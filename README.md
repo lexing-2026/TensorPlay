@@ -151,7 +151,7 @@ We provide benchmark results on several standard datasets to demonstrate TensorP
 
 <div align="center">
     <p>
-        <img src="https://raw.githubusercontent.com/bluemoon-o2/TensorPlay/main/docs/images/logo.png" alt="TensorPlay">
+        <img src="https://raw.githubusercontent.com/bluemoon-o2/TensorPlay/main/docs/images/logo-footer.png" alt="TensorPlay">
     </p>
 </div>
 
