@@ -1,0 +1,90 @@
+[build-system]
+requires = ["scikit-build-core", "nanobind", "PyYAML", "ninja", "cmake<4.0"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "tensorplay"
+version = "1.0.0rc0"
+description = "A simple deep learning framework designed for educational purposes and small-scale experiments."
+readme = "README.md"
+authors = [{ name = "zlx", email = "2095774200@shu.edu.cn" }]
+maintainers = [{ name = "zlx", email = "2095774200@shu.edu.cn" }]
+license = { text = "Apache License 2.0" }
+keywords = ["deep learning", "neural network", "tensor", "framework", "education", "CUDA", "CPU"]
+requires-python = ">=3.9,<3.14"
+dependencies = [
+    "numpy>=2.0.0",
+    "typing-extensions>=4.0.0",
+    "PyYAML"
+]
+
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3 :: Only",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: Microsoft :: Windows",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Intended Audience :: Education",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Typing :: Typed"
+]
+
+[project.optional-dependencies]
+all = [
+    "matplotlib",
+    "tqdm",
+    "onnx",
+    "scipy",
+    "soundfile"
+]
+
+[project.urls]
+Homepage = "https://github.com/bluemoon-o2/tensorplay"
+Repository = "https://github.com/bluemoon-o2/tensorplay.git"
+Issues = "https://github.com/bluemoon-o2/tensorplay/issues"
+Changelog = "https://github.com/bluemoon-o2/tensorplay/blob/main/CHANGELOG.md"
+Documentation = "https://bluemoon-o2.github.io/tensorplay/"
+Contributing = "https://github.com/bluemoon-o2/tensorplay/blob/main/CONTRIBUTING.md"
+
+[tool.scikit-build]
+cmake.version = ">=3.18"
+# Ensure the package is built in release mode
+cmake.build-type = "Release"
+# Install prefix handled by scikit-build-core
+# But we need to make sure our CMake install commands target the right place
+# scikit-build-core sets CMAKE_INSTALL_PREFIX to the wheel directory
+# Our CMakeLists.txt installs to "tensorplay", so it will be "wheel_dir/tensorplay"
+# which matches the python package structure if "tensorplay" is the package name.
+wheel.packages = ["tensorplay"]
+
+# Enable logging
+logging.level = "INFO"
+
+# Force Ninja generator via CMake args
+cmake.args = ["-GNinja"]
+
+# Disable stripping to avoid potential issues with DLLs on Windows
+install.strip = false
+
+# Ensure we include everything installed by CMake, but exclude unwanted artifacts if they slip through
+# scikit-build-core automatically includes files in wheel.packages
+# We can use exclude to be safe
+wheel.exclude = [
+    "tensorplay/include",
+    "tensorplay/share",
+    "tensorplay/lib/cmake",
+    "tensorplay/lib/*.lib",
+    "include",
+    "share",
+    "lib/cmake",
+    "lib/*.lib" 
+]

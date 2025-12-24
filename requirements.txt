@@ -1,0 +1,5 @@
+# TensorPlay dependencies
+setuptools>=45.0.0
+wheel>=0.34.0
+nanobind>=1.0.0
+numpy>=2.0.0

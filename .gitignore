@@ -1,0 +1,48 @@
+# Build and temporary files
+build/
+release_build/
+rebuild_build/
+*.egg-info/
+dist/
+.idea/
+.trae/
+.pytest_cache/
+data_torch/
+data/
+logs_*/
+
+# Compiled binaries
+*.dll
+*.lib
+*.exp
+*.pyd
+*.so
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.manifest
+*.res
+*.tlog
+*.lastbuildstate
+*.idb
+*.recipe
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Website
+website/
+node_modules/
+**/node_modules/
+
+# Third party sources
+third_party/oneDNN/
+third_party/cudnn/
+third_party/googletest/
+third_party/pybind11/
+third_party/nanobind/
+!third_party/*.py
+!third_party/*.zip

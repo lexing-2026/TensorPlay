@@ -1,0 +1,186 @@
+- name: permute(Tensor self, int64_t[] dims) -> Tensor
+  self: tensorplay::tpx::ops::permute_backward(grad, self, dims)
+
+- name: squeeze(Tensor self) -> Tensor
+  self: tensorplay::tpx::ops::squeeze_backward(grad, self)
+
+- name: squeeze.dim(Tensor self, int64_t dim) -> Tensor
+  self: grad.unsqueeze(dim)
+
+- name: unsqueeze(Tensor self, int64_t dim) -> Tensor
+  self: grad.squeeze(dim)
+
+- name: transpose(Tensor self, int64_t dim0, int64_t dim1) -> Tensor
+  self: grad.transpose(dim0, dim1)
+
+- name: t(Tensor self) -> Tensor
+  self: grad.t()
+
+- name: add.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor
+  self: grad
+  other: grad * alpha
+
+- name: sub.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor
+  self: grad
+  other: grad.neg() * alpha
+
+- name: mul.Tensor(Tensor self, Tensor other) -> Tensor
+  self: grad * other
+  other: grad * self
+
+- name: div.Tensor(Tensor self, Tensor other) -> Tensor
+  self: grad / other
+  other: -grad * self / (other * other)
+
+- name: neg(Tensor self) -> Tensor
+  self: grad.neg()
+
+- name: add.Scalar(Tensor self, Scalar other, Scalar alpha=1) -> Tensor
+  self: grad
+
+- name: clamp(Tensor self, Scalar? min=None, Scalar? max=None) -> Tensor
+  self: clamp_backward(grad, self, min, max)
+
+- name: sub.Scalar(Tensor self, Scalar other, Scalar alpha=1) -> Tensor
+  self: grad
+
+- name: mul.Scalar(Tensor self, Scalar other) -> Tensor
+  self: grad * other
+
+- name: div.Scalar(Tensor self, Scalar other) -> Tensor
+  self: grad / other
+
+- name: embedding(Tensor weight, Tensor indices, int64_t padding_idx=-1, bool scale_grad_by_freq=false, bool sparse=false) -> Tensor
+  weight: embedding_dense_backward(grad, indices, weight.size(0), padding_idx, scale_grad_by_freq)
+
+- name: view(Tensor self, int64_t[] shape) -> Tensor
+  self: grad.view(self.shape())
+
+- name: matmul(Tensor self, Tensor other) -> Tensor
+  self: grad.matmul(other.t())
+  other: self.t().matmul(grad)
+
+- name: mm(Tensor self, Tensor other) -> Tensor
+  self: grad.mm(other.t())
+  other: self.t().mm(grad)
+
+- name: sin(Tensor self) -> Tensor
+  self: grad * self.cos()
+
+- name: cos(Tensor self) -> Tensor
+  self: grad * -self.sin()
+
+- name: pow.Tensor_Scalar(Tensor self, Scalar exponent) -> Tensor
+  self: grad * exponent * self.pow(exponent - 1)
+
+- name: exp(Tensor self) -> Tensor
+  self: grad * self.exp()
+
+- name: sqrt(Tensor self) -> Tensor
+  self: grad / (2 * self.sqrt())
+
+- name: sum(Tensor self, *, DType dtype=Undefined) -> Tensor
+  self: grad.expand(self.shape())
+
+- name: mean(Tensor self, *, DType dtype=Undefined) -> Tensor
+  self: grad.expand(self.shape()) / self.numel()
+
+- name: reshape(Tensor self, int64_t[] shape) -> Tensor
+  self: grad.reshape(self.shape())
+
+- name: log_softmax(Tensor self, int64_t dim, DType dtype=Undefined) -> Tensor
+  self: grad - self.log_softmax(dim, dtype).exp() * grad.sum({dim}, true)
+
+- name: softmax(Tensor self, int64_t dim, DType dtype=Undefined) -> Tensor
+  self: (grad - (grad * result).sum({dim}, true)) * result
+
+- name: nll_loss(Tensor self, Tensor target, Tensor? weight=None, int64_t reduction=1, int64_t ignore_index=-100) -> (Tensor output, Tensor total_weight)
+  self: nll_loss_backward(grad, self, target, weight, reduction, ignore_index, total_weight)
+
+- name: mse_loss(Tensor self, Tensor target, int64_t reduction=1) -> Tensor
+  self: mse_loss_backward(grad, self, target, reduction)
+
+- name: relu(Tensor self) -> Tensor
+  self: threshold_backward(grad, result, 0)
+
+- name: max_pool2d(Tensor input, int64_t[] kernel_size, int64_t[] stride={}, int64_t[] padding={0, 0}, int64_t[] dilation={1, 1}, bool ceil_mode=false) -> Tensor
+  input: max_pool2d_backward(grad, input, kernel_size, stride, padding, dilation, ceil_mode)
+
+- name: adaptive_avg_pool2d(Tensor input, int64_t[] output_size) -> Tensor
+  input: adaptive_avg_pool2d_backward(grad, input)
+
+- name: adaptive_max_pool2d(Tensor input, int64_t[] output_size) -> Tensor
+  input: adaptive_max_pool2d_backward(grad, input)
+
+- name: batch_norm(Tensor input, Tensor? weight, Tensor? bias, Tensor? running_mean, Tensor? running_var, bool training, double momentum, double eps) -> Tensor
+  input: std::get<0>(batch_norm_backward(grad, input, weight, running_mean, running_var, training, eps))
+  weight: std::get<1>(batch_norm_backward(grad, input, weight, running_mean, running_var, training, eps))
+  bias: std::get<2>(batch_norm_backward(grad, input, weight, running_mean, running_var, training, eps))
+
+- name: layer_norm(Tensor input, int64_t[] normalized_shape, Tensor? weight=None, Tensor? bias=None, double eps=1e-5) -> Tensor
+  input: std::get<0>(layer_norm_backward(grad, input, normalized_shape, weight, bias, eps))
+  weight: std::get<1>(layer_norm_backward(grad, input, normalized_shape, weight, bias, eps))
+  bias: std::get<2>(layer_norm_backward(grad, input, normalized_shape, weight, bias, eps))
+
+- name: group_norm(Tensor input, int64_t num_groups, Tensor? weight=None, Tensor? bias=None, double eps=1e-5) -> Tensor
+  input: std::get<0>(group_norm_backward(grad, input, num_groups, weight, bias, eps))
+  weight: std::get<1>(group_norm_backward(grad, input, num_groups, weight, bias, eps))
+  bias: std::get<2>(group_norm_backward(grad, input, num_groups, weight, bias, eps))
+
+- name: instance_norm(Tensor input, Tensor? weight, Tensor? bias, Tensor? running_mean, Tensor? running_var, bool use_input_stats, double momentum, double eps) -> Tensor
+  input: std::get<0>(instance_norm_backward(grad, input, weight, bias, running_mean, running_var, use_input_stats, eps))
+  weight: std::get<1>(instance_norm_backward(grad, input, weight, bias, running_mean, running_var, use_input_stats, eps))
+  bias: std::get<2>(instance_norm_backward(grad, input, weight, bias, running_mean, running_var, use_input_stats, eps))
+
+- name: constant_pad_nd(Tensor self, int64_t[] pad, Scalar value=0) -> Tensor
+  self: constant_pad_nd_backward(grad, pad)
+
+- name: conv2d(Tensor input, Tensor weight, Tensor bias={}, int64_t[] stride={1, 1}, int64_t[] padding={0, 0}, int64_t[] dilation={1, 1}, int64_t groups=1) -> Tensor
+  input: conv2d_grad_input(grad, input, weight, stride, padding, dilation, groups)
+  weight: conv2d_grad_weight(grad, input, weight, stride, padding, dilation, groups)
+  bias: conv2d_grad_bias(grad, input, weight, stride, padding, dilation, groups)
+
+- name: conv1d(Tensor input, Tensor weight, Tensor bias={}, int64_t[] stride={1}, int64_t[] padding={0}, int64_t[] dilation={1}, int64_t groups=1) -> Tensor
+  input: conv1d_grad_input(grad, input, weight, stride, padding, dilation, groups)
+  weight: conv1d_grad_weight(grad, input, weight, stride, padding, dilation, groups)
+  bias: conv1d_grad_bias(grad, input, weight, stride, padding, dilation, groups)
+
+- name: conv3d(Tensor input, Tensor weight, Tensor bias={}, int64_t[] stride={1, 1, 1}, int64_t[] padding={0, 0, 0}, int64_t[] dilation={1, 1, 1}, int64_t groups=1) -> Tensor
+  input: conv3d_grad_input(grad, input, weight, stride, padding, dilation, groups)
+  weight: conv3d_grad_weight(grad, input, weight, stride, padding, dilation, groups)
+  bias: conv3d_grad_bias(grad, input, weight, stride, padding, dilation, groups)
+
+- name: conv_transpose2d(Tensor input, Tensor weight, Tensor bias={}, int64_t[] stride={1, 1}, int64_t[] padding={0, 0}, int64_t[] output_padding={0, 0}, int64_t groups=1, int64_t[] dilation={1, 1}) -> Tensor
+  input: conv_transpose2d_grad_input(grad, input, weight, stride, padding, output_padding, groups, dilation)
+  weight: conv_transpose2d_grad_weight(grad, input, weight, stride, padding, output_padding, groups, dilation)
+  bias: conv_transpose2d_grad_bias(grad, input, weight, stride, padding, output_padding, groups, dilation)
+
+- name: conv_transpose3d(Tensor input, Tensor weight, Tensor bias={}, int64_t[] stride={1, 1, 1}, int64_t[] padding={0, 0, 0}, int64_t[] output_padding={0, 0, 0}, int64_t groups=1, int64_t[] dilation={1, 1, 1}) -> Tensor
+  input: conv_transpose3d_grad_input(grad, input, weight, stride, padding, output_padding, groups, dilation)
+  weight: conv_transpose3d_grad_weight(grad, input, weight, stride, padding, output_padding, groups, dilation)
+  bias: conv_transpose3d_grad_bias(grad, input, weight, stride, padding, output_padding, groups, dilation)
+
+- name: sigmoid(Tensor self) -> Tensor
+  self: grad * result * (1 - result)
+
+- name: tanh(Tensor self) -> Tensor
+  self: grad * (1 - result * result)
+
+- name: atan2(Tensor self, Tensor other) -> Tensor
+  self: grad * other / (self * self + other * other)
+  other: grad * -self / (self * self + other * other)
+
+- name: lerp(Tensor self, Tensor end, Scalar weight) -> Tensor
+  self: grad * (Scalar(1) - weight)
+  end: grad * weight
+
+- name: lerp.Tensor(Tensor self, Tensor end, Tensor weight) -> Tensor
+  self: grad * (1 - weight)
+  end: grad * weight
+  weight: grad * (end - self)
+
+- name: var(Tensor self, int64_t correction=1) -> Tensor
+  self: grad * 2 * (self - self.mean()) / (self.numel() - correction)
+
+- name: std(Tensor self, int64_t correction=1) -> Tensor
+  self: grad * (self - self.mean()) / (result * (self.numel() - correction))
