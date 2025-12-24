@@ -3,7 +3,7 @@
         <img src="https://raw.githubusercontent.com/bluemoon-o2/TensorPlay/main/docs/images/logo.png" alt="TensorPlay" width="200">
     </p>
 
-[![stars](https://img.shields.io/github/stars/TensorPlay?color=ccf)](https://github.com/bluemoon-o2/TensorPlay)
+[![GitHub stars](https://img.shields.io/github/stars/bluemoon-o2/TensorPlay?style=flat-square&logo=github)](https://github.com/bluemoon-o2/TensorPlay/stargazers)
 [![PyPI Downloads](https://static.pepy.tech/personalized-badge/tensorplay?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLUE&right_color=GREEN&left_text=downloads)](https://pepy.tech/projects/tensorplay)
 ![PyPI - Downloads](https://img.shields.io/pypi/dm/TensorPlay?labelColor=blue)
 ![GitHub last commit](https://img.shields.io/github/last-commit/bluemoon-o2/TensorPlay?labelColor=teal)
