@@ -32,6 +32,8 @@ logs_*/
 # Python cache
 __pycache__/
 *.pyc
+try.py
+demo.py
 
 # Website
 website/
