@@ -1,6 +1,6 @@
 <div align="center">
     <p>
-        <img src="https://raw.githubusercontent.com/bluemoon-o2/TensorPlay/main/docs/images/logo.png" alt="TensorPlay" width="200">
+        <img src="https://raw.githubusercontent.com/bluemoon-o2/TensorPlay/main/docs/images/logo.png" alt="TensorPlay" width="400">
     </p>
 
 [![GitHub stars](https://img.shields.io/github/stars/bluemoon-o2/TensorPlay?style=flat-square&logo=github)](https://github.com/bluemoon-o2/TensorPlay/stargazers)
