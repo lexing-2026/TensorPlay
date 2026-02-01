@@ -154,13 +154,27 @@ We provide benchmark results on several standard datasets to demonstrate TensorP
     </p>
 </div>
 
-## 👩‍👩‍👧‍👦Contributing
-Contributions are welcome! Feel free to open issues for bugs or feature requests, or submit pull requests with improvements.
-
-## 📄 License
+# 📄 License
 This project is released under the [Apache 2.0 license](LICENSE).  
 
-## 🔗Links
-* [Source code and issue tracker](https://github.com/bluemoon-o2/TensorPlay)
-* [PyPI release](https://pypi.org/project/TensorPlay/)
+# 🔗Links
 * [Documentation](https://www.welog.me/article/TensorPLay)
+
+# 👩‍👩‍👧‍👦Contributing
+Contributions are welcome! Feel free to open issues for bugs or feature requests, or submit pull requests with improvements.
+
+Thanks to all our amazing contributors!
+
+<a href="https://github.com/bluemoon-o2/TensorPlay/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=bluemoon-o2/TensorPlay&columns=8" alt="Contributors" />
+</a>
+
+# 📈 Star History
+
+<a href="https://star-history.com/#bluemoon-o2/TensorPlay&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=bluemoon-o2/TensorPlay&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=bluemoon-o2/TensorPlay&type=Date" />
+    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=bluemoon-o2/TensorPlay&type=Date" width="100%" />
+  </picture>
+</a>
