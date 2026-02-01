@@ -26,11 +26,10 @@
         <img src="https://img.shields.io/pypi/v/tensorplay?color=blue&label=PyPI&logo=pypi" alt="PyPI Version">
     </a>
     <a href="https://pepy.tech/projects/tensorplay">
-        <img src="https://static.pepy.tech/personalized-badge/tensorplay?period=total&units=INTERNATIONAL_SYSTEM&left_color=grey&right_color=blue&left_text=downloads" alt="Downloads">
+        <img src="https://static.pepy.tech/badge/TensorPlay/month" alt="Monthly Downloads">
     </a>
-    <img src="https://img.shields.io/pypi/dm/TensorPlay?label=monthly%20downloads" alt="Monthly Downloads">
+    <img src="https://img.shields.io/github/downloads/bluemoon-o2/TensorPlay/total.svg?label=Github%20Downloads" alt="Monthly Downloads">
 </p>
-
 <!-- Community -->
 <p>
     <a href="https://github.com/bluemoon-o2/TensorPlay/stargazers">
