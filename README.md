@@ -22,6 +22,9 @@
 
 <!-- Package & Stats -->
 <p>
+    <a href="./LICENSE">
+        <img src="https://img.shields.io/badge/License-Apache%202.0-green?logo=apache" alt="License">
+    </a>
     <a href="https://pypi.org/project/tensorplay/">
         <img src="https://img.shields.io/pypi/v/tensorplay?color=blue&label=PyPI&logo=pypi" alt="PyPI Version">
     </a>
@@ -43,9 +46,6 @@
     </a>
     <a href="https://www.tensorplay.cn/">
         <img src="https://img.shields.io/badge/Docs-tensorplay.cn-blue?logo=readthedocs" alt="Documentation">
-    </a>
-    <a href="./LICENSE">
-        <img src="https://img.shields.io/badge/License-Apache%202.0-green?logo=apache" alt="License">
     </a>
 </p>
 
