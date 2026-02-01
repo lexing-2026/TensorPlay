@@ -257,5 +257,5 @@ for batch_x, batch_y in train_loader:
 </a>
 
 <div align="center">
-    <sub>为 AI 学习社区精心打造 ❤️ • <a href="https://www.tensorplay.cn">官方网站</a></sub>
+    <sub>Built with ❤️ for the AI Learning Community • <a href="https://www.tensorplay.cn">TensorPlay AI</a></sub>
 </div>
