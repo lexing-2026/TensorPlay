@@ -15,20 +15,23 @@
 
 <!-- 平台与构建 -->
 <p>
-    <img src="https://img.shields.io/badge/python-3.9～3.13-blue?logo=python&logoColor=white" alt="Python 版本">
-    <img src="https://img.shields.io/badge/平台-Win%20|%20Linux-purple" alt="Platform">
-    <img src="https://img.shields.io/badge/硬件-CPU%20|%20CUDA%2012.x%20|%2013.x-green?logo=nvidia" alt="Hardware">
+    <img src="https://img.shields.io/badge/python-3.9~3.13-blue?logo=python&logoColor=white" alt="Python Versions">
+    <img src="https://img.shields.io/badge/platform-Win%20|%20Linux-purple" alt="Platform">
+    <img src="https://img.shields.io/badge/hardware-CPU%20|%20CUDA%2012.x%20|%2013.x-green?logo=nvidia" alt="Hardware">
 </p>
 
 <!-- 包管理与统计 -->
 <p>
+    <a href="./LICENSE">
+        <img src="https://img.shields.io/badge/License-Apache%202.0-green?logo=apache" alt="License">
+    </a>
     <a href="https://pypi.org/project/tensorplay/">
-        <img src="https://img.shields.io/pypi/v/tensorplay?color=blue&label=PyPI&logo=pypi" alt="PyPI 版本">
+        <img src="https://img.shields.io/pypi/v/tensorplay?color=blue&label=PyPI&logo=pypi" alt="PyPI Version">
     </a>
     <a href="https://pepy.tech/projects/tensorplay">
-        <img src="https://static.pepy.tech/personalized-badge/tensorplay?period=total&units=INTERNATIONAL_SYSTEM&left_color=grey&right_color=blue&left_text=下载量" alt="Downloads">
+        <img src="https://static.pepy.tech/personalized-badge/tensorplay?period=total&units=INTERNATIONAL_SYSTEM&left_color=grey&right_color=blue&left_text=downloads" alt="Downloads">
     </a>
-    <img src="https://img.shields.io/pypi/dm/TensorPlay?label=月下载量" alt="Monthly Downloads">
+    <img src="https://img.shields.io/pypi/dm/TensorPlay?label=monthly%20downloads" alt="Monthly Downloads">
 </p>
 
 <!-- 社区与支持 -->
@@ -43,10 +46,7 @@
         <img src="https://img.shields.io/discord/1467167983616000062?color=5865F2&label=Discord&logo=discord&logoColor=white" alt="Discord">
     </a>
     <a href="https://www.tensorplay.cn/">
-        <img src="https://img.shields.io/badge/文档-tensorplay.cn-blue?logo=readthedocs" alt="Documentation">
-    </a>
-    <a href="./LICENSE">
-        <img src="https://img.shields.io/badge/许可证-Apache%202.0-green?logo=apache" alt="License">
+        <img src="https://img.shields.io/badge/Docs-tensorplay.cn-blue?logo=readthedocs" alt="Documentation">
     </a>
 </p>
 
