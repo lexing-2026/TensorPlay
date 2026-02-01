@@ -9,9 +9,8 @@
 ![GitHub last commit](https://img.shields.io/github/last-commit/bluemoon-o2/TensorPlay?labelColor=teal)
 
 ![python](https://img.shields.io/badge/python-3.9~3.13-aff.svg)
-![os](https://img.shields.io/badge/os-win-pink.svg)
-![hardware](https://img.shields.io/badge/hardware-cpu%2C%20cuda-red.svg)
 [![License](https://img.shields.io/badge/license-Apache%202.0-green)](./LICENSE)
+[![Discord](https://img.shields.io/badge/Discord-Join%20Chat-5865F2?logo=discord&style=flat-square)](https://discord.gg/u6T5e2kGJm)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/bluemoon-o2/TensorPlay)
 
 **TensorPlay is a learner-friendly, DIY-ready deep learning framework designed for educational purposes and small-scale experiments.**
