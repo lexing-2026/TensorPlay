@@ -254,5 +254,5 @@ We welcome contributions in all forms! Whether it's bug fixes, documentation imp
 </a>
 
 <div align="center">
-    <sub>Built with ❤️ for the AI Learning Community • <a href="https://www.tensorplay.cn">Official Website</a></sub>
+    <sub>Built with ❤️ for the AI Learning Community • <a href="https://www.tensorplay.cn">TensorPlay AI</a></sub>
 </div>
