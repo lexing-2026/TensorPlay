@@ -1,6 +1,10 @@
 import random
-from alpha.TensorPlay import Dense, Module, Adam, EarlyStopping
-from alpha.TensorPlay import DataLoader, accuracy, mse
+import os
+import sys
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
+from TensorPlay import Dense, Module, Adam, EarlyStopping
+from TensorPlay import DataLoader, accuracy, mse
 
 # 数据加载
 def load_data(path='D:/demo/Shen-main/krkopt.data'):

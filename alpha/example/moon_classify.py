@@ -1,4 +1,8 @@
-from alpha.TensorPlay import DataLoader, Dense, Module, Adam, accuracy, mse, load_moons
+import os
+import sys
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
+from TensorPlay import DataLoader, Dense, Module, Adam, accuracy, mse, load_moons
 
 class MoonClassify(Module):
     def __init__(self):
@@ -14,9 +18,9 @@ class MoonClassify(Module):
 
 train_dataset = DataLoader(load_moons())
 model = MoonClassify()
-optimizer = Adam(lr=0.001)
+optimizer = Adam(lr=1e-4)
 
-for epoch in range(1000):
+for epoch in range(10000):
     for x, y in train_dataset:
         pred = model(x)
         loss = mse(y, pred)

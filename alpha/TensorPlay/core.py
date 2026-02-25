@@ -2,7 +2,7 @@ import warnings
 import contextlib
 import weakref
 import numpy as np
-from alpha import TensorPlay as tp
+import TensorPlay as tp
 from typing import List, Union, Tuple, Optional, Any, Callable, Generator
 warnings.filterwarnings("default", category=UserWarning)
 
