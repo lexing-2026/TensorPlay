@@ -1,0 +1,43 @@
+#pragma once
+#include <cstdint>
+#include <type_traits>
+
+namespace tensorplay {
+
+// Lightweight equivalent of c10::irange: for (const auto i : irange(n)) { ... }
+// yields i in [0, n) with the same signed/unsigned semantics as torch.
+template <typename T>
+class irange {
+  static_assert(std::is_integral_v<T>, "irange requires an integral type");
+
+ public:
+  class iterator {
+   public:
+    using iterator_category = std::input_iterator_tag;
+    using value_type = T;
+    using difference_type = std::ptrdiff_t;
+    using pointer = const T*;
+    using reference = const T&;
+
+    iterator(T value) : value_(value) {}
+    T operator*() const { return value_; }
+    iterator& operator++() { ++value_; return *this; }
+    bool operator==(const iterator& other) const { return value_ == other.value_; }
+    bool operator!=(const iterator& other) const { return value_ != other.value_; }
+
+   private:
+    T value_;
+  };
+
+  irange(T begin, T end) : begin_(begin), end_(end) {}
+  explicit irange(T end) : begin_(T{0}), end_(end) {}
+
+  iterator begin() const { return iterator(begin_); }
+  iterator end() const { return iterator(end_); }
+
+ private:
+  T begin_;
+  T end_;
+};
+
+} // namespace tensorplay

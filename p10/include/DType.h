@@ -4,6 +4,9 @@
 #include <complex>
 #include <string>
 
+#include "Half.h"
+#include "BFloat16.h"
+
 // MSVC workaround: Avoid macro expansion issues in enum definition
 // Undefine common Windows/System macros that might conflict with our enum names
 #ifdef UInt8
@@ -57,6 +60,8 @@ namespace tensorplay {
     _(uint64_t, UInt64)                   \
     _(float, Float32)                     \
     _(double, Float64)                    \
+    _(tensorplay::Half, Float16)          \
+    _(tensorplay::BFloat16, BFloat16)     \
     _(bool, Bool)
 
 // ScalarType enum
@@ -71,9 +76,13 @@ enum class ScalarType : int8_t {
     UInt64,
     Float32,
     Float64,
+    Float16,
+    BFloat16,
     Bool,
     ComplexFloat,
     ComplexDouble,
+    ComplexHalf,
+    BComplex32,
     Undefined,
     NumOptions
 };
@@ -88,14 +97,89 @@ inline bool isIntegralType(ScalarType t, bool includeBool = false) {
 }
 
 inline bool isFloatingType(ScalarType t) {
-    return (t == ScalarType::Float32 || t == ScalarType::Float64 || t == ScalarType::ComplexFloat || t == ScalarType::ComplexDouble);
+    return (t == ScalarType::Float32 || t == ScalarType::Float64 ||
+            t == ScalarType::Float16 || t == ScalarType::BFloat16);
 }
+
+inline bool isReducedFloatingType(ScalarType t) {
+    return t == ScalarType::Float16 || t == ScalarType::BFloat16;
+}
+
+inline bool isComplexType(ScalarType t) {
+    return t == ScalarType::ComplexHalf ||
+           t == ScalarType::ComplexFloat ||
+           t == ScalarType::ComplexDouble ||
+           t == ScalarType::BComplex32;
+}
+
+inline bool isFloatingOrComplexType(ScalarType t) {
+    return isFloatingType(t) || isComplexType(t);
+}
+
+inline bool isSignedType(ScalarType t) {
+    switch (t) {
+        case ScalarType::Int8:
+        case ScalarType::Int16:
+        case ScalarType::Int32:
+        case ScalarType::Int64:
+        case ScalarType::Float16:
+        case ScalarType::BFloat16:
+        case ScalarType::Float32:
+        case ScalarType::Float64:
+        case ScalarType::ComplexHalf:
+        case ScalarType::ComplexFloat:
+        case ScalarType::ComplexDouble:
+        case ScalarType::BComplex32:
+            return true;
+        default:
+            return false;
+    }
+}
+
+inline ScalarType toRealValueType(ScalarType t) {
+    switch (t) {
+        case ScalarType::ComplexHalf: return ScalarType::Float16;
+        case ScalarType::ComplexFloat: return ScalarType::Float32;
+        case ScalarType::ComplexDouble: return ScalarType::Float64;
+        case ScalarType::BComplex32: return ScalarType::BFloat16;
+        default: return t;
+    }
+}
+
+inline ScalarType toComplexType(ScalarType t) {
+    switch (t) {
+        case ScalarType::Float16: return ScalarType::ComplexHalf;
+        case ScalarType::Float32: return ScalarType::ComplexFloat;
+        case ScalarType::Float64: return ScalarType::ComplexDouble;
+        case ScalarType::BFloat16: return ScalarType::BComplex32;
+        case ScalarType::ComplexHalf:
+        case ScalarType::ComplexFloat:
+        case ScalarType::ComplexDouble:
+        case ScalarType::BComplex32:
+            return t;
+        default:
+            return ScalarType::Undefined;
+    }
+}
+
+template <typename T>
+struct is_complex_type : std::false_type {};
+
+template <typename T>
+struct is_complex_type<std::complex<T>> : std::true_type {
+    using value_type = T;
+};
+
+template <typename T>
+inline constexpr bool is_complex_type_v = is_complex_type<T>::value;
 
 // Extended macro including complex types
 #define TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(_) \
     TENSORPLAY_FORALL_SCALAR_TYPES(_)                  \
+    _(std::complex<tensorplay::Half>, ComplexHalf)      \
     _(std::complex<float>, ComplexFloat)               \
-    _(std::complex<double>, ComplexDouble)
+    _(std::complex<double>, ComplexDouble)             \
+    _(std::complex<tensorplay::BFloat16>, BComplex32)
 
 // DType is an alias for ScalarType for compatibility
 using DType = ScalarType;

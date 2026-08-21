@@ -1,5 +1,6 @@
 #include "Tensor.h"
 #include "Dispatcher.h"
+#include "CUDARuntime.h"
 #include "CUDAContext.h"
 #include "Exception.h"
 #include "CUDNNUtils.h"
@@ -53,6 +54,23 @@ __global__ void silu_kernel_n(int64_t n, const T* input, T* output) {
     }
 }
 
+// Half/bfloat16 do not have a native device exp implementation in the
+// lightweight scalar wrappers used by TensorPlay.  Match PyTorch's usual
+// mixed-precision behavior by evaluating the sigmoid in FP32 and rounding only
+// the final result back to the input dtype.
+template <typename T>
+__global__ void silu_kernel_n_fp32(int64_t n, const T* input, T* output) {
+    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float x = static_cast<float>(input[i]);
+        float y = x / (1.0f + expf(-x));
+        output[i] = static_cast<T>(y);
+    }
+}
+
+template <typename T>
+__global__ void relu_kernel_n(int64_t n, const T* input, T* output);
+
 Tensor silu_kernel_cuda_native(const Tensor& self) {
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
     int64_t n = self.numel();
@@ -61,13 +79,21 @@ Tensor silu_kernel_cuda_native(const Tensor& self) {
     dim3 block(256);
     dim3 grid((n + 255) / 256);
     
-    // Support float/double
+    // Keep FP32/FP64 native, and use FP32 intermediates for reduced precision.
     if (self.dtype() == DType::Float32) {
-        silu_kernel_n<float><<<grid, block>>>(n, self.data_ptr<float>(), result.data_ptr<float>());
+        silu_kernel_n<float><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<float>(), result.data_ptr<float>());
     } else if (self.dtype() == DType::Float64) {
-        silu_kernel_n<double><<<grid, block>>>(n, self.data_ptr<double>(), result.data_ptr<double>());
+        silu_kernel_n<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<double>(), result.data_ptr<double>());
+    } else if (self.dtype() == DType::Float16) {
+        Tensor self_contig = self.is_contiguous() ? self : self.contiguous();
+        silu_kernel_n_fp32<tensorplay::Half><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
+            n, self_contig.data_ptr<tensorplay::Half>(), result.data_ptr<tensorplay::Half>());
+    } else if (self.dtype() == DType::BFloat16) {
+        Tensor self_contig = self.is_contiguous() ? self : self.contiguous();
+        silu_kernel_n_fp32<tensorplay::BFloat16><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
+            n, self_contig.data_ptr<tensorplay::BFloat16>(), result.data_ptr<tensorplay::BFloat16>());
     } else {
-        TP_THROW(NotImplementedError, "silu: only float/double supported");
+        TP_THROW(NotImplementedError, "silu: only float/double/fp16/bf16 supported");
     }
     
     // CUDA_CHECK is defined in this file or Macros? 
@@ -79,7 +105,32 @@ Tensor silu_kernel_cuda_native(const Tensor& self) {
     return result;
 }
 
-Tensor relu_kernel_cudnn(const Tensor& self) { return cudnn_activation(self, CUDNN_ACTIVATION_RELU); }
+Tensor relu_kernel_cudnn(const Tensor& self) {
+    if (self.dtype() == DType::Float32 || self.dtype() == DType::Float64) {
+        return cudnn_activation(self, CUDNN_ACTIVATION_RELU);
+    }
+    // cuDNN path only accepts float/double; fall back to a native kernel
+    // (fp16/bf16 and integral inputs keep their dtype, like PyTorch).
+    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
+    if (self.numel() == 0) return result;
+    dim3 block(256);
+    dim3 grid((self.numel() + 255) / 256);
+    Tensor self_contig = self.contiguous();
+    int64_t n = self.numel();
+    if (self.dtype() == DType::Float16) {
+        relu_kernel_n<tensorplay::Half><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self_contig.data_ptr<tensorplay::Half>(), result.data_ptr<tensorplay::Half>());
+    } else if (self.dtype() == DType::BFloat16) {
+        relu_kernel_n<tensorplay::BFloat16><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self_contig.data_ptr<tensorplay::BFloat16>(), result.data_ptr<tensorplay::BFloat16>());
+    } else if (self.dtype() == DType::Int32) {
+        relu_kernel_n<int32_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self_contig.data_ptr<int32_t>(), result.data_ptr<int32_t>());
+    } else if (self.dtype() == DType::Int64) {
+        relu_kernel_n<int64_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self_contig.data_ptr<int64_t>(), result.data_ptr<int64_t>());
+    } else {
+        TP_THROW(NotImplementedError, "relu: unsupported dtype");
+    }
+    checkCuda(cudaGetLastError(), "relu kernel launch");
+    return result;
+}
 
 Tensor& cudnn_activation_inplace(Tensor& self, cudnnActivationMode_t mode, double coef = 0.0) {
     if (self.numel() == 0) return self;
@@ -183,6 +234,15 @@ Tensor log_softmax_kernel_cudnn(const Tensor& self, int64_t dim, DType dtype) {
 // --- Backward Kernels ---
 
 template <typename T>
+__global__ void relu_kernel_n(int64_t n, const T* input, T* output) {
+    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        T x = input[i];
+        output[i] = x > T(0) ? x : T(0);
+    }
+}
+
+template <typename T>
 __global__ void threshold_backward_kernel_impl(int64_t n, const T* grad_output, const T* output, T threshold, T* grad_input) {
     int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
@@ -194,23 +254,47 @@ Tensor threshold_backward_kernel(const Tensor& grad_output, const Tensor& output
     if (grad_output.numel() != output.numel()) {
         TP_THROW(RuntimeError, "threshold_backward: grad_output and output must have same size");
     }
+
+    // Reduction backward can pass an expanded scalar tangent.  Its logical
+    // shape matches ``output``, but its storage has a zero stride and is not
+    // safe to consume as a flat CUDA pointer.  Materialize the same contiguous
+    // tangent contract used by PyTorch's autograd kernels before launching.
+    Tensor grad_contig = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
+    Tensor output_contig = output.is_contiguous() ? output : output.contiguous();
     
-    Tensor grad_input = Tensor::empty_like(grad_output, DType::Undefined, grad_output.device());
-    int64_t n = grad_output.numel();
+    Tensor grad_input = Tensor::empty_like(grad_contig, DType::Undefined, grad_contig.device());
+    int64_t n = grad_contig.numel();
     if (n == 0) return grad_input;
     
     dim3 block(256);
     dim3 grid((n + 255) / 256);
     
     if (grad_output.dtype() == DType::Float32) {
-        threshold_backward_kernel_impl<float><<<grid, block>>>(
+        Tensor output_cast = (output_contig.dtype() == DType::Float32) ? output_contig : output_contig.to(DType::Float32);
+        threshold_backward_kernel_impl<float><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
             n, 
-            grad_output.data_ptr<float>(), 
-            output.data_ptr<float>(), 
+            grad_contig.data_ptr<float>(), 
+            output_cast.data_ptr<float>(), 
             threshold.to<float>(), 
             grad_input.data_ptr<float>());
+    } else if (grad_output.dtype() == DType::Float16) {
+        Tensor output_cast = (output_contig.dtype() == DType::Float16) ? output_contig : output_contig.to(DType::Float16);
+        threshold_backward_kernel_impl<tensorplay::Half><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
+            n,
+            grad_contig.data_ptr<tensorplay::Half>(),
+            output_cast.data_ptr<tensorplay::Half>(),
+            tensorplay::Half(threshold.to<float>()),
+            grad_input.data_ptr<tensorplay::Half>());
+    } else if (grad_output.dtype() == DType::BFloat16) {
+        Tensor output_cast = (output_contig.dtype() == DType::BFloat16) ? output_contig : output_contig.to(DType::BFloat16);
+        threshold_backward_kernel_impl<tensorplay::BFloat16><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
+            n,
+            grad_contig.data_ptr<tensorplay::BFloat16>(),
+            output_cast.data_ptr<tensorplay::BFloat16>(),
+            tensorplay::BFloat16(threshold.to<float>()),
+            grad_input.data_ptr<tensorplay::BFloat16>());
     } else {
-        TP_THROW(NotImplementedError, "threshold_backward: only float32 supported");
+        TP_THROW(NotImplementedError, "threshold_backward: only float32/fp16/bf16 supported");
     }
     
     cudaError_t error = cudaGetLastError();

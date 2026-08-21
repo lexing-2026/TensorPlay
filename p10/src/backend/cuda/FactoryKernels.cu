@@ -1,8 +1,10 @@
 #include "Tensor.h"
 #include "Dispatcher.h"
+#include "CUDARuntime.h"
 #include "Exception.h"
 #include "Scalar.h"
 #include <cuda_runtime.h>
+#include <complex>
 #include <vector>
 
 namespace tensorplay {
@@ -26,12 +28,25 @@ Tensor& fill_kernel(Tensor& self, Scalar value) {
     #define OP_CASE(ctype, name) \
     case DType::name: { \
         ctype val = value.to<ctype>(); \
-        fill_kernel_cuda_impl<ctype><<<blocks, threads>>>(n, self.data_ptr<ctype>(), val); \
+        fill_kernel_cuda_impl<ctype><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<ctype>(), val); \
         break; \
     }
 
     switch (self.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(OP_CASE)
+        // Complex storage dtypes are not part of the real-type macro.
+        case DType::ComplexFloat: {
+            std::complex<float> val = value.to<std::complex<float>>();
+            fill_kernel_cuda_impl<std::complex<float>><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                n, self.data_ptr<std::complex<float>>(), val);
+            break;
+        }
+        case DType::ComplexDouble: {
+            std::complex<double> val = value.to<std::complex<double>>();
+            fill_kernel_cuda_impl<std::complex<double>><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                n, self.data_ptr<std::complex<double>>(), val);
+            break;
+        }
         default: TP_THROW(NotImplementedError, "fill_ not implemented for this dtype on CUDA");
     }
     #undef OP_CASE
@@ -44,21 +59,23 @@ Tensor& fill_kernel(Tensor& self, Scalar value) {
     return self;
 }
 
-Tensor zeros_kernel(const std::vector<int64_t>& size, DType dtype, Device device) {
+Tensor zeros_kernel(const std::vector<int64_t>& size, DType dtype, Device device, bool pin_memory) {
+    if (pin_memory) TP_THROW(RuntimeError, "pin_memory is only valid for CPU tensors");
     // Tensor constructor allocates memory (via empty)
     Tensor t(size, dtype, device);
     fill_kernel(t, 0);
     return t;
 }
 
-Tensor ones_kernel(const std::vector<int64_t>& size, DType dtype, Device device) {
+Tensor ones_kernel(const std::vector<int64_t>& size, DType dtype, Device device, bool pin_memory) {
+    if (pin_memory) TP_THROW(RuntimeError, "pin_memory is only valid for CPU tensors");
     Tensor t(size, dtype, device);
     fill_kernel(t, 1);
     return t;
 }
 
 Tensor empty_kernel(const std::vector<int64_t>& size, DType dtype, Device device, bool pin_memory) {
-    // pin_memory ignored for now (or TODO)
+    if (pin_memory) TP_THROW(RuntimeError, "pin_memory is only valid for CPU tensors");
     return Tensor(size, dtype, device);
 }
 
@@ -73,13 +90,13 @@ Tensor rand_like_kernel(const Tensor& self, DType dtype, std::optional<Device> d
 Tensor zeros_like_kernel(const Tensor& self, DType dtype, std::optional<Device> device) {
     if (dtype == DType::Undefined) dtype = self.dtype();
     Device dev = device.has_value() ? *device : self.device();
-    return zeros_kernel(static_cast<std::vector<int64_t>>(self.shape()), dtype, dev);
+    return zeros_kernel(static_cast<std::vector<int64_t>>(self.shape()), dtype, dev, false);
 }
 
 Tensor ones_like_kernel(const Tensor& self, DType dtype, std::optional<Device> device) {
     if (dtype == DType::Undefined) dtype = self.dtype();
     Device dev = device.has_value() ? *device : self.device();
-    return ones_kernel(static_cast<std::vector<int64_t>>(self.shape()), dtype, dev);
+    return ones_kernel(static_cast<std::vector<int64_t>>(self.shape()), dtype, dev, false);
 }
 
 Tensor empty_like_kernel(const Tensor& self, DType dtype, std::optional<Device> device) {
@@ -95,7 +112,8 @@ Tensor full_like_kernel(const Tensor& self, Scalar fill_value, DType dtype, std:
     return fill_kernel(t, fill_value);
 }
 
-Tensor full_kernel(const std::vector<int64_t>& size, Scalar fill_value, DType dtype, Device device, bool requires_grad) {
+Tensor full_kernel(const std::vector<int64_t>& size, Scalar fill_value, DType dtype, Device device, bool pin_memory) {
+    if (pin_memory) TP_THROW(RuntimeError, "pin_memory is only valid for CPU tensors");
     if (dtype == DType::Undefined) {
         if (fill_value.isFloatingPoint()) dtype = DType::Float32;
         else if (fill_value.isIntegral()) dtype = DType::Int64;
@@ -128,7 +146,7 @@ Tensor eye_kernel(int64_t n, int64_t m, DType dtype, Device device, bool require
     int blocks = (numel + threads - 1) / threads;
     
     if (dtype == DType::Float32) {
-        eye_kernel_cuda_impl<float><<<blocks, threads>>>(n, m, t.data_ptr<float>());
+        eye_kernel_cuda_impl<float><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(n, m, t.data_ptr<float>());
     } else {
         TP_THROW(NotImplementedError, "CUDA eye: only float32 supported");
     }

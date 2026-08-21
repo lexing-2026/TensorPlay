@@ -165,7 +165,7 @@ TensorPlay 建立在四个解耦的核心库之上，既可协同工作，也可
 
 ### 进阶
 3. **自定义数据集与转换** - 掌握 `Dataset` 类和数据预处理流水线
-4. **模型保存与加载** - 使用 `tp.save()` / `tp.load()` 和 `state_dict` 管理训练状态
+4. **模型保存与加载** - 使用 `tp.save()` / `tp.load()` 以原生 MEGA `.mega` 格式和 `state_dict` 管理训练状态
 
 👉 查看完整教程：[tutorials](https://www.tensorplay.cn/zh/guide/tutorials)
 

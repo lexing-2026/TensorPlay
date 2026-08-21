@@ -4,13 +4,14 @@ project(tpx LANGUAGES CXX)
 
 set(TPX_SOURCES
     src/Autograd.cpp
+    src/autocast_mode.cpp
     src/Engine.cpp
-    src/Tensor.cpp
-    src/AutogradMetaInterface.cpp
     ${GEN_TPX_OPS_CPP}
+    ${GEN_TPX_AUTOGRAD_REG_CPP}
+    ${GEN_AUTOCAST_CPP}
 )
 
-set_source_files_properties(${GEN_TPX_OPS_CPP} PROPERTIES GENERATED TRUE)
+set_source_files_properties(${GEN_TPX_OPS_CPP} ${GEN_TPX_AUTOGRAD_REG_CPP} ${GEN_AUTOCAST_CPP} PROPERTIES GENERATED TRUE)
 
 add_library(tpx ${TPX_SOURCES})
 set_target_properties(tpx PROPERTIES UNITY_BUILD ON)

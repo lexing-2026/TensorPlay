@@ -1,188 +1,128 @@
 #pragma once
 #include <vector>
 #include <memory>
-#include <unordered_map>
-#include <unordered_set>
 #include <queue>
-#include <stack>
-#include <iostream>
+#include <mutex>
+#include <condition_variable>
+#include <thread>
+#include <optional>
+#include <unordered_map>
+#include <cstdint>
 #include "Macros.h"
-#include "TPXTensor.h"
+#include "Tensor.h"
 #include "Edge.h"
 #include "Node.h"
+#include "InputBuffer.h"
+#include "GraphTask.h"
 
 namespace tensorplay {
 namespace tpx {
 
-class TENSORPLAY_API Engine {
-private:
+// Thread-safe ready queue ordered by sequence_nr (max first), mirroring
+// torch::autograd::ReadyQueue. One queue per execution device plus one for
+// CPU work; the thread that initiates backward() drains the CPU queue itself.
+class TENSORPLAY_API ReadyQueue {
+public:
     struct NodeTask {
-        std::shared_ptr<Node> fn;
-        
+        std::shared_ptr<Node> fn_;
+        InputBuffer input_buffer_;
+        // The graph this task belongs to. Raw pointer: the initiating thread
+        // blocks until every enqueued task has been evaluated, so the
+        // GraphTask always outlives its tasks.
+        GraphTask* graph_;
+
+        NodeTask(std::shared_ptr<Node> fn, InputBuffer input_buffer, GraphTask* graph)
+            : fn_(std::move(fn)), input_buffer_(std::move(input_buffer)), graph_(graph) {}
+
         // Max heap by sequence_nr
         bool operator<(const NodeTask& other) const {
-            return fn->sequence_nr() < other.fn->sequence_nr();
+            return fn_->sequence_nr() < other.fn_->sequence_nr();
         }
     };
 
-public:
-    static Engine& get_default_engine();
-    
-    // capture_grads: map from Node* to input gradients (vector of tensors).
-    // If a node is in this map, we capture its input gradients and do NOT execute the node.
-    void execute_graph(const std::vector<tensorplay::tpx::Edge>& roots, 
-                       const std::vector<tensorplay::tpx::Tensor>& inputs, 
-                       bool keep_graph, 
-                       bool create_graph,
-                       std::unordered_map<Node*, std::vector<Tensor>>* capture_grads = nullptr) {
-        if (roots.size() != inputs.size()) {
-            TP_THROW(RuntimeError, "Engine::execute: roots and inputs must have same size");
+    void push(NodeTask task) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            heap_.push(std::move(task));
         }
+        cv_.notify_one();
+    }
 
-        // 1. Compute dependencies
-        // Count incoming edges for nodes reachable from roots
-        std::unordered_map<Node*, int> dependencies;
-        std::unordered_set<Node*> visited;
-        std::vector<Node*> stack;
-        
-        for (const auto& edge : roots) {
-            if (edge.function) {
-                stack.push_back(edge.function.get());
+    // Blocks until a task is available. `stop` is polled so a caller that is
+    // only draining the queue on behalf of one GraphTask can leave when that
+    // graph completes even if this queue stays idle.
+    template <typename StopFn>
+    std::optional<NodeTask> pop_until(const StopFn& stop) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        for (;;) {
+            if (!heap_.empty()) {
+                auto task = std::move(const_cast<NodeTask&>(heap_.top()));
+                heap_.pop();
+                return task;
             }
-        }
-        
-        while (!stack.empty()) {
-            Node* node = stack.back();
-            stack.pop_back();
-            
-            if (visited.count(node)) continue;
-            visited.insert(node);
-            
-            for (const auto& edge : node->next_edges()) {
-                 if (auto next_node = edge.function) {
-                     dependencies[next_node.get()]++;
-                     stack.push_back(next_node.get());
-                 }
-            }
-        }
-        
-        struct NodeState {
-            std::unordered_map<uint32_t, Tensor> input_grads;
-            int outstanding_deps = 0;
-        };
-        
-        std::unordered_map<Node*, NodeState> graph_state;
-        
-        for (auto& [node, dep] : dependencies) {
-            graph_state[node].outstanding_deps = dep;
-        }
-        
-        // 2. Initialize Queue
-        std::priority_queue<NodeTask> ready_queue;
-        std::unordered_set<Node*> in_queue;
-
-        // 3. Feed Roots
-        for (size_t i = 0; i < roots.size(); ++i) {
-            auto node_ptr = roots[i].function;
-            if (!node_ptr) continue;
-            
-            Node* node = node_ptr.get();
-            auto& state = graph_state[node];
-            uint32_t input_nr = roots[i].input_nr;
-            
-            // Accumulate root gradients
-            if (state.input_grads[input_nr].defined()) {
-                 // Use in-place accumulation to avoid deep copy/allocation overhead
-                 state.input_grads[input_nr] += inputs[i];
-            } else {
-                 state.input_grads[input_nr] = inputs[i];
-            }
-            
-            // Mark as autograd shared to enable optimizations (e.g. OneDNN cache sharing)
-            if (state.input_grads[input_nr].defined()) {
-                state.input_grads[input_nr].unsafeGetTensorImpl()->set_autograd_shared(true);
-            }
-            
-            if (state.outstanding_deps == 0) {
-                if (in_queue.find(node) == in_queue.end()) {
-                    ready_queue.push({node_ptr});
-                    in_queue.insert(node);
-                }
-            }
-        }
-
-        // 4. Execution Loop
-        while (!ready_queue.empty()) {
-            auto task = ready_queue.top();
-            ready_queue.pop();
-            Node* node = task.fn.get();
-            
-            auto& state = graph_state[node];
-            
-            // Construct input list
-            uint32_t max_idx = 0;
-            for(auto& kv : state.input_grads) {
-                if (kv.first > max_idx) max_idx = kv.first;
-            }
-            
-            variable_list grad_inputs;
-            if (!state.input_grads.empty()) {
-                grad_inputs.resize(max_idx + 1);
-                for(auto& kv : state.input_grads) {
-                    grad_inputs[kv.first] = kv.second;
-                }
-            }
-            
-            // Check if we should capture this node's input gradients instead of executing
-            if (capture_grads && capture_grads->count(node)) {
-                (*capture_grads)[node] = grad_inputs;
-                continue;
-            }
-
-            // Execute Node
-            variable_list grad_outputs = node->apply(std::move(grad_inputs));
-            
-            // Propagate to next edges
-            const auto& edges = node->next_edges();
-            
-            // If mismatch, we just iterate min length
-            for (size_t i = 0; i < edges.size(); ++i) {
-                if (i >= grad_outputs.size()) break;
-                
-                const auto& edge = edges[i];
-                const auto& grad = grad_outputs[i];
-                
-                if (!edge.is_valid()) continue;
-                if (!grad.defined()) continue;
-                
-                Node* next_node = edge.function.get();
-                auto& next_state = graph_state[next_node];
-                
-                // Accumulate
-                if (next_state.input_grads[edge.input_nr].defined()) {
-                    next_state.input_grads[edge.input_nr] = next_state.input_grads[edge.input_nr].add(grad);
-                } else {
-                    next_state.input_grads[edge.input_nr] = grad;
-                }
-                
-                next_state.outstanding_deps--;
-                if (next_state.outstanding_deps == 0) {
-                    if (in_queue.find(next_node) == in_queue.end()) {
-                        ready_queue.push({edge.function});
-                        in_queue.insert(next_node);
-                    }
-                }
-            }
-
-            // Cleanup graph if needed
-            if (!keep_graph) {
-                node->release_variables();
-            }
+            if (stop()) return std::nullopt;
+            // Short poll: the stop predicate turns true as soon as this
+            // thread's GraphTask completes on another queue.
+            cv_.wait_for(lock, std::chrono::milliseconds(5));
         }
     }
-    
-    void test_link();
+
+private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::priority_queue<NodeTask> heap_;
 };
 
-}
-}
+class TENSORPLAY_API Engine {
+private:
+public:
+    static Engine& get_default_engine();
+
+    ~Engine();
+
+    // Executes the graph rooted at `roots` with the given `inputs`.
+    // accumulate_grad == true corresponds to backward(), false to grad().
+    // Returns the captured gradients for `outputs` (empty for backward()).
+    variable_list execute(const edge_list& roots,
+                          const variable_list& inputs,
+                          bool keep_graph,
+                          bool create_graph,
+                          bool accumulate_grad,
+                          const edge_list& outputs);
+
+private:
+    Engine() = default;
+
+    void compute_dependencies(Node* root, GraphTask& task, uint64_t min_topo_nr);
+
+    // Evaluates one dequeued function and distributes its outputs. When
+    // `local_queue` is non-null the engine runs in nested (reentrant) mode:
+    // every follow-up task is routed there instead of device queues, which
+    // keeps reentrant backward deadlock-free.
+    void evaluate_function(GraphTask& task, Node* func, InputBuffer& inputs,
+                           ReadyQueue& cpu_queue, ReadyQueue* local_queue);
+
+    // Routes a follow-up task: CUDA devices get dedicated worker threads,
+    // everything else lands on the CPU queue processed by the initiator.
+    void enqueue_task(GraphTask& task, ReadyQueue::NodeTask&& node_task,
+                      ReadyQueue& cpu_queue, ReadyQueue* local_queue);
+
+    // Entry point shared by device workers and the initiating thread.
+    void execute_task(ReadyQueue::NodeTask&& task, ReadyQueue& cpu_queue, ReadyQueue* local_queue);
+
+    ReadyQueue* queue_for_device(int device_index);
+
+    void worker_main(ReadyQueue& queue);
+
+    std::mutex queues_mutex_;
+    // -1 -> CPU queue; >= 0 -> CUDA device index. Queues are leaked by design
+    // (the engine is a process-lifetime singleton; workers may outlive users).
+    std::unordered_map<int, ReadyQueue*> ready_queues_;
+    std::unordered_map<int, std::thread> device_threads_;
+
+    // Depth of nested execute() calls on this thread.
+    static thread_local int nested_depth_;
+};
+
+} // namespace tpx
+} // namespace tensorplay

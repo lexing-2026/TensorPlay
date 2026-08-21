@@ -5,9 +5,107 @@
 #include <vector>
 #include <numeric>
 #include <algorithm>
+#include <limits>
 
 namespace tensorplay {
 namespace cpu {
+
+namespace {
+
+Tensor view_as_real_impl(const Tensor& self) {
+    if (!self.defined()) {
+        TP_THROW(RuntimeError, "view_as_real: input must be defined");
+    }
+    if (!isComplexType(self.dtype())) {
+        TP_THROW(RuntimeError,
+                "view_as_real is only supported for complex tensors, but got " +
+                std::string(toString(self.dtype())));
+    }
+
+    std::vector<int64_t> sizes = static_cast<std::vector<int64_t>>(self.shape());
+    std::vector<int64_t> strides = self.strides();
+    for (auto& stride : strides) {
+        if (stride > std::numeric_limits<int64_t>::max() / 2) {
+            TP_THROW(RuntimeError, "view_as_real: stride overflow");
+        }
+        stride *= 2;
+    }
+    sizes.push_back(2);
+    strides.push_back(1);
+
+    const size_t offset = self.unsafeGetTensorImpl()->storage_offset();
+    if (offset > std::numeric_limits<size_t>::max() / 2) {
+        TP_THROW(RuntimeError, "view_as_real: storage offset overflow");
+    }
+    Tensor result(self.unsafeGetTensorImpl()->storage(), sizes, strides,
+                  toRealValueType(self.dtype()), offset * 2);
+    result.unsafeGetTensorImpl()->share_version_counter(
+        *self.unsafeGetTensorImpl());
+    return result;
+}
+
+Tensor view_as_complex_impl(const Tensor& self) {
+    if (!self.defined()) {
+        TP_THROW(RuntimeError, "view_as_complex: input must be defined");
+    }
+    if (self.dtype() != DType::Float16 && self.dtype() != DType::Float32 &&
+        self.dtype() != DType::Float64) {
+        TP_THROW(RuntimeError,
+                "view_as_complex is only supported for half, float and double "
+                "tensors, but got " + std::string(toString(self.dtype())));
+    }
+    if (self.dim() == 0 || self.size(self.dim() - 1) != 2) {
+        TP_THROW(RuntimeError,
+                "view_as_complex: input tensor must have a last dimension of size 2");
+    }
+    if (self.stride(self.dim() - 1) != 1) {
+        TP_THROW(RuntimeError,
+                "view_as_complex: last dimension must have stride 1");
+    }
+    for (int64_t dim = 0; dim + 1 < self.dim(); ++dim) {
+        if ((self.stride(dim) & 1) != 0) {
+            TP_THROW(RuntimeError,
+                    "view_as_complex: strides of all dimensions except the last "
+                    "must be divisible by 2");
+        }
+    }
+    const size_t offset = self.unsafeGetTensorImpl()->storage_offset();
+    if ((offset & 1) != 0) {
+        TP_THROW(RuntimeError,
+                "view_as_complex: storage offset must be divisible by 2");
+    }
+
+    std::vector<int64_t> sizes = static_cast<std::vector<int64_t>>(self.shape());
+    std::vector<int64_t> strides = self.strides();
+    sizes.pop_back();
+    strides.pop_back();
+    for (auto& stride : strides) {
+        stride /= 2;
+    }
+
+    Tensor result(self.unsafeGetTensorImpl()->storage(), sizes, strides,
+                  toComplexType(self.dtype()), offset / 2);
+    result.unsafeGetTensorImpl()->share_version_counter(
+        *self.unsafeGetTensorImpl());
+    return result;
+}
+
+Tensor view_as_real_cpu(const Tensor& self) {
+    return view_as_real_impl(self);
+}
+
+Tensor view_as_complex_cpu(const Tensor& self) {
+    return view_as_complex_impl(self);
+}
+
+bool is_complex_cpu(const Tensor& self) {
+    if (!self.defined()) {
+        TP_THROW(RuntimeError, "is_complex: input must be defined");
+    }
+    return isComplexType(self.dtype());
+}
+
+} // namespace
 
 Tensor transpose_kernel(const Tensor& self, int64_t dim0, int64_t dim1) {
     int64_t ndim = self.dim();
@@ -301,8 +399,106 @@ Tensor squeeze_backward_kernel(const Tensor& grad, const Tensor& self) {
     return grad.reshape(static_cast<std::vector<int64_t>>(self.shape()));
 }
 
+// ATen semantics: remove dim1/dim2 and append the diagonal axis at the end.
+Tensor diagonal_kernel(const Tensor& self, int64_t offset, int64_t dim1, int64_t dim2) {
+    const int64_t ndim = self.dim();
+    if (ndim < 2) TP_THROW(RuntimeError, "diagonal(): input must be at least 2-dimensional");
+    if (dim1 < 0) dim1 += ndim;
+    if (dim2 < 0) dim2 += ndim;
+    if (dim1 < 0 || dim1 >= ndim || dim2 < 0 || dim2 >= ndim) {
+        TP_THROW(IndexError, "Dimension out of range");
+    }
+    if (dim1 == dim2) TP_THROW(RuntimeError, "diagonal(): dim1 and dim2 cannot be equal");
+
+    const int64_t size1 = self.size(dim1);
+    const int64_t size2 = self.size(dim2);
+    const int64_t stride1 = self.stride(dim1);
+    const int64_t stride2 = self.stride(dim2);
+
+    std::vector<int64_t> sizes;
+    std::vector<int64_t> strides;
+    sizes.reserve(ndim - 1);
+    strides.reserve(ndim - 1);
+    for (int64_t i = 0; i < ndim; ++i) {
+        if (i != dim1 && i != dim2) {
+            sizes.push_back(self.size(i));
+            strides.push_back(self.stride(i));
+        }
+    }
+
+    int64_t diag_size;
+    int64_t new_offset = static_cast<int64_t>(self.unsafeGetTensorImpl()->storage_offset());
+    if (offset >= 0) {
+        diag_size = std::max<int64_t>(std::min(size1, size2 - offset), 0);
+        new_offset += offset * stride2;
+    } else {
+        diag_size = std::max<int64_t>(std::min(size1 + offset, size2), 0);
+        new_offset -= offset * stride1;
+    }
+    sizes.push_back(diag_size);
+    strides.push_back(stride1 + stride2);
+    return self.as_strided(sizes, strides, new_offset);
+}
+
+Tensor diagonal_backward_kernel(const Tensor& grad, const std::vector<int64_t>& input_sizes,
+                                int64_t offset, int64_t dim1, int64_t dim2) {
+    Tensor result = Tensor::zeros(input_sizes, grad.dtype(), grad.device());
+    Tensor diag_view = diagonal_kernel(result, offset, dim1, dim2);
+    if (diag_view.numel() != grad.numel()) {
+        TP_THROW(RuntimeError, "diagonal_backward: gradient shape mismatch");
+    }
+    diag_view.copy_(grad.reshape(static_cast<std::vector<int64_t>>(diag_view.shape())));
+    return result;
+}
+
+Tensor movedim_kernel(const Tensor& self, const std::vector<int64_t>& source,
+                      const std::vector<int64_t>& destination) {
+    const int64_t ndim = self.dim();
+    if (source.size() != destination.size()) {
+        TP_THROW(RuntimeError, "movedim: Source and destination dims must have same number of elements");
+    }
+    std::vector<int64_t> src(source), dst(destination);
+    std::vector<bool> src_seen(ndim, false), dst_seen(ndim, false);
+    for (auto& d : src) {
+        const int64_t orig = d;
+        if (d < 0) d += ndim;
+        if (d < 0 || d >= ndim) {
+            TP_THROW(IndexError, "movedim: Tried to move to index ", orig,
+                     ", but the tensor has ", ndim, " dimensions");
+        }
+        if (src_seen[d]) TP_THROW(RuntimeError, "movedim: repeated source dimension");
+        src_seen[d] = true;
+    }
+    for (auto& d : dst) {
+        const int64_t orig = d;
+        if (d < 0) d += ndim;
+        if (d < 0 || d >= ndim) {
+            TP_THROW(IndexError, "movedim: Tried to move to index ", orig,
+                     ", but the tensor has ", ndim, " dimensions");
+        }
+        if (dst_seen[d]) TP_THROW(RuntimeError, "movedim: repeated destination dimension");
+        dst_seen[d] = true;
+    }
+
+    // Destination slots take the moved dimensions in order; every other slot
+    // keeps its original dimension, preserving ascending input order.
+    std::vector<int64_t> permutation(ndim, -1);
+    for (size_t k = 0; k < src.size(); ++k) permutation[dst[k]] = src[k];
+    int64_t cursor = 0;
+    for (int64_t i = 0; i < ndim; ++i) {
+        if (!dst_seen[i]) {
+            while (src_seen[cursor]) ++cursor;
+            permutation[i] = cursor++;
+        }
+    }
+    return permute_kernel(self, permutation);
+}
+
 
 TENSORPLAY_LIBRARY_IMPL(CPU, ViewKernels) {
+    m.impl("view_as_real", view_as_real_cpu);
+    m.impl("view_as_complex", view_as_complex_cpu);
+    m.impl("is_complex", is_complex_cpu);
     m.impl("transpose", transpose_kernel);
     m.impl("t", t_kernel);
     m.impl("permute", permute_kernel);
@@ -311,6 +507,9 @@ TENSORPLAY_LIBRARY_IMPL(CPU, ViewKernels) {
     m.impl("squeeze_backward", squeeze_backward_kernel);
     m.impl("squeeze.dim", squeeze_dim_kernel);
     m.impl("unsqueeze", unsqueeze_kernel);
+    m.impl("diagonal", diagonal_kernel);
+    m.impl("diagonal_backward", diagonal_backward_kernel);
+    m.impl("movedim", movedim_kernel);
     m.impl("cat", cat_kernel);
     m.impl("stack", stack_kernel);
     m.impl("split", split_kernel);

@@ -1,4 +1,12 @@
 #include "Generator.h"
+#include "Device.h"
+
+#ifdef USE_CUDA
+namespace tensorplay { namespace cuda {
+void manual_seed(uint64_t seed);
+void manual_seed_all(uint64_t seed);
+} }
+#endif
 
 namespace tensorplay {
 
@@ -37,6 +45,12 @@ Generator& default_generator() {
 
 void manual_seed(uint64_t seed) {
     default_generator().manual_seed(seed);
+#ifdef USE_CUDA
+    // torch semantics: torch.manual_seed seeds every device RNG. The CUDA
+    // backend applies this lazily (never initializing CUDA) and skips it in
+    // bad-fork children.
+    tensorplay::cuda::manual_seed_all(seed);
+#endif
 }
 
 } // namespace tensorplay

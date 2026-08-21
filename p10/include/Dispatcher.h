@@ -1,8 +1,14 @@
 #pragma once
 
-#include <unordered_map>
-#include <string>
+#include <array>
+#include <atomic>
+#include <cstddef>
+#include <memory>
 #include <mutex>
+#include <string>
+#include <type_traits>
+#include <utility>
+#include <unordered_map>
 #include "DispatchKey.h"
 #include "Device.h"
 #include "Exception.h"
@@ -12,7 +18,7 @@
 
 namespace tensorplay {
 
-// Helper to determine dispatch key
+// Helper to determine the backend dispatch key for a device
 inline DispatchKey computeDispatchKey(const Device& device) {
     if (device.is_cuda()) return DispatchKey::CUDA;
     return DispatchKey::CPU;
@@ -20,6 +26,54 @@ inline DispatchKey computeDispatchKey(const Device& device) {
 
 // Generic kernel function pointer type (type-erased)
 using KernelFunction = void*;
+
+constexpr std::size_t kDispatchKeyCount =
+    static_cast<std::size_t>(DispatchKey::EndOfKeys);
+
+inline constexpr std::size_t dispatchKeyIndex(DispatchKey key) noexcept {
+    return static_cast<std::size_t>(key);
+}
+
+// A stable operator table.  Registration is serialized by Dispatcher, while
+// reads in the hot path are atomic and do not take the registry mutex.
+struct P10_API DispatchTable {
+    explicit DispatchTable(std::string name) : name(std::move(name)) {
+        for (auto& kernel : kernels) {
+            kernel.store(nullptr, std::memory_order_relaxed);
+        }
+    }
+
+    DispatchTable(const DispatchTable&) = delete;
+    DispatchTable& operator=(const DispatchTable&) = delete;
+
+    std::string name;
+    std::array<std::atomic<KernelFunction>, kDispatchKeyCount> kernels;
+};
+
+class P10_API OperatorHandle {
+public:
+    OperatorHandle() noexcept = default;
+
+    KernelFunction getKernel(DispatchKey key) const noexcept {
+        if (!table_ || dispatchKeyIndex(key) >= kDispatchKeyCount) {
+            return nullptr;
+        }
+        return table_->kernels[dispatchKeyIndex(key)].load(std::memory_order_acquire);
+    }
+
+    const char* name() const noexcept {
+        return table_ ? table_->name.c_str() : "<undefined>";
+    }
+
+    explicit operator bool() const noexcept { return table_ != nullptr; }
+
+private:
+    friend class Dispatcher;
+
+    explicit OperatorHandle(const DispatchTable* table) noexcept : table_(table) {}
+
+    const DispatchTable* table_ = nullptr;
+};
 
 class P10_API Dispatcher {
 public:
@@ -31,14 +85,17 @@ public:
     // Get the kernel for a specific operator and dispatch key
     KernelFunction getKernel(const std::string& op_name, DispatchKey key);
 
+    // Resolve an operator once and use the returned handle for subsequent
+    // calls.  The table is owned by the process-lifetime Dispatcher singleton.
+    OperatorHandle findHandle(const std::string& op_name);
+    OperatorHandle findHandle(const char* op_name) {
+        return findHandle(std::string(op_name));
+    }
+
 private:
     Dispatcher() = default;
-    
-    struct OpDispatchTable {
-        std::unordered_map<DispatchKey, KernelFunction> kernels;
-    };
 
-    std::unordered_map<std::string, OpDispatchTable> operators_;
+    std::unordered_map<std::string, std::unique_ptr<DispatchTable>> operators_;
     std::mutex mutex_;
 };
 
@@ -46,15 +103,25 @@ private:
 template<typename Return, typename... Args>
 class DispatchStub {
 public:
-    static Return call(const std::string& op_name, DispatchKey key, Args... args) {
-        auto kernel_void = Dispatcher::singleton().getKernel(op_name, key);
+    static Return call(const OperatorHandle& handle, DispatchKey key, Args... args) {
+        auto kernel_void = handle.getKernel(key);
         if (!kernel_void) {
-            TP_THROW(NotImplementedError, "Kernel not found for op: " + op_name + " on backend: " + toString(key));
+            TP_THROW(NotImplementedError, "Kernel not found for op: " +
+                std::string(handle.name()) + " on backend: " + toString(key));
         }
-        
+
         using FuncType = Return(*)(Args...);
         auto kernel = reinterpret_cast<FuncType>(kernel_void);
-        return kernel(std::forward<Args>(args)...);
+        if constexpr (std::is_void_v<Return>) {
+            kernel(std::forward<Args>(args)...);
+        } else {
+            return kernel(std::forward<Args>(args)...);
+        }
+    }
+
+    static Return call(const std::string& op_name, DispatchKey key, Args... args) {
+        return call(Dispatcher::singleton().findHandle(op_name), key,
+                    std::forward<Args>(args)...);
     }
 };
 

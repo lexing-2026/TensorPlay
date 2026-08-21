@@ -22,6 +22,13 @@ struct P10_API StorageImpl {
             data_ptr = allocator->allocate(nbytes);
         }
     }
+
+    StorageImpl(size_t size, Allocator* allocator, const Device& device, bool resizable = true)
+        : nbytes(size), allocator(allocator), resizable(resizable) {
+        if (allocator) {
+            data_ptr = allocator->allocate(nbytes, device);
+        }
+    }
     
     StorageImpl(DataPtr&& ptr, size_t size, Allocator* alloc, bool resizable = false)
         : data_ptr(std::move(ptr)), nbytes(size), allocator(alloc), resizable(resizable) {}
@@ -40,11 +47,12 @@ struct P10_API StorageImpl {
             TP_THROW(RuntimeError, "Storage is not resizable");
         }
         
-        DataPtr new_data = allocator->allocate(new_nbytes);
+        DataPtr new_data = allocator->allocate(new_nbytes, data_ptr.device_);
         
         size_t copy_size = std::min(nbytes, new_nbytes);
         if (data_ptr.get() && new_data.get()) {
-            std::memcpy(new_data.get(), data_ptr.get(), copy_size);
+            copyAllocationBytes(new_data.get(), new_data.device_,
+                                data_ptr.get(), data_ptr.device_, copy_size);
         }
         
         data_ptr = std::move(new_data);

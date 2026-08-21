@@ -22,7 +22,8 @@ TensorImpl::TensorImpl(const std::vector<int64_t>& sizes, DType dtype, const Dev
     if (num_elements > 0) {
         size_t total_bytes = static_cast<size_t>(num_elements) * elementSize(dtype);
         Allocator* allocator = getAllocator(device.type());
-        shared_state_->storage = Storage(total_bytes, allocator);
+        shared_state_->storage = Storage(total_bytes, allocator, device);
+        device_ = shared_state_->storage.device();
     }
 }
 
@@ -37,7 +38,8 @@ TensorImpl::TensorImpl(const std::vector<int64_t>& sizes, const std::vector<int6
     if (num_elements > 0) {
         size_t total_bytes = static_cast<size_t>(num_elements) * elementSize(dtype);
         Allocator* allocator = getAllocator(device.type());
-        shared_state_->storage = Storage(total_bytes, allocator);
+        shared_state_->storage = Storage(total_bytes, allocator, device);
+        device_ = shared_state_->storage.device();
     }
 }
 
@@ -59,7 +61,17 @@ TensorImpl::TensorImpl(Storage storage, const std::vector<int64_t>& sizes, const
     is_contiguous_ = sizes_and_strides_.is_contiguous();
 }
 
-TensorImpl::TensorImpl(const TensorImpl& other) = default;
+// Copy does not carry autograd metadata: copies start fresh, matching
+// PyTorch (autograd metadata is attached by the autograd layer, never copied).
+TensorImpl::TensorImpl(const TensorImpl& other)
+    : storage_offset_(other.storage_offset_),
+      sizes_and_strides_(other.sizes_and_strides_),
+      dtype_(other.dtype_),
+      device_(other.device_),
+      version_counter_(other.version_counter_),
+      is_contiguous_(other.is_contiguous_),
+      is_channels_last_(other.is_channels_last_),
+      shared_state_(other.shared_state_) {}
 TensorImpl::TensorImpl(TensorImpl&& other) noexcept = default;
 TensorImpl& TensorImpl::operator=(const TensorImpl& other) = default;
 TensorImpl& TensorImpl::operator=(TensorImpl&& other) noexcept = default;

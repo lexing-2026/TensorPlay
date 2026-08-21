@@ -1,5 +1,6 @@
 #include "Tensor.h"
 #include "Dispatcher.h"
+#include "CUDARuntime.h"
 #include "Exception.h"
 #include "CUDAContext.h"
 #include <cuda_runtime.h>
@@ -77,7 +78,7 @@ std::tuple<Tensor, Tensor> nll_loss_cuda(const Tensor& input, const Tensor& targ
         int threads = 256;
         int blocks = (N + threads - 1) / threads;
         if (input.dtype() == DType::Float32) {
-            nll_loss_forward_kernel<float, int64_t><<<blocks, threads>>>(
+            nll_loss_forward_kernel<float, int64_t><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
                 N, C, input.data_ptr<float>(), target.data_ptr<int64_t>(),
                 weight.defined() ? weight.data_ptr<float>() : nullptr,
                 losses.data_ptr<float>(), ignore_index);
@@ -93,7 +94,7 @@ std::tuple<Tensor, Tensor> nll_loss_cuda(const Tensor& input, const Tensor& targ
         int blocks = (N + threads - 1) / threads;
         
         if (input.dtype() == DType::Float32) {
-            nll_loss_atomic_kernel<float><<<blocks, threads>>>(
+            nll_loss_atomic_kernel<float><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
                 N, C, input.data_ptr<float>(), target.data_ptr<int64_t>(),
                 weight.defined() ? weight.data_ptr<float>() : nullptr,
                 result.data_ptr<float>(),
@@ -105,7 +106,7 @@ std::tuple<Tensor, Tensor> nll_loss_cuda(const Tensor& input, const Tensor& targ
         
         if (reduction == 1) { // Mean
             if (input.dtype() == DType::Float32) {
-                div_ptrs_kernel<float><<<1, 1>>>(result.data_ptr<float>(), total_weight.data_ptr<float>());
+                div_ptrs_kernel<float><<<1, 1, 0, getCurrentCUDAStream().stream()>>>(result.data_ptr<float>(), total_weight.data_ptr<float>());
             }
         }
         
@@ -152,7 +153,7 @@ Tensor nll_loss_backward_cuda(const Tensor& grad_output, const Tensor& input, co
     int blocks = (N + threads - 1) / threads;
     
     if (input.dtype() == DType::Float32) {
-        nll_loss_backward_kernel<float, int64_t><<<blocks, threads>>>(
+        nll_loss_backward_kernel<float, int64_t><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
             N, C,
             grad_output.data_ptr<float>(),
             target.data_ptr<int64_t>(),
@@ -201,7 +202,7 @@ Tensor mse_loss_backward_cuda(const Tensor& grad_output, const Tensor& input, co
     int blocks = (n + threads - 1) / threads;
     
     if (input.dtype() == DType::Float32) {
-        mse_loss_backward_kernel_cuda_impl<float><<<blocks, threads>>>(
+        mse_loss_backward_kernel_cuda_impl<float><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
             n,
             grad_output.data_ptr<float>(),
             input.data_ptr<float>(),

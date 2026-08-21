@@ -4,6 +4,7 @@
 #include "TypePromotion.h"
 #include "Utils.h"
 #include "Exception.h"
+#include "Parallel.h"
 #include "OneDNNContext.h"
 #include "Allocator.h"
 #include <iostream>
@@ -29,6 +30,12 @@
 
 namespace tensorplay {
 namespace cpu {
+using namespace tensorplay::parallel;
+
+// Forward declarations for the scalar fallback used by the fused kernel.
+Tensor add_scalar_kernel(const Tensor& self, Scalar other, Scalar alpha);
+Tensor mul_scalar_kernel(const Tensor& self, Scalar other);
+Tensor& relu_inplace_kernel(Tensor& self);
 
 // --- Helper for Binary Ops ---
 
@@ -133,7 +140,9 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
                  }
 
                  DType result_dtype = promoteTypes(self.dtype(), other.dtype());
-                 if (alpha.isFloatingPoint()) result_dtype = promoteTypes(result_dtype, DType::Float32);
+                 if (alpha.isFloatingPoint() && !isFloatingType(result_dtype)) {
+                     result_dtype = promoteTypes(result_dtype, DType::Float32);
+                 }
                  Tensor result = Tensor::empty(out_shape, result_dtype, self.device());
 
                  size_t req_size = md->get_size();
@@ -153,87 +162,81 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
                  // Reuse AVX logic
                  #if defined(__AVX512F__)
                  if (std::abs(alpha_val - 1.0f) < 1e-6) {
-                      #ifdef _OPENMP
-                      #pragma omp parallel for
-                      #endif
-                      for (int64_t i = 0; i < n; i += 16) {
-                          if (i + 16 <= n) {
+                      parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                      for (int64_t i = begin; i < end; i += 16) {
+                          if (i + 16 <= end) {
                               __m512 a = _mm512_loadu_ps(s_ptr + i);
                               __m512 b = _mm512_loadu_ps(o_ptr + i);
                               _mm512_storeu_ps(r_ptr + i, _mm512_add_ps(a, b));
                           } else {
-                              for (int64_t j = i; j < n; ++j) r_ptr[j] = s_ptr[j] + o_ptr[j];
+                              for (int64_t j = i; j < end; ++j) r_ptr[j] = s_ptr[j] + o_ptr[j];
                           }
                       }
+                      });
                  } else if (std::abs(alpha_val + 1.0f) < 1e-6) {
-                      #ifdef _OPENMP
-                      #pragma omp parallel for
-                      #endif
-                      for (int64_t i = 0; i < n; i += 16) {
-                          if (i + 16 <= n) {
+                      parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                      for (int64_t i = begin; i < end; i += 16) {
+                          if (i + 16 <= end) {
                               __m512 a = _mm512_loadu_ps(s_ptr + i);
                               __m512 b = _mm512_loadu_ps(o_ptr + i);
                               _mm512_storeu_ps(r_ptr + i, _mm512_sub_ps(a, b));
                           } else {
-                              for (int64_t j = i; j < n; ++j) r_ptr[j] = s_ptr[j] - o_ptr[j];
+                              for (int64_t j = i; j < end; ++j) r_ptr[j] = s_ptr[j] - o_ptr[j];
                           }
                       }
+                      });
                  } else {
                       __m512 valpha = _mm512_set1_ps(alpha_val);
-                      #ifdef _OPENMP
-                      #pragma omp parallel for
-                      #endif
-                      for (int64_t i = 0; i < n; i += 16) {
-                          if (i + 16 <= n) {
+                      parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                      for (int64_t i = begin; i < end; i += 16) {
+                          if (i + 16 <= end) {
                               __m512 a = _mm512_loadu_ps(s_ptr + i);
                               __m512 b = _mm512_loadu_ps(o_ptr + i);
                               _mm512_storeu_ps(r_ptr + i, _mm512_fmadd_ps(valpha, b, a));
                           } else {
-                              for (int64_t j = i; j < n; ++j) r_ptr[j] = s_ptr[j] + alpha_val * o_ptr[j];
+                              for (int64_t j = i; j < end; ++j) r_ptr[j] = s_ptr[j] + alpha_val * o_ptr[j];
                           }
                       }
+                      });
                  }
                  #elif defined(__AVX2__)
                  if (std::abs(alpha_val - 1.0f) < 1e-6) {
-                      #ifdef _OPENMP
-                      #pragma omp parallel for
-                      #endif
-                      for (int64_t i = 0; i < n; i += 8) {
-                          if (i + 8 <= n) {
+                      parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                      for (int64_t i = begin; i < end; i += 8) {
+                          if (i + 8 <= end) {
                               __m256 a = _mm256_loadu_ps(s_ptr + i);
                               __m256 b = _mm256_loadu_ps(o_ptr + i);
                               _mm256_storeu_ps(r_ptr + i, _mm256_add_ps(a, b));
                           } else {
-                              for (int64_t j = i; j < n; ++j) r_ptr[j] = s_ptr[j] + o_ptr[j];
+                              for (int64_t j = i; j < end; ++j) r_ptr[j] = s_ptr[j] + o_ptr[j];
                           }
                       }
+                      });
                  } else if (std::abs(alpha_val + 1.0f) < 1e-6) {
-                      #ifdef _OPENMP
-                      #pragma omp parallel for
-                      #endif
-                      for (int64_t i = 0; i < n; i += 8) {
-                          if (i + 8 <= n) {
+                      parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                      for (int64_t i = begin; i < end; i += 8) {
+                          if (i + 8 <= end) {
                               __m256 a = _mm256_loadu_ps(s_ptr + i);
                               __m256 b = _mm256_loadu_ps(o_ptr + i);
                               _mm256_storeu_ps(r_ptr + i, _mm256_sub_ps(a, b));
                           } else {
-                              for (int64_t j = i; j < n; ++j) r_ptr[j] = s_ptr[j] - o_ptr[j];
+                              for (int64_t j = i; j < end; ++j) r_ptr[j] = s_ptr[j] - o_ptr[j];
                           }
                       }
+                      });
                  } else {
                       __m256 valpha = _mm256_set1_ps(alpha_val);
-                      #ifdef _OPENMP
-                      #pragma omp parallel for
-                      #endif
-                      for (int64_t i = 0; i < n; i += 8) {
-                          if (i + 8 <= n) {
+                      parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                      for (int64_t i = begin; i < end; i += 8) {
+                          if (i + 8 <= end) {
                               __m256 a = _mm256_loadu_ps(s_ptr + i);
                               __m256 b = _mm256_loadu_ps(o_ptr + i);
                               _mm256_storeu_ps(r_ptr + i, _mm256_add_ps(a, _mm256_mul_ps(valpha, b)));
                           } else {
-                              for (int64_t j = i; j < n; ++j) r_ptr[j] = s_ptr[j] + alpha_val * o_ptr[j];
+                              for (int64_t j = i; j < end; ++j) r_ptr[j] = s_ptr[j] + alpha_val * o_ptr[j];
                           }
                       }
+                      });
                  }
                  #else
                  for(int64_t i=0; i<n; ++i) r_ptr[i] = s_ptr[i] + alpha_val * o_ptr[i];
@@ -276,7 +279,7 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
 
     std::vector<int64_t> out_shape = broadcast_shapes(static_cast<std::vector<int64_t>>(self.shape()), static_cast<std::vector<int64_t>>(other.shape()));
     DType result_dtype = promoteTypes(self.dtype(), other.dtype());
-    if (alpha.isFloatingPoint()) {
+    if (alpha.isFloatingPoint() && !isFloatingType(result_dtype)) {
         result_dtype = promoteTypes(result_dtype, DType::Float32);
     }
     Tensor result = Tensor::empty(out_shape, result_dtype, self.device());
@@ -302,38 +305,18 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
         
         #ifdef USE_MKL
         if (std::abs(alpha_val - 1.0f) < 1e-6) {
-            #ifdef _OPENMP
-            #pragma omp parallel
-            {
-                int64_t num_threads = omp_get_num_threads();
-                int64_t tid = omp_get_thread_num();
-                int64_t chunk_size = (n + num_threads - 1) / num_threads;
-                int64_t start = tid * chunk_size;
-                int64_t end = std::min(start + chunk_size, n);
-                if (start < end) {
-                    vsAdd(end - start, s_ptr + start, o_ptr + start, r_ptr + start);
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                if (begin < end) {
+                    vsAdd(end - begin, s_ptr + begin, o_ptr + begin, r_ptr + begin);
                 }
-            }
-            #else
-            vsAdd((int)n, s_ptr, o_ptr, r_ptr);
-            #endif
+            });
             optimized = true;
         } else if (std::abs(alpha_val + 1.0f) < 1e-6) {
-            #ifdef _OPENMP
-            #pragma omp parallel
-            {
-                int64_t num_threads = omp_get_num_threads();
-                int64_t tid = omp_get_thread_num();
-                int64_t chunk_size = (n + num_threads - 1) / num_threads;
-                int64_t start = tid * chunk_size;
-                int64_t end = std::min(start + chunk_size, n);
-                if (start < end) {
-                    vsSub(end - start, s_ptr + start, o_ptr + start, r_ptr + start);
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                if (begin < end) {
+                    vsSub(end - begin, s_ptr + begin, o_ptr + begin, r_ptr + begin);
                 }
-            }
-            #else
-            vsSub((int)n, s_ptr, o_ptr, r_ptr);
-            #endif
+            });
             optimized = true;
         }
         #endif
@@ -341,111 +324,102 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
         if (!optimized) {
             #if defined(__AVX512F__)
             if (std::abs(alpha_val - 1.0f) < 1e-6) {
-                 #ifdef _OPENMP
-                 #pragma omp parallel for
-                 #endif
-                 for (int64_t i = 0; i < n; i += 16) {
-                     if (i + 16 <= n) {
+                 parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                 for (int64_t i = begin; i < end; i += 16) {
+                     if (i + 16 <= end) {
                          __m512 a = _mm512_loadu_ps(s_ptr + i);
                          __m512 b = _mm512_loadu_ps(o_ptr + i);
                          _mm512_storeu_ps(r_ptr + i, _mm512_add_ps(a, b));
                      } else {
-                         for (int64_t j = i; j < n; ++j) r_ptr[j] = s_ptr[j] + o_ptr[j];
+                         for (int64_t j = i; j < end; ++j) r_ptr[j] = s_ptr[j] + o_ptr[j];
                      }
                  }
+                 });
             } else if (std::abs(alpha_val + 1.0f) < 1e-6) {
-                 #ifdef _OPENMP
-                 #pragma omp parallel for
-                 #endif
-                 for (int64_t i = 0; i < n; i += 16) {
-                     if (i + 16 <= n) {
+                 parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                 for (int64_t i = begin; i < end; i += 16) {
+                     if (i + 16 <= end) {
                          __m512 a = _mm512_loadu_ps(s_ptr + i);
                          __m512 b = _mm512_loadu_ps(o_ptr + i);
                          _mm512_storeu_ps(r_ptr + i, _mm512_sub_ps(a, b));
                      } else {
-                         for (int64_t j = i; j < n; ++j) r_ptr[j] = s_ptr[j] - o_ptr[j];
+                         for (int64_t j = i; j < end; ++j) r_ptr[j] = s_ptr[j] - o_ptr[j];
                      }
                  }
+                 });
             } else {
                  __m512 valpha = _mm512_set1_ps(alpha_val);
-                 #ifdef _OPENMP
-                 #pragma omp parallel for
-                 #endif
-                 for (int64_t i = 0; i < n; i += 16) {
-                     if (i + 16 <= n) {
+                 parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                 for (int64_t i = begin; i < end; i += 16) {
+                     if (i + 16 <= end) {
                          __m512 a = _mm512_loadu_ps(s_ptr + i);
                          __m512 b = _mm512_loadu_ps(o_ptr + i);
                          _mm512_storeu_ps(r_ptr + i, _mm512_fmadd_ps(valpha, b, a));
                      } else {
-                         for (int64_t j = i; j < n; ++j) r_ptr[j] = s_ptr[j] + alpha_val * o_ptr[j];
+                         for (int64_t j = i; j < end; ++j) r_ptr[j] = s_ptr[j] + alpha_val * o_ptr[j];
                      }
                  }
+                 });
             }
             #elif defined(__AVX2__)
             if (std::abs(alpha_val - 1.0f) < 1e-6) {
-                 #ifdef _OPENMP
-                 #pragma omp parallel for
-                 #endif
-                 for (int64_t i = 0; i < n; i += 8) {
-                     if (i + 8 <= n) {
+                 parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                 for (int64_t i = begin; i < end; i += 8) {
+                     if (i + 8 <= end) {
                          __m256 a = _mm256_loadu_ps(s_ptr + i);
                          __m256 b = _mm256_loadu_ps(o_ptr + i);
                          _mm256_storeu_ps(r_ptr + i, _mm256_add_ps(a, b));
                      } else {
-                         for (int64_t j = i; j < n; ++j) r_ptr[j] = s_ptr[j] + o_ptr[j];
+                         for (int64_t j = i; j < end; ++j) r_ptr[j] = s_ptr[j] + o_ptr[j];
                      }
                  }
+                 });
             } else if (std::abs(alpha_val + 1.0f) < 1e-6) {
-                 #ifdef _OPENMP
-                 #pragma omp parallel for
-                 #endif
-                 for (int64_t i = 0; i < n; i += 8) {
-                     if (i + 8 <= n) {
+                 parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                 for (int64_t i = begin; i < end; i += 8) {
+                     if (i + 8 <= end) {
                          __m256 a = _mm256_loadu_ps(s_ptr + i);
                          __m256 b = _mm256_loadu_ps(o_ptr + i);
                          _mm256_storeu_ps(r_ptr + i, _mm256_sub_ps(a, b));
                      } else {
-                         for (int64_t j = i; j < n; ++j) r_ptr[j] = s_ptr[j] - o_ptr[j];
+                         for (int64_t j = i; j < end; ++j) r_ptr[j] = s_ptr[j] - o_ptr[j];
                      }
                  }
+                 });
             } else {
                  __m256 valpha = _mm256_set1_ps(alpha_val);
-                 #ifdef _OPENMP
-                 #pragma omp parallel for
-                 #endif
-                 for (int64_t i = 0; i < n; i += 8) {
-                     if (i + 8 <= n) {
+                 parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                 for (int64_t i = begin; i < end; i += 8) {
+                     if (i + 8 <= end) {
                          __m256 a = _mm256_loadu_ps(s_ptr + i);
                          __m256 b = _mm256_loadu_ps(o_ptr + i);
                          // Use mul+add instead of fmadd to be safe with AVX2 but no FMA3
                          _mm256_storeu_ps(r_ptr + i, _mm256_add_ps(a, _mm256_mul_ps(valpha, b)));
                      } else {
-                         for (int64_t j = i; j < n; ++j) r_ptr[j] = s_ptr[j] + alpha_val * o_ptr[j];
+                         for (int64_t j = i; j < end; ++j) r_ptr[j] = s_ptr[j] + alpha_val * o_ptr[j];
                      }
                  }
+                 });
             }
             #else
             if (std::abs(alpha_val - 1.0f) < 1e-6) {
-                 #ifdef _OPENMP
-                 #pragma omp parallel for
-                 #endif
-                 for (int64_t i = 0; i < n; ++i) {
+                 parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                 for (int64_t i = begin; i < end; ++i) {
                      r_ptr[i] = s_ptr[i] + o_ptr[i];
                  }
+                 });
              } else if (std::abs(alpha_val + 1.0f) < 1e-6) {
-                 #ifdef _OPENMP
-                 #pragma omp parallel for
-                 #endif
-                 for (int64_t i = 0; i < n; ++i) {
+                 parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                 for (int64_t i = begin; i < end; ++i) {
                      r_ptr[i] = s_ptr[i] - o_ptr[i];
                  }
+                 });
              } else {
-                 #ifdef _OPENMP
-                 #pragma omp parallel for
-                 #endif
-                 for (int64_t i = 0; i < n; ++i) {
+                 parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                 for (int64_t i = begin; i < end; ++i) {
                      r_ptr[i] = s_ptr[i] + alpha_val * o_ptr[i];
                  }
+                 });
              }
             #endif
             optimized = true;
@@ -485,6 +459,55 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
         #undef OP_CASE
     }
     return result;
+}
+
+Tensor add_relu_same_shape(const Tensor& self, const Tensor& other) {
+    Tensor result = Tensor::empty(
+        static_cast<std::vector<int64_t>>(self.shape()), DType::Float32, self.device());
+    const int64_t n = self.numel();
+    const float* self_ptr = self.data_ptr<float>();
+    const float* other_ptr = other.data_ptr<float>();
+    float* result_ptr = result.data_ptr<float>();
+
+    parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        int64_t i = begin;
+#if defined(__AVX512F__)
+        const __m512 zero = _mm512_setzero_ps();
+        for (; i + 16 <= end; i += 16) {
+            const __m512 sum = _mm512_add_ps(
+                _mm512_loadu_ps(self_ptr + i), _mm512_loadu_ps(other_ptr + i));
+            _mm512_storeu_ps(result_ptr + i, _mm512_max_ps(zero, sum));
+        }
+#elif defined(__AVX2__)
+        const __m256 zero = _mm256_setzero_ps();
+        for (; i + 8 <= end; i += 8) {
+            const __m256 sum = _mm256_add_ps(
+                _mm256_loadu_ps(self_ptr + i), _mm256_loadu_ps(other_ptr + i));
+            _mm256_storeu_ps(result_ptr + i, _mm256_max_ps(zero, sum));
+        }
+#endif
+        for (; i < end; ++i) {
+            result_ptr[i] = std::max(0.0f, self_ptr[i] + other_ptr[i]);
+        }
+    });
+    return result;
+}
+
+Tensor add_relu_cpu(const Tensor& self, const Tensor& other) {
+    bool plain_layout = true;
+#ifdef USE_ONEDNN
+    plain_layout =
+        !self.unsafeGetTensorImpl()->has_onednn_md() &&
+        !other.unsafeGetTensorImpl()->has_onednn_md();
+#endif
+    if (self.dtype() == DType::Float32 && other.dtype() == DType::Float32 &&
+        self.shape() == other.shape() && self.is_contiguous() &&
+        other.is_contiguous() && plain_layout) {
+        return add_relu_same_shape(self, other);
+    }
+
+    Tensor result = add_kernel(self, other, Scalar(1));
+    return relu_inplace_kernel(result);
 }
 
 Tensor sub_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
@@ -534,31 +557,29 @@ Tensor mul_kernel(const Tensor& self, const Tensor& other) {
                  const float* o_ptr = other.data_ptr<float>();
 
                  #if defined(__AVX512F__)
-                 #ifdef _OPENMP
-                 #pragma omp parallel for
-                 #endif
-                 for (int64_t i = 0; i < n; i += 16) {
-                     if (i + 16 <= n) {
+                 parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                 for (int64_t i = begin; i < end; i += 16) {
+                     if (i + 16 <= end) {
                          __m512 a = _mm512_loadu_ps(s_ptr + i);
                          __m512 b = _mm512_loadu_ps(o_ptr + i);
                          _mm512_storeu_ps(r_ptr + i, _mm512_mul_ps(a, b));
                      } else {
-                         for (int64_t j = i; j < n; ++j) r_ptr[j] = s_ptr[j] * o_ptr[j];
+                         for (int64_t j = i; j < end; ++j) r_ptr[j] = s_ptr[j] * o_ptr[j];
                      }
                  }
+                 });
                  #elif defined(__AVX2__)
-                 #ifdef _OPENMP
-                 #pragma omp parallel for
-                 #endif
-                 for (int64_t i = 0; i < n; i += 8) {
-                     if (i + 8 <= n) {
+                 parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                 for (int64_t i = begin; i < end; i += 8) {
+                     if (i + 8 <= end) {
                          __m256 a = _mm256_loadu_ps(s_ptr + i);
                          __m256 b = _mm256_loadu_ps(o_ptr + i);
                          _mm256_storeu_ps(r_ptr + i, _mm256_mul_ps(a, b));
                      } else {
-                         for (int64_t j = i; j < n; ++j) r_ptr[j] = s_ptr[j] * o_ptr[j];
+                         for (int64_t j = i; j < end; ++j) r_ptr[j] = s_ptr[j] * o_ptr[j];
                      }
                  }
+                 });
                  #else
                  for(int64_t i=0; i<n; ++i) r_ptr[i] = s_ptr[i] * o_ptr[i];
                  #endif
@@ -642,31 +663,29 @@ Tensor div_kernel(const Tensor& self, const Tensor& other) {
                  const float* o_ptr = other.data_ptr<float>();
 
                  #if defined(__AVX512F__)
-                 #ifdef _OPENMP
-                 #pragma omp parallel for
-                 #endif
-                 for (int64_t i = 0; i < n; i += 16) {
-                     if (i + 16 <= n) {
+                 parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                 for (int64_t i = begin; i < end; i += 16) {
+                     if (i + 16 <= end) {
                          __m512 a = _mm512_loadu_ps(s_ptr + i);
                          __m512 b = _mm512_loadu_ps(o_ptr + i);
                          _mm512_storeu_ps(r_ptr + i, _mm512_div_ps(a, b));
                      } else {
-                         for (int64_t j = i; j < n; ++j) r_ptr[j] = s_ptr[j] / o_ptr[j];
+                         for (int64_t j = i; j < end; ++j) r_ptr[j] = s_ptr[j] / o_ptr[j];
                      }
                  }
+                 });
                  #elif defined(__AVX2__)
-                 #ifdef _OPENMP
-                 #pragma omp parallel for
-                 #endif
-                 for (int64_t i = 0; i < n; i += 8) {
-                     if (i + 8 <= n) {
+                 parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                 for (int64_t i = begin; i < end; i += 8) {
+                     if (i + 8 <= end) {
                          __m256 a = _mm256_loadu_ps(s_ptr + i);
                          __m256 b = _mm256_loadu_ps(o_ptr + i);
                          _mm256_storeu_ps(r_ptr + i, _mm256_div_ps(a, b));
                      } else {
-                         for (int64_t j = i; j < n; ++j) r_ptr[j] = s_ptr[j] / o_ptr[j];
+                         for (int64_t j = i; j < end; ++j) r_ptr[j] = s_ptr[j] / o_ptr[j];
                      }
                  }
+                 });
                  #else
                  for(int64_t i=0; i<n; ++i) r_ptr[i] = s_ptr[i] / o_ptr[i];
                  #endif
@@ -715,6 +734,55 @@ Tensor div_kernel(const Tensor& self, const Tensor& other) {
         #endif
     };
     return binary_op_kernel_impl(self, other, op, mkl_op, true, true);
+}
+
+// Stax pointwise fusion primitive.  Keep the generic path on the existing
+// p10 kernels so broadcasting, promotion, layouts, and future devices retain
+// their established semantics.  The contiguous float32 path is the hot path
+// emitted by the Stax scheduler and performs one allocation and one parallel
+// pass for mul+add.
+Tensor fused_mul_add_kernel(const Tensor& self, const Tensor& other, const Tensor& addend) {
+    if (self.device() == other.device() && self.device() == addend.device() &&
+        self.dtype() == DType::Float32 && other.dtype() == DType::Float32 &&
+        addend.dtype() == DType::Float32 && self.is_contiguous() &&
+        other.is_contiguous() && addend.is_contiguous() &&
+        self.shape() == other.shape() && self.shape() == addend.shape()) {
+        Tensor result = Tensor::empty(
+            static_cast<std::vector<int64_t>>(self.shape()), DType::Float32, self.device());
+        const float* self_ptr = self.data_ptr<float>();
+        const float* other_ptr = other.data_ptr<float>();
+        const float* addend_ptr = addend.data_ptr<float>();
+        float* result_ptr = result.data_ptr<float>();
+        const int64_t n = self.numel();
+        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+            for (int64_t i = begin; i < end; ++i) {
+                result_ptr[i] = self_ptr[i] * other_ptr[i] + addend_ptr[i];
+            }
+        });
+        return result;
+    }
+
+    return add_kernel(mul_kernel(self, other), addend, Scalar(1));
+}
+
+Tensor fused_mul_add_scalar_kernel(const Tensor& self, Scalar other, Scalar addend) {
+    if (self.dtype() == DType::Float32 && self.is_contiguous()) {
+        Tensor result = Tensor::empty(
+            static_cast<std::vector<int64_t>>(self.shape()), DType::Float32, self.device());
+        const float* self_ptr = self.data_ptr<float>();
+        float* result_ptr = result.data_ptr<float>();
+        const float mul_value = static_cast<float>(other.toDouble());
+        const float add_value = static_cast<float>(addend.toDouble());
+        const int64_t n = self.numel();
+        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+            for (int64_t i = begin; i < end; ++i) {
+                result_ptr[i] = self_ptr[i] * mul_value + add_value;
+            }
+        });
+        return result;
+    }
+
+    return add_scalar_kernel(mul_scalar_kernel(self, other), addend, Scalar(1));
 }
 
 // --- Inplace Binary Kernels ---
@@ -832,87 +900,81 @@ Tensor& add_inplace_kernel(Tensor& self, const Tensor& other, Scalar alpha) {
              
              #if defined(__AVX512F__)
              if (std::abs(alpha_val - 1.0f) < 1e-6) {
-                 #ifdef _OPENMP
-                 #pragma omp parallel for
-                 #endif
-                 for (int64_t i = 0; i < n; i += 16) {
-                     if (i + 16 <= n) {
+                 parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                 for (int64_t i = begin; i < end; i += 16) {
+                     if (i + 16 <= end) {
                          __m512 a = _mm512_loadu_ps(s_ptr + i);
                          __m512 b = _mm512_loadu_ps(o_ptr + i);
                          _mm512_storeu_ps(s_ptr + i, _mm512_add_ps(a, b));
                      } else {
-                         for (int64_t j = i; j < n; ++j) s_ptr[j] += o_ptr[j];
+                         for (int64_t j = i; j < end; ++j) s_ptr[j] += o_ptr[j];
                      }
                  }
+                 });
              } else if (std::abs(alpha_val + 1.0f) < 1e-6) {
-                 #ifdef _OPENMP
-                 #pragma omp parallel for
-                 #endif
-                 for (int64_t i = 0; i < n; i += 16) {
-                     if (i + 16 <= n) {
+                 parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                 for (int64_t i = begin; i < end; i += 16) {
+                     if (i + 16 <= end) {
                          __m512 a = _mm512_loadu_ps(s_ptr + i);
                          __m512 b = _mm512_loadu_ps(o_ptr + i);
                          _mm512_storeu_ps(s_ptr + i, _mm512_sub_ps(a, b));
                      } else {
-                         for (int64_t j = i; j < n; ++j) s_ptr[j] -= o_ptr[j];
+                         for (int64_t j = i; j < end; ++j) s_ptr[j] -= o_ptr[j];
                      }
                  }
+                 });
              } else {
                  __m512 valpha = _mm512_set1_ps(alpha_val);
-                 #ifdef _OPENMP
-                 #pragma omp parallel for
-                 #endif
-                 for (int64_t i = 0; i < n; i += 16) {
-                     if (i + 16 <= n) {
+                 parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                 for (int64_t i = begin; i < end; i += 16) {
+                     if (i + 16 <= end) {
                          __m512 a = _mm512_loadu_ps(s_ptr + i);
                          __m512 b = _mm512_loadu_ps(o_ptr + i);
                          _mm512_storeu_ps(s_ptr + i, _mm512_fmadd_ps(valpha, b, a));
                      } else {
-                         for (int64_t j = i; j < n; ++j) s_ptr[j] += alpha_val * o_ptr[j];
+                         for (int64_t j = i; j < end; ++j) s_ptr[j] += alpha_val * o_ptr[j];
                      }
                  }
+                 });
              }
              #elif defined(__AVX2__)
              if (std::abs(alpha_val - 1.0f) < 1e-6) {
-                 #ifdef _OPENMP
-                 #pragma omp parallel for
-                 #endif
-                 for (int64_t i = 0; i < n; i += 8) {
-                     if (i + 8 <= n) {
+                 parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                 for (int64_t i = begin; i < end; i += 8) {
+                     if (i + 8 <= end) {
                          __m256 a = _mm256_loadu_ps(s_ptr + i);
                          __m256 b = _mm256_loadu_ps(o_ptr + i);
                          _mm256_storeu_ps(s_ptr + i, _mm256_add_ps(a, b));
                      } else {
-                         for (int64_t j = i; j < n; ++j) s_ptr[j] += o_ptr[j];
+                         for (int64_t j = i; j < end; ++j) s_ptr[j] += o_ptr[j];
                      }
                  }
+                 });
              } else if (std::abs(alpha_val + 1.0f) < 1e-6) {
-                 #ifdef _OPENMP
-                 #pragma omp parallel for
-                 #endif
-                 for (int64_t i = 0; i < n; i += 8) {
-                     if (i + 8 <= n) {
+                 parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                 for (int64_t i = begin; i < end; i += 8) {
+                     if (i + 8 <= end) {
                          __m256 a = _mm256_loadu_ps(s_ptr + i);
                          __m256 b = _mm256_loadu_ps(o_ptr + i);
                          _mm256_storeu_ps(s_ptr + i, _mm256_sub_ps(a, b));
                      } else {
-                         for (int64_t j = i; j < n; ++j) s_ptr[j] -= o_ptr[j];
+                         for (int64_t j = i; j < end; ++j) s_ptr[j] -= o_ptr[j];
                      }
                  }
+                 });
              } else {
                  __m256 valpha = _mm256_set1_ps(alpha_val);
-                 #ifdef _OPENMP
-                 #pragma omp parallel for
-                 #endif
-                 for (int64_t i = 0; i < n; i += 8) {
-                     if (i + 8 <= n) {
+                 parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                 for (int64_t i = begin; i < end; i += 8) {
+                     if (i + 8 <= end) {
                          __m256 a = _mm256_loadu_ps(s_ptr + i);
                          __m256 b = _mm256_loadu_ps(o_ptr + i);
                          _mm256_storeu_ps(s_ptr + i, _mm256_add_ps(a, _mm256_mul_ps(valpha, b)));
                      } else {
-                         for (int64_t j = i; j < n; ++j) s_ptr[j] += alpha_val * o_ptr[j];
+                         for (int64_t j = i; j < end; ++j) s_ptr[j] += alpha_val * o_ptr[j];
                      }
                  }
+                 });
              }
              #else
              for (int64_t i = 0; i < n; ++i) s_ptr[i] += alpha_val * o_ptr[i];
@@ -960,110 +1022,101 @@ Tensor& add_inplace_kernel(Tensor& self, const Tensor& other, Scalar alpha) {
              
              #if defined(__AVX512F__)
              if (std::abs(alpha_val - 1.0f) < 1e-6) {
-                 #ifdef _OPENMP
-                 #pragma omp parallel for
-                 #endif
-                 for (int64_t i = 0; i < n; i += 16) {
-                     if (i + 16 <= n) {
+                 parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                 for (int64_t i = begin; i < end; i += 16) {
+                     if (i + 16 <= end) {
                          __m512 a = _mm512_loadu_ps(s_ptr + i);
                          __m512 b = _mm512_loadu_ps(o_ptr + i);
                          _mm512_storeu_ps(s_ptr + i, _mm512_add_ps(a, b));
                      } else {
-                         for (int64_t j = i; j < n; ++j) s_ptr[j] += o_ptr[j];
+                         for (int64_t j = i; j < end; ++j) s_ptr[j] += o_ptr[j];
                      }
                  }
+                 });
              } else if (std::abs(alpha_val + 1.0f) < 1e-6) {
-                 #ifdef _OPENMP
-                 #pragma omp parallel for
-                 #endif
-                 for (int64_t i = 0; i < n; i += 16) {
-                     if (i + 16 <= n) {
+                 parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                 for (int64_t i = begin; i < end; i += 16) {
+                     if (i + 16 <= end) {
                          __m512 a = _mm512_loadu_ps(s_ptr + i);
                          __m512 b = _mm512_loadu_ps(o_ptr + i);
                          _mm512_storeu_ps(s_ptr + i, _mm512_sub_ps(a, b));
                      } else {
-                         for (int64_t j = i; j < n; ++j) s_ptr[j] -= o_ptr[j];
+                         for (int64_t j = i; j < end; ++j) s_ptr[j] -= o_ptr[j];
                      }
                  }
+                 });
              } else {
                  __m512 valpha = _mm512_set1_ps(alpha_val);
-                 #ifdef _OPENMP
-                 #pragma omp parallel for
-                 #endif
-                 for (int64_t i = 0; i < n; i += 16) {
-                     if (i + 16 <= n) {
+                 parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                 for (int64_t i = begin; i < end; i += 16) {
+                     if (i + 16 <= end) {
                          __m512 a = _mm512_loadu_ps(s_ptr + i);
                          __m512 b = _mm512_loadu_ps(o_ptr + i);
                          _mm512_storeu_ps(s_ptr + i, _mm512_fmadd_ps(valpha, b, a));
                      } else {
-                         for (int64_t j = i; j < n; ++j) s_ptr[j] += alpha_val * o_ptr[j];
+                         for (int64_t j = i; j < end; ++j) s_ptr[j] += alpha_val * o_ptr[j];
                      }
                  }
+                 });
              }
              #elif defined(__AVX2__)
              if (std::abs(alpha_val - 1.0f) < 1e-6) {
-                 #ifdef _OPENMP
-                 #pragma omp parallel for
-                 #endif
-                 for (int64_t i = 0; i < n; i += 8) {
-                     if (i + 8 <= n) {
+                 parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                 for (int64_t i = begin; i < end; i += 8) {
+                     if (i + 8 <= end) {
                          __m256 a = _mm256_loadu_ps(s_ptr + i);
                          __m256 b = _mm256_loadu_ps(o_ptr + i);
                          _mm256_storeu_ps(s_ptr + i, _mm256_add_ps(a, b));
                      } else {
-                         for (int64_t j = i; j < n; ++j) s_ptr[j] += o_ptr[j];
+                         for (int64_t j = i; j < end; ++j) s_ptr[j] += o_ptr[j];
                      }
                  }
+                 });
              } else if (std::abs(alpha_val + 1.0f) < 1e-6) {
-                 #ifdef _OPENMP
-                 #pragma omp parallel for
-                 #endif
-                 for (int64_t i = 0; i < n; i += 8) {
-                     if (i + 8 <= n) {
+                 parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                 for (int64_t i = begin; i < end; i += 8) {
+                     if (i + 8 <= end) {
                          __m256 a = _mm256_loadu_ps(s_ptr + i);
                          __m256 b = _mm256_loadu_ps(o_ptr + i);
                          _mm256_storeu_ps(s_ptr + i, _mm256_sub_ps(a, b));
                      } else {
-                         for (int64_t j = i; j < n; ++j) s_ptr[j] -= o_ptr[j];
+                         for (int64_t j = i; j < end; ++j) s_ptr[j] -= o_ptr[j];
                      }
                  }
+                 });
              } else {
                  __m256 valpha = _mm256_set1_ps(alpha_val);
-                 #ifdef _OPENMP
-                 #pragma omp parallel for
-                 #endif
-                 for (int64_t i = 0; i < n; i += 8) {
-                     if (i + 8 <= n) {
+                 parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                 for (int64_t i = begin; i < end; i += 8) {
+                     if (i + 8 <= end) {
                          __m256 a = _mm256_loadu_ps(s_ptr + i);
                          __m256 b = _mm256_loadu_ps(o_ptr + i);
                          _mm256_storeu_ps(s_ptr + i, _mm256_add_ps(a, _mm256_mul_ps(valpha, b)));
                      } else {
-                         for (int64_t j = i; j < n; ++j) s_ptr[j] += alpha_val * o_ptr[j];
+                         for (int64_t j = i; j < end; ++j) s_ptr[j] += alpha_val * o_ptr[j];
                      }
                  }
+                 });
              }
              #else
              if (std::abs(alpha_val - 1.0f) < 1e-6) {
-                 #ifdef _OPENMP
-                 #pragma omp parallel for
-                 #endif
-                 for (int64_t i = 0; i < n; ++i) {
+                 parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                 for (int64_t i = begin; i < end; ++i) {
                      s_ptr[i] += o_ptr[i];
                  }
+                 });
              } else if (std::abs(alpha_val + 1.0f) < 1e-6) {
-                 #ifdef _OPENMP
-                 #pragma omp parallel for
-                 #endif
-                 for (int64_t i = 0; i < n; ++i) {
+                 parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                 for (int64_t i = begin; i < end; ++i) {
                      s_ptr[i] -= o_ptr[i];
                  }
+                 });
              } else {
-                 #ifdef _OPENMP
-                 #pragma omp parallel for
-                 #endif
-                 for (int64_t i = 0; i < n; ++i) {
+                 parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                 for (int64_t i = begin; i < end; ++i) {
                      s_ptr[i] += alpha_val * o_ptr[i];
                  }
+                 });
              }
              #endif
              optimized = true;
@@ -1172,31 +1225,29 @@ Tensor& mul_inplace_kernel(Tensor& self, const Tensor& other) {
              const float* o_ptr = other_matching.data_ptr<float>();
              
              #if defined(__AVX512F__)
-             #ifdef _OPENMP
-             #pragma omp parallel for
-             #endif
-             for (int64_t i = 0; i < n; i += 16) {
-                 if (i + 16 <= n) {
+             parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+             for (int64_t i = begin; i < end; i += 16) {
+                 if (i + 16 <= end) {
                      __m512 a = _mm512_loadu_ps(s_ptr + i);
                      __m512 b = _mm512_loadu_ps(o_ptr + i);
                      _mm512_storeu_ps(s_ptr + i, _mm512_mul_ps(a, b));
                  } else {
-                     for (int64_t j = i; j < n; ++j) s_ptr[j] *= o_ptr[j];
+                     for (int64_t j = i; j < end; ++j) s_ptr[j] *= o_ptr[j];
                  }
              }
+             });
              #elif defined(__AVX2__)
-             #ifdef _OPENMP
-             #pragma omp parallel for
-             #endif
-             for (int64_t i = 0; i < n; i += 8) {
-                 if (i + 8 <= n) {
+             parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+             for (int64_t i = begin; i < end; i += 8) {
+                 if (i + 8 <= end) {
                      __m256 a = _mm256_loadu_ps(s_ptr + i);
                      __m256 b = _mm256_loadu_ps(o_ptr + i);
                      _mm256_storeu_ps(s_ptr + i, _mm256_mul_ps(a, b));
                  } else {
-                     for (int64_t j = i; j < n; ++j) s_ptr[j] *= o_ptr[j];
+                     for (int64_t j = i; j < end; ++j) s_ptr[j] *= o_ptr[j];
                  }
              }
+             });
              #else
              for (int64_t i = 0; i < n; ++i) s_ptr[i] *= o_ptr[i];
              #endif
@@ -1309,31 +1360,29 @@ Tensor& div_inplace_kernel(Tensor& self, const Tensor& other) {
              const float* o_ptr = other_matching.data_ptr<float>();
              
              #if defined(__AVX512F__)
-             #ifdef _OPENMP
-             #pragma omp parallel for
-             #endif
-             for (int64_t i = 0; i < n; i += 16) {
-                 if (i + 16 <= n) {
+             parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+             for (int64_t i = begin; i < end; i += 16) {
+                 if (i + 16 <= end) {
                      __m512 a = _mm512_loadu_ps(s_ptr + i);
                      __m512 b = _mm512_loadu_ps(o_ptr + i);
                      _mm512_storeu_ps(s_ptr + i, _mm512_div_ps(a, b));
                  } else {
-                     for (int64_t j = i; j < n; ++j) s_ptr[j] /= o_ptr[j];
+                     for (int64_t j = i; j < end; ++j) s_ptr[j] /= o_ptr[j];
                  }
              }
+             });
              #elif defined(__AVX2__)
-             #ifdef _OPENMP
-             #pragma omp parallel for
-             #endif
-             for (int64_t i = 0; i < n; i += 8) {
-                 if (i + 8 <= n) {
+             parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+             for (int64_t i = begin; i < end; i += 8) {
+                 if (i + 8 <= end) {
                      __m256 a = _mm256_loadu_ps(s_ptr + i);
                      __m256 b = _mm256_loadu_ps(o_ptr + i);
                      _mm256_storeu_ps(s_ptr + i, _mm256_div_ps(a, b));
                  } else {
-                     for (int64_t j = i; j < n; ++j) s_ptr[j] /= o_ptr[j];
+                     for (int64_t j = i; j < end; ++j) s_ptr[j] /= o_ptr[j];
                  }
              }
+             });
              #else
              for (int64_t i = 0; i < n; ++i) s_ptr[i] /= o_ptr[i];
              #endif
@@ -1402,7 +1451,8 @@ Tensor& div_inplace_kernel(Tensor& self, const Tensor& other) {
 
 Tensor add_scalar_kernel(const Tensor& self, Scalar other, Scalar alpha) {
     DType result_dtype = self.dtype();
-    if (other.isFloatingPoint() || alpha.isFloatingPoint()) {
+    if (!isFloatingType(result_dtype) &&
+        (other.isFloatingPoint() || alpha.isFloatingPoint())) {
         result_dtype = promoteTypes(result_dtype, DType::Float32);
     }
     
@@ -1435,7 +1485,8 @@ Tensor add_scalar_kernel(const Tensor& self, Scalar other, Scalar alpha) {
 
 Tensor sub_scalar_kernel(const Tensor& self, Scalar other, Scalar alpha) {
     DType result_dtype = self.dtype();
-    if (other.isFloatingPoint() || alpha.isFloatingPoint()) {
+    if (!isFloatingType(result_dtype) &&
+        (other.isFloatingPoint() || alpha.isFloatingPoint())) {
         result_dtype = promoteTypes(result_dtype, DType::Float32);
     }
     
@@ -1468,7 +1519,7 @@ Tensor sub_scalar_kernel(const Tensor& self, Scalar other, Scalar alpha) {
 
 Tensor mul_scalar_kernel(const Tensor& self, Scalar other) {
     DType result_dtype = self.dtype();
-    if (other.isFloatingPoint()) {
+    if (!isFloatingType(result_dtype) && other.isFloatingPoint()) {
         result_dtype = promoteTypes(result_dtype, DType::Float32);
     }
     
@@ -1501,8 +1552,9 @@ Tensor mul_scalar_kernel(const Tensor& self, Scalar other) {
 
 Tensor div_scalar_kernel(const Tensor& self, Scalar other) {
     DType result_dtype = self.dtype();
-    // Div usually promotes to float
-    result_dtype = promoteTypes(result_dtype, DType::Float32);
+    // True division promotes integral tensors, while preserving floating
+    // tensor precision for a Python scalar (the PyTorch rule).
+    if (!isFloatingType(result_dtype)) result_dtype = DType::Float32;
     
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), result_dtype, self.device());
     Tensor self_casted = (self.dtype() == result_dtype) ? self : self.to(result_dtype);
@@ -1628,12 +1680,312 @@ Tensor& div_scalar_inplace_kernel(Tensor& self, Scalar other) {
     return self;
 }
 
+// Torch's optimizer kernels use these compound pointwise operators directly.
+// Keep the common contiguous float32 case fused, and use one native ternary
+// traversal for every broadcasted/promotion path.  The latter is important:
+// composing mul() and add() here would reintroduce the Python/composite
+// implementation that this operator is meant to replace.
+Tensor addcmul_cpu(const Tensor& self, const Tensor& tensor1,
+                   const Tensor& tensor2, Scalar value) {
+    if (self.dtype() == DType::Float32 && tensor1.dtype() == DType::Float32 &&
+        tensor2.dtype() == DType::Float32 && self.is_contiguous() &&
+        tensor1.is_contiguous() && tensor2.is_contiguous() &&
+        self.shape() == tensor1.shape() && self.shape() == tensor2.shape()) {
+        Tensor result = Tensor::empty(
+            static_cast<std::vector<int64_t>>(self.shape()), DType::Float32, self.device());
+        const float* self_ptr = self.data_ptr<float>();
+        const float* tensor1_ptr = tensor1.data_ptr<float>();
+        const float* tensor2_ptr = tensor2.data_ptr<float>();
+        float* result_ptr = result.data_ptr<float>();
+        const float alpha = value.to<float>();
+        const int64_t n = self.numel();
+        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+            for (int64_t i = begin; i < end; ++i) {
+                result_ptr[i] = self_ptr[i] + alpha * tensor1_ptr[i] * tensor2_ptr[i];
+            }
+        });
+        return result;
+    }
+
+    std::vector<int64_t> out_shape = broadcast_shapes(
+        static_cast<std::vector<int64_t>>(self.shape()),
+        static_cast<std::vector<int64_t>>(tensor1.shape()),
+        static_cast<std::vector<int64_t>>(tensor2.shape()));
+    DType result_dtype = promoteTypes(
+        promoteTypes(self.dtype(), tensor1.dtype()), tensor2.dtype());
+    Tensor result = Tensor::empty(out_shape, result_dtype, self.device());
+    Tensor a = self.dtype() == result_dtype ? self : self.to(result_dtype);
+    Tensor b = tensor1.dtype() == result_dtype ? tensor1 : tensor1.to(result_dtype);
+    Tensor c = tensor2.dtype() == result_dtype ? tensor2 : tensor2.to(result_dtype);
+    auto a_strides = broadcast_strides(a, out_shape);
+    auto b_strides = broadcast_strides(b, out_shape);
+    auto c_strides = broadcast_strides(c, out_shape);
+
+    #define ADDCMUL_CASE(ctype, name) \
+        case DType::name: { \
+            const ctype alpha = value.to<ctype>(); \
+            auto op = [alpha](ctype x, ctype y, ctype z) -> ctype { \
+                return x + alpha * y * z; \
+            }; \
+            apply_ternary_op_recursive<ctype, ctype>( \
+                result.data_ptr<ctype>(), result.strides(), a, a_strides, \
+                b, b_strides, c, c_strides, 0, 0, 0, 0, 0, out_shape, op); \
+            break; \
+        }
+    switch (result_dtype) {
+        TENSORPLAY_FORALL_SCALAR_TYPES(ADDCMUL_CASE)
+        case DType::ComplexFloat: {
+            const std::complex<float> alpha = value.to<std::complex<float>>();
+            auto op = [alpha](std::complex<float> x, std::complex<float> y,
+                              std::complex<float> z) { return x + alpha * y * z; };
+            apply_ternary_op_recursive<std::complex<float>, std::complex<float>>( \
+                result.data_ptr<std::complex<float>>(), result.strides(), a, a_strides, \
+                b, b_strides, c, c_strides, 0, 0, 0, 0, 0, out_shape, op);
+            break;
+        }
+        case DType::ComplexDouble: {
+            const std::complex<double> alpha = value.to<std::complex<double>>();
+            auto op = [alpha](std::complex<double> x, std::complex<double> y,
+                              std::complex<double> z) { return x + alpha * y * z; };
+            apply_ternary_op_recursive<std::complex<double>, std::complex<double>>( \
+                result.data_ptr<std::complex<double>>(), result.strides(), a, a_strides, \
+                b, b_strides, c, c_strides, 0, 0, 0, 0, 0, out_shape, op);
+            break;
+        }
+        default: TP_THROW(TypeError, "addcmul: unsupported dtype");
+    }
+    #undef ADDCMUL_CASE
+    return result;
+}
+
+Tensor& addcmul_inplace_cpu(Tensor& self, const Tensor& tensor1,
+                            const Tensor& tensor2, Scalar value) {
+    if (self.dtype() == DType::Float32 && tensor1.dtype() == DType::Float32 &&
+        tensor2.dtype() == DType::Float32 && self.is_contiguous() &&
+        tensor1.is_contiguous() && tensor2.is_contiguous() &&
+        self.shape() == tensor1.shape() && self.shape() == tensor2.shape()) {
+        float* self_ptr = self.data_ptr<float>();
+        const float* tensor1_ptr = tensor1.data_ptr<float>();
+        const float* tensor2_ptr = tensor2.data_ptr<float>();
+        const float alpha = value.to<float>();
+        const int64_t n = self.numel();
+        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+            for (int64_t i = begin; i < end; ++i) {
+                self_ptr[i] += alpha * tensor1_ptr[i] * tensor2_ptr[i];
+            }
+        });
+        return self;
+    }
+
+    std::vector<int64_t> out_shape = broadcast_shapes(
+        static_cast<std::vector<int64_t>>(self.shape()),
+        static_cast<std::vector<int64_t>>(tensor1.shape()),
+        static_cast<std::vector<int64_t>>(tensor2.shape()));
+    if (out_shape != static_cast<std::vector<int64_t>>(self.shape())) {
+        TP_THROW(RuntimeError, "addcmul_: output shape does not match self");
+    }
+    Tensor b = tensor1.dtype() == self.dtype() ? tensor1 : tensor1.to(self.dtype());
+    Tensor c = tensor2.dtype() == self.dtype() ? tensor2 : tensor2.to(self.dtype());
+    auto self_strides = self.strides();
+    auto b_strides = broadcast_strides(b, out_shape);
+    auto c_strides = broadcast_strides(c, out_shape);
+    #define ADDCMUL_INPLACE_CASE(ctype, name) \
+        case DType::name: { \
+            const ctype alpha = value.to<ctype>(); \
+            auto op = [alpha](ctype x, ctype y, ctype z) -> ctype { \
+                return x + alpha * y * z; \
+            }; \
+            apply_ternary_op_recursive<ctype, ctype>( \
+                self.data_ptr<ctype>(), self_strides, self, self_strides, \
+                b, b_strides, c, c_strides, 0, 0, 0, 0, 0, out_shape, op); \
+            break; \
+        }
+    switch (self.dtype()) {
+        TENSORPLAY_FORALL_SCALAR_TYPES(ADDCMUL_INPLACE_CASE)
+        case DType::ComplexFloat: {
+            const std::complex<float> alpha = value.to<std::complex<float>>();
+            auto op = [alpha](std::complex<float> x, std::complex<float> y,
+                              std::complex<float> z) { return x + alpha * y * z; };
+            apply_ternary_op_recursive<std::complex<float>, std::complex<float>>( \
+                self.data_ptr<std::complex<float>>(), self_strides, self, self_strides, \
+                b, b_strides, c, c_strides, 0, 0, 0, 0, 0, out_shape, op);
+            break;
+        }
+        case DType::ComplexDouble: {
+            const std::complex<double> alpha = value.to<std::complex<double>>();
+            auto op = [alpha](std::complex<double> x, std::complex<double> y,
+                              std::complex<double> z) { return x + alpha * y * z; };
+            apply_ternary_op_recursive<std::complex<double>, std::complex<double>>( \
+                self.data_ptr<std::complex<double>>(), self_strides, self, self_strides, \
+                b, b_strides, c, c_strides, 0, 0, 0, 0, 0, out_shape, op);
+            break;
+        }
+        default: TP_THROW(TypeError, "addcmul_: unsupported dtype");
+    }
+    #undef ADDCMUL_INPLACE_CASE
+    return self;
+}
+
+Tensor addcdiv_cpu(const Tensor& self, const Tensor& tensor1,
+                   const Tensor& tensor2, Scalar value) {
+    if (isIntegralType(tensor1.dtype(), true) && isIntegralType(tensor2.dtype(), true)) {
+        TP_THROW(RuntimeError, "Integer division with addcdiv is not supported");
+    }
+    if (self.dtype() == DType::Float32 && tensor1.dtype() == DType::Float32 &&
+        tensor2.dtype() == DType::Float32 && self.is_contiguous() &&
+        tensor1.is_contiguous() && tensor2.is_contiguous() &&
+        self.shape() == tensor1.shape() && self.shape() == tensor2.shape()) {
+        Tensor result = Tensor::empty(
+            static_cast<std::vector<int64_t>>(self.shape()), DType::Float32, self.device());
+        const float* self_ptr = self.data_ptr<float>();
+        const float* tensor1_ptr = tensor1.data_ptr<float>();
+        const float* tensor2_ptr = tensor2.data_ptr<float>();
+        float* result_ptr = result.data_ptr<float>();
+        const float alpha = value.to<float>();
+        const int64_t n = self.numel();
+        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+            for (int64_t i = begin; i < end; ++i) {
+                result_ptr[i] = self_ptr[i] + alpha * tensor1_ptr[i] / tensor2_ptr[i];
+            }
+        });
+        return result;
+    }
+
+    std::vector<int64_t> out_shape = broadcast_shapes(
+        static_cast<std::vector<int64_t>>(self.shape()),
+        static_cast<std::vector<int64_t>>(tensor1.shape()),
+        static_cast<std::vector<int64_t>>(tensor2.shape()));
+    DType result_dtype = promoteTypes(
+        promoteTypes(self.dtype(), tensor1.dtype()), tensor2.dtype());
+    if (isIntegralType(result_dtype)) result_dtype = DType::Float32;
+    Tensor result = Tensor::empty(out_shape, result_dtype, self.device());
+    Tensor a = self.dtype() == result_dtype ? self : self.to(result_dtype);
+    Tensor b = tensor1.dtype() == result_dtype ? tensor1 : tensor1.to(result_dtype);
+    Tensor c = tensor2.dtype() == result_dtype ? tensor2 : tensor2.to(result_dtype);
+    auto a_strides = broadcast_strides(a, out_shape);
+    auto b_strides = broadcast_strides(b, out_shape);
+    auto c_strides = broadcast_strides(c, out_shape);
+    #define ADDCDIV_CASE(ctype, name) \
+        case DType::name: { \
+            const ctype alpha = value.to<ctype>(); \
+            auto op = [alpha](ctype x, ctype y, ctype z) -> ctype { \
+                return x + alpha * (y / z); \
+            }; \
+            apply_ternary_op_recursive<ctype, ctype>( \
+                result.data_ptr<ctype>(), result.strides(), a, a_strides, \
+                b, b_strides, c, c_strides, 0, 0, 0, 0, 0, out_shape, op); \
+            break; \
+        }
+    switch (result_dtype) {
+        TENSORPLAY_FORALL_SCALAR_TYPES(ADDCDIV_CASE)
+        case DType::ComplexFloat: {
+            const std::complex<float> alpha = value.to<std::complex<float>>();
+            auto op = [alpha](std::complex<float> x, std::complex<float> y,
+                              std::complex<float> z) { return x + alpha * (y / z); };
+            apply_ternary_op_recursive<std::complex<float>, std::complex<float>>( \
+                result.data_ptr<std::complex<float>>(), result.strides(), a, a_strides, \
+                b, b_strides, c, c_strides, 0, 0, 0, 0, 0, out_shape, op);
+            break;
+        }
+        case DType::ComplexDouble: {
+            const std::complex<double> alpha = value.to<std::complex<double>>();
+            auto op = [alpha](std::complex<double> x, std::complex<double> y,
+                              std::complex<double> z) { return x + alpha * (y / z); };
+            apply_ternary_op_recursive<std::complex<double>, std::complex<double>>( \
+                result.data_ptr<std::complex<double>>(), result.strides(), a, a_strides, \
+                b, b_strides, c, c_strides, 0, 0, 0, 0, 0, out_shape, op);
+            break;
+        }
+        default: TP_THROW(TypeError, "addcdiv: unsupported dtype");
+    }
+    #undef ADDCDIV_CASE
+    return result;
+}
+
+Tensor& addcdiv_inplace_cpu(Tensor& self, const Tensor& tensor1,
+                            const Tensor& tensor2, Scalar value) {
+    if (isIntegralType(tensor1.dtype(), true) && isIntegralType(tensor2.dtype(), true)) {
+        TP_THROW(RuntimeError, "Integer division with addcdiv is not supported");
+    }
+    if (self.dtype() == DType::Float32 && tensor1.dtype() == DType::Float32 &&
+        tensor2.dtype() == DType::Float32 && self.is_contiguous() &&
+        tensor1.is_contiguous() && tensor2.is_contiguous() &&
+        self.shape() == tensor1.shape() && self.shape() == tensor2.shape()) {
+        float* self_ptr = self.data_ptr<float>();
+        const float* tensor1_ptr = tensor1.data_ptr<float>();
+        const float* tensor2_ptr = tensor2.data_ptr<float>();
+        const float alpha = value.to<float>();
+        const int64_t n = self.numel();
+        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+            for (int64_t i = begin; i < end; ++i) {
+                self_ptr[i] += alpha * tensor1_ptr[i] / tensor2_ptr[i];
+            }
+        });
+        return self;
+    }
+
+    std::vector<int64_t> out_shape = broadcast_shapes(
+        static_cast<std::vector<int64_t>>(self.shape()),
+        static_cast<std::vector<int64_t>>(tensor1.shape()),
+        static_cast<std::vector<int64_t>>(tensor2.shape()));
+    if (out_shape != static_cast<std::vector<int64_t>>(self.shape())) {
+        TP_THROW(RuntimeError, "addcdiv_: output shape does not match self");
+    }
+    Tensor b = tensor1.dtype() == self.dtype() ? tensor1 : tensor1.to(self.dtype());
+    Tensor c = tensor2.dtype() == self.dtype() ? tensor2 : tensor2.to(self.dtype());
+    auto self_strides = self.strides();
+    auto b_strides = broadcast_strides(b, out_shape);
+    auto c_strides = broadcast_strides(c, out_shape);
+    #define ADDCDIV_INPLACE_CASE(ctype, name) \
+        case DType::name: { \
+            const ctype alpha = value.to<ctype>(); \
+            auto op = [alpha](ctype x, ctype y, ctype z) -> ctype { \
+                return x + alpha * (y / z); \
+            }; \
+            apply_ternary_op_recursive<ctype, ctype>( \
+                self.data_ptr<ctype>(), self_strides, self, self_strides, \
+                b, b_strides, c, c_strides, 0, 0, 0, 0, 0, out_shape, op); \
+            break; \
+        }
+    switch (self.dtype()) {
+        TENSORPLAY_FORALL_SCALAR_TYPES(ADDCDIV_INPLACE_CASE)
+        case DType::ComplexFloat: {
+            const std::complex<float> alpha = value.to<std::complex<float>>();
+            auto op = [alpha](std::complex<float> x, std::complex<float> y,
+                              std::complex<float> z) { return x + alpha * (y / z); };
+            apply_ternary_op_recursive<std::complex<float>, std::complex<float>>( \
+                self.data_ptr<std::complex<float>>(), self_strides, self, self_strides, \
+                b, b_strides, c, c_strides, 0, 0, 0, 0, 0, out_shape, op);
+            break;
+        }
+        case DType::ComplexDouble: {
+            const std::complex<double> alpha = value.to<std::complex<double>>();
+            auto op = [alpha](std::complex<double> x, std::complex<double> y,
+                              std::complex<double> z) { return x + alpha * (y / z); };
+            apply_ternary_op_recursive<std::complex<double>, std::complex<double>>( \
+                self.data_ptr<std::complex<double>>(), self_strides, self, self_strides, \
+                b, b_strides, c, c_strides, 0, 0, 0, 0, 0, out_shape, op);
+            break;
+        }
+        default: TP_THROW(TypeError, "addcdiv_: unsupported dtype");
+    }
+    #undef ADDCDIV_INPLACE_CASE
+    return self;
+}
+
 // Registration
 TENSORPLAY_LIBRARY_IMPL(CPU, ArithmeticKernels) {
     m.impl("add.Tensor", add_kernel);
+    m.impl("add_relu", add_relu_cpu);
     m.impl("sub.Tensor", sub_kernel);
     m.impl("mul.Tensor", mul_kernel);
     m.impl("div.Tensor", div_kernel);
+    m.impl("addcmul", addcmul_cpu);
+    m.impl("addcmul_", addcmul_inplace_cpu);
+    m.impl("addcdiv", addcdiv_cpu);
+    m.impl("addcdiv_", addcdiv_inplace_cpu);
+    m.impl("fused_mul_add", fused_mul_add_kernel);
+    m.impl("fused_mul_add.Scalar", fused_mul_add_scalar_kernel);
 
     m.impl("add_.Tensor", add_inplace_kernel);
     m.impl("sub_.Tensor", sub_inplace_kernel);

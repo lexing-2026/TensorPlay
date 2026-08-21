@@ -22,9 +22,23 @@ Scalar Scalar::operator OP(const Scalar& other) const { \
         float v1 = this->to<float>(); \
         float v2 = other.to<float>(); \
         return Scalar(v1 OP v2); \
+    } else if (result_dtype == DType::ComplexDouble) { \
+        auto v1 = this->to<std::complex<double>>(); \
+        auto v2 = other.to<std::complex<double>>(); \
+        return Scalar(v1 OP v2); \
+    } else if (result_dtype == DType::ComplexFloat || \
+               result_dtype == DType::ComplexHalf || \
+               result_dtype == DType::BComplex32) { \
+        auto v1 = this->to<std::complex<float>>(); \
+        auto v2 = other.to<std::complex<float>>(); \
+        return Scalar(v1 OP v2); \
     } else if (result_dtype == DType::Int64) { \
         int64_t v1 = this->to<int64_t>(); \
         int64_t v2 = other.to<int64_t>(); \
+        return Scalar(v1 OP v2); \
+    } else if (result_dtype == DType::UInt64) { \
+        uint64_t v1 = this->to<uint64_t>(); \
+        uint64_t v2 = other.to<uint64_t>(); \
         return Scalar(v1 OP v2); \
     } else if (result_dtype == DType::Int32) { \
         int32_t v1 = this->to<int32_t>(); \
@@ -51,7 +65,13 @@ Scalar Scalar::operator/(const Scalar& other) const {
     // In PyTorch, division usually results in float, unless floor_divide
     // Here we implement standard C++ division behavior but promoted
     
-    if (isFloatingPoint() || other.isFloatingPoint()) {
+    if (result_dtype == DType::ComplexDouble) {
+        return Scalar(this->to<std::complex<double>>() / other.to<std::complex<double>>());
+    } else if (result_dtype == DType::ComplexFloat ||
+               result_dtype == DType::ComplexHalf ||
+               result_dtype == DType::BComplex32) {
+        return Scalar(this->to<std::complex<float>>() / other.to<std::complex<float>>());
+    } else if (isFloatingPoint() || other.isFloatingPoint()) {
         if (result_dtype == DType::Float64) {
             return Scalar(this->to<double>() / other.to<double>());
         } else {
@@ -62,6 +82,8 @@ Scalar Scalar::operator/(const Scalar& other) const {
         // Check for division by zero?
         if (result_dtype == DType::Int64) {
              return Scalar(this->to<int64_t>() / other.to<int64_t>());
+        } else if (result_dtype == DType::UInt64) {
+             return Scalar(this->to<uint64_t>() / other.to<uint64_t>());
         } else {
              return Scalar(this->to<int32_t>() / other.to<int32_t>());
         }
@@ -82,6 +104,8 @@ bool Scalar::operator OP(const Scalar& other) const { \
         return this->to<int64_t>() OP other.to<int64_t>(); \
     } else if (common_dtype == DType::Int32) { \
         return this->to<int32_t>() OP other.to<int32_t>(); \
+    } else if (common_dtype == DType::UInt64) { \
+        return this->to<uint64_t>() OP other.to<uint64_t>(); \
     } else if (common_dtype == DType::Bool) { \
         return this->to<bool>() OP other.to<bool>(); \
     } \

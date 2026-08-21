@@ -8,6 +8,7 @@
   variants: function
   dispatch:
     CPU: embedding_dense_backward_cpu
+    CUDA: embedding_dense_backward_cuda
 
 - func: conv1d(Tensor input, Tensor weight, Tensor bias={}, int64_t[] stride={1}, int64_t[] padding={0}, int64_t[] dilation={1}, int64_t groups=1) -> Tensor
   variants: function
@@ -34,6 +35,25 @@
   dispatch:
     CPU: conv2d_cpu
     CUDA: conv2d_cuda
+
+# Inference-only fusion primitive used by the Stax native lowering.  It has
+# deliberately no autograd formula: training graphs keep the ordinary conv2d
+# operator, while eval/no-grad graphs can let oneDNN consume ReLU as a
+# convolution post-op (and CUDA can at least reuse the convolution buffer).
+- func: conv2d_relu(Tensor input, Tensor weight, Tensor bias={}, int64_t[] stride={1, 1}, int64_t[] padding={0, 0}, int64_t[] dilation={1, 1}, int64_t groups=1) -> Tensor
+  variants: function
+  dispatch:
+    CPU: conv2d_relu_cpu
+    CUDA: conv2d_relu_cuda
+
+# Residual pointwise fusion.  Its autograd rule is generated from
+# derivatives.yaml and is restricted by Stax to the equal-shape residual
+# pattern used by ResNet.
+- func: add_relu(Tensor self, Tensor other) -> Tensor
+  variants: function
+  dispatch:
+    CPU: add_relu_cpu
+    CUDA: add_relu_cuda
 
 - func: conv2d_grad_input(Tensor grad_output, Tensor input, Tensor weight, int64_t[] stride, int64_t[] padding, int64_t[] dilation, int64_t groups) -> Tensor
   variants: function
@@ -201,6 +221,381 @@
     CPU: div_cpu
     CUDA: div_cuda
 
+# Stax/Inductor pointwise fusion primitive.  The generated p10/tpx wrappers
+# keep the normal dispatcher and autograd contracts while CPU/CUDA provide a
+# single pass for the common mul+add fusion group.
+- func: fused_mul_add(Tensor self, Tensor other, Tensor addend) -> Tensor
+  variants: function
+  dispatch:
+    CPU: fused_mul_add_cpu
+    CUDA: fused_mul_add_cuda
+
+- func: fused_mul_add.Scalar(Tensor self, Scalar other, Scalar addend) -> Tensor
+  variants: function
+  dispatch:
+    CPU: fused_mul_add_scalar_cpu
+    CUDA: fused_mul_add_scalar_cuda
+
+# Optimizer fast paths.  These accept lists of same-device, contiguous
+# tensors and update all entries in one backend invocation.  Undefined state
+# tensors are used for options that are disabled (for example momentum or
+# AMSGrad), keeping one stable signature for the Python optimizer layer.
+- func: _foreach_sgd(Tensor[] params, Tensor[] grads, Tensor[] momentum_buffers, double lr, double momentum, double dampening, double weight_decay, bool nesterov, bool first_momentum_step) -> Tensor[]
+  variants: function
+  dispatch:
+    CPU: foreach_sgd_cpu
+    CUDA: foreach_sgd_cuda
+
+- func: _foreach_adam(Tensor[] params, Tensor[] grads, Tensor[] exp_avgs, Tensor[] exp_avg_sqs, Tensor[] max_exp_avg_sqs, int64_t[] steps, double lr, double beta1, double beta2, double eps, double weight_decay, bool amsgrad) -> Tensor[]
+  variants: function
+  dispatch:
+    CPU: foreach_adam_cpu
+    CUDA: foreach_adam_cuda
+
+# AMP support, mirroring torch._amp_foreach_non_finite_check_and_unscale_ and
+# torch._amp_update_scale_.  The foreach kernel checks every grad for
+# inf/NaN: if any non-finite value is found, found_inf is set to 1 and no
+# grad is rescaled; otherwise every grad is multiplied in place by inv_scale.
+- func: _amp_foreach_non_finite_check_and_unscale_(Tensor(a!)[] self, Tensor(b!) found_inf, Tensor inv_scale) -> ()
+  variants: function
+  dispatch:
+    CPU: _amp_foreach_non_finite_check_and_unscale_cpu
+    CUDA: _amp_foreach_non_finite_check_and_unscale_cuda
+
+- func: _amp_update_scale_(Tensor(a!) self, Tensor(b!) growth_tracker, Tensor found_inf, float growth_factor, float backoff_factor, int64_t growth_interval) -> ()
+  variants: function
+  dispatch:
+    CPU: _amp_update_scale_cpu
+    CUDA: _amp_update_scale_cuda
+
+# Torch's fused optimizer entry points.  The underscore is part of the
+# operator name: these mutate every tensor list in one backend launch and
+# return void, just like ATen's fused kernels.
+- func: _fused_adam_(Tensor(a!)[] self, Tensor(b!)[] grads, Tensor(c!)[] exp_avgs, Tensor(d!)[] exp_avg_sqs, Tensor(e!)[] max_exp_avg_sqs, Tensor[] state_steps, *, float lr, float beta1, float beta2, float weight_decay, float eps, bool amsgrad, bool maximize, Tensor? grad_scale=None, Tensor? found_inf=None) -> ()
+  variants: function
+  dispatch: {CPU: fused_adam_cpu, CUDA: fused_adam_cuda}
+- func: _fused_adam_.tensor_lr(Tensor(a!)[] self, Tensor(b!)[] grads, Tensor(c!)[] exp_avgs, Tensor(d!)[] exp_avg_sqs, Tensor(e!)[] max_exp_avg_sqs, Tensor[] state_steps, *, Tensor lr, float beta1, float beta2, float weight_decay, float eps, bool amsgrad, bool maximize, Tensor? grad_scale=None, Tensor? found_inf=None) -> ()
+  variants: function
+  device_check: NoCheck
+  dispatch: {CPU: fused_adam_tensor_lr_cpu, CUDA: fused_adam_tensor_lr_cuda}
+- func: _fused_adamw_(Tensor(a!)[] self, Tensor(b!)[] grads, Tensor(c!)[] exp_avgs, Tensor(d!)[] exp_avg_sqs, Tensor(e!)[] max_exp_avg_sqs, Tensor[] state_steps, *, float lr, float beta1, float beta2, float weight_decay, float eps, bool amsgrad, bool maximize, Tensor? grad_scale=None, Tensor? found_inf=None) -> ()
+  variants: function
+  dispatch: {CPU: fused_adamw_cpu, CUDA: fused_adamw_cuda}
+- func: _fused_adamw_.tensor_lr(Tensor(a!)[] self, Tensor(b!)[] grads, Tensor(c!)[] exp_avgs, Tensor(d!)[] exp_avg_sqs, Tensor(e!)[] max_exp_avg_sqs, Tensor[] state_steps, *, Tensor lr, float beta1, float beta2, float weight_decay, float eps, bool amsgrad, bool maximize, Tensor? grad_scale=None, Tensor? found_inf=None) -> ()
+  variants: function
+  device_check: NoCheck
+  dispatch: {CPU: fused_adamw_tensor_lr_cpu, CUDA: fused_adamw_tensor_lr_cuda}
+- func: _fused_sgd_(Tensor(a!)[] self, Tensor(b!)[] grads, Tensor(c!)[] momentum_buffer_list, *, float weight_decay, float momentum, float lr, float dampening, bool nesterov, bool maximize, bool is_first_step, Tensor? grad_scale=None, Tensor? found_inf=None) -> ()
+  variants: function
+  dispatch: {CPU: fused_sgd_cpu, CUDA: fused_sgd_cuda}
+- func: _fused_sgd_.tensor_lr(Tensor(a!)[] self, Tensor(b!)[] grads, Tensor(c!)[] momentum_buffer_list, *, float weight_decay, float momentum, Tensor lr, float dampening, bool nesterov, bool maximize, bool is_first_step, Tensor? grad_scale=None, Tensor? found_inf=None) -> ()
+  variants: function
+  device_check: NoCheck
+  dispatch: {CPU: fused_sgd_tensor_lr_cpu, CUDA: fused_sgd_tensor_lr_cuda}
+- func: _fused_adagrad_(Tensor(a!)[] self, Tensor(b!)[] grads, Tensor(c!)[] state_sums, Tensor(d!)[] state_steps, *, float lr, float lr_decay, float weight_decay, float eps, bool maximize, Tensor? grad_scale=None, Tensor? found_inf=None) -> ()
+  variants: function
+  dispatch: {CPU: fused_adagrad_cpu, CUDA: fused_adagrad_cuda}
+- func: _fused_adagrad_.tensor_lr(Tensor(a!)[] self, Tensor(b!)[] grads, Tensor(c!)[] state_sums, Tensor(d!)[] state_steps, *, Tensor lr, float lr_decay, float weight_decay, float eps, bool maximize, Tensor? grad_scale=None, Tensor? found_inf=None) -> ()
+  variants: function
+  device_check: NoCheck
+  dispatch: {CPU: fused_adagrad_tensor_lr_cpu, CUDA: fused_adagrad_tensor_lr_cuda}
+
+# Public Torch foreach primitives.  The optimizer fast paths above are fused
+# algorithm kernels; these schemas cover the list-wise arithmetic building
+# blocks used by the remaining optimizer source ports and by user code.
+- func: _foreach_add.Scalar(Tensor[] self, Scalar scalar) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_add_scalar_cpu, CUDA: foreach_add_scalar_cuda}
+- func: _foreach_add.List(Tensor[] self, Tensor[] other, *, Scalar alpha=1) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_add_list_cpu, CUDA: foreach_add_list_cuda}
+- func: _foreach_add.ScalarList(Tensor[] self, Scalar[] scalars) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_add_scalar_list_cpu, CUDA: foreach_add_scalar_list_cuda}
+- func: _foreach_add.Tensor(Tensor[] self, Tensor other, *, Scalar alpha=1) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_add_tensor_cpu, CUDA: foreach_add_tensor_cuda}
+- func: _foreach_add_.Scalar(Tensor(a!)[] self, Scalar scalar) -> ()
+  variants: function
+  dispatch: {CPU: foreach_add_scalar_inplace_cpu, CUDA: foreach_add_scalar_inplace_cuda}
+- func: _foreach_add_.List(Tensor(a!)[] self, Tensor[] other, *, Scalar alpha=1) -> ()
+  variants: function
+  dispatch: {CPU: foreach_add_list_inplace_cpu, CUDA: foreach_add_list_inplace_cuda}
+- func: _foreach_add_.ScalarList(Tensor(a!)[] self, Scalar[] scalars) -> ()
+  variants: function
+  dispatch: {CPU: foreach_add_scalar_list_inplace_cpu, CUDA: foreach_add_scalar_list_inplace_cuda}
+- func: _foreach_add_.Tensor(Tensor(a!)[] self, Tensor other, *, Scalar alpha=1) -> ()
+  variants: function
+  dispatch: {CPU: foreach_add_tensor_inplace_cpu, CUDA: foreach_add_tensor_inplace_cuda}
+
+- func: _foreach_sub.Scalar(Tensor[] self, Scalar scalar) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_sub_scalar_cpu, CUDA: foreach_sub_scalar_cuda}
+- func: _foreach_sub.List(Tensor[] self, Tensor[] other, *, Scalar alpha=1) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_sub_list_cpu, CUDA: foreach_sub_list_cuda}
+- func: _foreach_sub.ScalarList(Tensor[] self, Scalar[] scalars) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_sub_scalar_list_cpu, CUDA: foreach_sub_scalar_list_cuda}
+- func: _foreach_sub.Tensor(Tensor[] self, Tensor other, *, Scalar alpha=1) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_sub_tensor_cpu, CUDA: foreach_sub_tensor_cuda}
+- func: _foreach_sub_.Scalar(Tensor(a!)[] self, Scalar scalar) -> ()
+  variants: function
+  dispatch: {CPU: foreach_sub_scalar_inplace_cpu, CUDA: foreach_sub_scalar_inplace_cuda}
+- func: _foreach_sub_.List(Tensor(a!)[] self, Tensor[] other, *, Scalar alpha=1) -> ()
+  variants: function
+  dispatch: {CPU: foreach_sub_list_inplace_cpu, CUDA: foreach_sub_list_inplace_cuda}
+- func: _foreach_sub_.ScalarList(Tensor(a!)[] self, Scalar[] scalars) -> ()
+  variants: function
+  dispatch: {CPU: foreach_sub_scalar_list_inplace_cpu, CUDA: foreach_sub_scalar_list_inplace_cuda}
+- func: _foreach_sub_.Tensor(Tensor(a!)[] self, Tensor other, *, Scalar alpha=1) -> ()
+  variants: function
+  dispatch: {CPU: foreach_sub_tensor_inplace_cpu, CUDA: foreach_sub_tensor_inplace_cuda}
+
+- func: _foreach_mul.Scalar(Tensor[] self, Scalar scalar) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_mul_scalar_cpu, CUDA: foreach_mul_scalar_cuda}
+- func: _foreach_mul.List(Tensor[] self, Tensor[] other) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_mul_list_cpu, CUDA: foreach_mul_list_cuda}
+- func: _foreach_mul.ScalarList(Tensor[] self, Scalar[] scalars) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_mul_scalar_list_cpu, CUDA: foreach_mul_scalar_list_cuda}
+- func: _foreach_mul.Tensor(Tensor[] self, Tensor other) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_mul_tensor_cpu, CUDA: foreach_mul_tensor_cuda}
+- func: _foreach_mul_.Scalar(Tensor(a!)[] self, Scalar scalar) -> ()
+  variants: function
+  dispatch: {CPU: foreach_mul_scalar_inplace_cpu, CUDA: foreach_mul_scalar_inplace_cuda}
+- func: _foreach_mul_.List(Tensor(a!)[] self, Tensor[] other) -> ()
+  variants: function
+  dispatch: {CPU: foreach_mul_list_inplace_cpu, CUDA: foreach_mul_list_inplace_cuda}
+- func: _foreach_mul_.ScalarList(Tensor(a!)[] self, Scalar[] scalars) -> ()
+  variants: function
+  dispatch: {CPU: foreach_mul_scalar_list_inplace_cpu, CUDA: foreach_mul_scalar_list_inplace_cuda}
+- func: _foreach_mul_.Tensor(Tensor(a!)[] self, Tensor other) -> ()
+  variants: function
+  dispatch: {CPU: foreach_mul_tensor_inplace_cpu, CUDA: foreach_mul_tensor_inplace_cuda}
+
+- func: _foreach_div.Scalar(Tensor[] self, Scalar scalar) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_div_scalar_cpu, CUDA: foreach_div_scalar_cuda}
+- func: _foreach_div.List(Tensor[] self, Tensor[] other) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_div_list_cpu, CUDA: foreach_div_list_cuda}
+- func: _foreach_div.ScalarList(Tensor[] self, Scalar[] scalars) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_div_scalar_list_cpu, CUDA: foreach_div_scalar_list_cuda}
+- func: _foreach_div.Tensor(Tensor[] self, Tensor other) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_div_tensor_cpu, CUDA: foreach_div_tensor_cuda}
+- func: _foreach_div_.Scalar(Tensor(a!)[] self, Scalar scalar) -> ()
+  variants: function
+  dispatch: {CPU: foreach_div_scalar_inplace_cpu, CUDA: foreach_div_scalar_inplace_cuda}
+- func: _foreach_div_.List(Tensor(a!)[] self, Tensor[] other) -> ()
+  variants: function
+  dispatch: {CPU: foreach_div_list_inplace_cpu, CUDA: foreach_div_list_inplace_cuda}
+- func: _foreach_div_.ScalarList(Tensor(a!)[] self, Scalar[] scalars) -> ()
+  variants: function
+  dispatch: {CPU: foreach_div_scalar_list_inplace_cpu, CUDA: foreach_div_scalar_list_inplace_cuda}
+- func: _foreach_div_.Tensor(Tensor(a!)[] self, Tensor other) -> ()
+  variants: function
+  dispatch: {CPU: foreach_div_tensor_inplace_cpu, CUDA: foreach_div_tensor_inplace_cuda}
+
+- func: _foreach_addcmul.Scalar(Tensor[] self, Tensor[] tensor1, Tensor[] tensor2, Scalar value=1) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_addcmul_scalar_cpu, CUDA: foreach_addcmul_scalar_cuda}
+- func: _foreach_addcmul_.Scalar(Tensor(a!)[] self, Tensor[] tensor1, Tensor[] tensor2, Scalar value=1) -> ()
+  variants: function
+  dispatch: {CPU: foreach_addcmul_scalar_inplace_cpu, CUDA: foreach_addcmul_scalar_inplace_cuda}
+- func: _foreach_addcmul.ScalarList(Tensor[] self, Tensor[] tensor1, Tensor[] tensor2, Scalar[] scalars) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_addcmul_scalar_list_cpu, CUDA: foreach_addcmul_scalar_list_cuda}
+- func: _foreach_addcmul_.ScalarList(Tensor(a!)[] self, Tensor[] tensor1, Tensor[] tensor2, Scalar[] scalars) -> ()
+  variants: function
+  dispatch: {CPU: foreach_addcmul_scalar_list_inplace_cpu, CUDA: foreach_addcmul_scalar_list_inplace_cuda}
+- func: _foreach_addcmul.Tensor(Tensor[] self, Tensor[] tensor1, Tensor[] tensor2, Tensor scalars) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_addcmul_tensor_cpu, CUDA: foreach_addcmul_tensor_cuda}
+- func: _foreach_addcmul_.Tensor(Tensor(a!)[] self, Tensor[] tensor1, Tensor[] tensor2, Tensor scalars) -> ()
+  variants: function
+  dispatch: {CPU: foreach_addcmul_tensor_inplace_cpu, CUDA: foreach_addcmul_tensor_inplace_cuda}
+- func: _foreach_addcdiv.Scalar(Tensor[] self, Tensor[] tensor1, Tensor[] tensor2, Scalar value=1) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_addcdiv_scalar_cpu, CUDA: foreach_addcdiv_scalar_cuda}
+- func: _foreach_addcdiv_.Scalar(Tensor(a!)[] self, Tensor[] tensor1, Tensor[] tensor2, Scalar value=1) -> ()
+  variants: function
+  dispatch: {CPU: foreach_addcdiv_scalar_inplace_cpu, CUDA: foreach_addcdiv_scalar_inplace_cuda}
+- func: _foreach_addcdiv.ScalarList(Tensor[] self, Tensor[] tensor1, Tensor[] tensor2, Scalar[] scalars) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_addcdiv_scalar_list_cpu, CUDA: foreach_addcdiv_scalar_list_cuda}
+- func: _foreach_addcdiv_.ScalarList(Tensor(a!)[] self, Tensor[] tensor1, Tensor[] tensor2, Scalar[] scalars) -> ()
+  variants: function
+  dispatch: {CPU: foreach_addcdiv_scalar_list_inplace_cpu, CUDA: foreach_addcdiv_scalar_list_inplace_cuda}
+- func: _foreach_addcdiv.Tensor(Tensor[] self, Tensor[] tensor1, Tensor[] tensor2, Tensor scalars) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_addcdiv_tensor_cpu, CUDA: foreach_addcdiv_tensor_cuda}
+- func: _foreach_addcdiv_.Tensor(Tensor(a!)[] self, Tensor[] tensor1, Tensor[] tensor2, Tensor scalars) -> ()
+  variants: function
+  dispatch: {CPU: foreach_addcdiv_tensor_inplace_cpu, CUDA: foreach_addcdiv_tensor_inplace_cuda}
+
+- func: _foreach_lerp.Scalar(Tensor[] self, Tensor[] end, Scalar weight) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_lerp_scalar_cpu, CUDA: foreach_lerp_scalar_cuda}
+- func: _foreach_lerp.List(Tensor[] self, Tensor[] end, Tensor[] weight) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_lerp_list_cpu, CUDA: foreach_lerp_list_cuda}
+- func: _foreach_lerp_.Scalar(Tensor(a!)[] self, Tensor[] end, Scalar weight) -> ()
+  variants: function
+  dispatch: {CPU: foreach_lerp_scalar_inplace_cpu, CUDA: foreach_lerp_scalar_inplace_cuda}
+- func: _foreach_lerp_.List(Tensor(a!)[] self, Tensor[] end, Tensor[] weight) -> ()
+  variants: function
+  dispatch: {CPU: foreach_lerp_list_inplace_cpu, CUDA: foreach_lerp_list_inplace_cuda}
+- func: _foreach_lerp.ScalarList(Tensor[] self, Tensor[] end, Scalar[] weight) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_lerp_scalar_list_cpu, CUDA: foreach_lerp_scalar_list_cuda}
+- func: _foreach_lerp_.ScalarList(Tensor(a!)[] self, Tensor[] end, Scalar[] weight) -> ()
+  variants: function
+  dispatch: {CPU: foreach_lerp_scalar_list_inplace_cpu, CUDA: foreach_lerp_scalar_list_inplace_cuda}
+
+- func: _foreach_sqrt(Tensor[] self) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_sqrt_cpu, CUDA: foreach_sqrt_cuda}
+- func: _foreach_sqrt_(Tensor(a!)[] self) -> ()
+  variants: function
+  dispatch: {CPU: foreach_sqrt_inplace_cpu, CUDA: foreach_sqrt_inplace_cuda}
+- func: _foreach_rsqrt(Tensor[] self) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_rsqrt_cpu, CUDA: foreach_rsqrt_cuda}
+- func: _foreach_rsqrt_(Tensor(a!)[] self) -> ()
+  variants: function
+  dispatch: {CPU: foreach_rsqrt_inplace_cpu, CUDA: foreach_rsqrt_inplace_cuda}
+- func: _foreach_neg(Tensor[] self) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_neg_cpu, CUDA: foreach_neg_cuda}
+- func: _foreach_neg_(Tensor(a!)[] self) -> ()
+  variants: function
+  dispatch: {CPU: foreach_neg_inplace_cpu, CUDA: foreach_neg_inplace_cuda}
+- func: _foreach_abs(Tensor[] self) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_abs_cpu, CUDA: foreach_abs_cuda}
+- func: _foreach_abs_(Tensor(a!)[] self) -> ()
+  variants: function
+  dispatch: {CPU: foreach_abs_inplace_cpu, CUDA: foreach_abs_inplace_cuda}
+- func: _foreach_reciprocal(Tensor[] self) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_reciprocal_cpu, CUDA: foreach_reciprocal_cuda}
+- func: _foreach_reciprocal_(Tensor(a!)[] self) -> ()
+  variants: function
+  dispatch: {CPU: foreach_reciprocal_inplace_cpu, CUDA: foreach_reciprocal_inplace_cuda}
+- func: _foreach_sign(Tensor[] self) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_sign_cpu, CUDA: foreach_sign_cuda}
+- func: _foreach_sign_(Tensor(a!)[] self) -> ()
+  variants: function
+  dispatch: {CPU: foreach_sign_inplace_cpu, CUDA: foreach_sign_inplace_cuda}
+- func: _foreach_pow.Scalar(Tensor[] self, Scalar exponent) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_pow_scalar_cpu, CUDA: foreach_pow_scalar_cuda}
+- func: _foreach_pow.ScalarAndTensor(Scalar self, Tensor[] exponent) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_pow_scalar_tensor_cpu, CUDA: foreach_pow_scalar_tensor_cuda}
+- func: _foreach_pow.List(Tensor[] self, Tensor[] exponent) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_pow_list_cpu, CUDA: foreach_pow_list_cuda}
+- func: _foreach_pow_.Scalar(Tensor(a!)[] self, Scalar exponent) -> ()
+  variants: function
+  dispatch: {CPU: foreach_pow_scalar_inplace_cpu, CUDA: foreach_pow_scalar_inplace_cuda}
+- func: _foreach_pow_.List(Tensor(a!)[] self, Tensor[] exponent) -> ()
+  variants: function
+  dispatch: {CPU: foreach_pow_list_inplace_cpu, CUDA: foreach_pow_list_inplace_cuda}
+- func: _foreach_pow.ScalarList(Tensor[] self, Scalar[] exponent) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_pow_scalar_list_cpu, CUDA: foreach_pow_scalar_list_cuda}
+- func: _foreach_pow_.ScalarList(Tensor(a!)[] self, Scalar[] exponent) -> ()
+  variants: function
+  dispatch: {CPU: foreach_pow_scalar_list_inplace_cpu, CUDA: foreach_pow_scalar_list_inplace_cuda}
+
+- func: _foreach_clamp_min.Scalar(Tensor[] self, Scalar scalar) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_clamp_min_scalar_cpu, CUDA: foreach_clamp_min_scalar_cuda}
+- func: _foreach_clamp_max.Scalar(Tensor[] self, Scalar scalar) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_clamp_max_scalar_cpu, CUDA: foreach_clamp_max_scalar_cuda}
+- func: _foreach_clamp_min.List(Tensor[] self, Tensor[] other) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_clamp_min_list_cpu, CUDA: foreach_clamp_min_list_cuda}
+- func: _foreach_clamp_min_.List(Tensor(a!)[] self, Tensor[] other) -> ()
+  variants: function
+  dispatch: {CPU: foreach_clamp_min_list_inplace_cpu, CUDA: foreach_clamp_min_list_inplace_cuda}
+- func: _foreach_clamp_min.ScalarList(Tensor[] self, Scalar[] scalars) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_clamp_min_scalar_list_cpu, CUDA: foreach_clamp_min_scalar_list_cuda}
+- func: _foreach_clamp_min_.ScalarList(Tensor(a!)[] self, Scalar[] scalars) -> ()
+  variants: function
+  dispatch: {CPU: foreach_clamp_min_scalar_list_inplace_cpu, CUDA: foreach_clamp_min_scalar_list_inplace_cuda}
+- func: _foreach_clamp_max.List(Tensor[] self, Tensor[] other) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_clamp_max_list_cpu, CUDA: foreach_clamp_max_list_cuda}
+- func: _foreach_clamp_max_.List(Tensor(a!)[] self, Tensor[] other) -> ()
+  variants: function
+  dispatch: {CPU: foreach_clamp_max_list_inplace_cpu, CUDA: foreach_clamp_max_list_inplace_cuda}
+- func: _foreach_clamp_max.ScalarList(Tensor[] self, Scalar[] scalars) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_clamp_max_scalar_list_cpu, CUDA: foreach_clamp_max_scalar_list_cuda}
+- func: _foreach_clamp_max_.ScalarList(Tensor(a!)[] self, Scalar[] scalars) -> ()
+  variants: function
+  dispatch: {CPU: foreach_clamp_max_scalar_list_inplace_cpu, CUDA: foreach_clamp_max_scalar_list_inplace_cuda}
+- func: _foreach_clamp_min_.Scalar(Tensor(a!)[] self, Scalar scalar) -> ()
+  variants: function
+  dispatch: {CPU: foreach_clamp_min_scalar_inplace_cpu, CUDA: foreach_clamp_min_scalar_inplace_cuda}
+- func: _foreach_clamp_max_.Scalar(Tensor(a!)[] self, Scalar scalar) -> ()
+  variants: function
+  dispatch: {CPU: foreach_clamp_max_scalar_inplace_cpu, CUDA: foreach_clamp_max_scalar_inplace_cuda}
+- func: _foreach_maximum.Scalar(Tensor[] self, Scalar scalar) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_maximum_scalar_cpu, CUDA: foreach_maximum_scalar_cuda}
+- func: _foreach_minimum.Scalar(Tensor[] self, Scalar scalar) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_minimum_scalar_cpu, CUDA: foreach_minimum_scalar_cuda}
+- func: _foreach_maximum.List(Tensor[] self, Tensor[] other) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_maximum_list_cpu, CUDA: foreach_maximum_list_cuda}
+- func: _foreach_maximum_.List(Tensor(a!)[] self, Tensor[] other) -> ()
+  variants: function
+  dispatch: {CPU: foreach_maximum_list_inplace_cpu, CUDA: foreach_maximum_list_inplace_cuda}
+- func: _foreach_maximum.ScalarList(Tensor[] self, Scalar[] scalars) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_maximum_scalar_list_cpu, CUDA: foreach_maximum_scalar_list_cuda}
+- func: _foreach_maximum_.ScalarList(Tensor(a!)[] self, Scalar[] scalars) -> ()
+  variants: function
+  dispatch: {CPU: foreach_maximum_scalar_list_inplace_cpu, CUDA: foreach_maximum_scalar_list_inplace_cuda}
+- func: _foreach_minimum.List(Tensor[] self, Tensor[] other) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_minimum_list_cpu, CUDA: foreach_minimum_list_cuda}
+- func: _foreach_minimum_.List(Tensor(a!)[] self, Tensor[] other) -> ()
+  variants: function
+  dispatch: {CPU: foreach_minimum_list_inplace_cpu, CUDA: foreach_minimum_list_inplace_cuda}
+- func: _foreach_minimum.ScalarList(Tensor[] self, Scalar[] scalars) -> Tensor[]
+  variants: function
+  dispatch: {CPU: foreach_minimum_scalar_list_cpu, CUDA: foreach_minimum_scalar_list_cuda}
+- func: _foreach_minimum_.ScalarList(Tensor(a!)[] self, Scalar[] scalars) -> ()
+  variants: function
+  dispatch: {CPU: foreach_minimum_scalar_list_inplace_cpu, CUDA: foreach_minimum_scalar_list_inplace_cuda}
+- func: _foreach_maximum_.Scalar(Tensor(a!)[] self, Scalar scalar) -> ()
+  variants: function
+  dispatch: {CPU: foreach_maximum_scalar_inplace_cpu, CUDA: foreach_maximum_scalar_inplace_cuda}
+- func: _foreach_minimum_.Scalar(Tensor(a!)[] self, Scalar scalar) -> ()
+  variants: function
+  dispatch: {CPU: foreach_minimum_scalar_inplace_cpu, CUDA: foreach_minimum_scalar_inplace_cuda}
+- func: _foreach_copy_(Tensor(a!)[] self, Tensor[] src, bool non_blocking=false) -> ()
+  variants: function
+  dispatch: {CPU: foreach_copy_inplace_cpu, CUDA: foreach_copy_inplace_cuda}
+- func: _foreach_zero_(Tensor(a!)[] self) -> ()
+  variants: function
+  dispatch: {CPU: foreach_zero_inplace_cpu, CUDA: foreach_zero_inplace_cuda}
+
 - func: div.Scalar(Tensor self, Scalar other) -> Tensor
   variants: method
   dispatch:
@@ -219,17 +614,190 @@
     CPU: div_scalar_cpu
     CUDA: div_scalar_cuda
 
+# Optimizer source ports use Torch's fused compound arithmetic methods.  Keep
+# them as native dispatches so the Python optimizer never materializes the
+# product/quotient through a Python-level composite implementation.
+- func: addcmul(Tensor self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor
+  variants: function, method
+  dispatch:
+    CPU: addcmul_cpu
+    CUDA: addcmul_cuda
+
+- func: addcmul_(Tensor(a!) self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor(a!)
+  variants: method
+  dispatch:
+    CPU: addcmul_inplace_cpu
+    CUDA: addcmul_inplace_cuda
+
+- func: addcdiv(Tensor self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor
+  variants: function, method
+  dispatch:
+    CPU: addcdiv_cpu
+    CUDA: addcdiv_cuda
+
+- func: addcdiv_(Tensor(a!) self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor(a!)
+  variants: method
+  dispatch:
+    CPU: addcdiv_inplace_cpu
+    CUDA: addcdiv_inplace_cuda
+
+# Native comparison/selection dependencies used by Torch's differentiable
+# optimizer paths.  Keep all overloads in the dispatcher; the generated
+# Python functional surface is only a thin binding to these kernels.
+- func: where.self(Tensor condition, Tensor self, Tensor other) -> Tensor
+  variants: function
+  dispatch:
+    CPU: where_cpu
+    CUDA: where_cuda
+
+- func: where.ScalarSelf(Tensor condition, Scalar self, Tensor other) -> Tensor
+  variants: function
+  dispatch:
+    CPU: where_scalar_self_cpu
+    CUDA: where_scalar_self_cuda
+
+- func: where.ScalarOther(Tensor condition, Tensor self, Scalar other) -> Tensor
+  variants: function
+  dispatch:
+    CPU: where_scalar_other_cpu
+    CUDA: where_scalar_other_cuda
+
+- func: where.Scalar(Tensor condition, Scalar self, Scalar other) -> Tensor
+  variants: function
+  dispatch:
+    CPU: where_scalar_scalar_cpu
+    CUDA: where_scalar_scalar_cuda
+
+- func: maximum(Tensor self, Tensor other) -> Tensor
+  variants: function
+  dispatch:
+    CPU: maximum_cpu
+    CUDA: maximum_cuda
+
+- func: minimum(Tensor self, Tensor other) -> Tensor
+  variants: function
+  dispatch:
+    CPU: minimum_cpu
+    CUDA: minimum_cuda
+
+# Complex/real reinterpretation views used by Torch optimizer kernels.  These
+# are metadata-only views: the backend must preserve storage and the shared
+# version counter rather than materializing a copy.
+- func: view_as_real(Tensor self) -> Tensor
+  variants: function
+  dispatch:
+    CPU: view_as_real_cpu
+    CUDA: view_as_real_cuda
+
+- func: view_as_complex(Tensor self) -> Tensor
+  variants: function
+  dispatch:
+    CPU: view_as_complex_cpu
+    CUDA: view_as_complex_cuda
+
+- func: is_complex(Tensor self) -> bool
+  variants: function
+  dispatch:
+    CPU: is_complex_cpu
+    CUDA: is_complex_cuda
+
 - func: mm(Tensor self, Tensor other) -> Tensor
   variants: function, method
   dispatch:
     CPU: mm_kernel
     CUDA: mm_kernel_cuda
 
+- func: addmm(Tensor input, Tensor mat1, Tensor mat2, *, Scalar beta=1, Scalar alpha=1) -> Tensor
+  variants: function
+  dispatch:
+    CPU: addmm_kernel
+    CUDA: addmm_kernel_cuda
+
 - func: matmul(Tensor self, Tensor other) -> Tensor
   variants: function, method
   dispatch:
     CPU: matmul_kernel
     CUDA: matmul_kernel_cuda
+
+- func: matmul.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+  variants: function
+  dispatch:
+    CPU: matmul_out_kernel
+    CUDA: matmul_out_kernel_cuda
+
+# Matmul backward uses dedicated shape-aware kernels.  The ordinary
+# ``grad.matmul(other.t())`` formula is only valid for two-dimensional
+# operands and cannot express vector cases or broadcast reduction.
+- func: matmul_backward_self(Tensor grad_output, Tensor self, Tensor other) -> Tensor
+  variants: function
+  dispatch:
+    CPU: matmul_backward_self_kernel
+    CUDA: matmul_backward_self_kernel_cuda
+
+- func: matmul_backward_other(Tensor grad_output, Tensor self, Tensor other) -> Tensor
+  variants: function
+  dispatch:
+    CPU: matmul_backward_other_kernel
+    CUDA: matmul_backward_other_kernel_cuda
+
+# Batched GEMM family, mirroring torch's BLAS3 surface.
+- func: bmm(Tensor self, Tensor batch2) -> Tensor
+  variants: function, method
+  dispatch:
+    CPU: bmm_kernel
+    CUDA: bmm_kernel_cuda
+
+- func: baddbmm(Tensor input, Tensor batch1, Tensor batch2, *, Scalar beta=1, Scalar alpha=1) -> Tensor
+  variants: function
+  dispatch:
+    CPU: baddbmm_kernel
+    CUDA: baddbmm_kernel_cuda
+
+- func: mv(Tensor self, Tensor vec) -> Tensor
+  variants: function, method
+  dispatch:
+    CPU: mv_kernel
+    CUDA: mv_kernel_cuda
+
+- func: dot(Tensor self, Tensor other) -> Tensor
+  variants: function, method
+  dispatch:
+    CPU: dot_kernel
+    CUDA: dot_kernel_cuda
+
+- func: inner(Tensor self, Tensor other) -> Tensor
+  variants: function, method
+  dispatch:
+    CPU: inner_kernel
+    CUDA: inner_kernel_cuda
+
+- func: inner_backward_self(Tensor grad_output, Tensor self, Tensor other) -> Tensor
+  variants: function
+  dispatch:
+    CPU: inner_backward_self_kernel
+    CUDA: inner_backward_self_kernel_cuda
+
+- func: inner_backward_other(Tensor grad_output, Tensor self, Tensor other) -> Tensor
+  variants: function
+  dispatch:
+    CPU: inner_backward_other_kernel
+    CUDA: inner_backward_other_kernel_cuda
+
+- func: outer(Tensor self, Tensor vec2) -> Tensor
+  variants: function, method
+  dispatch:
+    CPU: outer_kernel
+    CUDA: outer_kernel_cuda
+
+# CompositeImplicitAutograd like torch: the kernel is expressed through
+# differentiable primitives, so autograd is derived from the inner calls.
+# The Python layer mirrors torch.functional.einsum (sublist parsing and the
+# optional opt-einsum contraction path).
+- func: einsum(str equation, Tensor[] operands, int64_t[] path={}) -> Tensor
+  variants: function
+  dispatch:
+    CPU: einsum_kernel
+    CUDA: einsum_kernel
 
 - func: eq.Tensor(Tensor self, Tensor other) -> Tensor
   variants: function, method
@@ -291,7 +859,7 @@
   dispatch:
     CPU: ge_scalar_kernel
 
-- func: copy_(Tensor(a!) self, Tensor src) -> Tensor(a!)
+- func: copy_(Tensor(a!) self, Tensor src, bool non_blocking=false) -> Tensor(a!)
   variants: method
   dispatch:
     CPU: copy_kernel
@@ -355,15 +923,36 @@
     CPU: unsqueeze_kernel
     CUDA: unsqueeze_kernel_cuda
 
+- func: diagonal(Tensor self, int64_t offset=0, int64_t dim1=0, int64_t dim2=1) -> Tensor
+  variants: function, method
+  dispatch:
+    CPU: diagonal_kernel
+    CUDA: diagonal_kernel_cuda
+
+# Scatter gradient back into the positions selected by diagonal().
+- func: diagonal_backward(Tensor grad_output, int64_t[] input_sizes, int64_t offset, int64_t dim1, int64_t dim2) -> Tensor
+  variants: function
+  dispatch:
+    CPU: diagonal_backward_kernel
+    CUDA: diagonal_backward_kernel_cuda
+
+- func: movedim(Tensor self, int64_t[] source, int64_t[] destination) -> Tensor
+  variants: function, method
+  dispatch:
+    CPU: movedim_kernel
+    CUDA: movedim_kernel_cuda
+
 - func: cat(Tensor[] tensors, int64_t dim=0) -> Tensor
   variants: function
   dispatch:
     CPU: cat_kernel
+    CUDA: cat_kernel_cuda
 
 - func: stack(Tensor[] tensors, int64_t dim=0) -> Tensor
   variants: function
   dispatch:
     CPU: stack_kernel
+    CUDA: stack_kernel_cuda
 
 - func: split(Tensor self, int64_t split_size, int64_t dim=0) -> Tensor[]
   variants: function, method
@@ -534,6 +1123,42 @@
     CPU: lerp_tensor_kernel
     CUDA: lerp_tensor_kernel_cuda
 
+- func: lerp_.Scalar(Tensor(a!) self, Tensor end, Scalar weight) -> Tensor(a!)
+  variants: method
+  dispatch:
+    CPU: lerp_scalar_inplace_kernel
+    CUDA: lerp_scalar_inplace_kernel_cuda
+
+- func: lerp_.Tensor(Tensor(a!) self, Tensor end, Tensor weight) -> Tensor(a!)
+  variants: method
+  dispatch:
+    CPU: lerp_tensor_inplace_kernel
+    CUDA: lerp_tensor_inplace_kernel_cuda
+
+- func: abs_(Tensor(a!) self) -> Tensor(a!)
+  variants: method
+  dispatch:
+    CPU: abs_inplace_kernel
+    CUDA: abs_inplace_kernel_cuda
+
+- func: neg_(Tensor(a!) self) -> Tensor(a!)
+  variants: method
+  dispatch:
+    CPU: neg_inplace_kernel
+    CUDA: neg_inplace_kernel_cuda
+
+- func: sqrt_(Tensor(a!) self) -> Tensor(a!)
+  variants: method
+  dispatch:
+    CPU: sqrt_inplace_kernel
+    CUDA: sqrt_inplace_kernel_cuda
+
+- func: rsqrt_(Tensor(a!) self) -> Tensor(a!)
+  variants: method
+  dispatch:
+    CPU: rsqrt_inplace_kernel
+    CUDA: rsqrt_inplace_kernel_cuda
+
 - func: log(Tensor self) -> Tensor
   variants: function, method
   dispatch:
@@ -644,24 +1269,25 @@
   dispatch:
     CPU: silu_kernel
 
-- func: empty(int64_t[] size, *, DType dtype=Float32, Device device=CPU, bool requires_grad=false) -> Tensor
+- func: empty(int64_t[] size, *, DType dtype=Float32, Device device=CPU, bool pin_memory=false, bool requires_grad=false) -> Tensor
   variants: function
   dispatch:
     CPU: empty_kernel
     CUDA: empty_kernel
 
-- func: full(int64_t[] size, Scalar fill_value, *, DType dtype=Undefined, Device device=CPU, bool requires_grad=false) -> Tensor
+- func: full(int64_t[] size, Scalar fill_value, *, DType dtype=Undefined, Device device=CPU, bool pin_memory=false, bool requires_grad=false) -> Tensor
   variants: function
   dispatch:
     CPU: full_kernel
+    CUDA: full_kernel
 
-- func: zeros(int64_t[] size, *, DType dtype=Float32, Device device=CPU, bool requires_grad=false) -> Tensor
+- func: zeros(int64_t[] size, *, DType dtype=Float32, Device device=CPU, bool pin_memory=false, bool requires_grad=false) -> Tensor
   variants: function
   dispatch:
     CPU: zeros_kernel
     CUDA: zeros_kernel
 
-- func: ones(int64_t[] size, *, DType dtype=Float32, Device device=CPU, bool requires_grad=false) -> Tensor
+- func: ones(int64_t[] size, *, DType dtype=Float32, Device device=CPU, bool pin_memory=false, bool requires_grad=false) -> Tensor
   variants: function
   dispatch:
     CPU: ones_kernel
@@ -711,6 +1337,12 @@
   variants: function, method
   dispatch:
     CPU: mean_dim_kernel
+
+- func: mean_dim_backward(Tensor grad_output, Tensor self, int64_t[] dim, bool keepdim=false) -> Tensor
+  variants: function
+  dispatch:
+    CPU: mean_dim_backward_kernel
+    CUDA: mean_dim_backward_kernel_cuda
 
 - func: max(Tensor self) -> Tensor
   variants: function, method
@@ -895,6 +1527,7 @@
   variants: function
   dispatch:
     CPU: adaptive_avg_pool2d_cpu
+    CUDA: adaptive_avg_pool2d_cuda
 
 - func: adaptive_max_pool2d(Tensor input, int64_t[] output_size) -> Tensor
   variants: function
@@ -941,6 +1574,7 @@
   variants: function
   dispatch:
     CPU: adaptive_avg_pool2d_backward_cpu
+    CUDA: adaptive_avg_pool2d_backward_cuda
 
 - func: adaptive_max_pool2d_backward(Tensor grad_output, Tensor input) -> Tensor
   variants: function
@@ -951,6 +1585,7 @@
   variants: function
   dispatch:
     CPU: batch_norm_cpu
+    CUDA: batch_norm_cuda
 
 - func: layer_norm(Tensor input, int64_t[] normalized_shape, Tensor? weight=None, Tensor? bias=None, double eps=1e-5) -> Tensor
   variants: function
@@ -971,6 +1606,7 @@
   variants: function
   dispatch:
     CPU: batch_norm_backward_cpu
+    CUDA: batch_norm_backward_cuda
 
 - func: layer_norm_backward(Tensor grad_output, Tensor input, int64_t[] normalized_shape, Tensor? weight=None, Tensor? bias=None, double eps=1e-5) -> std::tuple<Tensor, Tensor, Tensor>
   variants: function
@@ -986,3 +1622,33 @@
   variants: function
   dispatch:
     CPU: instance_norm_backward_cpu
+
+- func: multinomial(Tensor self, int64_t num_samples, bool replacement=false, int64_t impl=0) -> Tensor
+  variants: function
+  dispatch:
+    CPU: multinomial_kernel_cpu
+    CUDA: multinomial_kernel_cuda
+
+- func: topk(Tensor self, int64_t k, int64_t dim=-1, bool largest=true, bool sorted=true, int64_t impl=0) -> (Tensor values, Tensor indices)
+  variants: function
+  dispatch:
+    CPU: topk_kernel_cpu
+    CUDA: topk_kernel_cuda
+
+- func: sample(Tensor logits, double temperature=1.0, int64_t top_k=0, double top_p=1.0, int64_t impl=0) -> Tensor
+  variants: function
+  dispatch:
+    CPU: sample_kernel_cpu
+    CUDA: sample_kernel_cuda
+
+- func: scaled_dot_product_attention(Tensor query, Tensor key, Tensor value, bool is_causal=false, int64_t impl=0) -> Tensor
+  variants: function
+  dispatch:
+    CPU: sdpa_kernel_cpu
+    CUDA: sdpa_kernel_cuda
+
+- func: scaled_dot_product_attention_backward(Tensor grad_output, Tensor query, Tensor key, Tensor value, bool is_causal=false, int64_t impl=0) -> (Tensor grad_query, Tensor grad_key, Tensor grad_value)
+  variants: function
+  dispatch:
+    CPU: sdpa_backward_kernel_cpu
+    CUDA: sdpa_backward_kernel_cuda

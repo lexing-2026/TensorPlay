@@ -1,11 +1,15 @@
 #include "Tensor.h"
 #include "Dispatcher.h"
+#include "CUDARuntime.h"
 #include "CUDAContext.h"
 #include "Exception.h"
 #include "Allocator.h"
 #include "CUDNNUtils.h"
+#include "Scalar.h"
 #include "Utils.h"
 #include "TypePromotion.h"
+#include "CUDABroadcast.cuh"
+
 #include <cuda_runtime.h>
 
 #ifdef USE_CUDNN
@@ -14,6 +18,29 @@
 
 namespace tensorplay {
 namespace cuda {
+
+// ATen alignment: scalars are converted to the opmath type of T so reduced
+// floating types (Half/BFloat16) receive float32 scalars, matching aten
+// native/cuda binary kernels.
+template <typename T> struct BinaryOpMath { using type = T; };
+template <> struct BinaryOpMath<tensorplay::Half> { using type = float; };
+template <> struct BinaryOpMath<tensorplay::BFloat16> { using type = float; };
+
+template <typename T>
+inline typename BinaryOpMath<T>::type scalar_to_opmath(const Scalar& s) {
+    return s.to<typename BinaryOpMath<T>::type>();
+}
+
+// Grid-stride wrapper so any launch config is correct (ATen elementwise style)
+#define TP_CUDA_GRIDSTRIDE(i) \
+    int64_t i = blockIdx.x * blockDim.x + threadIdx.x; \
+    int64_t tp_stride = static_cast<int64_t>(blockDim.x) * gridDim.x; \
+    for (; i < n; i += tp_stride)
+
+// Forward declarations for the scalar fallback used by the fused kernel.
+Tensor add_scalar_kernel(const Tensor& self, Scalar other, Scalar alpha);
+Tensor mul_scalar_kernel(const Tensor& self, Scalar other);
+Tensor& relu_inplace_kernel_cudnn(Tensor& self);
 
 // --- Utils ---
 #define CUDA_CHECK(condition) \
@@ -26,62 +53,35 @@ namespace cuda {
 
 #define MAX_DIMS 8
 
-struct TensorDesc {
-    int64_t shape[MAX_DIMS];
-    int64_t strides[MAX_DIMS];
-    int ndim;
-};
-
-// Pad shapes/strides to output ndim (left padding with 1s and 0 strides for broadcast or just 1s and dummy strides)
-// Actually for broadcasting, we need to align dimensions from the right.
-// But broadcast_shapes aligns them.
-// We assume we have the output shape. We need to "view" inputs as having that rank.
-// If input has rank K and output has rank N (N >= K).
-// Input is padded on the left with 1s.
-// Strides for those 1s should be 0 (conceptually) or just 0 so they don't contribute to offset?
-// If dim is 1, offset contribution is 0 anyway.
-TensorDesc make_desc(const Tensor& t, int ndim) {
-    TensorDesc desc;
-    desc.ndim = ndim;
-    int t_ndim = t.dim();
-    int diff = ndim - t_ndim;
-    
-    for (int i = 0; i < ndim; ++i) {
-        if (i < diff) {
-            desc.shape[i] = 1;
-            desc.strides[i] = 0; 
-        } else {
-            desc.shape[i] = t.shape()[i - diff];
-            desc.strides[i] = t.strides()[i - diff];
+static bool is_channels_last_4d(
+    const Tensor& tensor,
+    const std::vector<int64_t>& logical_shape) {
+    if (tensor.dim() != 4 || logical_shape.size() != 4) return false;
+    for (size_t dim = 0; dim < 4; ++dim) {
+        if (tensor.size(static_cast<int64_t>(dim)) != logical_shape[dim]) {
+            return false;
         }
     }
-    return desc;
+    const int64_t c = logical_shape[1];
+    const int64_t h = logical_shape[2];
+    const int64_t w = logical_shape[3];
+    return tensor.stride(0) == c * h * w &&
+           tensor.stride(1) == 1 &&
+           tensor.stride(2) == w * c &&
+           tensor.stride(3) == c;
 }
 
-TensorDesc make_desc_from_shape(const std::vector<int64_t>& shape) {
-    TensorDesc desc;
-    desc.ndim = shape.size();
-    int64_t stride = 1;
-    for (int i = desc.ndim - 1; i >= 0; --i) {
-        desc.shape[i] = shape[i];
-        desc.strides[i] = stride;
-        stride *= shape[i];
-    }
-    return desc;
-}
-
-__device__ int64_t get_offset(int64_t idx, const TensorDesc& desc, const TensorDesc& out_desc) {
-    int64_t offset = 0;
-    // We compute coordinates from idx based on out_desc, then map to input offset
-    for (int i = out_desc.ndim - 1; i >= 0; --i) {
-        int64_t coord = idx % out_desc.shape[i];
-        idx /= out_desc.shape[i];
-        
-        if (desc.shape[i] != 1) {
-            offset += coord * desc.strides[i];
-        }
-    }
-    return offset;
+static Tensor empty_channels_last_4d(
+    const std::vector<int64_t>& logical_shape,
+    DType dtype,
+    const Device& device) {
+    Tensor result = Tensor::empty(logical_shape, dtype, device);
+    if (logical_shape.size() != 4) return result;
+    const int64_t c = logical_shape[1];
+    const int64_t h = logical_shape[2];
+    const int64_t w = logical_shape[3];
+    return result.as_strided(
+        logical_shape, {c * h * w, 1, w * c, c});
 }
 
 // --- Kernels ---
@@ -92,11 +92,11 @@ __global__ void div_broadcast_kernel(int64_t n,
                                      const T* a, TensorDesc a_desc,
                                      const T* b, TensorDesc b_desc,
                                      T* y, TensorDesc y_desc) {
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
+    using M = typename BinaryOpMath<T>::type;
+    TP_CUDA_GRIDSTRIDE(i) {
         int64_t a_off = get_offset(i, a_desc, y_desc);
         int64_t b_off = get_offset(i, b_desc, y_desc);
-        y[i] = a[a_off] / b[b_off];
+        y[i] = static_cast<T>(static_cast<M>(a[a_off]) / static_cast<M>(b[b_off]));
     }
 }
 
@@ -104,12 +104,12 @@ template <typename T>
 __global__ void add_broadcast_kernel(int64_t n, 
                                      const T* a, TensorDesc a_desc,
                                      const T* b, TensorDesc b_desc,
-                                     T* y, TensorDesc y_desc, T alpha) {
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
+                                     T* y, TensorDesc y_desc, typename BinaryOpMath<T>::type alpha) {
+    using M = typename BinaryOpMath<T>::type;
+    TP_CUDA_GRIDSTRIDE(i) {
         int64_t a_off = get_offset(i, a_desc, y_desc);
         int64_t b_off = get_offset(i, b_desc, y_desc);
-        y[i] = a[a_off] + alpha * b[b_off];
+        y[i] = static_cast<T>(static_cast<M>(a[a_off]) + alpha * static_cast<M>(b[b_off]));
     }
 }
 
@@ -117,12 +117,32 @@ template <typename T>
 __global__ void sub_broadcast_kernel(int64_t n, 
                                      const T* a, TensorDesc a_desc,
                                      const T* b, TensorDesc b_desc,
-                                     T* y, TensorDesc y_desc, T alpha) {
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
+                                     T* y, TensorDesc y_desc, typename BinaryOpMath<T>::type alpha) {
+    using M = typename BinaryOpMath<T>::type;
+    TP_CUDA_GRIDSTRIDE(i) {
         int64_t a_off = get_offset(i, a_desc, y_desc);
         int64_t b_off = get_offset(i, b_desc, y_desc);
-        y[i] = a[a_off] - alpha * b[b_off];
+        y[i] = static_cast<T>(static_cast<M>(a[a_off]) - alpha * static_cast<M>(b[b_off]));
+    }
+}
+
+template <typename T, bool Divide>
+__global__ void addc_broadcast_kernel(
+    int64_t n,
+    const T* a, TensorDesc a_desc,
+    const T* b, TensorDesc b_desc,
+    const T* c, TensorDesc c_desc,
+    T* y, TensorDesc y_desc, typename BinaryOpMath<T>::type alpha) {
+    using M = typename BinaryOpMath<T>::type;
+    TP_CUDA_GRIDSTRIDE(i) {
+        const int64_t a_off = get_offset(i, a_desc, y_desc);
+        const int64_t b_off = get_offset(i, b_desc, y_desc);
+        const int64_t c_off = get_offset(i, c_desc, y_desc);
+        if constexpr (Divide) {
+            y[i] = static_cast<T>(static_cast<M>(a[a_off]) + alpha * (static_cast<M>(b[b_off]) / static_cast<M>(c[c_off])));
+        } else {
+            y[i] = static_cast<T>(static_cast<M>(a[a_off]) + alpha * static_cast<M>(b[b_off]) * static_cast<M>(c[c_off]));
+        }
     }
 }
 
@@ -131,37 +151,66 @@ __global__ void mul_broadcast_kernel(int64_t n,
                                      const T* a, TensorDesc a_desc,
                                      const T* b, TensorDesc b_desc,
                                      T* y, TensorDesc y_desc) {
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
+    using M = typename BinaryOpMath<T>::type;
+    TP_CUDA_GRIDSTRIDE(i) {
         int64_t a_off = get_offset(i, a_desc, y_desc);
         int64_t b_off = get_offset(i, b_desc, y_desc);
-        y[i] = a[a_off] * b[b_off];
+        y[i] = static_cast<T>(static_cast<M>(a[a_off]) * static_cast<M>(b[b_off]));
     }
+}
+
+template <typename T>
+__global__ void fused_mul_add_kernel_cuda_impl(int64_t n,
+                                               const T* a,
+                                               const T* b,
+                                               const T* c,
+                                               T* y) {
+    using M = typename BinaryOpMath<T>::type;
+    TP_CUDA_GRIDSTRIDE(i) {
+        y[i] = static_cast<T>(static_cast<M>(a[i]) * static_cast<M>(b[i]) + static_cast<M>(c[i]));
+    }
+}
+
+__global__ void fused_mul_add_scalar_kernel_cuda_impl(int64_t n,
+                                                       const float* a,
+                                                       float b,
+                                                       float c,
+                                                       float* y) {
+    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = a[i] * b + c;
 }
 
 // Tensor-Scalar Kernels
 template <typename T>
-__global__ void add_scalar_kernel_cuda_impl(int n, const T* a, T b, T* y, T alpha) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) y[i] = a[i] + alpha * b;
+__global__ void add_scalar_kernel_cuda_impl(int64_t n, const T* a, typename BinaryOpMath<T>::type b, T* y, typename BinaryOpMath<T>::type alpha) {
+    using M = typename BinaryOpMath<T>::type;
+    TP_CUDA_GRIDSTRIDE(i) {
+        y[i] = static_cast<T>(static_cast<M>(a[i]) + alpha * static_cast<M>(b));
+    }
 }
 
 template <typename T>
-__global__ void sub_scalar_kernel_cuda_impl(int n, const T* a, T b, T* y, T alpha) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) y[i] = a[i] - alpha * b;
+__global__ void sub_scalar_kernel_cuda_impl(int64_t n, const T* a, typename BinaryOpMath<T>::type b, T* y, typename BinaryOpMath<T>::type alpha) {
+    using M = typename BinaryOpMath<T>::type;
+    TP_CUDA_GRIDSTRIDE(i) {
+        y[i] = static_cast<T>(static_cast<M>(a[i]) - alpha * static_cast<M>(b));
+    }
 }
 
 template <typename T>
-__global__ void mul_scalar_kernel_cuda_impl(int n, const T* a, T b, T* y) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) y[i] = a[i] * b;
+__global__ void mul_scalar_kernel_cuda_impl(int64_t n, const T* a, typename BinaryOpMath<T>::type b, T* y) {
+    using M = typename BinaryOpMath<T>::type;
+    TP_CUDA_GRIDSTRIDE(i) {
+        y[i] = static_cast<T>(static_cast<M>(a[i]) * static_cast<M>(b));
+    }
 }
 
 template <typename T>
-__global__ void div_scalar_kernel_cuda_impl(int n, const T* a, T b, T* y) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) y[i] = a[i] / b;
+__global__ void div_scalar_kernel_cuda_impl(int64_t n, const T* a, typename BinaryOpMath<T>::type b, T* y) {
+    using M = typename BinaryOpMath<T>::type;
+    TP_CUDA_GRIDSTRIDE(i) {
+        y[i] = static_cast<T>(static_cast<M>(a[i]) / static_cast<M>(b));
+    }
 }
 
 // --- Dispatchers ---
@@ -238,21 +287,104 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
     
     switch (result_dtype) {
         case DType::Float32:
-            add_broadcast_kernel<float><<<grid, block>>>(n, a.data_ptr<float>(), a_desc, b.data_ptr<float>(), b_desc, result.data_ptr<float>(), y_desc, alpha.to<float>());
+            add_broadcast_kernel<float><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<float>(), a_desc, b.data_ptr<float>(), b_desc, result.data_ptr<float>(), y_desc, alpha.to<float>());
             break;
         case DType::Int32:
-            add_broadcast_kernel<int><<<grid, block>>>(n, a.data_ptr<int>(), a_desc, b.data_ptr<int>(), b_desc, result.data_ptr<int>(), y_desc, alpha.to<int>());
+            add_broadcast_kernel<int><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<int>(), a_desc, b.data_ptr<int>(), b_desc, result.data_ptr<int>(), y_desc, alpha.to<int>());
             break;
         case DType::Int64:
-            add_broadcast_kernel<int64_t><<<grid, block>>>(n, a.data_ptr<int64_t>(), a_desc, b.data_ptr<int64_t>(), b_desc, result.data_ptr<int64_t>(), y_desc, alpha.to<int64_t>());
+            add_broadcast_kernel<int64_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<int64_t>(), a_desc, b.data_ptr<int64_t>(), b_desc, result.data_ptr<int64_t>(), y_desc, alpha.to<int64_t>());
+            break;
+        case DType::Float16:
+            add_broadcast_kernel<tensorplay::Half><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<tensorplay::Half>(), a_desc, b.data_ptr<tensorplay::Half>(), b_desc, result.data_ptr<tensorplay::Half>(), y_desc, alpha.to<float>());
+            break;
+        case DType::BFloat16:
+            add_broadcast_kernel<tensorplay::BFloat16><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<tensorplay::BFloat16>(), a_desc, b.data_ptr<tensorplay::BFloat16>(), b_desc, result.data_ptr<tensorplay::BFloat16>(), y_desc, alpha.to<float>());
             break;
         case DType::Float64:
-            add_broadcast_kernel<double><<<grid, block>>>(n, a.data_ptr<double>(), a_desc, b.data_ptr<double>(), b_desc, result.data_ptr<double>(), y_desc, alpha.to<double>());
+            add_broadcast_kernel<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<double>(), a_desc, b.data_ptr<double>(), b_desc, result.data_ptr<double>(), y_desc, alpha.to<double>());
             break;
         default:
             TP_THROW(NotImplementedError, "CUDA add: unsupported dtype");
     }
     return result;
+}
+
+__global__ void add_relu_same_shape_kernel(
+    int64_t n, const float* self, const float* other, float* result) {
+    const int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        const float value = self[i] + other[i];
+        result[i] = value < 0.0f ? 0.0f : value;
+    }
+}
+
+// TorchInductor's pointwise epilogue fusion writes relu(add(...)) directly
+// to the final output, including when the add operands broadcast.
+__global__ void add_relu_broadcast_kernel(
+    int64_t n,
+    const float* self,
+    TensorDesc self_desc,
+    const float* other,
+    TensorDesc other_desc,
+    float* result,
+    TensorDesc result_desc) {
+    TP_CUDA_GRIDSTRIDE(i) {
+        const int64_t self_offset = get_offset(i, self_desc, result_desc);
+        const int64_t other_offset = get_offset(i, other_desc, result_desc);
+        const float value = self[self_offset] + other[other_offset];
+        const int64_t result_offset = get_output_offset(i, result_desc);
+        result[result_offset] = value < 0.0f ? 0.0f : value;
+    }
+}
+
+Tensor add_relu_cuda(const Tensor& self, const Tensor& other) {
+    if (self.dtype() == DType::Float32 && other.dtype() == DType::Float32 &&
+        self.shape() == other.shape() && self.is_contiguous() &&
+        other.is_contiguous()) {
+        Tensor result = Tensor::empty(
+            static_cast<std::vector<int64_t>>(self.shape()), DType::Float32, self.device());
+        const int64_t n = result.numel();
+        if (n == 0) return result;
+        dim3 grid, block;
+        get_grid_block(n, grid, block);
+        add_relu_same_shape_kernel<<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
+            n, self.data_ptr<float>(), other.data_ptr<float>(), result.data_ptr<float>());
+        CUDA_CHECK(cudaGetLastError());
+        return result;
+    }
+
+    if (self.dtype() == DType::Float32 && other.dtype() == DType::Float32) {
+        const std::vector<int64_t> output_shape = broadcast_shapes(
+            static_cast<std::vector<int64_t>>(self.shape()),
+            static_cast<std::vector<int64_t>>(other.shape()));
+        const bool output_channels_last =
+            is_channels_last_4d(self, output_shape) ||
+            is_channels_last_4d(other, output_shape);
+        Tensor result = output_channels_last
+            ? empty_channels_last_4d(output_shape, DType::Float32, self.device())
+            : Tensor::empty(output_shape, DType::Float32, self.device());
+        const int64_t n = result.numel();
+        if (n == 0) return result;
+        dim3 grid, block;
+        get_grid_block(n, grid, block);
+        const TensorDesc self_desc = make_desc(self, output_shape.size());
+        const TensorDesc other_desc = make_desc(other, output_shape.size());
+        const TensorDesc result_desc = make_desc(result, output_shape.size());
+        add_relu_broadcast_kernel<<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
+            n,
+            self.data_ptr<float>(),
+            self_desc,
+            other.data_ptr<float>(),
+            other_desc,
+            result.data_ptr<float>(),
+            result_desc);
+        CUDA_CHECK(cudaGetLastError());
+        return result;
+    }
+
+    Tensor result = add_kernel(self, other, Scalar(1));
+    return relu_inplace_kernel_cudnn(result);
 }
 
 Tensor& add_inplace_kernel(Tensor& self, const Tensor& other, Scalar alpha) {
@@ -269,16 +401,22 @@ Tensor& add_inplace_kernel(Tensor& self, const Tensor& other, Scalar alpha) {
     
     switch (self.dtype()) {
         case DType::Float32:
-            add_broadcast_kernel<float><<<grid, block>>>(n, self.data_ptr<float>(), a_desc, b.data_ptr<float>(), b_desc, self.data_ptr<float>(), y_desc, alpha.to<float>());
+            add_broadcast_kernel<float><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<float>(), a_desc, b.data_ptr<float>(), b_desc, self.data_ptr<float>(), y_desc, alpha.to<float>());
             break;
         case DType::Int32:
-            add_broadcast_kernel<int><<<grid, block>>>(n, self.data_ptr<int>(), a_desc, b.data_ptr<int>(), b_desc, self.data_ptr<int>(), y_desc, alpha.to<int>());
+            add_broadcast_kernel<int><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<int>(), a_desc, b.data_ptr<int>(), b_desc, self.data_ptr<int>(), y_desc, alpha.to<int>());
             break;
         case DType::Int64:
-            add_broadcast_kernel<int64_t><<<grid, block>>>(n, self.data_ptr<int64_t>(), a_desc, b.data_ptr<int64_t>(), b_desc, self.data_ptr<int64_t>(), y_desc, alpha.to<int64_t>());
+            add_broadcast_kernel<int64_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<int64_t>(), a_desc, b.data_ptr<int64_t>(), b_desc, self.data_ptr<int64_t>(), y_desc, alpha.to<int64_t>());
+            break;
+        case DType::Float16:
+            add_broadcast_kernel<tensorplay::Half><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<tensorplay::Half>(), a_desc, b.data_ptr<tensorplay::Half>(), b_desc, self.data_ptr<tensorplay::Half>(), y_desc, alpha.to<float>());
+            break;
+        case DType::BFloat16:
+            add_broadcast_kernel<tensorplay::BFloat16><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<tensorplay::BFloat16>(), a_desc, b.data_ptr<tensorplay::BFloat16>(), b_desc, self.data_ptr<tensorplay::BFloat16>(), y_desc, alpha.to<float>());
             break;
         case DType::Float64:
-            add_broadcast_kernel<double><<<grid, block>>>(n, self.data_ptr<double>(), a_desc, b.data_ptr<double>(), b_desc, self.data_ptr<double>(), y_desc, alpha.to<double>());
+            add_broadcast_kernel<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<double>(), a_desc, b.data_ptr<double>(), b_desc, self.data_ptr<double>(), y_desc, alpha.to<double>());
             break;
         default:
             TP_THROW(NotImplementedError, "CUDA add_: unsupported dtype");
@@ -305,16 +443,22 @@ Tensor sub_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
     
     switch (result_dtype) {
         case DType::Float32:
-            sub_broadcast_kernel<float><<<grid, block>>>(n, a.data_ptr<float>(), a_desc, b.data_ptr<float>(), b_desc, result.data_ptr<float>(), y_desc, alpha.to<float>());
+            sub_broadcast_kernel<float><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<float>(), a_desc, b.data_ptr<float>(), b_desc, result.data_ptr<float>(), y_desc, alpha.to<float>());
             break;
         case DType::Int32:
-            sub_broadcast_kernel<int><<<grid, block>>>(n, a.data_ptr<int>(), a_desc, b.data_ptr<int>(), b_desc, result.data_ptr<int>(), y_desc, alpha.to<int>());
+            sub_broadcast_kernel<int><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<int>(), a_desc, b.data_ptr<int>(), b_desc, result.data_ptr<int>(), y_desc, alpha.to<int>());
             break;
         case DType::Int64:
-            sub_broadcast_kernel<int64_t><<<grid, block>>>(n, a.data_ptr<int64_t>(), a_desc, b.data_ptr<int64_t>(), b_desc, result.data_ptr<int64_t>(), y_desc, alpha.to<int64_t>());
+            sub_broadcast_kernel<int64_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<int64_t>(), a_desc, b.data_ptr<int64_t>(), b_desc, result.data_ptr<int64_t>(), y_desc, alpha.to<int64_t>());
+            break;
+        case DType::Float16:
+            sub_broadcast_kernel<tensorplay::Half><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<tensorplay::Half>(), a_desc, b.data_ptr<tensorplay::Half>(), b_desc, result.data_ptr<tensorplay::Half>(), y_desc, alpha.to<float>());
+            break;
+        case DType::BFloat16:
+            sub_broadcast_kernel<tensorplay::BFloat16><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<tensorplay::BFloat16>(), a_desc, b.data_ptr<tensorplay::BFloat16>(), b_desc, result.data_ptr<tensorplay::BFloat16>(), y_desc, alpha.to<float>());
             break;
         case DType::Float64:
-            sub_broadcast_kernel<double><<<grid, block>>>(n, a.data_ptr<double>(), a_desc, b.data_ptr<double>(), b_desc, result.data_ptr<double>(), y_desc, alpha.to<double>());
+            sub_broadcast_kernel<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<double>(), a_desc, b.data_ptr<double>(), b_desc, result.data_ptr<double>(), y_desc, alpha.to<double>());
             break;
         default:
             TP_THROW(NotImplementedError, "CUDA sub: unsupported dtype");
@@ -335,16 +479,22 @@ Tensor& sub_inplace_kernel(Tensor& self, const Tensor& other, Scalar alpha) {
     
     switch (self.dtype()) {
         case DType::Float32:
-            sub_broadcast_kernel<float><<<grid, block>>>(n, self.data_ptr<float>(), a_desc, b.data_ptr<float>(), b_desc, self.data_ptr<float>(), y_desc, alpha.to<float>());
+            sub_broadcast_kernel<float><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<float>(), a_desc, b.data_ptr<float>(), b_desc, self.data_ptr<float>(), y_desc, alpha.to<float>());
             break;
         case DType::Int32:
-            sub_broadcast_kernel<int><<<grid, block>>>(n, self.data_ptr<int>(), a_desc, b.data_ptr<int>(), b_desc, self.data_ptr<int>(), y_desc, alpha.to<int>());
+            sub_broadcast_kernel<int><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<int>(), a_desc, b.data_ptr<int>(), b_desc, self.data_ptr<int>(), y_desc, alpha.to<int>());
             break;
         case DType::Int64:
-            sub_broadcast_kernel<int64_t><<<grid, block>>>(n, self.data_ptr<int64_t>(), a_desc, b.data_ptr<int64_t>(), b_desc, self.data_ptr<int64_t>(), y_desc, alpha.to<int64_t>());
+            sub_broadcast_kernel<int64_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<int64_t>(), a_desc, b.data_ptr<int64_t>(), b_desc, self.data_ptr<int64_t>(), y_desc, alpha.to<int64_t>());
+            break;
+        case DType::Float16:
+            sub_broadcast_kernel<tensorplay::Half><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<tensorplay::Half>(), a_desc, b.data_ptr<tensorplay::Half>(), b_desc, self.data_ptr<tensorplay::Half>(), y_desc, alpha.to<float>());
+            break;
+        case DType::BFloat16:
+            sub_broadcast_kernel<tensorplay::BFloat16><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<tensorplay::BFloat16>(), a_desc, b.data_ptr<tensorplay::BFloat16>(), b_desc, self.data_ptr<tensorplay::BFloat16>(), y_desc, alpha.to<float>());
             break;
         case DType::Float64:
-            sub_broadcast_kernel<double><<<grid, block>>>(n, self.data_ptr<double>(), a_desc, b.data_ptr<double>(), b_desc, self.data_ptr<double>(), y_desc, alpha.to<double>());
+            sub_broadcast_kernel<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<double>(), a_desc, b.data_ptr<double>(), b_desc, self.data_ptr<double>(), y_desc, alpha.to<double>());
             break;
         default:
             TP_THROW(NotImplementedError, "CUDA sub_: unsupported dtype");
@@ -371,16 +521,22 @@ Tensor mul_kernel(const Tensor& self, const Tensor& other) {
     
     switch (result_dtype) {
         case DType::Float32:
-            mul_broadcast_kernel<float><<<grid, block>>>(n, a.data_ptr<float>(), a_desc, b.data_ptr<float>(), b_desc, result.data_ptr<float>(), y_desc);
+            mul_broadcast_kernel<float><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<float>(), a_desc, b.data_ptr<float>(), b_desc, result.data_ptr<float>(), y_desc);
             break;
         case DType::Int32:
-            mul_broadcast_kernel<int><<<grid, block>>>(n, a.data_ptr<int>(), a_desc, b.data_ptr<int>(), b_desc, result.data_ptr<int>(), y_desc);
+            mul_broadcast_kernel<int><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<int>(), a_desc, b.data_ptr<int>(), b_desc, result.data_ptr<int>(), y_desc);
             break;
         case DType::Int64:
-            mul_broadcast_kernel<int64_t><<<grid, block>>>(n, a.data_ptr<int64_t>(), a_desc, b.data_ptr<int64_t>(), b_desc, result.data_ptr<int64_t>(), y_desc);
+            mul_broadcast_kernel<int64_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<int64_t>(), a_desc, b.data_ptr<int64_t>(), b_desc, result.data_ptr<int64_t>(), y_desc);
+            break;
+        case DType::Float16:
+            mul_broadcast_kernel<tensorplay::Half><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<tensorplay::Half>(), a_desc, b.data_ptr<tensorplay::Half>(), b_desc, result.data_ptr<tensorplay::Half>(), y_desc);
+            break;
+        case DType::BFloat16:
+            mul_broadcast_kernel<tensorplay::BFloat16><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<tensorplay::BFloat16>(), a_desc, b.data_ptr<tensorplay::BFloat16>(), b_desc, result.data_ptr<tensorplay::BFloat16>(), y_desc);
             break;
         case DType::Float64:
-            mul_broadcast_kernel<double><<<grid, block>>>(n, a.data_ptr<double>(), a_desc, b.data_ptr<double>(), b_desc, result.data_ptr<double>(), y_desc);
+            mul_broadcast_kernel<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<double>(), a_desc, b.data_ptr<double>(), b_desc, result.data_ptr<double>(), y_desc);
             break;
         default:
             TP_THROW(NotImplementedError, "CUDA mul: unsupported dtype");
@@ -401,21 +557,66 @@ Tensor& mul_inplace_kernel(Tensor& self, const Tensor& other) {
     
     switch (self.dtype()) {
         case DType::Float32:
-            mul_broadcast_kernel<float><<<grid, block>>>(n, self.data_ptr<float>(), a_desc, b.data_ptr<float>(), b_desc, self.data_ptr<float>(), y_desc);
+            mul_broadcast_kernel<float><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<float>(), a_desc, b.data_ptr<float>(), b_desc, self.data_ptr<float>(), y_desc);
             break;
         case DType::Int32:
-            mul_broadcast_kernel<int><<<grid, block>>>(n, self.data_ptr<int>(), a_desc, b.data_ptr<int>(), b_desc, self.data_ptr<int>(), y_desc);
+            mul_broadcast_kernel<int><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<int>(), a_desc, b.data_ptr<int>(), b_desc, self.data_ptr<int>(), y_desc);
             break;
         case DType::Int64:
-            mul_broadcast_kernel<int64_t><<<grid, block>>>(n, self.data_ptr<int64_t>(), a_desc, b.data_ptr<int64_t>(), b_desc, self.data_ptr<int64_t>(), y_desc);
+            mul_broadcast_kernel<int64_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<int64_t>(), a_desc, b.data_ptr<int64_t>(), b_desc, self.data_ptr<int64_t>(), y_desc);
+            break;
+        case DType::Float16:
+            mul_broadcast_kernel<tensorplay::Half><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<tensorplay::Half>(), a_desc, b.data_ptr<tensorplay::Half>(), b_desc, self.data_ptr<tensorplay::Half>(), y_desc);
+            break;
+        case DType::BFloat16:
+            mul_broadcast_kernel<tensorplay::BFloat16><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<tensorplay::BFloat16>(), a_desc, b.data_ptr<tensorplay::BFloat16>(), b_desc, self.data_ptr<tensorplay::BFloat16>(), y_desc);
             break;
         case DType::Float64:
-            mul_broadcast_kernel<double><<<grid, block>>>(n, self.data_ptr<double>(), a_desc, b.data_ptr<double>(), b_desc, self.data_ptr<double>(), y_desc);
+            mul_broadcast_kernel<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<double>(), a_desc, b.data_ptr<double>(), b_desc, self.data_ptr<double>(), y_desc);
             break;
         default:
             TP_THROW(NotImplementedError, "CUDA mul_: unsupported dtype");
     }
     return self;
+}
+
+Tensor fused_mul_add_kernel(const Tensor& self, const Tensor& other, const Tensor& addend) {
+    if (self.dtype() == DType::Float32 && other.dtype() == DType::Float32 &&
+        addend.dtype() == DType::Float32 && self.is_contiguous() &&
+        other.is_contiguous() && addend.is_contiguous() &&
+        self.shape() == other.shape() && self.shape() == addend.shape()) {
+        Tensor result = Tensor::empty(
+            static_cast<std::vector<int64_t>>(self.shape()), DType::Float32, self.device());
+        int64_t n = self.numel();
+        if (n == 0) return result;
+        dim3 grid, block;
+        get_grid_block(n, grid, block);
+        fused_mul_add_kernel_cuda_impl<float><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
+            n, self.data_ptr<float>(), other.data_ptr<float>(), addend.data_ptr<float>(),
+            result.data_ptr<float>());
+        CUDA_CHECK(cudaGetLastError());
+        return result;
+    }
+
+    return add_kernel(mul_kernel(self, other), addend, Scalar(1));
+}
+
+Tensor fused_mul_add_scalar_kernel(const Tensor& self, Scalar other, Scalar addend) {
+    if (self.dtype() == DType::Float32 && self.is_contiguous()) {
+        Tensor result = Tensor::empty(
+            static_cast<std::vector<int64_t>>(self.shape()), DType::Float32, self.device());
+        const int64_t n = self.numel();
+        if (n == 0) return result;
+        dim3 grid, block;
+        get_grid_block(n, grid, block);
+        fused_mul_add_scalar_kernel_cuda_impl<<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
+            n, self.data_ptr<float>(), static_cast<float>(other.toDouble()),
+            static_cast<float>(addend.toDouble()), result.data_ptr<float>());
+        CUDA_CHECK(cudaGetLastError());
+        return result;
+    }
+
+    return add_scalar_kernel(mul_scalar_kernel(self, other), addend, Scalar(1));
 }
 
 // DIV
@@ -439,10 +640,16 @@ Tensor div_kernel(const Tensor& self, const Tensor& other) {
     
     switch (result_dtype) {
         case DType::Float32:
-            div_broadcast_kernel<float><<<grid, block>>>(n, a.data_ptr<float>(), a_desc, b.data_ptr<float>(), b_desc, result.data_ptr<float>(), y_desc);
+            div_broadcast_kernel<float><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<float>(), a_desc, b.data_ptr<float>(), b_desc, result.data_ptr<float>(), y_desc);
+            break;
+        case DType::Float16:
+            div_broadcast_kernel<tensorplay::Half><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<tensorplay::Half>(), a_desc, b.data_ptr<tensorplay::Half>(), b_desc, result.data_ptr<tensorplay::Half>(), y_desc);
+            break;
+        case DType::BFloat16:
+            div_broadcast_kernel<tensorplay::BFloat16><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<tensorplay::BFloat16>(), a_desc, b.data_ptr<tensorplay::BFloat16>(), b_desc, result.data_ptr<tensorplay::BFloat16>(), y_desc);
             break;
         case DType::Float64:
-            div_broadcast_kernel<double><<<grid, block>>>(n, a.data_ptr<double>(), a_desc, b.data_ptr<double>(), b_desc, result.data_ptr<double>(), y_desc);
+            div_broadcast_kernel<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<double>(), a_desc, b.data_ptr<double>(), b_desc, result.data_ptr<double>(), y_desc);
             break;
         default:
             TP_THROW(NotImplementedError, "CUDA div: unsupported dtype");
@@ -468,16 +675,22 @@ Tensor& div_inplace_kernel(Tensor& self, const Tensor& other) {
     
     switch (self.dtype()) {
         case DType::Float32:
-            div_broadcast_kernel<float><<<grid, block>>>(n, self.data_ptr<float>(), a_desc, b.data_ptr<float>(), b_desc, self.data_ptr<float>(), y_desc);
+            div_broadcast_kernel<float><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<float>(), a_desc, b.data_ptr<float>(), b_desc, self.data_ptr<float>(), y_desc);
             break;
         case DType::Int32:
-            div_broadcast_kernel<int><<<grid, block>>>(n, self.data_ptr<int>(), a_desc, b.data_ptr<int>(), b_desc, self.data_ptr<int>(), y_desc);
+            div_broadcast_kernel<int><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<int>(), a_desc, b.data_ptr<int>(), b_desc, self.data_ptr<int>(), y_desc);
             break;
         case DType::Int64:
-            div_broadcast_kernel<int64_t><<<grid, block>>>(n, self.data_ptr<int64_t>(), a_desc, b.data_ptr<int64_t>(), b_desc, self.data_ptr<int64_t>(), y_desc);
+            div_broadcast_kernel<int64_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<int64_t>(), a_desc, b.data_ptr<int64_t>(), b_desc, self.data_ptr<int64_t>(), y_desc);
+            break;
+        case DType::Float16:
+            div_broadcast_kernel<tensorplay::Half><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<tensorplay::Half>(), a_desc, b.data_ptr<tensorplay::Half>(), b_desc, self.data_ptr<tensorplay::Half>(), y_desc);
+            break;
+        case DType::BFloat16:
+            div_broadcast_kernel<tensorplay::BFloat16><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<tensorplay::BFloat16>(), a_desc, b.data_ptr<tensorplay::BFloat16>(), b_desc, self.data_ptr<tensorplay::BFloat16>(), y_desc);
             break;
         case DType::Float64:
-            div_broadcast_kernel<double><<<grid, block>>>(n, self.data_ptr<double>(), a_desc, b.data_ptr<double>(), b_desc, self.data_ptr<double>(), y_desc);
+            div_broadcast_kernel<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<double>(), a_desc, b.data_ptr<double>(), b_desc, self.data_ptr<double>(), y_desc);
             break;
         default:
             TP_THROW(NotImplementedError, "CUDA div_: unsupported dtype");
@@ -488,7 +701,11 @@ Tensor& div_inplace_kernel(Tensor& self, const Tensor& other) {
 
 Tensor add_scalar_kernel(const Tensor& self, Scalar other, Scalar alpha) {
     DType result_dtype = self.dtype();
-    if (other.isFloatingPoint() || alpha.isFloatingPoint()) {
+    // PyTorch's scalar promotion is value/type aware: a Python float does not
+    // widen an already floating tensor (including fp16/bf16).  Only integral
+    // tensors need promotion when they meet a floating scalar.
+    if (!isFloatingType(result_dtype) &&
+        (other.isFloatingPoint() || alpha.isFloatingPoint())) {
         result_dtype = promoteTypes(result_dtype, DType::Float32);
     }
     
@@ -502,16 +719,22 @@ Tensor add_scalar_kernel(const Tensor& self, Scalar other, Scalar alpha) {
     
     switch (result_dtype) {
         case DType::Float32:
-            add_scalar_kernel_cuda_impl<float><<<grid, block>>>(n, a.data_ptr<float>(), other.to<float>(), result.data_ptr<float>(), alpha.to<float>());
+            add_scalar_kernel_cuda_impl<float><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<float>(), other.to<float>(), result.data_ptr<float>(), alpha.to<float>());
             break;
         case DType::Int32:
-            add_scalar_kernel_cuda_impl<int><<<grid, block>>>(n, a.data_ptr<int>(), other.to<int>(), result.data_ptr<int>(), alpha.to<int>());
+            add_scalar_kernel_cuda_impl<int><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<int>(), other.to<int>(), result.data_ptr<int>(), alpha.to<int>());
             break;
         case DType::Int64:
-            add_scalar_kernel_cuda_impl<int64_t><<<grid, block>>>(n, a.data_ptr<int64_t>(), other.to<int64_t>(), result.data_ptr<int64_t>(), alpha.to<int64_t>());
+            add_scalar_kernel_cuda_impl<int64_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<int64_t>(), other.to<int64_t>(), result.data_ptr<int64_t>(), alpha.to<int64_t>());
+            break;
+        case DType::Float16:
+            add_scalar_kernel_cuda_impl<tensorplay::Half><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<tensorplay::Half>(), other.to<float>(), result.data_ptr<tensorplay::Half>(), alpha.to<float>());
+            break;
+        case DType::BFloat16:
+            add_scalar_kernel_cuda_impl<tensorplay::BFloat16><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<tensorplay::BFloat16>(), other.to<float>(), result.data_ptr<tensorplay::BFloat16>(), alpha.to<float>());
             break;
         case DType::Float64:
-            add_scalar_kernel_cuda_impl<double><<<grid, block>>>(n, a.data_ptr<double>(), other.to<double>(), result.data_ptr<double>(), alpha.to<double>());
+            add_scalar_kernel_cuda_impl<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<double>(), other.to<double>(), result.data_ptr<double>(), alpha.to<double>());
             break;
         default:
             TP_THROW(NotImplementedError, "CUDA add_scalar: unsupported dtype");
@@ -530,16 +753,22 @@ Tensor& add_scalar_inplace_kernel(Tensor& self, Scalar other, Scalar alpha) {
     
     switch (self.dtype()) {
         case DType::Float32:
-            add_scalar_kernel_cuda_impl<float><<<grid, block>>>(n, self.data_ptr<float>(), other.to<float>(), self.data_ptr<float>(), alpha.to<float>());
+            add_scalar_kernel_cuda_impl<float><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<float>(), other.to<float>(), self.data_ptr<float>(), alpha.to<float>());
             break;
         case DType::Int32:
-            add_scalar_kernel_cuda_impl<int><<<grid, block>>>(n, self.data_ptr<int>(), other.to<int>(), self.data_ptr<int>(), alpha.to<int>());
+            add_scalar_kernel_cuda_impl<int><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<int>(), other.to<int>(), self.data_ptr<int>(), alpha.to<int>());
             break;
         case DType::Int64:
-            add_scalar_kernel_cuda_impl<int64_t><<<grid, block>>>(n, self.data_ptr<int64_t>(), other.to<int64_t>(), self.data_ptr<int64_t>(), alpha.to<int64_t>());
+            add_scalar_kernel_cuda_impl<int64_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<int64_t>(), other.to<int64_t>(), self.data_ptr<int64_t>(), alpha.to<int64_t>());
+            break;
+        case DType::Float16:
+            add_scalar_kernel_cuda_impl<tensorplay::Half><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<tensorplay::Half>(), other.to<float>(), self.data_ptr<tensorplay::Half>(), alpha.to<float>());
+            break;
+        case DType::BFloat16:
+            add_scalar_kernel_cuda_impl<tensorplay::BFloat16><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<tensorplay::BFloat16>(), other.to<float>(), self.data_ptr<tensorplay::BFloat16>(), alpha.to<float>());
             break;
         case DType::Float64:
-            add_scalar_kernel_cuda_impl<double><<<grid, block>>>(n, self.data_ptr<double>(), other.to<double>(), self.data_ptr<double>(), alpha.to<double>());
+            add_scalar_kernel_cuda_impl<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<double>(), other.to<double>(), self.data_ptr<double>(), alpha.to<double>());
             break;
         default:
             TP_THROW(NotImplementedError, "CUDA add_scalar_: unsupported dtype");
@@ -549,7 +778,8 @@ Tensor& add_scalar_inplace_kernel(Tensor& self, Scalar other, Scalar alpha) {
 
 Tensor sub_scalar_kernel(const Tensor& self, Scalar other, Scalar alpha) {
     DType result_dtype = self.dtype();
-    if (other.isFloatingPoint() || alpha.isFloatingPoint()) {
+    if (!isFloatingType(result_dtype) &&
+        (other.isFloatingPoint() || alpha.isFloatingPoint())) {
         result_dtype = promoteTypes(result_dtype, DType::Float32);
     }
     
@@ -563,16 +793,22 @@ Tensor sub_scalar_kernel(const Tensor& self, Scalar other, Scalar alpha) {
     
     switch (result_dtype) {
         case DType::Float32:
-            sub_scalar_kernel_cuda_impl<float><<<grid, block>>>(n, a.data_ptr<float>(), other.to<float>(), result.data_ptr<float>(), alpha.to<float>());
+            sub_scalar_kernel_cuda_impl<float><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<float>(), other.to<float>(), result.data_ptr<float>(), alpha.to<float>());
             break;
         case DType::Int32:
-            sub_scalar_kernel_cuda_impl<int><<<grid, block>>>(n, a.data_ptr<int>(), other.to<int>(), result.data_ptr<int>(), alpha.to<int>());
+            sub_scalar_kernel_cuda_impl<int><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<int>(), other.to<int>(), result.data_ptr<int>(), alpha.to<int>());
             break;
         case DType::Int64:
-            sub_scalar_kernel_cuda_impl<int64_t><<<grid, block>>>(n, a.data_ptr<int64_t>(), other.to<int64_t>(), result.data_ptr<int64_t>(), alpha.to<int64_t>());
+            sub_scalar_kernel_cuda_impl<int64_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<int64_t>(), other.to<int64_t>(), result.data_ptr<int64_t>(), alpha.to<int64_t>());
+            break;
+        case DType::Float16:
+            sub_scalar_kernel_cuda_impl<tensorplay::Half><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<tensorplay::Half>(), other.to<float>(), result.data_ptr<tensorplay::Half>(), alpha.to<float>());
+            break;
+        case DType::BFloat16:
+            sub_scalar_kernel_cuda_impl<tensorplay::BFloat16><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<tensorplay::BFloat16>(), other.to<float>(), result.data_ptr<tensorplay::BFloat16>(), alpha.to<float>());
             break;
         case DType::Float64:
-            sub_scalar_kernel_cuda_impl<double><<<grid, block>>>(n, a.data_ptr<double>(), other.to<double>(), result.data_ptr<double>(), alpha.to<double>());
+            sub_scalar_kernel_cuda_impl<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<double>(), other.to<double>(), result.data_ptr<double>(), alpha.to<double>());
             break;
         default:
             TP_THROW(NotImplementedError, "CUDA sub_scalar: unsupported dtype");
@@ -591,16 +827,22 @@ Tensor& sub_scalar_inplace_kernel(Tensor& self, Scalar other, Scalar alpha) {
     
     switch (self.dtype()) {
         case DType::Float32:
-            sub_scalar_kernel_cuda_impl<float><<<grid, block>>>(n, self.data_ptr<float>(), other.to<float>(), self.data_ptr<float>(), alpha.to<float>());
+            sub_scalar_kernel_cuda_impl<float><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<float>(), other.to<float>(), self.data_ptr<float>(), alpha.to<float>());
             break;
         case DType::Int32:
-            sub_scalar_kernel_cuda_impl<int><<<grid, block>>>(n, self.data_ptr<int>(), other.to<int>(), self.data_ptr<int>(), alpha.to<int>());
+            sub_scalar_kernel_cuda_impl<int><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<int>(), other.to<int>(), self.data_ptr<int>(), alpha.to<int>());
             break;
         case DType::Int64:
-            sub_scalar_kernel_cuda_impl<int64_t><<<grid, block>>>(n, self.data_ptr<int64_t>(), other.to<int64_t>(), self.data_ptr<int64_t>(), alpha.to<int64_t>());
+            sub_scalar_kernel_cuda_impl<int64_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<int64_t>(), other.to<int64_t>(), self.data_ptr<int64_t>(), alpha.to<int64_t>());
+            break;
+        case DType::Float16:
+            sub_scalar_kernel_cuda_impl<tensorplay::Half><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<tensorplay::Half>(), other.to<float>(), self.data_ptr<tensorplay::Half>(), alpha.to<float>());
+            break;
+        case DType::BFloat16:
+            sub_scalar_kernel_cuda_impl<tensorplay::BFloat16><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<tensorplay::BFloat16>(), other.to<float>(), self.data_ptr<tensorplay::BFloat16>(), alpha.to<float>());
             break;
         case DType::Float64:
-            sub_scalar_kernel_cuda_impl<double><<<grid, block>>>(n, self.data_ptr<double>(), other.to<double>(), self.data_ptr<double>(), alpha.to<double>());
+            sub_scalar_kernel_cuda_impl<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<double>(), other.to<double>(), self.data_ptr<double>(), alpha.to<double>());
             break;
         default:
             TP_THROW(NotImplementedError, "CUDA sub_scalar_: unsupported dtype");
@@ -610,7 +852,7 @@ Tensor& sub_scalar_inplace_kernel(Tensor& self, Scalar other, Scalar alpha) {
 
 Tensor mul_scalar_kernel(const Tensor& self, Scalar other) {
     DType result_dtype = self.dtype();
-    if (other.isFloatingPoint()) {
+    if (!isFloatingType(result_dtype) && other.isFloatingPoint()) {
         result_dtype = promoteTypes(result_dtype, DType::Float32);
     }
     
@@ -624,16 +866,22 @@ Tensor mul_scalar_kernel(const Tensor& self, Scalar other) {
     
     switch (result_dtype) {
         case DType::Float32:
-            mul_scalar_kernel_cuda_impl<float><<<grid, block>>>(n, a.data_ptr<float>(), other.to<float>(), result.data_ptr<float>());
+            mul_scalar_kernel_cuda_impl<float><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<float>(), other.to<float>(), result.data_ptr<float>());
             break;
         case DType::Int32:
-            mul_scalar_kernel_cuda_impl<int><<<grid, block>>>(n, a.data_ptr<int>(), other.to<int>(), result.data_ptr<int>());
+            mul_scalar_kernel_cuda_impl<int><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<int>(), other.to<int>(), result.data_ptr<int>());
             break;
         case DType::Int64:
-            mul_scalar_kernel_cuda_impl<int64_t><<<grid, block>>>(n, a.data_ptr<int64_t>(), other.to<int64_t>(), result.data_ptr<int64_t>());
+            mul_scalar_kernel_cuda_impl<int64_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<int64_t>(), other.to<int64_t>(), result.data_ptr<int64_t>());
+            break;
+        case DType::Float16:
+            mul_scalar_kernel_cuda_impl<tensorplay::Half><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<tensorplay::Half>(), other.to<float>(), result.data_ptr<tensorplay::Half>());
+            break;
+        case DType::BFloat16:
+            mul_scalar_kernel_cuda_impl<tensorplay::BFloat16><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<tensorplay::BFloat16>(), other.to<float>(), result.data_ptr<tensorplay::BFloat16>());
             break;
         case DType::Float64:
-            mul_scalar_kernel_cuda_impl<double><<<grid, block>>>(n, a.data_ptr<double>(), other.to<double>(), result.data_ptr<double>());
+            mul_scalar_kernel_cuda_impl<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<double>(), other.to<double>(), result.data_ptr<double>());
             break;
         default:
             TP_THROW(NotImplementedError, "CUDA mul_scalar: unsupported dtype");
@@ -652,16 +900,22 @@ Tensor& mul_scalar_inplace_kernel(Tensor& self, Scalar other) {
     
     switch (self.dtype()) {
         case DType::Float32:
-            mul_scalar_kernel_cuda_impl<float><<<grid, block>>>(n, self.data_ptr<float>(), other.to<float>(), self.data_ptr<float>());
+            mul_scalar_kernel_cuda_impl<float><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<float>(), other.to<float>(), self.data_ptr<float>());
             break;
         case DType::Int32:
-            mul_scalar_kernel_cuda_impl<int><<<grid, block>>>(n, self.data_ptr<int>(), other.to<int>(), self.data_ptr<int>());
+            mul_scalar_kernel_cuda_impl<int><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<int>(), other.to<int>(), self.data_ptr<int>());
             break;
         case DType::Int64:
-            mul_scalar_kernel_cuda_impl<int64_t><<<grid, block>>>(n, self.data_ptr<int64_t>(), other.to<int64_t>(), self.data_ptr<int64_t>());
+            mul_scalar_kernel_cuda_impl<int64_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<int64_t>(), other.to<int64_t>(), self.data_ptr<int64_t>());
+            break;
+        case DType::Float16:
+            mul_scalar_kernel_cuda_impl<tensorplay::Half><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<tensorplay::Half>(), other.to<float>(), self.data_ptr<tensorplay::Half>());
+            break;
+        case DType::BFloat16:
+            mul_scalar_kernel_cuda_impl<tensorplay::BFloat16><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<tensorplay::BFloat16>(), other.to<float>(), self.data_ptr<tensorplay::BFloat16>());
             break;
         case DType::Float64:
-            mul_scalar_kernel_cuda_impl<double><<<grid, block>>>(n, self.data_ptr<double>(), other.to<double>(), self.data_ptr<double>());
+            mul_scalar_kernel_cuda_impl<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<double>(), other.to<double>(), self.data_ptr<double>());
             break;
         default:
             TP_THROW(NotImplementedError, "CUDA mul_scalar_: unsupported dtype");
@@ -671,7 +925,9 @@ Tensor& mul_scalar_inplace_kernel(Tensor& self, Scalar other) {
 
 Tensor div_scalar_kernel(const Tensor& self, Scalar other) {
     DType result_dtype = self.dtype();
-    result_dtype = promoteTypes(result_dtype, DType::Float32); // Always promote to float
+    // True division promotes integral tensors, but preserves fp16/bf16/fp32/
+    // fp64 just like torch.div(tensor, Python scalar).
+    if (!isFloatingType(result_dtype)) result_dtype = DType::Float32;
     
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), result_dtype, self.device());
     int64_t n = self.numel();
@@ -683,10 +939,16 @@ Tensor div_scalar_kernel(const Tensor& self, Scalar other) {
     
     switch (result_dtype) {
         case DType::Float32:
-            div_scalar_kernel_cuda_impl<float><<<grid, block>>>(n, a.data_ptr<float>(), other.to<float>(), result.data_ptr<float>());
+            div_scalar_kernel_cuda_impl<float><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<float>(), other.to<float>(), result.data_ptr<float>());
+            break;
+        case DType::Float16:
+            div_scalar_kernel_cuda_impl<tensorplay::Half><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<tensorplay::Half>(), other.to<float>(), result.data_ptr<tensorplay::Half>());
+            break;
+        case DType::BFloat16:
+            div_scalar_kernel_cuda_impl<tensorplay::BFloat16><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<tensorplay::BFloat16>(), other.to<float>(), result.data_ptr<tensorplay::BFloat16>());
             break;
         case DType::Float64:
-            div_scalar_kernel_cuda_impl<double><<<grid, block>>>(n, a.data_ptr<double>(), other.to<double>(), result.data_ptr<double>());
+            div_scalar_kernel_cuda_impl<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<double>(), other.to<double>(), result.data_ptr<double>());
             break;
         default:
             TP_THROW(NotImplementedError, "CUDA div_scalar: unsupported dtype");
@@ -711,16 +973,22 @@ Tensor& div_scalar_inplace_kernel(Tensor& self, Scalar other) {
     
     switch (self.dtype()) {
         case DType::Float32:
-            div_scalar_kernel_cuda_impl<float><<<grid, block>>>(n, self.data_ptr<float>(), other.to<float>(), self.data_ptr<float>());
+            div_scalar_kernel_cuda_impl<float><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<float>(), other.to<float>(), self.data_ptr<float>());
             break;
         case DType::Int32:
-            div_scalar_kernel_cuda_impl<int><<<grid, block>>>(n, self.data_ptr<int>(), other.to<int>(), self.data_ptr<int>());
+            div_scalar_kernel_cuda_impl<int><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<int>(), other.to<int>(), self.data_ptr<int>());
             break;
         case DType::Int64:
-            div_scalar_kernel_cuda_impl<int64_t><<<grid, block>>>(n, self.data_ptr<int64_t>(), other.to<int64_t>(), self.data_ptr<int64_t>());
+            div_scalar_kernel_cuda_impl<int64_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<int64_t>(), other.to<int64_t>(), self.data_ptr<int64_t>());
+            break;
+        case DType::Float16:
+            div_scalar_kernel_cuda_impl<tensorplay::Half><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<tensorplay::Half>(), other.to<float>(), self.data_ptr<tensorplay::Half>());
+            break;
+        case DType::BFloat16:
+            div_scalar_kernel_cuda_impl<tensorplay::BFloat16><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<tensorplay::BFloat16>(), other.to<float>(), self.data_ptr<tensorplay::BFloat16>());
             break;
         case DType::Float64:
-            div_scalar_kernel_cuda_impl<double><<<grid, block>>>(n, self.data_ptr<double>(), other.to<double>(), self.data_ptr<double>());
+            div_scalar_kernel_cuda_impl<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<double>(), other.to<double>(), self.data_ptr<double>());
             break;
         default:
             TP_THROW(NotImplementedError, "CUDA div_scalar_: unsupported dtype");
@@ -728,8 +996,130 @@ Tensor& div_scalar_inplace_kernel(Tensor& self, Scalar other) {
     return self;
 }
 
+template <bool Divide>
+Tensor addc_cuda_impl(const Tensor& self, const Tensor& tensor1,
+                      const Tensor& tensor2, Scalar value) {
+    if constexpr (Divide) {
+        if (isIntegralType(tensor1.dtype(), true) &&
+            isIntegralType(tensor2.dtype(), true)) {
+            TP_THROW(RuntimeError, "Integer division with addcdiv is not supported");
+        }
+    }
+
+    std::vector<int64_t> out_shape = broadcast_shapes(
+        static_cast<std::vector<int64_t>>(self.shape()),
+        static_cast<std::vector<int64_t>>(tensor1.shape()),
+        static_cast<std::vector<int64_t>>(tensor2.shape()));
+    DType result_dtype = promoteTypes(
+        promoteTypes(self.dtype(), tensor1.dtype()), tensor2.dtype());
+    if constexpr (Divide) {
+        if (isIntegralType(result_dtype)) result_dtype = DType::Float32;
+    }
+    Tensor result = Tensor::empty(out_shape, result_dtype, self.device());
+    const int64_t n = result.numel();
+    if (n == 0) return result;
+    dim3 grid, block;
+    get_grid_block(n, grid, block);
+
+    Tensor a = self.dtype() == result_dtype ? self : self.to(result_dtype);
+    Tensor b = tensor1.dtype() == result_dtype ? tensor1 : tensor1.to(result_dtype);
+    Tensor c = tensor2.dtype() == result_dtype ? tensor2 : tensor2.to(result_dtype);
+    TensorDesc a_desc = make_desc(a, out_shape.size());
+    TensorDesc b_desc = make_desc(b, out_shape.size());
+    TensorDesc c_desc = make_desc(c, out_shape.size());
+    TensorDesc y_desc = make_desc(result, out_shape.size());
+
+    #define ADDC_CASE(ctype, name) \
+        case DType::name: \
+            addc_broadcast_kernel<ctype, Divide><<<grid, block, 0, getCurrentCUDAStream().stream()>>>( \
+                n, a.data_ptr<ctype>(), a_desc, b.data_ptr<ctype>(), b_desc, \
+                c.data_ptr<ctype>(), c_desc, result.data_ptr<ctype>(), y_desc, scalar_to_opmath<ctype>(value)); \
+            break;
+    switch (result_dtype) {
+        ADDC_CASE(float, Float32)
+        ADDC_CASE(double, Float64)
+        ADDC_CASE(tensorplay::Half, Float16)
+        ADDC_CASE(tensorplay::BFloat16, BFloat16)
+        ADDC_CASE(int, Int32)
+        ADDC_CASE(int64_t, Int64)
+        default: TP_THROW(NotImplementedError, "CUDA addcmul/addcdiv: unsupported dtype");
+    }
+    #undef ADDC_CASE
+    CUDA_CHECK(cudaGetLastError());
+    return result;
+}
+
+template <bool Divide>
+Tensor& addc_cuda_inplace_impl(Tensor& self, const Tensor& tensor1,
+                               const Tensor& tensor2, Scalar value) {
+    if constexpr (Divide) {
+        if (isIntegralType(tensor1.dtype(), true) &&
+            isIntegralType(tensor2.dtype(), true)) {
+            TP_THROW(RuntimeError, "Integer division with addcdiv is not supported");
+        }
+    }
+    std::vector<int64_t> out_shape = broadcast_shapes(
+        static_cast<std::vector<int64_t>>(self.shape()),
+        static_cast<std::vector<int64_t>>(tensor1.shape()),
+        static_cast<std::vector<int64_t>>(tensor2.shape()));
+    if (out_shape != static_cast<std::vector<int64_t>>(self.shape())) {
+        TP_THROW(RuntimeError, "addcmul_/addcdiv_: output shape does not match self");
+    }
+    const int64_t n = self.numel();
+    if (n == 0) return self;
+    dim3 grid, block;
+    get_grid_block(n, grid, block);
+
+    Tensor b = tensor1.dtype() == self.dtype() ? tensor1 : tensor1.to(self.dtype());
+    Tensor c = tensor2.dtype() == self.dtype() ? tensor2 : tensor2.to(self.dtype());
+    TensorDesc a_desc = make_desc(self, out_shape.size());
+    TensorDesc b_desc = make_desc(b, out_shape.size());
+    TensorDesc c_desc = make_desc(c, out_shape.size());
+    TensorDesc y_desc = make_desc(self, out_shape.size());
+
+    #define ADDC_INPLACE_CASE(ctype, name) \
+        case DType::name: \
+            addc_broadcast_kernel<ctype, Divide><<<grid, block, 0, getCurrentCUDAStream().stream()>>>( \
+                n, self.data_ptr<ctype>(), a_desc, b.data_ptr<ctype>(), b_desc, \
+                c.data_ptr<ctype>(), c_desc, self.data_ptr<ctype>(), y_desc, scalar_to_opmath<ctype>(value)); \
+            break;
+    switch (self.dtype()) {
+        ADDC_INPLACE_CASE(float, Float32)
+        ADDC_INPLACE_CASE(double, Float64)
+        ADDC_INPLACE_CASE(tensorplay::Half, Float16)
+        ADDC_INPLACE_CASE(tensorplay::BFloat16, BFloat16)
+        ADDC_INPLACE_CASE(int, Int32)
+        ADDC_INPLACE_CASE(int64_t, Int64)
+        default: TP_THROW(NotImplementedError, "CUDA addcmul_/addcdiv_: unsupported dtype");
+    }
+    #undef ADDC_INPLACE_CASE
+    CUDA_CHECK(cudaGetLastError());
+    return self;
+}
+
+Tensor addcmul_cuda(const Tensor& self, const Tensor& tensor1,
+                    const Tensor& tensor2, Scalar value) {
+    return addc_cuda_impl<false>(self, tensor1, tensor2, value);
+}
+
+Tensor& addcmul_inplace_cuda(Tensor& self, const Tensor& tensor1,
+                             const Tensor& tensor2, Scalar value) {
+    return addc_cuda_inplace_impl<false>(self, tensor1, tensor2, value);
+}
+
+Tensor addcdiv_cuda(const Tensor& self, const Tensor& tensor1,
+                    const Tensor& tensor2, Scalar value) {
+    return addc_cuda_impl<true>(self, tensor1, tensor2, value);
+}
+
+Tensor& addcdiv_inplace_cuda(Tensor& self, const Tensor& tensor1,
+                             const Tensor& tensor2, Scalar value) {
+    return addc_cuda_inplace_impl<true>(self, tensor1, tensor2, value);
+}
+
 TENSORPLAY_LIBRARY_IMPL(CUDA, ArithmeticKernels) {
     m.impl("add.Tensor", add_kernel);
+    m.impl("add_relu", add_relu_cuda);
     m.impl("add_.Tensor", add_inplace_kernel);
     m.impl("add.Scalar", add_scalar_kernel);
     m.impl("add_.Scalar", add_scalar_inplace_kernel);
@@ -740,11 +1130,17 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, ArithmeticKernels) {
     m.impl("sub_.Scalar", sub_scalar_inplace_kernel);
     
     m.impl("mul.Tensor", mul_kernel);
+    m.impl("fused_mul_add", fused_mul_add_kernel);
+    m.impl("fused_mul_add.Scalar", fused_mul_add_scalar_kernel);
     m.impl("mul_.Tensor", mul_inplace_kernel);
     m.impl("mul.Scalar", mul_scalar_kernel);
     m.impl("mul_.Scalar", mul_scalar_inplace_kernel);
     
     m.impl("div.Tensor", div_kernel);
+    m.impl("addcmul", addcmul_cuda);
+    m.impl("addcmul_", addcmul_inplace_cuda);
+    m.impl("addcdiv", addcdiv_cuda);
+    m.impl("addcdiv_", addcdiv_inplace_cuda);
     m.impl("div_.Tensor", div_inplace_kernel);
     m.impl("div.Scalar", div_scalar_kernel);
     m.impl("div_.Scalar", div_scalar_inplace_kernel);

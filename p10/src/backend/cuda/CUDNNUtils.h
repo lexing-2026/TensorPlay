@@ -12,9 +12,9 @@ namespace cuda {
 
 #define CUDNN_CHECK(condition) \
   do { \
-    cudnnStatus_t status = condition; \
-    if (status != CUDNN_STATUS_SUCCESS) { \
-      std::string err_msg = std::string("cuDNN Error: ") + cudnnGetErrorString(status) + " at " + __FILE__ + ":" + std::to_string(__LINE__) + " in " + #condition; \
+    const cudnnStatus_t _tp_cudnn_status = (condition); \
+    if (_tp_cudnn_status != CUDNN_STATUS_SUCCESS) { \
+      std::string err_msg = std::string("cuDNN Error: ") + cudnnGetErrorString(_tp_cudnn_status) + " at " + __FILE__ + ":" + std::to_string(__LINE__) + " in " + #condition; \
       std::cout << "CUDNN FAILURE: " << err_msg << std::endl; \
       TP_THROW(RuntimeError, err_msg); \
     } \
@@ -52,18 +52,10 @@ inline cudnnTensorDescriptor_t createTensorDescriptor(const Tensor& t, bool pad_
     }
     
     cudnnDataType_t dtype;
-    if (t.dtype() == DType::Float32) dtype = CUDNN_DATA_FLOAT;
+    if (t.dtype() == DType::Float16) dtype = CUDNN_DATA_HALF;
+    else if (t.dtype() == DType::Float32) dtype = CUDNN_DATA_FLOAT;
     else if (t.dtype() == DType::Float64) dtype = CUDNN_DATA_DOUBLE;
     else TP_THROW(NotImplementedError, "cuDNN: only float/double supported");
-    
-    // DEBUG PRINT
-    
-    std::cout << "createTensorDescriptor: shape=(";
-    for(auto d : dimA) std::cout << d << ",";
-    std::cout << ") stride=(";
-    for(auto s : strideA) std::cout << s << ",";
-    std::cout << ")" << std::endl;
-    
     
     CUDNN_CHECK(cudnnSetTensorNdDescriptor(desc, dtype, static_cast<int>(dimA.size()), dimA.data(), strideA.data()));
     return desc;

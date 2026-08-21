@@ -2,8 +2,10 @@
 #include "TensorImpl.h"
 #include "Dispatcher.h"
 #include "Exception.h"
+#include "Parallel.h"
 #include "OneDNNContext.h"
 #include "Allocator.h"
+#include "GradMode.h"
 #include <memory>
 #include <vector>
 #include <cmath>
@@ -37,6 +39,7 @@ struct ConvKey {
     int64_t dh, dw;
     int64_t groups;
     bool has_bias;
+    bool fused_relu = false;
     int type; // 0: fwd, 1: bwd_data, 2: bwd_weights
 
     bool operator==(const ConvKey& other) const {
@@ -46,7 +49,8 @@ struct ConvKey {
                sh == other.sh && sw == other.sw &&
                ph_t == other.ph_t && ph_b == other.ph_b && pw_l == other.pw_l && pw_r == other.pw_r &&
                dh == other.dh && dw == other.dw &&
-               groups == other.groups && has_bias == other.has_bias && type == other.type;
+               groups == other.groups && has_bias == other.has_bias &&
+               fused_relu == other.fused_relu && type == other.type;
     }
 };
 
@@ -63,7 +67,7 @@ namespace std {
             hc(k.sh); hc(k.sw);
             hc(k.ph_t); hc(k.ph_b); hc(k.pw_l); hc(k.pw_r);
             hc(k.dh); hc(k.dw);
-            hc(k.groups); hc(k.has_bias); hc(k.type);
+            hc(k.groups); hc(k.has_bias); hc(k.fused_relu); hc(k.type);
             return h;
         }
     };
@@ -72,6 +76,7 @@ namespace std {
 
 namespace tensorplay {
 namespace cpu {
+using namespace tensorplay::parallel;
 
 using namespace dnnl;
 
@@ -81,6 +86,156 @@ Tensor mm_kernel(const Tensor& self, const Tensor& mat2);
 // Forward declaration from PadKernels.cpp
 Tensor constant_pad_nd_cpu(const Tensor& self, const std::vector<int64_t>& pad, Scalar value);
 
+// oneDNN matmul-primitive based GEMM.
+//
+// dnnl_sgemm (the raw BLAS-style API) cannot be used: in oneDNN 3.4.1 the JIT
+// AVX2 "nocopy" gemm driver corrupts the heap for every small-N shape
+// (N <= ~128), and the conv kernels always call GEMM with N == C_out_group,
+// which is small. The matmul primitive is a fully supported path with its own
+// kernels and is correct for all shapes (verified standalone and in-tree).
+// Every gemm_direct call site passes contiguous row-major matrices
+// (lda == M or K, ldb == K or N, ldc == N), so plain 'ab' descs map 1:1.
+namespace {
+struct MatmulGemmKey {
+    bool transA, transB;
+    int64_t M, N, K;
+    bool operator==(const MatmulGemmKey& o) const {
+        return transA == o.transA && transB == o.transB && M == o.M && N == o.N && K == o.K;
+    }
+};
+
+struct MatmulGemmKeyHash {
+    size_t operator()(const MatmulGemmKey& k) const {
+        size_t h = std::hash<bool>{}(k.transA);
+        h = h * 31 + std::hash<bool>{}(k.transB);
+        h = h * 31 + std::hash<int64_t>{}(k.M);
+        h = h * 31 + std::hash<int64_t>{}(k.N);
+        h = h * 31 + std::hash<int64_t>{}(k.K);
+        return h;
+    }
+};
+
+struct MatmulGemmEntry {
+    dnnl::matmul::primitive_desc pd;
+    dnnl::matmul prim;
+    dnnl::memory::desc user_src, user_wei, user_dst;
+    dnnl::memory::desc exp_src, exp_wei, exp_dst;
+    bool reorder_src = false, reorder_wei = false, reorder_dst = false;
+};
+
+struct MatmulGemmCache {
+    std::mutex mtx;
+    std::unordered_map<MatmulGemmKey, MatmulGemmEntry, MatmulGemmKeyHash> map;
+};
+
+void onednn_matmul_gemm(bool transA, bool transB, int64_t M, int64_t N, int64_t K,
+                        float alpha, const float* A, int64_t lda,
+                        const float* B, int64_t ldb,
+                        float beta, float* C, int64_t ldc) {
+    if (M <= 0 || N <= 0) return;
+    if (K <= 0 || alpha == 0.0f) {
+        if (beta == 0.0f) {
+            std::memset(C, 0, M * N * sizeof(float));
+        } else if (beta != 1.0f) {
+            for (int64_t i = 0; i < M * N; ++i) C[i] *= beta;
+        }
+        return;
+    }
+
+    auto& eng = OneDNNContext::get_engine();
+    auto& s = OneDNNContext::get_stream();
+
+    auto key = MatmulGemmKey{transA, transB, M, N, K};
+    static MatmulGemmCache cache;
+
+    MatmulGemmEntry* entry = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(cache.mtx);
+        auto it = cache.map.find(key);
+        if (it == cache.map.end()) {
+            MatmulGemmEntry e;
+            dnnl::memory::dims src_dims = {M, K};
+            dnnl::memory::dims wei_dims = {K, N};
+            dnnl::memory::dims dst_dims = {M, N};
+            // A transposed row-major matrix is expressed as a 'ba' plain desc
+            // (the matrix is stored column-major). The pointer is the same.
+            auto src_tag = transA ? dnnl::memory::format_tag::ba : dnnl::memory::format_tag::ab;
+            auto wei_tag = transB ? dnnl::memory::format_tag::ba : dnnl::memory::format_tag::ab;
+            e.user_src = dnnl::memory::desc(src_dims, dnnl::memory::data_type::f32, src_tag);
+            e.user_wei = dnnl::memory::desc(wei_dims, dnnl::memory::data_type::f32, wei_tag);
+            e.user_dst = dnnl::memory::desc(dst_dims, dnnl::memory::data_type::f32, dnnl::memory::format_tag::ab);
+            try {
+            e.pd = dnnl::matmul::primitive_desc(eng, e.user_src, e.user_wei, e.user_dst);
+            } catch (dnnl::error& ex) {
+                fprintf(stderr, "[gemm] pd FAIL transA=%d transB=%d M=%ld N=%ld K=%ld lda=%ld ldb=%ld ldc=%ld: %s\n",
+                        (int)transA, (int)transB, (long)M, (long)N, (long)K, (long)lda, (long)ldb, (long)ldc, ex.what());
+                throw;
+            }
+            e.exp_src = e.pd.src_desc();
+            e.exp_wei = e.pd.weights_desc();
+            e.exp_dst = e.pd.dst_desc();
+            e.reorder_src = e.exp_src != e.user_src;
+            e.reorder_wei = e.exp_wei != e.user_wei;
+            e.reorder_dst = e.exp_dst != e.user_dst;
+            e.prim = dnnl::matmul(e.pd);
+            it = cache.map.emplace(key, std::move(e)).first;
+        }
+        entry = &it->second;
+    }
+
+    // The scratchpad is written by the primitive, so it must not be shared
+    // between threads executing concurrently (conv kernels call this from
+    // inside an OpenMP parallel region).
+    thread_local std::unordered_map<MatmulGemmKey, dnnl::memory, MatmulGemmKeyHash> scratch;
+    auto sit = scratch.find(key);
+    if (sit == scratch.end()) {
+        sit = scratch.emplace(key, dnnl::memory(entry->pd.scratchpad_desc(), eng)).first;
+    }
+
+    dnnl::memory src_mem(entry->user_src, eng, const_cast<float*>(A));
+    dnnl::memory wei_mem(entry->user_wei, eng, const_cast<float*>(B));
+    dnnl::memory dst_mem(entry->user_dst, eng, C);
+
+    // Result buffer: the primitive computes dst = src * weights; the
+    // alpha/beta combination is applied afterwards.
+    int64_t out_count = M * N;
+    std::vector<float> tmp(out_count, 0.0f);
+    dnnl::memory tmp_mem(entry->user_dst, eng, tmp.data());
+
+    Storage src_tmp, wei_tmp;
+    if (entry->reorder_src) {
+        src_tmp = Storage(entry->exp_src.get_size(), getAllocator(DeviceType::CPU));
+        auto m = dnnl::memory(entry->exp_src, eng, src_tmp.data());
+        dnnl::reorder(src_mem, m).execute(s, src_mem, m);
+        src_mem = m;
+    }
+    if (entry->reorder_wei) {
+        wei_tmp = Storage(entry->exp_wei.get_size(), getAllocator(DeviceType::CPU));
+        auto m = dnnl::memory(entry->exp_wei, eng, wei_tmp.data());
+        dnnl::reorder(wei_mem, m).execute(s, wei_mem, m);
+        wei_mem = m;
+    }
+
+    entry->prim.execute(s, {
+        {DNNL_ARG_SRC, src_mem},
+        {DNNL_ARG_WEIGHTS, wei_mem},
+        {DNNL_ARG_DST, tmp_mem},
+        {DNNL_ARG_SCRATCHPAD, sit->second},
+    });
+    s.wait();
+
+    if (beta == 0.0f) {
+        if (alpha == 1.0f) {
+            std::memcpy(C, tmp.data(), out_count * sizeof(float));
+        } else {
+            for (int64_t i = 0; i < out_count; ++i) C[i] = alpha * tmp[i];
+        }
+    } else {
+        for (int64_t i = 0; i < out_count; ++i) C[i] = alpha * tmp[i] + beta * C[i];
+    }
+}
+} // namespace
+
 // Helper for GEMM (reuse from LinearAlgebraKernels logic implicitly or duplicate for now)
 // We need a direct gemm call to avoid tensor overhead
 void gemm_direct(bool transA, bool transB, int64_t M, int64_t N, int64_t K, float alpha, const float* A, int64_t lda, const float* B, int64_t ldb, float beta, float* C, int64_t ldc) {
@@ -88,46 +243,7 @@ void gemm_direct(bool transA, bool transB, int64_t M, int64_t N, int64_t K, floa
         cblas_sgemm(CblasRowMajor, transA ? CblasTrans : CblasNoTrans, transB ? CblasTrans : CblasNoTrans, 
                     (int)M, (int)N, (int)K, alpha, A, (int)lda, B, (int)ldb, beta, C, (int)ldc);
     #elif defined(USE_ONEDNN)
-        // OneDNN provides dnnl_sgemm which uses standard Fortran (Col-Major) layout
-        // To compute C = A * B in Row-Major:
-        // C^T (Col-Major) = B^T * A^T (Col-Major)
-        // In memory: B^T (Col-Major) is B (Row-Major), A^T is A, C^T is C
-        // So we call sgemm(N, M, K, B, A, C)
-        // Adjust Transpose flags:
-        // We want A * B.
-        // If transA=false, A is RowMajor. A^T is ColMajor.
-        // We pass A as 'matrix B' to sgemm.
-        // If transA=false, we want A (RowMajor) -> A^T (ColMajor). So we pass 'N' for second matrix?
-        // Wait. 
-        // We want C (RowMajor).
-        // sgemm computes C_col = alpha * op(A_col) * op(B_col) + beta * C_col
-        // Map: C_col -> C_row (our result)
-        // A_col -> B_row (our B input)
-        // B_col -> A_row (our A input)
-        // So: C_row = alpha * op(B_row) * op(A_row)
-        // But we want C = A * B.
-        // So we need op(B_row) * op(A_row) = A * B.
-        // This implies op(B_row) should be B^T, and op(A_row) should be A^T? No.
-        // (B^T * A^T)^T = A * B.
-        // So yes, we calculate C^T = B^T * A^T.
-        // In sgemm(ColMajor), passing pointer to B (RowMajor) means we passed B^T (ColMajor).
-        // Passing pointer to A (RowMajor) means we passed A^T (ColMajor).
-        // So if we want B^T * A^T, we just pass NoTrans for both?
-        // Let's trace:
-        // sgemm('N', 'N', ...) computes RefA * RefB.
-        // RefA is matrix at pointer B. Memory matches B^T.
-        // RefB is matrix at pointer A. Memory matches A^T.
-        // Result is B^T * A^T.
-        // Memory at C will contain (B^T * A^T) in ColMajor.
-        // Which is (A * B)^T in ColMajor.
-        // Which is A * B in RowMajor!
-        // So: if transA=false, transB=false: call sgemm('N', 'N', N, M, K, B, A, C)
-        
-        char ta = transB ? 'T' : 'N'; // Swap A and B
-        char tb = transA ? 'T' : 'N';
-        dnnl_sgemm(ta, tb, (dnnl_dim_t)N, (dnnl_dim_t)M, (dnnl_dim_t)K, 
-                   alpha, B, (dnnl_dim_t)ldb, A, (dnnl_dim_t)lda, 
-                   beta, C, (dnnl_dim_t)ldc);
+        onednn_matmul_gemm(transA, transB, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
     #else
         // Naive implementation (Supports only NoTrans for now, fallback to mm_kernel if complex)
         if (!transA && !transB) {
@@ -178,10 +294,8 @@ static void winograd_f23_transform_weight(const float* weight, int64_t K, int64_
     // T = G * g * G'
     
     // 16 components
-    #ifdef _OPENMP
-    #pragma omp parallel for
-    #endif
-    for (int64_t k = 0; k < K; ++k) {
+    parallel_for(0, K, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+    for (int64_t k = begin; k < end; ++k) {
         for (int64_t c = 0; c < C; ++c) {
             const float* w_ptr = weight + (k * C + c) * 9;
             float g[3][3];
@@ -224,6 +338,7 @@ static void winograd_f23_transform_weight(const float* weight, int64_t K, int64_
             }
         }
     }
+    });
 }
 
 static void winograd_f23_transform_input(const float* input, int64_t C, int64_t H, int64_t W, 
@@ -236,10 +351,8 @@ static void winograd_f23_transform_input(const float* input, int64_t C, int64_t 
     int64_t num_tiles = tile_h * tile_w;
     int64_t stride_v = C * num_tiles; // Stride between components in V
     
-    #ifdef _OPENMP
-    #pragma omp parallel for
-    #endif
-    for (int64_t c = 0; c < C; ++c) {
+    parallel_for(0, C, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+    for (int64_t c = begin; c < end; ++c) {
         for (int64_t t = 0; t < num_tiles; ++t) {
             int64_t th = t / tile_w;
             int64_t tw = t % tile_w;
@@ -316,6 +429,7 @@ static void winograd_f23_transform_input(const float* input, int64_t C, int64_t 
             v_ptr[15 * stride_v] = VT[3][3];
         }
     }
+    });
 }
 
 static void winograd_f23_transform_output(const float* M, int64_t K, int64_t H_out, int64_t W_out,
@@ -325,10 +439,8 @@ static void winograd_f23_transform_output(const float* M, int64_t K, int64_t H_o
     
     int64_t num_tiles = tile_h * tile_w;
     
-    #ifdef _OPENMP
-    #pragma omp parallel for
-    #endif
-    for (int64_t k = 0; k < K; ++k) {
+    parallel_for(0, K, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+    for (int64_t k = begin; k < end; ++k) {
         for (int64_t t = 0; t < num_tiles; ++t) {
             // Gather 4x4 matrix MT from M
             // M is (16, K, num_tiles)
@@ -389,6 +501,7 @@ static void winograd_f23_transform_output(const float* M, int64_t K, int64_t H_o
             }
         }
     }
+    });
 }
 
 static void conv2d_winograd_3x3(const Tensor& input, const Tensor& weight, const Tensor& bias,
@@ -474,10 +587,8 @@ void im2col(const T* data_im, int64_t channels, int64_t height, int64_t width,
     int64_t width_col = (width + 2 * pad_w - (dilation_w * (kernel_w - 1) + 1)) / stride_w + 1;
     int64_t channels_col = channels * kernel_h * kernel_w;
     
-    #ifdef _OPENMP
-    #pragma omp parallel for
-    #endif
-    for (int64_t c = 0; c < channels_col; ++c) {
+    parallel_for(0, channels_col, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+    for (int64_t c = begin; c < end; ++c) {
         int64_t w_offset = c % kernel_w;
         int64_t h_offset = (c / kernel_w) % kernel_h;
         int64_t c_im = c / kernel_h / kernel_w;
@@ -495,6 +606,7 @@ void im2col(const T* data_im, int64_t channels, int64_t height, int64_t width,
             }
         }
     }
+    });
 }
 
 // Col2Im implementation
@@ -508,10 +620,8 @@ void col2im(const T* data_col, int64_t channels, int64_t height, int64_t width,
     int64_t height_col = (height + 2 * pad_h - (dilation_h * (kernel_h - 1) + 1)) / stride_h + 1;
     int64_t width_col = (width + 2 * pad_w - (dilation_w * (kernel_w - 1) + 1)) / stride_w + 1;
     
-    #ifdef _OPENMP
-    #pragma omp parallel for
-    #endif
-    for (int64_t c_im = 0; c_im < channels; ++c_im) {
+    parallel_for(0, channels, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+    for (int64_t c_im = begin; c_im < end; ++c_im) {
         for (int64_t kh = 0; kh < kernel_h; ++kh) {
             for (int64_t kw = 0; kw < kernel_w; ++kw) {
                 int64_t c = (c_im * kernel_h + kh) * kernel_w + kw;
@@ -531,6 +641,7 @@ void col2im(const T* data_col, int64_t channels, int64_t height, int64_t width,
             }
         }
     }
+    });
 }
 
 // Im2Col 3D implementation
@@ -546,10 +657,8 @@ void im2col3d(const T* data_im, int64_t channels, int64_t depth, int64_t height,
     int64_t width_col = (width + 2 * pad_w - (dilation_w * (kernel_w - 1) + 1)) / stride_w + 1;
     int64_t channels_col = channels * kernel_d * kernel_h * kernel_w;
     
-    #ifdef _OPENMP
-    #pragma omp parallel for
-    #endif
-    for (int64_t c = 0; c < channels_col; ++c) {
+    parallel_for(0, channels_col, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+    for (int64_t c = begin; c < end; ++c) {
         int64_t w_offset = c % kernel_w;
         int64_t h_offset = (c / kernel_w) % kernel_h;
         int64_t d_offset = (c / kernel_w / kernel_h) % kernel_d;
@@ -571,6 +680,7 @@ void im2col3d(const T* data_im, int64_t channels, int64_t depth, int64_t height,
             }
         }
     }
+    });
 }
 
 // Col2Im 3D implementation
@@ -587,10 +697,8 @@ void col2im3d(const T* data_col, int64_t channels, int64_t depth, int64_t height
     int64_t height_col = (height + 2 * pad_h - (dilation_h * (kernel_h - 1) + 1)) / stride_h + 1;
     int64_t width_col = (width + 2 * pad_w - (dilation_w * (kernel_w - 1) + 1)) / stride_w + 1;
     
-    #ifdef _OPENMP
-    #pragma omp parallel for
-    #endif
-    for (int64_t c_im = 0; c_im < channels; ++c_im) {
+    parallel_for(0, channels, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+    for (int64_t c_im = begin; c_im < end; ++c_im) {
         for (int64_t kd = 0; kd < kernel_d; ++kd) {
             for (int64_t kh = 0; kh < kernel_h; ++kh) {
                 for (int64_t kw = 0; kw < kernel_w; ++kw) {
@@ -616,6 +724,7 @@ void col2im3d(const T* data_col, int64_t channels, int64_t depth, int64_t height
             }
         }
     }
+    });
 }
 
 #ifdef USE_ONEDNN
@@ -642,7 +751,7 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
                          const std::vector<int64_t>& stride, 
                          int64_t pH_top, int64_t pH_bottom, int64_t pW_left, int64_t pW_right,
                          const std::vector<int64_t>& dilation, int64_t groups,
-                         Tensor& output) {
+                         Tensor& output, bool fused_relu = false) {
     
     if (!OneDNNContext::is_enabled()) {
         return false;
@@ -663,6 +772,7 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
         key.dh = dilation[0]; key.dw = dilation[1];
         key.groups = groups;
         key.has_bias = (bias.defined() && bias.numel() > 0);
+        key.fused_relu = fused_relu;
         key.type = 0; // Forward
         
         struct CachedConv {
@@ -707,7 +817,10 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
             auto src_md = memory::desc(src_dims, memory::data_type::f32, src_tag);
             auto dst_md = memory::desc(dst_dims, memory::data_type::f32, dst_tag);
             
-            auto weights_md = groups > 1 
+            // Let oneDNN choose a blocked format; the inference path retains
+            // a read-only reordered copy, while training still leaves the
+            // user-visible parameter storage untouched.
+            auto weights_md = groups > 1
                 ? memory::desc(weights_dims, memory::data_type::f32, memory::format_tag::any)
                 : memory::desc(weights_dims, memory::data_type::f32, memory::format_tag::any);
             
@@ -727,6 +840,12 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
                 
                 dnnl::algorithm algo = get_onednn_algo(key.kh, key.kw);
                 convolution_forward::primitive_desc conv_pd;
+                primitive_attr conv_attr;
+                if (fused_relu) {
+                    post_ops conv_ops;
+                    conv_ops.append_eltwise(algorithm::eltwise_relu, 0.0f, 0.0f);
+                    conv_attr.set_post_ops(conv_ops);
+                }
                 
                 // Try selected algorithm first, fallback to auto if it fails
                 try {
@@ -734,14 +853,16 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
                         eng,
                         prop_kind::forward_inference, algo,
                         src_md, weights_md, bias_md, dst_md,
-                        strides_dims, dilates_dims, padding_l_dims, padding_r_dims);
+                        strides_dims, dilates_dims, padding_l_dims, padding_r_dims,
+                        conv_attr);
                 } catch (dnnl::error& e) {
                     if (algo != algorithm::convolution_auto) {
                         conv_pd = convolution_forward::primitive_desc(
                             eng,
                             prop_kind::forward_inference, algorithm::convolution_auto,
                             src_md, weights_md, bias_md, dst_md,
-                            strides_dims, dilates_dims, padding_l_dims, padding_r_dims);
+                            strides_dims, dilates_dims, padding_l_dims, padding_r_dims,
+                            conv_attr);
                     } else {
                         throw;
                     }
@@ -762,9 +883,39 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
         auto expected_src_md = pd.src_desc();
         auto expected_weights_md = pd.weights_desc();
         auto expected_dst_md = pd.dst_desc();
+
+        struct CachedWeight {
+            const void* data;
+            uint32_t version;
+            memory::desc source_md;
+            memory::desc expected_md;
+            Storage storage;
+
+            CachedWeight(
+                const void* data_,
+                uint32_t version_,
+                const memory::desc& source_md_,
+                const memory::desc& expected_md_,
+                const Storage& storage_)
+                : data(data_), version(version_), source_md(source_md_),
+                  expected_md(expected_md_), storage(storage_) {}
+        };
+        static std::unordered_map<const TensorImpl*, std::vector<CachedWeight>> weight_cache;
+        static std::mutex weight_cache_mutex;
+        const TensorImpl* weight_impl = weight.unsafeGetTensorImpl().get();
+        const void* weight_data = weight.data_ptr<float>();
+        const uint32_t weight_version = weight_impl->version();
+        // Keep the user-visible parameter in its plain layout for autograd,
+        // but cache the oneDNN-layout copy across training calls as well.
+        // The TensorImpl version is bumped by every in-place optimizer update,
+        // so a new parameter value naturally invalidates the cached reorder.
+        // TorchInductor applies the same principle by reusing transformed
+        // convolution parameters inside its compiled training graph.
+        const bool cache_weight = true;
         
         // 1. Input Reorder
         memory src_mem;
+        Storage reordered_input_storage;
         memory::desc user_src_md;
         
         if (input.unsafeGetTensorImpl()->has_onednn_md()) {
@@ -779,9 +930,9 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
         if (expected_src_md != user_src_md) {             
              size_t req_size = expected_src_md.get_size();
              Allocator* allocator = getAllocator(input.device().type());
-             Storage new_storage(req_size, allocator);
+             reordered_input_storage = Storage(req_size, allocator);
 
-             src_mem = memory(expected_src_md, eng, new_storage.data());
+             src_mem = memory(expected_src_md, eng, reordered_input_storage.data());
              
              reorder r_prim;
              bool r_found = false;
@@ -805,69 +956,88 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
                  }
              }
              r_prim.execute(s, user_src_mem, src_mem);
-
-             input.unsafeGetTensorImpl()->set_storage(new_storage);
-             input.unsafeGetTensorImpl()->set_onednn_md(std::make_shared<memory::desc>(expected_src_md));
         } else {
              src_mem = user_src_mem;
         }
 
-        // 2. Weights
+        // 2. Weights.  A trainable Tensor must remain in its user-visible
+        // layout: autograd produces gradients in that layout and optimizers
+        // update the same storage.  Reordering a parameter in place here
+        // silently makes SGD apply an NCHW gradient to blocked data.  Keep
+        // the reordered copy local to this invocation instead.
         memory weights_mem;
+        Storage reordered_weight_storage;
+
+        auto load_cached_weight = [&](const memory::desc& source_md) -> bool {
+            if (!cache_weight) return false;
+            std::lock_guard<std::mutex> lock(weight_cache_mutex);
+            auto it = weight_cache.find(weight_impl);
+            if (it == weight_cache.end()) return false;
+            for (const auto& cached : it->second) {
+                if (cached.data == weight_data && cached.version == weight_version &&
+                    cached.source_md == source_md &&
+                    cached.expected_md == expected_weights_md) {
+                    reordered_weight_storage = cached.storage;
+                    weights_mem = memory(
+                        expected_weights_md, eng, reordered_weight_storage.data());
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        auto save_cached_weight = [&](const memory::desc& source_md) {
+            if (!cache_weight) return;
+            std::lock_guard<std::mutex> lock(weight_cache_mutex);
+            auto& entries = weight_cache[weight_impl];
+            entries.erase(
+                std::remove_if(
+                    entries.begin(), entries.end(),
+                    [&](const CachedWeight& cached) {
+                        return cached.source_md == source_md &&
+                               cached.expected_md == expected_weights_md;
+                    }),
+                entries.end());
+            entries.emplace_back(
+                weight_data, weight_version, source_md, expected_weights_md,
+                reordered_weight_storage);
+        };
         
         if (weight.unsafeGetTensorImpl()->has_onednn_md()) {
              auto stored_md = std::static_pointer_cast<memory::desc>(weight.unsafeGetTensorImpl()->get_onednn_md());
              if (*stored_md == expected_weights_md) {
                  weights_mem = memory(*stored_md, eng, weight.data_ptr<float>());
-             } else {
+             } else if (!load_cached_weight(*stored_md)) {
                  // Reorder from stored to expected
                  auto src_mem = memory(*stored_md, eng, weight.data_ptr<float>());
-                 
                  size_t required_size = expected_weights_md.get_size();
-                 if (weight.numel() * sizeof(float) < required_size) {
-                      Allocator* allocator = getAllocator(weight.device().type());
-                      Storage new_storage(required_size, allocator);
-                      
-                      // Use temporary buffer for new storage to avoid overwriting source if it overlaps (it doesn't here, but good practice)
-                      // Actually we need to keep old storage alive for src_mem until reorder is done.
-                      // src_mem holds pointer to old storage.
-                      
-                      weights_mem = memory(expected_weights_md, eng, new_storage.data());
-                      reorder(src_mem, weights_mem).execute(s, src_mem, weights_mem);
-                      
-                      weight.unsafeGetTensorImpl()->set_storage(new_storage);
-                 } else {
-                      // Reuse storage? If layout is different, in-place reorder is risky/impossible if data is scrambled.
-                      // Safer to always allocate new storage for simplicity when changing layout.
-                      Allocator* allocator = getAllocator(weight.device().type());
-                      Storage new_storage(required_size, allocator);
-                      
-                      weights_mem = memory(expected_weights_md, eng, new_storage.data());
-                      reorder(src_mem, weights_mem).execute(s, src_mem, weights_mem);
-                      
-                      weight.unsafeGetTensorImpl()->set_storage(new_storage);
-                 }
-                 weight.unsafeGetTensorImpl()->set_onednn_md(std::make_shared<memory::desc>(expected_weights_md));
+                 Allocator* allocator = getAllocator(weight.device().type());
+                 reordered_weight_storage = Storage(required_size, allocator);
+                 weights_mem = memory(
+                     expected_weights_md, eng, reordered_weight_storage.data());
+                 reorder(src_mem, weights_mem).execute(s, src_mem, weights_mem);
+                 save_cached_weight(*stored_md);
              }
         } else {
              auto user_weights_md = groups > 1 
                  ? memory::desc(weights_dims, memory::data_type::f32, memory::format_tag::goihw)
                  : memory::desc(weights_dims, memory::data_type::f32, memory::format_tag::oihw);
                  
-             if (expected_weights_md != user_weights_md) {
+             if (expected_weights_md != user_weights_md &&
+                 !load_cached_weight(user_weights_md)) {
                  auto user_mem = memory(user_weights_md, eng, weight.data_ptr<float>());
                  
                  size_t required_size = expected_weights_md.get_size();
                  Allocator* allocator = getAllocator(weight.device().type());
-                 Storage new_storage(required_size, allocator);
-                 
-                 weights_mem = memory(expected_weights_md, eng, new_storage.data());
+                 reordered_weight_storage = Storage(required_size, allocator);
+                 weights_mem = memory(
+                     expected_weights_md, eng, reordered_weight_storage.data());
                  reorder(user_mem, weights_mem).execute(s, user_mem, weights_mem);
-                 
-                 weight.unsafeGetTensorImpl()->set_storage(new_storage);
-                 weight.unsafeGetTensorImpl()->set_onednn_md(std::make_shared<memory::desc>(expected_weights_md));
+                 save_cached_weight(user_weights_md);
              } else {
-                 weights_mem = memory(user_weights_md, eng, weight.data_ptr<float>());
+                 if (expected_weights_md == user_weights_md) {
+                     weights_mem = memory(user_weights_md, eng, weight.data_ptr<float>());
+                 }
              }
         }
         
@@ -941,25 +1111,26 @@ static bool conv3d_onednn(const Tensor& input, const Tensor& weight, const Tenso
     
     if (!OneDNNContext::is_enabled()) return false;
     if (input.dtype() != DType::Float32) return false;
+    if (std::getenv("TP_DISABLE_ONEDNN_CONV3D")) return false;
     
     try {
         auto& eng = OneDNNContext::get_engine();
         auto& s = OneDNNContext::get_stream();
         
-        memory::dims src_dims = {input.size(0), input.size(1), input.size(2), input.size(3)};
-        memory::dims dst_dims = {output.size(0), output.size(1), output.size(2), output.size(3)};
+        memory::dims src_dims = {input.size(0), input.size(1), input.size(2), input.size(3), input.size(4)};
+        memory::dims dst_dims = {output.size(0), output.size(1), output.size(2), output.size(3), output.size(4)};
         
         memory::dims weights_dims;
         if (groups > 1) {
-            weights_dims = {groups, weight.size(0)/groups, weight.size(1), weight.size(2), weight.size(3)};
+            weights_dims = {groups, weight.size(0)/groups, weight.size(1), weight.size(2), weight.size(3), weight.size(4)};
         } else {
-            weights_dims = {weight.size(0), weight.size(1), weight.size(2), weight.size(3)};
+            weights_dims = {weight.size(0), weight.size(1), weight.size(2), weight.size(3), weight.size(4)};
         }
         
-        memory::dims strides_dims = {stride[0], stride[1]};
-        memory::dims padding_l_dims = {pH_top, pW_left};
-        memory::dims padding_r_dims = {pH_bottom, pW_right};
-        memory::dims dilates_dims = {dilation[0] - 1, dilation[1] - 1};
+        memory::dims strides_dims = {stride[0], stride[1], stride[2]};
+        memory::dims padding_l_dims = {pD_front, pH_top, pW_left};
+        memory::dims padding_r_dims = {pD_back, pH_bottom, pW_right};
+        memory::dims dilates_dims = {dilation[0] - 1, dilation[1] - 1, dilation[2] - 1};
         
         auto src_md = memory::desc(src_dims, memory::data_type::f32, memory::format_tag::ncdhw);
         auto dst_tag = memory::format_tag::any;
@@ -995,8 +1166,39 @@ static bool conv3d_onednn(const Tensor& input, const Tensor& weight, const Tenso
              dst_mem = memory(expected_dst_md, eng, output.data_ptr<float>());
         }
 
-        auto src_mem = memory(src_md, eng, input.data_ptr<float>());
-        auto weights_mem = memory(weights_md, eng, weight.data_ptr<float>());
+        auto expected_src_md = conv_pd.src_desc();
+        auto expected_weights_md = conv_pd.weights_desc();
+
+        // 1. Input reorder: the primitive descriptor may pick a blocked/padded src
+        //    layout. Feeding it the user's plain ncdhw buffer directly makes oneDNN
+        //    read out of bounds (blocked formats are padded), corrupting the heap.
+        memory src_mem;
+        Storage src_storage_handle;
+        auto user_src_md = memory::desc(src_dims, memory::data_type::f32, memory::format_tag::ncdhw);
+        if (expected_src_md != user_src_md) {
+             size_t req_size = expected_src_md.get_size();
+             Allocator* allocator = getAllocator(input.device().type());
+             src_storage_handle = Storage(req_size, allocator);
+             src_mem = memory(expected_src_md, eng, src_storage_handle.data());
+             auto user_src_mem = memory(user_src_md, eng, input.data_ptr<float>());
+             reorder(user_src_mem, src_mem).execute(s, user_src_mem, src_mem);
+        } else {
+             src_mem = memory(user_src_md, eng, input.data_ptr<float>());
+        }
+
+        // 2. Weights reorder: same reasoning as src.
+        memory weights_mem;
+        Storage weights_storage_handle;
+        if (expected_weights_md != weights_md) {
+             size_t req_size = expected_weights_md.get_size();
+             Allocator* allocator = getAllocator(weight.device().type());
+             weights_storage_handle = Storage(req_size, allocator);
+             weights_mem = memory(expected_weights_md, eng, weights_storage_handle.data());
+             auto user_weights_mem = memory(weights_md, eng, weight.data_ptr<float>());
+             reorder(user_weights_mem, weights_mem).execute(s, user_weights_mem, weights_mem);
+        } else {
+             weights_mem = memory(weights_md, eng, weight.data_ptr<float>());
+        }
         
         convolution_forward conv(conv_pd);
         
@@ -1006,7 +1208,20 @@ static bool conv3d_onednn(const Tensor& input, const Tensor& weight, const Tenso
         args.insert({DNNL_ARG_DST, dst_mem});
         
         if (bias.defined() && bias.numel() > 0) {
-            auto bias_mem = memory(bias_md, eng, bias.data_ptr<float>());
+            auto expected_bias_md = conv_pd.bias_desc();
+            auto user_bias_md = memory::desc({bias.size(0)}, memory::data_type::f32, memory::format_tag::x);
+            memory bias_mem;
+            Storage bias_storage_handle;
+            if (expected_bias_md != user_bias_md) {
+                 size_t req_size = expected_bias_md.get_size();
+                 Allocator* allocator = getAllocator(bias.device().type());
+                 bias_storage_handle = Storage(req_size, allocator);
+                 bias_mem = memory(expected_bias_md, eng, bias_storage_handle.data());
+                 auto user_bias_mem = memory(user_bias_md, eng, bias.data_ptr<float>());
+                 reorder(user_bias_mem, bias_mem).execute(s, user_bias_mem, bias_mem);
+            } else {
+                 bias_mem = memory(user_bias_md, eng, bias.data_ptr<float>());
+            }
             args.insert({DNNL_ARG_BIAS, bias_mem});
         }
         
@@ -1634,7 +1849,7 @@ static bool conv2d_grad_weight_onednn(const Tensor& grad_output, const Tensor& i
 }
 #endif
 
-Tensor conv2d_cpu(const Tensor& input_arg, const Tensor& weight_arg, const Tensor& bias, const std::vector<int64_t>& stride_arg, const std::vector<int64_t>& padding_arg, const std::vector<int64_t>& dilation_arg, int64_t groups) {
+static Tensor conv2d_cpu_impl(const Tensor& input_arg, const Tensor& weight_arg, const Tensor& bias, const std::vector<int64_t>& stride_arg, const std::vector<int64_t>& padding_arg, const std::vector<int64_t>& dilation_arg, int64_t groups, bool fused_relu) {
     Tensor input = input_arg.is_contiguous() ? input_arg : input_arg.clone();
     Tensor weight = weight_arg.is_contiguous() ? weight_arg : weight_arg.clone();
     
@@ -1687,7 +1902,8 @@ Tensor conv2d_cpu(const Tensor& input_arg, const Tensor& weight_arg, const Tenso
     // Force padding to multiple of 8 for 3x3s1 convolutions to enable Winograd on AVX2
     // Only apply if input is NCHW (not blocked) to avoid messing up OneDNN formats
     if (groups == 1 && kH == 3 && kW == 3 && sH == 1 && sW == 1 && dH == 1 && dW == 1 &&
-        input.dtype() == DType::Float32 && !input.unsafeGetTensorImpl()->has_onednn_md()) {
+        input.dtype() == DType::Float32 && !input.unsafeGetTensorImpl()->has_onednn_md() &&
+        !fused_relu) {
         
         int64_t h_padded_total = H_in + pH_top + pH_bottom;
         int64_t w_padded_total = W_in + pW_left + pW_right;
@@ -1724,7 +1940,7 @@ Tensor conv2d_cpu(const Tensor& input_arg, const Tensor& weight_arg, const Tenso
 
     #ifdef USE_ONEDNN
     // Try oneDNN implementation first
-    if (conv2d_onednn(input, weight, bias, stride, pH_top, pH_bottom, pW_left, pW_right, dilation, groups, out)) {
+    if (conv2d_onednn(input, weight, bias, stride, pH_top, pH_bottom, pW_left, pW_right, dilation, groups, out, fused_relu)) {
         return out;
     }
     #endif
@@ -1734,6 +1950,10 @@ Tensor conv2d_cpu(const Tensor& input_arg, const Tensor& weight_arg, const Tenso
         // Only apply if groups=1 (Standard Conv)
         if (groups == 1 && kH == 3 && kW == 3 && sH == 1 && sW == 1 && dH == 1 && dW == 1) {
              conv2d_winograd_3x3(input, weight, bias, pH_top, pW_left, out);
+             if (fused_relu) {
+                 float* relu_ptr = out.data_ptr<float>();
+                 for (int64_t i = 0; i < out.numel(); ++i) relu_ptr[i] = std::max(0.0f, relu_ptr[i]);
+             }
              return out;
         }
 
@@ -1875,10 +2095,8 @@ Tensor conv2d_cpu(const Tensor& input_arg, const Tensor& weight_arg, const Tenso
         if (bias.defined() && bias.numel() > 0) {
              const float* b_ptr = bias.data_ptr<float>();
              
-             #ifdef _OPENMP
-             #pragma omp parallel for
-             #endif
-             for (int64_t n = 0; n < N; ++n) {
+             parallel_for(0, N, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+             for (int64_t n = begin; n < end; ++n) {
                  for (int64_t c = 0; c < C_out; ++c) {
                      float b = b_ptr[c];
                      float* out_n_c = out_ptr + (n * C_out + c) * out_spatial;
@@ -1891,13 +2109,30 @@ Tensor conv2d_cpu(const Tensor& input_arg, const Tensor& weight_arg, const Tenso
                      }
                  }
              }
+             });
         }
         
     } else {
         TP_THROW(NotImplementedError, "conv2d only supports Float32");
     }
     
+    if (fused_relu) {
+        float* relu_ptr = out.data_ptr<float>();
+        for (int64_t i = 0; i < out.numel(); ++i) relu_ptr[i] = std::max(0.0f, relu_ptr[i]);
+    }
     return out;
+}
+
+Tensor conv2d_cpu(const Tensor& input, const Tensor& weight, const Tensor& bias,
+                  const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
+                  const std::vector<int64_t>& dilation, int64_t groups) {
+    return conv2d_cpu_impl(input, weight, bias, stride, padding, dilation, groups, false);
+}
+
+Tensor conv2d_relu_cpu(const Tensor& input, const Tensor& weight, const Tensor& bias,
+                       const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
+                       const std::vector<int64_t>& dilation, int64_t groups) {
+    return conv2d_cpu_impl(input, weight, bias, stride, padding, dilation, groups, true);
 }
 
 Tensor conv1d_cpu(const Tensor& input, const Tensor& weight, const Tensor& bias, const std::vector<int64_t>& stride, const std::vector<int64_t>& padding, const std::vector<int64_t>& dilation, int64_t groups) {
@@ -2044,10 +2279,8 @@ Tensor conv3d_cpu(const Tensor& input_arg, const Tensor& weight_arg, const Tenso
         // Bias addition
         if (bias.defined() && bias.numel() > 0) {
              const float* b_ptr = bias.data_ptr<float>();
-             #ifdef _OPENMP
-             #pragma omp parallel for
-             #endif
-             for (int64_t n = 0; n < N; ++n) {
+             parallel_for(0, N, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+             for (int64_t n = begin; n < end; ++n) {
                  for (int64_t c = 0; c < C_out; ++c) {
                      float b = b_ptr[c];
                      float* out_n_c = out_ptr + (n * C_out + c) * out_volume;
@@ -2056,6 +2289,7 @@ Tensor conv3d_cpu(const Tensor& input_arg, const Tensor& weight_arg, const Tenso
                      }
                  }
              }
+             });
         }
     } else {
         TP_THROW(NotImplementedError, "conv3d only supports Float32");
@@ -2323,10 +2557,8 @@ Tensor conv2d_grad_input_cpu(const Tensor& grad_output, const Tensor& input, con
          int64_t K = C_out;
          int64_t N_pixels = H_in * W_in;
          
-         #ifdef _OPENMP
-         #pragma omp parallel for
-         #endif
-         for (int64_t n = 0; n < N; ++n) {
+         parallel_for(0, N, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+         for (int64_t n = begin; n < end; ++n) {
              const float* go_n = go_ptr + n * C_out * N_pixels;
              float* gi_n = gi_ptr + n * C_in * N_pixels;
              
@@ -2348,6 +2580,7 @@ Tensor conv2d_grad_input_cpu(const Tensor& grad_output, const Tensor& input, con
                          go_n, N_pixels,    // ldb = N_pixels
                          0.0f, gi_n, N_pixels); // ldc = N_pixels
          }
+         });
          return grad_input;
     }
 
@@ -2581,8 +2814,8 @@ Tensor conv2d_grad_bias_cpu(const Tensor& grad_output, const Tensor& input, cons
         float* gb_ptr = grad_bias.data_ptr<float>();
         const float* go_ptr = grad_output_contig.data_ptr<float>();
         
-        #pragma omp parallel for
-        for (int64_t c = 0; c < C_out; ++c) {
+        parallel_for(0, C_out, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        for (int64_t c = begin; c < end; ++c) {
             double sum = 0.0;
             for (int64_t n = 0; n < N; ++n) {
                 // Offset: n * (C * H * W) + c * (H * W)
@@ -2594,6 +2827,7 @@ Tensor conv2d_grad_bias_cpu(const Tensor& grad_output, const Tensor& input, cons
             }
             gb_ptr[c] = (float)sum;
         }
+        });
     } else {
          TP_THROW(NotImplementedError, "conv2d_grad_bias only supports Float32");
     }
@@ -2841,6 +3075,7 @@ Tensor conv_transpose3d_grad_bias_cpu(const Tensor& grad_output, const Tensor& i
 TENSORPLAY_LIBRARY_IMPL(CPU, ConvKernels) {
     m.impl("conv1d", conv1d_cpu);
     m.impl("conv2d", conv2d_cpu);
+    m.impl("conv2d_relu", conv2d_relu_cpu);
     m.impl("conv3d", conv3d_cpu);
     m.impl("conv_transpose2d", conv_transpose2d_cpu);
     m.impl("conv_transpose3d", conv_transpose3d_cpu);

@@ -9,7 +9,7 @@ import numpy as np
 # 1. 二次函数 (Quadratic Function)
 # f(x, y) = x^2 + 2y^2
 # Global minimum at (0, 0)
-@tp.stax.compile
+@tp.compile
 def quadratic_function(x):
     return x[0]**2 + 2 * x[1]**2
 

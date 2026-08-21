@@ -16,21 +16,116 @@
 - name: t(Tensor self) -> Tensor
   self: grad.t()
 
+# The complex optimizer path uses the same storage-reinterpretation views as
+# Torch.  Their backward operations are the inverse view and must remain
+# views, so higher-order optimizer differentiation does not insert a copy.
+- name: view_as_real(Tensor self) -> Tensor
+  self: tensorplay::tpx::ops::view_as_complex(grad)
+
+- name: view_as_complex(Tensor self) -> Tensor
+  self: tensorplay::tpx::ops::view_as_real(grad)
+
 - name: add.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor
   self: grad
   other: grad * alpha
+
+# In-place arithmetic is used by torch.optim's differentiable single-tensor
+# implementations.  Keep the same backward formulas as the functional
+# overloads; the generated wrapper attaches the new history to the mutated
+# non-leaf tensor and rejects leaf mutation under GradMode.
+- name: add_.Tensor(Tensor(a!) self, Tensor other, *, Scalar alpha=1) -> Tensor(a!)
+  self: grad
+  other: grad * alpha
+
+- name: add_.Scalar(Tensor(a!) self, Scalar other, Scalar alpha=1) -> Tensor(a!)
+  self: grad
+
+# TorchInductor keeps residual add+ReLU as one training forward node and
+# materializes the ReLU mask from the output in its backward graph.  The
+# TensorPlay native primitive has the same output contract for the equal-shape
+# residual case used by ResNet.
+- name: add_relu(Tensor self, Tensor other) -> Tensor
+  self: threshold_backward(grad, result, 0)
+  other: threshold_backward(grad, result, 0)
 
 - name: sub.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor
   self: grad
   other: grad.neg() * alpha
 
+- name: sub_.Tensor(Tensor(a!) self, Tensor other, *, Scalar alpha=1) -> Tensor(a!)
+  self: grad
+  other: grad.neg() * alpha
+
+- name: sub_.Scalar(Tensor(a!) self, Scalar other, Scalar alpha=1) -> Tensor(a!)
+  self: grad
+
 - name: mul.Tensor(Tensor self, Tensor other) -> Tensor
   self: grad * other
   other: grad * self
 
+- name: mul_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  self: grad * other
+  other: grad * self
+
+- name: mul_.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)
+  self: grad * other
+
 - name: div.Tensor(Tensor self, Tensor other) -> Tensor
   self: grad / other
   other: -grad * self / (other * other)
+
+- name: div_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  self: grad / other
+  other: -grad * self / (other * other)
+
+- name: div_.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)
+  self: grad / other
+
+- name: addcmul(Tensor self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor
+  self: grad
+  tensor1: grad * tensor2 * value
+  tensor2: grad * tensor1 * value
+
+- name: addcmul_(Tensor(a!) self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor(a!)
+  self: grad
+  tensor1: grad * tensor2 * value
+  tensor2: grad * tensor1 * value
+
+- name: addcdiv(Tensor self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor
+  self: grad
+  tensor1: grad / tensor2 * value
+  tensor2: -grad * tensor1 / (tensor2 * tensor2) * value
+
+- name: addcdiv_(Tensor(a!) self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor(a!)
+  self: grad
+  tensor1: grad / tensor2 * value
+  tensor2: -grad * tensor1 / (tensor2 * tensor2) * value
+
+- name: where.self(Tensor condition, Tensor self, Tensor other) -> Tensor
+  self: where(condition, grad, zeros_like(self))
+  other: where(condition, zeros_like(other), grad)
+
+- name: where.ScalarSelf(Tensor condition, Scalar self, Tensor other) -> Tensor
+  other: where(condition, zeros_like(other), grad)
+
+- name: where.ScalarOther(Tensor condition, Tensor self, Scalar other) -> Tensor
+  self: where(condition, grad, zeros_like(self))
+
+- name: maximum(Tensor self, Tensor other) -> Tensor
+  self: where(eq(self, other), grad / 2, where(gt(self, other), grad, zeros_like(self)))
+  other: where(eq(self, other), grad / 2, where(lt(self, other), grad, zeros_like(other)))
+
+- name: minimum(Tensor self, Tensor other) -> Tensor
+  self: where(eq(self, other), grad / 2, where(lt(self, other), grad, zeros_like(self)))
+  other: where(eq(self, other), grad / 2, where(gt(self, other), grad, zeros_like(other)))
+
+- name: fused_mul_add(Tensor self, Tensor other, Tensor addend) -> Tensor
+  self: grad * other
+  other: grad * self
+  addend: grad
+
+- name: fused_mul_add.Scalar(Tensor self, Scalar other, Scalar addend) -> Tensor
+  self: grad * other
 
 - name: neg(Tensor self) -> Tensor
   self: grad.neg()
@@ -57,12 +152,48 @@
   self: grad.view(self.shape())
 
 - name: matmul(Tensor self, Tensor other) -> Tensor
-  self: grad.matmul(other.t())
-  other: self.t().matmul(grad)
+  self: matmul_backward_self(grad, self, other)
+  other: matmul_backward_other(grad, self, other)
 
 - name: mm(Tensor self, Tensor other) -> Tensor
   self: grad.mm(other.t())
   other: self.t().mm(grad)
+
+- name: addmm(Tensor input, Tensor mat1, Tensor mat2, *, Scalar beta=1, Scalar alpha=1) -> Tensor
+  input: grad * beta
+  mat1: grad.mm(mat2.t()) * alpha
+  mat2: mat1.t().mm(grad) * alpha
+
+- name: bmm(Tensor self, Tensor batch2) -> Tensor
+  self: grad.matmul(batch2.transpose(-2, -1))
+  batch2: self.transpose(-2, -1).matmul(grad)
+
+- name: baddbmm(Tensor input, Tensor batch1, Tensor batch2, *, Scalar beta=1, Scalar alpha=1) -> Tensor
+  input: grad * beta
+  batch1: grad.matmul(batch2.transpose(-2, -1)) * alpha
+  batch2: batch1.transpose(-2, -1).matmul(grad) * alpha
+
+- name: mv(Tensor self, Tensor vec) -> Tensor
+  self: grad.outer(vec)
+  vec: self.t().mv(grad)
+
+- name: dot(Tensor self, Tensor other) -> Tensor
+  self: grad * other
+  other: grad * self
+
+- name: outer(Tensor self, Tensor vec2) -> Tensor
+  self: grad.mv(vec2)
+  vec2: self.t().mv(grad)
+
+- name: inner(Tensor self, Tensor other) -> Tensor
+  self: inner_backward_self(grad, self, other)
+  other: inner_backward_other(grad, self, other)
+
+- name: movedim(Tensor self, int64_t[] source, int64_t[] destination) -> Tensor
+  self: movedim(grad, destination, source)
+
+- name: diagonal(Tensor self, int64_t offset=0, int64_t dim1=0, int64_t dim2=1) -> Tensor
+  self: diagonal_backward(grad, self.shape(), offset, dim1, dim2)
 
 - name: sin(Tensor self) -> Tensor
   self: grad * self.cos()
@@ -70,20 +201,35 @@
 - name: cos(Tensor self) -> Tensor
   self: grad * -self.sin()
 
+- name: abs(Tensor self) -> Tensor
+  self: grad * self.sign()
+
 - name: pow.Tensor_Scalar(Tensor self, Scalar exponent) -> Tensor
   self: grad * exponent * self.pow(exponent - 1)
 
 - name: exp(Tensor self) -> Tensor
   self: grad * self.exp()
 
+- name: log(Tensor self) -> Tensor
+  self: grad / self
+
+- name: square(Tensor self) -> Tensor
+  self: grad * 2 * self
+
 - name: sqrt(Tensor self) -> Tensor
   self: grad / (2 * self.sqrt())
+
+- name: rsqrt(Tensor self) -> Tensor
+  self: -grad * result * result * result / 2
 
 - name: sum(Tensor self, *, DType dtype=Undefined) -> Tensor
   self: grad.expand(self.shape())
 
 - name: mean(Tensor self, *, DType dtype=Undefined) -> Tensor
   self: grad.expand(self.shape()) / self.numel()
+
+- name: mean.dim(Tensor self, int64_t[] dim, bool keepdim=false, *, DType dtype=Undefined) -> Tensor
+  self: mean_dim_backward(grad, self, dim, keepdim)
 
 - name: reshape(Tensor self, int64_t[] shape) -> Tensor
   self: grad.reshape(self.shape())
@@ -163,6 +309,9 @@
 - name: sigmoid(Tensor self) -> Tensor
   self: grad * result * (1 - result)
 
+- name: silu(Tensor self) -> Tensor
+  self: grad * self.sigmoid() * (self + 1)
+
 - name: tanh(Tensor self) -> Tensor
   self: grad * (1 - result * result)
 
@@ -184,3 +333,8 @@
 
 - name: std(Tensor self, int64_t correction=1) -> Tensor
   self: grad * (self - self.mean()) / (result * (self.numel() - correction))
+
+- name: scaled_dot_product_attention(Tensor query, Tensor key, Tensor value, bool is_causal=false, int64_t impl=0) -> Tensor
+  query: std::get<0>(scaled_dot_product_attention_backward(grad, query, key, value, is_causal, impl))
+  key: std::get<1>(scaled_dot_product_attention_backward(grad, query, key, value, is_causal, impl))
+  value: std::get<2>(scaled_dot_product_attention_backward(grad, query, key, value, is_causal, impl))

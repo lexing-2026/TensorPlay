@@ -1,47 +1,51 @@
 #include "python_bindings.h"
 #include "Node.h"
 #include "AccumulateGrad.h"
-#include "TPXTensor.h"
+#include "Autograd.h"
 #include <typeinfo>
 #include <string>
+#include <pybind11/functional.h>
 
 // Custom Node for Python-defined Autograd Functions
 class PyNode : public tensorplay::tpx::Node {
 public:
-    PyNode(nb::object py_ctx) : py_ctx_(std::move(py_ctx)) {}
+    PyNode(py::object py_ctx) : py_ctx_(std::move(py_ctx)) {}
 
     tensorplay::tpx::variable_list apply(tensorplay::tpx::variable_list&& inputs) override {
-        nb::gil_scoped_acquire gil;
+        if (std::getenv("TP_ENGINE_TRACE")) fprintf(stderr, "[tp-engine] PyNode: acquiring GIL\n");
+        py::gil_scoped_acquire gil;
+        if (std::getenv("TP_ENGINE_TRACE")) fprintf(stderr, "[tp-engine] PyNode: GIL acquired, calling backward\n");
 
         // Convert C++ inputs (grads) to Python
-        nb::list py_inputs;
+        py::list py_inputs;
         for (const auto& input : inputs) {
             if (input.defined()) {
-                py_inputs.append(nb::cast(input));
+                py_inputs.append(py::cast(input));
             } else {
-                py_inputs.append(nb::none());
+                py_inputs.append(py::none());
             }
         }
 
         // Call backward on the context object
-        if (!nb::hasattr(py_ctx_, "backward")) {
+        if (!py::hasattr(py_ctx_, "backward")) {
              throw std::runtime_error("PyNode context object has no 'backward' method");
         }
-        
-        nb::object result_obj = py_ctx_.attr("backward")(*py_inputs);
+
+        py::object result_obj = py_ctx_.attr("backward")(*py_inputs);
+        if (std::getenv("TP_ENGINE_TRACE")) fprintf(stderr, "[tp-engine] PyNode: backward returned\n");
 
         tensorplay::tpx::variable_list results;
 
         if (result_obj.is_none()) {
             return results;
-        } else if (nb::isinstance<Tensor>(result_obj)) {
-            results.push_back(nb::cast<Tensor>(result_obj));
-        } else if (nb::isinstance<nb::sequence>(result_obj)) {
-            for (auto item : nb::cast<nb::sequence>(result_obj)) {
+        } else if (py::isinstance<Tensor>(result_obj)) {
+            results.push_back(py::cast<Tensor>(result_obj));
+        } else if (py::isinstance<py::sequence>(result_obj)) {
+            for (auto item : py::cast<py::sequence>(result_obj)) {
                 if (item.is_none()) {
                     results.push_back(Tensor());
                 } else {
-                    results.push_back(nb::cast<Tensor>(item));
+                    results.push_back(py::cast<Tensor>(item));
                 }
             }
         } else {
@@ -52,38 +56,53 @@ public:
     }
 
 private:
-    nb::object py_ctx_;
+    py::object py_ctx_;
 };
 
-void init_autograd(nb::module_& m) {
-    nb::class_<tensorplay::tpx::Node>(m, "Node")
-        .def_prop_ro("name", [](const tensorplay::tpx::Node& self) {
+void init_autograd(py::module_& m) {
+    py::class_<tensorplay::tpx::Node, std::shared_ptr<tensorplay::tpx::Node>>(m, "Node")
+        .def_property_readonly("name", [](const tensorplay::tpx::Node& self) {
             return std::string(typeid(self).name());
         })
-        .def_prop_ro("next_functions", [](const tensorplay::tpx::Node& self) {
+        .def("add_pre_hook", [](tensorplay::tpx::Node& self,
+                                std::function<std::vector<tensorplay::tpx::Tensor>(
+                                    std::vector<tensorplay::tpx::Tensor>)> hook) {
+            // Hooks may fire on engine worker threads; manage the GIL here so
+            // the C++ hook invocation is always Python-safe.
+            self.add_pre_hook([hook](std::vector<tensorplay::tpx::Tensor>&& grads) {
+                py::gil_scoped_acquire gil;
+                return hook(std::move(grads));
+            });
+        }, py::arg("hook"))
+        .def("add_post_hook", [](tensorplay::tpx::Node& self,
+                                 std::function<std::vector<tensorplay::tpx::Tensor>(
+                                     const std::vector<tensorplay::tpx::Tensor>&,
+                                     std::vector<tensorplay::tpx::Tensor>)> hook) {
+            self.add_post_hook([hook](const std::vector<tensorplay::tpx::Tensor>& inputs,
+                                      std::vector<tensorplay::tpx::Tensor>&& outputs) {
+                py::gil_scoped_acquire gil;
+                return hook(inputs, std::move(outputs));
+            });
+        }, py::arg("hook"))
+        .def_property_readonly("next_functions", [](const tensorplay::tpx::Node& self) {
             std::vector<std::pair<std::shared_ptr<tensorplay::tpx::Node>, int>> result;
             for (const auto& edge : self.next_edges()) {
                 result.push_back({edge.function, (int)edge.input_nr});
             }
             return result;
         })
-        .def_prop_ro("variable", [](const tensorplay::tpx::Node& self) -> std::optional<tensorplay::tpx::Tensor> {
+        .def_property_readonly("variable", [](const tensorplay::tpx::Node& self) -> std::optional<tensorplay::tpx::Tensor> {
             auto* acc = dynamic_cast<const tensorplay::tpx::AccumulateGrad*>(&self);
             if (acc) {
-                if (auto impl = acc->impl_.lock()) {
-                    if (auto meta = acc->meta_.lock()) {
-                         tensorplay::Tensor p10_t(impl);
-                         return tensorplay::tpx::Tensor(p10_t, meta);
-                    }
-                }
+                return acc->value_;
             }
             return std::nullopt;
         });
 
-    nb::module_ autograd = m.def_submodule("_autograd", "Autograd mechanism");
+    py::module_ autograd = m.def_submodule("_autograd", "Autograd mechanism");
 
-    nb::class_<PyNode, tensorplay::tpx::Node>(autograd, "PyNode")
-        .def(nb::init<nb::object>())
+    py::class_<PyNode, tensorplay::tpx::Node, std::shared_ptr<PyNode>>(autograd, "PyNode")
+        .def(py::init<py::object>())
         .def("add_next_edge", [](PyNode& self, std::shared_ptr<tensorplay::tpx::Node> next_node, int input_nr) {
             if (next_node) {
                 self.add_next_edge(tensorplay::tpx::Edge(next_node, input_nr));
@@ -105,22 +124,27 @@ void init_autograd(nb::module_& m) {
         bool keep_graph = retain_graph.value_or(create_graph);
         std::vector<Tensor> grads;
         if (grad_tensors) grads = *grad_tensors;
+        // The engine may evaluate nodes on worker threads that need the GIL
+        // for Python-backed autograd functions; the initiating thread must
+        // not hold it while it waits for the graph to drain.
+        py::gil_scoped_release release;
         tensorplay::tpx::backward(tensors, grads, keep_graph, create_graph);
-    }, "tensors"_a, "grad_tensors"_a = nb::none(), "retain_graph"_a = nb::none(), "create_graph"_a = false);
+    }, "tensors"_a, "grad_tensors"_a = py::none(), "retain_graph"_a = py::none(), "create_graph"_a = false);
 
     autograd.def("grad", [](const std::vector<Tensor>& outputs, const std::vector<Tensor>& inputs, std::optional<std::vector<Tensor>> grad_outputs, std::optional<bool> retain_graph, bool create_graph, bool allow_unused) {
         bool keep_graph = retain_graph.value_or(create_graph);
         std::vector<Tensor> grads;
         if (grad_outputs) grads = *grad_outputs;
+        py::gil_scoped_release release;
         return tensorplay::tpx::grad(outputs, inputs, grads, keep_graph, create_graph, allow_unused);
-    }, "outputs"_a, "inputs"_a, "grad_outputs"_a = nb::none(), "retain_graph"_a = nb::none(), "create_graph"_a = false, "allow_unused"_a = false);
+    }, "outputs"_a, "inputs"_a, "grad_outputs"_a = py::none(), "retain_graph"_a = py::none(), "create_graph"_a = false, "allow_unused"_a = false);
 
     autograd.def("is_grad_enabled", &tensorplay::tpx::GradMode::is_enabled);
     autograd.def("set_grad_enabled", &tensorplay::tpx::GradMode::set_enabled);
 
     // Profiler submodule
-    nb::module_ profiler = m.def_submodule("profiler", "Profiler");
+    py::module_ profiler = m.def_submodule("profiler", "Profiler");
     
     // Parallel submodule
-    nb::module_ parallel = m.def_submodule("parallel", "Parallel computing");
+    py::module_ parallel = m.def_submodule("parallel", "Parallel computing");
 }

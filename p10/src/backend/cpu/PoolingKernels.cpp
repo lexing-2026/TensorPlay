@@ -112,6 +112,9 @@ Tensor avg_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_si
     if (ceil_mode) {
         H_out = (int64_t)(std::ceil((float)(H_in + 2 * pH - kH) / sH)) + 1;
         W_out = (int64_t)(std::ceil((float)(W_in + 2 * pW - kW) / sW)) + 1;
+        // ATen alignment: last window must start strictly inside (input + padding)
+        if (H_out > 1 && (H_out - 1) * sH >= H_in + pH) --H_out;
+        if (W_out > 1 && (W_out - 1) * sW >= W_in + pW) --W_out;
     } else {
         H_out = (H_in + 2 * pH - kH) / sH + 1;
         W_out = (W_in + 2 * pW - kW) / sW + 1;
@@ -158,7 +161,10 @@ Tensor avg_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_si
                         if (divisor_override.has_value()) {
                             divisor = (float)divisor_override.value();
                         } else if (count_include_pad) {
-                             divisor = (float)(kH * kW);
+                            // ATen alignment: window area clipped to (input + padding)
+                            int64_t clip_h = std::min(h_start + kH, H_in + pH) - h_start;
+                            int64_t clip_w = std::min(w_start + kW, W_in + pW) - w_start;
+                            divisor = (float)(clip_h * clip_w);
                         } else {
                              divisor = (float)count;
                         }
@@ -197,19 +203,14 @@ Tensor adaptive_avg_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& 
             for (int64_t c = 0; c < C; ++c) {
                 for (int64_t h = 0; h < H_out; ++h) {
                     int64_t h_start = (h * H_in) / H_out;
-                    int64_t h_end = ((h + 1) * H_in + H_out - 1) / H_out; // Ceil division
-                    // Actually usually: floor( (h+1) * H_in / H_out )?
-                    // PyTorch: start = floor(i * in / out), end = ceil((i+1) * in / out)
-                    // Wait, standard is floor for start and ceil for end.
-                    h_end = ((h + 1) * H_in) / H_out; 
-                    if (h_end == h_start) h_end += 1; // Ensure at least 1 pixel
+                    // Match PyTorch's adaptive pooling bins: floor(start), ceil(end).
+                    int64_t h_end = ((h + 1) * H_in + H_out - 1) / H_out;
                     
                     int64_t kH = h_end - h_start;
                     
                     for (int64_t w = 0; w < W_out; ++w) {
                         int64_t w_start = (w * W_in) / W_out;
-                        int64_t w_end = ((w + 1) * W_in) / W_out;
-                        if (w_end == w_start) w_end += 1;
+                        int64_t w_end = ((w + 1) * W_in + W_out - 1) / W_out;
                         
                         int64_t kW = w_end - w_start;
                         
@@ -383,7 +384,10 @@ Tensor avg_pool2d_backward_cpu(const Tensor& grad_output, const Tensor& input, c
                         if (divisor_override.has_value()) {
                             divisor = (float)divisor_override.value();
                         } else if (count_include_pad) {
-                             divisor = (float)(kH * kW);
+                            // ATen alignment: window area clipped to (input + padding)
+                            int64_t clip_h = std::min(h_start + kH, H_in + pH) - h_start;
+                            int64_t clip_w = std::min(w_start + kW, W_in + pW) - w_start;
+                            divisor = (float)(clip_h * clip_w);
                         } else {
                             // Calculate count excluding pad
                             int64_t count = 0;
@@ -444,14 +448,12 @@ Tensor adaptive_avg_pool2d_backward_cpu(const Tensor& grad_output, const Tensor&
             for (int64_t c = 0; c < C; ++c) {
                 for (int64_t h = 0; h < H_out; ++h) {
                     int64_t h_start = (h * H_in) / H_out;
-                    int64_t h_end = ((h + 1) * H_in) / H_out;
-                    if (h_end == h_start) h_end += 1;
+                    int64_t h_end = ((h + 1) * H_in + H_out - 1) / H_out;
                     int64_t kH = h_end - h_start;
 
                     for (int64_t w = 0; w < W_out; ++w) {
                         int64_t w_start = (w * W_in) / W_out;
-                        int64_t w_end = ((w + 1) * W_in) / W_out;
-                        if (w_end == w_start) w_end += 1;
+                        int64_t w_end = ((w + 1) * W_in + W_out - 1) / W_out;
                         int64_t kW = w_end - w_start;
 
                         int64_t out_idx = ((n * C + c) * H_out + h) * W_out + w;

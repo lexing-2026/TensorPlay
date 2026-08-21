@@ -2950,4 +2950,7 @@ class Module:
 
         See :func:`tensorplay.compile` for details on the arguments for this function.
         """
-        self._compiled_call_impl = tensorplay.compile(self._call_impl, *args, **kwargs)
+        # Match torch.nn.Module.compile(): the public compiler frontend owns
+        # capture and backend selection. Passing the module itself lets the
+        # frontend see its forward signature and registered submodules.
+        self._compiled_call_impl = tensorplay.compile(self, *args, **kwargs)

@@ -3,15 +3,77 @@
 #include <cstdint>
 #include <vector>
 #include "Macros.h"
-#include "TPXTensor.h"
-#include "AutogradMetaInterface.h"
+#include "Tensor.h"
+#include "Node.h"
 #include "Edge.h"
+#include "AutogradMeta.h"
+#include "GradMode.h"
 
 namespace tensorplay {
 namespace tpx {
 
-class Node; // Forward declaration
+// The single tensor type exposed by tpx is the p10 Tensor; tpx attaches
+// autograd metadata to its TensorImpl (mirroring torch, where Variable and
+// Tensor were merged into one type).
+using Tensor = tensorplay::Tensor;
 
+// Free-function accessors over the AutogradMeta extension point. These mirror
+// torch::autograd::impl::* helpers.
+namespace impl {
+
+TENSORPLAY_API AutogradMeta* get_autograd_meta(const Tensor& t);
+TENSORPLAY_API AutogradMeta* get_or_create_autograd_meta(const Tensor& t);
+
+inline bool requires_grad(const Tensor& t) {
+    if (auto* meta = get_autograd_meta(t)) return meta->requires_grad();
+    return false;
+}
+
+TENSORPLAY_API void set_requires_grad(const Tensor& t, bool requires_grad);
+
+inline Tensor grad(const Tensor& t) { return t.grad(); }
+
+// Gradient metadata is mutable even when the value tensor is passed as a
+// const reference, matching torch::Tensor's metadata semantics.
+inline void set_grad(const Tensor& t, const Tensor& grad) {
+    if (auto* meta = get_or_create_autograd_meta(t)) meta->set_grad(grad);
+}
+
+inline void retain_grad(const Tensor& t) {
+    if (auto* meta = get_or_create_autograd_meta(t)) meta->set_retains_grad(true);
+}
+
+inline std::shared_ptr<Node> grad_fn(const Tensor& t) {
+    if (auto* meta = get_autograd_meta(t)) return meta->grad_fn();
+    return nullptr;
+}
+
+inline void set_grad_fn(const Tensor& t, std::shared_ptr<Node> grad_fn, uint32_t output_nr = 0) {
+    if (auto* meta = get_or_create_autograd_meta(t)) {
+        meta->set_grad_fn(std::move(grad_fn));
+        meta->set_output_nr(output_nr);
+    }
+}
+
+inline uint32_t output_nr(const Tensor& t) {
+    if (auto* meta = get_autograd_meta(t)) return meta->output_nr();
+    return 0;
+}
+
+inline std::shared_ptr<Node> grad_accumulator(const Tensor& t) {
+    if (auto* meta = get_autograd_meta(t)) return meta->grad_accumulator();
+    return nullptr;
+}
+
+inline void set_grad_accumulator(const Tensor& t, std::shared_ptr<Node> grad_accumulator) {
+    if (auto* meta = get_or_create_autograd_meta(t)) meta->set_grad_accumulator(std::move(grad_accumulator));
+}
+
+inline bool is_leaf(const Tensor& t) {
+    return grad_fn(t) == nullptr;
+}
+
+} // namespace impl
 
 // Helper to collect next edges for autograd
 TENSORPLAY_API std::vector<Edge> collect_next_edges(const Tensor& t);
@@ -34,56 +96,31 @@ std::vector<Edge> collect_next_edges(const Args&... args) {
     return edges;
 }
 
+// Autograd-aware view/manipulation free functions (formerly tpx::Tensor methods).
+TENSORPLAY_API Tensor as_strided(const Tensor& self, const std::vector<int64_t>& size,
+                                 const std::vector<int64_t>& stride,
+                                 std::optional<int64_t> storage_offset = std::nullopt);
+TENSORPLAY_API Tensor select(const Tensor& self, int64_t dim, int64_t index);
+TENSORPLAY_API Tensor slice(const Tensor& self, int64_t dim, int64_t start, int64_t end, int64_t step = 1);
+TENSORPLAY_API Tensor expand(const Tensor& self, const std::vector<int64_t>& size);
+
 TENSORPLAY_API void backward(const Tensor& tensor, const Tensor& gradient = {}, bool retain_graph = false, bool create_graph = false);
 TENSORPLAY_API void backward(const std::vector<Tensor>& tensors, const std::vector<Tensor>& gradients = {}, bool retain_graph = false, bool create_graph = false);
 
 // Computes and returns the sum of gradients of outputs w.r.t. the inputs.
 // If allow_unused is False, specifying inputs that were not used to compute outputs will raise an error.
 TENSORPLAY_API std::vector<Tensor> grad(
-    const std::vector<Tensor>& outputs, 
-    const std::vector<Tensor>& inputs, 
-    const std::vector<Tensor>& grad_outputs = {}, 
-    bool retain_graph = false, 
-    bool create_graph = false, 
+    const std::vector<Tensor>& outputs,
+    const std::vector<Tensor>& inputs,
+    const std::vector<Tensor>& grad_outputs = {},
+    bool retain_graph = false,
+    bool create_graph = false,
     bool allow_unused = false);
 
 
-class TENSORPLAY_API GradMode {
-public:
-    static bool is_enabled();
-    static void set_enabled(bool enabled);
-};
-
-class TENSORPLAY_API AutogradMeta : public AutogradMetaInterface {
-private:
-    bool requires_grad_;
-    bool retain_grad_;
-    std::shared_ptr<Tensor> grad_;
-    std::shared_ptr<Node> grad_fn_;
-    std::shared_ptr<Node> grad_accumulator_;
-    uint32_t output_nr_;
-    
-public:
-    explicit AutogradMeta(bool requires_grad = false);
-    
-    bool requires_grad() const override;
-    void set_requires_grad(bool requires_grad) override;
-    Tensor grad() const override;
-    void set_grad(const Tensor& grad) override;
-    void accum_grad(const Tensor& grad) override;
-    
-    bool retain_grad() const override;
-    void set_retain_grad(bool retain_grad) override;
-    
-    void set_grad_fn(std::shared_ptr<Node> grad_fn) override;
-    std::shared_ptr<Node> grad_fn() const override;
-    
-    void set_grad_accumulator(std::shared_ptr<Node> grad_accumulator) override;
-    std::shared_ptr<Node> grad_accumulator() const override;
-    
-    uint32_t output_nr() const override;
-    void set_output_nr(uint32_t output_nr) override;
-};
+// GradMode moved to the p10 layer (c10-level TLS) so dispatch code can
+// consult it; re-exported here for source compatibility.
+using GradMode = tensorplay::GradMode;
 
 } // namespace tpx
 } // namespace tensorplay

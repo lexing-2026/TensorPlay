@@ -1,7 +1,12 @@
 import torch
 import tensorplay as tp
 import numpy as np
+import pytest
 from torch.utils.dlpack import to_dlpack
+
+pytestmark = pytest.mark.skipif(
+    not tp.cuda.is_available(), reason="requires CUDA build of tensorplay"
+)
 
 def test_strided_add():
     print("Testing Strided Add (Accumulate Grad scenario)...")

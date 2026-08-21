@@ -1,6 +1,11 @@
 import torch
 import tensorplay as tp
 import numpy as np
+import pytest
+
+pytestmark = pytest.mark.skipif(
+    not tp.cuda.is_available(), reason="requires CUDA build of tensorplay"
+)
 
 def test_matmul_transpose_ops():
     print("Testing Matmul with transpose(-2, -1)...")

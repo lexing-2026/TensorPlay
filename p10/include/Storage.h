@@ -15,6 +15,11 @@ public:
         if (!allocator) allocator = getCPUAllocator();
         impl_ = std::make_shared<StorageImpl>(nbytes, allocator);
     }
+
+    Storage(size_t nbytes, Allocator* allocator, const Device& device) {
+        if (!allocator) allocator = getCPUAllocator();
+        impl_ = std::make_shared<StorageImpl>(nbytes, allocator, device);
+    }
     
     // Create storage from existing DataPtr
     Storage(DataPtr&& data_ptr, size_t nbytes, Allocator* allocator = nullptr) {

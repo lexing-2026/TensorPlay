@@ -13,10 +13,22 @@ namespace tensorplay {
 // Helper for DType output
 std::ostream& operator<<(std::ostream& os, DType dt) {
     switch (dt) {
+        case DType::UInt8: os << "uint8"; break;
+        case DType::Int8: os << "int8"; break;
+        case DType::Int16: os << "int16"; break;
         case DType::Float32: os << "float32"; break;
         case DType::Float64: os << "float64"; break;
         case DType::Int32: os << "int32"; break;
         case DType::Int64: os << "int64"; break;
+        case DType::UInt16: os << "uint16"; break;
+        case DType::UInt32: os << "uint32"; break;
+        case DType::UInt64: os << "uint64"; break;
+        case DType::Float16: os << "float16"; break;
+        case DType::BFloat16: os << "bfloat16"; break;
+        case DType::ComplexHalf: os << "complex32"; break;
+        case DType::ComplexFloat: os << "complex64"; break;
+        case DType::ComplexDouble: os << "complex128"; break;
+        case DType::BComplex32: os << "bcomplex32"; break;
         case DType::Bool: os << "bool"; break;
         default: os << "dtype(" << static_cast<int>(dt) << ")"; break;
     }
@@ -67,7 +79,7 @@ Tensor::Tensor(const std::vector<int64_t>& sizes, Scalar fill_value, const Devic
 int64_t Tensor::dim() const { return impl_ ? impl_->dim() : 0; }
 int64_t Tensor::numel() const { return impl_ ? impl_->numel() : 0; }
 Size Tensor::shape() const { return impl_ ? Size(impl_->sizes()) : Size(); }
-std::vector<int64_t> Tensor::strides() const { return impl_ ? impl_->strides() : std::vector<int64_t>(); }
+std::vector<int64_t> Tensor::strides() const { return impl_ ? impl_->strides().vec() : std::vector<int64_t>(); }
 int64_t Tensor::size(int64_t dim) const {
     if (!impl_) return 0;
     if (dim < 0) dim += impl_->dim();
@@ -82,6 +94,74 @@ DType Tensor::dtype() const { return impl_ ? impl_->dtype() : DType::Undefined; 
 Device Tensor::device() const { return impl_ ? impl_->device() : Device(DeviceType::CPU); }
 size_t Tensor::itemsize() const { return impl_ ? impl_->itemsize() : 0; }
 bool Tensor::is_contiguous() const { return impl_ ? impl_->is_contiguous() : false; }
+
+bool Tensor::requires_grad() const {
+    return impl_ && impl_->autograd_meta() && impl_->autograd_meta()->requires_grad();
+}
+
+void Tensor::set_requires_grad(bool requires_grad) {
+    if (!impl_) return;
+    if (auto* meta = impl_->autograd_meta()) {
+        meta->set_requires_grad(requires_grad);
+    } else if (requires_grad) {
+        // No autograd metadata attached yet. The tpx layer owns the concrete
+        // AutogradMeta type; without it, requires_grad cannot be enabled.
+        // This mirrors a fresh TensorImpl in PyTorch, where requires_grad is
+        // only meaningful once the autograd layer attaches metadata.
+    }
+}
+
+Tensor Tensor::grad() const {
+    if (impl_ && impl_->autograd_meta()) return impl_->autograd_meta()->grad();
+    return Tensor();
+}
+
+void Tensor::set_grad(const Tensor& grad) {
+    if (!impl_) return;
+    if (auto* meta = impl_->autograd_meta()) meta->set_grad(grad);
+}
+
+bool Tensor::retains_grad() const {
+    return impl_ && impl_->autograd_meta() && impl_->autograd_meta()->retains_grad();
+}
+
+void Tensor::set_retains_grad(bool retains_grad) {
+    if (!impl_) return;
+    if (auto* meta = impl_->autograd_meta()) meta->set_retains_grad(retains_grad);
+}
+
+Tensor Tensor::detach() const {
+    if (!impl_) return Tensor();
+    return Tensor(std::make_shared<TensorImpl>(*impl_));
+}
+
+bool Tensor::is_pinned() const {
+#ifdef USE_CUDA
+    return impl_ && device().is_cpu() && impl_->has_storage() &&
+           impl_->storage().allocator() == getPinnedMemoryAllocator();
+#else
+    return false;
+#endif
+}
+
+Tensor Tensor::pin_memory() const {
+    if (!impl_) return Tensor();
+    if (!device().is_cpu()) {
+        TP_THROW(RuntimeError, "cannot pin a tensor on " + device().toString() +
+                               "; only dense CPU tensors can be pinned");
+    }
+#ifdef USE_CUDA
+    if (is_pinned()) return *this;
+    const auto sizes = static_cast<std::vector<int64_t>>(shape());
+    const size_t nbytes = static_cast<size_t>(numel()) * itemsize();
+    Storage storage(nbytes, getPinnedMemoryAllocator(), Device(DeviceType::CPU));
+    Tensor result(storage, sizes, dtype());
+    result.copy_(*this);
+    return result;
+#else
+    TP_THROW(RuntimeError, "pin_memory requires a CUDA-enabled TensorPlay build");
+#endif
+}
 
 bool Tensor::is_sparse() const { return false; }
 
@@ -99,9 +179,29 @@ Scalar Tensor::item() const {
     switch (dtype()) {
         case DType::Float32: return Scalar(static_cast<double>(*data_ptr<float>()));
         case DType::Float64: return Scalar(*data_ptr<double>());
+        case DType::Float16: return Scalar(static_cast<float>(*data_ptr<Half>()));
+        case DType::BFloat16: return Scalar(static_cast<float>(*data_ptr<BFloat16>()));
+        case DType::Int8: return Scalar(static_cast<int64_t>(*data_ptr<int8_t>()));
+        case DType::Int16: return Scalar(static_cast<int64_t>(*data_ptr<int16_t>()));
         case DType::Int32: return Scalar(static_cast<int64_t>(*data_ptr<int32_t>()));
         case DType::Int64: return Scalar(*data_ptr<int64_t>());
+        case DType::UInt8: return Scalar(static_cast<uint64_t>(*data_ptr<uint8_t>()));
+        case DType::UInt16: return Scalar(static_cast<uint64_t>(*data_ptr<uint16_t>()));
+        case DType::UInt32: return Scalar(static_cast<uint64_t>(*data_ptr<uint32_t>()));
+        case DType::UInt64: return Scalar(*data_ptr<uint64_t>());
         case DType::Bool: return Scalar(static_cast<bool>(*data_ptr<bool>()));
+        case DType::ComplexHalf: {
+            const auto value = *data_ptr<std::complex<Half>>();
+            return Scalar(std::complex<float>(static_cast<float>(value.real()),
+                                              static_cast<float>(value.imag())));
+        }
+        case DType::ComplexFloat: return Scalar(*data_ptr<std::complex<float>>());
+        case DType::ComplexDouble: return Scalar(*data_ptr<std::complex<double>>());
+        case DType::BComplex32: {
+            const auto value = *data_ptr<std::complex<BFloat16>>();
+            return Scalar(std::complex<float>(static_cast<float>(value.real()),
+                                              static_cast<float>(value.imag())));
+        }
         default: TP_THROW(NotImplementedError, "item() not implemented for this dtype");
     }
 }
@@ -304,7 +404,12 @@ Tensor operator-(const Tensor& t) {
 Tensor Tensor::as_strided(const std::vector<int64_t>& size, const std::vector<int64_t>& stride, std::optional<int64_t> storage_offset) const {
     if (!impl_) TP_THROW(RuntimeError, "Tensor not defined");
     size_t offset = storage_offset.value_or(impl_->storage_offset());
-    return Tensor(impl_->storage(), size, stride, impl_->dtype(), offset);
+    Tensor out = Tensor(impl_->storage(), size, stride, impl_->dtype(), offset);
+    // A view aliases the base memory: share the version counter so that
+    // in-place writes through either alias are visible to mutation tracking
+    // (mirrors PyTorch view semantics).
+    out.unsafeGetTensorImpl()->share_version_counter(*impl_);
+    return out;
 }
 
 Tensor Tensor::view(const std::vector<int64_t>& shape) const {
@@ -432,20 +537,19 @@ Tensor Tensor::operator*(const Tensor& other) const { return mul(other); }
 Tensor Tensor::operator/(const Tensor& other) const { return div(other); }
 
 Tensor Tensor::operator+(Scalar other) const { 
-    Tensor t = Tensor::full({}, other, other.dtype(), device());
-    return add(t);
+    // Keep the scalar overload on the dispatcher.  Materializing a scalar as
+    // a Float32 tensor silently promoted fp16/bf16 tensors and introduced a
+    // device allocation in the hot path (notably mean/RMSNorm).
+    return add(other, Scalar(1));
 }
 Tensor Tensor::operator-(Scalar other) const {
-    Tensor t = Tensor::full({}, other, other.dtype(), device());
-    return sub(t);
+    return sub(other, Scalar(1));
 }
 Tensor Tensor::operator*(Scalar other) const {
-    Tensor t = Tensor::full({}, other, other.dtype(), device());
-    return mul(t);
+    return mul(other);
 }
 Tensor Tensor::operator/(Scalar other) const {
-    Tensor t = Tensor::full({}, other, other.dtype(), device());
-    return div(t);
+    return div(other);
 }
 
 Tensor& Tensor::operator+=(const Tensor& other) { return add_(other); }
@@ -454,26 +558,37 @@ Tensor& Tensor::operator*=(const Tensor& other) { return mul_(other); }
 Tensor& Tensor::operator/=(const Tensor& other) { return div_(other); }
 
 Tensor& Tensor::operator+=(Scalar other) {
-    Tensor t = Tensor::full({}, other, other.dtype(), device());
-    return add_(t);
+    return add_(other, Scalar(1));
 }
 Tensor& Tensor::operator-=(Scalar other) {
-    Tensor t = Tensor::full({}, other, other.dtype(), device());
-    return sub_(t);
+    return sub_(other, Scalar(1));
 }
 Tensor& Tensor::operator*=(Scalar other) {
-    Tensor t = Tensor::full({}, other, other.dtype(), device());
-    return mul_(t);
+    return mul_(other);
 }
 Tensor& Tensor::operator/=(Scalar other) {
-    Tensor t = Tensor::full({}, other, other.dtype(), device());
-    return div_(t);
+    return div_(other);
 }
 
 Tensor Tensor::clone() const {
     if (!impl_) return Tensor();
     Tensor t(impl_->sizes(), dtype(), device());
-    t.copy_(*this);
+    // Match the native contiguous clone path used by Torch: avoid routing
+    // every same-dtype contiguous clone through the dispatcher.  Optimizer
+    // momentum initialization creates one clone per parameter, so this
+    // dispatch overhead is visible even though the operation is just a byte
+    // copy.  Non-contiguous and cross-device cases retain copy_'s layout and
+    // transfer semantics.
+    if (device().is_cpu() && is_contiguous()) {
+        std::memcpy(t.data_ptr(), data_ptr(),
+                    static_cast<size_t>(numel()) * itemsize());
+    } else {
+        t.copy_(*this);
+    }
+    // copy_ records a mutation on the destination; the clone result is a
+    // freshly materialized tensor and must start unmutated (PyTorch: version
+    // 0), so clear the counter the internal copy bumped.
+    t.unsafeGetTensorImpl()->reset_version();
     return t;
 }
 
@@ -483,7 +598,7 @@ Tensor Tensor::to(DType dtype, bool non_blocking, bool copy) const {
         return copy ? clone() : *this;
     }
     Tensor t(impl_->sizes(), dtype, device());
-    t.copy_(*this);
+    t.copy_(*this, non_blocking);
     return t;
 }
 
@@ -493,7 +608,7 @@ Tensor Tensor::to(Device device, bool non_blocking, bool copy) const {
         return copy ? clone() : *this;
     }
     Tensor t(impl_->sizes(), dtype(), device);
-    t.copy_(*this);
+    t.copy_(*this, non_blocking);
     return t;
 }
 
@@ -503,7 +618,7 @@ Tensor Tensor::to(Device device, DType dtype, bool non_blocking, bool copy) cons
         return copy ? clone() : *this;
     }
     Tensor t(impl_->sizes(), dtype, device);
-    t.copy_(*this);
+    t.copy_(*this, non_blocking);
     return t;
 }
 

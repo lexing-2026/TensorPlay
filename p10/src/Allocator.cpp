@@ -3,8 +3,14 @@
 #include <memory>
 #include <mutex>
 #include <cstdlib>
+#include <cstring>
 #include <unordered_map>
 #include <vector>
+
+#ifdef USE_CUDA
+#include "CUDARuntime.h"
+#include <cuda_runtime.h>
+#endif
 
 #ifdef _WIN32
 #include <malloc.h>
@@ -107,6 +113,39 @@ public:
 
 Allocator* getCPUAllocator() {
     return CachingAllocator::instance();
+}
+
+void copyAllocationBytes(void* destination, const Device& destination_device,
+                         const void* source, const Device& source_device,
+                         size_t nbytes) {
+    if (!destination || !source || nbytes == 0) return;
+    if (destination_device.is_cpu() && source_device.is_cpu()) {
+        std::memcpy(destination, source, nbytes);
+        return;
+    }
+#ifdef USE_CUDA
+    const Device cuda_device = destination_device.is_cuda()
+        ? destination_device
+        : source_device;
+    cuda::CUDAGuard guard(cuda_device);
+    auto stream = cuda::getCurrentCUDAStream(static_cast<int>(cuda_device.index()));
+    cudaMemcpyKind kind = cudaMemcpyDefault;
+    if (destination_device.is_cuda() && source_device.is_cuda()) {
+        kind = cudaMemcpyDeviceToDevice;
+    } else if (destination_device.is_cuda()) {
+        kind = cudaMemcpyHostToDevice;
+    } else {
+        kind = cudaMemcpyDeviceToHost;
+    }
+    cuda::checkCuda(cudaMemcpyAsync(destination, source, nbytes, kind, stream.stream()),
+                    "cudaMemcpyAsync (storage resize)");
+    if (destination_device.is_cuda()) cuda::recordStream(destination, stream);
+    if (source_device.is_cuda()) cuda::recordStream(const_cast<void*>(source), stream);
+    if (destination_device.is_cpu() || source_device.is_cpu()) stream.synchronize();
+    return;
+#else
+    TP_THROW(RuntimeError, "cannot copy CUDA storage in a CPU-only TensorPlay build");
+#endif
 }
 
 #ifdef USE_CUDA

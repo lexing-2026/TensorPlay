@@ -4,7 +4,17 @@ project(TensorPlay LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-option(USE_CUDA "Enable CUDA support" ON)
+# Auto-detect CUDA: default to ON only when an nvcc is available so that a
+# plain `pip install .` on a CPU-only machine still builds successfully.
+if(NOT DEFINED USE_CUDA)
+    find_program(NVCC_CANDIDATE nvcc)
+    if(NVCC_CANDIDATE)
+        set(USE_CUDA ON)
+    else()
+        set(USE_CUDA OFF)
+    endif()
+endif()
+option(USE_CUDA "Enable CUDA support" ${USE_CUDA})
 
 if(USE_CUDA)
     message(STATUS "Checking for CUDA compiler...")
@@ -138,6 +148,17 @@ if(USE_CUDA)
         set(USE_CUDNN ON)
         message(STATUS "Found cuDNN: ${CUDNN_INCLUDE_DIR}")
         add_compile_definitions(USE_CUDNN)
+
+        # cuDNN v9 frontend (header-only graph API)
+        find_path(CUDNN_FRONTEND_INCLUDE_DIR cudnn_frontend.h
+            HINTS
+                $ENV{CUDNN_FRONTEND_DIR}/include
+                "${CUDNN_INCLUDE_DIR}/cudnn_frontend"
+            DOC "Path to cuDNN frontend include directory"
+        )
+        if(CUDNN_FRONTEND_INCLUDE_DIR)
+            message(STATUS "Found cuDNN frontend: ${CUDNN_FRONTEND_INCLUDE_DIR}")
+        endif()
         
         # On Windows, we might need to copy DLLs if they are not in PATH
         if(WIN32)
@@ -240,23 +261,26 @@ set(GEN_BINDINGS_HEADER "${GEN_INCLUDE_DIR}/TensorBindingsGenerated.h")
 set(GEN_AUTOGRAD_NODES_H "${GEN_INCLUDE_DIR}/AutogradNodesGenerated.h")
 set(GEN_TPX_OPS_H "${GEN_INCLUDE_DIR}/TPXOpsGenerated.h")
 set(GEN_TPX_OPS_CPP "${GEN_INCLUDE_DIR}/TPXOpsGenerated.cpp")
+set(GEN_TPX_AUTOGRAD_REG_CPP "${GEN_INCLUDE_DIR}/TPXAutogradRegistration.cpp")
+set(GEN_AUTOCAST_CPP "${GEN_INCLUDE_DIR}/AutocastGenerated.cpp")
+set(GEN_TPX_REDISPATCH_H "${GEN_INCLUDE_DIR}/TensorRedispatchGenerated.h")
 
 # Python Interface Stub Generation
 set(TP_PACKAGE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tensorplay")
 
 # Add a custom target to ensure code generation runs before library building
-add_custom_target(generate_code DEPENDS ${GEN_HEADER} ${GEN_CPP} ${GEN_TPX_OPS_CPP})
+add_custom_target(generate_code DEPENDS ${GEN_HEADER} ${GEN_CPP} ${GEN_TPX_OPS_CPP} ${GEN_TPX_AUTOGRAD_REG_CPP} ${GEN_AUTOCAST_CPP} ${GEN_TPX_REDISPATCH_H})
 
 include_directories(${GEN_BASE_DIR})
 
-# Nanobind via pip installation
+# pybind11 via pip installation
 execute_process(
-  COMMAND "${Python_EXECUTABLE}" -c "import nanobind; print(nanobind.cmake_dir())"
-  OUTPUT_VARIABLE NANOBIND_CMAKE_DIR
+  COMMAND "${Python_EXECUTABLE}" -c "import pybind11; print(pybind11.get_cmake_dir())"
+  OUTPUT_VARIABLE PYBIND11_CMAKE_DIR
   OUTPUT_STRIP_TRAILING_WHITESPACE
 )
-list(APPEND CMAKE_PREFIX_PATH "${NANOBIND_CMAKE_DIR}")
-find_package(nanobind CONFIG REQUIRED)
+list(APPEND CMAKE_PREFIX_PATH "${PYBIND11_CMAKE_DIR}")
+find_package(pybind11 CONFIG REQUIRED)
 
 # --- Compute Backend Selection ---
 find_package(OpenMP)
@@ -464,6 +488,14 @@ endif()
 
 add_compile_definitions(${BLAS_COMPILE_DEFS})
 
+# Link the OpenMP runtime into every compute library and the Python extension.
+# Compile-only flags (-fopenmp) emit GOMP_* symbols without resolving them,
+# producing shared libraries with undefined OpenMP symbols (e.g. GOMP_critical_start).
+# COMPUTE_LIBS is propagated PUBLICly through p10 -> tpx -> stax -> _C.
+if(OpenMP_CXX_FOUND)
+    list(APPEND COMPUTE_LIBS OpenMP::OpenMP_CXX)
+endif()
+
 if(MSVC)
   list(APPEND BLAS_COMPILE_OPTIONS "/O2" "/arch:AVX2")
 else()
@@ -629,6 +661,7 @@ set(CONFIG_CONTENT "
 #pragma once
 #include <string>
 #include <map>
+#include \"Parallel.h\"
 
 namespace tensorplay {
     inline std::string show_config() {
@@ -651,7 +684,7 @@ namespace tensorplay {
     }
 
     inline std::string _parallel_info() {
-        return \"${TP_OPENMP_INFO}\";
+        return tensorplay::parallel::get_parallel_info();
     }
 
     inline std::map<std::string, std::string> get_build_info() {
@@ -674,14 +707,15 @@ file(WRITE "${GEN_BASE_DIR}/tensorplay/ops/Config.h" "${CONFIG_CONTENT}")
 
 # Code generation
 add_custom_command(
-            OUTPUT ${GEN_HEADER} ${GEN_CPP} ${GEN_BINDINGS_HEADER} 
+            OUTPUT ${GEN_HEADER} ${GEN_CPP} ${GEN_BINDINGS_HEADER}
                    ${GEN_AUTOGRAD_NODES_H} ${GEN_TPX_OPS_H} ${GEN_TPX_OPS_CPP}
-            COMMAND ${Python_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/codegen/gen.py 
-                    --yaml ${CMAKE_CURRENT_SOURCE_DIR}/config/native_functions.yaml 
+                   ${GEN_TPX_AUTOGRAD_REG_CPP} ${GEN_AUTOCAST_CPP} ${GEN_TPX_REDISPATCH_H}
+            COMMAND ${Python_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/codegen/gen.py
+                    --yaml ${CMAKE_CURRENT_SOURCE_DIR}/config/native_functions.yaml
                     --derivatives ${CMAKE_CURRENT_SOURCE_DIR}/config/derivatives.yaml
                     --out_dir ${GEN_INCLUDE_DIR}
                     --pkg_out ${CMAKE_CURRENT_SOURCE_DIR}/tensorplay
-            DEPENDS 
+            DEPENDS
                 ${CMAKE_CURRENT_SOURCE_DIR}/config/native_functions.yaml
                 ${CMAKE_CURRENT_SOURCE_DIR}/config/derivatives.yaml
                 ${CMAKE_CURRENT_SOURCE_DIR}/tools/codegen/gen.py
@@ -689,14 +723,16 @@ add_custom_command(
         )
 
 set_source_files_properties(
-    ${GEN_HEADER} ${GEN_CPP} ${GEN_BINDINGS_HEADER} 
+    ${GEN_HEADER} ${GEN_CPP} ${GEN_BINDINGS_HEADER}
     ${GEN_AUTOGRAD_NODES_H} ${GEN_TPX_OPS_H} ${GEN_TPX_OPS_CPP}
+    ${GEN_TPX_AUTOGRAD_REG_CPP} ${GEN_AUTOCAST_CPP} ${GEN_TPX_REDISPATCH_H}
     PROPERTIES GENERATED TRUE
 )
 
 option(BUILD_SHARED_LIBS "Build shared libraries" ON)
 
 # Add p10
+list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake/Modules)
 add_subdirectory(p10)
 
 # Add tpx
@@ -706,7 +742,7 @@ add_subdirectory(tpx)
 add_subdirectory(stax)
 
 # Python Bindings
-nanobind_add_module(_C 
+pybind11_add_module(_C 
     src/bindings/python/init.cpp
     src/bindings/python/DType.cpp
     src/bindings/python/Scalar.cpp
@@ -717,6 +753,8 @@ nanobind_add_module(_C
     src/bindings/python/Ops.cpp
     src/bindings/python/Tensor.cpp
     src/bindings/python/Stax.cpp
+    src/bindings/python/Parallel.cpp
+    src/bindings/python/Distributed.cpp
 )
 set_target_properties(_C PROPERTIES UNITY_BUILD ON)
 target_link_libraries(_C PRIVATE p10 tpx stax)
@@ -731,7 +769,15 @@ endif()
 # endif()
 
 # target_compile_definitions(_C PRIVATE TP_STATIC_BUILD)
-target_include_directories(_C PRIVATE ${GEN_BASE_DIR} include)
+# Distributed.cpp shares the NCCL stub/context declaration with p10.  Keep
+# this include path explicit: p10's include directory is public, but the
+# context header intentionally lives beside its CUDA implementation and is
+# not part of the public tensor API.
+target_include_directories(_C PRIVATE
+    ${GEN_BASE_DIR}
+    include
+    ${CMAKE_CURRENT_SOURCE_DIR}/p10/src/backend/cuda
+)
 
 set(TP_PACKAGE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tensorplay")
 set(TP_LIB_DIR "${TP_PACKAGE_DIR}/lib")
@@ -749,6 +795,22 @@ set_target_properties(_C PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY_DEBUG "${TP_PACKAGE_DIR}/_C"
     ARCHIVE_OUTPUT_DIRECTORY_DEBUG "${TP_PACKAGE_DIR}/_C"
 )
+
+# RPATH: the extension lives in tensorplay/_C while its dependencies
+# (libp10.so, libtpx.so, libstax.so) live in tensorplay/lib. Without an
+# explicit relative RPATH, importing tensorplay from a wheel/venv fails
+# with "cannot open shared object file". Windows ignores RPATH (DLL
+# search is handled by tensorplay/__init__.py via os.add_dll_directory).
+if(NOT WIN32)
+    set_target_properties(p10 tpx stax PROPERTIES
+        INSTALL_RPATH "$ORIGIN"
+        BUILD_RPATH "$ORIGIN"
+    )
+    set_target_properties(_C PROPERTIES
+        INSTALL_RPATH "$ORIGIN/../lib"
+        BUILD_RPATH "$ORIGIN/../lib"
+    )
+endif()
 
 # Installation
 install(TARGETS p10 tpx stax

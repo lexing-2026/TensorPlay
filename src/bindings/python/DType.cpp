@@ -1,50 +1,100 @@
 #include "python_bindings.h"
 
-void init_dtype(nb::module_& m) {
-    nb::enum_<DType>(m, "DType")
-        .value("float32", DType::Float32)
-        .value("float64", DType::Float64)
-        .value("int32", DType::Int32)
-        .value("int64", DType::Int64)
+namespace {
+
+const char* dtype_name(DType dtype) {
+    switch (dtype) {
+        case DType::UInt8: return "uint8";
+        case DType::Int8: return "int8";
+        case DType::Int16: return "int16";
+        case DType::Int32: return "int32";
+        case DType::Int64: return "int64";
+        case DType::UInt16: return "uint16";
+        case DType::UInt32: return "uint32";
+        case DType::UInt64: return "uint64";
+        case DType::Float16: return "float16";
+        case DType::BFloat16: return "bfloat16";
+        case DType::Float32: return "float32";
+        case DType::Float64: return "float64";
+        case DType::ComplexHalf: return "complex32";
+        case DType::ComplexFloat: return "complex64";
+        case DType::ComplexDouble: return "complex128";
+        case DType::BComplex32: return "bcomplex32";
+        case DType::Bool: return "bool";
+        default: return "undefined";
+    }
+}
+
+std::string dtype_repr(DType dtype) {
+    return std::string("tensorplay.") + dtype_name(dtype);
+}
+
+} // namespace
+
+void init_dtype(py::module_& m) {
+    auto dtype = py::enum_<DType>(m, "DType");
+    dtype
         .value("uint8", DType::UInt8)
         .value("int8", DType::Int8)
         .value("int16", DType::Int16)
+        .value("int32", DType::Int32)
+        .value("int64", DType::Int64)
         .value("uint16", DType::UInt16)
         .value("uint32", DType::UInt32)
         .value("uint64", DType::UInt64)
+        .value("float16", DType::Float16)
+        .value("bfloat16", DType::BFloat16)
+        .value("float32", DType::Float32)
+        .value("float64", DType::Float64)
+        .value("complex32", DType::ComplexHalf)
+        .value("complex64", DType::ComplexFloat)
+        .value("complex128", DType::ComplexDouble)
+        .value("bcomplex32", DType::BComplex32)
         .value("bool", DType::Bool)
         .value("undefined", DType::Undefined)
-        .def("__str__", [](DType d) {
-            switch(d) {
-                case DType::Float32: return "tensorplay.float32";
-                case DType::Float64: return "tensorplay.float64";
-                case DType::Int32: return "tensorplay.int32";
-                case DType::Int64: return "tensorplay.int64";
-                case DType::UInt8: return "tensorplay.uint8";
-                case DType::Int8: return "tensorplay.int8";
-                case DType::Int16: return "tensorplay.int16";
-                case DType::UInt16: return "tensorplay.uint16";
-                case DType::UInt32: return "tensorplay.uint32";
-                case DType::UInt64: return "tensorplay.uint64";
-                case DType::Bool: return "tensorplay.bool";
-                default: return "tensorplay.undefined";
-            }
+        .def("__str__", [](DType d) { return dtype_repr(d); })
+        .def("__repr__", [](DType d) { return dtype_repr(d); })
+        // Match torch.dtype's read-only classification attributes.
+        .def_property_readonly("is_floating_point", [](DType d) {
+            return tensorplay::isFloatingType(d);
         })
-        .def("__repr__", [](DType d) {
-            switch(d) {
-                case DType::Float32: return "tensorplay.float32";
-                case DType::Float64: return "tensorplay.float64";
-                case DType::Int32: return "tensorplay.int32";
-                case DType::Int64: return "tensorplay.int64";
-                case DType::UInt8: return "tensorplay.uint8";
-                case DType::Int8: return "tensorplay.int8";
-                case DType::Int16: return "tensorplay.int16";
-                case DType::UInt16: return "tensorplay.uint16";
-                case DType::UInt32: return "tensorplay.uint32";
-                case DType::UInt64: return "tensorplay.uint64";
-                case DType::Bool: return "tensorplay.bool";
-                default: return "tensorplay.undefined";
-            }
+        .def_property_readonly("is_complex", [](DType d) {
+            return tensorplay::isComplexType(d);
         })
-        .export_values();
+        .def_property_readonly("is_signed", [](DType d) {
+            return tensorplay::isSignedType(d);
+        })
+        .def_property_readonly("itemsize", [](DType d) {
+            return tensorplay::elementSize(d);
+        });
+
+    // Canonical module-level names and the aliases used by torch.
+    m.attr("uint8") = DType::UInt8;
+    m.attr("int8") = DType::Int8;
+    m.attr("int16") = DType::Int16;
+    m.attr("int32") = DType::Int32;
+    m.attr("int64") = DType::Int64;
+    m.attr("uint16") = DType::UInt16;
+    m.attr("uint32") = DType::UInt32;
+    m.attr("uint64") = DType::UInt64;
+    m.attr("float16") = DType::Float16;
+    m.attr("bfloat16") = DType::BFloat16;
+    m.attr("float32") = DType::Float32;
+    m.attr("float64") = DType::Float64;
+    m.attr("complex32") = DType::ComplexHalf;
+    m.attr("complex64") = DType::ComplexFloat;
+    m.attr("complex128") = DType::ComplexDouble;
+    m.attr("bcomplex32") = DType::BComplex32;
+    m.attr("bool") = DType::Bool;
+    m.attr("undefined") = DType::Undefined;
+
+    m.attr("half") = DType::Float16;
+    m.attr("float") = DType::Float32;
+    m.attr("double") = DType::Float64;
+    m.attr("short") = DType::Int16;
+    m.attr("int") = DType::Int32;
+    m.attr("long") = DType::Int64;
+    m.attr("cfloat") = DType::ComplexFloat;
+    m.attr("cdouble") = DType::ComplexDouble;
+    m.attr("chalf") = DType::ComplexHalf;
 }

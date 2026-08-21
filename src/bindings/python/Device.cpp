@@ -3,6 +3,7 @@
 #include "Device.h" // For Device class and cuda namespace declarations
 
 #ifdef USE_CUDA
+#include "CUDARuntime.h"
 #include <cuda_runtime.h>
 
 struct CudaDeviceProperties {
@@ -14,17 +15,16 @@ struct CudaDeviceProperties {
 };
 #endif
 
-void init_device(nb::module_& m) {
-    nb::enum_<DeviceType>(m, "DeviceType")
+void init_device(py::module_& m) {
+    py::enum_<DeviceType>(m, "DeviceType")
         .value("CPU", DeviceType::CPU)
-        .value("CUDA", DeviceType::CUDA)
-        .export_values();
+        .value("CUDA", DeviceType::CUDA);
 
-    nb::class_<Device>(m, "Device")
-        .def(nb::init<DeviceType, int64_t>(), "type"_a, "index"_a = -1)
-        .def(nb::init<const std::string&>(), "device"_a)
-        .def(nb::init<const std::string&, int64_t>(), "type"_a, "index"_a)
-        .def_prop_ro("type", [](const Device& d) {
+    py::class_<Device>(m, "Device")
+        .def(py::init<DeviceType, int64_t>(), "type"_a, "index"_a = -1)
+        .def(py::init<const std::string&>(), "device"_a)
+        .def(py::init<const std::string&, int64_t>(), "type"_a, "index"_a)
+        .def_property_readonly("type", [](const Device& d) {
             std::string s = d.toString();
             size_t colon = s.find(':');
             if (colon != std::string::npos) {
@@ -32,28 +32,93 @@ void init_device(nb::module_& m) {
             }
             return s;
         })
-        .def_prop_ro("index", &Device::index)
+        .def_property_readonly("index", &Device::index)
         .def("is_cpu", &Device::is_cpu)
         .def("is_cuda", &Device::is_cuda)
         .def("__repr__", &Device::toString)
         .def("__str__", &Device::toString)
-        .def(nb::self == nb::self)
-        .def(nb::self != nb::self);
+        .def(py::self == py::self)
+        .def(py::self != py::self);
 
-    nb::implicitly_convertible<std::string, Device>();
+    py::implicitly_convertible<std::string, Device>();
         
     // CUDA submodule
-    nb::module_ cuda = m.def_submodule("_cuda", "CUDA computation backend");
+    py::module_ cuda = m.def_submodule("_cuda", "CUDA computation backend");
     
 #ifdef USE_CUDA
-    nb::class_<CudaDeviceProperties>(cuda, "_CudaDeviceProperties")
-        .def_ro("name", &CudaDeviceProperties::name)
-        .def_ro("major", &CudaDeviceProperties::major)
-        .def_ro("minor", &CudaDeviceProperties::minor)
-        .def_ro("total_memory", &CudaDeviceProperties::total_memory)
-        .def_ro("multi_processor_count", &CudaDeviceProperties::multi_processor_count)
+    py::class_<CudaDeviceProperties>(cuda, "_CudaDeviceProperties")
+        .def_readonly("name", &CudaDeviceProperties::name)
+        .def_readonly("major", &CudaDeviceProperties::major)
+        .def_readonly("minor", &CudaDeviceProperties::minor)
+        .def_readonly("total_memory", &CudaDeviceProperties::total_memory)
+        .def_readonly("multi_processor_count", &CudaDeviceProperties::multi_processor_count)
         .def("__repr__", [](const CudaDeviceProperties& p) {
             return "_CudaDeviceProperties(name='" + p.name + "', major=" + std::to_string(p.major) + ", minor=" + std::to_string(p.minor) + ", total_memory=" + std::to_string(p.total_memory) + ", multi_processor_count=" + std::to_string(p.multi_processor_count) + ")";
+        });
+
+    py::class_<tensorplay::cuda::CUDAEvent>(cuda, "_CudaEvent")
+        .def(py::init<bool, bool, bool>(),
+             "enable_timing"_a = false, "blocking"_a = false,
+             "interprocess"_a = false)
+        .def("record", [](tensorplay::cuda::CUDAEvent& event,
+                           const std::optional<tensorplay::cuda::CUDAStream>& stream) {
+            if (stream) event.record(*stream);
+            else event.record();
+        }, "stream"_a = py::none())
+        .def("wait", [](const tensorplay::cuda::CUDAEvent& event,
+                         const std::optional<tensorplay::cuda::CUDAStream>& stream) {
+            event.block(stream.value_or(tensorplay::cuda::getCurrentCUDAStream()));
+        }, "stream"_a = py::none())
+        .def("query", &tensorplay::cuda::CUDAEvent::query)
+        .def("synchronize", &tensorplay::cuda::CUDAEvent::synchronize,
+             py::call_guard<py::gil_scoped_release>())
+        .def("elapsed_time", &tensorplay::cuda::CUDAEvent::elapsed_time, "end_event"_a)
+        .def_property_readonly("device", [](const tensorplay::cuda::CUDAEvent& event) -> py::object {
+            if (event.device_index() < 0) return py::none();
+            return py::cast(Device(DeviceType::CUDA, event.device_index()));
+        })
+        .def_property_readonly("cuda_event", &tensorplay::cuda::CUDAEvent::id)
+        .def("__repr__", [](const tensorplay::cuda::CUDAEvent& event) {
+            return "<tensorplay.cuda.Event device=" +
+                   (event.device_index() < 0 ? std::string("None")
+                                             : std::to_string(event.device_index())) + ">";
+        });
+
+    py::class_<tensorplay::cuda::CUDAStream>(cuda, "_CudaStream")
+        .def(py::init([](int device, int priority) {
+            return tensorplay::cuda::getStreamFromPool(priority, device);
+        }), "device"_a = -1, "priority"_a = 0)
+        .def_property_readonly("device", [](const tensorplay::cuda::CUDAStream& stream) {
+            return stream.device();
+        })
+        .def_property_readonly("device_index", &tensorplay::cuda::CUDAStream::device_index)
+        .def_property_readonly("cuda_stream", &tensorplay::cuda::CUDAStream::id)
+        .def_property_readonly("priority", &tensorplay::cuda::CUDAStream::priority)
+        .def("query", &tensorplay::cuda::CUDAStream::query)
+        .def("synchronize", &tensorplay::cuda::CUDAStream::synchronize,
+             py::call_guard<py::gil_scoped_release>())
+        .def("wait_event", [](const tensorplay::cuda::CUDAStream& stream,
+                              const tensorplay::cuda::CUDAEvent& event) {
+            event.block(stream);
+        }, "event"_a)
+        .def("wait_stream", [](const tensorplay::cuda::CUDAStream& stream,
+                               const tensorplay::cuda::CUDAStream& other) {
+            tensorplay::cuda::CUDAEvent event;
+            event.record(other);
+            event.block(stream);
+        }, "stream"_a)
+        .def("record_event", [](const tensorplay::cuda::CUDAStream& stream,
+                                std::optional<tensorplay::cuda::CUDAEvent> event) {
+            tensorplay::cuda::CUDAEvent result = event.value_or(tensorplay::cuda::CUDAEvent());
+            result.record(stream);
+            return result;
+        }, "event"_a = py::none())
+        .def(py::self == py::self)
+        .def(py::self != py::self)
+        .def("__repr__", [](const tensorplay::cuda::CUDAStream& stream) {
+            return "<tensorplay.cuda.Stream device=cuda:" +
+                   std::to_string(stream.device_index()) + " cuda_stream=" +
+                   std::to_string(stream.id()) + ">";
         });
 #endif
 
@@ -70,7 +135,13 @@ void init_device(nb::module_& m) {
 
     cuda.def("is_available", []() {
 #ifdef USE_CUDA
-        return true;
+        int count = 0;
+        cudaError_t error = cudaGetDeviceCount(&count);
+        if (error != cudaSuccess) {
+            (void)cudaGetLastError();
+            return false;
+        }
+        return count > 0;
 #else
         return false;
 #endif
@@ -158,20 +229,8 @@ void init_device(nb::module_& m) {
 
     cuda.def("synchronize", [](int device) {
 #ifdef USE_CUDA
-        // Ignoring device arg for now as cudaDeviceSynchronize acts on current device
-        // Ideally we should switch device, sync, then switch back
-        int current_device;
-        cudaGetDevice(&current_device);
-        if (device != -1 && device != current_device) {
-             cudaSetDevice(device);
-        }
-        cudaError_t err = cudaDeviceSynchronize();
-        if (device != -1 && device != current_device) {
-             cudaSetDevice(current_device);
-        }
-        if (err != cudaSuccess) {
-            throw std::runtime_error("CUDA error: " + std::string(cudaGetErrorString(err)));
-        }
+        tensorplay::cuda::CUDAGuard guard(device);
+        tensorplay::cuda::checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
 #else
         throw std::runtime_error("CUDA is not available");
 #endif
@@ -184,7 +243,15 @@ void init_device(nb::module_& m) {
 #else
         return 0;
 #endif
-    }, "device"_a = 0);
+    }, "device"_a = -1);
+
+    cuda.def("memory_reserved", [](int device) {
+#ifdef USE_CUDA
+        return tensorplay::cuda::memory_reserved(device);
+#else
+        return 0;
+#endif
+    }, "device"_a = -1);
 
     cuda.def("max_memory_allocated", [](int device) {
 #ifdef USE_CUDA
@@ -192,13 +259,27 @@ void init_device(nb::module_& m) {
 #else
         return 0;
 #endif
-    }, "device"_a = 0);
+    }, "device"_a = -1);
+
+    cuda.def("max_memory_reserved", [](int device) {
+#ifdef USE_CUDA
+        return tensorplay::cuda::max_memory_reserved(device);
+#else
+        return 0;
+#endif
+    }, "device"_a = -1);
 
     cuda.def("reset_max_memory_allocated", [](int device) {
 #ifdef USE_CUDA
         tensorplay::cuda::reset_max_memory_allocated(device);
 #endif
-    }, "device"_a = 0);
+    }, "device"_a = -1);
+
+    cuda.def("reset_peak_memory_stats", [](int device) {
+#ifdef USE_CUDA
+        tensorplay::cuda::reset_peak_memory_stats(device);
+#endif
+    }, "device"_a = -1);
     
     cuda.def("empty_cache", []() {
 #ifdef USE_CUDA
@@ -211,4 +292,39 @@ void init_device(nb::module_& m) {
         tensorplay::cuda::manual_seed(seed);
 #endif
     }, "seed"_a);
+
+    cuda.def("manual_seed_all", [](uint64_t seed) {
+#ifdef USE_CUDA
+        tensorplay::cuda::manual_seed_all(seed);
+#endif
+    }, "seed"_a);
+
+#ifdef USE_CUDA
+    cuda.def("current_stream", [](int device) {
+        return tensorplay::cuda::getCurrentCUDAStream(device);
+    }, "device"_a = -1);
+
+    cuda.def("default_stream", [](int device) {
+        return tensorplay::cuda::getDefaultCUDAStream(device);
+    }, "device"_a = -1);
+
+    cuda.def("set_stream", [](const tensorplay::cuda::CUDAStream& stream) {
+        tensorplay::cuda::setCurrentCUDAStream(stream);
+    }, "stream"_a);
+
+    cuda.def("get_stream_from_pool", [](int priority, int device) {
+        return tensorplay::cuda::getStreamFromPool(priority, device);
+    }, "priority"_a = 0, "device"_a = -1);
+
+    cuda.def("get_stream_priority_range", []() {
+        int least = 0;
+        int greatest = 0;
+        tensorplay::cuda::checkCuda(
+            cudaDeviceGetStreamPriorityRange(&least, &greatest),
+            "cudaDeviceGetStreamPriorityRange");
+        return std::make_pair(least, greatest);
+    });
+
+    cuda.def("_sleep", &tensorplay::cuda::sleep, "cycles"_a);
+#endif
 }

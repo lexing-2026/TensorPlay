@@ -161,7 +161,7 @@ Follow our structured tutorials to master deep learning principles from scratch:
 
 ### Advanced
 3. **Custom Datasets & Transforms** - Master the `Dataset` class and data preprocessing pipelines
-4. **Model Saving & Loading** - Use `tp.save()` / `tp.load()` and `state_dict` to manage training states
+4. **Model Saving & Loading** - Use `tp.save()` / `tp.load()` with the native MEGA `.mega` format and `state_dict`
 
 👉 View full tutorials: [tutorials](https://www.tensorplay.cn/en/guide/tutorials)
 

@@ -1,3 +1,4 @@
+# mypy: allow-untyped-defs
 import tensorplay
 from collections import OrderedDict
 import weakref
@@ -5,6 +6,30 @@ import warnings
 from typing import Any
 
 __all__ = ["RemovableHandle", "unserializable_hook", "warn_if_has_hooks", "BackwardHook"]
+
+
+def _zip_strict(*iterables):
+    """Python 3.9-compatible equivalent of ``zip(..., strict=True)``."""
+    iterators = tuple(iter(iterable) for iterable in iterables)
+    sentinel = object()
+    while True:
+        items = tuple(next(iterator, sentinel) for iterator in iterators)
+        if all(item is sentinel for item in items):
+            return
+        if any(item is sentinel for item in items):
+            if items[0] is sentinel:
+                longer = next(index for index, item in enumerate(items[1:], start=2)
+                               if item is not sentinel)
+                raise ValueError(
+                    f"zip() argument {longer} is longer than argument 1"
+                )
+            shorter = next(index for index, item in enumerate(items[1:], start=2)
+                           if item is sentinel)
+            raise ValueError(
+                f"zip() argument {shorter} is shorter than argument 1"
+            )
+        yield items
+
 
 class RemovableHandle:
     r"""
@@ -79,7 +104,7 @@ def unserializable_hook(f):
     return f
 
 
-def warn_if_has_hooks(tensor):
+def warn_if_has_hooks(tensor) -> None:
     if tensor._backward_hooks:
         for k in tensor._backward_hooks:
             hook = tensor._backward_hooks[k]
@@ -87,7 +112,7 @@ def warn_if_has_hooks(tensor):
                 warnings.warn(f"backward hook {repr(hook)} on tensor will not be "
                               "serialized.  If this is expected, you can "
                               "decorate the function with @tensorplay.utils.hooks.unserializable_hook "
-                              "to suppress this warning")
+                              "to suppress this warning", stacklevel=2)
 
 class BackwardHook:
     """
@@ -100,7 +125,7 @@ class BackwardHook:
       - Calling the user hook once both output and input gradients are available
     """
 
-    def __init__(self, module, user_hooks, user_pre_hooks):
+    def __init__(self, module, user_hooks, user_pre_hooks) -> None:
         self.user_hooks = user_hooks
         self.user_pre_hooks = user_pre_hooks
         self.module = module
@@ -113,7 +138,7 @@ class BackwardHook:
 
     def _pack_with_none(self, indices, values, size):
         res = [None] * size
-        for idx, val in zip(indices, values):
+        for idx, val in _zip_strict(indices, values):
             res[idx] = val
 
         return tuple(res)
@@ -123,7 +148,7 @@ class BackwardHook:
 
         return tuple(res)
 
-    def _set_user_hook(self, grad_fn):
+    def _set_user_hook(self, grad_fn) -> None:
         def hook(grad_input, _):
             if self.grad_outputs is None:
                 # This happens because the gradient in your nn.Module flows to
@@ -178,7 +203,7 @@ class BackwardHook:
         fn(grad_fns[0])
 
         arg_list = list(args)
-        for idx, val in zip(tensors_idx, new_tensors):
+        for idx, val in _zip_strict(tensors_idx, new_tensors):
             arg_list[idx] = val
 
         if type(args) is tuple:
@@ -188,7 +213,7 @@ class BackwardHook:
         return out, tensors_idx
 
     def setup_input_hook(self, args):
-        def fn(grad_fn):
+        def fn(grad_fn) -> None:
             self._set_user_hook(grad_fn)
 
         res, input_idx = self._apply_on_tensors(fn, args)
@@ -197,7 +222,7 @@ class BackwardHook:
         return res
 
     def setup_output_hook(self, args):
-        def fn(grad_fn):
+        def fn(grad_fn) -> None:
             def hook(_, grad_output):
                 self.grad_outputs = self._pack_with_none(self.output_tensors_index,
                                                          grad_output,
@@ -222,21 +247,26 @@ class BackwardHook:
                 # Special case if no input required gradients, this hook should call the user
                 # hook directly
                 if self.input_tensors_index is None:
-                    warnings.warn("Full backward hook is firing when gradients are computed "
-                                  "with respect to module outputs since no inputs require gradients. See "
-                                  "https://docs.pytensorplay.org/docs/main/generated/tensorplay.nn.Module.html#tensorplay.nn.Module.register_full_backward_hook "  # noqa: B950
-                                  "for more details.",
-                                  stacklevel=5)
-                    grad_inputs = self._pack_with_none([], [], self.n_inputs)
-                    for user_hook in self.user_hooks:
-                        res = user_hook(self.module, grad_inputs, self.grad_outputs)
-                        if res is not None and not (isinstance(res, tuple) and all(el is None for el in res)):
-                            raise RuntimeError("Backward hook for Modules where no input requires "
-                                               "gradient should always return None or None for all gradients.")
+                    # Only full backward hooks (not pre-hooks) receive grad_input
+                    # and are the subject of the warning; pre-hooks already ran
+                    # above from grad_output. Skip both when none are registered.
+                    if self.user_hooks:
+                        warnings.warn("Full backward hook is firing when gradients are computed "
+                                      "with respect to module outputs since no inputs require gradients. See "
+                                      "https://docs.pytensorplay.org/docs/main/generated/tensorplay.nn.Module.html#tensorplay.nn.Module.register_full_backward_hook "
+                                      "for more details.",
+                                      stacklevel=5)
+                        grad_inputs = self._pack_with_none([], [], self.n_inputs)
+                        for user_hook in self.user_hooks:
+                            res = user_hook(self.module, grad_inputs, self.grad_outputs)
+                            if res is not None and not (isinstance(res, tuple) and all(el is None for el in res)):
+                                raise RuntimeError("Backward hook for Modules where no input requires "
+                                                   "gradient should always return None or None for all gradients.")
                     self.grad_outputs = None
 
                 if local_grad_outputs is not None:
-                    assert self.output_tensors_index is not None  # mypy
+                    if self.output_tensors_index is None:
+                        raise AssertionError("output_tensors_index should not be None when grad_outputs is not None")
                     return tuple(local_grad_outputs[i] for i in self.output_tensors_index)
 
             grad_fn.register_hook(hook)

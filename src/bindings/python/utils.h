@@ -1,26 +1,28 @@
 #pragma once
 #include <Python.h>
-#include "TPXTensor.h"
+#include "Autograd.h"
 #include "Exception.h"
-#include <nanobind/nanobind.h>
-#include <nanobind/stl/vector.h>
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+#include <complex>
+#include <type_traits>
 
 namespace tensorplay {
 namespace python {
 
-using Tensor = tensorplay::tpx::Tensor;
+using Tensor = tensorplay::Tensor;
 
 // Helper function to parse shape from args
-inline std::vector<int64_t> parse_shape_args(nanobind::args args) {
+inline std::vector<int64_t> parse_shape_args(py::args args) {
     std::vector<int64_t> shape;
-    if (args.size() == 1 && (nanobind::isinstance<nanobind::list>(args[0]) || nanobind::isinstance<nanobind::tuple>(args[0]) || nanobind::isinstance<Size>(args[0]))) {
-        nanobind::object obj = args[0];
+    if (args.size() == 1 && (py::isinstance<py::list>(args[0]) || py::isinstance<py::tuple>(args[0]) || py::isinstance<Size>(args[0]))) {
+        py::object obj = args[0];
         for (auto item : obj) {
-            shape.push_back(nanobind::cast<int64_t>(item));
+            shape.push_back(py::cast<int64_t>(item));
         }
     } else {
         for (auto item : args) {
-            shape.push_back(nanobind::cast<int64_t>(item));
+            shape.push_back(py::cast<int64_t>(item));
         }
     }
     return shape;
@@ -90,8 +92,10 @@ inline DType infer_dtype(PyObject* list, int depth = 0) {
     if (len == 0) return DType::Float32;  // Empty list default to float32
 
     bool has_float = false;
+    bool has_complex = false;
     bool has_int = false;
     bool has_bool = false;
+    bool has_complex_double = false;
     
     // We only check the first element to guess type for optimization? 
     // Actually, we check all elements to be safe.
@@ -103,11 +107,18 @@ inline DType infer_dtype(PyObject* list, int depth = 0) {
         if (IsListOrTuple(item)) {
             // Recursively infer dtype of sublists
             DType sub_dtype = infer_dtype(item, depth + 1);
-            if (sub_dtype == DType::Float32 || sub_dtype == DType::Float64) has_float = true;
+            if (sub_dtype == DType::ComplexDouble) {
+                has_complex = true;
+                has_complex_double = true;
+            } else if (sub_dtype == DType::ComplexFloat || sub_dtype == DType::ComplexHalf || sub_dtype == DType::BComplex32) {
+                has_complex = true;
+            } else if (sub_dtype == DType::Float32 || sub_dtype == DType::Float64) has_float = true;
             else if (sub_dtype == DType::Int64 || sub_dtype == DType::Int32) has_int = true;
             else if (sub_dtype == DType::Bool) has_bool = true;
         } else {
-            if (PyFloat_Check(item)) {
+            if (PyComplex_Check(item)) {
+                has_complex = true;
+            } else if (PyFloat_Check(item)) {
                 has_float = true;
             } else if (PyBool_Check(item)) {
                 has_bool = true;
@@ -119,6 +130,7 @@ inline DType infer_dtype(PyObject* list, int depth = 0) {
         }
     }
     
+    if (has_complex) return has_complex_double ? DType::ComplexDouble : DType::ComplexFloat;
     if (has_float) return DType::Float32;
     if (has_int) return DType::Int64;
     if (has_bool) return DType::Bool;
@@ -128,23 +140,42 @@ inline DType infer_dtype(PyObject* list, int depth = 0) {
 
 // Optimized flat copy for the last dimension
 template <typename T>
+inline T python_scalar_cast(PyObject* item) {
+    if (PyComplex_Check(item)) {
+        Py_complex value = PyComplex_AsCComplex(item);
+        if (PyErr_Occurred()) {
+            throw py::error_already_set();
+        }
+        if constexpr (is_complex_type_v<T>) {
+            using value_type = typename is_complex_type<T>::value_type;
+            return T(static_cast<value_type>(value.real),
+                     static_cast<value_type>(value.imag));
+        } else {
+            return static_cast<T>(value.real);
+        }
+    }
+    if (PyFloat_Check(item)) return static_cast<T>(PyFloat_AsDouble(item));
+    if (PyBool_Check(item)) return static_cast<T>(item == Py_True);
+    if (PyLong_Check(item)) {
+        if constexpr (std::is_unsigned_v<T>) {
+            auto value = PyLong_AsUnsignedLongLong(item);
+            if (PyErr_Occurred()) throw py::error_already_set();
+            return static_cast<T>(value);
+        } else {
+            auto value = PyLong_AsLongLong(item);
+            if (PyErr_Occurred()) throw py::error_already_set();
+            return static_cast<T>(value);
+        }
+    }
+    TP_THROW(TypeError, "Unsupported element type in flat copy");
+}
+
+template <typename T>
 void copy_data_flat(PyObject* list, T* data, size_t& index) {
     int64_t len = GetSize(list);
     for (int64_t i = 0; i < len; ++i) {
          PyObject* item = GetItem(list, i);
-         T val;
-         // We trust parse_shape so we don't check for list again
-         if (PyFloat_Check(item)) {
-             val = static_cast<T>(PyFloat_AsDouble(item));
-         } else if (PyBool_Check(item)) {
-             val = static_cast<T>(item == Py_True);
-         } else if (PyLong_Check(item)) {
-             val = static_cast<T>(PyLong_AsLongLong(item));
-         } else {
-             // Fallback for safety
-             TP_THROW(TypeError, "Unsupported element type in flat copy");
-         }
-         data[index++] = val;
+         data[index++] = python_scalar_cast<T>(item);
     }
 }
 
@@ -185,6 +216,12 @@ void copy_data(PyObject* list, T* data, size_t& index, const std::vector<int64_t
     TP_DISPATCH_CASE(DType::UInt64, uint64_t, __VA_ARGS__) \
     TP_DISPATCH_CASE(DType::Float32, float, __VA_ARGS__) \
     TP_DISPATCH_CASE(DType::Float64, double, __VA_ARGS__) \
+    TP_DISPATCH_CASE(DType::Float16, tensorplay::Half, __VA_ARGS__) \
+    TP_DISPATCH_CASE(DType::BFloat16, tensorplay::BFloat16, __VA_ARGS__) \
+    TP_DISPATCH_CASE(DType::ComplexHalf, std::complex<tensorplay::Half>, __VA_ARGS__) \
+    TP_DISPATCH_CASE(DType::ComplexFloat, std::complex<float>, __VA_ARGS__) \
+    TP_DISPATCH_CASE(DType::ComplexDouble, std::complex<double>, __VA_ARGS__) \
+    TP_DISPATCH_CASE(DType::BComplex32, std::complex<tensorplay::BFloat16>, __VA_ARGS__) \
     TP_DISPATCH_CASE(DType::Bool, bool, __VA_ARGS__) \
     default: \
       TP_THROW(NotImplementedError, std::string(NAME) + " not implemented for this dtype"); \

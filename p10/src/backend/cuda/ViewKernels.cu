@@ -4,9 +4,99 @@
 #include <vector>
 #include <algorithm>
 #include <numeric>
+#include <limits>
 
 namespace tensorplay {
 namespace cuda {
+
+namespace {
+
+Tensor view_as_real_cuda(const Tensor& self) {
+    if (!self.defined()) {
+        TP_THROW(RuntimeError, "view_as_real: input must be defined");
+    }
+    if (!isComplexType(self.dtype())) {
+        TP_THROW(RuntimeError,
+                "view_as_real is only supported for complex tensors, but got " +
+                std::string(toString(self.dtype())));
+    }
+
+    std::vector<int64_t> sizes = static_cast<std::vector<int64_t>>(self.shape());
+    std::vector<int64_t> strides = self.strides();
+    for (auto& stride : strides) {
+        if (stride > std::numeric_limits<int64_t>::max() / 2) {
+            TP_THROW(RuntimeError, "view_as_real: stride overflow");
+        }
+        stride *= 2;
+    }
+    sizes.push_back(2);
+    strides.push_back(1);
+
+    const size_t offset = self.unsafeGetTensorImpl()->storage_offset();
+    if (offset > std::numeric_limits<size_t>::max() / 2) {
+        TP_THROW(RuntimeError, "view_as_real: storage offset overflow");
+    }
+    Tensor result(self.unsafeGetTensorImpl()->storage(), sizes, strides,
+                  toRealValueType(self.dtype()), offset * 2);
+    result.unsafeGetTensorImpl()->share_version_counter(
+        *self.unsafeGetTensorImpl());
+    return result;
+}
+
+Tensor view_as_complex_cuda(const Tensor& self) {
+    if (!self.defined()) {
+        TP_THROW(RuntimeError, "view_as_complex: input must be defined");
+    }
+    if (self.dtype() != DType::Float16 && self.dtype() != DType::Float32 &&
+        self.dtype() != DType::Float64) {
+        TP_THROW(RuntimeError,
+                "view_as_complex is only supported for half, float and double "
+                "tensors, but got " + std::string(toString(self.dtype())));
+    }
+    if (self.dim() == 0 || self.size(self.dim() - 1) != 2) {
+        TP_THROW(RuntimeError,
+                "view_as_complex: input tensor must have a last dimension of size 2");
+    }
+    if (self.stride(self.dim() - 1) != 1) {
+        TP_THROW(RuntimeError,
+                "view_as_complex: last dimension must have stride 1");
+    }
+    for (int64_t dim = 0; dim + 1 < self.dim(); ++dim) {
+        if ((self.stride(dim) & 1) != 0) {
+            TP_THROW(RuntimeError,
+                    "view_as_complex: strides of all dimensions except the last "
+                    "must be divisible by 2");
+        }
+    }
+    const size_t offset = self.unsafeGetTensorImpl()->storage_offset();
+    if ((offset & 1) != 0) {
+        TP_THROW(RuntimeError,
+                "view_as_complex: storage offset must be divisible by 2");
+    }
+
+    std::vector<int64_t> sizes = static_cast<std::vector<int64_t>>(self.shape());
+    std::vector<int64_t> strides = self.strides();
+    sizes.pop_back();
+    strides.pop_back();
+    for (auto& stride : strides) {
+        stride /= 2;
+    }
+
+    Tensor result(self.unsafeGetTensorImpl()->storage(), sizes, strides,
+                  toComplexType(self.dtype()), offset / 2);
+    result.unsafeGetTensorImpl()->share_version_counter(
+        *self.unsafeGetTensorImpl());
+    return result;
+}
+
+bool is_complex_cuda(const Tensor& self) {
+    if (!self.defined()) {
+        TP_THROW(RuntimeError, "is_complex: input must be defined");
+    }
+    return isComplexType(self.dtype());
+}
+
+} // namespace
 
 Tensor reshape_kernel_cuda(const Tensor& self, const std::vector<int64_t>& shape) {
     // Check if new shape is compatible with number of elements
@@ -138,6 +228,71 @@ Tensor unsqueeze_kernel_cuda(const Tensor& self, int64_t dim) {
     return self.as_strided(new_sizes, new_strides);
 }
 
+// Tensor-list view operators need an explicit CUDA registration.  The actual
+// copies are delegated to copy_ so they inherit the stream-aware CUDA allocator
+// and non-blocking copy semantics; this keeps the implementation correct for
+// non-contiguous inputs while avoiding a second bespoke concatenation kernel.
+Tensor cat_kernel_cuda(const std::vector<Tensor>& tensors, int64_t dim) {
+    if (tensors.empty()) {
+        TP_THROW(RuntimeError, "cat(): expected a non-empty list of tensors");
+    }
+
+    const Tensor& t0 = tensors[0];
+    int64_t ndim = t0.dim();
+    if (dim < 0) dim += ndim;
+    if (dim < 0 || dim >= ndim) TP_THROW(IndexError, "cat(): dimension out of range");
+
+    int64_t cat_dim_size = 0;
+    for (const auto& t : tensors) {
+        if (t.device() != t0.device()) {
+            TP_THROW(DeviceMismatchError, "cat(): all tensors must be on the same device");
+        }
+        if (t.dim() != ndim) {
+            TP_THROW(RuntimeError, "cat(): all tensors must have same number of dimensions");
+        }
+        if (t.dtype() != t0.dtype()) {
+            TP_THROW(TypeError, "cat(): all tensors must have same dtype (type promotion not impl)");
+        }
+        for (int64_t i = 0; i < ndim; ++i) {
+            if (i != dim && t.size(i) != t0.size(i)) {
+                TP_THROW(RuntimeError, "cat(): Sizes of tensors must match except in dimension " + std::to_string(dim));
+            }
+        }
+        cat_dim_size += t.size(dim);
+    }
+
+    std::vector<int64_t> out_shape = static_cast<std::vector<int64_t>>(t0.shape());
+    out_shape[dim] = cat_dim_size;
+    Tensor out = Tensor::empty(out_shape, t0.dtype(), t0.device());
+
+    int64_t offset = 0;
+    for (const auto& t : tensors) {
+        const int64_t size = t.size(dim);
+        if (size > 0) {
+            Tensor out_slice = out.slice(dim, offset, offset + size);
+            out_slice.copy_(t, /*non_blocking=*/true);
+            offset += size;
+        }
+    }
+    return out;
+}
+
+Tensor stack_kernel_cuda(const std::vector<Tensor>& tensors, int64_t dim) {
+    if (tensors.empty()) {
+        TP_THROW(RuntimeError, "stack(): expected a non-empty list of tensors");
+    }
+    int64_t ndim = tensors[0].dim();
+    if (dim < 0) dim += ndim + 1;
+    if (dim < 0 || dim > ndim) TP_THROW(IndexError, "stack(): dimension out of range");
+
+    std::vector<Tensor> unsqueezed;
+    unsqueezed.reserve(tensors.size());
+    for (const auto& t : tensors) {
+        unsqueezed.push_back(t.unsqueeze(dim));
+    }
+    return cat_kernel_cuda(unsqueezed, dim);
+}
+
 Tensor permute_backward_kernel_cuda(const Tensor& grad, const Tensor& self, const std::vector<int64_t>& dims) {
     int64_t ndim = grad.dim();
     if (dims.size() != (size_t)ndim) {
@@ -154,7 +309,104 @@ Tensor squeeze_backward_kernel_cuda(const Tensor& grad, const Tensor& self) {
     return grad.reshape(static_cast<std::vector<int64_t>>(self.shape()));
 }
 
+// ATen semantics: remove dim1/dim2 and append the diagonal axis at the end.
+// Pure metadata op: identical to the CPU kernel, safe on any device.
+Tensor diagonal_kernel_cuda(const Tensor& self, int64_t offset, int64_t dim1, int64_t dim2) {
+    const int64_t ndim = self.dim();
+    if (ndim < 2) TP_THROW(RuntimeError, "diagonal(): input must be at least 2-dimensional");
+    if (dim1 < 0) dim1 += ndim;
+    if (dim2 < 0) dim2 += ndim;
+    if (dim1 < 0 || dim1 >= ndim || dim2 < 0 || dim2 >= ndim) {
+        TP_THROW(IndexError, "Dimension out of range");
+    }
+    if (dim1 == dim2) TP_THROW(RuntimeError, "diagonal(): dim1 and dim2 cannot be equal");
+
+    const int64_t size1 = self.size(dim1);
+    const int64_t size2 = self.size(dim2);
+    const int64_t stride1 = self.stride(dim1);
+    const int64_t stride2 = self.stride(dim2);
+
+    std::vector<int64_t> sizes;
+    std::vector<int64_t> strides;
+    sizes.reserve(ndim - 1);
+    strides.reserve(ndim - 1);
+    for (int64_t i = 0; i < ndim; ++i) {
+        if (i != dim1 && i != dim2) {
+            sizes.push_back(self.size(i));
+            strides.push_back(self.stride(i));
+        }
+    }
+
+    int64_t diag_size;
+    int64_t new_offset = static_cast<int64_t>(self.unsafeGetTensorImpl()->storage_offset());
+    if (offset >= 0) {
+        diag_size = std::max<int64_t>(std::min(size1, size2 - offset), 0);
+        new_offset += offset * stride2;
+    } else {
+        diag_size = std::max<int64_t>(std::min(size1 + offset, size2), 0);
+        new_offset -= offset * stride1;
+    }
+    sizes.push_back(diag_size);
+    strides.push_back(stride1 + stride2);
+    return self.as_strided(sizes, strides, new_offset);
+}
+
+Tensor diagonal_backward_kernel_cuda(const Tensor& grad, const std::vector<int64_t>& input_sizes,
+                                     int64_t offset, int64_t dim1, int64_t dim2) {
+    Tensor result = Tensor::zeros(input_sizes, grad.dtype(), grad.device());
+    Tensor diag_view = diagonal_kernel_cuda(result, offset, dim1, dim2);
+    if (diag_view.numel() != grad.numel()) {
+        TP_THROW(RuntimeError, "diagonal_backward: gradient shape mismatch");
+    }
+    diag_view.copy_(grad.reshape(static_cast<std::vector<int64_t>>(diag_view.shape())));
+    return result;
+}
+
+Tensor movedim_kernel_cuda(const Tensor& self, const std::vector<int64_t>& source,
+                           const std::vector<int64_t>& destination) {
+    const int64_t ndim = self.dim();
+    if (source.size() != destination.size()) {
+        TP_THROW(RuntimeError, "movedim: Source and destination dims must have same number of elements");
+    }
+    std::vector<int64_t> src(source), dst(destination);
+    std::vector<bool> src_seen(ndim, false), dst_seen(ndim, false);
+    for (auto& d : src) {
+        const int64_t orig = d;
+        if (d < 0) d += ndim;
+        if (d < 0 || d >= ndim) {
+            TP_THROW(IndexError, "movedim: Tried to move to index ", orig,
+                     ", but the tensor has ", ndim, " dimensions");
+        }
+        if (src_seen[d]) TP_THROW(RuntimeError, "movedim: repeated source dimension");
+        src_seen[d] = true;
+    }
+    for (auto& d : dst) {
+        const int64_t orig = d;
+        if (d < 0) d += ndim;
+        if (d < 0 || d >= ndim) {
+            TP_THROW(IndexError, "movedim: Tried to move to index ", orig,
+                     ", but the tensor has ", ndim, " dimensions");
+        }
+        if (dst_seen[d]) TP_THROW(RuntimeError, "movedim: repeated destination dimension");
+        dst_seen[d] = true;
+    }
+
+    std::vector<int64_t> permutation(ndim, -1);
+    for (size_t k = 0; k < src.size(); ++k) permutation[dst[k]] = src[k];
+    int64_t cursor = 0;
+    for (int64_t i = 0; i < ndim; ++i) {
+        if (!dst_seen[i]) {
+            while (src_seen[cursor]) ++cursor;
+            permutation[i] = cursor++;
+        }
+    }
+    return permute_kernel_cuda(self, permutation);
+}
+
 TENSORPLAY_LIBRARY_IMPL(CUDA, ViewKernels) {
+    m.impl("view_as_real", view_as_real_cuda);
+    m.impl("view_as_complex", view_as_complex_cuda);
+    m.impl("is_complex", is_complex_cuda);
     m.impl("reshape", reshape_kernel_cuda);
     m.impl("transpose", transpose_kernel_cuda);
     m.impl("t", t_kernel_cuda);
@@ -164,6 +416,11 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, ViewKernels) {
     m.impl("squeeze_backward", squeeze_backward_kernel_cuda);
     m.impl("squeeze.dim", squeeze_dim_kernel_cuda);
     m.impl("unsqueeze", unsqueeze_kernel_cuda);
+    m.impl("diagonal", diagonal_kernel_cuda);
+    m.impl("diagonal_backward", diagonal_backward_kernel_cuda);
+    m.impl("movedim", movedim_kernel_cuda);
+    m.impl("cat", cat_kernel_cuda);
+    m.impl("stack", stack_kernel_cuda);
 }
 
 } // namespace cuda

@@ -1,0 +1,104 @@
+#pragma once
+#include <memory>
+#include <mutex>
+#include <atomic>
+#include <condition_variable>
+#include <exception>
+#include <vector>
+#include <unordered_map>
+#include <unordered_set>
+#include <cstdint>
+#include "Tensor.h"
+#include "Edge.h"
+#include "Node.h"
+#include "InputBuffer.h"
+
+namespace tensorplay {
+namespace tpx {
+
+// Holds metadata for a single execution of backward()/grad().
+// Mirrors torch/csrc/autograd/graph_task.h. With the multithreaded engine,
+// several worker threads may evaluate functions of one GraphTask
+// concurrently, so the shared bookkeeping is guarded by mutex_.
+struct GraphTask {
+    struct ExecInfo {
+        struct Capture {
+            Capture(int input_idx, int output_idx)
+                : input_idx_(input_idx), output_idx_(output_idx) {}
+            int input_idx_;  // within Node inputs
+            int output_idx_; // within the output vector of a GraphTask
+        };
+        bool should_execute() const { return needed_ || captures_; }
+        bool needed_ = false;
+        std::unique_ptr<std::vector<Capture>> captures_;
+    };
+
+    bool keep_graph_;
+    bool grad_mode_;
+
+    // --- Shared state (guarded by mutex_ once execution starts) ---
+    std::unordered_map<Node*, InputBuffer> not_ready_;
+    std::unordered_map<Node*, int> dependencies_;
+    std::unordered_set<Node*> nodes_in_graph_;
+    // Empty -> execute everything (backward()). Non-empty -> only execute
+    // nodes with should_execute() == true (grad()).
+    std::unordered_map<Node*, ExecInfo> exec_info_;
+    // Captured gradients returned to the caller of grad().
+    std::vector<Tensor> captured_vars_;
+
+    // --- Completion tracking ---
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    // Number of NodeTasks enqueued but not yet fully evaluated.
+    uint64_t outstanding_tasks_ = 0;
+    bool completed_ = false;
+    // First error raised by any node; rethrown by the initiating thread.
+    std::exception_ptr exception_;
+
+    explicit GraphTask(bool keep_graph, bool grad_mode)
+        : keep_graph_(keep_graph), grad_mode_(grad_mode) {}
+
+    void init_to_execute(Node& graph_root, const edge_list& outputs, bool accumulate_grad, uint64_t min_topo_nr);
+
+    // Enqueue accounting: called with mutex_ NOT held.
+    void task_enqueued() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++outstanding_tasks_;
+    }
+
+    // Mark one dequeued task as fully evaluated; wakes the initiator when the
+    // last task finishes.
+    void task_completed() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        --outstanding_tasks_;
+        if (outstanding_tasks_ == 0) {
+            completed_ = true;
+            cv_.notify_all();
+        }
+    }
+
+    // Record the first node error; the initiator rethrows it after the graph
+    // has fully drained (mirrors torch::autograd::GraphTask::set_exception).
+    void record_exception(std::exception_ptr exc) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!exception_) exception_ = std::move(exc);
+    }
+
+    bool is_completed() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return completed_;
+    }
+
+    // Block until every enqueued task has been evaluated.
+    void wait_for_completion() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [this] { return completed_; });
+    }
+
+    // Wake every worker blocked on this task's queues (used on completion so
+    // idle workers can exit their pop loop).
+    void wake_all() { cv_.notify_all(); }
+};
+
+} // namespace tpx
+} // namespace tensorplay

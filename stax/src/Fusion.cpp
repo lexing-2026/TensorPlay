@@ -3,6 +3,7 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <cstdlib>
 
 namespace tensorplay {
 namespace stax {
@@ -81,16 +82,42 @@ public:
                                 node->op_type = "fused_mul_add";
                                 
                                 OpNode* mul_node = input->producer;
+
+                                // Preserve scalar operands while removing the
+                                // intermediate mul value.  This mirrors an
+                                // Inductor pointwise fusion group: constants
+                                // remain attributes of the fused node.
+                                if (auto it = mul_node->attrs.find("scalar_value");
+                                    it != mul_node->attrs.end()) {
+                                    node->attrs["mul_scalar_value"] = it->second;
+                                    if (auto pos = mul_node->attrs.find("scalar_position");
+                                        pos != mul_node->attrs.end()) {
+                                        node->attrs["mul_scalar_position"] = pos->second;
+                                    }
+                                }
+                                if (auto it = node->attrs.find("scalar_value");
+                                    it != node->attrs.end()) {
+                                    node->attrs["add_scalar_value"] = it->second;
+                                    if (auto pos = node->attrs.find("scalar_position");
+                                        pos != node->attrs.end()) {
+                                        node->attrs["add_scalar_position"] = pos->second;
+                                    }
+                                }
                                 
-                                // Rewire inputs
+                                // Rewire inputs with the multiplied operand
+                                // first.  Addition is commutative, and the
+                                // fused executor's contract is
+                                // ``mul(input0, scalar) + input1``.  Keeping
+                                // the original add order would compile
+                                // ``input0 + mul(input1, scalar)`` as
+                                // ``mul(input0, scalar) + input1``.
                                 std::vector<ValueNode*> new_inputs;
+                                for (auto* mul_input : mul_node->inputs) {
+                                    new_inputs.push_back(mul_input);
+                                    mul_input->uses.push_back(node.get());
+                                }
                                 for (auto* original_input : node->inputs) {
-                                    if (original_input == input) {
-                                        for (auto* mul_input : mul_node->inputs) {
-                                            new_inputs.push_back(mul_input);
-                                            mul_input->uses.push_back(node.get());
-                                        }
-                                    } else {
+                                    if (original_input != input) {
                                         new_inputs.push_back(original_input);
                                     }
                                 }
@@ -116,16 +143,21 @@ void Optimizer::addPass(const std::string& pass_name) {
 }
 
 void Optimizer::run(Graph& graph) {
+    const bool verbose = std::getenv("TENSORPLAY_STAX_VERBOSE") != nullptr;
     for (const auto& pass_name : passes_) {
         auto pass = PassRegistry::instance().createPass(pass_name);
         if (pass) {
-            std::cout << "[Stax] Running Pass: " << pass->name() << std::endl;
+            if (verbose) {
+                std::cout << "[Stax] Running Pass: " << pass->name() << std::endl;
+            }
             bool changed = pass->run(graph);
-            if (changed) {
+            if (verbose && changed) {
                 std::cout << "       -> Graph modified." << std::endl;
             }
         } else {
-            std::cerr << "[Stax] Warning: Pass '" << pass_name << "' not found." << std::endl;
+            if (verbose) {
+                std::cerr << "[Stax] Warning: Pass '" << pass_name << "' not found." << std::endl;
+            }
         }
     }
 }

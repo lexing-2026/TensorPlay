@@ -30,7 +30,12 @@ struct STAX_API ValueNode {
     ValueNode(size_t id_, OpNode* n, size_t off) : id(id_), producer(n), producer_output_index(off) {}
 };
 
-using Attribute = std::variant<int64_t, double, std::string, std::vector<int64_t>>;
+using Attribute = std::variant<
+    int64_t,
+    double,
+    std::string,
+    std::vector<int64_t>,
+    std::vector<double>>;
 
 struct STAX_API OpNode {
     std::string op_type; // e.g., "add", "matmul"
@@ -61,6 +66,7 @@ struct STAX_API Graph {
     ValueNode* addInput();
     OpNode* createNode(std::string op_type, std::string name = "");
     void registerOutput(ValueNode* v);
+    std::vector<Tensor> execute(const std::vector<Tensor>& inputs) const;
     
     void print() const;
 

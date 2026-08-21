@@ -4,13 +4,13 @@
 #include <cstdlib>
 
 // Extern declarations (if not in header)
-void init_scalar(nb::module_& m);
+void init_scalar(py::module_& m);
 
-NB_MODULE(_C, m) {
+PYBIND11_MODULE(_C, m) {
     m.doc() = "The C extension module of tensorplay";
 
     // Exception translation
-    nb::register_exception_translator([](const std::exception_ptr &p, void * /* unused */) {
+    py::register_exception_translator([](std::exception_ptr p) {
         auto set_error = [](PyObject* type, const tensorplay::Exception& e) {
             std::string msg = e.msg();
             const char* env_val = std::getenv("TENSORPLAY_SHOW_CPP_STACKTRACES");
@@ -32,14 +32,15 @@ NB_MODULE(_C, m) {
             set_error(PyExc_NotImplementedError, e);
         } catch (const tensorplay::Exception &e) {
             set_error(PyExc_RuntimeError, e);
-        } catch (const std::exception &e) {
-            PyErr_SetString(PyExc_RuntimeError, e.what());
         }
+        // Generic std::exception (incl. pybind11 internal exceptions like
+        // stop_iteration) is left to pybind11's builtin translator, which
+        // converts them appropriately (e.g. StopIteration).
     });
 
     // Warning handler
     tensorplay::setWarningHandler([](const tensorplay::SourceLocation& source, const std::string& msg) {
-        nb::gil_scoped_acquire gil;
+        py::gil_scoped_acquire gil;
         PyErr_WarnEx(PyExc_UserWarning, msg.c_str(), 1);
     });
 
@@ -52,6 +53,8 @@ NB_MODULE(_C, m) {
     init_autograd(m);
     init_ops(m);
     init_stax(m);
+    init_parallel(m);
+    init_distributed(m);
 
     // CUDA availability
     m.def("is_cuda_available", []() {
@@ -70,10 +73,10 @@ NB_MODULE(_C, m) {
 
     m.def("set_printoptions", &tensorplay::set_printoptions, 
           "Set print options", 
-          nb::arg("edge_items") = -1, 
-          nb::arg("threshold") = -1, 
-          nb::arg("precision") = -1, 
-          nb::arg("linewidth") = -1);
+          py::arg("edge_items") = -1, 
+          py::arg("threshold") = -1, 
+          py::arg("precision") = -1, 
+          py::arg("linewidth") = -1);
 
     // Backends
     m.def("has_mkldnn", &tensorplay::OneDNNContext::is_available);
@@ -96,21 +99,21 @@ NB_MODULE(_C, m) {
 #endif
     });
 
-    m.def("_add_docstr", [](nb::object obj, const std::string& doc) {
+    m.def("_add_docstr", [](py::object obj, const std::string& doc) -> py::object {
          if (obj.is_none()) {
-              return nb::none();
+              return py::none();
          }
          try {
-             if (nb::hasattr(obj, "__doc__")) {
-                  nb::setattr(obj, "__doc__", nb::str(doc.c_str()));
+             if (py::hasattr(obj, "__doc__")) {
+                  py::setattr(obj, "__doc__", py::str(doc.c_str()));
              }
          } catch (...) {
              // Ignore errors if docstring cannot be set (e.g. read-only attribute)
          }
          return obj;
-     }, nb::arg("obj").none(), nb::arg("doc"), "Adds or replaces the docstring of a Python object.");
+     }, py::arg("obj").none(), py::arg("doc"), "Adds or replaces the docstring of a Python object.");
 
-    m.def("_set_module_name", [](nb::object obj, const std::string& name) {
+    m.def("_set_module_name", [](py::object obj, const std::string& name) {
         PyObject* o = obj.ptr();
         PyObject* name_obj = PyUnicode_FromString(name.c_str());
         if (!name_obj) {

@@ -134,12 +134,82 @@ if sys.platform == 'win32':
     del _load_dll_libraries
 
 # -------------------------------------------------------------------------
+# Linux CUDA dependency preload (PyTorch-compatible fallback)
+# -------------------------------------------------------------------------
+# PyTorch first lets the extension loader resolve its normal RUNPATH and only
+# preloads component CUDA wheels when the extension reports a missing SONAME.
+# Keep the same behavior here: a normal CPU-only import does not eagerly load
+# CUDA, while a CUDA build remains importable from NVIDIA Python wheels.
+elif sys.platform.startswith('linux'):
+    def _get_cuda_dep_paths(path, lib_folder, lib_name):
+        paths = []
+        paths.extend(glob.glob(os.path.join(path, 'nvidia', lib_folder, 'lib', lib_name)))
+        paths.extend(glob.glob(os.path.join(path, 'nvidia', 'cu*', 'lib', lib_name)))
+        paths.extend(glob.glob(os.path.join(path, lib_folder, 'lib', lib_name)))
+        if not paths and '.so.' in lib_name:
+            stem = lib_name.split('.so.', 1)[0]
+            paths.extend(glob.glob(os.path.join(path, 'nvidia', lib_folder, 'lib', stem + '.so')))
+            paths.extend(glob.glob(os.path.join(path, 'nvidia', 'cu*', 'lib', stem + '.so')))
+            paths.extend(glob.glob(os.path.join(path, lib_folder, 'lib', stem + '.so')))
+        return paths
+
+    def _preload_cuda_lib(lib_folder, lib_name, required=True):
+        for path in sys.path:
+            candidates = _get_cuda_dep_paths(path, lib_folder, lib_name)
+            if candidates:
+                ctypes.CDLL(candidates[0])
+                return
+        package_lib_path = os.path.join(os.path.dirname(__file__), 'lib')
+        candidates = glob.glob(os.path.join(package_lib_path, lib_name))
+        if not candidates and '.so.' in lib_name:
+            stem = lib_name.split('.so.', 1)[0]
+            candidates = glob.glob(os.path.join(package_lib_path, stem + '.so'))
+        if candidates:
+            ctypes.CDLL(candidates[0])
+            return
+        if required:
+            raise ImportError(f'{lib_name} not found in TensorPlay CUDA dependency paths')
+
+    def _preload_cuda_deps(err=None):
+        if err is not None:
+            message = str(err)
+            cuda_error = any(
+                token in message
+                for token in ('libcud', 'libcublas', 'libcurand', 'libnvrtc')
+            )
+            if not cuda_error:
+                raise err
+
+        # Match PyTorch's ordering: cublasLt must win before cublas, avoiding
+        # a mixed CUDA installation through cublas' transitive RUNPATH.
+        for lib_folder, lib_name, required in (
+            ('cublas', 'libcublasLt.so.*[0-9]', True),
+            ('cublas', 'libcublas.so.*[0-9]', True),
+            ('cudnn', 'libcudnn.so.*[0-9]', True),
+            ('cuda_nvrtc', 'libnvrtc.so.*[0-9]', False),
+            ('cuda_runtime', 'libcudart.so.*[0-9]', True),
+            ('curand', 'libcurand.so.*[0-9]', True),
+        ):
+            _preload_cuda_lib(lib_folder, lib_name, required=required)
+
+# -------------------------------------------------------------------------
 # Core Imports
 # -------------------------------------------------------------------------
+try:
+    from . import _C as _C
+except (ImportError, OSError) as _load_error:
+    if sys.platform.startswith('linux') and '_preload_cuda_deps' in globals():
+        _preload_cuda_deps(_load_error)
+        from . import _C as _C
+    else:
+        raise
+
 from ._tensor import Tensor
 from ._C import (tensor, DType, Size, Scalar, Device, DeviceType,
                 from_dlpack, to_dlpack, set_printoptions,
-                default_generator, manual_seed, seed, initial_seed, Generator)
+                default_generator, manual_seed, seed, initial_seed, Generator,
+                set_num_threads, get_num_threads, get_thread_num,
+                in_parallel_region, get_parallel_info)
 from .autograd import no_grad, enable_grad, set_grad_enabled, is_grad_enabled
 from .serialization import save, load
 
@@ -152,20 +222,44 @@ uint8 = DType.uint8
 int8 = DType.int8
 int16 = DType.int16
 uint16 = DType.uint16
+uint32 = DType.uint32
+uint64 = DType.uint64
 int32 = DType.int32
 int64 = DType.int64
 float32 = DType.float32
 float64 = DType.float64
+float16 = DType.float16
+bfloat16 = DType.bfloat16
+complex32 = DType.complex32
+complex64 = DType.complex64
+complex128 = DType.complex128
+bcomplex32 = DType.bcomplex32
 bool = DType.bool
 undefined = DType.undefined
+
+# Torch-compatible legacy aliases.
+half = DType.float16
+float = DType.float32
+double = DType.float64
+short = DType.int16
+int = DType.int32
+long = DType.int64
+cfloat = DType.complex64
+cdouble = DType.complex128
+chalf = DType.complex32
 
 
 __all__ = [
     "Tensor", "tensor", "from_dlpack", "Scalar", "DeviceType", "device", "dtype", "Size",
-    "uint8", "int8", "int16", "uint16", "int32", "int64", "float32", "float64", "bool",
+    "uint8", "int8", "int16", "uint16", "uint32", "uint64", "int32", "int64",
+    "float16", "bfloat16", "float32", "float64", "complex32", "complex64", "complex128", "bcomplex32", "bool",
+    "half", "float", "double", "short", "int", "long", "cfloat", "cdouble", "chalf",
     "save", "load", "as_tensor",
     "no_grad", "enable_grad", "set_grad_enabled", "is_grad_enabled",
     "allclose",
+    "compile", "compiler",
+    "set_num_threads", "get_num_threads", "get_thread_num",
+    "in_parallel_region", "get_parallel_info",
     "__config__",
 ]
 
@@ -201,14 +295,16 @@ __all__.extend([
     "squeeze", "squeeze_backward", "stack", "std", "sum", "t", "tan",
     "tanh", "threshold_backward", "transpose", "unbind", "unsqueeze",
     "var", "zeros", "zeros_like",
+    "where", "maximum", "minimum", "addcmul", "addcdiv",
+    "view_as_real", "view_as_complex", "is_complex",
 ])
 
 # Please keep this list sorted
 # assert __all__ == sorted(__all__)
 
-# The tensorplay._C submodule is already loaded via `from tensorplay._C import *` above
-# Make an explicit reference to the _C submodule to appease linters
-from tensorplay import _C as _C, multiprocessing
+# The tensorplay._C submodule is already loaded above; import multiprocessing
+# here for the same top-level namespace behavior as torch.
+from . import multiprocessing
 
 import functools
 
@@ -297,7 +393,10 @@ if not TYPE_CHECKING:
 
 
 from .functional import *
+from ._einsum import einsum
 from .utils.comparison import allclose
+from . import compiler
+from .compiler import compile
 
 # -------------------------------------------------------------------------
 # Submodules
@@ -308,21 +407,57 @@ from . import backends
 from . import optim
 from . import nn
 from . import autograd
+from . import distributed
 from . import utils
 from . import __config__
 
-# -------------------------------------------------------------------------
-# Lazy Loading for Heavy Submodules
-# -------------------------------------------------------------------------
-def __getattr__(name):
-    if name == "vision":
-        import tensorplay.vision as vision
-        return vision
-    elif name == "audio":
-        import tensorplay.audio as audio
-        return audio
-    return None
+from . import amp
+from .amp.autocast_mode import _install_autocast
 
+_install_autocast()
+
+from .amp.autocast_mode import (  # noqa: E402
+    autocast_decrement_nesting,
+    autocast_increment_nesting,
+    clear_autocast_cache,
+    get_autocast_cpu_dtype,
+    get_autocast_dtype,
+    get_autocast_gpu_dtype,
+    is_autocast_available,
+    is_autocast_cache_enabled,
+    is_autocast_enabled,
+    set_autocast_cache_enabled,
+    set_autocast_dtype,
+    set_autocast_enabled,
+)
+
+from .amp import (  # noqa: E402
+    GradScaler,
+    autocast,
+    custom_bwd,
+    custom_fwd,
+)
+
+__all__.extend([
+    "GradScaler",
+    "amp",
+    "cuda",
+    "autocast",
+    "autocast_decrement_nesting",
+    "autocast_increment_nesting",
+    "clear_autocast_cache",
+    "custom_bwd",
+    "custom_fwd",
+    "get_autocast_cpu_dtype",
+    "get_autocast_dtype",
+    "get_autocast_gpu_dtype",
+    "is_autocast_available",
+    "is_autocast_cache_enabled",
+    "is_autocast_enabled",
+    "set_autocast_cache_enabled",
+    "set_autocast_dtype",
+    "set_autocast_enabled",
+])
 
 def typename(obj: _Any, /) -> str:
     """
@@ -400,6 +535,18 @@ __all__.extend(
 from tensorplay import functional as functional
 from tensorplay.functional import *
 
+# Python's ``import *`` intentionally omits underscore-prefixed names, but
+# Torch exposes the foreach dispatcher family at the top level.  Re-export
+# only generated ``_foreach_*`` wrappers; their implementation is still the
+# native dispatcher/backend and this block does not introduce a Python
+# composite operator.
+for _foreach_name in dir(functional):
+    if _foreach_name.startswith("_foreach_"):
+        globals()[_foreach_name] = getattr(functional, _foreach_name)
+        if _foreach_name not in __all__:
+            __all__.append(_foreach_name)
+del _foreach_name
+
 ################################################################################
 # Import most common subpackages
 ################################################################################
@@ -420,7 +567,6 @@ from tensorplay import (
     __config__ as __config__,
     autograd as autograd,
     backends as backends,
-    cpu as cpu,
     cuda as cuda,
     hub as hub,
     multiprocessing as multiprocessing,
@@ -428,7 +574,6 @@ from tensorplay import (
     optim as optim,
     types as types,
     utils as utils,
-    version as version,
 )
 
 
@@ -442,7 +587,9 @@ if TYPE_CHECKING:
 
 else:
     _lazy_modules = {
+        "audio",
         "onnx",
+        "vision",
     }
 
     def __getattr__(name):

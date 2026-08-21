@@ -36,10 +36,10 @@ class MNIST(VisionDataset):
     `MNIST <http://yann.lecun.com/exdb/mnist/>`_ Dataset.
 
     Args:
-        root (string, optional): Root directory of dataset where ``MNIST/processed/training.pt``
-            and  ``MNIST/processed/test.pt`` exist. If None, uses default cache directory.
-        train (bool, optional): If True, creates dataset from ``training.pt``,
-            otherwise from ``test.pt``.
+        root (string, optional): Root directory of dataset where ``MNIST/processed/training.mega``
+            and  ``MNIST/processed/test.mega`` exist. If None, uses default cache directory.
+        train (bool, optional): If True, creates dataset from ``training.mega``,
+            otherwise from ``test.mega``.
         download (bool, optional): If true, downloads the dataset from the internet and
             puts it in root directory. If dataset is already downloaded, it is not
             downloaded again.
@@ -60,8 +60,8 @@ class MNIST(VisionDataset):
         ("t10k-labels-idx1-ubyte.gz", "ec29112dd5afa0611ce80d1b7f02629c")
     ]
 
-    training_file = 'training.tpm'
-    test_file = 'test.tpm'
+    training_file = 'training.mega'
+    test_file = 'test.mega'
     classes = ['0 - zero', '1 - one', '2 - two', '3 - three', '4 - four',
                '5 - five', '6 - six', '7 - seven', '8 - eight', '9 - nine']
 
@@ -160,7 +160,7 @@ class MNIST(VisionDataset):
             if not downloaded:
                  raise RuntimeError(f"Failed to download {filename} from any mirror")
 
-        # process and save as torch files
+        # process and save as MEGA tensor files
         print('Processing...')
         
         training_set = (
@@ -169,15 +169,13 @@ class MNIST(VisionDataset):
         )
         
         import tensorplay as tp
-        with open(os.path.join(self.processed_folder, self.training_file), 'wb') as f:
-            tp.save(training_set, f)
+        tp.save(training_set, os.path.join(self.processed_folder, self.training_file))
         
         test_set = (
             read_image_file(os.path.join(self.raw_folder, 't10k-images-idx3-ubyte.gz')),
             read_label_file(os.path.join(self.raw_folder, 't10k-labels-idx1-ubyte.gz'))
         )
         
-        with open(os.path.join(self.processed_folder, self.test_file), 'wb') as f:
-            tp.save(test_set, f)
+        tp.save(test_set, os.path.join(self.processed_folder, self.test_file))
 
         print('Done!')

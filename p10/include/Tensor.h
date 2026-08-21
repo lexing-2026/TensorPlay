@@ -56,6 +56,16 @@ template <typename Target, typename Source>
 inline Target cast_value(const Source& src) {
     if constexpr (std::is_same_v<Source, Scalar>) {
         return src.template to<Target>();
+    } else if constexpr (is_complex_type_v<Target>) {
+        using target_value_t = typename is_complex_type<Target>::value_type;
+        if constexpr (is_complex_type_v<Source>) {
+            return Target(static_cast<target_value_t>(src.real()),
+                          static_cast<target_value_t>(src.imag()));
+        } else {
+            return Target(static_cast<target_value_t>(src), target_value_t(0));
+        }
+    } else if constexpr (is_complex_type_v<Source>) {
+        return static_cast<Target>(src.real());
     } else {
         return static_cast<Target>(src);
     }
@@ -100,26 +110,24 @@ public:
             if (inferred_dtype == TypeTraits<T>::dtype) {
                  std::memcpy(t.data_ptr(), data.data(), data.size() * sizeof(T));
             } else {
-                 // Simple cast copy loop
-                 // Note: Ideally use a dispatcher/kernel
-                 if (inferred_dtype == DType::Float32) {
-                     float* ptr = t.data_ptr<float>();
-                     for(size_t i=0; i<data.size(); ++i) ptr[i] = cast_value<float>(data[i]);
-                 } else if (inferred_dtype == DType::Int64) {
-                     int64_t* ptr = t.data_ptr<int64_t>();
-                     for(size_t i=0; i<data.size(); ++i) ptr[i] = cast_value<int64_t>(data[i]);
-                 } else if (inferred_dtype == DType::Int32) {
-                     int32_t* ptr = t.data_ptr<int32_t>();
-                     for(size_t i=0; i<data.size(); ++i) ptr[i] = cast_value<int32_t>(data[i]);
-                 } else if (inferred_dtype == DType::Float64) {
-                     double* ptr = t.data_ptr<double>();
-                     for(size_t i=0; i<data.size(); ++i) ptr[i] = cast_value<double>(data[i]);
-                 } else if (inferred_dtype == DType::Bool) {
-                     bool* ptr = t.data_ptr<bool>();
-                     for(size_t i=0; i<data.size(); ++i) ptr[i] = cast_value<bool>(data[i]);
-                 } else {
-                     TP_THROW(NotImplementedError, "Type conversion in tensor() not fully implemented for this dtype");
+                 // Cast through the same complete dtype list used by CPU
+                 // copy/fill dispatch.  This keeps the C++ tensor factory in
+                 // sync with the Python factory for unsigned, reduced-float,
+                 // and complex dtypes.
+                 #define COPY_CASE(ctype, name) \
+                     case DType::name: { \
+                         auto* ptr = t.data_ptr<ctype>(); \
+                         for (size_t i = 0; i < data.size(); ++i) { \
+                             ptr[i] = cast_value<ctype>(data[i]); \
+                         } \
+                         break; \
+                     }
+                 switch (inferred_dtype) {
+                     TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(COPY_CASE)
+                     default:
+                         TP_THROW(NotImplementedError, "Type conversion in tensor() not fully implemented for this dtype");
                  }
+                 #undef COPY_CASE
             }
         } else {
              TP_THROW(NotImplementedError, "tensor() currently only supports CPU");
@@ -145,20 +153,21 @@ public:
     Device device() const;
     size_t itemsize() const;
     bool is_contiguous() const;
+    bool is_pinned() const;
+    Tensor pin_memory() const;
     Tensor contiguous() const;
     bool is_sparse() const;
     
-    // Autograd methods removed from P10
-    // bool requires_grad() const;
-    // void set_requires_grad(bool r);
-    // Tensor grad() const;
-    // void set_grad(const Tensor& grad);
-    // void retain_grad();
-    // bool is_leaf() const;
-    // Tensor detach() const;
-    
-    // void set_grad_fn(std::shared_ptr<Node> grad_fn);
-    // std::shared_ptr<Node> grad_fn() const;
+    // Autograd methods (delegated to the AutogradMeta extension point on
+    // TensorImpl; the concrete implementation lives in the tpx library).
+    bool requires_grad() const;
+    void set_requires_grad(bool requires_grad);
+    Tensor grad() const;
+    void set_grad(const Tensor& grad);
+    bool retains_grad() const;
+    void set_retains_grad(bool retains_grad);
+    // Creates a new tensor that shares storage but carries no autograd history.
+    Tensor detach() const;
     
     // Data access
     template<typename T>

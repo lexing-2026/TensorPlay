@@ -2,6 +2,7 @@ import unittest
 import sys
 import os
 import numpy as np
+import pytest
 
 # Debug info
 print(f"DEBUG: sys.path: {sys.path}")
@@ -12,6 +13,10 @@ except ImportError as e:
     print(f"DEBUG: Failed to import tensorplay: {e}")
 
 import torch
+
+pytestmark = pytest.mark.skipif(
+    not tensorplay.cuda.is_available(), reason="requires CUDA build of tensorplay"
+)
 
 class TestCUDA(unittest.TestCase):
     def test_cuda_availability(self):

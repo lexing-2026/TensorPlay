@@ -4,6 +4,7 @@ import tensorplay
 import tensorplay._C as _C
 from tensorplay._C import _add_docstr
 from tensorplay import Tensor
+from tensorplay.compiler.graph import capture_call as _capture_call
 
 def threshold(
     input: Tensor,
@@ -15,6 +16,11 @@ def threshold(
 
     See :class:`~tensorplay.nn.Threshold` for more details.
     """
+    captured = _capture_call(
+        globals()["threshold"], (input, threshold, value), {"inplace": inplace}
+    )
+    if captured is not None:
+        return captured
     if inplace:
         result = _C.threshold_(input, threshold, value)
     else:
@@ -40,6 +46,9 @@ def silu(input: Tensor, inplace: bool = False) -> Tensor:
 
     See :class:`~tensorplay.nn.SiLU` for more details.
     """
+    captured = _capture_call(silu, (input,), {"inplace": inplace})
+    if captured is not None:
+        return captured
     if inplace:
         return tensorplay._C.silu_(input)
     return tensorplay._C.silu(input)
@@ -66,6 +75,9 @@ See `Gaussian Error Linear Units (GELUs) <https://arxiv.org/abs/1606.08415>`_.
 
 
 def linear(input, weight, bias=None):
+    captured = _capture_call(linear, (input, weight, bias), {})
+    if captured is not None:
+        return captured
     output = input.matmul(weight.t())
     if bias is not None:
         output = output + bias
@@ -111,6 +123,13 @@ def bilinear(input1, input2, weight, bias=None):
     return output
 
 def relu(input, inplace=False):
+    captured = _capture_call(
+        relu,
+        (input,),
+        {"inplace": True} if inplace else {},
+    )
+    if captured is not None:
+        return captured
     if inplace:
         return _C.relu_(input)
     return _C.relu(input)
@@ -158,8 +177,15 @@ def flatten(input, start_dim=0, end_dim=-1):
     return input.flatten(start_dim, end_dim)
 
 def embedding(input, weight, padding_idx=None, max_norm=None, norm_type=2.0, scale_grad_by_freq=False, sparse=False):
+    if max_norm is not None:
+        raise NotImplementedError('embedding: max_norm is not supported')
     if padding_idx is None:
         padding_idx = -1
+    else:
+        if padding_idx < -weight.size(0) or padding_idx >= weight.size(0):
+            raise AssertionError('Padding_idx must be within num_embeddings')
+        if padding_idx < 0:
+            padding_idx += weight.size(0)
     return _C.embedding(weight, input, padding_idx, scale_grad_by_freq, sparse)
 
 # Add more functionals as needed
@@ -302,6 +328,13 @@ def conv2d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
     stride = _pair(stride)
     padding = _pair(padding)
     dilation = _pair(dilation)
+    captured = _capture_call(
+        conv2d,
+        (input, weight, bias, stride, padding, dilation, groups),
+        {},
+    )
+    if captured is not None:
+        return captured
     if bias is None:
         bias = Tensor()
     return _C.conv2d(input, weight, bias, stride, padding, dilation, groups)
@@ -365,6 +398,13 @@ def max_pool2d(input, kernel_size, stride=None, padding=0, dilation=1, ceil_mode
         stride = _pair(stride)
     padding = _pair(padding)
     dilation = _pair(dilation)
+    captured = _capture_call(
+        max_pool2d,
+        (input, kernel_size, stride, padding, dilation, ceil_mode, return_indices),
+        {},
+    )
+    if captured is not None:
+        return captured
     return _C.max_pool2d(input, kernel_size, stride, padding, dilation, ceil_mode)
 
 def avg_pool2d(input, kernel_size, stride=None, padding=0, ceil_mode=False, count_include_pad=True, divisor_override=None):
@@ -379,6 +419,9 @@ def avg_pool2d(input, kernel_size, stride=None, padding=0, ceil_mode=False, coun
 def adaptive_avg_pool2d(input, output_size):
     # output_size can be int or (int, int) or (None, int) etc.
     output_size = _pair(output_size)
+    captured = _capture_call(adaptive_avg_pool2d, (input, output_size), {})
+    if captured is not None:
+        return captured
     return _C.adaptive_avg_pool2d(input, output_size)
 
 def adaptive_max_pool2d(input, output_size):
@@ -388,6 +431,13 @@ def adaptive_max_pool2d(input, output_size):
 # Normalization functions
 
 def batch_norm(input, running_mean=None, running_var=None, weight=None, bias=None, training=False, momentum=0.1, eps=1e-5):
+    captured = _capture_call(
+        batch_norm,
+        (input, running_mean, running_var, weight, bias, training, momentum, eps),
+        {},
+    )
+    if captured is not None:
+        return captured
     return _C.batch_norm(input, weight, bias, running_mean, running_var, training, momentum, eps)
 
 def layer_norm(input, normalized_shape, weight=None, bias=None, eps=1e-5):

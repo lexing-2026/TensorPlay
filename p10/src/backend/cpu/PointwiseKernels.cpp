@@ -4,6 +4,7 @@
 #include "TypePromotion.h"
 #include "OneDNNContext.h"
 #include "Allocator.h"
+#include "Parallel.h"
 #include <iostream>
 #include <cmath>
 #include <algorithm>
@@ -28,6 +29,7 @@
 
 namespace tensorplay {
 namespace cpu {
+using namespace tensorplay::parallel;
 
 // --- Unary Kernels ---
 
@@ -79,8 +81,9 @@ Tensor unary_op_kernel(const Tensor& self, Func func) {
     case DType::name: { \
         const ctype* src = self_contig.data_ptr<ctype>(); \
         ctype* dst = result.data_ptr<ctype>(); \
-        _Pragma("omp parallel for") \
-        for(int64_t i=0; i<n; ++i) dst[i] = func(src[i]); \
+        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) { \
+        for(int64_t i = begin; i < end; ++i) dst[i] = func(src[i]); \
+        }); \
         break; \
     }
 
@@ -114,8 +117,9 @@ Tensor unary_float_op_kernel(const Tensor& self, Func func) {
         case DType::name: { \
             const ctype* src = self_contig.data_ptr<ctype>(); \
             float* dst = result.data_ptr<float>(); \
-            _Pragma("omp parallel for") \
-            for(int64_t i=0; i<n; ++i) dst[i] = static_cast<float>(func(static_cast<float>(src[i]))); \
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) { \
+            for(int64_t i = begin; i < end; ++i) dst[i] = static_cast<float>(func(static_cast<float>(src[i]))); \
+            }); \
             break; \
         }
         switch (self.dtype()) {
@@ -123,29 +127,48 @@ Tensor unary_float_op_kernel(const Tensor& self, Func func) {
             default: TP_THROW(TypeError, "Unsupported dtype");
         }
         #undef INT_CASE
+    } else if (self.dtype() == DType::Float16 || self.dtype() == DType::BFloat16) {
+        // ATen alignment: reduced floating types compute in float (opmath_t)
+        int64_t n = self.numel();
+        if (self.dtype() == DType::Float16) {
+            const Half* src = self_contig.data_ptr<Half>();
+            Half* dst = result.data_ptr<Half>();
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+            for(int64_t i = begin; i < end; ++i) dst[i] = static_cast<Half>(func(static_cast<float>(src[i])));
+            });
+        } else {
+            const BFloat16* src = self_contig.data_ptr<BFloat16>();
+            BFloat16* dst = result.data_ptr<BFloat16>();
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+            for(int64_t i = begin; i < end; ++i) dst[i] = static_cast<BFloat16>(func(static_cast<float>(src[i])));
+            });
+        }
     } else {
         // Input float, Output float
         #define FLOAT_CASE(ctype, name) \
         case DType::name: { \
             const ctype* src = self_contig.data_ptr<ctype>(); \
             ctype* dst = result.data_ptr<ctype>(); \
-            _Pragma("omp parallel for") \
-            for(int64_t i=0; i<n; ++i) dst[i] = func(src[i]); \
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) { \
+            for(int64_t i = begin; i < end; ++i) dst[i] = func(src[i]); \
+            }); \
             break; \
         }
         switch (self.dtype()) {
             case DType::Float32: {
                  const float* src = self_contig.data_ptr<float>();
                  float* dst = result.data_ptr<float>();
-                 _Pragma("omp parallel for") \
-                 for(int64_t i=0; i<n; ++i) dst[i] = func(src[i]);
+                 parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) { \
+                 for(int64_t i = begin; i < end; ++i) dst[i] = func(src[i]);
+                 });
                  break;
             }
             case DType::Float64: {
                  const double* src = self_contig.data_ptr<double>();
                  double* dst = result.data_ptr<double>();
-                 _Pragma("omp parallel for") \
-                 for(int64_t i=0; i<n; ++i) dst[i] = func(src[i]);
+                 parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) { \
+                 for(int64_t i = begin; i < end; ++i) dst[i] = func(src[i]);
+                 });
                  break;
             }
             default: TP_THROW(TypeError, "Unsupported dtype (expected float)");
@@ -188,9 +211,10 @@ Tensor sign_kernel(const Tensor& self) {
         if constexpr (std::is_same_v<decltype(x), bool>) {
             return x ? 1 : 0;
         } else {
-            if (x > 0) return 1;
-            if (x < 0) return -1;
-            return 0;
+            using ctype = decltype(x);
+            if (x > ctype(0)) return static_cast<ctype>(1);
+            if (x < ctype(0)) return static_cast<ctype>(-1);
+            return static_cast<ctype>(0);
         }
     });
 }
@@ -207,7 +231,8 @@ Tensor ceil_kernel(const Tensor& self) {
 
 Tensor round_kernel(const Tensor& self) {
     if (isIntegralType(self.dtype())) return self.clone();
-    return unary_op_kernel(self, [](auto x) { return std::round(x); });
+    // ATen alignment: round uses nearbyint (round-half-to-even), not roundf
+    return unary_op_kernel(self, [](auto x) { return std::nearbyint(x); });
 }
 
 // Float ops
@@ -227,8 +252,8 @@ Tensor tanh_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](a
 Tensor exp_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::exp(x); }); }
 Tensor log_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::log(x); }); }
 Tensor sqrt_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::sqrt(x); }); }
-Tensor rsqrt_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return 1.0 / std::sqrt(x); }); }
-Tensor sigmoid_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return 1.0 / (1.0 + std::exp(-x)); }); }
+Tensor rsqrt_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { using T = decltype(x); return static_cast<T>(1) / std::sqrt(x); }); }
+Tensor sigmoid_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { using T = decltype(x); return static_cast<T>(1) / (static_cast<T>(1) + std::exp(-x)); }); }
 
 Tensor relu_kernel(const Tensor& self) {
     #ifdef USE_ONEDNN
@@ -252,31 +277,29 @@ Tensor relu_kernel(const Tensor& self) {
 
          #if defined(__AVX512F__)
          __m512 zero = _mm512_setzero_ps();
-         #ifdef _OPENMP
-         #pragma omp parallel for
-         #endif
-         for (int64_t i = 0; i < n; i += 16) {
-             if (i + 16 <= n) {
+         parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+         for (int64_t i = begin; i < end; i += 16) {
+             if (i + 16 <= end) {
                  __m512 x = _mm512_loadu_ps(src + i);
                  _mm512_storeu_ps(dst + i, _mm512_max_ps(zero, x));
              } else {
-                 for (int64_t j = i; j < n; ++j) dst[j] = std::max(0.0f, src[j]);
+                 for (int64_t j = i; j < end; ++j) dst[j] = (src[j] < 0.0f ? 0.0f : src[j]);
              }
          }
+         });
          return result;
          #elif defined(__AVX2__)
          __m256 zero = _mm256_setzero_ps();
-         #ifdef _OPENMP
-         #pragma omp parallel for
-         #endif
-         for (int64_t i = 0; i < n; i += 8) {
-             if (i + 8 <= n) {
+         parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+         for (int64_t i = begin; i < end; i += 8) {
+             if (i + 8 <= end) {
                  __m256 x = _mm256_loadu_ps(src + i);
                  _mm256_storeu_ps(dst + i, _mm256_max_ps(zero, x));
              } else {
-                 for (int64_t j = i; j < n; ++j) dst[j] = std::max(0.0f, src[j]);
+                 for (int64_t j = i; j < end; ++j) dst[j] = (src[j] < 0.0f ? 0.0f : src[j]);
              }
          }
+         });
          return result;
          #endif
     }
@@ -286,24 +309,17 @@ Tensor relu_kernel(const Tensor& self) {
         if constexpr (std::is_unsigned_v<T>) {
             return x;
         } else {
-            return std::max(static_cast<T>(0), x);
+            // clamp_min semantics: NaN propagates (matches torch.relu)
+            return x < static_cast<T>(0) ? static_cast<T>(0) : x;
         }
     });
 }
 
 Tensor& relu_inplace_kernel(Tensor& self) {
-    // std::cout << "DEBUG: relu_inplace_kernel entry. dtype=" << (int)self.dtype() << " contiguous=" << self.is_contiguous() << std::endl;
-    #ifdef USE_ONEDNN
-    if (OneDNNContext::is_enabled() && self.dtype() == DType::Float32) {
-        try {
-            onednn_eltwise(self, self, dnnl::algorithm::eltwise_relu);
-            return self;
-        } catch (const std::exception& e) {
-            std::cerr << "OneDNN relu_inplace failed, falling back: " << e.what() << std::endl;
-        }
-    }
-    #endif
-
+    // OneDNN's eltwise primitive does not accept this tensor/layout as both
+    // source and destination.  Trying it first only produces a noisy
+    // exception before reaching the already-optimized direct in-place path.
+    // Keep OneDNN for out-of-place ReLU, but use the SIMD/scalar path here.
     if (self.dtype() == DType::Float32 && self.is_contiguous()) {
          // Optimized path
          int64_t n = self.numel();
@@ -311,35 +327,33 @@ Tensor& relu_inplace_kernel(Tensor& self) {
 
          #if defined(__AVX512F__)
          __m512 zero = _mm512_setzero_ps();
-         #ifdef _OPENMP
-         #pragma omp parallel for
-         #endif
-         for (int64_t i = 0; i < n; i += 16) {
-             if (i + 16 <= n) {
+         parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+         for (int64_t i = begin; i < end; i += 16) {
+             if (i + 16 <= end) {
                  __m512 x = _mm512_loadu_ps(data + i);
                  _mm512_storeu_ps(data + i, _mm512_max_ps(zero, x));
              } else {
-                 for (int64_t j = i; j < n; ++j) data[j] = std::max(0.0f, data[j]);
+                 for (int64_t j = i; j < end; ++j) data[j] = (data[j] < 0.0f ? 0.0f : data[j]);
              }
          }
+         });
          return self;
          #elif defined(__AVX2__)
          __m256 zero = _mm256_setzero_ps();
-         #ifdef _OPENMP
-         #pragma omp parallel for
-         #endif
-         for (int64_t i = 0; i < n; i += 8) {
-             if (i + 8 <= n) {
+         parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+         for (int64_t i = begin; i < end; i += 8) {
+             if (i + 8 <= end) {
                  __m256 x = _mm256_loadu_ps(data + i);
                  _mm256_storeu_ps(data + i, _mm256_max_ps(zero, x));
              } else {
-                 for (int64_t j = i; j < n; ++j) data[j] = std::max(0.0f, data[j]);
+                 for (int64_t j = i; j < end; ++j) data[j] = (data[j] < 0.0f ? 0.0f : data[j]);
              }
          }
+         });
          return self;
          #else
          // Scalar fallback for contiguous float32
-         for (int64_t i = 0; i < n; ++i) data[i] = std::max(0.0f, data[i]);
+         for (int64_t i = 0; i < n; ++i) data[i] = (data[i] < 0.0f ? 0.0f : data[i]);
          return self;
          #endif
     }
@@ -350,12 +364,13 @@ Tensor& relu_inplace_kernel(Tensor& self) {
     #define OP_CASE(ctype, name) \
     case DType::name: { \
         ctype* data = self.data_ptr<ctype>(); \
-        _Pragma("omp parallel for") \
-        for(int64_t i=0; i<n; ++i) { \
+        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) { \
+        for(int64_t i = begin; i < end; ++i) { \
             if constexpr (!std::is_unsigned_v<ctype>) { \
-                data[i] = std::max(static_cast<ctype>(0), data[i]); \
+                data[i] = data[i] < static_cast<ctype>(0) ? static_cast<ctype>(0) : data[i]; \
             } \
         } \
+        }); \
         break; \
     }
 
@@ -390,17 +405,39 @@ Tensor silu_kernel(const Tensor& self) {
 }
 
 Tensor pow_scalar_kernel(const Tensor& self, Scalar exponent) {
+    // ATen alignment: pow_tensor_scalar_optimized_kernel
+    if (self.dtype() == DType::Bool) TP_THROW(TypeError, "pow is not supported for bool tensors");
+    if (isIntegralType(self.dtype()) && exponent.isIntegral() && exponent.to<int64_t>() < 0) {
+        TP_THROW(RuntimeError, "Integers to negative integer powers are not allowed.");
+    }
     if (exponent.isFloatingPoint()) {
         double exp_val = exponent.toDouble();
-        return unary_float_op_kernel(self, [exp_val](auto x) { return std::pow(x, exp_val); });
+        // Fast paths mirroring ATen pow_tensor_scalar_optimized_kernel
+        if (exp_val == 0.5 && self.dtype() != DType::Float64) return sqrt_kernel(self);
+        if (exp_val == -0.5 && self.dtype() != DType::Float64) return rsqrt_kernel(self);
+        if (exp_val == 1.0) return self.clone();
+        if (exp_val == 2.0) return square_kernel(self);
+        if (exp_val == 3.0) {
+            return unary_float_op_kernel(self, [](auto x) { using T = decltype(x); return x * x * x; });
+        }
+        return unary_float_op_kernel(self, [exp_val](auto x) { using T = decltype(x); return std::pow(x, static_cast<T>(exp_val)); });
     } else {
         int64_t exp_val = exponent.to<int64_t>();
         if (exp_val < 0) {
-             return unary_float_op_kernel(self, [exp_val](auto x) { return std::pow(x, static_cast<double>(exp_val)); });
+             return unary_float_op_kernel(self, [exp_val](auto x) { using T = decltype(x); return std::pow(x, static_cast<T>(static_cast<double>(exp_val))); });
         }
         return unary_op_kernel(self, [exp_val](auto x) {
              using T = decltype(x);
-             return static_cast<T>(std::pow(x, exp_val));
+             // repeated multiplication (ipow), matches ATen integral behavior
+             T base = x;
+             T acc = static_cast<T>(1);
+             int64_t e = exp_val;
+             while (e > 0) {
+                 if (e & 1) acc = acc * base;
+                 e >>= 1;
+                 if (e) base = base * base;
+             }
+             return acc;
         });
     }
 }
@@ -429,12 +466,14 @@ Tensor clamp_kernel(const Tensor& self, std::optional<Scalar> min, std::optional
         ctype* dst = result.data_ptr<ctype>(); \
         ctype min_val = min.has_value() ? min->to<ctype>() : std::numeric_limits<ctype>::lowest(); \
         ctype max_val = max.has_value() ? max->to<ctype>() : std::numeric_limits<ctype>::max(); \
-        for(int64_t i=0; i<n; ++i) { \
+        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) { \
+        for(int64_t i=begin; i<end; ++i) { \
             ctype val = src[i]; \
             if (min.has_value() && val < min_val) val = min_val; \
             if (max.has_value() && val > max_val) val = max_val; \
             dst[i] = val; \
         } \
+        }); \
         break; \
     }
 
@@ -461,8 +500,8 @@ Tensor clamp_backward_kernel(const Tensor& grad_output, const Tensor& self, std:
         ctype* dst = result.data_ptr<ctype>(); \
         ctype min_val = min.has_value() ? min->to<ctype>() : std::numeric_limits<ctype>::lowest(); \
         ctype max_val = max.has_value() ? max->to<ctype>() : std::numeric_limits<ctype>::max(); \
-        _Pragma("omp parallel for") \
-        for(int64_t i=0; i<n; ++i) { \
+        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) { \
+        for(int64_t i = begin; i < end; ++i) { \
             ctype val = src[i]; \
             if ((min.has_value() && val < min_val) || (max.has_value() && val > max_val)) { \
                 dst[i] = 0; \
@@ -470,6 +509,7 @@ Tensor clamp_backward_kernel(const Tensor& grad_output, const Tensor& self, std:
                 dst[i] = grad[i]; \
             } \
         } \
+        }); \
         break; \
     }
 
@@ -495,14 +535,15 @@ Tensor threshold_backward_kernel(const Tensor& grad_output, const Tensor& output
         const ctype* grad = grad_contig.data_ptr<ctype>(); \
         ctype* dst = result.data_ptr<ctype>(); \
         ctype thresh = threshold.to<ctype>(); \
-        _Pragma("omp parallel for") \
-        for(int64_t i=0; i<n; ++i) { \
+        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) { \
+        for(int64_t i = begin; i < end; ++i) { \
             if (src[i] <= thresh) { \
                 dst[i] = 0; \
             } else { \
                 dst[i] = grad[i]; \
             } \
         } \
+        }); \
         break; \
     }
 
@@ -515,34 +556,81 @@ Tensor threshold_backward_kernel(const Tensor& grad_output, const Tensor& output
     return result;
 }
 
-// Softmax
+// Softmax — ATen alignment: single fused kernel over the reduction dim
+// (max pass, exp+sum pass, write pass) instead of materializing 5 temporaries.
+// Fast path: contiguous input, reduction over last dim. Fallback: composition.
+template <bool LogMode>
+static Tensor softmax_fused_kernel_impl(const Tensor& self, int64_t dim, DType out_dtype) {
+    Tensor input = self.to(out_dtype);
+    int64_t d = dim < 0 ? dim + input.dim() : dim;
+
+    bool innermost = input.is_contiguous() && (d == input.dim() - 1);
+    if (!innermost) {
+        // generic fallback via transpose-to-end + fused row loop
+        Tensor t = input.transpose(d, -1);
+        if (!t.is_contiguous()) t = t.contiguous();
+        Tensor result = softmax_fused_kernel_impl<LogMode>(t, t.dim() - 1, out_dtype);
+        return result.transpose(d, -1).contiguous();
+    }
+
+    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(input.shape()), out_dtype, input.device());
+    int64_t rows = input.numel() / input.size(-1);
+    int64_t size = input.size(-1);
+
+    #define SOFTMAX_CASE(ctype, name) \
+    case DType::name: { \
+        const ctype* in = input.data_ptr<ctype>(); \
+        ctype* out = result.data_ptr<ctype>(); \
+        parallel_for(0, rows, 1, [&](int64_t begin, int64_t end) { \
+            for (int64_t r = begin; r < end; ++r) { \
+                const ctype* row = in + r * size; \
+                ctype* orow = out + r * size; \
+                ctype m = row[0]; \
+                for (int64_t j = 1; j < size; ++j) m = std::max(m, row[j]); \
+                ctype sum = ctype(0); \
+                for (int64_t j = 0; j < size; ++j) { \
+                    ctype e = std::exp(row[j] - m); \
+                    orow[j] = e; \
+                    sum += e; \
+                } \
+                if constexpr (LogMode) { \
+                    ctype lse = std::log(sum); \
+                    for (int64_t j = 0; j < size; ++j) orow[j] = (row[j] - m) - lse; \
+                } else { \
+                    ctype inv = ctype(1) / sum; \
+                    for (int64_t j = 0; j < size; ++j) orow[j] *= inv; \
+                } \
+            } \
+        }); \
+        break; \
+    }
+    switch (out_dtype) {
+        SOFTMAX_CASE(float, Float32)
+        SOFTMAX_CASE(double, Float64)
+        default: TP_THROW(TypeError, "softmax: unsupported dtype");
+    }
+    #undef SOFTMAX_CASE
+    return result;
+}
+
 Tensor softmax_kernel(const Tensor& self, int64_t dim, std::optional<DType> dtype) {
     DType out_dtype = dtype.value_or(self.dtype());
     if (isIntegralType(out_dtype)) out_dtype = DType::Float32;
-    
-    Tensor input = self.to(out_dtype);
-    
-    Tensor max_val = input.max({dim}, true);
-    Tensor shifted = input - max_val;
-    Tensor exp_val = shifted.exp();
-    Tensor sum_exp = exp_val.sum({dim}, true);
-    return exp_val / sum_exp;
+    // ATen alignment: reduced floats compute in float32
+    if (isReducedFloatingType(out_dtype)) {
+        return softmax_fused_kernel_impl<false>(self, dim, DType::Float32).to(out_dtype);
+    }
+    return softmax_fused_kernel_impl<false>(self, dim, out_dtype);
 }
 
-// Log Softmax
+// Log Softmax — same fused structure as ATen (_log_softmax_vec)
 Tensor log_softmax_kernel(const Tensor& self, int64_t dim, std::optional<DType> dtype) {
     DType out_dtype = dtype.value_or(self.dtype());
     if (isIntegralType(out_dtype)) out_dtype = DType::Float32;
-    
-    Tensor input = self.to(out_dtype);
-    
-    // log_softmax(x) = x - max(x) - log(sum(exp(x - max(x))))
-    Tensor max_val = input.max({dim}, true);
-    Tensor shifted = input - max_val;
-    Tensor exp_val = shifted.exp();
-    Tensor sum_exp = exp_val.sum({dim}, true);
-    Tensor log_sum_exp = sum_exp.log();
-    return shifted - log_sum_exp;
+    if (isReducedFloatingType(out_dtype)) {
+        return softmax_fused_kernel_impl<true>(self, dim, DType::Float32).to(out_dtype);
+    }
+    return softmax_fused_kernel_impl<true>(self, dim, out_dtype);
 }
 
 // Helper for pow (Tensor, Tensor)
@@ -584,13 +672,13 @@ Tensor lerp_tensor_kernel(const Tensor& self, const Tensor& end, const Tensor& w
     DType common_dtype = promoteTypes(self.dtype(), end.dtype());
     common_dtype = promoteTypes(common_dtype, weight.dtype());
     if (isIntegralType(common_dtype)) common_dtype = DType::Float32;
-    
+
     // result = self + weight * (end - self)
     // Ensure all operands are cast to common_dtype
     Tensor s = self.to(common_dtype);
     Tensor e = end.to(common_dtype);
     Tensor w = weight.to(common_dtype);
-    
+
     return s + w * (e - s);
 }
 
@@ -598,11 +686,46 @@ Tensor lerp_scalar_kernel(const Tensor& self, const Tensor& end, Scalar weight) 
     DType common_dtype = promoteTypes(self.dtype(), end.dtype());
     if (weight.isFloatingPoint()) common_dtype = promoteTypes(common_dtype, DType::Float32);
     if (isIntegralType(common_dtype)) common_dtype = DType::Float32;
-    
+
     Tensor s = self.to(common_dtype);
     Tensor e = end.to(common_dtype);
-    
-    return s + weight * (e - s);
+
+    // ATen alignment: numerically stable branch chosen once for a scalar weight
+    double w = weight.toDouble();
+    if (std::abs(w) < 0.5) {
+        return s + weight * (e - s);
+    }
+    return e - (e - s) * (1.0 - w);
+}
+
+Tensor& lerp_scalar_inplace_kernel(Tensor& self, const Tensor& end, Scalar weight) {
+    self.copy_(lerp_scalar_kernel(self, end, weight));
+    return self;
+}
+
+Tensor& lerp_tensor_inplace_kernel(Tensor& self, const Tensor& end, const Tensor& weight) {
+    self.copy_(lerp_tensor_kernel(self, end, weight));
+    return self;
+}
+
+Tensor& abs_inplace_kernel(Tensor& self) {
+    self.copy_(abs_kernel(self));
+    return self;
+}
+
+Tensor& neg_inplace_kernel(Tensor& self) {
+    self.copy_(neg_kernel(self));
+    return self;
+}
+
+Tensor& sqrt_inplace_kernel(Tensor& self) {
+    self.copy_(sqrt_kernel(self));
+    return self;
+}
+
+Tensor& rsqrt_inplace_kernel(Tensor& self) {
+    self.copy_(rsqrt_kernel(self));
+    return self;
 }
 
 TENSORPLAY_LIBRARY_IMPL(CPU, PointwiseKernels) {
@@ -644,6 +767,12 @@ TENSORPLAY_LIBRARY_IMPL(CPU, PointwiseKernels) {
     m.impl("pow.Tensor_Tensor", pow_tensor_tensor_kernel);
     m.impl("lerp", lerp_scalar_kernel);
     m.impl("lerp.Tensor", lerp_tensor_kernel);
+    m.impl("lerp_.Scalar", lerp_scalar_inplace_kernel);
+    m.impl("lerp_.Tensor", lerp_tensor_inplace_kernel);
+    m.impl("abs_", abs_inplace_kernel);
+    m.impl("neg_", neg_inplace_kernel);
+    m.impl("sqrt_", sqrt_inplace_kernel);
+    m.impl("rsqrt_", rsqrt_inplace_kernel);
 }
 
 } // namespace cpu

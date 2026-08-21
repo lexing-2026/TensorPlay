@@ -74,10 +74,15 @@ public:
 
 namespace cuda {
     P10_API size_t memory_allocated(int device = 0);
+    P10_API size_t memory_reserved(int device = 0);
     P10_API size_t max_memory_allocated(int device = 0);
+    P10_API size_t max_memory_reserved(int device = 0);
     P10_API void reset_max_memory_allocated(int device = 0);
+    P10_API void reset_peak_memory_stats(int device = 0);
     P10_API void empty_cache();
     P10_API void manual_seed(uint64_t seed);
+    P10_API void manual_seed_all(uint64_t seed);
+    P10_API void recordStream(void* base_ptr, const Device& device);
 }
 
 } // namespace tensorplay

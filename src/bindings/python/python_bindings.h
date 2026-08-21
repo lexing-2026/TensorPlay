@@ -4,25 +4,21 @@
 #define TP_STATIC_BUILD
 #endif
 
-#include <nanobind/nanobind.h>
-#include <nanobind/stl/vector.h>
-#include <nanobind/stl/string.h>
-#include <nanobind/stl/map.h>
-#include <nanobind/stl/optional.h>
-#include <nanobind/stl/shared_ptr.h>
-#include <nanobind/operators.h>
-#include <nanobind/ndarray.h>
-#include <nanobind/make_iterator.h>
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+#include <pybind11/operators.h>
+#include <pybind11/numpy.h>
+#include <pybind11/functional.h>
+#include <pybind11/complex.h>
 
-#include "TPXTensor.h"
+#include "Autograd.h"
 #include "Device.h"
 #include "DType.h"
 #include "Exception.h"
 #include "Generator.h"
-#include "Autograd.h"
 
-namespace nb = nanobind;
-using namespace nb::literals;
+namespace py = pybind11;
+using namespace py::literals;
 
 using tensorplay::Device;
 using tensorplay::DeviceType;
@@ -32,16 +28,18 @@ using tensorplay::Scalar;
 using tensorplay::Generator;
 using tensorplay::default_generator;
 using tensorplay::manual_seed;
-using Tensor = tensorplay::tpx::Tensor;
+using Tensor = tensorplay::Tensor;
 
 // using namespace tensorplay;
 
-void init_tensor(nb::module_& m);
-void init_device(nb::module_& m);
-void init_dtype(nb::module_& m);
-void init_size(nb::module_& m);
-void init_generator(nb::module_& m);
-void init_autograd(nb::module_& m);
-void init_ops(nb::module_& m);
-void init_scalar(nb::module_& m);
-void init_stax(nb::module_& m);
+void init_tensor(py::module_& m);
+void init_device(py::module_& m);
+void init_dtype(py::module_& m);
+void init_size(py::module_& m);
+void init_generator(py::module_& m);
+void init_autograd(py::module_& m);
+void init_ops(py::module_& m);
+void init_scalar(py::module_& m);
+void init_stax(py::module_& m);
+void init_parallel(py::module_& m);
+void init_distributed(py::module_& m);

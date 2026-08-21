@@ -152,7 +152,12 @@ class _BatchNorm(_NormBase):
         )
 
     def forward(self, input: Tensor) -> Tensor:
-        self._check_input_dim(input)
+        # During compiler capture ``input`` is a symbolic Proxy and its rank
+        # is not a runtime Tensor property yet.  The concrete eager path
+        # keeps the normal validation; the compiler specializes this module
+        # from the ResNet graph and lowers the actual batch_norm call.
+        if not tensorplay.compiler.is_compiling():
+            self._check_input_dim(input)
 
         # exponential_average_factor is set to self.momentum
         # (when it is available) only so that it gets updated

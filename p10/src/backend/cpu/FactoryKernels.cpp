@@ -14,6 +14,23 @@ namespace cpu {
 
 Tensor& fill_kernel(Tensor& self, Scalar value);
 
+Tensor allocate_cpu_tensor(const std::vector<int64_t>& size, DType dtype, bool pin_memory) {
+#ifdef USE_CUDA
+    if (pin_memory) {
+        int64_t numel = 1;
+        for (int64_t value : size) numel *= value;
+        const size_t nbytes = static_cast<size_t>(numel) * elementSize(dtype);
+        Storage storage(nbytes, getPinnedMemoryAllocator(), Device(DeviceType::CPU));
+        return Tensor(storage, size, dtype);
+    }
+#else
+    if (pin_memory) {
+        TP_THROW(RuntimeError, "pin_memory requires a CUDA-enabled TensorPlay build");
+    }
+#endif
+    return Tensor(size, dtype, Device(DeviceType::CPU));
+}
+
 Tensor rand_kernel(const std::vector<int64_t>& size, DType dtype, Device device) {
     Tensor t(size, dtype, device);
     if (dtype == DType::Float32) {
@@ -30,8 +47,8 @@ Tensor rand_kernel(const std::vector<int64_t>& size, DType dtype, Device device)
     return t;
 }
 
-Tensor zeros_kernel(const std::vector<int64_t>& size, DType dtype, Device device) {
-    Tensor t(size, dtype, device);
+Tensor zeros_kernel(const std::vector<int64_t>& size, DType dtype, Device device, bool pin_memory) {
+    Tensor t = allocate_cpu_tensor(size, dtype, pin_memory);
     size_t nbytes = t.numel() * t.itemsize();
     if (t.data_ptr()) {
         std::memset(t.data_ptr(), 0, nbytes);
@@ -39,18 +56,18 @@ Tensor zeros_kernel(const std::vector<int64_t>& size, DType dtype, Device device
     return t;
 }
 
-Tensor ones_kernel(const std::vector<int64_t>& size, DType dtype, Device device) {
-    Tensor t(size, dtype, device);
+Tensor ones_kernel(const std::vector<int64_t>& size, DType dtype, Device device, bool pin_memory) {
+    Tensor t = allocate_cpu_tensor(size, dtype, pin_memory);
     fill_kernel(t, 1);
     return t;
 }
 
-Tensor full_kernel(const std::vector<int64_t>& size, Scalar fill_value, DType dtype, Device device) {
+Tensor full_kernel(const std::vector<int64_t>& size, Scalar fill_value, DType dtype, Device device, bool pin_memory) {
     DType inferred_dtype = dtype;
     if (inferred_dtype == DType::Undefined) {
         inferred_dtype = fill_value.dtype();
     }
-    Tensor t(size, inferred_dtype, device);
+    Tensor t = allocate_cpu_tensor(size, inferred_dtype, pin_memory);
     fill_kernel(t, fill_value);
     return t;
 }
@@ -132,9 +149,8 @@ Tensor arange_kernel(Scalar end, DType dtype, Device device) {
     return arange_start_step_kernel(Scalar(0), end, Scalar(1), dtype, device);
 }
 
-Tensor empty_kernel(const std::vector<int64_t>& size, DType dtype, Device device) {
-    Tensor t(size, dtype, device);
-    return t;
+Tensor empty_kernel(const std::vector<int64_t>& size, DType dtype, Device device, bool pin_memory) {
+    return allocate_cpu_tensor(size, dtype, pin_memory);
 }
 
 Tensor eye_kernel(int64_t n, int64_t m, DType dtype, Device device) {
@@ -295,25 +311,25 @@ Tensor randn_like_kernel(const Tensor& self, DType dtype, std::optional<Device> 
 Tensor empty_like_kernel(const Tensor& self, DType dtype, std::optional<Device> device) {
     if (dtype == DType::Undefined) dtype = self.dtype();
     Device dev = device.has_value() ? *device : self.device();
-    return empty_kernel(static_cast<std::vector<int64_t>>(self.shape()), dtype, dev);
+    return empty_kernel(static_cast<std::vector<int64_t>>(self.shape()), dtype, dev, false);
 }
 
 Tensor zeros_like_kernel(const Tensor& self, DType dtype, std::optional<Device> device) {
     if (dtype == DType::Undefined) dtype = self.dtype();
     Device dev = device.has_value() ? *device : self.device();
-    return zeros_kernel(static_cast<std::vector<int64_t>>(self.shape()), dtype, dev);
+    return zeros_kernel(static_cast<std::vector<int64_t>>(self.shape()), dtype, dev, false);
 }
 
 Tensor ones_like_kernel(const Tensor& self, DType dtype, std::optional<Device> device) {
     if (dtype == DType::Undefined) dtype = self.dtype();
     Device dev = device.has_value() ? *device : self.device();
-    return ones_kernel(static_cast<std::vector<int64_t>>(self.shape()), dtype, dev);
+    return ones_kernel(static_cast<std::vector<int64_t>>(self.shape()), dtype, dev, false);
 }
 
 Tensor full_like_kernel(const Tensor& self, Scalar fill_value, DType dtype, std::optional<Device> device) {
     if (dtype == DType::Undefined) dtype = self.dtype();
     Device dev = device.has_value() ? *device : self.device();
-    return full_kernel(static_cast<std::vector<int64_t>>(self.shape()), fill_value, dtype, dev);
+    return full_kernel(static_cast<std::vector<int64_t>>(self.shape()), fill_value, dtype, dev, false);
 }
 
 

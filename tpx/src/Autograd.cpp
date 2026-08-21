@@ -1,130 +1,79 @@
 #include "Autograd.h"
-#include "TPXTensor.h"
 #include "TensorImpl.h"
 #include "AccumulateGrad.h"
 #include "Engine.h"
+#include "InputBuffer.h"
+#include "ManualNodes.h" // For SelectBackward/SliceBackward/AsStridedBackward
 
 namespace tensorplay {
 namespace tpx {
 
-namespace {
-    thread_local bool grad_mode_enabled = true;
-}
+namespace impl {
 
-bool GradMode::is_enabled() {
-    return grad_mode_enabled;
-}
-
-void GradMode::set_enabled(bool enabled) {
-    grad_mode_enabled = enabled;
-}
-
-struct AutogradMetaFactoryImpl : public AutogradMetaFactory {
-    std::shared_ptr<AutogradMetaInterface> make() const override {
-        return std::make_shared<AutogradMeta>();
+AutogradMeta* get_autograd_meta(const Tensor& t) {
+    if (auto* impl = t.unsafeGetTensorImpl().get()) {
+        return static_cast<AutogradMeta*>(impl->autograd_meta());
     }
-};
+    return nullptr;
+}
 
-static AutogradMetaFactoryImpl global_autograd_meta_factory_impl;
-
-// Register factory on startup
-struct AutogradMetaFactoryRegister {
-    AutogradMetaFactoryRegister() {
-        SetAutogradMetaFactory(&global_autograd_meta_factory_impl);
+AutogradMeta* get_or_create_autograd_meta(const Tensor& t) {
+    auto impl = t.unsafeGetTensorImpl();
+    if (!impl) return nullptr;
+    if (auto* meta = impl->autograd_meta()) {
+        return static_cast<AutogradMeta*>(meta);
     }
-};
-
-static AutogradMetaFactoryRegister global_autograd_meta_factory_register;
-
-AutogradMeta::AutogradMeta(bool requires_grad) 
-    : requires_grad_(requires_grad), retain_grad_(false), output_nr_(0) {}
-
-bool AutogradMeta::requires_grad() const {
-    return requires_grad_ || grad_fn_ != nullptr;
+    auto meta = std::make_shared<AutogradMeta>();
+    auto* raw = meta.get();
+    impl->set_autograd_meta(std::move(meta));
+    return raw;
 }
 
-void AutogradMeta::set_requires_grad(bool requires_grad) {
-    requires_grad_ = requires_grad;
-}
-
-Tensor AutogradMeta::grad() const {
-    if (grad_) {
-        return *grad_;
-    }
-    return Tensor(); 
-}
-
-void AutogradMeta::set_grad(const Tensor& grad) {
-    if (grad.defined()) {
-        grad_ = std::make_shared<Tensor>(grad);
-    } else {
-        grad_ = nullptr;
+void set_requires_grad(const Tensor& t, bool requires_grad) {
+    if (auto* meta = get_or_create_autograd_meta(t)) {
+        meta->set_requires_grad(requires_grad);
     }
 }
 
-void AutogradMeta::accum_grad(const Tensor& grad) {
-    if (!grad_) {
-        grad_ = std::make_shared<Tensor>(grad);
+} // namespace impl
+
+void AutogradMeta::accum_grad(const tensorplay::Tensor& grad) {
+    if (!grad_.defined()) {
+        grad_ = grad;
+    } else if (!GradMode::is_enabled() && can_accumulate_inplace(grad_)) {
+        // In-place accumulation when safe: avoids an allocation per backward
+        grad_ += grad;
     } else {
         // Accumulate gradient
-        *grad_ = grad_->add(grad);
+        grad_ = grad_ + grad;
     }
-}
-
-void AutogradMeta::set_grad_fn(std::shared_ptr<Node> grad_fn) {
-    grad_fn_ = std::move(grad_fn);
-}
-
-std::shared_ptr<Node> AutogradMeta::grad_fn() const {
-    return grad_fn_;
-}
-
-void AutogradMeta::set_grad_accumulator(std::shared_ptr<Node> grad_accumulator) {
-    grad_accumulator_ = std::move(grad_accumulator);
-}
-
-std::shared_ptr<Node> AutogradMeta::grad_accumulator() const {
-    return grad_accumulator_;
-}
-
-uint32_t AutogradMeta::output_nr() const {
-    return output_nr_;
-}
-
-void AutogradMeta::set_output_nr(uint32_t output_nr) {
-    output_nr_ = output_nr;
-}
-
-bool AutogradMeta::retain_grad() const {
-    return retain_grad_;
-}
-
-void AutogradMeta::set_retain_grad(bool retain_grad) {
-    retain_grad_ = retain_grad;
 }
 
 std::vector<Edge> collect_next_edges(const Tensor& t) {
     std::vector<Edge> edges;
-    if (t.requires_grad()) {
-        auto fn = t.grad_fn();
+    if (impl::requires_grad(t)) {
+        auto fn = impl::grad_fn(t);
         if (fn) {
-             uint32_t output_nr = 0;
-             if (t.autograd_meta()) output_nr = t.autograd_meta()->output_nr();
-             edges.emplace_back(fn, output_nr);
+            edges.emplace_back(fn, impl::output_nr(t));
         } else {
-             // Leaf
-             auto meta = t.autograd_meta();
-             if (meta) {
-                 if (!meta->grad_accumulator()) {
-                     meta->set_grad_accumulator(std::make_shared<AccumulateGrad>(t));
-                 }
-                 edges.emplace_back(meta->grad_accumulator(), 0);
-             } else {
-                 edges.emplace_back();
-             }
+            // Leaf
+            auto* meta = impl::get_autograd_meta(t);
+            if (meta) {
+                // Hold a strong ref locally: the graph edge becomes its owner,
+                // while the tensor only keeps a weak cache reference (mirrors
+                // c10's weak grad_accumulator_).
+                std::shared_ptr<Node> acc = meta->grad_accumulator();
+                if (!acc) {
+                    acc = std::make_shared<AccumulateGrad>(t);
+                    meta->set_grad_accumulator(acc);
+                }
+                edges.emplace_back(std::move(acc), 0);
+            } else {
+                edges.emplace_back();
+            }
         }
     } else {
-        edges.emplace_back(); 
+        edges.emplace_back();
     }
     return edges;
 }
@@ -140,19 +89,16 @@ void backward(const std::vector<Tensor>& tensors, const std::vector<Tensor>& gra
     if (!gradients.empty() && tensors.size() != gradients.size()) {
         TP_THROW(RuntimeError, "Mismatch in tensors and gradients size");
     }
-    
-    // DEBUG THROW
-
 
     std::vector<Edge> roots;
     std::vector<Tensor> inputs;
     roots.reserve(tensors.size());
     inputs.reserve(tensors.size());
-    
+
     for (size_t i = 0; i < tensors.size(); ++i) {
         const auto& tensor = tensors[i];
         if (!tensor.requires_grad()) {
-             TP_THROW(RuntimeError, "Tensor does not require grad and does not have a grad_fn");
+            TP_THROW(RuntimeError, "Tensor does not require grad and does not have a grad_fn");
         }
 
         // Prepare gradient
@@ -160,175 +106,147 @@ void backward(const std::vector<Tensor>& tensors, const std::vector<Tensor>& gra
         if (i < gradients.size() && gradients[i].defined()) {
             grad = gradients[i];
         } else {
-             if (tensor.numel() != 1) {
-                 TP_THROW(RuntimeError, "grad can be implicitly created only for scalar outputs");
-             }
-             // Create scalar tensor on the same device and fill with 1.0
-             std::vector<int64_t> shape = {};
-             grad = Tensor(shape, tensor.dtype(), tensor.device());
-             grad.fill_(1.0);
+            if (tensor.numel() != 1) {
+                TP_THROW(RuntimeError, "grad can be implicitly created only for scalar outputs");
+            }
+            // Create scalar tensor on the same device and fill with 1.0
+            std::vector<int64_t> shape = {};
+            grad = Tensor(shape, tensor.dtype(), tensor.device());
+            grad.fill_(1.0);
         }
         inputs.push_back(grad);
 
         // Prepare root
-        if (auto fn = tensor.grad_fn()) {
-            uint32_t output_nr = 0;
-            if (tensor.autograd_meta()) {
-                output_nr = tensor.autograd_meta()->output_nr();
-            }
-            roots.emplace_back(fn, output_nr);
+        if (auto fn = impl::grad_fn(tensor)) {
+            roots.emplace_back(fn, impl::output_nr(tensor));
         } else if (tensor.requires_grad()) {
             // Leaf node
-            auto meta = tensor.autograd_meta();
+            auto* meta = impl::get_autograd_meta(tensor);
             if (meta) {
-                if (!meta->grad_accumulator()) {
-                    meta->set_grad_accumulator(std::make_shared<AccumulateGrad>(tensor));
+                std::shared_ptr<Node> acc = meta->grad_accumulator();
+                if (!acc) {
+                    acc = std::make_shared<AccumulateGrad>(tensor);
+                    meta->set_grad_accumulator(acc);
                 }
-                roots.emplace_back(meta->grad_accumulator(), 0);
+                roots.emplace_back(std::move(acc), 0);
             }
         }
     }
 
-    Engine::get_default_engine().test_link();
-    Engine::get_default_engine().execute_graph(roots, inputs, retain_graph, create_graph);
+    Engine::get_default_engine().execute(roots, inputs, retain_graph, create_graph,
+                                         /*accumulate_grad=*/true, /*outputs=*/{});
 }
 
 std::vector<Tensor> grad(
-    const std::vector<Tensor>& outputs, 
-    const std::vector<Tensor>& inputs, 
-    const std::vector<Tensor>& grad_outputs, 
-    bool retain_graph, 
-    bool create_graph, 
+    const std::vector<Tensor>& outputs,
+    const std::vector<Tensor>& inputs,
+    const std::vector<Tensor>& grad_outputs,
+    bool retain_graph,
+    bool create_graph,
     bool allow_unused) {
-    
+
     if (outputs.empty()) {
         TP_THROW(RuntimeError, "grad requires at least one output tensor");
     }
     if (inputs.empty()) {
         TP_THROW(RuntimeError, "grad requires at least one input tensor");
     }
-    
+
     // 1. Prepare roots
     std::vector<Edge> roots;
     roots.reserve(outputs.size());
     std::vector<Tensor> root_grads;
     root_grads.reserve(outputs.size());
-    
+
     for (size_t i = 0; i < outputs.size(); ++i) {
         const auto& output = outputs[i];
         if (!output.requires_grad()) {
-             TP_THROW(RuntimeError, "element " + std::to_string(i) + " of tensors does not require grad and does not have a grad_fn");
+            TP_THROW(RuntimeError, "element " + std::to_string(i) + " of tensors does not require grad and does not have a grad_fn");
         }
-        
+
         // Prepare grad
         Tensor gradient;
         if (i < grad_outputs.size() && grad_outputs[i].defined()) {
             gradient = grad_outputs[i];
         } else {
             if (output.numel() != 1) {
-                 TP_THROW(RuntimeError, "grad can be implicitly created only for scalar outputs");
+                TP_THROW(RuntimeError, "grad can be implicitly created only for scalar outputs");
             }
             std::vector<float> data = {1.0f};
             gradient = Tensor::tensor(data, output.dtype(), output.device()).reshape({});
         }
         root_grads.push_back(gradient);
-        
+
         // Prepare edge
-        if (auto fn = output.grad_fn()) {
-            uint32_t output_nr = 0;
-            if (output.autograd_meta()) {
-                output_nr = output.autograd_meta()->output_nr();
-            }
-            roots.emplace_back(fn, output_nr);
+        if (auto fn = impl::grad_fn(output)) {
+            roots.emplace_back(fn, impl::output_nr(output));
         } else {
             // Leaf
-            auto meta = output.autograd_meta();
+            auto* meta = impl::get_autograd_meta(output);
             if (meta) {
-                if (!meta->grad_accumulator()) {
-                    meta->set_grad_accumulator(std::make_shared<AccumulateGrad>(output));
+                std::shared_ptr<Node> acc = meta->grad_accumulator();
+                if (!acc) {
+                    acc = std::make_shared<AccumulateGrad>(output);
+                    meta->set_grad_accumulator(acc);
                 }
-                roots.emplace_back(meta->grad_accumulator(), 0);
+                roots.emplace_back(std::move(acc), 0);
             }
         }
     }
-    
-    // 2. Identify capture nodes
-    std::unordered_map<Node*, std::vector<Tensor>> capture_grads;
-    
-    struct InputInfo {
-        Node* node;
-        uint32_t output_nr; // Index into the captured vector
-    };
-    std::vector<InputInfo> input_infos;
-    input_infos.reserve(inputs.size());
-    
+
+    // 2. Build the output edges (the tensors w.r.t. which we differentiate).
+    // The engine captures the input gradients of these edges' functions.
+    std::vector<Edge> output_edges;
+    output_edges.reserve(inputs.size());
+
     for (const auto& input : inputs) {
         if (!input.requires_grad()) {
             TP_THROW(RuntimeError, "One of the differentiated Tensors does not require grad");
         }
-        
-        Node* node = nullptr;
-        uint32_t output_nr = 0;
-        
-        if (auto fn = input.grad_fn()) {
-            // Non-leaf
-            node = fn.get();
-            if (input.autograd_meta()) {
-                output_nr = input.autograd_meta()->output_nr();
-            }
+
+        Edge edge;
+        if (auto fn = impl::grad_fn(input)) {
+            edge = Edge(fn, impl::output_nr(input));
         } else {
             // Leaf
-            auto meta = input.autograd_meta();
+            auto* meta = impl::get_autograd_meta(input);
             if (meta) {
-                if (!meta->grad_accumulator()) {
-                    meta->set_grad_accumulator(std::make_shared<AccumulateGrad>(input));
+                std::shared_ptr<Node> acc = meta->grad_accumulator();
+                if (!acc) {
+                    acc = std::make_shared<AccumulateGrad>(input);
+                    meta->set_grad_accumulator(acc);
                 }
-                node = meta->grad_accumulator().get();
-                // AccumulateGrad always has 1 input (index 0)
-                output_nr = 0;
+                edge = Edge(std::move(acc), 0);
             }
         }
-        
-        if (!node) {
-             TP_THROW(RuntimeError, "Could not determine gradient node for input");
+
+        if (!edge.is_valid()) {
+            TP_THROW(RuntimeError, "Could not determine gradient edge for input");
         }
-        
-        input_infos.push_back({node, output_nr});
-        capture_grads[node] = {}; // Initialize entry
+        output_edges.push_back(std::move(edge));
     }
-    
+
     // 3. Execute
-    Engine::get_default_engine().test_link(); // Ensure engine instance
-    Engine::get_default_engine().execute_graph(roots, root_grads, retain_graph, create_graph, &capture_grads);
-    
+    auto captured = Engine::get_default_engine().execute(roots, root_grads, retain_graph,
+                                                         create_graph, /*accumulate_grad=*/false,
+                                                         output_edges);
+
     // 4. Collect results
     std::vector<Tensor> results;
     results.reserve(inputs.size());
-    
+
     for (size_t i = 0; i < inputs.size(); ++i) {
-        Node* node = input_infos[i].node;
-        uint32_t output_nr = input_infos[i].output_nr;
-        
-        auto it = capture_grads.find(node);
-        bool found = false;
         Tensor res;
-        
-        if (it != capture_grads.end()) {
-            const auto& grads = it->second;
-            if (output_nr < grads.size() && grads[output_nr].defined()) {
-                res = grads[output_nr];
-                found = true;
-            }
-        }
-        
-        if (!found) {
+        if (i < captured.size() && captured[i].defined()) {
+            res = captured[i];
+        } else {
             if (!allow_unused) {
                 TP_THROW(RuntimeError, "One of the differentiated Tensors was not used in the graph");
             }
         }
-        results.push_back(res);
+        results.push_back(std::move(res));
     }
-    
+
     return results;
 }
 
@@ -341,6 +259,123 @@ void backward(const Tensor& tensor, const Tensor& gradient, bool retain_graph, b
     backward(tensors, gradients, retain_graph, create_graph);
 }
 
+Tensor as_strided(const Tensor& self, const std::vector<int64_t>& size,
+                  const std::vector<int64_t>& stride,
+                  std::optional<int64_t> storage_offset) {
+    bool requires_grad = self.requires_grad();
+    std::shared_ptr<Node> grad_fn;
+    if (requires_grad) {
+        grad_fn = std::make_shared<AsStridedBackward>(self.shape(), size, stride, storage_offset, self.dtype(), self.device());
+        grad_fn->add_next_edge_list(collect_next_edges(self));
+    }
+
+    Tensor result = self.as_strided(size, stride, storage_offset);
+    if (requires_grad && result.defined()) {
+        impl::set_grad_fn(result, grad_fn);
+    }
+    return result;
+}
+
+Tensor select(const Tensor& self, int64_t dim, int64_t index) {
+    bool requires_grad = self.requires_grad();
+    std::shared_ptr<Node> grad_fn;
+    if (requires_grad) {
+        grad_fn = std::make_shared<SelectBackward>(self.shape(), dim, index, self.dtype(), self.device());
+        grad_fn->add_next_edge_list(collect_next_edges(self));
+    }
+
+    Tensor result = self.select(dim, index);
+    if (requires_grad && result.defined()) {
+        impl::set_grad_fn(result, grad_fn);
+    }
+    return result;
+}
+
+Tensor slice(const Tensor& self, int64_t dim, int64_t start, int64_t end, int64_t step) {
+    bool requires_grad = self.requires_grad();
+    std::shared_ptr<Node> grad_fn;
+    if (requires_grad) {
+        grad_fn = std::make_shared<SliceBackward>(self.shape(), dim, start, end, step, self.dtype(), self.device());
+        grad_fn->add_next_edge_list(collect_next_edges(self));
+    }
+
+    Tensor result = self.slice(dim, start, end, step);
+    if (requires_grad && result.defined()) {
+        impl::set_grad_fn(result, grad_fn);
+    }
+    return result;
+}
+
+namespace {
+
+// Torch formats shapes in error messages as "[2, 4]".
+std::string expand_shape_string(const std::vector<int64_t>& shape) {
+    std::string out = "[";
+    for (size_t i = 0; i < shape.size(); ++i) {
+        if (i) out += ", ";
+        out += std::to_string(shape[i]);
+    }
+    return out + "]";
+}
+
+} // namespace
+
+Tensor expand(const Tensor& self, const std::vector<int64_t>& size) {
+    std::vector<int64_t> target_shape = size;
+    std::vector<int64_t> self_shape = static_cast<std::vector<int64_t>>(self.shape());
+    std::vector<int64_t> self_strides = self.strides();
+
+    int64_t ndim = target_shape.size();
+    int64_t self_ndim = self_shape.size();
+
+    if (ndim < self_ndim) {
+        // Torch wording (its legacy type repr replaced by the dtype name).
+        throw std::runtime_error("expand(tensorplay." + std::string(toString(self.dtype())) +
+                                 "{" + expand_shape_string(self_shape) + "}, size=[" +
+                                 expand_shape_string(target_shape).substr(1) +
+                                 "): the number of sizes provided (" + std::to_string(ndim) +
+                                 ") must be greater or equal to the number of dimensions in the tensor (" +
+                                 std::to_string(self_ndim) + ")");
+    }
+
+    std::vector<int64_t> new_strides(ndim);
+
+    // Match dimensions from back
+    for (int64_t i = 0; i < ndim; ++i) {
+        int64_t target_dim = target_shape[ndim - 1 - i];
+        int64_t self_dim_idx = self_ndim - 1 - i;
+
+        if (self_dim_idx >= 0) {
+            int64_t self_dim = self_shape[self_dim_idx];
+            int64_t self_stride = self_strides[self_dim_idx];
+
+            if (target_dim == -1) {
+                target_dim = self_dim;
+                target_shape[ndim - 1 - i] = target_dim;
+            }
+
+            if (self_dim == 1 && target_dim > 1) {
+                new_strides[ndim - 1 - i] = 0;
+            } else if (self_dim == target_dim) {
+                new_strides[ndim - 1 - i] = self_stride;
+            } else {
+                // Torch wording, including the double spaces after periods.
+                throw std::runtime_error("The expanded size of the tensor (" +
+                                         std::to_string(target_dim) + ") must match the existing size (" +
+                                         std::to_string(self_dim) + ") at non-singleton dimension " +
+                                         std::to_string(ndim - 1 - i) + ".  Target sizes: [" +
+                                         expand_shape_string(target_shape).substr(1) + ".  Tensor sizes: [" +
+                                         expand_shape_string(self_shape).substr(1));
+            }
+        } else {
+            // New dimension at front
+            if (target_dim == -1) throw std::runtime_error("expand: cannot infer size for new dimension");
+            new_strides[ndim - 1 - i] = 0; // Broadcast
+        }
+    }
+
+    return as_strided(self, target_shape, new_strides);
+}
 
 } // namespace tpx
 } // namespace tensorplay

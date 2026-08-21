@@ -7,6 +7,7 @@
 #include <vector>
 
 #ifdef USE_CUDA
+#include "CUDARuntime.h"
 #include <cuda_runtime.h>
 #endif
 
@@ -33,7 +34,7 @@ void copy_recursive(
     int64_t self_offset, int64_t src_offset) {
     
     if (sizes.empty()) { // Scalar case
-        self_data[self_offset] = static_cast<T_SELF>(src_data[src_offset]);
+        self_data[self_offset] = cast_value<T_SELF>(src_data[src_offset]);
         return;
     }
 
@@ -42,7 +43,7 @@ void copy_recursive(
         int64_t self_stride = self_strides[dim];
         int64_t src_stride = src_strides[dim];
         for (int64_t i = 0; i < n; ++i) {
-            self_data[self_offset + i * self_stride] = static_cast<T_SELF>(src_data[src_offset + i * src_stride]);
+            self_data[self_offset + i * self_stride] = cast_value<T_SELF>(src_data[src_offset + i * src_stride]);
         }
     } else {
         int64_t n = sizes[dim];
@@ -68,35 +69,50 @@ void dispatch_dtype(DType dtype, F&& callback) {
     }
 
     switch (dtype) {
-        TENSORPLAY_FORALL_SCALAR_TYPES(DISPATCH_CASE)
+        TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(DISPATCH_CASE)
         default:
             throw std::runtime_error("Unsupported dtype in dispatch");
     }
     #undef DISPATCH_CASE
 }
 
-Tensor& copy_kernel(Tensor& self, const Tensor& src) {
+Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
     if (!self.device().is_cpu()) {
         throw std::runtime_error("copy_kernel (CPU) called with non-CPU destination");
     }
 
     if (src.device().is_cuda()) {
 #ifdef USE_CUDA
-        if (src.is_contiguous()) {
-            size_t nbytes = self.numel() * self.itemsize();
-            cudaError_t err = cudaMemcpy(self.data_ptr(), src.data_ptr(), nbytes, cudaMemcpyDeviceToHost);
-            if (err != cudaSuccess) {
-                 throw std::runtime_error(std::string("CUDA Copy D2H Error: ") + cudaGetErrorString(err));
+        cuda::CUDAGuard device_guard(src.device());
+        auto stream = cuda::getCurrentCUDAStream(static_cast<int>(src.device().index()));
+
+        Tensor src_ready = src;
+        if (!src.is_contiguous() || src.dtype() != self.dtype()) {
+            src_ready = Tensor(static_cast<std::vector<int64_t>>(src.shape()), self.dtype(), src.device());
+            src_ready.copy_(src);
+        }
+
+        const size_t nbytes = self.numel() * self.itemsize();
+        if (self.is_contiguous()) {
+            cuda::checkCuda(cudaMemcpyAsync(self.data_ptr(), src_ready.data_ptr(), nbytes,
+                                            cudaMemcpyDeviceToHost, stream.stream()),
+                            "cudaMemcpyAsync (D2H)");
+            if (non_blocking && self.is_pinned()) {
+                cuda::recordPinnedStream(
+                    self.unsafeGetTensorImpl()->storage().data(), stream);
+            } else {
+                // Ordinary CPU storage may be consumed immediately after
+                // copy_ returns, so the host-visible result must be complete.
+                stream.synchronize();
             }
         } else {
-            // Source is non-contiguous CUDA tensor.
-            // We must make it contiguous on device first, then copy.
-            Tensor src_contig = src.contiguous();
-            size_t nbytes = self.numel() * self.itemsize();
-            cudaError_t err = cudaMemcpy(self.data_ptr(), src_contig.data_ptr(), nbytes, cudaMemcpyDeviceToHost);
-            if (err != cudaSuccess) {
-                 throw std::runtime_error(std::string("CUDA Copy D2H Error (from non-contig): ") + cudaGetErrorString(err));
-            }
+            Tensor host_contiguous(static_cast<std::vector<int64_t>>(self.shape()),
+                                   self.dtype(), Device(DeviceType::CPU));
+            cuda::checkCuda(cudaMemcpyAsync(host_contiguous.data_ptr(), src_ready.data_ptr(), nbytes,
+                                            cudaMemcpyDeviceToHost, stream.stream()),
+                            "cudaMemcpyAsync (D2H staging)");
+            stream.synchronize();
+            self.copy_(host_contiguous);
         }
         return self;
 #else
@@ -247,20 +263,8 @@ Tensor embedding_cpu(const Tensor& weight, const Tensor& indices, int64_t paddin
     return output;
 }
 
-#include <iostream>
-
 Tensor embedding_dense_backward_cpu(const Tensor& grad_output, const Tensor& indices, int64_t num_weights, int64_t padding_idx, bool scale_grad_by_freq) {
     // 1. Check inputs
-    // DEBUG
-    std::cout << "DEBUG: embedding_dense_backward_cpu" << std::endl;
-    std::cout << "  grad_output shape: [";
-    for(auto d : grad_output.shape()) std::cout << d << ", ";
-    std::cout << "]" << std::endl;
-    std::cout << "  indices shape: [";
-    for(auto d : indices.shape()) std::cout << d << ", ";
-    std::cout << "]" << std::endl;
-    std::cout << "  num_weights: " << num_weights << std::endl;
-
     if (indices.dtype() != DType::Int64 && indices.dtype() != DType::Int32) {
         TP_THROW(TypeError, "embedding_dense_backward: indices must be Int64 or Int32");
     }
