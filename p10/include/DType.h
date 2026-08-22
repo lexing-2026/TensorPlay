@@ -6,6 +6,7 @@
 
 #include "Half.h"
 #include "BFloat16.h"
+#include "Float8.h"
 
 // MSVC workaround: Avoid macro expansion issues in enum definition
 // Undefine common Windows/System macros that might conflict with our enum names
@@ -83,6 +84,8 @@ enum class ScalarType : int8_t {
     ComplexDouble,
     ComplexHalf,
     BComplex32,
+    Float8_e4m3fn,
+    Float8_e5m2,
     Undefined,
     NumOptions
 };
@@ -180,6 +183,17 @@ inline constexpr bool is_complex_type_v = is_complex_type<T>::value;
     _(std::complex<float>, ComplexFloat)               \
     _(std::complex<double>, ComplexDouble)             \
     _(std::complex<tensorplay::BFloat16>, BComplex32)
+
+// Float8 family: opt-in tier -- only conversion/copy/item paths dispatch on
+// these initially (mirrors ATen keeping float8 out of the generic kernel
+// lists until per-op support lands).
+#define TENSORPLAY_FORALL_FP8_TYPES(_) \
+    _(tensorplay::Float8_e4m3fn, Float8_e4m3fn)   \
+    _(tensorplay::Float8_e5m2, Float8_e5m2)
+
+#define TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX_AND_FP8(_) \
+    TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(_)             \
+    TENSORPLAY_FORALL_FP8_TYPES(_)
 
 // DType is an alias for ScalarType for compatibility
 using DType = ScalarType;

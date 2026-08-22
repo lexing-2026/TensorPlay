@@ -3,6 +3,7 @@
 #include "Scalar.h"
 #include "TypePromotion.h"
 #include "Utils.h"
+#include "SparseKernels.h"
 #include <cstring>
 #include <vector>
 
@@ -69,7 +70,7 @@ void dispatch_dtype(DType dtype, F&& callback) {
     }
 
     switch (dtype) {
-        TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(DISPATCH_CASE)
+        TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX_AND_FP8(DISPATCH_CASE)
         default:
             throw std::runtime_error("Unsupported dtype in dispatch");
     }
@@ -339,12 +340,27 @@ Tensor embedding_dense_backward_cpu(const Tensor& grad_output, const Tensor& ind
     return grad_weight;
 }
 
+Tensor embedding_backward_cpu(const Tensor& grad_output, const Tensor& indices,
+                              int64_t num_weights, int64_t padding_idx,
+                              bool scale_grad_by_freq, bool sparse) {
+    if (sparse) {
+        return embedding_sparse_backward_cpu(grad_output, indices, num_weights,
+                                             padding_idx, scale_grad_by_freq);
+    }
+    return embedding_dense_backward_cpu(grad_output, indices, num_weights,
+                                       padding_idx, scale_grad_by_freq);
+}
+
 TENSORPLAY_LIBRARY_IMPL(CPU, CopyKernels) {
     m.impl("to", to_kernel);
     m.impl("masked_select", masked_select_cpu);
     m.impl("copy_", copy_kernel);
+    m.impl("sparse_coo_tensor", sparse_coo_tensor_cpu);
+    m.impl("sparse_mask", sparse_mask_cpu);
     m.impl("embedding", embedding_cpu);
     m.impl("embedding_dense_backward", embedding_dense_backward_cpu);
+    m.impl("embedding_sparse_backward", embedding_sparse_backward_cpu);
+    m.impl("embedding_backward", embedding_backward_cpu);
 }
 
 } // namespace cpu

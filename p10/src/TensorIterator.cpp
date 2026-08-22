@@ -697,6 +697,16 @@ void TensorIteratorBase::select_all_keeping_dim(int start_dim, const DimVector& 
   }
 }
 
+TensorIterator TensorIterator::binary_op(Tensor& out, const Tensor& a, const Tensor& b) {
+  return TensorIteratorConfig()
+    .add_owned_output(out)
+    .add_owned_const_input(a)
+    .add_owned_const_input(b)
+    .promote_inputs_to_common_dtype(true)
+    .check_all_same_dtype(false)
+    .build();
+}
+
 TensorIterator TensorIterator::reduce_op(Tensor& out, const Tensor& a) {
   TP_CHECK(out.defined(), "output must be defined");
   return TensorIteratorConfig()

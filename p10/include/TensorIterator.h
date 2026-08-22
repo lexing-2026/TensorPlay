@@ -422,6 +422,11 @@ struct TensorIterator final : public TensorIteratorBase {
   // Slicing is OK, TensorIterator guaranteed NOT to have any fields
   TensorIterator(const TensorIteratorBase& iter) : TensorIteratorBase(iter) {}
 
+  /// ATen-style factory for broadcast binary ops: output resized to the
+  /// broadcast shape, inputs promoted to the common dtype.  Inputs may be
+  /// arbitrarily strided; reorder/coalesce apply.
+  static TensorIterator binary_op(Tensor& out, const Tensor& a, const Tensor& b);
+
   static TensorIterator reduce_op(Tensor& out, const Tensor& a);
   static TensorIterator reduce_op(
       Tensor& out1,

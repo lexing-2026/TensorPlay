@@ -3,6 +3,7 @@
 #include "Scalar.h"
 #include "TypePromotion.h"
 #include "Utils.h"
+#include "TensorIteratorOps.h"
 #include "Exception.h"
 #include <vector>
 #include <cmath>
@@ -42,23 +43,9 @@ Tensor comparison_kernel_impl(const Tensor& self, const Tensor& other, Op op) {
     Tensor self_casted = (self.dtype() == common_dtype) ? self : self.to(common_dtype);
     Tensor other_casted = (other.dtype() == common_dtype) ? other : other.to(common_dtype);
 
-    Tensor self_expanded = self_casted.expand(out_shape);
-    Tensor other_expanded = other_casted.expand(out_shape);
-    
-    #define OP_CASE(ctype, name) \
-    case DType::name: { \
-        apply_op_recursive<bool, ctype>(result.data_ptr<bool>(), result.strides(), \
-                                 self_expanded, self_expanded.strides(), \
-                                 other_expanded, other_expanded.strides(), \
-                                 0, 0, 0, 0, out_shape, op); \
-        break; \
-    }
-
-    switch (common_dtype) {
-        TENSORPLAY_FORALL_SCALAR_TYPES(OP_CASE)
-        default: TP_THROW(TypeError, "comparison: unsupported dtype");
-    }
-    #undef OP_CASE
+    // TensorIterator owns broadcast/reorder/coalesce/parallelism; no
+    // materialized expansion needed.
+    ti_apply_compare(result, self_casted, other_casted, common_dtype, op);
     
     return result;
 }
@@ -200,19 +187,7 @@ Tensor maximum_minimum_kernel_impl(const Tensor& self, const Tensor& other, Op o
     Tensor result = Tensor::empty(out_shape, common_dtype, self.device());
     Tensor a = self.dtype() == common_dtype ? self : self.to(common_dtype);
     Tensor b = other.dtype() == common_dtype ? other : other.to(common_dtype);
-    auto a_strides = broadcast_strides(a, out_shape);
-    auto b_strides = broadcast_strides(b, out_shape);
-    #define MAXMIN_CASE(ctype, name) \
-        case DType::name: { \
-            apply_op_recursive<ctype>(result.data_ptr<ctype>(), result.strides(), \
-                a, a_strides, b, b_strides, 0, 0, 0, 0, out_shape, op); \
-            break; \
-        }
-    switch (common_dtype) {
-        TENSORPLAY_FORALL_SCALAR_TYPES(MAXMIN_CASE)
-        default: TP_THROW(TypeError, "maximum/minimum: unsupported dtype");
-    }
-    #undef MAXMIN_CASE
+    ti_apply_binary(result, a, b, op);
     return result;
 }
 

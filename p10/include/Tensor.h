@@ -8,6 +8,7 @@
 #include "Macros.h"
 #include "DType.h"
 #include "Device.h"
+#include "Generator.h"
 #include "Scalar.h"
 #include "TensorImpl.h"
 #include "Dispatcher.h"
@@ -157,6 +158,22 @@ public:
     Tensor pin_memory() const;
     Tensor contiguous() const;
     bool is_sparse() const;
+    bool is_coalesced() const;
+    int64_t sparse_dim() const;
+    int64_t dense_dim() const;
+    Tensor _indices() const;
+    Tensor _values() const;
+    Tensor coalesce() const;
+    Tensor sparse_mask(const Tensor& mask) const;
+
+    // Internal constructor used by the native sparse COO factory and
+    // sparse embedding backward.  The public Python surface is generated
+    // from sparse_coo_tensor(...) below; keeping the representation builder
+    // here avoids routing component tensors through a dense temporary.
+    static Tensor make_sparse_coo_tensor(const Tensor& indices,
+                                         const Tensor& values,
+                                         const std::vector<int64_t>& size,
+                                         bool is_coalesced = false);
     
     // Autograd methods (delegated to the AutogradMeta extension point on
     // TensorImpl; the concrete implementation lives in the tpx library).
@@ -171,7 +188,12 @@ public:
     
     // Data access
     template<typename T>
-    T* data_ptr() const { return impl_ ? impl_->data<T>() : nullptr; }
+    T* data_ptr() const {
+        if (is_sparse()) {
+            TP_THROW(RuntimeError, "data_ptr() is not supported for sparse COO tensors");
+        }
+        return impl_ ? impl_->data<T>() : nullptr;
+    }
     
     void* data_ptr() const;
     
@@ -203,7 +225,7 @@ public:
 
     // Modification
     // Tensor& copy_(const Tensor& src);
-    // Tensor& fill_(Scalar value);
+
     
     // Scalar access
     Scalar item() const;

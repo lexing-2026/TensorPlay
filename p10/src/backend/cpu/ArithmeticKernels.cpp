@@ -1,7 +1,10 @@
 #include "Tensor.h"
+#include "SparseKernels.h"
 #include "Dispatcher.h"
 #include "Scalar.h"
 #include "TypePromotion.h"
+#include "TensorIterator.h"
+#include "TensorIteratorOps.h"
 #include "Utils.h"
 #include "Exception.h"
 #include "Parallel.h"
@@ -81,23 +84,41 @@ Tensor binary_op_kernel_impl(const Tensor& self, const Tensor& other, Op op, Mkl
         Tensor self_casted = (self.dtype() == result_dtype) ? self : self.to(result_dtype);
         Tensor other_casted = (other.dtype() == result_dtype) ? other : other.to(result_dtype);
 
-        Tensor self_expanded = self_casted.expand(out_shape);
-        Tensor other_expanded = other_casted.expand(out_shape);
-        
-        #define OP_CASE(ctype, name) \
+        // Route through the shared TensorIterator: it broadcasts, reorders
+        // dimensions for memory locality, coalesces adjacent dims and
+        // parallelizes the inner loop (the old path was a serial recursion).
+        TensorIterator iter = TensorIterator::binary_op(result, self_casted, other_casted);
+
+        #define TI_OP_CASE(ctype, name) \
         case DType::name: { \
-            apply_op_recursive<ctype>(result.data_ptr<ctype>(), result.strides(), \
-                                     self_expanded, self_expanded.strides(), \
-                                     other_expanded, other_expanded.strides(), \
-                                     0, 0, 0, 0, out_shape, op); \
+            iter.for_each([&op](char** data, const int64_t* strides, int64_t n) { \
+                char* r = data[0]; \
+                const char* a = data[1]; \
+                const char* b = data[2]; \
+                /* strides are in bytes */ \
+                if (strides[0] == static_cast<int64_t>(sizeof(ctype)) && \
+                    strides[1] == static_cast<int64_t>(sizeof(ctype)) && \
+                    strides[2] == static_cast<int64_t>(sizeof(ctype))) { \
+                    ctype* rp = reinterpret_cast<ctype*>(r); \
+                    const ctype* ap = reinterpret_cast<const ctype*>(a); \
+                    const ctype* bp = reinterpret_cast<const ctype*>(b); \
+                    for (int64_t i = 0; i < n; ++i) rp[i] = op(ap[i], bp[i]); \
+                } else { \
+                    for (int64_t i = 0; i < n; ++i) { \
+                        *reinterpret_cast<ctype*>(r + i * strides[0]) = op( \
+                            *reinterpret_cast<const ctype*>(a + i * strides[1]), \
+                            *reinterpret_cast<const ctype*>(b + i * strides[2])); \
+                    } \
+                } \
+            }); \
             break; \
         }
 
         switch (result_dtype) {
-            TENSORPLAY_FORALL_SCALAR_TYPES(OP_CASE)
+            TENSORPLAY_FORALL_SCALAR_TYPES(TI_OP_CASE)
             default: TP_THROW(TypeError, "binary_op: unsupported dtype");
         }
-        #undef OP_CASE
+        #undef TI_OP_CASE
     }
     
     return result;
@@ -430,33 +451,29 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
         Tensor self_casted = (self.dtype() == result_dtype) ? self : self.to(result_dtype);
         Tensor other_casted = (other.dtype() == result_dtype) ? other : other.to(result_dtype);
         
-        Tensor self_expanded = self_casted.expand(out_shape);
-        Tensor other_expanded = other_casted.expand(out_shape);
-        
-        #define OP_CASE(ctype, name) \
+        // TensorIterator path: broadcast/reorder/coalesce/parallel in one.
+        TensorIterator iter = TensorIterator::binary_op(result, self_casted, other_casted);
+        #define TI_ALPHA_CASE(ctype, name) \
         case DType::name: { \
-            auto op = [alpha](ctype a, ctype b) -> ctype { \
-                if constexpr (std::is_floating_point_v<ctype>) { \
-                    return a + alpha.to<ctype>() * b; \
-                } else { \
-                    if (alpha.isFloatingPoint()) { \
-                        return static_cast<ctype>(a + alpha.toDouble() * b); \
-                    } else { \
-                        return static_cast<ctype>(a + alpha.to<int64_t>() * b); \
-                    } \
-                } \
-            }; \
-            apply_op_recursive<ctype>(result.data_ptr<ctype>(), result.strides(), \
-                                     self_expanded, self_expanded.strides(), \
-                                     other_expanded, other_expanded.strides(), \
-                                     0, 0, 0, 0, out_shape, op); \
+            iter.for_each([&alpha](char** data, const int64_t* strides, int64_t n) { \
+                using ctype_ = ctype; \
+                auto op = [alpha](ctype_ x, ctype_ y) -> ctype_ { \
+                    if constexpr (std::is_floating_point_v<ctype_>) return x + alpha.to<ctype_>() * y; \
+                    else if (alpha.isFloatingPoint()) return static_cast<ctype_>(x + alpha.toDouble() * y); \
+                    else return static_cast<ctype_>(x + alpha.to<int64_t>() * y); \
+                }; \
+                for (int64_t i = 0; i < n; ++i) \
+                    *reinterpret_cast<ctype_*>(data[0] + i * strides[0]) = op( \
+                        *reinterpret_cast<const ctype_*>(data[1] + i * strides[1]), \
+                        *reinterpret_cast<const ctype_*>(data[2] + i * strides[2])); \
+            }); \
             break; \
         }
         switch (result_dtype) {
-            TENSORPLAY_FORALL_SCALAR_TYPES(OP_CASE)
-            default: TP_THROW(TypeError, "add: unsupported dtype");
+            TENSORPLAY_FORALL_SCALAR_TYPES(TI_ALPHA_CASE)
+            default: TP_THROW(TypeError, "add_out: unsupported dtype");
         }
-        #undef OP_CASE
+        #undef TI_ALPHA_CASE
     }
     return result;
 }
@@ -788,6 +805,9 @@ Tensor fused_mul_add_scalar_kernel(const Tensor& self, Scalar other, Scalar adde
 // --- Inplace Binary Kernels ---
 
 Tensor& add_inplace_kernel(Tensor& self, const Tensor& other, Scalar alpha) {
+    if (other.is_sparse()) {
+        return add_sparse_to_dense_cpu(self, other, alpha);
+    }
     std::vector<int64_t> out_shape;
     try {
         out_shape = broadcast_shapes(static_cast<std::vector<int64_t>>(self.shape()), static_cast<std::vector<int64_t>>(other.shape()));
@@ -1124,35 +1144,15 @@ Tensor& add_inplace_kernel(Tensor& self, const Tensor& other, Scalar alpha) {
     }
     
     if (!optimized) {
-        Tensor other_expanded = other.expand(out_shape);
-        if (other_expanded.dtype() != self.dtype()) {
-            other_expanded = other_expanded.to(self.dtype());
+        Tensor other_c = (other.dtype() == self.dtype()) ? other : other.to(self.dtype());
+        { auto op = [alpha](auto x, auto y) {
+            using T = std::decay_t<decltype(x)>;
+            if constexpr (std::is_floating_point_v<T>) return x + alpha.to<T>() * y;
+            else if (alpha.isFloatingPoint()) return static_cast<T>(x + alpha.toDouble() * y);
+            else return static_cast<T>(x + alpha.to<int64_t>() * y);
+        };
+            ti_apply_binary(self, self, other_c, op);
         }
-        
-        #define OP_CASE(ctype, name) \
-        case DType::name: { \
-            auto op = [alpha](ctype a, ctype b) -> ctype { \
-                if constexpr (std::is_floating_point_v<ctype>) { \
-                    return a + alpha.to<ctype>() * b; \
-                } else { \
-                    if (alpha.isFloatingPoint()) { \
-                        return static_cast<ctype>(a + alpha.toDouble() * b); \
-                    } else { \
-                        return static_cast<ctype>(a + alpha.to<int64_t>() * b); \
-                    } \
-                } \
-            }; \
-            apply_op_recursive<ctype>(self.data_ptr<ctype>(), self.strides(), \
-                                     self, self.strides(), \
-                                     other_expanded, other_expanded.strides(), \
-                                     0, 0, 0, 0, out_shape, op); \
-            break; \
-        }
-        switch (self.dtype()) {
-            TENSORPLAY_FORALL_SCALAR_TYPES(OP_CASE)
-            default: TP_THROW(TypeError, "add_: unsupported dtype");
-        }
-        #undef OP_CASE
     }
     return self;
 }
@@ -1281,24 +1281,10 @@ Tensor& mul_inplace_kernel(Tensor& self, const Tensor& other) {
     }
     
     if (!optimized) {
-        Tensor other_expanded = other.expand(out_shape);
-        if (other_expanded.dtype() != self.dtype()) other_expanded = other_expanded.to(self.dtype());
-        
-        auto op = [](auto a, auto b) { return a * b; };
-        
-        #define OP_CASE(ctype, name) \
-        case DType::name: { \
-            apply_op_recursive<ctype>(self.data_ptr<ctype>(), self.strides(), \
-                                     self, self.strides(), \
-                                     other_expanded, other_expanded.strides(), \
-                                     0, 0, 0, 0, out_shape, op); \
-            break; \
+        Tensor other_c = (other.dtype() == self.dtype()) ? other : other.to(self.dtype());
+        { auto op = [](auto x, auto y) { return x * y; };
+            ti_apply_binary(self, self, other_c, op);
         }
-        switch (self.dtype()) {
-            TENSORPLAY_FORALL_SCALAR_TYPES(OP_CASE)
-            default: TP_THROW(TypeError, "mul_: unsupported dtype");
-        }
-        #undef OP_CASE
     }
     return self;
 }
@@ -1416,31 +1402,14 @@ Tensor& div_inplace_kernel(Tensor& self, const Tensor& other) {
     }
     
     if (!optimized) {
-        Tensor other_expanded = other.expand(out_shape);
-        if (other_expanded.dtype() != self.dtype()) other_expanded = other_expanded.to(self.dtype());
-        
-        auto op = [](auto a, auto b) {
-            using T = std::decay_t<decltype(a)>;
-            if constexpr (std::is_same_v<T, bool>) {
-                return static_cast<bool>(static_cast<int>(a) / static_cast<int>(b));
-            } else {
-                return a / b;
-            }
+        Tensor other_c = (other.dtype() == self.dtype()) ? other : other.to(self.dtype());
+        { auto op = [](auto x, auto y) {
+            using T = std::decay_t<decltype(x)>;
+            if constexpr (std::is_same_v<T, bool>) return static_cast<bool>(static_cast<int>(x) / static_cast<int>(y));
+            else return x / y;
         };
-        
-        #define OP_CASE(ctype, name) \
-        case DType::name: { \
-            apply_op_recursive<ctype>(self.data_ptr<ctype>(), self.strides(), \
-                                     self, self.strides(), \
-                                     other_expanded, other_expanded.strides(), \
-                                     0, 0, 0, 0, out_shape, op); \
-            break; \
+            ti_apply_binary(self, self, other_c, op);
         }
-        switch (self.dtype()) {
-            TENSORPLAY_FORALL_SCALAR_TYPES(OP_CASE)
-            default: TP_THROW(TypeError, "div_: unsupported dtype");
-        }
-        #undef OP_CASE
     }
     return self;
 }

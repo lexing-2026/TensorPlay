@@ -3,6 +3,7 @@
 #include "Tensor.h"
 #include "TensorImpl.h"
 #include "Storage.h"
+#include "SparseKernels.h"
 #include "Utils.h"
 #include <iostream>
 #include <cstring>
@@ -76,10 +77,75 @@ Tensor::Tensor(const std::vector<int64_t>& sizes, Scalar fill_value, const Devic
     fill_(fill_value);
 }
 
+Tensor Tensor::make_sparse_coo_tensor(const Tensor& indices,
+                                      const Tensor& values,
+                                      const std::vector<int64_t>& size,
+                                      bool is_coalesced) {
+    if (!indices.defined() || !values.defined()) {
+        TP_THROW(ValueError, "sparse_coo_tensor: indices and values must be defined");
+    }
+    if (indices.device() != values.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "sparse_coo_tensor: indices and values must be on the same device");
+    }
+    if (indices.dim() != 2) {
+        TP_THROW(ValueError, "sparse_coo_tensor: indices must be a 2-D tensor");
+    }
+    if (indices.dtype() != DType::Int64) {
+        // ATen canonicalizes both int32 and int64 COO indices to int64.
+        if (indices.dtype() != DType::Int32) {
+            TP_THROW(TypeError, "sparse_coo_tensor: indices must be Int32 or Int64");
+        }
+    }
+    if (size.size() < static_cast<size_t>(indices.size(0))) {
+        TP_THROW(ValueError, "sparse_coo_tensor: size has fewer dimensions than indices");
+    }
+    for (int64_t dim_size : size) {
+        if (dim_size < 0) {
+            TP_THROW(ValueError, "sparse_coo_tensor: size entries must be non-negative");
+        }
+    }
+
+    Tensor canonical_indices = indices.dtype() == DType::Int64
+        ? indices
+        : indices.to(DType::Int64);
+    const int64_t sparse_dim = canonical_indices.size(0);
+    const int64_t nnz = canonical_indices.size(1);
+    if (values.dim() == 0 || values.size(0) != nnz) {
+        TP_THROW(ValueError,
+                 "sparse_coo_tensor: values first dimension must equal indices nnz");
+    }
+    if (values.dim() - 1 != static_cast<int64_t>(size.size()) - sparse_dim) {
+        TP_THROW(ValueError,
+                 "sparse_coo_tensor: values dense dimensions do not match size");
+    }
+    for (int64_t i = 0; i < values.dim() - 1; ++i) {
+        if (values.size(i + 1) != size[static_cast<size_t>(sparse_dim + i)]) {
+            TP_THROW(ValueError,
+                     "sparse_coo_tensor: values shape does not match sparse size");
+        }
+    }
+
+    // Construct only the logical TensorImpl.  A sparse tensor must not first
+    // allocate storage for its full logical dense shape; large embeddings
+    // would otherwise briefly materialize the entire parameter.
+    Tensor result(std::make_shared<TensorImpl>(
+        size, values.dtype(), values.device(), /*allocate_storage=*/false));
+    result.unsafeGetTensorImpl()->set_sparse_state(
+        canonical_indices.unsafeGetTensorImpl(),
+        values.unsafeGetTensorImpl(),
+        size,
+        is_coalesced);
+    return result;
+}
+
 int64_t Tensor::dim() const { return impl_ ? impl_->dim() : 0; }
 int64_t Tensor::numel() const { return impl_ ? impl_->numel() : 0; }
 Size Tensor::shape() const { return impl_ ? Size(impl_->sizes()) : Size(); }
-std::vector<int64_t> Tensor::strides() const { return impl_ ? impl_->strides().vec() : std::vector<int64_t>(); }
+std::vector<int64_t> Tensor::strides() const {
+    if (is_sparse()) return std::vector<int64_t>(static_cast<size_t>(dim()), 0);
+    return impl_ ? impl_->strides().vec() : std::vector<int64_t>();
+}
 int64_t Tensor::size(int64_t dim) const {
     if (!impl_) return 0;
     if (dim < 0) dim += impl_->dim();
@@ -87,6 +153,7 @@ int64_t Tensor::size(int64_t dim) const {
 }
 int64_t Tensor::stride(int64_t dim) const {
     if (!impl_) return 0;
+    if (is_sparse()) return 0;
     if (dim < 0) dim += impl_->dim();
     return impl_->stride(dim);
 }
@@ -163,11 +230,73 @@ Tensor Tensor::pin_memory() const {
 #endif
 }
 
-bool Tensor::is_sparse() const { return false; }
+bool Tensor::is_sparse() const { return impl_ && impl_->is_sparse(); }
 
-void* Tensor::data_ptr() const { return impl_ ? impl_->data() : nullptr; }
+bool Tensor::is_coalesced() const {
+    if (!is_sparse()) {
+        TP_THROW(RuntimeError,
+                 "is_coalesced expected sparse coordinate tensor layout");
+    }
+    return impl_->is_coalesced();
+}
+
+int64_t Tensor::sparse_dim() const {
+    if (!is_sparse()) return 0;
+    return _indices().dim() == 0 ? 0 : _indices().size(0);
+}
+
+int64_t Tensor::dense_dim() const {
+    if (!is_sparse()) return dim();
+    return _values().dim() == 0 ? 0 : _values().dim() - 1;
+}
+
+Tensor Tensor::_indices() const {
+    if (!is_sparse()) TP_THROW(RuntimeError, "_indices() is only defined for sparse COO tensors");
+    return Tensor(impl_->sparse_indices_impl());
+}
+
+Tensor Tensor::_values() const {
+    if (!is_sparse()) TP_THROW(RuntimeError, "_values() is only defined for sparse COO tensors");
+    return Tensor(impl_->sparse_values_impl());
+}
+
+Tensor Tensor::coalesce() const {
+    if (!is_sparse()) TP_THROW(RuntimeError, "coalesce() is only defined for sparse COO tensors");
+    if (is_coalesced()) return *this;
+    if (device().is_cpu()) return cpu::coalesce_sparse_cpu(*this);
+#ifdef USE_CUDA
+    if (device().is_cuda()) return cuda::coalesce_sparse_cuda(*this);
+#endif
+    TP_THROW(NotImplementedError, "coalesce() is not implemented for this device");
+}
+
+Tensor Tensor::sparse_mask(const Tensor& mask) const {
+    if (is_sparse()) TP_THROW(RuntimeError, "sparse_mask(): self must be dense");
+    if (!mask.is_sparse()) TP_THROW(RuntimeError, "sparse_mask(): mask must be sparse COO");
+    if (shape() != mask.shape()) {
+        TP_THROW(RuntimeError, "sparse_mask(): operands have incompatible sizes");
+    }
+    if (device() != mask.device()) {
+        TP_THROW(DeviceMismatchError, "sparse_mask(): operands must be on the same device");
+    }
+    if (device().is_cpu()) return cpu::sparse_mask_cpu(*this, mask);
+#ifdef USE_CUDA
+    if (device().is_cuda()) return cuda::sparse_mask_cuda(*this, mask);
+#endif
+    TP_THROW(NotImplementedError, "sparse_mask() is not implemented for this device");
+}
+
+void* Tensor::data_ptr() const {
+    if (is_sparse()) {
+        TP_THROW(RuntimeError, "data_ptr() is not supported for sparse COO tensors");
+    }
+    return impl_ ? impl_->data() : nullptr;
+}
 
 Scalar Tensor::item() const {
+    if (is_sparse()) {
+        TP_THROW(RuntimeError, "item() is not supported for sparse COO tensors");
+    }
     if (numel() != 1) {
         TP_THROW(ValueError, "item() only supported for 1-element tensors");
     }
@@ -181,6 +310,8 @@ Scalar Tensor::item() const {
         case DType::Float64: return Scalar(*data_ptr<double>());
         case DType::Float16: return Scalar(static_cast<float>(*data_ptr<Half>()));
         case DType::BFloat16: return Scalar(static_cast<float>(*data_ptr<BFloat16>()));
+        case DType::Float8_e4m3fn: return Scalar(static_cast<float>(*data_ptr<Float8_e4m3fn>()));
+        case DType::Float8_e5m2: return Scalar(static_cast<float>(*data_ptr<Float8_e5m2>()));
         case DType::Int8: return Scalar(static_cast<int64_t>(*data_ptr<int8_t>()));
         case DType::Int16: return Scalar(static_cast<int64_t>(*data_ptr<int16_t>()));
         case DType::Int32: return Scalar(static_cast<int64_t>(*data_ptr<int32_t>()));
@@ -332,6 +463,16 @@ void set_printoptions(int64_t edge_items, int64_t threshold, int64_t precision, 
 
 std::string Tensor::toString() const {
     if (!impl_) return "Tensor(Undefined)";
+
+    if (is_sparse()) {
+        std::stringstream sparse;
+        sparse << "tensor(indices=" << _indices().toString()
+               << ", values=" << _values().toString()
+               << ", size=" << shape()
+               << ", nnz=" << _indices().size(1)
+               << ", layout=sparse_coo)";
+        return sparse.str();
+    }
     
     std::stringstream ss;
 
@@ -572,6 +713,11 @@ Tensor& Tensor::operator/=(Scalar other) {
 
 Tensor Tensor::clone() const {
     if (!impl_) return Tensor();
+    if (is_sparse()) {
+        return make_sparse_coo_tensor(_indices().clone(), _values().clone(),
+                                      static_cast<std::vector<int64_t>>(shape()),
+                                      is_coalesced());
+    }
     Tensor t(impl_->sizes(), dtype(), device());
     // Match the native contiguous clone path used by Torch: avoid routing
     // every same-dtype contiguous clone through the dispatcher.  Optimizer
@@ -594,6 +740,12 @@ Tensor Tensor::clone() const {
 
 Tensor Tensor::to(DType dtype, bool non_blocking, bool copy) const {
     if (!impl_) return Tensor();
+    if (is_sparse()) {
+        if (dtype == this->dtype()) return copy ? clone() : *this;
+        return make_sparse_coo_tensor(
+            _indices(), _values().to(dtype, non_blocking, copy),
+            static_cast<std::vector<int64_t>>(shape()), is_coalesced());
+    }
     if (this->dtype() == dtype) {
         return copy ? clone() : *this;
     }
@@ -604,6 +756,13 @@ Tensor Tensor::to(DType dtype, bool non_blocking, bool copy) const {
 
 Tensor Tensor::to(Device device, bool non_blocking, bool copy) const {
     if (!impl_) return Tensor();
+    if (is_sparse()) {
+        if (this->device() == device) return copy ? clone() : *this;
+        return make_sparse_coo_tensor(
+            _indices().to(device, non_blocking, copy),
+            _values().to(device, non_blocking, copy),
+            static_cast<std::vector<int64_t>>(shape()), is_coalesced());
+    }
     if (this->device() == device) {
         return copy ? clone() : *this;
     }
@@ -614,6 +773,15 @@ Tensor Tensor::to(Device device, bool non_blocking, bool copy) const {
 
 Tensor Tensor::to(Device device, DType dtype, bool non_blocking, bool copy) const {
     if (!impl_) return Tensor();
+    if (is_sparse()) {
+        if (this->device() == device && this->dtype() == dtype) {
+            return copy ? clone() : *this;
+        }
+        return make_sparse_coo_tensor(
+            _indices().to(device, non_blocking, copy),
+            _values().to(device, dtype, non_blocking, copy),
+            static_cast<std::vector<int64_t>>(shape()), is_coalesced());
+    }
     if (this->device() == device && this->dtype() == dtype) {
         return copy ? clone() : *this;
     }
@@ -622,7 +790,10 @@ Tensor Tensor::to(Device device, DType dtype, bool non_blocking, bool copy) cons
     return t;
 }
 
+
+
 Tensor Tensor::contiguous() const {
+    if (is_sparse()) return clone();
     if (is_contiguous()) return *this;
     return clone();
 }
