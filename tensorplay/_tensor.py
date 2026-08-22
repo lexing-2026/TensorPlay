@@ -1,15 +1,10 @@
+from collections import OrderedDict
+
 from . import _C
 
 # Alias Tensor to _C.TensorBase so that objects created by C++ (like via tp.tensor())
 # are instances of this class.
 Tensor = _C.TensorBase
-
-def is_float(self) -> bool:
-    """
-    Check if tensor is floating point.
-    """
-    return (self.dtype == _C.DType.float32 or self.dtype == _C.DType.float64 or
-            self.dtype == _C.DType.float16 or self.dtype == _C.DType.bfloat16)
 
 def ndimension(self) -> int:
     """
@@ -186,44 +181,6 @@ def type(self, dtype=None, non_blocking=False, **kwargs):
     return self.to(dtype, non_blocking=non_blocking, **kwargs)
 
 
-def addcmul(self, tensor1, tensor2, value=1):
-    return self + (tensor1 * tensor2) * value
-
-
-def addcmul_(self, tensor1, tensor2, value=1):
-    self.add_((tensor1 * tensor2) * value)
-    return self
-
-
-def addcdiv(self, tensor1, tensor2, value=1):
-    return self + (tensor1 / tensor2) * value
-
-
-def addcdiv_(self, tensor1, tensor2, value=1):
-    self.add_((tensor1 / tensor2) * value)
-    return self
-
-
-def lerp_(self, end, weight):
-    self.copy_(self.lerp(end, weight))
-    return self
-
-
-def sqrt_(self):
-    self.copy_(self.sqrt())
-    return self
-
-
-def rsqrt_(self):
-    self.copy_(self.rsqrt())
-    return self
-
-
-def neg_(self):
-    self.copy_(self.neg())
-    return self
-
-Tensor.is_float = is_float
 Tensor.ndimension = ndimension
 Tensor.flatten = flatten
 Tensor.unflatten = unflatten
@@ -235,23 +192,91 @@ Tensor.cuda = cuda
 Tensor.cpu = cpu
 Tensor.t = t
 Tensor.type = type
-# Keep the Python definitions only for an older extension that does not yet
-# expose the generated native operator.  A rebuilt extension owns these names;
-# overwriting them here would silently put optimizer hot paths back on the
-# Python composite fallback.
-if not hasattr(Tensor, "addcmul"):
-    Tensor.addcmul = addcmul
-if not hasattr(Tensor, "addcmul_"):
-    Tensor.addcmul_ = addcmul_
-if not hasattr(Tensor, "addcdiv"):
-    Tensor.addcdiv = addcdiv
-if not hasattr(Tensor, "addcdiv_"):
-    Tensor.addcdiv_ = addcdiv_
-if not hasattr(Tensor, "lerp_"):
-    Tensor.lerp_ = lerp_
-if not hasattr(Tensor, "sqrt_"):
-    Tensor.sqrt_ = sqrt_
-if not hasattr(Tensor, "rsqrt_"):
-    Tensor.rsqrt_ = rsqrt_
-if not hasattr(Tensor, "neg_"):
-    Tensor.neg_ = neg_
+
+
+
+
+def unfold(self, dimension, size, step):
+    """Returns a view of the original tensor which contains all slices of
+    size :attr:`size` from :attr:`self` in the dimension :attr:`dimension`,
+    stepping by :attr:`step` (torch's ``Tensor.unfold``).
+
+    Port of ``aten/src/ATen/native/TensorShape.cpp``: the view appends a new
+    trailing dimension of length ``size`` and re-strides ``dimension`` by
+    ``step``.
+    """
+    sizes = list(self.shape)
+    strides = list(self.strides)
+    if dimension < 0:
+        dimension += len(sizes)
+    if dimension < 0 or dimension >= len(sizes):
+        raise IndexError(f"Dimension out of range (expected to be in range of [0, {len(sizes) - 1}], but got {dimension})")
+    if sizes[dimension] < size:
+        raise ValueError(f"maximum size for tensor at dimension {dimension} is {sizes[dimension]} but size is {size}")
+    sizes[dimension] = (sizes[dimension] - size) // step + 1
+    # torch appends the ORIGINAL stride of `dimension`, then scales it by step
+    strides.append(strides[dimension])
+    sizes.append(size)
+    strides[dimension] *= step
+    return self.as_strided(sizes, strides)
+
+
+Tensor.unfold = unfold
+
+
+def register_hook(self, hook):
+    """Registers a backward hook (torch's ``Tensor.register_hook``).
+
+    The hook is called every time a gradient with respect to this tensor is
+    computed. It may modify the gradient by returning a replacement Tensor;
+    returning ``None`` leaves the gradient unchanged. Hooks compose in
+    registration order.
+
+    Returns a :class:`~tensorplay.utils.hooks.RemovableHandle` whose
+    ``remove()`` method (or context-manager form) unregisters the hook.
+    """
+    from tensorplay.utils.hooks import RemovableHandle
+
+    if not self.requires_grad:
+        raise RuntimeError(
+            "cannot register a hook on a tensor that doesn't require gradient"
+        )
+
+    hooks_dict = OrderedDict()
+
+    def _apply_hooks(grad):
+        for h in list(hooks_dict.values()):
+            result = h(grad)
+            if result is not None:
+                grad = result
+        return grad
+
+    if self.is_leaf or self.grad_fn is None:
+        node = self._accumulate_grad_node
+        if node is None:
+            raise RuntimeError(
+                "cannot register a hook on a tensor whose AccumulateGrad node "
+                "has not been created yet; run a backward pass first"
+            )
+        pos = 0
+    else:
+        node = self.grad_fn
+        pos = self._output_nr
+
+    def pre_hook(grads):
+        grad = grads[pos]
+        new_grad = _apply_hooks(grad)
+        if new_grad is grad:
+            return grads
+        out = list(grads)
+        out[pos] = new_grad
+        return out
+
+    node.add_pre_hook(pre_hook)
+
+    handle = RemovableHandle(hooks_dict)
+    hooks_dict[handle.id] = hook
+    return handle
+
+
+Tensor.register_hook = register_hook

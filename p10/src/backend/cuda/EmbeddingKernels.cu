@@ -1,4 +1,5 @@
 #include "Tensor.h"
+#include "SparseKernels.h"
 #include "Dispatcher.h"
 #include "CUDARuntime.h"
 #include "Exception.h"
@@ -535,10 +536,6 @@ Tensor embedding_cuda(
   if (indices.dtype() != DType::Int64 && indices.dtype() != DType::Int32) {
     TP_THROW(TypeError, "embedding: indices must be Int64 or Int32");
   }
-  if (sparse) {
-    TP_THROW(NotImplementedError, "embedding_cuda: sparse gradients are not supported");
-  }
-
   // scale_grad_by_freq affects only the derivative; accepting it here is
   // required for the forward half of the Torch API contract.
   (void)scale_grad_by_freq;
@@ -686,9 +683,22 @@ Tensor embedding_dense_backward_cuda(
   return grad_weight;
 }
 
+Tensor embedding_backward_cuda(const Tensor& grad_output, const Tensor& indices,
+                               int64_t num_weights, int64_t padding_idx,
+                               bool scale_grad_by_freq, bool sparse) {
+  if (sparse) {
+    return embedding_sparse_backward_cuda(grad_output, indices, num_weights,
+                                          padding_idx, scale_grad_by_freq);
+  }
+  return embedding_dense_backward_cuda(grad_output, indices, num_weights,
+                                       padding_idx, scale_grad_by_freq);
+}
+
 TENSORPLAY_LIBRARY_IMPL(CUDA, EmbeddingKernels) {
   m.impl("embedding", embedding_cuda);
   m.impl("embedding_dense_backward", embedding_dense_backward_cuda);
+  m.impl("embedding_sparse_backward", embedding_sparse_backward_cuda);
+  m.impl("embedding_backward", embedding_backward_cuda);
 }
 
 } // namespace cuda

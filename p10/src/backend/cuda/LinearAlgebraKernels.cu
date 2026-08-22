@@ -8,6 +8,7 @@
 #include "Utils.h"
 #include "GradMode.h"
 #include "LinearAlgebraNames.h"
+#include "CudaGemm.h"
 #include <cublas_v2.h>
 #include <cublasLt.h>
 #include <cuComplex.h>
@@ -21,6 +22,8 @@
 
 namespace tensorplay {
 namespace cuda {
+
+namespace {
 
 #define CUBLAS_CHECK(condition) \
   do { \
@@ -37,286 +40,6 @@ namespace cuda {
       TP_THROW(RuntimeError, "cuBLASLt Error " + std::to_string(static_cast<int>(_tp_cublaslt_status))); \
     } \
   } while (0)
-
-namespace {
-
-Tensor& zero_matmul_output_cuda(Tensor& output) {
-    if (output.numel() != 0) {
-        checkCuda(cudaMemsetAsync(
-            output.data_ptr(),
-            0,
-            output.numel() * output.itemsize(),
-            getCurrentCUDAStream().stream()),
-            "matmul zero output");
-    }
-    return output;
-}
-
-// Row-major GEMM via cuBLASLt (column-major native).
-// C_r(M x N) = A_r(M x K) * B_r(K x N). Using the transpose trick:
-//   C_r^T = B_r^T * A_r^T  =>  col-major C_c (N x M) = B_c (N x K) * A_c (K x M)
-// with B_c = B_r^T (ld = N), A_c = A_r^T (ld = K), C_c = C_r^T (ld = N).
-// So: opA = opB = N, A pointer = B_r, B pointer = A_r, no transposes needed.
-struct GemmKey {
-    ScalarType dtype;
-    int64_t m, n, k;
-    int device;
-    bool has_bias;
-
-    bool operator==(const GemmKey& o) const {
-        return dtype == o.dtype && m == o.m && n == o.n && k == o.k &&
-               device == o.device && has_bias == o.has_bias;
-    }
-};
-
-struct GemmKeyHash {
-    size_t operator()(const GemmKey& k) const {
-        size_t h = std::hash<int64_t>()(k.m);
-        h ^= std::hash<int64_t>()(k.n) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= std::hash<int64_t>()(k.k) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= std::hash<int>()(static_cast<int>(k.dtype)) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= std::hash<int>()(k.device) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= std::hash<bool>()(k.has_bias) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        return h;
-    }
-};
-
-struct GemmPlan {
-    int device = -1;
-    std::mutex execution_mutex;
-    cublasLtMatmulDesc_t matmul_desc = nullptr;
-    cublasLtMatrixLayout_t a_desc = nullptr;
-    cublasLtMatrixLayout_t b_desc = nullptr;
-    cublasLtMatrixLayout_t c_desc = nullptr;
-    cublasLtMatmulPreference_t pref = nullptr;
-    cublasLtMatmulHeuristicResult_t heuristic{};
-    bool heuristic_valid = false;
-    size_t workspace_size = 0;
-
-    ~GemmPlan() {
-        if (pref) cublasLtMatmulPreferenceDestroy(pref);
-        if (c_desc) cublasLtMatrixLayoutDestroy(c_desc);
-        if (b_desc) cublasLtMatrixLayoutDestroy(b_desc);
-        if (a_desc) cublasLtMatrixLayoutDestroy(a_desc);
-        if (matmul_desc) cublasLtMatmulDescDestroy(matmul_desc);
-    }
-};
-
-std::mutex& planMutex() {
-    static auto* mutex = new std::mutex();
-    return *mutex;
-}
-
-std::unordered_map<GemmKey, std::shared_ptr<GemmPlan>, GemmKeyHash>& planCache() {
-    // Plans own device workspaces and intentionally have process lifetime.
-    static auto* cache = new std::unordered_map<GemmKey, std::shared_ptr<GemmPlan>, GemmKeyHash>();
-    return *cache;
-}
-
-cudaDataType_t toCublasType(ScalarType t) {
-    switch (t) {
-        case ScalarType::Float32: return CUDA_R_32F;
-        case ScalarType::Float64: return CUDA_R_64F;
-        case ScalarType::Float16: return CUDA_R_16F;
-        case ScalarType::BFloat16: return CUDA_R_16BF;
-        case ScalarType::ComplexFloat: return CUDA_C_32F;
-        case ScalarType::ComplexDouble: return CUDA_C_64F;
-        default: TP_THROW(NotImplementedError, "mm: unsupported dtype on CUDA");
-    }
-}
-
-cublasComputeType_t toComputeType(ScalarType t) {
-    switch (t) {
-        // PyTorch's default is torch.backends.cuda.matmul.allow_tf32=False.
-        // Use ordinary FP32 accumulation so matmul has the same numerical
-        // contract instead of silently enabling TF32.
-        case ScalarType::Float32: return CUBLAS_COMPUTE_32F;
-        case ScalarType::Float64: return CUBLAS_COMPUTE_64F;
-        // PyTorch accumulates Half GEMM in FP32 by default
-        // (torch.backends.cuda.matmul.allow_fp16_accumulation is False), and
-        // its CUDABlas helpers pass CUDA_R_32F as the compute type with float
-        // alpha/beta for both Half and BFloat16.
-        case ScalarType::Float16: return CUBLAS_COMPUTE_32F;
-        case ScalarType::BFloat16: return CUBLAS_COMPUTE_32F;
-        case ScalarType::ComplexFloat: return CUBLAS_COMPUTE_32F;
-        case ScalarType::ComplexDouble: return CUBLAS_COMPUTE_64F;
-        default: TP_THROW(NotImplementedError, "mm: unsupported dtype on CUDA");
-    }
-}
-
-cudaDataType_t toScaleType(ScalarType t) {
-    switch (t) {
-        case ScalarType::Float32: return CUDA_R_32F;
-        case ScalarType::Float64: return CUDA_R_64F;
-        // FP32 compute for reduced-precision inputs: scale in FP32.
-        case ScalarType::Float16: return CUDA_R_32F;
-        // Compute is FP32-based (CUBLAS_COMPUTE_32F): scale in FP32.
-        case ScalarType::BFloat16: return CUDA_R_32F;
-        case ScalarType::ComplexFloat: return CUDA_C_32F;
-        case ScalarType::ComplexDouble: return CUDA_C_64F;
-        default: TP_THROW(NotImplementedError, "mm: unsupported dtype on CUDA");
-    }
-}
-
-// Alpha/beta must live in the scale type of the compute type.
-void* toScalarPtr(double v, ScalarType t, int slot) {
-    static thread_local float f32[2];
-    static thread_local double f64[2];
-    static thread_local cuFloatComplex c32[2];
-    static thread_local cuDoubleComplex c64[2];
-    switch (t) {
-        case ScalarType::Float32: f32[slot] = static_cast<float>(v); return &f32[slot];
-        case ScalarType::Float64: f64[slot] = v; return &f64[slot];
-        // FP32 compute for Half/BFloat16: alpha/beta live in the float scale type.
-        case ScalarType::Float16: f32[slot] = static_cast<float>(v); return &f32[slot];
-        case ScalarType::BFloat16: f32[slot] = static_cast<float>(v); return &f32[slot];
-        case ScalarType::ComplexFloat: c32[slot] = make_cuFloatComplex(static_cast<float>(v), 0.0f); return &c32[slot];
-        case ScalarType::ComplexDouble: c64[slot] = make_cuDoubleComplex(v, 0.0); return &c64[slot];
-        default: return nullptr;
-    }
-}
-
-std::shared_ptr<GemmPlan> getGemmPlan(ScalarType dtype, int64_t M, int64_t N, int64_t K, bool has_bias) {
-    const int device = currentDevice();
-    GemmKey key{dtype, M, N, K, device, has_bias};
-    std::lock_guard<std::mutex> lock(planMutex());
-    auto& cache = planCache();
-    auto it = cache.find(key);
-    if (it != cache.end()) return it->second;
-
-    auto plan = std::make_shared<GemmPlan>();
-    plan->device = device;
-    cudaDataType_t cudaType = toCublasType(dtype);
-    cublasComputeType_t computeType = toComputeType(dtype);
-    cudaDataType_t scaleType = toScaleType(dtype);
-
-    CUBLASLT_CHECK(cublasLtMatmulDescCreate(&plan->matmul_desc, computeType, scaleType));
-    cublasOperation_t opN = CUBLAS_OP_N;
-    cublasLtEpilogue_t epilogue = has_bias ? CUBLASLT_EPILOGUE_BIAS : CUBLASLT_EPILOGUE_DEFAULT;
-    CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(plan->matmul_desc, CUBLASLT_MATMUL_DESC_TRANSA, &opN, sizeof(opN)));
-    CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(plan->matmul_desc, CUBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN)));
-    CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(plan->matmul_desc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
-
-    // A' = B_r (N x K) col-major ld=N; B' = A_r (K x M) col-major ld=K; C' (N x M) ld=N.
-    CUBLASLT_CHECK(cublasLtMatrixLayoutCreate(&plan->a_desc, cudaType, N, K, N));
-    CUBLASLT_CHECK(cublasLtMatrixLayoutCreate(&plan->b_desc, cudaType, K, M, K));
-    CUBLASLT_CHECK(cublasLtMatrixLayoutCreate(&plan->c_desc, cudaType, N, M, N));
-
-    CUBLASLT_CHECK(cublasLtMatmulPreferenceCreate(&plan->pref));
-    size_t workspace_size = 32 * 1024 * 1024;
-    CUBLASLT_CHECK(cublasLtMatmulPreferenceSetAttribute(plan->pref,
-                                                         CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-                                                         &workspace_size, sizeof(workspace_size)));
-    plan->workspace_size = workspace_size;
-
-    int returned = 0;
-    CUBLASLT_CHECK(cublasLtMatmulAlgoGetHeuristic(
-        CUDAContext::getCublasLtHandle(), plan->matmul_desc, plan->a_desc, plan->b_desc, plan->c_desc, plan->c_desc,
-        plan->pref, 1, &plan->heuristic, &returned));
-    if (returned == 0) {
-        TP_THROW(RuntimeError, "cuBLASLt: no heuristic algorithm found");
-    }
-    plan->heuristic_valid = true;
-
-    cache.emplace(key, plan);
-    return plan;
-}
-
-void gemm_impl(const Tensor& self, const Tensor& other, const Tensor& result,
-               double alpha, double beta, const Tensor* bias) {
-    if (self.dim() != 2 || other.dim() != 2) {
-        TP_THROW(RuntimeError, "mm: tensors must be 2D");
-    }
-    if (self.shape()[1] != other.shape()[0]) {
-        TP_THROW(RuntimeError, "mm: shape mismatch");
-    }
-
-    Tensor self_contig = self.is_contiguous() ? self : self.contiguous();
-
-    // A decoder linear layer normally calls ``x @ weight.t()``.  Materializing
-    // that transpose here would transiently duplicate a 50--135 MiB weight
-    // matrix on every projection and is the dominant peak-memory gap versus
-    // Torch.  A contiguous [N, K] weight viewed as [K, N] has strides [1, K];
-    // map that view directly to column-major cuBLAS (W * X^T) instead.
-    const auto other_strides = other.strides();
-    const bool transposed_contiguous =
-        bias == nullptr && !other.is_contiguous() && other.dim() == 2 &&
-        other_strides[0] == 1 && other_strides[1] == self_contig.shape()[1];
-    if (transposed_contiguous) {
-        const int64_t M = self_contig.shape()[0];
-        const int64_t K = self_contig.shape()[1];
-        const int64_t N = other.shape()[1];
-        const ScalarType dtype = self_contig.dtype();
-        const cudaDataType_t cuda_type = toCublasType(dtype);
-        const cublasComputeType_t compute_type = toComputeType(dtype);
-        void* alpha_ptr = toScalarPtr(alpha, dtype, 0);
-        void* beta_ptr = toScalarPtr(beta, dtype, 1);
-        CUBLAS_CHECK(cublasGemmEx(
-            CUDAContext::getCublasHandle(),
-            CUBLAS_OP_T, CUBLAS_OP_N,
-            static_cast<int>(N), static_cast<int>(M), static_cast<int>(K),
-            alpha_ptr,
-            other.data_ptr(), cuda_type, static_cast<int>(K),
-            self_contig.data_ptr(), cuda_type, static_cast<int>(K),
-            beta_ptr,
-            result.data_ptr(), cuda_type, static_cast<int>(N),
-        compute_type, CUBLAS_GEMM_DEFAULT));
-        return;
-    }
-
-    Tensor other_contig = other.is_contiguous() ? other : other.contiguous();
-
-    int64_t M = self_contig.shape()[0];
-    int64_t K = self_contig.shape()[1];
-    int64_t N = other_contig.shape()[1];
-
-    const ScalarType dtype = self_contig.dtype();
-    if (isComplexType(dtype)) {
-        // cublasLt's complex algorithm set is not available uniformly across
-        // CUDA versions.  The classic GEMM API has the same row-major
-        // transpose trick and is the stable path for complex matmul.
-        const cudaDataType_t cuda_type = toCublasType(dtype);
-        const cublasComputeType_t compute_type = toComputeType(dtype);
-        void* alpha_ptr = toScalarPtr(alpha, dtype, 0);
-        void* beta_ptr = toScalarPtr(beta, dtype, 1);
-        CUBLAS_CHECK(cublasGemmEx(
-            CUDAContext::getCublasHandle(),
-            CUBLAS_OP_N, CUBLAS_OP_N,
-            static_cast<int>(N), static_cast<int>(M), static_cast<int>(K),
-            alpha_ptr,
-            other_contig.data_ptr(), cuda_type, static_cast<int>(N),
-            self_contig.data_ptr(), cuda_type, static_cast<int>(K),
-            beta_ptr,
-            result.data_ptr(), cuda_type, static_cast<int>(N),
-            compute_type, CUBLAS_GEMM_DEFAULT));
-        return;
-    }
-    bool has_bias = (bias != nullptr);
-    auto plan = getGemmPlan(dtype, M, N, K, has_bias);
-    Tensor workspace({static_cast<int64_t>(plan->workspace_size)}, DType::UInt8, self.device());
-    std::lock_guard<std::mutex> execution_lock(plan->execution_mutex);
-
-    void* alpha_ptr = toScalarPtr(alpha, dtype, 0);
-    void* beta_ptr = toScalarPtr(beta, dtype, 1);
-
-    // Bias pointer for the bias epilogue (CUDA 11-style API: set as desc attribute).
-    if (has_bias) {
-        void* bias_ptr = bias->data_ptr();
-        CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(plan->matmul_desc, CUBLASLT_MATMUL_DESC_BIAS_POINTER,
-                                                       &bias_ptr, sizeof(void*)));
-    }
-
-    cublasStatus_t status = cublasLtMatmul(
-        CUDAContext::getCublasLtHandle(), plan->matmul_desc, alpha_ptr,
-        other_contig.data_ptr(), plan->a_desc,
-        self_contig.data_ptr(), plan->b_desc,
-        beta_ptr,
-        result.data_ptr(), plan->c_desc,
-        result.data_ptr(), plan->c_desc,
-        &plan->heuristic.algo, workspace.data_ptr(), plan->workspace_size,
-        getCurrentCUDAStream().stream());
-    CUBLASLT_CHECK(status);
-}
 
 bool is_bias_vector(const Tensor& b, int64_t M, int64_t N) {
     if (b.dim() == 1 && b.shape()[0] == N) return true;
@@ -384,7 +107,7 @@ Tensor mm_kernel_cuda(const Tensor& self, const Tensor& other) {
     // Validate the dtype before any empty/K==0 fast path.  Torch rejects
     // integer and bool CUDA matmul even when the mathematical result is empty
     // or identically zero.
-    (void)toCublasType(result_dtype);
+    check_cublas_gemm_dtype(result_dtype);
     const Tensor& self_p = self;
     const Tensor& other_p = other;
     int64_t M = self_p.shape()[0];
@@ -487,39 +210,6 @@ long long batched_matrix_stride_cuda(
 
 // Launch one strided-batched GEMM over contiguous (B, M, K) x (B, K, N)
 // operand stacks into a contiguous (B, M, N) result.
-void gemm_strided_batched_3d(const Tensor& self_3d, const Tensor& other_3d,
-                             Tensor& result_3d, int64_t batch_size,
-                             int64_t M, int64_t N, int64_t K,
-                             double alpha, double beta) {
-    const ScalarType dtype = self_3d.dtype();
-    const cudaDataType_t cuda_type = toCublasType(dtype);
-    const cublasComputeType_t compute_type = toComputeType(dtype);
-    void* alpha_ptr = toScalarPtr(alpha, dtype, 0);
-    void* beta_ptr = toScalarPtr(beta, dtype, 1);
-    const long long stride_a = static_cast<long long>(M) * K;
-    const long long stride_b = static_cast<long long>(K) * N;
-    const long long stride_c = static_cast<long long>(M) * N;
-    // Torch leaves the algorithm choice to cuBLAS defaults; the TENSOR_OP
-    // hint only affects kernel selection, never the FP32-accumulate contract.
-    const cublasGemmAlgo_t algorithm = isComplexType(dtype)
-        ? CUBLAS_GEMM_DEFAULT
-        : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
-    if (batch_size == 0 || M == 0 || N == 0) return;
-    if (K == 0) {
-        zero_matmul_output_cuda(result_3d);
-        return;
-    }
-    CUBLAS_CHECK(cublasGemmStridedBatchedEx(
-        CUDAContext::getCublasHandle(),
-        CUBLAS_OP_N, CUBLAS_OP_N,
-        static_cast<int>(N), static_cast<int>(M), static_cast<int>(K),
-        alpha_ptr,
-        other_3d.data_ptr(), cuda_type, static_cast<int>(N), stride_b,
-        self_3d.data_ptr(), cuda_type, static_cast<int>(K), stride_a,
-        beta_ptr,
-        result_3d.data_ptr(), cuda_type, static_cast<int>(N), stride_c,
-        static_cast<int>(batch_size), compute_type, algorithm));
-}
 
 Tensor matmul_batched_2d_cuda(
     const Tensor& self, const Tensor& other,
@@ -533,7 +223,7 @@ Tensor matmul_batched_2d_cuda(
     if (K != other.size(other.dim() - 2)) {
         TP_THROW(RuntimeError, "matmul: size mismatch, got ", K, " and ", other.size(other.dim() - 2));
     }
-    (void)toCublasType(self.dtype());
+    (void)check_cublas_gemm_dtype(self.dtype());
     const int64_t N = other.size(other.dim() - 1);
     const std::vector<int64_t> batch_shape = broadcast_shapes(self_batch_shape, other_batch_shape);
 
@@ -582,29 +272,12 @@ Tensor matmul_batched_2d_cuda(
         other, other_batch_shape, batch_shape, K, N, batch_size);
     Tensor result_3d = result.reshape({batch_size, M, N});
 
-    const ScalarType dtype = self.dtype();
-    const cudaDataType_t cuda_type = toCublasType(dtype);
-    const cublasComputeType_t compute_type = toComputeType(dtype);
-    void* alpha_ptr = toScalarPtr(1.0, dtype, 0);
-    void* beta_ptr = toScalarPtr(0.0, dtype, 1);
     const long long stride_a = batched_matrix_stride_cuda(
-        other_batch_shape, batch_shape, K, N);
-    const long long stride_b = batched_matrix_stride_cuda(
         self_batch_shape, batch_shape, M, K);
-    const long long stride_c = static_cast<long long>(M) * N;
-    const cublasGemmAlgo_t batch_algorithm = isComplexType(dtype)
-        ? CUBLAS_GEMM_DEFAULT
-        : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
-    CUBLAS_CHECK(cublasGemmStridedBatchedEx(
-        CUDAContext::getCublasHandle(),
-        CUBLAS_OP_N, CUBLAS_OP_N,
-        static_cast<int>(N), static_cast<int>(M), static_cast<int>(K),
-        alpha_ptr,
-        other_3d.data_ptr(), cuda_type, static_cast<int>(N), stride_a,
-        self_3d.data_ptr(), cuda_type, static_cast<int>(K), stride_b,
-        beta_ptr,
-        result_3d.data_ptr(), cuda_type, static_cast<int>(N), stride_c,
-        static_cast<int>(batch_size), compute_type, batch_algorithm));
+    const long long stride_b = batched_matrix_stride_cuda(
+        other_batch_shape, batch_shape, K, N);
+    gemm_strided_batched_3d(self_3d, other_3d, result_3d, batch_size,
+                            M, N, K, stride_a, stride_b, 1.0, 0.0);
     return result;
 }
 
@@ -1035,7 +708,7 @@ Tensor bmm_kernel_cuda(const Tensor& self, const Tensor& batch2) {
                  " but found ", pretty_dtype_name(batch2.dtype()));
     }
     // Reject unsupported dtypes before touching memory, like torch.
-    (void)toCublasType(self.dtype());
+    check_cublas_gemm_dtype(self.dtype());
     return matmul_batched_2d_cuda(self, batch2, {self.size(0)}, {batch2.size(0)});
 }
 
@@ -1074,24 +747,46 @@ Tensor baddbmm_kernel_cuda(const Tensor& input, const Tensor& batch1, const Tens
     Tensor b1 = batch1.is_contiguous() ? batch1 : batch1.contiguous();
     Tensor b2 = batch2.is_contiguous() ? batch2 : batch2.contiguous();
     Tensor result_3d = std::move(result);
+    const long long stride_a = static_cast<long long>(M) * batch1.size(2);
+    const long long stride_b = static_cast<long long>(batch1.size(2)) * N;
     gemm_strided_batched_3d(b1, b2, result_3d, B, M, N, batch1.size(2),
+                            stride_a, stride_b,
                             alpha_v, beta_v == 0.0 ? 0.0 : 1.0);
     return result_3d;
 }
 
 Tensor mv_kernel_cuda(const Tensor& self, const Tensor& vec) {
-    if (self.dim() != 2) TP_THROW(RuntimeError, "self must be a matrix");
-    if (vec.dim() != 1) TP_THROW(RuntimeError, "vector must be 1D");
+    // Torch routes mv through addmv; mirror its meta checks verbatim
+    // (aten/src/ATen/native/Blas.cpp ADDMV_META).
+    if (self.dim() != 2 || vec.dim() != 1) {
+        TP_THROW(RuntimeError, "vector + matrix @ vector expected, got ", 1, ", ",
+                 self.dim(), ", ", vec.dim());
+    }
     if (self.size(1) != vec.size(0)) {
         TP_THROW(RuntimeError, "size mismatch, got input (", self.size(0), "), mat (",
                  self.size(0), "x", self.size(1), "), vec (", vec.size(0), ")");
     }
     if (self.dtype() != vec.dtype()) {
-        TP_THROW(RuntimeError, "expected m1 and m2 to have the same dtype, but got: ",
-                 c10_style_dtype_name(self.dtype()), " != ", c10_style_dtype_name(vec.dtype()));
+        // The leading value is addmv's accumulator slot; via mv it echoes vec.
+        TP_THROW(RuntimeError, "addmv input tensors must have the same dtype, but got ",
+                 pretty_dtype_name(vec.dtype()), ", ", pretty_dtype_name(self.dtype()), ", and ",
+                 pretty_dtype_name(vec.dtype()));
     }
     return matmul_batched_2d_cuda(self, vec.unsqueeze(-1), {}, {}).squeeze(-1);
 }
+
+
+namespace {
+cudaDataType_t dot_cublas_type(DType t) {
+    switch (t) {
+        case DType::Float32: return CUDA_R_32F;
+        case DType::Float64: return CUDA_R_64F;
+        case DType::Float16: return CUDA_R_16F;
+        case DType::BFloat16: return CUDA_R_16BF;
+        default: TP_THROW(NotImplementedError, "dot: unsupported dtype on CUDA");
+    }
+}
+} // namespace
 
 Tensor dot_kernel_cuda(const Tensor& self, const Tensor& other) {
     if (self.dim() != 1 || other.dim() != 1) {
@@ -1138,9 +833,9 @@ Tensor dot_kernel_cuda(const Tensor& self, const Tensor& other) {
             // FP32 accumulation contract, native storage for the scalar.
             CUBLAS_CHECK(cublasDotEx(
                 CUDAContext::getCublasHandle(), static_cast<int>(n),
-                self.data_ptr(), toCublasType(dtype), 1,
-                other.data_ptr(), toCublasType(dtype), 1,
-                result.data_ptr(), toCublasType(dtype), CUDA_R_32F));
+                self.data_ptr(), dot_cublas_type(dtype), 1,
+                other.data_ptr(), dot_cublas_type(dtype), 1,
+                result.data_ptr(), dot_cublas_type(dtype), CUDA_R_32F));
             return result;
         }
         default:
@@ -1151,16 +846,16 @@ Tensor dot_kernel_cuda(const Tensor& self, const Tensor& other) {
 }
 
 Tensor inner_kernel_cuda(const Tensor& self, const Tensor& other) {
+    // Torch: scalar operands go through plain multiplication (with
+    // promotion); otherwise this is tensordot over the last dimension.
     if (self.dim() == 0 || other.dim() == 0) {
-        if (self.dtype() != other.dtype()) {
-            TP_THROW(RuntimeError, "expected scalar type ", pretty_dtype_name(self.dtype()),
-                     " but found ", pretty_dtype_name(other.dtype()));
-        }
-        return self.mul(other);
+        return self * other;
     }
     const int64_t n = self.size(-1);
     if (other.size(-1) != n) {
-        TP_THROW(RuntimeError, "inner(): incompatible shapes: ", n, " vs ", other.size(-1));
+        TP_THROW(RuntimeError, "inner() the last dimension must match on both input tensors but got shapes ",
+                 Size(static_cast<std::vector<int64_t>>(self.shape())).toString(), " and ",
+                 Size(static_cast<std::vector<int64_t>>(other.shape())).toString());
     }
     if (self.dim() == 1 && other.dim() == 1) {
         return dot_kernel_cuda(self, other);

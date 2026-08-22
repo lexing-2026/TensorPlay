@@ -51,6 +51,7 @@ PYBIND11_MODULE(_C, m) {
     init_generator(m);
     init_tensor(m);
     init_autograd(m);
+    init_autocast(m);
     init_ops(m);
     init_stax(m);
     init_parallel(m);

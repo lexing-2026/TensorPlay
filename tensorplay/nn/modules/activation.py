@@ -1,3 +1,6 @@
+import warnings
+from typing import Optional
+
 import tensorplay
 from tensorplay.nn import functional as F
 from tensorplay import Tensor
@@ -13,6 +16,26 @@ __all__ = [
     "GELU",
     "Tanh",
     "PReLU",
+    "ReLU6",
+    "Hardswish",
+    "Hardsigmoid",
+    "LeakyReLU",
+    "ELU",
+    "Mish",
+    "SELU",
+    "CELU",
+    "Softplus",
+    "Softmax",
+    "LogSoftmax",
+    "LogSigmoid",
+    "Hardtanh",
+    "Hardshrink",
+    "Softshrink",
+    "Tanhshrink",
+    "Softmin",
+    "Softsign",
+    "GLU",
+    "RReLU",
 ]
 
 
@@ -333,3 +356,446 @@ class GELU(Module):
         Return the extra representation of the module.
         """
         return f"approximate={repr(self.approximate)}"
+
+class ReLU6(Module):
+    r"""Applies the element-wise function ``ReLU6(x) = min(max(0, x), 6)``.
+
+    Mirrors torch.nn.ReLU6; the kernel is the ATen hardtanh(0, 6) port.
+    """
+
+    def __init__(self, inplace: bool = False) -> None:
+        super().__init__()
+        self.inplace = inplace
+
+    def forward(self, input: Tensor) -> Tensor:
+        return F.relu6(input, self.inplace)
+
+    def extra_repr(self) -> str:
+        return "inplace=True" if self.inplace else ""
+
+
+class Hardswish(Module):
+    r"""Applies hardswish, element-wise: ``x * ReLU6(x + 3) / 6``.
+
+    Mirrors torch.nn.Hardswish (ATen Activation.cpp hardswish_kernel).
+    """
+
+    def __init__(self, inplace: bool = False) -> None:
+        super().__init__()
+        self.inplace = inplace
+
+    def forward(self, input: Tensor) -> Tensor:
+        return F.hardswish(input, self.inplace)
+
+    def extra_repr(self) -> str:
+        return "inplace=True" if self.inplace else ""
+
+
+class Hardsigmoid(Module):
+    r"""Applies hardsigmoid, element-wise: ``ReLU6(x + 3) / 6``.
+
+    Mirrors torch.nn.Hardsigmoid (ATen Activation.cpp hardsigmoid_kernel).
+    """
+
+    def __init__(self, inplace: bool = False) -> None:
+        super().__init__()
+        self.inplace = inplace
+
+    def forward(self, input: Tensor) -> Tensor:
+        return F.hardsigmoid(input, self.inplace)
+
+    def extra_repr(self) -> str:
+        return "inplace=True" if self.inplace else ""
+
+
+class LeakyReLU(Module):
+    r"""Applies leaky_relu: ``max(0, x) + negative_slope * min(0, x)``.
+
+    Mirrors torch.nn.LeakyReLU.
+    """
+
+    __constants__ = ["negative_slope", "inplace"]
+
+    def __init__(self, negative_slope: float = 1e-2, inplace: bool = False) -> None:
+        super().__init__()
+        self.negative_slope = negative_slope
+        self.inplace = inplace
+
+    def forward(self, input: Tensor) -> Tensor:
+        return F.leaky_relu(input, self.negative_slope, self.inplace)
+
+    def extra_repr(self) -> str:
+        return f"negative_slope={self.negative_slope}" + (", inplace=True" if self.inplace else "")
+
+
+class ELU(Module):
+    r"""Applies elu: ``max(0, x) + min(0, alpha * (exp(x) - 1))``.
+
+    Mirrors torch.nn.ELU.
+    """
+
+    __constants__ = ["alpha", "inplace"]
+
+    def __init__(self, alpha: float = 1.0, inplace: bool = False) -> None:
+        super().__init__()
+        self.alpha = alpha
+        self.inplace = inplace
+
+    def forward(self, input: Tensor) -> Tensor:
+        return F.elu(input, self.alpha, self.inplace)
+
+    def extra_repr(self) -> str:
+        return f"alpha={self.alpha}" + (", inplace=True" if self.inplace else "")
+
+
+class Mish(Module):
+    r"""Applies mish: ``x * tanh(softplus(x))``.
+
+    Mirrors torch.nn.Mish (ATen ActivationMishKernel).
+    """
+
+    def __init__(self, inplace: bool = False) -> None:
+        super().__init__()
+        self.inplace = inplace
+
+    def forward(self, input: Tensor) -> Tensor:
+        return F.mish(input, self.inplace)
+
+    def extra_repr(self) -> str:
+        return "inplace=True" if self.inplace else ""
+
+
+class SELU(Module):
+    r"""Applies selu with ATen's fixed lambda/alpha constants."""
+
+    def __init__(self, inplace: bool = False) -> None:
+        super().__init__()
+        self.inplace = inplace
+
+    def forward(self, input: Tensor) -> Tensor:
+        return F.selu(input, self.inplace)
+
+    def extra_repr(self) -> str:
+        return "inplace=True" if self.inplace else ""
+
+
+class CELU(Module):
+    r"""Applies celu: ``max(0, x) + min(0, alpha * (exp(x / alpha) - 1))``."""
+
+    __constants__ = ["alpha", "inplace"]
+
+    def __init__(self, alpha: float = 1.0, inplace: bool = False) -> None:
+        super().__init__()
+        self.alpha = alpha
+        self.inplace = inplace
+
+    def forward(self, input: Tensor) -> Tensor:
+        return F.celu(input, self.alpha, self.inplace)
+
+    def extra_repr(self) -> str:
+        return f"alpha={self.alpha}" + (", inplace=True" if self.inplace else "")
+
+
+class Softplus(Module):
+    r"""Applies softplus with linearization above `threshold * beta`."""
+
+    __constants__ = ["beta", "threshold"]
+
+    def __init__(self, beta: float = 1.0, threshold: float = 20.0) -> None:
+        super().__init__()
+        self.beta = beta
+        self.threshold = threshold
+
+    def forward(self, input: Tensor) -> Tensor:
+        return F.softplus(input, self.beta, self.threshold)
+
+    def extra_repr(self) -> str:
+        return f"beta={self.beta}, threshold={self.threshold}"
+
+
+class Softmax(Module):
+    r"""Softmax over ``dim``, mirroring torch.nn.Softmax."""
+
+    __constants__ = ["dim"]
+
+    def __init__(self, dim=None) -> None:
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, input: Tensor) -> Tensor:
+        return tensorplay.softmax(input, self.dim, dtype=None)
+
+    def extra_repr(self) -> str:
+        return f"dim={self.dim}"
+
+
+class LogSoftmax(Module):
+    r"""Log-softmax over ``dim``, mirroring torch.nn.LogSoftmax."""
+
+    __constants__ = ["dim"]
+
+    def __init__(self, dim=None) -> None:
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, input: Tensor) -> Tensor:
+        return tensorplay.log_softmax(input, self.dim, dtype=None)
+
+    def extra_repr(self) -> str:
+        return f"dim={self.dim}"
+
+
+class LogSigmoid(Module):
+    r"""Applies the Logsigmoid function element-wise.
+
+    .. math::
+        \text{LogSigmoid}(x) = \log\left(\frac{ 1 }{ 1 + \exp(-x)}\right)
+    """
+
+    def forward(self, input: Tensor) -> Tensor:
+        """
+        Run forward pass.
+        """
+        return F.logsigmoid(input)
+
+
+class Hardtanh(Module):
+    r"""Applies the HardTanh function element-wise.
+
+    .. math::
+        \text{HardTanh}(x) = \begin{cases}
+            \text{max\_val} & \text{ if } x > \text{ max\_val } \\
+            \text{min\_val} & \text{ if } x < \text{ min\_val } \\
+            x & \text{ otherwise } \\
+        \end{cases}
+
+    Args:
+        min_val: minimum value of the linear region range. Default: -1
+        max_val: maximum value of the linear region range. Default: 1
+        inplace: can optionally do the operation in-place. Default: ``False``
+    """
+
+    __constants__ = ["min_val", "max_val", "inplace"]
+
+    min_val: float
+    max_val: float
+    inplace: bool
+
+    def __init__(
+        self,
+        min_val: float = -1.0,
+        max_val: float = 1.0,
+        inplace: bool = False,
+        min_value: Optional[float] = None,
+        max_value: Optional[float] = None,
+    ) -> None:
+        super().__init__()
+        if min_value is not None:
+            warnings.warn(
+                "keyword argument `min_value` is deprecated and renamed to `min_val`",
+                FutureWarning,
+                stacklevel=2,
+            )
+            min_val = min_value
+        if max_value is not None:
+            warnings.warn(
+                "keyword argument `max_value` is deprecated and renamed to `max_val`",
+                FutureWarning,
+                stacklevel=2,
+            )
+            max_val = max_value
+
+        self.min_val = min_val
+        self.max_val = max_val
+        self.inplace = inplace
+        if self.max_val <= self.min_val:
+            raise AssertionError(
+                f"max_val ({self.max_val}) must be greater than min_val ({self.min_val})"
+            )
+
+    def forward(self, input: Tensor) -> Tensor:
+        """
+        Runs the forward pass.
+        """
+        return F.hardtanh(input, self.min_val, self.max_val, self.inplace)
+
+    def extra_repr(self) -> str:
+        inplace_str = ", inplace=True" if self.inplace else ""
+        return f"min_val={self.min_val}, max_val={self.max_val}{inplace_str}"
+
+
+class Hardshrink(Module):
+    r"""Applies the Hard Shrinkage (Hardshrink) function element-wise.
+
+    .. math::
+        \text{HardShrink}(x) =
+        \begin{cases}
+            x & \text{ if } x > \lambda \\
+            x & \text{ if } x < -\lambda \\
+            0 & \text{ otherwise }
+        \end{cases}
+
+    Args:
+        lambd: the :math:`\lambda` value for the Hardshrink formulation. Default: 0.5
+    """
+
+    __constants__ = ["lambd"]
+    lambd: float
+
+    def __init__(self, lambd: float = 0.5) -> None:
+        super().__init__()
+        self.lambd = lambd
+
+    def forward(self, input: Tensor) -> Tensor:
+        return F.hardshrink(input, self.lambd)
+
+    def extra_repr(self) -> str:
+        return f"lambd={self.lambd}"
+
+
+class Softshrink(Module):
+    r"""Applies the soft shrinkage function element-wise.
+
+    .. math::
+        \text{SoftShrinkage}(x) =
+        \begin{cases}
+            x - \lambda & \text{ if } x > \lambda \\
+            x + \lambda & \text{ if } x < -\lambda \\
+            0 & \text{ otherwise }
+        \end{cases}
+
+    Args:
+        lambd: the :math:`\lambda` (must be no less than zero) value for the
+            Softshrink formulation. Default: 0.5
+    """
+
+    __constants__ = ["lambd"]
+    lambd: float
+
+    def __init__(self, lambd: float = 0.5) -> None:
+        super().__init__()
+        self.lambd = lambd
+
+    def forward(self, input: Tensor) -> Tensor:
+        return F.softshrink(input, self.lambd)
+
+    def extra_repr(self) -> str:
+        return str(self.lambd)
+
+
+class Tanhshrink(Module):
+    r"""Applies element-wise, :math:`\text{Tanhshrink}(x) = x - \text{Tanh}(x)`"""
+
+    def forward(self, input: Tensor) -> Tensor:
+        return F.tanhshrink(input)
+
+
+class Softmin(Module):
+    r"""Applies the Softmin function to an n-dimensional input Tensor.
+
+    Rescales them so that the elements of the n-dimensional output Tensor
+    lie in the range `[0, 1]` and sum to 1.
+
+    Softmin is defined as:
+
+    .. math::
+        \text{Softmin}(x_{i}) = \frac{\exp(-x_i)}{\sum_j \exp(-x_j)}
+
+    Args:
+        dim (int): A dimension along which Softmin will be computed (so every
+            slice along dim will sum to 1).
+    """
+
+    __constants__ = ["dim"]
+    dim: Optional[int]
+
+    def __init__(self, dim: Optional[int] = None) -> None:
+        super().__init__()
+        self.dim = dim
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        if not hasattr(self, "dim"):
+            self.dim = None
+
+    def forward(self, input: Tensor) -> Tensor:
+        return F.softmin(input, self.dim)
+
+    def extra_repr(self) -> str:
+        return f"dim={self.dim}"
+
+
+class Softsign(Module):
+    r"""Applies the element-wise function:
+
+    .. math::
+        \text{SoftSign}(x) = \frac{x}{ 1 + |x|}
+
+    Shape:
+        - Input: :math:`(*)`, where :math:`*` means any number of dimensions.
+        - Output: :math:`(*)`, same shape as the input.
+    """
+
+    def forward(self, input: Tensor) -> Tensor:
+        return F.softsign(input)
+
+
+class GLU(Module):
+    r"""Applies the Gaussian Error Linear Units function.
+
+    .. math::
+        \text{GLU}(a, b) = a \otimes \sigma(b)
+
+    where :math:`a` is the first half of the input matrices and :math:`b` is
+    the second half.
+
+    Args:
+        dim (int): the dimension on which to split the input. Default: -1
+    """
+
+    __constants__ = ["dim"]
+    dim: int
+
+    def __init__(self, dim: int = -1) -> None:
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, input: Tensor) -> Tensor:
+        return F.glu(input, self.dim)
+
+    def extra_repr(self) -> str:
+        return f"dim={self.dim}"
+
+
+class RReLU(Module):
+    r"""Applies the randomized leaky rectified linear unit function, element-wise.
+
+    Method described in the paper:
+    `Empirical Evaluation of Rectified Activations in Convolutional Network <https://arxiv.org/abs/1505.00853>`_.
+
+    Args:
+        lower: lower bound of the uniform distribution. Default: :math:`\frac{1}{8}`
+        upper: upper bound of the uniform distribution. Default: :math:`\frac{1}{3}`
+        inplace: can optionally do the operation in-place. Default: ``False``
+    """
+
+    __constants__ = ["lower", "upper", "inplace"]
+
+    lower: float
+    upper: float
+    inplace: bool
+
+    def __init__(
+        self, lower: float = 1.0 / 8, upper: float = 1.0 / 3, inplace: bool = False
+    ) -> None:
+        super().__init__()
+        self.lower = lower
+        self.upper = upper
+        self.inplace = inplace
+
+    def forward(self, input: Tensor) -> Tensor:
+        return F.rrelu(input, self.lower, self.upper, self.training, self.inplace)
+
+    def extra_repr(self) -> str:
+        inplace_str = ", inplace=True" if self.inplace else ""
+        return f"lower={self.lower}, upper={self.upper}{inplace_str}"

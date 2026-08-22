@@ -10,6 +10,7 @@ from tensorplay.nn import (
     init as init,
     modules as modules,
     parameter as parameter,
+    utils as utils,
 )
 
 

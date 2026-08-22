@@ -53,8 +53,8 @@ def test_blas_family_numerics(device):
     cases = {
         "mm": (lambda: ta @ tb, lambda: ha @ hb),
         "matmul_batched": (lambda: tA @ tB, lambda: hA @ hB),
-        "matmul_vec_mat": (lambda: tv5 @ _mk(b.T.copy(), device),
-                           lambda: hv5 @ _torch_mk(b.T.copy(), device)),
+        "matmul_vec_mat": (lambda: tv5 @ tb,
+                           lambda: hv5 @ hb),
         "mv": (lambda: tp.mv(ta, tv5), lambda: torch.mv(ha, hv5)),
         "dot": (lambda: tp.dot(tv5, tv5), lambda: torch.dot(hv5, hv5)),
         "outer": (lambda: tp.outer(tv4, tv5), lambda: torch.outer(hv4, hv5)),

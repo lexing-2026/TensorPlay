@@ -2,6 +2,14 @@
 
 from .api import compile, is_compiling, reset
 from .graph import Graph, GraphCaptureError, GraphModule, Node, Proxy, Tracer
+from .passes import (
+    ConstFold,
+    DeadCodeElimination,
+    PassBase,
+    PassManager,
+    PassResult,
+    ShapeProp,
+)
 from .registry import (
     get_default_backend,
     list_backends,
@@ -10,14 +18,21 @@ from .registry import (
     register_debug_backend,
     register_experimental_backend,
     set_default_backend,
+    unregister_backend,
 )
 
 __all__ = [
+    "ConstFold",
+    "DeadCodeElimination",
     "Graph",
     "GraphCaptureError",
     "GraphModule",
     "Node",
+    "PassBase",
+    "PassManager",
+    "PassResult",
     "Proxy",
+    "ShapeProp",
     "Tracer",
     "compile",
     "get_default_backend",
@@ -29,5 +44,8 @@ __all__ = [
     "register_experimental_backend",
     "reset",
     "set_default_backend",
+    "unregister_backend",
 ]
 
+
+from .aot import AOTError, build_aot  # noqa: F401

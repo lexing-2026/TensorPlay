@@ -1,13 +1,38 @@
+from typing import cast
+
 import tensorplay as tp
-from .optimizer import Optimizer, _use_grad_for_differentiable
-from ._foreach import _batchable, sgd as _foreach_sgd, sgd_foreach as _sgd_foreach
-from ._fused import sgd as _fused_sgd
-from ._utils import foreach_enabled, scalar_value
+from tensorplay import Tensor
+
+from ._utils import scalar_value
+from .optimizer import (
+    DeviceDict,
+    Optimizer,
+    _default_to_fused_or_foreach,
+    _device_dtype_check_for_fused,
+    _to_scalar,
+    _use_grad_for_differentiable,
+    ParamsT,
+)
+
+
+__all__ = ["SGD", "sgd"]
+
 
 class SGD(Optimizer):
-    def __init__(self, params, lr=1e-3, momentum=0, dampening=0,
-                 weight_decay=0, nesterov=False, *, maximize=False,
-                 foreach=None, differentiable=False, fused=None):
+    def __init__(
+        self,
+        params: ParamsT,
+        lr: float | Tensor = 1e-3,
+        momentum: float = 0,
+        dampening: float = 0,
+        weight_decay: float | Tensor = 0,
+        nesterov: bool = False,
+        *,
+        maximize: bool = False,
+        foreach: bool | None = None,
+        differentiable: bool = False,
+        fused: bool | None = None,
+    ) -> None:
         if isinstance(lr, tp.Tensor) and lr.numel() != 1:
             raise ValueError("Tensor lr must be 1-element")
         if scalar_value(lr, "lr") < 0.0:
@@ -16,11 +41,6 @@ class SGD(Optimizer):
             raise ValueError("Invalid momentum value: {}".format(momentum))
         if scalar_value(weight_decay, "weight_decay") < 0.0:
             raise ValueError("Invalid weight_decay value: {}".format(weight_decay))
-        if dampening < 0.0:
-            raise ValueError("Invalid dampening value: {}".format(dampening))
-        if fused and foreach:
-            # Match torch.optim.SGD's mutually-exclusive dispatch options.
-            raise RuntimeError("`fused` and `foreach` cannot be `True` together.")
 
         defaults = dict(lr=lr, momentum=momentum, dampening=dampening,
                         weight_decay=weight_decay, nesterov=nesterov,
@@ -30,8 +50,13 @@ class SGD(Optimizer):
             raise ValueError("Nesterov momentum requires a momentum and zero dampening")
         super(SGD, self).__init__(params, defaults)
 
-        if fused and differentiable:
-            raise RuntimeError("`fused` does not support `differentiable`")
+        if fused:
+            self._step_supports_amp_scaling = True
+            self._need_device_dtype_check_for_fused = True
+            if differentiable:
+                raise RuntimeError("`fused` does not support `differentiable`")
+            if foreach:
+                raise RuntimeError("`fused` and `foreach` cannot be `True` together.")
 
     def __setstate__(self, state):
         super().__setstate__(state)
@@ -42,172 +67,286 @@ class SGD(Optimizer):
             group.setdefault("differentiable", False)
             group.setdefault("fused", False)
 
+    def _init_group(self, group, params, grads, momentum_buffer_list):
+        has_sparse_grad = False
+        for p in group["params"]:
+            if p.grad is None:
+                continue
+            if group["fused"] and getattr(
+                self, "_need_device_dtype_check_for_fused", True
+            ):
+                _device_dtype_check_for_fused(p)
+                self._need_device_dtype_check_for_fused = False
+            params.append(p)
+            grads.append(p.grad)
+            if p.grad.is_sparse:
+                has_sparse_grad = True
+            if group["momentum"] != 0:
+                momentum_buffer_list.append(self.state[p].get("momentum_buffer"))
+        return has_sparse_grad
+
     @_use_grad_for_differentiable
     def step(self, closure=None):
         loss = None
         if closure is not None:
-            loss = closure()
+            with tp.enable_grad():
+                loss = closure()
 
         for group in self.param_groups:
-            weight_decay = group['weight_decay']
-            momentum = group['momentum']
-            dampening = group['dampening']
-            nesterov = group['nesterov']
-            lr = group['lr']
-            maximize = group.get('maximize', False)
-            foreach = group.get('foreach', None)
-            fused = group.get('fused', False)
-
-            active = [p for p in group['params'] if p.grad is not None]
-            if active and fused:
-                if any(p.grad.is_sparse or p.is_complex() or
-                       not p.is_floating_point() for p in active):
-                    raise RuntimeError(
-                        "`fused` does not support sparse gradients or complex/non-floating parameters"
-                    )
-                # The native fused kernels consume flat contiguous buffers.
-                # Preserve Torch's logical-gradient behavior for strided views
-                # by materializing only those gradients.
-                fused_grads = [
-                    p.grad if p.grad.is_contiguous() else p.grad.clone()
-                    for p in active
-                ]
-                fused_buffers = []
-                candidate_buffers = []
-                fused_state_valid = True
-                if momentum != 0:
-                    states = [self.state.setdefault(p, {}) for p in active]
-                    has_buffers = ["momentum_buffer" in state for state in states]
-                    if all(has_buffers):
-                        fused_buffers = [state["momentum_buffer"] for state in states]
-                    elif not any(has_buffers):
-                        candidate_buffers = [grad.clone().detach() for grad in fused_grads]
-                        fused_buffers = candidate_buffers
-                    else:
-                        fused_state_valid = False
-                if (fused_state_valid and
-                        not isinstance(weight_decay, tp.Tensor) and
-                        _fused_sgd(
-                            active, fused_grads, fused_buffers,
-                            lr=(lr.to(device=active[0].device)
-                                if isinstance(lr, tp.Tensor) and
-                                lr.device != active[0].device else lr),
-                            momentum=momentum, dampening=dampening,
-                            weight_decay=weight_decay, nesterov=nesterov,
-                            maximize=maximize,
-                            is_first_step=bool(momentum != 0 and candidate_buffers),
-                            grad_scale=getattr(self, "grad_scale", None),
-                            found_inf=getattr(self, "found_inf", None),
-                        )):
-                    if candidate_buffers:
-                        for p, buffer in zip(active, candidate_buffers):
-                            self.state[p]["momentum_buffer"] = buffer
-                    continue
-
-            if (active and not fused and foreach_enabled(group, active)
-                    and not group.get('differentiable', False)):
-                params = active
-                # Torch's foreach optimizer accepts strided gradients and
-                # consumes their logical values.  The native TensorPlay
-                # kernel intentionally uses flat pointers, so materialize
-                # only the uncommon non-contiguous gradients (ResNet's final
-                # linear weight is one such view) instead of disabling the
-                # whole horizontal-fusion path.
-                grads = [
-                    p.grad if p.grad.is_contiguous() else p.grad.clone()
-                    for p in active
-                ]
-                first_momentum_step = False
-                candidate_buffers = None
-                can_foreach = True
-                if momentum != 0:
-                    states = [self.state.setdefault(p, {}) for p in active]
-                    has_buffers = ["momentum_buffer" in state for state in states]
-                    if all(has_buffers):
-                        buffers = [state["momentum_buffer"] for state in states]
-                    elif not any(has_buffers):
-                        # Torch's foreach path initializes every missing
-                        # momentum buffer from the effective gradient, then
-                        # performs the parameter update as one list operation.
-                        # The native kernel applies weight decay and the
-                        # first-step (dampening-free) momentum formula into
-                        # these candidates, so state is published only after
-                        # the native eligibility check succeeds.
-                        candidate_buffers = [grad.clone().detach() for grad in grads]
-                        buffers = candidate_buffers
-                        first_momentum_step = True
-                    else:
-                        can_foreach = False
-                        buffers = []
-                else:
-                    buffers = [tp.Tensor() for _ in active]
-
-                state_lists = ([buffers] if momentum != 0 else [])
-                if (can_foreach and not maximize and
-                        not (isinstance(lr, tp.Tensor) and lr.requires_grad) and
-                        not (isinstance(weight_decay, tp.Tensor) and weight_decay.requires_grad) and
-                        _batchable(params, grads, state_lists)):
-                    fast_success = _foreach_sgd(
-                        params, grads, buffers, lr=lr, momentum=momentum,
-                        dampening=dampening, weight_decay=weight_decay,
-                        nesterov=nesterov,
-                        first_momentum_step=first_momentum_step)
-                    if not fast_success:
-                        fast_success = _sgd_foreach(
-                            params, grads, buffers, lr=lr, momentum=momentum,
-                            dampening=dampening, weight_decay=weight_decay,
-                            nesterov=nesterov, maximize=maximize,
-                            first_momentum_step=first_momentum_step)
-                    if fast_success:
-                        if candidate_buffers is not None:
-                            for p, buffer in zip(active, candidate_buffers):
-                                self.state[p]["momentum_buffer"] = buffer
-                        continue
-                elif can_foreach and maximize:
-                    # The legacy native _foreach_sgd schema predates Torch's
-                    # maximize flag.  Route maximize through the generic
-                    # Torch foreach implementation instead of silently
-                    # applying the descent gradient.
-                    fast_success = _sgd_foreach(
-                        params, grads, buffers, lr=lr, momentum=momentum,
-                        dampening=dampening, weight_decay=weight_decay,
-                        nesterov=nesterov, maximize=True,
-                        first_momentum_step=first_momentum_step)
-                    if fast_success:
-                        if candidate_buffers is not None:
-                            for p, buffer in zip(active, candidate_buffers):
-                                self.state[p]["momentum_buffer"] = buffer
-                        continue
-
-            for p in group['params']:
-                if p.grad is None:
-                    continue
-                d_p = -p.grad if maximize else p.grad
-                
-                if weight_decay != 0:
-                    if isinstance(weight_decay, tp.Tensor) and weight_decay.requires_grad:
-                        d_p = d_p + p * weight_decay
-                    else:
-                        d_p = d_p.add(
-                            p, alpha=scalar_value(weight_decay, "weight_decay")
-                        )
-                
-                if momentum != 0:
-                    param_state = self.state.setdefault(p, {})
-                    if 'momentum_buffer' not in param_state:
-                        buf = param_state['momentum_buffer'] = d_p.clone().detach()
-                    else:
-                        buf = param_state['momentum_buffer']
-                        buf.mul_(momentum).add_(d_p, alpha=1 - dampening)
-                    
-                    if nesterov:
-                        d_p = d_p.add(buf, alpha=momentum)
-                    else:
-                        d_p = buf
-
-                if isinstance(lr, tp.Tensor) and lr.requires_grad:
-                    p.addcmul_(d_p, lr, value=-1)
-                else:
-                    p.add_(d_p, alpha=-scalar_value(lr, "lr"))
+            params, grads, momentum_buffer_list = [], [], []
+            has_sparse_grad = self._init_group(
+                group, params, grads, momentum_buffer_list
+            )
+            sgd(
+                params,
+                grads,
+                momentum_buffer_list,
+                weight_decay=group["weight_decay"],
+                momentum=group["momentum"],
+                lr=group["lr"],
+                dampening=group["dampening"],
+                nesterov=group["nesterov"],
+                maximize=group["maximize"],
+                has_sparse_grad=has_sparse_grad,
+                foreach=group["foreach"],
+                fused=group["fused"],
+                grad_scale=getattr(self, "grad_scale", None),
+                found_inf=getattr(self, "found_inf", None),
+            )
+            if group["momentum"] != 0:
+                for p, momentum_buffer in zip(
+                    params, momentum_buffer_list, strict=True
+                ):
+                    self.state[p]["momentum_buffer"] = momentum_buffer
 
         return loss
+
+
+def _single_tensor_sgd(
+    params,
+    grads,
+    momentum_buffer_list,
+    grad_scale,
+    found_inf,
+    *,
+    weight_decay,
+    momentum,
+    lr,
+    dampening,
+    nesterov,
+    maximize,
+    has_sparse_grad,
+):
+    if grad_scale is not None or found_inf is not None:
+        raise AssertionError("Expected grad_scale and found_inf to be None")
+    lr = _to_scalar(lr)
+    for index, param in enumerate(params):
+        grad = grads[index] if not maximize else -grads[index]
+        if weight_decay != 0:
+            if isinstance(weight_decay, tp.Tensor):
+                if weight_decay.requires_grad:
+                    grad = grad.addcmul_(param.clone(), weight_decay)
+                else:
+                    grad = grad.add(param, alpha=weight_decay)
+            else:
+                grad = grad.add(param, alpha=weight_decay)
+        if momentum != 0:
+            buf = momentum_buffer_list[index]
+            if buf is None:
+                buf = grad.detach().clone()
+                momentum_buffer_list[index] = buf
+            else:
+                buf.mul_(momentum).add_(grad, alpha=1 - dampening)
+            if nesterov:
+                grad = grad.add(buf, alpha=momentum)
+            else:
+                grad = buf
+        if isinstance(lr, tp.Tensor):
+            if lr.requires_grad:
+                param.addcmul_(grad, lr, value=-1)
+            else:
+                param.add_(grad, alpha=-lr)
+        else:
+            param.add_(grad, alpha=-lr)
+
+
+def _multi_tensor_sgd(
+    params,
+    grads,
+    momentum_buffer_list,
+    grad_scale,
+    found_inf,
+    *,
+    weight_decay,
+    momentum,
+    lr,
+    dampening,
+    nesterov,
+    maximize,
+    has_sparse_grad,
+):
+    if grad_scale is not None or found_inf is not None:
+        raise AssertionError("Expected grad_scale and found_inf to be None")
+    if not params:
+        return
+    lr = _to_scalar(lr)
+    grouped_tensors = Optimizer._group_tensors_by_device_and_dtype(
+        [params, grads, momentum_buffer_list], with_indices=True
+    )
+    for (device_params, device_grads, device_buffers), indices in grouped_tensors.values():
+        device_has_sparse_grad = has_sparse_grad and any(
+            grad.is_sparse for grad in device_grads if grad is not None
+        )
+        if maximize:
+            device_grads = tp._foreach_neg(device_grads)
+        if weight_decay != 0:
+            if maximize:
+                tp._foreach_add_(device_grads, device_params, alpha=weight_decay)
+            else:
+                device_grads = tp._foreach_add(
+                    device_grads, device_params, alpha=weight_decay
+                )
+        if momentum != 0:
+            bufs = []
+            all_states = all(buf is not None for buf in device_buffers)
+            if all_states:
+                bufs = list(device_buffers)
+                tp._foreach_mul_(bufs, momentum)
+                tp._foreach_add_(bufs, device_grads, alpha=1 - dampening)
+            else:
+                for index, buf in enumerate(device_buffers):
+                    if buf is None:
+                        buf = device_buffers[index] = momentum_buffer_list[
+                            indices[index]
+                        ] = device_grads[index].detach().clone()
+                    else:
+                        buf.mul_(momentum).add_(device_grads[index], alpha=1 - dampening)
+                    bufs.append(buf)
+            if nesterov:
+                tp._foreach_add_(device_grads, bufs, alpha=momentum)
+            else:
+                device_grads = bufs
+        if not device_has_sparse_grad:
+            if isinstance(lr, tp.Tensor) and tp.compiler.is_compiling():
+                tp._foreach_add_(device_params, tp._foreach_mul(device_grads, -lr))
+            else:
+                tp._foreach_add_(device_params, device_grads, alpha=-lr)
+        else:
+            for index, param in enumerate(device_params):
+                param.add_(device_grads[index], alpha=-lr)
+
+
+def _fused_sgd(
+    params,
+    grads,
+    momentum_buffer_list,
+    grad_scale,
+    found_inf,
+    *,
+    weight_decay,
+    momentum,
+    lr,
+    dampening,
+    nesterov,
+    maximize,
+    has_sparse_grad,
+):
+    if not params:
+        return
+    if has_sparse_grad:
+        raise RuntimeError("`_fused_sgd` does not support sparse gradients")
+    grad_scale_dict: DeviceDict = (
+        {grad_scale.device: grad_scale} if grad_scale is not None else {}
+    )
+    found_inf_dict: DeviceDict = (
+        {found_inf.device: found_inf} if found_inf is not None else {}
+    )
+
+    no_momentum_buffer = momentum == 0
+    is_first_step = (
+        all(t is None for t in momentum_buffer_list) and not no_momentum_buffer
+    )
+    if is_first_step:
+        for i, g in enumerate(grads):
+            momentum_buffer_list[i] = tp.empty_like(g)
+
+    grouped_tensors = Optimizer._group_tensors_by_device_and_dtype(
+        [params, grads, momentum_buffer_list], with_indices=False
+    )
+    for (device, _), (
+        (device_params_, device_grads_, device_momentum_buffer_list),
+        _,
+    ) in grouped_tensors.items():
+        device_params = cast(list[Tensor], device_params_)
+        device_grads = cast(list[Tensor], device_grads_)
+        device_grad_scale, device_found_inf = None, None
+        if grad_scale is not None:
+            device_grad_scale = grad_scale_dict.setdefault(
+                device, grad_scale.to(device)
+            )
+        if found_inf_dict is not None and found_inf is not None:
+            device_found_inf = found_inf_dict.setdefault(
+                device, found_inf.to(device)
+            )
+        tp._fused_sgd_(
+            device_params,
+            device_grads,
+            []
+            if no_momentum_buffer
+            else cast(list[Tensor], device_momentum_buffer_list),
+            weight_decay=weight_decay,
+            momentum=momentum,
+            lr=lr,
+            dampening=dampening,
+            nesterov=nesterov,
+            maximize=maximize,
+            is_first_step=is_first_step,
+            grad_scale=device_grad_scale,
+            found_inf=device_found_inf,
+        )
+
+
+def sgd(
+    params,
+    d_p_list,
+    momentum_buffer_list,
+    has_sparse_grad=False,
+    foreach=None,
+    fused=None,
+    grad_scale=None,
+    found_inf=None,
+    *,
+    weight_decay,
+    momentum,
+    lr,
+    dampening,
+    nesterov,
+    maximize,
+):
+    if foreach is None and fused is None:
+        fused, foreach = _default_to_fused_or_foreach(
+            params, differentiable=False, use_fused=False
+        )
+    foreach = bool(foreach)
+    fused = bool(fused)
+    if foreach:
+        _multi_tensor_sgd(
+            params, d_p_list, momentum_buffer_list, grad_scale, found_inf,
+            weight_decay=weight_decay, momentum=momentum, lr=lr,
+            dampening=dampening, nesterov=nesterov, maximize=maximize,
+            has_sparse_grad=has_sparse_grad,
+        )
+    elif fused:
+        _fused_sgd(
+            params, d_p_list, momentum_buffer_list, grad_scale, found_inf,
+            weight_decay=weight_decay, momentum=momentum, lr=lr,
+            dampening=dampening, nesterov=nesterov, maximize=maximize,
+            has_sparse_grad=has_sparse_grad,
+        )
+    else:
+        _single_tensor_sgd(
+            params, d_p_list, momentum_buffer_list, grad_scale, found_inf,
+            weight_decay=weight_decay, momentum=momentum, lr=lr,
+            dampening=dampening, nesterov=nesterov, maximize=maximize,
+            has_sparse_grad=has_sparse_grad,
+        )

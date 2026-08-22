@@ -48,3 +48,12 @@ third_party/pybind11/
 third_party/nanobind/
 !third_party/*.py
 !third_party/*.zip
+third_party/torchviz/
+third_party/torchview/
+
+# Object/library build artifacts (never intentionally versioned)
+*.o
+*.obj
+CMakeFiles/
+_deps/
+CMakeCache.txt

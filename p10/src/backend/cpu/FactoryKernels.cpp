@@ -1,13 +1,13 @@
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "Generator.h"
+#include "DistributionsHelper.h"
 #include "Scalar.h"
 #include "Exception.h"
 #include <vector>
 #include <cmath>
 #include <algorithm>
 #include <cstring>
-#include <random>
 
 namespace tensorplay {
 namespace cpu {
@@ -33,16 +33,55 @@ Tensor allocate_cpu_tensor(const std::vector<int64_t>& size, DType dtype, bool p
 
 Tensor rand_kernel(const std::vector<int64_t>& size, DType dtype, Device device) {
     Tensor t(size, dtype, device);
-    if (dtype == DType::Float32) {
-        float* data = t.data_ptr<float>();
-        int64_t n = t.numel();
-        std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-        auto& gen = default_generator().engine();
-        for (int64_t i = 0; i < n; ++i) {
-            data[i] = dist(gen);
+    int64_t n = t.numel();
+    auto& gen = default_generator();
+
+    switch (dtype) {
+        case DType::Float32: {
+            float* data = t.data_ptr<float>();
+            uniform_real_distribution<float> dist(0.0f, 1.0f);
+            const float to_scalar = 1.0f;
+            for (int64_t i = 0; i < n; ++i) {
+                float value = static_cast<float>(dist(&gen));
+                data[i] = value == to_scalar ? 0.0f : value;
+            }
+            break;
         }
-    } else {
-         TP_THROW(NotImplementedError, "rand() only supports Float32 for now");
+        case DType::Float64: {
+            double* data = t.data_ptr<double>();
+            uniform_real_distribution<double> dist(0.0, 1.0);
+            for (int64_t i = 0; i < n; ++i) {
+                data[i] = dist(&gen);
+            }
+            break;
+        }
+        case DType::Float16:
+        case DType::BFloat16: {
+            // Sample in float precision and cast down, like torch's
+            // opmath-based uniform_ path (with the round-up clamp).
+            if (dtype == DType::Float16) {
+                Half* data = t.data_ptr<Half>();
+                uniform_real_distribution<float> dist(0.0f, 1.0f);
+                const Half to_scalar = static_cast<Half>(1.0f);
+                for (int64_t i = 0; i < n; ++i) {
+                    float value = static_cast<float>(dist(&gen));
+                    Half casted = static_cast<Half>(value);
+                    data[i] = casted == to_scalar ? static_cast<Half>(0.0f) : casted;
+                }
+            } else {
+                BFloat16* data = t.data_ptr<BFloat16>();
+                uniform_real_distribution<float> dist(0.0f, 1.0f);
+                const BFloat16 to_scalar = static_cast<BFloat16>(1.0f);
+                for (int64_t i = 0; i < n; ++i) {
+                    float value = static_cast<float>(dist(&gen));
+                    BFloat16 casted = static_cast<BFloat16>(value);
+                    data[i] = casted == to_scalar ? static_cast<BFloat16>(0.0f) : casted;
+                }
+            }
+            break;
+        }
+        default:
+            TP_THROW(NotImplementedError, "rand() only supports floating dtypes for now");
     }
     return t;
 }
@@ -229,16 +268,61 @@ Tensor logspace_kernel(Scalar start, Scalar end, int64_t steps, double base, DTy
 
 Tensor randn_kernel(const std::vector<int64_t>& size, DType dtype, Device device) {
     Tensor t(size, dtype, device);
-    if (dtype == DType::Float32) {
-        float* data = t.data_ptr<float>();
-        int64_t n = t.numel();
-        std::normal_distribution<float> dist(0.0f, 1.0f);
-        auto& gen = default_generator().engine();
-        for (int64_t i = 0; i < n; ++i) {
-            data[i] = dist(gen);
+    int64_t n = t.numel();
+    auto& gen = default_generator();
+
+    switch (dtype) {
+        case DType::Float32: {
+            float* data = t.data_ptr<float>();
+            if (n >= 16 && t.is_contiguous()) {
+                normal_fill<float>(data, n, 0.0f, 1.0f, &gen);
+            } else {
+                normal_distribution<double> dist(0.0, 1.0);
+                for (int64_t i = 0; i < n; ++i) {
+                    data[i] = static_cast<float>(dist(&gen));
+                }
+            }
+            break;
         }
-    } else {
-         TP_THROW(NotImplementedError, "randn() only supports Float32 for now");
+        case DType::Float64: {
+            double* data = t.data_ptr<double>();
+            if (n >= 16 && t.is_contiguous()) {
+                normal_fill<double>(data, n, 0.0, 1.0, &gen);
+            } else {
+                normal_distribution<double> dist(0.0, 1.0);
+                for (int64_t i = 0; i < n; ++i) {
+                    data[i] = dist(&gen);
+                }
+            }
+            break;
+        }
+        case DType::Float16:
+        case DType::BFloat16: {
+            // Sample in float precision through a stack buffer, then cast.
+            if (n >= 16 && t.is_contiguous()) {
+                if (dtype == DType::Float16) {
+                    normal_fill_cast<Half>(t.data_ptr<Half>(), n, 0.0, 1.0, &gen);
+                } else {
+                    normal_fill_cast<BFloat16>(t.data_ptr<BFloat16>(), n, 0.0, 1.0, &gen);
+                }
+            } else {
+                normal_distribution<double> dist(0.0, 1.0);
+                if (dtype == DType::Float16) {
+                    Half* data = t.data_ptr<Half>();
+                    for (int64_t i = 0; i < n; ++i) {
+                        data[i] = static_cast<Half>(dist(&gen));
+                    }
+                } else {
+                    BFloat16* data = t.data_ptr<BFloat16>();
+                    for (int64_t i = 0; i < n; ++i) {
+                        data[i] = static_cast<BFloat16>(dist(&gen));
+                    }
+                }
+            }
+            break;
+        }
+        default:
+            TP_THROW(NotImplementedError, "randn() only supports floating dtypes for now");
     }
     return t;
 }
@@ -246,31 +330,33 @@ Tensor randn_kernel(const std::vector<int64_t>& size, DType dtype, Device device
 Tensor randint_kernel(int64_t low, int64_t high, const std::vector<int64_t>& size, DType dtype, Device device) {
     Tensor t(size, dtype, device);
     int64_t n = t.numel();
-    auto& gen = default_generator().engine();
-    
+    auto& gen = default_generator();
+    const uint64_t range = static_cast<uint64_t>(high - low);
+    const int64_t base = low;
+
     if (dtype == DType::Int64) {
         int64_t* data = t.data_ptr<int64_t>();
-        std::uniform_int_distribution<int64_t> dist(low, high - 1); 
+        uniform_int_from_to_distribution<int64_t> dist(range, base);
         for (int64_t i = 0; i < n; ++i) {
-            data[i] = dist(gen);
+            data[i] = dist(&gen);
         }
     } else if (dtype == DType::Int32) {
         int32_t* data = t.data_ptr<int32_t>();
-        std::uniform_int_distribution<int32_t> dist((int32_t)low, (int32_t)high - 1);
+        uniform_int_from_to_distribution<int32_t> dist(range, base);
         for (int64_t i = 0; i < n; ++i) {
-            data[i] = dist(gen);
+            data[i] = dist(&gen);
         }
     } else if (dtype == DType::Float32) {
         float* data = t.data_ptr<float>();
-        std::uniform_int_distribution<int64_t> dist(low, high - 1);
+        uniform_int_from_to_distribution<float> dist(range, base);
         for (int64_t i = 0; i < n; ++i) {
-            data[i] = static_cast<float>(dist(gen));
+            data[i] = dist(&gen);
         }
     } else if (dtype == DType::Float64) {
         double* data = t.data_ptr<double>();
-        std::uniform_int_distribution<int64_t> dist(low, high - 1);
+        uniform_int_from_to_distribution<double> dist(range, base);
         for (int64_t i = 0; i < n; ++i) {
-            data[i] = static_cast<double>(dist(gen));
+            data[i] = dist(&gen);
         }
     } else {
          TP_THROW(NotImplementedError, "randint() only supports Int64/Int32/Float32/Float64");
@@ -280,12 +366,31 @@ Tensor randint_kernel(int64_t low, int64_t high, const std::vector<int64_t>& siz
 
 Tensor randperm_kernel(int64_t n, DType dtype, Device device) {
     Tensor t({n}, dtype, device);
-    if (dtype == DType::Int64) {
-        int64_t* data = t.data_ptr<int64_t>();
-        for (int64_t i = 0; i < n; ++i) data[i] = i;
-        std::shuffle(data, data + n, default_generator().engine());
+    if (dtype == DType::Int64 || dtype == DType::Int32) {
+        // Fisher-Yates with the same draw pattern as torch's randperm_cpu:
+        // one 32-bit draw modulo the remaining tail per position.
+        auto& gen = default_generator();
+        if (dtype == DType::Int64) {
+            int64_t* data = t.data_ptr<int64_t>();
+            for (int64_t i = 0; i < n; ++i) data[i] = i;
+            for (int64_t i = 0; i < n - 1; i++) {
+                int64_t z = static_cast<int64_t>(gen.random() % static_cast<uint32_t>(n - i));
+                int64_t sav = data[i];
+                data[i] = data[z + i];
+                data[z + i] = sav;
+            }
+        } else {
+            int32_t* data = t.data_ptr<int32_t>();
+            for (int64_t i = 0; i < n; ++i) data[i] = static_cast<int32_t>(i);
+            for (int64_t i = 0; i < n - 1; i++) {
+                int64_t z = static_cast<int64_t>(gen.random() % static_cast<uint32_t>(n - i));
+                int32_t sav = data[i];
+                data[i] = data[z + i];
+                data[z + i] = sav;
+            }
+        }
     } else {
-        TP_THROW(NotImplementedError, "randperm() only supports Int64");
+        TP_THROW(NotImplementedError, "randperm() only supports Int64/Int32");
     }
     return t;
 }

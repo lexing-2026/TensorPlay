@@ -623,10 +623,7 @@ Tensor multinomial_kernel_cuda(const Tensor& self, int64_t num_samples, bool rep
   if (num_samples == 0) return result;
 
   Tensor uniforms = Tensor::empty({rows * num_samples}, DType::Float32, prob.device());
-  if (curandGenerateUniform(CUDAContext::getCurandGenerator(), uniforms.data_ptr<float>(),
-                            rows * num_samples) != CURAND_STATUS_SUCCESS) {
-    TP_THROW(RuntimeError, "multinomial: curandGenerateUniform failed");
-  }
+  uniforms.uniform_(0.0, 1.0);
 
   constexpr int kThreads = 256;
   Tensor cumdist = Tensor::empty({rows, cols}, DType::Float32, prob.device());
@@ -724,10 +721,7 @@ Tensor sample_kernel_cuda(const Tensor& logits, double temperature, int64_t top_
 
   Tensor result = Tensor::empty({rows}, DType::Int64, input.device());
   Tensor uniforms = Tensor::empty({rows}, DType::Float32, input.device());
-  if (curandGenerateUniform(CUDAContext::getCurandGenerator(), uniforms.data_ptr<float>(), rows) !=
-      CURAND_STATUS_SUCCESS) {
-    TP_THROW(RuntimeError, "sample: curandGenerateUniform failed");
-  }
+  uniforms.uniform_(0.0, 1.0);
 
   constexpr int kThreads = 256;
 

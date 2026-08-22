@@ -27,10 +27,15 @@ set(P10_SOURCES
     src/backend/cpu/ComparisonKernels.cpp
     src/backend/cpu/ConvKernels.cpp
     src/backend/cpu/CopyKernels.cpp
+    src/backend/cpu/SparseKernels.cpp
     src/backend/cpu/FactoryKernels.cpp
     src/backend/cpu/LinearAlgebraKernels.cpp
+    src/backend/cpu/LinalgKernels.cpp
+    src/backend/cpu/Lapack.cpp
     src/backend/cpu/PointwiseKernels.cpp
     src/backend/cpu/PoolingKernels.cpp
+    src/backend/cpu/UpsampleKernels.cpp
+    src/backend/cpu/MiscKernels.cpp
     src/backend/cpu/PadKernels.cpp
     src/backend/cpu/NormalizationKernels.cpp
     src/backend/cpu/RandomKernels.cpp
@@ -40,6 +45,10 @@ set(P10_SOURCES
     src/backend/cpu/ForeachKernels.cpp
     src/backend/cpu/OptimizerKernels.cpp
     src/backend/cpu/LlmReferenceKernels.cpp
+    src/backend/cpu/IndexingKernels.cpp
+    src/backend/cpu/TierOpsKernels.cpp
+    src/backend/cpu/Tier5OpsKernels.cpp
+    src/backend/cpu/SpectralKernels.cpp
     src/Einsum.cpp
     src/TensorIterator.cpp
     src/TensorIteratorReduce.cpp
@@ -52,19 +61,25 @@ if(USE_CUDA)
     list(APPEND P10_SOURCES
         src/backend/cuda/CUDAAllocator.cpp
         src/backend/cuda/CUDAContext.cpp
+        src/backend/cuda/CUDAGenerator.cpp
         src/backend/cuda/NCCLContext.cpp
         src/backend/cuda/CUDARuntime.cpp
         src/backend/cuda/CUDARuntimeKernels.cu
         src/backend/cuda/ArithmeticKernels.cu
         src/backend/cuda/CopyKernels.cu
+        src/backend/cuda/SparseKernels.cu
         src/backend/cuda/FactoryKernels.cu
         src/backend/cuda/EmbeddingKernels.cu
         src/backend/cuda/PointwiseKernels.cu
+        src/backend/cuda/MiscKernels.cu
+        src/backend/cuda/UpsampleKernels.cu
         src/backend/cuda/LinearAlgebraKernels.cu
+        src/backend/cuda/CudaBlasGemm.cpp
         src/backend/cuda/ActivationKernels.cu
         src/backend/cuda/NormalizationKernels.cu
         src/backend/cuda/LossKernels.cu
         src/backend/cuda/ConvKernels.cu
+        src/backend/cuda/PadKernels.cu
         src/backend/cuda/PoolingKernels.cu
         src/backend/cuda/RandomKernels.cu
         src/backend/cuda/ReductionKernels.cu
@@ -73,6 +88,12 @@ if(USE_CUDA)
         src/backend/cuda/AmpKernels.cu
         src/backend/cuda/SamplingKernels.cu
         src/backend/cuda/AttentionKernels.cu
+        src/backend/cuda/IndexingKernels.cu
+        src/backend/cuda/TierOpsKernels.cu
+        src/backend/cuda/TierOpsReduceKernels.cu
+        src/backend/cuda/Tier5OpsKernels.cu
+        src/backend/cuda/Tier5LossesKernels.cu
+        src/backend/cuda/SpectralKernels.cu
     )
 endif()
 
@@ -132,6 +153,16 @@ add_library(p10 ${P10_SOURCES})
 # Enable UNITY_BUILD for faster compilation
 set_target_properties(p10 PROPERTIES UNITY_BUILD OFF)
 
+if(USE_CUDA)
+    # ATen alignment: allow __device__ lambdas and constexpr libm calls in .cu kernels
+    target_compile_options(p10 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda --expt-relaxed-constexpr>)
+    # The local toolkit ships 13.0 headers while nvcc is 13.2; cccl's strict
+    # CUDART-vs-compiler check otherwise rejects any TU that includes
+    # <cub/cub.cuh> (e.g. SparseKernels.cu).  The macro is cccl's documented
+    # escape hatch for exactly this newer-compiler/older-headers pairing.
+    target_compile_definitions(p10 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:CCCL_DISABLE_CTK_COMPATIBILITY_CHECK>)
+endif()
+
 if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
     # Tell DispatchStub (and every TU) that AVX2 kernel copies exist, so the
     # AVX2 dispatch slots are registered and selected at runtime.
@@ -160,8 +191,14 @@ if(WIN32)
 endif()
 
 if(USE_CUDA)
-    target_link_libraries(p10 PRIVATE CUDA::cudart CUDA::cublas CUDA::cublasLt CUDA::curand)
+    target_link_libraries(p10 PRIVATE CUDA::cudart CUDA::cublas CUDA::cublasLt CUDA::cufft CUDA::cusolver)
     target_compile_definitions(p10 PRIVATE USE_CUDA)
+
+    # CUDA 13 moved CUB/thrust under <toolkit>/include/cccl; SparseKernels
+    # includes <cub/cub.cuh>, which resolves only with that dir on the path.
+    if(EXISTS "${CUDAToolkit_INCLUDE_DIRS}/cccl/cub")
+        target_include_directories(p10 PRIVATE "${CUDAToolkit_INCLUDE_DIRS}/cccl")
+    endif()
 
     # NCCL, mirroring pytorch's Dependencies.cmake: option + FindNCCL.cmake,
     # positive USE_NCCL define, graceful downgrade when absent.

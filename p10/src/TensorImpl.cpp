@@ -14,12 +14,16 @@ TensorImpl::TensorImpl()
 }
 
 TensorImpl::TensorImpl(const std::vector<int64_t>& sizes, DType dtype, const Device& device)
+    : TensorImpl(sizes, dtype, device, true) {}
+
+TensorImpl::TensorImpl(const std::vector<int64_t>& sizes, DType dtype,
+                       const Device& device, bool allocate_storage)
     : storage_offset_(0), sizes_and_strides_(sizes), dtype_(dtype), device_(device),
       is_contiguous_(true), is_channels_last_(false) {
     
     shared_state_ = std::make_shared<SharedState>();
     int64_t num_elements = sizes_and_strides_.numel();
-    if (num_elements > 0) {
+    if (allocate_storage && num_elements > 0) {
         size_t total_bytes = static_cast<size_t>(num_elements) * elementSize(dtype);
         Allocator* allocator = getAllocator(device.type());
         shared_state_->storage = Storage(total_bytes, allocator, device);
@@ -71,7 +75,8 @@ TensorImpl::TensorImpl(const TensorImpl& other)
       version_counter_(other.version_counter_),
       is_contiguous_(other.is_contiguous_),
       is_channels_last_(other.is_channels_last_),
-      shared_state_(other.shared_state_) {}
+      shared_state_(other.shared_state_),
+      sparse_state_(other.sparse_state_) {}
 TensorImpl::TensorImpl(TensorImpl&& other) noexcept = default;
 TensorImpl& TensorImpl::operator=(const TensorImpl& other) = default;
 TensorImpl& TensorImpl::operator=(TensorImpl&& other) noexcept = default;
@@ -151,6 +156,7 @@ void TensorImpl::copy_metadata_from(const TensorImpl& other) {
     device_ = other.device_;
     is_contiguous_ = other.is_contiguous_;
     is_channels_last_ = other.is_channels_last_;
+    sparse_state_ = other.sparse_state_;
     // onednn_md_ = other.onednn_md_; // Replaced by shared_state_
 }
 

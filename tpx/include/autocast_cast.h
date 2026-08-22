@@ -12,9 +12,9 @@ namespace tensorplay {
 namespace autocast {
 
 // Graph-aware autocast casting, mirroring ATen/autocast_mode.h.  The pure
-// state lives in p10's autocast_mode.h; everything that needs autograd
-// history recording lives here because TensorPlay's `.to()` is not
-// differentiable on its own (torch relies on ToCopyBackward).
+// state lives in p10's autocast_mode.h; the casting helpers live in tpx
+// because differentiability comes from the differentiable `to`
+// (ToCopyBackward), matching torch's _to_copy_backward.
 
 // Policies correspond to op categories that need code-divergent handling.
 enum class CastPolicy : uint8_t {
@@ -36,11 +36,14 @@ enum class CastPolicy : uint8_t {
 // ------------------------------------------------------------------
 
 inline bool is_autocast_eligible(const Tensor& tensor, DeviceType device_type) {
+    // TP alignment: Tensor exposes device()/dtype() rather than is_cuda()/is_floating_point()
+    const Device dev = tensor.device();
+    const DType dt = tensor.dtype();
     switch (device_type) {
         case DeviceType::CUDA:
-            return tensor.is_cuda() && tensor.is_floating_point();
+            return dev.is_cuda() && isFloatingType(dt);
         case DeviceType::CPU:
-            return tensor.is_cpu() && tensor.is_floating_point();
+            return dev.is_cpu() && isFloatingType(dt);
         default:
             return false;
     }
@@ -113,15 +116,11 @@ inline DType promote_type(DType current, DeviceType device_type, Arg0 arg0, Args
 }
 
 // ------------------------------------------------------------------
-// Cached casting (mirrors at::autocast::cached_cast)
+// Cached casting (mirrors at::autocast::cached_cast).  The cast is
+// differentiable through `to` (ToCopyBackward), so no custom node is needed.
 // ------------------------------------------------------------------
 
-// Performs `tensor.to(to_type)` and, when GradMode is enabled and the input
-// requires grad, records a CastBackward node so gradients flow back in the
-// source dtype (torch gets this for free from the differentiable `to`).
-TORCH_API Tensor cast_with_grad(const Tensor& tensor, DType to_type);
-
-TORCH_API Tensor cached_cast(DType to_type, const Tensor& arg, DeviceType device_type);
+P10_API Tensor cached_cast(DType to_type, const Tensor& arg, DeviceType device_type);
 
 inline std::optional<Tensor> cached_cast(
     DType to_type,

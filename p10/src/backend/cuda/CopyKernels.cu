@@ -1,6 +1,7 @@
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "CUDARuntime.h"
+#include "SparseKernels.h"
 #include "Exception.h"
 #include <cuComplex.h>
 #include <cuda_runtime.h>
@@ -232,6 +233,8 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
 
 TENSORPLAY_LIBRARY_IMPL(CUDA, CopyKernels) {
     m.impl("copy_", copy_kernel);
+    m.impl("sparse_coo_tensor", sparse_coo_tensor_cuda);
+    m.impl("sparse_mask", sparse_mask_cuda);
 }
 
 } // namespace cuda

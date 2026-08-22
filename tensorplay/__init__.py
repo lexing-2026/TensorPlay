@@ -208,10 +208,12 @@ from ._tensor import Tensor
 from ._C import (tensor, DType, Size, Scalar, Device, DeviceType,
                 from_dlpack, to_dlpack, set_printoptions,
                 default_generator, manual_seed, seed, initial_seed, Generator,
+                get_rng_state, set_rng_state,
                 set_num_threads, get_num_threads, get_thread_num,
                 in_parallel_region, get_parallel_info)
 from .autograd import no_grad, enable_grad, set_grad_enabled, is_grad_enabled
-from .serialization import save, load
+from .serialization import save, load, inspect_checkpoint
+from .random import fork_rng
 
 # -------------------------------------------------------------------------
 # DType Aliases
@@ -254,12 +256,14 @@ __all__ = [
     "uint8", "int8", "int16", "uint16", "uint32", "uint64", "int32", "int64",
     "float16", "bfloat16", "float32", "float64", "complex32", "complex64", "complex128", "bcomplex32", "bool",
     "half", "float", "double", "short", "int", "long", "cfloat", "cdouble", "chalf",
-    "save", "load", "as_tensor",
+    "save", "load", "inspect_checkpoint", "as_tensor",
     "no_grad", "enable_grad", "set_grad_enabled", "is_grad_enabled",
     "allclose",
-    "compile", "compiler",
+    "compile", "compiler", "graph",
     "set_num_threads", "get_num_threads", "get_thread_num",
     "in_parallel_region", "get_parallel_info",
+    "default_generator", "manual_seed", "seed", "initial_seed", "Generator",
+    "get_rng_state", "set_rng_state", "fork_rng",
     "__config__",
 ]
 
@@ -393,6 +397,7 @@ if not TYPE_CHECKING:
 
 
 from .functional import *
+from ._shape_funcs import *
 from ._einsum import einsum
 from .utils.comparison import allclose
 from . import compiler
@@ -406,15 +411,13 @@ from . import stax
 from . import backends
 from . import optim
 from . import nn
+from . import graph
 from . import autograd
 from . import distributed
 from . import utils
 from . import __config__
 
 from . import amp
-from .amp.autocast_mode import _install_autocast
-
-_install_autocast()
 
 from .amp.autocast_mode import (  # noqa: E402
     autocast_decrement_nesting,
@@ -514,6 +517,37 @@ def is_tensor(obj: _Any, /) -> _TypeIs["tensorplay.Tensor"]:
     return isinstance(obj, tensorplay.Tensor)
 
 
+def as_tensor(data, dtype=None, device=None):
+    r"""Convert ``data`` into a tensor, sharing storage when possible.
+
+    If ``data`` is already a tensor with the requested dtype and device, it is
+    returned as-is (no copy).  Otherwise it is converted, mirroring
+    ``torch.as_tensor``.
+
+    Args:
+        data (tensor, list, or scalar): Initial data for the tensor.
+        dtype (:class:`tensorplay.DType`, optional): the desired data type of
+            the returned tensor.
+        device (:class:`tensorplay.Device`, str, optional): the device of the
+            constructed tensor.
+
+    Example::
+
+        >>> x = tensorplay.tensor([1.0, 2.0])
+        >>> tensorplay.as_tensor(x) is x
+        True
+        >>> tensorplay.as_tensor([0, 1, 2], dtype=tensorplay.int64).dtype == tensorplay.int64
+        True
+    """
+    if isinstance(data, tensorplay.Tensor):
+        if dtype is not None and data.dtype != dtype:
+            data = data.to(dtype)
+        if device is not None and data.device != tensorplay.device(device):
+            data = data.to(device)
+        return data
+    return tensor(data, dtype=dtype, device=device)
+
+
 _GLOBAL_DEVICE_CONTEXT = threading.local()
 
 newaxis: None = None
@@ -579,16 +613,16 @@ from tensorplay import (
 
 if TYPE_CHECKING:
     # Import the following modules during type checking to enable code intelligence features,
-    # such as auto-completion in tools like pylance, even when these modules are not explicitly
+    # such as auto-completion for tools like pylance, even when these modules are not explicitly
     # imported in user code.
     from tensorplay import (
-        onnx as onnx,
+        export as export,
     )
 
 else:
     _lazy_modules = {
         "audio",
-        "onnx",
+        "export",
         "vision",
     }
 
