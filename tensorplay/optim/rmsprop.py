@@ -1,19 +1,20 @@
 import tensorplay as tp
 
 from ._utils import (
-    add_weight_decay,
-    capturable_supported,
-    gradient,
     scalar_value,
-    foreach_enabled,
-    ensure_state_step,
-    state_step,
     validate_nonnegative,
-    validate_unit_interval,
     zeros_like,
 )
-from .optimizer import Optimizer, _use_grad_for_differentiable
-from ._foreach import rmsprop as _foreach_rmsprop
+from .optimizer import (
+    Optimizer,
+    _default_to_fused_or_foreach,
+    _disable_dynamo_if_unsupported,
+    _get_capturable_supported_devices,
+    _get_scalar_dtype,
+    _to_scalar,
+    _use_grad_for_differentiable,
+    _view_as_real,
+)
 
 
 class RMSprop(Optimizer):
@@ -62,106 +63,274 @@ class RMSprop(Optimizer):
                         device=p.device if group["capturable"] else tp.device("cpu"),
                     )
 
+    def _init_group(
+        self, group, params_with_grad, grads, square_avgs,
+        momentum_buffer_list, grad_avgs, state_steps,
+    ):
+        has_complex = False
+        for p in group["params"]:
+            if p.grad is None:
+                continue
+            has_complex |= p.is_complex()
+            params_with_grad.append(p)
+            if p.grad.is_sparse:
+                raise RuntimeError("RMSprop does not support sparse gradients")
+            grads.append(p.grad)
+
+            state = self.state[p]
+            if not state:
+                state["step"] = tp.zeros(
+                    (), dtype=_get_scalar_dtype(),
+                    device=p.device if group["capturable"] else tp.device("cpu"),
+                )
+                state["square_avg"] = zeros_like(p)
+                if group["momentum"] > 0:
+                    state["momentum_buffer"] = zeros_like(p)
+                if group["centered"]:
+                    state["grad_avg"] = zeros_like(p)
+
+            square_avgs.append(state["square_avg"])
+            state_steps.append(state["step"])
+            if group["momentum"] > 0:
+                momentum_buffer_list.append(state["momentum_buffer"])
+            if group["centered"]:
+                grad_avgs.append(state["grad_avg"])
+        return has_complex
+
     @_use_grad_for_differentiable
     def step(self, closure=None):
-        loss = closure() if closure is not None else None
+        loss = None
+        if closure is not None:
+            with tp.enable_grad():
+                loss = closure()
+
         for group in self.param_groups:
-            lr = group["lr"]
-            alpha = scalar_value(group["alpha"], "alpha")
-            eps = scalar_value(group["eps"], "eps")
-            weight_decay = scalar_value(group["weight_decay"], "weight_decay")
-            momentum = scalar_value(group["momentum"], "momentum")
-            centered = group["centered"]
-            maximize = group.get("maximize", False)
-            capturable = group.get("capturable", False)
-            differentiable = group.get("differentiable", False)
-
-            active = [p for p in group["params"] if p.grad is not None]
-            for p in active:
-                if p.grad.is_sparse:
-                    raise RuntimeError("RMSprop does not support sparse gradients")
-                state = self.state[p]
-                if not state:
-                    state["step"] = tp.tensor(
-                        0.0, dtype=tp.float32,
-                        device=p.device if capturable else tp.device("cpu"),
-                    )
-                    state["square_avg"] = zeros_like(p)
-                    if momentum > 0:
-                        state["momentum_buffer"] = zeros_like(p)
-                    if centered:
-                        state["grad_avg"] = zeros_like(p)
-
-            if active and foreach_enabled(group, active):
-                steps = [
-                    ensure_state_step(self.state[p], param=p,
-                                      capturable=capturable)
-                    for p in active
-                ]
-                square_avgs = [self.state[p]["square_avg"] for p in active]
-                grad_avgs = ([self.state[p]["grad_avg"] for p in active]
-                             if centered else [])
-                momentum_buffers = ([self.state[p]["momentum_buffer"] for p in active]
-                                    if momentum > 0 else [])
-                if _foreach_rmsprop(
-                        active, [p.grad for p in active], square_avgs,
-                        grad_avgs, momentum_buffers, steps,
-                        lr=lr, alpha=alpha, eps=eps,
-                        weight_decay=weight_decay, momentum=momentum,
-                        centered=centered, maximize=maximize,
-                        capturable=capturable, differentiable=differentiable):
-                    continue
-
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                if p.grad.is_sparse:
-                    raise RuntimeError("RMSprop does not support sparse gradients")
-                state = self.state[p]
-
-                grad = gradient(p, maximize)
-                grad = add_weight_decay(p, grad, weight_decay)
-                if capturable:
-                    capturable_supported(p)
-                state_step(state, param=p, capturable=capturable)
-                is_complex = p.is_complex()
-                param = tp.view_as_real(p) if is_complex else p
-                grad = tp.view_as_real(grad) if is_complex else grad
-                square_avg = tp.view_as_real(state["square_avg"]) if is_complex else state["square_avg"]
-                momentum_buffer = (
-                    tp.view_as_real(state["momentum_buffer"])
-                    if momentum > 0 and is_complex else
-                    (state["momentum_buffer"] if momentum > 0 else None)
-                )
-                grad_avg = (
-                    tp.view_as_real(state["grad_avg"])
-                    if centered and is_complex else
-                    (state["grad_avg"] if centered else None)
-                )
-                square_avg.mul_(alpha).addcmul_(grad, grad, value=1.0 - alpha)
-
-                if centered:
-                    grad_avg.lerp_(grad, 1.0 - alpha)
-                    avg = square_avg.addcmul(
-                        grad_avg, grad_avg, value=-1.0
-                    ).sqrt_()
-                else:
-                    avg = square_avg.sqrt()
-                if differentiable:
-                    avg = avg.add(eps)
-                else:
-                    avg.add_(eps)
-
-                if momentum > 0:
-                    buf = momentum_buffer
-                    buf.mul_(momentum).addcdiv_(grad, avg)
-                    if isinstance(lr, tp.Tensor):
-                        param.add_(buf * (-lr))
-                    else:
-                        param.add_(buf, alpha=-lr)
-                else:
-                    if isinstance(lr, tp.Tensor):
-                        param.add_(grad / avg * (-lr))
-                    else:
-                        param.addcdiv_(grad, avg, value=-lr)
+            params_with_grad = []
+            grads = []
+            square_avgs = []
+            grad_avgs = []
+            momentum_buffer_list = []
+            state_steps = []
+            has_complex = self._init_group(
+                group, params_with_grad, grads, square_avgs,
+                momentum_buffer_list, grad_avgs, state_steps,
+            )
+            rmsprop(
+                params_with_grad,
+                grads,
+                square_avgs,
+                grad_avgs,
+                momentum_buffer_list,
+                state_steps,
+                lr=group["lr"],
+                alpha=group["alpha"],
+                eps=group["eps"],
+                weight_decay=group["weight_decay"],
+                momentum=group["momentum"],
+                centered=group["centered"],
+                foreach=group["foreach"],
+                maximize=group["maximize"],
+                differentiable=group["differentiable"],
+                capturable=group["capturable"],
+                has_complex=has_complex,
+            )
         return loss
+
+
+def _single_tensor_rmsprop(
+    params, grads, square_avgs, grad_avgs, momentum_buffer_list, state_steps,
+    *, lr, alpha, eps, weight_decay, momentum, centered, maximize,
+    differentiable, capturable, has_complex,
+):
+    if not tp.compiler.is_compiling():
+        lr = _to_scalar(lr)
+
+    for i, param in enumerate(params):
+        step = state_steps[i]
+        if not tp.compiler.is_compiling() and capturable:
+            supported = _get_capturable_supported_devices()
+            if not (
+                param.device.type == step.device.type
+                and param.device.type in supported
+            ):
+                raise AssertionError(
+                    "If capturable=True, params and state_steps must be on "
+                    f"supported devices: {supported}."
+                )
+
+        grad = grads[i] if not maximize else -grads[i]
+        step.add_(1)
+        if weight_decay != 0:
+            grad = grad.add(param, alpha=weight_decay)
+
+        is_complex_param = param.is_complex()
+        if is_complex_param:
+            param = tp.view_as_real(param)
+            grad = tp.view_as_real(grad)
+            square_avg = tp.view_as_real(square_avgs[i])
+        else:
+            square_avg = square_avgs[i]
+
+        square_avg.mul_(alpha).addcmul_(grad, grad, value=1 - alpha)
+        if centered:
+            grad_avg = grad_avgs[i]
+            if is_complex_param:
+                grad_avg = tp.view_as_real(grad_avg)
+            grad_avg.lerp_(grad, 1 - alpha)
+            avg = square_avg.addcmul(
+                grad_avg, grad_avg, value=-1
+            ).sqrt_()
+        else:
+            avg = square_avg.sqrt()
+        avg = avg.add(eps) if differentiable else avg.add_(eps)
+
+        if momentum > 0:
+            buf = momentum_buffer_list[i]
+            if is_complex_param:
+                buf = tp.view_as_real(buf)
+            buf.mul_(momentum).addcdiv_(grad, avg)
+            if isinstance(lr, tp.Tensor):
+                param.add_(buf * (-lr))
+            else:
+                param.add_(buf, alpha=-lr)
+        elif isinstance(lr, tp.Tensor):
+            param.add_(grad / avg * (-lr))
+        else:
+            param.addcdiv_(grad, avg, value=-lr)
+
+
+def _multi_tensor_rmsprop(
+    params, grads, square_avgs, grad_avgs, momentum_buffer_list, state_steps,
+    *, lr, alpha, eps, weight_decay, momentum, centered, maximize,
+    differentiable, capturable, has_complex,
+):
+    if len(params) == 0:
+        return
+    if differentiable:
+        raise AssertionError("_foreach ops don't support autograd")
+
+    if not tp.compiler.is_compiling() and capturable:
+        supported = _get_capturable_supported_devices()
+        if not all(
+            p.device.type == step.device.type
+            and p.device.type in supported
+            for p, step in zip(params, state_steps)
+        ):
+            raise AssertionError(
+                "If capturable=True, params and state_steps must be on "
+                f"supported devices: {supported}."
+            )
+
+    if not tp.compiler.is_compiling():
+        lr = _to_scalar(lr)
+    grouped = Optimizer._group_tensors_by_device_and_dtype(
+        [params, grads, square_avgs, grad_avgs, momentum_buffer_list, state_steps]
+    )
+    for (
+        grouped_params, grouped_grads, grouped_square_avgs, grouped_grad_avgs,
+        grouped_momentum_buffer_list, grouped_state_steps,
+    ), _ in grouped.values():
+        if has_complex:
+            states_and_grads = [grouped_grads, grouped_square_avgs]
+            if momentum > 0:
+                states_and_grads.append(grouped_momentum_buffer_list)
+            if centered:
+                states_and_grads.append(grouped_grad_avgs)
+            _view_as_real(grouped_params, *states_and_grads)
+
+        if maximize:
+            grouped_grads = tp._foreach_neg(grouped_grads)
+
+        if (
+            not tp.compiler.is_compiling()
+            and grouped_state_steps[0].device.type == "cpu"
+        ):
+            tp._foreach_add_(
+                grouped_state_steps,
+                tp.tensor(
+                    1.0, dtype=grouped_state_steps[0].dtype,
+                    device=tp.device("cpu"),
+                ),
+                alpha=1.0,
+            )
+        else:
+            tp._foreach_add_(grouped_state_steps, 1)
+
+        if weight_decay != 0:
+            if maximize:
+                tp._foreach_add_(grouped_grads, grouped_params, alpha=weight_decay)
+            else:
+                grouped_grads = tp._foreach_add(
+                    grouped_grads, grouped_params, alpha=weight_decay
+                )
+
+        tp._foreach_mul_(grouped_square_avgs, alpha)
+        tp._foreach_addcmul_(
+            grouped_square_avgs, grouped_grads, grouped_grads, value=1 - alpha
+        )
+        if centered:
+            tp._foreach_lerp_(grouped_grad_avgs, grouped_grads, 1 - alpha)
+            avg = tp._foreach_addcmul(
+                grouped_square_avgs, grouped_grad_avgs, grouped_grad_avgs,
+                value=-1,
+            )
+            tp._foreach_sqrt_(avg)
+            tp._foreach_add_(avg, eps)
+        else:
+            avg = tp._foreach_sqrt(grouped_square_avgs)
+            tp._foreach_add_(avg, eps)
+
+        if momentum > 0:
+            tp._foreach_mul_(grouped_momentum_buffer_list, momentum)
+            tp._foreach_addcdiv_(grouped_momentum_buffer_list, grouped_grads, avg)
+            if capturable and isinstance(lr, tp.Tensor):
+                momentum_lr = tp._foreach_mul(grouped_momentum_buffer_list, -lr)
+                tp._foreach_add_(grouped_params, momentum_lr)
+            else:
+                lr_value = scalar_value(lr, "lr")
+                tp._foreach_add_(
+                    grouped_params, grouped_momentum_buffer_list, alpha=-lr_value
+                )
+        elif capturable and isinstance(lr, tp.Tensor):
+            tp._foreach_div_(avg, -lr)
+            tp._foreach_addcdiv_(grouped_params, grouped_grads, avg)
+        else:
+            lr_value = scalar_value(lr, "lr")
+            tp._foreach_addcdiv_(
+                grouped_params, grouped_grads, avg, value=-lr_value
+            )
+
+
+@_disable_dynamo_if_unsupported(single_tensor_fn=_single_tensor_rmsprop)
+def rmsprop(
+    params, grads, square_avgs, grad_avgs, momentum_buffer_list, state_steps,
+    foreach=None, maximize=False, differentiable=False, capturable=False,
+    has_complex=False, *, lr, alpha, eps, weight_decay, momentum, centered,
+):
+    if not tp.compiler.is_compiling() and not all(
+        isinstance(value, tp.Tensor) for value in state_steps
+    ):
+        raise RuntimeError(
+            "API has changed, `state_steps` argument must contain a list of "
+            "singleton tensors"
+        )
+    if foreach is None:
+        _, foreach = _default_to_fused_or_foreach(
+            params, differentiable, use_fused=False
+        )
+    if foreach:
+        _multi_tensor_rmsprop(
+            params, grads, square_avgs, grad_avgs, momentum_buffer_list,
+            state_steps, lr=lr, alpha=alpha, eps=eps,
+            weight_decay=weight_decay, momentum=momentum, centered=centered,
+            maximize=maximize, differentiable=differentiable,
+            capturable=capturable, has_complex=has_complex,
+        )
+    else:
+        _single_tensor_rmsprop(
+            params, grads, square_avgs, grad_avgs, momentum_buffer_list,
+            state_steps, lr=lr, alpha=alpha, eps=eps,
+            weight_decay=weight_decay, momentum=momentum, centered=centered,
+            maximize=maximize, differentiable=differentiable,
+            capturable=capturable, has_complex=has_complex,
+        )

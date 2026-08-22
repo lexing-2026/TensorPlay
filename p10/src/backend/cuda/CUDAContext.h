@@ -7,7 +7,7 @@
 #endif
 #include <cublas_v2.h>
 #include <cublasLt.h>
-#include <curand.h>
+#include <cusolverDn.h>
 #include <cuda_runtime.h>
 
 namespace tensorplay {
@@ -20,9 +20,7 @@ public:
 #endif
     static cublasHandle_t getCublasHandle();
     static cublasLtHandle_t getCublasLtHandle();
-    static curandGenerator_t getCurandGenerator();
-    static void manual_seed(uint64_t seed);
-    static void manual_seed_all(uint64_t seed);
+    static cusolverDnHandle_t getCusolverDnHandle();
 };
 
 // True once this process has made a successful CUDA runtime call. Seeding and

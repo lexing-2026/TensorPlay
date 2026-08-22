@@ -131,6 +131,9 @@ def foreach_enabled(group, params):
     setting = group.get("foreach", None)
     if setting is True and group.get("differentiable", False):
         raise RuntimeError("_foreach ops don't support autograd")
+    if group.get("capturable", False) and params:
+        for param in params:
+            capturable_supported(param)
     if setting is not None:
         return bool(setting)
     if group.get("differentiable", False):

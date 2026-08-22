@@ -112,11 +112,10 @@ if(USE_CUDA)
             
             # List of DLLs to bundle
             # We use glob to find versioned DLLs (e.g. cublas64_11.dll)
-            set(CUDA_DLL_PATTERNS 
+            set(CUDA_DLL_PATTERNS
                 "cudart64_*.dll"
                 "cublas64_*.dll"
                 "cublasLt64_*.dll"
-                "curand64_*.dll"
                 "nvrtc64_*.dll"
             )
             
@@ -710,7 +709,7 @@ add_custom_command(
             OUTPUT ${GEN_HEADER} ${GEN_CPP} ${GEN_BINDINGS_HEADER}
                    ${GEN_AUTOGRAD_NODES_H} ${GEN_TPX_OPS_H} ${GEN_TPX_OPS_CPP}
                    ${GEN_TPX_AUTOGRAD_REG_CPP} ${GEN_AUTOCAST_CPP} ${GEN_TPX_REDISPATCH_H}
-            COMMAND ${Python_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/codegen/gen.py
+            COMMAND ${CMAKE_COMMAND} -E env PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR} ${Python_EXECUTABLE} -m tools.codegen.main
                     --yaml ${CMAKE_CURRENT_SOURCE_DIR}/config/native_functions.yaml
                     --derivatives ${CMAKE_CURRENT_SOURCE_DIR}/config/derivatives.yaml
                     --out_dir ${GEN_INCLUDE_DIR}
@@ -719,6 +718,16 @@ add_custom_command(
                 ${CMAKE_CURRENT_SOURCE_DIR}/config/native_functions.yaml
                 ${CMAKE_CURRENT_SOURCE_DIR}/config/derivatives.yaml
                 ${CMAKE_CURRENT_SOURCE_DIR}/tools/codegen/gen.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/tools/codegen/main.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/tools/codegen/model.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/tools/codegen/api_types.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/tools/codegen/gen_api.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/tools/codegen/gen_autograd.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/tools/codegen/gen_autocast.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/tools/codegen/gen_bindings.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/tools/codegen/gen_python.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/tools/codegen/gen_pyi.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/tools/codegen/gen_tpx.py
             COMMENT "Generating Tensor methods, bindings and pyi stubs from native_functions.yaml"
         )
 
@@ -750,6 +759,7 @@ pybind11_add_module(_C
     src/bindings/python/Size.cpp
     src/bindings/python/Generator.cpp
     src/bindings/python/Autograd.cpp
+    src/bindings/python/Autocast.cpp
     src/bindings/python/Ops.cpp
     src/bindings/python/Tensor.cpp
     src/bindings/python/Stax.cpp

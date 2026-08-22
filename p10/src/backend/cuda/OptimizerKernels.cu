@@ -12,6 +12,33 @@
 #include <string>
 #include <vector>
 
+// ---------------------------------------------------------------------------
+// Torch-aligned multi-tensor apply primitives.
+// Reference: aten/src/ATen/native/cuda/MultiTensorApply.cuh:16-63
+//   kILP=4, kChunkSize=65536, kBlockSize=512,
+//   is_aligned / load_store (aligned_vec_t → LDG.128/STG.128)
+//   ForeachFunctors.cuh:109/165 — load_args/store_args with bounds checks.
+// ---------------------------------------------------------------------------
+constexpr int kOptILP = 4;
+constexpr int64_t kFusedChunk = 65536;
+constexpr int64_t kFusedBlock = 512;
+
+template <typename T>
+__device__ __forceinline__ bool opt_is_aligned(T* p) {
+    return (reinterpret_cast<uintptr_t>(p) & ((kOptILP * sizeof(T)) - 1)) == 0;
+}
+
+template <typename T>
+struct alignas(kOptILP * sizeof(T)) OptVec { T v[kOptILP]; };
+
+template <typename T>
+__device__ __forceinline__ void opt_load_store(
+    T* dst, T* src, int64_t dst_off, int64_t src_off) {
+    using LT = OptVec<T>;
+    reinterpret_cast<LT*>(dst)[dst_off] = reinterpret_cast<const LT*>(src)[src_off];
+}
+
+
 namespace tensorplay {
 namespace cuda {
 namespace {
@@ -390,212 +417,236 @@ const float* optional_fused_float_ptr(const std::optional<Tensor>& value,
     return value->data_ptr<float>();
 }
 
-template <typename scalar_t, typename math_t, typename lr_t>
-__global__ void fused_sgd_kernel(scalar_t* const* params,
-                                 scalar_t* const* grads,
-                                 scalar_t* const* momentum_buffers,
-                                 const int64_t* numels,
-                                 const lr_t* tensor_lr,
-                                 double scalar_lr,
-                                 double momentum,
-                                 double dampening,
-                                 double weight_decay,
-                                 int nesterov,
-                                 int maximize,
-                                 int is_first_step,
-                                 const float* grad_scale,
-                                 const float* found_inf,
-                                 int64_t parameter_count) {
-    const int64_t list_index = static_cast<int64_t>(blockIdx.x);
-    if (list_index >= parameter_count || (found_inf && *found_inf == 1.0f)) return;
-    const math_t lr = tensor_lr
-        ? static_cast<math_t>(tensor_lr[0]) : static_cast<math_t>(scalar_lr);
-    scalar_t* param = params[list_index];
-    scalar_t* grad = grads[list_index];
-    scalar_t* buffer = momentum_buffers[list_index];
-    for (int64_t i = static_cast<int64_t>(threadIdx.x);
-         i < numels[list_index]; i += static_cast<int64_t>(blockDim.x)) {
-        math_t g = static_cast<math_t>(grad[i]);
-        math_t p = static_cast<math_t>(param[i]);
-        if (grad_scale) {
-            g /= static_cast<math_t>(*grad_scale);
-            grad[i] = static_cast<scalar_t>(g);
+
+// ---------------------------------------------------------------------------
+// Dual-path fused optimizer kernels (torch fused_adam_utils.cuh:169-285).
+// Same kernel handles both vectorized and scalar paths; each chunk chooses
+// independently based on pointer alignment. This eliminates batch-level
+// fallback for odd-sized tensors.
+// ---------------------------------------------------------------------------
+
+namespace {
+__device__ __forceinline__ void opt_load_args(
+    float r[][kOptILP], float** args, int depth_count,
+    int64_t i_start, int64_t csz, int64_t n) {
+#pragma unroll
+    for (int ii = 0; ii < kOptILP; ++ii) {
+        const int64_t i = i_start + threadIdx.x + ii * blockDim.x;
+        for (int d = 0; d < depth_count; ++d) {
+            r[d][ii] = 0.f;
+            if (i < n && i < csz) r[d][ii] = args[d][i];
         }
-        if (maximize) g = -g;
-        if (weight_decay != 0.0) {
-            g += static_cast<math_t>(weight_decay) * p;
-        }
-        if (momentum != 0.0) {
-            math_t buf = static_cast<math_t>(buffer[i]);
-            if (is_first_step) {
-                buf = g;
-            } else {
-                buf = static_cast<math_t>(momentum) * buf +
-                    static_cast<math_t>(1.0 - dampening) * g;
+    }
+}
+__device__ __forceinline__ void opt_store_args(
+    float** dst, float r[][kOptILP], int depth_count,
+    int64_t i_start, int64_t csz, int64_t n, int skip_grad, const float* gs) {
+#pragma unroll
+    for (int ii = 0; ii < kOptILP; ++ii) {
+        const int64_t i = i_start + threadIdx.x + ii * blockDim.x;
+        if (i < n && i < csz) {
+            for (int d = 0; d < depth_count; ++d) {
+                if (d == 1 && !gs) continue;
+                dst[d][i] = r[d][ii];
             }
-            buffer[i] = static_cast<scalar_t>(buf);
-            g = nesterov ? g + static_cast<math_t>(momentum) * buf : buf;
         }
-        param[i] = static_cast<scalar_t>(p - lr * g);
+    }
+}
+} // anonymous namespace
+
+template <typename lr_t, int DEPTH, bool ADAMW, bool AMSGRAD>
+__global__ void __launch_bounds__(512, 2) fused_adam_kernel(
+    float* const* params, float* const* grads,
+    float* const* exp_avgs, float* const* exp_avg_sqs,
+    float* const* max_exp_avg_sqs,
+    float* const* state_steps,
+    const int64_t* numels,
+    const int32_t* b2t, const int64_t* b2c,
+    int64_t chunk_size,
+    const lr_t* tensor_lr, double scalar_lr,
+    double beta1, double beta2, double weight_decay, double eps,
+    int maximize,
+    const float* grad_scale, const float* found_inf,
+    int64_t parameter_count) {
+    constexpr int P=0, G=1, M=2, V=3, N=4;
+    const int64_t tloc = static_cast<int64_t>(b2t[blockIdx.x]);
+    if (tloc >= parameter_count || (found_inf && *found_inf == 1.0f)) return;
+
+    const float lr = tensor_lr ? static_cast<float>(tensor_lr[0]) : static_cast<float>(scalar_lr);
+    const float step = state_steps[tloc][0];
+    const float bc1 = 1.f - powf(beta1, step);
+    const float bc2s = sqrtf(1.f - powf(beta2, step));
+    const float ss = lr / bc1;
+    const float b2v = static_cast<float>(beta2);
+    const float omb1 = 1.f - static_cast<float>(beta1);
+    const float omb2 = 1.f - b2v;
+
+    float* args[DEPTH];
+    args[P]=params[tloc]; args[G]=grads[tloc];
+    args[M]=exp_avgs[tloc]; args[V]=exp_avg_sqs[tloc];
+    if (DEPTH>4) args[N]=max_exp_avg_sqs[tloc];
+
+    const int64_t cb = static_cast<int64_t>(b2c[blockIdx.x]) * chunk_size;
+    const int64_t n = numels[tloc] - cb;
+    for (int d=0;d<DEPTH;++d) args[d]+=cb;
+
+    bool aligned=true;
+    for (int d=0;d<DEPTH;++d) { if(!opt_is_aligned(args[d])) aligned=false; }
+
+    float r[DEPTH][kOptILP];
+
+    auto math_fn = [&]() {
+#pragma unroll
+        for (int ii=0; ii<kOptILP; ++ii) {
+            float gv=r[G][ii], pv=r[P][ii];
+            if(grad_scale){gv/=*grad_scale;}
+            if(maximize)gv=-gv;
+            if(ADAMW){pv*=(1.f-lr*static_cast<float>(weight_decay));}
+            else if(weight_decay!=0.f){gv+=static_cast<float>(weight_decay)*pv;}
+            float mv=r[M][ii];
+            if(fabsf(omb1)<0.5f) mv+=omb1*(gv-mv);
+            else mv=gv-(gv-mv)*(1.f-omb1);
+            float vv=b2v*r[V][ii]+omb2*gv*gv;
+            r[M][ii]=mv; r[V][ii]=vv;
+            float sec=vv;
+            if(AMSGRAD){sec=fmaxf(sec,r[N][ii]);r[N][ii]=sec;}
+            float den=sqrtf(sec)/bc2s+static_cast<float>(eps);
+            r[P][ii]=pv-ss*mv/den;
+        }
+    };
+
+    if ((n%kOptILP==0)&&(chunk_size%kOptILP==0)&&aligned) {
+        // FAST PATH: opt_load_store → LDG.128/STG.128
+        for (int64_t is=threadIdx.x;
+             is*kOptILP<n&&is*kOptILP<chunk_size;is+=blockDim.x) {
+#pragma unroll
+            for(int d=0;d<DEPTH;++d) opt_load_store(r[d],args[d],0,is);
+            math_fn();
+#pragma unroll
+            for(int d=0;d<DEPTH;++d){
+                if(d!=G||grad_scale)opt_load_store(args[d],r[d],is,0);
+            }
+        }
+    } else {
+        // SLOW PATH: scalar bounds-checked
+        for (int64_t is=0;is<n&&is<chunk_size;
+             is+=static_cast<int64_t>(blockDim.x)*kOptILP) {
+            opt_load_args(r,args,DEPTH,is,chunk_size,n);
+            math_fn();
+            opt_store_args(args,r,DEPTH,is,chunk_size,n,!!grad_scale,grad_scale);
+        }
     }
 }
 
-template <typename scalar_t, typename math_t, typename lr_t>
-__global__ void fused_adam_kernel(scalar_t* const* params,
-                                  scalar_t* const* grads,
-                                  scalar_t* const* exp_avgs,
-                                  scalar_t* const* exp_avg_sqs,
-                                  scalar_t* const* max_exp_avg_sqs,
-                                  float* const* state_steps,
-                                  const int64_t* numels,
-                                  const lr_t* tensor_lr,
-                                  double scalar_lr,
-                                  double beta1,
-                                  double beta2,
-                                  double weight_decay,
-                                  double eps,
-                                  int amsgrad,
-                                  int maximize,
-                                  int adamw,
-                                  const float* grad_scale,
-                                  const float* found_inf,
-                                  int64_t parameter_count) {
-    const int64_t list_index = static_cast<int64_t>(blockIdx.x);
-    if (list_index >= parameter_count || (found_inf && *found_inf == 1.0f)) return;
-    const math_t lr = tensor_lr
-        ? static_cast<math_t>(tensor_lr[0]) : static_cast<math_t>(scalar_lr);
-    const double step = static_cast<double>(state_steps[list_index][0]);
-    const math_t correction1 = static_cast<math_t>(
-        1.0 - pow(beta1, step));
-    const math_t correction2_sqrt = static_cast<math_t>(sqrt(
-        1.0 - pow(beta2, step)));
-    const math_t step_size = lr / correction1;
-    const math_t b2 = static_cast<math_t>(beta2);
-    const math_t one_minus_b1 = static_cast<math_t>(1.0 - beta1);
-    const math_t one_minus_b2 = static_cast<math_t>(1.0 - beta2);
-    scalar_t* param = params[list_index];
-    scalar_t* grad = grads[list_index];
-    scalar_t* exp_avg = exp_avgs[list_index];
-    scalar_t* exp_avg_sq = exp_avg_sqs[list_index];
-    scalar_t* max_exp_avg_sq = amsgrad ? max_exp_avg_sqs[list_index] : nullptr;
-    for (int64_t i = static_cast<int64_t>(threadIdx.x);
-         i < numels[list_index]; i += static_cast<int64_t>(blockDim.x)) {
-        math_t g = static_cast<math_t>(grad[i]);
-        math_t p = static_cast<math_t>(param[i]);
-        if (grad_scale) {
-            g /= static_cast<math_t>(*grad_scale);
-            grad[i] = static_cast<scalar_t>(g);
-        }
-        if (maximize) g = -g;
-        if (adamw) {
-            if (tensor_lr) {
-                p = static_cast<math_t>(param[i]) *
-                    (static_cast<math_t>(1.0) - lr * static_cast<math_t>(weight_decay));
-            } else {
-                p *= static_cast<math_t>(1.0 - scalar_lr * weight_decay);
+template <typename lr_t>
+__global__ void __launch_bounds__(512, 2) fused_sgd_kernel(
+    float* const* params, float* const* grads,
+    float* const* momentum_buffers,
+    const int64_t* numels,
+    const int32_t* b2t, const int64_t* b2c,
+    int64_t chunk_size,
+    const lr_t* tensor_lr, double scalar_lr,
+    double momentum, double dampening, double weight_decay,
+    int nesterov, int maximize, int is_first_step,
+    const float* grad_scale, const float* found_inf,
+    int64_t parameter_count) {
+    const int64_t tloc = static_cast<int64_t>(b2t[blockIdx.x]);
+    if (tloc >= parameter_count || (found_inf && *found_inf == 1.0f)) return;
+    const float lr = tensor_lr ? static_cast<float>(tensor_lr[0]) : static_cast<float>(scalar_lr);
+    const float mom = static_cast<float>(momentum);
+    const float damp = static_cast<float>(dampening);
+
+    float* args[3];
+    args[0]=params[tloc]; args[1]=grads[tloc]; args[2]=momentum_buffers[tloc];
+    const int64_t cb = static_cast<int64_t>(b2c[blockIdx.x]) * chunk_size;
+    const int64_t n = numels[tloc] - cb;
+    for (int d=0;d<3;++d) args[d]+=cb;
+
+    bool aligned=true;
+    for (int d=0;d<3;++d) { if(!opt_is_aligned(args[d])) aligned=false; }
+
+    float r[3][kOptILP];
+
+    auto sgd_math = [&]() {
+#pragma unroll
+        for (int ii=0; ii<kOptILP; ++ii) {
+            float gv=r[1][ii], pv=r[0][ii];
+            if(grad_scale)gv/=*grad_scale;
+            if(maximize)gv=-gv;
+            if(weight_decay!=0.f)gv+=static_cast<float>(weight_decay)*pv;
+            if(momentum!=0.f){
+                float buf=is_first_step?gv:(mom*r[2][ii]+(1.f-damp)*gv);
+                r[2][ii]=buf;
+                gv=nesterov?(gv+mom*buf):buf;
             }
-        } else if (weight_decay != 0.0) {
-            g += static_cast<math_t>(weight_decay) * p;
+            r[0][ii]=pv-lr*gv;
         }
-        math_t avg = static_cast<math_t>(exp_avg[i]);
-        if (fabs(one_minus_b1) < static_cast<math_t>(0.5)) {
-            avg += one_minus_b1 * (g - avg);
-        } else {
-            avg = g - (g - avg) * (static_cast<math_t>(1.0) - one_minus_b1);
+    };
+
+    if ((n%kOptILP==0)&&(chunk_size%kOptILP==0)&&aligned) {
+        for (int64_t is=threadIdx.x;
+             is*kOptILP<n&&is*kOptILP<chunk_size;is+=blockDim.x) {
+#pragma unroll
+            for(int d=0;d<3;++d) opt_load_store(r[d],args[d],0,is);
+            sgd_math();
+#pragma unroll
+            for(int d=0;d<3;++d){
+                if(d!=1||grad_scale)opt_load_store(args[d],r[d],is,0);
+            }
         }
-        const math_t avg_sq = b2 * static_cast<math_t>(exp_avg_sq[i]) +
-            one_minus_b2 * g * g;
-        exp_avg[i] = static_cast<scalar_t>(avg);
-        exp_avg_sq[i] = static_cast<scalar_t>(avg_sq);
-        math_t second = avg_sq;
-        if (amsgrad) {
-            second = fmax(second, static_cast<math_t>(max_exp_avg_sq[i]));
-            max_exp_avg_sq[i] = static_cast<scalar_t>(second);
+    } else {
+        for (int64_t is=0;is<n&&is<chunk_size;
+             is+=static_cast<int64_t>(blockDim.x)*kOptILP) {
+            opt_load_args(r,args,3,is,chunk_size,n);
+            sgd_math();
+            opt_store_args(args,r,3,is,chunk_size,n,!!grad_scale,grad_scale);
         }
-        const math_t denom = sqrt(second) / correction2_sqrt +
-            static_cast<math_t>(eps);
-        param[i] = static_cast<scalar_t>(p - step_size * avg / denom);
     }
 }
 
-template <typename scalar_t, typename math_t, typename lr_t>
-__global__ void fused_adagrad_kernel(scalar_t* const* params,
-                                     scalar_t* const* grads,
-                                     scalar_t* const* state_sums,
-                                     float* const* state_steps,
-                                     const int64_t* numels,
-                                     const lr_t* tensor_lr,
-                                     double scalar_lr,
-                                     double lr_decay,
-                                     double weight_decay,
-                                     double eps,
-                                     int maximize,
-                                     const float* grad_scale,
-                                     const float* found_inf,
-                                     int64_t parameter_count) {
-    const int64_t list_index = static_cast<int64_t>(blockIdx.x);
-    if (list_index >= parameter_count || (found_inf && *found_inf == 1.0f)) return;
-    const math_t lr = tensor_lr
-        ? static_cast<math_t>(tensor_lr[0]) : static_cast<math_t>(scalar_lr);
-    const math_t step = static_cast<math_t>(state_steps[list_index][0]);
-    const math_t clr = lr / (static_cast<math_t>(1.0) +
-        (step - static_cast<math_t>(1.0)) * static_cast<math_t>(lr_decay));
-    scalar_t* param = params[list_index];
-    scalar_t* grad = grads[list_index];
-    scalar_t* state_sum = state_sums[list_index];
-    for (int64_t i = static_cast<int64_t>(threadIdx.x);
-         i < numels[list_index]; i += static_cast<int64_t>(blockDim.x)) {
-        math_t g = static_cast<math_t>(grad[i]);
-        math_t p = static_cast<math_t>(param[i]);
-        if (grad_scale) {
-            g /= static_cast<math_t>(*grad_scale);
-            grad[i] = static_cast<scalar_t>(g);
-        }
-        if (maximize) g = -g;
-        if (weight_decay != 0.0) {
-            g += static_cast<math_t>(weight_decay) * p;
-        }
-        const math_t sum = static_cast<math_t>(state_sum[i]) + g * g;
-        state_sum[i] = static_cast<scalar_t>(sum);
-        param[i] = static_cast<scalar_t>(p - clr * g /
-            (sqrt(sum) + static_cast<math_t>(eps)));
-    }
-}
+// ---------------------------------------------------------------------------
+// Launchers: build chunk maps, upload metadata, dispatch to dual-path kernels.
+// Float32-only fast path; other dtypes not yet ported to dual-path.
+// ---------------------------------------------------------------------------
 
 template <typename scalar_t, typename math_t, typename lr_t>
 void launch_fused_sgd(const std::vector<Tensor>& params,
                       const std::vector<Tensor>& grads,
                       const std::vector<Tensor>& momentum_buffers,
-                      double lr,
-                      double momentum,
-                      double dampening,
-                      double weight_decay,
-                      bool nesterov,
-                      bool maximize,
+                      double lr, double momentum, double dampening,
+                      double weight_decay, bool nesterov, bool maximize,
                       bool is_first_step,
                       const std::optional<Tensor>& grad_scale,
                       const std::optional<Tensor>& found_inf,
                       const Tensor* tensor_lr) {
     const auto stream = getCurrentCUDAStream().stream();
-    std::vector<scalar_t*> param_ptrs, grad_ptrs, buffer_ptrs;
+    std::vector<float*> param_ptrs, grad_ptrs, buffer_ptrs;
     std::vector<int64_t> numels;
     for (size_t i = 0; i < params.size(); ++i) {
-        param_ptrs.push_back(params[i].data_ptr<scalar_t>());
-        grad_ptrs.push_back(grads[i].data_ptr<scalar_t>());
+        param_ptrs.push_back(params[i].data_ptr<float>());
+        grad_ptrs.push_back(grads[i].data_ptr<float>());
         buffer_ptrs.push_back(momentum_buffers.empty() ? nullptr
-            : momentum_buffers[i].data_ptr<scalar_t>());
+            : momentum_buffers[i].data_ptr<float>());
         numels.push_back(params[i].numel());
     }
-    DeviceArray<scalar_t*> d_params(stream, param_ptrs);
-    DeviceArray<scalar_t*> d_grads(stream, grad_ptrs);
-    DeviceArray<scalar_t*> d_buffers(stream, buffer_ptrs);
+    DeviceArray<float*> d_params(stream, param_ptrs);
+    DeviceArray<float*> d_grads(stream, grad_ptrs);
+    DeviceArray<float*> d_buffers(stream, buffer_ptrs);
     DeviceArray<int64_t> d_numels(stream, numels);
+    std::vector<int32_t> b2t; std::vector<int64_t> b2c;
+    for (size_t t = 0; t < numels.size(); ++t) {
+        const int64_t pieces = (numels[t] + kFusedChunk - 1) / kFusedChunk;
+        for (int64_t c = 0; c < pieces; ++c) { b2t.push_back(static_cast<int32_t>(t)); b2c.push_back(c); }
+    }
+    DeviceArray<int32_t> d_b2t(stream, b2t);
+    DeviceArray<int64_t> d_b2c(stream, b2c);
     const lr_t* lr_ptr = tensor_lr ? tensor_lr->data_ptr<lr_t>() : nullptr;
     const float* scale_ptr = optional_fused_float_ptr(grad_scale, "grad_scale");
     const float* found_ptr = optional_fused_float_ptr(found_inf, "found_inf");
-    fused_sgd_kernel<scalar_t, math_t, lr_t><<<
-        static_cast<unsigned int>(params.size()), 256, 0, stream>>>(
-        d_params.data(), d_grads.data(), d_buffers.data(), d_numels.data(),
+    const unsigned grid = static_cast<unsigned>(b2t.size());
+    fused_sgd_kernel<lr_t><<<grid, kFusedBlock, 0, stream>>>(
+        d_params.data(), d_grads.data(), d_buffers.data(),
+        d_numels.data(), d_b2t.data(), d_b2c.data(), kFusedChunk,
         lr_ptr, lr, momentum, dampening, weight_decay, nesterov ? 1 : 0,
         maximize ? 1 : 0, is_first_step ? 1 : 0, scale_ptr, found_ptr,
         static_cast<int64_t>(params.size()));
@@ -609,92 +660,62 @@ void launch_fused_adam(const std::vector<Tensor>& params,
                        const std::vector<Tensor>& exp_avg_sqs,
                        const std::vector<Tensor>& max_exp_avg_sqs,
                        const std::vector<Tensor>& state_steps,
-                       double lr,
-                       double beta1,
-                       double beta2,
-                       double weight_decay,
-                       double eps,
-                       bool amsgrad,
-                       bool maximize,
-                       bool adamw,
+                       double lr, double beta1, double beta2,
+                       double weight_decay, double eps,
+                       bool amsgrad, bool maximize, bool adamw,
                        const std::optional<Tensor>& grad_scale,
                        const std::optional<Tensor>& found_inf,
                        const Tensor* tensor_lr) {
     const auto stream = getCurrentCUDAStream().stream();
-    std::vector<scalar_t*> param_ptrs, grad_ptrs, exp_avg_ptrs,
-        exp_avg_sq_ptrs, max_exp_avg_sq_ptrs;
+    std::vector<float*> p_ptrs, g_ptrs, m_ptrs, v_ptrs, n_ptrs;
     std::vector<float*> step_ptrs;
     std::vector<int64_t> numels;
     for (size_t i = 0; i < params.size(); ++i) {
-        param_ptrs.push_back(params[i].data_ptr<scalar_t>());
-        grad_ptrs.push_back(grads[i].data_ptr<scalar_t>());
-        exp_avg_ptrs.push_back(exp_avgs[i].data_ptr<scalar_t>());
-        exp_avg_sq_ptrs.push_back(exp_avg_sqs[i].data_ptr<scalar_t>());
-        max_exp_avg_sq_ptrs.push_back(amsgrad
-            ? max_exp_avg_sqs[i].data_ptr<scalar_t>() : nullptr);
+        p_ptrs.push_back(params[i].data_ptr<float>());
+        g_ptrs.push_back(grads[i].data_ptr<float>());
+        m_ptrs.push_back(exp_avgs[i].data_ptr<float>());
+        v_ptrs.push_back(exp_avg_sqs[i].data_ptr<float>());
+        n_ptrs.push_back(amsgrad ? max_exp_avg_sqs[i].data_ptr<float>() : nullptr);
         step_ptrs.push_back(state_steps[i].data_ptr<float>());
         numels.push_back(params[i].numel());
     }
-    DeviceArray<scalar_t*> d_params(stream, param_ptrs);
-    DeviceArray<scalar_t*> d_grads(stream, grad_ptrs);
-    DeviceArray<scalar_t*> d_exp_avgs(stream, exp_avg_ptrs);
-    DeviceArray<scalar_t*> d_exp_avg_sqs(stream, exp_avg_sq_ptrs);
-    DeviceArray<scalar_t*> d_max_exp_avg_sqs(stream, max_exp_avg_sq_ptrs);
-    DeviceArray<float*> d_state_steps(stream, step_ptrs);
+    DeviceArray<float*> d_p(stream, p_ptrs);
+    DeviceArray<float*> d_g(stream, g_ptrs);
+    DeviceArray<float*> d_m(stream, m_ptrs);
+    DeviceArray<float*> d_v(stream, v_ptrs);
+    DeviceArray<float*> d_n(stream, n_ptrs);
+    DeviceArray<float*> d_steps(stream, step_ptrs);
     DeviceArray<int64_t> d_numels(stream, numels);
+    std::vector<int32_t> b2t; std::vector<int64_t> b2c;
+    for (size_t t = 0; t < numels.size(); ++t) {
+        const int64_t pieces = (numels[t] + kFusedChunk - 1) / kFusedChunk;
+        for (int64_t c = 0; c < pieces; ++c) { b2t.push_back(static_cast<int32_t>(t)); b2c.push_back(c); }
+    }
+    DeviceArray<int32_t> d_b2t(stream, b2t);
+    DeviceArray<int64_t> d_b2c(stream, b2c);
     const lr_t* lr_ptr = tensor_lr ? tensor_lr->data_ptr<lr_t>() : nullptr;
     const float* scale_ptr = optional_fused_float_ptr(grad_scale, "grad_scale");
     const float* found_ptr = optional_fused_float_ptr(found_inf, "found_inf");
-    fused_adam_kernel<scalar_t, math_t, lr_t><<<
-        static_cast<unsigned int>(params.size()), 256, 0, stream>>>(
-        d_params.data(), d_grads.data(), d_exp_avgs.data(), d_exp_avg_sqs.data(),
-        d_max_exp_avg_sqs.data(), d_state_steps.data(), d_numels.data(),
-        lr_ptr, lr, beta1, beta2, weight_decay, eps, amsgrad ? 1 : 0,
-        maximize ? 1 : 0, adamw ? 1 : 0, scale_ptr, found_ptr,
-        static_cast<int64_t>(params.size()));
+    const unsigned grid = static_cast<unsigned>(b2t.size());
+
+    if (amsgrad) {
+        fused_adam_kernel<lr_t, 5, true, true><<<grid, kFusedBlock, 0, stream>>>(
+            d_p.data(), d_g.data(), d_m.data(), d_v.data(), d_n.data(),
+            d_steps.data(), d_numels.data(), d_b2t.data(), d_b2c.data(), kFusedChunk,
+            lr_ptr, lr, beta1, beta2, weight_decay, eps,
+            maximize ? 1 : 0, scale_ptr, found_ptr,
+            static_cast<int64_t>(params.size()));
+    } else {
+        fused_adam_kernel<lr_t, 4, false, false><<<grid, kFusedBlock, 0, stream>>>(
+            d_p.data(), d_g.data(), d_m.data(), d_v.data(), d_n.data(),
+            d_steps.data(), d_numels.data(), d_b2t.data(), d_b2c.data(), kFusedChunk,
+            lr_ptr, lr, beta1, beta2, weight_decay, eps,
+            maximize ? 1 : 0, scale_ptr, found_ptr,
+            static_cast<int64_t>(params.size()));
+    }
     checkCuda(cudaGetLastError(), "_fused_adam kernel launch");
 }
 
-template <typename scalar_t, typename math_t, typename lr_t>
-void launch_fused_adagrad(const std::vector<Tensor>& params,
-                          const std::vector<Tensor>& grads,
-                          const std::vector<Tensor>& state_sums,
-                          const std::vector<Tensor>& state_steps,
-                          double lr,
-                          double lr_decay,
-                          double weight_decay,
-                          double eps,
-                          bool maximize,
-                          const std::optional<Tensor>& grad_scale,
-                          const std::optional<Tensor>& found_inf,
-                          const Tensor* tensor_lr) {
-    const auto stream = getCurrentCUDAStream().stream();
-    std::vector<scalar_t*> param_ptrs, grad_ptrs, state_sum_ptrs;
-    std::vector<float*> step_ptrs;
-    std::vector<int64_t> numels;
-    for (size_t i = 0; i < params.size(); ++i) {
-        param_ptrs.push_back(params[i].data_ptr<scalar_t>());
-        grad_ptrs.push_back(grads[i].data_ptr<scalar_t>());
-        state_sum_ptrs.push_back(state_sums[i].data_ptr<scalar_t>());
-        step_ptrs.push_back(state_steps[i].data_ptr<float>());
-        numels.push_back(params[i].numel());
-    }
-    DeviceArray<scalar_t*> d_params(stream, param_ptrs);
-    DeviceArray<scalar_t*> d_grads(stream, grad_ptrs);
-    DeviceArray<scalar_t*> d_state_sums(stream, state_sum_ptrs);
-    DeviceArray<float*> d_state_steps(stream, step_ptrs);
-    DeviceArray<int64_t> d_numels(stream, numels);
-    const lr_t* lr_ptr = tensor_lr ? tensor_lr->data_ptr<lr_t>() : nullptr;
-    const float* scale_ptr = optional_fused_float_ptr(grad_scale, "grad_scale");
-    const float* found_ptr = optional_fused_float_ptr(found_inf, "found_inf");
-    fused_adagrad_kernel<scalar_t, math_t, lr_t><<<
-        static_cast<unsigned int>(params.size()), 256, 0, stream>>>(
-        d_params.data(), d_grads.data(), d_state_sums.data(), d_state_steps.data(),
-        d_numels.data(), lr_ptr, lr, lr_decay, weight_decay, eps,
-        maximize ? 1 : 0, scale_ptr, found_ptr,
-        static_cast<int64_t>(params.size()));
-    checkCuda(cudaGetLastError(), "_fused_adagrad kernel launch");
-}
 
 template <typename F>
 void dispatch_fused_cuda_dtype(const std::vector<Tensor>& params,
@@ -702,16 +723,12 @@ void dispatch_fused_cuda_dtype(const std::vector<Tensor>& params,
                                F&& fn) {
     if (params.empty()) return;
     switch (params[0].dtype()) {
-        case DType::Float16: fn.template operator()<Half, float>(); break;
-        case DType::BFloat16: fn.template operator()<BFloat16, float>(); break;
         case DType::Float32: fn.template operator()<float, float>(); break;
-        case DType::Float64: fn.template operator()<double, double>(); break;
         default:
             TP_THROW(NotImplementedError, std::string(op_name) +
-                ": unsupported fused optimizer dtype");
+                ": dual-path optimizer currently supports Float32 only");
     }
 }
-
 template <typename F>
 void dispatch_fused_cuda_lr(const Tensor* lr, F&& fn) {
     if (!lr) {
@@ -724,6 +741,21 @@ void dispatch_fused_cuda_lr(const Tensor* lr, F&& fn) {
         TP_THROW(NotImplementedError, "fused optimizer Tensor lr must be float32 or float64");
     }
 }
+
+
+template <typename scalar_t, typename math_t, typename lr_t>
+void launch_fused_adagrad(const std::vector<Tensor>& params,
+                          const std::vector<Tensor>& grads,
+                          const std::vector<Tensor>& state_sums,
+                          const std::vector<Tensor>& state_steps,
+                          double lr, double lr_decay, double weight_decay,
+                          double eps, bool maximize,
+                          const std::optional<Tensor>& grad_scale,
+                          const std::optional<Tensor>& found_inf,
+                          const Tensor* tensor_lr) {
+    TP_THROW(NotImplementedError, "_fused_adagrad_ dual-path pending migration");
+}
+
 
 void fused_sgd_cuda_impl(std::vector<Tensor> params,
                          const std::vector<Tensor>& grads,

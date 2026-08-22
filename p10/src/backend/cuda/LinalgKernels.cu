@@ -1,0 +1,583 @@
+// CUDA linalg kernels — cusolverDn ports of the CPU paths, following
+// third_party/pytorch/aten/src/ATen/native/cuda/linalg/BatchLinearAlgebraLib.cpp.
+//
+// Every routine loops over batch elements (as torch does for its non-batched
+// cusolver paths), works on batched column-major buffers produced with
+// clone_batched_column_major / empty_column_major, and reports LAPACK-style
+// info codes through device int32 tensors.
+//
+// Not ported here: linalg_eig / linalg_eigvals raise torch's no-MAGMA error
+// (torch's geev path needs MAGMA), and linalg_ldl_* stay CPU-only.
+
+#include "Tensor.h"
+#include "Dispatcher.h"
+#include "CUDAContext.h"
+#include "CUDARuntime.h"
+#include "Exception.h"
+
+#include <cublas_v2.h>
+#include <cusolverDn.h>
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <limits>
+#include <numeric>
+#include <string>
+#include <vector>
+
+namespace tensorplay {
+namespace cuda {
+
+namespace {
+
+#define CUSOLVER_CHECK(condition)                                              \
+    do {                                                                       \
+        const cusolverStatus_t _tp_cs = (condition);                           \
+        if (_tp_cs != CUSOLVER_STATUS_SUCCESS) {                               \
+            TP_THROW(RuntimeError, "cuSOLVER error ",                          \
+                     std::to_string(static_cast<int>(_tp_cs)));                \
+        }                                                                      \
+    } while (0)
+
+#define CUBLAS_CHECK(condition)                                                \
+    do {                                                                       \
+        const cublasStatus_t _tp_cb = (condition);                             \
+        if (_tp_cb != CUBLAS_STATUS_SUCCESS) {                                 \
+            TP_THROW(RuntimeError, "cuBLAS error ",                            \
+                     std::to_string(static_cast<int>(_tp_cb)));                \
+        }                                                                      \
+    } while (0)
+
+constexpr cublasFillMode_t fill_mode(char uplo) {
+    return uplo == 'U' ? CUBLAS_FILL_MODE_UPPER : CUBLAS_FILL_MODE_LOWER;
+}
+
+// ------------------------------------------------------------- helpers -----
+
+template <class Kernel>
+decltype(auto) run_real(DType dt, Kernel&& k) {
+    switch (dt) {
+        case DType::Float32:
+            return k(static_cast<float*>(nullptr));
+        case DType::Float64:
+            return k(static_cast<double*>(nullptr));
+        default:
+            TP_THROW(NotImplementedError,
+                     "linalg: unsupported dtype ", pretty_dtype_name(dt),
+                     " on CUDA (only float32/float64 are implemented)");
+    }
+}
+
+void check_is_matrix(const Tensor& A, const char* fn, const char* arg = "A") {
+    if (A.dim() < 2) {
+        TP_THROW(RuntimeError, fn, ": The input tensor ", arg,
+                 " must have at least 2 dimensions.");
+    }
+}
+
+void square_check_inputs(const Tensor& A, const char* fn, const char* arg = "A") {
+    check_is_matrix(A, fn, arg);
+    if (A.size(-1) != A.size(-2)) {
+        TP_THROW(RuntimeError, fn, ": ", arg,
+                 " must be batches of square matrices, but they are ",
+                 A.size(-2), " by ", A.size(-1), " matrices");
+    }
+}
+
+std::vector<int64_t> batch_shape_of(const Tensor& t) {
+    return std::vector<int64_t>(t.shape().begin(), t.shape().end() - 2);
+}
+
+int64_t matrix_stride_of(const Tensor& t) { return t.size(-1) * t.size(-2); }
+
+int64_t batch_count_of(const Tensor& t) {
+    const int64_t plane = matrix_stride_of(t);
+    return plane == 0 ? 0 : t.numel() / plane;
+}
+
+Tensor clone_batched_column_major(const Tensor& src) {
+    auto result = src.transpose(-2, -1).clone();
+    return result.transpose(-2, -1);
+}
+
+Tensor empty_column_major(std::vector<int64_t> shape, DType dt, Device dev) {
+    std::swap(shape[shape.size() - 2], shape[shape.size() - 1]);
+    return Tensor::empty(shape, dt, dev).transpose(-2, -1);
+}
+
+std::vector<int64_t> cat_batch(const std::vector<int64_t>& batch,
+                               std::vector<int64_t> tail) {
+    std::vector<int64_t> out = batch;
+    for (int64_t v : tail) out.push_back(v);
+    return out;
+}
+
+int64_t linear_batch_size(const std::vector<int64_t>& batch) {
+    return static_cast<int64_t>(std::accumulate(
+        batch.begin(), batch.end(), int64_t{1}, std::multiplies<int64_t>()));
+}
+
+std::vector<int64_t> broadcast_batch(const Tensor& a, const Tensor& b) {
+    const auto as = batch_shape_of(a);
+    const auto bs = batch_shape_of(b);
+    const size_t rank = std::max(as.size(), bs.size());
+    std::vector<int64_t> out(rank, 1);
+    for (size_t i = 0; i < rank; ++i) {
+        const int64_t da = i < rank - as.size() ? 1 : as[i - (rank - as.size())];
+        const int64_t db = i < rank - bs.size() ? 1 : bs[i - (rank - bs.size())];
+        if (da != db && da != 1 && db != 1) {
+            TP_THROW(RuntimeError, "The size of tensor a (", da,
+                     ") must match the size of tensor b (", db, ")");
+        }
+        out[i] = std::max(da, db);
+    }
+    return out;
+}
+
+Tensor expand_to_batch(const Tensor& t, const std::vector<int64_t>& batch) {
+    return t.expand(cat_batch(batch, {t.size(-2), t.size(-1)}));
+}
+
+int64_t first_nonzero_info(const Tensor& infos_host) {
+    const auto* ptr = infos_host.data_ptr<int32_t>();
+    for (int64_t i = 0; i < infos_host.numel(); ++i)
+        if (ptr[i] != 0) return i;
+    return -1;
+}
+
+// Port of at::native::_linalg_check_errors on a host copy of the info codes.
+void check_infos(const Tensor& infos_dev, std::string_view api_name, bool is_matrix) {
+    Tensor infos = infos_dev.to(Device(DeviceType::CPU), DType::Int32).contiguous();
+    const int64_t first = first_nonzero_info(infos);
+    if (first < 0) return;
+    const auto* ptr = infos.data_ptr<int32_t>();
+    const int64_t info = ptr[first];
+    const std::string b =
+        is_matrix ? "" : ": (Batch element " + std::to_string(first) + ")";
+    if (info < 0) {
+        TP_THROW(RuntimeError, api_name, b, ": Argument ", -info,
+                 " has illegal value.");
+    }
+    if (api_name.find("inv") != std::string_view::npos) {
+        TP_THROW(RuntimeError, api_name, b,
+                 ": The diagonal element ", info, " is zero, the inversion could not be completed because the input matrix is singular.");
+    } else if (api_name.find("lu_factor") != std::string_view::npos) {
+        TP_THROW(RuntimeError, api_name, b,
+                 ": U[", info, ",", info, "] is zero and using it on lu_solve would result in a division by zero. "
+                 "If you still want to perform the factorization, consider calling linalg.lu(A, pivot) or "
+                 "linalg.lu_factor_ex(A, pivot)");
+    } else if (api_name.find("cholesky") != std::string_view::npos) {
+        TP_THROW(RuntimeError, api_name, b,
+                 ": The factorization could not be completed because the input is not positive-definite (the leading minor of order ", info, " is not positive-definite).");
+    } else if (api_name.find("svd") != std::string_view::npos) {
+        TP_THROW(RuntimeError, api_name, b,
+                 ": The algorithm failed to converge because the input matrix is ill-conditioned or has too many repeated singular values (error code: ", info, ").");
+    } else if (api_name.find("eig") != std::string_view::npos ||
+               api_name.find("syevd") != std::string_view::npos) {
+        TP_THROW(RuntimeError, api_name, b,
+                 ": The algorithm failed to converge because the input matrix is ill-conditioned or has too many repeated eigenvalues (error code: ", info, ").");
+    } else {
+        TP_THROW(RuntimeError, api_name, b,
+                 ": The solver failed because the input matrix is singular.");
+    }
+}
+
+// ------------------------------------------------- cusolver entry traits ---
+
+template <typename scalar_t>
+struct CusolverTraits;
+
+template <>
+struct CusolverTraits<float> {
+    static constexpr bool is_float = true;
+    using T = float;
+    static cusolverStatus_t potrf_bufferSize(cusolverDnHandle_t h, char uplo, int n,
+                                             float* a, int lda, int* lw) {
+        return cusolverDnSpotrf_bufferSize(h, fill_mode(uplo), n, a, lda, lw);
+    }
+    static cusolverStatus_t potrf(cusolverDnHandle_t h, char uplo, int n, float* a,
+                                  int lda, float* work, int lwork, int* info) {
+        return cusolverDnSpotrf(h, fill_mode(uplo), n, a, lda, work, lwork, info);
+    }
+    static cusolverStatus_t getrf_bufferSize(cusolverDnHandle_t h, int m, int n,
+                                             float* a, int lda, int* lw) {
+        return cusolverDnSgetrf_bufferSize(h, m, n, a, lda, lw);
+    }
+    static cusolverStatus_t getrf(cusolverDnHandle_t h, int m, int n, float* a,
+                                  int lda, int* ipiv, float* work, int lwork,
+                                  int* info) {
+        return cusolverDnSgetrf(h, m, n, a, lda, ipiv, work, lwork, info);
+    }
+    static cusolverStatus_t getrs(cusolverDnHandle_t h, cublasOperation_t trans,
+                                  int n, int nrhs, const float* a, int lda,
+                                  const int* ipiv, float* b, int ldb, int* info) {
+        return cusolverDnSgetrs(h, trans, n, nrhs, a, lda, ipiv, b, ldb, info);
+    }
+    static cusolverStatus_t geqrf_bufferSize(cusolverDnHandle_t h, int m, int n,
+                                             float* a, int lda, int* lw) {
+        return cusolverDnSgeqrf_bufferSize(h, m, n, a, lda, lw);
+    }
+    static cusolverStatus_t geqrf(cusolverDnHandle_t h, int m, int n, float* a,
+                                  int lda, float* tau, float* work, int lwork,
+                                  int* info) {
+        return cusolverDnSgeqrf(h, m, n, a, lda, tau, work, lwork, info);
+    }
+    static cusolverStatus_t orgqr_bufferSize(cusolverDnHandle_t h, int m, int n,
+                                             int k, const float* /*a*/, int lda,
+                                             const float* /*tau*/, int* lw) {
+        return cusolverDnSorgqr_bufferSize(h, m, n, k, lda, lw);
+    }
+    static cusolverStatus_t orgqr(cusolverDnHandle_t h, int m, int n, int k,
+                                  float* a, int lda, const float* tau, float* work,
+                                  int lwork, int* info) {
+        return cusolverDnSorgqr(h, m, n, k, a, lda, tau, work, lwork, info);
+    }
+    static cusolverStatus_t syevd_bufferSize(cusolverDnHandle_t h,
+                                             cusolverEigMode_t jobz, char uplo,
+                                             int n, const float* a, int lda,
+                                             const float* w, int* lw) {
+        return cusolverDnSSyevd_bufferSize(h, jobz, fill_mode(uplo), n, a, lda, w, lw);
+    }
+    static cusolverStatus_t syevd(cusolverDnHandle_t h, cusolverEigMode_t jobz,
+                                  char uplo, int n, float* a, int lda, float* w,
+                                  float* work, int lwork, int* info) {
+        return cusolverDnSSyevd(h, jobz, fill_mode(uplo), n, a, lda, w, work,
+                                lwork, info);
+    }
+    static cusolverStatus_t gesvd(cusolverDnHandle_t h, signed char jobu,
+                                  signed char jobvt, int m, int n, float* a,
+                                  int lda, float* s, float* u, int ldu, float* vt,
+                                  int ldvt, float* work, int lwork, float* rwork,
+                                  int* info) {
+        return cusolverDnSgesvd(h, jobu, jobvt, m, n, a, lda, s, u, ldu, vt, ldvt,
+                                work, lwork, rwork, info);
+    }
+};
+
+template <>
+struct CusolverTraits<double> {
+    static constexpr bool is_float = false;
+    using T = double;
+    static cusolverStatus_t potrf_bufferSize(cusolverDnHandle_t h, char uplo, int n,
+                                             double* a, int lda, int* lw) {
+        return cusolverDnDpotrf_bufferSize(h, fill_mode(uplo), n, a, lda, lw);
+    }
+    static cusolverStatus_t potrf(cusolverDnHandle_t h, char uplo, int n, double* a,
+                                  int lda, double* work, int lwork, int* info) {
+        return cusolverDnDpotrf(h, fill_mode(uplo), n, a, lda, work, lwork, info);
+    }
+    static cusolverStatus_t getrf_bufferSize(cusolverDnHandle_t h, int m, int n,
+                                             double* a, int lda, int* lw) {
+        return cusolverDnDgetrf_bufferSize(h, m, n, a, lda, lw);
+    }
+    static cusolverStatus_t getrf(cusolverDnHandle_t h, int m, int n, double* a,
+                                  int lda, int* ipiv, double* work, int lwork,
+                                  int* info) {
+        return cusolverDnDgetrf(h, m, n, a, lda, ipiv, work, lwork, info);
+    }
+    static cusolverStatus_t getrs(cusolverDnHandle_t h, cublasOperation_t trans,
+                                  int n, int nrhs, const double* a, int lda,
+                                  const int* ipiv, double* b, int ldb, int* info) {
+        return cusolverDnDgetrs(h, trans, n, nrhs, a, lda, ipiv, b, ldb, info);
+    }
+    static cusolverStatus_t geqrf_bufferSize(cusolverDnHandle_t h, int m, int n,
+                                             double* a, int lda, int* lw) {
+        return cusolverDnDgeqrf_bufferSize(h, m, n, a, lda, lw);
+    }
+    static cusolverStatus_t geqrf(cusolverDnHandle_t h, int m, int n, double* a,
+                                  int lda, double* tau, double* work, int lwork,
+                                  int* info) {
+        return cusolverDnDgeqrf(h, m, n, a, lda, tau, work, lwork, info);
+    }
+    static cusolverStatus_t orgqr_bufferSize(cusolverDnHandle_t h, int m, int n,
+                                             int k, const double* /*a*/, int lda,
+                                             const double* /*tau*/, int* lw) {
+        return cusolverDnDorgqr_bufferSize(h, m, n, k, lda, lw);
+    }
+    static cusolverStatus_t orgqr(cusolverDnHandle_t h, int m, int n, int k,
+                                  double* a, int lda, const double* tau,
+                                  double* work, int lwork, int* info) {
+        return cusolverDnDorgqr(h, m, n, k, a, lda, tau, work, lwork, info);
+    }
+    static cusolverStatus_t syevd_bufferSize(cusolverDnHandle_t h,
+                                             cusolverEigMode_t jobz, char uplo,
+                                             int n, const double* a, int lda,
+                                             const double* w, int* lw) {
+        return cusolverDnDSyevd_bufferSize(h, jobz, fill_mode(uplo), n, a, lda, w, lw);
+    }
+    static cusolverStatus_t syevd(cusolverDnHandle_t h, cusolverEigMode_t jobz,
+                                  char uplo, int n, double* a, int lda, double* w,
+                                  double* work, int lwork, int* info) {
+        return cusolverDnDSyevd(h, jobz, fill_mode(uplo), n, a, lda, w, work,
+                                lwork, info);
+    }
+    static cusolverStatus_t gesvd(cusolverDnHandle_t h, signed char jobu,
+                                  signed char jobvt, int m, int n, double* a,
+                                  int lda, double* s, double* u, int ldu,
+                                  double* vt, int ldvt, double* work, int lwork,
+                                  double* rwork, int* info) {
+        return cusolverDnDgesvd(h, jobu, jobvt, m, n, a, lda, s, u, ldu, vt, ldvt,
+                                work, lwork, rwork, info);
+    }
+};
+
+// ------------------------------------------------------------- getrf -------
+
+template <typename scalar_t>
+void apply_getrf(const Tensor& input, const Tensor& pivots, const Tensor& info) {
+    using Tr = CusolverTraits<scalar_t>;
+    auto* a = input.data_ptr<scalar_t>();
+    auto* ipiv = pivots.data_ptr<int32_t>();
+    auto* info_data = info.data_ptr<int32_t>();
+    const int64_t ms = matrix_stride_of(input);
+    const int64_t piv_stride = pivots.dim() > 1 ? pivots.size(-1) : pivots.numel();
+    const int64_t batch = batch_count_of(input);
+    const int m = static_cast<int>(input.size(-2));
+    const int n = static_cast<int>(input.size(-1));
+    const int lda = std::max(1, m);
+    const auto handle = CUDAContext::getCusolverDnHandle();
+
+    int lwork = 0;
+    CUSOLVER_CHECK(Tr::getrf_bufferSize(handle, m, n, a, lda, &lwork));
+    Tensor work = Tensor::empty({std::max(lwork, 1)}, input.dtype(),
+                                input.device());
+    scalar_t* work_ptr =
+        Tr::is_float ? reinterpret_cast<scalar_t*>(static_cast<void*>(work.data_ptr<float>()))
+                     : reinterpret_cast<scalar_t*>(static_cast<void*>(work.data_ptr<double>()));
+    for (int64_t i = 0; i < batch; ++i) {
+        CUSOLVER_CHECK(Tr::getrf(handle, m, n, &a[i * ms], lda, &ipiv[i * piv_stride],
+                                 work_ptr, lwork, &info_data[i]));
+    }
+}
+
+std::tuple<Tensor, Tensor, Tensor> lu_factor_ex_cuda_impl(const Tensor& A,
+                                                          bool check_errors) {
+    square_check_inputs(A, "linalg.lu_factor_ex");
+    Tensor LU = clone_batched_column_major(A);
+    const auto batch = batch_shape_of(A);
+    const int64_t k = std::min(A.size(-2), A.size(-1));
+    Tensor pivots = Tensor::zeros(cat_batch(batch, {k}), DType::Int32, A.device());
+    Tensor info = Tensor::zeros(batch, DType::Int32, A.device());
+    run_real(A.dtype(), [&](auto tag) {
+        using T = std::remove_pointer_t<decltype(tag)>;
+        apply_getrf<T>(LU, pivots, info);
+    });
+    if (check_errors) check_infos(info, "torch.linalg.lu_factor_ex", A.dim() == 2);
+    return {LU.contiguous(), pivots.contiguous(), info.contiguous()};
+}
+
+std::tuple<Tensor, Tensor> linalg_lu_factor_kernel_cuda(const Tensor& A, bool pivot) {
+    (void)pivot;  // pivoting always on (torch CPU/CUDA parity).
+    auto [LU, pivots, info] = lu_factor_ex_cuda_impl(A, false);
+    check_infos(info, "torch.linalg.lu_factor", A.dim() == 2);
+    return {LU, pivots};
+}
+
+std::tuple<Tensor, Tensor, Tensor> linalg_lu_factor_ex_kernel_cuda(const Tensor& A,
+                                                                   bool pivot,
+                                                                   bool check_errors) {
+    (void)pivot;
+    return lu_factor_ex_cuda_impl(A, check_errors);
+}
+
+template <typename scalar_t>
+void host_det_slogdet(const Tensor& LU_h, const Tensor& piv_h, Tensor& det_out,
+                      Tensor* sign_out, Tensor* logabsdet_out) {
+    const int64_t bs = batch_count_of(LU_h);
+    const int64_t n = LU_h.size(-1);
+    const scalar_t* lu = LU_h.data_ptr<scalar_t>();
+    const int32_t* pv = piv_h.data_ptr<int32_t>();
+    std::vector<scalar_t> dets(bs), signs(bs), logs(bs);
+    constexpr bool want_log = sign_out != nullptr;
+    for (int64_t b = 0; b < bs; ++b) {
+        scalar_t det = scalar_t(1), sgn = scalar_t(1), logdet = scalar_t(0);
+        bool singular = false;
+        for (int64_t i = 0; i < n; ++i) {
+            const scalar_t v = lu[b * n * n + i * n + i];
+            if (v == scalar_t(0)) { singular = true; break; }
+            det *= v;
+            logdet += std::log(std::abs(v));
+            sgn *= v < scalar_t(0) ? scalar_t(-1) : scalar_t(1);
+        }
+        int64_t parity = 0;
+        for (int64_t i = 0; i < n; ++i)
+            if (pv[b * n + i] - 1 != static_cast<int32_t>(i)) ++parity;
+        const scalar_t perm_sign = (parity % 2 == 0) ? scalar_t(1) : scalar_t(-1);
+        if (want_log) {
+            signs[b] = singular ? scalar_t(0) : sgn * perm_sign;
+            logs[b] = singular ? -std::numeric_limits<scalar_t>::infinity() : logdet;
+        } else {
+            dets[b] = singular ? scalar_t(0) : det * perm_sign;
+        }
+    }
+    cudaMemcpyAsync(det_out.data_ptr(), want_log ? signs.data() : dets.data(),
+                    sizeof(scalar_t) * bs, cudaMemcpyHostToDevice,
+                    getCurrentCUDAStream().stream());
+    if (want_log) {
+        cudaMemcpyAsync(logabsdet_out->data_ptr(), logs.data(),
+                        sizeof(scalar_t) * bs, cudaMemcpyHostToDevice,
+                        getCurrentCUDAStream().stream());
+    }
+}
+
+Tensor linalg_det_kernel_cuda(const Tensor& A) {
+    square_check_inputs(A, "linalg.det");
+    // det(A^T) = det(A): reuse the contiguous layout like torch.
+    const Tensor src = A.is_contiguous() ? A.transpose(-2, -1) : A;
+    auto [LU, pivots, info] = lu_factor_ex_cuda_impl(src, false);
+    (void)info;
+    Tensor LU_h = LU.to(Device(DeviceType::CPU), A.dtype()).contiguous();
+    Tensor piv_h = pivots.to(Device(DeviceType::CPU), DType::Int32).contiguous();
+    Tensor out = Tensor::empty(batch_shape_of(A), A.dtype(), A.device());
+    run_real(A.dtype(), [&](auto tag) {
+        using T = std::remove_pointer_t<decltype(tag)>;
+        host_det_slogdet<T>(LU_h, piv_h, out, nullptr, nullptr);
+    });
+    return out;
+}
+
+std::tuple<Tensor, Tensor> linalg_slogdet_kernel_cuda(const Tensor& A) {
+    square_check_inputs(A, "linalg.slogdet");
+    const Tensor src = A.is_contiguous() ? A.transpose(-2, -1) : A;
+    auto [LU, pivots, info] = lu_factor_ex_cuda_impl(src, false);
+    (void)info;
+    Tensor LU_h = LU.to(Device(DeviceType::CPU), A.dtype()).contiguous();
+    Tensor piv_h = pivots.to(Device(DeviceType::CPU), DType::Int32).contiguous();
+    auto sign = Tensor::empty(batch_shape_of(A), A.dtype(), A.device());
+    auto logabsdet = Tensor::empty(batch_shape_of(A), A.dtype(), A.device());
+    run_real(A.dtype(), [&](auto tag) {
+        using T = std::remove_pointer_t<decltype(tag)>;
+        Tensor dummy;  // unused in slogdet mode
+        host_det_slogdet<T>(LU_h, piv_h, dummy, &sign, &logabsdet);
+    });
+    return {sign, logabsdet};
+}
+
+// ------------------------------------------------------- getrs-based solve --
+
+// Solves op(A) X = B in place on the column-major buffer `B_cm`.
+template <typename scalar_t>
+void apply_getrs(const Tensor& LU_cm, const Tensor& pivots, Tensor& B_cm,
+                 cublasOperation_t trans) {
+    using Tr = CusolverTraits<scalar_t>;
+    const int64_t n = LU_cm.size(-2);
+    const int64_t nrhs = B_cm.size(-1);
+    const int64_t bs = linear_batch_size(batch_shape_of(B_cm));
+    auto* lu = LU_cm.data_ptr<scalar_t>();
+    auto* b = B_cm.data_ptr<scalar_t>();
+    const auto* piv = pivots.data_ptr<int32_t>();
+    const int64_t lu_ms = matrix_stride_of(LU_cm);
+    const int64_t b_ms = matrix_stride_of(B_cm);
+    const int64_t piv_stride = n;
+    Tensor dev_info = Tensor::zeros({bs}, DType::Int32, B_cm.device());
+    auto* info_data = dev_info.data_ptr<int32_t>();
+    const auto handle = CUDAContext::getCusolverDnHandle();
+    for (int64_t i = 0; i < bs; ++i) {
+        CUSOLVER_CHECK(Tr::getrs(handle, trans, static_cast<int>(n),
+                                 static_cast<int>(nrhs), &lu[i * lu_ms],
+                                 static_cast<int>(n), &piv[i * piv_stride],
+                                 &b[i * b_ms], static_cast<int>(B_cm.size(-2)),
+                                 &info_data[i]));
+    }
+}
+
+std::tuple<Tensor, Tensor> linalg_solve_ex_kernel_cuda(const Tensor& A,
+                                                       const Tensor& B,
+                                                       bool left, bool check_errors) {
+    const char* api = "linalg.solve";
+    check_is_matrix(A, api, "A");
+    check_is_matrix(B, api, "B");
+    if (!(left ? A.size(-2) == B.size(-2) : A.size(-1) == B.size(-1))) {
+        TP_THROW(RuntimeError, api, ": Incompatible shapes of A and B for the equation ",
+                 left ? "AX = B" : "XA = B",
+                 " (", A.size(-2), "x", A.size(-1), " and ",
+                 B.size(-2), "x", B.size(-1), ")");
+    }
+    const auto batch = broadcast_batch(A, B);
+    Tensor LU_work = clone_batched_column_major(expand_to_batch(A, batch));
+    const int64_t n = A.size(-1);
+    Tensor pivots = Tensor::zeros(cat_batch(batch_shape_of(LU_work), {n}),
+                                  DType::Int32, A.device());
+    Tensor info = Tensor::zeros(batch_shape_of(LU_work), DType::Int32, A.device());
+    run_real(A.dtype(), [&](auto tag) {
+        using T = std::remove_pointer_t<decltype(tag)>;
+        apply_getrf<T>(LU_work, pivots, info);
+    });
+    check_infos(info, api, false);
+
+    Tensor result;
+    if (left) {
+        // op(A) = A or conj-transposed A; real dtypes: adjoint handled via 'T'.
+        // torch.linalg.solve has no adjoint flag; plain AX = B.
+        Tensor B_cm = clone_batched_column_major(expand_to_batch(B, batch));
+        run_real(A.dtype(), [&](auto tag) {
+            using T = std::remove_pointer_t<decltype(tag)>;
+            apply_getrs<T>(LU_work, pivots, B_cm, CUBLAS_OP_N);
+        });
+        result = B_cm.contiguous();
+    } else {
+        // X A = B <=> A^T X^T = B^T: solve against the transposed RHS.
+        Tensor BT_cm =
+            clone_batched_column_major(expand_to_batch(B, batch).transpose(-2, -1));
+        run_real(A.dtype(), [&](auto tag) {
+            using T = std::remove_pointer_t<decltype(tag)>;
+            apply_getrs<T>(LU_work, pivots, BT_cm, CUBLAS_OP_T);
+        });
+        result = BT_cm.contiguous().transpose(-2, -1).contiguous();
+    }
+    if (check_errors) {
+        // getrs reports only argument errors; singularity surfaced by getrf.
+    }
+    return {result, info};
+}
+
+Tensor linalg_solve_kernel_cuda(const Tensor& A, const Tensor& B, bool left) {
+    return std::get<0>(linalg_solve_ex_kernel_cuda(A, B, left, false));
+}
+
+std::tuple<Tensor, Tensor> linalg_inv_ex_kernel_cuda(const Tensor& A,
+                                                     bool check_errors) {
+    square_check_inputs(A, "linalg.inv_ex");
+    // torch composes inv through solve_ex against the identity.
+    Tensor identity = Tensor::empty(A.shape(), A.dtype(), A.device());
+    run_real(A.dtype(), [&](auto tag) {
+        using T = std::remove_pointer_t<decltype(tag)>;
+        auto* p = identity.data_ptr<T>();
+        const int64_t ms = matrix_stride_of(identity);
+        const int64_t bs = linear_batch_size(batch_shape_of(A));
+        const int64_t nn = A.size(-1);
+        for (int64_t b = 0; b < bs; ++b) {
+            cudaMemsetAsync(p + b * ms, 0, sizeof(T) * ms,
+                            getCurrentCUDAStream().stream());
+        }
+        // Diagonal ones via a tiny kernel-free path: build on host once.
+        std::vector<T> eye(static_cast<size_t>(nn));
+        for (int64_t i = 0; i < nn; ++i) eye[static_cast<size_t>(i)] = T(1);
+        Tensor eye_dev = Tensor::tensor(eye).to(A.device(), A.dtype());
+        for (int64_t b = 0; b < bs; ++b) {
+            for (int64_t i = 0; i < nn; ++i) {
+                T val = T(1);
+                cudaMemcpyAsync(p + b * ms + i * nn + i, &val, sizeof(T),
+                                cudaMemcpyHostToDevice,
+                                getCurrentCUDAStream().stream());
+            }
+        }
+        (void)eye_dev;
+    });
+    auto [inv, info] = linalg_solve_ex_kernel_cuda(A, identity, true, false);
+    if (check_errors) check_infos(info, "linalg.inv_ex", A.dim() == 2);
+    return {inv, info};
+}
+
+Tensor linalg_inv_kernel_cuda(const Tensor& A) {
+    auto [inv, info] = linalg_inv_ex_kernel_cuda(A, false);
+    check_infos(info, "linalg.inv", A.dim() == 2);
+    return inv;
+}
+
+}  // namespace
+
+}  // namespace cuda
+}  // namespace tensorplay

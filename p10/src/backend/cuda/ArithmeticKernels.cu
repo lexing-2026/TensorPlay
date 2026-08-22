@@ -1,4 +1,5 @@
 #include "Tensor.h"
+#include "SparseKernels.h"
 #include "Dispatcher.h"
 #include "CUDARuntime.h"
 #include "CUDAContext.h"
@@ -213,6 +214,96 @@ __global__ void div_scalar_kernel_cuda_impl(int64_t n, const T* a, typename Bina
     }
 }
 
+// --- Vectorized same-shape fast path ---
+// ATen alignment: contiguous same-numel operands address elements identically
+// (get_offset == identity), so the general broadcast machinery is skipped in
+// favor of 4-wide packed loads, mirroring ATen's vectorized_elementwise_kernel.
+
+template <typename T, int VecSize>
+struct alignas(VecSize * sizeof(T)) TPVecPack { T v[VecSize]; };
+
+struct BinaryAddVecOp { template <typename M> __device__ M operator()(M x, M y, M a) const { return x + a * y; } };
+struct BinarySubVecOp { template <typename M> __device__ M operator()(M x, M y, M a) const { return x - a * y; } };
+struct BinaryMulVecOp { template <typename M> __device__ M operator()(M x, M y, M) const { return x * y; } };
+struct BinaryDivVecOp { template <typename M> __device__ M operator()(M x, M y, M) const { return x / y; } };
+
+template <typename T, int VecSize, typename Op>
+__global__ void binary_same_shape_vectorized_kernel(
+    int64_t n, const T* __restrict__ a, const T* __restrict__ b,
+    T* __restrict__ y, typename BinaryOpMath<T>::type alpha, Op op) {
+    using M = typename BinaryOpMath<T>::type;
+    const int64_t vec_n = n / VecSize;
+    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    for (; i < vec_n; i += stride) {
+        TPVecPack<T, VecSize> pa = *reinterpret_cast<const TPVecPack<T, VecSize>*>(a + i * VecSize);
+        TPVecPack<T, VecSize> pb = *reinterpret_cast<const TPVecPack<T, VecSize>*>(b + i * VecSize);
+        TPVecPack<T, VecSize> po;
+#pragma unroll
+        for (int v = 0; v < VecSize; ++v)
+            po.v[v] = static_cast<T>(op(static_cast<M>(pa.v[v]), static_cast<M>(pb.v[v]), static_cast<M>(alpha)));
+        *reinterpret_cast<TPVecPack<T, VecSize>*>(y + i * VecSize) = po;
+    }
+    for (int64_t j = vec_n * VecSize + i; j < n; j += stride) {
+        y[j] = static_cast<T>(op(static_cast<M>(a[j]), static_cast<M>(b[j]), static_cast<M>(alpha)));
+    }
+}
+
+inline int arith_device_sms() {
+    static int sms = []() {
+        int dev = 0, count = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, dev);
+        return count > 0 ? count : 1;
+    }();
+    return sms;
+}
+
+template <typename T, typename Op>
+inline bool launch_binary_vec(
+    int64_t n, const Tensor& a, const Tensor& b, Tensor& y,
+    typename BinaryOpMath<T>::type alpha, Op op, cudaStream_t stream) {
+    constexpr int kVec = 4;
+    const T* pa = a.data_ptr<T>();
+    const T* pb = b.data_ptr<T>();
+    T* py = y.data_ptr<T>();
+    const uintptr_t align_mask = sizeof(T) * kVec - 1;
+    if ((reinterpret_cast<uintptr_t>(pa) | reinterpret_cast<uintptr_t>(pb) |
+         reinterpret_cast<uintptr_t>(py)) & align_mask) return false;
+
+    dim3 block(128);
+    const int64_t vec_n = n / kVec;
+    const int64_t want = (vec_n + block.x - 1) / block.x;
+    const int64_t cap = static_cast<int64_t>(arith_device_sms()) * 4;
+    dim3 grid(static_cast<unsigned>(want < 1 ? 1 : (want > cap ? cap : want)));
+    binary_same_shape_vectorized_kernel<T, kVec, Op><<<grid, block, 0, stream>>>(
+        n, pa, pb, py, alpha, op);
+    return true;
+}
+
+// Returns true when the vectorized kernel was launched.  Contiguous operands
+// with full numel overlap make get_offset(i) == i for every input.
+template <typename Op>
+inline bool try_binary_vectorized(
+    int64_t n, const Tensor& a, const Tensor& b, Tensor& y,
+    const Scalar& alpha, Op op) {
+    constexpr int64_t kMinElems = 4096;
+    if (n < kMinElems || n % 4 != 0) return false;
+    if (!a.is_contiguous() || !b.is_contiguous() || !y.is_contiguous()) return false;
+    if (a.numel() != n || b.numel() != n) return false;
+
+    const auto stream = getCurrentCUDAStream().stream();
+    switch (y.dtype()) {
+        case DType::Float32: return launch_binary_vec<float>(n, a, b, y, alpha.to<float>(), op, stream);
+        case DType::Float64: return launch_binary_vec<double>(n, a, b, y, alpha.to<double>(), op, stream);
+        case DType::Float16: return launch_binary_vec<tensorplay::Half>(n, a, b, y, alpha.to<float>(), op, stream);
+        case DType::BFloat16: return launch_binary_vec<tensorplay::BFloat16>(n, a, b, y, alpha.to<float>(), op, stream);
+        case DType::Int32: return launch_binary_vec<int>(n, a, b, y, alpha.to<int>(), op, stream);
+        case DType::Int64: return launch_binary_vec<int64_t>(n, a, b, y, alpha.to<int64_t>(), op, stream);
+        default: return false;
+    }
+}
+
 // --- Dispatchers ---
 
 void get_grid_block(int64_t n, dim3& grid, dim3& block) {
@@ -277,9 +368,14 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
     if (n == 0) return result;
 
     dim3 grid, block; get_grid_block(n, grid, block);
-    
+
     Tensor a = (self.dtype() == result_dtype) ? self : self.to(result_dtype);
     Tensor b = (other.dtype() == result_dtype) ? other : other.to(result_dtype);
+
+    if (try_binary_vectorized(n, a, b, result, alpha, BinaryAddVecOp{})) {
+        CUDA_CHECK(cudaGetLastError());
+        return result;
+    }
 
     TensorDesc a_desc = make_desc(a, out_shape.size());
     TensorDesc b_desc = make_desc(b, out_shape.size());
@@ -388,6 +484,9 @@ Tensor add_relu_cuda(const Tensor& self, const Tensor& other) {
 }
 
 Tensor& add_inplace_kernel(Tensor& self, const Tensor& other, Scalar alpha) {
+    if (other.is_sparse()) {
+        return add_sparse_to_dense_cuda(self, other, alpha);
+    }
     int64_t n = self.numel();
     if (n == 0) return self;
     dim3 grid, block; get_grid_block(n, grid, block);
@@ -433,9 +532,14 @@ Tensor sub_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
     if (n == 0) return result;
 
     dim3 grid, block; get_grid_block(n, grid, block);
-    
+
     Tensor a = (self.dtype() == result_dtype) ? self : self.to(result_dtype);
     Tensor b = (other.dtype() == result_dtype) ? other : other.to(result_dtype);
+
+    if (try_binary_vectorized(n, a, b, result, alpha, BinarySubVecOp{})) {
+        CUDA_CHECK(cudaGetLastError());
+        return result;
+    }
 
     TensorDesc a_desc = make_desc(a, out_shape.size());
     TensorDesc b_desc = make_desc(b, out_shape.size());
@@ -511,9 +615,14 @@ Tensor mul_kernel(const Tensor& self, const Tensor& other) {
     if (n == 0) return result;
 
     dim3 grid, block; get_grid_block(n, grid, block);
-    
+
     Tensor a = (self.dtype() == result_dtype) ? self : self.to(result_dtype);
     Tensor b = (other.dtype() == result_dtype) ? other : other.to(result_dtype);
+
+    if (try_binary_vectorized(n, a, b, result, Scalar(1), BinaryMulVecOp{})) {
+        CUDA_CHECK(cudaGetLastError());
+        return result;
+    }
 
     TensorDesc a_desc = make_desc(a, out_shape.size());
     TensorDesc b_desc = make_desc(b, out_shape.size());
@@ -624,15 +733,20 @@ Tensor div_kernel(const Tensor& self, const Tensor& other) {
     std::vector<int64_t> out_shape = broadcast_shapes(static_cast<std::vector<int64_t>>(self.shape()), static_cast<std::vector<int64_t>>(other.shape()));
     DType result_dtype = promoteTypes(self.dtype(), other.dtype());
     if (isIntegralType(result_dtype)) result_dtype = DType::Float32; // Div promotes to float
-    
+
     Tensor result = Tensor::empty(out_shape, result_dtype, self.device());
     int64_t n = result.numel();
     if (n == 0) return result;
 
     dim3 grid, block; get_grid_block(n, grid, block);
-    
+
     Tensor a = (self.dtype() == result_dtype) ? self : self.to(result_dtype);
     Tensor b = (other.dtype() == result_dtype) ? other : other.to(result_dtype);
+
+    if (try_binary_vectorized(n, a, b, result, Scalar(1), BinaryDivVecOp{})) {
+        CUDA_CHECK(cudaGetLastError());
+        return result;
+    }
 
     TensorDesc a_desc = make_desc(a, out_shape.size());
     TensorDesc b_desc = make_desc(b, out_shape.size());

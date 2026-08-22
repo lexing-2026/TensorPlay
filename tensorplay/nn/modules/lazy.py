@@ -2,10 +2,11 @@ import itertools
 from typing import Any, Optional, Protocol
 
 import tensorplay
-from tensorplay.nn.parameter import is_lazy
+from .linear import Linear
+from tensorplay.nn.parameter import UninitializedParameter, is_lazy
 
 
-__all__ = ["LazyModuleMixin"]
+__all__ = ["LazyLinear", "LazyModuleMixin"]
 
 
 class _LazyProtocol(Protocol):
@@ -273,3 +274,51 @@ class LazyModuleMixin:
             "Modules with uninitialized parameters can't be used with `DataParallel`. "
             "Run a dummy forward pass to correctly initialize the modules"
         )
+
+class LazyLinear(LazyModuleMixin, Linear):
+    r"""A :class:`tensorplay.nn.Linear` module where `in_features` is inferred.
+
+    In this module, the `weight` and `bias` are of
+    :class:`tensorplay.nn.UninitializedParameter` class. They will be initialized
+    after the first call to ``forward`` is done and the module will become a
+    regular :class:`tensorplay.nn.Linear` module. The ``in_features`` argument of
+    the :class:`Linear` is inferred from the ``input.shape[-1]``.
+
+    Args:
+        out_features: size of each output sample
+        bias: If set to ``False``, the layer will not learn an additive bias.
+            Default: ``True``
+
+    Attributes:
+        weight: the learnable weights of the module of shape
+            :math:`(\text{out\_features}, \text{in\_features})`.
+        bias:   the learnable bias of the module of shape
+            :math:`(\text{out\_features})`.
+    """
+
+    cls_to_become = Linear  # type: ignore[assignment]
+    weight: UninitializedParameter  # type: ignore[assignment]
+
+    def __init__(self, out_features: int, bias: bool = True) -> None:
+        # bias is hardcoded to False to avoid creating tensor
+        # that will soon be overwritten.
+        super().__init__(0, 0, False)
+        self.weight = UninitializedParameter()
+        self.out_features = out_features
+        if bias:
+            self.bias = UninitializedParameter()
+
+    def reset_parameters(self) -> None:
+        """Resets parameters based on their initialization used in ``__init__``."""
+        if not self.has_uninitialized_params() and self.in_features != 0:
+            super().reset_parameters()
+
+    def initialize_parameters(self, input) -> None:  # type: ignore[override]
+        """Infers ``in_features`` based on ``input`` and initializes parameters."""
+        if self.has_uninitialized_params():
+            with tensorplay.no_grad():
+                self.in_features = input.shape[-1]
+                self.weight.materialize((self.out_features, self.in_features))
+                if self.bias is not None:
+                    self.bias.materialize((self.out_features,))
+                self.reset_parameters()

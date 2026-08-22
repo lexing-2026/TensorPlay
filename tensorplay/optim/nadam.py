@@ -1,184 +1,525 @@
 import tensorplay as tp
 
-from ._utils import (
-    add_weight_decay,
-    capturable_supported,
-    decoupled_weight_decay,
-    ensure_state_step,
-    foreach_enabled,
-    gradient,
-    scalar_value,
-    scalar_pow,
-    state_step,
-    validate_nonnegative,
-    validate_unit_interval,
-    zeros_like,
+from ._utils import zeros_like
+from .optimizer import (
+    Optimizer,
+    _default_to_fused_or_foreach,
+    _disable_dynamo_if_unsupported,
+    _get_capturable_supported_devices,
+    _get_scalar_dtype,
+    _get_value,
+    _stack_if_compiling,
+    _to_scalar,
+    _use_grad_for_differentiable,
+    _view_as_real,
 )
-from .optimizer import Optimizer, _use_grad_for_differentiable
-from ._foreach import nadam as _foreach_nadam
+
+__all__ = ["NAdam", "nadam"]
 
 
 class NAdam(Optimizer):
-    """Nesterov-accelerated Adam optimizer."""
-
-    def __init__(self, params, lr=2e-3, betas=(0.9, 0.999), eps=1e-8,
-                 weight_decay=0, momentum_decay=0.004,
-                 decoupled_weight_decay=False, *, foreach=None,
-                 maximize=False, capturable=False, differentiable=False):
+    def __init__(
+        self,
+        params,
+        lr=2e-3,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=0,
+        momentum_decay=4e-3,
+        decoupled_weight_decay=False,
+        *,
+        foreach=None,
+        maximize=False,
+        capturable=False,
+        differentiable=False,
+    ):
         if isinstance(lr, tp.Tensor) and lr.numel() != 1:
             raise ValueError("Tensor lr must be 1-element")
-        lr_value = scalar_value(lr, "learning rate")
-        if lr_value < 0:
+        if not 0.0 <= lr:
             raise ValueError(f"Invalid learning rate: {lr}")
-        beta1 = validate_unit_interval(betas[0], "beta parameter at index 0")
-        beta2 = validate_unit_interval(betas[1], "beta parameter at index 1")
-        eps = validate_nonnegative(eps, "epsilon")
-        weight_decay = validate_nonnegative(weight_decay, "weight_decay")
-        momentum_decay = validate_nonnegative(momentum_decay, "momentum_decay")
-        defaults = dict(
-            lr=lr,
-            betas=(beta1, beta2),
-            eps=eps,
-            weight_decay=weight_decay,
-            momentum_decay=momentum_decay,
-            decoupled_weight_decay=decoupled_weight_decay,
-            foreach=foreach,
-            maximize=maximize,
-            capturable=capturable,
-            differentiable=differentiable,
-        )
+        if not 0.0 <= eps:
+            raise ValueError(f"Invalid epsilon value: {eps}")
+        if not 0.0 <= betas[0] < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 0: {betas[0]}")
+        if not 0.0 <= betas[1] < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 1: {betas[1]}")
+        if not 0.0 <= weight_decay:
+            raise ValueError(f"Invalid weight_decay value: {weight_decay}")
+        if not 0.0 <= momentum_decay:
+            raise ValueError(f"Invalid momentum_decay value: {momentum_decay}")
+        defaults = {
+            "lr": lr,
+            "betas": betas,
+            "eps": eps,
+            "weight_decay": weight_decay,
+            "momentum_decay": momentum_decay,
+            "decoupled_weight_decay": decoupled_weight_decay,
+            "maximize": maximize,
+            "foreach": foreach,
+            "capturable": capturable,
+            "differentiable": differentiable,
+        }
         super().__init__(params, defaults)
 
     def __setstate__(self, state):
         super().__setstate__(state)
         for group in self.param_groups:
-            group.setdefault("foreach", None)
             group.setdefault("maximize", False)
+            group.setdefault("foreach", None)
             group.setdefault("capturable", False)
             group.setdefault("differentiable", False)
             group.setdefault("decoupled_weight_decay", False)
             for p in group["params"]:
-                p_state = self.state.get(p, {})
-                if not p_state:
-                    continue
-                state_device = p.device if group["capturable"] else tp.device("cpu")
-                for name in ("step", "mu_product"):
-                    if not isinstance(p_state.get(name), tp.Tensor):
-                        p_state[name] = tp.tensor(
-                            float(p_state[name]), dtype=tp.float32,
-                            device=state_device,
+                p_state = self.state.get(p, [])
+                if len(p_state) != 0:
+                    if not tp.is_tensor(p_state["step"]):
+                        step_val = float(p_state["step"])
+                        p_state["step"] = (
+                            tp.tensor(
+                                step_val,
+                                dtype=_get_scalar_dtype(),
+                                device=p.device,
+                            )
+                            if group["capturable"]
+                            else tp.tensor(step_val, dtype=_get_scalar_dtype())
+                        )
+                    if not tp.is_tensor(p_state["mu_product"]):
+                        mu_prod_val = p_state["mu_product"]
+                        p_state["mu_product"] = (
+                            tp.tensor(
+                                mu_prod_val,
+                                dtype=_get_scalar_dtype(),
+                                device=p.device,
+                            )
+                            if group["capturable"]
+                            else tp.tensor(mu_prod_val, dtype=_get_scalar_dtype())
                         )
 
-    @_use_grad_for_differentiable
-    def step(self, closure=None):
-        loss = closure() if closure is not None else None
-        for group in self.param_groups:
-            lr = group["lr"]
-            lr_value = scalar_value(lr, "lr")
-            beta1, beta2 = group["betas"]
-            eps = scalar_value(group["eps"], "eps")
-            weight_decay = scalar_value(group["weight_decay"], "weight_decay")
-            momentum_decay = scalar_value(group["momentum_decay"], "momentum_decay")
-            decoupled = group.get("decoupled_weight_decay", False)
-            maximize = group.get("maximize", False)
-            capturable = group.get("capturable", False)
-            differentiable = group.get("differentiable", False)
-
-            active = [p for p in group["params"] if p.grad is not None]
-            for p in active:
+    def _init_group(
+        self,
+        group,
+        params_with_grad,
+        grads,
+        exp_avgs,
+        exp_avg_sqs,
+        mu_products,
+        state_steps,
+    ):
+        has_complex = False
+        for p in group["params"]:
+            if p.grad is not None:
+                has_complex |= tp.is_complex(p)
+                params_with_grad.append(p)
                 if p.grad.is_sparse:
                     raise RuntimeError("NAdam does not support sparse gradients")
+                grads.append(p.grad)
+
                 state = self.state[p]
-                if not state:
-                    state_device = p.device if capturable else tp.device("cpu")
-                    state["step"] = tp.tensor(
-                        0.0, dtype=tp.float32, device=state_device
+                if len(state) == 0:
+                    state["step"] = (
+                        tp.zeros((), dtype=_get_scalar_dtype(), device=p.device)
+                        if group["capturable"]
+                        else tp.tensor(0.0, dtype=_get_scalar_dtype())
                     )
-                    state["mu_product"] = tp.tensor(
-                        1.0, dtype=tp.float32, device=state_device
+                    state["mu_product"] = (
+                        tp.ones((), dtype=_get_scalar_dtype(), device=p.device)
+                        if group["capturable"]
+                        else tp.tensor(1.0, dtype=_get_scalar_dtype())
                     )
                     state["exp_avg"] = zeros_like(p)
                     state["exp_avg_sq"] = zeros_like(p)
 
-            if active and foreach_enabled(group, active):
-                steps = [
-                    ensure_state_step(self.state[p], param=p,
-                                      capturable=capturable)
-                    for p in active
-                ]
-                mu_products = [self.state[p]["mu_product"] for p in active]
-                fused_lr = (lr.to(device=active[0].device)
-                            if isinstance(lr, tp.Tensor) and
-                            lr.device != active[0].device else lr)
-                if _foreach_nadam(
-                        active, [p.grad for p in active],
-                        [self.state[p]["exp_avg"] for p in active],
-                        [self.state[p]["exp_avg_sq"] for p in active],
-                        mu_products, steps, beta1=beta1, beta2=beta2,
-                        lr=fused_lr, weight_decay=weight_decay,
-                        momentum_decay=momentum_decay, eps=eps,
-                        decoupled_weight_decay=decoupled, maximize=maximize,
-                        capturable=capturable, differentiable=differentiable):
-                    continue
+                exp_avgs.append(state["exp_avg"])
+                exp_avg_sqs.append(state["exp_avg_sq"])
+                mu_products.append(state["mu_product"])
+                state_steps.append(state["step"])
+        return has_complex
 
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                if p.grad.is_sparse:
-                    raise RuntimeError("NAdam does not support sparse gradients")
-                state = self.state[p]
+    @_use_grad_for_differentiable
+    def step(self, closure=None):
+        self._accelerator_graph_capture_health_check()
 
-                grad = gradient(p, maximize)
-                if capturable:
-                    capturable_supported(p)
-                if decoupled:
-                    decoupled_weight_decay(p, lr_value, weight_decay)
-                else:
-                    grad = add_weight_decay(p, grad, weight_decay)
-                step_t = state_step(state, param=p, capturable=capturable)
-                step = step_t if capturable else float(step_t.item())
-                bias_correction2 = 1.0 - scalar_pow(beta2, step)
-                mu = beta1 * (1.0 - 0.5 * scalar_pow(0.96, step * momentum_decay))
-                mu_next = beta1 * (
-                    1.0 - 0.5 * scalar_pow(0.96, (step + 1) * momentum_decay)
-                )
-                mu_product = state["mu_product"]
-                mu_product.mul_(mu)
+        loss = None
+        if closure is not None:
+            with tp.enable_grad():
+                loss = closure()
 
-                is_complex = p.is_complex()
-                param = tp.view_as_real(p) if is_complex else p
-                grad = tp.view_as_real(grad) if is_complex else grad
-                exp_avg = tp.view_as_real(state["exp_avg"]) if is_complex else state["exp_avg"]
-                exp_avg_sq = tp.view_as_real(state["exp_avg_sq"]) if is_complex else state["exp_avg_sq"]
-                exp_avg.lerp_(grad, 1.0 - beta1)
-                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
-                denom = exp_avg_sq.div(bias_correction2).sqrt()
-                if differentiable or capturable:
-                    denom = denom.add(eps)
-                    mu_product_next = mu_product * mu_next
-                    grad_update = grad * (
-                        -lr * (1.0 - mu) / (1.0 - mu_product)
-                    )
-                    exp_avg_update = exp_avg * (
-                        -lr * mu_next / (1.0 - mu_product_next)
-                    )
-                    param.addcdiv_(grad_update, denom)
-                    param.addcdiv_(exp_avg_update, denom)
-                else:
-                    denom.add_(eps)
-                    mu_product_next = float(mu_product.item()) * mu_next
-                    param.addcdiv_(
-                        grad,
-                        denom,
-                        value=-lr_value
-                        * (1.0 - mu)
-                        / (1.0 - float(mu_product.item())),
-                    )
-                    param.addcdiv_(
-                        exp_avg,
-                        denom,
-                        value=-lr_value
-                        * mu_next
-                        / (1.0 - mu_product_next),
-                    )
+        for group in self.param_groups:
+            params_with_grad = []
+            grads = []
+            exp_avgs = []
+            exp_avg_sqs = []
+            mu_products = []
+            state_steps = []
+            beta1, beta2 = group["betas"]
+
+            has_complex = self._init_group(
+                group,
+                params_with_grad,
+                grads,
+                exp_avgs,
+                exp_avg_sqs,
+                mu_products,
+                state_steps,
+            )
+
+            nadam(
+                params_with_grad,
+                grads,
+                exp_avgs,
+                exp_avg_sqs,
+                mu_products,
+                state_steps,
+                beta1=beta1,
+                beta2=beta2,
+                lr=group["lr"],
+                weight_decay=group["weight_decay"],
+                momentum_decay=group["momentum_decay"],
+                eps=group["eps"],
+                maximize=group["maximize"],
+                decoupled_weight_decay=group["decoupled_weight_decay"],
+                foreach=group["foreach"],
+                capturable=group["capturable"],
+                differentiable=group["differentiable"],
+                has_complex=has_complex,
+            )
         return loss
+
+
+def _single_tensor_nadam(
+    params,
+    grads,
+    exp_avgs,
+    exp_avg_sqs,
+    mu_products,
+    state_steps,
+    *,
+    beta1,
+    beta2,
+    lr,
+    weight_decay,
+    momentum_decay,
+    eps,
+    decoupled_weight_decay,
+    maximize,
+    capturable,
+    differentiable,
+    has_complex,
+):
+    lr = _to_scalar(lr)
+
+    for i, param in enumerate(params):
+        grad = grads[i] if not maximize else -grads[i]
+        exp_avg = exp_avgs[i]
+        exp_avg_sq = exp_avg_sqs[i]
+        mu_product = mu_products[i]
+        step_t = state_steps[i]
+
+        if tp.is_complex(param):
+            param = tp.view_as_real(param)
+            grad = tp.view_as_real(grad)
+            exp_avg = tp.view_as_real(exp_avg)
+            exp_avg_sq = tp.view_as_real(exp_avg_sq)
+
+        if not tp.compiler.is_compiling() and capturable:
+            supported = _get_capturable_supported_devices()
+            if not (
+                param.device.type == mu_product.device.type == step_t.device.type
+                and param.device.type in supported
+            ):
+                raise AssertionError(
+                    "If capturable=True, params, mu_products and state_steps "
+                    f"must be on supported devices: {supported}."
+                )
+
+        step_t += 1
+        step = step_t if capturable else _get_value(step_t)
+        bias_correction2 = 1 - beta2 ** step
+
+        if weight_decay != 0:
+            if decoupled_weight_decay:
+                param.mul_(1 - lr * weight_decay)
+            else:
+                grad = grad.add(param, alpha=weight_decay)
+
+        mu = beta1 * (1.0 - 0.5 * (0.96 ** (step * momentum_decay)))
+        mu_next = beta1 * (
+            1.0 - 0.5 * (0.96 ** ((step + 1) * momentum_decay))
+        )
+
+        mu_product.mul_(mu)
+        exp_avg.lerp_(grad, 1 - beta1)
+        exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+        denom = exp_avg_sq.div(bias_correction2).sqrt()
+
+        if differentiable or capturable:
+            denom = denom.add(eps)
+            mu_product_next = mu_product * mu_next
+            grad = grad * (-lr * (1.0 - mu) / (1.0 - mu_product))
+            exp_avg = exp_avg * (-lr * mu_next / (1.0 - mu_product_next))
+            param.addcdiv_(grad, denom)
+            param.addcdiv_(exp_avg, denom)
+        else:
+            mu_product_next = _get_value(mu_product) * mu_next
+            denom.add_(eps)
+            param.addcdiv_(
+                grad,
+                denom,
+                value=(-lr * (1.0 - mu) / (1.0 - _get_value(mu_product))),
+            )
+            param.addcdiv_(
+                exp_avg,
+                denom,
+                value=(-lr * mu_next / (1.0 - mu_product_next)),
+            )
+
+
+def _multi_tensor_nadam(
+    params,
+    grads,
+    exp_avgs,
+    exp_avg_sqs,
+    mu_products,
+    state_steps,
+    *,
+    beta1,
+    beta2,
+    lr,
+    weight_decay,
+    momentum_decay,
+    eps,
+    decoupled_weight_decay,
+    maximize,
+    capturable,
+    differentiable,
+    has_complex,
+):
+    if not params:
+        return
+    if differentiable:
+        raise AssertionError("_foreach ops don't support autograd")
+
+    if not tp.compiler.is_compiling() and capturable:
+        supported = _get_capturable_supported_devices(supports_xla=False)
+        if not all(
+            p.device.type == mu_product.device.type == step.device.type
+            and p.device.type in supported
+            for p, mu_product, step in zip(
+                params, mu_products, state_steps, strict=True
+            )
+        ):
+            raise AssertionError(
+                "If capturable=True, params, mu_products, and state_steps "
+                f"must be on supported devices: {supported}."
+            )
+
+    lr = _to_scalar(lr)
+    grouped_tensors = Optimizer._group_tensors_by_device_and_dtype(
+        [params, grads, exp_avgs, exp_avg_sqs, mu_products, state_steps]
+    )
+    for (
+        grouped_params,
+        grouped_grads,
+        grouped_exp_avgs,
+        grouped_exp_avg_sqs,
+        grouped_mu_products,
+        grouped_state_steps,
+    ), _ in grouped_tensors.values():
+        if not grouped_params:
+            continue
+        if (
+            not tp.compiler.is_compiling()
+            and grouped_state_steps[0].device.type == "cpu"
+        ):
+            tp._foreach_add_(
+                grouped_state_steps,
+                tp.tensor(
+                    1.0,
+                    dtype=grouped_state_steps[0].dtype,
+                    device=tp.device("cpu"),
+                ),
+                alpha=1.0,
+            )
+        else:
+            tp._foreach_add_(grouped_state_steps, 1)
+
+        if has_complex:
+            _view_as_real(
+                grouped_params,
+                grouped_grads,
+                grouped_exp_avgs,
+                grouped_exp_avg_sqs,
+            )
+
+        if maximize:
+            grouped_grads = tp._foreach_neg(grouped_grads)
+
+        if weight_decay != 0:
+            if decoupled_weight_decay:
+                tp._foreach_mul_(grouped_params, 1 - lr * weight_decay)
+            elif maximize:
+                tp._foreach_add_(grouped_grads, grouped_params, alpha=weight_decay)
+            else:
+                grouped_grads = tp._foreach_add(
+                    grouped_grads, grouped_params, alpha=weight_decay
+                )
+
+        tp._foreach_lerp_(grouped_exp_avgs, grouped_grads, 1 - beta1)
+        tp._foreach_mul_(grouped_exp_avg_sqs, beta2)
+        tp._foreach_addcmul_(
+            grouped_exp_avg_sqs, grouped_grads, grouped_grads, 1 - beta2
+        )
+        exp_avg_sq_sqrt = tp._foreach_sqrt(grouped_exp_avg_sqs)
+
+        if capturable:
+            exponent = tp._foreach_mul(grouped_state_steps, momentum_decay)
+            mus = tp._foreach_pow(0.96, exponent)
+            tp._foreach_mul_(mus, -0.5)
+            tp._foreach_add_(mus, 1.0)
+            tp._foreach_mul_(mus, beta1)
+
+            tp._foreach_add_(exponent, momentum_decay)
+            mu_nexts = tp._foreach_pow(0.96, exponent)
+            tp._foreach_mul_(mu_nexts, -0.5)
+            tp._foreach_add_(mu_nexts, 1.0)
+            tp._foreach_mul_(mu_nexts, beta1)
+            del exponent
+
+            bias_correction_sqrt = tp._foreach_pow(beta2, grouped_state_steps)
+            tp._foreach_sub_(bias_correction_sqrt, 1.0)
+            tp._foreach_neg_(bias_correction_sqrt)
+            tp._foreach_sqrt_(bias_correction_sqrt)
+        else:
+            bias_correction_sqrt = [
+                (1 - beta2 ** _get_value(step)) ** 0.5
+                for step in grouped_state_steps
+            ]
+            mus = [
+                beta1 * (1.0 - 0.5 * (0.96 ** (_get_value(step) * momentum_decay)))
+                for step in grouped_state_steps
+            ]
+            mu_nexts = [
+                beta1
+                * (1.0 - 0.5 * (0.96 ** ((_get_value(step) + 1) * momentum_decay)))
+                for step in grouped_state_steps
+            ]
+
+        tp._foreach_mul_(grouped_mu_products, mus)
+        tp._foreach_div_(exp_avg_sq_sqrt, bias_correction_sqrt)
+        tp._foreach_add_(exp_avg_sq_sqrt, eps)
+        del bias_correction_sqrt
+
+        if capturable:
+            tp._foreach_sub_(mus, 1.0)
+            tp._foreach_mul_(mus, lr)
+            denom = tp._foreach_sub(grouped_mu_products, 1.0)
+            tp._foreach_neg_(denom)
+            tp._foreach_div_(mus, denom)
+            step_size_grads = mus
+            del denom
+
+            denom = tp._foreach_mul(grouped_mu_products, mu_nexts)
+            tp._foreach_mul_(mu_nexts, lr)
+            tp._foreach_sub_(denom, 1.0)
+            tp._foreach_div_(mu_nexts, denom)
+            step_size_expavg = mu_nexts
+            del denom
+
+            numerator = tp._foreach_mul(step_size_grads, grouped_grads)
+            tp._foreach_addcmul_(
+                numerator, step_size_expavg, grouped_exp_avgs
+            )
+            tp._foreach_addcdiv_(grouped_params, numerator, exp_avg_sq_sqrt)
+        else:
+            step_size_grads = _stack_if_compiling(
+                [
+                    (_get_value(lr) * (1.0 - mu)
+                     / (1.0 - _get_value(mu_product))) * -1
+                    for mu_product, mu in zip(
+                        grouped_mu_products, mus, strict=True
+                    )
+                ]
+            )
+            step_size_expavg = _stack_if_compiling(
+                [
+                    (_get_value(lr) * mu_next
+                     / (1.0 - _get_value(mu_product) * mu_next)) * -1
+                    for mu_product, mu_next in zip(
+                        grouped_mu_products, mu_nexts, strict=True
+                    )
+                ]
+            )
+            tp._foreach_addcdiv_(
+                grouped_params,
+                grouped_grads,
+                exp_avg_sq_sqrt,
+                step_size_grads,
+            )
+            tp._foreach_addcdiv_(
+                grouped_params,
+                grouped_exp_avgs,
+                exp_avg_sq_sqrt,
+                step_size_expavg,
+            )
+
+
+@_disable_dynamo_if_unsupported(single_tensor_fn=_single_tensor_nadam)
+def nadam(
+    params,
+    grads,
+    exp_avgs,
+    exp_avg_sqs,
+    mu_products,
+    state_steps,
+    decoupled_weight_decay=False,
+    foreach=None,
+    capturable=False,
+    differentiable=False,
+    has_complex=False,
+    maximize=False,
+    *,
+    beta1,
+    beta2,
+    lr,
+    weight_decay,
+    momentum_decay,
+    eps,
+):
+    if not all(
+        isinstance(value, tp.Tensor) for value in state_steps
+    ):
+        raise RuntimeError(
+            "API has changed, `state_steps` argument must contain a list of "
+            "singleton tensors"
+        )
+    if not all(
+        isinstance(value, tp.Tensor) for value in mu_products
+    ):
+        raise RuntimeError(
+            "API has changed, `mu_products` argument must contain a list of "
+            "singleton tensors"
+        )
+    if foreach is None:
+        _, foreach = _default_to_fused_or_foreach(
+            params, differentiable, use_fused=False
+        )
+    func = _multi_tensor_nadam if foreach else _single_tensor_nadam
+    func(
+        params,
+        grads,
+        exp_avgs,
+        exp_avg_sqs,
+        mu_products,
+        state_steps,
+        beta1=beta1,
+        beta2=beta2,
+        lr=lr,
+        weight_decay=weight_decay,
+        momentum_decay=momentum_decay,
+        maximize=maximize,
+        decoupled_weight_decay=decoupled_weight_decay,
+        eps=eps,
+        capturable=capturable,
+        differentiable=differentiable,
+        has_complex=has_complex,
+    )

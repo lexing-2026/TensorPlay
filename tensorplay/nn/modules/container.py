@@ -794,18 +794,19 @@ class ParameterDict(Module):
         if parameters is not None:
             self.update(parameters)
 
-    @staticmethod
-    def _verify_key(key: str) -> str:
+    def _key_to_attr(self, key: str) -> str:
         if not isinstance(key, str):
             raise TypeError(
                 "Index given to ParameterDict cannot be used as a key as it is "
                 f"not a string (type is '{type(key).__name__}'). Open an issue on "
                 "github if you need non-string keys."
             )
-        return key
+        else:
+            # Use the key as-is so that `.named_parameters()` returns the right thing
+            return key
 
     def __getitem__(self, key: str) -> Any:
-        attr = self._verify_key(key)
+        attr = self._key_to_attr(key)
         return getattr(self, attr)
 
     def __setitem__(self, key: str, value: Any) -> None:
@@ -815,14 +816,14 @@ class ParameterDict(Module):
         # Objects added via setattr() are not in the dictionary part and thus won't
         # call into this function.
         self._keys[key] = None
-        attr = self._verify_key(key)
+        attr = self._key_to_attr(key)
         if isinstance(value, tensorplay.Tensor) and not isinstance(value, Parameter):
             value = Parameter(value)
         setattr(self, attr, value)
 
     def __delitem__(self, key: str) -> None:
         del self._keys[key]
-        attr = self._verify_key(key)
+        attr = self._key_to_attr(key)
         delattr(self, attr)
 
     def __len__(self) -> int:

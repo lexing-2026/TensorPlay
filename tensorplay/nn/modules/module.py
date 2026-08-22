@@ -581,9 +581,6 @@ class Module:
             >>> self.register_buffer('running_mean', tensorplay.zeros(num_features))
 
         """
-        if persistent is False and isinstance(self, tensorplay.jit.ScriptModule):
-            raise RuntimeError("ScriptModule does not support non-persistent buffers")
-
         if "_buffers" not in self.__dict__:
             raise AttributeError("cannot assign buffer before Module.__init__() call")
         elif not isinstance(name, str):
@@ -1657,30 +1654,6 @@ class Module:
         if prepend:
             self._forward_hooks.move_to_end(handle.id, last=False)  # type: ignore[attr-defined]
         return handle
-
-    def _slow_forward(self, *input, **kwargs):
-        tracing_state = tensorplay._C._get_tracing_state()
-        if not tracing_state or isinstance(self.forward, tensorplay._C.ScriptMethod):
-            return self.forward(*input, **kwargs)
-        recording_scopes = tensorplay.jit._trace._trace_module_map is not None
-        if recording_scopes:
-            # type ignore was added because at this point one knows that
-            # tensorplay.jit._trace._trace_module_map is not Optional and has type Dict[Any, Any]
-            name = (
-                tensorplay.jit._trace._trace_module_map[self]  # type: ignore[index]
-                if self in tensorplay.jit._trace._trace_module_map  # type: ignore[operator]
-                else None
-            )  # noqa: B950
-            if name:
-                tracing_state.push_scope(name)
-            else:
-                recording_scopes = False
-        try:
-            result = self.forward(*input, **kwargs)
-        finally:
-            if recording_scopes:
-                tracing_state.pop_scope()
-        return result
 
     def _wrapped_call_impl(self, *args, **kwargs):
         if self._compiled_call_impl is not None:

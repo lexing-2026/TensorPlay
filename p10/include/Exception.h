@@ -73,6 +73,11 @@ namespace detail {
 #define TP_THROW(Type, ...) \
     throw tensorplay::Type({__FILE__, __func__, __LINE__}, tensorplay::detail::format_msg(__VA_ARGS__))
 
+#define TP_THROW_IF(cond, Type, ...) \
+    if (cond) { \
+        TP_THROW(Type, __VA_ARGS__); \
+    }
+
 #define TP_CHECK(cond, ...) \
     if (!(cond)) { \
         TP_THROW(Exception, "Expected " #cond " to be true, but got false. ", __VA_ARGS__); \

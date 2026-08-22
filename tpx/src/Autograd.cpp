@@ -306,6 +306,15 @@ Tensor slice(const Tensor& self, int64_t dim, int64_t start, int64_t end, int64_
     return result;
 }
 
+Tensor narrow(const Tensor& self, int64_t dim, int64_t start, int64_t length) {
+    // torch's narrow is a slice of `length` elements starting at `start`;
+    // routing through slice carries the gradient via SliceBackward.
+    if (length < 0) {
+        TP_THROW(RuntimeError, "narrow(): length cannot be negative but got ", length);
+    }
+    return slice(self, dim, start, start + length);
+}
+
 namespace {
 
 // Torch formats shapes in error messages as "[2, 4]".
@@ -375,6 +384,64 @@ Tensor expand(const Tensor& self, const std::vector<int64_t>& size) {
     }
 
     return as_strided(self, target_shape, new_strides);
+}
+
+// Mirrors torch's ToCopyBackward / _to_copy_backward: the gradient is cast
+// back to the source tensor's dtype and device.
+struct ToCopyBackward : public Node {
+    DType dtype_;
+    Device device_;
+
+    ToCopyBackward(DType dtype, Device device) : dtype_(dtype), device_(device) {}
+
+    size_t num_inputs() const override { return 1; }
+
+    variable_list apply(variable_list&& inputs) override {
+        if (inputs.empty() || !inputs[0].defined()) return {Tensor()};
+        return {inputs[0].to(device_, dtype_)};
+    }
+};
+
+Tensor to(const Tensor& self, DType dtype, bool non_blocking, bool copy) {
+    bool requires_grad = self.requires_grad();
+    std::shared_ptr<Node> grad_fn;
+    if (requires_grad && (self.dtype() != dtype)) {
+        grad_fn = std::make_shared<ToCopyBackward>(self.dtype(), self.device());
+        grad_fn->add_next_edge_list(collect_next_edges(self));
+    }
+    Tensor result = self.to(dtype, non_blocking, copy);
+    if (requires_grad && result.defined() && grad_fn) {
+        impl::set_grad_fn(result, grad_fn);
+    }
+    return result;
+}
+
+Tensor to(const Tensor& self, Device device, bool non_blocking, bool copy) {
+    bool requires_grad = self.requires_grad();
+    std::shared_ptr<Node> grad_fn;
+    if (requires_grad && !(self.device() == device)) {
+        grad_fn = std::make_shared<ToCopyBackward>(self.dtype(), self.device());
+        grad_fn->add_next_edge_list(collect_next_edges(self));
+    }
+    Tensor result = self.to(device, non_blocking, copy);
+    if (requires_grad && result.defined() && grad_fn) {
+        impl::set_grad_fn(result, grad_fn);
+    }
+    return result;
+}
+
+Tensor to(const Tensor& self, Device device, DType dtype, bool non_blocking, bool copy) {
+    bool requires_grad = self.requires_grad();
+    std::shared_ptr<Node> grad_fn;
+    if (requires_grad && ((self.dtype() != dtype) || !(self.device() == device))) {
+        grad_fn = std::make_shared<ToCopyBackward>(self.dtype(), self.device());
+        grad_fn->add_next_edge_list(collect_next_edges(self));
+    }
+    Tensor result = self.to(device, dtype, non_blocking, copy);
+    if (requires_grad && result.defined() && grad_fn) {
+        impl::set_grad_fn(result, grad_fn);
+    }
+    return result;
 }
 
 } // namespace tpx

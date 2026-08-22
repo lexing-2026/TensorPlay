@@ -1,145 +1,185 @@
-import math
+# mypy: allow-untyped-defs
 
-import tensorplay as tp
+import tensorplay
+from tensorplay import Tensor
 
-from ._utils import scalar_value, zeros_like
-from .optimizer import Optimizer
+from . import _functional as F
+from .optimizer import _maximize_doc, _params_doc, _to_scalar, Optimizer, ParamsT
 
 
-def _sparse_adam(params, grads, exp_avgs, exp_avg_sqs, state_steps, *,
-                 eps, beta1, beta2, lr, maximize):
-    """Direct port of ``torch.optim._functional.sparse_adam``.
-
-    The algorithm itself is Python in Torch; the sparse Tensor methods carry
-    the indexed storage update.  Keeping this layer source-shaped means the
-    optimizer becomes functional as soon as TensorPlay's sparse COO methods
-    are available, instead of baking in a dense approximation.
-    """
-
-    for index, param in enumerate(params):
-        grad = grads[index] if not maximize else -grads[index]
-        grad = grad.coalesce()
-        grad_indices = grad._indices()
-        grad_values = grad._values()
-        if grad_values.numel() == 0:
-            continue
-        size = grad.shape
-
-        exp_avg = exp_avgs[index]
-        exp_avg_sq = exp_avg_sqs[index]
-
-        def make_sparse(values):
-            constructor = getattr(grad, "new", None)
-            if constructor is None:
-                raise RuntimeError(
-                    "TensorPlay sparse COO Tensor methods are unavailable"
-                )
-            if grad_indices.dim() == 0 or values.dim() == 0:
-                return constructor().resize_as_(grad)
-            return constructor(grad_indices, values, size)
-
-        old_exp_avg_values = exp_avg.sparse_mask(grad)._values()
-        exp_avg_update_values = grad_values.sub(old_exp_avg_values).mul_(1 - beta1)
-        exp_avg.add_(make_sparse(exp_avg_update_values))
-        old_exp_avg_sq_values = exp_avg_sq.sparse_mask(grad)._values()
-        exp_avg_sq_update_values = (
-            grad_values.pow(2).sub_(old_exp_avg_sq_values).mul_(1 - beta2)
-        )
-        exp_avg_sq.add_(make_sparse(exp_avg_sq_update_values))
-
-        numer = exp_avg_update_values.add_(old_exp_avg_values)
-        exp_avg_sq_update_values.add_(old_exp_avg_sq_values)
-        denom = exp_avg_sq_update_values.sqrt_().add_(eps)
-        bias_correction1 = 1.0 - beta1 ** state_steps[index]
-        bias_correction2 = 1.0 - beta2 ** state_steps[index]
-        step_size = lr * math.sqrt(bias_correction2) / bias_correction1
-        param.add_(make_sparse(-step_size * numer.div_(denom)))
+__all__ = ["SparseAdam"]
 
 
 class SparseAdam(Optimizer):
-    """Masked Adam for dense parameters with sparse gradients."""
-
-    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8,
-                 maximize=False):
-        if isinstance(lr, tp.Tensor) and lr.numel() != 1:
+    def __init__(
+        self,
+        params: ParamsT,
+        lr: float | Tensor = 1e-3,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        maximize: bool = False,
+    ) -> None:
+        if isinstance(lr, Tensor) and lr.numel() != 1:
             raise ValueError("Tensor lr must be 1-element")
-        if scalar_value(lr, "lr") <= 0.0:
+        if not 0.0 < lr:
             raise ValueError(f"Invalid learning rate: {lr}")
-        if scalar_value(eps, "eps") <= 0.0:
+        if not 0.0 < eps:
             raise ValueError(f"Invalid epsilon value: {eps}")
-        if not 0.0 <= scalar_value(betas[0], "beta parameter at index 0") < 1.0:
+        if not 0.0 <= betas[0] < 1.0:
             raise ValueError(f"Invalid beta parameter at index 0: {betas[0]}")
-        if not 0.0 <= scalar_value(betas[1], "beta parameter at index 1") < 1.0:
+        if not 0.0 <= betas[1] < 1.0:
             raise ValueError(f"Invalid beta parameter at index 1: {betas[1]}")
-        super().__init__(params, dict(
-            lr=lr, betas=betas, eps=eps, maximize=maximize
-        ))
+
+        defaults = {
+            "lr": lr,
+            "betas": betas,
+            "eps": eps,
+            "maximize": maximize,
+        }
+        super().__init__(params, defaults)
 
         sparse_params = []
         complex_params = []
-        for group_index, group in enumerate(self.param_groups):
-            for param_index, param in enumerate(group["params"]):
-                if param.is_sparse:
-                    sparse_params.append([group_index, param_index])
-                if param.is_complex():
-                    complex_params.append([group_index, param_index])
+        for index, param_group in enumerate(self.param_groups):
+            if not isinstance(param_group, dict):
+                raise AssertionError(
+                    f"param_groups must be a list of dicts, but got {type(param_group)}"
+                )
+            # given param group, convert given params to a list first before iterating
+            for d_index, d_param in enumerate(param_group["params"]):
+                if d_param.is_sparse:
+                    sparse_params.append([index, d_index])
+                if d_param.is_complex():
+                    complex_params.append([index, d_index])
         if sparse_params:
             raise ValueError(
-                f"Sparse params at indices {sparse_params}: "
-                "SparseAdam requires dense parameter tensors"
+                f"Sparse params at indices {sparse_params}: SparseAdam requires dense parameter tensors"
             )
         if complex_params:
             raise ValueError(
-                f"Complex params at indices {complex_params}: "
-                "SparseAdam does not support complex parameters"
+                f"Complex params at indices {complex_params}: SparseAdam does not support complex parameters"
             )
 
-    @tp.no_grad()
+    @tensorplay.no_grad()
     def step(self, closure=None):
+        """Perform a single optimization step.
+
+        Args:
+            closure (Callable, optional): A closure that reevaluates the model
+                and returns the loss.
+        """
         loss = None
         if closure is not None:
-            with tp.enable_grad():
+            with tensorplay.enable_grad():
                 loss = closure()
 
         for group in self.param_groups:
-            params_with_grad = []
-            grads = []
-            exp_avgs = []
-            exp_avg_sqs = []
-            state_steps = []
+            params_with_grad: list[Tensor] = []
+            grads: list[Tensor] = []
+            exp_avgs: list[Tensor] = []
+            exp_avg_sqs: list[Tensor] = []
+            state_steps: list[int] = []
             beta1, beta2 = group["betas"]
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                if not p.grad.is_sparse:
-                    raise RuntimeError(
-                        "SparseAdam does not support dense gradients, "
-                        "please consider Adam instead"
-                    )
-                params_with_grad.append(p)
-                grads.append(p.grad)
-                state = self.state[p]
-                if len(state) == 0:
-                    state["step"] = 0
-                    state["exp_avg"] = zeros_like(p)
-                    state["exp_avg_sq"] = zeros_like(p)
-                exp_avgs.append(state["exp_avg"])
-                exp_avg_sqs.append(state["exp_avg_sq"])
-                state["step"] += 1
-                state_steps.append(state["step"])
+            maximize = group.get("maximize", False)
 
-            if params_with_grad:
-                try:
-                    _sparse_adam(
-                        params_with_grad, grads, exp_avgs, exp_avg_sqs,
-                        state_steps, eps=scalar_value(group["eps"], "eps"),
-                        beta1=scalar_value(beta1, "beta1"),
-                        beta2=scalar_value(beta2, "beta2"),
-                        lr=scalar_value(group["lr"], "lr"),
-                        maximize=group.get("maximize", False),
-                    )
-                except AttributeError as exc:
-                    raise RuntimeError(
-                        "TensorPlay sparse COO Tensor methods are unavailable"
-                    ) from exc
+            for p in group["params"]:
+                if p.grad is not None:
+                    params_with_grad.append(p)
+                    if not p.grad.is_sparse:
+                        raise RuntimeError(
+                            "SparseAdam does not support dense gradients, please consider Adam instead"
+                        )
+                    grads.append(p.grad)
+
+                    state = self.state[p]
+
+                    # State initialization
+                    if len(state) == 0:
+                        state["step"] = 0
+                        # Exponential moving average of gradient values
+                        state["exp_avg"] = tensorplay.zeros_like(p)
+                        # Exponential moving average of squared gradient values
+                        state["exp_avg_sq"] = tensorplay.zeros_like(p)
+
+                    exp_avgs.append(state["exp_avg"])
+                    exp_avg_sqs.append(state["exp_avg_sq"])
+
+                    # update the steps for each param group update
+                    state["step"] += 1
+                    # record the step after step update
+                    state_steps.append(state["step"])
+
+            F.sparse_adam(
+                params_with_grad,
+                grads,
+                exp_avgs,
+                exp_avg_sqs,
+                state_steps,
+                eps=group["eps"],
+                beta1=beta1,
+                beta2=beta2,
+                lr=_to_scalar(group["lr"]),
+                maximize=maximize,
+            )
+
         return loss
+
+
+SparseAdam.__doc__ = rf"""SparseAdam implements a masked version of the Adam algorithm
+    suitable for sparse gradients. Currently, due to implementation constraints (explained
+    below), SparseAdam is only intended for a narrow subset of use cases, specifically
+    parameters of a dense layout with gradients of a sparse layout. This occurs in a
+    special case where the module backwards produces grads already in a sparse layout.
+    One example NN module that behaves as such is ``nn.Embedding(sparse=True)``.
+
+    SparseAdam approximates the Adam algorithm by masking out the parameter and moment
+    updates corresponding to the zero values in the gradients. Whereas the Adam algorithm
+    will update the first moment, the second moment, and the parameters based on all values
+    of the gradients, SparseAdam only updates the moments and parameters corresponding
+    to the non-zero values of the gradients.
+
+    A simplified way of thinking about the `intended` implementation is as such:
+
+    1. Create a mask of the non-zero values in the sparse gradients. For example,
+       if your gradient looks like [0, 5, 0, 0, 9], the mask would be [0, 1, 0, 0, 1].
+    2. Apply this mask over the running moments and do computation on only the
+       non-zero values.
+    3. Apply this mask over the parameters and only apply an update on non-zero values.
+
+    In actuality, we use sparse layout Tensors to optimize this approximation, which means the
+    more gradients that are masked by not being materialized, the more performant the optimization.
+    Since we rely on using sparse layout tensors, we infer that any materialized value in the
+    sparse layout is non-zero and we do NOT actually verify that all values are not zero!
+    It is important to not conflate a semantically sparse tensor (a tensor where many
+    of its values are zeros) with a sparse layout tensor (a tensor where ``.is_sparse``
+    returns ``True``). The SparseAdam approximation is intended for `semantically` sparse
+    tensors and the sparse layout is only an implementation detail. A clearer implementation
+    would be to use MaskedTensors, but those are experimental.
+
+
+    .. note::
+
+        If you suspect your gradients are semantically sparse (but do not have sparse
+        layout), this variant may not be the best for you. Ideally, you want to avoid
+        materializing anything that is suspected to be sparse in the first place, since
+        needing to convert all your grads from dense layout to sparse layout may outweigh
+        the performance gain. Here, using Adam may be the best alternative, unless you
+        can easily rig up your module to output sparse grads similar to
+        ``nn.Embedding(sparse=True)``. If you insist on converting your grads, you can do
+        so by manually overriding your parameters' ``.grad`` fields with their sparse
+        equivalents before calling ``.step()``.
+
+
+    Args:
+        {_params_doc}
+        lr (float, Tensor, optional): learning rate (default: 1e-3)
+        betas (Tuple[float, float], optional): coefficients used for computing
+            running averages of gradient and its square (default: (0.9, 0.999))
+        eps (float, optional): term added to the denominator to improve
+            numerical stability (default: 1e-8)
+        {_maximize_doc}
+
+    .. _Adam\: A Method for Stochastic Optimization:
+        https://arxiv.org/abs/1412.6980
+
+    """

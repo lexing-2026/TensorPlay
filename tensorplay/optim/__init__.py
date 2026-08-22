@@ -7,14 +7,20 @@ from .adagrad import Adagrad
 from .adadelta import Adadelta
 from .adamax import Adamax
 from .asgd import ASGD
-from .adafactor import Adafactor
+from ._adafactor import Adafactor
 from .lbfgs import LBFGS
-from .muon import Muon
+from ._muon import Muon
 from .nadam import NAdam
 from .radam import RAdam
 from .rprop import Rprop
 from .sparse_adam import SparseAdam
 from . import lr_scheduler
+from . import swa_utils
+from ._stateless import swap_in_optimizer_params_and_state
+
+Adafactor.__module__ = "tensorplay.optim"
+Muon.__module__ = "tensorplay.optim"
+swap_in_optimizer_params_and_state.__module__ = "tensorplay.optim"
 
 __all__ = [
     'Optimizer',
@@ -34,4 +40,6 @@ __all__ = [
     'Rprop',
     'SparseAdam',
     'lr_scheduler',
+    'swa_utils',
+    'swap_in_optimizer_params_and_state',
 ]

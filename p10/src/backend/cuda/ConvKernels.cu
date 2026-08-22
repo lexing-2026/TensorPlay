@@ -2,6 +2,7 @@
 #include "Dispatcher.h"
 #include "Exception.h"
 #include "CUDAContext.h"
+#include "CUDARuntime.h"
 #include "CUDNNUtils.h"
 #include "Allocator.h"
 #include <vector>
@@ -24,6 +25,29 @@ namespace cuda {
 #ifdef USE_CUDNN
 Tensor& relu_inplace_kernel_cudnn(Tensor& self);
 #endif
+
+// Defined below in this file; the conv_transpose1d wrappers call them.
+Tensor conv_transpose2d_grad_input_cuda(const Tensor& grad_output, const Tensor& input,
+                                        const Tensor& weight,
+                                        const std::vector<int64_t>& stride,
+                                        const std::vector<int64_t>& padding,
+                                        const std::vector<int64_t>& output_padding,
+                                        int64_t groups,
+                                        const std::vector<int64_t>& dilation);
+Tensor conv_transpose2d_grad_weight_cuda(const Tensor& grad_output, const Tensor& input,
+                                         const Tensor& weight,
+                                         const std::vector<int64_t>& stride,
+                                         const std::vector<int64_t>& padding,
+                                         const std::vector<int64_t>& output_padding,
+                                         int64_t groups,
+                                         const std::vector<int64_t>& dilation);
+Tensor conv_transpose2d_grad_bias_cuda(const Tensor& grad_output, const Tensor& input,
+                                       const Tensor& weight,
+                                       const std::vector<int64_t>& stride,
+                                       const std::vector<int64_t>& padding,
+                                       const std::vector<int64_t>& output_padding,
+                                       int64_t groups,
+                                       const std::vector<int64_t>& dilation);
 
 namespace {
     std::vector<int64_t> expand_param_if_needed(const std::vector<int64_t>& list, int64_t n, int64_t default_val) {
@@ -70,24 +94,36 @@ namespace {
 
 #ifdef USE_CUDNN
 
+// Shared dtype mapping for the descriptor helpers below.  Half/BFloat16 run
+// with FLOAT compute type (torch's tensor-core path), so the alpha/beta
+// float scalars stay valid for them.
+inline cudnnDataType_t to_cudnn_data_type(DType d) {
+    if (d == DType::Float32) return CUDNN_DATA_FLOAT;
+    if (d == DType::Float64) return CUDNN_DATA_DOUBLE;
+    if (d == DType::Float16) return CUDNN_DATA_HALF;
+    if (d == DType::BFloat16) return CUDNN_DATA_BFLOAT16;
+    TP_THROW(NotImplementedError, "cuDNN: only float/double/half/bfloat16 supported");
+}
+
+inline cudnnDataType_t to_cudnn_compute_type(DType d) {
+    return d == DType::Float64 ? CUDNN_DATA_DOUBLE : CUDNN_DATA_FLOAT;
+}
+
 // RAII Wrappers for cuDNN descriptors
 struct TensorDesc {
     cudnnTensorDescriptor_t desc;
     TensorDesc() { CUDNN_CHECK(cudnnCreateTensorDescriptor(&desc)); }
     ~TensorDesc() { cudnnDestroyTensorDescriptor(desc); }
     operator cudnnTensorDescriptor_t() const { return desc; }
-    
+
     void set(const Tensor& t) {
-        cudnnDataType_t dtype;
-        if (t.dtype() == DType::Float32) dtype = CUDNN_DATA_FLOAT;
-        else if (t.dtype() == DType::Float64) dtype = CUDNN_DATA_DOUBLE;
-        else TP_THROW(NotImplementedError, "cuDNN: only float/double supported");
-        
+        cudnnDataType_t dtype = to_cudnn_data_type(t.dtype());
+
         int n = static_cast<int>(t.size(0));
         int c = static_cast<int>(t.size(1));
         int h = static_cast<int>(t.size(2));
         int w = static_cast<int>(t.size(3));
-        
+
         // TensorPlay is NCHW by default
         CUDNN_CHECK(cudnnSetTensor4dDescriptor(desc, CUDNN_TENSOR_NCHW, dtype, n, c, h, w));
     }
@@ -98,18 +134,15 @@ struct FilterDesc {
     FilterDesc() { CUDNN_CHECK(cudnnCreateFilterDescriptor(&desc)); }
     ~FilterDesc() { cudnnDestroyFilterDescriptor(desc); }
     operator cudnnFilterDescriptor_t() const { return desc; }
-    
+
     void set(const Tensor& t) {
-        cudnnDataType_t dtype;
-        if (t.dtype() == DType::Float32) dtype = CUDNN_DATA_FLOAT;
-        else if (t.dtype() == DType::Float64) dtype = CUDNN_DATA_DOUBLE;
-        else TP_THROW(NotImplementedError, "cuDNN: only float/double supported");
-        
+        cudnnDataType_t dtype = to_cudnn_data_type(t.dtype());
+
         int k = static_cast<int>(t.size(0));
         int c = static_cast<int>(t.size(1));
         int h = static_cast<int>(t.size(2));
         int w = static_cast<int>(t.size(3));
-        
+
         CUDNN_CHECK(cudnnSetFilter4dDescriptor(desc, dtype, CUDNN_TENSOR_NCHW, k, c, h, w));
     }
 };
@@ -119,14 +152,9 @@ struct ConvDesc {
     ConvDesc() { CUDNN_CHECK(cudnnCreateConvolutionDescriptor(&desc)); }
     ~ConvDesc() { cudnnDestroyConvolutionDescriptor(desc); }
     operator cudnnConvolutionDescriptor_t() const { return desc; }
-    
+
     void set(int pad_h, int pad_w, int str_h, int str_w, int dil_h, int dil_w, int groups, DType dtype) {
-        cudnnDataType_t computeType;
-        if (dtype == DType::Float32) computeType = CUDNN_DATA_FLOAT;
-        else if (dtype == DType::Float64) computeType = CUDNN_DATA_DOUBLE;
-        else TP_THROW(NotImplementedError, "cuDNN: only float/double supported");
-        
-        CUDNN_CHECK(cudnnSetConvolution2dDescriptor(desc, pad_h, pad_w, str_h, str_w, dil_h, dil_w, CUDNN_CROSS_CORRELATION, computeType));
+        CUDNN_CHECK(cudnnSetConvolution2dDescriptor(desc, pad_h, pad_w, str_h, str_w, dil_h, dil_w, CUDNN_CROSS_CORRELATION, to_cudnn_compute_type(dtype)));
         CUDNN_CHECK(cudnnSetConvolutionGroupCount(desc, groups));
     }
 };
@@ -845,12 +873,828 @@ Tensor conv2d_grad_bias_cuda(const Tensor& grad_output, const Tensor& input, con
 #endif
 }
 
+// =========================================================================
+// Conv-family alignment with ATen: conv1d / conv3d / conv_transpose* on
+// CUDA, and the unfold/fold kernels (aten Im2Col.cu / Col2Im.cu).
+// =========================================================================
+
+#ifdef USE_CUDNN
+
+// Rank-generic descriptors for the 5-D (conv3d / conv_transpose3d) paths;
+// the helpers above only cover the 4-D case.
+struct TensorDescNd {
+    cudnnTensorDescriptor_t desc;
+    TensorDescNd() { CUDNN_CHECK(cudnnCreateTensorDescriptor(&desc)); }
+    ~TensorDescNd() { cudnnDestroyTensorDescriptor(desc); }
+    operator cudnnTensorDescriptor_t() const { return desc; }
+
+    void set(const std::vector<int64_t>& sizes, DType dtype) {
+        int nbDims = static_cast<int>(sizes.size());
+        int dims[8], strides[8];
+        int64_t stride = 1;
+        for (int i = nbDims - 1; i >= 0; --i) {
+            dims[i] = static_cast<int>(sizes[i]);
+            strides[i] = static_cast<int>(stride);
+            stride *= sizes[i];
+        }
+        // The Nd descriptor has no format argument: the stride array fully
+        // determines the layout, so dense NCDHW strides are passed in.
+        CUDNN_CHECK(cudnnSetTensorNdDescriptor(desc, to_cudnn_data_type(dtype), nbDims,
+                                               dims, strides));
+    }
+    void set(const Tensor& t) { set(t.shape(), t.dtype()); }
+};
+
+struct FilterDescNd {
+    cudnnFilterDescriptor_t desc;
+    FilterDescNd() { CUDNN_CHECK(cudnnCreateFilterDescriptor(&desc)); }
+    ~FilterDescNd() { cudnnDestroyFilterDescriptor(desc); }
+    operator cudnnFilterDescriptor_t() const { return desc; }
+
+    void set(const Tensor& t) {
+        int nbDims = static_cast<int>(t.dim());
+        int dims[8];
+        for (int i = 0; i < nbDims; ++i) dims[i] = static_cast<int>(t.size(i));
+        CUDNN_CHECK(cudnnSetFilterNdDescriptor(desc, to_cudnn_data_type(t.dtype()),
+                                               CUDNN_TENSOR_NCHW, nbDims, dims));
+    }
+};
+
+struct ConvDescNd {
+    cudnnConvolutionDescriptor_t desc;
+    ConvDescNd() { CUDNN_CHECK(cudnnCreateConvolutionDescriptor(&desc)); }
+    ~ConvDescNd() { cudnnDestroyConvolutionDescriptor(desc); }
+    operator cudnnConvolutionDescriptor_t() const { return desc; }
+
+    void set(const std::vector<int64_t>& pads, const std::vector<int64_t>& strides,
+             const std::vector<int64_t>& dilations, int64_t groups, DType dtype) {
+        int nbDims = static_cast<int>(pads.size());
+        int p[3], s[3], d[3];
+        for (int i = 0; i < nbDims; ++i) {
+            p[i] = static_cast<int>(pads[i]);
+            s[i] = static_cast<int>(strides[i]);
+            d[i] = static_cast<int>(dilations[i]);
+        }
+        CUDNN_CHECK(cudnnSetConvolutionNdDescriptor(desc, nbDims, p, s, d,
+                                                    CUDNN_CROSS_CORRELATION,
+                                                    to_cudnn_compute_type(dtype)));
+        CUDNN_CHECK(cudnnSetConvolutionGroupCount(desc, static_cast<int>(groups)));
+    }
+};
+
+// Adds a channel bias to a 5-D tensor (cudnnAddTensor is how torch's cudnn
+// conv path applies the bias too).
+static void conv3d_add_bias(cudnnHandle_t handle, const Tensor& out, const Tensor& bias) {
+    if (!bias.defined() || bias.numel() == 0) return;
+    TensorDescNd b_desc;
+    b_desc.set(std::vector<int64_t>{1, bias.size(0), 1, 1, 1}, bias.dtype());
+    TensorDescNd y_desc;
+    y_desc.set(out.shape(), out.dtype());
+    float alpha = 1.0f, beta = 1.0f;
+    double alpha_d = 1.0, beta_d = 1.0;
+    void* alpha_p = &alpha;
+    void* beta_p = &beta;
+    if (out.dtype() == DType::Float64) {
+        alpha_p = &alpha_d;
+        beta_p = &beta_d;
+    }
+    CUDNN_CHECK(cudnnAddTensor(handle, alpha_p, b_desc, bias.data_ptr(),
+                               beta_p, y_desc, out.data_ptr()));
+}
+
+static void* conv_alpha_ptr(DType dtype, float& alpha, double& alpha_d) {
+    if (dtype == DType::Float64) return &alpha_d;
+    return &alpha;
+}
+
+#endif  // USE_CUDNN
+
+// --- conv1d: reuse the conv2d cuDNN path, like conv1d_cpu does ----------------
+
+Tensor conv1d_cuda(const Tensor& input, const Tensor& weight, const Tensor& bias,
+                   const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
+                   const std::vector<int64_t>& dilation, int64_t groups) {
+    if (input.dim() != 3) TP_THROW(RuntimeError, "conv1d: Expected 3D input (N, C, L)");
+    Tensor in2 = input.unsqueeze(2);
+    Tensor w2 = weight.unsqueeze(2);
+    std::vector<int64_t> s2 = {1, stride.empty() ? 1 : stride[0]};
+    std::vector<int64_t> p2 = {0, padding.empty() ? 0 : padding[0]};
+    std::vector<int64_t> d2 = {1, dilation.empty() ? 1 : dilation[0]};
+    return conv2d_cuda(in2, w2, bias, s2, p2, d2, groups).squeeze(2);
+}
+
+Tensor conv1d_grad_input_cuda(const Tensor& grad_output, const Tensor& input, const Tensor& weight,
+                              const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
+                              const std::vector<int64_t>& dilation, int64_t groups) {
+    Tensor go2 = grad_output.unsqueeze(2);
+    Tensor in2 = input.unsqueeze(2);
+    Tensor w2 = weight.unsqueeze(2);
+    std::vector<int64_t> s2 = {1, stride.empty() ? 1 : stride[0]};
+    std::vector<int64_t> p2 = {0, padding.empty() ? 0 : padding[0]};
+    std::vector<int64_t> d2 = {1, dilation.empty() ? 1 : dilation[0]};
+    return conv2d_grad_input_cuda(go2, in2, w2, s2, p2, d2, groups).squeeze(2);
+}
+
+Tensor conv1d_grad_weight_cuda(const Tensor& grad_output, const Tensor& input, const Tensor& weight,
+                               const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
+                               const std::vector<int64_t>& dilation, int64_t groups) {
+    Tensor go2 = grad_output.unsqueeze(2);
+    Tensor in2 = input.unsqueeze(2);
+    Tensor w2 = weight.unsqueeze(2);
+    std::vector<int64_t> s2 = {1, stride.empty() ? 1 : stride[0]};
+    std::vector<int64_t> p2 = {0, padding.empty() ? 0 : padding[0]};
+    std::vector<int64_t> d2 = {1, dilation.empty() ? 1 : dilation[0]};
+    return conv2d_grad_weight_cuda(go2, in2, w2, s2, p2, d2, groups).squeeze(2);
+}
+
+Tensor conv1d_grad_bias_cuda(const Tensor& grad_output, const Tensor& input, const Tensor& weight,
+                             const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
+                             const std::vector<int64_t>& dilation, int64_t groups) {
+    return conv2d_grad_bias_cuda(grad_output, input, weight, stride, padding, dilation, groups);
+}
+
+// --- conv3d: legacy-descriptor cuDNN path with 5-D descriptors ---------------
+
+Tensor conv3d_cuda(const Tensor& input, const Tensor& weight, const Tensor& bias,
+                   const std::vector<int64_t>& stride_arg, const std::vector<int64_t>& padding_arg,
+                   const std::vector<int64_t>& dilation_arg, int64_t groups) {
+#ifdef USE_CUDNN
+    auto stride = expand_param_if_needed(stride_arg, 3, 1);
+    auto padding = expand_param_if_needed(padding_arg, 3, 0);
+    auto dilation = expand_param_if_needed(dilation_arg, 3, 1);
+
+    Tensor input_c = input.is_contiguous() ? input : input.contiguous();
+    Tensor weight_c = weight.is_contiguous() ? weight : weight.contiguous();
+
+    const int64_t D_in = input_c.size(2), H_in = input_c.size(3), W_in = input_c.size(4);
+    const int64_t kD = weight_c.size(2), kH = weight_c.size(3), kW = weight_c.size(4);
+    const int64_t D_out = (D_in + 2 * padding[0] - dilation[0] * (kD - 1) - 1) / stride[0] + 1;
+    const int64_t H_out = (H_in + 2 * padding[1] - dilation[1] * (kH - 1) - 1) / stride[1] + 1;
+    const int64_t W_out = (W_in + 2 * padding[2] - dilation[2] * (kW - 1) - 1) / stride[2] + 1;
+    if (D_out <= 0 || H_out <= 0 || W_out <= 0)
+        TP_THROW(RuntimeError, "conv3d: Calculated output size is too small");
+
+    Tensor out = Tensor::empty({input_c.size(0), weight_c.size(0), D_out, H_out, W_out},
+                               input_c.dtype(), input_c.device());
+
+    cudnnHandle_t handle = CUDAContext::getCudnnHandle();
+    TensorDescNd x_desc; x_desc.set(input_c);
+    FilterDescNd w_desc; w_desc.set(weight_c);
+    TensorDescNd y_desc; y_desc.set(out);
+    ConvDescNd conv_desc;
+    conv_desc.set(padding, stride, dilation, groups, input_c.dtype());
+
+    cudnnConvolutionFwdAlgoPerf_t perf;
+    int returned = 0;
+    CUDNN_CHECK(cudnnGetConvolutionForwardAlgorithm_v7(
+        handle, x_desc, w_desc, conv_desc, y_desc, 1, &returned, &perf));
+    if (returned == 0) TP_THROW(RuntimeError, "cuDNN: no forward convolution algorithm");
+
+    size_t workspace_size = 0;
+    CUDNN_CHECK(cudnnGetConvolutionForwardWorkspaceSize(
+        handle, x_desc, w_desc, conv_desc, y_desc, perf.algo, &workspace_size));
+    auto workspace = getAllocator(DeviceType::CUDA)->allocate(workspace_size, input_c.device());
+
+    float alpha = 1.0f, beta = 0.0f;
+    double alpha_d = 1.0, beta_d = 0.0;
+    void* alpha_p = conv_alpha_ptr(input_c.dtype(), alpha, alpha_d);
+    void* beta_p = input_c.dtype() == DType::Float64 ? static_cast<void*>(&beta_d)
+                                                     : static_cast<void*>(&beta);
+    CUDNN_CHECK(cudnnConvolutionForward(handle, alpha_p, x_desc, input_c.data_ptr(),
+                                        w_desc, weight_c.data_ptr(), conv_desc, perf.algo,
+                                        workspace.get(), workspace_size, beta_p,
+                                        y_desc, out.data_ptr()));
+    conv3d_add_bias(handle, out, bias);
+    return out;
+#else
+    TP_THROW(NotImplementedError, "conv3d_cuda requires cuDNN");
+#endif
+}
+
+Tensor conv3d_grad_input_cuda(const Tensor& grad_output, const Tensor& input, const Tensor& weight,
+                              const std::vector<int64_t>& stride_arg,
+                              const std::vector<int64_t>& padding_arg,
+                              const std::vector<int64_t>& dilation_arg, int64_t groups) {
+#ifdef USE_CUDNN
+    auto stride = expand_param_if_needed(stride_arg, 3, 1);
+    auto padding = expand_param_if_needed(padding_arg, 3, 0);
+    auto dilation = expand_param_if_needed(dilation_arg, 3, 1);
+
+    Tensor grad_output_c = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
+    Tensor input_c = input.is_contiguous() ? input : input.contiguous();
+    Tensor weight_c = weight.is_contiguous() ? weight : weight.contiguous();
+
+    cudnnHandle_t handle = CUDAContext::getCudnnHandle();
+    TensorDescNd dy_desc; dy_desc.set(grad_output_c);
+    FilterDescNd w_desc; w_desc.set(weight_c);
+    TensorDescNd dx_desc; dx_desc.set(input_c);
+    ConvDescNd conv_desc;
+    conv_desc.set(padding, stride, dilation, groups, input_c.dtype());
+
+    Tensor grad_input = Tensor::empty_like(input_c, DType::Undefined, input_c.device());
+
+    cudnnConvolutionBwdDataAlgoPerf_t perf;
+    int returned = 0;
+    CUDNN_CHECK(cudnnGetConvolutionBackwardDataAlgorithm_v7(
+        handle, w_desc, dy_desc, conv_desc, dx_desc, 1, &returned, &perf));
+    if (returned == 0) TP_THROW(RuntimeError, "cuDNN: no backward-data convolution algorithm");
+
+    size_t workspace_size = 0;
+    CUDNN_CHECK(cudnnGetConvolutionBackwardDataWorkspaceSize(
+        handle, w_desc, dy_desc, conv_desc, dx_desc, perf.algo, &workspace_size));
+    auto workspace = getAllocator(DeviceType::CUDA)->allocate(workspace_size, input_c.device());
+
+    float alpha = 1.0f, beta = 0.0f;
+    double alpha_d = 1.0, beta_d = 0.0;
+    void* alpha_p = conv_alpha_ptr(input_c.dtype(), alpha, alpha_d);
+    void* beta_p = input_c.dtype() == DType::Float64 ? static_cast<void*>(&beta_d)
+                                                     : static_cast<void*>(&beta);
+    CUDNN_CHECK(cudnnConvolutionBackwardData(handle, alpha_p, w_desc, weight_c.data_ptr(),
+                                             dy_desc, grad_output_c.data_ptr(), conv_desc,
+                                             perf.algo, workspace.get(), workspace_size,
+                                             beta_p, dx_desc, grad_input.data_ptr()));
+    return grad_input;
+#else
+    TP_THROW(NotImplementedError, "conv3d_grad_input_cuda requires cuDNN");
+#endif
+}
+
+Tensor conv3d_grad_weight_cuda(const Tensor& grad_output, const Tensor& input, const Tensor& weight,
+                               const std::vector<int64_t>& stride_arg,
+                               const std::vector<int64_t>& padding_arg,
+                               const std::vector<int64_t>& dilation_arg, int64_t groups) {
+#ifdef USE_CUDNN
+    auto stride = expand_param_if_needed(stride_arg, 3, 1);
+    auto padding = expand_param_if_needed(padding_arg, 3, 0);
+    auto dilation = expand_param_if_needed(dilation_arg, 3, 1);
+
+    Tensor grad_output_c = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
+    Tensor input_c = input.is_contiguous() ? input : input.contiguous();
+    Tensor weight_c = weight.is_contiguous() ? weight : weight.contiguous();
+
+    cudnnHandle_t handle = CUDAContext::getCudnnHandle();
+    TensorDescNd x_desc; x_desc.set(input_c);
+    TensorDescNd dy_desc; dy_desc.set(grad_output_c);
+    FilterDescNd dw_desc; dw_desc.set(weight_c);
+    ConvDescNd conv_desc;
+    conv_desc.set(padding, stride, dilation, groups, input_c.dtype());
+
+    Tensor grad_weight = Tensor::empty_like(weight_c, DType::Undefined, weight_c.device());
+
+    cudnnConvolutionBwdFilterAlgoPerf_t perf;
+    int returned = 0;
+    CUDNN_CHECK(cudnnGetConvolutionBackwardFilterAlgorithm_v7(
+        handle, x_desc, dy_desc, conv_desc, dw_desc, 1, &returned, &perf));
+    if (returned == 0) TP_THROW(RuntimeError, "cuDNN: no backward-filter convolution algorithm");
+
+    size_t workspace_size = 0;
+    CUDNN_CHECK(cudnnGetConvolutionBackwardFilterWorkspaceSize(
+        handle, x_desc, dy_desc, conv_desc, dw_desc, perf.algo, &workspace_size));
+    auto workspace = getAllocator(DeviceType::CUDA)->allocate(workspace_size, input_c.device());
+
+    float alpha = 1.0f, beta = 0.0f;
+    double alpha_d = 1.0, beta_d = 0.0;
+    void* alpha_p = conv_alpha_ptr(input_c.dtype(), alpha, alpha_d);
+    void* beta_p = input_c.dtype() == DType::Float64 ? static_cast<void*>(&beta_d)
+                                                     : static_cast<void*>(&beta);
+    CUDNN_CHECK(cudnnConvolutionBackwardFilter(handle, alpha_p, x_desc, input_c.data_ptr(),
+                                               dy_desc, grad_output_c.data_ptr(), conv_desc,
+                                               perf.algo, workspace.get(), workspace_size,
+                                               beta_p, dw_desc, grad_weight.data_ptr()));
+    return grad_weight;
+#else
+    TP_THROW(NotImplementedError, "conv3d_grad_weight_cuda requires cuDNN");
+#endif
+}
+
+Tensor conv3d_grad_bias_cuda(const Tensor& grad_output, const Tensor& input, const Tensor& weight,
+                             const std::vector<int64_t>& stride,
+                             const std::vector<int64_t>& padding,
+                             const std::vector<int64_t>& dilation, int64_t groups) {
+#ifdef USE_CUDNN
+    Tensor grad_output_c = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
+    cudnnHandle_t handle = CUDAContext::getCudnnHandle();
+    Tensor grad_bias = Tensor::empty({grad_output_c.size(1)}, grad_output_c.dtype(),
+                                     grad_output_c.device());
+
+    TensorDescNd dy_desc;
+    dy_desc.set(grad_output_c);
+    TensorDescNd db_desc;
+    db_desc.set(std::vector<int64_t>{1, grad_bias.size(0), 1, 1, 1}, grad_bias.dtype());
+
+    float alpha = 1.0f, beta = 0.0f;
+    double alpha_d = 1.0, beta_d = 0.0;
+    void* alpha_p = conv_alpha_ptr(grad_output_c.dtype(), alpha, alpha_d);
+    void* beta_p = grad_output_c.dtype() == DType::Float64 ? static_cast<void*>(&beta_d)
+                                                           : static_cast<void*>(&beta);
+    CUDNN_CHECK(cudnnConvolutionBackwardBias(handle, alpha_p, dy_desc,
+                                             grad_output_c.data_ptr(), beta_p, db_desc,
+                                             grad_bias.data_ptr()));
+    return grad_bias;
+#else
+    TP_THROW(NotImplementedError, "conv3d_grad_bias_cuda requires cuDNN");
+#endif
+}
+
+// --- transpose convolutions --------------------------------------------------
+//
+// A transpose convolution forward is the backward-data pass of its adjoint
+// convolution (the same mapping torch's cudnn convolution_transpose path
+// uses): the transpose input plays dy, the (C_in, C_out/g, k, k) weight is
+// already the adjoint filter layout, and the declared dx shape is the
+// transpose output.  Valid whenever output_padding < stride, which is
+// torch's constraint on transpose convs.
+
+Tensor conv_transpose2d_cuda(const Tensor& input, const Tensor& weight, const Tensor& bias,
+                             const std::vector<int64_t>& stride_arg,
+                             const std::vector<int64_t>& padding_arg,
+                             const std::vector<int64_t>& output_padding_arg, int64_t groups,
+                             const std::vector<int64_t>& dilation_arg) {
+#ifdef USE_CUDNN
+    auto stride = expand_param_if_needed(stride_arg, 2, 1);
+    auto padding = expand_param_if_needed(padding_arg, 2, 0);
+    auto output_padding = expand_param_if_needed(output_padding_arg, 2, 0);
+    auto dilation = expand_param_if_needed(dilation_arg, 2, 1);
+
+    Tensor input_c = input.is_contiguous() ? input : input.contiguous();
+    Tensor weight_c = weight.is_contiguous() ? weight : weight.contiguous();
+
+    const int64_t H_in = input_c.size(2), W_in = input_c.size(3);
+    const int64_t kH = weight_c.size(2), kW = weight_c.size(3);
+    const int64_t C_out = weight_c.size(1) * groups;
+    const int64_t H_out = (H_in - 1) * stride[0] - 2 * padding[0] +
+                          dilation[0] * (kH - 1) + output_padding[0] + 1;
+    const int64_t W_out = (W_in - 1) * stride[1] - 2 * padding[1] +
+                          dilation[1] * (kW - 1) + output_padding[1] + 1;
+
+    Tensor out = Tensor::empty({input_c.size(0), C_out, H_out, W_out},
+                               input_c.dtype(), input_c.device());
+
+    cudnnHandle_t handle = CUDAContext::getCudnnHandle();
+    TensorDesc dy_desc; dy_desc.set(input_c);   // transpose input == conv dy
+    FilterDesc w_desc; w_desc.set(weight_c);
+    TensorDesc dx_desc; dx_desc.set(out);
+    ConvDesc conv_desc;
+    conv_desc.set(static_cast<int>(padding[0]), static_cast<int>(padding[1]),
+                  static_cast<int>(stride[0]), static_cast<int>(stride[1]),
+                  static_cast<int>(dilation[0]), static_cast<int>(dilation[1]),
+                  static_cast<int>(groups), input_c.dtype());
+
+    cudnnConvolutionBwdDataAlgoPerf_t perf;
+    int returned = 0;
+    CUDNN_CHECK(cudnnGetConvolutionBackwardDataAlgorithm_v7(
+        handle, w_desc, dy_desc, conv_desc, dx_desc, 1, &returned, &perf));
+    if (returned == 0) TP_THROW(RuntimeError, "cuDNN: no backward-data convolution algorithm");
+
+    size_t workspace_size = 0;
+    CUDNN_CHECK(cudnnGetConvolutionBackwardDataWorkspaceSize(
+        handle, w_desc, dy_desc, conv_desc, dx_desc, perf.algo, &workspace_size));
+    auto workspace = getAllocator(DeviceType::CUDA)->allocate(workspace_size, input_c.device());
+
+    float alpha = 1.0f, beta = 0.0f;
+    double alpha_d = 1.0, beta_d = 0.0;
+    void* alpha_p = conv_alpha_ptr(input_c.dtype(), alpha, alpha_d);
+    void* beta_p = input_c.dtype() == DType::Float64 ? static_cast<void*>(&beta_d)
+                                                     : static_cast<void*>(&beta);
+    CUDNN_CHECK(cudnnConvolutionBackwardData(handle, alpha_p, w_desc, weight_c.data_ptr(),
+                                             dy_desc, input_c.data_ptr(), conv_desc, perf.algo,
+                                             workspace.get(), workspace_size, beta_p,
+                                             dx_desc, out.data_ptr()));
+    if (bias.defined() && bias.numel() > 0) {
+        Tensor bias_view = bias.reshape({1, C_out, 1, 1});
+        TensorDesc b_desc;
+        b_desc.set(bias_view);
+        float beta_one = 1.0f;
+        double beta_one_d = 1.0;
+        void* balpha_p = conv_alpha_ptr(input_c.dtype(), alpha, alpha_d);
+        void* bbeta_p = input_c.dtype() == DType::Float64
+                            ? static_cast<void*>(&beta_one_d)
+                            : static_cast<void*>(&beta_one);
+        CUDNN_CHECK(cudnnAddTensor(handle, balpha_p, b_desc, bias.data_ptr(),
+                                   bbeta_p, dx_desc, out.data_ptr()));
+    }
+    return out;
+#else
+    TP_THROW(NotImplementedError, "conv_transpose2d_cuda requires cuDNN");
+#endif
+}
+
+Tensor conv_transpose3d_cuda(const Tensor& input, const Tensor& weight, const Tensor& bias,
+                             const std::vector<int64_t>& stride_arg,
+                             const std::vector<int64_t>& padding_arg,
+                             const std::vector<int64_t>& output_padding_arg, int64_t groups,
+                             const std::vector<int64_t>& dilation_arg) {
+#ifdef USE_CUDNN
+    auto stride = expand_param_if_needed(stride_arg, 3, 1);
+    auto padding = expand_param_if_needed(padding_arg, 3, 0);
+    auto output_padding = expand_param_if_needed(output_padding_arg, 3, 0);
+    auto dilation = expand_param_if_needed(dilation_arg, 3, 1);
+
+    Tensor input_c = input.is_contiguous() ? input : input.contiguous();
+    Tensor weight_c = weight.is_contiguous() ? weight : weight.contiguous();
+
+    const int64_t D_in = input_c.size(2), H_in = input_c.size(3), W_in = input_c.size(4);
+    const int64_t kD = weight_c.size(2), kH = weight_c.size(3), kW = weight_c.size(4);
+    const int64_t C_out = weight_c.size(1) * groups;
+    const int64_t D_out = (D_in - 1) * stride[0] - 2 * padding[0] +
+                          dilation[0] * (kD - 1) + output_padding[0] + 1;
+    const int64_t H_out = (H_in - 1) * stride[1] - 2 * padding[1] +
+                          dilation[1] * (kH - 1) + output_padding[1] + 1;
+    const int64_t W_out = (W_in - 1) * stride[2] - 2 * padding[2] +
+                          dilation[2] * (kW - 1) + output_padding[2] + 1;
+
+    Tensor out = Tensor::empty({input_c.size(0), C_out, D_out, H_out, W_out},
+                               input_c.dtype(), input_c.device());
+
+    cudnnHandle_t handle = CUDAContext::getCudnnHandle();
+    TensorDescNd dy_desc; dy_desc.set(input_c);
+    FilterDescNd w_desc; w_desc.set(weight_c);
+    TensorDescNd dx_desc; dx_desc.set(out);
+    ConvDescNd conv_desc;
+    conv_desc.set(padding, stride, dilation, groups, input_c.dtype());
+
+    cudnnConvolutionBwdDataAlgoPerf_t perf;
+    int returned = 0;
+    CUDNN_CHECK(cudnnGetConvolutionBackwardDataAlgorithm_v7(
+        handle, w_desc, dy_desc, conv_desc, dx_desc, 1, &returned, &perf));
+    if (returned == 0) TP_THROW(RuntimeError, "cuDNN: no backward-data convolution algorithm");
+
+    size_t workspace_size = 0;
+    CUDNN_CHECK(cudnnGetConvolutionBackwardDataWorkspaceSize(
+        handle, w_desc, dy_desc, conv_desc, dx_desc, perf.algo, &workspace_size));
+    auto workspace = getAllocator(DeviceType::CUDA)->allocate(workspace_size, input_c.device());
+
+    float alpha = 1.0f, beta = 0.0f;
+    double alpha_d = 1.0, beta_d = 0.0;
+    void* alpha_p = conv_alpha_ptr(input_c.dtype(), alpha, alpha_d);
+    void* beta_p = input_c.dtype() == DType::Float64 ? static_cast<void*>(&beta_d)
+                                                     : static_cast<void*>(&beta);
+    CUDNN_CHECK(cudnnConvolutionBackwardData(handle, alpha_p, w_desc, weight_c.data_ptr(),
+                                             dy_desc, input_c.data_ptr(), conv_desc, perf.algo,
+                                             workspace.get(), workspace_size, beta_p,
+                                             dx_desc, out.data_ptr()));
+    conv3d_add_bias(handle, out, bias);
+    return out;
+#else
+    TP_THROW(NotImplementedError, "conv_transpose3d_cuda requires cuDNN");
+#endif
+}
+
+// Transpose grads reuse the conv2d/conv3d families exactly like the CPU
+// kernels do (grad_input = conv forward with the same weight; grad_weight =
+// conv grad_weight with the two leading tensors swapped; grad_bias shared).
+Tensor conv_transpose1d_cuda(const Tensor& input, const Tensor& weight, const Tensor& bias,
+                             const std::vector<int64_t>& stride,
+                             const std::vector<int64_t>& padding,
+                             const std::vector<int64_t>& output_padding, int64_t groups,
+                             const std::vector<int64_t>& dilation) {
+    Tensor in2 = input.unsqueeze(2);
+    Tensor w2 = weight.unsqueeze(2);
+    std::vector<int64_t> s2 = {1, stride.empty() ? 1 : stride[0]};
+    std::vector<int64_t> p2 = {0, padding.empty() ? 0 : padding[0]};
+    std::vector<int64_t> op2 = {0, output_padding.empty() ? 0 : output_padding[0]};
+    std::vector<int64_t> d2 = {1, dilation.empty() ? 1 : dilation[0]};
+    return conv_transpose2d_cuda(in2, w2, bias, s2, p2, op2, groups, d2).squeeze(2);
+}
+
+Tensor conv_transpose1d_grad_input_cuda(const Tensor& grad_output, const Tensor& input,
+                                        const Tensor& weight,
+                                        const std::vector<int64_t>& stride,
+                                        const std::vector<int64_t>& padding,
+                                        const std::vector<int64_t>& output_padding,
+                                        int64_t groups,
+                                        const std::vector<int64_t>& dilation) {
+    Tensor go2 = grad_output.unsqueeze(2);
+    Tensor in2 = input.unsqueeze(2);
+    Tensor w2 = weight.unsqueeze(2);
+    std::vector<int64_t> s2 = {1, stride.empty() ? 1 : stride[0]};
+    std::vector<int64_t> p2 = {0, padding.empty() ? 0 : padding[0]};
+    std::vector<int64_t> op2 = {0, output_padding.empty() ? 0 : output_padding[0]};
+    std::vector<int64_t> d2 = {1, dilation.empty() ? 1 : dilation[0]};
+    return conv_transpose2d_grad_input_cuda(go2, in2, w2, s2, p2, op2, groups, d2).squeeze(2);
+}
+
+Tensor conv_transpose1d_grad_weight_cuda(const Tensor& grad_output, const Tensor& input,
+                                         const Tensor& weight,
+                                         const std::vector<int64_t>& stride,
+                                         const std::vector<int64_t>& padding,
+                                         const std::vector<int64_t>& output_padding,
+                                         int64_t groups,
+                                         const std::vector<int64_t>& dilation) {
+    Tensor go2 = grad_output.unsqueeze(2);
+    Tensor in2 = input.unsqueeze(2);
+    Tensor w2 = weight.unsqueeze(2);
+    std::vector<int64_t> s2 = {1, stride.empty() ? 1 : stride[0]};
+    std::vector<int64_t> p2 = {0, padding.empty() ? 0 : padding[0]};
+    std::vector<int64_t> op2 = {0, output_padding.empty() ? 0 : output_padding[0]};
+    std::vector<int64_t> d2 = {1, dilation.empty() ? 1 : dilation[0]};
+    return conv_transpose2d_grad_weight_cuda(go2, in2, w2, s2, p2, op2, groups, d2).squeeze(2);
+}
+
+Tensor conv_transpose1d_grad_bias_cuda(const Tensor& grad_output, const Tensor& input,
+                                       const Tensor& weight,
+                                       const std::vector<int64_t>& stride,
+                                       const std::vector<int64_t>& padding,
+                                       const std::vector<int64_t>& output_padding,
+                                       int64_t groups,
+                                       const std::vector<int64_t>& dilation) {
+    return conv_transpose2d_grad_bias_cuda(grad_output, input, weight, stride, padding,
+                                           output_padding, groups, dilation);
+}
+
+Tensor conv_transpose2d_grad_input_cuda(const Tensor& grad_output, const Tensor& input,
+                                        const Tensor& weight,
+                                        const std::vector<int64_t>& stride,
+                                        const std::vector<int64_t>& padding,
+                                        const std::vector<int64_t>& output_padding,
+                                        int64_t groups,
+                                        const std::vector<int64_t>& dilation) {
+    return conv2d_cuda(grad_output, weight, Tensor(), stride, padding, dilation, groups);
+}
+
+Tensor conv_transpose2d_grad_weight_cuda(const Tensor& grad_output, const Tensor& input,
+                                         const Tensor& weight,
+                                         const std::vector<int64_t>& stride,
+                                         const std::vector<int64_t>& padding,
+                                         const std::vector<int64_t>& output_padding,
+                                         int64_t groups,
+                                         const std::vector<int64_t>& dilation) {
+    return conv2d_grad_weight_cuda(input, grad_output, weight, stride, padding, dilation, groups);
+}
+
+Tensor conv_transpose2d_grad_bias_cuda(const Tensor& grad_output, const Tensor& input,
+                                       const Tensor& weight,
+                                       const std::vector<int64_t>& stride,
+                                       const std::vector<int64_t>& padding,
+                                       const std::vector<int64_t>& output_padding,
+                                       int64_t groups,
+                                       const std::vector<int64_t>& dilation) {
+    return conv2d_grad_bias_cuda(grad_output, input, weight, stride, padding, dilation, groups);
+}
+
+Tensor conv_transpose3d_grad_input_cuda(const Tensor& grad_output, const Tensor& input,
+                                        const Tensor& weight,
+                                        const std::vector<int64_t>& stride,
+                                        const std::vector<int64_t>& padding,
+                                        const std::vector<int64_t>& output_padding,
+                                        int64_t groups,
+                                        const std::vector<int64_t>& dilation) {
+    return conv3d_cuda(grad_output, weight, Tensor(), stride, padding, dilation, groups);
+}
+
+Tensor conv_transpose3d_grad_weight_cuda(const Tensor& grad_output, const Tensor& input,
+                                         const Tensor& weight,
+                                         const std::vector<int64_t>& stride,
+                                         const std::vector<int64_t>& padding,
+                                         const std::vector<int64_t>& output_padding,
+                                         int64_t groups,
+                                         const std::vector<int64_t>& dilation) {
+    return conv3d_grad_weight_cuda(input, grad_output, weight, stride, padding, dilation, groups);
+}
+
+Tensor conv_transpose3d_grad_bias_cuda(const Tensor& grad_output, const Tensor& input,
+                                       const Tensor& weight,
+                                       const std::vector<int64_t>& stride,
+                                       const std::vector<int64_t>& padding,
+                                       const std::vector<int64_t>& output_padding,
+                                       int64_t groups,
+                                       const std::vector<int64_t>& dilation) {
+    return conv3d_grad_bias_cuda(grad_output, input, weight, stride, padding, dilation, groups);
+}
+
+// --- unfold / fold (aten Im2Col.cu / Col2Im.cu) ------------------------------
+
+namespace {
+
+template <typename T>
+__global__ void im2col_kernel(const T* in, T* col,
+                              int64_t N,
+                              int64_t C, int64_t H, int64_t W,
+                              int64_t kH, int64_t kW,
+                              int64_t pH, int64_t pW,
+                              int64_t sH, int64_t sW,
+                              int64_t dH, int64_t dW,
+                              int64_t OH, int64_t OW) {
+    const int64_t L = OH * OW;
+    const int64_t CP = C * kH * kW;
+    const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= N * CP * L) return;
+    const int64_t n = idx / (CP * L);
+    const int64_t rem = idx % (CP * L);
+    const int64_t plane = rem / L;
+    const int64_t l = rem % L;
+    const int64_t ow = l % OW;
+    const int64_t oh = l / OW;
+    const int64_t kw = plane % kW;
+    const int64_t kh = (plane / kW) % kH;
+    const int64_t ci = plane / (kW * kH);
+    const int64_t ih = oh * sH - pH + kh * dH;
+    const int64_t iw = ow * sW - pW + kw * dW;
+    T v = static_cast<T>(0);
+    if (ih >= 0 && ih < H && iw >= 0 && iw < W)
+        v = in[(n * C + ci) * H * W + ih * W + iw];
+    col[idx] = v;
+}
+
+template <typename T>
+__global__ void col2im_kernel(const T* col, T* im,
+                              int64_t C, int64_t H, int64_t W,
+                              int64_t kH, int64_t kW,
+                              int64_t pH, int64_t pW,
+                              int64_t sH, int64_t sW,
+                              int64_t dH, int64_t dW,
+                              int64_t OH, int64_t OW) {
+    // Race-free gather formulation: for each im element, the contributing
+    // patches are exactly those whose (kh, kw, oh, ow) satisfy
+    // ih = oh*sH - pH + kh*dH (and the width twin), so oh can be derived
+    // directly instead of scanning all patches.
+    const int64_t L = OH * OW;
+    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t frame = C * H * W;
+    if (idx >= frame) return;
+    const int64_t n = blockIdx.z;
+    const int64_t iw = idx % W;
+    const int64_t ih = (idx / W) % H;
+    const int64_t ci = idx / (W * H);
+    T acc = static_cast<T>(0);
+    for (int64_t kh = 0; kh < kH; ++kh) {
+        const int64_t h_pad = ih + pH - kh * dH;
+        if (h_pad < 0 || h_pad % sH != 0) continue;
+        const int64_t oh = h_pad / sH;
+        if (oh >= OH) continue;
+        for (int64_t kw = 0; kw < kW; ++kw) {
+            const int64_t w_pad = iw + pW - kw * dW;
+            if (w_pad < 0 || w_pad % sW != 0) continue;
+            const int64_t ow = w_pad / sW;
+            if (ow >= OW) continue;
+            const int64_t plane = (ci * kH + kh) * kW + kw;
+            acc += col[(n * C * kH * kW + plane) * L + oh * OW + ow];
+        }
+    }
+    im[n * frame + idx] = acc;
+}
+
+inline int cuda_blocks(int64_t n, int threads) {
+    return static_cast<int>((n + threads - 1) / threads);
+}
+
+}  // namespace
+
+Tensor im2col_cuda(const Tensor& self, const std::vector<int64_t>& kernel_size,
+                   const std::vector<int64_t>& dilation,
+                   const std::vector<int64_t>& padding,
+                   const std::vector<int64_t>& stride) {
+    if (kernel_size.size() != 2 || dilation.size() != 2 || padding.size() != 2 ||
+        stride.size() != 2)
+        TP_THROW(ValueError, "im2col: expected 2-element kernel_size/dilation/padding/stride");
+    Tensor input = self.is_contiguous() ? self : self.contiguous();
+    const bool batched = input.dim() == 4;
+    if (!batched && input.dim() != 3)
+        TP_THROW(ValueError, "im2col: expected 3D (unbatched) or 4D input");
+    // fp16/bf16: compute in float32 like torch's CUDA opmath kernels, then
+    // cast back (im2col only moves values, so this is exact).
+    const bool lowp = input.dtype() == DType::Float16 || input.dtype() == DType::BFloat16;
+    Tensor work = lowp ? input.to(DType::Float32) : input;
+
+    const int64_t b = batched ? 1 : 0;
+    const int64_t N = batched ? work.size(0) : 1;
+    const int64_t C = work.size(b);
+    const int64_t H = work.size(b + 1);
+    const int64_t W = work.size(b + 2);
+    const int64_t OH = (H + 2 * padding[0] - (dilation[0] * (kernel_size[0] - 1) + 1)) / stride[0] + 1;
+    const int64_t OW = (W + 2 * padding[1] - (dilation[1] * (kernel_size[1] - 1) + 1)) / stride[1] + 1;
+    if (OH <= 0 || OW <= 0) TP_THROW(RuntimeError, "im2col: calculated shape is too small");
+
+    const int64_t CP = C * kernel_size[0] * kernel_size[1];
+    const int64_t L = OH * OW;
+    Tensor out = Tensor::empty({N, CP, L}, work.dtype(), work.device());
+
+    const int64_t total = N * CP * L;
+    dim3 threads(256, 1, 1);
+    dim3 grid(cuda_blocks(total, 256), 1, 1);
+    if (work.dtype() == DType::Float64) {
+        im2col_kernel<double><<<grid, threads, 0, getCurrentCUDAStream().stream()>>>(
+            work.data_ptr<double>(), out.data_ptr<double>(), N, C, H, W, kernel_size[0],
+            kernel_size[1], padding[0], padding[1], stride[0], stride[1], dilation[0],
+            dilation[1], OH, OW);
+    } else {
+        im2col_kernel<float><<<grid, threads, 0, getCurrentCUDAStream().stream()>>>(
+            work.data_ptr<float>(), out.data_ptr<float>(), N, C, H, W, kernel_size[0],
+            kernel_size[1], padding[0], padding[1], stride[0], stride[1], dilation[0],
+            dilation[1], OH, OW);
+    }
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess)
+        TP_THROW(RuntimeError, std::string("im2col CUDA: ") + cudaGetErrorString(err));
+    if (!batched) out = out.squeeze(0);
+    return lowp ? out.to(input.dtype()) : out;
+}
+
+Tensor col2im_cuda(const Tensor& self, const std::vector<int64_t>& output_size,
+                   const std::vector<int64_t>& kernel_size,
+                   const std::vector<int64_t>& dilation,
+                   const std::vector<int64_t>& padding,
+                   const std::vector<int64_t>& stride) {
+    if (output_size.size() != 2)
+        TP_THROW(ValueError, "col2im: output_size must have 2 elements");
+    Tensor input = self.is_contiguous() ? self : self.contiguous();
+    const bool batched = input.dim() == 3;
+    if (!batched && input.dim() != 2)
+        TP_THROW(ValueError, "col2im: expected 2D (unbatched) or 3D input");
+    const bool lowp = input.dtype() == DType::Float16 || input.dtype() == DType::BFloat16;
+    Tensor work = lowp ? input.to(DType::Float32) : input;
+
+    const int64_t H = output_size[0], W = output_size[1];
+    const int64_t OH = (H + 2 * padding[0] - (dilation[0] * (kernel_size[0] - 1) + 1)) / stride[0] + 1;
+    const int64_t OW = (W + 2 * padding[1] - (dilation[1] * (kernel_size[1] - 1) + 1)) / stride[1] + 1;
+    const int64_t CP = work.size(work.dim() - 2);
+    const int64_t L = work.size(work.dim() - 1);
+    if (CP % (kernel_size[0] * kernel_size[1]) != 0 || L != OH * OW)
+        TP_THROW(RuntimeError, "col2im: input shape does not match kernel/output parameters");
+    const int64_t C = CP / (kernel_size[0] * kernel_size[1]);
+    const int64_t N = batched ? work.size(0) : 1;
+
+    Tensor out = Tensor::empty({N, C, H, W}, work.dtype(), work.device());
+    const int64_t frame = C * H * W;
+    dim3 threads(128, 1, 1);
+    dim3 grid(cuda_blocks(frame, 128), 1, static_cast<unsigned>(N));
+    if (work.dtype() == DType::Float64) {
+        col2im_kernel<double><<<grid, threads, 0, getCurrentCUDAStream().stream()>>>(
+            work.data_ptr<double>(), out.data_ptr<double>(), C, H, W, kernel_size[0],
+            kernel_size[1], padding[0], padding[1], stride[0], stride[1], dilation[0],
+            dilation[1], OH, OW);
+    } else {
+        col2im_kernel<float><<<grid, threads, 0, getCurrentCUDAStream().stream()>>>(
+            work.data_ptr<float>(), out.data_ptr<float>(), C, H, W, kernel_size[0],
+            kernel_size[1], padding[0], padding[1], stride[0], stride[1], dilation[0],
+            dilation[1], OH, OW);
+    }
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess)
+        TP_THROW(RuntimeError, std::string("col2im CUDA: ") + cudaGetErrorString(err));
+    if (!batched) out = out.squeeze(0);
+    return lowp ? out.to(input.dtype()) : out;
+}
+
+Tensor im2col_backward_cuda(const Tensor& grad_output, const std::vector<int64_t>& input_size,
+                            const std::vector<int64_t>& kernel_size,
+                            const std::vector<int64_t>& dilation,
+                            const std::vector<int64_t>& padding,
+                            const std::vector<int64_t>& stride) {
+    std::vector<int64_t> output_size = {input_size[input_size.size() - 2],
+                                        input_size[input_size.size() - 1]};
+    return col2im_cuda(grad_output, output_size, kernel_size, dilation, padding, stride);
+}
+
+Tensor col2im_backward_cuda(const Tensor& grad_output, const std::vector<int64_t>& input_size,
+                            const std::vector<int64_t>& output_size,
+                            const std::vector<int64_t>& kernel_size,
+                            const std::vector<int64_t>& dilation,
+                            const std::vector<int64_t>& padding,
+                            const std::vector<int64_t>& stride) {
+    // The adjoint of the scatter (col2im) is the gather (im2col); input_size
+    // is only needed for validation, which im2col performs on its own output.
+    (void)input_size;
+    (void)output_size;
+    return im2col_cuda(grad_output, kernel_size, dilation, padding, stride);
+}
+
 TENSORPLAY_LIBRARY_IMPL(CUDA, ConvKernels) {
     m.impl("conv2d", conv2d_cuda);
     m.impl("conv2d_relu", conv2d_relu_cuda);
     m.impl("conv2d_grad_input", conv2d_grad_input_cuda);
     m.impl("conv2d_grad_weight", conv2d_grad_weight_cuda);
     m.impl("conv2d_grad_bias", conv2d_grad_bias_cuda);
+
+    m.impl("conv1d", conv1d_cuda);
+    m.impl("conv1d_grad_input", conv1d_grad_input_cuda);
+    m.impl("conv1d_grad_weight", conv1d_grad_weight_cuda);
+    m.impl("conv1d_grad_bias", conv1d_grad_bias_cuda);
+
+    m.impl("conv3d", conv3d_cuda);
+    m.impl("conv3d_grad_input", conv3d_grad_input_cuda);
+    m.impl("conv3d_grad_weight", conv3d_grad_weight_cuda);
+    m.impl("conv3d_grad_bias", conv3d_grad_bias_cuda);
+
+    m.impl("conv_transpose1d", conv_transpose1d_cuda);
+    m.impl("conv_transpose1d_grad_input", conv_transpose1d_grad_input_cuda);
+    m.impl("conv_transpose1d_grad_weight", conv_transpose1d_grad_weight_cuda);
+    m.impl("conv_transpose1d_grad_bias", conv_transpose1d_grad_bias_cuda);
+
+    m.impl("conv_transpose2d", conv_transpose2d_cuda);
+    m.impl("conv_transpose2d_grad_input", conv_transpose2d_grad_input_cuda);
+    m.impl("conv_transpose2d_grad_weight", conv_transpose2d_grad_weight_cuda);
+    m.impl("conv_transpose2d_grad_bias", conv_transpose2d_grad_bias_cuda);
+
+    m.impl("conv_transpose3d", conv_transpose3d_cuda);
+    m.impl("conv_transpose3d_grad_input", conv_transpose3d_grad_input_cuda);
+    m.impl("conv_transpose3d_grad_weight", conv_transpose3d_grad_weight_cuda);
+    m.impl("conv_transpose3d_grad_bias", conv_transpose3d_grad_bias_cuda);
+
+    m.impl("im2col", im2col_cuda);
+    m.impl("im2col_backward", im2col_backward_cuda);
+    m.impl("col2im", col2im_cuda);
+    m.impl("col2im_backward", col2im_backward_cuda);
 }
 
 } // namespace cuda

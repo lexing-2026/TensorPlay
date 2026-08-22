@@ -135,3 +135,135 @@ def _calculate_correct_fan(tensor, mode):
 
     fan_in, fan_out = _calculate_fan_in_and_fan_out(tensor)
     return fan_in if mode == 'fan_in' else fan_out
+
+
+def trunc_normal_(tensor, mean=0.0, std=1.0, a=-2.0, b=2.0):
+    r"""Fills the input Tensor with values drawn from a truncated normal
+    distribution.
+
+    Method is based on the rejection-sampling scheme in
+    https://people.sc.fsu.edu/~jburkardt/presentations/truncated_normal.pdf —
+    a direct port of ``torch.nn.init._no_grad_trunc_normal_`` (torch/nn/init.py),
+    which torchvision transformer models use for positional embeddings.
+    """
+    import math
+    import warnings
+
+    def norm_cdf(x):
+        return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
+
+    if (mean < a - 2 * std) or (mean > b + 2 * std):
+        warnings.warn(
+            "mean is more than 2 std from [a, b] in nn.init.trunc_normal_. "
+            "The distribution of values may be incorrect.",
+            stacklevel=2,
+        )
+
+    with tp.no_grad():
+        p = norm_cdf((b - mean) / std) - norm_cdf((a - mean) / std)
+
+        if p > 0.3:
+            lo = float(a)
+            hi = float(b)
+            result = tensor.normal_(mean, std)
+            while True:
+                mask = (result < lo) | (result > hi)
+                if not bool(mask.any().item()):
+                    break
+                rejected = tensor.empty_like(result).normal_(mean, std)
+                result = tp.where(mask, rejected, result)
+            if tensor is not result:
+                tensor.copy_(result)
+        else:
+            mode = max(a, min(mean, b))
+            log_peak = -0.5 * ((mode - mean) / std) ** 2
+
+            candidates = tensor.empty_like(tensor)
+            accept_buf = tensor.empty_like(tensor)
+
+            # First iteration: sample directly into tensor.
+            tensor.uniform_(a, b)
+            candidates.copy_(tensor)
+            candidates.sub_(mean).div_(std).pow_(2).mul_(-0.5).sub_(log_peak)
+            pending = accept_buf.uniform_().log_() > candidates
+            if not bool(pending.any().item()):
+                pass
+            else:
+                result = tensor
+                while True:
+                    candidates.uniform_(a, b)
+                    result = tp.where(pending, candidates, result)
+                    candidates.sub_(mean).div_(std).pow_(2).mul_(-0.5).sub_(log_peak)
+                    new_pending = accept_buf.uniform_().log_() > candidates
+                    pending = tp.where(pending, new_pending, pending)
+                    if not bool(pending.any().item()):
+                        break
+                tensor.copy_(result)
+
+        return tensor
+
+def _qr_reduced(a):
+    # torch.nn.init.orthogonal_ relies on ATen's linalg_qr.  TensorPlay has no
+    # native QR yet, so this pure-tensor Householder reduction provides the
+    # same reduced-QR contract (Q: m x n with orthonormal columns, R: n x n).
+    m, n = a.shape
+    q = tp.eye(m, m, dtype=a.dtype, device=a.device)
+    r = a.clone()
+    for k in range(min(n, m - 1)):
+        x = r[k:, k]
+        norm_x = float(x.norm())
+        if norm_x == 0.0:
+            continue
+        v = x.clone()
+        v[0] = v[0] + (norm_x if float(x[0]) >= 0 else -norm_x)
+        v_norm = float(v.norm())
+        if v_norm == 0.0:
+            continue
+        v = v / v_norm
+        col = v.reshape(-1, 1)
+        row = v.reshape(1, -1)
+        r[k:, k:] = r[k:, k:] - 2.0 * tp.matmul(col, tp.matmul(row, r[k:, k:]))
+        q[:, k:] = q[:, k:] - 2.0 * tp.matmul(tp.matmul(q[:, k:], col), row)
+    return q[:, :n], r[:n, :]
+
+def orthogonal_(tensor, gain=1, generator=None):
+    if tensor.ndimension() < 2:
+        raise ValueError("Only tensors with 2 or more dimensions are supported")
+
+    rows = tensor.size(0)
+    cols = tensor.numel() // rows
+    flattened = tp.empty((rows, cols), dtype=tensor.dtype, device=tensor.device).normal_(0, 1)
+
+    swapped = rows < cols
+    if swapped:
+        flattened = flattened.t().clone()
+
+    q, r = _qr_reduced(flattened)
+
+    # Make Q uniform according to https://arxiv.org/pdf/math-ph/0609050.pdf
+    dim = min(r.shape[0], r.shape[1])
+    ph = tp.tensor([float(r[i, i]) for i in range(dim)]).sign().to(r.dtype, r.device)
+    q = q * ph
+
+    if swapped:
+        q = q.t()
+
+    with tp.no_grad():
+        tensor.copy_(q.reshape(tensor.shape))
+        tensor.mul_(gain)
+    return tensor
+
+def sparse_(tensor, sparsity, std=0.01, generator=None):
+    if tensor.ndimension() != 2:
+        raise ValueError("Only tensors with 2 dimensions are supported")
+
+    rows, cols = tensor.shape
+    num_zeros = math.ceil(sparsity * rows)
+
+    with tp.no_grad():
+        tensor.normal_(0, std)
+        for col_idx in range(cols):
+            row_indices = tp.randperm(rows)
+            zero_indices = row_indices[:num_zeros]
+            tensor[zero_indices, col_idx] = 0
+    return tensor

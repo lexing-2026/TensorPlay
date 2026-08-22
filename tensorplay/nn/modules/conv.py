@@ -1,7 +1,9 @@
 import math
 from typing import Optional
 
-from ..parameter import Parameter
+from ..parameter import Parameter, UninitializedParameter, is_lazy
+from ..parameter import is_lazy as _is_lazy_param
+from .lazy import LazyModuleMixin
 from .. import functional as F
 from .. import init
 from .module import Module
@@ -13,9 +15,16 @@ __all__ = [
     "Conv1d",
     "Conv2d",
     "Conv3d",
+    "ConvTranspose1d",
     "ConvTranspose2d",
     "ConvTranspose3d",
     "DepthwiseConv2d",
+    "LazyConv1d",
+    "LazyConv2d",
+    "LazyConv3d",
+    "LazyConvTranspose1d",
+    "LazyConvTranspose2d",
+    "LazyConvTranspose3d",
 ]
 
 
@@ -71,7 +80,7 @@ class _ConvNd(Module):
                         is_asymmetric = True
                 
                 if is_asymmetric:
-                    if len(self.kernel_size) == 2:
+                    if len(self.kernel_size) == 2 and self.padding_mode == 'zeros':
                         # Optimized path for Conv2d: pass asymmetric padding directly to kernel
                         # total_padding is [(top, bottom), (left, right)]
                         # We want (top, bottom, left, right)
@@ -90,6 +99,21 @@ class _ConvNd(Module):
                     self.padding = tuple(p[0] for p in total_padding)
             else:
                 raise ValueError("Invalid padding string: {}. Only 'valid' and 'same' are supported.".format(self.padding[0]))
+
+        if self.padding_mode not in ('zeros', 'reflect', 'replicate', 'circular'):
+            raise ValueError(
+                "padding_mode must be one of zeros/reflect/replicate/circular "
+                f"(got '{self.padding_mode}')")
+        if self.transposed and self.padding_mode != 'zeros':
+            raise ValueError('Only "zeros" padding mode is supported for ConvTranspose')
+        if self.padding_mode != 'zeros':
+            # torch's _conv_forward: pad the input with the requested mode and
+            # run the convolution itself unpadded.  The asymmetric-'same'
+            # branch above may already have built the reversed padding list.
+            if self._reversed_padding_repeated_twice is None:
+                self._reversed_padding_repeated_twice = tuple(
+                    x for p in reversed(self.padding) for x in (p, p))
+            self.padding = tuple(0 for _ in self.padding)
 
         if transposed:
             self.weight = Parameter(tp.empty((in_channels, out_channels // groups, *kernel_size), **factory_kwargs))
@@ -179,8 +203,10 @@ class Conv1d(_ConvNd):
             False, _single(0), groups, bias, padding_mode, **factory_kwargs)
         
     def forward(self, input):
-        if self._reversed_padding_repeated_twice is not None:
-            input = F.pad(input, self._reversed_padding_repeated_twice)
+        if self.padding_mode != 'zeros':
+            input = F.pad(input, list(self._reversed_padding_repeated_twice), mode=self.padding_mode)
+        elif self._reversed_padding_repeated_twice is not None:
+            input = F.pad(input, list(self._reversed_padding_repeated_twice))
         return F.conv1d(input, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
 
 class Conv2d(_ConvNd):
@@ -197,8 +223,10 @@ class Conv2d(_ConvNd):
             False, _pair(0), groups, bias, padding_mode, **factory_kwargs)
         
     def forward(self, input):
-        if self._reversed_padding_repeated_twice is not None:
-            input = F.pad(input, self._reversed_padding_repeated_twice)
+        if self.padding_mode != 'zeros':
+            input = F.pad(input, list(self._reversed_padding_repeated_twice), mode=self.padding_mode)
+        elif self._reversed_padding_repeated_twice is not None:
+            input = F.pad(input, list(self._reversed_padding_repeated_twice))
         return F.conv2d(input, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
 
 class Conv3d(_ConvNd):
@@ -215,9 +243,32 @@ class Conv3d(_ConvNd):
             False, _triple(0), groups, bias, padding_mode, **factory_kwargs)
         
     def forward(self, input):
-        if self._reversed_padding_repeated_twice is not None:
-            input = F.pad(input, self._reversed_padding_repeated_twice)
+        if self.padding_mode != 'zeros':
+            input = F.pad(input, list(self._reversed_padding_repeated_twice), mode=self.padding_mode)
+        elif self._reversed_padding_repeated_twice is not None:
+            input = F.pad(input, list(self._reversed_padding_repeated_twice))
         return F.conv3d(input, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
+
+class ConvTranspose1d(_ConvNd):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1,
+                 padding=0, output_padding=0, groups=1, bias=True,
+                 dilation=1, padding_mode='zeros', device=None, dtype=None):
+        factory_kwargs = {'device': device, 'dtype': dtype}
+        kernel_size = _single(kernel_size)
+        stride = _single(stride)
+        padding = _single(padding)
+        dilation = _single(dilation)
+        output_padding = _single(output_padding)
+        super().__init__(
+            in_channels, out_channels, kernel_size, stride, padding, dilation,
+            True, output_padding, groups, bias, padding_mode, **factory_kwargs)
+
+    def forward(self, input, output_size=None):
+        output_padding = self._output_padding(
+            input, output_size, self.stride, self.padding, self.kernel_size, self.dilation)
+
+        return F.conv_transpose1d(input, self.weight, self.bias, self.stride, self.padding,
+                                  output_padding, self.groups, self.dilation)
 
 class ConvTranspose2d(_ConvNd):
     def __init__(self, in_channels, out_channels, kernel_size, stride=1,
@@ -234,12 +285,9 @@ class ConvTranspose2d(_ConvNd):
             True, output_padding, groups, bias, padding_mode, **factory_kwargs)
         
     def forward(self, input, output_size=None):
-        if self.padding_mode != 'zeros':
-            raise ValueError('Only "zeros" padding mode is supported for ConvTranspose2d')
-        
         output_padding = self._output_padding(
             input, output_size, self.stride, self.padding, self.kernel_size, self.dilation)
-        
+
         return F.conv_transpose2d(input, self.weight, self.bias, self.stride, self.padding, output_padding, self.groups, self.dilation)
 
 class DepthwiseConv2d(Conv2d):
@@ -268,10 +316,121 @@ class ConvTranspose3d(_ConvNd):
             True, output_padding, groups, bias, padding_mode, **factory_kwargs)
         
     def forward(self, input, output_size=None):
-        if self.padding_mode != 'zeros':
-            raise ValueError('Only "zeros" padding mode is supported for ConvTranspose3d')
-
         output_padding = self._output_padding(
             input, output_size, self.stride, self.padding, self.kernel_size, self.dilation)
 
         return F.conv_transpose3d(input, self.weight, self.bias, self.stride, self.padding, output_padding, self.groups, self.dilation)
+
+
+class _LazyConvXdMixin(LazyModuleMixin):
+    r"""Lazily-initialized conv mixin (torch nn.LazyConv*): parameters are
+    created on the first forward pass from the input's channel dimension.
+    """
+    cls_to_become = None
+
+    def __init__(self, in_channels, out_channels, kernel_size, stride,
+                 padding, dilation, transposed, output_padding,
+                 groups, bias, padding_mode, device=None, dtype=None):
+        factory_kwargs = {'device': device, 'dtype': dtype}
+        super().__init__(
+            in_channels, out_channels, kernel_size, stride, padding, dilation,
+            transposed, output_padding, groups, False, padding_mode, **factory_kwargs)
+        if bias:
+            self.bias = UninitializedParameter(**factory_kwargs)
+        self.weight = UninitializedParameter(**factory_kwargs)
+        self.out_channels = out_channels
+
+    def reset_parameters(self):
+        if not any(_is_lazy_param(p) for p in self.parameters()) and self.in_channels != 0:
+            super().reset_parameters()
+
+    def initialize_parameters(self, *args, **kwargs) -> None:  # type: ignore[override]
+        self._infer_parameters(self, args[0])
+
+    def _infer_parameters(self, module, input):
+        module.in_channels = input.size(1)
+        if module.transposed:
+            module.weight = Parameter(tp.empty(
+                (module.in_channels, module.out_channels // module.groups, *module.kernel_size),
+                device=module.weight.device, dtype=module.weight.dtype))
+        else:
+            module.weight = Parameter(tp.empty(
+                (module.out_channels, module.in_channels // module.groups, *module.kernel_size),
+                device=module.weight.device, dtype=module.weight.dtype))
+        if module.bias is not None:
+            module.bias = Parameter(tp.empty(
+                (module.out_channels,),
+                device=module.bias.device, dtype=module.bias.dtype))
+        module.reset_parameters()
+
+
+class LazyConv1d(_LazyConvXdMixin, Conv1d):
+    def __init__(self, out_channels, kernel_size, stride=1, padding=0,
+                 dilation=1, groups=1, bias=True, padding_mode='zeros',
+                 device=None, dtype=None):
+        super().__init__(
+            0, out_channels, _single(kernel_size), _single(stride), _single(padding),
+            _single(dilation), False, _single(0), groups, bias, padding_mode,
+            device=device, dtype=dtype)
+
+    cls_to_become = Conv1d
+
+
+class LazyConv2d(_LazyConvXdMixin, Conv2d):
+    def __init__(self, out_channels, kernel_size, stride=1, padding=0,
+                 dilation=1, groups=1, bias=True, padding_mode='zeros',
+                 device=None, dtype=None):
+        super().__init__(
+            0, out_channels, _pair(kernel_size), _pair(stride), _pair(padding),
+            _pair(dilation), False, _pair(0), groups, bias, padding_mode,
+            device=device, dtype=dtype)
+
+    cls_to_become = Conv2d
+
+
+class LazyConv3d(_LazyConvXdMixin, Conv3d):
+    def __init__(self, out_channels, kernel_size, stride=1, padding=0,
+                 dilation=1, groups=1, bias=True, padding_mode='zeros',
+                 device=None, dtype=None):
+        super().__init__(
+            0, out_channels, _triple(kernel_size), _triple(stride), _triple(padding),
+            _triple(dilation), False, _triple(0), groups, bias, padding_mode,
+            device=device, dtype=dtype)
+
+    cls_to_become = Conv3d
+
+
+class LazyConvTranspose1d(_LazyConvXdMixin, ConvTranspose1d):
+    def __init__(self, out_channels, kernel_size, stride=1, padding=0,
+                 output_padding=0, groups=1, bias=True, dilation=1,
+                 padding_mode='zeros', device=None, dtype=None):
+        super().__init__(
+            0, out_channels, _single(kernel_size), _single(stride), _single(padding),
+            _single(dilation), True, _single(output_padding), groups, bias,
+            padding_mode, device=device, dtype=dtype)
+
+    cls_to_become = ConvTranspose1d
+
+
+class LazyConvTranspose2d(_LazyConvXdMixin, ConvTranspose2d):
+    def __init__(self, out_channels, kernel_size, stride=1, padding=0,
+                 output_padding=0, groups=1, bias=True, dilation=1,
+                 padding_mode='zeros', device=None, dtype=None):
+        super().__init__(
+            0, out_channels, _pair(kernel_size), _pair(stride), _pair(padding),
+            _pair(dilation), True, _pair(output_padding), groups, bias,
+            padding_mode, device=device, dtype=dtype)
+
+    cls_to_become = ConvTranspose2d
+
+
+class LazyConvTranspose3d(_LazyConvXdMixin, ConvTranspose3d):
+    def __init__(self, out_channels, kernel_size, stride=1, padding=0,
+                 output_padding=0, groups=1, bias=True, dilation=1,
+                 padding_mode='zeros', device=None, dtype=None):
+        super().__init__(
+            0, out_channels, _triple(kernel_size), _triple(stride), _triple(padding),
+            _triple(dilation), True, _triple(output_padding), groups, bias,
+            padding_mode, device=device, dtype=dtype)
+
+    cls_to_become = ConvTranspose3d

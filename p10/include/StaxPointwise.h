@@ -1,6 +1,7 @@
 #pragma once
 
 #include "DispatchStub.h"
+#include "Generator.h"
 #include "Tensor.h"
 
 #include <cstdint>
