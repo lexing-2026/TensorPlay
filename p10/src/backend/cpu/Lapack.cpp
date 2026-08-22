@@ -13,12 +13,18 @@
 
 #include "Exception.h"
 
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#else
 #include <dlfcn.h>
+#include <dirent.h>
+#endif
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <dirent.h>
+#include <filesystem>
 #include <fstream>
 #include <mutex>
 #include <string>
@@ -41,12 +47,26 @@ F g_strtrs, g_dtrtrs;
 F g_sgels, g_dgels;
 F g_ssytrf, g_dsytrf, g_ssytrs, g_dsytrs;
 
+#ifdef _WIN32
+using LibHandle = HMODULE;
+static LibHandle open_lib(const char* path) { return LoadLibraryA(path); }
+static void* sym(LibHandle h, const char* n) {
+    return reinterpret_cast<void*>(GetProcAddress(h, n));
+}
+#else
+using LibHandle = void*;
+static LibHandle open_lib(const char* path) {
+    return dlopen(path, RTLD_LAZY | RTLD_LOCAL);
+}
+static void* sym(LibHandle h, const char* n) { return dlsym(h, n); }
+#endif
+
 void* resolve_one(void* handle, const char* base) {
     char buf[128];
     const char* patterns[] = {"scipy_%s_64_", "%s_64_", "%s_"};
     for (const char* pattern : patterns) {
         std::snprintf(buf, sizeof(buf), pattern, base);
-        if (void* p = dlsym(handle, buf)) return p;
+        if (void* p = sym(handle, buf)) return p;
     }
     return nullptr;
 }
@@ -75,6 +95,28 @@ bool resolve_all(void* handle) {
 }
 
 void* find_library() {
+#ifdef _WIN32
+    if (const char* env = std::getenv("TP_LAPACK_LIB")) {
+        if (LibHandle h = open_lib(env)) return h;
+    }
+    namespace fs = std::filesystem;
+    std::vector<std::string> bases;
+    if (const char* cp = std::getenv("CONDA_PREFIX")) bases.push_back(cp);
+    if (const char* vp = std::getenv("VIRTUAL_ENV")) bases.push_back(vp);
+    bases.push_back("C:\\Python313\\Lib\\site-packages");
+    for (const auto& base : bases) {
+        std::error_code ec;
+        const fs::path dir_path = fs::path(base) / "numpy.libs";
+        if (!fs::exists(dir_path, ec)) continue;
+        for (const auto& ent : fs::directory_iterator(dir_path, ec)) {
+            const std::string name = ent.path().filename().string();
+            if (name.find("scipy_openblas") == std::string::npos &&
+                name.find("openblas") == std::string::npos) continue;
+            if (LibHandle h = open_lib(ent.path().string().c_str())) return h;
+        }
+    }
+    return open_lib("libscipy_openblas.dll");
+#else
     if (const char* env = std::getenv("TP_LAPACK_LIB")) {
         if (void* h = dlopen(env, RTLD_LAZY)) return h;
     }
@@ -112,6 +154,7 @@ void* find_library() {
     }
     // Last resort: loader search path.
     return dlopen("libscipy_openblas.so", RTLD_LAZY | RTLD_LOCAL);
+#endif
 }
 
 std::once_flag g_once;
