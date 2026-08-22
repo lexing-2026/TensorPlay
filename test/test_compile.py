@@ -143,14 +143,24 @@ def test_mode_and_options_are_mutually_exclusive():
         tp.compile(lambda x: x + 1, mode="default", options={})
 
 
-def test_fullgraph_rejects_python_control_flow():
+def test_fullgraph_rejects_python_data_dependent_control_flow():
     def fn(x):
-        if len(x) > 0:
+        if bool((x > 0).all()):
             return x + 1
         return x
 
     with pytest.raises(tp.compiler.GraphCaptureError):
         tp.compile(fn, backend="stax", fullgraph=True)(tp.tensor([1.0]))
+
+
+def test_fullgraph_specializes_metadata_control_flow():
+    def fn(x):
+        if len(x) > 0:
+            return x + 1
+        return x
+
+    compiled = tp.compile(fn, backend="stax", fullgraph=True)
+    assert compiled(tp.tensor([1.0])).tolist() == [2.0]
 
 
 def test_module_compile_uses_top_level_frontend():

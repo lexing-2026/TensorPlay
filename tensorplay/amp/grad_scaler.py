@@ -75,47 +75,6 @@ def _refresh_per_optimizer_state() -> dict[str, Any]:
     return {"stage": OptState.READY, "found_inf_per_device": {}}
 
 
-def _amp_foreach_non_finite_check_and_unscale_(
-    grads: list[tensorplay.Tensor],
-    found_inf: tensorplay.Tensor,
-    inv_scale: tensorplay.Tensor,
-) -> None:
-    """Pure-python fallback for ``torch._amp_foreach_non_finite_check_and_unscale_``.
-
-    If any grad contains inf/NaN, ``found_inf`` is set to 1 and no grad is
-    rescaled; otherwise every grad is multiplied in place by ``inv_scale``.
-    """
-    found = False
-    for g in grads:
-        if g.ne(g).any().item() or g.abs().eq(float("inf")).any().item():
-            found = True
-            break
-    if found:
-        found_inf.fill_(1.0)
-    else:
-        for g in grads:
-            g.mul_(inv_scale)
-
-
-def _amp_update_scale_(
-    scale: tensorplay.Tensor,
-    growth_tracker: tensorplay.Tensor,
-    found_inf: tensorplay.Tensor,
-    growth_factor: float,
-    backoff_factor: float,
-    growth_interval: int,
-) -> None:
-    """Pure-python fallback for ``torch._amp_update_scale_``."""
-    if found_inf.item() > 0:
-        scale.mul_(backoff_factor)
-        growth_tracker.zero_()
-    else:
-        growth_tracker.add_(1)
-        if growth_tracker.item() >= growth_interval:
-            scale.mul_(growth_factor)
-            growth_tracker.zero_()
-
-
 class GradScaler:
     """An instance ``scaler`` of :class:`GradScaler`.
 
@@ -346,7 +305,7 @@ class GradScaler:
 
             for device, per_dtype_grads in per_device_and_dtype_grads.items():
                 for grads in per_dtype_grads.values():
-                    _amp_foreach_non_finite_check_and_unscale_(
+                    tensorplay._amp_foreach_non_finite_check_and_unscale_(
                         grads,
                         per_device_found_inf.get(device),
                         per_device_inv_scale.get(device),
@@ -583,7 +542,7 @@ class GradScaler:
                 for i in range(1, len(found_infs)):
                     found_inf_combined += found_infs[i]
 
-            _amp_update_scale_(
+            tensorplay._amp_update_scale_(
                 _scale,
                 _growth_tracker,
                 found_inf_combined,

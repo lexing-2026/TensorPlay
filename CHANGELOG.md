@@ -1,103 +1,140 @@
-结论：TensorPlay 已经是一个“真实可运行的轻量计算框架”，不是 NumPy 包装；P10 eager 内核、TPX 自动微分、CPU oneDNN/OpenMP、CUDA/cuBLAS/cuDNN 路径都存在。但目前更接近“教学/研究型 alpha”，距离 Torch 的主要差距不在单个 GEMM/Conv 内核，而在正确性契约、运行时、编译器、CUDA 内存/流和工程门禁。
+# 1. RNG 与 Torch 逐位对齐（2026-08-21）
 
-## 1. 当前架构
+seed 随机性全链路对齐 `third_party/pytorch`（基准 `893b6406`）：
 
-```text
-Python Tensor / nn / optim
-          │
-          ▼
-     nanobind _C
-          │
-          ▼
-生成的 TPX Autograd Wrapper  ← derivatives.yaml
-          │
-          ▼
-       P10 Tensor
-          │
-          ▼
-字符串 Dispatcher
-     ┌────┴────┐
- CPU Kernels   CUDA Kernels
-OpenMP/oneDNN  custom/cuBLAS/cuDNN
+- **引擎**：`std::mt19937` → 移植 `at::mt19937`（`p10/include/MT19937RNGEngine.h`），同种子同 uint32 流。
+- **分布层**：新增 `p10/include/DistributionsHelper.h`，照搬 torch 变换公式与消耗模式
+  （uniform mantissa 变换、Box-Muller + generator 内缓存第二样本、有偏 modulo 整数、
+  Fisher-Yates randperm、Hoermann/Knuth poisson、double 精度 exponential/cauchy/geometric/log_normal）。
+- **normal_fill**：移植 torch AVX2 向量化路径（avx_mathfun 的 log256_ps/sincos256_ps，
+  `p10/include/avx_mathfun.h`），运行时按 `__builtin_cpu_supports("avx2")` 分发，大张量 randn 逐位一致。
+- **Generator**：默认种子 67280421310721、seed=0 合法、默认 generator 非确定初始化；
+  get/set_state 采用 torch 同款 5056 字节 POD 布局（字节兼容，含 normal 缓存）。
+- **CUDA**：移除 host cuRAND，改为 torch 同款 curand 设备端 Philox4_32_10 + host (seed, offset)
+  预留（`CUDAGenerator.h/.cpp`），state 为 16 字节 seed+offset。
+- **Python**：新增 `get_rng_state/set_rng_state/fork_rng`（`tensorplay/random.py`）、
+  `Generator.get_state/set_state`、无参 `seed()`。
+- **dtype 补齐**：分布算子覆盖 Half/BFloat16（float 精度采样后转型）、random_/geometric_ 全整型谱 + Bool、
+  randperm Int32；与 torch dispatch 范围一致。
+- **验证**：`test/test_random.py` 新增 `TestTorchParity`（同种子逐值断言，含半精度与 state 互通）；
+  编译验证待构建窗口执行。
 
-Stax Tracer ──► CPU Python Interpreter / Triton pointwise 原型
-               （尚未融入主 eager 执行路径）
-```
+## 8. CUDA 算子优化批次（2026-08-21）
 
-四层划分本身清晰，见 [README.zh.md](/home/bluemoon/projects/TensorPlay/README.zh.md:128)。TensorImpl 已有 Storage、offset、shape/stride、dtype、device、version counter 和 oneDNN 缓存元数据，见 [TensorImpl.h](/home/bluemoon/projects/TensorPlay/p10/include/TensorImpl.h:21)。
+参照 `third_party/pytorch`（基准 `893b6406`）补齐 CUDA 侧三个性能/覆盖缺口：
 
-## 2. 与 Torch 的核心差距
+- **LayerNorm CUDA 前向/反向**：`p10/src/backend/cuda/NormalizationKernels.cu` 新增自定义
+  kernel（不再依赖 cuDNN）。算法照 torch `layer_norm_kernel.cu`：每行一个 block、
+  Welford 矩经 `__shfl_down_sync` warp 归约 + shared memory 跨 warp 合并、
+  前向单次发射融合统计与归一化、`N % 4 == 0` 且指针对齐时走 4 宽向量化加载；
+  半精度以 fp32 累加。反向三 kernel：行矩重算、grad_input（两 sum 块归约）、
+  grad_weight/grad_bias 列并行确定性归约（无 atomic）。支持
+  Float32/Float64/Float16/BFloat16；`native_functions.yaml` 注册
+  `layer_norm`/`layer_norm_backward` 的 CUDA 分支，autograd 经
+  `derivatives.yaml` 自动生效。
+- **Loss 半精度**：`LossKernels.cu` 的 `nll_loss`/`nll_loss_backward`/`mse_loss_backward`
+  从仅 Float32 扩展到 Float64/Half/BFloat16（fp32 数学；归约路径 fp32 atomic
+  累加后单线程转回——BF16 atomicAdd 需 sm_90+，Ampere 不可用）。
+- **二元算子向量化**：`ArithmeticKernels.cu` 的 add/sub/mul/div 增加同形状连续
+  快路径：numel ≥ 4096、`n % 4 == 0` 且指针按 `sizeof(T)*4` 对齐时走 4 宽
+  packed load/store（128 线程、4 元素/线程、grid 上限 4×SM，对齐 ATen
+  elementwise 配置）；广播/非连续路径维持原 TensorDesc kernel。
+- **半精度一元浮点向量化**：`PointwiseKernels.cu` 的 Half/BFloat16 一元浮点
+  算子（exp/log/sqrt 等经 `unary_reduced_float` 路径）接入与 float 相同的
+  4 宽向量化发射。
+- CUDA caching allocator 与 Stream/Event 基础设施已在 `CUDAAllocator.cpp` 落地
+  （大小池 best-fit、segment 切分合并、跨 stream 事件保护、OOM emptyCache 重试、
+  memory stats API），本批次未再改动。
+- 验证：编译与测试待构建窗口执行（本机 3090 当时被其他进程占用，性能对照
+  延后到空闲窗口）。
 
-| 领域 | TensorPlay 当前状态 | Torch 参照 | 判断 |
-|---|---|---|---|
-| 算子规模 | 187 个 schema、53 条反向规则；约 186 个 CPU、134 个 CUDA 注册项 | PyTorch 源码约 2,585 个 native schema、688 条反向规则；本机运行时 3,599 个 operator name | 约一个数量级差距，CUDA 覆盖更不完整 |
-| Dispatcher | 每次按字符串查两层 `unordered_map`，热路径带全局 mutex，只按 CPU/CUDA 选 key，[Dispatcher.h](/home/bluemoon/projects/TensorPlay/p10/include/Dispatcher.h:15)、[Dispatcher.cpp](/home/bluemoon/projects/TensorPlay/p10/src/Dispatcher.cpp:11) | DispatchKeySet、Meta/Autograd/AMP/Sparse/Functionalize 等 key，固定小型 dispatch table，[PyTorch DispatchKey.h](/home/bluemoon/projects/TensorPlay/third_party/pytorch/c10/core/DispatchKey.h:36)、[OperatorEntry.h](/home/bluemoon/projects/TensorPlay/third_party/pytorch/aten/src/ATen/core/dispatch/OperatorEntry.h:237) | 扩展性、组合语义和并发热路径差距大 |
-| Autograd | 单线程 priority queue；`create_graph` 参数未实际控制 GradMode，[Engine.h](/home/bluemoon/projects/TensorPlay/tpx/include/Engine.h:33) | 设备队列、线程池、reentrant backward、stream 同步、异常与 hook，[PyTorch engine.h](/home/bluemoon/projects/TensorPlay/third_party/pytorch/torch/csrc/autograd/engine.h:87) | 当前首先是语义安全问题，其次才是性能 |
-| 原地修改安全 | 有 version counter 类，但没有找到任何 `bump()` 调用或 SavedVariable 检查，[VariableVersion.h](/home/bluemoon/projects/TensorPlay/p10/include/VariableVersion.h:8) | 保存版本并在 backward 时检测原地修改 | 已实测产生静默错误梯度 |
-| CPU 核心内核 | FP32 GEMM/Conv 已有 oneDNN/OpenMP，特定形状接近 Torch；CPU exact-size caching allocator 是亮点 | MKL、oneDNN、TensorIterator、统一线程池、算子级粒度策略 | 大矩阵不错，reduction、小算子并行和通用 stride 较弱 |
-| CUDA 运行时 | GEMM 支持 TF32，但只支持 FP32/FP64；输出和 cuDNN workspace 频繁 `cudaMalloc/free`，[LinearAlgebraKernels.cu](/home/bluemoon/projects/TensorPlay/p10/src/backend/cuda/LinearAlgebraKernels.cu:73)、[ConvKernels.cu](/home/bluemoon/projects/TensorPlay/p10/src/backend/cuda/ConvKernels.cu:121) | stream-aware caching allocator、cuBLASLt、cuDNN plan cache、CUDA Graph、AMP | 这是 GPU 性能的首要结构性瓶颈 |
-| CUDA Stream/Event | Python Stream/Event 是 no-op，elapsed time 恒为 0，[cuda.py](/home/bluemoon/projects/TensorPlay/tensorplay/cuda.py:113)；handle 是进程级单例，[CUDAContext.cpp](/home/bluemoon/projects/TensorPlay/p10/src/backend/cuda/CUDAContext.cpp:37) | 真正的多流、事件、per-device/thread handle、recordStream | 无法可靠并发、计时或做异步生命周期管理 |
-| dtype/AMP | 没有 float16、bfloat16、float8；`is_autocast_available()` 直接 `pass`，[DType.h](/home/bluemoon/projects/TensorPlay/p10/include/DType.h:48)、[autocast_mode.py](/home/bluemoon/projects/TensorPlay/tensorplay/amp/autocast_mode.py:26) | AMP、Tensor Core dtype、量化与复杂类型 | 深度学习训练吞吐差距会非常大 |
-| Stax 编译器 | CPU backend 是逐节点 Python 解释器；Triton 假定整图为平坦 1D pointwise，[cpu.py](/home/bluemoon/projects/TensorPlay/tensorplay/backends/cpu.py:12)、[triton.py](/home/bluemoon/projects/TensorPlay/tensorplay/backends/triton.py:52) | Dynamo + AOTAutograd + Inductor、guards、dynamic shapes、functionalization | 当前是编译器原型，不是可替代 `torch.compile` 的执行栈 |
-| 生态能力 | DataLoader 包缺失；AMP 是桩；ONNX 使用了 Stax 中不存在的 API；distributed 不存在 | DataLoader、DDP/FSDP、ONNX/export、profiler、distributed collectives | Python API 外观明显领先于实际实现 |
-| 测试/发布 | 175 个测试，但部分 parity 失败只打印并返回，不会 fail，[test_op_parity.py](/home/bluemoon/projects/TensorPlay/test/test_op_parity.py:28) | 大规模多平台 CI、OpInfo/gradcheck/sanitizer | 当前测试不能作为兼容性证明 |
+## 9. tensorplay.graph 门面:FX 对齐 + 特征提取 + 图可视化(2026-08-22)
 
-两个已复现的 autograd 错误：
+公共图 API 从占位 shim 迁移为真实实现;实现位置不变(`tensorplay/compiler/graph.py`),
+新增门面 `tensorplay/graph.py` 作公共入口,删除无人引用的 `tensorplay/fx.py`。
 
-- `x=2; y=x*x; x.fill_(10); y.backward()` 没有报错，返回错误梯度 `20`；Torch 会因版本不一致拒绝 backward。
-- `create_graph=False` 后，`x.grad.requires_grad` 仍为 `True`，导致无谓构图和内存开销。
+- **Graph 原语**(`compiler/graph.py`):
+  - 节点命名从 `_{counter}` 升级为 fx 风格语义名(`add`/`conv1`/`view`),按目标推导 +
+    `_0/_1` 唯一化;显式命名优先。名字在 erase 后保留不复用,保证 recompile 生成代码的
+    变量名安全;
+  - 新增 `Node.erase_node` / `Node.replace_all_uses_with`(含拓扑守卫);
+    `dead_code_elimination` 改为返回移除数量并同步清空被删节点的 graph 指针;
+  - **修复双 output bug**:`Graph.output()` 现为单例替换语义(先擦旧 output 再建新),
+    此前 `_interpret` 取首个 output 而 `recompile` 取末个,可能返回不同值;
+  - `lint()` 增加跨图引用与多 output 校验。
+- **Tracer**:
+  - `is_leaf_module(module, qualified_name)` 钩子(默认 False 保持 Dynamo 式内联,
+    `tp.compile` 行为不变);返回 True 的子模块产出 `call_module` 节点;
+  - `Tracer.node_to_qualname`:每个 call_module 节点记录限定模块路径,共享模块多次执行
+    得到 `path_0/path_1` 消歧(torchvision NodePathTracer 等价物);叶子子树参数不再产生
+    悬空 `get_attr`;
+  - 支持 `concrete_args={...}`:列出的参数特化 baked 进图,不生成 placeholder,
+    结果 signature 同步收缩。
+- **特征提取**(对齐 torchvision `models.feature_extraction`):
+  - `get_graph_node_names(model)` → `(train_names, eval_names)`,合并语义节点名与叶子
+    模块路径,排序去重;
+  - `create_feature_extractor(model, return_nodes=..., train_return_nodes=/eval_return_nodes=...)`:
+    双模式各剪枝一张图(output 先删后建 → DCE → lint),返回 `DualFeatureExtractor`
+    (`nn.Module`,`.train()/.eval()` 切换活动图);叶子子模块 deepcopy 按原限定名注册,
+    `state_dict` 与原模型键兼容可直接载入预训练权重。
+- **可视化**(参考 `third_party/torchviz`、`third_party/torchview`):
+  - `Graph.to_dot()`:零依赖生成 DOT 文本,节点按 op 类型着色(placeholder 蓝 /
+    get_attr 橙 / function·method 黄 / module 绿 / output 淡绿),kwargs 边带标签;
+  - `Graph.draw("model.png")`:检测 `dot` 二进制渲染 PNG/SVG/PDF;无 Graphviz 时落盘
+    `.gv` 并给出可读指引。
+- **测试**:`test/test_graph.py` 覆盖命名唯一化、output 单例、erase/replace、concrete_args、
+  call_module 产出与 qualname 消歧、特征提取正确性/state_dict 兼容/双模式切换、DOT 导出。
+- **附带最小修复**:`p10/src/backend/cuda/IndexingKernels.cu` scatter 分发——`if (Add)`
+  改 `if constexpr`,assign 模式全 dtype 实例化不再要求 atomic 重载;add 模式分发收窄至
+  Float32/Float64/Int32/Int64(与既有运行时契约一致)。
 
-## 3. CPU 实测
+### P0:L2 pass 体系落地(compiler/passes.py)
 
-环境：Intel Core Ultra 7 265K、Python 3.13；TensorPlay 为本地 CPU+oneDNN 3.4.1 构建，实际 BLAS 未启用；Torch 2.13.0+cu130，MKL+oneDNN 3.12。由于顶层包不能直接导入，TensorPlay 数据是绕过 Python 包装层、直接调用 `_C` 得到的核心性能。
+- `PassManager`(对齐 `torch.fx.passes.infra`):按序执行至不动点(`run_passes_once`
+  可退化为单轮),每轮后 `lint()`;`PassBase/PassResult` 契约同 fx。
+- 内置 pass:`DeadCodeElimination`(包装既有 DCE)、`ConstFold`
+  (operator 白名单 + 常量参数才折叠;张量操作数与运行期非法常量——如除零——
+  保持原语义不折叠)、`ShapeProp`(按占位符名绑定示例输入解释执行,写
+  `meta["val"]/meta["tensor_shape"]`,供 to_dot tooltip 与后续形状感知 pass 使用;
+  Node/Proxy 符号目标的图跳过标注防污染)。
+- 接线:`compiler/api.py::_compile_region` 默认管线改为
+  ConstFold → DeadCodeElimination,绑定 backend_inputs 后追加 ShapeProp
+  (失败仅放弃 meta,不阻断编译)。
+- 导出:`tensorplay.compiler.*` 与 `tensorplay.graph.*` 双命名空间。
+- 验证:HEAD 快照 worktree 中 test_passes/test_graph/test_compile 共 46/46 通过;
+  更广套件的既有失败(einsum/serialization 等)经对照实验确认为快照缺失未提交
+  修复所致,与本批改动无关。
 
-下表中倍率为 `TensorPlay / Torch`，大于 1 表示 TensorPlay 更慢。
+### P1:L1-D1 控制流静态特化(元数据具体化)
 
-| 测试 | 单线程：TP / Torch | 8 线程：TP / Torch | 结论 |
-|---|---:|---:|---|
-| 1 元素 add | 0.47 / 0.52 µs，0.90× | 6.69 / 0.54 µs，12.4× | OpenMP 缺少最小粒度阈值 |
-| 1M 元素 pointwise 三段链 | 855 / 3568 µs，0.24× | 437 / 1094 µs，0.40× | 热缓存 eager 表现很好；推测主要受益于 exact-size CPU allocator，不是 Stax 融合 |
-| 1M 元素 sum | 406 / 63 µs，6.4× | 405 / 15.5 µs，26.0× | reduction 几乎没有多线程扩展 |
-| 1024² GEMM | 14.69 / 14.76 ms，1.00× | 3.02 / 3.18 ms，0.95× | GEMM 已接近 Torch |
-| 1×64×56² Conv3d-like 2D shape | 1.52 / 1.56 ms，0.98× | 0.447 / 0.371 ms，1.21× | Conv 主路径基本合格 |
-| 512² pointwise 前反向 | 446 / 237 µs，1.89× | 661 / 101 µs，6.52× | TPX engine、额外构图和并行策略是瓶颈 |
-| Stax CPU vs `torch.compile` pointwise | 947 / 379 µs，2.5× | 517 / 37.8 µs，13.7× | Stax CPU 当前反而比 TensorPlay eager 慢 |
+- `Tracer().trace(model, sample_inputs={名: 值})`:捕获期为占位符绑定示例值。
+  `api._compile_region` 自动把本次调用的实参经签名绑定后传入,`GraphModule.meta
+  ["sample_inputs"]` 留档供后端/调试。
+- **语义边界 = torch 同款**:元数据(shape/dtype/device/ndim/len)在捕获期解析为
+  具体值——它们本就是编译特化签名的键,不引入新的重编译条件;张量数据仍严格符号,
+  数据依赖分支(`bool((x>0).all())`)继续 `GraphCaptureError`(fullgraph 下传播)。
+- 效果:`if x.shape[0] > 2`、`range(x.ndim)` 循环、`len(x)` 切片等 Python 控制
+  流现在可 fullgraph 静态特化;不同 shape 触发各自特化,与 torch.compile 一致。
+- 附带:`Proxy` 的 data-dependent 拒绝消息统一(torch.export strict 措辞);
+  `compiler.registry.unregister_backend(name)` 公共化(测试/工具注销后端)。
+- 测试:`test/test_control_flow.py`(8 例):静态分支、图内容断言、循环展开、
+  len 切片、数据依赖拒绝、样本留档、无样本回退符号路径;原
+  `test_fullgraph_rejects_python_control_flow` 拆分为"数据依赖拒绝"+"元数据特化
+  正向"两例。四套件合计 54/54。
 
-因此性能结论不是“TensorPlay 全面慢”：FP32 GEMM/Conv 与部分 eager pointwise 已经不错；最突出的问题是 reduction、多线程小算子、autograd 和编译器。
+### P2:L3 守卫版符号形状(dynamic 缓存安全化)
 
-CUDA 没有给出数字：截至 2026-08-17，你提供的 [cu130 索引](https://download.tensorplay.cn/whl/cu130/tensorplay/)只列出 `win_amd64` wheel，本机 Linux 执行安装命令无匹配版本；强制下载列出的 Win313 文件又返回 404。发布包确实存在，[PyPI 元数据](https://pypi.org/pypi/tensorplay/json)也包含 1.0.0rc0，但当前无法用于这台 Linux 机器的 CUDA 对照。
-
-## 4. 设计优化表
-
-| 优先级 | 设计项 | 建议实现 | 验收门槛 |
-|---|---|---|---|
-| P0 | 正确性与发布门禁 | 先修 Conv3d 内存破坏、wheel RPATH、OpenMP 链接、缺失 `utils.data`；增加 Linux/Windows、CPU/CUDA wheel smoke CI | 干净 venv 一条命令安装导入；ASan/UBSan 无崩溃；完整 pytest 可收集运行 |
-| P0 | Autograd 安全模型 | SavedVariable 保存版本；所有原地/视图写入 bump；`create_graph=False` 下关闭 GradMode；正确处理 retain_graph、hooks、异常 | gradcheck/gradgradcheck；原地修改必须报错；二阶梯度和 Torch 对齐 |
-| P0 | 统一 operator runtime | schema 作为唯一事实源；引入 DispatchKeySet、Meta、Autograd、Autocast、Composite key；kernel handle 缓存，热路径移除字符串与 mutex | schema、注册、Python stub 自动一致；并发 dispatcher 测试通过 |
-| P0 | CUDA 执行契约 | 真正的 DeviceGuard、Stream/Event、异步 copy、per-device/thread handles、stream-aware allocator | 双流可重叠；事件时间非零且正确；多 GPU 不再硬编码 device 0 |
-| P1 | TensorIterator/类型提升 | 统一 broadcasting、stride、dtype promotion、contiguous fast path，避免每个算子重复 clone | 非连续、broadcast、mixed dtype OpInfo 对齐 |
-| P1 | Stax 编译契约 | 增加 Meta tensor、shape/dtype/device guards、graph break、functionalization、partition、真实 lowering 与缓存 | shape/dtype 改变会安全重编译；编译 CPU 不再解释执行 |
-| P1 | API 能力真实性 | 未实现 API 明确抛 `NotImplementedError`；补齐或暂时移除 AMP、ONNX、DataLoader 的假兼容入口 | 文档示例全部在 CI 中执行 |
-| P2 | 分布式与可观测性 | 在单机语义稳定后再做 NCCL/Gloo、DDP、profiler、memory snapshot | 多卡一致性、故障传播和 trace 可验证 |
-
-## 5. 性能优化表
-
-| 优先级 | 瓶颈证据 | 优化方向 | 性能验收 |
-|---|---|---|---|
-| P0 | 8 线程 1 元素 add 慢 12.4× | 建立统一 `parallel_for(begin,end,grain)`；小于阈值串行；线程池替代每算子裸 OpenMP | 小算子 8 线程开销不超过单线程 1.5× |
-| P0 | sum 8 线程慢 26×且没有扩展 | 分块树形 reduction、SIMD 累积、线程局部 partial buffer；按维度和连续性专门化 | 1M sum 在 8 线程至少获得 4×单线程加速 |
-| P0 | backward 8 线程慢 6.5× | 修复 `create_graph=False`；用 vector/small-map 替代每节点 unordered_map；CPU/device ready queue 并行执行 | 代表性前反向控制在 Torch eager 1.5×以内 |
-| P0 | CUDA 每次 `cudaMalloc/free`，cuDNN workspace 也现申请 | 分尺寸、分 stream caching allocator；workspace pool；`recordStream`；OOM 回收与 per-device stats | warmup 后稳态零 `cudaMalloc/free`；无跨流 use-after-free |
-| P1 | 无 FP16/BF16 | 增加 Half/BFloat16、autocast dispatch、GradScaler；使用 cuBLASLt epilogue 和 cuDNN frontend plan cache | Ampere 上 FP16/BF16 GEMM/Conv 使用 Tensor Core，吞吐达到 Torch 同配置的 80%+ |
-| P1 | Stax CPU 比 eager 慢，Torch compile 快 13.7× | pointwise/reduction fusion、CPU LLVM/C++ codegen或 oneDNN Graph、Triton 分区；加入内存规划和 buffer reuse | 三段 pointwise 生成一个 kernel；性能接近 `torch.compile` 1.5×以内 |
-| P1 | Conv/GEMM 每次重建 descriptor/primitive | 缓存 oneDNN primitive、reordered weight、cuDNN plan；支持 channels-last 和预打包 | 稳态不重复建 plan/reorder；Conv 8 线程追平 Torch |
-| P2 | Python/dispatcher/optimizer 小操作多 | op handle 内联缓存、无锁热表、foreach/fused optimizer、批量参数更新 | Adam/SGD kernel launch 数和参数数解耦 |
-
-## 6. 建议落地顺序
-
-1. 先做 release/import、Conv3d 崩溃、autograd 版本安全和真实断言测试。
-2. 再做 CPU parallel/reduction 与 CUDA allocator/stream。
-3. 然后重构 Dispatcher + TensorIterator，给 AMP/Meta/Stax 提供正确基础。
-4. 最后投入编译器、distributed、ONNX 等生态能力。
-
-本次定向核心测试有 33 项通过；完整套件先被未声明的 `matplotlib` 阻断，排除后在 Conv3d 稳定触发 exit 139。源码跟踪文件未修改；PyTorch 已以稀疏浅克隆保留在 `third_party/pytorch`，基准提交为 `893b6406afc1a6384ab6fae8a2247d03cc230d87`，约 146 MB，目前为未跟踪目录。构建还留下了被 Git 忽略的 `_C`/`lib` 二进制产物。
+- **问题**:dynamic 模式下缓存键泛化为 ("dynamic", rank),但若捕获期发生
+  `x.shape[...]`/`len(x)` 读取并驱动了 Python 分支,分支结果被 bake 进图——
+  其他尺寸复用该特化会静默算错。
+- **机制**:`Tracer.metadata_touches` 记录占位符级元数据读取(shape/len/ndim/
+  dtype/device/requires_grad);`api._extract_shape_guard_params` 提取 shape 类
+  触碰参数;首次捕获后提升为 `guard_param_names`,缓存键追加
+  ("shape-guards", 精确签名) 分量并清空旧键重存。dtype/device/requires_grad
+  本就在签名内,无需额外守卫。
+- **效果**:被读形状的参数按尺寸精确重特化(正确性),未触碰参数保持通配
+  (dynamic 收益保留);静态模式行为不变。
+- 测试:`test/test_symbolic.py` 5 例(守卫重特化、通配复用、参数级作用域、
+  meta 留档、静态模式回归)。五套件合计 59/59。
+- 备注:完整 sympy 符号表达式系统(size 变量约束传播)仍属 L3 后续,需配合
+  native lowering(stax M 系列)才有落地价值;本批先堵正确性缺口。

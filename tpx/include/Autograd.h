@@ -102,7 +102,17 @@ TENSORPLAY_API Tensor as_strided(const Tensor& self, const std::vector<int64_t>&
                                  std::optional<int64_t> storage_offset = std::nullopt);
 TENSORPLAY_API Tensor select(const Tensor& self, int64_t dim, int64_t index);
 TENSORPLAY_API Tensor slice(const Tensor& self, int64_t dim, int64_t start, int64_t end, int64_t step = 1);
+// at::native::narrow is slice(dim, start, start + length); routing through
+// slice reuses its backward.
+TENSORPLAY_API Tensor narrow(const Tensor& self, int64_t dim, int64_t start, int64_t length);
 TENSORPLAY_API Tensor expand(const Tensor& self, const std::vector<int64_t>& size);
+
+// Differentiable `to`, mirroring torch: the forward cast records a
+// ToCopyBackward node whose backward casts the gradient back to the source
+// tensor's dtype/device (see _to_copy_backward in torch).
+TENSORPLAY_API Tensor to(const Tensor& self, DType dtype, bool non_blocking = false, bool copy = false);
+TENSORPLAY_API Tensor to(const Tensor& self, Device device, bool non_blocking = false, bool copy = false);
+TENSORPLAY_API Tensor to(const Tensor& self, Device device, DType dtype, bool non_blocking = false, bool copy = false);
 
 TENSORPLAY_API void backward(const Tensor& tensor, const Tensor& gradient = {}, bool retain_graph = false, bool create_graph = false);
 TENSORPLAY_API void backward(const std::vector<Tensor>& tensors, const std::vector<Tensor>& gradients = {}, bool retain_graph = false, bool create_graph = false);

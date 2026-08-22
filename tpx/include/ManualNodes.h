@@ -165,6 +165,28 @@ struct CatBackward : public Node {
     }
 };
 
+// torch differentiates roll as grad.roll(-shifts, dims) (derivatives.yaml:
+// "self: grad.roll_symint(fmap(reverse_list_symint(shifts), [](c10::SymInt i)
+// {return -i;}), reverse_list(dims))").  TensorPlay's formula DSL cannot map
+// over int64 lists, so the element-wise negation happens here and the node
+// simply re-rolls the gradient with the negated shifts.
+struct RollBackward : public Node {
+    std::vector<int64_t> shifts_;
+    std::vector<int64_t> dims_;
+
+    RollBackward(std::vector<int64_t> shifts, std::vector<int64_t> dims)
+        : shifts_(std::move(shifts)), dims_(std::move(dims)) {}
+
+    variable_list apply(variable_list&& inputs) override {
+        if (inputs.empty() || !inputs[0].defined()) return {Tensor()};
+        const Tensor& grad = inputs[0];
+
+        std::vector<int64_t> neg_shifts(shifts_.size());
+        for (size_t i = 0; i < shifts_.size(); ++i) neg_shifts[i] = -shifts_[i];
+        return {roll(grad, neg_shifts, dims_)};
+    }
+};
+
 struct StackBackward : public Node {
     std::vector<Tensor> tensors_;
     int64_t dim_;

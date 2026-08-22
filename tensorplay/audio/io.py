@@ -1,171 +1,181 @@
+"""Audio I/O — torch-compatible load / save / info.
+
+Signatures follow torchaudio 2.x: ``load`` supports partial reads via
+frame_offset/num_frames, ``save`` takes an explicit channels_first flag
+instead of guessing, and ``info`` returns an ``AudioMetaData`` namedtuple.
+Backends are soundfile (preferred) and scipy.
+"""
+from collections import namedtuple
+
 import numpy as np
 import tensorplay as tp
 from .backend import get_audio_backend, _SCIPY_AVAILABLE, _SOUNDFILE_AVAILABLE
 
+# torchaudio AudioMetaData (torchaudio/AudioMetaData.py)
+AudioMetaData = namedtuple(
+    "AudioMetaData",
+    ["sample_rate", "num_frames", "num_channels", "bits_per_sample", "encoding"],
+)
 
-def load(filepath, normalize=True, channels_first=True):
-    """
-    Loads an audio file from the filesystem.
-    
+
+def _sf_dtype(normalize, bits_per_sample):
+    if normalize:
+        return "float32"
+    return {16: "int16", 32: "int32", 8: "uint8", 24: "int32"}.get(bits_per_sample, "int16")
+
+
+def load(filepath, frame_offset=0, num_frames=-1, normalize=True,
+         channels_first=True, format=None):
+    """Loads an audio file into a Tensor (torchaudio.load semantics).
+
     Args:
-        filepath (str): Path to the audio file.
-        normalize (bool): If True, normalize the audio to [-1, 1] (float32).
-                          If False, return original values (e.g. int16).
-                          Default: True.
-        channels_first (bool): If True, return (Channels, Time).
-                               If False, return (Time, Channels).
-                               Default: True (PyTorch style).
-                               
+        filepath: Path to the audio file.
+        frame_offset: Number of frames to skip before reading.
+        num_frames: Maximum number of frames to read; -1 reads everything
+            from frame_offset.
+        normalize: If True, convert to float32 normalized to [-1, 1];
+            otherwise keep the native integer encoding.
+        channels_first: If True (default), return (Channels, Time).
+        format: Ignored; the backend sniffs the container.
+
     Returns:
-        Tensor: Audio tensor.
-        int: Sample rate.
+        (Tensor, int): waveform tensor and sample rate.
     """
     backend = get_audio_backend()
     if backend is None:
-        raise ImportError("No audio backend available. Please install soundfile or scipy.")
-        
-    sr = 0
+        raise ImportError(
+            "No audio backend available. Please install soundfile or scipy.")
+
     audio_np = None
-    
+    sr = 0
+
     if backend == "soundfile":
         import soundfile as sf
-        # soundfile always returns float32 normalized by default if read normally?
-        # sf.read returns (data, samplerate)
-        # data is (frames, channels)
-        # dtype can be specified.
-        dtype = 'float32' if normalize else 'int16'
-        audio_np, sr = sf.read(filepath, dtype=dtype)
-        
+        dtype = "float32" if normalize else None
+        start = int(frame_offset)
+        count = int(num_frames)
+        if num_frames == -1:
+            audio_np, sr = sf.read(filepath, dtype=dtype, start=start,
+                                   always_2d=True)
+        else:
+            audio_np, sr = sf.read(filepath, dtype=dtype, start=start,
+                                   frames=count, always_2d=True)
+
     elif backend == "scipy":
         from scipy.io import wavfile
-        # wavfile.read returns (rate, data)
-        # data is usually int16 for wav
-        sr, audio_np = wavfile.read(filepath)
-        
-        # scipy reads as is (int16, etc). 
-        # If we need normalization, we can let C++ handle it or do it here.
-        # But wait, our C++ optimization handles int16->float32 normalization!
-        # So we just pass the raw numpy array to C++.
-    
+        sr, raw = wavfile.read(filepath)
+        if not isinstance(raw, np.ndarray):
+            raw = np.array(raw)
+        if raw.ndim == 1:
+            raw = raw[:, None]
+        start = max(0, int(frame_offset))
+        stop = raw.shape[0] if num_frames == -1 else min(raw.shape[0], start + int(num_frames))
+        audio_np = raw[start:stop]
+        if normalize:
+            if raw.dtype == np.int16:
+                audio_np = audio_np.astype(np.float32) / 32768.0
+            elif raw.dtype == np.int32:
+                audio_np = audio_np.astype(np.float32) / 2147483648.0
+            elif raw.dtype == np.uint8:
+                audio_np = (audio_np.astype(np.float32) - 128.0) / 128.0
+
     if audio_np is None:
         raise RuntimeError(f"Failed to load audio file: {filepath}")
-
-    # Ensure array
     if not isinstance(audio_np, np.ndarray):
         audio_np = np.array(audio_np)
-        
-    # C++ Optimized Path
-    # Condition: 
-    # 1. We want PyTorch style output (Channels, Time) -> C++ does this transpose.
-    # 2. We want normalization -> C++ does this for int16/uint8 inputs.
-    
-    use_cpp_opt = False
-    
-    # If scipy read int16 and we want normalized float32 tensor:
-    if normalize and audio_np.dtype == np.int16 and hasattr(tp, 'audio_to_tensor'):
-        use_cpp_opt = True
-        
-    # If already float32 (e.g. soundfile) and we just want transpose:
-    if audio_np.dtype == np.float32 and hasattr(tp, 'audio_to_tensor'):
-        use_cpp_opt = True
-        
-    if use_cpp_opt:
-        # tp.audio_to_tensor always returns (C, T) float32
-        tensor = tp.audio_to_tensor(audio_np)
-        
-        if not channels_first:
-            # Transpose back if user requested (T, C)
-            tensor = tensor.t()
-            
+    if audio_np.ndim == 1:
+        audio_np = audio_np[:, None]
+
+    # Fast path: C++ kernel converts (Time, Channels) -> (Channels, Time)
+    # with int16/int32/uint8 normalization folded in.
+    use_cpp = (
+        hasattr(tp, "audio_to_tensor")
+        and normalize
+        and audio_np.dtype in (np.int16, np.int32, np.uint8, np.float32)
+    )
+    if use_cpp:
+        tensor = tp.audio_to_tensor(audio_np.astype(np.float32))
+    else:
+        tensor = tp.tensor(audio_np.T.copy() if channels_first else audio_np.copy())
         return tensor, sr
 
-    # Fallback / Non-optimized path
-    # ... (Manual implementation if C++ opt not applicable or available)
-    
-    # Handle Normalization manually if not handled by C++
-    if normalize:
-        if audio_np.dtype == np.int16:
-            audio_np = audio_np.astype(np.float32) / 32768.0
-        elif audio_np.dtype == np.uint8:
-            audio_np = (audio_np.astype(np.float32) - 128.0) / 128.0
-        # Add other types if needed
-    
-    # Handle Channels First (Transpose)
-    # Numpy is (Time, Channels) usually
-    if audio_np.ndim == 2 and channels_first:
-        audio_np = audio_np.transpose(1, 0) # (C, T)
-    elif audio_np.ndim == 1 and channels_first:
-        audio_np = audio_np[None, :] # (1, T)
-        
-    return tp.tensor(audio_np), sr
+    if not channels_first:
+        tensor = tensor.t()
+    return tensor, sr
 
-def save(filepath, src, sample_rate):
-    """
-    Saves a Tensor to an audio file.
-    
+
+def save(filepath, src, sample_rate, channels_first=True, format=None):
+    """Saves a Tensor to an audio file (torchaudio.save semantics).
+
     Args:
-        filepath (str): Path to save.
-        src (Tensor): Audio tensor (C, T) or (T, C) or (T,).
-        sample_rate (int): Sample rate.
+        filepath: Destination path (.wav etc. per backend support).
+        src: Waveform tensor; interpreted as (Channels, Time) when
+            channels_first=True (default), else (Time, Channels).
+        sample_rate: Sampling rate in Hz.
+        channels_first: Layout flag of ``src``.
+        format: Ignored; inferred from the extension.
     """
     backend = get_audio_backend()
     if backend is None:
         raise ImportError("No audio backend available.")
-        
-    # Convert to numpy
+
     if isinstance(src, tp.Tensor):
-        # We assume float32 [-1, 1] usually
-        # But we need to check shape.
-        # Most backends expect (Time, Channels)
-        
-        # If (C, T) -> Transpose to (T, C)
-        if src.ndim == 2 and src.shape[0] < src.shape[1]: 
-            # Heuristic: Channels is usually small (1, 2, etc), Time is large.
-            # If shape[0] << shape[1], assume (C, T)
-            src = src.transpose(0, 1) # -> (T, C)
-            
-        # Convert to numpy
-        # TODO: Need Tensor -> Numpy binding or via DLPack
-        # For now, if we don't have direct to_numpy, we might need a workaround or assume it exists.
-        # tensorplay seems to have numpy() method? Let's check or assume.
-        # If not, use dlpack.
         try:
             arr = src.numpy()
-        except:
-            # Fallback
-            arr = np.array(src) # Implicit conversion?
-            
+        except Exception:
+            arr = np.asarray(src)
     else:
-        arr = src
-        
+        arr = np.asarray(src)
+
+    arr = np.asarray(arr)
+    if channels_first:
+        # torchaudio expects backend-facing (Time, Channels)
+        if arr.ndim == 1:
+            arr = arr[:, None]
+        else:
+            arr = arr.T
+    elif arr.ndim == 1:
+        arr = arr[:, None]
+
     if backend == "soundfile":
         import soundfile as sf
-        sf.write(filepath, arr, sample_rate)
+        sf.write(filepath, arr, int(sample_rate))
     elif backend == "scipy":
         from scipy.io import wavfile
-        # scipy expects int16 usually for wav if we want standard wav?
-        # Or float32 is fine? Scipy supports float32 wav.
-        wavfile.write(filepath, sample_rate, arr)
+        wavfile.write(filepath, int(sample_rate), arr)
 
-def info(filepath):
-    """
-    Get signal information of an audio file.
+
+def info(filepath, format=None, buffer_size=4096):
+    """Returns signal information of an audio file (torchaudio.info).
+
+    Returns:
+        AudioMetaData with fields
+        (sample_rate, num_frames, num_channels, bits_per_sample, encoding).
     """
     backend = get_audio_backend()
     if backend == "soundfile":
         import soundfile as sf
         si = sf.info(filepath)
-        return {"samplerate": si.samplerate, "channels": si.channels, "frames": si.frames}
+        subtype_bits = {
+            "PCM_S8": 8, "PCM_U8": 8, "PCM_16": 16, "PCM_24": 24, "PCM_32": 32,
+            "FLOAT": 32, "DOUBLE": 64, "ULAW": 8, "ALAW": 8,
+        }
+        return AudioMetaData(
+            sample_rate=int(si.samplerate),
+            num_frames=int(si.frames),
+            num_channels=int(si.channels),
+            bits_per_sample=subtype_bits.get(si.subtype, 16),
+            encoding=si.subtype,
+        )
     elif backend == "scipy":
-        # Scipy doesn't have a cheap 'info' without reading?
-        # Actually wavfile.read reads the whole file.
-        # So scipy is bad for just info.
-        # Maybe use wave module for info if scipy is backend?
         import wave
         with wave.open(filepath, 'rb') as f:
-            return {
-                "samplerate": f.getframerate(),
-                "channels": f.getnchannels(),
-                "frames": f.getnframes()
-            }
+            encodings = {1: "PCM_S", 2: "ALAW", 3: "FLOAT", 6: "ALAW", 7: "ULAW"}
+            return AudioMetaData(
+                sample_rate=f.getframerate(),
+                num_frames=f.getnframes(),
+                num_channels=f.getnchannels(),
+                bits_per_sample=f.getsampwidth() * 8,
+                encoding=encodings.get(f.getcomptype(), "PCM_S"),
+            )
     return None

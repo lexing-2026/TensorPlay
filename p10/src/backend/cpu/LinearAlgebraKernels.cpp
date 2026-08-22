@@ -482,7 +482,7 @@ Tensor addmm_kernel(const Tensor& input, const Tensor& mat1, const Tensor& mat2,
     } else {
         // Any broadcastable input works in torch, including 0-dim/(M,1)/(1,N).
         result = expand_gemm_input(input, {M, N}).clone();
-        if (beta_v != 1.0) result = result.mul(beta_v);
+        if (beta_v != 1.0) result.mul_(beta);
     }
 
     // alpha * (self @ other) via mm_kernel, then add
@@ -940,7 +940,7 @@ Tensor baddbmm_kernel(const Tensor& input, const Tensor& batch1, const Tensor& b
     } else {
         // Any broadcastable input works in torch, including 0-dim/(N,)/(M,N).
         result = expand_gemm_input(input, target).clone();
-        if (beta_v != 1.0) result = result.mul(beta_v);
+        if (beta_v != 1.0) result.mul_(beta);
     }
 
     Tensor product = bmm_kernel(batch1, batch2);
@@ -949,15 +949,21 @@ Tensor baddbmm_kernel(const Tensor& input, const Tensor& batch1, const Tensor& b
 }
 
 Tensor mv_kernel(const Tensor& self, const Tensor& vec) {
-    if (self.dim() != 2) TP_THROW(RuntimeError, "self must be a matrix");
-    if (vec.dim() != 1) TP_THROW(RuntimeError, "vector must be 1D");
+    // Torch routes mv through addmv; mirror its meta checks verbatim
+    // (aten/src/ATen/native/Blas.cpp ADDMV_META).
+    if (self.dim() != 2 || vec.dim() != 1) {
+        TP_THROW(RuntimeError, "vector + matrix @ vector expected, got ", 1, ", ",
+                 self.dim(), ", ", vec.dim());
+    }
     if (self.size(1) != vec.size(0)) {
         TP_THROW(RuntimeError, "size mismatch, got input (", self.size(0), "), mat (",
                  self.size(0), "x", self.size(1), "), vec (", vec.size(0), ")");
     }
     if (self.dtype() != vec.dtype()) {
-        TP_THROW(RuntimeError, "expected m1 and m2 to have the same dtype, but got: ",
-                 c10_style_dtype_name(self.dtype()), " != ", c10_style_dtype_name(vec.dtype()));
+        // The leading value is addmv's accumulator slot; via mv it echoes vec.
+        TP_THROW(RuntimeError, "addmv input tensors must have the same dtype, but got ",
+                 pretty_dtype_name(vec.dtype()), ", ", pretty_dtype_name(self.dtype()), ", and ",
+                 pretty_dtype_name(vec.dtype()));
     }
     check_cpu_matmul_dtype(self.dtype());
     return matmul_batched_2d(self, vec.unsqueeze(-1), {}, {}).squeeze(-1);
@@ -1063,16 +1069,16 @@ Tensor dot_kernel(const Tensor& self, const Tensor& other) {
 }
 
 Tensor inner_kernel(const Tensor& self, const Tensor& other) {
+    // Torch: scalar operands go through plain multiplication (with
+    // promotion); otherwise this is tensordot over the last dimension.
     if (self.dim() == 0 || other.dim() == 0) {
-        if (self.dtype() != other.dtype()) {
-            TP_THROW(RuntimeError, "expected scalar type ", pretty_dtype_name(self.dtype()),
-                     " but found ", pretty_dtype_name(other.dtype()));
-        }
-        return self.mul(other);
+        return self * other;
     }
     const int64_t n = self.size(-1);
     if (other.size(-1) != n) {
-        TP_THROW(RuntimeError, "inner(): incompatible shapes: ", n, " vs ", other.size(-1));
+        TP_THROW(RuntimeError, "inner() the last dimension must match on both input tensors but got shapes ",
+                 Size(static_cast<std::vector<int64_t>>(self.shape())).toString(), " and ",
+                 Size(static_cast<std::vector<int64_t>>(other.shape())).toString());
     }
     if (self.dim() == 1 && other.dim() == 1) {
         return dot_kernel(self, other);

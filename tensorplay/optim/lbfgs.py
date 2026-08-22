@@ -189,6 +189,8 @@ class LBFGS(Optimizer):
         tolerance_change=1e-9,
         history_size=100,
         line_search_fn=None,
+        *,
+        maximize=False,
     ):
         if isinstance(lr, tp.Tensor) and lr.numel() != 1:
             raise ValueError("Tensor lr must be 1-element")
@@ -204,6 +206,7 @@ class LBFGS(Optimizer):
             tolerance_change=tolerance_change,
             history_size=history_size,
             line_search_fn=line_search_fn,
+            maximize=maximize,
         )
         super().__init__(params, defaults)
 
@@ -237,7 +240,10 @@ class LBFGS(Optimizer):
             views.append(view)
         if not views:
             return tp.zeros((0,), dtype=tp.float32)
-        return tp.cat(views, dim=0)
+        flat_grad = tp.cat(views, dim=0)
+        if self.param_groups[0].get("maximize", False):
+            flat_grad.neg_()
+        return flat_grad
 
     def _add_grad(self, step_size, update):
         offset = 0
@@ -262,8 +268,11 @@ class LBFGS(Optimizer):
         loss = _as_loss(closure())
         flat_grad = self._gather_flat_grad()
         self._set_param(x)
+        if self.param_groups[0].get("maximize", False):
+            loss = -loss
         return loss, flat_grad
 
+    @tp.no_grad()
     def step(self, closure):
         if closure is None:
             raise RuntimeError("LBFGS requires a closure")
@@ -285,13 +294,14 @@ class LBFGS(Optimizer):
             tolerance_change = group["tolerance_change"]
             line_search_fn = group["line_search_fn"]
             history_size = group["history_size"]
+            maximize = group.get("maximize", False)
 
             state = self.state[self._params[0]]
             state.setdefault("func_evals", 0)
             state.setdefault("n_iter", 0)
 
             orig_loss = closure()
-            loss = _as_loss(orig_loss)
+            loss = -_as_loss(orig_loss) if maximize else _as_loss(orig_loss)
             current_evals = 1
             state["func_evals"] += 1
 
@@ -387,7 +397,7 @@ class LBFGS(Optimizer):
                     self._add_grad(t, d)
                     if n_iter != max_iter:
                         loss_tensor = closure()
-                        loss = _as_loss(loss_tensor)
+                        loss = -_as_loss(loss_tensor) if maximize else _as_loss(loss_tensor)
                         flat_grad = self._gather_flat_grad()
                         opt_cond = max_abs(flat_grad) <= tolerance_grad
                         ls_func_evals = 1

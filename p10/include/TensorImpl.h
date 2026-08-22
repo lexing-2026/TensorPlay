@@ -47,9 +47,26 @@ private:
     };
     std::shared_ptr<SharedState> shared_state_;
 
+    // COO sparse tensors have no dense storage of their own.  Keep the COO
+    // metadata next to the dense metadata, mirroring TensorImpl's split
+    // between logical sizes and the storage implementation.  The component
+    // tensors are shared handles, so ordinary Tensor copies preserve the
+    // aliasing rules of torch.sparse_coo_tensor(indices, values, ...).
+    struct SparseState {
+        std::shared_ptr<TensorImpl> indices;
+        std::shared_ptr<TensorImpl> values;
+        std::vector<int64_t> sparse_sizes;
+        bool coalesced = false;
+    };
+    std::shared_ptr<SparseState> sparse_state_;
+
 public:
     TensorImpl();
     TensorImpl(const std::vector<int64_t>& sizes, DType dtype, const Device& device = Device());
+    // Sparse COO tensors need logical sizes and dtype/device metadata without
+    // allocating a dense backing store for the full logical shape.
+    TensorImpl(const std::vector<int64_t>& sizes, DType dtype,
+               const Device& device, bool allocate_storage);
     TensorImpl(const std::vector<int64_t>& sizes, const std::vector<int64_t>& strides, DType dtype, const Device& device = Device());
     TensorImpl(Storage storage, const std::vector<int64_t>& sizes, DType dtype, size_t storage_offset = 0);
     TensorImpl(Storage storage, const std::vector<int64_t>& sizes, const std::vector<int64_t>& strides, DType dtype, size_t storage_offset = 0);
@@ -66,6 +83,7 @@ public:
     const Storage& storage() const { return shared_state_->storage; }
     size_t storage_offset() const { return storage_offset_; }
     void set_storage(Storage storage) { shared_state_->storage = storage; }
+    void clear_storage() { shared_state_->storage = Storage(); }
     void set_storage_offset(size_t offset) { storage_offset_ = offset; }
     bool has_storage() const { return shared_state_ && shared_state_->storage.defined(); }
     
@@ -94,6 +112,32 @@ public:
     
     size_t itemsize() const { return elementSize(dtype_); }
     bool is_contiguous() const { return is_contiguous_; }
+
+    bool is_sparse() const { return sparse_state_ != nullptr; }
+    bool is_coalesced() const { return sparse_state_ && sparse_state_->coalesced; }
+    std::shared_ptr<TensorImpl> sparse_indices_impl() const {
+        return sparse_state_ ? sparse_state_->indices : nullptr;
+    }
+    std::shared_ptr<TensorImpl> sparse_values_impl() const {
+        return sparse_state_ ? sparse_state_->values : nullptr;
+    }
+    const std::vector<int64_t>& sparse_sizes() const {
+        static const std::vector<int64_t> empty;
+        return sparse_state_ ? sparse_state_->sparse_sizes : empty;
+    }
+    void set_sparse_state(std::shared_ptr<TensorImpl> indices,
+                          std::shared_ptr<TensorImpl> values,
+                          std::vector<int64_t> sparse_sizes,
+                          bool coalesced) {
+        sparse_state_ = std::make_shared<SparseState>();
+        sparse_state_->indices = std::move(indices);
+        sparse_state_->values = std::move(values);
+        sparse_state_->sparse_sizes = std::move(sparse_sizes);
+        sparse_state_->coalesced = coalesced;
+        is_contiguous_ = false;
+        storage_offset_ = 0;
+        clear_storage();
+    }
 
     // Version counter access (PyTorch-style mutation tracking). Views share
     // the counter with their base via share_version_counter().

@@ -1,5 +1,6 @@
 #include "CUDAContext.h"
 
+#include "CUDAGenerator.h"
 #include "CUDARuntime.h"
 #include "Device.h"
 #include "Exception.h"
@@ -21,14 +22,20 @@ namespace {
 // torch.cuda.manual_seed_all's _lazy_call + _is_in_bad_fork behavior.
 std::atomic<bool> g_cuda_initialized{false};
 std::atomic<pid_t> g_cuda_init_pid{0};
-std::atomic<bool> g_has_pending_seed{false};
-std::atomic<uint64_t> g_pending_seed{0};
 
 void checkCublas(cublasStatus_t error, const char* operation) {
     if (error != CUBLAS_STATUS_SUCCESS) {
         TP_THROW(RuntimeError,
                  std::string(operation) + " failed with cuBLAS status " +
                  std::to_string(static_cast<int>(error)));
+    }
+}
+
+void checkCusolver(cusolverStatus_t error, const char* operation) {
+    if (error != CUSOLVER_STATUS_SUCCESS) {
+        TP_THROW(RuntimeError,
+                 std::string(operation) + " failed: cusolver error " +
+                     std::to_string(static_cast<int>(error)));
     }
 }
 
@@ -41,18 +48,10 @@ void checkCudnn(cudnnStatus_t error, const char* operation) {
 }
 #endif
 
-void checkCurand(curandStatus_t error, const char* operation) {
-    if (error != CURAND_STATUS_SUCCESS) {
-        TP_THROW(RuntimeError,
-                 std::string(operation) + " failed with cuRAND status " +
-                 std::to_string(static_cast<int>(error)));
-    }
-}
-
 struct DeviceHandles {
+    cusolverDnHandle_t cusolver_dn = nullptr;
     cublasHandle_t cublas = nullptr;
     cublasLtHandle_t cublas_lt = nullptr;
-    curandGenerator_t curand = nullptr;
 #ifdef USE_CUDNN
     cudnnHandle_t cudnn = nullptr;
 #endif
@@ -68,12 +67,9 @@ DeviceHandles& handlesForCurrentDevice() {
     if (it != handles.end()) return *it->second;
 
     auto* created = new DeviceHandles();
+    checkCusolver(cusolverDnCreate(&created->cusolver_dn), "cusolverDnCreate");
     checkCublas(cublasCreate(&created->cublas), "cublasCreate");
     checkCublas(cublasLtCreate(&created->cublas_lt), "cublasLtCreate");
-    checkCurand(curandCreateGenerator(&created->curand, CURAND_RNG_PSEUDO_DEFAULT),
-                "curandCreateGenerator");
-    checkCurand(curandSetPseudoRandomGeneratorSeed(created->curand, 1234ULL),
-                "curandSetPseudoRandomGeneratorSeed");
 #ifdef USE_CUDNN
     checkCudnn(cudnnCreate(&created->cudnn), "cudnnCreate");
 #endif
@@ -103,50 +99,11 @@ cublasLtHandle_t CUDAContext::getCublasLtHandle() {
     return handlesForCurrentDevice().cublas_lt;
 }
 
-curandGenerator_t CUDAContext::getCurandGenerator() {
+cusolverDnHandle_t CUDAContext::getCusolverDnHandle() {
     auto& handles = handlesForCurrentDevice();
-    checkCurand(curandSetStream(handles.curand, getCurrentCUDAStream().stream()),
-                "curandSetStream");
-    return handles.curand;
-}
-
-void CUDAContext::manual_seed(uint64_t seed) {
-    auto stream = getCurrentCUDAStream();
-    stream.synchronize();
-    auto generator = getCurandGenerator();
-    checkCurand(curandSetPseudoRandomGeneratorSeed(generator, seed),
-                "curandSetPseudoRandomGeneratorSeed");
-    checkCurand(curandSetGeneratorOffset(generator, 0), "curandSetGeneratorOffset");
-}
-
-void CUDAContext::manual_seed_all(uint64_t seed) {
-    const int count = deviceCount();
-    for (int device = 0; device < count; ++device) {
-        CUDAGuard guard(device);
-        manual_seed(seed);
-    }
-}
-
-void manual_seed(uint64_t seed) {
-    // Lazy: never initialize CUDA from a seeding call. If CUDA is not
-    // initialized yet, stash the seed and apply it at first real CUDA use.
-    if (!isCudaInitialized()) {
-        g_pending_seed.store(seed, std::memory_order_relaxed);
-        g_has_pending_seed.store(true, std::memory_order_release);
-        return;
-    }
-    if (isInBadFork()) return;
-    CUDAContext::manual_seed(seed);
-}
-
-void manual_seed_all(uint64_t seed) {
-    if (!isCudaInitialized()) {
-        g_pending_seed.store(seed, std::memory_order_relaxed);
-        g_has_pending_seed.store(true, std::memory_order_release);
-        return;
-    }
-    if (isInBadFork()) return;
-    CUDAContext::manual_seed_all(seed);
+    checkCusolver(cusolverDnSetStream(handles.cusolver_dn, getCurrentCUDAStream().stream()),
+                  "cusolverDnSetStream");
+    return handles.cusolver_dn;
 }
 
 bool isCudaInitialized() {
@@ -166,9 +123,7 @@ void noteCudaRuntimeCall() {
     }
     g_cuda_init_pid.store(getpid(), std::memory_order_relaxed);
     // Apply a seed stashed by a pre-initialization manual_seed call.
-    if (g_has_pending_seed.exchange(false, std::memory_order_acq_rel)) {
-        CUDAContext::manual_seed_all(g_pending_seed.load(std::memory_order_relaxed));
-    }
+    apply_pending_seed();
 }
 
 } // namespace cuda

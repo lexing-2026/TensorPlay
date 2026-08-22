@@ -67,21 +67,22 @@ void _amp_foreach_non_finite_check_and_unscale_cpu(
         });
 }
 
-void _amp_update_scale_cpu(
+Tensor& _amp_update_scale_cpu(
     Tensor& self, Tensor& growth_tracker, const Tensor& found_inf,
-    double growth_factor, double backoff_factor, int64_t growth_interval) {
+    double scale_growth_factor, double scale_backoff_factor, int64_t growth_interval) {
     float* scale_ptr = self.data_ptr<float>();
     int32_t* tracker_ptr = growth_tracker.data_ptr<int32_t>();
     if (found_inf.data_ptr<float>()[0] > 0) {
-        scale_ptr[0] = static_cast<float>(scale_ptr[0] * backoff_factor);
+        scale_ptr[0] = static_cast<float>(scale_ptr[0] * scale_backoff_factor);
         tracker_ptr[0] = 0;
     } else {
         tracker_ptr[0] += 1;
         if (tracker_ptr[0] == growth_interval) {
-            scale_ptr[0] = static_cast<float>(scale_ptr[0] * growth_factor);
+            scale_ptr[0] = static_cast<float>(scale_ptr[0] * scale_growth_factor);
             tracker_ptr[0] = 0;
         }
     }
+    return self;
 }
 
 } // namespace cpu

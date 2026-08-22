@@ -86,6 +86,51 @@ Tensor mm_kernel(const Tensor& self, const Tensor& mat2);
 // Forward declaration from PadKernels.cpp
 Tensor constant_pad_nd_cpu(const Tensor& self, const std::vector<int64_t>& pad, Scalar value);
 
+// Naive Float64 conv drivers and helpers, defined near the bottom of this
+// file but used by the conv paths above.
+static bool conv_is_low_precision(DType d);
+template <typename T> static Tensor conv_grad_bias_generic(const Tensor& grad_output);
+static Tensor slow_conv2d_forward(const Tensor& input, const Tensor& weight, const Tensor& bias,
+                                  const std::vector<int64_t>& stride,
+                                  const std::vector<int64_t>& padding,
+                                  const std::vector<int64_t>& dilation,
+                                  int64_t groups, bool fused_relu);
+static Tensor slow_conv2d_grad_input(const Tensor& grad_output, const Tensor& input, const Tensor& weight,
+                                     const std::vector<int64_t>& stride,
+                                     const std::vector<int64_t>& padding,
+                                     const std::vector<int64_t>& dilation,
+                                     int64_t groups);
+static Tensor slow_conv2d_grad_weight(const Tensor& grad_output, const Tensor& input, const Tensor& weight,
+                                      const std::vector<int64_t>& stride,
+                                      const std::vector<int64_t>& padding,
+                                      const std::vector<int64_t>& dilation,
+                                      int64_t groups);
+static Tensor slow_conv3d_forward(const Tensor& input, const Tensor& weight, const Tensor& bias,
+                                  const std::vector<int64_t>& stride,
+                                  const std::vector<int64_t>& padding,
+                                  const std::vector<int64_t>& dilation,
+                                  int64_t groups);
+static Tensor slow_conv3d_grad_input(const Tensor& grad_output, const Tensor& input, const Tensor& weight,
+                                     const std::vector<int64_t>& stride,
+                                     const std::vector<int64_t>& padding,
+                                     const std::vector<int64_t>& dilation,
+                                     int64_t groups);
+static Tensor slow_conv3d_grad_weight(const Tensor& grad_output, const Tensor& input, const Tensor& weight,
+                                      const std::vector<int64_t>& stride,
+                                      const std::vector<int64_t>& padding,
+                                      const std::vector<int64_t>& dilation,
+                                      int64_t groups);
+static Tensor conv_transpose2d_naive(const Tensor& input, const Tensor& weight, const Tensor& bias,
+                                     const std::vector<int64_t>& stride,
+                                     const std::vector<int64_t>& padding,
+                                     const std::vector<int64_t>& output_padding,
+                                     int64_t groups, const std::vector<int64_t>& dilation);
+static Tensor conv_transpose3d_naive(const Tensor& input, const Tensor& weight, const Tensor& bias,
+                                     const std::vector<int64_t>& stride,
+                                     const std::vector<int64_t>& padding,
+                                     const std::vector<int64_t>& output_padding,
+                                     int64_t groups, const std::vector<int64_t>& dilation);
+
 // oneDNN matmul-primitive based GEMM.
 //
 // dnnl_sgemm (the raw BLAS-style API) cannot be used: in oneDNN 3.4.1 the JIT
@@ -1062,12 +1107,12 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
         args.insert({DNNL_ARG_SRC, src_mem});
         args.insert({DNNL_ARG_WEIGHTS, weights_mem});
         args.insert({DNNL_ARG_DST, dst_mem});
-        
+
         if (bias.defined() && bias.numel() > 0) {
             auto user_bias_md = memory::desc({bias.size(0)}, memory::data_type::f32, memory::format_tag::x);
             auto expected_bias_md = pd.bias_desc();
             memory bias_mem;
-            
+
             if (expected_bias_md != user_bias_md) {
                  auto user_bias_mem = memory(user_bias_md, eng, bias.data_ptr<float>());
                  bias_mem = memory(expected_bias_md, eng);
@@ -1077,7 +1122,17 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
             }
             args.insert({DNNL_ARG_BIAS, bias_mem});
         }
-        
+
+        // The scratchpad is written by the primitive: the storage must stay
+        // alive for the execute() call.
+        Storage scratch_storage_handle;
+        if (pd.scratchpad_desc().get_size() > 0) {
+            scratch_storage_handle = Storage(pd.scratchpad_desc().get_size(),
+                                             getAllocator(output.device().type()));
+            args.insert({DNNL_ARG_SCRATCHPAD,
+                         memory(pd.scratchpad_desc(), eng, scratch_storage_handle.data())});
+        }
+
         conv.execute(s, args);
         
         if (need_reorder_dst) {
@@ -1224,7 +1279,19 @@ static bool conv3d_onednn(const Tensor& input, const Tensor& weight, const Tenso
             }
             args.insert({DNNL_ARG_BIAS, bias_mem});
         }
-        
+
+        // The scratchpad is written by the primitive: the storage must stay
+        // alive for the execute() call.  conv3d always runs this uncached
+        // path, and oneDNN's convolution_auto kernels routinely need one --
+        // the missing arg is what corrupted the heap (exit 139).
+        Storage scratch_storage_handle;
+        if (conv_pd.scratchpad_desc().get_size() > 0) {
+            scratch_storage_handle = Storage(conv_pd.scratchpad_desc().get_size(),
+                                             getAllocator(output.device().type()));
+            args.insert({DNNL_ARG_SCRATCHPAD,
+                         memory(conv_pd.scratchpad_desc(), eng, scratch_storage_handle.data())});
+        }
+
         conv.execute(s, args);
         
         if (need_reorder_dst) {
@@ -1517,11 +1584,21 @@ static bool conv2d_grad_input_onednn(const Tensor& grad_output, const Tensor& in
         }
 
         auto start_conv = std::chrono::high_resolution_clock::now();
-        bwd_d.execute(s, {
+        // The scratchpad is written by the primitive: the storage must stay
+        // alive for the execute() call.
+        Storage bwd_d_scratch_handle;
+        std::unordered_map<int, memory> bwd_d_args = {
             {DNNL_ARG_DIFF_DST, diff_dst_mem},
             {DNNL_ARG_WEIGHTS, weights_mem},
             {DNNL_ARG_DIFF_SRC, diff_src_mem}
-        });
+        };
+        if (pd.scratchpad_desc().get_size() > 0) {
+            bwd_d_scratch_handle = Storage(pd.scratchpad_desc().get_size(),
+                                           getAllocator(grad_input.device().type()));
+            bwd_d_args.insert({DNNL_ARG_SCRATCHPAD,
+                               memory(pd.scratchpad_desc(), eng, bwd_d_scratch_handle.data())});
+        }
+        bwd_d.execute(s, bwd_d_args);
         
         if (need_reorder_diff_src) {
              auto user_mem = memory(user_diff_src_md, eng, grad_input.data_ptr<float>());
@@ -1820,11 +1897,21 @@ static bool conv2d_grad_weight_onednn(const Tensor& grad_output, const Tensor& i
         }
 #endif
 
-        bwd_w.execute(s, {
+        // The scratchpad is written by the primitive: the storage must stay
+        // alive for the execute() call.
+        Storage bwd_w_scratch_handle;
+        std::unordered_map<int, memory> bwd_w_args = {
             {DNNL_ARG_SRC, src_mem},
             {DNNL_ARG_DIFF_DST, diff_dst_mem},
             {DNNL_ARG_DIFF_WEIGHTS, diff_weights_mem}
-        });
+        };
+        if (pd.scratchpad_desc().get_size() > 0) {
+            bwd_w_scratch_handle = Storage(pd.scratchpad_desc().get_size(),
+                                           getAllocator(grad_weight.device().type()));
+            bwd_w_args.insert({DNNL_ARG_SCRATCHPAD,
+                               memory(pd.scratchpad_desc(), eng, bwd_w_scratch_handle.data())});
+        }
+        bwd_w.execute(s, bwd_w_args);
 
 #ifdef _OPENMP
         if (adjusted) {
@@ -1892,6 +1979,17 @@ static Tensor conv2d_cpu_impl(const Tensor& input_arg, const Tensor& weight_arg,
     int64_t W_out = (W_in + pW_left + pW_right - dW * (kW - 1) - 1) / sW + 1;
     
     if (H_out <= 0 || W_out <= 0) TP_THROW(RuntimeError, "conv2d: Calculated output size is too small");
+
+    if (input.dtype() == DType::Float64) {
+        if (pH_top == pH_bottom && pW_left == pW_right) {
+            return slow_conv2d_forward(input, weight, bias, stride, {pH_top, pW_left},
+                                       dilation, groups, fused_relu);
+        }
+        Tensor padded = constant_pad_nd_cpu(input, {pW_left, pW_right, pH_top, pH_bottom}, Scalar(0.0));
+        Tensor full = slow_conv2d_forward(padded, weight, bias, stride, {0, 0},
+                                          dilation, groups, fused_relu);
+        return full.slice(2, 0, H_out).slice(3, 0, W_out);
+    }
 
     Tensor out = Tensor::empty({N, C_out, H_out, W_out}, input.dtype(), input.device());
     
@@ -2126,12 +2224,22 @@ static Tensor conv2d_cpu_impl(const Tensor& input_arg, const Tensor& weight_arg,
 Tensor conv2d_cpu(const Tensor& input, const Tensor& weight, const Tensor& bias,
                   const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
                   const std::vector<int64_t>& dilation, int64_t groups) {
+    if (conv_is_low_precision(input.dtype())) {
+        return conv2d_cpu_impl(input.to(DType::Float32), weight.to(DType::Float32),
+                               (bias.defined() && bias.numel() > 0) ? bias.to(DType::Float32) : bias,
+                               stride, padding, dilation, groups, false).to(input.dtype());
+    }
     return conv2d_cpu_impl(input, weight, bias, stride, padding, dilation, groups, false);
 }
 
 Tensor conv2d_relu_cpu(const Tensor& input, const Tensor& weight, const Tensor& bias,
                        const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
                        const std::vector<int64_t>& dilation, int64_t groups) {
+    if (conv_is_low_precision(input.dtype())) {
+        return conv2d_cpu_impl(input.to(DType::Float32), weight.to(DType::Float32),
+                               (bias.defined() && bias.numel() > 0) ? bias.to(DType::Float32) : bias,
+                               stride, padding, dilation, groups, true).to(input.dtype());
+    }
     return conv2d_cpu_impl(input, weight, bias, stride, padding, dilation, groups, true);
 }
 
@@ -2160,6 +2268,12 @@ Tensor conv3d_cpu(const Tensor& input_arg, const Tensor& weight_arg, const Tenso
     Tensor weight = weight_arg.is_contiguous() ? weight_arg : weight_arg.clone();
 
     if (input.dim() != 5 || weight.dim() != 5) TP_THROW(RuntimeError, "conv3d: Expected 5D input and weight");
+
+    if (conv_is_low_precision(input.dtype())) {
+        return conv3d_cpu(input.to(DType::Float32), weight.to(DType::Float32),
+                          (bias.defined() && bias.numel() > 0) ? bias.to(DType::Float32) : bias,
+                          stride_arg, padding_arg, dilation_arg, groups).to(input.dtype());
+    }
     
     int64_t N = input.size(0);
     int64_t C_in = input.size(1);
@@ -2184,8 +2298,12 @@ Tensor conv3d_cpu(const Tensor& input_arg, const Tensor& weight_arg, const Tenso
     int64_t D_out = (D_in + 2 * pD - dD * (kD - 1) - 1) / sD + 1;
     int64_t H_out = (H_in + 2 * pH - dH * (kH - 1) - 1) / sH + 1;
     int64_t W_out = (W_in + 2 * pW - dW * (kW - 1) - 1) / sW + 1;
-    
+
     if (D_out <= 0 || H_out <= 0 || W_out <= 0) TP_THROW(RuntimeError, "conv3d: Calculated output size is too small");
+
+    if (input.dtype() == DType::Float64) {
+        return slow_conv3d_forward(input, weight, bias, stride, padding, dilation, groups);
+    }
 
     Tensor out = Tensor::empty({N, C_out, D_out, H_out, W_out}, input.dtype(), input.device());
     
@@ -2301,7 +2419,21 @@ Tensor conv_transpose2d_cpu(const Tensor& input, const Tensor& weight, const Ten
     // Input: (N, C_in, H_in, W_in)
     // Weight: (C_in, C_out/groups, kH, kW) - NOTE: Inverted compared to conv2d!
     // Output: (N, C_out, H_out, W_out)
-    
+    if (conv_is_low_precision(input.dtype())) {
+        return conv_transpose2d_cpu(input.to(DType::Float32), weight.to(DType::Float32),
+                                    (bias.defined() && bias.numel() > 0) ? bias.to(DType::Float32) : bias,
+                                    stride_arg, padding_arg, output_padding_arg, groups,
+                                    dilation_arg).to(input.dtype());
+    }
+    if (input.dtype() == DType::Float64) {
+        auto stride = expand_param(stride_arg, 2, "stride");
+        auto padding = expand_param(padding_arg, 2, "padding");
+        auto output_padding = expand_param(output_padding_arg, 2, "output_padding");
+        auto dilation = expand_param(dilation_arg, 2, "dilation");
+        return conv_transpose2d_naive(input, weight, bias, stride, padding, output_padding,
+                                      groups, dilation);
+    }
+
     int64_t N = input.size(0);
     int64_t C_in = input.size(1);
     int64_t H_in = input.size(2);
@@ -2400,6 +2532,21 @@ Tensor conv_transpose2d_cpu(const Tensor& input, const Tensor& weight, const Ten
 
 Tensor conv_transpose3d_cpu(const Tensor& input, const Tensor& weight, const Tensor& bias, const std::vector<int64_t>& stride_arg, const std::vector<int64_t>& padding_arg, const std::vector<int64_t>& output_padding_arg, int64_t groups, const std::vector<int64_t>& dilation_arg) {
     if (input.dim() != 5 || weight.dim() != 5) TP_THROW(RuntimeError, "conv_transpose3d: Expected 5D input and weight");
+
+    if (conv_is_low_precision(input.dtype())) {
+        return conv_transpose3d_cpu(input.to(DType::Float32), weight.to(DType::Float32),
+                                    (bias.defined() && bias.numel() > 0) ? bias.to(DType::Float32) : bias,
+                                    stride_arg, padding_arg, output_padding_arg, groups,
+                                    dilation_arg).to(input.dtype());
+    }
+    if (input.dtype() == DType::Float64) {
+        auto stride = expand_param(stride_arg, 3, "stride");
+        auto padding = expand_param(padding_arg, 3, "padding");
+        auto output_padding = expand_param(output_padding_arg, 3, "output_padding");
+        auto dilation = expand_param(dilation_arg, 3, "dilation");
+        return conv_transpose3d_naive(input, weight, bias, stride, padding, output_padding,
+                                      groups, dilation);
+    }
 
     int64_t N = input.size(0);
     int64_t C_in = input.size(1);
@@ -2508,7 +2655,18 @@ Tensor conv2d_grad_input_cpu(const Tensor& grad_output, const Tensor& input, con
     // grad_output: (N, C_out, H_out, W_out)
     // weight: (C_out, C_in_group, kH, kW)
     // input: Used only for shape (N, C_in, H_in, W_in)
-    
+    if (conv_is_low_precision(grad_output.dtype())) {
+        return conv2d_grad_input_cpu(grad_output.to(DType::Float32), input.to(DType::Float32),
+                                     weight.to(DType::Float32),
+                                     stride_arg, padding_arg, dilation_arg, groups).to(grad_output.dtype());
+    }
+    if (grad_output.dtype() == DType::Float64) {
+        auto stride = expand_param(stride_arg, 2, "stride");
+        auto padding = expand_param(padding_arg, 2, "padding");
+        auto dilation = expand_param(dilation_arg, 2, "dilation");
+        return slow_conv2d_grad_input(grad_output, input, weight, stride, padding, dilation, groups);
+    }
+
     int64_t N = input.size(0);
     int64_t C_in = input.size(1);
     int64_t H_in = input.size(2);
@@ -2640,6 +2798,17 @@ Tensor conv2d_grad_input_cpu(const Tensor& grad_output, const Tensor& input, con
 }
 
 Tensor conv2d_grad_weight_cpu(const Tensor& grad_output, const Tensor& input, const Tensor& weight, const std::vector<int64_t>& stride_arg, const std::vector<int64_t>& padding_arg, const std::vector<int64_t>& dilation_arg, int64_t groups) {
+    if (conv_is_low_precision(grad_output.dtype())) {
+        return conv2d_grad_weight_cpu(grad_output.to(DType::Float32), input.to(DType::Float32),
+                                      weight.to(DType::Float32),
+                                      stride_arg, padding_arg, dilation_arg, groups).to(grad_output.dtype());
+    }
+    if (grad_output.dtype() == DType::Float64) {
+        auto stride = expand_param(stride_arg, 2, "stride");
+        auto padding = expand_param(padding_arg, 2, "padding");
+        auto dilation = expand_param(dilation_arg, 2, "dilation");
+        return slow_conv2d_grad_weight(grad_output, input, weight, stride, padding, dilation, groups);
+    }
     Tensor grad_output_contig = grad_output.contiguous();
     Tensor input_contig = input.contiguous();
     
@@ -2801,6 +2970,14 @@ Tensor conv2d_grad_weight_cpu(const Tensor& grad_output, const Tensor& input, co
 #include <iostream>
 
 Tensor conv2d_grad_bias_cpu(const Tensor& grad_output, const Tensor& input, const Tensor& weight, const std::vector<int64_t>& stride_arg, const std::vector<int64_t>& padding_arg, const std::vector<int64_t>& dilation_arg, int64_t groups) {
+    if (conv_is_low_precision(grad_output.dtype())) {
+        return conv2d_grad_bias_cpu(grad_output.to(DType::Float32), input.to(DType::Float32),
+                                    weight.to(DType::Float32),
+                                    stride_arg, padding_arg, dilation_arg, groups).to(grad_output.dtype());
+    }
+    if (grad_output.dtype() == DType::Float64) {
+        return conv_grad_bias_generic<double>(grad_output);
+    }
     int64_t N = grad_output.size(0);
     int64_t C_out = grad_output.size(1);
     int64_t H_out = grad_output.size(2);
@@ -2873,6 +3050,17 @@ Tensor conv1d_grad_bias_cpu(const Tensor& grad_output, const Tensor& input, cons
 
 // Conv3d Backward
 Tensor conv3d_grad_input_cpu(const Tensor& grad_output, const Tensor& input, const Tensor& weight, const std::vector<int64_t>& stride_arg, const std::vector<int64_t>& padding_arg, const std::vector<int64_t>& dilation_arg, int64_t groups) {
+    if (conv_is_low_precision(grad_output.dtype())) {
+        return conv3d_grad_input_cpu(grad_output.to(DType::Float32), input.to(DType::Float32),
+                                     weight.to(DType::Float32),
+                                     stride_arg, padding_arg, dilation_arg, groups).to(grad_output.dtype());
+    }
+    if (grad_output.dtype() == DType::Float64) {
+        auto stride = expand_param(stride_arg, 3, "stride");
+        auto padding = expand_param(padding_arg, 3, "padding");
+        auto dilation = expand_param(dilation_arg, 3, "dilation");
+        return slow_conv3d_grad_input(grad_output, input, weight, stride, padding, dilation, groups);
+    }
     int64_t N = input.size(0);
     int64_t C_in = input.size(1);
     int64_t D_in = input.size(2);
@@ -2939,6 +3127,17 @@ Tensor conv3d_grad_input_cpu(const Tensor& grad_output, const Tensor& input, con
 }
 
 Tensor conv3d_grad_weight_cpu(const Tensor& grad_output, const Tensor& input, const Tensor& weight, const std::vector<int64_t>& stride_arg, const std::vector<int64_t>& padding_arg, const std::vector<int64_t>& dilation_arg, int64_t groups) {
+    if (conv_is_low_precision(grad_output.dtype())) {
+        return conv3d_grad_weight_cpu(grad_output.to(DType::Float32), input.to(DType::Float32),
+                                      weight.to(DType::Float32),
+                                      stride_arg, padding_arg, dilation_arg, groups).to(grad_output.dtype());
+    }
+    if (grad_output.dtype() == DType::Float64) {
+        auto stride = expand_param(stride_arg, 3, "stride");
+        auto padding = expand_param(padding_arg, 3, "padding");
+        auto dilation = expand_param(dilation_arg, 3, "dilation");
+        return slow_conv3d_grad_weight(grad_output, input, weight, stride, padding, dilation, groups);
+    }
     Tensor grad_output_contig = grad_output.is_contiguous() ? grad_output : grad_output.clone();
     Tensor input_contig = input.is_contiguous() ? input : input.clone();
     
@@ -3005,6 +3204,14 @@ Tensor conv3d_grad_weight_cpu(const Tensor& grad_output, const Tensor& input, co
 }
 
 Tensor conv3d_grad_bias_cpu(const Tensor& grad_output, const Tensor& input, const Tensor& weight, const std::vector<int64_t>& stride_arg, const std::vector<int64_t>& padding_arg, const std::vector<int64_t>& dilation_arg, int64_t groups) {
+    if (conv_is_low_precision(grad_output.dtype())) {
+        return conv3d_grad_bias_cpu(grad_output.to(DType::Float32), input.to(DType::Float32),
+                                    weight.to(DType::Float32),
+                                    stride_arg, padding_arg, dilation_arg, groups).to(grad_output.dtype());
+    }
+    if (grad_output.dtype() == DType::Float64) {
+        return conv_grad_bias_generic<double>(grad_output);
+    }
     int64_t N = grad_output.size(0);
     int64_t C_out = grad_output.size(1);
     int64_t D_out = grad_output.size(2);
@@ -3072,6 +3279,884 @@ Tensor conv_transpose3d_grad_bias_cpu(const Tensor& grad_output, const Tensor& i
     return conv3d_grad_bias_cpu(grad_output, input, weight, stride, padding, dilation, groups);
 }
 
+// =========================================================================
+// Conv-family alignment with ATen.
+//
+// * unfold / fold: public im2col / col2im entry points wrap the templates
+//   the conv2d/conv3d fallback already uses; the adjoints mirror aten's
+//   unfold_backward / col2im_backward.
+// * conv_transpose1d: mapped onto conv_transpose2d exactly the way
+//   conv1d_cpu maps onto conv2d (unsqueeze the spatial axis).
+// * dtype coverage mirrors torch CPU: Float64 runs a naive direct
+//   convolution (the aten slow_conv path -- oneDNN has no f64 conv here),
+//   Float16/BFloat16 are computed in Float32 and cast back.
+// =========================================================================
+
+static bool conv_is_low_precision(DType d) {
+    return d == DType::Float16 || d == DType::BFloat16;
+}
+
+// --- naive direct convolution for Float64 ---------------------------------
+
+template <typename T>
+static void slow_conv2d_frame(const T* in, const T* w, const T* bias, T* out,
+                              int64_t C_in, int64_t C_out, int64_t groups,
+                              int64_t H, int64_t W, int64_t kH, int64_t kW,
+                              int64_t sH, int64_t sW, int64_t pH, int64_t pW,
+                              int64_t dH, int64_t dW, int64_t OH, int64_t OW,
+                              bool fused_relu) {
+    const int64_t cg_in = C_in / groups;
+    const int64_t cg_out = C_out / groups;
+    for (int64_t co = 0; co < C_out; ++co) {
+        const int64_t g = co / cg_out;
+        const T* w_co = w + co * cg_in * kH * kW;
+        for (int64_t oh = 0; oh < OH; ++oh) {
+            for (int64_t ow = 0; ow < OW; ++ow) {
+                T acc = bias ? bias[co] : static_cast<T>(0);
+                for (int64_t ci = 0; ci < cg_in; ++ci) {
+                    const T* w_row = w_co + ci * kH * kW;
+                    const T* in_c = in + (g * cg_in + ci) * H * W;
+                    for (int64_t kh = 0; kh < kH; ++kh) {
+                        const int64_t ih = oh * sH - pH + kh * dH;
+                        if (ih < 0 || ih >= H) continue;
+                        for (int64_t kw = 0; kw < kW; ++kw) {
+                            const int64_t iw = ow * sW - pW + kw * dW;
+                            if (iw < 0 || iw >= W) continue;
+                            acc += w_row[kh * kW + kw] * in_c[ih * W + iw];
+                        }
+                    }
+                }
+                if (fused_relu && acc < static_cast<T>(0)) acc = static_cast<T>(0);
+                out[(co * OH + oh) * OW + ow] = acc;
+            }
+        }
+    }
+}
+
+template <typename T>
+static void slow_conv2d_grad_input_frame(const T* go, const T* w, T* gin,
+                                         int64_t C_in, int64_t C_out, int64_t groups,
+                                         int64_t H, int64_t W, int64_t kH, int64_t kW,
+                                         int64_t sH, int64_t sW, int64_t pH, int64_t pW,
+                                         int64_t dH, int64_t dW, int64_t OH, int64_t OW) {
+    const int64_t cg_in = C_in / groups;
+    const int64_t cg_out = C_out / groups;
+    std::memset(gin, 0, C_in * H * W * sizeof(T));
+    for (int64_t co = 0; co < C_out; ++co) {
+        const int64_t g = co / cg_out;
+        const T* w_co = w + co * cg_in * kH * kW;
+        for (int64_t oh = 0; oh < OH; ++oh) {
+            for (int64_t ow = 0; ow < OW; ++ow) {
+                const T go_v = go[(co * OH + oh) * OW + ow];
+                for (int64_t ci = 0; ci < cg_in; ++ci) {
+                    const T* w_row = w_co + ci * kH * kW;
+                    T* gin_c = gin + (g * cg_in + ci) * H * W;
+                    for (int64_t kh = 0; kh < kH; ++kh) {
+                        const int64_t ih = oh * sH - pH + kh * dH;
+                        if (ih < 0 || ih >= H) continue;
+                        for (int64_t kw = 0; kw < kW; ++kw) {
+                            const int64_t iw = ow * sW - pW + kw * dW;
+                            if (iw < 0 || iw >= W) continue;
+                            gin_c[ih * W + iw] += go_v * w_row[kh * kW + kw];
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// One output-channel row of the weight gradient; parallelised over co so
+// distinct threads never touch the same gw slice.
+template <typename T>
+static void slow_conv2d_grad_weight_outchan(int64_t co, int64_t N,
+                                            const T* in, const T* go, T* gw,
+                                            int64_t C_in, int64_t C_out, int64_t groups,
+                                            int64_t H, int64_t W, int64_t kH, int64_t kW,
+                                            int64_t sH, int64_t sW, int64_t pH, int64_t pW,
+                                            int64_t dH, int64_t dW, int64_t OH, int64_t OW) {
+    const int64_t cg_in = C_in / groups;
+    const int64_t cg_out = C_out / groups;
+    const int64_t g = co / cg_out;
+    const int64_t frame_in = C_in * H * W;
+    const int64_t frame_out = C_out * OH * OW;
+    T* gw_co = gw + co * cg_in * kH * kW;
+    std::memset(gw_co, 0, cg_in * kH * kW * sizeof(T));
+    for (int64_t n = 0; n < N; ++n) {
+        const T* in_n = in + n * frame_in;
+        const T* go_n = go + n * frame_out + co * OH * OW;
+        for (int64_t ci = 0; ci < cg_in; ++ci) {
+            const T* in_c = in_n + (g * cg_in + ci) * H * W;
+            T* gw_row = gw_co + ci * kH * kW;
+            for (int64_t kh = 0; kh < kH; ++kh) {
+                for (int64_t kw = 0; kw < kW; ++kw) {
+                    T acc = static_cast<T>(0);
+                    for (int64_t oh = 0; oh < OH; ++oh) {
+                        const int64_t ih = oh * sH - pH + kh * dH;
+                        if (ih < 0 || ih >= H) continue;
+                        for (int64_t ow = 0; ow < OW; ++ow) {
+                            const int64_t iw = ow * sW - pW + kw * dW;
+                            if (iw < 0 || iw >= W) continue;
+                            acc += go_n[oh * OW + ow] * in_c[ih * W + iw];
+                        }
+                    }
+                    gw_row[kh * kW + kw] += acc;
+                }
+            }
+        }
+    }
+}
+
+template <typename T>
+static void slow_conv3d_frame(const T* in, const T* w, const T* bias, T* out,
+                              int64_t C_in, int64_t C_out, int64_t groups,
+                              int64_t D, int64_t H, int64_t W,
+                              int64_t kD, int64_t kH, int64_t kW,
+                              int64_t sD, int64_t sH, int64_t sW,
+                              int64_t pD, int64_t pH, int64_t pW,
+                              int64_t dD, int64_t dH, int64_t dW,
+                              int64_t OD, int64_t OH, int64_t OW) {
+    const int64_t cg_in = C_in / groups;
+    const int64_t cg_out = C_out / groups;
+    for (int64_t co = 0; co < C_out; ++co) {
+        const int64_t g = co / cg_out;
+        const T* w_co = w + co * cg_in * kD * kH * kW;
+        for (int64_t od = 0; od < OD; ++od) {
+            for (int64_t oh = 0; oh < OH; ++oh) {
+                for (int64_t ow = 0; ow < OW; ++ow) {
+                    T acc = bias ? bias[co] : static_cast<T>(0);
+                    for (int64_t ci = 0; ci < cg_in; ++ci) {
+                        const T* w_row = w_co + ci * kD * kH * kW;
+                        const T* in_c = in + (g * cg_in + ci) * D * H * W;
+                        for (int64_t kd = 0; kd < kD; ++kd) {
+                            const int64_t id = od * sD - pD + kd * dD;
+                            if (id < 0 || id >= D) continue;
+                            for (int64_t kh = 0; kh < kH; ++kh) {
+                                const int64_t ih = oh * sH - pH + kh * dH;
+                                if (ih < 0 || ih >= H) continue;
+                                for (int64_t kw = 0; kw < kW; ++kw) {
+                                    const int64_t iw = ow * sW - pW + kw * dW;
+                                    if (iw < 0 || iw >= W) continue;
+                                    acc += w_row[(kd * kH + kh) * kW + kw] *
+                                           in_c[(id * H + ih) * W + iw];
+                                }
+                            }
+                        }
+                    }
+                    out[((co * OD + od) * OH + oh) * OW + ow] = acc;
+                }
+            }
+        }
+    }
+}
+
+template <typename T>
+static void slow_conv3d_grad_input_frame(const T* go, const T* w, T* gin,
+                                         int64_t C_in, int64_t C_out, int64_t groups,
+                                         int64_t D, int64_t H, int64_t W,
+                                         int64_t kD, int64_t kH, int64_t kW,
+                                         int64_t sD, int64_t sH, int64_t sW,
+                                         int64_t pD, int64_t pH, int64_t pW,
+                                         int64_t dD, int64_t dH, int64_t dW,
+                                         int64_t OD, int64_t OH, int64_t OW) {
+    const int64_t cg_in = C_in / groups;
+    const int64_t cg_out = C_out / groups;
+    std::memset(gin, 0, C_in * D * H * W * sizeof(T));
+    for (int64_t co = 0; co < C_out; ++co) {
+        const int64_t g = co / cg_out;
+        const T* w_co = w + co * cg_in * kD * kH * kW;
+        for (int64_t od = 0; od < OD; ++od) {
+            for (int64_t oh = 0; oh < OH; ++oh) {
+                for (int64_t ow = 0; ow < OW; ++ow) {
+                    const T go_v = go[((co * OD + od) * OH + oh) * OW + ow];
+                    for (int64_t ci = 0; ci < cg_in; ++ci) {
+                        const T* w_row = w_co + ci * kD * kH * kW;
+                        T* gin_c = gin + (g * cg_in + ci) * D * H * W;
+                        for (int64_t kd = 0; kd < kD; ++kd) {
+                            const int64_t id = od * sD - pD + kd * dD;
+                            if (id < 0 || id >= D) continue;
+                            for (int64_t kh = 0; kh < kH; ++kh) {
+                                const int64_t ih = oh * sH - pH + kh * dH;
+                                if (ih < 0 || ih >= H) continue;
+                                for (int64_t kw = 0; kw < kW; ++kw) {
+                                    const int64_t iw = ow * sW - pW + kw * dW;
+                                    if (iw < 0 || iw >= W) continue;
+                                    gin_c[(id * H + ih) * W + iw] +=
+                                        go_v * w_row[(kd * kH + kh) * kW + kw];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+template <typename T>
+static void slow_conv3d_grad_weight_outchan(int64_t co, int64_t N,
+                                            const T* in, const T* go, T* gw,
+                                            int64_t C_in, int64_t C_out, int64_t groups,
+                                            int64_t D, int64_t H, int64_t W,
+                                            int64_t kD, int64_t kH, int64_t kW,
+                                            int64_t sD, int64_t sH, int64_t sW,
+                                            int64_t pD, int64_t pH, int64_t pW,
+                                            int64_t dD, int64_t dH, int64_t dW,
+                                            int64_t OD, int64_t OH, int64_t OW) {
+    const int64_t cg_in = C_in / groups;
+    const int64_t cg_out = C_out / groups;
+    const int64_t g = co / cg_out;
+    const int64_t frame_in = C_in * D * H * W;
+    const int64_t frame_out = C_out * OD * OH * OW;
+    T* gw_co = gw + co * cg_in * kD * kH * kW;
+    std::memset(gw_co, 0, cg_in * kD * kH * kW * sizeof(T));
+    for (int64_t n = 0; n < N; ++n) {
+        const T* in_n = in + n * frame_in;
+        const T* go_n = go + n * frame_out + co * OD * OH * OW;
+        for (int64_t ci = 0; ci < cg_in; ++ci) {
+            const T* in_c = in_n + (g * cg_in + ci) * D * H * W;
+            T* gw_row = gw_co + ci * kD * kH * kW;
+            for (int64_t kd = 0; kd < kD; ++kd) {
+                for (int64_t kh = 0; kh < kH; ++kh) {
+                    for (int64_t kw = 0; kw < kW; ++kw) {
+                        T acc = static_cast<T>(0);
+                        for (int64_t od = 0; od < OD; ++od) {
+                            const int64_t id = od * sD - pD + kd * dD;
+                            if (id < 0 || id >= D) continue;
+                            for (int64_t oh = 0; oh < OH; ++oh) {
+                                const int64_t ih = oh * sH - pH + kh * dH;
+                                if (ih < 0 || ih >= H) continue;
+                                for (int64_t ow = 0; ow < OW; ++ow) {
+                                    const int64_t iw = ow * sW - pW + kw * dW;
+                                    if (iw < 0 || iw >= W) continue;
+                                    acc += go_n[(od * OH + oh) * OW + ow] *
+                                           in_c[(id * H + ih) * W + iw];
+                                }
+                            }
+                        }
+                        gw_row[(kd * kH + kh) * kW + kw] += acc;
+                    }
+                }
+            }
+        }
+    }
+}
+
+template <typename T>
+static void conv_transpose2d_naive_frame(const T* in, const T* w, const T* bias, T* out,
+                                         int64_t C_in, int64_t C_out_group, int64_t groups,
+                                         int64_t H_in, int64_t W_in, int64_t kH, int64_t kW,
+                                         int64_t sH, int64_t sW, int64_t pH, int64_t pW,
+                                         int64_t dH, int64_t dW,
+                                         int64_t H_out, int64_t W_out) {
+    const int64_t C_in_group = C_in / groups;
+    const int64_t C_out = C_out_group * groups;
+    const int64_t out_frame = C_out * H_out * W_out;
+    if (bias) {
+        for (int64_t c = 0; c < C_out; ++c) {
+            T b = bias[c];
+            T* out_c = out + c * H_out * W_out;
+            for (int64_t i = 0; i < H_out * W_out; ++i) out_c[i] = b;
+        }
+    } else {
+        std::memset(out, 0, out_frame * sizeof(T));
+    }
+    for (int64_t g = 0; g < groups; ++g) {
+        for (int64_t ci = 0; ci < C_in_group; ++ci) {
+            const int64_t c_in = g * C_in_group + ci;
+            const T* in_c = in + c_in * H_in * W_in;
+            const T* w_c = w + c_in * C_out_group * kH * kW;
+            for (int64_t h_in = 0; h_in < H_in; ++h_in) {
+                for (int64_t w_in = 0; w_in < W_in; ++w_in) {
+                    const T v = in_c[h_in * W_in + w_in];
+                    for (int64_t co_i = 0; co_i < C_out_group; ++co_i) {
+                        T* out_co = out + (g * C_out_group + co_i) * H_out * W_out;
+                        const T* w_co = w_c + co_i * kH * kW;
+                        for (int64_t kh = 0; kh < kH; ++kh) {
+                            const int64_t h_out = h_in * sH + kh * dH - pH;
+                            if (h_out < 0 || h_out >= H_out) continue;
+                            for (int64_t kw = 0; kw < kW; ++kw) {
+                                const int64_t w_out = w_in * sW + kw * dW - pW;
+                                if (w_out < 0 || w_out >= W_out) continue;
+                                out_co[h_out * W_out + w_out] += v * w_co[kh * kW + kw];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+template <typename T>
+static void conv_transpose3d_naive_frame(const T* in, const T* w, const T* bias, T* out,
+                                         int64_t C_in, int64_t C_out_group, int64_t groups,
+                                         int64_t D_in, int64_t H_in, int64_t W_in,
+                                         int64_t kD, int64_t kH, int64_t kW,
+                                         int64_t sD, int64_t sH, int64_t sW,
+                                         int64_t pD, int64_t pH, int64_t pW,
+                                         int64_t dD, int64_t dH, int64_t dW,
+                                         int64_t D_out, int64_t H_out, int64_t W_out) {
+    const int64_t C_in_group = C_in / groups;
+    const int64_t C_out = C_out_group * groups;
+    const int64_t out_spatial = D_out * H_out * W_out;
+    if (bias) {
+        for (int64_t c = 0; c < C_out; ++c) {
+            T b = bias[c];
+            T* out_c = out + c * out_spatial;
+            for (int64_t i = 0; i < out_spatial; ++i) out_c[i] = b;
+        }
+    } else {
+        std::memset(out, 0, C_out * out_spatial * sizeof(T));
+    }
+    for (int64_t g = 0; g < groups; ++g) {
+        for (int64_t ci = 0; ci < C_in_group; ++ci) {
+            const int64_t c_in = g * C_in_group + ci;
+            const T* in_c = in + c_in * D_in * H_in * W_in;
+            const T* w_c = w + c_in * C_out_group * kD * kH * kW;
+            for (int64_t d_in = 0; d_in < D_in; ++d_in) {
+                for (int64_t h_in = 0; h_in < H_in; ++h_in) {
+                    for (int64_t w_in = 0; w_in < W_in; ++w_in) {
+                        const T v = in_c[(d_in * H_in + h_in) * W_in + w_in];
+                        for (int64_t co_i = 0; co_i < C_out_group; ++co_i) {
+                            T* out_co = out + (g * C_out_group + co_i) * out_spatial;
+                            const T* w_co = w_c + co_i * kD * kH * kW;
+                            for (int64_t kd = 0; kd < kD; ++kd) {
+                                const int64_t d_out = d_in * sD + kd * dD - pD;
+                                if (d_out < 0 || d_out >= D_out) continue;
+                                for (int64_t kh = 0; kh < kH; ++kh) {
+                                    const int64_t h_out = h_in * sH + kh * dH - pH;
+                                    if (h_out < 0 || h_out >= H_out) continue;
+                                    for (int64_t kw = 0; kw < kW; ++kw) {
+                                        const int64_t w_out = w_in * sW + kw * dW - pW;
+                                        if (w_out < 0 || w_out >= W_out) continue;
+                                        out_co[(d_out * H_out + h_out) * W_out + w_out] +=
+                                            v * w_co[(kd * kH + kh) * kW + kw];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// --- public Float64 / low-precision entry glue ------------------------------
+
+static Tensor slow_conv2d_forward(const Tensor& input, const Tensor& weight, const Tensor& bias,
+                                  const std::vector<int64_t>& stride,
+                                  const std::vector<int64_t>& padding,
+                                  const std::vector<int64_t>& dilation,
+                                  int64_t groups, bool fused_relu) {
+    const int64_t N = input.size(0), C_in = input.size(1), H = input.size(2), W = input.size(3);
+    const int64_t C_out = weight.size(0), cg_in = weight.size(1);
+    const int64_t kH = weight.size(2), kW = weight.size(3);
+    const int64_t OH = (H + 2 * padding[0] - dilation[0] * (kH - 1) - 1) / stride[0] + 1;
+    const int64_t OW = (W + 2 * padding[1] - dilation[1] * (kW - 1) - 1) / stride[1] + 1;
+    Tensor out = Tensor::empty({N, C_out, OH, OW}, input.dtype(), input.device());
+    const double* in_p = input.data_ptr<double>();
+    const double* w_p = weight.data_ptr<double>();
+    const double* b_p = (bias.defined() && bias.numel() > 0) ? bias.data_ptr<double>() : nullptr;
+    double* out_p = out.data_ptr<double>();
+    const int64_t frame = C_in * H * W, out_frame = C_out * OH * OW;
+    parallel_for(0, N, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        for (int64_t n = begin; n < end; ++n)
+            slow_conv2d_frame<double>(in_p + n * frame, w_p, b_p, out_p + n * out_frame,
+                                      C_in, C_out, groups, H, W, kH, kW,
+                                      stride[0], stride[1], padding[0], padding[1],
+                                      dilation[0], dilation[1], OH, OW, fused_relu);
+    });
+    return out;
+}
+
+static Tensor slow_conv2d_grad_input(const Tensor& grad_output, const Tensor& input, const Tensor& weight,
+                                     const std::vector<int64_t>& stride,
+                                     const std::vector<int64_t>& padding,
+                                     const std::vector<int64_t>& dilation,
+                                     int64_t groups) {
+    const int64_t N = input.size(0), C_in = input.size(1), H = input.size(2), W = input.size(3);
+    const int64_t C_out = weight.size(0), kH = weight.size(2), kW = weight.size(3);
+    const int64_t OH = grad_output.size(2), OW = grad_output.size(3);
+    Tensor gin = Tensor::empty(input.shape(), input.dtype(), input.device());
+    const double* go_p = grad_output.data_ptr<double>();
+    const double* w_p = weight.data_ptr<double>();
+    double* gin_p = gin.data_ptr<double>();
+    const int64_t frame = C_in * H * W, out_frame = C_out * OH * OW;
+    parallel_for(0, N, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        for (int64_t n = begin; n < end; ++n)
+            slow_conv2d_grad_input_frame<double>(go_p + n * out_frame, w_p, gin_p + n * frame,
+                                                 C_in, C_out, groups, H, W, kH, kW,
+                                                 stride[0], stride[1], padding[0], padding[1],
+                                                 dilation[0], dilation[1], OH, OW);
+    });
+    return gin;
+}
+
+static Tensor slow_conv2d_grad_weight(const Tensor& grad_output, const Tensor& input, const Tensor& weight,
+                                      const std::vector<int64_t>& stride,
+                                      const std::vector<int64_t>& padding,
+                                      const std::vector<int64_t>& dilation,
+                                      int64_t groups) {
+    const int64_t N = input.size(0), C_in = input.size(1), H = input.size(2), W = input.size(3);
+    const int64_t C_out = weight.size(0), kH = weight.size(2), kW = weight.size(3);
+    const int64_t OH = grad_output.size(2), OW = grad_output.size(3);
+    Tensor gw = Tensor::zeros(weight.shape(), weight.dtype(), weight.device());
+    const double* go_p = grad_output.data_ptr<double>();
+    const double* in_p = input.data_ptr<double>();
+    double* gw_p = gw.data_ptr<double>();
+    parallel_for(0, C_out, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        for (int64_t co = begin; co < end; ++co)
+            slow_conv2d_grad_weight_outchan<double>(co, N, in_p, go_p, gw_p,
+                                                    C_in, C_out, groups, H, W, kH, kW,
+                                                    stride[0], stride[1], padding[0], padding[1],
+                                                    dilation[0], dilation[1], OH, OW);
+    });
+    return gw;
+}
+
+static Tensor slow_conv3d_forward(const Tensor& input, const Tensor& weight, const Tensor& bias,
+                                  const std::vector<int64_t>& stride,
+                                  const std::vector<int64_t>& padding,
+                                  const std::vector<int64_t>& dilation,
+                                  int64_t groups) {
+    const int64_t N = input.size(0), C_in = input.size(1);
+    const int64_t D = input.size(2), H = input.size(3), W = input.size(4);
+    const int64_t C_out = weight.size(0);
+    const int64_t kD = weight.size(2), kH = weight.size(3), kW = weight.size(4);
+    const int64_t OD = (D + 2 * padding[0] - dilation[0] * (kD - 1) - 1) / stride[0] + 1;
+    const int64_t OH = (H + 2 * padding[1] - dilation[1] * (kH - 1) - 1) / stride[1] + 1;
+    const int64_t OW = (W + 2 * padding[2] - dilation[2] * (kW - 1) - 1) / stride[2] + 1;
+    Tensor out = Tensor::empty({N, C_out, OD, OH, OW}, input.dtype(), input.device());
+    const double* in_p = input.data_ptr<double>();
+    const double* w_p = weight.data_ptr<double>();
+    const double* b_p = (bias.defined() && bias.numel() > 0) ? bias.data_ptr<double>() : nullptr;
+    double* out_p = out.data_ptr<double>();
+    const int64_t frame = C_in * D * H * W, out_frame = C_out * OD * OH * OW;
+    parallel_for(0, N, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        for (int64_t n = begin; n < end; ++n)
+            slow_conv3d_frame<double>(in_p + n * frame, w_p, b_p, out_p + n * out_frame,
+                                      C_in, C_out, groups, D, H, W, kD, kH, kW,
+                                      stride[0], stride[1], stride[2],
+                                      padding[0], padding[1], padding[2],
+                                      dilation[0], dilation[1], dilation[2],
+                                      OD, OH, OW);
+    });
+    return out;
+}
+
+static Tensor slow_conv3d_grad_input(const Tensor& grad_output, const Tensor& input, const Tensor& weight,
+                                     const std::vector<int64_t>& stride,
+                                     const std::vector<int64_t>& padding,
+                                     const std::vector<int64_t>& dilation,
+                                     int64_t groups) {
+    const int64_t N = input.size(0), C_in = input.size(1);
+    const int64_t D = input.size(2), H = input.size(3), W = input.size(4);
+    const int64_t C_out = weight.size(0);
+    const int64_t kD = weight.size(2), kH = weight.size(3), kW = weight.size(4);
+    const int64_t OD = grad_output.size(2), OH = grad_output.size(3), OW = grad_output.size(4);
+    Tensor gin = Tensor::empty(input.shape(), input.dtype(), input.device());
+    const double* go_p = grad_output.data_ptr<double>();
+    const double* w_p = weight.data_ptr<double>();
+    double* gin_p = gin.data_ptr<double>();
+    const int64_t frame = C_in * D * H * W, out_frame = C_out * OD * OH * OW;
+    parallel_for(0, N, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        for (int64_t n = begin; n < end; ++n)
+            slow_conv3d_grad_input_frame<double>(go_p + n * out_frame, w_p, gin_p + n * frame,
+                                                 C_in, C_out, groups, D, H, W, kD, kH, kW,
+                                                 stride[0], stride[1], stride[2],
+                                                 padding[0], padding[1], padding[2],
+                                                 dilation[0], dilation[1], dilation[2],
+                                                 OD, OH, OW);
+    });
+    return gin;
+}
+
+static Tensor slow_conv3d_grad_weight(const Tensor& grad_output, const Tensor& input, const Tensor& weight,
+                                      const std::vector<int64_t>& stride,
+                                      const std::vector<int64_t>& padding,
+                                      const std::vector<int64_t>& dilation,
+                                      int64_t groups) {
+    const int64_t N = input.size(0), C_in = input.size(1);
+    const int64_t D = input.size(2), H = input.size(3), W = input.size(4);
+    const int64_t C_out = weight.size(0);
+    const int64_t kD = weight.size(2), kH = weight.size(3), kW = weight.size(4);
+    const int64_t OD = grad_output.size(2), OH = grad_output.size(3), OW = grad_output.size(4);
+    Tensor gw = Tensor::zeros(weight.shape(), weight.dtype(), weight.device());
+    const double* go_p = grad_output.data_ptr<double>();
+    const double* in_p = input.data_ptr<double>();
+    double* gw_p = gw.data_ptr<double>();
+    parallel_for(0, C_out, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        for (int64_t co = begin; co < end; ++co)
+            slow_conv3d_grad_weight_outchan<double>(co, N, in_p, go_p, gw_p,
+                                                    C_in, C_out, groups, D, H, W, kD, kH, kW,
+                                                    stride[0], stride[1], stride[2],
+                                                    padding[0], padding[1], padding[2],
+                                                    dilation[0], dilation[1], dilation[2],
+                                                    OD, OH, OW);
+    });
+    return gw;
+}
+
+static Tensor conv_transpose2d_naive(const Tensor& input_arg, const Tensor& weight_arg, const Tensor& bias,
+                                     const std::vector<int64_t>& stride,
+                                     const std::vector<int64_t>& padding,
+                                     const std::vector<int64_t>& output_padding,
+                                     int64_t groups, const std::vector<int64_t>& dilation) {
+    Tensor input = input_arg.is_contiguous() ? input_arg : input_arg.clone();
+    Tensor weight = weight_arg.is_contiguous() ? weight_arg : weight_arg.clone();
+    const int64_t N = input.size(0), C_in = input.size(1), H_in = input.size(2), W_in = input.size(3);
+    const int64_t C_out_group = weight.size(1), kH = weight.size(2), kW = weight.size(3);
+    const int64_t C_out = C_out_group * groups;
+    const int64_t H_out = (H_in - 1) * stride[0] - 2 * padding[0] + dilation[0] * (kH - 1) + output_padding[0] + 1;
+    const int64_t W_out = (W_in - 1) * stride[1] - 2 * padding[1] + dilation[1] * (kW - 1) + output_padding[1] + 1;
+    Tensor out = Tensor::zeros({N, C_out, H_out, W_out}, input.dtype(), input.device());
+    const double* in_p = input.data_ptr<double>();
+    const double* w_p = weight.data_ptr<double>();
+    const double* b_p = (bias.defined() && bias.numel() > 0) ? bias.data_ptr<double>() : nullptr;
+    double* out_p = out.data_ptr<double>();
+    const int64_t frame = C_in * H_in * W_in, out_frame = C_out * H_out * W_out;
+    parallel_for(0, N, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        for (int64_t n = begin; n < end; ++n)
+            conv_transpose2d_naive_frame<double>(in_p + n * frame, w_p, b_p, out_p + n * out_frame,
+                                                 C_in, C_out_group, groups, H_in, W_in, kH, kW,
+                                                 stride[0], stride[1], padding[0], padding[1],
+                                                 dilation[0], dilation[1], H_out, W_out);
+    });
+    return out;
+}
+
+static Tensor conv_transpose3d_naive(const Tensor& input_arg, const Tensor& weight_arg, const Tensor& bias,
+                                     const std::vector<int64_t>& stride,
+                                     const std::vector<int64_t>& padding,
+                                     const std::vector<int64_t>& output_padding,
+                                     int64_t groups, const std::vector<int64_t>& dilation) {
+    Tensor input = input_arg.is_contiguous() ? input_arg : input_arg.clone();
+    Tensor weight = weight_arg.is_contiguous() ? weight_arg : weight_arg.clone();
+    const int64_t N = input.size(0), C_in = input.size(1);
+    const int64_t D_in = input.size(2), H_in = input.size(3), W_in = input.size(4);
+    const int64_t C_out_group = weight.size(1);
+    const int64_t kD = weight.size(2), kH = weight.size(3), kW = weight.size(4);
+    const int64_t C_out = C_out_group * groups;
+    const int64_t D_out = (D_in - 1) * stride[0] - 2 * padding[0] + dilation[0] * (kD - 1) + output_padding[0] + 1;
+    const int64_t H_out = (H_in - 1) * stride[1] - 2 * padding[1] + dilation[1] * (kH - 1) + output_padding[1] + 1;
+    const int64_t W_out = (W_in - 1) * stride[2] - 2 * padding[2] + dilation[2] * (kW - 1) + output_padding[2] + 1;
+    Tensor out = Tensor::zeros({N, C_out, D_out, H_out, W_out}, input.dtype(), input.device());
+    const double* in_p = input.data_ptr<double>();
+    const double* w_p = weight.data_ptr<double>();
+    const double* b_p = (bias.defined() && bias.numel() > 0) ? bias.data_ptr<double>() : nullptr;
+    double* out_p = out.data_ptr<double>();
+    const int64_t frame = C_in * D_in * H_in * W_in, out_frame = C_out * D_out * H_out * W_out;
+    parallel_for(0, N, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        for (int64_t n = begin; n < end; ++n)
+            conv_transpose3d_naive_frame<double>(in_p + n * frame, w_p, b_p, out_p + n * out_frame,
+                                                 C_in, C_out_group, groups, D_in, H_in, W_in,
+                                                 kD, kH, kW,
+                                                 stride[0], stride[1], stride[2],
+                                                 padding[0], padding[1], padding[2],
+                                                 dilation[0], dilation[1], dilation[2],
+                                                 D_out, H_out, W_out);
+    });
+    return out;
+}
+
+// Generic bias-grad reduction over (N, spatial); works for every dtype that
+// has a C++ scalar type.
+template <typename T>
+static Tensor conv_grad_bias_generic(const Tensor& grad_output) {
+    const int64_t N = grad_output.size(0);
+    const int64_t C_out = grad_output.size(1);
+    const int64_t spatial = grad_output.numel() / (N * C_out);
+    Tensor gb = Tensor::zeros({C_out}, grad_output.dtype(), grad_output.device());
+    Tensor go_c = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
+    const T* go_p = go_c.data_ptr<T>();
+    T* gb_p = gb.data_ptr<T>();
+    parallel_for(0, C_out, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        for (int64_t c = begin; c < end; ++c) {
+            double sum = 0.0;
+            for (int64_t n = 0; n < N; ++n) {
+                const T* ptr = go_p + (n * C_out + c) * spatial;
+                for (int64_t i = 0; i < spatial; ++i) sum += static_cast<double>(ptr[i]);
+            }
+            gb_p[c] = static_cast<T>(sum);
+        }
+    });
+    return gb;
+}
+
+// torch's CPU conv computes fp16/bf16 operands in float32 and stores back;
+// mirror that by upcasting around the Float32 path.
+
+// --- unfold / fold (aten im2col / col2im) -----------------------------------
+
+static void im2col_check_args(const char* op, const Tensor& input,
+                              const std::vector<int64_t>& kernel_size,
+                              const std::vector<int64_t>& dilation,
+                              const std::vector<int64_t>& padding,
+                              const std::vector<int64_t>& stride) {
+    if (kernel_size.size() != 2) TP_THROW(ValueError, op, ": kernel_size must have 2 elements");
+    if (dilation.size() != 2) TP_THROW(ValueError, op, ": dilation must have 2 elements");
+    if (padding.size() != 2) TP_THROW(ValueError, op, ": padding must have 2 elements");
+    if (stride.size() != 2) TP_THROW(ValueError, op, ": stride must have 2 elements");
+    if (input.dim() != 3 && input.dim() != 4)
+        TP_THROW(ValueError, op, ": expected 3D (unbatched) or 4D input, got ", input.dim(), "D");
+}
+
+Tensor im2col_cpu(const Tensor& self, const std::vector<int64_t>& kernel_size,
+                  const std::vector<int64_t>& dilation,
+                  const std::vector<int64_t>& padding,
+                  const std::vector<int64_t>& stride) {
+    im2col_check_args("im2col", self, kernel_size, dilation, padding, stride);
+    Tensor input = self.is_contiguous() ? self : self.clone();
+    const bool batched = input.dim() == 4;
+    const int64_t b = batched ? 1 : 0;
+    const int64_t N = batched ? input.size(0) : 1;
+    const int64_t C = input.size(b);
+    const int64_t H = input.size(b + 1);
+    const int64_t W = input.size(b + 2);
+
+    const int64_t OH = (H + 2 * padding[0] - (dilation[0] * (kernel_size[0] - 1) + 1)) / stride[0] + 1;
+    const int64_t OW = (W + 2 * padding[1] - (dilation[1] * (kernel_size[1] - 1) + 1)) / stride[1] + 1;
+    if (OH <= 0 || OW <= 0)
+        TP_THROW(RuntimeError, "im2col: calculated shape is too small (", OH, "x", OW, ")");
+
+    const int64_t CP = C * kernel_size[0] * kernel_size[1];
+    const int64_t L = OH * OW;
+    Tensor out = Tensor::empty({N, CP, L}, input.dtype(), input.device());
+
+    const int64_t frame = C * H * W;
+    const int64_t out_frame = CP * L;
+    switch (input.dtype()) {
+        case DType::Float32: {
+            const float* in_p = input.data_ptr<float>();
+            float* out_p = out.data_ptr<float>();
+            parallel_for(0, N, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                for (int64_t n = begin; n < end; ++n)
+                    im2col<float>(in_p + n * frame, C, H, W, kernel_size[0], kernel_size[1],
+                                  padding[0], padding[1], stride[0], stride[1],
+                                  dilation[0], dilation[1], out_p + n * out_frame);
+            });
+            break;
+        }
+        case DType::Float64: {
+            const double* in_p = input.data_ptr<double>();
+            double* out_p = out.data_ptr<double>();
+            parallel_for(0, N, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                for (int64_t n = begin; n < end; ++n)
+                    im2col<double>(in_p + n * frame, C, H, W, kernel_size[0], kernel_size[1],
+                                   padding[0], padding[1], stride[0], stride[1],
+                                   dilation[0], dilation[1], out_p + n * out_frame);
+            });
+            break;
+        }
+        case DType::Float16: {
+            const Half* in_p = input.data_ptr<Half>();
+            Half* out_p = out.data_ptr<Half>();
+            for (int64_t n = 0; n < N; ++n)
+                im2col<Half>(in_p + n * frame, C, H, W, kernel_size[0], kernel_size[1],
+                             padding[0], padding[1], stride[0], stride[1],
+                             dilation[0], dilation[1], out_p + n * out_frame);
+            break;
+        }
+        case DType::BFloat16: {
+            const BFloat16* in_p = input.data_ptr<BFloat16>();
+            BFloat16* out_p = out.data_ptr<BFloat16>();
+            for (int64_t n = 0; n < N; ++n)
+                im2col<BFloat16>(in_p + n * frame, C, H, W, kernel_size[0], kernel_size[1],
+                                 padding[0], padding[1], stride[0], stride[1],
+                                 dilation[0], dilation[1], out_p + n * out_frame);
+            break;
+        }
+        default:
+            TP_THROW(NotImplementedError, "im2col only supports floating point dtypes");
+    }
+    return batched ? out : out.squeeze(0);
+}
+
+static void col2im_compute(const Tensor& self, const std::vector<int64_t>& output_size,
+                           const std::vector<int64_t>& kernel_size,
+                           const std::vector<int64_t>& dilation,
+                           const std::vector<int64_t>& padding,
+                           const std::vector<int64_t>& stride, Tensor& out,
+                           int64_t& N, int64_t& C, int64_t& H, int64_t& W, bool& batched) {
+    if (output_size.size() != 2) TP_THROW(ValueError, "col2im: output_size must have 2 elements");
+    if (kernel_size.size() != 2 || dilation.size() != 2 || padding.size() != 2 || stride.size() != 2)
+        TP_THROW(ValueError, "col2im: kernel_size/dilation/padding/stride must have 2 elements");
+    if (self.dim() != 2 && self.dim() != 3)
+        TP_THROW(ValueError, "col2im: expected 2D (unbatched) or 3D input, got ", self.dim(), "D");
+    H = output_size[0];
+    W = output_size[1];
+    const int64_t OH = (H + 2 * padding[0] - (dilation[0] * (kernel_size[0] - 1) + 1)) / stride[0] + 1;
+    const int64_t OW = (W + 2 * padding[1] - (dilation[1] * (kernel_size[1] - 1) + 1)) / stride[1] + 1;
+    const int64_t CP = self.size(self.dim() - 2);
+    if (CP % (kernel_size[0] * kernel_size[1]) != 0)
+        TP_THROW(RuntimeError, "col2im: expected size of input's dimension 1 to be divisible by "
+                               "prod(kernel_size) but it does not match");
+    C = CP / (kernel_size[0] * kernel_size[1]);
+    if (self.size(self.dim() - 1) != OH * OW)
+        TP_THROW(RuntimeError, "col2im: expected size of input's dimension 2 to match the "
+                               "calculated number of patches but it does not match");
+    batched = self.dim() == 3;
+    N = batched ? self.size(0) : 1;
+    out = Tensor::zeros({N, C, H, W}, self.dtype(), self.device());
+}
+
+
+Tensor col2im_cpu(const Tensor& self, const std::vector<int64_t>& output_size,
+                  const std::vector<int64_t>& kernel_size,
+                  const std::vector<int64_t>& dilation,
+                  const std::vector<int64_t>& padding,
+                  const std::vector<int64_t>& stride) {
+    Tensor input = self.is_contiguous() ? self : self.clone();
+    Tensor out;
+    int64_t N, C, H, W;
+    bool batched;
+    col2im_compute(input, output_size, kernel_size, dilation, padding, stride,
+                   out, N, C, H, W, batched);
+    const int64_t CP = C * kernel_size[0] * kernel_size[1];
+    const int64_t in_frame = input.numel() / N;
+    switch (input.dtype()) {
+        case DType::Float32: {
+            const float* in_p = input.data_ptr<float>();
+            float* out_p = out.data_ptr<float>();
+            parallel_for(0, N, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                for (int64_t n = begin; n < end; ++n)
+                    col2im<float>(in_p + n * in_frame, C, H, W, kernel_size[0], kernel_size[1],
+                                  padding[0], padding[1], stride[0], stride[1],
+                                  dilation[0], dilation[1], out_p + n * C * H * W);
+            });
+            break;
+        }
+        case DType::Float64: {
+            const double* in_p = input.data_ptr<double>();
+            double* out_p = out.data_ptr<double>();
+            parallel_for(0, N, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                for (int64_t n = begin; n < end; ++n)
+                    col2im<double>(in_p + n * in_frame, C, H, W, kernel_size[0], kernel_size[1],
+                                   padding[0], padding[1], stride[0], stride[1],
+                                   dilation[0], dilation[1], out_p + n * C * H * W);
+            });
+            break;
+        }
+        case DType::Float16: {
+            const Half* in_p = input.data_ptr<Half>();
+            Half* out_p = out.data_ptr<Half>();
+            for (int64_t n = 0; n < N; ++n)
+                col2im<Half>(in_p + n * in_frame, C, H, W, kernel_size[0], kernel_size[1],
+                             padding[0], padding[1], stride[0], stride[1],
+                             dilation[0], dilation[1], out_p + n * C * H * W);
+            break;
+        }
+        case DType::BFloat16: {
+            const BFloat16* in_p = input.data_ptr<BFloat16>();
+            BFloat16* out_p = out.data_ptr<BFloat16>();
+            for (int64_t n = 0; n < N; ++n)
+                col2im<BFloat16>(in_p + n * in_frame, C, H, W, kernel_size[0], kernel_size[1],
+                                 padding[0], padding[1], stride[0], stride[1],
+                                 dilation[0], dilation[1], out_p + n * C * H * W);
+            break;
+        }
+        default:
+            TP_THROW(NotImplementedError, "col2im only supports floating point dtypes");
+    }
+    return batched ? out : out.squeeze(0);
+}
+
+Tensor im2col_backward_cpu(const Tensor& grad_output, const std::vector<int64_t>& input_size,
+                           const std::vector<int64_t>& kernel_size,
+                           const std::vector<int64_t>& dilation,
+                           const std::vector<int64_t>& padding,
+                           const std::vector<int64_t>& stride) {
+    if (input_size.size() != 3 && input_size.size() != 4)
+        TP_THROW(ValueError, "im2col_backward: expected input_size with 3 (unbatched) or 4 elements");
+    std::vector<int64_t> output_size = {input_size[input_size.size() - 2],
+                                        input_size[input_size.size() - 1]};
+    return col2im_cpu(grad_output, output_size, kernel_size, dilation, padding, stride);
+}
+
+Tensor col2im_backward_cpu(const Tensor& grad_output, const std::vector<int64_t>& input_size,
+                           const std::vector<int64_t>& output_size,
+                           const std::vector<int64_t>& kernel_size,
+                           const std::vector<int64_t>& dilation,
+                           const std::vector<int64_t>& padding,
+                           const std::vector<int64_t>& stride) {
+    // input_size describes the col2im input (N, C*prod(kernel), L); the
+    // adjoint is the im2col gather of the incoming gradient.
+    return im2col_cpu(grad_output, kernel_size, dilation, padding, stride);
+}
+
+// --- conv_transpose1d (mapped onto conv_transpose2d like conv1d_cpu) --------
+
+Tensor conv_transpose1d_cpu(const Tensor& input, const Tensor& weight, const Tensor& bias,
+                            const std::vector<int64_t>& stride,
+                            const std::vector<int64_t>& padding,
+                            const std::vector<int64_t>& output_padding,
+                            int64_t groups,
+                            const std::vector<int64_t>& dilation) {
+    if (input.dim() != 3) TP_THROW(RuntimeError, "conv_transpose1d: Expected 3D input (N, C, L)");
+    if (weight.dim() != 3) TP_THROW(RuntimeError, "conv_transpose1d: Expected 3D weight");
+
+    Tensor in_2d = input.unsqueeze(2);
+    Tensor w_2d = weight.unsqueeze(2);
+
+    std::vector<int64_t> s_2d = {1, stride.empty() ? 1 : stride[0]};
+    std::vector<int64_t> p_2d = {0, padding.empty() ? 0 : padding[0]};
+    std::vector<int64_t> op_2d = {0, output_padding.empty() ? 0 : output_padding[0]};
+    std::vector<int64_t> d_2d = {1, dilation.empty() ? 1 : dilation[0]};
+
+    Tensor out_2d = conv_transpose2d_cpu(in_2d, w_2d, bias, s_2d, p_2d, op_2d, groups, d_2d);
+    return out_2d.squeeze(2);
+}
+
+Tensor conv_transpose1d_grad_input_cpu(const Tensor& grad_output, const Tensor& input, const Tensor& weight,
+                                       const std::vector<int64_t>& stride,
+                                       const std::vector<int64_t>& padding,
+                                       const std::vector<int64_t>& output_padding,
+                                       int64_t groups,
+                                       const std::vector<int64_t>& dilation) {
+    Tensor go_2d = grad_output.unsqueeze(2);
+    Tensor in_2d = input.unsqueeze(2);
+    Tensor w_2d = weight.unsqueeze(2);
+    std::vector<int64_t> s_2d = {1, stride.empty() ? 1 : stride[0]};
+    std::vector<int64_t> p_2d = {0, padding.empty() ? 0 : padding[0]};
+    std::vector<int64_t> op_2d = {0, output_padding.empty() ? 0 : output_padding[0]};
+    std::vector<int64_t> d_2d = {1, dilation.empty() ? 1 : dilation[0]};
+    return conv_transpose2d_grad_input_cpu(go_2d, in_2d, w_2d, s_2d, p_2d, op_2d, groups, d_2d).squeeze(2);
+}
+
+Tensor conv_transpose1d_grad_weight_cpu(const Tensor& grad_output, const Tensor& input, const Tensor& weight,
+                                        const std::vector<int64_t>& stride,
+                                        const std::vector<int64_t>& padding,
+                                        const std::vector<int64_t>& output_padding,
+                                        int64_t groups,
+                                        const std::vector<int64_t>& dilation) {
+    Tensor go_2d = grad_output.unsqueeze(2);
+    Tensor in_2d = input.unsqueeze(2);
+    Tensor w_2d = weight.unsqueeze(2);
+    std::vector<int64_t> s_2d = {1, stride.empty() ? 1 : stride[0]};
+    std::vector<int64_t> p_2d = {0, padding.empty() ? 0 : padding[0]};
+    std::vector<int64_t> op_2d = {0, output_padding.empty() ? 0 : output_padding[0]};
+    std::vector<int64_t> d_2d = {1, dilation.empty() ? 1 : dilation[0]};
+    return conv_transpose2d_grad_weight_cpu(go_2d, in_2d, w_2d, s_2d, p_2d, op_2d, groups, d_2d).squeeze(2);
+}
+
+Tensor conv_transpose1d_grad_bias_cpu(const Tensor& grad_output, const Tensor& input, const Tensor& weight,
+                                      const std::vector<int64_t>& stride,
+                                      const std::vector<int64_t>& padding,
+                                      const std::vector<int64_t>& output_padding,
+                                      int64_t groups,
+                                      const std::vector<int64_t>& dilation) {
+    Tensor go_2d = grad_output.unsqueeze(2);
+    Tensor in_2d = input.unsqueeze(2);
+    Tensor w_2d = weight.unsqueeze(2);
+    std::vector<int64_t> s_2d = {1, stride.empty() ? 1 : stride[0]};
+    std::vector<int64_t> p_2d = {0, padding.empty() ? 0 : padding[0]};
+    std::vector<int64_t> op_2d = {0, output_padding.empty() ? 0 : output_padding[0]};
+    std::vector<int64_t> d_2d = {1, dilation.empty() ? 1 : dilation[0]};
+    return conv_transpose2d_grad_bias_cpu(go_2d, in_2d, w_2d, s_2d, p_2d, op_2d, groups, d_2d);
+}
+
 TENSORPLAY_LIBRARY_IMPL(CPU, ConvKernels) {
     m.impl("conv1d", conv1d_cpu);
     m.impl("conv2d", conv2d_cpu);
@@ -3079,26 +4164,36 @@ TENSORPLAY_LIBRARY_IMPL(CPU, ConvKernels) {
     m.impl("conv3d", conv3d_cpu);
     m.impl("conv_transpose2d", conv_transpose2d_cpu);
     m.impl("conv_transpose3d", conv_transpose3d_cpu);
-    
+
     m.impl("conv2d_grad_input", conv2d_grad_input_cpu);
     m.impl("conv2d_grad_weight", conv2d_grad_weight_cpu);
     m.impl("conv2d_grad_bias", conv2d_grad_bias_cpu);
-    
+
     m.impl("conv1d_grad_input", conv1d_grad_input_cpu);
     m.impl("conv1d_grad_weight", conv1d_grad_weight_cpu);
     m.impl("conv1d_grad_bias", conv1d_grad_bias_cpu);
-    
+
     m.impl("conv3d_grad_input", conv3d_grad_input_cpu);
     m.impl("conv3d_grad_weight", conv3d_grad_weight_cpu);
     m.impl("conv3d_grad_bias", conv3d_grad_bias_cpu);
-    
+
     m.impl("conv_transpose2d_grad_input", conv_transpose2d_grad_input_cpu);
     m.impl("conv_transpose2d_grad_weight", conv_transpose2d_grad_weight_cpu);
     m.impl("conv_transpose2d_grad_bias", conv_transpose2d_grad_bias_cpu);
-    
+
     m.impl("conv_transpose3d_grad_input", conv_transpose3d_grad_input_cpu);
     m.impl("conv_transpose3d_grad_weight", conv_transpose3d_grad_weight_cpu);
     m.impl("conv_transpose3d_grad_bias", conv_transpose3d_grad_bias_cpu);
+
+    m.impl("conv_transpose1d", conv_transpose1d_cpu);
+    m.impl("conv_transpose1d_grad_input", conv_transpose1d_grad_input_cpu);
+    m.impl("conv_transpose1d_grad_weight", conv_transpose1d_grad_weight_cpu);
+    m.impl("conv_transpose1d_grad_bias", conv_transpose1d_grad_bias_cpu);
+
+    m.impl("im2col", im2col_cpu);
+    m.impl("im2col_backward", im2col_backward_cpu);
+    m.impl("col2im", col2im_cpu);
+    m.impl("col2im_backward", col2im_backward_cpu);
 }
 
 } // namespace cpu

@@ -743,9 +743,175 @@ py::object as_tensor(py::object data, std::optional<DType> dtype, std::optional<
 }
 
 void init_tensor(py::module_& m) {
+    // from_numpy — direct port of torch/csrc/utils/tensor_numpy.cpp
+    // tensor_from_numpy(): zero-copy from_blob view; non-writable arrays warn
+    // once instead of failing; byte-stride divisibility, negative strides and
+    // foreign byte order are rejected with torch's exact messages.
+    static bool warned_numpy_not_writeable = false;
+    m.def("from_numpy", [](py::object obj) -> Tensor {
+        py::array array = py::array::ensure(obj);
+        if (!array) {
+            TP_THROW(TypeError, "expected np.ndarray");
+        }
+
+        const int64_t ndim = array.ndim();
+        std::vector<int64_t> sizes(ndim), strides(ndim);
+        for (int64_t i = 0; i < ndim; ++i) {
+            sizes[i] = array.shape(i);
+            strides[i] = array.strides(i);
+        }
+        const int64_t element_size_in_bytes = (std::max<py::ssize_t>(array.itemsize(), 1));
+        if (!(element_size_in_bytes > 0)) {
+            TP_THROW(ValueError, "element_size must be 0");
+        }
+        for (auto& stride : strides) {
+            if (stride % element_size_in_bytes != 0) {
+                TP_THROW(ValueError,
+                         "given numpy array strides not a multiple of the element byte size. "
+                         "Copy the numpy array to reallocate the memory.");
+            }
+            stride /= element_size_in_bytes;
+        }
+        for (const auto& stride : strides) {
+            if (stride < 0) {
+                TP_THROW(ValueError,
+                         "At least one stride in the given numpy array is negative, "
+                         "and tensors with negative strides are not currently supported. "
+                         "(You can probably work around this by making a copy of your array "
+                         " with array.copy().) ");
+            }
+        }
+        // Byte-order check (tensor_numpy.cpp): only native-order arrays are
+        // accepted, matching ATen's PyArray_EquivByteorders gate.
+        {
+            static char native_order = []() {
+                int one = 1;
+                return (*reinterpret_cast<char*>(&one) == 1) ? '<' : '>';
+            }();
+            py::dtype dt = array.dtype();
+            py::object bo = py::reinterpret_steal<py::object>(
+                PyObject_GetAttrString(dt.ptr(), "byteorder"));
+            if (bo.ptr() != nullptr) {
+                char c = bo.cast<char>();
+                if (c != '=' && c != '|' && c != native_order) {
+                    TP_THROW(ValueError,
+                             "given numpy array has byte order different from the native byte order. "
+                             "Conversion between byte orders is currently not supported.");
+                }
+            }
+        }
+
+        if (!array.writeable() && !warned_numpy_not_writeable) {
+            PyErr_WarnEx(PyExc_UserWarning,
+                         "The given NumPy array is not writable, and TensorPlay does "
+                         "not support non-writable tensors. This means writing to this tensor "
+                         "would result in undefined behavior. You may want to copy the array "
+                         "to protect its data or make it writable before converting it to a "
+                         "tensor. This type of warning will be suppressed for the rest of this "
+                         "program.", 1);
+            warned_numpy_not_writeable = true;
+        }
+
+        // Route through create_tensor's numpy branch: dtype mapping + zero-copy
+        // DataPtr (keeps the array alive) are shared with tp.tensor().
+        // create_tensor uses mutable_data(); for read-only arrays fall back to
+        // const data cast — writes are UB exactly as torch documents above.
+        Tensor t = create_tensor(std::move(obj), std::nullopt, std::nullopt);
+        return t;
+    }, "ndarray"_a);
+
+    // frombuffer — direct port of torch/csrc/utils/tensor_new.cpp
+    // tensor_frombuffer(): buffer-protocol view, zero-copy, writable preferred
+    // with the same non-writable warn-once fallback and value checks.
+    static bool warned_non_writable = false;
+    m.def("frombuffer", [warned_non_writable](py::object buffer, DType dtype,
+                                              int64_t count, int64_t offset,
+                                              bool requires_grad) mutable -> Tensor {
+        const size_t elsize = tensorplay::elementSize(dtype);
+        Py_buffer view;
+        if (PyObject_GetBuffer(buffer.ptr(), &view, PyBUF_WRITABLE) < 0) {
+            if (PyObject_GetBuffer(buffer.ptr(), &view, PyBUF_SIMPLE) < 0) {
+                TP_THROW(ValueError, "could not retrieve buffer from object");
+            }
+            if (!warned_non_writable) {
+                PyErr_WarnEx(PyExc_UserWarning,
+                             "The given buffer is not writable, and TensorPlay does "
+                             "not support non-writable tensors. This means you can write to the "
+                             "underlying (supposedly non-writable) buffer using the tensor. "
+                             "You may want to copy the buffer to protect its data or make it writable "
+                             "before converting it to a tensor. This type of warning will be "
+                             "suppressed for the rest of this program.", 1);
+                warned_non_writable = true;
+            }
+            PyErr_Clear();
+        }
+
+        PyObject* view_obj = view.obj;
+        Py_INCREF(view_obj);
+
+        const int64_t len = static_cast<int64_t>(view.len);
+        void* buf = view.buf;
+        PyBuffer_Release(&view);
+        (void)buf;
+
+        if (!(len > 0 && count != 0)) {
+            Py_DECREF(view_obj);
+            TP_THROW(ValueError, "both buffer length and count must not be 0");
+        }
+        if (!(offset >= 0 && offset < len)) {
+            Py_DECREF(view_obj);
+            TP_THROW(ValueError, "offset must be non-negative and no greater than buffer length minus 1");
+        }
+        if (!(count > 0 || (len - offset) % static_cast<int64_t>(elsize) == 0)) {
+            Py_DECREF(view_obj);
+            TP_THROW(ValueError, "buffer length after offset must be a multiple of element size");
+        }
+
+        size_t actual_count;
+        if (count < 0) {
+            actual_count = static_cast<size_t>((len - offset) / static_cast<int64_t>(elsize));
+        } else {
+            actual_count = static_cast<size_t>(count);
+        }
+        if (static_cast<size_t>(offset) + actual_count * elsize > static_cast<size_t>(len)) {
+            Py_DECREF(view_obj);
+            TP_THROW(ValueError, "requested buffer length must not be greater than actual buffer length");
+        }
+
+        auto* offset_buf = static_cast<char*>(buf) + offset;
+
+        // Zero-copy: the DataPtr keeps the buffer's owner alive via DECREF.
+        tensorplay::DataPtr ptr(offset_buf, view_obj, &pyobject_deleter, Device(DeviceType::CPU));
+        tensorplay::Storage storage(std::move(ptr), actual_count * elsize);
+
+        std::vector<int64_t> shape{static_cast<int64_t>(actual_count)};
+        std::vector<int64_t> strides{1};
+        auto impl = std::make_shared<tensorplay::TensorImpl>(storage, shape, strides, dtype);
+        Tensor t(impl);
+        tensorplay::tpx::impl::set_requires_grad(t, requires_grad);
+        return t;
+    }, "buffer"_a, "dtype"_a = DType::Float32, "count"_a = -1, "offset"_a = 0,
+       "requires_grad"_a = false);
+
     // Expose from_dlpack as a module function
     m.def("from_dlpack", &from_dlpack, "obj"_a);
     m.def("to_dlpack", &to_dlpack, "obj"_a, "stream"_a = py::none());
+
+    // from_numpy: zero-copy view over the numpy array's memory when dtypes
+    // match (same contract as ATen torch.from_numpy; the array is kept alive
+    // by the DataPtr deleter, and negative strides are rejected like torch).
+    m.def("from_numpy", [](py::array array) -> Tensor {
+        if (array.ndim() > 0) {
+            for (size_t i = 0; i < (size_t)array.ndim(); ++i) {
+                if (array.strides(i) < 0) {
+                    TP_THROW(ValueError,
+                             "from_numpy: negative strides are not supported; "
+                             "use np.ascontiguousarray(arr)");
+                }
+            }
+        }
+        return create_tensor(py::object(std::move(array)), std::nullopt, std::nullopt);
+    }, "array"_a);
     
     // Expose as_tensor
     m.def("as_tensor", &as_tensor, "data"_a, "dtype"_a = py::none(), "device"_a = py::none(),
@@ -798,6 +964,15 @@ void init_tensor(py::module_& m) {
             return t.as_strided(sizes, strides);
         })
         .def_property_readonly("is_sparse", &Tensor::is_sparse)
+        .def("is_coalesced", &Tensor::is_coalesced)
+        .def("sparse_dim", &Tensor::sparse_dim)
+        .def("dense_dim", &Tensor::dense_dim)
+        .def("_indices", &Tensor::_indices)
+        .def("_values", &Tensor::_values)
+        .def("coalesce", &Tensor::coalesce)
+        .def("sparse_mask",
+             static_cast<Tensor (Tensor::*)(const Tensor&) const>(&Tensor::sparse_mask),
+             "mask"_a)
         .def_property_readonly("strides", [](const Tensor& self) {
             return py::tuple(py::cast(self.strides()));
         })
@@ -819,6 +994,12 @@ void init_tensor(py::module_& m) {
         .def("_set_grad_fn", [](Tensor& self, std::shared_ptr<tensorplay::tpx::Node> node, int output_nr) {
             tensorplay::tpx::impl::set_grad_fn(self, std::move(node), output_nr);
         }, "node"_a, "output_nr"_a = 0)
+        .def_property_readonly("_output_nr", [](const Tensor& self) {
+            return tensorplay::tpx::impl::output_nr(self);
+        })
+        .def_property_readonly("_accumulate_grad_node", [](const Tensor& self) -> std::shared_ptr<tensorplay::tpx::Node> {
+            return tensorplay::tpx::impl::grad_accumulator(self);
+        })
         .def_property_readonly("is_cuda", [](const Tensor& self) { return self.device().type() == DeviceType::CUDA; })
         .def("pin_memory", [](const Tensor& self) {
              Tensor result(self.pin_memory());
@@ -952,6 +1133,9 @@ void init_tensor(py::module_& m) {
         .def("slice", [](const Tensor& self, int64_t dim, int64_t start, int64_t end, int64_t step) {
             return tensorplay::tpx::slice(self, dim, start, end, step);
         }, "dim"_a, "start"_a, "end"_a, "step"_a = 1)
+        .def("narrow", [](const Tensor& self, int64_t dim, int64_t start, int64_t length) {
+            return tensorplay::tpx::narrow(self, dim, start, length);
+        }, "dim"_a, "start"_a, "length"_a)
         .def("copy_", [](py::object self_obj, const Tensor& src, bool non_blocking) {
             Tensor& self = py::cast<Tensor&>(self_obj);
             self.copy_(src, non_blocking);
@@ -1298,13 +1482,13 @@ void init_tensor(py::module_& m) {
 
         // Manual overloads using lambdas
         .def("to", [](const Tensor& self, DType dtype, bool non_blocking, bool copy) {
-            return self.to(dtype, non_blocking, copy);
+            return tensorplay::tpx::to(self, dtype, non_blocking, copy);
         }, "dtype"_a, "non_blocking"_a = false, "copy"_a = false)
         .def("to", [](const Tensor& self, Device device, bool non_blocking, bool copy) {
-            return self.to(device, non_blocking, copy);
+            return tensorplay::tpx::to(self, device, non_blocking, copy);
         }, "device"_a, "non_blocking"_a = false, "copy"_a = false)
         .def("to", [](const Tensor& self, Device device, DType dtype, bool non_blocking, bool copy) {
-            return self.to(device, dtype, non_blocking, copy);
+            return tensorplay::tpx::to(self, device, dtype, non_blocking, copy);
         }, "device"_a, "dtype"_a, "non_blocking"_a = false, "copy"_a = false)
 
         .def("__array__", [](py::object self_obj, py::object dtype, bool copy) {

@@ -1,4 +1,6 @@
 import hashlib
+import re
+from types import ModuleType
 import logging
 import shutil
 import sys
@@ -279,3 +281,378 @@ def download_url_to_file(
             if retry_count >= max_retries:
                 tmp_dst.unlink(missing_ok=True)
                 raise RuntimeError(f"Network error: Retried {max_retries} times, still failed. URL: {url}") from e
+
+
+
+
+# ---------------------------------------------------------------------------
+# Unified remote-model hub: MEGA (default) + GitHub/torch.hub compatibility.
+#
+#   tp.hub.load_state_dict("org/model", "weights.mst")                 # mega
+#   tp.hub.load_model("org/model", model_class="...resnet50")          # mega
+#   tp.hub.load("pytorch/vision", "resnet50")                          # github
+#   sd = tp.hub.load_state_dict(
+#       "https://download.pytorch.org/models/resnet50.pth",
+#       source="github")                                               # url
+#
+# The GitHub path mirrors torch.hub.load: shallow-clone the repo into the hub
+# cache, execute its ``hubconf.py`` under a torch->tensorplay module aliasing,
+# then invoke the requested entrypoint.
+# ---------------------------------------------------------------------------
+
+__all__ += [
+    "load_state_dict",
+    "load_model",
+    "snapshot_download",
+    "load",
+    "list_entrypoints",
+    "load_state_dict_from_url",
+]
+
+_WEIGHT_URL_RE = re.compile(r"^https?://.*\.(pth|pt|ckpt|safetensors|mst)([?#].*)?$", re.I)
+
+
+# ---------------------------------------------------------------------------
+# torch -> tensorplay module aliasing (for executing foreign hubconf.py)
+# ---------------------------------------------------------------------------
+
+class _LazyAlias(ModuleType):
+    """Module placeholder whose attribute access proxies to ``target``."""
+
+    def __init__(self, name: str, target):
+        super().__init__(name)
+        self._target = target
+
+    def __getattr__(self, item):
+        return getattr(self._target, item)
+
+
+class torch_hub_alias:
+    """Temporarily aliases ``torch*`` modules onto tensorplay so that foreign
+    hubconf.py files (written against PyTorch) import our implementation.
+
+    Restores the previous ``sys.modules`` entries on exit.
+    """
+
+    def __init__(self):
+        self._saved = {}
+
+    def _aliases(self) -> dict:
+        import tensorplay
+        import tensorplay.nn
+
+        hub_shim = ModuleType("tensorplay.hub.shim")
+        hub_shim.        hub_shim.download_url_to_file = download_url_to_file
+        hub_shim.get_dir = get_dir
+        hub_shim.set_dir = set_dir
+        hub_shim._get_torch_home = lambda: str(get_dir())
+
+        utils_shim = ModuleType("tensorplay.utils.shim")
+        from tensorplay.utils import checkpoint as _cp  # noqa: F401
+        utils_shim.checkpoint = _cp
+
+        jit_mod = _import_optional("tensorplay.jit")
+        fx_mod = _import_optional("tensorplay.fx")
+
+        return {
+            "torch": tensorplay,
+            "torch.nn": tensorplay.nn,
+            "torch.nn.functional": tensorplay.nn.functional,
+            "torch.nn.init": tensorplay.nn.init,
+            "torch.Tensor": type(tensorplay.Tensor([0.0])) if False else None,
+            "torch.hub": hub_shim,
+            "torch.utils": utils_shim,
+            "torch.utils.checkpoint": _cp,
+            "torch.jit": jit_mod,
+            "torch.fx": fx_mod,
+            "torchvision": _import_optional("tensorplay.vision"),
+            "torchvision.models": _import_optional("tensorplay.vision.models"),
+            "torchvision.transforms": _import_optional("tensorplay.vision.transforms"),
+            "torchvision.datasets": _import_optional("tensorplay.vision.datasets"),
+            "torchvision.io": _import_optional("tensorplay.vision.io"),
+        }
+
+    def __enter__(self):
+        for name, target in self._aliases().items():
+            if target is None:
+                continue
+            self._saved[name] = sys.modules.get(name)
+            if isinstance(target, ModuleType):
+                sys.modules[name] = target
+            else:
+                sys.modules[name] = _LazyAlias(name, target)
+        return self
+
+    def __exit__(self, *exc):
+        for name, prev in self._saved.items():
+            if prev is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = prev
+        return False
+
+
+def _import_optional(name: str):
+    import importlib
+
+    try:
+        return importlib.import_module(name)
+    except ImportError:
+        mod = ModuleType(name)
+        return mod
+
+
+# ---------------------------------------------------------------------------
+# GitHub backend
+# ---------------------------------------------------------------------------
+
+def _github_repo_dir(repo_id: str, ref: str | None = None) -> Path:
+    name = repo_id.split("/")[-1]
+    base = get_dir() / "github" / repo_id.replace("/", "_")
+    if base.exists():
+        return base
+    base.mkdir(parents=True, exist_ok=True)
+    cmd = ["git", "clone", "--depth", "1"]
+    url = f"https://github.com/{repo_id}.git"
+    if ref:
+        cmd += ["--branch", ref]
+    cmd += [url, str(base)]
+    import subprocess
+
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"git clone failed for {url}: {proc.stderr.strip()}")
+    return base
+
+
+def _exec_hubconf(repo_dir: Path):
+    import importlib.util
+
+    conf = repo_dir / "hubconf.py"
+    if not conf.exists():
+        raise RuntimeError(f"{repo_dir} has no hubconf.py")
+    spec = importlib.util.spec_from_file_location("_tensorplay_foreign_hubconf", conf)
+    module = importlib.util.module_from_spec(spec)
+    with torch_hub_alias():
+        spec.loader.exec_module(module)
+    return module
+
+
+def list_entrypoints(repo_id: str, ref: str | None = None) -> list[str]:
+    """Entrypoints declared by a GitHub repo's hubconf.py (torch.hub.list)."""
+    repo_dir = _github_repo_dir(repo_id, ref)
+    module = _exec_hubconf(repo_dir)
+    deps = {"dependencies", "verbose"}
+    return sorted(n for n in dir(module)
+                  if not n.startswith("_") and n not in deps and callable(getattr(module, n)))
+
+
+def load(repo_id: str, model: str | None = None, *args, ref: str | None = None, **kwargs):
+    """Unified model loader.
+
+    mega:    tp.hub.load("org/repo", filename="weights.mst", model_class=...)
+    github:  tp.hub.load("pytorch/vision", "resnet50")  # torch.hub.load equivalent
+
+    Dispatches on ``source`` exactly like :func:`load_model`; the two-argument
+    form is the torch.hub.load shape.
+    """
+    repo_dir = _github_repo_dir(repo_id, ref)
+    module = _exec_hubconf(repo_dir)
+    fn = getattr(module, model, None)
+    if fn is None:
+        raise RuntimeError(f"'{model}' is not an entrypoint of {repo_id}; "
+                           f"available: {list_entrypoints(repo_id, ref)}")
+    with torch_hub_alias():
+        return fn(*args, **kwargs)
+
+
+def load_state_dict_from_url(url: str, progress: bool = True, check_hash: bool = False,
+                             map_location=None, **kwargs) -> dict:
+    """Downloads a raw checkpoint URL and loads it (torch semantics)."""
+    parts = url.rstrip("/").split("/")
+    cached = get_dir() / "checkpoints" / parts[-1]
+    cached.parent.mkdir(parents=True, exist_ok=True)
+    hash_prefix = None
+    if check_hash:
+        m = re.search(r"-([a-f0-9]{8,})\.", parts[-1])
+        hash_prefix = m.group(1) if m else None
+    if not cached.exists():
+        download_url_to_file(url, str(cached), hash_prefix=hash_prefix, progress=progress)
+
+    # Delegate deserialization to the torch-compat serialization layer.
+    try:
+        from tensorplay import _serialization_torch as ser_torch
+    except ImportError:
+        ser_torch = None
+    import tensorplay as tp
+
+    if ser_torch is not None:
+        return ser_torch.load(str(cached), map_location=map_location)
+    return tp.load(str(cached), map_location=map_location)
+
+
+# ---------------------------------------------------------------------------
+# MEGA backend (megatensors SDK, imported lazily)
+# ---------------------------------------------------------------------------
+
+_WEIGHT_EXTS = (".safetensors", ".mst", ".pt", ".pth", ".bin")
+
+
+def _mega_client(endpoint=None, token=None):
+    try:
+        from megatensors.hub import MegaHubClient
+    except ImportError as exc:
+        raise ImportError(
+            "MEGA hub support requires the 'megatensors' package. "
+            "Install it with `pip install megatensors`."
+        ) from exc
+    return MegaHubClient(endpoint=endpoint, token=token)
+
+
+def _mega_load_state_dict(paths, device, load_kwargs):
+    import megatensors
+
+    kwargs = {"framework": "tensorplay", "device": device}
+    kwargs.update(load_kwargs)
+    return megatensors.load_state_dict([str(p) for p in paths], **kwargs)
+
+
+def snapshot_download(
+    repo_id: str,
+    *,
+    source: str = "mega",
+    revision: str = "main",
+    include=None,
+    exclude=None,
+    endpoint=None,
+    token=None,
+    ref: str | None = None,
+) -> Path:
+    """Downloads a full repository snapshot (mega or github) into the cache."""
+    if source == "mega":
+        local_dir = get_dir() / "mega" / repo_id
+        client = _mega_client(endpoint, token)
+        return client.snapshot_download(
+            repo_id, local_dir=local_dir, revision=revision, include=include, exclude=exclude
+        )
+    elif source == "github":
+        return _github_repo_dir(repo_id, ref or revision)
+    raise ValueError(f"unknown source '{source}' (expected 'mega' or 'github')")
+
+
+def load_state_dict(
+    repo_or_url: str,
+    filename: str | None = None,
+    *,
+    source: str = "auto",
+    device: str = "cpu",
+    revision: str = "main",
+    endpoint=None,
+    token=None,
+    ref: str | None = None,
+    **load_kwargs,
+) -> dict:
+    """Loads weights from MEGA, a GitHub checkpoint URL, or a github repo.
+
+    ``source='auto'`` inspects the argument: an http(s) URL uses the github
+    checkpoint path, anything else is treated as a MEGA ``repo_id``.
+    """
+    src = source
+    if src == "auto":
+        src = "github" if _WEIGHT_URL_RE.match(repo_or_url) else "mega"
+
+    if src == "github":
+        if _WEIGHT_URL_RE.match(repo_or_url):
+            return load_state_dict_from_url(repo_or_url)
+        # github repo holding a bare state-dict entrypoint is rare; route
+        # through the entrypoint loader when a filename/entrypoint is given.
+        if filename is not None:
+            obj = load(repo_or_url, filename, ref=ref, **load_kwargs)
+            return obj
+        raise ValueError("github source needs a full checkpoint URL or an entrypoint name")
+
+    client = _mega_client(endpoint, token)
+    cache_root = get_dir() / "mega" / repo_or_url
+    if filename is not None:
+        path = client.download_file(repo_or_url, filename, local_dir=cache_root, revision=revision)
+        return _mega_load_state_dict([path], device, load_kwargs)
+
+    local_dir = client.snapshot_download(repo_or_url, local_dir=cache_root, revision=revision)
+    paths = sorted(p for p in local_dir.rglob("*") if p.is_file() and p.suffix.lower() in _WEIGHT_EXTS)
+    if not paths:
+        raise RuntimeError(f"No weight files found in MEGA repo '{repo_or_url}' (revision={revision})")
+    return _mega_load_state_dict(paths, device, load_kwargs)
+
+
+def load_model(
+    repo_or_url: str,
+    filename: str | None = None,
+    *,
+    source: str = "auto",
+    device: str = "cpu",
+    revision: str = "main",
+    endpoint=None,
+    token=None,
+    ref: str | None = None,
+    model=None,
+    model_class=None,
+    model_kwargs: dict | None = None,
+    strict: bool = True,
+    assign: bool = False,
+    **load_kwargs,
+):
+    """Loads weights and returns a ready-to-run model (mega or github).
+
+    Architecture resolution (mega backend): ``model`` instance >
+    ``model_class`` callable/dotted-path > repository metadata
+    (``model.class`` / ``model.init.*`` via megatensors).
+    For the github backend this is exactly ``torch.hub.load``.
+    """
+    src = source
+    if src == "auto":
+        src = "github" if (_WEIGHT_URL_RE.match(repo_or_url) or "/" in repo_or_url and filename is None) else "mega"
+
+    if src == "github":
+        if model is not None or model_class is not None or model_kwargs is not None:
+            raise ValueError("github source resolves architecture via the repo entrypoint")
+        entry = filename if filename is not None else repo_or_url.rsplit("/", 1)[-1]
+        return load(repo_or_url, entry, ref=ref, **load_kwargs)
+
+    client = _mega_client(endpoint, token)
+    cache_root = get_dir() / "mega" / repo_or_url
+    import megatensors
+
+    if model is not None:
+        sd = load_state_dict(
+            repo_or_url, filename, source="mega", device=device, revision=revision,
+            endpoint=endpoint, token=token, **load_kwargs,
+        )
+        try:
+            model.load_state_dict(sd, strict=strict, assign=assign)
+        except TypeError:
+            model.load_state_dict(sd, strict=strict)
+        if hasattr(model, "to") and device != "cpu":
+            model = model.to(device)
+        return model
+
+    if filename is not None:
+        paths = [client.download_file(repo_or_url, filename, local_dir=cache_root, revision=revision)]
+    else:
+        local_dir = client.snapshot_download(repo_or_url, local_dir=cache_root, revision=revision)
+        index = local_dir / ".mega.index.json"
+        paths = sorted(p for p in local_dir.rglob("*") if p.is_file() and p.suffix.lower() in _WEIGHT_EXTS)
+        if index.exists():
+            paths = [index] + paths
+    if not paths:
+        raise RuntimeError(f"No weight files found in MEGA repo '{repo_or_url}' (revision={revision})")
+
+    return megatensors.load_model(
+        [str(p) for p in paths],
+        device=device,
+        framework="tensorplay",
+        model_class=model_class,
+        model_kwargs=model_kwargs,
+        strict=strict,
+        assign=assign,
+        **load_kwargs,
+    )

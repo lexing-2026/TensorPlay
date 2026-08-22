@@ -38,6 +38,7 @@ void init_dtype(py::module_& m);
 void init_size(py::module_& m);
 void init_generator(py::module_& m);
 void init_autograd(py::module_& m);
+void init_autocast(py::module_& m);
 void init_ops(py::module_& m);
 void init_scalar(py::module_& m);
 void init_stax(py::module_& m);

@@ -363,6 +363,9 @@ Tensor welford_same_dtype(
 template <typename T>
 Tensor argmax_same_dtype(
         const Tensor& input, const ReductionSpec& spec, bool keepdim) {
+    // Compile-time pruning: bool has no argmax (matches torch); blocking it
+    // here kills the whole ArgPair<int> instantiation tree.
+    static_assert(!std::is_same_v<T, bool>, "argmax is not implemented for bool");
     if (input.numel() == 0) {
         TP_THROW(RuntimeError, "argmax(): Expected reduction dim to be non-empty");
     }
@@ -377,6 +380,7 @@ Tensor argmax_same_dtype(
 template <typename T>
 Tensor argmin_same_dtype(
         const Tensor& input, const ReductionSpec& spec, bool keepdim) {
+    static_assert(!std::is_same_v<T, bool>, "argmin is not implemented for bool");
     if (input.numel() == 0) {
         TP_THROW(RuntimeError, "argmin(): Expected reduction dim to be non-empty");
     }
@@ -403,6 +407,26 @@ Tensor argmin_same_dtype(
         case DType::Float16: return FN<Half>(__VA_ARGS__); \
         case DType::BFloat16: return FN<BFloat16>(__VA_ARGS__); \
         case DType::Bool: return FN<bool>(__VA_ARGS__); \
+        default: TP_THROW(NotImplementedError, "CUDA reduction: unsupported dtype"); \
+    }
+
+// ATen alignment: argmax/argmin don't support Bool — excluding it here prunes
+// the entire bool instantiation tree (major ptxas time sink).
+#define TP_DISPATCH_REDUCTION_NO_BOOL(FN, DTYPE, ...) \
+    switch (DTYPE) { \
+        case DType::UInt8: return FN<uint8_t>(__VA_ARGS__); \
+        case DType::Int8: return FN<int8_t>(__VA_ARGS__); \
+        case DType::Int16: return FN<int16_t>(__VA_ARGS__); \
+        case DType::Int32: return FN<int32_t>(__VA_ARGS__); \
+        case DType::Int64: return FN<int64_t>(__VA_ARGS__); \
+        case DType::UInt16: return FN<uint16_t>(__VA_ARGS__); \
+        case DType::UInt32: return FN<uint32_t>(__VA_ARGS__); \
+        case DType::UInt64: return FN<uint64_t>(__VA_ARGS__); \
+        case DType::Float32: return FN<float>(__VA_ARGS__); \
+        case DType::Float64: return FN<double>(__VA_ARGS__); \
+        case DType::Float16: return FN<Half>(__VA_ARGS__); \
+        case DType::BFloat16: return FN<BFloat16>(__VA_ARGS__); \
+        case DType::Bool: TP_THROW(NotImplementedError, "argmax/argmin not implemented for Bool"); \
         default: TP_THROW(NotImplementedError, "CUDA reduction: unsupported dtype"); \
     }
 
@@ -566,7 +590,7 @@ Tensor argmax_kernel(const Tensor& self, std::optional<int64_t> dim, bool keepdi
     if (!dim.has_value() && !input.is_contiguous()) input = input.contiguous();
     const ReductionSpec spec = make_reduction_spec(
         input, dim.has_value() ? std::vector<int64_t>{*dim} : std::vector<int64_t>{});
-    TP_DISPATCH_REDUCTION(argmax_same_dtype, input.dtype(), input, spec, keepdim);
+    TP_DISPATCH_REDUCTION_NO_BOOL(argmax_same_dtype, input.dtype(), input, spec, keepdim);
 }
 
 Tensor argmin_kernel(const Tensor& self, std::optional<int64_t> dim, bool keepdim) {
@@ -574,7 +598,7 @@ Tensor argmin_kernel(const Tensor& self, std::optional<int64_t> dim, bool keepdi
     if (!dim.has_value() && !input.is_contiguous()) input = input.contiguous();
     const ReductionSpec spec = make_reduction_spec(
         input, dim.has_value() ? std::vector<int64_t>{*dim} : std::vector<int64_t>{});
-    TP_DISPATCH_REDUCTION(argmin_same_dtype, input.dtype(), input, spec, keepdim);
+    TP_DISPATCH_REDUCTION_NO_BOOL(argmin_same_dtype, input.dtype(), input, spec, keepdim);
 }
 
 
