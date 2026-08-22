@@ -25,7 +25,9 @@
 #endif
 
 #ifdef __AVX2__
+#if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
+#endif
 #endif
 
 namespace tensorplay {

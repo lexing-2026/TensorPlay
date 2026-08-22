@@ -15,7 +15,9 @@
 #include <cmath>
 #include <algorithm>
 #include <cstring>
+#if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
+#endif
 
 #ifdef USE_ONEDNN
 #include "dnnl.hpp"
