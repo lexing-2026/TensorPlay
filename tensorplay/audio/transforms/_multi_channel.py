@@ -5,7 +5,7 @@ from typing import Optional, Union
 
 import tensorplay as torch
 from tensorplay import Tensor
-from torchaudio import functional as F
+from tensorplay.audio import functional as F
 
 
 __all__ = []

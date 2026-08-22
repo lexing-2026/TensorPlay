@@ -1,7 +1,9 @@
 #include "Engine.h"
 #include "Autograd.h"
+#include "AnomalyMode.h"
 #include "ManualNodes.h"
 #include "Exception.h"
+#include "tensorplay/ops/TPXOpsGenerated.h"
 #include <limits>
 #include <algorithm>
 #include <utility>
@@ -46,6 +48,13 @@ uint64_t compute_min_topological_nr(const edge_list& outputs) {
         }
     }
     return min_topo_nr == std::numeric_limits<uint64_t>::max() ? 0 : min_topo_nr;
+}
+
+// Anomaly-mode NaN probe: relies on IEEE `NaN != NaN`; runs through the
+// dispatcher so it works on both CPU and CUDA tensors.
+bool tensor_has_nan(const Tensor& t) {
+    if (!t.defined() || !isFloatingOrComplexType(t.dtype())) return false;
+    return t.ne(t).any().item<bool>();
 }
 } // namespace
 
@@ -221,9 +230,34 @@ void Engine::evaluate_function(GraphTask& task, Node* func, InputBuffer& inputs,
         for (const auto& hook : func->pre_hooks()) {
             vars = hook(std::move(vars));
         }
-        outputs = func->apply(std::move(vars));
+        // Track the node under evaluation so nodes created during a
+        // create_graph backward record it as their anomaly-mode parent, and
+        // surface the forward traceback when the backward itself fails.
+        CurrentEvalNodeGuard eval_node_guard(
+            AnomalyMode::is_enabled() ? func->shared_from_this() : nullptr);
+        if (AnomalyMode::is_enabled()) {
+            try {
+                outputs = func->apply(std::move(vars));
+            } catch (...) {
+                if (auto* metadata = func->anomaly_metadata()) {
+                    metadata->print_stack(func->name());
+                }
+                throw;
+            }
+        } else {
+            outputs = func->apply(std::move(vars));
+        }
         for (const auto& hook : func->post_hooks()) {
             outputs = hook(outputs, std::move(outputs));
+        }
+    }
+
+    if (AnomalyMode::is_enabled() && AnomalyMode::should_check_nan()) {
+        GradModeGuard grad_guard(false);
+        for (size_t i = 0; i < outputs.size(); ++i) {
+            TP_THROW_IF(tensor_has_nan(outputs[i]), RuntimeError,
+                        "Function '", func->name(), "' returned nan values in its ",
+                        i, "th output.");
         }
     }
 

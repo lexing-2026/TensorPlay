@@ -642,28 +642,136 @@ def mse_loss(input, target, reduction='mean'):
 
     return _C.mse_loss(input, target, reduction_enum)
 
+def _nll_loss_red_enum(reduction):
+    if reduction == 'none': return 0
+    elif reduction == 'mean': return 1
+    elif reduction == 'sum': return 2
+    raise ValueError(f"{reduction} is not a valid value for reduction")
+
 def nll_loss(input, target, weight=None, size_average=None, ignore_index=-100,
              reduce=None, reduction='mean'):
+    r"""The negative log likelihood loss.
+
+    Supports the same shapes as :func:`torch.nn.functional.nll_loss`: 1D
+    ``input`` with a scalar ``target``, 2D ``(N, C)``, and N-d
+    ``(N, C, d_1, ..., d_k)`` (torch's ``nll_loss_nd``) with matching
+    ``target``.
+
+    See :class:`~tensorplay.nn.NLLLoss` for details.
+    """
     if size_average is not None or reduce is not None:
         if size_average is None: size_average = True
         if reduce is None: reduce = True
         if not reduce: reduction = 'none'
         elif size_average: reduction = 'mean'
         else: reduction = 'sum'
-    
-    reduction_enum = 1
-    if reduction == 'none': reduction_enum = 0
-    elif reduction == 'mean': reduction_enum = 1
-    elif reduction == 'sum': reduction_enum = 2
-    else: raise ValueError(f"{reduction} is not a valid value for reduction")
 
-    # nll_loss returns (output, total_weight)
-    output, _ = _C.nll_loss(input, target, weight, reduction_enum, ignore_index)
+    reduction_enum = _nll_loss_red_enum(reduction)
+
+    if input.dim() <= 2:
+        # nll_loss returns (output, total_weight)
+        output, _ = _C.nll_loss(input, target, weight, reduction_enum, ignore_index)
+        return output
+
+    # Port of at::native::nll_loss_nd_symint (aten/src/ATen/native/LossNLL.cpp:678):
+    # every spatial position acts as its own batch row, so move classes last,
+    # flatten to (-1, C), run the 2-D kernel and restore the target shape.
+    if tuple(target.size())[1:] != tuple(input.size())[2:]:
+        expected = tuple(input.size()[:1] + input.size()[2:])
+        raise ValueError(f"Expected target size {expected}, got {tuple(target.size())}")
+    n = input.size(0)
+    c = input.size(1)
+    # (N, C, d_1, ..., d_k) -> (N, d_1, ..., d_k, C) -> (N * prod(d_i), C);
+    # row order matches target's contiguous flattening.
+    x = input.permute([0] + list(range(2, input.dim())) + [1]).contiguous().reshape(-1, c)
+    t = target.contiguous().reshape(-1)
+    if t.dtype != DType.int64:
+        t = t.to(DType.int64)
+    output, _ = _C.nll_loss(x, t, weight, reduction_enum, ignore_index)
+    if reduction == 'none':
+        output = output.reshape(target.size())
     return output
 
 def cross_entropy(input, target, weight=None, size_average=None, ignore_index=-100,
                   reduce=None, reduction='mean', label_smoothing=0.0):
-    return nll_loss(log_softmax(input, 1), target, weight, None, ignore_index, None, reduction)
+    r"""Compute the cross entropy loss between input logits and target.
+
+    Port of at::native::cross_entropy_loss_symint
+    (aten/src/ATen/native/LossNLL.cpp:633): equal input/target shapes select
+    the class-probability path, positive ``label_smoothing`` blends the NLL
+    with a smoothed uniform term, and otherwise this is
+    ``nll_loss(log_softmax(input), target)`` with N-d support.
+
+    See :class:`~tensorplay.nn.CrossEntropyLoss` for details.
+    """
+    if size_average is not None or reduce is not None:
+        reduction = _legacy_get_string(size_average, reduce)
+
+    class_dim = 0 if input.dim() == 1 else 1
+    n_classes = input.size(class_dim)
+    if weight is not None and (weight.dim() != 1 or weight.numel() != n_classes):
+        raise ValueError(
+            f"cross_entropy: weight tensor should be defined either for all "
+            f"{n_classes} classes or no classes but got weight tensor of "
+            f"shape: {tuple(weight.size())}")
+
+    if tuple(target.size()) == tuple(input.size()):
+        # Soft targets when input and target shapes are the same
+        # (port of cross_entropy_loss_prob_target, LossNLL.cpp:529).
+        if ignore_index >= 0:
+            raise ValueError("ignore_index is not supported for floating point target")
+        if label_smoothing > 1.0:
+            raise ValueError(f"label_smoothing must be between 0.0 and 1.0. Got: {label_smoothing}")
+        input_ = log_softmax(input, class_dim)
+        if label_smoothing > 0.0:
+            target = target * (1 - label_smoothing) + label_smoothing / n_classes
+        if weight is not None:
+            w_shape = [1] * input.dim()
+            w_shape[class_dim] = n_classes
+            loss = -(input_ * target * weight.view(w_shape)).sum(class_dim)
+        else:
+            loss = -(input_ * target).sum(class_dim)
+        if reduction == "none":
+            return loss
+        total = loss.sum()
+        if reduction == "sum":
+            return total
+        if input.numel() == 0:
+            return tensorplay.full([], float("nan"), dtype=total.dtype, device=total.device)
+        return total / (input.numel() / n_classes)
+
+    if label_smoothing > 0.0:
+        # Port of cross_entropy_loss_label_smoothing (LossNLL.cpp:577).
+        if label_smoothing > 1.0:
+            raise ValueError(f"label_smoothing must be between 0.0 and 1.0. Got: {label_smoothing}")
+        input_ = log_softmax(input, class_dim)
+        nllloss = nll_loss(input_, target, weight, None, ignore_index, None, reduction)
+        if weight is not None:
+            w_shape = [1] * input_.dim()
+            w_shape[class_dim] = n_classes
+            smooth_loss = -(input_ * weight.view(w_shape)).sum(class_dim)
+        else:
+            smooth_loss = -input_.sum(class_dim)
+        ignore_mask = target.eq(ignore_index)
+        smooth_loss = smooth_loss.masked_fill(ignore_mask, 0.0)
+        if reduction == "mean":
+            if weight is not None:
+                filtered_target = target.masked_fill(ignore_mask, 0)
+                tgt_weights = weight.index_select(0, filtered_target.reshape(-1))
+                weight_sum = tgt_weights.masked_fill_(ignore_mask.reshape(-1), 0).sum()
+                ret = smooth_loss.sum() / weight_sum
+            else:
+                true_mask = tensorplay.logical_not(ignore_mask)
+                ret = smooth_loss.sum() / true_mask.to(smooth_loss.dtype).sum()
+        elif reduction == "sum":
+            ret = smooth_loss.sum()
+        elif reduction == "none":
+            ret = smooth_loss
+        else:
+            raise ValueError(f"{reduction} is not valid")
+        return (1 - label_smoothing) * nllloss + ret * (label_smoothing / n_classes)
+
+    return nll_loss(log_softmax(input, class_dim), target, weight, None, ignore_index, None, reduction)
 
 
 # -----------------------------------------------------------------------------
@@ -2801,9 +2909,10 @@ def scaled_dot_product_attention(
     dropout_p: float = 0.0,
     is_causal: bool = False,
     scale=None,
+    backend: Optional[str] = None,
 ) -> Tensor:
     r"""scaled_dot_product_attention(query, key, value, attn_mask=None,
-    dropout_p=0.0, is_causal=False, scale=None) -> Tensor
+    dropout_p=0.0, is_causal=False, scale=None, backend=None) -> Tensor
 
     Computes scaled dot product attention on query, key and value. Routes to
     the fused native kernel when possible, otherwise follows torch's math
@@ -2811,10 +2920,37 @@ def scaled_dot_product_attention(
 
     .. math::
         \text{Attention}(Q, K, V) = \text{softmax}(\frac{Q K^T}{\sqrt{E}}) V
+
+    Args:
+        backend (str, optional): ``'flash'`` | ``'mem_efficient'`` |
+            ``'math'``, or ``None`` to pick automatically. ``'flash'``
+            selects the fused flash-attention kernel (impl=1), ``'math'``
+            forces the composed reference path; ``'mem_efficient'``,
+            matching torch's memory-efficient backend, is not available in
+            this build.
     """
     if attn_mask is not None and is_causal:
         raise AssertionError("Explicit attn_mask should not be set when is_causal=True")
-    if scale is None and attn_mask is None and dropout_p == 0.0:
+    if backend not in (None, "math", "flash", "mem_efficient"):
+        raise ValueError(
+            f"scaled_dot_product_attention: unknown backend '{backend}'; "
+            "expected 'flash', 'mem_efficient', 'math' or None")
+    if backend == "mem_efficient":
+        raise NotImplementedError(
+            "scaled_dot_product_attention: the mem_efficient backend requires "
+            "native memory-efficient attention kernels, which are not yet "
+            "available in this build.")
+
+    if backend == "flash":
+        if dropout_p != 0.0:
+            raise NotImplementedError(
+                "scaled_dot_product_attention: the flash backend does not support dropout")
+        return tensorplay.scaled_dot_product_attention(query, key, value, is_causal=is_causal, impl=1)
+
+    # Auto-routing: only the plain case hits the fused native kernel; every
+    # other combination (and an explicit 'math' request) uses the reference
+    # composition below.
+    if backend is None and scale is None and attn_mask is None and dropout_p == 0.0:
         return tensorplay.scaled_dot_product_attention(query, key, value, is_causal=is_causal)
 
     L, S = query.size(-2), key.size(-2)

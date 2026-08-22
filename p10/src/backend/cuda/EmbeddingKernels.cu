@@ -1,6 +1,7 @@
 #include "Tensor.h"
 #include "SparseKernels.h"
 #include "Dispatcher.h"
+#include "Context.h"
 #include "CUDARuntime.h"
 #include "Exception.h"
 #include "Half.h"
@@ -572,6 +573,8 @@ Tensor embedding_dense_backward_cuda(
     int64_t num_weights,
     int64_t padding_idx,
     bool scale_grad_by_freq) {
+  // Accumulates with atomicAdd (no deterministic variant implemented).
+  globalContext().alertNotDeterministic("embedding_dense_backward_cuda");
   if (indices.dtype() != DType::Int64 && indices.dtype() != DType::Int32) {
     TP_THROW(TypeError, "embedding_dense_backward: indices must be Int64 or Int32");
   }

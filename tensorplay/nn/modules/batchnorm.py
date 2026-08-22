@@ -16,6 +16,7 @@ __all__ = [
     "LazyBatchNorm2d",
     "BatchNorm3d",
     "LazyBatchNorm3d",
+    "SyncBatchNorm",
 ]
 
 
@@ -597,3 +598,226 @@ class LazyBatchNorm3d(_LazyNormBase, _BatchNorm):
     def _check_input_dim(self, input) -> None:
         if input.dim() != 5:
             raise ValueError(f"expected 5D input (got {input.dim()}D input)")
+
+
+class SyncBatchNorm(_BatchNorm):
+    r"""Applies Batch Normalization over a N-Dimensional input with
+    synchronized batch statistics across all processes in the group.
+
+    See :class:`~tensorplay.nn.BatchNorm2d` (and torch's ``SyncBatchNorm``)
+    for the semantics; during training the per-rank mean/invstd are gathered
+    and combined with a count-weighted parallel-variance formula, so every
+    rank normalizes with identical global statistics. Eval mode and
+    single-process runs fall back to plain :class:`BatchNorm` behavior.
+
+    Currently only :class:`~tensorplay.nn.parallel.DistributedDataParallel`
+    usage is supported. Use
+    :meth:`~SyncBatchNorm.convert_sync_batchnorm` to convert
+    ``BatchNorm*d`` layers before wrapping the module in DDP.
+
+    Args:
+        num_features: :math:`C` from an expected input of size :math:`(N, C, +)`
+        eps: a value added to the denominator for numerical stability.
+            Default: 1e-5
+        momentum: the value used for the running_mean and running_var
+            computation. Can be ``None`` for cumulative moving average.
+            Default: 0.1
+        affine: a boolean value that when set to ``True``, this module has
+            learnable affine parameters. Default: ``True``
+        track_running_stats: whether to track running statistics. Default: ``True``
+        process_group: process group over which statistics are synchronized.
+            Default: the whole world.
+    """
+
+    def __init__(
+        self,
+        num_features: int,
+        eps: float = 1e-5,
+        momentum: Optional[float] = 0.1,
+        affine: bool = True,
+        track_running_stats: bool = True,
+        process_group=None,
+        device=None,
+        dtype=None,
+    ) -> None:
+        super().__init__(
+            num_features,
+            eps,
+            momentum,
+            affine,
+            track_running_stats,
+            device=device,
+            dtype=dtype,
+        )
+        self.process_group = process_group
+
+    def _check_input_dim(self, input) -> None:
+        if input.dim() < 2:
+            raise ValueError(f"expected at least 2D input (got {input.dim()}D input)")
+
+    def forward(self, input: Tensor) -> Tensor:
+        """
+        Runs the forward pass.
+        """
+        self._check_input_dim(input)
+
+        if self.momentum is None:
+            exponential_average_factor = 0.0
+        else:
+            exponential_average_factor = self.momentum
+
+        if self.training and self.track_running_stats:
+            if self.num_batches_tracked is not None:
+                self.num_batches_tracked.add_(1)
+                if self.momentum is None:  # use cumulative moving average
+                    exponential_average_factor = 1.0 / float(self.num_batches_tracked.item())
+                else:  # use exponential moving average
+                    exponential_average_factor = self.momentum
+
+        if self.training:
+            bn_training = True
+        else:
+            bn_training = (self.running_mean is None) and (self.running_var is None)
+
+        running_mean = (
+            self.running_mean if not self.training or self.track_running_stats else None
+        )
+        running_var = (
+            self.running_var if not self.training or self.track_running_stats else None
+        )
+
+        # Don't sync batchnorm stats in inference mode (model.eval()).
+        need_sync = (
+            bn_training
+            and self.training
+            and tensorplay.distributed.is_available()
+            and tensorplay.distributed.is_initialized()
+        )
+        if need_sync:
+            process_group = self.process_group
+            world_size = tensorplay.distributed.get_world_size(process_group)
+            need_sync = world_size > 1
+
+        # fallback to framework BN when synchronization is not necessary
+        if not need_sync:
+            return F.batch_norm(
+                input,
+                running_mean,
+                running_var,
+                self.weight,
+                self.bias,
+                bn_training,
+                exponential_average_factor,
+                self.eps,
+            )
+
+        return _sync_batch_norm(
+            input,
+            self.weight,
+            self.bias,
+            running_mean,
+            running_var,
+            self.eps,
+            exponential_average_factor,
+            process_group,
+            world_size,
+        )
+
+    @classmethod
+    def convert_sync_batchnorm(cls, module, process_group=None):
+        r"""Converts all :attr:`BatchNorm*d` layers in the model to :class:`SyncBatchNorm` layers.
+
+        Args:
+            module (nn.Module): module containing one or more :attr:`BatchNorm*d` layers
+            process_group (optional): process group to scope synchronization,
+                default is the whole world
+
+        Returns:
+            The original :attr:`module` with converted :class:`SyncBatchNorm`
+            layers. If the original :attr:`module` is a :attr:`BatchNorm*d`
+            layer, a new :class:`SyncBatchNorm` layer object will be returned instead.
+        """
+        from . import batchnorm as _bn
+
+        module_output = module
+        if isinstance(module, _bn._BatchNorm) and not isinstance(module, SyncBatchNorm):
+            module_output = SyncBatchNorm(
+                module.num_features,
+                module.eps,
+                module.momentum,
+                module.affine,
+                module.track_running_stats,
+                process_group,
+            )
+            if module.affine:
+                with tensorplay.no_grad():
+                    module_output.weight = module.weight
+                    module_output.bias = module.bias
+            module_output.running_mean = module.running_mean
+            module_output.running_var = module.running_var
+            module_output.num_batches_tracked = module.num_batches_tracked
+            module_output.training = module.training
+        for name, child in module.named_children():
+            module_output.add_module(name, cls.convert_sync_batchnorm(child, process_group))
+        return module_output
+
+
+def _sync_batch_norm(input, weight, bias, running_mean, running_var,
+                     eps, momentum, process_group, world_size):
+    # Composed entirely of differentiable primitives, so backward flows through
+    # the standard autograd graph (no custom Function needed). Statistics sync
+    # mirrors torch.nn.modules._functions.SyncBatchNorm.forward.
+    dist = tensorplay.distributed
+    num_channels = input.shape[1]
+    ndim = input.dim()
+
+    # Per-channel stats over (N, +): move channel last, flatten rows.
+    perm = [0] + list(range(2, ndim)) + [1]
+    v = input.permute(perm)
+    v = v.reshape([-1, num_channels])
+
+    local_mean = v.mean(dim=[0])
+    centered = v - local_mean.unsqueeze(0)
+    local_var = (centered * centered).mean(dim=[0])
+    local_invstd = tensorplay.rsqrt(local_var + eps)
+
+    count = tensorplay.full([1], v.shape[0], dtype=local_mean.dtype, device=local_mean.device)
+    # (C,) + (C,) + (1,) -> (2C + 1,)
+    combined = tensorplay.cat([local_mean, local_invstd, count], dim=0)
+
+    gather_list = [
+        tensorplay.zeros_like(combined, requires_grad=False) for _ in range(world_size)
+    ]
+    dist.all_gather(gather_list, combined.contiguous(), process_group)
+    stacked = tensorplay.stack(gather_list, dim=0)  # (W, 2C+1)
+
+    mean_all = stacked[:, :num_channels]
+    invstd_all = stacked[:, num_channels:2 * num_channels]
+    count_all = stacked[:, 2 * num_channels]
+
+    # Remove stats from empty inputs.
+    mask = count_all.reshape(-1) >= 1
+    mean_all = mean_all[mask]
+    invstd_all = invstd_all[mask]
+    counts = count_all.reshape(-1)[mask].to(mean_all.dtype)
+
+    total_count = counts.sum()
+    mean = (mean_all * counts.unsqueeze(-1)).sum(dim=[0]) / total_count
+    variances = invstd_all * invstd_all - eps
+    var = ((variances + (mean_all - mean.unsqueeze(0)) ** 2) * counts.unsqueeze(-1)).sum(dim=[0]) / total_count
+
+    if running_mean is not None:
+        with tensorplay.no_grad():
+            running_mean.mul_(1.0 - momentum).add_(momentum * mean)
+    if running_var is not None:
+        with tensorplay.no_grad():
+            running_var.mul_(1.0 - momentum).add_(momentum * var)
+
+    view_shape = [1, num_channels] + [1] * (ndim - 2)
+    invstd = tensorplay.rsqrt(var + eps).reshape(view_shape)
+    out = (input - mean.reshape(view_shape)) * invstd
+    if weight is not None:
+        out = out * weight.reshape(view_shape)
+    if bias is not None:
+        out = out + bias.reshape(view_shape)
+    return out

@@ -269,7 +269,7 @@ def binding_default(t: Type, default: str) -> str:
         return "DType::Float32"
     if d == "Int64":
         return "DType::Int64"
-    if d.startswith("{"):
+    if d.startswith("{") or d.startswith("["):
         inner = d[1:-1].strip()
         if t.is_tensor_like:
             return "py::none()"

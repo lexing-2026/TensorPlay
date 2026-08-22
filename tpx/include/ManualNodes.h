@@ -183,7 +183,7 @@ struct RollBackward : public Node {
 
         std::vector<int64_t> neg_shifts(shifts_.size());
         for (size_t i = 0; i < shifts_.size(); ++i) neg_shifts[i] = -shifts_[i];
-        return {roll(grad, neg_shifts, dims_)};
+        return {tensorplay::tpx::ops::roll(grad, neg_shifts, dims_)};
     }
 };
 

@@ -9,8 +9,8 @@ from tensorplay import Tensor
 from torch.nn.modules.lazy import LazyModuleMixin
 from torch.nn.parameter import UninitializedParameter
 
-from torchaudio import functional as F
-from torchaudio.functional.functional import (
+from tensorplay.audio import functional as F
+from tensorplay.audio.functional.functional import (
     _apply_sinc_resample_kernel,
     _check_convolve_mode,
     _fix_waveform_shape,
