@@ -25,7 +25,7 @@ from flashlight.lib.text.dictionary import (
     Dictionary as _Dictionary,
     load_words as _load_words,
 )
-from torchaudio.utils import _download_asset
+from tensorplay.audio.utils.download import download_asset as _download_asset
 
 try:
     from flashlight.lib.text.decoder.kenlm import KenLM as _KenLM

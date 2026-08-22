@@ -1,6 +1,7 @@
 #pragma once
 #include <Python.h>
 #include "Autograd.h"
+#include "Context.h"
 #include "Exception.h"
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -130,12 +131,19 @@ inline DType infer_dtype(PyObject* list, int depth = 0) {
         }
     }
     
-    if (has_complex) return has_complex_double ? DType::ComplexDouble : DType::ComplexFloat;
-    if (has_float) return DType::Float32;
+    if (has_complex) {
+        // Mirrors torch: the default complex dtype follows the default
+        // floating point dtype (float64 -> complex128, else complex64).
+        if (has_complex_double || globalContext().defaultDType() == DType::Float64) {
+            return DType::ComplexDouble;
+        }
+        return DType::ComplexFloat;
+    }
+    if (has_float) return globalContext().defaultDType();
     if (has_int) return DType::Int64;
     if (has_bool) return DType::Bool;
-    
-    return DType::Float32; // Default if nothing found (e.g. empty sublists)
+
+    return globalContext().defaultDType(); // Default if nothing found (e.g. empty sublists)
 }
 
 // Optimized flat copy for the last dimension
@@ -239,7 +247,7 @@ inline Tensor list_to_tensor(PyObject* list, std::optional<DType> requested_dtyp
     }
     
     // Determine target device
-    Device target_device = device.value_or(Device(DeviceType::CPU));
+    Device target_device = device.value_or(globalContext().defaultDevice());
     
     // Optimization: If target is CPU, create directly.
     // If target is GPU, create on CPU first (staging) then copy.

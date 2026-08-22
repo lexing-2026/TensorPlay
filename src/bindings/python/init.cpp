@@ -1,5 +1,6 @@
 #include "python_bindings.h"
 #include "tensorplay/ops/Config.h"
+#include "Context.h"
 #include "OneDNNContext.h"
 #include <cstdlib>
 
@@ -71,6 +72,77 @@ PYBIND11_MODULE(_C, m) {
     m.def("_cxx_flags", &tensorplay::_cxx_flags);
     m.def("_parallel_info", &tensorplay::_parallel_info);
     m.def("_get_build_info", &tensorplay::get_build_info);
+
+    // Global default dtype/device (mirrors torch._C bindings of the same
+    // names; see torch/csrc/Module.cpp and torch/__init__.py).
+    m.def("get_default_dtype", []() {
+        return tensorplay::globalContext().defaultDType();
+    }, "get_default_dtype() -> DType\n\n"
+       "Gets the current default floating point dtype.");
+
+    m.def("_set_default_dtype", [](DType dtype) {
+        tensorplay::globalContext().setDefaultDType(dtype);
+    }, "dtype"_a);
+
+    m.def("get_default_device", []() {
+        return tensorplay::globalContext().defaultDevice();
+    }, "get_default_device() -> Device\n\n"
+       "Gets the default ``Tensor`` to be allocated on ``device``");
+
+    m.def("_set_default_device", [](std::optional<Device> device) {
+        if (device.has_value()) {
+            tensorplay::globalContext().setDefaultDevice(device);
+        } else {
+            tensorplay::globalContext().clearDefaultDevice();
+        }
+    }, "device"_a.none());
+
+    m.def("_push_default_device", [](const Device& device) {
+        tensorplay::globalContext().pushDefaultDevice(device);
+    }, "device"_a);
+    m.def("_pop_default_device", []() {
+        tensorplay::globalContext().popDefaultDevice();
+    });
+
+    // Deterministic algorithms (torch/csrc/Module.cpp:
+    // _set_deterministic_algorithms / _get_deterministic_algorithms /
+    // _get_deterministic_algorithms_warn_only)
+    m.def("_set_deterministic_algorithms",
+          [](bool mode, bool warn_only) {
+              tensorplay::globalContext().setDeterministicAlgorithms(mode, warn_only);
+          },
+          "mode"_a, py::kw_only(), "warn_only"_a = false);
+    m.def("_get_deterministic_algorithms", []() {
+        return tensorplay::globalContext().deterministicAlgorithms();
+    });
+    m.def("_get_deterministic_algorithms_warn_only", []() {
+        return tensorplay::globalContext().deterministicAlgorithmsWarnOnly();
+    });
+
+    // Float32 matmul precision (torch/csrc/Module.cpp:
+    // _set_float32_matmul_precision / _get_float32_matmul_precision)
+    m.def("get_float32_matmul_precision", []() {
+        return tensorplay::globalContext().getFloat32MatmulPrecisionStr();
+    }, "get_float32_matmul_precision() -> str\n\n"
+       "Returns the current value of float32 matrix multiplication precision.");
+    m.def("_set_float32_matmul_precision", [](const std::string& precision) {
+        tensorplay::globalContext().setFloat32MatmulPrecision(precision);
+    }, "precision"_a);
+
+    // TF32 flags (torch/csrc/Module.cpp: _get/_set_cublas_allow_tf32,
+    // _get/_set_cudnn_allow_tf32)
+    m.def("_get_cublas_allow_tf32", []() {
+        return tensorplay::globalContext().allowTF32CuBLAS();
+    });
+    m.def("_set_cublas_allow_tf32", [](bool enabled) {
+        tensorplay::globalContext().setAllowTF32CuBLAS(enabled);
+    }, "enabled"_a);
+    m.def("_get_cudnn_allow_tf32", []() {
+        return tensorplay::globalContext().allowTF32CuDNN();
+    });
+    m.def("_set_cudnn_allow_tf32", [](bool enabled) {
+        tensorplay::globalContext().setAllowTF32CuDNN(enabled);
+    }, "enabled"_a);
 
     m.def("set_printoptions", &tensorplay::set_printoptions, 
           "Set print options", 

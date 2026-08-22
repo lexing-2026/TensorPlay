@@ -421,7 +421,8 @@ Tensor create_tensor(py::object data, std::optional<DType> dtype, std::optional<
     
     // Handle dtype conversion if needed
     if (dtype.has_value() && t.dtype() != *dtype) {
-        Tensor new_t(static_cast<std::vector<int64_t>>(t.shape()), *dtype, device.value_or(Device(DeviceType::CPU)));
+        Tensor new_t(static_cast<std::vector<int64_t>>(t.shape()), *dtype,
+                     device.value_or(tensorplay::globalContext().defaultDevice()));
         Tensor new_t_wrapper(new_t);
         convert_tensor_data(t, new_t_wrapper);
         t = new_t_wrapper;
@@ -429,7 +430,12 @@ Tensor create_tensor(py::object data, std::optional<DType> dtype, std::optional<
     
     // Handle device movement if needed
     // Note: list_to_tensor returns CPU tensor.
-    if (device.has_value() && t.device() != *device) {
+    if (!device.has_value()) {
+        Device target = tensorplay::globalContext().defaultDevice();
+        if (t.device() != target && target.type() != DeviceType::CPU) {
+            t = t.to(target);
+        }
+    } else if (t.device() != *device) {
         Tensor new_t(static_cast<std::vector<int64_t>>(t.shape()), t.dtype(), *device);
         new_t.copy_(t);
         t = Tensor(new_t);
@@ -999,6 +1005,9 @@ void init_tensor(py::module_& m) {
         })
         .def_property_readonly("_accumulate_grad_node", [](const Tensor& self) -> std::shared_ptr<tensorplay::tpx::Node> {
             return tensorplay::tpx::impl::grad_accumulator(self);
+        })
+        .def("element_size", [](const Tensor& self) -> int64_t {
+            return static_cast<int64_t>(self.itemsize());
         })
         .def_property_readonly("is_cuda", [](const Tensor& self) { return self.device().type() == DeviceType::CUDA; })
         .def("pin_memory", [](const Tensor& self) {

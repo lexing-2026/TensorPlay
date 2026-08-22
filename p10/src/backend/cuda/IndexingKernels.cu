@@ -16,6 +16,7 @@
 #include "Dispatcher.h"
 #include "Scalar.h"
 #include "Exception.h"
+#include "Context.h"
 #include "CUDARuntime.h"
 #include "Utils.h"
 
@@ -735,6 +736,8 @@ Tensor scatter_base_cuda(const Tensor& self, int64_t dim, const Tensor& index,
 } // anonymous namespace
 
 Tensor scatter_add_cuda(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& src) {
+    // Accumulates with atomicAdd (no deterministic variant implemented).
+    globalContext().alertNotDeterministic("scatter_add_cuda");
     return scatter_base_cuda<true>(self, dim, index, src);
 }
 Tensor scatter_src_cuda(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& src) {
@@ -751,6 +754,10 @@ Tensor scatter_value_cuda(const Tensor& self, int64_t dim, const Tensor& index, 
 // kernel plus a copy back so any layout works.
 static Tensor& scatter_base_inplace_cuda(Tensor& self, int64_t dim, const Tensor& index,
                                          const Tensor& src, bool add) {
+    if (add) {
+        // Accumulates with atomicAdd (no deterministic variant implemented).
+        globalContext().alertNotDeterministic("scatter_add_");
+    }
     if (!self.is_contiguous()) {
         // scatter_base_cuda<Add> already starts from a clone of self, so its
         // result is exactly what scatter_/scatter_add_ should leave in self.
@@ -1002,6 +1009,10 @@ namespace {
 Tensor index_put_impl_cuda(Tensor& result, const std::vector<Tensor>& indices,
                            const Tensor& values, bool accumulate) {
     if (indices.empty()) TP_THROW(IndexError, "index_put: at least one index tensor required");
+    if (accumulate) {
+        // Accumulates with atomicAdd (no deterministic variant implemented).
+        globalContext().alertNotDeterministic("index_put");
+    }
     int64_t numel_self = result.numel();
     Tensor flat_idx = indices[0].to(DType::Int64).contiguous();
     for (size_t i = 1; i < indices.size(); ++i) {
@@ -1181,6 +1192,8 @@ Tensor bucketize_cuda(const Tensor& self, const Tensor& boundaries, bool out_int
 // ---------------------------------------------------------------------------
 
 Tensor bincount_cuda(const Tensor& self, const Tensor& weights, int64_t minlength) {
+    // Accumulates with atomicAdd (no deterministic variant implemented).
+    globalContext().alertNotDeterministic("bincount_cuda");
     if (minlength < 0) TP_THROW(RuntimeError, "minlength should be >= 0");
     if (isFloatingType(self.dtype())) {
         TP_THROW(RuntimeError, "bincount only supports 1-d non-negative integral inputs.");

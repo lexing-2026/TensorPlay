@@ -21,19 +21,36 @@ from .grad_mode import (
 )
 
 from .function import Function
-from .._C._autograd import backward, grad as _grad
+from .._C._autograd import (
+    backward,
+    grad as _grad,
+    is_anomaly_enabled,
+    is_anomaly_check_nan_enabled,
+)
 
 
 __all__ = [
     "Function",
     "backward",
+    "grad",
     "grad_mode",
     "enable_grad",
     "is_grad_enabled",
-    "grad",
     "inference_mode",
     "no_grad",
     "set_grad_enabled",
+    # anomaly mode
+    "detect_anomaly",
+    "set_detect_anomaly",
+    "is_anomaly_enabled",
+    "is_anomaly_check_nan_enabled",
+    # functional API for higher-order derivatives
+    "jacobian",
+    "hessian",
+    "vjp",
+    "vhp",
+    "hvp",
+    "jvp",
 ]
 
 _OptionalTensor = Optional[tensorplay.Tensor]
@@ -47,7 +64,7 @@ def grad(
     retain_graph: Optional[bool] = None,
     create_graph: bool = False,
     allow_unused: Optional[bool] = None,
-) -> tuple[tensorplay.Tensor, ...]:
+) -> tuple[Optional[tensorplay.Tensor], ...]:
     r"""Compute and return the sum of gradients of outputs with respect to the inputs.
 
     ``grad_outputs`` should be a sequence of length matching ``output``
@@ -85,13 +102,20 @@ def grad(
         outputs = [outputs]
     if not isinstance(inputs, (list, tuple)):
         inputs = [inputs]
-        
+
     if retain_graph is None:
         retain_graph = create_graph
     if allow_unused is None:
         allow_unused = False
-        
+
     return _grad(outputs, inputs, grad_outputs, retain_graph, create_graph, allow_unused)
 
 
-__all__ = ["backward", "grad", "no_grad", "enable_grad", "set_grad_enabled", "is_grad_enabled", "Function"]
+from .anomaly_mode import detect_anomaly, set_detect_anomaly  # noqa: E402
+from . import functional as functional  # noqa: E402
+from .functional import jacobian, hessian, vjp, vhp, hvp, jvp  # noqa: E402
+from .gradcheck import (  # noqa: E402
+    gradcheck,
+    gradgradcheck,
+    GradcheckError,
+)

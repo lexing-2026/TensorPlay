@@ -720,7 +720,6 @@ add_custom_command(
             DEPENDS
                 ${CMAKE_CURRENT_SOURCE_DIR}/config/native_functions.yaml
                 ${CMAKE_CURRENT_SOURCE_DIR}/config/derivatives.yaml
-                ${CMAKE_CURRENT_SOURCE_DIR}/tools/codegen/gen.py
                 ${CMAKE_CURRENT_SOURCE_DIR}/tools/codegen/main.py
                 ${CMAKE_CURRENT_SOURCE_DIR}/tools/codegen/model.py
                 ${CMAKE_CURRENT_SOURCE_DIR}/tools/codegen/api_types.py

@@ -20,6 +20,7 @@
 
 #include "Tensor.h"
 #include "Dispatcher.h"
+#include "Context.h"
 #include "CUDARuntime.h"
 #include "Utils.h"
 
@@ -842,6 +843,8 @@ Tensor upsample_trilinear3d_cuda(const Tensor& self, std::vector<int64_t> output
 }
 
 Tensor upsample_linear1d_backward_cuda(const Tensor& grad_output, std::vector<int64_t> output_size, std::vector<int64_t> input_size, bool align_corners, std::optional<double> scales) {
+    // Accumulates with atomicAdd (no deterministic variant implemented).
+    globalContext().alertNotDeterministic("upsample_linear1d_backward_cuda");
     Tensor go = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
     Tensor grad_input = Tensor::zeros(out_shape(go, input_size), go.dtype(), go.device());
     const int64_t batchsize = go.size(0), channels = go.size(1);
@@ -861,6 +864,8 @@ Tensor upsample_linear1d_backward_cuda(const Tensor& grad_output, std::vector<in
 }
 
 Tensor upsample_bilinear2d_backward_cuda(const Tensor& grad_output, std::vector<int64_t> output_size, std::vector<int64_t> input_size, bool align_corners, std::optional<double> scales_h, std::optional<double> scales_w) {
+    // Accumulates with atomicAdd (no deterministic variant implemented).
+    globalContext().alertNotDeterministic("upsample_bilinear2d_backward_cuda");
     Tensor go = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
     Tensor grad_input = Tensor::zeros(out_shape(go, input_size), go.dtype(), go.device());
     const int64_t batchsize = go.size(0), channels = go.size(1);
@@ -883,6 +888,8 @@ Tensor upsample_bilinear2d_backward_cuda(const Tensor& grad_output, std::vector<
 }
 
 Tensor upsample_trilinear3d_backward_cuda(const Tensor& grad_output, std::vector<int64_t> output_size, std::vector<int64_t> input_size, bool align_corners, std::optional<double> scales_d, std::optional<double> scales_h, std::optional<double> scales_w) {
+    // Accumulates with atomicAdd (no deterministic variant implemented).
+    globalContext().alertNotDeterministic("upsample_trilinear3d_backward_cuda");
     // ATen UpSampleTrilinear3d.cu upsample_trilinear3d_backward_out_frame:
     // trilinear scatter with atomicAdd; implemented as two chained bilinear
     // scatters per depth slice pair (identical weight decomposition).
@@ -931,6 +938,8 @@ Tensor upsample_bicubic2d_cuda(const Tensor& self, std::vector<int64_t> output_s
 }
 
 Tensor upsample_bicubic2d_backward_cuda(const Tensor& grad_output, std::vector<int64_t> output_size, std::vector<int64_t> input_size, bool align_corners, std::optional<double> scales_h, std::optional<double> scales_w) {
+    // Accumulates with atomicAdd (no deterministic variant implemented).
+    globalContext().alertNotDeterministic("upsample_bicubic2d_backward_cuda");
     Tensor go = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
     Tensor grad_input = Tensor::zeros(out_shape(go, input_size), go.dtype(), go.device());
     const int64_t batchsize = go.size(0), channels = go.size(1);

@@ -4,6 +4,7 @@ project(tpx LANGUAGES CXX)
 
 set(TPX_SOURCES
     src/Autograd.cpp
+    src/AnomalyMode.cpp
     src/autocast_mode.cpp
     src/Engine.cpp
     ${GEN_TPX_OPS_CPP}

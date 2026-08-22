@@ -12,74 +12,89 @@ namespace tensorplay {
 namespace cpu {
 using namespace tensorplay::parallel;
 
+// Port of at::native::constant_pad_nd (aten/src/ATen/native/PadNd.cpp:29).
+// Composite over narrow/fill_/copy_ so one body serves CPU and CUDA; negative
+// pads crop the input through narrow, positive pads fill an output canvas.
 Tensor constant_pad_nd_cpu(const Tensor& self, const std::vector<int64_t>& pad, Scalar value) {
-    auto self_shape = self.shape();
-    auto ndim = self.dim();
-    auto pad_len = pad.size();
+    auto input_sizes = self.shape();
+    int64_t l_inp = self.dim();
+    int64_t l_pad = static_cast<int64_t>(pad.size()) / 2;
 
-    if (pad_len % 2 != 0) {
-         TP_THROW(ValueError, "Length of pad must be even but instead it equals ", pad_len);
+    if (pad.size() % 2 != 0) {
+         TP_THROW(ValueError, "Length of pad must be even but instead it equals ", pad.size());
+    }
+    if (l_inp < l_pad) {
+         TP_THROW(ValueError, "Length of pad should be no more than twice the number of "
+                  "dimensions of the input. Pad length is ", pad.size(), " while the input has ",
+                  l_inp, " dimensions.");
     }
 
-    int64_t l_pad = pad_len / 2;
-    if (l_pad > ndim) {
-         TP_THROW(ValueError, "Padding length too large");
+    bool all_pads_non_positive = true;
+    Tensor c_input = self;
+    for (int64_t i = l_inp - l_pad; i < l_inp; ++i) {
+        int64_t pad_idx = 2 * (l_inp - i - 1);
+        if (pad[pad_idx] < 0) {
+            c_input = c_input.slice(i, -pad[pad_idx], c_input.size(i));
+        } else if (pad[pad_idx] != 0) {
+            all_pads_non_positive = false;
+        }
+        if (pad[pad_idx + 1] < 0) {
+            c_input = c_input.slice(i, 0, c_input.size(i) + pad[pad_idx + 1]);
+        } else if (pad[pad_idx + 1] != 0) {
+            all_pads_non_positive = false;
+        }
     }
 
-    // 1. Calculate output shape
-    std::vector<int64_t> out_shape = static_cast<std::vector<int64_t>>(self_shape);
-    for (size_t i = 0; i < l_pad; ++i) {
-        // pad is [pad_left, pad_right, pad_top, pad_bottom, ...]
-        // corresponding to dim [ndim-1, ndim-2, ...]
-        int64_t pad_idx = i * 2; // 0, 2, 4
-        int64_t dim = ndim - 1 - i;
-        out_shape[dim] += pad[pad_idx] + pad[pad_idx + 1];
+    // if none of the pads are positive we can optimize and just return the result
+    // of calling .narrow() on the input
+    if (all_pads_non_positive) {
+        return c_input.clone();
     }
 
-    // 2. Allocate output
-    Tensor output = Tensor::empty(out_shape, self.dtype(), self.device());
+    std::vector<int64_t> new_shape;
+    new_shape.reserve(l_inp - l_pad);
+    for (int64_t i = 0; i < l_inp - l_pad; ++i) {
+        new_shape.push_back(input_sizes[i]);
+    }
 
-    // 3. Fill with value
+    for (int64_t i = 0; i < l_pad; ++i) {
+        size_t pad_idx = pad.size() - ((i + 1) * 2);
+        int64_t new_dim = input_sizes[l_inp - l_pad + i] + pad[pad_idx] + pad[pad_idx + 1];
+        if (new_dim < 0) {
+            TP_THROW(ValueError, "The input size ", input_sizes[l_inp - l_pad + i],
+                     ", plus negative padding ", pad[pad_idx], " and ", pad[pad_idx + 1],
+                     " resulted in a negative output size, which is invalid. Check dimension ",
+                     l_inp - l_pad + i, " of your input.");
+        }
+        new_shape.push_back(new_dim);
+    }
+
+    Tensor output = Tensor::empty(new_shape, self.dtype(), self.device());
     output.fill_(value);
 
-    // 4. Copy input to output slice
-    Tensor out_slice = output;
-    for (size_t i = 0; i < l_pad; ++i) {
-        int64_t dim = ndim - 1 - i;
-        int64_t pad_l = pad[i * 2];
-        // narrow/slice logic
-        // slice(dim, start, end)
-        int64_t start = pad_l;
-        int64_t end = start + self_shape[dim];
-        out_slice = out_slice.slice(dim, start, end);
+    Tensor c_output = output;
+    for (int64_t i = l_inp - l_pad; i < l_inp; ++i) {
+        int64_t pad_idx = 2 * (l_inp - i - 1);
+        if (pad[pad_idx] > 0) {
+            c_output = c_output.slice(i, pad[pad_idx], c_output.size(i));
+        }
+        if (pad[pad_idx + 1] > 0) {
+            c_output = c_output.slice(i, 0, c_output.size(i) - pad[pad_idx + 1]);
+        }
     }
-    out_slice.copy_(self);
+    c_output.copy_(c_input);
 
     return output;
 }
 
+// Port of torch::autograd::generated::constant_pad_nd_backward
+// (torch/csrc/autograd/FunctionsManual.cpp): the co-gradient is
+// constant_pad_nd(grad, -pad, 0), which uniformly zero-fills cropped regions
+// and slices padded ones.
 Tensor constant_pad_nd_backward_cpu(const Tensor& grad_output, const std::vector<int64_t>& pad) {
-    auto ndim = grad_output.dim();
-    auto pad_len = pad.size();
-    auto l_pad = pad_len / 2;
-
-    Tensor grad_input = grad_output;
-    for (size_t i = 0; i < l_pad; ++i) {
-        int64_t dim = ndim - 1 - i;
-        int64_t pad_l = pad[i * 2];
-        int64_t pad_r = pad[i * 2 + 1];
-
-        int64_t start = pad_l;
-        int64_t end = grad_input.size(dim) - pad_r;
-        grad_input = grad_input.slice(dim, start, end);
-    }
-
-    // Return contiguous copy
-    if (grad_input.is_contiguous()) {
-        return grad_input;
-    } else {
-        return grad_input.clone();
-    }
+    std::vector<int64_t> negated_pad = pad;
+    for (auto& p : negated_pad) p = -p;
+    return constant_pad_nd_cpu(grad_output, negated_pad, 0);
 }
 
 // ===========================================================================
@@ -351,6 +366,14 @@ TENSORPLAY_LIBRARY_IMPL(CPU, PadKernels) {
     m.impl("replication_pad_nd_backward", replication_pad_nd_backward_cpu);
     m.impl("circular_pad_nd", circular_pad_nd_cpu);
     m.impl("circular_pad_nd_backward", circular_pad_nd_backward_cpu);
+}
+
+// constant_pad_nd is a composite over narrow/fill_/copy_ (PadNd.cpp), all of
+// which dispatch by tensor device, so the CPU TU registers the same body for
+// CUDA instead of carrying a duplicate kernel.
+TENSORPLAY_LIBRARY_IMPL(CUDA, PadKernelsConstantComposite) {
+    m.impl("constant_pad_nd", constant_pad_nd_cpu);
+    m.impl("constant_pad_nd_backward", constant_pad_nd_backward_cpu);
 }
 
 } // namespace cpu

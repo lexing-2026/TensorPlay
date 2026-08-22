@@ -280,3 +280,49 @@ def register_hook(self, hook):
 
 
 Tensor.register_hook = register_hook
+
+
+def register_post_accumulate_grad_hook(self, hook):
+    """Registers a hook (torch's ``Tensor.register_post_accumulate_grad_hook``).
+
+    The hook runs after the gradient has been accumulated into ``self.grad``.
+    It receives the tensor (the parameter) and its return value is ignored;
+    unlike :meth:`register_hook` it cannot replace the gradient, but it may
+    modify ``self.grad`` in place. Only leaf tensors that require grad and
+    are used in the autograd graph support this hook.
+
+    Returns a :class:`~tensorplay.utils.hooks.RemovableHandle`.
+    """
+    from tensorplay.utils.hooks import RemovableHandle
+
+    if not self.requires_grad:
+        raise RuntimeError(
+            "cannot register a hook on a tensor that doesn't require gradient"
+        )
+    if not self.is_leaf:
+        raise RuntimeError(
+            "Registering a hook on a tensor that is not a leaf will "
+            "cause an error"
+        )
+
+    hooks_dict = OrderedDict()
+
+    def post_hook(_inputs, outputs):
+        for h in list(hooks_dict.values()):
+            h(self)
+        return outputs
+
+    node = self._accumulate_grad_node
+    if node is None:
+        raise RuntimeError(
+            "cannot register a hook on a tensor whose AccumulateGrad node "
+            "has not been created yet; run a backward pass first"
+        )
+    node.add_post_hook(post_hook)
+
+    handle = RemovableHandle(hooks_dict)
+    hooks_dict[handle.id] = hook
+    return handle
+
+
+Tensor.register_post_accumulate_grad_hook = register_post_accumulate_grad_hook

@@ -5,6 +5,7 @@
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
 #include <algorithm>
+#include <limits>
 #include <string>
 #include <tuple>
 
@@ -236,6 +237,68 @@ Tensor& normal_kernel_cuda(Tensor& self, double mean, double std) {
     return self;
 }
 
+// Port of at::native::templates::cuda::exponential_kernel
+// (aten/src/ATen/native/cuda/DistributionTemplates.h:561) +
+// transformation::exponential CUDA branch
+// (aten/src/ATen/core/TransformationHelper.h:128): curand_uniform yields
+// (0, 1]; log(1) is 0 and the exponential distribution excludes 0, so values
+// within epsilon/2 of 1 clamp their log to -epsilon/2.
+Tensor& exponential_kernel_cuda(Tensor& self, double lambd) {
+    int64_t n = self.numel();
+    if (n == 0) return self;
+    if (self.dtype() == DType::Float32) {
+        float* data = self.data_ptr<float>();
+        const float lambda = static_cast<float>(lambd);
+        constexpr float kEps = std::numeric_limits<float>::epsilon();
+        distribution_nullary_kernel<float, float4, 4>(
+            data, n,
+            [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
+            [lambda] __device__ (float val) {
+                float log = val >= 1.f - kEps / 2 ? -kEps / 2 : __logf(val);
+                return -1.f / lambda * log;
+            });
+    } else if (self.dtype() == DType::Float64) {
+        double* data = self.data_ptr<double>();
+        const double lambda = lambd;
+        constexpr double kEps = std::numeric_limits<double>::epsilon();
+        distribution_nullary_kernel<double, double2, 2>(
+            data, n,
+            [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform2_double(state); },
+            [lambda] __device__ (double val) {
+                double log = val >= 1. - kEps / 2 ? -kEps / 2 : ::log(val);
+                return -1. / lambda * log;
+            });
+    } else if (self.dtype() == DType::Float16 || self.dtype() == DType::BFloat16) {
+        // torch dispatches half/bfloat16 through accscalar_t = float.
+        if (self.dtype() == DType::Float16) {
+            Half* data = self.data_ptr<Half>();
+            const float lambda = static_cast<float>(lambd);
+            constexpr float kEps = std::numeric_limits<float>::epsilon();
+            distribution_nullary_kernel<Half, float4, 4>(
+                data, n,
+                [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
+                [lambda] __device__ (float val) {
+                    float log = val >= 1.f - kEps / 2 ? -kEps / 2 : __logf(val);
+                    return static_cast<Half>(-1.f / lambda * log);
+                });
+        } else {
+            BFloat16* data = self.data_ptr<BFloat16>();
+            const float lambda = static_cast<float>(lambd);
+            constexpr float kEps = std::numeric_limits<float>::epsilon();
+            distribution_nullary_kernel<BFloat16, float4, 4>(
+                data, n,
+                [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
+                [lambda] __device__ (float val) {
+                    float log = val >= 1.f - kEps / 2 ? -kEps / 2 : __logf(val);
+                    return static_cast<BFloat16>(-1.f / lambda * log);
+                });
+        }
+    } else {
+        TP_THROW(NotImplementedError, "exponential_() only supports floating dtypes on CUDA for now");
+    }
+    return self;
+}
+
 TENSORPLAY_LIBRARY_IMPL(CUDA, RandomKernels) {
     m.impl("rand", rand_kernel_cuda);
     m.impl("randn", randn_kernel_cuda);
@@ -243,6 +306,7 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, RandomKernels) {
     m.impl("randn_like", randn_like_kernel_cuda);
     m.impl("uniform_", uniform_kernel_cuda);
     m.impl("normal_", normal_kernel_cuda);
+    m.impl("exponential_", exponential_kernel_cuda);
 }
 
 } // namespace cuda

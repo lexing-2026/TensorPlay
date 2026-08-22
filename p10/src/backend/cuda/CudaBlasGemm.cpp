@@ -9,6 +9,7 @@
 #include "CUDAContext.h"
 #include "CUDARuntime.h"
 #include "Exception.h"
+#include "Context.h"
 #include "LinearAlgebraNames.h"
 
 #include <cublas_v2.h>
@@ -141,10 +142,14 @@ cudaDataType_t to_cublas_type(DType t) {
 
 cublasComputeType_t to_compute_type(DType t) {
     switch (t) {
-        // PyTorch's default is torch.backends.cuda.matmul.allow_tf32=False,
-        // and its CUDABlas helpers accumulate Half/BFloat16 in FP32 with float
-        // alpha/beta.  Mirror that contract exactly.
-        case DType::Float32: return CUBLAS_COMPUTE_32F;
+        // PyTorch's default is torch.backends.cuda.matmul.allow_tf32=False
+        // (float32_matmul_precision == "highest"), and its CUDABlas helpers
+        // accumulate Half/BFloat16 in FP32 with float alpha/beta.  Mirror
+        // that contract; "high"/"medium" enable TF32 compute for Float32,
+        // matching Context::allowTF32CuBLAS.
+        case DType::Float32:
+            if (globalContext().allowTF32CuBLAS()) return CUBLAS_COMPUTE_32F_FAST_TF32;
+            return CUBLAS_COMPUTE_32F;
         case DType::Float64: return CUBLAS_COMPUTE_64F;
         case DType::Float16: return CUBLAS_COMPUTE_32F;
         case DType::BFloat16: return CUBLAS_COMPUTE_32F;

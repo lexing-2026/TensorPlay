@@ -37,7 +37,9 @@ from .batchnorm import (
     LazyBatchNorm1d,
     LazyBatchNorm2d,
     LazyBatchNorm3d,
+    SyncBatchNorm,
 )
+from .adaptive import AdaptiveLogSoftmaxWithLoss
 from .channelshuffle import ChannelShuffle
 from .container import (
     ModuleDict,
@@ -86,6 +88,7 @@ from .instancenorm import (
 from .loss import (
     BCELoss,
     BCEWithLogitsLoss,
+    CTCLoss,
     CrossEntropyLoss,
     CosineEmbeddingLoss,
     GaussianNLLLoss,
@@ -95,6 +98,7 @@ from .loss import (
     L1Loss,
     MSELoss,
     MarginRankingLoss,
+    MultiLabelMarginLoss,
     MultiLabelSoftMarginLoss,
     MultiMarginLoss,
     NLLLoss,
@@ -150,7 +154,7 @@ from .pooling import (
     MaxUnpool2d,
     MaxUnpool3d,
 )
-from .sparse import Embedding
+from .sparse import Embedding, EmbeddingBag
 from .multihead_attention import MultiheadAttention, NonDynamicallyQuantizableLinear
 from .rnn import (
     GRU,
@@ -176,6 +180,7 @@ __all__ = [
     "AdaptiveAvgPool1d",
     "AdaptiveAvgPool2d",
     "AdaptiveAvgPool3d",
+    "AdaptiveLogSoftmaxWithLoss",
     "AdaptiveMaxPool1d",
     "AdaptiveMaxPool2d",
     "AdaptiveMaxPool3d",
@@ -190,6 +195,7 @@ __all__ = [
     "BatchNorm3d",
     "Bilinear",
     "CELU",
+    "CTCLoss",
     "ChannelShuffle",
     "CircularPad1d",
     "CircularPad2d",
@@ -213,6 +219,7 @@ __all__ = [
     "Dropout3d",
     "ELU",
     "Embedding",
+    "EmbeddingBag",
     "FeatureAlphaDropout",
     "Flatten",
     "Fold",
@@ -271,6 +278,7 @@ __all__ = [
     "Module",
     "ModuleDict",
     "ModuleList",
+    "MultiLabelMarginLoss",
     "MultiLabelSoftMarginLoss",
     "MultiMarginLoss",
     "MultiheadAttention",
@@ -308,6 +316,7 @@ __all__ = [
     "Softplus",
     "Softshrink",
     "Softsign",
+    "SyncBatchNorm",
     "Tanh",
     "Tanhshrink",
     "Threshold",

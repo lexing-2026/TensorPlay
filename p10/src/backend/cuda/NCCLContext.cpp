@@ -58,6 +58,20 @@ void send(const void*, size_t, DType, int, Comm, void*) {
 void recv(void*, size_t, DType, int, Comm, void*) {
     TP_THROW(RuntimeError, "TensorPlay was built without NCCL support");
 }
+void groupStart() {
+    TP_THROW(RuntimeError, "TensorPlay was built without NCCL support");
+}
+void groupEnd() {
+    TP_THROW(RuntimeError, "TensorPlay was built without NCCL support");
+}
+void allToAllSingleEqualSplit(const void*, void*, size_t, DType, Comm, void*) {
+    TP_THROW(RuntimeError, "TensorPlay was built without NCCL support");
+}
+void allToAllSingleUnequalSplit(const void*, const size_t*, const size_t*,
+                                void*, const size_t*, const size_t*, size_t,
+                                DType, Comm, void*) {
+    TP_THROW(RuntimeError, "TensorPlay was built without NCCL support");
+}
 
 } // namespace nccl
 } // namespace tensorplay
@@ -236,6 +250,82 @@ void recv(void* buffer, size_t count, DType dtype, int peer,
                        static_cast<ncclComm_t>(comm),
                        reinterpret_cast<cudaStream_t>(stream)),
               "ncclRecv");
+}
+
+// torch's _nccl_should_send_recv: skip zero-size p2p legs (NCCL errors on
+// zero-count send/recv).
+namespace {
+inline bool shouldSendRecv(size_t count) { return count > 0; }
+} // namespace
+
+void groupStart() { checkNccl(ncclGroupStart(), "ncclGroupStart"); }
+
+void groupEnd() { checkNccl(ncclGroupEnd(), "ncclGroupEnd"); }
+
+void allToAllSingleEqualSplit(const void* sendbuff, void* recvbuff,
+                              size_t count_total, DType dtype,
+                              Comm comm, void* stream) {
+    // torch::cuda::nccl::all2all_single_equal_split
+#if defined(NCCL_ALLTOALL_SUPPORTED) || \
+    NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
+    int num_ranks = 0;
+    checkNccl(ncclCommCount(static_cast<ncclComm_t>(comm), &num_ranks),
+              "ncclCommCount");
+    size_t count = count_total / static_cast<size_t>(num_ranks);
+    if (count * static_cast<size_t>(num_ranks) != count_total) {
+        TP_THROW(RuntimeError,
+                 "all_to_all_single with equal splits requires the input to be "
+                 "evenly divisible by world size");
+    }
+    checkNccl(ncclAlltoAll(sendbuff, recvbuff, count, toNcclDType(dtype),
+                           static_cast<ncclComm_t>(comm),
+                           reinterpret_cast<cudaStream_t>(stream)),
+              "ncclAlltoAll");
+#else
+    int num_ranks = 0;
+    checkNccl(ncclCommCount(static_cast<ncclComm_t>(comm), &num_ranks),
+              "ncclCommCount");
+    size_t rankdiff = count_total / static_cast<size_t>(num_ranks);
+    auto type = toNcclDType(dtype);
+    const char* sbuf = static_cast<const char*>(sendbuff);
+    char* rbuf = static_cast<char*>(recvbuff);
+    cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
+    checkNccl(ncclGroupStart(), "ncclGroupStart");
+    for (int r = 0; r < num_ranks; ++r) {
+        checkNccl(ncclSend(sbuf + r * rankdiff, rankdiff, type, r,
+                           static_cast<ncclComm_t>(comm), s), "ncclSend");
+        checkNccl(ncclRecv(rbuf + r * rankdiff, rankdiff, type, r,
+                           static_cast<ncclComm_t>(comm), s), "ncclRecv");
+    }
+    checkNccl(ncclGroupEnd(), "ncclGroupEnd");
+#endif
+}
+
+void allToAllSingleUnequalSplit(
+    const void* sendbuff, const size_t* sendcounts, const size_t* senddispls,
+    void* recvbuff, const size_t* recvcounts, const size_t* recvdispls,
+    size_t element_size, DType dtype, Comm comm, void* stream) {
+    // torch::cuda::nccl::all2all_single_unequal_split (send/recv group form;
+    // used whenever NCCL lacks ncclAlltoAllv, i.e. always on stock builds).
+    auto type = toNcclDType(dtype);
+    ncclComm_t c = static_cast<ncclComm_t>(comm);
+    cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
+    int num_ranks = 0;
+    checkNccl(ncclCommCount(c, &num_ranks), "ncclCommCount");
+    checkNccl(ncclGroupStart(), "ncclGroupStart");
+    for (int r = 0; r < num_ranks; ++r) {
+        if (shouldSendRecv(sendcounts[r])) {
+            checkNccl(ncclSend(
+                static_cast<const char*>(sendbuff) + senddispls[r] * element_size,
+                sendcounts[r], type, r, c, s), "ncclSend");
+        }
+        if (shouldSendRecv(recvcounts[r])) {
+            checkNccl(ncclRecv(
+                static_cast<char*>(recvbuff) + recvdispls[r] * element_size,
+                recvcounts[r], type, r, c, s), "ncclRecv");
+        }
+    }
+    checkNccl(ncclGroupEnd(), "ncclGroupEnd");
 }
 
 } // namespace nccl

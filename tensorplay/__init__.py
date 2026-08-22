@@ -211,7 +211,8 @@ from ._C import (tensor, DType, Size, Scalar, Device, DeviceType,
                 get_rng_state, set_rng_state,
                 set_num_threads, get_num_threads, get_thread_num,
                 in_parallel_region, get_parallel_info)
-from .autograd import no_grad, enable_grad, set_grad_enabled, is_grad_enabled
+from .autograd import (no_grad, enable_grad, set_grad_enabled, is_grad_enabled,
+                       inference_mode)
 from .serialization import save, load, inspect_checkpoint
 from .random import fork_rng
 
@@ -397,6 +398,24 @@ if not TYPE_CHECKING:
 
 
 from .functional import *
+
+
+def unique(input, sorted=True, return_inverse=False, return_counts=False):
+    """torch-compatible unique: arity follows the request flags.
+
+    The native op always computes all three outputs; this wrapper mirrors
+    torch.unique's public contract of returning 1/2/3 tensors depending on
+    ``return_inverse`` / ``return_counts``.
+    """
+    values, inverse, counts = _C.unique(input, sorted, True, True)
+    if return_inverse and return_counts:
+        return values, inverse, counts
+    if return_counts:
+        return values, counts
+    if return_inverse:
+        return values, inverse
+    return values
+
 from ._shape_funcs import *
 from ._einsum import einsum
 from .utils.comparison import allclose
@@ -550,6 +569,322 @@ def as_tensor(data, dtype=None, device=None):
 
 _GLOBAL_DEVICE_CONTEXT = threading.local()
 
+# The default device is a thread-local global in _C (mirroring torch's
+# thread-local mode stack semantics); _GLOBAL_DEVICE_CONTEXT is kept for API
+# parity with torch/__init__.py.
+
+
+def get_default_device() -> "tensorplay.device":
+    r"""Gets the default ``tensorplay.Tensor`` to be allocated on ``device``"""
+    return _C.get_default_device()
+
+
+def set_default_device(device: Device) -> None:
+    """Sets the default ``tensorplay.Tensor`` to be allocated on ``device``.  This
+    does not affect factory function calls which are called with an explicit
+    ``device`` argument.  Factory calls will be performed as if they
+    were passed ``device`` as an argument.
+
+    To only temporarily change the default device instead of setting it
+    globally, use ``with tensorplay.device(device):`` instead.
+
+    The default device is initially ``cpu``.  If you set the default tensor
+    device to another device (e.g., ``cuda``) without a device index, tensors
+    will be allocated on whatever the current device for the device type,
+    even after :func:`tensorplay.cuda.set_device` is called.
+
+    .. warning::
+
+        This function imposes a slight performance cost on every Python
+        call to the tensorplay API (not just factory functions).
+
+    .. note::
+
+        This doesn't affect functions that create tensors that share the same memory as the input, like:
+        :func:`tensorplay.from_numpy` and :func:`tensorplay.frombuffer`
+
+    Args:
+        device (:class:`tensorplay.device`, str, int, or None): the device to set as
+            default, or ``None`` to clear the override. An integer is
+            interpreted as an index for the current accelerator.
+
+    Example::
+
+        >>> # xdoctest: +SKIP("requires cuda, changes global state")
+        >>> tensorplay.get_default_device()
+        device(type='cpu')
+        >>> tensorplay.set_default_device('cuda')  # current device is 0
+        >>> tensorplay.get_default_device()
+        device(type='cuda', index=0)
+        >>> tensorplay.set_default_device('cuda')
+        >>> tensorplay.cuda.set_device('cuda:1')  # current device is 1
+        >>> tensorplay.get_default_device()
+        device(type='cuda', index=1)
+        >>> tensorplay.set_default_device('cuda:1')
+        >>> tensorplay.get_default_device()
+        device(type='cuda', index=1)
+
+    """
+    if isinstance(device, str):
+        device = Device(device)
+    elif isinstance(device, builtins.int):
+        # An integer is interpreted as an index for the current accelerator
+        # (CUDA is TensorPlay's accelerator device type).
+        device = Device(DeviceType.CUDA, device)
+    _C._set_default_device(device)
+
+
+def set_default_dtype(d: DType, /) -> None:
+    r"""
+
+    Sets the default floating point dtype to :attr:`d`. Supports floating point dtype
+    as inputs. Other dtypes will cause tensorplay to raise an exception.
+
+    When TensorPlay is initialized its default floating point dtype is float32,
+    and the intent of set_default_dtype(float64) is to facilitate NumPy-like
+    type inference. The default floating point dtype is used to:
+
+    1. Implicitly determine the default complex dtype. When the default floating type is float16,
+       the default complex dtype is complex32. For float32, the default complex dtype is complex64.
+       For float64, it is complex128. For bfloat16, an exception will be raised because
+       there is no corresponding complex type for bfloat16.
+    2. Infer the dtype for tensors constructed using Python floats or complex Python
+       numbers. See examples below.
+    3. Determine the result of type promotion between bool and integer tensors and
+       Python floats and complex Python numbers.
+
+    Args:
+        d (:class:`tensorplay.dtype`): the floating point dtype to make the default.
+
+    Example:
+        >>> # xdoctest: +SKIP("Other tests may have changed the default type. Can we reset it?")
+        >>> # initial default for floating point is float32
+        >>> # Python floats are interpreted as float32
+        >>> tensorplay.tensor([1.2, 3]).dtype
+        tensorplay.float32
+        >>> # initial default for floating point is complex64
+        >>> # Complex Python numbers are interpreted as complex64
+        >>> tensorplay.tensor([1.2, 3j]).dtype
+        tensorplay.complex64
+
+        >>> tensorplay.set_default_dtype(tensorplay.float64)
+        >>> # Python floats are now interpreted as float64
+        >>> tensorplay.tensor([1.2, 3]).dtype  # a new floating point tensor
+        tensorplay.float64
+        >>> # Complex Python numbers are now interpreted as complex128
+        >>> tensorplay.tensor([1.2, 3j]).dtype  # a new complex tensor
+        tensorplay.complex128
+
+        >>> tensorplay.set_default_dtype(tensorplay.float16)
+        >>> # Python floats are now interpreted as float16
+        >>> tensorplay.tensor([1.2, 3]).dtype  # a new floating point tensor
+        tensorplay.float16
+        >>> # Complex Python numbers are now interpreted as complex128
+        >>> tensorplay.tensor([1.2, 3j]).dtype  # a new complex tensor
+        tensorplay.complex32
+
+    """
+    _C._set_default_dtype(d)
+
+
+def use_deterministic_algorithms(
+    mode: builtins.bool,
+    *,
+    warn_only: builtins.bool = False,
+) -> None:
+    r"""Sets whether TensorPlay operations must use "deterministic"
+    algorithms. That is, algorithms which, given the same input, and when
+    run on the same software and hardware, always produce the same output.
+    When enabled, operations will use deterministic algorithms when available,
+    and if only nondeterministic algorithms are available they will throw a
+    :class:`RuntimeError` when called.
+
+    .. note:: This setting alone is not always enough to make an application
+        reproducible. Refer to :ref:`reproducibility` for more information.
+
+    .. note:: :func:`tensorplay.set_deterministic_debug_mode` offers an alternative
+        interface for this feature.
+
+    Note that deterministic operations tend to have worse performance than
+    nondeterministic operations.
+
+    .. note::
+
+        This flag does not detect or prevent nondeterministic behavior caused
+        by calling an inplace operation on a tensor with an internal memory
+        overlap or by giving such a tensor as the :attr:`out` argument for an
+        operation. In these cases, multiple writes of different data may target
+        a single memory location, and the order of writes is not guaranteed.
+
+    Args:
+        mode (:class:`bool`): If True, makes potentially nondeterministic
+            operations switch to a deterministic algorithm or throw a runtime
+            error. If False, allows nondeterministic operations.
+
+    Keyword args:
+        warn_only (:class:`bool`, optional): If True, operations that do not
+            have a deterministic implementation will throw a warning instead of
+            an error. Default: ``False``
+
+    Example::
+
+        >>> # xdoctest: +SKIP
+        >>> tensorplay.use_deterministic_algorithms(True)
+    """
+    # NOTE: torch also toggles Inductor's deterministic mode here; TensorPlay
+    # has no Inductor counterpart.
+    _C._set_deterministic_algorithms(mode, warn_only=warn_only)
+
+
+def are_deterministic_algorithms_enabled() -> builtins.bool:
+    r"""Returns True if the global deterministic flag is turned on. Refer to
+    :func:`tensorplay.use_deterministic_algorithms` documentation for more details.
+    """
+    return _C._get_deterministic_algorithms()
+
+
+def is_deterministic_algorithms_warn_only_enabled() -> builtins.bool:
+    r"""Returns True if the global deterministic flag is set to warn only.
+    Refer to :func:`tensorplay.use_deterministic_algorithms` documentation for more
+    details.
+    """
+    return _C._get_deterministic_algorithms_warn_only()
+
+
+def set_deterministic_debug_mode(debug_mode: builtins.int | str) -> None:
+    r"""Sets the debug mode for deterministic operations.
+
+    .. note:: This is an alternative interface for
+        :func:`tensorplay.use_deterministic_algorithms`. Refer to that function's
+        documentation for details about affected operations.
+
+    Args:
+        debug_mode(str or int): If "default" or 0, don't error or warn on
+            nondeterministic operations. If "warn" or 1, warn on
+            nondeterministic operations. If "error" or 2, error on
+            nondeterministic operations.
+    """
+
+    # NOTE: builtins.int is used here because int in this scope resolves
+    # to tensorplay.int
+    if not isinstance(debug_mode, (builtins.int, str)):
+        raise TypeError(f"debug_mode must be str or int, but got {type(debug_mode)}")
+
+    if isinstance(debug_mode, str):
+        if debug_mode == "default":
+            debug_mode = 0
+        elif debug_mode == "warn":
+            debug_mode = 1
+        elif debug_mode == "error":
+            debug_mode = 2
+        else:
+            raise RuntimeError(
+                "invalid value of debug_mode, expected one of `default`, "
+                f"`warn`, `error`, but got {debug_mode}"
+            )
+
+    if debug_mode == 0:
+        _C._set_deterministic_algorithms(False)
+    elif debug_mode == 1:
+        _C._set_deterministic_algorithms(True, warn_only=True)
+    elif debug_mode == 2:
+        _C._set_deterministic_algorithms(True)
+    else:
+        raise RuntimeError(
+            f"invalid value of debug_mode, expected 0, 1, or 2, but got {debug_mode}"
+        )
+
+
+def get_deterministic_debug_mode() -> builtins.int:
+    r"""Returns the current value of the debug mode for deterministic
+    operations. Refer to :func:`tensorplay.set_deterministic_debug_mode`
+    documentation for more details.
+    """
+
+    if _C._get_deterministic_algorithms():
+        if _C._get_deterministic_algorithms_warn_only():
+            return 1
+        else:
+            return 2
+    else:
+        return 0
+
+
+def get_float32_matmul_precision() -> str:
+    r"""Returns the current value of float32 matrix multiplication precision. Refer to
+    :func:`tensorplay.set_float32_matmul_precision` documentation for more details.
+    """
+    return _C.get_float32_matmul_precision()
+
+
+def set_float32_matmul_precision(precision: str) -> None:
+    r"""Sets the internal precision of float32 matrix multiplications.
+
+    Running float32 matrix multiplications in lower precision may significantly increase
+    performance, and in some programs the loss of precision has a negligible impact.
+
+    Supports three settings:
+
+        * "highest", float32 matrix multiplications use the float32 datatype (24 mantissa
+          bits with 23 bits explicitly stored) for internal computations.
+        * "high", float32 matrix multiplications either use the TensorFloat32 datatype (10
+          mantissa bits explicitly stored) or treat each float32 number as the sum of two bfloat16 numbers
+          (approximately 16 mantissa bits with 14 bits explicitly stored), if the appropriate fast matrix multiplication
+          algorithms are available.  Otherwise float32 matrix multiplications are computed
+          as if the precision is "highest".  See below for more information on the bfloat16
+          approach.
+        * "medium", float32 matrix multiplications use the bfloat16 datatype (8 mantissa
+          bits with 7 bits explicitly stored) for internal computations, if a fast matrix multiplication algorithm
+          using that datatype internally is available. Otherwise float32
+          matrix multiplications are computed as if the precision is "high".
+
+    .. [Henry2019] http://arxiv.org/abs/1904.06376
+
+    .. note::
+
+        This does not change the output dtype of float32 matrix multiplications,
+        it controls how the internal computation of the matrix multiplication is performed.
+
+    .. note::
+
+        This does not change the precision of convolution operations. Other flags,
+        like `tensorplay.backends.cudnn.allow_tf32`, may control the precision of convolution
+        operations.
+
+    .. note::
+
+        This flag currently only affects one native device type: CUDA.
+        If "high" or "medium" are set then the TensorFloat32 datatype will be used
+        when computing float32 matrix multiplications, equivalent to setting
+        `tensorplay.backends.cuda.matmul.allow_tf32 = True`. When "highest" (the default)
+        is set then the float32 datatype is used for internal computations, equivalent
+        to setting `tensorplay.backends.cuda.matmul.allow_tf32 = False`.
+
+    Args:
+        precision(str): can be set to "highest" (default), "high", or "medium" (see above).
+
+    """
+    if not isinstance(precision, str):
+        raise TypeError("set_float32_matmul_precision expects a str, "
+                        f"but got {type(precision)}")
+    _C._set_float32_matmul_precision(precision)
+
+
+__all__.extend([
+    "inference_mode",
+    "get_default_dtype",
+    "set_default_dtype",
+    "get_default_device",
+    "set_default_device",
+    "use_deterministic_algorithms",
+    "are_deterministic_algorithms_enabled",
+    "is_deterministic_algorithms_warn_only_enabled",
+    "set_deterministic_debug_mode",
+    "get_deterministic_debug_mode",
+    "get_float32_matmul_precision",
+    "set_float32_matmul_precision",
+])
+
 newaxis: None = None
 
 __all__.extend(["e", "pi", "nan", "inf", "newaxis"])
@@ -592,6 +927,7 @@ del _foreach_name
 # needs to be before import tensorplay.nn as nn to avoid circular dependencies
 from tensorplay.autograd import (
     enable_grad as enable_grad,
+    inference_mode as inference_mode,
     no_grad as no_grad,
     set_grad_enabled as set_grad_enabled,
     is_grad_enabled as is_grad_enabled,
@@ -602,6 +938,7 @@ from tensorplay import (
     autograd as autograd,
     backends as backends,
     cuda as cuda,
+    futures as futures,
     hub as hub,
     multiprocessing as multiprocessing,
     nn as nn,
@@ -623,6 +960,8 @@ else:
     _lazy_modules = {
         "audio",
         "export",
+        "fft",
+        "special",
         "vision",
     }
 

@@ -1,5 +1,6 @@
 #include "Tensor.h"
 #include "Dispatcher.h"
+#include "Context.h"
 #include "Exception.h"
 #include "CUDAContext.h"
 #include "CUDARuntime.h"
@@ -156,6 +157,13 @@ struct ConvDesc {
     void set(int pad_h, int pad_w, int str_h, int str_w, int dil_h, int dil_w, int groups, DType dtype) {
         CUDNN_CHECK(cudnnSetConvolution2dDescriptor(desc, pad_h, pad_w, str_h, str_w, dil_h, dil_w, CUDNN_CROSS_CORRELATION, to_cudnn_compute_type(dtype)));
         CUDNN_CHECK(cudnnSetConvolutionGroupCount(desc, groups));
+        // torch.backends.cudnn.allow_tf32 (default True); only meaningful for
+        // Float32 convolutions.
+        cudnnMathType_t math_type = CUDNN_DEFAULT_MATH;
+        if (dtype == DType::Float32 && tensorplay::globalContext().allowTF32CuDNN()) {
+            math_type = CUDNN_TENSOR_OP_MATH;
+        }
+        CUDNN_CHECK(cudnnSetConvolutionMathType(desc, math_type));
     }
 };
 
@@ -398,6 +406,11 @@ static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const 
 
     // Compute type: FLOAT for fp32/half/bf16, DOUBLE for fp64 (matches torch).
     cudnnDataType_t compute = (dtype == CUDNN_DATA_DOUBLE) ? CUDNN_DATA_DOUBLE : CUDNN_DATA_FLOAT;
+    // torch.backends.cudnn.allow_tf32 (default True): run Float32 convolutions
+    // with TF32 compute, matching at::Context::allowTF32CuDNN.
+    if (dtype == CUDNN_DATA_FLOAT && tensorplay::globalContext().allowTF32CuDNN()) {
+        compute = CUDNN_DATA_FLOAT;
+    }
 
     // Cache key: everything that determines the plan.  TorchInductor's
     // Conv_v8 path builds descriptors from actual sizes and strides, so the

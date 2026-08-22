@@ -24,14 +24,14 @@ from tensorplay._C import (
     linalg_eigvalsh,
     linalg_householder_product as householder_product,
     linalg_inv_ex,
-    linalg_ldl_factor,
-    linalg_ldl_factor_ex,
-    linalg_ldl_solve,
+    linalg_ldl_factor as ldl_factor,
+    linalg_ldl_factor_ex as ldl_factor_ex,
+    linalg_ldl_solve as ldl_solve,
     linalg_lu as lu,
-    linalg_lu_factor,
-    linalg_lu_factor_ex,
-    linalg_lu_solve,
-    linalg_solve_triangular,
+    linalg_lu_factor as lu_factor,
+    linalg_lu_factor_ex as lu_factor_ex,
+    linalg_lu_solve as lu_solve,
+    linalg_solve_triangular as solve_triangular,
 )
 
 __all__ = [

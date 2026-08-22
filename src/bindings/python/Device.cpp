@@ -1,5 +1,6 @@
 #include "python_bindings.h"
 #include "tensorplay/ops/Config.h"
+#include "Context.h"
 #include "Device.h" // For Device class and cuda namespace declarations
 
 #ifdef USE_CUDA
@@ -38,7 +39,18 @@ void init_device(py::module_& m) {
         .def("__repr__", &Device::toString)
         .def("__str__", &Device::toString)
         .def(py::self == py::self)
-        .def(py::self != py::self);
+        .def(py::self != py::self)
+        // Mirrors torch/csrc/Device.cpp THPDevice_enter/exit: entering a
+        // device object scopes the default device for factory functions, so
+        // `with tensorplay.device('cuda'):` allocates on that device.
+        .def("__enter__", [](py::object self) {
+            tensorplay::globalContext().pushDefaultDevice(self.cast<const Device&>());
+            return self;
+        })
+        .def("__exit__", [](py::object /*self*/, const py::object&, const py::object&, const py::object&) {
+            tensorplay::globalContext().popDefaultDevice();
+            return py::bool_(false);  // never suppress exceptions
+        });
 
     py::implicitly_convertible<std::string, Device>();
         

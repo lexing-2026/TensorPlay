@@ -245,34 +245,34 @@ Tensor adaptive_max_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& 
     
     auto [H_out, W_out] = get_pair(output_size);
     if (H_out <= 0 || W_out <= 0) TP_THROW(RuntimeError, "adaptive_max_pool2d: Invalid output size");
-    
+
     Tensor out = Tensor::empty({N, C, H_out, W_out}, input.dtype(), input.device());
-    
+
     if (input.dtype() == DType::Float32) {
         float* out_ptr = out.data_ptr<float>();
         const float* in_ptr = input.data_ptr<float>();
-        
+
         for (int64_t n = 0; n < N; ++n) {
             for (int64_t c = 0; c < C; ++c) {
                 for (int64_t h = 0; h < H_out; ++h) {
+                    // AdaptivePooling.h start_index/end_index: floor start,
+                    // ceil end -- the same bins as adaptive avg pooling.
                     int64_t h_start = (h * H_in) / H_out;
-                    int64_t h_end = ((h + 1) * H_in) / H_out;
-                    if (h_end == h_start) h_end += 1;
-                    
+                    int64_t h_end = 1 + (((h + 1) * H_in) - 1) / H_out;
+
                     for (int64_t w = 0; w < W_out; ++w) {
                         int64_t w_start = (w * W_in) / W_out;
-                        int64_t w_end = ((w + 1) * W_in) / W_out;
-                        if (w_end == w_start) w_end += 1;
-                        
+                        int64_t w_end = 1 + (((w + 1) * W_in) - 1) / W_out;
+
                         float max_val = -std::numeric_limits<float>::infinity();
                         for (int64_t ih = h_start; ih < h_end; ++ih) {
                             for (int64_t iw = w_start; iw < w_end; ++iw) {
                                 int64_t idx = ((n * C + c) * H_in + ih) * W_in + iw;
                                 float val = in_ptr[idx];
-                                if (val > max_val) max_val = val;
+                                if ((val > max_val) || std::isnan(val)) max_val = val;
                             }
                         }
-                        
+
                         int64_t out_idx = ((n * C + c) * H_out + h) * W_out + w;
                         out_ptr[out_idx] = max_val;
                     }
@@ -282,7 +282,7 @@ Tensor adaptive_max_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& 
     } else {
          TP_THROW(NotImplementedError, "adaptive_max_pool2d only supports Float32");
     }
-    
+
     return out;
 }
 
@@ -496,15 +496,14 @@ Tensor adaptive_max_pool2d_backward_cpu(const Tensor& grad_output, const Tensor&
         for (int64_t n = 0; n < N; ++n) {
             for (int64_t c = 0; c < C; ++c) {
                 for (int64_t h = 0; h < H_out; ++h) {
+                    // AdaptivePooling.h start_index/end_index (floor/ceil).
                     int64_t h_start = (h * H_in) / H_out;
-                    int64_t h_end = ((h + 1) * H_in) / H_out;
-                    if (h_end == h_start) h_end += 1;
-                    
+                    int64_t h_end = 1 + (((h + 1) * H_in) - 1) / H_out;
+
                     for (int64_t w = 0; w < W_out; ++w) {
                         int64_t w_start = (w * W_in) / W_out;
-                        int64_t w_end = ((w + 1) * W_in) / W_out;
-                        if (w_end == w_start) w_end += 1;
-                        
+                        int64_t w_end = 1 + (((w + 1) * W_in) - 1) / W_out;
+
                         float max_val = -std::numeric_limits<float>::infinity();
                         int64_t max_idx = -1;
 
@@ -512,7 +511,7 @@ Tensor adaptive_max_pool2d_backward_cpu(const Tensor& grad_output, const Tensor&
                             for (int64_t iw = w_start; iw < w_end; ++iw) {
                                 int64_t idx = ((n * C + c) * H_in + ih) * W_in + iw;
                                 float val = in_ptr[idx];
-                                if (val > max_val) {
+                                if ((val > max_val) || std::isnan(val)) {
                                     max_val = val;
                                     max_idx = idx;
                                 }
