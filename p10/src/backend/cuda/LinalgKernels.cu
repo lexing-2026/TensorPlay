@@ -541,30 +541,20 @@ std::tuple<Tensor, Tensor> linalg_inv_ex_kernel_cuda(const Tensor& A,
                                                      bool check_errors) {
     square_check_inputs(A, "linalg.inv_ex");
     // torch composes inv through solve_ex against the identity.
+    const int64_t n = A.size(-1);
+    const int64_t ms = n * n;
+    const int64_t bs = linear_batch_size(batch_shape_of(A));
     Tensor identity = Tensor::empty(A.shape(), A.dtype(), A.device());
     run_real(A.dtype(), [&](auto tag) {
         using T = std::remove_pointer_t<decltype(tag)>;
-        auto* p = identity.data_ptr<T>();
-        const int64_t ms = matrix_stride_of(identity);
-        const int64_t bs = linear_batch_size(batch_shape_of(A));
-        const int64_t nn = A.size(-1);
-        for (int64_t b = 0; b < bs; ++b) {
-            cudaMemsetAsync(p + b * ms, 0, sizeof(T) * ms,
-                            getCurrentCUDAStream().stream());
-        }
-        // Diagonal ones via a tiny kernel-free path: build on host once.
-        std::vector<T> eye(static_cast<size_t>(nn));
-        for (int64_t i = 0; i < nn; ++i) eye[static_cast<size_t>(i)] = T(1);
-        Tensor eye_dev = Tensor::tensor(eye).to(A.device(), A.dtype());
-        for (int64_t b = 0; b < bs; ++b) {
-            for (int64_t i = 0; i < nn; ++i) {
-                T val = T(1);
-                cudaMemcpyAsync(p + b * ms + i * nn + i, &val, sizeof(T),
-                                cudaMemcpyHostToDevice,
-                                getCurrentCUDAStream().stream());
-            }
-        }
-        (void)eye_dev;
+        std::vector<T> eye_host(static_cast<size_t>(ms), T(0));
+        for (int64_t i = 0; i < n; ++i)
+            eye_host[static_cast<size_t>(i * n + i)] = T(1);
+        for (int64_t b = 1; b < bs; ++b)
+            std::copy(eye_host.begin(), eye_host.end(),
+                      eye_host.begin() + b * ms);
+        cudaMemcpyAsync(identity.data_ptr(), eye_host.data(), sizeof(T) * ms * bs,
+                        cudaMemcpyHostToDevice, getCurrentCUDAStream().stream());
     });
     auto [inv, info] = linalg_solve_ex_kernel_cuda(A, identity, true, false);
     if (check_errors) check_infos(info, "linalg.inv_ex", A.dim() == 2);
@@ -575,6 +565,380 @@ Tensor linalg_inv_kernel_cuda(const Tensor& A) {
     auto [inv, info] = linalg_inv_ex_kernel_cuda(A, false);
     check_infos(info, "linalg.inv", A.dim() == 2);
     return inv;
+}
+
+// ------------------------------------------------------------- potrf -------
+
+template <typename scalar_t>
+void apply_potrf(const Tensor& L, const Tensor& info, char uplo) {
+    using Tr = CusolverTraits<scalar_t>;
+    auto* a = L.data_ptr<scalar_t>();
+    auto* info_data = info.data_ptr<int32_t>();
+    const int64_t ms = matrix_stride_of(L);
+    const int64_t batch = batch_count_of(L);
+    const int n = static_cast<int>(L.size(-1));
+    const int lda = std::max(1, n);
+    const auto handle = CUDAContext::getCusolverDnHandle();
+    int lwork = 0;
+    CUSOLVER_CHECK(Tr::potrf_bufferSize(handle, uplo, n, a, lda, &lwork));
+    Tensor work = Tensor::empty({std::max(lwork, 1)}, L.dtype(), L.device());
+    scalar_t* work_ptr =
+        Tr::is_float ? reinterpret_cast<scalar_t*>(static_cast<void*>(work.data_ptr<float>()))
+                     : reinterpret_cast<scalar_t*>(static_cast<void*>(work.data_ptr<double>()));
+    for (int64_t i = 0; i < batch; ++i) {
+        CUSOLVER_CHECK(Tr::potrf(handle, uplo, n, &a[i * ms], lda, work_ptr,
+                                 lwork, &info_data[i]));
+    }
+}
+
+std::tuple<Tensor, Tensor> linalg_cholesky_ex_kernel_cuda(const Tensor& A, bool upper,
+                                                          bool check_errors) {
+    square_check_inputs(A, "linalg.cholesky_ex");
+    Tensor L = clone_batched_column_major(A);
+    const auto batch = batch_shape_of(A);
+    Tensor info = Tensor::zeros(batch, DType::Int32, A.device());
+    run_real(A.dtype(), [&](auto tag) {
+        using T = std::remove_pointer_t<decltype(tag)>;
+        apply_potrf<T>(L, info, upper ? 'U' : 'L');
+    });
+    if (check_errors) check_infos(info, "linalg.cholesky_ex", A.dim() == 2);
+    return {L.contiguous(), info.contiguous()};
+}
+
+Tensor linalg_cholesky_kernel_cuda(const Tensor& A, bool upper) {
+    auto [L, info] = linalg_cholesky_ex_kernel_cuda(A, upper, false);
+    check_infos(info, "linalg.cholesky", A.dim() == 2);
+    return L;
+}
+
+// -------------------------------------------------------------- lu_solve ---
+
+Tensor linalg_lu_solve_kernel_cuda(const Tensor& LU, const Tensor& pivots,
+                                   const Tensor& B, bool left, bool adjoint) {
+    const char* api = "linalg.lu_solve";
+    square_check_inputs(LU, api, "LU");
+    check_is_matrix(B, api, "B");
+    if (!(left ? LU.size(-2) == B.size(-2) : LU.size(-1) == B.size(-1))) {
+        TP_THROW(RuntimeError, api, ": Incompatible shapes of LU and B for the equation ",
+                 left ? "AX = B" : "XA = B",
+                 " (", LU.size(-2), "x", LU.size(-1), " and ",
+                 B.size(-2), "x", B.size(-1), ")");
+    }
+    const auto batch = broadcast_batch(LU, B);
+    Tensor LU_work = clone_batched_column_major(expand_to_batch(LU, batch));
+    std::vector<int64_t> piv_shape = cat_batch(batch, {pivots.size(-1)});
+    Tensor piv_exp = pivots.expand(piv_shape).contiguous();
+    if (left) {
+        Tensor B_cm = clone_batched_column_major(expand_to_batch(B, batch));
+        run_real(LU.dtype(), [&](auto tag) {
+            using T = std::remove_pointer_t<decltype(tag)>;
+            apply_getrs<T>(LU_work, piv_exp, B_cm,
+                           adjoint ? CUBLAS_OP_T : CUBLAS_OP_N);
+        });
+        return B_cm.contiguous();
+    }
+    Tensor BT_cm =
+        clone_batched_column_major(expand_to_batch(B, batch).transpose(-2, -1));
+    run_real(LU.dtype(), [&](auto tag) {
+        using T = std::remove_pointer_t<decltype(tag)>;
+        apply_getrs<T>(LU_work, piv_exp, BT_cm,
+                       adjoint ? CUBLAS_OP_N : CUBLAS_OP_T);
+    });
+    return BT_cm.contiguous().transpose(-2, -1).contiguous();
+}
+
+// --------------------------------------------------------- geqrf / orgqr ---
+
+template <typename scalar_t>
+void apply_geqrf(const Tensor& QR_cm, const Tensor& tau) {
+    using Tr = CusolverTraits<scalar_t>;
+    auto* a = QR_cm.data_ptr<scalar_t>();
+    auto* tau_ptr = tau.data_ptr<scalar_t>();
+    const int64_t ms = matrix_stride_of(QR_cm);
+    const int64_t tau_stride = tau.dim() > 1 ? tau.size(-1) : tau.numel();
+    const int64_t batch = batch_count_of(QR_cm);
+    const int m = static_cast<int>(QR_cm.size(-2));
+    const int n = static_cast<int>(QR_cm.size(-1));
+    const int lda = std::max(1, m);
+    const auto handle = CUDAContext::getCusolverDnHandle();
+    int lwork = 0;
+    CUSOLVER_CHECK(Tr::geqrf_bufferSize(handle, m, n, a, lda, &lwork));
+    Tensor work = Tensor::empty({std::max(lwork, 1)}, QR_cm.dtype(),
+                                QR_cm.device());
+    scalar_t* work_ptr =
+        Tr::is_float ? reinterpret_cast<scalar_t*>(static_cast<void*>(work.data_ptr<float>()))
+                     : reinterpret_cast<scalar_t*>(static_cast<void*>(work.data_ptr<double>()));
+    Tensor dev_info = Tensor::zeros({batch}, DType::Int32, QR_cm.device());
+    auto* info_data = dev_info.data_ptr<int32_t>();
+    for (int64_t i = 0; i < batch; ++i) {
+        CUSOLVER_CHECK(Tr::geqrf(handle, m, n, &a[i * ms], lda,
+                                 &tau_ptr[i * tau_stride], work_ptr, lwork,
+                                 &info_data[i]));
+    }
+}
+
+template <typename scalar_t>
+void apply_orgqr(Tensor& Q_cm, const Tensor& tau) {
+    using Tr = CusolverTraits<scalar_t>;
+    if (Q_cm.numel() == 0) return;
+    auto* a = Q_cm.data_ptr<scalar_t>();
+    const auto* tau_ptr = tau.data_ptr<scalar_t>();
+    const int64_t ms = matrix_stride_of(Q_cm);
+    const int64_t tau_stride = tau.dim() > 1 ? tau.size(-1) : tau.numel();
+    const int64_t batch = batch_count_of(Q_cm);
+    const int m = static_cast<int>(Q_cm.size(-2));
+    const int n = static_cast<int>(Q_cm.size(-1));
+    const int k = static_cast<int>(tau.size(-1));
+    const int lda = std::max(1, m);
+    const auto handle = CUDAContext::getCusolverDnHandle();
+    int lwork = 0;
+    CUSOLVER_CHECK(Tr::orgqr_bufferSize(handle, m, n, k, a, lda, tau_ptr, &lwork));
+    Tensor work = Tensor::empty({std::max(lwork, 1)}, Q_cm.dtype(),
+                                Q_cm.device());
+    scalar_t* work_ptr =
+        Tr::is_float ? reinterpret_cast<scalar_t*>(static_cast<void*>(work.data_ptr<float>()))
+                     : reinterpret_cast<scalar_t*>(static_cast<void*>(work.data_ptr<double>()));
+    Tensor dev_info = Tensor::zeros({batch}, DType::Int32, Q_cm.device());
+    auto* info_data = dev_info.data_ptr<int32_t>();
+    for (int64_t i = 0; i < batch; ++i) {
+        CUSOLVER_CHECK(Tr::orgqr(handle, m, n, k, &a[i * ms], lda,
+                                 &tau_ptr[i * tau_stride], work_ptr, lwork,
+                                 &info_data[i]));
+    }
+}
+
+template <typename scalar_t>
+__global__ void triu_extract_kernel(const scalar_t* src, scalar_t* dst,
+                                    int64_t ld_src, int64_t rows, int64_t cols,
+                                    int64_t total) {
+    const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    const int64_t col = idx % cols;
+    const int64_t row = (idx / cols) % rows;
+    const int64_t b = idx / (rows * cols);
+    dst[idx] = col >= row ? src[b * ld_src * cols + col * ld_src + row]
+                          : scalar_t(0);
+}
+
+template <typename scalar_t>
+std::tuple<Tensor, Tensor> linalg_qr_kernel_cuda_impl(const Tensor& A,
+                                                      const std::string& mode) {
+    Tensor QR = clone_batched_column_major(A);
+    const int64_t m = A.size(-2);
+    const int64_t n = A.size(-1);
+    const int64_t k = std::min(m, n);
+    const auto batch = batch_shape_of(A);
+    const bool reduced = mode != "complete";
+    Tensor tau = Tensor::zeros(cat_batch(batch, {k}), A.dtype(), A.device());
+    run_real(A.dtype(), [&](auto tag) {
+        using T = std::remove_pointer_t<decltype(tag)>;
+        apply_geqrf<T>(QR, tau);
+    });
+
+    const int64_t qcols = reduced ? k : m;
+    const int64_t rrows = reduced ? k : m;
+    const int64_t bs = linear_batch_size(batch);
+
+    // Pack the first qcols reflector columns: column segments are contiguous
+    // in both layouts, so one strided 2D copy suffices.
+    Tensor Q_in = empty_column_major(cat_batch(batch, {m, qcols}),
+                                     A.dtype(), A.device());
+    run_real(A.dtype(), [&](auto tag) {
+        using T = std::remove_pointer_t<decltype(tag)>;
+        cudaMemcpy2DAsync(
+            Q_in.data_ptr<T>(), sizeof(T) * qcols, QR.data_ptr<T>(), sizeof(T) * n,
+            sizeof(T) * m, qcols, cudaMemcpyDeviceToDevice,
+            getCurrentCUDAStream().stream());
+        apply_orgqr<T>(Q_in, tau);
+    });
+
+    // R: upper triangle of the geqrf buffer.
+    Tensor R = empty_column_major(cat_batch(batch, {rrows, n}), A.dtype(),
+                                  A.device());
+    run_real(A.dtype(), [&](auto tag) {
+        using T = std::remove_pointer_t<decltype(tag)>;
+        const int64_t total = bs * rrows * n;
+        if (total > 0) {
+            triu_extract_kernel<T><<<static_cast<unsigned>((total + 255) / 256),
+                                     256, 0,
+                                     getCurrentCUDAStream().stream()>>>(
+                QR.data_ptr<T>(), R.data_ptr<T>(), m, rrows, n, total);
+        }
+    });
+    return {Q_in.contiguous(), R.contiguous()};
+}
+
+std::tuple<Tensor, Tensor> linalg_qr_kernel_cuda(const Tensor& A,
+                                                 std::string mode) {
+    check_is_matrix(A, "linalg.qr");
+    if (mode != "reduced" && mode != "complete" && mode != "r" && mode != "R") {
+        TP_THROW(RuntimeError, "linalg.qr: mode '", mode, "' not recognized.");
+    }
+    return run_real(A.dtype(), [&](auto tag) -> std::tuple<Tensor, Tensor> {
+        using T = std::remove_pointer_t<decltype(tag)>;
+        return linalg_qr_kernel_cuda_impl<T>(A, mode);
+    });
+}
+
+Tensor linalg_householder_product_kernel_cuda(const Tensor& input, const Tensor& tau) {
+    const char* api = "linalg.householder_product";
+    check_is_matrix(input, api);
+    if (input.size(-2) < input.size(-1)) {
+        TP_THROW(RuntimeError, api, ": If input has size (..., m, n), "
+                                    "n must be less than or equal to m, but got n = ",
+                 input.size(-1), " and m = ", input.size(-2));
+    }
+    if (tau.dim() < 1 || tau.size(-1) != std::min(input.size(-2), input.size(-1))) {
+        TP_THROW(RuntimeError, api,
+                 ": If tau has size (..., k), then when input has size (..., m, n) "
+                 "we require k == min(m, n)");
+    }
+    if (tau.dtype() != input.dtype()) {
+        TP_THROW(RuntimeError, api, ": input and tau must have the same dtype");
+    }
+    Tensor result = clone_batched_column_major(input);
+    run_real(input.dtype(), [&](auto tag) {
+        using T = std::remove_pointer_t<decltype(tag)>;
+        apply_orgqr<T>(result, tau);
+    });
+    return result.contiguous();
+}
+
+// --------------------------------------------------------------- syevd -----
+
+std::tuple<Tensor, Tensor> eigh_impl_cuda(const Tensor& A, bool upper,
+                                          bool compute_eigenvectors) {
+    square_check_inputs(A, "linalg.eigh");
+    Tensor vectors = clone_batched_column_major(A);
+    const auto batch = batch_shape_of(A);
+    const int64_t n = A.size(-1);
+    Tensor values = Tensor::empty(cat_batch(batch, {n}), A.dtype(), A.device());
+    Tensor info = Tensor::zeros(batch, DType::Int32, A.device());
+    run_real(A.dtype(), [&](auto tag) {
+        using Tr = CusolverTraits<std::remove_pointer_t<decltype(tag)>>;
+        using T = typename Tr::T;
+        auto* v = vectors.data_ptr<T>();
+        auto* w = values.data_ptr<T>();
+        auto* info_data = info.data_ptr<int32_t>();
+        const int64_t ms = matrix_stride_of(vectors);
+        const int64_t batch_n = batch_count_of(vectors);
+        const int nn = static_cast<int>(n);
+        const int lda = std::max(1, nn);
+        const char uplo = upper ? 'U' : 'L';
+        const cusolverEigMode_t jobz =
+            compute_eigenvectors ? CUSOLVER_EIG_MODE_VECTOR : CUSOLVER_EIG_MODE_NOVECTOR;
+        const auto handle = CUDAContext::getCusolverDnHandle();
+        int lwork = 0;
+        CUSOLVER_CHECK(Tr::syevd_bufferSize(handle, jobz, uplo, nn, v, lda, w, &lwork));
+        Tensor work = Tensor::empty({std::max(lwork, 1)}, A.dtype(), A.device());
+        T* work_ptr =
+            Tr::is_float
+                ? reinterpret_cast<T*>(static_cast<void*>(work.data_ptr<float>()))
+                : reinterpret_cast<T*>(static_cast<void*>(work.data_ptr<double>()));
+        for (int64_t i = 0; i < batch_n; ++i) {
+            CUSOLVER_CHECK(Tr::syevd(handle, jobz, uplo, nn, &v[i * ms], lda,
+                                     &w[i * n], work_ptr, lwork, &info_data[i]));
+            // torch returns early on the first failure.
+            if (info_data[i] != 0) break;
+        }
+    });
+    check_infos(info, "linalg.eigh", A.dim() == 2);
+    return {values.contiguous(), vectors.contiguous()};
+}
+
+std::tuple<Tensor, Tensor> linalg_eigh_kernel_cuda(const Tensor& A, std::string UPLO) {
+    if (UPLO != "U" && UPLO != "L") {
+        TP_THROW(RuntimeError, "linalg.eigh: UPLO argument must be 'U' or 'L', got ", UPLO);
+    }
+    return eigh_impl_cuda(A, UPLO == "U", true);
+}
+
+Tensor linalg_eigvalsh_kernel_cuda(const Tensor& A, std::string UPLO) {
+    if (UPLO != "U" && UPLO != "L") {
+        TP_THROW(RuntimeError, "linalg.eigvalsh: UPLO argument must be 'U' or 'L', got ", UPLO);
+    }
+    return std::get<0>(eigh_impl_cuda(A, UPLO == "U", false));
+}
+
+// --------------------------------------------------------------- gesvd -----
+
+std::tuple<Tensor, Tensor, Tensor> svd_impl_cuda(const Tensor& A, bool full_matrices,
+                                                 bool compute_uv) {
+    check_is_matrix(A, "linalg.svd");
+    Tensor a_copy = clone_batched_column_major(A);  // gesvd destroys its input
+    const int64_t m = A.size(-2);
+    const int64_t n = A.size(-1);
+    const int64_t k = std::min(m, n);
+    const auto batch = batch_shape_of(A);
+    const int64_t bs = linear_batch_size(batch);
+    Tensor U, S, Vh;
+    if (compute_uv) {
+        U = empty_column_major(cat_batch(batch, {m, full_matrices ? m : k}),
+                               A.dtype(), A.device());
+        Vh = empty_column_major(cat_batch(batch, {full_matrices ? n : k, n}),
+                                A.dtype(), A.device());
+    } else {
+        U = Tensor::empty(cat_batch(batch, {m, 0}), A.dtype(), A.device());
+        Vh = Tensor::empty(cat_batch(batch, {0, n}), A.dtype(), A.device());
+    }
+    S = Tensor::empty(cat_batch(batch, {k}), A.dtype(), A.device());
+    Tensor info = Tensor::zeros(batch, DType::Int32, A.device());
+    run_real(A.dtype(), [&](auto tag) {
+        using Tr = CusolverTraits<std::remove_pointer_t<decltype(tag)>>;
+        using T = typename Tr::T;
+        auto* a = a_copy.data_ptr<T>();
+        auto* s = S.data_ptr<T>();
+        auto* u = compute_uv ? U.data_ptr<T>() : nullptr;
+        auto* vt = compute_uv ? Vh.data_ptr<T>() : nullptr;
+        auto* info_data = info.data_ptr<int32_t>();
+        const signed char jobz = compute_uv ? (full_matrices ? 'A' : 'S') : 'N';
+        const int mm = static_cast<int>(m);
+        const int nn = static_cast<int>(n);
+        const int lda = std::max(1, mm);
+        const int ldu = compute_uv ? static_cast<int>(U.stride(-1)) : 1;
+        const int ldvt = compute_uv ? static_cast<int>(Vh.stride(-1)) : 1;
+        const auto handle = CUDAContext::getCusolverDnHandle();
+        int lwork = 0;
+        CUSOLVER_CHECK(Tr::gesvd(handle, jobz, jobz, mm, nn, a, lda, nullptr,
+                                 nullptr, ldu, nullptr, ldvt, nullptr, -1, nullptr,
+                                 &lwork));
+        Tensor work = Tensor::empty({std::max(lwork, 1)}, A.dtype(), A.device());
+        Tensor rwork = Tensor::empty({std::max<int64_t>(5 * k, 1)},
+                                     A.dtype(), A.device());
+        T* work_ptr =
+            Tr::is_float
+                ? reinterpret_cast<T*>(static_cast<void*>(work.data_ptr<float>()))
+                : reinterpret_cast<T*>(static_cast<void*>(work.data_ptr<double>()));
+        T* rwork_ptr =
+            Tr::is_float
+                ? reinterpret_cast<T*>(static_cast<void*>(rwork.data_ptr<float>()))
+                : reinterpret_cast<T*>(static_cast<void*>(rwork.data_ptr<double>()));
+        for (int64_t i = 0; i < bs; ++i) {
+            CUSOLVER_CHECK(Tr::gesvd(handle, jobz, jobz, mm, nn, &a[i * m * n],
+                                     lda, &s[i * k],
+                                     compute_uv ? &u[i * matrix_stride_of(U)] : nullptr,
+                                     ldu,
+                                     compute_uv ? &vt[i * matrix_stride_of(Vh)] : nullptr,
+                                     ldvt, work_ptr, lwork, rwork_ptr,
+                                     &info_data[i]));
+        }
+    });
+    check_infos(info, "linalg.svd", A.dim() == 2);
+    return {U.contiguous(), S.contiguous(), Vh.contiguous()};
+}
+
+std::tuple<Tensor, Tensor, Tensor> linalg_svd_kernel_cuda(
+        const Tensor& A, bool full_matrices, std::optional<std::string> driver) {
+    if (driver.has_value() && driver.value() != "gesvd" && driver.value() != "gesvdj") {
+        TP_THROW(RuntimeError, "linalg.svd(): driver ", driver.value(),
+                 " is not supported on CUDA");
+    }
+    return svd_impl_cuda(A, full_matrices, true);
+}
+
+Tensor linalg_svdvals_kernel_cuda(const Tensor& A, std::optional<std::string> driver) {
+    (void)driver;
+    return std::get<1>(svd_impl_cuda(A, false, false));
 }
 
 }  // namespace
