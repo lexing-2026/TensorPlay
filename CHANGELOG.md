@@ -138,3 +138,16 @@ seed 随机性全链路对齐 `third_party/pytorch`（基准 `893b6406`）：
   meta 留档、静态模式回归)。五套件合计 59/59。
 - 备注:完整 sympy 符号表达式系统(size 变量约束传播)仍属 L3 后续,需配合
   native lowering(stax M 系列)才有落地价值;本批先堵正确性缺口。
+
+## 图编译系统 L4(P3)—— AOT 双 partitioner
+
+- `partition_default`:joint-graph 标签切分(结构判据:有 backward 消费者即保存),
+  torch 契约 `(fwd..., bwd...)` + `num_fwd_outputs` 边界;
+- `partition_min_cut`(P3-L4b 设计落地):自研 Edmonds-Karp 最大流/最小割,
+  容量模型(候选保存=字节权重、必存=get_attr/fusible 链内部/双侧消费节点 ∞)、
+  backward 重算闭包递归克隆;`memory_budget` 权重化;
+- `build_aot(partitioner="default"|"min_cut")` 分发;sweep 阶段 tagged 链加产出
+  叶子梯度,role 标签(tangent/leaf/saved)按名绑定彻底替代位置假设;
+- test_aot:梯度用例按 policy×partitioner 参数化 + 3 个结构性验收
+  (role 一致性 / saved 单调性 / budget 行为);
+- 数值级对拍与 SIGSEGV 排查待原生层就绪后统一执行。
