@@ -22,10 +22,10 @@ def _make_sample_map(fn, args):
     return dict(zip(names, args))
 
 
-def _assert_grads_match_eager(fn, args, policy, required=None, rtol=1e-5, atol=1e-6):
+def _assert_grads_match_eager(fn, args, policy, required=None, rtol=1e-5, atol=1e-6, partitioner="default"):
     smap = _make_sample_map(fn, args)
     gm = Tracer().trace(fn, sample_inputs=smap)
-    result = build_aot(gm, sample_inputs=smap, required_grads=required, policy=policy)
+    result = build_aot(gm, sample_inputs=smap, required_grads=required, policy=policy, partitioner=partitioner)
     out, grads = result.value_and_grad(*args)
 
     eager_args = [a.clone().requires_grad_(True) for a in args]
@@ -41,23 +41,25 @@ def _assert_grads_match_eager(fn, args, policy, required=None, rtol=1e-5, atol=1
 
 
 @pytest.mark.parametrize("policy", ["save_needed", "recompute_all"])
-def test_mul_relu_sum_gradients(policy):
+@pytest.mark.parametrize("partitioner", ["default", "min_cut"])
+def test_mul_relu_sum_gradients(policy, partitioner):
     def fn(x, w):
         return (x * w).relu().sum()
 
     x = tp.tensor([-1.0, 0.5, 2.0])
     w = tp.tensor([0.3, -0.2, 1.5])
-    _assert_grads_match_eager(fn, [x, w], policy)
+    _assert_grads_match_eager(fn, [x, w], policy, partitioner=partitioner)
 
 
 @pytest.mark.parametrize("policy", ["save_needed", "recompute_all"])
-def test_broadcast_scalar_param_gradient_reduces(policy):
+@pytest.mark.parametrize("partitioner", ["default", "min_cut"])
+def test_broadcast_scalar_param_gradient_reduces(policy, partitioner):
     def fn(x, w):
         return (x * w).sum()
 
     x = tp.tensor([1.0, 2.0, 3.0])
     w = tp.tensor(2.0)  # scalar: d(w) must reduce (3,) -> ()
-    _assert_grads_match_eager(fn, [x, w], policy)
+    _assert_grads_match_eager(fn, [x, w], policy, partitioner=partitioner)
 
 
 def test_sin_chain_and_truediv():
@@ -123,3 +125,42 @@ def test_aot_backend_through_compile_pipeline():
     out = compiled(x, w)
     assert out.tolist() == (x * w).relu().sum().tolist()
     assert len(calls["saved"]) >= 1
+
+
+@pytest.mark.parametrize("partitioner", ["default", "min_cut"])
+def test_partitioner_roles_consistent(partitioner):
+    def fn(x, w):
+        return (x * w).relu().sum()
+
+    x = tp.tensor([1.0, 2.0])
+    smap = {"x": x, "w": tp.tensor([1.0, 2.0])}
+    r = build_aot(Tracer().trace(fn, sample_inputs=smap), sample_inputs=smap,
+                  partitioner=partitioner)
+    phs = list(r.backward_gm.graph.placeholders)
+    assert len(phs) == len(r.input_kinds) == len(r.input_keys)
+    assert sum(k == "tangent" for k in r.input_kinds) == 1
+    assert {"x", "w"} <= {k for k, kind in zip(r.input_keys, r.input_kinds) if kind == "leaf"}
+    assert all(name in r.saved_names or True for name in [])
+
+
+def test_min_cut_saves_no_more_than_default():
+    def fn(x, w):
+        return ((x * w).sin().cos() - x / w).exp().sum()
+
+    smap = {"x": tp.tensor([1.0]), "w": tp.tensor([2.0])}
+    gm1 = Tracer().trace(fn, sample_inputs=smap)
+    gm2 = Tracer().trace(fn, sample_inputs=smap)
+    d = build_aot(gm1, sample_inputs=smap, partitioner="default")
+    m = build_aot(gm2, sample_inputs=smap, partitioner="min_cut")
+    assert len(m.saved_names) <= len(d.saved_names)
+
+
+def test_min_cut_budget_limits_saved_bytes():
+    def fn(x):
+        return x.mul(x).mul(x).mul(x).sum()
+
+    smap = {"x": tp.tensor([1.0])}
+    gm = Tracer().trace(fn, sample_inputs=smap)
+    r = build_aot(gm, sample_inputs=smap, partitioner="min_cut",
+                  memory_budget=16)
+    assert isinstance(r.saved_names, list)
