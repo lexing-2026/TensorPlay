@@ -4,6 +4,7 @@ project(p10 LANGUAGES CXX)
 
 set(P10_SOURCES
     src/Allocator.cpp
+    src/Context.cpp
     src/Device.cpp
     src/Dispatcher.cpp
     src/DispatchStub.cpp
@@ -48,6 +49,7 @@ set(P10_SOURCES
     src/backend/cpu/IndexingKernels.cpp
     src/backend/cpu/TierOpsKernels.cpp
     src/backend/cpu/Tier5OpsKernels.cpp
+    src/backend/cpu/SpecialKernels.cpp
     src/backend/cpu/SpectralKernels.cpp
     src/Einsum.cpp
     src/TensorIterator.cpp
@@ -74,6 +76,7 @@ if(USE_CUDA)
         src/backend/cuda/MiscKernels.cu
         src/backend/cuda/UpsampleKernels.cu
         src/backend/cuda/LinearAlgebraKernels.cu
+        src/backend/cuda/LinalgKernels.cu
         src/backend/cuda/CudaBlasGemm.cpp
         src/backend/cuda/ActivationKernels.cu
         src/backend/cuda/NormalizationKernels.cu
@@ -93,6 +96,7 @@ if(USE_CUDA)
         src/backend/cuda/TierOpsReduceKernels.cu
         src/backend/cuda/Tier5OpsKernels.cu
         src/backend/cuda/Tier5LossesKernels.cu
+        src/backend/cuda/SpecialKernels.cu
         src/backend/cuda/SpectralKernels.cu
     )
 endif()

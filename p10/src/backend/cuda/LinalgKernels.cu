@@ -14,6 +14,7 @@
 #include "CUDAContext.h"
 #include "CUDARuntime.h"
 #include "Exception.h"
+#include "LinearAlgebraNames.h"
 
 #include <cublas_v2.h>
 #include <cusolverDn.h>
@@ -208,7 +209,7 @@ struct CusolverTraits<float> {
     static cusolverStatus_t getrf(cusolverDnHandle_t h, int m, int n, float* a,
                                   int lda, int* ipiv, float* work, int lwork,
                                   int* info) {
-        return cusolverDnSgetrf(h, m, n, a, lda, ipiv, work, lwork, info);
+        return cusolverDnSgetrf(h, m, n, a, lda, work, ipiv, info); (void)lwork;
     }
     static cusolverStatus_t getrs(cusolverDnHandle_t h, cublasOperation_t trans,
                                   int n, int nrhs, const float* a, int lda,
@@ -225,9 +226,9 @@ struct CusolverTraits<float> {
         return cusolverDnSgeqrf(h, m, n, a, lda, tau, work, lwork, info);
     }
     static cusolverStatus_t orgqr_bufferSize(cusolverDnHandle_t h, int m, int n,
-                                             int k, const float* /*a*/, int lda,
-                                             const float* /*tau*/, int* lw) {
-        return cusolverDnSorgqr_bufferSize(h, m, n, k, lda, lw);
+                                             int k, const float* a, int lda,
+                                             const float* tau, int* lw) {
+        return cusolverDnSorgqr_bufferSize(h, m, n, k, a, lda, tau, lw);
     }
     static cusolverStatus_t orgqr(cusolverDnHandle_t h, int m, int n, int k,
                                   float* a, int lda, const float* tau, float* work,
@@ -238,12 +239,12 @@ struct CusolverTraits<float> {
                                              cusolverEigMode_t jobz, char uplo,
                                              int n, const float* a, int lda,
                                              const float* w, int* lw) {
-        return cusolverDnSSyevd_bufferSize(h, jobz, fill_mode(uplo), n, a, lda, w, lw);
+        return cusolverDnSsyevd_bufferSize(h, jobz, fill_mode(uplo), n, a, lda, w, lw);
     }
     static cusolverStatus_t syevd(cusolverDnHandle_t h, cusolverEigMode_t jobz,
                                   char uplo, int n, float* a, int lda, float* w,
                                   float* work, int lwork, int* info) {
-        return cusolverDnSSyevd(h, jobz, fill_mode(uplo), n, a, lda, w, work,
+        return cusolverDnSsyevd(h, jobz, fill_mode(uplo), n, a, lda, w, work,
                                 lwork, info);
     }
     static cusolverStatus_t gesvd(cusolverDnHandle_t h, signed char jobu,
@@ -275,7 +276,7 @@ struct CusolverTraits<double> {
     static cusolverStatus_t getrf(cusolverDnHandle_t h, int m, int n, double* a,
                                   int lda, int* ipiv, double* work, int lwork,
                                   int* info) {
-        return cusolverDnDgetrf(h, m, n, a, lda, ipiv, work, lwork, info);
+        return cusolverDnDgetrf(h, m, n, a, lda, work, ipiv, info); (void)lwork;
     }
     static cusolverStatus_t getrs(cusolverDnHandle_t h, cublasOperation_t trans,
                                   int n, int nrhs, const double* a, int lda,
@@ -292,9 +293,9 @@ struct CusolverTraits<double> {
         return cusolverDnDgeqrf(h, m, n, a, lda, tau, work, lwork, info);
     }
     static cusolverStatus_t orgqr_bufferSize(cusolverDnHandle_t h, int m, int n,
-                                             int k, const double* /*a*/, int lda,
-                                             const double* /*tau*/, int* lw) {
-        return cusolverDnDorgqr_bufferSize(h, m, n, k, lda, lw);
+                                             int k, const double* a, int lda,
+                                             const double* tau, int* lw) {
+        return cusolverDnDorgqr_bufferSize(h, m, n, k, a, lda, tau, lw);
     }
     static cusolverStatus_t orgqr(cusolverDnHandle_t h, int m, int n, int k,
                                   double* a, int lda, const double* tau,
@@ -305,12 +306,12 @@ struct CusolverTraits<double> {
                                              cusolverEigMode_t jobz, char uplo,
                                              int n, const double* a, int lda,
                                              const double* w, int* lw) {
-        return cusolverDnDSyevd_bufferSize(h, jobz, fill_mode(uplo), n, a, lda, w, lw);
+        return cusolverDnDsyevd_bufferSize(h, jobz, fill_mode(uplo), n, a, lda, w, lw);
     }
     static cusolverStatus_t syevd(cusolverDnHandle_t h, cusolverEigMode_t jobz,
                                   char uplo, int n, double* a, int lda, double* w,
                                   double* work, int lwork, int* info) {
-        return cusolverDnDSyevd(h, jobz, fill_mode(uplo), n, a, lda, w, work,
+        return cusolverDnDsyevd(h, jobz, fill_mode(uplo), n, a, lda, w, work,
                                 lwork, info);
     }
     static cusolverStatus_t gesvd(cusolverDnHandle_t h, signed char jobu,
@@ -390,7 +391,7 @@ void host_det_slogdet(const Tensor& LU_h, const Tensor& piv_h, Tensor& det_out,
     const scalar_t* lu = LU_h.data_ptr<scalar_t>();
     const int32_t* pv = piv_h.data_ptr<int32_t>();
     std::vector<scalar_t> dets(bs), signs(bs), logs(bs);
-    constexpr bool want_log = sign_out != nullptr;
+    const bool want_log = sign_out != nullptr;
     for (int64_t b = 0; b < bs; ++b) {
         scalar_t det = scalar_t(1), sgn = scalar_t(1), logdet = scalar_t(0);
         bool singular = false;
@@ -1034,7 +1035,7 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> linalg_lstsq_kernel_cuda(
                 Tr::orgqr_bufferSize(handle, static_cast<int>(ldb),
                                      static_cast<int>(nrhs), static_cast<int>(n),
                                      A_cm.data_ptr<T>(), static_cast<int>(m),
-                                     tau2.data_ptr<T>(), &lwork));
+                                     tau.data_ptr<T>(), &lwork));
             Tensor work = Tensor::empty({std::max(lwork, 1)}, A.dtype(), A.device());
             Tensor dev_info = Tensor::zeros({bs}, DType::Int32, A.device());
             for (int64_t i = 0; i < bs; ++i) {
@@ -1112,7 +1113,206 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> linalg_lstsq_kernel_cuda(
     return {solution, residuals, rank, solution};
 }
 
+// -------------------------------------------------------- lu with unpack ---
+
+std::tuple<Tensor, Tensor, Tensor> linalg_lu_kernel_cuda(const Tensor& A, bool pivot) {
+    (void)pivot;
+    square_check_inputs(A, "linalg.lu");
+    auto [LU, pivots, info] = lu_factor_ex_cuda_impl(A, false);
+    (void)info;
+    const int64_t m = A.size(-2);
+    const int64_t n = A.size(-1);
+    const int64_t kk = std::min(m, n);
+    const auto batch = batch_shape_of(A);
+    const int64_t bs = linear_batch_size(batch);
+    Tensor P = Tensor::zeros(cat_batch(batch, {m, m}), A.dtype(), A.device());
+    Tensor L = Tensor::zeros(cat_batch(batch, {m, kk}), A.dtype(), A.device());
+    Tensor U = Tensor::zeros(cat_batch(batch, {kk, n}), A.dtype(), A.device());
+    Tensor LU_h = LU.to(Device(DeviceType::CPU), A.dtype()).contiguous();
+    Tensor piv_h = pivots.to(Device(DeviceType::CPU), DType::Int32).contiguous();
+    run_real(A.dtype(), [&](auto tag) {
+        using T = std::remove_pointer_t<decltype(tag)>;
+        const T* lu_all = LU_h.data_ptr<T>();
+        const int32_t* piv = piv_h.data_ptr<int32_t>();
+        std::vector<T> p_host(static_cast<size_t>(bs * m * m));
+        std::vector<T> l_host(static_cast<size_t>(bs * m * kk));
+        std::vector<T> u_host(static_cast<size_t>(bs * kk * n));
+        for (int64_t b = 0; b < bs; ++b) {
+            const T* lu = &lu_all[b * m * n];
+            // LU is column-major (lda=m): element (i, j) at lu[j*m + i].
+            for (int64_t col = 0; col < kk; ++col) {
+                for (int64_t row = 0; row < m; ++row)
+                    l_host[(b * m + row) * kk + col] =
+                        row < col ? T(0)
+                                  : (row == col ? T(1) : lu[col * m + row]);
+            }
+            for (int64_t col = 0; col < n; ++col)
+                for (int64_t row = 0; row < kk; ++row)
+                    u_host[(b * kk + row) * n + col] =
+                        row <= col ? lu[col * m + row] : T(0);
+            std::vector<int64_t> perm(static_cast<size_t>(m));
+            for (int64_t i = 0; i < m; ++i) perm[i] = i;
+            for (int64_t i = 0; i < kk; ++i) {
+                const int64_t p_ = piv[b * kk + i] - 1;
+                if (p_ != i) std::swap(perm[i], perm[p_]);
+            }
+            for (int64_t j = 0; j < m; ++j)
+                p_host[(b * m + j) * m + perm[j]] = T(1);
+        }
+        Tensor p_stage = Tensor::tensor(p_host);
+        Tensor l_stage = Tensor::tensor(l_host);
+        Tensor u_stage = Tensor::tensor(u_host);
+        cudaMemcpyAsync(P.data_ptr(), p_stage.data_ptr(),
+                        sizeof(T) * bs * m * m, cudaMemcpyHostToDevice,
+                        getCurrentCUDAStream().stream());
+        cudaMemcpyAsync(L.data_ptr(), l_stage.data_ptr(),
+                        sizeof(T) * bs * m * kk, cudaMemcpyHostToDevice,
+                        getCurrentCUDAStream().stream());
+        cudaMemcpyAsync(U.data_ptr(), u_stage.data_ptr(),
+                        sizeof(T) * bs * kk * n, cudaMemcpyHostToDevice,
+                        getCurrentCUDAStream().stream());
+    });
+    return {P, L, U};
+}
+
+// ------------------------------------------------------- eig (no MAGMA) ----
+
+[[noreturn]] void throw_no_magma(const char* api) {
+    TP_THROW(RuntimeError, "Calling ", api,
+             " on a CUDA tensor requires compiling PyTorch with MAGMA. "
+             "Please move the tensor to the CPU.");
+}
+
+std::tuple<Tensor, Tensor> linalg_eig_kernel_cuda(const Tensor& A) {
+    square_check_inputs(A, "linalg.eig");
+    throw_no_magma("torch.linalg.eig");
+}
+
+Tensor linalg_eigvals_kernel_cuda(const Tensor& A) {
+    square_check_inputs(A, "linalg.eigvals");
+    throw_no_magma("torch.linalg.eigvals");
+}
+
+// --------------------------------------------------------------- diagonal --
+
+template <typename scalar_t>
+__global__ void diagonal_gather_kernel(
+    const scalar_t* src, scalar_t* dst, int64_t total, int64_t diag_len,
+    int64_t outer, int64_t s_outer, int64_t s1, int64_t s2, int64_t base_off1,
+    int64_t base_off2) {
+    const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    const int64_t t = idx % diag_len;
+    const int64_t o = idx / diag_len;
+    dst[idx] = src[o * s_outer + base_off1 + t * s1 + base_off2 + t * s2];
+}
+
+Tensor linalg_diagonal_kernel_cuda(const Tensor& A, int64_t offset, int64_t dim1,
+                                   int64_t dim2) {
+    const char* api = "linalg.diagonal";
+    check_is_matrix(A, api);
+    const int64_t ndim = A.dim();
+    const auto norm_dim = [&](int64_t d) {
+        const int64_t r = d < 0 ? d + ndim : d;
+        if (r < 0 || r >= ndim) {
+            TP_THROW(RuntimeError, "Dimension out of range");
+        }
+        return r;
+    };
+    dim1 = norm_dim(dim1);
+    dim2 = norm_dim(dim2);
+    if (dim1 == dim2) {
+        TP_THROW(RuntimeError, api, ": dimension 1 and dimension 2 cannot be equal");
+    }
+    // Move (dim1, dim2) to trailing positions via permute for a flat gather.
+    std::vector<int64_t> perm;
+    for (int64_t i = 0; i < ndim; ++i)
+        if (i != dim1 && i != dim2) perm.push_back(i);
+    perm.push_back(dim1);
+    perm.push_back(dim2);
+    Tensor work = A.permute(perm).contiguous();
+    const int64_t d1 = work.size(-2);
+    const int64_t d2 = work.size(-1);
+    const int64_t outer = work.numel() / (d1 * d2 == 0 ? 1 : d1 * d2);
+    const int64_t diag_len =
+        offset >= 0 ? std::max<int64_t>(std::min(d1, d2 - offset), 0)
+                    : std::max<int64_t>(std::min(d1 + offset, d2), 0);
+    Tensor out = Tensor::empty(cat_batch(std::vector<int64_t>{outer}, {diag_len}),
+                               A.dtype(), A.device());
+    if (out.numel() == 0) return out.reshape([&] {
+        std::vector<int64_t> shape(perm.size() - 1);
+        for (size_t i = 0; i < shape.size(); ++i)
+            shape[i] = i == shape.size() - 1 ? diag_len
+                                             : A.size(static_cast<int64_t>(perm[i]));
+        return shape;
+    }());
+
+    std::vector<int64_t> strides(ndim);
+    {
+        std::vector<int64_t> st(ndim, 1);
+        for (int64_t i = ndim - 2; i >= 0; --i) st[i] = st[i + 1] * A.size(i + 1);
+        strides = st;
+    }
+    const int64_t s_outer = [&] {
+        int64_t acc = 1;
+        bool first = true;
+        for (int64_t i = 0; i < ndim; ++i) {
+            if (i == dim1 || i == dim2) continue;
+            if (first) { acc = strides[i]; first = false; }
+        }
+        return first ? 0 : acc;
+    }();
+    // Base offsets fold the fixed index of every non-gathered axis.
+    (void)s_outer;
+    // Simpler correct path: iterate with explicit strides over the two dims.
+    const int64_t total = outer * diag_len;
+    run_real(A.dtype(), [&](auto tag) {
+        using T = std::remove_pointer_t<decltype(tag)>;
+        const int64_t inner_block = d1 * d2;
+        diagonal_gather_kernel<T><<<static_cast<unsigned>((total + 255) / 256),
+                                    256, 0,
+                                    getCurrentCUDAStream().stream()>>>(
+            work.data_ptr<T>(), out.data_ptr<T>(), total, diag_len, outer,
+            inner_block,
+            /*s1=*/strides[ndim - 2], /*s2=*/strides[ndim - 1],
+            offset >= 0 ? 0 : -offset * strides[ndim - 2],
+            offset >= 0 ? offset * strides[ndim - 1] : 0);
+    });
+    std::vector<int64_t> out_shape;
+    for (int64_t i = 0; i < ndim; ++i) {
+        if (i != dim1 && i != dim2) out_shape.push_back(A.size(i));
+    }
+    out_shape.push_back(diag_len);
+    return out.reshape(out_shape);
+}
+
 }  // namespace
+
+TENSORPLAY_LIBRARY_IMPL(CUDA, LinalgKernels) {
+    m.impl("linalg_cholesky", linalg_cholesky_kernel_cuda);
+    m.impl("linalg_cholesky_ex", linalg_cholesky_ex_kernel_cuda);
+    m.impl("linalg_inv", linalg_inv_kernel_cuda);
+    m.impl("linalg_inv_ex", linalg_inv_ex_kernel_cuda);
+    m.impl("linalg_det", linalg_det_kernel_cuda);
+    m.impl("linalg_slogdet", linalg_slogdet_kernel_cuda);
+    m.impl("linalg_solve", linalg_solve_kernel_cuda);
+    m.impl("linalg_solve_ex", linalg_solve_ex_kernel_cuda);
+    m.impl("linalg_lu_factor", linalg_lu_factor_kernel_cuda);
+    m.impl("linalg_lu_factor_ex", linalg_lu_factor_ex_kernel_cuda);
+    m.impl("linalg_lu", linalg_lu_kernel_cuda);
+    m.impl("linalg_lu_solve", linalg_lu_solve_kernel_cuda);
+    m.impl("linalg_solve_triangular", linalg_solve_triangular_kernel_cuda);
+    m.impl("linalg_eigh", linalg_eigh_kernel_cuda);
+    m.impl("linalg_eigvalsh", linalg_eigvalsh_kernel_cuda);
+    m.impl("linalg_eig", linalg_eig_kernel_cuda);
+    m.impl("linalg_eigvals", linalg_eigvals_kernel_cuda);
+    m.impl("linalg_svd", linalg_svd_kernel_cuda);
+    m.impl("linalg_svdvals", linalg_svdvals_kernel_cuda);
+    m.impl("linalg_lstsq", linalg_lstsq_kernel_cuda);
+    m.impl("linalg_qr", linalg_qr_kernel_cuda);
+    m.impl("linalg_householder_product", linalg_householder_product_kernel_cuda);
+    m.impl("linalg_diagonal", linalg_diagonal_kernel_cuda);
+}
 
 }  // namespace cuda
 }  // namespace tensorplay

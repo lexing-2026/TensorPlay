@@ -3,6 +3,7 @@
 #include "CUDARuntime.h"
 #include "Exception.h"
 #include "Scalar.h"
+#include "Context.h"
 #include <cuda_runtime.h>
 #include <complex>
 #include <vector>
@@ -115,10 +116,10 @@ Tensor full_like_kernel(const Tensor& self, Scalar fill_value, DType dtype, std:
 Tensor full_kernel(const std::vector<int64_t>& size, Scalar fill_value, DType dtype, Device device, bool pin_memory) {
     if (pin_memory) TP_THROW(RuntimeError, "pin_memory is only valid for CPU tensors");
     if (dtype == DType::Undefined) {
-        if (fill_value.isFloatingPoint()) dtype = DType::Float32;
+        if (fill_value.isFloatingPoint()) dtype = globalContext().defaultDType();
         else if (fill_value.isIntegral()) dtype = DType::Int64;
         else if (fill_value.isBoolean()) dtype = DType::Bool;
-        else dtype = DType::Float32;
+        else dtype = globalContext().defaultDType();
     }
     Tensor t(size, dtype, device);
     fill_kernel(t, fill_value);

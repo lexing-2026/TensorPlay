@@ -40,73 +40,6 @@ inline int64_t wrap_dim_local(int64_t dim, int64_t ndim) {
 
 } // anonymous namespace
 
-std::vector<Tensor> meshgrid_cuda(const std::vector<Tensor>& tensors, const std::string& indexing) {
-    // ATen native/TensorShape.cpp meshgrid(tensors, indexing): pure view
-    // composition (reshape+expand), identical on every backend.
-    const int64_t size = static_cast<int64_t>(tensors.size());
-    if (size <= 0) TP_THROW(RuntimeError, "meshgrid expects a non-empty TensorList");
-    for (int64_t i = 0; i < size - 1; ++i) {
-        if (tensors[i].dtype() != tensors[i + 1].dtype()) {
-            TP_THROW(RuntimeError, "meshgrid expects all tensors to have the same dtype");
-        }
-        if (!(tensors[i].device() == tensors[i + 1].device())) {
-            TP_THROW(RuntimeError, "meshgrid expects all tensors to have the same device");
-        }
-    }
-
-    bool swap_first_and_second_tensors = false;
-    std::vector<Tensor> tensor_refs(tensors.begin(), tensors.end());
-    if (indexing == "xy") {
-        swap_first_and_second_tensors = size >= 2;
-        if (swap_first_and_second_tensors) std::swap(tensor_refs[0], tensor_refs[1]);
-    } else if (indexing != "ij") {
-        TP_THROW(RuntimeError, "torch.meshgrid: indexing must be one of \"xy\" or \"ij\", but received: " + indexing);
-    }
-
-    std::vector<int64_t> shape(size);
-    for (int64_t i = 0; i < size; ++i) {
-        if (tensor_refs[i].dim() > 1) {
-            TP_THROW(RuntimeError, "torch.meshgrid: Expected 0D or 1D tensor in the tensor list but got: " +
-                                       std::to_string(tensor_refs[i].dim()));
-        }
-        shape[i] = tensor_refs[i].numel();
-    }
-
-    std::vector<Tensor> grids;
-    grids.reserve(size);
-    std::vector<int64_t> view_shape(size, 1);
-    for (int64_t i = 0; i < size; ++i) {
-        view_shape[i] = -1;
-        grids.push_back(tensor_refs[i].view(view_shape).expand(shape));
-        view_shape[i] = 1;
-    }
-    if (swap_first_and_second_tensors) std::swap(grids[0], grids[1]);
-    return grids;
-}
-
-Tensor roll_cuda(const Tensor& self, std::vector<int64_t> shifts, std::vector<int64_t> dims) {
-    // ATen TensorTransformations.cpp roll(): per-dim narrow+cat.
-    if (dims.empty()) {
-        if (shifts.size() != 1) TP_THROW(RuntimeError, "`shifts` required");
-        dims.push_back(0);
-    }
-    if (shifts.size() != dims.size()) {
-        TP_THROW(RuntimeError, "shifts and dimensions must align. shifts: " + std::to_string(shifts.size()) +
-                                   ", dims:" + std::to_string(dims.size()));
-    }
-    Tensor result = self;
-    for (size_t i = 0; i < dims.size(); ++i) {
-        const int64_t dim = wrap_dim_local(dims[i], result.dim());
-        const int64_t size = result.size(dim);
-        if (result.numel() == 0 || size == 0) continue;
-        const int64_t start = (((size - shifts[i]) % size) + size) % size;
-        Tensor t0 = result.slice(dim, start, size);
-        Tensor t1 = result.slice(dim, 0, start);
-        result = Tensor::cat({t0, t1}, dim);
-    }
-    return result;
-}
-
 static Tensor diff_helper(const Tensor& self, int64_t n, int64_t dim) {
     // ATen ReduceOps.cpp diff_helper.
     Tensor result = self;
@@ -128,19 +61,6 @@ Tensor diff_cuda(const Tensor& self, int64_t n, int64_t dim, const Tensor& prepe
     pieces.push_back(self);
     if (has_append) pieces.push_back(append);
     return diff_helper(Tensor::cat(pieces, d), n, d);
-}
-
-Tensor masked_fill_cuda(const Tensor& self, const Tensor& mask, Scalar value) {
-    Tensor filled = Tensor::full(static_cast<std::vector<int64_t>>(self.shape()), value,
-                                 self.dtype(), self.device());
-    return where_cuda(mask, filled, self);
-}
-
-Tensor masked_fill__cuda(Tensor& self, const Tensor& mask, Scalar value) {
-    Tensor filled = Tensor::full(static_cast<std::vector<int64_t>>(self.shape()), value,
-                                 self.dtype(), self.device());
-    self.copy_(where_cuda(mask, filled, self));
-    return self;
 }
 
 Tensor one_hot_cuda(const Tensor& self, int64_t num_classes) {

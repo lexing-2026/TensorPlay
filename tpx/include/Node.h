@@ -8,6 +8,7 @@
 #include "Macros.h"
 #include "Edge.h"
 #include "Tensor.h"
+#include "AnomalyMode.h"
 
 namespace tensorplay {
 namespace tpx {
@@ -23,6 +24,12 @@ inline uint64_t get_and_increment_sequence_nr() {
     return counter++;
 }
 
+#if defined(__GNUG__) && !defined(TP_NO_CXA_DEMANGLE)
+// Demangles a typeid name and keeps only the class component (torch prints
+// backward nodes as e.g. "MulBackward0", never namespace-qualified).
+inline std::string demangle_node_name(const char* mangled);
+#endif
+
 class TENSORPLAY_API Node : public std::enable_shared_from_this<Node> {
 public:
     // Hooks mirror torch::autograd::Node: pre-hooks may rewrite the incoming
@@ -30,14 +37,20 @@ public:
     using PreHookFn = std::function<variable_list(variable_list&&)>;
     using PostHookFn = std::function<variable_list(const variable_list&, variable_list&&)>;
 
-    Node() : sequence_nr_(get_and_increment_sequence_nr()) {}
-    explicit Node(uint64_t sequence_nr) : sequence_nr_(sequence_nr) {}
-    virtual ~Node() = default;
+    Node() : sequence_nr_(get_and_increment_sequence_nr()) { init_anomaly_metadata(); }
+    explicit Node(uint64_t sequence_nr) : sequence_nr_(sequence_nr) { init_anomaly_metadata(); }
 
     virtual variable_list apply(variable_list&& inputs) = 0;
 
-    // Mirrors at::Node::name(): RTTI-based class name for introspection.
-    virtual std::string name() const { return typeid(*this).name(); }
+    // Mirrors at::Node::name(): demangled class name for introspection and
+    // anomaly-mode error messages.
+    virtual std::string name() const {
+#if defined(__GNUG__) && !defined(TP_NO_CXA_DEMANGLE)
+        return demangle_node_name(typeid(*this).name());
+#else
+        return typeid(*this).name();
+#endif
+    }
 
     void add_next_edge(Edge edge) {
         update_topological_nr(edge);
@@ -72,7 +85,27 @@ public:
     const std::vector<PreHookFn>& pre_hooks() const { return pre_hooks_; }
     const std::vector<PostHookFn>& post_hooks() const { return post_hooks_; }
 
+    // Debug metadata for anomaly mode, created lazily on first access.
+    AnomalyMetadata* anomaly_metadata() {
+        if (!anomaly_metadata_) {
+            anomaly_metadata_ = std::make_unique<AnomalyMetadata>();
+        }
+        return anomaly_metadata_.get();
+    }
+
 private:
+    // Mirrors torch::autograd::Node's constructor: when anomaly mode is on,
+    // capture where (in which stack) this node was created and record the
+    // node being evaluated (if any) as its parent.
+    void init_anomaly_metadata() {
+        if (AnomalyMode::is_enabled()) {
+            anomaly_metadata()->store_stack();
+            if (auto parent = get_current_evaluating_node()) {
+                anomaly_metadata()->assign_parent(parent);
+            }
+        }
+    }
+
     void update_topological_nr(const Edge& edge) {
         if (!edge.is_valid()) return;
         auto topo_nr = edge.function->topological_nr();
@@ -89,7 +122,23 @@ protected:
 private:
     std::vector<PreHookFn> pre_hooks_;
     std::vector<PostHookFn> post_hooks_;
+    std::unique_ptr<AnomalyMetadata> anomaly_metadata_ = nullptr;
 };
+
+#if defined(__GNUG__) && !defined(TP_NO_CXA_DEMANGLE)
+#include <cxxabi.h>
+
+inline std::string demangle_node_name(const char* mangled) {
+    int status = 0;
+    char* demangled = abi::__cxa_demangle(mangled, nullptr, nullptr, &status);
+    if (status != 0 || !demangled) return mangled;
+    std::string full(demangled);
+    free(demangled);
+    // Keep only the unqualified class name.
+    auto pos = full.rfind("::");
+    return pos == std::string::npos ? full : full.substr(pos + 2);
+}
+#endif
 
 } // namespace tpx
 } // namespace tensorplay

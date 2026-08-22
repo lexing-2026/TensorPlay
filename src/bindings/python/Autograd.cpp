@@ -2,6 +2,7 @@
 #include "Node.h"
 #include "AccumulateGrad.h"
 #include "Autograd.h"
+#include "AnomalyMode.h"
 #include <typeinfo>
 #include <string>
 #include <pybind11/functional.h>
@@ -63,6 +64,9 @@ void init_autograd(py::module_& m) {
     py::class_<tensorplay::tpx::Node, std::shared_ptr<tensorplay::tpx::Node>>(m, "Node")
         .def_property_readonly("name", [](const tensorplay::tpx::Node& self) {
             return std::string(typeid(self).name());
+        })
+        .def("_raw_ptr", [](const tensorplay::tpx::Node& self) -> int64_t {
+            return reinterpret_cast<int64_t>(&self);
         })
         .def("add_pre_hook", [](tensorplay::tpx::Node& self,
                                 std::function<std::vector<tensorplay::tpx::Tensor>(
@@ -136,15 +140,51 @@ void init_autograd(py::module_& m) {
         std::vector<Tensor> grads;
         if (grad_outputs) grads = *grad_outputs;
         py::gil_scoped_release release;
-        return tensorplay::tpx::grad(outputs, inputs, grads, keep_graph, create_graph, allow_unused);
+        auto captured = tensorplay::tpx::grad(outputs, inputs, grads, keep_graph, create_graph, allow_unused);
+        // Undefined gradients (unused inputs, or grads that arrive as
+        // undefined through the graph) surface as None, matching torch.
+        std::vector<std::optional<Tensor>> result;
+        result.reserve(captured.size());
+        for (auto& t : captured) {
+            if (t.defined()) result.emplace_back(std::move(t));
+            else result.emplace_back(std::nullopt);
+        }
+        return result;
     }, "outputs"_a, "inputs"_a, "grad_outputs"_a = py::none(), "retain_graph"_a = py::none(), "create_graph"_a = false, "allow_unused"_a = false);
 
     autograd.def("is_grad_enabled", &tensorplay::tpx::GradMode::is_enabled);
     autograd.def("set_grad_enabled", &tensorplay::tpx::GradMode::set_enabled);
 
+    // Anomaly mode (mirrors torch._C._autograd anomaly bindings). Node
+    // creation happens deep inside C++ op wrappers while the calling thread
+    // holds the GIL, so capturing the Python traceback at that point records
+    // the user-level call site of each forward op.
+    autograd.def("is_anomaly_enabled", &tensorplay::tpx::AnomalyMode::is_enabled);
+    autograd.def("is_anomaly_check_nan_enabled", &tensorplay::tpx::AnomalyMode::should_check_nan);
+    autograd.def("set_anomaly_enabled",
+                 [](bool enabled, bool check_nan) { tensorplay::tpx::AnomalyMode::set_enabled(enabled, check_nan); },
+                 "enabled"_a, "check_nan"_a = true);
+
     // Profiler submodule
     py::module_ profiler = m.def_submodule("profiler", "Profiler");
-    
+
     // Parallel submodule
     py::module_ parallel = m.def_submodule("parallel", "Parallel computing");
+
+    // Install the anomaly-mode stack capturer: records the Python traceback
+    // of the forward op call site (mirrors torch's PyAnomalyMetadata, which
+    // overrides the C++ backtrace default for the Python engine).
+    tensorplay::tpx::set_anomaly_stack_capture([]() -> std::string {
+        if (!Py_IsInitialized()) return {};
+        try {
+            py::gil_scoped_acquire gil;
+            if (!Py_IsInitialized()) return {};
+            auto traceback = py::module_::import("traceback");
+            auto stack = traceback.attr("format_stack")();
+            std::string out = py::str(stack).cast<std::string>();
+            return out;
+        } catch (const std::exception&) {
+            return {};
+        }
+    });
 }

@@ -7,6 +7,7 @@ from typing import Optional
 __all__ = [
     "BCELoss",
     "BCEWithLogitsLoss",
+    "CTCLoss",
     "CrossEntropyLoss",
     "CosineEmbeddingLoss",
     "GaussianNLLLoss",
@@ -16,6 +17,7 @@ __all__ = [
     "L1Loss",
     "MSELoss",
     "MarginRankingLoss",
+    "MultiLabelMarginLoss",
     "MultiLabelSoftMarginLoss",
     "MultiMarginLoss",
     "NLLLoss",
@@ -305,3 +307,32 @@ class GaussianNLLLoss(_Loss):
     def forward(self, input: tp.Tensor, target: tp.Tensor, var: tp.Tensor) -> tp.Tensor:
         return F.gaussian_nll_loss(input, target, var, full=self.full, eps=self.eps,
                                    reduction=self.reduction)
+
+
+class MultiLabelMarginLoss(_Loss):
+    __constants__ = ['reduction']
+
+    def __init__(self, size_average=None, reduce=None, reduction: str = 'mean') -> None:
+        super(MultiLabelMarginLoss, self).__init__(reduction)
+
+    def forward(self, input: tp.Tensor, target: tp.Tensor) -> tp.Tensor:
+        return F.multilabel_margin_loss(input, target, reduction=self.reduction)
+
+
+class CTCLoss(_Loss):
+    __constants__ = ['blank', 'reduction']
+    blank: int
+    zero_infinity: bool
+
+    def __init__(self, blank: int = 0, reduction: str = 'mean', zero_infinity: bool = False) -> None:
+        super(CTCLoss, self).__init__(reduction=reduction)
+        self.blank = blank
+        self.zero_infinity = zero_infinity
+
+    def forward(self,
+                log_probs: tp.Tensor,
+                targets: tp.Tensor,
+                input_lengths: tp.Tensor,
+                target_lengths: tp.Tensor) -> tp.Tensor:
+        return F.ctc_loss(log_probs, targets, input_lengths, target_lengths,
+                          self.blank, self.reduction, self.zero_infinity)

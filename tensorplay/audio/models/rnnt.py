@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple
 
 import tensorplay as torch
-from torchaudio.models import Emformer
+from tensorplay.audio.models import Emformer
 
 
 __all__ = ["RNNT", "emformer_rnnt_base", "emformer_rnnt_model"]

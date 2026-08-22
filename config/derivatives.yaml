@@ -152,7 +152,7 @@
   self: grad / other
 
 - name: embedding(Tensor weight, Tensor indices, int padding_idx=-1, bool scale_grad_by_freq=false, bool sparse=false) -> Tensor
-  weight: embedding_backward(grad, indices, weight.size(0), padding_idx, scale_grad_by_freq, sparse)
+  weight: tensorplay::tpx::ops::embedding_dense_backward(grad, indices, weight.size(0), padding_idx, scale_grad_by_freq)
 
 - name: view(Tensor self, int[] shape) -> Tensor
   self: grad.view(self.shape())
@@ -375,7 +375,7 @@
 
 # ATen: - name: gelu(Tensor self, *, str approximate='none') -> Tensor
 - name: gelu(Tensor self, str approximate="none") -> Tensor
-  self: gelu_backward(grad, self, approximate)
+  self: tensorplay::tpx::ops::gelu_backward(grad, self, approximate)
 
 # ATen: hardtanh(Tensor self, Scalar min_val=-1, Scalar max_val=1)
 - name: hardtanh(Tensor self, Scalar min_val=-1, Scalar max_val=1) -> Tensor
@@ -474,10 +474,10 @@
 - name: triu(Tensor self, int diagonal=0) -> Tensor
   self: grad.triu(diagonal)
 
-# derivatives.yaml:531 cumsum_backward(grad.to(self.scalar_type()), dim);
-# our native helper scans in reverse along dim.
+# derivatives.yaml:531 + torch/csrc/autograd/FunctionsManual.cpp:1136
+# cumsum_backward = grad.flip(dim).cumsum(dim).flip(dim)
 - name: cumsum(Tensor self, int dim, ScalarType? dtype=None) -> Tensor
-  self: cumsum_backward(grad, dim)
+  self: tensorplay::tpx::ops::flip(tensorplay::tpx::ops::cumsum(tensorplay::tpx::ops::flip(grad, {dim}), dim), {dim})
 
 # gather_backward composite (TensorAdvancedIndexing.cpp:2118):
 # new_zeros(self.sizes()).scatter_add_(dim, index, grad)
@@ -496,7 +496,7 @@
 # derivatives.yaml:864+ self: grad; source: grad.index_select(dim, index)
 - name: index_add(Tensor self, int dim, Tensor index, Tensor source) -> Tensor
   self: grad
-  source: grad.index_select(dim, index)
+  source: tensorplay::tpx::ops::index_select(grad, dim, index)
 
 # ===========================================================================
 # Tier 2-4 autograd rules. Formulas follow
@@ -604,10 +604,10 @@
 
 # PixelShuffle.cpp pair are inverses of each other.
 - name: pixel_shuffle(Tensor self, int upscale_factor) -> Tensor
-  self: grad.pixel_unshuffle(upscale_factor)
+  self: tensorplay::tpx::ops::pixel_unshuffle(grad, upscale_factor)
 
 - name: pixel_unshuffle(Tensor self, int downscale_factor) -> Tensor
-  self: grad.pixel_shuffle(downscale_factor)
+  self: tensorplay::tpx::ops::pixel_shuffle(grad, downscale_factor)
 
 # ReduceOps.cpp:1578 logsumexp
 - name: logsumexp(Tensor self, int dim, bool keepdim=false) -> Tensor

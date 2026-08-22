@@ -1,6 +1,7 @@
 #include "Tensor.h"
 #include "Generator.h"
 #include "Dispatcher.h"
+#include "Context.h"
 #include "CUDARuntime.h"
 #include "Exception.h"
 #include "CUDAContext.h"
@@ -171,6 +172,8 @@ __global__ void nll_loss_backward_kernel(
 }
 
 Tensor nll_loss_backward_cuda(const Tensor& grad_output, const Tensor& input, const Tensor& target, const std::optional<Tensor>& weight_opt, int64_t reduction, int64_t ignore_index, const Tensor& total_weight) {
+    // Accumulates with atomicAdd (no deterministic variant implemented).
+    globalContext().alertNotDeterministic("nll_loss_backward_cuda");
     int64_t N = input.size(0);
     int64_t C = input.size(1);
     Tensor grad_input = Tensor::zeros_like(input);

@@ -12,6 +12,7 @@ from tensorplay.nn import (
     parameter as parameter,
     utils as utils,
 )
+from tensorplay.nn.parallel.data_parallel import DataParallel as DataParallel
 
 
 def factory_kwargs(kwargs):

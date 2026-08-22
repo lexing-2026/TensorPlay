@@ -171,24 +171,154 @@ Tensor adaptive_avg_pool2d_backward_cuda(const Tensor& grad_output, const Tensor
     return grad_input;
 }
 
+// Port of at::native::adaptivemaxpool
+// (aten/src/ATen/native/cuda/AdaptiveMaxPooling2d.cu:46), flattened to one
+// thread per output element in tp's pooling-kernel style. Window bounds come
+// from AdaptivePooling.h start_index/end_index (floor start, ceil end); NaN
+// wins the argmax scan like ATen's `(val > max) || isnan(val)`.
+__global__ void adaptive_max_pool2d_forward_kernel(
+    const float* input,
+    float* output,
+    int64_t N,
+    int64_t C,
+    int64_t H_in,
+    int64_t W_in,
+    int64_t H_out,
+    int64_t W_out) {
+    int64_t output_index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t output_elements = N * C * H_out * W_out;
+    if (output_index >= output_elements) return;
+
+    int64_t w = output_index % W_out;
+    int64_t h = (output_index / W_out) % H_out;
+    int64_t c = (output_index / (W_out * H_out)) % C;
+    int64_t n = output_index / (W_out * H_out * C);
+
+    int64_t h_start = (h * H_in) / H_out;
+    int64_t h_end = 1 + (((h + 1) * H_in) - 1) / H_out;
+    int64_t w_start = (w * W_in) / W_out;
+    int64_t w_end = 1 + (((w + 1) * W_in) - 1) / W_out;
+
+    const float* plane = input + (n * C + c) * H_in * W_in;
+    float max_val = -__int_as_float(0x7f800000);
+    for (int64_t ih = h_start; ih < h_end; ++ih) {
+        for (int64_t iw = w_start; iw < w_end; ++iw) {
+            float val = plane[ih * W_in + iw];
+            if ((val > max_val) || isnan(val)) max_val = val;
+        }
+    }
+    output[output_index] = max_val;
+}
+
+// Port of at::native::atomicadaptivemaxgradinput
+// (aten/src/ATen/native/cuda/AdaptiveMaxPooling2d.cu:159): re-derive the
+// window argmax (the dispatcher op returns values only) and scatter
+// grad_output atomically, since windows overlap.
+__global__ void adaptive_max_pool2d_backward_kernel(
+    const float* grad_output,
+    const float* input,
+    float* grad_input,
+    int64_t N,
+    int64_t C,
+    int64_t H_in,
+    int64_t W_in,
+    int64_t H_out,
+    int64_t W_out) {
+    int64_t output_index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t output_elements = N * C * H_out * W_out;
+    if (output_index >= output_elements) return;
+
+    int64_t w = output_index % W_out;
+    int64_t h = (output_index / W_out) % H_out;
+    int64_t c = (output_index / (W_out * H_out)) % C;
+    int64_t n = output_index / (W_out * H_out * C);
+
+    int64_t h_start = (h * H_in) / H_out;
+    int64_t h_end = 1 + (((h + 1) * H_in) - 1) / H_out;
+    int64_t w_start = (w * W_in) / W_out;
+    int64_t w_end = 1 + (((w + 1) * W_in) - 1) / W_out;
+
+    const float* plane = input + (n * C + c) * H_in * W_in;
+    float max_val = -__int_as_float(0x7f800000);
+    int64_t max_idx = h_start * W_in + w_start;
+    for (int64_t ih = h_start; ih < h_end; ++ih) {
+        for (int64_t iw = w_start; iw < w_end; ++iw) {
+            int64_t idx = ih * W_in + iw;
+            float val = plane[idx];
+            if ((val > max_val) || isnan(val)) {
+                max_val = val;
+                max_idx = idx;
+            }
+        }
+    }
+    atomicAdd(grad_input + (n * C + c) * H_in * W_in + max_idx,
+              grad_output[output_index]);
+}
+
+Tensor adaptive_max_pool2d_cuda(const Tensor& input, const std::vector<int64_t>& output_size) {
+    if (input.dim() != 4) TP_THROW(RuntimeError, "adaptive_max_pool2d: Expected 4D input");
+    if (input.dtype() != DType::Float32) {
+        TP_THROW(NotImplementedError, "adaptive_max_pool2d CUDA only supports Float32");
+    }
+    auto [H_out, W_out] = get_pair(output_size);
+    if (H_out <= 0 || W_out <= 0) TP_THROW(RuntimeError, "adaptive_max_pool2d: Invalid output size");
+
+    Tensor input_contig = input.is_contiguous() ? input : input.contiguous();
+    Tensor output = Tensor::empty({input.size(0), input.size(1), H_out, W_out}, input.dtype(), input.device());
+    int64_t elements = output.numel();
+    if (elements == 0) return output;
+    int threads = 256;
+    int blocks = static_cast<int>((elements + threads - 1) / threads);
+    adaptive_max_pool2d_forward_kernel<<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+        input_contig.data_ptr<float>(), output.data_ptr<float>(),
+        input.size(0), input.size(1), input.size(2), input.size(3), H_out, W_out);
+    cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) TP_THROW(RuntimeError, std::string("adaptive_max_pool2d CUDA: ") + cudaGetErrorString(error));
+    return output;
+}
+
+Tensor adaptive_max_pool2d_backward_cuda(const Tensor& grad_output, const Tensor& input) {
+    if (input.dim() != 4 || grad_output.dim() != 4) {
+        TP_THROW(RuntimeError, "adaptive_max_pool2d_backward: Expected 4D input and grad_output");
+    }
+    if (input.dtype() != DType::Float32 || grad_output.dtype() != DType::Float32) {
+        TP_THROW(NotImplementedError, "adaptive_max_pool2d_backward CUDA only supports Float32");
+    }
+    Tensor input_contig = input.is_contiguous() ? input : input.contiguous();
+    Tensor grad_output_contig = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
+    Tensor grad_input = Tensor::zeros_like(input_contig);
+    int64_t elements = grad_output_contig.numel();
+    if (elements == 0 || input_contig.numel() == 0) return grad_input;
+    int threads = 256;
+    int blocks = static_cast<int>((elements + threads - 1) / threads);
+    adaptive_max_pool2d_backward_kernel<<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+        grad_output_contig.data_ptr<float>(), input_contig.data_ptr<float>(),
+        grad_input.data_ptr<float>(),
+        input.size(0), input.size(1), input.size(2), input.size(3),
+        grad_output.size(2), grad_output.size(3));
+    cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) TP_THROW(RuntimeError, std::string("adaptive_max_pool2d_backward CUDA: ") + cudaGetErrorString(error));
+    return grad_input;
+}
+
 #ifdef USE_CUDNN
 struct TensorDesc {
     cudnnTensorDescriptor_t desc;
     TensorDesc() { CUDNN_CHECK(cudnnCreateTensorDescriptor(&desc)); }
     ~TensorDesc() { cudnnDestroyTensorDescriptor(desc); }
     operator cudnnTensorDescriptor_t() const { return desc; }
-    
+
     void set(const Tensor& t) {
         cudnnDataType_t dtype;
         if (t.dtype() == DType::Float32) dtype = CUDNN_DATA_FLOAT;
         else if (t.dtype() == DType::Float64) dtype = CUDNN_DATA_DOUBLE;
         else TP_THROW(NotImplementedError, "cuDNN: only float/double supported");
-        
+
         int n = static_cast<int>(t.size(0));
         int c = static_cast<int>(t.size(1));
         int h = static_cast<int>(t.size(2));
         int w = static_cast<int>(t.size(3));
-        
+
         // cuDNN's Ex descriptor preserves the actual logical tensor strides,
         // matching the descriptor construction in PyTorch's cuDNN v8 path.
         CUDNN_CHECK(cudnnSetTensor4dDescriptorEx(
@@ -379,6 +509,8 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, PoolingKernels) {
     m.impl("avg_pool2d_backward", avg_pool2d_backward_cuda);
     m.impl("adaptive_avg_pool2d", adaptive_avg_pool2d_cuda);
     m.impl("adaptive_avg_pool2d_backward", adaptive_avg_pool2d_backward_cuda);
+    m.impl("adaptive_max_pool2d", adaptive_max_pool2d_cuda);
+    m.impl("adaptive_max_pool2d_backward", adaptive_max_pool2d_backward_cuda);
 }
 
 } // namespace cuda

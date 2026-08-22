@@ -5,6 +5,8 @@
 
 #include "NCCLContext.h"
 
+#include <vector>
+
 #ifdef USE_CUDA
 #include "CUDARuntime.h"
 #endif
@@ -216,4 +218,97 @@ void init_distributed(py::module_& m) {
         (void)t; (void)peer; (void)handle;
 #endif
     }, "tensor"_a, "peer"_a, "comm"_a);
+
+    auto dtype_item_size = [](const Tensor& t) -> size_t {
+        switch (t.dtype()) {
+            case DType::Int8:
+            case DType::UInt8: return 1;
+            case DType::Int16:
+            case DType::UInt16:
+            case DType::Float16:
+            case DType::BFloat16: return 2;
+            case DType::Int32:
+            case DType::UInt32:
+            case DType::Float32: return 4;
+            case DType::Int64:
+            case DType::UInt64:
+            case DType::Float64: return 8;
+            default:
+                TP_THROW(RuntimeError,
+                         "unsupported dtype for all_to_all_single");
+        }
+    };
+
+    // torch.distributed.all_to_all_single with equal splits
+    dist.def("all_to_all_single_equal_split", [&](Tensor& output, Tensor& input, uint64_t handle) {
+#ifdef USE_CUDA
+        void* send_ptr = require_cuda(input);
+        void* recv_ptr = require_cuda(output);
+        if (input.dtype() != output.dtype()) {
+            TP_THROW(ValueError, "output tensor must have the same type as input tensor");
+        }
+        if (output.numel() != input.numel()) {
+            TP_THROW(ValueError, "output tensor must have the same number of elements as input tensor");
+        }
+        tensorplay::nccl::allToAllSingleEqualSplit(
+            send_ptr, recv_ptr, input.numel(), input.dtype(),
+            reinterpret_cast<Comm>(handle), current_stream_ptr(input));
+#else
+        (void)output; (void)input; (void)handle;
+#endif
+    }, "recv"_a, "send"_a, "comm"_a);
+
+    // torch.distributed.all_to_all_single with explicit per-rank splits
+    dist.def("all_to_all_single_unequal_split",
+             [&](Tensor& output, Tensor& input,
+                 std::vector<int64_t> output_split_sizes,
+                 std::vector<int64_t> input_split_sizes, uint64_t handle) {
+#ifdef USE_CUDA
+        void* send_ptr = require_cuda(input);
+        void* recv_ptr = require_cuda(output);
+        if (input.dtype() != output.dtype()) {
+            TP_THROW(ValueError, "output tensor must have the same type as input tensor");
+        }
+        size_t elem = dtype_item_size(input);
+        std::vector<size_t> sendcounts, senddispls, recvcounts, recvdispls;
+        size_t acc = 0;
+        for (int64_t s : input_split_sizes) {
+            sendcounts.push_back(static_cast<size_t>(s));
+            senddispls.push_back(acc);
+            acc += static_cast<size_t>(s);
+        }
+        if (acc != static_cast<size_t>(input.numel())) {
+            TP_THROW(ValueError, "input_split_sizes sum must equal input numel");
+        }
+        acc = 0;
+        for (int64_t s : output_split_sizes) {
+            recvcounts.push_back(static_cast<size_t>(s));
+            recvdispls.push_back(acc);
+            acc += static_cast<size_t>(s);
+        }
+        if (acc != static_cast<size_t>(output.numel())) {
+            TP_THROW(ValueError, "output_split_sizes sum must equal output numel");
+        }
+        tensorplay::nccl::allToAllSingleUnequalSplit(
+            send_ptr, sendcounts.data(), senddispls.data(),
+            recv_ptr, recvcounts.data(), recvdispls.data(),
+            elem, input.dtype(), reinterpret_cast<Comm>(handle),
+            current_stream_ptr(input));
+#else
+        (void)output; (void)input; (void)output_split_sizes;
+        (void)input_split_sizes; (void)handle;
+#endif
+    }, "recv"_a, "send"_a, "output_split_sizes"_a, "input_split_sizes"_a, "comm"_a);
+
+    // Group semantics for batched p2p (torch batch_isend_irecv support)
+    dist.def("group_start", []() {
+#ifdef USE_CUDA
+        tensorplay::nccl::groupStart();
+#endif
+    });
+    dist.def("group_end", []() {
+#ifdef USE_CUDA
+        tensorplay::nccl::groupEnd();
+#endif
+    });
 }

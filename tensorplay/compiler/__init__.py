@@ -49,3 +49,7 @@ __all__ = [
 
 
 from .aot import AOTError, build_aot  # noqa: F401
+
+from .decompositions import DecomposePass  # noqa: F401
+from .codecache import CodeCache, default_cache  # noqa: F401
+from .cudagraphs import CudaGraphError, CudaGraphManager  # noqa: F401

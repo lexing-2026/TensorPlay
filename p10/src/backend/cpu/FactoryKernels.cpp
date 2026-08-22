@@ -4,6 +4,7 @@
 #include "DistributionsHelper.h"
 #include "Scalar.h"
 #include "Exception.h"
+#include "Context.h"
 #include <vector>
 #include <cmath>
 #include <algorithm>
@@ -161,7 +162,7 @@ Tensor arange_start_step_kernel(Scalar start, Scalar end, Scalar step, DType dty
     // Type inference if Undefined
     if (dtype == DType::Undefined) {
         if (start.isFloatingPoint() || end.isFloatingPoint() || step.isFloatingPoint()) {
-            dtype = DType::Float32;
+            dtype = globalContext().defaultDType();
         } else {
             dtype = DType::Int64;
         }

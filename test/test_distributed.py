@@ -92,6 +92,7 @@ _NCCL_SCRIPT = """
 import sys
 import tensorplay as tp
 import tensorplay.distributed as dist
+from tensorplay.nn.parallel import DistributedDataParallel
 
 def L(x):
     return x.cpu().tolist()
@@ -123,6 +124,17 @@ dist.all_gather(outs, t)
 for r in range(world):
     assert L(outs[r]) == [float(r)] * 2, f"all_gather[{r}] {L(outs[r])}"
 
+# all_gather_into_tensor / _allgather_base
+t = tp.full((2,), float(rank + 1), dtype=tp.float32, device="cuda:0")
+flat_out = tp.zeros(2 * world, dtype=tp.float32, device="cuda:0")
+dist.all_gather_into_tensor(flat_out, t)
+assert L(flat_out) == [float(r + 1) for r in range(world) for _ in range(2)], \\
+    f"all_gather_into_tensor {L(flat_out)}"
+flat_out.zero_()
+dist._allgather_base(flat_out, t)
+assert L(flat_out) == [float(r + 1) for r in range(world) for _ in range(2)], \\
+    f"_allgather_base {L(flat_out)}"
+
 # gather
 gather_list = None
 if rank == 0:
@@ -148,6 +160,74 @@ output = tp.zeros(2, dtype=tp.float32, device="cuda:0")
 dist.reduce_scatter(output, ins, op=dist.ReduceOp.SUM)
 assert L(output) == [float(world)] * 2, f"reduce_scatter {L(output)}"
 
+# reduce_scatter_tensor / _reduce_scatter_base
+flat_in = tp.ones(world * 2, dtype=tp.float32, device="cuda:0")
+rs_out = tp.zeros(2, dtype=tp.float32, device="cuda:0")
+dist.reduce_scatter_tensor(rs_out, flat_in)
+assert L(rs_out) == [float(world)] * 2, f"reduce_scatter_tensor {L(rs_out)}"
+rs_out.zero_()
+dist._reduce_scatter_base(rs_out, flat_in)
+assert L(rs_out) == [float(world)] * 2, f"_reduce_scatter_base {L(rs_out)}"
+
+# group-rank translation APIs
+assert dist.get_process_group_ranks() == list(range(world))
+sub_all = dist.new_group(ranks=list(range(world)))
+assert dist.get_global_rank(sub_all, rank) == rank
+assert dist.get_group_rank(sub_all, rank) == rank
+assert dist.get_process_group_ranks(sub_all) == list(range(world))
+
+# all_to_all_single (equal splits)
+in_t = tp.arange(world * 2, dtype=tp.float32, device="cuda:0") + 100.0 * rank
+out_t = tp.zeros(world * 2, dtype=tp.float32, device="cuda:0")
+dist.all_to_all_single(out_t, in_t)
+expected = []
+for r in range(world):
+    expected.extend([float(100.0 * r + 2 * rank), float(100.0 * r + 2 * rank + 1)])
+assert L(out_t) == expected, f"all_to_all_single {L(out_t)} vs {expected}"
+
+# all_to_all_single (uneven splits): to rank r we send a chunk of size (r+1)
+in_sizes = [r + 1 for r in range(world)]
+out_sizes = [rank + 1] * world
+flat_in = tp.cat([tp.full((s,), float(10 * rank + s),
+                          dtype=tp.float32, device="cuda:0")
+                  for s in in_sizes])
+flat_out = tp.zeros(sum(out_sizes), dtype=tp.float32, device="cuda:0")
+dist.all_to_all_single(flat_out, flat_in, out_sizes, in_sizes)
+# rank r receives from each peer a chunk of size (rank+1) filled with 10*r_src+(rank+1)
+got = []
+for r in range(world):
+    got.extend([float(10 * r + rank + 1)] * (rank + 1))
+assert L(flat_out) == got, f"all_to_all_single uneven {L(flat_out)} vs {got}"
+
+# all_to_all tensor-list form
+ins_l = [tp.full((1,), float(rank * 10 + i), dtype=tp.float32,
+                 device="cuda:0") for i in range(world)]
+outs_l = [tp.zeros(1, dtype=tp.float32, device="cuda:0") for _ in range(world)]
+dist.all_to_all(outs_l, ins_l)
+for r in range(world):
+    assert L(outs_l[r]) == [float(r * 10 + rank)], f"all_to_all[{r}]"
+
+dist.barrier()
+
+if world >= 2:
+    # batch_isend_irecv ring exchange via grouped p2p
+    peer = (rank + 1) % world
+    prev = (rank - 1 + world) % world
+    send_t = tp.full((3,), float(rank), dtype=tp.float32, device="cuda:0")
+    recv_t = tp.zeros(3, dtype=tp.float32, device="cuda:0")
+    ops = [dist.P2POp(dist.isend, send_t, peer),
+           dist.P2POp(dist.irecv, recv_t, prev)]
+    reqs = dist.batch_isend_irecv(ops)
+    for req in reqs:
+        req.wait()
+    assert L(recv_t) == [float(prev)] * 3, f"batch_isend_irecv {L(recv_t)}"
+    # isend/irecv used directly
+    fut_work = dist.isend(send_t, peer)
+    got_w = dist.irecv(recv_t, prev)
+    fut_work.wait()
+    got_w.wait()
+    assert L(recv_t) == [float(rank)] * 3
+
 if world >= 2:
     # send / recv ring (requires a peer rank; NCCL forbids duplicate GPUs,
     # so this only runs on multi-GPU hosts)
@@ -171,6 +251,153 @@ assert L(t) == [2.0 * world] * 2, f"new_group {L(t)}"
 assert dist.get_rank(sub) == rank
 assert dist.get_world_size(sub) == world
 assert dist.get_backend() == "nccl"
+
+# object collectives
+objects = ["foo", {"r": rank}, rank]
+if rank == 0:
+    bcast = objects
+else:
+    bcast = [None] * 3
+dist.broadcast_object_list(bcast, src=0)
+assert bcast[0] == "foo" and bcast[1] == {"r": 0} and bcast[2] == 0, \\
+    f"broadcast_object_list {bcast}"
+
+ag = [None] * world
+dist.all_gather_object(ag, {"me": rank})
+for r in range(world):
+    assert ag[r] == {"me": r}, f"all_gather_object[{r}] {ag[r]}"
+
+go = [None] * world if rank == 0 else None
+dist.gather_object({"mine": rank}, go, dst=0)
+if rank == 0:
+    for r in range(world):
+        assert go[r] == {"mine": r}, f"gather_object[{r}] {go[r]}"
+
+so = [None]
+slist = [{"to": i} for i in range(world)] if rank == 0 else None
+dist.scatter_object_list(so, slist, src=0)
+assert so[0] == {"to": rank}, f"scatter_object_list {so[0]}"
+
+if world >= 2:
+    if rank == 0:
+        so_list = ["a", "b"]
+        dist.send_object_list(so_list, dst=1)
+    else:
+        ro = [None, None]
+        got_src = dist.recv_object_list(ro, src=0)
+        assert ro == ["a", "b"], f"recv_object_list {ro}"
+        assert got_src == 0
+
+dist.barrier()
+
+# DDP: initial-state sync, gradient averaging, buffer sync
+class Tiny(tp.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc = tp.nn.Linear(8, 4)
+        self.register_buffer("step", tp.zeros(1))
+
+tp.manual_seed(1234)
+model = Tiny().to("cuda:0")
+with tp.no_grad():
+    model.step.add_(float(rank + 1))  # diverge buffers per rank
+ddp = DistributedDataParallel(model, device_ids=[rank])
+ddp.module.step.zero_()
+
+# after construction all params/buffers equal rank 0's copies
+ws = []
+dist.all_gather_object(ws, ddp.module.fc.weight.detach().cpu().tolist())
+assert all(w == ws[0] for w in ws), "DDP param sync failed"
+bs = []
+dist.all_gather_object(bs, ddp.module.step.detach().cpu().tolist())
+assert all(b == bs[0] for b in bs), f"DDP init buffer sync failed {bs}"
+
+x = tp.full((16, 8), 0.5, dtype=tp.float32, device="cuda:0")
+loss = ddp(x).pow(2).sum()
+loss.backward()
+grads = []
+dist.all_gather_object(grads, ddp.module.fc.weight.grad.detach().cpu().tolist())
+assert all(g == grads[0] for g in grads), "DDP grads not identical across ranks"
+y = x @ ddp.module.fc.weight.t() + ddp.module.fc.bias
+expected_grad = (2.0 / world) * (y.t() @ x)
+diff = (ddp.module.fc.weight.grad - expected_grad).abs().max().item()
+assert diff < 1e-4, f"DDP grad mismatch {diff}"
+assert int(ddp.module.step.item()) == 0
+
+with ddp.no_sync():
+    assert ddp.require_backward_grad_sync is False
+assert ddp.require_backward_grad_sync is True
+
+sd = ddp.state_dict()
+assert any(k.startswith("module.") for k in sd.keys()), f"state_dict keys {list(sd)[:4]}"
+
+# ---- DDP with forced multi-bucket reduction (tiny cap) ----
+tp.manual_seed(1234)
+model_b = Tiny().to("cuda:0")
+ddp_b = DistributedDataParallel(model_b, device_ids=[rank], bucket_cap_mb=1)
+loss = ddp_b(x).pow(2).sum()
+loss.backward()
+grads_b = []
+dist.all_gather_object(grads_b, ddp_b.module.fc.weight.grad.detach().cpu().tolist())
+assert all(g == grads_b[0] for g in grads_b), "bucketed grads not identical"
+y_b = x @ ddp_b.module.fc.weight.t() + ddp_b.module.fc.bias
+expected_b = (2.0 / world) * (y_b.t() @ x)
+diff = (ddp_b.module.fc.weight.grad - expected_b).abs().max().item()
+assert diff < 1e-4, f"bucketed grad mismatch {diff}"
+
+# ---- DDP + allreduce comm hook (must match default path) ----
+from tensorplay.distributed.algorithms.ddp_comm_hooks import default_hooks
+tp.manual_seed(1234)
+model_c = Tiny().to("cuda:0")
+ddp_c = DistributedDataParallel(model_c, device_ids=[rank])
+ddp_c.register_comm_hook(None, default_hooks.allreduce_hook)
+loss = ddp_c(x).pow(2).sum()
+loss.backward()
+y_c = x @ ddp_c.module.fc.weight.t() + ddp_c.module.fc.bias
+expected_c = (2.0 / world) * (y_c.t() @ x)
+diff = (ddp_c.module.fc.weight.grad - expected_c).abs().max().item()
+assert diff < 1e-4, f"comm hook grad mismatch {diff}"
+
+# ---- DDP + fp16 compression hook ----
+tp.manual_seed(1234)
+model_d = Tiny().to("cuda:0")
+ddp_d = DistributedDataParallel(model_d, device_ids=[rank])
+ddp_d.register_comm_hook(None, default_hooks.fp16_compress_hook)
+loss = ddp_d(x).pow(2).sum()
+loss.backward()
+diff = (ddp_d.module.fc.weight.grad - (2.0 / world) * (
+    (x @ ddp_d.module.fc.weight.t() + ddp_d.module.fc.bias).t() @ x)
+).abs().max().item()
+assert diff < 5e-3, f"fp16 hook grad mismatch {diff}"
+
+# ---- DDP find_unused_parameters: two heads, rank-dependent usage ----
+class TwoHeads(tp.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.body = tp.nn.Linear(8, 8)
+        self.head0 = tp.nn.Linear(8, 2)
+        self.head1 = tp.nn.Linear(8, 2)
+
+    def forward(self, x):
+        return tp.cat([self.head0(self.body(x)),
+                       self.head1(self.body(x))], dim=1)
+
+tp.manual_seed(1234)
+model_e = TwoHeads().to("cuda:0")
+ddp_e = DistributedDataParallel(model_e, device_ids=[rank],
+                                find_unused_parameters=True,
+                                bucket_cap_mb=1)
+h = ddp_e(x)
+out = h[:, :2].pow(2).sum() if rank % 2 == 0 else h[:, 2:].pow(2).sum()
+out.backward()
+g_body = []
+dist.all_gather_object(g_body, ddp_e.module.body.weight.grad.detach().cpu().tolist())
+assert all(g == g_body[0] for g in g_body), "find_unused body grads differ"
+used_head = ddp_e.module.head0 if rank % 2 == 0 else ddp_e.module.head1
+unused_head = ddp_e.module.head1 if rank % 2 == 0 else ddp_e.module.head0
+assert used_head.weight.grad is not None, "used head grad missing"
+assert unused_head.weight.grad is None, "unused head grad should stay None"
+dist.barrier()
 
 dist.barrier()
 dist.destroy_process_group()
