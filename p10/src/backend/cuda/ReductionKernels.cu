@@ -225,10 +225,7 @@ Tensor run_reduction_typed(
     Tensor viewed = reduction_view(result, input, spec, keepdim);
     TensorIterator iter = TensorIterator::reduce_op(viewed, input);
     const auto config = reduction::make_reduce_config<InputT, AccT, OutputT>(iter);
-    if (config.input_vec_size == 8) {
-        reduction::launch_reduce<InputT, AccT, OutputT, Ops, ValuesPerThread, 8>(
-            iter, ops, identity);
-    } else if (config.input_vec_size == 4) {
+    if (config.input_vec_size == 4) {
         reduction::launch_reduce<InputT, AccT, OutputT, Ops, ValuesPerThread, 4>(
             iter, ops, identity);
     } else {

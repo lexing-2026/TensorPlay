@@ -338,7 +338,9 @@ inline ReduceConfig make_reduce_config(const TensorIterator& iter) {
 
     if (reduction_on_fastest_dimension && config.num_reduce_dims == 1 &&
         config.input_strides[0] == 1 && config.num_inputs >= 128) {
-        config.input_vec_size = sizeof(InputT) <= 2 ? 8 : 4;
+        // torch caps reduction vectorization at 4 (memory::can_vectorize_up_to);
+        // vec=8 instantiations triple reduce_kernel PTX for negligible gain.
+        config.input_vec_size = 4;
         const size_t vector_bytes = sizeof(InputT) * static_cast<size_t>(config.input_vec_size);
         bool aligned = reduction_pointer_aligned(iter, vector_bytes);
         for (int dim = config.num_reduce_dims; dim < config.ndim; ++dim) {
@@ -472,22 +474,19 @@ struct ReduceOp {
             if (logical_base < config.num_inputs) {
                 value = ops.reduce(value, row[config.input_offset(logical_base)], logical_base);
             }
+        } else if (logical_base + InputVecSize <= config.num_inputs &&
+                   config.input_strides[0] == 1 && config.vectorize_input) {
+            using Vec = aligned_vector<InputT, InputVecSize>;
+            const Vec loaded = *reinterpret_cast<const Vec*>(row + logical_base);
+            #pragma unroll
+            for (int i = 0; i < InputVecSize; ++i) {
+                value = ops.reduce(value, loaded.val[i], logical_base + i);
+            }
         } else {
-            if (logical_base + InputVecSize <= config.num_inputs &&
-                config.input_strides[0] == 1 && config.vectorize_input) {
-                using Vec = aligned_vector<InputT, InputVecSize>;
-                const Vec loaded = *reinterpret_cast<const Vec*>(row + logical_base);
-                #pragma unroll
-                for (int i = 0; i < InputVecSize; ++i) {
-                    value = ops.reduce(value, loaded.val[i], logical_base + i);
-                }
-            } else {
-                #pragma unroll
-                for (int i = 0; i < InputVecSize; ++i) {
-                    const int64_t logical = logical_base + i;
-                    if (logical < config.num_inputs) {
-                        value = ops.reduce(value, row[config.input_offset(logical)], logical);
-                    }
+            for (int i = 0; i < InputVecSize; ++i) {
+                const int64_t logical = logical_base + i;
+                if (logical < config.num_inputs) {
+                    value = ops.reduce(value, row[config.input_offset(logical)], logical);
                 }
             }
         }
@@ -495,6 +494,10 @@ struct ReduceOp {
         return value;
     }
 
+    // torch Reduce.cuh pattern: the vectorized fast path is selected once per
+    // thread with loop-invariant state and purely affine addressing, so the
+    // multi-dim div/mod offset decomposition never lands inside an unrolled
+    // region. Only the rare ragged tail goes through input_offset.
     __device__ __forceinline__ AccT thread_reduce(int64_t output_index) const {
         AccT values[ValuesPerThread];
         #pragma unroll
@@ -505,24 +508,37 @@ struct ReduceOp {
         const int64_t end = config.num_input_units;
         const int64_t base = config.input_base_offset(output_index);
         const InputT* row = input + base;
+        const bool can_vec = InputVecSize > 1 &&
+            config.input_strides[0] == 1 && config.vectorize_input;
 
         int64_t unit = start;
         while (unit + static_cast<int64_t>(ValuesPerThread - 1) * step < end) {
             #pragma unroll
             for (int i = 0; i < ValuesPerThread; ++i) {
                 const int64_t current = unit + static_cast<int64_t>(i) * step;
-                values[i] = reduce_unit(values[i], row, current,
-                    current * InputVecSize);
+                const int64_t logical_base = current * InputVecSize;
+                if (can_vec && logical_base + InputVecSize <= config.num_inputs) {
+                    using Vec = aligned_vector<InputT, InputVecSize>;
+                    const Vec loaded = *reinterpret_cast<const Vec*>(row + logical_base);
+                    #pragma unroll
+                    for (int j = 0; j < InputVecSize; ++j) {
+                        values[i] = ops.reduce(values[i], loaded.val[j], logical_base + j);
+                    }
+                } else {
+                    for (int j = 0; j < InputVecSize; ++j) {
+                        const int64_t logical = logical_base + j;
+                        if (logical < config.num_inputs) {
+                            values[i] = ops.reduce(
+                                values[i], row[config.input_offset(logical)], logical);
+                        }
+                    }
+                }
             }
             unit += step * ValuesPerThread;
         }
-        #pragma unroll
-        for (int i = 0; i < ValuesPerThread; ++i) {
-            const int64_t current = unit + static_cast<int64_t>(i) * step;
-            if (current < end) {
-                values[i] = reduce_unit(values[i], row, current,
-                    current * InputVecSize);
-            }
+        while (unit < end) {
+            values[0] = reduce_unit(values[0], row, unit, unit * InputVecSize);
+            ++unit;
         }
 
         #pragma unroll

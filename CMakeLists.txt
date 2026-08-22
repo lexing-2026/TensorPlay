@@ -208,6 +208,9 @@ if(WIN32)
         # /MP: Multi-processor compilation
         # /Gm-: Disable minimal rebuild
         set(MSVC_COMMON_FLAGS /EHsc /wd4251 /wd4275 /wd4819 /MP /Gm-)
+        # M_PI and friends are gated behind this define on MSVC
+        # (same treatment as upstream PyTorch's Windows builds).
+        add_compile_definitions($<$<COMPILE_LANGUAGE:CXX>:_USE_MATH_DEFINES>)
         set(MSVC_REL_FLAGS /O2 /arch:AVX2)
         
         foreach(FLAG ${MSVC_COMMON_FLAGS})
@@ -739,6 +742,13 @@ set_source_files_properties(
 )
 
 option(BUILD_SHARED_LIBS "Build shared libraries" ON)
+# Mirror upstream PyTorch's Windows layout: all internal libraries are
+# statically linked into the single Python extension (_C.pyd).  This avoids
+# needing __declspec(dllexport) annotations on every p10 symbol that crosses
+# the DLL boundary, which the codebase does not carry.
+if(WIN32 AND BUILD_SHARED_LIBS)
+    set(BUILD_SHARED_LIBS OFF)
+endif()
 
 # Add p10
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake/Modules)
