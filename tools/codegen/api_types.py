@@ -68,6 +68,9 @@ _RAW_ATOMIC = {
 def p10_ctype(t: Type):
     """Compose the p10 C++ type for a schema Type via torchgen algebra."""
     atom = BaseCType(_RAW_ATOMIC[t.kind])
+    if t.is_list and t.is_opt:
+        # ``int[]?`` composes optional over the vector type.
+        return StdOptionalCType(StdVectorCType(atom))
     if t.is_list:
         return StdVectorCType(atom)
     if t.is_opt:

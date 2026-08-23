@@ -155,6 +155,31 @@ void init_autograd(py::module_& m) {
     autograd.def("is_grad_enabled", &tensorplay::tpx::GradMode::is_enabled);
     autograd.def("set_grad_enabled", &tensorplay::tpx::GradMode::set_enabled);
 
+    // Inference mode (mirrors torch._C._InferenceMode): a context object the
+    // Python wrapper drives through __enter__/__exit__. Entering disables
+    // autograd recording and freezes version counters; exit restores the
+    // previous state so nested contexts behave like torch's guard stack.
+    struct PyInferenceMode {
+        bool prev_ = false;
+        explicit PyInferenceMode(bool mode) {
+            prev_ = tensorplay::tpx::InferenceMode::is_enabled();
+            tensorplay::tpx::InferenceMode::set_enabled(mode);
+        }
+        void enter() {}
+        void exit(const std::optional<py::object>&,
+                  const std::optional<py::object>&,
+                  const std::optional<py::object>&) {
+            tensorplay::tpx::InferenceMode::set_enabled(prev_);
+        }
+    };
+
+    py::class_<PyInferenceMode>(autograd, "_InferenceMode")
+        .def(py::init<bool>(), py::arg("mode") = true)
+        .def("__enter__", &PyInferenceMode::enter)
+        .def("__exit__", &PyInferenceMode::exit);
+
+    autograd.def("is_inference_mode_enabled", &tensorplay::tpx::InferenceMode::is_enabled);
+
     // Anomaly mode (mirrors torch._C._autograd anomaly bindings). Node
     // creation happens deep inside C++ op wrappers while the calling thread
     // holds the GIL, so capturing the Python traceback at that point records

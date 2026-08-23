@@ -1,5 +1,6 @@
 #include "python_bindings.h"
 #include "tensorplay/ops/TensorBindingsGenerated.h"
+#include "tensorplay/ops/TensorCPythonGenerated.h"
 #include "utils.h"
 #include "dlpack_types.h"
 #include "TensorImpl.h" // For unsafeGetTensorImpl
@@ -476,7 +477,7 @@ static void set_storage_from_shm(Tensor& self, py::object shm, size_t nbytes) {
 }
 
 
-// Normalize a Python slice against a length (mirrors nanobind's slice::compute)
+// Normalize a Python slice against a length (py::slice::compute, i.e. PySlice_GetIndicesEx)
 static std::tuple<int64_t, int64_t, int64_t, int64_t> compute_slice(py::slice s, int64_t length) {
     ssize_t start, stop, step, slicelength;
     if (!s.compute((ssize_t)length, &start, &stop, &step, &slicelength)) {
@@ -952,8 +953,21 @@ void init_tensor(py::module_& m) {
         .def("dim", &Tensor::dim)
         .def("numel", &Tensor::numel)
         .def("itemsize", &Tensor::itemsize)
-        .def("is_contiguous", &Tensor::is_contiguous)
-        .def("is_complex", [](const Tensor& t) { 
+        .def("is_contiguous", [](const Tensor& t) { return t.is_contiguous(); })
+        .def("is_contiguous", [](const Tensor& t, int64_t format) {
+             return t.is_contiguous(static_cast<tensorplay::MemoryFormat>(format));
+        }, "memory_format"_a)
+        .def("memory_format", [](const Tensor& t) {
+             return static_cast<int64_t>(t.memory_format());
+        })
+        .def("is_channels_last", &Tensor::is_channels_last)
+        .def("is_channels_last_2d", &Tensor::is_channels_last_2d)
+        .def("is_channels_last_3d", &Tensor::is_channels_last_3d)
+        .def("contiguous", [](const Tensor& t) { return t.contiguous(); })
+        .def("contiguous", [](const Tensor& t, int64_t format) {
+             return t.contiguous(static_cast<tensorplay::MemoryFormat>(format));
+        }, "memory_format"_a)
+        .def("is_complex", [](const Tensor& t) {
              return tensorplay::isComplexType(t.dtype());
         })
         .def("is_floating_point", [](const Tensor& t) {
@@ -970,11 +984,14 @@ void init_tensor(py::module_& m) {
             return t.as_strided(sizes, strides);
         })
         .def_property_readonly("is_sparse", &Tensor::is_sparse)
+        .def("is_sparse_csr", &Tensor::is_sparse_csr)
         .def("is_coalesced", &Tensor::is_coalesced)
         .def("sparse_dim", &Tensor::sparse_dim)
         .def("dense_dim", &Tensor::dense_dim)
         .def("_indices", &Tensor::_indices)
         .def("_values", &Tensor::_values)
+        .def("_crow_indices", &Tensor::_crow_indices)
+        .def("_col_indices", &Tensor::_col_indices)
         .def("coalesce", &Tensor::coalesce)
         .def("sparse_mask",
              static_cast<Tensor (Tensor::*)(const Tensor&) const>(&Tensor::sparse_mask),
@@ -1501,21 +1518,19 @@ void init_tensor(py::module_& m) {
         }, "device"_a, "dtype"_a, "non_blocking"_a = false, "copy"_a = false)
 
         .def("__array__", [](py::object self_obj, py::object dtype, bool copy) {
-            try {
-                py::module_ np = py::module_::import("numpy");
-                // Delegate to from_dlpack which is zero-copy and efficient
-                py::object arr = np.attr("from_dlpack")(self_obj);
-                if (copy) {
-                    arr = arr.attr("copy")();
-                }
-                if (!dtype.is_none()) {
-                    return arr.attr("astype")(dtype, "copy"_a = false);
-                }
-                return arr;
-            } catch (const std::exception&) {
-                TP_THROW(RuntimeError, "numpy is not installed or cannot be imported.");
+            // Port of torch/_tensor.py Tensor.__array__(dtype=None): delegate
+            // to .numpy() so both share one conversion path (grad/device/
+            // reduced-dtype handling included), then optionally cast.
+            // Default is a zero-copy view, matching numpy.asarray and torch.
+            py::object arr = self_obj.attr("numpy")();
+            if (!dtype.is_none()) {
+                return arr.attr("astype")(dtype, "copy"_a = false);
             }
-        }, "dtype"_a = py::none(), "copy"_a = true)
+            if (copy) {
+                arr = arr.attr("copy")();
+            }
+            return arr;
+        }, "dtype"_a = py::none(), "copy"_a = false)
 
         .def("numpy", [](py::object self_obj) {
             Tensor& self = py::cast<Tensor&>(self_obj);
@@ -1907,10 +1922,7 @@ void init_tensor(py::module_& m) {
             return self_obj;
         }, "other"_a)
         .def("bernoulli", static_cast<Tensor(Tensor::*)() const>(&Tensor::bernoulli))
-        .def("poisson", static_cast<Tensor(Tensor::*)() const>(&Tensor::poisson))
-        .def("mm", [](const Tensor& self, const Tensor& other) { return tensorplay::tpx::ops::mm(self, other); }, "other"_a)
-        .def("matmul", [](const Tensor& self, const Tensor& other) { return tensorplay::tpx::ops::matmul(self, other); }, "other"_a)
-        .def("__matmul__", [](const Tensor& self, const Tensor& other) { return tensorplay::tpx::ops::matmul(self, other); }, "other"_a)
+        .def("poisson", static_cast<Tensor(Tensor::*)() const>(&Tensor::poisson))        .def("__matmul__", [](const Tensor& self, const Tensor& other) { return tensorplay::tpx::ops::matmul(self, other); }, "other"_a)
 
         // Comparison operators
         .def("__hash__", [](const Tensor& self) { return (intptr_t)&self; })
@@ -1936,14 +1948,6 @@ void init_tensor(py::module_& m) {
         .def("asinh", [](const Tensor& self) { return tensorplay::tpx::ops::asinh(self); })
         .def("atan", [](const Tensor& self) { return tensorplay::tpx::ops::atan(self); })
         .def("atanh", [](const Tensor& self) { return tensorplay::tpx::ops::atanh(self); })
-        .def("ceil", [](const Tensor& self) { return tensorplay::tpx::ops::ceil(self); })
-        .def("clamp", [](const Tensor& self, std::optional<Scalar> min, std::optional<Scalar> max) {
-            return tensorplay::tpx::ops::clamp(self, min, max);
-        }, "min"_a = py::none(), "max"_a = py::none())
-        .def("cos", [](const Tensor& self) { return tensorplay::tpx::ops::cos(self); })
-        .def("cosh", [](const Tensor& self) { return tensorplay::tpx::ops::cosh(self); })
-        .def("exp", [](const Tensor& self) { return tensorplay::tpx::ops::exp(self); })
-        .def("floor", [](const Tensor& self) { return tensorplay::tpx::ops::floor(self); })
         .def("gelu", [](const Tensor& self) { return tensorplay::tpx::ops::gelu(self); })
         .def("lerp", [](const Tensor& self, const Tensor& end, Scalar weight) {
             return tensorplay::tpx::ops::lerp(self, end, weight);
@@ -1951,8 +1955,6 @@ void init_tensor(py::module_& m) {
         .def("lerp", [](const Tensor& self, const Tensor& end, const Tensor& weight) {
             return tensorplay::tpx::ops::lerp(self, end, weight);
         }, "end"_a, "weight"_a)
-        .def("log", [](const Tensor& self) { return tensorplay::tpx::ops::log(self); })
-        .def("neg", [](const Tensor& self) { return tensorplay::tpx::ops::neg(self); })
         .def("pow", [](const Tensor& self, Scalar exponent) { return tensorplay::tpx::ops::pow(self, exponent); }, "exponent"_a)
         .def("pow", [](const Tensor& self, const Tensor& exponent) { return tensorplay::tpx::ops::pow(self, exponent); }, "exponent"_a)
         .def("__pow__", [](const Tensor& self, Scalar exponent) { return tensorplay::tpx::ops::pow(self, exponent); }, "exponent"_a)
@@ -1960,24 +1962,7 @@ void init_tensor(py::module_& m) {
         .def("__rpow__", [](const Tensor& self, Scalar base) {
             Tensor base_t = Tensor::full({}, base, self.dtype(), self.device());
             return tensorplay::tpx::ops::pow(base_t, self);
-        })
-        .def("relu", [](const Tensor& self) { return tensorplay::tpx::ops::relu(self); })
-        .def("round", [](const Tensor& self) { return tensorplay::tpx::ops::round(self); })
-        .def("rsqrt", [](const Tensor& self) { return tensorplay::tpx::ops::rsqrt(self); })
-        .def("sigmoid", [](const Tensor& self) { return tensorplay::tpx::ops::sigmoid(self); })
-        .def("silu", [](const Tensor& self) { return tensorplay::tpx::ops::silu(self); })
-        .def("sign", [](const Tensor& self) { return tensorplay::tpx::ops::sign(self); })
-        .def("sin", [](const Tensor& self) { return tensorplay::tpx::ops::sin(self); })
-        .def("sinh", [](const Tensor& self) { return tensorplay::tpx::ops::sinh(self); })
-        .def("softmax", [](const Tensor& self, int64_t dim, DType dtype) {
-            return tensorplay::tpx::ops::softmax(self, dim, dtype);
-        }, "dim"_a, "dtype"_a = DType::Undefined)
-        .def("sqrt", [](const Tensor& self) { return tensorplay::tpx::ops::sqrt(self); })
-        .def("square", [](const Tensor& self) { return tensorplay::tpx::ops::square(self); })
-        .def("tan", [](const Tensor& self) { return tensorplay::tpx::ops::tan(self); })
-        .def("tanh", [](const Tensor& self) { return tensorplay::tpx::ops::tanh(self); })
-
-        // DLPack
+        })        // DLPack
         .def("__dlpack__", [](py::object self_obj, std::optional<int64_t> stream) {
             return to_dlpack(self_obj, stream);
         }, "stream"_a = py::none())
@@ -2075,5 +2060,16 @@ void init_tensor(py::module_& m) {
 
         // String repr
         .def("__repr__", &Tensor::toString)
-        .def("__str__", &Tensor::toString);
+        .def("__str__", &Tensor::toString)
+        // Scalar/float conversion: Tensor::item() has the C++ side; without
+        // this, float(t) on the raw extension type raises TypeError.
+        .def("__float__", [](const Tensor& self) { return self.item().to<double>(); })
+        .def("__int__", [](const Tensor& self) { return static_cast<int64_t>(self.item().to<double>()); });
+
+    // FASTCALL method layer goes in LAST: it fills names nothing above
+    // bound, and must never shadow a hand-written pybind overload (e.g.
+    // sum's scalar/list forms).
+    if (tensorplay::python_c::register_generated_cpython_methods(tensor.ptr()) != 0) {
+        throw py::error_already_set();
+    }
 }

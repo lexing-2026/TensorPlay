@@ -2,6 +2,7 @@
 #include "Utils.h"
 
 #include <algorithm>
+#include <cmath>
 #include <numeric>
 #include <utility>
 #include <vector>
@@ -54,8 +55,33 @@ std::vector<int64_t> dense_shape_for(const Tensor& sparse) {
 } // namespace
 
 Tensor sparse_coo_tensor_cpu(const Tensor& indices, const Tensor& values,
-                             const std::vector<int64_t>& size, bool is_coalesced) {
-    return Tensor::make_sparse_coo_tensor(indices, values, size, is_coalesced);
+                             std::optional<std::vector<int64_t>> size,
+                             bool is_coalesced) {
+    // torch infers missing sizes from the coordinates (sparse dims: max+1)
+    // and the values shape (dense dims).  The reduction needs host data, so
+    // CUDA indices are staged through the CPU like coalesce_cuda does.
+    if (!size.has_value()) {
+        Tensor host_indices = indices.device().is_cpu()
+            ? indices.contiguous() : indices.to(Device(DeviceType::CPU));
+        Tensor canonical = host_indices.dtype() == DType::Int64
+            ? host_indices : host_indices.to(DType::Int64);
+        const int64_t sparse_dim = canonical.size(0);
+        const int64_t nnz = canonical.size(1);
+        std::vector<int64_t> inferred(static_cast<size_t>(sparse_dim), 0);
+        const int64_t* index_data = canonical.data_ptr<int64_t>();
+        for (int64_t d = 0; d < sparse_dim; ++d) {
+            int64_t max_coordinate = -1;
+            for (int64_t n = 0; n < nnz; ++n) {
+                max_coordinate = std::max(max_coordinate, index_data[d * nnz + n]);
+            }
+            inferred[static_cast<size_t>(d)] = max_coordinate + 1;
+        }
+        for (int64_t i = 1; i < values.dim(); ++i) {
+            inferred.push_back(values.size(i));
+        }
+        size = std::move(inferred);
+    }
+    return Tensor::make_sparse_coo_tensor(indices, values, *size, is_coalesced);
 }
 
 Tensor coalesce_sparse_cpu(const Tensor& self) {
@@ -303,6 +329,256 @@ Tensor embedding_sparse_backward_cpu(const Tensor& grad,
     const bool coalesced = selected.size() <= 1;
     return Tensor::make_sparse_coo_tensor(output_indices, output_values,
                                           {num_weights, row_size}, coalesced);
+}
+
+Tensor to_dense_sparse_cpu(const Tensor& self) {
+    if (!self.is_sparse()) return self;
+    if (self.is_sparse_csr()) {
+        if (self.dim() != 2) {
+            TP_THROW(RuntimeError, "to_dense(): CSR tensors must be 2-D");
+        }
+        Tensor crow = self._crow_indices().contiguous();
+        Tensor col = self._col_indices().contiguous();
+        Tensor values = self._values().contiguous();
+        if (values.dim() != 1) {
+            TP_THROW(RuntimeError,
+                     "to_dense(): hybrid CSR tensors are not supported");
+        }
+        const int64_t rows = crow.size(0) - 1;
+        Tensor out = Tensor::zeros(self.shape(), self.dtype(), self.device());
+        dispatch_dtype(self.dtype(), [&](auto tag) {
+            using scalar_t = typename decltype(tag)::type;
+            const int64_t* crow_ptr = crow.data_ptr<int64_t>();
+            const int64_t* col_ptr = col.data_ptr<int64_t>();
+            const scalar_t* value_ptr = values.data_ptr<scalar_t>();
+            scalar_t* out_ptr = out.data_ptr<scalar_t>();
+            for (int64_t i = 0; i < rows; ++i) {
+                for (int64_t t = crow_ptr[i]; t < crow_ptr[i + 1]; ++t) {
+                    out_ptr[i * self.size(1) + col_ptr[t]] = value_ptr[t];
+                }
+            }
+        });
+        return out;
+    }
+
+    // COO: coalesce first so each coordinate is written exactly once.
+    Tensor canonical = self.is_coalesced() ? self : self.coalesce();
+    Tensor indices = canonical._indices().contiguous();
+    Tensor values = canonical._values().contiguous();
+    Tensor out = Tensor::zeros(self.shape(), self.dtype(), self.device());
+    const int64_t sparse_dim = canonical.sparse_dim();
+    const int64_t nnz = indices.size(1);
+    std::vector<int64_t> dense_shape = dense_shape_for(canonical);
+    const int64_t dense_numel = product(dense_shape);
+    const std::vector<int64_t> out_strides = out.strides();
+
+    dispatch_dtype(self.dtype(), [&](auto tag) {
+        using scalar_t = typename decltype(tag)::type;
+        const int64_t* index_data = indices.data_ptr<int64_t>();
+        const scalar_t* source = values.data_ptr<scalar_t>();
+        scalar_t* destination = out.data_ptr<scalar_t>();
+        for (int64_t n = 0; n < nnz; ++n) {
+            int64_t base_offset = 0;
+            for (int64_t d = 0; d < sparse_dim; ++d) {
+                base_offset += index_data[d * nnz + n] *
+                               out_strides[static_cast<size_t>(d)];
+            }
+            for (int64_t j = 0; j < dense_numel; ++j) {
+                int64_t remainder = j;
+                int64_t offset = base_offset;
+                for (int64_t d = static_cast<int64_t>(dense_shape.size()) - 1;
+                     d >= 0; --d) {
+                    const int64_t dim_size = dense_shape[static_cast<size_t>(d)];
+                    const int64_t coordinate = remainder % dim_size;
+                    remainder /= dim_size;
+                    offset += coordinate * out_strides[static_cast<size_t>(sparse_dim + d)];
+                }
+                destination[offset] += source[n * dense_numel + j];
+            }
+        }
+    });
+    return out;
+}
+
+int64_t sparse_nnz_cpu(const Tensor& self) {
+    if (!self.is_sparse()) {
+        TP_THROW(RuntimeError, "_nnz(): expected a sparse tensor");
+    }
+    return self._values().size(0);
+}
+
+namespace {
+
+// Positions (row-major flat coordinates) of nonzero elements of a
+// contiguous host tensor, used by both dense -> sparse conversions.
+std::vector<int64_t> nonzero_positions(const Tensor& contiguous_self) {
+    std::vector<int64_t> positions;
+    const int64_t numel = contiguous_self.numel();
+    dispatch_dtype(contiguous_self.dtype(), [&](auto tag) {
+        using scalar_t = typename decltype(tag)::type;
+        const scalar_t* data = contiguous_self.data_ptr<scalar_t>();
+        for (int64_t i = 0; i < numel; ++i) {
+            if (data[i] != scalar_t(0)) positions.push_back(i);
+        }
+    });
+    return positions;
+}
+
+} // namespace
+
+Tensor to_sparse_coo_cpu(const Tensor& self) {
+    if (self.is_sparse()) return self.coalesce();
+    Tensor contiguous_self = self.contiguous();
+    const std::vector<int64_t> sizes =
+        static_cast<std::vector<int64_t>>(contiguous_self.shape());
+    const int64_t ndim = static_cast<int64_t>(sizes.size());
+    const std::vector<int64_t> positions = nonzero_positions(contiguous_self);
+    const int64_t nnz = static_cast<int64_t>(positions.size());
+
+    Tensor indices = Tensor::empty({ndim, nnz}, DType::Int64, self.device());
+    Tensor values = Tensor::empty(
+        std::vector<int64_t>{nnz}, contiguous_self.dtype(), self.device());
+    int64_t* index_data = indices.data_ptr<int64_t>();
+    dispatch_dtype(contiguous_self.dtype(), [&](auto tag) {
+        using scalar_t = typename decltype(tag)::type;
+        const scalar_t* source = contiguous_self.data_ptr<scalar_t>();
+        scalar_t* destination = values.data_ptr<scalar_t>();
+        for (int64_t n = 0; n < nnz; ++n) {
+            int64_t remainder = positions[static_cast<size_t>(n)];
+            destination[n] = source[remainder];
+            for (int64_t d = ndim - 1; d >= 0; --d) {
+                index_data[d * nnz + n] = remainder % sizes[static_cast<size_t>(d)];
+                remainder /= sizes[static_cast<size_t>(d)];
+            }
+        }
+    });
+    return Tensor::make_sparse_coo_tensor(indices, values, sizes, /*is_coalesced=*/true);
+}
+
+Tensor to_sparse_csr_cpu(const Tensor& self) {
+    if (self.dim() != 2) {
+        TP_THROW(RuntimeError,
+                 "to_sparse_csr(): only 2-D input is supported, got " +
+                     std::to_string(self.dim()) + "-D");
+    }
+    Tensor contiguous_self = self.contiguous();
+    const int64_t rows = contiguous_self.size(0);
+    const int64_t cols = contiguous_self.size(1);
+    const std::vector<int64_t> positions = nonzero_positions(contiguous_self);
+
+    Tensor crow = Tensor::zeros({rows + 1}, DType::Int64, self.device());
+    int64_t* crow_ptr = crow.data_ptr<int64_t>();
+    const int64_t nnz = static_cast<int64_t>(positions.size());
+    for (int64_t position : positions) {
+        const int64_t row = position / cols;
+        ++crow_ptr[row + 1];
+    }
+    for (int64_t i = 0; i < rows; ++i) crow_ptr[i + 1] += crow_ptr[i];
+
+    Tensor col = Tensor::empty({nnz}, DType::Int64, self.device());
+    Tensor values = Tensor::empty({nnz}, contiguous_self.dtype(), self.device());
+    int64_t* col_ptr = col.data_ptr<int64_t>();
+    dispatch_dtype(contiguous_self.dtype(), [&](auto tag) {
+        using scalar_t = typename decltype(tag)::type;
+        const scalar_t* source = contiguous_self.data_ptr<scalar_t>();
+        scalar_t* destination = values.data_ptr<scalar_t>();
+        for (int64_t n = 0; n < nnz; ++n) {
+            const int64_t position = positions[static_cast<size_t>(n)];
+            col_ptr[n] = position % cols;
+            destination[n] = source[position];
+        }
+    });
+    // Row-major scanning keeps columns ascending within every row, so the
+    // result is canonical CSR.
+    return Tensor::make_sparse_csr_tensor(crow, col, values, {rows, cols});
+}
+
+Tensor sparse_mm_cpu(const Tensor& self, const Tensor& dense) {
+    if (!self.is_sparse()) {
+        TP_THROW(RuntimeError,
+                 "sparse_mm(): expected a sparse COO/CSR first argument");
+    }
+    if (self.dim() != 2 || dense.dim() != 2) {
+        TP_THROW(RuntimeError, "sparse_mm(): both operands must be 2-D");
+    }
+    const int64_t inner = self.size(1);
+    if (dense.size(0) != inner) {
+        TP_THROW(RuntimeError,
+                 "sparse_mm(): operand shapes are incompatible for matmul");
+    }
+    if (dense.dtype() != self.dtype()) {
+        TP_THROW(TypeError,
+                 "sparse_mm(): operands must share the sparse tensor's dtype");
+    }
+    const int64_t rows = self.size(0);
+    const int64_t cols = dense.size(1);
+    Tensor dense_contiguous = dense.is_contiguous() ? dense : dense.contiguous();
+    Tensor out = Tensor::zeros({rows, cols}, self.dtype(), self.device());
+
+    if (self.is_sparse_csr()) {
+        Tensor crow = self._crow_indices().contiguous();
+        Tensor col = self._col_indices().contiguous();
+        Tensor values = self._values().contiguous();
+        const int64_t* crow_ptr = crow.data_ptr<int64_t>();
+        const int64_t* col_ptr = col.data_ptr<int64_t>();
+        dispatch_dtype(self.dtype(), [&](auto tag) {
+            using scalar_t = typename decltype(tag)::type;
+            const scalar_t* value_ptr = values.data_ptr<scalar_t>();
+            const scalar_t* dense_ptr = dense_contiguous.data_ptr<scalar_t>();
+            scalar_t* out_ptr = out.data_ptr<scalar_t>();
+            for (int64_t i = 0; i < rows; ++i) {
+                for (int64_t t = crow_ptr[i]; t < crow_ptr[i + 1]; ++t) {
+                    const scalar_t v = value_ptr[t];
+                    const scalar_t* dense_row = dense_ptr + col_ptr[t] * cols;
+                    scalar_t* out_row = out_ptr + i * cols;
+                    for (int64_t j = 0; j < cols; ++j) out_row[j] += v * dense_row[j];
+                }
+            }
+        });
+        return out;
+    }
+
+    Tensor canonical = self.is_coalesced() ? self : self.coalesce();
+    Tensor indices = canonical._indices().contiguous();
+    Tensor values = canonical._values().contiguous();
+    if (values.dim() != 1) {
+        TP_THROW(RuntimeError, "sparse_mm(): hybrid COO tensors are not supported");
+    }
+    const int64_t nnz = indices.size(1);
+    const int64_t* index_data = indices.data_ptr<int64_t>();
+    dispatch_dtype(self.dtype(), [&](auto tag) {
+        using scalar_t = typename decltype(tag)::type;
+        const int64_t* row_indices = index_data;
+        const int64_t* col_indices = index_data + nnz;
+        const scalar_t* value_ptr = values.data_ptr<scalar_t>();
+        const scalar_t* dense_ptr = dense_contiguous.data_ptr<scalar_t>();
+        scalar_t* out_ptr = out.data_ptr<scalar_t>();
+        for (int64_t n = 0; n < nnz; ++n) {
+            const scalar_t v = value_ptr[n];
+            const scalar_t* dense_row = dense_ptr + col_indices[n] * cols;
+            scalar_t* out_row = out_ptr + row_indices[n] * cols;
+            for (int64_t j = 0; j < cols; ++j) out_row[j] += v * dense_row[j];
+        }
+    });
+    return out;
+}
+
+Tensor sparse_sum_cpu(const Tensor& self) {
+    if (!self.is_sparse()) {
+        TP_THROW(RuntimeError, "sparse_sum(): expected a sparse tensor");
+    }
+    Tensor canonical = self.is_coalesced() ? self : self.coalesce();
+    Tensor values = canonical._values().contiguous();
+    Tensor out = Tensor::zeros({}, self.dtype(), self.device());
+    const int64_t numel = values.numel();
+    dispatch_dtype(values.dtype(), [&](auto tag) {
+        using scalar_t = typename decltype(tag)::type;
+        const scalar_t* data = values.data_ptr<scalar_t>();
+        scalar_t accumulator = scalar_t(0);
+        for (int64_t i = 0; i < numel; ++i) accumulator += data[i];
+        out.data_ptr<scalar_t>()[0] = accumulator;
+    });
+    return out;
 }
 
 } // namespace cpu

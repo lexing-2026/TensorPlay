@@ -1,5 +1,5 @@
 [build-system]
-requires = ["scikit-build-core", "nanobind", "PyYAML", "ninja", "cmake<4.0"]
+requires = ["scikit-build-core", "pybind11", "PyYAML", "ninja", "cmake<4.0"]
 build-backend = "scikit_build_core.build"
 
 [project]

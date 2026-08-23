@@ -34,6 +34,50 @@ std::atomic<int> num_intraop_threads{NOT_SET};
 
 thread_local bool in_parallel_region_ = false;
 thread_local int thread_num_ = 0;
+// Set on intraop-pool threads only; lets in_parallel_region() answer without
+// taking the pool mutex (the old implementation locked + scanned thread ids
+// on every parallel_for call from the main thread).
+thread_local bool t_is_pool_thread_ = false;
+
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+inline void cpu_relax() { _mm_pause(); }
+#else
+inline void cpu_relax() { std::this_thread::yield(); }
+#endif
+
+// Physical-core count for the default thread pool size, mirroring ATen's
+// TaskThreadPoolBase::defaultNumThreads() (cpuinfo "cores" vs "processors"):
+// SMT siblings share execution ports, so defaulting to logical CPUs
+// oversubscribes compute-bound elementwise kernels.
+int physical_core_count() {
+  int logical = static_cast<int>(std::thread::hardware_concurrency());
+#ifdef __linux__
+  FILE* f = std::fopen("/proc/cpuinfo", "re");
+  if (!f) {
+    return logical;
+  }
+  int siblings = -1;
+  int cores = -1;
+  char line[256];
+  while (std::fgets(line, sizeof(line), f)) {
+    int v = -1;
+    if (siblings < 0 && std::sscanf(line, "siblings : %d", &v) == 1 && v > 0) {
+      siblings = v;
+    } else if ((v = -1, std::sscanf(line, "cpu cores : %d", &v) == 1) && v > 0) {
+      cores = v;
+    }
+    if (siblings > 0 && cores > 0) {
+      break;
+    }
+  }
+  std::fclose(f);
+  if (siblings > 0 && cores > 0 && siblings > cores) {
+    return std::max(1, logical * cores / siblings);
+  }
+#endif
+  return logical;
+}
 
 int intraop_default_num_threads() {
   const char* env = std::getenv("OMP_NUM_THREADS");
@@ -50,8 +94,7 @@ int intraop_default_num_threads() {
       return n;
     }
   }
-  unsigned int hc = std::thread::hardware_concurrency();
-  return hc > 0 ? static_cast<int>(hc) : 1;
+  return physical_core_count();
 }
 
 // Persistent pool of worker threads. The calling (master) thread participates
@@ -80,30 +123,63 @@ class IntraopThreadPool {
 
   size_t size() const { return threads_.size(); }
 
-  bool in_thread_pool() const {
-    std::thread::id id = std::this_thread::get_id();
-    std::unique_lock<std::mutex> lk(mutex_);
-    for (const auto& t : threads_) {
-      if (t.get_id() == id) {
-        return true;
-      }
-    }
-    return false;
-  }
-
   void run(std::function<void()> func) {
     {
       std::unique_lock<std::mutex> lk(mutex_);
       tasks_.push(std::move(func));
-      condition_.notify_one();
     }
+    // Publish after the push (release), then wake.  Spinning workers poll
+    // pending_ lock-free and only fall through to the condvar when idle for
+    // longer than the spin budget.
+    pending_.fetch_add(1, std::memory_order_release);
+    condition_.notify_one();
   }
 
  private:
+  // Steals one queued task if any is visibly pending.  Returns false both
+  // when the queue looks empty and when a peer stole it between our load and
+  // the locked pop; callers simply retry or fall asleep.
+  bool try_pop(std::function<void()>& out) {
+    if (pending_.load(std::memory_order_acquire) == 0) {
+      return false;
+    }
+    std::unique_lock<std::mutex> lk(mutex_);
+    if (tasks_.empty()) {
+      return false;
+    }
+    out = std::move(tasks_.front());
+    tasks_.pop();
+    pending_.fetch_sub(1, std::memory_order_relaxed);
+    return true;
+  }
+
   void worker_loop() {
+    t_is_pool_thread_ = true;
+    // Tiered idle wait.  A pure condvar park costs a futex wakeup (tens of us)
+    // per op burst; an unbounded busy-wait makes idle workers steal physical
+    // cores from tasks that are still computing (fatal once #tasks exceeds
+    // #physical cores).  So: a few microseconds of tight polling to catch
+    // immediate follow-on work, a short yield phase to stay responsive
+    // without burning a core, then park.
+    constexpr size_t kPauseSpins = 128; // ~0.5-2us of _mm_pause polling
+    constexpr size_t kYieldSpins = 96;  // sched_yield decay before parking
+    size_t spins = 0;
     while (true) {
       std::function<void()> task;
-      {
+      bool got = false;
+      while (spins < kPauseSpins) {
+        if (!running_.load(std::memory_order_acquire)) break;
+        if (try_pop(task)) { got = true; break; }
+        cpu_relax();
+        ++spins;
+      }
+      while (!got && spins < kPauseSpins + kYieldSpins) {
+        if (!running_.load(std::memory_order_acquire)) break;
+        if (try_pop(task)) { got = true; break; }
+        std::this_thread::yield();
+        ++spins;
+      }
+      if (!got) {
         std::unique_lock<std::mutex> lk(mutex_);
         condition_.wait(lk, [this] { return !running_ || !tasks_.empty(); });
         if (!running_ && tasks_.empty()) {
@@ -111,7 +187,9 @@ class IntraopThreadPool {
         }
         task = std::move(tasks_.front());
         tasks_.pop();
+        pending_.fetch_sub(1, std::memory_order_relaxed);
       }
+      spins = 0;
       task();
     }
   }
@@ -121,6 +199,9 @@ class IntraopThreadPool {
   mutable std::mutex mutex_;
   std::condition_variable condition_;
   std::atomic<bool> running_{true};
+  // Queue length mirror for lock-free polling by spinning workers; own cache
+  // line so producer mutex/queue traffic doesn't invalidate the polled line.
+  alignas(64) std::atomic<size_t> pending_{0};
 };
 
 int _num_pool_threads(int nthreads) {
@@ -224,8 +305,9 @@ bool in_parallel_region() {
   if (in_parallel_region_) {
     return true;
   }
-  return num_intraop_threads.load() == CONSUMED &&
-      get_intraop_pool().in_thread_pool();
+  // t_is_pool_thread_ is a thread_local set at worker startup: no locks, no
+  // thread-id scan on the hot parallel_for path.
+  return num_intraop_threads.load() == CONSUMED && t_is_pool_thread_;
 }
 
 std::string get_parallel_info() {
@@ -259,6 +341,40 @@ void invoke_parallel_impl(
   // parallel_for: work below grain_size never reaches this point.
   int64_t chunk_size = std::max(grain_size, (numiter + num_threads - 1) / num_threads);
   const size_t num_tasks = static_cast<size_t>((numiter + chunk_size - 1) / chunk_size);
+
+#ifdef _OPENMP
+  // Mirror ATen's OpenMP backend (ParallelOpenMP.cpp): run the chunk loop as
+  // an OpenMP region so libgomp keeps the team warm (threads spin between
+  // regions instead of futex-parking), which is what makes torch's small-op
+  // dispatch cost microseconds.  The native pool below stays as the fallback
+  // for non-OpenMP builds.
+  if (omp_get_max_threads() > 1 && !omp_in_parallel()) {
+    std::atomic_flag err_flag = ATOMIC_FLAG_INIT;
+    std::exception_ptr eptr;
+    const int64_t ntasks = static_cast<int64_t>(num_tasks);
+    const int nthreads_clause =
+        static_cast<int>(std::min<size_t>(num_tasks, static_cast<size_t>(omp_get_max_threads())));
+    #pragma omp parallel for schedule(static) num_threads(nthreads_clause)
+    for (int64_t t = 0; t < ntasks; ++t) {
+      int64_t local_begin = begin + t * chunk_size;
+      if (local_begin < end) {
+        try {
+          ParallelRegionGuard guard(static_cast<int>(t));
+          int64_t local_end = std::min(end, chunk_size + local_begin);
+          f(local_begin, local_end);
+        } catch (...) {
+          if (!err_flag.test_and_set()) {
+            eptr = std::current_exception();
+          }
+        }
+      }
+    }
+    if (eptr) {
+      std::rethrow_exception(eptr);
+    }
+    return;
+  }
+#endif
 
   struct State {
     std::atomic_flag err_flag = ATOMIC_FLAG_INIT;

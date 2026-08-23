@@ -139,6 +139,45 @@ Tensor Tensor::make_sparse_coo_tensor(const Tensor& indices,
     return result;
 }
 
+Tensor Tensor::make_sparse_csr_tensor(const Tensor& crow,
+                                      const Tensor& col,
+                                      const Tensor& values,
+                                      const std::vector<int64_t>& size) {
+    if (!crow.defined() || !col.defined() || !values.defined()) {
+        TP_THROW(ValueError, "sparse_csr_tensor: crow/col/values must be defined");
+    }
+    if (crow.device() != col.device() || crow.device() != values.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "sparse_csr_tensor: crow/col/values must be on the same device");
+    }
+    if (crow.dim() != 1 || col.dim() != 1) {
+        TP_THROW(ValueError, "sparse_csr_tensor: crow/col must be 1-D tensors");
+    }
+    if (size.size() != 2) {
+        TP_THROW(ValueError, "sparse_csr_tensor: CSR layout supports exactly 2-D sizes");
+    }
+    if (crow.size(0) != size[0] + 1) {
+        TP_THROW(ValueError,
+                 "sparse_csr_tensor: crow must have rows+1 entries");
+    }
+    if (col.size(0) != values.size(0)) {
+        TP_THROW(ValueError,
+                 "sparse_csr_tensor: col and values must have the same nnz");
+    }
+    Tensor canonical_crow = crow.dtype() == DType::Int64 ? crow : crow.to(DType::Int64);
+    Tensor canonical_col = col.dtype() == DType::Int64 ? col : col.to(DType::Int64);
+
+    // Same rationale as the COO constructor: install logical metadata only.
+    Tensor result(std::make_shared<TensorImpl>(
+        size, values.dtype(), values.device(), /*allocate_storage=*/false));
+    result.unsafeGetTensorImpl()->set_sparse_csr_state(
+        canonical_crow.unsafeGetTensorImpl(),
+        canonical_col.unsafeGetTensorImpl(),
+        values.unsafeGetTensorImpl(),
+        size);
+    return result;
+}
+
 int64_t Tensor::dim() const { return impl_ ? impl_->dim() : 0; }
 int64_t Tensor::numel() const { return impl_ ? impl_->numel() : 0; }
 Size Tensor::shape() const { return impl_ ? Size(impl_->sizes()) : Size(); }
@@ -258,6 +297,24 @@ Tensor Tensor::_indices() const {
 Tensor Tensor::_values() const {
     if (!is_sparse()) TP_THROW(RuntimeError, "_values() is only defined for sparse COO tensors");
     return Tensor(impl_->sparse_values_impl());
+}
+
+bool Tensor::is_sparse_csr() const {
+    return is_sparse() && impl_->sparse_layout() == TensorImpl::kSparseCSRLayout;
+}
+
+Tensor Tensor::_crow_indices() const {
+    if (!is_sparse_csr()) {
+        TP_THROW(RuntimeError, "_crow_indices() is only defined for sparse CSR tensors");
+    }
+    return Tensor(impl_->sparse_crow_impl());
+}
+
+Tensor Tensor::_col_indices() const {
+    if (!is_sparse_csr()) {
+        TP_THROW(RuntimeError, "_col_indices() is only defined for sparse CSR tensors");
+    }
+    return Tensor(impl_->sparse_col_impl());
 }
 
 Tensor Tensor::coalesce() const {
@@ -796,6 +853,51 @@ Tensor Tensor::contiguous() const {
     if (is_sparse()) return clone();
     if (is_contiguous()) return *this;
     return clone();
+}
+
+bool Tensor::is_contiguous(MemoryFormat format) const {
+    if (!impl_) return false;
+    if (!defined()) return false;
+    switch (format) {
+        case MemoryFormat::Contiguous:
+            return is_contiguous();
+        case MemoryFormat::Preserve:
+            return true;
+        case MemoryFormat::ChannelsLast:
+            return dim() == 4 && impl_->is_contiguous_in(format);
+        case MemoryFormat::ChannelsLast3d:
+            return dim() == 5 && impl_->is_contiguous_in(format);
+    }
+    return false;
+}
+
+MemoryFormat Tensor::memory_format() const { return impl_ ? impl_->memory_format() : MemoryFormat::Contiguous; }
+bool Tensor::is_channels_last() const { return dim() == 4 && impl_ && impl_->is_channels_last(); }
+bool Tensor::is_channels_last_2d() const { return is_channels_last(); }
+bool Tensor::is_channels_last_3d() const { return dim() == 5 && impl_ && impl_->is_channels_last_3d(); }
+
+Tensor Tensor::contiguous(MemoryFormat format) const {
+    if (format == MemoryFormat::Preserve) return contiguous();
+    if (is_sparse()) TP_THROW(NotImplementedError,
+                              "contiguous(memory_format) is not supported on sparse tensors");
+    if (is_contiguous(format)) return *this;
+    if (dim() < 3 || (format == MemoryFormat::ChannelsLast && dim() != 4) ||
+        (format == MemoryFormat::ChannelsLast3d && dim() != 5)) {
+        // Channels-last layouts are only representable at these ranks; fall
+        // back to row-major like ATen's empty_like memory-format handling.
+        return contiguous();
+    }
+    const auto sizes_v = static_cast<std::vector<int64_t>>(impl_->sizes());
+    std::vector<int64_t> strides = get_strides_for(sizes_v, format);
+    Storage storage(static_cast<size_t>(numel()) * itemsize(),
+                    getAllocator(device().type()), device());
+    auto out_impl = std::make_shared<TensorImpl>(storage, sizes_v, strides, dtype(), 0);
+    out_impl->set_memory_format(format);
+    Tensor out(std::move(out_impl));
+    out.copy_(*this);
+    // Freshly materialized tensor: the internal copy bumped the version.
+    out.unsafeGetTensorImpl()->reset_version();
+    return out;
 }
 
 } // namespace tensorplay

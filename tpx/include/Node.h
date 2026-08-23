@@ -69,7 +69,10 @@ public:
     // Number of gradient inputs this node expects, indexed by input_nr.
     virtual size_t num_inputs() const { return next_edges_.size(); }
 
-    void release_variables() {
+    // Virtual so generated/hand-written nodes can also free the forward
+    // tensors they saved (SavedVariable::reset_data) when the graph is
+    // released, mirroring torch::autograd::Node::release_variables.
+    virtual void release_variables() {
         next_edges_.clear();
     }
 

@@ -8,6 +8,7 @@
 #include "Edge.h"
 #include "AutogradMeta.h"
 #include "GradMode.h"
+#include "InferenceMode.h"
 
 namespace tensorplay {
 namespace tpx {
@@ -131,6 +132,10 @@ TENSORPLAY_API std::vector<Tensor> grad(
 // GradMode moved to the p10 layer (c10-level TLS) so dispatch code can
 // consult it; re-exported here for source compatibility.
 using GradMode = tensorplay::GradMode;
+
+// InferenceMode likewise lives at the p10 layer; re-exported for the
+// generated tpx wrappers and the Python bindings.
+using InferenceMode = tensorplay::InferenceMode;
 
 } // namespace tpx
 } // namespace tensorplay

@@ -26,6 +26,7 @@ from .._C._autograd import (
     grad as _grad,
     is_anomaly_enabled,
     is_anomaly_check_nan_enabled,
+    is_inference_mode_enabled,
 )
 
 
@@ -39,6 +40,8 @@ __all__ = [
     "inference_mode",
     "no_grad",
     "set_grad_enabled",
+    # inference mode
+    "is_inference_mode_enabled",
     # anomaly mode
     "detect_anomaly",
     "set_detect_anomaly",

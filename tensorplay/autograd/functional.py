@@ -341,7 +341,7 @@ def vjp(func, inputs, v=None, create_graph=False, strict=False):
     )
 
 
-def jvp(func, inputs, v=None, create_graph=False, strict=False):
+def jvp(func, inputs, v=None, create_graph=False, strict=False, mode="reversed"):
     r"""Compute the dot product between the Jacobian of the given function at the point given by the inputs and a vector ``v``.
 
     Args:
@@ -393,7 +393,23 @@ def jvp(func, inputs, v=None, create_graph=False, strict=False):
         (tensor([2.2399, 2.5005]),
          tensor([5., 5.]))
 
+    mode (str, optional): "reversed" computes the jvp via the double
+        backwards trick; "forward" uses native forward-mode AD kernels and
+        propagates tangents in a single pass per op (requires ``func`` to be
+        written with operators/methods supported by forward-mode, see
+        ``tensorplay.autograd._forward``).  Defaults to "reversed".
+
     """
+    if mode == "forward":
+        # Native forward-mode: tangents propagate through fused forward_*
+        # kernels with no backward graph.  create_graph/strict semantics do
+        # not apply (the result is exact and graph-free).
+        from tensorplay.autograd._forward import forward_jvp
+        return forward_jvp(func, inputs, v)
+    elif mode != "reversed":
+        raise ValueError(
+            f"jvp(): mode must be 'reversed' or 'forward', got {mode!r}")
+
     with tensorplay.enable_grad():
         is_inputs_tuple, inputs = _as_tuple(inputs, "inputs", "jvp")
         inputs = _grad_preprocess(inputs, create_graph=create_graph, need_graph=True)

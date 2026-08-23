@@ -939,7 +939,7 @@
   dispatch:
     CPU: unbind_kernel
 
-- func: rand(int[] size, *, ScalarType dtype=Float32, Device device=CPU, bool requires_grad=false) -> Tensor
+- func: rand(int[] size, *, ScalarType? dtype=None, Device? device=None, bool requires_grad=false) -> Tensor
   variants: function
   dispatch:
     CPU: rand_kernel
@@ -949,7 +949,7 @@
   dispatch:
     CPU: rand_like_kernel
 
-- func: randint(int low, int high, int[] size, *, ScalarType dtype=Int64, Device device=CPU, bool requires_grad=false) -> Tensor
+- func: randint(int low, int high, int[] size, *, ScalarType dtype=Int64, Device? device=None, bool requires_grad=false) -> Tensor
   variants: function
   dispatch:
     CPU: randint_kernel
@@ -959,7 +959,7 @@
   dispatch:
     CPU: randint_like_kernel
 
-- func: randn(int[] size, *, ScalarType dtype=Float32, Device device=CPU, bool requires_grad=false) -> Tensor
+- func: randn(int[] size, *, ScalarType? dtype=None, Device? device=None, bool requires_grad=false) -> Tensor
   variants: function
   dispatch:
     CPU: randn_kernel
@@ -969,13 +969,32 @@
   dispatch:
     CPU: randn_like_kernel
 
-- func: randperm(int n, *, ScalarType dtype=Int64, Device device=CPU, bool requires_grad=false) -> Tensor
+- func: randperm(int n, *, ScalarType dtype=Int64, Device? device=None, bool requires_grad=false) -> Tensor
   variants: function
   dispatch:
     CPU: randperm_kernel
 
 - func: bernoulli(Tensor self) -> Tensor
   variants: method, function
+
+# Fused dropout forward (torch's native_dropout): returns the scaled output
+# and the bool keep-mask. The public F.dropout gates training/p==0/p==1 and
+# calls this; autograd flows through the generated node whose formula is
+# grad * mask / (1 - p).
+- func: native_dropout(Tensor input, float p) -> (Tensor output, Tensor mask)
+  variants: function
+  dispatch:
+    CPU: native_dropout_cpu
+    CUDA: native_dropout_cuda
+
+# resize_ grows the storage in place when needed (preserving contents) and
+# adopts contiguous strides; shrinking is logical-only. Non-differentiable,
+# matching torch.
+- func: resize_(Tensor(a!) self, int[] size) -> Tensor(a!)
+  variants: method
+  dispatch:
+    CPU: resize__cpu
+    CUDA: resize__cuda
 
 
 - func: normal(Tensor mean, Tensor std) -> Tensor
@@ -1256,47 +1275,47 @@
   dispatch:
     CPU: silu_kernel
 
-- func: empty(int[] size, *, ScalarType dtype=Float32, Device device=CPU, bool pin_memory=false, bool requires_grad=false) -> Tensor
+- func: empty(int[] size, *, ScalarType? dtype=None, Device? device=None, bool pin_memory=false, bool requires_grad=false) -> Tensor
   variants: function
   dispatch:
     CPU: empty_kernel
 
-- func: full(int[] size, Scalar fill_value, *, ScalarType dtype=Undefined, Device device=CPU, bool pin_memory=false, bool requires_grad=false) -> Tensor
+- func: full(int[] size, Scalar fill_value, *, ScalarType dtype=Undefined, Device? device=None, bool pin_memory=false, bool requires_grad=false) -> Tensor
   variants: function
   dispatch:
     CPU: full_kernel
 
-- func: zeros(int[] size, *, ScalarType dtype=Float32, Device device=CPU, bool pin_memory=false, bool requires_grad=false) -> Tensor
+- func: zeros(int[] size, *, ScalarType? dtype=None, Device? device=None, bool pin_memory=false, bool requires_grad=false) -> Tensor
   variants: function
   dispatch:
     CPU: zeros_kernel
 
-- func: ones(int[] size, *, ScalarType dtype=Float32, Device device=CPU, bool pin_memory=false, bool requires_grad=false) -> Tensor
+- func: ones(int[] size, *, ScalarType? dtype=None, Device? device=None, bool pin_memory=false, bool requires_grad=false) -> Tensor
   variants: function
   dispatch:
     CPU: ones_kernel
 
-- func: eye(int n, int m=-1, *, ScalarType dtype=Float32, Device device=CPU, bool requires_grad=false) -> Tensor
+- func: eye(int n, int m=-1, *, ScalarType dtype=Float32, Device? device=None, bool requires_grad=false) -> Tensor
   variants: function
   dispatch:
     CPU: eye_kernel
 
-- func: arange(Scalar start, Scalar end, Scalar step=1, *, ScalarType dtype=Undefined, Device device=CPU, bool requires_grad=false) -> Tensor
+- func: arange(Scalar start, Scalar end, Scalar step=1, *, ScalarType dtype=Undefined, Device? device=None, bool requires_grad=false) -> Tensor
   variants: function
   dispatch:
     CPU: arange_start_step_kernel
 
-- func: arange.end(Scalar end, *, ScalarType dtype=Undefined, Device device=CPU, bool requires_grad=false) -> Tensor
+- func: arange.end(Scalar end, *, ScalarType dtype=Undefined, Device? device=None, bool requires_grad=false) -> Tensor
   variants: function
   dispatch:
     CPU: arange_kernel
 
-- func: linspace(Scalar start, Scalar end, int steps, *, ScalarType dtype=Float32, Device device=CPU, bool requires_grad=false) -> Tensor
+- func: linspace(Scalar start, Scalar end, int steps, *, ScalarType dtype=Float32, Device? device=None, bool requires_grad=false) -> Tensor
   variants: function
   dispatch:
     CPU: linspace_kernel
 
-- func: logspace(Scalar start, Scalar end, int steps, float base=10.0, *, ScalarType dtype=Float32, Device device=CPU, bool requires_grad=false) -> Tensor
+- func: logspace(Scalar start, Scalar end, int steps, float base=10.0, *, ScalarType dtype=Float32, Device? device=None, bool requires_grad=false) -> Tensor
   variants: function
   dispatch:
     CPU: logspace_kernel
@@ -3204,3 +3223,172 @@
   dispatch:
     CPU: polygamma_cpu
     CUDA: polygamma_cuda
+
+# ---------------------------------------------------------------------------
+# Sparse COO/CSR.  Exposes the COO machinery plus dense<->sparse conversions
+# and sparse-dense matmul to Python.  Non-differentiable, matching torch:
+# sparse training paths use embedding(sparse=True)/embedding_sparse_backward.
+- func: sparse_coo_tensor(Tensor indices, Tensor values, int[]? size=None, *, bool is_coalesced=False) -> Tensor
+  variants: function
+  dispatch:
+    CPU: sparse_coo_tensor_cpu
+    CUDA: sparse_coo_tensor_cuda
+
+- func: to_dense(Tensor self) -> Tensor
+  variants: function, method
+  dispatch:
+    CPU: to_dense_sparse_cpu
+    CUDA: to_dense_sparse_cuda
+
+- func: to_sparse(Tensor self) -> Tensor
+  variants: function, method
+  dispatch:
+    CPU: to_sparse_coo_cpu
+    CUDA: to_sparse_coo_cuda
+
+- func: to_sparse_csr(Tensor self) -> Tensor
+  variants: function, method
+  dispatch:
+    CPU: to_sparse_csr_cpu
+    CUDA: to_sparse_csr_cuda
+
+- func: _nnz(Tensor self) -> int
+  variants: function, method
+  dispatch:
+    CPU: sparse_nnz_cpu
+    CUDA: sparse_nnz_cuda
+
+- func: sparse_mm(Tensor self, Tensor dense) -> Tensor
+  variants: function
+  dispatch:
+    CPU: sparse_mm_cpu
+    CUDA: sparse_mm_cuda
+
+- func: sparse_sum(Tensor self) -> Tensor
+  variants: function, method
+  dispatch:
+    CPU: sparse_sum_cpu
+    CUDA: sparse_sum_cuda
+
+# ---------------------------------------------------------------------------
+# Quantization (affine, Int8 storage).  quantize_* maps floating values to
+# Int8 with round-to-even; dequantize_* inverts the mapping to Float32.
+# Per-channel variants broadcast 1-D scales/zero_points along `axis`.
+- func: quantize_per_tensor(Tensor self, float scale, int zero_point, int quant_min=-128, int quant_max=127) -> Tensor
+  variants: function, method
+  dispatch:
+    CPU: quantize_per_tensor_cpu
+    CUDA: quantize_per_tensor_cuda
+
+- func: dequantize_per_tensor(Tensor self, float scale, int zero_point) -> Tensor
+  variants: function, method
+  dispatch:
+    CPU: dequantize_per_tensor_cpu
+    CUDA: dequantize_per_tensor_cuda
+
+- func: quantize_per_channel(Tensor self, Tensor scales, Tensor zero_points, int axis=0) -> Tensor
+  variants: function, method
+  dispatch:
+    CPU: quantize_per_channel_cpu
+    CUDA: quantize_per_channel_cuda
+
+- func: dequantize_per_channel(Tensor self, Tensor scales, Tensor zero_points, int axis=0) -> Tensor
+  variants: function, method
+  dispatch:
+    CPU: dequantize_per_channel_cpu
+    CUDA: dequantize_per_channel_cuda
+
+# ---------------------------------------------------------------------------
+# Native forward-mode AD (JVP) kernels: each op evaluates the primal and its
+# tangent propagation in one pass, {primal_out, tangent_out}.  Used by
+# tensorplay.autograd.functional.jvp(mode="forward") through the DualTensor
+# layer; non-differentiable themselves (no derivatives.yaml entries).
+- func: forward_neg(Tensor a, Tensor da) -> (Tensor, Tensor)
+  variants: function
+  dispatch:
+    CPU: forward_neg_cpu
+    CUDA: forward_neg_cuda
+
+- func: forward_exp(Tensor a, Tensor da) -> (Tensor, Tensor)
+  variants: function
+  dispatch:
+    CPU: forward_exp_cpu
+    CUDA: forward_exp_cuda
+
+- func: forward_log(Tensor a, Tensor da) -> (Tensor, Tensor)
+  variants: function
+  dispatch:
+    CPU: forward_log_cpu
+    CUDA: forward_log_cuda
+
+- func: forward_sin(Tensor a, Tensor da) -> (Tensor, Tensor)
+  variants: function
+  dispatch:
+    CPU: forward_sin_cpu
+    CUDA: forward_sin_cuda
+
+- func: forward_cos(Tensor a, Tensor da) -> (Tensor, Tensor)
+  variants: function
+  dispatch:
+    CPU: forward_cos_cpu
+    CUDA: forward_cos_cuda
+
+- func: forward_sqrt(Tensor a, Tensor da) -> (Tensor, Tensor)
+  variants: function
+  dispatch:
+    CPU: forward_sqrt_cpu
+    CUDA: forward_sqrt_cuda
+
+- func: forward_tanh(Tensor a, Tensor da) -> (Tensor, Tensor)
+  variants: function
+  dispatch:
+    CPU: forward_tanh_cpu
+    CUDA: forward_tanh_cuda
+
+- func: forward_sigmoid(Tensor a, Tensor da) -> (Tensor, Tensor)
+  variants: function
+  dispatch:
+    CPU: forward_sigmoid_cpu
+    CUDA: forward_sigmoid_cuda
+
+- func: forward_relu(Tensor a, Tensor da) -> (Tensor, Tensor)
+  variants: function
+  dispatch:
+    CPU: forward_relu_cpu
+    CUDA: forward_relu_cuda
+
+- func: forward_add(Tensor a, Tensor da, Tensor b, Tensor db) -> (Tensor, Tensor)
+  variants: function
+  dispatch:
+    CPU: forward_add_cpu
+    CUDA: forward_add_cuda
+
+- func: forward_sub(Tensor a, Tensor da, Tensor b, Tensor db) -> (Tensor, Tensor)
+  variants: function
+  dispatch:
+    CPU: forward_sub_cpu
+    CUDA: forward_sub_cuda
+
+- func: forward_mul(Tensor a, Tensor da, Tensor b, Tensor db) -> (Tensor, Tensor)
+  variants: function
+  dispatch:
+    CPU: forward_mul_cpu
+    CUDA: forward_mul_cuda
+
+- func: forward_div(Tensor a, Tensor da, Tensor b, Tensor db) -> (Tensor, Tensor)
+  variants: function
+  dispatch:
+    CPU: forward_div_cpu
+    CUDA: forward_div_cuda
+
+- func: forward_pow(Tensor a, Tensor da, Tensor b, Tensor db) -> (Tensor, Tensor)
+  variants: function
+  dispatch:
+    CPU: forward_pow_cpu
+    CUDA: forward_pow_cuda
+
+- func: forward_mm(Tensor a, Tensor da, Tensor b, Tensor db) -> (Tensor, Tensor)
+  variants: function
+  dispatch:
+    CPU: forward_mm_cpu
+    CUDA: forward_mm_cuda
