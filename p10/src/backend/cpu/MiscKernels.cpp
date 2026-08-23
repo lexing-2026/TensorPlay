@@ -15,8 +15,11 @@
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "Utils.h"
+#include "Generator.h"
+#include "DistributionsHelper.h"
 #include <algorithm>
 #include <numeric>
+#include <tuple>
 
 namespace tensorplay {
 namespace cpu {
@@ -27,6 +30,10 @@ namespace cpu {
 // be a distinct, undefined symbol).
 Tensor where_cpu(const Tensor& condition, const Tensor& self, const Tensor& other);
 Tensor eq_tensor_kernel(const Tensor& self, const Tensor& other);
+
+// Defined below the registration table.
+Tensor& resize__cpu(Tensor& self, const std::vector<int64_t>& size);
+std::tuple<Tensor, Tensor> native_dropout_cpu(const Tensor& input, double p);
 
 namespace {
 
@@ -175,6 +182,110 @@ TENSORPLAY_LIBRARY_IMPL(CPU, MiscKernels) {
     m.impl("one_hot", one_hot_cpu);
     m.impl("glu", glu_cpu);
     m.impl("glu_backward", glu_backward_cpu);
+    m.impl("resize_", resize__cpu);
+    m.impl("native_dropout", native_dropout_cpu);
+}
+
+// resize_ grows the storage in place (preserving the old contents) and then
+// adopts contiguous strides; shrinking only changes the logical shape, like
+// ATen. The metadata half is TensorImpl::set_sizes_contiguous.
+Tensor& resize__cpu(Tensor& self, const std::vector<int64_t>& size) {
+    auto* impl = self.unsafeGetTensorImpl().get();
+    int64_t new_numel = 1;
+    for (int64_t s : size) {
+        if (s < 0) {
+            TP_THROW(ValueError, "resize_: negative sizes are not allowed");
+        }
+        new_numel *= s;
+    }
+    const size_t new_bytes = static_cast<size_t>(new_numel) * impl->itemsize();
+    if (!impl->has_storage()) {
+        if (new_bytes > 0) {
+            impl->set_storage(
+                Storage(new_bytes, getAllocator(impl->device().type()), impl->device()));
+        }
+    } else if (new_bytes > impl->storage().nbytes()) {
+        // Throws when the storage wraps foreign memory (resizable=false),
+        // mirroring torch's resize error surface for such storages.
+        Storage storage = impl->storage();
+        storage.set_nbytes(new_bytes);
+    }
+    impl->set_sizes_contiguous(size);
+    return self;
+}
+
+// Fused dropout forward: one RNG pass produces both the scaled output and
+// the bool mask consumed by native_dropout's generated backward node
+// (grad * mask / (1 - p)). p == 1 is rejected here because its scale is
+// undefined; F.dropout gates that case in Python.
+std::tuple<Tensor, Tensor> native_dropout_cpu(const Tensor& input, double p) {
+    if (p < 0 || p >= 1) {
+        TP_THROW(ValueError, "native_dropout: p must be in [0, 1)");
+    }
+    Tensor mask(static_cast<std::vector<int64_t>>(input.shape()), DType::Bool,
+                input.device());
+    Tensor out(static_cast<std::vector<int64_t>>(input.shape()), input.dtype(),
+               input.device());
+    const int64_t n = input.numel();
+    auto& gen = default_generator();
+    uniform_real_distribution<double> uniform(0.0, 1.0);
+    const double scale = 1.0 / (1.0 - p);
+
+    switch (input.dtype()) {
+        case DType::Float32: {
+            const float* in = input.data_ptr<float>();
+            float* o = out.data_ptr<float>();
+            bool* m = mask.data_ptr<bool>();
+            for (int64_t i = 0; i < n; ++i) {
+                const bool keep = uniform(&gen) >= p;
+                m[i] = keep;
+                o[i] = keep ? static_cast<float>(in[i] * scale) : 0.0f;
+            }
+            break;
+        }
+        case DType::Float64: {
+            const double* in = input.data_ptr<double>();
+            double* o = out.data_ptr<double>();
+            bool* m = mask.data_ptr<bool>();
+            for (int64_t i = 0; i < n; ++i) {
+                const bool keep = uniform(&gen) >= p;
+                m[i] = keep;
+                o[i] = keep ? in[i] * scale : 0.0;
+            }
+            break;
+        }
+        case DType::Float16:
+        case DType::BFloat16: {
+            if (input.dtype() == DType::Float16) {
+                const Half* in = input.data_ptr<Half>();
+                Half* o = out.data_ptr<Half>();
+                bool* m = mask.data_ptr<bool>();
+                for (int64_t i = 0; i < n; ++i) {
+                    const bool keep = uniform(&gen) >= p;
+                    m[i] = keep;
+                    o[i] = static_cast<Half>(keep
+                                                 ? static_cast<double>(in[i]) * scale
+                                                 : 0.0);
+                }
+            } else {
+                const BFloat16* in = input.data_ptr<BFloat16>();
+                BFloat16* o = out.data_ptr<BFloat16>();
+                bool* m = mask.data_ptr<bool>();
+                for (int64_t i = 0; i < n; ++i) {
+                    const bool keep = uniform(&gen) >= p;
+                    m[i] = keep;
+                    o[i] = static_cast<BFloat16>(keep
+                                                     ? static_cast<double>(in[i]) * scale
+                                                     : 0.0);
+                }
+            }
+            break;
+        }
+        default:
+            TP_THROW(NotImplementedError,
+                     "dropout is only supported on floating point tensors");
+    }
+    return {std::move(out), std::move(mask)};
 }
 
 } // namespace cpu

@@ -296,17 +296,20 @@ def dropout(input, p=0.5, training=True, inplace=False):
         raise ValueError("dropout probability has to be between 0 and 1, but got {}".format(p))
     if not training or p == 0:
         return input
-    
-    # Generate mask
-    mask = (_C.rand(input.shape, device=input.device) > p).to(input.dtype)
-    
-    # Scale
-    scale = 1.0 / (1.0 - p)
-    
+
     if inplace:
-        return input.mul_(mask).mul_(scale)
-    else:
-        return input * mask * scale
+        # Composite fallback until a fused dropout_ op exists (torch's
+        # dropout_ mutates self and records the mask for backward).
+        mask = (_C.rand(input.shape, device=input.device) > p).to(input.dtype)
+        return input.mul_(mask).mul_(1.0 / (1.0 - p))
+
+    if p == 1:
+        # native_dropout rejects p >= 1 (its scale is undefined); torch
+        # zeroes everything in this case.
+        return _C.zeros_like(input)
+
+    out, _mask = _C.native_dropout(input, p)
+    return out
 
 def dropout2d(input, p=0.5, training=True, inplace=False):
     if p < 0 or p > 1:

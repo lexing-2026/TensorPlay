@@ -235,6 +235,12 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, CopyKernels) {
     m.impl("copy_", copy_kernel);
     m.impl("sparse_coo_tensor", sparse_coo_tensor_cuda);
     m.impl("sparse_mask", sparse_mask_cuda);
+    m.impl("to_dense", to_dense_sparse_cuda);
+    m.impl("to_sparse", to_sparse_coo_cuda);
+    m.impl("to_sparse_csr", to_sparse_csr_cuda);
+    m.impl("_nnz", sparse_nnz_cuda);
+    m.impl("sparse_mm", sparse_mm_cuda);
+    m.impl("sparse_sum", sparse_sum_cuda);
 }
 
 } // namespace cuda

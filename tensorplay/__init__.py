@@ -10,6 +10,7 @@ on an NVIDIA GPU with compute capability >= 3.0.
 
 import builtins
 import ctypes
+from enum import IntEnum
 import glob
 import importlib
 import inspect
@@ -252,8 +253,28 @@ cdouble = DType.complex128
 chalf = DType.complex32
 
 
+class MemoryFormat(IntEnum):
+    """Tensor memory layout, mirroring torch.MemoryFormat."""
+    CONTIGUOUS = 0
+    PRESERVE = 1
+    CHANNELS_LAST = 2
+    CHANNELS_LAST_3D = 3
+    # Lowercase aliases (enum value-aliases), matching torch.MemoryFormat.
+    contiguous_format = 0
+    preserve_format = 1
+    channels_last = 2
+    channels_last_3d = 3
+
+
+contiguous_format = MemoryFormat.CONTIGUOUS
+preserve_format = MemoryFormat.PRESERVE
+channels_last = MemoryFormat.CHANNELS_LAST
+channels_last_3d = MemoryFormat.CHANNELS_LAST_3D
+
+
 __all__ = [
     "Tensor", "tensor", "from_dlpack", "Scalar", "DeviceType", "device", "dtype", "Size",
+    "MemoryFormat", "contiguous_format", "preserve_format", "channels_last", "channels_last_3d",
     "uint8", "int8", "int16", "uint16", "uint32", "uint64", "int32", "int64",
     "float16", "bfloat16", "float32", "float64", "complex32", "complex64", "complex128", "bcomplex32", "bool",
     "half", "float", "double", "short", "int", "long", "cfloat", "cdouble", "chalf",
@@ -355,8 +376,9 @@ for __attr_name in dir(_C):
                     __obj.__module__ = __name__
                 except AttributeError:
                     # Fallback: wrap it if it's a function and module wasn't updated
-                    # Check if it is a nanobind function (type name usually nb_func)
-                    if "nb_func" in type(__obj).__name__:
+                    # (pybind11 functions are builtin_function_or_method, which
+                    # rejects __module__ writes)
+                    if callable(__obj):
                          def make_wrapper(f):
                              @functools.wraps(f)
                              def wrapper(*args, **kwargs):
@@ -428,8 +450,10 @@ from .compiler import compile
 from . import cuda
 from . import stax
 from . import backends
-from . import optim
+# nn before optim (upstream order): optim.swa_utils pulls in tensorplay.nn,
+# which must be fully initialized by then to avoid a partial-import cycle.
 from . import nn
+from . import optim
 from . import graph
 from . import autograd
 from . import distributed
@@ -961,6 +985,8 @@ else:
         "audio",
         "export",
         "fft",
+        "quantization",
+        "sparse",
         "special",
         "vision",
     }

@@ -126,14 +126,13 @@ def make_type(kind: str, is_list: bool = False, is_opt: bool = False,
 
 def _type_from_tg(t) -> Type:
     tgm = _ensure_torchgen_imported()
-    is_list = isinstance(t, tgm.ListType)
+    # Unwrap Optional<T> first; T may be a BaseType or a ListType
+    # (``int[]?`` -> optional list of int64_t).
     is_opt = isinstance(t, tgm.OptionalType)
-    elem = t.elem if (is_list or is_opt) else t
-    base = elem.name if not is_list or not hasattr(elem, "elem") else elem.name
-    # ListType.elem / OptionalType.elem unwrap one level; BaseType has .name
-    while not hasattr(base, "name") and hasattr(base, "elem"):
-        base = base.elem
-    name = base.name if hasattr(base, "name") else str(elem)
+    inner = t.elem if is_opt else t
+    is_list = isinstance(inner, tgm.ListType)
+    elem = inner.elem if is_list else inner
+    name = elem.name.name if hasattr(elem.name, "name") else str(elem.name)
     symint = str(name) == "SymInt"
     kind = _KIND_ALIASES.get(str(name), str(name))
     return make_type(kind, is_list, is_opt, None, symint)
@@ -245,9 +244,12 @@ def parse_schema(schema: str) -> NativeFunction:
     schema = schema.replace("int64_t", "int")
     tgm = _ensure_torchgen_imported()
     BaseType = tgm.BaseType
-    KeywordArgument = getattr(tgm, "KeywordArgument", ())
 
     ts = tgm.FunctionSchema.parse(schema)
+    # Upstream torchgen has no KeywordArgument wrapper: it splits arguments
+    # into positional / kwarg-only / out buckets at parse time and `.all`
+    # flattens them.  Recover the distinction via the kwarg-only bucket.
+    kwarg_names = {a.name for a in ts.arguments.flat_kwarg_only}
 
     def unwrap(t):
         while not isinstance(t, BaseType):
@@ -257,15 +259,19 @@ def parse_schema(schema: str) -> NativeFunction:
     def conv_arg(w):
         a = getattr(w, "argument", w)
         mut = "a" if (a.annotation is not None and a.annotation.is_write) else None
-        base = unwrap(a.type)
+        # ``int[]?`` stacks Optional over List over Base; peel each layer so
+        # the element type AND both flags are recovered.
+        outer = a.type
+        is_opt = isinstance(outer, tgm.OptionalType)
+        inner = outer.elem if is_opt else outer
+        is_list = isinstance(inner, tgm.ListType)
+        base = unwrap(inner)
         symint = base == "SymInt"
         kind = _KIND_ALIASES.get(base, base)
-        is_list = "ListType" in type(a.type).__name__
-        is_opt = "OptionalType" in type(a.type).__name__
         t = make_type(kind, is_list, is_opt, None, symint)
         if mut and t.is_tensor_like:
             t = make_type(t.kind, t.is_list, t.is_opt, mut, t.symint)
-        kwonly = isinstance(w, KeywordArgument)
+        kwonly = a.name in kwarg_names
         return Argument(name=a.name, type=t,
                         default=_norm_default(a.default), kwonly=kwonly)
 

@@ -12,6 +12,7 @@
 #include "Device.h"
 #include "DispatchKey.h"
 #include "Dispatcher.h"
+#include "MemoryFormat.h"
 #include "VariableVersion.h"
 #include "Storage.h"
 #include "SizesAndStrides.h"
@@ -30,7 +31,10 @@ private:
     tensorplay::VariableVersion version_counter_;
 
     bool is_contiguous_;
-    bool is_channels_last_;
+    // Layout tag: Contiguous, ChannelsLast (NHWC) or ChannelsLast3d (NDHWC).
+    // Never Preserve on a live tensor. Replaces the old is_channels_last_
+    // bool so the full format (including 3-D) is representable.
+    MemoryFormat memory_format_ = MemoryFormat::Contiguous;
 
     // Autograd extension point (mirrors c10::TensorImpl::autograd_meta_).
     // Never copied by TensorImpl copy operations: copies start without
@@ -47,20 +51,29 @@ private:
     };
     std::shared_ptr<SharedState> shared_state_;
 
-    // COO sparse tensors have no dense storage of their own.  Keep the COO
-    // metadata next to the dense metadata, mirroring TensorImpl's split
-    // between logical sizes and the storage implementation.  The component
-    // tensors are shared handles, so ordinary Tensor copies preserve the
-    // aliasing rules of torch.sparse_coo_tensor(indices, values, ...).
+    // COO/CSR sparse tensors have no dense storage of their own.  Keep the
+    // sparse metadata next to the dense metadata, mirroring TensorImpl's
+    // split between logical sizes and the storage implementation.  The
+    // component tensors are shared handles, so ordinary Tensor copies
+    // preserve the aliasing rules of torch.sparse_coo_tensor(...).
+    // Layout mirrors at::Layout: COO stores coordinates in `indices`
+    // (shape [sparse_dim, nnz]); CSR (2D only) stores row pointers in
+    // `crow` (shape [rows+1]) and column coordinates in `col` (shape [nnz]).
     struct SparseState {
+        int layout = 0;  // 0 = SparseCOO, 1 = SparseCSR
         std::shared_ptr<TensorImpl> indices;
         std::shared_ptr<TensorImpl> values;
+        std::shared_ptr<TensorImpl> crow;
+        std::shared_ptr<TensorImpl> col;
         std::vector<int64_t> sparse_sizes;
         bool coalesced = false;
     };
     std::shared_ptr<SparseState> sparse_state_;
 
 public:
+    // Layout tags mirroring at::Layout; used by Tensor sparse predicates.
+    static constexpr int kSparseCOOLayout = 0;
+    static constexpr int kSparseCSRLayout = 1;
     TensorImpl();
     TensorImpl(const std::vector<int64_t>& sizes, DType dtype, const Device& device = Device());
     // Sparse COO tensors need logical sizes and dtype/device metadata without
@@ -113,13 +126,54 @@ public:
     size_t itemsize() const { return elementSize(dtype_); }
     bool is_contiguous() const { return is_contiguous_; }
 
+    // Layout accessors (torch Tensor API surface).
+    MemoryFormat memory_format() const {
+        return memory_format_ == MemoryFormat::Preserve ? MemoryFormat::Contiguous
+                                                        : memory_format_;
+    }
+    void set_memory_format(MemoryFormat format) {
+        if (format == MemoryFormat::Preserve) format = MemoryFormat::Contiguous;
+        memory_format_ = format;
+        is_contiguous_ = is_contiguous_in(format);
+    }
+    bool is_channels_last() const { return memory_format_ == MemoryFormat::ChannelsLast; }
+    bool is_channels_last_2d() const { return memory_format_ == MemoryFormat::ChannelsLast; }
+    bool is_channels_last_3d() const { return memory_format_ == MemoryFormat::ChannelsLast3d; }
+
+    // Stride-set equality against `format`'s canonical layout, mirroring
+    // at::TensorImpl::is_contiguous(MemoryFormat). Strict comparison: size-1
+    // dims are not special-cased here.
+    bool is_contiguous_in(MemoryFormat format) const {
+        const auto sz = sizes_and_strides_.sizes().vec();
+        const auto st = sizes_and_strides_.strides().vec();
+        switch (format) {
+            case MemoryFormat::Preserve:
+                return is_contiguous_;
+            case MemoryFormat::ChannelsLast:
+            case MemoryFormat::ChannelsLast3d:
+                return st == get_channels_last_strides(sz);
+            default:
+                return is_contiguous_;
+        }
+    }
+
     bool is_sparse() const { return sparse_state_ != nullptr; }
+    int sparse_layout() const { return sparse_state_ ? sparse_state_->layout : kSparseCOOLayout; }
     bool is_coalesced() const { return sparse_state_ && sparse_state_->coalesced; }
     std::shared_ptr<TensorImpl> sparse_indices_impl() const {
-        return sparse_state_ ? sparse_state_->indices : nullptr;
+        return (sparse_state_ && sparse_state_->layout == kSparseCOOLayout)
+                   ? sparse_state_->indices : nullptr;
     }
     std::shared_ptr<TensorImpl> sparse_values_impl() const {
         return sparse_state_ ? sparse_state_->values : nullptr;
+    }
+    std::shared_ptr<TensorImpl> sparse_crow_impl() const {
+        return (sparse_state_ && sparse_state_->layout == kSparseCSRLayout)
+                   ? sparse_state_->crow : nullptr;
+    }
+    std::shared_ptr<TensorImpl> sparse_col_impl() const {
+        return (sparse_state_ && sparse_state_->layout == kSparseCSRLayout)
+                   ? sparse_state_->col : nullptr;
     }
     const std::vector<int64_t>& sparse_sizes() const {
         static const std::vector<int64_t> empty;
@@ -130,10 +184,31 @@ public:
                           std::vector<int64_t> sparse_sizes,
                           bool coalesced) {
         sparse_state_ = std::make_shared<SparseState>();
+        sparse_state_->layout = kSparseCOOLayout;
         sparse_state_->indices = std::move(indices);
         sparse_state_->values = std::move(values);
         sparse_state_->sparse_sizes = std::move(sparse_sizes);
         sparse_state_->coalesced = coalesced;
+        is_contiguous_ = false;
+        storage_offset_ = 0;
+        clear_storage();
+    }
+
+    // CSR layout constructor (2D only): `crow` has rows+1 entries, `col` and
+    // `values` have one entry per stored element.
+    void set_sparse_csr_state(std::shared_ptr<TensorImpl> crow,
+                              std::shared_ptr<TensorImpl> col,
+                              std::shared_ptr<TensorImpl> values,
+                              std::vector<int64_t> dense_sizes) {
+        TP_CHECK(crow != nullptr && col != nullptr && values != nullptr,
+                 "set_sparse_csr_state: crow/col/values must be defined");
+        sparse_state_ = std::make_shared<SparseState>();
+        sparse_state_->layout = kSparseCSRLayout;
+        sparse_state_->crow = std::move(crow);
+        sparse_state_->col = std::move(col);
+        sparse_state_->values = std::move(values);
+        sparse_state_->sparse_sizes = std::move(dense_sizes);
+        sparse_state_->coalesced = true;  // CSR is canonical by construction
         is_contiguous_ = false;
         storage_offset_ = 0;
         clear_storage();
@@ -187,6 +262,30 @@ public:
     AutogradMetaBase* autograd_meta() const { return autograd_meta_.get(); }
     bool has_autograd_meta() const { return autograd_meta_ != nullptr; }
     std::shared_ptr<AutogradMetaBase> autograd_meta_shared() const { return autograd_meta_; }
+
+    // resize_ support: adopt new logical sizes with fresh contiguous strides.
+    // Storage growth is the caller's job (kernels grow it first so the old
+    // contents stay readable in place).
+    void set_sizes_contiguous(const std::vector<int64_t>& new_sizes) {
+        sizes_and_strides_.resize(new_sizes);
+        is_contiguous_ = true;
+        memory_format_ = MemoryFormat::Contiguous;
+    }
+
+    // Adopt explicit sizes/strides (used by contiguous(memory_format) and
+    // other layout-materializing paths); layout flags are recomputed.
+    void set_sizes_and_strides(const std::vector<int64_t>& new_sizes,
+                               const std::vector<int64_t>& new_strides) {
+        sizes_and_strides_.set_sizes_and_strides(new_sizes, new_strides);
+        is_contiguous_ =
+            new_strides == SizesAndStrides::compute_contiguous_strides(new_sizes);
+        if (is_contiguous_) {
+            memory_format_ = MemoryFormat::Contiguous;
+        } else if (new_strides == get_channels_last_strides(new_sizes)) {
+            memory_format_ = new_sizes.size() == 5 ? MemoryFormat::ChannelsLast3d
+                                                   : MemoryFormat::ChannelsLast;
+        }
+    }
     
     // Share storage state from another TensorImpl
     void share_storage_from(const TensorImpl& other) {

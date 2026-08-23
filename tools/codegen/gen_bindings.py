@@ -25,9 +25,15 @@ using Tensor = tensorplay::Tensor;
 
 def _emit_def(lines, f: NativeFunction, *, method: bool):
     args = []
-    for a in f.args:
-        if method and a.name == 'self':
+    kwonly_open = False
+    for i, a in enumerate(f.args):
+        if method and i == 0:
+            # Bound via free-function pointer: args[0] is the implicit self,
+            # which pybind11 (>=3) counts through the is_method extra itself.
             continue
+        if a.kwonly and not kwonly_open:
+            args.append("py::kw_only()")
+            kwonly_open = True
         s = f'py::arg("{sanitize_name(a.name)}")'
         dft = py_default_for(f, a, 'binding') or (
             binding_default(a.type, a.default) if a.default else None)
@@ -41,6 +47,11 @@ def _emit_def(lines, f: NativeFunction, *, method: bool):
 
 
 def generate_bindings(funcs: list[NativeFunction]) -> str:
+    # Ops owned by the METH_FASTCALL layer (TensorCPythonGenerated.h) are
+    # NOT bound here: one binding per op, C-level parsing.  Lazy import --
+    # gen_python_c pulls .main, which imports this module.
+    from .gen_python_c import capi_claims
+    claimed = capi_claims(funcs)
     lines = _HEADER.splitlines()
     lines.append('inline void bind_generated_tensor_methods(py::class_<Tensor>& m) {')
     seen: set[str] = set()
@@ -49,6 +60,8 @@ def generate_bindings(funcs: list[NativeFunction]) -> str:
             if variant != 'method':
                 continue
             if _dedup_key(f) in seen:
+                continue
+            if (variant, f.cpp_name) in claimed:
                 continue
             seen.add(_dedup_key(f))
             _emit_def(lines, f, method=True)
@@ -62,6 +75,8 @@ def generate_bindings(funcs: list[NativeFunction]) -> str:
                 continue
             key = _dedup_key(f)
             if key in seen:
+                continue
+            if (variant, f.cpp_name) in claimed:
                 continue
             seen.add(key)
             _emit_def(lines, f, method=False)

@@ -156,7 +156,8 @@ def _gen_pyi(ctx: CodegenContext) -> None:
 
 DEFAULT_TARGETS = ["TensorMethods", "Redispatch", "AutogradNodes", "TPXOps",
                    "AutogradRegistration", "Bindings", "Autocast",
-                   "InplaceOrView", "Structured", "PythonFunctional"]
+                   "InplaceOrView", "Structured", "PythonFunctional",
+                   "PythonCAPI"]
 
 
 def run_gen(ctx: CodegenContext, targets: list[str]) -> None:

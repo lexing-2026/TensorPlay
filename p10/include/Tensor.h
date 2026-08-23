@@ -154,15 +154,28 @@ public:
     Device device() const;
     size_t itemsize() const;
     bool is_contiguous() const;
+    bool is_contiguous(MemoryFormat format) const;
+    MemoryFormat memory_format() const;
+    bool is_channels_last() const;
+    bool is_channels_last_2d() const;
+    bool is_channels_last_3d() const;
     bool is_pinned() const;
     Tensor pin_memory() const;
     Tensor contiguous() const;
+    // Materializes *this with the canonical strides of `format` (NHWC /
+    // NDHWC); returns *this unchanged when it already matches. Preserve
+    // resolves to plain contiguous().
+    Tensor contiguous(MemoryFormat format) const;
     bool is_sparse() const;
     bool is_coalesced() const;
     int64_t sparse_dim() const;
     int64_t dense_dim() const;
     Tensor _indices() const;
     Tensor _values() const;
+    // CSR layout accessors (2D); throw for COO/dense tensors.
+    Tensor _crow_indices() const;
+    Tensor _col_indices() const;
+    bool is_sparse_csr() const;
     Tensor coalesce() const;
     Tensor sparse_mask(const Tensor& mask) const;
 
@@ -174,6 +187,12 @@ public:
                                          const Tensor& values,
                                          const std::vector<int64_t>& size,
                                          bool is_coalesced = false);
+    // Internal CSR constructor used by to_sparse_csr; mirrors
+    // make_sparse_coo_tensor but installs crow/col components.
+    static Tensor make_sparse_csr_tensor(const Tensor& crow,
+                                         const Tensor& col,
+                                         const Tensor& values,
+                                         const std::vector<int64_t>& size);
     
     // Autograd methods (delegated to the AutogradMeta extension point on
     // TensorImpl; the concrete implementation lives in the tpx library).

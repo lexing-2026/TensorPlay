@@ -1,5 +1,6 @@
 #include "python_bindings.h"
 #include "tensorplay/ops/Config.h"
+#include "tensorplay/ops/TensorCPythonGenerated.h"
 #include "Context.h"
 #include "OneDNNContext.h"
 #include <cstdlib>
@@ -199,4 +200,11 @@ PYBIND11_MODULE(_C, m) {
         }
         Py_DECREF(name_obj);
     });
+
+    // METH_FASTCALL function layer goes in LAST, after every pybind11
+    // binding above: it only fills names nothing else bound and must never
+    // shadow a hand-written overload.
+    if (tensorplay::python_c::register_generated_cpython_functions(m.ptr()) != 0) {
+        throw py::error_already_set();
+    }
 }
