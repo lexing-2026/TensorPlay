@@ -44,3 +44,4 @@ void init_scalar(py::module_& m);
 void init_stax(py::module_& m);
 void init_parallel(py::module_& m);
 void init_distributed(py::module_& m);
+void init_cuda_graph(py::module_& m);

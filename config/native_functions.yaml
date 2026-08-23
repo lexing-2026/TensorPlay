@@ -2176,7 +2176,7 @@
     CUDA: one_hot_cuda
 
 - func: narrow(Tensor self, int dim, int start, int length) -> Tensor
-  variants: function
+  variants: function, method
   dispatch:
     CPU: narrow_cpu
     CUDA: narrow_cuda
@@ -3110,73 +3110,73 @@
     CUDA: i1e_cuda
 
 - func: chebyshev_polynomial_t(Tensor x, Tensor n) -> Tensor
-  variants: function, method
+  variants: function
   dispatch:
     CPU: chebyshev_polynomial_t_cpu
     CUDA: chebyshev_polynomial_t_cuda
 
 - func: chebyshev_polynomial_u(Tensor x, Tensor n) -> Tensor
-  variants: function, method
+  variants: function
   dispatch:
     CPU: chebyshev_polynomial_u_cpu
     CUDA: chebyshev_polynomial_u_cuda
 
 - func: chebyshev_polynomial_v(Tensor x, Tensor n) -> Tensor
-  variants: function, method
+  variants: function
   dispatch:
     CPU: chebyshev_polynomial_v_cpu
     CUDA: chebyshev_polynomial_v_cuda
 
 - func: chebyshev_polynomial_w(Tensor x, Tensor n) -> Tensor
-  variants: function, method
+  variants: function
   dispatch:
     CPU: chebyshev_polynomial_w_cpu
     CUDA: chebyshev_polynomial_w_cuda
 
 - func: shifted_chebyshev_polynomial_t(Tensor x, Tensor n) -> Tensor
-  variants: function, method
+  variants: function
   dispatch:
     CPU: shifted_chebyshev_polynomial_t_cpu
     CUDA: shifted_chebyshev_polynomial_t_cuda
 
 - func: shifted_chebyshev_polynomial_u(Tensor x, Tensor n) -> Tensor
-  variants: function, method
+  variants: function
   dispatch:
     CPU: shifted_chebyshev_polynomial_u_cpu
     CUDA: shifted_chebyshev_polynomial_u_cuda
 
 - func: shifted_chebyshev_polynomial_v(Tensor x, Tensor n) -> Tensor
-  variants: function, method
+  variants: function
   dispatch:
     CPU: shifted_chebyshev_polynomial_v_cpu
     CUDA: shifted_chebyshev_polynomial_v_cuda
 
 - func: shifted_chebyshev_polynomial_w(Tensor x, Tensor n) -> Tensor
-  variants: function, method
+  variants: function
   dispatch:
     CPU: shifted_chebyshev_polynomial_w_cpu
     CUDA: shifted_chebyshev_polynomial_w_cuda
 
 - func: hermite_polynomial_h(Tensor x, Tensor n) -> Tensor
-  variants: function, method
+  variants: function
   dispatch:
     CPU: hermite_polynomial_h_cpu
     CUDA: hermite_polynomial_h_cuda
 
 - func: hermite_polynomial_he(Tensor x, Tensor n) -> Tensor
-  variants: function, method
+  variants: function
   dispatch:
     CPU: hermite_polynomial_he_cpu
     CUDA: hermite_polynomial_he_cuda
 
 - func: laguerre_polynomial_l(Tensor x, Tensor n) -> Tensor
-  variants: function, method
+  variants: function
   dispatch:
     CPU: laguerre_polynomial_l_cpu
     CUDA: laguerre_polynomial_l_cuda
 
 - func: legendre_polynomial_p(Tensor x, Tensor n) -> Tensor
-  variants: function, method
+  variants: function
   dispatch:
     CPU: legendre_polynomial_p_cpu
     CUDA: legendre_polynomial_p_cuda
@@ -3188,13 +3188,13 @@
     CUDA: zeta_cuda
 
 - func: gammainc(Tensor a, Tensor x) -> Tensor
-  variants: function, method
+  variants: function
   dispatch:
     CPU: gammainc_cpu
     CUDA: gammainc_cuda
 
 - func: gammaincc(Tensor a, Tensor x) -> Tensor
-  variants: function, method
+  variants: function
   dispatch:
     CPU: gammaincc_cpu
     CUDA: gammaincc_cuda

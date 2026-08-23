@@ -1,4 +1,5 @@
 #include "Allocator.h"
+#include "CUDAGraph.h"
 #include "CUDARuntime.h"
 #include "Device.h"
 #include "Exception.h"
@@ -64,6 +65,10 @@ struct Block {
     cudaStream_t allocation_stream = nullptr;
     std::unordered_set<cudaStream_t> streams;
     std::vector<cudaEvent_t> events;
+    // Non-zero while the block belongs to a graph-private memory pool: its
+    // address may be baked into a captured graph, so it is never recycled
+    // outside that pool (see CUDAGraph.h).
+    uint64_t pool_id = 0;
 };
 
 struct DeviceStats {
@@ -102,6 +107,24 @@ struct PinnedBlock {
     std::vector<PinnedEvent> events;
 };
 
+// Open capture scope: while set, allocations on {device, stream} are routed
+// into the graph-private pool (CUDAGraph.h note).
+struct ActiveCapture {
+    uint64_t pool_id = 0;
+    int device = -1;
+    cudaStream_t stream = nullptr;
+};
+
+struct GraphPool {
+    // Free blocks parked after release.  They stay exclusive to this pool so
+    // a later capture-time allocation can reuse them, but no eager path can.
+    std::map<size_t, std::vector<std::shared_ptr<Block>>> small;
+    std::map<size_t, std::vector<std::shared_ptr<Block>>> large;
+    // Segments cudaMalloc'd while this pool was the routing target.  Their
+    // backing memory is returned to CUDA only by releasePool().
+    std::vector<Segment*> segments;
+};
+
 class AllocatorState {
 public:
     static AllocatorState& instance() {
@@ -118,13 +141,32 @@ public:
         const cudaStream_t allocation_stream =
             getCurrentCUDAStream(device).stream();
 
+        uint64_t pool_target = 0;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             ensureDevice(device);
-            reclaimCompletedLocked(device);
-            if (auto block = takeCachedLocked(device, rounded, allocation_stream)) {
-                activateLocked(block, allocation_stream, nbytes);
-                return block;
+            if (capture_.pool_id != 0 && capture_.device == device &&
+                capture_.stream == allocation_stream) {
+                // Graph-capture allocation: reuse is restricted to the
+                // private pool so replay-visible addresses stay exclusive.
+                pool_target = capture_.pool_id;
+            } else {
+                // Event queries are skipped while any capture is open: a
+                // cudaEventQuery on a pending block cannot fail the capture,
+                // but the queries themselves may target events recorded on
+                // unrelated streams mid-capture; deferring them is free.
+                if (capture_.pool_id == 0) reclaimCompletedLocked(device);
+                if (auto block = takeCachedLocked(device, rounded, allocation_stream)) {
+                    activateLocked(block, allocation_stream, nbytes);
+                    return block;
+                }
+            }
+            if (pool_target != 0) {
+                if (auto block = takeGraphPoolLocked(pool_target, rounded,
+                                                     allocation_stream)) {
+                    activateLocked(block, allocation_stream, nbytes);
+                    return block;
+                }
             }
         }
 
@@ -165,6 +207,10 @@ public:
             block->segment = segment_ptr;
             block->offset = 0;
             auto& stats = caches_[device].stats;
+            if (pool_target != 0) {
+                block->pool_id = pool_target;
+                pools_[pool_target].segments.push_back(segment_ptr);
+            }
             stats.reserved += rounded;
             stats.max_reserved = std::max(stats.max_reserved, stats.reserved);
             activateLocked(block, allocation_stream, nbytes);
@@ -209,6 +255,23 @@ public:
             // streams which are not ordered with the owner need fencing.
             streams.erase(std::remove(streams.begin(), streams.end(), allocation_stream),
                           streams.end());
+
+            if (block->pool_id != 0) {
+                // Graph-pool blocks never re-enter the general cache and
+                // never take event fences: event records on a capturing
+                // stream abort the capture, and cross-stream reuse cannot
+                // happen because only the pool's own same-stream free lists
+                // can hand the block out again.  The memory stays reserved
+                // until releasePool() frees its segment.
+                std::lock_guard<std::mutex> lock(mutex_);
+                block->requested_size = 0;
+                auto pit = pools_.find(block->pool_id);
+                if (pit == pools_.end()) return;
+                auto& pmap = isSmall(block->size) ? pit->second.small
+                                                  : pit->second.large;
+                pmap[block->size].push_back(block);
+                return;
+            }
 
             if (streams.empty()) {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -308,6 +371,76 @@ public:
     void emptyCache() {
         const int count = deviceCount();
         for (int device = 0; device < count; ++device) emptyCacheDevice(device);
+    }
+
+    // -- graph-private pools (CUDAGraph.h) ------------------------------------
+
+    uint64_t beginGraphCapture(int device, const CUDAStream& stream) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (capture_.pool_id != 0) {
+            TP_THROW(RuntimeError,
+                     "nested CUDA graph capture pools are not supported");
+        }
+        const uint64_t pool_id = next_pool_id_++;
+        pools_[pool_id] = GraphPool{};
+        capture_ = ActiveCapture{pool_id, device, stream.stream()};
+        return pool_id;
+    }
+
+    void endGraphCapture(uint64_t pool_id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (capture_.pool_id == pool_id) capture_ = ActiveCapture{};
+    }
+
+    bool isCapturing() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return capture_.pool_id != 0;
+    }
+
+    void releaseGraphPool(uint64_t pool_id) {
+        std::vector<std::tuple<void*, size_t, int>> segments_to_free;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto it = pools_.find(pool_id);
+            if (it == pools_.end()) return;
+            if (capture_.pool_id == pool_id) {
+                TP_THROW(RuntimeError,
+                         "cannot release a CUDA graph memory pool while its "
+                         "capture is open");
+            }
+            GraphPool& pool = it->second;
+            // A segment's block_count counts every metadata reference: live
+            // tensors plus blocks parked on this pool's free lists.  Freeing
+            // is safe only when nothing beyond those parked blocks remains.
+            size_t parked = 0;
+            for (const auto& [size, bucket] : pool.small) parked += bucket.size();
+            for (const auto& [size, bucket] : pool.large) parked += bucket.size();
+            size_t total_refs = 0;
+            for (const Segment* segment : pool.segments) {
+                total_refs += segment->block_count;
+            }
+            if (total_refs > parked) {
+                TP_THROW(RuntimeError,
+                         "refusing to release CUDA graph memory pool " +
+                         std::to_string(pool_id) + ": " +
+                         std::to_string(total_refs - parked) +
+                         " tensor(s) allocated during capture are still "
+                         "alive; destroy the graph executable and drop all "
+                         "static input/output tensors first");
+            }
+            for (Segment* segment : pool.segments) {
+                segments_to_free.emplace_back(segment->ptr, segment->size,
+                                              segment->device);
+                auto& stats = caches_[segment->device].stats;
+                stats.reserved -= std::min(stats.reserved, segment->size);
+                segments_.erase(segment->ptr);
+            }
+            pools_.erase(it);
+        }
+        for (const auto& segment : segments_to_free) {
+            CUDAGuard segment_guard(std::get<2>(segment));
+            checkCuda(cudaFree(std::get<0>(segment)), "cudaFree");
+        }
     }
 
 private:
@@ -421,6 +554,43 @@ private:
         return nullptr;
     }
 
+    // Graph-pool counterpart of takeCachedLocked.  No coalescing and no
+    // address index: pool blocks are parked per size and reused same-stream
+    // only, which is enough because the pool is short-lived and private.
+    std::shared_ptr<Block> takeGraphPoolLocked(uint64_t pool_id, size_t rounded,
+                                               cudaStream_t allocation_stream) {
+        auto pit = pools_.find(pool_id);
+        if (pit == pools_.end()) return nullptr;
+        GraphPool& pool = pit->second;
+        auto& pmap = isSmall(rounded) ? pool.small : pool.large;
+        for (auto it = pmap.lower_bound(rounded); it != pmap.end(); ++it) {
+            auto& bucket = it->second;
+            for (auto bucket_it = bucket.begin(); bucket_it != bucket.end(); ++bucket_it) {
+                if ((*bucket_it)->allocation_stream != allocation_stream) continue;
+                auto block = *bucket_it;
+                bucket.erase(bucket_it);
+                if (bucket.empty()) pmap.erase(it);
+                if (block->size > rounded) {
+                    auto remainder = std::make_shared<Block>();
+                    remainder->ptr = static_cast<char*>(block->ptr) + rounded;
+                    remainder->size = block->size - rounded;
+                    remainder->device = block->device;
+                    remainder->segment = block->segment;
+                    remainder->offset = block->offset + rounded;
+                    remainder->allocation_stream = block->allocation_stream;
+                    remainder->pool_id = pool_id;
+                    if (remainder->segment) remainder->segment->block_count++;
+                    block->size = rounded;
+                    auto& remainder_map = isSmall(remainder->size) ? pool.small
+                                                                   : pool.large;
+                    remainder_map[remainder->size].push_back(std::move(remainder));
+                }
+                return block;
+            }
+        }
+        return nullptr;
+    }
+
     void activateLocked(const std::shared_ptr<Block>& block,
                         cudaStream_t allocation_stream,
                         size_t requested_size) {
@@ -467,6 +637,12 @@ private:
 
     void emptyCacheDevice(int device) {
         device = normalizeDevice(device);
+        {
+            // cudaDeviceSynchronize below would abort an open stream capture;
+            // skip the release entirely while a graph is being captured.
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (capture_.pool_id != 0) return;
+        }
         CUDAGuard guard(device);
         std::vector<std::shared_ptr<Block>> blocks;
         std::vector<std::tuple<void*, size_t, int>> segments_to_free;
@@ -519,10 +695,15 @@ private:
         }
     }
 
-    std::mutex mutex_;
+    // mutable — isCapturing() is const and must be callable while any thread
+    // holds the allocator lock.
+    mutable std::mutex mutex_;
     std::vector<DeviceCache> caches_;
     std::unordered_map<void*, std::unique_ptr<Segment>> segments_;
     std::unordered_map<void*, std::shared_ptr<Block>> live_blocks_;
+    ActiveCapture capture_;
+    std::unordered_map<uint64_t, GraphPool> pools_;
+    uint64_t next_pool_id_ = 1;
 };
 
 class PinnedAllocatorState {
@@ -729,6 +910,23 @@ void recordStream(void* base_ptr, const CUDAStream& stream) {
 
 void recordPinnedStream(void* base_ptr, const CUDAStream& stream) {
     PinnedAllocatorState::instance().record(base_ptr, stream);
+}
+
+bool isCapturing() {
+    return AllocatorState::instance().isCapturing();
+}
+
+uint64_t beginAllocateToPool(int device, const CUDAStream& stream) {
+    device = device < 0 ? currentDevice() : device;
+    return AllocatorState::instance().beginGraphCapture(device, stream);
+}
+
+void endAllocateToPool(uint64_t pool_id) {
+    AllocatorState::instance().endGraphCapture(pool_id);
+}
+
+void releasePool(uint64_t pool_id) {
+    AllocatorState::instance().releaseGraphPool(pool_id);
 }
 
 } // namespace tensorplay::cuda

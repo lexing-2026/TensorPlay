@@ -22,6 +22,14 @@
 
 #include <cuda_runtime.h>
 
+// fp16/bf16 (and narrow-width integer) atomics: vendored from
+// ATen/cuda/Atomic.cuh — no native 16-bit CAS before sm_70, so the Half/
+// BFloat16 overloads align back to the containing 32-bit word and swap the
+// target half via atomicCAS(uint32_t*). Must stay at global scope: the
+// tensorplay::Half/BFloat16 qualified names inside would otherwise resolve
+// relative to an enclosing namespace.
+#include "Atomic.cuh"
+
 #include <vector>
 #include <algorithm>
 #include <cstring>
@@ -167,39 +175,24 @@ __global__ void gather_kernel(int64_t n, int64_t idx_dim_size, int64_t inner,
     }
 }
 
-// int64 atomicAdd via unsigned long long (two's-complement add is bitwise
-// identical).
 __device__ __forceinline__ void atomic_add_rel(int64_t* addr, int64_t v) {
-    atomicAdd(reinterpret_cast<unsigned long long*>(addr), static_cast<unsigned long long>(v));
+    gpuAtomicAdd(addr, v);
 }
-__device__ __forceinline__ void atomic_add_rel(int32_t* addr, int32_t v) { atomicAdd(addr, v); }
-__device__ __forceinline__ void atomic_add_rel(float* addr, float v) { atomicAdd(addr, v); }
-__device__ __forceinline__ void atomic_add_rel(double* addr, double v) { atomicAdd(addr, v); }
-// sm_86 has no scalar fp16/bf16 atomicAdd; accumulate via 16-bit CAS so
-// concurrent index hits on the same element are not lost.
-template <typename HT>
-__device__ __forceinline__ void atomic_add_fp16_like(HT* addr, HT v) {
-    unsigned short* p = reinterpret_cast<unsigned short*>(addr);
-    unsigned short assumed = *p;
-    for (;;) {
-        HT next = HT(static_cast<float>(*reinterpret_cast<HT*>(&assumed)) +
-                     static_cast<float>(v));
-        unsigned short cur = *reinterpret_cast<unsigned short*>(&next);
-        unsigned short prev = atomicCAS(p, assumed, cur);
-        if (prev == assumed) return;
-        assumed = prev;
-    }
-}
+__device__ __forceinline__ void atomic_add_rel(int32_t* addr, int32_t v) { gpuAtomicAdd(addr, v); }
+__device__ __forceinline__ void atomic_add_rel(float* addr, float v) { gpuAtomicAdd(addr, v); }
+__device__ __forceinline__ void atomic_add_rel(double* addr, double v) { gpuAtomicAdd(addr, v); }
 __device__ __forceinline__ void atomic_add_rel(Half* addr, Half v) {
-    atomic_add_fp16_like(addr, v);
+    gpuAtomicAdd(addr, v);
 }
 __device__ __forceinline__ void atomic_add_rel(BFloat16* addr, BFloat16 v) {
-    atomic_add_fp16_like(addr, v);
+    gpuAtomicAdd(addr, v);
 }
 
 __device__ __forceinline__ int64_t atomic_add_rel_return(int64_t* addr) {
-    return static_cast<int64_t>(atomicAdd(reinterpret_cast<unsigned long long*>(addr),
-                                          static_cast<unsigned long long>(1)));
+    // ::atomicAdd — the vendored tensorplay::cuda overloads shadow the global
+    // CUDA atomicAdd set inside this namespace.
+    return static_cast<int64_t>(::atomicAdd(reinterpret_cast<unsigned long long*>(addr),
+                                            static_cast<unsigned long long>(1)));
 }
 
 // scatter/scatter_add: elementwise indexed write. Assign mode matches

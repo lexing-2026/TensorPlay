@@ -258,12 +258,14 @@ __global__ void gru_cell_backward_kernel(
 
 inline Tensor cont(const Tensor& t) { return t.is_contiguous() ? t : t.contiguous(); }
 
-#define TP_RNN_DISPATCH(FN, ...)                                        \
+// Dispatch helper: invokes FN<T> for the floating dtype family (ATen
+// AT_DISPATCH_FLOATING_TYPES_AND2(kHalf, kBFloat16) equivalent).
+#define TP_RNN_DISPATCH(FN)                                             \
     switch (dtype) {                                                    \
-        case DType::Float64: FN<double>(__VA_ARGS__); break;            \
-        case DType::Float16: FN<tensorplay::Half>(__VA_ARGS__); break;   \
-        case DType::BFloat16: FN<tensorplay::BFloat16>(__VA_ARGS__); break;\
-        default: FN<float>(__VA_ARGS__); break;                         \
+        case DType::Float64: FN(double{}); break;                       \
+        case DType::Float16: FN(tensorplay::Half{}); break;             \
+        case DType::BFloat16: FN(tensorplay::BFloat16{}); break;        \
+        default: FN(float{}); break;                                    \
     }
 
 } // namespace
