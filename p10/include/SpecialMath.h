@@ -161,7 +161,7 @@ Output was modified to be inf or -inf when input is 1 or -1. */
 #define CENTRAL_RANGE 0.7
 
 template <typename T>
-inline typename std::enable_if_t<std::is_floating_point_v<T>, T>
+TP_HOST_DEVICE inline typename std::enable_if_t<std::is_floating_point_v<T>, T>
 calc_erfinv(T y) {
 /* Function to calculate inverse error function.  Rational approximation
 is used to generate an initial approximation, which is then improved to

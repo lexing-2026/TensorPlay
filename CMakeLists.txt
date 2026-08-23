@@ -774,6 +774,7 @@ pybind11_add_module(_C
     src/bindings/python/Stax.cpp
     src/bindings/python/Parallel.cpp
     src/bindings/python/Distributed.cpp
+    src/bindings/python/CudaGraph.cpp
 )
 set_target_properties(_C PROPERTIES UNITY_BUILD ON)
 target_link_libraries(_C PRIVATE p10 tpx stax)
