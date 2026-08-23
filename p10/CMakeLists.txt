@@ -66,6 +66,7 @@ if(USE_CUDA)
         src/backend/cuda/CUDAGenerator.cpp
         src/backend/cuda/NCCLContext.cpp
         src/backend/cuda/CUDARuntime.cpp
+        src/backend/cuda/CUDAGraph.cpp
         src/backend/cuda/CUDARuntimeKernels.cu
         src/backend/cuda/ArithmeticKernels.cu
         src/backend/cuda/CopyKernels.cu
@@ -94,6 +95,7 @@ if(USE_CUDA)
         src/backend/cuda/IndexingKernels.cu
         src/backend/cuda/TierOpsKernels.cu
         src/backend/cuda/TierOpsReduceKernels.cu
+        src/backend/cuda/RNNKernels.cu
         src/backend/cuda/Tier5OpsKernels.cu
         src/backend/cuda/Tier5LossesKernels.cu
         src/backend/cuda/SpecialKernels.cu

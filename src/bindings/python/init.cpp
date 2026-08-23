@@ -57,6 +57,7 @@ PYBIND11_MODULE(_C, m) {
     init_stax(m);
     init_parallel(m);
     init_distributed(m);
+    init_cuda_graph(m);
 
     // CUDA availability
     m.def("is_cuda_available", []() {

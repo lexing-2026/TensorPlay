@@ -52,6 +52,11 @@ public:
     }
     bool operator!=(const CUDAStream& other) const noexcept { return !(*this == other); }
 
+    // Unbound placeholder ("no stream yet"), mirroring c10's default-constructed
+    // Stream. Needed by components like CUDAGraph that stash a stream slot
+    // before capture begins; not a usable launch stream.
+    static CUDAStream undefined() noexcept { return CUDAStream(-1, nullptr); }
+
 private:
     CUDAStream(int device_index, cudaStream_t stream) noexcept
         : device_index_(device_index), stream_(stream) {}

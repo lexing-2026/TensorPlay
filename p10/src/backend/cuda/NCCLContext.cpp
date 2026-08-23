@@ -81,6 +81,7 @@ void allToAllSingleUnequalSplit(const void*, const size_t*, const size_t*,
 #include "CUDARuntime.h"
 
 #include <nccl.h>
+#include <cuda_runtime.h>
 
 #include <string>
 
@@ -127,6 +128,10 @@ ncclRedOp_t toNcclRedOp(ReduceOp op) {
             TP_THROW(RuntimeError, "Invalid NCCL reduce op");
     }
 }
+
+// torch's _nccl_should_send_recv: skip zero-size p2p legs (NCCL errors on
+// zero-count send/recv).
+inline bool shouldSendRecv(size_t count) { return count > 0; }
 
 } // namespace
 
@@ -218,22 +223,109 @@ void reduceScatter(void* sendbuff, void* recvbuff, size_t count, DType dtype,
               "ncclReduceScatter");
 }
 
+// Byte size of one element for the flat-buffer slot arithmetic below.
+// (NCCL 2.x ships no rooted ncclGather/ncclScatter; the slot layout matches
+// torch::cuda::nccl::gather/scatter where root's buffers hold numranks
+// contiguous per-rank chunks.)
+inline size_t ncclElemSize(ncclDataType_t type) {
+    switch (type) {
+        case ncclInt8:
+        case ncclUint8: return 1;
+        case ncclInt32:
+        case ncclUint32: return 4;
+        case ncclInt64:
+        case ncclUint64: return 8;
+        case ncclFloat16: return 2;
+        case ncclFloat32: return 4;
+        case ncclFloat64: return 8;
+#if defined(ncclBfloat16)
+        case ncclBfloat16: return 2;
+#endif
+#if defined(ncclFloat8e4m3)
+        case ncclFloat8e4m3: return 1;
+#endif
+#if defined(ncclFloat8e5m2)
+        case ncclFloat8e5m2: return 1;
+#endif
+        default:
+            TP_THROW(RuntimeError, "unsupported NCCL dtype");
+    }
+}
+
 void gather(const void* sendbuff, void* recvbuff, size_t count, DType dtype,
             int root, Comm comm, void* stream) {
-    checkNccl(ncclGather(const_cast<void*>(sendbuff), recvbuff, count,
-                         toNcclDType(dtype), root,
-                         static_cast<ncclComm_t>(comm),
-                         reinterpret_cast<cudaStream_t>(stream)),
-              "ncclGather");
+    // Port of torch::cuda::nccl::gather: grouped point-to-point ops. The
+    // root posts one recv per peer into its flat recv slots and copies its
+    // own chunk device-to-device; every peer sends its chunk to the root.
+    ncclComm_t c = static_cast<ncclComm_t>(comm);
+    cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
+    int num_ranks = 0, cur_rank = 0;
+    checkNccl(ncclCommCount(c, &num_ranks), "ncclCommCount");
+    checkNccl(ncclCommUserRank(c, &cur_rank), "ncclCommUserRank");
+    auto type = toNcclDType(dtype);
+    const size_t esz = ncclElemSize(type);
+    char* rbuf = static_cast<char*>(recvbuff);
+    checkNccl(ncclGroupStart(), "ncclGroupStart");
+    if (cur_rank == root) {
+        for (int r = 0; r < num_ranks; ++r) {
+            if (r != root) {
+                if (shouldSendRecv(count)) {
+                    checkNccl(ncclRecv(rbuf + r * count * esz, count, type, r,
+                                       c, s), "ncclRecv");
+                }
+            } else if (count > 0) {
+                // own slot: plain copy on the collective stream
+                cudaError_t cerr = cudaMemcpyAsync(
+                    rbuf + static_cast<size_t>(root) * count * esz, sendbuff,
+                    count * esz, cudaMemcpyDeviceToDevice, s);
+                if (cerr != cudaSuccess) {
+                    TP_THROW(RuntimeError, std::string("cudaMemcpyAsync: ") +
+                                               cudaGetErrorString(cerr));
+                }
+            }
+        }
+    } else if (shouldSendRecv(count)) {
+        checkNccl(ncclSend(sendbuff, count, type, root, c, s), "ncclSend");
+    }
+    checkNccl(ncclGroupEnd(), "ncclGroupEnd");
 }
 
 void scatter(const void* sendbuff, void* recvbuff, size_t count, DType dtype,
              int root, Comm comm, void* stream) {
-    checkNccl(ncclScatter(const_cast<void*>(sendbuff), recvbuff, count,
-                          toNcclDType(dtype), root,
-                          static_cast<ncclComm_t>(comm),
-                          reinterpret_cast<cudaStream_t>(stream)),
-              "ncclScatter");
+    // Port of torch::cuda::nccl::scatter: the root sends one chunk per peer
+    // from its flat send buffer and copies its own chunk; every peer receives
+    // its chunk from the root.
+    ncclComm_t c = static_cast<ncclComm_t>(comm);
+    cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
+    int num_ranks = 0, cur_rank = 0;
+    checkNccl(ncclCommCount(c, &num_ranks), "ncclCommCount");
+    checkNccl(ncclCommUserRank(c, &cur_rank), "ncclCommUserRank");
+    auto type = toNcclDType(dtype);
+    const size_t esz = ncclElemSize(type);
+    char* rbuf = static_cast<char*>(recvbuff);
+    const char* sbuf = static_cast<const char*>(sendbuff);
+    checkNccl(ncclGroupStart(), "ncclGroupStart");
+    if (cur_rank == root) {
+        for (int r = 0; r < num_ranks; ++r) {
+            if (r != root) {
+                if (shouldSendRecv(count)) {
+                    checkNccl(ncclSend(sbuf + r * count * esz, count, type, r,
+                                       c, s), "ncclSend");
+                }
+            } else if (count > 0) {
+                cudaError_t cerr = cudaMemcpyAsync(
+                    rbuf, sbuf + static_cast<size_t>(root) * count * esz,
+                    count * esz, cudaMemcpyDeviceToDevice, s);
+                if (cerr != cudaSuccess) {
+                    TP_THROW(RuntimeError, std::string("cudaMemcpyAsync: ") +
+                                               cudaGetErrorString(cerr));
+                }
+            }
+        }
+    } else if (shouldSendRecv(count)) {
+        checkNccl(ncclRecv(rbuf, count, type, root, c, s), "ncclRecv");
+    }
+    checkNccl(ncclGroupEnd(), "ncclGroupEnd");
 }
 
 void send(const void* buffer, size_t count, DType dtype, int peer,
@@ -251,12 +343,6 @@ void recv(void* buffer, size_t count, DType dtype, int peer,
                        reinterpret_cast<cudaStream_t>(stream)),
               "ncclRecv");
 }
-
-// torch's _nccl_should_send_recv: skip zero-size p2p legs (NCCL errors on
-// zero-count send/recv).
-namespace {
-inline bool shouldSendRecv(size_t count) { return count > 0; }
-} // namespace
 
 void groupStart() { checkNccl(ncclGroupStart(), "ncclGroupStart"); }
 

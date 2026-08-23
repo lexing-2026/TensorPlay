@@ -2,6 +2,7 @@
 
 from .api import compile, is_compiling, reset
 from .graph import Graph, GraphCaptureError, GraphModule, Node, Proxy, Tracer
+from .guards import Guard, GuardChain, format_recompile_reasons  # noqa: F401
 from .passes import (
     ConstFold,
     DeadCodeElimination,
@@ -27,6 +28,8 @@ __all__ = [
     "Graph",
     "GraphCaptureError",
     "GraphModule",
+    "Guard",
+    "GuardChain",
     "Node",
     "PassBase",
     "PassManager",
@@ -35,6 +38,7 @@ __all__ = [
     "ShapeProp",
     "Tracer",
     "compile",
+    "format_recompile_reasons",
     "get_default_backend",
     "is_compiling",
     "list_backends",
