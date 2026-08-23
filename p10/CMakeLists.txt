@@ -11,6 +11,7 @@ set(P10_SOURCES
     src/Exception.cpp
     src/Generator.cpp
     src/GradMode.cpp
+    src/InferenceMode.cpp
     src/Parallel.cpp
     src/Scalar.cpp
     src/SizesAndStrides.cpp
@@ -29,6 +30,8 @@ set(P10_SOURCES
     src/backend/cpu/ConvKernels.cpp
     src/backend/cpu/CopyKernels.cpp
     src/backend/cpu/SparseKernels.cpp
+    src/backend/cpu/QuantKernels.cpp
+    src/backend/cpu/ForwardKernels.cpp
     src/backend/cpu/FactoryKernels.cpp
     src/backend/cpu/LinearAlgebraKernels.cpp
     src/backend/cpu/LinalgKernels.cpp
@@ -71,6 +74,8 @@ if(USE_CUDA)
         src/backend/cuda/ArithmeticKernels.cu
         src/backend/cuda/CopyKernels.cu
         src/backend/cuda/SparseKernels.cu
+        src/backend/cuda/QuantKernels.cu
+        src/backend/cuda/ForwardKernels.cu
         src/backend/cuda/FactoryKernels.cu
         src/backend/cuda/EmbeddingKernels.cu
         src/backend/cuda/PointwiseKernels.cu

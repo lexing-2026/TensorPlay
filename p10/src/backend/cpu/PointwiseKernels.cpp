@@ -6,6 +6,7 @@
 #include "OneDNNContext.h"
 #include "Allocator.h"
 #include "Parallel.h"
+#include "cpu/VecUnary.h"
 #include <iostream>
 #include <cmath>
 #include <algorithm>
@@ -72,19 +73,54 @@ void onednn_eltwise(const Tensor& src, Tensor& dst, dnnl::algorithm algo, float 
 }
 #endif
 
-// Helper for operations that preserve dtype (e.g. abs, neg, square)
+namespace {
+// Only f32/f64 have vector kernels.  Templating the dispatch (instead of
+// if-constexpr at the macro site) matters: the switch below expands with a
+// concrete ctype inside this non-template function, and a discarded
+// constexpr branch there would still be fully type-checked.
+template <typename T>
+inline void vec_run(vecunary::VOp op, const vecunary::VParams& prm,
+                    const T* src, T* dst, int64_t begin, int64_t end) {
+    if constexpr (std::is_same_v<T, float>) {
+        vecunary::run_f32(op, prm, src, dst, begin, end);
+    } else if constexpr (std::is_same_v<T, double>) {
+        vecunary::run_f64(op, prm, src, dst, begin, end);
+    }
+}
+} // namespace
+
+// Elementwise kernels use a finer grain than the global default: with the
+// spinning intraop pool a chunk handoff costs ~1-2us, so splitting small-ish
+// tensors across all workers wins far more than the handoff costs.
+constexpr int64_t kUnaryGrain = 8192;
+
+// Helper for operations that preserve dtype (e.g. abs, neg, square).
+// vec_op selects the AVX2 fast path (see cpu/VecUnary.h) for float/double;
+// the scalar lambda stays as the fallback for other dtypes and non-AVX2 hosts.
 template<typename Func>
-Tensor unary_op_kernel(const Tensor& self, Func func) {
+Tensor unary_op_kernel(const Tensor& self, Func func,
+                       vecunary::VOp vec_op = vecunary::VOp::None,
+                       vecunary::VParams vec_prm = {}) {
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
     int64_t n = self.numel();
-    
+
     Tensor self_contig = self.is_contiguous() ? self : self.clone();
-    
+    // Vector fast paths exist only for f32/f64; other dtypes take the
+    // scalar-lambda fallback and must never instantiate the vec calls.
+    const bool vec_ok = vecunary::vec_ready() && vec_op != vecunary::VOp::None
+        && (self.dtype() == DType::Float32 || self.dtype() == DType::Float64);
+
     #define OP_CASE(ctype, name) \
     case DType::name: { \
         const ctype* src = self_contig.data_ptr<ctype>(); \
         ctype* dst = result.data_ptr<ctype>(); \
-        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) { \
+        if (vec_ok) { \
+            parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) { \
+            vec_run(vec_op, vec_prm, src, dst, begin, end); \
+            }); \
+            break; \
+        } \
+        parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) { \
         for(int64_t i = begin; i < end; ++i) dst[i] = func(src[i]); \
         }); \
         break; \
@@ -99,28 +135,35 @@ Tensor unary_op_kernel(const Tensor& self, Func func) {
     return result;
 }
 
-// Helper for operations that promote integer to float (e.g. sin, cos, exp)
+// Helper for operations that promote integer to float (e.g. sin, cos, exp).
+// vec_op selects the AVX2 fast path (see cpu/VecUnary.h) for float/double and
+// the widen-compute-narrow paths for half/bfloat16; the scalar lambda remains
+// as fallback.
 template<typename Func>
-Tensor unary_float_op_kernel(const Tensor& self, Func func) {
+Tensor unary_float_op_kernel(const Tensor& self, Func func,
+                             vecunary::VOp vec_op = vecunary::VOp::None,
+                             vecunary::VParams vec_prm = {}) {
     DType out_dtype = self.dtype();
     if (isIntegralType(out_dtype)) {
         out_dtype = DType::Float32;
     }
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), out_dtype, self.device());
     int64_t n = self.numel();
-    
+
     Tensor self_contig = self.is_contiguous() ? self : self.clone();
-    
-    // We need to handle the case where input is int, output is float
-    // And input is float, output is float
-    
+    // Vector fast paths cover f32/f64 plus the widen-compute-narrow f16/bf16
+    // kernels; integral inputs stay on the scalar-lambda fallback.
+    const bool vec_ok = vecunary::vec_ready() && vec_op != vecunary::VOp::None
+        && (self.dtype() == DType::Float32 || self.dtype() == DType::Float64
+            || self.dtype() == DType::Float16 || self.dtype() == DType::BFloat16);
+
     if (isIntegralType(self.dtype())) {
         // Input int, Output float
         #define INT_CASE(ctype, name) \
         case DType::name: { \
             const ctype* src = self_contig.data_ptr<ctype>(); \
             float* dst = result.data_ptr<float>(); \
-            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) { \
+            parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) { \
             for(int64_t i = begin; i < end; ++i) dst[i] = static_cast<float>(func(static_cast<float>(src[i]))); \
             }); \
             break; \
@@ -136,15 +179,31 @@ Tensor unary_float_op_kernel(const Tensor& self, Func func) {
         if (self.dtype() == DType::Float16) {
             const Half* src = self_contig.data_ptr<Half>();
             Half* dst = result.data_ptr<Half>();
-            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-            for(int64_t i = begin; i < end; ++i) dst[i] = static_cast<Half>(func(static_cast<float>(src[i])));
-            });
+            if (vec_ok && vecunary::f16c_available()) {
+                parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) {
+                vecunary::run_f16(vec_op, vec_prm,
+                                  reinterpret_cast<const uint16_t*>(src),
+                                  reinterpret_cast<uint16_t*>(dst), begin, end);
+                });
+            } else {
+                parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) {
+                for(int64_t i = begin; i < end; ++i) dst[i] = static_cast<Half>(func(static_cast<float>(src[i])));
+                });
+            }
         } else {
             const BFloat16* src = self_contig.data_ptr<BFloat16>();
             BFloat16* dst = result.data_ptr<BFloat16>();
-            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-            for(int64_t i = begin; i < end; ++i) dst[i] = static_cast<BFloat16>(func(static_cast<float>(src[i])));
-            });
+            if (vec_ok) {
+                parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) {
+                vecunary::run_bf16(vec_op, vec_prm,
+                                   reinterpret_cast<const uint16_t*>(src),
+                                   reinterpret_cast<uint16_t*>(dst), begin, end);
+                });
+            } else {
+                parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) {
+                for(int64_t i = begin; i < end; ++i) dst[i] = static_cast<BFloat16>(func(static_cast<float>(src[i])));
+                });
+            }
         }
     } else {
         // Input float, Output float
@@ -152,7 +211,7 @@ Tensor unary_float_op_kernel(const Tensor& self, Func func) {
         case DType::name: { \
             const ctype* src = self_contig.data_ptr<ctype>(); \
             ctype* dst = result.data_ptr<ctype>(); \
-            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) { \
+            parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) { \
             for(int64_t i = begin; i < end; ++i) dst[i] = func(src[i]); \
             }); \
             break; \
@@ -161,7 +220,13 @@ Tensor unary_float_op_kernel(const Tensor& self, Func func) {
             case DType::Float32: {
                  const float* src = self_contig.data_ptr<float>();
                  float* dst = result.data_ptr<float>();
-                 parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) { \
+                 if (vec_ok) {
+                     parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) { \
+                     vecunary::run_f32(vec_op, vec_prm, src, dst, begin, end);
+                     });
+                     break;
+                 }
+                 parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) { \
                  for(int64_t i = begin; i < end; ++i) dst[i] = func(src[i]);
                  });
                  break;
@@ -169,7 +234,13 @@ Tensor unary_float_op_kernel(const Tensor& self, Func func) {
             case DType::Float64: {
                  const double* src = self_contig.data_ptr<double>();
                  double* dst = result.data_ptr<double>();
-                 parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) { \
+                 if (vec_ok) {
+                     parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) { \
+                     vecunary::run_f64(vec_op, vec_prm, src, dst, begin, end);
+                     });
+                     break;
+                 }
+                 parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) { \
                  for(int64_t i = begin; i < end; ++i) dst[i] = func(src[i]);
                  });
                  break;
@@ -192,7 +263,7 @@ Tensor abs_kernel(const Tensor& self) {
         } else {
             return std::abs(x);
         }
-    });
+    }, vecunary::VOp::Abs);
 }
 
 Tensor neg_kernel(const Tensor& self) {
@@ -202,11 +273,11 @@ Tensor neg_kernel(const Tensor& self) {
         } else {
              return -x;
         }
-    });
+    }, vecunary::VOp::Neg);
 }
 
 Tensor square_kernel(const Tensor& self) {
-    return unary_op_kernel(self, [](auto x) { return x * x; });
+    return unary_op_kernel(self, [](auto x) { return x * x; }, vecunary::VOp::Square);
 }
 
 Tensor sign_kernel(const Tensor& self) {
@@ -219,62 +290,62 @@ Tensor sign_kernel(const Tensor& self) {
             if (x < ctype(0)) return static_cast<ctype>(-1);
             return static_cast<ctype>(0);
         }
-    });
+    }, vecunary::VOp::Sign);
 }
 
 Tensor floor_kernel(const Tensor& self) {
     if (isIntegralType(self.dtype())) return self.clone();
-    return unary_op_kernel(self, [](auto x) { return std::floor(x); });
+    return unary_op_kernel(self, [](auto x) { return std::floor(x); }, vecunary::VOp::Floor);
 }
 
 Tensor ceil_kernel(const Tensor& self) {
     if (isIntegralType(self.dtype())) return self.clone();
-    return unary_op_kernel(self, [](auto x) { return std::ceil(x); });
+    return unary_op_kernel(self, [](auto x) { return std::ceil(x); }, vecunary::VOp::Ceil);
 }
 
 Tensor round_kernel(const Tensor& self) {
     if (isIntegralType(self.dtype())) return self.clone();
     // ATen alignment: round uses nearbyint (round-half-to-even), not roundf
-    return unary_op_kernel(self, [](auto x) { return std::nearbyint(x); });
+    return unary_op_kernel(self, [](auto x) { return std::nearbyint(x); }, vecunary::VOp::Round);
 }
 
 // Float ops
 
-Tensor acos_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::acos(x); }); }
-Tensor acosh_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::acosh(x); }); }
-Tensor asin_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::asin(x); }); }
-Tensor asinh_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::asinh(x); }); }
-Tensor atan_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::atan(x); }); }
-Tensor atanh_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::atanh(x); }); }
-Tensor cos_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::cos(x); }); }
-Tensor cosh_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::cosh(x); }); }
-Tensor sin_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::sin(x); }); }
-Tensor sinh_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::sinh(x); }); }
-Tensor tan_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::tan(x); }); }
-Tensor tanh_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::tanh(x); }); }
-Tensor exp_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::exp(x); }); }
-Tensor expm1_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::expm1(x); }); }
-Tensor erf_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::erf(x); }); }
-Tensor erfc_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::erfc(x); }); }
-Tensor log_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::log(x); }); }
-Tensor log10_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::log10(x); }); }
-Tensor log1p_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::log1p(x); }); }
-Tensor log2_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::log2(x); }); }
-Tensor lgamma_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::lgamma(x); }); }
-Tensor sqrt_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::sqrt(x); }); }
-Tensor rsqrt_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { using T = decltype(x); return static_cast<T>(1) / std::sqrt(x); }); }
-Tensor sigmoid_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { using T = decltype(x); return static_cast<T>(1) / (static_cast<T>(1) + std::exp(-x)); }); }
+Tensor acos_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::acos(x); }, vecunary::VOp::Acos); }
+Tensor acosh_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::acosh(x); }, vecunary::VOp::Acosh); }
+Tensor asin_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::asin(x); }, vecunary::VOp::Asin); }
+Tensor asinh_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::asinh(x); }, vecunary::VOp::Asinh); }
+Tensor atan_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::atan(x); }, vecunary::VOp::Atan); }
+Tensor atanh_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::atanh(x); }, vecunary::VOp::Atanh); }
+Tensor cos_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::cos(x); }, vecunary::VOp::Cos); }
+Tensor cosh_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::cosh(x); }, vecunary::VOp::Cosh); }
+Tensor sin_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::sin(x); }, vecunary::VOp::Sin); }
+Tensor sinh_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::sinh(x); }, vecunary::VOp::Sinh); }
+Tensor tan_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::tan(x); }, vecunary::VOp::Tan); }
+Tensor tanh_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::tanh(x); }, vecunary::VOp::Tanh); }
+Tensor exp_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::exp(x); }, vecunary::VOp::Exp); }
+Tensor expm1_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::expm1(x); }, vecunary::VOp::Expm1); }
+Tensor erf_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::erf(x); }, vecunary::VOp::Erf); }
+Tensor erfc_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::erfc(x); }, vecunary::VOp::Erfc); }
+Tensor log_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::log(x); }, vecunary::VOp::Log); }
+Tensor log10_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::log10(x); }, vecunary::VOp::Log10); }
+Tensor log1p_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::log1p(x); }, vecunary::VOp::Log1p); }
+Tensor log2_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::log2(x); }, vecunary::VOp::Log2); }
+Tensor lgamma_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::lgamma(x); }, vecunary::VOp::Lgamma); }
+Tensor sqrt_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::sqrt(x); }, vecunary::VOp::Sqrt); }
+Tensor rsqrt_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { using T = decltype(x); return static_cast<T>(1) / std::sqrt(x); }, vecunary::VOp::Rsqrt); }
+Tensor sigmoid_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { using T = decltype(x); return static_cast<T>(1) / (static_cast<T>(1) + std::exp(-x)); }, vecunary::VOp::Sigmoid); }
 
 Tensor frac_kernel(const Tensor& self) {
     if (isIntegralType(self.dtype())) {
         TP_THROW(NotImplementedError, "frac is not implemented for integral tensors");
     }
-    return unary_op_kernel(self, [](auto x) { return x - std::trunc(x); });
+    return unary_op_kernel(self, [](auto x) { return x - std::trunc(x); }, vecunary::VOp::Frac);
 }
 
 Tensor trunc_kernel(const Tensor& self) {
     if (isIntegralType(self.dtype())) return self.clone();
-    return unary_op_kernel(self, [](auto x) { return std::trunc(x); });
+    return unary_op_kernel(self, [](auto x) { return std::trunc(x); }, vecunary::VOp::Trunc);
 }
 
 Tensor relu_kernel(const Tensor& self) {
@@ -290,40 +361,20 @@ Tensor relu_kernel(const Tensor& self) {
     }
     #endif
 
-    // Optimized AVX2/AVX512 implementation for Float32
-    if (self.dtype() == DType::Float32 && self.is_contiguous()) {
+    // Vectorized path for contiguous Float32 (see cpu/VecUnary.h).  The old
+    // __AVX512F__/__AVX2__ blocks here were dead code: this TU compiles
+    // without ISA flags, so dispatch goes through VecUnary's per-function
+    // target attributes instead.  Non-AVX2 hosts fall through to the generic
+    // kernel below.
+    if (vecunary::vec_ready() && self.dtype() == DType::Float32 && self.is_contiguous()) {
          Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
          int64_t n = self.numel();
          const float* src = self.data_ptr<float>();
          float* dst = result.data_ptr<float>();
-
-         #if defined(__AVX512F__)
-         __m512 zero = _mm512_setzero_ps();
-         parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-         for (int64_t i = begin; i < end; i += 16) {
-             if (i + 16 <= end) {
-                 __m512 x = _mm512_loadu_ps(src + i);
-                 _mm512_storeu_ps(dst + i, _mm512_max_ps(zero, x));
-             } else {
-                 for (int64_t j = i; j < end; ++j) dst[j] = (src[j] < 0.0f ? 0.0f : src[j]);
-             }
-         }
+         parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) {
+             vecunary::run_f32(vecunary::VOp::Relu, vecunary::VParams{}, src, dst, begin, end);
          });
          return result;
-         #elif defined(__AVX2__)
-         __m256 zero = _mm256_setzero_ps();
-         parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-         for (int64_t i = begin; i < end; i += 8) {
-             if (i + 8 <= end) {
-                 __m256 x = _mm256_loadu_ps(src + i);
-                 _mm256_storeu_ps(dst + i, _mm256_max_ps(zero, x));
-             } else {
-                 for (int64_t j = i; j < end; ++j) dst[j] = (src[j] < 0.0f ? 0.0f : src[j]);
-             }
-         }
-         });
-         return result;
-         #endif
     }
 
     return unary_op_kernel(self, [](auto x) {
@@ -338,46 +389,18 @@ Tensor relu_kernel(const Tensor& self) {
 }
 
 Tensor& relu_inplace_kernel(Tensor& self) {
-    // OneDNN's eltwise primitive does not accept this tensor/layout as both
-    // source and destination.  Trying it first only produces a noisy
-    // exception before reaching the already-optimized direct in-place path.
     // Keep OneDNN for out-of-place ReLU, but use the SIMD/scalar path here.
-    if (self.dtype() == DType::Float32 && self.is_contiguous()) {
-         // Optimized path
+    // Vectorized path for contiguous Float32 (see cpu/VecUnary.h); the old
+    // __AVX512F__/__AVX2__ blocks were dead code in this TU and the #else arm
+    // was a serial full-tensor loop.  Non-AVX2 hosts fall through to the
+    // parallel generic branch below.
+    if (vecunary::vec_ready() && self.dtype() == DType::Float32 && self.is_contiguous()) {
          int64_t n = self.numel();
          float* data = self.data_ptr<float>();
-
-         #if defined(__AVX512F__)
-         __m512 zero = _mm512_setzero_ps();
-         parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-         for (int64_t i = begin; i < end; i += 16) {
-             if (i + 16 <= end) {
-                 __m512 x = _mm512_loadu_ps(data + i);
-                 _mm512_storeu_ps(data + i, _mm512_max_ps(zero, x));
-             } else {
-                 for (int64_t j = i; j < end; ++j) data[j] = (data[j] < 0.0f ? 0.0f : data[j]);
-             }
-         }
+         parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) {
+             vecunary::run_f32(vecunary::VOp::Relu, vecunary::VParams{}, data, data, begin, end);
          });
          return self;
-         #elif defined(__AVX2__)
-         __m256 zero = _mm256_setzero_ps();
-         parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-         for (int64_t i = begin; i < end; i += 8) {
-             if (i + 8 <= end) {
-                 __m256 x = _mm256_loadu_ps(data + i);
-                 _mm256_storeu_ps(data + i, _mm256_max_ps(zero, x));
-             } else {
-                 for (int64_t j = i; j < end; ++j) data[j] = (data[j] < 0.0f ? 0.0f : data[j]);
-             }
-         }
-         });
-         return self;
-         #else
-         // Scalar fallback for contiguous float32
-         for (int64_t i = 0; i < n; ++i) data[i] = (data[i] < 0.0f ? 0.0f : data[i]);
-         return self;
-         #endif
     }
 
     // Generic fallback
@@ -425,7 +448,7 @@ Tensor gelu_kernel(const Tensor& self, const std::string& approximate) {
         using T = decltype(x);
         constexpr T kAlpha = static_cast<T>(0.70710678118654752440); // M_SQRT1_2
         return static_cast<T>(0.5) * x * (static_cast<T>(1) + std::erf(x * kAlpha));
-    });
+    }, vecunary::VOp::GeluNone);
 }
 
 Tensor gelu_backward_kernel(const Tensor& grad_output, const Tensor& self, const std::string& approximate) {
@@ -437,7 +460,7 @@ Tensor silu_kernel(const Tensor& self) {
     return unary_float_op_kernel(self, [](auto x) {
         using T = decltype(x);
         return x / (static_cast<T>(1) + std::exp(-x));
-    });
+    }, vecunary::VOp::Silu);
 }
 
 // ---------------------------------------------------------------------------
@@ -530,7 +553,7 @@ Tensor gelu_tanh_impl(const Tensor& self) {
     return unary_float_op_kernel(self, [](auto x) {
         using T = decltype(x);
         return static_cast<T>(gelu_tanh_scalar(static_cast<float>(x)));
-    });
+    }, vecunary::VOp::GeluTanh);
 }
 
 Tensor gelu_backward_impl(const Tensor& grad_output, const Tensor& self, const std::string& approximate) {
@@ -544,12 +567,15 @@ Tensor gelu_backward_impl(const Tensor& grad_output, const Tensor& self, const s
 
 Tensor hardtanh_kernel_impl(const Tensor& self, Scalar min_val, Scalar max_val) {
     // ATen Activation.cpp hardtanh: std::clamp(x, min_val, max_val)
+    vecunary::VParams prm;
+    prm.p0 = min_val.toDouble();
+    prm.p1 = max_val.toDouble();
     return unary_float_op_kernel(self, [min_val, max_val](auto x) {
         using T = decltype(x);
         T lo = static_cast<T>(min_val.toDouble());
         T hi = static_cast<T>(max_val.toDouble());
         return x < lo ? lo : (x > hi ? hi : x);
-    });
+    }, vecunary::VOp::Hardtanh, prm);
 }
 
 Tensor hardtanh_backward_kernel_impl(const Tensor& grad_output, const Tensor& self, Scalar min_val, Scalar max_val) {
@@ -572,7 +598,7 @@ Tensor hardswish_kernel_impl(const Tensor& self) {
         T xf = static_cast<T>(static_cast<float>(x));
         T clamped = (xf + T(3) < T(0)) ? T(0) : (xf + T(3) > T(6)) ? T(6) : xf + T(3);
         return xf * clamped / T(6);
-    });
+    }, vecunary::VOp::Hardswish);
 }
 
 Tensor hardswish_backward_kernel_impl(const Tensor& grad_output, const Tensor& self) {
@@ -594,7 +620,7 @@ Tensor hardsigmoid_kernel_impl(const Tensor& self) {
         T v = xf + T(3);
         v = v < T(0) ? T(0) : (v > T(6) ? T(6) : v);
         return v / T(6);
-    });
+    }, vecunary::VOp::Hardsigmoid);
 }
 
 Tensor hardsigmoid_backward_kernel_impl(const Tensor& grad_output, const Tensor& self) {
@@ -610,11 +636,13 @@ Tensor hardsigmoid_backward_kernel_impl(const Tensor& grad_output, const Tensor&
 Tensor leaky_relu_kernel_impl(const Tensor& self, Scalar negative_slope) {
     // ATen Activation.cpp leaky_relu_kernel: x >= 0 ? x : negative_slope * x
     double slope = negative_slope.toDouble();
+    vecunary::VParams prm;
+    prm.p0 = slope;
     return unary_float_op_kernel(self, [slope](auto x) {
         using T = decltype(x);
         T xf = static_cast<T>(static_cast<float>(x));
         return xf < T(0) ? static_cast<T>(slope) * xf : xf;
-    });
+    }, vecunary::VOp::LeakyRelu, prm);
 }
 
 Tensor leaky_relu_backward_kernel_impl(const Tensor& grad_output, const Tensor& self, Scalar negative_slope, bool self_is_result) {
@@ -631,13 +659,17 @@ Tensor elu_kernel_impl(const Tensor& self, Scalar alpha, Scalar scale, Scalar in
     double negcoef = alpha.toDouble() * scale.toDouble();
     double poscoef = scale.toDouble();
     double negiptcoef = input_scale.toDouble();
+    vecunary::VParams prm; // p0=alpha*scale, p1=scale, p2=input_scale
+    prm.p0 = negcoef;
+    prm.p1 = poscoef;
+    prm.p2 = negiptcoef;
     return unary_float_op_kernel(self, [negcoef, poscoef, negiptcoef](auto x) {
         using T = decltype(x);
         T a = static_cast<T>(static_cast<float>(x));
         return a < T(0)
             ? static_cast<T>(std::expm1(static_cast<float>(a) * static_cast<float>(negiptcoef)) * static_cast<float>(negcoef))
             : a * static_cast<T>(poscoef);
-    });
+    }, vecunary::VOp::Elu, prm);
 }
 
 Tensor elu_backward_kernel_impl(const Tensor& grad_output, Scalar alpha, Scalar scale, Scalar input_scale, bool is_result, const Tensor& self_or_result) {
@@ -664,7 +696,7 @@ Tensor mish_kernel_impl(const Tensor& self) {
         T xf = static_cast<T>(static_cast<float>(x));
         T sp = std::log(T(1) + std::exp(xf));
         return xf * std::tanh(sp);
-    });
+    }, vecunary::VOp::Mish);
 }
 
 Tensor mish_backward_kernel_impl(const Tensor& grad_output, const Tensor& self) {
@@ -692,17 +724,19 @@ Tensor selu_kernel_impl(const Tensor& self) {
         T a = static_cast<T>(static_cast<float>(x));
         return a > T(0) ? a * static_cast<T>(lambda_)
                         : static_cast<T>(alpha_ * lambda_) * std::expm1(a);
-    });
+    }, vecunary::VOp::Selu);
 }
 
 Tensor celu_kernel_impl(const Tensor& self, Scalar alpha) {
     // ATen Activation.h celu: max(0,x) + min(0, alpha * expm1(x / alpha))
     double a = alpha.toDouble();
+    vecunary::VParams prm;
+    prm.p0 = a;
     return unary_float_op_kernel(self, [a](auto x) {
         using T = decltype(x);
         T af = static_cast<T>(static_cast<float>(x));
         return af > T(0) ? af : static_cast<T>(a) * (std::expm1(af / static_cast<T>(a)));
-    });
+    }, vecunary::VOp::Celu, prm);
 }
 
 Tensor softplus_kernel_impl(const Tensor& self, Scalar beta, Scalar threshold) {
@@ -710,6 +744,9 @@ Tensor softplus_kernel_impl(const Tensor& self, Scalar beta, Scalar threshold) {
     //   beta_in * a > threshold ? a : log1p(exp(beta_in * a)) / beta_in
     double beta_in = beta.toDouble();
     double threshold_in = threshold.toDouble();
+    vecunary::VParams prm; // p0=beta_in, p1=threshold_in
+    prm.p0 = beta_in;
+    prm.p1 = threshold_in;
     return unary_float_op_kernel(self, [beta_in, threshold_in](auto x) {
         using T = decltype(x);
         T a = static_cast<T>(static_cast<float>(x));
@@ -717,7 +754,7 @@ Tensor softplus_kernel_impl(const Tensor& self, Scalar beta, Scalar threshold) {
         return a * beta_in_t > static_cast<T>(threshold_in)
             ? a
             : static_cast<T>(std::log1p(std::exp(static_cast<float>(a * beta_in_t))) / beta_in);
-    });
+    }, vecunary::VOp::Softplus, prm);
 }
 
 Tensor softplus_backward_kernel_impl(const Tensor& grad_output, const Tensor& self, Scalar beta, Scalar threshold) {

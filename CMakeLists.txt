@@ -260,6 +260,7 @@ set(GEN_INCLUDE_DIR "${GEN_BASE_DIR}/tensorplay/ops")
 set(GEN_HEADER "${GEN_INCLUDE_DIR}/TensorGenerated.h")
 set(GEN_CPP "${GEN_INCLUDE_DIR}/TensorGenerated.cpp")
 set(GEN_BINDINGS_HEADER "${GEN_INCLUDE_DIR}/TensorBindingsGenerated.h")
+set(GEN_CPYTHON_HEADER "${GEN_INCLUDE_DIR}/TensorCPythonGenerated.h")
 set(GEN_AUTOGRAD_NODES_H "${GEN_INCLUDE_DIR}/AutogradNodesGenerated.h")
 set(GEN_TPX_OPS_H "${GEN_INCLUDE_DIR}/TPXOpsGenerated.h")
 set(GEN_TPX_OPS_CPP "${GEN_INCLUDE_DIR}/TPXOpsGenerated.cpp")
@@ -710,6 +711,7 @@ file(WRITE "${GEN_BASE_DIR}/tensorplay/ops/Config.h" "${CONFIG_CONTENT}")
 # Code generation
 add_custom_command(
             OUTPUT ${GEN_HEADER} ${GEN_CPP} ${GEN_BINDINGS_HEADER}
+                   ${GEN_CPYTHON_HEADER}
                    ${GEN_AUTOGRAD_NODES_H} ${GEN_TPX_OPS_H} ${GEN_TPX_OPS_CPP}
                    ${GEN_TPX_AUTOGRAD_REG_CPP} ${GEN_AUTOCAST_CPP} ${GEN_TPX_REDISPATCH_H}
             COMMAND ${CMAKE_COMMAND} -E env PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR} ${Python_EXECUTABLE} -m tools.codegen.main
@@ -760,8 +762,9 @@ add_subdirectory(tpx)
 add_subdirectory(stax)
 
 # Python Bindings
-pybind11_add_module(_C 
+pybind11_add_module(_C
     src/bindings/python/init.cpp
+    src/bindings/python/CPythonBridge.cpp
     src/bindings/python/DType.cpp
     src/bindings/python/Scalar.cpp
     src/bindings/python/Device.cpp
@@ -796,6 +799,7 @@ endif()
 target_include_directories(_C PRIVATE
     ${GEN_BASE_DIR}
     include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/bindings/python
     ${CMAKE_CURRENT_SOURCE_DIR}/p10/src/backend/cuda
 )
 

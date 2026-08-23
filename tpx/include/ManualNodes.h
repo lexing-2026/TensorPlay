@@ -1,6 +1,7 @@
 #pragma once
 #include "Node.h"
 #include "Autograd.h"
+#include "SavedVariable.h"
 #include <tuple>
 #include <utility>
 
@@ -102,9 +103,9 @@ struct AsStridedBackward : public Node {
 // of evaluating the expensive native backward three times (one per input),
 // which is particularly important for Llama training.
 struct ScaledDotProductAttentionBackward : public Node {
-    Tensor query_;
-    Tensor key_;
-    Tensor value_;
+    SavedVariable query_;
+    SavedVariable key_;
+    SavedVariable value_;
     bool is_causal_;
     int64_t impl_;
 
@@ -117,9 +118,19 @@ struct ScaledDotProductAttentionBackward : public Node {
         if (inputs.empty() || !inputs[0].defined()) {
             return {Tensor(), Tensor(), Tensor()};
         }
+        const Tensor query = query_.unpack();
+        const Tensor key = key_.unpack();
+        const Tensor value = value_.unpack();
         auto grads = Tensor::scaled_dot_product_attention_backward(
-            inputs[0], query_, key_, value_, is_causal_, impl_);
+            inputs[0], query, key, value, is_causal_, impl_);
         return {std::get<0>(grads), std::get<1>(grads), std::get<2>(grads)};
+    }
+
+    void release_variables() override {
+        Node::release_variables();
+        query_.reset_data();
+        key_.reset_data();
+        value_.reset_data();
     }
 };
 
@@ -128,24 +139,32 @@ struct ScaledDotProductAttentionBackward : public Node {
 // cast in the manual node so a float32 reduction of an fp16/bf16 tensor does
 // not leak a float32 gradient into the leaf or into the SDPA backward node.
 struct MeanBackward : public Node {
-    Tensor self_;
+    SavedVariable self_;
 
     explicit MeanBackward(Tensor self) : self_(std::move(self)) {}
 
     variable_list apply(variable_list&& inputs) override {
         if (inputs.empty() || !inputs[0].defined()) return {Tensor()};
-        Tensor grad = inputs[0].expand(self_.shape());
-        if (grad.dtype() != self_.dtype()) grad = grad.to(self_.dtype());
-        return {grad / Scalar(static_cast<float>(self_.numel()))};
+        const Tensor self = self_.unpack();
+        Tensor grad = inputs[0].expand(self.shape());
+        if (grad.dtype() != self.dtype()) grad = grad.to(self.dtype());
+        return {grad / Scalar(static_cast<float>(self.numel()))};
+    }
+
+    void release_variables() override {
+        Node::release_variables();
+        self_.reset_data();
     }
 };
 
 struct CatBackward : public Node {
-    std::vector<Tensor> tensors_;
+    std::vector<SavedVariable> tensors_;
     int64_t dim_;
 
-    CatBackward(std::vector<Tensor> tensors, int64_t dim)
-        : tensors_(std::move(tensors)), dim_(dim) {}
+    CatBackward(std::vector<Tensor> tensors, int64_t dim) : dim_(dim) {
+        tensors_.reserve(tensors.size());
+        for (auto& t : tensors) tensors_.emplace_back(std::move(t));
+    }
 
     variable_list apply(variable_list&& inputs) override {
         if (inputs.empty() || !inputs[0].defined()) {
@@ -156,12 +175,18 @@ struct CatBackward : public Node {
         int64_t offset = 0;
         variable_list grads;
         grads.reserve(tensors_.size());
-        for (const auto& tensor : tensors_) {
+        for (const auto& saved : tensors_) {
+            const Tensor tensor = saved.unpack();
             const int64_t size = tensor.size(dim);
             grads.push_back(grad.slice(dim, offset, offset + size));
             offset += size;
         }
         return grads;
+    }
+
+    void release_variables() override {
+        Node::release_variables();
+        for (auto& saved : tensors_) saved.reset_data();
     }
 };
 
@@ -188,11 +213,13 @@ struct RollBackward : public Node {
 };
 
 struct StackBackward : public Node {
-    std::vector<Tensor> tensors_;
+    std::vector<SavedVariable> tensors_;
     int64_t dim_;
 
-    StackBackward(std::vector<Tensor> tensors, int64_t dim)
-        : tensors_(std::move(tensors)), dim_(dim) {}
+    StackBackward(std::vector<Tensor> tensors, int64_t dim) : dim_(dim) {
+        tensors_.reserve(tensors.size());
+        for (auto& t : tensors) tensors_.emplace_back(std::move(t));
+    }
 
     variable_list apply(variable_list&& inputs) override {
         if (inputs.empty() || !inputs[0].defined()) {
@@ -206,6 +233,11 @@ struct StackBackward : public Node {
             grads.push_back(grad.select(dim, static_cast<int64_t>(i)));
         }
         return grads;
+    }
+
+    void release_variables() override {
+        Node::release_variables();
+        for (auto& saved : tensors_) saved.reset_data();
     }
 };
 

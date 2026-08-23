@@ -67,7 +67,10 @@ def _arg_expr(policy: str, a) -> str:
     if policy == 'fp32_set_opt_dtype':
         if a.type.kind == 'DType':
             return f'::tensorplay::autocast::set_opt_dtype(DType::Float32, {a.name})'
-        return a.name
+        # Upstream casts every tensor arg to fp32 so reductions accumulate in
+        # float; passing them raw leaves the ToCopy node out of the graph and
+        # backward then hands a float grad to a lower-precision node.
+        return f'::tensorplay::autocast::cached_cast(DType::Float32, {a.name}, __device_type)'
     return a.name
 
 
@@ -157,8 +160,14 @@ def generate_autocast_registration(funcs: list[NativeFunction]) -> str:
             seen.add(name)
 
     lines += ['} // anonymous namespace', '']
-    for device_key, lib_name in (('CPU', 'AutocastKernelsCPU'), ('CUDA', 'AutocastKernelsCUDA')):
-        lines.append(f'TENSORPLAY_LIBRARY_IMPL({device_key}, {lib_name}) {{')
+    # Upstream registers these under TORCH_LIBRARY_IMPL(aten, AutocastCPU/CUDA);
+    # the library KEY must be the Autocast key -- registering under the bare
+    # backend key would shadow the real CPU/CUDA kernels and recurse forever.
+    for device_key, lib_key, lib_name in (
+        ('CPU', 'AutocastCPU', 'AutocastKernelsCPU'),
+        ('CUDA', 'AutocastCUDA', 'AutocastKernelsCUDA'),
+    ):
+        lines.append(f'TENSORPLAY_LIBRARY_IMPL({lib_key}, {lib_name}) {{')
         for name, kernel, key in kernels:
             if key != device_key:
                 continue

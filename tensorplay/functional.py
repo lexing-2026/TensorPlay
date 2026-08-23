@@ -806,7 +806,7 @@ def rand_like(input, dtype=DType.undefined, device=None, requires_grad=False):
         return _captured
     return _C.rand_like(self=input, dtype=dtype, device=device, requires_grad=requires_grad)
 
-def randint(low, high, size, dtype=DType.int64, device=..., requires_grad=False):
+def randint(low, high, size, dtype=DType.int64, device=None, requires_grad=False):
     _captured = _capture_call(randint, (low, high, size, dtype, device, requires_grad), {})
     if _captured is not None:
         return _captured
@@ -834,7 +834,7 @@ def randn_like(input, dtype=DType.undefined, device=None, requires_grad=False):
         return _captured
     return _C.randn_like(self=input, dtype=dtype, device=device, requires_grad=requires_grad)
 
-def randperm(n, dtype=DType.int64, device=..., requires_grad=False):
+def randperm(n, dtype=DType.int64, device=None, requires_grad=False):
     _captured = _capture_call(randperm, (n, dtype, device, requires_grad), {})
     if _captured is not None:
         return _captured
@@ -845,6 +845,15 @@ def bernoulli(input):
     if _captured is not None:
         return _captured
     return _C.bernoulli(self=input)
+
+def native_dropout(input, p):
+    _captured = _capture_call(native_dropout, (input, p), {})
+    if _captured is not None:
+        return _captured
+    return _C.native_dropout(input=input, p=p)
+
+def resize_(input, size):
+    return input.resize_(size=size)
 
 def normal(mean, std):
     _captured = _capture_call(normal, (mean, std), {})
@@ -1167,7 +1176,7 @@ def empty(*size, dtype=DType.float32, device=None, pin_memory=False, requires_gr
         return _captured
     return _C.empty(size=list(_size), dtype=dtype, device=_ensure_device(device), pin_memory=pin_memory, requires_grad=requires_grad)
 
-def full(size, fill_value, dtype=DType.undefined, device=..., pin_memory=False, requires_grad=False):
+def full(size, fill_value, dtype=DType.undefined, device=None, pin_memory=False, requires_grad=False):
     _captured = _capture_call(full, (size, fill_value, dtype, device, pin_memory, requires_grad), {})
     if _captured is not None:
         return _captured
@@ -1195,7 +1204,7 @@ def ones(*size, dtype=DType.float32, device=None, pin_memory=False, requires_gra
         return _captured
     return _C.ones(size=list(_size), dtype=dtype, device=_ensure_device(device), pin_memory=pin_memory, requires_grad=requires_grad)
 
-def eye(n, m=-1, dtype=DType.float32, device=..., requires_grad=False):
+def eye(n, m=-1, dtype=DType.float32, device=None, requires_grad=False):
     _captured = _capture_call(eye, (n, m, dtype, device, requires_grad), {})
     if _captured is not None:
         return _captured
@@ -1214,7 +1223,7 @@ def arange(*args, dtype=DType.undefined, device=None, requires_grad=False):
     else:
         raise TypeError(f'arange expected 1-3 positional arguments, got {len(args)}')
 
-def linspace(start, end, steps, dtype=DType.float32, device=..., requires_grad=False):
+def linspace(start, end, steps, dtype=DType.float32, device=None, requires_grad=False):
     _captured = _capture_call(linspace, (start, end, steps, dtype, device, requires_grad), {})
     if _captured is not None:
         return _captured
@@ -1224,7 +1233,7 @@ def linspace(start, end, steps, dtype=DType.float32, device=..., requires_grad=F
         end = tensorplay.Scalar(end)
     return _C.linspace(start=start, end=end, steps=steps, dtype=dtype, device=_ensure_device(device), requires_grad=requires_grad)
 
-def logspace(start, end, steps, base=10.0, dtype=DType.float32, device=..., requires_grad=False):
+def logspace(start, end, steps, base=10.0, dtype=DType.float32, device=None, requires_grad=False):
     _captured = _capture_call(logspace, (start, end, steps, base, dtype, device, requires_grad), {})
     if _captured is not None:
         return _captured
@@ -3092,4 +3101,160 @@ def polygamma(n, input):
     if _captured is not None:
         return _captured
     return _C.polygamma(n=n, self=input)
+
+def sparse_coo_tensor(indices, values, size=None, is_coalesced=False):
+    _captured = _capture_call(sparse_coo_tensor, (indices, values, size, is_coalesced), {})
+    if _captured is not None:
+        return _captured
+    return _C.sparse_coo_tensor(indices=indices, values=values, size=size, is_coalesced=is_coalesced)
+
+def to_dense(input):
+    _captured = _capture_call(to_dense, (input,), {})
+    if _captured is not None:
+        return _captured
+    return _C.to_dense(self=input)
+
+def to_sparse(input):
+    _captured = _capture_call(to_sparse, (input,), {})
+    if _captured is not None:
+        return _captured
+    return _C.to_sparse(self=input)
+
+def to_sparse_csr(input):
+    _captured = _capture_call(to_sparse_csr, (input,), {})
+    if _captured is not None:
+        return _captured
+    return _C.to_sparse_csr(self=input)
+
+def _nnz(input):
+    _captured = _capture_call(_nnz, (input,), {})
+    if _captured is not None:
+        return _captured
+    return _C._nnz(self=input)
+
+def sparse_mm(input, dense):
+    _captured = _capture_call(sparse_mm, (input, dense), {})
+    if _captured is not None:
+        return _captured
+    return _C.sparse_mm(self=input, dense=dense)
+
+def sparse_sum(input):
+    _captured = _capture_call(sparse_sum, (input,), {})
+    if _captured is not None:
+        return _captured
+    return _C.sparse_sum(self=input)
+
+def quantize_per_tensor(input, scale, zero_point, quant_min=-128, quant_max=127):
+    _captured = _capture_call(quantize_per_tensor, (input, scale, zero_point, quant_min, quant_max), {})
+    if _captured is not None:
+        return _captured
+    return _C.quantize_per_tensor(self=input, scale=scale, zero_point=zero_point, quant_min=quant_min, quant_max=quant_max)
+
+def dequantize_per_tensor(input, scale, zero_point):
+    _captured = _capture_call(dequantize_per_tensor, (input, scale, zero_point), {})
+    if _captured is not None:
+        return _captured
+    return _C.dequantize_per_tensor(self=input, scale=scale, zero_point=zero_point)
+
+def quantize_per_channel(input, scales, zero_points, axis=0):
+    _captured = _capture_call(quantize_per_channel, (input, scales, zero_points, axis), {})
+    if _captured is not None:
+        return _captured
+    return _C.quantize_per_channel(self=input, scales=scales, zero_points=zero_points, axis=axis)
+
+def dequantize_per_channel(input, scales, zero_points, axis=0):
+    _captured = _capture_call(dequantize_per_channel, (input, scales, zero_points, axis), {})
+    if _captured is not None:
+        return _captured
+    return _C.dequantize_per_channel(self=input, scales=scales, zero_points=zero_points, axis=axis)
+
+def forward_neg(a, da):
+    _captured = _capture_call(forward_neg, (a, da), {})
+    if _captured is not None:
+        return _captured
+    return _C.forward_neg(a=a, da=da)
+
+def forward_exp(a, da):
+    _captured = _capture_call(forward_exp, (a, da), {})
+    if _captured is not None:
+        return _captured
+    return _C.forward_exp(a=a, da=da)
+
+def forward_log(a, da):
+    _captured = _capture_call(forward_log, (a, da), {})
+    if _captured is not None:
+        return _captured
+    return _C.forward_log(a=a, da=da)
+
+def forward_sin(a, da):
+    _captured = _capture_call(forward_sin, (a, da), {})
+    if _captured is not None:
+        return _captured
+    return _C.forward_sin(a=a, da=da)
+
+def forward_cos(a, da):
+    _captured = _capture_call(forward_cos, (a, da), {})
+    if _captured is not None:
+        return _captured
+    return _C.forward_cos(a=a, da=da)
+
+def forward_sqrt(a, da):
+    _captured = _capture_call(forward_sqrt, (a, da), {})
+    if _captured is not None:
+        return _captured
+    return _C.forward_sqrt(a=a, da=da)
+
+def forward_tanh(a, da):
+    _captured = _capture_call(forward_tanh, (a, da), {})
+    if _captured is not None:
+        return _captured
+    return _C.forward_tanh(a=a, da=da)
+
+def forward_sigmoid(a, da):
+    _captured = _capture_call(forward_sigmoid, (a, da), {})
+    if _captured is not None:
+        return _captured
+    return _C.forward_sigmoid(a=a, da=da)
+
+def forward_relu(a, da):
+    _captured = _capture_call(forward_relu, (a, da), {})
+    if _captured is not None:
+        return _captured
+    return _C.forward_relu(a=a, da=da)
+
+def forward_add(a, da, b, db):
+    _captured = _capture_call(forward_add, (a, da, b, db), {})
+    if _captured is not None:
+        return _captured
+    return _C.forward_add(a=a, da=da, b=b, db=db)
+
+def forward_sub(a, da, b, db):
+    _captured = _capture_call(forward_sub, (a, da, b, db), {})
+    if _captured is not None:
+        return _captured
+    return _C.forward_sub(a=a, da=da, b=b, db=db)
+
+def forward_mul(a, da, b, db):
+    _captured = _capture_call(forward_mul, (a, da, b, db), {})
+    if _captured is not None:
+        return _captured
+    return _C.forward_mul(a=a, da=da, b=b, db=db)
+
+def forward_div(a, da, b, db):
+    _captured = _capture_call(forward_div, (a, da, b, db), {})
+    if _captured is not None:
+        return _captured
+    return _C.forward_div(a=a, da=da, b=b, db=db)
+
+def forward_pow(a, da, b, db):
+    _captured = _capture_call(forward_pow, (a, da, b, db), {})
+    if _captured is not None:
+        return _captured
+    return _C.forward_pow(a=a, da=da, b=b, db=db)
+
+def forward_mm(a, da, b, db):
+    _captured = _capture_call(forward_mm, (a, da, b, db), {})
+    if _captured is not None:
+        return _captured
+    return _C.forward_mm(a=a, da=da, b=b, db=db)
 

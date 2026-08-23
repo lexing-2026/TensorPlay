@@ -18,6 +18,13 @@
 
 namespace tensorplay {
 
+namespace autocast {
+// Declared here (defined in autocast_mode.cpp) so the dispatch choke point can
+// consult autocast state without pulling autocast_mode.h -- and its Tensor.h
+// dependency -- into every dispatcher user.
+P10_API bool is_enabled(DispatchKey autocast_key);
+} // namespace autocast
+
 // Helper to determine the backend dispatch key for a device
 inline DispatchKey computeDispatchKey(const Device& device) {
     if (device.is_cuda()) return DispatchKey::CUDA;
@@ -104,6 +111,14 @@ template<typename Return, typename... Args>
 class DispatchStub {
 public:
     static Return call(const OperatorHandle& handle, DispatchKey key, Args... args) {
+        // Choke-point enforcement of the autocast exclusion contract: a
+        // disabled Autocast key behaves as if no kernel were registered, no
+        // matter which path reached here. Non-autocast keys pay one predicted
+        // range compare.
+        if (is_autocast_key(key) && !autocast::is_enabled(key)) [[unlikely]] {
+            TP_THROW(NotImplementedError, "Autocast kernel dispatched while autocast is disabled for op: " +
+                std::string(handle.name()) + " on key: " + toString(key));
+        }
         auto kernel_void = handle.getKernel(key);
         if (!kernel_void) {
             TP_THROW(NotImplementedError, "Kernel not found for op: " +

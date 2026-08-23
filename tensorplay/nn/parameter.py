@@ -1,5 +1,4 @@
 from typing import Any
-from abc import ABCMeta
 import tensorplay as tp
 from tensorplay import Tensor
 
@@ -49,7 +48,7 @@ class Parameter(Tensor):
             (self.data, self.requires_grad)
         )
 
-class UninitializedTensorMixin(metaclass=ABCMeta):
+class UninitializedTensorMixin:
     def materialize(self, shape, device=None, dtype=None):
         r"""Create a Parameter or Tensor with the same properties of the uninitialized one.
 
@@ -109,7 +108,7 @@ def is_lazy(param: Any) -> bool:
     return isinstance(param, UninitializedTensorMixin)
 
 
-class UninitializedParameter(Parameter):
+class UninitializedParameter(UninitializedTensorMixin, Parameter):
     r"""A parameter that is not initialized.
 
     Uninitialized Parameters are a special case of :class:`tensorplay.nn.Parameter`
@@ -133,26 +132,6 @@ class UninitializedParameter(Parameter):
         factory_kwargs = {k: v for k, v in factory_kwargs.items() if v is not None}
         data = tp.empty(0, **factory_kwargs)
         super().__init__(data, requires_grad)
-
-    # Mixin methods copied due to nanobind multiple inheritance limitation
-    def materialize(self, shape, device=None, dtype=None):
-        UninitializedTensorMixin.materialize(self, shape, device, dtype)
-
-    @property
-    def shape(self):
-        return UninitializedTensorMixin.shape.fget(self)
-
-    def share_memory_(self):
-        UninitializedTensorMixin.share_memory_(self)
-
-    def __repr__(self):
-        return UninitializedTensorMixin.__repr__(self)
-
-    def __reduce_ex__(self, proto):
-        return UninitializedTensorMixin.__reduce_ex__(self, proto)
-
-# Register as virtual subclass
-UninitializedTensorMixin.register(UninitializedParameter)
 
 
 class Buffer(Tensor):
@@ -192,7 +171,7 @@ class Buffer(Tensor):
 class _MaterializedTensor(Tensor):
     pass
 
-class UninitializedBuffer(Tensor):
+class UninitializedBuffer(UninitializedTensorMixin, Tensor):
     r"""A buffer that is not initialized.
 
     Uninitialized Buffer is a a special case of :class:`tensorplay.Tensor`
@@ -200,7 +179,7 @@ class UninitializedBuffer(Tensor):
 
     Unlike a :class:`tensorplay.Tensor`, uninitialized parameters
     hold no data and attempting to access some properties, like their shape,
-    will throw a runtime error. The only operations that can be performed on a uninitialized
+    will throw a runtime error. The only operations that can be performed on an uninitialized
     parameter are changing its datatype, moving it to a different device and
     converting it to a regular :class:`tensorplay.Tensor`.
 
@@ -219,23 +198,3 @@ class UninitializedBuffer(Tensor):
         self.requires_grad = requires_grad
         self.persistent = persistent
         self._is_buffer = True
-
-    # Mixin methods copied due to nanobind multiple inheritance limitation
-    def materialize(self, shape, device=None, dtype=None):
-        UninitializedTensorMixin.materialize(self, shape, device, dtype)
-
-    @property
-    def shape(self):
-        return UninitializedTensorMixin.shape.fget(self)
-
-    def share_memory_(self):
-        UninitializedTensorMixin.share_memory_(self)
-
-    def __repr__(self):
-        return UninitializedTensorMixin.__repr__(self)
-
-    def __reduce_ex__(self, proto):
-        return UninitializedTensorMixin.__reduce_ex__(self, proto)
-
-# Register as virtual subclass
-UninitializedTensorMixin.register(UninitializedBuffer)

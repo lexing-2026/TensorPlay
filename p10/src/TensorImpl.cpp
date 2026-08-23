@@ -7,9 +7,19 @@
 
 namespace tensorplay {
 
-TensorImpl::TensorImpl() 
+const char* toString(MemoryFormat format) {
+    switch (format) {
+        case MemoryFormat::Contiguous: return "Contiguous";
+        case MemoryFormat::Preserve: return "Preserve";
+        case MemoryFormat::ChannelsLast: return "ChannelsLast";
+        case MemoryFormat::ChannelsLast3d: return "ChannelsLast3d";
+    }
+    return "Unknown";
+}
+
+TensorImpl::TensorImpl()
     : storage_offset_(0), dtype_(DType::Float32), device_(DeviceType::CPU),
-      is_contiguous_(true), is_channels_last_(false) {
+      is_contiguous_(true) {
     shared_state_ = std::make_shared<SharedState>();
 }
 
@@ -19,7 +29,7 @@ TensorImpl::TensorImpl(const std::vector<int64_t>& sizes, DType dtype, const Dev
 TensorImpl::TensorImpl(const std::vector<int64_t>& sizes, DType dtype,
                        const Device& device, bool allocate_storage)
     : storage_offset_(0), sizes_and_strides_(sizes), dtype_(dtype), device_(device),
-      is_contiguous_(true), is_channels_last_(false) {
+      is_contiguous_(true) {
     
     shared_state_ = std::make_shared<SharedState>();
     int64_t num_elements = sizes_and_strides_.numel();
@@ -33,7 +43,7 @@ TensorImpl::TensorImpl(const std::vector<int64_t>& sizes, DType dtype,
 
 TensorImpl::TensorImpl(const std::vector<int64_t>& sizes, const std::vector<int64_t>& strides, DType dtype, const Device& device)
     : storage_offset_(0), sizes_and_strides_(sizes, strides), dtype_(dtype), device_(device),
-      is_contiguous_(false), is_channels_last_(false) {
+      is_contiguous_(false) {
     
     shared_state_ = std::make_shared<SharedState>();
     is_contiguous_ = sizes_and_strides_.is_contiguous();
@@ -49,7 +59,7 @@ TensorImpl::TensorImpl(const std::vector<int64_t>& sizes, const std::vector<int6
 
 TensorImpl::TensorImpl(Storage storage, const std::vector<int64_t>& sizes, DType dtype, size_t storage_offset)
     : storage_offset_(storage_offset), sizes_and_strides_(sizes), dtype_(dtype),
-      device_(storage.device()), is_contiguous_(true), is_channels_last_(false) {
+      device_(storage.device()), is_contiguous_(true) {
     
     shared_state_ = std::make_shared<SharedState>();
     shared_state_->storage = storage;
@@ -58,7 +68,7 @@ TensorImpl::TensorImpl(Storage storage, const std::vector<int64_t>& sizes, DType
 
 TensorImpl::TensorImpl(Storage storage, const std::vector<int64_t>& sizes, const std::vector<int64_t>& strides, DType dtype, size_t storage_offset)
     : storage_offset_(storage_offset), sizes_and_strides_(sizes, strides), dtype_(dtype),
-      device_(storage.device()), is_contiguous_(false), is_channels_last_(false) {
+      device_(storage.device()), is_contiguous_(false) {
       
     shared_state_ = std::make_shared<SharedState>();
     shared_state_->storage = storage;
@@ -74,7 +84,7 @@ TensorImpl::TensorImpl(const TensorImpl& other)
       device_(other.device_),
       version_counter_(other.version_counter_),
       is_contiguous_(other.is_contiguous_),
-      is_channels_last_(other.is_channels_last_),
+      memory_format_(other.memory_format_),
       shared_state_(other.shared_state_),
       sparse_state_(other.sparse_state_) {}
 TensorImpl::TensorImpl(TensorImpl&& other) noexcept = default;
@@ -155,7 +165,7 @@ void TensorImpl::copy_metadata_from(const TensorImpl& other) {
     dtype_ = other.dtype_;
     device_ = other.device_;
     is_contiguous_ = other.is_contiguous_;
-    is_channels_last_ = other.is_channels_last_;
+    memory_format_ = other.memory_format_;
     sparse_state_ = other.sparse_state_;
     // onednn_md_ = other.onednn_md_; // Replaced by shared_state_
 }

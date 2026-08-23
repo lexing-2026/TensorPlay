@@ -1,5 +1,6 @@
 #include "autocast_mode.h"
 #include "autocast_cast.h"
+#include "Autograd.h"
 
 namespace tensorplay {
 namespace autocast {
@@ -18,14 +19,14 @@ Tensor cached_cast(DType to_type, const Tensor& arg, DeviceType device_type) {
             if (hit.defined()) {
                 return hit;
             }
-            // The cast is differentiable through `to` (ToCopyBackward), so the
-            // cached tensor always carries a grad_fn and can be reused in
-            // grad-enabled contexts.
-            Tensor casted_arg = arg.to(to_type);
+            // The cast must be differentiable (ToCopyBackward), so route it
+            // through tpx::to -- the raw Tensor::to bypasses autograd and
+            // would silently cut the graph at every autocast boundary.
+            Tensor casted_arg = tpx::to(arg, to_type);
             cache_store(arg.unsafeGetTensorImpl().get(), arg, casted_arg);
             return casted_arg;
         } else {
-            return arg.to(to_type);
+            return tpx::to(arg, to_type);
         }
     } else {
         return arg;

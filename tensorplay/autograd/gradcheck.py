@@ -14,6 +14,10 @@ from itertools import product
 
 import tensorplay
 
+# Upstream uses the C++ torch._C._functions.UndefinedGrad here; this repo has
+# no such binding yet, so the ported Python subclass stands in for it.
+from .function import Function
+
 
 # Note: `get_*_jacobian` functions are added here even though we didn't intend to make them public
 # since they have been exposed from before we added `__all__`  and we already maintain BC for them
@@ -57,7 +61,7 @@ class GradcheckError(RuntimeError):
     r"""Error raised by :func:`gradcheck` and :func:`gradgradcheck`."""
 
 
-class _UndefinedGrad(tensorplay.autograd.Function):
+class _UndefinedGrad(Function):
     # Port of torch._C._functions.UndefinedGrad: passes the input through in
     # the forward but makes backward *ignore* whatever gradient it receives
     # and propagate undefined (None) grads instead. Used by gradcheck to test
