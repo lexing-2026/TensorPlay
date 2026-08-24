@@ -643,6 +643,65 @@ Tensor Tensor::view(const std::vector<int64_t>& shape) const {
     return as_strided(final_shape, new_strides);
 }
 
+// Mirrors aten's view_dtype (Tensor.view(dtype)): reinterprets the raw
+// element stream as `dtype` while aliasing the same storage.  Same-size
+// dtypes keep shape/strides; otherwise only the last dimension may change
+// and it must be contiguous, matching PyTorch's documented constraints.
+Tensor Tensor::view_dtype(DType dtype) const {
+    if (!impl_) TP_THROW(RuntimeError, "Tensor not defined");
+    const DType self_dtype = impl_->dtype();
+    if (dtype == self_dtype) {
+        return Tensor(impl_);
+    }
+
+    const std::vector<int64_t> self_sizes = static_cast<std::vector<int64_t>>(shape());
+    const std::vector<int64_t> self_strides = strides();
+    const size_t src_esize = elementSize(self_dtype);
+    const size_t dst_esize = elementSize(dtype);
+
+    if (self_strides.empty()) {
+        TP_THROW(RuntimeError,
+                 "view(): cannot reinterpret a 0-dim tensor to a dtype of a different element size");
+    }
+    if (self_strides.back() != 1 && src_esize != dst_esize) {
+        TP_THROW(RuntimeError,
+                 "view(): view(dtype) requires the last dimension to be contiguous when "
+                 "element sizes differ");
+    }
+
+    std::vector<int64_t> new_sizes = self_sizes;
+    std::vector<int64_t> new_strides = self_strides;
+
+    if (dst_esize < src_esize) {
+        const int64_t ratio = static_cast<int64_t>(src_esize / dst_esize);
+        new_sizes.back() *= ratio;
+        for (size_t i = 0; i + 1 < new_strides.size(); ++i) new_strides[i] *= ratio;
+    } else if (dst_esize > src_esize) {
+        const int64_t ratio = static_cast<int64_t>(dst_esize / src_esize);
+        if (new_sizes.back() % ratio != 0) {
+            TP_THROW(RuntimeError,
+                     "view(): the last dimension must be divisible by the element size ratio");
+        }
+        for (size_t i = 0; i + 1 < new_strides.size(); ++i) {
+            if (new_strides[i] % ratio != 0) {
+                TP_THROW(RuntimeError,
+                         "view(): strides must be divisible by the element size ratio");
+            }
+            new_strides[i] /= ratio;
+        }
+        new_sizes.back() /= ratio;
+        if ((impl_->storage_offset() * static_cast<int64_t>(src_esize)) %
+                static_cast<int64_t>(dst_esize) != 0) {
+            TP_THROW(RuntimeError,
+                     "view(): storage offset is not aligned to the target element size");
+        }
+    }
+
+    Tensor out = Tensor(impl_->storage(), new_sizes, new_strides, dtype, impl_->storage_offset());
+    out.unsafeGetTensorImpl()->share_version_counter(*impl_);
+    return out;
+}
+
 Tensor Tensor::select(int64_t dim, int64_t index) const {
     if (!impl_) TP_THROW(RuntimeError, "Tensor not defined");
     int64_t ndim = this->dim();
@@ -693,42 +752,6 @@ Tensor Tensor::slice(int64_t dim, int64_t start, int64_t end, int64_t step) cons
     return as_strided(new_sizes, new_strides, new_offset);
 }
 
-Tensor Tensor::expand(const std::vector<int64_t>& size) const {
-    if (!impl_) TP_THROW(RuntimeError, "Tensor not defined");
-    int64_t ndim = dim();
-    int64_t new_ndim = size.size();
-    
-    if (new_ndim < ndim) {
-        TP_THROW(RuntimeError, "expand(): the number of sizes provided must be greater or equal to the number of dimensions in the tensor.");
-    }
-    
-    std::vector<int64_t> new_sizes(size);
-    std::vector<int64_t> new_strides(new_ndim);
-    
-    for (int64_t i = new_ndim - 1; i >= 0; --i) {
-        int64_t offset = new_ndim - 1 - i;
-        int64_t dim_index = ndim - 1 - offset;
-        
-        if (dim_index >= 0) {
-            int64_t size_dim = this->size(dim_index);
-            int64_t stride_dim = this->stride(dim_index);
-            
-            if (size_dim == 1 && new_sizes[i] > 1) {
-                new_strides[i] = 0;
-            } else if (size_dim == new_sizes[i]) {
-                new_strides[i] = stride_dim;
-            } else {
-                 TP_THROW(RuntimeError, "expand(): incompatible dimensions");
-            }
-        } else {
-            if (new_sizes[i] == -1) TP_THROW(RuntimeError, "expand(): invalid size -1");
-            new_strides[i] = 0; 
-        }
-    }
-    
-    return as_strided(new_sizes, new_strides);
-}
-
 Tensor Tensor::operator+(const Tensor& other) const { return add(other); }
 Tensor Tensor::operator-(const Tensor& other) const { return sub(other); }
 Tensor Tensor::operator*(const Tensor& other) const { return mul(other); }
@@ -768,25 +791,30 @@ Tensor& Tensor::operator/=(Scalar other) {
     return div_(other);
 }
 
-Tensor Tensor::clone() const {
-    if (!impl_) return Tensor();
-    if (is_sparse()) {
-        return make_sparse_coo_tensor(_indices().clone(), _values().clone(),
-                                      static_cast<std::vector<int64_t>>(shape()),
-                                      is_coalesced());
+namespace detail {
+
+// Dispatcher-level clone shared by the generated Tensor::clone member via
+// backend kernels.  Kept free-standing so kernels never re-enter the
+// dispatcher for a plain byte copy.
+Tensor clone_impl(const Tensor& self) {
+    if (!self.defined()) return Tensor();
+    if (self.is_sparse()) {
+        return Tensor::make_sparse_coo_tensor(self._indices().clone(), self._values().clone(),
+                                              static_cast<std::vector<int64_t>>(self.shape()),
+                                              self.is_coalesced());
     }
-    Tensor t(impl_->sizes(), dtype(), device());
+    Tensor t(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
     // Match the native contiguous clone path used by Torch: avoid routing
     // every same-dtype contiguous clone through the dispatcher.  Optimizer
     // momentum initialization creates one clone per parameter, so this
     // dispatch overhead is visible even though the operation is just a byte
     // copy.  Non-contiguous and cross-device cases retain copy_'s layout and
     // transfer semantics.
-    if (device().is_cpu() && is_contiguous()) {
-        std::memcpy(t.data_ptr(), data_ptr(),
-                    static_cast<size_t>(numel()) * itemsize());
+    if (self.device().is_cpu() && self.is_contiguous()) {
+        std::memcpy(t.data_ptr(), self.data_ptr(),
+                    static_cast<size_t>(self.numel()) * self.itemsize());
     } else {
-        t.copy_(*this);
+        t.copy_(self);
     }
     // copy_ records a mutation on the destination; the clone result is a
     // freshly materialized tensor and must start unmutated (PyTorch: version
@@ -795,10 +823,45 @@ Tensor Tensor::clone() const {
     return t;
 }
 
+Tensor contiguous_impl(const Tensor& self, int64_t memory_format_raw) {
+    auto format = static_cast<MemoryFormat>(memory_format_raw);
+    if (format == MemoryFormat::Preserve) format = MemoryFormat::Contiguous;
+    if (self.is_sparse()) return clone_impl(self);
+    if (format != MemoryFormat::Contiguous && !self.is_contiguous(format)) {
+        if (self.dim() < 3 ||
+            (format == MemoryFormat::ChannelsLast && self.dim() != 4) ||
+            (format == MemoryFormat::ChannelsLast3d && self.dim() != 5)) {
+            // Channels-last layouts are only representable at these ranks;
+            // fall back to row-major like ATen's empty_like handling.
+            format = MemoryFormat::Contiguous;
+        }
+    }
+    if (self.is_contiguous(format)) return self;
+    const auto sizes_v = static_cast<std::vector<int64_t>>(self.shape());
+    std::vector<int64_t> strides = get_strides_for(sizes_v, format);
+    Storage storage(static_cast<size_t>(self.numel()) * self.itemsize(),
+                    getAllocator(self.device().type()), self.device());
+    auto out_impl = std::make_shared<TensorImpl>(storage, sizes_v, strides, self.dtype(), 0);
+    out_impl->set_memory_format(format);
+    Tensor out(std::move(out_impl));
+    out.copy_(self);
+    out.unsafeGetTensorImpl()->reset_version();
+    return out;
+}
+
+} // namespace detail
+
+
 Tensor Tensor::to(DType dtype, bool non_blocking, bool copy) const {
     if (!impl_) return Tensor();
     if (is_sparse()) {
         if (dtype == this->dtype()) return copy ? clone() : *this;
+        if (is_sparse_csr()) {
+            return make_sparse_csr_tensor(
+                _crow_indices(), _col_indices(),
+                _values().to(dtype, non_blocking, copy),
+                static_cast<std::vector<int64_t>>(shape()));
+        }
         return make_sparse_coo_tensor(
             _indices(), _values().to(dtype, non_blocking, copy),
             static_cast<std::vector<int64_t>>(shape()), is_coalesced());
@@ -815,6 +878,13 @@ Tensor Tensor::to(Device device, bool non_blocking, bool copy) const {
     if (!impl_) return Tensor();
     if (is_sparse()) {
         if (this->device() == device) return copy ? clone() : *this;
+        if (is_sparse_csr()) {
+            return make_sparse_csr_tensor(
+                _crow_indices().to(device, non_blocking, copy),
+                _col_indices().to(device, non_blocking, copy),
+                _values().to(device, non_blocking, copy),
+                static_cast<std::vector<int64_t>>(shape()));
+        }
         return make_sparse_coo_tensor(
             _indices().to(device, non_blocking, copy),
             _values().to(device, non_blocking, copy),
@@ -834,6 +904,13 @@ Tensor Tensor::to(Device device, DType dtype, bool non_blocking, bool copy) cons
         if (this->device() == device && this->dtype() == dtype) {
             return copy ? clone() : *this;
         }
+        if (is_sparse_csr()) {
+            return make_sparse_csr_tensor(
+                _crow_indices().to(device, non_blocking, copy),
+                _col_indices().to(device, non_blocking, copy),
+                _values().to(device, dtype, non_blocking, copy),
+                static_cast<std::vector<int64_t>>(shape()));
+        }
         return make_sparse_coo_tensor(
             _indices().to(device, non_blocking, copy),
             _values().to(device, dtype, non_blocking, copy),
@@ -848,12 +925,6 @@ Tensor Tensor::to(Device device, DType dtype, bool non_blocking, bool copy) cons
 }
 
 
-
-Tensor Tensor::contiguous() const {
-    if (is_sparse()) return clone();
-    if (is_contiguous()) return *this;
-    return clone();
-}
 
 bool Tensor::is_contiguous(MemoryFormat format) const {
     if (!impl_) return false;
@@ -875,29 +946,5 @@ MemoryFormat Tensor::memory_format() const { return impl_ ? impl_->memory_format
 bool Tensor::is_channels_last() const { return dim() == 4 && impl_ && impl_->is_channels_last(); }
 bool Tensor::is_channels_last_2d() const { return is_channels_last(); }
 bool Tensor::is_channels_last_3d() const { return dim() == 5 && impl_ && impl_->is_channels_last_3d(); }
-
-Tensor Tensor::contiguous(MemoryFormat format) const {
-    if (format == MemoryFormat::Preserve) return contiguous();
-    if (is_sparse()) TP_THROW(NotImplementedError,
-                              "contiguous(memory_format) is not supported on sparse tensors");
-    if (is_contiguous(format)) return *this;
-    if (dim() < 3 || (format == MemoryFormat::ChannelsLast && dim() != 4) ||
-        (format == MemoryFormat::ChannelsLast3d && dim() != 5)) {
-        // Channels-last layouts are only representable at these ranks; fall
-        // back to row-major like ATen's empty_like memory-format handling.
-        return contiguous();
-    }
-    const auto sizes_v = static_cast<std::vector<int64_t>>(impl_->sizes());
-    std::vector<int64_t> strides = get_strides_for(sizes_v, format);
-    Storage storage(static_cast<size_t>(numel()) * itemsize(),
-                    getAllocator(device().type()), device());
-    auto out_impl = std::make_shared<TensorImpl>(storage, sizes_v, strides, dtype(), 0);
-    out_impl->set_memory_format(format);
-    Tensor out(std::move(out_impl));
-    out.copy_(*this);
-    // Freshly materialized tensor: the internal copy bumped the version.
-    out.unsafeGetTensorImpl()->reset_version();
-    return out;
-}
 
 } // namespace tensorplay

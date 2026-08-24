@@ -1,10 +1,18 @@
 [build-system]
-requires = ["scikit-build-core", "pybind11", "PyYAML", "ninja", "cmake<4.0"]
+requires = [
+    # 1.0 is required for [tool.scikit-build.env] and [[tool.dynamic-metadata]]
+    # used below (MAX_JOBS forwarding, version.txt as the version source).
+    "scikit-build-core>=1.0",
+    "pybind11",
+    "PyYAML",
+    "ninja",
+    "cmake<4.0",
+]
 build-backend = "scikit_build_core.build"
 
 [project]
 name = "tensorplay"
-version = "1.0.0rc0"
+dynamic = ["version"]
 description = "A simple deep learning framework designed for educational purposes and small-scale experiments."
 readme = "README.md"
 authors = [{ name = "zlx", email = "2095774200@shu.edu.cn" }]
@@ -56,30 +64,61 @@ Changelog = "https://github.com/bluemoon-o2/tensorplay/blob/main/CHANGELOG.md"
 Documentation = "https://bluemoon-o2.github.io/tensorplay/"
 Contributing = "https://github.com/bluemoon-o2/tensorplay/blob/main/CONTRIBUTING.md"
 
+[[tool.dynamic-metadata]]
+# Delegates to tools/metadata/version.py which resolves the version from
+# TENSORPLAY_BUILD_VERSION / TENSORPLAY_BUILD_NUMBER (release), PKG-INFO
+# (sdist), or version.txt + git SHA (dev builds) -- mirroring pytorch's
+# tools/metadata provider chain.
+provider = { path = "tools/metadata", module = "version" }
+
 [tool.scikit-build]
-cmake.version = ">=3.18"
-# Ensure the package is built in release mode
-cmake.build-type = "Release"
-# Install prefix handled by scikit-build-core
-# But we need to make sure our CMake install commands target the right place
-# scikit-build-core sets CMAKE_INSTALL_PREFIX to the wheel directory
-# Our CMakeLists.txt installs to "tensorplay", so it will be "wheel_dir/tensorplay"
-# which matches the python package structure if "tensorplay" is the package name.
-wheel.packages = ["tensorplay"]
+# Track the build-system.requires floor (scikit-build-core>=1.0) so the schema
+# and defaults are pinned to the version we build against.
+minimum-version = "build-system.requires"
+build-dir = "build"
+# cmake.build-type is deliberately not set: it defaults to Release, and
+# leaving it unconfigured lets scikit-build-core honor a CMAKE_BUILD_TYPE
+# set in the environment (mirrors pytorch's pyproject.toml).
 
-# Enable logging
-logging.level = "INFO"
+[tool.scikit-build.env]
+# MAX_JOBS is pytorch's umbrella parallelism knob; alias it to the variable
+# CMake natively honors for `cmake --build`. setdefault semantics: a
+# user-set CMAKE_BUILD_PARALLEL_LEVEL always wins.
+CMAKE_BUILD_PARALLEL_LEVEL = { env = "MAX_JOBS" }
 
-# Force Ninja generator via CMake args
-cmake.args = ["-GNinja"]
+[tool.scikit-build.editable]
+# Editable installs use redirect mode: Python files come from the source
+# tree, CMake-built artifacts from the build tree. Rebuild-on-import is OFF
+# (a rebuild on every import stalls `import tensorplay`); rebuild explicitly
+# instead.
+mode = "redirect"
+rebuild = false
 
-# Disable stripping to avoid potential issues with DLLs on Windows
-install.strip = false
+[tool.scikit-build.install]
+# Disable stripping to avoid potential issues with DLLs on Windows.
+strip = false
+
+[tool.scikit-build.sdist]
+# Ship the buildable sources, not repo/CI plumbing or the reference-only
+# third_party checkouts (pytorch/audio are 1.7G+ gitlinks used for alignment
+# work, never consumed by the build).
+exclude = [
+    "**/.github/**",
+    "build/**",
+    ".codegraph/**",
+    "third_party/pytorch/**",
+    "third_party/audio/**",
+]
+
+[tool.scikit-build.wheel]
+# Python packages to include in the wheel; CMake installs the built
+# libraries/stubs under tensorplay/ relative to the wheel root.
+packages = ["tensorplay"]
 
 # Ensure we include everything installed by CMake, but exclude unwanted artifacts if they slip through
 # scikit-build-core automatically includes files in wheel.packages
 # We can use exclude to be safe
-wheel.exclude = [
+exclude = [
     "tensorplay/include",
     "tensorplay/share",
     "tensorplay/lib/cmake",
@@ -88,4 +127,48 @@ wheel.exclude = [
     "share",
     "lib/cmake",
     "lib/*.lib" 
+]
+
+[dependency-groups]
+# Kept in sync with requirements-build.txt (mirrors pytorch keeping its
+# requirements-build.txt in sync with [dependency-groups] dev).
+dev = [
+    "scikit-build-core>=1.0",
+    "cmake<4.0",
+    "ninja",
+    "pybind11",
+    "PyYAML",
+    "packaging>=24.2",
+    "build",
+    "pytest",
+    "numpy>=2.0.0",
+    "typing-extensions>=4.0.0",
+]
+
+# Linter tools #################################################################
+
+[tool.ruff]
+line-length = 120
+src = ["tensorplay", "tpx", "tools", "test"]
+extend-exclude = ["third_party", "build", "alpha", "stax", "p10", "tensorplay/_C"]
+
+[tool.ruff.lint]
+select = [
+    "F",              # pyflakes
+    "E4", "E7", "E9", # subset of pycodestyle errors
+]
+ignore = [
+    # Pre-existing debt across the codebase; tighten over time
+    # (mirrors pytorch keeping an explicit ignore list).
+    "E402",                 # module level import not at top of file
+    "E701", "E702", "E731", # colon/semicolon compound statements, lambda assign
+    "E741",                 # ambiguous variable name `l`; used in math-heavy code
+    "F401", "F403", "F405", # unused/star imports
+    "F811", "F821", "F822", "F841", # redefinition, undefined name, unused variable
+    "F541",                 # f-string without placeholders
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = [
+    "F401",  # re-exports
 ]

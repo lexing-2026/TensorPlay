@@ -29,6 +29,8 @@ def _normalize_comparisons(formula: str) -> str:
     torch's derivatives.yaml permits comparison operators inside derivative
     formulas (they produce bool masks); TensorPlay's expression DSL has no
     infix comparisons, so translate them to the dispatched gt/lt/... ops.
+    Handles both parenthesized groups and bare `a > b` operands (upstream
+    clamp_min/clamp_max style).
     """
     out = formula
     for _ in range(10):
@@ -37,6 +39,15 @@ def _normalize_comparisons(formula: str) -> str:
             break
         op = _COMPARISON_OPS[m.group(2)]
         out = out[:m.start()] + f"{op}({m.group(1)}, {m.group(3)})" + out[m.end():]
+
+    def _bare(m):
+        return f"{_COMPARISON_OPS[m.group(2)]}({m.group(1)}, {m.group(3)})"
+
+    out = re.sub(
+        r"(?<![\w.])([A-Za-z_][\w.:]*)\s*(<=|>=|==|!=|<|>)\s*([A-Za-z_][\w.:]*)",
+        _bare,
+        out,
+    )
     return out
 
 
@@ -256,6 +267,7 @@ BACKWARD_HELPERS = {
     "conv_transpose2d_grad_bias", "conv_transpose3d_grad_input",
     "conv_transpose3d_grad_weight", "conv_transpose3d_grad_bias",
     "embedding_dense_backward", "permute_backward", "squeeze_backward",
+    "_alpha_dropout_backward", "_feature_dropout_backward",
 }
 
 # Tensor-returning methods that the DSL lowers to tpx::ops free functions,
@@ -437,14 +449,19 @@ class OpDerivatives:
 # tensor list.  Declared here (upstream keeps equivalent hand-written nodes);
 # `saved` lists forward inputs stored by the manual node in ManualNodes.h.
 MANUAL_DERIVATIVES: dict[str, dict] = {
+    "block_diag": {"saved": ["tensors"]},
+    "mean": {"saved": ["self"]},
     "cat": {"saved": ["tensors", "dim"]},
     "stack": {"saved": ["tensors", "dim"]},
     "roll": {"saved": ["shifts", "dims"]},
+    # Dim-dependent case split (dot / vec@mat / mat@vec / batched); the node
+    # composes recordable primitives so double-backward through `@` records.
+    "matmul": {"saved": ["self", "other"]},
 }
 
 # Ops whose backward node is provided hand-written elsewhere; skip emitting a
 # generated class even though derivatives exist.
-EXTERNAL_NODES = {"scaled_dot_product_attention", "mean"}
+EXTERNAL_NODES = {"scaled_dot_product_attention"}
 
 
 def compute_op_derivatives(func: NativeFunction, raw_formulas: dict[str, str],

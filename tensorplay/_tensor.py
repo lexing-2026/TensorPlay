@@ -1,3 +1,8 @@
+import builtins as _builtins
+
+builtins_int = _builtins.int
+builtins_complex = _builtins.complex
+
 from collections import OrderedDict
 
 from . import _C
@@ -326,3 +331,354 @@ def register_post_accumulate_grad_hook(self, hook):
 
 
 Tensor.register_post_accumulate_grad_hook = register_post_accumulate_grad_hook
+
+
+# ---------------------------------------------------------------------------
+# permute: accept both permute(*dims) and permute(dims_list), like torch.
+# The C++ binding takes a single sequence; normalize the variadic form here.
+# ---------------------------------------------------------------------------
+_orig_permute = Tensor.permute
+
+
+def _permute(self, *dims):
+    if len(dims) == 1 and isinstance(dims[0], (list, tuple)):
+        dims = dims[0]
+    return _orig_permute(self, list(dims))
+
+
+Tensor.permute = _permute
+
+
+# ---------------------------------------------------------------------------
+# expand: accept both expand(size) and expand(*size), like torch.
+# ---------------------------------------------------------------------------
+_orig_expand = Tensor.expand
+
+
+def _expand(self, *size):
+    if len(size) == 1:
+        s0 = size[0]
+        if isinstance(s0, (list, tuple)) or hasattr(s0, "__iter__"):
+            return _orig_expand(self, s0)
+    return _orig_expand(self, list(size))
+
+
+Tensor.expand = _expand
+
+
+# ---------------------------------------------------------------------------
+# item: the generated binding returns a tp Scalar wrapper (schema
+# `-> Scalar`); torch's Tensor.item() returns a Python number.  Unbox
+# according to dtype so arithmetic like `t.item() - other` keeps working.
+# ---------------------------------------------------------------------------
+_orig_item = Tensor.item
+
+
+def item(self):
+    import builtins
+    value = _orig_item(self)
+    dt = self.dtype
+    if dt in (_C.float32, _C.float64, _C.float16, _C.bfloat16,
+              _C.complex64, _C.complex128):
+        return builtins.float(value)
+    return builtins.int(value)
+
+
+Tensor.item = item
+
+
+# ---------------------------------------------------------------------------
+# new_* factory methods (torch parity): result keeps device, takes explicit
+# dtype override like torch (defaults to self.dtype).
+# ---------------------------------------------------------------------------
+def _norm_new_size(size):
+    if len(size) == 1 and hasattr(size[0], "__iter__") and \
+            not isinstance(size[0], _C.TensorBase):
+        return [builtins_int(x) for x in size[0]]
+    return [builtins_int(x) for x in size]
+
+
+def _flag(out, requires_grad):
+    return out.requires_grad_(True) if requires_grad else out
+
+
+def _new_zeros(self, *size, dtype=None, device=None, requires_grad=False):
+    shape = _norm_new_size(size)
+    if shape:
+        out = _C.full(shape, 0.0, dtype=dtype or self.dtype,
+                      device=device or self.device)
+    else:
+        out = _C.zeros_like(self, dtype=dtype or self.dtype,
+                            device=device or self.device)
+    return _flag(out, requires_grad)
+
+
+def _new_ones(self, *size, dtype=None, device=None, requires_grad=False):
+    shape = _norm_new_size(size)
+    if shape:
+        out = _C.full(shape, 1.0, dtype=dtype or self.dtype,
+                      device=device or self.device)
+    else:
+        out = _C.ones_like(self, dtype=dtype or self.dtype,
+                           device=device or self.device)
+    return _flag(out, requires_grad)
+
+
+def _new_full(self, size, fill_value, *, dtype=None, device=None,
+              requires_grad=False):
+    out = _C.full(list(size), fill_value, dtype=dtype or self.dtype,
+                  device=device or self.device)
+    return out.requires_grad_(requires_grad) if requires_grad else out
+
+
+def _new_empty(self, size, *, dtype=None, device=None, requires_grad=False):
+    if isinstance(size, builtins_int):
+        size = [size]
+    shape = _norm_new_size(tuple(size))
+    if shape:
+        out = _C.empty(shape, dtype=dtype or self.dtype,
+                       device=device or self.device)
+    else:
+        out = _C.empty_like(self, dtype=dtype or self.dtype,
+                            device=device or self.device)
+    return _flag(out, requires_grad)
+
+
+def _new_tensor(self, data, *, dtype=None, device=None, requires_grad=False):
+    out = _C.tensor(data, dtype=dtype or self.dtype,
+                    device=device or self.device)
+    return out.requires_grad_(requires_grad) if requires_grad else out
+
+
+Tensor.new_zeros = _new_zeros
+Tensor.new_ones = _new_ones
+Tensor.new_full = _new_full
+Tensor.new_empty = _new_empty
+Tensor.new_tensor = _new_tensor
+
+
+# ---------------------------------------------------------------------------
+# dtype shortcut methods (torch parity). float/int/long/double already exist
+# as generated bindings; add the rest of the family.
+# ---------------------------------------------------------------------------
+_DTYPE_SHORTCUTS = {
+    "bool": "bool",
+    "byte": "uint8",
+    "char": "int8",
+    "short": "int16",
+    "half": "float16",
+    "bfloat16": "bfloat16",
+}
+
+
+def _make_dtype_shortcut(attr, dt_name):
+    def op(self):
+        return self.to(getattr(_C.DType, dt_name))
+    op.__name__ = attr
+    return op
+
+
+for _attr, _dt in _DTYPE_SHORTCUTS.items():
+    setattr(Tensor, _attr, _make_dtype_shortcut(_attr, _dt))
+del _attr, _dt
+
+
+# ---------------------------------------------------------------------------
+# pointwise method forms routed through the top-level composites so the
+# integer-division direction matches torch (floor vs trunc).
+# ---------------------------------------------------------------------------
+def _cf(name):
+    from . import _composite_funcs
+    return getattr(_composite_funcs, name)
+
+
+def _as_tensor(x):
+    from . import as_tensor
+    return as_tensor(x)
+
+
+def _floor_divide(self, other):
+    return _cf("floor_divide")(self, other)
+
+
+def __rfloordiv__(self, other):
+    return _cf("floor_divide")(_as_tensor(other), self)
+
+
+def _remainder(self, other):
+    return _cf("remainder")(self, other)
+
+
+def __rmod__(self, other):
+    return _cf("remainder")(_as_tensor(other), self)
+
+
+def _fmod(self, other):
+    return _cf("fmod")(self, other)
+
+
+def true_divide(self, other):
+    return self.div(other)
+
+
+Tensor.floor_divide = _floor_divide
+Tensor.__rfloordiv__ = __rfloordiv__
+Tensor.remainder = _remainder
+Tensor.__rmod__ = __rmod__
+Tensor.fmod = _fmod
+Tensor.true_divide = true_divide
+
+
+def repeat_interleave(self, repeats, dim=None, *, output_size=None):
+    return _cf("repeat_interleave")(self, repeats, dim=dim,
+                                    output_size=output_size)
+
+
+Tensor.repeat_interleave = repeat_interleave
+
+
+def count_nonzero(self, dim=None):
+    nz = self.ne(0).to(_C.DType.int64)
+    return nz.sum() if dim is None else nz.sum(dim=dim)
+
+
+Tensor.count_nonzero = count_nonzero
+
+
+def unique(self, sorted=True, return_inverse=False, return_counts=False):
+    # native op always computes all three outputs; mirror torch.unique's
+    # public contract of returning 1/2/3 tensors depending on the flags.
+    values, inverse, counts = _C.unique(self, sorted, True, True)
+    outs = [values]
+    if return_inverse:
+        outs.append(inverse)
+    if return_counts:
+        outs.append(counts)
+    return outs[0] if len(outs) == 1 else tuple(outs)
+
+
+Tensor.unique = unique
+
+
+def topk(self, k, dim=None, largest=True, sorted=True):
+    import operator
+    d = self.dim() - 1 if dim is None else int(dim)
+    if d < 0:
+        d += self.dim()
+    desc = largest
+    values, indices = _C.sort(self, dim=d, descending=desc)
+    n = self.size(d)
+    k = builtins_int(k)
+    if k < 0 or k > n:
+        raise RuntimeError(
+            f"selected index k: {k} out of range for dimension {d} "
+            f"of size {n}")
+    sl = [slice(None)] * self.dim()
+    sl[d] = slice(0, k)
+    return values[tuple(sl)], indices[tuple(sl)]
+
+
+Tensor.topk = topk
+
+
+# ---------------------------------------------------------------------------
+# operator dunders: floor-div/mod reflect + bitwise family. Bitwise ops
+# dispatch to the module functions (integers and bool; shifts take the
+# bit width modulo through the unsigned domain in the kernel).
+# ---------------------------------------------------------------------------
+def __ifloordiv__(self, other):
+    res = _floor_divide(self, other)
+    with _C_no_grad():
+        self.copy_(res)
+    return self
+
+
+def __imod__(self, other):
+    res = _remainder(self, other)
+    with _C_no_grad():
+        self.copy_(res)
+    return self
+
+
+def _C_no_grad():
+    from .autograd import no_grad
+    return no_grad()
+
+
+_BITWISE_NAMES = {
+    "and": "bitwise_and",
+    "or": "bitwise_or",
+    "xor": "bitwise_xor",
+    "lshift": "bitwise_left_shift",
+    "rshift": "bitwise_right_shift",
+}
+
+
+def _bitwise_fn(name, reflect=False):
+    def op(self, other):
+        import tensorplay
+        fn = getattr(tensorplay, _BITWISE_NAMES[name])
+        if reflect:
+            return fn(_as_tensor(other), self)
+        return fn(self, other)
+
+    return op
+
+
+def _bitwise_inplace(name):
+    def op(self, other):
+        res = _bitwise_fn(name)(self, other)
+        with _C_no_grad():
+            self.copy_(res)
+        return self
+
+    return op
+
+
+def __invert__(self):
+    import tensorplay
+    return tensorplay.bitwise_not(self)
+
+
+def __pos__(self):
+    return self
+
+
+def __abs__(self):
+    return self.abs()
+
+
+Tensor.__floordiv__ = lambda self, other: _floor_divide(self, other)
+Tensor.__mod__ = _remainder
+Tensor.__ifloordiv__ = __ifloordiv__
+Tensor.__imod__ = __imod__
+Tensor.__and__ = _bitwise_fn("and")
+Tensor.__rand__ = _bitwise_fn("and", reflect=True)
+Tensor.__iand__ = _bitwise_inplace("and")
+Tensor.__or__ = _bitwise_fn("or")
+Tensor.__ror__ = _bitwise_fn("or", reflect=True)
+Tensor.__ior__ = _bitwise_inplace("or")
+Tensor.__xor__ = _bitwise_fn("xor")
+Tensor.__rxor__ = _bitwise_fn("xor", reflect=True)
+Tensor.__ixor__ = _bitwise_inplace("xor")
+Tensor.__invert__ = __invert__
+Tensor.__lshift__ = _bitwise_fn("lshift")
+Tensor.__rlshift__ = _bitwise_fn("lshift", reflect=True)
+Tensor.__ilshift__ = _bitwise_inplace("lshift")
+Tensor.__rshift__ = _bitwise_fn("rshift")
+Tensor.__rrshift__ = _bitwise_fn("rshift", reflect=True)
+Tensor.__irshift__ = _bitwise_inplace("rshift")
+Tensor.__pos__ = __pos__
+Tensor.__abs__ = __abs__
+
+
+def __complex__(self):
+    return builtins_complex(self.item())
+
+
+def __index__(self):
+    return builtins_int(self.item())
+
+
+Tensor.__complex__ = __complex__
+Tensor.__index__ = __index__

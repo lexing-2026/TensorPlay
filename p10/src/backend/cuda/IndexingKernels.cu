@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <tuple>
 #include <type_traits>
 
 namespace {
@@ -199,23 +200,26 @@ __device__ __forceinline__ int64_t atomic_add_rel_return(int64_t* addr) {
 // ScatterGatherKernel.cu gpu_scatter_assign; Add mode uses atomicAdd exactly
 // like gpu_scatter_add_kernel (nondeterminism noted at ScatterGatherKernel.cu:588).
 template <typename T, bool Add>
-__global__ void scatter_kernel(int64_t total_idx, int64_t idx_dim_size, int64_t inner,
-                               int64_t self_dim_size, T* d, const int64_t* ip, const T* vp) {
-    int64_t flat = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+__global__ void scatter_kernel(int64_t total_idx, int64_t idx_dim_size, int64_t idx_inner,
+                               int64_t self_dim_size, int64_t self_inner,
+                               T* d, const int64_t* ip, const T* vp) {
+    // One thread per (index element, inner position): each index entry fills
+    // its whole self_inner slice with the broadcast source value, matching
+    // ATen's ScatterGatherKernel.cu semantics.
+    int64_t work = total_idx * self_inner;
+    int64_t w = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; flat < total_idx; flat += stride) {
+    for (; w < work; w += stride) {
+        int64_t flat = w / self_inner;
+        int64_t k = w - flat * self_inner;
         int64_t rem = flat;
-        int64_t outer_off = rem / (idx_dim_size * inner); rem -= outer_off * idx_dim_size * inner;
-        int64_t j = rem / inner; rem -= j * inner;
-        int64_t in2 = rem;
+        int64_t outer_off = rem / (idx_dim_size * idx_inner);
+        rem -= outer_off * idx_dim_size * idx_inner;
+        int64_t j = rem / idx_inner; (void)j;
         int64_t idx = ip[flat];
         if (idx < 0) idx += self_dim_size;
-        int64_t dst = (outer_off * self_dim_size + idx) * inner + in2;
-        // constexpr keeps the atomic arm out of assign-mode instantiations,
-        // which exist for every scalar type but never accumulate.
+        int64_t dst = (outer_off * self_dim_size + idx) * self_inner + k;
         if constexpr (Add) {
-            // atomic_add_rel covers int32/int64/float/double natively; other
-            // scalar instantiations never reach this branch (dispatch throws).
             if constexpr (std::is_same_v<T, float> || std::is_same_v<T, double> ||
                           std::is_same_v<T, int32_t> || std::is_same_v<T, int64_t>) {
                 atomic_add_rel(&d[dst], vp[flat]);
@@ -397,11 +401,13 @@ __global__ void sort_kernel(int64_t n_slices, int64_t d_size, int64_t inner,
         T* vb = vals + o * d_size * inner + in2;
         int64_t* ib = idxs + o * d_size * inner + in2;
         for (int64_t j = 0; j < d_size; ++j) { vb[j * inner] = sp[j * inner]; ib[j * inner] = j; }
-        // build max-heap on (value, index) pairs
+        // build heap on (value, index) pairs
         auto less = [&](int64_t a, int64_t b) {
             T va = vb[a * inner], vbv = vb[b * inner];
             bool lt = va < vbv, gt = va > vbv;
-            return descending ? lt : gt; // "smaller" element sinks for ascending order
+            // Ascending needs a MAX-heap (largest at root, extracted to the
+            // tail), i.e. the *larger* element must sink on sift_down.
+            return descending ? gt : lt;
         };
         auto swap_pair = [&](int64_t a, int64_t b) {
             T tv = vb[a * inner]; vb[a * inner] = vb[b * inner]; vb[b * inner] = tv;
@@ -682,16 +688,26 @@ Tensor scatter_base_cuda(const Tensor& self, int64_t dim, const Tensor& index,
         TP_THROW(IndexError, "Index must have same number of dimensions as output tensor");
     }
     Tensor idx_c = (index.dtype() == DType::Int64) ? index.contiguous() : index.to(DType::Int64).contiguous();
-    std::vector<int64_t> idx_shape(idx_c.shape().begin(), idx_c.shape().end());
+    std::vector<int64_t> idx_shape(static_cast<std::vector<int64_t>>(idx_c.shape()));
     Tensor src_b;
-    if (src.dim() == 0) {
+    if (src.numel() == 1) {
         src_b = src.expand(idx_shape).contiguous();
     } else {
         std::vector<int64_t> bshape = broadcast_shapes(
             static_cast<std::vector<int64_t>>(src.shape()), idx_shape);
-        src_b = src.expand(bshape).contiguous();
+        if (bshape != idx_shape) {
+            TP_THROW(RuntimeError, "scatter: src shape must broadcast to the index shape");
+        }
+        src_b = src.expand(idx_shape).contiguous();
+    }
+    if (src_b.dtype() != self.dtype()) {
+        src_b = src_b.to(self.dtype());
     }
     Tensor result = self.clone();
+    int64_t idx_outer = 1;
+    for (int64_t i = 0; i < dim; ++i) idx_outer *= idx_c.size(i);
+    int64_t idx_inner = 1;
+    for (int64_t i = dim + 1; i < nd; ++i) idx_inner *= idx_c.size(i);
     int64_t inner = 1;
     for (int64_t i = dim + 1; i < nd; ++i) inner *= self.size(i);
     int64_t idx_dim_size = idx_c.size(dim);
@@ -714,9 +730,9 @@ Tensor scatter_base_cuda(const Tensor& self, int64_t dim, const Tensor& index,
     }
 #define TP_SC_CASE(ctype, name) \
     case DType::name: \
-        scatter_kernel<ctype, Add><<<(total_idx + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
-            total_idx, idx_dim_size, inner, self_dim_size, result.data_ptr<ctype>(), \
-            idx_c.data_ptr<int64_t>(), src_b.data_ptr<ctype>()); \
+        scatter_kernel<ctype, Add><<<(total_idx * inner + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
+            total_idx, idx_dim_size, idx_inner, self_dim_size, inner, \
+            result.data_ptr<ctype>(), idx_c.data_ptr<int64_t>(), src_b.data_ptr<ctype>()); \
         break;
     switch (self.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_SC_CASE)
@@ -765,16 +781,24 @@ static Tensor& scatter_base_inplace_cuda(Tensor& self, int64_t dim, const Tensor
         TP_THROW(IndexError, "Index must have same number of dimensions as output tensor");
     }
     Tensor idx_c = (index.dtype() == DType::Int64) ? index.contiguous() : index.to(DType::Int64).contiguous();
-    std::vector<int64_t> idx_shape(idx_c.shape().begin(), idx_c.shape().end());
+    std::vector<int64_t> idx_shape(static_cast<std::vector<int64_t>>(idx_c.shape()));
     Tensor src_b;
-    if (src.dim() == 0) {
+    if (src.numel() == 1) {
         src_b = src.expand(idx_shape).contiguous();
     } else {
         std::vector<int64_t> bshape = broadcast_shapes(
             static_cast<std::vector<int64_t>>(src.shape()), idx_shape);
-        src_b = src.expand(bshape).contiguous();
+        if (bshape != idx_shape) {
+            TP_THROW(RuntimeError, "scatter_: src shape must broadcast to the index shape");
+        }
+        src_b = src.expand(idx_shape).contiguous();
+    }
+    if (src_b.dtype() != self.dtype()) {
+        src_b = src_b.to(self.dtype());
     }
     Tensor& result = self;
+    int64_t idx_inner = 1;
+    for (int64_t i = dim + 1; i < nd; ++i) idx_inner *= idx_c.size(i);
     int64_t inner = 1;
     for (int64_t i = dim + 1; i < nd; ++i) inner *= self.size(i);
     int64_t idx_dim_size = idx_c.size(dim);
@@ -784,9 +808,9 @@ static Tensor& scatter_base_inplace_cuda(Tensor& self, int64_t dim, const Tensor
     auto stream = getCurrentCUDAStream().stream();
 #define TP_SC_INPLACE_ASSIGN_CASE(ctype, name) \
     case DType::name: { \
-        scatter_kernel<ctype, false><<<(total_idx + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
-            total_idx, idx_dim_size, inner, self_dim_size, result.data_ptr<ctype>(), \
-            idx_c.data_ptr<int64_t>(), src_b.data_ptr<ctype>()); \
+        scatter_kernel<ctype, false><<<(total_idx * inner + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
+            total_idx, idx_dim_size, idx_inner, self_dim_size, inner, \
+            result.data_ptr<ctype>(), idx_c.data_ptr<int64_t>(), src_b.data_ptr<ctype>()); \
         break; \
     }
     if (add) {
@@ -795,22 +819,22 @@ static Tensor& scatter_base_inplace_cuda(Tensor& self, int64_t dim, const Tensor
         switch (self.dtype()) {
             case DType::Float32:
                 scatter_kernel<float, true><<<(total_idx + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                    total_idx, idx_dim_size, inner, self_dim_size, result.data_ptr<float>(),
+                    total_idx, idx_dim_size, idx_inner, self_dim_size, inner, result.data_ptr<float>(),
                     idx_c.data_ptr<int64_t>(), src_b.data_ptr<float>());
                 break;
             case DType::Float64:
                 scatter_kernel<double, true><<<(total_idx + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                    total_idx, idx_dim_size, inner, self_dim_size, result.data_ptr<double>(),
+                    total_idx, idx_dim_size, idx_inner, self_dim_size, inner, result.data_ptr<double>(),
                     idx_c.data_ptr<int64_t>(), src_b.data_ptr<double>());
                 break;
             case DType::Int32:
                 scatter_kernel<int32_t, true><<<(total_idx + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                    total_idx, idx_dim_size, inner, self_dim_size, result.data_ptr<int32_t>(),
+                    total_idx, idx_dim_size, idx_inner, self_dim_size, inner, result.data_ptr<int32_t>(),
                     idx_c.data_ptr<int64_t>(), src_b.data_ptr<int32_t>());
                 break;
             case DType::Int64:
                 scatter_kernel<int64_t, true><<<(total_idx + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                    total_idx, idx_dim_size, inner, self_dim_size, result.data_ptr<int64_t>(),
+                    total_idx, idx_dim_size, idx_inner, self_dim_size, inner, result.data_ptr<int64_t>(),
                     idx_c.data_ptr<int64_t>(), src_b.data_ptr<int64_t>());
                 break;
             default:
@@ -962,6 +986,11 @@ Tensor index_copy_cuda(const Tensor& self, int64_t dim, const Tensor& index, con
 Tensor index_fill_scalar_cuda(const Tensor& self, int64_t dim, const Tensor& index, Scalar value);
 
 Tensor index_fill_tensor_cuda(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& value) {
+    if (value.dim() != 0) {
+        TP_THROW(RuntimeError,
+                 "index_fill only supports a 0-dimensional value tensor, but got tensor with ",
+                 value.dim(), " dimension(s).");
+    }
     Scalar v = value.item();
     return index_fill_scalar_cuda(self, dim, index, v);
 }
@@ -992,6 +1021,22 @@ Tensor index_fill_scalar_cuda(const Tensor& self, int64_t dim, const Tensor& ind
 #undef TP_IF_CASE
     CUDA_CHECK(cudaGetLastError());
     return result;
+}
+
+Tensor& index_fill_scalar__cuda(Tensor& self, int64_t dim, const Tensor& index, Scalar value) {
+    // In-place variant of index_fill (IndexKernel.cu semantics): fill a
+    // clone then copy back through the existing in-place copy path.
+    self.copy_(index_fill_scalar_cuda(self, dim, index, value));
+    return self;
+}
+
+Tensor& index_fill_tensor__cuda(Tensor& self, int64_t dim, const Tensor& index, const Tensor& value) {
+    if (value.dim() != 0) {
+        TP_THROW(RuntimeError,
+                 "index_fill_ only supports a 0-dimensional value tensor, but got tensor with ",
+                 value.dim(), " dimension(s).");
+    }
+    return index_fill_scalar__cuda(self, dim, index, value.item());
 }
 
 // ---------------------------------------------------------------------------
@@ -1100,7 +1145,7 @@ Tensor nonzero_cuda(const Tensor& self) {
     Tensor result = Tensor::zeros({count_host, nd}, DType::Int64, self.device());
     if (count_host == 0) return result;
     // sizes live on the host; stage them on-device for the fill kernel
-    std::vector<int64_t> h_sizes(self_c.shape().begin(), self_c.shape().end());
+    std::vector<int64_t> h_sizes(static_cast<std::vector<int64_t>>(self_c.shape()));
     Tensor sizes_d = Tensor::empty({nd}, DType::Int64, self.device());
     CUDA_CHECK(cudaMemcpy(sizes_d.data_ptr<int64_t>(), h_sizes.data(), nd * sizeof(int64_t),
                           cudaMemcpyHostToDevice));
@@ -1184,7 +1229,8 @@ Tensor bucketize_cuda(const Tensor& self, const Tensor& boundaries, bool out_int
 // bincount (BincountKernel.cu: max-reduce to size on host, then atomicAdd)
 // ---------------------------------------------------------------------------
 
-Tensor bincount_cuda(const Tensor& self, const Tensor& weights, int64_t minlength) {
+Tensor bincount_cuda(const Tensor& self, const std::optional<Tensor>& weights_opt, int64_t minlength) {
+    Tensor weights = weights_opt.value_or(Tensor());
     // Accumulates with atomicAdd (no deterministic variant implemented).
     globalContext().alertNotDeterministic("bincount_cuda");
     if (minlength < 0) TP_THROW(RuntimeError, "minlength should be >= 0");
@@ -1325,6 +1371,145 @@ Tensor argsort_cuda(const Tensor& self, int64_t dim, bool descending) {
 }
 
 // ---------------------------------------------------------------------------
+// unique (torch unique_cuda_temp_impl semantics via sort + adjacent-diff):
+//   flags[i] = (i == 0) || sorted[i] != sorted[i-1]
+//   group id = inclusive cumsum(flags) - 1
+//   inverse[order[i]] = gid[i]; counts[g] = next boundary - boundary
+// ---------------------------------------------------------------------------
+namespace {
+
+template <typename T>
+__global__ void unique_flags_kernel(int64_t n, const T* __restrict__ sorted,
+                                    int64_t* __restrict__ flags) {
+    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    flags[i] = (i == 0 || sorted[i] != sorted[i - 1]) ? 1 : 0;
+}
+
+__global__ void unique_inverse_kernel(int64_t n, const int64_t* __restrict__ order,
+                                      const int64_t* __restrict__ gid,
+                                      int64_t* __restrict__ inverse) {
+    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) inverse[order[i]] = gid[i] - 1;
+}
+
+template <typename T>
+__global__ void unique_emit_kernel(int64_t n, const T* __restrict__ sorted,
+                                   const int64_t* __restrict__ flags,
+                                   const int64_t* __restrict__ gid_inclusive,
+                                   T* __restrict__ values,
+                                   int64_t* __restrict__ starts) {
+    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n || !flags[i]) return;
+    const int64_t g = gid_inclusive[i] - 1;  // inclusive cumsum is 1-based
+    values[g] = sorted[i];
+    starts[g] = i;   // segment length = next start (or n) - i, resolved on host
+}
+
+} // namespace
+
+std::tuple<Tensor, Tensor, Tensor> unique_cuda(const Tensor& self, bool sorted,
+                                               bool return_inverse,
+                                               bool return_counts) {
+    TP_CHECK(self.dim() <= 1 || self.numel() == self.size(-1),
+             "unique: only 1D tensors are supported");
+    Tensor flat = self.contiguous().reshape({self.numel()});
+    const int64_t n = flat.numel();
+
+    Tensor values = Tensor::empty({0}, self.dtype(), self.device());
+    Tensor inverse = return_inverse ? Tensor::empty({0}, DType::Int64, self.device())
+                                    : Tensor();
+    Tensor counts = return_counts ? Tensor::empty({0}, DType::Int64, self.device())
+                                  : Tensor();
+    if (n == 0) return std::make_tuple(values, inverse, counts);
+
+    auto [sorted_vals, order] = sort_cuda(flat, 0, false);
+    const int threads = 256;
+    const int blocks = static_cast<int>((n + threads - 1) / threads);
+
+    Tensor flags = Tensor::zeros({n}, DType::Int64, self.device());
+
+    #define UNIQUE_FLAGS_CASE(ctype, name)                                     \
+    case DType::name:                                                          \
+        unique_flags_kernel<ctype><<<blocks, threads>>>(                        \
+            n, sorted_vals.data_ptr<ctype>(), flags.data_ptr<int64_t>());      \
+        break;
+
+    switch (self.dtype()) {
+        UNIQUE_FLAGS_CASE(float, Float32)
+        UNIQUE_FLAGS_CASE(double, Float64)
+        UNIQUE_FLAGS_CASE(int64_t, Int64)
+        UNIQUE_FLAGS_CASE(int32_t, Int32)
+        UNIQUE_FLAGS_CASE(int16_t, Int16)
+        UNIQUE_FLAGS_CASE(int8_t, Int8)
+        UNIQUE_FLAGS_CASE(uint8_t, UInt8)
+        case DType::Bool:
+            unique_flags_kernel<bool><<<blocks, threads>>>(
+                n, reinterpret_cast<const bool*>(sorted_vals.data_ptr<bool>()),
+                flags.data_ptr<int64_t>());
+            break;
+        default:
+            TP_THROW(NotImplementedError, "unique: unsupported dtype on CUDA");
+    }
+    #undef UNIQUE_FLAGS_CASE
+
+    // gid = inclusive cumsum(flags); last element == number of groups.
+    Tensor gid = flags.cumsum(0);
+    const int64_t num_groups =
+        gid.to(Device(DeviceType::CPU)).data_ptr<int64_t>()[n - 1];
+
+    values = Tensor::empty({num_groups}, self.dtype(), self.device());
+    if (return_inverse) {
+        inverse = Tensor::empty({n}, DType::Int64, self.device());
+        unique_inverse_kernel<<<blocks, threads>>>(
+            n, order.data_ptr<int64_t>(), gid.data_ptr<int64_t>(),
+            inverse.data_ptr<int64_t>());
+    }
+    if (return_counts) {
+        counts = Tensor::zeros({num_groups}, DType::Int64, self.device());
+        // counts[g] via a small host pass over boundaries would need a sync;
+        // do it with an atomic-free scatter of segment lengths on device:
+        Tensor starts = Tensor::full({num_groups}, int64_t(-1), DType::Int64,
+                                     self.device());
+        // emit values + record start positions
+        #define UNIQUE_EMIT_CASE(ctype, name)                                  \
+        case DType::name:                                                      \
+            unique_emit_kernel<ctype><<<blocks, threads>>>(                     \
+                n, sorted_vals.data_ptr<ctype>(), flags.data_ptr<int64_t>(),   \
+                gid.data_ptr<int64_t>(), values.data_ptr<ctype>(),             \
+                starts.data_ptr<int64_t>());                                    \
+            break;
+        switch (self.dtype()) {
+            UNIQUE_EMIT_CASE(float, Float32)
+            UNIQUE_EMIT_CASE(double, Float64)
+            UNIQUE_EMIT_CASE(int64_t, Int64)
+            UNIQUE_EMIT_CASE(int32_t, Int32)
+            UNIQUE_EMIT_CASE(int16_t, Int16)
+            UNIQUE_EMIT_CASE(int8_t, Int8)
+            UNIQUE_EMIT_CASE(uint8_t, UInt8)
+            default:
+                TP_THROW(NotImplementedError, "unique: unsupported dtype on CUDA");
+        }
+        #undef UNIQUE_EMIT_CASE
+        // counts[g] = next_start - start; resolved on host over the small
+        // starts buffer (num_groups entries).
+        std::vector<int64_t> h(num_groups);
+        std::memcpy(h.data(), starts.to(Device(DeviceType::CPU)).data_ptr<int64_t>(),
+                    static_cast<size_t>(num_groups) * sizeof(int64_t));
+        std::vector<int64_t> hc(num_groups);
+        for (int64_t g = 0; g < num_groups; ++g) {
+            const int64_t e = (g + 1 < num_groups) ? h[g + 1] : n;
+            hc[g] = e - h[g];
+        }
+        // NB: counts lives on the device -- materialize on CPU via the tensor
+        // factory, then move (H2D); a raw memcpy into device memory segfaults
+        // on discrete GPUs, and tensor() itself is CPU-only in this tree.
+        counts = Tensor::tensor(hc, DType::Int64).to(self.device());
+    }
+    return std::make_tuple(values, inverse, counts);
+}
+
+// ---------------------------------------------------------------------------
 // cumsum_backward (derivatives.yaml:530 -> reverse scan R[i]=sum_{j>=i} g[j])
 // ---------------------------------------------------------------------------
 
@@ -1401,11 +1586,14 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, IndexingKernels) {
     m.impl("index_copy", index_copy_cuda);
     m.impl("index_fill.Tensor", index_fill_tensor_cuda);
     m.impl("index_fill.Scalar", index_fill_scalar_cuda);
+    m.impl("index_fill_.Tensor", index_fill_tensor__cuda);
+    m.impl("index_fill_.Scalar", index_fill_scalar__cuda);
     m.impl("index_put", index_put_cuda);
     m.impl("index_put_", index_put__cuda);
     m.impl("nonzero", nonzero_cuda);
     m.impl("sort", sort_cuda);
     m.impl("argsort", argsort_cuda);
+    m.impl("unique", unique_cuda);
     m.impl("searchsorted.Tensor", searchsorted_cuda);
     m.impl("bucketize.Tensor", bucketize_cuda);
     m.impl("bincount", bincount_cuda);

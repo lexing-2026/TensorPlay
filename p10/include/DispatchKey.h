@@ -27,6 +27,16 @@ enum class DispatchKey : uint8_t {
     AutocastCPU = 4,
     AutocastCUDA = 5,
 
+    // Backend-neutral composite key, TensorPlay's proportionate stand-in for
+    // c10's CompositeExplicitAutograd alias key: getRuntimeDispatchKeySet()
+    // expands it to backend_dispatch_keyset (c10/core/DispatchKeySet.cpp) and
+    // DefaultBackend aliases it -- one registration serves every dense backend
+    // until a backend registers its own kernel ("valid to explicitly override
+    // on a per-backend basis", DispatchKey.h).  Lookups never walk this key
+    // from a tensor key set; the dispatcher consults it only when a backend
+    // slot is empty.
+    Composite = 6,
+
     EndOfKeys // Sentinel
 };
 
@@ -43,13 +53,21 @@ inline constexpr DispatchKey toAutogradKey(DispatchKey backend) {
 }
 
 inline constexpr bool is_autocast_key(DispatchKey key) {
-    return static_cast<uint8_t>(key) >= kAutocastKeyOffset &&
-           static_cast<uint8_t>(key) < kAutogradKeyOffset;
+    // Autocast keys occupy [kAutocastKeyOffset, kAutocastKeyOffset + kBackendKeyCount).
+    const uint8_t k = static_cast<uint8_t>(key);
+    return k >= kAutocastKeyOffset && k < kAutocastKeyOffset + kBackendKeyCount;
 }
 
 inline constexpr bool is_autograd_key(DispatchKey key) {
-    return static_cast<uint8_t>(key) >= kAutogradKeyOffset &&
-           static_cast<uint8_t>(key) < static_cast<uint8_t>(DispatchKey::EndOfKeys);
+    // Autograd keys occupy [kAutogradKeyOffset, kAutogradKeyOffset + kBackendKeyCount);
+    // the Composite key sits above them and must not be classified as autograd.
+    const uint8_t k = static_cast<uint8_t>(key);
+    return k >= kAutogradKeyOffset && k < kAutogradKeyOffset + kBackendKeyCount;
+}
+
+// True for the dense backend component keys (c10 isBackendDispatchKey).
+inline constexpr bool is_backend_key(DispatchKey key) {
+    return key == DispatchKey::CPU || key == DispatchKey::CUDA;
 }
 
 // The backend component of an autocast or autograd key (identity for backend keys).
@@ -69,6 +87,7 @@ inline std::string toString(DispatchKey key) {
         case DispatchKey::AutocastCUDA: return "AutocastCUDA";
         case DispatchKey::AutogradCPU: return "AutogradCPU";
         case DispatchKey::AutogradCUDA: return "AutogradCUDA";
+        case DispatchKey::Composite: return "Composite";
         default: return "Unknown";
     }
 }

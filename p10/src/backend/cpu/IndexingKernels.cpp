@@ -393,23 +393,39 @@ Tensor scatter_base_cpu(const Tensor& self, int64_t dim, const Tensor& index,
         TP_THROW(IndexError, "Index must have same number of dimensions as output tensor");
     }
     Tensor idx_c = (index.dtype() == DType::Int64) ? index.contiguous() : index.to(DType::Int64).contiguous();
-    // broadcast src against index shape
-    std::vector<int64_t> idx_shape(idx_c.shape().begin(), idx_c.shape().end());
+    // src must broadcast against the index shape (torch semantics).
+    std::vector<int64_t> idx_shape(static_cast<std::vector<int64_t>>(idx_c.shape()));
     Tensor src_b;
-    if (src.dim() == 0) {
+    if (src.numel() == 1) {
         src_b = src.expand(idx_shape).contiguous();
     } else {
         std::vector<int64_t> bshape = broadcast_shapes(
             static_cast<std::vector<int64_t>>(src.shape()), idx_shape);
-        src_b = src.expand(bshape).contiguous();
+        if (bshape != idx_shape) {
+            TP_THROW(RuntimeError, "scatter: src shape must broadcast to the index shape");
+        }
+        src_b = src.expand(idx_shape).contiguous();
+    }
+    if (src_b.dtype() != self.dtype()) {
+        // torch scatters through self's dtype
+        src_b = src_b.to(self.dtype());
     }
     Tensor result = self.clone();
-    int64_t inner = 1;
-    for (int64_t i = dim + 1; i < nd; ++i) inner *= self.size(i);
+    // Layout of the index tensor: [outer][dim][idx_inner]; the destination
+    // row stride inside `self` is its own inner extent (which may be larger
+    // than the index's when the index is broadcast-thin along trailing dims).
+    int64_t idx_outer = 1;
+    for (int64_t i = 0; i < dim; ++i) idx_outer *= idx_c.size(i);
+    int64_t idx_inner = 1;
+    for (int64_t i = dim + 1; i < nd; ++i) idx_inner *= idx_c.size(i);
+    int64_t self_inner = 1;
+    for (int64_t i = dim + 1; i < nd; ++i) self_inner *= self.size(i);
     int64_t idx_dim_size = idx_c.size(dim);
     int64_t total_idx = idx_c.numel();
     int64_t self_dim_size = self.size(dim);
-
+    // Each index element addresses one slice of `self_inner` values; the
+    // source value is broadcast across that slice (ATen gpu_scatter_assign /
+    // scatter_gather_base_kernel).
 #define TP_SCATTER_CASE(ctype, name) \
     case DType::name: { \
         ctype* d = result.data_ptr<ctype>(); \
@@ -418,15 +434,18 @@ Tensor scatter_base_cpu(const Tensor& self, int64_t dim, const Tensor& index,
         parallel_for(0, total_idx, GRAIN_SIZE, [&](int64_t begin, int64_t end) { \
             for (int64_t flat = begin; flat < end; ++flat) { \
                 int64_t rem = flat; \
-                int64_t outer_off = rem / (idx_dim_size * inner); rem -= outer_off * idx_dim_size * inner; \
-                int64_t j = rem / inner; rem -= j * inner; \
-                int64_t in2 = rem; \
+                int64_t outer_off = rem / (idx_dim_size * idx_inner); \
+                rem -= outer_off * idx_dim_size * idx_inner; \
+                int64_t j = rem / idx_inner; \
                 int64_t idx = ip[flat]; \
                 if (idx < 0) idx += self_dim_size; \
-                int64_t dst = (outer_off * self_dim_size + idx) * inner + in2; \
+                int64_t dst = (outer_off * self_dim_size + idx) * self_inner; \
                 ctype v = vp[flat]; \
-                if (mode == ScatterMode::Assign) d[dst] = v; \
-                else d[dst] += v; \
+                if (mode == ScatterMode::Assign) { \
+                    for (int64_t k = 0; k < self_inner; ++k) d[dst + k] = v; \
+                } else { \
+                    for (int64_t k = 0; k < self_inner; ++k) d[dst + k] += v; \
+                } \
             } \
         }); \
         break; \
@@ -464,14 +483,20 @@ static Tensor& scatter_base_inplace_cpu(Tensor& self, int64_t dim, const Tensor&
         TP_THROW(IndexError, "Index must have same number of dimensions as output tensor");
     }
     Tensor idx_c = (index.dtype() == DType::Int64) ? index.contiguous() : index.to(DType::Int64).contiguous();
-    std::vector<int64_t> idx_shape(idx_c.shape().begin(), idx_c.shape().end());
+    std::vector<int64_t> idx_shape(static_cast<std::vector<int64_t>>(idx_c.shape()));
     Tensor src_b;
-    if (src.dim() == 0) {
+    if (src.numel() == 1) {
         src_b = src.expand(idx_shape).contiguous();
     } else {
         std::vector<int64_t> bshape = broadcast_shapes(
             static_cast<std::vector<int64_t>>(src.shape()), idx_shape);
-        src_b = src.expand(bshape).contiguous();
+        if (bshape != idx_shape) {
+            TP_THROW(RuntimeError, "scatter_: src shape must broadcast to the index shape");
+        }
+        src_b = src.expand(idx_shape).contiguous();
+    }
+    if (src_b.dtype() != self.dtype()) {
+        src_b = src_b.to(self.dtype());
     }
     if (!self.is_contiguous()) {
         // The raw-pointer loop below needs a contiguous destination; scatter
@@ -482,6 +507,10 @@ static Tensor& scatter_base_inplace_cpu(Tensor& self, int64_t dim, const Tensor&
         return self;
     }
     Tensor& result = self;
+    int64_t idx_outer = 1;
+    for (int64_t i = 0; i < dim; ++i) idx_outer *= idx_c.size(i);
+    int64_t idx_inner = 1;
+    for (int64_t i = dim + 1; i < nd; ++i) idx_inner *= idx_c.size(i);
     int64_t inner = 1;
     for (int64_t i = dim + 1; i < nd; ++i) inner *= self.size(i);
     int64_t idx_dim_size = idx_c.size(dim);
@@ -496,15 +525,18 @@ static Tensor& scatter_base_inplace_cpu(Tensor& self, int64_t dim, const Tensor&
         parallel_for(0, total_idx, GRAIN_SIZE, [&](int64_t begin, int64_t end) { \
             for (int64_t flat = begin; flat < end; ++flat) { \
                 int64_t rem = flat; \
-                int64_t outer_off = rem / (idx_dim_size * inner); rem -= outer_off * idx_dim_size * inner; \
-                int64_t j = rem / inner; rem -= j * inner; \
-                int64_t in2 = rem; \
+                int64_t outer_off = rem / (idx_dim_size * idx_inner); \
+                rem -= outer_off * idx_dim_size * idx_inner; \
+                int64_t j = rem / idx_inner; \
                 int64_t idx = ip[flat]; \
                 if (idx < 0) idx += self_dim_size; \
-                int64_t dst = (outer_off * self_dim_size + idx) * inner + in2; \
+                int64_t dst = (outer_off * self_dim_size + idx) * inner; \
                 ctype v = vp[flat]; \
-                if (mode == ScatterMode::Assign) d[dst] = v; \
-                else d[dst] += v; \
+                if (mode == ScatterMode::Assign) { \
+                    for (int64_t k = 0; k < inner; ++k) d[dst + k] = v; \
+                } else { \
+                    for (int64_t k = 0; k < inner; ++k) d[dst + k] += v; \
+                } \
             } \
         }); \
         break; \
@@ -667,6 +699,11 @@ Tensor index_fill_scalar_cpu(const Tensor& self, int64_t dim, const Tensor& inde
 
 Tensor index_fill_tensor_cpu(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& value) {
     // ATen index_fill_.Tensor reduces the 0-dim value to a scalar first.
+    if (value.dim() != 0) {
+        TP_THROW(RuntimeError,
+                 "index_fill only supports a 0-dimensional value tensor, but got tensor with ",
+                 value.dim(), " dimension(s).");
+    }
     Scalar v = value.item();
     return index_fill_scalar_cpu(self, dim, index, v);
 }
@@ -701,6 +738,23 @@ Tensor index_fill_scalar_cpu(const Tensor& self, int64_t dim, const Tensor& inde
     }
 #undef TP_IFILL_CASE
     return result;
+}
+
+Tensor& index_fill_scalar__cpu(Tensor& self, int64_t dim, const Tensor& index, Scalar value) {
+    // ATen IndexKernel.cpp index_fill_ writes in place through the same
+    // slice loop; tp composes it as fill-then-copy_ like the other
+    // in-place index ops.
+    self.copy_(index_fill_scalar_cpu(self, dim, index, value));
+    return self;
+}
+
+Tensor& index_fill_tensor__cpu(Tensor& self, int64_t dim, const Tensor& index, const Tensor& value) {
+    if (value.dim() != 0) {
+        TP_THROW(RuntimeError,
+                 "index_fill_ only supports a 0-dimensional value tensor, but got tensor with ",
+                 value.dim(), " dimension(s).");
+    }
+    return index_fill_scalar__cpu(self, dim, index, value.item());
 }
 
 // ---------------------------------------------------------------------------
@@ -936,7 +990,8 @@ Tensor bucketize_cpu(const Tensor& self, const Tensor& boundaries, bool out_int3
 //     output is always Long (:73).
 // ---------------------------------------------------------------------------
 
-Tensor bincount_cpu(const Tensor& self, const Tensor& weights, int64_t minlength) {
+Tensor bincount_cpu(const Tensor& self, const std::optional<Tensor>& weights_opt, int64_t minlength) {
+    Tensor weights = weights_opt.value_or(Tensor());
     if (minlength < 0) {
         TP_THROW(RuntimeError, "minlength should be >= 0");
     }
@@ -1151,10 +1206,13 @@ std::tuple<Tensor, Tensor, Tensor> unique_cpu(const Tensor& self, bool sorted, b
     const int64_t n_groups = int64_t(group_first.size());
 
     Tensor values = Tensor::empty({n_groups}, sc.dtype(), sc.device());
+    // NB: group_first[] indexes positions in the sorted order[] sequence;
+    // dereference order first or we read original-layout values (ATen
+    // unique_cpu_temp_impl gathers via sort_indices).
     #define TP_UNIQUE_FILL(ctype, dt)                                            \
         {                                                                        \
             ctype* dst = values.data_ptr<ctype>();                               \
-            for (int64_t g = 0; g < n_groups; ++g) dst[g] = p[group_first[g]];   \
+            for (int64_t g = 0; g < n_groups; ++g) dst[g] = p[order[group_first[g]]]; \
         }                                                                        \
         break;
     switch (sc.dtype()) {
@@ -1211,6 +1269,8 @@ TENSORPLAY_LIBRARY_IMPL(CPU, IndexingKernels) {
     m.impl("index_copy", index_copy_cpu);
     m.impl("index_fill.Tensor", index_fill_tensor_cpu);
     m.impl("index_fill.Scalar", index_fill_scalar_cpu);
+    m.impl("index_fill_.Tensor", index_fill_tensor__cpu);
+    m.impl("index_fill_.Scalar", index_fill_scalar__cpu);
     m.impl("index_put", index_put_cpu);
     m.impl("index_put_", index_put__cpu);
     m.impl("nonzero", nonzero_cpu);

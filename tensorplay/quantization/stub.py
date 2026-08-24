@@ -23,6 +23,12 @@ class QuantStub(nn.Module):
         super().__init__()
         self.fake_quant = FakeQuantize() if qconfig is None else qconfig()
 
+    def record(self, x):
+        """Calibration entry point: feeds the batch to the inner FakeQuantize
+        observer without fake-quantizing (mirrors manual calibration loops)."""
+        self.fake_quant.record(x)
+        return x
+
     def forward(self, x):
         # Calibration / QAT path: simulated quantization keeps the graph
         # float while nudging values toward the quantized grid.

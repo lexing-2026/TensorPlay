@@ -35,7 +35,7 @@ class Stream:
     A CUDA stream is a linear sequence of execution that belongs to a specific
     device, independent from other streams. It supports with statement as a
     context manager to ensure the operators within the with block are running
-    on the corresponding stream.  See :ref:`cuda-semantics` for details.
+    on the corresponding stream.  See the CUDA semantics documentation for details.
 
     Args:
         device(tensorplay.Device or int, optional): a device on which to allocate

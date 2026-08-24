@@ -65,7 +65,17 @@ public:
         if (!table_ || dispatchKeyIndex(key) >= kDispatchKeyCount) {
             return nullptr;
         }
-        return table_->kernels[dispatchKeyIndex(key)].load(std::memory_order_acquire);
+        auto kernel = table_->kernels[dispatchKeyIndex(key)].load(std::memory_order_acquire);
+        // Composite fallthrough (c10: getRuntimeDispatchKeySet(
+        // CompositeExplicitAutograd) == backend_dispatch_keyset): a backend
+        // with no kernel of its own is served by the backend-neutral composite
+        // registration; an explicit backend kernel overrides it.
+        if (!kernel && is_backend_key(key)) {
+            constexpr auto kCompositeIdx = dispatchKeyIndex(DispatchKey::Composite);
+            static_assert(kCompositeIdx < kDispatchKeyCount, "composite key out of range");
+            kernel = table_->kernels[kCompositeIdx].load(std::memory_order_acquire);
+        }
+        return kernel;
     }
 
     const char* name() const noexcept {

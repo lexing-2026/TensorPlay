@@ -18,8 +18,10 @@ Typical use follows torch.cuda.graph::
     g.replay()
 
 Static input/output tensors must stay alive for as long as the graph; their
-addresses are baked into the executable.  Random-number ops inside a capture
-replay identical values (RNG offset prologue/epilogue is not implemented).
+addresses are baked into the executable.  Random ops captured inside the graph
+read their (seed, offset) from a graph-owned device buffer that every
+:meth:`CUDAGraph.replay` refreshes from the generator, so each replay draws a
+fresh, disjoint slice of the random stream (mirroring torch's graph-safe RNG).
 """
 
 import contextlib

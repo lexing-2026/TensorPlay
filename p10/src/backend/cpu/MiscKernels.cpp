@@ -34,6 +34,10 @@ Tensor eq_tensor_kernel(const Tensor& self, const Tensor& other);
 // Defined below the registration table.
 Tensor& resize__cpu(Tensor& self, const std::vector<int64_t>& size);
 std::tuple<Tensor, Tensor> native_dropout_cpu(const Tensor& input, double p);
+std::tuple<Tensor, Tensor> native_alpha_dropout_cpu(const Tensor& input, double p);
+Tensor alpha_dropout_backward_cpu(const Tensor& grad, const Tensor& mask, double p);
+std::tuple<Tensor, Tensor> native_feature_dropout_cpu(const Tensor& input, double p);
+Tensor feature_dropout_backward_cpu(const Tensor& grad, const Tensor& mask, double p);
 
 namespace {
 
@@ -184,6 +188,10 @@ TENSORPLAY_LIBRARY_IMPL(CPU, MiscKernels) {
     m.impl("glu_backward", glu_backward_cpu);
     m.impl("resize_", resize__cpu);
     m.impl("native_dropout", native_dropout_cpu);
+    m.impl("native_alpha_dropout", native_alpha_dropout_cpu);
+    m.impl("_alpha_dropout_backward", alpha_dropout_backward_cpu);
+    m.impl("native_feature_dropout", native_feature_dropout_cpu);
+    m.impl("_feature_dropout_backward", feature_dropout_backward_cpu);
 }
 
 // resize_ grows the storage in place (preserving the old contents) and then
@@ -286,6 +294,72 @@ std::tuple<Tensor, Tensor> native_dropout_cpu(const Tensor& input, double p) {
                      "dropout is only supported on floating point tensors");
     }
     return {std::move(out), std::move(mask)};
+}
+
+// ---------------------------------------------------------------------------
+// Alpha / feature dropout — ATen _dropout_impl<feature, alpha> fused as
+// (output, mask) pairs so the backward can reapply the saved mask. The
+// Bernoulli noise reuses the registered bernoulli_ kernel; the affine math
+// is expressed through dispatched mul/add so both backends share one path.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr double kAlphaDropoutAlpha = 1.7580993408473766;
+
+double alpha_dropout_scale(double p) {
+    return 1.0 / std::sqrt((kAlphaDropoutAlpha * kAlphaDropoutAlpha * p + 1.0) *
+                           (1.0 - p));
+}
+
+Tensor bernoulli_mask(const Tensor& input, const std::vector<int64_t>& shape,
+                      double keep_prob) {
+    Tensor noise = Tensor::full(shape, keep_prob, DType::Float32,
+                                input.device());
+    noise.bernoulli_();
+    return noise;
+}
+
+} // anonymous namespace
+
+std::tuple<Tensor, Tensor> native_alpha_dropout_cpu(const Tensor& input, double p) {
+    if (p < 0 || p >= 1) {
+        TP_THROW(ValueError, "alpha_dropout: p must be in [0, 1)");
+    }
+    Tensor mask = bernoulli_mask(input,
+                                 static_cast<std::vector<int64_t>>(input.shape()),
+                                 1.0 - p);
+    const double a = alpha_dropout_scale(p);
+    // out = mask * (x * a + alpha * a) + alpha * a * (p - 1)
+    Tensor out = mask.mul(input.mul(a).add(kAlphaDropoutAlpha * a))
+                    .add(kAlphaDropoutAlpha * a * (p - 1.0));
+    return {std::move(out), std::move(mask)};
+}
+
+Tensor alpha_dropout_backward_cpu(const Tensor& grad, const Tensor& mask,
+                                  double p) {
+    const double a = alpha_dropout_scale(p);
+    return grad.mul(mask).mul(a);
+}
+
+std::tuple<Tensor, Tensor> native_feature_dropout_cpu(const Tensor& input, double p) {
+    if (p < 0 || p >= 1) {
+        TP_THROW(ValueError, "feature_dropout: p must be in [0, 1)");
+    }
+    if (input.dim() < 2) {
+        TP_THROW(RuntimeError, "feature_dropout requires at least 2D input");
+    }
+    std::vector<int64_t> mask_shape =
+        static_cast<std::vector<int64_t>>(input.shape());
+    for (int64_t d = 2; d < input.dim(); ++d) mask_shape[d] = 1;
+    Tensor mask = bernoulli_mask(input, mask_shape, 1.0 - p);
+    Tensor out = input.mul(mask).div(1.0 - p);
+    return {std::move(out), std::move(mask)};
+}
+
+Tensor feature_dropout_backward_cpu(const Tensor& grad, const Tensor& mask,
+                                    double p) {
+    return grad.mul(mask).div(1.0 - p);
 }
 
 } // namespace cpu

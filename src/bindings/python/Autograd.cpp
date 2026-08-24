@@ -139,15 +139,21 @@ void init_autograd(py::module_& m) {
         bool keep_graph = retain_graph.value_or(create_graph);
         std::vector<Tensor> grads;
         if (grad_outputs) grads = *grad_outputs;
-        py::gil_scoped_release release;
-        auto captured = tensorplay::tpx::grad(outputs, inputs, grads, keep_graph, create_graph, allow_unused);
         // Undefined gradients (unused inputs, or grads that arrive as
         // undefined through the graph) surface as None, matching torch.
-        std::vector<std::optional<Tensor>> result;
-        result.reserve(captured.size());
-        for (auto& t : captured) {
-            if (t.defined()) result.emplace_back(std::move(t));
-            else result.emplace_back(std::nullopt);
+        // torch.autograd.grad returns a tuple; functional.py's vjp/jvp rely
+        // on it.
+        std::vector<tensorplay::Tensor> captured;
+        {
+            py::gil_scoped_release release;
+            captured = tensorplay::tpx::grad(outputs, inputs, grads,
+                                             keep_graph, create_graph,
+                                             allow_unused);
+        }
+        py::tuple result(captured.size());
+        for (size_t i = 0; i < captured.size(); ++i) {
+            if (captured[i].defined()) result[i] = py::cast(std::move(captured[i]));
+            else result[i] = py::none();
         }
         return result;
     }, "outputs"_a, "inputs"_a, "grad_outputs"_a = py::none(), "retain_graph"_a = py::none(), "create_graph"_a = false, "allow_unused"_a = false);

@@ -211,6 +211,29 @@ def node_member_type(t: Type) -> str:
 # Default value translation
 # ---------------------------------------------------------------------------
 
+# Single source of truth for MemoryFormat's ABI-stable integer values; the
+# dispatcher rides the enum as int64_t everywhere ("enum not exposed" in the
+# C++ atomics above), so every target language renders defaults from here.
+_MEMORY_FORMAT_VALUES = {"Contiguous": 0, "Preserve": 1,
+                         "ChannelsLast": 2, "ChannelsLast3d": 3}
+
+# torch spelling for generated Python surfaces (`torch.contiguous_format`
+# analog): tensorplay exposes these as IntEnum members, which ARE their
+# integer ABI values.
+_MEMORY_FORMAT_PY = {
+    "Contiguous": "tensorplay.contiguous_format",
+    "Preserve": "tensorplay.preserve_format",
+    "ChannelsLast": "tensorplay.channels_last",
+    "ChannelsLast3d": "tensorplay.channels_last_3d",
+}
+
+
+def _memory_format_name(default: str) -> str | None:
+    """Accept both bare and enum-qualified yaml spellings."""
+    name = default.split("::")[-1].strip()
+    return name if name in _MEMORY_FORMAT_VALUES else None
+
+
 def cpp_default(t: Type, default: str) -> str:
     d = default
     if d == "Float32":
@@ -227,6 +250,12 @@ def cpp_default(t: Type, default: str) -> str:
         return "true"
     if d == "false":
         return "false"
+    if t.kind == "MemoryFormat":
+        # MemoryFormat rides the dispatcher as its integer value, and the
+        # rendered C++ parameter type is int64_t.
+        name = _memory_format_name(d)
+        if name is not None:
+            return str(_MEMORY_FORMAT_VALUES[name])
     if d.startswith("{") or d.startswith("["):
         body = d[1:-1].strip()
         if t.is_list or t.kind.endswith("[]"):
@@ -251,6 +280,12 @@ _PYI_DEFAULT_MAP = {
 
 
 def pyi_default(t: Type, default: str) -> str:
+    if t.kind == "MemoryFormat":
+        # Bare `Contiguous` would be an undefined name in generated Python;
+        # emit the torch-style module-level enum spelling instead.
+        name = _memory_format_name(default)
+        if name is not None:
+            return _MEMORY_FORMAT_PY[name]
     d = _PYI_DEFAULT_MAP.get(default, default)
     if t.is_tensor_like and d == "{}":
         return "None"

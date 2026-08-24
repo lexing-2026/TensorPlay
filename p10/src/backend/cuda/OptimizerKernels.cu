@@ -1407,6 +1407,12 @@ std::vector<Tensor> foreach_pow_scalar_tensor_cuda(
         return base.pow(value);
     });
 }
+// cpu foreach_pow_tensor_tensor_cpu: one base tensor, per-element exponents
+// -- out[i] = self ** exponent[i] (broadcast via the dispatcher pow op).
+std::vector<Tensor> foreach_pow_tensor_tensor_cuda(const Tensor& self,
+                                                  const std::vector<Tensor>& exponent) {
+    return foreach_map(exponent, [&](const Tensor& value) { return self.pow(value); });
+}
 std::vector<Tensor> foreach_pow_list_cuda(const std::vector<Tensor>& self, const std::vector<Tensor>& exponent) {
     return foreach_map_pair(self, exponent, [&](const Tensor& value, const Tensor& rhs) { return value.pow(rhs); });
 }
@@ -1528,6 +1534,378 @@ void foreach_zero_inplace_cuda(std::vector<Tensor> self) {
 
 } // namespace
 
+// ---------------------------------------------------------------------------
+// Gap-fill: remaining functional foreach ops + the _out variant family.
+// Mirrors cpu/ForeachKernels.cpp: _out computes functionally, then copies
+// each result into the matching output handle.
+// ---------------------------------------------------------------------------
+
+static void copy_foreach_out_cuda(std::vector<Tensor> result,
+                                  std::vector<Tensor> out,
+                                  const char* op_name) {
+    if (result.size() != out.size()) {
+        TP_THROW(ValueError, std::string(op_name) +
+            ": output list must have the same length as the input list");
+    }
+    for (size_t i = 0; i < result.size(); ++i) {
+        out[i].copy_(result[i]);
+    }
+}
+
+#define DEFINE_FOREACH_EXTRA_UNARY(NAME) \
+std::vector<Tensor> foreach_##NAME##_cuda(const std::vector<Tensor>& self) { \
+    std::vector<Tensor> out; \
+    out.reserve(self.size()); \
+    for (const auto& value : self) out.push_back(value.NAME()); \
+    return out; \
+} \
+void foreach_##NAME##_inplace_cuda(std::vector<Tensor> self) { \
+    for (auto& value : self) value.copy_(value.NAME()); \
+}
+DEFINE_FOREACH_EXTRA_UNARY(acos)
+DEFINE_FOREACH_EXTRA_UNARY(asin)
+DEFINE_FOREACH_EXTRA_UNARY(atan)
+DEFINE_FOREACH_EXTRA_UNARY(ceil)
+DEFINE_FOREACH_EXTRA_UNARY(cos)
+DEFINE_FOREACH_EXTRA_UNARY(cosh)
+DEFINE_FOREACH_EXTRA_UNARY(erf)
+DEFINE_FOREACH_EXTRA_UNARY(erfc)
+DEFINE_FOREACH_EXTRA_UNARY(exp)
+DEFINE_FOREACH_EXTRA_UNARY(expm1)
+DEFINE_FOREACH_EXTRA_UNARY(floor)
+DEFINE_FOREACH_EXTRA_UNARY(frac)
+DEFINE_FOREACH_EXTRA_UNARY(lgamma)
+DEFINE_FOREACH_EXTRA_UNARY(log)
+DEFINE_FOREACH_EXTRA_UNARY(log10)
+DEFINE_FOREACH_EXTRA_UNARY(log1p)
+DEFINE_FOREACH_EXTRA_UNARY(log2)
+DEFINE_FOREACH_EXTRA_UNARY(round)
+DEFINE_FOREACH_EXTRA_UNARY(sigmoid)
+DEFINE_FOREACH_EXTRA_UNARY(sin)
+DEFINE_FOREACH_EXTRA_UNARY(sinh)
+DEFINE_FOREACH_EXTRA_UNARY(tanh)
+DEFINE_FOREACH_EXTRA_UNARY(tan)
+DEFINE_FOREACH_EXTRA_UNARY(trunc)
+#undef DEFINE_FOREACH_EXTRA_UNARY
+
+std::vector<Tensor> foreach_max_cuda(const std::vector<Tensor>& self) {
+    std::vector<Tensor> out;
+    out.reserve(self.size());
+    for (const auto& value : self) out.push_back(value.max());
+    return out;
+}
+
+std::vector<Tensor> foreach_zero_cuda(const std::vector<Tensor>& self) {
+    std::vector<Tensor> out;
+    out.reserve(self.size());
+    for (const auto& value : self) out.push_back(Tensor::zeros_like(value));
+    return out;
+}
+
+std::vector<Tensor> foreach_clone_cuda(const std::vector<Tensor>& self,
+                                       const std::optional<int64_t>& /*memory_format*/) {
+    std::vector<Tensor> out;
+    out.reserve(self.size());
+    for (const auto& value : self) out.push_back(value.clone());
+    return out;
+}
+
+std::vector<Tensor> foreach_copy_cuda(const std::vector<Tensor>& self,
+                                      const std::vector<Tensor>& src,
+                                      bool /*non_blocking*/) {
+    if (self.size() != src.size()) {
+        TP_THROW(ValueError, "_foreach_copy: list sizes must match");
+    }
+    std::vector<Tensor> out;
+    out.reserve(self.size());
+    for (size_t i = 0; i < self.size(); ++i) out.push_back(src[i].clone());
+    return out;
+}
+
+std::vector<Tensor> foreach_mm_cuda(const std::vector<Tensor>& self,
+                                    const std::vector<Tensor>& mat2) {
+    if (self.size() != mat2.size()) {
+        TP_THROW(ValueError, "_foreach_mm: list sizes must match");
+    }
+    std::vector<Tensor> out;
+    out.reserve(self.size());
+    for (size_t i = 0; i < self.size(); ++i) out.push_back(self[i].mm(mat2[i]));
+    return out;
+}
+
+std::vector<Tensor> foreach_norm_cuda(const std::vector<Tensor>& self,
+                                      Scalar ord,
+                                      const std::optional<DType>& dtype) {
+    std::vector<Tensor> out;
+    out.reserve(self.size());
+    for (const auto& value : self) {
+        Tensor input = dtype.has_value() ? value.to(*dtype) : value;
+        out.push_back(input.norm(ord.toDouble()));
+    }
+    return out;
+}
+
+std::vector<Tensor> foreach_powsum_cuda(const std::vector<Tensor>& self,
+                                        Scalar ord,
+                                        const std::optional<DType>& dtype) {
+    std::vector<Tensor> out;
+    out.reserve(self.size());
+    for (const auto& value : self) {
+        Tensor input = dtype.has_value() ? value.to(*dtype) : value;
+        out.push_back(input.abs().pow(ord).sum());
+    }
+    return out;
+}
+
+#define DEFINE_FOREACH_UNARY_OUT_CUDA(NAME) \
+void foreach_##NAME##_out_cuda(const std::vector<Tensor>& self, \
+                               std::vector<Tensor> out) { \
+    copy_foreach_out_cuda(foreach_##NAME##_cuda(self), std::move(out), \
+                          "_foreach_" #NAME ".out"); \
+}
+DEFINE_FOREACH_UNARY_OUT_CUDA(sqrt)
+DEFINE_FOREACH_UNARY_OUT_CUDA(rsqrt)
+DEFINE_FOREACH_UNARY_OUT_CUDA(neg)
+DEFINE_FOREACH_UNARY_OUT_CUDA(abs)
+DEFINE_FOREACH_UNARY_OUT_CUDA(sign)
+DEFINE_FOREACH_UNARY_OUT_CUDA(reciprocal)
+DEFINE_FOREACH_UNARY_OUT_CUDA(acos)
+DEFINE_FOREACH_UNARY_OUT_CUDA(asin)
+DEFINE_FOREACH_UNARY_OUT_CUDA(atan)
+DEFINE_FOREACH_UNARY_OUT_CUDA(ceil)
+DEFINE_FOREACH_UNARY_OUT_CUDA(cos)
+DEFINE_FOREACH_UNARY_OUT_CUDA(cosh)
+DEFINE_FOREACH_UNARY_OUT_CUDA(erf)
+DEFINE_FOREACH_UNARY_OUT_CUDA(erfc)
+DEFINE_FOREACH_UNARY_OUT_CUDA(exp)
+DEFINE_FOREACH_UNARY_OUT_CUDA(expm1)
+DEFINE_FOREACH_UNARY_OUT_CUDA(floor)
+DEFINE_FOREACH_UNARY_OUT_CUDA(frac)
+DEFINE_FOREACH_UNARY_OUT_CUDA(lgamma)
+DEFINE_FOREACH_UNARY_OUT_CUDA(log)
+DEFINE_FOREACH_UNARY_OUT_CUDA(log10)
+DEFINE_FOREACH_UNARY_OUT_CUDA(log1p)
+DEFINE_FOREACH_UNARY_OUT_CUDA(log2)
+DEFINE_FOREACH_UNARY_OUT_CUDA(round)
+DEFINE_FOREACH_UNARY_OUT_CUDA(sigmoid)
+DEFINE_FOREACH_UNARY_OUT_CUDA(sin)
+DEFINE_FOREACH_UNARY_OUT_CUDA(sinh)
+DEFINE_FOREACH_UNARY_OUT_CUDA(tan)
+DEFINE_FOREACH_UNARY_OUT_CUDA(tanh)
+DEFINE_FOREACH_UNARY_OUT_CUDA(trunc)
+#undef DEFINE_FOREACH_UNARY_OUT_CUDA
+
+#define DEFINE_FOREACH_ADDSUB_OUT_CUDA(NAME) \
+void foreach_##NAME##_scalar_out_cuda(const std::vector<Tensor>& self, Scalar scalar, \
+                                      std::vector<Tensor> out) { \
+    copy_foreach_out_cuda(foreach_##NAME##_scalar_cuda(self, scalar), std::move(out), \
+                          "_foreach_" #NAME ".Scalar_out"); \
+} \
+void foreach_##NAME##_list_out_cuda(const std::vector<Tensor>& self, \
+                                    const std::vector<Tensor>& other, Scalar alpha, \
+                                    std::vector<Tensor> out) { \
+    copy_foreach_out_cuda(foreach_##NAME##_list_cuda(self, other, alpha), std::move(out), \
+                          "_foreach_" #NAME ".List_out"); \
+} \
+void foreach_##NAME##_scalar_list_out_cuda(const std::vector<Tensor>& self, \
+                                           const std::vector<Scalar>& scalars, \
+                                           std::vector<Tensor> out) { \
+    copy_foreach_out_cuda(foreach_##NAME##_scalar_list_cuda(self, scalars), std::move(out), \
+                          "_foreach_" #NAME ".ScalarList_out"); \
+} \
+void foreach_##NAME##_tensor_out_cuda(const std::vector<Tensor>& self, const Tensor& other, \
+                                      Scalar alpha, std::vector<Tensor> out) { \
+    copy_foreach_out_cuda(foreach_##NAME##_tensor_cuda(self, other, alpha), std::move(out), \
+                          "_foreach_" #NAME ".Tensor_out"); \
+}
+DEFINE_FOREACH_ADDSUB_OUT_CUDA(add)
+DEFINE_FOREACH_ADDSUB_OUT_CUDA(sub)
+#undef DEFINE_FOREACH_ADDSUB_OUT_CUDA
+
+#define DEFINE_FOREACH_MULDIV_OUT_CUDA(NAME) \
+void foreach_##NAME##_scalar_out_cuda(const std::vector<Tensor>& self, Scalar scalar, \
+                                      std::vector<Tensor> out) { \
+    copy_foreach_out_cuda(foreach_##NAME##_scalar_cuda(self, scalar), std::move(out), \
+                          "_foreach_" #NAME ".Scalar_out"); \
+} \
+void foreach_##NAME##_list_out_cuda(const std::vector<Tensor>& self, \
+                                    const std::vector<Tensor>& other, \
+                                    std::vector<Tensor> out) { \
+    copy_foreach_out_cuda(foreach_##NAME##_list_cuda(self, other), std::move(out), \
+                          "_foreach_" #NAME ".List_out"); \
+} \
+void foreach_##NAME##_scalar_list_out_cuda(const std::vector<Tensor>& self, \
+                                           const std::vector<Scalar>& scalars, \
+                                           std::vector<Tensor> out) { \
+    copy_foreach_out_cuda(foreach_##NAME##_scalar_list_cuda(self, scalars), std::move(out), \
+                          "_foreach_" #NAME ".ScalarList_out"); \
+} \
+void foreach_##NAME##_tensor_out_cuda(const std::vector<Tensor>& self, const Tensor& other, \
+                                      std::vector<Tensor> out) { \
+    copy_foreach_out_cuda(foreach_##NAME##_tensor_cuda(self, other), std::move(out), \
+                          "_foreach_" #NAME ".Tensor_out"); \
+}
+DEFINE_FOREACH_MULDIV_OUT_CUDA(mul)
+DEFINE_FOREACH_MULDIV_OUT_CUDA(div)
+#undef DEFINE_FOREACH_MULDIV_OUT_CUDA
+
+#define DEFINE_FOREACH_CLAMP_OUT_CUDA(NAME) \
+void foreach_##NAME##_scalar_out_cuda(const std::vector<Tensor>& self, Scalar scalar, \
+                                      std::vector<Tensor> out) { \
+    copy_foreach_out_cuda(foreach_##NAME##_scalar_cuda(self, scalar), std::move(out), \
+                          "_foreach_" #NAME ".Scalar_out"); \
+} \
+void foreach_##NAME##_list_out_cuda(const std::vector<Tensor>& self, \
+                                    const std::vector<Tensor>& other, \
+                                    std::vector<Tensor> out) { \
+    copy_foreach_out_cuda(foreach_##NAME##_list_cuda(self, other), std::move(out), \
+                          "_foreach_" #NAME ".List_out"); \
+} \
+void foreach_##NAME##_scalar_list_out_cuda(const std::vector<Tensor>& self, \
+                                           const std::vector<Scalar>& scalars, \
+                                           std::vector<Tensor> out) { \
+    copy_foreach_out_cuda(foreach_##NAME##_scalar_list_cuda(self, scalars), std::move(out), \
+                          "_foreach_" #NAME ".ScalarList_out"); \
+}
+DEFINE_FOREACH_CLAMP_OUT_CUDA(clamp_max)
+DEFINE_FOREACH_CLAMP_OUT_CUDA(clamp_min)
+DEFINE_FOREACH_CLAMP_OUT_CUDA(maximum)
+DEFINE_FOREACH_CLAMP_OUT_CUDA(minimum)
+#undef DEFINE_FOREACH_CLAMP_OUT_CUDA
+
+// lerp overloads have differing weight types; write them out explicitly.
+void foreach_lerp_scalar_out_cuda(const std::vector<Tensor>& self,
+                                  const std::vector<Tensor>& end,
+                                  Scalar weight,
+                                  std::vector<Tensor> out) {
+    copy_foreach_out_cuda(foreach_lerp_scalar_cuda(self, end, weight), std::move(out),
+                          "_foreach_lerp.Scalar_out");
+}
+void foreach_lerp_list_out_cuda(const std::vector<Tensor>& self,
+                                const std::vector<Tensor>& end,
+                                const std::vector<Tensor>& weight,
+                                std::vector<Tensor> out) {
+    copy_foreach_out_cuda(foreach_lerp_list_cuda(self, end, weight), std::move(out),
+                          "_foreach_lerp.List_out");
+}
+void foreach_lerp_scalar_list_out_cuda(const std::vector<Tensor>& self,
+                                       const std::vector<Tensor>& end,
+                                       const std::vector<Scalar>& weights,
+                                       std::vector<Tensor> out) {
+    copy_foreach_out_cuda(foreach_lerp_scalar_list_cuda(self, end, weights), std::move(out),
+                          "_foreach_lerp.ScalarList_out");
+}
+
+void foreach_pow_scalar_out_cuda(const std::vector<Tensor>& self, Scalar exponent,
+                                 std::vector<Tensor> out) {
+    copy_foreach_out_cuda(foreach_pow_scalar_cuda(self, exponent), std::move(out),
+                          "_foreach_pow.Scalar_out");
+}
+void foreach_pow_list_out_cuda(const std::vector<Tensor>& self,
+                               const std::vector<Tensor>& exponent,
+                               std::vector<Tensor> out) {
+    copy_foreach_out_cuda(foreach_pow_list_cuda(self, exponent), std::move(out),
+                          "_foreach_pow.List_out");
+}
+void foreach_pow_scalar_list_out_cuda(const std::vector<Tensor>& self,
+                                      const std::vector<Scalar>& exponents,
+                                      std::vector<Tensor> out) {
+    copy_foreach_out_cuda(foreach_pow_scalar_list_cuda(self, exponents), std::move(out),
+                          "_foreach_pow.ScalarList_out");
+}
+
+void foreach_addcmul_scalar_out_cuda(const std::vector<Tensor>& self,
+                                     const std::vector<Tensor>& tensor1,
+                                     const std::vector<Tensor>& tensor2, Scalar value,
+                                     std::vector<Tensor> out) {
+    std::vector<Tensor> result;
+    result.reserve(self.size());
+    for (size_t i = 0; i < self.size(); ++i)
+        result.push_back(self[i].addcmul(tensor1[i], tensor2[i], value));
+    copy_foreach_out_cuda(std::move(result), std::move(out), "_foreach_addcmul.Scalar_out");
+}
+void foreach_addcmul_scalar_list_out_cuda(const std::vector<Tensor>& self,
+                                          const std::vector<Tensor>& tensor1,
+                                          const std::vector<Tensor>& tensor2,
+                                          const std::vector<Scalar>& scalars,
+                                          std::vector<Tensor> out) {
+    std::vector<Tensor> result;
+    result.reserve(self.size());
+    for (size_t i = 0; i < self.size(); ++i)
+        result.push_back(self[i].addcmul(tensor1[i], tensor2[i], scalars[i]));
+    copy_foreach_out_cuda(std::move(result), std::move(out), "_foreach_addcmul.ScalarList_out");
+}
+void foreach_addcmul_tensor_out_cuda(const std::vector<Tensor>& self,
+                                     const std::vector<Tensor>& tensor1,
+                                     const std::vector<Tensor>& tensor2, Scalar value,
+                                     std::vector<Tensor> out) {
+    std::vector<Tensor> result;
+    result.reserve(self.size());
+    for (size_t i = 0; i < self.size(); ++i)
+        result.push_back(self[i].addcmul(tensor1[i], tensor2[i], value));
+    copy_foreach_out_cuda(std::move(result), std::move(out), "_foreach_addcmul.Tensor_out");
+}
+void foreach_addcdiv_scalar_out_cuda(const std::vector<Tensor>& self,
+                                     const std::vector<Tensor>& tensor1,
+                                     const std::vector<Tensor>& tensor2, Scalar value,
+                                     std::vector<Tensor> out) {
+    std::vector<Tensor> result;
+    result.reserve(self.size());
+    for (size_t i = 0; i < self.size(); ++i)
+        result.push_back(self[i].addcdiv(tensor1[i], tensor2[i], value));
+    copy_foreach_out_cuda(std::move(result), std::move(out), "_foreach_addcdiv.Scalar_out");
+}
+void foreach_addcdiv_scalar_list_out_cuda(const std::vector<Tensor>& self,
+                                          const std::vector<Tensor>& tensor1,
+                                          const std::vector<Tensor>& tensor2,
+                                          const std::vector<Scalar>& scalars,
+                                          std::vector<Tensor> out) {
+    std::vector<Tensor> result;
+    result.reserve(self.size());
+    for (size_t i = 0; i < self.size(); ++i)
+        result.push_back(self[i].addcdiv(tensor1[i], tensor2[i], scalars[i]));
+    copy_foreach_out_cuda(std::move(result), std::move(out), "_foreach_addcdiv.ScalarList_out");
+}
+void foreach_addcdiv_tensor_out_cuda(const std::vector<Tensor>& self,
+                                     const std::vector<Tensor>& tensor1,
+                                     const std::vector<Tensor>& tensor2, Scalar value,
+                                     std::vector<Tensor> out) {
+    std::vector<Tensor> result;
+    result.reserve(self.size());
+    for (size_t i = 0; i < self.size(); ++i)
+        result.push_back(self[i].addcdiv(tensor1[i], tensor2[i], value));
+    copy_foreach_out_cuda(std::move(result), std::move(out), "_foreach_addcdiv.Tensor_out");
+}
+
+void foreach_max_out_cuda(const std::vector<Tensor>& self, std::vector<Tensor> out) {
+    copy_foreach_out_cuda(foreach_max_cuda(self), std::move(out), "_foreach_max.out");
+}
+void foreach_zero_out_cuda(const std::vector<Tensor>& self, std::vector<Tensor> out) {
+    copy_foreach_out_cuda(foreach_zero_cuda(self), std::move(out), "_foreach_zero.out");
+}
+void foreach_clone_out_cuda(const std::vector<Tensor>& self,
+                            const std::optional<int64_t>& memory_format,
+                            std::vector<Tensor> out) {
+    copy_foreach_out_cuda(foreach_clone_cuda(self, memory_format), std::move(out),
+                          "_foreach_clone.out");
+}
+void foreach_copy_out_cuda(const std::vector<Tensor>& self,
+                           const std::vector<Tensor>& src, bool non_blocking,
+                           std::vector<Tensor> out) {
+    copy_foreach_out_cuda(foreach_copy_cuda(self, src, non_blocking), std::move(out),
+                          "_foreach_copy.out");
+}
+void foreach_norm_out_cuda(const std::vector<Tensor>& self, Scalar ord,
+                           const std::optional<DType>& dtype, std::vector<Tensor> out) {
+    copy_foreach_out_cuda(foreach_norm_cuda(self, ord, dtype), std::move(out),
+                          "_foreach_norm.Scalar_out");
+}
+void foreach_powsum_out_cuda(const std::vector<Tensor>& self, Scalar ord,
+                             const std::optional<DType>& dtype, std::vector<Tensor> out) {
+    copy_foreach_out_cuda(foreach_powsum_cuda(self, ord, dtype), std::move(out),
+                          "_foreach_powsum.Scalar_out");
+}
+
 TENSORPLAY_LIBRARY_IMPL(CUDA, OptimizerKernels) {
     m.impl("_foreach_sgd", foreach_sgd_cuda);
     m.impl("_foreach_adam", foreach_adam_cuda);
@@ -1573,6 +1951,128 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, OptimizerKernels) {
     REGISTER_FOREACH_UNARY(sign)
 #undef REGISTER_FOREACH_UNARY
 
+#define REGISTER_FOREACH_UNARY_OUT(NAME) \
+    m.impl("_foreach_" #NAME ".out", foreach_##NAME##_out_cuda);
+    REGISTER_FOREACH_UNARY_OUT(sqrt)
+    REGISTER_FOREACH_UNARY_OUT(rsqrt)
+    REGISTER_FOREACH_UNARY_OUT(neg)
+    REGISTER_FOREACH_UNARY_OUT(abs)
+    REGISTER_FOREACH_UNARY_OUT(sign)
+    REGISTER_FOREACH_UNARY_OUT(reciprocal)
+    REGISTER_FOREACH_UNARY_OUT(acos)
+    REGISTER_FOREACH_UNARY_OUT(asin)
+    REGISTER_FOREACH_UNARY_OUT(atan)
+    REGISTER_FOREACH_UNARY_OUT(ceil)
+    REGISTER_FOREACH_UNARY_OUT(cos)
+    REGISTER_FOREACH_UNARY_OUT(cosh)
+    REGISTER_FOREACH_UNARY_OUT(erf)
+    REGISTER_FOREACH_UNARY_OUT(erfc)
+    REGISTER_FOREACH_UNARY_OUT(exp)
+    REGISTER_FOREACH_UNARY_OUT(expm1)
+    REGISTER_FOREACH_UNARY_OUT(floor)
+    REGISTER_FOREACH_UNARY_OUT(frac)
+    REGISTER_FOREACH_UNARY_OUT(lgamma)
+    REGISTER_FOREACH_UNARY_OUT(log)
+    REGISTER_FOREACH_UNARY_OUT(log10)
+    REGISTER_FOREACH_UNARY_OUT(log1p)
+    REGISTER_FOREACH_UNARY_OUT(log2)
+    REGISTER_FOREACH_UNARY_OUT(round)
+    REGISTER_FOREACH_UNARY_OUT(sigmoid)
+    REGISTER_FOREACH_UNARY_OUT(sin)
+    REGISTER_FOREACH_UNARY_OUT(sinh)
+    REGISTER_FOREACH_UNARY_OUT(tan)
+    REGISTER_FOREACH_UNARY_OUT(tanh)
+    REGISTER_FOREACH_UNARY_OUT(trunc)
+#undef REGISTER_FOREACH_UNARY_OUT
+
+#define REGISTER_FOREACH_EXTRA_UNARY(NAME) \
+    m.impl("_foreach_" #NAME, foreach_##NAME##_cuda); \
+    m.impl("_foreach_" #NAME "_", foreach_##NAME##_inplace_cuda);
+    REGISTER_FOREACH_EXTRA_UNARY(acos)
+    REGISTER_FOREACH_EXTRA_UNARY(asin)
+    REGISTER_FOREACH_EXTRA_UNARY(atan)
+    REGISTER_FOREACH_EXTRA_UNARY(ceil)
+    REGISTER_FOREACH_EXTRA_UNARY(cos)
+    REGISTER_FOREACH_EXTRA_UNARY(cosh)
+    REGISTER_FOREACH_EXTRA_UNARY(erf)
+    REGISTER_FOREACH_EXTRA_UNARY(erfc)
+    REGISTER_FOREACH_EXTRA_UNARY(exp)
+    REGISTER_FOREACH_EXTRA_UNARY(expm1)
+    REGISTER_FOREACH_EXTRA_UNARY(floor)
+    REGISTER_FOREACH_EXTRA_UNARY(frac)
+    REGISTER_FOREACH_EXTRA_UNARY(lgamma)
+    REGISTER_FOREACH_EXTRA_UNARY(log)
+    REGISTER_FOREACH_EXTRA_UNARY(log10)
+    REGISTER_FOREACH_EXTRA_UNARY(log1p)
+    REGISTER_FOREACH_EXTRA_UNARY(log2)
+    REGISTER_FOREACH_EXTRA_UNARY(round)
+    REGISTER_FOREACH_EXTRA_UNARY(sigmoid)
+    REGISTER_FOREACH_EXTRA_UNARY(sin)
+    REGISTER_FOREACH_EXTRA_UNARY(sinh)
+    REGISTER_FOREACH_EXTRA_UNARY(tan)
+    REGISTER_FOREACH_EXTRA_UNARY(trunc)
+#undef REGISTER_FOREACH_EXTRA_UNARY
+
+    m.impl("_foreach_max", foreach_max_cuda);
+    m.impl("_foreach_max.out", foreach_max_out_cuda);
+    m.impl("_foreach_zero", foreach_zero_cuda);
+    m.impl("_foreach_zero.out", foreach_zero_out_cuda);
+    m.impl("_foreach_clone", foreach_clone_cuda);
+    m.impl("_foreach_clone.out", foreach_clone_out_cuda);
+    m.impl("_foreach_copy", foreach_copy_cuda);
+    m.impl("_foreach_copy.out", foreach_copy_out_cuda);
+    m.impl("_foreach_mm", foreach_mm_cuda);
+    m.impl("_foreach_norm.Scalar", foreach_norm_cuda);
+    m.impl("_foreach_norm.Scalar_out", foreach_norm_out_cuda);
+    m.impl("_foreach_powsum.Scalar", foreach_powsum_cuda);
+    m.impl("_foreach_powsum.Scalar_out", foreach_powsum_out_cuda);
+
+    m.impl("_foreach_add.List_out", foreach_add_list_out_cuda);
+    m.impl("_foreach_add.ScalarList_out", foreach_add_scalar_list_out_cuda);
+    m.impl("_foreach_add.Scalar_out", foreach_add_scalar_out_cuda);
+    m.impl("_foreach_add.Tensor_out", foreach_add_tensor_out_cuda);
+    m.impl("_foreach_sub.List_out", foreach_sub_list_out_cuda);
+    m.impl("_foreach_sub.ScalarList_out", foreach_sub_scalar_list_out_cuda);
+    m.impl("_foreach_sub.Scalar_out", foreach_sub_scalar_out_cuda);
+    m.impl("_foreach_sub.Tensor_out", foreach_sub_tensor_out_cuda);
+    m.impl("_foreach_mul.List_out", foreach_mul_list_out_cuda);
+    m.impl("_foreach_mul.ScalarList_out", foreach_mul_scalar_list_out_cuda);
+    m.impl("_foreach_mul.Scalar_out", foreach_mul_scalar_out_cuda);
+    m.impl("_foreach_mul.Tensor_out", foreach_mul_tensor_out_cuda);
+    m.impl("_foreach_div.List_out", foreach_div_list_out_cuda);
+    m.impl("_foreach_div.ScalarList_out", foreach_div_scalar_list_out_cuda);
+    m.impl("_foreach_div.Scalar_out", foreach_div_scalar_out_cuda);
+    m.impl("_foreach_div.Tensor_out", foreach_div_tensor_out_cuda);
+
+    m.impl("_foreach_clamp_max.List_out", foreach_clamp_max_list_out_cuda);
+    m.impl("_foreach_clamp_max.ScalarList_out", foreach_clamp_max_scalar_list_out_cuda);
+    m.impl("_foreach_clamp_max.Scalar_out", foreach_clamp_max_scalar_out_cuda);
+    m.impl("_foreach_clamp_min.List_out", foreach_clamp_min_list_out_cuda);
+    m.impl("_foreach_clamp_min.ScalarList_out", foreach_clamp_min_scalar_list_out_cuda);
+    m.impl("_foreach_clamp_min.Scalar_out", foreach_clamp_min_scalar_out_cuda);
+    m.impl("_foreach_maximum.List_out", foreach_maximum_list_out_cuda);
+    m.impl("_foreach_maximum.ScalarList_out", foreach_maximum_scalar_list_out_cuda);
+    m.impl("_foreach_maximum.Scalar_out", foreach_maximum_scalar_out_cuda);
+    m.impl("_foreach_minimum.List_out", foreach_minimum_list_out_cuda);
+    m.impl("_foreach_minimum.ScalarList_out", foreach_minimum_scalar_list_out_cuda);
+    m.impl("_foreach_minimum.Scalar_out", foreach_minimum_scalar_out_cuda);
+
+    m.impl("_foreach_lerp.Scalar_out", foreach_lerp_scalar_out_cuda);
+    m.impl("_foreach_lerp.List_out", foreach_lerp_list_out_cuda);
+    m.impl("_foreach_lerp.ScalarList_out", foreach_lerp_scalar_list_out_cuda);
+
+    m.impl("_foreach_pow.Scalar_out", foreach_pow_scalar_out_cuda);
+    m.impl("_foreach_pow.List_out", foreach_pow_list_out_cuda);
+    m.impl("_foreach_pow.ScalarList_out", foreach_pow_scalar_list_out_cuda);
+
+    m.impl("_foreach_addcmul.Scalar_out", foreach_addcmul_scalar_out_cuda);
+    m.impl("_foreach_addcmul.ScalarList_out", foreach_addcmul_scalar_list_out_cuda);
+    m.impl("_foreach_addcmul.Tensor_out", foreach_addcmul_tensor_out_cuda);
+    m.impl("_foreach_addcdiv.Scalar_out", foreach_addcdiv_scalar_out_cuda);
+    m.impl("_foreach_addcdiv.ScalarList_out", foreach_addcdiv_scalar_list_out_cuda);
+    m.impl("_foreach_addcdiv.Tensor_out", foreach_addcdiv_tensor_out_cuda);
+#undef REGISTER_FOREACH_UNARY
+
     m.impl("_foreach_addcmul.Scalar", foreach_addcmul_scalar_cuda);
     m.impl("_foreach_addcmul_.Scalar", foreach_addcmul_scalar_inplace_cuda);
     m.impl("_foreach_addcmul.ScalarList", foreach_addcmul_scalar_list_cuda);
@@ -1593,6 +2093,7 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, OptimizerKernels) {
     m.impl("_foreach_lerp_.ScalarList", foreach_lerp_scalar_list_inplace_cuda);
     m.impl("_foreach_pow.Scalar", foreach_pow_scalar_cuda);
     m.impl("_foreach_pow.ScalarAndTensor", foreach_pow_scalar_tensor_cuda);
+    m.impl("_foreach_pow.TensorAndTensor", foreach_pow_tensor_tensor_cuda);
     m.impl("_foreach_pow.List", foreach_pow_list_cuda);
     m.impl("_foreach_pow_.Scalar", foreach_pow_scalar_inplace_cuda);
     m.impl("_foreach_pow_.List", foreach_pow_list_inplace_cuda);

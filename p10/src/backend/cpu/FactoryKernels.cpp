@@ -173,6 +173,9 @@ Tensor arange_start_step_kernel(Scalar start, Scalar end, Scalar step, DType dty
     if (dtype == DType::Float32) {
         float* data = t.data_ptr<float>();
         for (int64_t i = 0; i < len; ++i) data[i] = static_cast<float>(s_d + i * st_d);
+    } else if (dtype == DType::Float64) {
+        double* data = t.data_ptr<double>();
+        for (int64_t i = 0; i < len; ++i) data[i] = s_d + i * st_d;
     } else if (dtype == DType::Int64) {
         int64_t* data = t.data_ptr<int64_t>();
         // Use double accumulation to avoid overflow if possible, or int accumulation?
@@ -234,8 +237,18 @@ Tensor linspace_kernel(Scalar start, Scalar end, int64_t steps, DType dtype, Dev
                 data[i] = static_cast<float>(s + i * step);
             }
         }
+    } else if (dtype == DType::Float64) {
+        double* data = t.data_ptr<double>();
+        if (steps == 1) {
+            data[0] = s;
+        } else {
+            double step = (e - s) / (steps - 1);
+            for(int64_t i=0; i<steps; ++i) {
+                data[i] = s + i * step;
+            }
+        }
     } else {
-         TP_THROW(NotImplementedError, "linspace only supports Float32");
+         TP_THROW(NotImplementedError, "linspace only supports Float32/Float64");
     }
     return t;
 }
@@ -259,8 +272,19 @@ Tensor logspace_kernel(Scalar start, Scalar end, int64_t steps, double base, DTy
                 data[i] = static_cast<float>(std::pow(base, val));
             }
         }
+    } else if (dtype == DType::Float64) {
+        double* data = t.data_ptr<double>();
+        if (steps == 1) {
+            data[0] = std::pow(base, s);
+        } else {
+            double step = (e - s) / (steps - 1);
+            for(int64_t i=0; i<steps; ++i) {
+                double val = s + i * step;
+                data[i] = std::pow(base, val);
+            }
+        }
     } else {
-         TP_THROW(NotImplementedError, "logspace only supports Float32");
+         TP_THROW(NotImplementedError, "logspace only supports Float32/Float64");
     }
     return t;
 }
@@ -443,22 +467,111 @@ Tensor& zero_kernel(Tensor& self) {
     return fill_kernel(self, 0);
 }
 
+// --- Stub-ABI adapters ------------------------------------------------------
+// The dispatcher invokes kernels with schema-level argument types
+// (std::optional<DType> / std::optional<Device>), while the raw kernels above
+// keep concrete parameters for internal reuse.  These thin wrappers bridge the
+// two and resolve schema-level None the way torch factories do.
+namespace {
+
+Device resolve_factory_device(const std::optional<Device>& device) {
+    return device.has_value() ? *device : Device(globalContext().defaultDevice());
+}
+
+DType resolve_factory_dtype(const std::optional<DType>& dtype) {
+    return (dtype.has_value() && *dtype != DType::Undefined)
+               ? *dtype
+               : globalContext().defaultDType();
+}
+
+Tensor rand_stub(const std::vector<int64_t>& size, std::optional<DType> dtype,
+                 std::optional<Device> device) {
+    return rand_kernel(size, resolve_factory_dtype(dtype),
+                       resolve_factory_device(device));
+}
+
+Tensor randn_stub(const std::vector<int64_t>& size, std::optional<DType> dtype,
+                  std::optional<Device> device) {
+    return randn_kernel(size, resolve_factory_dtype(dtype),
+                        resolve_factory_device(device));
+}
+
+Tensor randint_stub(int64_t low, int64_t high, const std::vector<int64_t>& size,
+                    DType dtype, std::optional<Device> device) {
+    return randint_kernel(low, high, size, dtype, resolve_factory_device(device));
+}
+
+Tensor randperm_stub(int64_t n, DType dtype, std::optional<Device> device) {
+    return randperm_kernel(n, dtype, resolve_factory_device(device));
+}
+
+Tensor eye_stub(int64_t n, int64_t m, DType dtype, std::optional<Device> device) {
+    return eye_kernel(n, m, dtype, resolve_factory_device(device));
+}
+
+Tensor arange_start_step_stub(Scalar start, Scalar end, Scalar step, DType dtype,
+                              std::optional<Device> device) {
+    return arange_start_step_kernel(start, end, step, dtype,
+                                    resolve_factory_device(device));
+}
+
+Tensor arange_end_stub(Scalar end, DType dtype, std::optional<Device> device) {
+    return arange_kernel(end, dtype, resolve_factory_device(device));
+}
+
+Tensor linspace_stub(Scalar start, Scalar end, int64_t steps, DType dtype,
+                     std::optional<Device> device) {
+    return linspace_kernel(start, end, steps, dtype, resolve_factory_device(device));
+}
+
+Tensor logspace_stub(Scalar start, Scalar end, int64_t steps, double base,
+                     DType dtype, std::optional<Device> device) {
+    return logspace_kernel(start, end, steps, base, dtype,
+                           resolve_factory_device(device));
+}
+
+Tensor empty_stub(const std::vector<int64_t>& size, std::optional<DType> dtype,
+                  std::optional<Device> device, bool pin_memory) {
+    return empty_kernel(size, resolve_factory_dtype(dtype),
+                        resolve_factory_device(device), pin_memory);
+}
+
+Tensor zeros_stub(const std::vector<int64_t>& size, std::optional<DType> dtype,
+                  std::optional<Device> device, bool pin_memory) {
+    return zeros_kernel(size, resolve_factory_dtype(dtype),
+                        resolve_factory_device(device), pin_memory);
+}
+
+Tensor ones_stub(const std::vector<int64_t>& size, std::optional<DType> dtype,
+                 std::optional<Device> device, bool pin_memory) {
+    return ones_kernel(size, resolve_factory_dtype(dtype),
+                       resolve_factory_device(device), pin_memory);
+}
+
+Tensor full_stub(const std::vector<int64_t>& size, Scalar fill_value,
+                 DType dtype, std::optional<Device> device, bool pin_memory) {
+    return full_kernel(size, fill_value, dtype, resolve_factory_device(device),
+                       pin_memory);
+}
+
+} // anonymous namespace
+
 TENSORPLAY_LIBRARY_IMPL(CPU, FactoryKernels) {
-    m.impl("rand", rand_kernel);
-    m.impl("zeros", zeros_kernel);
-    m.impl("ones", ones_kernel);
-    m.impl("full", full_kernel);
-    m.impl("arange", arange_start_step_kernel);
-    m.impl("arange.end", arange_kernel);
-    m.impl("empty", empty_kernel);
-    m.impl("eye", eye_kernel);
-    m.impl("linspace", linspace_kernel);
-    m.impl("logspace", logspace_kernel);
+    m.impl("rand", rand_stub);
+    m.impl("zeros", zeros_stub);
+    m.impl("ones", ones_stub);
+    m.impl("full", full_stub);
+    m.impl("arange", arange_start_step_stub);
+    m.impl("arange.end", arange_end_stub);
+    m.impl("empty", empty_stub);
+    m.impl("eye", eye_stub);
+    m.impl("linspace", linspace_stub);
+    m.impl("logspace", logspace_stub);
     m.impl("fill_.Scalar", fill_kernel);
     m.impl("zero_", zero_kernel);
-    m.impl("randn", randn_kernel);
-    m.impl("randint", randint_kernel);
-    m.impl("randperm", randperm_kernel);
+    m.impl("randn", randn_stub);
+    m.impl("randint", randint_stub);
+    m.impl("randperm", randperm_stub);
     m.impl("rand_like", rand_like_kernel);
     m.impl("randint_like", randint_like_kernel);
     m.impl("randn_like", randn_like_kernel);

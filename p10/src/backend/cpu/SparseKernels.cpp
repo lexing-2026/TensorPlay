@@ -6,6 +6,7 @@
 #include <numeric>
 #include <utility>
 #include <vector>
+#include <unordered_set>
 
 namespace tensorplay {
 namespace cpu {
@@ -563,22 +564,297 @@ Tensor sparse_mm_cpu(const Tensor& self, const Tensor& dense) {
     return out;
 }
 
-Tensor sparse_sum_cpu(const Tensor& self) {
+// ATen SparseTensorMath.cpp::_sparse_sum semantics: reducing every sparse dim
+// returns a dense tensor (the values summed); a partial reduction keeps the
+// surviving coordinate rows, rebuilds the COO over the kept dims and folds
+// duplicate coordinates via coalesce(), returning a sparse tensor.  ``dtype``
+// converts the input first, acting as the accumulation type.
+Tensor sparse_sum_cpu(const Tensor& self, std::optional<std::vector<int64_t>> dim,
+                      std::optional<DType> dtype) {
     if (!self.is_sparse()) {
         TP_THROW(RuntimeError, "sparse_sum(): expected a sparse tensor");
     }
-    Tensor canonical = self.is_coalesced() ? self : self.coalesce();
+    Tensor input = self;
+    if (dtype.has_value() && *dtype != DType::Undefined &&
+        *dtype != self.dtype()) {
+        input = self.to(*dtype);
+    }
+    Tensor canonical = input.is_coalesced() ? input : input.coalesce();
+    if (canonical._values().dim() != 1) {
+        TP_THROW(RuntimeError,
+                 "sparse_sum(): hybrid COO tensors are not supported");
+    }
+
+    // No dims (or an empty list): dense sum over all values.
+    if (!dim.has_value() || dim->empty()) {
+        return canonical._values().sum();
+    }
+
+    const int64_t sparse_dim = canonical.sparse_dim();
+    std::vector<bool> reduced(static_cast<size_t>(sparse_dim), false);
+    for (int64_t d : *dim) {
+        if (d < 0) d += canonical.dim();
+        if (d < 0 || d >= sparse_dim) {
+            TP_THROW(ValueError, "sparse_sum(): dim out of the sparse range");
+        }
+        reduced[static_cast<size_t>(d)] = true;
+    }
+    int64_t num_reduced = 0;
+    for (bool r : reduced) num_reduced += r ? 1 : 0;
+    if (num_reduced == sparse_dim) {
+        return canonical._values().sum();
+    }
+
+    std::vector<int64_t> kept_dims;
+    for (int64_t d = 0; d < sparse_dim; ++d) {
+        if (!reduced[static_cast<size_t>(d)]) kept_dims.push_back(d);
+    }
+    const std::vector<int64_t> sizes =
+        static_cast<std::vector<int64_t>>(canonical.shape());
+    std::vector<int64_t> out_sizes;
+    for (int64_t d : kept_dims) out_sizes.push_back(sizes[static_cast<size_t>(d)]);
+
+    Tensor indices = canonical._indices().contiguous();
     Tensor values = canonical._values().contiguous();
-    Tensor out = Tensor::zeros({}, self.dtype(), self.device());
-    const int64_t numel = values.numel();
-    dispatch_dtype(values.dtype(), [&](auto tag) {
+    const int64_t nnz = indices.size(1);
+    Tensor new_indices = Tensor::empty(
+        {static_cast<int64_t>(kept_dims.size()), nnz}, DType::Int64,
+        indices.device());
+    int64_t* dst = new_indices.data_ptr<int64_t>();
+    const int64_t* src = indices.data_ptr<int64_t>();
+    for (int64_t i = 0; i < static_cast<int64_t>(kept_dims.size()); ++i) {
+        std::copy_n(src + kept_dims[static_cast<size_t>(i)] * nnz, nnz,
+                    dst + i * nnz);
+    }
+    return Tensor::make_sparse_coo_tensor(new_indices, values.clone(), out_sizes,
+                                          /*is_coalesced=*/false).coalesce();
+}
+
+namespace {
+
+// Coordinate-union addition: concatenate both COO component sets and run the
+// existing coalescing sweep so duplicates fold naturally.
+Tensor sparse_add_cpu_impl(const Tensor& self, const Tensor& other) {
+    if (!self.is_sparse() || self.is_sparse_csr() ||
+        !other.is_sparse() || other.is_sparse_csr()) {
+        TP_THROW(RuntimeError,
+                 "sparse.add(): expected two sparse COO tensors");
+    }
+    if (self.shape() != other.shape()) {
+        TP_THROW(RuntimeError,
+                 "sparse.add(): operands must have identical sizes");
+    }
+    if (self.dtype() != other.dtype()) {
+        TP_THROW(TypeError, "sparse.add(): operands must share one dtype");
+    }
+    Tensor a = self.is_coalesced() ? self : self.coalesce();
+    Tensor b = other.is_coalesced() ? other : other.coalesce();
+    if (a._values().dim() != 1 || b._values().dim() != 1) {
+        TP_THROW(RuntimeError,
+                 "sparse.add(): hybrid COO tensors are not supported");
+    }
+    Tensor cat_indices = Tensor::cat({a._indices(), b._indices()}, 1);
+    Tensor cat_values = Tensor::cat({a._values(), b._values()}, 0);
+    return Tensor::make_sparse_coo_tensor(
+        cat_indices, cat_values,
+        static_cast<std::vector<int64_t>>(a.shape()),
+        /*is_coalesced=*/false).coalesce();
+}
+
+} // namespace
+
+Tensor sparse_add_cpu(const Tensor& self, const Tensor& other) {
+    return sparse_add_cpu_impl(self, other);
+}
+
+Tensor sparse_mul_cpu(const Tensor& self, const Tensor& other) {
+    Tensor result_storage;
+    if (!self.is_sparse() || self.is_sparse_csr() ||
+        !other.is_sparse() || other.is_sparse_csr()) {
+        TP_THROW(RuntimeError,
+                 "sparse.mul(): expected two sparse COO tensors");
+    }
+    if (self.shape() != other.shape()) {
+        TP_THROW(RuntimeError,
+                 "sparse.mul(): operands must have identical sizes");
+    }
+    if (self.dtype() != other.dtype()) {
+        TP_THROW(TypeError, "sparse.mul(): operands must share one dtype");
+    }
+    Tensor a = self.is_coalesced() ? self : self.coalesce();
+    Tensor b = other.is_coalesced() ? other : other.coalesce();
+    if (a._values().dim() != 1 || b._values().dim() != 1) {
+        TP_THROW(RuntimeError,
+                 "sparse.mul(): hybrid COO tensors are not supported");
+    }
+    const int64_t sparse_dim = a.sparse_dim();
+    Tensor ia = a._indices().contiguous();
+    Tensor va = a._values().contiguous();
+    Tensor ib = b._indices().contiguous();
+    Tensor vb = b._values().contiguous();
+    const int64_t nnz_a = va.size(0);
+    const int64_t nnz_b = vb.size(0);
+
+    // Sorted-merge intersection on coordinates.  Both sides are coalesced so
+    // their rows sort lexicographically already.
+    auto coord_at = [](const Tensor& idx, int64_t nnz, int64_t n,
+                       std::vector<int64_t>* out) {
+        const int64_t* data = idx.data_ptr<int64_t>();
+        for (int64_t d = 0; d < idx.size(0); ++d) {
+            out->at(static_cast<size_t>(d)) = data[d * nnz + n];
+        }
+    };
+
+    dispatch_dtype(va.dtype(), [&](auto tag) {
         using scalar_t = typename decltype(tag)::type;
-        const scalar_t* data = values.data_ptr<scalar_t>();
-        scalar_t accumulator = scalar_t(0);
-        for (int64_t i = 0; i < numel; ++i) accumulator += data[i];
-        out.data_ptr<scalar_t>()[0] = accumulator;
+        std::vector<int64_t> out_coords;
+        std::vector<scalar_t> out_values;
+        std::vector<int64_t> ca(static_cast<size_t>(sparse_dim));
+        std::vector<int64_t> cb(static_cast<size_t>(sparse_dim));
+        const scalar_t* pa = va.data_ptr<scalar_t>();
+        const scalar_t* pb = vb.data_ptr<scalar_t>();
+        int64_t i = 0, j = 0;
+        while (i < nnz_a && j < nnz_b) {
+            coord_at(ia, nnz_a, i, &ca);
+            coord_at(ib, nnz_b, j, &cb);
+            if (ca < cb) { ++i; }
+            else if (cb < ca) { ++j; }
+            else {
+                out_coords.insert(out_coords.end(), ca.begin(), ca.end());
+                out_values.push_back(pa[i] * pb[j]);
+                ++i; ++j;
+            }
+        }
+        const int64_t out_nnz = static_cast<int64_t>(out_values.size());
+        Tensor oi = Tensor::empty({sparse_dim, out_nnz}, DType::Int64,
+                                  self.device());
+        Tensor ov = Tensor::empty(std::vector<int64_t>{out_nnz},
+                                  self.dtype(), self.device());
+        int64_t* oi_ptr = oi.data_ptr<int64_t>();
+        for (int64_t n = 0; n < out_nnz; ++n) {
+            for (int64_t d = 0; d < sparse_dim; ++d) {
+                oi_ptr[d * out_nnz + n] =
+                    out_coords[static_cast<size_t>(n * sparse_dim + d)];
+            }
+        }
+        for (int64_t n = 0; n < out_nnz; ++n) {
+            ov.data_ptr<scalar_t>()[n] = out_values[static_cast<size_t>(n)];
+        }
+        result_storage = Tensor::make_sparse_coo_tensor(
+            oi, ov, static_cast<std::vector<int64_t>>(a.shape()), true);
     });
-    return out;
+    return result_storage;
+}
+
+// ATen SparseFactories.cpp::spdiags + _spdiags_kernel_cpu: diagonal ``d``
+// stores ``min(d+M, L)`` entries when ``d <= 0`` and ``min(N, L) - d``
+// otherwise, placed starting at cell ``(max(d,0)-d, max(d,0))``; values are
+// read from row ``j`` of ``diagonals`` beginning at column ``max(d, 0)``.
+namespace {
+
+// Builds canonical CSR components from a coalesced COO whose coordinates are
+// sorted row-major over a 2-D shape.
+Tensor coo_to_csr_cpu(const Tensor& coalesced, int64_t rows) {
+    Tensor indices = coalesced._indices().contiguous();
+    Tensor values = coalesced._values().contiguous();
+    const int64_t nnz = indices.size(1);
+    const int64_t* coords = indices.data_ptr<int64_t>();
+    Tensor crow = Tensor::zeros({rows + 1}, DType::Int64, coalesced.device());
+    int64_t* crow_ptr = crow.data_ptr<int64_t>();
+    for (int64_t n = 0; n < nnz; ++n) ++crow_ptr[coords[n] + 1];
+    for (int64_t i = 0; i < rows; ++i) crow_ptr[i + 1] += crow_ptr[i];
+    return Tensor::make_sparse_csr_tensor(
+        crow, indices.select(0, 1), values,
+        static_cast<std::vector<int64_t>>(coalesced.shape()));
+}
+
+} // namespace
+
+Tensor spdiags_cpu(const Tensor& diagonals, const Tensor& offsets,
+                   std::vector<int64_t> shape,
+                   std::optional<int64_t> layout) {
+    if (layout.has_value() && *layout != 0 && *layout != 1) {
+        TP_THROW(ValueError,
+                 "spdiags(): only sparse_coo (0) and sparse_csr (1) output "
+                 "layouts are supported");
+    }
+    if (shape.size() != 2) {
+        TP_THROW(ValueError, "spdiags(): output shape must be 2-dimensional");
+    }
+    Tensor diags2d = diagonals.dim() == 1 ? diagonals.unsqueeze(0) : diagonals;
+    if (diags2d.dim() != 2) {
+        TP_THROW(ValueError, "spdiags(): diagonals must be a vector or matrix");
+    }
+    Tensor offs = offsets.dim() == 0 ? offsets.unsqueeze(0) : offsets;
+    if (offs.dim() != 1 || offs.dtype() != DType::Int64) {
+        TP_THROW(TypeError, "spdiags(): offset tensor must be 1-D int64");
+    }
+    const int64_t n_diag = offs.size(0);
+    if (diags2d.size(0) != n_diag) {
+        TP_THROW(ValueError,
+                 "spdiags(): number of diagonals (" +
+                     std::to_string(diags2d.size(0)) +
+                     ") does not match the number of offsets (" +
+                     std::to_string(n_diag) + ")");
+    }
+    Tensor diags_c = diags2d.contiguous();
+    Tensor offs_c = offs.contiguous();
+    const int64_t* off_data = offs_c.data_ptr<int64_t>();
+    std::vector<int64_t> off_host(off_data, off_data + n_diag);
+    std::unordered_set<int64_t> unique_offs(off_host.begin(), off_host.end());
+    if (unique_offs.size() != static_cast<size_t>(n_diag)) {
+        TP_THROW(ValueError, "spdiags(): offset tensor contains duplicate values");
+    }
+
+    const int64_t m_size = shape[0];
+    const int64_t n_size = shape[1];
+    const int64_t length = diags_c.size(1);
+    std::vector<int64_t> counts(static_cast<size_t>(n_diag), 0);
+    std::vector<int64_t> starts(static_cast<size_t>(n_diag), 0);
+    int64_t total_nnz = 0;
+    for (int64_t j = 0; j < n_diag; ++j) {
+        const int64_t d = off_host[static_cast<size_t>(j)];
+        // Out-of-range offsets clamp to zero stored elements where torch
+        // would produce undefined content.
+        const int64_t count = d <= 0 ? std::min(d + m_size, length)
+                                     : std::min(n_size, length) - d;
+        counts[static_cast<size_t>(j)] = std::max<int64_t>(count, 0);
+        starts[static_cast<size_t>(j)] = total_nnz;
+        total_nnz += counts[static_cast<size_t>(j)];
+    }
+
+    Tensor indices = Tensor::empty({2, total_nnz}, DType::Int64,
+                                   offsets.device());
+    Tensor values = Tensor::empty({total_nnz}, diags_c.dtype(),
+                                  diags_c.device());
+    int64_t* rows_ptr = indices.data_ptr<int64_t>();
+    int64_t* cols_ptr = rows_ptr + total_nnz;
+    dispatch_dtype(diags_c.dtype(), [&](auto tag) {
+        using scalar_t = typename decltype(tag)::type;
+        const scalar_t* diag_data = diags_c.data_ptr<scalar_t>();
+        scalar_t* val_ptr = values.data_ptr<scalar_t>();
+        for (int64_t j = 0; j < n_diag; ++j) {
+            const int64_t count = counts[static_cast<size_t>(j)];
+            if (count <= 0) continue;
+            const int64_t first_col =
+                std::max<int64_t>(off_host[static_cast<size_t>(j)], 0);
+            const int64_t first_row = first_col - off_host[static_cast<size_t>(j)];
+            const int64_t slot = starts[static_cast<size_t>(j)];
+            const scalar_t* read = diag_data + j * length + first_col;
+            for (int64_t i = 0; i < count; ++i) {
+                rows_ptr[slot + i] = first_row + i;
+                cols_ptr[slot + i] = first_col + i;
+                val_ptr[slot + i] = read[i];
+            }
+        }
+    });
+
+    auto result = Tensor::make_sparse_coo_tensor(indices, values, shape,
+                                                 /*is_coalesced=*/false);
+    if (layout.has_value() && *layout == 1) {
+        return coo_to_csr_cpu(result.coalesce(), m_size);
+    }
+    return result;
 }
 
 } // namespace cpu

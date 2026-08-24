@@ -22,6 +22,7 @@ set(P10_SOURCES
     src/autocast_mode.cpp
     # src/AutogradMetaInterface.cpp (Moved to TPX)
     src/Tensor.cpp
+    src/RegisterComposites.cpp
     
     # Kernels
     src/backend/cpu/AmpKernels.cpp
@@ -46,6 +47,7 @@ set(P10_SOURCES
     src/backend/cpu/ReductionKernels.cpp
     src/backend/cpu/LossKernels.cpp
     src/backend/cpu/ViewKernels.cpp
+    src/backend/cpu/ShapeAlignKernels.cpp
     src/backend/cpu/ForeachKernels.cpp
     src/backend/cpu/OptimizerKernels.cpp
     src/backend/cpu/LlmReferenceKernels.cpp
@@ -93,6 +95,7 @@ if(USE_CUDA)
         src/backend/cuda/RandomKernels.cu
         src/backend/cuda/ReductionKernels.cu
         src/backend/cuda/ViewKernels.cu
+        src/backend/cuda/ShapeAlignKernels.cu
         src/backend/cuda/OptimizerKernels.cu
         src/backend/cuda/AmpKernels.cu
         src/backend/cuda/SamplingKernels.cu

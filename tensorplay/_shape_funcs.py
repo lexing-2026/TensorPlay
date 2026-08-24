@@ -375,8 +375,17 @@ def tensordot(input, other, dims=2):
 
     free_a = [i for i in range(nd_a) if i not in set(dims_a)]
     free_b = [i for i in range(nd_b) if i not in set(dims_b)]
-    perm_a = free_a + dims_a
-    perm_b = dims_b + free_b
+
+    # ATen tensordot pairing: flatten both sides so the t-th contracted axis
+    # of `input` aligns with the t-th of `other`.  The joint order is fixed by
+    # `other`'s axis indices (sorted), and `input`'s pairing follows it --
+    # summation commutes, so any consistent joint order is torch-equivalent.
+    pair_order = sorted(range(len(dims_a)), key=lambda t: dims_b[t])
+    da_ordered = [dims_a[t] for t in pair_order]
+    db_sorted = sorted(dims_b)
+
+    perm_a = free_a + da_ordered
+    perm_b = db_sorted + free_b
 
     contract_size = 1
     for x in dims_a:

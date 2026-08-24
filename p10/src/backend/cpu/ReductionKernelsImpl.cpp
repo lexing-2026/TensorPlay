@@ -2,6 +2,7 @@
 #include "Dispatcher.h"
 #include "Exception.h"
 #include "Utils.h"
+#include "Parallel.h"
 #include "ReductionKernels.h"
 #include "TensorIterator.h"
 #include "cpu/Reduce.h"
@@ -17,6 +18,8 @@ namespace tensorplay {
 namespace cpu {
 namespace {
 using namespace vec;
+// parallel_for / GRAIN_SIZE moved under tensorplay::parallel.
+using namespace tensorplay::parallel;
 
 template <typename T>
 struct Accumulator {
@@ -139,7 +142,7 @@ Tensor sum_kernel_impl(const Tensor& self, DType dtype) {
     return acc_dtype == out_dtype ? out : out.to(out_dtype);
 }
 
-Tensor sum_dim_kernel_impl(const Tensor& self, std::vector<int64_t> dims, bool keepdim, DType dtype) {
+Tensor sum_dim_kernel_impl(const Tensor& self, const std::vector<int64_t>& dims, bool keepdim, DType dtype) {
     DType out_dtype = dtype;
     if (out_dtype == DType::Undefined) {
          out_dtype = self.dtype();
@@ -227,65 +230,76 @@ Tensor max_kernel_impl(const Tensor& self) {
     return out;
 }
 
-Tensor max_dim_kernel_impl(const Tensor& self, std::vector<int64_t> dims, bool keepdim) {
-    if (dims.empty()) return max_kernel_impl(self);
-    
-    std::vector<int64_t> out_shape = compute_reduction_shape(self, dims, keepdim);
-    Tensor out = Tensor::empty(out_shape, self.dtype(), self.device());
-    
-    std::vector<int64_t> inp_strides = static_cast<std::vector<int64_t>>(self.strides());
-    std::vector<int64_t> out_strides = static_cast<std::vector<int64_t>>(out.strides());
-    std::vector<int64_t> inp_shape = static_cast<std::vector<int64_t>>(self.shape());
-    
-    std::vector<bool> dim_mask(inp_shape.size(), false);
-    for (int64_t d : dims) {
-        if (d < 0) d += inp_shape.size();
-        dim_mask[d] = true;
+std::tuple<Tensor, Tensor> max_dim_kernel_impl(const Tensor& self, int64_t dim0, bool keepdim) {
+    // torch.max(input, dim) -> (values, indices); strict compare keeps the
+    // FIRST maximal index, matching ATen's argmax pairing.
+    const int64_t nd = self.dim();
+    TP_CHECK(nd > 0, "max(): Expected input to have at least one dimension");
+    const int64_t dim = dim0 < 0 ? dim0 + nd : dim0;
+    TP_CHECK(dim >= 0 && dim < nd,
+             "Dimension out of range (expected to be in range of [-", nd, ", ", nd - 1, "], but got ", dim0, ")");
+    if (self.size(dim) == 0) {
+        TP_THROW(RuntimeError, "max(): Expected reduction dim ", dim, " to have non-zero size");
     }
-    
-    std::vector<int64_t> inp_dim_to_out_stride(inp_shape.size(), 0);
-    int64_t out_dim_idx = 0;
-    for (size_t i = 0; i < inp_shape.size(); ++i) {
-        if (dim_mask[i]) {
-            inp_dim_to_out_stride[i] = 0; 
-            if (keepdim) out_dim_idx++;
-        } else {
-            inp_dim_to_out_stride[i] = out_strides[out_dim_idx];
-            out_dim_idx++;
-        }
+
+    Tensor sc = self.is_contiguous() ? self : self.clone();
+    std::vector<int64_t> in_shape = static_cast<std::vector<int64_t>>(sc.shape());
+    const int64_t d_size = in_shape[dim];
+    int64_t outer = 1, inner = 1;
+    for (int64_t i = 0; i < dim; ++i) outer *= in_shape[i];
+    for (int64_t i = dim + 1; i < nd; ++i) inner *= in_shape[i];
+
+    std::vector<int64_t> out_shape = compute_reduction_shape(sc, {dim}, keepdim);
+    Tensor vals = Tensor::empty(out_shape, sc.dtype(), sc.device());
+    Tensor idxs = Tensor::empty(out_shape, DType::Int64, sc.device());
+
+    // With the reduced dim removed (or sized 1 under keepdim), the output is
+    // a contiguous [outer, inner] grid and line i lives at o*d_size*inner +
+    // i*inner + in2 -- identical addressing for both keepdim modes.
+#define TP_MAXMIN_DIM_CASE(ctype, name_, CMP_OP)                                        \
+    case DType::name_: {                                                                \
+        const ctype* sp = sc.data_ptr<ctype>();                                         \
+        ctype* vp = vals.data_ptr<ctype>();                                             \
+        int64_t* ip = idxs.data_ptr<int64_t>();                                         \
+        parallel_for(0, outer * inner, GRAIN_SIZE, [&](int64_t b, int64_t e) {          \
+            for (int64_t flat = b; flat < e; ++flat) {                                  \
+                const int64_t o = flat / inner, in2 = flat % inner;                     \
+                const ctype* line = sp + o * d_size * inner + in2;                      \
+                ctype best = line[0];                                                   \
+                int64_t bi = 0;                                                         \
+                for (int64_t i = 1; i < d_size; ++i) {                                  \
+                    if (line[i * inner] CMP_OP best) {                                  \
+                        best = line[i * inner];                                         \
+                        bi = i;                                                         \
+                    }                                                                   \
+                }                                                                       \
+                vp[flat] = best;                                                        \
+                ip[flat] = bi;                                                          \
+            }                                                                           \
+        });                                                                             \
+        break;                                                                          \
     }
-    
-    #define OP_CASE(ctype, name) \
-    case DType::name: { \
-        const ctype* inp_data = self.data_ptr<ctype>(); \
-        ctype* out_data = out.data_ptr<ctype>(); \
-        ctype init_val = get_lowest<ctype>(); \
-        int64_t out_n = out.numel(); \
-        for(int64_t i=0; i<out_n; ++i) out_data[i] = init_val; \
-        \
-        auto recurse = [&](auto&& self_recurse, int64_t dim, int64_t inp_off, int64_t out_off) -> void { \
-            if (dim == (int64_t)inp_shape.size()) { \
-                if (inp_data[inp_off] > out_data[out_off]) out_data[out_off] = inp_data[inp_off]; \
-                return; \
-            } \
-            int64_t size = inp_shape[dim]; \
-            int64_t i_stride = inp_strides[dim]; \
-            int64_t o_stride = inp_dim_to_out_stride[dim]; \
-            for (int64_t i = 0; i < size; ++i) { \
-                self_recurse(self_recurse, dim + 1, inp_off + i * i_stride, out_off + i * o_stride); \
-            } \
-        }; \
-        recurse(recurse, 0, 0, 0); \
-        break; \
+#define TP_MAXMIN_MAX_DISPATCH()                       \
+    switch (sc.dtype()) {                              \
+        TP_MAXMIN_DIM_CASE(uint8_t, UInt8, >)          \
+        TP_MAXMIN_DIM_CASE(int8_t, Int8, >)            \
+        TP_MAXMIN_DIM_CASE(int16_t, Int16, >)          \
+        TP_MAXMIN_DIM_CASE(int32_t, Int32, >)          \
+        TP_MAXMIN_DIM_CASE(int64_t, Int64, >)          \
+        TP_MAXMIN_DIM_CASE(uint16_t, UInt16, >)        \
+        TP_MAXMIN_DIM_CASE(uint32_t, UInt32, >)        \
+        TP_MAXMIN_DIM_CASE(uint64_t, UInt64, >)        \
+        TP_MAXMIN_DIM_CASE(float, Float32, >)          \
+        TP_MAXMIN_DIM_CASE(double, Float64, >)         \
+        TP_MAXMIN_DIM_CASE(Half, Float16, >)           \
+        TP_MAXMIN_DIM_CASE(BFloat16, BFloat16, >)      \
+        default:                                       \
+            TP_THROW(NotImplementedError, "max_dim not implemented for this dtype"); \
     }
-    
-    switch (self.dtype()) {
-        TENSORPLAY_FORALL_SCALAR_TYPES(OP_CASE)
-        default: TP_THROW(NotImplementedError, "max_dim not implemented for this dtype");
-    }
-    #undef OP_CASE
-    
-    return out;
+    TP_MAXMIN_MAX_DISPATCH()
+#undef TP_MAXMIN_MAX_DISPATCH
+#undef TP_MAXMIN_DIM_CASE
+    return {vals, idxs};
 }
 
 Tensor min_kernel_impl(const Tensor& self) {
@@ -313,65 +327,70 @@ Tensor min_kernel_impl(const Tensor& self) {
     return out;
 }
 
-Tensor min_dim_kernel_impl(const Tensor& self, std::vector<int64_t> dims, bool keepdim) {
-    if (dims.empty()) return min_kernel_impl(self);
-    
-    std::vector<int64_t> out_shape = compute_reduction_shape(self, dims, keepdim);
-    Tensor out = Tensor::empty(out_shape, self.dtype(), self.device());
-    
-    std::vector<int64_t> inp_strides = static_cast<std::vector<int64_t>>(self.strides());
-    std::vector<int64_t> out_strides = static_cast<std::vector<int64_t>>(out.strides());
-    std::vector<int64_t> inp_shape = static_cast<std::vector<int64_t>>(self.shape());
-    
-    std::vector<bool> dim_mask(inp_shape.size(), false);
-    for (int64_t d : dims) {
-        if (d < 0) d += inp_shape.size();
-        dim_mask[d] = true;
+std::tuple<Tensor, Tensor> min_dim_kernel_impl(const Tensor& self, int64_t dim0, bool keepdim) {
+    // torch.min(input, dim) -> (values, indices); strict compare keeps the
+    // FIRST minimal index.
+    const int64_t nd = self.dim();
+    TP_CHECK(nd > 0, "min(): Expected input to have at least one dimension");
+    const int64_t dim = dim0 < 0 ? dim0 + nd : dim0;
+    TP_CHECK(dim >= 0 && dim < nd,
+             "Dimension out of range (expected to be in range of [-", nd, ", ", nd - 1, "], but got ", dim0, ")");
+    if (self.size(dim) == 0) {
+        TP_THROW(RuntimeError, "min(): Expected reduction dim ", dim, " to have non-zero size");
     }
-    
-    std::vector<int64_t> inp_dim_to_out_stride(inp_shape.size(), 0);
-    int64_t out_dim_idx = 0;
-    for (size_t i = 0; i < inp_shape.size(); ++i) {
-        if (dim_mask[i]) {
-            inp_dim_to_out_stride[i] = 0; 
-            if (keepdim) out_dim_idx++;
-        } else {
-            inp_dim_to_out_stride[i] = out_strides[out_dim_idx];
-            out_dim_idx++;
-        }
+
+    Tensor sc = self.is_contiguous() ? self : self.clone();
+    std::vector<int64_t> in_shape = static_cast<std::vector<int64_t>>(sc.shape());
+    const int64_t d_size = in_shape[dim];
+    int64_t outer = 1, inner = 1;
+    for (int64_t i = 0; i < dim; ++i) outer *= in_shape[i];
+    for (int64_t i = dim + 1; i < nd; ++i) inner *= in_shape[i];
+
+    std::vector<int64_t> out_shape = compute_reduction_shape(sc, {dim}, keepdim);
+    Tensor vals = Tensor::empty(out_shape, sc.dtype(), sc.device());
+    Tensor idxs = Tensor::empty(out_shape, DType::Int64, sc.device());
+
+#define TP_MIN_DIM_CASE(ctype, name_)                                                   \
+    case DType::name_: {                                                                \
+        const ctype* sp = sc.data_ptr<ctype>();                                         \
+        ctype* vp = vals.data_ptr<ctype>();                                             \
+        int64_t* ip = idxs.data_ptr<int64_t>();                                         \
+        parallel_for(0, outer * inner, GRAIN_SIZE, [&](int64_t b, int64_t e) {          \
+            for (int64_t flat = b; flat < e; ++flat) {                                  \
+                const int64_t o = flat / inner, in2 = flat % inner;                     \
+                const ctype* line = sp + o * d_size * inner + in2;                      \
+                ctype best = line[0];                                                   \
+                int64_t bi = 0;                                                         \
+                for (int64_t i = 1; i < d_size; ++i) {                                  \
+                    if (line[i * inner] < best) {                                       \
+                        best = line[i * inner];                                         \
+                        bi = i;                                                         \
+                    }                                                                   \
+                }                                                                       \
+                vp[flat] = best;                                                        \
+                ip[flat] = bi;                                                          \
+            }                                                                           \
+        });                                                                             \
+        break;                                                                          \
     }
-    
-    #define OP_CASE(ctype, name) \
-    case DType::name: { \
-        const ctype* inp_data = self.data_ptr<ctype>(); \
-        ctype* out_data = out.data_ptr<ctype>(); \
-        ctype init_val = get_highest<ctype>(); \
-        int64_t out_n = out.numel(); \
-        for(int64_t i=0; i<out_n; ++i) out_data[i] = init_val; \
-        \
-        auto recurse = [&](auto&& self_recurse, int64_t dim, int64_t inp_off, int64_t out_off) -> void { \
-            if (dim == (int64_t)inp_shape.size()) { \
-                if (inp_data[inp_off] < out_data[out_off]) out_data[out_off] = inp_data[inp_off]; \
-                return; \
-            } \
-            int64_t size = inp_shape[dim]; \
-            int64_t i_stride = inp_strides[dim]; \
-            int64_t o_stride = inp_dim_to_out_stride[dim]; \
-            for (int64_t i = 0; i < size; ++i) { \
-                self_recurse(self_recurse, dim + 1, inp_off + i * i_stride, out_off + i * o_stride); \
-            } \
-        }; \
-        recurse(recurse, 0, 0, 0); \
-        break; \
+    switch (sc.dtype()) {
+        TP_MIN_DIM_CASE(uint8_t, UInt8)
+        TP_MIN_DIM_CASE(int8_t, Int8)
+        TP_MIN_DIM_CASE(int16_t, Int16)
+        TP_MIN_DIM_CASE(int32_t, Int32)
+        TP_MIN_DIM_CASE(int64_t, Int64)
+        TP_MIN_DIM_CASE(uint16_t, UInt16)
+        TP_MIN_DIM_CASE(uint32_t, UInt32)
+        TP_MIN_DIM_CASE(uint64_t, UInt64)
+        TP_MIN_DIM_CASE(float, Float32)
+        TP_MIN_DIM_CASE(double, Float64)
+        TP_MIN_DIM_CASE(Half, Float16)
+        TP_MIN_DIM_CASE(BFloat16, BFloat16)
+        default:
+            TP_THROW(NotImplementedError, "min_dim not implemented for this dtype");
     }
-    
-    switch (self.dtype()) {
-        TENSORPLAY_FORALL_SCALAR_TYPES(OP_CASE)
-        default: TP_THROW(NotImplementedError, "min_dim not implemented for this dtype");
-    }
-    #undef OP_CASE
-    
-    return out;
+#undef TP_MIN_DIM_CASE
+    return {vals, idxs};
 }
 
 
@@ -412,7 +431,7 @@ Tensor prod_kernel_impl(const Tensor& self, DType dtype) {
     return out;
 }
 
-Tensor prod_dim_kernel_impl(const Tensor& self, std::vector<int64_t> dims, bool keepdim, DType dtype) {
+Tensor prod_dim_kernel_impl(const Tensor& self, const std::vector<int64_t>& dims, bool keepdim, DType dtype) {
     DType out_dtype = dtype;
     if (out_dtype == DType::Undefined) {
          out_dtype = self.dtype();
@@ -536,7 +555,7 @@ Tensor any_kernel_impl(const Tensor& self) {
     return out;
 }
 
-Tensor all_dim_kernel_impl(const Tensor& self, std::vector<int64_t> dims, bool keepdim) {
+Tensor all_dim_kernel_impl(const Tensor& self, const std::vector<int64_t>& dims, bool keepdim) {
     if (dims.empty()) return all_kernel_impl(self);
     
     std::vector<int64_t> out_shape = compute_reduction_shape(self, dims, keepdim);
@@ -593,7 +612,7 @@ Tensor all_dim_kernel_impl(const Tensor& self, std::vector<int64_t> dims, bool k
     return out;
 }
 
-Tensor any_dim_kernel_impl(const Tensor& self, std::vector<int64_t> dims, bool keepdim) {
+Tensor any_dim_kernel_impl(const Tensor& self, const std::vector<int64_t>& dims, bool keepdim) {
     if (dims.empty()) return any_kernel_impl(self);
     
     std::vector<int64_t> out_shape = compute_reduction_shape(self, dims, keepdim);

@@ -161,11 +161,11 @@ public:
     bool is_channels_last_3d() const;
     bool is_pinned() const;
     Tensor pin_memory() const;
-    Tensor contiguous() const;
+    // Tensor contiguous() const; // Generated
     // Materializes *this with the canonical strides of `format` (NHWC /
     // NDHWC); returns *this unchanged when it already matches. Preserve
     // resolves to plain contiguous().
-    Tensor contiguous(MemoryFormat format) const;
+    // Tensor contiguous(MemoryFormat format) const; // Generated
     bool is_sparse() const;
     bool is_coalesced() const;
     int64_t sparse_dim() const;
@@ -222,12 +222,13 @@ public:
     std::string toString() const;
     
     // View methods
-    // Tensor view(const std::vector<int64_t>& shape) const; // Generated
+    Tensor view(const std::vector<int64_t>& shape) const;
+    Tensor view_dtype(DType dtype) const;
     // Tensor reshape(const std::vector<int64_t>& shape) const; // Generated
     Tensor as_strided(const std::vector<int64_t>& size, const std::vector<int64_t>& stride, std::optional<int64_t> storage_offset = std::nullopt) const;
     Tensor select(int64_t dim, int64_t index) const;
     Tensor slice(int64_t dim, int64_t start, int64_t end, int64_t step = 1) const;
-    Tensor expand(const std::vector<int64_t>& size) const;
+    // Tensor expand(const std::vector<int64_t>& size) const; // Generated
     
     // Tensor transpose(int64_t dim0, int64_t dim1) const; // Generated
     // Tensor t() const; // Generated
@@ -255,7 +256,7 @@ public:
     }
     
     // Clone
-    Tensor clone() const;
+    // Tensor clone() const; // Generated
 
     // Factories (static)
     // static Tensor empty(const std::vector<int64_t>& size, DType dtype = DType::Float32, Device device = Device(DeviceType::CPU)); // Generated
@@ -319,6 +320,14 @@ public:
 
 // Unary operators
 P10_API Tensor operator-(const Tensor& t);
+
+// Dispatcher-level implementations shared by the backend kernels; the
+// clone/contiguous Tensor members are codegen-owned (native_functions.yaml)
+// and route here through the dispatcher.
+namespace detail {
+P10_API Tensor clone_impl(const Tensor& self);
+P10_API Tensor contiguous_impl(const Tensor& self, int64_t memory_format);
+} // namespace detail
 
 // Global operators for Scalar first
 P10_API inline Tensor operator+(Scalar s, const Tensor& t) { return t + s; }

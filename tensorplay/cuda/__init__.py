@@ -850,7 +850,7 @@ def synchronize(device: Any = None) -> None:
             if :attr:`device` is ``None`` (default).
     """
     _lazy_init()
-    with device(device):
+    with _DeviceGuard(_get_device_index(device, optional=True)):
         return _lcuda.synchronize(-1)
 
 

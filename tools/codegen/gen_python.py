@@ -18,8 +18,11 @@ from tensorplay._C import DType
 from tensorplay.compiler.graph import capture_call as _capture_call
 
 def _ensure_device(device):
+    # None stays None so the C++ factory layer resolves it against
+    # globalContext().defaultDevice() (torch TensorOptions fallthrough);
+    # only spellings the bindings cannot parse are normalized here.
     if device is None or device is Ellipsis:
-        return tensorplay.device("cpu")
+        return None
     if isinstance(device, str):
         return tensorplay.device(device)
     return device
@@ -40,16 +43,107 @@ def _capture_line(lines, fn_name, params):
     lines.append('        return _captured')
 
 
+def _sig_param(a) -> str:
+    s = _param_name(a)
+    if a.default:
+        return s + '=' + python_default(a.type, a.default)
+    # Added positional (e.g. `int[] dim`) with no schema default: the Python
+    # sentinel None selects the base overload, mirroring torch's
+    # `int[1]? dim=None`.
+    return s + '=None'
+
+
+def _reduction_union_lines(name, base, sib) -> list[str] | None:
+    """torch unifies `<op>(self, *, dtype)` and
+    `<op>.dim_IntList(self, dim, keepdim, *, dtype)` behind one public
+    signature `op(input, dim=None, keepdim=False, *, dtype=...)`; dim=None
+    delegates to the base overload (ATen ReduceOps.cpp precedent). Emits that
+    union wrapper when the overload pair has exactly that shape: identical
+    kwonly sets, and the sibling's positionals are the base's with new
+    defaulted/list params inserted (subsequence check)."""
+    nonout = [g for g in (base, sib)]
+    pa = [a for a in base.args if not a.kwonly]
+    ps = [a for a in sib.args if not a.kwonly]
+    ka = [a for a in base.args if a.kwonly]
+    ks = [a for a in sib.args if a.kwonly]
+    if ('function' not in base.variants
+            or not pa or not pa[0].type.is_tensor_like
+            or not ps[0].type.is_tensor_like
+            or [a.name for a in ka] != [a.name for a in ks]):
+        return None
+    base_names = [a.name for a in pa[1:]]
+    it = iter([a.name for a in ps[1:]])
+    if not all(n in it for n in base_names):
+        return None
+    sib_extras = [a for a in ps[1:]]
+    known = set(base_names)
+    added = [a for a in sib_extras if a.name not in known]
+    if not added:
+        return None
+    # Only unambiguous additions: defaulted scalars/flags or a leading dim
+    # list / bare-int (which may lack a schema default -- it becomes the
+    # None router).
+    if not all(a.type.is_list or a.default or a.type.kind == 'int64_t'
+               for a in added):
+        return None
+    route = next((a for a in added
+                  if a.type.is_list or not a.default), None)
+    if route is None or len(added) > 2:
+        return None
+
+    # Existing base positionals keep their slots (tp.norm(x, 2) stays p=2);
+    # new params are appended before the kwonly tail.
+    sig = ['input'] + [_sig_param(a) for a in pa[1:]]
+    sig += [_sig_param(a) for a in added]
+    if ka:
+        sig += ['*'] + [_sig_param(a) for a in ka]
+
+    cap = ['input'] + [_param_name(a) for a in pa[1:] + added + ka]
+
+    def ccall(g, args):
+        parts = ['self=input']
+        parts += [f'{a.python_name}={_param_name(a)}' for a in args]
+        parts += [f'{a.python_name}={_param_name(a)}' for a in g.args if a.kwonly]
+        return f'_C.{name}({", ".join(parts)})'
+
+    base_call = ccall(base, pa[1:])
+    sib_call = ccall(sib, ps[1:])
+    return [
+        f'def {name}({", ".join(sig)}):',
+        '    _captured = _capture_call('
+        + f'{name}, ({", ".join(cap)}' + (',' if len(cap) == 1 else '')
+        + '), {})',
+        '    if _captured is not None:',
+        '        return _captured',
+        f'    if {_param_name(route)} is None:',
+        f'        return {base_call}',
+        f'    return {sib_call}',
+        '',
+    ]
+
+
 def generate_functional_py(funcs: list[NativeFunction]) -> str:
     lines = [_HEADER]
 
     seen: set[str] = set()
-    has_matmul_out = any(f.func_name == 'matmul.out' for f in funcs)
 
     for f in funcs:
         name = f.cpp_name
         if name in seen or 'function' not in f.variants and 'method' not in f.variants:
             continue
+
+        # Overload-group facts, mirroring upstream PythonArgParser behavior:
+        #  - a sibling `.out` overload exposes the torch-style `*, out=None`
+        #    keyword on the public function;
+        #  - a base+dim reduction pair (sum/mean/prod/max/min/all/any/
+        #    squeeze/var/std/norm) gets the torch union signature with
+        #    dim=None routing to the base overload (_reduction_union_lines);
+        #  - remaining non-out overloads must be selected by positional shape
+        #    (tensor_split's int vs int[] vs Tensor), so the wrapper forwards
+        #    positionally and lets the FASTCALL group dispatcher pick.
+        group = [g for g in funcs if g.cpp_name == name]
+        out_variant = next((g for g in group if g.overload_name == 'out'), None)
+        multi_overload = sum(1 for g in group if g.overload_name != 'out') > 1
 
         # linalg ops are exposed through the tensorplay.linalg package only
         # (mirrors torch, where they live under torch.linalg).
@@ -98,11 +192,13 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
                           + (", 'pin_memory': pin_memory" if pin_ok else "")
                           + ", 'requires_grad': requires_grad}")
             lines += [
-                f'def {name}(*size, dtype=DType.float32, device=None{pin_param}, requires_grad=False):',
+                f'def {name}(*size, dtype=None, device=None{pin_param}, requires_grad=False):',
                 '    if len(size) == 1 and (isinstance(size[0], (list, tuple)) or hasattr(size[0], \'__iter__\')):',
                 '        _size = size[0]',
                 '    else:',
                 '        _size = size',
+                '    if dtype is None:',
+                '        dtype = DType.undefined',
                 f'    _captured = _capture_call({name}, tuple(size), {cap_kwargs})',
                 '    if _captured is not None:',
                 '        return _captured',
@@ -113,11 +209,24 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
 
         if name == 'arange' and 'function' in f.variants:
             seen.add(name)
+            # Resolve DType.undefined here (torch PythonArgParser behavior):
+            # integral args -> int64, any float arg -> default float dtype.
+            # Passing Undefined through the binding crashes on some builds.
             lines += [
                 'def arange(*args, dtype=DType.undefined, device=None, requires_grad=False):',
                 "    _captured = _capture_call(arange, tuple(args), {'dtype': dtype, 'device': device, 'requires_grad': requires_grad})",
                 '    if _captured is not None:',
                 '        return _captured',
+                '    if dtype == DType.undefined:',
+                '        _has_float = False',
+                '        for _a in args:',
+                '            if isinstance(_a, float):',
+                '                _has_float = True',
+                '                break',
+                '        if _has_float:',
+                '            dtype = DType.float32',
+                '        else:',
+                '            dtype = DType.int64',
                 '    if len(args) == 1:',
                 '        return _C.arange(end=args[0], dtype=dtype, device=_ensure_device(device), requires_grad=requires_grad)',
                 '    elif len(args) == 2:',
@@ -133,18 +242,64 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
         if 'function' in f.variants:
             seen.add(name)
 
-            if name == 'matmul' and has_matmul_out:
-                lines += [
-                    'def matmul(input, other, *, out=None):',
-                    '    if out is not None:',
-                    '        return _C.matmul(self=input, other=other, out=out)',
-                    '    _captured = _capture_call(matmul, (input, other), {})',
-                    '    if _captured is not None:',
-                    '        return _captured',
-                    '    return _C.matmul(self=input, other=other)',
-                    '',
-                ]
+            if out_variant is not None:
+                # torch: `def op(<args>, *, out=None)`; the out branch skips
+                # autograd capture (matching the matmul special-case this
+                # generalizes).
+                pos = [_param_name(a) for a in f.args]
+                kw = ", ".join(f"{a.python_name}={p}" for a, p in zip(f.args, pos))
+                lines.append(f'def {name}({", ".join(pos)}, *, out=None):')
+                lines.append('    if out is not None:')
+                lines.append(f'        return _C.{name}({kw}, out=out)')
+                _capture_line(lines, name, pos)
+                lines.append(f'    return _C.{name}({kw})')
+                lines.append('')
                 continue
+
+            # torch exposes sole-TensorList-argument ops as varargs
+            # (broadcast_tensors(*tensors), block_diag(*tensors)); the
+            # FASTCALL layer folds surplus positionals into the list.
+            seq_varargs = any(
+                g.overload_name != 'out' and len(g.args) == 1
+                and g.args[0].type.is_tensor_like and g.args[0].type.is_list
+                for g in group)
+            if (len(f.args) >= 2 and f.args[0].type.kind == 'str'
+                    and f.args[1].type.is_tensor_like and f.args[1].type.is_list):
+                # torch.einsum(equation, *operands[, ...]): fold the tail.
+                head = [_param_name(a) for a in f.args[:1]]
+                rest = f.args[1:]
+                sig = head[0] + ", *" + rest[0].python_name
+                extra = "".join(
+                    ", " + _param_name(a) + "=None" for a in rest[1:])
+                tail = ""
+                for a in rest[1:]:
+                    pn = _param_name(a)
+                    dft = python_default(a.type, a.default) if a.default else "None"
+                    tail += f", {pn} if {pn} is not None else {dft}"
+                fwd = head[0] + ", list(" + rest[0].python_name + ")" + tail
+                lines.append(f'def {name}({sig}{extra}):')
+                _capture_line(lines, name, head + ['*' + rest[0].python_name])
+                lines.append(f'    return _C.{name}({fwd})')
+                lines.append('')
+                continue
+
+            if seq_varargs:
+                # Works with or without sibling overloads: a lone tensor hits
+                # the plain candidate, surplus positionals fold into the
+                # Tensor[] candidate (atleast_2d(t) vs atleast_2d(t1, t2)).
+                lines.append(f'def {name}(*args):')
+                _capture_line(lines, name, ['*args'])
+                lines.append(f'    return _C.{name}(*args)')
+                lines.append('')
+                continue
+
+            sibs = [g for g in group if g is not f and g.overload_name != 'out']
+            if multi_overload and len(sibs) == 1:
+                union = _reduction_union_lines(name, f, sibs[0])
+                if union is not None:
+                    seen.add(name)
+                    lines += union
+                    continue
 
             arg_strs, call_args = [], []
             for a in f.args:
@@ -175,11 +330,27 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
                     lines.append(
                         f'    if {pname} is not None and not isinstance({pname}, (tensorplay.Scalar, tensorplay.Tensor)):')
                     lines.append(f'        {pname} = tensorplay.Scalar({pname})')
+                elif t.kind == 'DType' and t.is_opt:
+                    # Factory ops (no leading tensor receiver) resolve an
+                    # explicit None through the C++ default-dtype
+                    # substitution (DType.undefined); tensor-receiver ops
+                    # keep std::optional semantics -- their kernels
+                    # distinguish "absent" (keep input dtype) from
+                    # "undefined" (global default).
+                    if not (f.args and f.args[0].type.is_tensor_like):
+                        lines.append(f'    if {pname} is None:')
+                        lines.append(f'            {pname} = DType.undefined')
                 elif t.is_tensor_like and not t.is_list and a.default == '{}':
                     lines.append(f'    if {pname} is None:')
                     lines.append(f'        {pname} = tensorplay.Tensor()')
 
-            lines.append(f'    return _C.{name}({", ".join(call_args)})')
+            if multi_overload:
+                # Positional forwarding: candidate selection happens in the
+                # FASTCALL group dispatcher, exactly like PythonArgParser.
+                lines.append(
+                    f"    return _C.{name}({', '.join(_param_name(a) for a in f.args)})")
+            else:
+                lines.append(f'    return _C.{name}({", ".join(call_args)})')
             lines.append('')
             continue
 

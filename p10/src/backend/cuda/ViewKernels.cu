@@ -277,6 +277,72 @@ Tensor cat_kernel_cuda(const std::vector<Tensor>& tensors, int64_t dim) {
     return out;
 }
 
+std::vector<Tensor> split_kernel_cuda(const Tensor& self, int64_t split_size, int64_t dim) {
+    int64_t ndim = self.dim();
+    if (dim < 0) dim += ndim;
+    if (dim < 0 || dim >= ndim) TP_THROW(IndexError, "split(): dimension out of range");
+    if (split_size <= 0) TP_THROW(RuntimeError, "split(): split_size must be positive");
+
+    int64_t dim_size = self.size(dim);
+    std::vector<Tensor> result;
+    for (int64_t i = 0; i < dim_size; i += split_size) {
+        int64_t end = std::min(i + split_size, dim_size);
+        result.push_back(self.slice(dim, i, end));
+    }
+    return result;
+}
+
+std::vector<Tensor> split_sizes_kernel_cuda(const Tensor& self,
+                                            const std::vector<int64_t>& split_sizes,
+                                            int64_t dim) {
+    int64_t ndim = self.dim();
+    if (dim < 0) dim += ndim;
+    if (dim < 0 || dim >= ndim) TP_THROW(IndexError, "split(): dimension out of range");
+
+    int64_t dim_size = self.size(dim);
+    int64_t sum_sizes = 0;
+    for (auto s : split_sizes) sum_sizes += s;
+    if (sum_sizes != dim_size) {
+        TP_THROW(RuntimeError, "split(): sum of split_sizes must equal dimension size");
+    }
+
+    std::vector<Tensor> result;
+    int64_t offset = 0;
+    for (auto s : split_sizes) {
+        result.push_back(self.slice(dim, offset, offset + s));
+        offset += s;
+    }
+    return result;
+}
+
+std::vector<Tensor> chunk_kernel_cuda(const Tensor& self, int64_t chunks, int64_t dim) {
+    int64_t ndim = self.dim();
+    if (dim < 0) dim += ndim;
+    if (dim < 0 || dim >= ndim) TP_THROW(IndexError, "chunk(): dimension out of range");
+    if (chunks <= 0) TP_THROW(RuntimeError, "chunk(): chunks must be positive");
+
+    int64_t dim_size = self.size(dim);
+    int64_t split_size = (dim_size + chunks - 1) / chunks;
+    std::vector<Tensor> result;
+    for (int64_t i = 0; i < dim_size; i += split_size) {
+        int64_t end = std::min(i + split_size, dim_size);
+        result.push_back(self.slice(dim, i, end));
+    }
+    return result;
+}
+
+std::vector<Tensor> unbind_kernel_cuda(const Tensor& self, int64_t dim) {
+    int64_t d = dim < 0 ? dim + self.dim() : dim;
+    if (d < 0 || d >= self.dim()) TP_THROW(IndexError, "Dimension out of range");
+    std::vector<Tensor> result;
+    int64_t size_dim = self.size(d);
+    result.reserve(size_dim);
+    for (int64_t i = 0; i < size_dim; ++i) {
+        result.push_back(self.select(d, i));
+    }
+    return result;
+}
+
 Tensor stack_kernel_cuda(const std::vector<Tensor>& tensors, int64_t dim) {
     if (tensors.empty()) {
         TP_THROW(RuntimeError, "stack(): expected a non-empty list of tensors");
@@ -403,6 +469,55 @@ Tensor movedim_kernel_cuda(const Tensor& self, const std::vector<int64_t>& sourc
     return permute_kernel_cuda(self, permutation);
 }
 
+// --- clone / slice / contiguous --------------------------------------------
+// The detail implementations live in libp10 and route copies by device, so
+// the CUDA registrations share the CPU bodies.  Sparse layouts are rejected
+// before the dense-stride math, matching the CPU guards.  (select/item use
+// skip_implementation -- their core Tensor methods are the implementation.)
+Tensor clone_kernel_cuda(const Tensor& self, std::optional<int64_t> memory_format) {
+    (void)memory_format;
+    return tensorplay::detail::clone_impl(self);
+}
+
+Tensor slice_kernel_cuda(const Tensor& self, int64_t dim,
+                         std::optional<int64_t> start,
+                         std::optional<int64_t> end, int64_t step) {
+    if (self.is_sparse()) {
+        TP_THROW(RuntimeError, "slice() is not supported for sparse COO tensors");
+    }
+    return self.slice(dim, start.value_or(0),
+                      end.value_or(std::numeric_limits<int64_t>::max()), step);
+}
+
+Tensor contiguous_kernel_cuda(const Tensor& self, int64_t memory_format) {
+    return tensorplay::detail::contiguous_impl(self, memory_format);
+}
+
+Tensor select_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self,
+                                   int64_t dim, int64_t index) {
+    if (self.is_sparse()) {
+        TP_THROW(RuntimeError, "select(): gradient w.r.t. sparse COO tensors is not supported");
+    }
+    Tensor out(self.shape(), grad_output.dtype(), grad_output.device());
+    out.zero_();
+    out.select(dim, index).copy_(grad_output);
+    return out;
+}
+
+Tensor slice_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self,
+                                  int64_t dim, std::optional<int64_t> start,
+                                  std::optional<int64_t> end, int64_t step) {
+    if (self.is_sparse()) {
+        TP_THROW(RuntimeError, "slice(): gradient w.r.t. sparse COO tensors is not supported");
+    }
+    Tensor out(self.shape(), grad_output.dtype(), grad_output.device());
+    out.zero_();
+    out.slice(dim, start.value_or(0),
+              end.value_or(std::numeric_limits<int64_t>::max()), step)
+        .copy_(grad_output);
+    return out;
+}
+
 TENSORPLAY_LIBRARY_IMPL(CUDA, ViewKernels) {
     m.impl("view_as_real", view_as_real_cuda);
     m.impl("view_as_complex", view_as_complex_cuda);
@@ -416,11 +531,20 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, ViewKernels) {
     m.impl("squeeze_backward", squeeze_backward_kernel_cuda);
     m.impl("squeeze.dim", squeeze_dim_kernel_cuda);
     m.impl("unsqueeze", unsqueeze_kernel_cuda);
+    m.impl("clone", clone_kernel_cuda);
+    m.impl("slice", slice_kernel_cuda);
+    m.impl("contiguous", contiguous_kernel_cuda);
+    m.impl("select_backward", select_backward_kernel_cuda);
+    m.impl("slice_backward", slice_backward_kernel_cuda);
     m.impl("diagonal", diagonal_kernel_cuda);
     m.impl("diagonal_backward", diagonal_backward_kernel_cuda);
     m.impl("movedim", movedim_kernel_cuda);
     m.impl("cat", cat_kernel_cuda);
     m.impl("stack", stack_kernel_cuda);
+    m.impl("split", split_kernel_cuda);
+    m.impl("split.sizes", split_sizes_kernel_cuda);
+    m.impl("chunk", chunk_kernel_cuda);
+    m.impl("unbind", unbind_kernel_cuda);
 }
 
 } // namespace cuda

@@ -37,6 +37,7 @@ void init_stax(py::module_& m) {
         .def_property_readonly("outputs", [](const OpNode& n) { return n.outputs; }, py::return_value_policy::reference)
         .def("set_int_attr", [](OpNode& n, const std::string& key, int64_t val) { n.setAttr(key, val); })
         .def("set_float_attr", [](OpNode& n, const std::string& key, double val) { n.setAttr(key, val); })
+        .def("set_str_attr", [](OpNode& n, const std::string& key, const std::string& val) { n.setAttr(key, val); })
         .def("set_ints_attr", [](OpNode& n, const std::string& key, const std::vector<int64_t>& val) { n.setAttr(key, val); })
         .def("set_floats_attr", [](OpNode& n, const std::string& key, const std::vector<double>& val) { n.setAttr(key, val); })
         .def("get_int_attr", [](OpNode& n, const std::string& key) { 
