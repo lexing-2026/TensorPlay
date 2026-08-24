@@ -1,1 +1,0 @@
-/usr/bin/g++-13 -fPIC -O3 -DNDEBUG -shared -Wl,-soname,libtpx.so -o ../tensorplay/lib/libtpx.so CMakeFiles/tpx.dir/Unity/unity_0_cxx.cxx.o  -Wl,-rpath,"\$ORIGIN:/home/bluemoon/projects/TensorPlay/tensorplay/lib:" ../tensorplay/lib/libp10.so ../_deps/onednn-build/src/libdnnl.a -ldl /usr/lib/gcc/x86_64-linux-gnu/13/libgomp.so /usr/lib/x86_64-linux-gnu/libpthread.a -lm 
