@@ -239,9 +239,14 @@ def generate_tpx_ops_cpp(funcs: list[NativeFunction], *,
                         'device = globalContext().defaultDevice();')
                 elif (a.name == 'dtype' and f.base_name in _DTYPE_GLOBAL_DEFAULT_OPS
                       and at in ('DType', 'std::optional<DType>')):
-                    lines.append(
-                        '    if (dtype == DType::Undefined) '
-                        'dtype = globalContext().defaultDType();')
+                    if at == 'std::optional<DType>':
+                        lines.append(
+                            '    if (!dtype.has_value() || *dtype == DType::Undefined) '
+                            'dtype = globalContext().defaultDType();')
+                    else:
+                        lines.append(
+                            '    if (dtype == DType::Undefined) '
+                            'dtype = globalContext().defaultDType();')
 
         if f.func_name in autocast_ops:
             _emit_autocast_block(lines, f, arg_types)
@@ -287,14 +292,12 @@ def generate_tpx_ops_cpp(funcs: list[NativeFunction], *,
                     and f.base_name in _VIEW_OPS
                     and kind == 'value')
         if _is_inplace:
-            alias0 = next((a.name for a in f.mutable_args if a.type.is_mutable_ref),
-                          None)
-            if alias0:
-                # Mirrors torch: in-place ops under inference_mode skip the
-                # version bump (normal tensors keep their version frozen).
-                lines.append(
-                    f'    if (!InferenceMode::is_enabled()) '
-                    f'{alias0}.unsafeGetTensorImpl()->bump_version();')
+            # Version bumping is owned exclusively by the below-autograd
+            # redispatch layer (gen_api.py emits it inside
+            # detail::redispatch_*), mirroring upstream where InplaceOrView
+            # kernels sit beneath VariableType; bumping here again would
+            # double-count under the default autograd path.
+            pass
         elif _is_view:
             lines.append(
                 f'    result.unsafeGetTensorImpl()->share_version_counter('

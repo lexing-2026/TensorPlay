@@ -462,6 +462,18 @@ def jvp(func, inputs, v=None, create_graph=False, strict=False, mode="reversed")
     )
 
 
+def jacfwd(func, inputs):
+    r"""Compute the Jacobian of ``func`` using native forward-mode AD.
+
+    Column-scan over the inputs through :class:`~tensorplay.autograd._forward.
+    DualTensor`; no backward graph is built.  Returns one Jacobian block per
+    input with shape ``out_shape + in_shape`` (tuple-of-tuples when ``func``
+    returns multiple outputs).
+    """
+    from tensorplay.autograd._forward import jacfwd as _jacfwd
+    return _jacfwd(func, inputs)
+
+
 def jacobian(
     func,
     inputs,

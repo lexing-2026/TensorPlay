@@ -98,15 +98,14 @@ std::vector<Edge> collect_next_edges(const Args&... args) {
 }
 
 // Autograd-aware view/manipulation free functions (formerly tpx::Tensor methods).
+// select/slice moved to the generated tpx::ops surface (yaml + derivatives).
 TENSORPLAY_API Tensor as_strided(const Tensor& self, const std::vector<int64_t>& size,
                                  const std::vector<int64_t>& stride,
                                  std::optional<int64_t> storage_offset = std::nullopt);
-TENSORPLAY_API Tensor select(const Tensor& self, int64_t dim, int64_t index);
-TENSORPLAY_API Tensor slice(const Tensor& self, int64_t dim, int64_t start, int64_t end, int64_t step = 1);
 // at::native::narrow is slice(dim, start, start + length); routing through
-// slice reuses its backward.
+// the generated slice op reuses its backward.
 TENSORPLAY_API Tensor narrow(const Tensor& self, int64_t dim, int64_t start, int64_t length);
-TENSORPLAY_API Tensor expand(const Tensor& self, const std::vector<int64_t>& size);
+// expand() likewise moved to the generated tpx::ops surface.
 
 // Differentiable `to`, mirroring torch: the forward cast records a
 // ToCopyBackward node whose backward casts the gradient back to the source

@@ -1,4 +1,104 @@
-# 1. RNG 与 Torch 逐位对齐（2026-08-21）
+# 1. 构建 / CI / 发布对齐 torch，删除自建构建脚本（2026-08-24）
+
+对照 `third_party/pytorch` 的 pyproject.toml 与 `.github/workflows/` 重排构建、CI 与发布，
+删除自建的 Python 构建编排脚本：
+
+- **删除自建脚本**：`rebuild.py`（Windows 本地构建编排）、`release.py`（cibuildwheel 发布编排）
+  一并移除。构建统一走 scikit-build-core 的 PEP 517 接口（`pip install .` /
+  `python -m build --wheel`），与 torch 一致；`CMakeLists.txt` 中引用 rebuild.py 的过时注释同步清理，
+  `CONTRIBUTING.md` 的 `python setup.py install` 过时说明改为 PEP 517 命令。
+- **pyproject.toml 对齐 torch**：`[tool.scikit-build.env]` 把 `MAX_JOBS` 映射到
+  `CMAKE_BUILD_PARALLEL_LEVEL`（torch 同款伞形并行度旋钮）；`build-dir` 固定 `build/`；
+  不再显式设 `cmake.build-type`（默认 Release，且允许环境 `CMAKE_BUILD_TYPE` 覆盖，torch 同款）；
+  去掉冗余的全局 `-GNinja`（scikit-build-core 默认即 Ninja）；editable 用 redirect 模式且
+  关闭 import 时自动重编（torch 同款，避免每次 import 触发 cmake/ninja）；
+  sdist 排除 `.github/`、`build/` 及仅作参考的 `third_party/pytorch`（1.7G gitlink）、`third_party/audio`；
+  build-system 下限提升到 `scikit-build-core>=1.0`（env 表与 dynamic-metadata 所需）。
+- **新增**：`requirements-build.txt` 与 `[dependency-groups] dev`（与 torch 的
+  requirements-build.txt ↔ dependency-groups 同步机制一致）。
+- **版本链路整体照抄 torch 的 tools/metadata**：新增 `tools/generate_tensorplay_version.py` 与
+  `tools/metadata/{_common,version}.py` provider（逐行移植，仅改环境变量名与标识符）：
+  版本优先级 TENSORPLAY_BUILD_VERSION/BUILD_NUMBER（发布注入）→ PKG-INFO（sdist 构建）→
+  `version.txt + git SHA`（本地开发构建，带 `+git<sha7>` 后缀），含 PEP 440 校验与 sdist
+  一致性断言。CMake `generate_code` 目标新增生成步骤产出 `tensorplay/version.py`
+  （`__version__`/`debug`/`cuda`/`git_version`，已 gitignore），`tensorplay/__init__.py`
+  改为消费生成物而非硬编码版本。
+- **CMake 对齐 torch 的 EnvVarForwarding**：新增 `cmake/EnvVarForwarding.cmake`（核心机制照抄，
+  变量表裁到本项目开关）：`BUILD_*`/`USE_*`/`CMAKE_*` 环境变量经 Python 枚举后直通为同名
+  CMake 缓存变量——`USE_CUDA=OFF pip install .`、`CMAKE_CUDA_ARCHITECTURES=61 pip install .`
+  等 torch 风格写法直接生效，不再依赖 `SKBUILD_CMAKE_DEFINE`；include 置于 project() 后、
+  USE_CUDA 自动探测前。
+- **CI 重排为 torch 形态**：原单一 `release.yml` 拆为可复用
+  `_binary-build.yml` / `_binary-test.yml` / `_binary-upload.yml`（对标 torch 的
+  `_binary-build-linux.yml` / `_binary-test-linux.yml` / `_binary-upload.yml`），
+  编排入口 `pull.yml`（PR）/ `trunk.yml`（main 与 release/* 推送）/ `release.yml`（v* tag：
+  全矩阵构建 → 逐 wheel 冒烟 → PyPI trusted publishing）/ `lint.yml`（ruff，规则在
+  pyproject.toml）。矩阵保持不变（ubuntu-22.04 cpu/cu121、ubuntu-24.04-arm cpu、windows-2022 cpu、
+  py3.11），torch 风格的 `BUILD_ENVIRONMENT`/`SHA1`/`PR_NUMBER` 环境变量、concurrency 取消组、
+  显式 `permissions` 一并引入；cu121 wheel 的冒烟测试在独立 test job 安装 CUDA toolkit 以满足
+  扩展运行时依赖。
+
+# 2. 用户自定义算子三层对齐 torch（2026-08-24）
+
+对照 `third_party/pytorch` 补齐用户自定义 TVM/Triton 算子集成的三个层面：
+
+- **层面一 · 自定义算子注册**：新增 `tensorplay/library.py`（`torch.library` 对标）。
+  `custom_op/triton_op` 装饰器（被装饰函数即默认 kernel，`device_types` 声明覆盖面）、
+  `register_kernel/register_fake/register_autograd`（autograd 经既有 PyNode 引擎，
+  `backward(ctx, *grads)` + `setup_context` 签名与 torch 一致）、`Library`
+  （DEF/IMPL/FRAGMENT，schema 字符串仅取限定名）、`get_op/has_op`、顶层
+  `tensorplay.ops.<ns>.<op>` 包命名空间（`_ops.py`，同时承接 `load_library` 委托，
+  修复 `_classes.py` 悬空引用）。
+- **层面二 · Triton 集成**：`wrap_triton` 幂等包装 `@triton.jit` kernel；eager 直通启动，
+  被 `tensorplay.compile` 捕获到裸 launch（代理参数）时按 torch 语义报 GraphCaptureError，
+  引导用户走 `triton_op`。捕获后 op 以原生 `custom_op` 节点进入 Stax 原生图——
+  与 Inductor 对 triton op 的黑盒契约一致（不透明=融合屏障，但执行仍是原生的，
+  绝不回退 Python 解释器）。
+- **层面三 · TVM 后端**：新增 `tensorplay/backends/tvm.py`（`backend="tvm"`），结构对齐
+  `torch/_dynamo/backends/tvm.py`（薄委托、缺依赖时报 actionable 错误、`has_tvm()`）。
+  点白名单（复用 POINTWISE_FUSED_OP_NAMES 单一事实源）逐节点下沉为纯 TIR 内建
+  te.compute，`create_prim_func` 内联成单 kernel（对应 Inductor scheduler 的融合语义）；
+  DLPack 零拷贝进出。刻意绕开 topi：unity 线轮子的 topi 超越函数经 WorkspacePool，
+  与 p10 已加载的 OpenMP 同进程段错误。strict_native/回退契约与 stax.triton 一致；
+  训练区保持原生路径。
+- **原生执行（非解释器）**：Stax 原生图新增 `custom_op` 节点类型（`stax/{include,src}/Graph.h/.cpp`
+  执行器钩子 + `set_str_attr` 绑定）。`_lower_native` 遇 `CustomOpDef` 节点直接下沉原生图，
+  经 `Ops.cpp` 安装的 executor 回调重入 `library._native_invoke`——设备分发与
+  `register_autograd` 全语义保留，autograd 可穿透编译图求梯度。
+  `_call_native_op/_has_native_kernel` 供 `run_native`/测试走真实 findHandle+kernel 表路径
+  （规范 unboxed 约定 tensors-in/out，composite 槽双注册 CPU/CUDA）。
+- **验证**：`test/test_library.py`（29 用例：注册/分发/autograd/Library/包/捕获屏障/
+  **原生图下沉断言 `_stax_native_graph` 非空**/**autograd 穿透原生图**）、
+  `test/test_backend_tvm.py`（数值 parity、alpha 形态、自定义算子边界回退、训练区、
+  shape 变更重编译、CUDA target）。本地全绿（含重建后）；远端 GPU 用例待共享树构建窗口
+  （另一 agent 的 p10 sparse WIP 反复破坏 functional.py 生成物与链接）。
+- **Composite 分发键（torch CompositeExplicitAutograd 对齐）**：形状/视图组合算子批
+  （expand/broadcast_to/tile/stack 族/tensor_split 族/atleast/flatten/ravel/moveaxis/
+  swapaxes/argwhere/equal/allclose/fill）此前只注册 CPU 键，CUDA 张量直接
+  `Kernel not found`。按 c10 机制补齐：`DispatchKey.h` 新增 `Composite` 键
+  （对应 `getRuntimeDispatchKeySet(CompositeExplicitAutograd)==backend_dispatch_keyset`
+  与 `DefaultBackend` 别名），后端查找未命中时落到该键、显式后端内核可覆盖；
+  注册集中于 `p10/src/RegisterComposites.cpp`（对标生成的
+  `RegisterCompositeExplicitAutograd.cpp`），声明收口 `p10/include/ShapeAlignKernels.h`，
+  cpu/cuda 的 ShapeAlign fragment 只留真设备内核 `repeat`（上游 MPS: repeat_mps 同款
+  覆盖模式）。顺带修正 `is_autocast_key` 恒假 / `is_autograd_key` 上界吞新键两个区间谓词。
+  远端 P4 实测：equal/allclose/expand/isclose(内含 expand)/argwhere/tensor_split 等
+  全链路 GPU 通过，test_compile 既有 CUDA allclose 断言用例由失败转通过。
+- **Triton 集成测试升级为真实 JITFunction**：远端 P4 安装 triton 3.7.1（清华镜像；
+  sm_61 低于 Triton 的 sm_70 启动下限，真实发射不可行），`test_library.py` 新增
+  `RealTritonJITFunctionTest`（无 triton 环境整体跳过、mock 用例保底）：真实
+  `@triton.jit` 对象过 `wrap_triton` 类型检查/幂等；`triton_op` 捕获契约——
+  单个不透明融合屏障节点、函数体在追踪期零执行（哨兵断言）、内部 add 不泄漏为
+  独立图节点。启动级验证受限于硬件（本地无 GPU、P4 为 Pascal），已在用例 docstring
+  注明。远端 5 套件 108 passed / 2 skipped。
+- **dlpack 修复**：`Tensor.cpp to_dlpack_device` 将 CPU/-1 归一为 device_id=0（DLPack 规范、
+  torch 同款）。此前 -1 使 tvm_ffi 判定 device 不匹配走入 workspace 复制路径 → 段错误。
+- **验证**：`test/test_library.py`（27 用例：注册/分发/autograd/Library/包/捕获屏障/原生桥）、
+  `test/test_backend_tvm.py`（数值 parity、alpha 形态、自定义算子边界回退、训练区、
+  shape 变更重编译、CUDA target）。本地全绿；远端 GPU 用例待共享树构建窗口
+  （另一 agent 的 p10 sparse WIP 反复破坏 functional.py 生成物与链接）。
+
+# 3. RNG 与 Torch 逐位对齐（2026-08-21）
 
 seed 随机性全链路对齐 `third_party/pytorch`（基准 `893b6406`）：
 

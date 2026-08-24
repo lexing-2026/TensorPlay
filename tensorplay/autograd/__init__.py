@@ -111,6 +111,16 @@ def grad(
     if allow_unused is None:
         allow_unused = False
 
+    # torch semantics: a None entry in grad_outputs seeds that output with
+    # ones; the C++ binding cannot carry None elements, so materialize them.
+    if grad_outputs is not None:
+        if not isinstance(grad_outputs, (list, tuple)):
+            grad_outputs = [grad_outputs]
+        grad_outputs = tuple(
+            tensorplay.ones_like(out) if g is None else g
+            for g, out in zip(grad_outputs, outputs)
+        )
+
     return _grad(outputs, inputs, grad_outputs, retain_graph, create_graph, allow_unused)
 
 

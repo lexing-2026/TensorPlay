@@ -89,16 +89,39 @@ Tensor max_kernel(const Tensor& self) {
     return max_stub(DeviceType::CPU, self);
 }
 
-Tensor max_dim_kernel(const Tensor& self, std::vector<int64_t> dims, bool keepdim) {
-    return max_dim_stub(DeviceType::CPU, self, std::move(dims), keepdim);
+// Autograd helper for sum.dim_IntList (torch's sum_to_size): restore reduced
+// singleton dims and broadcast back to the input shape.
+Tensor sum_dim_backward_kernel(const Tensor& grad_output, const Tensor& self,
+                               const std::vector<int64_t>& dims, bool keepdim) {
+    std::vector<int64_t> normalized;
+    normalized.reserve(dims.size());
+    for (int64_t d : dims) {
+        if (d < 0) d += self.dim();
+        if (d < 0 || d >= self.dim()) {
+            TP_THROW(IndexError, "sum.dim backward: dimension out of range");
+        }
+        normalized.push_back(d);
+    }
+    std::sort(normalized.begin(), normalized.end());
+    Tensor expanded = grad_output;
+    if (!keepdim) {
+        for (auto it = normalized.rbegin(); it != normalized.rend(); ++it) {
+            expanded = expanded.unsqueeze(*it);
+        }
+    }
+    return expanded.expand(static_cast<std::vector<int64_t>>(self.shape()));
+}
+
+std::tuple<Tensor, Tensor> max_dim_kernel(const Tensor& self, int64_t dim, bool keepdim) {
+    return max_dim_stub(DeviceType::CPU, self, dim, keepdim);
 }
 
 Tensor min_kernel(const Tensor& self) {
     return min_stub(DeviceType::CPU, self);
 }
 
-Tensor min_dim_kernel(const Tensor& self, std::vector<int64_t> dims, bool keepdim) {
-    return min_dim_stub(DeviceType::CPU, self, std::move(dims), keepdim);
+std::tuple<Tensor, Tensor> min_dim_kernel(const Tensor& self, int64_t dim, bool keepdim) {
+    return min_dim_stub(DeviceType::CPU, self, dim, keepdim);
 }
 
 Tensor prod_kernel(const Tensor& self, DType dtype) {
@@ -181,8 +204,9 @@ Tensor norm_kernel(const Tensor& self, double p) {
 
 Tensor norm_dim_kernel(const Tensor& self, std::vector<int64_t> dim, double p, bool keepdim) {
     if (std::isinf(p)) {
-        if (p > 0) return self.abs().max(dim, keepdim);
-        else return self.abs().min(dim, keepdim);
+        Tensor abs = self.abs();
+        if (p > 0) return Tensor::amax(abs, dim, keepdim);
+        else return Tensor::amin(abs, dim, keepdim);
     }
     return self.abs().pow(Scalar(p)).sum(dim, keepdim).pow(Scalar(1.0/p));
 }
@@ -197,6 +221,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, ReductionKernels) {
     m.impl("mean", mean_kernel);
     m.impl("mean.dim", mean_dim_kernel);
     m.impl("mean_dim_backward", mean_dim_backward_kernel);
+    m.impl("_sum_dim_backward", sum_dim_backward_kernel);
     m.impl("max", max_kernel);
     m.impl("max.dim", max_dim_kernel);
     m.impl("min", min_kernel);

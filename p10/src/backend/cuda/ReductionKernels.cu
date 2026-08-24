@@ -441,7 +441,7 @@ Tensor argmin_same_dtype(
 // --- Implementations ---
 
 // Sum
-Tensor sum_dim_kernel(const Tensor& self, std::vector<int64_t> dim, bool keepdim, DType dtype) {
+Tensor sum_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, bool keepdim, DType dtype) {
     DType out_dtype = dtype;
     if (out_dtype == DType::Undefined) {
         out_dtype = isIntegralType(self.dtype(), true) ? DType::Int64 : self.dtype();
@@ -456,7 +456,7 @@ Tensor sum_kernel(const Tensor& self, DType dtype) {
 }
 
 // Mean
-Tensor mean_dim_kernel(const Tensor& self, std::vector<int64_t> dim, bool keepdim, DType dtype) {
+Tensor mean_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, bool keepdim, DType dtype) {
     DType out_dtype = dtype;
     if (out_dtype == DType::Undefined) {
         out_dtype = isFloatingType(self.dtype()) ? self.dtype() : DType::Float32;
@@ -496,8 +496,30 @@ Tensor mean_kernel(const Tensor& self, DType dtype) {
     return mean_dim_kernel(self, {}, false, dtype);
 }
 
+// Autograd helper for sum.dim_IntList (torch's sum_to_size).
+Tensor sum_dim_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self,
+                                    const std::vector<int64_t>& dims, bool keepdim) {
+    std::vector<int64_t> normalized;
+    normalized.reserve(dims.size());
+    for (int64_t d : dims) {
+        if (d < 0) d += self.dim();
+        if (d < 0 || d >= self.dim()) {
+            TP_THROW(IndexError, "sum.dim backward: dimension out of range");
+        }
+        normalized.push_back(d);
+    }
+    std::sort(normalized.begin(), normalized.end());
+    Tensor expanded = grad_output;
+    if (!keepdim) {
+        for (auto it = normalized.rbegin(); it != normalized.rend(); ++it) {
+            expanded = expanded.unsqueeze(*it);
+        }
+    }
+    return expanded.expand(static_cast<std::vector<int64_t>>(self.shape()));
+}
+
 // Prod
-Tensor prod_dim_kernel(const Tensor& self, std::vector<int64_t> dim, bool keepdim, DType dtype) {
+Tensor prod_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, bool keepdim, DType dtype) {
     DType out_dtype = dtype;
     if (out_dtype == DType::Undefined) {
         out_dtype = isIntegralType(self.dtype(), true) ? DType::Int64 : self.dtype();
@@ -512,23 +534,78 @@ Tensor prod_kernel(const Tensor& self, DType dtype) {
 }
 
 // Max
-Tensor max_dim_kernel(const Tensor& self, std::vector<int64_t> dim, bool keepdim) {
-    const ReductionSpec spec = make_reduction_spec(self, dim);
-    TP_DISPATCH_REDUCTION(max_same_dtype, self.dtype(), self, spec, keepdim);
+std::tuple<Tensor, Tensor> max_dim_kernel(const Tensor& self, int64_t dim0, bool keepdim) {
+    // torch.max(input, dim) -> (values, indices).  Values come from the
+    // existing min/max reduction machinery; indices from the ArgOps pass.
+    // Both share the same first-occurrence tie rule (strict >).
+    const int64_t nd = self.dim();
+    TP_CHECK(nd > 0, "max(): Expected input to have at least one dimension");
+    const int64_t dim = dim0 < 0 ? dim0 + nd : dim0;
+    TP_CHECK(dim >= 0 && dim < nd,
+             "Dimension out of range (expected to be in range of [-", nd, ", ", nd - 1, "], but got ", dim0, ")");
+    if (self.size(dim) == 0) {
+        TP_THROW(RuntimeError, "max(): Expected reduction dim ", dim, " to have non-zero size");
+    }
+    const ReductionSpec spec = make_reduction_spec(self, {dim});
+    if (self.dtype() == DType::Bool) {
+        // argmax has no Bool instantiation (ptxas time); max over bool is
+        // equally exotic on CUDA -- fail loudly instead of desyncing the pair.
+        TP_THROW(NotImplementedError, "max(dim) not implemented for Bool on CUDA");
+    }
+    // The dispatch macros expand to a returning switch; route them through an
+    // immediately-invoked lambda to capture both outputs.
+    Tensor values = [&]() -> Tensor {
+        TP_DISPATCH_REDUCTION(max_same_dtype, self.dtype(), self, spec, keepdim);
+        return Tensor();
+    }();
+    Tensor indices = [&]() -> Tensor {
+        TP_DISPATCH_REDUCTION_NO_BOOL(argmax_same_dtype, self.dtype(), self, spec, keepdim);
+        return Tensor();
+    }();
+    return {values, indices};
 }
 
 Tensor max_kernel(const Tensor& self) {
-    return max_dim_kernel(self, {}, false);
+    auto spec = make_reduction_spec(self, {});
+    Tensor values = [&]() -> Tensor {
+        TP_DISPATCH_REDUCTION(max_same_dtype, self.dtype(), self, spec, false);
+        return Tensor();
+    }();
+    return values;
 }
 
 // Min
-Tensor min_dim_kernel(const Tensor& self, std::vector<int64_t> dim, bool keepdim) {
-    const ReductionSpec spec = make_reduction_spec(self, dim);
-    TP_DISPATCH_REDUCTION(min_same_dtype, self.dtype(), self, spec, keepdim);
+std::tuple<Tensor, Tensor> min_dim_kernel(const Tensor& self, int64_t dim0, bool keepdim) {
+    const int64_t nd = self.dim();
+    TP_CHECK(nd > 0, "min(): Expected input to have at least one dimension");
+    const int64_t dim = dim0 < 0 ? dim0 + nd : dim0;
+    TP_CHECK(dim >= 0 && dim < nd,
+             "Dimension out of range (expected to be in range of [-", nd, ", ", nd - 1, "], but got ", dim0, ")");
+    if (self.size(dim) == 0) {
+        TP_THROW(RuntimeError, "min(): Expected reduction dim ", dim, " to have non-zero size");
+    }
+    const ReductionSpec spec = make_reduction_spec(self, {dim});
+    if (self.dtype() == DType::Bool) {
+        TP_THROW(NotImplementedError, "min(dim) not implemented for Bool on CUDA");
+    }
+    Tensor values = [&]() -> Tensor {
+        TP_DISPATCH_REDUCTION(min_same_dtype, self.dtype(), self, spec, keepdim);
+        return Tensor();
+    }();
+    Tensor indices = [&]() -> Tensor {
+        TP_DISPATCH_REDUCTION_NO_BOOL(argmin_same_dtype, self.dtype(), self, spec, keepdim);
+        return Tensor();
+    }();
+    return {values, indices};
 }
 
 Tensor min_kernel(const Tensor& self) {
-    return min_dim_kernel(self, {}, false);
+    auto spec = make_reduction_spec(self, {});
+    Tensor values = [&]() -> Tensor {
+        TP_DISPATCH_REDUCTION(min_same_dtype, self.dtype(), self, spec, false);
+        return Tensor();
+    }();
+    return values;
 }
 
 // Norm (L2)
@@ -537,13 +614,13 @@ Tensor norm_global_kernel(const Tensor& self, double p) {
     TP_DISPATCH_FLOAT_REDUCTION(norm_same_dtype, self.dtype(), self, spec, false, p);
 }
 
-Tensor norm_dim_kernel(const Tensor& self, std::vector<int64_t> dim, double p, bool keepdim) {
+Tensor norm_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, double p, bool keepdim) {
     const ReductionSpec spec = make_reduction_spec(self, dim);
     TP_DISPATCH_FLOAT_REDUCTION(norm_same_dtype, self.dtype(), self, spec, keepdim, p);
 }
 
 // All / Any
-Tensor all_dim_kernel(const Tensor& self, std::vector<int64_t> dim, bool keepdim) {
+Tensor all_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, bool keepdim) {
     const ReductionSpec spec = make_reduction_spec(self, dim);
     TP_DISPATCH_REDUCTION(all_same_dtype, self.dtype(), self, spec, keepdim);
 }
@@ -552,7 +629,7 @@ Tensor all_kernel(const Tensor& self) {
     return all_dim_kernel(self, {}, false);
 }
 
-Tensor any_dim_kernel(const Tensor& self, std::vector<int64_t> dim, bool keepdim) {
+Tensor any_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, bool keepdim) {
     const ReductionSpec spec = make_reduction_spec(self, dim);
     TP_DISPATCH_REDUCTION(any_same_dtype, self.dtype(), self, spec, keepdim);
 }
@@ -562,7 +639,7 @@ Tensor any_kernel(const Tensor& self) {
 }
 
 // Var / Std
-Tensor var_dim_kernel(const Tensor& self, std::vector<int64_t> dim, int64_t correction, bool keepdim) {
+Tensor var_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, int64_t correction, bool keepdim) {
     const ReductionSpec spec = make_reduction_spec(self, dim);
     TP_DISPATCH_FLOAT_REDUCTION(welford_same_dtype, self.dtype(), self, spec,
                                 keepdim, correction, false);
@@ -572,7 +649,7 @@ Tensor var_kernel(const Tensor& self, int64_t correction) {
     return var_dim_kernel(self, {}, correction, false);
 }
 
-Tensor std_dim_kernel(const Tensor& self, std::vector<int64_t> dim, int64_t correction, bool keepdim) {
+Tensor std_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, int64_t correction, bool keepdim) {
     const ReductionSpec spec = make_reduction_spec(self, dim);
     TP_DISPATCH_FLOAT_REDUCTION(welford_same_dtype, self.dtype(), self, spec,
                                 keepdim, correction, true);
@@ -598,6 +675,20 @@ Tensor argmin_kernel(const Tensor& self, std::optional<int64_t> dim, bool keepdi
     TP_DISPATCH_REDUCTION_NO_BOOL(argmin_same_dtype, input.dtype(), input, spec, keepdim);
 }
 
+// median (torch median): lower-middle element of the sorted flatten.
+// Sort-based like torch's median_cuda small-slice path; index (n-1)/2.
+Tensor median_kernel(const Tensor& self) {
+    Tensor flat = self.contiguous().reshape({-1});
+    const int64_t n = flat.numel();
+    if (n == 0) {
+        TP_THROW(RuntimeError, "median(): input tensor is empty");
+    }
+    extern std::tuple<Tensor, Tensor> sort_cuda(const Tensor& self, int64_t dim,
+                                                bool descending);
+    Tensor sorted = std::get<0>(sort_cuda(flat, 0, false));
+    return sorted.select(0, (n - 1) / 2);
+}
+
 
 TENSORPLAY_LIBRARY_IMPL(CUDA, ReductionKernels) {
     m.impl("sum", sum_kernel);
@@ -606,6 +697,7 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, ReductionKernels) {
     m.impl("mean", mean_kernel);
     m.impl("mean.dim", mean_dim_kernel);
     m.impl("mean_dim_backward", mean_dim_backward_kernel_cuda);
+    m.impl("_sum_dim_backward", sum_dim_backward_kernel_cuda);
     
     m.impl("prod", prod_kernel);
     m.impl("prod.dim_IntList", prod_dim_kernel);
@@ -633,6 +725,7 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, ReductionKernels) {
 
     m.impl("argmax", argmax_kernel);
     m.impl("argmin", argmin_kernel);
+    m.impl("median", median_kernel);
 }
 
 } // namespace cuda

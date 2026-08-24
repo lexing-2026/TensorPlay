@@ -39,37 +39,37 @@ inline std::vector<int64_t> compute_reduction_shape(const Tensor& self, const st
 using sum_fn = Tensor (*)(const Tensor&, DType);
 DECLARE_DISPATCH(sum_fn, sum_stub)
 
-using sum_dim_fn = Tensor (*)(const Tensor&, std::vector<int64_t>, bool, DType);
+using sum_dim_fn = Tensor (*)(const Tensor&, const std::vector<int64_t>&, bool, DType);
 DECLARE_DISPATCH(sum_dim_fn, sum_dim_stub)
 
 using max_fn = Tensor (*)(const Tensor&);
 DECLARE_DISPATCH(max_fn, max_stub)
 
-using max_dim_fn = Tensor (*)(const Tensor&, std::vector<int64_t>, bool);
+using max_dim_fn = std::tuple<Tensor, Tensor> (*)(const Tensor&, int64_t, bool);
 DECLARE_DISPATCH(max_dim_fn, max_dim_stub)
 
 using min_fn = Tensor (*)(const Tensor&);
 DECLARE_DISPATCH(min_fn, min_stub)
 
-using min_dim_fn = Tensor (*)(const Tensor&, std::vector<int64_t>, bool);
+using min_dim_fn = std::tuple<Tensor, Tensor> (*)(const Tensor&, int64_t, bool);
 DECLARE_DISPATCH(min_dim_fn, min_dim_stub)
 
 using prod_fn = Tensor (*)(const Tensor&, DType);
 DECLARE_DISPATCH(prod_fn, prod_stub)
 
-using prod_dim_fn = Tensor (*)(const Tensor&, std::vector<int64_t>, bool, DType);
+using prod_dim_fn = Tensor (*)(const Tensor&, const std::vector<int64_t>&, bool, DType);
 DECLARE_DISPATCH(prod_dim_fn, prod_dim_stub)
 
 using all_fn = Tensor (*)(const Tensor&);
 DECLARE_DISPATCH(all_fn, all_stub)
 
-using all_dim_fn = Tensor (*)(const Tensor&, std::vector<int64_t>, bool);
+using all_dim_fn = Tensor (*)(const Tensor&, const std::vector<int64_t>&, bool);
 DECLARE_DISPATCH(all_dim_fn, all_dim_stub)
 
 using any_fn = Tensor (*)(const Tensor&);
 DECLARE_DISPATCH(any_fn, any_stub)
 
-using any_dim_fn = Tensor (*)(const Tensor&, std::vector<int64_t>, bool);
+using any_dim_fn = Tensor (*)(const Tensor&, const std::vector<int64_t>&, bool);
 DECLARE_DISPATCH(any_dim_fn, any_dim_stub)
 
 using argmax_fn = Tensor (*)(const Tensor&, std::optional<int64_t>, bool);

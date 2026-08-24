@@ -3,7 +3,9 @@
 #include "AccumulateGrad.h"
 #include "Engine.h"
 #include "InputBuffer.h"
-#include "ManualNodes.h" // For SelectBackward/SliceBackward/AsStridedBackward
+#include "ManualNodes.h" // For AsStridedBackward
+#include "tensorplay/ops/TPXOpsGenerated.h"
+#include "tensorplay/ops/AutogradNodesGenerated.h"
 
 namespace tensorplay {
 namespace tpx {
@@ -276,115 +278,19 @@ Tensor as_strided(const Tensor& self, const std::vector<int64_t>& size,
     return result;
 }
 
-Tensor select(const Tensor& self, int64_t dim, int64_t index) {
-    bool requires_grad = self.requires_grad();
-    std::shared_ptr<Node> grad_fn;
-    if (requires_grad) {
-        grad_fn = std::make_shared<SelectBackward>(self.shape(), dim, index, self.dtype(), self.device());
-        grad_fn->add_next_edge_list(collect_next_edges(self));
-    }
-
-    Tensor result = self.select(dim, index);
-    if (requires_grad && result.defined()) {
-        impl::set_grad_fn(result, grad_fn);
-    }
-    return result;
-}
-
-Tensor slice(const Tensor& self, int64_t dim, int64_t start, int64_t end, int64_t step) {
-    bool requires_grad = self.requires_grad();
-    std::shared_ptr<Node> grad_fn;
-    if (requires_grad) {
-        grad_fn = std::make_shared<SliceBackward>(self.shape(), dim, start, end, step, self.dtype(), self.device());
-        grad_fn->add_next_edge_list(collect_next_edges(self));
-    }
-
-    Tensor result = self.slice(dim, start, end, step);
-    if (requires_grad && result.defined()) {
-        impl::set_grad_fn(result, grad_fn);
-    }
-    return result;
-}
-
 Tensor narrow(const Tensor& self, int64_t dim, int64_t start, int64_t length) {
     // torch's narrow is a slice of `length` elements starting at `start`;
-    // routing through slice carries the gradient via SliceBackward.
+    // routing through the generated slice op carries the gradient via
+    // SliceBackward.
     if (length < 0) {
         TP_THROW(RuntimeError, "narrow(): length cannot be negative but got ", length);
     }
-    return slice(self, dim, start, start + length);
+    return tensorplay::tpx::ops::slice(self, dim, start, start + length, 1);
 }
 
-namespace {
-
-// Torch formats shapes in error messages as "[2, 4]".
-std::string expand_shape_string(const std::vector<int64_t>& shape) {
-    std::string out = "[";
-    for (size_t i = 0; i < shape.size(); ++i) {
-        if (i) out += ", ";
-        out += std::to_string(shape[i]);
-    }
-    return out + "]";
-}
-
-} // namespace
-
-Tensor expand(const Tensor& self, const std::vector<int64_t>& size) {
-    std::vector<int64_t> target_shape = size;
-    std::vector<int64_t> self_shape = static_cast<std::vector<int64_t>>(self.shape());
-    std::vector<int64_t> self_strides = self.strides();
-
-    int64_t ndim = target_shape.size();
-    int64_t self_ndim = self_shape.size();
-
-    if (ndim < self_ndim) {
-        // Torch wording (its legacy type repr replaced by the dtype name).
-        throw std::runtime_error("expand(tensorplay." + std::string(toString(self.dtype())) +
-                                 "{" + expand_shape_string(self_shape) + "}, size=[" +
-                                 expand_shape_string(target_shape).substr(1) +
-                                 "): the number of sizes provided (" + std::to_string(ndim) +
-                                 ") must be greater or equal to the number of dimensions in the tensor (" +
-                                 std::to_string(self_ndim) + ")");
-    }
-
-    std::vector<int64_t> new_strides(ndim);
-
-    // Match dimensions from back
-    for (int64_t i = 0; i < ndim; ++i) {
-        int64_t target_dim = target_shape[ndim - 1 - i];
-        int64_t self_dim_idx = self_ndim - 1 - i;
-
-        if (self_dim_idx >= 0) {
-            int64_t self_dim = self_shape[self_dim_idx];
-            int64_t self_stride = self_strides[self_dim_idx];
-
-            if (target_dim == -1) {
-                target_dim = self_dim;
-                target_shape[ndim - 1 - i] = target_dim;
-            }
-
-            if (self_dim == 1 && target_dim > 1) {
-                new_strides[ndim - 1 - i] = 0;
-            } else if (self_dim == target_dim) {
-                new_strides[ndim - 1 - i] = self_stride;
-            } else {
-                // Torch wording, including the double spaces after periods.
-                throw std::runtime_error("The expanded size of the tensor (" +
-                                         std::to_string(target_dim) + ") must match the existing size (" +
-                                         std::to_string(self_dim) + ") at non-singleton dimension " +
-                                         std::to_string(ndim - 1 - i) + ".  Target sizes: [" +
-                                         expand_shape_string(target_shape).substr(1) + ".  Tensor sizes: [" +
-                                         expand_shape_string(self_shape).substr(1));
-            }
-        } else {
-            // New dimension at front
-            if (target_dim == -1) throw std::runtime_error("expand: cannot infer size for new dimension");
-            new_strides[ndim - 1 - i] = 0; // Broadcast
-        }
-    }
-
-    return as_strided(self, target_shape, new_strides);
-}
+// expand() moved to the generated dispatcher surface (native_functions.yaml);
+// the derivative formulas in derivatives.yaml now resolve against
+// tensorplay::tpx::ops::expand, which carries autograd routing.
 
 // Mirrors torch's ToCopyBackward / _to_copy_backward: the gradient is cast
 // back to the source tensor's dtype and device.

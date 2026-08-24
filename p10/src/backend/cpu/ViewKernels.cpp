@@ -494,6 +494,59 @@ Tensor movedim_kernel(const Tensor& self, const std::vector<int64_t>& source,
     return permute_kernel(self, permutation);
 }
 
+// --- select / slice / contiguous -------------------------------------------
+// Thin dispatcher wrappers over the shared detail implementations so
+// generated Python bindings route through the standard redispatch path.
+// Their autograd counterparts are derivatives.yaml formulas calling the
+// *_backward kernels.  Sparse layouts are rejected explicitly where the
+// stride math would silently corrupt sparse storage.
+Tensor clone_kernel(const Tensor& self, std::optional<int64_t> memory_format) {
+    (void)memory_format;
+    return tensorplay::detail::clone_impl(self);
+}
+
+Tensor slice_kernel(const Tensor& self, int64_t dim,
+                    std::optional<int64_t> start,
+                    std::optional<int64_t> end, int64_t step) {
+    if (self.is_sparse()) {
+        TP_THROW(RuntimeError, "slice() is not supported for sparse COO tensors");
+    }
+    // torch semantics: start=None -> 0, end=None -> dim size; Tensor::slice
+    // already normalizes negatives and clamps overflow.
+    return self.slice(dim, start.value_or(0),
+                      end.value_or(std::numeric_limits<int64_t>::max()), step);
+}
+
+Tensor contiguous_kernel(const Tensor& self, int64_t memory_format) {
+    return tensorplay::detail::contiguous_impl(self, memory_format);
+}
+
+Tensor select_backward_kernel(const Tensor& grad_output, const Tensor& self,
+                              int64_t dim, int64_t index) {
+    if (self.is_sparse()) {
+        TP_THROW(RuntimeError, "select(): gradient w.r.t. sparse COO tensors is not supported");
+    }
+    // Zero everywhere except the selected index along `dim`.
+    Tensor out(self.shape(), grad_output.dtype(), grad_output.device());
+    out.zero_();
+    out.select(dim, index).copy_(grad_output);
+    return out;
+}
+
+Tensor slice_backward_kernel(const Tensor& grad_output, const Tensor& self,
+                             int64_t dim, std::optional<int64_t> start,
+                             std::optional<int64_t> end, int64_t step) {
+    if (self.is_sparse()) {
+        TP_THROW(RuntimeError, "slice(): gradient w.r.t. sparse COO tensors is not supported");
+    }
+    Tensor out(self.shape(), grad_output.dtype(), grad_output.device());
+    out.zero_();
+    out.slice(dim, start.value_or(0),
+              end.value_or(std::numeric_limits<int64_t>::max()), step)
+        .copy_(grad_output);
+    return out;
+}
+
 
 TENSORPLAY_LIBRARY_IMPL(CPU, ViewKernels) {
     m.impl("view_as_real", view_as_real_cpu);
@@ -507,6 +560,11 @@ TENSORPLAY_LIBRARY_IMPL(CPU, ViewKernels) {
     m.impl("squeeze_backward", squeeze_backward_kernel);
     m.impl("squeeze.dim", squeeze_dim_kernel);
     m.impl("unsqueeze", unsqueeze_kernel);
+    m.impl("clone", clone_kernel);
+    m.impl("slice", slice_kernel);
+    m.impl("contiguous", contiguous_kernel);
+    m.impl("select_backward", select_backward_kernel);
+    m.impl("slice_backward", slice_backward_kernel);
     m.impl("diagonal", diagonal_kernel);
     m.impl("diagonal_backward", diagonal_backward_kernel);
     m.impl("movedim", movedim_kernel);

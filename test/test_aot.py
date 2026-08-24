@@ -35,7 +35,10 @@ def _assert_grads_match_eager(fn, args, policy, required=None, rtol=1e-5, atol=1
     else:
         sum(t.sum() for t in eager_out).backward()
 
-    assert out.shape == eager_out.shape
+    if isinstance(eager_out, tp.Tensor):
+        assert out.shape == eager_out.shape
+    else:
+        assert tuple(o.shape for o in out) == tuple(o.shape for o in eager_out)
     for got, want in zip(grads.values(), [a.grad for a in eager_args]):
         assert tp.allclose(got, want, rtol=rtol, atol=atol)
 

@@ -85,7 +85,11 @@ static DType from_dlpack_dtype(DLDataType dt) {
 
 static DLDevice to_dlpack_device(Device device) {
     DLDevice d;
-    d.device_id = device.index();
+    // DLPack requires a concrete device id; torch exports CPU as 0 and
+    // resolves "current device" (-1) the same way.
+    int64_t index = device.index();
+    if (index < 0) index = 0;
+    d.device_id = index;
     switch (device.type()) {
         case DeviceType::CPU: d.device_type = kDLCPU; break;
         case DeviceType::CUDA: d.device_type = kDLCUDA; break;
@@ -963,27 +967,13 @@ void init_tensor(py::module_& m) {
         .def("is_channels_last", &Tensor::is_channels_last)
         .def("is_channels_last_2d", &Tensor::is_channels_last_2d)
         .def("is_channels_last_3d", &Tensor::is_channels_last_3d)
-        .def("contiguous", [](const Tensor& t) { return t.contiguous(); })
-        .def("contiguous", [](const Tensor& t, int64_t format) {
-             return t.contiguous(static_cast<tensorplay::MemoryFormat>(format));
-        }, "memory_format"_a)
-        .def("is_complex", [](const Tensor& t) {
+                        .def("is_complex", [](const Tensor& t) {
              return tensorplay::isComplexType(t.dtype());
         })
         .def("is_floating_point", [](const Tensor& t) {
              return tensorplay::isFloatingType(t.dtype());
         })
-        .def("t", [](const Tensor& t) {
-            // Simple transpose for 2D. For ND we need generic transpose.
-            if (t.dim() != 2) throw std::runtime_error("t() expects a 2D tensor, but self is " + std::to_string(t.dim()) + "D");
-            // Generic transpose: swap strides and shape
-            std::vector<int64_t> sizes = static_cast<std::vector<int64_t>>(t.shape());
-            std::vector<int64_t> strides = t.strides();
-            std::swap(sizes[0], sizes[1]);
-            std::swap(strides[0], strides[1]);
-            return t.as_strided(sizes, strides);
-        })
-        .def_property_readonly("is_sparse", &Tensor::is_sparse)
+                .def_property_readonly("is_sparse", &Tensor::is_sparse)
         .def("is_sparse_csr", &Tensor::is_sparse_csr)
         .def("is_coalesced", &Tensor::is_coalesced)
         .def("sparse_dim", &Tensor::sparse_dim)
@@ -992,6 +982,16 @@ void init_tensor(py::module_& m) {
         .def("_values", &Tensor::_values)
         .def("_crow_indices", &Tensor::_crow_indices)
         .def("_col_indices", &Tensor::_col_indices)
+        // torch-style public aliases for the sparse component accessors.
+        .def("values", [](const Tensor& t) { return t._values(); })
+        .def("crow_indices", &Tensor::_crow_indices)
+        .def("col_indices", &Tensor::_col_indices)
+        // Mirrors torch.layout loosely: 0 = sparse COO, 1 = sparse CSR,
+        // 2 = strided (dense). Compare against tensorplay.sparse_coo etc.
+        .def_property_readonly("layout", [](const Tensor& t) -> int64_t {
+            if (!t.is_sparse()) return 2;
+            return t.is_sparse_csr() ? 1 : 0;
+        })
         .def("coalesce", &Tensor::coalesce)
         .def("sparse_mask",
              static_cast<Tensor (Tensor::*)(const Tensor&) const>(&Tensor::sparse_mask),
@@ -1063,10 +1063,13 @@ void init_tensor(py::module_& m) {
                 return std::nullopt;
             },
             [](Tensor& self, const Tensor* grad) {
+                // Route through tpx::impl::set_grad so autograd metadata is
+                // lazily created -- assigning .grad to a leaf that never
+                // required grad must not silently drop (torch semantics).
                 if (grad) {
-                    self.set_grad(*grad);
+                    tensorplay::tpx::impl::set_grad(self, *grad);
                 } else {
-                    self.set_grad(Tensor());
+                    tensorplay::tpx::impl::set_grad(self, Tensor());
                 }
             }
         )
@@ -1102,8 +1105,7 @@ void init_tensor(py::module_& m) {
             
             return self_obj;
         })
-        .def("clone", &Tensor::clone)
-        .def("requires_grad_", [](py::object self_obj, bool requires_grad) {
+                .def("requires_grad_", [](py::object self_obj, bool requires_grad) {
             Tensor& self = py::cast<Tensor&>(self_obj);
             tensorplay::tpx::impl::set_requires_grad(self, requires_grad);
             return self_obj;
@@ -1116,101 +1118,21 @@ void init_tensor(py::module_& m) {
         .def("size", [](const Tensor& self, int64_t dim) {
             return self.size(dim);
         })
-        .def("view", [](const Tensor& self, py::args args) {
-            std::vector<int64_t> shape;
-            if (args.size() == 1 && (py::isinstance<py::list>(args[0]) || py::isinstance<py::tuple>(args[0]) || py::isinstance<Size>(args[0]))) {
-                py::object obj = args[0];
-                for (auto item : obj) {
-                    shape.push_back(py::cast<int64_t>(item));
-                }
-            } else {
-                for (auto item : args) {
-                    shape.push_back(py::cast<int64_t>(item));
-                }
+        // expand: served by the generated METH_FASTCALL layer (dispatcher op).
+        .def("view", [](const Tensor& self, py::object spec) {
+            if (py::isinstance<DType>(spec)) {
+                return self.view_dtype(spec.cast<DType>());
             }
-            return tensorplay::tpx::ops::view(self, shape);
+            return self.view(spec.cast<std::vector<int64_t>>());
         })
-        .def("reshape", [](const Tensor& self, py::args args) {
-            std::vector<int64_t> shape;
-            if (args.size() == 1 && (py::isinstance<py::list>(args[0]) || py::isinstance<py::tuple>(args[0]) || py::isinstance<Size>(args[0]))) {
-                py::object obj = args[0];
-                for (auto item : obj) {
-                    shape.push_back(py::cast<int64_t>(item));
-                }
-            } else {
-                for (auto item : args) {
-                    shape.push_back(py::cast<int64_t>(item));
-                }
-            }
-            return tensorplay::tpx::ops::reshape(self, shape);
-        })
-        .def("expand", [](const Tensor& self, const std::vector<int64_t>& size, bool /*implicit*/) {
-            return tensorplay::tpx::expand(self, size);
-        }, "size"_a, "implicit"_a = false)
         .def("as_strided", [](const Tensor& self,
                               const std::vector<int64_t>& size,
                               const std::vector<int64_t>& stride,
                               std::optional<int64_t> storage_offset) {
             return tensorplay::tpx::as_strided(self, size, stride, storage_offset);
         }, "size"_a, "stride"_a, "storage_offset"_a = py::none())
-        .def("select", [](const Tensor& self, int64_t dim, int64_t index) {
-            return tensorplay::tpx::select(self, dim, index);
-        }, "dim"_a, "index"_a)
-        .def("slice", [](const Tensor& self, int64_t dim, int64_t start, int64_t end, int64_t step) {
-            return tensorplay::tpx::slice(self, dim, start, end, step);
-        }, "dim"_a, "start"_a, "end"_a, "step"_a = 1)
-        .def("narrow", [](const Tensor& self, int64_t dim, int64_t start, int64_t length) {
-            return tensorplay::tpx::narrow(self, dim, start, length);
-        }, "dim"_a, "start"_a, "length"_a)
-        .def("copy_", [](py::object self_obj, const Tensor& src, bool non_blocking) {
-            Tensor& self = py::cast<Tensor&>(self_obj);
-            self.copy_(src, non_blocking);
-            return self_obj;
-        }, "src"_a, "non_blocking"_a = false)
-        .def("fill_", [](py::object self_obj, Scalar value) {
-            Tensor& self = py::cast<Tensor&>(self_obj);
-            self.fill_(value);
-            return self_obj;
-        }, "value"_a)
-        .def("zero_", [](py::object self_obj) {
-            Tensor& self = py::cast<Tensor&>(self_obj);
-            self.zero_();
-            return self_obj;
-        })
-        // In-place random sampling
-        .def("bernoulli_", [](py::object self_obj) {
-             py::cast<Tensor&>(self_obj).bernoulli_();
-             return self_obj;
-        })
-        .def("cauchy_", [](py::object self_obj, double median, double sigma) {
-             py::cast<Tensor&>(self_obj).cauchy_(median, sigma);
-             return self_obj;
-        }, "median"_a = 0.0, "sigma"_a = 1.0)
-        .def("exponential_", [](py::object self_obj, double lambd) {
-             py::cast<Tensor&>(self_obj).exponential_(lambd);
-             return self_obj;
-        }, "lambd"_a = 1.0)
-        .def("geometric_", [](py::object self_obj, double p) {
-             py::cast<Tensor&>(self_obj).geometric_(p);
-             return self_obj;
-        }, "p"_a)
-        .def("log_normal_", [](py::object self_obj, double mean, double std) {
-             py::cast<Tensor&>(self_obj).log_normal_(mean, std);
-             return self_obj;
-        }, "mean"_a = 1.0, "std"_a = 2.0)
-        .def("normal_", [](py::object self_obj, double mean, double std) {
-             py::cast<Tensor&>(self_obj).normal_(mean, std);
-             return self_obj;
-        }, "mean"_a = 0.0, "std"_a = 1.0)
-        .def("random_", [](py::object self_obj, int64_t low, int64_t high) {
-             py::cast<Tensor&>(self_obj).random_(low, high);
-             return self_obj;
-        }, "low"_a = 0, "high"_a = 0)
-        .def("uniform_", [](py::object self_obj, double from, double to) {
-             py::cast<Tensor&>(self_obj).uniform_(from, to);
-             return self_obj;
-        }, "from"_a = 0.0, "to"_a = 1.0)
-        
+                                                        // In-place random sampling
+                                                                        
 
 
 // ...
@@ -1378,134 +1300,20 @@ void init_tensor(py::module_& m) {
 
         // torch.Tensor.movedim accepts Union[int, int[]]; the generated
         // binding covers the list form, so add the scalar-int overloads here.
-        tensor.def("movedim", [](const Tensor& self, int64_t source, int64_t destination) {
-            return tensorplay::tpx::ops::movedim(self, {source}, {destination});
-        }, "source"_a, "destination"_a)
-        .def("sum", [](const Tensor& self, std::optional<DType> dtype) {
-            return self.sum(dtype.value_or(DType::Undefined));
-        }, py::kw_only(), "dtype"_a = py::none())
-        .def("sum", [](const Tensor& self, const std::vector<int64_t>& dim, bool keepdim, std::optional<DType> dtype) {
-            return self.sum(dim, keepdim, dtype.value_or(DType::Undefined));
-        }, "dim"_a, "keepdim"_a = false, py::kw_only(), "dtype"_a = py::none())
-        .def("sum", [](const Tensor& self, int64_t dim, bool keepdim, std::optional<DType> dtype) {
-            return self.sum({dim}, keepdim, dtype.value_or(DType::Undefined));
-        }, "dim"_a, "keepdim"_a = false, py::kw_only(), "dtype"_a = py::none())
-
-        .def("mean", [](const Tensor& self, std::optional<DType> dtype) {
-            return self.mean(dtype.value_or(DType::Undefined));
-        }, py::kw_only(), "dtype"_a = py::none())
-        .def("mean", [](const Tensor& self, const std::vector<int64_t>& dim, bool keepdim, std::optional<DType> dtype) {
-            return self.mean(dim, keepdim, dtype.value_or(DType::Undefined));
-        }, "dim"_a, "keepdim"_a = false, py::kw_only(), "dtype"_a = py::none())
-        .def("mean", [](const Tensor& self, int64_t dim, bool keepdim, std::optional<DType> dtype) {
-            return self.mean({dim}, keepdim, dtype.value_or(DType::Undefined));
-        }, "dim"_a, "keepdim"_a = false, py::kw_only(), "dtype"_a = py::none())
-
-        .def("prod", [](const Tensor& self, std::optional<DType> dtype) {
-            return self.prod(dtype.value_or(DType::Undefined));
-        }, py::kw_only(), "dtype"_a = py::none())
-        .def("prod", [](const Tensor& self, const std::vector<int64_t>& dim, bool keepdim, std::optional<DType> dtype) {
-            return self.prod(dim, keepdim, dtype.value_or(DType::Undefined));
-        }, "dim"_a, "keepdim"_a = false, py::kw_only(), "dtype"_a = py::none())
-        .def("prod", [](const Tensor& self, int64_t dim, bool keepdim, std::optional<DType> dtype) {
-            return self.prod({dim}, keepdim, dtype.value_or(DType::Undefined));
-        }, "dim"_a, "keepdim"_a = false, py::kw_only(), "dtype"_a = py::none())
-
-        .def("all", [](const Tensor& self) { return self.all(); })
-        .def("all", [](const Tensor& self, const std::vector<int64_t>& dim, bool keepdim) {
-            return self.all(dim, keepdim);
-        }, "dim"_a, "keepdim"_a = false)
-        .def("all", [](const Tensor& self, int64_t dim, bool keepdim) {
-            return self.all({dim}, keepdim);
-        }, "dim"_a, "keepdim"_a = false)
-
-        .def("any", [](const Tensor& self) { return self.any(); })
-        .def("any", [](const Tensor& self, const std::vector<int64_t>& dim, bool keepdim) {
-            return self.any(dim, keepdim);
-        }, "dim"_a, "keepdim"_a = false)
-        .def("any", [](const Tensor& self, int64_t dim, bool keepdim) {
-            return self.any({dim}, keepdim);
-        }, "dim"_a, "keepdim"_a = false)
-
-        .def("argmax", [](const Tensor& self, std::optional<int64_t> dim, bool keepdim) {
-            return self.argmax(dim, keepdim);
-        }, "dim"_a = py::none(), "keepdim"_a = false)
-        .def("argmin", [](const Tensor& self, std::optional<int64_t> dim, bool keepdim) {
-            return self.argmin(dim, keepdim);
-        }, "dim"_a = py::none(), "keepdim"_a = false)
-
-        .def("var", [](const Tensor& self, int64_t correction) {
-            return self.var(correction);
-        }, "correction"_a = 1)
-        .def("var", [](const Tensor& self, const std::vector<int64_t>& dim, int64_t correction, bool keepdim) {
-            return self.var(dim, correction, keepdim);
-        }, "dim"_a, "correction"_a = 1, "keepdim"_a = false)
-        .def("var", [](const Tensor& self, int64_t dim, int64_t correction, bool keepdim) {
-            return self.var({dim}, correction, keepdim);
-        }, "dim"_a, "correction"_a = 1, "keepdim"_a = false)
-
-        .def("std", [](const Tensor& self, int64_t correction) {
-            return self.std(correction);
-        }, "correction"_a = 1)
-        .def("std", [](const Tensor& self, const std::vector<int64_t>& dim, int64_t correction, bool keepdim) {
-            return self.std(dim, correction, keepdim);
-        }, "dim"_a, "correction"_a = 1, "keepdim"_a = false)
-        .def("std", [](const Tensor& self, int64_t dim, int64_t correction, bool keepdim) {
-            return self.std({dim}, correction, keepdim);
-        }, "dim"_a, "correction"_a = 1, "keepdim"_a = false)
-
-        .def("norm", [](const Tensor& self, double p) {
-            return self.norm(p);
-        }, "p"_a = 2.0)
-        .def("norm", [](const Tensor& self, const std::vector<int64_t>& dim, double p, bool keepdim) {
-            return self.norm(dim, p, keepdim);
-        }, "dim"_a, "p"_a = 2.0, "keepdim"_a = false)
-        .def("norm", [](const Tensor& self, int64_t dim, double p, bool keepdim) {
-            return self.norm({dim}, p, keepdim);
-        }, "dim"_a, "p"_a = 2.0, "keepdim"_a = false)
-
-        .def("max", [](const Tensor& self) { return self.max(); })
-        .def("max", [](const Tensor& self, const std::vector<int64_t>& dim, bool keepdim) {
-            return self.max(dim, keepdim);
-        }, "dim"_a, "keepdim"_a = false)
-        .def("max", [](const Tensor& self, int64_t dim, bool keepdim) {
-            return self.max({dim}, keepdim);
-        }, "dim"_a, "keepdim"_a = false)
-
-        .def("min", [](const Tensor& self) { return self.min(); })
-        .def("min", [](const Tensor& self, const std::vector<int64_t>& dim, bool keepdim) {
-            return self.min(dim, keepdim);
-        }, "dim"_a, "keepdim"_a = false)
-        .def("min", [](const Tensor& self, int64_t dim, bool keepdim) {
-            return self.min({dim}, keepdim);
-        }, "dim"_a, "keepdim"_a = false)
-
-        .def("pow", [](const Tensor& self, Scalar exponent) {
-            return self.pow(exponent);
-        }, "exponent"_a)
-        .def("sqrt", [](const Tensor& self) { return self.sqrt(); })
-        .def("abs", [](const Tensor& self) { return self.abs(); })
-
-        .def("max", [](const Tensor& self) {
-            return self.max();
-        })
-        .def("max", [](const Tensor& self, const std::vector<int64_t>& dim, bool keepdim) {
-            return self.max(dim, keepdim);
-        }, "dim"_a, "keepdim"_a = false)
-        .def("max", [](const Tensor& self, int64_t dim, bool keepdim) {
-            return self.max({dim}, keepdim);
-        }, "dim"_a, "keepdim"_a = false)
-
-        .def("min", [](const Tensor& self) {
-            return self.min();
-        })
-        .def("min", [](const Tensor& self, const std::vector<int64_t>& dim, bool keepdim) {
-            return self.min(dim, keepdim);
-        }, "dim"_a, "keepdim"_a = false)
-        .def("min", [](const Tensor& self, int64_t dim, bool keepdim) {
-            return self.min({dim}, keepdim);
-        }, "dim"_a, "keepdim"_a = false)
-
+        tensor                        
+                        
+                        
+                        
+                        
+                
+                        
+                        
+                        
+                        
+                        
+                        
+                        
+                        
         // Manual overloads using lambdas
         .def("to", [](const Tensor& self, DType dtype, bool non_blocking, bool copy) {
             return tensorplay::tpx::to(self, dtype, non_blocking, copy);
@@ -1623,31 +1431,7 @@ void init_tensor(py::module_& m) {
         .def("data_ptr", [](const Tensor& self) {
             return reinterpret_cast<uintptr_t>(self.data_ptr());
         })
-        .def("item", [](const Tensor& self) -> py::object {
-            switch (self.dtype()) {
-                case DType::Float32: return py::float_(self.item().to<float>());
-                case DType::Float64: return py::float_(self.item().to<double>());
-                case DType::Float16: return py::float_(self.item().to<float>());
-                case DType::BFloat16: return py::float_(self.item().to<float>());
-                case DType::Int32: return py::int_(self.item().to<int32_t>());
-                case DType::Int64: return py::int_(self.item().to<int64_t>());
-                case DType::Int8: return py::int_(self.item().to<int8_t>());
-                case DType::Int16: return py::int_(self.item().to<int16_t>());
-                case DType::UInt8: return py::int_(self.item().to<uint8_t>());
-                case DType::UInt16: return py::int_(self.item().to<uint16_t>());
-                case DType::UInt32: return py::int_(self.item().to<uint32_t>());
-                case DType::UInt64: return py::int_(self.item().to<uint64_t>());
-                case DType::ComplexHalf:
-                case DType::ComplexFloat:
-                    return py::cast(self.item().to<std::complex<float>>());
-                case DType::ComplexDouble:
-                case DType::BComplex32:
-                    return py::cast(self.item().to<std::complex<double>>());
-                case DType::Bool: return py::bool_(self.item().to<bool>());
-                default: TP_THROW(NotImplementedError, "item() not implemented for this dtype");
-            }
-        })
-        
+                
         // Indexing
         .def("tolist", [](const Tensor& self) -> py::object {
             if (self.device().type() != DeviceType::CPU) {
@@ -1736,23 +1520,29 @@ void init_tensor(py::module_& m) {
                          // Route indexing through the autograd-aware wrapper;
                          // calling the raw Tensor view would sever gradients
                          // for common RoPE/decoder slicing patterns.
-                         result = tensorplay::tpx::select(result, target_dim, val);
+                         result = tensorplay::tpx::ops::select(result, target_dim, val);
                      } else if (py::isinstance<py::slice>(idx)) {
                          py::slice s = py::cast<py::slice>(idx);
                          auto [start, stop, step, slicelength] = compute_slice(s, result.size(target_dim));
-                         result = tensorplay::tpx::slice(result, target_dim, start, stop, step);
+                         result = tensorplay::tpx::ops::slice(result, target_dim, start, stop, step);
                          target_dim++;
-                     } else {
-                         TP_THROW(TypeError, "Unsupported index type in tuple");
+                      } else if (idx.ptr() == Py_Ellipsis) {
+                         // torch semantics: "..." expands to full slices over
+                         // every dimension not covered by the other indices.
+                         int64_t absorbed = static_cast<int64_t>(self.dim())
+                                            - static_cast<int64_t>(indices.size()) + 1;
+                         if (absorbed > 0) target_dim += absorbed;
+                      } else {
+
                      }
                  }
                  return result;
             } else if (py::isinstance<py::int_>(index)) {
-                return tensorplay::tpx::select(self, 0, py::cast<int64_t>(index));
+                return tensorplay::tpx::ops::select(self, 0, py::cast<int64_t>(index));
             } else if (py::isinstance<py::slice>(index)) {
                 py::slice s = py::cast<py::slice>(index);
                 auto [start, stop, step, slicelength] = compute_slice(s, self.size(0));
-                return tensorplay::tpx::slice(self, 0, start, stop, step);
+                return tensorplay::tpx::ops::slice(self, 0, start, stop, step);
             }
             TP_THROW(TypeError, "Unsupported index type");
         })
@@ -1768,20 +1558,26 @@ void init_tensor(py::module_& m) {
                          int64_t val = py::cast<int64_t>(idx);
                          target = target.select(target_dim, val);
                      } else if (py::isinstance<py::slice>(idx)) {
-                         py::slice s = py::cast<py::slice>(idx);
-                         auto [start, stop, step, slicelength] = compute_slice(s, target.size(target_dim));
-                         target = target.slice(target_dim, start, stop, step);
-                         target_dim++;
-                     } else {
-                         TP_THROW(TypeError, "Unsupported index type in tuple");
-                     }
-                 }
+                          py::slice s = py::cast<py::slice>(idx);
+                          auto [start, stop, step, slicelength] = compute_slice(s, target.size(target_dim));
+                          target = target.slice(target_dim, start, stop, step);
+                          target_dim++;
+                      } else if (idx.ptr() == Py_Ellipsis) {
+                          int64_t absorbed = static_cast<int64_t>(self.dim())
+                                             - static_cast<int64_t>(indices.size()) + 1;
+                          if (absorbed > 0) target_dim += absorbed;
+                      } else {
+                          TP_THROW(TypeError, "Unsupported index type in tuple");
+                      }
+                  }
+             } else if (index.ptr() == Py_Ellipsis) {
+                 target = self;
             } else if (py::isinstance<py::int_>(index)) {
-                target = tensorplay::tpx::select(self, 0, py::cast<int64_t>(index));
+                target = tensorplay::tpx::ops::select(self, 0, py::cast<int64_t>(index));
             } else if (py::isinstance<py::slice>(index)) {
                 py::slice s = py::cast<py::slice>(index);
                 auto [start, stop, step, slicelength] = compute_slice(s, self.size(0));
-                target = tensorplay::tpx::slice(self, 0, start, stop, step);
+                target = tensorplay::tpx::ops::slice(self, 0, start, stop, step);
             } else {
                 TP_THROW(TypeError, "Unsupported index type");
             }
@@ -1809,10 +1605,17 @@ void init_tensor(py::module_& m) {
         .def("__sub__", [](const Tensor& a, const Tensor& b) { return tensorplay::tpx::ops::sub(a, b); })
         .def("__mul__", [](const Tensor& a, const Tensor& b) { return tensorplay::tpx::ops::mul(a, b); })
         .def("__truediv__", [](const Tensor& a, const Tensor& b) { return tensorplay::tpx::ops::div(a, b); })
+        // Integral scalars must keep integer-tensor dtypes (torch wraps them
+        // as int64 scalars); the double overloads below handle real scalars.
+        .def("__add__", [](const Tensor& t, int64_t s) { return tensorplay::tpx::ops::add(t, Scalar(s)); })
+        .def("__sub__", [](const Tensor& t, int64_t s) { return tensorplay::tpx::ops::sub(t, Scalar(s)); })
+        .def("__mul__", [](const Tensor& t, int64_t s) { return tensorplay::tpx::ops::mul(t, Scalar(s)); })
         .def("__add__", [](const Tensor& t, double s) { return tensorplay::tpx::ops::add(t, Scalar(s)); })
         .def("__sub__", [](const Tensor& t, double s) { return tensorplay::tpx::ops::sub(t, Scalar(s)); })
         .def("__mul__", [](const Tensor& t, double s) { return tensorplay::tpx::ops::mul(t, Scalar(s)); })
         .def("__truediv__", [](const Tensor& t, double s) { return tensorplay::tpx::ops::div(t, Scalar(s)); })
+        .def("__radd__", [](const Tensor& t, int64_t s) { return tensorplay::tpx::ops::add(t, Scalar(s)); })
+        .def("__rmul__", [](const Tensor& t, int64_t s) { return tensorplay::tpx::ops::mul(t, Scalar(s)); })
         .def("__radd__", [](const Tensor& t, double s) { return tensorplay::tpx::ops::add(t, Scalar(s)); })
         .def("__rsub__", [](const Tensor& t, double s) {
             Tensor s_t = Tensor::full({}, Scalar(s), t.dtype(), t.device());
@@ -1857,72 +1660,7 @@ void init_tensor(py::module_& m) {
         })
         
         // Explicit arithmetic
-        .def("add", [](const Tensor& self, const Tensor& other, std::optional<Scalar> alpha) {
-            return tensorplay::tpx::ops::add(self, other, alpha.value_or(Scalar(1)));
-        }, "other"_a, "alpha"_a = py::none())
-        .def("add", [](const Tensor& self, Scalar other, std::optional<Scalar> alpha) {
-            return tensorplay::tpx::ops::add(self, other, alpha.value_or(Scalar(1)));
-        }, "other"_a, "alpha"_a = py::none())
-        .def("add_", [](py::object self_obj, const Tensor& other, std::optional<Scalar> alpha) {
-            Tensor& self = py::cast<Tensor&>(self_obj);
-            tensorplay::tpx::ops::add_(self, other, alpha.value_or(Scalar(1)));
-            return self_obj;
-        }, "other"_a, "alpha"_a = py::none())
-        .def("add_", [](py::object self_obj, Scalar other, std::optional<Scalar> alpha) {
-            Tensor& self = py::cast<Tensor&>(self_obj);
-            tensorplay::tpx::ops::add_(self, other, alpha.value_or(Scalar(1)));
-            return self_obj;
-        }, "other"_a, "alpha"_a = py::none())
-        .def("sub", [](const Tensor& self, const Tensor& other, std::optional<Scalar> alpha) {
-            return tensorplay::tpx::ops::sub(self, other, alpha.value_or(Scalar(1)));
-        }, "other"_a, "alpha"_a = py::none())
-        .def("sub", [](const Tensor& self, Scalar other, std::optional<Scalar> alpha) {
-            return tensorplay::tpx::ops::sub(self, other, alpha.value_or(Scalar(1)));
-        }, "other"_a, "alpha"_a = py::none())
-        .def("sub_", [](py::object self_obj, const Tensor& other, std::optional<Scalar> alpha) {
-            Tensor& self = py::cast<Tensor&>(self_obj);
-            tensorplay::tpx::ops::sub_(self, other, alpha.value_or(Scalar(1)));
-            return self_obj;
-        }, "other"_a, "alpha"_a = py::none())
-        .def("sub_", [](py::object self_obj, Scalar other, std::optional<Scalar> alpha) {
-            Tensor& self = py::cast<Tensor&>(self_obj);
-            tensorplay::tpx::ops::sub_(self, other, alpha.value_or(Scalar(1)));
-            return self_obj;
-        }, "other"_a, "alpha"_a = py::none())
-        .def("mul", [](const Tensor& self, const Tensor& other) {
-            return tensorplay::tpx::ops::mul(self, other);
-        }, "other"_a)
-        .def("mul", [](const Tensor& self, Scalar other) {
-            return tensorplay::tpx::ops::mul(self, other);
-        }, "other"_a)
-        .def("mul_", [](py::object self_obj, const Tensor& other) {
-            Tensor& self = py::cast<Tensor&>(self_obj);
-            tensorplay::tpx::ops::mul_(self, other);
-            return self_obj;
-        }, "other"_a)
-        .def("mul_", [](py::object self_obj, Scalar other) {
-            Tensor& self = py::cast<Tensor&>(self_obj);
-            tensorplay::tpx::ops::mul_(self, other);
-            return self_obj;
-        }, "other"_a)
-        .def("div", [](const Tensor& self, const Tensor& other) {
-            return tensorplay::tpx::ops::div(self, other);
-        }, "other"_a)
-        .def("div", [](const Tensor& self, Scalar other) {
-            return tensorplay::tpx::ops::div(self, other);
-        }, "other"_a)
-        .def("div_", [](py::object self_obj, const Tensor& other) {
-            Tensor& self = py::cast<Tensor&>(self_obj);
-            tensorplay::tpx::ops::div_(self, other);
-            return self_obj;
-        }, "other"_a)
-        .def("div_", [](py::object self_obj, Scalar other) {
-            Tensor& self = py::cast<Tensor&>(self_obj);
-            tensorplay::tpx::ops::div_(self, other);
-            return self_obj;
-        }, "other"_a)
-        .def("bernoulli", static_cast<Tensor(Tensor::*)() const>(&Tensor::bernoulli))
-        .def("poisson", static_cast<Tensor(Tensor::*)() const>(&Tensor::poisson))        .def("__matmul__", [](const Tensor& self, const Tensor& other) { return tensorplay::tpx::ops::matmul(self, other); }, "other"_a)
+                                                                                                                                                .def("__matmul__", [](const Tensor& self, const Tensor& other) { return tensorplay::tpx::ops::matmul(self, other); }, "other"_a)
 
         // Comparison operators
         .def("__hash__", [](const Tensor& self) { return (intptr_t)&self; })
@@ -1940,24 +1678,7 @@ void init_tensor(py::module_& m) {
         .def("__ge__", [](const Tensor& self, Scalar other) { return self.ge(other); })
 
         // Pointwise ops
-        .def("abs", [](const Tensor& self) { return tensorplay::tpx::ops::abs(self); })
-        .def("acos", [](const Tensor& self) { return tensorplay::tpx::ops::acos(self); })
-        .def("acosh", [](const Tensor& self) { return tensorplay::tpx::ops::acosh(self); })
-        .def("angle", [](const Tensor& self) { return tensorplay::tpx::ops::angle(self); })
-        .def("asin", [](const Tensor& self) { return tensorplay::tpx::ops::asin(self); })
-        .def("asinh", [](const Tensor& self) { return tensorplay::tpx::ops::asinh(self); })
-        .def("atan", [](const Tensor& self) { return tensorplay::tpx::ops::atan(self); })
-        .def("atanh", [](const Tensor& self) { return tensorplay::tpx::ops::atanh(self); })
-        .def("gelu", [](const Tensor& self) { return tensorplay::tpx::ops::gelu(self); })
-        .def("lerp", [](const Tensor& self, const Tensor& end, Scalar weight) {
-            return tensorplay::tpx::ops::lerp(self, end, weight);
-        }, "end"_a, "weight"_a)
-        .def("lerp", [](const Tensor& self, const Tensor& end, const Tensor& weight) {
-            return tensorplay::tpx::ops::lerp(self, end, weight);
-        }, "end"_a, "weight"_a)
-        .def("pow", [](const Tensor& self, Scalar exponent) { return tensorplay::tpx::ops::pow(self, exponent); }, "exponent"_a)
-        .def("pow", [](const Tensor& self, const Tensor& exponent) { return tensorplay::tpx::ops::pow(self, exponent); }, "exponent"_a)
-        .def("__pow__", [](const Tensor& self, Scalar exponent) { return tensorplay::tpx::ops::pow(self, exponent); }, "exponent"_a)
+                                                                                                                .def("__pow__", [](const Tensor& self, Scalar exponent) { return tensorplay::tpx::ops::pow(self, exponent); }, "exponent"_a)
         .def("__pow__", [](const Tensor& self, const Tensor& exponent) { return tensorplay::tpx::ops::pow(self, exponent); }, "exponent"_a)
         .def("__rpow__", [](const Tensor& self, Scalar base) {
             Tensor base_t = Tensor::full({}, base, self.dtype(), self.device());

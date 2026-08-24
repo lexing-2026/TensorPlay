@@ -3,6 +3,8 @@
 #include "Tensor.h"
 
 #include <optional>
+#include <unordered_set>
+#include <vector>
 
 namespace tensorplay {
 namespace cpu {
@@ -29,8 +31,20 @@ Tensor to_sparse_coo_cpu(const Tensor& self);
 Tensor to_sparse_csr_cpu(const Tensor& self);
 // sparse @ dense for 2-D COO/CSR `self` (SpMM / SpMM-dense).
 Tensor sparse_mm_cpu(const Tensor& self, const Tensor& dense);
-// Full reduction of a sparse tensor to a 0-dim dense tensor.
-Tensor sparse_sum_cpu(const Tensor& self);
+// COO @ COO elementwise product on matching coordinates and coordinate-union
+// addition; both require same dtype/shape and non-hybrid values.
+Tensor sparse_mul_cpu(const Tensor& self, const Tensor& other);
+Tensor sparse_add_cpu(const Tensor& self, const Tensor& other);
+// ATen _sparse_sum semantics: no dim -> dense sum of values; partial dim ->
+// coalesced COO over the kept dims (duplicates folded); all sparse dims ->
+// dense tensor.  ``dtype`` converts the input first (accumulation dtype).
+Tensor sparse_sum_cpu(const Tensor& self, std::optional<std::vector<int64_t>> dim,
+                      std::optional<DType> dtype);
+// torch.sparse.spdiags: builds an (uncoalesced) COO from diagonal rows.
+// ``layout`` selects the output: 0 = sparse COO, 1 = sparse CSR.
+Tensor spdiags_cpu(const Tensor& diagonals, const Tensor& offsets,
+                   std::vector<int64_t> shape,
+                   std::optional<int64_t> layout);
 
 } // namespace cpu
 
@@ -53,7 +67,14 @@ int64_t sparse_nnz_cuda(const Tensor& self);
 Tensor to_sparse_coo_cuda(const Tensor& self);
 Tensor to_sparse_csr_cuda(const Tensor& self);
 Tensor sparse_mm_cuda(const Tensor& self, const Tensor& dense);
-Tensor sparse_sum_cuda(const Tensor& self);
+Tensor sparse_sum_cuda(const Tensor& self, std::optional<std::vector<int64_t>> dim,
+                       std::optional<DType> dtype);
+Tensor spdiags_cuda(const Tensor& diagonals, const Tensor& offsets,
+                    std::vector<int64_t> shape,
+                    std::optional<int64_t> layout);
+
+Tensor sparse_mul_cuda(const Tensor& self, const Tensor& other);
+Tensor sparse_add_cuda(const Tensor& self, const Tensor& other);
 
 } // namespace cuda
 #endif

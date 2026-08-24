@@ -13,8 +13,8 @@ upstream's "unsupported signature" fallthrough.
 
 from __future__ import annotations
 
-from .api_types import (binding_default, cpp_arg_type, cpp_return_type,
-                        py_default_for)
+from .api_types import (_MEMORY_FORMAT_VALUES, binding_default,
+                        cpp_arg_type, cpp_return_type, py_default_for)
 from .main import CodegenContext, register_generator
 
 import re as _re
@@ -53,6 +53,12 @@ def _default_pyobject(a, expr: str) -> str:
         return f"tpx_py_wrap_dtype({expr})"
     if a.type.kind == "Device" and expr.startswith("Device("):
         return f"tpx_py_wrap_device({expr})"
+    if a.type.kind == "MemoryFormat":
+        # MemoryFormat rides the dispatcher as its integer value; accept both
+        # bare and enum-qualified spellings from the yaml.
+        name = expr.split("::")[-1].strip()
+        if name in _MEMORY_FORMAT_VALUES:
+            return f"PyLong_FromLongLong({_MEMORY_FORMAT_VALUES[name]}LL)"
     raise SystemExit(
         f"default {expr!r} for argument '{a.name}' of type '{a.type.kind}' "
         "has no CPython-literal mapping; drop the default from the yaml or "
@@ -78,11 +84,59 @@ _BRIDGE = {
     "std::optional<Scalar>": "tpx_py_opt_scalar({n})",
     "std::vector<int64_t>": "tpx_py_intlist({n})",
     "std::vector<double>": "tpx_py_doublelist({n})",
+    # Schemas bind lists by const-ref at signature level; the unpackers
+    # return by value, which binds fine -- keep both spellings claimed.
+    "const std::vector<int64_t>&": "tpx_py_intlist({n})",
+    "const std::vector<double>&": "tpx_py_doublelist({n})",
+    "std::vector<Tensor>": "tpx_py_tensorlist({n})",
+    "const std::vector<Tensor>&": "tpx_py_tensorlist({n})",
+    "std::vector<Scalar>": "tpx_py_scalarlist({n})",
+    "const std::vector<Scalar>&": "tpx_py_scalarlist({n})",
+    "const std::optional<Tensor>&": "tpx_py_opt_tensor({n})",
+    "std::optional<std::vector<int64_t>>": "tpx_py_opt_intlist({n})",
+    "std::optional<std::string>": "tpx_py_opt_string({n})",
     "std::string": "tpx_py_string({n})",
     "DType": "tpx_py_dtype({n})",
     "std::optional<DType>": "tpx_py_opt_dtype({n})",
     "std::optional<Device>": "tpx_py_opt_device({n})",
 }
+
+# C++ argument type -> tpx_py_type_kind byte (see CPythonBridge.h).  Mirrors
+# _BRIDGE's key set; entries absent here disable the eager check for ops
+# using them rather than changing which ops get FASTCALL bindings.
+_KIND_CONST = {
+    "const Tensor&": "TPK_TENSOR",
+    "Tensor&": "TPK_TENSOR",
+    "Tensor": "TPK_TENSOR",
+    "const Scalar&": "TPK_NUMBER",
+    "Scalar": "TPK_NUMBER",
+    "int64_t": "TPK_INT",
+    "double": "TPK_FLOAT",
+    "bool": "TPK_BOOL",
+    "std::vector<int64_t>": "TPK_INTLIST",
+    "std::vector<double>": "TPK_FLOATLIST",
+    "const std::vector<int64_t>&": "TPK_INTLIST",
+    "const std::vector<double>&": "TPK_FLOATLIST",
+    "std::vector<Tensor>": "TPK_TENSORLIST",
+    "const std::vector<Tensor>&": "TPK_TENSORLIST",
+    "std::vector<Scalar>": "TPK_SCALARLIST",
+    "const std::vector<Scalar>&": "TPK_SCALARLIST",
+    "std::string": "TPK_STR",
+    "DType": "TPK_DTYPE",
+}
+_OPT = {
+    "std::optional<Tensor>": "TPK_TENSOR",
+    "std::optional<int64_t>": "TPK_INT",
+    "std::optional<double>": "TPK_FLOAT",
+    "std::optional<bool>": "TPK_BOOL",
+    "std::optional<Scalar>": "TPK_NUMBER",
+    "std::optional<std::string>": "TPK_STR",
+    "std::optional<DType>": "TPK_DTYPE",
+    "std::optional<Device>": "TPK_DEVICE",
+    "const std::optional<Tensor>&": "TPK_TENSOR",
+    "std::optional<std::vector<int64_t>>": "TPK_INTLIST",
+}
+_KIND_CONST.update({k: v + " | TPK_OPTIONAL" for k, v in _OPT.items()})
 
 _RET_SHAPES = {"void", "value", "tuple", "list", "mut_ref"}
 
@@ -95,7 +149,7 @@ def _op_supported(f, variant: str) -> bool:
     if f.cpp_return_kind not in _RET_SHAPES:
         return False
     if f.cpp_return_kind == "value":
-        return cpp_return_type(f) in ("Tensor", "bool", "Scalar")
+        return cpp_return_type(f) in ("Tensor", "bool", "Scalar", "int64_t")
     if f.cpp_return_kind == "tuple":
         return len(f.returns) in (2, 3, 4)
     return True
@@ -177,15 +231,25 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
     op = f"tensorplay::tpx::ops::{f.cpp_name}"
     kind = f.cpp_return_kind
     ret_cpp = cpp_return_type(f)
+    # Upstream gen_python_functions wraps every dispatch in an unconditional
+    # `gil_scoped_release`; mirror that with the RAII equivalent so kernels
+    # run multithreaded.  The lambda restores the GIL before the result is
+    # wrapped (all Python C-API stays under the GIL).
     if kind == "void":
-        invoke = f"{op}({call}); Py_RETURN_NONE;"
+        invoke = f"[&]() {{ tpx_py_GilRelease _gil; {op}({call}); }}(); Py_RETURN_NONE;"
     elif kind == "value":
         if ret_cpp == "bool":
-            invoke = f"auto r = {op}({call}); return PyBool_FromLong(r);"
+            invoke = (f"auto r = [&]() {{ tpx_py_GilRelease _gil; return {op}({call}); }}(); "
+                      "return PyBool_FromLong(r);")
         elif ret_cpp == "Scalar":
-            invoke = f"auto r = {op}({call}); return tpx_py_wrap_scalar(r);"
+            invoke = (f"auto r = [&]() {{ tpx_py_GilRelease _gil; return {op}({call}); }}(); "
+                      "return tpx_py_wrap_scalar(r);")
+        elif ret_cpp == "int64_t":
+            invoke = (f"auto r = [&]() {{ tpx_py_GilRelease _gil; return {op}({call}); }}(); "
+                      "return PyLong_FromLongLong(r);")
         elif ret_cpp == "Tensor":
-            invoke = f"auto r = {op}({call}); return tpx_py_wrap(r);"
+            invoke = (f"auto r = [&]() {{ tpx_py_GilRelease _gil; return {op}({call}); }}(); "
+                      "return tpx_py_wrap(r);")
         else:
             return False                       # unhandled scalar shape
     elif kind == "tuple":
@@ -193,14 +257,17 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
                   4: "tpx_py_wrap_tuple4"}.get(len(f.returns))
         if packer is None:
             return None
-        invoke = f"auto r = {op}({call}); return {packer}(r);"
+        invoke = (f"auto r = [&]() {{ tpx_py_GilRelease _gil; return {op}({call}); }}(); "
+                  f"return {packer}(r);")
     elif kind == "list":
-        invoke = f"auto r = {op}({call}); return tpx_py_wrap_list(r);"
+        invoke = (f"auto r = [&]() {{ tpx_py_GilRelease _gil; return {op}({call}); }}(); "
+                  "return tpx_py_wrap_list(r);")
     else:                                      # mut_ref
         # slots[0] is the raw self PyObject; the s_* locals hold unpacked
         # C++ tensors.
         keep = "tpx_py_keep_alive(slots[0]);" if nargs else ""
-        invoke = f"auto& r = {op}({call}); {keep} return tpx_py_wrap(r);"
+        invoke = (f"auto& r = [&]() -> auto& {{ tpx_py_GilRelease _gil; "
+                  f"return {op}({call}); }}(); {keep} return tpx_py_wrap(r);")
 
     recv = "PyObject* self" if is_method else "PyObject*"
     out.extend(prelude)
@@ -214,12 +281,61 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
         f"        {kwlist}",
         f"        PyObject* slots[{nargs}];",
     ]
+
+    # Upstream PythonArgParser folds surplus positionals into a trailing
+    # IntList parameter (t.view(2, 3) == t.view([2, 3])).  Replicate that:
+    # when the last positional parameter is list-typed, pack args[P-1..]
+    # into a tuple before parsing instead of rejecting extra positionals.
+    _pos = [a for a in f.args[(1 if is_method else 0):] if not a.kwonly]
+    splat = bool(_pos) and _pos[-1].type.is_list
+
+    if splat:
+        P = user_pos
+        body += [
+            f"        PyObject* buf[{P}];",
+            "        PyObject* const* ap = args;",
+            "        Py_ssize_t an = nargs;",
+            f"        if (nargs > {P}) {{",
+            f"            PyObject* folded = PyTuple_New(nargs - {P - 1});",
+            f"            for (Py_ssize_t i = 0; i < nargs - {P - 1}; ++i) {{",
+            f"                PyObject* it = args[{P - 1} + i];",
+            "                Py_INCREF(it);",
+            "                PyTuple_SET_ITEM(folded, i, it);",
+            "            }",
+        ]
+        if P > 1:
+            body.append(
+                f"            for (Py_ssize_t i = 0; i < {P - 1}; ++i) buf[i] = args[i];")
+        body += [
+            f"            buf[{P - 1}] = folded;",
+            "            ap = buf;",
+            f"            an = {P};",
+            "        }",
+        ]
+        arg_arr, arg_n = "ap", "an"
+        # A bare Tensor passed to a TensorList splat folds to a singleton
+        # (torch.block_diag(t)); lists/tuples pass through untouched.
+        if "tensorlist" in _BRIDGE.get(cpp_arg_type(_pos[-1].type), ""):
+            body += [
+                "        if (an == " + str(P) + " && ap[" + str(P - 1) + "] != nullptr &&",
+                "            !PyList_Check(ap[" + str(P - 1) + "]) &&",
+                "            !PyTuple_Check(ap[" + str(P - 1) + "])) {",
+                "            PyObject* single = PyTuple_New(1);",
+                "            Py_INCREF(ap[" + str(P - 1) + "]);",
+                "            PyTuple_SET_ITEM(single, 0, ap[" + str(P - 1) + "]);",
+                "            buf[" + str(P - 1) + "] = single;",
+                "            ap = buf;",
+                "        }",
+            ]
+    else:
+        arg_arr, arg_n = "args", "nargs"
+
     if is_method:
         body.append("        slots[0] = self;")
         body.append(
-            f'        tpx_py_parse_into(args, nargs, kwnames, kwlist, '
+            f'        tpx_py_parse_into({arg_arr}, {arg_n}, kwnames, kwlist, '
             f'{nargs - 1}, "{f.func_name}", slots + 1);')
-        if user_pos < nargs - 1:
+        if not splat and user_pos < nargs - 1:
             # std::invalid_argument (not a Python error) so multi-overload
             # dispatch can fall through to the next candidate signature.
             body.append(f"        if (nargs > {user_pos}) {{")
@@ -228,15 +344,33 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
             body.append("        }")
     else:
         body.append(
-            f'        tpx_py_parse_into(args, nargs, kwnames, kwlist, '
+            f'        tpx_py_parse_into({arg_arr}, {arg_n}, kwnames, kwlist, '
             f'{nargs}, "{f.func_name}", slots);')
-        if user_pos < nargs:
+        if not splat and user_pos < nargs:
             body.append(f"        if (nargs > {user_pos}) {{")
             body.append(f'            throw std::invalid_argument("{f.func_name}: '
                         'too many positional arguments");')
             body.append("        }")
     out.extend(body)
+
+    # Eager type validation with upstream error wording: one static kind
+    # table per overload, consumed by tpx_py_check_types right after slot
+    # merging.  Unknown argument types simply skip the check (casters stay
+    # authoritative); this never changes operator support.
+    off = 1 if is_method else 0
+    kind_consts = [_KIND_CONST.get(cpp_arg_type(a.type)) for a in f.args[off:]]
+    if nargs > off and all(kind_consts):
+        out.append('        static const unsigned char tpx_kinds[] = {'
+                   + ", ".join(kind_consts) + '};')
+        out.append(
+            f'        tpx_py_check_types(slots + {off}, {nargs - off}, '
+            f'"{f.func_name}", kwlist, tpx_kinds, {user_pos});')
+
     first_default = 1 if is_method else 0
+    splat_slot = -1
+    if splat:
+        splat_name = _pos[-1].name
+        splat_slot = next(i for i, (n, _, _) in enumerate(slots) if n == splat_name)
     for i, (name, tpl, dflt) in enumerate(slots):
         src = "slots[%d]" % i
         if i < first_default:
@@ -248,7 +382,19 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
             out.append(f"        static PyObject* k{i} = {dflt}; (void)k{i};")
             out.append(
                 f"        PyObject* r_{i} = {src} ? {src} : k{i};")
+        elif i == splat_slot:
+            # Zero folded positionals (torch.block_diag()) parse as an empty
+            # trailing list instead of a missing required argument.
+            out.append(f"        PyObject* r_{i} = {src} ? {src} : PyTuple_New(0);")
         else:
+            # Required argument: a missing slot must raise (invalid_argument
+            # reads as TypeError and lets multi-overload groups fall through),
+            # never flow into the unpackers -- they would deref null.
+            out.append(f"        if ({src} == nullptr) {{")
+            out.append(
+                f'            throw std::invalid_argument("{f.func_name}: '
+                f'missing required argument \\"{name}\\"");')
+            out.append("        }")
             out.append(f"        PyObject* r_{i} = {src};")
         out.append(f"        auto&& s_{name} = {tpl.format(n=f'r_{i}')};")
     out.append(f"        {invoke}")

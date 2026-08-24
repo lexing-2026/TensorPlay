@@ -31,10 +31,10 @@ class TestVJP(unittest.TestCase):
         x = inputs.detach().requires_grad_(True)
         outs = exp_reducer(x)
         for i in range(4):
-            g = tp.autograd.grad(outs[i], x)[0] * v[i]
+            g = tp.autograd.grad(outs[i], x, retain_graph=True)[0] * v[i]
             for j in range(4):
                 self.assertAlmostEqual(
-                    vjpval[i][j].item(), g[j].item(), places=8
+                    vjpval[i][j].item(), g[i][j].item(), places=8
                 )
 
     def test_create_graph(self):
@@ -65,17 +65,23 @@ class TestVJP(unittest.TestCase):
 class TestJVP(unittest.TestCase):
     def test_matches_vjp_transpose(self):
         # For a linear f: jvp(f)(v) == vjp(f.T)... simplest check: linear map
+        # Both engines: "reversed" is the default (double-backward trick,
+        # exercises the MatmulBackward node's recordable composition);
+        # "forward" walks the forward-mode kernels.
         W = tp.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=tp.float64)
 
         def f(x):
-            return tp.matmul(x, W.t())
+            return x @ W.t()
 
         x = tp.tensor([1.0, 2.0], dtype=tp.float64)
         v = tp.tensor([1.0, 1.0], dtype=tp.float64)
-        out, jvpval = jvp(f, x, v)
         expected = v @ W.t()
-        for i in range(2):
-            self.assertAlmostEqual(jvpval[i].item(), expected[i].item(), places=10)
+        for mode in ("reversed", "forward"):
+            out, jvpval = jvp(f, x, v, mode=mode)
+            for i in range(2):
+                self.assertAlmostEqual(float(jvpval[i]), float(expected[i]),
+                                       places=10,
+                                       msg=f"mode={mode} component {i}")
 
     def test_quadratic(self):
         x = tp.tensor([1.0, 2.0], dtype=tp.float64)
@@ -90,8 +96,8 @@ class TestJVP(unittest.TestCase):
         self.assertAlmostEqual(jvpval[1].item(), 4.0, places=10)
 
     def test_create_graph(self):
-        x = tp.rand(2, dtype=tp.float64, requires_grad=True)
-        v = tp.ones(2, dtype=tp.float64)
+        x = tp.rand(2, 2, dtype=tp.float64, requires_grad=True)
+        v = tp.ones_like(x)
         out, jvpval = jvp(exp_reducer, x, v, create_graph=True)
         self.assertTrue(out.requires_grad)
         self.assertTrue(jvpval.requires_grad)
@@ -117,17 +123,18 @@ class TestJacobian(unittest.TestCase):
         x = tp.rand(2, dtype=tp.float64)
         y = tp.rand(2, dtype=tp.float64)
         jxx, jxy = jacobian(exp_adder, (x, y))
-        self.assertIsInstance(jxx, tuple)
-        self.assertEqual(tuple(jxx[0].shape), (2, 2))
+        # torch: single output + tuple inputs -> tuple of Tensors (per input)
+        self.assertIsInstance(jxx, tp.Tensor)
+        self.assertEqual(tuple(jxx.shape), (2, 2))
         xd = x.detach()
         for i in range(2):
             for j in range(2):
                 expected = 2 * math.exp(xd[i].item()) if i == j else 0.0
-                self.assertAlmostEqual(jxx[0][i][j].item(), expected, places=8)
-                self.assertAlmostEqual(jxy[0][i][j].item(), 3.0 if i == j else 0.0, places=8)
+                self.assertAlmostEqual(jxx[i][j].item(), expected, places=8)
+                self.assertAlmostEqual(jxy[i][j].item(), 3.0 if i == j else 0.0, places=8)
 
     def test_create_graph(self):
-        x = tp.rand(2, dtype=tp.float64, requires_grad=True)
+        x = tp.rand(2, 2, dtype=tp.float64, requires_grad=True)
         jac = jacobian(exp_reducer, x, create_graph=True)
         self.assertTrue(jac.requires_grad)
 
@@ -186,7 +193,7 @@ class TestHessian(unittest.TestCase):
 
     def test_multi_output_raises(self):
         x = tp.rand(2, dtype=tp.float64)
-        with self.assertRaisesRegex(RuntimeError, "single Tensor"):
+        with self.assertRaisesRegex(RuntimeError, "should contain a single element"):
             hessian(lambda t: t * t, x)
 
 

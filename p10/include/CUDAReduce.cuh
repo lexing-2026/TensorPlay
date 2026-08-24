@@ -538,7 +538,10 @@ struct ReduceOp {
         }
         while (unit < end) {
             values[0] = reduce_unit(values[0], row, unit, unit * InputVecSize);
-            ++unit;
+            // Threads stride by step_input; a plain ++unit makes every lane
+            // walk into its neighbours' units (each element counted
+            // (num_inputs - lane) times -> triangular sums).
+            unit += step;
         }
 
         #pragma unroll
@@ -569,7 +572,7 @@ struct ReduceOp {
             if (threadIdx.x == 0 && threadIdx.y == 0) {
                 partials[output_index * config.ctas_per_output + blockIdx.y] = value;
             }
-        } else if (config.should_store(output_index)) {
+        } else         if (config.should_store(output_index)) {
             output[config.output_offset(output_index)] = ops.project(value);
         }
     }

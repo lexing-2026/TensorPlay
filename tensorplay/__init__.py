@@ -23,8 +23,10 @@ from typing import (
 )
 from typing_extensions import TypeIs as _TypeIs
 
-
-__version__ = "1.0.0rc0"
+# Generated at build time by tools/generate_tensorplay_version.py (CMake
+# generate_code target); mirrors torch importing __version__ from a
+# generated version module.
+from tensorplay.version import __version__ as __version__
 
 
 # -------------------------------------------------------------------------
@@ -266,6 +268,26 @@ class MemoryFormat(IntEnum):
     channels_last_3d = 3
 
 
+
+class Layout(IntEnum):
+    """Sparse/dense storage layout tags (mirrors torch.layout loosely).
+
+    ``tensor.layout`` returns one of these values; dense tensors report
+    STRIDED.
+    """
+
+    SPARSE_COO = 0
+    SPARSE_CSR = 1
+    STRIDED = 2
+    # Lowercase value aliases, torch spelling.
+    sparse_coo = 0
+    sparse_csr = 1
+    strided = 2
+
+
+sparse_coo = Layout.SPARSE_COO
+sparse_csr = Layout.SPARSE_CSR
+strided = Layout.STRIDED
 contiguous_format = MemoryFormat.CONTIGUOUS
 preserve_format = MemoryFormat.PRESERVE
 channels_last = MemoryFormat.CHANNELS_LAST
@@ -281,7 +303,7 @@ __all__ = [
     "save", "load", "inspect_checkpoint", "as_tensor",
     "no_grad", "enable_grad", "set_grad_enabled", "is_grad_enabled",
     "allclose",
-    "compile", "compiler", "graph",
+    "compile", "compiler", "graph", "library",
     "set_num_threads", "get_num_threads", "get_thread_num",
     "in_parallel_region", "get_parallel_info",
     "default_generator", "manual_seed", "seed", "initial_seed", "Generator",
@@ -439,10 +461,13 @@ def unique(input, sorted=True, return_inverse=False, return_counts=False):
     return values
 
 from ._shape_funcs import *
+from ._composite_funcs import *
 from ._einsum import einsum
 from .utils.comparison import allclose
 from . import compiler
 from .compiler import compile
+from . import library
+from ._ops import ops as ops
 
 # -------------------------------------------------------------------------
 # Submodules
@@ -658,6 +683,15 @@ def set_default_device(device: Device) -> None:
     _C._set_default_device(device)
 
 
+_default_dtype: DType = float32
+
+
+def get_default_dtype() -> DType:
+    """Returns the current default floating point dtype (float32 initially,
+    changed by :func:`set_default_dtype`)."""
+    return _default_dtype
+
+
 def set_default_dtype(d: DType, /) -> None:
     r"""
 
@@ -709,6 +743,8 @@ def set_default_dtype(d: DType, /) -> None:
 
     """
     _C._set_default_dtype(d)
+    global _default_dtype
+    _default_dtype = d
 
 
 def use_deterministic_algorithms(
@@ -932,9 +968,10 @@ from tensorplay.functional import *
 # Torch exposes the foreach dispatcher family at the top level.  Re-export
 # only generated ``_foreach_*`` wrappers; their implementation is still the
 # native dispatcher/backend and this block does not introduce a Python
-# composite operator.
+# composite operator.  ``_amp_*`` dispatcher hooks follow the same rule
+# (torch._amp_foreach_non_finite_check_and_unscale_ / torch._amp_update_scale_).
 for _foreach_name in dir(functional):
-    if _foreach_name.startswith("_foreach_"):
+    if _foreach_name.startswith("_foreach_") or _foreach_name.startswith("_amp_"):
         globals()[_foreach_name] = getattr(functional, _foreach_name)
         if _foreach_name not in __all__:
             __all__.append(_foreach_name)

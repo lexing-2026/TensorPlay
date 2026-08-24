@@ -21,7 +21,158 @@ static std::pair<int64_t, int64_t> get_pair_from_kernel(const std::vector<int64_
     return get_pair(list);
 }
 
+// Upstream ATen/Dispatch.h AT_DISPATCH_FLOATING_TYPES parity: immediately
+// invoked lambda, scalar_t hint inside, Double before Float, and the exact
+// '"kernel" not implemented for '<Type>'' wording on the default branch.
+#define TP_DISPATCH_FLOATING_TYPES(TYPE, NAME, ...)                        \
+    [&]() {                                                                \
+        const auto& the_type = TYPE;                                       \
+        (void)the_type;                                                    \
+        switch (the_type) {                                                \
+            case DType::Float64: {                                         \
+                using scalar_t [[maybe_unused]] = double;                  \
+                return __VA_ARGS__();                                      \
+            }                                                              \
+            case DType::Float32: {                                         \
+                using scalar_t [[maybe_unused]] = float;                   \
+                return __VA_ARGS__();                                      \
+            }                                                              \
+            default:                                                       \
+                TP_THROW(NotImplementedError,                              \
+                    std::string("\"") + NAME +                             \
+                    "\" not implemented for '" +                           \
+                    tensorplay::toString(the_type) + "'");                 \
+        }                                                                  \
+    }()
+
+// AT_DISPATCH_ALL_TYPES parity: Byte, Char, Short, Int, Long, Float, Double.
+#define TP_DISPATCH_ALL_TYPES(TYPE, NAME, ...)                             \
+    [&]() {                                                                \
+        const auto& the_type = TYPE;                                       \
+        (void)the_type;                                                    \
+        switch (the_type) {                                                \
+            case DType::Float64: {                                         \
+                using scalar_t [[maybe_unused]] = double;                  \
+                return __VA_ARGS__();                                      \
+            }                                                              \
+            case DType::Float32: {                                         \
+                using scalar_t [[maybe_unused]] = float;                   \
+                return __VA_ARGS__();                                      \
+            }                                                              \
+            case DType::Int64: {                                           \
+                using scalar_t [[maybe_unused]] = int64_t;                 \
+                return __VA_ARGS__();                                      \
+            }                                                              \
+            case DType::Int32: {                                           \
+                using scalar_t [[maybe_unused]] = int32_t;                 \
+                return __VA_ARGS__();                                      \
+            }                                                              \
+            case DType::Int16: {                                           \
+                using scalar_t [[maybe_unused]] = int16_t;                 \
+                return __VA_ARGS__();                                      \
+            }                                                              \
+            case DType::Int8: {                                            \
+                using scalar_t [[maybe_unused]] = int8_t;                  \
+                return __VA_ARGS__();                                      \
+            }                                                              \
+            case DType::UInt8: {                                           \
+                using scalar_t [[maybe_unused]] = uint8_t;                 \
+                return __VA_ARGS__();                                      \
+            }                                                              \
+            default:                                                       \
+                TP_THROW(NotImplementedError,                              \
+                    std::string("\"") + NAME +                             \
+                    "\" not implemented for '" +                           \
+                    tensorplay::toString(the_type) + "'");                 \
+        }                                                                  \
+    }()
+
+// AT_DISPATCH_FLOATING_TYPES_AND3(kLong, kBFloat16, kHalf) minus the half
+// types (p10 has no compute path for them yet): floats + Long.
+#define TP_DISPATCH_FLOATING_TYPES_AND_LONG(TYPE, NAME, ...)               \
+    [&]() {                                                                \
+        const auto& the_type = TYPE;                                       \
+        (void)the_type;                                                    \
+        switch (the_type) {                                                \
+            case DType::Float64: {                                         \
+                using scalar_t [[maybe_unused]] = double;                  \
+                return __VA_ARGS__();                                      \
+            }                                                              \
+            case DType::Float32: {                                         \
+                using scalar_t [[maybe_unused]] = float;                   \
+                return __VA_ARGS__();                                      \
+            }                                                              \
+            case DType::Int64: {                                           \
+                using scalar_t [[maybe_unused]] = int64_t;                 \
+                return __VA_ARGS__();                                      \
+            }                                                              \
+            default:                                                       \
+                TP_THROW(NotImplementedError,                              \
+                    std::string("\"") + NAME +                             \
+                    "\" not implemented for '" +                           \
+                    tensorplay::toString(the_type) + "'");                 \
+        }                                                                  \
+    }()
+
+// Upstream aten/src/ATen/native/AveragePool3d.cpp parity.
+Tensor avg_pool3d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_size,
+                      const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
+                      bool ceil_mode, bool count_include_pad,
+                      std::optional<int64_t> divisor_override) {
+    if (input.dim() == 4) {
+        // torch accepts unbatched (C,D,H,W): pool as a batch of one.
+        return avg_pool3d_cpu(input.unsqueeze(0), kernel_size, stride, padding,
+                              ceil_mode, count_include_pad,
+                              divisor_override).squeeze(0);
+    }
+    if (input.dim() != 5) TP_THROW(RuntimeError, "avg_pool3d: Expected 5D input");
+    const int64_t N = input.size(0), C = input.size(1);
+    const int64_t D = input.size(2), H = input.size(3), W = input.size(4);
+    const int64_t kd = kernel_size[0], kh = kernel_size[1], kw = kernel_size[2];
+    const int64_t sd = stride[0], sh = stride[1], sw = stride[2];
+    const int64_t pd_ = padding[0], ph = padding[1], pw = padding[2];
+    auto out_size = [&](int64_t in, int64_t k, int64_t s, int64_t p) {
+        return ceil_mode ? (in + 2 * p - k + s - 1) / s + 1
+                         : (in + 2 * p - k) / s + 1;
+    };
+    const int64_t oD = out_size(D, kd, sd, pd_);
+    const int64_t oH = out_size(H, kh, sh, ph);
+    const int64_t oW = out_size(W, kw, sw, pw);
+    Tensor out = Tensor::empty({N, C, oD, oH, oW}, input.dtype(), input.device());
+    TP_DISPATCH_FLOATING_TYPES_AND_LONG(input.dtype(), "avg_pool3d", [&]() {
+        scalar_t* out_ptr = out.data_ptr<scalar_t>();
+        const scalar_t* in_ptr = input.data_ptr<scalar_t>();
+        for (int64_t n = 0; n < N; ++n)
+        for (int64_t c = 0; c < C; ++c)
+        for (int64_t od = 0; od < oD; ++od)
+        for (int64_t oh = 0; oh < oH; ++oh)
+        for (int64_t ow = 0; ow < oW; ++ow) {
+            const int64_t d0 = od * sd - pd_, h0 = oh * sh - ph, w0 = ow * sw - pw;
+            const int64_t d1 = std::min(d0 + kd, D), h1 = std::min(h0 + kh, H), w1 = std::min(w0 + kw, W);
+            scalar_t sum = scalar_t(0);
+            int64_t cnt = 0;
+            for (int64_t d = std::max(d0, int64_t(0)); d < d1; ++d)
+            for (int64_t h = std::max(h0, int64_t(0)); h < h1; ++h)
+            for (int64_t w = std::max(w0, int64_t(0)); w < w1; ++w) {
+                sum += in_ptr[((n * C + c) * D + d) * H * W + h * W + w];
+                ++cnt;
+            }
+            int64_t div = divisor_override.has_value()
+                              ? *divisor_override
+                              : (count_include_pad ? kd * kh * kw : cnt);
+            out_ptr[((n * C + c) * oD + od) * oH * oW + oh * oW + ow] =
+                div > 0 ? sum / static_cast<scalar_t>(div) : scalar_t(0);
+        }
+    });
+    return out;
+}
+
 Tensor max_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_size, const std::vector<int64_t>& stride, const std::vector<int64_t>& padding, const std::vector<int64_t>& dilation, bool ceil_mode) {
+    if (input.dim() == 3) {
+        // torch accepts unbatched (C,H,W): pool as a batch of one.
+        return max_pool2d_cpu(input.unsqueeze(0), kernel_size, stride, padding,
+                              dilation, ceil_mode).squeeze(0);
+    }
     if (input.dim() != 4) TP_THROW(RuntimeError, "max_pool2d: Expected 4D input");
     
     int64_t N = input.size(0);
@@ -50,53 +201,54 @@ Tensor max_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_si
     
     Tensor out = Tensor::empty({N, C, H_out, W_out}, input.dtype(), input.device());
     
-    if (input.dtype() == DType::Float32) {
-        float* out_ptr = out.data_ptr<float>();
-        const float* in_ptr = input.data_ptr<float>();
-        
+    TP_DISPATCH_ALL_TYPES(input.dtype(), "max_pool2d", [&]() {
+        scalar_t* out_ptr = out.data_ptr<scalar_t>();
+        const scalar_t* in_ptr = input.data_ptr<scalar_t>();
+
         for (int64_t n = 0; n < N; ++n) {
             for (int64_t c = 0; c < C; ++c) {
                 for (int64_t h = 0; h < H_out; ++h) {
                     for (int64_t w = 0; w < W_out; ++w) {
-                        
+
                         int64_t h_start = h * sH - pH;
                         int64_t w_start = w * sW - pW;
-                        int64_t h_end = h_start + (kH - 1) * dH + 1;
-                        int64_t w_end = w_start + (kW - 1) * dW + 1;
-                        
+
                         // Valid window range
                         // We iterate kernel
-                        float max_val = -std::numeric_limits<float>::infinity();
-                        
+                        scalar_t max_val = -std::numeric_limits<scalar_t>::infinity();
+
                         for (int64_t kh = 0; kh < kH; ++kh) {
                             for (int64_t kw = 0; kw < kW; ++kw) {
                                 int64_t h_in_idx = h_start + kh * dH;
                                 int64_t w_in_idx = w_start + kw * dW;
-                                
+
                                 if (h_in_idx >= 0 && h_in_idx < H_in && w_in_idx >= 0 && w_in_idx < W_in) {
                                     int64_t idx = ((n * C + c) * H_in + h_in_idx) * W_in + w_in_idx;
-                                    float val = in_ptr[idx];
+                                    scalar_t val = in_ptr[idx];
                                     if (val > max_val) {
                                         max_val = val;
                                     }
                                 }
                             }
                         }
-                        
+
                         int64_t out_idx = ((n * C + c) * H_out + h) * W_out + w;
                         out_ptr[out_idx] = max_val;
                     }
                 }
             }
         }
-    } else {
-        TP_THROW(NotImplementedError, "max_pool2d only supports Float32");
-    }
+    });
     
     return out;
 }
 
 Tensor avg_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_size, const std::vector<int64_t>& stride, const std::vector<int64_t>& padding, bool ceil_mode, bool count_include_pad, std::optional<int64_t> divisor_override) {
+    if (input.dim() == 3) {
+        // torch accepts unbatched (C,H,W): pool as a batch of one.
+        return avg_pool2d_cpu(input.unsqueeze(0), kernel_size, stride, padding,
+                              ceil_mode, count_include_pad, divisor_override).squeeze(0);
+    }
     if (input.dim() != 4) TP_THROW(RuntimeError, "avg_pool2d: Expected 4D input");
     
     int64_t N = input.size(0);
@@ -124,9 +276,9 @@ Tensor avg_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_si
 
     Tensor out = Tensor::empty({N, C, H_out, W_out}, input.dtype(), input.device());
     
-    if (input.dtype() == DType::Float32) {
-        float* out_ptr = out.data_ptr<float>();
-        const float* in_ptr = input.data_ptr<float>();
+    TP_DISPATCH_FLOATING_TYPES_AND_LONG(input.dtype(), "avg_pool2d", [&]() {
+        scalar_t* out_ptr = out.data_ptr<scalar_t>();
+        const scalar_t* in_ptr = input.data_ptr<scalar_t>();
         
         for (int64_t n = 0; n < N; ++n) {
             for (int64_t c = 0; c < C; ++c) {
@@ -141,7 +293,7 @@ Tensor avg_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_si
                         int64_t pool_size = (h_end - h_start) * (w_end - w_start); // This calculation is slightly wrong if we consider padding logic
                         // Let's iterate explicitly
                         
-                        float sum = 0.0f;
+                        scalar_t sum = 0.0f;
                         int64_t count = 0;
                         
                         for (int64_t kh = 0; kh < kH; ++kh) {
@@ -157,16 +309,16 @@ Tensor avg_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_si
                             }
                         }
                         
-                        float divisor;
+                        scalar_t divisor;
                         if (divisor_override.has_value()) {
-                            divisor = (float)divisor_override.value();
+                            divisor = (scalar_t)divisor_override.value();
                         } else if (count_include_pad) {
                             // ATen alignment: window area clipped to (input + padding)
                             int64_t clip_h = std::min(h_start + kH, H_in + pH) - h_start;
                             int64_t clip_w = std::min(w_start + kW, W_in + pW) - w_start;
-                            divisor = (float)(clip_h * clip_w);
+                            divisor = (scalar_t)(clip_h * clip_w);
                         } else {
-                             divisor = (float)count;
+                             divisor = (scalar_t)count;
                         }
                         
                         int64_t out_idx = ((n * C + c) * H_out + h) * W_out + w;
@@ -175,14 +327,16 @@ Tensor avg_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_si
                 }
             }
         }
-    } else {
-        TP_THROW(NotImplementedError, "avg_pool2d only supports Float32");
-    }
+    });
     
     return out;
 }
 
 Tensor adaptive_avg_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& output_size) {
+    if (input.dim() == 3) {
+        // torch accepts unbatched (C,H,W): pool as a batch of one.
+        return adaptive_avg_pool2d_cpu(input.unsqueeze(0), output_size).squeeze(0);
+    }
     if (input.dim() != 4) TP_THROW(RuntimeError, "adaptive_avg_pool2d: Expected 4D input");
     
     int64_t N = input.size(0);
@@ -195,9 +349,9 @@ Tensor adaptive_avg_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& 
     
     Tensor out = Tensor::empty({N, C, H_out, W_out}, input.dtype(), input.device());
     
-    if (input.dtype() == DType::Float32) {
-        float* out_ptr = out.data_ptr<float>();
-        const float* in_ptr = input.data_ptr<float>();
+    TP_DISPATCH_FLOATING_TYPES_AND_LONG(input.dtype(), "adaptive_avg_pool2d", [&]() {
+        scalar_t* out_ptr = out.data_ptr<scalar_t>();
+        const scalar_t* in_ptr = input.data_ptr<scalar_t>();
         
         for (int64_t n = 0; n < N; ++n) {
             for (int64_t c = 0; c < C; ++c) {
@@ -214,7 +368,7 @@ Tensor adaptive_avg_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& 
                         
                         int64_t kW = w_end - w_start;
                         
-                        float sum = 0.0f;
+                        scalar_t sum = 0.0f;
                         for (int64_t ih = h_start; ih < h_end; ++ih) {
                             for (int64_t iw = w_start; iw < w_end; ++iw) {
                                 int64_t idx = ((n * C + c) * H_in + ih) * W_in + iw;
@@ -228,14 +382,16 @@ Tensor adaptive_avg_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& 
                 }
             }
         }
-    } else {
-         TP_THROW(NotImplementedError, "adaptive_avg_pool2d only supports Float32");
-    }
+    });
     
     return out;
 }
 
 Tensor adaptive_max_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& output_size) {
+    if (input.dim() == 3) {
+        // torch accepts unbatched (C,H,W): pool as a batch of one.
+        return adaptive_max_pool2d_cpu(input.unsqueeze(0), output_size).squeeze(0);
+    }
     if (input.dim() != 4) TP_THROW(RuntimeError, "adaptive_max_pool2d: Expected 4D input");
     
     int64_t N = input.size(0);
@@ -248,9 +404,9 @@ Tensor adaptive_max_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& 
 
     Tensor out = Tensor::empty({N, C, H_out, W_out}, input.dtype(), input.device());
 
-    if (input.dtype() == DType::Float32) {
-        float* out_ptr = out.data_ptr<float>();
-        const float* in_ptr = input.data_ptr<float>();
+    TP_DISPATCH_ALL_TYPES(input.dtype(), "adaptive_max_pool2d", [&]() {
+        scalar_t* out_ptr = out.data_ptr<scalar_t>();
+        const scalar_t* in_ptr = input.data_ptr<scalar_t>();
 
         for (int64_t n = 0; n < N; ++n) {
             for (int64_t c = 0; c < C; ++c) {
@@ -264,11 +420,11 @@ Tensor adaptive_max_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& 
                         int64_t w_start = (w * W_in) / W_out;
                         int64_t w_end = 1 + (((w + 1) * W_in) - 1) / W_out;
 
-                        float max_val = -std::numeric_limits<float>::infinity();
+                        scalar_t max_val = -std::numeric_limits<scalar_t>::infinity();
                         for (int64_t ih = h_start; ih < h_end; ++ih) {
                             for (int64_t iw = w_start; iw < w_end; ++iw) {
                                 int64_t idx = ((n * C + c) * H_in + ih) * W_in + iw;
-                                float val = in_ptr[idx];
+                                scalar_t val = in_ptr[idx];
                                 if ((val > max_val) || std::isnan(val)) max_val = val;
                             }
                         }
@@ -279,9 +435,7 @@ Tensor adaptive_max_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& 
                 }
             }
         }
-    } else {
-         TP_THROW(NotImplementedError, "adaptive_max_pool2d only supports Float32");
-    }
+    });
 
     return out;
 }
@@ -304,10 +458,10 @@ Tensor max_pool2d_backward_cpu(const Tensor& grad_output, const Tensor& input, c
 
     Tensor grad_input = Tensor::zeros_like(input);
     
-    if (input.dtype() == DType::Float32) {
-        float* grad_in_ptr = grad_input.data_ptr<float>();
-        const float* grad_out_ptr = grad_output.data_ptr<float>();
-        const float* in_ptr = input.data_ptr<float>();
+    TP_DISPATCH_ALL_TYPES(input.dtype(), "max_pool2d_backward", [&]() {
+        scalar_t* grad_in_ptr = grad_input.data_ptr<scalar_t>();
+        const scalar_t* grad_out_ptr = grad_output.data_ptr<scalar_t>();
+        const scalar_t* in_ptr = input.data_ptr<scalar_t>();
 
         for (int64_t n = 0; n < N; ++n) {
             for (int64_t c = 0; c < C; ++c) {
@@ -316,7 +470,7 @@ Tensor max_pool2d_backward_cpu(const Tensor& grad_output, const Tensor& input, c
                         int64_t h_start = h * sH - pH;
                         int64_t w_start = w * sW - pW;
                         
-                        float max_val = -std::numeric_limits<float>::infinity();
+                        scalar_t max_val = -std::numeric_limits<scalar_t>::infinity();
                         int64_t max_idx = -1;
 
                         for (int64_t kh = 0; kh < kH; ++kh) {
@@ -326,7 +480,7 @@ Tensor max_pool2d_backward_cpu(const Tensor& grad_output, const Tensor& input, c
                                 
                                 if (h_in_idx >= 0 && h_in_idx < H_in && w_in_idx >= 0 && w_in_idx < W_in) {
                                     int64_t idx = ((n * C + c) * H_in + h_in_idx) * W_in + w_in_idx;
-                                    float val = in_ptr[idx];
+                                    scalar_t val = in_ptr[idx];
                                     if (val > max_val) {
                                         max_val = val;
                                         max_idx = idx;
@@ -343,9 +497,7 @@ Tensor max_pool2d_backward_cpu(const Tensor& grad_output, const Tensor& input, c
                 }
             }
         }
-    } else {
-        TP_THROW(NotImplementedError, "max_pool2d_backward only supports Float32");
-    }
+    });
     return grad_input;
 }
 
@@ -366,9 +518,9 @@ Tensor avg_pool2d_backward_cpu(const Tensor& grad_output, const Tensor& input, c
 
     Tensor grad_input = Tensor::zeros_like(input);
 
-    if (input.dtype() == DType::Float32) {
-        float* grad_in_ptr = grad_input.data_ptr<float>();
-        const float* grad_out_ptr = grad_output.data_ptr<float>();
+    TP_DISPATCH_FLOATING_TYPES_AND_LONG(input.dtype(), "avg_pool2d_backward", [&]() {
+        scalar_t* grad_in_ptr = grad_input.data_ptr<scalar_t>();
+        const scalar_t* grad_out_ptr = grad_output.data_ptr<scalar_t>();
 
         for (int64_t n = 0; n < N; ++n) {
             for (int64_t c = 0; c < C; ++c) {
@@ -379,15 +531,15 @@ Tensor avg_pool2d_backward_cpu(const Tensor& grad_output, const Tensor& input, c
                         int64_t h_end = std::min(h_start + kH, H_in + pH);
                         int64_t w_end = std::min(w_start + kW, W_in + pW);
                         
-                        float divisor;
+                        scalar_t divisor;
                          // Recalculate divisor logic from forward
                         if (divisor_override.has_value()) {
-                            divisor = (float)divisor_override.value();
+                            divisor = (scalar_t)divisor_override.value();
                         } else if (count_include_pad) {
                             // ATen alignment: window area clipped to (input + padding)
                             int64_t clip_h = std::min(h_start + kH, H_in + pH) - h_start;
                             int64_t clip_w = std::min(w_start + kW, W_in + pW) - w_start;
-                            divisor = (float)(clip_h * clip_w);
+                            divisor = (scalar_t)(clip_h * clip_w);
                         } else {
                             // Calculate count excluding pad
                             int64_t count = 0;
@@ -400,11 +552,11 @@ Tensor avg_pool2d_backward_cpu(const Tensor& grad_output, const Tensor& input, c
                                     }
                                 }
                             }
-                            divisor = (float)count;
+                            divisor = (scalar_t)count;
                         }
 
                         int64_t out_idx = ((n * C + c) * H_out + h) * W_out + w;
-                        float grad_val = grad_out_ptr[out_idx] / divisor;
+                        scalar_t grad_val = grad_out_ptr[out_idx] / divisor;
 
                         for (int64_t kh = 0; kh < kH; ++kh) {
                             for (int64_t kw = 0; kw < kW; ++kw) {
@@ -421,9 +573,7 @@ Tensor avg_pool2d_backward_cpu(const Tensor& grad_output, const Tensor& input, c
                 }
             }
         }
-    } else {
-        TP_THROW(NotImplementedError, "avg_pool2d_backward only supports Float32");
-    }
+    });
     return grad_input;
 }
 
@@ -440,9 +590,9 @@ Tensor adaptive_avg_pool2d_backward_cpu(const Tensor& grad_output, const Tensor&
 
     Tensor grad_input = Tensor::zeros_like(input);
 
-    if (input.dtype() == DType::Float32) {
-        float* grad_in_ptr = grad_input.data_ptr<float>();
-        const float* grad_out_ptr = grad_output.data_ptr<float>();
+    TP_DISPATCH_FLOATING_TYPES_AND_LONG(input.dtype(), "adaptive_avg_pool2d_backward", [&]() {
+        scalar_t* grad_in_ptr = grad_input.data_ptr<scalar_t>();
+        const scalar_t* grad_out_ptr = grad_output.data_ptr<scalar_t>();
 
         for (int64_t n = 0; n < N; ++n) {
             for (int64_t c = 0; c < C; ++c) {
@@ -457,7 +607,7 @@ Tensor adaptive_avg_pool2d_backward_cpu(const Tensor& grad_output, const Tensor&
                         int64_t kW = w_end - w_start;
 
                         int64_t out_idx = ((n * C + c) * H_out + h) * W_out + w;
-                        float grad_val = grad_out_ptr[out_idx] / (kH * kW);
+                        scalar_t grad_val = grad_out_ptr[out_idx] / (kH * kW);
 
                         for (int64_t ih = h_start; ih < h_end; ++ih) {
                             for (int64_t iw = w_start; iw < w_end; ++iw) {
@@ -469,9 +619,7 @@ Tensor adaptive_avg_pool2d_backward_cpu(const Tensor& grad_output, const Tensor&
                 }
             }
         }
-    } else {
-        TP_THROW(NotImplementedError, "adaptive_avg_pool2d_backward only supports Float32");
-    }
+    });
     return grad_input;
 }
 
@@ -488,10 +636,10 @@ Tensor adaptive_max_pool2d_backward_cpu(const Tensor& grad_output, const Tensor&
 
     Tensor grad_input = Tensor::zeros_like(input);
 
-    if (input.dtype() == DType::Float32) {
-        float* grad_in_ptr = grad_input.data_ptr<float>();
-        const float* grad_out_ptr = grad_output.data_ptr<float>();
-        const float* in_ptr = input.data_ptr<float>();
+    TP_DISPATCH_ALL_TYPES(input.dtype(), "adaptive_max_pool2d_backward", [&]() {
+        scalar_t* grad_in_ptr = grad_input.data_ptr<scalar_t>();
+        const scalar_t* grad_out_ptr = grad_output.data_ptr<scalar_t>();
+        const scalar_t* in_ptr = input.data_ptr<scalar_t>();
 
         for (int64_t n = 0; n < N; ++n) {
             for (int64_t c = 0; c < C; ++c) {
@@ -504,13 +652,13 @@ Tensor adaptive_max_pool2d_backward_cpu(const Tensor& grad_output, const Tensor&
                         int64_t w_start = (w * W_in) / W_out;
                         int64_t w_end = 1 + (((w + 1) * W_in) - 1) / W_out;
 
-                        float max_val = -std::numeric_limits<float>::infinity();
+                        scalar_t max_val = -std::numeric_limits<scalar_t>::infinity();
                         int64_t max_idx = -1;
 
                         for (int64_t ih = h_start; ih < h_end; ++ih) {
                             for (int64_t iw = w_start; iw < w_end; ++iw) {
                                 int64_t idx = ((n * C + c) * H_in + ih) * W_in + iw;
-                                float val = in_ptr[idx];
+                                scalar_t val = in_ptr[idx];
                                 if ((val > max_val) || std::isnan(val)) {
                                     max_val = val;
                                     max_idx = idx;
@@ -526,9 +674,135 @@ Tensor adaptive_max_pool2d_backward_cpu(const Tensor& grad_output, const Tensor&
                 }
             }
         }
-    } else {
-        TP_THROW(NotImplementedError, "adaptive_max_pool2d_backward only supports Float32");
+    });
+    return grad_input;
+}
+
+// Upstream aten/src/ATen/native/AveragePool3d.cpp avg_pool3d_backward_out_frame.
+Tensor avg_pool3d_backward_cpu(const Tensor& grad_output, const Tensor& input,
+                               const std::vector<int64_t>& kernel_size,
+                               const std::vector<int64_t>& stride,
+                               const std::vector<int64_t>& padding,
+                               bool ceil_mode, bool count_include_pad,
+                               std::optional<int64_t> divisor_override) {
+    if (grad_output.dim() == 4 && input.dim() == 4) {
+        return avg_pool3d_backward_cpu(grad_output.unsqueeze(0), input.unsqueeze(0),
+                                       kernel_size, stride, padding, ceil_mode,
+                                       count_include_pad,
+                                       divisor_override).squeeze(0);
     }
+    if (grad_output.dim() != 5 || input.dim() != 5)
+        TP_THROW(RuntimeError, "avg_pool3d_backward: Expected 5D input and grad_output");
+    const int64_t N = input.size(0), C = input.size(1);
+    const int64_t D = input.size(2), H = input.size(3), W = input.size(4);
+    const int64_t oD = grad_output.size(2), oH = grad_output.size(3), oW = grad_output.size(4);
+    const int64_t kd = kernel_size[0], kh = kernel_size[1], kw = kernel_size[2];
+    const int64_t sd = stride[0], sh = stride[1], sw = stride[2];
+    const int64_t pd_ = padding[0], ph = padding[1], pw = padding[2];
+    Tensor grad_input = Tensor::zeros({N, C, D, H, W}, input.dtype(), input.device());
+    TP_DISPATCH_FLOATING_TYPES_AND_LONG(input.dtype(), "avg_pool3d_backward", [&]() {
+        scalar_t* gi = grad_input.data_ptr<scalar_t>();
+        const scalar_t* go = grad_output.data_ptr<scalar_t>();
+        for (int64_t n = 0; n < N; ++n)
+        for (int64_t c = 0; c < C; ++c)
+        for (int64_t od = 0; od < oD; ++od)
+        for (int64_t oh = 0; oh < oH; ++oh)
+        for (int64_t ow = 0; ow < oW; ++ow) {
+            // window bounds in padded coordinates first (pool_size includes
+            // padding when count_include_pad), then clip to the input.
+            int64_t d0 = od * sd - pd_, h0 = oh * sh - ph, w0 = ow * sw - pw;
+            int64_t d1 = std::min(d0 + kd, D + pd_), h1 = std::min(h0 + kh, H + ph), w1 = std::min(w0 + kw, W + pw);
+            int64_t pool_size = (d1 - d0) * (h1 - h0) * (w1 - w0);
+            int64_t cd0 = std::max(d0, int64_t(0)), ch0 = std::max(h0, int64_t(0)), cw0 = std::max(w0, int64_t(0));
+            int64_t cd1 = std::min(d1, D), ch1 = std::min(h1, H), cw1 = std::min(w1, W);
+            int64_t div = divisor_override.has_value() ? *divisor_override
+                          : count_include_pad ? pool_size
+                          : (cd1 - cd0) * (ch1 - ch0) * (cw1 - cw0);
+            if (div <= 0) continue;
+            const scalar_t g = go[((n * C + c) * oD + od) * oH * oW + oh * oW + ow] / static_cast<scalar_t>(div);
+            for (int64_t d = cd0; d < cd1; ++d)
+            for (int64_t h = ch0; h < ch1; ++h)
+            for (int64_t w = cw0; w < cw1; ++w)
+                gi[((n * C + c) * D + d) * H * W + h * W + w] += g;
+        }
+    });
+    return grad_input;
+}
+
+// Upstream ATen/native/AdaptiveAveragePooling3d.cpp: window bounds are
+// start = floor(i * in / out), end = ceil((i+1) * in / out).
+Tensor adaptive_avg_pool3d_cpu(const Tensor& input, const std::vector<int64_t>& output_size) {
+    if (input.dim() == 4)
+        return adaptive_avg_pool3d_cpu(input.unsqueeze(0), output_size).squeeze(0);
+    if (input.dim() != 5) TP_THROW(RuntimeError, "adaptive_avg_pool3d: Expected 5D input");
+    const int64_t N = input.size(0), C = input.size(1);
+    const int64_t D = input.size(2), H = input.size(3), W = input.size(4);
+    const int64_t oD = output_size[0], oH = output_size[1], oW = output_size[2];
+    Tensor out = Tensor::empty({N, C, oD, oH, oW}, input.dtype(), input.device());
+    TP_DISPATCH_FLOATING_TYPES_AND_LONG(input.dtype(), "adaptive_avg_pool3d", [&]() {
+        scalar_t* op = out.data_ptr<scalar_t>();
+        const scalar_t* ip = input.data_ptr<scalar_t>();
+        for (int64_t n = 0; n < N; ++n)
+        for (int64_t c = 0; c < C; ++c)
+        for (int64_t d = 0; d < oD; ++d) {
+            const int64_t ds = d * D / oD, de = (d + 1) * D / oD + ((d + 1) * D % oD > 0 ? 0 : 0);
+            const int64_t de_ = static_cast<int64_t>(std::ceil((d + 1) * D / static_cast<double>(oD)));
+            (void)de;
+            for (int64_t h = 0; h < oH; ++h) {
+                const int64_t hs = h * H / oH;
+                const int64_t he = static_cast<int64_t>(std::ceil((h + 1) * H / static_cast<double>(oH)));
+                for (int64_t w = 0; w < oW; ++w) {
+                    const int64_t ws = w * W / oW;
+                    const int64_t we = static_cast<int64_t>(std::ceil((w + 1) * W / static_cast<double>(oW)));
+                    scalar_t sum = scalar_t(0);
+                    for (int64_t z = ds; z < de_; ++z)
+                    for (int64_t y = hs; y < he; ++y)
+                    for (int64_t x = ws; x < we; ++x)
+                        sum += ip[((n * C + c) * D + z) * H * W + y * W + x];
+                    op[((n * C + c) * oD + d) * oH * oW + h * oW + w] =
+                        sum / static_cast<scalar_t>((de_ - ds) * (he - hs) * (we - ws));
+                }
+            }
+        }
+    });
+    return out;
+}
+
+Tensor adaptive_avg_pool3d_backward_cpu(const Tensor& grad_output, const Tensor& input) {
+    if (grad_output.dim() == 4 && input.dim() == 4)
+        return adaptive_avg_pool3d_backward_cpu(grad_output.unsqueeze(0),
+                                                input.unsqueeze(0)).squeeze(0);
+    if (grad_output.dim() != 5 || input.dim() != 5)
+        TP_THROW(RuntimeError, "adaptive_avg_pool3d_backward: Expected 5D input and grad_output");
+    const int64_t N = input.size(0), C = input.size(1);
+    const int64_t D = input.size(2), H = input.size(3), W = input.size(4);
+    const int64_t oD = grad_output.size(2), oH = grad_output.size(3), oW = grad_output.size(4);
+    Tensor grad_input = Tensor::zeros({N, C, D, H, W}, input.dtype(), input.device());
+    TP_DISPATCH_FLOATING_TYPES_AND_LONG(input.dtype(), "adaptive_avg_pool3d_backward", [&]() {
+        scalar_t* gi = grad_input.data_ptr<scalar_t>();
+        const scalar_t* go = grad_output.data_ptr<scalar_t>();
+        for (int64_t n = 0; n < N; ++n)
+        for (int64_t c = 0; c < C; ++c)
+        for (int64_t d = 0; d < oD; ++d) {
+            const int64_t ds = d * D / oD;
+            const int64_t de = static_cast<int64_t>(std::ceil((d + 1) * D / static_cast<double>(oD)));
+            for (int64_t h = 0; h < oH; ++h) {
+                const int64_t hs = h * H / oH;
+                const int64_t he = static_cast<int64_t>(std::ceil((h + 1) * H / static_cast<double>(oH)));
+                for (int64_t w = 0; w < oW; ++w) {
+                    const int64_t ws = w * W / oW;
+                    const int64_t we = static_cast<int64_t>(std::ceil((w + 1) * W / static_cast<double>(oW)));
+                    const scalar_t g =
+                        go[((n * C + c) * oD + d) * oH * oW + h * oW + w] /
+                        static_cast<scalar_t>((de - ds) * (he - hs) * (we - ws));
+                    for (int64_t z = ds; z < de; ++z)
+                    for (int64_t y = hs; y < he; ++y)
+                    for (int64_t x = ws; x < we; ++x)
+                        gi[((n * C + c) * D + z) * H * W + y * W + x] += g;
+                }
+            }
+        }
+    });
     return grad_input;
 }
 
@@ -539,6 +813,10 @@ TENSORPLAY_LIBRARY_IMPL(CPU, PoolingKernels) {
     m.impl("adaptive_max_pool2d", adaptive_max_pool2d_cpu);
     m.impl("max_pool2d_backward", max_pool2d_backward_cpu);
     m.impl("avg_pool2d_backward", avg_pool2d_backward_cpu);
+    m.impl("avg_pool3d", avg_pool3d_cpu);
+    m.impl("avg_pool3d_backward", avg_pool3d_backward_cpu);
+    m.impl("adaptive_avg_pool3d", adaptive_avg_pool3d_cpu);
+    m.impl("adaptive_avg_pool3d_backward", adaptive_avg_pool3d_backward_cpu);
     m.impl("adaptive_avg_pool2d_backward", adaptive_avg_pool2d_backward_cpu);
     m.impl("adaptive_max_pool2d_backward", adaptive_max_pool2d_backward_cpu);
 }

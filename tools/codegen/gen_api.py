@@ -117,6 +117,12 @@ def generate_header(funcs: list[NativeFunction]) -> str:
     ]
     seen_decl = set()
     for f in funcs:
+        if f.skip_implementation:
+            # The core Tensor method is the implementation (gen_tpx routes
+            # through it and generate_cpp skips the definition); re-declaring
+            # it here would collide with p10/include/Tensor.h -- a class may
+            # not declare the same member twice.
+            continue
         for variant in _variant_instances(f):
             key = method_signature(f, variant, declaration=True)
             if key in seen_decl:

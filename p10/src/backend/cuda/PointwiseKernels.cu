@@ -334,6 +334,13 @@ Tensor sin_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(sel
 Tensor cos_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, CosFunctor()); }
 Tensor tanh_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, TanhFunctor()); }
 Tensor sigmoid_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, SigmoidFunctor()); }
+// angle (torch angle_kernel for real input): 0 if x >= 0 else pi.
+struct AngleFunctor {
+    template<typename T> __device__ T operator()(T x) const {
+        return x >= T(0) ? T(0) : static_cast<T>(3.14159265358979323846);
+    }
+};
+Tensor angle_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, AngleFunctor()); }
 Tensor relu_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, ReluFunctor()); }
 Tensor gelu_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, GeluFunctor()); }
 Tensor silu_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, SiluFunctor()); }
@@ -1325,6 +1332,7 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, PointwiseKernels) {
     m.impl("frac", frac_kernel_cuda);
     
     m.impl("sigmoid", sigmoid_kernel_cuda);
+    m.impl("angle", angle_kernel_cuda);
     m.impl("relu", relu_kernel_cuda);
     m.impl("gelu", gelu_kernel_cuda_v2);
     m.impl("gelu_backward", gelu_backward_kernel_cuda);

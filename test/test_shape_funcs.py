@@ -59,7 +59,7 @@ class TestBroadcastTensors:
     def test_grad_flows_like_expand_backward(self):
         x = tp.arange(3).to(DType.float32)
         x.requires_grad = True
-        (out,) = tp.broadcast_tensors(x, (2, 3))
+        out = tp.broadcast_tensors(x, tp.ones([2, 3]))[0]
         out.sum().backward()
         assert x.grad.tolist() == [2.0, 2.0, 2.0]
 
@@ -67,7 +67,7 @@ class TestBroadcastTensors:
         x = arange_f(3, 1)
         x.requires_grad = True
         y = tp.ones([1, 4])
-        (out,) = tp.broadcast_tensors(x, (3, 4))
+        out = tp.broadcast_tensors(x, tp.ones([3, 4]))[0]
         _ = y
         (out * 1.0).sum().backward()
         assert x.grad.tolist() == [[4.0], [4.0], [4.0]]
@@ -112,9 +112,8 @@ class TestStack:
 
     def test_hstack_zero_dim(self):
         out = tp.hstack([scalar0(1), scalar0(2)])
-        assert out.tolist() == [3.0, 3.0] if False else True
         assert tuple(out.size()) == (2,)
-        assert out.tolist() == [3.0, 3.0]
+        assert out.tolist() == [1.0, 2.0]  # torch: values pass through
 
     def test_hstack_mixed_ndim_raises(self):
         with pytest.raises(RuntimeError):
@@ -128,7 +127,7 @@ class TestStack:
     def test_vstack_zero_dim(self):
         out = tp.vstack([scalar0(5), scalar0(7)])
         assert tuple(out.size()) == (2, 1)
-        assert [r[0] for r in out.tolist()] == [3.0, 3.0]
+        assert [r[0] for r in out.tolist()] == [5.0, 7.0]
 
     def test_row_stack_alias(self):
         a = [arange_f(3), arange_f(3)]
@@ -169,11 +168,11 @@ class TestTensorSplit:
     def test_list_points(self):
         pieces = tp.tensor_split(arange_f(7, 3), [2, 5])
         assert [p.size(0) for p in pieces] == [2, 3, 2]
-        assert pieces[0].tolist() == [[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]]
+        assert pieces[0].tolist() == [[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]]
 
     def test_unsorted_points_clamp(self):
         pieces = tp.tensor_split(arange_f(6), [4, 2])
-        assert [p.numel() for p in pieces] == [4, 0, 2]
+        assert [p.numel() for p in pieces] == [4, 0, 4]
 
     def test_over_split_empty_pieces(self):
         pieces = tp.tensor_split(arange_f(2), 4)
@@ -237,8 +236,10 @@ class TestTensordot:
         out = tp.tensordot(a, b, 1)
         out.sum().backward()
         assert a.grad.size(0) == 2 and a.grad.size(1) == 3
-        total = sum(sum(r) for r in b.tolist())
-        assert a.grad.tolist() == [[total] * 3] * 2
+        # d/da of sum(a @ b) is dOut @ b^T: each row of a.grad is the
+        # row-sums of b ([6.0, 22.0, 38.0]).
+        row_sums = [sum(r) for r in b.tolist()]
+        assert a.grad.tolist() == [list(row_sums) for _ in range(2)]
 
 
 class TestBlockDiag:
@@ -247,12 +248,14 @@ class TestBlockDiag:
         v = tp.arange(2).to(DType.float32) + 1
         s = scalar0(5)
         out = tp.block_diag(m, v, s)
-        assert tuple(out.size()) == (4, 4)
+        # ATen TensorShape.cpp block_diag: 1-D input becomes a (1, n)
+        # diagonal row block, so mixed shapes yield a rectangular result.
+        assert tuple(out.size()) == (4, 5)
         expect = [
-            [0.0, 1.0, 0.0, 0.0],
-            [2.0, 3.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0, 0.0],
-            [0.0, 0.0, 0.0, 5.0],
+            [0.0, 1.0, 0.0, 0.0, 0.0],
+            [2.0, 3.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 2.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 5.0],
         ]
         assert out.tolist() == expect
 

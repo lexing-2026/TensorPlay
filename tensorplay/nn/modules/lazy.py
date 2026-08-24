@@ -119,7 +119,7 @@ class LazyModuleMixin:
     This can cause the parameters of a network using lazy modules to be initialized differently
     than the parameters of a network without lazy modules as the order of parameter initializations,
     which often depends on a stateful random number generator, is different.
-    Check :doc:`/notes/randomness` for more details.
+    Check the randomness documentation for more details.
 
     Lazy modules can be serialized with a state dict like other modules. For example:
 

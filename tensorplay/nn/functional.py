@@ -340,24 +340,51 @@ def alpha_dropout(input, p=0.5, training=True, inplace=False):
         raise ValueError("dropout probability has to be between 0 and 1, but got {}".format(p))
     if not training or p == 0:
         return input
-    
-    alpha = 1.6732632423543772848170429916717
-    scale = 1.0507009873554804934193349852946
-    alpha_prime = -scale * alpha
-    
-    # Restore simplified implementation or best guess based on previous reads
-    # We lack the exact calculation of 'a' and 'b' from the lost lines
-    # For now, we will use a placeholder implementation that assumes standard Alpha Dropout behavior
-    # if parameters were available. Since we can't fully restore, we might raise an error or use standard dropout as fallback
-    # but to avoid breaking imports, we keep the signature.
-    
-    # mask = (tp.rand(input.shape, device=input.device) > p).to(input.dtype)
-    # ...
-    # return (input * mask + alpha_prime * (1 - mask)) * a + b
-    
-    # Fallback to normal dropout for now to avoid crash, but warn
-    # print("Warning: alpha_dropout is using standard dropout due to file restoration")
-    return dropout(input, p, training, inplace)
+
+    # Native fused forward (native_alpha_dropout) + generated backward via
+    # the saved mask; mirrors how F.dropout sits on native_dropout.
+    if p == 1:
+        # ATen _dropout_impl short-circuits p == 1 to multiply-by-zeros.
+        result = _C.zeros_like(input)
+    else:
+        result, _mask = _C.native_alpha_dropout(input, p)
+    if inplace:
+        return input.copy_(result)
+    return result
+
+
+def feature_dropout(input, p=0.5, training=False, inplace=False):
+    r"""Randomly zeroes entire channels (dim 1), port of
+    at::_feature_dropout: the Bernoulli noise has shape (N, C, 1..., ...)."""
+    if p < 0 or p > 1:
+        raise ValueError("dropout probability has to be between 0 and 1, but got {}".format(p))
+    if input.dim() < 2:
+        raise RuntimeError(
+            f"Feature dropout requires at least 2 dimensions in the input, "
+            f"but got {input.dim()}")
+    if not training or p == 0 or input.numel() == 0:
+        return input
+
+    result, _mask = _C.native_feature_dropout(input, p)
+    if inplace:
+        return input.copy_(result)
+    return result
+
+
+def dropout_(input, p=0.5, training=True):
+    r"""In-place version of :func:`dropout`."""
+    return dropout(input, p=p, training=training, inplace=True)
+
+
+def rrelu_(input, lower=1.0 / 8, upper=1.0 / 3, training=False):
+    r"""In-place version of :func:`rrelu`."""
+    return rrelu(input, lower=lower, upper=upper, training=training,
+                 inplace=True)
+
+
+def feature_dropout_(input, p=0.5, training=True):
+    r"""In-place version of :func:`feature_dropout`."""
+    return feature_dropout(input, p=p, training=training, inplace=True)
 
 # Pooling helpers
 def _pair(x):
@@ -1201,7 +1228,7 @@ def avg_pool1d(
     s = k if stride is None else _single(stride)[0]
     p = _single(padding)[0]
     out = avg_pool2d(
-        x.unsqueeze(3), (k, 1), (s, 1), (p, 1), ceil_mode,
+        x.unsqueeze(3), (k, 1), (s, 1), (p, 0), ceil_mode,
         count_include_pad, divisor_override,
     ).squeeze(3)
     return out.squeeze(0) if unbatched else out
@@ -1233,7 +1260,7 @@ def max_pool1d(
     p = _single(padding)[0]
     d = _single(dilation)[0]
     out = max_pool2d(
-        x.unsqueeze(3), (k, 1), (s, 1), (p, 1), (d, 1), ceil_mode,
+        x.unsqueeze(3), (k, 1), (s, 1), (p, 0), (d, 1), ceil_mode,
     ).squeeze(3)
     return out.squeeze(0) if unbatched else out
 
@@ -1459,7 +1486,8 @@ def feature_alpha_dropout(
 
 def cosine_similarity(x1: Tensor, x2: Tensor, dim: int = 1, eps: float = 1e-8) -> Tensor:
     r"""Returns cosine similarity between x1 and x2, computed along dim."""
-    denom = x1.norm([dim]).mul(x2.norm([dim])).clamp_min(eps)
+    denom = x1.norm([dim]).mul(x2.norm([dim]))
+    denom = tensorplay.clamp(denom, min=eps)
     return (x1 * x2).sum(dim) / denom
 
 
@@ -2162,20 +2190,24 @@ def multilabel_margin_loss(
     nframe, dim = x.shape[0], x.shape[-1]
     t64 = t.to(DType.int64)
     valid = t64.ge(0)
-    # entries after the first -1 are ignored (ATen breaks out of the loop)
+    # entries from the first -1 onward are ignored (ATen breaks out of the
+    # per-row loop when it sees -1)
     idxs = tensorplay.arange(t64.size(-1), dtype=DType.int64, device=x.device)
-    last_valid = _C.max(idxs.unsqueeze(0) * valid.reshape(-1).to(DType.int64).unsqueeze(0), dim=[0])
-    active = tensorplay.logical_and(idxs.unsqueeze(0) <= last_valid, valid.reshape(-1))
+    neg = t64.eq(-1)
+    big = tensorplay.full((nframe, t64.size(-1)), t64.size(-1),
+                          dtype=DType.int64, device=x.device)
+    first_neg = _C.min(tensorplay.where(neg, idxs.unsqueeze(0).expand(nframe, t64.size(-1)), big), dim=1, keepdim=True)[0]
+    active = idxs.unsqueeze(0) < first_neg          # (nframe, dim) bool
     active = active.reshape(valid.shape).to(x.dtype)
 
     # is_target[n, c] = 1 iff class c appears among the active targets of n
     t_safe = t64.clamp(min=0)
     hot = one_hot(t_safe, dim).to(x.dtype) * active.unsqueeze(-1)
-    is_target = _C.max(hot, dim=[1]).clamp(max=1.0)
+    is_target = _C.max(hot, dim=1)[0].clamp(max=1.0)
 
     # gather x at each target column: (N, S)
-    gid = tensorplay.arange(nframe, dtype=DType.int64, device=x.device) * dim + t_safe.reshape(-1)
-    x_t = tensorplay.embedding(x.contiguous().reshape(-1), gid).view(nframe, -1)
+    gid = tensorplay.arange(nframe, dtype=DType.int64, device=x.device).unsqueeze(1) * dim + t_safe
+    x_t = tensorplay.embedding(x.contiguous().reshape(-1), gid.reshape(-1)).view(nframe, -1)
 
     z = 1.0 - x_t.unsqueeze(-1) + x.unsqueeze(1)          # (N, S, C)
     h = z.clamp(min=0.0)
@@ -2472,15 +2504,32 @@ def _gs_unnormalize(coord, size, align_corners):
     return ((coord + 1) * size - 1) / 2
 
 
-def _gs_adjust(coord, max_val, padding_mode):
-    """clip_coordinates / reflect_coordinates (two folds, as ATen)."""
+def _gs_adjust(coord, size, padding_mode, align_corners=False):
+    """Port of ATen GridSampler.h compute_coordinates (border/reflection)."""
     if padding_mode == 'border':
-        return coord.clamp(0, max_val)
+        return coord.clamp(0, size - 1)
     if padding_mode == 'reflection':
-        for _ in range(2):
-            coord = tensorplay.where(coord < 0, -coord, coord)
-            coord = tensorplay.where(coord > max_val, 2 * max_val - coord, coord)
-        return coord
+        # fmod-based reflect over [lo/2, hi/2]; the reflected interval
+        # depends on align_corners, then a border clip (as ATen).
+        if align_corners:
+            lo, hi = 0, 2 * (size - 1)
+        else:
+            lo, hi = -1, 2 * size - 1
+        min_ = lo / 2
+        span = (hi - lo) / 2
+        c = coord - min_
+        c = tensorplay.where(c < 0, -c, c)
+        fq = c / span
+        fq_floor = tensorplay.floor(fq)
+        flips = fq_floor.to(DType.int64)
+        extra = fq - fq_floor
+        half = fq_floor / 2
+        c = tensorplay.where(half == tensorplay.floor(half),
+                             extra + min_, span - extra + min_)
+        return c.clamp(0, size - 1)
+    return coord
+def _vfloor(t):
+    return tensorplay.floor(t)
     return coord
 
 
@@ -2498,8 +2547,9 @@ def _grid_sample_gather(input, xs, ys, in_bounds):
     pos = ys_c * W + xs_c                                  # (N, Ho, Wo)
     if in_bounds is not None:
         pos = tensorplay.where(in_bounds, pos, pos * 0)
-    bidx = tensorplay.arange(N, dtype=i64, device=dev).view(N, 1, 1) * (C * H * W)
-    cidx = tensorplay.arange(C, dtype=i64, device=dev).view(1, C, 1) * (H * W)
+    # keep every operand rank-4: our broadcast kernel requires equal ranks.
+    bidx = tensorplay.arange(N, dtype=i64, device=dev).view(N, 1, 1, 1) * (C * H * W)
+    cidx = tensorplay.arange(C, dtype=i64, device=dev).view(1, C, 1, 1) * (H * W)
     gid = bidx + cidx + pos.unsqueeze(1)                   # (N, C, Ho, Wo)
     vals = tensorplay.embedding(input.contiguous().reshape(-1), gid.reshape(-1)).view(N, C, xs.shape[-2], xs.shape[-1])
     if in_bounds is not None:
@@ -2508,20 +2558,22 @@ def _grid_sample_gather(input, xs, ys, in_bounds):
 
 
 def _grid_sampler_2d(input, grid, interpolation_mode, padding_mode, align_corners):
+    if isinstance(padding_mode, str):
+        padding_mode = GRID_SAMPLE_PADDING_MODES.index(padding_mode)
     N, C, H_in, W_in = input.shape
     H_out, W_out = grid.shape[1], grid.shape[2]
     x = _gs_unnormalize(grid[..., 0], W_in, align_corners)
     y = _gs_unnormalize(grid[..., 1], H_in, align_corners)
-    if padding_mode != 'zeros':
-        x = _gs_adjust(x, W_in - 1, padding_mode)
-        y = _gs_adjust(y, H_in - 1, padding_mode)
+    if padding_mode != 0:
+        x = _gs_adjust(x, W_in, padding_mode, align_corners)
+        y = _gs_adjust(y, H_in, padding_mode, align_corners)
 
     if interpolation_mode == 1:  # nearest
         xi = tensorplay.floor(x).to(DType.int64)
         yi = tensorplay.floor(y).to(DType.int64)
         ib = tensorplay.logical_and(
             tensorplay.logical_and(xi >= 0, xi < W_in),
-            tensorplay.logical_and(yi >= 0, yi < H_in)) if padding_mode == 'zeros' else None
+            tensorplay.logical_and(yi >= 0, yi < H_in)) if padding_mode == 0 else None
         return _grid_sample_gather(input, xi, yi, ib)
 
     x0f = tensorplay.floor(x)
@@ -2545,7 +2597,7 @@ def _grid_sampler_2d(input, grid, interpolation_mode, padding_mode, align_corner
         ]
         out = None
         for cx, cy, wgt in corners:
-            ib = corner_mask(cx, cy) if padding_mode == 'zeros' else None
+            ib = corner_mask(cx, cy) if padding_mode == 0 else None
             v = _grid_sample_gather(input, cx, cy, ib)
             term = v * wgt.unsqueeze(1).to(v.dtype)
             out = term if out is None else out + term
@@ -2567,7 +2619,7 @@ def _grid_sampler_2d(input, grid, interpolation_mode, padding_mode, align_corner
         for k in range(4):      # cols (x offset k-1)
             cx = x0 + (k - 1)
             cy = y0 + (j - 1)
-            ib = corner_mask(cx, cy) if padding_mode == 'zeros' else None
+            ib = corner_mask(cx, cy) if padding_mode == 0 else None
             v = _grid_sample_gather(input, cx, cy, ib)
             wgt = (wxs[k] * wys[j]).unsqueeze(1).to(v.dtype)
             term = v * wgt
@@ -2631,14 +2683,16 @@ def grid_sample(
 
 
 def _grid_sampler_3d(input, grid, interpolation_mode, padding_mode, align_corners):
+    if isinstance(padding_mode, str):
+        padding_mode = GRID_SAMPLE_PADDING_MODES.index(padding_mode)
     N, C, D_in, H_in, W_in = input.shape
     D_out, H_out, W_out = grid.shape[1], grid.shape[2], grid.shape[3]
     x = _gs_unnormalize(grid[..., 2], W_in, align_corners)
     y = _gs_unnormalize(grid[..., 1], H_in, align_corners)
     z = _gs_unnormalize(grid[..., 0], D_in, align_corners)
-    if padding_mode != 'zeros':
-        x = _gs_adjust(x, W_in - 1, padding_mode)
-        y = _gs_adjust(y, H_in - 1, padding_mode)
+    if padding_mode != 0:
+        x = _gs_adjust(x, W_in, padding_mode, align_corners)
+        y = _gs_adjust(y, H_in, padding_mode, align_corners)
         z = _gs_adjust(z, D_in - 1, padding_mode)
 
     def gather3(xi, yi, zi, ib):
@@ -2673,7 +2727,7 @@ def _grid_sampler_3d(input, grid, interpolation_mode, padding_mode, align_corner
 
     if interpolation_mode == 1:  # nearest
         xi, yi, zi = x0, y0, z0
-        ib = bounds3(xi, yi, zi) if padding_mode == 'zeros' else None
+        ib = bounds3(xi, yi, zi) if padding_mode == 0 else None
         return gather3(xi, yi, zi, ib)
 
     out = None
@@ -2681,7 +2735,7 @@ def _grid_sampler_3d(input, grid, interpolation_mode, padding_mode, align_corner
         for dy in (0, 1):
             for dx in (0, 1):
                 cx, cy, cz = x0 + dx, y0 + dy, z0 + dz
-                ib = bounds3(cx, cy, cz) if padding_mode == 'zeros' else None
+                ib = bounds3(cx, cy, cz) if padding_mode == 0 else None
                 v = gather3(cx, cy, cz, ib)
                 wgt = (
                     ((wx if dx else 1 - wx) * (wy if dy else 1 - wy) * (wz if dz else 1 - wz))
@@ -2705,9 +2759,9 @@ def _vector_norm(vec, p, keepdim=False):
     at::norm(x1 - x2 + eps, p, innermost_dim, keepdim)."""
     dim = vec.dim() - 1
     if p == float("inf"):
-        return _C.max(vec.abs(), dim=[dim], keepdim=keepdim)
+        return _C.max(vec.abs(), dim=dim, keepdim=keepdim)[0]
     if p == -float("inf"):
-        return -_C.max((-vec.abs()), dim=[dim], keepdim=keepdim)
+        return -_C.max((-vec.abs()), dim=dim, keepdim=keepdim)[0]
     if p == 0:
         return vec.ne(0).to(DType.float32).sum(dim=[dim], keepdim=keepdim)
     return _C.norm(vec, [dim], float(p), keepdim)
@@ -3240,7 +3294,9 @@ def _max_pool2d_indices(x4, kernel_size, stride, padding, dilation, oH=None, oW=
         gid = base + pos.reshape(1, M * K)
         vals = tensorplay.embedding(x4.contiguous().reshape(-1), gid).view(P, M, K)
         vals = tensorplay.where(valid, vals, tensorplay.full_like(vals, float("-inf")))
-        am = _C.argmax(vals, 1, False)
+        # argmax over the kernel axis (last of (P, M, K)): one-hot select of
+        # the winning offset per output position.
+        am = _C.argmax(vals, 2, False)
 
         kar = _rng(K).view(1, 1, K)
         sel = am.unsqueeze(-1).eq(kar)
@@ -3300,7 +3356,7 @@ def max_pool1d_with_indices(
     p = _single(padding)[0]
     d = _single(dilation)[0]
     values, indices = max_pool2d_with_indices(
-        x.unsqueeze(3), (k, 1), (s, 1), (p, 1), (d, 1), ceil_mode
+        x.unsqueeze(3), (k, 1), (s, 1), (p, 0), (d, 1), ceil_mode
     )
     values = values.squeeze(3)
     indices = indices.squeeze(3)
@@ -3334,8 +3390,24 @@ def max_pool3d(
     sd, sh, sw = _triple(stride) if stride is not None else (kd, kh, kw)
     pd_, ph, pw = _triple(padding)
     dd, dh, dw = _triple(dilation)
-    m1 = _C.max_pool2d(x, (kh, kw), (sh, sw), (ph, pw), (dh, dw), ceil_mode)
-    out = max_pool1d(m1, kd, sd, pd_, dd, ceil_mode)
+    # Stage 1 pools (H, W) per depth plane: fold (N, C, D) into the batch so
+    # max_pool2d keeps its torch-mandated 4-D shape.
+    N, C, D, H, W = x.shape
+    m1 = _C.max_pool2d(
+        x.reshape(N * C * D, 1, H, W), (kh, kw), (sh, sw), (ph, pw),
+        (dh, dw), ceil_mode,
+    )
+    oH, oW = m1.shape[2], m1.shape[3]
+    # Stage 2 pools D: move depth last, fold everything else into batch.
+    mt = (
+        m1.reshape(N, C, D, oH, oW)
+        .permute(0, 1, 3, 4, 2)
+        .contiguous()
+        .reshape(N * C * oH * oW, 1, D)
+    )
+    out = max_pool1d(mt, kd, sd, pd_, dd, ceil_mode)
+    od = out.shape[-1]
+    out = out.reshape(N, C, oH, oW, od).permute(0, 1, 4, 2, 3).contiguous()
     return out.squeeze(0) if unbatched else out
 
 
@@ -3417,15 +3489,8 @@ def avg_pool3d(
     else:
         sd, sh, sw = _triple(stride)
     pd_, ph, pw = _triple(padding)
-    # divisor_override replaces the denominator entirely: pool with true
-    # means (count_include_pad semantics factorize per dimension) and rescale.
-    cip = True if divisor_override is not None else count_include_pad
-    m1 = avg_pool2d(x, (kh, kw), (sh, sw), (ph, pw), ceil_mode, cip)
-    m2 = avg_pool1d(m1, kd, sd, pd_, ceil_mode, cip)
-    out = m2
-    if divisor_override is not None:
-        out = out * (kd * kh * kw / divisor_override)
-    return out.squeeze(0) if unbatched else out
+    return _C.avg_pool3d(x, (kd, kh, kw), (sd, sh, sw), (pd_, ph, pw),
+                         ceil_mode, count_include_pad, divisor_override)
 
 
 def adaptive_avg_pool3d(input: Tensor, output_size) -> Tensor:
@@ -3433,9 +3498,8 @@ def adaptive_avg_pool3d(input: Tensor, output_size) -> Tensor:
     unbatched = input.dim() == 4
     x = input.unsqueeze(0) if unbatched else input
     od, oh, ow = _triple(output_size)
-    m1 = adaptive_avg_pool2d(x, (oh, ow))
-    out = adaptive_avg_pool1d(m1, od)
-    return out.squeeze(0) if unbatched else out
+    return _C.adaptive_avg_pool3d(x, (od, oh, ow)).squeeze(0) if unbatched \
+        else _C.adaptive_avg_pool3d(x, (od, oh, ow))
 
 
 def lp_pool3d(
@@ -3488,12 +3552,16 @@ def _adaptive_max_pool2d_wi(x4, oH, oW):
                 cv, ci = _C.topk(t, 1, -1, True, True, 0)
                 cv = cv.view(N, C, a, 1)
                 ci = ci.view(N, C, a, 1)
-                rv, ri = _C.topk(cv, 1, 2, True, True, 0)
-                ri = ri.view(N, C, 1, 1)
-                sel = ri.eq(tensorplay.arange(a, dtype=DType.int64, device=x4.device).view(1, 1, -1, 1))
-                col = tensorplay.where(sel, ci, ci * 0).sum(2).view(N, C, 1, 1)
+                # topk kernel is last-dim only: swap the window axis to last.
+                rv, ri = _C.topk(cv.transpose(3, 2), 1, -1, True, True, 0)
+                ri = ri.view(N, C)
+                sel = ri.view(N, C, 1, 1).eq(
+                    tensorplay.arange(a, dtype=DType.int64,
+                                      device=x4.device).view(1, 1, -1, 1))
+                col = tensorplay.where(sel, ci, ci * 0).sum(2).view(N, C)
                 vals.append(rv.view(N, C))
-                idxs.append((ri * b + col).view(N, C).to(DType.int64))
+                # ATen stores absolute plane-linear indices: y * W + x.
+                idxs.append((hs_list[i] + ri) * W + (ws_list[j] + col))
         v = tensorplay.stack(vals, dim=2).reshape(N, C, oH, oW)
         ix = tensorplay.stack(idxs, dim=2).reshape(N, C, oH, oW)
         return v, ix
@@ -3532,12 +3600,29 @@ def adaptive_max_pool1d_with_indices(input: Tensor, output_size, return_indices:
 
 
 def _adaptive_max_values_3d(x5, od, oh, ow):
-    parts = []
-    hs, he = _adaptive_window_bounds(x5.size(2), od)
+    """Returns ``(values, indices)``; torch-style linear index into CHW."""
+    N, C, D, H, W = x5.shape
+    hs, he = _adaptive_window_bounds(D, od)
+    vs, ixs = [], []
     for d in range(od):
-        sl = x5[:, :, hs[d]:he[d], :, :]
-        parts.append(_C.adaptive_max_pool2d(sl, [oh, ow]))
-    return tensorplay.stack(parts, dim=2)
+        dsz = he[d] - hs[d]
+        sl = x5[:, :, hs[d]:he[d], :, :].reshape(N * C * dsz, 1, H, W)
+        pv = _C.adaptive_max_pool2d(sl, [oh, ow]).reshape(N, C, dsz, oh, ow)
+        _, pi = _adaptive_max_pool2d_wi(sl.reshape(N * C * dsz, H, W).unsqueeze(1), oh, ow)
+        pi = pi.reshape(N, C, dsz, oh, ow)
+        # max is associative: reduce the depth window after pooling (H, W).
+        vs.append(_C.max(pv, dim=2)[0])
+        # argmax kernel mishandles non-last dims: bring dsz to the end.
+        zt = pv.transpose(2, 4).contiguous().reshape(N * C * oh * ow, dsz)
+        _, zt_idx = _C.topk(zt, 1, -1, True, True, 0)
+        # rows are (n, c, w_out, h_out) after the transpose: undo it.
+        z = zt_idx.reshape(N, C, ow, oh).transpose(2, 3)
+        sel = z.unsqueeze(2).eq(tensorplay.arange(dsz, dtype=DType.int64,
+                                                 device=x5.device).view(1, 1, -1, 1, 1))
+        # torch linear index spans the full CHW plane: (z*H + y)*W + x.
+        win_idx = (pi * sel).sum(2) + (hs[d] + z) * (H * W)
+        ixs.append(win_idx)
+    return tensorplay.stack(vs, dim=2), tensorplay.stack(ixs, dim=2)
 
 
 def adaptive_max_pool3d_with_indices(input: Tensor, output_size, return_indices: bool = True):
@@ -3550,15 +3635,8 @@ def adaptive_max_pool3d_with_indices(input: Tensor, output_size, return_indices:
     unbatched = input.dim() == 4
     x = input.unsqueeze(0) if unbatched else input
     N, C, D, H, W = x.shape
-    values = _adaptive_max_values_3d(x, od, oh, ow)
     with tensorplay.no_grad():
-        hs, he = _adaptive_window_bounds(D, od)
-        entries = []
-        for d in range(od):
-            sl = x[:, :, hs[d]:he[d], :, :]
-            _, idx2 = _adaptive_max_pool2d_wi(sl, oh, ow)
-            entries.append(idx2 + hs[d] * (H * W))
-        indices = tensorplay.stack(entries, dim=2)
+        values, indices = _adaptive_max_values_3d(x, od, oh, ow)
     if unbatched:
         return values.squeeze(0), indices.squeeze(0)
     return values, indices

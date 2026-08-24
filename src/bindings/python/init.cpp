@@ -203,8 +203,11 @@ PYBIND11_MODULE(_C, m) {
 
     // METH_FASTCALL function layer goes in LAST, after every pybind11
     // binding above: it only fills names nothing else bound and must never
-    // shadow a hand-written overload.
-    if (tensorplay::python_c::register_generated_cpython_functions(m.ptr()) != 0) {
-        throw py::error_already_set();
+    // shadow a hand-written overload.  TP_NO_FASTCALL=1 disables it (escape
+    // hatch while a py3.12-specific crash in the bridge is investigated).
+    if (getenv("TP_NO_FASTCALL") == nullptr) {
+        if (tensorplay::python_c::register_generated_cpython_functions(m.ptr()) != 0) {
+            throw py::error_already_set();
+        }
     }
 }

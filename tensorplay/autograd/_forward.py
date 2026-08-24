@@ -53,13 +53,23 @@ class DualTensor:
     # ---- helpers ---------------------------------------------------------
     @staticmethod
     def _coerce(other, like):
-        """Wraps scalars / tensors as constant duals for mixed arithmetic."""
+        """Wraps scalars / tensors as constant duals for mixed arithmetic.
+
+        Scalars are broadcast to the dual's primal shape because the native
+        forward kernels require operand/tangent shapes to match exactly.
+        """
         if isinstance(other, DualTensor):
             return other
         if isinstance(other, tensorplay.Tensor):
+            if other.shape != like.primal.shape:
+                other = other + tensorplay.zeros_like(like.primal)
+                if other.shape != like.primal.shape:
+                    raise ValueError(
+                        "forward AD: cannot broadcast tensor operand to the "
+                        "dual's primal shape")
             return DualTensor(other, tensorplay.zeros_like(other))
-        # Python scalar: broadcastable constants get an explicit zero tangent.
-        const = tensorplay.as_tensor(other, dtype=like.primal.dtype)
+        # Python scalar: materialize a constant dual over `like`'s layout.
+        const = tensorplay.full_like(like.primal, float(other))
         return DualTensor(const, tensorplay.zeros_like(const))
 
     def _binary(self, other, op):
@@ -110,7 +120,25 @@ class DualTensor:
         return self._unary(tensorplay._C.forward_neg)
 
     def __matmul__(self, other):
+        if isinstance(other, DualTensor):
+            # Product rule over the raw matmuls: supports the full
+            # vector/matrix broadcast semantics of `@` (unlike the fused
+            # 2-D forward_mm kernel).
+            primal = self.primal @ other.primal
+            tangent = (self.tangent @ other.primal) + (self.primal @ other.tangent)
+            return DualTensor._from_parts(primal, tangent)
+        if isinstance(other, tensorplay.Tensor):
+            return DualTensor._from_parts(self.primal @ other,
+                                          self.tangent @ other)
         return self._binary(other, tensorplay._C.forward_mm)
+
+    def __rmatmul__(self, other):
+        if isinstance(other, tensorplay.Tensor):
+            return DualTensor._from_parts(other @ self.primal,
+                                          other @ self.tangent)
+        raise NotImplementedError(
+            "forward AD: DualTensor.__rmatmul__ with a dual right operand is "
+            "not supported; reorder the product")
 
     # ---- named ops -------------------------------------------------------
     def exp(self):
@@ -161,6 +189,9 @@ class DualTensor:
         return DualTensor._from_parts(self.primal.detach(),
                                       self.tangent.detach())
 
+    def __getitem__(self, idx):
+        return DualTensor._from_parts(self.primal[idx], self.tangent[idx])
+
 
 def _unwrap(output):
     """Splits a function output into (primals, tangents) like jvp."""
@@ -203,3 +234,71 @@ def forward_jvp(func, inputs, v=None):
     duals = tuple(DualTensor(x, dv) for x, dv in zip(inputs_t, v_t))
     output = func(*duals)
     return _unwrap(output)
+
+
+def _as_plain_tuple(x):
+    if isinstance(x, tuple):
+        return x
+    if isinstance(x, list):
+        return tuple(x)
+    return (x,)
+
+
+def jacfwd(func, inputs):
+    """Computes the full Jacobian by forward-mode column scanning.
+
+    Mirrors ``torch.func.jacfwd`` loosely: returns one Jacobian block per
+    (output, input) pair with shape ``out_shape + in_shape``, computed with
+    num_cols(func cost) forward passes and no backward graph.
+    """
+    single = isinstance(inputs, tensorplay.Tensor)
+    ins = (inputs,) if single else tuple(inputs)
+
+    primals = func(*ins)
+    primal_tuple = _as_plain_tuple(primals)
+    for p in primal_tuple:
+        if not isinstance(p, tensorplay.Tensor):
+            raise NotImplementedError(
+                "jacfwd: outputs must be tensors (or tuples of tensors)")
+
+    jacobian_blocks = [[None] * len(ins) for _ in primal_tuple]
+    for i, x in enumerate(ins):
+        flat_x = x.reshape(-1)
+        in_numel = flat_x.numel()
+        for o, primal in enumerate(primal_tuple):
+            out_shape = tuple(primal.shape)
+            out_numel = primal.numel()
+            columns = []
+            for k in range(in_numel):
+                tangent = tensorplay.zeros_like(flat_x)
+                tangent[k] = 1.0
+                _, js = forward_jvp(
+                    func, ins,
+                    tuple(tensorplay.zeros_like(t) for t in ins[:i])
+                    + (tangent.reshape(x.shape),)
+                    + tuple(tensorplay.zeros_like(t) for t in ins[i + 1:]))
+                jt = _as_plain_tuple(js)[o]
+                # Column k of the Jacobian: d(output_e)/d(input_k).
+                columns.append(jt.reshape(-1))
+            if columns:
+                j_flat = tensorplay.stack(columns, dim=1)
+                jacobian_blocks[o][i] = j_flat.reshape(out_shape +
+                                                       tuple(x.shape))
+            else:
+                jacobian_blocks[o][i] = tensorplay.zeros(out_shape +
+                                                         tuple(x.shape))
+
+    # torch.autograd.functional.jacobian conventions:
+    #   single in/out            -> Tensor
+    #   one side a tuple         -> tuple of Tensors
+    #   both sides tuples        -> tuple of tuples (Jacobian[i][j])
+    multi_out = len(jacobian_blocks) > 1
+    multi_in = len(ins) > 1
+    if not multi_out and not multi_in:
+        return jacobian_blocks[0][0]
+    if not multi_in:
+        return tuple(jacobian_blocks[o][0] for o in range(len(jacobian_blocks)))
+    if not multi_out:
+        return tuple(jacobian_blocks[0][i] for i in range(len(ins)))
+    return tuple(tuple(_block(o, i) for i in range(len(ins)))
+                 for o in range(len(jacobian_blocks)))

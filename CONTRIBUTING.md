@@ -41,21 +41,39 @@ We want to make contributing to TensorPlay as easy and transparent as possible.
 ### Prerequisites
 - Python 3.9+
 - CMake 3.18+
-- C++17 compatible compiler (MSVC on Windows, GCC/Clang on Linux/macOS)
+- C++20 compatible compiler (MSVC on Windows, GCC/Clang on Linux/macOS)
 - CUDA Toolkit (optional, for GPU support)
 
 ### Installation
 
-```bash
-pip install -r requirements.txt
-python setup.py install
-```
-
-Or for development (editable install):
+TensorPlay is built with scikit-build-core through the standard PEP 517
+interface declared in `pyproject.toml`:
 
 ```bash
+# Install (add -v for verbose output)
+pip install .
+
+# CPU-only build (USE_*/BUILD_*/CMAKE_* env vars are forwarded to CMake,
+# mirroring pytorch's EnvVarForwarding)
+USE_CUDA=OFF pip install .
+
+# Editable install for development
 pip install -e .
+
+# Build a wheel
+python -m build --wheel
 ```
+
+Build requirements (scikit-build-core, cmake, ninja, ...) are fetched
+automatically in isolated PEP 517 builds. For `--no-build-isolation`
+installs, install them first:
+
+```bash
+pip install -r requirements-build.txt
+```
+
+`MAX_JOBS=N` caps build parallelism; the package
+version comes from `version.txt`.
 
 ## Running Tests
 

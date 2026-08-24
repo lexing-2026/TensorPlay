@@ -9,7 +9,9 @@ outside, matching torch's default FakeQuantize behavior.
 
 import tensorplay
 from tensorplay._C import (
+    dequantize_per_channel as _dequantize_per_channel,
     dequantize_per_tensor as _dequantize_per_tensor,
+    quantize_per_channel as _quantize_per_channel,
     quantize_per_tensor as _quantize_per_tensor,
 )
 from tensorplay.autograd.function import Function
@@ -35,11 +37,13 @@ class _FakeQuantizeSTE(Function):
         return y
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, grad_x, *_rest):
+        # The engine delivers one gradient slot per forward argument; only
+        # the first (w.r.t. ``x``) is differentiable here.
         (x,) = ctx.saved_tensors
         in_range = x.clamp(min=ctx.lo, max=ctx.hi) == x
         grad_input = tensorplay.where(
-            in_range, grad_output, tensorplay.zeros_like(grad_output))
+            in_range, grad_x, tensorplay.zeros_like(grad_x))
         return (grad_input, None, None, None, None)
 
 
@@ -58,7 +62,8 @@ class FakeQuantize(nn.Module):
     recalibrating.  With explicit scale/zero_point arguments it is stateless.
     """
 
-    def __init__(self, observer=None, scale=None, zero_point=None):
+    def __init__(self, observer=None, scale=None, zero_point=None,
+                 disable_observer=False):
         super().__init__()
         if observer is None:
             from .observer import MinMaxObserver
@@ -67,9 +72,13 @@ class FakeQuantize(nn.Module):
         self.scale = scale
         self.zero_point = zero_point
         self.frozen = scale is not None
+        # When True, calibration is suspended: forward keeps fake-quantizing
+        # with the current qparams but the observer sees no new data (torch's
+        # FakeQuantize.disable_observer).
+        self.disable_observer = bool(disable_observer)
 
     def record(self, x):
-        if not self.frozen:
+        if not self.frozen and not self.disable_observer:
             self.observer.record(x)
 
     def freeze(self):
@@ -87,3 +96,86 @@ class FakeQuantize(nn.Module):
         self.record(x)
         scale, zero_point = self.calculate_qparams()
         return fake_quantize_per_tensor(x, scale, zero_point)
+
+class PerChannelFakeQuantize(nn.Module):
+    """Per-channel fake quantization with range-masked STE.
+
+    ``ch_axis`` selects the quantized dimension; scale/zero_point may be
+    given explicitly (tensors of length n) or derived from a
+    PerChannelMinMaxObserver over incoming batches.
+    """
+
+    def __init__(self, ch_axis=0, observer=None, scales=None, zero_points=None,
+                 disable_observer=False):
+        super().__init__()
+        if observer is None:
+            from .observer import PerChannelMinMaxObserver
+            observer = PerChannelMinMaxObserver(ch_axis=ch_axis)
+        self.observer = observer
+        self.ch_axis = ch_axis
+        self.scales = scales
+        self.zero_points = zero_points
+        self.frozen = scales is not None
+        self.disable_observer = bool(disable_observer)
+
+    def record(self, x):
+        if not self.frozen and not self.disable_observer:
+            self.observer.record(x)
+
+    def calculate_qparams(self):
+        if self.scales is not None:
+            return self.scales, self.zero_points
+        return self.observer.calculate_qparams()
+
+    def forward(self, x):
+        self.record(x)
+        scales, zero_points = self.calculate_qparams()
+        return fake_quantize_per_channel(x, scales.float(),
+                                         zero_points.long(),
+                                         axis=self.ch_axis)
+
+
+def fake_quantize_per_channel(x, scales, zero_points, axis=0,
+                              quant_min=QUANT_MIN, quant_max=QUANT_MAX):
+    """Applies per-channel fake quantization with fixed affine parameters.
+
+    Gradient passes through where ``x`` lies inside its channel's
+    representable real range [qmin-zp, qmax-zp]*scale, else zero.
+    """
+    axis = axis % x.dim()
+    shape = [1] * x.dim()
+    shape[axis] = x.size(axis)
+    scales1 = scales.to(tensorplay.float32)
+    zps1 = zero_points.to(tensorplay.int64)
+
+    q = _quantize_per_channel(self=x, scales=scales1,
+                              zero_points=zps1, axis=axis)
+    y = _dequantize_per_channel(self=q, scales=scales1,
+                                zero_points=zps1, axis=axis)
+    # Broadcast per-channel real-domain bounds for the STE mask.
+    lo_b = ((quant_min - zps1.to(scales1.dtype)) * scales1).reshape(shape) \
+        .expand(x.shape).contiguous()
+    hi_b = ((quant_max - zps1.to(scales1.dtype)) * scales1).reshape(shape) \
+        .expand(x.shape).contiguous()
+
+    class _STE(Function):
+        @staticmethod
+        def forward(ctx, xin, lo, hi):
+            ctx.x = xin
+            ctx.lo = lo
+            ctx.hi = hi
+            return y
+
+        @staticmethod
+        def backward(ctx, grad_x, *_rest):
+            # In-range iff (x-lo)*(x-hi) <= 0; clamp() only takes scalars.
+            signed = (ctx.x - ctx.lo) * (ctx.x - ctx.hi)
+            in_range = signed <= tensorplay.zeros_like(signed)
+            return (tensorplay.where(in_range, grad_x,
+                                     tensorplay.zeros_like(grad_x)),
+                    None, None)
+
+    return _STE.apply(x, lo_b, hi_b)
+
+
+__all__.extend(["PerChannelFakeQuantize", "fake_quantize_per_channel"])

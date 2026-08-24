@@ -286,17 +286,25 @@ std::tuple<Tensor, Tensor> margin_ranking_loss_backward_kernel(
 
 Tensor hinge_embedding_loss_kernel(const Tensor& input, const Tensor& target,
                                    double margin, int64_t reduction) {
+    // ATen Loss.cpp:185 — loss = where(t != 1, clamp_min(margin - x, 0), 0)
+    //                        + where(t != -1, x, 0)
     Tensor z = zeros_like_shim(input);
-    Tensor loss = Tensor::where(target.eq(1), input,
-                  Tensor::where(target.eq(-1), clamp_min_shim(margin - input, Scalar(0.0)), z));
-    return loss_reduce(loss, reduction);
+    Tensor margin_part = Tensor::where(target.ne(1),
+                                       clamp_min_shim(margin - input, Scalar(0.0)), z);
+    Tensor self_part = Tensor::where(target.ne(-1), input, z);
+    return loss_reduce(margin_part + self_part, reduction);
 }
 
 Tensor hinge_embedding_loss_backward_kernel(const Tensor& grad_output, const Tensor& input,
                                             const Tensor& target, double margin, int64_t reduction) {
-    Tensor z = zeros_like_shim(input);
-    Tensor g = Tensor::where(target.eq(1), Tensor::ones_like(input),
-               Tensor::where(target.eq(-1), ((margin - input).gt(Scalar(0.0))).to(input.dtype()), z));
+    // d/dx of the ATen form above:
+    //   y == 1          -> 1
+    //   y == -1         -> (margin - x > 0) ? -1 : 0
+    //   otherwise       -> 1 + ((margin - x > 0) ? -1 : 0)
+    Tensor ones = Tensor::ones_like(input);
+    Tensor active = ((margin - input).gt(Scalar(0.0))).to(input.dtype());
+    Tensor g = Tensor::where(target.eq(1), ones,
+               Tensor::where(target.eq(-1), -active, ones - active));
     g = g * grad_output;
     return scale_grad(g, reduction, input.numel());
 }
@@ -320,9 +328,13 @@ Tensor cosine_embedding_loss_kernel(const Tensor& x1, const Tensor& x2,
     Tensor d = (n1 * n2).sqrt();
     Tensor cos = (x1 * x2).sum(std::vector<int64_t>{1}) / d;
     Tensor zero = zeros_like_shim(cos);
+    // ATen Loss.cpp cosine_embedding_loss_out:
+    //   t ==  1 -> 1 - cos
+    //   t == -1 -> max(0, cos - margin)
+    //   else    -> 0
     Tensor loss = Tensor::where(target.eq(1), zero + (1.0 - cos),
-                  Tensor::where(target.eq(-1), clamp_min_shim(cos - margin, Scalar(margin)),
-                                zero + clamp_min_shim(1.0 - cos - margin, Scalar(0.0))));
+                   Tensor::where(target.eq(-1), clamp_min_shim(cos - margin, Scalar(0.0)),
+                                 zero));
     return loss_reduce(loss, reduction);
 }
 
