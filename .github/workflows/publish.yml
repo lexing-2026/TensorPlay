@@ -1,0 +1,187 @@
+name: publish
+
+# Release orchestrator: on a v*.*.0 tag, build the configured wheel matrix,
+# validate every wheel, publish CPU wheels to PyPI via trusted publishing, and
+# publish every configured CUDA variant through GitHub Releases plus the
+# pypi-pages branch consumed by Cloudflare Pages.
+
+on:
+  push:
+    # Publish only major/minor releases: v1.0.0, v1.2.0, v2.0.0.
+    # Patch tags such as v1.2.1 do not start this workflow.
+    tags: ['v*.*.0']
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+permissions: read-all
+
+jobs:
+  define-wheel-matrix:
+    name: define-wheel-matrix
+    runs-on: ubuntu-latest
+    outputs:
+      cpu: ${{ steps.read-matrix.outputs.cpu }}
+      cuda: ${{ steps.read-matrix.outputs.cuda }}
+      variants: ${{ steps.read-matrix.outputs.variants }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          show-progress: false
+      - id: read-matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          cpu_matrix="$(jq -c '
+            [
+              .cpu_platforms[] as $platform |
+              .python_versions[] as $python |
+              {
+                platform: $platform.name,
+                runner: $platform.runner,
+                python: $python,
+                build_name: ("tensorplay-" + $platform.name + "-py" + ($python | gsub("\\."; "_")) + "-cpu")
+              }
+            ]
+          ' .github/wheel-platforms.json)"
+          cuda_matrix="$(jq -c --slurpfile variants .github/cuda-variants.json '
+            [
+              .cuda_platforms[] as $platform |
+              .python_versions[] as $python |
+              $variants[0][] as $cuda |
+              {
+                platform: $platform.name,
+                runner: $platform.runner,
+                python: $python,
+                variant: $cuda.variant,
+                toolkit: $cuda.toolkit,
+                build_name: ("tensorplay-" + $platform.name + "-" + $cuda.variant + "-py" + ($python | gsub("\\."; "_")))
+              }
+            ]
+          ' .github/wheel-platforms.json)"
+          echo "cpu=$cpu_matrix" >> "$GITHUB_OUTPUT"
+          echo "cuda=$cuda_matrix" >> "$GITHUB_OUTPUT"
+          echo "variants=$(jq -c . .github/cuda-variants.json)" >> "$GITHUB_OUTPUT"
+
+  # The release exists before any matrix job uploads its tested wheel. A
+  # manual dispatch from a branch simply skips this step and runs CI locally.
+  create-release:
+    name: create-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create release for an eligible tag
+        if: ${{ startsWith(github.ref, 'refs/tags/v') && endsWith(github.ref_name, '.0') }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists"
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --title "TensorPlay $GITHUB_REF_NAME" \
+              --generate-notes
+          fi
+
+  cpu-build:
+    name: ${{ matrix.build_name }}-build-test
+    needs:
+      - define-wheel-matrix
+      - create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.define-wheel-matrix.outputs.cpu) }}
+    permissions:
+      contents: write
+    uses: ./.github/workflows/_binary-build-test.yml
+    with:
+      build_name: ${{ matrix.build_name }}
+      build_environment: ${{ format('release-{0}-py{1}-cpu', matrix.platform, matrix.python) }}
+      runs_on: ${{ matrix.runner }}
+      python_version: ${{ matrix.python }}
+      upload_release: ${{ startsWith(github.ref, 'refs/tags/v') && endsWith(github.ref_name, '.0') }}
+
+  cuda-build:
+    name: ${{ matrix.build_name }}-build-test
+    needs:
+      - define-wheel-matrix
+      - create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.define-wheel-matrix.outputs.cuda) }}
+    permissions:
+      contents: write
+    uses: ./.github/workflows/_binary-build-test.yml
+    with:
+      build_name: ${{ matrix.build_name }}
+      build_environment: ${{ format('release-{0}-py{1}-{2}', matrix.platform, matrix.python, matrix.variant) }}
+      runs_on: ${{ matrix.runner }}
+      python_version: ${{ matrix.python }}
+      cuda: ${{ matrix.variant }}
+      cuda_toolkit: ${{ matrix.toolkit }}
+      upload_release: ${{ startsWith(github.ref, 'refs/tags/v') && endsWith(github.ref_name, '.0') }}
+
+  pypi-upload:
+    # CPU wheels remain on PyPI. Release assets are downloaded after every
+    # CPU build has tested and uploaded its own wheel.
+    if: startsWith(github.ref, 'refs/tags/v') && endsWith(github.ref_name, '.0')
+    needs: cpu-build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/tensorplay
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download CPU wheels from GitHub Release
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets dist
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir release-assets
+
+          shopt -s nullglob
+          for wheel in release-assets/*.whl; do
+            case "$wheel" in
+              *+cu*.whl) ;;
+              *) cp "$wheel" dist/ ;;
+            esac
+          done
+          cpu_wheels=(dist/*.whl)
+          if (("${#cpu_wheels[@]}" == 0)); then
+            echo "No CPU wheels found in release assets" >&2
+            exit 1
+          fi
+          printf 'CPU wheels:\n%s\n' "${cpu_wheels[@]}"
+
+      - name: Publish CPU wheels to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  cuda-upload:
+    # Publish one complete static index to the branch tracked by Pages.
+    if: startsWith(github.ref, 'refs/tags/v') && endsWith(github.ref_name, '.0')
+    needs:
+      - define-wheel-matrix
+      - cuda-build
+    uses: ./.github/workflows/_cuda-upload.yml
+    permissions:
+      contents: write
+    with:
+      build_environment: release
+      cuda_variants_json: ${{ needs.define-wheel-matrix.outputs.variants }}
+      pages_branch: pypi-pages
