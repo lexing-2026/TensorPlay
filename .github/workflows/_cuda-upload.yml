@@ -1,0 +1,124 @@
+name: cuda-upload
+
+# CUDA wheels are uploaded by their build-and-test jobs directly to the
+# current GitHub Release. This job downloads those release assets, builds one
+# static PEP 503 index for every configured variant, and publishes the complete
+# site to the pypi-pages branch. Cloudflare Pages follows that branch.
+
+on:
+  workflow_call:
+    inputs:
+      build_environment:
+        required: false
+        type: string
+        default: release
+        description: Upload environment identifier
+      cuda_variants_json:
+        required: false
+        type: string
+        default: '[{"variant":"cu124","toolkit":"12.4.1"},{"variant":"cu126","toolkit":"12.6.3"},{"variant":"cu130","toolkit":"13.0.2"}]'
+        description: JSON array from .github/cuda-variants.json
+      pages_branch:
+        required: false
+        type: string
+        default: pypi-pages
+        description: Branch tracked by Cloudflare Pages
+
+permissions: read-all
+
+jobs:
+  publish:
+    name: publish-cuda-indexes
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      BUILD_ENVIRONMENT: ${{ inputs.build_environment }}-cuda-upload
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+          show-progress: false
+
+      - name: Download CUDA wheels from GitHub Release
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir dist
+
+          shopt -s nullglob
+          cuda_wheels=(dist/*+cu*.whl)
+          if (("${#cuda_wheels[@]}" == 0)); then
+            echo "No CUDA wheels found in release assets" >&2
+            exit 1
+          fi
+          for wheel in dist/*.whl; do
+            case "$wheel" in
+              *+cu*.whl) ;;
+              *) rm -f "$wheel" ;;
+            esac
+          done
+          printf 'CUDA wheels:\n%s\n' "${cuda_wheels[@]}"
+
+      - name: Collect all CUDA release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq '.[] | select(.draft == false) | {tag_name: .tag_name, assets: [.assets[] | {name: .name, browser_download_url: .browser_download_url}]}' \
+            > "$RUNNER_TEMP/tensorplay-releases.jsonl"
+
+      - name: Build all CUDA PEP 503 indexes
+        shell: bash
+        env:
+          CUDA_VARIANTS_JSON: ${{ inputs.cuda_variants_json }}
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet packaging
+          mapfile -t variants < <(jq -r '.[].variant' <<< "$CUDA_VARIANTS_JSON")
+          variant_args=()
+          for variant in "${variants[@]}"; do
+            variant_args+=(--variant "$variant")
+          done
+          python tools/build_simple_index.py \
+            --dist-dir dist \
+            --output-dir release_site \
+            --release-tag "$GITHUB_REF_NAME" \
+            --release-base-url "https://github.com/${GITHUB_REPOSITORY}/releases/download" \
+            --releases-json "$RUNNER_TEMP/tensorplay-releases.jsonl" \
+            "${variant_args[@]}"
+
+      - name: Publish static indexes to the Pages branch
+        shell: bash
+        env:
+          PAGES_BRANCH: ${{ inputs.pages_branch }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git ls-remote --exit-code --heads origin "$PAGES_BRANCH" >/dev/null 2>&1; then
+            git fetch origin "$PAGES_BRANCH"
+            git worktree add pages-branch "$PAGES_BRANCH"
+          else
+            git worktree add --orphan -b "$PAGES_BRANCH" pages-branch
+          fi
+
+          find pages-branch -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf -- {} +
+          cp -a release_site/. pages-branch/
+          git -C pages-branch add --all
+
+          if git -C pages-branch diff --cached --quiet; then
+            echo "No static index changes to publish"
+          else
+            git -C pages-branch commit -m "Update CUDA indexes for $GITHUB_REF_NAME"
+            git -C pages-branch push origin "$PAGES_BRANCH"
+          fi

@@ -1,0 +1,126 @@
+name: binary-build-test
+
+# Reusable wheel build plus smoke-test workflow. The wheel stays inside the
+# runner, is tested there, and is uploaded directly to the GitHub Release only
+# for a release tag. No Actions artifact is created.
+
+on:
+  workflow_call:
+    inputs:
+      build_name:
+        required: true
+        type: string
+        description: Human-readable build name
+      build_environment:
+        required: true
+        type: string
+        description: Build environment identifier
+      runs_on:
+        required: true
+        type: string
+        description: GitHub runner label
+      python_version:
+        required: false
+        type: string
+        default: "3.11"
+      cuda:
+        required: false
+        type: string
+        default: "cpu"
+        description: Variant tag, cpu or a CUDA tag such as cu124
+      cuda_toolkit:
+        required: false
+        type: string
+        default: "12.4.1"
+        description: CUDA Toolkit version
+      upload_release:
+        required: false
+        type: boolean
+        default: false
+        description: Upload the tested wheel to the current GitHub Release
+
+jobs:
+  build-test:
+    name: ${{ inputs.build_name }}
+    runs-on: ${{ inputs.runs_on }}
+    permissions:
+      contents: write
+    timeout-minutes: 150
+    env:
+      BUILD_ENVIRONMENT: ${{ inputs.build_environment }}
+      SHA1: ${{ github.event.pull_request.head.sha || github.sha }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          show-progress: false
+
+      # Release tags pin the exact version. CUDA wheels use a local version
+      # suffix so CPU and CUDA files can coexist in one GitHub Release.
+      - name: Set TENSORPLAY_BUILD_VERSION on release tags
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        shell: bash
+        run: |
+          build_version="${GITHUB_REF_NAME#v}"
+          if [[ "${{ inputs.cuda }}" != "cpu" ]]; then
+            build_version="${build_version}+${{ inputs.cuda }}"
+          fi
+          echo "TENSORPLAY_BUILD_VERSION=${build_version}" >> "$GITHUB_ENV"
+          echo "TENSORPLAY_BUILD_NUMBER=1" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      # This installs the compiler/toolkit only. Free GitHub-hosted runners
+      # have no GPU, so CUDA kernels are never executed in this workflow.
+      - uses: jimver/cuda-toolkit@v0.2.36
+        if: ${{ inputs.cuda != 'cpu' }}
+        with:
+          cuda: ${{ inputs.cuda_toolkit }}
+
+      - name: Build wheel
+        shell: bash
+        env:
+          SKBUILD_CMAKE_DEFINE: ${{ inputs.cuda != 'cpu' && 'USE_CUDA=ON' || 'USE_CUDA=OFF' }}
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel
+
+      - name: Install built wheel
+        shell: bash
+        run: |
+          python -m pip install dist/*.whl numpy PyYAML typing-extensions
+
+      - name: Smoke test (CPU import plus tiny op)
+        if: ${{ inputs.cuda == 'cpu' }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import tensorplay as tp
+          x = tp.rand(4, 4)
+          y = x @ x
+          assert y.shape == (4, 4)
+          print("CPU smoke test ok:", getattr(tp, "__version__", "ok"))
+          PY
+
+      - name: Smoke test (CUDA import only)
+        if: ${{ inputs.cuda != 'cpu' }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import tensorplay as tp
+          print("CUDA wheel import ok:", getattr(tp, "__version__", "ok"))
+          PY
+
+      - name: Upload tested wheel to GitHub Release
+        if: ${{ inputs.upload_release && startsWith(github.ref, 'refs/tags/v') }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release upload "$GITHUB_REF_NAME" dist/*.whl \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
