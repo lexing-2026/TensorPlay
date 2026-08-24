@@ -1,0 +1,14 @@
+[
+  {
+    "variant": "cu124",
+    "toolkit": "12.4.1"
+  },
+  {
+    "variant": "cu126",
+    "toolkit": "12.6.3"
+  },
+  {
+    "variant": "cu130",
+    "toolkit": "13.0.2"
+  }
+]
