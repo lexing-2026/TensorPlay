@@ -16,12 +16,6 @@
 - name: t(Tensor self) -> Tensor
   self: grad.t()
 
-# contiguous returns the same values in dense layout; the gradient flows
-# through unchanged (torch gets this for free because its contiguous is a
-# composite that decomposes to clone).
-- name: contiguous(Tensor self) -> Tensor
-  self: grad
-
 # The complex optimizer path uses the same storage-reinterpretation views as
 # Torch.  Their backward operations are the inverse view and must remain
 # views, so higher-order optimizer differentiation does not insert a copy.
@@ -36,6 +30,15 @@
 # upstream, so 1 - p is never zero.
 - name: native_dropout(Tensor input, float p) -> (Tensor output, Tensor mask)
   input: grad * mask / (1 - p)
+
+# Alpha dropout keeps the kept-elements slope at `a`; the affine offset b
+# contributes no gradient. a = 1/sqrt((alpha^2 p + 1)(1 - p)) is recomputed
+# in the backward kernel from the scalar p.
+- name: native_alpha_dropout(Tensor input, float p) -> (Tensor output, Tensor mask)
+  input: _alpha_dropout_backward(grad, mask, p)
+
+- name: native_feature_dropout(Tensor input, float p) -> (Tensor output, Tensor mask)
+  input: _feature_dropout_backward(grad, mask, p)
 
 - name: add.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor
   self: grad
@@ -148,6 +151,19 @@
 - name: clamp(Tensor self, Scalar? min=None, Scalar? max=None) -> Tensor
   self: clamp_backward(grad, self, min, max)
 
+# Verbatim upstream formulas (tools/autograd/derivatives.yaml).
+- name: clamp_min(Tensor self, Scalar min) -> Tensor
+  self: where(self > min, grad, zeros_like(self))
+
+- name: clamp_max(Tensor self, Scalar max) -> Tensor
+  self: where(self < max, grad, zeros_like(self))
+
+- name: clamp_min_(Tensor(a!) self, Scalar min) -> Tensor(a!)
+  self: where(self > min, grad, zeros_like(self))
+
+- name: clamp_max_(Tensor(a!) self, Scalar max) -> Tensor(a!)
+  self: where(self < max, grad, zeros_like(self))
+
 - name: sub.Scalar(Tensor self, Scalar other, Scalar alpha=1) -> Tensor
   self: grad
 
@@ -163,9 +179,29 @@
 - name: view(Tensor self, int[] shape) -> Tensor
   self: grad.view(self.shape())
 
-- name: matmul(Tensor self, Tensor other) -> Tensor
-  self: matmul_backward_self(grad, self, other)
-  other: matmul_backward_other(grad, self, other)
+- name: clone(Tensor self, *, MemoryFormat? memory_format=None) -> Tensor
+  self: grad
+
+- name: contiguous(Tensor self, *, MemoryFormat memory_format=Contiguous) -> Tensor
+  self: grad
+
+- name: select(Tensor self, int dim, int index) -> Tensor
+  self: tensorplay::tpx::ops::select_backward(grad, self, dim, index)
+
+- name: slice(Tensor self, int dim=0, int? start=None, int? end=None, int step=1) -> Tensor
+  self: tensorplay::tpx::ops::slice_backward(grad, self, dim, start, end, step)
+
+# Upstream narrow is CompositeImplicitAutograd == slice(dim, start, start+length);
+# our kernels materialize a copy, backward reuses the slice formula verbatim.
+- name: narrow(Tensor self, int dim, int start, int length) -> Tensor
+  self: tensorplay::tpx::ops::slice_backward(grad, self, dim, start, start + length, 1)
+
+# matmul's backward branches on the input dims (dot / vec@mat / mat@vec /
+# batched), which the formula DSL cannot express.  The hand-written node in
+# tpx/include/ManualNodes.h (MatmulBackward, registered via
+# MANUAL_DERIVATIVES) composes recordable primitives so create_graph /
+# double-backward sees a graph through `@` -- mirroring upstream, whose
+# matmul_backward native calls dispatched at:: ops.
 
 - name: mm(Tensor self, Tensor mat2) -> Tensor
   self: grad.mm(mat2.t())
@@ -235,13 +271,32 @@
   self: -grad * result * result * result / 2
 
 - name: sum(Tensor self, *, ScalarType dtype=Undefined) -> Tensor
-  self: grad.expand(self.shape())
+  # zeros_like + broadcast add == grad expanded to self.shape(); written this
+  # way to avoid the ambiguous expand overloads in the generated header.
+  self: zeros_like(self) + grad
 
 - name: mean(Tensor self, *, ScalarType dtype=Undefined) -> Tensor
-  self: grad.expand(self.shape()) / self.numel()
+  # grad.expand(...) / N is equivalent; scalar div keeps broadcasting and
+  # avoids the ambiguous expand overloads in the generated autograd header.
+  self: grad / self.numel()
 
 - name: mean.dim(Tensor self, int[] dim, bool keepdim=false, *, ScalarType dtype=Undefined) -> Tensor
-  self: mean_dim_backward(grad, self, dim, keepdim)
+  # Recordable composition (unsqueeze reduced dims back in + scale by the
+  # kept-element count); the former opaque mean_dim_backward kernel broke
+  # double-backward the same way matmul's did.
+  self: tensorplay::tpx::broadcast_mean_backward(grad, self, dim, keepdim)
+
+# torch routes these through value_selecting_reduction_backward (an opaque
+# native that composes dispatched ops).  Same structure here: a recordable
+# tpx-level helper so create_graph sees through max/min(dim).
+- name: max.dim(Tensor self, int64_t dim, bool keepdim=False) -> (Tensor values, Tensor indices)
+  self: tensorplay::tpx::value_selecting_reduction_backward(grad, dim, indices, self, keepdim)
+
+- name: min.dim(Tensor self, int64_t dim, bool keepdim=False) -> (Tensor values, Tensor indices)
+  self: tensorplay::tpx::value_selecting_reduction_backward(grad, dim, indices, self, keepdim)
+
+- name: sum.dim_IntList(Tensor self, int[] dim, bool keepdim=false, *, ScalarType dtype=Undefined) -> Tensor
+  self: _sum_dim_backward(grad, self, dim, keepdim)
 
 - name: reshape(Tensor self, int[] shape) -> Tensor
   self: grad.reshape(self.shape())
@@ -263,6 +318,15 @@
 
 - name: max_pool2d(Tensor input, int[] kernel_size, int[] stride=[], int[] padding=[], int[] dilation=[], bool ceil_mode=false) -> Tensor
   input: max_pool2d_backward(grad, input, kernel_size, stride, padding, dilation, ceil_mode)
+
+- name: avg_pool2d(Tensor input, int[] kernel_size, int[] stride=[], int[] padding=[], bool ceil_mode=false, bool count_include_pad=true, int? divisor_override=None) -> Tensor
+  input: avg_pool2d_backward(grad, input, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override)
+
+- name: avg_pool3d(Tensor input, int[] kernel_size, int[] stride=[], int[] padding=[], bool ceil_mode=false, bool count_include_pad=true, int? divisor_override=None) -> Tensor
+  input: avg_pool3d_backward(grad, input, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override)
+
+- name: adaptive_avg_pool3d(Tensor input, int[] output_size) -> Tensor
+  input: adaptive_avg_pool3d_backward(grad, input)
 
 - name: adaptive_avg_pool2d(Tensor input, int[] output_size) -> Tensor
   input: adaptive_avg_pool2d_backward(grad, input)
@@ -344,7 +408,7 @@
   self: grad * result * (1 - result)
 
 - name: silu(Tensor self) -> Tensor
-  self: grad * self.sigmoid() * (self + 1)
+  self: grad * self.sigmoid() * (1 + self * (1 - self.sigmoid()))
 
 - name: tanh(Tensor self) -> Tensor
   self: grad * (1 - result * result)
@@ -704,3 +768,50 @@
 
 - name: diff(Tensor self, int n=1, int dim=-1, Tensor? prepend=None, Tensor? append=None) -> Tensor
   self: tensorplay::tpx::ops::neg(grad)
+
+- name: to_dense(Tensor self) -> Tensor
+  self: grad.sparse_mask(self)
+
+# --- 2026-08-24: torch 对齐补齐（silu 公式修正 + 双曲/反双曲/logit/expm1 新增）---
+# 公式逐条对照 third_party/pytorch/tools/autograd/derivatives.yaml（去 complex 分支）。
+# silu 旧式 `grad * self.sigmoid() * (self + 1)` 漏 (1 - sigmoid) 因子，
+# 有限差分验证: x=0.49 处旧值 0.9239 vs 真值 0.7354。
+
+- name: sinh(Tensor self) -> Tensor
+  self: grad * self.cosh()
+
+- name: cosh(Tensor self) -> Tensor
+  self: grad * self.sinh()
+
+- name: asinh(Tensor self) -> Tensor
+  self: grad * (self * self + 1).rsqrt()
+
+- name: acosh(Tensor self) -> Tensor
+  self: grad * (self * self - 1).rsqrt()
+
+- name: atanh(Tensor self) -> Tensor
+  self: grad / (1 - self * self)
+
+- name: logit(Tensor self, Scalar? eps=None) -> Tensor
+  self: grad / (self * (1 - self))
+
+- name: expm1(Tensor self) -> Tensor
+  self: grad * (result + 1)
+
+# ---- Shape & view alignment batch: formulas mirror upstream
+# tools/autograd/derivatives.yaml (`at::sum_to(grad, self.sym_sizes())`,
+# `repeat_backward(grad, repeats, self.sym_sizes())`); the helpers are ports
+# of at::sum_to_size / autograd::repeat_backward and live in ManualNodes.h.
+
+- name: expand(Tensor self, int[] size, *, bool implicit=False) -> Tensor
+  self: sum_to_size(grad, self.shape())
+
+- name: repeat(Tensor self, int[] repeats) -> Tensor
+  self: repeat_backward(grad, repeats, self.shape())
+
+- name: fill.Scalar(Tensor self, Scalar value) -> Tensor
+  self: tensorplay::tpx::ops::zeros_like(grad)
+
+- name: fill.Tensor(Tensor self, Tensor value) -> Tensor
+  self: tensorplay::tpx::ops::zeros_like(grad)
+  value: grad.sum()

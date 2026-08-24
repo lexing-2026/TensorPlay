@@ -76,7 +76,8 @@ inline void check_inputs_solver(const Tensor& A, const Tensor& B, bool left, con
 }
 
 std::vector<int64_t> batch_shape_of(const Tensor& t) {
-    return std::vector<int64_t>(t.shape().begin(), t.shape().end() - 2);
+    const Size t_shape = t.shape();
+    return std::vector<int64_t>(t_shape.begin(), t_shape.end() - 2);
 }
 
 int64_t matrix_stride_of(const Tensor& t) { return t.size(-1) * t.size(-2); }

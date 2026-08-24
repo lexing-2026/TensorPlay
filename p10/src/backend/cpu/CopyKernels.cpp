@@ -363,6 +363,9 @@ TENSORPLAY_LIBRARY_IMPL(CPU, CopyKernels) {
     m.impl("_nnz", sparse_nnz_cpu);
     m.impl("sparse_mm", sparse_mm_cpu);
     m.impl("sparse_sum", sparse_sum_cpu);
+    m.impl("sparse_add", sparse_add_cpu);
+    m.impl("sparse_mul", sparse_mul_cpu);
+    m.impl("spdiags", spdiags_cpu);
     m.impl("embedding", embedding_cpu);
     m.impl("embedding_dense_backward", embedding_dense_backward_cpu);
     m.impl("embedding_sparse_backward", embedding_sparse_backward_cpu);

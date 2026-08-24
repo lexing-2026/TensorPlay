@@ -1,0 +1,6 @@
+﻿tensorplay.nn.functional.max\_pool3d\_with\_indices
+===================================================
+
+.. currentmodule:: tensorplay.nn.functional
+
+.. autofunction:: max_pool3d_with_indices

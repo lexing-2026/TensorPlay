@@ -124,6 +124,19 @@ void Graph::registerOutput(ValueNode* v) {
     outputs.push_back(v);
 }
 
+static CustomOpExecutor& customOpExecutorSlot() {
+    static CustomOpExecutor executor;
+    return executor;
+}
+
+void setCustomOpExecutor(CustomOpExecutor executor) {
+    customOpExecutorSlot() = std::move(executor);
+}
+
+CustomOpExecutor& customOpExecutor() {
+    return customOpExecutorSlot();
+}
+
 std::vector<Tensor> Graph::execute(const std::vector<Tensor>& inputs) const {
     if (inputs.size() != this->inputs.size()) {
         throw std::runtime_error(
@@ -205,6 +218,7 @@ std::vector<Tensor> Graph::execute(const std::vector<Tensor>& inputs) const {
         }
 
         Tensor result;
+        bool handled_by_custom_op = false;
         if (node.op_type == "channels_last") {
             // TorchInductor's CUDA layout pass represents a logical NCHW
             // tensor with NHWC physical storage (see
@@ -660,17 +674,47 @@ std::vector<Tensor> Graph::execute(const std::vector<Tensor>& inputs) const {
                         : tpx::ops::add(product, value(node.inputs[2]));
                 }
             }
+        } else if (node.op_type == "custom_op") {
+            // User-defined operator: re-enter the Python dispatcher bridge
+            // (device dispatch + autograd preserved) with the tensor values.
+            const auto& executor = customOpExecutor();
+            if (!executor) {
+                throw std::runtime_error(
+                    "Stax Graph::execute found a custom_op node but no "
+                    "executor is installed");
+            }
+            std::vector<Tensor> op_inputs;
+            op_inputs.reserve(node.inputs.size());
+            for (const ValueNode* input : node.inputs) {
+                op_inputs.push_back(value(input));
+            }
+            std::vector<Tensor> op_outputs =
+                executor(node.getAttr<std::string>("op_name"), op_inputs);
+            if (op_outputs.size() != node.outputs.size()) {
+                throw std::runtime_error(
+                    "custom op '" + node.name + "' produced " +
+                    std::to_string(op_outputs.size()) + " outputs but the "
+                    "native graph reserved " +
+                    std::to_string(node.outputs.size()));
+            }
+            for (size_t oi = 0; oi < op_outputs.size(); ++oi) {
+                env[node.outputs[oi]->id] = std::move(op_outputs[oi]);
+            }
+            release_inputs(node);
+            handled_by_custom_op = true;
         } else {
             throw std::runtime_error("Stax Graph::execute does not support op: " + node.op_type);
         }
 
-        if (node.outputs.size() != 1) {
-            throw std::runtime_error(
-                "Stax native operation has multiple outputs but no output handler: " +
-                node.op_type);
+        if (!handled_by_custom_op) {
+            if (node.outputs.size() != 1) {
+                throw std::runtime_error(
+                    "Stax native operation has multiple outputs but no output handler: " +
+                    node.op_type);
+            }
+            env[node.outputs[0]->id] = std::move(result);
+            release_inputs(node);
         }
-        env[node.outputs[0]->id] = std::move(result);
-        release_inputs(node);
     }
 
     std::vector<Tensor> result;

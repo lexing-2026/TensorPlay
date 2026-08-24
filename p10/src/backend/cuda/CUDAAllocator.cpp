@@ -170,12 +170,28 @@ public:
             }
         }
 
+        // Raw cudaMalloc is a "potentially unsafe" API: while a Global-mode
+        // capture is open anywhere in the process it would abort the capture
+        // with cudaErrorStreamCaptureUnsupported (error 900), yet segments
+        // must grow mid-capture to serve graph-pool allocations.  Mirror
+        // torch's CUDAStreamCaptureModeGuard by relaxing this thread's
+        // capture mode around the driver call only.
+        cudaStreamCaptureMode previous_mode = cudaStreamCaptureModeGlobal;
+        const bool relax = capture_.pool_id != 0;
+        if (relax) {
+            cudaStreamCaptureMode relaxed = cudaStreamCaptureModeRelaxed;
+            (void)cudaThreadExchangeStreamCaptureMode(&relaxed);
+            previous_mode = relaxed;
+        }
         void* ptr = nullptr;
         cudaError_t error = cudaMalloc(&ptr, rounded);
         if (error == cudaErrorMemoryAllocation) {
             (void)cudaGetLastError();
             emptyCacheDevice(device);
             error = cudaMalloc(&ptr, rounded);
+        }
+        if (relax) {
+            cudaThreadExchangeStreamCaptureMode(&previous_mode);
         }
         if (error != cudaSuccess) {
             size_t free_bytes = 0;

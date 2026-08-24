@@ -4,6 +4,8 @@
 
 #include <cuda_runtime.h>
 #include <vector>
+#include <cuda_runtime.h>
+#include <vector>
 
 namespace tensorplay {
 namespace cuda {
@@ -215,11 +217,115 @@ Tensor dequantize_per_channel_cuda(const Tensor& self, const Tensor& scales,
     return out;
 }
 
+__global__ void quantized_linear_kernel(int64_t total, int64_t k_size,
+                                        int64_t out_features,
+                                        const int8_t* x, const int8_t* w,
+                                        double input_scale,
+                                        int64_t input_zero_point,
+                                        const float* w_scales,
+                                        const int64_t* w_zps,
+                                        const float* bias, float* out) {
+    const int64_t e = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (e >= total) return;
+    const int64_t m = e / out_features;
+    const int64_t n = e - m * out_features;
+    const int8_t* x_row = x + m * k_size;
+    const int8_t* w_row = w + n * k_size;
+    const int64_t w_zp = w_zps[n];
+    int64_t acc = 0;
+    for (int64_t k = 0; k < k_size; ++k) {
+        acc += static_cast<int64_t>(x_row[k] - input_zero_point) *
+               static_cast<int64_t>(w_row[k] - w_zp);
+    }
+    out[e] = static_cast<float>(input_scale) * w_scales[n] *
+                 static_cast<float>(acc) +
+             bias[n];
+}
+
+Tensor quantized_linear_cuda(const Tensor& input, const Tensor& weight,
+                             double input_scale, int64_t input_zero_point,
+                             const Tensor& weight_scales,
+                             const Tensor& weight_zero_points,
+                             std::optional<Tensor> bias) {
+    // Fused Int8 GEMM with per-channel weight requantization; one thread per
+    // (m, n) output element streams both operand rows over K.
+    if (input.dtype() != DType::Int8 || weight.dtype() != DType::Int8) {
+        TP_THROW(TypeError,
+                 "quantized_linear(): activations and weights must be Int8");
+    }
+    if (input.dim() != 2 || weight.dim() != 2) {
+        TP_THROW(ValueError,
+                 "quantized_linear(): expected 2-D [M,K] activations and "
+                 "[N,K] weights");
+    }
+    if (!(input_scale > 0.0)) {
+        TP_THROW(ValueError, "quantized_linear(): scale must be positive");
+    }
+    if (input.size(1) != weight.size(1)) {
+        TP_THROW(ValueError,
+                 "quantized_linear(): incompatible K dimensions (" +
+                     std::to_string(input.size(1)) + " vs " +
+                     std::to_string(weight.size(1)) + ")");
+    }
+    const int64_t out_features = weight.size(0);
+    if (weight_scales.dim() != 1 || weight_scales.size(0) != out_features ||
+        weight_zero_points.shape() != weight_scales.shape()) {
+        TP_THROW(ValueError,
+                 "quantized_linear(): weight scales/zero_points must be 1-D "
+                 "of length out_features");
+    }
+
+    Tensor x = input.contiguous();
+    Tensor w = weight.contiguous();
+    Tensor sc = weight_scales.to(DType::Float32).contiguous();
+    Tensor zp = weight_zero_points.to(DType::Int64).contiguous();
+    Tensor zps_host = zp.to(Device(DeviceType::CPU));
+    const int64_t* host_zps = zps_host.data_ptr<int64_t>();
+    for (int64_t n = 0; n < out_features; ++n) {
+        if (host_zps[n] < -128 || host_zps[n] > 127) {
+            TP_THROW(ValueError,
+                     "quantized_linear(): zero_point out of the Int8 range");
+        }
+    }
+
+    Tensor bias_f;
+    if (bias.has_value()) {
+        if (!isFloatingType(bias->dtype()) || bias->dim() != 1 ||
+            bias->size(0) != out_features) {
+            TP_THROW(ValueError,
+                     "quantized_linear(): bias must be a 1-D floating tensor "
+                     "of length out_features");
+        }
+        bias_f = bias->to(DType::Float32).contiguous();
+    } else {
+        bias_f = Tensor::zeros({out_features}, DType::Float32, x.device());
+    }
+
+    const int64_t m_size = x.size(0);
+    const int64_t k_size = x.size(1);
+    Tensor out = Tensor::empty({m_size, out_features}, DType::Float32,
+                               x.device());
+    const int64_t total = m_size * out_features;
+    if (total == 0) return out;
+
+    const cudaStream_t stream = getCurrentCUDAStream().stream();
+    const int threads = 128;
+    const int blocks = static_cast<int>((total + threads - 1) / threads);
+    quantized_linear_kernel<<<blocks, threads, 0, stream>>>(
+        total, k_size, out_features, x.data_ptr<int8_t>(),
+        w.data_ptr<int8_t>(), input_scale, input_zero_point,
+        sc.data_ptr<float>(), zp.data_ptr<int64_t>(),
+        bias_f.data_ptr<float>(), out.data_ptr<float>());
+    checkCuda(cudaGetLastError(), "CUDA quantized_linear kernel");
+    return out;
+}
+
 TENSORPLAY_LIBRARY_IMPL(CUDA, QuantKernels) {
     m.impl("quantize_per_tensor", quantize_per_tensor_cuda);
     m.impl("dequantize_per_tensor", dequantize_per_tensor_cuda);
     m.impl("quantize_per_channel", quantize_per_channel_cuda);
     m.impl("dequantize_per_channel", dequantize_per_channel_cuda);
+    m.impl("quantized_linear", quantized_linear_cuda);
 }
 
 } // namespace cuda

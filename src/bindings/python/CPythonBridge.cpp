@@ -19,9 +19,12 @@ namespace python_c {
 
 namespace {
 
-[[noreturn]] void type_error(const char* op, int index, const char* want) {
+// torch python_arg_parser parity suffix: "... must be int, not tuple".
+[[noreturn]] void type_error(PyObject* obj, const char* op, int index,
+                             const char* want) {
+    const char* got = obj ? Py_TYPE(obj)->tp_name : "None";
     std::string msg = std::string(op) + ": argument " + std::to_string(index)
-                      + " must be " + want;
+                      + " must be " + want + ", not " + got;
     throw std::invalid_argument(msg);
 }
 
@@ -105,7 +108,7 @@ Tensor as_tensor(PyObject* obj, const char* op, int idx) {
     try {
         return py::reinterpret_borrow<py::object>(obj).cast<Tensor>();
     } catch (const py::cast_error&) {
-        type_error(op, idx, "a Tensor");
+        type_error(obj, op, idx, "a Tensor");
     }
 }
 
@@ -120,14 +123,14 @@ Scalar as_scalar(PyObject* obj, const char* op, int idx) {
         try {
             return py::reinterpret_borrow<py::object>(obj).cast<Scalar>();
         } catch (const py::cast_error&) {
-            type_error(op, idx, "a Scalar");
+            type_error(obj, op, idx, "a Scalar");
         }
     }
     if (PyFloat_Check(obj)) return Scalar(PyFloat_AS_DOUBLE(obj));
     try {
         return py::reinterpret_borrow<py::object>(obj).cast<Scalar>();
     } catch (const py::cast_error&) {
-        type_error(op, idx, "a Scalar");
+        type_error(obj, op, idx, "a Scalar");
     }
 }
 
@@ -135,12 +138,12 @@ DType as_dtype(PyObject* obj, const char* op, int idx) {
     try {
         return py::reinterpret_borrow<py::object>(obj).cast<DType>();
     } catch (const py::cast_error&) {
-        type_error(op, idx, "a DType");
+        type_error(obj, op, idx, "a DType");
     }
 }
 
 int64_t as_int(PyObject* obj, const char* op, int idx) {
-    if (!PyIndex_Check(obj)) type_error(op, idx, "an integer");
+    if (!PyIndex_Check(obj)) type_error(obj, op, idx, "an integer");
     // AsSsize_t with an error-raising sentinel: without the check an
     // out-of-range value would silently saturate and the kernel would run
     // with garbage before anyone noticed the pending exception.
@@ -158,7 +161,7 @@ double as_double(PyObject* obj, const char* op, int idx) {
     double v = PyFloat_AsDouble(obj);
     if (v == -1.0 && PyErr_Occurred()) {
         PyErr_Clear();
-        type_error(op, idx, "a float");
+        type_error(obj, op, idx, "a float");
     }
     return v;
 }
@@ -179,7 +182,7 @@ const Tensor& tensor_cref_slow(PyObject* obj) {
         if (g_tensor_type == nullptr) g_tensor_type = Py_TYPE(obj);
         return t;
     } catch (const py::cast_error&) {
-        type_error("op", 0, "a Tensor");
+        type_error(obj, "op", 0, "a Tensor");
     }
 }
 
@@ -189,7 +192,7 @@ Tensor& tensor_mref_slow(PyObject* obj) {
         if (g_tensor_type == nullptr) g_tensor_type = Py_TYPE(obj);
         return t;
     } catch (const py::cast_error&) {
-        type_error("op", 0, "a Tensor");
+        type_error(obj, "op", 0, "a Tensor");
     }
 }
 
@@ -232,7 +235,7 @@ bool tpx_py_bool(PyObject* obj) {
     // enforced (and upstream's PythonArgParser): truthiness of arbitrary
     // objects is a silent behavior change.
     if (PyBool_Check(obj)) return obj == Py_True;
-    type_error("op", 0, "a bool");
+    type_error(obj, "op", 0, "a bool");
 }
 std::optional<int64_t> tpx_py_opt_int64(PyObject* obj) {
     if (obj == Py_None) return std::nullopt;
@@ -255,7 +258,7 @@ std::optional<Device> tpx_py_opt_device(PyObject* obj) {
     try {
         return py::cast<Device>(py::reinterpret_borrow<py::object>(obj));
     } catch (const py::cast_error&) {
-        type_error("op", 0, "a Device");
+        type_error(obj, "op", 0, "a Device");
     }
 }
 std::vector<int64_t> tpx_py_intlist(PyObject* obj) {
@@ -289,6 +292,185 @@ std::string tpx_py_string(PyObject* obj) {
     const char* s = PyUnicode_AsUTF8(obj);
     if (!s) { PyErr_Clear(); throw std::invalid_argument("expected a string"); }
     return std::string(s);
+}
+std::optional<std::string> tpx_py_opt_string(PyObject* obj) {
+    if (obj == Py_None) return std::nullopt;
+    return tpx_py_string(obj);
+}
+std::optional<std::vector<int64_t>> tpx_py_opt_intlist(PyObject* obj) {
+    if (obj == Py_None) return std::nullopt;
+    return tpx_py_intlist(obj);
+}
+
+// ---------------------------------------------------------------------------
+// eager typed validation: torch python_arg_parser parity for error wording
+// ---------------------------------------------------------------------------
+
+namespace {
+
+[[noreturn]] void arg_type_error(const char* op_name, const char* name,
+                                 int index, const char* want, PyObject* obj) {
+    std::string msg = std::string(op_name) + "(): argument '" + (name ? name : "?")
+                      + "'";
+    // Upstream annotates a position only for arguments that can be passed
+    // positionally; kw-only args get the bare form.
+    if (index >= 0) {
+        msg += " (position " + std::to_string(index + 1) + ")";
+    }
+    msg += std::string(" must be ") + want + ", not "
+           + (obj ? Py_TYPE(obj)->tp_name : "NoneType");
+    throw std::invalid_argument(msg);
+}
+
+bool obj_is_tensor(PyObject* obj) {
+    if (g_tensor_type && Py_TYPE(obj) == g_tensor_type) return true;
+    try {
+        return py::isinstance<tensorplay::Tensor>(py::handle(obj));
+    } catch (...) {
+        return false;
+    }
+}
+
+bool seq_item_is_number(PyObject* o) {
+    // Python numbers plus the registered tensorplay.Scalar wrapper, which
+    // generated wrappers (e.g. addmm's beta/alpha) pass through directly.
+    if (PyIndex_Check(o) || PyFloat_Check(o)) return true;
+    try {
+        return py::isinstance<tensorplay::Scalar>(py::handle(o));
+    } catch (...) {
+        return false;
+    }
+}
+
+// INT_LIST / FLOAT_LIST upstream semantics: a bare scalar folds to a
+// singleton list, otherwise only tuple/list qualify -- plus tensorplay._C.Size,
+// a pybind sequence that mirrors torch.Size (a tuple subclass upstream).
+bool check_list(PyObject* obj, bool integral) {
+    bool single = integral ? PyIndex_Check(obj) != 0 : seq_item_is_number(obj);
+    if (single) return true;
+    if (!PySequence_Check(obj)) return false;
+    PyObject* seq = PySequence_Fast(obj, nullptr);
+    if (!seq) { PyErr_Clear(); return false; }
+    Py_ssize_t n = PySequence_Fast_GET_SIZE(seq);
+    bool ok = true;
+    for (Py_ssize_t i = 0; i < n && ok; ++i) {
+        PyObject* it = PySequence_Fast_GET_ITEM(seq, i);
+        ok = integral ? PyIndex_Check(it) != 0 : seq_item_is_number(it);
+    }
+    Py_DECREF(seq);
+    return ok;
+}
+
+const char* kind_want(unsigned char k) {
+    switch (static_cast<tpx_py_type_kind>(k & ~TPK_OPTIONAL)) {
+        case TPK_TENSOR:     return "Tensor";
+        case TPK_NUMBER:     return "Number";
+        case TPK_INT:        return "int";
+        case TPK_FLOAT:      return "float";
+        case TPK_BOOL:       return "bool";
+        case TPK_STR:        return "str";
+        case TPK_DTYPE:      return "dtype";
+        case TPK_DEVICE:     return "Device";
+        case TPK_INTLIST:    return "int[]";
+        case TPK_FLOATLIST:  return "float[]";
+        case TPK_TENSORLIST: return "Tensor[]";
+        case TPK_SCALARLIST: return "Number[]";
+    }
+    return "?";
+}
+
+}  // namespace
+
+void tpx_py_check_types(PyObject* const* slots, Py_ssize_t n,
+                        const char* op_name, const char* const* names,
+                        const unsigned char* kinds, int max_pos) {
+    auto fail = [&](int i, PyObject* obj) {
+        unsigned char k = kinds[i];
+        int pos = (i < max_pos) ? i : -1;
+        arg_type_error(op_name, names[i], pos, kind_want(k), obj);
+    };
+    for (Py_ssize_t i = 0; i < n; ++i) {
+        PyObject* obj = slots[i];
+        if (obj == nullptr || obj == Py_None) continue;  // absent/optional-None
+        unsigned char k = kinds[i];
+        bool ok = true;
+        switch (static_cast<tpx_py_type_kind>(k & ~TPK_OPTIONAL)) {
+            case TPK_TENSOR:     ok = obj_is_tensor(obj); break;
+            case TPK_NUMBER:     ok = seq_item_is_number(obj); break;
+            case TPK_INT:
+                // Upstream toInt() accepts floats with an exact integral
+                // value (e.g. divisor_override=3.0 on an int? argument).
+                ok = PyIndex_Check(obj);
+                if (!ok && PyFloat_Check(obj)) {
+                    ok = std::fmod(PyFloat_AS_DOUBLE(obj), 1.0) == 0;
+                }
+                break;
+            case TPK_FLOAT:      ok = PyFloat_Check(obj) || PyIndex_Check(obj); break;
+            case TPK_BOOL:       ok = PyBool_Check(obj); break;
+            case TPK_STR:        ok = PyUnicode_Check(obj); break;
+            case TPK_DTYPE:
+            case TPK_DEVICE:     ok = true; break;  // enum casters own these
+            case TPK_INTLIST:    ok = check_list(obj, true); break;
+            case TPK_FLOATLIST:  ok = check_list(obj, false); break;
+            case TPK_TENSORLIST:
+                if (!PyTuple_Check(obj) && !PyList_Check(obj)) { ok = false; break; }
+                {
+                    Py_ssize_t m = PyTuple_Check(obj) ? PyTuple_GET_SIZE(obj)
+                                                      : PyList_GET_SIZE(obj);
+                    for (Py_ssize_t j = 0; j < m && ok; ++j) {
+                        PyObject* el = PyTuple_Check(obj)
+                                           ? PyTuple_GET_ITEM(obj, j)
+                                           : PyList_GET_ITEM(obj, j);
+                        ok = obj_is_tensor(el);
+                    }
+                }
+                break;
+            case TPK_SCALARLIST: ok = check_list(obj, false); break;
+        }
+        if (!ok) fail(static_cast<int>(i), obj);
+    }
+}
+
+
+// Upstream parity (python_arg_parser.cpp is_tensor_list_and_append_overloaded):
+// only tuple/list qualify; each element must be a Tensor wrapper.  Element
+// errors stay std::invalid_argument so multi-overload dispatch can fall
+// through to the next candidate signature.
+std::vector<Tensor> tpx_py_tensorlist(PyObject* obj) {
+    std::vector<Tensor> r;
+    if (!PyTuple_Check(obj) && !PyList_Check(obj)) {
+        throw std::invalid_argument("expected a sequence of tensors");
+    }
+    Py_ssize_t n = PyTuple_Check(obj) ? PyTuple_GET_SIZE(obj)
+                                      : PyList_GET_SIZE(obj);
+    r.reserve(static_cast<size_t>(n));
+    for (Py_ssize_t i = 0; i < n; ++i) {
+        PyObject* item = PyTuple_Check(obj) ? PyTuple_GET_ITEM(obj, i)
+                                            : PyList_GET_ITEM(obj, i);
+        try {
+            r.push_back(tpx_py_tensor_cref(item));
+        } catch (const std::invalid_argument&) {
+            throw std::invalid_argument(std::string("expected Tensor as element ") +
+                                        std::to_string(i) + ", but got " +
+                                        Py_TYPE(item)->tp_name);
+        }
+    }
+    return r;
+}
+std::vector<Scalar> tpx_py_scalarlist(PyObject* obj) {
+    std::vector<Scalar> r;
+    if (!PyTuple_Check(obj) && !PyList_Check(obj)) {
+        throw std::invalid_argument("expected a sequence of scalars");
+    }
+    Py_ssize_t n = PyTuple_Check(obj) ? PyTuple_GET_SIZE(obj)
+                                      : PyList_GET_SIZE(obj);
+    r.reserve(static_cast<size_t>(n));
+    for (Py_ssize_t i = 0; i < n; ++i) {
+        PyObject* item = PyTuple_Check(obj) ? PyTuple_GET_ITEM(obj, i)
+                                            : PyList_GET_ITEM(obj, i);
+        r.push_back(tpx_py_scalar(item));
+    }
+    return r;
 }
 DType tpx_py_dtype(PyObject* obj) { return as_dtype(obj, "op", 0); }
 std::optional<DType> tpx_py_opt_dtype(PyObject* obj) {

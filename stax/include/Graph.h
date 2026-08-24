@@ -2,11 +2,12 @@
 #include <vector>
 #include <string>
 #include <memory>
+#include <functional>
 #include <unordered_map>
 #include <optional>
 #include <iostream>
 #include <variant>
-#include "Tensor.h" 
+#include "Tensor.h"
 #include "Macros.h"
 
 namespace tensorplay {
@@ -14,6 +15,18 @@ namespace stax {
 
 struct OpNode;
 struct Graph;
+
+// Native escape hatch for user-defined operators (torch.library parity):
+// a "custom_op" node carries its qualified "ns::op" name as a string
+// attribute and hands its tensor inputs to the installed executor — the
+// Python↔dispatcher bridge in the bindings.  Kernels keep full eager
+// semantics (device dispatch, autograd) because the bridge re-enters the
+// Python operator entry instead of a raw callable.
+using CustomOpExecutor =
+    std::function<std::vector<Tensor>(const std::string&, const std::vector<Tensor>&)>;
+
+STAX_API void setCustomOpExecutor(CustomOpExecutor executor);
+STAX_API CustomOpExecutor& customOpExecutor();
 
 struct STAX_API ValueNode {
     size_t id;

@@ -4,6 +4,7 @@ release_build/
 rebuild_build/
 *.egg-info/
 dist/
+release_site/
 .idea/
 .trae/
 .pytest_cache/
@@ -34,6 +35,9 @@ __pycache__/
 *.pyc
 try.py
 demo.py
+
+# Generated at build time by tools/generate_tensorplay_version.py
+tensorplay/version.py
 
 # Website
 website/

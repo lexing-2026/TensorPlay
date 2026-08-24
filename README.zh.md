@@ -31,7 +31,7 @@
     <a href="https://pepy.tech/projects/tensorplay">
         <img src="https://static.pepy.tech/badge/TensorPlay/month" alt="Monthly Downloads">
     </a>
-    <img src="https://img.shields.io/github/downloads/bluemoon-o2/TensorPlay/total.svg?label=Github%20Downloads" alt="Monthly Downloads">
+    <img src="https://img.shields.io/github/downloads/bluemoon-o2/TensorPlay/total.svg?label=Github%20Downloads" alt="Github Downloads">
 </p>
 
 <!-- 社区与支持 -->
@@ -56,139 +56,177 @@
 </h3>
 
 <p>
-    <a href="https://www.tensorplay.cn/zh/guide/tutorials"><strong>🎓 教程</strong></a> •
-    <a href="https://www.tensorplay.cn/"><strong>📚 文档</strong></a> •
-    <a href="#quick-install"><strong>🚀 快速开始</strong></a> •
-    <a href="#why-tensorplay"><strong>💡 为什么选择？</strong></a>
+    <a href="https://www.tensorplay.cn/zh/guide/tutorials"><strong>教程</strong></a> •
+    <a href="https://www.tensorplay.cn/"><strong>文档</strong></a> •
+    <a href="#getting-started"><strong>快速开始</strong></a> •
+    <a href="#installation"><strong>安装指南</strong></a>
 </p>
 </div>
 
----
+--------------------------------------------------------------------------------
 
-<a name="why-tensorplay"></a>
-## 💡 为什么选择 TensorPlay？
+TensorPlay 是一个 Python 软件包，提供两大高层能力：
 
-TensorPlay 以**透明架构**为设计哲学，让学习者能够追踪从 Python 到 C++ 核心的每一个操作，而不会迷失在抽象层中。
+- 带有强大 GPU 加速的张量计算（类 NumPy）
+- 建立在显式、基于磁带（tape）机制的自动微分系统之上的深度神经网络
 
-<table>
-<tr>
-<td width="50%">
+整个技术栈——Python API、C++ 核心、CUDA 内核、编译器——都为「可读」而生：实现干净、计算图显式，模型与硬件之间没有黑盒。
 
-#### 🔍 纯粹且透明  
-清晰可读的代码实现，允许你深入理解每个算子的底层逻辑——从自动微分到内存管理，没有黑盒。
+<!-- toc -->
 
-</td>
-<td width="50%">
+- [关于 TensorPlay](#关于-tensorplay)
+  - [一个透明的张量库](#一个透明的张量库)
+  - [为什么选择 TensorPlay](#为什么选择-tensorplay)
+- [安装](#安装)
+  - [二进制安装](#二进制安装)
+  - [从源码构建](#从源码构建)
+    - [环境要求](#环境要求)
+    - [获取源码](#获取源码)
+    - [安装构建依赖](#安装构建依赖)
+    - [安装 TensorPlay](#安装-tensorplay)
+    - [调整构建选项（可选）](#调整构建选项可选)
+- [快速上手](#快速上手)
+  - [自动微分](#自动微分)
+  - [定义神经网络](#定义神经网络)
+  - [训练循环](#训练循环)
+- [测试](#测试)
+- [资源](#资源)
+- [发布与贡献](#发布与贡献)
+- [许可证](#许可证)
 
-#### 🛠️ DIY 硬件加速  
-简化的 CPU 和 CUDA 后端实现，是实验自定义硬件内核、理解并行计算原理的完美游乐场。
+<!-- tocstop -->
 
-</td>
-</tr>
-<tr>
-<td width="50%">
+## 关于 TensorPlay
 
-#### 🧬 模块化自动微分  
-通过解耦的 **TPX** 引擎，显式构建计算图，轻松理解反向传播的魔力，且易于扩展和修改。
+### 一个透明的张量库
 
-</td>
-<td width="50%">
+在更细的粒度上，TensorPlay 由以下组件构成：
 
-#### 🧪 研究就绪  
-高度可扩展的设计，让你能够以极少的样板代码原型化新的层类型、优化器和存储格式。
+| 组件 | 说明 |
+| ---- | ---- |
+| **tensorplay** | Python API：张量、自动微分、`nn`、`optim`、数据加载、序列化——对外公开层 |
+| **p10** | C++ 核心引擎：张量存储与内存管理、基础的 CPU 与 CUDA 内核实现 |
+| **tpx** | 自动微分层：显式构建计算图并执行反向传播，与核心完全解耦 |
+| **stax** | JIT 编译器试验场：静态图捕获与算子融合实验，支持自定义算子的原生下沉 |
+| **tensorplay.nn** | 神经网络构件：`Module`、`Linear`、`Conv2d`、激活函数、损失函数与容器抽象 |
+| **tensorplay.optim** | 优化器（SGD、Adam、AdamW），支持学习率调度与权重衰减 |
+| **tensorplay.data** | `Dataset` / `DataLoader`：多 worker 批处理、预取 (prefetch) 与自动打乱 |
+| **tensorplay.library** | 一等公民的自定义算子：注册算子、挂接 fake/meta 与自动微分公式、接入自有 Triton kernel |
 
-</td>
-</tr>
-</table>
+四大支柱——**P10**、**TPX**、**Stax** 与 **NN**——是刻意解耦的核心库，既可协同工作，也可独立使用。`linalg`、`fft`、`sparse`、`special`、`amp`、`distributed`、`serialization` 等领域子包补全了完整的 API 面。
 
-<a name="quick-install"></a>
-## 🚀 快速安装
+### 为什么选择 TensorPlay
 
-选择适合你的安装方式：
+TensorPlay 以**透明架构**为设计哲学：每个操作都能从 Python 追踪到 C++ 核心，而不会迷失在抽象层中。
 
-### 📦 CPU 版本
+- **纯粹且可读的实现。** 深入理解每个算子的底层逻辑——从自动微分到内存管理，没有黑盒。
+- **DIY 硬件加速。** 简化的 CPU/CUDA 后端是实验自定义硬件内核、学习并行计算原理的游乐场。
+- **模块化自动微分。** 解耦的 TPX 引擎显式构建计算图，反向传播的原理一目了然，且易于扩展。
+- **研究就绪。** 以极少的样板代码原型化新的层类型、优化器、自定义算子与存储格式。
+- **亲切的 API 风格。** 用过主流深度学习框架的话，心智模型可以直接迁移——把时间花在理解内部机制上，而不是语法上。
+
+## 安装
+
+### 二进制安装
+
 ```bash
+# 从 PyPI 安装 CPU 版本
 pip install tensorplay --upgrade
+
+# 从 TensorPlay CUDA 源安装 CUDA 版本（可选 cu124、cu126 或 cu130）
+# PyPI 作为运行时依赖的额外索引
+pip install tensorplay --index-url https://download.tensorplay.cn/whl/cu124/ --extra-index-url https://pypi.org/simple
 ```
 
-### 🎮 CUDA 版本
-```bash
-# CUDA 13.0
-pip install tensorplay --index-url https://download.tensorplay.cn/whl/cu130/
-```
-> **注意：** 确保 Python 版本与 wheel 标签匹配（如 `cp310` 对应 Python 3.10）。若遇连接问题，请确认可访问上述 URL。
+> **注意：** 请确保 Python 版本与 wheel 标签匹配（如 `cp310` 对应 Python 3.10）。CUDA 版本要求驱动与运行时支持对应 CUDA 版本。
 
-### 🔧 开发安装
+### 从源码构建
+
+源码构建得到的是可魔改、可调试的安装——推荐贡献者以及所有研究内核的开发者使用。
+
+#### 环境要求
+
+- Python >= 3.9，< 3.14
+- CMake >= 3.18（< 4.0）
+- 支持 C++20 的编译器（Windows 使用 MSVC 2022，Linux 使用 GCC/Clang）
+- CUDA Toolkit（可选，用于 GPU 支持）；可通过 `CMAKE_CUDA_ARCHITECTURES` 指定目标 GPU 架构
+- [Ninja](https://ninja-build.org/)（随构建依赖自动安装）
+
+#### 获取源码
+
 ```bash
 git clone https://github.com/bluemoon-o2/TensorPlay.git
 cd TensorPlay
-pip install -e .
 ```
 
-## 🏗️ 架构：四大支柱
+#### 安装构建依赖
 
-TensorPlay 建立在四个解耦的核心库之上，既可协同工作，也可独立使用：
+隔离的 PEP 517 构建会自动获取全部依赖。若需更快的迭代开发，可先装好工具链再关闭隔离：
 
-| 库 | 核心职责 | 设计理念 |
-|:-------:|:---------|:---------|
-| **P10** | 🔧 核心引擎 | 提供**干净、可读**的内存管理和基础张量内核实现，是计算引擎的基石 |
-| **TPX** | 🔄 自动微分 | **显式**自动微分层，让你理解或修改计算图的构建方式，完全透明 |
-| **Stax** | ⚡ JIT 与优化 | 在简化环境中试验**算子融合**和**静态图捕获**，纯粹的优化游乐场 |
-| **NN** | 🧩 高层 API | 与 PyTorch 兼容的模块化业务层；Linear/Conv2d 等组件可作为自定义层的蓝图 |
+```bash
+pip install -r requirements-build.txt
+```
 
-## 🎯 核心特性
+#### 安装 TensorPlay
 
-### 📐 张量运算
-- **完整自动微分**：基于 `requires_grad` 的自动梯度计算，完全对齐 PyTorch 行为
-- **广播机制**：NumPy 兼容的张量广播
-- **激活函数**：ReLU、Sigmoid、Tanh、Softmax、GELU 等常用激活函数
-- **设备管理**：无缝 CPU/CUDA 切换，显式控制内存位置
+TensorPlay 通过 `pyproject.toml` 中声明的标准 PEP 517 接口由 scikit-build-core 构建：
 
-### 🧠 神经网络层
-- **线性层/全连接层**：支持权重初始化策略
-- **Conv2d**：二维卷积层，理解参数计算和感受野
-- **模块系统**：继承 `tp.nn.Module`，自动参数注册和结构可视化
-- **损失函数**：MSE、NLL、CrossEntropy、SSE 等
+```bash
+# 完整构建并安装（加 -v 可查看详细输出）
+pip install .
 
-### ⚙️ 优化与数据
-- **优化器**：SGD、Adam、AdamW，支持学习率调度和权重衰减
-- **数据加载器**：多 worker 批处理、预取 (prefetch)、自动打乱
-- **早停机制**：内置早停回调，防止过拟合
+# 开发用可编辑安装
+pip install -e . --no-build-isolation
 
-## 🎓 学习路径
+# 或只产出 wheel 不安装
+python -m build --wheel
+```
 
-跟随我们的结构化教程，从零开始掌握深度学习原理：
+构建成功后，`import tensorplay` 会加载安装包内编译好的 `_C` 扩展。
 
-### 初学者
-1. **[从零开始的线性回归](https://www.tensorplay.cn/zh/guide/tutorials)** - 理解 `requires_grad` 和反向传播基础
-2. **[MNIST CNN 图像分类](https://www.tensorplay.cn/zh/guide/tutorials)** - 使用 `Conv2d`、`MaxPool`、`DataLoader` 构建第一个神经网络
+#### 调整构建选项（可选）
 
-### 进阶
-3. **自定义数据集与转换** - 掌握 `Dataset` 类和数据预处理流水线
-4. **模型保存与加载** - 使用 `tp.save()` / `tp.load()` 以原生 MEGA `.mega` 格式和 `state_dict` 管理训练状态
+构建由环境变量驱动——无需 `-D` 参数：
 
-👉 查看完整教程：[tutorials](https://www.tensorplay.cn/zh/guide/tutorials)
+```bash
+# 仅构建 CPU 版本
+USE_CUDA=OFF pip install .
 
-## ⚡ 快速示例
+# 指定目标 GPU 架构
+CMAKE_CUDA_ARCHITECTURES="70;75;86" pip install .
+```
+
+| 变量 | 默认值 | 说明 |
+| ---- | ---- | ---- |
+| `USE_CUDA` | 自动探测 | 启用/禁用 CUDA 构建 |
+| `BUILD_TESTS` | `OFF` | 构建 C++ 测试套件 |
+| `USE_BLAS` / `USE_ONEDNN` | `ON` | BLAS 加速 / oneDNN 算子库 |
+| `MAX_JOBS` | 机器默认 | 限制编译并行度 |
+| `DEBUG` | 未设置 | 以 `-O0 -g` 构建 |
+| `CMAKE_CUDA_ARCHITECTURES` | 本机架构 | 分号分隔的 GPU 架构列表 |
+| `TENSORPLAY_BUILD_VERSION` / `TENSORPLAY_BUILD_NUMBER` | 未设置 | 覆盖包版本号（发布 CI 使用） |
+
+所有 `USE_*`、`BUILD_*`、`CMAKE_*` 环境变量都会自动转发给 CMake——无需任何额外参数。
+
+## 快速上手
 
 ### 自动微分
+
 ```python
 import tensorplay as tp
 
-# 创建可训练张量
 x = tp.Tensor([[1.0, 2.0], [3.0, 4.0]], requires_grad=True)
 y = tp.Tensor([[5.0, 6.0], [7.0, 8.0]], requires_grad=True)
 
-# 前向传播 + 反向传播
 z = x.matmul(y) + tp.ones_like(x)
 loss = z.sum()
 loss.backward()
 
-# 查看梯度（与 PyTorch 行为一致）
 print(x.grad)  # [[6., 6.], [6., 6.]]
 ```
 
 ### 定义神经网络
+
 ```python
 import tensorplay as tp
 from tensorplay.nn import Module, Linear, ReLU, Sigmoid
@@ -200,53 +238,62 @@ class MLP(Module):
         self.relu = ReLU()
         self.fc2 = Linear(hidden_dim, output_dim)
         self.sigmoid = Sigmoid()
-    
+
     def forward(self, x: tp.Tensor) -> tp.Tensor:
         x = self.relu(self.fc1(x))
         return self.sigmoid(self.fc2(x))
 
-# 初始化并查看结构
 model = MLP(10, 32, 1)
 print(model)  # 自动生成层结构可视化
 ```
 
 ### 训练循环
+
 ```python
 from tensorplay.data import DataLoader, TensorDataset
 
-# 准备数据
 train_data = TensorDataset(tp.randn(100, 10), tp.randn(100, 1))
 train_loader = DataLoader(dataset=train_data, batch_size=8, shuffle=True)
 
-# 训练迭代（与 PyTorch API 几乎一致）
 for batch_x, batch_y in train_loader:
     predictions = model(batch_x)
-    # ... 计算损失并反向传播
+    # ... 计算损失、调用 loss.backward()、更新优化器
 ```
 
-## 📊 基准测试
+体系化教程——从零开始的线性回归、MNIST CNN 图像分类、自定义数据集、`.mega` + `state_dict` 模型保存与加载——见 [tensorplay.cn](https://www.tensorplay.cn/zh/guide/tutorials)。
 
-我们在标准数据集上提供了详细的性能对比，展示 TensorPlay 在小规模实验中的效率。查看完整的 [Benchmark Report](./benchmark/)。
+## 测试
 
-<div align="center">
-    <img src="https://raw.githubusercontent.com/bluemoon-o2/TensorPlay/main/docs/images/logo-footer.png" alt="TensorPlay">
-</div>
+Python 测试套件使用 pytest 针对已安装（或原地构建）的包运行：
 
-## 📄 许可证
+```bash
+pytest test/
+```
 
-本项目采用 [Apache 2.0 许可证](LICENSE)。
+CI 会在每个 PR 和 main 推送上构建完整 wheel 矩阵（Python 3.9–3.13；CPU 覆盖 Linux x86_64/aarch64、macOS arm64、Windows x86_64；CUDA 覆盖 Linux 和 Windows x86_64）并验证每个 wheel；参见 [.github/workflows/](.github/workflows/)（`pull`、`trunk`、`publish`、`lint`）。Lint 规则位于 `pyproject.toml` 的 `[tool.ruff]` 段。
 
-## 🤝 贡献指南
+## 资源
 
-我们欢迎各种形式的贡献！无论是修复 bug、改进文档，还是提出新功能建议。
+- **文档：** [tensorplay.cn](https://www.tensorplay.cn/)
+- **教程：** [tensorplay.cn/zh/guide/tutorials](https://www.tensorplay.cn/zh/guide/tutorials)
+- **基准测试：** [benchmark/](benchmark/)
+- **社区：** [Discord](https://discord.gg/u6T5e2kGJm)
 
-### 👥 贡献者
+## 发布与贡献
+
+包版本号以 [`version.txt`](version.txt) 为单一来源（开发安装会带 `+git<sha>` 后缀）。正式发布通过推送 `v主版本.次版本.0` tag 触发；例如 `v1.2.1` 这样的修订版本 tag 不会发布二进制包。CI 流水线自动构建并验证完整 wheel 矩阵，CPU wheel 发布到 PyPI，CUDA wheel 上传到 GitHub Release，并将其 PEP 503 索引部署到 Cloudflare Pages。
+
+发布工作流使用 GitHub 的 `pypi` 环境进行 PyPI 可信发布。Python 版本以及 CPU/CUDA 平台 runner 配置在 [`.github/wheel-platforms.json`](.github/wheel-platforms.json) 中；当前 CUDA 版本为 `cu124`、`cu126`、`cu130`，配置在 [`.github/cuda-variants.json`](.github/cuda-variants.json) 中。未来增加 `{ "variant": "cu132", "toolkit": "13.2.1" }` 后，CI 会构建并在同一次 Pages 部署中发布新的 CUDA 索引。CUDA Release wheel 会带 `+cuXXX` 本地版本后缀，确保不同 CUDA 版本可以共存于同一个 GitHub Release。CUDA 索引部署需要仓库 Secrets `CLOUDFLARE_API_TOKEN` 和 `CLOUDFLARE_ACCOUNT_ID`；可选的仓库变量 `CLOUDFLARE_PAGES_PROJECT_NAME` 默认为 `tensorplay-pypi`。
+
+我们欢迎各种形式的贡献——bug 修复、文档改进、新功能建议。开发流程与编码规范见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 <a href="https://github.com/bluemoon-o2/TensorPlay/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=bluemoon-o2/TensorPlay&columns=10" alt="Contributors" />
 </a>
 
-## ⭐ Star 历史
+## 许可证
+
+TensorPlay 采用 [Apache 2.0 许可证](LICENSE)。
 
 <a href="https://star-history.com/#bluemoon-o2/TensorPlay&Date">
   <picture>

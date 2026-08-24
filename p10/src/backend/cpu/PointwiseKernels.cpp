@@ -851,6 +851,23 @@ Tensor clamp_kernel(const Tensor& self, std::optional<Scalar> min, std::optional
     return result;
 }
 
+// clamp_min/clamp_max family -- ATen implements these as composites over
+// clamp(self, bound, nullopt); delegate to the same kernel here.
+Tensor clamp_min_kernel(const Tensor& self, Scalar min) {
+    return clamp_kernel(self, min, std::nullopt);
+}
+Tensor clamp_max_kernel(const Tensor& self, Scalar max) {
+    return clamp_kernel(self, std::nullopt, max);
+}
+Tensor clamp_min__kernel(Tensor& self, Scalar min) {
+    self.copy_(clamp_kernel(self, min, std::nullopt));
+    return self;
+}
+Tensor clamp_max__kernel(Tensor& self, Scalar max) {
+    self.copy_(clamp_kernel(self, std::nullopt, max));
+    return self;
+}
+
 // Helper for clamp backward
 Tensor clamp_backward_kernel(const Tensor& grad_output, const Tensor& self, std::optional<Scalar> min, std::optional<Scalar> max) {
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(grad_output.shape()), grad_output.dtype(), grad_output.device());
@@ -979,8 +996,8 @@ static Tensor softmax_fused_kernel_impl(const Tensor& self, int64_t dim, DType o
     return result;
 }
 
-Tensor softmax_kernel(const Tensor& self, int64_t dim, std::optional<DType> dtype) {
-    DType out_dtype = dtype.value_or(self.dtype());
+Tensor softmax_kernel(const Tensor& self, int64_t dim, DType dtype) {
+    DType out_dtype = (dtype != DType::Undefined) ? dtype : self.dtype();
     if (isIntegralType(out_dtype)) out_dtype = DType::Float32;
     // ATen alignment: reduced floats compute in float32
     if (isReducedFloatingType(out_dtype)) {
@@ -990,8 +1007,8 @@ Tensor softmax_kernel(const Tensor& self, int64_t dim, std::optional<DType> dtyp
 }
 
 // Log Softmax — same fused structure as ATen (_log_softmax_vec)
-Tensor log_softmax_kernel(const Tensor& self, int64_t dim, std::optional<DType> dtype) {
-    DType out_dtype = dtype.value_or(self.dtype());
+Tensor log_softmax_kernel(const Tensor& self, int64_t dim, DType dtype) {
+    DType out_dtype = (dtype != DType::Undefined) ? dtype : self.dtype();
     if (isIntegralType(out_dtype)) out_dtype = DType::Float32;
     if (isReducedFloatingType(out_dtype)) {
         return softmax_fused_kernel_impl<true>(self, dim, DType::Float32).to(out_dtype);
@@ -1135,6 +1152,10 @@ TENSORPLAY_LIBRARY_IMPL(CPU, PointwiseKernels) {
     m.impl("pow.Tensor_Scalar", pow_scalar_kernel);
     m.impl("angle", angle_kernel);
     m.impl("clamp", clamp_kernel);
+    m.impl("clamp_min", clamp_min_kernel);
+    m.impl("clamp_max", clamp_max_kernel);
+    m.impl("clamp_min_", clamp_min__kernel);
+    m.impl("clamp_max_", clamp_max__kernel);
     m.impl("clamp_backward", clamp_backward_kernel);
     m.impl("threshold_backward", threshold_backward_kernel);
     m.impl("softmax", softmax_kernel);

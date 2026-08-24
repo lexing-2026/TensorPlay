@@ -59,16 +59,18 @@ def apply_permutation(tensor: Tensor, permutation: Tensor, dim: int = 1) -> Tens
 def _rnn_tanh_cell(input, hidden, params, pre_compute_input=False):
     # SimpleCell<tanh_f> (aten RNN.cpp:736-746)
     w_ih, w_hh, b_ih, b_hh, _ = params
-    out = F.linear(hidden, w_hh, b_hh)
-    out.add_(input if pre_compute_input else F.linear(input, w_ih, b_ih))
+    # Out-of-place add: in-place add_ on an op result drops the input-side
+    # branch from the autograd graph (no version-counter fixup here).
+    out = F.linear(hidden, w_hh, b_hh) + (
+        input if pre_compute_input else F.linear(input, w_ih, b_ih))
     return out.tanh()
 
 
 def _rnn_relu_cell(input, hidden, params, pre_compute_input=False):
     # SimpleCell<relu_f> (aten RNN.cpp:736-746)
     w_ih, w_hh, b_ih, b_hh, _ = params
-    out = F.linear(hidden, w_hh, b_hh)
-    out.add_(input if pre_compute_input else F.linear(input, w_ih, b_ih))
+    out = F.linear(hidden, w_hh, b_hh) + (
+        input if pre_compute_input else F.linear(input, w_ih, b_ih))
     return out.relu()
 
 
@@ -77,14 +79,16 @@ def _lstm_cell(input, hidden, params, pre_compute_input=False):
     w_ih, w_hh, b_ih, b_hh, w_hr = params
     hx, cx = hidden
 
-    gates = F.linear(hx, w_hh, b_hh)
-    gates.add_(input if pre_compute_input else F.linear(input, w_ih, b_ih))
-    ingate, forgetgate, cellgate, outgate = gates.chunk(4, 1)
-    ingate = ingate.sigmoid()
-    forgetgate = forgetgate.sigmoid()
-    cellgate = cellgate.tanh()
-    outgate = outgate.sigmoid()
-    cy = (forgetgate * cx).add_(ingate * cellgate)
+    gates = F.linear(hx, w_hh, b_hh) + (
+        input if pre_compute_input else F.linear(input, w_ih, b_ih))
+    H = hx.size(1)
+    # narrow (not chunk) keeps the autograd graph: chunk has no registered
+    # derivative, while narrow is a differentiable view on every backend.
+    ingate = gates.narrow(1, 0, H).sigmoid()
+    forgetgate = gates.narrow(1, H, H).sigmoid()
+    cellgate = gates.narrow(1, 2 * H, H).tanh()
+    outgate = gates.narrow(1, 3 * H, H).sigmoid()
+    cy = forgetgate * cx + ingate * cellgate
     hy = outgate * cy.tanh()
     if w_hr is not None:
         hy = hy.matmul(w_hr.t())
@@ -97,8 +101,14 @@ def _gru_cell(input, hidden, params, pre_compute_input=False):
 
     igates = input if pre_compute_input else F.linear(input, w_ih, b_ih)
     hgates = F.linear(hidden, w_hh, b_hh)
-    ri, zi, ni = igates.chunk(3, 1)
-    rh, zh, nh = hgates.chunk(3, 1)
+    H = hidden.size(1)
+    # narrow instead of chunk: chunk slices carry no autograd history.
+    ri = igates.narrow(1, 0, H)
+    zi = igates.narrow(1, H, H)
+    ni = igates.narrow(1, 2 * H, H)
+    rh = hgates.narrow(1, 0, H)
+    zh = hgates.narrow(1, H, H)
+    nh = hgates.narrow(1, 2 * H, H)
     reset_gate = (rh + ri).sigmoid()
     input_gate = (zh + zi).sigmoid()
     new_gate = (ni + nh * reset_gate).tanh()
@@ -153,12 +163,15 @@ def _full_layer(input, input_hidden, params, cell, is_cpu):
     # (pre_compute_input).
     if is_cpu:
         input_w = F.linear(input, params[0], params[2])
-        step_inputs = input_w.unbind(0)
+        # select views (not unbind) keep the autograd graph: unbind, like
+        # chunk, has no registered derivative.
+        step_inputs = [input_w.select(0, i) for i in range(input_w.size(0))]
         step_outputs, final_hidden = _layer_scan(
             step_inputs, input_hidden, params, cell, True
         )
     else:
-        step_inputs = input.unbind(0)
+        # select views keep autograd (unbind has no derivative)
+        step_inputs = [input.select(0, i) for i in range(input.size(0))]
         step_outputs, final_hidden = _layer_scan(
             step_inputs, input_hidden, params, cell, False
         )
@@ -174,20 +187,23 @@ def _full_bidirectional_layer(input, input_hidden, params_pair, cell, is_cpu):
     if is_cpu:
         input_w = F.linear(input, fw_params[0], fw_params[2])
         fw_outputs, fw_hidden_out = _layer_scan(
-            input_w.unbind(0), fw_hidden, fw_params, cell, True
+            [input_w.select(0, i) for i in range(input_w.size(0))],
+            fw_hidden, fw_params, cell, True
         )
         if not fw_outputs:
             raise RuntimeError("Expected sequence length to be larger than 0 in RNN")
         fw_output = tp.stack(fw_outputs, 0)
         input_w = F.linear(input, rev_params[0], rev_params[2])
-        rev_step_inputs = list(input_w.unbind(0))[::-1]
+        rev_step_inputs = [input_w.select(0, i)
+                           for i in range(input_w.size(0))][::-1]
         rev_outputs, rev_hidden_out = _layer_scan(
             rev_step_inputs, rev_hidden, rev_params, cell, True
         )
         rev_outputs.reverse()
         rev_output = tp.stack(rev_outputs, 0)
     else:
-        step_inputs = input.unbind(0)
+        # select views keep autograd (unbind has no derivative)
+        step_inputs = [input.select(0, i) for i in range(input.size(0))]
         fw_outputs, fw_hidden_out = _layer_scan(
             step_inputs, fw_hidden, fw_params, cell, False
         )
@@ -401,7 +417,9 @@ def _one_hidden_rnn(cell, input, hx, flat_weights, has_biases, num_layers,
             return _full_layer(layer_input, hidden, param, cell, is_cpu)
 
         output, final_hidden = _apply_layer_stack(
-            layer_fn, input, list(hx.unbind(0)), params, num_layers, dropout_p, train
+            layer_fn, input,
+        [hx.select(0, i) for i in range(hx.size(0))], params, num_layers,
+        dropout_p, train
         )
         hy = tp.stack(final_hidden, 0)
     if batch_first:
@@ -436,7 +454,9 @@ def _one_hidden_rnn_packed(cell, data, batch_sizes, hx, flat_weights, has_biases
             return _packed_layer(layer_input, hidden, param, cell, is_cpu)
 
         layer_input, final_hidden = _apply_layer_stack(
-            layer_fn, packed_input, list(hx.unbind(0)), params, num_layers, dropout_p, train
+            layer_fn, packed_input,
+        [hx.select(0, i) for i in range(hx.size(0))], params, num_layers,
+        dropout_p, train
         )
         hy = tp.stack(final_hidden, 0)
     return layer_input.data, hy
@@ -446,8 +466,8 @@ def _lstm_impl(cell, packed_input, hx, cx, params, num_layers, dropout_p, train,
                bidirectional, is_cpu):
     # Port of _lstm_impl (aten RNN.cpp:1168-1195): transpose the (hx, cx) pair
     # into per-layer pairs, run the stack, and stack hy/cy back.
-    layer_hx = list(hx.unbind(0))
-    layer_cx = list(cx.unbind(0))
+    layer_hx = [hx.select(0, i) for i in range(hx.size(0))]
+    layer_cx = [cx.select(0, i) for i in range(cx.size(0))]
     total_layers = len(layer_hx)
     hiddens = [(layer_hx[i], layer_cx[i]) for i in range(total_layers)]
 

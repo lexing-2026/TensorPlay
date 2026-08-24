@@ -10,6 +10,7 @@
 //   aten/src/ATen/native/GatedLinearUnit.cpp    glu()/glu_backward()
 
 #include "Tensor.h"
+#include "CUDARuntime.h"
 #include "Dispatcher.h"
 #include "Utils.h"
 #include "CUDAGenerator.h"
@@ -23,6 +24,10 @@ namespace cuda {
 // Defined below the registration table.
 Tensor& resize__cuda(Tensor& self, const std::vector<int64_t>& size);
 std::tuple<Tensor, Tensor> native_dropout_cuda(const Tensor& input, double p);
+std::tuple<Tensor, Tensor> native_alpha_dropout_cuda(const Tensor& input, double p);
+Tensor alpha_dropout_backward_cuda(const Tensor& grad, const Tensor& mask, double p);
+std::tuple<Tensor, Tensor> native_feature_dropout_cuda(const Tensor& input, double p);
+Tensor feature_dropout_backward_cuda(const Tensor& grad, const Tensor& mask, double p);
 
 // Defined in PointwiseKernels.cu.
 Tensor eq_kernel_cuda(const Tensor& self, const Tensor& other);
@@ -129,6 +134,10 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, MiscKernels) {
     m.impl("glu_backward", glu_backward_cuda);
     m.impl("resize_", resize__cuda);
     m.impl("native_dropout", native_dropout_cuda);
+    m.impl("native_alpha_dropout", native_alpha_dropout_cuda);
+    m.impl("_alpha_dropout_backward", alpha_dropout_backward_cuda);
+    m.impl("native_feature_dropout", native_feature_dropout_cuda);
+    m.impl("_feature_dropout_backward", feature_dropout_backward_cuda);
 }
 
 namespace {
@@ -152,12 +161,23 @@ uint32_t deviceAttribute(cudaDeviceAttr attr) {
 // Grid-stride fused dropout: each thread draws curand uniforms and writes
 // both the scaled output element and the bool keep-mask, mirroring the
 // philox counter discipline of RandomKernels.cu (offsets reserved host-side
-// via philox_engine_inputs so results are launch-geometry independent).
+// so results are launch-geometry independent).  Under CUDA graph capture the
+// (seed, offset) pair is read from the graph's device buffer instead and
+// refreshed before each replay (see CUDAGenerator.h).
 template <typename scalar_t>
-__global__ void native_dropout_kernel(int64_t numel, uint64_t seed,
-                                      uint64_t offset, float p, float scale,
+__global__ void native_dropout_kernel(int64_t numel, PhiloxCudaState philox_args,
+                                      float p, float scale,
                                       const scalar_t* in, scalar_t* out,
                                       bool* mask) {
+    uint64_t seed;
+    uint64_t offset;
+    if (philox_args.captured) {
+        seed = *philox_args.seed_dev;
+        offset = *philox_args.offset_dev + philox_args.offset_intragraph;
+    } else {
+        seed = philox_args.seed;
+        offset = philox_args.offset;
+    }
     int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     curandStatePhilox4_32_10_t state;
     curand_init(seed, idx, offset, &state);
@@ -240,7 +260,7 @@ std::tuple<Tensor, Tensor> native_dropout_cuda(const Tensor& input, double p) {
     const uint64_t counter_offset =
         ((static_cast<uint64_t>(n) - 1) / (kDropoutBlockSize * grid.x * 4) + 1) *
         kMaxGeneratorOffsetsPerCall;
-    auto philox_args = philox_engine_inputs(counter_offset);
+    auto philox_args = philox_cuda_state(counter_offset);
 
     const float pf = static_cast<float>(p);
     const float scale = static_cast<float>(1.0 / (1.0 - p));
@@ -248,8 +268,8 @@ std::tuple<Tensor, Tensor> native_dropout_cuda(const Tensor& input, double p) {
 
     auto launch = [&](auto type_tag) {
         using scalar_t = decltype(type_tag);
-        native_dropout_kernel<scalar_t><<<grid, block>>>(
-            n, philox_args.first, philox_args.second, pf, scale,
+        native_dropout_kernel<scalar_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
+            n, philox_args, pf, scale,
             input.data_ptr<scalar_t>(), out.data_ptr<scalar_t>(), mask_data);
         cudaError_t error = cudaGetLastError();
         if (error != cudaSuccess) {
@@ -266,6 +286,72 @@ std::tuple<Tensor, Tensor> native_dropout_cuda(const Tensor& input, double p) {
         default: break;
     }
     return {std::move(out), std::move(mask)};
+}
+
+
+// ---------------------------------------------------------------------------
+// Alpha / feature dropout (CUDA) — same dispatcher-composite shape as the
+// CPU side: bernoulli_ noise via the registered RNG kernel, affine math via
+// dispatched mul/add. bernoulli_/mul/div redispatch to their CUDA kernels.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr double kAlphaDropoutAlphaCuda = 1.7580993408473766;
+
+double alpha_dropout_scale_cuda(double p) {
+    return 1.0 / std::sqrt(
+                      (kAlphaDropoutAlphaCuda * kAlphaDropoutAlphaCuda * p + 1.0) *
+                      (1.0 - p));
+}
+
+Tensor bernoulli_mask_cuda(const Tensor& input,
+                           const std::vector<int64_t>& shape,
+                           double keep_prob) {
+    Tensor noise = Tensor::full(shape, keep_prob, DType::Float32,
+                                input.device());
+    noise.bernoulli_();
+    return noise;
+}
+
+} // anonymous namespace
+
+std::tuple<Tensor, Tensor> native_alpha_dropout_cuda(const Tensor& input, double p) {
+    if (p < 0 || p >= 1) {
+        TP_THROW(ValueError, "alpha_dropout: p must be in [0, 1)");
+    }
+    Tensor mask = bernoulli_mask_cuda(
+        input, static_cast<std::vector<int64_t>>(input.shape()), 1.0 - p);
+    const double a = alpha_dropout_scale_cuda(p);
+    Tensor out = mask.mul(input.mul(a).add(kAlphaDropoutAlphaCuda * a))
+                    .add(kAlphaDropoutAlphaCuda * a * (p - 1.0));
+    return {std::move(out), std::move(mask)};
+}
+
+Tensor alpha_dropout_backward_cuda(const Tensor& grad, const Tensor& mask,
+                                   double p) {
+    const double a = alpha_dropout_scale_cuda(p);
+    return grad.mul(mask).mul(a);
+}
+
+std::tuple<Tensor, Tensor> native_feature_dropout_cuda(const Tensor& input, double p) {
+    if (p < 0 || p >= 1) {
+        TP_THROW(ValueError, "feature_dropout: p must be in [0, 1)");
+    }
+    if (input.dim() < 2) {
+        TP_THROW(RuntimeError, "feature_dropout requires at least 2D input");
+    }
+    std::vector<int64_t> mask_shape =
+        static_cast<std::vector<int64_t>>(input.shape());
+    for (int64_t d = 2; d < input.dim(); ++d) mask_shape[d] = 1;
+    Tensor mask = bernoulli_mask_cuda(input, mask_shape, 1.0 - p);
+    Tensor out = input.mul(mask).div(1.0 - p);
+    return {std::move(out), std::move(mask)};
+}
+
+Tensor feature_dropout_backward_cuda(const Tensor& grad, const Tensor& mask,
+                                     double p) {
+    return grad.mul(mask).div(1.0 - p);
 }
 
 } // namespace cuda

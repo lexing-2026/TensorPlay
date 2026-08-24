@@ -40,7 +40,7 @@ def test_compile_uses_single_public_entrypoint_and_stax_backend():
     assert not hasattr(tp, "not_a_tensorplay_name")
     assert actual.tolist() == expected.tolist()
     assert compiled._tensorplay_backend == "stax"
-    assert tp.compiler.list_backends() == ["stax"]
+    assert tp.compiler.list_backends() == ["stax", "tvm"]
 
 
 def test_custom_backend_receives_graph_module_and_caches_specializations():
@@ -241,6 +241,10 @@ def test_stax_triton_compiles_forward_and_backward_together():
         import triton  # noqa: F401
     except ImportError:
         pytest.skip("Triton is unavailable")
+    from tensorplay.compiler.codegen.triton import runtime_available
+
+    if not runtime_available():
+        pytest.skip("Triton runtime cannot target this device")
 
     def fn(left, right):
         return ((left.abs() + right.sigmoid()).tanh() / (left.cos() + 2.0)).relu()

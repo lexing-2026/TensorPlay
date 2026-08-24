@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <cstdint>
 #include <type_traits>
 
@@ -29,8 +30,12 @@ class irange {
     T value_;
   };
 
-  irange(T begin, T end) : begin_(begin), end_(end) {}
-  explicit irange(T end) : begin_(T{0}), end_(end) {}
+  // c10 parity: [begin, end) with end<=begin yielding an EMPTY range -- the
+  // range-for end test is `!=`, so the terminator is clamped up to begin.
+  // reorder_dimensions relies on this for 0-dim reductions
+  // (irange(1, ndim()) must not iterate when ndim()==0).
+  irange(T begin, T end) : begin_(begin), end_(std::max(begin, end)) {}
+  explicit irange(T end) : begin_(T{0}), end_(std::max(T{0}, end)) {}
 
   iterator begin() const { return iterator(begin_); }
   iterator end() const { return iterator(end_); }

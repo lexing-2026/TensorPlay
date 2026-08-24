@@ -1,6 +1,8 @@
 """Interoperability: torch .pt archives (zip/stream/tar) and safetensors."""
 
+import copyreg
 import io
+import json
 import pickle
 import struct
 import sys
@@ -156,7 +158,7 @@ def _build_magic_number_stream(tensors: dict) -> bytes:
         return (st._rebuild_tensor_v2,
                 (ref, 0, shape, st._contiguous_stride(shape), False, {}))
 
-    dispatch = dict(pickle.Pickler.dispatch_table)
+    dispatch = copyreg.dispatch_table.copy()
     dispatch[type(tp.Tensor)] = reduce_tensor
     parameter_cls = getattr(tp.nn, "Parameter", None)
     if parameter_cls is not None and parameter_cls is not tp.Tensor:

@@ -241,6 +241,9 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, CopyKernels) {
     m.impl("_nnz", sparse_nnz_cuda);
     m.impl("sparse_mm", sparse_mm_cuda);
     m.impl("sparse_sum", sparse_sum_cuda);
+    m.impl("sparse_add", sparse_add_cuda);
+    m.impl("sparse_mul", sparse_mul_cuda);
+    m.impl("spdiags", spdiags_cuda);
 }
 
 } // namespace cuda

@@ -1,6 +1,7 @@
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "Exception.h"
+#include "Scalar.h"
 #include "CUDARuntime.h"
 #include "Allocator.h"
 #include <cuda_runtime.h>
@@ -232,6 +233,86 @@ Tensor circular_pad_nd_backward_cuda(const Tensor& grad_output, const Tensor& se
     return pad_mode_backward(grad_output, self, pad, 2);
 }
 
+// constant_pad_nd is a composite over slice/fill_/copy_ (see the CPU implementation of
+// aten/src/ATen/native/PadNd.cpp:29); every primitive used has a CUDA kernel,
+// so the same body serves both backends.
+static Tensor constant_pad_nd_cuda(const Tensor& self, const std::vector<int64_t>& pad,
+                                   Scalar value) {
+    auto input_sizes = self.shape();
+    int64_t l_inp = self.dim();
+    int64_t l_pad = static_cast<int64_t>(pad.size()) / 2;
+
+    if (pad.size() % 2 != 0) {
+        TP_THROW(ValueError, "Length of pad must be even but instead it equals ", pad.size());
+    }
+    if (l_inp < l_pad) {
+        TP_THROW(ValueError, "Length of pad should be no more than twice the number of "
+                 "dimensions of the input. Pad length is ", pad.size(), " while the input has ",
+                 l_inp, " dimensions.");
+    }
+
+    bool all_pads_non_positive = true;
+    Tensor c_input = self;
+    for (int64_t i = l_inp - l_pad; i < l_inp; ++i) {
+        int64_t pad_idx = 2 * (l_inp - i - 1);
+        if (pad[pad_idx] < 0) {
+            c_input = c_input.slice(i, -pad[pad_idx], c_input.size(i));
+        } else if (pad[pad_idx] != 0) {
+            all_pads_non_positive = false;
+        }
+        if (pad[pad_idx + 1] < 0) {
+            c_input = c_input.slice(i, 0, c_input.size(i) + pad[pad_idx + 1]);
+        } else if (pad[pad_idx + 1] != 0) {
+            all_pads_non_positive = false;
+        }
+    }
+
+    if (all_pads_non_positive) {
+        return c_input.clone();
+    }
+
+    std::vector<int64_t> new_shape;
+    new_shape.reserve(l_inp - l_pad);
+    for (int64_t i = 0; i < l_inp - l_pad; ++i) {
+        new_shape.push_back(input_sizes[i]);
+    }
+    for (int64_t i = 0; i < l_pad; ++i) {
+        size_t pad_idx = pad.size() - ((i + 1) * 2);
+        int64_t new_dim = input_sizes[l_inp - l_pad + i] + pad[pad_idx] + pad[pad_idx + 1];
+        if (new_dim < 0) {
+            TP_THROW(ValueError, "The input size ", input_sizes[l_inp - l_pad + i],
+                     ", plus negative padding ", pad[pad_idx], " and ", pad[pad_idx + 1],
+                     " resulted in a negative output size, which is invalid. Check dimension ",
+                     l_inp - l_pad + i, " of your input.");
+        }
+        new_shape.push_back(new_dim);
+    }
+
+    Tensor output = Tensor::empty(new_shape, self.dtype(), self.device());
+    output.fill_(value);
+
+    Tensor c_output = output;
+    for (int64_t i = l_inp - l_pad; i < l_inp; ++i) {
+        int64_t pad_idx = 2 * (l_inp - i - 1);
+        if (pad[pad_idx] > 0) {
+            c_output = c_output.slice(i, pad[pad_idx], c_output.size(i));
+        }
+        if (pad[pad_idx + 1] > 0) {
+            c_output = c_output.slice(i, 0, c_output.size(i) - pad[pad_idx + 1]);
+        }
+    }
+    c_output.copy_(c_input);
+
+    return output;
+}
+
+static Tensor constant_pad_nd_backward_cuda(const Tensor& grad_output,
+                                            const std::vector<int64_t>& pad) {
+    std::vector<int64_t> negated_pad = pad;
+    for (auto& p : negated_pad) p = -p;
+    return constant_pad_nd_cuda(grad_output, negated_pad, Scalar(0));
+}
+
 TENSORPLAY_LIBRARY_IMPL(CUDA, PadKernels) {
     m.impl("reflection_pad_nd", reflection_pad_nd_cuda);
     m.impl("reflection_pad_nd_backward", reflection_pad_nd_backward_cuda);
@@ -239,6 +320,8 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, PadKernels) {
     m.impl("replication_pad_nd_backward", replication_pad_nd_backward_cuda);
     m.impl("circular_pad_nd", circular_pad_nd_cuda);
     m.impl("circular_pad_nd_backward", circular_pad_nd_backward_cuda);
+    m.impl("constant_pad_nd", constant_pad_nd_cuda);
+    m.impl("constant_pad_nd_backward", constant_pad_nd_backward_cuda);
 }
 
 }  // namespace cuda

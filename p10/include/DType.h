@@ -215,18 +215,33 @@ TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(SPECIALIZE_TYPE_TRAITS)
 
 // Helper functions for ScalarType
 inline const char* toString(ScalarType t) {
-#define DEFINE_CASE(ctype, name) \
-    case ScalarType::name:       \
-        return #name;
+    // c10::toString parity -- these spellings appear verbatim in user-facing
+    // messages like '"avg_pool2d" not implemented for 'Long''.  Enum entry
+    // names stay p10-style (Int64 etc.); only the message spelling maps.
+#define TP_TOSTRING_CASE(name, str) \
+    case ScalarType::name:          \
+        return str;
 
     switch (t) {
-        TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(DEFINE_CASE)
+        TP_TOSTRING_CASE(UInt8, "Byte")
+        TP_TOSTRING_CASE(Int8, "Char")
+        TP_TOSTRING_CASE(Int16, "Short")
+        TP_TOSTRING_CASE(Int32, "Int")
+        TP_TOSTRING_CASE(Int64, "Long")
+        TP_TOSTRING_CASE(UInt16, "UInt16")
+        TP_TOSTRING_CASE(UInt32, "UInt32")
+        TP_TOSTRING_CASE(UInt64, "UInt64")
+        TP_TOSTRING_CASE(Float32, "Float")
+        TP_TOSTRING_CASE(Float64, "Double")
+        TP_TOSTRING_CASE(Float16, "Half")
+        TP_TOSTRING_CASE(BFloat16, "BFloat16")
+        TP_TOSTRING_CASE(Bool, "Bool")
         case ScalarType::Undefined:
             return "Undefined";
         default:
             return "UNKNOWN_SCALAR";
     }
-#undef DEFINE_CASE
+#undef TP_TOSTRING_CASE
 }
 
 inline size_t elementSize(ScalarType t) {

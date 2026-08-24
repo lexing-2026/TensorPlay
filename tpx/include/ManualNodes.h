@@ -2,14 +2,191 @@
 #include "Node.h"
 #include "Autograd.h"
 #include "SavedVariable.h"
+#include "tensorplay/ops/TPXOpsGenerated.h"
 #include <tuple>
 #include <utility>
+#include <algorithm>
 
 namespace tensorplay {
 namespace tpx {
 
-// Dummy root node used when executing a graph with multiple roots: it holds
-// the root edges and feeds the root gradients as its outputs.
+// Port of at::is_expandable_to (aten/src/ATen/ExpandUtils.h): can `shape`
+// be expanded to `desired`?  Dims are aligned at the trailing side; a dim
+// may differ from the target only when the *source* dim is 1.
+inline bool is_expandable_to(const std::vector<int64_t>& shape,
+                             const std::vector<int64_t>& desired) {
+    const size_t ndim = shape.size();
+    const size_t target_dim = desired.size();
+    if (ndim > target_dim) return false;
+    for (size_t i = 0; i < ndim; ++i) {
+        const auto size = shape[ndim - i - 1];
+        const auto target = desired[target_dim - i - 1];
+        if (size != target && size != 1) return false;
+    }
+    return true;
+}
+
+// Port of at::_sum_to / at::sum_to (aten/src/ATen/ExpandUtils.h): reduce
+// `tensor` down to `shape` with a single batched keepdim sum over the
+// leading extra dims and any dim whose target size is 1, then view back.
+inline Tensor sum_to(Tensor tensor, const std::vector<int64_t>& shape) {
+    if (shape.empty()) return ops::sum(tensor);
+
+    const auto sizes = static_cast<std::vector<int64_t>>(tensor.shape());
+    std::vector<int64_t> reduce_dims;
+    const int64_t leading_dims =
+        static_cast<int64_t>(sizes.size() - shape.size());
+    for (int64_t i = 0; i < leading_dims; ++i) reduce_dims.push_back(i);
+    for (int64_t i = leading_dims; i < static_cast<int64_t>(sizes.size()); ++i) {
+        if (shape[i - leading_dims] == 1 && sizes[i] != 1)
+            reduce_dims.push_back(i);
+    }
+
+    if (!reduce_dims.empty())
+        tensor = tensor.sum(reduce_dims, /*keepdim=*/true);
+
+    return leading_dims > 0 ? tensor.view(shape) : tensor;
+}
+
+// ATen native op sum_to_size (aten/src/ATen/native/TensorShape.cpp):
+// expandability check + sum_to.
+inline Tensor sum_to_size(const Tensor& self, const std::vector<int64_t>& size) {
+    TP_CHECK(
+        is_expandable_to(size, static_cast<std::vector<int64_t>>(self.shape())),
+        "size ", Size(size).toString(), " is not expandable to size ",
+        self.shape().toString(), ".");
+
+    return sum_to(self, size);
+}
+
+// Faithful port of autograd::repeat_backward
+// (torch/csrc/autograd/FunctionsManual.cpp): guard zero repeats, sum away
+// unsqueezed leading dims, then one reshape to interleaved (repeat, size)
+// pairs — only where repeat != 1 — followed by a single batched sum.
+inline Tensor repeat_backward(Tensor grad, const std::vector<int64_t>& repeats,
+                              const std::vector<int64_t>& input_shape) {
+    if (std::find(repeats.begin(), repeats.end(), 0) != repeats.end()) {
+        return ops::zeros(input_shape, grad.dtype(), grad.device());
+    }
+    const int64_t input_dims = static_cast<int64_t>(input_shape.size());
+    const int64_t num_unsqueezed = grad.dim() - input_dims;
+    for (int64_t i = 0; i < num_unsqueezed; ++i) {
+        grad = grad.sum(std::vector<int64_t>{0}, /*keepdim=*/false);
+    }
+
+    std::vector<int64_t> grad_size;
+    std::vector<int64_t> sum_dims;
+    for (int64_t dim = 0; dim < input_dims; ++dim) {
+        const auto repeat = repeats[dim + num_unsqueezed];
+        // Reshape gradient (repeat > 1); dims repeated once pass through.
+        if (repeat != 1) {
+            grad_size.push_back(repeat);
+            sum_dims.push_back(static_cast<int64_t>(grad_size.size() - 1));
+        }
+        grad_size.push_back(input_shape[dim]);
+    }
+    // One-time reshape & batched sum; empty sum_dims means no repeats beyond
+    // unsqueezing and grad already has input_shape.
+    if (!sum_dims.empty()) {
+        grad = grad.reshape(grad_size);
+        grad = grad.sum(sum_dims);
+    }
+    return grad;
+}
+
+// Derivative of max/min(dim, keepdim): route the incoming gradient to the
+// winning positions.  Recordable composition of unsqueeze/eq/mul -- the
+// upstream namesake native (FunctionsManual.cpp) does the same with
+// dispatched at:: ops, so create_graph sees through max/min(dim).
+inline Tensor value_selecting_reduction_backward(const Tensor& grad, int64_t dim,
+                                                 const Tensor& indices,
+                                                 const Tensor& self, bool keepdim) {
+    const int64_t nd = self.dim();
+    TP_CHECK(nd > 0, "value_selecting_reduction_backward expects a non-scalar input");
+    const int64_t d = dim < 0 ? dim + nd : dim;
+    Tensor g = grad;
+    Tensor idx = indices;
+    if (!keepdim) {
+        g = ops::unsqueeze(g, d);
+        idx = ops::unsqueeze(idx, d);
+    }
+    // Position iota shaped as ones everywhere except the reduced dim, so the
+    // equality broadcast marks exactly the winning slot per output element.
+    std::vector<int64_t> iota_sizes(static_cast<size_t>(nd), 1);
+    iota_sizes[static_cast<size_t>(d)] = self.size(d);
+    Tensor pos = ops::arange(Scalar(self.size(d)), DType::Int64, self.device());
+    pos = pos.reshape(iota_sizes);
+    Tensor mask = ops::eq(idx, pos);
+    if (mask.dtype() != g.dtype()) mask = mask.to(g.dtype());
+    return ops::mul(g, mask);
+}
+
+// Derivative of mean(dim, keepdim): re-insert the reduced dims, scale by the
+// kept-element count, then EXPAND back to self's shape.  The expansion must
+// be a recorded op (ExpandBackward -> sum_to_size): a bare broadcast would
+// leave singleton dims in the gradient shape, silently corrupting
+// second-order results.
+inline Tensor broadcast_mean_backward(const Tensor& grad, const Tensor& self,
+                                      const std::vector<int64_t>& dims, bool keepdim) {
+    Tensor g = grad;
+    if (!keepdim) {
+        std::vector<int64_t> sorted;
+        sorted.reserve(dims.size());
+        for (auto d : dims) {
+            const int64_t dd = d < 0 ? d + static_cast<int64_t>(self.dim()) : d;
+            TP_CHECK(dd >= 0 && dd < self.dim(), "Dimension out of range");
+            sorted.push_back(dd);
+        }
+        std::sort(sorted.begin(), sorted.end());
+        for (auto d : sorted) g = ops::unsqueeze(g, d);
+    }
+    const double count =
+        static_cast<double>(self.numel()) / static_cast<double>(g.numel());
+    Tensor scaled = ops::div(g, Scalar(count));
+    return ops::expand(scaled,
+                       static_cast<std::vector<int64_t>>(self.shape()));
+}
+
+// block_diag backward: scatter each output-block gradient back to its input.
+// Upstream derives this from CopySlices on the zeros+slice+copy_ composite;
+// our copy_ does not yet record view mutation, so the layout is explicit.
+// Block extents follow the forward promotion: 0-D -> 1x1, 1-D -> (1, n).
+struct BlockDiagBackward : public Node {
+    std::vector<SavedVariable> tensors_;
+
+    explicit BlockDiagBackward(std::vector<Tensor> tensors) {
+        tensors_.reserve(tensors.size());
+        for (auto& t : tensors) tensors_.emplace_back(std::move(t));
+    }
+
+    size_t num_inputs() const override { return 1; }
+
+    variable_list apply(variable_list&& inputs) override {
+        const Tensor& grad = inputs.empty() ? Tensor() : inputs[0];
+        variable_list grads;
+        grads.reserve(tensors_.size());
+        int64_t off0 = 0, off1 = 0;
+        for (auto& sv : tensors_) {
+            Tensor t = sv.unpack();
+            const int64_t h = (t.dim() == 0) ? 1 : (t.dim() == 1 ? 1 : t.size(0));
+            const int64_t w = (t.dim() == 0) ? 1 : (t.dim() == 1 ? t.size(0) : t.size(1));
+            Tensor g;
+            if (grad.defined()) {
+                g = grad.slice(0, off0, off0 + h)
+                         .slice(1, off1, off1 + w);
+                if (t.dim() == 1) g = g.squeeze(0);
+                else if (t.dim() == 0) g = g.reshape({});
+            } else {
+                g = Tensor();
+            }
+            grads.push_back(g);
+            off0 += h;
+            off1 += w;
+        }
+        return grads;
+    }
+};
+
 struct GraphRoot : public Node {
     GraphRoot(edge_list functions, variable_list inputs)
         : functions_(std::move(functions)), inputs_(std::move(inputs)) {
@@ -22,50 +199,6 @@ struct GraphRoot : public Node {
 
     edge_list functions_;
     variable_list inputs_;
-};
-
-struct SelectBackward : public Node {
-    std::vector<int64_t> input_shape_;
-    int64_t dim_;
-    int64_t index_;
-    DType dtype_;
-    Device device_;
-
-    SelectBackward(Size shape, int64_t dim, int64_t index, DType dtype, Device device)
-        : input_shape_(static_cast<std::vector<int64_t>>(shape)), dim_(dim), index_(index), dtype_(dtype), device_(device) {}
-
-    variable_list apply(variable_list&& inputs) override {
-        if (inputs.empty() || !inputs[0].defined()) return {Tensor()};
-        Tensor grad = inputs[0];
-        
-        Tensor grad_input = Tensor::zeros(input_shape_, dtype_, device_);
-        grad_input.select(dim_, index_).copy_(grad);
-
-        return {grad_input};
-    }
-};
-
-struct SliceBackward : public Node {
-    std::vector<int64_t> input_shape_;
-    int64_t dim_;
-    int64_t start_;
-    int64_t end_;
-    int64_t step_;
-    DType dtype_;
-    Device device_;
-
-    SliceBackward(Size shape, int64_t dim, int64_t start, int64_t end, int64_t step, DType dtype, Device device)
-        : input_shape_(static_cast<std::vector<int64_t>>(shape)), dim_(dim), start_(start), end_(end), step_(step), dtype_(dtype), device_(device) {}
-
-    variable_list apply(variable_list&& inputs) override {
-        if (inputs.empty() || !inputs[0].defined()) return {Tensor()};
-        Tensor grad = inputs[0];
-        
-        Tensor grad_input = Tensor::zeros(input_shape_, dtype_, device_);
-        grad_input.slice(dim_, start_, end_, step_).copy_(grad);
-
-        return {grad_input};
-    }
 };
 
 struct AsStridedBackward : public Node {
@@ -154,6 +287,94 @@ struct MeanBackward : public Node {
     void release_variables() override {
         Node::release_variables();
         self_.reset_data();
+    }
+};
+
+// matmul backward over every dim combination (dot / vec@mat / mat@vec /
+// batched with broadcasting).  Upstream likewise keeps a hand-written native
+// (matmul_backward, LinearAlgebra.cpp) because derivative formulas cannot
+// branch on dim(); like upstream, every step composes dispatched recordable
+// primitives, so create_graph sees a graph through `@` (double-backward).
+struct MatmulBackward : public Node {
+    SavedVariable self_;
+    SavedVariable other_;
+
+    explicit MatmulBackward(Tensor self, Tensor other)
+        : self_(std::move(self)), other_(std::move(other)) {}
+
+    variable_list apply(variable_list&& inputs) override {
+        if (inputs.empty() || !inputs[0].defined()) return {Tensor(), Tensor()};
+        const Tensor grad = inputs[0];
+        const Tensor self = self_.unpack();
+        const Tensor other = other_.unpack();
+        const bool self_vector = self.dim() == 1;
+        const bool other_vector = other.dim() == 1;
+
+        if (isComplexType(self.dtype())) {
+            // The complex adjoint is the conjugate transpose; the recordable
+            // conj building blocks (select/slice derivatives) are not wired
+            // yet, so delegate to the retained native helper ops -- values
+            // match upstream exactly, but the complex branch does not record
+            // (same depth as before this node existed).
+            return {ops::matmul_backward_self(grad, self, other),
+                    ops::matmul_backward_other(grad, self, other)};
+        }
+
+        // Normalize vectors into matrix space (same convention as the fused
+        // matmul_backward kernels and upstream LinearAlgebra.cpp).
+        Tensor self_m = self_vector ? ops::unsqueeze(self, 0) : self;
+        Tensor other_m = other_vector ? ops::unsqueeze(other, -1) : other;
+        Tensor grad_m = grad;
+        if (self_vector && other_vector) {
+            grad_m = ops::unsqueeze(ops::unsqueeze(grad, 0), 0);
+        } else if (self_vector) {
+            grad_m = ops::unsqueeze(grad, -2);
+        } else if (other_vector) {
+            grad_m = ops::unsqueeze(grad, -1);
+        }
+
+        auto adjoint = [](const Tensor& t) {
+            return t.dim() == 2 ? ops::t(t) : ops::transpose(t, -2, -1);
+        };
+        // Broadcast-accumulate `g` down to `target` (port of the kernels'
+        // sum_to_shape_cpu, expressed with a recordable batched keepdim sum).
+        auto reduce_to = [](const Tensor& g, const Tensor& target) {
+            const auto src = static_cast<std::vector<int64_t>>(g.shape());
+            const auto dst = static_cast<std::vector<int64_t>>(target.shape());
+            std::vector<int64_t> dims;
+            const int64_t leading =
+                static_cast<int64_t>(src.size() - dst.size());
+            for (int64_t i = 0; i < leading; ++i) dims.push_back(i);
+            for (int64_t i = 0; i < static_cast<int64_t>(dst.size()); ++i) {
+                if (dst[i] == 1 && src[leading + i] != 1)
+                    dims.push_back(leading + i);
+            }
+            if (dims.empty()) return g;
+            Tensor out = ops::sum(g, dims, /*keepdim=*/true);
+            if (out.dim() != static_cast<int64_t>(dst.size()))
+                out = ops::reshape(out, dst);
+            return out;
+        };
+
+        Tensor grad_self = ops::matmul(grad_m, adjoint(other_m));
+        grad_self = reduce_to(grad_self, self_m);
+        if (self_vector) grad_self = ops::squeeze(grad_self, 0);
+        if (grad_self.dtype() != self.dtype())
+            grad_self = grad_self.to(self.dtype());
+
+        Tensor grad_other = ops::matmul(adjoint(self_m), grad_m);
+        grad_other = reduce_to(grad_other, other_m);
+        if (other_vector) grad_other = ops::squeeze(grad_other, -1);
+        if (grad_other.dtype() != other.dtype())
+            grad_other = grad_other.to(other.dtype());
+
+        return {grad_self, grad_other};
+    }
+
+    void release_variables() override {
+        Node::release_variables();
+        self_.reset_data();
+        other_.reset_data();
     }
 };
 
