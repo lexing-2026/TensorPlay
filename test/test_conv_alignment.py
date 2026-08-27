@@ -29,10 +29,16 @@ def _grads_torch(fn, *inputs):
     return [x.grad if x.dtype.is_floating_point else None for x in t_inputs], out.detach(), grad
 
 
-def _grads_tp(fn, *inputs):
+def _grads_tp(fn, *inputs, tangent=None):
     t_inputs = [x.clone().requires_grad_(True) for x in inputs]
     out = fn(*t_inputs)
-    grad = tp.randn(*out.shape)
+    # The torch-side helper draws its tangent from torch's RNG; comparing
+    # gradients requires BOTH sides to consume the same tangent (the two RNG
+    # streams are unrelated).
+    if tangent is not None:
+        grad = tp.tensor(tangent.detach().numpy())
+    else:
+        grad = tp.randn(*out.shape)
     out.backward(grad)
     return [x.grad for x in t_inputs], out.detach(), grad
 
@@ -43,6 +49,9 @@ def _make(shape, dtype=torch.float32, seed=0):
 
 
 def _to_tp(t):
+    if t.dtype == torch.bfloat16:
+        # numpy has no bfloat16; bf16 values are exactly representable in f32
+        return tp.tensor(t.detach().float().numpy()).to(tp.bfloat16)
     return tp.tensor(t.detach().numpy())
 
 
@@ -66,7 +75,7 @@ class TestConvTranspose1d(unittest.TestCase):
         got = lambda x, w, b: F.conv_transpose1d(x, w, b, stride=2, padding=1,
                                                  output_padding=1, groups=1)
         grads_t, out_t, g_t = _grads_torch(ref, x_t, w_t, b_t)
-        grads_p, out_p, g_p = _grads_tp(got, _to_tp(x_t), _to_tp(w_t), _to_tp(b_t))
+        grads_p, out_p, g_p = _grads_tp(got, _to_tp(x_t), _to_tp(w_t), _to_tp(b_t), tangent=g_t)
         _assert_close(out_p, out_t, "conv_transpose1d forward")
         for i, name in enumerate(["input", "weight", "bias"]):
             _assert_close(grads_p[i], grads_t[i], f"conv_transpose1d grad {name}")
@@ -89,8 +98,8 @@ class TestUnfoldFold(unittest.TestCase):
         x_t = _make((2, 3, 8, 8))
         ref = lambda x: TF.unfold(x, kernel_size=3, padding=1, stride=2, dilation=1)
         got = lambda x: F.unfold(x, kernel_size=3, padding=1, stride=2, dilation=1)
-        grads_t, out_t, _ = _grads_torch(ref, x_t)
-        grads_p, out_p, _ = _grads_tp(got, _to_tp(x_t))
+        grads_t, out_t, g_t = _grads_torch(ref, x_t)
+        grads_p, out_p, _ = _grads_tp(got, _to_tp(x_t), tangent=g_t)
         _assert_close(out_p, out_t, "F.unfold forward")
         _assert_close(grads_p[0], grads_t[0], "F.unfold backward")
 
@@ -100,8 +109,8 @@ class TestUnfoldFold(unittest.TestCase):
         col = TF.unfold(x_img, kernel_size=3, padding=1, stride=2)
         ref = lambda c: TF.fold(c, output_size=(8, 8), kernel_size=3, padding=1, stride=2)
         got = lambda c: F.fold(c, output_size=(8, 8), kernel_size=3, padding=1, stride=2)
-        grads_t, out_t, _ = _grads_torch(ref, col)
-        grads_p, out_p, _ = _grads_tp(got, _to_tp(col))
+        grads_t, out_t, g_t = _grads_torch(ref, col)
+        grads_p, out_p, _ = _grads_tp(got, _to_tp(col), tangent=g_t)
         _assert_close(out_p, out_t, "F.fold forward")
         _assert_close(grads_p[0], grads_t[0], "F.fold backward")
 
@@ -111,7 +120,7 @@ class TestUnfoldFold(unittest.TestCase):
         x = _make((2, 5, 3, 4))
         out = u(_to_tp(x))
         self.assertEqual(tuple(out.shape), (2, 30, 4))
-        rec = f(tp.randn(2, 20, 6))
+        rec = f(tp.randn(2, 20, 12))  # L must equal the (4-2+1)*(5-2+1)=12 blocks
         self.assertEqual(tuple(rec.shape), (2, 5, 4, 5))
 
 
@@ -120,8 +129,8 @@ class TestPadModes(unittest.TestCase):
         x_t = _make(shape, seed=seed)
         ref = lambda x: TF.pad(x, pad, mode=mode)
         got = lambda x: F.pad(x, pad, mode=mode)
-        grads_t, out_t, _ = _grads_torch(ref, x_t)
-        grads_p, out_p, _ = _grads_tp(got, _to_tp(x_t))
+        grads_t, out_t, g_t = _grads_torch(ref, x_t)
+        grads_p, out_p, _ = _grads_tp(got, _to_tp(x_t), tangent=g_t)
         _assert_close(out_p, out_t, f"F.pad {mode} forward {shape} {pad}")
         _assert_close(grads_p[0], grads_t[0], f"F.pad {mode} backward {shape} {pad}")
 
@@ -196,8 +205,8 @@ class TestTensorUnfoldView(unittest.TestCase):
 class TestConvTbc(unittest.TestCase):
     def test_matches_torch(self):
         x_t = _make((6, 2, 3))       # (T, B, C)
-        w_t = _make((3, 3))          # (k, C)
-        b_t = _make((3,))
+        w_t = _make((3, 3, 5))       # (k, C_in, C_out) -- torch contract
+        b_t = _make((5,))
         ref = torch.conv_tbc(x_t, w_t, b_t, 2)
         got = F.conv_tbc(_to_tp(x_t), _to_tp(w_t), _to_tp(b_t), 2)
         _assert_close(got, ref, "conv_tbc")
@@ -226,8 +235,8 @@ class TestFloat64Conv(unittest.TestCase):
         b_t = _make((4,), dtype=torch.float64, seed=11)
         ref = lambda x, w, b: TF.conv2d(x, w, b, stride=1, padding=1)
         got = lambda x, w, b: F.conv2d(x, w, b, stride=1, padding=1)
-        grads_t, out_t, _ = _grads_torch(ref, x_t, w_t, b_t)
-        grads_p, out_p, _ = _grads_tp(got, _to_tp(x_t), _to_tp(w_t), _to_tp(b_t))
+        grads_t, out_t, g_t = _grads_torch(ref, x_t, w_t, b_t)
+        grads_p, out_p, _ = _grads_tp(got, _to_tp(x_t), _to_tp(w_t), _to_tp(b_t), tangent=g_t)
         _assert_close(out_p, out_t, "conv2d f64 forward", tol=TOL64)
         for i, name in enumerate(["input", "weight", "bias"]):
             _assert_close(grads_p[i], grads_t[i], f"conv2d f64 grad {name}", tol=TOL64)
@@ -237,8 +246,8 @@ class TestFloat64Conv(unittest.TestCase):
         w_t = _make((3, 2, 3, 3, 3), dtype=torch.float64, seed=13)
         ref = lambda x, w: TF.conv3d(x, w, None, stride=1, padding=1)
         got = lambda x, w: F.conv3d(x, w, None, stride=1, padding=1)
-        grads_t, out_t, _ = _grads_torch(ref, x_t, w_t)
-        grads_p, out_p, _ = _grads_tp(got, _to_tp(x_t), _to_tp(w_t))
+        grads_t, out_t, g_t = _grads_torch(ref, x_t, w_t)
+        grads_p, out_p, _ = _grads_tp(got, _to_tp(x_t), _to_tp(w_t), tangent=g_t)
         _assert_close(out_p, out_t, "conv3d f64 forward", tol=TOL64)
         _assert_close(grads_p[0], grads_t[0], "conv3d f64 grad input", tol=TOL64)
         _assert_close(grads_p[1], grads_t[1], "conv3d f64 grad weight", tol=TOL64)
@@ -254,8 +263,10 @@ class TestFloat64Conv(unittest.TestCase):
 
 class TestLowPrecisionCPU(unittest.TestCase):
     def _check(self, fwd_tp, fwd_torch, inputs, tol):
-        outs_t = [fwd_torch(*[torch.tensor(x.detach().numpy()) for x in inputs])]
-        outs_p = [fwd_tp(*inputs)]
+        # inputs are torch tensors already; a numpy detour would drop
+        # bfloat16 (numpy has no bf16) and perturb fp16.
+        outs_t = [fwd_torch(*[x.clone() for x in inputs])]
+        outs_p = [fwd_tp(*[_to_tp(x) for x in inputs])]
         _assert_close(outs_p[0], outs_t[0], "low-precision conv", tol=tol)
 
     def test_conv2d_half(self):

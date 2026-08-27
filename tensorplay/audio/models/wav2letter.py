@@ -1,4 +1,4 @@
-from torch import nn, Tensor
+from tensorplay import nn, Tensor
 
 __all__ = [
     "Wav2Letter",
@@ -10,7 +10,7 @@ class Wav2Letter(nn.Module):
     Recognition System* :cite:`collobert2016wav2letter`.
 
     See Also:
-        * `Training example <https://github.com/pytorch/audio/tree/release/0.12/examples/pipeline_wav2letter>`__
+        * `Training example <https://github.com/tensorplay/audio/tree/release/0.12/examples/pipeline_wav2letter>`__
 
     Args:
         num_classes (int, optional): Number of classes to be classified. (Default: ``40``)
@@ -61,7 +61,7 @@ class Wav2Letter(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         r"""
         Args:
-            x (torch.Tensor): Tensor of dimension (batch_size, num_features, input_length).
+            x (tensorplay.Tensor): Tensor of dimension (batch_size, num_features, input_length).
 
         Returns:
             Tensor: Predictor tensor of dimension (batch_size, number_of_classes, input_length).

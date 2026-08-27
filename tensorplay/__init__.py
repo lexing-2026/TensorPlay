@@ -146,13 +146,15 @@ if sys.platform == 'win32':
 elif sys.platform.startswith('linux'):
     def _get_cuda_dep_paths(path, lib_folder, lib_name):
         paths = []
+        # Exact wheel layout only (nvidia/cuda_runtime, nvidia/cublas, ...).
+        # A broad 'nvidia/cu*' glob would also swallow foreign major-version
+        # wheels like nvidia/cu13 and dlopen the wrong libcudart SONAME,
+        # poisoning later loads of the versioned .so.12 that torch needs.
         paths.extend(glob.glob(os.path.join(path, 'nvidia', lib_folder, 'lib', lib_name)))
-        paths.extend(glob.glob(os.path.join(path, 'nvidia', 'cu*', 'lib', lib_name)))
         paths.extend(glob.glob(os.path.join(path, lib_folder, 'lib', lib_name)))
         if not paths and '.so.' in lib_name:
             stem = lib_name.split('.so.', 1)[0]
             paths.extend(glob.glob(os.path.join(path, 'nvidia', lib_folder, 'lib', stem + '.so')))
-            paths.extend(glob.glob(os.path.join(path, 'nvidia', 'cu*', 'lib', stem + '.so')))
             paths.extend(glob.glob(os.path.join(path, lib_folder, 'lib', stem + '.so')))
         return paths
 
@@ -207,9 +209,13 @@ except (ImportError, OSError) as _load_error:
     else:
         raise
 
+# torch._C._log_api_usage_once parity: usage telemetry hook; a no-op here.
+if not hasattr(_C, "_log_api_usage_once"):
+    _C._log_api_usage_once = lambda *args, **kwargs: None
+
 from ._tensor import Tensor
 from ._C import (tensor, DType, Size, Scalar, Device, DeviceType,
-                from_dlpack, to_dlpack, set_printoptions,
+                from_dlpack, to_dlpack, from_numpy, frombuffer, set_printoptions,
                 default_generator, manual_seed, seed, initial_seed, Generator,
                 get_rng_state, set_rng_state,
                 set_num_threads, get_num_threads, get_thread_num,
@@ -308,6 +314,7 @@ __all__ = [
     "in_parallel_region", "get_parallel_info",
     "default_generator", "manual_seed", "seed", "initial_seed", "Generator",
     "get_rng_state", "set_rng_state", "fork_rng",
+    "DeviceMismatchError",
     "__config__",
 ]
 
@@ -379,10 +386,14 @@ from ._C import (
     permute_backward, poisson, pow, prod, rand, rand_like, randint, 
     randint_like, randn, randn_like, randperm, relu, reshape, round, 
     rsqrt, sigmoid, sign, silu, sin, sinh, softmax, split, sqrt, square, 
-    squeeze, squeeze_backward, stack, std, sum, t, tan, tanh, 
-    threshold_backward, transpose, unbind, unsqueeze, var, zeros, 
+    squeeze, squeeze_backward, stack, std, sum, t, tan, tanh,
+    threshold_backward, transpose, unbind, unsqueeze, var, zeros,
     zeros_like, as_tensor,
 )
+
+# Catchable device-mismatch error raised by the C++ core (RuntimeError
+# subclass); kept explicit because it is an exception type, not an op.
+DeviceMismatchError = _C.DeviceMismatchError
 
 __attr_name, __obj = "", None
 for __attr_name in dir(_C):
@@ -464,10 +475,12 @@ from ._shape_funcs import *
 from ._composite_funcs import *
 from ._einsum import einsum
 from .utils.comparison import allclose
+
+from ._ops import ops as ops
 from . import compiler
 from .compiler import compile
 from . import library
-from ._ops import ops as ops
+from . import profiler
 
 # -------------------------------------------------------------------------
 # Submodules
@@ -964,18 +977,92 @@ __all__.extend(
 from tensorplay import functional as functional
 from tensorplay.functional import *
 
+# Re-pin the einsum shim: functional.py's thin wrapper predates the sublist
+# calling convention; _einsum.einsum supersedes it (torch/functional parity).
+# quantile/nanquantile/histogram need the same treatment: the generated
+# functional.py wrappers forward a raw Python-number `q` (the _C binding
+# requires a Tensor) and drop `histogram`'s `range` keyword, so the
+# hand-written _composite_funcs versions (scalar-q -> input-dtype Tensor
+# coercion, range kwarg, torch-parity validation) are re-pinned here.
+from ._einsum import einsum as einsum
+from ._composite_funcs import quantile as quantile
+from ._composite_funcs import nanquantile as nanquantile
+from ._composite_funcs import histogram as histogram
+from ._finfo import finfo, iinfo
+from . import jit
+
 # Python's ``import *`` intentionally omits underscore-prefixed names, but
 # Torch exposes the foreach dispatcher family at the top level.  Re-export
 # only generated ``_foreach_*`` wrappers; their implementation is still the
 # native dispatcher/backend and this block does not introduce a Python
 # composite operator.  ``_amp_*`` dispatcher hooks follow the same rule
-# (torch._amp_foreach_non_finite_check_and_unscale_ / torch._amp_update_scale_).
+# (torch._amp_foreach_non_finite_check_and_unscale_ / torch._amp_update_scale_)
+# and the fused optimizer entry points mirror torch._fused_adam_/torch._fused_adamw_/
+# torch._fused_sgd_/torch._fused_adagrad_.
 for _foreach_name in dir(functional):
-    if _foreach_name.startswith("_foreach_") or _foreach_name.startswith("_amp_"):
+    if (_foreach_name.startswith("_foreach_") or _foreach_name.startswith("_amp_")
+            or _foreach_name.startswith("_fused_")):
         globals()[_foreach_name] = getattr(functional, _foreach_name)
         if _foreach_name not in __all__:
             __all__.append(_foreach_name)
 del _foreach_name
+
+
+# -------------------------------------------------------------------------
+# torch.max / torch.min overload parity (must follow the final
+# ``from tensorplay.functional import *`` above, which shadows earlier defs).
+#
+# torch exposes three faces on these names: global reduction, (dim, keepdim)
+# reduction returning a named tuple with ``values``/``indices``, and the
+# elementwise binary form ``torch.max(input, other)``.  The codegen binds the
+# reduction faces only, so the binary face and the named-tuple contract are
+# restored here at the package boundary.
+# -------------------------------------------------------------------------
+import collections as _collections
+
+_max_return_type = _collections.namedtuple("max_return_type", ["values", "indices"])
+_min_return_type = _collections.namedtuple("min_return_type", ["values", "indices"])
+
+
+def max(input, other=None, *, dim=None, keepdim=False):
+    if other is not None:
+        return _C.maximum(input, other)
+    result = functional.max(input, dim=dim, keepdim=keepdim)
+    if dim is not None and isinstance(result, tuple):
+        return _max_return_type(*result)
+    return result
+
+
+def min(input, other=None, *, dim=None, keepdim=False):
+    if other is not None:
+        return _C.minimum(input, other)
+    result = functional.min(input, dim=dim, keepdim=keepdim)
+    if dim is not None and isinstance(result, tuple):
+        return _min_return_type(*result)
+    return result
+
+
+def gradient(input, *, spacing=None, dim=None, edge_order=1):
+    """``torch.gradient`` parity: accept scalar / mixed scalar-or-Tensor lists.
+
+    The native binding only takes ``Tensor[]`` spacing / ``int[]`` dim;
+    materialize python numbers into scalar tensors typed like ``input`` (a
+    single scalar applies to every dimension).
+    """
+    dims = [dim] if isinstance(dim, builtins.int) else (
+        list(dim) if dim is not None else list(range(input.dim())))
+    if spacing is None:
+        sp = []
+    elif isinstance(spacing, (builtins.int, builtins.float)):
+        sp = [full([], spacing, dtype=input.dtype) for _ in dims]
+    elif isinstance(spacing, Tensor):
+        # A single coordinate tensor (numpy-style) applies to every
+        # requested dimension; the kernel broadcasts numel()==n vs ==1.
+        sp = [spacing]
+    else:
+        sp = [v if isinstance(v, Tensor) else full([], v, dtype=input.dtype)
+              for v in spacing]
+    return _C.gradient(self=input, spacing=sp, dim=dims, edge_order=edge_order)
 
 ################################################################################
 # Import most common subpackages
@@ -1022,6 +1109,7 @@ else:
         "audio",
         "export",
         "fft",
+        "linalg",
         "quantization",
         "sparse",
         "special",

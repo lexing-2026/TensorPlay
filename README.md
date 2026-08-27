@@ -1,6 +1,6 @@
 <div align="center">
     <p>
-        <img src="https://raw.githubusercontent.com/bluemoon-o2/TensorPlay/main/docs/images/logo.png" alt="TensorPlay" width="400">
+        <img src="https://raw.githubusercontent.com/bluemoon-o2/TensorPlay/main/docs/images/tensorplay-mark.png" alt="TensorPlay mark" width="180">
     </p>
 
 <!-- Language Switch -->

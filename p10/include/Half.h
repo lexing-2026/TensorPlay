@@ -19,6 +19,15 @@
 #define TP_HOST_DEVICE
 #endif
 
+// std::bit_cast needs C++20; nvcc is often invoked under an older -std via
+// CMake dialect machinery.  __builtin_bit_cast (GCC 11 / Clang 13 / nvcc 12+)
+// carries identical semantics with no dialect requirement.
+#if defined(__GNUC__) || defined(__clang__) || defined(__CUDACC__)
+#define TP_BIT_CAST(dst_t, src) __builtin_bit_cast(dst_t, (src))
+#else
+#define TP_BIT_CAST(dst_t, src) std::bit_cast<dst_t>(src)
+#endif
+
 namespace tensorplay {
 
 struct alignas(2) Half {
@@ -75,7 +84,7 @@ struct alignas(2) Half {
 namespace detail {
 
 inline uint16_t float_to_half_bits(float f) {
-  uint32_t bits = std::bit_cast<uint32_t>(f);
+  uint32_t bits = TP_BIT_CAST(uint32_t, f);
   uint32_t sign = (bits >> 16) & 0x8000u;
   int32_t exponent = ((bits >> 23) & 0xFFu) - 127 + 15;
   uint32_t mantissa = bits & 0x7FFFFFu;
@@ -131,7 +140,7 @@ inline float half_to_float_bits(uint16_t h) {
 
   if (exponent == 0) {
     if (mantissa == 0) {
-      return std::bit_cast<float>(sign);
+      return TP_BIT_CAST(float, sign);
     }
     // Subnormal: normalize
     uint32_t e = 127 - 15 + 1;
@@ -140,12 +149,12 @@ inline float half_to_float_bits(uint16_t h) {
       e--;
     }
     mantissa &= 0x3FFu;
-    return std::bit_cast<float>(sign | (e << 23) | (mantissa << 13));
+    return TP_BIT_CAST(float, sign | (e << 23) | (mantissa << 13));
   }
   if (exponent == 0x1F) {
-    return std::bit_cast<float>(sign | 0x7F800000u | (mantissa << 13));
+    return TP_BIT_CAST(float, sign | 0x7F800000u | (mantissa << 13));
   }
-  return std::bit_cast<float>(sign | ((exponent - 15 + 127) << 23) | (mantissa << 13));
+  return TP_BIT_CAST(float, sign | ((exponent - 15 + 127) << 23) | (mantissa << 13));
 }
 
 } // namespace detail
@@ -202,22 +211,22 @@ inline TP_HOST_DEVICE bool operator>=(const Half& a, const Half& b) {
 // Mixed-type overloads used by generic kernels that mix Half with
 // double/int64_t scalars. Without these, the implicit conversions in both
 // directions make the built-in operator ambiguous.
-inline TP_HOST_DEVICE Half operator+(const Half& a, double b) { return a + Half(b); }
-inline TP_HOST_DEVICE Half operator+(double a, const Half& b) { return Half(a) + b; }
-inline TP_HOST_DEVICE Half operator-(const Half& a, double b) { return a - Half(b); }
-inline TP_HOST_DEVICE Half operator-(double a, const Half& b) { return Half(a) - b; }
-inline TP_HOST_DEVICE Half operator*(const Half& a, double b) { return a * Half(b); }
-inline TP_HOST_DEVICE Half operator*(double a, const Half& b) { return Half(a) * b; }
-inline TP_HOST_DEVICE Half operator/(const Half& a, double b) { return a / Half(b); }
-inline TP_HOST_DEVICE Half operator/(double a, const Half& b) { return Half(a) / b; }
-inline TP_HOST_DEVICE Half operator+(const Half& a, float b) { return a + Half(b); }
-inline TP_HOST_DEVICE Half operator+(float a, const Half& b) { return Half(a) + b; }
-inline TP_HOST_DEVICE Half operator-(const Half& a, float b) { return a - Half(b); }
-inline TP_HOST_DEVICE Half operator-(float a, const Half& b) { return Half(a) - b; }
-inline TP_HOST_DEVICE Half operator*(const Half& a, float b) { return a * Half(b); }
-inline TP_HOST_DEVICE Half operator*(float a, const Half& b) { return Half(a) * b; }
-inline TP_HOST_DEVICE Half operator/(const Half& a, float b) { return a / Half(b); }
-inline TP_HOST_DEVICE Half operator/(float a, const Half& b) { return Half(a) / b; }
+inline TP_HOST_DEVICE double operator+(Half a, double b) { return static_cast<double>(a) + b; }
+inline TP_HOST_DEVICE double operator+(double a, Half b) { return a + static_cast<double>(b); }
+inline TP_HOST_DEVICE double operator-(Half a, double b) { return static_cast<double>(a) - b; }
+inline TP_HOST_DEVICE double operator-(double a, Half b) { return a - static_cast<double>(b); }
+inline TP_HOST_DEVICE double operator*(Half a, double b) { return static_cast<double>(a) * b; }
+inline TP_HOST_DEVICE double operator*(double a, Half b) { return a * static_cast<double>(b); }
+inline TP_HOST_DEVICE double operator/(Half a, double b) { return static_cast<double>(a) / b; }
+inline TP_HOST_DEVICE double operator/(double a, Half b) { return a / static_cast<double>(b); }
+inline TP_HOST_DEVICE float operator+(Half a, float b) { return static_cast<float>(a) + b; }
+inline TP_HOST_DEVICE float operator+(float a, Half b) { return a + static_cast<float>(b); }
+inline TP_HOST_DEVICE float operator-(Half a, float b) { return static_cast<float>(a) - b; }
+inline TP_HOST_DEVICE float operator-(float a, Half b) { return a - static_cast<float>(b); }
+inline TP_HOST_DEVICE float operator*(Half a, float b) { return static_cast<float>(a) * b; }
+inline TP_HOST_DEVICE float operator*(float a, Half b) { return a * static_cast<float>(b); }
+inline TP_HOST_DEVICE float operator/(Half a, float b) { return static_cast<float>(a) / b; }
+inline TP_HOST_DEVICE float operator/(float a, Half b) { return a / static_cast<float>(b); }
 inline TP_HOST_DEVICE Half operator+(const Half& a, int64_t b) { return a + Half(b); }
 inline TP_HOST_DEVICE Half operator+(int64_t a, const Half& b) { return Half(a) + b; }
 inline TP_HOST_DEVICE Half operator-(const Half& a, int64_t b) { return a - Half(b); }

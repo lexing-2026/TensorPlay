@@ -45,3 +45,19 @@ void init_stax(py::module_& m);
 void init_parallel(py::module_& m);
 void init_distributed(py::module_& m);
 void init_cuda_graph(py::module_& m);
+
+namespace tensorplay {
+class Exception;
+
+// Single source of truth for C++ -> Python exception translation, shared by
+// the pybind11 translator and the METH_FASTCALL bridge (defined in
+// CPythonBridge.cpp): maps p10 exception kinds to their Python types (incl.
+// the registered DeviceMismatchError subclass). Callers pass the result to
+// PyErr_SetString together with the message.
+PyObject* translate_exception(const Exception& e);
+
+// Registers the Python type object for DeviceMismatchError (called once by
+// init.cpp during module init; before that, translation falls back to plain
+// RuntimeError).
+void set_device_mismatch_error_type(PyObject* type);
+} // namespace tensorplay

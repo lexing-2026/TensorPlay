@@ -3,9 +3,9 @@
 import warnings
 from typing import Optional, Union
 
-import tensorplay as torch
+import tensorplay as tensorplay
 from tensorplay import Tensor
-from torch.nn.functional import conv2d, grid_sample, interpolate, pad as torch_pad
+from tensorplay.nn.functional import conv2d, grid_sample, interpolate, pad as torch_pad
 
 
 def _is_tensor_a_torch_image(x: Tensor) -> bool:
@@ -14,7 +14,7 @@ def _is_tensor_a_torch_image(x: Tensor) -> bool:
 
 def _assert_image_tensor(img: Tensor) -> None:
     if not _is_tensor_a_torch_image(img):
-        raise TypeError("Tensor is not a torch image.")
+        raise TypeError("Tensor is not a tensorplay image.")
 
 
 def get_dimensions(img: Tensor) -> list[int]:
@@ -40,18 +40,18 @@ def get_image_num_channels(img: Tensor) -> int:
     raise TypeError(f"Input ndim should be 2 or more. Got {img.ndim}")
 
 
-def _max_value(dtype: torch.dtype) -> int:
-    if dtype == torch.uint8:
+def _max_value(dtype: tensorplay.dtype) -> int:
+    if dtype == tensorplay.uint8:
         return 255
-    elif dtype == torch.int8:
+    elif dtype == tensorplay.int8:
         return 127
-    elif dtype == torch.int16:
+    elif dtype == tensorplay.int16:
         return 32767
-    elif dtype == torch.uint16:
+    elif dtype == tensorplay.uint16:
         return 65535
-    elif dtype == torch.int32:
+    elif dtype == tensorplay.int32:
         return 2147483647
-    elif dtype == torch.int64:
+    elif dtype == tensorplay.int64:
         return 9223372036854775807
     else:
         # This is only here for completeness. This value is implicitly assumed in a lot of places so changing it is not
@@ -65,19 +65,19 @@ def _assert_channels(img: Tensor, permitted: list[int]) -> None:
         raise TypeError(f"Input image tensor permitted channel values are {permitted}, but found {c}")
 
 
-def convert_image_dtype(image: torch.Tensor, dtype: torch.dtype = torch.float) -> torch.Tensor:
+def convert_image_dtype(image: tensorplay.Tensor, dtype: tensorplay.dtype = tensorplay.float) -> tensorplay.Tensor:
     if image.dtype == dtype:
         return image
 
     if image.is_floating_point():
 
         # TODO: replace with dtype.is_floating_point when torchscript supports it
-        if torch.tensor(0, dtype=dtype).is_floating_point():
+        if tensorplay.tensor(0, dtype=dtype).is_floating_point():
             return image.to(dtype)
 
         # float to int
-        if (image.dtype == torch.float32 and dtype in (torch.int32, torch.int64)) or (
-            image.dtype == torch.float64 and dtype == torch.int64
+        if (image.dtype == tensorplay.float32 and dtype in (tensorplay.int32, tensorplay.int64)) or (
+            image.dtype == tensorplay.float64 and dtype == tensorplay.int64
         ):
             msg = f"The cast from {image.dtype} to {dtype} cannot be performed safely."
             raise RuntimeError(msg)
@@ -96,7 +96,7 @@ def convert_image_dtype(image: torch.Tensor, dtype: torch.dtype = torch.float) -
 
         # int to float
         # TODO: replace with dtype.is_floating_point when torchscript supports it
-        if torch.tensor(0, dtype=dtype).is_floating_point():
+        if tensorplay.tensor(0, dtype=dtype).is_floating_point():
             image = image.to(dtype)
             return image / input_max
 
@@ -107,7 +107,7 @@ def convert_image_dtype(image: torch.Tensor, dtype: torch.dtype = torch.float) -
             # factor should be forced to int for torch jit script
             # otherwise factor is a float and image // factor can produce different results
             factor = int((input_max + 1) // (output_max + 1))
-            image = torch.div(image, factor, rounding_mode="floor")
+            image = tensorplay.div(image, factor, rounding_mode="floor")
             return image.to(dtype)
         else:
             # factor should be forced to int for torch jit script
@@ -178,7 +178,7 @@ def adjust_brightness(img: Tensor, brightness_factor: float) -> Tensor:
 
     _assert_channels(img, [1, 3])
 
-    return _blend(img, torch.zeros_like(img), brightness_factor)
+    return _blend(img, tensorplay.zeros_like(img), brightness_factor)
 
 
 def adjust_contrast(img: Tensor, contrast_factor: float) -> Tensor:
@@ -189,11 +189,11 @@ def adjust_contrast(img: Tensor, contrast_factor: float) -> Tensor:
 
     _assert_channels(img, [3, 1])
     c = get_dimensions(img)[0]
-    dtype = img.dtype if torch.is_floating_point(img) else torch.float32
+    dtype = img.dtype if tensorplay.is_floating_point(img) else tensorplay.float32
     if c == 3:
-        mean = torch.mean(rgb_to_grayscale(img).to(dtype), dim=(-3, -2, -1), keepdim=True)
+        mean = tensorplay.mean(rgb_to_grayscale(img).to(dtype), dim=(-3, -2, -1), keepdim=True)
     else:
-        mean = torch.mean(img.to(dtype), dim=(-3, -2, -1), keepdim=True)
+        mean = tensorplay.mean(img.to(dtype), dim=(-3, -2, -1), keepdim=True)
 
     return _blend(img, mean, contrast_factor)
 
@@ -202,7 +202,7 @@ def adjust_hue(img: Tensor, hue_factor: float) -> Tensor:
     if not (-0.5 <= hue_factor <= 0.5):
         raise ValueError(f"hue_factor ({hue_factor}) is not in [-0.5, 0.5].")
 
-    if not (isinstance(img, torch.Tensor)):
+    if not (isinstance(img, tensorplay.Tensor)):
         raise TypeError("Input img should be Tensor image")
 
     _assert_image_tensor(img)
@@ -212,12 +212,12 @@ def adjust_hue(img: Tensor, hue_factor: float) -> Tensor:
         return img
 
     orig_dtype = img.dtype
-    img = convert_image_dtype(img, torch.float32)
+    img = convert_image_dtype(img, tensorplay.float32)
 
     img = _rgb2hsv(img)
     h, s, v = img.unbind(dim=-3)
     h = (h + hue_factor) % 1.0
-    img = torch.stack((h, s, v), dim=-3)
+    img = tensorplay.stack((h, s, v), dim=-3)
     img_hue_adj = _hsv2rgb(img)
 
     return convert_image_dtype(img_hue_adj, orig_dtype)
@@ -238,7 +238,7 @@ def adjust_saturation(img: Tensor, saturation_factor: float) -> Tensor:
 
 
 def adjust_gamma(img: Tensor, gamma: float, gain: float = 1) -> Tensor:
-    if not isinstance(img, torch.Tensor):
+    if not isinstance(img, tensorplay.Tensor):
         raise TypeError("Input img should be a Tensor.")
 
     _assert_channels(img, [1, 3])
@@ -248,8 +248,8 @@ def adjust_gamma(img: Tensor, gamma: float, gain: float = 1) -> Tensor:
 
     result = img
     dtype = img.dtype
-    if not torch.is_floating_point(img):
-        result = convert_image_dtype(result, torch.float32)
+    if not tensorplay.is_floating_point(img):
+        result = convert_image_dtype(result, tensorplay.float32)
 
     result = (gain * result.pow(gamma)).clamp(0, 1)
 
@@ -268,8 +268,8 @@ def _rgb2hsv(img: Tensor) -> Tensor:
 
     # Implementation is based on https://github.com/python-pillow/Pillow/blob/4174d4267616897df3746d315d5a2d0f82c656ee/
     # src/libImaging/Convert.c#L330
-    maxc = torch.max(img, dim=-3).values
-    minc = torch.min(img, dim=-3).values
+    maxc = tensorplay.max(img, dim=-3).values
+    minc = tensorplay.min(img, dim=-3).values
 
     # The algorithm erases S and H channel where `maxc = minc`. This avoids NaN
     # from happening in the results, because
@@ -283,13 +283,13 @@ def _rgb2hsv(img: Tensor) -> Tensor:
 
     cr = maxc - minc
     # Since `eqc => cr = 0`, replacing denominator with 1 when `eqc` is fine.
-    ones = torch.ones_like(maxc)
-    s = cr / torch.where(eqc, ones, maxc)
+    ones = tensorplay.ones_like(maxc)
+    s = cr / tensorplay.where(eqc, ones, maxc)
     # Note that `eqc => maxc = minc = r = g = b`. So the following calculation
     # of `h` would reduce to `bc - gc + 2 + rc - bc + 4 + rc - bc = 6` so it
     # would not matter what values `rc`, `gc`, and `bc` have here, and thus
     # replacing denominator with 1 when `eqc` is fine.
-    cr_divisor = torch.where(eqc, ones, cr)
+    cr_divisor = tensorplay.where(eqc, ones, cr)
     rc = (maxc - r) / cr_divisor
     gc = (maxc - g) / cr_divisor
     bc = (maxc - b) / cr_divisor
@@ -298,29 +298,29 @@ def _rgb2hsv(img: Tensor) -> Tensor:
     hg = ((maxc == g) & (maxc != r)) * (2.0 + rc - bc)
     hb = ((maxc != g) & (maxc != r)) * (4.0 + gc - rc)
     h = hr + hg + hb
-    h = torch.fmod((h / 6.0 + 1.0), 1.0)
-    return torch.stack((h, s, maxc), dim=-3)
+    h = tensorplay.fmod((h / 6.0 + 1.0), 1.0)
+    return tensorplay.stack((h, s, maxc), dim=-3)
 
 
 def _hsv2rgb(img: Tensor) -> Tensor:
     h, s, v = img.unbind(dim=-3)
-    i = torch.floor(h * 6.0)
+    i = tensorplay.floor(h * 6.0)
     f = (h * 6.0) - i
-    i = i.to(dtype=torch.int32)
+    i = i.to(dtype=tensorplay.int32)
 
-    p = torch.clamp((v * (1.0 - s)), 0.0, 1.0)
-    q = torch.clamp((v * (1.0 - s * f)), 0.0, 1.0)
-    t = torch.clamp((v * (1.0 - s * (1.0 - f))), 0.0, 1.0)
+    p = tensorplay.clamp((v * (1.0 - s)), 0.0, 1.0)
+    q = tensorplay.clamp((v * (1.0 - s * f)), 0.0, 1.0)
+    t = tensorplay.clamp((v * (1.0 - s * (1.0 - f))), 0.0, 1.0)
     i = i % 6
 
-    mask = i.unsqueeze(dim=-3) == torch.arange(6, device=i.device).view(-1, 1, 1)
+    mask = i.unsqueeze(dim=-3) == tensorplay.arange(6, device=i.device).view(-1, 1, 1)
 
-    a1 = torch.stack((v, q, p, p, t, v), dim=-3)
-    a2 = torch.stack((t, v, v, q, p, p), dim=-3)
-    a3 = torch.stack((p, p, t, v, v, q), dim=-3)
-    a4 = torch.stack((a1, a2, a3), dim=-4)
+    a1 = tensorplay.stack((v, q, p, p, t, v), dim=-3)
+    a2 = tensorplay.stack((t, v, v, q, p, p), dim=-3)
+    a3 = tensorplay.stack((p, p, t, v, v, q), dim=-3)
+    a4 = tensorplay.stack((a1, a2, a3), dim=-4)
 
-    return torch.einsum("...ijk, ...xijk -> ...xjk", mask.to(dtype=img.dtype), a4)
+    return tensorplay.einsum("...ijk, ...xijk -> ...xjk", mask.to(dtype=img.dtype), a4)
 
 
 def _pad_symmetric(img: Tensor, padding: list[int]) -> Tensor:
@@ -338,12 +338,12 @@ def _pad_symmetric(img: Tensor, padding: list[int]) -> Tensor:
     _x_indices = [i for i in range(in_sizes[-1])]  # [0, 1, 2, 3, ...]
     left_indices = [i for i in range(padding[0] - 1, -1, -1)]  # e.g. [3, 2, 1, 0]
     right_indices = [-(i + 1) for i in range(padding[1])]  # e.g. [-1, -2, -3]
-    x_indices = torch.tensor(left_indices + _x_indices + right_indices, device=img.device)
+    x_indices = tensorplay.tensor(left_indices + _x_indices + right_indices, device=img.device)
 
     _y_indices = [i for i in range(in_sizes[-2])]
     top_indices = [i for i in range(padding[2] - 1, -1, -1)]
     bottom_indices = [-(i + 1) for i in range(padding[3])]
-    y_indices = torch.tensor(top_indices + _y_indices + bottom_indices, device=img.device)
+    y_indices = tensorplay.tensor(top_indices + _y_indices + bottom_indices, device=img.device)
 
     ndim = img.ndim
     if ndim == 3:
@@ -356,7 +356,7 @@ def _pad_symmetric(img: Tensor, padding: list[int]) -> Tensor:
 
 def _parse_pad_padding(padding: Union[int, list[int]]) -> list[int]:
     if isinstance(padding, int):
-        if torch.jit.is_scripting():
+        if tensorplay.jit.is_scripting():
             # This maybe unreachable
             raise ValueError("padding can't be an int while torchscripting, set it as a list [value, ]")
         pad_left = pad_right = pad_top = pad_bottom = padding
@@ -419,12 +419,12 @@ def pad(
 
     out_dtype = img.dtype
     need_cast = False
-    if (padding_mode != "constant") and img.dtype not in (torch.float32, torch.float64):
+    if (padding_mode != "constant") and img.dtype not in (tensorplay.float32, tensorplay.float64):
         # Here we temporarily cast input tensor to float
         # until pytorch issue is resolved :
         # https://github.com/pytorch/pytorch/issues/40763
         need_cast = True
-        img = img.to(torch.float32)
+        img = img.to(tensorplay.float32)
 
     if padding_mode in ("reflect", "replicate"):
         img = torch_pad(img, p, mode=padding_mode)
@@ -461,14 +461,14 @@ def resize(
         # now we don't as True is the default.
         antialias = False
 
-    img, need_cast, need_squeeze, out_dtype = _cast_squeeze_in(img, [torch.float32, torch.float64])
+    img, need_cast, need_squeeze, out_dtype = _cast_squeeze_in(img, [tensorplay.float32, tensorplay.float64])
 
     # Define align_corners to avoid warnings
     align_corners = False if interpolation in ["bilinear", "bicubic"] else None
 
     img = interpolate(img, size=size, mode=interpolation, align_corners=align_corners, antialias=antialias)
 
-    if interpolation == "bicubic" and out_dtype == torch.uint8:
+    if interpolation == "bicubic" and out_dtype == tensorplay.uint8:
         img = img.clamp(min=0, max=255)
 
     img = _cast_squeeze_out(img, need_cast=need_cast, need_squeeze=need_squeeze, out_dtype=out_dtype)
@@ -485,7 +485,7 @@ def _assert_grid_transform_inputs(
     coeffs: Optional[list[float]] = None,
 ) -> None:
 
-    if not (isinstance(img, torch.Tensor)):
+    if not (isinstance(img, tensorplay.Tensor)):
         raise TypeError("Input img should be Tensor")
 
     _assert_image_tensor(img)
@@ -515,7 +515,7 @@ def _assert_grid_transform_inputs(
         raise ValueError(f"Interpolation mode '{interpolation}' is unsupported with Tensor input")
 
 
-def _cast_squeeze_in(img: Tensor, req_dtypes: list[torch.dtype]) -> tuple[Tensor, bool, bool, torch.dtype]:
+def _cast_squeeze_in(img: Tensor, req_dtypes: list[tensorplay.dtype]) -> tuple[Tensor, bool, bool, tensorplay.dtype]:
     need_squeeze = False
     # make image NCHW
     if img.ndim < 4:
@@ -531,14 +531,14 @@ def _cast_squeeze_in(img: Tensor, req_dtypes: list[torch.dtype]) -> tuple[Tensor
     return img, need_cast, need_squeeze, out_dtype
 
 
-def _cast_squeeze_out(img: Tensor, need_cast: bool, need_squeeze: bool, out_dtype: torch.dtype) -> Tensor:
+def _cast_squeeze_out(img: Tensor, need_cast: bool, need_squeeze: bool, out_dtype: tensorplay.dtype) -> Tensor:
     if need_squeeze:
         img = img.squeeze(dim=0)
 
     if need_cast:
-        if out_dtype in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64):
+        if out_dtype in (tensorplay.uint8, tensorplay.int8, tensorplay.int16, tensorplay.int32, tensorplay.int64):
             # it is better to round before cast
-            img = torch.round(img)
+            img = tensorplay.round(img)
         img = img.to(out_dtype)
 
     return img
@@ -556,8 +556,8 @@ def _apply_grid_transform(
 
     # Append a dummy mask for customized fill colors, should be faster than grid_sample() twice
     if fill is not None:
-        mask = torch.ones((img.shape[0], 1, img.shape[2], img.shape[3]), dtype=img.dtype, device=img.device)
-        img = torch.cat((img, mask), dim=1)
+        mask = tensorplay.ones((img.shape[0], 1, img.shape[2], img.shape[3]), dtype=img.dtype, device=img.device)
+        img = tensorplay.cat((img, mask), dim=1)
 
     img = grid_sample(img, grid, mode=mode, padding_mode="zeros", align_corners=False)
 
@@ -567,7 +567,7 @@ def _apply_grid_transform(
         img = img[:, :-1, :, :]  # N * C * H * W
         mask = mask.expand_as(img)
         fill_list, len_fill = (fill, len(fill)) if isinstance(fill, (tuple, list)) else ([float(fill)], 1)
-        fill_img = torch.tensor(fill_list, dtype=img.dtype, device=img.device).view(1, len_fill, 1, 1).expand_as(img)
+        fill_img = tensorplay.tensor(fill_list, dtype=img.dtype, device=img.device).view(1, len_fill, 1, 1).expand_as(img)
         if mode == "nearest":
             mask = mask < 0.5
             img[mask] = fill_img[mask]
@@ -592,14 +592,14 @@ def _gen_affine_grid(
     # 2) we can normalize by other image size, such that it covers "extend" option like in PIL.Image.rotate
 
     d = 0.5
-    base_grid = torch.empty(1, oh, ow, 3, dtype=theta.dtype, device=theta.device)
-    x_grid = torch.linspace(-ow * 0.5 + d, ow * 0.5 + d - 1, steps=ow, device=theta.device)
+    base_grid = tensorplay.empty(1, oh, ow, 3, dtype=theta.dtype, device=theta.device)
+    x_grid = tensorplay.linspace(-ow * 0.5 + d, ow * 0.5 + d - 1, steps=ow, device=theta.device)
     base_grid[..., 0].copy_(x_grid)
-    y_grid = torch.linspace(-oh * 0.5 + d, oh * 0.5 + d - 1, steps=oh, device=theta.device).unsqueeze_(-1)
+    y_grid = tensorplay.linspace(-oh * 0.5 + d, oh * 0.5 + d - 1, steps=oh, device=theta.device).unsqueeze_(-1)
     base_grid[..., 1].copy_(y_grid)
     base_grid[..., 2].fill_(1)
 
-    rescaled_theta = theta.transpose(1, 2) / torch.tensor([0.5 * w, 0.5 * h], dtype=theta.dtype, device=theta.device)
+    rescaled_theta = theta.transpose(1, 2) / tensorplay.tensor([0.5 * w, 0.5 * h], dtype=theta.dtype, device=theta.device)
     output_grid = base_grid.view(1, oh * ow, 3).bmm(rescaled_theta)
     return output_grid.view(1, oh, ow, 2)
 
@@ -612,8 +612,8 @@ def affine(
 ) -> Tensor:
     _assert_grid_transform_inputs(img, matrix, interpolation, fill, ["nearest", "bilinear"])
 
-    dtype = img.dtype if torch.is_floating_point(img) else torch.float32
-    theta = torch.tensor(matrix, dtype=dtype, device=img.device).reshape(1, 2, 3)
+    dtype = img.dtype if tensorplay.is_floating_point(img) else tensorplay.float32
+    theta = tensorplay.tensor(matrix, dtype=dtype, device=img.device).reshape(1, 2, 3)
     shape = img.shape
     # grid will be generated on the same device as theta and img
     grid = _gen_affine_grid(theta, w=shape[-1], h=shape[-2], ow=shape[-1], oh=shape[-2])
@@ -628,7 +628,7 @@ def _compute_affine_output_size(matrix: list[float], w: int, h: int) -> tuple[in
     # pts are Top-Left, Top-Right, Bottom-Left, Bottom-Right points.
     # Points are shifted due to affine matrix torch convention about
     # the center point. Center is (0, 0) for image center pivot point (w * 0.5, h * 0.5)
-    pts = torch.tensor(
+    pts = tensorplay.tensor(
         [
             [-0.5 * w, -0.5 * h, 1.0],
             [-0.5 * w, 0.5 * h, 1.0],
@@ -636,19 +636,19 @@ def _compute_affine_output_size(matrix: list[float], w: int, h: int) -> tuple[in
             [0.5 * w, -0.5 * h, 1.0],
         ]
     )
-    theta = torch.tensor(matrix, dtype=torch.float).view(2, 3)
-    new_pts = torch.matmul(pts, theta.T)
+    theta = tensorplay.tensor(matrix, dtype=tensorplay.float).view(2, 3)
+    new_pts = tensorplay.matmul(pts, theta.T)
     min_vals, _ = new_pts.min(dim=0)
     max_vals, _ = new_pts.max(dim=0)
 
     # shift points to [0, w] and [0, h] interval to match PIL results
-    min_vals += torch.tensor((w * 0.5, h * 0.5))
-    max_vals += torch.tensor((w * 0.5, h * 0.5))
+    min_vals += tensorplay.tensor((w * 0.5, h * 0.5))
+    max_vals += tensorplay.tensor((w * 0.5, h * 0.5))
 
     # Truncate precision to 1e-4 to avoid ceil of Xe-15 to 1.0
     tol = 1e-4
-    cmax = torch.ceil((max_vals / tol).trunc_() * tol)
-    cmin = torch.floor((min_vals / tol).trunc_() * tol)
+    cmax = tensorplay.ceil((max_vals / tol).trunc_() * tol)
+    cmin = tensorplay.floor((min_vals / tol).trunc_() * tol)
     size = cmax - cmin
     return int(size[0]), int(size[1])  # w, h
 
@@ -663,15 +663,15 @@ def rotate(
     _assert_grid_transform_inputs(img, matrix, interpolation, fill, ["nearest", "bilinear"])
     w, h = img.shape[-1], img.shape[-2]
     ow, oh = _compute_affine_output_size(matrix, w, h) if expand else (w, h)
-    dtype = img.dtype if torch.is_floating_point(img) else torch.float32
-    theta = torch.tensor(matrix, dtype=dtype, device=img.device).reshape(1, 2, 3)
+    dtype = img.dtype if tensorplay.is_floating_point(img) else tensorplay.float32
+    theta = tensorplay.tensor(matrix, dtype=dtype, device=img.device).reshape(1, 2, 3)
     # grid will be generated on the same device as theta and img
     grid = _gen_affine_grid(theta, w=w, h=h, ow=ow, oh=oh)
 
     return _apply_grid_transform(img, grid, interpolation, fill=fill)
 
 
-def _perspective_grid(coeffs: list[float], ow: int, oh: int, dtype: torch.dtype, device: torch.device) -> Tensor:
+def _perspective_grid(coeffs: list[float], ow: int, oh: int, dtype: tensorplay.dtype, device: tensorplay.device) -> Tensor:
     # https://github.com/python-pillow/Pillow/blob/4634eafe3c695a014267eefdce830b4a825beed7/
     # src/libImaging/Geometry.c#L394
 
@@ -679,20 +679,20 @@ def _perspective_grid(coeffs: list[float], ow: int, oh: int, dtype: torch.dtype,
     # x_out = (coeffs[0] * x + coeffs[1] * y + coeffs[2]) / (coeffs[6] * x + coeffs[7] * y + 1)
     # y_out = (coeffs[3] * x + coeffs[4] * y + coeffs[5]) / (coeffs[6] * x + coeffs[7] * y + 1)
     #
-    theta1 = torch.tensor(
+    theta1 = tensorplay.tensor(
         [[[coeffs[0], coeffs[1], coeffs[2]], [coeffs[3], coeffs[4], coeffs[5]]]], dtype=dtype, device=device
     )
-    theta2 = torch.tensor([[[coeffs[6], coeffs[7], 1.0], [coeffs[6], coeffs[7], 1.0]]], dtype=dtype, device=device)
+    theta2 = tensorplay.tensor([[[coeffs[6], coeffs[7], 1.0], [coeffs[6], coeffs[7], 1.0]]], dtype=dtype, device=device)
 
     d = 0.5
-    base_grid = torch.empty(1, oh, ow, 3, dtype=dtype, device=device)
-    x_grid = torch.linspace(d, ow * 1.0 + d - 1.0, steps=ow, device=device)
+    base_grid = tensorplay.empty(1, oh, ow, 3, dtype=dtype, device=device)
+    x_grid = tensorplay.linspace(d, ow * 1.0 + d - 1.0, steps=ow, device=device)
     base_grid[..., 0].copy_(x_grid)
-    y_grid = torch.linspace(d, oh * 1.0 + d - 1.0, steps=oh, device=device).unsqueeze_(-1)
+    y_grid = tensorplay.linspace(d, oh * 1.0 + d - 1.0, steps=oh, device=device).unsqueeze_(-1)
     base_grid[..., 1].copy_(y_grid)
     base_grid[..., 2].fill_(1)
 
-    rescaled_theta1 = theta1.transpose(1, 2) / torch.tensor([0.5 * ow, 0.5 * oh], dtype=dtype, device=device)
+    rescaled_theta1 = theta1.transpose(1, 2) / tensorplay.tensor([0.5 * ow, 0.5 * oh], dtype=dtype, device=device)
     output_grid1 = base_grid.view(1, oh * ow, 3).bmm(rescaled_theta1)
     output_grid2 = base_grid.view(1, oh * ow, 3).bmm(theta2.transpose(1, 2))
 
@@ -706,7 +706,7 @@ def perspective(
     interpolation: str = "bilinear",
     fill: Optional[Union[int, float, list[float]]] = None,
 ) -> Tensor:
-    if not (isinstance(img, torch.Tensor)):
+    if not (isinstance(img, tensorplay.Tensor)):
         raise TypeError("Input img should be Tensor.")
 
     _assert_image_tensor(img)
@@ -721,37 +721,37 @@ def perspective(
     )
 
     ow, oh = img.shape[-1], img.shape[-2]
-    dtype = img.dtype if torch.is_floating_point(img) else torch.float32
+    dtype = img.dtype if tensorplay.is_floating_point(img) else tensorplay.float32
     grid = _perspective_grid(perspective_coeffs, ow=ow, oh=oh, dtype=dtype, device=img.device)
     return _apply_grid_transform(img, grid, interpolation, fill=fill)
 
 
-def _get_gaussian_kernel1d(kernel_size: int, sigma: float, dtype: torch.dtype, device: torch.device) -> Tensor:
+def _get_gaussian_kernel1d(kernel_size: int, sigma: float, dtype: tensorplay.dtype, device: tensorplay.device) -> Tensor:
     ksize_half = (kernel_size - 1) * 0.5
 
-    x = torch.linspace(-ksize_half, ksize_half, steps=kernel_size, dtype=dtype, device=device)
-    pdf = torch.exp(-0.5 * (x / sigma).pow(2))
+    x = tensorplay.linspace(-ksize_half, ksize_half, steps=kernel_size, dtype=dtype, device=device)
+    pdf = tensorplay.exp(-0.5 * (x / sigma).pow(2))
     kernel1d = pdf / pdf.sum()
 
     return kernel1d
 
 
 def _get_gaussian_kernel2d(
-    kernel_size: list[int], sigma: list[float], dtype: torch.dtype, device: torch.device
+    kernel_size: list[int], sigma: list[float], dtype: tensorplay.dtype, device: tensorplay.device
 ) -> Tensor:
     kernel1d_x = _get_gaussian_kernel1d(kernel_size[0], sigma[0], dtype, device)
     kernel1d_y = _get_gaussian_kernel1d(kernel_size[1], sigma[1], dtype, device)
-    kernel2d = torch.mm(kernel1d_y[:, None], kernel1d_x[None, :])
+    kernel2d = tensorplay.mm(kernel1d_y[:, None], kernel1d_x[None, :])
     return kernel2d
 
 
 def gaussian_blur(img: Tensor, kernel_size: list[int], sigma: list[float]) -> Tensor:
-    if not (isinstance(img, torch.Tensor)):
+    if not (isinstance(img, tensorplay.Tensor)):
         raise TypeError(f"img should be Tensor. Got {type(img)}")
 
     _assert_image_tensor(img)
 
-    dtype = img.dtype if torch.is_floating_point(img) else torch.float32
+    dtype = img.dtype if tensorplay.is_floating_point(img) else tensorplay.float32
     kernel = _get_gaussian_kernel2d(kernel_size, sigma, dtype=dtype, device=img.device)
     kernel = kernel.expand(img.shape[-3], 1, kernel.shape[0], kernel.shape[1])
 
@@ -784,8 +784,8 @@ def posterize(img: Tensor, bits: int) -> Tensor:
 
     if img.ndim < 3:
         raise TypeError(f"Input image tensor should have at least 3 dimensions, but found {img.ndim}")
-    if img.dtype != torch.uint8:
-        raise TypeError(f"Only torch.uint8 image tensors are supported, but found {img.dtype}")
+    if img.dtype != tensorplay.uint8:
+        raise TypeError(f"Only tensorplay.uint8 image tensors are supported, but found {img.dtype}")
 
     _assert_channels(img, [1, 3])
     mask = -int(2 ** (8 - bits))  # JIT-friendly for: ~(2 ** (8 - bits) - 1)
@@ -805,13 +805,13 @@ def solarize(img: Tensor, threshold: float) -> Tensor:
         raise TypeError("Threshold should be less than bound of img.")
 
     inverted_img = invert(img)
-    return torch.where(img >= threshold, inverted_img, img)
+    return tensorplay.where(img >= threshold, inverted_img, img)
 
 
 def _blurred_degenerate_image(img: Tensor) -> Tensor:
-    dtype = img.dtype if torch.is_floating_point(img) else torch.float32
+    dtype = img.dtype if tensorplay.is_floating_point(img) else tensorplay.float32
 
-    kernel = torch.ones((3, 3), dtype=dtype, device=img.device)
+    kernel = tensorplay.ones((3, 3), dtype=dtype, device=img.device)
     kernel[1, 1] = 5.0
     kernel /= kernel.sum()
     kernel = kernel.expand(img.shape[-3], 1, kernel.shape[0], kernel.shape[1])
@@ -850,12 +850,12 @@ def autocontrast(img: Tensor) -> Tensor:
     _assert_channels(img, [1, 3])
 
     bound = _max_value(img.dtype)
-    dtype = img.dtype if torch.is_floating_point(img) else torch.float32
+    dtype = img.dtype if tensorplay.is_floating_point(img) else tensorplay.float32
 
     minimum = img.amin(dim=(-2, -1), keepdim=True).to(dtype)
     maximum = img.amax(dim=(-2, -1), keepdim=True).to(dtype)
     scale = bound / (maximum - minimum)
-    eq_idxs = torch.isfinite(scale).logical_not()
+    eq_idxs = tensorplay.isfinite(scale).logical_not()
     minimum[eq_idxs] = 0
     scale[eq_idxs] = 1
 
@@ -868,23 +868,23 @@ def _scale_channel(img_chan: Tensor) -> Tensor:
     # https://github.com/pytorch/pytorch/issues/53194 is fixed, remove the if
     # block and only use bincount.
     if img_chan.is_cuda:
-        hist = torch.histc(img_chan.to(torch.float32), bins=256, min=0, max=255)
+        hist = tensorplay.histc(img_chan.to(tensorplay.float32), bins=256, min=0, max=255)
     else:
-        hist = torch.bincount(img_chan.reshape(-1), minlength=256)
+        hist = tensorplay.bincount(img_chan.reshape(-1), minlength=256)
 
     nonzero_hist = hist[hist != 0]
-    step = torch.div(nonzero_hist[:-1].sum(), 255, rounding_mode="floor")
+    step = tensorplay.div(nonzero_hist[:-1].sum(), 255, rounding_mode="floor")
     if step == 0:
         return img_chan
 
-    lut = torch.div(torch.cumsum(hist, 0) + torch.div(step, 2, rounding_mode="floor"), step, rounding_mode="floor")
-    lut = torch.nn.functional.pad(lut, [1, 0])[:-1].clamp(0, 255)
+    lut = tensorplay.div(tensorplay.cumsum(hist, 0) + tensorplay.div(step, 2, rounding_mode="floor"), step, rounding_mode="floor")
+    lut = tensorplay.nn.functional.pad(lut, [1, 0])[:-1].clamp(0, 255)
 
-    return lut[img_chan.to(torch.int64)].to(torch.uint8)
+    return lut[img_chan.to(tensorplay.int64)].to(tensorplay.uint8)
 
 
 def _equalize_single_image(img: Tensor) -> Tensor:
-    return torch.stack([_scale_channel(img[c]) for c in range(img.size(0))])
+    return tensorplay.stack([_scale_channel(img[c]) for c in range(img.size(0))])
 
 
 def equalize(img: Tensor) -> Tensor:
@@ -893,15 +893,15 @@ def equalize(img: Tensor) -> Tensor:
 
     if not (3 <= img.ndim <= 4):
         raise TypeError(f"Input image tensor should have 3 or 4 dimensions, but found {img.ndim}")
-    if img.dtype != torch.uint8:
-        raise TypeError(f"Only torch.uint8 image tensors are supported, but found {img.dtype}")
+    if img.dtype != tensorplay.uint8:
+        raise TypeError(f"Only tensorplay.uint8 image tensors are supported, but found {img.dtype}")
 
     _assert_channels(img, [1, 3])
 
     if img.ndim == 3:
         return _equalize_single_image(img)
 
-    return torch.stack([_equalize_single_image(x) for x in img])
+    return tensorplay.stack([_equalize_single_image(x) for x in img])
 
 
 def normalize(tensor: Tensor, mean: list[float], std: list[float], inplace: bool = False) -> Tensor:
@@ -919,8 +919,8 @@ def normalize(tensor: Tensor, mean: list[float], std: list[float], inplace: bool
         tensor = tensor.clone()
 
     dtype = tensor.dtype
-    mean = torch.as_tensor(mean, dtype=dtype, device=tensor.device)
-    std = torch.as_tensor(std, dtype=dtype, device=tensor.device)
+    mean = tensorplay.as_tensor(mean, dtype=dtype, device=tensor.device)
+    std = tensorplay.as_tensor(std, dtype=dtype, device=tensor.device)
     if (std == 0).any():
         raise ValueError(f"std evaluated to zero after conversion to {dtype}, leading to division by zero.")
     if mean.ndim == 1:
@@ -941,9 +941,9 @@ def erase(img: Tensor, i: int, j: int, h: int, w: int, v: Tensor, inplace: bool 
 
 
 def _create_identity_grid(size: list[int]) -> Tensor:
-    hw_space = [torch.linspace((-s + 1) / s, (s - 1) / s, s) for s in size]
-    grid_y, grid_x = torch.meshgrid(hw_space, indexing="ij")
-    return torch.stack([grid_x, grid_y], -1).unsqueeze(0)  # 1 x H x W x 2
+    hw_space = [tensorplay.linspace((-s + 1) / s, (s - 1) / s, s) for s in size]
+    grid_y, grid_x = tensorplay.meshgrid(hw_space, indexing="ij")
+    return tensorplay.stack([grid_x, grid_y], -1).unsqueeze(0)  # 1 x H x W x 2
 
 
 def elastic_transform(
@@ -953,7 +953,7 @@ def elastic_transform(
     fill: Optional[Union[int, float, list[float]]] = None,
 ) -> Tensor:
 
-    if not (isinstance(img, torch.Tensor)):
+    if not (isinstance(img, tensorplay.Tensor)):
         raise TypeError(f"img should be Tensor. Got {type(img)}")
 
     size = list(img.shape[-2:])

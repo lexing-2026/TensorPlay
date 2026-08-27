@@ -4,8 +4,8 @@ from pathlib import Path
 from typing import Tuple, Union
 
 from tensorplay import Tensor
-from torch.utils.data import Dataset
-from torchaudio.datasets.utils import _load_waveform
+from tensorplay.utils.data import Dataset
+from tensorplay.audio.datasets.utils import _load_waveform
 
 SAMPLE_RATE = 16000
 

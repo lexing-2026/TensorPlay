@@ -62,6 +62,9 @@ class Adagrad(Optimizer):
             fused=fused,
         )
         super().__init__(params, defaults)
+        # Eager-only cache for the native layout probe.  The C++ fused
+        # dispatcher keeps the authoritative validation on every call.
+        self._tp_adagrad_layout_cache = {}
 
         if fused:
             if differentiable:
@@ -78,7 +81,7 @@ class Adagrad(Optimizer):
                 state["step"] = tp.tensor(
                     0.0,
                     dtype=_get_scalar_dtype(is_fused=group["fused"]),
-                    device=p.device if group.get("fused") else tp.device("cpu"),
+                    device=p.device if group["fused"] else tp.device("cpu"),
                 )
                 state["sum"] = full_like(
                     p,
@@ -89,6 +92,8 @@ class Adagrad(Optimizer):
 
     def __setstate__(self, state):
         super().__setstate__(state)
+        if not hasattr(self, "_tp_adagrad_layout_cache"):
+            self._tp_adagrad_layout_cache = {}
         # define "fused" for the state migration below
         fused = None
         for group in self.param_groups:
@@ -102,7 +107,7 @@ class Adagrad(Optimizer):
                     p_state["step"] = tp.tensor(
                         float(p_state["step"]),
                         dtype=_get_scalar_dtype(is_fused=fused),
-                        device=p.device if group["fused"] else tp.device("cpu"),
+                        device=p.device if fused else tp.device("cpu"),
                     )
 
         state_values = list(self.state.values())
@@ -195,6 +200,9 @@ class Adagrad(Optimizer):
                 fused=group["fused"],
                 grad_scale=getattr(self, "grad_scale", None),
                 found_inf=getattr(self, "found_inf", None),
+                layout_cache=self._tp_adagrad_layout_cache.setdefault(
+                    id(group), {}
+                ),
             )
         return loss
 
@@ -217,7 +225,15 @@ def _single_tensor_adagrad(
     ):
         step_t += 1
         step = _get_value(step_t)
-        grad = grad if not maximize else -grad
+        if maximize:
+            # Keep sparse gradients sparse when applying Torch's maximize
+            # convention; TensorPlay's generic unary neg does not accept COO.
+            if grad.is_sparse:
+                grad = tp.sparse_coo_tensor(
+                    grad._indices(), -grad._values(), grad.size()
+                )
+            else:
+                grad = -grad
         if weight_decay != 0:
             if grad.is_sparse:
                 raise RuntimeError(
@@ -392,7 +408,16 @@ def _fused_adagrad(
             lr_dict[device] = lr.to(device=device, non_blocking=True)
             lr = lr_dict[device]
 
-        tp._foreach_add_(device_state_steps, 1)
+        # The CUDA host-step kernel increments CPU counters inside C++ and
+        # consumes the snapshot in the same pass.  CPU fused and CUDA
+        # device-step variants still require the Python increment.
+        host_cuda_steps = (
+            device.type == "cuda"
+            and device_state_steps
+            and device_state_steps[0].device.type == "cpu"
+        )
+        if not host_cuda_steps:
+            tp._foreach_add_(device_state_steps, 1)
         tp._fused_adagrad_(
             device_params,
             device_grads,
@@ -413,20 +438,145 @@ def _fused_adagrad(
             )
 
 
+def _adagrad_layout_cache_key(params, grads, state_sums, state_steps):
+    """Build a low-overhead fingerprint for the fused Adagrad layout probe."""
+    key = [len(params)]
+    for p, g, s in zip(params, grads, state_sums, strict=True):
+        key.append((
+            id(p), id(s), p.data_ptr(), s.data_ptr(),
+            p.numel(), g.numel(), s.numel(),
+            g.dtype, g.device,
+            p.is_contiguous(), g.is_contiguous(), s.is_contiguous(),
+            p.stride(), g.stride(), s.stride(),
+        ))
+    for step in state_steps:
+        key.append((
+            id(step), step.data_ptr(), step.numel(),
+            step.is_contiguous(), step.stride(),
+        ))
+    return tuple(key)
+
+
+def _adagrad_fused_layout_ready(
+        params, grads, state_sums, state_steps, layout_cache=None):
+    if not params or len(params) != len(grads):
+        return False
+    if len(state_sums) != len(params) or len(state_steps) != len(params):
+        return False
+    first_device = params[0].device
+    first_dtype = params[0].dtype
+    if first_device.type not in ("cpu", "cuda"):
+        return False
+    if first_dtype not in (tp.float32, tp.float64):
+        return False
+
+    cache_key = None
+    if layout_cache is not None:
+        cache_key = _adagrad_layout_cache_key(
+            params, grads, state_sums, state_steps,
+        )
+        if layout_cache.get("key") == cache_key:
+            return layout_cache["ready"]
+
+    ready = all(
+        p.device == first_device
+        and p.dtype == first_dtype
+        and p.is_contiguous()
+        and not g.is_sparse
+        and g.device == p.device
+        and g.dtype == p.dtype
+        and g.shape == p.shape
+        and g.is_contiguous()
+        and s.device == p.device
+        and s.dtype == p.dtype
+        and s.shape == p.shape
+        and s.is_contiguous()
+        for p, g, s in zip(params, grads, state_sums, strict=True)
+    )
+    if layout_cache is not None:
+        layout_cache["key"] = cache_key
+        layout_cache["ready"] = ready
+    return ready
+
+
 def adagrad(
     params, grads, state_sums, state_steps, fused=None, grad_scale=None,
     found_inf=None, has_sparse_grad=False, foreach=None, differentiable=False,
     has_complex=False, *, lr, weight_decay, lr_decay, eps, maximize,
+    layout_cache=None,
 ):
     if not all(isinstance(value, tp.Tensor) for value in state_steps):
         raise RuntimeError(
             "API has changed, `state_steps` argument must contain a list of "
             "singleton tensors"
         )
-    if fused is None and foreach is None:
-        _, foreach = _default_to_fused_or_foreach(
-            params, differentiable, use_fused=False
+
+    # The fused entry point requires a homogeneous contiguous group.  Keep the
+    # full check at this dispatch boundary: non-contiguous tensors are valid
+    # Torch foreach/single inputs and must not be probed through a backend
+    # kernel that cannot consume their strides.
+    native_layout_ready = (
+        not differentiable
+        and not has_sparse_grad
+        and not has_complex
+        and grad_scale is None
+        and found_inf is None
+        and bool(params)
+        and params[0].device.type in ("cpu", "cuda")
+        and _adagrad_fused_layout_ready(
+            params, grads, state_sums, state_steps, layout_cache,
         )
+        and all(
+            step.device.type == "cpu"
+            or step.device == params[0].device
+            for step in state_steps
+        )
+    )
+    native_candidate = fused is not True and native_layout_ready
+    if native_candidate:
+        try:
+            # The CPU fused entry point consumes the caller-maintained step
+            # value; CUDA's host-step implementation increments its scalar
+            # state inside C++ before launching the device kernel.
+            cpu_step_incremented = params[0].device.type == "cpu"
+            if cpu_step_incremented:
+                tp._foreach_add_(state_steps, 1)
+            tp._fused_adagrad_(
+                params,
+                grads,
+                state_sums,
+                state_steps,
+                lr=scalar_value(lr, "lr"),
+                lr_decay=lr_decay,
+                weight_decay=weight_decay,
+                eps=eps,
+                maximize=maximize,
+                grad_scale=None,
+                found_inf=None,
+            )
+            return
+        except NotImplementedError:
+            if params[0].device.type == "cpu":
+                tp._foreach_sub_(state_steps, 1)
+            pass
+
+    if fused is None and foreach is None:
+        # Native fused kernel exists on cpu/cuda; prefer it for the default
+        # resolution (same math, one vectorized call per group).  On CUDA the
+        # kernel needs state_steps colocated with the params; until state is
+        # migrated there, stay on the foreach path.
+        if native_layout_ready:
+            fused, foreach = _default_to_fused_or_foreach(
+                params, differentiable, use_fused=True
+            )
+        else:
+            # The user did not request a fused kernel; preserve the valid
+            # foreach default when the native fused layout is unavailable.
+            fused, foreach = False, True
+        if fused and has_sparse_grad:
+            fused, foreach = False, True
+        if fused and params and params[0].device.type == "cuda":
+            fused, foreach = False, True
     fused = bool(fused)
     foreach = bool(foreach)
     if fused:

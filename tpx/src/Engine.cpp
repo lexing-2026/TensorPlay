@@ -3,6 +3,8 @@
 #include "AnomalyMode.h"
 #include "ManualNodes.h"
 #include "Exception.h"
+#include "LinearAlgebraNames.h"
+#include "Profiler.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 #include <limits>
 #include <algorithm>
@@ -32,6 +34,88 @@ inline bool engine_trace_enabled() {
     return on;
 }
 #define TP_ENGINE_TRACE(msg) do { if (engine_trace_enabled()) fprintf(stderr, "[tp-engine] %s\n", (msg)); } while (0)
+
+// ---------------------------------------------------------------------------
+// Structured backward-graph tracing (TP_ENGINE_TRACE).
+//
+// A lightweight debugging surface the upstream engine does not have:
+//   TP_ENGINE_TRACE=0/unset  off (single static check on the hot path)
+//   TP_ENGINE_TRACE=1        lifecycle events only
+//   TP_ENGINE_TRACE=2        + per-node apply (shapes) and every delivery
+//                            decision (dependency counter, buffer/enqueue)
+//   TP_ENGINE_TRACE=3        + gradient VALUES (truncated) instead of shapes
+//   TP_ENGINE_TRACE_FILE=... redirect the stream (default stderr)
+//
+// Every line carries the GraphTask id so nested/concurrent backwards are
+// separable, and nodes are labeled name#seq@ptr-suffix which stays stable
+// across a single graph.
+struct EngineTrace {
+    static int level() {
+        static const int lvl = [] {
+            const char* e = std::getenv("TP_ENGINE_TRACE");
+            if (!e || !e[0]) return 0;
+            return e[0] >= '1' && e[0] <= '3' ? e[0] - '0' : 1;
+        }();
+        return lvl;
+    }
+    static FILE* sink() {
+        static FILE* f = [] {
+            const char* p = std::getenv("TP_ENGINE_TRACE_FILE");
+            return (p && p[0]) ? fopen(p, "w") : stderr;
+        }();
+        return f;
+    }
+    static uint64_t next_graph_id() {
+        static std::atomic<uint64_t> counter{0};
+        return counter.fetch_add(1) + 1;
+    }
+
+    // Stable short label for a node: name#seq@suffix-of-pointer.
+    static void node_label(char* buf, size_t n, const Node* fn) {
+        if (!fn) { snprintf(buf, n, "<null>"); return; }
+        snprintf(buf, n, "%s#%llu@%zx", fn->name().c_str(),
+                 static_cast<unsigned long long>(fn->sequence_nr()),
+                 reinterpret_cast<size_t>(fn) % 0x10000);
+    }
+
+    // Level 2 renders shape/dtype; level 3 appends up to 8 elements.
+    static void tensor_desc(char* buf, size_t n, const Tensor& t) {
+        if (!t.defined()) { snprintf(buf, n, "<undef>"); return; }
+        std::string shape = "(";
+        const auto sizes = static_cast<std::vector<int64_t>>(t.shape());
+        for (size_t i = 0; i < sizes.size(); ++i) {
+            shape += std::to_string(sizes[i]);
+            if (i + 1 < sizes.size()) shape += ",";
+        }
+        shape += ")";
+        char base[48];
+        snprintf(base, sizeof(base), "%s%s rg=%d",
+                 c10_style_dtype_name(t.dtype()), shape.c_str(),
+                 t.requires_grad() ? 1 : 0);
+        if (level() < 3) { snprintf(buf, n, "%s", base); return; }
+        std::string vals = "{";
+        Tensor flat = t.reshape({-1});
+        const int64_t total = flat.numel();
+        const int64_t show = std::min<int64_t>(total, 8);
+        for (int64_t i = 0; i < show; ++i) {
+            vals += std::to_string(flat.select(0, i).item().toDouble());
+            if (i + 1 < show) vals += ",";
+        }
+        if (total > show) vals += ",...";
+        vals += "}";
+        snprintf(buf, n, "%s%s", base, vals.c_str());
+    }
+
+    template <typename... Args>
+    static void emit(uint64_t graph_id, const char* fmt, Args&&... args) {
+        FILE* out = sink();
+        fprintf(out, "[tp-engine g%llu] ",
+                static_cast<unsigned long long>(graph_id));
+        fprintf(out, fmt, std::forward<Args>(args)...);
+        fputc('\n', out);
+    }
+};
+
 
 // Restores a thread-local counter on scope exit, including via exceptions.
 struct DepthGuard {
@@ -120,6 +204,14 @@ void Engine::compute_dependencies(Node* root, GraphTask& task, uint64_t min_topo
         for (const auto& edge : fn->next_edges()) {
             if (auto next_ptr = edge.function.get()) {
                 dependencies[next_ptr] += 1;
+                if (EngineTrace::level() >= 2) {
+                    char from[128], to[128];
+                    EngineTrace::node_label(from, sizeof(from), fn);
+                    EngineTrace::node_label(to, sizeof(to), next_ptr);
+                    EngineTrace::emit(
+                        task.trace_id_, "dep  %s -> %s (count=%d)",
+                        from, to, dependencies[next_ptr]);
+                }
                 const bool was_inserted = nodes_in_graph.insert(next_ptr).second;
                 if (was_inserted) {
                     queue.push_back(next_ptr);
@@ -200,6 +292,46 @@ void GraphTask::init_to_execute(Node& graph_root, const edge_list& outputs,
     }
 }
 
+// Mirrors torch's validate_outputs/at::sum_to: reduce a gradient whose shape
+// doesn't match the recorded forward-input shape of its destination slot.
+// Without this, gradients of broadcast operands keep their broadcast-inflated
+// shape mid-graph and break consumers expecting the operand's true shape.
+static Tensor sum_to_shape(const Tensor& grad, const std::vector<int64_t>& target) {
+    // Mirrors ATen ExpandUtils.h::_sum_to: sum the extra leading dims and any
+    // broadcast-inflated (target==1) dims with keepdim=true, then view down
+    // to the exact target rank.
+    if (target.empty()) {
+        return ops::sum(grad);
+    }
+    const int64_t leading =
+        static_cast<int64_t>(grad.dim()) - static_cast<int64_t>(target.size());
+    if (leading < 0) {
+        // Gradient rank below the forward-input rank (e.g. a scalar seed
+        // feeding a (1,) leaf): reshape up when element counts line up --
+        // broadcast-compatible -- otherwise hand the grad through untouched.
+        int64_t target_numel = 1;
+        for (const auto d : target) target_numel *= d;
+        if (grad.numel() == target_numel) {
+            return ops::reshape(grad, target);
+        }
+        return grad;
+    }
+    std::vector<int64_t> reduce_dims;
+    for (int64_t i = 0; i < leading; ++i) reduce_dims.push_back(i);
+    for (int64_t i = leading; i < static_cast<int64_t>(grad.dim()); ++i) {
+        if (target[static_cast<size_t>(i - leading)] == 1 &&
+            grad.size(i) != 1) {
+            reduce_dims.push_back(i);
+        }
+    }
+    Tensor cur = reduce_dims.empty()
+        ? grad : ops::sum(grad, reduce_dims, /*keepdim=*/true);
+    if (leading > 0) {
+        cur = ops::reshape(cur, target);
+    }
+    return cur;
+}
+
 void Engine::evaluate_function(GraphTask& task, Node* func, InputBuffer& inputs,
                                ReadyQueue& cpu_queue, ReadyQueue* local_queue) {
     auto& exec_info_ = task.exec_info_;
@@ -226,7 +358,73 @@ void Engine::evaluate_function(GraphTask& task, Node* func, InputBuffer& inputs,
 
     variable_list outputs;
     {
+        // Per-node backward event ("backward::MulBackward0" style, matching
+        // upstream's profiler surface).  Inactive cost: one atomic load;
+        // the virtual demangle runs only when a session is live, and names
+        // are interned so long training loops don't grow any arena.
+        const bool __tp_prof_on =
+            tensorplay::prof::g_active.load(std::memory_order_acquire);
+        const char* __tp_node_nm = "";
+        if (__tp_prof_on) {
+            __tp_node_nm = tensorplay::prof::intern_name(
+                "backward::" + func->name());
+        }
+        tensorplay::prof::OpRecord __tp_node_rec(__tp_node_nm);
+        if (EngineTrace::level() >= 2) {
+            char label[128], buf[256];
+            EngineTrace::node_label(label, sizeof(label), func);
+            std::string in = "apply " + std::string(label) + " inputs=[";
+            for (size_t i = 0; i < inputs.buffer.size(); ++i) {
+                EngineTrace::tensor_desc(buf, sizeof(buf), inputs.buffer[i]);
+                in += (i ? ", " : "");
+                in += buf;
+            }
+            in += "]";
+            EngineTrace::emit(task.trace_id_, "%s", in.c_str());
+        }
         variable_list vars = InputBuffer::variables(std::move(inputs));
+        // torch parity (InputMetadata + materialize_grads): zero-fill any
+        // undefined input gradient so user backward functions never see None
+        // unless they opted out via set_materialize_grads(false).
+        //
+        // Metadata source differs by node kind: custom-function nodes
+        // (PyNode) record per-OUTPUT-slot metadata at attach time (their
+        // backward inputs ARE the forward outputs); generated derivative
+        // nodes fall back to the metadata recorded on their next_edges.
+        if (func->materialize_grads()) {
+            const auto& out_metas = func->output_metas();
+            const auto& in_edges = func->next_edges();
+            const size_t n = std::min(vars.size(),
+                out_metas.empty() ? in_edges.size() : out_metas.size());
+            for (size_t i = 0; i < n; ++i) {
+                if (vars[i].defined()) continue;
+                std::vector<int64_t> shape;
+                DType dt = DType::Undefined;
+                DeviceType dev_type = DeviceType::CPU;
+                int64_t dev_idx = -1;
+                bool have = false;
+                if (!out_metas.empty() && i < out_metas.size()
+                    && out_metas[i].valid) {
+                    shape = out_metas[i].shape;
+                    dt = out_metas[i].dtype;
+                    dev_idx = out_metas[i].device_index;
+                    have = true;
+                } else if (i < in_edges.size() && in_edges[i].has_shape_hint
+                           && in_edges[i].grad_dtype.has_value()
+                           && in_edges[i].device_type_hint.has_value()
+                           && in_edges[i].device_index_hint.has_value()) {
+                    shape = in_edges[i].shape_hint;
+                    dt = *in_edges[i].grad_dtype;
+                    dev_type = *in_edges[i].device_type_hint;
+                    dev_idx = *in_edges[i].device_index_hint;
+                    have = true;
+                }
+                if (!have) continue;
+                Device dev(dev_type,
+                           dev_type == DeviceType::CPU ? -1 : dev_idx);
+                vars[i] = ops::zeros(shape, dt, dev);
+            }
+        }
         for (const auto& hook : func->pre_hooks()) {
             vars = hook(std::move(vars));
         }
@@ -249,6 +447,58 @@ void Engine::evaluate_function(GraphTask& task, Node* func, InputBuffer& inputs,
         }
         for (const auto& hook : func->post_hooks()) {
             outputs = hook(outputs, std::move(outputs));
+        }
+    }
+    if (EngineTrace::level() >= 2) {
+        char label[128], buf[256];
+        EngineTrace::node_label(label, sizeof(label), func);
+        std::string out = "emit  " + std::string(label) + " outputs=[";
+        for (size_t i = 0; i < outputs.size(); ++i) {
+            EngineTrace::tensor_desc(buf, sizeof(buf), outputs[i]);
+            out += (i ? ", " : "");
+            out += buf;
+        }
+        out += "]";
+        EngineTrace::emit(task.trace_id_, "%s", out.c_str());
+    }
+
+    // Shape-validate gradients against the forward-input shapes recorded on
+    // this node's edges (see Edge::shape_hint). Mirrors torch's
+    // Engine::validate_outputs; under create_graph the reduction ops join the
+    // second-order graph because GradMode is active here.
+    {
+        const auto& out_edges = func->next_edges();
+        const size_t n = std::min(outputs.size(), out_edges.size());
+        for (size_t i = 0; i < n; ++i) {
+            if (!outputs[i].defined() || !out_edges[i].is_valid()) continue;
+            const auto& hint = out_edges[i].shape_hint;
+            if (out_edges[i].has_shape_hint) {
+                bool shape_ok = true;
+                if (static_cast<size_t>(outputs[i].dim()) == hint.size()) {
+                    const auto out_sizes =
+                        static_cast<std::vector<int64_t>>(outputs[i].shape());
+                    shape_ok =
+                        std::equal(hint.begin(), hint.end(), out_sizes.begin());
+                } else {
+                    shape_ok = false;
+                }
+                if (!shape_ok) {
+                    outputs[i] = sum_to_shape(outputs[i], hint);
+                }
+            }
+            // Dtype contract (torch InputMetadata::grad_dtype via
+            // validate_outputs): a floating gradient crossing an edge must be
+            // the forward input's dtype.  Autocast graphs depend on this --
+            // unwrapped promote ops emit fp32 grads that must re-enter
+            // backward nodes holding low-precision saved tensors.
+            // Non-floating hints (bool masks / index tensors) never carry
+            // gradients and are left alone.
+            const auto& grad_dt = out_edges[i].grad_dtype;
+            if (grad_dt.has_value() && isFloatingType(*grad_dt) &&
+                isFloatingType(outputs[i].dtype()) &&
+                outputs[i].dtype() != *grad_dt && !InferenceMode::is_enabled()) {
+                outputs[i] = tpx::to(outputs[i], *grad_dt);
+            }
         }
     }
 
@@ -320,7 +570,23 @@ void Engine::evaluate_function(GraphTask& task, Node* func, InputBuffer& inputs,
             }
         }
         if (enqueue_now) {
+            if (EngineTrace::level() >= 2) {
+                char from[128], to[128];
+                EngineTrace::node_label(from, sizeof(from), func);
+                EngineTrace::node_label(to, sizeof(to), next.function.get());
+                EngineTrace::emit(task.trace_id_,
+                                  "send %s -> %s@%zu ready (dep exhausted)",
+                                  from, to,
+                                  static_cast<size_t>(next.input_nr));
+            }
             enqueue_task(task, std::move(pending), cpu_queue, local_queue);
+        } else if (EngineTrace::level() >= 2 && next.is_valid()) {
+            char from[128], to[128];
+            EngineTrace::node_label(from, sizeof(from), func);
+            EngineTrace::node_label(to, sizeof(to), next.function.get());
+            EngineTrace::emit(task.trace_id_,
+                              "buf  %s -> %s@%zu (waiting on more inputs)",
+                              from, to, static_cast<size_t>(next.input_nr));
         }
     }
 
@@ -346,6 +612,11 @@ void Engine::enqueue_task(GraphTask& task, ReadyQueue::NodeTask&& node_task,
 variable_list Engine::execute(const edge_list& root_edges, const variable_list& inputs,
                               bool keep_graph, bool create_graph, bool accumulate_grad,
                               const edge_list& outputs) {
+    // Backward-phase annotation for the profiler: one span per engine
+    // execution, visible in chrome traces as the parent of every backward
+    // node event (worker-thread op events overlap it by wall time).
+    tensorplay::prof::OpRecord __tp_backward_span(
+        "__backward__", tensorplay::prof::EventKind::kBackward);
     if (root_edges.size() != inputs.size()) {
         TP_THROW(RuntimeError, "Engine::execute: roots and inputs must have same size");
     }
@@ -354,6 +625,14 @@ variable_list Engine::execute(const edge_list& root_edges, const variable_list& 
     }
 
     GraphTask graph_task(keep_graph, create_graph);
+    graph_task.trace_id_ = EngineTrace::next_graph_id();
+    if (EngineTrace::level() >= 1) {
+        EngineTrace::emit(graph_task.trace_id_,
+                          "execute create_graph=%d keep_graph=%d "
+                          "accumulate_grad=%d roots=%zu",
+                          create_graph ? 1 : 0, keep_graph ? 1 : 0,
+                          accumulate_grad ? 1 : 0, root_edges.size());
+    }
 
     // If we receive a single root, skip creating an extra root node.
     bool skip_dummy_node = root_edges.size() == 1;
@@ -410,6 +689,10 @@ variable_list Engine::execute(const edge_list& root_edges, const variable_list& 
     }
 
     TP_ENGINE_TRACE("execute done");
+    if (EngineTrace::level() >= 1) {
+        EngineTrace::emit(graph_task.trace_id_, "done captured=%zu",
+                          graph_task.captured_vars_.size());
+    }
     if (graph_task.exception_) {
         std::rethrow_exception(graph_task.exception_);
     }

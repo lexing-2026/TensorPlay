@@ -20,14 +20,14 @@ class CLEVRClassification(VisionDataset):
         root (str or ``pathlib.Path``): Root directory of dataset where directory ``root/clevr`` exists or will be saved to if download is
             set to True.
         split (string, optional): The dataset split, supports ``"train"`` (default), ``"val"``, or ``"test"``.
-        transform (callable, optional): A function/transform that takes in a PIL image or torch.Tensor, depends on the given loader,
+        transform (callable, optional): A function/transform that takes in a PIL image or tensorplay.Tensor, depends on the given loader,
             and returns a transformed version. E.g, ``transforms.RandomCrop``
         target_transform (callable, optional): A function/transform that takes in them target and transforms it.
         download (bool, optional): If true, downloads the dataset from the internet and puts it in root directory. If
             dataset is already downloaded, it is not downloaded again.
         loader (callable, optional): A function to load an image given its path.
             By default, it uses PIL as its image loader, but users could also pass in
-            ``torchvision.io.decode_image`` for decoding image data into tensors directly.
+            ``tensorplay.vision.io.decode_image`` for decoding image data into tensors directly.
     """
 
     _URL = "https://dl.fbaipublicfiles.com/clevr/CLEVR_v1.0.zip"

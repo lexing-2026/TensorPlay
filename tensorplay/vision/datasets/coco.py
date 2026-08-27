@@ -85,8 +85,8 @@ class CocoCaptions(CocoDetection):
 
         .. code:: python
 
-            import torchvision.datasets as dset
-            import torchvision.transforms as transforms
+            import tensorplay.vision.datasets as dset
+            import tensorplay.vision.transforms as transforms
             cap = dset.CocoCaptions(root = 'dir where images are',
                                     annFile = 'json annotation file',
                                     transform=transforms.PILToTensor())

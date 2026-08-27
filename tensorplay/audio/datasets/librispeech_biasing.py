@@ -3,9 +3,9 @@ from pathlib import Path
 from typing import List, Tuple, Union
 
 from tensorplay import Tensor
-from torch.utils.data import Dataset
+from tensorplay.utils.data import Dataset
 from tensorplay.hub import download_url_to_file
-from torchaudio.datasets.utils import _extract_tar, _load_waveform
+from tensorplay.audio.datasets.utils import _extract_tar, _load_waveform
 
 URL = "train-clean-100"
 FOLDER_IN_ARCHIVE = "LibriSpeech"

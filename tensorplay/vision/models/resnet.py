@@ -4,7 +4,7 @@
 from functools import partial
 from typing import Any, Callable, Optional, Union
 
-import tensorplay as torch
+import tensorplay as tensorplay
 import tensorplay.nn as nn
 from tensorplay import Tensor
 
@@ -279,7 +279,7 @@ class ResNet(nn.Module):
         x = self.layer4(x)
 
         x = self.avgpool(x)
-        x = torch.flatten(x, 1)
+        x = tensorplay.flatten(x, 1)
         x = self.fc(x)
 
         return x
@@ -319,7 +319,7 @@ class ResNet18_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 11689512,
-            "recipe": "https://github.com/pytorch/vision/tree/main/references/classification#resnet",
+            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#resnet",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 69.758,
@@ -341,7 +341,7 @@ class ResNet34_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 21797672,
-            "recipe": "https://github.com/pytorch/vision/tree/main/references/classification#resnet",
+            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#resnet",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 73.314,
@@ -363,7 +363,7 @@ class ResNet50_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 25557032,
-            "recipe": "https://github.com/pytorch/vision/tree/main/references/classification#resnet",
+            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#resnet",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 76.130,
@@ -381,7 +381,7 @@ class ResNet50_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 25557032,
-            "recipe": "https://github.com/pytorch/vision/issues/3995#issuecomment-1013906621",
+            "recipe": "https://github.com/tensorplay/vision/issues/3995#issuecomment-1013906621",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 80.858,
@@ -391,8 +391,8 @@ class ResNet50_Weights(WeightsEnum):
             "_ops": 4.089,
             "_file_size": 97.79,
             "_docs": """
-                These weights improve upon the results of the original paper by using TorchVision's `new training recipe
-                <https://pytorch.org/blog/how-to-train-state-of-the-art-models-using-torchvision-latest-primitives/>`_.
+                These weights improve upon the results of the original paper by using TensorPlay Vision's `new training recipe
+                <https://tensorplay.org/blog/how-to-train-state-of-the-art-models-using-tensorplay.vision-latest-primitives/>`_.
             """,
         },
     )
@@ -406,7 +406,7 @@ class ResNet101_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 44549160,
-            "recipe": "https://github.com/pytorch/vision/tree/main/references/classification#resnet",
+            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#resnet",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 77.374,
@@ -424,7 +424,7 @@ class ResNet101_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 44549160,
-            "recipe": "https://github.com/pytorch/vision/issues/3995#new-recipe",
+            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 81.886,
@@ -434,8 +434,8 @@ class ResNet101_Weights(WeightsEnum):
             "_ops": 7.801,
             "_file_size": 170.53,
             "_docs": """
-                These weights improve upon the results of the original paper by using TorchVision's `new training recipe
-                <https://pytorch.org/blog/how-to-train-state-of-the-art-models-using-torchvision-latest-primitives/>`_.
+                These weights improve upon the results of the original paper by using TensorPlay Vision's `new training recipe
+                <https://tensorplay.org/blog/how-to-train-state-of-the-art-models-using-tensorplay.vision-latest-primitives/>`_.
             """,
         },
     )
@@ -449,7 +449,7 @@ class ResNet152_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 60192808,
-            "recipe": "https://github.com/pytorch/vision/tree/main/references/classification#resnet",
+            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#resnet",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 78.312,
@@ -467,7 +467,7 @@ class ResNet152_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 60192808,
-            "recipe": "https://github.com/pytorch/vision/issues/3995#new-recipe",
+            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 82.284,
@@ -477,8 +477,8 @@ class ResNet152_Weights(WeightsEnum):
             "_ops": 11.514,
             "_file_size": 230.474,
             "_docs": """
-                These weights improve upon the results of the original paper by using TorchVision's `new training recipe
-                <https://pytorch.org/blog/how-to-train-state-of-the-art-models-using-torchvision-latest-primitives/>`_.
+                These weights improve upon the results of the original paper by using TensorPlay Vision's `new training recipe
+                <https://tensorplay.org/blog/how-to-train-state-of-the-art-models-using-tensorplay.vision-latest-primitives/>`_.
             """,
         },
     )
@@ -492,7 +492,7 @@ class ResNeXt50_32X4D_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 25028904,
-            "recipe": "https://github.com/pytorch/vision/tree/main/references/classification#resnext",
+            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#resnext",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 77.618,
@@ -510,7 +510,7 @@ class ResNeXt50_32X4D_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 25028904,
-            "recipe": "https://github.com/pytorch/vision/issues/3995#new-recipe",
+            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 81.198,
@@ -520,8 +520,8 @@ class ResNeXt50_32X4D_Weights(WeightsEnum):
             "_ops": 4.23,
             "_file_size": 95.833,
             "_docs": """
-                These weights improve upon the results of the original paper by using TorchVision's `new training recipe
-                <https://pytorch.org/blog/how-to-train-state-of-the-art-models-using-torchvision-latest-primitives/>`_.
+                These weights improve upon the results of the original paper by using TensorPlay Vision's `new training recipe
+                <https://tensorplay.org/blog/how-to-train-state-of-the-art-models-using-tensorplay.vision-latest-primitives/>`_.
             """,
         },
     )
@@ -535,7 +535,7 @@ class ResNeXt101_32X8D_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 88791336,
-            "recipe": "https://github.com/pytorch/vision/tree/main/references/classification#resnext",
+            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#resnext",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 79.312,
@@ -553,7 +553,7 @@ class ResNeXt101_32X8D_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 88791336,
-            "recipe": "https://github.com/pytorch/vision/issues/3995#new-recipe-with-fixres",
+            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe-with-fixres",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 82.834,
@@ -563,8 +563,8 @@ class ResNeXt101_32X8D_Weights(WeightsEnum):
             "_ops": 16.414,
             "_file_size": 339.673,
             "_docs": """
-                These weights improve upon the results of the original paper by using TorchVision's `new training recipe
-                <https://pytorch.org/blog/how-to-train-state-of-the-art-models-using-torchvision-latest-primitives/>`_.
+                These weights improve upon the results of the original paper by using TensorPlay Vision's `new training recipe
+                <https://tensorplay.org/blog/how-to-train-state-of-the-art-models-using-tensorplay.vision-latest-primitives/>`_.
             """,
         },
     )
@@ -578,7 +578,7 @@ class ResNeXt101_64X4D_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 83455272,
-            "recipe": "https://github.com/pytorch/vision/pull/5935",
+            "recipe": "https://github.com/tensorplay/vision/pull/5935",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 83.246,
@@ -588,8 +588,8 @@ class ResNeXt101_64X4D_Weights(WeightsEnum):
             "_ops": 15.46,
             "_file_size": 319.318,
             "_docs": """
-                These weights were trained from scratch by using TorchVision's `new training recipe
-                <https://pytorch.org/blog/how-to-train-state-of-the-art-models-using-torchvision-latest-primitives/>`_.
+                These weights were trained from scratch by using TensorPlay Vision's `new training recipe
+                <https://tensorplay.org/blog/how-to-train-state-of-the-art-models-using-tensorplay.vision-latest-primitives/>`_.
             """,
         },
     )
@@ -603,7 +603,7 @@ class Wide_ResNet50_2_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 68883240,
-            "recipe": "https://github.com/pytorch/vision/pull/912#issue-445437439",
+            "recipe": "https://github.com/tensorplay/vision/pull/912#issue-445437439",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 78.468,
@@ -621,7 +621,7 @@ class Wide_ResNet50_2_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 68883240,
-            "recipe": "https://github.com/pytorch/vision/issues/3995#new-recipe-with-fixres",
+            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe-with-fixres",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 81.602,
@@ -631,8 +631,8 @@ class Wide_ResNet50_2_Weights(WeightsEnum):
             "_ops": 11.398,
             "_file_size": 263.124,
             "_docs": """
-                These weights improve upon the results of the original paper by using TorchVision's `new training recipe
-                <https://pytorch.org/blog/how-to-train-state-of-the-art-models-using-torchvision-latest-primitives/>`_.
+                These weights improve upon the results of the original paper by using TensorPlay Vision's `new training recipe
+                <https://tensorplay.org/blog/how-to-train-state-of-the-art-models-using-tensorplay.vision-latest-primitives/>`_.
             """,
         },
     )
@@ -646,7 +646,7 @@ class Wide_ResNet101_2_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 126886696,
-            "recipe": "https://github.com/pytorch/vision/pull/912#issue-445437439",
+            "recipe": "https://github.com/tensorplay/vision/pull/912#issue-445437439",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 78.848,
@@ -664,7 +664,7 @@ class Wide_ResNet101_2_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 126886696,
-            "recipe": "https://github.com/pytorch/vision/issues/3995#new-recipe",
+            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 82.510,
@@ -674,8 +674,8 @@ class Wide_ResNet101_2_Weights(WeightsEnum):
             "_ops": 22.753,
             "_file_size": 484.747,
             "_docs": """
-                These weights improve upon the results of the original paper by using TorchVision's `new training recipe
-                <https://pytorch.org/blog/how-to-train-state-of-the-art-models-using-torchvision-latest-primitives/>`_.
+                These weights improve upon the results of the original paper by using TensorPlay Vision's `new training recipe
+                <https://tensorplay.org/blog/how-to-train-state-of-the-art-models-using-tensorplay.vision-latest-primitives/>`_.
             """,
         },
     )
@@ -688,19 +688,19 @@ def resnet18(*, weights: Optional[ResNet18_Weights] = None, progress: bool = Tru
     """ResNet-18 from `Deep Residual Learning for Image Recognition <https://arxiv.org/abs/1512.03385>`__.
 
     Args:
-        weights (:class:`~torchvision.models.ResNet18_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.ResNet18_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.ResNet18_Weights` below for
+            :class:`~tensorplay.vision.models.ResNet18_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.resnet.ResNet``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.resnet.ResNet``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/resnet.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/resnet.py>`_
             for more details about this class.
 
-    .. autoclass:: torchvision.models.ResNet18_Weights
+    .. autoclass:: tensorplay.vision.models.ResNet18_Weights
         :members:
     """
     weights = ResNet18_Weights.verify(weights)
@@ -714,19 +714,19 @@ def resnet34(*, weights: Optional[ResNet34_Weights] = None, progress: bool = Tru
     """ResNet-34 from `Deep Residual Learning for Image Recognition <https://arxiv.org/abs/1512.03385>`__.
 
     Args:
-        weights (:class:`~torchvision.models.ResNet34_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.ResNet34_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.ResNet34_Weights` below for
+            :class:`~tensorplay.vision.models.ResNet34_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.resnet.ResNet``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.resnet.ResNet``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/resnet.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/resnet.py>`_
             for more details about this class.
 
-    .. autoclass:: torchvision.models.ResNet34_Weights
+    .. autoclass:: tensorplay.vision.models.ResNet34_Weights
         :members:
     """
     weights = ResNet34_Weights.verify(weights)
@@ -740,25 +740,25 @@ def resnet50(*, weights: Optional[ResNet50_Weights] = None, progress: bool = Tru
     """ResNet-50 from `Deep Residual Learning for Image Recognition <https://arxiv.org/abs/1512.03385>`__.
 
     .. note::
-       The bottleneck of TorchVision places the stride for downsampling to the second 3x3
+       The bottleneck of TensorPlay Vision places the stride for downsampling to the second 3x3
        convolution while the original paper places it to the first 1x1 convolution.
        This variant improves the accuracy and is known as `ResNet V1.5
-       <https://ngc.nvidia.com/catalog/model-scripts/nvidia:resnet_50_v1_5_for_pytorch>`_.
+       <https://ngc.nvidia.com/catalog/model-scripts/nvidia:resnet_50_v1_5_for_tensorplay>`_.
 
     Args:
-        weights (:class:`~torchvision.models.ResNet50_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.ResNet50_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.ResNet50_Weights` below for
+            :class:`~tensorplay.vision.models.ResNet50_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.resnet.ResNet``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.resnet.ResNet``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/resnet.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/resnet.py>`_
             for more details about this class.
 
-    .. autoclass:: torchvision.models.ResNet50_Weights
+    .. autoclass:: tensorplay.vision.models.ResNet50_Weights
         :members:
     """
     weights = ResNet50_Weights.verify(weights)
@@ -772,25 +772,25 @@ def resnet101(*, weights: Optional[ResNet101_Weights] = None, progress: bool = T
     """ResNet-101 from `Deep Residual Learning for Image Recognition <https://arxiv.org/abs/1512.03385>`__.
 
     .. note::
-       The bottleneck of TorchVision places the stride for downsampling to the second 3x3
+       The bottleneck of TensorPlay Vision places the stride for downsampling to the second 3x3
        convolution while the original paper places it to the first 1x1 convolution.
        This variant improves the accuracy and is known as `ResNet V1.5
-       <https://ngc.nvidia.com/catalog/model-scripts/nvidia:resnet_50_v1_5_for_pytorch>`_.
+       <https://ngc.nvidia.com/catalog/model-scripts/nvidia:resnet_50_v1_5_for_tensorplay>`_.
 
     Args:
-        weights (:class:`~torchvision.models.ResNet101_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.ResNet101_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.ResNet101_Weights` below for
+            :class:`~tensorplay.vision.models.ResNet101_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.resnet.ResNet``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.resnet.ResNet``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/resnet.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/resnet.py>`_
             for more details about this class.
 
-    .. autoclass:: torchvision.models.ResNet101_Weights
+    .. autoclass:: tensorplay.vision.models.ResNet101_Weights
         :members:
     """
     weights = ResNet101_Weights.verify(weights)
@@ -804,25 +804,25 @@ def resnet152(*, weights: Optional[ResNet152_Weights] = None, progress: bool = T
     """ResNet-152 from `Deep Residual Learning for Image Recognition <https://arxiv.org/abs/1512.03385>`__.
 
     .. note::
-       The bottleneck of TorchVision places the stride for downsampling to the second 3x3
+       The bottleneck of TensorPlay Vision places the stride for downsampling to the second 3x3
        convolution while the original paper places it to the first 1x1 convolution.
        This variant improves the accuracy and is known as `ResNet V1.5
-       <https://ngc.nvidia.com/catalog/model-scripts/nvidia:resnet_50_v1_5_for_pytorch>`_.
+       <https://ngc.nvidia.com/catalog/model-scripts/nvidia:resnet_50_v1_5_for_tensorplay>`_.
 
     Args:
-        weights (:class:`~torchvision.models.ResNet152_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.ResNet152_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.ResNet152_Weights` below for
+            :class:`~tensorplay.vision.models.ResNet152_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.resnet.ResNet``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.resnet.ResNet``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/resnet.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/resnet.py>`_
             for more details about this class.
 
-    .. autoclass:: torchvision.models.ResNet152_Weights
+    .. autoclass:: tensorplay.vision.models.ResNet152_Weights
         :members:
     """
     weights = ResNet152_Weights.verify(weights)
@@ -839,18 +839,18 @@ def resnext50_32x4d(
     `Aggregated Residual Transformation for Deep Neural Networks <https://arxiv.org/abs/1611.05431>`_.
 
     Args:
-        weights (:class:`~torchvision.models.ResNeXt50_32X4D_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.ResNeXt50_32X4D_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.ResNext50_32X4D_Weights` below for
+            :class:`~tensorplay.vision.models.ResNext50_32X4D_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.resnet.ResNet``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.resnet.ResNet``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/resnet.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/resnet.py>`_
             for more details about this class.
-    .. autoclass:: torchvision.models.ResNeXt50_32X4D_Weights
+    .. autoclass:: tensorplay.vision.models.ResNeXt50_32X4D_Weights
         :members:
     """
     weights = ResNeXt50_32X4D_Weights.verify(weights)
@@ -869,18 +869,18 @@ def resnext101_32x8d(
     `Aggregated Residual Transformation for Deep Neural Networks <https://arxiv.org/abs/1611.05431>`_.
 
     Args:
-        weights (:class:`~torchvision.models.ResNeXt101_32X8D_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.ResNeXt101_32X8D_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.ResNeXt101_32X8D_Weights` below for
+            :class:`~tensorplay.vision.models.ResNeXt101_32X8D_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.resnet.ResNet``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.resnet.ResNet``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/resnet.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/resnet.py>`_
             for more details about this class.
-    .. autoclass:: torchvision.models.ResNeXt101_32X8D_Weights
+    .. autoclass:: tensorplay.vision.models.ResNeXt101_32X8D_Weights
         :members:
     """
     weights = ResNeXt101_32X8D_Weights.verify(weights)
@@ -899,18 +899,18 @@ def resnext101_64x4d(
     `Aggregated Residual Transformation for Deep Neural Networks <https://arxiv.org/abs/1611.05431>`_.
 
     Args:
-        weights (:class:`~torchvision.models.ResNeXt101_64X4D_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.ResNeXt101_64X4D_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.ResNeXt101_64X4D_Weights` below for
+            :class:`~tensorplay.vision.models.ResNeXt101_64X4D_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.resnet.ResNet``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.resnet.ResNet``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/resnet.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/resnet.py>`_
             for more details about this class.
-    .. autoclass:: torchvision.models.ResNeXt101_64X4D_Weights
+    .. autoclass:: tensorplay.vision.models.ResNeXt101_64X4D_Weights
         :members:
     """
     weights = ResNeXt101_64X4D_Weights.verify(weights)
@@ -934,18 +934,18 @@ def wide_resnet50_2(
     channels, and in Wide ResNet-50-2 has 2048-1024-2048.
 
     Args:
-        weights (:class:`~torchvision.models.Wide_ResNet50_2_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.Wide_ResNet50_2_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.Wide_ResNet50_2_Weights` below for
+            :class:`~tensorplay.vision.models.Wide_ResNet50_2_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.resnet.ResNet``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.resnet.ResNet``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/resnet.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/resnet.py>`_
             for more details about this class.
-    .. autoclass:: torchvision.models.Wide_ResNet50_2_Weights
+    .. autoclass:: tensorplay.vision.models.Wide_ResNet50_2_Weights
         :members:
     """
     weights = Wide_ResNet50_2_Weights.verify(weights)
@@ -968,18 +968,18 @@ def wide_resnet101_2(
     channels, and in Wide ResNet-101-2 has 2048-1024-2048.
 
     Args:
-        weights (:class:`~torchvision.models.Wide_ResNet101_2_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.Wide_ResNet101_2_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.Wide_ResNet101_2_Weights` below for
+            :class:`~tensorplay.vision.models.Wide_ResNet101_2_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.resnet.ResNet``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.resnet.ResNet``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/resnet.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/resnet.py>`_
             for more details about this class.
-    .. autoclass:: torchvision.models.Wide_ResNet101_2_Weights
+    .. autoclass:: tensorplay.vision.models.Wide_ResNet101_2_Weights
         :members:
     """
     weights = Wide_ResNet101_2_Weights.verify(weights)

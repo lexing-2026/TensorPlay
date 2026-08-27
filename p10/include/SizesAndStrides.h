@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include "Macros.h"
 #include "ArrayRef.h"
@@ -77,6 +78,28 @@ public:
 
     // Compute strides for contiguous storage
     static std::vector<int64_t> compute_contiguous_strides(const std::vector<int64_t>& sizes);
+
+    // Torch at::detail::computeStride parity: returns the strides a view with
+    // `newshape` would have over (oldshape, oldstride), or std::nullopt when
+    // the view is not compatible (a dimension spans two contiguous
+    // subspaces).  Unlike a plain contiguity test this accepts non-contiguous
+    // inputs whose layout still admits the view (e.g. same-shape views).
+    static std::optional<std::vector<int64_t>> compute_view_strides(
+        const std::vector<int64_t>& oldshape,
+        const std::vector<int64_t>& oldstride,
+        const std::vector<int64_t>& newshape);
+
+    // Torch at::infer_size_dv parity: resolves a single -1 in `shape`
+    // against `numel`, throwing torch's exact errors (invalid dims, numel
+    // mismatch, ambiguous 0-element inference).
+    static std::vector<int64_t> infer_size(const std::vector<int64_t>& shape, int64_t numel);
+
+    // Torch c10::_compute_non_overlapping_and_dense parity: true when the
+    // strides tile exactly one dense, non-overlapping block of memory
+    // (permutations of contiguous layouts, e.g. transposed tensors).  clone()
+    // preserves strides exactly in that case, matching at::native::clone.
+    static bool is_non_overlapping_and_dense(const std::vector<int64_t>& sizes,
+                                             const std::vector<int64_t>& strides);
 
     // Convert to string representation
     std::string toString() const;

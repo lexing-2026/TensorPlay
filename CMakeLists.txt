@@ -37,8 +37,17 @@ if(USE_CUDA)
 
     if(CMAKE_CUDA_COMPILER OR CMAKE_CUDA_COMPILER_ID)
         enable_language(CUDA)
-        set(CMAKE_CUDA_STANDARD 17)
+        set(CMAKE_CUDA_STANDARD 20)
         set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+        # Sources genuinely require C++20 even for nvcc (Float8.h uses
+        # requires-clauses).  cmake 3.25's NVIDIA module predates nvcc's
+        # -std=c++20 and defines no CUDA20 options, so provide them here;
+        # newer cmakes already do this natively and the guards below simply
+        # overwrite with identical values.
+        list(APPEND CMAKE_CUDA_COMPILE_FEATURES cuda_std_20)
+        set(CMAKE_CUDA20_COMPILE_FEATURES cuda_std_20)
+        set(CMAKE_CUDA20_STANDARD_COMPILE_OPTION "-std=c++20")
+        set(CMAKE_CUDA20_EXTENSION_COMPILE_OPTION "-std=c++20")
         # Add basic CUDA flags
         if(MSVC)
             # Windows/MSVC specific flags
@@ -334,6 +343,17 @@ if(WIN32)
         # MKL config: <root>/mkl/latest/lib/cmake/mkl
         list(APPEND CMAKE_PREFIX_PATH "${ONEAPI_ROOT}")
     endif()
+else()
+    # Linux/macOS: honor ONEAPI_ROOT, else the default install location, so
+    # find_package(MKL CONFIG) can discover a system oneAPI install.
+    if(NOT DEFINED ENV{ONEAPI_ROOT} AND EXISTS "/opt/intel/oneapi")
+        set(ENV{ONEAPI_ROOT} "/opt/intel/oneapi")
+    endif()
+    if(DEFINED ENV{ONEAPI_ROOT} AND EXISTS "$ENV{ONEAPI_ROOT}")
+        message(STATUS "Found OneAPI Root: $ENV{ONEAPI_ROOT}")
+        list(APPEND CMAKE_PREFIX_PATH "$ENV{ONEAPI_ROOT}/mkl/latest"
+                                      "$ENV{ONEAPI_ROOT}/dnnl/latest")
+    endif()
 endif()
 
 option(USE_BLAS "Enable BLAS linear algebra acceleration" ON)
@@ -342,13 +362,21 @@ set(BLAS_COMPILE_DEFS "")
 set(BLAS_COMPILE_OPTIONS "")
 
 if(USE_BLAS)
+    # Default MKL; when it is absent the detector falls through to OpenBLAS
+    # (system, then the vendored copy below) so wheels never ship the
+    # naive-GEMM fallback -- torch bundles real BLAS the same way.
     set(BLAS_PROVIDER "MKL" CACHE STRING "BLAS provider (MKL/OpenBLAS)")
     set_property(CACHE BLAS_PROVIDER PROPERTY STRINGS "MKL" "OpenBLAS")
 
     if(BLAS_PROVIDER STREQUAL "MKL")
         # 1. Try MKL Config mode (Best for OneAPI)
-        set(MKL_THREADING "sequential")
+        # torch's recipe: GNU-OpenMP-threaded MKL (mkl_gnu_thread) linked
+        # statically into our .so -- shares the libgomp runtime with our own
+        # parallel_for pool, so no second threading runtime is loaded.
+        set(MKL_THREADING "gnu_thread")
         set(MKL_LINK "static")
+        # Our kernels use 32-bit cblas indices; MKLConfig defaults to ilp64.
+        set(MKL_INTERFACE lp64)
         find_package(MKL CONFIG QUIET)
         
         if(MKL_FOUND)
@@ -436,7 +464,15 @@ if(USE_BLAS)
             endif()
         endif()
 
-    elseif(BLAS_PROVIDER STREQUAL "OpenBLAS")
+        # MKL absent (CI runners, clean dev boxes): still try OpenBLAS below
+        # instead of silently dropping to the naive-GEMM fallback.
+        if(NOT BLAS_FOUND)
+            set(TP_TRY_OPENBLAS TRUE)
+        endif()
+
+    endif()
+
+    if(NOT BLAS_FOUND AND (BLAS_PROVIDER STREQUAL "OpenBLAS" OR TP_TRY_OPENBLAS))
         find_package(OpenBLAS CONFIG QUIET)
         if(OpenBLAS_FOUND)
              list(APPEND COMPUTE_LIBS OpenBLAS::OpenBLAS)
@@ -456,8 +492,52 @@ if(USE_BLAS)
         endif()
     endif()
     
+    # Last resort for CI runners / clean machines: build the vendored OpenBLAS
+    # (C-only BLAS, no LAPACK/Fortran) as static PIC and link it in, so shipped
+    # wheels never fall back to gemm_naive.  Mirrors how oneDNN is vendored.
+    if(NOT BLAS_FOUND AND NOT BLAS_PROVIDER STREQUAL "None"
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/OpenBLAS-0.3.29.tar.gz")
+        message(STATUS "Configuring vendored OpenBLAS 0.3.29 (static, C-only)...")
+        include(FetchContent)  # normally pulled in by the oneDNN section below
+        # BUILD_SHARED_LIBS must be scoped to the vendored subbuild ONLY.
+        # A bare set() here leaks into every later add_subdirectory: p10
+        # silently builds static, the linker then discards the registration-
+        # only kernel objects (nothing references them) and ALL CUDA/CPU
+        # kernels vanish from the dispatcher at runtime.
+        set(TP_SAVED_BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS})
+        set(BUILD_SHARED_LIBS OFF)
+        set(BUILD_STATIC_LIBS ON)
+        set(NO_LAPACK ON)
+        set(C_LAPACK OFF)
+        set(NOFORTRAN ON)
+        FetchContent_Declare(openblas_vendor
+            URL "${CMAKE_CURRENT_SOURCE_DIR}/third_party/OpenBLAS-0.3.29.tar.gz"
+            URL_HASH SHA256=38240eee1b29e2bde47ebb5d61160207dc68668a54cac62c076bb5032013b1eb
+        )
+        FetchContent_MakeAvailable(openblas_vendor)
+        set(BUILD_SHARED_LIBS ${TP_SAVED_BUILD_SHARED_LIBS})
+        set(BUILD_STATIC_LIBS ${TP_SAVED_BUILD_SHARED_LIBS})
+        # `openblas` is an ALIAS; the static archive is the real target.
+        if(TARGET openblas_static)
+            set_property(TARGET openblas_static PROPERTY POSITION_INDEPENDENT_CODE ON)
+            list(APPEND COMPUTE_LIBS openblas_static)
+            # Scope the vendored headers to consumers of the target (p10).
+            # A global include_directories() here would leak this directory
+            # into EVERY later target — oneDNN's bundled xbyak then resolves
+            # <cpuid.h> to OpenBLAS's helper of the same name (which does not
+            # define GCC's __cpuid macro) and fails to compile on MKL-less
+            # machines.  Consumers inherit these dirs transitively.
+            target_include_directories(openblas_static SYSTEM INTERFACE
+                $<BUILD_INTERFACE:${openblas_vendor_SOURCE_DIR}>
+                $<BUILD_INTERFACE:${openblas_vendor_BINARY_DIR}>)
+            set(BLAS_FOUND TRUE)
+            list(APPEND BLAS_COMPILE_DEFS "USE_OPENBLAS" "USE_BLAS")
+            message(STATUS "✅ Vendored OpenBLAS configured")
+        endif()
+    endif()
+
     if(BLAS_FOUND)
-        message(STATUS "✅ Successfully configured BLAS: ${BLAS_PROVIDER}")
+        message(STATUS "✅ Successfully configured BLAS: ${BLAS_PROVIDER} (${BLAS_COMPILE_DEFS})")
     else()
         message(WARNING "Could not find ${BLAS_PROVIDER}.")
     endif()
@@ -475,7 +555,12 @@ if(USE_ONEDNN)
     set(DNNL_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(DNNL_BUILD_TESTS OFF CACHE BOOL "" FORCE)
     set(DNNL_ENABLE_CONCURRENT_EXEC ON CACHE BOOL "" FORCE)
-    set(DNNL_CPU_RUNTIME "OMP" CACHE STRING "" FORCE)
+    # THREADPOOL runtime: oneDNN submits its GEMM partitions through the
+    # dnnl::threadpool_interop bridge onto TensorPlay's own intra-op pool
+    # instead of spawning an independent OpenMP team -- one shared worker
+    # team means no oversubscription/spin contention between pointwise
+    # kernels and primitive execution inside training loops.
+    set(DNNL_CPU_RUNTIME "THREADPOOL" CACHE STRING "" FORCE)
     set(DNNL_ENABLE_WORKLOAD "TRAINING" CACHE STRING "" FORCE)
     set(DNNL_ENABLE_PRIMITIVE "CONVOLUTION;MATMUL;REORDER" CACHE STRING "" FORCE)
     set(DNNL_ENABLE_PRIMITIVE_CACHE ON CACHE BOOL "" FORCE)
@@ -785,17 +870,34 @@ add_subdirectory(tpx)
 # Add stax (Optional)
 add_subdirectory(stax)
 
+# Conversion surface shared by every extension -- the libtorch_python analog.
+# ONE shared copy keeps the pybind11 caster substrate and the wrap-identity
+# cache registered from a single module boundary: _C registers the Tensor
+# type through it at import time, and user op modules (add_tensorplay_op)
+# link the same library so their tpx_py_wrap calls resolve against that
+# registration.  Compiling CPythonBridge.cpp per-extension segfaults on the
+# first returned Tensor (each copy would carry its own registry/cache).
+# Windows keeps the historical layout (statically embedded everywhere)
+# because the codebase carries no __declspec(dllexport) annotations.
+if(NOT WIN32)
+    add_library(tp_python SHARED src/bindings/python/CPythonBridge.cpp)
+    target_include_directories(tp_python
+        PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/p10/include"
+               "${CMAKE_CURRENT_SOURCE_DIR}/src/bindings/python"
+               "${CMAKE_CURRENT_SOURCE_DIR}/tpx/include")
+    target_link_libraries(tp_python PUBLIC p10 pybind11::pybind11)
+endif()
+
 # Python Bindings
 pybind11_add_module(_C
     src/bindings/python/init.cpp
-    src/bindings/python/CPythonBridge.cpp
     src/bindings/python/DType.cpp
     src/bindings/python/Scalar.cpp
     src/bindings/python/Device.cpp
     src/bindings/python/Size.cpp
     src/bindings/python/Generator.cpp
     src/bindings/python/Autograd.cpp
-    src/bindings/python/Autocast.cpp
+    src/bindings/python/autocast_mode.cpp
     src/bindings/python/Ops.cpp
     src/bindings/python/Tensor.cpp
     src/bindings/python/Stax.cpp
@@ -804,7 +906,11 @@ pybind11_add_module(_C
     src/bindings/python/CudaGraph.cpp
 )
 set_target_properties(_C PROPERTIES UNITY_BUILD ON)
-target_link_libraries(_C PRIVATE p10 tpx stax)
+if(NOT WIN32)
+    target_link_libraries(_C PRIVATE p10 tpx stax tp_python)
+else()
+    target_link_libraries(_C PRIVATE p10 tpx stax)
+endif()
 
 if(USE_CUDA)
     target_link_libraries(_C PRIVATE CUDA::cudart)
@@ -844,6 +950,13 @@ set_target_properties(_C PROPERTIES
     ARCHIVE_OUTPUT_DIRECTORY_DEBUG "${TP_PACKAGE_DIR}/_C"
 )
 
+if(NOT WIN32)
+    set_target_properties(tp_python PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY "${TP_LIB_DIR}"
+        LIBRARY_OUTPUT_DIRECTORY_RELEASE "${TP_LIB_DIR}"
+        LIBRARY_OUTPUT_DIRECTORY_DEBUG "${TP_LIB_DIR}")
+endif()
+
 # RPATH: the extension lives in tensorplay/_C while its dependencies
 # (libp10.so, libtpx.so, libstax.so) live in tensorplay/lib. Without an
 # explicit relative RPATH, importing tensorplay from a wheel/venv fails
@@ -854,6 +967,10 @@ if(NOT WIN32)
         INSTALL_RPATH "$ORIGIN"
         BUILD_RPATH "$ORIGIN"
     )
+    set_target_properties(tp_python PROPERTIES
+        INSTALL_RPATH "$ORIGIN"
+        BUILD_RPATH "$ORIGIN"
+    )
     set_target_properties(_C PROPERTIES
         INSTALL_RPATH "$ORIGIN/../lib"
         BUILD_RPATH "$ORIGIN/../lib"
@@ -861,7 +978,7 @@ if(NOT WIN32)
 endif()
 
 # Installation
-install(TARGETS p10 tpx stax
+install(TARGETS p10 tpx stax tp_python
     LIBRARY DESTINATION tensorplay/lib
     RUNTIME DESTINATION tensorplay/lib
 )

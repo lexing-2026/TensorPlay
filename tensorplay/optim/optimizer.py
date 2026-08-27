@@ -188,6 +188,9 @@ def _default_to_fused_or_foreach(params, differentiable, use_fused=False):
     if differentiable:
         return False, False
     fused_supported_devices = _get_fused_kernels_supported_devices()
+    # Match Torch's default selection exactly: foreach is an implicit
+    # accelerator path, while CPU falls back to the single-tensor route unless
+    # the optimizer has an explicit native CPU kernel of its own.
     foreach_supported_devices = _get_foreach_kernels_supported_devices()
     fused = bool(use_fused) and all(
         param is None

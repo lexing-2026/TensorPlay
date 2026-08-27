@@ -6,7 +6,7 @@ from pathlib import Path
 
 from typing import Any, Callable, Optional, Union
 
-import tensorplay as torch
+import tensorplay as tensorplay
 from PIL import Image
 
 from .utils import download_and_extract_archive, download_file_from_google_drive, extract_archive, verify_str_arg
@@ -77,7 +77,7 @@ class WIDERFace(VisionDataset):
         if not self._check_integrity():
             raise RuntimeError("Dataset not found or corrupted. You can use download=True to download and prepare it")
 
-        self.img_info: list[dict[str, Union[str, dict[str, torch.Tensor]]]] = []
+        self.img_info: list[dict[str, Union[str, dict[str, tensorplay.Tensor]]]] = []
         if self.split in ("train", "val"):
             self.parse_train_val_annotations_file()
         else:
@@ -140,7 +140,7 @@ class WIDERFace(VisionDataset):
                     if box_counter >= num_boxes:
                         box_annotation_line = False
                         file_name_line = True
-                        labels_tensor = torch.tensor(labels)
+                        labels_tensor = tensorplay.tensor(labels)
                         self.img_info.append(
                             {
                                 "img_path": img_path,

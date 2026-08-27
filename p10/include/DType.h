@@ -236,6 +236,10 @@ inline const char* toString(ScalarType t) {
         TP_TOSTRING_CASE(Float16, "Half")
         TP_TOSTRING_CASE(BFloat16, "BFloat16")
         TP_TOSTRING_CASE(Bool, "Bool")
+        TP_TOSTRING_CASE(ComplexHalf, "ComplexHalf")
+        TP_TOSTRING_CASE(ComplexFloat, "ComplexFloat")
+        TP_TOSTRING_CASE(ComplexDouble, "ComplexDouble")
+        TP_TOSTRING_CASE(BComplex32, "BComplex32")
         case ScalarType::Undefined:
             return "Undefined";
         default:

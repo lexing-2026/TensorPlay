@@ -116,7 +116,7 @@ class TestJacobianHelpers(unittest.TestCase):
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", FutureWarning)
-            jacs = get_numerical_jacobian(lambda *args: args[0] * args[0], (x,))
+            jacs = get_numerical_jacobian(lambda inp: inp[0] * inp[0], x)
         self.assertEqual(len(jacs), 1)
         jac = jacs[0]
         self.assertEqual(tuple(jac.shape), (2, 2))

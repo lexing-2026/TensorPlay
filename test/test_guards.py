@@ -40,7 +40,7 @@ def test_guard_chain_renders_tensor_conditions():
     assert chain.source.startswith("def guard(")
 
 
-def test_evaluate_and_explain_on_live_args():
+def test_evaluate_and_explain_on_live_args(probe_calls):
     def fn(x, w):
         return (x * w).sum()
 
@@ -69,11 +69,17 @@ def test_recompile_reasons_recorded_under_dynamic(probe_calls):
 
     compiled = tp.compile(fn, backend="l6_probe", dynamic=True)
     compiled(tp.tensor([1.0, 2.0]))
-    compiled(tp.tensor([1.0]))  # rank change -> new specialization
+    compiled(tp.tensor([[1.0]]))  # rank 1 -> rank 2 -> new specialization
 
     reasons = compiled._tensorplay_last_recompile_reasons
     assert reasons
-    assert any("rank" in guard.expr or "shape" in guard.expr for guard in reasons)
+    # Shape guards render as indexed expressions ("inputs[0][0][2]") rather
+    # than literal prose, so match the same disjunction the chain-rendering
+    # test above accepts.
+    assert any(
+        "rank" in guard.expr or "shape" in guard.expr or "[2]" in guard.expr
+        for guard in reasons
+    )
     assert len(probe_calls) == 2
 
 
@@ -86,7 +92,7 @@ def test_recompile_warning_via_env(probe_calls, recwarn, monkeypatch):
     compiled = tp.compile(fn, backend="l6_probe", dynamic=True)
     compiled(tp.tensor([1.0, 2.0]))
     n_warnings = len(recwarn)
-    compiled(tp.tensor([1.0]))
+    compiled(tp.tensor([[1.0]]))
     assert len(recwarn) > n_warnings
     message = str(recwarn.pop(UserWarning).message)
     assert "recompiling" in message

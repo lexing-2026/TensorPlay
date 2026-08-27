@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Union
 
 import PIL
-import tensorplay as torch
+import tensorplay as tensorplay
 
 from .utils import check_integrity, download_file_from_google_drive, extract_archive, verify_str_arg
 from .vision import VisionDataset
@@ -37,7 +37,7 @@ class CelebA(VisionDataset):
                       dataset. As a result, the coordinates will not match and may fall
                       outside the image boundaries.
 
-                      See `Issue #9008 <https://github.com/pytorch/vision/issues/9008>`_ for
+                      See `Issue #9008 <https://github.com/tensorplay/vision/issues/9008>`_ for
                       details and potential workarounds.
 
                 - ``landmarks`` (Tensor shape=(10,) dtype=int): landmark points (lefteye_x, lefteye_y, righteye_x,
@@ -124,13 +124,13 @@ class CelebA(VisionDataset):
         if mask == slice(None):  # if split == "all"
             self.filename = splits.index
         else:
-            self.filename = [splits.index[i] for i in torch.squeeze(torch.nonzero(mask))]  # type: ignore[arg-type]
+            self.filename = [splits.index[i] for i in tensorplay.squeeze(tensorplay.nonzero(mask))]  # type: ignore[arg-type]
         self.identity = identity.data[mask]
         self.bbox = bbox.data[mask]
         self.landmarks_align = landmarks_align.data[mask]
         self.attr = attr.data[mask]
         # map from {-1, 1} to {0, 1}
-        self.attr = torch.div(self.attr + 1, 2, rounding_mode="floor")
+        self.attr = tensorplay.div(self.attr + 1, 2, rounding_mode="floor")
         self.attr_names = attr.header
 
     def _load_csv(
@@ -151,7 +151,7 @@ class CelebA(VisionDataset):
         data = [row[1:] for row in data]
         data_int = [list(map(int, i)) for i in data]
 
-        return CSV(headers, indices, torch.tensor(data_int))
+        return CSV(headers, indices, tensorplay.tensor(data_int))
 
     def _check_integrity(self) -> bool:
         for _, md5, filename in self.file_list:

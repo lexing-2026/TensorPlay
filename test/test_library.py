@@ -376,6 +376,439 @@ class WrapTritonTest(unittest.TestCase):
             self.fail("expected GraphCaptureError for raw triton launch")
 
 
+class CustomOpSignatureParityTest(unittest.TestCase):
+    """torch 2.13 signature surface: fn positional + schema attachment."""
+
+    def test_fn_positional(self):
+        def body(x):
+            return tp.add(x, 1.0)
+
+        op = library.custom_op("signs::plusk", body, mutates_args=())
+        self.assertIs(library.get_op("signs::plusk"), op)
+        self.assertEqual(op(tp.tensor([1.0])).tolist(), [2.0])
+
+    def test_schema_attachment(self):
+        @library.custom_op(
+            "signs::docd",
+            mutates_args=(),
+            schema="signs::docd(Tensor self) -> Tensor",
+        )
+        def docd(x):
+            return x
+
+        self.assertEqual(docd.schema, "signs::docd(Tensor self) -> Tensor")
+
+    def test_triton_and_tilelang_accept_fn_positional(self):
+        op = library.triton_op("signs::trop", lambda x: x, mutates_args=())
+        self.assertTrue(op.is_triton_op)
+        tl = library.tile_lang_op("signs::tlop", lambda x: x, mutates_args=())
+        self.assertTrue(tl.is_tile_lang_op)
+        self.assertIn("<tile_lang_op signs::tlop>", repr(tl))
+        self.assertFalse(tl.is_triton_op)
+
+
+class KwargsPassThroughTest(unittest.TestCase):
+    """Regression: eager dispatch must forward keyword arguments."""
+
+    def test_kwargs_reach_kernel(self):
+        @library.custom_op("kwns::scale_by", mutates_args=())
+        def scale_by(x, alpha=1.0):
+            return tp.mul(x, alpha)
+
+        x = tp.tensor([2.0])
+        self.assertEqual(scale_by(x, alpha=3.0).tolist(), [6.0])
+        self.assertEqual(scale_by(x).tolist(), [2.0])
+
+    def test_kwargs_reach_autograd_path(self):
+        @library.custom_op("kwns::powk", mutates_args=())
+        def powk(x, p=2.0):
+            return tp.pow(x, p)
+
+        powk.register_autograd(lambda ctx, g: (g,))
+        x = tp.tensor([3.0], requires_grad=True)
+        y = powk(x, p=2.0)
+        self.assertEqual(y.tolist(), [9.0])
+        y.sum().backward()
+        self.assertIsNotNone(x.grad)
+
+
+class SetKernelEnabledTest(unittest.TestCase):
+    def test_disable_falls_back_to_composite(self):
+        @library.custom_op("enabens::dual", mutates_args=())
+        def dual(x):
+            return tp.mul(x, 1.0)  # composite slot
+
+        @dual.register_kernel("cpu")
+        def _(x):
+            return tp.mul(x, 10.0)  # concrete slot
+
+        x = tp.tensor([1.0])
+        self.assertEqual(dual(x).tolist(), [10.0])
+        with dual.set_kernel_enabled("cpu", enabled=False):
+            self.assertEqual(dual(x).tolist(), [1.0])
+        self.assertEqual(dual(x).tolist(), [10.0])
+
+    def test_double_toggle_warns(self):
+        @library.custom_op("enabens::one", mutates_args=())
+        def one(x):
+            return x
+
+        @one.register_kernel("cpu")
+        def _(x):
+            return x
+
+        # Enter the first disable outside the recorder: the *second* disable
+        # must warn "already disabled" (nested assertWarns would swallow it,
+        # since only the innermost catch_warnings records).
+        disable_ctx = one.set_kernel_enabled("cpu", enabled=False)
+        with disable_ctx, self.assertWarns(UserWarning):
+            with one.set_kernel_enabled("cpu", enabled=False):
+                pass
+        self.assertEqual(one._disabled_kernels, set())
+
+
+class GetKernelTest(unittest.TestCase):
+    def test_get_kernel_resolves_slots(self):
+        @library.custom_op("gkerns::probe", mutates_args=())
+        def probe(x):
+            return x  # composite/default slot
+
+        @probe.register_kernel("cpu")
+        def cpu_fn(x):
+            return x
+
+        self.assertIs(library.get_kernel(probe, "cpu"), cpu_fn)
+        self.assertIs(library.get_kernel(probe, "default"), probe._kernels[None])
+        self.assertIs(library.get_kernel(probe, "CompositeExplicitAutograd"), probe._kernels[None])
+
+    def test_missing_kernel_raises_lookup_error(self):
+        @library.custom_op("gkerns::lonely", mutates_args=())
+        def lonely(x):
+            return x
+
+        with self.assertRaises(LookupError):
+            library.get_kernel(lonely, "cuda")
+
+
+class RegisterVmapTest(unittest.TestCase):
+    def test_method_and_toplevel_store_formula(self):
+        @library.custom_op("vmapns::f", mutates_args=())
+        def f(x):
+            return x
+
+        formula = lambda info, in_dims, *args: (args[0], in_dims[0])  # noqa: E731
+        ret = f.register_vmap(formula)
+        self.assertIs(ret, formula)
+        self.assertIs(f._vmap_fn, formula)
+        library.register_vmap(f, formula)
+        # Autograd class exposes the hook once a backward exists too.
+        f.register_autograd(lambda ctx, g: (g,))
+        self.assertTrue(hasattr(f._autograd_cls, "vmap"))
+
+    def test_non_callable_rejected(self):
+        @library.custom_op("vmapns::g", mutates_args=())
+        def g(x):
+            return x
+
+        with self.assertRaises(TypeError):
+            g.register_vmap(42)
+
+
+class RegisterAutocastTest(unittest.TestCase):
+    def test_autocast_casts_floating_inputs(self):
+        seen = []
+
+        @library.custom_op("acns::dtype_probe", mutates_args=())
+        def probe(x):
+            seen.append(str(x.dtype))
+            return x
+
+        probe.register_autocast("cpu", tp.float16)
+
+        x = tp.tensor([1.0])
+        probe(x)  # autocast disabled: fp32 flows through untouched
+        self.assertEqual(seen[-1], str(tp.float32))
+        with tp.autocast("cpu", dtype=tp.float16):
+            self.assertTrue(tp.is_autocast_enabled("cpu"))
+            probe(x)
+        self.assertEqual(seen[-1], str(tp.float16))
+        probe(x)  # exited: back to fp32
+        self.assertEqual(seen[-1], str(tp.float32))
+
+    def test_toplevel_registration(self):
+        @library.custom_op("acns2::probe", mutates_args=())
+        def probe(x):
+            return x
+
+        library.register_autocast(probe, "cpu", tp.bfloat16)
+        self.assertIn("cpu", probe._autocast_rules)
+
+    def test_invalid_rule_rejected(self):
+        @library.custom_op("acns3::probe", mutates_args=())
+        def probe(x):
+            return x
+
+        with self.assertRaises(TypeError):
+            probe.register_autocast("cpu", tp.int32)
+
+
+class InferSchemaTest(unittest.TestCase):
+    def test_typed_prototype(self):
+        from tensorplay import Tensor
+
+        def weighted(x: Tensor, n: int, out: Tensor) -> Tensor:
+            raise NotImplementedError
+
+        schema = library.infer_schema(
+            weighted, mutates_args=("out",), op_name="mylib::weighted"
+        )
+        self.assertEqual(schema, "mylib::weighted(Tensor, SymInt, Tensor(a!)) -> Tensor")
+
+    def test_unannotated_defaults_to_tensor(self):
+        def bare(x, y):
+            raise NotImplementedError
+
+        schema = library.infer_schema(bare, mutates_args=())
+        self.assertEqual(schema, "bare(Tensor, Tensor) -> Tensor")
+
+
+class OpcheckTest(unittest.TestCase):
+    def _make_good_op(self, name):
+        @library.custom_op(name, mutates_args=())
+        def square(x):
+            return tp.mul(x, x)
+
+        @square.register_fake
+        def _(x):
+            return tp.empty_like(x)
+
+        square.register_autograd(lambda ctx, g: (g * 2.0,))
+        return square
+
+    def test_well_registered_op_passes_all(self):
+        op = self._make_good_op("opchkns::square_ok")
+        failures = library.opcheck(
+            op, (tp.tensor([1.0, 2.0]),), raise_exception=False
+        )
+        self.assertEqual(failures, {})
+
+    def test_undeclared_mutation_detected(self):
+        @library.custom_op("opchkns::mutator", mutates_args=())
+        def mutator(x):
+            y = tp.mul(x, 2.0)  # writes through x's storage? no: fresh buf;
+            x.copy_(y)  # actual in-place write
+            return y
+
+        failures = library.opcheck(
+            mutator, (tp.tensor([1.0]),), raise_exception=False
+        )
+        self.assertIn("test_schema", failures)
+
+    def test_input_aliasing_output_detected(self):
+        @library.custom_op("opchkns::aliaser", mutates_args=())
+        def aliaser(x):
+            return x  # returns the input itself
+
+        failures = library.opcheck(
+            aliaser, (tp.tensor([1.0]),), raise_exception=False
+        )
+        self.assertIn("test_schema", failures)
+
+    def test_missing_fake_reported(self):
+        @library.custom_op("opchkns::nofake", mutates_args=())
+        def nofake(x):
+            return tp.add(x, 1.0)
+
+        failures = library.opcheck(nofake, (tp.tensor([1.0]),), raise_exception=False)
+        self.assertIn("test_faketensor", failures)
+
+    def test_fake_shape_mismatch_detected(self):
+        @library.custom_op("opchkns::badfake", mutates_args=())
+        def badfake(x):
+            return tp.add(x, 1.0)
+
+        @badfake.register_fake
+        def _(x):
+            return tp.empty([x.shape[0] + 1])
+
+        failures = library.opcheck(
+            badfake, (tp.tensor([1.0]),), raise_exception=False
+        )
+        self.assertIn("test_faketensor", failures)
+
+    def test_autograd_gap_detected(self):
+        # TensorPlay kernels differentiate implicitly through composed ops,
+        # so a missing register_autograd is legal; what opcheck flags is a
+        # kernel that BREAKS the graph or drops the gradient.
+        @library.custom_op("opchkns::gradbreaker", mutates_args=())
+        def gradbreaker(x):
+            with tp.no_grad():
+                return tp.mul(x, 2.0)
+
+        @gradbreaker.register_fake
+        def _(x):
+            return tp.empty_like(x)
+
+        failures = library.opcheck(
+            gradbreaker,
+            (tp.tensor([1.0], requires_grad=True),),
+            raise_exception=False,
+        )
+        self.assertIn("test_autograd_registration", failures)
+
+    def test_implicit_differentiation_passes(self):
+        @library.custom_op("opchkns::implicit", mutates_args=())
+        def implicit(x):
+            return tp.mul(x, 2.0)  # composite-implicit: no formula needed
+
+        failures = library.opcheck(
+            implicit,
+            (tp.tensor([1.0], requires_grad=True),),
+            raise_exception=False,
+            test_utils=("test_schema", "test_autograd_registration"),
+        )
+        self.assertEqual(failures, {})
+
+    def test_raise_exception_mode(self):
+        op = self._make_good_op("opchkns::raiseok")
+        self.assertEqual(library.opcheck(op, (tp.tensor([2.0]),)), {})
+
+    def test_unknown_test_utils_rejected(self):
+        op = self._make_good_op("opchkns::unknownutils")
+        with self.assertRaises(ValueError):
+            library.opcheck(op, (tp.tensor([1.0]),), test_utils="test_nope")
+
+
+class TopLevelDefineImplTest(unittest.TestCase):
+    def test_define_then_impl(self):
+        library.define("topdefs::bump(Tensor self) -> Tensor")
+        library.impl("topdefs::bump", "cpu", lambda x: tp.add(x, 1.0))
+        self.assertEqual(
+            library.get_op("topdefs::bump")(tp.tensor([1.0])).tolist(), [2.0]
+        )
+
+    def test_impl_decorator_form(self):
+        library.define("topdefs::twice2(Tensor) -> Tensor")
+
+        @library.impl("topdefs::twice2", "cpu")
+        def twice2(x):
+            return tp.mul(x, 2.0)
+
+        self.assertEqual(twice2(tp.tensor([1.0])).tolist(), [2.0])
+
+    def test_impl_abstract_alias_registers_fake(self):
+        library.define("topdefs::meta(Tensor) -> Tensor")
+        library.impl_abstract("topdefs::meta", lambda x: tp.empty_like(x))
+        self.assertIsNotNone(library.get_op("topdefs::meta")._fake_fn)
+
+
+class LibraryImplDispatchKeyAliasTest(unittest.TestCase):
+    def test_dispatch_key_kwarg(self):
+        lib = library.Library("dkalias")
+        lib.define("dkalias::go(Tensor) -> Tensor")
+        lib.impl("go", lambda x: tp.add(x, 5.0), dispatch_key="CPU")
+        self.assertEqual(
+            library.get_op("dkalias::go")(tp.tensor([0.0])).tolist(), [5.0]
+        )
+
+
+class _FakeTileLangKernel:
+    """Duck-typed stand-in for tilelang.jit.kernel.JITKernel."""
+
+    _tilelang_kernel = True
+
+    def __init__(self):
+        self.launches = []
+
+    def __call__(self, *args, **kwargs):
+        self.launches.append((args, kwargs))
+        return "tl-launched"
+
+
+class _FakeTileLangFactory:
+    """Duck-typed stand-in for lazy-mode tilelang.jit.JITImpl."""
+
+    def get_tir(self, *args, **kwargs):
+        return None
+
+    def __call__(self, *args, **kwargs):
+        return _FakeTileLangKernel()
+
+
+class WrapTileLangTest(unittest.TestCase):
+    def test_eager_passthrough(self):
+        kernel = _FakeTileLangKernel()
+        wrapped = library.wrap_tilelang(kernel)
+        self.assertEqual(wrapped(1, 2, BLOCK=64), "tl-launched")
+        self.assertEqual(kernel.launches, [((1, 2), {"BLOCK": 64})])
+
+    def test_lazy_factory_accepted(self):
+        wrapped = library.wrap_tilelang(_FakeTileLangFactory())
+        bound = wrapped.compile(1024, 1024, 1024)
+        self.assertIsInstance(bound, library.TileLangKernelWrapper)
+        self.assertEqual(bound(), "tl-launched")
+
+    def test_wrap_is_idempotent(self):
+        kernel = _FakeTileLangKernel()
+        once = library.wrap_tilelang(kernel)
+        self.assertIs(library.wrap_tilelang(once), once)
+
+    def test_plain_callable_rejected(self):
+        with self.assertRaises(TypeError):
+            library.wrap_tilelang(lambda: None)
+        with self.assertRaises(TypeError):
+            library.wrap_tilelang(object())
+
+    def test_capture_of_raw_launch_raises_graph_error(self):
+        wrapped = library.wrap_tilelang(_FakeTileLangKernel())
+
+        def broken(a):
+            return wrapped(a)
+
+        x = tp.tensor([1.0])
+        with self.assertRaises(Exception) as ctx:
+            tp.compiler.Tracer().trace(broken, sample_inputs={"a": x})
+        from tensorplay.compiler.graph import GraphCaptureError
+
+        self.assertIsInstance(ctx.exception, GraphCaptureError)
+
+
+class TileLangOpCaptureTest(unittest.TestCase):
+    def test_tile_lang_op_captures_single_opaque_node(self):
+        launched = []
+        wrapped = library.wrap_tilelang(_FakeTileLangKernel())
+
+        @library.tile_lang_op("tlcapns::shift", mutates_args=())
+        def shift(x):
+            # Eager path would launch here; tracing never runs the body.
+            launched.append(True)
+            del wrapped
+            return tp.add(x, 1.0)
+
+        x = tp.tensor([1.0, 2.0])
+        gm = tp.compiler.Tracer().trace(lambda a: shift(a), sample_inputs={"a": x})
+
+        self.assertEqual(launched, [])  # body skipped under trace
+        op_nodes = [
+            n
+            for n in gm.graph.nodes
+            if n.op == "call_function" and isinstance(n.target, library.CustomOpDef)
+        ]
+        self.assertEqual(len(op_nodes), 1)
+        self.assertTrue(op_nodes[0].target.is_tile_lang_op)
+        compute_nodes = [n for n in gm.graph.nodes if n.op == "call_function"]
+        self.assertEqual(len(compute_nodes), 1)  # fusion barrier held
+
+    def test_compiled_matches_eager(self):
+        @library.tile_lang_op("tlcapns::plus_ten", mutates_args=())
+        def plus_ten(x):
+            return tp.add(x, 10.0)
+
+        x = tp.tensor([1.0, 2.0])
+        compiled = tp.compile(lambda a: tp.mul(plus_ten(a), 2.0))
+        self.assertEqual(compiled(x).tolist(), [22.0, 24.0])
+
+
 @unittest.skipIf(not _HAS_TRITON, "triton is unavailable")
 class RealTritonJITFunctionTest(unittest.TestCase):
     """Level-2 plumbing against a genuine ``@triton.jit`` kernel object.

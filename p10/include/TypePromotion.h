@@ -43,9 +43,10 @@ inline DType promoteTypes(DType type1, DType type2) {
         }
 
         // ComplexFloat is the result of complex32 with bfloat16/float32, and
-        // dominates all integral, bool, and real float32 inputs.
+        // dominates all integral, bool, and float32 inputs.  float64 still
+        // wins (c10: promote_types(double, complex64) == complex128).
         if (type1 == DType::ComplexFloat || type2 == DType::ComplexFloat) {
-            if (type1 == DType::ComplexDouble || type2 == DType::ComplexDouble) {
+            if (type1 == DType::Float64 || type2 == DType::Float64) {
                 return DType::ComplexDouble;
             }
             return DType::ComplexFloat;
@@ -124,9 +125,13 @@ inline DType result_type(const Scalar& scalar, DType tensorType) {
     if (isFloatingOrComplexType(tensorType)) {
         return tensorType;
     }
+    if (scalar.isComplex()) {
+        // Int Tensor + Complex Scalar -> Complex64 Tensor
+        return DType::ComplexFloat;
+    }
     if (scalar.isFloatingPoint()) {
         // Int Tensor + Float Scalar -> Float Tensor (usually Float32 default unless tensor is Double)
-        return DType::Float32; 
+        return DType::Float32;
     }
     return tensorType;
 }

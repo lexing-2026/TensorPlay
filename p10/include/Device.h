@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <string>
 #include <memory>
+#include <unordered_map>
 #include <cctype>
 #include "Macros.h"
 
@@ -80,6 +81,11 @@ namespace cuda {
     P10_API void reset_max_memory_allocated(int device = 0);
     P10_API void reset_peak_memory_stats(int device = 0);
     P10_API void empty_cache();
+    // Fragmentation-aware accounting: allocated/reserved/peaks plus segment
+    // counts, free-block bytes (largest block), event-pending blocks and the
+    // number of live graph pools.
+    P10_API std::unordered_map<std::string, uint64_t> memory_stats(
+        int device = -1);
     P10_API void manual_seed(uint64_t seed);
     P10_API void manual_seed_all(uint64_t seed);
     P10_API void recordStream(void* base_ptr, const Device& device);

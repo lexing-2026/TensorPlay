@@ -1,43 +1,20 @@
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "CUDARuntime.h"
+#include "ForeachMultiTensor.cuh"
+#include "OptimizerMTA.cuh"
 #include "Exception.h"
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <limits>
 #include <optional>
 #include <string>
 #include <vector>
-
-// ---------------------------------------------------------------------------
-// Torch-aligned multi-tensor apply primitives.
-// Reference: aten/src/ATen/native/cuda/MultiTensorApply.cuh:16-63
-//   kILP=4, kChunkSize=65536, kBlockSize=512,
-//   is_aligned / load_store (aligned_vec_t → LDG.128/STG.128)
-//   ForeachFunctors.cuh:109/165 — load_args/store_args with bounds checks.
-// ---------------------------------------------------------------------------
-constexpr int kOptILP = 4;
-constexpr int64_t kFusedChunk = 65536;
-constexpr int64_t kFusedBlock = 512;
-
-template <typename T>
-__device__ __forceinline__ bool opt_is_aligned(T* p) {
-    return (reinterpret_cast<uintptr_t>(p) & ((kOptILP * sizeof(T)) - 1)) == 0;
-}
-
-template <typename T>
-struct alignas(kOptILP * sizeof(T)) OptVec { T v[kOptILP]; };
-
-template <typename T>
-__device__ __forceinline__ void opt_load_store(
-    T* dst, T* src, int64_t dst_off, int64_t src_off) {
-    using LT = OptVec<T>;
-    reinterpret_cast<LT*>(dst)[dst_off] = reinterpret_cast<const LT*>(src)[src_off];
-}
-
 
 namespace tensorplay {
 namespace cuda {
@@ -54,8 +31,15 @@ void validate_lists(const std::vector<Tensor>& params,
                    bool require_third_state,
                    const char* op_name) {
     const auto count = params.size();
-    if (grads.size() != count || first_state.size() != count ||
-        second_state.size() != count || third_state.size() != count) {
+    // An optional state list may be entirely absent (e.g. _foreach_sgd with
+    // momentum == 0 receives no momentum buffers); when present it must still
+    // cover every parameter.
+    if (grads.size() != count ||
+        ((require_first_state || !first_state.empty()) &&
+         first_state.size() != count) ||
+        ((require_second_state || !second_state.empty()) &&
+         second_state.size() != count) ||
+        (!third_state.empty() && third_state.size() != count)) {
         TP_THROW(ValueError, std::string(op_name) +
             ": tensor list sizes must match");
     }
@@ -84,19 +68,35 @@ void validate_lists(const std::vector<Tensor>& params,
                 ": requires contiguous same-device parameter/gradient pairs with one dtype");
         }
 
-        const Tensor* states[] = {&first_state[i], &second_state[i]};
-        const bool required[] = {require_first_state, require_second_state};
-        for (size_t state_index = 0; state_index < 2; ++state_index) {
-            if (!required[state_index]) continue;
-            const Tensor& state = *states[state_index];
-            if (!state.defined() || !state.is_contiguous() ||
-                state.shape() != param.shape() || state.dtype() != dtype ||
-                state.device() != device) {
+        if (require_first_state && !first_state.empty()) {
+            const Tensor& state = first_state[i];
+            if (!state.defined()) {
+                TP_THROW(ValueError, std::string(op_name) +
+                    ": required optimizer state is undefined");
+            }
+            if (!state.is_contiguous() || state.shape() != param.shape() ||
+                state.dtype() != param.dtype() || state.device() != param.device()) {
+                TP_THROW(NotImplementedError, std::string(op_name) +
+                    ": optimizer state must match its parameter layout");
+            }
+        }
+        if (require_second_state && !second_state.empty()) {
+            const Tensor& state = second_state[i];
+            if (!state.defined()) {
+                TP_THROW(ValueError, std::string(op_name) +
+                    ": required optimizer state is undefined");
+            }
+            if (!state.is_contiguous() || state.shape() != param.shape() ||
+                state.dtype() != param.dtype() || state.device() != param.device()) {
                 TP_THROW(NotImplementedError, std::string(op_name) +
                     ": optimizer state must match its parameter layout");
             }
         }
         if (require_third_state) {
+            if (third_state.empty()) {
+                TP_THROW(ValueError, std::string(op_name) +
+                    ": required optimizer state is undefined");
+            }
             const Tensor& state = third_state[i];
             if (!state.defined() || !state.is_contiguous() ||
                 state.shape() != param.shape() || state.dtype() != dtype ||
@@ -106,235 +106,6 @@ void validate_lists(const std::vector<Tensor>& params,
             }
         }
     }
-}
-
-template <typename T>
-class DeviceArray {
-public:
-    DeviceArray(cudaStream_t stream, const std::vector<T>& values)
-        : stream_(stream) {
-        if (values.empty()) return;
-        checkCuda(cudaMallocAsync(reinterpret_cast<void**>(&data_),
-                                  values.size() * sizeof(T), stream_),
-                  "cudaMallocAsync optimizer metadata");
-        checkCuda(cudaMemcpyAsync(data_, values.data(),
-                                  values.size() * sizeof(T),
-                                  cudaMemcpyHostToDevice, stream_),
-                  "cudaMemcpyAsync optimizer metadata");
-    }
-
-    ~DeviceArray() {
-        if (data_) (void)cudaFreeAsync(data_, stream_);
-    }
-
-    DeviceArray(const DeviceArray&) = delete;
-    DeviceArray& operator=(const DeviceArray&) = delete;
-
-    T* data() const noexcept { return data_; }
-
-private:
-    cudaStream_t stream_ = nullptr;
-    T* data_ = nullptr;
-};
-
-template <typename scalar_t>
-__global__ void foreach_sgd_kernel(scalar_t* const* params,
-                                   scalar_t* const* grads,
-                                   scalar_t* const* momentum_buffers,
-                                   const int64_t* numels,
-                                   int64_t parameter_count,
-                                   double lr,
-                                   double momentum,
-                                   double dampening,
-                                   double weight_decay,
-                                   int nesterov,
-                                   int first_momentum_step) {
-    const int64_t list_index = static_cast<int64_t>(blockIdx.x);
-    if (list_index >= parameter_count) return;
-
-    scalar_t* param = params[list_index];
-    scalar_t* grad = grads[list_index];
-    scalar_t* buffer = momentum_buffers[list_index];
-    const scalar_t lr_value = static_cast<scalar_t>(lr);
-    const scalar_t momentum_value = static_cast<scalar_t>(momentum);
-    const scalar_t dampening_value = static_cast<scalar_t>(dampening);
-    const scalar_t decay_value = static_cast<scalar_t>(weight_decay);
-
-    for (int64_t i = static_cast<int64_t>(threadIdx.x);
-         i < numels[list_index]; i += static_cast<int64_t>(blockDim.x)) {
-        scalar_t update = grad[i];
-        if (weight_decay != 0.0) update += decay_value * param[i];
-        if (momentum != 0.0) {
-            if (first_momentum_step) {
-                buffer[i] = update;
-                if (nesterov) update += momentum_value * buffer[i];
-                else update = buffer[i];
-            } else {
-                buffer[i] = momentum_value * buffer[i] +
-                    (scalar_t(1) - dampening_value) * update;
-                if (nesterov) update += momentum_value * buffer[i];
-                else update = buffer[i];
-            }
-        }
-        param[i] -= lr_value * update;
-    }
-}
-
-template <typename scalar_t>
-__global__ void foreach_adam_kernel(scalar_t* const* params,
-                                    scalar_t* const* grads,
-                                    scalar_t* const* exp_avgs,
-                                    scalar_t* const* exp_avg_sqs,
-                                    scalar_t* const* max_exp_avg_sqs,
-                                    const int64_t* numels,
-                                    const double* step_sizes,
-                                    const double* correction2_sqrts,
-                                    int64_t parameter_count,
-                                    double beta1,
-                                    double beta2,
-                                    double eps,
-                                    double weight_decay,
-                                    int amsgrad) {
-    const int64_t list_index = static_cast<int64_t>(blockIdx.x);
-    if (list_index >= parameter_count) return;
-
-    scalar_t* param = params[list_index];
-    scalar_t* grad = grads[list_index];
-    scalar_t* exp_avg = exp_avgs[list_index];
-    scalar_t* exp_avg_sq = exp_avg_sqs[list_index];
-    scalar_t* max_exp_avg_sq = amsgrad ? max_exp_avg_sqs[list_index] : nullptr;
-    // Bias corrections are identical for every element in this tensor.  They
-    // are computed once on the host per parameter tensor instead of repeating
-    // pow/sqrt in every CUDA thread.
-    const scalar_t step_size = static_cast<scalar_t>(step_sizes[list_index]);
-    const scalar_t correction2_sqrt = static_cast<scalar_t>(
-        correction2_sqrts[list_index]);
-    const scalar_t beta1_value = static_cast<scalar_t>(beta1);
-    const scalar_t beta2_value = static_cast<scalar_t>(beta2);
-    const scalar_t one_minus_beta1 = static_cast<scalar_t>(1.0 - beta1);
-    const scalar_t one_minus_beta2 = static_cast<scalar_t>(1.0 - beta2);
-    const scalar_t eps_value = static_cast<scalar_t>(eps);
-    const scalar_t decay_value = static_cast<scalar_t>(weight_decay);
-
-    for (int64_t i = static_cast<int64_t>(threadIdx.x);
-         i < numels[list_index]; i += static_cast<int64_t>(blockDim.x)) {
-        scalar_t g = grad[i];
-        if (weight_decay != 0.0) g += decay_value * param[i];
-        exp_avg[i] = beta1_value * exp_avg[i] + one_minus_beta1 * g;
-        exp_avg_sq[i] = beta2_value * exp_avg_sq[i] + one_minus_beta2 * g * g;
-
-        scalar_t second_moment = exp_avg_sq[i];
-        if (amsgrad) {
-            if (max_exp_avg_sq[i] < second_moment) {
-                max_exp_avg_sq[i] = second_moment;
-            }
-            second_moment = max_exp_avg_sq[i];
-        }
-        const scalar_t denom = static_cast<scalar_t>(
-            sqrt(static_cast<double>(second_moment)) /
-            static_cast<double>(correction2_sqrt)) + eps_value;
-        param[i] -= step_size * exp_avg[i] / denom;
-    }
-}
-
-template <typename scalar_t>
-void launch_sgd(const std::vector<Tensor>& params,
-                const std::vector<Tensor>& grads,
-                const std::vector<Tensor>& momentum_buffers,
-                double lr,
-                double momentum,
-                double dampening,
-                double weight_decay,
-                bool nesterov,
-                bool first_momentum_step) {
-    const auto stream = getCurrentCUDAStream().stream();
-    std::vector<scalar_t*> param_ptrs;
-    std::vector<scalar_t*> grad_ptrs;
-    std::vector<scalar_t*> buffer_ptrs;
-    std::vector<int64_t> numels;
-    param_ptrs.reserve(params.size());
-    grad_ptrs.reserve(params.size());
-    buffer_ptrs.reserve(params.size());
-    numels.reserve(params.size());
-    for (size_t i = 0; i < params.size(); ++i) {
-        param_ptrs.push_back(params[i].data_ptr<scalar_t>());
-        grad_ptrs.push_back(grads[i].data_ptr<scalar_t>());
-        buffer_ptrs.push_back(momentum_buffers[i].defined()
-            ? momentum_buffers[i].data_ptr<scalar_t>() : nullptr);
-        numels.push_back(params[i].numel());
-    }
-    DeviceArray<scalar_t*> d_params(stream, param_ptrs);
-    DeviceArray<scalar_t*> d_grads(stream, grad_ptrs);
-    DeviceArray<scalar_t*> d_buffers(stream, buffer_ptrs);
-    DeviceArray<int64_t> d_numels(stream, numels);
-
-    foreach_sgd_kernel<scalar_t><<<static_cast<unsigned int>(params.size()), 256, 0, stream>>>(
-        d_params.data(), d_grads.data(), d_buffers.data(), d_numels.data(),
-                static_cast<int64_t>(params.size()), lr, momentum, dampening,
-        weight_decay, nesterov ? 1 : 0, first_momentum_step ? 1 : 0);
-    checkCuda(cudaGetLastError(), "_foreach_sgd kernel launch");
-}
-
-template <typename scalar_t>
-void launch_adam(const std::vector<Tensor>& params,
-                 const std::vector<Tensor>& grads,
-                 const std::vector<Tensor>& exp_avgs,
-                 const std::vector<Tensor>& exp_avg_sqs,
-                 const std::vector<Tensor>& max_exp_avg_sqs,
-                 const std::vector<int64_t>& steps,
-                 double lr,
-                 double beta1,
-                 double beta2,
-                 double eps,
-                 double weight_decay,
-                 bool amsgrad) {
-    const auto stream = getCurrentCUDAStream().stream();
-    std::vector<scalar_t*> param_ptrs;
-    std::vector<scalar_t*> grad_ptrs;
-    std::vector<scalar_t*> exp_avg_ptrs;
-    std::vector<scalar_t*> exp_avg_sq_ptrs;
-    std::vector<scalar_t*> max_exp_avg_sq_ptrs;
-    std::vector<int64_t> numels;
-    std::vector<double> step_sizes;
-    std::vector<double> correction2_sqrts;
-    param_ptrs.reserve(params.size());
-    grad_ptrs.reserve(params.size());
-    exp_avg_ptrs.reserve(params.size());
-    exp_avg_sq_ptrs.reserve(params.size());
-    max_exp_avg_sq_ptrs.reserve(params.size());
-    numels.reserve(params.size());
-    step_sizes.reserve(params.size());
-    correction2_sqrts.reserve(params.size());
-    for (size_t i = 0; i < params.size(); ++i) {
-        param_ptrs.push_back(params[i].data_ptr<scalar_t>());
-        grad_ptrs.push_back(grads[i].data_ptr<scalar_t>());
-        exp_avg_ptrs.push_back(exp_avgs[i].data_ptr<scalar_t>());
-        exp_avg_sq_ptrs.push_back(exp_avg_sqs[i].data_ptr<scalar_t>());
-        max_exp_avg_sq_ptrs.push_back(amsgrad
-            ? max_exp_avg_sqs[i].data_ptr<scalar_t>() : nullptr);
-        numels.push_back(params[i].numel());
-        const double bias_correction1 =
-            1.0 - std::pow(beta1, static_cast<double>(steps[i]));
-        const double bias_correction2 =
-            1.0 - std::pow(beta2, static_cast<double>(steps[i]));
-        step_sizes.push_back(lr / bias_correction1);
-        correction2_sqrts.push_back(std::sqrt(bias_correction2));
-    }
-    DeviceArray<scalar_t*> d_params(stream, param_ptrs);
-    DeviceArray<scalar_t*> d_grads(stream, grad_ptrs);
-    DeviceArray<scalar_t*> d_exp_avgs(stream, exp_avg_ptrs);
-    DeviceArray<scalar_t*> d_exp_avg_sqs(stream, exp_avg_sq_ptrs);
-    DeviceArray<scalar_t*> d_max_exp_avg_sqs(stream, max_exp_avg_sq_ptrs);
-    DeviceArray<int64_t> d_numels(stream, numels);
-    DeviceArray<double> d_step_sizes(stream, step_sizes);
-    DeviceArray<double> d_correction2_sqrts(stream, correction2_sqrts);
-
-    foreach_adam_kernel<scalar_t><<<static_cast<unsigned int>(params.size()), 256, 0, stream>>>(
-        d_params.data(), d_grads.data(), d_exp_avgs.data(), d_exp_avg_sqs.data(),
-        d_max_exp_avg_sqs.data(), d_numels.data(), d_step_sizes.data(),
-        d_correction2_sqrts.data(), static_cast<int64_t>(params.size()), beta1,
-        beta2, eps, weight_decay, amsgrad ? 1 : 0);
-    checkCuda(cudaGetLastError(), "_foreach_adam kernel launch");
 }
 
 void validate_fused_pairs(const std::vector<Tensor>& params,
@@ -361,8 +132,8 @@ void validate_fused_pairs(const std::vector<Tensor>& params,
         if (param.is_sparse() || grad.is_sparse() || isComplexType(param.dtype()) ||
             !param.is_contiguous() || !grad.is_contiguous() ||
             param.shape() != grad.shape() || param.dtype() != grad.dtype() ||
-            param.dtype() != dtype || param.device() != Device(DeviceType::CUDA) ||
-            grad.device() != Device(DeviceType::CUDA)) {
+            param.dtype() != dtype || !param.device().is_cuda() ||
+            !grad.device().is_cuda()) {
             TP_THROW(NotImplementedError, std::string(op_name) +
                 ": requires contiguous CUDA tensors with matching floating dtype and shape");
         }
@@ -399,321 +170,151 @@ void validate_fused_steps(const std::vector<Tensor>& params,
     for (const Tensor& step : state_steps) {
         if (!step.defined() || !step.is_contiguous() || step.numel() != 1 ||
             step.dtype() != DType::Float32 ||
-            step.device() != Device(DeviceType::CUDA)) {
+            !step.device().is_cuda()) {
             TP_THROW(NotImplementedError, std::string(op_name) +
                 ": state_steps must be singleton CUDA float32 tensors");
         }
     }
 }
 
+// Non-capturable optimizer state keeps the scalar step counters on CPU, just
+// like Torch.  The CUDA algorithm kernels consume one host value per tensor;
+// incrementing the counters here avoids a separate device foreach launch and
+// leaves graph-capture/device-step cases on their existing fallback path.
+void validate_host_steps(const std::vector<Tensor>& params,
+                         const std::vector<Tensor>& state_steps,
+                         const char* op_name) {
+    if (state_steps.size() != params.size()) {
+        TP_THROW(ValueError, std::string(op_name) +
+            ": state_steps must match parameter list");
+    }
+    for (const Tensor& step : state_steps) {
+        if (!step.defined() || !step.is_contiguous() || step.numel() != 1 ||
+            step.device() != Device(DeviceType::CPU) ||
+            (step.dtype() != DType::Float32 &&
+             step.dtype() != DType::Float64)) {
+            TP_THROW(NotImplementedError, std::string(op_name) +
+                ": native CUDA path requires singleton CPU float32/float64 state_steps");
+        }
+    }
+}
+
+double increment_host_step(const Tensor& step, const char* op_name) {
+    Tensor& mutable_step = const_cast<Tensor&>(step);
+    if (step.dtype() == DType::Float32) {
+        float* value = mutable_step.data_ptr<float>();
+        *value += 1.0f;
+        return static_cast<double>(*value);
+    }
+    if (step.dtype() == DType::Float64) {
+        double* value = mutable_step.data_ptr<double>();
+        *value += 1.0;
+        return *value;
+    }
+    TP_THROW(NotImplementedError, std::string(op_name) +
+        ": state_steps must be float32 or float64");
+}
+
+std::vector<int64_t> increment_host_step_indices(
+        const std::vector<Tensor>& params,
+        const std::vector<Tensor>& state_steps, const char* op_name) {
+    validate_host_steps(params, state_steps, op_name);
+    std::vector<int64_t> steps(state_steps.size());
+    for (size_t i = 0; i < state_steps.size(); ++i) {
+        // Keep the host-step update and the value consumed by bias correction
+        // in one C++ pass.  The Python foreach increment followed by
+        // Tensor.item() used to add one dispatch and one scalar extraction per
+        // parameter tensor on the CUDA foreach path.
+        steps[i] = static_cast<int64_t>(
+            increment_host_step(state_steps[i], op_name));
+    }
+    return steps;
+}
+
+std::vector<double> increment_host_steps(
+        const std::vector<Tensor>& params,
+        const std::vector<Tensor>& state_steps, const char* op_name) {
+    validate_host_steps(params, state_steps, op_name);
+    std::vector<double> steps(state_steps.size());
+    for (size_t i = 0; i < state_steps.size(); ++i) {
+        steps[i] = increment_host_step(state_steps[i], op_name);
+    }
+    return steps;
+}
+
+void increment_host_steps_inplace(
+        const std::vector<Tensor>& params,
+        const std::vector<Tensor>& state_steps, const char* op_name) {
+    validate_host_steps(params, state_steps, op_name);
+    for (const Tensor& step : state_steps) {
+        (void)increment_host_step(step, op_name);
+    }
+}
+
+void validate_cuda_scalar_states(const std::vector<Tensor>& params,
+                                 const std::vector<Tensor>& states,
+                                 const char* name, const char* op_name) {
+    if (states.size() != params.size()) {
+        TP_THROW(ValueError, std::string(op_name) + ": " + name +
+            " list must match parameter list");
+    }
+    for (const Tensor& state : states) {
+        if (!state.defined() || !state.is_contiguous() || state.numel() != 1 ||
+            !state.device().is_cuda() || state.dtype() != DType::Float32) {
+            TP_THROW(NotImplementedError, std::string(op_name) + ": " + name +
+                " must be singleton CUDA float32 tensors");
+        }
+    }
+}
+
+void validate_host_scalar_states(const std::vector<Tensor>& params,
+                                 const std::vector<Tensor>& states,
+                                 const char* name, const char* op_name) {
+    if (states.size() != params.size()) {
+        TP_THROW(ValueError, std::string(op_name) + ": " + name +
+            " list must match parameter list");
+    }
+    for (const Tensor& state : states) {
+        if (!state.defined() || !state.is_contiguous() || state.numel() != 1 ||
+            state.device() != Device(DeviceType::CPU) ||
+            (state.dtype() != DType::Float32 &&
+             state.dtype() != DType::Float64)) {
+            TP_THROW(NotImplementedError, std::string(op_name) + ": " + name +
+                " must be singleton CPU float32/float64 tensors");
+        }
+    }
+}
+
+double read_host_scalar(const Tensor& state, const char* op_name) {
+    if (state.dtype() == DType::Float32) return *state.data_ptr<float>();
+    if (state.dtype() == DType::Float64) return *state.data_ptr<double>();
+    TP_THROW(NotImplementedError, std::string(op_name) +
+        ": scalar optimizer state must be float32 or float64");
+}
+
+void write_host_scalar(const Tensor& state, double value, const char* op_name) {
+    Tensor& mutable_state = const_cast<Tensor&>(state);
+    if (state.dtype() == DType::Float32) {
+        *mutable_state.data_ptr<float>() = static_cast<float>(value);
+        return;
+    }
+    if (state.dtype() == DType::Float64) {
+        *mutable_state.data_ptr<double>() = value;
+        return;
+    }
+    TP_THROW(NotImplementedError, std::string(op_name) +
+        ": scalar optimizer state must be float32 or float64");
+}
+
 const float* optional_fused_float_ptr(const std::optional<Tensor>& value,
                                       const char* name) {
     if (!value.has_value() || !value->defined()) return nullptr;
     if (value->numel() != 1 || value->dtype() != DType::Float32 ||
-        value->device() != Device(DeviceType::CUDA)) {
+        !value->device().is_cuda()) {
         TP_THROW(NotImplementedError, std::string(name) +
             " must be a singleton CUDA float32 tensor");
     }
     return value->data_ptr<float>();
-}
-
-
-// ---------------------------------------------------------------------------
-// Dual-path fused optimizer kernels (torch fused_adam_utils.cuh:169-285).
-// Same kernel handles both vectorized and scalar paths; each chunk chooses
-// independently based on pointer alignment. This eliminates batch-level
-// fallback for odd-sized tensors.
-// ---------------------------------------------------------------------------
-
-namespace {
-__device__ __forceinline__ void opt_load_args(
-    float r[][kOptILP], float** args, int depth_count,
-    int64_t i_start, int64_t csz, int64_t n) {
-#pragma unroll
-    for (int ii = 0; ii < kOptILP; ++ii) {
-        const int64_t i = i_start + threadIdx.x + ii * blockDim.x;
-        for (int d = 0; d < depth_count; ++d) {
-            r[d][ii] = 0.f;
-            if (i < n && i < csz) r[d][ii] = args[d][i];
-        }
-    }
-}
-__device__ __forceinline__ void opt_store_args(
-    float** dst, float r[][kOptILP], int depth_count,
-    int64_t i_start, int64_t csz, int64_t n, int skip_grad, const float* gs) {
-#pragma unroll
-    for (int ii = 0; ii < kOptILP; ++ii) {
-        const int64_t i = i_start + threadIdx.x + ii * blockDim.x;
-        if (i < n && i < csz) {
-            for (int d = 0; d < depth_count; ++d) {
-                if (d == 1 && !gs) continue;
-                dst[d][i] = r[d][ii];
-            }
-        }
-    }
-}
-} // anonymous namespace
-
-template <typename lr_t, int DEPTH, bool ADAMW, bool AMSGRAD>
-__global__ void __launch_bounds__(512, 2) fused_adam_kernel(
-    float* const* params, float* const* grads,
-    float* const* exp_avgs, float* const* exp_avg_sqs,
-    float* const* max_exp_avg_sqs,
-    float* const* state_steps,
-    const int64_t* numels,
-    const int32_t* b2t, const int64_t* b2c,
-    int64_t chunk_size,
-    const lr_t* tensor_lr, double scalar_lr,
-    double beta1, double beta2, double weight_decay, double eps,
-    int maximize,
-    const float* grad_scale, const float* found_inf,
-    int64_t parameter_count) {
-    constexpr int P=0, G=1, M=2, V=3, N=4;
-    const int64_t tloc = static_cast<int64_t>(b2t[blockIdx.x]);
-    if (tloc >= parameter_count || (found_inf && *found_inf == 1.0f)) return;
-
-    const float lr = tensor_lr ? static_cast<float>(tensor_lr[0]) : static_cast<float>(scalar_lr);
-    const float step = state_steps[tloc][0];
-    const float bc1 = 1.f - powf(beta1, step);
-    const float bc2s = sqrtf(1.f - powf(beta2, step));
-    const float ss = lr / bc1;
-    const float b2v = static_cast<float>(beta2);
-    const float omb1 = 1.f - static_cast<float>(beta1);
-    const float omb2 = 1.f - b2v;
-
-    float* args[DEPTH];
-    args[P]=params[tloc]; args[G]=grads[tloc];
-    args[M]=exp_avgs[tloc]; args[V]=exp_avg_sqs[tloc];
-    if (DEPTH>4) args[N]=max_exp_avg_sqs[tloc];
-
-    const int64_t cb = static_cast<int64_t>(b2c[blockIdx.x]) * chunk_size;
-    const int64_t n = numels[tloc] - cb;
-    for (int d=0;d<DEPTH;++d) args[d]+=cb;
-
-    bool aligned=true;
-    for (int d=0;d<DEPTH;++d) { if(!opt_is_aligned(args[d])) aligned=false; }
-
-    float r[DEPTH][kOptILP];
-
-    auto math_fn = [&]() {
-#pragma unroll
-        for (int ii=0; ii<kOptILP; ++ii) {
-            float gv=r[G][ii], pv=r[P][ii];
-            if(grad_scale){gv/=*grad_scale;}
-            if(maximize)gv=-gv;
-            if(ADAMW){pv*=(1.f-lr*static_cast<float>(weight_decay));}
-            else if(weight_decay!=0.f){gv+=static_cast<float>(weight_decay)*pv;}
-            float mv=r[M][ii];
-            if(fabsf(omb1)<0.5f) mv+=omb1*(gv-mv);
-            else mv=gv-(gv-mv)*(1.f-omb1);
-            float vv=b2v*r[V][ii]+omb2*gv*gv;
-            r[M][ii]=mv; r[V][ii]=vv;
-            float sec=vv;
-            if(AMSGRAD){sec=fmaxf(sec,r[N][ii]);r[N][ii]=sec;}
-            float den=sqrtf(sec)/bc2s+static_cast<float>(eps);
-            r[P][ii]=pv-ss*mv/den;
-        }
-    };
-
-    if ((n%kOptILP==0)&&(chunk_size%kOptILP==0)&&aligned) {
-        // FAST PATH: opt_load_store → LDG.128/STG.128
-        for (int64_t is=threadIdx.x;
-             is*kOptILP<n&&is*kOptILP<chunk_size;is+=blockDim.x) {
-#pragma unroll
-            for(int d=0;d<DEPTH;++d) opt_load_store(r[d],args[d],0,is);
-            math_fn();
-#pragma unroll
-            for(int d=0;d<DEPTH;++d){
-                if(d!=G||grad_scale)opt_load_store(args[d],r[d],is,0);
-            }
-        }
-    } else {
-        // SLOW PATH: scalar bounds-checked
-        for (int64_t is=0;is<n&&is<chunk_size;
-             is+=static_cast<int64_t>(blockDim.x)*kOptILP) {
-            opt_load_args(r,args,DEPTH,is,chunk_size,n);
-            math_fn();
-            opt_store_args(args,r,DEPTH,is,chunk_size,n,!!grad_scale,grad_scale);
-        }
-    }
-}
-
-template <typename lr_t>
-__global__ void __launch_bounds__(512, 2) fused_sgd_kernel(
-    float* const* params, float* const* grads,
-    float* const* momentum_buffers,
-    const int64_t* numels,
-    const int32_t* b2t, const int64_t* b2c,
-    int64_t chunk_size,
-    const lr_t* tensor_lr, double scalar_lr,
-    double momentum, double dampening, double weight_decay,
-    int nesterov, int maximize, int is_first_step,
-    const float* grad_scale, const float* found_inf,
-    int64_t parameter_count) {
-    const int64_t tloc = static_cast<int64_t>(b2t[blockIdx.x]);
-    if (tloc >= parameter_count || (found_inf && *found_inf == 1.0f)) return;
-    const float lr = tensor_lr ? static_cast<float>(tensor_lr[0]) : static_cast<float>(scalar_lr);
-    const float mom = static_cast<float>(momentum);
-    const float damp = static_cast<float>(dampening);
-
-    float* args[3];
-    args[0]=params[tloc]; args[1]=grads[tloc]; args[2]=momentum_buffers[tloc];
-    const int64_t cb = static_cast<int64_t>(b2c[blockIdx.x]) * chunk_size;
-    const int64_t n = numels[tloc] - cb;
-    for (int d=0;d<3;++d) args[d]+=cb;
-
-    bool aligned=true;
-    for (int d=0;d<3;++d) { if(!opt_is_aligned(args[d])) aligned=false; }
-
-    float r[3][kOptILP];
-
-    auto sgd_math = [&]() {
-#pragma unroll
-        for (int ii=0; ii<kOptILP; ++ii) {
-            float gv=r[1][ii], pv=r[0][ii];
-            if(grad_scale)gv/=*grad_scale;
-            if(maximize)gv=-gv;
-            if(weight_decay!=0.f)gv+=static_cast<float>(weight_decay)*pv;
-            if(momentum!=0.f){
-                float buf=is_first_step?gv:(mom*r[2][ii]+(1.f-damp)*gv);
-                r[2][ii]=buf;
-                gv=nesterov?(gv+mom*buf):buf;
-            }
-            r[0][ii]=pv-lr*gv;
-        }
-    };
-
-    if ((n%kOptILP==0)&&(chunk_size%kOptILP==0)&&aligned) {
-        for (int64_t is=threadIdx.x;
-             is*kOptILP<n&&is*kOptILP<chunk_size;is+=blockDim.x) {
-#pragma unroll
-            for(int d=0;d<3;++d) opt_load_store(r[d],args[d],0,is);
-            sgd_math();
-#pragma unroll
-            for(int d=0;d<3;++d){
-                if(d!=1||grad_scale)opt_load_store(args[d],r[d],is,0);
-            }
-        }
-    } else {
-        for (int64_t is=0;is<n&&is<chunk_size;
-             is+=static_cast<int64_t>(blockDim.x)*kOptILP) {
-            opt_load_args(r,args,3,is,chunk_size,n);
-            sgd_math();
-            opt_store_args(args,r,3,is,chunk_size,n,!!grad_scale,grad_scale);
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Launchers: build chunk maps, upload metadata, dispatch to dual-path kernels.
-// Float32-only fast path; other dtypes not yet ported to dual-path.
-// ---------------------------------------------------------------------------
-
-template <typename scalar_t, typename math_t, typename lr_t>
-void launch_fused_sgd(const std::vector<Tensor>& params,
-                      const std::vector<Tensor>& grads,
-                      const std::vector<Tensor>& momentum_buffers,
-                      double lr, double momentum, double dampening,
-                      double weight_decay, bool nesterov, bool maximize,
-                      bool is_first_step,
-                      const std::optional<Tensor>& grad_scale,
-                      const std::optional<Tensor>& found_inf,
-                      const Tensor* tensor_lr) {
-    const auto stream = getCurrentCUDAStream().stream();
-    std::vector<float*> param_ptrs, grad_ptrs, buffer_ptrs;
-    std::vector<int64_t> numels;
-    for (size_t i = 0; i < params.size(); ++i) {
-        param_ptrs.push_back(params[i].data_ptr<float>());
-        grad_ptrs.push_back(grads[i].data_ptr<float>());
-        buffer_ptrs.push_back(momentum_buffers.empty() ? nullptr
-            : momentum_buffers[i].data_ptr<float>());
-        numels.push_back(params[i].numel());
-    }
-    DeviceArray<float*> d_params(stream, param_ptrs);
-    DeviceArray<float*> d_grads(stream, grad_ptrs);
-    DeviceArray<float*> d_buffers(stream, buffer_ptrs);
-    DeviceArray<int64_t> d_numels(stream, numels);
-    std::vector<int32_t> b2t; std::vector<int64_t> b2c;
-    for (size_t t = 0; t < numels.size(); ++t) {
-        const int64_t pieces = (numels[t] + kFusedChunk - 1) / kFusedChunk;
-        for (int64_t c = 0; c < pieces; ++c) { b2t.push_back(static_cast<int32_t>(t)); b2c.push_back(c); }
-    }
-    DeviceArray<int32_t> d_b2t(stream, b2t);
-    DeviceArray<int64_t> d_b2c(stream, b2c);
-    const lr_t* lr_ptr = tensor_lr ? tensor_lr->data_ptr<lr_t>() : nullptr;
-    const float* scale_ptr = optional_fused_float_ptr(grad_scale, "grad_scale");
-    const float* found_ptr = optional_fused_float_ptr(found_inf, "found_inf");
-    const unsigned grid = static_cast<unsigned>(b2t.size());
-    fused_sgd_kernel<lr_t><<<grid, kFusedBlock, 0, stream>>>(
-        d_params.data(), d_grads.data(), d_buffers.data(),
-        d_numels.data(), d_b2t.data(), d_b2c.data(), kFusedChunk,
-        lr_ptr, lr, momentum, dampening, weight_decay, nesterov ? 1 : 0,
-        maximize ? 1 : 0, is_first_step ? 1 : 0, scale_ptr, found_ptr,
-        static_cast<int64_t>(params.size()));
-    checkCuda(cudaGetLastError(), "_fused_sgd kernel launch");
-}
-
-template <typename scalar_t, typename math_t, typename lr_t>
-void launch_fused_adam(const std::vector<Tensor>& params,
-                       const std::vector<Tensor>& grads,
-                       const std::vector<Tensor>& exp_avgs,
-                       const std::vector<Tensor>& exp_avg_sqs,
-                       const std::vector<Tensor>& max_exp_avg_sqs,
-                       const std::vector<Tensor>& state_steps,
-                       double lr, double beta1, double beta2,
-                       double weight_decay, double eps,
-                       bool amsgrad, bool maximize, bool adamw,
-                       const std::optional<Tensor>& grad_scale,
-                       const std::optional<Tensor>& found_inf,
-                       const Tensor* tensor_lr) {
-    const auto stream = getCurrentCUDAStream().stream();
-    std::vector<float*> p_ptrs, g_ptrs, m_ptrs, v_ptrs, n_ptrs;
-    std::vector<float*> step_ptrs;
-    std::vector<int64_t> numels;
-    for (size_t i = 0; i < params.size(); ++i) {
-        p_ptrs.push_back(params[i].data_ptr<float>());
-        g_ptrs.push_back(grads[i].data_ptr<float>());
-        m_ptrs.push_back(exp_avgs[i].data_ptr<float>());
-        v_ptrs.push_back(exp_avg_sqs[i].data_ptr<float>());
-        n_ptrs.push_back(amsgrad ? max_exp_avg_sqs[i].data_ptr<float>() : nullptr);
-        step_ptrs.push_back(state_steps[i].data_ptr<float>());
-        numels.push_back(params[i].numel());
-    }
-    DeviceArray<float*> d_p(stream, p_ptrs);
-    DeviceArray<float*> d_g(stream, g_ptrs);
-    DeviceArray<float*> d_m(stream, m_ptrs);
-    DeviceArray<float*> d_v(stream, v_ptrs);
-    DeviceArray<float*> d_n(stream, n_ptrs);
-    DeviceArray<float*> d_steps(stream, step_ptrs);
-    DeviceArray<int64_t> d_numels(stream, numels);
-    std::vector<int32_t> b2t; std::vector<int64_t> b2c;
-    for (size_t t = 0; t < numels.size(); ++t) {
-        const int64_t pieces = (numels[t] + kFusedChunk - 1) / kFusedChunk;
-        for (int64_t c = 0; c < pieces; ++c) { b2t.push_back(static_cast<int32_t>(t)); b2c.push_back(c); }
-    }
-    DeviceArray<int32_t> d_b2t(stream, b2t);
-    DeviceArray<int64_t> d_b2c(stream, b2c);
-    const lr_t* lr_ptr = tensor_lr ? tensor_lr->data_ptr<lr_t>() : nullptr;
-    const float* scale_ptr = optional_fused_float_ptr(grad_scale, "grad_scale");
-    const float* found_ptr = optional_fused_float_ptr(found_inf, "found_inf");
-    const unsigned grid = static_cast<unsigned>(b2t.size());
-
-    if (amsgrad) {
-        fused_adam_kernel<lr_t, 5, true, true><<<grid, kFusedBlock, 0, stream>>>(
-            d_p.data(), d_g.data(), d_m.data(), d_v.data(), d_n.data(),
-            d_steps.data(), d_numels.data(), d_b2t.data(), d_b2c.data(), kFusedChunk,
-            lr_ptr, lr, beta1, beta2, weight_decay, eps,
-            maximize ? 1 : 0, scale_ptr, found_ptr,
-            static_cast<int64_t>(params.size()));
-    } else {
-        fused_adam_kernel<lr_t, 4, false, false><<<grid, kFusedBlock, 0, stream>>>(
-            d_p.data(), d_g.data(), d_m.data(), d_v.data(), d_n.data(),
-            d_steps.data(), d_numels.data(), d_b2t.data(), d_b2c.data(), kFusedChunk,
-            lr_ptr, lr, beta1, beta2, weight_decay, eps,
-            maximize ? 1 : 0, scale_ptr, found_ptr,
-            static_cast<int64_t>(params.size()));
-    }
-    checkCuda(cudaGetLastError(), "_fused_adam kernel launch");
 }
 
 
@@ -722,13 +323,16 @@ void dispatch_fused_cuda_dtype(const std::vector<Tensor>& params,
                                const char* op_name,
                                F&& fn) {
     if (params.empty()) return;
-    switch (params[0].dtype()) {
-        case DType::Float32: fn.template operator()<float, float>(); break;
-        default:
-            TP_THROW(NotImplementedError, std::string(op_name) +
-                ": dual-path optimizer currently supports Float32 only");
+    if (!foreach_mta::dispatch_dtype(params[0].dtype(), fn)) {
+        TP_THROW(NotImplementedError, std::string(op_name) +
+            ": fused optimizer supports float16, bfloat16, float32, and float64");
     }
 }
+
+bool uses_foreach_exact_lowp(DType dtype) {
+    return dtype == DType::Float16 || dtype == DType::BFloat16;
+}
+
 template <typename F>
 void dispatch_fused_cuda_lr(const Tensor* lr, F&& fn) {
     if (!lr) {
@@ -740,20 +344,6 @@ void dispatch_fused_cuda_lr(const Tensor* lr, F&& fn) {
     } else {
         TP_THROW(NotImplementedError, "fused optimizer Tensor lr must be float32 or float64");
     }
-}
-
-
-template <typename scalar_t, typename math_t, typename lr_t>
-void launch_fused_adagrad(const std::vector<Tensor>& params,
-                          const std::vector<Tensor>& grads,
-                          const std::vector<Tensor>& state_sums,
-                          const std::vector<Tensor>& state_steps,
-                          double lr, double lr_decay, double weight_decay,
-                          double eps, bool maximize,
-                          const std::optional<Tensor>& grad_scale,
-                          const std::optional<Tensor>& found_inf,
-                          const Tensor* tensor_lr) {
-    TP_THROW(NotImplementedError, "_fused_adagrad_ dual-path pending migration");
 }
 
 
@@ -779,12 +369,21 @@ void fused_sgd_cuda_impl(std::vector<Tensor> params,
     } else {
         validate_fused_state(params, momentum_buffers, true, "_fused_sgd_");
     }
+    const float* scale_ptr = optional_fused_float_ptr(grad_scale, "grad_scale");
+    const float* found_ptr = optional_fused_float_ptr(found_inf, "found_inf");
     dispatch_fused_cuda_lr(tensor_lr, [&]<typename lr_t>() {
         dispatch_fused_cuda_dtype(params, "_fused_sgd_", [&]<typename scalar_t, typename math_t>() {
-            launch_fused_sgd<scalar_t, math_t, lr_t>(params, grads,
-                momentum_buffers, lr, momentum, dampening, weight_decay,
-                nesterov, maximize, is_first_step, grad_scale, found_inf,
-                tensor_lr);
+            if (momentum == 0.0) {
+                optimizer_mta::launch_sgd<scalar_t, math_t, lr_t, false>(
+                    params, grads, momentum_buffers, lr, momentum, dampening,
+                    weight_decay, nesterov, is_first_step, maximize,
+                    scale_ptr, found_ptr, tensor_lr, "_fused_sgd_");
+            } else {
+                optimizer_mta::launch_sgd<scalar_t, math_t, lr_t, true>(
+                    params, grads, momentum_buffers, lr, momentum, dampening,
+                    weight_decay, nesterov, is_first_step, maximize,
+                    scale_ptr, found_ptr, tensor_lr, "_fused_sgd_");
+            }
         });
     });
     for (const Tensor& param : params) param.unsafeGetTensorImpl()->bump_version();
@@ -806,7 +405,8 @@ void fused_adam_cuda_impl(std::vector<Tensor> params,
                           bool adamw,
                           const std::optional<Tensor>& grad_scale,
                           const std::optional<Tensor>& found_inf,
-                          const Tensor* tensor_lr) {
+                          const Tensor* tensor_lr,
+                          bool exact) {
     const char* op_name = adamw ? "_fused_adamw_" : "_fused_adam_";
     validate_fused_pairs(params, grads, op_name);
     if (params.empty()) return;
@@ -817,13 +417,134 @@ void fused_adam_cuda_impl(std::vector<Tensor> params,
         TP_THROW(ValueError, std::string(op_name) +
             ": max_exp_avg_sqs must be empty when amsgrad is false");
     }
+    const float* scale_ptr = optional_fused_float_ptr(grad_scale, "grad_scale");
+    const float* found_ptr = optional_fused_float_ptr(found_inf, "found_inf");
+    // Non-capturable Torch optimizers deliberately keep their step tensors on
+    // CPU.  Update them and materialize the host snapshot in one pass, then
+    // use the same native MTA kernel as the device-step fused path.  AMP
+    // metadata is intentionally excluded here because the host-step kernel
+    // has no device-side scale/found-inf arguments; callers with AMP continue
+    // through the existing route.
+    const bool host_steps = !state_steps.empty() &&
+        state_steps[0].device() == Device(DeviceType::CPU);
+    if (host_steps) {
+        validate_host_steps(params, state_steps, op_name);
+        if (grad_scale.has_value() || found_inf.has_value()) {
+            TP_THROW(NotImplementedError,
+                std::string(op_name) +
+                ": host state-step CUDA path does not support AMP metadata");
+        }
+        const std::vector<int64_t> steps = increment_host_step_indices(
+            params, state_steps, op_name);
+        dispatch_fused_cuda_dtype(params, op_name,
+            [&]<typename scalar_t, typename math_t>() {
+                // Standard foreach Adam on Half/BFloat16 rounds at every
+                // intermediate foreach boundary.  Keep the explicit fused
+                // kernel's all-opmath behavior for its public API, while the
+                // private exact route used by _multi_tensor_adam_ gets the
+                // native equivalent of Torch's composed sequence.
+                const bool use_exact = exact &&
+                    (params[0].dtype() == DType::Float16 ||
+                     params[0].dtype() == DType::BFloat16);
+                if (use_exact) {
+                    if (adamw) {
+                        if (amsgrad) {
+                            optimizer_mta::launch_adam_host_exact<
+                                scalar_t, math_t, true, true>(
+                                params, grads, exp_avgs, exp_avg_sqs,
+                                max_exp_avg_sqs, steps, lr, beta1, beta2, eps,
+                                weight_decay, maximize, op_name);
+                        } else {
+                            optimizer_mta::launch_adam_host_exact<
+                                scalar_t, math_t, true, false>(
+                                params, grads, exp_avgs, exp_avg_sqs,
+                                max_exp_avg_sqs, steps, lr, beta1, beta2, eps,
+                                weight_decay, maximize, op_name);
+                        }
+                    } else if (amsgrad) {
+                        optimizer_mta::launch_adam_host_exact<
+                            scalar_t, math_t, false, true>(
+                            params, grads, exp_avgs, exp_avg_sqs,
+                            max_exp_avg_sqs, steps, lr, beta1, beta2, eps,
+                            weight_decay, maximize, op_name);
+                    } else {
+                        optimizer_mta::launch_adam_host_exact<
+                            scalar_t, math_t, false, false>(
+                            params, grads, exp_avgs, exp_avg_sqs,
+                            max_exp_avg_sqs, steps, lr, beta1, beta2, eps,
+                            weight_decay, maximize, op_name);
+                    }
+                    return;
+                }
+                if (adamw) {
+                    if (amsgrad) {
+                        optimizer_mta::launch_adam_host<
+                            scalar_t, math_t, double, true, true>(
+                            params, grads, exp_avgs, exp_avg_sqs,
+                            max_exp_avg_sqs, steps, lr, beta1, beta2, eps,
+                            weight_decay, maximize, op_name);
+                    } else {
+                        optimizer_mta::launch_adam_host<
+                            scalar_t, math_t, double, true, false>(
+                            params, grads, exp_avgs, exp_avg_sqs,
+                            max_exp_avg_sqs, steps, lr, beta1, beta2, eps,
+                            weight_decay, maximize, op_name);
+                    }
+                } else {
+                    if (amsgrad) {
+                        optimizer_mta::launch_adam_host<
+                            scalar_t, math_t, double, false, true>(
+                            params, grads, exp_avgs, exp_avg_sqs,
+                            max_exp_avg_sqs, steps, lr, beta1, beta2, eps,
+                            weight_decay, maximize, op_name);
+                    } else {
+                        optimizer_mta::launch_adam_host<
+                            scalar_t, math_t, double, false, false>(
+                            params, grads, exp_avgs, exp_avg_sqs,
+                            max_exp_avg_sqs, steps, lr, beta1, beta2, eps,
+                            weight_decay, maximize, op_name);
+                    }
+                }
+            });
+        for (const Tensor& param : params) {
+            param.unsafeGetTensorImpl()->bump_version();
+        }
+        return;
+    }
     validate_fused_steps(params, state_steps, op_name);
     dispatch_fused_cuda_lr(tensor_lr, [&]<typename lr_t>() {
         dispatch_fused_cuda_dtype(params, op_name, [&]<typename scalar_t, typename math_t>() {
-            launch_fused_adam<scalar_t, math_t, lr_t>(params, grads, exp_avgs,
-                exp_avg_sqs, max_exp_avg_sqs, state_steps, lr, beta1, beta2,
-                weight_decay, eps, amsgrad, maximize, adamw, grad_scale,
-                found_inf, tensor_lr);
+            if (adamw) {
+                if (amsgrad) {
+                    optimizer_mta::launch_adam_fused<
+                        scalar_t, math_t, lr_t, true, true>(
+                        params, grads, exp_avgs, exp_avg_sqs,
+                        max_exp_avg_sqs, state_steps, lr, beta1, beta2,
+                        eps, weight_decay, maximize, scale_ptr, found_ptr,
+                        tensor_lr, op_name);
+                } else {
+                    optimizer_mta::launch_adam_fused<
+                        scalar_t, math_t, lr_t, true, false>(
+                        params, grads, exp_avgs, exp_avg_sqs,
+                        max_exp_avg_sqs, state_steps, lr, beta1, beta2,
+                        eps, weight_decay, maximize, scale_ptr, found_ptr,
+                        tensor_lr, op_name);
+                }
+            } else if (amsgrad) {
+                optimizer_mta::launch_adam_fused<
+                    scalar_t, math_t, lr_t, false, true>(
+                    params, grads, exp_avgs, exp_avg_sqs,
+                    max_exp_avg_sqs, state_steps, lr, beta1, beta2,
+                    eps, weight_decay, maximize, scale_ptr, found_ptr,
+                    tensor_lr, op_name);
+            } else {
+                optimizer_mta::launch_adam_fused<
+                    scalar_t, math_t, lr_t, false, false>(
+                    params, grads, exp_avgs, exp_avg_sqs,
+                    max_exp_avg_sqs, state_steps, lr, beta1, beta2,
+                    eps, weight_decay, maximize, scale_ptr, found_ptr,
+                    tensor_lr, op_name);
+            }
         });
     });
     for (const Tensor& param : params) param.unsafeGetTensorImpl()->bump_version();
@@ -844,14 +565,354 @@ void fused_adagrad_cuda_impl(std::vector<Tensor> params,
     validate_fused_pairs(params, grads, "_fused_adagrad_");
     if (params.empty()) return;
     validate_fused_state(params, state_sums, true, "_fused_adagrad_");
+    const bool host_steps = !state_steps.empty() &&
+        state_steps[0].device() == Device(DeviceType::CPU);
+    for (const Tensor& step : state_steps) {
+        if ((step.device() == Device(DeviceType::CPU)) != host_steps) {
+            TP_THROW(NotImplementedError,
+                "_fused_adagrad_: state_steps must be all CPU or all CUDA");
+        }
+    }
+    const float* scale_ptr = optional_fused_float_ptr(grad_scale, "grad_scale");
+    const float* found_ptr = optional_fused_float_ptr(found_inf, "found_inf");
+    if (host_steps) {
+        if (grad_scale.has_value() || found_inf.has_value()) {
+            TP_THROW(NotImplementedError,
+                "_fused_adagrad_: host state-step CUDA path does not support AMP metadata");
+        }
+        const std::vector<double> steps = increment_host_steps(
+            params, state_steps, "_fused_adagrad_");
+        const double scalar_lr = tensor_lr == nullptr
+            ? lr : tensor_lr->item().toDouble();
+        const bool exact = uses_foreach_exact_lowp(params[0].dtype());
+        dispatch_fused_cuda_dtype(params, "_fused_adagrad_",
+            [&]<typename scalar_t, typename math_t>() {
+                if (exact) {
+                    std::vector<double> corrected_lrs(steps.size());
+                    for (size_t i = 0; i < steps.size(); ++i) {
+                        corrected_lrs[i] = scalar_lr /
+                            (1.0 + (steps[i] - 1.0) * lr_decay);
+                    }
+                    optimizer_mta::launch_adagrad_host_exact<scalar_t, math_t>(
+                        params, grads, state_sums, corrected_lrs, eps,
+                        weight_decay, maximize,
+                        "_fused_adagrad_");
+                } else {
+                    optimizer_mta::launch_adagrad_host<scalar_t, math_t>(
+                        params, grads, state_sums, steps, scalar_lr, lr_decay,
+                        weight_decay, eps, maximize, "_fused_adagrad_");
+                }
+            });
+        for (const Tensor& param : params) {
+            param.unsafeGetTensorImpl()->bump_version();
+        }
+        return;
+    }
     validate_fused_steps(params, state_steps, "_fused_adagrad_");
     dispatch_fused_cuda_lr(tensor_lr, [&]<typename lr_t>() {
         dispatch_fused_cuda_dtype(params, "_fused_adagrad_", [&]<typename scalar_t, typename math_t>() {
-            launch_fused_adagrad<scalar_t, math_t, lr_t>(params, grads,
-                state_sums, state_steps, lr, lr_decay, weight_decay, eps,
-                maximize, grad_scale, found_inf, tensor_lr);
+            optimizer_mta::launch_adagrad_fused<scalar_t, math_t, lr_t>(
+                params, grads, state_sums, state_steps, lr, lr_decay,
+                weight_decay, eps, maximize, scale_ptr, found_ptr,
+                tensor_lr, "_fused_adagrad_");
         });
     });
+    for (const Tensor& param : params) param.unsafeGetTensorImpl()->bump_version();
+}
+
+void fused_rmsprop_cuda(
+        std::vector<Tensor> params, const std::vector<Tensor>& grads,
+        std::vector<Tensor> square_avgs, std::vector<Tensor> grad_avgs,
+        std::vector<Tensor> momentum_buffers, std::vector<Tensor> state_steps,
+        double lr, double alpha, double eps, double weight_decay,
+        double momentum, bool centered, bool maximize) {
+    const char* op_name = "_fused_rmsprop_";
+    validate_fused_pairs(params, grads, op_name);
+    if (params.empty()) return;
+    validate_fused_state(params, square_avgs, true, op_name);
+    validate_fused_state(params, grad_avgs, centered, op_name);
+    validate_fused_state(params, momentum_buffers, momentum != 0.0, op_name);
+    increment_host_steps_inplace(params, state_steps, op_name);
+    const bool exact = uses_foreach_exact_lowp(params[0].dtype());
+    dispatch_fused_cuda_dtype(params, op_name,
+        [&]<typename scalar_t, typename math_t>() {
+            if (exact) {
+                optimizer_mta::launch_rmsprop_exact<scalar_t, math_t>(
+                    params, grads, square_avgs, grad_avgs, momentum_buffers,
+                    lr, alpha, eps, weight_decay, momentum, centered,
+                    maximize, op_name);
+            } else {
+                optimizer_mta::launch_rmsprop<scalar_t, math_t>(
+                    params, grads, square_avgs, grad_avgs, momentum_buffers,
+                    lr, alpha, eps, weight_decay, momentum, centered,
+                    maximize, op_name);
+            }
+        });
+    for (const Tensor& param : params) param.unsafeGetTensorImpl()->bump_version();
+}
+
+void fused_adadelta_cuda(
+        std::vector<Tensor> params, const std::vector<Tensor>& grads,
+        std::vector<Tensor> square_avgs, std::vector<Tensor> acc_deltas,
+        std::vector<Tensor> state_steps, double lr, double rho, double eps,
+        double weight_decay, bool maximize) {
+    const char* op_name = "_fused_adadelta_";
+    validate_fused_pairs(params, grads, op_name);
+    if (params.empty()) return;
+    validate_fused_state(params, square_avgs, true, op_name);
+    validate_fused_state(params, acc_deltas, true, op_name);
+    increment_host_steps_inplace(params, state_steps, op_name);
+    const bool exact = uses_foreach_exact_lowp(params[0].dtype());
+    dispatch_fused_cuda_dtype(params, op_name,
+        [&]<typename scalar_t, typename math_t>() {
+            if (exact) {
+                optimizer_mta::launch_adadelta_exact<scalar_t, math_t>(
+                    params, grads, square_avgs, acc_deltas, lr, rho, eps,
+                    weight_decay, maximize, op_name);
+            } else {
+                optimizer_mta::launch_adadelta<scalar_t, math_t>(
+                    params, grads, square_avgs, acc_deltas, lr, rho, eps,
+                    weight_decay, maximize, op_name);
+            }
+        });
+    for (const Tensor& param : params) param.unsafeGetTensorImpl()->bump_version();
+}
+
+void fused_adamax_cuda(
+        std::vector<Tensor> params, const std::vector<Tensor>& grads,
+        std::vector<Tensor> exp_avgs, std::vector<Tensor> exp_infs,
+        std::vector<Tensor> state_steps, double lr, double beta1,
+        double beta2, double eps, double weight_decay, bool maximize) {
+    const char* op_name = "_fused_adamax_";
+    validate_fused_pairs(params, grads, op_name);
+    if (params.empty()) return;
+    validate_fused_state(params, exp_avgs, true, op_name);
+    validate_fused_state(params, exp_infs, true, op_name);
+    const std::vector<double> steps = increment_host_steps(
+        params, state_steps, op_name);
+    const bool exact = uses_foreach_exact_lowp(params[0].dtype());
+    dispatch_fused_cuda_dtype(params, op_name,
+        [&]<typename scalar_t, typename math_t>() {
+            if (exact) {
+                optimizer_mta::launch_adamax_exact<scalar_t, math_t>(
+                    params, grads, exp_avgs, exp_infs, steps, lr, beta1,
+                    beta2, eps, weight_decay, maximize, op_name);
+            } else {
+                optimizer_mta::launch_adamax<scalar_t, math_t>(
+                    params, grads, exp_avgs, exp_infs, steps, lr, beta1,
+                    beta2, eps, weight_decay, maximize, op_name);
+            }
+        });
+    for (const Tensor& param : params) param.unsafeGetTensorImpl()->bump_version();
+}
+
+void fused_asgd_cuda(
+        std::vector<Tensor> params, const std::vector<Tensor>& grads,
+        std::vector<Tensor> axs, std::vector<Tensor> mus,
+        std::vector<Tensor> etas, std::vector<Tensor> state_steps,
+        double lr, double lambd, double t0, double alpha,
+        double weight_decay, bool maximize) {
+    const char* op_name = "_fused_asgd_";
+    validate_fused_pairs(params, grads, op_name);
+    if (params.empty()) return;
+    validate_fused_state(params, axs, true, op_name);
+    if (params[0].dtype() != DType::Float32) {
+        TP_THROW(NotImplementedError,
+            "_fused_asgd_: native CUDA path currently requires float32 parameters");
+    }
+    validate_cuda_scalar_states(params, mus, "mus", op_name);
+    validate_cuda_scalar_states(params, etas, "etas", op_name);
+    const bool device_steps = !state_steps.empty() &&
+        state_steps[0].device().is_cuda();
+    for (const Tensor& step : state_steps) {
+        if ((step.device().is_cuda()) != device_steps) {
+            TP_THROW(NotImplementedError,
+                "_fused_asgd_: state_steps must be all CPU or all CUDA");
+        }
+    }
+    std::vector<double> steps;
+    if (device_steps) {
+        validate_fused_steps(params, state_steps, op_name);
+    } else {
+        steps = increment_host_steps(params, state_steps, op_name);
+    }
+    dispatch_fused_cuda_dtype(params, op_name,
+        [&]<typename scalar_t, typename math_t>() {
+            optimizer_mta::launch_asgd<scalar_t, math_t>(
+                params, grads, axs, mus, etas,
+                device_steps ? nullptr : &steps,
+                device_steps ? &state_steps : nullptr,
+                lr, lambd, t0, alpha, weight_decay, maximize, op_name);
+        });
+    for (const Tensor& param : params) param.unsafeGetTensorImpl()->bump_version();
+}
+
+void fused_rprop_cuda(
+        std::vector<Tensor> params, const std::vector<Tensor>& grads,
+        std::vector<Tensor> prevs, std::vector<Tensor> step_sizes,
+        std::vector<Tensor> state_steps, double step_size_min,
+        double step_size_max, double etaminus, double etaplus,
+        bool maximize) {
+    const char* op_name = "_fused_rprop_";
+    validate_fused_pairs(params, grads, op_name);
+    if (params.empty()) return;
+    validate_fused_state(params, prevs, true, op_name);
+    validate_fused_state(params, step_sizes, true, op_name);
+    (void)increment_host_steps(params, state_steps, op_name);
+    const bool exact = uses_foreach_exact_lowp(params[0].dtype());
+    dispatch_fused_cuda_dtype(params, op_name,
+        [&]<typename scalar_t, typename math_t>() {
+            if (exact) {
+                optimizer_mta::launch_rprop_exact<scalar_t, math_t>(
+                    params, grads, prevs, step_sizes, step_size_min,
+                    step_size_max, etaminus, etaplus, maximize, op_name);
+            } else {
+                optimizer_mta::launch_rprop<scalar_t, math_t>(
+                    params, grads, prevs, step_sizes, step_size_min,
+                    step_size_max, etaminus, etaplus, maximize, op_name);
+            }
+        });
+    for (const Tensor& param : params) param.unsafeGetTensorImpl()->bump_version();
+}
+
+void fused_nadam_cuda(
+        std::vector<Tensor> params, const std::vector<Tensor>& grads,
+        std::vector<Tensor> exp_avgs, std::vector<Tensor> exp_avg_sqs,
+        std::vector<Tensor> mu_products, std::vector<Tensor> state_steps,
+        double lr, double beta1, double beta2, double eps,
+        double weight_decay, double momentum_decay,
+        bool decoupled_weight_decay, bool maximize) {
+    const char* op_name = "_fused_nadam_";
+    validate_fused_pairs(params, grads, op_name);
+    if (params.empty()) return;
+    validate_fused_state(params, exp_avgs, true, op_name);
+    validate_fused_state(params, exp_avg_sqs, true, op_name);
+    validate_host_scalar_states(params, mu_products, "mu_products", op_name);
+    const std::vector<double> steps = increment_host_steps(
+        params, state_steps, op_name);
+    std::vector<double> next_mu_products(mu_products.size());
+    for (size_t i = 0; i < mu_products.size(); ++i) {
+        const double mu = beta1 * (1.0 - 0.5 * std::pow(
+            0.96, steps[i] * momentum_decay));
+        next_mu_products[i] = read_host_scalar(mu_products[i], op_name) * mu;
+        write_host_scalar(mu_products[i], next_mu_products[i], op_name);
+        // Torch's scalar state is stored through its dtype before the next
+        // foreach launch observes it.  Feed the rounded value to the kernel,
+        // not the pre-store double temporary.
+        next_mu_products[i] = read_host_scalar(mu_products[i], op_name);
+    }
+    const bool exact = uses_foreach_exact_lowp(params[0].dtype());
+    dispatch_fused_cuda_dtype(params, op_name,
+        [&]<typename scalar_t, typename math_t>() {
+            if (exact) {
+                optimizer_mta::launch_nadam_exact<scalar_t, math_t>(
+                    params, grads, exp_avgs, exp_avg_sqs, steps,
+                    next_mu_products, lr, beta1, beta2, eps, momentum_decay,
+                    weight_decay, decoupled_weight_decay, maximize, op_name);
+            } else {
+                optimizer_mta::launch_nadam<scalar_t, math_t>(
+                    params, grads, exp_avgs, exp_avg_sqs, steps,
+                    next_mu_products, lr, beta1, beta2, eps, momentum_decay,
+                    weight_decay, decoupled_weight_decay, maximize, op_name);
+            }
+        });
+    for (const Tensor& param : params) param.unsafeGetTensorImpl()->bump_version();
+}
+
+void fused_radam_cuda(
+        std::vector<Tensor> params, const std::vector<Tensor>& grads,
+        std::vector<Tensor> exp_avgs, std::vector<Tensor> exp_avg_sqs,
+        std::vector<Tensor> state_steps, double lr, double beta1,
+        double beta2, double eps, double weight_decay,
+        bool decoupled_weight_decay, bool maximize) {
+    const char* op_name = "_fused_radam_";
+    validate_fused_pairs(params, grads, op_name);
+    if (params.empty()) return;
+    validate_fused_state(params, exp_avgs, true, op_name);
+    validate_fused_state(params, exp_avg_sqs, true, op_name);
+    const std::vector<double> steps = increment_host_steps(
+        params, state_steps, op_name);
+    const bool exact = uses_foreach_exact_lowp(params[0].dtype());
+    dispatch_fused_cuda_dtype(params, op_name,
+        [&]<typename scalar_t, typename math_t>() {
+            if (exact) {
+                optimizer_mta::launch_radam_exact<scalar_t, math_t>(
+                    params, grads, exp_avgs, exp_avg_sqs, steps, lr, beta1,
+                    beta2, eps, weight_decay, decoupled_weight_decay,
+                    maximize, op_name);
+            } else {
+                optimizer_mta::launch_radam<scalar_t, math_t>(
+                    params, grads, exp_avgs, exp_avg_sqs, steps, lr, beta1,
+                    beta2, eps, weight_decay, decoupled_weight_decay,
+                    maximize, op_name);
+            }
+        });
+    for (const Tensor& param : params) param.unsafeGetTensorImpl()->bump_version();
+}
+
+void validate_adafactor_factored_state(
+        const std::vector<Tensor>& params,
+        const std::vector<Tensor>& row_vars,
+        const std::vector<Tensor>& col_vars,
+        const char* op_name) {
+    if (row_vars.size() != params.size() || col_vars.size() != params.size()) {
+        TP_THROW(ValueError, std::string(op_name) +
+            ": factored state lists must match parameter list");
+    }
+    for (size_t i = 0; i < params.size(); ++i) {
+        const Tensor& p = params[i];
+        const Tensor& row = row_vars[i];
+        const Tensor& col = col_vars[i];
+        if (p.dim() != 2 || !row.defined() || !col.defined() ||
+            !row.is_contiguous() || !col.is_contiguous() ||
+            row.shape() != Size({p.size(0), 1}) ||
+            col.shape() != Size({1, p.size(1)}) ||
+            row.dtype() != p.dtype() || col.dtype() != p.dtype() ||
+            row.device() != p.device() || col.device() != p.device()) {
+            TP_THROW(NotImplementedError, std::string(op_name) +
+                ": factored states require contiguous 2-D matching tensors");
+        }
+    }
+}
+
+void fused_adafactor_cuda(
+        std::vector<Tensor> params, const std::vector<Tensor>& grads,
+        std::vector<Tensor> variances, std::vector<Tensor> state_steps,
+        double lr, double beta2_decay, double eps1, double eps2, double d,
+        double weight_decay, bool maximize) {
+    const char* op_name = "_fused_adafactor_";
+    validate_fused_pairs(params, grads, op_name);
+    if (params.empty()) return;
+    validate_fused_state(params, variances, true, op_name);
+    const std::vector<double> steps = increment_host_steps(
+        params, state_steps, op_name);
+    dispatch_fused_cuda_dtype(params, op_name,
+        [&]<typename scalar_t, typename math_t>() {
+            optimizer_mta::launch_adafactor_vector<scalar_t, math_t>(
+                params, grads, variances, steps, lr, beta2_decay, eps1, eps2,
+                d, weight_decay, maximize, op_name);
+        });
+    for (const Tensor& param : params) param.unsafeGetTensorImpl()->bump_version();
+}
+
+void fused_adafactor_factored_cuda(
+        std::vector<Tensor> params, const std::vector<Tensor>& grads,
+        std::vector<Tensor> row_vars, std::vector<Tensor> col_vars,
+        std::vector<Tensor> state_steps, double lr, double beta2_decay,
+        double eps1, double eps2, double d, double weight_decay,
+        bool maximize) {
+    const char* op_name = "_fused_adafactor_factored_";
+    validate_fused_pairs(params, grads, op_name);
+    if (params.empty()) return;
+    validate_adafactor_factored_state(params, row_vars, col_vars, op_name);
+    const std::vector<double> steps = increment_host_steps(
+        params, state_steps, op_name);
+    dispatch_fused_cuda_dtype(params, op_name,
+        [&]<typename scalar_t, typename math_t>() {
+            optimizer_mta::launch_adafactor_factored<scalar_t, math_t>(
+                params, grads, row_vars, col_vars, steps, lr, beta2_decay,
+                eps1, eps2, d, weight_decay, maximize, op_name);
+        });
     for (const Tensor& param : params) param.unsafeGetTensorImpl()->bump_version();
 }
 
@@ -864,11 +925,12 @@ void fused_adam_cuda(std::vector<Tensor> params,
                      double lr, double beta1, double beta2, double weight_decay,
                      double eps, bool amsgrad, bool maximize,
                      const std::optional<Tensor>& grad_scale,
-                     const std::optional<Tensor>& found_inf) {
+                     const std::optional<Tensor>& found_inf,
+                     bool exact) {
     fused_adam_cuda_impl(std::move(params), grads, exp_avgs, exp_avg_sqs,
         max_exp_avg_sqs, state_steps, lr, beta1,
         beta2, weight_decay, eps, amsgrad,
-        maximize, false, grad_scale, found_inf, nullptr);
+        maximize, false, grad_scale, found_inf, nullptr, exact);
 }
 
 void fused_adam_tensor_lr_cuda(std::vector<Tensor> params,
@@ -881,11 +943,12 @@ void fused_adam_tensor_lr_cuda(std::vector<Tensor> params,
                                double weight_decay, double eps, bool amsgrad,
                                bool maximize,
                                const std::optional<Tensor>& grad_scale,
-                               const std::optional<Tensor>& found_inf) {
+                               const std::optional<Tensor>& found_inf,
+                               bool exact) {
     fused_adam_cuda_impl(std::move(params), grads, exp_avgs, exp_avg_sqs,
         max_exp_avg_sqs, state_steps, 0.0, beta1, beta2,
         weight_decay, eps, amsgrad, maximize, false,
-        grad_scale, found_inf, &lr);
+        grad_scale, found_inf, &lr, exact);
 }
 
 void fused_adamw_cuda(std::vector<Tensor> params,
@@ -897,11 +960,12 @@ void fused_adamw_cuda(std::vector<Tensor> params,
                       double lr, double beta1, double beta2, double weight_decay,
                       double eps, bool amsgrad, bool maximize,
                       const std::optional<Tensor>& grad_scale,
-                      const std::optional<Tensor>& found_inf) {
+                      const std::optional<Tensor>& found_inf,
+                      bool exact) {
     fused_adam_cuda_impl(std::move(params), grads, exp_avgs, exp_avg_sqs,
         max_exp_avg_sqs, state_steps, lr, beta1,
         beta2, weight_decay, eps, amsgrad,
-        maximize, true, grad_scale, found_inf, nullptr);
+        maximize, true, grad_scale, found_inf, nullptr, exact);
 }
 
 void fused_adamw_tensor_lr_cuda(std::vector<Tensor> params,
@@ -914,11 +978,12 @@ void fused_adamw_tensor_lr_cuda(std::vector<Tensor> params,
                                 double weight_decay, double eps, bool amsgrad,
                                 bool maximize,
                                 const std::optional<Tensor>& grad_scale,
-                                const std::optional<Tensor>& found_inf) {
+                                const std::optional<Tensor>& found_inf,
+                                bool exact) {
     fused_adam_cuda_impl(std::move(params), grads, exp_avgs, exp_avg_sqs,
         max_exp_avg_sqs, state_steps, 0.0, beta1, beta2,
         weight_decay, eps, amsgrad, maximize, true,
-        grad_scale, found_inf, &lr);
+        grad_scale, found_inf, &lr, exact);
 }
 
 void fused_sgd_cuda(std::vector<Tensor> params,
@@ -989,15 +1054,23 @@ std::vector<Tensor> foreach_sgd_cuda(const std::vector<Tensor>& params,
     validate_lists(params, grads, momentum_buffers, empty_states, empty_states,
                    no_steps, momentum != 0.0, false, false, "_foreach_sgd");
     if (params.empty()) return params;
-    if (params[0].dtype() == DType::Float32) {
-        launch_sgd<float>(params, grads, momentum_buffers, lr, momentum,
-                          dampening, weight_decay, nesterov, first_momentum_step);
-    } else if (params[0].dtype() == DType::Float64) {
-        launch_sgd<double>(params, grads, momentum_buffers, lr, momentum,
-                           dampening, weight_decay, nesterov, first_momentum_step);
-    } else {
+    const bool launched = foreach_mta::dispatch_dtype(
+        params[0].dtype(), [&]<typename scalar_t, typename math_t>() {
+            if (momentum == 0.0) {
+                optimizer_mta::launch_sgd<scalar_t, math_t, double, false>(
+                    params, grads, momentum_buffers, lr, momentum, dampening,
+                    weight_decay, nesterov, first_momentum_step, false,
+                    nullptr, nullptr, nullptr, "_foreach_sgd");
+            } else {
+                optimizer_mta::launch_sgd<scalar_t, math_t, double, true>(
+                    params, grads, momentum_buffers, lr, momentum, dampening,
+                    weight_decay, nesterov, first_momentum_step, false,
+                    nullptr, nullptr, nullptr, "_foreach_sgd");
+            }
+        });
+    if (!launched) {
         TP_THROW(NotImplementedError,
-                 "_foreach_sgd supports float32 and float64 CUDA tensors");
+                 "_foreach_sgd supports floating CUDA tensors");
     }
     // Match PyTorch's in-place optimizer contract: the parameter version
     // changes immediately after the queued update, even though the CUDA
@@ -1027,17 +1100,25 @@ std::vector<Tensor> foreach_adam_cuda(const std::vector<Tensor>& params,
     validate_lists(params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs,
                    steps, true, true, amsgrad, "_foreach_adam");
     if (params.empty()) return params;
-    if (params[0].dtype() == DType::Float32) {
-        launch_adam<float>(params, grads, exp_avgs, exp_avg_sqs,
-                           max_exp_avg_sqs, steps, lr, beta1, beta2, eps,
-                           weight_decay, amsgrad);
-    } else if (params[0].dtype() == DType::Float64) {
-        launch_adam<double>(params, grads, exp_avgs, exp_avg_sqs,
-                            max_exp_avg_sqs, steps, lr, beta1, beta2, eps,
-                            weight_decay, amsgrad);
-    } else {
+    const bool launched = foreach_mta::dispatch_dtype(
+        params[0].dtype(), [&]<typename scalar_t, typename math_t>() {
+            if (amsgrad) {
+                optimizer_mta::launch_adam_host<
+                    scalar_t, math_t, double, false, true>(
+                    params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs,
+                    steps, lr, beta1, beta2, eps, weight_decay,
+                    false, "_foreach_adam");
+            } else {
+                optimizer_mta::launch_adam_host<
+                    scalar_t, math_t, double, false, false>(
+                    params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs,
+                    steps, lr, beta1, beta2, eps, weight_decay,
+                    false, "_foreach_adam");
+            }
+        });
+    if (!launched) {
         TP_THROW(NotImplementedError,
-                 "_foreach_adam supports float32 and float64 CUDA tensors");
+                 "_foreach_adam supports floating CUDA tensors");
     }
     for (const auto& param : params) {
         param.unsafeGetTensorImpl()->bump_version();
@@ -1906,6 +1987,411 @@ void foreach_powsum_out_cuda(const std::vector<Tensor>& self, Scalar ord,
                           "_foreach_powsum.Scalar_out");
 }
 
+
+// ------------------------------------------------------------------
+// Multi-tensor-apply fast paths for the hot optimizer foreach ops.
+//
+// The per-tensor foreach_map_* implementations pay one kernel launch per
+// tensor per op; a transformer-like group of 100+ small tensors therefore
+// spends its whole step in launch overhead (torch's CUDA foreach uses
+// MultiTensorApply for exactly this reason).  These wrappers route
+// eligible fp16/bf16/fp32/fp64 groups through foreach_mta::launch -- one
+// launch walks chunks from every tensor -- and fall back to the
+// per-tensor implementations otherwise.
+// ------------------------------------------------------------------
+
+namespace {
+
+bool mta_ready(const std::vector<Tensor>& xs) {
+    return !xs.empty() && xs.front().defined() &&
+        xs.front().device().is_cuda();
+}
+
+template <typename M>
+std::vector<M> mta_scalar_values(const std::vector<Scalar>& scalars) {
+    std::vector<M> values;
+    values.reserve(scalars.size());
+    for (const Scalar& scalar : scalars) {
+        values.push_back(scalar.to<M>());
+    }
+    return values;
+}
+
+void mta_bump(std::vector<Tensor>& xs) {
+    for (Tensor& t : xs) t.unsafeGetTensorImpl()->bump_version();
+}
+
+std::vector<Tensor> foreach_alloc_like_cuda(const std::vector<Tensor>& xs) {
+    std::vector<Tensor> out;
+    out.reserve(xs.size());
+    for (const Tensor& t : xs) out.push_back(Tensor::empty_like(t));
+    return out;
+}
+
+
+}  // namespace
+
+#define TP_MTA_UNARY_INPLACE(NAME, FUNCTOR)                                   \
+void foreach_##NAME##_mta_inplace_cuda(std::vector<Tensor> self) {            \
+    if (!mta_ready(self) ||                                                   \
+        !foreach_mta::eligible_list(self)) {                                  \
+        foreach_##NAME##_inplace_cuda(std::move(self));                       \
+        return;                                                               \
+    }                                                                         \
+    const bool launched = foreach_mta::dispatch_dtype(                        \
+        self[0].dtype(), [&]<typename T, typename M>() {                      \
+            foreach_mta::launch<1, 0, T, M>(                                  \
+                std::array<const std::vector<Tensor>*, 1>{&self},             \
+                FUNCTOR<M>{}, "_foreach_" #NAME "_.cuda");                    \
+        });                                                                   \
+    if (!launched) {                                                          \
+        foreach_##NAME##_inplace_cuda(std::move(self));                       \
+        return;                                                               \
+    }                                                                         \
+    mta_bump(self);                                                           \
+}
+
+TP_MTA_UNARY_INPLACE(sqrt, foreach_mta::UnarySqrt)
+TP_MTA_UNARY_INPLACE(rsqrt, foreach_mta::UnaryRsqrt)
+TP_MTA_UNARY_INPLACE(neg, foreach_mta::UnaryNeg)
+TP_MTA_UNARY_INPLACE(abs, foreach_mta::UnaryAbs)
+TP_MTA_UNARY_INPLACE(sign, foreach_mta::UnarySign)
+TP_MTA_UNARY_INPLACE(reciprocal, foreach_mta::UnaryReciprocal)
+#undef TP_MTA_UNARY_INPLACE
+
+void foreach_zero_mta_inplace_cuda(std::vector<Tensor> self) {
+    if (!mta_ready(self) || !foreach_mta::eligible_list(self)) {
+        foreach_zero_inplace_cuda(std::move(self));
+        return;
+    }
+    const bool launched = foreach_mta::dispatch_dtype(
+        self[0].dtype(), [&]<typename T, typename M>() {
+            foreach_mta::launch<1, 0, T, M>(
+                std::array<const std::vector<Tensor>*, 1>{&self},
+                foreach_mta::UnaryZero<M>{}, "_foreach_zero_.cuda");
+        });
+    if (!launched) {
+        foreach_zero_inplace_cuda(std::move(self));
+        return;
+    }
+    mta_bump(self);
+}
+
+#define TP_MTA_SCALAR_INPLACE(NAME, FUNCTOR)                                  \
+void foreach_##NAME##_scalar_mta_inplace_cuda(std::vector<Tensor> self,       \
+                                              Scalar s) {                     \
+    if (!mta_ready(self) || !foreach_mta::eligible_list(self)) {              \
+        foreach_##NAME##_scalar_inplace_cuda(std::move(self), s);             \
+        return;                                                               \
+    }                                                                         \
+    const bool launched = foreach_mta::dispatch_dtype(                        \
+        self[0].dtype(), [&]<typename T, typename M>() {                      \
+            foreach_mta::launch<1, 0, T, M>(                                  \
+                std::array<const std::vector<Tensor>*, 1>{&self},             \
+                FUNCTOR<M>{s.to<M>()}, "_foreach_" #NAME "_.cuda");           \
+        });                                                                   \
+    if (!launched) {                                                          \
+        foreach_##NAME##_scalar_inplace_cuda(std::move(self), s);             \
+        return;                                                               \
+    }                                                                         \
+    mta_bump(self);                                                           \
+}
+
+TP_MTA_SCALAR_INPLACE(add, foreach_mta::BinaryAddScalar)
+TP_MTA_SCALAR_INPLACE(sub, foreach_mta::BinarySubScalar)
+TP_MTA_SCALAR_INPLACE(mul, foreach_mta::BinaryMulScalar)
+TP_MTA_SCALAR_INPLACE(div, foreach_mta::BinaryDivScalar)
+#undef TP_MTA_SCALAR_INPLACE
+
+#define TP_MTA_SCALAR_LIST_INPLACE(NAME, FUNCTOR)                             \
+void foreach_##NAME##_scalar_list_mta_inplace_cuda(                           \
+        std::vector<Tensor> self, const std::vector<Scalar>& scalars) {       \
+    if (!mta_ready(self) || !foreach_mta::eligible_list(self) ||              \
+        self.size() != scalars.size()) {                                      \
+        foreach_##NAME##_scalar_list_inplace_cuda(std::move(self), scalars);   \
+        return;                                                               \
+    }                                                                          \
+    const bool launched = foreach_mta::dispatch_dtype(                        \
+        self[0].dtype(), [&]<typename T, typename M>() {                      \
+            const std::vector<M> values = mta_scalar_values<M>(scalars);      \
+            foreach_mta::launch_scalar_list<1, 0, T, M>(                      \
+                std::array<const std::vector<Tensor>*, 1>{&self}, values,     \
+                FUNCTOR<M>{}, "_foreach_" #NAME "_.ScalarList.cuda");        \
+        });                                                                   \
+    if (!launched) {                                                           \
+        foreach_##NAME##_scalar_list_inplace_cuda(std::move(self), scalars);   \
+        return;                                                                \
+    }                                                                          \
+    mta_bump(self);                                                            \
+}
+
+TP_MTA_SCALAR_LIST_INPLACE(add, foreach_mta::BinaryAddScalarList)
+TP_MTA_SCALAR_LIST_INPLACE(sub, foreach_mta::BinarySubScalarList)
+TP_MTA_SCALAR_LIST_INPLACE(mul, foreach_mta::BinaryMulScalarList)
+TP_MTA_SCALAR_LIST_INPLACE(div, foreach_mta::BinaryDivScalarList)
+#undef TP_MTA_SCALAR_LIST_INPLACE
+
+#define TP_MTA_LIST_INPLACE(NAME, FUNCTOR)                                    \
+void foreach_##NAME##_list_mta_inplace_cuda(std::vector<Tensor> self,         \
+                                            const std::vector<Tensor>& other) {\
+    if (!mta_ready(self) ||                                                   \
+        !foreach_mta::eligible_pair(self, other)) {                           \
+        foreach_##NAME##_list_inplace_cuda(std::move(self), other);           \
+        return;                                                               \
+    }                                                                         \
+    const bool launched = foreach_mta::dispatch_dtype(                        \
+        self[0].dtype(), [&]<typename T, typename M>() {                      \
+            foreach_mta::launch<2, 0, T, M>(                                  \
+                std::array<const std::vector<Tensor>*, 2>{&self, &other},     \
+                FUNCTOR<M>{}, "_foreach_" #NAME "_.cuda");                    \
+        });                                                                   \
+    if (!launched) {                                                          \
+        foreach_##NAME##_list_inplace_cuda(std::move(self), other);           \
+        return;                                                               \
+    }                                                                         \
+    mta_bump(self);                                                           \
+}
+
+TP_MTA_LIST_INPLACE(mul, foreach_mta::BinaryMulList)
+TP_MTA_LIST_INPLACE(div, foreach_mta::BinaryDivList)
+TP_MTA_LIST_INPLACE(maximum, foreach_mta::BinaryMaximumList)
+#undef TP_MTA_LIST_INPLACE
+
+void foreach_add_list_mta_inplace_cuda(std::vector<Tensor> self,
+                                       const std::vector<Tensor>& other,
+                                       Scalar alpha) {
+    if (!mta_ready(self) || !foreach_mta::eligible_pair(self, other)) {
+        foreach_add_list_inplace_cuda(std::move(self), other, alpha);
+        return;
+    }
+    const bool launched = foreach_mta::dispatch_dtype(
+        self[0].dtype(), [&]<typename T, typename M>() {
+            foreach_mta::launch<2, 0, T, M>(
+                std::array<const std::vector<Tensor>*, 2>{&self, &other},
+                foreach_mta::BinaryAddList<M>{alpha.to<M>()},
+                "_foreach_add_.list.cuda");
+        });
+    if (!launched) {
+        foreach_add_list_inplace_cuda(std::move(self), other, alpha);
+        return;
+    }
+    mta_bump(self);
+}
+
+void foreach_lerp_scalar_mta_inplace_cuda(std::vector<Tensor> self,
+                                          const std::vector<Tensor>& end,
+                                          Scalar weight) {
+    if (!mta_ready(self) || !foreach_mta::eligible_pair(self, end)) {
+        foreach_lerp_scalar_inplace_cuda(std::move(self), end, weight);
+        return;
+    }
+    const bool launched = foreach_mta::dispatch_dtype(
+        self[0].dtype(), [&]<typename T, typename M>() {
+            foreach_mta::launch<2, 0, T, M>(
+                std::array<const std::vector<Tensor>*, 2>{&self, &end},
+                foreach_mta::BinaryLerp<M>{weight.to<M>()},
+                "_foreach_lerp_.cuda");
+        });
+    if (!launched) {
+        foreach_lerp_scalar_inplace_cuda(std::move(self), end, weight);
+        return;
+    }
+    mta_bump(self);
+}
+
+void foreach_addcmul_scalar_mta_inplace_cuda(
+        std::vector<Tensor> self, const std::vector<Tensor>& t1,
+        const std::vector<Tensor>& t2, Scalar value) {
+    if (!mta_ready(self) || !foreach_mta::eligible_ternary(self, t1, t2)) {
+        foreach_addcmul_scalar_inplace_cuda(std::move(self), t1, t2, value);
+        return;
+    }
+    const bool launched = foreach_mta::dispatch_dtype(
+        self[0].dtype(), [&]<typename T, typename M>() {
+            foreach_mta::launch<3, 0, T, M>(
+                std::array<const std::vector<Tensor>*, 3>{&self, &t1, &t2},
+                foreach_mta::TernaryAddcmul<M>{value.to<M>()},
+                "_foreach_addcmul_.cuda");
+        });
+    if (!launched) {
+        foreach_addcmul_scalar_inplace_cuda(std::move(self), t1, t2, value);
+        return;
+    }
+    mta_bump(self);
+}
+
+void foreach_addcdiv_scalar_mta_inplace_cuda(
+        std::vector<Tensor> self, const std::vector<Tensor>& t1,
+        const std::vector<Tensor>& t2, Scalar value) {
+    if (!mta_ready(self) || !foreach_mta::eligible_ternary(self, t1, t2)) {
+        foreach_addcdiv_scalar_inplace_cuda(std::move(self), t1, t2, value);
+        return;
+    }
+    const bool launched = foreach_mta::dispatch_dtype(
+        self[0].dtype(), [&]<typename T, typename M>() {
+            foreach_mta::launch<3, 0, T, M>(
+                std::array<const std::vector<Tensor>*, 3>{&self, &t1, &t2},
+                foreach_mta::TernaryAddcdiv<M>{value.to<M>()},
+                "_foreach_addcdiv_.cuda");
+        });
+    if (!launched) {
+        foreach_addcdiv_scalar_inplace_cuda(std::move(self), t1, t2, value);
+        return;
+    }
+    mta_bump(self);
+}
+
+#define TP_MTA_TERNARY_SCALAR_LIST_INPLACE(NAME, FUNCTOR)                     \
+void foreach_##NAME##_scalar_list_mta_inplace_cuda(                           \
+        std::vector<Tensor> self, const std::vector<Tensor>& t1,              \
+        const std::vector<Tensor>& t2, const std::vector<Scalar>& scalars) {   \
+    if (!mta_ready(self) ||                                                    \
+        !foreach_mta::eligible_ternary(self, t1, t2) ||                        \
+        self.size() != scalars.size()) {                                       \
+        foreach_##NAME##_scalar_list_inplace_cuda(                             \
+            std::move(self), t1, t2, scalars);                                 \
+        return;                                                                \
+    }                                                                          \
+    const bool launched = foreach_mta::dispatch_dtype(                         \
+        self[0].dtype(), [&]<typename T, typename M>() {                       \
+            const std::vector<M> values = mta_scalar_values<M>(scalars);       \
+            foreach_mta::launch_scalar_list<3, 0, T, M>(                       \
+                std::array<const std::vector<Tensor>*, 3>{&self, &t1, &t2},    \
+                values, FUNCTOR<M>{},                                          \
+                "_foreach_" #NAME "_.ScalarList.cuda");                      \
+        });                                                                    \
+    if (!launched) {                                                            \
+        foreach_##NAME##_scalar_list_inplace_cuda(                              \
+            std::move(self), t1, t2, scalars);                                  \
+        return;                                                                 \
+    }                                                                           \
+    mta_bump(self);                                                             \
+}
+
+TP_MTA_TERNARY_SCALAR_LIST_INPLACE(addcmul, foreach_mta::TernaryAddcmulScalarList)
+TP_MTA_TERNARY_SCALAR_LIST_INPLACE(addcdiv, foreach_mta::TernaryAddcdivScalarList)
+#undef TP_MTA_TERNARY_SCALAR_LIST_INPLACE
+
+void foreach_lerp_scalar_list_mta_inplace_cuda(
+        std::vector<Tensor> self, const std::vector<Tensor>& end,
+        const std::vector<Scalar>& weights) {
+    if (!mta_ready(self) || !foreach_mta::eligible_pair(self, end) ||
+        self.size() != weights.size()) {
+        foreach_lerp_scalar_list_inplace_cuda(std::move(self), end, weights);
+        return;
+    }
+    const bool launched = foreach_mta::dispatch_dtype(
+        self[0].dtype(), [&]<typename T, typename M>() {
+            const std::vector<M> values = mta_scalar_values<M>(weights);
+            foreach_mta::launch_scalar_list<2, 0, T, M>(
+                std::array<const std::vector<Tensor>*, 2>{&self, &end},
+                values, foreach_mta::BinaryLerpScalarList<M>{},
+                "_foreach_lerp_.ScalarList.cuda");
+        });
+    if (!launched) {
+        foreach_lerp_scalar_list_inplace_cuda(std::move(self), end, weights);
+        return;
+    }
+    mta_bump(self);
+}
+
+
+std::vector<Tensor> foreach_sub_scalar_mta_ret_cuda(
+        const std::vector<Tensor>& self, Scalar s) {
+    if (!mta_ready(self) || !foreach_mta::eligible_list(self)) {
+        return foreach_sub_scalar_cuda(self, s);
+    }
+    std::vector<Tensor> out = foreach_alloc_like_cuda(self);
+    const bool launched = foreach_mta::dispatch_dtype(
+        self[0].dtype(), [&]<typename T, typename M>() {
+            foreach_mta::launch<2, 1, T, M>(
+                std::array<const std::vector<Tensor>*, 2>{&self, &out},
+                foreach_mta::BinarySubScalar<M>{s.to<M>()},
+                "_foreach_sub.cuda");
+        });
+    if (!launched) return foreach_sub_scalar_cuda(self, s);
+    return out;
+}
+
+void foreach_sub_list_mta_inplace_cuda(std::vector<Tensor> self,
+                                       const std::vector<Tensor>& other) {
+    if (!mta_ready(self) || !foreach_mta::eligible_pair(self, other)) {
+        for (size_t i = 0; i < self.size(); ++i)
+            self[i].sub_(other[i]);
+        return;
+    }
+    const bool launched = foreach_mta::dispatch_dtype(
+        self[0].dtype(), [&]<typename T, typename M>() {
+            foreach_mta::launch<2, 0, T, M>(
+                std::array<const std::vector<Tensor>*, 2>{&self, &other},
+                foreach_mta::BinarySubList<M>{M(1)},
+                "_foreach_sub_.list.cuda");
+        });
+    if (!launched) {
+        for (size_t i = 0; i < self.size(); ++i)
+            self[i].sub_(other[i]);
+        return;
+    }
+    mta_bump(self);
+}
+
+// ---- returning variants: allocate once, write through MTA --------------
+
+#define TP_MTA_SCALAR_RET(NAME, FUNCTOR)                                      \
+std::vector<Tensor> foreach_##NAME##_scalar_mta_ret_cuda(                     \
+        const std::vector<Tensor>& self, Scalar s) {                          \
+    if (!mta_ready(self) || !foreach_mta::eligible_list(self)) {              \
+        return foreach_##NAME##_scalar_cuda(self, s);                         \
+    }                                                                         \
+    std::vector<Tensor> out = foreach_alloc_like_cuda(self);                  \
+    const bool launched = foreach_mta::dispatch_dtype(                        \
+        self[0].dtype(), [&]<typename T, typename M>() {                      \
+            foreach_mta::launch<2, 1, T, M>(                                  \
+                std::array<const std::vector<Tensor>*, 2>{&self, &out},       \
+                FUNCTOR<M>{s.to<M>()}, "_foreach_" #NAME ".cuda");            \
+        });                                                                   \
+    if (!launched) {                                                          \
+        return foreach_##NAME##_scalar_cuda(self, s);                         \
+    }                                                                         \
+    return out;                                                               \
+}
+
+TP_MTA_SCALAR_RET(add, foreach_mta::BinaryAddScalar)
+TP_MTA_SCALAR_RET(mul, foreach_mta::BinaryMulScalar)
+TP_MTA_SCALAR_RET(div, foreach_mta::BinaryDivScalar)
+#undef TP_MTA_SCALAR_RET
+
+std::vector<Tensor> foreach_sqrt_mta_ret_cuda(const std::vector<Tensor>& self) {
+    if (!mta_ready(self) || !foreach_mta::eligible_list(self)) {
+        return foreach_sqrt_cuda(self);
+    }
+    std::vector<Tensor> out = foreach_alloc_like_cuda(self);
+    const bool launched = foreach_mta::dispatch_dtype(
+        self[0].dtype(), [&]<typename T, typename M>() {
+            foreach_mta::launch<2, 1, T, M>(
+                std::array<const std::vector<Tensor>*, 2>{&self, &out},
+                foreach_mta::UnarySqrt<M>{}, "_foreach_sqrt.cuda");
+        });
+    if (!launched) return foreach_sqrt_cuda(self);
+    return out;
+}
+
+std::vector<Tensor> foreach_neg_mta_ret_cuda(const std::vector<Tensor>& self) {
+    if (!mta_ready(self) || !foreach_mta::eligible_list(self)) {
+        return foreach_neg_cuda(self);
+    }
+    std::vector<Tensor> out = foreach_alloc_like_cuda(self);
+    const bool launched = foreach_mta::dispatch_dtype(
+        self[0].dtype(), [&]<typename T, typename M>() {
+            foreach_mta::launch<2, 1, T, M>(
+                std::array<const std::vector<Tensor>*, 2>{&self, &out},
+                foreach_mta::UnaryNeg<M>{}, "_foreach_neg.cuda");
+        });
+    if (!launched) return foreach_neg_cuda(self);
+    return out;
+}
+
+
 TENSORPLAY_LIBRARY_IMPL(CUDA, OptimizerKernels) {
     m.impl("_foreach_sgd", foreach_sgd_cuda);
     m.impl("_foreach_adam", foreach_adam_cuda);
@@ -1917,23 +2403,32 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, OptimizerKernels) {
     m.impl("_fused_sgd_.tensor_lr", fused_sgd_tensor_lr_cuda);
     m.impl("_fused_adagrad_", fused_adagrad_cuda);
     m.impl("_fused_adagrad_.tensor_lr", fused_adagrad_tensor_lr_cuda);
-    m.impl("_foreach_add.Scalar", foreach_add_scalar_cuda);
+    m.impl("_fused_rmsprop_", fused_rmsprop_cuda);
+    m.impl("_fused_adadelta_", fused_adadelta_cuda);
+    m.impl("_fused_adamax_", fused_adamax_cuda);
+    m.impl("_fused_asgd_", fused_asgd_cuda);
+    m.impl("_fused_rprop_", fused_rprop_cuda);
+    m.impl("_fused_nadam_", fused_nadam_cuda);
+    m.impl("_fused_radam_", fused_radam_cuda);
+    m.impl("_fused_adafactor_", fused_adafactor_cuda);
+    m.impl("_fused_adafactor_factored_", fused_adafactor_factored_cuda);
+    m.impl("_foreach_add.Scalar", foreach_add_scalar_mta_ret_cuda);
     m.impl("_foreach_add.List", foreach_add_list_cuda);
     m.impl("_foreach_add.ScalarList", foreach_add_scalar_list_cuda);
     m.impl("_foreach_add.Tensor", foreach_add_tensor_cuda);
-    m.impl("_foreach_add_.Scalar", foreach_add_scalar_inplace_cuda);
-    m.impl("_foreach_add_.List", foreach_add_list_inplace_cuda);
-    m.impl("_foreach_add_.ScalarList", foreach_add_scalar_list_inplace_cuda);
+    m.impl("_foreach_add_.Scalar", foreach_add_scalar_mta_inplace_cuda);
+    m.impl("_foreach_add_.List", foreach_add_list_mta_inplace_cuda);
+    m.impl("_foreach_add_.ScalarList", foreach_add_scalar_list_mta_inplace_cuda);
     m.impl("_foreach_add_.Tensor", foreach_add_tensor_inplace_cuda);
 
 #define REGISTER_FOREACH_BINARY(NAME) \
-    m.impl("_foreach_" #NAME ".Scalar", foreach_##NAME##_scalar_cuda); \
+    m.impl("_foreach_" #NAME ".Scalar", foreach_##NAME##_scalar_mta_ret_cuda); \
     m.impl("_foreach_" #NAME ".List", foreach_##NAME##_list_cuda); \
     m.impl("_foreach_" #NAME ".ScalarList", foreach_##NAME##_scalar_list_cuda); \
     m.impl("_foreach_" #NAME ".Tensor", foreach_##NAME##_tensor_cuda); \
-    m.impl("_foreach_" #NAME "_.Scalar", foreach_##NAME##_scalar_inplace_cuda); \
-    m.impl("_foreach_" #NAME "_.List", foreach_##NAME##_list_inplace_cuda); \
-    m.impl("_foreach_" #NAME "_.ScalarList", foreach_##NAME##_scalar_list_inplace_cuda); \
+    m.impl("_foreach_" #NAME "_.Scalar", foreach_##NAME##_scalar_mta_inplace_cuda); \
+    m.impl("_foreach_" #NAME "_.List", foreach_##NAME##_list_mta_inplace_cuda); \
+    m.impl("_foreach_" #NAME "_.ScalarList", foreach_##NAME##_scalar_list_mta_inplace_cuda); \
     m.impl("_foreach_" #NAME "_.Tensor", foreach_##NAME##_tensor_inplace_cuda);
     REGISTER_FOREACH_BINARY(sub)
     REGISTER_FOREACH_BINARY(mul)
@@ -1943,12 +2438,24 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, OptimizerKernels) {
 #define REGISTER_FOREACH_UNARY(NAME) \
     m.impl("_foreach_" #NAME, foreach_##NAME##_cuda); \
     m.impl("_foreach_" #NAME "_", foreach_##NAME##_inplace_cuda);
-    REGISTER_FOREACH_UNARY(sqrt)
-    REGISTER_FOREACH_UNARY(rsqrt)
-    REGISTER_FOREACH_UNARY(neg)
-    REGISTER_FOREACH_UNARY(abs)
-    REGISTER_FOREACH_UNARY(reciprocal)
-    REGISTER_FOREACH_UNARY(sign)
+    m.impl("_foreach_sqrt", foreach_sqrt_mta_ret_cuda); \
+    m.impl("_foreach_sqrt_", foreach_sqrt_mta_inplace_cuda); \
+    m.impl("_foreach_sqrt.out", foreach_sqrt_out_cuda);
+    m.impl("_foreach_rsqrt", foreach_rsqrt_cuda); \
+    m.impl("_foreach_rsqrt_", foreach_rsqrt_mta_inplace_cuda); \
+    m.impl("_foreach_rsqrt.out", foreach_rsqrt_out_cuda);
+    m.impl("_foreach_neg", foreach_neg_mta_ret_cuda); \
+    m.impl("_foreach_neg_", foreach_neg_mta_inplace_cuda); \
+    m.impl("_foreach_neg.out", foreach_neg_out_cuda);
+    m.impl("_foreach_abs", foreach_abs_cuda); \
+    m.impl("_foreach_abs_", foreach_abs_mta_inplace_cuda); \
+    m.impl("_foreach_abs.out", foreach_abs_out_cuda);
+    m.impl("_foreach_reciprocal", foreach_reciprocal_cuda); \
+    m.impl("_foreach_reciprocal_", foreach_reciprocal_mta_inplace_cuda); \
+    m.impl("_foreach_reciprocal.out", foreach_reciprocal_out_cuda);
+    m.impl("_foreach_sign", foreach_sign_cuda); \
+    m.impl("_foreach_sign_", foreach_sign_mta_inplace_cuda); \
+    m.impl("_foreach_sign.out", foreach_sign_out_cuda);
 #undef REGISTER_FOREACH_UNARY
 
 #define REGISTER_FOREACH_UNARY_OUT(NAME) \
@@ -2031,7 +2538,10 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, OptimizerKernels) {
     m.impl("_foreach_add.ScalarList_out", foreach_add_scalar_list_out_cuda);
     m.impl("_foreach_add.Scalar_out", foreach_add_scalar_out_cuda);
     m.impl("_foreach_add.Tensor_out", foreach_add_tensor_out_cuda);
-    m.impl("_foreach_sub.List_out", foreach_sub_list_out_cuda);
+    m.impl("_foreach_sub_.Scalar", foreach_sub_scalar_mta_inplace_cuda);
+    m.impl("_foreach_sub_.List", foreach_sub_list_mta_inplace_cuda);
+    m.impl("_foreach_sub.Scalar", foreach_sub_scalar_mta_ret_cuda);
+m.impl("_foreach_sub.List_out", foreach_sub_list_out_cuda);
     m.impl("_foreach_sub.ScalarList_out", foreach_sub_scalar_list_out_cuda);
     m.impl("_foreach_sub.Scalar_out", foreach_sub_scalar_out_cuda);
     m.impl("_foreach_sub.Tensor_out", foreach_sub_tensor_out_cuda);
@@ -2074,23 +2584,23 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, OptimizerKernels) {
 #undef REGISTER_FOREACH_UNARY
 
     m.impl("_foreach_addcmul.Scalar", foreach_addcmul_scalar_cuda);
-    m.impl("_foreach_addcmul_.Scalar", foreach_addcmul_scalar_inplace_cuda);
+    m.impl("_foreach_addcmul_.Scalar", foreach_addcmul_scalar_mta_inplace_cuda);
     m.impl("_foreach_addcmul.ScalarList", foreach_addcmul_scalar_list_cuda);
-    m.impl("_foreach_addcmul_.ScalarList", foreach_addcmul_scalar_list_inplace_cuda);
+    m.impl("_foreach_addcmul_.ScalarList", foreach_addcmul_scalar_list_mta_inplace_cuda);
     m.impl("_foreach_addcmul.Tensor", foreach_addcmul_tensor_cuda);
     m.impl("_foreach_addcmul_.Tensor", foreach_addcmul_tensor_inplace_cuda);
     m.impl("_foreach_addcdiv.Scalar", foreach_addcdiv_scalar_cuda);
-    m.impl("_foreach_addcdiv_.Scalar", foreach_addcdiv_scalar_inplace_cuda);
+    m.impl("_foreach_addcdiv_.Scalar", foreach_addcdiv_scalar_mta_inplace_cuda);
     m.impl("_foreach_addcdiv.ScalarList", foreach_addcdiv_scalar_list_cuda);
-    m.impl("_foreach_addcdiv_.ScalarList", foreach_addcdiv_scalar_list_inplace_cuda);
+    m.impl("_foreach_addcdiv_.ScalarList", foreach_addcdiv_scalar_list_mta_inplace_cuda);
     m.impl("_foreach_addcdiv.Tensor", foreach_addcdiv_tensor_cuda);
     m.impl("_foreach_addcdiv_.Tensor", foreach_addcdiv_tensor_inplace_cuda);
     m.impl("_foreach_lerp.Scalar", foreach_lerp_scalar_cuda);
     m.impl("_foreach_lerp.List", foreach_lerp_list_cuda);
-    m.impl("_foreach_lerp_.Scalar", foreach_lerp_scalar_inplace_cuda);
+    m.impl("_foreach_lerp_.Scalar", foreach_lerp_scalar_mta_inplace_cuda);
     m.impl("_foreach_lerp_.List", foreach_lerp_list_inplace_cuda);
     m.impl("_foreach_lerp.ScalarList", foreach_lerp_scalar_list_cuda);
-    m.impl("_foreach_lerp_.ScalarList", foreach_lerp_scalar_list_inplace_cuda);
+    m.impl("_foreach_lerp_.ScalarList", foreach_lerp_scalar_list_mta_inplace_cuda);
     m.impl("_foreach_pow.Scalar", foreach_pow_scalar_cuda);
     m.impl("_foreach_pow.ScalarAndTensor", foreach_pow_scalar_tensor_cuda);
     m.impl("_foreach_pow.TensorAndTensor", foreach_pow_tensor_tensor_cuda);
@@ -2124,7 +2634,7 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, OptimizerKernels) {
     m.impl("_foreach_minimum.ScalarList", foreach_minimum_scalar_list_cuda);
     m.impl("_foreach_minimum_.ScalarList", foreach_minimum_scalar_list_inplace_cuda);
     m.impl("_foreach_copy_", foreach_copy_inplace_cuda);
-    m.impl("_foreach_zero_", foreach_zero_inplace_cuda);
+    m.impl("_foreach_zero_", foreach_zero_mta_inplace_cuda);
 }
 
 } // namespace cuda

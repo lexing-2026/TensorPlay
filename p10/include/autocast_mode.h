@@ -118,12 +118,27 @@ private:
 
 // ------------------------------------------------------------------
 // Cast cache storage (populated by tpx's cached_cast)
+//
+// torch guards a process-global map with a mutex taken on every eligible
+// op; the cache here is thread-local instead, so the hot path is
+// lock-free and multi-threaded inference/training never contends.
+// Entries carry the source's version counter: an in-place mutation of the
+// fp32 source invalidates its cached low-precision copy (this is what makes
+// caching inference tensors -- which torch does not -- safe).
 // ------------------------------------------------------------------
 
 using val_type = std::pair<std::weak_ptr<TensorImpl>, Tensor>;
 
-P10_API Tensor cache_lookup(TensorImpl* key);
+P10_API Tensor cache_lookup(const TensorImpl* key);
 P10_API void cache_store(TensorImpl* key, const Tensor& source, const Tensor& casted);
+
+// Secondary cache for transient views (e.g. the per-call `weight.t()` GEMM
+// argument): keyed by the underlying data pointer -- stable across views --
+// and validated against the probe tensor's shared version counter and shape,
+// so in-place mutation of the parent still invalidates the entry.
+P10_API Tensor cache_lookup_ptr(const void* key, const Tensor& probe);
+P10_API void cache_store_ptr(const void* key, const Tensor& probe,
+                             const Tensor& casted);
 
 } // namespace autocast
 } // namespace tensorplay

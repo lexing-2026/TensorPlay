@@ -7,12 +7,20 @@
 
 #include <pybind11/pybind11.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <tuple>
 #include <unordered_map>
 
 namespace py = ::pybind11;
+
+// Shared exception translator (defined at the bottom of this file so it can
+// serve both this fastcall bridge and the pybind11 translator in init.cpp).
+namespace tensorplay {
+class Exception;
+PyObject* translate_exception(const Exception& e);
+} // namespace tensorplay
 
 namespace tensorplay {
 namespace python_c {
@@ -29,6 +37,38 @@ namespace {
 }
 
 }  // namespace
+}  // namespace python_c
+
+namespace {
+// Borrowed pointer to the registered Python DeviceMismatchError type (set by
+// init.cpp during module init). Null until then -> plain RuntimeError.
+PyObject* g_device_mismatch_type = nullptr;
+}  // namespace
+
+// Single source of truth for C++ -> Python error mapping (see
+// python_bindings.h).
+PyObject* translate_exception(const Exception& e) {
+    if (dynamic_cast<const IndexError*>(&e)) return PyExc_IndexError;
+    if (dynamic_cast<const ValueError*>(&e)) return PyExc_ValueError;
+    if (dynamic_cast<const TypeError*>(&e)) return PyExc_TypeError;
+    if (dynamic_cast<const NotImplementedError*>(&e)) {
+        return PyExc_NotImplementedError;
+    }
+    if (dynamic_cast<const DeviceMismatchError*>(&e)) {
+        return g_device_mismatch_type ? g_device_mismatch_type : PyExc_RuntimeError;
+    }
+    return PyExc_RuntimeError;
+}
+
+void set_device_mismatch_error_type(PyObject* type) {
+    g_device_mismatch_type = type;
+}
+
+} // namespace tensorplay
+
+namespace tensorplay {
+
+namespace python_c {
 
 // ---------------------------------------------------------------------------
 // tpx_py_parse[_into]: merge positional args and keyword names into kwlist
@@ -127,6 +167,11 @@ Scalar as_scalar(PyObject* obj, const char* op, int idx) {
         }
     }
     if (PyFloat_Check(obj)) return Scalar(PyFloat_AS_DOUBLE(obj));
+    if (PyComplex_Check(obj)) {
+        // torch parity: a wrapped python complex becomes a complex128 scalar.
+        return Scalar(std::complex<double>(PyComplex_RealAsDouble(obj),
+                                           PyComplex_ImagAsDouble(obj)));
+    }
     try {
         return py::reinterpret_borrow<py::object>(obj).cast<Scalar>();
     } catch (const py::cast_error&) {
@@ -143,6 +188,15 @@ DType as_dtype(PyObject* obj, const char* op, int idx) {
 }
 
 int64_t as_int(PyObject* obj, const char* op, int idx) {
+    // Upstream PythonArgParser accepts integral-valued floats for int slots
+    // (e.g. divisor_override=3.0); non-integral floats still raise.
+    if (PyFloat_Check(obj)) {
+        const double d = PyFloat_AS_DOUBLE(obj);
+        if (static_cast<double>(static_cast<int64_t>(d)) == d) {
+            return static_cast<int64_t>(d);
+        }
+        type_error(obj, op, idx, "an integer");
+    }
     if (!PyIndex_Check(obj)) type_error(obj, op, idx, "an integer");
     // AsSsize_t with an error-raising sentinel: without the check an
     // out-of-range value would silently saturate and the kernel would run
@@ -334,7 +388,8 @@ bool obj_is_tensor(PyObject* obj) {
 bool seq_item_is_number(PyObject* o) {
     // Python numbers plus the registered tensorplay.Scalar wrapper, which
     // generated wrappers (e.g. addmm's beta/alpha) pass through directly.
-    if (PyIndex_Check(o) || PyFloat_Check(o)) return true;
+    // Complex numbers count as Number for python_arg_parser parity.
+    if (PyIndex_Check(o) || PyFloat_Check(o) || PyComplex_Check(o)) return true;
     try {
         return py::isinstance<tensorplay::Scalar>(py::handle(o));
     } catch (...) {
@@ -511,10 +566,13 @@ PyObject* tpx_py_wrap(const Tensor& t) {
     PyObject* wrapped = py::cast(t).release().ptr();
     if (wrapped == nullptr) return nullptr;
 
-    // dynamic_attr wrappers can carry the invalidation capsule; anything
-    // else (should not happen for Tensor) skips caching gracefully.
-    PyObject* caps = PyCapsule_New(const_cast<void*>(impl), nullptr,
-                                   &wrap_cache_capsule_destructor);
+    // Undefined tensors carry a null impl; the invalidation capsule is just
+    // a caching optimization, so skip it instead of tripping the
+    // "PyCapsule_New called with null pointer" interpreter error.
+    PyObject* caps = impl != nullptr
+        ? PyCapsule_New(const_cast<void*>(impl), nullptr,
+                        &wrap_cache_capsule_destructor)
+        : nullptr;
     if (caps != nullptr) {
         if (PyObject_SetAttrString(wrapped, kWrapCacheAttr, caps) == 0) {
             g_wrap_cache.emplace(impl, wrapped);  // borrowed; owned by obj
@@ -575,23 +633,26 @@ void tpx_py_keep_alive(PyObject*) {
 
 void tpx_py_set_error(const std::exception& e) {
     if (PyErr_Occurred()) return;  // already translated deeper down
-    // Mirror upstream HANDLE_TH_ERRORS: p10 exception kinds map onto their
-    // matching Python builtins instead of flattening to RuntimeError.
-    // Bridge argument-shape errors (std::invalid_argument) read as TypeError,
-    // the builtin callers expect for bad arguments.
+    // Bridge argument-shape errors read as TypeError, the builtin callers
+    // expect for bad arguments.
     if (dynamic_cast<const std::invalid_argument*>(&e)) {
         PyErr_SetString(PyExc_TypeError, e.what());
-    } else if (dynamic_cast<const IndexError*>(&e)) {
-        PyErr_SetString(PyExc_IndexError, e.what());
-    } else if (dynamic_cast<const ValueError*>(&e)) {
-        PyErr_SetString(PyExc_ValueError, e.what());
-    } else if (dynamic_cast<const TypeError*>(&e)) {
-        PyErr_SetString(PyExc_TypeError, e.what());
-    } else if (dynamic_cast<const NotImplementedError*>(&e)) {
-        PyErr_SetString(PyExc_NotImplementedError, e.what());
-    } else {
-        PyErr_SetString(PyExc_RuntimeError, e.what());
+        return;
     }
+    // p10 exception kinds map onto their matching Python types via the same
+    // translator the pybind11 path uses (incl. DeviceMismatchError and the
+    // TENSORPLAY_SHOW_CPP_STACKTRACES switch) instead of flattening
+    // everything to RuntimeError.
+    if (const tensorplay::Exception* tp = dynamic_cast<const tensorplay::Exception*>(&e)) {
+        std::string msg = tp->msg();
+        const char* env_val = std::getenv("TENSORPLAY_SHOW_CPP_STACKTRACES");
+        if (env_val && std::string(env_val) == "1" && !tp->stacktrace().empty()) {
+            msg += "\n\n" + tp->stacktrace();
+        }
+        PyErr_SetString(tensorplay::translate_exception(*tp), msg.c_str());
+        return;
+    }
+    PyErr_SetString(PyExc_RuntimeError, e.what());
 }
 
 }  // namespace python_c

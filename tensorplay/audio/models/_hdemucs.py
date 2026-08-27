@@ -27,12 +27,12 @@ import math
 import typing as tp
 from typing import Any, Dict, List, Optional
 
-import tensorplay as torch
-from torch import nn
-from torch.nn import functional as F
+import tensorplay as tensorplay
+from tensorplay import nn
+from tensorplay.nn import functional as F
 
 
-class _ScaledEmbedding(torch.nn.Module):
+class _ScaledEmbedding(tensorplay.nn.Module):
     r"""Make continuous embeddings and boost learning rate
 
     Args:
@@ -46,21 +46,21 @@ class _ScaledEmbedding(torch.nn.Module):
         super().__init__()
         self.embedding = nn.Embedding(num_embeddings, embedding_dim)
         if smooth:
-            weight = torch.cumsum(self.embedding.weight.data, dim=0)
+            weight = tensorplay.cumsum(self.embedding.weight.data, dim=0)
             # when summing gaussian, scale raises as sqrt(n), so we normalize by that.
-            weight = weight / torch.arange(1, num_embeddings + 1).sqrt()[:, None]
+            weight = weight / tensorplay.arange(1, num_embeddings + 1).sqrt()[:, None]
             self.embedding.weight.data[:] = weight
         self.embedding.weight.data /= scale
         self.scale = scale
 
     @property
-    def weight(self) -> torch.Tensor:
+    def weight(self) -> tensorplay.Tensor:
         return self.embedding.weight * self.scale
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: tensorplay.Tensor) -> tensorplay.Tensor:
         r"""Forward pass for embedding with scale.
         Args:
-            x (torch.Tensor): input tensor of shape `(num_embeddings)`
+            x (tensorplay.Tensor): input tensor of shape `(num_embeddings)`
 
         Returns:
             (Tensor):
@@ -70,7 +70,7 @@ class _ScaledEmbedding(torch.nn.Module):
         return out
 
 
-class _HEncLayer(torch.nn.Module):
+class _HEncLayer(tensorplay.nn.Module):
 
     r"""Encoder layer. This used both by the time and the frequency branch.
     Args:
@@ -133,15 +133,15 @@ class _HEncLayer(torch.nn.Module):
             self.norm2 = norm_fn(2 * chout)
             self.dconv = _DConv(chout, **dconv_kw)
 
-    def forward(self, x: torch.Tensor, inject: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: tensorplay.Tensor, inject: Optional[tensorplay.Tensor] = None) -> tensorplay.Tensor:
         r"""Forward pass for encoding layer.
 
         Size depends on whether frequency or time
 
         Args:
-            x (torch.Tensor): tensor input of shape `(B, C, F, T)` for frequency and shape
+            x (tensorplay.Tensor): tensor input of shape `(B, C, F, T)` for frequency and shape
                 `(B, C, T)` for time
-            inject (torch.Tensor, optional): on last layer, combine frequency and time branches through inject param,
+            inject (tensorplay.Tensor, optional): on last layer, combine frequency and time branches through inject param,
                 same shape as x (default: ``None``)
 
         Returns:
@@ -180,7 +180,7 @@ class _HEncLayer(torch.nn.Module):
         return z
 
 
-class _HDecLayer(torch.nn.Module):
+class _HDecLayer(tensorplay.nn.Module):
     r"""Decoder layer. This used both by the time and the frequency branches.
     Args:
         chin (int): number of input channels.
@@ -249,15 +249,15 @@ class _HDecLayer(torch.nn.Module):
             self.rewrite = klass(chin, 2 * chin, 1 + 2 * context, 1, context)
             self.norm1 = norm_fn(2 * chin)
 
-    def forward(self, x: torch.Tensor, skip: Optional[torch.Tensor], length):
+    def forward(self, x: tensorplay.Tensor, skip: Optional[tensorplay.Tensor], length):
         r"""Forward pass for decoding layer.
 
         Size depends on whether frequency or time
 
         Args:
-            x (torch.Tensor): tensor input of shape `(B, C, F, T)` for frequency and shape
+            x (tensorplay.Tensor): tensor input of shape `(B, C, F, T)` for frequency and shape
                 `(B, C, T)` for time
-            skip (torch.Tensor, optional): on first layer, separate frequency and time branches using param
+            skip (tensorplay.Tensor, optional): on first layer, separate frequency and time branches using param
                 (default: ``None``)
             length (int): Size of tensor for output
 
@@ -298,12 +298,12 @@ class _HDecLayer(torch.nn.Module):
         return z, y
 
 
-class HDemucs(torch.nn.Module):
+class HDemucs(tensorplay.nn.Module):
     r"""Hybrid Demucs model from
     *Hybrid Spectrogram and Waveform Source Separation* :cite:`defossez2021hybrid`.
 
     See Also:
-        * :class:`torchaudio.pipelines.SourceSeparationBundle`: Source separation pipeline with pre-trained models.
+        * :class:`tensorplay.audio.pipelines.SourceSeparationBundle`: Source separation pipeline with pre-trained models.
 
     Args:
         sources (List[str]): list of source names. List can contain the following source
@@ -496,7 +496,7 @@ class HDemucs(torch.nn.Module):
         x = x[..., pad : pad + length]
         return x
 
-    def _pad1d(self, x: torch.Tensor, padding_left: int, padding_right: int, mode: str = "zero", value: float = 0.0):
+    def _pad1d(self, x: tensorplay.Tensor, padding_left: int, padding_right: int, mode: str = "zero", value: float = 0.0):
         """Wrapper around F.pad, in order for reflect padding when num_frames is shorter than max_pad.
         Add extra zero padding around in order for padding to not break."""
         length = x.shape[-1]
@@ -509,7 +509,7 @@ class HDemucs(torch.nn.Module):
     def _magnitude(self, z):
         # move the complex dimension to the channel one.
         B, C, Fr, T = z.shape
-        m = torch.view_as_real(z).permute(0, 1, 4, 2, 3)
+        m = tensorplay.view_as_real(z).permute(0, 1, 4, 2, 3)
         m = m.reshape(B, C * 2, Fr, T)
         return m
 
@@ -517,15 +517,15 @@ class HDemucs(torch.nn.Module):
         # `m` is a full spectrogram and `z` is ignored.
         B, S, C, Fr, T = m.shape
         out = m.view(B, S, -1, 2, Fr, T).permute(0, 1, 2, 4, 5, 3)
-        out = torch.view_as_complex(out.contiguous())
+        out = tensorplay.view_as_complex(out.contiguous())
         return out
 
-    def forward(self, input: torch.Tensor):
+    def forward(self, input: tensorplay.Tensor):
 
         r"""HDemucs forward call
 
         Args:
-            input (torch.Tensor): input mixed tensor of shape `(batch_size, channel, num_frames)`
+            input (tensorplay.Tensor): input mixed tensor of shape `(batch_size, channel, num_frames)`
 
         Returns:
             Tensor
@@ -586,14 +586,14 @@ class HDemucs(torch.nn.Module):
             if idx == 0 and self.freq_emb is not None:
                 # add frequency embedding to allow for non equivariant convolutions
                 # over the frequency axis.
-                frs = torch.arange(x.shape[-2], device=x.device)
+                frs = tensorplay.arange(x.shape[-2], device=x.device)
                 emb = self.freq_emb(frs).t()[None, :, :, None].expand_as(x)
                 x = x + self.freq_emb_scale * emb
 
             saved.append(x)
 
-        x = torch.zeros_like(x)
-        xt = torch.zeros_like(x)
+        x = tensorplay.zeros_like(x)
+        xt = tensorplay.zeros_like(x)
         # initialize everything to zero (signal will go through u-net skips).
 
         for idx, decode in enumerate(self.freq_decoder):
@@ -634,7 +634,7 @@ class HDemucs(torch.nn.Module):
         return x
 
 
-class _DConv(torch.nn.Module):
+class _DConv(tensorplay.nn.Module):
     r"""
     New residual branches in each encoder layer.
     This alternates dilated convolutions, potentially with LSTMs and attention.
@@ -710,7 +710,7 @@ class _DConv(torch.nn.Module):
         r"""DConv forward call
 
         Args:
-            x (torch.Tensor): input tensor for convolution
+            x (tensorplay.Tensor): input tensor for convolution
 
         Returns:
             Tensor
@@ -721,7 +721,7 @@ class _DConv(torch.nn.Module):
         return x
 
 
-class _BLSTM(torch.nn.Module):
+class _BLSTM(tensorplay.nn.Module):
     r"""
     BiLSTM with same hidden units as input dim.
     If `max_steps` is not None, input will be splitting in overlapping
@@ -739,11 +739,11 @@ class _BLSTM(torch.nn.Module):
         self.linear = nn.Linear(2 * dim, dim)
         self.skip = skip
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: tensorplay.Tensor) -> tensorplay.Tensor:
         r"""BLSTM forward call
 
         Args:
-            x (torch.Tensor): input tensor for BLSTM shape is `(batch_size, dim, time_steps)`
+            x (tensorplay.Tensor): input tensor for BLSTM shape is `(batch_size, dim, time_steps)`
 
         Returns:
             Tensor
@@ -779,7 +779,7 @@ class _BLSTM(torch.nn.Module):
                     out.append(frames[:, k, :, limit:])
                 else:
                     out.append(frames[:, k, :, limit:-limit])
-            out = torch.cat(out, -1)
+            out = tensorplay.cat(out, -1)
             out = out[..., :T]
             x = out
         if self.skip:
@@ -819,11 +819,11 @@ class _LocalState(nn.Module):
             self.query_decay.bias.data[:] = -2
         self.proj = nn.Conv1d(channels + heads * 0, channels, 1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: tensorplay.Tensor) -> tensorplay.Tensor:
         r"""LocalState forward call
 
         Args:
-            x (torch.Tensor): input tensor for LocalState
+            x (tensorplay.Tensor): input tensor for LocalState
 
         Returns:
             Tensor
@@ -831,28 +831,28 @@ class _LocalState(nn.Module):
         """
         B, C, T = x.shape
         heads = self.heads
-        indexes = torch.arange(T, device=x.device, dtype=x.dtype)
+        indexes = tensorplay.arange(T, device=x.device, dtype=x.dtype)
         # left index are keys, right index are queries
         delta = indexes[:, None] - indexes[None, :]
 
         queries = self.query(x).view(B, heads, -1, T)
         keys = self.key(x).view(B, heads, -1, T)
         # t are keys, s are queries
-        dots = torch.einsum("bhct,bhcs->bhts", keys, queries)
+        dots = tensorplay.einsum("bhct,bhcs->bhts", keys, queries)
         dots /= math.sqrt(keys.shape[2])
         if self.ndecay:
-            decays = torch.arange(1, self.ndecay + 1, device=x.device, dtype=x.dtype)
+            decays = tensorplay.arange(1, self.ndecay + 1, device=x.device, dtype=x.dtype)
             decay_q = self.query_decay(x).view(B, heads, -1, T)
-            decay_q = torch.sigmoid(decay_q) / 2
+            decay_q = tensorplay.sigmoid(decay_q) / 2
             decay_kernel = -decays.view(-1, 1, 1) * delta.abs() / math.sqrt(self.ndecay)
-            dots += torch.einsum("fts,bhfs->bhts", decay_kernel, decay_q)
+            dots += tensorplay.einsum("fts,bhfs->bhts", decay_kernel, decay_q)
 
         # Kill self reference.
-        dots.masked_fill_(torch.eye(T, device=dots.device, dtype=torch.bool), -100)
-        weights = torch.softmax(dots, dim=2)
+        dots.masked_fill_(tensorplay.eye(T, device=dots.device, dtype=tensorplay.bool), -100)
+        weights = tensorplay.softmax(dots, dim=2)
 
         content = self.content(x).view(B, heads, -1, T)
-        result = torch.einsum("bhts,bhct->bhcs", weights, content)
+        result = tensorplay.einsum("bhts,bhct->bhcs", weights, content)
         result = result.reshape(B, -1, T)
         return x + self.proj(result)
 
@@ -869,14 +869,14 @@ class _LayerScale(nn.Module):
             init (float, optional): Scale to default to (default: 0)
         """
         super().__init__()
-        self.scale = nn.Parameter(torch.zeros(channels, requires_grad=True))
+        self.scale = nn.Parameter(tensorplay.zeros(channels, requires_grad=True))
         self.scale.data[:] = init
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: tensorplay.Tensor) -> tensorplay.Tensor:
         r"""LayerScale forward call
 
         Args:
-            x (torch.Tensor): input tensor for LayerScale
+            x (tensorplay.Tensor): input tensor for LayerScale
 
         Returns:
             Tensor
@@ -885,11 +885,11 @@ class _LayerScale(nn.Module):
         return self.scale[:, None] * x
 
 
-def _unfold(a: torch.Tensor, kernel_size: int, stride: int) -> torch.Tensor:
+def _unfold(a: tensorplay.Tensor, kernel_size: int, stride: int) -> tensorplay.Tensor:
     """Given input of size [*OT, T], output Tensor of size [*OT, F, K]
     with K the kernel size, by extracting frames with the given stride.
     This will pad the input so that `F = ceil(T / K)`.
-    see https://github.com/pytorch/pytorch/issues/60466
+    see https://github.com/tensorplay/tensorplay/issues/60466
     """
     shape = list(a.shape[:-1])
     length = int(a.shape[-1])
@@ -918,15 +918,15 @@ def _rescale_module(module):
                 sub.bias.data /= scale
 
 
-def _spectro(x: torch.Tensor, n_fft: int = 512, hop_length: int = 0, pad: int = 0) -> torch.Tensor:
+def _spectro(x: tensorplay.Tensor, n_fft: int = 512, hop_length: int = 0, pad: int = 0) -> tensorplay.Tensor:
     other = list(x.shape[:-1])
     length = int(x.shape[-1])
     x = x.reshape(-1, length)
-    z = torch.stft(
+    z = tensorplay.stft(
         x,
         n_fft * (1 + pad),
         hop_length,
-        window=torch.hann_window(n_fft).to(x),
+        window=tensorplay.hann_window(n_fft).to(x),
         win_length=n_fft,
         normalized=True,
         center=True,
@@ -938,7 +938,7 @@ def _spectro(x: torch.Tensor, n_fft: int = 512, hop_length: int = 0, pad: int = 
     return z.view(other)
 
 
-def _ispectro(z: torch.Tensor, hop_length: int = 0, length: int = 0, pad: int = 0) -> torch.Tensor:
+def _ispectro(z: tensorplay.Tensor, hop_length: int = 0, length: int = 0, pad: int = 0) -> tensorplay.Tensor:
     other = list(z.shape[:-2])
     freqs = int(z.shape[-2])
     frames = int(z.shape[-1])
@@ -946,11 +946,11 @@ def _ispectro(z: torch.Tensor, hop_length: int = 0, length: int = 0, pad: int = 
     n_fft = 2 * freqs - 2
     z = z.view(-1, freqs, frames)
     win_length = n_fft // (1 + pad)
-    x = torch.istft(
+    x = tensorplay.istft(
         z,
         n_fft,
         hop_length,
-        window=torch.hann_window(win_length).to(z.real),
+        window=tensorplay.hann_window(win_length).to(z.real),
         win_length=win_length,
         normalized=True,
         length=length,

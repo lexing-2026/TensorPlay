@@ -74,6 +74,11 @@ inline bool is_leaf(const Tensor& t) {
     return grad_fn(t) == nullptr;
 }
 
+// Torch parity (torch/csrc/autograd/VariableTypeUtils.h can_mutate_inplace):
+// true when `t` is a differentiable view whose base chain ends at a leaf
+// (its grad_fn chain walks through view nodes down to an AccumulateGrad).
+TENSORPLAY_API bool is_view_of_leaf(const Tensor& t);
+
 } // namespace impl
 
 // Helper to collect next edges for autograd

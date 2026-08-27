@@ -20,6 +20,12 @@ namespace cpu {
 static DType result_type_with_scalar(const Tensor& t, const Scalar& s) {
     DType td = t.dtype();
     if (s.dtype() == DType::Bool) return td;
+    if (isComplexType(s.dtype())) {
+        // ATen weak-scalar rule: int tensors compare as complex64,
+        // float64 widens to complex128.
+        if (isFloatingOrComplexType(td)) return td;
+        return promoteTypes(td, DType::ComplexFloat);
+    }
     if (isFloatingType(s.dtype())) {
         if (isFloatingType(td)) return td;   // half/bf16 stay reduced
         return DType::Float32;
@@ -28,50 +34,62 @@ static DType result_type_with_scalar(const Tensor& t, const Scalar& s) {
     return td;
 }
 
-// Helper for comparison ops
-template<typename Op>
+// Helper for comparison ops.
+// kEquality=false: ordering ops (lt/le/gt/ge) -- undefined over complex in
+// torch, so complex inputs raise NotImplementedError before instantiation
+// (std::complex has no operator<).
+// kEquality=true: eq/ne -- component-wise over complex, per torch.
+template<bool kEquality, typename Op>
 Tensor comparison_kernel_impl(const Tensor& self, const Tensor& other, Op op) {
     std::vector<int64_t> out_shape = broadcast_shapes(static_cast<std::vector<int64_t>>(self.shape()), static_cast<std::vector<int64_t>>(other.shape()));
-    
+
     // Result is always Bool
     Tensor result = Tensor::empty(out_shape, DType::Bool, self.device());
-    
-    // For comparison, we usually don't promote types to a common type for the operation, 
+
+    // For comparison, we usually don't promote types to a common type for the operation,
     // but C++ requires it. PyTorch promotes to common type before comparison.
     DType common_dtype = promoteTypes(self.dtype(), other.dtype());
-    
+
+    if (!kEquality && isComplexType(common_dtype)) {
+        TP_THROW(NotImplementedError, "comparison not implemented for '", toString(common_dtype), "'");
+    }
+
     Tensor self_casted = (self.dtype() == common_dtype) ? self : self.to(common_dtype);
     Tensor other_casted = (other.dtype() == common_dtype) ? other : other.to(common_dtype);
 
     // TensorIterator owns broadcast/reorder/coalesce/parallelism; no
     // materialized expansion needed.
-    ti_apply_compare(result, self_casted, other_casted, common_dtype, op);
-    
+    if constexpr (kEquality) {
+        ti_apply_equality(result, self_casted, other_casted, common_dtype, op);
+    } else {
+        ti_apply_compare(result, self_casted, other_casted, common_dtype, op);
+    }
+
     return result;
 }
 
 Tensor eq_tensor_kernel(const Tensor& self, const Tensor& other) {
-    return comparison_kernel_impl(self, other, [](auto a, auto b) { return a == b; });
+    return comparison_kernel_impl<true>(self, other, [](auto a, auto b) { return a == b; });
 }
 
 Tensor ne_tensor_kernel(const Tensor& self, const Tensor& other) {
-    return comparison_kernel_impl(self, other, [](auto a, auto b) { return a != b; });
+    return comparison_kernel_impl<true>(self, other, [](auto a, auto b) { return a != b; });
 }
 
 Tensor lt_tensor_kernel(const Tensor& self, const Tensor& other) {
-    return comparison_kernel_impl(self, other, [](auto a, auto b) { return a < b; });
+    return comparison_kernel_impl<false>(self, other, [](auto a, auto b) { return a < b; });
 }
 
 Tensor le_tensor_kernel(const Tensor& self, const Tensor& other) {
-    return comparison_kernel_impl(self, other, [](auto a, auto b) { return a <= b; });
+    return comparison_kernel_impl<false>(self, other, [](auto a, auto b) { return a <= b; });
 }
 
 Tensor gt_tensor_kernel(const Tensor& self, const Tensor& other) {
-    return comparison_kernel_impl(self, other, [](auto a, auto b) { return a > b; });
+    return comparison_kernel_impl<false>(self, other, [](auto a, auto b) { return a > b; });
 }
 
 Tensor ge_tensor_kernel(const Tensor& self, const Tensor& other) {
-    return comparison_kernel_impl(self, other, [](auto a, auto b) { return a >= b; });
+    return comparison_kernel_impl<false>(self, other, [](auto a, auto b) { return a >= b; });
 }
 
 // Scalar versions: promote the scalar with weak-scalar rules instead of

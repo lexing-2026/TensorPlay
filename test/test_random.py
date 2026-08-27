@@ -266,18 +266,20 @@ class TestTorchParity(unittest.TestCase):
 
     def test_rng_state_cross_compatible(self):
         # A state saved by tensorplay must load into torch and continue its
-        # sequence (both use the same 5056-byte POD layout).
+        # sequence (both use the same 5056-byte POD layout).  The state must
+        # be captured BEFORE drawing the reference sequence.
         tp.manual_seed(SEED)
-        expected = tp.rand([8]).tolist()
         state = tp.get_rng_state()
+        expected = tp.rand([8]).tolist()
         gen = torch.Generator()
-        gen.set_state(state.numpy().tobytes() if hasattr(state, 'numpy') else bytes(state))
+        raw = state.numpy().tobytes()
+        gen.set_state(torch.frombuffer(bytearray(raw), dtype=torch.uint8))
         actual = torch.rand(8, generator=gen).tolist()
         self.assertEqual(expected, actual)
 
     def test_randn_half_bfloat16_parity(self):
-        # Half/BFloat16 sample in float precision and cast down; identical
-        # consumption to the float32 path.
+        # Native CPU Half/BFloat16 path uses storage-dtype uniforms and
+        # storage-dtype Box-Muller math, with the same raw stream as torch.
         self._tp_torch(lambda: tp.randn([1024], dtype=tp.float16),
                        lambda: torch.randn(1024, dtype=torch.float16))
         self._tp_torch(lambda: tp.randn([1024], dtype=tp.bfloat16),
@@ -297,9 +299,11 @@ class TestTorchParity(unittest.TestCase):
         self._tp_torch(tp_fn, th_fn)
 
     def test_random_wide_int_parity(self):
+        # NOTE: torch 2.x rejects random_ on bool tensors ("to - 1 is out of
+        # bounds for bool"), so bool cannot be parity-checked here.
         for tp_dt, th_dt in [(tp.int8, torch.int8), (tp.uint8, torch.uint8),
                              (tp.int16, torch.int16), (tp.uint16, torch.uint16),
-                             (tp.uint32, torch.uint32), (tp.bool, torch.bool)]:
+                             (tp.uint32, torch.uint32)]:
             with self.subTest(dtype=th_dt):
                 def tp_fn(dt=tp_dt):
                     t = tp.empty([100], dtype=dt)

@@ -1,10 +1,10 @@
-"""Import fariseq's wav2vec2.0 pretrained weights to torchaudios's format.
+"""Import fariseq's wav2vec2.0 pretrained weights to tensorplay.audios's format.
 
 For this module to work, you need `fairseq`.
 """
 import re
 
-from torch.nn import Module
+from tensorplay.nn import Module
 
 from ..model import wav2vec2_model, Wav2Vec2Model
 
@@ -126,10 +126,10 @@ def _convert_state_dict(state_dict):
 
 def import_fairseq_model(original: Module) -> Wav2Vec2Model:
     """Builds :class:`Wav2Vec2Model` from the corresponding model object of
-    `fairseq <https://github.com/pytorch/fairseq>`_.
+    `fairseq <https://github.com/tensorplay/fairseq>`_.
 
     Args:
-        original (torch.nn.Module):
+        original (tensorplay.nn.Module):
             An instance of fairseq's Wav2Vec2.0 or HuBERT model.
             One of ``fairseq.models.wav2vec.wav2vec2_asr.Wav2VecEncoder``,
             ``fairseq.models.wav2vec.wav2vec2.Wav2Vec2Model`` or
@@ -139,7 +139,7 @@ def import_fairseq_model(original: Module) -> Wav2Vec2Model:
         Wav2Vec2Model: Imported model.
 
     Example - Loading pretrain-only model
-        >>> from torchaudio.models.wav2vec2.utils import import_fairseq_model
+        >>> from tensorplay.audio.models.wav2vec2.utils import import_fairseq_model
         >>>
         >>> # Load model using fairseq
         >>> model_file = 'wav2vec_small.pt'
@@ -148,15 +148,15 @@ def import_fairseq_model(original: Module) -> Wav2Vec2Model:
         >>> imported = import_fairseq_model(original)
         >>>
         >>> # Perform feature extraction
-        >>> waveform, _ = torchaudio.load('audio.wav')
+        >>> waveform, _ = tensorplay.audio.load('audio.wav')
         >>> features, _ = imported.extract_features(waveform)
         >>>
         >>> # Compare result with the original model from fairseq
         >>> reference = original.feature_extractor(waveform).transpose(1, 2)
-        >>> torch.testing.assert_allclose(features, reference)
+        >>> tensorplay.testing.assert_allclose(features, reference)
 
     Example - Fine-tuned model
-        >>> from torchaudio.models.wav2vec2.utils import import_fairseq_model
+        >>> from tensorplay.audio.models.wav2vec2.utils import import_fairseq_model
         >>>
         >>> # Load model using fairseq
         >>> model_file = 'wav2vec_small_960h.pt'
@@ -165,13 +165,13 @@ def import_fairseq_model(original: Module) -> Wav2Vec2Model:
         >>> imported = import_fairseq_model(original.w2v_encoder)
         >>>
         >>> # Perform encoding
-        >>> waveform, _ = torchaudio.load('audio.wav')
+        >>> waveform, _ = tensorplay.audio.load('audio.wav')
         >>> emission, _ = imported(waveform)
         >>>
         >>> # Compare result with the original model from fairseq
-        >>> mask = torch.zeros_like(waveform)
+        >>> mask = tensorplay.zeros_like(waveform)
         >>> reference = original(waveform, mask)['encoder_out'].transpose(0, 1)
-        >>> torch.testing.assert_allclose(emission, reference)
+        >>> tensorplay.testing.assert_allclose(emission, reference)
     """
     class_ = original.__class__.__name__
     if class_ == "Wav2Vec2Model":

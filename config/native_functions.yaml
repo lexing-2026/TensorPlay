@@ -266,17 +266,17 @@
 # Torch's fused optimizer entry points.  The underscore is part of the
 # operator name: these mutate every tensor list in one backend launch and
 # return void, just like ATen's fused kernels.
-- func: _fused_adam_(Tensor(a!)[] self, Tensor(b!)[] grads, Tensor(c!)[] exp_avgs, Tensor(d!)[] exp_avg_sqs, Tensor(e!)[] max_exp_avg_sqs, Tensor[] state_steps, *, float lr, float beta1, float beta2, float weight_decay, float eps, bool amsgrad, bool maximize, Tensor? grad_scale=None, Tensor? found_inf=None) -> ()
+- func: _fused_adam_(Tensor(a!)[] self, Tensor(b!)[] grads, Tensor(c!)[] exp_avgs, Tensor(d!)[] exp_avg_sqs, Tensor(e!)[] max_exp_avg_sqs, Tensor[] state_steps, *, float lr, float beta1, float beta2, float weight_decay, float eps, bool amsgrad, bool maximize, Tensor? grad_scale=None, Tensor? found_inf=None, bool exact=False) -> ()
   variants: function
   dispatch: {CPU: fused_adam_cpu, CUDA: fused_adam_cuda}
-- func: _fused_adam_.tensor_lr(Tensor(a!)[] self, Tensor(b!)[] grads, Tensor(c!)[] exp_avgs, Tensor(d!)[] exp_avg_sqs, Tensor(e!)[] max_exp_avg_sqs, Tensor[] state_steps, *, Tensor lr, float beta1, float beta2, float weight_decay, float eps, bool amsgrad, bool maximize, Tensor? grad_scale=None, Tensor? found_inf=None) -> ()
+- func: _fused_adam_.tensor_lr(Tensor(a!)[] self, Tensor(b!)[] grads, Tensor(c!)[] exp_avgs, Tensor(d!)[] exp_avg_sqs, Tensor(e!)[] max_exp_avg_sqs, Tensor[] state_steps, *, Tensor lr, float beta1, float beta2, float weight_decay, float eps, bool amsgrad, bool maximize, Tensor? grad_scale=None, Tensor? found_inf=None, bool exact=False) -> ()
   variants: function
   device_check: NoCheck
   dispatch: {CPU: fused_adam_tensor_lr_cpu, CUDA: fused_adam_tensor_lr_cuda}
-- func: _fused_adamw_(Tensor(a!)[] self, Tensor(b!)[] grads, Tensor(c!)[] exp_avgs, Tensor(d!)[] exp_avg_sqs, Tensor(e!)[] max_exp_avg_sqs, Tensor[] state_steps, *, float lr, float beta1, float beta2, float weight_decay, float eps, bool amsgrad, bool maximize, Tensor? grad_scale=None, Tensor? found_inf=None) -> ()
+- func: _fused_adamw_(Tensor(a!)[] self, Tensor(b!)[] grads, Tensor(c!)[] exp_avgs, Tensor(d!)[] exp_avg_sqs, Tensor(e!)[] max_exp_avg_sqs, Tensor[] state_steps, *, float lr, float beta1, float beta2, float weight_decay, float eps, bool amsgrad, bool maximize, Tensor? grad_scale=None, Tensor? found_inf=None, bool exact=False) -> ()
   variants: function
   dispatch: {CPU: fused_adamw_cpu, CUDA: fused_adamw_cuda}
-- func: _fused_adamw_.tensor_lr(Tensor(a!)[] self, Tensor(b!)[] grads, Tensor(c!)[] exp_avgs, Tensor(d!)[] exp_avg_sqs, Tensor(e!)[] max_exp_avg_sqs, Tensor[] state_steps, *, Tensor lr, float beta1, float beta2, float weight_decay, float eps, bool amsgrad, bool maximize, Tensor? grad_scale=None, Tensor? found_inf=None) -> ()
+- func: _fused_adamw_.tensor_lr(Tensor(a!)[] self, Tensor(b!)[] grads, Tensor(c!)[] exp_avgs, Tensor(d!)[] exp_avg_sqs, Tensor(e!)[] max_exp_avg_sqs, Tensor[] state_steps, *, Tensor lr, float beta1, float beta2, float weight_decay, float eps, bool amsgrad, bool maximize, Tensor? grad_scale=None, Tensor? found_inf=None, bool exact=False) -> ()
   variants: function
   device_check: NoCheck
   dispatch: {CPU: fused_adamw_tensor_lr_cpu, CUDA: fused_adamw_tensor_lr_cuda}
@@ -294,6 +294,48 @@
   variants: function
   device_check: NoCheck
   dispatch: {CPU: fused_adagrad_tensor_lr_cpu, CUDA: fused_adagrad_tensor_lr_cuda}
+
+# Native CPU algorithm kernels for optimizers whose Torch implementation is
+# composed from many foreach calls.  Python keeps the existing foreach/single
+# paths for unsupported layouts, CUDA graph capture, complex tensors, and
+# differentiable mode; contiguous CPU floating groups take one backend call
+# and one horizontal parallel schedule.
+- func: _fused_rmsprop_(Tensor(a!)[] self, Tensor[] grads, Tensor(b!)[] square_avgs, Tensor(c!)[] grad_avgs, Tensor(d!)[] momentum_buffer_list, Tensor(e!)[] state_steps, *, float lr, float alpha, float eps, float weight_decay, float momentum, bool centered, bool maximize) -> ()
+  variants: function
+  device_check: NoCheck
+  dispatch: {CPU: fused_rmsprop_cpu, CUDA: fused_rmsprop_cuda}
+- func: _fused_adadelta_(Tensor(a!)[] self, Tensor[] grads, Tensor(b!)[] square_avgs, Tensor(c!)[] acc_deltas, Tensor[] state_steps, *, float lr, float rho, float eps, float weight_decay, bool maximize) -> ()
+  variants: function
+  device_check: NoCheck
+  dispatch: {CPU: fused_adadelta_cpu, CUDA: fused_adadelta_cuda}
+- func: _fused_adamax_(Tensor(a!)[] self, Tensor[] grads, Tensor(b!)[] exp_avgs, Tensor(c!)[] exp_infs, Tensor[] state_steps, *, float lr, float beta1, float beta2, float eps, float weight_decay, bool maximize) -> ()
+  variants: function
+  device_check: NoCheck
+  dispatch: {CPU: fused_adamax_cpu, CUDA: fused_adamax_cuda}
+- func: _fused_asgd_(Tensor(a!)[] self, Tensor[] grads, Tensor(b!)[] axs, Tensor(c!)[] mus, Tensor(d!)[] etas, Tensor[] state_steps, *, float lr, float lambd, float t0, float alpha, float weight_decay, bool maximize) -> ()
+  variants: function
+  device_check: NoCheck
+  dispatch: {CPU: fused_asgd_cpu, CUDA: fused_asgd_cuda}
+- func: _fused_rprop_(Tensor(a!)[] self, Tensor[] grads, Tensor(b!)[] prevs, Tensor(c!)[] step_sizes, Tensor[] state_steps, *, float step_size_min, float step_size_max, float etaminus, float etaplus, bool maximize) -> ()
+  variants: function
+  device_check: NoCheck
+  dispatch: {CPU: fused_rprop_cpu, CUDA: fused_rprop_cuda}
+- func: _fused_nadam_(Tensor(a!)[] self, Tensor[] grads, Tensor(b!)[] exp_avgs, Tensor(c!)[] exp_avg_sqs, Tensor(d!)[] mu_products, Tensor[] state_steps, *, float lr, float beta1, float beta2, float eps, float weight_decay, float momentum_decay, bool decoupled_weight_decay, bool maximize) -> ()
+  variants: function
+  device_check: NoCheck
+  dispatch: {CPU: fused_nadam_cpu, CUDA: fused_nadam_cuda}
+- func: _fused_radam_(Tensor(a!)[] self, Tensor[] grads, Tensor(b!)[] exp_avgs, Tensor(c!)[] exp_avg_sqs, Tensor[] state_steps, *, float lr, float beta1, float beta2, float eps, float weight_decay, bool decoupled_weight_decay, bool maximize) -> ()
+  variants: function
+  device_check: NoCheck
+  dispatch: {CPU: fused_radam_cpu, CUDA: fused_radam_cuda}
+- func: _fused_adafactor_(Tensor(a!)[] self, Tensor[] grads, Tensor(b!)[] variances, Tensor[] state_steps, *, float lr, float beta2_decay, float eps1, float eps2, float d, float weight_decay, bool maximize) -> ()
+  variants: function
+  device_check: NoCheck
+  dispatch: {CPU: fused_adafactor_cpu, CUDA: fused_adafactor_cuda}
+- func: _fused_adafactor_factored_(Tensor(a!)[] self, Tensor[] grads, Tensor(b!)[] row_vars, Tensor(c!)[] col_vars, Tensor[] state_steps, *, float lr, float beta2_decay, float eps1, float eps2, float d, float weight_decay, bool maximize) -> ()
+  variants: function
+  device_check: NoCheck
+  dispatch: {CPU: fused_adafactor_factored_cpu, CUDA: fused_adafactor_factored_cuda}
 
 # Public Torch foreach primitives.  The optimizer fast paths above are fused
 # algorithm kernels; these schemas cover the list-wise arithmetic building
@@ -673,12 +715,12 @@
 # are metadata-only views: the backend must preserve storage and the shared
 # version counter rather than materializing a copy.
 - func: view_as_real(Tensor self) -> Tensor
-  variants: function
+  variants: function, method
   dispatch:
     CPU: view_as_real_cpu
 
 - func: view_as_complex(Tensor self) -> Tensor
-  variants: function
+  variants: function, method
   dispatch:
     CPU: view_as_complex_cpu
 
@@ -764,8 +806,10 @@
 
 # CompositeImplicitAutograd like torch: the kernel is expressed through
 # differentiable primitives, so autograd is derived from the inner calls.
-# The Python layer mirrors torch.functional.einsum (sublist parsing and the
-# optional opt-einsum contraction path).
+# The Python layer mirrors torch.functional.einsum (sublist parsing); with
+# no explicit path and >2 operands the kernel plans the contraction order
+# natively (exact search for small counts, greedy beyond) -- torch instead
+# depends on the optional opt-einsum package or degrades to left-to-right.
 - func: einsum(str equation, Tensor[] operands, int[] path=[]) -> Tensor
   python_defaults: {path: '[]'}
   variants: function
@@ -1051,6 +1095,111 @@
     CPU: feature_dropout_backward_cpu
     CUDA: feature_dropout_backward_cuda
 
+# Quantile family (ATen native/Sorting.cpp quantile_impl): device-generic
+# composite over sort/gather/lerp -- upstream's CPU nth_element fast path is
+# a pure optimization and the sort path is semantically identical, so one
+# body serves both dense backends (Einsum.cpp registration precedent).
+# No derivatives.yaml entry upstream: torch.quantile is non-differentiable.
+- func: quantile(Tensor self, Tensor q, int? dim=None, bool keepdim=False, *, str interpolation="linear") -> Tensor
+  variants: function
+  dispatch:
+    CPU: quantile_kernel
+
+- func: nanquantile(Tensor self, Tensor q, int? dim=None, bool keepdim=False, *, str interpolation="linear") -> Tensor
+  variants: function
+  dispatch:
+    CPU: nanquantile_kernel
+
+# Histogram (ATen native/Histogram.cpp + cpu/HistogramKernel.cpp): returns
+# (hist, bin_edges) in the input dtype.  The per-element bin mapping for both
+# the bins-tensor path (BINARY_SEARCH) and the linspace-edges path
+# (LINEAR_INTERPOLATION_WITH_LOCAL_SEARCH, documented upstream to match
+# BINARY_SEARCH exactly) is expressed with searchsorted over the edge tensor;
+# weight accumulation goes through the dispatched index_add, so the same body
+# registers for CPU and CUDA.
+- func: histogram.bins_tensor(Tensor self, Tensor bins, *, Tensor? weight=None, bool density=False) -> (Tensor hist, Tensor bin_edges)
+  variants: function
+  dispatch:
+    CPU: histogram_bins_tensor_kernel
+
+- func: histogram.bin_ct(Tensor self, int bins=100, *, float[]? range=None, Tensor? weight=None, bool density=False) -> (Tensor hist, Tensor bin_edges)
+  variants: function
+  dispatch:
+    CPU: histogram_bin_ct_kernel
+
+# Trapezoid integration (ATen native Sum.cpp trapezoid/cumulative_trapezoid):
+# forward is a weighted sum along `dim`; x=None selects uniform spacing dx.
+# Backward rebuilds the per-element weights from x / ysizes and reuses
+# dispatched arithmetic.
+- func: trapezoid(Tensor y, Tensor? x=None, *, Scalar dx=1, int dim=-1) -> Tensor
+  variants: function
+  dispatch:
+    CPU: trapezoid_cpu
+    CUDA: trapezoid_cuda
+
+- func: cumulative_trapezoid(Tensor y, Tensor? x=None, *, Scalar dx=1, int dim=-1) -> Tensor
+  variants: function
+  dispatch:
+    CPU: cumulative_trapezoid_cpu
+    CUDA: cumulative_trapezoid_cuda
+
+- func: _trapezoid_backward(Tensor grad, Tensor? x, int[] ysizes, Scalar dx, int dim) -> Tensor
+  variants: function
+  dispatch:
+    CPU: trapezoid_backward_cpu
+    CUDA: trapezoid_backward_cuda
+
+- func: _cumulative_trapezoid_backward(Tensor grad, Tensor? x, Scalar dx, int dim) -> Tensor
+  variants: function
+  dispatch:
+    CPU: cumulative_trapezoid_backward_cpu
+    CUDA: cumulative_trapezoid_backward_cuda
+
+# torch.gradient (ATen Gradient.cpp): upstream registers gradient.* with no
+# dispatch section, i.e. the default CompositeImplicitAutograd -- forward is a
+# pure composition of differentiable primitives (narrow/sub/mul/div/cat), no
+# derivatives.yaml entry exists and every returned tensor keeps the grad_fn
+# recorded by the inner calls (backward AND double-backward for free).  The
+# same composition lives in backend/cpu/GradientKernels.cpp registered once
+# under the backend-neutral Composite key; OperatorHandle::getKernel serves it
+# to every dense backend until overridden (p10/include/Dispatcher.h).
+# spacing/dim are non-optional lists on purpose: empty = "all dims with unit
+# step"; the Python wrapper (functional.gradient) normalizes torch's scalar /
+# tensor / tuple surface into these lists.
+- func: gradient(Tensor self, Tensor[] spacing=[], int[] dim=[], int edge_order=1) -> Tensor[]
+  variants: function
+  dispatch:
+    Composite: gradient_composite
+
+# Covariance / correlation (ATen native Correlation.cpp verbatim): each row
+# a variable, each column an observation; fweights are frequencies
+# (integral), aweights reliability weights (floating); arithmetic stays in
+# the input dtype. Backwards are explicit helpers — tp has no
+# composite-implicit-autograd, formulas validated vs torch autograd.
+- func: cov(Tensor self, *, int correction=1, Tensor? fweights=None, Tensor? aweights=None) -> Tensor
+  variants: function, method
+  dispatch:
+    CPU: cov_cpu
+    CUDA: cov_cuda
+
+- func: corrcoef(Tensor self) -> Tensor
+  variants: function, method
+  dispatch:
+    CPU: corrcoef_cpu
+    CUDA: corrcoef_cuda
+
+- func: _cov_backward(Tensor grad, Tensor self, int correction, Tensor? fweights, Tensor? aweights) -> Tensor
+  variants: function
+  dispatch:
+    CPU: cov_backward_cpu
+    CUDA: cov_backward_cuda
+
+- func: _corrcoef_backward(Tensor grad, Tensor self) -> Tensor
+  variants: function
+  dispatch:
+    CPU: corrcoef_backward_cpu
+    CUDA: corrcoef_backward_cuda
+
 # resize_ grows the storage in place when needed (preserving contents) and
 # adopts contiguous strides; shrinking is logical-only. Non-differentiable,
 # matching torch.
@@ -1083,6 +1232,7 @@
   variants: function, method
   dispatch:
     CPU: angle_kernel
+    CUDA: angle_kernel_cuda
 
 - func: asin(Tensor self) -> Tensor
   variants: function, method
@@ -1634,6 +1784,21 @@
   dispatch:
     CPU: nll_loss_backward_kernel
 
+# CTC loss native kernels (port of aten/src/ATen/native/LossCTC.cpp CPU).
+# Targets use the batch-first zero-padded layout (N, S); lengths are (N,)
+# int64 tensors. `_ctc_loss` returns the raw per-sequence NLL (impossible
+# alignments keep +inf; `zero_infinity` gates only the backward's grad
+# zeroing, mirroring ATen) together with the log-alpha table (N, T, 2S+1).
+- func: _ctc_loss(Tensor log_probs, Tensor targets, Tensor input_lengths, Tensor target_lengths, int blank=0, bool zero_infinity=False) -> (Tensor neg_log_likelihood, Tensor log_alpha)
+  variants: function
+  dispatch:
+    CPU: _ctc_loss_cpu
+
+- func: _ctc_loss_backward(Tensor grad, Tensor log_probs, Tensor targets, Tensor input_lengths, Tensor target_lengths, Tensor neg_log_likelihood, Tensor log_alpha, int blank, bool zero_infinity) -> Tensor
+  variants: function
+  dispatch:
+    CPU: _ctc_loss_backward_cpu
+
 - func: mse_loss(Tensor self, Tensor target, int reduction=1) -> Tensor
   variants: function
   dispatch:
@@ -1934,7 +2099,7 @@
     CPU: index_select_cpu
 
 - func: index_add(Tensor self, int dim, Tensor index, Tensor source) -> Tensor
-  variants: function
+  variants: function, method
   dispatch:
     CPU: index_add_cpu
 
@@ -1980,9 +2145,10 @@
     CPU: polar_cpu
 
 - func: real(Tensor self) -> Tensor
-  variants: function
+  variants: function, method
   dispatch:
     CPU: real_cpu
+    CUDA: real_cuda
 
 - func: diff(Tensor self, int n=1, int dim=-1, Tensor? prepend=None, Tensor? append=None) -> Tensor
   variants: function
@@ -2606,6 +2772,12 @@
   dispatch:
     CPU: conj_cpu
     CUDA: conj_cuda
+
+- func: adjoint(Tensor self) -> Tensor
+  variants: function, method
+  dispatch:
+    CPU: adjoint_cpu
+    CUDA: adjoint_cuda
 
 - func: imag(Tensor self) -> Tensor
   variants: function, method
@@ -3987,3 +4159,345 @@
   dispatch:
     CPU: tpsa_allclose
     CUDA: tpsa_allclose
+
+# scatter_reduce / index_reduce (ATen ScatterGatherKernel / TensorAdvanced
+# Indexing): fused reduce-scatter. Backward helpers mirror torch/csrc/autograd
+# FunctionsManual.cpp; index is non-differentiable.
+- func: scatter_reduce(Tensor self, int dim, Tensor index, Tensor src, str reduce, *, bool include_self=True) -> Tensor
+  variants: function, method
+  dispatch:
+    CPU: scatter_reduce_cpu
+    CUDA: scatter_reduce_cuda
+
+- func: index_reduce(Tensor self, int dim, Tensor index, Tensor source, str reduce, *, bool include_self=True) -> Tensor
+  variants: function, method
+  dispatch:
+    CPU: index_reduce_cpu
+    CUDA: index_reduce_cuda
+
+- func: _scatter_reduce_backward_self(Tensor grad, Tensor self, int dim, Tensor index, Tensor src, str reduce, bool include_self) -> Tensor
+  variants: function
+  dispatch:
+    CPU: scatter_reduce_backward_self_cpu
+    CUDA: scatter_reduce_backward_self_cuda
+
+- func: _scatter_reduce_backward_src(Tensor grad, Tensor self, int dim, Tensor index, Tensor src, str reduce, bool include_self) -> Tensor
+  variants: function
+  dispatch:
+    CPU: scatter_reduce_backward_src_cpu
+    CUDA: scatter_reduce_backward_src_cuda
+
+- func: _index_reduce_backward_self(Tensor grad, Tensor self, int dim, Tensor index, Tensor source, str reduce, bool include_self) -> Tensor
+  variants: function
+  dispatch:
+    CPU: index_reduce_backward_self_cpu
+    CUDA: index_reduce_backward_self_cuda
+
+- func: _index_reduce_backward_src(Tensor grad, Tensor self, int dim, Tensor index, Tensor source, str reduce, bool include_self) -> Tensor
+  variants: function
+  dispatch:
+    CPU: index_reduce_backward_src_cpu
+    CUDA: index_reduce_backward_src_cuda
+
+# MoE expert compute: ragged grouped GEMM (torch._grouped_mm 2D x 3D
+# semantics).  offs holds cumulative end offsets; the no-grad path is a
+# single dispatch wrapping per-group sgemm calls, GradMode falls back to
+# the differentiable narrow/mm/cat composite.
+- func: grouped_mm(Tensor self, Tensor mat2, Tensor offs) -> Tensor
+  variants: function
+  dispatch:
+    CPU: grouped_mm_cpu
+    CUDA: grouped_mm_cuda
+
+# rms_norm native: single fused kernel both devices (ATen composite semantics:
+# fp32 accumulation for reduced dtypes).  Replaces the 6-op python composite.
+- func: rms_norm(Tensor input, int[] normalized_shape, Tensor? weight=None, float? eps=None) -> Tensor
+  variants: function
+  dispatch:
+    CPU: rms_norm_cpu
+    CUDA: rms_norm_cuda
+
+# F.linear: fused CPU kernel (bias epilogue / nD flatten live in C++ next to
+# the seeded-GEMM addmm); other backends fall through to the composite.
+- func: linear(Tensor input, Tensor weight, Tensor? bias=None) -> Tensor
+  variants: function
+  dispatch:
+    CPU: linear_kernel
+    Composite: linear_composite
+
+# Decode-time LLM primitives.  These are inference-oriented native kernels:
+# `silu_mul` is the elementwise SwiGLU epilogue, while `fused_rope` rotates Q
+# and K in one launch.  `rotary_embedding` is the single-tensor form used by
+# callers that do not have a Q/K pair.  The tables use interleaved pairs
+# [x0, x1] and have shape [max_seq, head_dim / 2] (or [head_dim / 2]).
+- func: silu_mul(Tensor gate, Tensor up) -> Tensor
+  variants: function
+  dispatch:
+    CPU: silu_mul_cpu
+    CUDA: silu_mul_cuda
+
+- func: fused_swiglu(Tensor gate, Tensor up) -> Tensor
+  variants: function
+  dispatch:
+    CPU: fused_swiglu_cpu
+    CUDA: fused_swiglu_cuda
+
+# vLLM-style packed gate/up input: [..., 2 * intermediate] ->
+# [..., intermediate].  Keeping this adjacent to silu_mul makes the two
+# layouts explicit without asking callers to materialize split views.
+- func: silu_and_mul(Tensor input) -> Tensor
+  variants: function
+  dispatch:
+    CPU: silu_and_mul_cpu
+    CUDA: silu_and_mul_cuda
+
+- func: rotary_embedding(Tensor input, Tensor cos, Tensor sin, int position_offset=0) -> Tensor
+  variants: function
+  dispatch:
+    CPU: rotary_embedding_cpu
+    CUDA: rotary_embedding_cuda
+
+- func: fused_rope(Tensor query, Tensor key, Tensor cos, Tensor sin, int position_offset=0) -> (Tensor query_out, Tensor key_out)
+  variants: function
+  dispatch:
+    CPU: fused_rope_cpu
+    CUDA: fused_rope_cuda
+
+# ------------------------------------------------------------------
+# In-place family completion.  In-place counterparts (name + '_',
+# mutable self/return) of existing functional ops whose kernels both
+# backends already provide; argument schemas mirror the repo's own
+# functional entries so generated bindings type-check verbatim.
+# Deviations from upstream native_functions.yaml:
+#   - index_add_ has no `alpha` kwarg (repo index_add lacks it)
+#   - nan_to_num_ takes `Scalar nan=0.0`, logit_/nan_to_num_ use Scalar?
+#     not float?  (repo functional forms)
+# Kernels registered from backend InplaceCompletionKernels.{cpp,cu}.
+# ------------------------------------------------------------------
+- func: acos_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: acosh_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: addbmm_(Tensor(a!) self, Tensor batch1, Tensor batch2, *, Scalar beta=1, Scalar alpha=1) -> Tensor(a!)
+  variants: function, method
+
+- func: addmm_(Tensor(a!) self, Tensor mat1, Tensor mat2, *, Scalar beta=1, Scalar alpha=1) -> Tensor(a!)
+  variants: function, method
+
+- func: addmv_(Tensor(a!) self, Tensor mat, Tensor vec, *, Scalar beta=1, Scalar alpha=1) -> Tensor(a!)
+  variants: function, method
+
+- func: addr_(Tensor(a!) self, Tensor vec1, Tensor vec2, *, Scalar beta=1, Scalar alpha=1) -> Tensor(a!)
+  variants: function, method
+
+- func: asin_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: asinh_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: atan2_(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  variants: function, method
+
+- func: atan_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: atanh_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: bitwise_not_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: ceil_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: celu_(Tensor(a!) self, Scalar alpha=1.0) -> Tensor(a!)
+  variants: function, method
+
+- func: clip_(Tensor(a!) self, Scalar? min=None, Scalar? max=None) -> Tensor(a!)
+  variants: function, method
+
+- func: cos_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: cosh_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: cumprod_(Tensor(a!) self, int dim, ScalarType? dtype=None) -> Tensor(a!)
+  variants: function, method
+
+- func: cumsum_(Tensor(a!) self, int dim=0, ScalarType? dtype=None) -> Tensor(a!)
+  variants: function, method
+
+- func: deg2rad_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: elu_(Tensor(a!) self, Scalar alpha=1, Scalar scale=1, Scalar input_scale=1) -> Tensor(a!)
+  variants: function, method
+
+- func: erf_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: erfc_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: erfinv_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: exp2_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: exp_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: expm1_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: floor_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: frac_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: gcd_(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  variants: function, method
+
+- func: gelu_(Tensor(a!) self, str approximate="none") -> Tensor(a!)
+  variants: function, method
+
+- func: hardsigmoid_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: hardswish_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: hardtanh_(Tensor(a!) self, Scalar min_val=-1, Scalar max_val=1) -> Tensor(a!)
+  variants: function, method
+
+- func: heaviside_(Tensor(a!) self, Tensor values) -> Tensor(a!)
+  variants: function, method
+
+- func: hypot_(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  variants: function, method
+
+- func: index_add_(Tensor(a!) self, int dim, Tensor index, Tensor source) -> Tensor(a!)
+  variants: function, method
+
+- func: index_copy_(Tensor(a!) self, int dim, Tensor index, Tensor source) -> Tensor(a!)
+  variants: function, method
+
+- func: index_reduce_(Tensor(a!) self, int dim, Tensor index, Tensor source, str reduce, *, bool include_self=True) -> Tensor(a!)
+  variants: function, method
+
+- func: lcm_(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  variants: function, method
+
+- func: leaky_relu_(Tensor(a!) self, Scalar negative_slope=0.01) -> Tensor(a!)
+  variants: function, method
+
+- func: lgamma_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: log10_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: log1p_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: log2_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: log_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: logical_and_(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  variants: function, method
+
+- func: logical_not_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: logical_or_(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  variants: function, method
+
+- func: logical_xor_(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  variants: function, method
+
+- func: logit_(Tensor(a!) self, Scalar? eps=None) -> Tensor(a!)
+  variants: function, method
+
+- func: masked_scatter_(Tensor(a!) self, Tensor mask, Tensor source) -> Tensor(a!)
+  variants: function, method
+
+- func: mish_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: nan_to_num_(Tensor(a!) self, Scalar nan=0.0, Scalar? posinf=None, Scalar? neginf=None) -> Tensor(a!)
+  variants: function, method
+
+- func: nextafter_(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  variants: function, method
+
+- func: rad2deg_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: reciprocal_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: relu6_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: renorm_(Tensor(a!) self, Scalar p, int dim, Scalar maxnorm) -> Tensor(a!)
+  variants: function, method
+
+- func: round_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: selu_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: sgn_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: sigmoid_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: sign_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: silu_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: sin_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: sinc_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: sinh_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: square_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: tan_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: tanh_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: tril_(Tensor(a!) self, int diagonal=0) -> Tensor(a!)
+  variants: function, method
+
+- func: triu_(Tensor(a!) self, int diagonal=0) -> Tensor(a!)
+  variants: function, method
+
+- func: trunc_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: threshold_(Tensor(a!) self, Scalar threshold, Scalar value) -> Tensor(a!)
+  variants: function, method
+
+- func: i0_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method

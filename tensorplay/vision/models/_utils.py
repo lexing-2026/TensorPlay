@@ -33,14 +33,14 @@ class IntermediateLayerGetter(nn.ModuleDict):
 
     Examples::
 
-        >>> m = torchvision.models.resnet18(weights=ResNet18_Weights.DEFAULT)
+        >>> m = tensorplay.vision.models.resnet18(weights=ResNet18_Weights.DEFAULT)
         >>> # extract layer1 and layer3, giving as names `feat1` and feat2`
-        >>> new_m = torchvision.models._utils.IntermediateLayerGetter(m,
+        >>> new_m = tensorplay.vision.models._utils.IntermediateLayerGetter(m,
         >>>     {'layer1': 'feat1', 'layer3': 'feat2'})
-        >>> out = new_m(torch.rand(1, 3, 224, 224))
+        >>> out = new_m(tensorplay.rand(1, 3, 224, 224))
         >>> print([(k, v.shape) for k, v in out.items()])
-        >>>     [('feat1', torch.Size([1, 64, 56, 56])),
-        >>>      ('feat2', torch.Size([1, 256, 14, 14]))]
+        >>>     [('feat1', tensorplay.Size([1, 64, 56, 56])),
+        >>>      ('feat2', tensorplay.Size([1, 256, 14, 14]))]
     """
 
     _version = 2

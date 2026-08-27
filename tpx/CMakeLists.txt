@@ -16,6 +16,11 @@ set(TPX_SOURCES
 set_source_files_properties(${GEN_TPX_OPS_CPP} ${GEN_TPX_AUTOGRAD_REG_CPP} ${GEN_AUTOCAST_CPP} PROPERTIES GENERATED TRUE)
 
 add_library(tpx ${TPX_SOURCES})
+# Engine.cpp instantiates cpu::veccomplex AVX2 inline helpers (VecComplex.h);
+# compile this TU with matching ISA flags so always_inline succeeds.  The
+# complex fast paths themselves are runtime-guarded at their dispatch sites.
+set_source_files_properties(src/Engine.cpp PROPERTIES
+    COMPILE_OPTIONS "-mavx2;-mfma")
 set_target_properties(tpx PROPERTIES UNITY_BUILD ON)
 add_dependencies(tpx generate_code)
 target_link_libraries(tpx PRIVATE p10)

@@ -1,9 +1,9 @@
-"""Audio I/O backend registry — torch-compatible backend model.
+"""Audio I/O backend registry — tensorplay-compatible backend model.
 
-Mirrors the classic torchaudio backend API (set_audio_backend /
+Mirrors the classic tensorplay.audio backend API (set_audio_backend /
 get_audio_backend / list_audio_backends).  Backends are provided by the
 optional soundfile and scipy packages; soundfile is preferred when both are
-present, matching torchaudio's historical default order.
+present, matching tensorplay.audio's historical default order.
 """
 import os
 import sys
@@ -28,7 +28,7 @@ _ALLOWED = ("soundfile", "scipy")
 
 
 def set_audio_backend(backend: str | None) -> None:
-    """Specifies the package used to load audio files (torchaudio semantics).
+    """Specifies the package used to load audio files (tensorplay.audio semantics).
 
     Args:
         backend: One of ``"soundfile"``, ``"scipy"`` or ``None``.
@@ -60,7 +60,7 @@ def get_audio_backend() -> str | None:
 
 
 def list_audio_backends() -> list[str]:
-    """Returns available backends, best first (torchaudio semantics)."""
+    """Returns available backends, best first (tensorplay.audio semantics)."""
     out = []
     if _SOUNDFILE_AVAILABLE:
         out.append("soundfile")

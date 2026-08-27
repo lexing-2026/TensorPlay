@@ -58,26 +58,44 @@ Tensor rand_kernel(const std::vector<int64_t>& size, DType dtype, Device device)
         }
         case DType::Float16:
         case DType::BFloat16: {
-            // Sample in float precision and cast down, like torch's
-            // opmath-based uniform_ path (with the round-up clamp).
+            // PyTorch's CPU uniform_ uses the storage dtype for Half and
+            // BFloat16 (and therefore the dtype's mantissa mask), rather
+            // than sampling a 24-bit float and casting afterwards.
             if (dtype == DType::Float16) {
                 Half* data = t.data_ptr<Half>();
-                uniform_real_distribution<float> dist(0.0f, 1.0f);
-                const Half to_scalar = static_cast<Half>(1.0f);
+                uniform_real_distribution<Half> dist(static_cast<Half>(0.0f),
+                                                      static_cast<Half>(1.0f));
                 for (int64_t i = 0; i < n; ++i) {
-                    float value = static_cast<float>(dist(&gen));
-                    Half casted = static_cast<Half>(value);
-                    data[i] = casted == to_scalar ? static_cast<Half>(0.0f) : casted;
+                    data[i] = static_cast<Half>(dist(&gen));
                 }
             } else {
                 BFloat16* data = t.data_ptr<BFloat16>();
-                uniform_real_distribution<float> dist(0.0f, 1.0f);
-                const BFloat16 to_scalar = static_cast<BFloat16>(1.0f);
+                uniform_real_distribution<BFloat16> dist(static_cast<BFloat16>(0.0f),
+                                                          static_cast<BFloat16>(1.0f));
                 for (int64_t i = 0; i < n; ++i) {
-                    float value = static_cast<float>(dist(&gen));
-                    BFloat16 casted = static_cast<BFloat16>(value);
-                    data[i] = casted == to_scalar ? static_cast<BFloat16>(0.0f) : casted;
+                    data[i] = static_cast<BFloat16>(dist(&gen));
                 }
+            }
+            break;
+        }
+        case DType::ComplexFloat: {
+            std::complex<float>* data = t.data_ptr<std::complex<float>>();
+            uniform_real_distribution<float> dist(0.0f, 1.0f);
+            const float to_scalar = 1.0f;
+            for (int64_t i = 0; i < n; ++i) {
+                float re = static_cast<float>(dist(&gen));
+                float im = static_cast<float>(dist(&gen));
+                data[i] = std::complex<float>(
+                    re == to_scalar ? 0.0f : re,
+                    im == to_scalar ? 0.0f : im);
+            }
+            break;
+        }
+        case DType::ComplexDouble: {
+            std::complex<double>* data = t.data_ptr<std::complex<double>>();
+            uniform_real_distribution<double> dist(0.0, 1.0);
+            for (int64_t i = 0; i < n; ++i) {
+                data[i] = std::complex<double>(dist(&gen), dist(&gen));
             }
             break;
         }
@@ -86,6 +104,12 @@ Tensor rand_kernel(const std::vector<int64_t>& size, DType dtype, Device device)
     }
     return t;
 }
+
+namespace {
+// torch parity: complex randn draws both components from N(0, 1/sqrt(2)) so
+// E|z|^2 == 1; complex rand draws components uniform on [0, 1).
+constexpr double kComplexComponentStd = 0.7071067811865476;  // 1/sqrt(2)
+}  // namespace
 
 Tensor zeros_kernel(const std::vector<int64_t>& size, DType dtype, Device device, bool pin_memory) {
     Tensor t = allocate_cpu_tensor(size, dtype, pin_memory);
@@ -169,21 +193,34 @@ Tensor arange_start_step_kernel(Scalar start, Scalar end, Scalar step, DType dty
     }
     
     Tensor t({len}, dtype, device);
-    
-    if (dtype == DType::Float32) {
-        float* data = t.data_ptr<float>();
-        for (int64_t i = 0; i < len; ++i) data[i] = static_cast<float>(s_d + i * st_d);
-    } else if (dtype == DType::Float64) {
-        double* data = t.data_ptr<double>();
-        for (int64_t i = 0; i < len; ++i) data[i] = s_d + i * st_d;
-    } else if (dtype == DType::Int64) {
-        int64_t* data = t.data_ptr<int64_t>();
-        // Use double accumulation to avoid overflow if possible, or int accumulation?
-        // PyTorch uses accumulation in result type.
-        for (int64_t i = 0; i < len; ++i) data[i] = static_cast<int64_t>(s_d + i * st_d);
-    } else if (dtype == DType::Int32) {
-        int32_t* data = t.data_ptr<int32_t>();
-        for (int64_t i = 0; i < len; ++i) data[i] = static_cast<int32_t>(s_d + i * st_d);
+
+    // Torch parity: upstream dispatches arange over
+    // AT_DISPATCH_ALL_TYPES_AND2(Half, BFloat16) -- Bool, UInt16/32/64 and
+    // complex are not implemented.  The sub-32-bit types supported below
+    // were previously left uninitialized.
+    switch (dtype) {
+        case DType::Bool:
+            TP_THROW(NotImplementedError,
+                     "\"arange\" not implemented for '" + std::string(toString(dtype)) + "'");
+#define ARANGE_CASE(ctype, name) \
+        case DType::name: { \
+            ctype* data = t.data_ptr<ctype>(); \
+            for (int64_t i = 0; i < len; ++i) data[i] = static_cast<ctype>(s_d + i * st_d); \
+            break; \
+        }
+        ARANGE_CASE(uint8_t, UInt8)
+        ARANGE_CASE(int8_t, Int8)
+        ARANGE_CASE(int16_t, Int16)
+        ARANGE_CASE(int32_t, Int32)
+        ARANGE_CASE(int64_t, Int64)
+        ARANGE_CASE(float, Float32)
+        ARANGE_CASE(double, Float64)
+        ARANGE_CASE(tensorplay::Half, Float16)
+        ARANGE_CASE(tensorplay::BFloat16, BFloat16)
+#undef ARANGE_CASE
+        default:
+            TP_THROW(NotImplementedError,
+                     "\"arange\" not implemented for '" + std::string(toString(dtype)) + "'");
     }
     return t;
 }
@@ -204,6 +241,11 @@ Tensor eye_kernel(int64_t n, int64_t m, DType dtype, Device device) {
         float* data = t.data_ptr<float>();
         for(int64_t i=0; i<min_dim; ++i) {
             data[i*m + i] = 1.0f;
+        }
+    } else if (dtype == DType::Float64) {
+        double* data = t.data_ptr<double>();
+        for(int64_t i=0; i<min_dim; ++i) {
+            data[i*m + i] = 1.0;
         }
     } else if (dtype == DType::Int64) {
         int64_t* data = t.data_ptr<int64_t>();
@@ -323,12 +365,17 @@ Tensor randn_kernel(const std::vector<int64_t>& size, DType dtype, Device device
         }
         case DType::Float16:
         case DType::BFloat16: {
-            // Sample in float precision through a stack buffer, then cast.
+            // Match native CPU normal_: Half/BFloat16 use their storage dtype
+            // throughout the 16-value Box-Muller block.  This deliberately
+            // consumes the same raw 32-bit stream as the float path while
+            // retaining the storage-dtype rounding at every operation.
             if (n >= 16 && t.is_contiguous()) {
                 if (dtype == DType::Float16) {
-                    normal_fill_cast<Half>(t.data_ptr<Half>(), n, 0.0, 1.0, &gen);
+                    normal_fill<Half>(t.data_ptr<Half>(), n,
+                                      static_cast<Half>(0.0f), static_cast<Half>(1.0f), &gen);
                 } else {
-                    normal_fill_cast<BFloat16>(t.data_ptr<BFloat16>(), n, 0.0, 1.0, &gen);
+                    normal_fill<BFloat16>(t.data_ptr<BFloat16>(), n,
+                                          static_cast<BFloat16>(0.0f), static_cast<BFloat16>(1.0f), &gen);
                 }
             } else {
                 normal_distribution<double> dist(0.0, 1.0);
@@ -342,6 +389,30 @@ Tensor randn_kernel(const std::vector<int64_t>& size, DType dtype, Device device
                     for (int64_t i = 0; i < n; ++i) {
                         data[i] = static_cast<BFloat16>(dist(&gen));
                     }
+                }
+            }
+            break;
+        }
+        case DType::ComplexFloat:
+        case DType::ComplexDouble: {
+            // ATen DistributionTemplates.h normal_impl_ parity: complex
+            // normal samples view_as_real(self) with std/sqrt(2); with the
+            // standard-normal factory that is N(0, 1/sqrt(2)) per component.
+            const double comp_std = kComplexComponentStd;
+            if (dtype == DType::ComplexFloat) {
+                std::complex<float>* data = t.data_ptr<std::complex<float>>();
+                normal_distribution<double> dist(0.0, 1.0);
+                for (int64_t i = 0; i < n; ++i) {
+                    data[i] = std::complex<float>(
+                        static_cast<float>(dist(&gen) * comp_std),
+                        static_cast<float>(dist(&gen) * comp_std));
+                }
+            } else {
+                std::complex<double>* data = t.data_ptr<std::complex<double>>();
+                normal_distribution<double> dist(0.0, 1.0);
+                for (int64_t i = 0; i < n; ++i) {
+                    data[i] = std::complex<double>(dist(&gen) * comp_std,
+                                                   dist(&gen) * comp_std);
                 }
             }
             break;

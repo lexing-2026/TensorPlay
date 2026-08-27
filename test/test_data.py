@@ -57,6 +57,62 @@ class TestDatasetParity(unittest.TestCase):
         with self.assertRaises(AssertionError):
             torchdata.TensorDataset(torch.arange(5), torch.arange(3))
 
+    def test_tensor_advanced_indexing(self):
+        x = tp.arange(24).reshape([2, 3, 4])
+        tx = torch.arange(24).reshape(2, 3, 4)
+        cases = [
+            ([1, 0], tx[[1, 0]]),
+            ([-1, 0], tx[[-1, 0]]),
+            ([], tx[[]]),
+            (tp.tensor([1, 0], dtype=tp.int64), tx[torch.tensor([1, 0])]),
+            (
+                tp.tensor([[1, 0]], dtype=tp.int64),
+                tx[torch.tensor([[1, 0]])],
+            ),
+        ]
+        for index, expected in cases:
+            actual = x[index]
+            self.assertEqual(tuple(actual.shape), tuple(expected.shape))
+            self.assertEqual(actual.tolist(), expected.tolist())
+
+        self.assertEqual(x[[1, 0], :, 2].tolist(), tx[[1, 0], :, 2].tolist())
+        self.assertEqual(x[..., [3, 1]].tolist(), tx[..., [3, 1]].tolist())
+        self.assertEqual(x[[True, False]].tolist(), tx[[True, False]].tolist())
+        self.assertEqual(
+            x[[0, 1], :, [1, 2]].tolist(),
+            tx[[0, 1], :, [1, 2]].tolist(),
+        )
+        mask = tp.tensor([[True, False, False], [False, True, False]])
+        expected_mask = torch.tensor([[True, False, False], [False, True, False]])
+        self.assertEqual(x[mask].tolist(), tx[expected_mask].tolist())
+
+        actual = tp.arange(24).reshape([2, 3, 4])
+        expected = torch.arange(24).reshape(2, 3, 4)
+        actual[[1, 0]] = 7
+        expected[[1, 0]] = 7
+        self.assertEqual(actual.tolist(), expected.tolist())
+        actual = tp.arange(24).reshape([2, 3, 4])
+        expected = torch.arange(24).reshape(2, 3, 4)
+        actual[[0, 1], :, [1, 2]] = 9
+        expected[[0, 1], :, [1, 2]] = 9
+        self.assertEqual(actual.tolist(), expected.tolist())
+
+        scalar_index = tp.tensor(1, dtype=tp.int64)
+        self.assertEqual(
+            x[(scalar_index, slice(None))].tolist(),
+            tx[(torch.tensor(1), slice(None))].tolist(),
+        )
+        actual = tp.arange(24).reshape([2, 3, 4]).transpose(0, 1)
+        expected = torch.arange(24).reshape(2, 3, 4).transpose(0, 1)
+        actual[[0, 2], :, [3, 1]] = 11
+        expected[[0, 2], :, [3, 1]] = 11
+        self.assertEqual(actual.tolist(), expected.tolist())
+
+        with self.assertRaises(IndexError):
+            _ = x[[2]]
+        with self.assertRaises(TypeError):
+            _ = x[["1"]]
+
     def test_concat_dataset(self):
         tp_ds = td.ConcatDataset([_DS(3), _DS(4)])
         t_ds = torchdata.ConcatDataset([_TDS(3), _TDS(4)])
@@ -348,15 +404,17 @@ class TestDataLoaderParity(unittest.TestCase):
         t_out = [x for x in torchdata.DataLoader(TIDS(), batch_size=None)]
         self.assertEqual(tp_out, t_out)
 
-    def _check_raises(self, fn, tf, exc, msg=None):
+    def _check_raises(self, fn, tf, exc, msg=None, *, torch_msg=None):
         with self.assertRaises(exc) as cm:
             fn()
         if msg:
             self.assertIn(msg, str(cm.exception))
         with self.assertRaises(exc) as tcm:
             tf()
-        if msg:
-            self.assertIn(msg, str(tcm.exception))
+        if torch_msg is None:
+            torch_msg = msg
+        if torch_msg:
+            self.assertIn(torch_msg, str(tcm.exception))
 
     def test_validation_messages(self):
         class IDS(td.IterableDataset):
@@ -427,6 +485,10 @@ class TestDataLoaderParity(unittest.TestCase):
             lambda: list(td.DataLoader(_DS(5), num_workers=2, prefetch_factor=0)),
             lambda: list(torchdata.DataLoader(_TDS(5), num_workers=2, prefetch_factor=0)),
             AssertionError, "prefetch_factor must be greater than 0",
+            # PyTorch 2.8 still implements this validation as a bare assert,
+            # so its exception text is empty even though TensorPlay reports
+            # the native diagnostic above.
+            torch_msg="",
         )
         self._check_raises(
             lambda: td.DataLoader(_DS(5), num_workers=0, persistent_workers=True),

@@ -231,24 +231,28 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
     op = f"tensorplay::tpx::ops::{f.cpp_name}"
     kind = f.cpp_return_kind
     ret_cpp = cpp_return_type(f)
+    # Python call-site capture for the profiler (with_stack): runs under the
+    # GIL at binding entry, before the GIL-releasing invoke.  The helper
+    # itself re-checks the capture flags, so inactive cost is one load.
+    site_hook = "tensorplay::python::tpx_prof_capture_site();\n        "
     # Upstream gen_python_functions wraps every dispatch in an unconditional
     # `gil_scoped_release`; mirror that with the RAII equivalent so kernels
     # run multithreaded.  The lambda restores the GIL before the result is
     # wrapped (all Python C-API stays under the GIL).
     if kind == "void":
-        invoke = f"[&]() {{ tpx_py_GilRelease _gil; {op}({call}); }}(); Py_RETURN_NONE;"
+        invoke = site_hook + f"[&]() {{ tpx_py_GilRelease _gil; {op}({call}); }}(); Py_RETURN_NONE;"
     elif kind == "value":
         if ret_cpp == "bool":
-            invoke = (f"auto r = [&]() {{ tpx_py_GilRelease _gil; return {op}({call}); }}(); "
+            invoke = (site_hook + f"auto r = [&]() {{ tpx_py_GilRelease _gil; return {op}({call}); }}(); "
                       "return PyBool_FromLong(r);")
         elif ret_cpp == "Scalar":
-            invoke = (f"auto r = [&]() {{ tpx_py_GilRelease _gil; return {op}({call}); }}(); "
+            invoke = (site_hook + f"auto r = [&]() {{ tpx_py_GilRelease _gil; return {op}({call}); }}(); "
                       "return tpx_py_wrap_scalar(r);")
         elif ret_cpp == "int64_t":
-            invoke = (f"auto r = [&]() {{ tpx_py_GilRelease _gil; return {op}({call}); }}(); "
+            invoke = (site_hook + f"auto r = [&]() {{ tpx_py_GilRelease _gil; return {op}({call}); }}(); "
                       "return PyLong_FromLongLong(r);")
         elif ret_cpp == "Tensor":
-            invoke = (f"auto r = [&]() {{ tpx_py_GilRelease _gil; return {op}({call}); }}(); "
+            invoke = (site_hook + f"auto r = [&]() {{ tpx_py_GilRelease _gil; return {op}({call}); }}(); "
                       "return tpx_py_wrap(r);")
         else:
             return False                       # unhandled scalar shape
@@ -257,20 +261,24 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
                   4: "tpx_py_wrap_tuple4"}.get(len(f.returns))
         if packer is None:
             return None
-        invoke = (f"auto r = [&]() {{ tpx_py_GilRelease _gil; return {op}({call}); }}(); "
+        invoke = (site_hook + f"auto r = [&]() {{ tpx_py_GilRelease _gil; return {op}({call}); }}(); "
                   f"return {packer}(r);")
     elif kind == "list":
-        invoke = (f"auto r = [&]() {{ tpx_py_GilRelease _gil; return {op}({call}); }}(); "
+        invoke = (site_hook + f"auto r = [&]() {{ tpx_py_GilRelease _gil; return {op}({call}); }}(); "
                   "return tpx_py_wrap_list(r);")
     else:                                      # mut_ref
         # slots[0] is the raw self PyObject; the s_* locals hold unpacked
         # C++ tensors.
         keep = "tpx_py_keep_alive(slots[0]);" if nargs else ""
-        invoke = (f"auto& r = [&]() -> auto& {{ tpx_py_GilRelease _gil; "
+        invoke = (site_hook + f"auto& r = [&]() -> auto& {{ tpx_py_GilRelease _gil; "
                   f"return {op}({call}); }}(); {keep} return tpx_py_wrap(r);")
 
     recv = "PyObject* self" if is_method else "PyObject*"
     out.extend(prelude)
+    # Python call-site capture for the profiler (with_stack): runs under the
+    # GIL at binding entry, before the GIL-releasing invoke.  The helper
+    # itself re-checks the capture flags, so inactive cost is one load.
+    site_hook = "tensorplay::python::tpx_prof_capture_site();\n        "
     body = [
         f"static PyObject* {fn}({recv}, PyObject* const* args,",
         f"{' ' * len(fn)}                        Py_ssize_t nargs, PyObject* kwnames) {{",
@@ -293,6 +301,10 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
         P = user_pos
         body += [
             f"        PyObject* buf[{P}];",
+            # Seed every slot from args up front: the fold branches below may
+            # rewrite only the tail slots, and ap=buf must never expose an
+            # uninitialized stack value to tpx_py_parse_into.
+            f"        for (Py_ssize_t i = 0; i < {P}; ++i) buf[i] = args[i];",
             "        PyObject* const* ap = args;",
             "        Py_ssize_t an = nargs;",
             f"        if (nargs > {P}) {{",
@@ -423,12 +435,18 @@ def _gen_python_capi(ctx: CodegenContext) -> None:
         "#include <stdexcept>",
         '#include "CPythonBridge.h"',
         '#include "tensorplay/ops/TPXOpsGenerated.h"',
-        "",
+        "namespace tensorplay { namespace python { "
+        "void tpx_prof_capture_site(); } }  // profiler with_stack hook",
         "namespace tensorplay { namespace python_c {",
         "",
     ]
     fn_table: list[str] = []
     meth_table: list[str] = []
+    # torch parity: Tensor.real / Tensor.imag are properties (getset
+    # descriptors), not methods -- their zero-arg method wrappers double as
+    # property getters.
+    property_methods = {"real", "imag"}
+    prop_table: list[str] = []
     skipped = 0
     claimed = plan_groups(ctx.funcs)
     for (variant, cname), fs in sorted(claimed.items()):
@@ -478,7 +496,17 @@ def _gen_python_capi(ctx: CodegenContext) -> None:
             f'    {{"{cname}", (PyCFunction)(void*){entry_fn},'
             f' METH_FASTCALL | METH_KEYWORDS, "{doc}"}},')
         if variant == "method":
-            meth_table.append(entry_line)
+            if cname in property_methods and len(fs) == 1:
+                # Property getter shim over the zero-arg FASTCALL entry.
+                out.append(
+                    f"static PyObject* pyprop_{cname}_get(PyObject* self, void*) {{")
+                out.append(f"    return {base}(self, nullptr, 0, nullptr);")
+                out.append("}")
+                out.append("")
+                prop_table.append(
+                    f'    {{"{cname}", pyprop_{cname}_get, nullptr, nullptr, nullptr}},')
+            else:
+                meth_table.append(entry_line)
         else:
             fn_table.append(entry_line)
 
@@ -496,6 +524,12 @@ def _gen_python_capi(ctx: CodegenContext) -> None:
         f"inline PyMethodDef generated_tensor_methods[] = {{",
         *meth_table,
         "    {nullptr, nullptr, 0, nullptr},",
+        "};",
+        "",
+        "// torch parity: Tensor.real / Tensor.imag surface as properties.",
+        "inline PyGetSetDef generated_tensor_properties[] = {",
+        *prop_table,
+        "    {nullptr, nullptr, nullptr, nullptr, nullptr},",
         "};",
         "",
         "// Fill-only installation: an entry is skipped whenever its name is",
@@ -517,12 +551,20 @@ def _gen_python_capi(ctx: CodegenContext) -> None:
         "",
         "inline int register_generated_cpython_methods(PyObject* type_obj) {",
         "    auto* type = reinterpret_cast<PyTypeObject*>(type_obj);",
-        "    for (auto* def = generated_tensor_methods; def->ml_name != nullptr;"
+        "    for (auto* def = generated_tensor_methods; def->ml_name != nullptr;",
         " ++def) {",
         "        if (PyObject_HasAttrString(type_obj, def->ml_name)) continue;",
         "        PyObject* descr = PyDescr_NewMethod(type, def);",
         "        if (descr == nullptr) return -1;",
         "        int rc = PyObject_SetAttrString(type_obj, def->ml_name, descr);",
+        "        Py_DECREF(descr);",
+        "        if (rc != 0) return -1;",
+        "    }",
+        "    for (auto* def = generated_tensor_properties; def->name != nullptr;",
+        " ++def) {",
+        "        PyObject* descr = PyDescr_NewGetSet(type, def);",
+        "        if (descr == nullptr) return -1;",
+        "        int rc = PyObject_SetAttrString(type_obj, def->name, descr);",
         "        Py_DECREF(descr);",
         "        if (rc != 0) return -1;",
         "    }",

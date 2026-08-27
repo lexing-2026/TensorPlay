@@ -2,6 +2,7 @@ r"""Functional interface."""
 
 import math
 
+import tensorplay as tp
 from tensorplay import Tensor
 
 from .adadelta import adadelta  # type: ignore[attr-defined]  # noqa: F401
@@ -39,7 +40,14 @@ def sparse_adam(
     """
     for i, param in enumerate(params):
         grad = grads[i]
-        grad = grad if not maximize else -grad
+        if maximize:
+            # Unary negation is not implemented for TensorPlay sparse COO
+            # tensors.  Torch negates the sparse values while preserving the
+            # index structure, so keep the operation sparse at this boundary
+            # instead of materializing a dense gradient.
+            grad = tp.sparse_coo_tensor(
+                grad._indices(), -grad._values(), grad.size()
+            )
         grad = grad.coalesce()  # the update is non-linear so indices must be unique
         grad_indices = grad._indices()
         grad_values = grad._values()
@@ -53,10 +61,9 @@ def sparse_adam(
         step = state_steps[i]
 
         def make_sparse(values: Tensor) -> Tensor:
-            constructor = grad.new
             if grad_indices.dim() == 0 or values.dim() == 0:
-                return constructor().resize_as_(grad)
-            return constructor(grad_indices, values, size)
+                return tp.zeros(list(grad.shape), dtype=grad.dtype)
+            return tp.sparse_coo_tensor(grad_indices, values, list(size))
 
         # Decay the first and second moment running average coefficient
         #      old <- b * old + (1 - b) * new

@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-import tensorplay as torch
+import tensorplay as tensorplay
 from tensorplay import Tensor
 from ._extension import fail_if_no_align
 
@@ -55,22 +55,22 @@ def forced_align(
     """
     if blank in targets:
         raise ValueError(f"targets Tensor shouldn't contain blank index. Found {targets}.")
-    if torch.max(targets) >= log_probs.shape[-1]:
+    if tensorplay.max(targets) >= log_probs.shape[-1]:
         raise ValueError("targets values must be less than the CTC dimension")
 
     if input_lengths is None:
         batch_size, length = log_probs.size(0), log_probs.size(1)
-        input_lengths = torch.full((batch_size,), length, dtype=torch.int64, device=log_probs.device)
+        input_lengths = tensorplay.full((batch_size,), length, dtype=tensorplay.int64, device=log_probs.device)
     if target_lengths is None:
         batch_size, length = targets.size(0), targets.size(1)
-        target_lengths = torch.full((batch_size,), length, dtype=torch.int64, device=targets.device)
+        target_lengths = tensorplay.full((batch_size,), length, dtype=tensorplay.int64, device=targets.device)
 
     # For TorchScript compatibility
     assert input_lengths is not None
     assert target_lengths is not None
 
-    paths, scores = torch.ops.torchaudio.forced_align(log_probs, targets, input_lengths, target_lengths, blank)
-    return paths, scores[:, torch.arange(scores.shape[1]), paths[0]]
+    paths, scores = tensorplay.ops.torchaudio.forced_align(log_probs, targets, input_lengths, target_lengths, blank)
+    return paths, scores[:, tensorplay.arange(scores.shape[1]), paths[0]]
 
 
 @dataclass
@@ -115,10 +115,10 @@ def merge_tokens(tokens: Tensor, scores: Tensor, blank: int = 0) -> List[TokenSp
     if len(tokens) != len(scores):
         raise ValueError("`tokens` and `scores` must be the same length.")
 
-    diff = torch.diff(
-        tokens, prepend=torch.tensor([-1], device=tokens.device), append=torch.tensor([-1], device=tokens.device)
+    diff = tensorplay.diff(
+        tokens, prepend=tensorplay.tensor([-1], device=tokens.device), append=tensorplay.tensor([-1], device=tokens.device)
     )
-    changes_wo_blank = torch.nonzero((diff != 0)).squeeze().tolist()
+    changes_wo_blank = tensorplay.nonzero((diff != 0)).squeeze().tolist()
     tokens = tokens.tolist()
     spans = [
         TokenSpan(token=token, start=start, end=end, score=scores[start:end].mean().item())

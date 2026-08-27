@@ -111,14 +111,14 @@ class LFWPeople(_LFW):
             ``10fold`` (default).
         image_set (str, optional): Type of image funneling to use, ``original``, ``funneled`` or
             ``deepfunneled``. Defaults to ``funneled``.
-        transform (callable, optional): A function/transform that takes in a PIL image or torch.Tensor, depends on the given loader,
+        transform (callable, optional): A function/transform that takes in a PIL image or tensorplay.Tensor, depends on the given loader,
             and returns a transformed version. E.g, ``transforms.RandomCrop``
         target_transform (callable, optional): A function/transform that takes in the
             target and transforms it.
         download (bool, optional): NOT SUPPORTED ANYMORE, leave to False.
         loader (callable, optional): A function to load an image given its path.
             By default, it uses PIL as its image loader, but users could also pass in
-            ``torchvision.io.decode_image`` for decoding image data into tensors directly.
+            ``tensorplay.vision.io.decode_image`` for decoding image data into tensors directly.
     """
 
     def __init__(
@@ -207,7 +207,7 @@ class LFWPairs(_LFW):
         download (bool, optional): NOT SUPPORTED ANYMORE, leave to False.
         loader (callable, optional): A function to load an image given its path.
             By default, it uses PIL as its image loader, but users could also pass in
-            ``torchvision.io.decode_image`` for decoding image data into tensors directly.
+            ``tensorplay.vision.io.decode_image`` for decoding image data into tensors directly.
 
     """
 

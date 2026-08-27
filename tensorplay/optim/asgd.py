@@ -85,7 +85,10 @@ class ASGD(Optimizer):
 
             state = self.state[p]
             if len(state) == 0:
-                state["step"] = tp.zeros((), dtype=_get_scalar_dtype())
+                state["step"] = tp.zeros(
+                    (), dtype=_get_scalar_dtype(),
+                    device=p.device,
+                )
                 state["eta"] = (
                     tp.tensor(
                         _to_scalar(group["lr"]),
@@ -325,16 +328,26 @@ def _multi_tensor_asgd(
             tp._foreach_copy_(grouped_etas, new_etas)
         else:
             device = grouped_etas[0].device
+            # One host transfer for all step counters (CUDA sync otherwise).
+            if grouped_state_steps and grouped_state_steps[0].is_cuda:
+                # TensorPlay, like the native CUDA backend, requires an
+                # explicit device-to-host copy before exposing values through
+                # ``tolist``.  This path is only used to update eta/mu for
+                # non-capturable fallback groups; the f32 native CUDA path
+                # keeps the whole scalar update on-device.
+                steps_host = tp.stack(grouped_state_steps).cpu().tolist()
+            else:
+                steps_host = [_get_value(step) for step in grouped_state_steps]
             new_etas = [
                 tp.as_tensor(
-                    lr / ((1 + lambd * lr * _get_value(step)) ** alpha),
+                    lr / ((1 + lambd * lr * float(step)) ** alpha),
                     device=device,
                 )
-                for step in grouped_state_steps
+                for step in steps_host
             ]
             new_mus = [
-                tp.as_tensor(1 / max(1, _get_value(step) - t0), device=device)
-                for step in grouped_state_steps
+                tp.as_tensor(1 / max(1, float(step) - t0), device=device)
+                for step in steps_host
             ]
             tp._foreach_copy_(grouped_etas, new_etas)
             tp._foreach_copy_(grouped_mus, new_mus)
@@ -367,6 +380,103 @@ def asgd(
             "API has changed, `state_steps` argument must contain a list of "
             "singleton tensors"
         )
+
+    native_cpu = (
+        not differentiable
+        and not capturable
+        and not has_complex
+        and bool(params)
+        # The fused reduced-dtype update combines parameter operations that
+        # Torch performs as separate kernels, changing the cast point. Keep
+        # fp16/bf16 on the native-compatible reference path.
+        and params[0].dtype in (tp.float32, tp.float64)
+        and all(
+            p.device.type == "cpu"
+            and p.is_contiguous()
+            and p.is_floating_point()
+            and p.dtype == params[0].dtype
+            for p in params
+        )
+        and all(
+            g.device.type == "cpu"
+            and g.is_contiguous()
+            and g.dtype == params[0].dtype
+            for g in grads
+        )
+        and all(
+            state.device.type == "cpu"
+            and state.is_contiguous()
+            and state.numel() == 1
+            and state.dtype in (tp.float32, tp.float64)
+            for state in (*mus, *etas, *state_steps)
+        )
+    )
+    if native_cpu:
+        tp._fused_asgd_(
+            params,
+            grads,
+            axs,
+            mus,
+            etas,
+            state_steps,
+            lr=scalar_value(lr, "lr"),
+            lambd=lambd,
+            t0=t0,
+            alpha=alpha,
+            weight_decay=weight_decay,
+            maximize=maximize,
+        )
+        return
+
+    native_cuda = (
+        not differentiable
+        and not capturable
+        and not has_complex
+        and bool(params)
+        and all(
+            p.device.type == "cuda"
+            and p.is_contiguous()
+            and p.dtype == tp.float32
+            for p in params
+        )
+        and all(
+            g.device.type == "cuda"
+            and g.is_contiguous()
+            and g.dtype == tp.float32
+            for g in grads
+        )
+        and all(
+            state.device.type == "cuda"
+            and state.is_contiguous()
+            and state.numel() == 1
+            and state.dtype == tp.float32
+            for state in (*mus, *etas)
+        )
+        and all(
+            state.device.type == "cuda"
+            and state.is_contiguous()
+            and state.numel() == 1
+            and state.dtype == tp.float32
+            for state in state_steps
+        )
+    )
+    if native_cuda:
+        tp._fused_asgd_(
+            params,
+            grads,
+            axs,
+            mus,
+            etas,
+            state_steps,
+            lr=scalar_value(lr, "lr"),
+            lambd=lambd,
+            t0=t0,
+            alpha=alpha,
+            weight_decay=weight_decay,
+            maximize=maximize,
+        )
+        return
+
     if foreach is None:
         _, foreach = _default_to_fused_or_foreach(
             params, differentiable, use_fused=False

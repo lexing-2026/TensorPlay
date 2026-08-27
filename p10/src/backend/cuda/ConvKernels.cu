@@ -16,6 +16,10 @@
 
 #ifdef USE_CUDNN
 #include <cudnn.h>
+#endif
+
+#if defined(USE_CUDNN) && __has_include(<cudnn_frontend.h>)
+#define TP_HAS_CUDNN_FRONTEND 1
 #include <cudnn_frontend.h>
 namespace fe = cudnn_frontend;
 #endif
@@ -380,8 +384,122 @@ static Tensor conv2d_relu_cudnn(
 }
 #endif
 
+// The graph API is header-only and is not present in every cuDNN runtime
+// image.  Keep the legacy cuDNN forward path available in that case so a
+// missing optional frontend header does not prevent unrelated targets (in
+// particular optimizer kernels) from being rebuilt.
+#ifdef USE_CUDNN
+static Tensor conv2d_cudnn_legacy(
+    const Tensor& input,
+    const Tensor& weight,
+    const Tensor& bias,
+    const std::vector<int64_t>& stride_arg,
+    const std::vector<int64_t>& padding_arg,
+    const std::vector<int64_t>& dilation_arg,
+    int64_t groups,
+    bool fused_relu) {
+    auto stride = expand_param_if_needed(stride_arg, 2, 1);
+    auto padding = expand_param_if_needed(padding_arg, 2, 0);
+    auto dilation = expand_param_if_needed(dilation_arg, 2, 1);
+    Tensor input_c = input.is_contiguous() ? input : input.contiguous();
+    Tensor weight_c = weight.is_contiguous() ? weight : weight.contiguous();
+
+    const int64_t n = input_c.size(0);
+    const int64_t k = weight_c.size(0);
+    const int64_t h = input_c.size(2);
+    const int64_t w = input_c.size(3);
+    const int64_t r = weight_c.size(2);
+    const int64_t s = weight_c.size(3);
+    const int64_t oh = (h + 2 * padding[0] - dilation[0] * (r - 1) - 1) /
+        stride[0] + 1;
+    const int64_t ow = (w + 2 * padding[1] - dilation[1] * (s - 1) - 1) /
+        stride[1] + 1;
+    if (oh <= 0 || ow <= 0) {
+        TP_THROW(RuntimeError, "conv2d: calculated output size is too small");
+    }
+
+    if (fused_relu && bias.defined() &&
+        (input_c.dtype() == DType::Float32 ||
+         input_c.dtype() == DType::Float64)) {
+        return conv2d_relu_cudnn(
+            input_c, weight_c, bias, stride, padding, dilation, groups);
+    }
+
+    cudnnHandle_t handle = CUDAContext::getCudnnHandle();
+    TensorDesc x_desc; x_desc.set(input_c);
+    FilterDesc w_desc; w_desc.set(weight_c);
+    Tensor out = Tensor::empty({n, k, oh, ow}, input_c.dtype(), input_c.device());
+    TensorDesc y_desc; y_desc.set(out);
+    ConvDesc conv_desc;
+    conv_desc.set(
+        static_cast<int>(padding[0]), static_cast<int>(padding[1]),
+        static_cast<int>(stride[0]), static_cast<int>(stride[1]),
+        static_cast<int>(dilation[0]), static_cast<int>(dilation[1]),
+        static_cast<int>(groups), input_c.dtype());
+
+    const std::string cache_key = make_conv_fwd_cache_key(
+        input_c, weight_c, stride, padding, dilation, groups, false);
+    cudnnConvolutionFwdAlgo_t algorithm;
+    size_t workspace_size;
+    {
+        std::lock_guard<std::mutex> lock(g_conv_fwd_cache_mutex);
+        auto it = g_conv_fwd_algo_cache.find(cache_key);
+        if (it == g_conv_fwd_algo_cache.end()) {
+            cudnnConvolutionFwdAlgoPerf_t perf_results;
+            int returned_algo_count = 0;
+            CUDNN_CHECK(cudnnGetConvolutionForwardAlgorithm_v7(
+                handle, x_desc, w_desc, conv_desc, y_desc,
+                1, &returned_algo_count, &perf_results));
+            if (returned_algo_count == 0) {
+                TP_THROW(RuntimeError, "cuDNN: no forward convolution algorithm");
+            }
+            algorithm = perf_results.algo;
+            CUDNN_CHECK(cudnnGetConvolutionForwardWorkspaceSize(
+                handle, x_desc, w_desc, conv_desc, y_desc,
+                algorithm, &workspace_size));
+            g_conv_fwd_algo_cache.emplace(
+                cache_key, ConvFwdAlgo{algorithm, workspace_size});
+        } else {
+            algorithm = it->second.algorithm;
+            workspace_size = it->second.workspace_size;
+        }
+    }
+
+    auto workspace = getAllocator(DeviceType::CUDA)->allocate(
+        workspace_size ? workspace_size : 1, input_c.device());
+    float alpha = 1.0f, beta = 0.0f;
+    double alpha_d = 1.0, beta_d = 0.0;
+    void* alpha_p = &alpha;
+    void* beta_p = &beta;
+    if (input_c.dtype() == DType::Float64) {
+        alpha_p = &alpha_d;
+        beta_p = &beta_d;
+    }
+    CUDNN_CHECK(cudnnConvolutionForward(
+        handle, alpha_p, x_desc, input_c.data_ptr(), w_desc,
+        weight_c.data_ptr(), conv_desc, algorithm, workspace.get(),
+        workspace_size, beta_p, y_desc, out.data_ptr()));
+
+    if (bias.defined() && bias.numel() != 0) {
+        Tensor bias_c = bias.is_contiguous() ? bias : bias.contiguous();
+        Tensor bias_4d = bias_c.reshape({1, k, 1, 1});
+        TensorDesc bias_desc; bias_desc.set(bias_4d);
+        float beta_one = 1.0f;
+        double beta_one_d = 1.0;
+        void* beta_one_p = &beta_one;
+        if (input_c.dtype() == DType::Float64) beta_one_p = &beta_one_d;
+        CUDNN_CHECK(cudnnAddTensor(
+            handle, alpha_p, bias_desc, bias_4d.data_ptr(), beta_one_p,
+            y_desc, out.data_ptr()));
+    }
+    if (fused_relu) relu_inplace_kernel_cudnn(out);
+    return out;
+}
+#endif
+
 static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const Tensor& bias, const std::vector<int64_t>& stride_arg, const std::vector<int64_t>& padding_arg, const std::vector<int64_t>& dilation_arg, int64_t groups, bool fused_relu) {
 #ifdef USE_CUDNN
+#if defined(TP_HAS_CUDNN_FRONTEND)
     auto stride = expand_param_if_needed(stride_arg, 2, 1);
     auto padding = expand_param_if_needed(padding_arg, 2, 0);
     auto dilation = expand_param_if_needed(dilation_arg, 2, 1);
@@ -703,6 +821,11 @@ static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const 
     }
 
     return out;
+#else
+    return conv2d_cudnn_legacy(
+        input, weight, bias, stride_arg, padding_arg, dilation_arg, groups,
+        fused_relu);
+#endif
 #else
     TP_THROW(NotImplementedError, "conv2d_cuda requires cuDNN");
 #endif

@@ -42,7 +42,7 @@
 
 - name: add.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor
   self: grad
-  other: grad * alpha
+  other: maybe_multiply(grad, alpha)
 
 # In-place arithmetic is used by torch.optim's differentiable single-tensor
 # implementations.  Keep the same backward formulas as the functional
@@ -50,7 +50,7 @@
 # non-leaf tensor and rejects leaf mutation under GradMode.
 - name: add_.Tensor(Tensor(a!) self, Tensor other, *, Scalar alpha=1) -> Tensor(a!)
   self: grad
-  other: grad * alpha
+  other: maybe_multiply(grad, alpha)
 
 - name: add_.Scalar(Tensor(a!) self, Scalar other, Scalar alpha=1) -> Tensor(a!)
   self: grad
@@ -65,36 +65,36 @@
 
 - name: sub.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor
   self: grad
-  other: grad.neg() * alpha
+  other: maybe_multiply(grad.neg(), alpha)
 
 - name: sub_.Tensor(Tensor(a!) self, Tensor other, *, Scalar alpha=1) -> Tensor(a!)
   self: grad
-  other: grad.neg() * alpha
+  other: maybe_multiply(grad.neg(), alpha)
 
 - name: sub_.Scalar(Tensor(a!) self, Scalar other, Scalar alpha=1) -> Tensor(a!)
   self: grad
 
 - name: mul.Tensor(Tensor self, Tensor other) -> Tensor
-  self: grad * other
-  other: grad * self
+  self: mul_tensor_backward(grad, other, self.dtype())
+  other: mul_tensor_backward(grad, self, other.dtype())
 
 - name: mul_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
-  self: grad * other
-  other: grad * self
+  self: grad * ops::conj(other)
+  other: grad * ops::conj(self)
 
 - name: mul_.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)
-  self: grad * other
+  self: grad * scalar_conj_if_complex(other)
 
 - name: div.Tensor(Tensor self, Tensor other) -> Tensor
-  self: grad / other
-  other: -grad * self / (other * other)
+  self: div_tensor_self_backward(grad, other, self.dtype())
+  other: div_tensor_other_backward(grad, self, other)
 
 - name: div_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
-  self: grad / other
-  other: -grad * self / (other * other)
+  self: grad / ops::conj(other)
+  other: -(grad * self) * ops::conj(self / other / other)
 
 - name: div_.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)
-  self: grad / other
+  self: grad / scalar_conj_if_complex(other)
 
 - name: addcmul(Tensor self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor
   self: grad
@@ -168,16 +168,19 @@
   self: grad
 
 - name: mul.Scalar(Tensor self, Scalar other) -> Tensor
-  self: grad * other
+  self: grad * scalar_conj_if_complex(other)
 
 - name: div.Scalar(Tensor self, Scalar other) -> Tensor
-  self: grad / other
+  self: grad / scalar_conj_if_complex(other)
 
 - name: embedding(Tensor weight, Tensor indices, int padding_idx=-1, bool scale_grad_by_freq=false, bool sparse=false) -> Tensor
   weight: tensorplay::tpx::ops::embedding_dense_backward(grad, indices, weight.size(0), padding_idx, scale_grad_by_freq)
 
+# Upstream torch uses `grad.reshape_symint(self.sym_sizes())`
+# (tools/autograd/derivatives.yaml): reshape falls back to a copy when the
+# incoming grad is not viewable, so non-contiguous grads never error here.
 - name: view(Tensor self, int[] shape) -> Tensor
-  self: grad.view(self.shape())
+  self: grad.reshape(self.shape())
 
 - name: clone(Tensor self, *, MemoryFormat? memory_format=None) -> Tensor
   self: grad
@@ -207,19 +210,27 @@
   self: grad.mm(mat2.t())
   mat2: self.t().mm(grad)
 
+# Native F.linear (CPU kernel; other backends fall through to the composite).
+# Per-slot compositions keep double-backward alive, mirroring upstream's
+# linear_backward contract (tools/autograd/derivatives.yaml:2388-2391).
+- name: linear(Tensor input, Tensor weight, Tensor? bias=None) -> Tensor
+  input: linear_backward_input(grad, input, weight)
+  weight: linear_backward_weight(grad, input, weight)
+  bias: linear_backward_bias(grad)
+
 - name: addmm(Tensor self, Tensor mat1, Tensor mat2, *, Scalar beta=1, Scalar alpha=1) -> Tensor
-  self: grad * beta
-  mat1: grad.mm(mat2.t()) * alpha
-  mat2: mat1.t().mm(grad) * alpha
+  self: maybe_multiply(grad, beta)
+  mat1: maybe_multiply(grad.mm(mat2.t()), alpha)
+  mat2: maybe_multiply(mat1.t().mm(grad), alpha)
 
 - name: bmm(Tensor self, Tensor mat2) -> Tensor
   self: grad.matmul(mat2.transpose(-2, -1))
   mat2: self.transpose(-2, -1).matmul(grad)
 
 - name: baddbmm(Tensor self, Tensor batch1, Tensor batch2, *, Scalar beta=1, Scalar alpha=1) -> Tensor
-  self: grad * beta
-  batch1: grad.matmul(batch2.transpose(-2, -1)) * alpha
-  batch2: batch1.transpose(-2, -1).matmul(grad) * alpha
+  self: maybe_multiply(grad, beta)
+  batch1: maybe_multiply(grad.matmul(batch2.transpose(-2, -1)), alpha)
+  batch2: maybe_multiply(batch1.transpose(-2, -1).matmul(grad), alpha)
 
 - name: mv(Tensor self, Tensor vec) -> Tensor
   self: grad.outer(vec)
@@ -231,7 +242,7 @@
 
 - name: outer(Tensor self, Tensor vec2) -> Tensor
   self: grad.mv(vec2)
-  vec2: self.t().mv(grad)
+  vec2: grad.t().mv(self)
 
 - name: inner(Tensor self, Tensor other) -> Tensor
   self: inner_backward_self(grad, self, other)
@@ -244,31 +255,50 @@
   self: diagonal_backward(grad, self.shape(), offset, dim1, dim2)
 
 - name: sin(Tensor self) -> Tensor
-  self: grad * self.cos()
+  self: grad * self.cos().conj()
 
 - name: cos(Tensor self) -> Tensor
-  self: grad * -self.sin()
+  self: grad * -self.sin().conj()
 
 - name: abs(Tensor self) -> Tensor
+  # |z| maps C->R; conj(conj(z)/|z|) == z/|z| == sgn(z), so the plain sgn form
+  # already carries the conjugated Jacobian.
   self: grad * self.sign()
 
+# Rounding ops are piecewise-constant: zero gradient, but the entry keeps the
+# graph connected so consumers (e.g. grid_sample nearest d/dgrid) still get a
+# defined grad instead of silently detaching.
+- name: floor(Tensor self) -> Tensor
+  self: zeros_like(grad)
+
+- name: ceil(Tensor self) -> Tensor
+  self: zeros_like(grad)
+
+- name: round(Tensor self) -> Tensor
+  self: zeros_like(grad)
+
+- name: trunc(Tensor self) -> Tensor
+  self: zeros_like(grad)
+
+
 - name: pow.Tensor_Scalar(Tensor self, Scalar exponent) -> Tensor
-  self: grad * exponent * self.pow(exponent - 1)
+  self: pow_backward(grad, self, exponent)
 
 - name: exp(Tensor self) -> Tensor
-  self: grad * self.exp()
+  self: grad * result.conj()
 
 - name: log(Tensor self) -> Tensor
-  self: grad / self
+  self: grad / self.conj()
 
 - name: square(Tensor self) -> Tensor
-  self: grad * 2 * self
+  # analytic J = 2*self; torch convention stores grad * conj(J)
+  self: grad * 2 * self.conj()
 
 - name: sqrt(Tensor self) -> Tensor
-  self: grad / (2 * self.sqrt())
+  self: grad / (2 * result.conj())
 
 - name: rsqrt(Tensor self) -> Tensor
-  self: -grad * result * result * result / 2
+  self: -0.5 * grad * result.pow(3).conj()
 
 - name: sum(Tensor self, *, ScalarType dtype=Undefined) -> Tensor
   # zeros_like + broadcast add == grad expanded to self.shape(); written this
@@ -309,6 +339,12 @@
 
 - name: nll_loss(Tensor self, Tensor target, Tensor? weight=None, int reduction=1, int ignore_index=-100) -> (Tensor output, Tensor total_weight)
   self: nll_loss_backward(grad, self, target, weight, reduction, ignore_index, total_weight)
+
+# CTC: grad flows only to log_probs; the backward consumes the saved forward
+# outputs (raw per-sequence NLL keeps +inf for impossible alignments so the
+# kernel's zero_infinity gating works) and applies aten LossCTC.cpp eq(16).
+- name: _ctc_loss(Tensor log_probs, Tensor targets, Tensor input_lengths, Tensor target_lengths, int blank=0, bool zero_infinity=False) -> (Tensor neg_log_likelihood, Tensor log_alpha)
+  log_probs: _ctc_loss_backward(grad, log_probs, targets, input_lengths, target_lengths, neg_log_likelihood, log_alpha, blank, zero_infinity)
 
 - name: mse_loss(Tensor self, Tensor target, int reduction=1) -> Tensor
   self: mse_loss_backward(grad, self, target, reduction)
@@ -405,13 +441,13 @@
   self: circular_pad_nd_backward(grad, self, pad)
 
 - name: sigmoid(Tensor self) -> Tensor
-  self: grad * result * (1 - result)
+  self: grad * (result * (1 - result)).conj()
 
 - name: silu(Tensor self) -> Tensor
   self: grad * self.sigmoid() * (1 + self * (1 - self.sigmoid()))
 
 - name: tanh(Tensor self) -> Tensor
-  self: grad * (1 - result * result)
+  self: grad * (1 - result * result).conj()
 
 - name: atan2(Tensor self, Tensor other) -> Tensor
   self: grad * other / (self * self + other * other)
@@ -588,15 +624,15 @@
   other: -(grad * result) / other
 
 - name: divide.Tensor(Tensor self, Tensor other) -> Tensor
-  self: grad / other
-  other: -(grad * result) / other
+  self: div_tensor_self_backward(grad, other, self.dtype())
+  other: div_tensor_other_backward(grad, self, other)
 
 - name: multiply.Tensor(Tensor self, Tensor other) -> Tensor
-  self: grad * other
-  other: grad * self
+  self: mul_tensor_backward(grad, other, self.dtype())
+  other: mul_tensor_backward(grad, self, other.dtype())
 
 - name: multiply.Scalar(Tensor self, Scalar other) -> Tensor
-  self: grad * other
+  self: grad * scalar_conj_if_complex(other)
 
 - name: negative(Tensor self) -> Tensor
   self: -grad
@@ -611,10 +647,10 @@
 
 # UnaryOps.cpp reciprocal: -grad / self^2
 - name: reciprocal(Tensor self) -> Tensor
-  self: -grad / (self * self)
+  self: -grad * (result * result).conj()
 
 - name: exp2(Tensor self) -> Tensor
-  self: grad * result * 0.69314718055994530942
+  self: grad * (result.conj() * 0.6931471805599453)
 
 - name: xlogy.Tensor(Tensor self, Tensor other) -> Tensor
   self: grad * log(other)
@@ -692,6 +728,11 @@
 - name: conj(Tensor self) -> Tensor
   self: grad.conj()
 
+# adjoint is transpose(-2,-1) composed with conj; both are self-inverse on
+# the gradient (torch: grad.adjoint()).
+- name: adjoint(Tensor self) -> Tensor
+  self: grad.adjoint()
+
 # polar(r, theta) = r * exp(i*theta): dr = cos(theta)*grad; dtheta = -r*sin(theta)*grad
 - name: polar(Tensor abs_, Tensor angle) -> Tensor
   abs_: grad * cos(angle)
@@ -761,7 +802,7 @@
   self: grad / self * 0.43429448190325176
 
 - name: log1p(Tensor self) -> Tensor
-  self: grad / (self + 1)
+  self: log1p_backward(grad, self)
 
 - name: frac(Tensor self) -> Tensor
   self: grad
@@ -778,25 +819,97 @@
 # 有限差分验证: x=0.49 处旧值 0.9239 vs 真值 0.7354。
 
 - name: sinh(Tensor self) -> Tensor
-  self: grad * self.cosh()
+  self: grad * self.cosh().conj()
+
+# --- torch 对齐补齐(第 2 批):反三角/误差函数/lgamma/log2 ---
+# 公式逐条对照 third_party/pytorch/tools/autograd/derivatives.yaml
+# (去 .conj() 复数分支;M_2_SQRTPI/M_LN2 常量内联为数值)。
+
+- name: acos(Tensor self) -> Tensor
+  self: grad * -((-self * self + 1).rsqrt()).conj()
+
+- name: asin(Tensor self) -> Tensor
+  self: grad * (-self * self + 1).rsqrt().conj()
+
+- name: atan(Tensor self) -> Tensor
+  self: grad / (self * self + 1).conj()
+
+- name: tan(Tensor self) -> Tensor
+  self: grad * (1 + result.pow(2)).conj()
+
+- name: erf(Tensor self) -> Tensor
+  self: 1.1283791670205586 * exp(-(self.pow(2))) * grad
+
+- name: erfc(Tensor self) -> Tensor
+  self: -1.1283791670205586 * exp(-(self.pow(2))) * grad
+
+- name: lgamma(Tensor self) -> Tensor
+  self: grad * digamma(self)
+
+- name: log2(Tensor self) -> Tensor
+  self: grad / (self.conj() * 0.6931471805599453)
 
 - name: cosh(Tensor self) -> Tensor
-  self: grad * self.sinh()
+  self: grad * self.sinh().conj()
 
 - name: asinh(Tensor self) -> Tensor
-  self: grad * (self * self + 1).rsqrt()
+  self: grad * (self.pow(2) + 1).rsqrt().conj()
 
 - name: acosh(Tensor self) -> Tensor
-  self: grad * (self * self - 1).rsqrt()
+  self: acosh_backward(grad, self)
 
 - name: atanh(Tensor self) -> Tensor
-  self: grad / (1 - self * self)
+  self: grad * 1 / (1 - self.pow(2)).conj()
+
+# In-place arc variants reuse the out-of-place formula.  The saved `self` is
+# captured before the mutation (gen_tpx hoists a clone, matching upstream
+# gen_variable_type's `original_self = self.clone()`), so the slope is
+# evaluated at the pre-update value like torch's auto-derived in-place
+# backwards.  torch itself leaves acosh_/asinh_/atanh_ unimplemented; TP
+# provides them via the closed-form slope (spec: test_composite_funcs).
+- name: acos_(Tensor(a!) self) -> Tensor(a!)
+  self: grad * -((-self * self + 1).rsqrt()).conj()
+
+- name: asin_(Tensor(a!) self) -> Tensor(a!)
+  self: grad * (-self * self + 1).rsqrt().conj()
+
+- name: atan_(Tensor(a!) self) -> Tensor(a!)
+  self: grad / (self * self + 1).conj()
+
+- name: acosh_(Tensor(a!) self) -> Tensor(a!)
+  self: acosh_backward(grad, self)
+
+- name: asinh_(Tensor(a!) self) -> Tensor(a!)
+  self: grad * (self.pow(2) + 1).rsqrt().conj()
+
+- name: atanh_(Tensor(a!) self) -> Tensor(a!)
+  self: grad * 1 / (1 - self.pow(2)).conj()
 
 - name: logit(Tensor self, Scalar? eps=None) -> Tensor
   self: grad / (self * (1 - self))
 
 - name: expm1(Tensor self) -> Tensor
-  self: grad * (result + 1)
+  self: grad * (result.conj() + 1)
+
+# torch derivatives.yaml: angle backward is zero at z == 0, else grad * i*z/|z|^2
+- name: angle(Tensor self) -> Tensor
+  self: angle_backward(grad, self)
+
+# torch: complex(r, i) routes the stored (conjugated) gradient components
+# straight back to the parts: dL/dr = g.real, dL/di = g.imag.
+- name: complex(Tensor real, Tensor imag) -> Tensor
+  real: grad.real()
+  imag: grad.imag()
+
+# torch: pow.Tensor_Tensor uses pow_backward_self / pow_backward_exponent with
+# conjugated Jacobians; see FunctionsManual.cpp.
+- name: pow.Tensor_Tensor(Tensor self, Tensor exponent) -> Tensor
+  self: pow_backward_self(grad, self, exponent)
+  exponent: pow_backward_exponent(grad, self, exponent, result)
+
+- name: prod(Tensor self, *, ScalarType dtype=Undefined) -> Tensor
+  # simplified torch prod_backward: exact without zeros, zeros otherwise
+  self: prod_backward_fast(grad, self, result)
 
 # ---- Shape & view alignment batch: formulas mirror upstream
 # tools/autograd/derivatives.yaml (`at::sum_to(grad, self.sym_sizes())`,
@@ -815,3 +928,30 @@
 - name: fill.Tensor(Tensor self, Tensor value) -> Tensor
   self: tensorplay::tpx::ops::zeros_like(grad)
   value: grad.sum()
+
+# Trapezoid family: weights w_j = dx * [0.5, 1, ..., 1, 0.5] for the sum
+# form (x form uses coordinate differences); the cumulative form backprops a
+# reversed cumsum of grad times the same weights.
+- name: trapezoid(Tensor y, Tensor? x=None, *, Scalar dx=1, int dim=-1) -> Tensor
+  y: _trapezoid_backward(grad, x, y.shape(), dx, dim)
+
+- name: cumulative_trapezoid(Tensor y, Tensor? x=None, *, Scalar dx=1, int dim=-1) -> Tensor
+  y: _cumulative_trapezoid_backward(grad, x, dx, dim)
+
+- name: scatter_reduce(Tensor self, int dim, Tensor index, Tensor src, str reduce, *, bool include_self=True) -> Tensor
+  self: _scatter_reduce_backward_self(grad, self, dim, index, src, reduce, include_self)
+  src: _scatter_reduce_backward_src(grad, self, dim, index, src, reduce, include_self)
+
+- name: index_reduce(Tensor self, int dim, Tensor index, Tensor source, str reduce, *, bool include_self=True) -> Tensor
+  self: _index_reduce_backward_self(grad, self, dim, index, source, reduce, include_self)
+  source: _index_reduce_backward_src(grad, self, dim, index, source, reduce, include_self)
+
+# Covariance / correlation (ATen Correlation.cpp): C = M diag(w) M^T / fact
+# with M = X - weighted_avg. dL/dX = G_M - rowsum(G_M) * (w / wsum) where
+# G_M = ((grad + grad^T) M diag(w)) / fact. corrcoef chains through the clip
+# mask, the D^-1 C D^-1 normalization and cov's formula.
+- name: cov(Tensor self, *, int correction=1, Tensor? fweights=None, Tensor? aweights=None) -> Tensor
+  self: _cov_backward(grad, self, correction, fweights, aweights)
+
+- name: corrcoef(Tensor self) -> Tensor
+  self: _corrcoef_backward(grad, self)

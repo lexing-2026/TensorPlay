@@ -9,6 +9,9 @@ import unittest
 
 import tensorplay as tp
 
+if not tp.cuda.is_available():
+    raise unittest.SkipTest("CUDA runtime is not available")
+
 
 def _allclose(a, b, rtol=1e-5, atol=1e-6):
     return tp.allclose(a, b, rtol=rtol, atol=atol)
@@ -82,10 +85,10 @@ class TestLossHalfPrecision(unittest.TestCase):
             logits = tp.randn((6, 10), dtype=tp.float32).cuda().to(dtype)
             target = tp.randint(0, 10, (6,), dtype=tp.int64).cuda()
 
-            loss_none, _ = tp.nn.functional.nll_loss(logits, target, reduction="none")
+            loss_none = tp.nn.functional.nll_loss(logits, target, reduction="none")
             self.assertEqual(loss_none.dtype, logits.dtype)
-            loss_mean, _ = tp.nn.functional.nll_loss(logits, target, reduction="mean")
-            expected = -loss_none.mean()
+            loss_mean = tp.nn.functional.nll_loss(logits, target, reduction="mean")
+            expected = loss_none.mean()
             self.assertTrue(_allclose(loss_mean, expected, rtol=5e-2, atol=1e-2))
 
     def test_mse_loss_backward_reduced_dtype(self):

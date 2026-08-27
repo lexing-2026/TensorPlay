@@ -4,7 +4,7 @@ import math
 from enum import Enum
 from typing import Optional
 
-import tensorplay as torch
+import tensorplay as tensorplay
 from tensorplay import Tensor
 
 from . import functional as F, InterpolationMode
@@ -102,18 +102,18 @@ class AutoAugmentPolicy(Enum):
     SVHN = "svhn"
 
 
-class AutoAugment(torch.nn.Module):
+class AutoAugment(tensorplay.nn.Module):
     r"""AutoAugment data augmentation method based on
     `"AutoAugment: Learning Augmentation Strategies from Data" <https://arxiv.org/pdf/1805.09501.pdf>`_.
-    If the image is torch Tensor, it should be of type torch.uint8, and it is expected
+    If the image is tensorplay Tensor, it should be of type tensorplay.uint8, and it is expected
     to have [..., 1 or 3, H, W] shape, where ... means an arbitrary number of leading dimensions.
     If img is PIL Image, it is expected to be in mode "L" or "RGB".
 
     Args:
         policy (AutoAugmentPolicy): Desired policy enum defined by
-            :class:`torchvision.transforms.autoaugment.AutoAugmentPolicy`. Default is ``AutoAugmentPolicy.IMAGENET``.
+            :class:`tensorplay.vision.transforms.autoaugment.AutoAugmentPolicy`. Default is ``AutoAugmentPolicy.IMAGENET``.
         interpolation (InterpolationMode): Desired interpolation enum defined by
-            :class:`torchvision.transforms.InterpolationMode`. Default is ``InterpolationMode.NEAREST``.
+            :class:`tensorplay.vision.transforms.InterpolationMode`. Default is ``InterpolationMode.NEAREST``.
             If input is Tensor, only ``InterpolationMode.NEAREST``, ``InterpolationMode.BILINEAR`` are supported.
         fill (sequence or number, optional): Pixel fill value for the area outside the transformed
             image. If given a number, the value is used for all bands respectively.
@@ -224,20 +224,20 @@ class AutoAugment(torch.nn.Module):
     def _augmentation_space(self, num_bins: int, image_size: tuple[int, int]) -> dict[str, tuple[Tensor, bool]]:
         return {
             # op_name: (magnitudes, signed)
-            "ShearX": (torch.linspace(0.0, 0.3, num_bins), True),
-            "ShearY": (torch.linspace(0.0, 0.3, num_bins), True),
-            "TranslateX": (torch.linspace(0.0, 150.0 / 331.0 * image_size[1], num_bins), True),
-            "TranslateY": (torch.linspace(0.0, 150.0 / 331.0 * image_size[0], num_bins), True),
-            "Rotate": (torch.linspace(0.0, 30.0, num_bins), True),
-            "Brightness": (torch.linspace(0.0, 0.9, num_bins), True),
-            "Color": (torch.linspace(0.0, 0.9, num_bins), True),
-            "Contrast": (torch.linspace(0.0, 0.9, num_bins), True),
-            "Sharpness": (torch.linspace(0.0, 0.9, num_bins), True),
-            "Posterize": (8 - (torch.arange(num_bins) / ((num_bins - 1) / 4)).round().int(), False),
-            "Solarize": (torch.linspace(255.0, 0.0, num_bins), False),
-            "AutoContrast": (torch.tensor(0.0), False),
-            "Equalize": (torch.tensor(0.0), False),
-            "Invert": (torch.tensor(0.0), False),
+            "ShearX": (tensorplay.linspace(0.0, 0.3, num_bins), True),
+            "ShearY": (tensorplay.linspace(0.0, 0.3, num_bins), True),
+            "TranslateX": (tensorplay.linspace(0.0, 150.0 / 331.0 * image_size[1], num_bins), True),
+            "TranslateY": (tensorplay.linspace(0.0, 150.0 / 331.0 * image_size[0], num_bins), True),
+            "Rotate": (tensorplay.linspace(0.0, 30.0, num_bins), True),
+            "Brightness": (tensorplay.linspace(0.0, 0.9, num_bins), True),
+            "Color": (tensorplay.linspace(0.0, 0.9, num_bins), True),
+            "Contrast": (tensorplay.linspace(0.0, 0.9, num_bins), True),
+            "Sharpness": (tensorplay.linspace(0.0, 0.9, num_bins), True),
+            "Posterize": (8 - (tensorplay.arange(num_bins) / ((num_bins - 1) / 4)).round().int(), False),
+            "Solarize": (tensorplay.linspace(255.0, 0.0, num_bins), False),
+            "AutoContrast": (tensorplay.tensor(0.0), False),
+            "Equalize": (tensorplay.tensor(0.0), False),
+            "Invert": (tensorplay.tensor(0.0), False),
         }
 
     @staticmethod
@@ -247,9 +247,9 @@ class AutoAugment(torch.nn.Module):
         Returns:
             params required by the autoaugment transformation
         """
-        policy_id = int(torch.randint(transform_num, (1,)).item())
-        probs = torch.rand((2,))
-        signs = torch.randint(2, (2,))
+        policy_id = int(tensorplay.randint(transform_num, (1,)).item())
+        probs = tensorplay.rand((2,))
+        signs = tensorplay.randint(2, (2,))
 
         return policy_id, probs, signs
 
@@ -285,11 +285,11 @@ class AutoAugment(torch.nn.Module):
         return f"{self.__class__.__name__}(policy={self.policy}, fill={self.fill})"
 
 
-class RandAugment(torch.nn.Module):
+class RandAugment(tensorplay.nn.Module):
     r"""RandAugment data augmentation method based on
     `"RandAugment: Practical automated data augmentation with a reduced search space"
     <https://arxiv.org/abs/1909.13719>`_.
-    If the image is torch Tensor, it should be of type torch.uint8, and it is expected
+    If the image is tensorplay Tensor, it should be of type tensorplay.uint8, and it is expected
     to have [..., 1 or 3, H, W] shape, where ... means an arbitrary number of leading dimensions.
     If img is PIL Image, it is expected to be in mode "L" or "RGB".
 
@@ -298,7 +298,7 @@ class RandAugment(torch.nn.Module):
         magnitude (int): Magnitude for all the transformations.
         num_magnitude_bins (int): The number of different magnitude values.
         interpolation (InterpolationMode): Desired interpolation enum defined by
-            :class:`torchvision.transforms.InterpolationMode`. Default is ``InterpolationMode.NEAREST``.
+            :class:`tensorplay.vision.transforms.InterpolationMode`. Default is ``InterpolationMode.NEAREST``.
             If input is Tensor, only ``InterpolationMode.NEAREST``, ``InterpolationMode.BILINEAR`` are supported.
         fill (sequence or number, optional): Pixel fill value for the area outside the transformed
             image. If given a number, the value is used for all bands respectively.
@@ -322,20 +322,20 @@ class RandAugment(torch.nn.Module):
     def _augmentation_space(self, num_bins: int, image_size: tuple[int, int]) -> dict[str, tuple[Tensor, bool]]:
         return {
             # op_name: (magnitudes, signed)
-            "Identity": (torch.tensor(0.0), False),
-            "ShearX": (torch.linspace(0.0, 0.3, num_bins), True),
-            "ShearY": (torch.linspace(0.0, 0.3, num_bins), True),
-            "TranslateX": (torch.linspace(0.0, 150.0 / 331.0 * image_size[1], num_bins), True),
-            "TranslateY": (torch.linspace(0.0, 150.0 / 331.0 * image_size[0], num_bins), True),
-            "Rotate": (torch.linspace(0.0, 30.0, num_bins), True),
-            "Brightness": (torch.linspace(0.0, 0.9, num_bins), True),
-            "Color": (torch.linspace(0.0, 0.9, num_bins), True),
-            "Contrast": (torch.linspace(0.0, 0.9, num_bins), True),
-            "Sharpness": (torch.linspace(0.0, 0.9, num_bins), True),
-            "Posterize": (8 - (torch.arange(num_bins) / ((num_bins - 1) / 4)).round().int(), False),
-            "Solarize": (torch.linspace(255.0, 0.0, num_bins), False),
-            "AutoContrast": (torch.tensor(0.0), False),
-            "Equalize": (torch.tensor(0.0), False),
+            "Identity": (tensorplay.tensor(0.0), False),
+            "ShearX": (tensorplay.linspace(0.0, 0.3, num_bins), True),
+            "ShearY": (tensorplay.linspace(0.0, 0.3, num_bins), True),
+            "TranslateX": (tensorplay.linspace(0.0, 150.0 / 331.0 * image_size[1], num_bins), True),
+            "TranslateY": (tensorplay.linspace(0.0, 150.0 / 331.0 * image_size[0], num_bins), True),
+            "Rotate": (tensorplay.linspace(0.0, 30.0, num_bins), True),
+            "Brightness": (tensorplay.linspace(0.0, 0.9, num_bins), True),
+            "Color": (tensorplay.linspace(0.0, 0.9, num_bins), True),
+            "Contrast": (tensorplay.linspace(0.0, 0.9, num_bins), True),
+            "Sharpness": (tensorplay.linspace(0.0, 0.9, num_bins), True),
+            "Posterize": (8 - (tensorplay.arange(num_bins) / ((num_bins - 1) / 4)).round().int(), False),
+            "Solarize": (tensorplay.linspace(255.0, 0.0, num_bins), False),
+            "AutoContrast": (tensorplay.tensor(0.0), False),
+            "Equalize": (tensorplay.tensor(0.0), False),
         }
 
     def forward(self, img: Tensor) -> Tensor:
@@ -355,11 +355,11 @@ class RandAugment(torch.nn.Module):
 
         op_meta = self._augmentation_space(self.num_magnitude_bins, (height, width))
         for _ in range(self.num_ops):
-            op_index = int(torch.randint(len(op_meta), (1,)).item())
+            op_index = int(tensorplay.randint(len(op_meta), (1,)).item())
             op_name = list(op_meta.keys())[op_index]
             magnitudes, signed = op_meta[op_name]
             magnitude = float(magnitudes[self.magnitude].item()) if magnitudes.ndim > 0 else 0.0
-            if signed and torch.randint(2, (1,)):
+            if signed and tensorplay.randint(2, (1,)):
                 magnitude *= -1.0
             img = _apply_op(img, op_name, magnitude, interpolation=self.interpolation, fill=fill)
 
@@ -378,17 +378,17 @@ class RandAugment(torch.nn.Module):
         return s
 
 
-class TrivialAugmentWide(torch.nn.Module):
+class TrivialAugmentWide(tensorplay.nn.Module):
     r"""Dataset-independent data-augmentation with TrivialAugment Wide, as described in
     `"TrivialAugment: Tuning-free Yet State-of-the-Art Data Augmentation" <https://arxiv.org/abs/2103.10158>`_.
-    If the image is torch Tensor, it should be of type torch.uint8, and it is expected
+    If the image is tensorplay Tensor, it should be of type tensorplay.uint8, and it is expected
     to have [..., 1 or 3, H, W] shape, where ... means an arbitrary number of leading dimensions.
     If img is PIL Image, it is expected to be in mode "L" or "RGB".
 
     Args:
         num_magnitude_bins (int): The number of different magnitude values.
         interpolation (InterpolationMode): Desired interpolation enum defined by
-            :class:`torchvision.transforms.InterpolationMode`. Default is ``InterpolationMode.NEAREST``.
+            :class:`tensorplay.vision.transforms.InterpolationMode`. Default is ``InterpolationMode.NEAREST``.
             If input is Tensor, only ``InterpolationMode.NEAREST``, ``InterpolationMode.BILINEAR`` are supported.
         fill (sequence or number, optional): Pixel fill value for the area outside the transformed
             image. If given a number, the value is used for all bands respectively.
@@ -408,20 +408,20 @@ class TrivialAugmentWide(torch.nn.Module):
     def _augmentation_space(self, num_bins: int) -> dict[str, tuple[Tensor, bool]]:
         return {
             # op_name: (magnitudes, signed)
-            "Identity": (torch.tensor(0.0), False),
-            "ShearX": (torch.linspace(0.0, 0.99, num_bins), True),
-            "ShearY": (torch.linspace(0.0, 0.99, num_bins), True),
-            "TranslateX": (torch.linspace(0.0, 32.0, num_bins), True),
-            "TranslateY": (torch.linspace(0.0, 32.0, num_bins), True),
-            "Rotate": (torch.linspace(0.0, 135.0, num_bins), True),
-            "Brightness": (torch.linspace(0.0, 0.99, num_bins), True),
-            "Color": (torch.linspace(0.0, 0.99, num_bins), True),
-            "Contrast": (torch.linspace(0.0, 0.99, num_bins), True),
-            "Sharpness": (torch.linspace(0.0, 0.99, num_bins), True),
-            "Posterize": (8 - (torch.arange(num_bins) / ((num_bins - 1) / 6)).round().int(), False),
-            "Solarize": (torch.linspace(255.0, 0.0, num_bins), False),
-            "AutoContrast": (torch.tensor(0.0), False),
-            "Equalize": (torch.tensor(0.0), False),
+            "Identity": (tensorplay.tensor(0.0), False),
+            "ShearX": (tensorplay.linspace(0.0, 0.99, num_bins), True),
+            "ShearY": (tensorplay.linspace(0.0, 0.99, num_bins), True),
+            "TranslateX": (tensorplay.linspace(0.0, 32.0, num_bins), True),
+            "TranslateY": (tensorplay.linspace(0.0, 32.0, num_bins), True),
+            "Rotate": (tensorplay.linspace(0.0, 135.0, num_bins), True),
+            "Brightness": (tensorplay.linspace(0.0, 0.99, num_bins), True),
+            "Color": (tensorplay.linspace(0.0, 0.99, num_bins), True),
+            "Contrast": (tensorplay.linspace(0.0, 0.99, num_bins), True),
+            "Sharpness": (tensorplay.linspace(0.0, 0.99, num_bins), True),
+            "Posterize": (8 - (tensorplay.arange(num_bins) / ((num_bins - 1) / 6)).round().int(), False),
+            "Solarize": (tensorplay.linspace(255.0, 0.0, num_bins), False),
+            "AutoContrast": (tensorplay.tensor(0.0), False),
+            "Equalize": (tensorplay.tensor(0.0), False),
         }
 
     def forward(self, img: Tensor) -> Tensor:
@@ -440,15 +440,15 @@ class TrivialAugmentWide(torch.nn.Module):
                 fill = [float(f) for f in fill]
 
         op_meta = self._augmentation_space(self.num_magnitude_bins)
-        op_index = int(torch.randint(len(op_meta), (1,)).item())
+        op_index = int(tensorplay.randint(len(op_meta), (1,)).item())
         op_name = list(op_meta.keys())[op_index]
         magnitudes, signed = op_meta[op_name]
         magnitude = (
-            float(magnitudes[torch.randint(len(magnitudes), (1,), dtype=torch.long)].item())
+            float(magnitudes[tensorplay.randint(len(magnitudes), (1,), dtype=tensorplay.long)].item())
             if magnitudes.ndim > 0
             else 0.0
         )
-        if signed and torch.randint(2, (1,)):
+        if signed and tensorplay.randint(2, (1,)):
             magnitude *= -1.0
 
         return _apply_op(img, op_name, magnitude, interpolation=self.interpolation, fill=fill)
@@ -464,10 +464,10 @@ class TrivialAugmentWide(torch.nn.Module):
         return s
 
 
-class AugMix(torch.nn.Module):
+class AugMix(tensorplay.nn.Module):
     r"""AugMix data augmentation method based on
     `"AugMix: A Simple Data Processing Method to Improve Robustness and Uncertainty" <https://arxiv.org/abs/1912.02781>`_.
-    If the image is torch Tensor, it should be of type torch.uint8, and it is expected
+    If the image is tensorplay Tensor, it should be of type tensorplay.uint8, and it is expected
     to have [..., 1 or 3, H, W] shape, where ... means an arbitrary number of leading dimensions.
     If img is PIL Image, it is expected to be in mode "L" or "RGB".
 
@@ -479,7 +479,7 @@ class AugMix(torch.nn.Module):
         alpha (float): The hyperparameter for the probability distributions. Default is ``1.0``.
         all_ops (bool): Use all operations (including brightness, contrast, color and sharpness). Default is ``True``.
         interpolation (InterpolationMode): Desired interpolation enum defined by
-            :class:`torchvision.transforms.InterpolationMode`. Default is ``InterpolationMode.NEAREST``.
+            :class:`tensorplay.vision.transforms.InterpolationMode`. Default is ``InterpolationMode.NEAREST``.
             If input is Tensor, only ``InterpolationMode.NEAREST``, ``InterpolationMode.BILINEAR`` are supported.
         fill (sequence or number, optional): Pixel fill value for the area outside the transformed
             image. If given a number, the value is used for all bands respectively.
@@ -510,38 +510,38 @@ class AugMix(torch.nn.Module):
     def _augmentation_space(self, num_bins: int, image_size: tuple[int, int]) -> dict[str, tuple[Tensor, bool]]:
         s = {
             # op_name: (magnitudes, signed)
-            "ShearX": (torch.linspace(0.0, 0.3, num_bins), True),
-            "ShearY": (torch.linspace(0.0, 0.3, num_bins), True),
-            "TranslateX": (torch.linspace(0.0, image_size[1] / 3.0, num_bins), True),
-            "TranslateY": (torch.linspace(0.0, image_size[0] / 3.0, num_bins), True),
-            "Rotate": (torch.linspace(0.0, 30.0, num_bins), True),
-            "Posterize": (4 - (torch.arange(num_bins) / ((num_bins - 1) / 4)).round().int(), False),
-            "Solarize": (torch.linspace(255.0, 0.0, num_bins), False),
-            "AutoContrast": (torch.tensor(0.0), False),
-            "Equalize": (torch.tensor(0.0), False),
+            "ShearX": (tensorplay.linspace(0.0, 0.3, num_bins), True),
+            "ShearY": (tensorplay.linspace(0.0, 0.3, num_bins), True),
+            "TranslateX": (tensorplay.linspace(0.0, image_size[1] / 3.0, num_bins), True),
+            "TranslateY": (tensorplay.linspace(0.0, image_size[0] / 3.0, num_bins), True),
+            "Rotate": (tensorplay.linspace(0.0, 30.0, num_bins), True),
+            "Posterize": (4 - (tensorplay.arange(num_bins) / ((num_bins - 1) / 4)).round().int(), False),
+            "Solarize": (tensorplay.linspace(255.0, 0.0, num_bins), False),
+            "AutoContrast": (tensorplay.tensor(0.0), False),
+            "Equalize": (tensorplay.tensor(0.0), False),
         }
         if self.all_ops:
             s.update(
                 {
-                    "Brightness": (torch.linspace(0.0, 0.9, num_bins), True),
-                    "Color": (torch.linspace(0.0, 0.9, num_bins), True),
-                    "Contrast": (torch.linspace(0.0, 0.9, num_bins), True),
-                    "Sharpness": (torch.linspace(0.0, 0.9, num_bins), True),
+                    "Brightness": (tensorplay.linspace(0.0, 0.9, num_bins), True),
+                    "Color": (tensorplay.linspace(0.0, 0.9, num_bins), True),
+                    "Contrast": (tensorplay.linspace(0.0, 0.9, num_bins), True),
+                    "Sharpness": (tensorplay.linspace(0.0, 0.9, num_bins), True),
                 }
             )
         return s
 
-    @torch.jit.unused
+    @tensorplay.jit.unused
     def _pil_to_tensor(self, img) -> Tensor:
         return F.pil_to_tensor(img)
 
-    @torch.jit.unused
+    @tensorplay.jit.unused
     def _tensor_to_pil(self, img: Tensor):
         return F.to_pil_image(img)
 
     def _sample_dirichlet(self, params: Tensor) -> Tensor:
         # Must be on a separate method so that we can overwrite it in tests.
-        return torch._sample_dirichlet(params)
+        return tensorplay._sample_dirichlet(params)
 
     def forward(self, orig_img: Tensor) -> Tensor:
         """
@@ -570,28 +570,28 @@ class AugMix(torch.nn.Module):
         # Sample the beta weights for combining the original and augmented image. To get Beta, we use a Dirichlet
         # with 2 parameters. The 1st column stores the weights of the original and the 2nd the ones of augmented image.
         m = self._sample_dirichlet(
-            torch.tensor([self.alpha, self.alpha], device=batch.device).expand(batch_dims[0], -1)
+            tensorplay.tensor([self.alpha, self.alpha], device=batch.device).expand(batch_dims[0], -1)
         )
 
         # Sample the mixing weights and combine them with the ones sampled from Beta for the augmented images.
         combined_weights = self._sample_dirichlet(
-            torch.tensor([self.alpha] * self.mixture_width, device=batch.device).expand(batch_dims[0], -1)
+            tensorplay.tensor([self.alpha] * self.mixture_width, device=batch.device).expand(batch_dims[0], -1)
         ) * m[:, 1].view([batch_dims[0], -1])
 
         mix = m[:, 0].view(batch_dims) * batch
         for i in range(self.mixture_width):
             aug = batch
-            depth = self.chain_depth if self.chain_depth > 0 else int(torch.randint(low=1, high=4, size=(1,)).item())
+            depth = self.chain_depth if self.chain_depth > 0 else int(tensorplay.randint(low=1, high=4, size=(1,)).item())
             for _ in range(depth):
-                op_index = int(torch.randint(len(op_meta), (1,)).item())
+                op_index = int(tensorplay.randint(len(op_meta), (1,)).item())
                 op_name = list(op_meta.keys())[op_index]
                 magnitudes, signed = op_meta[op_name]
                 magnitude = (
-                    float(magnitudes[torch.randint(self.severity, (1,), dtype=torch.long)].item())
+                    float(magnitudes[tensorplay.randint(self.severity, (1,), dtype=tensorplay.long)].item())
                     if magnitudes.ndim > 0
                     else 0.0
                 )
-                if signed and torch.randint(2, (1,)):
+                if signed and tensorplay.randint(2, (1,)):
                     magnitude *= -1.0
                 aug = _apply_op(aug, op_name, magnitude, interpolation=self.interpolation, fill=fill)
             mix.add_(combined_weights[:, i].view(batch_dims) * aug)

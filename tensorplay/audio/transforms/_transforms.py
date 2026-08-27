@@ -4,10 +4,10 @@ import math
 import warnings
 from typing import Callable, Optional, Sequence, Tuple, Union
 
-import tensorplay as torch
+import tensorplay as tensorplay
 from tensorplay import Tensor
-from torch.nn.modules.lazy import LazyModuleMixin
-from torch.nn.parameter import UninitializedParameter
+from tensorplay.nn.modules.lazy import LazyModuleMixin
+from tensorplay.nn.parameter import UninitializedParameter
 
 from tensorplay.audio import functional as F
 from tensorplay.audio.functional.functional import (
@@ -22,7 +22,7 @@ from tensorplay.audio.functional.functional import (
 __all__ = []
 
 
-class Spectrogram(torch.nn.Module):
+class Spectrogram(tensorplay.nn.Module):
     r"""Create a spectrogram from a audio signal.
 
     .. devices:: CPU CUDA
@@ -35,7 +35,7 @@ class Spectrogram(torch.nn.Module):
         hop_length (int or None, optional): Length of hop between STFT windows. (Default: ``win_length // 2``)
         pad (int, optional): Two sided padding of signal. (Default: ``0``)
         window_fn (Callable[..., Tensor], optional): A function to create a window tensor
-            that is applied/multiplied to each frame/window. (Default: ``torch.hann_window``)
+            that is applied/multiplied to each frame/window. (Default: ``tensorplay.hann_window``)
         power (float or None, optional): Exponent for the magnitude spectrogram,
             (must be > 0) e.g., 1 for magnitude, 2 for power, etc.
             If None, then the complex spectrum is returned instead. (Default: ``2``)
@@ -54,8 +54,8 @@ class Spectrogram(torch.nn.Module):
             Deprecated and not used.
 
     Example
-        >>> waveform, sample_rate = torchaudio.load("test.wav", normalize=True)
-        >>> transform = torchaudio.transforms.Spectrogram(n_fft=800)
+        >>> waveform, sample_rate = tensorplay.audio.load("test.wav", normalize=True)
+        >>> transform = tensorplay.audio.transforms.Spectrogram(n_fft=800)
         >>> spectrogram = transform(waveform)
 
     """
@@ -67,7 +67,7 @@ class Spectrogram(torch.nn.Module):
         win_length: Optional[int] = None,
         hop_length: Optional[int] = None,
         pad: int = 0,
-        window_fn: Callable[..., Tensor] = torch.hann_window,
+        window_fn: Callable[..., Tensor] = tensorplay.hann_window,
         power: Optional[float] = 2.0,
         normalized: Union[bool, str] = False,
         wkwargs: Optional[dict] = None,
@@ -77,7 +77,7 @@ class Spectrogram(torch.nn.Module):
         return_complex: Optional[bool] = None,
     ) -> None:
         super(Spectrogram, self).__init__()
-        torch._C._log_api_usage_once("torchaudio.transforms.Spectrogram")
+        tensorplay._C._log_api_usage_once("tensorplay.audio.transforms.Spectrogram")
         self.n_fft = n_fft
         # number of FFT bins. the returned STFT result will have n_fft // 2 + 1
         # number of frequencies due to onesided=True in torch.stft
@@ -94,7 +94,7 @@ class Spectrogram(torch.nn.Module):
         if return_complex is not None:
             warnings.warn(
                 "`return_complex` argument is now deprecated and is not effective."
-                "`torchaudio.transforms.Spectrogram(power=None)` always returns a tensor with "
+                "`tensorplay.audio.transforms.Spectrogram(power=None)` always returns a tensor with "
                 "complex dtype. Please remove the argument in the function call."
             )
 
@@ -123,7 +123,7 @@ class Spectrogram(torch.nn.Module):
         )
 
 
-class InverseSpectrogram(torch.nn.Module):
+class InverseSpectrogram(tensorplay.nn.Module):
     r"""Create an inverse spectrogram to recover an audio signal from a spectrogram.
 
     .. devices:: CPU CUDA
@@ -136,7 +136,7 @@ class InverseSpectrogram(torch.nn.Module):
         hop_length (int or None, optional): Length of hop between STFT windows. (Default: ``win_length // 2``)
         pad (int, optional): Two sided padding of signal. (Default: ``0``)
         window_fn (Callable[..., Tensor], optional): A function to create a window tensor
-            that is applied/multiplied to each frame/window. (Default: ``torch.hann_window``)
+            that is applied/multiplied to each frame/window. (Default: ``tensorplay.hann_window``)
         normalized (bool or str, optional): Whether the stft output was normalized by magnitude. If input is str,
             choices are ``"window"`` and ``"frame_length"``, dependent on normalization mode. ``True`` maps to
             ``"window"``. (Default: ``False``)
@@ -152,7 +152,7 @@ class InverseSpectrogram(torch.nn.Module):
     Example
         >>> batch, freq, time = 2, 257, 100
         >>> length = 25344
-        >>> spectrogram = torch.randn(batch, freq, time, dtype=torch.cdouble)
+        >>> spectrogram = tensorplay.randn(batch, freq, time, dtype=tensorplay.cdouble)
         >>> transform = transforms.InverseSpectrogram(n_fft=512)
         >>> waveform = transform(spectrogram, length)
     """
@@ -164,7 +164,7 @@ class InverseSpectrogram(torch.nn.Module):
         win_length: Optional[int] = None,
         hop_length: Optional[int] = None,
         pad: int = 0,
-        window_fn: Callable[..., Tensor] = torch.hann_window,
+        window_fn: Callable[..., Tensor] = tensorplay.hann_window,
         normalized: Union[bool, str] = False,
         wkwargs: Optional[dict] = None,
         center: bool = True,
@@ -209,7 +209,7 @@ class InverseSpectrogram(torch.nn.Module):
         )
 
 
-class GriffinLim(torch.nn.Module):
+class GriffinLim(tensorplay.nn.Module):
     r"""Compute waveform from a linear scale magnitude spectrogram using the Griffin-Lim transformation.
 
     .. devices:: CPU CUDA
@@ -226,7 +226,7 @@ class GriffinLim(torch.nn.Module):
         win_length (int or None, optional): Window size. (Default: ``n_fft``)
         hop_length (int or None, optional): Length of hop between STFT windows. (Default: ``win_length // 2``)
         window_fn (Callable[..., Tensor], optional): A function to create a window tensor
-            that is applied/multiplied to each frame/window. (Default: ``torch.hann_window``)
+            that is applied/multiplied to each frame/window. (Default: ``tensorplay.hann_window``)
         power (float, optional): Exponent for the magnitude spectrogram,
             (must be > 0) e.g., 1 for magnitude, 2 for power, etc. (Default: ``2``)
         wkwargs (dict or None, optional): Arguments for window function. (Default: ``None``)
@@ -238,7 +238,7 @@ class GriffinLim(torch.nn.Module):
 
     Example
         >>> batch, freq, time = 2, 257, 100
-        >>> spectrogram = torch.randn(batch, freq, time)
+        >>> spectrogram = tensorplay.randn(batch, freq, time)
         >>> transform = transforms.GriffinLim(n_fft=512)
         >>> waveform = transform(spectrogram)
     """
@@ -250,7 +250,7 @@ class GriffinLim(torch.nn.Module):
         n_iter: int = 32,
         win_length: Optional[int] = None,
         hop_length: Optional[int] = None,
-        window_fn: Callable[..., Tensor] = torch.hann_window,
+        window_fn: Callable[..., Tensor] = tensorplay.hann_window,
         power: float = 2.0,
         wkwargs: Optional[dict] = None,
         momentum: float = 0.99,
@@ -297,7 +297,7 @@ class GriffinLim(torch.nn.Module):
         )
 
 
-class AmplitudeToDB(torch.nn.Module):
+class AmplitudeToDB(tensorplay.nn.Module):
     r"""Turn a tensor from the power/amplitude scale to the decibel scale.
 
     .. devices:: CPU CUDA
@@ -315,7 +315,7 @@ class AmplitudeToDB(torch.nn.Module):
             number is 80. (Default: ``None``)
 
     Example
-        >>> waveform, sample_rate = torchaudio.load("test.wav", normalize=True)
+        >>> waveform, sample_rate = tensorplay.audio.load("test.wav", normalize=True)
         >>> transform = transforms.AmplitudeToDB(stype="amplitude", top_db=80)
         >>> waveform_db = transform(waveform)
     """
@@ -346,7 +346,7 @@ class AmplitudeToDB(torch.nn.Module):
         return F.amplitude_to_DB(x, self.multiplier, self.amin, self.db_multiplier, self.top_db)
 
 
-class MelScale(torch.nn.Module):
+class MelScale(tensorplay.nn.Module):
     r"""Turn a normal STFT into a mel frequency STFT with triangular filter banks.
 
     .. devices:: CPU CUDA
@@ -364,14 +364,14 @@ class MelScale(torch.nn.Module):
         mel_scale (str, optional): Scale to use: ``htk`` or ``slaney``. (Default: ``htk``)
 
     Example
-        >>> waveform, sample_rate = torchaudio.load("test.wav", normalize=True)
+        >>> waveform, sample_rate = tensorplay.audio.load("test.wav", normalize=True)
         >>> spectrogram_transform = transforms.Spectrogram(n_fft=1024)
         >>> spectrogram = spectrogram_transform(waveform)
         >>> melscale_transform = transforms.MelScale(sample_rate=sample_rate, n_stft=1024 // 2 + 1)
         >>> melscale_spectrogram = melscale_transform(spectrogram)
 
     See also:
-        :py:func:`torchaudio.functional.melscale_fbanks` - The function used to
+        :py:func:`tensorplay.audio.functional.melscale_fbanks` - The function used to
         generate the filter banks.
     """
 
@@ -414,18 +414,18 @@ class MelScale(torch.nn.Module):
         """
 
         # (..., time, freq) dot (freq, n_mels) -> (..., n_mels, time)
-        mel_specgram = torch.matmul(specgram.transpose(-1, -2), self.fb).transpose(-1, -2)
+        mel_specgram = tensorplay.matmul(specgram.transpose(-1, -2), self.fb).transpose(-1, -2)
 
         return mel_specgram
 
 
-class InverseMelScale(torch.nn.Module):
+class InverseMelScale(tensorplay.nn.Module):
     r"""Estimate a STFT in normal frequency domain from mel frequency domain.
 
     .. devices:: CPU CUDA
 
     It minimizes the euclidian norm between the input mel-spectrogram and the product between
-    the estimated spectrogram and the filter banks using `torch.linalg.lstsq`.
+    the estimated spectrogram and the filter banks using `tensorplay.linalg.lstsq`.
 
     Args:
         n_stft (int): Number of bins in STFT. See ``n_fft`` in :class:`Spectrogram`.
@@ -436,13 +436,13 @@ class InverseMelScale(torch.nn.Module):
         norm (str or None, optional): If "slaney", divide the triangular mel weights by the width of the mel band
             (area normalization). (Default: ``None``)
         mel_scale (str, optional): Scale to use: ``htk`` or ``slaney``. (Default: ``htk``)
-        driver (str, optional): Name of the LAPACK/MAGMA method to be used for `torch.lstsq`.
+        driver (str, optional): Name of the LAPACK/MAGMA method to be used for `tensorplay.lstsq`.
             For CPU inputs the valid values are ``"gels"``, ``"gelsy"``, ``"gelsd"``, ``"gelss"``.
             For CUDA input, the only valid driver is ``"gels"``, which assumes that A is full-rank.
             (Default: ``"gels``)
 
     Example
-        >>> waveform, sample_rate = torchaudio.load("test.wav", normalize=True)
+        >>> waveform, sample_rate = tensorplay.audio.load("test.wav", normalize=True)
         >>> mel_spectrogram_transform = transforms.MelSpectrogram(sample_rate, n_fft=1024)
         >>> mel_spectrogram = mel_spectrogram_transform(waveform)
         >>> inverse_melscale_transform = transforms.InverseMelScale(n_stft=1024 // 2 + 1)
@@ -505,22 +505,22 @@ class InverseMelScale(torch.nn.Module):
         if self.n_mels != n_mels:
             raise ValueError("Expected an input with {} mel bins. Found: {}".format(self.n_mels, n_mels))
 
-        specgram = torch.relu(torch.linalg.lstsq(self.fb.transpose(-1, -2)[None], melspec, driver=self.driver).solution)
+        specgram = tensorplay.relu(tensorplay.linalg.lstsq(self.fb.transpose(-1, -2)[None], melspec, driver=self.driver).solution)
 
         # unpack batch
         specgram = specgram.view(shape[:-2] + (freq, time))
         return specgram
 
 
-class MelSpectrogram(torch.nn.Module):
+class MelSpectrogram(tensorplay.nn.Module):
     r"""Create MelSpectrogram for a raw audio signal.
 
     .. devices:: CPU CUDA
 
     .. properties:: Autograd TorchScript
 
-    This is a composition of :py:func:`torchaudio.transforms.Spectrogram`
-    and :py:func:`torchaudio.transforms.MelScale`.
+    This is a composition of :py:func:`tensorplay.audio.transforms.Spectrogram`
+    and :py:func:`tensorplay.audio.transforms.MelScale`.
 
     Sources
         * https://gist.github.com/kastnerkyle/179d6e9a88202ab0a2fe
@@ -537,7 +537,7 @@ class MelSpectrogram(torch.nn.Module):
         pad (int, optional): Two sided padding of signal. (Default: ``0``)
         n_mels (int, optional): Number of mel filterbanks. (Default: ``128``)
         window_fn (Callable[..., Tensor], optional): A function to create a window tensor
-            that is applied/multiplied to each frame/window. (Default: ``torch.hann_window``)
+            that is applied/multiplied to each frame/window. (Default: ``tensorplay.hann_window``)
         power (float, optional): Exponent for the magnitude spectrogram,
             (must be > 0) e.g., 1 for magnitude, 2 for power, etc. (Default: ``2``)
         normalized (bool, optional): Whether to normalize by magnitude after stft. (Default: ``False``)
@@ -553,12 +553,12 @@ class MelSpectrogram(torch.nn.Module):
         mel_scale (str, optional): Scale to use: ``htk`` or ``slaney``. (Default: ``htk``)
 
     Example
-        >>> waveform, sample_rate = torchaudio.load("test.wav", normalize=True)
+        >>> waveform, sample_rate = tensorplay.audio.load("test.wav", normalize=True)
         >>> transform = transforms.MelSpectrogram(sample_rate)
         >>> mel_specgram = transform(waveform)  # (channel, n_mels, time)
 
     See also:
-        :py:func:`torchaudio.functional.melscale_fbanks` - The function used to
+        :py:func:`tensorplay.audio.functional.melscale_fbanks` - The function used to
         generate the filter banks.
     """
     __constants__ = ["sample_rate", "n_fft", "win_length", "hop_length", "pad", "n_mels", "f_min"]
@@ -573,7 +573,7 @@ class MelSpectrogram(torch.nn.Module):
         f_max: Optional[float] = None,
         pad: int = 0,
         n_mels: int = 128,
-        window_fn: Callable[..., Tensor] = torch.hann_window,
+        window_fn: Callable[..., Tensor] = tensorplay.hann_window,
         power: float = 2.0,
         normalized: bool = False,
         wkwargs: Optional[dict] = None,
@@ -584,7 +584,7 @@ class MelSpectrogram(torch.nn.Module):
         mel_scale: str = "htk",
     ) -> None:
         super(MelSpectrogram, self).__init__()
-        torch._C._log_api_usage_once("torchaudio.transforms.MelSpectrogram")
+        tensorplay._C._log_api_usage_once("tensorplay.audio.transforms.MelSpectrogram")
 
         if onesided is not None:
             warnings.warn(
@@ -631,7 +631,7 @@ class MelSpectrogram(torch.nn.Module):
         return mel_specgram
 
 
-class MFCC(torch.nn.Module):
+class MFCC(tensorplay.nn.Module):
     r"""Create the Mel-frequency cepstrum coefficients from an audio signal.
 
     .. devices:: CPU CUDA
@@ -655,7 +655,7 @@ class MFCC(torch.nn.Module):
         melkwargs (dict or None, optional): arguments for MelSpectrogram. (Default: ``None``)
 
     Example
-        >>> waveform, sample_rate = torchaudio.load("test.wav", normalize=True)
+        >>> waveform, sample_rate = tensorplay.audio.load("test.wav", normalize=True)
         >>> transform = transforms.MFCC(
         >>>     sample_rate=sample_rate,
         >>>     n_mfcc=13,
@@ -664,7 +664,7 @@ class MFCC(torch.nn.Module):
         >>> mfcc = transform(waveform)
 
     See also:
-        :py:func:`torchaudio.functional.melscale_fbanks` - The function used to
+        :py:func:`tensorplay.audio.functional.melscale_fbanks` - The function used to
         generate the filter banks.
     """
     __constants__ = ["sample_rate", "n_mfcc", "dct_type", "top_db", "log_mels"]
@@ -709,16 +709,16 @@ class MFCC(torch.nn.Module):
         mel_specgram = self.MelSpectrogram(waveform)
         if self.log_mels:
             log_offset = 1e-6
-            mel_specgram = torch.log(mel_specgram + log_offset)
+            mel_specgram = tensorplay.log(mel_specgram + log_offset)
         else:
             mel_specgram = self.amplitude_to_DB(mel_specgram)
 
         # (..., time, n_mels) dot (n_mels, n_mfcc) -> (..., n_nfcc, time)
-        mfcc = torch.matmul(mel_specgram.transpose(-1, -2), self.dct_mat).transpose(-1, -2)
+        mfcc = tensorplay.matmul(mel_specgram.transpose(-1, -2), self.dct_mat).transpose(-1, -2)
         return mfcc
 
 
-class LFCC(torch.nn.Module):
+class LFCC(tensorplay.nn.Module):
     r"""Create the linear-frequency cepstrum coefficients from an audio signal.
 
     .. devices:: CPU CUDA
@@ -745,7 +745,7 @@ class LFCC(torch.nn.Module):
         speckwargs (dict or None, optional): arguments for Spectrogram. (Default: ``None``)
 
     Example
-        >>> waveform, sample_rate = torchaudio.load("test.wav", normalize=True)
+        >>> waveform, sample_rate = tensorplay.audio.load("test.wav", normalize=True)
         >>> transform = transforms.LFCC(
         >>>     sample_rate=sample_rate,
         >>>     n_lfcc=13,
@@ -754,7 +754,7 @@ class LFCC(torch.nn.Module):
         >>> lfcc = transform(waveform)
 
     See also:
-        :py:func:`torchaudio.functional.linear_fbanks` - The function used to
+        :py:func:`tensorplay.audio.functional.linear_fbanks` - The function used to
         generate the filter banks.
     """
     __constants__ = ["sample_rate", "n_filter", "n_lfcc", "dct_type", "top_db", "log_lf"]
@@ -815,20 +815,20 @@ class LFCC(torch.nn.Module):
         specgram = self.Spectrogram(waveform)
 
         # (..., time, freq) dot (freq, n_filter) -> (..., n_filter, time)
-        specgram = torch.matmul(specgram.transpose(-1, -2), self.filter_mat).transpose(-1, -2)
+        specgram = tensorplay.matmul(specgram.transpose(-1, -2), self.filter_mat).transpose(-1, -2)
 
         if self.log_lf:
             log_offset = 1e-6
-            specgram = torch.log(specgram + log_offset)
+            specgram = tensorplay.log(specgram + log_offset)
         else:
             specgram = self.amplitude_to_DB(specgram)
 
         # (..., time, n_filter) dot (n_filter, n_lfcc) -> (..., n_lfcc, time)
-        lfcc = torch.matmul(specgram.transpose(-1, -2), self.dct_mat).transpose(-1, -2)
+        lfcc = tensorplay.matmul(specgram.transpose(-1, -2), self.dct_mat).transpose(-1, -2)
         return lfcc
 
 
-class MuLawEncoding(torch.nn.Module):
+class MuLawEncoding(tensorplay.nn.Module):
     r"""Encode signal based on mu-law companding.
 
     .. devices:: CPU CUDA
@@ -845,8 +845,8 @@ class MuLawEncoding(torch.nn.Module):
         quantization_channels (int, optional): Number of channels. (Default: ``256``)
 
     Example
-       >>> waveform, sample_rate = torchaudio.load("test.wav", normalize=True)
-       >>> transform = torchaudio.transforms.MuLawEncoding(quantization_channels=512)
+       >>> waveform, sample_rate = tensorplay.audio.load("test.wav", normalize=True)
+       >>> transform = tensorplay.audio.transforms.MuLawEncoding(quantization_channels=512)
        >>> mulawtrans = transform(waveform)
 
     """
@@ -867,7 +867,7 @@ class MuLawEncoding(torch.nn.Module):
         return F.mu_law_encoding(x, self.quantization_channels)
 
 
-class MuLawDecoding(torch.nn.Module):
+class MuLawDecoding(tensorplay.nn.Module):
     r"""Decode mu-law encoded signal.
 
     .. devices:: CPU CUDA
@@ -884,8 +884,8 @@ class MuLawDecoding(torch.nn.Module):
         quantization_channels (int, optional): Number of channels. (Default: ``256``)
 
     Example
-        >>> waveform, sample_rate = torchaudio.load("test.wav", normalize=True)
-        >>> transform = torchaudio.transforms.MuLawDecoding(quantization_channels=512)
+        >>> waveform, sample_rate = tensorplay.audio.load("test.wav", normalize=True)
+        >>> transform = tensorplay.audio.transforms.MuLawDecoding(quantization_channels=512)
         >>> mulawtrans = transform(waveform)
     """
     __constants__ = ["quantization_channels"]
@@ -905,7 +905,7 @@ class MuLawDecoding(torch.nn.Module):
         return F.mu_law_decoding(x_mu, self.quantization_channels)
 
 
-class Resample(torch.nn.Module):
+class Resample(tensorplay.nn.Module):
     r"""Resample a signal from one frequency to another. A resampling method can be given.
 
     .. devices:: CPU CUDA
@@ -928,16 +928,16 @@ class Resample(torch.nn.Module):
         rolloff (float, optional): The roll-off frequency of the filter, as a fraction of the Nyquist.
             Lower values reduce anti-aliasing, but also reduce some of the highest frequencies. (Default: ``0.99``)
         beta (float or None, optional): The shape parameter used for kaiser window.
-        dtype (torch.device, optional):
+        dtype (tensorplay.device, optional):
             Determnines the precision that resampling kernel is pre-computed and cached. If not provided,
-            kernel is computed with ``torch.float64`` then cached as ``torch.float32``.
-            If you need higher precision, provide ``torch.float64``, and the pre-computed kernel is computed and
-            cached as ``torch.float64``. If you use resample with lower precision, then instead of providing this
+            kernel is computed with ``tensorplay.float64`` then cached as ``tensorplay.float32``.
+            If you need higher precision, provide ``tensorplay.float64``, and the pre-computed kernel is computed and
+            cached as ``tensorplay.float64``. If you use resample with lower precision, then instead of providing this
             providing this argument, please use ``Resample.to(dtype)``, so that the kernel generation is still
-            carried out on ``torch.float64``.
+            carried out on ``tensorplay.float64``.
 
     Example
-        >>> waveform, sample_rate = torchaudio.load("test.wav", normalize=True)
+        >>> waveform, sample_rate = tensorplay.audio.load("test.wav", normalize=True)
         >>> transform = transforms.Resample(sample_rate, sample_rate/10)
         >>> waveform = transform(waveform)
     """
@@ -951,7 +951,7 @@ class Resample(torch.nn.Module):
         rolloff: float = 0.99,
         beta: Optional[float] = None,
         *,
-        dtype: Optional[torch.dtype] = None,
+        dtype: Optional[tensorplay.dtype] = None,
     ) -> None:
         super().__init__()
 
@@ -989,14 +989,14 @@ class Resample(torch.nn.Module):
         return _apply_sinc_resample_kernel(waveform, self.orig_freq, self.new_freq, self.gcd, self.kernel, self.width)
 
 
-class ComputeDeltas(torch.nn.Module):
+class ComputeDeltas(tensorplay.nn.Module):
     r"""Compute delta coefficients of a tensor, usually a spectrogram.
 
     .. devices:: CPU CUDA
 
     .. properties:: Autograd TorchScript
 
-    See `torchaudio.functional.compute_deltas` for more details.
+    See `tensorplay.audio.functional.compute_deltas` for more details.
 
     Args:
         win_length (int, optional): The window length used for computing delta. (Default: ``5``)
@@ -1020,7 +1020,7 @@ class ComputeDeltas(torch.nn.Module):
         return F.compute_deltas(specgram, win_length=self.win_length, mode=self.mode)
 
 
-class TimeStretch(torch.nn.Module):
+class TimeStretch(tensorplay.nn.Module):
     r"""Stretch stft in time without modifying pitch for a given rate.
 
     .. devices:: CPU CUDA
@@ -1061,7 +1061,7 @@ class TimeStretch(torch.nn.Module):
 
         n_fft = (n_freq - 1) * 2
         hop_length = hop_length if hop_length is not None else n_fft // 2
-        self.register_buffer("phase_advance", torch.linspace(0, math.pi * hop_length, n_freq)[..., None])
+        self.register_buffer("phase_advance", tensorplay.linspace(0, math.pi * hop_length, n_freq)[..., None])
 
     def forward(self, complex_specgrams: Tensor, overriding_rate: Optional[float] = None) -> Tensor:
         r"""
@@ -1076,7 +1076,7 @@ class TimeStretch(torch.nn.Module):
                 Stretched spectrogram. The resulting tensor is of the corresponding complex dtype
                 as the input spectrogram, and the number of frames is changed to ``ceil(num_frame / rate)``.
         """
-        if not torch.is_complex(complex_specgrams):
+        if not tensorplay.is_complex(complex_specgrams):
             warnings.warn(
                 "The input to TimeStretch must be complex type. "
                 "Providing non-complex tensor produces invalid results.",
@@ -1092,7 +1092,7 @@ class TimeStretch(torch.nn.Module):
         return F.phase_vocoder(complex_specgrams, rate, self.phase_advance)
 
 
-class Fade(torch.nn.Module):
+class Fade(tensorplay.nn.Module):
     r"""Add a fade in and/or fade out to an waveform.
 
     .. devices:: CPU CUDA
@@ -1107,7 +1107,7 @@ class Fade(torch.nn.Module):
             (Default: ``"linear"``)
 
     Example
-        >>> waveform, sample_rate = torchaudio.load("test.wav", normalize=True)
+        >>> waveform, sample_rate = tensorplay.audio.load("test.wav", normalize=True)
         >>> transform = transforms.Fade(fade_in_len=sample_rate, fade_out_len=2 * sample_rate, fade_shape="linear")
         >>> faded_waveform = transform(waveform)
     """
@@ -1130,50 +1130,50 @@ class Fade(torch.nn.Module):
         device = waveform.device
         return self._fade_in(waveform_length, device) * self._fade_out(waveform_length, device) * waveform
 
-    def _fade_in(self, waveform_length: int, device: torch.device) -> Tensor:
-        fade = torch.linspace(0, 1, self.fade_in_len, device=device)
-        ones = torch.ones(waveform_length - self.fade_in_len, device=device)
+    def _fade_in(self, waveform_length: int, device: tensorplay.device) -> Tensor:
+        fade = tensorplay.linspace(0, 1, self.fade_in_len, device=device)
+        ones = tensorplay.ones(waveform_length - self.fade_in_len, device=device)
 
         if self.fade_shape == "linear":
             fade = fade
 
         if self.fade_shape == "exponential":
-            fade = torch.pow(2, (fade - 1)) * fade
+            fade = tensorplay.pow(2, (fade - 1)) * fade
 
         if self.fade_shape == "logarithmic":
-            fade = torch.log10(0.1 + fade) + 1
+            fade = tensorplay.log10(0.1 + fade) + 1
 
         if self.fade_shape == "quarter_sine":
-            fade = torch.sin(fade * math.pi / 2)
+            fade = tensorplay.sin(fade * math.pi / 2)
 
         if self.fade_shape == "half_sine":
-            fade = torch.sin(fade * math.pi - math.pi / 2) / 2 + 0.5
+            fade = tensorplay.sin(fade * math.pi - math.pi / 2) / 2 + 0.5
 
-        return torch.cat((fade, ones)).clamp_(0, 1)
+        return tensorplay.cat((fade, ones)).clamp_(0, 1)
 
-    def _fade_out(self, waveform_length: int, device: torch.device) -> Tensor:
-        fade = torch.linspace(0, 1, self.fade_out_len, device=device)
-        ones = torch.ones(waveform_length - self.fade_out_len, device=device)
+    def _fade_out(self, waveform_length: int, device: tensorplay.device) -> Tensor:
+        fade = tensorplay.linspace(0, 1, self.fade_out_len, device=device)
+        ones = tensorplay.ones(waveform_length - self.fade_out_len, device=device)
 
         if self.fade_shape == "linear":
             fade = -fade + 1
 
         if self.fade_shape == "exponential":
-            fade = torch.pow(2, -fade) * (1 - fade)
+            fade = tensorplay.pow(2, -fade) * (1 - fade)
 
         if self.fade_shape == "logarithmic":
-            fade = torch.log10(1.1 - fade) + 1
+            fade = tensorplay.log10(1.1 - fade) + 1
 
         if self.fade_shape == "quarter_sine":
-            fade = torch.sin(fade * math.pi / 2 + math.pi / 2)
+            fade = tensorplay.sin(fade * math.pi / 2 + math.pi / 2)
 
         if self.fade_shape == "half_sine":
-            fade = torch.sin(fade * math.pi + math.pi / 2) / 2 + 0.5
+            fade = tensorplay.sin(fade * math.pi + math.pi / 2) / 2 + 0.5
 
-        return torch.cat((ones, fade)).clamp_(0, 1)
+        return tensorplay.cat((ones, fade)).clamp_(0, 1)
 
 
-class _AxisMasking(torch.nn.Module):
+class _AxisMasking(tensorplay.nn.Module):
     r"""Apply masking to a spectrogram.
 
     Args:
@@ -1194,7 +1194,7 @@ class _AxisMasking(torch.nn.Module):
         self.iid_masks = iid_masks
         self.p = p
 
-    def forward(self, specgram: Tensor, mask_value: Union[float, torch.Tensor] = 0.0) -> Tensor:
+    def forward(self, specgram: Tensor, mask_value: Union[float, tensorplay.Tensor] = 0.0) -> Tensor:
         r"""
         Args:
             specgram (Tensor): Tensor of dimension `(..., freq, time)`.
@@ -1287,7 +1287,7 @@ class TimeMasking(_AxisMasking):
         super(TimeMasking, self).__init__(time_mask_param, 2, iid_masks, p=p)
 
 
-class SpecAugment(torch.nn.Module):
+class SpecAugment(tensorplay.nn.Module):
     r"""Apply time and frequency masking to a spectrogram.
     Args:
         n_time_masks (int): Number of time masks. If its value is zero, no time masking will be applied.
@@ -1358,7 +1358,7 @@ class SpecAugment(torch.nn.Module):
         return specgram
 
 
-class Loudness(torch.nn.Module):
+class Loudness(tensorplay.nn.Module):
     r"""Measure audio loudness according to the ITU-R BS.1770-4 recommendation.
 
     .. devices:: CPU CUDA
@@ -1369,7 +1369,7 @@ class Loudness(torch.nn.Module):
         sample_rate (int): Sample rate of audio signal.
 
     Example
-        >>> waveform, sample_rate = torchaudio.load("test.wav", normalize=True)
+        >>> waveform, sample_rate = tensorplay.audio.load("test.wav", normalize=True)
         >>> transform = transforms.Loudness(sample_rate)
         >>> loudness = transform(waveform)
 
@@ -1385,7 +1385,7 @@ class Loudness(torch.nn.Module):
     def forward(self, wavefrom: Tensor):
         r"""
         Args:
-            waveform(torch.Tensor): audio waveform of dimension `(..., channels, time)`
+            waveform(tensorplay.Tensor): audio waveform of dimension `(..., channels, time)`
 
         Returns:
             Tensor: loudness estimates (LKFS)
@@ -1393,7 +1393,7 @@ class Loudness(torch.nn.Module):
         return F.loudness(wavefrom, self.sample_rate)
 
 
-class Vol(torch.nn.Module):
+class Vol(tensorplay.nn.Module):
     r"""Adjust volume of waveform.
 
     .. devices:: CPU CUDA
@@ -1408,7 +1408,7 @@ class Vol(torch.nn.Module):
         gain_type (str, optional): Type of gain. One of: ``amplitude``, ``power``, ``db`` (Default: ``amplitude``)
 
     Example
-        >>> waveform, sample_rate = torchaudio.load("test.wav", normalize=True)
+        >>> waveform, sample_rate = tensorplay.audio.load("test.wav", normalize=True)
         >>> transform = transforms.Vol(gain=0.5, gain_type="amplitude")
         >>> quieter_waveform = transform(waveform)
     """
@@ -1438,10 +1438,10 @@ class Vol(torch.nn.Module):
         if self.gain_type == "power":
             waveform = F.gain(waveform, 10 * math.log10(self.gain))
 
-        return torch.clamp(waveform, -1, 1)
+        return tensorplay.clamp(waveform, -1, 1)
 
 
-class SlidingWindowCmn(torch.nn.Module):
+class SlidingWindowCmn(tensorplay.nn.Module):
     r"""
     Apply sliding-window cepstral mean (and optionally variance) normalization per utterance.
 
@@ -1458,7 +1458,7 @@ class SlidingWindowCmn(torch.nn.Module):
         norm_vars (bool, optional): If true, normalize variance to one. (bool, default = false)
 
     Example
-        >>> waveform, sample_rate = torchaudio.load("test.wav", normalize=True)
+        >>> waveform, sample_rate = tensorplay.audio.load("test.wav", normalize=True)
         >>> transform = transforms.SlidingWindowCmn(cmn_window=1000)
         >>> cmn_waveform = transform(waveform)
     """
@@ -1484,7 +1484,7 @@ class SlidingWindowCmn(torch.nn.Module):
         return cmn_specgram
 
 
-class Vad(torch.nn.Module):
+class Vad(tensorplay.nn.Module):
     r"""Voice Activity Detector. Similar to SoX implementation.
 
     .. devices:: CPU CUDA
@@ -1538,7 +1538,7 @@ class Vad(torch.nn.Module):
             in the detector algorithm. (Default: 2000.0)
 
     Example
-        >>> waveform, sample_rate = torchaudio.load("test.wav", normalize=True)
+        >>> waveform, sample_rate = tensorplay.audio.load("test.wav", normalize=True)
         >>> waveform_reversed, sample_rate = apply_effects_tensor(waveform, sample_rate, [["reverse"]])
         >>> transform = transforms.Vad(sample_rate=sample_rate, trigger_level=7.5)
         >>> waveform_reversed_front_trim = transform(waveform_reversed)
@@ -1620,7 +1620,7 @@ class Vad(torch.nn.Module):
         )
 
 
-class SpectralCentroid(torch.nn.Module):
+class SpectralCentroid(tensorplay.nn.Module):
     r"""Compute the spectral centroid for each channel along the time axis.
 
     .. devices:: CPU CUDA
@@ -1637,11 +1637,11 @@ class SpectralCentroid(torch.nn.Module):
         hop_length (int or None, optional): Length of hop between STFT windows. (Default: ``win_length // 2``)
         pad (int, optional): Two sided padding of signal. (Default: ``0``)
         window_fn (Callable[..., Tensor], optional): A function to create a window tensor
-            that is applied/multiplied to each frame/window. (Default: ``torch.hann_window``)
+            that is applied/multiplied to each frame/window. (Default: ``tensorplay.hann_window``)
         wkwargs (dict or None, optional): Arguments for window function. (Default: ``None``)
 
     Example
-        >>> waveform, sample_rate = torchaudio.load("test.wav", normalize=True)
+        >>> waveform, sample_rate = tensorplay.audio.load("test.wav", normalize=True)
         >>> transform = transforms.SpectralCentroid(sample_rate)
         >>> spectral_centroid = transform(waveform)  # (channel, time)
     """
@@ -1654,7 +1654,7 @@ class SpectralCentroid(torch.nn.Module):
         win_length: Optional[int] = None,
         hop_length: Optional[int] = None,
         pad: int = 0,
-        window_fn: Callable[..., Tensor] = torch.hann_window,
+        window_fn: Callable[..., Tensor] = tensorplay.hann_window,
         wkwargs: Optional[dict] = None,
     ) -> None:
         super(SpectralCentroid, self).__init__()
@@ -1680,7 +1680,7 @@ class SpectralCentroid(torch.nn.Module):
         )
 
 
-class PitchShift(LazyModuleMixin, torch.nn.Module):
+class PitchShift(LazyModuleMixin, tensorplay.nn.Module):
     r"""Shift the pitch of a waveform by ``n_steps`` steps.
 
     .. devices:: CPU CUDA
@@ -1697,10 +1697,10 @@ class PitchShift(LazyModuleMixin, torch.nn.Module):
         hop_length (int or None, optional): Length of hop between STFT windows. If None, then ``win_length // 4``
             is used (Default: ``None``).
         window (Tensor or None, optional): Window tensor that is applied/multiplied to each frame/window.
-            If None, then ``torch.hann_window(win_length)`` is used (Default: ``None``).
+            If None, then ``tensorplay.hann_window(win_length)`` is used (Default: ``None``).
 
     Example
-        >>> waveform, sample_rate = torchaudio.load("test.wav", normalize=True)
+        >>> waveform, sample_rate = tensorplay.audio.load("test.wav", normalize=True)
         >>> transform = transforms.PitchShift(sample_rate, 4)
         >>> waveform_shift = transform(waveform)  # (channel, time)
     """
@@ -1717,7 +1717,7 @@ class PitchShift(LazyModuleMixin, torch.nn.Module):
         n_fft: int = 512,
         win_length: Optional[int] = None,
         hop_length: Optional[int] = None,
-        window_fn: Callable[..., Tensor] = torch.hann_window,
+        window_fn: Callable[..., Tensor] = tensorplay.hann_window,
         wkwargs: Optional[dict] = None,
     ) -> None:
         super().__init__()
@@ -1740,7 +1740,7 @@ class PitchShift(LazyModuleMixin, torch.nn.Module):
     def initialize_parameters(self, input):
         if self.has_uninitialized_params():
             if self.orig_freq != self.sample_rate:
-                with torch.no_grad():
+                with tensorplay.no_grad():
                     kernel, self.width = _get_sinc_resample_kernel(
                         self.orig_freq,
                         self.sample_rate,
@@ -1789,7 +1789,7 @@ class PitchShift(LazyModuleMixin, torch.nn.Module):
         )
 
 
-class RNNTLoss(torch.nn.Module):
+class RNNTLoss(tensorplay.nn.Module):
     """Compute the RNN Transducer loss from *Sequence Transduction with Recurrent Neural Networks*
     :cite:`graves2012sequence`.
 
@@ -1810,17 +1810,17 @@ class RNNTLoss(torch.nn.Module):
 
     Example
         >>> # Hypothetical values
-        >>> logits = torch.tensor([[[[0.1, 0.6, 0.1, 0.1, 0.1],
+        >>> logits = tensorplay.tensor([[[[0.1, 0.6, 0.1, 0.1, 0.1],
         >>>                          [0.1, 0.1, 0.6, 0.1, 0.1],
         >>>                          [0.1, 0.1, 0.2, 0.8, 0.1]],
         >>>                         [[0.1, 0.6, 0.1, 0.1, 0.1],
         >>>                          [0.1, 0.1, 0.2, 0.1, 0.1],
         >>>                          [0.7, 0.1, 0.2, 0.1, 0.1]]]],
-        >>>                       dtype=torch.float32,
+        >>>                       dtype=tensorplay.float32,
         >>>                       requires_grad=True)
-        >>> targets = torch.tensor([[1, 2]], dtype=torch.int)
-        >>> logit_lengths = torch.tensor([2], dtype=torch.int)
-        >>> target_lengths = torch.tensor([2], dtype=torch.int)
+        >>> targets = tensorplay.tensor([[1, 2]], dtype=tensorplay.int)
+        >>> logit_lengths = tensorplay.tensor([2], dtype=tensorplay.int)
+        >>> target_lengths = tensorplay.tensor([2], dtype=tensorplay.int)
         >>> transform = transforms.RNNTLoss(blank=0)
         >>> loss = transform(logits, targets, logit_lengths, target_lengths)
         >>> loss.backward()
@@ -1869,10 +1869,10 @@ class RNNTLoss(torch.nn.Module):
         )
 
 
-class Convolve(torch.nn.Module):
+class Convolve(tensorplay.nn.Module):
     r"""
     Convolves inputs along their last dimension using the direct method.
-    Note that, in contrast to :class:`torch.nn.Conv1d`, which actually applies the valid cross-correlation
+    Note that, in contrast to :class:`tensorplay.nn.Conv1d`, which actually applies the valid cross-correlation
     operator, this module applies the true `convolution`_ operator.
 
     .. devices:: CPU CUDA
@@ -1898,25 +1898,25 @@ class Convolve(torch.nn.Module):
         super().__init__()
         self.mode = mode
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: tensorplay.Tensor, y: tensorplay.Tensor) -> tensorplay.Tensor:
         r"""
         Args:
-            x (torch.Tensor): First convolution operand, with shape `(..., N)`.
-            y (torch.Tensor): Second convolution operand, with shape `(..., M)`
+            x (tensorplay.Tensor): First convolution operand, with shape `(..., N)`.
+            y (tensorplay.Tensor): Second convolution operand, with shape `(..., M)`
                 (leading dimensions must be broadcast-able with those of ``x``).
 
         Returns:
-            torch.Tensor: Result of convolving ``x`` and ``y``, with shape `(..., L)`, where
+            tensorplay.Tensor: Result of convolving ``x`` and ``y``, with shape `(..., L)`, where
             the leading dimensions match those of ``x`` and `L` is dictated by ``mode``.
         """
         return F.convolve(x, y, mode=self.mode)
 
 
-class FFTConvolve(torch.nn.Module):
+class FFTConvolve(tensorplay.nn.Module):
     r"""
     Convolves inputs along their last dimension using FFT. For inputs with large last dimensions, this module
     is generally much faster than :class:`Convolve`.
-    Note that, in contrast to :class:`torch.nn.Conv1d`, which actually applies the valid cross-correlation
+    Note that, in contrast to :class:`tensorplay.nn.Conv1d`, which actually applies the valid cross-correlation
     operator, this module applies the true `convolution`_ operator.
     Also note that this module can only output float tensors (int tensor inputs will be cast to float).
 
@@ -1943,15 +1943,15 @@ class FFTConvolve(torch.nn.Module):
         super().__init__()
         self.mode = mode
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: tensorplay.Tensor, y: tensorplay.Tensor) -> tensorplay.Tensor:
         r"""
         Args:
-            x (torch.Tensor): First convolution operand, with shape `(..., N)`.
-            y (torch.Tensor): Second convolution operand, with shape `(..., M)`
+            x (tensorplay.Tensor): First convolution operand, with shape `(..., N)`.
+            y (tensorplay.Tensor): Second convolution operand, with shape `(..., M)`
                 (leading dimensions must be broadcast-able with those of ``x``).
 
         Returns:
-            torch.Tensor: Result of convolving ``x`` and ``y``, with shape `(..., L)`, where
+            tensorplay.Tensor: Result of convolving ``x`` and ``y``, with shape `(..., L)`, where
             the leading dimensions match those of ``x`` and `L` is dictated by ``mode``.
         """
         return F.fftconvolve(x, y, mode=self.mode)
@@ -1964,7 +1964,7 @@ def _source_target_sample_rate(orig_freq: int, speed: float) -> Tuple[int, int]:
     return source_sample_rate // gcd, target_sample_rate // gcd
 
 
-class Speed(torch.nn.Module):
+class Speed(tensorplay.nn.Module):
     r"""Adjusts waveform speed.
 
     .. devices:: CPU CUDA
@@ -1986,18 +1986,18 @@ class Speed(torch.nn.Module):
         self.source_sample_rate, self.target_sample_rate = _source_target_sample_rate(orig_freq, factor)
         self.resampler = Resample(orig_freq=self.source_sample_rate, new_freq=self.target_sample_rate)
 
-    def forward(self, waveform, lengths: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self, waveform, lengths: Optional[tensorplay.Tensor] = None) -> Tuple[tensorplay.Tensor, Optional[tensorplay.Tensor]]:
         r"""
         Args:
-            waveform (torch.Tensor): Input signals, with shape `(..., time)`.
-            lengths (torch.Tensor or None, optional): Valid lengths of signals in ``waveform``, with shape `(...)`.
+            waveform (tensorplay.Tensor): Input signals, with shape `(..., time)`.
+            lengths (tensorplay.Tensor or None, optional): Valid lengths of signals in ``waveform``, with shape `(...)`.
                 If ``None``, all elements in ``waveform`` are treated as valid. (Default: ``None``)
 
         Returns:
-            (torch.Tensor, torch.Tensor or None):
-                torch.Tensor
+            (tensorplay.Tensor, tensorplay.Tensor or None):
+                tensorplay.Tensor
                     Speed-adjusted waveform, with shape `(..., new_time).`
-                torch.Tensor or None
+                tensorplay.Tensor or None
                     If ``lengths`` is not ``None``, valid lengths of signals in speed-adjusted waveform,
                     with shape `(...)`; otherwise, ``None``.
         """
@@ -2005,12 +2005,12 @@ class Speed(torch.nn.Module):
         if lengths is None:
             out_lengths = None
         else:
-            out_lengths = torch.ceil(lengths * self.target_sample_rate / self.source_sample_rate).to(lengths.dtype)
+            out_lengths = tensorplay.ceil(lengths * self.target_sample_rate / self.source_sample_rate).to(lengths.dtype)
 
         return self.resampler(waveform), out_lengths
 
 
-class SpeedPerturbation(torch.nn.Module):
+class SpeedPerturbation(tensorplay.nn.Module):
     r"""Applies the speed perturbation augmentation introduced in
     *Audio augmentation for speech recognition* :cite:`ko15_interspeech`. For a given input,
     the module samples a speed-up factor from ``factors`` uniformly at random and adjusts
@@ -2035,27 +2035,27 @@ class SpeedPerturbation(torch.nn.Module):
     def __init__(self, orig_freq: int, factors: Sequence[float]) -> None:
         super().__init__()
 
-        self.speeders = torch.nn.ModuleList([Speed(orig_freq=orig_freq, factor=factor) for factor in factors])
+        self.speeders = tensorplay.nn.ModuleList([Speed(orig_freq=orig_freq, factor=factor) for factor in factors])
 
     def forward(
-        self, waveform: torch.Tensor, lengths: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        self, waveform: tensorplay.Tensor, lengths: Optional[tensorplay.Tensor] = None
+    ) -> Tuple[tensorplay.Tensor, Optional[tensorplay.Tensor]]:
         r"""
         Args:
-            waveform (torch.Tensor): Input signals, with shape `(..., time)`.
-            lengths (torch.Tensor or None, optional): Valid lengths of signals in ``waveform``, with shape `(...)`.
+            waveform (tensorplay.Tensor): Input signals, with shape `(..., time)`.
+            lengths (tensorplay.Tensor or None, optional): Valid lengths of signals in ``waveform``, with shape `(...)`.
                 If ``None``, all elements in ``waveform`` are treated as valid. (Default: ``None``)
 
         Returns:
-            (torch.Tensor, torch.Tensor or None):
-                torch.Tensor
+            (tensorplay.Tensor, tensorplay.Tensor or None):
+                tensorplay.Tensor
                     Speed-adjusted waveform, with shape `(..., new_time).`
-                torch.Tensor or None
+                tensorplay.Tensor or None
                     If ``lengths`` is not ``None``, valid lengths of signals in speed-adjusted waveform,
                     with shape `(...)`; otherwise, ``None``.
         """
 
-        idx = int(torch.randint(len(self.speeders), ()))
+        idx = int(tensorplay.randint(len(self.speeders), ()))
         # NOTE: we do this because TorchScript doesn't allow for
         # indexing ModuleList instances with non-literals.
         for speeder_idx, speeder in enumerate(self.speeders):
@@ -2064,9 +2064,9 @@ class SpeedPerturbation(torch.nn.Module):
         raise RuntimeError("Speeder not found; execution should have never reached here.")
 
 
-class AddNoise(torch.nn.Module):
+class AddNoise(tensorplay.nn.Module):
     r"""Scales and adds noise to waveform per signal-to-noise ratio.
-    See :meth:`torchaudio.functional.add_noise` for more details.
+    See :meth:`tensorplay.audio.functional.add_noise` for more details.
 
     .. devices:: CPU CUDA
 
@@ -2074,27 +2074,27 @@ class AddNoise(torch.nn.Module):
     """
 
     def forward(
-        self, waveform: torch.Tensor, noise: torch.Tensor, snr: torch.Tensor, lengths: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+        self, waveform: tensorplay.Tensor, noise: tensorplay.Tensor, snr: tensorplay.Tensor, lengths: Optional[tensorplay.Tensor] = None
+    ) -> tensorplay.Tensor:
         r"""
         Args:
-            waveform (torch.Tensor): Input waveform, with shape `(..., L)`.
-            noise (torch.Tensor): Noise, with shape `(..., L)` (same shape as ``waveform``).
-            snr (torch.Tensor): Signal-to-noise ratios in dB, with shape `(...,)`.
-            lengths (torch.Tensor or None, optional): Valid lengths of signals in ``waveform`` and ``noise``,
+            waveform (tensorplay.Tensor): Input waveform, with shape `(..., L)`.
+            noise (tensorplay.Tensor): Noise, with shape `(..., L)` (same shape as ``waveform``).
+            snr (tensorplay.Tensor): Signal-to-noise ratios in dB, with shape `(...,)`.
+            lengths (tensorplay.Tensor or None, optional): Valid lengths of signals in ``waveform`` and ``noise``,
             with shape `(...,)` (leading dimensions must match those of ``waveform``). If ``None``, all
             elements in ``waveform`` and ``noise`` are treated as valid. (Default: ``None``)
 
         Returns:
-            torch.Tensor: Result of scaling and adding ``noise`` to ``waveform``, with shape `(..., L)`
+            tensorplay.Tensor: Result of scaling and adding ``noise`` to ``waveform``, with shape `(..., L)`
             (same shape as ``waveform``).
         """
         return F.add_noise(waveform, noise, snr, lengths)
 
 
-class Preemphasis(torch.nn.Module):
+class Preemphasis(tensorplay.nn.Module):
     r"""Pre-emphasizes a waveform along its last dimension.
-    See :meth:`torchaudio.functional.preemphasis` for more details.
+    See :meth:`tensorplay.audio.functional.preemphasis` for more details.
 
     .. devices:: CPU CUDA
 
@@ -2109,20 +2109,20 @@ class Preemphasis(torch.nn.Module):
         super().__init__()
         self.coeff = coeff
 
-    def forward(self, waveform: torch.Tensor) -> torch.Tensor:
+    def forward(self, waveform: tensorplay.Tensor) -> tensorplay.Tensor:
         r"""
         Args:
-            waveform (torch.Tensor): Waveform, with shape `(..., N)`.
+            waveform (tensorplay.Tensor): Waveform, with shape `(..., N)`.
 
         Returns:
-            torch.Tensor: Pre-emphasized waveform, with shape `(..., N)`.
+            tensorplay.Tensor: Pre-emphasized waveform, with shape `(..., N)`.
         """
         return F.preemphasis(waveform, coeff=self.coeff)
 
 
-class Deemphasis(torch.nn.Module):
+class Deemphasis(tensorplay.nn.Module):
     r"""De-emphasizes a waveform along its last dimension.
-    See :meth:`torchaudio.functional.deemphasis` for more details.
+    See :meth:`tensorplay.audio.functional.deemphasis` for more details.
 
     .. devices:: CPU CUDA
 
@@ -2137,12 +2137,12 @@ class Deemphasis(torch.nn.Module):
         super().__init__()
         self.coeff = coeff
 
-    def forward(self, waveform: torch.Tensor) -> torch.Tensor:
+    def forward(self, waveform: tensorplay.Tensor) -> tensorplay.Tensor:
         r"""
         Args:
-            waveform (torch.Tensor): Waveform, with shape `(..., N)`.
+            waveform (tensorplay.Tensor): Waveform, with shape `(..., N)`.
 
         Returns:
-            torch.Tensor: De-emphasized waveform, with shape `(..., N)`.
+            tensorplay.Tensor: De-emphasized waveform, with shape `(..., N)`.
         """
         return F.functional.deemphasis(waveform, coeff=self.coeff)

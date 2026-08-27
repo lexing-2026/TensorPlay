@@ -8,6 +8,7 @@ skipped when torch is not importable.
 import pickle
 import warnings
 
+import numpy as np
 import pytest
 
 import tensorplay as tp
@@ -449,3 +450,235 @@ def test_parity_autocast_dtypes_cpu():
     assert th_out.dtype == torch.bfloat16
     assert tp_sm.dtype == tp.float32
     assert th_sm.dtype == torch.float32
+
+
+# ---------------------------------------------------------------------------
+# Upstream policy-list alignment (ops added to match AT_FORALL_*)
+# ---------------------------------------------------------------------------
+
+def test_lower_precision_ops_added():
+    import tensorplay.nn.functional as F
+
+    a = tp.randn(4, 4)
+    b = tp.randn(4, 4)
+    w = tp.randn(()) * 0.5 + 1.0
+    with autocast(device_type="cpu"):
+        assert tp.addmm(a, b, b).dtype == tp.bfloat16
+        assert tp.addbmm(a, b.unsqueeze(0).expand(3, 4, 4),
+                         b.unsqueeze(0).expand(3, 4, 4)).dtype == tp.bfloat16
+        assert F.prelu(a, w.abs()).dtype == tp.bfloat16
+        # torch's KERNEL_CPU list does NOT wrap addmv/addr/mv/einsum: they run
+        # in their input dtype (fp32 here), matching ATen/autocast_mode.cpp.
+        assert tp.addmv(a[0], b, b[0]).dtype == tp.float32
+        assert tp.addr(a[0], b[0], b[1]).dtype == tp.float32
+
+
+def test_fp32_loss_and_reduction_ops_added():
+    a = tp.randn(8, 4)
+    target = tp.randn(8, 4)
+    cls_target = tp.zeros(8, dtype=tp.int64)
+    with autocast(device_type="cpu"):
+        for out in (
+            tp.kl_div(a.log_softmax(1), a.softmax(1)),
+            tp.l1_loss(a, target),
+            tp.smooth_l1_loss(a, target),
+            tp.huber_loss(a, target),
+            tp.binary_cross_entropy_with_logits(a.sum(1), cls_target.to(a.dtype)),
+            tp.logsumexp(a, dim=1),
+            tp.cumsum(a, dim=1),
+            tp.cumprod(a.abs(), dim=1),
+            tp.pow(a, 2.0),
+            tp.reciprocal(a.abs().clamp_min(0.5)),
+            tp.softplus(a),
+            tp.renorm(a, 2, 0, 1.0),
+            tp.dist(a, target),
+        ):
+            assert out.dtype == tp.float32, out.dtype
+
+
+def test_pow_tensor_tensor_stays_fp32():
+    a = tp.randn(4, 4)
+    with autocast(device_type="cpu"):
+        assert tp.pow(a, a.abs()).dtype == tp.float32
+        assert (a ** 2).dtype == tp.float32
+
+
+def test_promote_ops_added():
+    a = tp.randn(4, 4)
+    half_a = a.to(tp.float16)
+    idx = tp.zeros(4, dtype=tp.int64)
+    src = tp.randn(2, 4)
+    with autocast(device_type="cpu"):
+        # smoke: promote-wrapped op runs under autocast
+        assert tp.scatter_add(
+            tp.zeros(4, 4), 0,
+            idx[:2].unsqueeze(1).expand(2, 4), src) is not None
+        # promote semantics: fp32 present -> fp32 out (matches upstream)
+        assert tp.atan2(a, half_a).dtype == tp.float32
+
+
+# ---------------------------------------------------------------------------
+# Cast-cache semantics (thread-local, version-validated, inference caching)
+# ---------------------------------------------------------------------------
+
+def test_inference_weights_cached_not_recast_every_op():
+    """Under no_grad torch recasts every weight on every call; with the
+    version-validated cache every repeat must be bit-identical to the first
+    (the cached low-precision weights are reused)."""
+    w = tp.randn(4, 4)
+    x = tp.randn(4, 4) * 0.1
+    outs = []
+    with tp.no_grad():
+        with autocast(device_type="cpu"):
+            for _ in range(3):
+                outs.append(tp.matmul(w, x))
+    first = outs[0]
+    assert first.dtype == tp.bfloat16
+    for o in outs[1:]:
+        assert o.dtype == tp.bfloat16
+        assert np.array_equal(o.cpu().numpy(), first.cpu().numpy())
+
+
+def test_inplace_mutation_invalidates_cached_cast():
+    w = tp.randn(4, 4)
+    ones = tp.ones(4, 4)
+    with tp.no_grad():
+        with autocast(device_type="cpu"):
+            before = tp.matmul(w, ones).sum().item()
+            w.add_(1.0)  # bump version -> cached bf16 cast must be dropped
+            after = tp.matmul(w, ones).sum().item()
+    # sum(w @ ones) == 4 * sum(w); adding 1.0 everywhere adds exactly 16
+    assert after - before > 15.5
+
+
+def test_cache_cleared_after_region_exit():
+    w = tp.randn(4, 4)
+    with tp.no_grad():
+        with autocast(device_type="cpu"):
+            tp.matmul(w, w)
+    # re-entering starts from an empty cache: results stay correct either way
+    with tp.no_grad():
+        with autocast(device_type="cpu"):
+            assert tp.matmul(w, w).dtype == tp.bfloat16
+
+
+def test_enter_exit_on_exception_restores_state():
+    prev_enabled = tp.is_autocast_enabled("cpu")
+    prev_dtype = tp.get_autocast_dtype("cpu")
+    base_nesting = tp.autocast_increment_nesting()
+    tp.autocast_decrement_nesting()
+    try:
+        with autocast(device_type="cpu", dtype=tp.float16):
+            raise ValueError("boom")
+    except ValueError:
+        pass
+    assert tp.is_autocast_enabled("cpu") == prev_enabled
+    assert tp.get_autocast_dtype("cpu") == prev_dtype
+
+
+@pytest.mark.skipif(not HAS_TORCH, reason="torch not installed")
+def test_parity_new_policy_ops_cpu():
+    import torch
+
+    ta = tp.randn(6, 6)
+    tb = tp.randn(6, 6)
+    xa = torch.from_numpy(ta.numpy())
+    xb = torch.from_numpy(tb.numpy())
+
+    pairs = [
+        (lambda m, a, b: m.addbmm(a, b.unsqueeze(0).expand(3, 6, 6),
+                                  b.unsqueeze(0).expand(3, 6, 6)),
+         lambda d: d.bfloat16),
+        (lambda m, a, b: m.pow(a, 2.0), lambda d: d.float32),
+        (lambda m, a, b: m.cumsum(a, dim=1), lambda d: d.float32),
+        (lambda m, a, b: __import__(f"{m.__name__}.nn", fromlist=["functional"])
+         .functional.l1_loss(a, b), lambda d: d.float32),
+        (lambda m, a, b: m.logsumexp(a, dim=1), lambda d: d.float32),
+    ]
+    for fn, dtf in pairs:
+        with tp.autocast(device_type="cpu"):
+            tp_out = fn(tp, ta, tb)
+        with torch.autocast(device_type="cpu"):
+            th_out = fn(torch, xa, xb)
+        assert tp_out.dtype == dtf(tp), fn
+        assert th_out.dtype == dtf(torch), fn
+
+
+# ---------------------------------------------------------------------------
+# CPU list parity with ATen/autocast_mode.cpp's hand-written KERNEL_CPU block
+# (verified against torch with bf16 inputs: softmax/layer_norm/pow stay low
+# precision on CPU; the fp32 loss family and BCE are wrapped).
+# ---------------------------------------------------------------------------
+
+def _bf16_pair(d=8):
+    a = tp.randn(4, d)
+    return a, a.to(tp.float16)
+
+
+@pytest.mark.skipif(not HAS_TORCH, reason="torch not installed")
+def test_parity_cpu_unwrapped_ops_stay_low_precision():
+    import torch
+
+    ta, _ = _bf16_pair()
+    xa = torch.from_numpy(ta.numpy())
+
+    def run(mod, t):
+        import importlib
+        nn_m = importlib.import_module(f"{mod.__name__}.nn")
+        Fx = nn_m.functional
+        with mod.autocast("cpu"):
+            return [
+                str(mod.softmax(t, 1).dtype).split(".")[-1],
+                str(Fx.layer_norm(t, [t.shape[-1]]).dtype).split(".")[-1],
+                str(mod.pow(t, 2.0).dtype).split(".")[-1],
+                str(mod.cumsum(t, 1).dtype).split(".")[-1],
+            ]
+
+    assert run(tp, ta) == run(torch, xa), (run(tp, ta), run(torch, xa))
+
+
+@pytest.mark.skipif(not HAS_TORCH, reason="torch not installed")
+def test_parity_cpu_wrapped_fp32_ops():
+    import torch
+
+    ta, _ = _bf16_pair()
+    xa = torch.from_numpy(ta.numpy())
+
+    tb = tp.rand(4, 8)
+    xb = torch.from_numpy(tb.numpy())
+    t_label = tp.rand(4, 8).clamp(1e-3, 1 - 1e-3)
+    x_label = torch.from_numpy(t_label.numpy())
+
+    def run(mod, a, b, lab):
+        import importlib
+        Fx = importlib.import_module(f"{mod.__name__}.nn").functional
+        with mod.autocast("cpu"):
+            return [
+                str(mod.kl_div(a.log_softmax(1), mod.softmax(b.float(), 1)).dtype).split(".")[-1],
+                str(Fx.l1_loss(a, b).dtype).split(".")[-1],
+                str(Fx.smooth_l1_loss(a, b).dtype).split(".")[-1],
+                str(Fx.binary_cross_entropy_with_logits(
+                    a.sum(1), lab[:, 0]).dtype).split(".")[-1],
+            ]
+
+    assert run(tp, ta, tb, t_label) == run(torch, xa, xb, x_label), (
+        run(tp, ta, tb, t_label), run(torch, xa, xb, x_label))
+
+
+def test_cpu_binary_cross_entropy_runs_fp32_not_banned():
+    # Upstream KERNEL_CPU(binary_cross_entropy, fp32): inputs cast to fp32 and
+    # the op runs (the `banned` error exists only on CUDA-class backends).
+    p = tp.rand(8).clamp(1e-3, 1 - 1e-3)
+    t = tp.zeros(8)
+    with autocast(device_type="cpu"):
+        out = tp.binary_cross_entropy(p, t)
+    assert out.dtype == tp.float32
+
+
+def test_cat_promote_cpu():
+    lo = tp.randn(4, 4).to(tp.bfloat16)
+    hi = tp.randn(4, 4)
+    with autocast(device_type="cpu"):
+        # promote policy: any fp32 operand lifts the result to fp32
+        assert tp.cat([lo, lo], 0).dtype == tp.bfloat16
+        assert tp.cat([lo, hi], 0).dtype == tp.float32

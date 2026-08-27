@@ -341,8 +341,15 @@ Tensor gather_cpu(const Tensor& self, int64_t dim, const Tensor& index) {
     Tensor idx_c = (index.dtype() == DType::Int64) ? index.contiguous() : index.to(DType::Int64).contiguous();
     Tensor self_c = self.contiguous();
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(idx_c.shape()), self.dtype(), self.device());
-    int64_t inner = 1;
-    for (int64_t i = dim + 1; i < nd; ++i) inner *= self.size(i);
+    // Decomposition runs over the RESULT (=index) shape; the source read
+    // applies self's own strides (ATen allows index.size(i) <= self.size(i)
+    // for i != dim, so the two extents may differ).
+    int64_t idx_outer = 1;
+    for (int64_t i = 0; i < dim; ++i) idx_outer *= idx_c.size(i);
+    int64_t idx_inner = 1;
+    for (int64_t i = dim + 1; i < nd; ++i) idx_inner *= idx_c.size(i);
+    int64_t self_inner = 1;
+    for (int64_t i = dim + 1; i < nd; ++i) self_inner *= self.size(i);
     int64_t idx_dim_size = idx_c.size(dim);
     int64_t n = result.numel();
     int64_t self_dim_size = self.size(dim);
@@ -355,12 +362,11 @@ Tensor gather_cpu(const Tensor& self, int64_t dim, const Tensor& index) {
         parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) { \
             for (int64_t flat = begin; flat < end; ++flat) { \
                 int64_t rem = flat; \
-                int64_t outer_off = rem / (idx_dim_size * inner); rem -= outer_off * idx_dim_size * inner; \
-                int64_t j = rem / inner; rem -= j * inner; \
-                int64_t in2 = rem; \
+                int64_t outer_off = rem / (idx_dim_size * idx_inner); rem -= outer_off * idx_dim_size * idx_inner; \
+                int64_t t = rem % idx_inner; \
                 int64_t idx = ip[flat]; \
                 if (idx < 0) idx += self_dim_size; \
-                d[flat] = s[(outer_off * self_dim_size + idx) * inner + in2]; \
+                d[flat] = s[(outer_off * self_dim_size + idx) * self_inner + t]; \
             } \
         }); \
         break; \
@@ -410,7 +416,7 @@ Tensor scatter_base_cpu(const Tensor& self, int64_t dim, const Tensor& index,
         // torch scatters through self's dtype
         src_b = src_b.to(self.dtype());
     }
-    Tensor result = self.clone();
+    Tensor result = detail::contiguous_clone(self);
     // Layout of the index tensor: [outer][dim][idx_inner]; the destination
     // row stride inside `self` is its own inner extent (which may be larger
     // than the index's when the index is broadcast-thin along trailing dims).
@@ -423,9 +429,9 @@ Tensor scatter_base_cpu(const Tensor& self, int64_t dim, const Tensor& index,
     int64_t idx_dim_size = idx_c.size(dim);
     int64_t total_idx = idx_c.numel();
     int64_t self_dim_size = self.size(dim);
-    // Each index element addresses one slice of `self_inner` values; the
-    // source value is broadcast across that slice (ATen gpu_scatter_assign /
-    // scatter_gather_base_kernel).
+    // Elementwise mapping (ATen scatter_gather_base_kernel via
+    // TensorIterator): one destination element per index element,
+    // out[oo][idx_value][t] <- src[oo][j][t].
 #define TP_SCATTER_CASE(ctype, name) \
     case DType::name: { \
         ctype* d = result.data_ptr<ctype>(); \
@@ -436,15 +442,15 @@ Tensor scatter_base_cpu(const Tensor& self, int64_t dim, const Tensor& index,
                 int64_t rem = flat; \
                 int64_t outer_off = rem / (idx_dim_size * idx_inner); \
                 rem -= outer_off * idx_dim_size * idx_inner; \
-                int64_t j = rem / idx_inner; \
+                int64_t t = rem % idx_inner; \
                 int64_t idx = ip[flat]; \
                 if (idx < 0) idx += self_dim_size; \
-                int64_t dst = (outer_off * self_dim_size + idx) * self_inner; \
+                int64_t dst = (outer_off * self_dim_size + idx) * self_inner + t; \
                 ctype v = vp[flat]; \
                 if (mode == ScatterMode::Assign) { \
-                    for (int64_t k = 0; k < self_inner; ++k) d[dst + k] = v; \
+                    d[dst] = v; \
                 } else { \
-                    for (int64_t k = 0; k < self_inner; ++k) d[dst + k] += v; \
+                    d[dst] += v; \
                 } \
             } \
         }); \
@@ -527,15 +533,15 @@ static Tensor& scatter_base_inplace_cpu(Tensor& self, int64_t dim, const Tensor&
                 int64_t rem = flat; \
                 int64_t outer_off = rem / (idx_dim_size * idx_inner); \
                 rem -= outer_off * idx_dim_size * idx_inner; \
-                int64_t j = rem / idx_inner; \
+                int64_t t = rem % idx_inner; \
                 int64_t idx = ip[flat]; \
                 if (idx < 0) idx += self_dim_size; \
-                int64_t dst = (outer_off * self_dim_size + idx) * inner; \
+                int64_t dst = (outer_off * self_dim_size + idx) * inner + t; \
                 ctype v = vp[flat]; \
                 if (mode == ScatterMode::Assign) { \
-                    for (int64_t k = 0; k < inner; ++k) d[dst + k] = v; \
+                    d[dst] = v; \
                 } else { \
-                    for (int64_t k = 0; k < inner; ++k) d[dst + k] += v; \
+                    d[dst] += v; \
                 } \
             } \
         }); \
@@ -617,7 +623,7 @@ Tensor index_add_cpu(const Tensor& self, int64_t dim, const Tensor& index, const
     int64_t nd = self.dim();
     dim = wrap_dim(dim, nd);
     Tensor idx = (index.dtype() == DType::Int64) ? index.contiguous() : index.to(DType::Int64).contiguous();
-    Tensor result = self.clone();
+    Tensor result = detail::contiguous_clone(self);
     int64_t n_idx = idx.numel();
     if (n_idx == 0) return result;
     const int64_t* ip = idx.data_ptr<int64_t>();
@@ -667,7 +673,7 @@ Tensor index_copy_cpu(const Tensor& self, int64_t dim, const Tensor& index, cons
     int64_t nd = self.dim();
     dim = wrap_dim(dim, nd);
     Tensor idx = (index.dtype() == DType::Int64) ? index.contiguous() : index.to(DType::Int64).contiguous();
-    Tensor result = self.clone();
+    Tensor result = detail::contiguous_clone(self);
     int64_t n_idx = idx.numel();
     if (n_idx == 0) return result;
     const int64_t* ip = idx.data_ptr<int64_t>();
@@ -712,7 +718,7 @@ Tensor index_fill_scalar_cpu(const Tensor& self, int64_t dim, const Tensor& inde
     int64_t nd = self.dim();
     dim = wrap_dim(dim, nd);
     Tensor idx = (index.dtype() == DType::Int64) ? index.contiguous() : index.to(DType::Int64).contiguous();
-    Tensor result = self.clone();
+    Tensor result = detail::contiguous_clone(self);
     int64_t n_idx = idx.numel();
     if (n_idx == 0) return result;
     const int64_t* ip = idx.data_ptr<int64_t>();
@@ -803,7 +809,7 @@ Tensor index_put_impl_cpu(Tensor& result, const std::vector<Tensor>& indices,
 
 Tensor index_put_cpu(const Tensor& self, const std::vector<Tensor>& indices,
                      const Tensor& values, bool accumulate) {
-    Tensor result = self.clone();
+    Tensor result = detail::contiguous_clone(self);
     return index_put_impl_cpu(result, indices, values, accumulate);
 }
 
@@ -1073,7 +1079,7 @@ Tensor take_cpu(const Tensor& self, const Tensor& index) {
 Tensor masked_scatter_cpu(const Tensor& self, const Tensor& mask, const Tensor& source) {
     Tensor m_full = mask.to(DType::Bool).expand(static_cast<std::vector<int64_t>>(self.shape())).contiguous();
     Tensor src = source.contiguous();
-    Tensor result = self.clone();
+    Tensor result = detail::contiguous_clone(self);
     int64_t n = result.numel();
     const bool* mp = m_full.data_ptr<bool>();
     int64_t src_i = 0;
@@ -1246,6 +1252,33 @@ std::tuple<Tensor, Tensor, Tensor> unique_cpu(const Tensor& self, bool sorted, b
     return std::make_tuple(values, inverse_t, counts_t);
 }
 
+Tensor scatter_reduce_cpu(const Tensor& self, int64_t dim, const Tensor& index,
+                          const Tensor& src, const std::string& reduce,
+                          bool include_self);
+Tensor index_reduce_cpu(const Tensor& self, int64_t dim, const Tensor& index,
+                        const Tensor& source, const std::string& reduce,
+                        bool include_self);
+Tensor scatter_reduce_backward_self_cpu(const Tensor& grad, const Tensor& self,
+                                        int64_t dim, const Tensor& index,
+                                        const Tensor& src,
+                                        const std::string& reduce,
+                                        bool include_self);
+Tensor scatter_reduce_backward_src_cpu(const Tensor& grad, const Tensor& self,
+                                       int64_t dim, const Tensor& index,
+                                       const Tensor& src,
+                                       const std::string& reduce,
+                                       bool include_self);
+Tensor index_reduce_backward_self_cpu(const Tensor& grad, const Tensor& self,
+                                      int64_t dim, const Tensor& index,
+                                      const Tensor& source,
+                                      const std::string& reduce,
+                                      bool include_self);
+Tensor index_reduce_backward_src_cpu(const Tensor& grad, const Tensor& self,
+                                     int64_t dim, const Tensor& index,
+                                     const Tensor& source,
+                                     const std::string& reduce,
+                                     bool include_self);
+
 TENSORPLAY_LIBRARY_IMPL(CPU, IndexingKernels) {
     m.impl("masked_fill", masked_fill_cpu);
     m.impl("masked_fill_", masked_fill__cpu);
@@ -1259,6 +1292,12 @@ TENSORPLAY_LIBRARY_IMPL(CPU, IndexingKernels) {
     m.impl("logcumsumexp", logcumsumexp_cpu);
     m.impl("gather", gather_cpu);
     m.impl("scatter_add", scatter_add_cpu);
+    m.impl("scatter_reduce", scatter_reduce_cpu);
+    m.impl("index_reduce", index_reduce_cpu);
+    m.impl("_scatter_reduce_backward_self", scatter_reduce_backward_self_cpu);
+    m.impl("_scatter_reduce_backward_src", scatter_reduce_backward_src_cpu);
+    m.impl("_index_reduce_backward_self", index_reduce_backward_self_cpu);
+    m.impl("_index_reduce_backward_src", index_reduce_backward_src_cpu);
     m.impl("scatter.src", scatter_src_cpu);
     m.impl("scatter.value", scatter_value_cpu);
     m.impl("scatter_.src", scatter_inplace_src_cpu);
@@ -1284,5 +1323,589 @@ TENSORPLAY_LIBRARY_IMPL(CPU, IndexingKernels) {
     m.impl("masked_scatter", masked_scatter_cpu);
 }
 
+
+// ---------------------------------------------------------------------------
+// scatter_reduce / index_reduce — ATen TensorAdvancedIndexing.cpp
+// scatter_impl + scatter_reduce_exclude_self_helper (:2133) and Indexing.cu
+// index_reduce_func_cuda_impl (:1320). reduce ∈ {sum, prod, mean, amin,
+// amax}. With include_self=False only the indexed slices are reset to the
+// per-op identity before accumulating (ATen's index_fill_ pre-pass); slices
+// never touched by index keep their original self values. The backward
+// helpers mirror torch/csrc/autograd/FunctionsManual.cpp
+// scatter_reduce_backward / index_reduce_backward.
+//
+// Accumulation is deliberately serial: duplicate indices are the point of
+// this op, so a data-parallel RMW over flats would race on collisions (the
+// same reason bincount above is serial).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+enum class SrReduce { Sum, Prod, Mean, AMin, AMax };
+
+SrReduce parse_sr_reduce(const std::string& r) {
+    if (r == "sum") return SrReduce::Sum;
+    if (r == "prod") return SrReduce::Prod;
+    if (r == "mean") return SrReduce::Mean;
+    if (r == "amin") return SrReduce::AMin;
+    if (r == "amax") return SrReduce::AMax;
+    TP_THROW(ValueError,
+             "reduce argument must be one of 'sum', 'prod', 'mean', 'amin', "
+             "'amax' but got: " + r);
+}
+
+template <typename T>
+inline T sr_identity(SrReduce op) {
+    switch (op) {
+        case SrReduce::Sum:
+        case SrReduce::Mean: return static_cast<T>(0);
+        case SrReduce::Prod: return static_cast<T>(1);
+        case SrReduce::AMin: return std::numeric_limits<T>::has_infinity
+                                    ? std::numeric_limits<T>::infinity()
+                                    : std::numeric_limits<T>::max();
+        case SrReduce::AMax: return std::numeric_limits<T>::has_infinity
+                                    ? -std::numeric_limits<T>::infinity()
+                                    : std::numeric_limits<T>::lowest();
+    }
+    return static_cast<T>(0);  // unreachable
+}
+
+inline void sr_decode(int64_t flat, int64_t idx_dim_size, int64_t idx_inner,
+                      int64_t& outer_off, int64_t& j, int64_t& idx,
+                      const int64_t* ip, int64_t self_dim_size) {
+    // flat layout: [outer][dim][idx_inner]
+    int64_t rem = flat;
+    outer_off = rem / (idx_dim_size * idx_inner);
+    rem -= outer_off * idx_dim_size * idx_inner;
+    j = rem % idx_inner;
+    idx = ip[flat];
+    if (idx < 0) idx += self_dim_size;
+}
+
+// torch div_(count, "floor") for integral dtypes.
+template <typename T>
+inline T sr_floor_div(T v, T c) {
+    T q = v / c;
+    if ((v % c) != 0 && ((v < 0) != (c < 0))) --q;
+    return q;
+}
+
+template <typename T>
+inline void sr_mean_divide(T* d, const int64_t* cp, int64_t n) {
+    // torch: count.masked_fill_(count == 0, 1); out.div_(count)
+    for (int64_t i = 0; i < n; ++i) {
+        const int64_t c = cp[i] == 0 ? 1 : cp[i];
+        if constexpr (std::is_floating_point_v<T>) {
+            d[i] /= static_cast<T>(c);
+        } else if constexpr (std::is_integral_v<T> &&
+                             !std::is_same_v<T, bool>) {
+            d[i] = sr_floor_div(d[i], static_cast<T>(c));
+        } else {
+            // Half / BFloat16
+            d[i] = static_cast<T>(static_cast<float>(d[i]) /
+                                  static_cast<float>(c));
+        }
+    }
+}
+
+inline Tensor sr_where(const Tensor& cond, const Tensor& a, const Tensor& b) {
+    return Tensor::where(cond, a, b);
+}
+
+} // anonymous namespace
+
+// Shared forward body for scatter_reduce/index_reduce (identical indexing).
+Tensor sr_reduce_forward(const Tensor& self, int64_t dim, const Tensor& index,
+                         const Tensor& src_in, const std::string& reduce,
+                         bool include_self) {
+    const SrReduce op = parse_sr_reduce(reduce);
+    int64_t nd = self.dim();
+    dim = wrap_dim(dim, nd);
+    if (index.dim() != nd) {
+        TP_THROW(IndexError,
+                 "index must have the same number of dimensions as self");
+    }
+    Tensor idx_c = (index.dtype() == DType::Int64)
+                       ? index.contiguous()
+                       : index.to(DType::Int64).contiguous();
+    std::vector<int64_t> idx_shape(
+        static_cast<std::vector<int64_t>>(idx_c.shape()));
+    Tensor src_b;
+    {
+        std::vector<int64_t> bshape = broadcast_shapes(
+            static_cast<std::vector<int64_t>>(src_in.shape()), idx_shape);
+        if (bshape != idx_shape) {
+            TP_THROW(RuntimeError,
+                     "src/source shape must broadcast to the index shape");
+        }
+        src_b = src_in.expand(idx_shape).contiguous();
+    }
+    if (src_b.dtype() != self.dtype()) src_b = src_b.to(self.dtype());
+
+    const int64_t idx_inner = [&] {
+        int64_t v = 1;
+        for (int64_t i = dim + 1; i < nd; ++i) v *= idx_c.size(i);
+        return v;
+    }();
+    const int64_t idx_dim_size = idx_c.size(dim);
+    const int64_t total_idx = idx_c.numel();
+    const int64_t self_dim_size = self.size(dim);
+
+    // Bounds check up front (torch: "index out of range in self").
+    {
+        const int64_t* ip0 = idx_c.data_ptr<int64_t>();
+        for (int64_t i = 0; i < total_idx; ++i) {
+            // torch rejects negative indices in the scatter family
+            // ("index -1 is out of bounds for dimension D with size N").
+            const int64_t v = ip0[i];
+            if (v < 0 || v >= self_dim_size) {
+                TP_THROW(IndexError, "index ", v,
+                         " is out of bounds for dimension ", dim,
+                         " with size ", self_dim_size);
+            }
+        }
+    }
+
+    Tensor result = detail::contiguous_clone(self);
+    if (!include_self && total_idx > 0 && result.numel() > 0) {
+        // scatter_reduce_exclude_self_helper: reset indexed slices to the
+        // op identity (idempotent writes, so flat order does not matter).
+        const int64_t self_inner = [&] {
+            int64_t v = 1;
+            for (int64_t i = dim + 1; i < nd; ++i) v *= self.size(i);
+            return v;
+        }();
+#define TP_SR_INIT_CASE(ctype, name)                                         \
+    case DType::name: {                                                      \
+        ctype* d = result.data_ptr<ctype>();                                 \
+        const int64_t* ip = idx_c.data_ptr<int64_t>();                       \
+        const ctype init_v = sr_identity<ctype>(op);                         \
+        for (int64_t flat = 0; flat < total_idx; ++flat) {                   \
+            int64_t oo, j, idx;                                              \
+            sr_decode(flat, idx_dim_size, idx_inner, oo, j, idx, ip,         \
+                      self_dim_size);                                        \
+            d[(oo * self_dim_size + idx) * self_inner + j] = init_v;         \
+        }                                                                    \
+        break;                                                               \
+    }
+        switch (self.dtype()) {
+            TENSORPLAY_FORALL_SCALAR_TYPES(TP_SR_INIT_CASE)
+            default:
+                TP_THROW(TypeError, "scatter_reduce: unsupported dtype");
+        }
+#undef TP_SR_INIT_CASE
+    }
+
+    // mean counts are full-rank, like torch's
+    // count.scatter_add_(dim, index, ones_like(src)).
+    Tensor count;
+    int64_t* cp = nullptr;
+    if (op == SrReduce::Mean) {
+        count = Tensor::full(static_cast<std::vector<int64_t>>(self.shape()),
+                             include_self ? 1 : 0, DType::Int64,
+                             self.device());
+        cp = count.data_ptr<int64_t>();
+    }
+
+    const int64_t self_inner = [&] {
+        int64_t v = 1;
+        for (int64_t i = dim + 1; i < nd; ++i) v *= self.size(i);
+        return v;
+    }();
+
+#define TP_SR_CASE(ctype, name)                                                \
+    case DType::name: {                                                        \
+        ctype* d = result.data_ptr<ctype>();                                   \
+        const int64_t* ip = idx_c.data_ptr<int64_t>();                         \
+        const ctype* vp = src_b.data_ptr<ctype>();                             \
+        for (int64_t flat = 0; flat < total_idx; ++flat) {                     \
+            int64_t oo, j, idx;                                                \
+            sr_decode(flat, idx_dim_size, idx_inner, oo, j, idx, ip,           \
+                      self_dim_size);                                          \
+            const int64_t dst =                                                \
+                (oo * self_dim_size + idx) * self_inner + j;                   \
+            const ctype v = vp[flat];                                          \
+            const ctype cur = d[dst];                                          \
+            switch (op) {                                                      \
+                case SrReduce::Sum:                                            \
+                    d[dst] = cur + v;                                          \
+                    break;                                                     \
+                case SrReduce::Prod:                                           \
+                    d[dst] = cur * v;                                          \
+                    break;                                                     \
+                case SrReduce::AMin:                                           \
+                    /* at::native::minimum semantics: propagate NaN */          \
+                    d[dst] =                                                   \
+                        (std::isnan(cur) || cur < v) ? cur : v;                 \
+                    break;                                                     \
+                case SrReduce::AMax:                                           \
+                    /* at::native::maximum semantics: propagate NaN */          \
+                    d[dst] =                                                   \
+                        (std::isnan(cur) || cur > v) ? cur : v;                 \
+                    break;                                                     \
+                case SrReduce::Mean:                                           \
+                    d[dst] = cur + v;                                          \
+                    cp[dst] += 1;                                              \
+                    break;                                                     \
+            }                                                                  \
+        }                                                                      \
+        if (op == SrReduce::Mean) {                                            \
+            sr_mean_divide<ctype>(d, cp, result.numel());                       \
+        }                                                                      \
+        break;                                                                 \
+    }
+
+    switch (self.dtype()) {
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_SR_CASE)
+        default:
+            TP_THROW(TypeError, "scatter_reduce: unsupported dtype");
+    }
+#undef TP_SR_CASE
+
+    return result;
+}
+
+Tensor scatter_reduce_cpu(const Tensor& self, int64_t dim, const Tensor& index,
+                          const Tensor& src, const std::string& reduce,
+                          bool include_self) {
+    return sr_reduce_forward(self, dim, index, src, reduce, include_self);
+}
+
+Tensor index_reduce_cpu(const Tensor& self, int64_t dim, const Tensor& index,
+                        const Tensor& source, const std::string& reduce,
+                        bool include_self) {
+    // ATen TensorAdvancedIndexing.cpp TORCH_META_FUNC(index_reduce):
+    // unlike scatter_reduce this variant takes a 1-D index, a source of
+    // self's rank (equal sizes except dim == index.numel()), and rejects
+    // 'sum'.
+    if (reduce != "prod" && reduce != "mean" && reduce != "amax" &&
+        reduce != "amin") {
+        TP_THROW(ValueError,
+                 "index_reduce(): Expected reduce to be one of prod, mean, "
+                 "amax or amin but got ",
+                 reduce);
+    }
+    int64_t nd = self.dim();
+    dim = wrap_dim(dim, nd);
+    if (nd == 0) {
+        TP_THROW(RuntimeError,
+                 "index_reduce(): dimension not supported for scalar tensors");
+    }
+    if (source.dim() != nd) {
+        TP_THROW(IndexError,
+                 "index_reduce(): Index is supposed to be a vector");
+    }
+    if (index.dim() != 1) {
+        TP_THROW(IndexError,
+                 "index_reduce(): Index is supposed to be a vector, but got dim: ",
+                 index.dim());
+    }
+    for (int64_t i = 0; i < nd; ++i) {
+        if (i == dim) continue;
+        if (source.size(i) != self.size(i)) {
+            TP_THROW(IndexError,
+                     "index_reduce(): Expected source and self to have the "
+                     "same size at dimension ", i);
+        }
+    }
+    Tensor idx_c = (index.dtype() == DType::Int64)
+                       ? index.contiguous()
+                       : index.to(DType::Int64).contiguous();
+    Tensor src_c = source.contiguous();
+    const int64_t K = idx_c.numel();
+    if (src_c.size(dim) != K) {
+        TP_THROW(IndexError,
+                 "index_reduce(): Number of indices (", K,
+                 ") should be equal to source.size(dim): (", src_c.size(dim),
+                 "),");
+    }
+    const int64_t* ip = idx_c.data_ptr<int64_t>();
+    const int64_t self_dim_size = self.size(dim);
+    for (int64_t j = 0; j < K; ++j) {
+        // torch rejects negative indices in the scatter family
+        if (ip[j] < 0 || ip[j] >= self_dim_size) {
+            TP_THROW(IndexError, "index ", ip[j],
+                     " is out of bounds for dimension ", dim,
+                     " with size ", self_dim_size);
+        }
+    }
+
+    const SrReduce op = parse_sr_reduce(reduce);
+    int64_t outer = 1;
+    for (int64_t i = 0; i < dim; ++i) outer *= self.size(i);
+    int64_t self_inner = 1;
+    for (int64_t i = dim + 1; i < nd; ++i) self_inner *= self.size(i);
+
+    Tensor result = detail::contiguous_clone(self);
+    Tensor count;
+    int64_t* cp = nullptr;
+    if (reduce == "mean") {
+        // torch: ones/zeros_like(result), accumulated per destination row
+        count = Tensor::full(
+            static_cast<std::vector<int64_t>>(self.shape()),
+            include_self ? 1 : 0, DType::Int64, self.device());
+        cp = count.data_ptr<int64_t>();
+    }
+#define TP_IR_CASE(ctype, name)                                                \
+    case DType::name: {                                                        \
+        ctype* d = result.data_ptr<ctype>();                                   \
+        const ctype* sp = src_c.data_ptr<ctype>();                             \
+        const ctype init_v = sr_identity<ctype>(op);                           \
+        if (!include_self && K > 0 && result.numel() > 0) {                    \
+            /* index_fill_(dim, index, identity): whole rows reset */          \
+            for (int64_t oo = 0; oo < outer; ++oo) {                           \
+                for (int64_t j = 0; j < K; ++j) {                              \
+                    ctype* row = d + (oo * self_dim_size + ip[j]) * self_inner;\
+                    for (int64_t t = 0; t < self_inner; ++t) row[t] = init_v;  \
+                }                                                              \
+            }                                                                  \
+        }                                                                      \
+        /* serial: duplicate destinations are the point of this op */           \
+        for (int64_t oo = 0; oo < outer; ++oo) {                               \
+            for (int64_t j = 0; j < K; ++j) {                                  \
+                const int64_t dst_row = (oo * self_dim_size + ip[j]) * self_inner; \
+                const int64_t src_row = (oo * K + j) * self_inner;             \
+                if (cp != nullptr) {                                           \
+                    int64_t* crow = cp + dst_row;                              \
+                    for (int64_t t = 0; t < self_inner; ++t) crow[t] += 1;      \
+                }                                                              \
+                for (int64_t t = 0; t < self_inner; ++t) {                      \
+                    const ctype v = sp[src_row + t];                            \
+                    const ctype cur = d[dst_row + t];                           \
+                    switch (op) {                                               \
+                        case SrReduce::Prod:                                    \
+                            d[dst_row + t] = cur * v;                           \
+                            break;                                              \
+                        case SrReduce::AMin:                                    \
+                            d[dst_row + t] =                                    \
+                                (std::isnan(cur) || cur < v) ? cur : v;         \
+                            break;                                              \
+                        case SrReduce::AMax:                                    \
+                            d[dst_row + t] =                                    \
+                                (std::isnan(cur) || cur > v) ? cur : v;         \
+                            break;                                              \
+                        default:                                                \
+                            d[dst_row + t] = cur + v;                           \
+                            break;                                              \
+                    }                                                           \
+                }                                                               \
+            }                                                                   \
+        }                                                                       \
+        if (cp != nullptr) {                                                    \
+            sr_mean_divide<ctype>(d, cp, result.numel());                        \
+        }                                                                       \
+        break;                                                                  \
+    }
+    switch (self.dtype()) {
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_IR_CASE)
+        default:
+            TP_THROW(TypeError, "index_reduce: unsupported dtype");
+    }
+#undef TP_IR_CASE
+    return result;
+}
+
+
+namespace {
+
+// Re-run the forward to obtain `result` inside backward helpers.
+Tensor sr_result_for_backward(const Tensor& self, int64_t dim,
+                              const Tensor& index, const Tensor& src,
+                              const std::string& reduce, bool include_self) {
+    return sr_reduce_forward(self, dim, index, src, reduce, include_self);
+}
+
+} // anonymous namespace
+
+Tensor scatter_reduce_backward_self_cpu(const Tensor& grad, const Tensor& self,
+                                        int64_t dim, const Tensor& index,
+                                        const Tensor& src,
+                                        const std::string& reduce,
+                                        bool include_self) {
+    const SrReduce op = parse_sr_reduce(reduce);
+    if (op == SrReduce::Sum) {
+        // FunctionsManual: grad_self = grad
+        if (!include_self) return grad.scatter(dim, index, Scalar(0));
+        return grad;
+    }
+    if (op == SrReduce::Mean) {
+        Tensor N = include_self ? Tensor::ones_like(grad, grad.dtype(), grad.device())
+                                : Tensor::zeros_like(grad, grad.dtype(), grad.device());
+        N = N.scatter_add(dim, index,
+                          Tensor::ones_like(src, src.dtype(), src.device()));
+        N = N.masked_fill(N.eq(0), 1.0);
+        Tensor gself = grad.div(N);
+        if (!include_self) gself = gself.scatter(dim, index, 0.0);
+        return gself;
+    }
+    if (op == SrReduce::AMin || op == SrReduce::AMax) {
+        Tensor result = sr_result_for_backward(self, dim, index, src, reduce,
+                                               include_self);
+        Tensor value = result.gather(dim, index);
+        Tensor self_is_result = self.eq(result).to(self.dtype());
+        Tensor src_is_result = src.eq(value).to(self.dtype());
+        Tensor n_dist = self_is_result.scatter_add(dim, index, src_is_result);
+        Tensor distributed = grad.div(n_dist);
+        Tensor out = self_is_result.mul(distributed);
+        if (!include_self) out = out.scatter(dim, index, Scalar(0.0));
+        return out;
+    }
+    // prod
+    Tensor masked_self = self.masked_fill(self.eq(0), 1.0);
+    Tensor masked_result = sr_reduce_forward(masked_self, dim, index, src,
+                                             reduce, include_self);
+    Tensor gself = grad.mul(masked_result).div(masked_self);
+    if (!include_self) gself = gself.scatter(dim, index, 0.0);
+    return gself;
+}
+
+Tensor scatter_reduce_backward_src_cpu(const Tensor& grad, const Tensor& self,
+                                       int64_t dim, const Tensor& index,
+                                       const Tensor& src,
+                                       const std::string& reduce,
+                                       bool include_self) {
+    const SrReduce op = parse_sr_reduce(reduce);
+    if (op == SrReduce::Sum) return grad.gather(dim, index);
+    if (op == SrReduce::Mean) {
+        Tensor N = include_self ? Tensor::ones_like(grad, grad.dtype(), grad.device())
+                                : Tensor::zeros_like(grad, grad.dtype(), grad.device());
+        N = N.scatter_add(dim, index,
+                          Tensor::ones_like(src, src.dtype(), src.device()));
+        N = N.masked_fill(N.eq(0), 1.0);
+        return grad.gather(dim, index).div(N.gather(dim, index));
+    }
+    if (op == SrReduce::AMin || op == SrReduce::AMax) {
+        Tensor result = sr_result_for_backward(self, dim, index, src, reduce,
+                                               include_self);
+        Tensor value = result.gather(dim, index);
+        Tensor self_is_result = self.eq(result).to(self.dtype());
+        Tensor src_is_result = src.eq(value).to(self.dtype());
+        Tensor n_dist = self_is_result.scatter_add(dim, index, src_is_result);
+        Tensor distributed = grad.div(n_dist);
+        Tensor out = src_is_result.mul(distributed.gather(dim, index));
+        // FunctionsManual applies the !include_self zeroing to grad_self
+        // only; grad_src always receives gradient (src is accumulated even
+        // when self is excluded).
+        return out;
+    }
+    // prod: handle zeros in src per torch FunctionsManual
+    Tensor masked_self = self.masked_fill(self.eq(0), 1.0);
+    Tensor masked_self_result = sr_reduce_forward(masked_self, dim, index, src,
+                                                  reduce, include_self);
+    Tensor src_zero = src.eq(0);
+    Tensor num_zeros = Tensor::zeros_like(self, self.dtype(), self.device())
+                           .scatter_add(dim, index,
+                                        src_zero.to(self.dtype()))
+                           .gather(dim, index);
+    Tensor single_zero = src_zero.bitwise_and(num_zeros.eq(1));
+    Tensor masked_src = src.masked_fill(single_zero, 1.0);
+    Tensor masked_src_result = sr_reduce_forward(self, dim, index, masked_src,
+                                                 reduce, include_self);
+    Tensor result = sr_reduce_forward(self, dim, index, src, reduce,
+                                      include_self);
+    Tensor gsrc = sr_where(
+        single_zero,
+        grad.mul(masked_src_result).gather(dim, index),
+        grad.mul(result).gather(dim, index).div(src.masked_fill(src_zero, 1.0)));
+    return gsrc;
+}
+
+Tensor index_reduce_backward_self_cpu(const Tensor& grad, const Tensor& self,
+                                      int64_t dim, const Tensor& index,
+                                      const Tensor& source,
+                                      const std::string& reduce,
+                                      bool include_self) {
+    // FunctionsManual index_reduce_backward: like the scatter variant but
+    // all reads use vector-index ops (index_select/index_add/index_fill).
+    const SrReduce op = parse_sr_reduce(reduce);
+    if (op == SrReduce::Sum) {
+        if (!include_self) return grad.index_fill(dim, index, Scalar(0));
+        return grad;
+    }
+    if (op == SrReduce::Mean) {
+        Tensor N = include_self ? Tensor::ones_like(grad, grad.dtype(), grad.device())
+                                : Tensor::zeros_like(grad, grad.dtype(), grad.device());
+        N = Tensor::index_add(N, dim, index,
+                          Tensor::ones_like(source, source.dtype(),
+                                            source.device()));
+        N = N.masked_fill(N.eq(0), 1.0);
+        Tensor gself = grad.div(N);
+        if (!include_self) gself = gself.index_fill(dim, index, 0.0);
+        return gself;
+    }
+    Tensor result = index_reduce_cpu(self, dim, index, source, reduce,
+                                           include_self);
+    if (op == SrReduce::AMin || op == SrReduce::AMax) {
+        Tensor value = result.index_select(dim, index);
+        Tensor self_is_result = self.eq(result).to(self.dtype());
+        Tensor source_is_result = source.eq(value).to(self.dtype());
+        Tensor n_dist = Tensor::index_add(self_is_result, dim, index,
+                                          source_is_result);
+        Tensor distributed = grad.div(n_dist);
+        Tensor out = self_is_result.mul(distributed);
+        if (!include_self) out = out.index_fill(dim, index, Scalar(0.0));
+        return out;
+    }
+    // prod
+    Tensor masked_self = self.masked_fill(self.eq(0), 1.0);
+    Tensor masked_result = index_reduce_cpu(masked_self, dim, index, source,
+                                            reduce, include_self);
+    Tensor gself = grad.mul(masked_result).div(masked_self);
+    if (!include_self) gself = gself.index_fill(dim, index, 0.0);
+    return gself;
+}
+
+Tensor index_reduce_backward_src_cpu(const Tensor& grad, const Tensor& self,
+                                     int64_t dim, const Tensor& index,
+                                     const Tensor& source,
+                                     const std::string& reduce,
+                                     bool include_self) {
+    const SrReduce op = parse_sr_reduce(reduce);
+    if (op == SrReduce::Sum) return grad.index_select(dim, index);
+    if (op == SrReduce::Mean) {
+        Tensor N = include_self ? Tensor::ones_like(grad, grad.dtype(), grad.device())
+                                : Tensor::zeros_like(grad, grad.dtype(), grad.device());
+        N = Tensor::index_add(N, dim, index,
+                          Tensor::ones_like(source, source.dtype(),
+                                            source.device()));
+        N = N.masked_fill(N.eq(0), 1.0);
+        return grad.index_select(dim, index).div(
+            N.index_select(dim, index));
+    }
+    Tensor result = index_reduce_cpu(self, dim, index, source, reduce,
+                                           include_self);
+    if (op == SrReduce::AMin || op == SrReduce::AMax) {
+        Tensor value = result.index_select(dim, index);
+        Tensor self_is_result = self.eq(result).to(self.dtype());
+        Tensor source_is_result = source.eq(value).to(self.dtype());
+        Tensor n_dist = Tensor::index_add(self_is_result, dim, index,
+                                          source_is_result);
+        Tensor distributed = grad.div(n_dist);
+        Tensor out = source_is_result.mul(distributed.index_select(dim, index));
+        // grad_src never receives the !include_self zeroing (see above).
+        return out;
+    }
+    // prod
+    Tensor masked_self = self.masked_fill(self.eq(0), 1.0);
+    Tensor masked_self_result = index_reduce_cpu(masked_self, dim, index,
+                                                 source, reduce,
+                                                 include_self);
+    Tensor src_zero = source.eq(0);
+    Tensor num_zeros = Tensor::index_add(
+              Tensor::zeros_like(self, self.dtype(), self.device()), dim,
+              index, src_zero.to(self.dtype())).index_select(dim, index);
+    Tensor single_zero = src_zero.bitwise_and(num_zeros.eq(1));
+    Tensor masked_source = source.masked_fill(single_zero, 1.0);
+    Tensor masked_result = index_reduce_cpu(self, dim, index, masked_source,
+                                            reduce, include_self);
+    Tensor gsrc = sr_where(
+        single_zero,
+        grad.mul(masked_result).index_select(dim, index),
+        grad.mul(result).index_select(dim, index).div(
+            source.masked_fill(src_zero, 1.0)));
+    return gsrc;
+}
+
 } // namespace cpu
+
 } // namespace tensorplay

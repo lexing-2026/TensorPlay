@@ -13,7 +13,7 @@ import pytest
 
 import tensorplay as tp
 
-from tensorplay.serialization import inspect_checkpoint
+from tensorplay.serialization import inspect_checkpoint, _sniff_format
 from tensorplay import _serialization_torch as st
 
 
@@ -67,7 +67,7 @@ def test_torch_zip_buffer_round_trip():
     tp.save(value, buffer)
 
     buffer.seek(0)
-    kind = st._sniff_format(buffer.read(4))
+    kind = _sniff_format(buffer.read(4))
     buffer.seek(0)
     assert kind == "torch_zip"
     loaded = tp.load(buffer)
@@ -127,9 +127,11 @@ class _StorageRef:
 def _storage_class_for(tensor):
     dtype_name = st._dtype_name_of(tensor)
     storage_name = st._STORAGE_NAMES_BY_DTYPE[dtype_name]
-    return type(storage_name, (), {
+    cls = type(storage_name, (), {
         "__module__": "torch", "__qualname__": storage_name, "__name__": storage_name,
     })
+    cls._tp_torch_ref = ("torch", storage_name)
+    return cls
 
 
 def _build_magic_number_stream(tensors: dict) -> bytes:
@@ -144,7 +146,7 @@ def _build_magic_number_stream(tensors: dict) -> bytes:
 
     key_of = {id(tensor): str(index) for index, tensor in enumerate(tensors.values())}
 
-    pickler = pickle.Pickler(buf, protocol=2)
+    pickler = st._TorchCompatPickler(buf, 2)
 
     def persistent_id(obj):
         if isinstance(obj, _StorageRef):
@@ -159,7 +161,7 @@ def _build_magic_number_stream(tensors: dict) -> bytes:
                 (ref, 0, shape, st._contiguous_stride(shape), False, {}))
 
     dispatch = copyreg.dispatch_table.copy()
-    dispatch[type(tp.Tensor)] = reduce_tensor
+    dispatch[tp.Tensor] = reduce_tensor
     parameter_cls = getattr(tp.nn, "Parameter", None)
     if parameter_cls is not None and parameter_cls is not tp.Tensor:
         dispatch[parameter_cls] = reduce_tensor

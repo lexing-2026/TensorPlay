@@ -260,6 +260,89 @@ def rprop(
             "API has changed, `state_steps` argument must contain a list of "
             "singleton tensors"
         )
+
+    native_cpu = (
+        not differentiable
+        and not capturable
+        and not has_complex
+        and bool(params)
+        and all(
+            p.device.type == "cpu"
+            and p.is_contiguous()
+            and p.is_floating_point()
+            and p.dtype == params[0].dtype
+            for p in params
+        )
+        and all(
+            g.device.type == "cpu"
+            and g.is_contiguous()
+            and g.dtype == params[0].dtype
+            for g in grads
+        )
+        and all(
+            step.device.type == "cpu"
+            and step.is_contiguous()
+            and step.numel() == 1
+            and step.dtype in (tp.float32, tp.float64)
+            for step in state_steps
+        )
+    )
+    if native_cpu:
+        tp._fused_rprop_(
+            params,
+            grads,
+            prevs,
+            step_sizes,
+            state_steps,
+            step_size_min=step_size_min,
+            step_size_max=step_size_max,
+            etaminus=etaminus,
+            etaplus=etaplus,
+            maximize=maximize,
+        )
+        return
+
+    native_cuda = (
+        not differentiable
+        and not capturable
+        and not has_complex
+        and bool(params)
+        and all(
+            p.device.type == "cuda"
+            and p.is_contiguous()
+            and p.is_floating_point()
+            and p.dtype == params[0].dtype
+            for p in params
+        )
+        and all(
+            g.device.type == "cuda"
+            and g.is_contiguous()
+            and g.dtype == params[0].dtype
+            for g in grads
+        )
+        and all(
+            step.device.type == "cpu"
+            and step.is_contiguous()
+            and step.numel() == 1
+            and step.dtype in (tp.float32, tp.float64)
+            for step in state_steps
+        )
+    )
+    if native_cuda:
+        tp._fused_rprop_(
+            params,
+            grads,
+            prevs,
+            step_sizes,
+            state_steps,
+            step_size_min=step_size_min,
+            step_size_max=step_size_max,
+            etaminus=etaminus,
+            etaplus=etaplus,
+            maximize=maximize,
+        )
+        return
+
     if foreach is None:
         _, foreach = _default_to_fused_or_foreach(
             params, differentiable, use_fused=False

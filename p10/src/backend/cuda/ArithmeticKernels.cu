@@ -10,6 +10,8 @@
 #include "Utils.h"
 #include "TypePromotion.h"
 #include "CUDABroadcast.cuh"
+#include "CUDAComplex.cuh"
+#include <thrust/complex.h>
 
 #include <cuda_runtime.h>
 
@@ -19,6 +21,15 @@
 
 namespace tensorplay {
 namespace cuda {
+
+// --- Utils ---
+#define CUDA_CHECK(condition) \
+  do { \
+    cudaError_t error = condition; \
+    if (error != cudaSuccess) { \
+       TP_THROW(RuntimeError, std::string("CUDA Error: ") + cudaGetErrorString(error)); \
+    } \
+  } while (0)
 
 // ATen alignment: scalars are converted to the opmath type of T so reduced
 // floating types (Half/BFloat16) receive float32 scalars, matching aten
@@ -32,6 +43,96 @@ inline typename BinaryOpMath<T>::type scalar_to_opmath(const Scalar& s) {
     return s.to<typename BinaryOpMath<T>::type>();
 }
 
+// --- complex (thrust::complex on interleaved storage) -----------------------
+// Same-shape contiguous inputs take the flat kernel; everything else goes
+// through the TensorDesc broadcast kernel. `alpha` rides in the functor.
+template <typename T, typename OpF>
+static void run_cplx_binary(const Tensor& a, const Tensor& b, Tensor& y,
+                            OpF op) {
+    auto stream = getCurrentCUDAStream().stream();
+    const int64_t n = y.numel();
+    bool same = a.is_contiguous() && b.is_contiguous() && y.is_contiguous() &&
+                a.dim() == static_cast<int64_t>(y.dim()) &&
+                b.dim() == static_cast<int64_t>(y.dim());
+    if (same) {
+        for (int64_t d = 0; d < static_cast<int64_t>(y.dim()); ++d) {
+            if (a.size(d) != y.size(d) || b.size(d) != y.size(d)) {
+                same = false;
+                break;
+            }
+        }
+    }
+    if (same) {
+        cuda::cplx::launch_binary<T>(n, a.data_ptr(), b.data_ptr(),
+                                     y.data_ptr(), op, stream);
+    } else {
+        TensorDesc ad = make_desc(a, static_cast<size_t>(y.dim()));
+        TensorDesc bd = make_desc(b, static_cast<size_t>(y.dim()));
+        TensorDesc yd = make_desc(y, static_cast<size_t>(y.dim()));
+        cuda::cplx::launch_binary_broadcast<T>(n, a.data_ptr(), ad,
+                                               b.data_ptr(), bd, y.data_ptr(),
+                                               yd, op, stream);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <typename T> inline thrust::complex<T> s2c(const Scalar& s);
+template <> inline thrust::complex<float> s2c<float>(const Scalar& s) {
+    return cuda::cplx::to_c64(s);
+}
+template <> inline thrust::complex<double> s2c<double>(const Scalar& s) {
+    return cuda::cplx::to_c128(s);
+}
+
+template <typename T>
+static void run_cplx_add_scalar(Tensor& x, const Scalar& other,
+                                const Scalar& alpha, Tensor& y) {
+    cuda::cplx::add_scalar_kernel_impl<T>
+        <<<cuda::cplx::default_grid(x.numel()), cuda::cplx::default_block(),
+           0, getCurrentCUDAStream().stream()>>>(
+            x.numel(),
+            static_cast<const thrust::complex<T>*>(x.data_ptr()),
+            s2c<T>(other),
+            s2c<T>(alpha),
+            static_cast<thrust::complex<T>*>(y.data_ptr()));
+    CUDA_CHECK(cudaGetLastError());
+}
+template <typename T>
+static void run_cplx_sub_scalar(Tensor& x, const Scalar& other,
+                                const Scalar& alpha, Tensor& y) {
+    cuda::cplx::sub_scalar_kernel_impl<T>
+        <<<cuda::cplx::default_grid(x.numel()), cuda::cplx::default_block(),
+           0, getCurrentCUDAStream().stream()>>>(
+            x.numel(),
+            static_cast<const thrust::complex<T>*>(x.data_ptr()),
+            s2c<T>(other),
+            s2c<T>(alpha),
+            static_cast<thrust::complex<T>*>(y.data_ptr()));
+    CUDA_CHECK(cudaGetLastError());
+}
+template <typename T>
+static void run_cplx_mul_scalar(Tensor& x, const Scalar& other, Tensor& y) {
+    cuda::cplx::mul_scalar_kernel_impl<T>
+        <<<cuda::cplx::default_grid(x.numel()), cuda::cplx::default_block(),
+           0, getCurrentCUDAStream().stream()>>>(
+            x.numel(),
+            static_cast<const thrust::complex<T>*>(x.data_ptr()),
+            s2c<T>(other),
+            static_cast<thrust::complex<T>*>(y.data_ptr()));
+    CUDA_CHECK(cudaGetLastError());
+}
+template <typename T>
+static void run_cplx_div_scalar(Tensor& x, const Scalar& other, Tensor& y) {
+    cuda::cplx::div_scalar_kernel_impl<T>
+        <<<cuda::cplx::default_grid(x.numel()), cuda::cplx::default_block(),
+           0, getCurrentCUDAStream().stream()>>>(
+            x.numel(),
+            static_cast<const thrust::complex<T>*>(x.data_ptr()),
+            s2c<T>(other),
+            static_cast<thrust::complex<T>*>(y.data_ptr()));
+    CUDA_CHECK(cudaGetLastError());
+}
+
 // Grid-stride wrapper so any launch config is correct (ATen elementwise style)
 #define TP_CUDA_GRIDSTRIDE(i) \
     int64_t i = blockIdx.x * blockDim.x + threadIdx.x; \
@@ -41,16 +142,11 @@ inline typename BinaryOpMath<T>::type scalar_to_opmath(const Scalar& s) {
 // Forward declarations for the scalar fallback used by the fused kernel.
 Tensor add_scalar_kernel(const Tensor& self, Scalar other, Scalar alpha);
 Tensor mul_scalar_kernel(const Tensor& self, Scalar other);
+#ifdef USE_CUDNN
 Tensor& relu_inplace_kernel_cudnn(Tensor& self);
-
-// --- Utils ---
-#define CUDA_CHECK(condition) \
-  do { \
-    cudaError_t error = condition; \
-    if (error != cudaSuccess) { \
-       TP_THROW(RuntimeError, std::string("CUDA Error: ") + cudaGetErrorString(error)); \
-    } \
-  } while (0)
+#else
+Tensor relu_kernel_cuda(const Tensor& self);
+#endif
 
 #define MAX_DIMS 8
 
@@ -400,6 +496,14 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
         case DType::Float64:
             add_broadcast_kernel<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<double>(), a_desc, b.data_ptr<double>(), b_desc, result.data_ptr<double>(), y_desc, alpha.to<double>());
             break;
+        case DType::ComplexFloat:
+            run_cplx_binary<float>(a, b, result,
+                                   cuda::cplx::AddAlphaOp<float>{s2c<float>(alpha)});
+            break;
+        case DType::ComplexDouble:
+            run_cplx_binary<double>(a, b, result,
+                                    cuda::cplx::AddAlphaOp<double>{s2c<double>(alpha)});
+            break;
         default:
             TP_THROW(NotImplementedError, "CUDA add: unsupported dtype");
     }
@@ -480,7 +584,11 @@ Tensor add_relu_cuda(const Tensor& self, const Tensor& other) {
     }
 
     Tensor result = add_kernel(self, other, Scalar(1));
+#ifdef USE_CUDNN
     return relu_inplace_kernel_cudnn(result);
+#else
+    return relu_kernel_cuda(result);
+#endif
 }
 
 Tensor& add_inplace_kernel(Tensor& self, const Tensor& other, Scalar alpha) {
@@ -516,6 +624,14 @@ Tensor& add_inplace_kernel(Tensor& self, const Tensor& other, Scalar alpha) {
             break;
         case DType::Float64:
             add_broadcast_kernel<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<double>(), a_desc, b.data_ptr<double>(), b_desc, self.data_ptr<double>(), y_desc, alpha.to<double>());
+            break;
+        case DType::ComplexFloat:
+            run_cplx_binary<float>(self, b, self,
+                                   cuda::cplx::AddAlphaOp<float>{s2c<float>(alpha)});
+            break;
+        case DType::ComplexDouble:
+            run_cplx_binary<double>(self, b, self,
+                                    cuda::cplx::AddAlphaOp<double>{s2c<double>(alpha)});
             break;
         default:
             TP_THROW(NotImplementedError, "CUDA add_: unsupported dtype");
@@ -564,6 +680,14 @@ Tensor sub_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
         case DType::Float64:
             sub_broadcast_kernel<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<double>(), a_desc, b.data_ptr<double>(), b_desc, result.data_ptr<double>(), y_desc, alpha.to<double>());
             break;
+        case DType::ComplexFloat:
+            run_cplx_binary<float>(a, b, result,
+                                   cuda::cplx::SubAlphaOp<float>{s2c<float>(alpha)});
+            break;
+        case DType::ComplexDouble:
+            run_cplx_binary<double>(a, b, result,
+                                    cuda::cplx::SubAlphaOp<double>{s2c<double>(alpha)});
+            break;
         default:
             TP_THROW(NotImplementedError, "CUDA sub: unsupported dtype");
     }
@@ -599,6 +723,14 @@ Tensor& sub_inplace_kernel(Tensor& self, const Tensor& other, Scalar alpha) {
             break;
         case DType::Float64:
             sub_broadcast_kernel<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<double>(), a_desc, b.data_ptr<double>(), b_desc, self.data_ptr<double>(), y_desc, alpha.to<double>());
+            break;
+        case DType::ComplexFloat:
+            run_cplx_binary<float>(self, b, self,
+                                   cuda::cplx::SubAlphaOp<float>{s2c<float>(alpha)});
+            break;
+        case DType::ComplexDouble:
+            run_cplx_binary<double>(self, b, self,
+                                    cuda::cplx::SubAlphaOp<double>{s2c<double>(alpha)});
             break;
         default:
             TP_THROW(NotImplementedError, "CUDA sub_: unsupported dtype");
@@ -647,6 +779,12 @@ Tensor mul_kernel(const Tensor& self, const Tensor& other) {
         case DType::Float64:
             mul_broadcast_kernel<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<double>(), a_desc, b.data_ptr<double>(), b_desc, result.data_ptr<double>(), y_desc);
             break;
+        case DType::ComplexFloat:
+            run_cplx_binary<float>(a, b, result, cuda::cplx::MulOp{});
+            break;
+        case DType::ComplexDouble:
+            run_cplx_binary<double>(a, b, result, cuda::cplx::MulOp{});
+            break;
         default:
             TP_THROW(NotImplementedError, "CUDA mul: unsupported dtype");
     }
@@ -682,6 +820,12 @@ Tensor& mul_inplace_kernel(Tensor& self, const Tensor& other) {
             break;
         case DType::Float64:
             mul_broadcast_kernel<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<double>(), a_desc, b.data_ptr<double>(), b_desc, self.data_ptr<double>(), y_desc);
+            break;
+        case DType::ComplexFloat:
+            run_cplx_binary<float>(self, b, self, cuda::cplx::MulOp{});
+            break;
+        case DType::ComplexDouble:
+            run_cplx_binary<double>(self, b, self, cuda::cplx::MulOp{});
             break;
         default:
             TP_THROW(NotImplementedError, "CUDA mul_: unsupported dtype");
@@ -765,6 +909,12 @@ Tensor div_kernel(const Tensor& self, const Tensor& other) {
         case DType::Float64:
             div_broadcast_kernel<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<double>(), a_desc, b.data_ptr<double>(), b_desc, result.data_ptr<double>(), y_desc);
             break;
+        case DType::ComplexFloat:
+            run_cplx_binary<float>(a, b, result, cuda::cplx::DivOp{});
+            break;
+        case DType::ComplexDouble:
+            run_cplx_binary<double>(a, b, result, cuda::cplx::DivOp{});
+            break;
         default:
             TP_THROW(NotImplementedError, "CUDA div: unsupported dtype");
     }
@@ -806,6 +956,12 @@ Tensor& div_inplace_kernel(Tensor& self, const Tensor& other) {
         case DType::Float64:
             div_broadcast_kernel<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<double>(), a_desc, b.data_ptr<double>(), b_desc, self.data_ptr<double>(), y_desc);
             break;
+        case DType::ComplexFloat:
+            run_cplx_binary<float>(self, b, self, cuda::cplx::DivOp{});
+            break;
+        case DType::ComplexDouble:
+            run_cplx_binary<double>(self, b, self, cuda::cplx::DivOp{});
+            break;
         default:
             TP_THROW(NotImplementedError, "CUDA div_: unsupported dtype");
     }
@@ -814,14 +970,8 @@ Tensor& div_inplace_kernel(Tensor& self, const Tensor& other) {
 
 
 Tensor add_scalar_kernel(const Tensor& self, Scalar other, Scalar alpha) {
-    DType result_dtype = self.dtype();
-    // PyTorch's scalar promotion is value/type aware: a Python float does not
-    // widen an already floating tensor (including fp16/bf16).  Only integral
-    // tensors need promotion when they meet a floating scalar.
-    if (!isFloatingType(result_dtype) &&
-        (other.isFloatingPoint() || alpha.isFloatingPoint())) {
-        result_dtype = promoteTypes(result_dtype, DType::Float32);
-    }
+    DType result_dtype = cuda::cplx::scalar_result_dtype(
+        self.dtype(), other, &alpha);
     
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), result_dtype, self.device());
     int64_t n = self.numel();
@@ -849,6 +999,12 @@ Tensor add_scalar_kernel(const Tensor& self, Scalar other, Scalar alpha) {
             break;
         case DType::Float64:
             add_scalar_kernel_cuda_impl<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<double>(), other.to<double>(), result.data_ptr<double>(), alpha.to<double>());
+            break;
+        case DType::ComplexFloat:
+            run_cplx_add_scalar<float>(a, other, alpha, result);
+            break;
+        case DType::ComplexDouble:
+            run_cplx_add_scalar<double>(a, other, alpha, result);
             break;
         default:
             TP_THROW(NotImplementedError, "CUDA add_scalar: unsupported dtype");
@@ -884,6 +1040,12 @@ Tensor& add_scalar_inplace_kernel(Tensor& self, Scalar other, Scalar alpha) {
         case DType::Float64:
             add_scalar_kernel_cuda_impl<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<double>(), other.to<double>(), self.data_ptr<double>(), alpha.to<double>());
             break;
+        case DType::ComplexFloat:
+            run_cplx_add_scalar<float>(self, other, alpha, self);
+            break;
+        case DType::ComplexDouble:
+            run_cplx_add_scalar<double>(self, other, alpha, self);
+            break;
         default:
             TP_THROW(NotImplementedError, "CUDA add_scalar_: unsupported dtype");
     }
@@ -891,11 +1053,8 @@ Tensor& add_scalar_inplace_kernel(Tensor& self, Scalar other, Scalar alpha) {
 }
 
 Tensor sub_scalar_kernel(const Tensor& self, Scalar other, Scalar alpha) {
-    DType result_dtype = self.dtype();
-    if (!isFloatingType(result_dtype) &&
-        (other.isFloatingPoint() || alpha.isFloatingPoint())) {
-        result_dtype = promoteTypes(result_dtype, DType::Float32);
-    }
+    DType result_dtype = cuda::cplx::scalar_result_dtype(
+        self.dtype(), other, &alpha);
     
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), result_dtype, self.device());
     int64_t n = self.numel();
@@ -923,6 +1082,12 @@ Tensor sub_scalar_kernel(const Tensor& self, Scalar other, Scalar alpha) {
             break;
         case DType::Float64:
             sub_scalar_kernel_cuda_impl<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<double>(), other.to<double>(), result.data_ptr<double>(), alpha.to<double>());
+            break;
+        case DType::ComplexFloat:
+            run_cplx_sub_scalar<float>(a, other, alpha, result);
+            break;
+        case DType::ComplexDouble:
+            run_cplx_sub_scalar<double>(a, other, alpha, result);
             break;
         default:
             TP_THROW(NotImplementedError, "CUDA sub_scalar: unsupported dtype");
@@ -958,6 +1123,12 @@ Tensor& sub_scalar_inplace_kernel(Tensor& self, Scalar other, Scalar alpha) {
         case DType::Float64:
             sub_scalar_kernel_cuda_impl<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<double>(), other.to<double>(), self.data_ptr<double>(), alpha.to<double>());
             break;
+        case DType::ComplexFloat:
+            run_cplx_sub_scalar<float>(self, other, alpha, self);
+            break;
+        case DType::ComplexDouble:
+            run_cplx_sub_scalar<double>(self, other, alpha, self);
+            break;
         default:
             TP_THROW(NotImplementedError, "CUDA sub_scalar_: unsupported dtype");
     }
@@ -965,10 +1136,7 @@ Tensor& sub_scalar_inplace_kernel(Tensor& self, Scalar other, Scalar alpha) {
 }
 
 Tensor mul_scalar_kernel(const Tensor& self, Scalar other) {
-    DType result_dtype = self.dtype();
-    if (!isFloatingType(result_dtype) && other.isFloatingPoint()) {
-        result_dtype = promoteTypes(result_dtype, DType::Float32);
-    }
+    DType result_dtype = cuda::cplx::scalar_result_dtype(self.dtype(), other);
     
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), result_dtype, self.device());
     int64_t n = self.numel();
@@ -996,6 +1164,12 @@ Tensor mul_scalar_kernel(const Tensor& self, Scalar other) {
             break;
         case DType::Float64:
             mul_scalar_kernel_cuda_impl<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<double>(), other.to<double>(), result.data_ptr<double>());
+            break;
+        case DType::ComplexFloat:
+            run_cplx_mul_scalar<float>(a, other, result);
+            break;
+        case DType::ComplexDouble:
+            run_cplx_mul_scalar<double>(a, other, result);
             break;
         default:
             TP_THROW(NotImplementedError, "CUDA mul_scalar: unsupported dtype");
@@ -1031,6 +1205,12 @@ Tensor& mul_scalar_inplace_kernel(Tensor& self, Scalar other) {
         case DType::Float64:
             mul_scalar_kernel_cuda_impl<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<double>(), other.to<double>(), self.data_ptr<double>());
             break;
+        case DType::ComplexFloat:
+            run_cplx_mul_scalar<float>(self, other, self);
+            break;
+        case DType::ComplexDouble:
+            run_cplx_mul_scalar<double>(self, other, self);
+            break;
         default:
             TP_THROW(NotImplementedError, "CUDA mul_scalar_: unsupported dtype");
     }
@@ -1039,9 +1219,13 @@ Tensor& mul_scalar_inplace_kernel(Tensor& self, Scalar other) {
 
 Tensor div_scalar_kernel(const Tensor& self, Scalar other) {
     DType result_dtype = self.dtype();
-    // True division promotes integral tensors, but preserves fp16/bf16/fp32/
-    // fp64 just like torch.div(tensor, Python scalar).
-    if (!isFloatingType(result_dtype)) result_dtype = DType::Float32;
+    // True division promotes integral tensors to Float32 (ComplexFloat for a
+    // wrapped complex divisor), preserving floating widths like torch.
+    if (!isFloatingOrComplexType(result_dtype)) {
+        result_dtype = other.isComplex() ? DType::ComplexFloat : DType::Float32;
+    } else if (!isComplexType(result_dtype) && other.isComplex()) {
+        result_dtype = promoteTypes(toComplexType(result_dtype), other.dtype());
+    }
     
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), result_dtype, self.device());
     int64_t n = self.numel();
@@ -1063,6 +1247,12 @@ Tensor div_scalar_kernel(const Tensor& self, Scalar other) {
             break;
         case DType::Float64:
             div_scalar_kernel_cuda_impl<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, a.data_ptr<double>(), other.to<double>(), result.data_ptr<double>());
+            break;
+        case DType::ComplexFloat:
+            run_cplx_div_scalar<float>(a, other, result);
+            break;
+        case DType::ComplexDouble:
+            run_cplx_div_scalar<double>(a, other, result);
             break;
         default:
             TP_THROW(NotImplementedError, "CUDA div_scalar: unsupported dtype");
@@ -1103,6 +1293,12 @@ Tensor& div_scalar_inplace_kernel(Tensor& self, Scalar other) {
             break;
         case DType::Float64:
             div_scalar_kernel_cuda_impl<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self.data_ptr<double>(), other.to<double>(), self.data_ptr<double>());
+            break;
+        case DType::ComplexFloat:
+            run_cplx_div_scalar<float>(self, other, self);
+            break;
+        case DType::ComplexDouble:
+            run_cplx_div_scalar<double>(self, other, self);
             break;
         default:
             TP_THROW(NotImplementedError, "CUDA div_scalar_: unsupported dtype");

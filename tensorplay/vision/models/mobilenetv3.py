@@ -5,8 +5,8 @@ from collections.abc import Sequence
 from functools import partial
 from typing import Any, Callable, Optional
 
-import tensorplay as torch
-from torch import nn, Tensor
+import tensorplay as tensorplay
+from tensorplay import nn, Tensor
 
 from ..ops.misc import Conv2dNormActivation, SqueezeExcitation as SElayer
 from ..transforms._presets import ImageClassification
@@ -214,7 +214,7 @@ class MobileNetV3(nn.Module):
         x = self.features(x)
 
         x = self.avgpool(x)
-        x = torch.flatten(x, 1)
+        x = tensorplay.flatten(x, 1)
 
         x = self.classifier(x)
 
@@ -304,7 +304,7 @@ class MobileNet_V3_Large_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 5483032,
-            "recipe": "https://github.com/pytorch/vision/tree/main/references/classification#mobilenetv3-large--small",
+            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#mobilenetv3-large--small",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 74.042,
@@ -322,7 +322,7 @@ class MobileNet_V3_Large_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 5483032,
-            "recipe": "https://github.com/pytorch/vision/issues/3995#new-recipe-with-reg-tuning",
+            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe-with-reg-tuning",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 75.274,
@@ -333,8 +333,8 @@ class MobileNet_V3_Large_Weights(WeightsEnum):
             "_file_size": 21.107,
             "_docs": """
                 These weights improve marginally upon the results of the original paper by using a modified version of
-                TorchVision's `new training recipe
-                <https://pytorch.org/blog/how-to-train-state-of-the-art-models-using-torchvision-latest-primitives/>`_.
+                TensorPlay Vision's `new training recipe
+                <https://tensorplay.org/blog/how-to-train-state-of-the-art-models-using-tensorplay.vision-latest-primitives/>`_.
             """,
         },
     )
@@ -348,7 +348,7 @@ class MobileNet_V3_Small_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 2542856,
-            "recipe": "https://github.com/pytorch/vision/tree/main/references/classification#mobilenetv3-large--small",
+            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#mobilenetv3-large--small",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 67.668,
@@ -375,19 +375,19 @@ def mobilenet_v3_large(
     `Searching for MobileNetV3 <https://arxiv.org/abs/1905.02244>`__.
 
     Args:
-        weights (:class:`~torchvision.models.MobileNet_V3_Large_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.MobileNet_V3_Large_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.MobileNet_V3_Large_Weights` below for
+            :class:`~tensorplay.vision.models.MobileNet_V3_Large_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.mobilenet.MobileNetV3``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.mobilenet.MobileNetV3``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/mobilenetv3.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/mobilenetv3.py>`_
             for more details about this class.
 
-    .. autoclass:: torchvision.models.MobileNet_V3_Large_Weights
+    .. autoclass:: tensorplay.vision.models.MobileNet_V3_Large_Weights
         :members:
     """
     weights = MobileNet_V3_Large_Weights.verify(weights)
@@ -406,19 +406,19 @@ def mobilenet_v3_small(
     `Searching for MobileNetV3 <https://arxiv.org/abs/1905.02244>`__.
 
     Args:
-        weights (:class:`~torchvision.models.MobileNet_V3_Small_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.MobileNet_V3_Small_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.MobileNet_V3_Small_Weights` below for
+            :class:`~tensorplay.vision.models.MobileNet_V3_Small_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.mobilenet.MobileNetV3``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.mobilenet.MobileNetV3``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/mobilenetv3.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/mobilenetv3.py>`_
             for more details about this class.
 
-    .. autoclass:: torchvision.models.MobileNet_V3_Small_Weights
+    .. autoclass:: tensorplay.vision.models.MobileNet_V3_Small_Weights
         :members:
     """
     weights = MobileNet_V3_Small_Weights.verify(weights)

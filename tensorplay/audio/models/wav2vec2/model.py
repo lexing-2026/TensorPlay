@@ -1,9 +1,9 @@
 import math
 from typing import List, Optional, Tuple
 
-import tensorplay as torch
+import tensorplay as tensorplay
 from tensorplay import Tensor
-from torch.nn import Module
+from tensorplay.nn import Module
 
 from . import components
 
@@ -15,18 +15,18 @@ class Wav2Vec2Model(Module):
         To build the model, please use one of the factory functions.
 
     See Also:
-        * :class:`torchaudio.pipelines.Wav2Vec2Bundle`: Pretrained models (without fine-tuning)
-        * :class:`torchaudio.pipelines.Wav2Vec2ASRBundle`: ASR pipelines with pretrained models.
+        * :class:`tensorplay.audio.pipelines.Wav2Vec2Bundle`: Pretrained models (without fine-tuning)
+        * :class:`tensorplay.audio.pipelines.Wav2Vec2ASRBundle`: ASR pipelines with pretrained models.
 
     Args:
-        feature_extractor (torch.nn.Module):
+        feature_extractor (tensorplay.nn.Module):
             Feature extractor that extracts feature vectors from raw audio Tensor.
 
-        encoder (torch.nn.Module):
+        encoder (tensorplay.nn.Module):
             Encoder that converts the audio features into the sequence of probability
             distribution (in negative log-likelihood) over labels.
 
-        aux (torch.nn.Module or None, optional):
+        aux (tensorplay.nn.Module or None, optional):
             Auxiliary module. If provided, the output from encoder is passed to this module.
     """  # noqa: E501
 
@@ -41,7 +41,7 @@ class Wav2Vec2Model(Module):
         self.encoder = encoder
         self.aux = aux
 
-    @torch.jit.export
+    @tensorplay.jit.export
     def extract_features(
         self,
         waveforms: Tensor,
@@ -130,16 +130,16 @@ class HuBERTPretrainModel(Module):
 
     See Also:
         `HuBERT Pre-training and Fine-tuning Recipes
-        <https://github.com/pytorch/audio/tree/main/examples/hubert>`__
+        <https://github.com/tensorplay/audio/tree/main/examples/hubert>`__
 
     Args:
         wav2vec2 (Wav2Vec2Model):
             Wav2Vec2 encoder that generates the transformer outputs.
 
-        mask_generator (torch.nn.Module):
+        mask_generator (tensorplay.nn.Module):
             Mask generator that generates the mask for masked prediction during the training.
 
-        logit_generator (torch.nn.Module):
+        logit_generator (tensorplay.nn.Module):
             Logit generator that predicts the logits of the masked and unmasked inputs.
 
         feature_grad_mult (float or None):
@@ -212,8 +212,8 @@ class HuBERTPretrainModel(Module):
         if x.shape[1] != labels.shape[1]:
             raise ValueError("The length of label must match that of HuBERT model output")
         if padding_mask is not None:
-            mask_m = torch.logical_and(~padding_mask, mask)
-            mask_u = torch.logical_and(~padding_mask, ~mask_m)
+            mask_m = tensorplay.logical_and(~padding_mask, mask)
+            mask_u = tensorplay.logical_and(~padding_mask, ~mask_m)
         else:
             mask_m = mask
             mask_u = ~mask_m
@@ -241,16 +241,16 @@ def wav2vec2_model(
     encoder_layer_drop: float,
     aux_num_out: Optional[int],
 ) -> Wav2Vec2Model:
-    """Builds custom :class:`~torchaudio.models.Wav2Vec2Model`.
+    """Builds custom :class:`~tensorplay.audio.models.Wav2Vec2Model`.
 
     Note:
         The "feature extractor" below corresponds to
-        `ConvFeatureExtractionModel <https://github.com/pytorch/fairseq/blob/dd3bd3c0497ae9a7ae7364404a6b0a4c501780b3/fairseq/models/wav2vec/wav2vec2.py#L736>`__
+        `ConvFeatureExtractionModel <https://github.com/tensorplay/fairseq/blob/dd3bd3c0497ae9a7ae7364404a6b0a4c501780b3/fairseq/models/wav2vec/wav2vec2.py#L736>`__
         in the original ``fairseq`` implementation.
         This is referred as "(convolutional) feature encoder" in the *wav2vec 2.0*
         :cite:`baevski2020wav2vec` paper.
 
-        The "encoder" below corresponds to `TransformerEncoder <https://github.com/pytorch/fairseq/blob/dd3bd3c0497ae9a7ae7364404a6b0a4c501780b3/fairseq/models/wav2vec/wav2vec2.py#L817>`__,
+        The "encoder" below corresponds to `TransformerEncoder <https://github.com/tensorplay/fairseq/blob/dd3bd3c0497ae9a7ae7364404a6b0a4c501780b3/fairseq/models/wav2vec/wav2vec2.py#L817>`__,
         and this is referred as "Transformer" in the paper.
 
     Args:
@@ -385,7 +385,7 @@ def wav2vec2_model(
     )
     aux = None
     if aux_num_out is not None:
-        aux = torch.nn.Linear(in_features=encoder_embed_dim, out_features=aux_num_out)
+        aux = tensorplay.nn.Linear(in_features=encoder_embed_dim, out_features=aux_num_out)
     return Wav2Vec2Model(feature_extractor, encoder, aux)
 
 
@@ -397,7 +397,7 @@ def wav2vec2_base(
     encoder_layer_drop: float = 0.1,
     aux_num_out: Optional[int] = None,
 ) -> Wav2Vec2Model:
-    """Builds "base" :class:`~torchaudio.models.Wav2Vec2Model` from *wav2vec 2.0* :cite:`baevski2020wav2vec`
+    """Builds "base" :class:`~tensorplay.audio.models.Wav2Vec2Model` from *wav2vec 2.0* :cite:`baevski2020wav2vec`
 
     Args:
         encoder_projection_dropout (float):
@@ -445,7 +445,7 @@ def wav2vec2_large(
     encoder_layer_drop: float = 0.1,
     aux_num_out: Optional[int] = None,
 ) -> Wav2Vec2Model:
-    """Builds "large" :class:`~torchaudio.models.Wav2Vec2Model` from *wav2vec 2.0* :cite:`baevski2020wav2vec`
+    """Builds "large" :class:`~tensorplay.audio.models.Wav2Vec2Model` from *wav2vec 2.0* :cite:`baevski2020wav2vec`
 
     Args:
         encoder_projection_dropout (float):
@@ -493,7 +493,7 @@ def wav2vec2_large_lv60k(
     encoder_layer_drop: float = 0.1,
     aux_num_out: Optional[int] = None,
 ) -> Wav2Vec2Model:
-    """Builds "large lv-60k" :class:`~torchaudio.models.Wav2Vec2Model` from *wav2vec 2.0* :cite:`baevski2020wav2vec`
+    """Builds "large lv-60k" :class:`~tensorplay.audio.models.Wav2Vec2Model` from *wav2vec 2.0* :cite:`baevski2020wav2vec`
 
     Args:
         encoder_projection_dropout (float):
@@ -541,7 +541,7 @@ def hubert_base(
     encoder_layer_drop: float = 0.05,
     aux_num_out: Optional[int] = None,
 ) -> Wav2Vec2Model:
-    """Builds "base" :class:`HuBERT <torchaudio.models.Wav2Vec2Model>` from *HuBERT* :cite:`hsu2021hubert`
+    """Builds "base" :class:`HuBERT <tensorplay.audio.models.Wav2Vec2Model>` from *HuBERT* :cite:`hsu2021hubert`
 
     Args:
         encoder_projection_dropout (float):
@@ -589,7 +589,7 @@ def hubert_large(
     encoder_layer_drop: float = 0.0,
     aux_num_out: Optional[int] = None,
 ) -> Wav2Vec2Model:
-    """Builds "large" :class:`HuBERT <torchaudio.models.Wav2Vec2Model>` from *HuBERT* :cite:`hsu2021hubert`
+    """Builds "large" :class:`HuBERT <tensorplay.audio.models.Wav2Vec2Model>` from *HuBERT* :cite:`hsu2021hubert`
 
     Args:
         encoder_projection_dropout (float):
@@ -637,7 +637,7 @@ def hubert_xlarge(
     encoder_layer_drop: float = 0.0,
     aux_num_out: Optional[int] = None,
 ) -> Wav2Vec2Model:
-    """Builds "extra large" :class:`HuBERT <torchaudio.models.Wav2Vec2Model>` from *HuBERT* :cite:`hsu2021hubert`
+    """Builds "extra large" :class:`HuBERT <tensorplay.audio.models.Wav2Vec2Model>` from *HuBERT* :cite:`hsu2021hubert`
 
     Args:
         encoder_projection_dropout (float):
@@ -679,19 +679,19 @@ def hubert_xlarge(
 
 def _init_hubert_pretrain_model(module):
     if isinstance(module, components.ConvLayerBlock):
-        torch.nn.init.kaiming_normal_(module.conv.weight)
+        tensorplay.nn.init.kaiming_normal_(module.conv.weight)
     elif isinstance(module, components.ConvolutionalPositionalEmbedding):
         # normalize the weight to normal distribution.
         std = math.sqrt(4.0 / (module.embed_dim * module.kernel_size))
-        torch.nn.init.normal_(module.conv.weight, mean=0.0, std=std)
-        torch.nn.init.constant_(module.conv.bias, 0.0)
+        tensorplay.nn.init.normal_(module.conv.weight, mean=0.0, std=std)
+        tensorplay.nn.init.constant_(module.conv.bias, 0.0)
     elif isinstance(module, components.SelfAttention):
         # normalize the query, key, value, and out_proj parameters in self attention module.
-        torch.nn.init.xavier_uniform_(module.k_proj.weight, gain=1 / math.sqrt(2))
-        torch.nn.init.xavier_uniform_(module.v_proj.weight, gain=1 / math.sqrt(2))
-        torch.nn.init.xavier_uniform_(module.q_proj.weight, gain=1 / math.sqrt(2))
-        torch.nn.init.xavier_uniform_(module.out_proj.weight)
-        torch.nn.init.constant_(module.out_proj.bias, 0.0)
+        tensorplay.nn.init.xavier_uniform_(module.k_proj.weight, gain=1 / math.sqrt(2))
+        tensorplay.nn.init.xavier_uniform_(module.v_proj.weight, gain=1 / math.sqrt(2))
+        tensorplay.nn.init.xavier_uniform_(module.q_proj.weight, gain=1 / math.sqrt(2))
+        tensorplay.nn.init.xavier_uniform_(module.out_proj.weight)
+        tensorplay.nn.init.constant_(module.out_proj.bias, 0.0)
     elif isinstance(module, components.Transformer):
         module.apply(components._init_transformer_params)
     else:
@@ -736,12 +736,12 @@ def hubert_pretrain_model(
 
     Note:
         The "feature extractor" below corresponds to
-        `ConvFeatureExtractionModel <https://github.com/pytorch/fairseq/blob/dd3bd3c0497ae9a7ae7364404a6b0a4c501780b3/fairseq/models/wav2vec/wav2vec2.py#L736>`__
+        `ConvFeatureExtractionModel <https://github.com/tensorplay/fairseq/blob/dd3bd3c0497ae9a7ae7364404a6b0a4c501780b3/fairseq/models/wav2vec/wav2vec2.py#L736>`__
         in the original ``fairseq`` implementation.
         This is referred as "(convolutional) feature encoder" in the *wav2vec 2.0*
         :cite:`baevski2020wav2vec` paper.
 
-        The "encoder" below corresponds to `TransformerEncoder <https://github.com/pytorch/fairseq/blob/dd3bd3c0497ae9a7ae7364404a6b0a4c501780b3/fairseq/models/wav2vec/wav2vec2.py#L817>`__,
+        The "encoder" below corresponds to `TransformerEncoder <https://github.com/tensorplay/fairseq/blob/dd3bd3c0497ae9a7ae7364404a6b0a4c501780b3/fairseq/models/wav2vec/wav2vec2.py#L817>`__,
         and this is referred as "Transformer" in the paper.
 
     Args:
@@ -1235,36 +1235,36 @@ def wavlm_model(
 ) -> Wav2Vec2Model:
     """Builds custom WaveLM model :cite:`chen2022wavlm`. The architecture is compatible
     with Wav2Vec2 model :cite:`baevski2020wav2vec`, and so the output object is
-    :class:`~torchaudio.models.Wav2Vec2Model`. Most of the arguments have the same meaning
-    as in :py:func:`~torchaudio.models.wav2vec2_model` so please refer there for documentation.
+    :class:`~tensorplay.audio.models.Wav2Vec2Model`. Most of the arguments have the same meaning
+    as in :py:func:`~tensorplay.audio.models.wav2vec2_model` so please refer there for documentation.
 
     Args:
         extractor_mode (str): Operation mode of feature extractor.
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
 
         extractor_conv_layer_config (list of integer tuples or None):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
 
         extractor_conv_bias (bool):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
 
         encoder_embed_dim (int):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
 
         encoder_projection_dropout (float):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
 
         encoder_pos_conv_kernel (int):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
 
         encoder_pos_conv_groups (int):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
 
         encoder_num_layers (int):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
 
         encoder_num_heads (int):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
 
         encoder_num_buckets (int):
             Number of buckets for relative position embedding.
@@ -1272,25 +1272,25 @@ def wavlm_model(
             Maximum distance for relative position embedding.
 
         encoder_attention_dropout (float):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
 
         encoder_ff_interm_features (int):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
 
         encoder_ff_interm_dropout (float):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
 
         encoder_dropout (float):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
 
         encoder_layer_norm_first (bool):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
 
         encoder_layer_drop (float):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
 
         aux_num_out (int or None):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
 
     Returns:
         Wav2Vec2Model:
@@ -1321,7 +1321,7 @@ def wavlm_model(
     )
     aux = None
     if aux_num_out is not None:
-        aux = torch.nn.Linear(in_features=encoder_embed_dim, out_features=aux_num_out)
+        aux = tensorplay.nn.Linear(in_features=encoder_embed_dim, out_features=aux_num_out)
     return Wav2Vec2Model(feature_extractor, encoder, aux)
 
 
@@ -1335,21 +1335,21 @@ def wavlm_base(
 ) -> Wav2Vec2Model:
     """Builds "base" WaveLM model :cite:`chen2022wavlm`. The architecture is compatible
     with Wav2Vec2 model :cite:`baevski2020wav2vec`, and so the output class is
-    :class:`~torchaudio.models.Wav2Vec2Model`.
+    :class:`~tensorplay.audio.models.Wav2Vec2Model`.
 
     Args:
         encoder_projection_dropout (float):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
         encoder_attention_dropout (float):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
         encoder_ff_interm_dropout (float):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
         encoder_dropout (float):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
         encoder_layer_drop (float):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
         aux_num_out (int, optional):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
 
     Returns:
         Wav2Vec2Model:
@@ -1387,21 +1387,21 @@ def wavlm_large(
 ) -> Wav2Vec2Model:
     """Builds "large" WaveLM model :cite:`chen2022wavlm`. The architecture is compatible
     with Wav2Vec2 model :cite:`baevski2020wav2vec`, and so the output class is
-    :class:`~torchaudio.models.Wav2Vec2Model`.
+    :class:`~tensorplay.audio.models.Wav2Vec2Model`.
 
     Args:
         encoder_projection_dropout (float):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
         encoder_attention_dropout (float):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
         encoder_ff_interm_dropout (float):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
         encoder_dropout (float):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
         encoder_layer_drop (float):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
         aux_num_out (int, optional):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
 
     Returns:
         Wav2Vec2Model:
@@ -1439,21 +1439,21 @@ def wav2vec2_xlsr_300m(
 ) -> Wav2Vec2Model:
     """Builds XLS-R model :cite:`babu2021xls` with 300 millions of parameters. The architecture is compatible
     with Wav2Vec2 model :cite:`baevski2020wav2vec`, and so the output class is
-    :class:`~torchaudio.models.Wav2Vec2Model`.
+    :class:`~tensorplay.audio.models.Wav2Vec2Model`.
 
     Args:
         encoder_projection_dropout (float):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
         encoder_attention_dropout (float):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
         encoder_ff_interm_dropout (float):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
         encoder_dropout (float):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
         encoder_layer_drop (float):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
         aux_num_out (int, optional):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
 
     Returns:
         Wav2Vec2Model:
@@ -1489,21 +1489,21 @@ def wav2vec2_xlsr_1b(
 ) -> Wav2Vec2Model:
     """Builds XLS-R model :cite:`babu2021xls` with 1 billion of parameters. The architecture is compatible
     with Wav2Vec2 model :cite:`baevski2020wav2vec`, and so the output class is
-    :class:`~torchaudio.models.Wav2Vec2Model`.
+    :class:`~tensorplay.audio.models.Wav2Vec2Model`.
 
     Args:
         encoder_projection_dropout (float):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
         encoder_attention_dropout (float):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
         encoder_ff_interm_dropout (float):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
         encoder_dropout (float):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
         encoder_layer_drop (float):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
         aux_num_out (int, optional):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
 
     Returns:
         Wav2Vec2Model:
@@ -1539,21 +1539,21 @@ def wav2vec2_xlsr_2b(
 ) -> Wav2Vec2Model:
     """Builds XLS-R model :cite:`babu2021xls` with 2 billions of parameters. The architecture is compatible
     with Wav2Vec2 model :cite:`baevski2020wav2vec`, and so the output class is
-    :class:`~torchaudio.models.Wav2Vec2Model`.
+    :class:`~tensorplay.audio.models.Wav2Vec2Model`.
 
     Args:
         encoder_projection_dropout (float):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
         encoder_attention_dropout (float):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
         encoder_ff_interm_dropout (float):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
         encoder_dropout (float):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
         encoder_layer_drop (float):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
         aux_num_out (int, optional):
-            See :py:func:`~torchaudio.models.wav2vec2_model`.
+            See :py:func:`~tensorplay.audio.models.wav2vec2_model`.
 
     Returns:
         Wav2Vec2Model:

@@ -10,13 +10,14 @@ differentiable. Spec tests against local torch live in
 Deliberate narrows (documented per function):
 - ``matrix_power`` negative exponents raise (needs inverse wiring);
 - ``unique_consecutive`` supports the flattened form only (dim=None);
-- ``quantile``/``nanquantile`` support interpolation='linear';
 - conjugation-bit queries report physical layout (tp has no conj bit);
 - ``cartesian_prod`` accepts 1-D inputs.
 """
 
 import itertools
 import math
+
+import numpy as np
 
 import tensorplay
 from tensorplay._C import DType
@@ -32,8 +33,8 @@ __all__ = [
     "detach", "diagflat", "numel", "scalar_tensor",
     "chain_matmul", "matrix_power", "kron", "vander",
     "tril_indices", "triu_indices", "cartesian_prod", "combinations",
-    "cov", "corrcoef", "trapezoid", "trapz", "cumulative_trapezoid",
-    "gradient", "quantile", "nanquantile", "histc", "histogram",
+    "trapezoid", "trapz", "cumulative_trapezoid",
+    "quantile", "nanquantile", "histc", "histogram",
     "isin", "unique_consecutive", "repeat_interleave", "kaiser_window",
     "lstm_cell", "rnn_relu_cell", "rnn_tanh_cell",
     "put", "resolve_conj", "resolve_neg", "is_conj", "is_neg",
@@ -42,7 +43,7 @@ __all__ = [
     "alias_copy", "t_copy", "permute_copy", "transpose_copy",
     "squeeze_copy", "unsqueeze_copy", "select_copy", "slice_copy",
     "narrow_copy", "diagonal_copy", "unbind_copy", "split_copy",
-    "view_copy", "unfold_copy", "expand_copy",
+    "view_copy", "unfold_copy", "expand_copy", "reshape_as",
     "unsafe_chunk", "unsafe_split",
     "rms_norm", "cosine_similarity",
     "max_pool1d", "avg_pool1d", "adaptive_avg_pool1d",
@@ -272,18 +273,36 @@ def floor_divide(input, other, *, out=None):
     return q
 
 
+def _int_pair_target(input, other):
+    # torch result_type for two integral operands stays integral (a Python
+    # int counts as integral).
+    def _is_int(v):
+        if isinstance(v, tensorplay.Tensor):
+            return v.dtype in _INT_DTYPES
+        return isinstance(v, (int, np.integer)) and not isinstance(v, bool)
+    a_ok = _is_int(input)
+    b_ok = _is_int(other)
+    if a_ok and b_ok:
+        return input.dtype if isinstance(input, tensorplay.Tensor) else None
+    return None
+
+
 def remainder(input, other, *, out=None):
     q = _true_quotient(input, other).floor()
     prod = multiply(q, _as_tensor(other).to(q.dtype))
     base = input if isinstance(input, tensorplay.Tensor) else _as_tensor(input)
-    return base.to(prod.dtype).sub(prod)
+    res = base.to(prod.dtype).sub(prod)
+    target = _int_pair_target(input, other)
+    return res.to(target) if target is not None else res
 
 
 def fmod(input, other, *, out=None):
     q = _true_quotient(input, other).trunc()
     prod = multiply(q, _as_tensor(other).to(q.dtype))
     base = input if isinstance(input, tensorplay.Tensor) else _as_tensor(input)
-    return base.to(prod.dtype).sub(prod)
+    res = base.to(prod.dtype).sub(prod)
+    target = _int_pair_target(input, other)
+    return res.to(target) if target is not None else res
 
 
 def clamp_max(input, max):
@@ -458,87 +477,6 @@ def _float_out_dtype(dt):
     return DType.float64 if dt == DType.float64 else DType.float32
 
 
-def cov(input, *, correction=1, fweights=None, aweights=None):
-    """ATen Correlation.cpp covariance(): each row is a variable, each
-    column an observation; fweights are frequencies, aweights reliability
-    weights; result squeezed for a single variable."""
-    m = input
-    if m.dim() > 2:
-        raise RuntimeError("cov(): expected at most 2 dimensions")
-    if m.dtype == DType.bool:
-        raise RuntimeError("cov(): bool dtype is not supported")
-    md = m.to(DType.float64)
-    if md.dim() < 2:
-        md = md.reshape([1, -1])
-    n = md.size(1)
-    fw = None
-    aw = None
-    if fweights is not None:
-        if fweights.dim() > 1 or fweights.dtype not in _INT_DTYPES or \
-                fweights.numel() != n:
-            raise RuntimeError(
-                "cov(): fweights must be an integral 1-D vector with one "
-                "element per observation")
-        if fweights.numel() and fweights.min().item() < 0:
-            raise RuntimeError("cov(): fweights cannot be negative")
-        fw = fweights.to(DType.float64)
-    if aweights is not None:
-        if aweights.dim() > 1 or aweights.numel() != n or \
-                not aweights.dtype.is_floating_point:
-            raise RuntimeError(
-                "cov(): aweights must be a floating-point 1-D vector with "
-                "one element per observation")
-        if aweights.numel() and aweights.min().item() < 0:
-            raise RuntimeError("cov(): aweights cannot be negative")
-        aw = aweights.to(DType.float64)
-    w = fw
-    if aw is not None:
-        w = w.mul(aw) if w is not None else aw
-    if w is not None:
-        w_sum = w.sum()
-        if float(w_sum.item()) == 0.0:
-            raise RuntimeError(
-                "cov(): weights sum to zero, can't be normalized")
-        avg = md.mul(w.unsqueeze(0)).sum(1, keepdim=True).div(w_sum)
-    else:
-        w_sum = tensorplay.scalar_tensor(float(n), dtype=DType.float64)
-        avg = md.mean(1, keepdim=True)
-    if w is None:
-        fact = float(n) - float(correction)
-    elif float(correction) == 0.0:
-        fact = float(w_sum.item())
-    elif aw is None:
-        fact = float(w_sum.item()) - float(correction)
-    else:
-        fact = float(w_sum.item()) - \
-            float(correction) * float(w.mul(aw).sum().item()) / \
-            float(w_sum.item())
-    if fact <= 0:
-        import warnings
-        warnings.warn(
-            "cov(): degrees of freedom is <= 0; correction should be "
-            "strictly less than the number of observations")
-        fact = 0.0
-    mc = md.sub(avg)
-    cw = mc.mul(w.unsqueeze(0)) if w is not None else mc
-    c = mc.mm(cw.transpose(0, 1))
-    out = c.div(fact if fact > 0 else 1.0)
-    if m.dim() <= 1 or out.size(0) == 1:
-        return out.reshape([]).to(m.dtype)
-    return out.to(m.dtype)
-
-
-def corrcoef(input):
-    c = cov(input)
-    d = c.diagonal()
-    std = d.clamp(min=0.0).sqrt()
-    bad = std.eq(0)
-    std_safe = tensorplay.where(bad, tensorplay.full_like(std, 1.0), std)
-    out = c.div(std_safe.unsqueeze(1)).div(std_safe.unsqueeze(0)) \
-        .clamp(-1.0, 1.0)
-    return out
-
-
 def trapezoid(y, x=None, *, dx=None, dim=-1):
     d = _norm_dim(dim, y.dim())
     if x is None:
@@ -591,154 +529,36 @@ def cumulative_trapezoid(y, x=None, *, dx=None, dim=-1):
     return avg.cumsum(d)
 
 
-def gradient(input, *, spacing=None, dim=None, edge_order=1):
-    if edge_order != 1:
-        raise NotImplementedError(
-            "gradient(): only edge_order=1 is supported"
-        )
-    ndim = input.dim()
-    if dim is None:
-        dims = list(range(ndim))
-    elif isinstance(dim, int):
-        dims = [_norm_dim(dim, ndim)]
-    else:
-        dims = [_norm_dim(dd, ndim) for dd in dim]
-    if spacing is None:
-        spacings = [1.0] * ndim
-    elif isinstance(spacing, tensorplay.Tensor):
-        spacings = [spacing] * ndim
-    elif isinstance(spacing, (int, float)):
-        spacings = [float(spacing)] * ndim
-    else:
-        spacings = [
-            s if isinstance(s, tensorplay.Tensor) else float(s)
-            for s in spacing
-        ]
-        if len(spacings) == 1:
-            spacings = spacings * ndim
-    outs = []
-    for d in dims:
-        n = input.size(d)
-        if n < 2:
-            raise RuntimeError(
-                "gradient(): dimension size must be at least 2"
-            )
-        coord = spacings[d]
-        left = input.narrow(d, 1, 1).sub(input.narrow(d, 0, 1))
-        right = input.narrow(d, n - 1, 1).sub(input.narrow(d, n - 2, 1))
-        inner = input.narrow(d, 2, n - 2).sub(input.narrow(d, 0, n - 2))
-        if isinstance(coord, tensorplay.Tensor):
-            c = coord.reshape([-1]).to(input.dtype)
-            h_l = c.narrow(0, 1, n - 2).sub(c.narrow(0, 0, n - 2))
-            h_r = c.narrow(0, 2, n - 2).sub(c.narrow(0, 1, n - 2))
-            view = [1] * ndim
-            view[d] = -1
-            h_l = h_l.reshape(view)
-            h_r = h_r.reshape(view)
-            fl = input.narrow(d, 1, n - 2).sub(input.narrow(d, 0, n - 2))
-            fr = input.narrow(d, 2, n - 2).sub(input.narrow(d, 1, n - 2))
-            sl = fl.div(h_l)
-            sr = fr.div(h_r)
-            wsum = h_l.add(h_r)
-            gi = sl.mul(h_r).add(sr.mul(h_l)).div(wsum)
-            den_l = c.narrow(0, 1, 1).sub(c.narrow(0, 0, 1)).reshape(view)
-            den_r = c.narrow(0, n - 1, 1).sub(c.narrow(0, n - 2, 1)) \
-                .reshape(view)
-            gl = left.div(den_l)
-            gr = right.div(den_r)
-        else:
-            gi = inner.div(2.0 * float(coord))
-            gl = left.div(float(coord))
-            gr = right.div(float(coord))
-        outs.append(tensorplay.cat([gl, gi, gr], dim=d))
-    return tuple(outs)
-
-
 def quantile(input, q, dim=None, keepdim=False, *, interpolation="linear"):
-    if interpolation != "linear":
-        raise NotImplementedError(
-            "quantile(): only interpolation='linear' is supported"
-        )
-    qs = q if isinstance(q, tensorplay.Tensor) else \
-        tensorplay.tensor([float(q)])
-    qs = qs.to(DType.float64).reshape([-1])
-    work = input.to(DType.float64)
-    if dim is None:
-        vals, _ = tensorplay.sort(work.reshape([-1]))
-        n = vals.numel()
-        pos = qs.mul(float(n - 1))
-        lo = pos.floor().to(DType.int64).clamp(0, n - 1)
-        hi = pos.ceil().to(DType.int64).clamp(0, n - 1)
-        frac = pos.sub(pos.floor())
-        lo_v = vals.index_select(0, lo)
-        hi_v = vals.index_select(0, hi)
-        out = lo_v.add(hi_v.sub(lo_v).mul(frac))
-        od = _float_out_dtype(input.dtype)
-        if not isinstance(q, tensorplay.Tensor) or q.dim() == 0:
-            return out.reshape([]).to(od)
-        return out.reshape(list(q.size())).to(od)
-    axis = _norm_dim(dim, input.dim())
-    perm = [i for i in range(work.dim()) if i != axis] + [axis]
-    moved = work.permute(perm)
-    front = list(moved.size())[:-1]
-    flat = moved.reshape([-1, moved.size(-1)])
-    vals, _ = tensorplay.sort(flat, dim=1)
-    n = vals.size(1)
-    pos = qs.mul(float(n - 1)).unsqueeze(1)
-    lo = pos.floor().to(DType.int64).clamp(0, n - 1)
-    hi = pos.ceil().to(DType.int64).clamp(0, n - 1)
-    frac = pos.sub(pos.floor())
-    lo_idx = lo.transpose(0, 1).repeat([flat.size(0), 1])
-    hi_idx = hi.transpose(0, 1).repeat([flat.size(0), 1])
-    lo_v = vals.gather(1, lo_idx)
-    hi_v = vals.gather(1, hi_idx)
-    frac_b = frac.transpose(0, 1).repeat([flat.size(0), 1])
-    rows = lo_v.add(hi_v.sub(lo_v).mul(frac_b))
-    by_q = rows.transpose(0, 1)
-    scalar_q = not isinstance(q, tensorplay.Tensor) or q.dim() == 0
-    if scalar_q:
-        if keepdim:
-            kept = [1 if i == axis else sz
-                    for i, sz in enumerate(input.size())]
-            return by_q.reshape(kept).to(_float_out_dtype(input.dtype))
-        return by_q.reshape(front).to(_float_out_dtype(input.dtype))
-    out = by_q.reshape(list(qs.size()) + front)
-    if keepdim:
-        kept = [1 if i == axis else sz
-                for i, sz in enumerate(input.size())]
-        out = by_q.reshape(list(qs.size()) + kept)
-    return out.to(_float_out_dtype(input.dtype))
+    """torch.quantile parity via the native dispatcher op (Sorting.cpp
+    quantile_impl composite): all five interpolation modes, float32/float64,
+    NaN semantics and output shapes match upstream.  A Python-number q is
+    wrapped in the input's dtype/device like torch's arg parser; lists are
+    rejected the way torch rejects them."""
+    if isinstance(q, tensorplay.Tensor):
+        qs = q
+    elif isinstance(q, (int, float)):
+        qs = tensorplay.tensor(q, dtype=input.dtype, device=input.device)
+    else:
+        raise TypeError(
+            "quantile() received an invalid combination of arguments - got "
+            f"(Tensor, {type(q).__name__}), but expected (Tensor, Tensor)")
+    return tensorplay._C.quantile(input, qs, dim=dim, keepdim=keepdim,
+                                  interpolation=interpolation)
 
 
 def nanquantile(input, q, dim=None, keepdim=False, *, interpolation="linear"):
-    if dim is not None:
-        raise NotImplementedError("nanquantile(): only dim=None is supported")
-    if interpolation != "linear":
-        raise NotImplementedError(
-            "nanquantile(): only interpolation='linear' is supported"
-        )
-    flat = input.reshape([-1]).to(DType.float64)
-    valid = flat.isnan().logical_not()
-    k = int(valid.sum().item())
-    if k == 0:
-        qsize = list(q.size()) if isinstance(q, tensorplay.Tensor) else []
-        return tensorplay.full(qsize, float("nan"),
-                               _float_out_dtype(input.dtype))
-    filled = tensorplay.where(valid, flat,
-                              tensorplay.full_like(flat, float("inf")))
-    vals, _ = tensorplay.sort(filled)
-    vals = vals.narrow(0, 0, k)
-    qs = q if isinstance(q, tensorplay.Tensor) else \
-        tensorplay.tensor([float(q)])
-    qsd = qs.to(DType.float64).reshape([-1])
-    pos = qsd.mul(float(k - 1)).clamp(0, k - 1)
-    lo = pos.floor().to(DType.int64).clamp(0, k - 1)
-    hi = pos.ceil().to(DType.int64).clamp(0, k - 1)
-    frac = pos.sub(pos.floor())
-    lo_v = vals.index_select(0, lo)
-    hi_v = vals.index_select(0, hi)
-    out = lo_v.add(hi_v.sub(lo_v).mul(frac))
-    return out.reshape(list(qsd.size()))
+    """torch.nanquantile parity via the native dispatcher op."""
+    if isinstance(q, tensorplay.Tensor):
+        qs = q
+    elif isinstance(q, (int, float)):
+        qs = tensorplay.tensor(q, dtype=input.dtype, device=input.device)
+    else:
+        raise TypeError(
+            "nanquantile() received an invalid combination of arguments - got "
+            f"(Tensor, {type(q).__name__}), but expected (Tensor, Tensor)")
+    return tensorplay._C.nanquantile(input, qs, dim=dim, keepdim=keepdim,
+                                     interpolation=interpolation)
 
 
 def histc(input, bins=100, min=0, max=0):
@@ -762,44 +582,17 @@ def histc(input, bins=100, min=0, max=0):
     return counts.to(input.dtype)
 
 
-def histogram(input, bins=10, range=None, *, weight=None, density=False):
+def histogram(input, bins=100, range=None, *, weight=None, density=False):
+    """torch.histogram parity via the native dispatcher op (Histogram.cpp
+    composite): hist/bin_edges in the input dtype, linspace edges, aminmax
+    outer-edge inference with the numpy empty-range expansion, weight in the
+    input dtype and density normalization."""
     if isinstance(bins, tensorplay.Tensor):
-        edges = bins.to(DType.float64).reshape([-1])
-        nb = edges.numel() - 1
-        if nb < 1:
-            raise RuntimeError("histogram(): bins tensor must have at "
-                               "least two elements")
-        v = input.reshape([-1]).to(DType.float64)
-        lo = edges[0].item()
-        hi = edges[-1].item()
-        in_range = _band(v.ge(lo), v.le(hi))
-        idx = tensorplay.searchsorted(edges, v, right=True).sub(1) \
-            .clamp(0, nb - 1).mul(in_range.to(DType.int64))
-        widths = edges.narrow(0, 1, nb).sub(edges.narrow(0, 0, nb))
-        hist = _weighted_bincount(idx, weight, nb, density, widths)
-        return hist.to(input.dtype), bins.clone()
-
-    bins = int(bins)
-    v = input.reshape([-1]).to(DType.float64)
-    if range is not None:
-        lo, hi = float(range[0]), float(range[1])
-    elif v.numel() == 0:
-        lo, hi = 0.0, 1.0
-    else:
-        lo = v.min().item()
-        hi = v.max().item()
-    if hi <= lo:
-        lo -= 0.5
-        hi += 0.5
-    width = (hi - lo) / bins
-    in_range = _band(v.ge(lo), v.le(hi))
-    idx = ((v - lo) / width).floor().to(DType.int64).clamp(0, bins - 1) \
-        .mul(in_range.to(DType.int64))
-    widths = tensorplay.full([bins], width, DType.float64)
-    hist = _weighted_bincount(idx, weight, bins, density, widths)
-    steps = tensorplay.arange(bins + 1, dtype=DType.float64)
-    edges = steps.mul(width).add(lo).to(input.dtype)
-    return hist.to(input.dtype), edges
+        # The bins_tensor overload has no `range` parameter (torch parity).
+        return tensorplay._C.histogram(input, bins, weight=weight,
+                                       density=density)
+    return tensorplay._C.histogram(input, bins, range=range, weight=weight,
+                                   density=density)
 
 
 def _weighted_bincount(idx, weight, nbins, density, widths):
@@ -1102,12 +895,16 @@ def result_type(*args):
 
 
 def is_nonzero(input):
-    if input.numel() != 1:
+    n = input.numel()
+    if n == 0:
         raise RuntimeError(
-            "is_nonzero(): bool value of Tensor with more than one value "
-            "is ambiguous"
+            "Boolean value of Tensor with no values is ambiguous"
         )
-    return input.abs().sum().item() != 0
+    if n != 1:
+        raise RuntimeError(
+            "Boolean value of Tensor with more than one value is ambiguous"
+        )
+    return input.item() != 0
 
 
 def is_same_size(input, other):
@@ -1180,6 +977,12 @@ def split_copy(input, split_size_or_sections, dim=0):
 
 def view_copy(input, size):
     return input.view(list(size)).clone()
+
+
+def reshape_as(input, other):
+    # torch CompositeImplicitAutograd parity: reshape_as(input, other) is
+    # input.reshape(other.shape).
+    return input.reshape(list(other.shape))
 
 
 def unfold_copy(input, dimension, size, step):

@@ -172,11 +172,19 @@ def _single_tensor_adadelta(
             square_avg = tp.view_as_real(square_avg)
             acc_delta = tp.view_as_real(acc_delta)
         square_avg.mul_(rho).addcmul_(grad, grad, value=1 - rho)
-        std = square_avg.add(eps).sqrt_()
-        delta = acc_delta.add(eps).sqrt_()
         if differentiable:
-            delta = delta.clone()
-        delta.div_(std).mul_(grad)
+            # Do not mutate the temporary saved by add() in-place before its
+            # backward pass; Torch's differentiable path treats these as
+            # out-of-place temporaries.
+            std = square_avg.add(eps).sqrt()
+            delta = acc_delta.add(eps).sqrt()
+        else:
+            std = square_avg.add(eps).sqrt_()
+            delta = acc_delta.add(eps).sqrt_()
+        if differentiable:
+            delta = delta.div(std).mul(grad)
+        else:
+            delta.div_(std).mul_(grad)
         acc_delta.mul_(rho).addcmul_(delta, delta, value=1 - rho)
         if is_complex:
             delta = tp.view_as_complex(delta)
@@ -267,6 +275,89 @@ def adadelta(
             "API has changed, `state_steps` argument must contain a list of "
             "singleton tensors"
         )
+
+    native_cpu = (
+        not differentiable
+        and not capturable
+        and not has_complex
+        and bool(params)
+        and all(
+            p.device.type == "cpu"
+            and p.is_contiguous()
+            and p.is_floating_point()
+            and p.dtype == params[0].dtype
+            for p in params
+        )
+        and all(
+            g.device.type == "cpu"
+            and g.is_contiguous()
+            and g.dtype == params[0].dtype
+            for g in grads
+        )
+        and all(
+            step.device.type == "cpu"
+            and step.is_contiguous()
+            and step.numel() == 1
+            and step.dtype in (tp.float32, tp.float64)
+            for step in state_steps
+        )
+    )
+    if native_cpu:
+        tp._fused_adadelta_(
+            params,
+            grads,
+            square_avgs,
+            acc_deltas,
+            state_steps,
+            lr=scalar_value(lr, "lr"),
+            rho=rho,
+            eps=eps,
+            weight_decay=weight_decay,
+            maximize=maximize,
+        )
+        return
+
+    native_cuda = (
+        not differentiable
+        and not capturable
+        and not has_complex
+        and bool(params)
+        and all(
+            p.device.type == "cuda"
+            and p.is_contiguous()
+            and p.is_floating_point()
+            and p.dtype == params[0].dtype
+            for p in params
+        )
+        and all(
+            g.device.type == "cuda"
+            and g.is_contiguous()
+            and g.dtype == params[0].dtype
+            for g in grads
+        )
+        and all(
+            step.device.type == "cpu"
+            and step.is_contiguous()
+            and step.numel() == 1
+            and step.dtype in (tp.float32, tp.float64)
+            for step in state_steps
+        )
+    )
+    if native_cuda:
+        tp._fused_adadelta_(
+            params,
+            grads,
+            square_avgs,
+            acc_deltas,
+            state_steps,
+            lr=scalar_value(lr, "lr"),
+            rho=rho,
+            eps=eps,
+            weight_decay=weight_decay,
+            maximize=maximize,
+        )
+        return
+
     if foreach is None:
         _, foreach = _default_to_fused_or_foreach(
             params, differentiable, use_fused=False

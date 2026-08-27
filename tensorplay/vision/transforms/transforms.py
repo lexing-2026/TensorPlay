@@ -7,7 +7,7 @@ import warnings
 from collections.abc import Sequence
 from typing import Optional, Union
 
-import tensorplay as torch
+import tensorplay as tensorplay
 from tensorplay import Tensor
 
 try:
@@ -70,25 +70,25 @@ class Compose:
         >>> transforms.Compose([
         >>>     transforms.CenterCrop(10),
         >>>     transforms.PILToTensor(),
-        >>>     transforms.ConvertImageDtype(torch.float),
+        >>>     transforms.ConvertImageDtype(tensorplay.float),
         >>> ])
 
     .. note::
-        In order to script the transformations, please use ``torch.nn.Sequential`` as below.
+        In order to script the transformations, please use ``tensorplay.nn.Sequential`` as below.
 
-        >>> transforms = torch.nn.Sequential(
+        >>> transforms = tensorplay.nn.Sequential(
         >>>     transforms.CenterCrop(10),
         >>>     transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
         >>> )
-        >>> scripted_transforms = torch.jit.script(transforms)
+        >>> scripted_transforms = tensorplay.jit.script(transforms)
 
-        Make sure to use only scriptable transformations, i.e. that work with ``torch.Tensor``, does not require
+        Make sure to use only scriptable transformations, i.e. that work with ``tensorplay.Tensor``, does not require
         `lambda` functions or ``PIL.Image``.
 
     """
 
     def __init__(self, transforms):
-        if not torch.jit.is_scripting() and not torch.jit.is_tracing():
+        if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
             _log_api_usage_once(self)
         self.transforms = transforms
 
@@ -112,7 +112,7 @@ class ToTensor:
     This transform does not support torchscript.
 
     Converts a PIL Image or numpy.ndarray (H x W x C) in the range
-    [0, 255] to a torch.FloatTensor of shape (C x H x W) in the range [0.0, 1.0]
+    [0, 255] to a tensorplay.FloatTensor of shape (C x H x W) in the range [0.0, 1.0]
     if the PIL Image belongs to one of the modes (L, LA, P, I, F, RGB, YCbCr, RGBA, CMYK, 1)
     or if the numpy.ndarray has dtype = np.uint8
 
@@ -122,7 +122,7 @@ class ToTensor:
         Because the input image is scaled to [0.0, 1.0], this transformation should not be used when
         transforming target image masks. See the `references`_ for implementing the transforms for image masks.
 
-    .. _references: https://github.com/pytorch/vision/tree/main/references/segmentation
+    .. _references: https://github.com/tensorplay/vision/tree/main/references/segmentation
     """
 
     def __init__(self) -> None:
@@ -151,11 +151,11 @@ class PILToTensor:
 
     Example:
         >>> from PIL import Image
-        >>> import torchvision.transforms as T
+        >>> import tensorplay.vision.transforms as T
         >>> img = Image.new("RGB", (320, 240))  # size (W=320, H=240)
         >>> tensor = T.PILToTensor()(img)
         >>> print(tensor.shape)
-        torch.Size([3, 240, 320])
+        tensorplay.Size([3, 240, 320])
     """
 
     def __init__(self) -> None:
@@ -179,13 +179,13 @@ class PILToTensor:
         return f"{self.__class__.__name__}()"
 
 
-class ConvertImageDtype(torch.nn.Module):
+class ConvertImageDtype(tensorplay.nn.Module):
     """Convert a tensor image to the given ``dtype`` and scale the values accordingly.
 
     This function does not support PIL Image.
 
     Args:
-        dtype (torch.dtype): Desired data type of the output
+        dtype (tensorplay.dtype): Desired data type of the output
 
     .. note::
 
@@ -193,13 +193,13 @@ class ConvertImageDtype(torch.nn.Module):
         If converted back and forth, this mismatch has no effect.
 
     Raises:
-        RuntimeError: When trying to cast :class:`torch.float32` to :class:`torch.int32` or :class:`torch.int64` as
-            well as for trying to cast :class:`torch.float64` to :class:`torch.int64`. These conversions might lead to
+        RuntimeError: When trying to cast :class:`tensorplay.float32` to :class:`tensorplay.int32` or :class:`tensorplay.int64` as
+            well as for trying to cast :class:`tensorplay.float64` to :class:`tensorplay.int64`. These conversions might lead to
             overflow errors since the floating point ``dtype`` cannot store consecutive integers over the whole range
             of the integer ``dtype``.
     """
 
-    def __init__(self, dtype: torch.dtype) -> None:
+    def __init__(self, dtype: tensorplay.dtype) -> None:
         super().__init__()
         _log_api_usage_once(self)
         self.dtype = dtype
@@ -213,7 +213,7 @@ class ToPILImage:
 
     This transform does not support torchscript.
 
-    Converts a torch.*Tensor of shape C x H x W or a numpy ndarray of shape
+    Converts a tensorplay.*Tensor of shape C x H x W or a numpy ndarray of shape
     H x W x C to a PIL Image while adjusting the value range depending on the ``mode``.
 
     Args:
@@ -251,12 +251,12 @@ class ToPILImage:
         return format_string
 
 
-class Normalize(torch.nn.Module):
+class Normalize(tensorplay.nn.Module):
     """Normalize a tensor image with mean and standard deviation.
     This transform does not support PIL Image.
     Given mean: ``(mean[1],...,mean[n])`` and std: ``(std[1],..,std[n])`` for ``n``
     channels, this transform will normalize each channel of the input
-    ``torch.*Tensor`` i.e.,
+    ``tensorplay.*Tensor`` i.e.,
     ``output[channel] = (input[channel] - mean[channel]) / std[channel]``
 
     .. note::
@@ -290,9 +290,9 @@ class Normalize(torch.nn.Module):
         return f"{self.__class__.__name__}(mean={self.mean}, std={self.std})"
 
 
-class Resize(torch.nn.Module):
+class Resize(tensorplay.nn.Module):
     """Resize the input image to the given size.
-    If the image is torch Tensor, it is expected
+    If the image is tensorplay Tensor, it is expected
     to have [..., H, W] shape, where ... means a maximum of two leading dimensions
 
     Args:
@@ -305,7 +305,7 @@ class Resize(torch.nn.Module):
             .. note::
                 In torchscript mode size as single int is not supported, use a sequence of length 1: ``[size, ]``.
         interpolation (InterpolationMode): Desired interpolation enum defined by
-            :class:`torchvision.transforms.InterpolationMode`. Default is ``InterpolationMode.BILINEAR``.
+            :class:`tensorplay.vision.transforms.InterpolationMode`. Default is ``InterpolationMode.BILINEAR``.
             If input is Tensor, only ``InterpolationMode.NEAREST``, ``InterpolationMode.NEAREST_EXACT``,
             ``InterpolationMode.BILINEAR`` and ``InterpolationMode.BICUBIC`` are supported.
             The corresponding Pillow integer constants, e.g. ``PIL.Image.BILINEAR`` are accepted as well.
@@ -368,9 +368,9 @@ class Resize(torch.nn.Module):
         return f"{self.__class__.__name__}{detail}"
 
 
-class CenterCrop(torch.nn.Module):
+class CenterCrop(tensorplay.nn.Module):
     """Crops the given image at the center.
-    If the image is torch Tensor, it is expected
+    If the image is tensorplay Tensor, it is expected
     to have [..., H, W] shape, where ... means an arbitrary number of leading dimensions.
     If image size is smaller than output size along any edge, image is padded with 0 and then center cropped.
 
@@ -399,9 +399,9 @@ class CenterCrop(torch.nn.Module):
         return f"{self.__class__.__name__}(size={self.size})"
 
 
-class Pad(torch.nn.Module):
+class Pad(tensorplay.nn.Module):
     """Pad the given image on all sides with the given "pad" value.
-    If the image is torch Tensor, it is expected
+    If the image is tensorplay Tensor, it is expected
     to have [..., H, W] shape, where ... means at most 2 leading dimensions for mode reflect and symmetric,
     at most 3 leading dimensions for mode edge,
     and an arbitrary number of leading dimensions for mode constant
@@ -418,7 +418,7 @@ class Pad(torch.nn.Module):
         fill (number or tuple): Pixel fill value for constant fill. Default is 0. If a tuple of
             length 3, it is used to fill R, G, B channels respectively.
             This value is only used when the padding_mode is constant.
-            Only number is supported for torch Tensor.
+            Only number is supported for tensorplay Tensor.
             Only int or tuple value is supported for PIL Image.
         padding_mode (str): Type of padding. Should be: constant, edge, reflect or symmetric.
             Default is constant.
@@ -426,7 +426,7 @@ class Pad(torch.nn.Module):
             - constant: pads with a constant value, this value is specified with fill
 
             - edge: pads with the last value at the edge of the image.
-              If input a 5D torch Tensor, the last 3 dimensions will be padded instead of the last 2
+              If input a 5D tensorplay Tensor, the last 3 dimensions will be padded instead of the last 2
 
             - reflect: pads with reflection of image without repeating the last value on the edge.
               For example, padding [1, 2, 3, 4] with 2 elements on both sides in reflect mode
@@ -517,23 +517,23 @@ class RandomTransforms:
         return format_string
 
 
-class RandomApply(torch.nn.Module):
+class RandomApply(tensorplay.nn.Module):
     """Apply randomly a list of transformations with a given probability.
 
     .. note::
-        In order to script the transformation, please use ``torch.nn.ModuleList`` as input instead of list/tuple of
+        In order to script the transformation, please use ``tensorplay.nn.ModuleList`` as input instead of list/tuple of
         transforms as shown below:
 
-        >>> transforms = transforms.RandomApply(torch.nn.ModuleList([
+        >>> transforms = transforms.RandomApply(tensorplay.nn.ModuleList([
         >>>     transforms.ColorJitter(),
         >>> ]), p=0.3)
-        >>> scripted_transforms = torch.jit.script(transforms)
+        >>> scripted_transforms = tensorplay.jit.script(transforms)
 
-        Make sure to use only scriptable transformations, i.e. that work with ``torch.Tensor``, does not require
+        Make sure to use only scriptable transformations, i.e. that work with ``tensorplay.Tensor``, does not require
         `lambda` functions or ``PIL.Image``.
 
     Args:
-        transforms (sequence or torch.nn.Module): list of transformations
+        transforms (sequence or tensorplay.nn.Module): list of transformations
         p (float): probability
     """
 
@@ -544,7 +544,7 @@ class RandomApply(torch.nn.Module):
         self.p = p
 
     def forward(self, img):
-        if self.p < torch.rand(1):
+        if self.p < tensorplay.rand(1):
             return img
         for t in self.transforms:
             img = t(img)
@@ -588,9 +588,9 @@ class RandomChoice(RandomTransforms):
         return f"{super().__repr__()}(p={self.p})"
 
 
-class RandomCrop(torch.nn.Module):
+class RandomCrop(tensorplay.nn.Module):
     """Crop the given image at a random location.
-    If the image is torch Tensor, it is expected
+    If the image is tensorplay Tensor, it is expected
     to have [..., H, W] shape, where ... means an arbitrary number of leading dimensions,
     but if non-constant padding is used, the input is expected to have at most 2 leading dimensions
 
@@ -613,7 +613,7 @@ class RandomCrop(torch.nn.Module):
         fill (number or tuple): Pixel fill value for constant fill. Default is 0. If a tuple of
             length 3, it is used to fill R, G, B channels respectively.
             This value is only used when the padding_mode is constant.
-            Only number is supported for torch Tensor.
+            Only number is supported for tensorplay Tensor.
             Only int or tuple value is supported for PIL Image.
         padding_mode (str): Type of padding. Should be: constant, edge, reflect or symmetric.
             Default is constant.
@@ -621,7 +621,7 @@ class RandomCrop(torch.nn.Module):
             - constant: pads with a constant value, this value is specified with fill
 
             - edge: pads with the last value at the edge of the image.
-              If input a 5D torch Tensor, the last 3 dimensions will be padded instead of the last 2
+              If input a 5D tensorplay Tensor, the last 3 dimensions will be padded instead of the last 2
 
             - reflect: pads with reflection of image without repeating the last value on the edge.
               For example, padding [1, 2, 3, 4] with 2 elements on both sides in reflect mode
@@ -652,8 +652,8 @@ class RandomCrop(torch.nn.Module):
         if w == tw and h == th:
             return 0, 0, h, w
 
-        i = torch.randint(0, h - th + 1, size=(1,)).item()
-        j = torch.randint(0, w - tw + 1, size=(1,)).item()
+        i = tensorplay.randint(0, h - th + 1, size=(1,)).item()
+        j = tensorplay.randint(0, w - tw + 1, size=(1,)).item()
         return i, j, th, tw
 
     def __init__(self, size, padding=None, pad_if_needed=False, fill=0, padding_mode="constant"):
@@ -696,9 +696,9 @@ class RandomCrop(torch.nn.Module):
         return f"{self.__class__.__name__}(size={self.size}, padding={self.padding})"
 
 
-class RandomHorizontalFlip(torch.nn.Module):
+class RandomHorizontalFlip(tensorplay.nn.Module):
     """Horizontally flip the given image randomly with a given probability.
-    If the image is torch Tensor, it is expected
+    If the image is tensorplay Tensor, it is expected
     to have [..., H, W] shape, where ... means an arbitrary number of leading
     dimensions
 
@@ -719,7 +719,7 @@ class RandomHorizontalFlip(torch.nn.Module):
         Returns:
             PIL Image or Tensor: Randomly flipped image.
         """
-        if torch.rand(1) < self.p:
+        if tensorplay.rand(1) < self.p:
             return F.hflip(img)
         return img
 
@@ -727,9 +727,9 @@ class RandomHorizontalFlip(torch.nn.Module):
         return f"{self.__class__.__name__}(p={self.p})"
 
 
-class RandomVerticalFlip(torch.nn.Module):
+class RandomVerticalFlip(tensorplay.nn.Module):
     """Vertically flip the given image randomly with a given probability.
-    If the image is torch Tensor, it is expected
+    If the image is tensorplay Tensor, it is expected
     to have [..., H, W] shape, where ... means an arbitrary number of leading
     dimensions
 
@@ -750,7 +750,7 @@ class RandomVerticalFlip(torch.nn.Module):
         Returns:
             PIL Image or Tensor: Randomly flipped image.
         """
-        if torch.rand(1) < self.p:
+        if tensorplay.rand(1) < self.p:
             return F.vflip(img)
         return img
 
@@ -758,9 +758,9 @@ class RandomVerticalFlip(torch.nn.Module):
         return f"{self.__class__.__name__}(p={self.p})"
 
 
-class RandomPerspective(torch.nn.Module):
+class RandomPerspective(tensorplay.nn.Module):
     """Performs a random perspective transformation of the given image with a given probability.
-    If the image is torch Tensor, it is expected
+    If the image is tensorplay Tensor, it is expected
     to have [..., H, W] shape, where ... means an arbitrary number of leading dimensions.
 
     Args:
@@ -768,7 +768,7 @@ class RandomPerspective(torch.nn.Module):
             Default is 0.5.
         p (float): probability of the image being transformed. Default is 0.5.
         interpolation (InterpolationMode): Desired interpolation enum defined by
-            :class:`torchvision.transforms.InterpolationMode`. Default is ``InterpolationMode.BILINEAR``.
+            :class:`tensorplay.vision.transforms.InterpolationMode`. Default is ``InterpolationMode.BILINEAR``.
             If input is Tensor, only ``InterpolationMode.NEAREST``, ``InterpolationMode.BILINEAR`` are supported.
             The corresponding Pillow integer constants, e.g. ``PIL.Image.BILINEAR`` are accepted as well.
         fill (sequence or number): Pixel fill value for the area outside the transformed
@@ -810,7 +810,7 @@ class RandomPerspective(torch.nn.Module):
             else:
                 fill = [float(f) for f in fill]
 
-        if torch.rand(1) < self.p:
+        if tensorplay.rand(1) < self.p:
             startpoints, endpoints = self.get_params(width, height, self.distortion_scale)
             return F.perspective(img, startpoints, endpoints, self.interpolation, fill)
         return img
@@ -831,20 +831,20 @@ class RandomPerspective(torch.nn.Module):
         half_height = height // 2
         half_width = width // 2
         topleft = [
-            int(torch.randint(0, int(distortion_scale * half_width) + 1, size=(1,)).item()),
-            int(torch.randint(0, int(distortion_scale * half_height) + 1, size=(1,)).item()),
+            int(tensorplay.randint(0, int(distortion_scale * half_width) + 1, size=(1,)).item()),
+            int(tensorplay.randint(0, int(distortion_scale * half_height) + 1, size=(1,)).item()),
         ]
         topright = [
-            int(torch.randint(width - int(distortion_scale * half_width) - 1, width, size=(1,)).item()),
-            int(torch.randint(0, int(distortion_scale * half_height) + 1, size=(1,)).item()),
+            int(tensorplay.randint(width - int(distortion_scale * half_width) - 1, width, size=(1,)).item()),
+            int(tensorplay.randint(0, int(distortion_scale * half_height) + 1, size=(1,)).item()),
         ]
         botright = [
-            int(torch.randint(width - int(distortion_scale * half_width) - 1, width, size=(1,)).item()),
-            int(torch.randint(height - int(distortion_scale * half_height) - 1, height, size=(1,)).item()),
+            int(tensorplay.randint(width - int(distortion_scale * half_width) - 1, width, size=(1,)).item()),
+            int(tensorplay.randint(height - int(distortion_scale * half_height) - 1, height, size=(1,)).item()),
         ]
         botleft = [
-            int(torch.randint(0, int(distortion_scale * half_width) + 1, size=(1,)).item()),
-            int(torch.randint(height - int(distortion_scale * half_height) - 1, height, size=(1,)).item()),
+            int(tensorplay.randint(0, int(distortion_scale * half_width) + 1, size=(1,)).item()),
+            int(tensorplay.randint(height - int(distortion_scale * half_height) - 1, height, size=(1,)).item()),
         ]
         startpoints = [[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]]
         endpoints = [topleft, topright, botright, botleft]
@@ -854,10 +854,10 @@ class RandomPerspective(torch.nn.Module):
         return f"{self.__class__.__name__}(p={self.p})"
 
 
-class RandomResizedCrop(torch.nn.Module):
+class RandomResizedCrop(tensorplay.nn.Module):
     """Crop a random portion of image and resize it to a given size.
 
-    If the image is torch Tensor, it is expected
+    If the image is tensorplay Tensor, it is expected
     to have [..., H, W] shape, where ... means an arbitrary number of leading dimensions
 
     A crop of the original image is made: the crop has a random area (H * W)
@@ -876,7 +876,7 @@ class RandomResizedCrop(torch.nn.Module):
         ratio (tuple of float): lower and upper bounds for the random aspect ratio of the crop, before
             resizing.
         interpolation (InterpolationMode): Desired interpolation enum defined by
-            :class:`torchvision.transforms.InterpolationMode`. Default is ``InterpolationMode.BILINEAR``.
+            :class:`tensorplay.vision.transforms.InterpolationMode`. Default is ``InterpolationMode.BILINEAR``.
             If input is Tensor, only ``InterpolationMode.NEAREST``, ``InterpolationMode.NEAREST_EXACT``,
             ``InterpolationMode.BILINEAR`` and ``InterpolationMode.BICUBIC`` are supported.
             The corresponding Pillow integer constants, e.g. ``PIL.Image.BILINEAR`` are accepted as well.
@@ -943,17 +943,17 @@ class RandomResizedCrop(torch.nn.Module):
         _, height, width = F.get_dimensions(img)
         area = height * width
 
-        log_ratio = torch.log(torch.tensor(ratio))
+        log_ratio = tensorplay.log(tensorplay.tensor(ratio))
         for _ in range(10):
-            target_area = area * torch.empty(1).uniform_(scale[0], scale[1]).item()
-            aspect_ratio = torch.exp(torch.empty(1).uniform_(log_ratio[0], log_ratio[1])).item()
+            target_area = area * tensorplay.empty(1).uniform_(scale[0], scale[1]).item()
+            aspect_ratio = tensorplay.exp(tensorplay.empty(1).uniform_(log_ratio[0], log_ratio[1])).item()
 
             w = int(round(math.sqrt(target_area * aspect_ratio)))
             h = int(round(math.sqrt(target_area / aspect_ratio)))
 
             if 0 < w <= width and 0 < h <= height:
-                i = torch.randint(0, height - h + 1, size=(1,)).item()
-                j = torch.randint(0, width - w + 1, size=(1,)).item()
+                i = tensorplay.randint(0, height - h + 1, size=(1,)).item()
+                j = tensorplay.randint(0, width - w + 1, size=(1,)).item()
                 return i, j, h, w
 
         # Fallback to central crop
@@ -992,9 +992,9 @@ class RandomResizedCrop(torch.nn.Module):
         return format_string
 
 
-class FiveCrop(torch.nn.Module):
+class FiveCrop(tensorplay.nn.Module):
     """Crop the given image into four corners and the central crop.
-    If the image is torch Tensor, it is expected
+    If the image is tensorplay Tensor, it is expected
     to have [..., H, W] shape, where ... means an arbitrary number of leading
     dimensions
 
@@ -1011,7 +1011,7 @@ class FiveCrop(torch.nn.Module):
     Example:
          >>> transform = Compose([
          >>>    FiveCrop(size), # this is a list of PIL Images
-         >>>    Lambda(lambda crops: torch.stack([PILToTensor()(crop) for crop in crops])) # returns a 4D tensor
+         >>>    Lambda(lambda crops: tensorplay.stack([PILToTensor()(crop) for crop in crops])) # returns a 4D tensor
          >>> ])
          >>> #In your test loop you can do the following:
          >>> input, target = batch # input is a 5d tensor, target is 2d
@@ -1039,10 +1039,10 @@ class FiveCrop(torch.nn.Module):
         return f"{self.__class__.__name__}(size={self.size})"
 
 
-class TenCrop(torch.nn.Module):
+class TenCrop(tensorplay.nn.Module):
     """Crop the given image into four corners and the central crop plus the flipped version of
     these (horizontal flipping is used by default).
-    If the image is torch Tensor, it is expected
+    If the image is tensorplay Tensor, it is expected
     to have [..., H, W] shape, where ... means an arbitrary number of leading
     dimensions
 
@@ -1060,7 +1060,7 @@ class TenCrop(torch.nn.Module):
     Example:
          >>> transform = Compose([
          >>>    TenCrop(size), # this is a tuple of PIL Images
-         >>>    Lambda(lambda crops: torch.stack([PILToTensor()(crop) for crop in crops])) # returns a 4D tensor
+         >>>    Lambda(lambda crops: tensorplay.stack([PILToTensor()(crop) for crop in crops])) # returns a 4D tensor
          >>> ])
          >>> #In your test loop you can do the following:
          >>> input, target = batch # input is a 5d tensor, target is 2d
@@ -1089,18 +1089,18 @@ class TenCrop(torch.nn.Module):
         return f"{self.__class__.__name__}(size={self.size}, vertical_flip={self.vertical_flip})"
 
 
-class LinearTransformation(torch.nn.Module):
+class LinearTransformation(tensorplay.nn.Module):
     """Transform a tensor image with a square transformation matrix and a mean_vector computed
     offline.
     This transform does not support PIL Image.
-    Given transformation_matrix and mean_vector, will flatten the torch.*Tensor and
+    Given transformation_matrix and mean_vector, will flatten the tensorplay.*Tensor and
     subtract mean_vector from it which is then followed by computing the dot
     product with the transformation matrix and then reshaping the tensor to its
     original shape.
 
     Applications:
         whitening transformation: Suppose X is a column vector zero-centered data.
-        Then compute the data covariance matrix [D x D] with torch.mm(X.t(), X),
+        Then compute the data covariance matrix [D x D] with tensorplay.mm(X.t(), X),
         perform SVD on this matrix and pass it as transformation_matrix.
 
     Args:
@@ -1161,7 +1161,7 @@ class LinearTransformation(torch.nn.Module):
 
         flat_tensor = tensor.view(-1, n) - self.mean_vector
         transformation_matrix = self.transformation_matrix.to(flat_tensor.dtype)
-        transformed_tensor = torch.mm(flat_tensor, transformation_matrix)
+        transformed_tensor = tensorplay.mm(flat_tensor, transformation_matrix)
         tensor = transformed_tensor.view(shape)
         return tensor
 
@@ -1174,9 +1174,9 @@ class LinearTransformation(torch.nn.Module):
         return s
 
 
-class ColorJitter(torch.nn.Module):
+class ColorJitter(tensorplay.nn.Module):
     """Randomly change the brightness, contrast, saturation and hue of an image.
-    If the image is torch Tensor, it is expected
+    If the image is tensorplay Tensor, it is expected
     to have [..., 1 or 3, H, W] shape, where ... means an arbitrary number of leading dimensions.
     If img is PIL Image, mode "1", "I", "F" and modes with transparency (alpha channel) are not supported.
 
@@ -1212,7 +1212,7 @@ class ColorJitter(torch.nn.Module):
         self.saturation = self._check_input(saturation, "saturation")
         self.hue = self._check_input(hue, "hue", center=0, bound=(-0.5, 0.5), clip_first_on_zero=False)
 
-    @torch.jit.unused
+    @tensorplay.jit.unused
     def _check_input(self, value, name, center=1, bound=(0, float("inf")), clip_first_on_zero=True):
         if isinstance(value, numbers.Number):
             if value < 0:
@@ -1258,12 +1258,12 @@ class ColorJitter(torch.nn.Module):
             tuple: The parameters used to apply the randomized transform
             along with their random order.
         """
-        fn_idx = torch.randperm(4)
+        fn_idx = tensorplay.randperm(4)
 
-        b = None if brightness is None else float(torch.empty(1).uniform_(brightness[0], brightness[1]))
-        c = None if contrast is None else float(torch.empty(1).uniform_(contrast[0], contrast[1]))
-        s = None if saturation is None else float(torch.empty(1).uniform_(saturation[0], saturation[1]))
-        h = None if hue is None else float(torch.empty(1).uniform_(hue[0], hue[1]))
+        b = None if brightness is None else float(tensorplay.empty(1).uniform_(brightness[0], brightness[1]))
+        c = None if contrast is None else float(tensorplay.empty(1).uniform_(contrast[0], contrast[1]))
+        s = None if saturation is None else float(tensorplay.empty(1).uniform_(saturation[0], saturation[1]))
+        h = None if hue is None else float(tensorplay.empty(1).uniform_(hue[0], hue[1]))
 
         return fn_idx, b, c, s, h
 
@@ -1302,9 +1302,9 @@ class ColorJitter(torch.nn.Module):
         return s
 
 
-class RandomRotation(torch.nn.Module):
+class RandomRotation(tensorplay.nn.Module):
     """Rotate the image by angle.
-    If the image is torch Tensor, it is expected
+    If the image is tensorplay Tensor, it is expected
     to have [..., H, W] shape, where ... means an arbitrary number of leading dimensions.
 
     Args:
@@ -1312,7 +1312,7 @@ class RandomRotation(torch.nn.Module):
             If degrees is a number instead of sequence like (min, max), the range of degrees
             will be (-degrees, +degrees).
         interpolation (InterpolationMode): Desired interpolation enum defined by
-            :class:`torchvision.transforms.InterpolationMode`. Default is ``InterpolationMode.NEAREST``.
+            :class:`tensorplay.vision.transforms.InterpolationMode`. Default is ``InterpolationMode.NEAREST``.
             If input is Tensor, only ``InterpolationMode.NEAREST``, ``InterpolationMode.BILINEAR`` are supported.
             The corresponding Pillow integer constants, e.g. ``PIL.Image.BILINEAR`` are accepted as well.
         expand (bool, optional): Optional expansion flag.
@@ -1359,7 +1359,7 @@ class RandomRotation(torch.nn.Module):
         Returns:
             float: angle parameter to be passed to ``rotate`` for random rotation.
         """
-        angle = float(torch.empty(1).uniform_(float(degrees[0]), float(degrees[1])).item())
+        angle = float(tensorplay.empty(1).uniform_(float(degrees[0]), float(degrees[1])).item())
         return angle
 
     def forward(self, img):
@@ -1394,9 +1394,9 @@ class RandomRotation(torch.nn.Module):
         return format_string
 
 
-class RandomAffine(torch.nn.Module):
+class RandomAffine(tensorplay.nn.Module):
     """Random affine transformation of the image keeping center invariant.
-    If the image is torch Tensor, it is expected
+    If the image is tensorplay Tensor, it is expected
     to have [..., H, W] shape, where ... means an arbitrary number of leading dimensions.
 
     Args:
@@ -1416,7 +1416,7 @@ class RandomAffine(torch.nn.Module):
             an x-axis shear in (shear[0], shear[1]) and y-axis shear in (shear[2], shear[3]) will be applied.
             Will not apply shear by default.
         interpolation (InterpolationMode): Desired interpolation enum defined by
-            :class:`torchvision.transforms.InterpolationMode`. Default is ``InterpolationMode.NEAREST``.
+            :class:`tensorplay.vision.transforms.InterpolationMode`. Default is ``InterpolationMode.NEAREST``.
             If input is Tensor, only ``InterpolationMode.NEAREST``, ``InterpolationMode.BILINEAR`` are supported.
             The corresponding Pillow integer constants, e.g. ``PIL.Image.BILINEAR`` are accepted as well.
         fill (sequence or number): Pixel fill value for the area outside the transformed
@@ -1492,26 +1492,26 @@ class RandomAffine(torch.nn.Module):
         Returns:
             params to be passed to the affine transformation
         """
-        angle = float(torch.empty(1).uniform_(float(degrees[0]), float(degrees[1])).item())
+        angle = float(tensorplay.empty(1).uniform_(float(degrees[0]), float(degrees[1])).item())
         if translate is not None:
             max_dx = float(translate[0] * img_size[0])
             max_dy = float(translate[1] * img_size[1])
-            tx = int(round(torch.empty(1).uniform_(-max_dx, max_dx).item()))
-            ty = int(round(torch.empty(1).uniform_(-max_dy, max_dy).item()))
+            tx = int(round(tensorplay.empty(1).uniform_(-max_dx, max_dx).item()))
+            ty = int(round(tensorplay.empty(1).uniform_(-max_dy, max_dy).item()))
             translations = (tx, ty)
         else:
             translations = (0, 0)
 
         if scale_ranges is not None:
-            scale = float(torch.empty(1).uniform_(scale_ranges[0], scale_ranges[1]).item())
+            scale = float(tensorplay.empty(1).uniform_(scale_ranges[0], scale_ranges[1]).item())
         else:
             scale = 1.0
 
         shear_x = shear_y = 0.0
         if shears is not None:
-            shear_x = float(torch.empty(1).uniform_(shears[0], shears[1]).item())
+            shear_x = float(tensorplay.empty(1).uniform_(shears[0], shears[1]).item())
             if len(shears) == 4:
-                shear_y = float(torch.empty(1).uniform_(shears[2], shears[3]).item())
+                shear_y = float(tensorplay.empty(1).uniform_(shears[2], shears[3]).item())
 
         shear = (shear_x, shear_y)
 
@@ -1551,9 +1551,9 @@ class RandomAffine(torch.nn.Module):
         return s
 
 
-class Grayscale(torch.nn.Module):
+class Grayscale(tensorplay.nn.Module):
     """Convert image to grayscale.
-    If the image is torch Tensor, it is expected
+    If the image is tensorplay Tensor, it is expected
     to have [..., 3, H, W] shape, where ... means an arbitrary number of leading dimensions
 
     Args:
@@ -1586,9 +1586,9 @@ class Grayscale(torch.nn.Module):
         return f"{self.__class__.__name__}(num_output_channels={self.num_output_channels})"
 
 
-class RandomGrayscale(torch.nn.Module):
+class RandomGrayscale(tensorplay.nn.Module):
     """Randomly convert image to grayscale with a probability of p (default 0.1).
-    If the image is torch Tensor, it is expected
+    If the image is tensorplay Tensor, it is expected
     to have [..., 3, H, W] shape, where ... means an arbitrary number of leading dimensions
 
     Args:
@@ -1616,7 +1616,7 @@ class RandomGrayscale(torch.nn.Module):
             PIL Image or Tensor: Randomly grayscaled image.
         """
         num_output_channels, _, _ = F.get_dimensions(img)
-        if torch.rand(1) < self.p:
+        if tensorplay.rand(1) < self.p:
             return F.rgb_to_grayscale(img, num_output_channels=num_output_channels)
         return img
 
@@ -1624,8 +1624,8 @@ class RandomGrayscale(torch.nn.Module):
         return f"{self.__class__.__name__}(p={self.p})"
 
 
-class RandomErasing(torch.nn.Module):
-    """Randomly selects a rectangle region in a torch.Tensor image and erases its pixels.
+class RandomErasing(tensorplay.nn.Module):
+    """Randomly selects a rectangle region in a tensorplay.Tensor image and erases its pixels.
     This transform does not support PIL Image.
     'Random Erasing Data Augmentation' by Zhong et al. See https://arxiv.org/abs/1708.04896
 
@@ -1646,7 +1646,7 @@ class RandomErasing(torch.nn.Module):
         >>> transform = transforms.Compose([
         >>>   transforms.RandomHorizontalFlip(),
         >>>   transforms.PILToTensor(),
-        >>>   transforms.ConvertImageDtype(torch.float),
+        >>>   transforms.ConvertImageDtype(tensorplay.float),
         >>>   transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
         >>>   transforms.RandomErasing(),
         >>> ])
@@ -1696,10 +1696,10 @@ class RandomErasing(torch.nn.Module):
         img_c, img_h, img_w = img.shape[-3], img.shape[-2], img.shape[-1]
         area = img_h * img_w
 
-        log_ratio = torch.log(torch.tensor(ratio))
+        log_ratio = tensorplay.log(tensorplay.tensor(ratio))
         for _ in range(10):
-            erase_area = area * torch.empty(1).uniform_(scale[0], scale[1]).item()
-            aspect_ratio = torch.exp(torch.empty(1).uniform_(log_ratio[0], log_ratio[1])).item()
+            erase_area = area * tensorplay.empty(1).uniform_(scale[0], scale[1]).item()
+            aspect_ratio = tensorplay.exp(tensorplay.empty(1).uniform_(log_ratio[0], log_ratio[1])).item()
 
             h = int(round(math.sqrt(erase_area * aspect_ratio)))
             w = int(round(math.sqrt(erase_area / aspect_ratio)))
@@ -1707,12 +1707,12 @@ class RandomErasing(torch.nn.Module):
                 continue
 
             if value is None:
-                v = torch.empty([img_c, h, w], dtype=torch.float32).normal_()
+                v = tensorplay.empty([img_c, h, w], dtype=tensorplay.float32).normal_()
             else:
-                v = torch.tensor(value)[:, None, None]
+                v = tensorplay.tensor(value)[:, None, None]
 
-            i = torch.randint(0, img_h - h + 1, size=(1,)).item()
-            j = torch.randint(0, img_w - w + 1, size=(1,)).item()
+            i = tensorplay.randint(0, img_h - h + 1, size=(1,)).item()
+            j = tensorplay.randint(0, img_w - w + 1, size=(1,)).item()
             return i, j, h, w, v
 
         # Return original image
@@ -1726,7 +1726,7 @@ class RandomErasing(torch.nn.Module):
         Returns:
             img (Tensor): Erased Tensor image.
         """
-        if torch.rand(1) < self.p:
+        if tensorplay.rand(1) < self.p:
 
             # cast self.value to script acceptable type
             if isinstance(self.value, (int, float)):
@@ -1760,9 +1760,9 @@ class RandomErasing(torch.nn.Module):
         return s
 
 
-class GaussianBlur(torch.nn.Module):
+class GaussianBlur(tensorplay.nn.Module):
     """Blurs image with randomly chosen Gaussian blur.
-    If the image is torch Tensor, it is expected
+    If the image is tensorplay Tensor, it is expected
     to have [..., C, H, W] shape, where ... means at most one leading dimension.
 
     Args:
@@ -1808,7 +1808,7 @@ class GaussianBlur(torch.nn.Module):
         Returns:
             float: Standard deviation to be passed to calculate kernel for gaussian blurring.
         """
-        return torch.empty(1).uniform_(sigma_min, sigma_max).item()
+        return tensorplay.empty(1).uniform_(sigma_min, sigma_max).item()
 
     def forward(self, img: Tensor) -> Tensor:
         """
@@ -1858,7 +1858,7 @@ def _setup_angle(x, name, req_sizes=(2,)):
     return [float(d) for d in x]
 
 
-class RandomInvert(torch.nn.Module):
+class RandomInvert(tensorplay.nn.Module):
     """Inverts the colors of the given image randomly with a given probability.
     If img is a Tensor, it is expected to be in [..., 1 or 3, H, W] format,
     where ... means it can have an arbitrary number of leading dimensions.
@@ -1881,7 +1881,7 @@ class RandomInvert(torch.nn.Module):
         Returns:
             PIL Image or Tensor: Randomly color inverted image.
         """
-        if torch.rand(1).item() < self.p:
+        if tensorplay.rand(1).item() < self.p:
             return F.invert(img)
         return img
 
@@ -1889,9 +1889,9 @@ class RandomInvert(torch.nn.Module):
         return f"{self.__class__.__name__}(p={self.p})"
 
 
-class RandomPosterize(torch.nn.Module):
+class RandomPosterize(tensorplay.nn.Module):
     """Posterize the image randomly with a given probability by reducing the
-    number of bits for each color channel. If the image is torch Tensor, it should be of type torch.uint8,
+    number of bits for each color channel. If the image is tensorplay Tensor, it should be of type tensorplay.uint8,
     and it is expected to have [..., 1 or 3, H, W] shape, where ... means an arbitrary number of leading dimensions.
     If img is PIL Image, it is expected to be in mode "L" or "RGB".
 
@@ -1914,7 +1914,7 @@ class RandomPosterize(torch.nn.Module):
         Returns:
             PIL Image or Tensor: Randomly posterized image.
         """
-        if torch.rand(1).item() < self.p:
+        if tensorplay.rand(1).item() < self.p:
             return F.posterize(img, self.bits)
         return img
 
@@ -1922,7 +1922,7 @@ class RandomPosterize(torch.nn.Module):
         return f"{self.__class__.__name__}(bits={self.bits},p={self.p})"
 
 
-class RandomSolarize(torch.nn.Module):
+class RandomSolarize(tensorplay.nn.Module):
     """Solarize the image randomly with a given probability by inverting all pixel
     values above a threshold. If img is a Tensor, it is expected to be in [..., 1 or 3, H, W] format,
     where ... means it can have an arbitrary number of leading dimensions.
@@ -1947,7 +1947,7 @@ class RandomSolarize(torch.nn.Module):
         Returns:
             PIL Image or Tensor: Randomly solarized image.
         """
-        if torch.rand(1).item() < self.p:
+        if tensorplay.rand(1).item() < self.p:
             return F.solarize(img, self.threshold)
         return img
 
@@ -1955,8 +1955,8 @@ class RandomSolarize(torch.nn.Module):
         return f"{self.__class__.__name__}(threshold={self.threshold},p={self.p})"
 
 
-class RandomAdjustSharpness(torch.nn.Module):
-    """Adjust the sharpness of the image randomly with a given probability. If the image is torch Tensor,
+class RandomAdjustSharpness(tensorplay.nn.Module):
+    """Adjust the sharpness of the image randomly with a given probability. If the image is tensorplay Tensor,
     it is expected to have [..., 1 or 3, H, W] shape, where ... means an arbitrary number of leading dimensions.
 
     Args:
@@ -1980,7 +1980,7 @@ class RandomAdjustSharpness(torch.nn.Module):
         Returns:
             PIL Image or Tensor: Randomly sharpened image.
         """
-        if torch.rand(1).item() < self.p:
+        if tensorplay.rand(1).item() < self.p:
             return F.adjust_sharpness(img, self.sharpness_factor)
         return img
 
@@ -1988,9 +1988,9 @@ class RandomAdjustSharpness(torch.nn.Module):
         return f"{self.__class__.__name__}(sharpness_factor={self.sharpness_factor},p={self.p})"
 
 
-class RandomAutocontrast(torch.nn.Module):
+class RandomAutocontrast(tensorplay.nn.Module):
     """Autocontrast the pixels of the given image randomly with a given probability.
-    If the image is torch Tensor, it is expected
+    If the image is tensorplay Tensor, it is expected
     to have [..., 1 or 3, H, W] shape, where ... means an arbitrary number of leading dimensions.
     If img is PIL Image, it is expected to be in mode "L" or "RGB".
 
@@ -2011,7 +2011,7 @@ class RandomAutocontrast(torch.nn.Module):
         Returns:
             PIL Image or Tensor: Randomly autocontrasted image.
         """
-        if torch.rand(1).item() < self.p:
+        if tensorplay.rand(1).item() < self.p:
             return F.autocontrast(img)
         return img
 
@@ -2019,9 +2019,9 @@ class RandomAutocontrast(torch.nn.Module):
         return f"{self.__class__.__name__}(p={self.p})"
 
 
-class RandomEqualize(torch.nn.Module):
+class RandomEqualize(tensorplay.nn.Module):
     """Equalize the histogram of the given image randomly with a given probability.
-    If the image is torch Tensor, it is expected
+    If the image is tensorplay Tensor, it is expected
     to have [..., 1 or 3, H, W] shape, where ... means an arbitrary number of leading dimensions.
     If img is PIL Image, it is expected to be in mode "P", "L" or "RGB".
 
@@ -2042,7 +2042,7 @@ class RandomEqualize(torch.nn.Module):
         Returns:
             PIL Image or Tensor: Randomly equalized image.
         """
-        if torch.rand(1).item() < self.p:
+        if tensorplay.rand(1).item() < self.p:
             return F.equalize(img)
         return img
 
@@ -2050,7 +2050,7 @@ class RandomEqualize(torch.nn.Module):
         return f"{self.__class__.__name__}(p={self.p})"
 
 
-class ElasticTransform(torch.nn.Module):
+class ElasticTransform(tensorplay.nn.Module):
     """Transform a tensor image with elastic transformations.
     Given alpha and sigma, it will generate displacement
     vectors for all pixels based on random offsets. Alpha controls the strength
@@ -2066,7 +2066,7 @@ class ElasticTransform(torch.nn.Module):
         alpha (float or sequence of floats): Magnitude of displacements. Default is 50.0.
         sigma (float or sequence of floats): Smoothness of displacements. Default is 5.0.
         interpolation (InterpolationMode): Desired interpolation enum defined by
-            :class:`torchvision.transforms.InterpolationMode`. Default is ``InterpolationMode.BILINEAR``.
+            :class:`tensorplay.vision.transforms.InterpolationMode`. Default is ``InterpolationMode.BILINEAR``.
             If input is Tensor, only ``InterpolationMode.NEAREST``, ``InterpolationMode.BILINEAR`` are supported.
             The corresponding Pillow integer constants, e.g. ``PIL.Image.BILINEAR`` are accepted as well.
         fill (sequence or number): Pixel fill value for the area outside the transformed
@@ -2123,7 +2123,7 @@ class ElasticTransform(torch.nn.Module):
 
     @staticmethod
     def get_params(alpha: list[float], sigma: list[float], size: list[int]) -> Tensor:
-        dx = torch.rand([1, 1] + size) * 2 - 1
+        dx = tensorplay.rand([1, 1] + size) * 2 - 1
         if sigma[0] > 0.0:
             kx = int(8 * sigma[0] + 1)
             # if kernel size is even we have to make it odd
@@ -2133,7 +2133,7 @@ class ElasticTransform(torch.nn.Module):
         # normalize horizontal displacement by width (size[1])
         dx = dx * alpha[0] / size[1]
 
-        dy = torch.rand([1, 1] + size) * 2 - 1
+        dy = tensorplay.rand([1, 1] + size) * 2 - 1
         if sigma[1] > 0.0:
             ky = int(8 * sigma[1] + 1)
             # if kernel size is even we have to make it odd
@@ -2142,7 +2142,7 @@ class ElasticTransform(torch.nn.Module):
             dy = F.gaussian_blur(dy, [ky, ky], sigma)
         # normalize vertical displacement by height (size[0])
         dy = dy * alpha[1] / size[0]
-        return torch.concat([dx, dy], 1).permute([0, 2, 3, 1])  # 1 x H x W x 2
+        return tensorplay.concat([dx, dy], 1).permute([0, 2, 3, 1])  # 1 x H x W x 2
 
     def forward(self, tensor: Tensor) -> Tensor:
         """

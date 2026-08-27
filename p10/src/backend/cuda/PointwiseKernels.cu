@@ -7,6 +7,8 @@
 #include "Utils.h"
 #include "TypePromotion.h"
 #include "CUDABroadcast.cuh"
+#include "CUDAComplex.cuh"
+#include <thrust/complex.h>
 #include <cuda_runtime.h>
 #include <cmath>
 
@@ -241,10 +243,159 @@ Tensor unary_op_kernel_v2(const Tensor& self, Functor functor) {
     return result;
 }
 
-Tensor abs_kernel_cuda(const Tensor& self) { return unary_op_kernel_v2(self, AbsFunctor()); }
-Tensor neg_kernel_cuda(const Tensor& self) { return unary_op_kernel_v2(self, NegFunctor()); }
-Tensor square_kernel_cuda(const Tensor& self) { return unary_op_kernel_v2(self, SquareFunctor()); }
-Tensor sign_kernel_cuda(const Tensor& self) { return unary_op_kernel_v2(self, SignFunctor()); }
+Tensor abs_kernel_cuda(const Tensor& self) {
+    if (isComplexType(self.dtype())) {
+        if (self.dtype() != DType::ComplexFloat &&
+            self.dtype() != DType::ComplexDouble) {
+            TP_THROW(NotImplementedError,
+                     "CUDA abs: half complexes are not supported yet");
+        }
+        DType out_dt = toRealValueType(self.dtype());
+        Tensor result = Tensor::empty(
+            static_cast<std::vector<int64_t>>(self.shape()), out_dt,
+            self.device());
+        const int64_t n = self.numel();
+        auto stream = getCurrentCUDAStream().stream();
+        Tensor sc = self.contiguous();
+        if (self.dtype() == DType::ComplexFloat)
+            cuda::cplx::launch_abs<float>(n, sc.data_ptr(), result.data_ptr(), stream);
+        else
+            cuda::cplx::launch_abs<double>(n, sc.data_ptr(), result.data_ptr(), stream);
+        CUDA_CHECK(cudaGetLastError());
+        return result;
+    }
+    return unary_op_kernel_v2(self, AbsFunctor());
+}
+// neg/square complex paths are defined after complex_math_kernel_cuda and the
+// Cx* functors below (translation-unit ordering; see #undef CX_FUNCTOR).
+// ATen alignment: sgn(z) = z / |z| for complex, 0 stays 0. Operates on the
+// interleaved re/im storage directly.
+__global__ void sign_cplx_f32_kernel(int64_t n, const float* __restrict__ src, float* __restrict__ dst) {
+    const int64_t i = blockIdx.x * int64_t(blockDim.x) + threadIdx.x;
+    if (i >= n) return;
+    const float re = src[2 * i], im = src[2 * i + 1];
+    const float m = sqrtf(re * re + im * im);
+    if (m == 0.f) { dst[2 * i] = 0.f; dst[2 * i + 1] = 0.f; }
+    else { dst[2 * i] = re / m; dst[2 * i + 1] = im / m; }
+}
+
+__global__ void sign_cplx_f64_kernel(int64_t n, const double* __restrict__ src, double* __restrict__ dst) {
+    const int64_t i = blockIdx.x * int64_t(blockDim.x) + threadIdx.x;
+    if (i >= n) return;
+    const double re = src[2 * i], im = src[2 * i + 1];
+    const double m = sqrt(re * re + im * im);
+    if (m == 0.) { dst[2 * i] = 0.; dst[2 * i + 1] = 0.; }
+    else { dst[2 * i] = re / m; dst[2 * i + 1] = im / m; }
+}
+
+Tensor sign_kernel_cuda(const Tensor& self) {
+    if (isComplexType(self.dtype())) {
+        Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
+        const int64_t n = self.numel();
+        if (n > 0) {
+            dim3 block(256);
+            dim3 grid((n + 255) / 256);
+            Tensor self_contig = self.contiguous();
+            auto stream = getCurrentCUDAStream().stream();
+            if (self.dtype() == DType::ComplexDouble) {
+                sign_cplx_f64_kernel<<<grid, block, 0, stream>>>(
+                    n, static_cast<const double*>(self_contig.data_ptr()),
+                    static_cast<double*>(result.data_ptr()));
+            } else {
+                sign_cplx_f32_kernel<<<grid, block, 0, stream>>>(
+                    n, static_cast<const float*>(self_contig.data_ptr()),
+                    static_cast<float*>(result.data_ptr()));
+            }
+            CUDA_CHECK(cudaGetLastError());
+        }
+        return result;
+    }
+    return unary_op_kernel_v2(self, SignFunctor());
+}
+
+// --- complex elementwise math (thrust::complex on interleaved storage) -----
+// Reduced complexes (ComplexHalf/BComplex32) are rejected like torch CUDA.
+template <typename F>
+Tensor complex_math_kernel_cuda(const Tensor& self, F f) {
+    const DType dt = self.dtype();
+    TP_CHECK(isComplexType(dt),
+             "complex_math_kernel_cuda: expected a complex dtype");
+    if (dt != DType::ComplexFloat && dt != DType::ComplexDouble) {
+        TP_THROW(NotImplementedError,
+                 "CUDA complex math: half complexes are not supported yet");
+    }
+    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()),
+                                  dt, self.device());
+    const int64_t n = self.numel();
+    if (n == 0) return result;
+    Tensor self_contig = self.contiguous();
+    auto stream = getCurrentCUDAStream().stream();
+    if (dt == DType::ComplexFloat)
+        cuda::cplx::launch_unary<float>(n, self_contig.data_ptr(),
+                                        result.data_ptr(), f, stream);
+    else
+        cuda::cplx::launch_unary<double>(n, self_contig.data_ptr(),
+                                         result.data_ptr(), f, stream);
+    CUDA_CHECK(cudaGetLastError());
+    return result;
+}
+
+#define CX_FUNCTOR(NAME, EXPR)                                                \
+    struct NAME {                                                             \
+        template <typename T>                                                 \
+        __device__ thrust::complex<T> operator()(thrust::complex<T> z) const {\
+            return EXPR;                                                      \
+        }                                                                     \
+    };
+CX_FUNCTOR(CxExp, exp(z))
+CX_FUNCTOR(CxExpm1, exp(z) - static_cast<T>(1))
+CX_FUNCTOR(CxLog, log(z))
+CX_FUNCTOR(CxLog10, log10(z))
+CX_FUNCTOR(CxLog1p, log(z + static_cast<T>(1)))
+CX_FUNCTOR(CxLog2, log(z) / log(static_cast<T>(2)))
+CX_FUNCTOR(CxSqrt, sqrt(z))
+CX_FUNCTOR(CxRsqrt, static_cast<T>(1) / sqrt(z))
+CX_FUNCTOR(CxSin, sin(z))
+CX_FUNCTOR(CxCos, cos(z))
+CX_FUNCTOR(CxTan, tan(z))
+CX_FUNCTOR(CxAsin, asin(z))
+CX_FUNCTOR(CxAcos, acos(z))
+CX_FUNCTOR(CxAtan, atan(z))
+CX_FUNCTOR(CxSinh, sinh(z))
+CX_FUNCTOR(CxCosh, cosh(z))
+CX_FUNCTOR(CxTanh, tanh(z))
+CX_FUNCTOR(CxAsinh, asinh(z))
+CX_FUNCTOR(CxAcosh, acosh(z))
+CX_FUNCTOR(CxAtanh, atanh(z))
+CX_FUNCTOR(CxSigmoid,
+           static_cast<T>(1) / (static_cast<T>(1) + exp(-z)))
+CX_FUNCTOR(CxRecip, static_cast<T>(1) / z)
+CX_FUNCTOR(CxNeg, -z)
+CX_FUNCTOR(CxSquare, z * z)
+struct CxPowScalar {
+    double re, im;
+    template <typename T>
+    __device__ thrust::complex<T> operator()(thrust::complex<T> z) const {
+        return pow(z, thrust::complex<T>(static_cast<T>(re), static_cast<T>(im)));
+    }
+};
+struct CxPowScalarC {
+    double re, im;
+    template <typename T>
+    __device__ thrust::complex<T> operator()(thrust::complex<T> z) const {
+        return pow(z, thrust::complex<T>(static_cast<T>(re), static_cast<T>(im)));
+    }
+};
+#undef CX_FUNCTOR
+
+Tensor neg_kernel_cuda(const Tensor& self) {
+    if (isComplexType(self.dtype())) return complex_math_kernel_cuda(self, CxNeg{});
+    return unary_op_kernel_v2(self, NegFunctor());
+}
+Tensor square_kernel_cuda(const Tensor& self) {
+    if (isComplexType(self.dtype())) return complex_math_kernel_cuda(self, CxSquare{});
+    return unary_op_kernel_v2(self, SquareFunctor());
+}
 
 // Float ops need simpler dispatch since we cast to float/double
 template<typename Functor>
@@ -319,28 +470,86 @@ struct SiluFunctor {
     }
 };
 
-Tensor exp_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, ExpFunctor()); }
-Tensor expm1_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, Expm1Functor()); }
+Tensor exp_kernel_cuda(const Tensor& self) {
+    if (isComplexType(self.dtype())) return complex_math_kernel_cuda(self, CxExp{});
+    return unary_float_op_kernel_v2(self, ExpFunctor());
+}
+Tensor expm1_kernel_cuda(const Tensor& self) {
+    if (isComplexType(self.dtype())) return complex_math_kernel_cuda(self, CxExpm1{});
+    return unary_float_op_kernel_v2(self, Expm1Functor());
+}
 Tensor erf_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, ErfFunctor()); }
 Tensor erfc_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, ErfcFunctor()); }
-Tensor log_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, LogFunctor()); }
-Tensor log10_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, Log10Functor()); }
-Tensor log1p_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, Log1pFunctor()); }
-Tensor log2_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, Log2Functor()); }
+Tensor log_kernel_cuda(const Tensor& self) {
+    if (isComplexType(self.dtype())) return complex_math_kernel_cuda(self, CxLog{});
+    return unary_float_op_kernel_v2(self, LogFunctor());
+}
+Tensor log10_kernel_cuda(const Tensor& self) {
+    if (isComplexType(self.dtype())) return complex_math_kernel_cuda(self, CxLog10{});
+    return unary_float_op_kernel_v2(self, Log10Functor());
+}
+Tensor log1p_kernel_cuda(const Tensor& self) {
+    if (isComplexType(self.dtype())) return complex_math_kernel_cuda(self, CxLog1p{});
+    return unary_float_op_kernel_v2(self, Log1pFunctor());
+}
+Tensor log2_kernel_cuda(const Tensor& self) {
+    if (isComplexType(self.dtype())) return complex_math_kernel_cuda(self, CxLog2{});
+    return unary_float_op_kernel_v2(self, Log2Functor());
+}
 Tensor lgamma_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, LgammaFunctor()); }
-Tensor sqrt_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, SqrtFunctor()); }
-Tensor rsqrt_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, RsqrtFunctor()); }
-Tensor sin_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, SinFunctor()); }
-Tensor cos_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, CosFunctor()); }
-Tensor tanh_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, TanhFunctor()); }
-Tensor sigmoid_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, SigmoidFunctor()); }
+Tensor sqrt_kernel_cuda(const Tensor& self) {
+    if (isComplexType(self.dtype())) return complex_math_kernel_cuda(self, CxSqrt{});
+    return unary_float_op_kernel_v2(self, SqrtFunctor());
+}
+Tensor rsqrt_kernel_cuda(const Tensor& self) {
+    if (isComplexType(self.dtype())) return complex_math_kernel_cuda(self, CxRsqrt{});
+    return unary_float_op_kernel_v2(self, RsqrtFunctor());
+}
+Tensor sin_kernel_cuda(const Tensor& self) {
+    if (isComplexType(self.dtype())) return complex_math_kernel_cuda(self, CxSin{});
+    return unary_float_op_kernel_v2(self, SinFunctor());
+}
+Tensor cos_kernel_cuda(const Tensor& self) {
+    if (isComplexType(self.dtype())) return complex_math_kernel_cuda(self, CxCos{});
+    return unary_float_op_kernel_v2(self, CosFunctor());
+}
+Tensor tanh_kernel_cuda(const Tensor& self) {
+    if (isComplexType(self.dtype())) return complex_math_kernel_cuda(self, CxTanh{});
+    return unary_float_op_kernel_v2(self, TanhFunctor());
+}
+Tensor sigmoid_kernel_cuda(const Tensor& self) {
+    if (isComplexType(self.dtype())) return complex_math_kernel_cuda(self, CxSigmoid{});
+    return unary_float_op_kernel_v2(self, SigmoidFunctor());
+}
 // angle (torch angle_kernel for real input): 0 if x >= 0 else pi.
 struct AngleFunctor {
     template<typename T> __device__ T operator()(T x) const {
         return x >= T(0) ? T(0) : static_cast<T>(3.14159265358979323846);
     }
 };
-Tensor angle_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, AngleFunctor()); }
+Tensor angle_kernel_cuda(const Tensor& self) {
+    if (isComplexType(self.dtype())) {
+        if (self.dtype() != DType::ComplexFloat &&
+            self.dtype() != DType::ComplexDouble) {
+            TP_THROW(NotImplementedError,
+                     "CUDA angle: half complexes are not supported yet");
+        }
+        DType out_dt = toRealValueType(self.dtype());
+        Tensor result = Tensor::empty(
+            static_cast<std::vector<int64_t>>(self.shape()), out_dt,
+            self.device());
+        const int64_t n = self.numel();
+        auto stream = getCurrentCUDAStream().stream();
+        Tensor sc = self.contiguous();
+        if (self.dtype() == DType::ComplexFloat)
+            cuda::cplx::launch_angle<float>(n, sc.data_ptr(), result.data_ptr(), stream);
+        else
+            cuda::cplx::launch_angle<double>(n, sc.data_ptr(), result.data_ptr(), stream);
+        CUDA_CHECK(cudaGetLastError());
+        return result;
+    }
+    return unary_float_op_kernel_v2(self, AngleFunctor());
+}
 Tensor relu_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, ReluFunctor()); }
 Tensor gelu_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, GeluFunctor()); }
 Tensor silu_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, SiluFunctor()); }
@@ -684,18 +893,45 @@ struct FracFunctor {
     }
 };
 
-Tensor acos_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, AcosFunctor()); }
-Tensor acosh_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, AcoshFunctor()); }
-Tensor asin_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, AsinFunctor()); }
-Tensor asinh_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, AsinhFunctor()); }
-Tensor atan_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, AtanFunctor()); }
-Tensor atanh_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, AtanhFunctor()); }
+Tensor acos_kernel_cuda(const Tensor& self) {
+    if (isComplexType(self.dtype())) return complex_math_kernel_cuda(self, CxAcos{});
+    return unary_float_op_kernel_v2(self, AcosFunctor());
+}
+Tensor acosh_kernel_cuda(const Tensor& self) {
+    if (isComplexType(self.dtype())) return complex_math_kernel_cuda(self, CxAcosh{});
+    return unary_float_op_kernel_v2(self, AcoshFunctor());
+}
+Tensor asin_kernel_cuda(const Tensor& self) {
+    if (isComplexType(self.dtype())) return complex_math_kernel_cuda(self, CxAsin{});
+    return unary_float_op_kernel_v2(self, AsinFunctor());
+}
+Tensor asinh_kernel_cuda(const Tensor& self) {
+    if (isComplexType(self.dtype())) return complex_math_kernel_cuda(self, CxAsinh{});
+    return unary_float_op_kernel_v2(self, AsinhFunctor());
+}
+Tensor atan_kernel_cuda(const Tensor& self) {
+    if (isComplexType(self.dtype())) return complex_math_kernel_cuda(self, CxAtan{});
+    return unary_float_op_kernel_v2(self, AtanFunctor());
+}
+Tensor atanh_kernel_cuda(const Tensor& self) {
+    if (isComplexType(self.dtype())) return complex_math_kernel_cuda(self, CxAtanh{});
+    return unary_float_op_kernel_v2(self, AtanhFunctor());
+}
 Tensor ceil_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, CeilFunctor()); }
-Tensor cosh_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, CoshFunctor()); }
+Tensor cosh_kernel_cuda(const Tensor& self) {
+    if (isComplexType(self.dtype())) return complex_math_kernel_cuda(self, CxCosh{});
+    return unary_float_op_kernel_v2(self, CoshFunctor());
+}
 Tensor floor_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, FloorFunctor()); }
 Tensor round_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, RoundFunctor()); }
-Tensor sinh_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, SinhFunctor()); }
-Tensor tan_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, TanFunctor()); }
+Tensor sinh_kernel_cuda(const Tensor& self) {
+    if (isComplexType(self.dtype())) return complex_math_kernel_cuda(self, CxSinh{});
+    return unary_float_op_kernel_v2(self, SinhFunctor());
+}
+Tensor tan_kernel_cuda(const Tensor& self) {
+    if (isComplexType(self.dtype())) return complex_math_kernel_cuda(self, CxTan{});
+    return unary_float_op_kernel_v2(self, TanFunctor());
+}
 Tensor trunc_kernel_cuda(const Tensor& self) { return unary_op_kernel_v2(self, TruncFunctor()); }
 Tensor frac_kernel_cuda(const Tensor& self) {
     if (isIntegralType(self.dtype())) {
@@ -828,15 +1064,91 @@ struct LeFunctor { template<typename T> __device__ bool operator()(T a, T b) con
 struct GtFunctor { template<typename T> __device__ bool operator()(T a, T b) const { return a > b; } };
 struct GeFunctor { template<typename T> __device__ bool operator()(T a, T b) const { return a >= b; } };
 
-Tensor eq_kernel_cuda(const Tensor& self, const Tensor& other) { return comparison_op_kernel(self, other, EqFunctor()); }
-Tensor ne_kernel_cuda(const Tensor& self, const Tensor& other) { return comparison_op_kernel(self, other, NeFunctor()); }
+// torch parity: eq/ne are component-wise over complex; ordering comparisons
+// stay rejected by comparison_op_kernel's real-only dispatch.
+template <typename CxOp>
+Tensor complex_comparison_kernel(const Tensor& self, const Tensor& other,
+                                 CxOp op) {
+    DType rd = promoteTypes(self.dtype(), other.dtype());
+    if (rd != DType::ComplexFloat && rd != DType::ComplexDouble)
+        TP_THROW(NotImplementedError,
+                 "CUDA complex comparison: half complexes not supported");
+    std::vector<int64_t> out_shape = broadcast_shapes(
+        static_cast<std::vector<int64_t>>(self.shape()),
+        static_cast<std::vector<int64_t>>(other.shape()));
+    Tensor result = Tensor::empty(out_shape, DType::Bool, self.device());
+    Tensor a = self.to(rd);
+    Tensor b = other.to(rd);
+    const int64_t n = result.numel();
+    auto stream = getCurrentCUDAStream().stream();
+    bool same = a.is_contiguous() && b.is_contiguous() &&
+                a.dim() == static_cast<int64_t>(out_shape.size()) &&
+                b.dim() == static_cast<int64_t>(out_shape.size());
+    if (same)
+        for (int64_t d = 0; d < static_cast<int64_t>(out_shape.size()); ++d)
+            if (a.size(d) != out_shape[d] || b.size(d) != out_shape[d]) { same = false; break; }
+    if (rd == DType::ComplexFloat) {
+        if (same)
+            cuda::cplx::launch_binary<float>(n, a.data_ptr(), b.data_ptr(),
+                                             result.data_ptr(), op, stream);
+        else
+            cuda::cplx::launch_binary_broadcast<float>(
+                n, a.data_ptr(), make_desc(a, out_shape.size()), b.data_ptr(),
+                make_desc(b, out_shape.size()), result.data_ptr(),
+                make_desc(result, out_shape.size()), op, stream);
+    } else {
+        if (same)
+            cuda::cplx::launch_binary<double>(n, a.data_ptr(), b.data_ptr(),
+                                              result.data_ptr(), op, stream);
+        else
+            cuda::cplx::launch_binary_broadcast<double>(
+                n, a.data_ptr(), make_desc(a, out_shape.size()), b.data_ptr(),
+                make_desc(b, out_shape.size()), result.data_ptr(),
+                make_desc(result, out_shape.size()), op, stream);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return result;
+}
+
+Tensor eq_kernel_cuda(const Tensor& self, const Tensor& other) {
+    if (isComplexType(promoteTypes(self.dtype(), other.dtype())))
+        return complex_comparison_kernel(self, other, cuda::cplx::EqOp{});
+    return comparison_op_kernel(self, other, EqFunctor());
+}
+Tensor ne_kernel_cuda(const Tensor& self, const Tensor& other) {
+    if (isComplexType(promoteTypes(self.dtype(), other.dtype())))
+        return complex_comparison_kernel(self, other, cuda::cplx::NeOp{});
+    return comparison_op_kernel(self, other, NeFunctor());
+}
 Tensor lt_kernel_cuda(const Tensor& self, const Tensor& other) { return comparison_op_kernel(self, other, LtFunctor()); }
 Tensor le_kernel_cuda(const Tensor& self, const Tensor& other) { return comparison_op_kernel(self, other, LeFunctor()); }
 Tensor gt_kernel_cuda(const Tensor& self, const Tensor& other) { return comparison_op_kernel(self, other, GtFunctor()); }
 Tensor ge_kernel_cuda(const Tensor& self, const Tensor& other) { return comparison_op_kernel(self, other, GeFunctor()); }
 
-Tensor eq_scalar_kernel_cuda(const Tensor& self, Scalar other) { return comparison_scalar_op_kernel(self, other, EqFunctor()); }
-Tensor ne_scalar_kernel_cuda(const Tensor& self, Scalar other) { return comparison_scalar_op_kernel(self, other, NeFunctor()); }
+Tensor eq_scalar_kernel_cuda(const Tensor& self, Scalar other) {
+    if (other.isComplex()) {
+        DType rd = isComplexType(self.dtype())
+            ? self.dtype()
+            : (isFloatingType(self.dtype())
+                   ? promoteTypes(toComplexType(self.dtype()), other.dtype())
+                   : promoteTypes(DType::ComplexFloat, other.dtype()));
+        Tensor o = Tensor::full({}, other, rd, self.device());
+        return eq_kernel_cuda(self.to(rd), o);
+    }
+    return comparison_scalar_op_kernel(self, other, EqFunctor());
+}
+Tensor ne_scalar_kernel_cuda(const Tensor& self, Scalar other) {
+    if (other.isComplex()) {
+        DType rd = isComplexType(self.dtype())
+            ? self.dtype()
+            : (isFloatingType(self.dtype())
+                   ? promoteTypes(toComplexType(self.dtype()), other.dtype())
+                   : promoteTypes(DType::ComplexFloat, other.dtype()));
+        Tensor o = Tensor::full({}, other, rd, self.device());
+        return ne_kernel_cuda(self.to(rd), o);
+    }
+    return comparison_scalar_op_kernel(self, other, NeFunctor());
+}
 Tensor lt_scalar_kernel_cuda(const Tensor& self, Scalar other) { return comparison_scalar_op_kernel(self, other, LtFunctor()); }
 Tensor le_scalar_kernel_cuda(const Tensor& self, Scalar other) { return comparison_scalar_op_kernel(self, other, LeFunctor()); }
 Tensor gt_scalar_kernel_cuda(const Tensor& self, Scalar other) { return comparison_scalar_op_kernel(self, other, GtFunctor()); }
@@ -1100,11 +1412,81 @@ struct PowScalarFunctor {
 };
 struct Atan2Functor { template<typename T> __device__ T operator()(T a, T b) const { return atan2(a, b); } };
 
-Tensor pow_kernel_cuda(const Tensor& self, const Tensor& other) { return binary_float_op_kernel_v2(self, other, PowFunctor()); }
+Tensor pow_kernel_cuda(const Tensor& self, const Tensor& other) {
+    if (isComplexType(promoteTypes(self.dtype(), other.dtype()))) {
+        DType rd = promoteTypes(self.dtype(), other.dtype());
+        if (rd != DType::ComplexFloat && rd != DType::ComplexDouble)
+            TP_THROW(NotImplementedError,
+                     "CUDA pow: half complexes are not supported yet");
+        std::vector<int64_t> out_shape = broadcast_shapes(
+            static_cast<std::vector<int64_t>>(self.shape()),
+            static_cast<std::vector<int64_t>>(other.shape()));
+        Tensor result = Tensor::empty(out_shape, rd, self.device());
+        Tensor a = self.to(rd);
+        Tensor b = other.to(rd);
+        const int64_t n = result.numel();
+        auto stream = getCurrentCUDAStream().stream();
+        bool same = a.is_contiguous() && b.is_contiguous() &&
+                    a.dim() == static_cast<int64_t>(out_shape.size()) &&
+                    b.dim() == static_cast<int64_t>(out_shape.size());
+        if (same)
+            for (int64_t d = 0; d < static_cast<int64_t>(out_shape.size()); ++d)
+                if (a.size(d) != out_shape[d] || b.size(d) != out_shape[d]) { same = false; break; }
+        if (rd == DType::ComplexFloat) {
+            if (same)
+                cuda::cplx::launch_binary<float>(n, a.data_ptr(), b.data_ptr(),
+                                                 result.data_ptr(),
+                                                 cuda::cplx::PowOp{}, stream);
+            else
+                cuda::cplx::launch_binary_broadcast<float>(
+                    n, a.data_ptr(), make_desc(a, out_shape.size()),
+                    b.data_ptr(), make_desc(b, out_shape.size()),
+                    result.data_ptr(), make_desc(result, out_shape.size()),
+                    cuda::cplx::PowOp{}, stream);
+        } else {
+            if (same)
+                cuda::cplx::launch_binary<double>(n, a.data_ptr(), b.data_ptr(),
+                                                  result.data_ptr(),
+                                                  cuda::cplx::PowOp{}, stream);
+            else
+                cuda::cplx::launch_binary_broadcast<double>(
+                    n, a.data_ptr(), make_desc(a, out_shape.size()),
+                    b.data_ptr(), make_desc(b, out_shape.size()),
+                    result.data_ptr(), make_desc(result, out_shape.size()),
+                    cuda::cplx::PowOp{}, stream);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return result;
+    }
+    return binary_float_op_kernel_v2(self, other, PowFunctor());
+}
 Tensor pow_scalar_kernel_cuda(const Tensor& self, Scalar exponent) {
     // ATen alignment: integer base with negative integer exponent is rejected
-    if (isIntegralType(self.dtype()) && !exponent.isFloatingPoint() && exponent.to<int64_t>() < 0) {
+    if (!isComplexType(self.dtype()) && !exponent.isComplex() &&
+        isIntegralType(self.dtype()) && !exponent.isFloatingPoint() &&
+        exponent.to<int64_t>() < 0) {
         TP_THROW(RuntimeError, "Integers to negative integer powers are not allowed.");
+    }
+    if (isComplexType(self.dtype()) || exponent.isComplex()) {
+        DType rd = isComplexType(self.dtype())
+            ? self.dtype()
+            : (isFloatingType(self.dtype()) ? toComplexType(self.dtype())
+                                            : DType::ComplexFloat);
+        Tensor base = self.to(rd);
+        if (exponent.isFloatingPoint() && !exponent.isComplex()) {
+            double ev = exponent.toDouble();
+            if (ev == 0.5) return sqrt_kernel_cuda(base);
+            if (ev == -0.5) return rsqrt_kernel_cuda(base);
+            if (ev == 2.0) return square_kernel_cuda(base);
+            return complex_math_kernel_cuda(base, CxPowScalar{ev});
+        }
+        if (rd == DType::ComplexDouble)
+            return complex_math_kernel_cuda(
+                base, CxPowScalarC{exponent.to<std::complex<double>>().real(),
+                                   exponent.to<std::complex<double>>().imag()});
+        return complex_math_kernel_cuda(
+            base, CxPowScalarC{static_cast<float>(exponent.to<std::complex<double>>().real()),
+                               static_cast<float>(exponent.to<std::complex<double>>().imag())});
     }
     return unary_float_op_kernel_v2(self, PowScalarFunctor(exponent.toDouble()));
 }
@@ -1134,6 +1516,42 @@ __global__ void lerp_tensor_kernel_cuda_impl(int64_t n, const T* start, const T*
     }
 }
 
+// ATen's lerp promotes Half/BFloat16 inputs to float for the complete
+// numerically-stable calculation and casts only once on store.  Keep that
+// contract for TensorPlay's reduced floating types as well; doing the
+// recurrence through separate mul/add TensorIterator launches rounds twice
+// and is observable in optimizer moment buffers.
+template <typename T>
+__global__ void lerp_scalar_reduced_kernel_cuda_impl(
+        int64_t n, const T* start, const T* end, T* output, float weight) {
+    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    for (; i < n; i += stride) {
+        const float s = static_cast<float>(start[i]);
+        const float e = static_cast<float>(end[i]);
+        const float value = (fabsf(weight) < 0.5f)
+            ? s + weight * (e - s)
+            : e - (e - s) * (1.0f - weight);
+        output[i] = static_cast<T>(value);
+    }
+}
+
+template <typename T>
+__global__ void lerp_tensor_reduced_kernel_cuda_impl(
+        int64_t n, const T* start, const T* end, const T* weight, T* output) {
+    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    for (; i < n; i += stride) {
+        const float s = static_cast<float>(start[i]);
+        const float e = static_cast<float>(end[i]);
+        const float w = static_cast<float>(weight[i]);
+        const float value = (fabsf(w) < 0.5f)
+            ? s + w * (e - s)
+            : e - (e - s) * (1.0f - w);
+        output[i] = static_cast<T>(value);
+    }
+}
+
 Tensor lerp_scalar_kernel_cuda(const Tensor& self, const Tensor& end, Scalar weight) {
     if (self.shape() != end.shape()) TP_THROW(RuntimeError, "CUDA lerp: broadcasting not supported");
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
@@ -1152,7 +1570,17 @@ Tensor lerp_scalar_kernel_cuda(const Tensor& self, const Tensor& end, Scalar wei
     switch (self.dtype()) {
         LERP_CASE(float, Float32)
         LERP_CASE(double, Float64)
-        default: TP_THROW(NotImplementedError, "CUDA lerp: only float32/float64 supported");
+        case DType::Float16:
+            lerp_scalar_reduced_kernel_cuda_impl<Half><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
+                n, self_c.data_ptr<Half>(), end_c.data_ptr<Half>(),
+                result.data_ptr<Half>(), weight.to<float>());
+            break;
+        case DType::BFloat16:
+            lerp_scalar_reduced_kernel_cuda_impl<BFloat16><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
+                n, self_c.data_ptr<BFloat16>(), end_c.data_ptr<BFloat16>(),
+                result.data_ptr<BFloat16>(), weight.to<float>());
+            break;
+        default: TP_THROW(NotImplementedError, "CUDA lerp: unsupported dtype");
     }
     #undef LERP_CASE
     return result;
@@ -1177,7 +1605,17 @@ Tensor lerp_tensor_kernel_cuda(const Tensor& self, const Tensor& end, const Tens
     switch (self.dtype()) {
         LERPT_CASE(float, Float32)
         LERPT_CASE(double, Float64)
-        default: TP_THROW(NotImplementedError, "CUDA lerp: only float32/float64 supported");
+        case DType::Float16:
+            lerp_tensor_reduced_kernel_cuda_impl<Half><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
+                n, self_c.data_ptr<Half>(), end_c.data_ptr<Half>(),
+                weight_c.data_ptr<Half>(), result.data_ptr<Half>());
+            break;
+        case DType::BFloat16:
+            lerp_tensor_reduced_kernel_cuda_impl<BFloat16><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
+                n, self_c.data_ptr<BFloat16>(), end_c.data_ptr<BFloat16>(),
+                weight_c.data_ptr<BFloat16>(), result.data_ptr<BFloat16>());
+            break;
+        default: TP_THROW(NotImplementedError, "CUDA lerp: unsupported dtype");
     }
     #undef LERPT_CASE
     return result;

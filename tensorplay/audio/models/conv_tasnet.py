@@ -5,10 +5,10 @@ Based on https://github.com/naplab/Conv-TasNet/tree/e66d82a8f956a69749ec8a4ae382
 
 from typing import Optional, Tuple
 
-import tensorplay as torch
+import tensorplay as tensorplay
 
 
-class ConvBlock(torch.nn.Module):
+class ConvBlock(tensorplay.nn.Module):
     """1D Convolutional block.
 
     Args:
@@ -34,11 +34,11 @@ class ConvBlock(torch.nn.Module):
     ):
         super().__init__()
 
-        self.conv_layers = torch.nn.Sequential(
-            torch.nn.Conv1d(in_channels=io_channels, out_channels=hidden_channels, kernel_size=1),
-            torch.nn.PReLU(),
-            torch.nn.GroupNorm(num_groups=1, num_channels=hidden_channels, eps=1e-08),
-            torch.nn.Conv1d(
+        self.conv_layers = tensorplay.nn.Sequential(
+            tensorplay.nn.Conv1d(in_channels=io_channels, out_channels=hidden_channels, kernel_size=1),
+            tensorplay.nn.PReLU(),
+            tensorplay.nn.GroupNorm(num_groups=1, num_channels=hidden_channels, eps=1e-08),
+            tensorplay.nn.Conv1d(
                 in_channels=hidden_channels,
                 out_channels=hidden_channels,
                 kernel_size=kernel_size,
@@ -46,18 +46,18 @@ class ConvBlock(torch.nn.Module):
                 dilation=dilation,
                 groups=hidden_channels,
             ),
-            torch.nn.PReLU(),
-            torch.nn.GroupNorm(num_groups=1, num_channels=hidden_channels, eps=1e-08),
+            tensorplay.nn.PReLU(),
+            tensorplay.nn.GroupNorm(num_groups=1, num_channels=hidden_channels, eps=1e-08),
         )
 
         self.res_out = (
             None
             if no_residual
-            else torch.nn.Conv1d(in_channels=hidden_channels, out_channels=io_channels, kernel_size=1)
+            else tensorplay.nn.Conv1d(in_channels=hidden_channels, out_channels=io_channels, kernel_size=1)
         )
-        self.skip_out = torch.nn.Conv1d(in_channels=hidden_channels, out_channels=io_channels, kernel_size=1)
+        self.skip_out = tensorplay.nn.Conv1d(in_channels=hidden_channels, out_channels=io_channels, kernel_size=1)
 
-    def forward(self, input: torch.Tensor) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
+    def forward(self, input: tensorplay.Tensor) -> Tuple[Optional[tensorplay.Tensor], tensorplay.Tensor]:
         feature = self.conv_layers(input)
         if self.res_out is None:
             residual = None
@@ -67,7 +67,7 @@ class ConvBlock(torch.nn.Module):
         return residual, skip_out
 
 
-class MaskGenerator(torch.nn.Module):
+class MaskGenerator(tensorplay.nn.Module):
     """TCN (Temporal Convolution Network) Separation Module
 
     Generates masks for separation.
@@ -102,11 +102,11 @@ class MaskGenerator(torch.nn.Module):
         self.input_dim = input_dim
         self.num_sources = num_sources
 
-        self.input_norm = torch.nn.GroupNorm(num_groups=1, num_channels=input_dim, eps=1e-8)
-        self.input_conv = torch.nn.Conv1d(in_channels=input_dim, out_channels=num_feats, kernel_size=1)
+        self.input_norm = tensorplay.nn.GroupNorm(num_groups=1, num_channels=input_dim, eps=1e-8)
+        self.input_conv = tensorplay.nn.Conv1d(in_channels=input_dim, out_channels=num_feats, kernel_size=1)
 
         self.receptive_field = 0
-        self.conv_layers = torch.nn.ModuleList([])
+        self.conv_layers = tensorplay.nn.ModuleList([])
         for s in range(num_stacks):
             for l in range(num_layers):
                 multi = 2**l
@@ -122,24 +122,24 @@ class MaskGenerator(torch.nn.Module):
                     )
                 )
                 self.receptive_field += kernel_size if s == 0 and l == 0 else (kernel_size - 1) * multi
-        self.output_prelu = torch.nn.PReLU()
-        self.output_conv = torch.nn.Conv1d(
+        self.output_prelu = tensorplay.nn.PReLU()
+        self.output_conv = tensorplay.nn.Conv1d(
             in_channels=num_feats,
             out_channels=input_dim * num_sources,
             kernel_size=1,
         )
         if msk_activate == "sigmoid":
-            self.mask_activate = torch.nn.Sigmoid()
+            self.mask_activate = tensorplay.nn.Sigmoid()
         elif msk_activate == "relu":
-            self.mask_activate = torch.nn.ReLU()
+            self.mask_activate = tensorplay.nn.ReLU()
         else:
             raise ValueError(f"Unsupported activation {msk_activate}")
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
+    def forward(self, input: tensorplay.Tensor) -> tensorplay.Tensor:
         """Generate separation mask.
 
         Args:
-            input (torch.Tensor): 3D Tensor with shape [batch, features, frames]
+            input (tensorplay.Tensor): 3D Tensor with shape [batch, features, frames]
 
         Returns:
             Tensor: shape [batch, num_sources, features, frames]
@@ -159,7 +159,7 @@ class MaskGenerator(torch.nn.Module):
         return output.view(batch_size, self.num_sources, self.input_dim, -1)
 
 
-class ConvTasNet(torch.nn.Module):
+class ConvTasNet(tensorplay.nn.Module):
     """Conv-TasNet architecture introduced in
     *Conv-TasNet: Surpassing Ideal Time–Frequency Magnitude Masking for Speech Separation*
     :cite:`Luo_2019`.
@@ -168,7 +168,7 @@ class ConvTasNet(torch.nn.Module):
         This implementation corresponds to the "non-causal" setting in the paper.
 
     See Also:
-        * :class:`torchaudio.pipelines.SourceSeparationBundle`: Source separation pipeline with pre-trained models.
+        * :class:`tensorplay.audio.pipelines.SourceSeparationBundle`: Source separation pipeline with pre-trained models.
 
     Args:
         num_sources (int, optional): The number of sources to split.
@@ -203,7 +203,7 @@ class ConvTasNet(torch.nn.Module):
         self.enc_kernel_size = enc_kernel_size
         self.enc_stride = enc_kernel_size // 2
 
-        self.encoder = torch.nn.Conv1d(
+        self.encoder = tensorplay.nn.Conv1d(
             in_channels=1,
             out_channels=enc_num_feats,
             kernel_size=enc_kernel_size,
@@ -221,7 +221,7 @@ class ConvTasNet(torch.nn.Module):
             num_stacks=msk_num_stacks,
             msk_activate=msk_activate,
         )
-        self.decoder = torch.nn.ConvTranspose1d(
+        self.decoder = tensorplay.nn.ConvTranspose1d(
             in_channels=enc_num_feats,
             out_channels=1,
             kernel_size=enc_kernel_size,
@@ -230,7 +230,7 @@ class ConvTasNet(torch.nn.Module):
             bias=False,
         )
 
-    def _align_num_frames_with_strides(self, input: torch.Tensor) -> Tuple[torch.Tensor, int]:
+    def _align_num_frames_with_strides(self, input: tensorplay.Tensor) -> Tuple[tensorplay.Tensor, int]:
         """Pad input Tensor so that the end of the input tensor corresponds with
 
         1. (if kernel size is odd) the center of the last convolution kernel
@@ -250,7 +250,7 @@ class ConvTasNet(torch.nn.Module):
          stride                         PAD  stride
 
         Args:
-            input (torch.Tensor): 3D Tensor with shape (batch_size, channels==1, frames)
+            input (tensorplay.Tensor): 3D Tensor with shape (batch_size, channels==1, frames)
 
         Returns:
             Tensor: Padded Tensor
@@ -264,20 +264,20 @@ class ConvTasNet(torch.nn.Module):
             return input, 0
 
         num_paddings = self.enc_stride - num_remainings
-        pad = torch.zeros(
+        pad = tensorplay.zeros(
             batch_size,
             num_channels,
             num_paddings,
             dtype=input.dtype,
             device=input.device,
         )
-        return torch.cat([input, pad], 2), num_paddings
+        return tensorplay.cat([input, pad], 2), num_paddings
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
+    def forward(self, input: tensorplay.Tensor) -> tensorplay.Tensor:
         """Perform source separation. Generate audio source waveforms.
 
         Args:
-            input (torch.Tensor): 3D Tensor with shape [batch, channel==1, frames]
+            input (tensorplay.Tensor): 3D Tensor with shape [batch, channel==1, frames]
 
         Returns:
             Tensor: 3D Tensor with shape [batch, channel==num_sources, frames]
@@ -305,7 +305,7 @@ class ConvTasNet(torch.nn.Module):
 
 
 def conv_tasnet_base(num_sources: int = 2) -> ConvTasNet:
-    r"""Builds non-causal version of :class:`~torchaudio.models.ConvTasNet`.
+    r"""Builds non-causal version of :class:`~tensorplay.audio.models.ConvTasNet`.
 
     The parameter settings follow the ones with the highest Si-SNR metirc score in the paper,
     except the mask activation function is changed from "sigmoid" to "relu" for performance improvement.

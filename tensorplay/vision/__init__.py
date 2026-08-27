@@ -1,6 +1,6 @@
-"""tensorplay.vision — torchvision-compatible vision components.
+"""tensorplay.vision — tensorplay.vision-compatible vision components.
 
-Structure mirrors torchvision: ``datasets``, ``transforms``, ``models``,
+Structure mirrors tensorplay.vision: ``datasets``, ``transforms``, ``models``,
 ``ops`` and ``io`` subpackages plus the ``make_grid``/``save_image`` helpers
 from ``utils``.  The legacy module-level helpers ``from_file`` and
 ``from_image`` are kept for backwards compatibility.

@@ -2,9 +2,9 @@ import os
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
-import tensorplay as torch
-from torch.utils.data import Dataset
-from torchaudio.datasets.utils import _load_waveform
+import tensorplay as tensorplay
+from tensorplay.utils.data import Dataset
+from tensorplay.audio.datasets.utils import _load_waveform
 
 
 _SAMPLE_RATE = 16000
@@ -127,7 +127,7 @@ class Snips(Dataset):
         transcript, iob, intent = self.labels[file_name]
         return relpath, _SAMPLE_RATE, file_name, transcript, iob, intent
 
-    def __getitem__(self, n: int) -> Tuple[torch.Tensor, int, str, str, str]:
+    def __getitem__(self, n: int) -> Tuple[tensorplay.Tensor, int, str, str, str]:
         """Load the n-th sample from the dataset.
 
         Args:

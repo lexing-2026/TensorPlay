@@ -1,14 +1,14 @@
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple
 
-import tensorplay as torch
+import tensorplay as tensorplay
 from tensorplay.audio.models import Emformer
 
 
 __all__ = ["RNNT", "emformer_rnnt_base", "emformer_rnnt_model"]
 
 
-class _TimeReduction(torch.nn.Module):
+class _TimeReduction(tensorplay.nn.Module):
     r"""Coalesces frames along time dimension into a
     fewer number of frames with higher feature dimensionality.
 
@@ -20,7 +20,7 @@ class _TimeReduction(torch.nn.Module):
         super().__init__()
         self.stride = stride
 
-    def forward(self, input: torch.Tensor, lengths: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, input: tensorplay.Tensor, lengths: tensorplay.Tensor) -> Tuple[tensorplay.Tensor, tensorplay.Tensor]:
         r"""Forward pass.
 
         B: batch size;
@@ -28,16 +28,16 @@ class _TimeReduction(torch.nn.Module):
         D: feature dimension of each input sequence frame.
 
         Args:
-            input (torch.Tensor): input sequences, with shape `(B, T, D)`.
-            lengths (torch.Tensor): with shape `(B,)` and i-th element representing
+            input (tensorplay.Tensor): input sequences, with shape `(B, T, D)`.
+            lengths (tensorplay.Tensor): with shape `(B,)` and i-th element representing
                 number of valid frames for i-th batch element in ``input``.
 
         Returns:
-            (torch.Tensor, torch.Tensor):
-                torch.Tensor
+            (tensorplay.Tensor, tensorplay.Tensor):
+                tensorplay.Tensor
                     output sequences, with shape
                     `(B, T  // stride, D * stride)`
-                torch.Tensor
+                tensorplay.Tensor
                     output lengths, with shape `(B,)` and i-th element representing
                     number of valid frames for i-th batch element in output sequences.
         """
@@ -52,7 +52,7 @@ class _TimeReduction(torch.nn.Module):
         return output, lengths
 
 
-class _CustomLSTM(torch.nn.Module):
+class _CustomLSTM(tensorplay.nn.Module):
     r"""Custom long-short-term memory (LSTM) block that applies layer normalization
     to internal nodes.
 
@@ -72,20 +72,20 @@ class _CustomLSTM(torch.nn.Module):
         layer_norm_epsilon: float = 1e-5,
     ) -> None:
         super().__init__()
-        self.x2g = torch.nn.Linear(input_dim, 4 * hidden_dim, bias=(not layer_norm))
-        self.p2g = torch.nn.Linear(hidden_dim, 4 * hidden_dim, bias=False)
+        self.x2g = tensorplay.nn.Linear(input_dim, 4 * hidden_dim, bias=(not layer_norm))
+        self.p2g = tensorplay.nn.Linear(hidden_dim, 4 * hidden_dim, bias=False)
         if layer_norm:
-            self.c_norm = torch.nn.LayerNorm(hidden_dim, eps=layer_norm_epsilon)
-            self.g_norm = torch.nn.LayerNorm(4 * hidden_dim, eps=layer_norm_epsilon)
+            self.c_norm = tensorplay.nn.LayerNorm(hidden_dim, eps=layer_norm_epsilon)
+            self.g_norm = tensorplay.nn.LayerNorm(4 * hidden_dim, eps=layer_norm_epsilon)
         else:
-            self.c_norm = torch.nn.Identity()
-            self.g_norm = torch.nn.Identity()
+            self.c_norm = tensorplay.nn.Identity()
+            self.g_norm = tensorplay.nn.Identity()
 
         self.hidden_dim = hidden_dim
 
     def forward(
-        self, input: torch.Tensor, state: Optional[List[torch.Tensor]]
-    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        self, input: tensorplay.Tensor, state: Optional[List[tensorplay.Tensor]]
+    ) -> Tuple[tensorplay.Tensor, List[tensorplay.Tensor]]:
         r"""Forward pass.
 
         B: batch size;
@@ -93,23 +93,23 @@ class _CustomLSTM(torch.nn.Module):
         D: feature dimension of each input sequence element.
 
         Args:
-            input (torch.Tensor): with shape `(T, B, D)`.
-            state (List[torch.Tensor] or None): list of tensors
+            input (tensorplay.Tensor): with shape `(T, B, D)`.
+            state (List[tensorplay.Tensor] or None): list of tensors
                 representing internal state generated in preceding invocation
                 of ``forward``.
 
         Returns:
-            (torch.Tensor, List[torch.Tensor]):
-                torch.Tensor
+            (tensorplay.Tensor, List[tensorplay.Tensor]):
+                tensorplay.Tensor
                     output, with shape `(T, B, hidden_dim)`.
-                List[torch.Tensor]
+                List[tensorplay.Tensor]
                     list of tensors representing internal state generated
                     in current invocation of ``forward``.
         """
         if state is None:
             B = input.size(1)
-            h = torch.zeros(B, self.hidden_dim, device=input.device, dtype=input.dtype)
-            c = torch.zeros(B, self.hidden_dim, device=input.device, dtype=input.dtype)
+            h = tensorplay.zeros(B, self.hidden_dim, device=input.device, dtype=input.dtype)
+            c = tensorplay.zeros(B, self.hidden_dim, device=input.device, dtype=input.dtype)
         else:
             h, c = state
 
@@ -128,7 +128,7 @@ class _CustomLSTM(torch.nn.Module):
             h = output_gate * c.tanh()
             outputs.append(h)
 
-        output = torch.stack(outputs, dim=0)
+        output = tensorplay.stack(outputs, dim=0)
         state = [h, c]
 
         return output, state
@@ -136,20 +136,20 @@ class _CustomLSTM(torch.nn.Module):
 
 class _Transcriber(ABC):
     @abstractmethod
-    def forward(self, input: torch.Tensor, lengths: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, input: tensorplay.Tensor, lengths: tensorplay.Tensor) -> Tuple[tensorplay.Tensor, tensorplay.Tensor]:
         pass
 
     @abstractmethod
     def infer(
         self,
-        input: torch.Tensor,
-        lengths: torch.Tensor,
-        states: Optional[List[List[torch.Tensor]]],
-    ) -> Tuple[torch.Tensor, torch.Tensor, List[List[torch.Tensor]]]:
+        input: tensorplay.Tensor,
+        lengths: tensorplay.Tensor,
+        states: Optional[List[List[tensorplay.Tensor]]],
+    ) -> Tuple[tensorplay.Tensor, tensorplay.Tensor, List[List[tensorplay.Tensor]]]:
         pass
 
 
-class _EmformerEncoder(torch.nn.Module, _Transcriber):
+class _EmformerEncoder(tensorplay.nn.Module, _Transcriber):
     r"""Emformer-based recurrent neural network transducer (RNN-T) encoder (transcription network).
 
     Args:
@@ -193,7 +193,7 @@ class _EmformerEncoder(torch.nn.Module, _Transcriber):
         transformer_tanh_on_mem: bool = False,
     ) -> None:
         super().__init__()
-        self.input_linear = torch.nn.Linear(
+        self.input_linear = tensorplay.nn.Linear(
             input_dim,
             time_reduction_input_dim,
             bias=False,
@@ -214,10 +214,10 @@ class _EmformerEncoder(torch.nn.Module, _Transcriber):
             weight_init_scale_strategy=transformer_weight_init_scale_strategy,
             tanh_on_mem=transformer_tanh_on_mem,
         )
-        self.output_linear = torch.nn.Linear(transformer_input_dim, output_dim)
-        self.layer_norm = torch.nn.LayerNorm(output_dim)
+        self.output_linear = tensorplay.nn.Linear(transformer_input_dim, output_dim)
+        self.layer_norm = tensorplay.nn.LayerNorm(output_dim)
 
-    def forward(self, input: torch.Tensor, lengths: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, input: tensorplay.Tensor, lengths: tensorplay.Tensor) -> Tuple[tensorplay.Tensor, tensorplay.Tensor]:
         r"""Forward pass for training.
 
         B: batch size;
@@ -225,17 +225,17 @@ class _EmformerEncoder(torch.nn.Module, _Transcriber):
         D: feature dimension of each input sequence frame (input_dim).
 
         Args:
-            input (torch.Tensor): input frame sequences right-padded with right context, with
+            input (tensorplay.Tensor): input frame sequences right-padded with right context, with
                 shape `(B, T + right context length, D)`.
-            lengths (torch.Tensor): with shape `(B,)` and i-th element representing
+            lengths (tensorplay.Tensor): with shape `(B,)` and i-th element representing
                 number of valid frames for i-th batch element in ``input``.
 
         Returns:
-            (torch.Tensor, torch.Tensor):
-                torch.Tensor
+            (tensorplay.Tensor, tensorplay.Tensor):
+                tensorplay.Tensor
                     output frame sequences, with
                     shape `(B, T // time_reduction_stride, output_dim)`.
-                torch.Tensor
+                tensorplay.Tensor
                     output input lengths, with shape `(B,)` and i-th element representing
                     number of valid elements for i-th batch element in output frame sequences.
         """
@@ -246,13 +246,13 @@ class _EmformerEncoder(torch.nn.Module, _Transcriber):
         layer_norm_out = self.layer_norm(output_linear_out)
         return layer_norm_out, transformer_lengths
 
-    @torch.jit.export
+    @tensorplay.jit.export
     def infer(
         self,
-        input: torch.Tensor,
-        lengths: torch.Tensor,
-        states: Optional[List[List[torch.Tensor]]],
-    ) -> Tuple[torch.Tensor, torch.Tensor, List[List[torch.Tensor]]]:
+        input: tensorplay.Tensor,
+        lengths: tensorplay.Tensor,
+        states: Optional[List[List[tensorplay.Tensor]]],
+    ) -> Tuple[tensorplay.Tensor, tensorplay.Tensor, List[List[tensorplay.Tensor]]]:
         r"""Forward pass for inference.
 
         B: batch size;
@@ -260,23 +260,23 @@ class _EmformerEncoder(torch.nn.Module, _Transcriber):
         D: feature dimension of each input sequence frame (input_dim).
 
         Args:
-            input (torch.Tensor): input frame sequence segments right-padded with right context, with
+            input (tensorplay.Tensor): input frame sequence segments right-padded with right context, with
                 shape `(B, T + right context length, D)`.
-            lengths (torch.Tensor): with shape `(B,)` and i-th element representing
+            lengths (tensorplay.Tensor): with shape `(B,)` and i-th element representing
                 number of valid frames for i-th batch element in ``input``.
-            state (List[List[torch.Tensor]] or None): list of lists of tensors
+            state (List[List[tensorplay.Tensor]] or None): list of lists of tensors
                 representing internal state generated in preceding invocation
                 of ``infer``.
 
         Returns:
-            (torch.Tensor, torch.Tensor, List[List[torch.Tensor]]):
-                torch.Tensor
+            (tensorplay.Tensor, tensorplay.Tensor, List[List[tensorplay.Tensor]]):
+                tensorplay.Tensor
                     output frame sequences, with
                     shape `(B, T // time_reduction_stride, output_dim)`.
-                torch.Tensor
+                tensorplay.Tensor
                     output input lengths, with shape `(B,)` and i-th element representing
                     number of valid elements for i-th batch element in output.
-                List[List[torch.Tensor]]
+                List[List[tensorplay.Tensor]]
                     output states; list of lists of tensors
                     representing internal state generated in current invocation
                     of ``infer``.
@@ -293,7 +293,7 @@ class _EmformerEncoder(torch.nn.Module, _Transcriber):
         return layer_norm_out, transformer_lengths, transformer_states
 
 
-class _Predictor(torch.nn.Module):
+class _Predictor(tensorplay.nn.Module):
     r"""Recurrent neural network transducer (RNN-T) prediction network.
 
     Args:
@@ -322,9 +322,9 @@ class _Predictor(torch.nn.Module):
         lstm_dropout: float = 0.0,
     ) -> None:
         super().__init__()
-        self.embedding = torch.nn.Embedding(num_symbols, symbol_embedding_dim)
-        self.input_layer_norm = torch.nn.LayerNorm(symbol_embedding_dim)
-        self.lstm_layers = torch.nn.ModuleList(
+        self.embedding = tensorplay.nn.Embedding(num_symbols, symbol_embedding_dim)
+        self.input_layer_norm = tensorplay.nn.LayerNorm(symbol_embedding_dim)
+        self.lstm_layers = tensorplay.nn.ModuleList(
             [
                 _CustomLSTM(
                     symbol_embedding_dim if idx == 0 else lstm_hidden_dim,
@@ -335,18 +335,18 @@ class _Predictor(torch.nn.Module):
                 for idx in range(num_lstm_layers)
             ]
         )
-        self.dropout = torch.nn.Dropout(p=lstm_dropout)
-        self.linear = torch.nn.Linear(lstm_hidden_dim, output_dim)
-        self.output_layer_norm = torch.nn.LayerNorm(output_dim)
+        self.dropout = tensorplay.nn.Dropout(p=lstm_dropout)
+        self.linear = tensorplay.nn.Linear(lstm_hidden_dim, output_dim)
+        self.output_layer_norm = tensorplay.nn.LayerNorm(output_dim)
 
         self.lstm_dropout = lstm_dropout
 
     def forward(
         self,
-        input: torch.Tensor,
-        lengths: torch.Tensor,
-        state: Optional[List[List[torch.Tensor]]] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, List[List[torch.Tensor]]]:
+        input: tensorplay.Tensor,
+        lengths: tensorplay.Tensor,
+        state: Optional[List[List[tensorplay.Tensor]]] = None,
+    ) -> Tuple[tensorplay.Tensor, tensorplay.Tensor, List[List[tensorplay.Tensor]]]:
         r"""Forward pass.
 
         B: batch size;
@@ -354,22 +354,22 @@ class _Predictor(torch.nn.Module):
         D: feature dimension of each input sequence element.
 
         Args:
-            input (torch.Tensor): target sequences, with shape `(B, U)` and each element
+            input (tensorplay.Tensor): target sequences, with shape `(B, U)` and each element
                 mapping to a target symbol, i.e. in range `[0, num_symbols)`.
-            lengths (torch.Tensor): with shape `(B,)` and i-th element representing
+            lengths (tensorplay.Tensor): with shape `(B,)` and i-th element representing
                 number of valid frames for i-th batch element in ``input``.
-            state (List[List[torch.Tensor]] or None, optional): list of lists of tensors
+            state (List[List[tensorplay.Tensor]] or None, optional): list of lists of tensors
                 representing internal state generated in preceding invocation
                 of ``forward``. (Default: ``None``)
 
         Returns:
-            (torch.Tensor, torch.Tensor, List[List[torch.Tensor]]):
-                torch.Tensor
+            (tensorplay.Tensor, tensorplay.Tensor, List[List[tensorplay.Tensor]]):
+                tensorplay.Tensor
                     output encoding sequences, with shape `(B, U, output_dim)`
-                torch.Tensor
+                tensorplay.Tensor
                     output lengths, with shape `(B,)` and i-th element representing
                     number of valid elements for i-th batch element in output encoding sequences.
-                List[List[torch.Tensor]]
+                List[List[tensorplay.Tensor]]
                     output states; list of lists of tensors
                     representing internal state generated in current invocation of ``forward``.
         """
@@ -378,7 +378,7 @@ class _Predictor(torch.nn.Module):
         input_layer_norm_out = self.input_layer_norm(embedding_out)
 
         lstm_out = input_layer_norm_out
-        state_out: List[List[torch.Tensor]] = []
+        state_out: List[List[tensorplay.Tensor]] = []
         for layer_idx, lstm in enumerate(self.lstm_layers):
             lstm_out, lstm_state_out = lstm(lstm_out, None if state is None else state[layer_idx])
             lstm_out = self.dropout(lstm_out)
@@ -389,7 +389,7 @@ class _Predictor(torch.nn.Module):
         return output_layer_norm_out.permute(1, 0, 2), lengths, state_out
 
 
-class _Joiner(torch.nn.Module):
+class _Joiner(tensorplay.nn.Module):
     r"""Recurrent neural network transducer (RNN-T) joint network.
 
     Args:
@@ -402,21 +402,21 @@ class _Joiner(torch.nn.Module):
 
     def __init__(self, input_dim: int, output_dim: int, activation: str = "relu") -> None:
         super().__init__()
-        self.linear = torch.nn.Linear(input_dim, output_dim, bias=True)
+        self.linear = tensorplay.nn.Linear(input_dim, output_dim, bias=True)
         if activation == "relu":
-            self.activation = torch.nn.ReLU()
+            self.activation = tensorplay.nn.ReLU()
         elif activation == "tanh":
-            self.activation = torch.nn.Tanh()
+            self.activation = tensorplay.nn.Tanh()
         else:
             raise ValueError(f"Unsupported activation {activation}")
 
     def forward(
         self,
-        source_encodings: torch.Tensor,
-        source_lengths: torch.Tensor,
-        target_encodings: torch.Tensor,
-        target_lengths: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        source_encodings: tensorplay.Tensor,
+        source_lengths: tensorplay.Tensor,
+        target_encodings: tensorplay.Tensor,
+        target_lengths: tensorplay.Tensor,
+    ) -> Tuple[tensorplay.Tensor, tensorplay.Tensor, tensorplay.Tensor]:
         r"""Forward pass for training.
 
         B: batch size;
@@ -425,22 +425,22 @@ class _Joiner(torch.nn.Module):
         D: dimension of each source and target sequence encoding.
 
         Args:
-            source_encodings (torch.Tensor): source encoding sequences, with
+            source_encodings (tensorplay.Tensor): source encoding sequences, with
                 shape `(B, T, D)`.
-            source_lengths (torch.Tensor): with shape `(B,)` and i-th element representing
+            source_lengths (tensorplay.Tensor): with shape `(B,)` and i-th element representing
                 valid sequence length of i-th batch element in ``source_encodings``.
-            target_encodings (torch.Tensor): target encoding sequences, with shape `(B, U, D)`.
-            target_lengths (torch.Tensor): with shape `(B,)` and i-th element representing
+            target_encodings (tensorplay.Tensor): target encoding sequences, with shape `(B, U, D)`.
+            target_lengths (tensorplay.Tensor): with shape `(B,)` and i-th element representing
                 valid sequence length of i-th batch element in ``target_encodings``.
 
         Returns:
-            (torch.Tensor, torch.Tensor, torch.Tensor):
-                torch.Tensor
+            (tensorplay.Tensor, tensorplay.Tensor, tensorplay.Tensor):
+                tensorplay.Tensor
                     joint network output, with shape `(B, T, U, output_dim)`.
-                torch.Tensor
+                tensorplay.Tensor
                     output source lengths, with shape `(B,)` and i-th element representing
                     number of valid elements along dim 1 for i-th batch element in joint network output.
-                torch.Tensor
+                tensorplay.Tensor
                     output target lengths, with shape `(B,)` and i-th element representing
                     number of valid elements along dim 2 for i-th batch element in joint network output.
         """
@@ -450,8 +450,8 @@ class _Joiner(torch.nn.Module):
         return output, source_lengths, target_lengths
 
 
-class RNNT(torch.nn.Module):
-    r"""torchaudio.models.RNNT()
+class RNNT(tensorplay.nn.Module):
+    r"""tensorplay.audio.models.RNNT()
 
     Recurrent neural network transducer (RNN-T) model.
 
@@ -459,12 +459,12 @@ class RNNT(torch.nn.Module):
         To build the model, please use one of the factory functions.
 
     See Also:
-        :class:`torchaudio.pipelines.RNNTBundle`: ASR pipeline with pre-trained models.
+        :class:`tensorplay.audio.pipelines.RNNTBundle`: ASR pipeline with pre-trained models.
 
     Args:
-        transcriber (torch.nn.Module): transcription network.
-        predictor (torch.nn.Module): prediction network.
-        joiner (torch.nn.Module): joint network.
+        transcriber (tensorplay.nn.Module): transcription network.
+        predictor (tensorplay.nn.Module): prediction network.
+        joiner (tensorplay.nn.Module): joint network.
     """
 
     def __init__(self, transcriber: _Transcriber, predictor: _Predictor, joiner: _Joiner) -> None:
@@ -475,12 +475,12 @@ class RNNT(torch.nn.Module):
 
     def forward(
         self,
-        sources: torch.Tensor,
-        source_lengths: torch.Tensor,
-        targets: torch.Tensor,
-        target_lengths: torch.Tensor,
-        predictor_state: Optional[List[List[torch.Tensor]]] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[List[torch.Tensor]]]:
+        sources: tensorplay.Tensor,
+        source_lengths: tensorplay.Tensor,
+        targets: tensorplay.Tensor,
+        target_lengths: tensorplay.Tensor,
+        predictor_state: Optional[List[List[tensorplay.Tensor]]] = None,
+    ) -> Tuple[tensorplay.Tensor, tensorplay.Tensor, tensorplay.Tensor, List[List[tensorplay.Tensor]]]:
         r"""Forward pass for training.
 
         B: batch size;
@@ -489,30 +489,30 @@ class RNNT(torch.nn.Module):
         D: feature dimension of each source sequence element.
 
         Args:
-            sources (torch.Tensor): source frame sequences right-padded with right context, with
+            sources (tensorplay.Tensor): source frame sequences right-padded with right context, with
                 shape `(B, T, D)`.
-            source_lengths (torch.Tensor): with shape `(B,)` and i-th element representing
+            source_lengths (tensorplay.Tensor): with shape `(B,)` and i-th element representing
                 number of valid frames for i-th batch element in ``sources``.
-            targets (torch.Tensor): target sequences, with shape `(B, U)` and each element
+            targets (tensorplay.Tensor): target sequences, with shape `(B, U)` and each element
                 mapping to a target symbol.
-            target_lengths (torch.Tensor): with shape `(B,)` and i-th element representing
+            target_lengths (tensorplay.Tensor): with shape `(B,)` and i-th element representing
                 number of valid frames for i-th batch element in ``targets``.
-            predictor_state (List[List[torch.Tensor]] or None, optional): list of lists of tensors
+            predictor_state (List[List[tensorplay.Tensor]] or None, optional): list of lists of tensors
                 representing prediction network internal state generated in preceding invocation
                 of ``forward``. (Default: ``None``)
 
         Returns:
-            (torch.Tensor, torch.Tensor, torch.Tensor, List[List[torch.Tensor]]):
-                torch.Tensor
+            (tensorplay.Tensor, tensorplay.Tensor, tensorplay.Tensor, List[List[tensorplay.Tensor]]):
+                tensorplay.Tensor
                     joint network output, with shape
                     `(B, max output source length, max output target length, output_dim (number of target symbols))`.
-                torch.Tensor
+                tensorplay.Tensor
                     output source lengths, with shape `(B,)` and i-th element representing
                     number of valid elements along dim 1 for i-th batch element in joint network output.
-                torch.Tensor
+                tensorplay.Tensor
                     output target lengths, with shape `(B,)` and i-th element representing
                     number of valid elements along dim 2 for i-th batch element in joint network output.
-                List[List[torch.Tensor]]
+                List[List[tensorplay.Tensor]]
                     output states; list of lists of tensors
                     representing prediction network internal state generated in current invocation
                     of ``forward``.
@@ -540,13 +540,13 @@ class RNNT(torch.nn.Module):
             predictor_state,
         )
 
-    @torch.jit.export
+    @tensorplay.jit.export
     def transcribe_streaming(
         self,
-        sources: torch.Tensor,
-        source_lengths: torch.Tensor,
-        state: Optional[List[List[torch.Tensor]]],
-    ) -> Tuple[torch.Tensor, torch.Tensor, List[List[torch.Tensor]]]:
+        sources: tensorplay.Tensor,
+        source_lengths: tensorplay.Tensor,
+        state: Optional[List[List[tensorplay.Tensor]]],
+    ) -> Tuple[tensorplay.Tensor, tensorplay.Tensor, List[List[tensorplay.Tensor]]]:
         r"""Applies transcription network to sources in streaming mode.
 
         B: batch size;
@@ -554,35 +554,35 @@ class RNNT(torch.nn.Module):
         D: feature dimension of each source sequence frame.
 
         Args:
-            sources (torch.Tensor): source frame sequence segments right-padded with right context, with
+            sources (tensorplay.Tensor): source frame sequence segments right-padded with right context, with
                 shape `(B, T + right context length, D)`.
-            source_lengths (torch.Tensor): with shape `(B,)` and i-th element representing
+            source_lengths (tensorplay.Tensor): with shape `(B,)` and i-th element representing
                 number of valid frames for i-th batch element in ``sources``.
-            state (List[List[torch.Tensor]] or None): list of lists of tensors
+            state (List[List[tensorplay.Tensor]] or None): list of lists of tensors
                 representing transcription network internal state generated in preceding invocation
                 of ``transcribe_streaming``.
 
         Returns:
-            (torch.Tensor, torch.Tensor, List[List[torch.Tensor]]):
-                torch.Tensor
+            (tensorplay.Tensor, tensorplay.Tensor, List[List[tensorplay.Tensor]]):
+                tensorplay.Tensor
                     output frame sequences, with
                     shape `(B, T // time_reduction_stride, output_dim)`.
-                torch.Tensor
+                tensorplay.Tensor
                     output lengths, with shape `(B,)` and i-th element representing
                     number of valid elements for i-th batch element in output.
-                List[List[torch.Tensor]]
+                List[List[tensorplay.Tensor]]
                     output states; list of lists of tensors
                     representing transcription network internal state generated in current invocation
                     of ``transcribe_streaming``.
         """
         return self.transcriber.infer(sources, source_lengths, state)
 
-    @torch.jit.export
+    @tensorplay.jit.export
     def transcribe(
         self,
-        sources: torch.Tensor,
-        source_lengths: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        sources: tensorplay.Tensor,
+        source_lengths: tensorplay.Tensor,
+    ) -> Tuple[tensorplay.Tensor, tensorplay.Tensor]:
         r"""Applies transcription network to sources in non-streaming mode.
 
         B: batch size;
@@ -590,29 +590,29 @@ class RNNT(torch.nn.Module):
         D: feature dimension of each source sequence frame.
 
         Args:
-            sources (torch.Tensor): source frame sequences right-padded with right context, with
+            sources (tensorplay.Tensor): source frame sequences right-padded with right context, with
                 shape `(B, T + right context length, D)`.
-            source_lengths (torch.Tensor): with shape `(B,)` and i-th element representing
+            source_lengths (tensorplay.Tensor): with shape `(B,)` and i-th element representing
                 number of valid frames for i-th batch element in ``sources``.
 
         Returns:
-            (torch.Tensor, torch.Tensor):
-                torch.Tensor
+            (tensorplay.Tensor, tensorplay.Tensor):
+                tensorplay.Tensor
                     output frame sequences, with
                     shape `(B, T // time_reduction_stride, output_dim)`.
-                torch.Tensor
+                tensorplay.Tensor
                     output lengths, with shape `(B,)` and i-th element representing
                     number of valid elements for i-th batch element in output frame sequences.
         """
         return self.transcriber(sources, source_lengths)
 
-    @torch.jit.export
+    @tensorplay.jit.export
     def predict(
         self,
-        targets: torch.Tensor,
-        target_lengths: torch.Tensor,
-        state: Optional[List[List[torch.Tensor]]],
-    ) -> Tuple[torch.Tensor, torch.Tensor, List[List[torch.Tensor]]]:
+        targets: tensorplay.Tensor,
+        target_lengths: tensorplay.Tensor,
+        state: Optional[List[List[tensorplay.Tensor]]],
+    ) -> Tuple[tensorplay.Tensor, tensorplay.Tensor, List[List[tensorplay.Tensor]]]:
         r"""Applies prediction network to targets.
 
         B: batch size;
@@ -620,35 +620,35 @@ class RNNT(torch.nn.Module):
         D: feature dimension of each target sequence frame.
 
         Args:
-            targets (torch.Tensor): target sequences, with shape `(B, U)` and each element
+            targets (tensorplay.Tensor): target sequences, with shape `(B, U)` and each element
                 mapping to a target symbol, i.e. in range `[0, num_symbols)`.
-            target_lengths (torch.Tensor): with shape `(B,)` and i-th element representing
+            target_lengths (tensorplay.Tensor): with shape `(B,)` and i-th element representing
                 number of valid frames for i-th batch element in ``targets``.
-            state (List[List[torch.Tensor]] or None): list of lists of tensors
+            state (List[List[tensorplay.Tensor]] or None): list of lists of tensors
                 representing internal state generated in preceding invocation
                 of ``predict``.
 
         Returns:
-            (torch.Tensor, torch.Tensor, List[List[torch.Tensor]]):
-                torch.Tensor
+            (tensorplay.Tensor, tensorplay.Tensor, List[List[tensorplay.Tensor]]):
+                tensorplay.Tensor
                     output frame sequences, with shape `(B, U, output_dim)`.
-                torch.Tensor
+                tensorplay.Tensor
                     output lengths, with shape `(B,)` and i-th element representing
                     number of valid elements for i-th batch element in output.
-                List[List[torch.Tensor]]
+                List[List[tensorplay.Tensor]]
                     output states; list of lists of tensors
                     representing internal state generated in current invocation of ``predict``.
         """
         return self.predictor(input=targets, lengths=target_lengths, state=state)
 
-    @torch.jit.export
+    @tensorplay.jit.export
     def join(
         self,
-        source_encodings: torch.Tensor,
-        source_lengths: torch.Tensor,
-        target_encodings: torch.Tensor,
-        target_lengths: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        source_encodings: tensorplay.Tensor,
+        source_lengths: tensorplay.Tensor,
+        target_encodings: tensorplay.Tensor,
+        target_lengths: tensorplay.Tensor,
+    ) -> Tuple[tensorplay.Tensor, tensorplay.Tensor, tensorplay.Tensor]:
         r"""Applies joint network to source and target encodings.
 
         B: batch size;
@@ -657,22 +657,22 @@ class RNNT(torch.nn.Module):
         D: dimension of each source and target sequence encoding.
 
         Args:
-            source_encodings (torch.Tensor): source encoding sequences, with
+            source_encodings (tensorplay.Tensor): source encoding sequences, with
                 shape `(B, T, D)`.
-            source_lengths (torch.Tensor): with shape `(B,)` and i-th element representing
+            source_lengths (tensorplay.Tensor): with shape `(B,)` and i-th element representing
                 valid sequence length of i-th batch element in ``source_encodings``.
-            target_encodings (torch.Tensor): target encoding sequences, with shape `(B, U, D)`.
-            target_lengths (torch.Tensor): with shape `(B,)` and i-th element representing
+            target_encodings (tensorplay.Tensor): target encoding sequences, with shape `(B, U, D)`.
+            target_lengths (tensorplay.Tensor): with shape `(B,)` and i-th element representing
                 valid sequence length of i-th batch element in ``target_encodings``.
 
         Returns:
-            (torch.Tensor, torch.Tensor, torch.Tensor):
-                torch.Tensor
+            (tensorplay.Tensor, tensorplay.Tensor, tensorplay.Tensor):
+                tensorplay.Tensor
                     joint network output, with shape `(B, T, U, output_dim)`.
-                torch.Tensor
+                tensorplay.Tensor
                     output source lengths, with shape `(B,)` and i-th element representing
                     number of valid elements along dim 1 for i-th batch element in joint network output.
-                torch.Tensor
+                tensorplay.Tensor
                     output target lengths, with shape `(B,)` and i-th element representing
                     number of valid elements along dim 2 for i-th batch element in joint network output.
         """
@@ -709,7 +709,7 @@ def emformer_rnnt_model(
     lstm_layer_norm_epsilon: float,
     lstm_dropout: float,
 ) -> RNNT:
-    r"""Builds Emformer-based :class:`~torchaudio.models.RNNT`.
+    r"""Builds Emformer-based :class:`~tensorplay.audio.models.RNNT`.
 
     Note:
         For non-streaming inference, the expectation is for `transcribe` to be called on input
@@ -782,7 +782,7 @@ def emformer_rnnt_model(
 
 
 def emformer_rnnt_base(num_symbols: int) -> RNNT:
-    r"""Builds basic version of Emformer-based :class:`~torchaudio.models.RNNT`.
+    r"""Builds basic version of Emformer-based :class:`~tensorplay.audio.models.RNNT`.
 
     Args:
         num_symbols (int): The size of target token lexicon.

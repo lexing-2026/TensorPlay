@@ -6,41 +6,65 @@ import tensorplay as tp
 from tensorplay.compiler import CudaGraphError, CudaGraphManager
 
 
-class FakeNative:
+class FakeGraph:
+    """Stand-in for tensorplay._C.CUDAGraph (new native surface)."""
+
     def __init__(self):
-        self.launches = 0
+        self.in_capture = False
+        self.captured = False
+        self.replays = 0
+        self.resets = 0
+        self.pool = 0
 
-    def cuda_graph_begin_capture(self):
-        assert not getattr(self, "_in_capture", False)
-        self._in_capture = True
+    def capture_begin(self, pool=0, capture_error_mode="global", stream=None):
+        assert not self.in_capture, "nested capture on one graph object"
+        self.in_capture = True
+        self.pool = pool
 
-    def cuda_graph_end_capture(self):
-        self._in_capture = False
-        return object()  # opaque graph
+    def capture_end(self):
+        assert self.in_capture, "capture_end without capture_begin"
+        self.in_capture = False
+        self.captured = True
 
-    def cuda_graph_instantiate(self, graph):
-        return ("exec", graph)
+    def replay(self):
+        assert self.captured
+        self.replays += 1
 
-    def cuda_graph_launch(self, executable):
-        self.launches += 1
-
-
-def _manager():
-    return CudaGraphManager(native=FakeNative())
+    def reset(self):
+        self.resets += 1
 
 
-def test_missing_native_names_symbols(monkeypatch):
-    class NoC:  # module stand-in without bindings
-        pass
+class FakeNativeNoBulk:
+    """Stand-in module exposing only the minimal pre-bulk surface."""
 
+    CUDAGraph = FakeGraph
+
+
+class FakeGraphBulk(FakeGraph):
+    def stage_and_launch(self, static_inputs, inputs):
+        assert self.captured
+        for dst, src in zip(static_inputs, inputs):
+            dst.copy_(src)
+        self.replays += 1
+
+
+class FakeNative(FakeNativeNoBulk):
+    CUDAGraph = FakeGraphBulk
+
+
+def _manager(native=FakeNative):
+    return CudaGraphManager(native=native)
+
+
+def test_missing_native_reports_surface(monkeypatch):
     import tensorplay.compiler.cudagraphs as cg
     monkeypatch.setattr(cg, "_default_native", lambda: (_ for _ in ()).throw(
-        NotImplementedError("CUDA graph bindings not implemented yet in "
-                            "tensorplay._C: cuda_graph_begin_capture")))
+        NotImplementedError("CUDA graphs are not supported by this TensorPlay "
+                            "build (tensorplay._C exposes no CUDAGraph class)")))
     mgr = CudaGraphManager()
     with pytest.raises(NotImplementedError) as ei:
         mgr.capture("k", lambda a: a, tp.tensor([1.0]))
-    assert "cuda_graph_begin_capture" in str(ei.value)
+    assert "CUDAGraph" in str(ei.value)
 
 
 def test_capture_once_replay_copies_inputs():
@@ -59,7 +83,26 @@ def test_capture_once_replay_copies_inputs():
         mgr.replay("mm", tp.tensor([1.0]))  # arity mismatch
     with pytest.raises(CudaGraphError):
         mgr.replay("mm", tp.tensor([1.0]), tp.tensor([1.0, 2.0, 3.0]))  # shape drift
-    assert mgr.native.launches == 1 and entry.replays == 1
+    assert entry.graph.replays == 1 and entry.replays == 1
+
+
+def test_bulk_replay_routes_through_stage_and_launch():
+    mgr = _manager()
+    entry = mgr.capture("a", lambda x: x * 2, tp.tensor([1.0]))
+    assert entry.bulk is True
+    out = mgr.replay("a", tp.tensor([5.0]))[0]
+    assert entry.static_inputs[0].tolist() == [5.0]
+    assert out is entry.static_outputs[0]
+    assert entry.graph.replays == 1
+
+
+def test_fallback_replay_without_bulk_path():
+    mgr = _manager(native=FakeNativeNoBulk)
+    entry = mgr.capture("a", lambda x: x * 2, tp.tensor([1.0]))
+    assert entry.bulk is False
+    mgr.replay("a", tp.tensor([-3.0]))
+    assert entry.static_inputs[0].tolist() == [-3.0]
+    assert entry.graph.replays == 1
 
 
 def test_same_key_same_signature_returns_entry():
@@ -71,22 +114,27 @@ def test_same_key_same_signature_returns_entry():
 
 def test_nested_capture_rejected():
     mgr = _manager()
-    native = mgr.native
-
-    def inner():
-        mgr.capture("inner", lambda x: x, tp.tensor([1.0]))
-
-    def outer(x):
-        native.cuda_graph_begin_capture()
-        try:
-            inner()
-        finally:
-            native._in_capture = False
-        return x
-
     mgr.capturing = "outer"
     try:
         with pytest.raises(CudaGraphError):
             mgr.capture("inner", lambda x: x, tp.tensor([1.0]))
     finally:
         mgr.capturing = None
+
+
+def test_clear_resets_graph_objects():
+    mgr = _manager()
+    entry = mgr.capture("a", lambda x: x * 2, tp.tensor([1.0]))
+    mgr.clear("a")
+    assert entry.graph.resets == 1
+    assert "a" not in mgr._entries
+    with pytest.raises(CudaGraphError):
+        mgr.replay("a", tp.tensor([1.0]))
+
+
+def test_clear_all_resets_every_entry():
+    mgr = _manager()
+    e1 = mgr.capture("a", lambda x: x * 2, tp.tensor([1.0]))
+    e2 = mgr.capture("b", lambda x: x + 1, tp.tensor([1.0]))
+    mgr.clear()
+    assert e1.graph.resets == 1 and e2.graph.resets == 1

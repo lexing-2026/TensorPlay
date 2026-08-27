@@ -12,7 +12,7 @@ void check_cublas_gemm_dtype(DType t);
 
 // Row-major single GEMM: result(M,N) = alpha * self(M,K) @ other(K,N) + beta * result.
 // `bias` (optional) enables the cuBLASLt bias epilogue and must be length-N.
-void gemm_impl(const Tensor& self, const Tensor& other, const Tensor& result,
+void gemm_impl(const Tensor& self, const Tensor& other, Tensor& result,
                double alpha, double beta, const Tensor* bias);
 
 // One strided-batched GEMM over (batch_size, M, K) x (batch_size, K, N)

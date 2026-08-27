@@ -1,5 +1,6 @@
 #include <iostream>
 #include "Tensor.h"
+#include <thrust/complex.h>
 #include "Dispatcher.h"
 #include "CUDARuntime.h"
 #include "CUDAContext.h"
@@ -15,6 +16,7 @@
 #include <optional>
 #include <vector>
 #include <numeric>
+#include <type_traits>
 
 #ifdef USE_CUDNN
 #include <cudnn.h>
@@ -31,6 +33,16 @@ namespace cuda {
        TP_THROW(RuntimeError, std::string("CUDA Error: ") + cudaGetErrorString(error)); \
     } \
   } while (0)
+
+// Mean over complex dtypes: scale the accumulated sum by 1/count in place
+// (grid-stride; src and dst may alias).
+template <typename T>
+__global__ void scale_complex_kernel(int64_t n, const thrust::complex<T>* src,
+                                     thrust::complex<T> scale,
+                                     thrust::complex<T>* dst) {
+    int64_t i = blockIdx.x * int64_t(blockDim.x) + threadIdx.x;
+    if (i < n) dst[i] = src[i] * scale;
+}
 
 // --- cuDNN Reduction Helper ---
 
@@ -264,11 +276,11 @@ Tensor prod_same_dtype(
 template <typename T, bool MaxMode>
 Tensor minmax_same_dtype(
         const Tensor& input, const ReductionSpec& spec, bool keepdim) {
-    if (input.numel() == 0) {
-        TP_THROW(RuntimeError, MaxMode
-            ? "max(): Expected reduction dim to be non-empty"
-            : "min(): Expected reduction dim to be non-empty");
-    }
+    // Empty inputs are legal here: callers (max_kernel/min_kernel for full
+    // reductions, max_dim_kernel/min_dim_kernel for dim reductions) already
+    // raised on zero-numel inputs per ATen semantics; what remains is a
+    // reduction over non-empty dims of a zero-element tensor, which yields
+    // an empty result (run_reduction_typed returns it untouched).
     using AccT = same_dtype_acc_t<T>;
     using Ops = MinMaxOps<T, AccT, T, MaxMode>;
     const AccT identity = MaxMode
@@ -363,10 +375,19 @@ Tensor argmax_same_dtype(
     // Compile-time pruning: bool has no argmax (matches torch); blocking it
     // here kills the whole ArgPair<int> instantiation tree.
     static_assert(!std::is_same_v<T, bool>, "argmax is not implemented for bool");
-    if (input.numel() == 0) {
-        TP_THROW(RuntimeError, "argmax(): Expected reduction dim to be non-empty");
-    }
+    // Zero-element inputs with a non-empty reduction dim produce empty
+    // results (ATen parity); the entry points raise on the invalid cases.
     using ValueT = same_dtype_acc_t<T>;
+    // Warp-shuffle fast path: float-family reductions whose logical index
+    // fits int32 run the packed-u64 max form (identical winners — value
+    // desc / first occurrence); everything else keeps the ArgPair tree.
+    if constexpr (std::is_same_v<ValueT, float>) {
+        if (spec.reduced_numel <= ((int64_t{1} << 31) - 1)) {
+            return run_reduction_typed<T, unsigned long long, int64_t>(
+                input, spec, keepdim, DType::Int64,
+                reduction::PackedArgMaxOps{}, 0ull);
+        }
+    }
     using StateT = ArgPair<ValueT>;
     using Ops = ArgOps<ValueT, true>;
     return run_reduction_typed<T, StateT, int64_t>(
@@ -378,9 +399,6 @@ template <typename T>
 Tensor argmin_same_dtype(
         const Tensor& input, const ReductionSpec& spec, bool keepdim) {
     static_assert(!std::is_same_v<T, bool>, "argmin is not implemented for bool");
-    if (input.numel() == 0) {
-        TP_THROW(RuntimeError, "argmin(): Expected reduction dim to be non-empty");
-    }
     using ValueT = same_dtype_acc_t<T>;
     using StateT = ArgPair<ValueT>;
     using Ops = ArgOps<ValueT, false>;
@@ -448,6 +466,13 @@ Tensor sum_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, bool 
     }
     Tensor input = self.dtype() == out_dtype ? self : self.to(out_dtype);
     const ReductionSpec spec = make_reduction_spec(input, dim);
+    // Complex accumulates in its own width via the generic ops (+ only).
+    if (input.dtype() == DType::ComplexFloat) {
+        return sum_same_dtype<thrust::complex<float>>(input, spec, keepdim, out_dtype);
+    }
+    if (input.dtype() == DType::ComplexDouble) {
+        return sum_same_dtype<thrust::complex<double>>(input, spec, keepdim, out_dtype);
+    }
     TP_DISPATCH_REDUCTION(sum_same_dtype, input.dtype(), input, spec, keepdim, out_dtype);
 }
 
@@ -459,7 +484,38 @@ Tensor sum_kernel(const Tensor& self, DType dtype) {
 Tensor mean_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, bool keepdim, DType dtype) {
     DType out_dtype = dtype;
     if (out_dtype == DType::Undefined) {
-        out_dtype = isFloatingType(self.dtype()) ? self.dtype() : DType::Float32;
+        out_dtype = isFloatingOrComplexType(self.dtype()) ? self.dtype() : DType::Float32;
+    }
+    if (self.dtype() == DType::ComplexFloat ||
+        self.dtype() == DType::ComplexDouble) {
+        // mean = sum * (1/n); MeanOps' host-side factor path is real-only.
+        Tensor s = sum_dim_kernel(self, dim, keepdim, out_dtype);
+        int64_t count = 1;
+        if (dim.empty()) {
+            count = self.numel();
+        } else {
+            for (int64_t d : dim) {
+                const int64_t dd = d < 0 ? d + static_cast<int64_t>(self.dim()) : d;
+                count *= self.size(dd);
+            }
+        }
+        count = std::max<int64_t>(1, count);
+        auto stream = getCurrentCUDAStream().stream();
+        int64_t n = s.numel();
+        dim3 grid((unsigned)((n + 255) / 256)), block(256);
+        if (out_dtype == DType::ComplexFloat) {
+            scale_complex_kernel<float><<<grid, block, 0, stream>>>(
+                n, static_cast<const thrust::complex<float>*>(s.data_ptr()),
+                thrust::complex<float>(static_cast<float>(1.0 / count)),
+                static_cast<thrust::complex<float>*>(s.data_ptr()));
+        } else {
+            scale_complex_kernel<double><<<grid, block, 0, stream>>>(
+                n, static_cast<const thrust::complex<double>*>(s.data_ptr()),
+                thrust::complex<double>(1.0 / static_cast<double>(count)),
+                static_cast<thrust::complex<double>*>(s.data_ptr()));
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return s;
     }
     Tensor input = self.dtype() == out_dtype ? self : self.to(out_dtype);
     const ReductionSpec spec = make_reduction_spec(input, dim);
@@ -526,6 +582,12 @@ Tensor prod_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, bool
     }
     Tensor input = self.dtype() == out_dtype ? self : self.to(out_dtype);
     const ReductionSpec spec = make_reduction_spec(input, dim);
+    if (input.dtype() == DType::ComplexFloat) {
+        return prod_same_dtype<thrust::complex<float>>(input, spec, keepdim, out_dtype);
+    }
+    if (input.dtype() == DType::ComplexDouble) {
+        return prod_same_dtype<thrust::complex<double>>(input, spec, keepdim, out_dtype);
+    }
     TP_DISPATCH_REDUCTION(prod_same_dtype, input.dtype(), input, spec, keepdim, out_dtype);
 }
 
@@ -544,7 +606,7 @@ std::tuple<Tensor, Tensor> max_dim_kernel(const Tensor& self, int64_t dim0, bool
     TP_CHECK(dim >= 0 && dim < nd,
              "Dimension out of range (expected to be in range of [-", nd, ", ", nd - 1, "], but got ", dim0, ")");
     if (self.size(dim) == 0) {
-        TP_THROW(RuntimeError, "max(): Expected reduction dim ", dim, " to have non-zero size");
+        TP_THROW(IndexError, "max(): Expected reduction dim ", dim, " to have non-zero size.");
     }
     const ReductionSpec spec = make_reduction_spec(self, {dim});
     if (self.dtype() == DType::Bool) {
@@ -566,6 +628,10 @@ std::tuple<Tensor, Tensor> max_dim_kernel(const Tensor& self, int64_t dim0, bool
 }
 
 Tensor max_kernel(const Tensor& self) {
+    if (self.numel() == 0) {
+        TP_THROW(RuntimeError, "max(): Expected reduction dim to be specified for input.numel() == 0. "
+                 "Specify the reduction dim with the 'dim' argument.");
+    }
     auto spec = make_reduction_spec(self, {});
     Tensor values = [&]() -> Tensor {
         TP_DISPATCH_REDUCTION(max_same_dtype, self.dtype(), self, spec, false);
@@ -582,7 +648,7 @@ std::tuple<Tensor, Tensor> min_dim_kernel(const Tensor& self, int64_t dim0, bool
     TP_CHECK(dim >= 0 && dim < nd,
              "Dimension out of range (expected to be in range of [-", nd, ", ", nd - 1, "], but got ", dim0, ")");
     if (self.size(dim) == 0) {
-        TP_THROW(RuntimeError, "min(): Expected reduction dim ", dim, " to have non-zero size");
+        TP_THROW(IndexError, "min(): Expected reduction dim ", dim, " to have non-zero size.");
     }
     const ReductionSpec spec = make_reduction_spec(self, {dim});
     if (self.dtype() == DType::Bool) {
@@ -600,6 +666,10 @@ std::tuple<Tensor, Tensor> min_dim_kernel(const Tensor& self, int64_t dim0, bool
 }
 
 Tensor min_kernel(const Tensor& self) {
+    if (self.numel() == 0) {
+        TP_THROW(RuntimeError, "min(): Expected reduction dim to be specified for input.numel() == 0. "
+                 "Specify the reduction dim with the 'dim' argument.");
+    }
     auto spec = make_reduction_spec(self, {});
     Tensor values = [&]() -> Tensor {
         TP_DISPATCH_REDUCTION(min_same_dtype, self.dtype(), self, spec, false);
@@ -609,12 +679,264 @@ Tensor min_kernel(const Tensor& self) {
 }
 
 // Norm (L2)
+//
+// The generic reduction engine is deliberately flexible, but its global
+// reduction configuration can split a single scalar across many CTAs and
+// then allocate/finalize a partial buffer.  That overhead is visible in the
+// hot Muon path, which normalizes one matrix per optimizer step.  Keep a
+// narrow, contiguous p=2 path with the same opmath accumulation as Torch's
+// native norm kernel: one coalesced grid pass and one small final reduction.
+template <typename InputT, typename AccT>
+__global__ void norm2_partial_kernel(
+        int64_t n, const InputT* input, AccT* partials) {
+    AccT value = AccT(0);
+    const int64_t first = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    for (int64_t i = first; i < n; i += stride) {
+        const AccT v = static_cast<AccT>(input[i]);
+        value += v * v;
+    }
+
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value += __shfl_down_sync(0xffffffffu, value, offset);
+    }
+    __shared__ AccT warp_values[32];
+    if (lane == 0) warp_values[warp] = value;
+    __syncthreads();
+
+    if (warp == 0) {
+        const int warp_count = (blockDim.x + 31) / 32;
+        value = lane < warp_count ? warp_values[lane] : AccT(0);
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            value += __shfl_down_sync(0xffffffffu, value, offset);
+        }
+        if (lane == 0) partials[blockIdx.x] = value;
+    }
+}
+
+template <typename AccT, typename OutputT>
+__global__ void norm2_finalize_kernel(
+        int64_t count, const AccT* partials, OutputT* output) {
+    AccT value = AccT(0);
+    for (int64_t i = threadIdx.x; i < count; i += blockDim.x) {
+        value += partials[i];
+    }
+    __shared__ AccT warp_values[32];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value += __shfl_down_sync(0xffffffffu, value, offset);
+    }
+    if (lane == 0) warp_values[warp] = value;
+    __syncthreads();
+    if (warp == 0) {
+        const int warp_count = (blockDim.x + 31) / 32;
+        value = lane < warp_count ? warp_values[lane] : AccT(0);
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            value += __shfl_down_sync(0xffffffffu, value, offset);
+        }
+        if (lane == 0) {
+            if constexpr (std::is_same_v<AccT, float>) {
+                output[0] = static_cast<OutputT>(sqrtf(value));
+            } else {
+                output[0] = static_cast<OutputT>(sqrt(value));
+            }
+        }
+    }
+}
+
+template <typename InputT, typename AccT, typename OutputT>
+__global__ void norm2_single_block_kernel(
+        int64_t n, const InputT* input, OutputT* output) {
+    AccT value = AccT(0);
+    for (int64_t base = static_cast<int64_t>(threadIdx.x) * 4;
+         base < n;
+         base += static_cast<int64_t>(blockDim.x) * 4) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int64_t i = base + j;
+            if (i < n) {
+                const AccT v = static_cast<AccT>(input[i]);
+                value += v * v;
+            }
+        }
+    }
+
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value += __shfl_down_sync(0xffffffffu, value, offset);
+    }
+    __shared__ AccT warp_values[32];
+    if (lane == 0) warp_values[warp] = value;
+    __syncthreads();
+
+    if (warp == 0) {
+        const int warp_count = (blockDim.x + 31) / 32;
+        value = lane < warp_count ? warp_values[lane] : AccT(0);
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            value += __shfl_down_sync(0xffffffffu, value, offset);
+        }
+        if (lane == 0) {
+            if constexpr (std::is_same_v<AccT, float>) {
+                output[0] = static_cast<OutputT>(sqrtf(value));
+            } else {
+                output[0] = static_cast<OutputT>(sqrt(value));
+            }
+        }
+    }
+}
+
+template <typename InputT, typename AccT>
+__global__ void norm2_atomic_kernel(
+        int64_t n, const InputT* input, AccT* accumulator) {
+    AccT value = AccT(0);
+    for (int64_t base =
+             static_cast<int64_t>(blockIdx.x) * blockDim.x * 4 +
+             static_cast<int64_t>(threadIdx.x) * 4;
+         base < n;
+         base += static_cast<int64_t>(gridDim.x) * blockDim.x * 4) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int64_t i = base + j;
+            if (i < n) {
+                const AccT v = static_cast<AccT>(input[i]);
+                value += v * v;
+            }
+        }
+    }
+
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value += __shfl_down_sync(0xffffffffu, value, offset);
+    }
+    __shared__ AccT warp_values[32];
+    if (lane == 0) warp_values[warp] = value;
+    __syncthreads();
+
+    if (warp == 0) {
+        const int warp_count = (blockDim.x + 31) / 32;
+        value = lane < warp_count ? warp_values[lane] : AccT(0);
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            value += __shfl_down_sync(0xffffffffu, value, offset);
+        }
+        if (lane == 0) atomicAdd(accumulator, value);
+    }
+}
+
+template <typename AccT, typename OutputT>
+__global__ void norm2_finalize_scalar_kernel(
+        const AccT* accumulator, OutputT* output) {
+    if (threadIdx.x == 0) {
+        const AccT value = *accumulator;
+        if constexpr (std::is_same_v<AccT, float>) {
+            output[0] = static_cast<OutputT>(sqrtf(value));
+        } else {
+            output[0] = static_cast<OutputT>(sqrt(value));
+        }
+    }
+}
+
+template <typename InputT, typename AccT>
+Tensor norm2_global_fast_typed(const Tensor& self) {
+    Tensor result = Tensor::empty({}, self.dtype(), self.device());
+    const int64_t n = self.numel();
+    if (n == 0) {
+        result.zero_();
+        return result;
+    }
+
+    constexpr int block_size = 256;
+    const auto stream = getCurrentCUDAStream().stream();
+
+    // Muon commonly normalizes matrices up to a few million elements.  A
+    // single coalesced block avoids both the temporary partial allocation and
+    // the second launch while retaining a grid-stride loop over the complete
+    // tensor.  Use the two-stage path for very large reductions so bandwidth
+    // remains the priority there.
+    constexpr int64_t single_block_limit = 64 * 1024;
+    if (n <= single_block_limit) {
+        const int single_block_threads = n > 64 * 1024 ? 512 : block_size;
+        norm2_single_block_kernel<InputT, AccT, InputT><<<1, single_block_threads, 0, stream>>>(
+            n, static_cast<const InputT*>(self.data_ptr()),
+            static_cast<InputT*>(result.data_ptr()));
+        CUDA_CHECK(cudaGetLastError());
+        return result;
+    }
+
+    constexpr int elements_per_thread = 8;
+    const int64_t needed =
+        (n + static_cast<int64_t>(block_size * elements_per_thread) - 1) /
+        static_cast<int64_t>(block_size * elements_per_thread);
+    // Keep the launch geometry out of the hot host path.  Querying
+    // cudaGetDeviceProperties for every Muon step costs roughly 0.9 ms on
+    // the target GPU, dwarfing the reduction itself.  256 CTAs is a safe
+    // upper bound for this one-output reduction across the supported CUDA
+    // devices; the grid-stride loop handles smaller tensors naturally.
+    constexpr int64_t target = 256;
+    const int blocks = static_cast<int>(std::max<int64_t>(1, std::min<int64_t>(needed, target)));
+
+    const DType accumulator_dtype =
+        std::is_same_v<AccT, float> ? DType::Float32 : DType::Float64;
+    Tensor accumulator = Tensor::empty({}, accumulator_dtype, self.device());
+    CUDA_CHECK(cudaMemsetAsync(accumulator.data_ptr(), 0, sizeof(AccT), stream));
+    norm2_atomic_kernel<InputT, AccT><<<blocks, block_size, 0, stream>>>(
+        n, static_cast<const InputT*>(self.data_ptr()),
+        static_cast<AccT*>(accumulator.data_ptr()));
+    CUDA_CHECK(cudaGetLastError());
+    norm2_finalize_scalar_kernel<AccT, InputT><<<1, 32, 0, stream>>>(
+        static_cast<const AccT*>(accumulator.data_ptr()),
+        static_cast<InputT*>(result.data_ptr()));
+    CUDA_CHECK(cudaGetLastError());
+    return result;
+}
+
 Tensor norm_global_kernel(const Tensor& self, double p) {
+    if (isComplexType(self.dtype())) {
+        // torch norm(complex, p=2) = (sum |z|^p)^(1/p); abs() maps complex to
+        // the real counterpart so the float path below handles the reduction.
+        Tensor areal = self.abs();
+        if (std::isinf(p)) return p > 0 ? areal.max() : areal.min();
+        return areal.pow(Scalar(p)).sum().pow(Scalar(1.0 / p));
+    }
+    // A transpose of a contiguous 2-D tensor is logically non-contiguous but
+    // still occupies one dense storage span.  Since a global norm is
+    // independent of element order, scan that span directly instead of
+    // falling through to the generic strided reduction (or making a copy).
+    const bool dense_storage =
+        self.is_contiguous() ||
+        (self.dim() == 2 && self.stride(0) == 1 &&
+         self.stride(1) == self.size(0));
+    if (p == 2.0 && dense_storage) {
+        switch (self.dtype()) {
+            case DType::Float32:
+                return norm2_global_fast_typed<float, float>(self);
+            case DType::Float64:
+                return norm2_global_fast_typed<double, double>(self);
+            case DType::Float16:
+                return norm2_global_fast_typed<Half, float>(self);
+            case DType::BFloat16:
+                return norm2_global_fast_typed<BFloat16, float>(self);
+            default:
+                break;
+        }
+    }
     const ReductionSpec spec = make_reduction_spec(self, {});
     TP_DISPATCH_FLOAT_REDUCTION(norm_same_dtype, self.dtype(), self, spec, false, p);
 }
 
 Tensor norm_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, double p, bool keepdim) {
+    if (isComplexType(self.dtype())) {
+        Tensor areal = self.abs();
+        if (std::isinf(p)) {
+            if (p > 0) return Tensor::amax(areal, dim, keepdim);
+            return Tensor::amin(areal, dim, keepdim);
+        }
+        return areal.pow(Scalar(p)).sum(dim, keepdim).pow(Scalar(1.0 / p));
+    }
     const ReductionSpec spec = make_reduction_spec(self, dim);
     TP_DISPATCH_FLOAT_REDUCTION(norm_same_dtype, self.dtype(), self, spec, keepdim, p);
 }
@@ -640,26 +962,65 @@ Tensor any_kernel(const Tensor& self) {
 
 // Var / Std
 Tensor var_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, int64_t correction, bool keepdim) {
+    if (isComplexType(self.dtype())) {
+        // Upstream ATen semantics (aten/src/ATen/native/ReduceOps.cpp):
+        // complex variance = E|z - mean|^2 == var(re) + var(imag); the result
+        // dtype is the real counterpart.  Built from dispatched complex-safe
+        // ops (mean/sub/abs/sum) so both backends share one definition.
+        Tensor mean = self.mean(dim, true);
+        Tensor diff = self - mean;
+        Tensor sum_sq = diff.abs().pow(Scalar(2)).sum(dim, keepdim);
+        std::vector<int64_t> shape = static_cast<std::vector<int64_t>>(self.shape());
+        int64_t n = 1;
+        for (int64_t d : dim) {
+            if (d < 0) d += shape.size();
+            n *= shape[d];
+        }
+        double div = std::max<double>(0.0, static_cast<double>(n - correction));
+        return sum_sq / Scalar(div);
+    }
     const ReductionSpec spec = make_reduction_spec(self, dim);
     TP_DISPATCH_FLOAT_REDUCTION(welford_same_dtype, self.dtype(), self, spec,
                                 keepdim, correction, false);
 }
 
 Tensor var_kernel(const Tensor& self, int64_t correction) {
+    if (isComplexType(self.dtype())) {
+        Tensor diff = self - self.mean();
+        Tensor sum_sq = diff.abs().pow(Scalar(2)).sum();
+        int64_t n = self.numel();
+        double div_val = std::max<double>(0.0, static_cast<double>(n - correction));
+        return sum_sq / Scalar(div_val);
+    }
     return var_dim_kernel(self, {}, correction, false);
 }
 
 Tensor std_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, int64_t correction, bool keepdim) {
+    if (isComplexType(self.dtype())) {
+        return var_dim_kernel(self, dim, correction, keepdim).sqrt();
+    }
     const ReductionSpec spec = make_reduction_spec(self, dim);
     TP_DISPATCH_FLOAT_REDUCTION(welford_same_dtype, self.dtype(), self, spec,
                                 keepdim, correction, true);
 }
 
 Tensor std_kernel(const Tensor& self, int64_t correction) {
+    if (isComplexType(self.dtype())) {
+        return var_kernel(self, correction).sqrt();
+    }
     return std_dim_kernel(self, {}, correction, false);
 }
 
 Tensor argmax_kernel(const Tensor& self, std::optional<int64_t> dim, bool keepdim) {
+    // ATen parity (ReduceOps.cpp check_argmax_argmin).
+    if (!dim.has_value()) {
+        TP_CHECK_INDEX(self.numel() != 0,
+                       "argmax(): Expected reduction dim to be specified for input.numel() == 0.");
+    } else {
+        const int64_t d = *dim < 0 ? *dim + self.dim() : *dim;
+        TP_CHECK_INDEX(self.size(d) != 0,
+                       "argmax(): Expected reduction dim ", d, " to have non-zero size.");
+    }
     Tensor input = self;
     if (!dim.has_value() && !input.is_contiguous()) input = input.contiguous();
     const ReductionSpec spec = make_reduction_spec(
@@ -668,6 +1029,14 @@ Tensor argmax_kernel(const Tensor& self, std::optional<int64_t> dim, bool keepdi
 }
 
 Tensor argmin_kernel(const Tensor& self, std::optional<int64_t> dim, bool keepdim) {
+    if (!dim.has_value()) {
+        TP_CHECK_INDEX(self.numel() != 0,
+                       "argmin(): Expected reduction dim to be specified for input.numel() == 0.");
+    } else {
+        const int64_t d = *dim < 0 ? *dim + self.dim() : *dim;
+        TP_CHECK_INDEX(self.size(d) != 0,
+                       "argmin(): Expected reduction dim ", d, " to have non-zero size.");
+    }
     Tensor input = self;
     if (!dim.has_value() && !input.is_contiguous()) input = input.contiguous();
     const ReductionSpec spec = make_reduction_spec(
@@ -681,7 +1050,22 @@ Tensor median_kernel(const Tensor& self) {
     Tensor flat = self.contiguous().reshape({-1});
     const int64_t n = flat.numel();
     if (n == 0) {
-        TP_THROW(RuntimeError, "median(): input tensor is empty");
+        // torch Sorting.cpp:752: full({}, NaN).to(self.options()) — NaN stays
+        // NaN for float dtypes, converts to true for bool, lowest() for
+        // signed ints and 0 for unsigned ints.
+        Scalar fill(std::numeric_limits<double>::quiet_NaN());
+        switch (self.dtype()) {
+            case DType::Bool: fill = Scalar(true); break;
+            case DType::UInt8: case DType::UInt16:
+            case DType::UInt32: case DType::UInt64:
+                fill = Scalar(int64_t(0)); break;
+            case DType::Int8: fill = Scalar(int64_t(std::numeric_limits<int8_t>::lowest())); break;
+            case DType::Int16: fill = Scalar(int64_t(std::numeric_limits<int16_t>::lowest())); break;
+            case DType::Int32: fill = Scalar(int64_t(std::numeric_limits<int32_t>::lowest())); break;
+            case DType::Int64: fill = Scalar(std::numeric_limits<int64_t>::lowest()); break;
+            default: break;
+        }
+        return Tensor::full({}, fill, self.dtype(), self.device());
     }
     extern std::tuple<Tensor, Tensor> sort_cuda(const Tensor& self, int64_t dim,
                                                 bool descending);

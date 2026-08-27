@@ -14,6 +14,7 @@
 #include "CUDARuntime.h"
 
 #include <cuda_runtime.h>
+#include <thrust/complex.h>
 
 #include <algorithm>
 #include <array>
@@ -115,6 +116,22 @@ template <typename T>
 __device__ __forceinline__ T reduce_warp_shuffle_down(
         T value, unsigned mask, int offset) {
     return __shfl_down_sync(mask, value, offset);
+}
+
+// thrust::complex has no intrinsic __shfl_down_sync overload; shuffle the
+// real/imag components separately (ATen does the same for complex reduce).
+__device__ __forceinline__ thrust::complex<float> reduce_warp_shuffle_down(
+        thrust::complex<float> value, unsigned mask, int offset) {
+    float re = __shfl_down_sync(mask, value.real(), offset);
+    float im = __shfl_down_sync(mask, value.imag(), offset);
+    return thrust::complex<float>(re, im);
+}
+
+__device__ __forceinline__ thrust::complex<double> reduce_warp_shuffle_down(
+        thrust::complex<double> value, unsigned mask, int offset) {
+    double re = __shfl_down_sync(mask, value.real(), offset);
+    double im = __shfl_down_sync(mask, value.imag(), offset);
+    return thrust::complex<double>(re, im);
 }
 
 template <typename T, int N>
@@ -729,6 +746,57 @@ struct ArgOps {
         if (a.value == b.value) return a.index < b.index;
         if constexpr (MaxMode) return a.value > b.value;
         else return a.value < b.value;
+    }
+};
+
+// Packed argmax (warp-shuffle form): the whole reduction state is ONE 64-bit
+// word — [monotone value key (high 32) | ~index (low 32)] — selected with a
+// plain integer max.  Each shuffle level moves a single u64 (native
+// __shfl_down_sync overload) instead of the two shuffles plus comparator
+// branches an ArgPair<float> tree performs, and no divergent NaN/tie logic
+// survives in the hot loop because ordering is baked into the encoding:
+//   * finite values map monotonically via the IEEE trick
+//     bits ^ (sign ? 0xFFFFFFFF : 0x80000000);
+//   * every NaN collapses to canonical qNaN, so any NaN outranks +inf and
+//     equal NaN keys fall through to the index half (first NaN wins);
+//   * -0 folds onto +0 so IEEE equality keeps the first-occurrence rule;
+//   * ~index in the low half: on equal keys integer max keeps the smaller
+//     index — bit-identical winners to ArgOps<float, true>.
+// Row length must fit int32 (host-side guard); identities at padding lanes
+// encode key 0, below every representable element key.
+struct PackedArgMaxOps {
+    using acc_type = unsigned long long;
+
+    __device__ static unsigned long long pack(float value, int64_t index) {
+        unsigned bits = __float_as_uint(value);
+        if ((bits & 0x7FFFFFFFu) > 0x7F800000u) {
+            bits = 0x7FC00000u;  // NaN family -> canonical qNaN
+        } else if (bits == 0x80000000u) {
+            bits = 0u;           // fold -0 onto +0
+        }
+        const unsigned sign = static_cast<unsigned>(static_cast<int>(bits) >> 31);
+        const unsigned key = bits ^ (0x80000000u | (0x7FFFFFFFu & sign));
+        return (static_cast<unsigned long long>(key) << 32) |
+               static_cast<unsigned>(~static_cast<unsigned>(index));
+    }
+
+    template <typename V>
+    __device__ unsigned long long reduce(
+            unsigned long long acc, V value, int64_t index) const {
+        const unsigned long long candidate = pack(
+            static_cast<float>(value), index);
+        return candidate > acc ? candidate : acc;
+    }
+
+    __device__ unsigned long long combine(unsigned long long a,
+                                          unsigned long long b) const {
+        return a > b ? a : b;
+    }
+
+    __device__ int64_t project(unsigned long long value) const {
+        const unsigned idx =
+            ~static_cast<unsigned>(value & 0xFFFFFFFFull);
+        return static_cast<int64_t>(static_cast<int32_t>(idx));
     }
 };
 

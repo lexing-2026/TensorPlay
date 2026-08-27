@@ -2,11 +2,10 @@ import os
 from pathlib import Path
 from typing import Tuple, Union
 
-import tensorplay.audio as torchaudio
 from tensorplay import Tensor
-from torch.utils.data import Dataset
+from tensorplay.utils.data import Dataset
 from tensorplay.hub import download_url_to_file
-from torchaudio.datasets.utils import _extract_tar
+from tensorplay.audio.datasets.utils import _extract_tar
 
 URL = "aew"
 FOLDER_IN_ARCHIVE = "ARCTIC"
@@ -42,7 +41,7 @@ def load_cmuarctic_item(line: str, path: str, folder_audio: str, ext_audio: str)
     file_audio = os.path.join(path, folder_audio, utterance_id + ext_audio)
 
     # Load audio
-    waveform, sample_rate = torchaudio.load(file_audio)
+    waveform, sample_rate = tensorplay.audio.load(file_audio)
 
     return (waveform, sample_rate, transcript, utterance_id.split("_")[1])
 

@@ -1,7 +1,7 @@
-"""Classification models, mirroring torchvision==0.28.0 models/__init__.py.
+"""Classification models, mirroring tensorplay.vision==0.28.0 models/__init__.py.
 
 The detection / optical_flow / quantization / segmentation / video
-subpackages are not ported; everything else follows torchvision.
+subpackages are not ported; everything else follows tensorplay.vision.
 """
 
 from .alexnet import *

@@ -157,6 +157,23 @@ Tensor rand_kernel_cuda(const std::vector<int64_t>& size, DType dtype, Device de
                 [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
                 [] __device__ (float rand) { return static_cast<BFloat16>(rand); });
         }
+    } else if (dtype == DType::ComplexFloat || dtype == DType::ComplexDouble) {
+        // torch parity: each component draws U[0,1) independently -- sample
+        // the interleaved component buffer as a real array.
+        const int64_t comps = t.numel() * 2;
+        if (dtype == DType::ComplexFloat) {
+            float* raw = static_cast<float*>(t.data_ptr());
+            distribution_nullary_kernel<float, float4, 4>(
+                raw, comps,
+                [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
+                [] __device__ (float v) { return v; });
+        } else {
+            double* raw = static_cast<double*>(t.data_ptr());
+            distribution_nullary_kernel<double, double2, 2>(
+                raw, comps,
+                [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform2_double(state); },
+                [] __device__ (double v) { return v; });
+        }
     } else {
          TP_THROW(NotImplementedError, "rand() only supports floating dtypes on CUDA for now");
     }
@@ -192,6 +209,25 @@ Tensor randn_kernel_cuda(const std::vector<int64_t>& size, DType dtype, Device d
                 data, n,
                 [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal4(state); },
                 [] __device__ (float rand) { return static_cast<BFloat16>(rand); });
+        }
+    } else if (dtype == DType::ComplexFloat || dtype == DType::ComplexDouble) {
+        // ATen normal_impl_ parity: view_as_real(self) with std/sqrt(2); the
+        // standard-normal factory is N(0, 1/sqrt(2)) per component.
+        constexpr float kInvSqrt2f = 0.70710678118654752f;
+        constexpr double kInvSqrt2 = 0.70710678118654752440;
+        const int64_t comps = t.numel() * 2;
+        if (dtype == DType::ComplexFloat) {
+            float* raw = static_cast<float*>(t.data_ptr());
+            distribution_nullary_kernel<float, float4, 4>(
+                raw, comps,
+                [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal4(state); },
+                [] __device__ (float v) { return v * kInvSqrt2f; });
+        } else {
+            double* raw = static_cast<double*>(t.data_ptr());
+            distribution_nullary_kernel<double, double2, 2>(
+                raw, comps,
+                [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal2_double(state); },
+                [] __device__ (double v) { return v * kInvSqrt2; });
         }
     } else {
          TP_THROW(NotImplementedError, "randn() only supports floating dtypes on CUDA for now");

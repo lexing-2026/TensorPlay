@@ -38,13 +38,21 @@ def _ensure_torchgen():
     if _TORCHGEN_READY:
         return
     root = Path(__file__).resolve()
+    # Preferred layout: torchgen vendored standalone (keeps CI/remote syncs
+    # free of the 1.7GB pytorch tree).  Legacy fallback: the full vendored
+    # pytorch checkout.
     for cand in root.parents:
+        standalone = cand / "third_party" / "torchgen"
+        if (standalone / "torchgen" / "model.py").exists():
+            pt = str(standalone)
+            break
         if (cand / "third_party" / "pytorch" / "torchgen" / "model.py").exists():
             pt = str(cand / "third_party" / "pytorch")
             break
     else:
         raise RuntimeError(
-            "vendored torchgen not found under third_party/pytorch")
+            "vendored torchgen not found (expected third_party/torchgen/ "
+            "or the legacy third_party/pytorch/ layout)")
 
     for m in [k for k in list(_sys.modules)
               if k == "torchgen" or k.startswith("torchgen.")]:

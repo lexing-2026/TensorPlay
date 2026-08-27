@@ -30,6 +30,14 @@ def _group_tensors_by_device_and_dtype(
     tensorlistlist: TensorListList,
     with_indices: bool = False,
 ) -> dict[tuple[tp.Device, tp.dtype], tuple[TensorListList, Indices]]:
+    # Match Torch's native torch._C._group_tensors_by_device_and_dtype.  Keep
+    # the Python implementation below as an ABI/backward-compatible fallback
+    # for an extension built before the native helper was introduced.
+    native_group = getattr(getattr(tp, "_C", None),
+                           "_group_tensors_by_device_and_dtype", None)
+    if native_group is not None:
+        return native_group(tensorlistlist, with_indices)
+
     if not tensorlistlist or not tensorlistlist[0]:
         raise RuntimeError(
             "Expected the first nested tensor list to be non-empty"

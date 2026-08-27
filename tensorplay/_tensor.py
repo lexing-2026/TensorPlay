@@ -355,11 +355,13 @@ Tensor.permute = _permute
 _orig_expand = Tensor.expand
 
 
-def _expand(self, *size):
+def _expand(self, *size, implicit=False):
     if len(size) == 1:
         s0 = size[0]
         if isinstance(s0, (list, tuple)) or hasattr(s0, "__iter__"):
-            return _orig_expand(self, s0)
+            size = tuple(s0)
+    if implicit:
+        return _orig_expand(self, list(size), implicit=True)
     return _orig_expand(self, list(size))
 
 
@@ -367,24 +369,21 @@ Tensor.expand = _expand
 
 
 # ---------------------------------------------------------------------------
-# item: the generated binding returns a tp Scalar wrapper (schema
-# `-> Scalar`); torch's Tensor.item() returns a Python number.  Unbox
-# according to dtype so arithmetic like `t.item() - other` keeps working.
-# ---------------------------------------------------------------------------
-_orig_item = Tensor.item
-
-
+# item: torch's Tensor.item() returns a native Python number.  The generated
+# binding boxes into a tp Scalar wrapper, so route through _C.item_python
+# which unboxes in C++ (bool/int/float/complex by dtype) — one frame, no
+# per-call imports.
 def item(self):
-    import builtins
-    value = _orig_item(self)
-    dt = self.dtype
-    if dt in (_C.float32, _C.float64, _C.float16, _C.bfloat16,
-              _C.complex64, _C.complex128):
-        return builtins.float(value)
-    return builtins.int(value)
+    return _C.item_python(self)
 
 
 Tensor.item = item
+
+
+# ---------------------------------------------------------------------------
+# __bool__ lives in the C extension (nb_bool slot on TensorBase): empty ->
+# RuntimeError "no values is ambiguous", one element -> value != 0, more ->
+# RuntimeError "more than one value is ambiguous", verbatim torch.
 
 
 # ---------------------------------------------------------------------------
@@ -537,12 +536,70 @@ def repeat_interleave(self, repeats, dim=None, *, output_size=None):
 Tensor.repeat_interleave = repeat_interleave
 
 
+# ---------------------------------------------------------------------------
+# torch.Tensor.max / .min overload parity: the native binding exposes the
+# reduction faces returning plain tuples.  Restore (a) the elementwise binary
+# form ``t.max(Tensor)`` and (b) the named-tuple contract with
+# ``values``/``indices`` for dim reductions (torch.return_types).
+# ---------------------------------------------------------------------------
+_native_tensor_max = Tensor.max
+_native_tensor_min = Tensor.min
+
+
+def max(self, *args, **kwargs):
+    if args and hasattr(args[0], "shape"):
+        return _C.maximum(self, args[0])
+    result = _native_tensor_max(self, *args, **kwargs)
+    if ((args and args[0] is not None) or kwargs.get("dim") is not None) \
+            and isinstance(result, tuple):
+        from ._return_types import max_return_type
+        return max_return_type(*result)
+    return result
+
+
+def min(self, *args, **kwargs):
+    if args and hasattr(args[0], "shape"):
+        return _C.minimum(self, args[0])
+    result = _native_tensor_min(self, *args, **kwargs)
+    if ((args and args[0] is not None) or kwargs.get("dim") is not None) \
+            and isinstance(result, tuple):
+        from ._return_types import min_return_type
+        return min_return_type(*result)
+    return result
+
+
+Tensor.max = max
+Tensor.min = min
+
+
+def amax(self, dim=None, keepdim=False):
+    from . import functional
+    return functional.amax(self, dim=dim, keepdim=keepdim)
+
+
+def amin(self, dim=None, keepdim=False):
+    from . import functional
+    return functional.amin(self, dim=dim, keepdim=keepdim)
+
+
+Tensor.amax = amax
+Tensor.amin = amin
+
+
 def count_nonzero(self, dim=None):
     nz = self.ne(0).to(_C.DType.int64)
     return nz.sum() if dim is None else nz.sum(dim=dim)
 
 
 Tensor.count_nonzero = count_nonzero
+
+
+def nonzero(self):
+    from . import functional
+    return functional.nonzero(self)
+
+
+Tensor.nonzero = nonzero
 
 
 def unique(self, sorted=True, return_inverse=False, return_counts=False):
@@ -682,3 +739,43 @@ def __index__(self):
 
 Tensor.__complex__ = __complex__
 Tensor.__index__ = __index__
+
+
+# ---------------------------------------------------------------------------
+# Device / layout query face (torch.Tensor parity).  The movement family
+# (cpu/cuda/to/pin_memory/record_stream) is bound natively; these are the
+# remaining queries and aliases.
+# ---------------------------------------------------------------------------
+def _is_cpu(self):
+    return str(self.device.type) == "cpu"
+
+
+def _is_cuda(self):
+    return str(self.device.type) == "cuda"
+
+
+def _is_meta(self):
+    dt = getattr(_C.DeviceType, "META", None)
+    return dt is not None and str(self.device.type) == str(dt)
+
+
+Tensor.is_cpu = property(_is_cpu)
+Tensor.is_cuda = property(_is_cuda)
+if hasattr(_C.DeviceType, "META"):
+    Tensor.is_meta = property(_is_meta)
+else:
+    Tensor.is_meta = property(lambda self: False)
+del _is_cpu, _is_cuda
+
+
+def xpu(self, device=None):
+    """Moves to the XPU device (torch parity; raises without an XPU backend)."""
+    if device is None:
+        return self.to(_C.Device(_C.DeviceType.XPU))
+    if builtins_int(device) == device and not isinstance(device, str):
+        return self.to(_C.Device(_C.DeviceType.XPU, device))
+    parsed = _C.Device(device)
+    return self.to(parsed)
+
+
+Tensor.xpu = xpu

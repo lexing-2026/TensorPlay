@@ -1,9 +1,9 @@
 import logging
 from typing import List, Optional, Tuple
 
-import tensorplay as torch
-from torch import nn, Tensor
-from torch.nn import Module, Parameter
+import tensorplay as tensorplay
+from tensorplay import nn, Tensor
+from tensorplay.nn import Module, Parameter
 
 from .wavlm_attention import WavLMSelfAttention
 
@@ -93,9 +93,9 @@ class ConvLayerBlock(Module):
         x = nn.functional.gelu(x)
 
         if length is not None:
-            length = torch.div(length - self.kernel_size, self.stride, rounding_mode="floor") + 1
+            length = tensorplay.div(length - self.kernel_size, self.stride, rounding_mode="floor") + 1
             # When input length is 0, the resulting length can be negative. So fix it here.
-            length = torch.max(torch.zeros_like(length), length)
+            length = tensorplay.max(tensorplay.zeros_like(length), length)
         return x, length
 
 
@@ -214,7 +214,7 @@ class ConvolutionalPositionalEmbedding(Module):
     def __prepare_scriptable__(self):
         if self.conv.__class__.__name__ == "ParametrizedConv1d":
             _LG.warning("Removing weight_norm from %s", self.__class__.__name__)
-            torch.nn.utils.parametrize.remove_parametrizations(self.conv, "weight")
+            tensorplay.nn.utils.parametrize.remove_parametrizations(self.conv, "weight")
         return self
 
     def forward(self, x):
@@ -229,7 +229,7 @@ class ConvolutionalPositionalEmbedding(Module):
         x = self.conv(x)
         if self.num_remove > 0:
             x = x[..., : -self.num_remove]
-        x = torch.nn.functional.gelu(x)
+        x = tensorplay.nn.functional.gelu(x)
         x = x.transpose(-2, -1)
         return x
 
@@ -302,7 +302,7 @@ class SelfAttention(Module):
         k = self.k_proj(x).view(*shape).transpose(2, 1)  # B, nH, L, Hd
         v = self.v_proj(x).view(*shape).transpose(2, 1)  # B, nH, L, Hd
         dropout = self.dropout if self.training else 0.0
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
+        attn_output = tensorplay.nn.functional.scaled_dot_product_attention(
             q, k, v, attn_mask=attention_mask, dropout_p=dropout, is_causal=False
         )
         attn_output = attn_output.transpose(1, 2).reshape(batch_size, -1, self.num_heads * self.head_dim)
@@ -334,7 +334,7 @@ class FeedForward(Module):
             x (Tensor): shape: `(batch, sequence_length, io_features)`
         """
         x = self.intermediate_dense(x)
-        x = torch.nn.functional.gelu(x)
+        x = tensorplay.nn.functional.gelu(x)
         x = self.intermediate_dropout(x)
 
         x = self.output_dense(x)
@@ -435,7 +435,7 @@ class Transformer(Module):
     ) -> Tensor:
         x = self._preprocess(x)
         for layer in self.layers:
-            if not (self.training and torch.rand(1).item() <= self.layer_drop):
+            if not (self.training and tensorplay.rand(1).item() <= self.layer_drop):
                 x, position_bias = layer(x, attention_mask, position_bias=position_bias)
 
         if not self.layer_norm_first:
@@ -484,7 +484,7 @@ class Encoder(Module):
         if lengths is not None:
             batch_size, max_len, _ = x.shape
             # create mask for padded elements and zero-out them
-            mask = torch.arange(max_len, device=lengths.device).expand(batch_size, max_len) >= lengths[:, None]
+            mask = tensorplay.arange(max_len, device=lengths.device).expand(batch_size, max_len) >= lengths[:, None]
             x[mask] = 0.0
             # extend the mask to attention shape and set weight
             mask = -10000.0 * mask[:, None, None, :].to(dtype=features.dtype)
@@ -540,20 +540,20 @@ def _get_feature_extractor(
 
     See Also:
         * Original implementation
-            https://github.com/pytorch/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/fairseq/models/wav2vec/wav2vec2.py#L666-L733
+            https://github.com/tensorplay/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/fairseq/models/wav2vec/wav2vec2.py#L666-L733
         * "extractor_mode"
           - Def and base:
-            https://github.com/pytorch/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/fairseq/models/wav2vec/wav2vec2.py#L38-L45
+            https://github.com/tensorplay/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/fairseq/models/wav2vec/wav2vec2.py#L38-L45
           - Large:
-            https://github.com/pytorch/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/examples/wav2vec/config/pretraining/wav2vec2_large_librivox.yaml#L52
+            https://github.com/tensorplay/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/examples/wav2vec/config/pretraining/wav2vec2_large_librivox.yaml#L52
         * "conv_feature_layers"
           - Def, base and large:
-            https://github.com/pytorch/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/fairseq/models/wav2vec/wav2vec2.py#L94-L100
+            https://github.com/tensorplay/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/fairseq/models/wav2vec/wav2vec2.py#L94-L100
         * "conv_bias"
           - Def and base:
-            https://github.com/pytorch/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/fairseq/models/wav2vec/wav2vec2.py#L101-L103
+            https://github.com/tensorplay/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/fairseq/models/wav2vec/wav2vec2.py#L101-L103
           - Large:
-            https://github.com/pytorch/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/examples/wav2vec/config/pretraining/wav2vec2_large_librivox.yaml#L61
+            https://github.com/tensorplay/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/examples/wav2vec/config/pretraining/wav2vec2_large_librivox.yaml#L61
     """
     if norm_mode not in ["group_norm", "layer_norm"]:
         raise ValueError("Invalid norm mode")
@@ -663,65 +663,65 @@ def _get_encoder(
     See Also:
         * "encoder_embed_dim"
           - Def and base
-            https://github.com/pytorch/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/fairseq/models/wav2vec/wav2vec2.py#L49-L51
+            https://github.com/tensorplay/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/fairseq/models/wav2vec/wav2vec2.py#L49-L51
           - Large
-            https://github.com/pytorch/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/examples/wav2vec/config/pretraining/wav2vec2_large_librivox.yaml#L64
+            https://github.com/tensorplay/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/examples/wav2vec/config/pretraining/wav2vec2_large_librivox.yaml#L64
         * "dropout_input"
           - Def, base and large
-            https://github.com/pytorch/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/fairseq/models/wav2vec/wav2vec2.py#L75-L78
+            https://github.com/tensorplay/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/fairseq/models/wav2vec/wav2vec2.py#L75-L78
         * "conv_pos"
           - Def, base and large
             NOTE: The description is wrong.
-            https://github.com/pytorch/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/fairseq/models/wav2vec/wav2vec2.py#L204-L207
+            https://github.com/tensorplay/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/fairseq/models/wav2vec/wav2vec2.py#L204-L207
           - Usage
-            https://github.com/pytorch/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/fairseq/models/wav2vec/wav2vec2.py#L756
+            https://github.com/tensorplay/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/fairseq/models/wav2vec/wav2vec2.py#L756
         * "conv_pos_groups"
           - Def, base and large
-            https://github.com/pytorch/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/fairseq/models/wav2vec/wav2vec2.py#L208-L211
+            https://github.com/tensorplay/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/fairseq/models/wav2vec/wav2vec2.py#L208-L211
         * "encoder_layers"
           - Def and base
-            https://github.com/pytorch/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/fairseq/models/wav2vec/wav2vec2.py#L46-L48
+            https://github.com/tensorplay/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/fairseq/models/wav2vec/wav2vec2.py#L46-L48
           - Large
-            https://github.com/pytorch/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/examples/wav2vec/config/pretraining/wav2vec2_large_librivox.yaml#L63
+            https://github.com/tensorplay/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/examples/wav2vec/config/pretraining/wav2vec2_large_librivox.yaml#L63
         * "encoder_attention_heads"
           - Def and base
-            https://github.com/pytorch/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/fairseq/models/wav2vec/wav2vec2.py#L55-L57
+            https://github.com/tensorplay/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/fairseq/models/wav2vec/wav2vec2.py#L55-L57
           - Large
-            https://github.com/pytorch/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/examples/wav2vec/config/pretraining/wav2vec2_large_librivox.yaml#L66
+            https://github.com/tensorplay/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/examples/wav2vec/config/pretraining/wav2vec2_large_librivox.yaml#L66
         * "attention_dropout"
           - Def and base
-            https://github.com/pytorch/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/fairseq/models/wav2vec/wav2vec2.py#L66-L68
+            https://github.com/tensorplay/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/fairseq/models/wav2vec/wav2vec2.py#L66-L68
           - Large
-            https://github.com/pytorch/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/examples/wav2vec/config/pretraining/wav2vec2_large_librivox.yaml#L60
+            https://github.com/tensorplay/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/examples/wav2vec/config/pretraining/wav2vec2_large_librivox.yaml#L60
         * "encoder_ffn_embed_dim"
           - Def and base
-            https://github.com/pytorch/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/fairseq/models/wav2vec/wav2vec2.py#L52-L54
+            https://github.com/tensorplay/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/fairseq/models/wav2vec/wav2vec2.py#L52-L54
           - Large
-            https://github.com/pytorch/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/examples/wav2vec/config/pretraining/wav2vec2_large_librivox.yaml#L65
+            https://github.com/tensorplay/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/examples/wav2vec/config/pretraining/wav2vec2_large_librivox.yaml#L65
         * "activation_dropout"
           - Def
-            https://github.com/pytorch/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/fairseq/models/wav2vec/wav2vec2.py#L69-L71
+            https://github.com/tensorplay/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/fairseq/models/wav2vec/wav2vec2.py#L69-L71
           - Base
-            https://github.com/pytorch/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/examples/wav2vec/config/finetuning/base_960h.yaml#L55
+            https://github.com/tensorplay/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/examples/wav2vec/config/finetuning/base_960h.yaml#L55
           - Large
-            https://github.com/pytorch/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/examples/wav2vec/config/finetuning/vox_960h.yaml#L55
+            https://github.com/tensorplay/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/examples/wav2vec/config/finetuning/vox_960h.yaml#L55
         * "dropout"
           - Def and base
-            https://github.com/pytorch/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/fairseq/models/wav2vec/wav2vec2.py#L63-L65
+            https://github.com/tensorplay/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/fairseq/models/wav2vec/wav2vec2.py#L63-L65
           - Large
-            https://github.com/pytorch/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/examples/wav2vec/config/pretraining/wav2vec2_large_librivox.yaml#L59
+            https://github.com/tensorplay/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/examples/wav2vec/config/pretraining/wav2vec2_large_librivox.yaml#L59
         * "layer_norm_first"
           - Def and base
-            https://github.com/pytorch/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/fairseq/models/wav2vec/wav2vec2.py#L91-L93
+            https://github.com/tensorplay/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/fairseq/models/wav2vec/wav2vec2.py#L91-L93
           - Large
-            https://github.com/pytorch/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/examples/wav2vec/config/pretraining/wav2vec2_large_librivox.yaml#L53
+            https://github.com/tensorplay/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/examples/wav2vec/config/pretraining/wav2vec2_large_librivox.yaml#L53
         * "layerdrop"
           - Def
-            https://github.com/pytorch/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/fairseq/models/wav2vec/wav2vec2.py#L72-L74
+            https://github.com/tensorplay/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/fairseq/models/wav2vec/wav2vec2.py#L72-L74
           - Base
-            https://github.com/pytorch/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/examples/wav2vec/config/finetuning/base_960h.yaml#L54
+            https://github.com/tensorplay/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/examples/wav2vec/config/finetuning/base_960h.yaml#L54
           - Large
-            https://github.com/pytorch/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/examples/wav2vec/config/finetuning/vox_960h.yaml#L54
+            https://github.com/tensorplay/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/examples/wav2vec/config/finetuning/vox_960h.yaml#L54
     """
     feature_projection = FeatureProjection(in_features, embed_dim, dropout_input)
     pos_conv = ConvolutionalPositionalEmbedding(embed_dim, pos_conv_kernel, pos_conv_groups)
@@ -874,9 +874,9 @@ def _compute_mask_indices(
     """
 
     batch_size, frame = shape
-    mask = torch.full((batch_size, frame), False)
+    mask = tensorplay.full((batch_size, frame), False)
     # add a random number for probabilistic rounding
-    all_num_mask = int(mask_prob * frame / float(mask_length) + torch.rand(1))
+    all_num_mask = int(mask_prob * frame / float(mask_length) + tensorplay.rand(1))
 
     all_num_mask = max(min_masks, all_num_mask)
 
@@ -885,22 +885,22 @@ def _compute_mask_indices(
         if padding_mask is not None:
             sz = frame - padding_mask[i].long().sum().item()
             # add a random number for probabilistic rounding
-            num_mask = int(mask_prob * sz / float(mask_length) + torch.rand(1))
+            num_mask = int(mask_prob * sz / float(mask_length) + tensorplay.rand(1))
             num_mask = max(min_masks, num_mask)
         else:
             sz = frame
             num_mask = all_num_mask
 
         if mask_type == "static":
-            lengths = torch.full((num_mask,), mask_length)
+            lengths = tensorplay.full((num_mask,), mask_length)
         elif mask_type == "uniform":
-            lengths = torch.randint(int(mask_other), mask_length * 2 + 1, size=(num_mask,))
+            lengths = tensorplay.randint(int(mask_other), mask_length * 2 + 1, size=(num_mask,))
         elif mask_type == "normal":
-            lengths = torch.normal(mask_length, mask_other, size=(num_mask,))
-            lengths = torch.maximum(torch.ones(1), torch.round(lengths)).int()
+            lengths = tensorplay.normal(mask_length, mask_other, size=(num_mask,))
+            lengths = tensorplay.maximum(tensorplay.ones(1), tensorplay.round(lengths)).int()
         elif mask_type == "poisson":
-            lengths = torch.poisson(mask_length, size=(num_mask,))
-            lengths = torch.round(lengths).int()
+            lengths = tensorplay.poisson(mask_length, size=(num_mask,))
+            lengths = tensorplay.round(lengths).int()
         else:
             raise Exception(f"unknown mask selection: {mask_type}")
 
@@ -911,7 +911,7 @@ def _compute_mask_indices(
             mask_idc = []
 
             def arrange(s, e, length, keep_length):
-                span_start = torch.randint(s, e - length, size=(1,))
+                span_start = tensorplay.randint(s, e - length, size=(1,))
                 mask_idc.extend(span_start + i for i in range(length))
 
                 new_parts = []
@@ -924,32 +924,32 @@ def _compute_mask_indices(
             parts = [(0, sz)]
             min_length = min(lengths)
             for length in sorted(lengths, reverse=True):
-                lens = torch.tensor([e - s for s, e in parts], dtype=torch.int)
+                lens = tensorplay.tensor([e - s for s, e in parts], dtype=tensorplay.int)
                 lens[lens < length + min_space] = 0
                 l_sum = lens.sum()
                 if l_sum == 0:
                     break
                 probs = lens / l_sum
-                c = torch.distributions.categorical.Categorical(probs).sample()
+                c = tensorplay.distributions.categorical.Categorical(probs).sample()
                 s, e = parts.pop(c)
                 parts.extend(arrange(s, e, length, min_length))
-            mask_idc = torch.tensor(mask_idc)
+            mask_idc = tensorplay.tensor(mask_idc)
         else:
             min_len = min(lengths)
             if sz - min_len <= num_mask:
                 min_len = sz - num_mask - 1
 
-            mask_idc = torch.randperm(sz - min_len)[:num_mask]
-            mask_idc = torch.tensor(
+            mask_idc = tensorplay.randperm(sz - min_len)[:num_mask]
+            mask_idc = tensorplay.tensor(
                 [mask_idc[j] + offset for j in range(len(mask_idc)) for offset in range(lengths[j])]
             )
 
-        mask_idcs.append(torch.unique(mask_idc[mask_idc < sz]))
+        mask_idcs.append(tensorplay.unique(mask_idc[mask_idc < sz]))
 
     min_len = min([len(m) for m in mask_idcs])
     for i, mask_idc in enumerate(mask_idcs):
         if len(mask_idc) > min_len:
-            mask_idc = mask_idc[torch.randperm(len(mask_idc))[:min_len].long()]
+            mask_idc = mask_idc[tensorplay.randperm(len(mask_idc))[:min_len].long()]
         mask[i, mask_idc] = True
 
     return mask
@@ -965,7 +965,7 @@ def _get_padding_mask(input: Tensor, lengths: Tensor) -> Tensor:
         (Tensor): The padding mask.
     """
     batch_size, max_len, _ = input.shape
-    mask = torch.arange(max_len, device=lengths.device).expand(batch_size, max_len) >= lengths[:, None]
+    mask = tensorplay.arange(max_len, device=lengths.device).expand(batch_size, max_len) >= lengths[:, None]
     return mask
 
 
@@ -1021,8 +1021,8 @@ class MaskGenerator(Module):
         self.mask_channel_length = mask_channel_length
         self.no_mask_channel_overlap = no_mask_channel_overlap
         self.mask_channel_min_space = mask_channel_min_space
-        self.mask_embedding = Parameter(torch.FloatTensor(encoder_embed_dim))
-        torch.nn.init.uniform_(self.mask_embedding)
+        self.mask_embedding = Parameter(tensorplay.FloatTensor(encoder_embed_dim))
+        tensorplay.nn.init.uniform_(self.mask_embedding)
 
     def forward(self, x: Tensor, padding_mask: Optional[Tensor]) -> Tensor:
         """
@@ -1087,13 +1087,13 @@ def _compute_logits(
         (Tensor): The logits of the inputs.
     """
     logit_temp = 0.1
-    pos = torch.index_select(label_embeddings, 0, target.long())
+    pos = tensorplay.index_select(label_embeddings, 0, target.long())
     negs = label_embeddings.unsqueeze(1).expand(-1, proj_x.size(0), -1)
     neg_is_pos = (pos == negs).all(-1)
     pos = pos.unsqueeze(0)
-    targets = torch.cat([pos, negs], dim=0)
+    targets = tensorplay.cat([pos, negs], dim=0)
 
-    logits = torch.cosine_similarity(proj_x.float(), targets.float(), dim=-1).type_as(proj_x)
+    logits = tensorplay.cosine_similarity(proj_x.float(), targets.float(), dim=-1).type_as(proj_x)
     logits /= logit_temp
     if neg_is_pos.any():
         logits[1:][neg_is_pos] = float("-inf")
@@ -1120,9 +1120,9 @@ class LogitGenerator(Module):
         skip_nomask: bool,
     ):
         super().__init__()
-        self.label_embeddings = Parameter(torch.FloatTensor(num_classes, final_dim))
-        torch.nn.init.uniform_(self.label_embeddings)
-        self.final_proj = torch.nn.Linear(encoder_embed_dim, final_dim)
+        self.label_embeddings = Parameter(tensorplay.FloatTensor(num_classes, final_dim))
+        tensorplay.nn.init.uniform_(self.label_embeddings)
+        self.final_proj = tensorplay.nn.Linear(encoder_embed_dim, final_dim)
         self.skip_masked = skip_masked
         self.skip_nomask = skip_nomask
 
@@ -1155,7 +1155,7 @@ class LogitGenerator(Module):
         return logit_m, logit_u
 
 
-class GradMultiply(torch.autograd.Function):
+class GradMultiply(tensorplay.autograd.Function):
     @staticmethod
     def forward(ctx, x, scale):
         ctx.scale = scale

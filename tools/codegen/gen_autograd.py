@@ -268,6 +268,10 @@ BACKWARD_HELPERS = {
     "conv_transpose3d_grad_weight", "conv_transpose3d_grad_bias",
     "embedding_dense_backward", "permute_backward", "squeeze_backward",
     "_alpha_dropout_backward", "_feature_dropout_backward",
+    "_trapezoid_backward", "_cumulative_trapezoid_backward",
+    "_cov_backward", "_corrcoef_backward",
+    "_scatter_reduce_backward_self", "_scatter_reduce_backward_src",
+    "_index_reduce_backward_self", "_index_reduce_backward_src",
 }
 
 # Tensor-returning methods that the DSL lowers to tpx::ops free functions,
@@ -461,7 +465,7 @@ MANUAL_DERIVATIVES: dict[str, dict] = {
 
 # Ops whose backward node is provided hand-written elsewhere; skip emitting a
 # generated class even though derivatives exist.
-EXTERNAL_NODES = {"scaled_dot_product_attention"}
+EXTERNAL_NODES: set[str] = set()
 
 
 def compute_op_derivatives(func: NativeFunction, raw_formulas: dict[str, str],
@@ -585,9 +589,10 @@ def generate_autograd_nodes(derivatives: dict[str, OpDerivatives]) -> str:
         emitted.add(dv.node_name)
         f = dv.func
         member_names = {m for m, _ in dv.members}
-        # Saved forward tensors (Tensor-typed members) go into SavedVariable
-        # with version checking; scalars/dims stay plain members.
+        # Saved forward tensors (Tensor-typed forward args) go into
+        # SavedVariable with version checking; scalars/dims stay plain.
         tensor_members = {m for m, t in dv.members if t == "Tensor"}
+        member_names = {m for m, _ in dv.members}
         tensor_syms = {a.name for a in f.args if a.type.is_tensor_like}
         # Saved forward outputs referenced by formulas (`result`, named tuple
         # elements) are tensor symbols too.

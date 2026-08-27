@@ -1,6 +1,6 @@
 import tensorplay as tp
 
-from ._utils import zeros_like
+from ._utils import scalar_value, zeros_like
 from .optimizer import (
     Optimizer,
     _default_to_fused_or_foreach,
@@ -204,7 +204,11 @@ def _single_tensor_radam(
             else:
                 grad = grad.add(param, alpha=weight_decay)
 
-        exp_avg.lerp_(grad, 1 - beta1)
+        if differentiable:
+            # mul/add retains the source edge for higher-order grads.
+            exp_avg.mul_(beta1).add_(grad * (1 - beta1))
+        else:
+            exp_avg.lerp_(grad, 1 - beta1)
         exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
         bias_correction1 = 1 - beta1 ** step
         bias_correction2 = 1 - beta2 ** step
@@ -333,11 +337,17 @@ def _multi_tensor_radam(
             tp._foreach_add_(bias_correction2, rho_inf)
             rho_t_list = bias_correction2
         else:
+            # One host transfer for all step counters (avoids per-tensor
+            # CUDA synchronizations).
+            if grouped_state_steps and grouped_state_steps[0].is_cuda:
+                steps_host = tp.stack(grouped_state_steps).tolist()
+            else:
+                steps_host = [_get_value(step) for step in grouped_state_steps]
             rho_t_list = [
                 rho_inf
-                - 2 * _get_value(step) * (beta2 ** _get_value(step))
-                / (1 - beta2 ** _get_value(step))
-                for step in grouped_state_steps
+                - 2 * float(step) * (beta2 ** float(step))
+                / (1 - beta2 ** float(step))
+                for step in steps_host
             ]
 
         if weight_decay != 0:
@@ -455,6 +465,55 @@ def radam(
             "API has changed, `state_steps` argument must contain a list of "
             "singleton tensors"
         )
+
+    native_device = params[0].device.type if params else None
+    native = (
+        not differentiable
+        and not capturable
+        and not has_complex
+        and native_device in ("cpu", "cuda")
+        and bool(params)
+        # The fused reduced-dtype kernel combines several updates that Torch
+        # performs as separate CUDA ops; retain native rounding for fp16/bf16.
+        and params[0].dtype in (tp.float32, tp.float64)
+        and all(
+            p.device.type == native_device
+            and p.is_contiguous()
+            and p.is_floating_point()
+            and p.dtype == params[0].dtype
+            for p in params
+        )
+        and all(
+            g.device.type == native_device
+            and g.is_contiguous()
+            and g.dtype == params[0].dtype
+            for g in grads
+        )
+        and all(
+            step.device.type == "cpu"
+            and step.is_contiguous()
+            and step.numel() == 1
+            and step.dtype in (tp.float32, tp.float64)
+            for step in state_steps
+        )
+    )
+    if native:
+        tp._fused_radam_(
+            params,
+            grads,
+            exp_avgs,
+            exp_avg_sqs,
+            state_steps,
+            lr=scalar_value(lr, "lr"),
+            beta1=beta1,
+            beta2=beta2,
+            eps=eps,
+            weight_decay=weight_decay,
+            decoupled_weight_decay=decoupled_weight_decay,
+            maximize=maximize,
+        )
+        return
+
     if foreach is None:
         _, foreach = _default_to_fused_or_foreach(
             params, differentiable, use_fused=False

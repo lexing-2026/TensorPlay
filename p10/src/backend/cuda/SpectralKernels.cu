@@ -263,6 +263,19 @@ __global__ void scale_c_kernel(C* data, int64_t total, S scale) {
     }
 }
 
+// Project interleaved complex data to its real part.
+__global__ void cplx_real_f64_kernel(const cufftDoubleComplex* __restrict__ src,
+                                     double* __restrict__ dst, int64_t total) {
+    const int64_t i = blockIdx.x * int64_t(blockDim.x) + threadIdx.x;
+    if (i < total) dst[i] = src[i].x;
+}
+
+__global__ void cplx_real_f32_kernel(const cufftComplex* __restrict__ src,
+                                     float* __restrict__ dst, int64_t total) {
+    const int64_t i = blockIdx.x * int64_t(blockDim.x) + threadIdx.x;
+    if (i < total) dst[i] = src[i].x;
+}
+
 template <typename T>
 __global__ void fill_r_kernel(T* data, int64_t n, T value) {
     const int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -278,11 +291,16 @@ __global__ void window_fill_kernel(T* w, int64_t n, int64_t L,
     constexpr double kPi = 3.141592653589793238463;
     double v;
     if (kind == 2) {  // bartlett
-        const int64_t first_half = ((L - 1) >> 1) + 1;
-        const double x = (2.0 * i) / double(L - 1);
-        v = i >= first_half ? 2.0 - x : x;
+        const double num = 2.0 * static_cast<double>(i);
+        if (num < static_cast<double>(L)) {
+            v = num / static_cast<double>(L);
+        } else if (num > static_cast<double>(L)) {
+            v = 2.0 - num / static_cast<double>(L);
+        } else {
+            v = 1.0;
+        }
     } else if (kind == 3) {  // blackman
-        const double a = kPi * i / double(L - 1);
+        const double a = kPi * i / static_cast<double>(L);
         v = 0.42 + 0.5 * std::cos(2 * a) - 0.08 * std::cos(4 * a);
     } else {          // hann (alpha=beta=0.5) / hamming
         v = alpha - beta * std::cos(2.0 * kPi * i / L);
@@ -519,34 +537,108 @@ Tensor finish_layout(Tensor&& t, const std::vector<int64_t>& inv_perm) {
 
 }  // namespace
 
+namespace {
+
+// ATen parity: torch.fft.fft/ifft accept real input — materialize a
+// zero-imaginary complex copy (SpectralOps.cpp fft_r2c "fft"/"ifft" path).
+template <bool IsDouble>
+__global__ void real_to_cplx_kernel(
+    int64_t n, const typename CudaTypes<IsDouble>::R* __restrict__ src,
+    typename CudaTypes<IsDouble>::C* __restrict__ dst) {
+    const int64_t i = blockIdx.x * int64_t(blockDim.x) + threadIdx.x;
+    if (i >= n) return;
+    dst[i].x = src[i];
+    dst[i].y = typename CudaTypes<IsDouble>::R(0);
+}
+
+template <bool IsDouble>
+Tensor promote_real_for_c2c_cuda(const Tensor& self) {
+    TP_CHECK(self.dtype() == DType::Float32 || self.dtype() == DType::Float64,
+             "Unsupported input dtype for spectral op");
+    Tensor x = self.contiguous();
+    Tensor out(sizes_of(x), complex_dtype_of(x.dtype()));
+    auto stream = getCurrentCUDAStream().stream();
+    const int64_t n = x.numel();
+    if constexpr (IsDouble) {
+        real_to_cplx_kernel<true><<<(n + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+            n, static_cast<const double*>(x.data_ptr()),
+            reinterpret_cast<cufftDoubleComplex*>(out.data_ptr()));
+    } else {
+        real_to_cplx_kernel<false><<<(n + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+            n, static_cast<const float*>(x.data_ptr()),
+            reinterpret_cast<cufftComplex*>(out.data_ptr()));
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return out;
+}
+
+// Adjoint of the real->complex materialization: take the real part.
+template <bool IsDouble>
+__global__ void cplx_real_part_kernel(
+    int64_t n, const typename CudaTypes<IsDouble>::C* __restrict__ src,
+    typename CudaTypes<IsDouble>::R* __restrict__ dst) {
+    const int64_t i = blockIdx.x * int64_t(blockDim.x) + threadIdx.x;
+    if (i >= n) return;
+    dst[i] = src[i].x;
+}
+
+template <bool IsDouble>
+Tensor extract_real_part_cuda(const Tensor& z) {
+    Tensor zc = z.contiguous();
+    Tensor out(sizes_of(zc), real_dtype_of(zc.dtype()));
+    auto stream = getCurrentCUDAStream().stream();
+    const int64_t n = zc.numel();
+    if constexpr (IsDouble) {
+        cplx_real_part_kernel<true><<<(n + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+            n, reinterpret_cast<const cufftDoubleComplex*>(zc.data_ptr()),
+            static_cast<double*>(out.data_ptr()));
+    } else {
+        cplx_real_part_kernel<false><<<(n + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+            n, reinterpret_cast<const cufftComplex*>(zc.data_ptr()),
+            static_cast<float*>(out.data_ptr()));
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return out;
+}
+
+}  // namespace
+
 // ATen: aten/src/ATen/native/SpectralOps.cpp fft_c2c (fft/ifft public API)
 Tensor fft_fft_cuda(const Tensor& self, int64_t n, int64_t dim, std::string norm) {
-    TP_CHECK(is_cplx(self.dtype()), "torch.fft.fft expects a complex input");
-    TP_CHECK(self.dim() >= 1, "fft expects at least 1 dimension");
-    dim = wrap_dim(dim, self.dim());
-    auto [x, inv] = prepare_lastdim(self, dim);
+    const bool real_in = !is_cplx(self.dtype());
+    Tensor inp = real_in
+        ? (self.dtype() == DType::Float64 ? promote_real_for_c2c_cuda<true>(self)
+                                          : promote_real_for_c2c_cuda<false>(self))
+        : self;
+    TP_CHECK(inp.dim() >= 1, "fft expects at least 1 dimension");
+    dim = wrap_dim(dim, inp.dim());
+    auto [x, inv] = prepare_lastdim(inp, dim);
     const int64_t N = x.size(-1);
     const int64_t n_eff = n > 0 ? n : N;
     TP_CHECK(n_eff >= 1, "Invalid number of data points specified");
     if (n > 0 && n != N) x = resize_last_dim<float>(x, n_eff);  // elem-size agnostic copy
     const auto mode = norm_from_string(norm, true);
-    Tensor out = self.dtype() == DType::ComplexDouble
+    Tensor out = inp.dtype() == DType::ComplexDouble
         ? core_c2c_impl<true>(x, n_eff, mode, true)
         : core_c2c_impl<false>(x, n_eff, mode, true);
     return finish_layout(std::move(out), inv);
 }
 
 Tensor fft_ifft_cuda(const Tensor& self, int64_t n, int64_t dim, std::string norm) {
-    TP_CHECK(is_cplx(self.dtype()), "torch.fft.ifft expects a complex input");
-    TP_CHECK(self.dim() >= 1, "ifft expects at least 1 dimension");
-    dim = wrap_dim(dim, self.dim());
-    auto [x, inv] = prepare_lastdim(self, dim);
+    const bool real_in = !is_cplx(self.dtype());
+    Tensor inp = real_in
+        ? (self.dtype() == DType::Float64 ? promote_real_for_c2c_cuda<true>(self)
+                                          : promote_real_for_c2c_cuda<false>(self))
+        : self;
+    TP_CHECK(inp.dim() >= 1, "ifft expects at least 1 dimension");
+    dim = wrap_dim(dim, inp.dim());
+    auto [x, inv] = prepare_lastdim(inp, dim);
     const int64_t N = x.size(-1);
     const int64_t n_eff = n > 0 ? n : N;
     TP_CHECK(n_eff >= 1, "Invalid number of data points specified");
     if (n > 0 && n != N) x = resize_last_dim<float>(x, n_eff);
     const auto mode = norm_from_string(norm, false);
-    Tensor out = self.dtype() == DType::ComplexDouble
+    Tensor out = inp.dtype() == DType::ComplexDouble
         ? core_c2c_impl<true>(x, n_eff, mode, false)
         : core_c2c_impl<false>(x, n_eff, mode, false);
     return finish_layout(std::move(out), inv);
@@ -596,6 +688,7 @@ Tensor fft_irfft_cuda(const Tensor& self, int64_t n, int64_t dim, std::string no
 
 Tensor fft_fft_backward_cuda(const Tensor& grad, const Tensor& self, int64_t dim, std::string norm) {
     dim = wrap_dim(dim, self.dim());
+    const bool real_primal = !is_cplx(self.dtype());
     auto [g, inv] = prepare_lastdim(grad, dim);
     const int64_t input_len = self.size(dim);
     const auto mode = norm_from_string(norm, true);  // forward was fft
@@ -603,11 +696,17 @@ Tensor fft_fft_backward_cuda(const Tensor& grad, const Tensor& self, int64_t dim
         ? core_c2c_impl<true>(g, g.size(-1), mode, /*forward=*/false)
         : core_c2c_impl<false>(g, g.size(-1), mode, false);
     out = resize_last_dim<float>(out, input_len);
-    return finish_layout(std::move(out), inv);
+    out = finish_layout(std::move(out), inv);
+    // adjoint of the real->complex materialization is taking the real part
+    return real_primal
+        ? (out.dtype() == DType::ComplexDouble ? extract_real_part_cuda<true>(out)
+                                               : extract_real_part_cuda<false>(out))
+        : std::move(out);
 }
 
 Tensor fft_ifft_backward_cuda(const Tensor& grad, const Tensor& self, int64_t dim, std::string norm) {
     dim = wrap_dim(dim, self.dim());
+    const bool real_primal = !is_cplx(self.dtype());
     auto [g, inv] = prepare_lastdim(grad, dim);
     const int64_t input_len = self.size(dim);
     const auto mode = norm_from_string(norm, false);  // forward was ifft
@@ -615,45 +714,60 @@ Tensor fft_ifft_backward_cuda(const Tensor& grad, const Tensor& self, int64_t di
         ? core_c2c_impl<true>(g, g.size(-1), mode, /*forward=*/true)
         : core_c2c_impl<false>(g, g.size(-1), mode, true);
     out = resize_last_dim<float>(out, input_len);
-    return finish_layout(std::move(out), inv);
+    out = finish_layout(std::move(out), inv);
+    return real_primal
+        ? (out.dtype() == DType::ComplexDouble ? extract_real_part_cuda<true>(out)
+                                               : extract_real_part_cuda<false>(out))
+        : std::move(out);
 }
 
-// rfft adjoint — ATen fft_r2c_backward (SpectralOpsUtils.h conjugate-symmetry
-// note): conj-fill + unscaled inverse + real projection == batched C2R.
+// ATen fft_r2c_backward (torch/csrc/autograd/FunctionsManual.cpp :5135):
+// onesided r2c == [zero-fill imag, c2c fwd, drop half]; backward ==
+// [zero-fill twosided spectrum, INVERSE c2c with the forward's normalization,
+// take real part].
+namespace {
+template <bool IsDouble>
+Tensor rfft_backward_core_cuda(const Tensor& g, int64_t input_len, fft_norm_mode mode) {
+    const int64_t bins = g.size(-1);
+    std::vector<int64_t> sizes = sizes_of(g);
+    sizes.back() = input_len;
+    Tensor full = Tensor::zeros(sizes, g.dtype(), g.device());
+    if (bins < input_len) full.slice(-1, 0, bins).copy_(g);
+    else full.copy_(g);
+    Tensor t = g.dtype() == DType::ComplexDouble
+        ? core_c2c_impl<true>(full, input_len, mode, /*forward=*/false)
+        : core_c2c_impl<false>(full, input_len, mode, /*forward=*/false);
+    return extract_real_part_cuda<IsDouble>(t);
+}
+}  // namespace
+
 Tensor fft_rfft_backward_cuda(const Tensor& grad, const Tensor& self, int64_t dim, std::string norm) {
     dim = wrap_dim(dim, self.dim());
     auto [g, inv] = prepare_lastdim(grad, dim);
     const int64_t input_len = self.size(dim);
     const auto mode = norm_from_string(norm, true);
     Tensor out = g.dtype() == DType::ComplexDouble
-        ? core_c2r_impl<true>(g, input_len, mode)
-        : core_c2r_impl<false>(g, input_len, mode);
+        ? rfft_backward_core_cuda<true>(g, input_len, mode)
+        : rfft_backward_core_cuda<false>(g, input_len, mode);
     return finish_layout(std::move(out), inv);
 }
 
-// irfft adjoint — ATen fft_c2r_backward: unscaled forward R2C of the real
-// gradient scaled by the primal inverse factor, sliced to the bin count.
+// irfft adjoint — ATen fft_c2r_backward (FunctionsManual.cpp :5095): forward
+// R2C of the real gradient with the primal normalization, then double the bins
+// whose conjugate mirror fell outside the onesided range.
 namespace {
 template <bool IsDouble>
 Tensor irfft_backward_core(const Tensor& g, int64_t freq_bins, fft_norm_mode mode) {
-    using R = typename CudaTypes<IsDouble>::R;
-    const LineInfo li = last_dim_lines(sizes_of(g));
     const int64_t M = g.size(-1);
-    const R s_inv = norm_factor<R>(mode, M);
-    Tensor spec = core_r2c_impl<IsDouble>(g, M, fft_norm_mode::none);
-    if (s_inv != R(1)) {
-        auto stream = getCurrentCUDAStream().stream();
-        const int64_t total = spec.numel();
-        if constexpr (IsDouble) {
-            scale_c_kernel<cufftDoubleComplex, double><<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                reinterpret_cast<cufftDoubleComplex*>(spec.data_ptr()), total, s_inv);
-        } else {
-            scale_c_kernel<cufftComplex, float><<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                reinterpret_cast<cufftComplex*>(spec.data_ptr()), total, s_inv);
-        }
-        CUDA_CHECK(cudaGetLastError());
+    Tensor spec = core_r2c_impl<IsDouble>(g, M, mode);
+    const int64_t got_bins = spec.size(-1);
+    const int64_t double_length = M - got_bins;
+    if (double_length > 0) {
+        Tensor scaled = spec.slice(-1, 1, 1 + double_length).mul(Scalar(2.0));
+        spec.slice(-1, 1, 1 + double_length).copy_(scaled);
     }
-    return resize_last_dim<float>(spec, freq_bins);
+    if (got_bins != freq_bins) spec = resize_last_dim<float>(spec, freq_bins);
+    return spec;
 }
 }  // namespace
 
@@ -680,6 +794,7 @@ Tensor window_cuda(int64_t out_len, int64_t formula_len, std::optional<DType> dt
     // kind: 0=hann 1=hamming 2=bartlett 3=blackman
     if (out_len < 0) TP_THROW(ValueError, name, ": window_length must be non-negative");
     DType dt = dtype_opt.value_or(DType::Float32);
+    if (dt == DType::Undefined) dt = DType::Float32;
     if (dt != DType::Float32 && dt != DType::Float64)
         TP_THROW(NotImplementedError, name, ": only float32/float64 windows are supported");
     Tensor w({std::max<int64_t>(out_len, 0)}, dt);
@@ -698,23 +813,28 @@ Tensor window_cuda(int64_t out_len, int64_t formula_len, std::optional<DType> dt
 }
 }  // namespace
 
+// ATen denominator semantics: periodic -> N, symmetric -> N - 1.
+inline int64_t window_denominator_cuda(int64_t window_length, bool periodic) {
+    return window_length - (periodic ? 0 : 1);
+}
+
 Tensor hann_window_cuda(int64_t window_length, bool periodic, std::optional<DType> dtype) {
-    const int64_t L = window_length + ((periodic && window_length > 1) ? 1 : 0);
+    const int64_t L = window_denominator_cuda(window_length, periodic);
     return window_cuda(window_length, L, dtype, "hann_window", 0.5, 0.5, 0);
 }
 
 Tensor hamming_window_cuda(int64_t window_length, bool periodic, double alpha, double beta, std::optional<DType> dtype) {
-    const int64_t L = window_length + ((periodic && window_length > 1) ? 1 : 0);
+    const int64_t L = window_denominator_cuda(window_length, periodic);
     return window_cuda(window_length, L, dtype, "hamming_window", alpha, beta, 1);
 }
 
 Tensor bartlett_window_cuda(int64_t window_length, bool periodic, std::optional<DType> dtype) {
-    const int64_t L = window_length + ((periodic && window_length > 1) ? 1 : 0);
+    const int64_t L = window_denominator_cuda(window_length, periodic);
     return window_cuda(window_length, L, dtype, "bartlett_window", 0.0, 0.0, 2);
 }
 
 Tensor blackman_window_cuda(int64_t window_length, bool periodic, std::optional<DType> dtype) {
-    const int64_t L = window_length + ((periodic && window_length > 1) ? 1 : 0);
+    const int64_t L = window_denominator_cuda(window_length, periodic);
     return window_cuda(window_length, L, dtype, "blackman_window", 0.0, 0.0, 3);
 }
 
@@ -978,14 +1098,15 @@ Tensor istft_cuda_impl(const Tensor& input, int64_t n_fft, int64_t hop, int64_t 
     using R = typename CudaTypes<IsDouble>::R;
     using C = typename CudaTypes<IsDouble>::C;
     std::vector<int64_t> isizes = sizes_of(input);
-    TP_CHECK(isizes.size() == 3 || isizes.size() == 4,
-             "istft: expected a tensor with 3 or 4 dimensions");
+    // ATen checks the real view (3 or 4 dims); on the complex tensor this is
+    // 2D (freq, frames) -> (len,) or 3D (batch, freq, frames) -> (B, len).
+    TP_CHECK(isizes.size() == 2 || isizes.size() == 3,
+             "istft: expected a complex tensor with 2 or 3 dimensions");
     const int64_t frames_dim_pos = isizes.size() - 1;
     const int64_t frames = isizes[frames_dim_pos];
     const int64_t fft_size = isizes[frames_dim_pos - 1];
-    // ATen supports only last-two-dims spec layouts here; batch leading
-    const bool was_3d = isizes.size() == 3;
-    const int64_t batch = was_3d ? 1 : isizes[0];
+    const bool was_2d = isizes.size() == 2;
+    const int64_t batch = was_2d ? 1 : isizes[0];
     const int64_t expected_len = n_fft + hop * (frames - 1);
 
     // ATen: window_tmp = window or ones(win_length); center-pad into n_fft.
@@ -1064,7 +1185,7 @@ Tensor istft_cuda_impl(const Tensor& input, int64_t n_fft, int64_t hop, int64_t 
     const int64_t out_len = end - start;
 
     std::vector<int64_t> out_sizes =
-        was_3d ? std::vector<int64_t>{out_len} : std::vector<int64_t>{batch, out_len};
+        was_2d ? std::vector<int64_t>{out_len} : std::vector<int64_t>{batch, out_len};
     Tensor out(out_sizes, real_dtype_of(input.dtype()));
     {
         auto stream = getCurrentCUDAStream().stream();
@@ -1223,8 +1344,30 @@ Tensor stft_backward_cuda_impl(const Tensor& grad_output, const Tensor& self, in
         CUDA_CHECK(cudaGetLastError());
     }
 
-    Tensor tf = core_c2r_impl<IsDouble>(cols, n_fft, mode);
-
+    // ATen composes the spectral adjoint via fft_r2c_backward: zero-fill the
+    // twosided spectrum from the onesided grad, run the INVERSE c2c carrying
+    // the forward's normalization, then project to the real part.
+    Tensor full = Tensor::zeros(std::vector<int64_t>{batch * frames, n_fft},
+                                complex_dtype_of(self.dtype()), self.device());
+    if (n_freq < n_fft) full.slice(-1, 0, n_freq).copy_(cols);
+    else full.copy_(cols);
+    Tensor ctime = core_c2c_impl<IsDouble>(full, n_fft, mode, /*forward=*/false);
+    Tensor tf = Tensor::empty(std::vector<int64_t>{batch * frames, n_fft},
+                              self.dtype(), self.device());
+    {
+        auto stream = getCurrentCUDAStream().stream();
+        const int64_t total = ctime.numel();
+        if constexpr (IsDouble) {
+            cplx_real_f64_kernel<<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+                reinterpret_cast<const cufftDoubleComplex*>(ctime.data_ptr()),
+                static_cast<double*>(tf.data_ptr()), total);
+        } else {
+            cplx_real_f32_kernel<<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+                reinterpret_cast<const cufftComplex*>(ctime.data_ptr()),
+                static_cast<float*>(tf.data_ptr()), total);
+        }
+        CUDA_CHECK(cudaGetLastError());
+    }
     const int64_t orig_len = self.size(-1);
     const int64_t padded_len = orig_len + (center ? (n_fft / 2) * 2 : 0);
     Tensor xg = Tensor::zeros(std::vector<int64_t>{batch * padded_len}, self.dtype(),

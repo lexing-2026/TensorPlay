@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstddef>
 #include <memory>
+#include <execinfo.h>
 #include <mutex>
 #include <string>
 #include <type_traits>
@@ -131,6 +132,13 @@ public:
         }
         auto kernel_void = handle.getKernel(key);
         if (!kernel_void) {
+            if (getenv("TP_TRACE_KERNEL_MISS") != nullptr) {
+                fprintf(stderr, "[kernel-miss] op=%s key=%d\n",
+                        handle.name(), static_cast<int>(key));
+                void* bt[32];
+                int n = backtrace(bt, 32);
+                backtrace_symbols_fd(bt, n, 2);
+            }
             TP_THROW(NotImplementedError, "Kernel not found for op: " +
                 std::string(handle.name()) + " on backend: " + toString(key));
         }

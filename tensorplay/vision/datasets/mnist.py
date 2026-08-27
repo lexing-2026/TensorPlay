@@ -12,7 +12,7 @@ from typing import Any, Callable, Optional, Union
 from urllib.error import URLError
 
 import numpy as np
-import tensorplay as torch
+import tensorplay as tensorplay
 
 from ..utils import _Image_fromarray
 from .utils import _flip_byte_order, check_integrity, download_and_extract_archive, extract_archive, verify_str_arg
@@ -119,7 +119,7 @@ class MNIST(VisionDataset):
         # This is for BC only. We no longer cache the data in a custom binary, but simply read from the raw data
         # directly.
         data_file = self.training_file if self.train else self.test_file
-        return torch.load(os.path.join(self.processed_folder, data_file), weights_only=True)
+        return tensorplay.load(os.path.join(self.processed_folder, data_file), weights_only=True)
 
     def _load_data(self):
         image_file = f"{'train' if self.train else 't10k'}-images-idx3-ubyte"
@@ -358,7 +358,7 @@ class QMNIST(MNIST):
             according to the compatibility argument 'train'.
         compat (bool,optional): A boolean that says whether the target
             for each example is class number (for compatibility with
-            the MNIST dataloader) or a torch vector containing the
+            the MNIST dataloader) or a tensorplay vector containing the
             full qmnist information. Default=True.
         train (bool,optional,compatibility): When argument 'what' is
             not specified, this boolean decides whether to load the
@@ -446,8 +446,8 @@ class QMNIST(MNIST):
 
     def _load_data(self):
         data = read_sn3_pascalvincent_tensor(self.images_file)
-        if data.dtype != torch.uint8:
-            raise TypeError(f"data should be of dtype torch.uint8 instead of {data.dtype}")
+        if data.dtype != tensorplay.uint8:
+            raise TypeError(f"data should be of dtype tensorplay.uint8 instead of {data.dtype}")
         if data.ndimension() != 3:
             raise ValueError("data should have 3 dimensions instead of {data.ndimension()}")
 
@@ -498,16 +498,16 @@ def get_int(b: bytes) -> int:
 
 
 SN3_PASCALVINCENT_TYPEMAP = {
-    8: torch.uint8,
-    9: torch.int8,
-    11: torch.int16,
-    12: torch.int32,
-    13: torch.float32,
-    14: torch.float64,
+    8: tensorplay.uint8,
+    9: tensorplay.int8,
+    11: tensorplay.int16,
+    12: tensorplay.int32,
+    13: tensorplay.float32,
+    14: tensorplay.float64,
 }
 
 
-def read_sn3_pascalvincent_tensor(path: str, strict: bool = True) -> torch.Tensor:
+def read_sn3_pascalvincent_tensor(path: str, strict: bool = True) -> tensorplay.Tensor:
     """Read a SN3 file in "Pascal Vincent" format (Lush file 'libidx/idx-io.lsh').
     Argument may be a filename, compressed filename, or file object.
     """
@@ -533,7 +533,7 @@ def read_sn3_pascalvincent_tensor(path: str, strict: bool = True) -> torch.Tenso
         for i in range(len(s)):
             s[i] = int.from_bytes(s[i].to_bytes(4, byteorder="little"), byteorder="big", signed=False)
 
-    parsed = torch.frombuffer(bytearray(data), dtype=torch_type, offset=(4 * (nd + 1)))
+    parsed = tensorplay.frombuffer(bytearray(data), dtype=torch_type, offset=(4 * (nd + 1)))
 
     # The MNIST format uses the big endian byte order, while `torch.frombuffer` uses whatever the system uses. In case
     # that is little endian and the dtype has more than one byte, we need to flip them.
@@ -544,19 +544,19 @@ def read_sn3_pascalvincent_tensor(path: str, strict: bool = True) -> torch.Tenso
     return parsed.view(*s)
 
 
-def read_label_file(path: str) -> torch.Tensor:
+def read_label_file(path: str) -> tensorplay.Tensor:
     x = read_sn3_pascalvincent_tensor(path, strict=False)
-    if x.dtype != torch.uint8:
-        raise TypeError(f"x should be of dtype torch.uint8 instead of {x.dtype}")
+    if x.dtype != tensorplay.uint8:
+        raise TypeError(f"x should be of dtype tensorplay.uint8 instead of {x.dtype}")
     if x.ndimension() != 1:
         raise ValueError(f"x should have 1 dimension instead of {x.ndimension()}")
     return x.long()
 
 
-def read_image_file(path: str) -> torch.Tensor:
+def read_image_file(path: str) -> tensorplay.Tensor:
     x = read_sn3_pascalvincent_tensor(path, strict=False)
-    if x.dtype != torch.uint8:
-        raise TypeError(f"x should be of dtype torch.uint8 instead of {x.dtype}")
+    if x.dtype != tensorplay.uint8:
+        raise TypeError(f"x should be of dtype tensorplay.uint8 instead of {x.dtype}")
     if x.ndimension() != 3:
         raise ValueError(f"x should have 3 dimension instead of {x.ndimension()}")
     return x

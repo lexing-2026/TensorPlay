@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Optional, Union
 
-import tensorplay as torch
+import tensorplay as tensorplay
 
 from .folder import ImageFolder
 from .utils import check_integrity, extract_archive, verify_str_arg
@@ -34,13 +34,13 @@ class ImageNet(ImageFolder):
     Args:
         root (str or ``pathlib.Path``): Root directory of the ImageNet Dataset.
         split (string, optional): The dataset split, supports ``train``, or ``val``.
-        transform (callable, optional): A function/transform that takes in a PIL image or torch.Tensor, depends on the given loader,
+        transform (callable, optional): A function/transform that takes in a PIL image or tensorplay.Tensor, depends on the given loader,
             and returns a transformed version. E.g, ``transforms.RandomCrop``
         target_transform (callable, optional): A function/transform that takes in the
             target and transforms it.
         loader (callable, optional): A function to load an image given its path.
             By default, it uses PIL as its image loader, but users could also pass in
-            ``torchvision.io.decode_image`` for decoding image data into tensors directly.
+            ``tensorplay.vision.io.decode_image`` for decoding image data into tensors directly.
 
      Attributes:
         classes (list): List of the class name tuples.
@@ -90,7 +90,7 @@ def load_meta_file(root: Union[str, Path], file: Optional[str] = None) -> tuple[
     file = os.path.join(root, file)
 
     if check_integrity(file):
-        return torch.load(file, weights_only=True)
+        return tensorplay.load(file, weights_only=True)
     else:
         msg = (
             "The meta file {} is not present in the root directory or is corrupted. "
@@ -159,7 +159,7 @@ def parse_devkit_archive(root: Union[str, Path], file: Optional[str] = None) -> 
         val_idcs = parse_val_groundtruth_txt(devkit_root)
         val_wnids = [idx_to_wnid[idx] for idx in val_idcs]
 
-        torch.save((wnid_to_classes, val_wnids), os.path.join(root, META_FILE))
+        tensorplay.save((wnid_to_classes, val_wnids), os.path.join(root, META_FILE))
 
 
 def parse_train_archive(root: Union[str, Path], file: Optional[str] = None, folder: str = "train") -> None:

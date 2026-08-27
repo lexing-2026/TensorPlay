@@ -287,6 +287,20 @@ void init_device(py::module_& m) {
 #endif
     }, "device"_a = -1);
 
+    cuda.def("memory_stats", [](int device) -> py::dict {
+        py::dict out;
+#ifdef USE_CUDA
+        for (const auto& [key, value] :
+             tensorplay::cuda::memory_stats(device)) {
+            out[key.c_str()] = py::cast(value);
+        }
+#endif
+        return out;
+    }, "device"_a = -1,
+       "Fragmentation-aware allocator accounting (allocated/reserved/peaks, "
+       "segment and free-block counts, largest free block, pending bytes, "
+       "graph pools)");
+
     cuda.def("reset_max_memory_allocated", [](int device) {
 #ifdef USE_CUDA
         tensorplay::cuda::reset_max_memory_allocated(device);

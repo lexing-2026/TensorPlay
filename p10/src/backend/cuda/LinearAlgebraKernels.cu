@@ -70,10 +70,14 @@ Tensor expand_gemm_input_cuda(const Tensor& input, const std::vector<int64_t>& t
         if (src[k] != 1 && src[k] != target[k]) {
             std::string tgt = "[";
             std::string own = "[";
+            const auto own_sizes = static_cast<std::vector<int64_t>>(input.shape());
             for (int64_t d = 0; d < td; ++d) {
-                if (d) { tgt += ", "; own += ", "; }
+                if (d) { tgt += ", "; }
                 tgt += std::to_string(target[d]);
-                own += std::to_string(src[d]);
+            }
+            for (size_t d = 0; d < own_sizes.size(); ++d) {
+                if (d) { own += ", "; }
+                own += std::to_string(own_sizes[d]);
             }
             tgt += "]";
             own += "]";
@@ -100,7 +104,7 @@ Tensor mm_kernel_cuda(const Tensor& self, const Tensor& other) {
                  "x", self.size(1), " and ", other.size(0), "x", other.size(1), ")");
     }
     if (self.dtype() != other.dtype()) {
-        TP_THROW(RuntimeError, "expected m1 and m2 to have the same dtype, but got: ",
+        TP_THROW(RuntimeError, "expected mat1 and mat2 to have the same dtype, but got: ",
                  c10_style_dtype_name(self.dtype()), " != ", c10_style_dtype_name(other.dtype()));
     }
     const DType result_dtype = self.dtype();
@@ -188,10 +192,11 @@ Tensor materialize_batched_cuda(
         input.dim() != static_cast<int64_t>(output_batch_shape.size()) + 2) {
         normalized = input.expand(target_shape);
     }
-    // cublasGemmStridedBatchedEx requires regular strides.  This clone also
+    // cublasGemmStridedBatchedEx requires regular strides.  contiguous()
     // materializes zero-stride broadcast dimensions and arbitrary matrix
-    // views in one pass.
-    if (!normalized.is_contiguous()) normalized = normalized.clone();
+    // views in one pass (clone() would preserve non-overlapping-and-dense
+    // strides such as transposed views, which cublas cannot consume).
+    if (!normalized.is_contiguous()) normalized = normalized.contiguous();
     return normalized.reshape({batch_size, rows, cols});
 }
 
@@ -342,7 +347,7 @@ Tensor matmul_kernel_cuda(const Tensor& self, const Tensor& other) {
             TP_THROW(RuntimeError, "inconsistent tensor size, expected tensor [", self.size(0),
                      "] and src [", other.size(0),
                      "] to have the same number of elements, but got ", self.size(0), " and ",
-                     other.size(0), " elements respective");
+                     other.size(0), " elements respectively");
         }
     } else if (dim1 == 1) {
         const int64_t k = self.size(0);
@@ -381,7 +386,7 @@ Tensor matmul_kernel_cuda(const Tensor& self, const Tensor& other) {
     }
 
     if (self.dtype() != other.dtype()) {
-        TP_THROW(RuntimeError, "expected m1 and m2 to have the same dtype, but got: ",
+        TP_THROW(RuntimeError, "expected mat1 and mat2 to have the same dtype, but got: ",
                  c10_style_dtype_name(self.dtype()), " != ", c10_style_dtype_name(other.dtype()));
     }
     const Tensor& self_p = self;
@@ -797,7 +802,7 @@ Tensor dot_kernel_cuda(const Tensor& self, const Tensor& other) {
         TP_THROW(RuntimeError, "inconsistent tensor size, expected tensor [", self.size(0),
                  "] and src [", other.size(0),
                  "] to have the same number of elements, but got ", self.size(0), " and ",
-                 other.size(0), " elements respective");
+                 other.size(0), " elements respectively");
     }
     if (self.dtype() != other.dtype()) {
         TP_THROW(RuntimeError, "dot : expected both vectors to have same dtype, but found ",
@@ -893,7 +898,7 @@ Tensor inner_backward_self_kernel_cuda(const Tensor& grad_output, const Tensor& 
     // dA2 = grad2 @ B2 -- exactly matmul_backward_self on the flattened pair.
     Tensor grad2 = grad_output.reshape({prod_a, prod_b});
     Tensor other2 = other.reshape({-1, n});
-    Tensor da2 = matmul_kernel_cuda(grad2, transpose_last_two_view_cuda(other2));
+    Tensor da2 = matmul_kernel_cuda(grad2, other2);
     Tensor grad = sum_to_shape_cuda(da2, static_cast<std::vector<int64_t>>(self.shape()));
     return grad.reshape(static_cast<std::vector<int64_t>>(self.shape()));
 }

@@ -2,9 +2,9 @@ import os
 from pathlib import Path
 from typing import List, Tuple, Union
 
-import tensorplay as torch
-from torch.utils.data import Dataset
-from torchaudio.datasets.utils import _load_waveform
+import tensorplay as tensorplay
+from tensorplay.utils.data import Dataset
+from tensorplay.audio.datasets.utils import _load_waveform
 
 _TASKS_TO_MIXTURE = {
     "sep_clean": "mix_clean",
@@ -76,7 +76,7 @@ class LibriMix(Dataset):
         self.files = [p.name for p in self.mix_dir.glob("*.wav")]
         self.files.sort()
 
-    def _load_sample(self, key) -> Tuple[int, torch.Tensor, List[torch.Tensor]]:
+    def _load_sample(self, key) -> Tuple[int, tensorplay.Tensor, List[tensorplay.Tensor]]:
         metadata = self.get_metadata(key)
         mixed = _load_waveform(self.root, metadata[1], metadata[0])
         srcs = []
@@ -114,7 +114,7 @@ class LibriMix(Dataset):
     def __len__(self) -> int:
         return len(self.files)
 
-    def __getitem__(self, key: int) -> Tuple[int, torch.Tensor, List[torch.Tensor]]:
+    def __getitem__(self, key: int) -> Tuple[int, tensorplay.Tensor, List[tensorplay.Tensor]]:
         """Load the n-th sample from the dataset.
 
         Args:
