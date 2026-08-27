@@ -41,6 +41,10 @@ public:
     
     // Validity
     bool defined() const { return impl_ != nullptr; }
+
+    // Identity: true when both storages wrap the same StorageImpl (a view
+    // always shares its base's StorageImpl).
+    bool is_same(const Storage& other) const { return impl_ == other.impl_; }
     
     // Resize (only if resizable)
     void set_nbytes(size_t new_nbytes) {

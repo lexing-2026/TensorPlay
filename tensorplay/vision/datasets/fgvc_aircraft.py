@@ -31,7 +31,7 @@ class FGVCAircraft(VisionDataset):
             ``trainval`` and ``test``.
         annotation_level (str, optional): The annotation level, supports ``variant``,
             ``family`` and ``manufacturer``.
-        transform (callable, optional): A function/transform that takes in a PIL image or torch.Tensor, depends on the given loader,
+        transform (callable, optional): A function/transform that takes in a PIL image or tensorplay.Tensor, depends on the given loader,
             and returns a transformed version. E.g, ``transforms.RandomCrop``
         target_transform (callable, optional): A function/transform that takes in the
             target and transforms it.
@@ -40,7 +40,7 @@ class FGVCAircraft(VisionDataset):
             downloaded again.
         loader (callable, optional): A function to load an image given its path.
             By default, it uses PIL as its image loader, but users could also pass in
-            ``torchvision.io.decode_image`` for decoding image data into tensors directly.
+            ``tensorplay.vision.io.decode_image`` for decoding image data into tensors directly.
     """
 
     _URL = "https://www.robots.ox.ac.uk/~vgg/data/fgvc-aircraft/archives/fgvc-aircraft-2013b.tar.gz"

@@ -91,9 +91,10 @@ class TestJVP(unittest.TestCase):
 
         v = tp.tensor([1.0, 1.0], dtype=tp.float64)
         out, jvpval = jvp(f, x, v)
-        # d/dt [t^2 sum] applied to v = 2 * t * v
-        self.assertAlmostEqual(jvpval[0].item(), 2.0, places=10)
-        self.assertAlmostEqual(jvpval[1].item(), 4.0, places=10)
+        # f maps R^2 -> R, so the jvp is the scalar <2t, v> = 6
+        # (matches torch.autograd.functional.jvp).
+        self.assertAlmostEqual(out.item(), 5.0, places=10)
+        self.assertAlmostEqual(jvpval.item(), 6.0, places=10)
 
     def test_create_graph(self):
         x = tp.rand(2, 2, dtype=tp.float64, requires_grad=True)

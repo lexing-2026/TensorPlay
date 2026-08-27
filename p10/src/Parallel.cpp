@@ -80,21 +80,26 @@ int physical_core_count() {
 }
 
 int intraop_default_num_threads() {
-  const char* env = std::getenv("OMP_NUM_THREADS");
-  if (env) {
-    int n = std::atoi(env);
-    if (n > 0) {
-      return n;
+  // Computed once: the default path parses /proc/cpuinfo, which costs
+  // ~100us+ per call on many-core machines -- fatal for per-op hot paths.
+  static const int cached = [] {
+    const char* env = std::getenv("OMP_NUM_THREADS");
+    if (env) {
+      int n = std::atoi(env);
+      if (n > 0) {
+        return n;
+      }
     }
-  }
-  env = std::getenv("MKL_NUM_THREADS");
-  if (env) {
-    int n = std::atoi(env);
-    if (n > 0) {
-      return n;
+    env = std::getenv("MKL_NUM_THREADS");
+    if (env) {
+      int n = std::atoi(env);
+      if (n > 0) {
+        return n;
+      }
     }
-  }
-  return physical_core_count();
+    return physical_core_count();
+  }();
+  return cached;
 }
 
 // Persistent pool of worker threads. The calling (master) thread participates

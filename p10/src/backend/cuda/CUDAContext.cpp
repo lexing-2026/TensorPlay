@@ -112,6 +112,10 @@ cusolverDnHandle_t CUDAContext::getCusolverDnHandle() {
     return handles.cusolver_dn;
 }
 
+void CUDAContext::warmupHandles() {
+    handlesForCurrentDevice();
+}
+
 bool isCudaInitialized() {
     return g_cuda_initialized.load(std::memory_order_acquire);
 }

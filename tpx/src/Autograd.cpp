@@ -54,9 +54,19 @@ void AutogradMeta::accum_grad(const tensorplay::Tensor& grad) {
 std::vector<Edge> collect_next_edges(const Tensor& t) {
     std::vector<Edge> edges;
     if (impl::requires_grad(t)) {
+        // Record the forward shape on every edge regardless of target kind:
+        // the engine reduces broadcast-inflated grads back to it.  The dtype
+        // is recorded too (torch's InputMetadata::grad_dtype): the engine
+        // casts floating gradients to it before the consumer node runs.
+        const auto shape = static_cast<std::vector<int64_t>>(t.shape());
+        const DType dt = t.dtype();
         auto fn = impl::grad_fn(t);
         if (fn) {
-            edges.emplace_back(fn, impl::output_nr(t));
+            Edge edge(std::move(fn), impl::output_nr(t), std::move(shape));
+            edge.grad_dtype = dt;
+            edge.device_type_hint = t.device().type();
+            edge.device_index_hint = t.device().index();
+            edges.push_back(std::move(edge));
         } else {
             // Leaf
             auto* meta = impl::get_autograd_meta(t);
@@ -69,7 +79,11 @@ std::vector<Edge> collect_next_edges(const Tensor& t) {
                     acc = std::make_shared<AccumulateGrad>(t);
                     meta->set_grad_accumulator(acc);
                 }
-                edges.emplace_back(std::move(acc), 0);
+                Edge edge(std::move(acc), 0, std::move(shape));
+                edge.grad_dtype = dt;
+                edge.device_type_hint = t.device().type();
+                edge.device_index_hint = t.device().index();
+                edges.push_back(std::move(edge));
             } else {
                 edges.emplace_back();
             }
@@ -86,6 +100,20 @@ std::vector<Edge> collect_next_edges(const std::optional<Tensor>& t) {
     }
     return {Edge()};
 }
+
+namespace impl {
+bool is_view_of_leaf(const Tensor& t) {
+    // Walk the grad_fn chain through view nodes; if it terminates at an
+    // AccumulateGrad the (transitive) base is a leaf that requires grad.
+    auto fn = grad_fn(t);
+    while (fn && fn->is_view_fn()) {
+        const auto& edges = fn->next_edges();
+        if (edges.empty()) return false;
+        fn = edges[0].function;
+    }
+    return fn != nullptr && dynamic_cast<AccumulateGrad*>(fn.get()) != nullptr;
+}
+} // namespace impl
 
 void backward(const std::vector<Tensor>& tensors, const std::vector<Tensor>& gradients, bool retain_graph, bool create_graph) {
     if (!gradients.empty() && tensors.size() != gradients.size()) {
@@ -268,10 +296,16 @@ Tensor as_strided(const Tensor& self, const std::vector<int64_t>& size,
     std::shared_ptr<Node> grad_fn;
     if (requires_grad) {
         grad_fn = std::make_shared<AsStridedBackward>(self.shape(), size, stride, storage_offset, self.dtype(), self.device());
+        grad_fn->set_view_fn(true);
         grad_fn->add_next_edge_list(collect_next_edges(self));
     }
 
     Tensor result = self.as_strided(size, stride, storage_offset);
+    // torch parity: as_strided always returns a view (ADInplaceOrView marks it
+    // regardless of grad mode); detach_() must reject it.
+    if (result.defined()) {
+        result.unsafeGetTensorImpl()->set_is_view(true);
+    }
     if (requires_grad && result.defined()) {
         impl::set_grad_fn(result, grad_fn);
     }
@@ -310,6 +344,13 @@ struct ToCopyBackward : public Node {
 
 Tensor to(const Tensor& self, DType dtype, bool non_blocking, bool copy) {
     bool requires_grad = self.requires_grad();
+    // torch parity: casting to a non-differentiable dtype (int/bool) detaches
+    // -- integer tensors cannot require grad, so no ToCopyBackward node is
+    // registered and the result sits outside the graph.  Letting the node
+    // through would push floating grads into the integer subgraph.
+    if (requires_grad && !isFloatingOrComplexType(dtype)) {
+        requires_grad = false;
+    }
     std::shared_ptr<Node> grad_fn;
     if (requires_grad && (self.dtype() != dtype)) {
         grad_fn = std::make_shared<ToCopyBackward>(self.dtype(), self.device());

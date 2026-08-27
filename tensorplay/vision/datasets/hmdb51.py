@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
 
-from torch import Tensor
+from tensorplay import Tensor
 
 from .folder import find_classes, make_dataset
 from .video_utils import VideoClips

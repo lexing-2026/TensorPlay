@@ -1,11 +1,10 @@
 from pathlib import Path
 from typing import Dict, Tuple, Union
 
-import tensorplay.audio as torchaudio
 from tensorplay import Tensor
-from torch.utils.data import Dataset
+from tensorplay.utils.data import Dataset
 from tensorplay.hub import download_url_to_file
-from torchaudio.datasets.utils import _extract_zip
+from tensorplay.audio.datasets.utils import _extract_zip
 
 
 _URL = "https://datashare.ed.ac.uk/bitstream/handle/10283/3038/DR-VCTK.zip"
@@ -75,8 +74,8 @@ class DR_VCTK(Dataset):
         source, channel_id = self._config[filename]
         file_clean_audio = self._clean_audio_dir / filename
         file_noisy_audio = self._noisy_audio_dir / filename
-        waveform_clean, sample_rate_clean = torchaudio.load(file_clean_audio)
-        waveform_noisy, sample_rate_noisy = torchaudio.load(file_noisy_audio)
+        waveform_clean, sample_rate_clean = tensorplay.audio.load(file_clean_audio)
+        waveform_noisy, sample_rate_noisy = tensorplay.audio.load(file_noisy_audio)
         return (
             waveform_clean,
             sample_rate_clean,

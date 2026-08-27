@@ -2,7 +2,7 @@
 # Only torch -> tensorplay imports were rewritten.
 from typing import Any, Callable, Optional
 
-import tensorplay as torch
+import tensorplay as tensorplay
 
 from .. import transforms
 from .vision import VisionDataset
@@ -50,11 +50,11 @@ class FakeData(VisionDataset):
         # create random image that is consistent with the index id
         if index >= len(self):
             raise IndexError(f"{self.__class__.__name__} index out of range")
-        rng_state = torch.get_rng_state()
-        torch.manual_seed(index + self.random_offset)
-        img = torch.randn(*self.image_size)
-        target = torch.randint(0, self.num_classes, size=(1,), dtype=torch.long)[0]
-        torch.set_rng_state(rng_state)
+        rng_state = tensorplay.get_rng_state()
+        tensorplay.manual_seed(index + self.random_offset)
+        img = tensorplay.randn(*self.image_size)
+        target = tensorplay.randint(0, self.num_classes, size=(1,), dtype=tensorplay.long)[0]
+        tensorplay.set_rng_state(rng_state)
 
         # convert to PIL Image
         img = transforms.ToPILImage()(img)

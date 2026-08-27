@@ -24,6 +24,7 @@
 #include <cassert>
 #include <climits>
 #include <cmath>
+#include <bit>
 #include <cstring>
 #include <functional>
 #include <ostream>

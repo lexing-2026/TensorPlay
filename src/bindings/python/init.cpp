@@ -3,37 +3,331 @@
 #include "tensorplay/ops/TensorCPythonGenerated.h"
 #include "Context.h"
 #include "OneDNNContext.h"
+#include "Profiler.h"
 #include <cstdlib>
+#include <cstring>
 
 // Extern declarations (if not in header)
 void init_scalar(py::module_& m);
 
+namespace tensorplay {
+namespace python {
+
+// with_stack hook: called from every generated METH_FASTCALL entry while the
+// GIL is held, before its GIL-releasing invoke.  Extracts the caller's
+// frame (C functions add no frames, so the current frame IS user code) and
+// hands plain bytes to the profiler; the next OpRecord on this thread adopts
+// it and clears the slot, so composite inner ops record no site.
+void tpx_prof_capture_site() {
+    if (!tensorplay::prof::g_active.load(std::memory_order_acquire)) return;
+    if (!tensorplay::prof::g_capture_sites.load(std::memory_order_acquire)) {
+        return;
+    }
+    PyFrameObject* frame = PyEval_GetFrame();
+    if (frame == nullptr) return;
+    PyCodeObject* code = PyFrame_GetCode(frame);
+#if PY_VERSION_HEX >= 0x030D0000
+    const char* file = PyCode_GetFilename(code);   // borrowed (3.13+)
+#else
+    // pre-3.13: co_filename is a directly accessible member
+    const char* file = PyUnicode_AsUTF8(code->co_filename);
+#endif
+    const int line = PyFrame_GetLineNumber(frame);
+    tensorplay::prof::set_python_site(file ? file : "<unknown>", line);
+    Py_DECREF(code);
+}
+
+} // namespace python
+} // namespace tensorplay
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// Factory fast paths
+//
+// The generated METH_FASTCALL layer already parses empty/zeros/ones/rand/
+// randn/full faster than torch's PythonArgParser, but the Python functional
+// wrappers in front of them cost ~0.5us of frame/checks per call -- which is
+// the whole remaining gap vs torch.empty.  install_factory_fast_paths()
+// rebinds those public names onto C trampolines:
+//
+//   * while a Tracer capture is live (tensorplay.compiler.graph._TRACE_DEPTH
+//     > 0) the call vectors straight to the original Python wrapper, so
+//     capture_call/proxy-scan semantics are preserved bit-for-bit;
+//   * otherwise it normalizes just the spellings the generated parser rejects
+//     (device strings, lone-int or iterable-only sizes, bare-int fill_value)
+//     and vectors directly into the fastcall entry -- zero Python frames.
+//
+// Called from the tail of tensorplay/functional.py (which owns the wrappers),
+// so both refs are resolved eagerly and every failure degrades to keeping the
+// plain Python wrappers (older extensions without this symbol hit the
+// AttributeError guard there).
+// ---------------------------------------------------------------------------
+
+struct FactoryHook {
+    PyObject* raw;      // generated fastcall entry (strong ref)
+    PyObject* wrapper;  // original Python functional wrapper (strong ref)
+    PyObject* tensor_type;  // tensorplay.Tensor (strong, may be null)
+    PyObject* scalar_type;  // tensorplay.Scalar (strong, may be null)
+    PyObject* device_fn;    // tensorplay.device (strong, may be null)
+    bool varargs;           // empty family: fold *size positionals
+};
+
+PyObject* g_factory_graph_mod = nullptr;  // tensorplay.compiler.graph
+
+// Borrowed-borrowed-borrowed: returns false only when capture state cannot be
+// read, in which case callers must divert to the Python wrapper (correct by
+// construction -- the wrapper consults capturing() itself).
+bool factory_trace_depth(long* out) {
+    if (!g_factory_graph_mod) return false;
+    PyObject* v = PyDict_GetItemString(PyModule_GetDict(g_factory_graph_mod),
+                                       "_TRACE_DEPTH");
+    if (!v || !PyLong_Check(v)) return false;
+    long d = PyLong_AsLong(v);
+    if (d < 0) { PyErr_Clear(); return false; }
+    *out = d;
+    return true;
+}
+
+// A single size argument the generated int[] parser consumes natively.
+bool factory_size_seq(PyObject* o) {
+    return PyList_Check(o) || PyTuple_Check(o) || PyRange_Check(o);
+}
+
+PyObject* factory_trampoline(PyObject* self, PyObject* const* args,
+                             Py_ssize_t nargs, PyObject* kwnames) {
+    FactoryHook* h = (FactoryHook*)PyCapsule_GetPointer(self, nullptr);
+    if (!h) return nullptr;
+
+    long depth;
+    if (!factory_trace_depth(&depth) || depth > 0)
+        return PyObject_Vectorcall(h->wrapper, args, (size_t)nargs, kwnames);
+
+    Py_ssize_t nkw = kwnames ? PyTuple_GET_SIZE(kwnames) : 0;
+
+    // Classify the positional size spelling.
+    PyObject* owned_size = nullptr;   // list built for fold/lift conversions
+    Py_ssize_t call_nargs = nargs;
+    bool fold_all = false, lift_first = false, listify_single = false;
+    if (h->varargs) {
+        if (nargs != 1 || !factory_size_seq(args[0])) {
+            if (nargs == 1 && PyObject_HasAttrString(args[0], "__iter__")) {
+                listify_single = true;   // generator/range-like: consume like list(x)
+            } else {
+                fold_all = true;         // *size ints (or ()) -> single list
+            }
+        }
+    } else if (nargs >= 1 && PyLong_Check(args[0]) && !PyBool_Check(args[0])) {
+        lift_first = true;               // full(3, v) -> full([3], v)
+    }
+
+    // Keyword scan: only "device" needs conversion (string -> Device).
+    PyObject* owned_dev = nullptr;
+    Py_ssize_t dev_kw = -1;
+    for (Py_ssize_t j = 0; j < nkw; ++j) {
+        if (PyUnicode_CompareWithASCIIString(PyTuple_GET_ITEM(kwnames, j),
+                                             "device") == 0) {
+            PyObject* dv = args[nargs + j];
+            if (PyUnicode_Check(dv)) {
+                if (!h->device_fn) {
+                    // No converter available: let the wrapper produce the
+                    // canonical error instead of a raw parse failure.
+                    return PyObject_Vectorcall(h->wrapper, args,
+                                               (size_t)nargs, kwnames);
+                }
+                owned_dev = PyObject_CallOneArg(h->device_fn, dv);
+                if (!owned_dev) return nullptr;
+                dev_kw = j;
+            }
+            break;
+        }
+    }
+
+    // full(): numbers/Tensors/Scalars go straight through; anything exotic
+    // (numpy scalars, Decimal, ...) takes the wrapper's Scalar() promotion.
+    if (!h->varargs && !lift_first && nargs >= 2 && h->tensor_type &&
+        h->scalar_type) {
+        PyObject* fv = args[nargs - 1];
+        if (!PyLong_Check(fv) && !PyFloat_Check(fv) && !PyBool_Check(fv) &&
+            Py_TYPE(fv) != (PyTypeObject*)h->tensor_type &&
+            Py_TYPE(fv) != (PyTypeObject*)h->scalar_type) {
+            PyObject* r = PyObject_Vectorcall(h->wrapper, args,
+                                              (size_t)nargs, kwnames);
+            Py_XDECREF(owned_dev);
+            return r;
+        }
+    }
+
+    if (!fold_all && !lift_first && !listify_single && dev_kw < 0)
+        return PyObject_Vectorcall(h->raw, args, (size_t)nargs, kwnames);
+
+    // Slow-shaped eager call: build a rewritten argument buffer.
+    PyObject* stack[24];
+    PyObject** buf = stack;
+    PyObject** heap = nullptr;
+    if (nargs + nkw + 1 > 24) {
+        heap = (PyObject**)PyMem_Malloc(sizeof(PyObject*) * (size_t)(nargs + nkw + 1));
+        if (!heap) { Py_XDECREF(owned_dev); return PyErr_NoMemory(); }
+        buf = heap;
+    }
+    Py_ssize_t out = 0;
+    if (fold_all) {
+        owned_size = PyList_New(nargs);
+        if (!owned_size) goto fail;
+        for (Py_ssize_t i = 0; i < nargs; ++i) {
+            Py_INCREF(args[i]);
+            PyList_SET_ITEM(owned_size, i, args[i]);
+        }
+        buf[out++] = owned_size;
+    } else if (lift_first) {
+        owned_size = PyList_New(1);
+        if (!owned_size) goto fail;
+        Py_INCREF(args[0]);
+        PyList_SET_ITEM(owned_size, 0, args[0]);
+        buf[out++] = owned_size;
+        for (Py_ssize_t i = 1; i < nargs; ++i) buf[out++] = args[i];
+    } else if (listify_single) {
+        owned_size = PySequence_List(args[0]);
+        if (!owned_size) goto fail;
+        buf[out++] = owned_size;
+    } else {
+        for (Py_ssize_t i = 0; i < nargs; ++i) buf[out++] = args[i];
+    }
+    for (Py_ssize_t j = 0; j < nkw; ++j)
+        buf[out++] = (j == dev_kw) ? owned_dev : args[nargs + j];
+
+    {
+        // nargsf counts POSITIONALS only; kw values trail after them and are
+        // counted via kwnames.
+        PyObject* r = PyObject_Vectorcall(h->raw, buf, (size_t)(out - nkw), kwnames);
+        Py_XDECREF(owned_dev);
+        Py_XDECREF(owned_size);
+        PyMem_Free(heap);
+        return r;
+    }
+
+fail:
+    Py_XDECREF(owned_dev);
+    Py_XDECREF(owned_size);
+    PyMem_Free(heap);
+    return nullptr;
+}
+
+PyMethodDef factory_defs[] = {
+    {"empty",  (PyCFunction)(void(*)(void))factory_trampoline,
+        METH_FASTCALL | METH_KEYWORDS, nullptr},
+    {"zeros",  (PyCFunction)(void(*)(void))factory_trampoline,
+        METH_FASTCALL | METH_KEYWORDS, nullptr},
+    {"ones",   (PyCFunction)(void(*)(void))factory_trampoline,
+        METH_FASTCALL | METH_KEYWORDS, nullptr},
+    {"rand",   (PyCFunction)(void(*)(void))factory_trampoline,
+        METH_FASTCALL | METH_KEYWORDS, nullptr},
+    {"randn",  (PyCFunction)(void(*)(void))factory_trampoline,
+        METH_FASTCALL | METH_KEYWORDS, nullptr},
+    {"full",   (PyCFunction)(void(*)(void))factory_trampoline,
+        METH_FASTCALL | METH_KEYWORDS, nullptr},
+};
+const char* factory_names[] = {"empty", "zeros", "ones",
+                               "rand", "randn", "full"};
+
+int install_factory_fast_paths_impl(py::module_& m, py::dict wrappers) {
+    static bool done = false;
+    if (done) return 0;
+    done = true;
+
+    // Capture-state source.  Missing => trampolines divert everything to the
+    // Python wrappers (still correct), so a soft failure is fine here.
+    g_factory_graph_mod = PyImport_ImportModule("tensorplay.compiler.graph");
+    if (!g_factory_graph_mod) PyErr_Clear();
+
+    PyObject* tp_mod = PyImport_ImportModule("tensorplay");
+    PyObject* tensor_type = nullptr, *scalar_type = nullptr, *device_fn = nullptr;
+    if (tp_mod) {
+        tensor_type = PyObject_GetAttrString(tp_mod, "Tensor");
+        if (!tensor_type) PyErr_Clear();
+        scalar_type = PyObject_GetAttrString(tp_mod, "Scalar");
+        if (!scalar_type) PyErr_Clear();
+        device_fn = PyObject_GetAttrString(tp_mod, "device");
+        if (!device_fn) PyErr_Clear();
+        Py_DECREF(tp_mod);
+    } else {
+        PyErr_Clear();
+    }
+
+    for (size_t i = 0; i < sizeof(factory_names)/sizeof(factory_names[0]); ++i) {
+        PyObject* raw = PyObject_GetAttrString(m.ptr(), factory_names[i]);
+        if (!raw) { PyErr_Clear(); continue; }  // unbound op: leave as-is
+        PyObject* w = PyDict_GetItemString(wrappers.ptr(), factory_names[i]);
+        if (!w) { Py_DECREF(raw); continue; }
+
+        FactoryHook* h = new FactoryHook();
+        h->raw = raw;                       // ownership moved from GetAttr
+        h->wrapper = Py_NewRef(w);
+        h->tensor_type = tensor_type ? Py_NewRef(tensor_type) : nullptr;
+        h->scalar_type = scalar_type ? Py_NewRef(scalar_type) : nullptr;
+        h->device_fn = device_fn ? Py_NewRef(device_fn) : nullptr;
+        h->varargs = (strcmp(factory_names[i], "full") != 0);
+
+        PyObject* cap = PyCapsule_New((void*)h, nullptr,
+                                      [](PyObject* c) {
+            auto* hh = (FactoryHook*)PyCapsule_GetPointer(c, nullptr);
+            if (hh) {
+                Py_XDECREF(hh->raw);
+                Py_XDECREF(hh->wrapper);
+                Py_XDECREF(hh->tensor_type);
+                Py_XDECREF(hh->scalar_type);
+                Py_XDECREF(hh->device_fn);
+                delete hh;
+            }
+        });
+        if (!cap) { PyErr_Clear(); continue; }
+        PyObject* fn = PyCFunction_New(&factory_defs[i], cap);
+        Py_DECREF(cap);  // fn holds the self reference
+        if (!fn) { PyErr_Clear(); continue; }
+        // Inherit the generated entry's docstring (best effort).
+        PyObject* doc = PyObject_GetAttrString(raw, "__doc__");
+        if (doc) {
+            if (PyObject_SetAttrString(fn, "__doc__", doc) != 0) PyErr_Clear();
+            Py_DECREF(doc);
+        } else {
+            PyErr_Clear();
+        }
+        std::string fast_name = std::string(factory_names[i]) + "_fast";
+        if (PyObject_SetAttrString(m.ptr(), fast_name.c_str(), fn) != 0)
+            PyErr_Clear();
+        Py_DECREF(fn);
+    }
+    Py_XDECREF(tensor_type);
+    Py_XDECREF(scalar_type);
+    Py_XDECREF(device_fn);
+    return 0;
+}
+
+} // anonymous namespace
+
 PYBIND11_MODULE(_C, m) {
     m.doc() = "The C extension module of tensorplay";
 
+    // Catchable device-mismatch exception (RuntimeError subclass), so users
+    // can write `except tensorplay.DeviceMismatchError:` like torch's
+    // FakeTensorDeviceMismatchError but for real tensors. Auto re-exported at
+    // top level by tensorplay/__init__.py.
+    tensorplay::set_device_mismatch_error_type(
+        py::register_exception<tensorplay::DeviceMismatchError>(
+            m, "DeviceMismatchError", PyExc_RuntimeError)
+            .ptr());
+
     // Exception translation
     py::register_exception_translator([](std::exception_ptr p) {
-        auto set_error = [](PyObject* type, const tensorplay::Exception& e) {
+        try {
+            std::rethrow_exception(p);
+        } catch (const tensorplay::Exception &e) {
             std::string msg = e.msg();
             const char* env_val = std::getenv("TENSORPLAY_SHOW_CPP_STACKTRACES");
             if (env_val && std::string(env_val) == "1" && !e.stacktrace().empty()) {
                 msg += "\n\n" + e.stacktrace();
             }
-            PyErr_SetString(type, msg.c_str());
-        };
-
-        try {
-            std::rethrow_exception(p);
-        } catch (const tensorplay::IndexError &e) {
-            set_error(PyExc_IndexError, e);
-        } catch (const tensorplay::ValueError &e) {
-            set_error(PyExc_ValueError, e);
-        } catch (const tensorplay::TypeError &e) {
-            set_error(PyExc_TypeError, e);
-        } catch (const tensorplay::NotImplementedError &e) {
-            set_error(PyExc_NotImplementedError, e);
-        } catch (const tensorplay::Exception &e) {
-            set_error(PyExc_RuntimeError, e);
+            PyErr_SetString(translate_exception(e), msg.c_str());
         }
         // Generic std::exception (incl. pybind11 internal exceptions like
         // stop_iteration) is left to pybind11's builtin translator, which
@@ -157,6 +451,78 @@ PYBIND11_MODULE(_C, m) {
     m.def("has_mkldnn", &tensorplay::OneDNNContext::is_available);
     m.def("is_mkldnn_enabled", &tensorplay::OneDNNContext::is_enabled);
     m.def("set_mkldnn_enabled", &tensorplay::OneDNNContext::set_enabled);
+
+    // ---- Native profiler (torch.profiler subset; see p10/include/Profiler.h)
+    using tensorplay::prof::Event;
+    m.def("_profiler_start", [](bool capture_shapes, bool with_stack,
+                                bool gpu_timing) {
+        // This is a session option, not a process-global sticky mode.  In
+        // particular, a later CPU profile must not arm CUDA events for CPU
+        // redispatches after a timed CUDA profile has finished.
+        tensorplay::prof::g_gpu_timing.store(
+            gpu_timing, std::memory_order_release);
+        if (with_stack) {
+            tensorplay::prof::profiler_start_full();
+        } else if (capture_shapes) {
+            tensorplay::prof::profiler_start_with_shapes();
+        } else {
+            tensorplay::prof::profiler_start();
+        }
+    }, "capture_shapes"_a = false, "with_stack"_a = false,
+       "gpu_timing"_a = false);
+    // Returns (name, kind, start_ns, end_ns, tid, shapes|None, dtypes|None,
+    // site_str|None, gpu_ms, out_bytes) tuples ordered by start.
+    m.def("_profiler_stop", []() {
+        py::gil_scoped_release release;
+        std::vector<Event> events = tensorplay::prof::profiler_stop();
+        // Resolve GPU pairs with bounded waits on the recorded stream tails;
+        // this deliberately avoids a device-wide synchronize and writes
+        // gpu_ms into the events.
+        tensorplay::prof::gpu_resolve_all(
+            events, [](Event&, float) {});
+        tensorplay::prof::g_gpu_timing.store(false,
+                                             std::memory_order_release);
+        py::gil_scoped_acquire acquire;
+        py::list out;
+        for (const auto& e : events) {
+            py::object shapes = py::none();
+            if (e.shapes) {
+                py::list sh;
+                for (const auto& s : *e.shapes) sh.append(s);
+                shapes = std::move(sh);
+            }
+            py::object dtypes = py::none();
+            if (e.dtypes) {
+                dtypes = py::cast(*e.dtypes);
+            }
+            py::object site = py::none();
+            if (e.site_id != Event::kNoSite) {
+                site = py::str(tensorplay::prof::site_string(e.site_id));
+            }
+            out.append(py::make_tuple(
+                std::string(e.name), char(e.kind), e.start_ns, e.end_ns,
+                e.tid, std::move(shapes), std::move(dtypes),
+                std::move(site), e.gpu_ms, e.out_bytes));
+        }
+        return out;
+    });
+    m.def("_profiler_user_begin", [](const std::string& name) {
+        // Capture the caller's frame while we still hold the GIL; the span
+        // adopts it like any op would.
+        tensorplay::python::tpx_prof_capture_site();
+        tensorplay::prof::user_span_begin(name);
+    });
+    m.def("_profiler_user_end", []() {
+        tensorplay::prof::user_span_end();
+    });
+    m.def("_profiler_emit_nvtx", [](bool on) {
+        tensorplay::prof::g_emit_nvtx.store(on,
+                                            std::memory_order_release);
+    });
+    m.def("_profiler_emit_itt", [](bool on) {
+        tensorplay::prof::g_emit_itt.store(on,
+                                           std::memory_order_release);
+    });
     
     m.def("has_mkl", []() {
 #ifdef USE_MKL
@@ -210,4 +576,11 @@ PYBIND11_MODULE(_C, m) {
             throw py::error_already_set();
         }
     }
+
+    // Factory fast paths: opted into from the tail of functional.py, which
+    // hands over the Python wrappers the trampolines divert to under capture.
+    m.def("install_factory_fast_paths",
+          [](py::module_& mod, py::dict wrappers) {
+              install_factory_fast_paths_impl(mod, wrappers);
+          }, "mod"_a, "wrappers"_a);
 }

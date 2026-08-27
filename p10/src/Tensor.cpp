@@ -5,6 +5,7 @@
 #include "Storage.h"
 #include "SparseKernels.h"
 #include "Utils.h"
+#include "ErrorReporting.h"
 #include <iostream>
 #include <cstring>
 #include <sstream>
@@ -612,35 +613,21 @@ Tensor Tensor::as_strided(const std::vector<int64_t>& size, const std::vector<in
 
 Tensor Tensor::view(const std::vector<int64_t>& shape) const {
     if (!impl_) TP_THROW(RuntimeError, "Tensor not defined");
-    if (!is_contiguous()) TP_THROW(RuntimeError, "view(): tensor must be contiguous");
-    
-    int64_t new_numel = 1;
-    int infer_dim = -1;
-    
-    for (size_t i = 0; i < shape.size(); ++i) {
-        if (shape[i] == -1) {
-            if (infer_dim != -1) TP_THROW(RuntimeError, "view(): only one dimension can be inferred");
-            infer_dim = i;
-        } else {
-            if (shape[i] < 0) TP_THROW(RuntimeError, "view(): invalid negative dimension");
-            new_numel *= shape[i];
-        }
+
+    // Torch parity (at::infer_size_dv): resolve a single -1 against numel().
+    std::vector<int64_t> inferred = SizesAndStrides::infer_size(shape, numel());
+
+    // Torch parity (at::detail::computeStride, TensorShape.cpp view_impl): the
+    // view is valid whenever the layout admits it -- not only for contiguous
+    // tensors -- and the resulting strides follow the input's layout.
+    auto stride = SizesAndStrides::compute_view_strides(
+        static_cast<std::vector<int64_t>>(this->shape()), strides(), inferred);
+    if (!stride.has_value()) {
+        TP_THROW(RuntimeError, "view size is "
+                 "not compatible with input tensor's size and stride (at least one dimension"
+                 " spans across two contiguous subspaces). Use .reshape(...) instead.");
     }
-    
-    std::vector<int64_t> final_shape = shape;
-    if (infer_dim != -1) {
-        if (new_numel == 0) TP_THROW(RuntimeError, "view(): cannot infer shape when other dimensions are 0");
-        if (numel() % new_numel != 0) TP_THROW(RuntimeError, "view(): shape inference failed");
-        final_shape[infer_dim] = numel() / new_numel;
-        new_numel *= final_shape[infer_dim];
-    }
-    
-    if (new_numel != numel()) {
-        TP_THROW(RuntimeError, "view(): invalid shape, numel mismatch");
-    }
-    
-    std::vector<int64_t> new_strides = SizesAndStrides::compute_contiguous_strides(final_shape);
-    return as_strided(final_shape, new_strides);
+    return as_strided(inferred, *stride);
 }
 
 // Mirrors aten's view_dtype (Tensor.view(dtype)): reinterprets the raw
@@ -651,7 +638,17 @@ Tensor Tensor::view_dtype(DType dtype) const {
     if (!impl_) TP_THROW(RuntimeError, "Tensor not defined");
     const DType self_dtype = impl_->dtype();
     if (dtype == self_dtype) {
-        return Tensor(impl_);
+        // torch view_dtype parity: even the same-dtype view is a fresh impl
+        // aliasing the storage (metadata changes on it must not leak back to
+        // the original tensor), carrying the base's version counter.  Note
+        // torch does NOT mark view(dtype) results as autograd views:
+        // x.view(dtype).detach_() is legal and _is_view() is False.
+        Tensor out = Tensor(impl_->storage(),
+                            static_cast<std::vector<int64_t>>(shape()),
+                            static_cast<std::vector<int64_t>>(strides()),
+                            dtype, impl_->storage_offset());
+        out.unsafeGetTensorImpl()->share_version_counter(*impl_);
+        return out;
     }
 
     const std::vector<int64_t> self_sizes = static_cast<std::vector<int64_t>>(shape());
@@ -671,11 +668,16 @@ Tensor Tensor::view_dtype(DType dtype) const {
 
     std::vector<int64_t> new_sizes = self_sizes;
     std::vector<int64_t> new_strides = self_strides;
+    // Storage offset is measured in elements, so it must be rescaled by the
+    // element-size ratio (torch view_dtype parity: offset * ratio when
+    // downsizing, offset / ratio when upsizing).
+    size_t new_offset = impl_->storage_offset();
 
     if (dst_esize < src_esize) {
         const int64_t ratio = static_cast<int64_t>(src_esize / dst_esize);
         new_sizes.back() *= ratio;
         for (size_t i = 0; i + 1 < new_strides.size(); ++i) new_strides[i] *= ratio;
+        new_offset = impl_->storage_offset() * static_cast<size_t>(ratio);
     } else if (dst_esize > src_esize) {
         const int64_t ratio = static_cast<int64_t>(dst_esize / src_esize);
         if (new_sizes.back() % ratio != 0) {
@@ -695,9 +697,10 @@ Tensor Tensor::view_dtype(DType dtype) const {
             TP_THROW(RuntimeError,
                      "view(): storage offset is not aligned to the target element size");
         }
+        new_offset = impl_->storage_offset() / static_cast<size_t>(ratio);
     }
 
-    Tensor out = Tensor(impl_->storage(), new_sizes, new_strides, dtype, impl_->storage_offset());
+    Tensor out = Tensor(impl_->storage(), new_sizes, new_strides, dtype, new_offset);
     out.unsafeGetTensorImpl()->share_version_counter(*impl_);
     return out;
 }
@@ -706,8 +709,8 @@ Tensor Tensor::select(int64_t dim, int64_t index) const {
     if (!impl_) TP_THROW(RuntimeError, "Tensor not defined");
     int64_t ndim = this->dim();
     if (dim < 0) dim += ndim;
-    if (dim < 0 || dim >= ndim) TP_THROW(IndexError, "Dimension out of range");
-    
+    if (dim < 0 || dim >= ndim) TP_THROW(IndexError, format_dim_range(ndim, dim));
+
     int64_t size_dim = size(dim);
     if (index < 0) index += size_dim;
     if (index < 0 || index >= size_dim) TP_THROW(IndexError, "Index out of range");
@@ -727,8 +730,8 @@ Tensor Tensor::slice(int64_t dim, int64_t start, int64_t end, int64_t step) cons
     if (!impl_) TP_THROW(RuntimeError, "Tensor not defined");
     int64_t ndim = this->dim();
     if (dim < 0) dim += ndim;
-    if (dim < 0 || dim >= ndim) TP_THROW(IndexError, "Dimension out of range");
-    
+    if (dim < 0 || dim >= ndim) TP_THROW(IndexError, format_dim_range(ndim, dim));
+
     int64_t size_dim = size(dim);
     if (start < 0) start += size_dim;
     if (end < 0) end += size_dim;
@@ -796,21 +799,76 @@ namespace detail {
 // Dispatcher-level clone shared by the generated Tensor::clone member via
 // backend kernels.  Kept free-standing so kernels never re-enter the
 // dispatcher for a plain byte copy.
-Tensor clone_impl(const Tensor& self) {
+//
+// Torch at::native::clone parity (aten/src/ATen/native/TensorFactories.cpp):
+// with no/Preserve memory_format the result keeps the input's exact strides
+// when they are non-overlapping and dense (e.g. transposed tensors), and
+// falls back to contiguous otherwise (expanded/overlapping inputs).  An
+// explicit format materializes that layout, with torch's rank checks for the
+// channels-last formats.  Sparse clones reject any memory_format like
+// at::native::clone_sparse.
+Tensor clone_impl(const Tensor& self, std::optional<MemoryFormat> memory_format) {
     if (!self.defined()) return Tensor();
     if (self.is_sparse()) {
+        if (memory_format.has_value()) {
+            TP_THROW(RuntimeError, "unsupported memory format option ",
+                     toString(*memory_format));
+        }
         return Tensor::make_sparse_coo_tensor(self._indices().clone(), self._values().clone(),
                                               static_cast<std::vector<int64_t>>(self.shape()),
                                               self.is_coalesced());
     }
-    Tensor t(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
+    const auto format = memory_format.value_or(MemoryFormat::Preserve);
+    const auto sizes_v = static_cast<std::vector<int64_t>>(self.shape());
+    std::vector<int64_t> strides;
+    MemoryFormat result_format = MemoryFormat::Contiguous;
+    if (format == MemoryFormat::Preserve) {
+        const auto strides_v = static_cast<std::vector<int64_t>>(self.strides());
+        if (SizesAndStrides::is_non_overlapping_and_dense(sizes_v, strides_v)) {
+            // Copy all strides, mirroring at::empty_strided(sizes, strides).
+            strides = strides_v;
+        } else {
+            strides = SizesAndStrides::compute_contiguous_strides(sizes_v);
+        }
+    } else if (format == MemoryFormat::ChannelsLast) {
+        TP_THROW_IF(self.dim() != 4, RuntimeError,
+                    "required rank 4 tensor to use channels_last format");
+        strides = get_channels_last_strides(sizes_v);
+        result_format = MemoryFormat::ChannelsLast;
+    } else if (format == MemoryFormat::ChannelsLast3d) {
+        TP_THROW_IF(self.dim() != 5, RuntimeError,
+                    "required rank 5 tensor to use channels_last_3d format");
+        strides = get_channels_last_strides(sizes_v);
+        result_format = MemoryFormat::ChannelsLast3d;
+    } else {
+        strides = SizesAndStrides::compute_contiguous_strides(sizes_v);
+    }
+    Storage storage(static_cast<size_t>(self.numel()) * self.itemsize(),
+                    getAllocator(self.device().type()), self.device());
+    auto out_impl = std::make_shared<TensorImpl>(storage, sizes_v, strides, self.dtype(), 0);
+    if (format == MemoryFormat::Preserve) {
+        // Mirror TensorImpl::set_sizes_and_strides layout tagging so a
+        // preserved channels-last input clones into a channels-last tensor.
+        if (strides == get_channels_last_strides(sizes_v) &&
+            strides != SizesAndStrides::compute_contiguous_strides(sizes_v)) {
+            result_format = sizes_v.size() == 5 ? MemoryFormat::ChannelsLast3d
+                                                : MemoryFormat::ChannelsLast;
+        }
+    }
+    out_impl->set_memory_format(result_format);
+    Tensor t(std::move(out_impl));
     // Match the native contiguous clone path used by Torch: avoid routing
     // every same-dtype contiguous clone through the dispatcher.  Optimizer
     // momentum initialization creates one clone per parameter, so this
     // dispatch overhead is visible even though the operation is just a byte
-    // copy.  Non-contiguous and cross-device cases retain copy_'s layout and
-    // transfer semantics.
-    if (self.device().is_cpu() && self.is_contiguous()) {
+    // copy.  Everything else (preserved non-contiguous strides, channels-last
+    // destinations, cross-device) retains copy_'s layout and transfer
+    // semantics.  Note is_contiguous() alone is not enough here: it does not
+    // distinguish row-major from channels-last layouts, so compare strides.
+    const auto rm_strides = SizesAndStrides::compute_contiguous_strides(sizes_v);
+    const bool row_major = strides == rm_strides &&
+        static_cast<std::vector<int64_t>>(self.strides()) == rm_strides;
+    if (self.device().is_cpu() && row_major) {
         std::memcpy(t.data_ptr(), self.data_ptr(),
                     static_cast<size_t>(self.numel()) * self.itemsize());
     } else {
@@ -821,6 +879,12 @@ Tensor clone_impl(const Tensor& self) {
     // 0), so clear the counter the internal copy bumped.
     t.unsafeGetTensorImpl()->reset_version();
     return t;
+}
+
+Tensor contiguous_clone(const Tensor& self) {
+    if (!self.defined()) return Tensor();
+    if (self.is_sparse()) return clone_impl(self);
+    return clone_impl(self, MemoryFormat::Contiguous);
 }
 
 Tensor contiguous_impl(const Tensor& self, int64_t memory_format_raw) {

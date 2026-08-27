@@ -176,12 +176,17 @@ def _single_tensor_rmsprop(
             grad_avg = grad_avgs[i]
             if is_complex_param:
                 grad_avg = tp.view_as_real(grad_avg)
-            grad_avg.lerp_(grad, 1 - alpha)
-            avg = square_avg.addcmul(
+            if differentiable:
+                # Preserve the source edge needed by differentiable mode.
+                grad_avg.mul_(alpha).add_(grad * (1 - alpha))
+            else:
+                grad_avg.lerp_(grad, 1 - alpha)
+            centered_var = square_avg.addcmul(
                 grad_avg, grad_avg, value=-1
-            ).sqrt_()
+            )
+            avg = centered_var.sqrt() if differentiable else centered_var.sqrt_()
         else:
-            avg = square_avg.sqrt()
+            avg = square_avg.sqrt() if differentiable else square_avg.sqrt_()
         avg = avg.add(eps) if differentiable else avg.add_(eps)
 
         if momentum > 0:
@@ -314,6 +319,44 @@ def rmsprop(
             "API has changed, `state_steps` argument must contain a list of "
             "singleton tensors"
         )
+
+    # The native CPU/CUDA kernels validate every tensor pair and state list
+    # in C++.  Probe the cheap first tensor metadata here and let an
+    # unsupported layout fall through to Torch's foreach implementation.  A
+    # Python all(...) over every parameter was measurably more expensive than
+    # the optimizer kernel for the many-small-tensor case.
+    native_candidate = (
+        not differentiable
+        and not capturable
+        and not has_complex
+        and bool(params)
+        and params[0].device.type in ("cpu", "cuda")
+        and params[0].is_floating_point()
+    )
+    if native_candidate:
+        try:
+            tp._fused_rmsprop_(
+                params,
+                grads,
+                square_avgs,
+                grad_avgs,
+                momentum_buffer_list,
+                state_steps,
+                lr=scalar_value(lr, "lr"),
+                alpha=alpha,
+                eps=eps,
+                weight_decay=weight_decay,
+                momentum=momentum,
+                centered=centered,
+                maximize=maximize,
+            )
+            return
+        except NotImplementedError:
+            # The C++ validator uses NotImplementedError for layouts and
+            # dtypes that the fused path cannot consume.  Those are valid
+            # foreach inputs, so retain Torch's fallback semantics.
+            pass
+
     if foreach is None:
         _, foreach = _default_to_fused_or_foreach(
             params, differentiable, use_fused=False

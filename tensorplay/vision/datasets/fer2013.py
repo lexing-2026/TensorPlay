@@ -4,7 +4,7 @@ import csv
 import pathlib
 from typing import Any, Callable, Optional, Union
 
-import tensorplay as torch
+import tensorplay as tensorplay
 from PIL import Image
 
 from .utils import check_integrity, verify_str_arg
@@ -86,7 +86,7 @@ class FER2013(VisionDataset):
         usage_key = " Usage" if use_icml_file else "Usage"
 
         def get_img(row):
-            return torch.tensor([int(idx) for idx in row[pixels_key].split()], dtype=torch.uint8).reshape(48, 48)
+            return tensorplay.tensor([int(idx) for idx in row[pixels_key].split()], dtype=tensorplay.uint8).reshape(48, 48)
 
         def get_label(row):
             if use_fer_file or use_icml_file or self._split == "train":

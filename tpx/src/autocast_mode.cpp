@@ -7,12 +7,45 @@ namespace autocast {
 
 Tensor cached_cast(DType to_type, const Tensor& arg, DeviceType device_type) {
     if (is_eligible(arg, device_type) && (arg.dtype() != to_type)) {
-        // Heuristic: Do what Apex does, and cache lower_precision_fp casts of
-        // fp32 model weights (leaves).
+        // Transposed-view fast path (torch parity via aten::linear wrapping):
+        // callers hand GEMMs a fresh `weight.t()` view every call, so caching
+        // on the view's TensorImpl* never hits and the fallback would redo a
+        // strided scalar cast each iteration.  Cast the dense parent instead
+        // -- its address is stable, so the weight-cache hits across calls --
+        // and re-apply the transpose as a zero-copy view of the result.
+        if (!arg.is_contiguous() && arg.dim() == 2 && arg.dtype() == DType::Float32 &&
+            arg.stride(0) == 1 && arg.stride(1) == arg.size(0)) {
+            // Stable-key cache: the view's data_ptr aliases the parent
+            // parameter's storage and views share its version counter.
+            Tensor hit = cache_lookup_ptr(arg.data_ptr(), arg);
+            if (hit.defined()) {
+                return hit.t();
+            }
+            Tensor dense = arg.t();
+            Tensor casted = cached_cast(to_type, dense, device_type);
+            if (casted.defined()) {
+                if (!casted.is_contiguous()) {
+                    casted = casted.contiguous();
+                }
+                cache_store_ptr(arg.data_ptr(), arg, casted);
+                return casted.t();
+            }
+        }
         bool can_try_cache =
             (to_type == get_lower_precision_fp_from_device_type(device_type) &&
-             arg.dtype() == DType::Float32 && arg.requires_grad() &&
-             tpx::impl::is_leaf(arg) && is_autocast_cache_enabled());
+             arg.dtype() == DType::Float32 && is_autocast_cache_enabled());
+
+        if (can_try_cache) {
+            // Upstream/Apex heuristic caches fp32 leaves that require grad.
+            // Non-grad tensors (inference weights) are safe to cache too --
+            // lookup validates the source's version counter, so an in-place
+            // mutation drops the stale copy -- and skipping their per-op
+            // recasts is a large inference-loop win over torch, which recasts
+            // every weight on every forward under no_grad.
+            if (arg.requires_grad() && !tpx::impl::is_leaf(arg)) {
+                can_try_cache = false;
+            }
+        }
 
         if (can_try_cache) {
             Tensor hit = cache_lookup(arg.unsafeGetTensorImpl().get());

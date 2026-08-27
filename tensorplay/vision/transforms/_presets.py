@@ -7,7 +7,7 @@ future versions without warning. The classes should be accessed only via the tra
 
 from typing import Optional, Union
 
-import tensorplay as torch
+import tensorplay as tensorplay
 from tensorplay import nn, Tensor
 
 from . import functional as F, InterpolationMode
@@ -26,14 +26,14 @@ class ObjectDetection(nn.Module):
     def forward(self, img: Tensor) -> Tensor:
         if not isinstance(img, Tensor):
             img = F.pil_to_tensor(img)
-        return F.convert_image_dtype(img, torch.float)
+        return F.convert_image_dtype(img, tensorplay.float)
 
     def __repr__(self) -> str:
         return self.__class__.__name__ + "()"
 
     def describe(self) -> str:
         return (
-            "Accepts ``PIL.Image``, batched ``(B, C, H, W)`` and single ``(C, H, W)`` image ``torch.Tensor`` objects. "
+            "Accepts ``PIL.Image``, batched ``(B, C, H, W)`` and single ``(C, H, W)`` image ``tensorplay.Tensor`` objects. "
             "The images are rescaled to ``[0.0, 1.0]``."
         )
 
@@ -62,7 +62,7 @@ class ImageClassification(nn.Module):
         img = F.center_crop(img, self.crop_size)
         if not isinstance(img, Tensor):
             img = F.pil_to_tensor(img)
-        img = F.convert_image_dtype(img, torch.float)
+        img = F.convert_image_dtype(img, tensorplay.float)
         img = F.normalize(img, mean=self.mean, std=self.std)
         return img
 
@@ -78,7 +78,7 @@ class ImageClassification(nn.Module):
 
     def describe(self) -> str:
         return (
-            "Accepts ``PIL.Image``, batched ``(B, C, H, W)`` and single ``(C, H, W)`` image ``torch.Tensor`` objects. "
+            "Accepts ``PIL.Image``, batched ``(B, C, H, W)`` and single ``(C, H, W)`` image ``tensorplay.Tensor`` objects. "
             f"The images are resized to ``resize_size={self.resize_size}`` using ``interpolation={self.interpolation}``, "
             f"followed by a central crop of ``crop_size={self.crop_size}``. Finally the values are first rescaled to "
             f"``[0.0, 1.0]`` and then normalized using ``mean={self.mean}`` and ``std={self.std}``."
@@ -116,7 +116,7 @@ class VideoClassification(nn.Module):
         # TODO: we could re-train the video models with antialias=True?
         vid = F.resize(vid, self.resize_size, interpolation=self.interpolation, antialias=False)
         vid = F.center_crop(vid, self.crop_size)
-        vid = F.convert_image_dtype(vid, torch.float)
+        vid = F.convert_image_dtype(vid, tensorplay.float)
         vid = F.normalize(vid, mean=self.mean, std=self.std)
         H, W = self.crop_size
         vid = vid.view(N, T, C, H, W)
@@ -138,7 +138,7 @@ class VideoClassification(nn.Module):
 
     def describe(self) -> str:
         return (
-            "Accepts batched ``(B, T, C, H, W)`` and single ``(T, C, H, W)`` video frame ``torch.Tensor`` objects. "
+            "Accepts batched ``(B, T, C, H, W)`` and single ``(T, C, H, W)`` video frame ``tensorplay.Tensor`` objects. "
             f"The frames are resized to ``resize_size={self.resize_size}`` using ``interpolation={self.interpolation}``, "
             f"followed by a central crop of ``crop_size={self.crop_size}``. Finally the values are first rescaled to "
             f"``[0.0, 1.0]`` and then normalized using ``mean={self.mean}`` and ``std={self.std}``. Finally the output "
@@ -168,7 +168,7 @@ class SemanticSegmentation(nn.Module):
             img = F.resize(img, self.resize_size, interpolation=self.interpolation, antialias=self.antialias)
         if not isinstance(img, Tensor):
             img = F.pil_to_tensor(img)
-        img = F.convert_image_dtype(img, torch.float)
+        img = F.convert_image_dtype(img, tensorplay.float)
         img = F.normalize(img, mean=self.mean, std=self.std)
         return img
 
@@ -183,7 +183,7 @@ class SemanticSegmentation(nn.Module):
 
     def describe(self) -> str:
         return (
-            "Accepts ``PIL.Image``, batched ``(B, C, H, W)`` and single ``(C, H, W)`` image ``torch.Tensor`` objects. "
+            "Accepts ``PIL.Image``, batched ``(B, C, H, W)`` and single ``(C, H, W)`` image ``tensorplay.Tensor`` objects. "
             f"The images are resized to ``resize_size={self.resize_size}`` using ``interpolation={self.interpolation}``. "
             f"Finally the values are first rescaled to ``[0.0, 1.0]`` and then normalized using ``mean={self.mean}`` and "
             f"``std={self.std}``."
@@ -197,8 +197,8 @@ class OpticalFlow(nn.Module):
         if not isinstance(img2, Tensor):
             img2 = F.pil_to_tensor(img2)
 
-        img1 = F.convert_image_dtype(img1, torch.float)
-        img2 = F.convert_image_dtype(img2, torch.float)
+        img1 = F.convert_image_dtype(img1, tensorplay.float)
+        img2 = F.convert_image_dtype(img2, tensorplay.float)
 
         # map [0, 1] into [-1, 1]
         img1 = F.normalize(img1, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
@@ -214,6 +214,6 @@ class OpticalFlow(nn.Module):
 
     def describe(self) -> str:
         return (
-            "Accepts ``PIL.Image``, batched ``(B, C, H, W)`` and single ``(C, H, W)`` image ``torch.Tensor`` objects. "
+            "Accepts ``PIL.Image``, batched ``(B, C, H, W)`` and single ``(C, H, W)`` image ``tensorplay.Tensor`` objects. "
             "The images are rescaled to ``[-1.0, 1.0]``."
         )

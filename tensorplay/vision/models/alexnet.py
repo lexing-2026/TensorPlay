@@ -4,7 +4,7 @@
 from functools import partial
 from typing import Any, Optional
 
-import tensorplay as torch
+import tensorplay as tensorplay
 import tensorplay.nn as nn
 
 from ..transforms._presets import ImageClassification
@@ -47,10 +47,10 @@ class AlexNet(nn.Module):
             nn.Linear(4096, num_classes),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: tensorplay.Tensor) -> tensorplay.Tensor:
         x = self.features(x)
         x = self.avgpool(x)
-        x = torch.flatten(x, 1)
+        x = tensorplay.flatten(x, 1)
         x = self.classifier(x)
         return x
 
@@ -63,7 +63,7 @@ class AlexNet_Weights(WeightsEnum):
             "num_params": 61100840,
             "min_size": (63, 63),
             "categories": _IMAGENET_CATEGORIES,
-            "recipe": "https://github.com/pytorch/vision/tree/main/references/classification#alexnet-and-vgg",
+            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#alexnet-and-vgg",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 56.522,
@@ -93,19 +93,19 @@ def alexnet(*, weights: Optional[AlexNet_Weights] = None, progress: bool = True,
         paper above.
 
     Args:
-        weights (:class:`~torchvision.models.AlexNet_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.AlexNet_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.AlexNet_Weights` below for
+            :class:`~tensorplay.vision.models.AlexNet_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.squeezenet.AlexNet``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.squeezenet.AlexNet``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/alexnet.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/alexnet.py>`_
             for more details about this class.
 
-    .. autoclass:: torchvision.models.AlexNet_Weights
+    .. autoclass:: tensorplay.vision.models.AlexNet_Weights
         :members:
     """
 

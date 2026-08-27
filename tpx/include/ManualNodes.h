@@ -10,6 +10,57 @@
 namespace tensorplay {
 namespace tpx {
 
+// Backward components of the native F.linear (aten Linear.cpp linear_backward
+// reduced to its 2-D-weight contract).  Like MatmulBackward, every step
+// composes dispatched recordable primitives so create_graph sees a graph
+// through the op (double-backward).
+//
+// Shapes: out = in_flat @ W^T (+ bias), where in_flat is `input` viewed as
+// {prod_leading, K} (1-D input behaves as a single row).
+
+inline Tensor linear_backward_input(const Tensor& grad, const Tensor& input,
+                                    const Tensor& weight) {
+    if (!grad.defined()) return Tensor();
+    const bool vector_input = input.dim() <= 1;
+    Tensor g = grad.dim() == 1 ? ops::reshape(grad, {1, grad.size(0)}) : grad;
+    // product of leading dims of input == rows of g either way.
+    Tensor gxw = ops::matmul(g, weight);
+    if (vector_input) {
+        std::vector<int64_t> in_sizes(
+            static_cast<std::vector<int64_t>>(input.shape()));
+        return ops::reshape(gxw, in_sizes);
+    }
+    auto target = static_cast<std::vector<int64_t>>(input.shape());
+    if (gxw.dim() != static_cast<int64_t>(target.size()))
+        return ops::reshape(gxw, target);
+    return gxw;
+}
+
+inline Tensor linear_backward_weight(const Tensor& grad, const Tensor& input,
+                                     const Tensor& weight) {
+    if (!grad.defined()) return Tensor();
+    const int64_t k = weight.size(1);
+    const int64_t n = weight.size(0);
+    // Flatten both grad and input to 2-D so the transpose+matmul contracts
+    // over the batch dimension cleanly: dW = g_flat.T @ x_flat -> {N, K}.
+    Tensor x = input.dim() >= 2
+        ? ops::reshape(input, {-1, k})
+        : ops::reshape(input, {1, input.size(0)});
+    Tensor g = grad.dim() == 1 ? ops::reshape(grad, {1, n})
+                                : ops::reshape(grad, {-1, n});
+    return ops::matmul(ops::transpose(g, -2, -1), x);
+}
+
+inline Tensor linear_backward_bias(const Tensor& grad) {
+    if (!grad.defined()) return Tensor();
+    if (grad.dim() == 1) {
+        return ops::sum(grad);
+    }
+    std::vector<int64_t> dims;
+    for (int64_t d = 0; d < grad.dim() - 1; ++d) dims.push_back(d);
+    return ops::sum(grad, dims);
+}
+
 // Port of at::is_expandable_to (aten/src/ATen/ExpandUtils.h): can `shape`
 // be expanded to `desired`?  Dims are aligned at the trailing side; a dim
 // may differ from the target only when the *source* dim is 1.
@@ -57,6 +108,16 @@ inline Tensor sum_to_size(const Tensor& self, const std::vector<int64_t>& size) 
         self.shape().toString(), ".");
 
     return sum_to(self, size);
+}
+
+// Port of autograd::maybe_multiply
+// (torch/csrc/autograd/FunctionsManual.cpp:138): derivatives expressed as
+// `expr * alpha` elide the pointwise multiply entirely when the scalar is 1,
+// so beta=alpha=1 backwards (every F.linear/addmm training step) no longer
+// pay a full-tensor mul + allocation per gradient slot.
+inline Tensor maybe_multiply(const Tensor& t, const Scalar& s) {
+    if (s.toDouble() == 1.0) return t;
+    return t.mul(s);
 }
 
 // Faithful port of autograd::repeat_backward
@@ -231,42 +292,9 @@ struct AsStridedBackward : public Node {
     }
 };
 
-// SDPA returns three gradients from one fused reference/backward kernel.  A
-// hand-written node keeps the tuple alive once per backward invocation instead
-// of evaluating the expensive native backward three times (one per input),
-// which is particularly important for Llama training.
-struct ScaledDotProductAttentionBackward : public Node {
-    SavedVariable query_;
-    SavedVariable key_;
-    SavedVariable value_;
-    bool is_causal_;
-    int64_t impl_;
-
-    ScaledDotProductAttentionBackward(Tensor query, Tensor key, Tensor value,
-                                      bool is_causal, int64_t impl)
-        : query_(std::move(query)), key_(std::move(key)), value_(std::move(value)),
-          is_causal_(is_causal), impl_(impl) {}
-
-    variable_list apply(variable_list&& inputs) override {
-        if (inputs.empty() || !inputs[0].defined()) {
-            return {Tensor(), Tensor(), Tensor()};
-        }
-        const Tensor query = query_.unpack();
-        const Tensor key = key_.unpack();
-        const Tensor value = value_.unpack();
-        auto grads = Tensor::scaled_dot_product_attention_backward(
-            inputs[0], query, key, value, is_causal_, impl_);
-        return {std::get<0>(grads), std::get<1>(grads), std::get<2>(grads)};
-    }
-
-    void release_variables() override {
-        Node::release_variables();
-        query_.reset_data();
-        key_.reset_data();
-        value_.reset_data();
-    }
-};
-
+// NOTE(history): a hand-written ScaledDotProductAttentionBackward used to live
+// here but was never instantiated -- the generated autograd node (from
+// derivatives.yaml) is authoritative and avoids the double bookkeeping.
 // mean(dtype=...) may accumulate in a wider dtype, but its derivative must be
 // represented in the input dtype (the same contract as torch).  Keep this
 // cast in the manual node so a float32 reduction of an fp16/bf16 tensor does
@@ -461,6 +489,142 @@ struct StackBackward : public Node {
         for (auto& saved : tensors_) saved.reset_data();
     }
 };
+
+// ===========================================================================
+// Manual backward helpers -- port of torch/csrc/autograd/FunctionsManual.cpp
+// for the elementwise formulas that carry torch's complex convention: every
+// pointwise Jacobian J is applied as grad * J.conj(), so the stored leaf
+// gradient matches torch's conjugated-gradient representation.
+// conj over real dtypes is an alias (see conj_cpu), so the real training
+// path stays copy-free.
+// ===========================================================================
+
+// FunctionsManual.cpp handle_r_to_c: if the forward output dtype is real but
+// the formula produced a complex gradient, keep only the real part.
+inline Tensor handle_r_to_c(DType self_st, Tensor gradient_result) {
+    if (!isComplexType(self_st) && isComplexType(gradient_result.dtype())) {
+        return ops::real(gradient_result);
+    }
+    return gradient_result;
+}
+
+// Scalar flavor of the mul backward's `other.conj()`: conjugate a complex
+// python/C++ scalar in place of a tensor op.
+inline Scalar scalar_conj_if_complex(const Scalar& s) {
+    if (!s.isComplex()) return s;
+    const std::complex<double> c = s.to<std::complex<double>>();
+    return Scalar(std::complex<double>(c.real(), -c.imag()));
+}
+
+// FunctionsManual.cpp mul_tensor_backward: grad * other.conj()
+template <typename T>
+inline Tensor mul_tensor_backward(const Tensor& grad, const T& other,
+                                  DType self_st) {
+    Tensor scaled;
+    if constexpr (std::is_same_v<T, Scalar>) {
+        scaled = grad * scalar_conj_if_complex(other);
+    } else {
+        scaled = grad * ops::conj(other);
+    }
+    return handle_r_to_c(self_st, std::move(scaled));
+}
+
+// FunctionsManual.cpp div_tensor_self_backward: grad / other.conj()
+template <typename T>
+inline Tensor div_tensor_self_backward(const Tensor& grad, const T& other,
+                                       DType self_st) {
+    Tensor scaled;
+    if constexpr (std::is_same_v<T, Scalar>) {
+        scaled = grad / scalar_conj_if_complex(other);
+    } else {
+        scaled = grad / ops::conj(other);
+    }
+    return handle_r_to_c(self_st, std::move(scaled));
+}
+
+// div_tensor_other_backward: -grad * conj((self / other) / other)
+// (FunctionsManual.cpp conjugates the whole quotient, self included).
+inline Tensor div_tensor_other_backward(const Tensor& grad,
+                                        const Tensor& self,
+                                        const Tensor& other) {
+    return handle_r_to_c(
+        other.dtype(), -(grad * ops::conj(self / other / other)));
+}
+
+// FunctionsManual.cpp pow_backward (scalar exponent): zero exponent short
+// circuits; otherwise exponent * self^(exponent-1) under conj.
+inline Tensor pow_backward(const Tensor& grad, const Tensor& self,
+                           const Scalar& exponent) {
+    if (exponent.isIntegral() && exponent.to<int64_t>() == 0) {
+        return ops::zeros_like(self);
+    }
+    return handle_r_to_c(
+        self.dtype(),
+        grad * ops::conj(self.pow(Scalar(exponent.to<double>() - 1.0)) *
+                         exponent.to<double>()));
+}
+
+// pow_backward_self (tensor exponent): d z^b / dz = b * z^(b-1)
+inline Tensor pow_backward_self(const Tensor& grad, const Tensor& self,
+                                const Tensor& exponent) {
+    const Tensor one = ops::ones_like(exponent);
+    return handle_r_to_c(
+        self.dtype(),
+        grad * ops::conj(exponent * self.pow(exponent - one)));
+}
+
+// pow_backward_exponent (tensor base): d(a^b)/db = a^b * log(a); zeros where
+// base == 0 with non-negative real exponent.
+inline Tensor pow_backward_exponent(const Tensor& grad, const Tensor& self,
+                                    const Tensor& exponent,
+                                    const Tensor& result) {
+    const Tensor cond = ops::logical_and(ops::eq(self, Scalar(0)),
+                                         ops::ge(exponent, Scalar(0)));
+    return ops::where(cond, ops::zeros_like(self),
+                      grad * ops::conj(result * self.log()));
+}
+
+// FunctionsManual.cpp log1p_backward: grad / (self + 1).conj()
+inline Tensor log1p_backward(const Tensor& grad, const Tensor& self) {
+    return grad / ops::conj(self + 1);
+}
+
+// derivatives.yaml acosh: real path keeps the cheap (x*x-1).rsqrt(); complex
+// uses the numerically safer ((x+1).rsqrt() * (x-1).rsqrt()).conj().
+inline Tensor acosh_backward(const Tensor& grad, const Tensor& self) {
+    if (!isComplexType(self.dtype())) {
+        return grad * ops::rsqrt(self * self - 1);
+    }
+    return grad * ops::conj(ops::rsqrt(self + 1) * ops::rsqrt(self - 1));
+}
+
+// FunctionsManual.cpp angle_backward: zero at z == 0, otherwise
+// grad * i * z / |z|^2 (already the conjugated Jacobian).
+inline Tensor angle_backward(const Tensor& grad, const Tensor& self) {
+    if (!isComplexType(self.dtype())) {
+        return ops::zeros_like(self);
+    }
+    const Tensor zero_c = ops::eq(self, Scalar(0));
+    const Tensor zero = ops::zeros_like(self);
+    const Tensor ii = ops::full({}, Scalar(std::complex<double>(0.0, 1.0)),
+                                DType::ComplexDouble, self.device());
+    const Tensor zd = self.to(DType::ComplexDouble);
+    Tensor out = grad * zd * ii / zd.abs().pow(Scalar(2));
+    return ops::where(zero_c, zero, out.to(self.dtype()));
+}
+
+// FunctionsManual.cpp prod_backward fast path: exact when no element is zero;
+// all-zero gradient when more than one zero exists (the single-zero scatter
+// case needs nonzero(), which p10 does not expose yet).
+inline Tensor prod_backward_fast(const Tensor& grad, const Tensor& input,
+                                 const Tensor& result) {
+    if (input.dim() == 0) return grad;
+    const Tensor has_zero = ops::any(ops::eq(input, Scalar(0)));
+    if (has_zero.item().to<bool>()) {
+        return ops::zeros_like(input);
+    }
+    return grad * ops::conj(result / input);
+}
 
 }
 }

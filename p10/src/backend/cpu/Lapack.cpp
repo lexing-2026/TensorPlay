@@ -77,15 +77,18 @@ bool resolve_all(void* handle) {
         {g_sgetrf, "sgetrf"}, {g_dgetrf, "dgetrf"},
         {g_sgetrs, "sgetrs"}, {g_dgetrs, "dgetrs"},
         {g_spotrf, "spotrf"}, {g_dpotrf, "dpotrf"},
-        {g_sgeqrf, "geqrf"},  {g_dgeqrf, "geqrf"},
-        {g_sorgqr, "orgqr"},  {g_dorgqr, "orgqr"},
-        {g_sgesdd, "gesdd"},  {g_dgesdd, "gesdd"},
-        {g_ssyevd, "syevd"},  {g_dsyevd, "syevd"},
-        {g_sgeev, "geev"},    {g_dgeev, "geev"},
-        {g_strtrs, "trtrs"},  {g_dtrtrs, "trtrs"},
-        {g_sgels, "gels"},    {g_dgels, "gels"},
-        {g_ssytrf, "sytrf"},  {g_dsytrf, "sytrf"},
-        {g_ssytrs, "sytrs"},  {g_dsytrs, "sytrs"},
+        // LAPACK's generic-name routines (geqrf/gesdd/syevd/...) carry the
+        // s/d precision prefix in their symbols; the scipy-openblas wheel
+        // exports them as scipy_<s|d><name>_64_.
+        {g_sgeqrf, "sgeqrf"}, {g_dgeqrf, "dgeqrf"},
+        {g_sorgqr, "sorgqr"}, {g_dorgqr, "dorgqr"},
+        {g_sgesdd, "sgesdd"}, {g_dgesdd, "dgesdd"},
+        {g_ssyevd, "ssyevd"}, {g_dsyevd, "dsyevd"},
+        {g_sgeev,  "sgeev"},  {g_dgeev,  "dgeev"},
+        {g_strtrs, "strtrs"}, {g_dtrtrs, "dtrtrs"},
+        {g_sgels,  "sgels"},  {g_dgels,  "dgels"},
+        {g_ssytrf, "ssytrf"}, {g_dsytrf, "dsytrf"},
+        {g_ssytrs, "ssytrs"}, {g_dsytrs, "dsytrs"},
     };
     for (const auto& p : pairs) {
         p.slot = resolve_one(handle, p.name);
@@ -133,12 +136,17 @@ void* find_library() {
         if (line.find(".so") == std::string::npos) continue;
         if (void* h = dlopen(line.substr(start, end - start).c_str(), RTLD_LAZY | RTLD_NOLOAD)) return h;
     }
-    // numpy's wheel directory inside a conda/venv prefix.
+    // numpy's wheel directory inside a conda/venv prefix.  Distros install
+    // under versioned python3.X paths, so glob every interpreter we can see.
     std::vector<std::string> bases;
     if (const char* cp = std::getenv("CONDA_PREFIX")) bases.push_back(cp);
     if (const char* vp = std::getenv("VIRTUAL_ENV")) bases.push_back(vp);
-    bases.push_back("/usr/local/lib/python3.13/dist-packages");
-    bases.push_back("/usr/lib/python3/dist-packages");
+    {
+        const char* home = std::getenv("PYTHONHOME");
+        if (home) bases.push_back(std::string(home) + "/lib");
+    }
+    bases.push_back("/usr/local/lib");  // Debian/Ubuntu pip: python3.X/dist-packages
+    bases.push_back("/usr/lib");        // apt: python3/dist-packages
     for (const auto& base : bases) {
         const std::string dir_path = base + "/numpy.libs";
         DIR* dir = opendir(dir_path.c_str());
@@ -151,6 +159,25 @@ void* find_library() {
             if (void* h = dlopen(path.c_str(), RTLD_LAZY | RTLD_LOCAL)) return h;
         }
         closedir(dir);
+    }
+    // Versioned interpreter prefixes (python3.Y layout varies across distros).
+    for (const char* prefix : {"/usr/local/lib", "/usr/lib"}) {
+        for (int minor = 8; minor <= 14; ++minor) {
+            for (const char* kind : {"dist-packages", "site-packages"}) {
+                const std::string dir_path = std::string(prefix) + "/python3." +
+                    std::to_string(minor) + "/" + kind + "/numpy.libs";
+                DIR* dir = opendir(dir_path.c_str());
+                if (!dir) continue;
+                while (const dirent* ent = readdir(dir)) {
+                    const std::string name = ent->d_name;
+                    if (name.find("scipy_openblas") == std::string::npos &&
+                        name.find("openblas64") == std::string::npos) continue;
+                    const std::string path = dir_path + "/" + name;
+                    if (void* h = dlopen(path.c_str(), RTLD_LAZY | RTLD_LOCAL)) return h;
+                }
+                closedir(dir);
+            }
+        }
     }
     // Last resort: loader search path.
     return dlopen("libscipy_openblas.so", RTLD_LAZY | RTLD_LOCAL);

@@ -6,7 +6,7 @@ from collections import OrderedDict
 from functools import partial
 from typing import Any, Callable, NamedTuple, Optional
 
-import tensorplay as torch
+import tensorplay as tensorplay
 import tensorplay.nn as nn
 
 from ..ops.misc import Conv2dNormActivation, MLP
@@ -96,7 +96,7 @@ class EncoderBlock(nn.Module):
         mlp_dim: int,
         dropout: float,
         attention_dropout: float,
-        norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
+        norm_layer: Callable[..., tensorplay.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -110,8 +110,8 @@ class EncoderBlock(nn.Module):
         self.ln_2 = norm_layer(hidden_dim)
         self.mlp = MLPBlock(hidden_dim, mlp_dim, dropout)
 
-    def forward(self, input: torch.Tensor):
-        torch._assert(input.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {input.shape}")
+    def forward(self, input: tensorplay.Tensor):
+        tensorplay._assert(input.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {input.shape}")
         x = self.ln_1(input)
         x, _ = self.self_attention(x, x, x, need_weights=False)
         x = self.dropout(x)
@@ -134,12 +134,12 @@ class Encoder(nn.Module):
         mlp_dim: int,
         dropout: float,
         attention_dropout: float,
-        norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
+        norm_layer: Callable[..., tensorplay.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
     ):
         super().__init__()
         # Note that batch_size is on the first dim because
         # we have batch_first=True in nn.MultiAttention() by default
-        self.pos_embedding = nn.Parameter(torch.empty(1, seq_length, hidden_dim).normal_(std=0.02))  # from BERT
+        self.pos_embedding = nn.Parameter(tensorplay.empty(1, seq_length, hidden_dim).normal_(std=0.02))  # from BERT
         self.dropout = nn.Dropout(dropout)
         layers: OrderedDict[str, nn.Module] = OrderedDict()
         for i in range(num_layers):
@@ -154,8 +154,8 @@ class Encoder(nn.Module):
         self.layers = nn.Sequential(layers)
         self.ln = norm_layer(hidden_dim)
 
-    def forward(self, input: torch.Tensor):
-        torch._assert(input.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {input.shape}")
+    def forward(self, input: tensorplay.Tensor):
+        tensorplay._assert(input.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {input.shape}")
         input = input + self.pos_embedding
         return self.ln(self.layers(self.dropout(input)))
 
@@ -175,12 +175,12 @@ class VisionTransformer(nn.Module):
         attention_dropout: float = 0.0,
         num_classes: int = 1000,
         representation_size: Optional[int] = None,
-        norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
+        norm_layer: Callable[..., tensorplay.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
         conv_stem_configs: Optional[list[ConvStemConfig]] = None,
     ):
         super().__init__()
         _log_api_usage_once(self)
-        torch._assert(image_size % patch_size == 0, "Input shape indivisible by patch size!")
+        tensorplay._assert(image_size % patch_size == 0, "Input shape indivisible by patch size!")
         self.image_size = image_size
         self.patch_size = patch_size
         self.hidden_dim = hidden_dim
@@ -220,7 +220,7 @@ class VisionTransformer(nn.Module):
         seq_length = (image_size // patch_size) ** 2
 
         # Add a class token
-        self.class_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+        self.class_token = nn.Parameter(tensorplay.zeros(1, 1, hidden_dim))
         seq_length += 1
 
         self.encoder = Encoder(
@@ -268,11 +268,11 @@ class VisionTransformer(nn.Module):
             nn.init.zeros_(self.heads.head.weight)
             nn.init.zeros_(self.heads.head.bias)
 
-    def _process_input(self, x: torch.Tensor) -> torch.Tensor:
+    def _process_input(self, x: tensorplay.Tensor) -> tensorplay.Tensor:
         n, c, h, w = x.shape
         p = self.patch_size
-        torch._assert(h == self.image_size, f"Wrong image height! Expected {self.image_size} but got {h}!")
-        torch._assert(w == self.image_size, f"Wrong image width! Expected {self.image_size} but got {w}!")
+        tensorplay._assert(h == self.image_size, f"Wrong image height! Expected {self.image_size} but got {h}!")
+        tensorplay._assert(w == self.image_size, f"Wrong image width! Expected {self.image_size} but got {w}!")
         n_h = h // p
         n_w = w // p
 
@@ -289,14 +289,14 @@ class VisionTransformer(nn.Module):
 
         return x
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: tensorplay.Tensor):
         # Reshape and permute the input tensor
         x = self._process_input(x)
         n = x.shape[0]
 
         # Expand the class token to the full batch
         batch_class_token = self.class_token.expand(n, -1, -1)
-        x = torch.cat([batch_class_token, x], dim=1)
+        x = tensorplay.cat([batch_class_token, x], dim=1)
 
         x = self.encoder(x)
 
@@ -359,7 +359,7 @@ class ViT_B_16_Weights(WeightsEnum):
             **_COMMON_META,
             "num_params": 86567656,
             "min_size": (224, 224),
-            "recipe": "https://github.com/pytorch/vision/tree/main/references/classification#vit_b_16",
+            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#vit_b_16",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 81.072,
@@ -410,7 +410,7 @@ class ViT_B_16_Weights(WeightsEnum):
         ),
         meta={
             **_COMMON_SWAG_META,
-            "recipe": "https://github.com/pytorch/vision/pull/5793",
+            "recipe": "https://github.com/tensorplay/vision/pull/5793",
             "num_params": 86567656,
             "min_size": (224, 224),
             "_metrics": {
@@ -438,7 +438,7 @@ class ViT_B_32_Weights(WeightsEnum):
             **_COMMON_META,
             "num_params": 88224232,
             "min_size": (224, 224),
-            "recipe": "https://github.com/pytorch/vision/tree/main/references/classification#vit_b_32",
+            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#vit_b_32",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 75.912,
@@ -464,7 +464,7 @@ class ViT_L_16_Weights(WeightsEnum):
             **_COMMON_META,
             "num_params": 304326632,
             "min_size": (224, 224),
-            "recipe": "https://github.com/pytorch/vision/tree/main/references/classification#vit_l_16",
+            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#vit_l_16",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 79.662,
@@ -474,9 +474,9 @@ class ViT_L_16_Weights(WeightsEnum):
             "_ops": 61.555,
             "_file_size": 1161.023,
             "_docs": """
-                These weights were trained from scratch by using a modified version of TorchVision's
+                These weights were trained from scratch by using a modified version of TensorPlay Vision's
                 `new training recipe
-                <https://pytorch.org/blog/how-to-train-state-of-the-art-models-using-torchvision-latest-primitives/>`_.
+                <https://tensorplay.org/blog/how-to-train-state-of-the-art-models-using-tensorplay.vision-latest-primitives/>`_.
             """,
         },
     )
@@ -516,7 +516,7 @@ class ViT_L_16_Weights(WeightsEnum):
         ),
         meta={
             **_COMMON_SWAG_META,
-            "recipe": "https://github.com/pytorch/vision/pull/5793",
+            "recipe": "https://github.com/tensorplay/vision/pull/5793",
             "num_params": 304326632,
             "min_size": (224, 224),
             "_metrics": {
@@ -544,7 +544,7 @@ class ViT_L_32_Weights(WeightsEnum):
             **_COMMON_META,
             "num_params": 306535400,
             "min_size": (224, 224),
-            "recipe": "https://github.com/pytorch/vision/tree/main/references/classification#vit_l_32",
+            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#vit_l_32",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 76.972,
@@ -599,7 +599,7 @@ class ViT_H_14_Weights(WeightsEnum):
         ),
         meta={
             **_COMMON_SWAG_META,
-            "recipe": "https://github.com/pytorch/vision/pull/5793",
+            "recipe": "https://github.com/tensorplay/vision/pull/5793",
             "num_params": 632045800,
             "min_size": (224, 224),
             "_metrics": {
@@ -627,16 +627,16 @@ def vit_b_16(*, weights: Optional[ViT_B_16_Weights] = None, progress: bool = Tru
     `An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale <https://arxiv.org/abs/2010.11929>`_.
 
     Args:
-        weights (:class:`~torchvision.models.ViT_B_16_Weights`, optional): The pretrained
-            weights to use. See :class:`~torchvision.models.ViT_B_16_Weights`
+        weights (:class:`~tensorplay.vision.models.ViT_B_16_Weights`, optional): The pretrained
+            weights to use. See :class:`~tensorplay.vision.models.ViT_B_16_Weights`
             below for more details and possible values. By default, no pre-trained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.vision_transformer.VisionTransformer``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.vision_transformer.VisionTransformer``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/vision_transformer.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/vision_transformer.py>`_
             for more details about this class.
 
-    .. autoclass:: torchvision.models.ViT_B_16_Weights
+    .. autoclass:: tensorplay.vision.models.ViT_B_16_Weights
         :members:
     """
     weights = ViT_B_16_Weights.verify(weights)
@@ -661,16 +661,16 @@ def vit_b_32(*, weights: Optional[ViT_B_32_Weights] = None, progress: bool = Tru
     `An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale <https://arxiv.org/abs/2010.11929>`_.
 
     Args:
-        weights (:class:`~torchvision.models.ViT_B_32_Weights`, optional): The pretrained
-            weights to use. See :class:`~torchvision.models.ViT_B_32_Weights`
+        weights (:class:`~tensorplay.vision.models.ViT_B_32_Weights`, optional): The pretrained
+            weights to use. See :class:`~tensorplay.vision.models.ViT_B_32_Weights`
             below for more details and possible values. By default, no pre-trained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.vision_transformer.VisionTransformer``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.vision_transformer.VisionTransformer``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/vision_transformer.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/vision_transformer.py>`_
             for more details about this class.
 
-    .. autoclass:: torchvision.models.ViT_B_32_Weights
+    .. autoclass:: tensorplay.vision.models.ViT_B_32_Weights
         :members:
     """
     weights = ViT_B_32_Weights.verify(weights)
@@ -695,16 +695,16 @@ def vit_l_16(*, weights: Optional[ViT_L_16_Weights] = None, progress: bool = Tru
     `An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale <https://arxiv.org/abs/2010.11929>`_.
 
     Args:
-        weights (:class:`~torchvision.models.ViT_L_16_Weights`, optional): The pretrained
-            weights to use. See :class:`~torchvision.models.ViT_L_16_Weights`
+        weights (:class:`~tensorplay.vision.models.ViT_L_16_Weights`, optional): The pretrained
+            weights to use. See :class:`~tensorplay.vision.models.ViT_L_16_Weights`
             below for more details and possible values. By default, no pre-trained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.vision_transformer.VisionTransformer``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.vision_transformer.VisionTransformer``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/vision_transformer.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/vision_transformer.py>`_
             for more details about this class.
 
-    .. autoclass:: torchvision.models.ViT_L_16_Weights
+    .. autoclass:: tensorplay.vision.models.ViT_L_16_Weights
         :members:
     """
     weights = ViT_L_16_Weights.verify(weights)
@@ -729,16 +729,16 @@ def vit_l_32(*, weights: Optional[ViT_L_32_Weights] = None, progress: bool = Tru
     `An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale <https://arxiv.org/abs/2010.11929>`_.
 
     Args:
-        weights (:class:`~torchvision.models.ViT_L_32_Weights`, optional): The pretrained
-            weights to use. See :class:`~torchvision.models.ViT_L_32_Weights`
+        weights (:class:`~tensorplay.vision.models.ViT_L_32_Weights`, optional): The pretrained
+            weights to use. See :class:`~tensorplay.vision.models.ViT_L_32_Weights`
             below for more details and possible values. By default, no pre-trained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.vision_transformer.VisionTransformer``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.vision_transformer.VisionTransformer``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/vision_transformer.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/vision_transformer.py>`_
             for more details about this class.
 
-    .. autoclass:: torchvision.models.ViT_L_32_Weights
+    .. autoclass:: tensorplay.vision.models.ViT_L_32_Weights
         :members:
     """
     weights = ViT_L_32_Weights.verify(weights)
@@ -763,16 +763,16 @@ def vit_h_14(*, weights: Optional[ViT_H_14_Weights] = None, progress: bool = Tru
     `An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale <https://arxiv.org/abs/2010.11929>`_.
 
     Args:
-        weights (:class:`~torchvision.models.ViT_H_14_Weights`, optional): The pretrained
-            weights to use. See :class:`~torchvision.models.ViT_H_14_Weights`
+        weights (:class:`~tensorplay.vision.models.ViT_H_14_Weights`, optional): The pretrained
+            weights to use. See :class:`~tensorplay.vision.models.ViT_H_14_Weights`
             below for more details and possible values. By default, no pre-trained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.vision_transformer.VisionTransformer``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.vision_transformer.VisionTransformer``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/vision_transformer.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/vision_transformer.py>`_
             for more details about this class.
 
-    .. autoclass:: torchvision.models.ViT_H_14_Weights
+    .. autoclass:: tensorplay.vision.models.ViT_H_14_Weights
         :members:
     """
     weights = ViT_H_14_Weights.verify(weights)
@@ -792,22 +792,22 @@ def vit_h_14(*, weights: Optional[ViT_H_14_Weights] = None, progress: bool = Tru
 def interpolate_embeddings(
     image_size: int,
     patch_size: int,
-    model_state: "OrderedDict[str, torch.Tensor]",
+    model_state: "OrderedDict[str, tensorplay.Tensor]",
     interpolation_mode: str = "bicubic",
     reset_heads: bool = False,
-) -> "OrderedDict[str, torch.Tensor]":
+) -> "OrderedDict[str, tensorplay.Tensor]":
     """This function helps interpolate positional embeddings during checkpoint loading,
     especially when you want to apply a pre-trained model on images with different resolution.
 
     Args:
         image_size (int): Image size of the new model.
         patch_size (int): Patch size of the new model.
-        model_state (OrderedDict[str, torch.Tensor]): State dict of the pre-trained model.
+        model_state (OrderedDict[str, tensorplay.Tensor]): State dict of the pre-trained model.
         interpolation_mode (str): The algorithm used for upsampling. Default: bicubic.
         reset_heads (bool): If true, not copying the state of heads. Default: False.
 
     Returns:
-        OrderedDict[str, torch.Tensor]: A state dict which can be loaded into the new model.
+        OrderedDict[str, tensorplay.Tensor]: A state dict which can be loaded into the new model.
     """
     # Shape of pos_embedding is (1, seq_length, hidden_dim)
     pos_embedding = model_state["encoder.pos_embedding"]
@@ -853,12 +853,12 @@ def interpolate_embeddings(
 
         # (1, hidden_dim, new_seq_length) -> (1, new_seq_length, hidden_dim)
         new_pos_embedding_img = new_pos_embedding_img.permute(0, 2, 1)
-        new_pos_embedding = torch.cat([pos_embedding_token, new_pos_embedding_img], dim=1)
+        new_pos_embedding = tensorplay.cat([pos_embedding_token, new_pos_embedding_img], dim=1)
 
         model_state["encoder.pos_embedding"] = new_pos_embedding
 
         if reset_heads:
-            model_state_copy: "OrderedDict[str, torch.Tensor]" = OrderedDict()
+            model_state_copy: "OrderedDict[str, tensorplay.Tensor]" = OrderedDict()
             for k, v in model_state.items():
                 if not k.startswith("heads"):
                     model_state_copy[k] = v

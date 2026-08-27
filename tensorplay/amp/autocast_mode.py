@@ -26,7 +26,6 @@ __all__ = [
 # The autocast state lives in the dispatcher (tensorplay._C), mirroring
 # torch, where is_autocast_enabled/get_autocast_dtype/... are C++ bindings
 # into at::autocast.  Re-export them here under the same names.
-is_autocast_available = _C._is_autocast_available
 is_autocast_enabled = _C.is_autocast_enabled
 get_autocast_dtype = _C.get_autocast_dtype
 set_autocast_enabled = _C.set_autocast_enabled
@@ -36,6 +35,11 @@ autocast_decrement_nesting = _C.autocast_decrement_nesting
 clear_autocast_cache = _C.clear_autocast_cache
 is_autocast_cache_enabled = _C.is_autocast_cache_enabled
 set_autocast_cache_enabled = _C.set_autocast_cache_enabled
+
+# Fused enter/exit (single binding per context transition); absent in older
+# compiled extensions, where we fall back to the granular calls.
+_fused_enter = getattr(_C, "_autocast_enter", None)
+_fused_exit = getattr(_C, "_autocast_exit", None)
 
 
 def get_autocast_gpu_dtype():
@@ -58,6 +62,18 @@ def get_autocast_cpu_dtype():
     return _C.get_autocast_cpu_dtype()
 
 
+def is_autocast_available(device_type: str) -> bool:
+    r"""
+    Return a bool indicating if autocast is available on :attr:`device_type`.
+
+    Args:
+        device_type(str):  Device type to use. Possible values are: 'cuda', 'cpu'.
+            The type is the same as the `type` attribute of a :class:`tensorplay.device`.
+            Thus, you may obtain the device type of a tensor using `Tensor.device.type`.
+    """
+    return _C._is_autocast_available(device_type)
+
+
 def autocast_decorator(autocast_instance, func):
     @functools.wraps(func)
     def decorate_autocast(*args, **kwargs):
@@ -70,13 +86,13 @@ def autocast_decorator(autocast_instance, func):
     return decorate_autocast
 
 
-def _is_cuda_available() -> bool:
+def _amp_definitely_not_available() -> bool:
     try:
         import tensorplay.cuda as cuda
 
-        return cuda.is_available()
+        return not cuda.is_available()
     except Exception:
-        return False
+        return True
 
 
 def _is_cuda_bf16_supported() -> bool:
@@ -169,14 +185,16 @@ class autocast:
             raise ValueError(
                 f"Expected `device_type` of type `str`, got: `{type(device_type)}`"
             )
-        self.fast_dtype = (
-            get_autocast_dtype(device_type) if dtype is None else dtype
-        )
+        # Upstream checks availability BEFORE resolving the default dtype so
+        # unsupported devices raise RuntimeError (not the binding's ValueError).
         self.device = device_type
         if not is_autocast_available(self.device):
             raise RuntimeError(
                 f"User specified an unsupported autocast device_type '{self.device}'"
             )
+        self.fast_dtype = (
+            get_autocast_dtype(device_type) if dtype is None else dtype
+        )
 
         device_supported_dtypes = [tensorplay.bfloat16, tensorplay.float16]
 
@@ -190,9 +208,9 @@ class autocast:
         if enabled:
             # Special case for CUDA AMP and bfloat16 support
             if self.device == "cuda":
-                if not _is_cuda_available():
+                if _amp_definitely_not_available():
                     warnings.warn(
-                        "CUDA is not available. Disabling autocast.",
+                        "CUDA is not available or tensorplay_xla is imported. Disabling autocast.",
                         stacklevel=2,
                     )
                     enabled = False
@@ -215,6 +233,11 @@ class autocast:
         self._enabled = enabled
 
     def __enter__(self):
+        if _fused_enter is not None:
+            self._prev = _fused_enter(
+                self.device, self.fast_dtype, self._enabled, self._cache_enabled
+            )
+            return self
         self.prev_cache_enabled = is_autocast_cache_enabled()
         self.prev = is_autocast_enabled(self.device)
         self.prev_fastdtype = get_autocast_dtype(self.device)
@@ -226,6 +249,9 @@ class autocast:
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any):  # type: ignore[override]
+        if _fused_exit is not None:
+            _fused_exit(self.device, self._prev)
+            return False
         # Drop the cache when we exit to a nesting level that's outside any instance of autocast.
         if autocast_decrement_nesting() == 0:
             clear_autocast_cache()

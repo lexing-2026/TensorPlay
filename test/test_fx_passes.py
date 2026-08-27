@@ -194,14 +194,21 @@ def test_sum_epilogue_detection_and_source():
     assert kind == "sum"
 
     # triples: tmp0=mul(in0,in1); tmp1=relu(tmp0)
+    # Unknown reference shape -> the two-stage split emission: partial sums
+    # into a workspace plus a finalize kernel that writes the scalar.
     codegen = TritonProgramCodegen(program=[3, 0, 1, 17, 2, -1], constants=[],
                                    output_refs=(2,), input_count=2,
                                    reduction="sum")
     src = codegen.generate("k", fixed_config=(256, 4))
-    assert src.count("@triton.jit") == 1          # one kernel, not three
+    assert src.count("@triton.jit") == 2          # main + finalize kernels
     assert "tl.sum(" in src                       # epilogue folded in
-    assert "@triton.autotune" not in src          # fixed config pinned
+    assert "tl.store(ws_ptr + tl.program_id(0), partial)" in src
+    assert "for fbase in tl.range(0, wsn, FBLOCK):" in src
+    assert "acc_f = acc_f + tl.sum(fvals, axis=0)" in src
+    assert "tl.store(out_ptr0, acc_f)" in src
+    assert "@triton.autotune" not in src          # reduction is config-pinned
     assert "tp.empty((), dtype=" in src           # scalar output buffer
+    assert "tp.empty((wsn,)" in src               # split workspace buffer
 
 
 def test_no_epilogue_for_non_sum_tail():

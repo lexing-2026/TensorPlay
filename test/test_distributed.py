@@ -169,8 +169,8 @@ rs_out.zero_()
 dist._reduce_scatter_base(rs_out, flat_in)
 assert L(rs_out) == [float(world)] * 2, f"_reduce_scatter_base {L(rs_out)}"
 
-# group-rank translation APIs
-assert dist.get_process_group_ranks() == list(range(world))
+# group-rank translation APIs (torch: get_process_group_ranks takes a group)
+assert dist.get_process_group_ranks(dist.group.WORLD) == list(range(world))
 sub_all = dist.new_group(ranks=list(range(world)))
 assert dist.get_global_rank(sub_all, rank) == rank
 assert dist.get_group_rank(sub_all, rank) == rank

@@ -21,6 +21,11 @@ public:
     static cublasHandle_t getCublasHandle();
     static cublasLtHandle_t getCublasLtHandle();
     static cusolverDnHandle_t getCusolverDnHandle();
+    // Creates every lazy library handle for the current device up front.
+    // Handle creation performs internal allocations, which are illegal once
+    // stream capture is active (ATen pre-warms for the same reason), so
+    // CUDAGraph::capture_begin calls this before cudaStreamBeginCapture.
+    static void warmupHandles();
 };
 
 // True once this process has made a successful CUDA runtime call. Seeding and

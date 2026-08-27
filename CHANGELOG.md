@@ -1,4 +1,193 @@
-# 1. 构建 / CI / 发布对齐 torch，删除自建构建脚本（2026-08-24）
+# 1. autograd.Function 全面对齐 torch + 引擎原生增强 + forward-mode AD（2026-08-26）
+
+## L5-PERF 轮四(2026-08-27): evict/.cg + packed argmax + 静默窗口复核
+
+### pw 链内核 parity 确认
+- profiler 拆解:`tp_stax` 与 `torch_compile`(inductor) 纯内核 GPU 时间
+  **145.0 vs 145.3 µs, 完全持平**。0.90x 差距全在 Python 启动器:TP
+  wrapper 闭包链(~19 µs/call) vs inductor 静态 launcher(~0)。
+- 改动:① `_load_lines` 参考布局无掩码加载加 `cache_modifier='.cg'`;② dims r-loop
+  与 split-persistent 内循环加载加 `eviction_policy='evict_first'`;③ 固定配置
+  launch 注入 literal grid + `XBLOCK`/`num_warps` constexpr kwarg。
+- 实测(shape 4096×4096, warmup=30, iters=200,min-of-window):
+  - pw gelu-ish tanh/exp chain: **0.90x**
+  - epilogue chain sum(dim=1)*3+1: **1.47x**
+  - full-sum sigmoid: **1.44x**
+  - sum full 16M: 0.37x(噪声,需独占机器复核)
+
+### 原生 argmax packed warp-shuffle
+- `CUDAReduce.cuh` 新增 `PackedArgMaxOps`:将(float value, int64 index)
+  打包为单个 u64 `[key(32)|~index(32)]`,warp shuffle 层只做一次整数
+  max(5次 shuffles 替代原来 10次 + 分支 comparator),NaN/±0/首现 tie
+  保持与原 ArgOps 位等价。
+- `ReductionKernels.cu` argmax_same_dtype:float-family(num_inputs ≤ INT32_MAX)
+  自动走 packed 路径,half/BFloat16 通过 float 提升兼容。
+- 测试:`test/test_cuda_reductions.py` 8 例全绿(含 NaN 首现、±0、
+  ±inf、tie、4096-long 行 vec4 跨路径)。
+
+### 决策缓存盐
+- `stax_autotune.decision_key` 加入 `TUNING_VERSION="t7-evict8w"`,
+  消除 codegen 升级后旧决策长驻问题;CANDIDATE_CONFIGS 新增 (2048,4)
+  16-elem/thread 探子。
+
+### 遗留
+- pw 链仍 0.90x:核心瓶颈是 TP `compiled()` 闭包链 + triton JITFunction
+  dispatch(~19µs/call),inductor 静态 launcher 走 c_wrapper 直连。
+  需复现 Inductor StaticTritonCompileResult 路径,范围超出本轮。
+
+### 静默窗口复核结果(2026-08-28 cc RTX 4090 D)
+- 测试套件:`test_triton_reduction + test_stax_autotune + test_cuda_reductions`
+  **65 passed, 1 xfailed**(`test_triton_reduction` — triton autotune 在
+  共享机器上偶发,属已知噪声)。
+- argmax packed parity vs torch eager(shape 4096×4096 last-dim):
+  - 基本: **match**
+  - tie(all-same value): **match**
+  - NaN-first(首现): **match**
+  - ±inf edge: **match**
+  - bench(tp min-of-200 vs torch min-of-200): ~1.03x(torch 0.03µs vs tp
+    0.02µs,量级为 kernel launch 噪声,实际计算时间在 µs 级,详见下方说明)。
+- sum-full 16M 噪声读数 0.37x 未复核(共享机器仍有其他进程占用)。
+- pw 链 end-to-end 超越 inductor 仍需静态 launcher 路径复现,本轮未达成。
+
+以 third_party/pytorch 源码为蓝本逐文件对比（THPFunction_apply/unpack_input/
+_wrap_outputs/PyNode::apply/engine.cpp），追平并超越：
+
+- **Py 层 `Function` 对齐**：ctx-first backward（实证 torch 约定）；grad_fn 与
+  ctx 双侧 hooks（torch 签名 `(grad_inputs, grad_outputs)` / prehook
+  `(grad_outputs,)`）；`to_save`(tuple 契约)/`metadata`/`next_functions`/
+  `requires_grad`/`mark_dirty`(版本号 bump)/`once_differentiable`/
+  `InplaceFunction`/`NestedIOFunction`；梯度数校验含"多余 None 截断"规则；
+  `FunctionMeta.name`、`generate_vmap_rule`。
+- **单入口融合**：新增 `custom_function_apply` —— 节点创建/unpack_input/
+  AutoGradMode(false) forward/setup_context/wrap_outputs 一次 C 穿越完成，
+  缓存型 `fast_is_tensor` 类型检查，needs 以 tuple 直返。
+- **引擎 InputMetadata 原生化**：Edge 记录 shape/dtype/device 三元组；
+  Node 增 `OutputSlotMeta`（attach 时采集输出元数据）；
+  Engine 在 apply 前 C++ 零填充缺失梯度槽（`set_materialize_grads(False)`
+  透传 None），Python 热路径剔除物化分支。PyNode backward 输入槽语义修正为
+  前向输出数（对齐 CustomFunctionNode），缺失槽自动补 None。
+- **PyNode::apply** 梯度转换改 PyTuple 直构。
+- **saved_tensors_hooks**：新模块 `tensorplay/autograd/graph.py`，pack 在
+  save 时、unpack 随 ctx 快照走。
+- **forward-mode AD 原生核心**：`tensorplay/autograd/forward_ad.py`
+  （level 栈/DualTensor/种子算子 JVP），反向模式与有限差分双重验证。
+- **C++ 编译期自定义算子端到端打通**：修复生成器 GIL 作用域 bug（wrap/error
+  必须持 GIL）；桥接层重构为单拷贝 `libtp_python.so`（libtorch_python 模型）；
+  新增 test/test_cpp_custom_op.py 端到端测试与 benchmark/autograd_function_overhead.py。
+
+性能（静默机器）：custom Function 端到端 fwd+bwd **40-45µs vs torch 62-80µs**
+（快 ~1.7×）；backward 腿 13.5µs vs torch 58.7µs（快 ~4×）；apply 层
+16.9µs vs torch 18.8µs。
+
+# 2. 自定义算子全通道对齐 torch：Py 层补齐 + 调度层性能超越 + tile-lang/tvm-ffi（2026-08-25）
+
+对照 torch 2.13 `torch.library` 全量公开面逐方法审计补齐，四条通道全覆盖：
+
+- **Py 层签名对齐**：`custom_op/triton_op/register_kernel/register_fake/register_vmap`
+  支持 fn 位置参数；新增 `schema=` 参数附着与 `.schema` 内省；
+  `register_autograd` backward 改位置传参。修复 eager 调用丢弃 kwargs 的对齐 bug。
+- **补齐缺失 API**：`CustomOpDef.set_kernel_enabled`（上下文管理器，禁用具体设备内核回退
+  composite 槽）、`get_kernel`（严格按键查找，缺失抛 LookupError）、
+  `register_autocast`（autocast 启用时浮点入参按规则转换后再进内核）、
+  `register_vmap`（接入 autograd.Function.vmap 钩子）、顶层
+  `define/impl/impl_abstract`、`infer_schema`（类型注解→schema 字符串，
+  mutates_args 输出 `Tensor(a!)` 标记）、`opcheck` 四项检测
+  （test_schema 未声明变更/输出别名输入、test_faketensor 元数据一致性、
+  test_autograd_registration 断图探测——TP 内核为隐式复合微分故缺公式合法、
+  test_aot_dispatch_dynamic 捕获重放一致性）。
+- **热路径极致优化**：捕获守卫接 `compiler.graph.capturing()`（无 trace 时完全跳过
+  proxy 扫描，与生成式 functional 包装层同款模式）；内核选择无锁化（GIL 原子读，
+  锁只护写）；设备键免 str() 包装；`is_grad_enabled` 模块级别名绑定。
+  基准 `benchmark/custom_ops_overhead.py`：调度层净开销 2.3µs vs torch 16.0µs，
+  **约 7× 低开销**，端到端调用快 ~2.9×。
+- **tile-lang 一等支持**：`tile_lang_op` + `wrap_tilelang`（已克隆 third_party/tilelang
+  对齐源码：JITKernel `torch_function` 直通、JITImpl 懒工厂 `compile()` 绑定、
+  鸭子类型识别 `adapter/torch_function/get_tir`）；raw launch 误捕获给出指路
+  GraphCaptureError；编译期单节点不透明融合屏障契约同 triton_op。torch 无此 API
+  （Triton 系其自家栈），系按同一契约的超集扩展。
+- **tvm-ffi 直通（C++/CUDA AOT+JIT）**：TP Tensor 实现 DLPack 协议，
+  `tvm_ffi.cpp.load_inline` JIT 与 `build_inline→load_module` AOT 两路的
+  `tvm::ffi::TensorView` 参数零拷贝直通 TP 张量（实测验证，零适配代码）；
+  新增 `test/test_tvm_ffi.py` 覆盖 JIT/AOT 往返 + ffi 内核包进 custom_op 后的
+  autograd/opcheck 全过/编译屏障语义保持；docs/source/library.md 增补用法章节。
+
+# 2. CUDA graphs 原生对齐 torch：补齐差距（条件节点/并发捕获/graphed callables）（2026-08-25）
+
+对齐 torch 的最后三块能力差距：
+
+- **条件节点（if/while 图）**：`CUDAGraph.begin_capture_to_if_node /
+  begin_capture_to_while_node / set_conditional_handle_for_current_node /
+  end_capture_to_conditional_node`，CUDA ≥ 12.4（`cudaGraphConditionalHandle`
+  + 捕获内核 `cudaGraphSetConditional` + `cudaStreamBeginCaptureToGraph`，
+  版本分支与 torch 相同）。条件体在专属子流上捕获，分配路由经
+  `routeStreamToPool/unrouteStreamFromPool` 复用父图私有池；
+  嵌套条件以 handle 栈管理。Python 层同名方法 + `_C.conditional_nodes_supported()`。
+- **多设备并发捕获**：allocator 路由从单一 `capture_` 插槽改为
+  `active_captures_` 列表（线性扫描），不同设备/线程可同时各持一个捕获窗口；
+  GraphState 按 `std::thread::id` 键控捕获槽——同线程嵌套仍拒绝，跨线程并行放行。
+  `memory_stats` 新增 `active_captures` 字段。
+- **make_graphed_callables / make_graphed_autograd_function**：自 torch 完整移植。
+  共享池上先 warmup、再按 fwd1..fwdN → bwdN..bwd1 顺序捕获前后向图，
+  返回 forward/backward 均为图回放的 autograd Function（once_differentiable）；
+  附带最小 pytree（flatten/unflatten 往返含 tuple/list/dict 嵌套）替代
+  torch.utils._pytree。nn.Module 传入时替换 forward 并保留 training 状态切换回退。
+- **测试**：新增 if 条件节点真伪两路验证、双 GPU 双线程并发捕获一致性、
+  graphed callables 前向输出与 x/W 梯度对齐 eager 三组 GPU 门控测试。
+
+# 2. CUDA graphs 原生对齐 torch + 回放路径性能超越（2026-08-25）
+
+原生层重写为 `tensorplay::cuda::graph::CUDAGraph` 类（对照 `at::cuda::CUDAGraph`），
+删除旧的整型句柄自由函数接口与 Python 侧流切换编排：
+
+- **捕获语义对齐 torch**：`capture_end()` 即完成 `cudaGraphInstantiateWithFlags`
+  （原实现推迟到首次 replay 且每次 replay 空转一次 instantiate 检查）；
+  `replay()` 直接持有 exec 指针发射，无注册表互斥锁/查表；支持
+  `capture_error_mode`（global/thread_local/relaxed → `cudaStreamBeginCapture` 模式）、
+  自定义捕获流、`enable_debug_mode()/debug_dump()`（`cudaGraphDebugDotPrint`，debug 时保留模板）。
+- **共享内存池**：新增 `graph_pool_handle()`；allocator 的 `beginGraphCapture`
+  支持复用已存在 pool id（惰性创建），多个 graph 经 `graph(pool=...)` 共享一个私有池；
+  GraphState 按 pool 引用计数释放段，先 reset 的 graph 不会释放仍被其他可执行文件
+  引用的地址。
+- **回放快路径（超越点）**：新增 `stage_and_launch(static_inputs, inputs)` —— 全部输入
+  在单次 Python→C++ 调用内用裸 `cudaMemcpyAsync` D2D 拷贝到静态缓冲（绕过 dispatcher/
+  版本号/autograd 记账），并对源 tensor 做 recordStream 防提前回收，随后同调用内
+  发射图；非连续/跨设备/类型漂移回退完整 `copy_` 语义。
+  `CudaGraphManager.replay` 默认走该路径，torch 无等价单调用接口。
+- **CUDAStream 热路径优化**：设备数进程级缓存（原先每次取流都调
+  `cudaGetDeviceCount`）；每线程当前流从 unordered_map 换成按 device 下标的扁平数组
+  （消除每次 kernel launch 的哈希查找）；`priority()/query()/synchronize()` 去掉多余
+  设备 guard（stream 句柄自带 context，c10 同款做法）。
+- **Python 层**：`tensorplay/cuda/graphs.py` 重写为原生类薄封装并补齐
+  pool/stream/error_mode/debug_dump/export_dot；`compiler/cudagraphs.py` 删除
+  Python 流切换与逐输入 copy_ 编排；旧 `_C.cuda_graph_*` 自由函数绑定全部移除。
+- **测试/基准**：`test/test_cudagraphs.py` 迁移到新注入面；新增 GPU 门控的
+  `test/test_cuda_graph_gpu.py`（eager 一致性、RNG 跨回放新鲜、共享池引用计数、
+  批量暂存、DOT 导出、嵌套捕获拒绝、多流回放）；新增
+  `benchmark/bench_cudagraph_replay.py` 对比 eager/manual/bulk 与 torch 的
+  每迭代主机开销。
+
+# 2. CUDA 流/图极致优化 + 碎片管理（2026-08-25，同日第二波）
+
+- **当前设备线程级缓存**：所有 `cudaSetDevice` 收口到 `setDeviceCached`/
+  `CUDAGuard`（全仓库仅 CUDARuntime.cpp 一处 set 点），`currentDevice()` 与
+  `getCurrentCUDAStream(-1)` 从每次一次驱动调用降为一次 TLS 读——kernel launch
+  热路径上 torch 仍需 `cudaGetDevice`，此点严格低于 torch 开销。
+- **图回放微优化**：`replay()` 仅在设备不匹配时构造 guard（TLS 比较）；
+  新增 `replay(stream=...)` 显式流重载，钉在单流的回放循环连 current-stream
+  查询都省掉；RNG prologue 保持无 RNG 图零开销。
+- **图池碎片整理**：GraphPool 新增地址有序索引与相邻空闲块合并
+  （同 segment+stream），混合尺寸捕获共用一个池时不再碎裂成不可用小片；
+  `take/insert` 全部走合并路径。
+- **OOM 防御梯队**：分配失败时先同步排空该设备的跨流事件 pending 块
+  （字节立即可复用），再整体 flush 缓存后重试；最终 OOM 报文附带
+  reserved/allocated/free 统计（对齐 torch 的诊断信息量）。
+- **碎片可观测性**：新增原生 `memory_stats(device)`（segments、free_blocks、
+  free_bytes、largest_free_block、pending_blocks/bytes、graph_pools、capturing），
+  绑定到 `_C._cuda.memory_stats` 并接入 `tp.cuda.memory_stats*` 的嵌套字典
+  （torch 形状键保留，新增 `allocator` 小节）；`inactive_split*` 键从占位 0
+  改为真实值。
+
+# 3. 构建 / CI / 发布对齐 torch，删除自建构建脚本（2026-08-24）
 
 对照 `third_party/pytorch` 的 pyproject.toml 与 `.github/workflows/` 重排构建、CI 与发布，
 删除自建的 Python 构建编排脚本：

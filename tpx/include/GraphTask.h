@@ -36,6 +36,10 @@ struct GraphTask {
     bool keep_graph_;
     bool grad_mode_;
 
+    // Monotonic id for TP_ENGINE_TRACE correlation across concurrent or
+    // nested graphs. Zero cost when tracing is off.
+    uint64_t trace_id_ = 0;
+
     // --- Shared state (guarded by mutex_ once execution starts) ---
     std::unordered_map<Node*, InputBuffer> not_ready_;
     std::unordered_map<Node*, int> dependencies_;

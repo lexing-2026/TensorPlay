@@ -48,15 +48,22 @@ set(P10_SOURCES
     src/backend/cpu/LossKernels.cpp
     src/backend/cpu/ViewKernels.cpp
     src/backend/cpu/ShapeAlignKernels.cpp
+    src/backend/cpu/GradientKernels.cpp
     src/backend/cpu/ForeachKernels.cpp
     src/backend/cpu/OptimizerKernels.cpp
-    src/backend/cpu/LlmReferenceKernels.cpp
+    src/backend/cpu/SamplingKernels.cpp
+    src/backend/cpu/TransformersKernels.cpp
     src/backend/cpu/IndexingKernels.cpp
     src/backend/cpu/TierOpsKernels.cpp
     src/backend/cpu/Tier5OpsKernels.cpp
     src/backend/cpu/SpecialKernels.cpp
     src/backend/cpu/SpectralKernels.cpp
+    src/backend/cpu/InplaceCompletionKernels.cpp
     src/Einsum.cpp
+    src/Profiler.cpp
+    src/ProfilerGpu.cpp
+    src/ProfilerNvtx.cpp
+    src/ProfilerItt.cpp
     src/TensorIterator.cpp
     src/TensorIteratorReduce.cpp
     
@@ -72,6 +79,7 @@ if(USE_CUDA)
         src/backend/cuda/NCCLContext.cpp
         src/backend/cuda/CUDARuntime.cpp
         src/backend/cuda/CUDAGraph.cpp
+        src/backend/cuda/CUDAGraphKernels.cu
         src/backend/cuda/CUDARuntimeKernels.cu
         src/backend/cuda/ArithmeticKernels.cu
         src/backend/cuda/CopyKernels.cu
@@ -108,6 +116,7 @@ if(USE_CUDA)
         src/backend/cuda/Tier5LossesKernels.cu
         src/backend/cuda/SpecialKernels.cu
         src/backend/cuda/SpectralKernels.cu
+        src/backend/cuda/InplaceCompletionKernels.cu
     )
 endif()
 
@@ -128,21 +137,44 @@ set_source_files_properties(${GEN_CPP} PROPERTIES GENERATED TRUE)
 # HAVE_AVX2_CPU_DEFINITION is defined).
 set(TP_CPU_KERNEL_SRCS
     src/backend/cpu/ReductionKernelsImpl.cpp
+    src/backend/cpu/ActivationUnaryKernels.cpp
     src/backend/cpu/StaxPointwiseKernels.cpp
+    src/backend/cpu/ComplexKernels.cpp
 )
 
 if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
+    # Probe AVX512 support the way torch's Codegen.cmake does
+    # (CXX_AVX512_FOUND): only build the tier when the compiler accepts the
+    # ISA flags, mirroring CPU_CAPABILITY_NAMES/FLAGS there.
+    include(CheckCXXCompilerFlag)
+    check_cxx_compiler_flag("-mavx512f -mavx512bw -mavx512vl -mavx512dq -mfma"
+        TP_CXX_AVX512_FOUND)
     foreach(KERNEL_SRC ${TP_CPU_KERNEL_SRCS})
         get_filename_component(KERNEL_NAME ${KERNEL_SRC} NAME_WE)
         add_library(p10_kernel_default_${KERNEL_NAME} OBJECT ${KERNEL_SRC})
         set_target_properties(p10_kernel_default_${KERNEL_NAME} PROPERTIES
             POSITION_INDEPENDENT_CODE ON)
+        # torch parity (Codegen.cmake): HAVE_* capability macros are global
+        # (add_compile_definitions), so every tier sees the same DispatchStub
+        # layout; only CPU_CAPABILITY differs per copy.
         target_compile_definitions(p10_kernel_default_${KERNEL_NAME} PRIVATE
-            CPU_CAPABILITY_DEFAULT CPU_CAPABILITY=DEFAULT)
+            CPU_CAPABILITY_DEFAULT CPU_CAPABILITY=DEFAULT
+            HAVE_AVX2_CPU_DEFINITION)
+        if(TP_CXX_AVX512_FOUND)
+            target_compile_definitions(p10_kernel_default_${KERNEL_NAME} PRIVATE
+                HAVE_AVX512_CPU_DEFINITION)
+        endif()
         target_include_directories(p10_kernel_default_${KERNEL_NAME} PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/include ${GEN_BASE_DIR})
         target_compile_definitions(p10_kernel_default_${KERNEL_NAME} PRIVATE
             ${BLAS_COMPILE_DEFS})
+        # ComplexKernels owns the DispatchStub definitions.  Only its DEFAULT
+        # copy emits those definitions; AVX2/AVX512 copies contribute the
+        # capability-specific implementations and registrations.
+        if(KERNEL_NAME STREQUAL "ComplexKernels")
+            target_compile_definitions(p10_kernel_default_${KERNEL_NAME} PRIVATE
+                TP_COMPLEX_KERNELS_DEFINE_DISPATCH)
+        endif()
         add_dependencies(p10_kernel_default_${KERNEL_NAME} generate_code)
 
         add_library(p10_kernel_avx2_${KERNEL_NAME} OBJECT ${KERNEL_SRC})
@@ -150,7 +182,15 @@ if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
             POSITION_INDEPENDENT_CODE ON)
         target_compile_definitions(p10_kernel_avx2_${KERNEL_NAME} PRIVATE
             CPU_CAPABILITY_AVX2 CPU_CAPABILITY=AVX2 HAVE_AVX2_CPU_DEFINITION)
+        if(TP_CXX_AVX512_FOUND)
+            target_compile_definitions(p10_kernel_avx2_${KERNEL_NAME} PRIVATE
+                HAVE_AVX512_CPU_DEFINITION)
+        endif()
         target_compile_options(p10_kernel_avx2_${KERNEL_NAME} PRIVATE -mavx2 -mfma)
+        if(KERNEL_NAME STREQUAL "ComplexKernels")
+            target_compile_definitions(p10_kernel_avx2_${KERNEL_NAME} PRIVATE
+                TP_COMPLEX_KERNELS_NO_DISPATCH_DEFINITION)
+        endif()
         target_include_directories(p10_kernel_avx2_${KERNEL_NAME} PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/include ${GEN_BASE_DIR})
         target_compile_definitions(p10_kernel_avx2_${KERNEL_NAME} PRIVATE
@@ -159,16 +199,63 @@ if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
 
         list(APPEND TP_CPU_KERNEL_DEFAULT_OBJS $<TARGET_OBJECTS:p10_kernel_default_${KERNEL_NAME}>)
         list(APPEND TP_CPU_KERNEL_AVX2_OBJS $<TARGET_OBJECTS:p10_kernel_avx2_${KERNEL_NAME}>)
+
+        if(TP_CXX_AVX512_FOUND)
+            add_library(p10_kernel_avx512_${KERNEL_NAME} OBJECT ${KERNEL_SRC})
+            set_target_properties(p10_kernel_avx512_${KERNEL_NAME} PROPERTIES
+                POSITION_INDEPENDENT_CODE ON)
+            target_compile_definitions(p10_kernel_avx512_${KERNEL_NAME} PRIVATE
+                CPU_CAPABILITY_AVX512 CPU_CAPABILITY=AVX512 HAVE_AVX512_CPU_DEFINITION HAVE_AVX2_CPU_DEFINITION)
+            # Same flag set as Codegen.cmake's AVX512 capability entry.
+            target_compile_options(p10_kernel_avx512_${KERNEL_NAME} PRIVATE
+                -mavx512f -mavx512bw -mavx512vl -mavx512dq -mfma)
+            if(KERNEL_NAME STREQUAL "ComplexKernels")
+                target_compile_definitions(p10_kernel_avx512_${KERNEL_NAME} PRIVATE
+                    TP_COMPLEX_KERNELS_NO_DISPATCH_DEFINITION)
+            endif()
+            target_include_directories(p10_kernel_avx512_${KERNEL_NAME} PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/include ${GEN_BASE_DIR})
+            target_compile_definitions(p10_kernel_avx512_${KERNEL_NAME} PRIVATE
+                ${BLAS_COMPILE_DEFS})
+            add_dependencies(p10_kernel_avx512_${KERNEL_NAME} generate_code)
+            list(APPEND TP_CPU_KERNEL_AVX512_OBJS $<TARGET_OBJECTS:p10_kernel_avx512_${KERNEL_NAME}>)
+        endif()
     endforeach()
     list(APPEND P10_SOURCES ${TP_CPU_KERNEL_DEFAULT_OBJS} ${TP_CPU_KERNEL_AVX2_OBJS})
+    if(TP_CXX_AVX512_FOUND)
+        list(APPEND P10_SOURCES ${TP_CPU_KERNEL_AVX512_OBJS})
+    endif()
 endif()
 
 add_library(p10 ${P10_SOURCES})
 # Enable UNITY_BUILD for faster compilation
 set_target_properties(p10 PROPERTIES UNITY_BUILD OFF)
 
+if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
+    # Tell DispatchStub (and every TU) that AVX2 kernel copies exist, so the
+    # AVX2 dispatch slots are registered and selected at runtime.
+    target_compile_definitions(p10 PUBLIC HAVE_AVX2_CPU_DEFINITION)
+    if(TP_CXX_AVX512_FOUND)
+        target_compile_definitions(p10 PUBLIC HAVE_AVX512_CPU_DEFINITION)
+    endif()
+endif()
+
 if(USE_CUDA)
-    # ATen alignment: allow __device__ lambdas and constexpr libm calls in .cu kernels
+    # The native aligned flash path consumes only the standalone CUTE/CUTLASS
+    # headers and flash kernels.  It intentionally does not include or link
+    # ATen; when the local Torch source tree is absent the TensorPlay fallback
+    # kernels remain buildable.
+    set(TP_NATIVE_FLASH_SRC
+        "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/pytorch/third_party/flash-attention/csrc/flash_attn/src")
+    set(TP_NATIVE_CUTLASS_INCLUDE
+        "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/pytorch/third_party/cutlass/include")
+    if(EXISTS "${TP_NATIVE_FLASH_SRC}/flash.h" AND
+       EXISTS "${TP_NATIVE_CUTLASS_INCLUDE}/cute/tensor.hpp")
+        target_include_directories(p10 PRIVATE
+            "${TP_NATIVE_FLASH_SRC}"
+            "${TP_NATIVE_CUTLASS_INCLUDE}")
+    endif()
+    # CUDA kernel alignment: allow __device__ lambdas and constexpr libm calls in .cu kernels
     target_compile_options(p10 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda --expt-relaxed-constexpr>)
     # The local toolkit ships 13.0 headers while nvcc is 13.2; cccl's strict
     # CUDART-vs-compiler check otherwise rejects any TU that includes
@@ -177,11 +264,6 @@ if(USE_CUDA)
     target_compile_definitions(p10 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:CCCL_DISABLE_CTK_COMPATIBILITY_CHECK>)
 endif()
 
-if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
-    # Tell DispatchStub (and every TU) that AVX2 kernel copies exist, so the
-    # AVX2 dispatch slots are registered and selected at runtime.
-    target_compile_definitions(p10 PUBLIC HAVE_AVX2_CPU_DEFINITION)
-endif()
 # Exclude generated files from UNITY_BUILD as they might cause conflicts or be too large
 set_source_files_properties(${GEN_CPP} PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
 

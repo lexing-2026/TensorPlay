@@ -17,7 +17,7 @@ class SUN397(VisionDataset):
 
     Args:
         root (str or ``pathlib.Path``): Root directory of the dataset.
-        transform (callable, optional): A function/transform that takes in a PIL image or torch.Tensor, depends on the given loader,
+        transform (callable, optional): A function/transform that takes in a PIL image or tensorplay.Tensor, depends on the given loader,
             and returns a transformed version. E.g, ``transforms.RandomCrop``
         target_transform (callable, optional): A function/transform that takes in the target and transforms it.
         download (bool, optional): If true, downloads the dataset from the internet and
@@ -25,7 +25,7 @@ class SUN397(VisionDataset):
             downloaded again.
         loader (callable, optional): A function to load an image given its path.
             By default, it uses PIL as its image loader, but users could also pass in
-            ``torchvision.io.decode_image`` for decoding image data into tensors directly.
+            ``tensorplay.vision.io.decode_image`` for decoding image data into tensors directly.
     """
 
     _DATASET_URL = "http://vision.princeton.edu/projects/2010/SUN/SUN397.tar.gz"

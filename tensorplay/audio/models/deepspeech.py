@@ -1,9 +1,9 @@
-import tensorplay as torch
+import tensorplay as tensorplay
 
 __all__ = ["DeepSpeech"]
 
 
-class FullyConnected(torch.nn.Module):
+class FullyConnected(tensorplay.nn.Module):
     """
     Args:
         n_feature: Number of input features
@@ -12,20 +12,20 @@ class FullyConnected(torch.nn.Module):
 
     def __init__(self, n_feature: int, n_hidden: int, dropout: float, relu_max_clip: int = 20) -> None:
         super(FullyConnected, self).__init__()
-        self.fc = torch.nn.Linear(n_feature, n_hidden, bias=True)
+        self.fc = tensorplay.nn.Linear(n_feature, n_hidden, bias=True)
         self.relu_max_clip = relu_max_clip
         self.dropout = dropout
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: tensorplay.Tensor) -> tensorplay.Tensor:
         x = self.fc(x)
-        x = torch.nn.functional.relu(x)
-        x = torch.nn.functional.hardtanh(x, 0, self.relu_max_clip)
+        x = tensorplay.nn.functional.relu(x)
+        x = tensorplay.nn.functional.hardtanh(x, 0, self.relu_max_clip)
         if self.dropout:
-            x = torch.nn.functional.dropout(x, self.dropout, self.training)
+            x = tensorplay.nn.functional.dropout(x, self.dropout, self.training)
         return x
 
 
-class DeepSpeech(torch.nn.Module):
+class DeepSpeech(tensorplay.nn.Module):
     """DeepSpeech architecture introduced in
     *Deep Speech: Scaling up end-to-end speech recognition* :cite:`hannun2014deep`.
 
@@ -47,14 +47,14 @@ class DeepSpeech(torch.nn.Module):
         self.fc1 = FullyConnected(n_feature, n_hidden, dropout)
         self.fc2 = FullyConnected(n_hidden, n_hidden, dropout)
         self.fc3 = FullyConnected(n_hidden, n_hidden, dropout)
-        self.bi_rnn = torch.nn.RNN(n_hidden, n_hidden, num_layers=1, nonlinearity="relu", bidirectional=True)
+        self.bi_rnn = tensorplay.nn.RNN(n_hidden, n_hidden, num_layers=1, nonlinearity="relu", bidirectional=True)
         self.fc4 = FullyConnected(n_hidden, n_hidden, dropout)
-        self.out = torch.nn.Linear(n_hidden, n_class)
+        self.out = tensorplay.nn.Linear(n_hidden, n_class)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: tensorplay.Tensor) -> tensorplay.Tensor:
         """
         Args:
-            x (torch.Tensor): Tensor of dimension (batch, channel, time, feature).
+            x (tensorplay.Tensor): Tensor of dimension (batch, channel, time, feature).
         Returns:
             Tensor: Predictor tensor of dimension (batch, time, class).
         """
@@ -79,6 +79,6 @@ class DeepSpeech(torch.nn.Module):
         # T x N x n_class
         x = x.permute(1, 0, 2)
         # N x T x n_class
-        x = torch.nn.functional.log_softmax(x, dim=2)
+        x = tensorplay.nn.functional.log_softmax(x, dim=2)
         # N x T x n_class
         return x

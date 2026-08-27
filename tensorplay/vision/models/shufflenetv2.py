@@ -4,7 +4,7 @@
 from functools import partial
 from typing import Any, Callable, Optional
 
-import tensorplay as torch
+import tensorplay as tensorplay
 import tensorplay.nn as nn
 from tensorplay import Tensor
 
@@ -35,7 +35,7 @@ def channel_shuffle(x: Tensor, groups: int) -> Tensor:
     # reshape
     x = x.view(batchsize, groups, channels_per_group, height, width)
 
-    x = torch.transpose(x, 1, 2).contiguous()
+    x = tensorplay.transpose(x, 1, 2).contiguous()
 
     # flatten
     x = x.view(batchsize, num_channels, height, width)
@@ -95,9 +95,9 @@ class InvertedResidual(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         if self.stride == 1:
             x1, x2 = x.chunk(2, dim=1)
-            out = torch.cat((x1, self.branch2(x2)), dim=1)
+            out = tensorplay.cat((x1, self.branch2(x2)), dim=1)
         else:
-            out = torch.cat((self.branch1(x), self.branch2(x)), dim=1)
+            out = tensorplay.cat((self.branch1(x), self.branch2(x)), dim=1)
 
         out = channel_shuffle(out, 2)
 
@@ -243,7 +243,7 @@ class ShuffleNet_V2_X1_5_Weights(WeightsEnum):
         transforms=partial(ImageClassification, crop_size=224, resize_size=232),
         meta={
             **_COMMON_META,
-            "recipe": "https://github.com/pytorch/vision/pull/5906",
+            "recipe": "https://github.com/tensorplay/vision/pull/5906",
             "num_params": 3503624,
             "_metrics": {
                 "ImageNet-1K": {
@@ -254,8 +254,8 @@ class ShuffleNet_V2_X1_5_Weights(WeightsEnum):
             "_ops": 0.296,
             "_file_size": 13.557,
             "_docs": """
-                These weights were trained from scratch by using TorchVision's `new training recipe
-                <https://pytorch.org/blog/how-to-train-state-of-the-art-models-using-torchvision-latest-primitives/>`_.
+                These weights were trained from scratch by using TensorPlay Vision's `new training recipe
+                <https://tensorplay.org/blog/how-to-train-state-of-the-art-models-using-tensorplay.vision-latest-primitives/>`_.
             """,
         },
     )
@@ -268,7 +268,7 @@ class ShuffleNet_V2_X2_0_Weights(WeightsEnum):
         transforms=partial(ImageClassification, crop_size=224, resize_size=232),
         meta={
             **_COMMON_META,
-            "recipe": "https://github.com/pytorch/vision/pull/5906",
+            "recipe": "https://github.com/tensorplay/vision/pull/5906",
             "num_params": 7393996,
             "_metrics": {
                 "ImageNet-1K": {
@@ -279,8 +279,8 @@ class ShuffleNet_V2_X2_0_Weights(WeightsEnum):
             "_ops": 0.583,
             "_file_size": 28.433,
             "_docs": """
-                These weights were trained from scratch by using TorchVision's `new training recipe
-                <https://pytorch.org/blog/how-to-train-state-of-the-art-models-using-torchvision-latest-primitives/>`_.
+                These weights were trained from scratch by using TensorPlay Vision's `new training recipe
+                <https://tensorplay.org/blog/how-to-train-state-of-the-art-models-using-tensorplay.vision-latest-primitives/>`_.
             """,
         },
     )
@@ -298,19 +298,19 @@ def shufflenet_v2_x0_5(
     <https://arxiv.org/abs/1807.11164>`__.
 
     Args:
-        weights (:class:`~torchvision.models.ShuffleNet_V2_X0_5_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.ShuffleNet_V2_X0_5_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.ShuffleNet_V2_X0_5_Weights` below for
+            :class:`~tensorplay.vision.models.ShuffleNet_V2_X0_5_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.shufflenetv2.ShuffleNetV2``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.shufflenetv2.ShuffleNetV2``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/shufflenetv2.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/shufflenetv2.py>`_
             for more details about this class.
 
-    .. autoclass:: torchvision.models.ShuffleNet_V2_X0_5_Weights
+    .. autoclass:: tensorplay.vision.models.ShuffleNet_V2_X0_5_Weights
         :members:
     """
     weights = ShuffleNet_V2_X0_5_Weights.verify(weights)
@@ -329,19 +329,19 @@ def shufflenet_v2_x1_0(
     <https://arxiv.org/abs/1807.11164>`__.
 
     Args:
-        weights (:class:`~torchvision.models.ShuffleNet_V2_X1_0_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.ShuffleNet_V2_X1_0_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.ShuffleNet_V2_X1_0_Weights` below for
+            :class:`~tensorplay.vision.models.ShuffleNet_V2_X1_0_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.shufflenetv2.ShuffleNetV2``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.shufflenetv2.ShuffleNetV2``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/shufflenetv2.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/shufflenetv2.py>`_
             for more details about this class.
 
-    .. autoclass:: torchvision.models.ShuffleNet_V2_X1_0_Weights
+    .. autoclass:: tensorplay.vision.models.ShuffleNet_V2_X1_0_Weights
         :members:
     """
     weights = ShuffleNet_V2_X1_0_Weights.verify(weights)
@@ -360,19 +360,19 @@ def shufflenet_v2_x1_5(
     <https://arxiv.org/abs/1807.11164>`__.
 
     Args:
-        weights (:class:`~torchvision.models.ShuffleNet_V2_X1_5_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.ShuffleNet_V2_X1_5_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.ShuffleNet_V2_X1_5_Weights` below for
+            :class:`~tensorplay.vision.models.ShuffleNet_V2_X1_5_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.shufflenetv2.ShuffleNetV2``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.shufflenetv2.ShuffleNetV2``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/shufflenetv2.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/shufflenetv2.py>`_
             for more details about this class.
 
-    .. autoclass:: torchvision.models.ShuffleNet_V2_X1_5_Weights
+    .. autoclass:: tensorplay.vision.models.ShuffleNet_V2_X1_5_Weights
         :members:
     """
     weights = ShuffleNet_V2_X1_5_Weights.verify(weights)
@@ -391,19 +391,19 @@ def shufflenet_v2_x2_0(
     <https://arxiv.org/abs/1807.11164>`__.
 
     Args:
-        weights (:class:`~torchvision.models.ShuffleNet_V2_X2_0_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.ShuffleNet_V2_X2_0_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.ShuffleNet_V2_X2_0_Weights` below for
+            :class:`~tensorplay.vision.models.ShuffleNet_V2_X2_0_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.shufflenetv2.ShuffleNetV2``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.shufflenetv2.ShuffleNetV2``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/shufflenetv2.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/shufflenetv2.py>`_
             for more details about this class.
 
-    .. autoclass:: torchvision.models.ShuffleNet_V2_X2_0_Weights
+    .. autoclass:: tensorplay.vision.models.ShuffleNet_V2_X2_0_Weights
         :members:
     """
     weights = ShuffleNet_V2_X2_0_Weights.verify(weights)

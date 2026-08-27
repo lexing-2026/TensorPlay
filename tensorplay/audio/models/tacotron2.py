@@ -28,9 +28,9 @@
 import warnings
 from typing import List, Optional, Tuple, Union
 
-import tensorplay as torch
-from torch import nn, Tensor
-from torch.nn import functional as F
+import tensorplay as tensorplay
+from tensorplay import nn, Tensor
+from tensorplay.nn import functional as F
 
 
 __all__ = [
@@ -38,21 +38,21 @@ __all__ = [
 ]
 
 
-def _get_linear_layer(in_dim: int, out_dim: int, bias: bool = True, w_init_gain: str = "linear") -> torch.nn.Linear:
+def _get_linear_layer(in_dim: int, out_dim: int, bias: bool = True, w_init_gain: str = "linear") -> tensorplay.nn.Linear:
     r"""Linear layer with xavier uniform initialization.
 
     Args:
         in_dim (int): Size of each input sample.
         out_dim (int): Size of each output sample.
         bias (bool, optional): If set to ``False``, the layer will not learn an additive bias. (Default: ``True``)
-        w_init_gain (str, optional): Parameter passed to ``torch.nn.init.calculate_gain``
+        w_init_gain (str, optional): Parameter passed to ``tensorplay.nn.init.calculate_gain``
             for setting the gain parameter of ``xavier_uniform_``. (Default: ``linear``)
 
     Returns:
-        (torch.nn.Linear): The corresponding linear layer.
+        (tensorplay.nn.Linear): The corresponding linear layer.
     """
-    linear = torch.nn.Linear(in_dim, out_dim, bias=bias)
-    torch.nn.init.xavier_uniform_(linear.weight, gain=torch.nn.init.calculate_gain(w_init_gain))
+    linear = tensorplay.nn.Linear(in_dim, out_dim, bias=bias)
+    tensorplay.nn.init.xavier_uniform_(linear.weight, gain=tensorplay.nn.init.calculate_gain(w_init_gain))
     return linear
 
 
@@ -65,7 +65,7 @@ def _get_conv1d_layer(
     dilation: int = 1,
     bias: bool = True,
     w_init_gain: str = "linear",
-) -> torch.nn.Conv1d:
+) -> tensorplay.nn.Conv1d:
     r"""1D convolution with xavier uniform initialization.
 
     Args:
@@ -76,18 +76,18 @@ def _get_conv1d_layer(
         padding (str, int or tuple, optional): Padding added to both sides of the input.
             (Default: dilation * (kernel_size - 1) / 2)
         dilation (int, optional): Number of channels in the input image. (Default: ``1``)
-        w_init_gain (str, optional): Parameter passed to ``torch.nn.init.calculate_gain``
+        w_init_gain (str, optional): Parameter passed to ``tensorplay.nn.init.calculate_gain``
             for setting the gain parameter of ``xavier_uniform_``. (Default: ``linear``)
 
     Returns:
-        (torch.nn.Conv1d): The corresponding Conv1D layer.
+        (tensorplay.nn.Conv1d): The corresponding Conv1D layer.
     """
     if padding is None:
         if kernel_size % 2 != 1:
             raise ValueError("kernel_size must be odd")
         padding = int(dilation * (kernel_size - 1) / 2)
 
-    conv1d = torch.nn.Conv1d(
+    conv1d = tensorplay.nn.Conv1d(
         in_channels,
         out_channels,
         kernel_size=kernel_size,
@@ -97,7 +97,7 @@ def _get_conv1d_layer(
         bias=bias,
     )
 
-    torch.nn.init.xavier_uniform_(conv1d.weight, gain=torch.nn.init.calculate_gain(w_init_gain))
+    tensorplay.nn.init.xavier_uniform_(conv1d.weight, gain=tensorplay.nn.init.calculate_gain(w_init_gain))
 
     return conv1d
 
@@ -112,10 +112,10 @@ def _get_mask_from_lengths(lengths: Tensor) -> Tensor:
     Returns:
         mask (Tensor): The binary mask, with shape (n_batch, max of ``lengths``).
     """
-    max_len = torch.max(lengths).item()
-    ids = torch.arange(0, max_len, device=lengths.device, dtype=lengths.dtype)
+    max_len = tensorplay.max(lengths).item()
+    ids = tensorplay.arange(0, max_len, device=lengths.device, dtype=lengths.dtype)
     mask = (ids < lengths.unsqueeze(1)).byte()
-    mask = torch.le(mask, 0)
+    mask = tensorplay.le(mask, 0)
     return mask
 
 
@@ -216,7 +216,7 @@ class _Attention(nn.Module):
 
         processed_query = self.query_layer(query.unsqueeze(1))
         processed_attention_weights = self.location_layer(attention_weights_cat)
-        energies = self.v(torch.tanh(processed_query + processed_attention_weights + processed_memory))
+        energies = self.v(tensorplay.tanh(processed_query + processed_attention_weights + processed_memory))
 
         alignment = energies.squeeze(2)
         return alignment
@@ -249,7 +249,7 @@ class _Attention(nn.Module):
         alignment = alignment.masked_fill(mask, self.score_mask_value)
 
         attention_weights = F.softmax(alignment, dim=1)
-        attention_context = torch.bmm(attention_weights.unsqueeze(1), memory)
+        attention_context = tensorplay.bmm(attention_weights.unsqueeze(1), memory)
         attention_context = attention_context.squeeze(1)
 
         return attention_context, attention_weights
@@ -339,7 +339,7 @@ class _Postnet(nn.Module):
 
         for i, conv in enumerate(self.convolutions):
             if i < self.n_convs - 1:
-                x = F.dropout(torch.tanh(conv(x)), 0.5, training=self.training)
+                x = F.dropout(tensorplay.tanh(conv(x)), 0.5, training=self.training)
             else:
                 x = F.dropout(conv(x), 0.5, training=self.training)
 
@@ -356,7 +356,7 @@ class _Encoder(nn.Module):
 
     Examples
         >>> encoder = _Encoder(3, 512, 5)
-        >>> input = torch.rand(10, 20, 30)
+        >>> input = tensorplay.rand(10, 20, 30)
         >>> output = encoder(input)  # shape: (10, 30, 512)
     """
 
@@ -503,7 +503,7 @@ class _Decoder(nn.Module):
         n_batch = memory.size(0)
         dtype = memory.dtype
         device = memory.device
-        decoder_input = torch.zeros(n_batch, self.n_mels * self.n_frames_per_step, dtype=dtype, device=device)
+        decoder_input = tensorplay.zeros(n_batch, self.n_mels * self.n_frames_per_step, dtype=dtype, device=device)
         return decoder_input
 
     def _initialize_decoder_states(
@@ -532,15 +532,15 @@ class _Decoder(nn.Module):
         dtype = memory.dtype
         device = memory.device
 
-        attention_hidden = torch.zeros(n_batch, self.attention_rnn_dim, dtype=dtype, device=device)
-        attention_cell = torch.zeros(n_batch, self.attention_rnn_dim, dtype=dtype, device=device)
+        attention_hidden = tensorplay.zeros(n_batch, self.attention_rnn_dim, dtype=dtype, device=device)
+        attention_cell = tensorplay.zeros(n_batch, self.attention_rnn_dim, dtype=dtype, device=device)
 
-        decoder_hidden = torch.zeros(n_batch, self.decoder_rnn_dim, dtype=dtype, device=device)
-        decoder_cell = torch.zeros(n_batch, self.decoder_rnn_dim, dtype=dtype, device=device)
+        decoder_hidden = tensorplay.zeros(n_batch, self.decoder_rnn_dim, dtype=dtype, device=device)
+        decoder_cell = tensorplay.zeros(n_batch, self.decoder_rnn_dim, dtype=dtype, device=device)
 
-        attention_weights = torch.zeros(n_batch, max_time, dtype=dtype, device=device)
-        attention_weights_cum = torch.zeros(n_batch, max_time, dtype=dtype, device=device)
-        attention_context = torch.zeros(n_batch, self.encoder_embedding_dim, dtype=dtype, device=device)
+        attention_weights = tensorplay.zeros(n_batch, max_time, dtype=dtype, device=device)
+        attention_weights_cum = tensorplay.zeros(n_batch, max_time, dtype=dtype, device=device)
+        attention_context = tensorplay.zeros(n_batch, self.encoder_embedding_dim, dtype=dtype, device=device)
 
         processed_memory = self.attention_layer.memory_layer(memory)
 
@@ -649,23 +649,23 @@ class _Decoder(nn.Module):
             attention_weights_cum (Tensor): Cumulated attention weights with shape (n_batch, max of ``text_lengths``).
             attention_context (Tensor): Context vector with shape (n_batch, ``encoder_embedding_dim``).
         """
-        cell_input = torch.cat((decoder_input, attention_context), -1)
+        cell_input = tensorplay.cat((decoder_input, attention_context), -1)
 
         attention_hidden, attention_cell = self.attention_rnn(cell_input, (attention_hidden, attention_cell))
         attention_hidden = F.dropout(attention_hidden, self.attention_dropout, self.training)
 
-        attention_weights_cat = torch.cat((attention_weights.unsqueeze(1), attention_weights_cum.unsqueeze(1)), dim=1)
+        attention_weights_cat = tensorplay.cat((attention_weights.unsqueeze(1), attention_weights_cum.unsqueeze(1)), dim=1)
         attention_context, attention_weights = self.attention_layer(
             attention_hidden, memory, processed_memory, attention_weights_cat, mask
         )
 
         attention_weights_cum += attention_weights
-        decoder_input = torch.cat((attention_hidden, attention_context), -1)
+        decoder_input = tensorplay.cat((attention_hidden, attention_context), -1)
 
         decoder_hidden, decoder_cell = self.decoder_rnn(decoder_input, (decoder_hidden, decoder_cell))
         decoder_hidden = F.dropout(decoder_hidden, self.decoder_dropout, self.training)
 
-        decoder_hidden_attention_context = torch.cat((decoder_hidden, attention_context), dim=1)
+        decoder_hidden_attention_context = tensorplay.cat((decoder_hidden, attention_context), dim=1)
         decoder_output = self.linear_projection(decoder_hidden_attention_context)
 
         gate_prediction = self.gate_layer(decoder_hidden_attention_context)
@@ -706,7 +706,7 @@ class _Decoder(nn.Module):
 
         decoder_input = self._get_initial_frame(memory).unsqueeze(0)
         decoder_inputs = self._parse_decoder_inputs(mel_specgram_truth)
-        decoder_inputs = torch.cat((decoder_input, decoder_inputs), dim=0)
+        decoder_inputs = tensorplay.cat((decoder_input, decoder_inputs), dim=0)
         decoder_inputs = self.prenet(decoder_inputs)
 
         mask = _get_mask_from_lengths(memory_lengths)
@@ -753,7 +753,7 @@ class _Decoder(nn.Module):
             alignments += [attention_weights]
 
         mel_specgram, gate_outputs, alignments = self._parse_decoder_outputs(
-            torch.stack(mel_outputs), torch.stack(gate_outputs), torch.stack(alignments)
+            tensorplay.stack(mel_outputs), tensorplay.stack(gate_outputs), tensorplay.stack(alignments)
         )
 
         return mel_specgram, gate_outputs, alignments
@@ -772,10 +772,10 @@ class _Decoder(nn.Module):
         n_batch = memory.size(0)
         dtype = memory.dtype
         device = memory.device
-        decoder_input = torch.zeros(n_batch, self.n_mels * self.n_frames_per_step, dtype=dtype, device=device)
+        decoder_input = tensorplay.zeros(n_batch, self.n_mels * self.n_frames_per_step, dtype=dtype, device=device)
         return decoder_input
 
-    @torch.jit.export
+    @tensorplay.jit.export
     def infer(self, memory: Tensor, memory_lengths: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         """Decoder inference
 
@@ -810,8 +810,8 @@ class _Decoder(nn.Module):
             processed_memory,
         ) = self._initialize_decoder_states(memory)
 
-        mel_specgram_lengths = torch.zeros([batch_size], dtype=torch.int32, device=device)
-        finished = torch.zeros([batch_size], dtype=torch.bool, device=device)
+        mel_specgram_lengths = tensorplay.zeros([batch_size], dtype=tensorplay.int32, device=device)
+        finished = tensorplay.zeros([batch_size], dtype=tensorplay.bool, device=device)
         mel_specgrams: List[Tensor] = []
         gate_outputs: List[Tensor] = []
         alignments: List[Tensor] = []
@@ -846,8 +846,8 @@ class _Decoder(nn.Module):
             alignments.append(attention_weights)
             mel_specgram_lengths[~finished] += 1
 
-            finished |= torch.sigmoid(gate_output.squeeze(1)) > self.gate_threshold
-            if self.decoder_early_stopping and torch.all(finished):
+            finished |= tensorplay.sigmoid(gate_output.squeeze(1)) > self.gate_threshold
+            if self.decoder_early_stopping and tensorplay.all(finished):
                 break
 
             decoder_input = mel_specgram
@@ -857,9 +857,9 @@ class _Decoder(nn.Module):
                 "Reached max decoder steps. The generated spectrogram might not cover " "the whole transcript."
             )
 
-        mel_specgrams = torch.cat(mel_specgrams, dim=0)
-        gate_outputs = torch.cat(gate_outputs, dim=0)
-        alignments = torch.cat(alignments, dim=0)
+        mel_specgrams = tensorplay.cat(mel_specgrams, dim=0)
+        gate_outputs = tensorplay.cat(gate_outputs, dim=0)
+        alignments = tensorplay.cat(alignments, dim=0)
 
         mel_specgrams, gate_outputs, alignments = self._parse_decoder_outputs(mel_specgrams, gate_outputs, alignments)
 
@@ -872,7 +872,7 @@ class Tacotron2(nn.Module):
     `Nvidia Deep Learning Examples <https://github.com/NVIDIA/DeepLearningExamples/>`_.
 
     See Also:
-        * :class:`torchaudio.pipelines.Tacotron2TTSBundle`: TTS pipeline with pretrained model.
+        * :class:`tensorplay.audio.pipelines.Tacotron2TTSBundle`: TTS pipeline with pretrained model.
 
     Args:
         mask_padding (bool, optional): Use mask padding (Default: ``False``).
@@ -930,7 +930,7 @@ class Tacotron2(nn.Module):
         self.n_mels = n_mels
         self.n_frames_per_step = n_frames_per_step
         self.embedding = nn.Embedding(n_symbol, symbol_embedding_dim)
-        torch.nn.init.xavier_uniform_(self.embedding.weight)
+        tensorplay.nn.init.xavier_uniform_(self.embedding.weight)
         self.encoder = _Encoder(encoder_embedding_dim, encoder_n_convolution, encoder_kernel_size)
         self.decoder = _Decoder(
             n_mels,
@@ -1004,7 +1004,7 @@ class Tacotron2(nn.Module):
 
         return mel_specgram, mel_specgram_postnet, gate_outputs, alignments
 
-    @torch.jit.export
+    @tensorplay.jit.export
     def infer(self, tokens: Tensor, lengths: Optional[Tensor] = None) -> Tuple[Tensor, Tensor, Tensor]:
         r"""Using Tacotron2 for inference. The input is a batch of encoded
         sentences (``tokens``) and its corresponding lengths (``lengths``). The
@@ -1031,7 +1031,7 @@ class Tacotron2(nn.Module):
         """
         n_batch, max_length = tokens.shape
         if lengths is None:
-            lengths = torch.tensor([max_length]).expand(n_batch).to(tokens.device, tokens.dtype)
+            lengths = tensorplay.tensor([max_length]).expand(n_batch).to(tokens.device, tokens.dtype)
 
         assert lengths is not None  # For TorchScript compiler
         embedded_inputs = self.embedding(tokens).transpose(1, 2)

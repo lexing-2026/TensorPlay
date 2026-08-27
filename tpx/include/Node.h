@@ -17,6 +17,17 @@ using Tensor = tensorplay::Tensor;
 using variable_list = std::vector<Tensor>;
 using edge_list = std::vector<Edge>;
 
+// torch InputMetadata analog for BACKWARD input slots.  For custom-function
+// nodes the gradients arriving from consumers correspond to the node's
+// forward OUTPUTS, so their zero-fill metadata is captured at output-attach
+// time (PyNode::attach_outputs) rather than derived from next_edges.
+struct OutputSlotMeta {
+    std::vector<int64_t> shape;
+    DType dtype{DType::Undefined};
+    int64_t device_index = -1;
+    bool valid = false;
+};
+
 // Thread-local monotonically increasing sequence number, assigned at Node
 // construction. Mirrors at::sequence_number::get_and_increment().
 inline uint64_t get_and_increment_sequence_nr() {
@@ -39,6 +50,23 @@ public:
 
     Node() : sequence_nr_(get_and_increment_sequence_nr()) { init_anomaly_metadata(); }
     explicit Node(uint64_t sequence_nr) : sequence_nr_(sequence_nr) { init_anomaly_metadata(); }
+
+    // torch parity (ctx.set_materialize_grads): when false the engine hands
+    // undefined input gradients through as-is instead of zero-filling them
+    // from the edge's recorded InputMetadata.
+    bool materialize_grads() const { return materialize_grads_; }
+    void set_materialize_grads(bool v) { materialize_grads_ = v; }
+
+    // Torch parity (ADInplaceOrView "view functions"): set by the generated
+    // view wrappers / tpx::as_strided so in-place ops can reject mutations
+    // of views of leaf variables (check_inplace, VariableTypeUtils.h).
+    bool is_view_fn() const { return is_view_fn_; }
+    void set_view_fn(bool v) { is_view_fn_ = v; }
+
+    // Backward-input (output-slot) metadata, filled by custom-function nodes
+    // at attach time; empty for generated derivative nodes.
+    const std::vector<OutputSlotMeta>& output_metas() const { return output_metas_; }
+    std::vector<OutputSlotMeta>& output_metas() { return output_metas_; }
 
     virtual variable_list apply(variable_list&& inputs) = 0;
 
@@ -120,6 +148,9 @@ private:
 protected:
     std::vector<Edge> next_edges_;
     uint64_t sequence_nr_ = 0;
+    bool materialize_grads_ = true;
+    bool is_view_fn_ = false;
+    std::vector<OutputSlotMeta> output_metas_;
     uint64_t topological_nr_ = 0;
 
 private:

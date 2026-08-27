@@ -10,6 +10,7 @@
 #include <cctype>
 #include <mutex>
 #include <unordered_map>
+#include <optional>
 
 using namespace tensorplay::python;
 
@@ -178,6 +179,113 @@ void init_ops(py::module_& m) {
     }, "data"_a, py::kw_only(), "dtype"_a = py::none(), "device"_a = py::none(),
        "pin_memory"_a = false, "requires_grad"_a = false,
     "tensor(data, *, dtype: Optional[DType] = None, device: Optional[Device] = None, pin_memory: bool = False, requires_grad: bool = False) -> Tensor");
+
+
+    // Torch keeps this optimizer hot path in C++ (torch._C._group...).  The
+    // Python implementation is functionally correct but spends most of a
+    // small multi-tensor optimizer step in per-element Python list/dict work.
+    // Keep the same contract here: grouping is keyed by the first tensor list;
+    // later lists may be empty or contain None, and their original positions
+    // are retained when with_indices is requested.
+    m.def("_group_tensors_by_device_and_dtype",
+          [](py::object nested_object, bool with_indices) {
+              if (!PySequence_Check(nested_object.ptr())) {
+                  TP_THROW(TypeError,
+                      "Expected a sequence of nested tensor lists");
+              }
+              const py::sequence nested =
+                  py::reinterpret_borrow<py::sequence>(nested_object);
+              if (py::len(nested) == 0 || py::len(nested[0]) == 0) {
+                  TP_THROW(ValueError,
+                      "Expected the first nested tensor list to be non-empty");
+              }
+              std::vector<py::sequence> sources;
+              sources.reserve(static_cast<size_t>(py::len(nested)));
+              for (const py::handle item : nested) {
+                  if (!PySequence_Check(item.ptr())) {
+                      TP_THROW(TypeError,
+                          "Expected every nested tensor list to be a sequence");
+                  }
+                  sources.push_back(
+                      py::reinterpret_borrow<py::sequence>(item));
+              }
+              const size_t num_tensors =
+                  static_cast<size_t>(py::len(sources[0]));
+              for (size_t list_index = 1; list_index < sources.size();
+                   ++list_index) {
+                  const size_t size =
+                      static_cast<size_t>(py::len(sources[list_index]));
+                  if (size != 0 && size != num_tensors) {
+                      TP_THROW(ValueError,
+                          "Expected every nested tensor list to have the same "
+                          "length as the first list or to be empty");
+                  }
+              }
+
+              struct Group {
+                  Device device;
+                  DType dtype;
+                  std::vector<size_t> indices;
+              };
+              std::vector<Group> groups;
+              groups.reserve(2);
+              for (size_t tensor_index = 0; tensor_index < num_tensors;
+                   ++tensor_index) {
+                  const py::handle first_object = sources[0][tensor_index];
+                  if (first_object.is_none()) {
+                      TP_THROW(ValueError,
+                          "Tensors of the first list of nested Tensor lists "
+                          "are supposed to be defined");
+                  }
+                  const Tensor& first = py::cast<const Tensor&>(first_object);
+                  const Device device = first.device();
+                  const DType dtype = first.dtype();
+                  size_t group_index = 0;
+                  for (; group_index < groups.size(); ++group_index) {
+                      if (groups[group_index].device == device &&
+                          groups[group_index].dtype == dtype) {
+                          break;
+                      }
+                  }
+                  if (group_index == groups.size()) {
+                      groups.push_back(Group{device, dtype, {}});
+                  }
+                  groups[group_index].indices.push_back(tensor_index);
+              }
+
+              py::dict result;
+              for (const auto& group : groups) {
+                  py::list grouped_lists;
+                  for (const auto& source : sources) {
+                      py::list grouped;
+                      if (py::len(source) != 0) {
+                          for (const size_t tensor_index : group.indices) {
+                              const py::handle value = source[tensor_index];
+                              if (!value.is_none()) {
+                                  // Reuse the original Python Tensor wrapper;
+                                  // constructing a fresh py::cast(Tensor)
+                                  // here costs more than the native grouping.
+                                  grouped.append(value);
+                              } else {
+                                  grouped.append(py::none());
+                              }
+                          }
+                      }
+                      grouped_lists.append(std::move(grouped));
+                  }
+                  py::list indices;
+                  if (with_indices) {
+                      for (const size_t tensor_index : group.indices) {
+                          indices.append(py::int_(tensor_index));
+                      }
+                  }
+                  result[py::make_tuple(py::cast(group.device),
+                                        py::cast(group.dtype))] =
+                      py::make_tuple(std::move(grouped_lists),
+                                     std::move(indices));
+              }
+              return result;
+          }, "tensorlistlist"_a, "with_indices"_a = false);
 
 
     // Ops submodule

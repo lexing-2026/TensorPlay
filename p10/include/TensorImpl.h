@@ -41,6 +41,14 @@ private:
     // autograd metadata, matching PyTorch semantics.
     std::shared_ptr<AutogradMetaBase> autograd_meta_;
 
+    // View identity (mirrors the DifferentiableViewMeta is_view_ bit carried
+    // by torch's autograd layer): set by the InplaceOrView-level wrappers for
+    // ops that alias their input's storage, so detach_() can reject views
+    // exactly like torch.  Deliberately NOT copied by the TensorImpl copy
+    // constructor: detach() strips view identity, matching torch's
+    // shallow_copy_and_detach (x.t().detach()._is_view() == False).
+    bool is_view_ = false;
+
     // Opaque pointer to OneDNN memory descriptor (std::shared_ptr<dnnl::memory::desc>)
     // std::shared_ptr<void> onednn_md_;
     
@@ -140,6 +148,11 @@ public:
     bool is_channels_last_2d() const { return memory_format_ == MemoryFormat::ChannelsLast; }
     bool is_channels_last_3d() const { return memory_format_ == MemoryFormat::ChannelsLast3d; }
 
+    // View identity: true when this tensor was created by a view op at the
+    // InplaceOrView layer (torch Tensor::_is_view() parity).
+    bool is_view() const { return is_view_; }
+    void set_is_view(bool v) { is_view_ = v; }
+
     // Stride-set equality against `format`'s canonical layout, mirroring
     // at::TensorImpl::is_contiguous(MemoryFormat). Strict comparison: size-1
     // dims are not special-cased here.
@@ -221,6 +234,7 @@ public:
     // Zero the counter (used when a fresh tensor is materialized by an
     // internal copy such as clone(), so the result starts unmutated).
     void reset_version() { version_counter_.reset(); }
+    void set_version_counter(const VariableVersion& vc) { version_counter_ = vc; }
     const VariableVersion& version_counter() const { return version_counter_; }
     // Make this tensor's version counter alias `other`'s (view semantics).
     void share_version_counter(const TensorImpl& other) { version_counter_ = other.version_counter_; }

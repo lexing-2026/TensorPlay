@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Union
 
 import numpy as np
-import tensorplay as torch
+import tensorplay as tensorplay
 from PIL import Image
 
 from .utils import download_url
@@ -114,9 +114,9 @@ class PhotoTour(VisionDataset):
             self.cache()
 
         # load the serialized data
-        self.data, self.labels, self.matches = torch.load(self.data_file, weights_only=True)
+        self.data, self.labels, self.matches = tensorplay.load(self.data_file, weights_only=True)
 
-    def __getitem__(self, index: int) -> Union[torch.Tensor, tuple[Any, Any, torch.Tensor]]:
+    def __getitem__(self, index: int) -> Union[tensorplay.Tensor, tuple[Any, Any, tensorplay.Tensor]]:
         """
         Args:
             index (int): Index
@@ -175,14 +175,14 @@ class PhotoTour(VisionDataset):
         )
 
         with open(self.data_file, "wb") as f:
-            torch.save(dataset, f)
+            tensorplay.save(dataset, f)
 
     def extra_repr(self) -> str:
         split = "Train" if self.train is True else "Test"
         return f"Split: {split}"
 
 
-def read_image_file(data_dir: str, image_ext: str, n: int) -> torch.Tensor:
+def read_image_file(data_dir: str, image_ext: str, n: int) -> tensorplay.Tensor:
     """Return a Tensor containing the patches"""
 
     def PIL2array(_img: Image.Image) -> np.ndarray:
@@ -207,19 +207,19 @@ def read_image_file(data_dir: str, image_ext: str, n: int) -> torch.Tensor:
             for x in range(0, img.width, 64):
                 patch = img.crop((x, y, x + 64, y + 64))
                 patches.append(PIL2array(patch))
-    return torch.ByteTensor(np.array(patches[:n]))
+    return tensorplay.ByteTensor(np.array(patches[:n]))
 
 
-def read_info_file(data_dir: str, info_file: str) -> torch.Tensor:
+def read_info_file(data_dir: str, info_file: str) -> tensorplay.Tensor:
     """Return a Tensor containing the list of labels
     Read the file and keep only the ID of the 3D point.
     """
     with open(os.path.join(data_dir, info_file)) as f:
         labels = [int(line.split()[0]) for line in f]
-    return torch.LongTensor(labels)
+    return tensorplay.LongTensor(labels)
 
 
-def read_matches_files(data_dir: str, matches_file: str) -> torch.Tensor:
+def read_matches_files(data_dir: str, matches_file: str) -> tensorplay.Tensor:
     """Return a Tensor containing the ground truth matches
     Read the file and keep only 3D point ID.
     Matches are represented with a 1, non matches with a 0.
@@ -229,4 +229,4 @@ def read_matches_files(data_dir: str, matches_file: str) -> torch.Tensor:
         for line in f:
             line_split = line.split()
             matches.append([int(line_split[0]), int(line_split[3]), int(line_split[1] == line_split[4])])
-    return torch.LongTensor(matches)
+    return tensorplay.LongTensor(matches)

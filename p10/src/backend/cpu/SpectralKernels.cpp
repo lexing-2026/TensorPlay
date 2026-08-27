@@ -224,32 +224,54 @@ Tensor core_c2r(const Tensor& contig, int64_t dim, int64_t out_len, fft_norm_mod
 // Public fft entry points (mirror ATen fft_c2c / fft_r2c / fft_c2r wrappers)
 // ---------------------------------------------------------------------------
 
-Tensor fft_fft_cpu(const Tensor& self, int64_t n, int64_t dim, std::string norm) {
-    TP_CHECK(is_cplx(self.dtype()), "torch.fft.fft expects a complex input");
-    TP_CHECK(self.dim() >= 1, "fft expects at least 1 dimension");
-    dim = wrap_dim(dim, self.dim());
+namespace {
+// ATen parity: torch.fft.fft/ifft accept real input and promote it to complex
+// with a zero imaginary part (SpectralOps.cpp fft_r2c "fft"/"ifft" entry).
+template <typename T>
+Tensor materialize_real_as_complex(const Tensor& x) {
+    using C = std::complex<T>;
+    Tensor out(sizes_of(x), complex_of_real(x.dtype()));
+    const T* src = static_cast<const T*>(x.data_ptr());
+    C* dst = static_cast<C*>(out.data_ptr());
+    const int64_t n = x.numel();
+    for (int64_t i = 0; i < n; ++i) dst[i] = C(src[i], T(0));
+    return out;
+}
+
+Tensor promote_real_input_for_c2c(const Tensor& self) {
+    TP_CHECK(self.dtype() == DType::Float32 || self.dtype() == DType::Float64,
+             "Unsupported input dtype for spectral op");
     Tensor x = self.contiguous();
-    const int64_t N = sizes_of(x)[dim];
+    if (x.dtype() == DType::Float32)
+        return materialize_real_as_complex<float>(x);
+    return materialize_real_as_complex<double>(x);
+}
+}  // namespace
+
+Tensor fft_fft_cpu(const Tensor& self, int64_t n, int64_t dim, std::string norm) {
+    Tensor x_in = is_cplx(self.dtype()) ? self.contiguous() : promote_real_input_for_c2c(self);
+    TP_CHECK(x_in.dim() >= 1, "fft expects at least 1 dimension");
+    dim = wrap_dim(dim, x_in.dim());
+    const int64_t N = sizes_of(x_in)[dim];
     const int64_t n_eff = n > 0 ? n : N;
     TP_CHECK(n_eff >= 1, "Invalid number of data points specified");
     const auto mode = norm_from_string(norm, /*forward=*/true);
-    if (x.dtype() == DType::ComplexFloat)
-        return core_c2c<float>(x, dim, n_eff, mode, true);
-    return core_c2c<double>(x, dim, n_eff, mode, true);
+    if (x_in.dtype() == DType::ComplexFloat)
+        return core_c2c<float>(x_in, dim, n_eff, mode, true);
+    return core_c2c<double>(x_in, dim, n_eff, mode, true);
 }
 
 Tensor fft_ifft_cpu(const Tensor& self, int64_t n, int64_t dim, std::string norm) {
-    TP_CHECK(is_cplx(self.dtype()), "torch.fft.ifft expects a complex input");
-    TP_CHECK(self.dim() >= 1, "ifft expects at least 1 dimension");
-    dim = wrap_dim(dim, self.dim());
-    Tensor x = self.contiguous();
-    const int64_t N = sizes_of(x)[dim];
+    Tensor x_in = is_cplx(self.dtype()) ? self.contiguous() : promote_real_input_for_c2c(self);
+    TP_CHECK(x_in.dim() >= 1, "ifft expects at least 1 dimension");
+    dim = wrap_dim(dim, x_in.dim());
+    const int64_t N = sizes_of(x_in)[dim];
     const int64_t n_eff = n > 0 ? n : N;
     TP_CHECK(n_eff >= 1, "Invalid number of data points specified");
     const auto mode = norm_from_string(norm, false);
-    if (x.dtype() == DType::ComplexFloat)
-        return core_c2c<float>(x, dim, n_eff, mode, false);
-    return core_c2c<double>(x, dim, n_eff, mode, false);
+    if (x_in.dtype() == DType::ComplexFloat)
+        return core_c2c<float>(x_in, dim, n_eff, mode, false);
+    return core_c2c<double>(x_in, dim, n_eff, mode, false);
 }
 
 Tensor fft_rfft_cpu(const Tensor& self, int64_t n, int64_t dim, std::string norm) {
@@ -288,6 +310,20 @@ Tensor fft_irfft_cpu(const Tensor& self, int64_t n, int64_t dim, std::string nor
 // ---------------------------------------------------------------------------
 
 namespace {
+// ATen parity: the adjoint of "materialize real as complex" is taking the
+// real part, so fft/ifft on a real primal yields a real gradient.
+template <typename T>
+Tensor extract_real_part(const Tensor& z) {
+    using C = std::complex<T>;
+    Tensor out(sizes_of(z), real_of_complex(z.dtype()));
+    Tensor zc = z.contiguous();
+    const C* src = static_cast<const C*>(zc.data_ptr());
+    T* dst = static_cast<T*>(out.data_ptr());
+    const int64_t n = z.numel();
+    for (int64_t i = 0; i < n; ++i) dst[i] = src[i].real();
+    return out;
+}
+
 template <typename T>
 Tensor c2c_backward_core(const Tensor& grad, int64_t input_len, int64_t dim,
                          const std::string& norm, bool forward_was) {
@@ -301,33 +337,50 @@ Tensor c2c_backward_core(const Tensor& grad, int64_t input_len, int64_t dim,
 Tensor fft_fft_backward_cpu(const Tensor& grad, const Tensor& self, int64_t dim, std::string norm) {
     dim = wrap_dim(dim, self.dim());
     const int64_t input_len = self.size(dim);
-    if (grad.dtype() == DType::ComplexFloat)
-        return c2c_backward_core<float>(grad, input_len, dim, norm, true);
-    return c2c_backward_core<double>(grad, input_len, dim, norm, true);
+    const bool real_primal = !is_cplx(self.dtype());
+    if (grad.dtype() == DType::ComplexFloat) {
+        Tensor g = c2c_backward_core<float>(grad, input_len, dim, norm, true);
+        return real_primal ? extract_real_part<float>(g) : g;
+    }
+    Tensor g = c2c_backward_core<double>(grad, input_len, dim, norm, true);
+    return real_primal ? extract_real_part<double>(g) : g;
 }
 
 Tensor fft_ifft_backward_cpu(const Tensor& grad, const Tensor& self, int64_t dim, std::string norm) {
     dim = wrap_dim(dim, self.dim());
     const int64_t input_len = self.size(dim);
-    if (grad.dtype() == DType::ComplexFloat)
-        return c2c_backward_core<float>(grad, input_len, dim, norm, false);
-    return c2c_backward_core<double>(grad, input_len, dim, norm, false);
+    const bool real_primal = !is_cplx(self.dtype());
+    if (grad.dtype() == DType::ComplexFloat) {
+        Tensor g = c2c_backward_core<float>(grad, input_len, dim, norm, false);
+        return real_primal ? extract_real_part<float>(g) : g;
+    }
+    Tensor g = c2c_backward_core<double>(grad, input_len, dim, norm, false);
+    return real_primal ? extract_real_part<double>(g) : g;
 }
 
 namespace {
-// rfft adjoint: cuFFT/pocketfft-style c2r assumes Hermitian symmetry from the
-// first N/2+1 bins — exactly conj-fill + unscaled inverse + real projection.
+// rfft adjoint — ATen fft_r2c_backward (torch/csrc/autograd/FunctionsManual.cpp
+// :5135): view onesided r2c as [zero-fill imag, c2c forward, drop half], so the
+// backward is [zero-fill the twosided spectrum, c2c INVERSE with the forward's
+// normalization, take the real part].
 template <typename T>
 Tensor rfft_backward_core(const Tensor& grad, int64_t input_len, int64_t dim,
                           fft_norm_mode mode) {
-    using C = std::complex<T>;
     Tensor g = grad.contiguous();
     std::vector<int64_t> gsizes = sizes_of(g);
-    // ensure enough bins for a length-N Hermitian reconstruction
-    if (gsizes[dim] < input_len / 2 + 1) g = resize_input_dim(g, dim, input_len / 2 + 1);
-    const T s_fwd = norm_factor<T>(mode, input_len);
-    // c2r with fct=s_fwd yields Re(F^H g_padded) * s_fwd
-    return core_c2r<T>(g, dim, input_len, fft_norm_mode::none).mul(Scalar(double(s_fwd)));
+    const int64_t bins = gsizes[dim];
+    std::vector<int64_t> full_sizes = gsizes;
+    full_sizes[dim] = input_len;
+    Tensor full(full_sizes, g.dtype());
+    full.zero_();
+    if (bins == input_len) {
+        // grad already covers every bin: plain inverse c2c.
+        Tensor t = core_c2c<T>(g, dim, input_len, mode, /*forward=*/false);
+        return extract_real_part<T>(t);
+    }
+    full.slice(dim, 0, bins).copy_(g);
+    Tensor t = core_c2c<T>(full, dim, input_len, mode, /*forward=*/false);
+    return extract_real_part<T>(t);
 }
 }  // namespace
 
@@ -340,18 +393,23 @@ Tensor fft_rfft_backward_cpu(const Tensor& grad, const Tensor& self, int64_t dim
 }
 
 namespace {
-// irfft adjoint: unnormalized forward r2c of the real gradient scaled by the
-// primal inverse factor, sliced back to the primal bin count.
+// irfft adjoint — ATen fft_c2r_backward (FunctionsManual.cpp :5095):
+// r2c of the real gradient with the forward's normalization, then double the
+// bins whose conjugate mirror fell outside the onesided range
+// (indices 1 .. N - onesided_length).
 template <typename T>
 Tensor irfft_backward_core(const Tensor& grad, int64_t freq_bins, int64_t dim,
                            fft_norm_mode mode) {
     Tensor g = grad.contiguous();
-    std::vector<int64_t> gsizes = sizes_of(g);
-    const int64_t M = gsizes[dim];
-    const T s_inv = norm_factor<T>(mode, M);
-    Tensor t = core_r2c<T>(g, dim, fft_norm_mode::none, /*onesided=*/true);
-    t = resize_input_dim(t, dim, freq_bins);
-    return t.mul(Scalar(double(s_inv)));
+    Tensor t = core_r2c<T>(g, dim, mode, /*onesided=*/true);
+    const int64_t got_bins = sizes_of(t)[dim];
+    const int64_t double_length = freq_bins - got_bins;
+    if (double_length > 0) {
+        // bins 1 .. N - onesided_length receive their conjugate mirror twice.
+        Tensor scaled = t.slice(dim, 1, 1 + double_length).mul(Scalar(2.0));
+        t.slice(dim, 1, 1 + double_length).copy_(scaled);
+    }
+    return t;
 }
 }  // namespace
 
@@ -373,7 +431,10 @@ Tensor window_tensor(int64_t out_len, int64_t formula_len, std::optional<DType> 
     if (out_len < 0) {
         TP_THROW(ValueError, name, ": window_length must be non-negative");
     }
+    // Python layer passes DType::Undefined for "no dtype given" (torch
+    // default-floating semantics); normalize before the support check.
     DType dt = dtype_opt.value_or(DType::Float32);
+    if (dt == DType::Undefined) dt = DType::Float32;
     if (dt != DType::Float32 && dt != DType::Float64) {
         TP_THROW(NotImplementedError, name, ": only float32/float64 windows are supported");
     }
@@ -395,34 +456,41 @@ Tensor window_tensor(int64_t out_len, int64_t formula_len, std::optional<DType> 
 }
 }  // namespace
 
+// ATen denominator semantics: periodic -> N, symmetric -> N - 1.
+inline int64_t window_denominator(int64_t window_length, bool periodic) {
+    return window_length - (periodic ? 0 : 1);
+}
+
 Tensor hann_window_cpu(int64_t window_length, bool periodic, std::optional<DType> dtype) {
-    const int64_t L = window_length + ((periodic && window_length > 1) ? 1 : 0);
+    const int64_t L = window_denominator(window_length, periodic);
     return window_tensor(window_length, L, dtype, "hann_window", [L](int64_t n) {
         return 0.5 - 0.5 * std::cos(2.0 * kPiD * n / L);
     });
 }
 
 Tensor hamming_window_cpu(int64_t window_length, bool periodic, double alpha, double beta, std::optional<DType> dtype) {
-    const int64_t L = window_length + ((periodic && window_length > 1) ? 1 : 0);
+    const int64_t L = window_denominator(window_length, periodic);
     return window_tensor(window_length, L, dtype, "hamming_window", [L, alpha, beta](int64_t n) {
         return alpha - beta * std::cos(2.0 * kPiD * n / L);
     });
 }
 
 Tensor bartlett_window_cpu(int64_t window_length, bool periodic, std::optional<DType> dtype) {
-    const int64_t L = window_length + ((periodic && window_length > 1) ? 1 : 0);
-    const int64_t first_half = ((L - 1) >> 1) + 1;
-    return window_tensor(window_length, L, dtype, "bartlett_window", [L, first_half](int64_t n) {
-        const double v = (2.0 * n) / double(L - 1);
-        return n >= first_half ? 2.0 - v : v;
+    const int64_t L = window_denominator(window_length, periodic);
+    return window_tensor(window_length, L, dtype, "bartlett_window", [L](int64_t n) {
+        const double num = 2.0 * static_cast<double>(n);
+        if (num < static_cast<double>(L)) return num / static_cast<double>(L);
+        if (num > static_cast<double>(L)) return 2.0 - num / static_cast<double>(L);
+        return 1.0;
     });
 }
 
 Tensor blackman_window_cpu(int64_t window_length, bool periodic, std::optional<DType> dtype) {
-    const int64_t L = window_length + ((periodic && window_length > 1) ? 1 : 0);
+    const int64_t L = window_denominator(window_length, periodic);
     return window_tensor(window_length, L, dtype, "blackman_window", [L](int64_t n) {
-        const double x = kPiD * n / double(L - 1);
-        return 0.42 + 0.5 * std::cos(2 * x) - 0.08 * std::cos(4 * x);
+        // ATen blackman_window: a0 - a1*cos(x) + a2*cos(2x), x = 2*pi*n/L.
+        const double x = 2.0 * kPiD * n / static_cast<double>(L);
+        return 0.42 - 0.5 * std::cos(x) + 0.08 * std::cos(2 * x);
     });
 }
 
@@ -498,8 +566,12 @@ void unpad_scatter_time_axis(const T* padded_grad, int64_t batch, int64_t padded
 template <typename T>
 void fill_win_full(std::vector<T>& win_full, const std::optional<Tensor>& window,
                    int64_t win_length, int64_t n_fft) {
-    win_full.assign(n_fft, T(1));
-    if (!window.has_value()) return;
+    // ATen SpectralOps.cpp stft: no window -> rectangular (ones); a defined
+    // window of win_length < n_fft is zero-padded on both sides.
+    if (!window.has_value()) {
+        win_full.assign(n_fft, T(1));
+        return;
+    }
     Tensor w = window->contiguous();
     TP_CHECK(w.dim() == 1 && w.size(0) == win_length, "window must be 1D of size win_length");
     std::vector<T> tmp(win_length);
@@ -513,6 +585,7 @@ void fill_win_full(std::vector<T>& win_full, const std::optional<Tensor>& window
         const T* p = static_cast<const T*>(w.data_ptr());
         for (int64_t i = 0; i < win_length; ++i) tmp[i] = p[i];
     }
+    win_full.assign(n_fft, T(0));
     const int64_t left = (n_fft - win_length) / 2;
     for (int64_t i = 0; i < win_length; ++i) win_full[left + i] = tmp[i];
 }
@@ -649,12 +722,14 @@ Tensor istft_impl(const Tensor& input, int64_t n_fft, int64_t hop, int64_t win,
     using C = std::complex<T>;
     const auto mode = normalized ? fft_norm_mode::by_root_n : fft_norm_mode::by_n;
     std::vector<int64_t> isizes = sizes_of(input);
-    TP_CHECK(isizes.size() == 3 || isizes.size() == 4,
-             "istft: expected a tensor with 3 or 4 dimensions");
+    // ATen istft checks the *real view* (3 or 4 dims); on the complex tensor
+    // this is 2D (freq, frames) -> (len,) or 3D (batch, freq, frames) -> (B, len).
+    TP_CHECK(isizes.size() == 2 || isizes.size() == 3,
+             "istft: expected a complex tensor with 2 or 3 dimensions");
+    const bool was_2d = isizes.size() == 2;
     const int64_t frames = isizes.back();
     const int64_t fft_size = isizes[isizes.size() - 2];
-    const bool was_3d = isizes.size() == 3;
-    const int64_t batch = was_3d ? 1 : isizes[0];
+    const int64_t batch = was_2d ? 1 : isizes[0];
     const int64_t expected_len = n_fft + hop * (frames - 1);
     if (onesided) {
         TP_CHECK(fft_size == n_fft / 2 + 1,
@@ -663,8 +738,9 @@ Tensor istft_impl(const Tensor& input, int64_t n_fft, int64_t hop, int64_t win,
         TP_CHECK(fft_size == n_fft, "istft: frequency dim must equal n_fft when onesided=False");
     }
 
-    // window center-padded to n_fft
-    std::vector<T> win_full(n_fft, T(1));
+    // window center-padded to n_fft with zeros when defined (ATen constant_pad_nd),
+    // rectangular ones only when the window is absent.
+    std::vector<T> win_full(n_fft, window.has_value() ? T(0) : T(1));
     {
         std::vector<T> tmp(win);
         if (window.has_value()) {
@@ -681,9 +757,9 @@ Tensor istft_impl(const Tensor& input, int64_t n_fft, int64_t hop, int64_t win,
                 const T* p = static_cast<const T*>(w.data_ptr());
                 for (int64_t i = 0; i < win; ++i) tmp[i] = p[i];
             }
+            const int64_t left = (n_fft - win) / 2;
+            for (int64_t i = 0; i < win; ++i) win_full[left + i] = tmp[i];
         }
-        const int64_t left = (n_fft - win) / 2;
-        for (int64_t i = 0; i < win; ++i) win_full[left + i] = tmp[i];
     }
     // gather columns into (batch*frames, bins) — ATen's transpose(1,2) step.
     // For c2r pocketfft reads only the first n/2+1 Hermitian bins.
@@ -737,7 +813,7 @@ Tensor istft_impl(const Tensor& input, int64_t n_fft, int64_t hop, int64_t win,
     end = std::min(end, expected_len);
     TP_CHECK(end > start, "istft: requested output length is too small");
 
-    std::vector<int64_t> out_sizes = was_3d ? std::vector<int64_t>{end - start}
+    std::vector<int64_t> out_sizes = was_2d ? std::vector<int64_t>{end - start}
                                             : std::vector<int64_t>{batch, end - start};
     Tensor out(out_sizes, real_of_complex(input.dtype()));
     T* op = static_cast<T*>(out.data_ptr());
@@ -786,16 +862,27 @@ Tensor stft_backward_impl(const Tensor& grad_output, const Tensor& self, int64_t
                         gsrc[(size_t(b) * n_freq + k) * frames + t];
     }
 
-    // batched inverse transform: conj-symmetry fill + unscaled inverse + real
-    // projection is exactly what c2r computes; fct carries the adjoint scale.
+    // ATen composes the spectral adjoint via fft_r2c_backward: zero-fill the
+    // twosided spectrum from the onesided grad, run the INVERSE c2c carrying
+    // the forward's normalization, then project to the real part.
+    Tensor full({batch * frames, n_fft}, complex_of_real(self.dtype()));
+    full.zero_();
+    if (n_freq < n_fft) full.slice(1, 0, n_freq).copy_(cols);
+    else full.copy_(cols);
+    Tensor ctime({batch * frames, n_fft}, complex_of_real(self.dtype()));
+    {
+        auto pshape = pocketfft::shape_t{size_t(batch * frames), size_t(n_fft)};
+        auto strides = contig_byte_strides({batch * frames, n_fft}, sizeof(C));
+        pocketfft::c2c<T>(pshape, strides, strides, {1}, /*forward=*/false,
+                          static_cast<const C*>(full.data_ptr()),
+                          static_cast<C*>(ctime.data_ptr()), s_fwd, 1);
+    }
     Tensor time_frames({batch * frames, n_fft}, self.dtype());
     {
-        auto pshape_out = pocketfft::shape_t{size_t(batch * frames), size_t(n_fft)};
-        auto sin_ = contig_byte_strides({batch * frames, n_freq}, sizeof(C));
-        auto sout = contig_byte_strides({batch * frames, n_fft}, sizeof(T));
-        pocketfft::c2r<T>(pshape_out, sin_, sout, 1, false,
-                          static_cast<const C*>(cols.data_ptr()),
-                          static_cast<T*>(time_frames.data_ptr()), s_fwd, 1);
+        const C* cp = static_cast<const C*>(ctime.data_ptr());
+        T* rp = static_cast<T*>(time_frames.data_ptr());
+        const int64_t total = batch * frames * n_fft;
+        for (int64_t i = 0; i < total; ++i) rp[i] = cp[i].real();
     }
 
     // multiply window and overlap-add scatter into padded positions

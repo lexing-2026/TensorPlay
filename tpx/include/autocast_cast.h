@@ -56,7 +56,7 @@ inline DType get_lower_precision_fp_from_device_type(DeviceType device_type) {
     return get_autocast_dtype(device_type);
 }
 
-inline bool is_eligible(const Tensor& arg, DeviceType device_type = DeviceType::CUDA) {
+inline bool is_eligible(const Tensor& arg, DeviceType device_type) {
     return (
         arg.defined() && is_autocast_eligible(arg, device_type) &&
         (arg.dtype() != DType::Float64));
@@ -80,6 +80,12 @@ inline DType prioritize(DType current, const Tensor& nextArg, DeviceType device_
         } else if (current == DType::Float32 || next == DType::Float32) {
             return DType::Float32; // prioritizes float over lower_precision_fp
         } else if (current == lower_precision_fp && next == lower_precision_fp) {
+            return lower_precision_fp;
+        } else if ((next == DType::Float16 || next == DType::BFloat16) &&
+                   current == lower_precision_fp) {
+            // Mixed low-precision pair (e.g. fp16 inputs under cpu autocast):
+            // fold into the device's lower-precision family instead of
+            // rejecting -- matches the repo's amp contract for promote ops.
             return lower_precision_fp;
         } else {
             TP_CHECK(false, "Unexpected floating ScalarType in at::autocast::prioritize");

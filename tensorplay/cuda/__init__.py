@@ -38,7 +38,6 @@ from .gds import GdsFile, is_gds_available  # noqa: F401
 from .graphs import (
     CUDAGraph,
     export_dot,
-    export_graph_data,
     graph,
     graph_pool_handle,
     is_current_stream_capturing,
@@ -1085,7 +1084,6 @@ __all__ = [
     "device_of",
     "empty_cache",
     "export_dot",
-    "export_graph_data",
     "gds",
     "get_allocator_backend",
     "get_arch_list",

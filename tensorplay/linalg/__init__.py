@@ -45,7 +45,12 @@ __all__ = [
     "tensorinv", "tensorsolve", "qr", "polar", "vander", "vecdot",
 ]
 
-LstsqResult = namedtuple("LstsqResult", ["solution", "residuals", "rank", "coefficients"])
+SlogdetResult = namedtuple("SlogdetResult", ["sign", "logabsdet"])
+QRResult = namedtuple("QRResult", ["Q", "R"])
+LstsqResult = namedtuple("LstsqResult", ["solution", "residuals", "rank", "singular_values"])
+EighResult = namedtuple("EighResult", ["eigenvalues", "eigenvectors"])
+EigResult = namedtuple("EigResult", ["eigenvalues", "eigenvectors"])
+SVDResult = namedtuple("SVDResult", ["U", "S", "Vh"])
 
 
 class LinAlgError(RuntimeError):
@@ -89,8 +94,9 @@ def det(A):
 
 
 def slogdet(A):
-    """slogdet(A) -> (Tensor sign, Tensor logabsdet)"""
-    return _C.linalg_slogdet(A)
+    """slogdet(A) -> SlogdetResult(sign, logabsdet)"""
+    sign, logabsdet = _C.linalg_slogdet(A)
+    return SlogdetResult(sign, logabsdet)
 
 
 def solve(A, B, *, left=True):
@@ -104,8 +110,9 @@ def solve_ex(A, B, *, left=True, check_errors=False):
 
 
 def eigh(A, UPLO="L"):
-    """eigh(A, UPLO='L') -> (Tensor eigenvalues, Tensor eigenvectors)"""
-    return linalg_eigh(A, UPLO)
+    """eigh(A, UPLO='L') -> EighResult(eigenvalues, eigenvectors)"""
+    values, vectors = linalg_eigh(A, UPLO)
+    return EighResult(values, vectors)
 
 
 def eigvalsh(A, UPLO="L"):
@@ -114,8 +121,9 @@ def eigvalsh(A, UPLO="L"):
 
 
 def eig(A):
-    """eig(A) -> (Tensor eigenvalues, Tensor eigenvectors)"""
-    return linalg_eig(A)
+    """eig(A) -> EigResult(eigenvalues, eigenvectors)"""
+    values, vectors = linalg_eig(A)
+    return EigResult(values, vectors)
 
 
 def eigvals(A):
@@ -124,8 +132,9 @@ def eigvals(A):
 
 
 def svd(A, full_matrices=True, *, driver=None):
-    """svd(A, full_matrices=True, *, driver=None) -> (Tensor U, Tensor S, Tensor Vh)"""
-    return _C.linalg_svd(A, full_matrices, driver=driver)
+    """svd(A, full_matrices=True, *, driver=None) -> SVDResult(U, S, Vh)"""
+    U, S, Vh = _C.linalg_svd(A, full_matrices, driver=driver)
+    return SVDResult(U, S, Vh)
 
 
 def svdvals(A, *, driver=None):
@@ -134,17 +143,17 @@ def svdvals(A, *, driver=None):
 
 
 def qr(A, mode="reduced"):
-    """qr(A, mode='reduced') -> (Tensor Q, Tensor R)"""
+    """qr(A, mode='reduced') -> QRResult(Q, R)"""
     Q, R = _C.linalg_qr(A, mode)
     if mode in ("r", "R"):
         # torch parity: only R is computed; Q comes back empty.
         empty = tensorplay.empty(list(A.shape[:-2]) + [A.shape[-2], 0], dtype=A.dtype)
-        return empty, R
-    return Q, R
+        return QRResult(empty, R)
+    return QRResult(Q, R)
 
 
 def lstsq(A, B, rcond=None, *, driver=None):
-    """lstsq(A, B, rcond=None, *, driver=None) -> LstsqResult(solution, residuals, rank, coefficients)"""
+    """lstsq(A, B, rcond=None, *, driver=None) -> LstsqResult(solution, residuals, rank, singular_values)"""
     solution, residuals, rank, coefficients = _C.linalg_lstsq(A, B, rcond, driver=driver)
     return LstsqResult(solution, residuals, rank, coefficients)
 
@@ -282,6 +291,10 @@ def matrix_norm(A, ord="fro", dim=(-2, -1), keepdim=False):
         return reduce_maxmin(A.abs().sum(dim=d1), adj(d2), "max")
     if ord == -1:
         return reduce_maxmin(A.abs().sum(dim=d1), adj(d2), "min")
+    if ord == 2 or ord == -2:  # spectral / smallest singular value
+        s = svdvals(A)
+        r = reduce_maxmin(s, -1, "max" if ord == 2 else "min")
+        return r.unsqueeze(-1).unsqueeze(-1) if keepdim else r
     raise RuntimeError(f"linalg.matrix_norm: invalid ord {ord!r}")
 
 

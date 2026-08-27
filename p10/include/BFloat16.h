@@ -18,6 +18,15 @@
 #define TP_HOST_DEVICE
 #endif
 
+// std::bit_cast needs C++20; nvcc is often invoked under an older -std via
+// CMake dialect machinery.  __builtin_bit_cast (GCC 11 / Clang 13 / nvcc 12+)
+// carries identical semantics with no dialect requirement.
+#if defined(__GNUC__) || defined(__clang__) || defined(__CUDACC__)
+#define TP_BIT_CAST(dst_t, src) __builtin_bit_cast(dst_t, (src))
+#else
+#define TP_BIT_CAST(dst_t, src) std::bit_cast<dst_t>(src)
+#endif
+
 namespace tensorplay {
 
 struct alignas(2) BFloat16 {
@@ -73,13 +82,13 @@ namespace detail {
 
 // Round-to-nearest-even conversion from f32 to bf16 (host fallback)
 inline uint16_t float_to_bfloat16_bits(float f) {
-  uint32_t bits = std::bit_cast<uint32_t>(f);
+  uint32_t bits = TP_BIT_CAST(uint32_t, f);
   uint32_t rounded = bits + 0x7FFFu + ((bits >> 16) & 1u);
   return static_cast<uint16_t>(rounded >> 16);
 }
 
 inline float bfloat16_to_float_bits(uint16_t b) {
-  return std::bit_cast<float>(static_cast<uint32_t>(b) << 16);
+  return TP_BIT_CAST(float, static_cast<uint32_t>(b) << 16);
 }
 
 } // namespace detail
@@ -135,22 +144,22 @@ inline TP_HOST_DEVICE bool operator>=(const BFloat16& a, const BFloat16& b) {
 
 // Mixed-type overloads used by generic kernels that mix BFloat16 with
 // double/int64_t scalars.
-inline TP_HOST_DEVICE BFloat16 operator+(const BFloat16& a, double b) { return a + BFloat16(b); }
-inline TP_HOST_DEVICE BFloat16 operator+(double a, const BFloat16& b) { return BFloat16(a) + b; }
-inline TP_HOST_DEVICE BFloat16 operator-(const BFloat16& a, double b) { return a - BFloat16(b); }
-inline TP_HOST_DEVICE BFloat16 operator-(double a, const BFloat16& b) { return BFloat16(a) - b; }
-inline TP_HOST_DEVICE BFloat16 operator*(const BFloat16& a, double b) { return a * BFloat16(b); }
-inline TP_HOST_DEVICE BFloat16 operator*(double a, const BFloat16& b) { return BFloat16(a) * b; }
-inline TP_HOST_DEVICE BFloat16 operator/(const BFloat16& a, double b) { return a / BFloat16(b); }
-inline TP_HOST_DEVICE BFloat16 operator/(double a, const BFloat16& b) { return BFloat16(a) / b; }
-inline TP_HOST_DEVICE BFloat16 operator+(const BFloat16& a, float b) { return a + BFloat16(b); }
-inline TP_HOST_DEVICE BFloat16 operator+(float a, const BFloat16& b) { return BFloat16(a) + b; }
-inline TP_HOST_DEVICE BFloat16 operator-(const BFloat16& a, float b) { return a - BFloat16(b); }
-inline TP_HOST_DEVICE BFloat16 operator-(float a, const BFloat16& b) { return BFloat16(a) - b; }
-inline TP_HOST_DEVICE BFloat16 operator*(const BFloat16& a, float b) { return a * BFloat16(b); }
-inline TP_HOST_DEVICE BFloat16 operator*(float a, const BFloat16& b) { return BFloat16(a) * b; }
-inline TP_HOST_DEVICE BFloat16 operator/(const BFloat16& a, float b) { return a / BFloat16(b); }
-inline TP_HOST_DEVICE BFloat16 operator/(float a, const BFloat16& b) { return BFloat16(a) / b; }
+inline TP_HOST_DEVICE double operator+(BFloat16 a, double b) { return static_cast<double>(a) + b; }
+inline TP_HOST_DEVICE double operator+(double a, BFloat16 b) { return a + static_cast<double>(b); }
+inline TP_HOST_DEVICE double operator-(BFloat16 a, double b) { return static_cast<double>(a) - b; }
+inline TP_HOST_DEVICE double operator-(double a, BFloat16 b) { return a - static_cast<double>(b); }
+inline TP_HOST_DEVICE double operator*(BFloat16 a, double b) { return static_cast<double>(a) * b; }
+inline TP_HOST_DEVICE double operator*(double a, BFloat16 b) { return a * static_cast<double>(b); }
+inline TP_HOST_DEVICE double operator/(BFloat16 a, double b) { return static_cast<double>(a) / b; }
+inline TP_HOST_DEVICE double operator/(double a, BFloat16 b) { return a / static_cast<double>(b); }
+inline TP_HOST_DEVICE float operator+(BFloat16 a, float b) { return static_cast<float>(a) + b; }
+inline TP_HOST_DEVICE float operator+(float a, BFloat16 b) { return a + static_cast<float>(b); }
+inline TP_HOST_DEVICE float operator-(BFloat16 a, float b) { return static_cast<float>(a) - b; }
+inline TP_HOST_DEVICE float operator-(float a, BFloat16 b) { return a - static_cast<float>(b); }
+inline TP_HOST_DEVICE float operator*(BFloat16 a, float b) { return static_cast<float>(a) * b; }
+inline TP_HOST_DEVICE float operator*(float a, BFloat16 b) { return a * static_cast<float>(b); }
+inline TP_HOST_DEVICE float operator/(BFloat16 a, float b) { return static_cast<float>(a) / b; }
+inline TP_HOST_DEVICE float operator/(float a, BFloat16 b) { return a / static_cast<float>(b); }
 inline TP_HOST_DEVICE BFloat16 operator+(const BFloat16& a, int64_t b) { return a + BFloat16(b); }
 inline TP_HOST_DEVICE BFloat16 operator+(int64_t a, const BFloat16& b) { return BFloat16(a) + b; }
 inline TP_HOST_DEVICE BFloat16 operator-(const BFloat16& a, int64_t b) { return a - BFloat16(b); }

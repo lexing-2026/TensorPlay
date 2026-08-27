@@ -2,11 +2,10 @@ import os
 from pathlib import Path
 from typing import Tuple, Union
 
-import tensorplay.audio as torchaudio
 from tensorplay import Tensor
-from torch.utils.data import Dataset
+from tensorplay.utils.data import Dataset
 from tensorplay.hub import download_url_to_file
-from torchaudio.datasets.utils import _extract_tar
+from tensorplay.audio.datasets.utils import _extract_tar
 
 
 _RELEASE_CONFIGS = {
@@ -168,7 +167,7 @@ class TEDLIUM(Dataset):
 
         kwargs = {"frame_offset": start_time, "num_frames": end_time - start_time}
 
-        return torchaudio.load(path, **kwargs)
+        return tensorplay.audio.load(path, **kwargs)
 
     def __getitem__(self, n: int) -> Tuple[Tensor, int, str, int, int, int]:
         """Load the n-th sample from the dataset.

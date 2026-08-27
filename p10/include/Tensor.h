@@ -66,7 +66,9 @@ inline Target cast_value(const Source& src) {
             return Target(static_cast<target_value_t>(src), target_value_t(0));
         }
     } else if constexpr (is_complex_type_v<Source>) {
-        return static_cast<Target>(src.real());
+        // Route through double so reduced-precision element types (e.g.
+        // Float16) without direct integral conversions still compile.
+        return static_cast<Target>(static_cast<double>(src.real()));
     } else {
         return static_cast<Target>(src);
     }
@@ -325,8 +327,14 @@ P10_API Tensor operator-(const Tensor& t);
 // clone/contiguous Tensor members are codegen-owned (native_functions.yaml)
 // and route here through the dispatcher.
 namespace detail {
-P10_API Tensor clone_impl(const Tensor& self);
+P10_API Tensor clone_impl(const Tensor& self,
+                          std::optional<MemoryFormat> memory_format = std::nullopt);
 P10_API Tensor contiguous_impl(const Tensor& self, int64_t memory_format);
+// Fresh row-major copy for internal kernels that do flat/contiguous pointer
+// arithmetic: unlike clone() (which preserves non-overlapping-and-dense
+// strides, torch parity) and contiguous() (which aliases already-contiguous
+// inputs), this always materializes a new contiguous buffer.
+P10_API Tensor contiguous_clone(const Tensor& self);
 } // namespace detail
 
 // Global operators for Scalar first

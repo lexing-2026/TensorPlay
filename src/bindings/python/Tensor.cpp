@@ -1,6 +1,7 @@
 #include "python_bindings.h"
 #include "tensorplay/ops/TensorBindingsGenerated.h"
 #include "tensorplay/ops/TensorCPythonGenerated.h"
+#include "tensorplay/ops/TPXOpsGenerated.h"
 #include "utils.h"
 #include "dlpack_types.h"
 #include "TensorImpl.h" // For unsafeGetTensorImpl
@@ -8,10 +9,15 @@
 #include "Storage.h"
 #include "DataPtr.h"
 #include "Node.h" // For grad_fn
+#include "Utils.h" // broadcast shape validation for indexed assignment
+#include "TypePromotion.h" // complex weak-scalar reflected-op dtype rules
 #include <mutex>
 #include <pybind11/functional.h>
+#include <algorithm>
 #include <cstring>
 #include <cstdio>
+#include <limits>
+#include <vector>
 
 #ifdef USE_CUDA
 #include "CUDARuntime.h"
@@ -387,13 +393,20 @@ Tensor create_tensor(py::object data, std::optional<DType> dtype, std::optional<
              for(auto s : shape) numel *= s;
              size_t total_bytes = numel * itemsize; 
              
-             if (final_dtype == inferred_dtype) {
-                 std::memcpy(t.data_ptr(), array.data(), total_bytes);
-             } else {
-                 Tensor src(shape, inferred_dtype, Device(DeviceType::CPU));
-                 std::memcpy(src.data_ptr(), array.data(), total_bytes);
-                 t.copy_(src);
+             // The NumPy buffer is host memory.  Directly memcpy'ing it into
+             // `t` is invalid when the requested device is CUDA (and also
+             // mishandles non-contiguous NumPy views).  Normalize the source
+             // to a C-contiguous CPU array, then let copy_ select the correct
+             // host-to-device and/or dtype-conversion path.
+             py::array contiguous_array =
+                 py::array::ensure(array, py::array::c_style);
+             if (!contiguous_array) {
+                 TP_THROW(ValueError,
+                          "could not make NumPy array C-contiguous");
              }
+             Tensor src(shape, inferred_dtype, Device(DeviceType::CPU));
+             std::memcpy(src.data_ptr(), contiguous_array.data(), total_bytes);
+             t.copy_(src);
          }
     }
     // 1. Check for DLPack support (fast path for interop other than NumPy)
@@ -488,6 +501,743 @@ static std::tuple<int64_t, int64_t, int64_t, int64_t> compute_slice(py::slice s,
         throw py::error_already_set();
     }
     return {start, stop, step, slicelength};
+}
+
+// Python's list/tensor indexing is advanced indexing, not a view operation.
+// Keep the conversion here, at the C++ binding boundary, so all Python entry
+// points (including DataLoader datasets) use the same device, bounds, and
+// autograd-aware index_select path.  In particular, do not read a CUDA index
+// through data_ptr() on the host: stage it explicitly before normalizing
+// negative values and checking bounds.
+struct PreparedTensorIndex {
+    Tensor flat;
+    std::vector<int64_t> shape;
+    std::vector<int64_t> values;
+    bool scalar = false;
+};
+
+// PyTorch still accepts uint8 masks for backward compatibility (with a
+// deprecation warning).  Keep that interpretation at this boundary instead
+// of treating a byte mask as an integer index tensor.
+static bool is_boolean_mask_dtype(DType dtype) {
+    return dtype == DType::Bool || dtype == DType::UInt8;
+}
+
+static int64_t checked_index_dim(const Tensor& self, int64_t dim) {
+    const int64_t ndim = self.dim();
+    if (ndim == 0) {
+        TP_THROW(IndexError, "too many indices for tensor of dimension 0");
+    }
+    if (dim < 0) dim += ndim;
+    if (dim < 0 || dim >= ndim) {
+        TP_THROW(IndexError, "Dimension out of range");
+    }
+    return dim;
+}
+
+static Tensor make_normalized_index(const Tensor& self, int64_t dim,
+                                    std::vector<int64_t>& values) {
+    dim = checked_index_dim(self, dim);
+    const int64_t dim_size = self.size(dim);
+    for (int64_t& value : values) {
+        if (value < 0) value += dim_size;
+        if (value < 0 || value >= dim_size) {
+            TP_THROW(IndexError, "index out of range");
+        }
+    }
+
+    // Tensor::tensor(vector, ...) is a CPU factory.  Constructing the small
+    // index on CPU and moving it once is also the safe route for CUDA: the
+    // CUDA index_select kernel must never be handed a host pointer.
+    Tensor result = Tensor::tensor(values, DType::Int64);
+    if (!self.device().is_cpu()) result = result.to(self.device());
+    return result;
+}
+
+static PreparedTensorIndex prepare_integer_index(const Tensor& self,
+                                                 int64_t dim,
+                                                 const Tensor& raw_index) {
+    dim = checked_index_dim(self, dim);
+    if (raw_index.dtype() == DType::Bool ||
+        !isIntegralType(raw_index.dtype(), /*includeBool=*/false)) {
+        TP_THROW(TypeError,
+                 "tensors used as indices must be long, int, short, byte or bool tensors");
+    }
+
+    PreparedTensorIndex prepared;
+    prepared.shape = static_cast<std::vector<int64_t>>(raw_index.shape());
+    prepared.scalar = raw_index.dim() == 0;
+
+    Tensor index = raw_index.to(DType::Int64).contiguous();
+    Tensor host_index = index;
+    if (!host_index.device().is_cpu()) {
+        host_index = host_index.to(Device(DeviceType::CPU));
+    }
+    host_index = host_index.contiguous();
+    prepared.values.resize(static_cast<size_t>(host_index.numel()));
+    if (!prepared.values.empty()) {
+        std::memcpy(prepared.values.data(), host_index.data_ptr<int64_t>(),
+                    prepared.values.size() * sizeof(int64_t));
+    }
+    prepared.flat = make_normalized_index(self, dim, prepared.values);
+    return prepared;
+}
+
+static bool is_python_bool_vector(py::handle object) {
+    if (!PyList_Check(object.ptr()) && !PyTuple_Check(object.ptr())) return false;
+    py::sequence sequence = py::reinterpret_borrow<py::sequence>(object);
+    const Py_ssize_t length = sequence.size();
+    // An empty Python list is an integer index with shape [0] in torch; it
+    // cannot be distinguished from an empty bool mask, so keep torch's
+    // integer-list behavior here.
+    if (length == 0) return false;
+    for (Py_ssize_t i = 0; i < length; ++i) {
+        if (!PyBool_Check(sequence[i].ptr())) return false;
+    }
+    return true;
+}
+
+static PreparedTensorIndex prepare_python_bool_index(const Tensor& self,
+                                                     int64_t dim,
+                                                     py::handle object) {
+    dim = checked_index_dim(self, dim);
+    py::sequence sequence = py::reinterpret_borrow<py::sequence>(object);
+    const int64_t length = static_cast<int64_t>(sequence.size());
+    if (length != self.size(dim)) {
+        TP_THROW(IndexError, "The shape of the mask does not match the indexed tensor");
+    }
+
+    PreparedTensorIndex prepared;
+    for (int64_t i = 0; i < length; ++i) {
+        if (PyObject_IsTrue(sequence[static_cast<Py_ssize_t>(i)].ptr())) {
+            prepared.values.push_back(i);
+        }
+    }
+    prepared.shape = {static_cast<int64_t>(prepared.values.size())};
+    prepared.flat = make_normalized_index(self, dim, prepared.values);
+    return prepared;
+}
+
+static PreparedTensorIndex prepare_bool_tensor_index(const Tensor& self,
+                                                     int64_t dim,
+                                                     const Tensor& raw_index) {
+    dim = checked_index_dim(self, dim);
+    if (raw_index.dim() != 1 || raw_index.size(0) != self.size(dim)) {
+        TP_THROW(IndexError, "The shape of the mask does not match the indexed tensor");
+    }
+
+    Tensor host_mask = raw_index;
+    if (!host_mask.device().is_cpu()) {
+        host_mask = host_mask.to(Device(DeviceType::CPU));
+    }
+    host_mask = host_mask.contiguous();
+
+    PreparedTensorIndex prepared;
+    const bool* bool_mask = host_mask.dtype() == DType::Bool
+                                ? host_mask.data_ptr<bool>()
+                                : nullptr;
+    const uint8_t* byte_mask = host_mask.dtype() == DType::UInt8
+                                   ? host_mask.data_ptr<uint8_t>()
+                                   : nullptr;
+    for (int64_t i = 0; i < host_mask.numel(); ++i) {
+        if (bool_mask ? bool_mask[i] : byte_mask[i]) {
+            prepared.values.push_back(i);
+        }
+    }
+    prepared.shape = {static_cast<int64_t>(prepared.values.size())};
+    prepared.flat = make_normalized_index(self, dim, prepared.values);
+    return prepared;
+}
+
+static PreparedTensorIndex prepare_python_integer_index(const Tensor& self,
+                                                        int64_t dim,
+                                                        py::handle object) {
+    // list_to_tensor handles nested lists as well, so e.g. x[[[0, 1]]]
+    // preserves the [1, 2] index shape after index_select.
+    Tensor raw = list_to_tensor(object.ptr(), DType::Int64,
+                                Device(DeviceType::CPU));
+    return prepare_integer_index(self, dim, raw);
+}
+
+static Tensor apply_prepared_index(const Tensor& self, int64_t dim,
+                                   const PreparedTensorIndex& prepared) {
+    dim = checked_index_dim(self, dim);
+    if (prepared.scalar) {
+        return tensorplay::tpx::ops::select(self, dim, prepared.values.at(0));
+    }
+
+    Tensor selected = tensorplay::tpx::ops::index_select(self, dim, prepared.flat);
+    if (prepared.shape.size() <= 1) return selected;
+
+    std::vector<int64_t> output_shape = static_cast<std::vector<int64_t>>(self.shape());
+    output_shape.erase(output_shape.begin() + dim);
+    output_shape.insert(output_shape.begin() + dim,
+                        prepared.shape.begin(), prepared.shape.end());
+    return tensorplay::tpx::ops::reshape(selected, output_shape);
+}
+
+static Tensor prepare_setitem_value(const Tensor& self, py::object value) {
+    if (py::isinstance<Tensor>(value)) {
+        Tensor result = py::cast<Tensor>(value);
+        if (result.dtype() != self.dtype() || result.device() != self.device()) {
+            result = result.to(self.device(), self.dtype());
+        }
+        return result;
+    }
+    if (py::isinstance<py::array>(value)) {
+        return create_tensor(std::move(value), self.dtype(), self.device());
+    }
+    if (py::isinstance<py::list>(value) ||
+        py::isinstance<py::tuple>(value)) {
+        return list_to_tensor(value.ptr(), self.dtype(), self.device());
+    }
+    // Preserve Python integer precision.  Converting an int through double
+    // first silently rounds large int64 assignments (e.g. 2**63 - 1).
+    if (py::isinstance<py::bool_>(value)) {
+        return Tensor::full({}, Scalar(py::cast<bool>(value)), self.dtype(),
+                            self.device());
+    }
+    if (py::isinstance<py::int_>(value)) {
+        return Tensor::full({}, Scalar(py::cast<int64_t>(value)), self.dtype(),
+                            self.device());
+    }
+    if (py::isinstance<py::float_>(value)) {
+        return Tensor::full({}, Scalar(py::cast<double>(value)), self.dtype(),
+                            self.device());
+    }
+    TP_THROW(TypeError, "Unsupported value type for setitem");
+}
+
+static Tensor prepare_setitem_value(const Tensor& self, py::object value,
+                                    const std::vector<int64_t>& target_shape) {
+    Tensor result = prepare_setitem_value(self, std::move(value));
+    const auto result_shape = static_cast<std::vector<int64_t>>(result.shape());
+    const auto broadcast_shape = tensorplay::broadcast_shapes(target_shape, result_shape);
+    if (broadcast_shape != target_shape) {
+        TP_THROW(RuntimeError, "shape mismatch: value cannot be broadcast to indexed result");
+    }
+    if (result_shape != target_shape) {
+        result = result.expand(target_shape).contiguous();
+    }
+    return result;
+}
+
+static std::vector<int64_t> indexed_result_shape_dim0(
+    const Tensor& self, const PreparedTensorIndex& prepared) {
+    std::vector<int64_t> shape = prepared.shape;
+    const auto self_shape = static_cast<std::vector<int64_t>>(self.shape());
+    shape.insert(shape.end(), self_shape.begin() + 1, self_shape.end());
+    return shape;
+}
+
+static void assign_prepared_index_dim0(Tensor& self,
+                                       const PreparedTensorIndex& prepared,
+                                       py::object value) {
+    if (prepared.scalar) {
+        Tensor target = self.select(0, prepared.values.at(0));
+        Tensor rhs = prepare_setitem_value(self, std::move(value),
+                                           static_cast<std::vector<int64_t>>(target.shape()));
+        tensorplay::tpx::ops::copy_(target, rhs);
+        return;
+    }
+
+    const std::vector<int64_t> indexed_shape =
+        indexed_result_shape_dim0(self, prepared);
+    Tensor rhs = prepare_setitem_value(self, std::move(value), indexed_shape);
+
+    // index_copy_ consumes a one-dimensional index and a source whose
+    // indexed dimension is the index length.  Flatten only the advanced
+    // index shape; the remaining tensor dimensions retain their layout.
+    std::vector<int64_t> source_shape;
+    source_shape.reserve(indexed_shape.size() - prepared.shape.size() + 1);
+    source_shape.push_back(static_cast<int64_t>(prepared.values.size()));
+    const auto self_shape = static_cast<std::vector<int64_t>>(self.shape());
+    source_shape.insert(source_shape.end(), self_shape.begin() + 1, self_shape.end());
+    rhs = rhs.reshape(source_shape).contiguous();
+    tensorplay::tpx::ops::index_copy_(self, 0, prepared.flat, rhs);
+}
+
+// A tuple can contain more than one advanced index.  Applying those indices
+// one at a time is observably wrong for non-adjacent indices (x[[0, 1], :,
+// [1, 2]] must pair the two index vectors, rather than form a cartesian
+// product).  Keep a small native index planner for this less common path;
+// the one-dimensional top-level path above stays on index_select/index_copy_
+// for DataLoader-sized batches.
+enum class NativeIndexKind {
+    Integer,
+    Slice,
+    Advanced,
+    NewAxis,
+};
+
+struct NativeIndexComponent {
+    NativeIndexKind kind = NativeIndexKind::Slice;
+    int64_t input_dim = -1;
+    int64_t integer = 0;
+    int64_t start = 0;
+    int64_t step = 1;
+    int64_t length = 0;
+    std::vector<int64_t> values;
+    std::vector<int64_t> shape;
+};
+
+static int64_t checked_shape_numel(const std::vector<int64_t>& shape) {
+    int64_t result = 1;
+    for (const int64_t size : shape) {
+        if (size < 0 || (size != 0 &&
+                         result > std::numeric_limits<int64_t>::max() / size)) {
+            TP_THROW(RuntimeError, "invalid or overflowing indexed shape");
+        }
+        result *= size;
+    }
+    return result;
+}
+
+static NativeIndexComponent make_full_index_component(const Tensor& self,
+                                                      int64_t input_dim) {
+    NativeIndexComponent component;
+    component.kind = NativeIndexKind::Slice;
+    component.input_dim = input_dim;
+    component.length = self.size(input_dim);
+    return component;
+}
+
+static NativeIndexComponent make_slice_index_component(const Tensor& self,
+                                                       int64_t input_dim,
+                                                       py::slice slice) {
+    auto [start, stop, step, length] = compute_slice(slice, self.size(input_dim));
+    NativeIndexComponent component;
+    component.kind = NativeIndexKind::Slice;
+    component.input_dim = input_dim;
+    component.start = start;
+    component.step = step;
+    component.length = length;
+    (void)stop;
+    return component;
+}
+
+static NativeIndexComponent make_integer_index_component(const Tensor& self,
+                                                         int64_t input_dim,
+                                                         int64_t value) {
+    input_dim = checked_index_dim(self, input_dim);
+    const int64_t size = self.size(input_dim);
+    if (value < 0) value += size;
+    if (value < 0 || value >= size) TP_THROW(IndexError, "index out of range");
+
+    NativeIndexComponent component;
+    component.kind = NativeIndexKind::Integer;
+    component.input_dim = input_dim;
+    component.integer = value;
+    return component;
+}
+
+static NativeIndexComponent make_advanced_index_component(
+    int64_t input_dim, PreparedTensorIndex prepared) {
+    NativeIndexComponent component;
+    component.kind = NativeIndexKind::Advanced;
+    component.input_dim = input_dim;
+    component.values = std::move(prepared.values);
+    component.shape = std::move(prepared.shape);
+    return component;
+}
+
+static std::vector<NativeIndexComponent> make_bool_tensor_components(
+    const Tensor& self, int64_t first_dim, const Tensor& raw_mask) {
+    first_dim = checked_index_dim(self, first_dim);
+    const int64_t mask_dim = raw_mask.dim();
+    if (mask_dim == 0 || first_dim + mask_dim > self.dim()) {
+        TP_THROW(IndexError, "The shape of the mask does not match the indexed tensor");
+    }
+    for (int64_t d = 0; d < mask_dim; ++d) {
+        if (raw_mask.size(d) != self.size(first_dim + d)) {
+            TP_THROW(IndexError, "The shape of the mask does not match the indexed tensor");
+        }
+    }
+
+    Tensor host_mask = raw_mask;
+    if (!host_mask.device().is_cpu()) {
+        host_mask = host_mask.to(Device(DeviceType::CPU));
+    }
+    host_mask = host_mask.contiguous();
+    const int64_t mask_numel = host_mask.numel();
+    const bool* bool_mask = host_mask.dtype() == DType::Bool
+                                ? host_mask.data_ptr<bool>()
+                                : nullptr;
+    const uint8_t* byte_mask = host_mask.dtype() == DType::UInt8
+                                   ? host_mask.data_ptr<uint8_t>()
+                                   : nullptr;
+    std::vector<std::vector<int64_t>> coordinates(
+        static_cast<size_t>(mask_dim));
+    for (int64_t linear = 0; linear < mask_numel; ++linear) {
+        if (!(bool_mask ? bool_mask[linear] : byte_mask[linear])) continue;
+        int64_t remainder = linear;
+        std::vector<int64_t> current(static_cast<size_t>(mask_dim));
+        for (int64_t d = mask_dim - 1; d >= 0; --d) {
+            const int64_t size = raw_mask.size(d);
+            current[static_cast<size_t>(d)] = size == 0 ? 0 : remainder % size;
+            if (size != 0) remainder /= size;
+        }
+        for (int64_t d = 0; d < mask_dim; ++d) {
+            coordinates[static_cast<size_t>(d)].push_back(
+                current[static_cast<size_t>(d)]);
+        }
+    }
+
+    std::vector<NativeIndexComponent> components;
+    components.reserve(static_cast<size_t>(mask_dim));
+    for (int64_t d = 0; d < mask_dim; ++d) {
+        NativeIndexComponent component;
+        component.kind = NativeIndexKind::Advanced;
+        component.input_dim = first_dim + d;
+        component.values = std::move(coordinates[static_cast<size_t>(d)]);
+        component.shape = {static_cast<int64_t>(component.values.size())};
+        components.push_back(std::move(component));
+    }
+    return components;
+}
+
+static int64_t consumed_index_dims(py::handle index) {
+    if (index.is_none() || index.ptr() == Py_Ellipsis) return 0;
+    if (py::isinstance<py::bool_>(index)) return 0;
+    if (py::isinstance<py::int_>(index) ||
+        py::isinstance<py::slice>(index) ||
+        py::isinstance<py::list>(index)) {
+        return 1;
+    }
+    if (py::isinstance<Tensor>(index)) {
+        Tensor tensor_index = py::cast<Tensor>(index);
+        if (is_boolean_mask_dtype(tensor_index.dtype())) {
+            // A scalar bool is a separate, zero-width newaxis; non-scalar
+            // masks consume one input dimension per mask dimension.
+            return tensor_index.dim();
+        }
+        if (isIntegralType(tensor_index.dtype(), /*includeBool=*/false)) return 1;
+        TP_THROW(TypeError,
+                 "tensors used as indices must be long, int, short, byte or bool tensors");
+    }
+    TP_THROW(TypeError, "Unsupported index type in tuple");
+}
+
+static std::vector<NativeIndexComponent> expand_native_index_tuple(
+    const Tensor& self, py::tuple indices) {
+    const int64_t ndim = self.dim();
+    int64_t consumed = 0;
+    int64_t ellipsis = -1;
+    for (size_t i = 0; i < indices.size(); ++i) {
+        py::handle index = indices[i];
+        if (index.ptr() == Py_Ellipsis) {
+            if (ellipsis >= 0) {
+                TP_THROW(IndexError, "an index can only have a single ellipsis");
+            }
+            ellipsis = static_cast<int64_t>(i);
+            continue;
+        }
+        consumed += consumed_index_dims(index);
+    }
+    if (consumed > ndim) TP_THROW(IndexError, "too many indices for tensor");
+
+    const int64_t ellipsis_fill = ndim - consumed;
+    std::vector<NativeIndexComponent> components;
+    components.reserve(static_cast<size_t>(ndim + indices.size()));
+    int64_t input_dim = 0;
+
+    auto append_index = [&](py::handle index) {
+        if (index.is_none()) {
+            NativeIndexComponent component;
+            component.kind = NativeIndexKind::NewAxis;
+            component.length = 1;
+            components.push_back(std::move(component));
+            return;
+        }
+        if (py::isinstance<py::bool_>(index)) {
+            NativeIndexComponent component;
+            component.kind = NativeIndexKind::NewAxis;
+            component.length = py::cast<bool>(index) ? 1 : 0;
+            components.push_back(std::move(component));
+            return;
+        }
+        if (py::isinstance<py::int_>(index)) {
+            components.push_back(make_integer_index_component(
+                self, input_dim++, py::cast<int64_t>(index)));
+            return;
+        }
+        if (py::isinstance<py::slice>(index)) {
+            components.push_back(make_slice_index_component(
+                self, input_dim++, py::cast<py::slice>(index)));
+            return;
+        }
+        if (py::isinstance<py::list>(index)) {
+            PreparedTensorIndex prepared =
+                is_python_bool_vector(index)
+                    ? prepare_python_bool_index(self, input_dim, index)
+                    : prepare_python_integer_index(self, input_dim, index);
+            components.push_back(make_advanced_index_component(
+                input_dim++, std::move(prepared)));
+            return;
+        }
+        if (py::isinstance<Tensor>(index)) {
+            Tensor tensor_index = py::cast<Tensor>(index);
+            if (is_boolean_mask_dtype(tensor_index.dtype())) {
+                if (tensor_index.dim() == 0) {
+                    NativeIndexComponent component;
+                    component.kind = NativeIndexKind::NewAxis;
+                    component.length = tensor_index.item<bool>() ? 1 : 0;
+                    components.push_back(std::move(component));
+                    return;
+                }
+                std::vector<NativeIndexComponent> mask_components =
+                    make_bool_tensor_components(self, input_dim, tensor_index);
+                input_dim += tensor_index.dim();
+                for (auto& component : mask_components) {
+                    components.push_back(std::move(component));
+                }
+                return;
+            }
+            if (!isIntegralType(tensor_index.dtype(), /*includeBool=*/false)) {
+                TP_THROW(TypeError,
+                         "tensors used as indices must be long, int, short, byte or bool tensors");
+            }
+            PreparedTensorIndex prepared =
+                prepare_integer_index(self, input_dim, tensor_index);
+            if (prepared.scalar) {
+                components.push_back(make_integer_index_component(
+                    self, input_dim++, prepared.values.at(0)));
+            } else {
+                components.push_back(make_advanced_index_component(
+                    input_dim++, std::move(prepared)));
+            }
+            return;
+        }
+        TP_THROW(TypeError, "Unsupported index type in tuple");
+    };
+
+    for (size_t i = 0; i < indices.size(); ++i) {
+        py::handle index = indices[i];
+        if (index.ptr() == Py_Ellipsis) {
+            for (int64_t d = 0; d < ellipsis_fill; ++d) {
+                components.push_back(make_full_index_component(self, input_dim++));
+            }
+        } else {
+            append_index(index);
+        }
+    }
+    while (input_dim < ndim) {
+        components.push_back(make_full_index_component(self, input_dim++));
+    }
+    return components;
+}
+
+static bool tuple_needs_native_index_plan(py::tuple indices) {
+    int64_t advanced_count = 0;
+    for (size_t i = 0; i < indices.size(); ++i) {
+        py::handle index = indices[i];
+        if (index.is_none()) return true;
+        if (py::isinstance<py::bool_>(index)) return true;
+        if (py::isinstance<py::list>(index)) {
+            ++advanced_count;
+            continue;
+        }
+        if (py::isinstance<Tensor>(index)) {
+            Tensor tensor_index = py::cast<Tensor>(index);
+            if (is_boolean_mask_dtype(tensor_index.dtype())) {
+                if (tensor_index.dim() == 0 || tensor_index.dim() > 1) return true;
+                if (tensor_index.dim() == 1) ++advanced_count;
+            } else if (isIntegralType(tensor_index.dtype(), /*includeBool=*/false)) {
+                // A scalar integer tensor is a basic index, but sending it
+                // through the native planner keeps tuple getitem/setitem on
+                // the same path (the old setter only handled Python ints).
+                if (tensor_index.dim() == 0) return true;
+                ++advanced_count;
+            }
+        }
+    }
+    return advanced_count > 1;
+}
+
+static bool tuple_contains_advanced_index(py::tuple indices) {
+    for (size_t i = 0; i < indices.size(); ++i) {
+        py::handle index = indices[i];
+        if (py::isinstance<py::list>(index)) return true;
+        if (!py::isinstance<Tensor>(index)) continue;
+        Tensor tensor_index = py::cast<Tensor>(index);
+        if (is_boolean_mask_dtype(tensor_index.dtype())) {
+            if (tensor_index.dim() > 0) return true;
+        } else if (isIntegralType(tensor_index.dtype(), /*includeBool=*/false) &&
+                   tensor_index.dim() > 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+struct NativeIndexPlan {
+    std::vector<int64_t> output_shape;
+    std::vector<int64_t> linear_indices;
+};
+
+static NativeIndexPlan build_native_index_plan(
+    const Tensor& self, const std::vector<NativeIndexComponent>& components) {
+    std::vector<size_t> advanced_positions;
+    std::vector<int64_t> advanced_shape;
+    for (size_t i = 0; i < components.size(); ++i) {
+        if (components[i].kind != NativeIndexKind::Advanced) continue;
+        advanced_positions.push_back(i);
+        if (advanced_shape.empty()) {
+            advanced_shape = components[i].shape;
+        } else {
+            advanced_shape = tensorplay::broadcast_shapes(
+                advanced_shape, components[i].shape);
+        }
+    }
+
+    NativeIndexPlan plan;
+    const bool has_advanced = !advanced_positions.empty();
+    const size_t first_advanced = has_advanced ? advanced_positions.front()
+                                               : components.size();
+    const size_t last_advanced = has_advanced ? advanced_positions.back()
+                                              : components.size();
+    const bool advanced_contiguous =
+        !has_advanced || last_advanced - first_advanced + 1 == advanced_positions.size();
+    int64_t advanced_output_start = 0;
+    std::vector<int64_t> component_output_axis(components.size(), -1);
+
+    auto append_basic_shape = [&](size_t component_index) {
+        const auto& component = components[component_index];
+        if (component.kind == NativeIndexKind::NewAxis) {
+            component_output_axis[component_index] =
+                static_cast<int64_t>(plan.output_shape.size());
+            plan.output_shape.push_back(component.length);
+        } else if (component.kind == NativeIndexKind::Slice) {
+            component_output_axis[component_index] =
+                static_cast<int64_t>(plan.output_shape.size());
+            plan.output_shape.push_back(component.length);
+        }
+    };
+
+    if (!has_advanced) {
+        for (size_t i = 0; i < components.size(); ++i) {
+            append_basic_shape(i);
+        }
+    } else if (!advanced_contiguous) {
+        plan.output_shape.insert(plan.output_shape.end(),
+                                 advanced_shape.begin(), advanced_shape.end());
+        for (size_t i = 0; i < components.size(); ++i) {
+            if (components[i].kind != NativeIndexKind::Advanced) {
+                append_basic_shape(i);
+            }
+        }
+    } else {
+        for (size_t i = 0; i < components.size(); ++i) {
+            if (i == first_advanced) {
+                advanced_output_start =
+                    static_cast<int64_t>(plan.output_shape.size());
+                plan.output_shape.insert(plan.output_shape.end(),
+                                         advanced_shape.begin(), advanced_shape.end());
+            }
+            if (components[i].kind != NativeIndexKind::Advanced) {
+                append_basic_shape(i);
+            }
+        }
+    }
+
+    const int64_t output_numel = checked_shape_numel(plan.output_shape);
+    plan.linear_indices.resize(static_cast<size_t>(output_numel));
+    const int64_t advanced_rank = static_cast<int64_t>(advanced_shape.size());
+    auto advanced_value = [&](const NativeIndexComponent& component,
+                              const std::vector<int64_t>& output_coords) {
+        int64_t offset = 0;
+        const int64_t component_rank = static_cast<int64_t>(component.shape.size());
+        for (int64_t d = 0; d < component_rank; ++d) {
+            const int64_t output_dim = advanced_output_start + advanced_rank -
+                                       component_rank + d;
+            const int64_t coordinate =
+                component.shape[static_cast<size_t>(d)] == 1
+                    ? 0
+                    : output_coords[static_cast<size_t>(output_dim)];
+            offset = offset * component.shape[static_cast<size_t>(d)] + coordinate;
+        }
+        return component.values[static_cast<size_t>(offset)];
+    };
+
+    // The planner is used for advanced tuples only.  Decode the output in
+    // row-major order, then map each coordinate back to one source element.
+    // This is linear in the result size and preserves the exact torch output
+    // order for both contiguous and non-contiguous advanced groups.
+    for (int64_t linear = 0; linear < output_numel; ++linear) {
+        std::vector<int64_t> output_coords(plan.output_shape.size(), 0);
+        int64_t remainder = linear;
+        for (int64_t d = static_cast<int64_t>(plan.output_shape.size()) - 1;
+             d >= 0; --d) {
+            const int64_t size = plan.output_shape[static_cast<size_t>(d)];
+            output_coords[static_cast<size_t>(d)] = size == 0 ? 0 : remainder % size;
+            if (size != 0) remainder /= size;
+        }
+
+        int64_t source_linear = 0;
+        for (const auto& component : components) {
+            if (component.kind == NativeIndexKind::NewAxis) continue;
+            int64_t coordinate = 0;
+            if (component.kind == NativeIndexKind::Integer) {
+                coordinate = component.integer;
+            } else if (component.kind == NativeIndexKind::Slice) {
+                // Find the output dimension assigned to this basic component.
+                // NewAxis and integer components do not consume an output slot.
+                // component_output_axis was filled in the same order as the
+                // output shape above.
+                const size_t component_index = static_cast<size_t>(
+                    &component - components.data());
+                const int64_t output_dim = component_output_axis[component_index];
+                coordinate = component.start + component.step *
+                    output_coords[static_cast<size_t>(output_dim)];
+            } else {
+                coordinate = advanced_value(component, output_coords);
+            }
+            source_linear = source_linear * self.size(component.input_dim) + coordinate;
+        }
+        plan.linear_indices[static_cast<size_t>(linear)] = source_linear;
+    }
+    return plan;
+}
+
+static Tensor apply_native_index_plan(const Tensor& self,
+                                      const NativeIndexPlan& plan) {
+    Tensor index = Tensor::tensor(plan.linear_indices, DType::Int64);
+    if (!self.device().is_cpu()) index = index.to(self.device());
+    Tensor flat = self.reshape({self.numel()});
+    Tensor selected = tensorplay::tpx::ops::index_select(flat, 0, index);
+    return tensorplay::tpx::ops::reshape(selected, plan.output_shape);
+}
+
+static void assign_native_index_plan(Tensor& self, const NativeIndexPlan& plan,
+                                     py::object value) {
+    Tensor rhs = prepare_setitem_value(self, std::move(value), plan.output_shape);
+    rhs = rhs.reshape({static_cast<int64_t>(plan.linear_indices.size())})
+              .contiguous()
+              .clone();
+    if (plan.linear_indices.empty()) return;
+
+    Tensor index = Tensor::tensor(plan.linear_indices, DType::Int64);
+    if (!self.device().is_cpu()) index = index.to(self.device());
+    // A single index tensor is deliberately used here: index_put_'s backend
+    // interprets one index as a linear offset, which is exactly what the
+    // planner produced.  Cloning rhs makes overlapping assignments (e.g.
+    // x[[1, 0]] = x[[0, 1]]) deterministic like torch's temporary RHS.
+    // The backend's linear writer is contiguous-only, however.  Stage through
+    // a contiguous clone for a transposed/sliced destination, then copy the
+    // logical result back through TensorIterator so the view's strides are
+    // honored.
+    Tensor target = self.is_contiguous() ? self : self.contiguous();
+    tensorplay::tpx::ops::index_put_(
+        target, std::vector<Tensor>{index}, rhs, false);
+    if (!self.is_contiguous()) {
+        tensorplay::tpx::ops::copy_(self, target);
+    }
+}
+
+static Tensor apply_python_bool_scalar_index(const Tensor& self, bool value) {
+    Tensor with_index_dim = tensorplay::tpx::ops::unsqueeze(self, 0);
+    if (value) return with_index_dim;
+    return tensorplay::tpx::ops::slice(with_index_dim, 0, 0, 0, 1);
 }
 
 static std::pair<Tensor, py::dict> setstate_helper(py::tuple state) {
@@ -754,6 +1504,27 @@ py::object as_tensor(py::object data, std::optional<DType> dtype, std::optional<
 }
 
 void init_tensor(py::module_& m) {
+    // item -> native Python number: the generated fastcall binding boxes the
+    // result into a tp.Scalar object which the _tensor.py wrapper then
+    // unboxes per dtype (with a per-call `import builtins`).  Returning raw
+    // Python numbers here matches torch's Tensor.item() contract and skips
+    // both extra layers.
+    m.def("item_python", [](const Tensor& t) -> py::object {
+        const Scalar v = t.item();
+        if (v.isBoolean()) return py::bool_(v.to<bool>());
+        if (v.isComplex()) {
+            const auto c = v.to<std::complex<double>>();
+            return py::reinterpret_steal<py::object>(
+                PyComplex_FromDoubles(c.real(), c.imag()));
+        }
+        if (v.dtype() == DType::UInt64) {
+            return py::reinterpret_steal<py::object>(PyLong_FromUnsignedLongLong(
+                static_cast<unsigned long long>(v.to<uint64_t>())));
+        }
+        if (v.isFloatingPoint()) return py::float_(v.to<double>());
+        return py::int_(v.to<int64_t>());
+    });
+
     // from_numpy — direct port of torch/csrc/utils/tensor_numpy.cpp
     // tensor_from_numpy(): zero-copy from_blob view; non-writable arrays warn
     // once instead of failing; byte-stride divisibility, negative strides and
@@ -940,11 +1711,11 @@ void init_tensor(py::module_& m) {
     tensor
         .def(py::init<>())
         // Constructor from data (torch.tensor equivalent)
-        .def("__init__", [](Tensor* self, py::object data, std::optional<DType> dtype, std::optional<Device> device, bool requires_grad) {
+        .def(py::init([](py::object data, std::optional<DType> dtype, std::optional<Device> device, bool requires_grad) {
             Tensor t = create_tensor(data, dtype, device);
             tensorplay::tpx::impl::set_requires_grad(t, requires_grad);
-            new (self) Tensor(std::move(t));
-        }, "data"_a, "dtype"_a = py::none(), "device"_a = py::none(), "requires_grad"_a = false)
+            return t;
+        }), "data"_a, "dtype"_a = py::none(), "device"_a = py::none(), "requires_grad"_a = false)
         
         // Properties
         .def_property_readonly("_impl_id", [](const Tensor& self) {
@@ -1017,6 +1788,12 @@ void init_tensor(py::module_& m) {
         .def("_set_grad_fn", [](Tensor& self, std::shared_ptr<tensorplay::tpx::Node> node, int output_nr) {
             tensorplay::tpx::impl::set_grad_fn(self, std::move(node), output_nr);
         }, "node"_a, "output_nr"_a = 0)
+        .def("_bump_version", [](Tensor& self) {
+            // torch parity for ctx.mark_dirty: in-place custom Functions
+            // must advance the version counter so saved-tensor checks and
+            // double-backward see the mutation.
+            self.unsafeGetTensorImpl()->bump_version();
+        })
         .def_property_readonly("_output_nr", [](const Tensor& self) {
             return tensorplay::tpx::impl::output_nr(self);
         })
@@ -1026,6 +1803,53 @@ void init_tensor(py::module_& m) {
         .def("element_size", [](const Tensor& self) -> int64_t {
             return static_cast<int64_t>(self.itemsize());
         })
+        .def("nbytes", [](const Tensor& self) -> int64_t {
+            return static_cast<int64_t>(self.numel() * self.itemsize());
+        })
+        .def("storage_offset", [](const Tensor& self) -> int64_t {
+            return static_cast<int64_t>(self.unsafeGetTensorImpl()->storage_offset());
+        })
+        .def("get_device", [](const Tensor& self) -> int64_t {
+            // torch parity: device index, -1 for CPU.
+            const auto dev = self.device();
+            return dev.is_cuda() || dev.type() != DeviceType::CPU ? dev.index() : -1;
+        })
+        .def("type_as", [](const Tensor& self, const Tensor& other) {
+            if (self.dtype() == other.dtype()) return self;
+            return self.to(other.dtype());
+        }, py::arg("other"))
+        .def("set_", [](Tensor& self, const Tensor& source,
+                        std::optional<int64_t> storage_offset,
+                        std::optional<std::vector<int64_t>> size,
+                        std::optional<std::vector<int64_t>> stride) -> Tensor& {
+            // torch.Tensor.set_ parity: re-point this tensor at `source`'s
+            // storage.  Autograd metadata on the impl stays untouched.
+            auto impl = self.unsafeGetTensorImpl();
+            const auto& src_impl = *source.unsafeGetTensorImpl();
+            std::vector<int64_t> ns = size.has_value()
+                ? *size
+                : static_cast<std::vector<int64_t>>(source.shape());
+            std::vector<int64_t> nst = stride.has_value()
+                ? *stride
+                : (size.has_value()
+                       ? std::vector<int64_t>{}
+                       : static_cast<std::vector<int64_t>>(source.strides()));
+            if (nst.empty() && !ns.empty()) {
+                // sizes given without strides: fresh contiguous strides
+                nst.assign(ns.size(), 1);
+                for (int i = static_cast<int>(ns.size()) - 2; i >= 0; --i)
+                    nst[i] = nst[i + 1] * ns[i + 1];
+            }
+            impl->set_storage(src_impl.storage());
+            impl->set_sizes_and_strides(ns, nst);
+            impl->set_storage_offset(storage_offset.has_value()
+                ? static_cast<size_t>(*storage_offset)
+                : src_impl.storage_offset());
+            return self;
+        },
+             py::arg("source"), py::arg("storage_offset").none(true) = py::none(),
+             py::arg("size").none(true) = py::none(),
+             py::arg("stride").none(true) = py::none())
         .def_property_readonly("is_cuda", [](const Tensor& self) { return self.device().type() == DeviceType::CUDA; })
         .def("pin_memory", [](const Tensor& self) {
              Tensor result(self.pin_memory());
@@ -1086,8 +1910,15 @@ void init_tensor(py::module_& m) {
                  tensorplay::tpx::backward(self, Tensor(), keep_graph, create_graph);
              }
         }, "gradient"_a = py::none(), "retain_graph"_a = py::none(), "create_graph"_a = false)
-        .def_property("data", 
-            [](const Tensor& self) { return self.detach(); },
+        .def_property("data",
+            [](const Tensor& self) {
+                // torch parity: `.data` shares storage but carries a FRESH
+                // version counter, so in-place writes through it stay
+                // invisible to mutation tracking on the original tensor.
+                Tensor out = self.detach();
+                out.unsafeGetTensorImpl()->set_version_counter(tensorplay::VariableVersion());
+                return out;
+            },
             [](Tensor& self, const Tensor& other) {
                 if (!self.defined() || !other.defined()) {
                     self = other;
@@ -1099,10 +1930,27 @@ void init_tensor(py::module_& m) {
             }
         )
         .def("detach", &Tensor::detach)
+        .def("_is_view", [](const Tensor& self) {
+            return self.defined() && self.unsafeGetTensorImpl()->is_view();
+        })
         .def("detach_", [](py::object self_obj) {
             Tensor& self = py::cast<Tensor&>(self_obj);
-            self.set_requires_grad(false);
-            
+            // torch VariableType::detach_ parity: in-place detach is only
+            // legal on non-views (a view's impl is shared with its base, so
+            // stripping its autograd edge in place would corrupt the base's
+            // graph bookkeeping).
+            if (self.defined() && self.unsafeGetTensorImpl()->is_view()) {
+                TP_THROW(RuntimeError,
+                    "Can't detach views in-place. Use detach() instead. "
+                    "If you are using DistributedDataParallel (DDP) for training, "
+                    "and gradient_as_bucket_view is set as True, gradients are "
+                    "views of DDP buckets, and hence detach_() cannot be called "
+                    "on these gradients. To fix this error, please refer to the "
+                    "Optimizer.zero_grad() function in torch/optim/optimizer.py "
+                    "as the solution.");
+            }
+            tensorplay::tpx::impl::set_requires_grad(self, false);
+            tensorplay::tpx::impl::set_grad_fn(self, nullptr, 0);
             return self_obj;
         })
                 .def("requires_grad_", [](py::object self_obj, bool requires_grad) {
@@ -1119,11 +1967,32 @@ void init_tensor(py::module_& m) {
             return self.size(dim);
         })
         // expand: served by the generated METH_FASTCALL layer (dispatcher op).
-        .def("view", [](const Tensor& self, py::object spec) {
-            if (py::isinstance<DType>(spec)) {
-                return self.view_dtype(spec.cast<DType>());
+        // view: torch accepts varargs ints (t.view(8, 1)), a sequence
+        // ([8, 1] / Size / tuple), -1 inference, and a dtype reinterpret.
+        // Route through tpx::ops::view (NOT Tensor::view): the generated
+        // wrapper records ViewBackward; the raw method silently detaches.
+        .def("view", [](const Tensor& self, py::args args) -> Tensor {
+            if (args.size() == 1) {
+                py::object spec = args[0];
+                if (py::isinstance<DType>(spec)) {
+                    return self.view_dtype(spec.cast<DType>());
+                }
+                try {
+                    return tensorplay::tpx::ops::view(self, spec.cast<std::vector<int64_t>>());
+                } catch (const py::cast_error&) {
+                    // fall through to per-arg ints below (e.g. numpy scalars)
+                }
             }
-            return self.view(spec.cast<std::vector<int64_t>>());
+            std::vector<int64_t> shape;
+            shape.reserve(args.size());
+            for (auto a : args) shape.push_back(a.cast<int64_t>());
+            return tensorplay::tpx::ops::view(self, shape);
+        })
+        // reshape_as: torch exposes it only as a method
+        // (CompositeImplicitAutograd -> reshape(other.shape)).
+        .def("reshape_as", [](const Tensor& self, const Tensor& other) -> Tensor {
+            return tensorplay::tpx::ops::reshape(
+                self, static_cast<std::vector<int64_t>>(other.shape()));
         })
         .def("as_strided", [](const Tensor& self,
                               const std::vector<int64_t>& size,
@@ -1263,7 +2132,7 @@ void init_tensor(py::module_& m) {
                      t_cpu = t_cpu.to(Device(DeviceType::CPU));
                  }
                  if (!t_cpu.is_contiguous()) {
-                     t_cpu = t_cpu.clone(); 
+                     t_cpu = t_cpu.contiguous();
                  }
                  
                  const tensorplay::Tensor& p10_t = t_cpu;
@@ -1504,14 +2373,42 @@ void init_tensor(py::module_& m) {
 
         .def("__getitem__", [](const Tensor& self, py::object index) -> Tensor {
             if (py::isinstance<Tensor>(index)) {
-            Tensor idx = py::cast<Tensor>(index);
-            if (idx.dtype() == DType::Bool) {
-                return self.masked_select(idx);
+                Tensor idx = py::cast<Tensor>(index);
+                if (is_boolean_mask_dtype(idx.dtype())) {
+                    if (idx.dim() == 0) {
+                        return apply_python_bool_scalar_index(self, idx.item<bool>());
+                    }
+                    std::vector<NativeIndexComponent> components =
+                        make_bool_tensor_components(self, 0, idx);
+                    for (int64_t dim = idx.dim(); dim < self.dim(); ++dim) {
+                        components.push_back(make_full_index_component(self, dim));
+                    }
+                    return apply_native_index_plan(
+                        self, build_native_index_plan(self, components));
+                }
+                if (isIntegralType(idx.dtype(), /*includeBool=*/false)) {
+                    return apply_prepared_index(
+                        self, 0, prepare_integer_index(self, 0, idx));
+                }
+                TP_THROW(TypeError,
+                         "tensors used as indices must be long, int, short, byte or bool tensors");
+            } else if (py::isinstance<py::list>(index)) {
+                PreparedTensorIndex prepared =
+                    is_python_bool_vector(index)
+                        ? prepare_python_bool_index(self, 0, index)
+                        : prepare_python_integer_index(self, 0, index);
+                return apply_prepared_index(self, 0, prepared);
             }
-        }
+
             if (py::isinstance<py::tuple>(index)) {
                  py::tuple indices = py::cast<py::tuple>(index);
+                 if (tuple_needs_native_index_plan(indices)) {
+                     const auto components = expand_native_index_tuple(self, indices);
+                     return apply_native_index_plan(
+                         self, build_native_index_plan(self, components));
+                 }
                  Tensor result = self;
+                 bool ellipsis_seen = false;
                  int64_t target_dim = 0;
                  for (size_t i = 0; i < indices.size(); ++i) {
                      py::object idx = indices[i];
@@ -1526,17 +2423,55 @@ void init_tensor(py::module_& m) {
                          auto [start, stop, step, slicelength] = compute_slice(s, result.size(target_dim));
                          result = tensorplay::tpx::ops::slice(result, target_dim, start, stop, step);
                          target_dim++;
+                     } else if (py::isinstance<py::list>(idx)) {
+                         PreparedTensorIndex prepared =
+                             is_python_bool_vector(idx)
+                                 ? prepare_python_bool_index(result, target_dim, idx)
+                                 : prepare_python_integer_index(result, target_dim, idx);
+                         result = apply_prepared_index(result, target_dim, prepared);
+                         if (!prepared.scalar) {
+                             target_dim += static_cast<int64_t>(prepared.shape.size());
+                         }
+                     } else if (py::isinstance<Tensor>(idx)) {
+                         Tensor tensor_index = py::cast<Tensor>(idx);
+                         PreparedTensorIndex prepared;
+                         if (is_boolean_mask_dtype(tensor_index.dtype())) {
+                             prepared = prepare_bool_tensor_index(result, target_dim,
+                                                                   tensor_index);
+                         } else if (isIntegralType(tensor_index.dtype(),
+                                                   /*includeBool=*/false)) {
+                             prepared = prepare_integer_index(result, target_dim,
+                                                              tensor_index);
+                         } else {
+                             TP_THROW(TypeError,
+                                      "tensors used as indices must be long, int, short, byte or bool tensors");
+                         }
+                         result = apply_prepared_index(result, target_dim, prepared);
+                         if (!prepared.scalar) {
+                             target_dim += static_cast<int64_t>(prepared.shape.size());
+                         }
                       } else if (idx.ptr() == Py_Ellipsis) {
                          // torch semantics: "..." expands to full slices over
                          // every dimension not covered by the other indices.
-                         int64_t absorbed = static_cast<int64_t>(self.dim())
-                                            - static_cast<int64_t>(indices.size()) + 1;
-                         if (absorbed > 0) target_dim += absorbed;
+                         if (ellipsis_seen) {
+                             TP_THROW(IndexError, "an index can only have a single ellipsis");
+                         }
+                         ellipsis_seen = true;
+                         const int64_t remaining =
+                             static_cast<int64_t>(indices.size() - i - 1);
+                         const int64_t absorbed = result.dim() - target_dim - remaining;
+                         if (absorbed < 0) {
+                             TP_THROW(IndexError, "too many indices for tensor");
+                         }
+                         target_dim += absorbed;
                       } else {
-
+                         TP_THROW(TypeError, "Unsupported index type in tuple");
                      }
                  }
                  return result;
+            } else if (py::isinstance<py::bool_>(index)) {
+                return apply_python_bool_scalar_index(
+                    self, py::cast<bool>(index));
             } else if (py::isinstance<py::int_>(index)) {
                 return tensorplay::tpx::ops::select(self, 0, py::cast<int64_t>(index));
             } else if (py::isinstance<py::slice>(index)) {
@@ -1550,6 +2485,14 @@ void init_tensor(py::module_& m) {
             Tensor target;
             if (py::isinstance<py::tuple>(index)) {
                  py::tuple indices = py::cast<py::tuple>(index);
+                 if (tuple_contains_advanced_index(indices) ||
+                     tuple_needs_native_index_plan(indices)) {
+                     const auto components = expand_native_index_tuple(self, indices);
+                     assign_native_index_plan(
+                         self, build_native_index_plan(self, components),
+                         std::move(value));
+                     return;
+                 }
                  target = self;
                  int64_t target_dim = 0;
                  for (size_t i = 0; i < indices.size(); ++i) {
@@ -1570,8 +2513,51 @@ void init_tensor(py::module_& m) {
                           TP_THROW(TypeError, "Unsupported index type in tuple");
                       }
                   }
-             } else if (index.ptr() == Py_Ellipsis) {
-                 target = self;
+            } else if (index.ptr() == Py_Ellipsis) {
+                target = self;
+            } else if (py::isinstance<py::list>(index) ||
+                       py::isinstance<Tensor>(index)) {
+                PreparedTensorIndex prepared;
+                if (py::isinstance<Tensor>(index)) {
+                    Tensor tensor_index = py::cast<Tensor>(index);
+                    if (is_boolean_mask_dtype(tensor_index.dtype())) {
+                        if (tensor_index.dim() == 0) {
+                            if (!tensor_index.item<bool>()) return;
+                            Tensor rhs = prepare_setitem_value(
+                                self, std::move(value),
+                                static_cast<std::vector<int64_t>>(self.shape()));
+                            tensorplay::tpx::ops::copy_(self, rhs);
+                            return;
+                        }
+                        std::vector<NativeIndexComponent> components =
+                            make_bool_tensor_components(self, 0, tensor_index);
+                        for (int64_t dim = tensor_index.dim(); dim < self.dim(); ++dim) {
+                            components.push_back(make_full_index_component(self, dim));
+                        }
+                        assign_native_index_plan(
+                            self, build_native_index_plan(self, components),
+                            std::move(value));
+                        return;
+                    }
+                    prepared = prepare_integer_index(self, 0, tensor_index);
+                } else {
+                    prepared = is_python_bool_vector(index)
+                                   ? prepare_python_bool_index(self, 0, index)
+                                   : prepare_python_integer_index(self, 0, index);
+                }
+                if (prepared.scalar) {
+                    target = self.select(0, prepared.values.at(0));
+                } else {
+                    assign_prepared_index_dim0(self, prepared, std::move(value));
+                    return;
+                }
+            } else if (py::isinstance<py::bool_>(index)) {
+                if (!py::cast<bool>(index)) return;
+                Tensor rhs = prepare_setitem_value(
+                    self, std::move(value),
+                    static_cast<std::vector<int64_t>>(self.shape()));
+                tensorplay::tpx::ops::copy_(self, rhs);
+                return;
             } else if (py::isinstance<py::int_>(index)) {
                 target = tensorplay::tpx::ops::select(self, 0, py::cast<int64_t>(index));
             } else if (py::isinstance<py::slice>(index)) {
@@ -1582,21 +2568,10 @@ void init_tensor(py::module_& m) {
                 TP_THROW(TypeError, "Unsupported index type");
             }
 
-            if (py::isinstance<Tensor>(value)) {
-                target.copy_(py::cast<Tensor>(value));
-            } else {
-                try {
-                    // Try to cast to scalar (float/int/bool)
-                    if (py::isinstance<py::float_>(value) || py::isinstance<py::int_>(value) || py::isinstance<py::bool_>(value)) {
-                         double v = py::cast<double>(value);
-                         target.fill_(Scalar(v));
-                    } else {
-                         TP_THROW(TypeError, "Unsupported value type for setitem");
-                    }
-                } catch (...) {
-                    TP_THROW(TypeError, "Unsupported value type for setitem");
-                }
-            }
+            Tensor rhs = prepare_setitem_value(
+                self, std::move(value),
+                static_cast<std::vector<int64_t>>(target.shape()));
+            tensorplay::tpx::ops::copy_(target, rhs);
         })
         
         // Operators
@@ -1614,6 +2589,12 @@ void init_tensor(py::module_& m) {
         .def("__sub__", [](const Tensor& t, double s) { return tensorplay::tpx::ops::sub(t, Scalar(s)); })
         .def("__mul__", [](const Tensor& t, double s) { return tensorplay::tpx::ops::mul(t, Scalar(s)); })
         .def("__truediv__", [](const Tensor& t, double s) { return tensorplay::tpx::ops::div(t, Scalar(s)); })
+        // torch parity: python complex scalars wrap as complex128 and follow
+        // the weak-scalar promotion rules in the kernels.
+        .def("__add__", [](const Tensor& t, std::complex<double> s) { return tensorplay::tpx::ops::add(t, Scalar(s)); })
+        .def("__sub__", [](const Tensor& t, std::complex<double> s) { return tensorplay::tpx::ops::sub(t, Scalar(s)); })
+        .def("__mul__", [](const Tensor& t, std::complex<double> s) { return tensorplay::tpx::ops::mul(t, Scalar(s)); })
+        .def("__truediv__", [](const Tensor& t, std::complex<double> s) { return tensorplay::tpx::ops::div(t, Scalar(s)); })
         .def("__radd__", [](const Tensor& t, int64_t s) { return tensorplay::tpx::ops::add(t, Scalar(s)); })
         .def("__rmul__", [](const Tensor& t, int64_t s) { return tensorplay::tpx::ops::mul(t, Scalar(s)); })
         .def("__radd__", [](const Tensor& t, double s) { return tensorplay::tpx::ops::add(t, Scalar(s)); })
@@ -1622,8 +2603,33 @@ void init_tensor(py::module_& m) {
             return tensorplay::tpx::ops::sub(s_t, t);
         })
         .def("__rmul__", [](const Tensor& t, double s) { return tensorplay::tpx::ops::mul(t, Scalar(s)); })
+        .def("__radd__", [](const Tensor& t, std::complex<double> s) { return tensorplay::tpx::ops::add(t, Scalar(s)); })
+        // Weak-scalar rule for the reflected operand's storage width:
+        // complex tensor keeps its dtype; float32 -> complex64,
+        // float64 -> complex128; integral -> complex64.
+        .def("__rsub__", [](const Tensor& t, std::complex<double> s) {
+            DType sdt = isComplexType(t.dtype())
+                ? t.dtype()
+                : (isFloatingType(t.dtype()) ? promoteTypes(toComplexType(t.dtype()), DType::ComplexFloat)
+                                             : DType::ComplexFloat);
+            Tensor s_t = Tensor::full({}, Scalar(s), sdt, t.device());
+            return tensorplay::tpx::ops::sub(s_t, t);
+        })
+        .def("__rmul__", [](const Tensor& t, std::complex<double> s) { return tensorplay::tpx::ops::mul(t, Scalar(s)); })
+        // NOTE: the double overload must precede the std::complex<double> one.
+        // pybind tries overloads in registration order and a python float is
+        // convertible to complex<double>; otherwise every `1.0 / real_tensor`
+        // silently promoted to complex (broke linalg.pinv et al).
         .def("__rtruediv__", [](const Tensor& t, double s) {
             Tensor s_t = Tensor::full({}, Scalar(s), t.dtype(), t.device());
+            return tensorplay::tpx::ops::div(s_t, t);
+        })
+        .def("__rtruediv__", [](const Tensor& t, std::complex<double> s) {
+            DType sdt = isComplexType(t.dtype())
+                ? t.dtype()
+                : (isFloatingType(t.dtype()) ? promoteTypes(toComplexType(t.dtype()), DType::ComplexFloat)
+                                             : DType::ComplexFloat);
+            Tensor s_t = Tensor::full({}, Scalar(s), sdt, t.device());
             return tensorplay::tpx::ops::div(s_t, t);
         })
         .def("__iadd__", [](Tensor& self, const Tensor& other) {
@@ -1745,7 +2751,7 @@ void init_tensor(py::module_& m) {
                 ));
             }
             
-            Tensor contig = self.is_contiguous() ? self : self.clone();
+            Tensor contig = self.is_contiguous() ? self : self.contiguous();
             size_t nbytes = contig.numel() * contig.itemsize();
             
             // Create bytes object from data
@@ -1782,6 +2788,17 @@ void init_tensor(py::module_& m) {
         // String repr
         .def("__repr__", &Tensor::toString)
         .def("__str__", &Tensor::toString)
+        // Truthiness: torch raises for empty/multi-element tensors instead of
+        // pybind's default always-true object truthiness (which made a 0-d
+        // Bool tensor bool(t) == True even when t.item() == False).
+        .def("__bool__", [](const Tensor& self) -> bool {
+            const int64_t n = self.numel();
+            if (n == 0)
+                TP_THROW(RuntimeError, "Boolean value of Tensor with no values is ambiguous");
+            if (n != 1)
+                TP_THROW(RuntimeError, "Boolean value of Tensor with more than one value is ambiguous");
+            return self.item().to<bool>();
+        })
         // Scalar/float conversion: Tensor::item() has the C++ side; without
         // this, float(t) on the raw extension type raises TypeError.
         .def("__float__", [](const Tensor& self) { return self.item().to<double>(); })

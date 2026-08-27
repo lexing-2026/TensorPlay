@@ -90,7 +90,7 @@ int64_t batch_count_of(const Tensor& t) {
 // torch::cloneBatchedColumnMajor — logical shape unchanged, Fortran-contiguous
 // memory so LAPACK can work in place with lda = size(-2).
 Tensor clone_batched_column_major(const Tensor& src) {
-    auto result = src.transpose(-2, -1).clone();
+    auto result = src.transpose(-2, -1).clone(static_cast<int64_t>(MemoryFormat::Contiguous));
     return result.transpose(-2, -1);
 }
 
@@ -451,8 +451,11 @@ Tensor linalg_solve_kernel(const Tensor& A, const Tensor& B, bool left) {
 // torch::linalg_inv_ex: solve A X = I in place (torch composes this through
 // linalg_solve_ex_out with result pre-filled with the identity).
 std::tuple<Tensor, Tensor> linalg_inv_ex_kernel(const Tensor& A, bool check_errors) {
-    const auto batch = batch_shape_of(A);
-    Tensor identity = Tensor::empty(batch_shape_of(A), A.dtype(), A.device());
+    // Identity RHS has the FULL shape of A (torch fills (..., n, n)); using
+    // batch_shape_of here collapsed 2-D inputs to a 0-D scalar and made
+    // linalg.inv reject its own RHS.
+    Tensor identity = Tensor::empty(static_cast<std::vector<int64_t>>(A.shape()),
+                                    A.dtype(), A.device());
     run_real(A.dtype(), [&](auto tag) {
         using T = std::remove_pointer_t<decltype(tag)>;
         auto* p = identity.data_ptr<T>();
@@ -494,6 +497,17 @@ void apply_cholesky(const Tensor& input, const Tensor& info, bool upper) {
             err = lapack_spotrf(uplo, n, a, lda);
         } else {
             err = lapack_dpotrf(uplo, n, a, lda);
+        }
+        // torch parity: the triangle opposite `uplo` is zeroed in the result
+        // (LAPACK leaves the input's untouched entries there).
+        if (err == 0) {
+            for (int64_t r = 0; r < n; ++r) {
+                for (int64_t c = 0; c < n; ++c) {
+                    const bool strictly_opposite =
+                        upper ? (r > c) : (r < c);
+                    if (strictly_opposite) a[c * n + r] = scalar_t(0);
+                }
+            }
         }
         info_data[i] = static_cast<int32_t>(err);
     }
@@ -803,7 +817,13 @@ std::tuple<Tensor, Tensor> eig_impl(const Tensor& A, bool compute_eigenvectors) 
     Tensor wi = Tensor::empty(repeat_batch(batch, n), A.dtype(), A.device());
     Tensor rvectors;
     if (compute_eigenvectors) {
-        rvectors = empty_column_major(batch_shape_of(A), A.dtype(), A.device());
+        // Logical shape (..., n, n): batch_shape_of collapses a 2-D input to
+        // an empty vector, and empty_column_major indexes shape[-2] — build
+        // the full shape explicitly.
+        std::vector<int64_t> vshape = batch;
+        vshape.push_back(n);
+        vshape.push_back(n);
+        rvectors = empty_column_major(vshape, A.dtype(), A.device());
     }
     Tensor info = empty_info_like(A, batch);
     run_real(A.dtype(), [&](auto tag) {
@@ -816,7 +836,10 @@ std::tuple<Tensor, Tensor> eig_impl(const Tensor& A, bool compute_eigenvectors) 
     Tensor values = Tensor::empty(repeat_batch(batch, n), cdtype, A.device());
     Tensor eigvecs;
     if (compute_eigenvectors) {
-        eigvecs = empty_column_major(batch_shape_of(A), cdtype, A.device());
+        std::vector<int64_t> cshape = batch;
+        cshape.push_back(n);
+        cshape.push_back(n);
+        eigvecs = empty_column_major(cshape, cdtype, A.device());
     }
     pack_complex_outputs(is_float_input, wr, wi, rvectors, values, eigvecs,
                          compute_eigenvectors);
@@ -1123,14 +1146,19 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> linalg_lstsq_kernel(
         constexpr bool is_float = std::is_same_v<T, float>;
 
         // Zero-fill the padded buffer, then copy B into its top m rows.
+        // b_rowmajor is a contiguous ROW-major (... m, nrhs) tensor: element
+        // (row, col) lives at row * nrhs + col (the old col * m stride read
+        // garbage for nrhs != 1).
         const Tensor b_rowmajor = expand_to_batch(B, batch).contiguous();
         const auto* bsrc = b_rowmajor.data_ptr<T>();
         const int64_t b_ms_src = matrix_stride_of(b_rowmajor);
+        const int64_t b_cols = B.size(-1);
         std::memset(b, 0, sizeof(T) * static_cast<size_t>(B_work.numel()));
         for (int64_t i = 0; i < bs; ++i)
-            for (int64_t col = 0; col < nrhs; ++col)
-                std::memcpy(b + (i * ldb * nrhs) + col * ldb,
-                            bsrc + (i * b_ms_src) + col * m, sizeof(T) * m);
+            for (int64_t row = 0; row < m; ++row)
+                for (int64_t col = 0; col < nrhs; ++col)
+                    b[i * ldb * nrhs + col * ldb + row] =
+                        bsrc[i * b_ms_src + row * b_cols + col];
 
         // Workspace query once, then one gels call per batch element.
         int64_t lwork = -1;

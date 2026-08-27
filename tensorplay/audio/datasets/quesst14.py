@@ -3,10 +3,10 @@ import re
 from pathlib import Path
 from typing import Optional, Tuple, Union
 
-import tensorplay as torch
-from torch.utils.data import Dataset
+import tensorplay as tensorplay
+from tensorplay.utils.data import Dataset
 from tensorplay.hub import download_url_to_file
-from torchaudio.datasets.utils import _extract_tar, _load_waveform
+from tensorplay.audio.datasets.utils import _extract_tar, _load_waveform
 
 
 URL = "https://speech.fit.vutbr.cz/files/quesst14Database.tgz"
@@ -92,7 +92,7 @@ class QUESST14(Dataset):
         relpath = os.path.relpath(audio_path, self._path)
         return relpath, SAMPLE_RATE, audio_path.with_suffix("").name
 
-    def __getitem__(self, n: int) -> Tuple[torch.Tensor, int, str]:
+    def __getitem__(self, n: int) -> Tuple[tensorplay.Tensor, int, str]:
         """Load the n-th sample from the dataset.
 
         Args:

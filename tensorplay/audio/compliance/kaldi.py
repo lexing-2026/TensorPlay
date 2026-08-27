@@ -1,8 +1,7 @@
 import math
 from typing import Tuple
 
-import tensorplay as torch
-import tensorplay.audio as torchaudio
+import tensorplay as tensorplay
 from tensorplay import Tensor
 
 __all__ = [
@@ -19,7 +18,7 @@ __all__ = [
 ]
 
 # numeric_limits<float>::epsilon() 1.1920928955078125e-07
-EPSILON = torch.tensor(torch.finfo(torch.float).eps)
+EPSILON = tensorplay.tensor(tensorplay.finfo(tensorplay.float).eps)
 # 1 milliseconds = 0.001 seconds
 MILLISECONDS_TO_SECONDS = 0.001
 
@@ -62,11 +61,11 @@ def _get_strided(waveform: Tensor, window_size: int, window_shift: int, snip_edg
 
     if snip_edges:
         if num_samples < window_size:
-            return torch.empty((0, 0), dtype=waveform.dtype, device=waveform.device)
+            return tensorplay.empty((0, 0), dtype=waveform.dtype, device=waveform.device)
         else:
             m = 1 + (num_samples - window_size) // window_shift
     else:
-        reversed_waveform = torch.flip(waveform, [0])
+        reversed_waveform = tensorplay.flip(waveform, [0])
         m = (num_samples + (window_shift // 2)) // window_shift
         pad = window_size // 2 - window_shift // 2
         pad_right = reversed_waveform
@@ -74,10 +73,10 @@ def _get_strided(waveform: Tensor, window_size: int, window_shift: int, snip_edg
             # torch.nn.functional.pad returns [2,1,0,1,2] for 'reflect'
             # but we want [2, 1, 0, 0, 1, 2]
             pad_left = reversed_waveform[-pad:]
-            waveform = torch.cat((pad_left, waveform, pad_right), dim=0)
+            waveform = tensorplay.cat((pad_left, waveform, pad_right), dim=0)
         else:
             # pad is negative so we want to trim the waveform at the front
-            waveform = torch.cat((waveform[-pad:], pad_right), dim=0)
+            waveform = tensorplay.cat((waveform[-pad:], pad_right), dim=0)
 
     sizes = (m, window_size)
     return waveform.as_strided(sizes, strides)
@@ -87,27 +86,27 @@ def _feature_window_function(
     window_type: str,
     window_size: int,
     blackman_coeff: float,
-    device: torch.device,
+    device: tensorplay.device,
     dtype: int,
 ) -> Tensor:
     r"""Returns a window function with the given type and size"""
     if window_type == HANNING:
-        return torch.hann_window(window_size, periodic=False, device=device, dtype=dtype)
+        return tensorplay.hann_window(window_size, periodic=False, device=device, dtype=dtype)
     elif window_type == HAMMING:
-        return torch.hamming_window(window_size, periodic=False, alpha=0.54, beta=0.46, device=device, dtype=dtype)
+        return tensorplay.hamming_window(window_size, periodic=False, alpha=0.54, beta=0.46, device=device, dtype=dtype)
     elif window_type == POVEY:
         # like hanning but goes to zero at edges
-        return torch.hann_window(window_size, periodic=False, device=device, dtype=dtype).pow(0.85)
+        return tensorplay.hann_window(window_size, periodic=False, device=device, dtype=dtype).pow(0.85)
     elif window_type == RECTANGULAR:
-        return torch.ones(window_size, device=device, dtype=dtype)
+        return tensorplay.ones(window_size, device=device, dtype=dtype)
     elif window_type == BLACKMAN:
         a = 2 * math.pi / (window_size - 1)
-        window_function = torch.arange(window_size, device=device, dtype=dtype)
+        window_function = tensorplay.arange(window_size, device=device, dtype=dtype)
         # can't use torch.blackman_window as they use different coefficients
         return (
             blackman_coeff
-            - 0.5 * torch.cos(a * window_function)
-            + (0.5 - blackman_coeff) * torch.cos(2 * a * window_function)
+            - 0.5 * tensorplay.cos(a * window_function)
+            + (0.5 - blackman_coeff) * tensorplay.cos(2 * a * window_function)
         ).to(device=device, dtype=dtype)
     else:
         raise Exception("Invalid window type " + window_type)
@@ -116,10 +115,10 @@ def _feature_window_function(
 def _get_log_energy(strided_input: Tensor, epsilon: Tensor, energy_floor: float) -> Tensor:
     r"""Returns the log energy of size (m) for a strided_input (m,*)"""
     device, dtype = strided_input.device, strided_input.dtype
-    log_energy = torch.max(strided_input.pow(2).sum(1), epsilon).log()  # size (m)
+    log_energy = tensorplay.max(strided_input.pow(2).sum(1), epsilon).log()  # size (m)
     if energy_floor == 0.0:
         return log_energy
-    return torch.max(log_energy, torch.tensor(math.log(energy_floor), device=device, dtype=dtype))
+    return tensorplay.max(log_energy, tensorplay.tensor(math.log(energy_floor), device=device, dtype=dtype))
 
 
 def _get_waveform_and_window_properties(
@@ -177,12 +176,12 @@ def _get_window(
     strided_input = _get_strided(waveform, window_size, window_shift, snip_edges)
 
     if dither != 0.0:
-        rand_gauss = torch.randn(strided_input.shape, device=device, dtype=dtype)
+        rand_gauss = tensorplay.randn(strided_input.shape, device=device, dtype=dtype)
         strided_input = strided_input + rand_gauss * dither
 
     if remove_dc_offset:
         # Subtract each row/frame by its mean
-        row_means = torch.mean(strided_input, dim=1).unsqueeze(1)  # size (m, 1)
+        row_means = tensorplay.mean(strided_input, dim=1).unsqueeze(1)  # size (m, 1)
         strided_input = strided_input - row_means
 
     if raw_energy:
@@ -192,7 +191,7 @@ def _get_window(
 
     if preemphasis_coefficient != 0.0:
         # strided_input[i,j] -= preemphasis_coefficient * strided_input[i, max(0, j-1)] for all i,j
-        offset_strided_input = torch.nn.functional.pad(strided_input.unsqueeze(0), (1, 0), mode="replicate").squeeze(
+        offset_strided_input = tensorplay.nn.functional.pad(strided_input.unsqueeze(0), (1, 0), mode="replicate").squeeze(
             0
         )  # size (m, window_size + 1)
         strided_input = strided_input - preemphasis_coefficient * offset_strided_input[:, :-1]
@@ -206,7 +205,7 @@ def _get_window(
     # Pad columns with zero until we reach size (m, padded_window_size)
     if padded_window_size != window_size:
         padding_right = padded_window_size - window_size
-        strided_input = torch.nn.functional.pad(
+        strided_input = tensorplay.nn.functional.pad(
             strided_input.unsqueeze(0), (0, padding_right), mode="constant", value=0
         ).squeeze(0)
 
@@ -221,7 +220,7 @@ def _subtract_column_mean(tensor: Tensor, subtract_mean: bool) -> Tensor:
     # subtracts the column mean of the tensor size (m, n) if subtract_mean=True
     # it returns size (m, n)
     if subtract_mean:
-        col_means = torch.mean(tensor, dim=0).unsqueeze(0)
+        col_means = tensorplay.mean(tensor, dim=0).unsqueeze(0)
         tensor = tensor - col_means
     return tensor
 
@@ -287,7 +286,7 @@ def spectrogram(
 
     if len(waveform) < min_duration * sample_frequency:
         # signal is too short
-        return torch.empty(0)
+        return tensorplay.empty(0)
 
     strided_input, signal_log_energy = _get_window(
         waveform,
@@ -305,10 +304,10 @@ def spectrogram(
     )
 
     # size (m, padded_window_size // 2 + 1, 2)
-    fft = torch.fft.rfft(strided_input)
+    fft = tensorplay.fft.rfft(strided_input)
 
     # Convert the FFT into a power spectrum
-    power_spectrum = torch.max(fft.abs().pow(2.0), epsilon).log()  # size (m, padded_window_size // 2 + 1)
+    power_spectrum = tensorplay.max(fft.abs().pow(2.0), epsilon).log()  # size (m, padded_window_size // 2 + 1)
     power_spectrum[:, 0] = signal_log_energy
 
     power_spectrum = _subtract_column_mean(power_spectrum, subtract_mean)
@@ -390,12 +389,12 @@ def vtln_warp_freq(
     # slope of right part of the 3-piece linear function
     scale_right = (high_freq - Fh) / (high_freq - h)
 
-    res = torch.empty_like(freq)
+    res = tensorplay.empty_like(freq)
 
-    outside_low_high_freq = torch.lt(freq, low_freq) | torch.gt(freq, high_freq)  # freq < low_freq || freq > high_freq
-    before_l = torch.lt(freq, l)  # freq < l
-    before_h = torch.lt(freq, h)  # freq < h
-    after_h = torch.ge(freq, h)  # freq >= h
+    outside_low_high_freq = tensorplay.lt(freq, low_freq) | tensorplay.gt(freq, high_freq)  # freq < low_freq || freq > high_freq
+    before_l = tensorplay.lt(freq, l)  # freq < l
+    before_h = tensorplay.lt(freq, h)  # freq < h
+    after_h = tensorplay.ge(freq, h)  # freq >= h
 
     # order of operations matter here (since there is overlapping frequency regions)
     res[after_h] = high_freq + scale_right * (freq[after_h] - high_freq)
@@ -479,7 +478,7 @@ def get_mel_banks(
         vtln_low, vtln_high, low_freq, high_freq
     )
 
-    bin = torch.arange(num_bins).unsqueeze(1)
+    bin = tensorplay.arange(num_bins).unsqueeze(1)
     left_mel = mel_low_freq + bin * mel_freq_delta  # size(num_bins, 1)
     center_mel = mel_low_freq + (bin + 1.0) * mel_freq_delta  # size(num_bins, 1)
     right_mel = mel_low_freq + (bin + 2.0) * mel_freq_delta  # size(num_bins, 1)
@@ -491,7 +490,7 @@ def get_mel_banks(
 
     center_freqs = inverse_mel_scale(center_mel)  # size (num_bins)
     # size(1, num_fft_bins)
-    mel = mel_scale(fft_bin_width * torch.arange(num_fft_bins)).unsqueeze(0)
+    mel = mel_scale(fft_bin_width * tensorplay.arange(num_fft_bins)).unsqueeze(0)
 
     # size (num_bins, num_fft_bins)
     up_slope = (mel - left_mel) / (center_mel - left_mel)
@@ -499,12 +498,12 @@ def get_mel_banks(
 
     if vtln_warp_factor == 1.0:
         # left_mel < center_mel < right_mel so we can min the two slopes and clamp negative values
-        bins = torch.max(torch.zeros(1), torch.min(up_slope, down_slope))
+        bins = tensorplay.max(tensorplay.zeros(1), tensorplay.min(up_slope, down_slope))
     else:
         # warping can move the order of left_mel, center_mel, right_mel anywhere
-        bins = torch.zeros_like(up_slope)
-        up_idx = torch.gt(mel, left_mel) & torch.le(mel, center_mel)  # left_mel < mel <= center_mel
-        down_idx = torch.gt(mel, center_mel) & torch.lt(mel, right_mel)  # center_mel < mel < right_mel
+        bins = tensorplay.zeros_like(up_slope)
+        up_idx = tensorplay.gt(mel, left_mel) & tensorplay.le(mel, center_mel)  # left_mel < mel <= center_mel
+        down_idx = tensorplay.gt(mel, center_mel) & tensorplay.lt(mel, right_mel)  # center_mel < mel < right_mel
         bins[up_idx] = up_slope[up_idx]
         bins[down_idx] = down_slope[down_idx]
 
@@ -594,7 +593,7 @@ def fbank(
 
     if len(waveform) < min_duration * sample_frequency:
         # signal is too short
-        return torch.empty(0, device=device, dtype=dtype)
+        return tensorplay.empty(0, device=device, dtype=dtype)
 
     # strided_input, size (m, padded_window_size) and signal_log_energy, size (m)
     strided_input, signal_log_energy = _get_window(
@@ -613,7 +612,7 @@ def fbank(
     )
 
     # size (m, padded_window_size // 2 + 1)
-    spectrum = torch.fft.rfft(strided_input).abs()
+    spectrum = tensorplay.fft.rfft(strided_input).abs()
     if use_power:
         spectrum = spectrum.pow(2.0)
 
@@ -624,22 +623,22 @@ def fbank(
     mel_energies = mel_energies.to(device=device, dtype=dtype)
 
     # pad right column with zeros and add dimension, size (num_mel_bins, padded_window_size // 2 + 1)
-    mel_energies = torch.nn.functional.pad(mel_energies, (0, 1), mode="constant", value=0)
+    mel_energies = tensorplay.nn.functional.pad(mel_energies, (0, 1), mode="constant", value=0)
 
     # sum with mel fiterbanks over the power spectrum, size (m, num_mel_bins)
-    mel_energies = torch.mm(spectrum, mel_energies.T)
+    mel_energies = tensorplay.mm(spectrum, mel_energies.T)
     if use_log_fbank:
         # avoid log of zero (which should be prevented anyway by dithering)
-        mel_energies = torch.max(mel_energies, _get_epsilon(device, dtype)).log()
+        mel_energies = tensorplay.max(mel_energies, _get_epsilon(device, dtype)).log()
 
     # if use_energy then add it as the last column for htk_compat == true else first column
     if use_energy:
         signal_log_energy = signal_log_energy.unsqueeze(1)  # size (m, 1)
         # returns size (m, num_mel_bins + 1)
         if htk_compat:
-            mel_energies = torch.cat((mel_energies, signal_log_energy), dim=1)
+            mel_energies = tensorplay.cat((mel_energies, signal_log_energy), dim=1)
         else:
-            mel_energies = torch.cat((signal_log_energy, mel_energies), dim=1)
+            mel_energies = tensorplay.cat((signal_log_energy, mel_energies), dim=1)
 
     mel_energies = _subtract_column_mean(mel_energies, subtract_mean)
     return mel_energies
@@ -648,9 +647,9 @@ def fbank(
 def _get_dct_matrix(num_ceps: int, num_mel_bins: int) -> Tensor:
     # returns a dct matrix of size (num_mel_bins, num_ceps)
     # size (num_mel_bins, num_mel_bins)
-    dct_matrix = torchaudio.functional.create_dct(num_mel_bins, num_mel_bins, "ortho")
+    dct_matrix = tensorplay.audio.functional.create_dct(num_mel_bins, num_mel_bins, "ortho")
     # kaldi expects the first cepstral to be weighted sum of factor sqrt(1/num_mel_bins)
-    # this would be the first column in the dct_matrix for torchaudio as it expects a
+    # this would be the first column in the dct_matrix for tensorplay.audio as it expects a
     # right multiply (which would be the first column of the kaldi's dct_matrix as kaldi
     # expects a left multiply e.g. dct_matrix * vector).
     dct_matrix[:, 0] = math.sqrt(1 / float(num_mel_bins))
@@ -662,8 +661,8 @@ def _get_lifter_coeffs(num_ceps: int, cepstral_lifter: float) -> Tensor:
     # returns size (num_ceps)
     # Compute liftering coefficients (scaling on cepstral coeffs)
     # coeffs are numbered slightly differently from HTK: the zeroth index is C0, which is not affected.
-    i = torch.arange(num_ceps)
-    return 1.0 + 0.5 * cepstral_lifter * torch.sin(math.pi * i / cepstral_lifter)
+    i = tensorplay.arange(num_ceps)
+    return 1.0 + 0.5 * cepstral_lifter * tensorplay.sin(math.pi * i / cepstral_lifter)
 
 
 def mfcc(
@@ -807,7 +806,7 @@ def mfcc(
             # part of one common definition of the cosine transform.)
             energy *= math.sqrt(2)
 
-        feature = torch.cat((feature, energy), dim=1)
+        feature = tensorplay.cat((feature, energy), dim=1)
 
     feature = _subtract_column_mean(feature, subtract_mean)
     return feature

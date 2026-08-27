@@ -100,7 +100,10 @@ int64_t batch_count_of(const Tensor& t) {
 }
 
 Tensor clone_batched_column_major(const Tensor& src) {
-    auto result = src.transpose(-2, -1).clone();
+    // The clone must physically transpose into a contiguous buffer of the
+    // transposed shape: clone() with Preserve would keep the transposed view's
+    // strides (non-overlapping-and-dense), leaving the data row-major.
+    auto result = src.transpose(-2, -1).clone(static_cast<int64_t>(MemoryFormat::Contiguous));
     return result.transpose(-2, -1);
 }
 

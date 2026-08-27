@@ -173,7 +173,11 @@ def _single_tensor_adamax(
             grad = tp.view_as_real(grad)
             exp_avg = tp.view_as_real(exp_avg)
             exp_inf = tp.view_as_real(exp_inf)
-        exp_avg.lerp_(grad, 1 - beta1)
+        if differentiable:
+            # Keep the source edge for higher-order gradients.
+            exp_avg.mul_(beta1).add_(grad * (1 - beta1))
+        else:
+            exp_avg.lerp_(grad, 1 - beta1)
         if differentiable:
             candidate = tp.maximum(exp_inf * beta2, grad.abs() + eps)
             exp_inf.copy_(candidate)
@@ -259,9 +263,14 @@ def _multi_tensor_adamax(
             denom = tp._foreach_mul(grouped_exp_infs, bias_corrections)
             tp._foreach_addcdiv_(grouped_params, grouped_exp_avgs, denom)
         else:
+            # One host transfer for all step counters (CUDA sync otherwise).
+            if grouped_state_steps and grouped_state_steps[0].is_cuda:
+                steps_host = tp.stack(grouped_state_steps).tolist()
+            else:
+                steps_host = [_get_value(step) for step in grouped_state_steps]
             bias_corrections = [
-                1 - beta1 ** _get_value(step)
-                for step in grouped_state_steps
+                1 - beta1 ** float(step)
+                for step in steps_host
             ]
             step_size = [
                 -_get_value(lr) / correction
@@ -285,6 +294,37 @@ def adamax(
             "API has changed, `state_steps` argument must contain a list of "
             "singleton tensors"
         )
+
+    # Fused CPU/CUDA Adamax validates all pairs and states in the native
+    # dispatcher.  Avoid repeating the full layout scan in Python for the
+    # steady-state optimizer loop; invalid layouts take the cold fallback.
+    native_candidate = (
+        not differentiable
+        and not capturable
+        and not has_complex
+        and bool(params)
+        and params[0].device.type in ("cpu", "cuda")
+        and params[0].is_floating_point()
+    )
+    if native_candidate:
+        try:
+            tp._fused_adamax_(
+                params,
+                grads,
+                exp_avgs,
+                exp_infs,
+                state_steps,
+                lr=scalar_value(lr, "lr"),
+                beta1=beta1,
+                beta2=beta2,
+                eps=eps,
+                weight_decay=weight_decay,
+                maximize=maximize,
+            )
+            return
+        except NotImplementedError:
+            pass
+
     if foreach is None:
         _, foreach = _default_to_fused_or_foreach(
             params, differentiable, use_fused=False

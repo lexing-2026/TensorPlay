@@ -143,14 +143,74 @@ def test_mode_and_options_are_mutually_exclusive():
         tp.compile(lambda x: x + 1, mode="default", options={})
 
 
-def test_fullgraph_rejects_python_data_dependent_control_flow():
+def test_fullgraph_specializes_data_dependent_control_flow():
+    """D1: execute-mode capture specializes tensor-data branches."""
+
+    def fn(x):
+        if bool((x > 0).all()):
+            return x + 1
+        return x - 1
+
+    compiled = tp.compile(fn, fullgraph=True)
+    assert compiled(tp.tensor([1.0, 2.0])).tolist() == [2.0, 3.0]
+    # Branch flip: gate guards force a fresh specialization instead of
+    # silently reusing the wrong side.  Keys hold gate OUTCOMES (not input
+    # bytes), so different data taking the same branch shares one entry.
+    assert compiled(tp.tensor([-3.0])).tolist() == [-4.0]
+    assert compiled(tp.tensor([7.0, 8.0])).tolist() == [8.0, 9.0]
+    assert len(compiled._tensorplay_cache) == 2
+    chains = compiled._tensorplay_guard_chains
+    assert any(chain._data_component for chain in chains.values())
+    assert any(
+        chain._data_component[0] == "gates" for chain in chains.values()
+    )
+    chains = compiled._tensorplay_guard_chains
+    assert any(chain._data_component for chain in chains.values())
+
+
+def test_data_guards_survive_in_place_mutation():
+    """Identity reuse is unsound once a data-guarded input mutates."""
+
+    def fn(x):
+        if x.sum().item() > 0:
+            return x * 10
+        return x * -1
+
+    compiled = tp.compile(fn, fullgraph=True)
+    x = tp.tensor([1.0, 2.0])
+    assert compiled(x).tolist() == [10.0, 20.0]
+    x.sub_(10)  # [-9.0, -8.0]: identity unchanged, branch-deciding bytes flipped
+    assert compiled(x).tolist() == [9.0, 8.0]
+
+
+def test_scalar_and_numeric_gates_specialize_from_samples():
+    def scalar_fn(x):
+        if x.sum().item() > 2:
+            return x * 100
+        return x
+
+    compiled = tp.compile(scalar_fn, fullgraph=True)
+    assert compiled(tp.tensor([4.0, 5.0])).tolist() == [400.0, 500.0]
+    assert compiled(tp.tensor([1.0, 1.0])).tolist() == [1.0, 1.0]
+
+    def int_fn(x):
+        return x + int(x.sum().item())
+
+    int_compiled = tp.compile(int_fn, fullgraph=True)
+    assert int_compiled(tp.tensor([1.0, 2.0])).tolist() == [4.0, 5.0]
+
+
+def test_symbolic_tracer_still_rejects_data_dependent_control_flow():
+    from tensorplay.compiler.graph import GraphCaptureError, Tracer
+
     def fn(x):
         if bool((x > 0).all()):
             return x + 1
         return x
 
-    with pytest.raises(tp.compiler.GraphCaptureError):
-        tp.compile(fn, backend="stax", fullgraph=True)(tp.tensor([1.0]))
+    tracer = Tracer()
+    with pytest.raises(GraphCaptureError):
+        tracer.trace(fn, sample_inputs={"x": tp.tensor([1.0])})
 
 
 def test_fullgraph_specializes_metadata_control_flow():

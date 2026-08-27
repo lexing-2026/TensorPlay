@@ -57,6 +57,13 @@ public:
     // before capture begins; not a usable launch stream.
     static CUDAStream undefined() noexcept { return CUDAStream(-1, nullptr); }
 
+    // Adopts a raw driver stream (e.g. a conditional-node child stream) as a
+    // value object without taking ownership of its lifetime.
+    static CUDAStream fromExternal(cudaStream_t stream,
+                                   int device_index) noexcept {
+        return CUDAStream(device_index, stream);
+    }
+
 private:
     CUDAStream(int device_index, cudaStream_t stream) noexcept
         : device_index_(device_index), stream_(stream) {}

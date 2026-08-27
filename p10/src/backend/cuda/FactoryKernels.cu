@@ -149,8 +149,14 @@ Tensor eye_kernel(int64_t n, int64_t m, DType dtype, Device device, bool require
     
     if (dtype == DType::Float32) {
         eye_kernel_cuda_impl<float><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(n, m, t.data_ptr<float>());
+    } else if (dtype == DType::Float64) {
+        eye_kernel_cuda_impl<double><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(n, m, t.data_ptr<double>());
+    } else if (dtype == DType::Int64) {
+        eye_kernel_cuda_impl<int64_t><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(n, m, t.data_ptr<int64_t>());
+    } else if (dtype == DType::Int32) {
+        eye_kernel_cuda_impl<int32_t><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(n, m, t.data_ptr<int32_t>());
     } else {
-        TP_THROW(NotImplementedError, "CUDA eye: only float32 supported");
+        TP_THROW(NotImplementedError, "CUDA eye: only float32/float64/int64/int32 supported");
     }
     
     return t;
@@ -230,6 +236,18 @@ Tensor arange_start_step_cuda(Scalar start, Scalar end, Scalar step,
         }
     }
 
+    // Torch parity: reject unsupported dtypes even for empty results
+    // (upstream dispatches over AT_DISPATCH_ALL_TYPES_AND2(Half, BFloat16)).
+    const bool arange_dtype_supported =
+        dtype == DType::Float32 || dtype == DType::Float64 ||
+        dtype == DType::Int64 || dtype == DType::Int32 || dtype == DType::Int16 ||
+        dtype == DType::Int8 || dtype == DType::UInt8 ||
+        dtype == DType::Float16 || dtype == DType::BFloat16;
+    if (!arange_dtype_supported) {
+        TP_THROW(NotImplementedError,
+                 "\"arange\" not implemented for '" + std::string(toString(dtype)) + "'");
+    }
+
     Tensor t({len}, dtype, dev);
     if (len == 0) return t;
 
@@ -251,8 +269,11 @@ Tensor arange_start_step_cuda(Scalar start, Scalar end, Scalar step,
         ARANGE_CASE(int16_t, Int16)
         ARANGE_CASE(int8_t, Int8)
         ARANGE_CASE(uint8_t, UInt8)
+        ARANGE_CASE(tensorplay::Half, Float16)
+        ARANGE_CASE(tensorplay::BFloat16, BFloat16)
         default:
-            TP_THROW(NotImplementedError, "arange: unsupported dtype on CUDA");
+            TP_THROW(NotImplementedError,
+                     "\"arange\" not implemented for '" + std::string(toString(dtype)) + "'");
     }
     #undef ARANGE_CASE
 

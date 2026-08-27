@@ -1,87 +1,96 @@
-import unittest
+"""Tests for tensorplay.autograd.forward_ad (native seed-op core).
+
+JVPs are validated against reverse-mode autograd and central finite
+differences, including nested dual levels.
+"""
+
+import math
+
+import pytest
 
 import tensorplay as tp
-from tensorplay.autograd.functional import jacfwd, jvp
+from tensorplay.autograd import forward_ad as fw
 
 
-class TestJvpForward(unittest.TestCase):
-    def test_matches_analytic(self):
-        tp.manual_seed(0)
-        x = tp.randn(4, 4)
-        v = tp.ones_like(x)
-
-        def f(x):
-            return (x.tanh() * 2.0 + 1.0).sum(dim=1)
-
-        out_f, jvp_f = jvp(f, (x,), (v,), mode="forward")
-        self.assertTrue(tp.allclose(out_f, f(x)))
-        # d/dx [2*tanh(x)+1] row-summed with seed 1 == 2*sech^2(x) row-sum.
-        expect = (2.0 * (1.0 - x.tanh().pow(2))).sum(dim=1)
-        self.assertTrue(tp.allclose(jvp_f, expect))
-
-    def test_elementwise_matches_reversed_mode(self):
-        # The double-backward trick agrees with native forward AD for
-        # pointwise chains (reductions under create_graph are a known engine
-        # gap tracked separately).
-        x = tp.tensor([0.4, -1.2, 2.2])
-        v = tp.ones_like(x)
-
-        def f(x):
-            return x.sigmoid() * x
-
-        _, jvp_r = jvp(f, (x,), (v,), mode="reversed")
-        _, jvp_f = jvp(f, (x,), (v,), mode="forward")
-        self.assertTrue(tp.allclose(jvp_r, jvp_f))
-
-    def test_multi_input(self):
-        x = tp.tensor([1.0, 2.0])
-        y = tp.tensor([3.0, 4.0])
-        out, d = jvp(lambda a, b: a * b + b.exp(), (x, y),
-                     (tp.ones_like(x), tp.zeros_like(y)), mode="forward")
-        # Only x perturbed: tangent of x*y is y.
-        self.assertTrue(tp.allclose(d, y))
+def f_main(v):
+    return v**3 * v.sin() + v.exp() / v
 
 
-class TestJacfwd(unittest.TestCase):
-    def test_scalar_output_jacobian(self):
-        x = tp.tensor([0.5, -0.25, 2.0])
+class TestLevels:
+    def test_first_level_is_zero(self):
+        assert fw.current_dual_level() == -1
+        lvl = fw.enter_dual_level()
+        assert lvl == 0 and fw.current_dual_level() == 0
+        fw.exit_dual_level(lvl)
+        assert fw.current_dual_level() == -1
 
-        def f(x):
-            return x.sin().sum()
+    def test_nested_exit_pops_inner_levels(self):
+        a = fw.enter_dual_level()
+        b = fw.enter_dual_level()
+        fw.exit_dual_level(a)
+        assert fw.current_dual_level() == -1
 
-        j = jacfwd(f, x)
-        expect = tp.cos(x)
-        # torch.func.jacfwd convention: scalar output -> shape (in,).
-        self.assertEqual(tuple(j.shape), (3,))
-        self.assertTrue(tp.allclose(j.reshape(expect.shape), expect))
+    def test_exit_without_enter_raises(self):
+        with pytest.raises(RuntimeError):
+            fw.exit_dual_level()
 
-    def test_vector_output_full_jacobian(self):
-        x = tp.tensor([0.3, 1.7])
-
-        def f(x):
-            # Tuple output (free functions do not intercept DualTensor).
-            return (x[0] * x[1], x[0].exp())
-
-        j = jacfwd(f, x)
-        # j[0] = d(out0)/dx = [x1, x0]; j[1] = d(out1)/dx = [exp(x0), 0]
-        e0 = float(x[1])
-        e1 = float(x[0])
-        g0 = float(tp.exp(x[0]))
-        self.assertAlmostEqual(float(j[0][0]), e0, places=5)
-        self.assertAlmostEqual(float(j[0][1]), e1, places=5)
-        self.assertAlmostEqual(float(j[1][0]), g0, places=5)
-        self.assertAlmostEqual(float(j[1][1]), 0.0, places=5)
-
-    def test_matrix_input_shape(self):
-        x = tp.randn(2, 3)
-
-        def f(x):
-            return (x * x).sum()
-
-        j = jacfwd(f, x)
-        self.assertEqual(tuple(j.shape), (2, 3))
-        self.assertTrue(tp.allclose(j, 2.0 * x))
+    def test_make_dual_requires_active_level(self):
+        with pytest.raises(RuntimeError, match="active forward AD level"):
+            fw.make_dual(tp.tensor([1.0]), tp.tensor([1.0]))
 
 
-if __name__ == "__main__":
-    unittest.main()
+class TestSeedOps:
+    @pytest.mark.parametrize(
+        "fn",
+        [
+            lambda v: v**3 * v.sin() + v.exp() / v,
+            lambda v: (v / 2.0 - 3.0 * v) .cos(),
+            lambda v: ((v * 2.0).log()),
+        ],
+        ids=["poly-sin-exp-div", "sub-cos", "mul-log"],
+    )
+    def test_jvp_matches_reverse_mode(self, fn):
+        x = tp.tensor([2.0])
+        x.requires_grad_(True)
+
+        lvl = fw.enter_dual_level()
+        xd = fw.make_dual(x, tp.tensor([1.0]))
+        tangent, _ = fw.unpack_dual(fn(xd))
+        fw.exit_dual_level(lvl)
+
+        fn(x).sum().backward()
+        assert abs(float(tangent.sum()) - float(x.grad)) < 1e-5
+
+    def test_two_argument_chain_rule(self):
+        l0 = fw.enter_dual_level()
+        a = fw.make_dual(tp.tensor([3.0]), tp.tensor([1.0]))
+        b = fw.make_dual(tp.tensor([0.5]), tp.tensor([2.0]))
+        r = (a / b + a * b).exp().log()
+        t, _ = fw.unpack_dual(r)
+        fw.exit_dual_level(l0)
+
+        g = lambda u, v: math.log(math.exp(u / v + u * v))
+        h = 1e-6
+        ref = (g(3+h, .5) - g(3-h, .5)) / (2*h) \
+            + 2 * (g(3, .5+h) - g(3, .5-h)) / (2*h)
+        assert abs(float(t.sum()) - ref) < 1e-4
+
+    def test_unsupported_op_raises_not_silently_drops(self):
+        lvl = fw.enter_dual_level()
+        d = fw.make_dual(tp.tensor([[1.0, 2.0]]), tp.tensor([[1.0, 1.0]]))
+        with pytest.raises((TypeError, RuntimeError)):
+            d.matmul(d.t())  # not in the native seed set
+        fw.exit_dual_level(lvl)
+
+
+class TestUnpack:
+    def test_plain_tensor_returns_none_tangent(self):
+        tan, primal = fw.unpack_dual(tp.ones(2))
+        assert tan is None and primal.shape == (2,)
+
+    def test_item_guarded(self):
+        lvl = fw.enter_dual_level()
+        d = fw.make_dual(tp.tensor([1.0]), tp.tensor([1.0]))
+        with pytest.raises(TypeError, match="unpack_dual"):
+            d.item()
+        fw.exit_dual_level(lvl)

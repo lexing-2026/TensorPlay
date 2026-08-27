@@ -1,6 +1,6 @@
-"""Audio I/O — torch-compatible load / save / info.
+"""Audio I/O — tensorplay-compatible load / save / info.
 
-Signatures follow torchaudio 2.x: ``load`` supports partial reads via
+Signatures follow tensorplay.audio 2.x: ``load`` supports partial reads via
 frame_offset/num_frames, ``save`` takes an explicit channels_first flag
 instead of guessing, and ``info`` returns an ``AudioMetaData`` namedtuple.
 Backends are soundfile (preferred) and scipy.
@@ -26,7 +26,7 @@ def _sf_dtype(normalize, bits_per_sample):
 
 def load(filepath, frame_offset=0, num_frames=-1, normalize=True,
          channels_first=True, format=None):
-    """Loads an audio file into a Tensor (torchaudio.load semantics).
+    """Loads an audio file into a Tensor (tensorplay.audio.load semantics).
 
     Args:
         filepath: Path to the audio file.
@@ -105,7 +105,7 @@ def load(filepath, frame_offset=0, num_frames=-1, normalize=True,
 
 
 def save(filepath, src, sample_rate, channels_first=True, format=None):
-    """Saves a Tensor to an audio file (torchaudio.save semantics).
+    """Saves a Tensor to an audio file (tensorplay.audio.save semantics).
 
     Args:
         filepath: Destination path (.wav etc. per backend support).
@@ -146,7 +146,7 @@ def save(filepath, src, sample_rate, channels_first=True, format=None):
 
 
 def info(filepath, format=None, buffer_size=4096):
-    """Returns signal information of an audio file (torchaudio.info).
+    """Returns signal information of an audio file (tensorplay.audio.info).
 
     Returns:
         AudioMetaData with fields

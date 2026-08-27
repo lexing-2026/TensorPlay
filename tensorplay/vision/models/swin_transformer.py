@@ -5,9 +5,9 @@ import math
 from functools import partial
 from typing import Any, Callable, Optional
 
-import tensorplay as torch
+import tensorplay as tensorplay
 import tensorplay.nn.functional as F
-from torch import nn, Tensor
+from tensorplay import nn, Tensor
 
 from ..ops.misc import MLP, Permute
 from ..ops.stochastic_depth import StochasticDepth
@@ -35,23 +35,23 @@ __all__ = [
 ]
 
 
-def _patch_merging_pad(x: torch.Tensor) -> torch.Tensor:
+def _patch_merging_pad(x: tensorplay.Tensor) -> tensorplay.Tensor:
     H, W, _ = x.shape[-3:]
     x = F.pad(x, (0, 0, 0, W % 2, 0, H % 2))
     x0 = x[..., 0::2, 0::2, :]  # ... H/2 W/2 C
     x1 = x[..., 1::2, 0::2, :]  # ... H/2 W/2 C
     x2 = x[..., 0::2, 1::2, :]  # ... H/2 W/2 C
     x3 = x[..., 1::2, 1::2, :]  # ... H/2 W/2 C
-    x = torch.cat([x0, x1, x2, x3], -1)  # ... H/2 W/2 4*C
+    x = tensorplay.cat([x0, x1, x2, x3], -1)  # ... H/2 W/2 4*C
     return x
 
 
-torch.fx.wrap("_patch_merging_pad")
+tensorplay.graph.wrap("_patch_merging_pad")
 
 
 def _get_relative_position_bias(
-    relative_position_bias_table: torch.Tensor, relative_position_index: torch.Tensor, window_size: list[int]
-) -> torch.Tensor:
+    relative_position_bias_table: tensorplay.Tensor, relative_position_index: tensorplay.Tensor, window_size: list[int]
+) -> tensorplay.Tensor:
     N = window_size[0] * window_size[1]
     relative_position_bias = relative_position_bias_table[relative_position_index]  # type: ignore[index]
     relative_position_bias = relative_position_bias.view(N, N, -1)
@@ -59,7 +59,7 @@ def _get_relative_position_bias(
     return relative_position_bias
 
 
-torch.fx.wrap("_get_relative_position_bias")
+tensorplay.graph.wrap("_get_relative_position_bias")
 
 
 class PatchMerging(nn.Module):
@@ -128,7 +128,7 @@ def shifted_window_attention(
     dropout: float = 0.0,
     qkv_bias: Optional[Tensor] = None,
     proj_bias: Optional[Tensor] = None,
-    logit_scale: Optional[torch.Tensor] = None,
+    logit_scale: Optional[tensorplay.Tensor] = None,
     training: bool = True,
 ) -> Tensor:
     """
@@ -167,7 +167,7 @@ def shifted_window_attention(
 
     # cyclic shift
     if sum(shift_size) > 0:
-        x = torch.roll(x, shifts=(-shift_size[0], -shift_size[1]), dims=(1, 2))
+        x = tensorplay.roll(x, shifts=(-shift_size[0], -shift_size[1]), dims=(1, 2))
 
     # partition windows
     num_windows = (pad_H // window_size[0]) * (pad_W // window_size[1])
@@ -185,7 +185,7 @@ def shifted_window_attention(
     if logit_scale is not None:
         # cosine attention
         attn = F.normalize(q, dim=-1) @ F.normalize(k, dim=-1).transpose(-2, -1)
-        logit_scale = torch.clamp(logit_scale, max=math.log(100.0)).exp()
+        logit_scale = tensorplay.clamp(logit_scale, max=math.log(100.0)).exp()
         attn = attn * logit_scale
     else:
         q = q * (C // num_heads) ** -0.5
@@ -224,14 +224,14 @@ def shifted_window_attention(
 
     # reverse cyclic shift
     if sum(shift_size) > 0:
-        x = torch.roll(x, shifts=(shift_size[0], shift_size[1]), dims=(1, 2))
+        x = tensorplay.roll(x, shifts=(shift_size[0], shift_size[1]), dims=(1, 2))
 
     # unpad features
     x = x[:, :H, :W, :].contiguous()
     return x
 
 
-torch.fx.wrap("shifted_window_attention")
+tensorplay.graph.wrap("shifted_window_attention")
 
 
 class ShiftedWindowAttention(nn.Module):
@@ -268,16 +268,16 @@ class ShiftedWindowAttention(nn.Module):
     def define_relative_position_bias_table(self):
         # define a parameter table of relative position bias
         self.relative_position_bias_table = nn.Parameter(
-            torch.zeros((2 * self.window_size[0] - 1) * (2 * self.window_size[1] - 1), self.num_heads)
+            tensorplay.zeros((2 * self.window_size[0] - 1) * (2 * self.window_size[1] - 1), self.num_heads)
         )  # 2*Wh-1 * 2*Ww-1, nH
         nn.init.trunc_normal_(self.relative_position_bias_table, std=0.02)
 
     def define_relative_position_index(self):
         # get pair-wise relative position index for each token inside the window
-        coords_h = torch.arange(self.window_size[0])
-        coords_w = torch.arange(self.window_size[1])
-        coords = torch.stack(torch.meshgrid(coords_h, coords_w, indexing="ij"))  # 2, Wh, Ww
-        coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
+        coords_h = tensorplay.arange(self.window_size[0])
+        coords_w = tensorplay.arange(self.window_size[1])
+        coords = tensorplay.stack(tensorplay.meshgrid(coords_h, coords_w, indexing="ij"))  # 2, Wh, Ww
+        coords_flatten = tensorplay.flatten(coords, 1)  # 2, Wh*Ww
         relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww
         relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2
         relative_coords[:, :, 0] += self.window_size[0] - 1  # shift to start from 0
@@ -286,7 +286,7 @@ class ShiftedWindowAttention(nn.Module):
         relative_position_index = relative_coords.sum(-1).flatten()  # Wh*Ww*Wh*Ww
         self.register_buffer("relative_position_index", relative_position_index)
 
-    def get_relative_position_bias(self) -> torch.Tensor:
+    def get_relative_position_bias(self) -> tensorplay.Tensor:
         return _get_relative_position_bias(
             self.relative_position_bias_table, self.relative_position_index, self.window_size  # type: ignore[arg-type]
         )
@@ -342,7 +342,7 @@ class ShiftedWindowAttentionV2(ShiftedWindowAttention):
             dropout=dropout,
         )
 
-        self.logit_scale = nn.Parameter(torch.log(10 * torch.ones((num_heads, 1, 1))))
+        self.logit_scale = nn.Parameter(tensorplay.log(10 * tensorplay.ones((num_heads, 1, 1))))
         # mlp to generate continuous relative position bias
         self.cpb_mlp = nn.Sequential(
             nn.Linear(2, 512, bias=True), nn.ReLU(inplace=True), nn.Linear(512, num_heads, bias=False)
@@ -353,9 +353,9 @@ class ShiftedWindowAttentionV2(ShiftedWindowAttention):
 
     def define_relative_position_bias_table(self):
         # get relative_coords_table
-        relative_coords_h = torch.arange(-(self.window_size[0] - 1), self.window_size[0], dtype=torch.float32)
-        relative_coords_w = torch.arange(-(self.window_size[1] - 1), self.window_size[1], dtype=torch.float32)
-        relative_coords_table = torch.stack(torch.meshgrid([relative_coords_h, relative_coords_w], indexing="ij"))
+        relative_coords_h = tensorplay.arange(-(self.window_size[0] - 1), self.window_size[0], dtype=tensorplay.float32)
+        relative_coords_w = tensorplay.arange(-(self.window_size[1] - 1), self.window_size[1], dtype=tensorplay.float32)
+        relative_coords_table = tensorplay.stack(tensorplay.meshgrid([relative_coords_h, relative_coords_w], indexing="ij"))
         relative_coords_table = relative_coords_table.permute(1, 2, 0).contiguous().unsqueeze(0)  # 1, 2*Wh-1, 2*Ww-1, 2
 
         relative_coords_table[:, :, :, 0] /= self.window_size[0] - 1
@@ -363,17 +363,17 @@ class ShiftedWindowAttentionV2(ShiftedWindowAttention):
 
         relative_coords_table *= 8  # normalize to -8, 8
         relative_coords_table = (
-            torch.sign(relative_coords_table) * torch.log2(torch.abs(relative_coords_table) + 1.0) / 3.0
+            tensorplay.sign(relative_coords_table) * tensorplay.log2(tensorplay.abs(relative_coords_table) + 1.0) / 3.0
         )
         self.register_buffer("relative_coords_table", relative_coords_table)
 
-    def get_relative_position_bias(self) -> torch.Tensor:
+    def get_relative_position_bias(self) -> tensorplay.Tensor:
         relative_position_bias = _get_relative_position_bias(
             self.cpb_mlp(self.relative_coords_table).view(-1, self.num_heads),
             self.relative_position_index,  # type: ignore[arg-type]
             self.window_size,
         )
-        relative_position_bias = 16 * torch.sigmoid(relative_position_bias)
+        relative_position_bias = 16 * tensorplay.sigmoid(relative_position_bias)
         return relative_position_bias
 
     def forward(self, x: Tensor):
@@ -662,7 +662,7 @@ class Swin_T_Weights(WeightsEnum):
             **_COMMON_META,
             "num_params": 28288354,
             "min_size": (224, 224),
-            "recipe": "https://github.com/pytorch/vision/tree/main/references/classification#swintransformer",
+            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#swintransformer",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 81.474,
@@ -687,7 +687,7 @@ class Swin_S_Weights(WeightsEnum):
             **_COMMON_META,
             "num_params": 49606258,
             "min_size": (224, 224),
-            "recipe": "https://github.com/pytorch/vision/tree/main/references/classification#swintransformer",
+            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#swintransformer",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 83.196,
@@ -712,7 +712,7 @@ class Swin_B_Weights(WeightsEnum):
             **_COMMON_META,
             "num_params": 87768224,
             "min_size": (224, 224),
-            "recipe": "https://github.com/pytorch/vision/tree/main/references/classification#swintransformer",
+            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#swintransformer",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 83.582,
@@ -737,7 +737,7 @@ class Swin_V2_T_Weights(WeightsEnum):
             **_COMMON_META,
             "num_params": 28351570,
             "min_size": (256, 256),
-            "recipe": "https://github.com/pytorch/vision/tree/main/references/classification#swintransformer-v2",
+            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#swintransformer-v2",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 82.072,
@@ -762,7 +762,7 @@ class Swin_V2_S_Weights(WeightsEnum):
             **_COMMON_META,
             "num_params": 49737442,
             "min_size": (256, 256),
-            "recipe": "https://github.com/pytorch/vision/tree/main/references/classification#swintransformer-v2",
+            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#swintransformer-v2",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 83.712,
@@ -787,7 +787,7 @@ class Swin_V2_B_Weights(WeightsEnum):
             **_COMMON_META,
             "num_params": 87930848,
             "min_size": (256, 256),
-            "recipe": "https://github.com/pytorch/vision/tree/main/references/classification#swintransformer-v2",
+            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#swintransformer-v2",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 84.112,
@@ -810,19 +810,19 @@ def swin_t(*, weights: Optional[Swin_T_Weights] = None, progress: bool = True, *
     `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows <https://arxiv.org/abs/2103.14030>`_.
 
     Args:
-        weights (:class:`~torchvision.models.Swin_T_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.Swin_T_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.Swin_T_Weights` below for
+            :class:`~tensorplay.vision.models.Swin_T_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.swin_transformer.SwinTransformer``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.swin_transformer.SwinTransformer``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/swin_transformer.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/swin_transformer.py>`_
             for more details about this class.
 
-    .. autoclass:: torchvision.models.Swin_T_Weights
+    .. autoclass:: tensorplay.vision.models.Swin_T_Weights
         :members:
     """
     weights = Swin_T_Weights.verify(weights)
@@ -848,19 +848,19 @@ def swin_s(*, weights: Optional[Swin_S_Weights] = None, progress: bool = True, *
     `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows <https://arxiv.org/abs/2103.14030>`_.
 
     Args:
-        weights (:class:`~torchvision.models.Swin_S_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.Swin_S_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.Swin_S_Weights` below for
+            :class:`~tensorplay.vision.models.Swin_S_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.swin_transformer.SwinTransformer``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.swin_transformer.SwinTransformer``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/swin_transformer.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/swin_transformer.py>`_
             for more details about this class.
 
-    .. autoclass:: torchvision.models.Swin_S_Weights
+    .. autoclass:: tensorplay.vision.models.Swin_S_Weights
         :members:
     """
     weights = Swin_S_Weights.verify(weights)
@@ -886,19 +886,19 @@ def swin_b(*, weights: Optional[Swin_B_Weights] = None, progress: bool = True, *
     `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows <https://arxiv.org/abs/2103.14030>`_.
 
     Args:
-        weights (:class:`~torchvision.models.Swin_B_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.Swin_B_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.Swin_B_Weights` below for
+            :class:`~tensorplay.vision.models.Swin_B_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.swin_transformer.SwinTransformer``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.swin_transformer.SwinTransformer``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/swin_transformer.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/swin_transformer.py>`_
             for more details about this class.
 
-    .. autoclass:: torchvision.models.Swin_B_Weights
+    .. autoclass:: tensorplay.vision.models.Swin_B_Weights
         :members:
     """
     weights = Swin_B_Weights.verify(weights)
@@ -924,19 +924,19 @@ def swin_v2_t(*, weights: Optional[Swin_V2_T_Weights] = None, progress: bool = T
     `Swin Transformer V2: Scaling Up Capacity and Resolution <https://arxiv.org/abs/2111.09883>`_.
 
     Args:
-        weights (:class:`~torchvision.models.Swin_V2_T_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.Swin_V2_T_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.Swin_V2_T_Weights` below for
+            :class:`~tensorplay.vision.models.Swin_V2_T_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.swin_transformer.SwinTransformer``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.swin_transformer.SwinTransformer``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/swin_transformer.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/swin_transformer.py>`_
             for more details about this class.
 
-    .. autoclass:: torchvision.models.Swin_V2_T_Weights
+    .. autoclass:: tensorplay.vision.models.Swin_V2_T_Weights
         :members:
     """
     weights = Swin_V2_T_Weights.verify(weights)
@@ -964,19 +964,19 @@ def swin_v2_s(*, weights: Optional[Swin_V2_S_Weights] = None, progress: bool = T
     `Swin Transformer V2: Scaling Up Capacity and Resolution <https://arxiv.org/abs/2111.09883>`_.
 
     Args:
-        weights (:class:`~torchvision.models.Swin_V2_S_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.Swin_V2_S_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.Swin_V2_S_Weights` below for
+            :class:`~tensorplay.vision.models.Swin_V2_S_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.swin_transformer.SwinTransformer``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.swin_transformer.SwinTransformer``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/swin_transformer.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/swin_transformer.py>`_
             for more details about this class.
 
-    .. autoclass:: torchvision.models.Swin_V2_S_Weights
+    .. autoclass:: tensorplay.vision.models.Swin_V2_S_Weights
         :members:
     """
     weights = Swin_V2_S_Weights.verify(weights)
@@ -1004,19 +1004,19 @@ def swin_v2_b(*, weights: Optional[Swin_V2_B_Weights] = None, progress: bool = T
     `Swin Transformer V2: Scaling Up Capacity and Resolution <https://arxiv.org/abs/2111.09883>`_.
 
     Args:
-        weights (:class:`~torchvision.models.Swin_V2_B_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.Swin_V2_B_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.Swin_V2_B_Weights` below for
+            :class:`~tensorplay.vision.models.Swin_V2_B_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.swin_transformer.SwinTransformer``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.swin_transformer.SwinTransformer``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/swin_transformer.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/swin_transformer.py>`_
             for more details about this class.
 
-    .. autoclass:: torchvision.models.Swin_V2_B_Weights
+    .. autoclass:: tensorplay.vision.models.Swin_V2_B_Weights
         :members:
     """
     weights = Swin_V2_B_Weights.verify(weights)

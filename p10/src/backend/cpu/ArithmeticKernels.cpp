@@ -10,6 +10,7 @@
 #include "Parallel.h"
 #include "OneDNNContext.h"
 #include "Allocator.h"
+#include "cpu/VecComplex.h"
 #include <iostream>
 #include <vector>
 #include <cmath>
@@ -41,6 +42,311 @@ using namespace tensorplay::parallel;
 Tensor add_scalar_kernel(const Tensor& self, Scalar other, Scalar alpha);
 Tensor mul_scalar_kernel(const Tensor& self, Scalar other);
 Tensor& relu_inplace_kernel(Tensor& self);
+
+// --- AVX-512 runtime-dispatched contiguous binary kernels -------------------
+// Zen4-class CPUs run zmm natively; the build carries no global -mavx512f so
+// these carry their own target attribute and are gated by cpuid at runtime.
+// Formulas match ATen's reduced-precision CPU kernels: vector add uses the
+// native fused multiply-add path, while mul/div are single IEEE ops.
+#if defined(__x86_64__)
+namespace {
+
+inline bool cpu_has_avx512() {
+    static const bool ok = __builtin_cpu_supports("avx512f") != 0 &&
+                           __builtin_cpu_supports("avx512vl") != 0 &&
+                           __builtin_cpu_supports("avx512dq") != 0;
+    return ok;
+}
+
+enum : int { BIN_ADD = 0, BIN_MUL = 1, BIN_DIV = 2 };
+
+__attribute__((target("avx512f")))
+void binary_f32_avx512(int code, const float* a, const float* b, float* y,
+                       int64_t n, float alpha) {
+    const __m512 va = _mm512_set1_ps(alpha);
+    int64_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m512 x = _mm512_loadu_ps(a + i);
+        __m512 w = _mm512_loadu_ps(b + i);
+        __m512 r;
+        switch (code) {
+            case BIN_ADD: r = _mm512_add_ps(x, _mm512_mul_ps(va, w)); break;
+            case BIN_MUL: r = _mm512_mul_ps(x, w); break;
+            default:      r = _mm512_div_ps(x, w); break;
+        }
+        _mm512_storeu_ps(y + i, r);
+    }
+    for (; i < n; ++i) {
+        switch (code) {
+            case BIN_ADD: y[i] = a[i] + alpha * b[i]; break;
+            case BIN_MUL: y[i] = a[i] * b[i]; break;
+            default:      y[i] = a[i] / b[i]; break;
+        }
+    }
+}
+
+__attribute__((target("avx512f")))
+void binary_f64_avx512(int code, const double* a, const double* b, double* y,
+                       int64_t n, double alpha) {
+    const __m512d va = _mm512_set1_pd(alpha);
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m512d x = _mm512_loadu_pd(a + i);
+        __m512d w = _mm512_loadu_pd(b + i);
+        __m512d r;
+        switch (code) {
+            case BIN_ADD: r = _mm512_add_pd(x, _mm512_mul_pd(va, w)); break;
+            case BIN_MUL: r = _mm512_mul_pd(x, w); break;
+            default:      r = _mm512_div_pd(x, w); break;
+        }
+        _mm512_storeu_pd(y + i, r);
+    }
+    for (; i < n; ++i) {
+        switch (code) {
+            case BIN_ADD: y[i] = a[i] + alpha * b[i]; break;
+            case BIN_MUL: y[i] = a[i] * b[i]; break;
+            default:      y[i] = a[i] / b[i]; break;
+        }
+    }
+}
+
+__attribute__((target("avx512f")))
+void scalar_f32_avx512(int code, const float* a, float* y, int64_t n,
+                       float scalar) {
+    const __m512 vscalar = _mm512_set1_ps(scalar);
+    int64_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        const __m512 x = _mm512_loadu_ps(a + i);
+        __m512 r;
+        switch (code) {
+            case BIN_ADD: r = _mm512_add_ps(x, vscalar); break;
+            case BIN_MUL: r = _mm512_mul_ps(x, vscalar); break;
+            default:      r = _mm512_div_ps(x, vscalar); break;
+        }
+        _mm512_storeu_ps(y + i, r);
+    }
+    for (; i < n; ++i) {
+        y[i] = code == BIN_ADD ? a[i] + scalar
+             : code == BIN_MUL ? a[i] * scalar : a[i] / scalar;
+    }
+}
+
+__attribute__((target("avx512f")))
+void scalar_f64_avx512(int code, const double* a, double* y, int64_t n,
+                       double scalar) {
+    const __m512d vscalar = _mm512_set1_pd(scalar);
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m512d x = _mm512_loadu_pd(a + i);
+        __m512d r;
+        switch (code) {
+            case BIN_ADD: r = _mm512_add_pd(x, vscalar); break;
+            case BIN_MUL: r = _mm512_mul_pd(x, vscalar); break;
+            default:      r = _mm512_div_pd(x, vscalar); break;
+        }
+        _mm512_storeu_pd(y + i, r);
+    }
+    for (; i < n; ++i) {
+        y[i] = code == BIN_ADD ? a[i] + scalar
+             : code == BIN_MUL ? a[i] * scalar : a[i] / scalar;
+    }
+}
+
+// TensorIterator's native CPU kernels parallelize contiguous scalar and
+// wrapped-scalar operations at the same grain size as ordinary pointwise
+// kernels.  Keep the target-specific loop above single-purpose, but add the
+// same scheduling around it so a large optimizer tensor does not silently
+// become a one-thread AVX-512 loop.
+inline void scalar_f32_contiguous(int code, const float* a, float* y,
+                                   int64_t n, float scalar) {
+    parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        scalar_f32_avx512(code, a + begin, y + begin, end - begin, scalar);
+    });
+}
+
+inline void scalar_f64_contiguous(int code, const double* a, double* y,
+                                   int64_t n, double scalar) {
+    parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        scalar_f64_avx512(code, a + begin, y + begin, end - begin, scalar);
+    });
+}
+
+inline void binary_f32_contiguous(int code, const float* a, const float* b,
+                                   float* y, int64_t n, float alpha) {
+    parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        binary_f32_avx512(code, a + begin, b + begin, y + begin,
+                          end - begin, alpha);
+    });
+}
+
+inline void binary_f64_contiguous(int code, const double* a, const double* b,
+                                   double* y, int64_t n, double alpha) {
+    parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        binary_f64_avx512(code, a + begin, b + begin, y + begin,
+                          end - begin, alpha);
+    });
+}
+
+// Muon keeps parameters in FP32 but its Newton-Schulz update in BF16.  The
+// native reduced-precision TensorIterator path widens BF16 to FP32, performs
+// the scaled add in FP32, and stores back to FP32.  This specialization avoids
+// sending that very common optimizer update through the generic mixed-dtype
+// iterator/oneDNN path.
+__attribute__((target("avx512f,fma")))
+void f32_bf16_add_inplace_avx512(float* dst, const uint16_t* src,
+                                 int64_t n, float alpha) {
+    const __m512 valpha = _mm512_set1_ps(alpha);
+    int64_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        const __m256i raw = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i*>(src + i));
+        const __m512 value = _mm512_castsi512_ps(
+            _mm512_slli_epi32(_mm512_cvtepu16_epi32(raw), 16));
+        const __m512 current = _mm512_loadu_ps(dst + i);
+        _mm512_storeu_ps(dst + i, _mm512_fmadd_ps(valpha, value, current));
+    }
+    for (; i < n; ++i) {
+        dst[i] += alpha * detail::bfloat16_to_float_bits(src[i]);
+    }
+}
+
+inline void f32_bf16_add_inplace_contiguous(float* dst,
+                                            const BFloat16* src,
+                                            int64_t n, float alpha) {
+    const auto* bits = reinterpret_cast<const uint16_t*>(src);
+    parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        f32_bf16_add_inplace_avx512(dst + begin, bits + begin,
+                                    end - begin, alpha);
+    });
+}
+
+inline bool cpu_has_avx512_bf16() {
+    static const bool ok = __builtin_cpu_supports("avx512f") != 0 &&
+                           __builtin_cpu_supports("avx512bw") != 0 &&
+                           __builtin_cpu_supports("avx512bf16") != 0;
+    return ok;
+}
+
+// BF16 arithmetic is performed in float32 and rounded once on store, just as
+// ATen's reduced-precision CPU kernels do.  Keep the conversion in this
+// target-attributed routine: the rest of p10 remains safe to load on hosts
+// without AVX-512 BF16, while Zen4-class hosts get the native 16-lane path.
+__attribute__((target("avx512f,avx512bw,avx512bf16,fma")))
+void bf16_binary_avx512(int code, const uint16_t* a, const uint16_t* b,
+                        uint16_t* y, int64_t n, float alpha) {
+    const __m512 valpha = _mm512_set1_ps(alpha);
+    int64_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        const __m256i ar = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i*>(a + i));
+        const __m256i br = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i*>(b + i));
+        const __m512 af = _mm512_castsi512_ps(
+            _mm512_slli_epi32(_mm512_cvtepu16_epi32(ar), 16));
+        const __m512 bf = _mm512_castsi512_ps(
+            _mm512_slli_epi32(_mm512_cvtepu16_epi32(br), 16));
+        __m512 out;
+        switch (code) {
+            // ATen's Vectorized BF16 add uses vec::fmadd(other, alpha, self).
+            // Match that accumulation order before the single BF16 store.
+            case BIN_ADD: out = _mm512_fmadd_ps(valpha, bf, af); break;
+            case BIN_MUL: out = _mm512_mul_ps(af, bf); break;
+            default:      out = _mm512_div_ps(af, bf); break;
+        }
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(y + i),
+                            (__m256i)_mm512_cvtneps_pbh(out));
+    }
+    for (; i < n; ++i) {
+        const float af = detail::bfloat16_to_float_bits(a[i]);
+        const float bf = detail::bfloat16_to_float_bits(b[i]);
+        float out;
+        switch (code) {
+            case BIN_ADD: out = af + alpha * bf; break;
+            case BIN_MUL: out = af * bf; break;
+            default:      out = af / bf; break;
+        }
+        y[i] = detail::float_to_bfloat16_bits(out);
+    }
+}
+
+__attribute__((target("avx512f,avx512bw,avx512bf16")))
+void bf16_scalar_avx512(int code, const uint16_t* a, uint16_t* y,
+                        int64_t n, float scalar) {
+    const __m512 vscalar = _mm512_set1_ps(scalar);
+    int64_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        const __m256i ar = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i*>(a + i));
+        const __m512 af = _mm512_castsi512_ps(
+            _mm512_slli_epi32(_mm512_cvtepu16_epi32(ar), 16));
+        __m512 out;
+        switch (code) {
+            case BIN_ADD: out = _mm512_add_ps(af, vscalar); break;
+            case BIN_MUL: out = _mm512_mul_ps(af, vscalar); break;
+            default:      out = _mm512_div_ps(af, vscalar); break;
+        }
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(y + i),
+                            (__m256i)_mm512_cvtneps_pbh(out));
+    }
+    for (; i < n; ++i) {
+        const float af = detail::bfloat16_to_float_bits(a[i]);
+        float out;
+        switch (code) {
+            case BIN_ADD: out = af + scalar; break;
+            case BIN_MUL: out = af * scalar; break;
+            default:      out = af / scalar; break;
+        }
+        y[i] = detail::float_to_bfloat16_bits(out);
+    }
+}
+
+inline void bf16_binary_contiguous(int code, const BFloat16* a,
+                                   const BFloat16* b, BFloat16* y,
+                                   int64_t n, float alpha) {
+    const auto* ap = reinterpret_cast<const uint16_t*>(a);
+    const auto* bp = reinterpret_cast<const uint16_t*>(b);
+    auto* yp = reinterpret_cast<uint16_t*>(y);
+    if (cpu_has_avx512_bf16()) {
+        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+            bf16_binary_avx512(code, ap + begin, bp + begin, yp + begin,
+                               end - begin, alpha);
+        });
+        return;
+    }
+    parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        for (int64_t i = begin; i < end; ++i) {
+            const float av = static_cast<float>(a[i]);
+            const float bv = static_cast<float>(b[i]);
+            const float out = code == BIN_ADD ? av + alpha * bv
+                               : code == BIN_MUL ? av * bv : av / bv;
+            y[i] = static_cast<BFloat16>(out);
+        }
+    });
+}
+
+inline void bf16_scalar_contiguous(int code, const BFloat16* a, BFloat16* y,
+                                   int64_t n, float scalar) {
+    const auto* ap = reinterpret_cast<const uint16_t*>(a);
+    auto* yp = reinterpret_cast<uint16_t*>(y);
+    if (cpu_has_avx512_bf16()) {
+        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+            bf16_scalar_avx512(code, ap + begin, yp + begin, end - begin,
+                               scalar);
+        });
+        return;
+    }
+    parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        for (int64_t i = begin; i < end; ++i) {
+            const float av = static_cast<float>(a[i]);
+            const float out = code == BIN_ADD ? av + scalar
+                               : code == BIN_MUL ? av * scalar : av / scalar;
+            y[i] = static_cast<BFloat16>(out);
+        }
+    });
+}
+
+}  // namespace
+#endif  // __x86_64__
 
 // --- Helper for Binary Ops ---
 
@@ -117,7 +423,9 @@ Tensor binary_op_kernel_impl(const Tensor& self, const Tensor& other, Op op, Mkl
         }
 
         switch (result_dtype) {
-            TENSORPLAY_FORALL_SCALAR_TYPES(TI_OP_CASE)
+            // Complex parity with ATen BinaryOpsKernel: +, -, *, / are
+            // defined component-wise over the complex dtypes.
+            TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TI_OP_CASE)
             default: TP_THROW(TypeError, "binary_op: unsupported dtype");
         }
         #undef TI_OP_CASE
@@ -127,6 +435,28 @@ Tensor binary_op_kernel_impl(const Tensor& self, const Tensor& other, Op op, Mkl
 }
 
 // --- Binary Kernels ---
+
+// alpha * y with per-dtype semantics.  Template + if constexpr so each
+// instantiation only compiles its own branch (a non-template context would
+// semantically check discarded branches too, breaking e.g. y.real() on
+// integral dtypes).  Complex values scale the low-precision components via
+// double, mirroring the real-path alpha.toDouble() behavior.
+template <typename T>
+inline T tp_alpha_scaled(const tensorplay::Scalar& alpha, const T& y) {
+    if constexpr (is_complex_type_v<T>) {
+        using v_t = typename is_complex_type<T>::value_type;
+        const v_t a = static_cast<v_t>(alpha.toDouble());
+        return T(a * y.real(), a * y.imag());
+    } else if constexpr (std::is_floating_point_v<T>) {
+        return alpha.to<T>() * y;
+    } else if constexpr (std::is_integral_v<T>) {
+        return static_cast<T>(alpha.to<int64_t>()) * y;
+    } else {
+        // Half/BFloat16 and other low-precision scalars: compute in float.
+        return static_cast<T>(static_cast<float>(alpha.toDouble()) *
+                              static_cast<float>(y));
+    }
+}
 
 Tensor add_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
     #ifdef USE_ONEDNN
@@ -325,7 +655,17 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
         float* r_ptr = result_contig.data_ptr<float>();
         const float* s_ptr = self_contig.data_ptr<float>();
         const float* o_ptr = other_contig.data_ptr<float>();
-        
+
+#if defined(__x86_64__)
+        // AVX-512 runtime dispatch: full-width add for any alpha.
+        if (cpu_has_avx512()) {
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                binary_f32_avx512(BIN_ADD, s_ptr + begin, o_ptr + begin,
+                                  r_ptr + begin, end - begin, alpha_val);
+            });
+            optimized = true;
+        }
+#endif
         #ifdef USE_MKL
         if (std::abs(alpha_val - 1.0f) < 1e-6) {
             parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
@@ -449,20 +789,86 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
         }
     }
     
+#if defined(__x86_64__)
+    // Native BF16 add: widen once, apply alpha in float32, and round once on
+    // store.  The generic TensorIterator path is scalar for this dtype.
+    if (self.dtype() == DType::BFloat16 && other.dtype() == DType::BFloat16 &&
+        self.is_contiguous() && other.is_contiguous() &&
+        self.shape() == other.shape() && !alpha.isComplex()) {
+        Tensor result = Tensor::empty(
+            static_cast<std::vector<int64_t>>(self.shape()), DType::BFloat16,
+            self.device());
+        bf16_binary_contiguous(BIN_ADD, self.data_ptr<BFloat16>(),
+                               other.data_ptr<BFloat16>(),
+                               result.data_ptr<BFloat16>(), self.numel(),
+                               static_cast<float>(static_cast<BFloat16>(
+                                   alpha.to<float>())));
+        return result;
+    }
+#endif
+
+    // AVX2 complex fast path (cpu/VecComplex.h): contiguous same-shape
+    // add/sub with alpha == +/-1 (bit-identical to the generic path since
+    // v_t(±1.0)*x == ±x exactly); other alphas keep the iterator loop.
+    if (!optimized &&
+        (self.dtype() == DType::ComplexFloat ||
+         self.dtype() == DType::ComplexDouble) &&
+        other.dtype() == self.dtype() && self.shape() == other.shape() &&
+        self.numel() >= 4096) {
+        const double a = alpha.toDouble();
+        if (a == 1.0 || a == -1.0) {
+            Tensor self_contig = self.is_contiguous() ? self : self.contiguous();
+            Tensor other_contig = other.is_contiguous() ? other : other.contiguous();
+            Tensor out = Tensor::empty(
+                static_cast<std::vector<int64_t>>(self.shape()), self.dtype(),
+                self.device());
+            const veccomplex::Op vop =
+                a == 1.0 ? veccomplex::Op::Add : veccomplex::Op::Sub;
+            if (veccomplex::try_binary(self_contig.data_ptr(),
+                                       other_contig.data_ptr(), out.data_ptr(),
+                                       self.numel(), self.dtype(), vop)) {
+                return out;
+            }
+        }
+    }
+
+#if defined(__x86_64__)
+    // AVX-512 runtime dispatch for float64 same-shape add (no fast path
+    // existed before -- f64 went through the TensorIterator scalar loop).
+    if (!optimized && cpu_has_avx512() &&
+        result_dtype == DType::Float64 &&
+        self.dtype() == DType::Float64 &&
+        other.dtype() == DType::Float64 &&
+        self.shape() == other.shape()) {
+        Tensor self_contig = self.is_contiguous() ? self : self.contiguous();
+        Tensor other_contig = other.is_contiguous() ? other : other.contiguous();
+        Tensor result_contig = result.is_contiguous() ? result : result.contiguous();
+        int64_t n = self_contig.numel();
+        const double alpha_val = alpha.toDouble();
+        double* r_ptr = result_contig.data_ptr<double>();
+        const double* s_ptr = self_contig.data_ptr<double>();
+        const double* o_ptr = other_contig.data_ptr<double>();
+        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+            binary_f64_avx512(BIN_ADD, s_ptr + begin, o_ptr + begin,
+                              r_ptr + begin, end - begin, alpha_val);
+        });
+        optimized = true;
+    }
+#endif
+
     if (!optimized) {
         Tensor self_casted = (self.dtype() == result_dtype) ? self : self.to(result_dtype);
         Tensor other_casted = (other.dtype() == result_dtype) ? other : other.to(result_dtype);
-        
-        // TensorIterator path: broadcast/reorder/coalesce/parallel in one.
+
+        // alpha * y with per-dtype semantics; a template so the if constexpr
+        // branches are truly discarded per instantiation.
         TensorIterator iter = TensorIterator::binary_op(result, self_casted, other_casted);
         #define TI_ALPHA_CASE(ctype, name) \
         case DType::name: { \
+            using ctype_ = ctype; \
             iter.for_each([&alpha](char** data, const int64_t* strides, int64_t n) { \
-                using ctype_ = ctype; \
                 auto op = [alpha](ctype_ x, ctype_ y) -> ctype_ { \
-                    if constexpr (std::is_floating_point_v<ctype_>) return x + alpha.to<ctype_>() * y; \
-                    else if (alpha.isFloatingPoint()) return static_cast<ctype_>(x + alpha.toDouble() * y); \
-                    else return static_cast<ctype_>(x + alpha.to<int64_t>() * y); \
+                    return x + tp_alpha_scaled(alpha, y); \
                 }; \
                 for (int64_t i = 0; i < n; ++i) \
                     *reinterpret_cast<ctype_*>(data[0] + i * strides[0]) = op( \
@@ -472,7 +878,7 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
             break; \
         }
         switch (result_dtype) {
-            TENSORPLAY_FORALL_SCALAR_TYPES(TI_ALPHA_CASE)
+            TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TI_ALPHA_CASE)
             default: TP_THROW(TypeError, "add_out: unsupported dtype");
         }
         #undef TI_ALPHA_CASE
@@ -636,6 +1042,63 @@ Tensor mul_kernel(const Tensor& self, const Tensor& other) {
     }
     #endif
 
+#if defined(__x86_64__)
+    if (self.dtype() == DType::BFloat16 && other.dtype() == DType::BFloat16 &&
+        self.is_contiguous() && other.is_contiguous() &&
+        self.shape() == other.shape()) {
+        Tensor result = Tensor::empty(
+            static_cast<std::vector<int64_t>>(self.shape()), DType::BFloat16,
+            self.device());
+        bf16_binary_contiguous(BIN_MUL, self.data_ptr<BFloat16>(),
+                               other.data_ptr<BFloat16>(),
+                               result.data_ptr<BFloat16>(), self.numel(), 1.0f);
+        return result;
+    }
+#endif
+
+    // AVX2 complex fast path (cpu/VecComplex.h): contiguous same-shape mul.
+    if ((self.dtype() == DType::ComplexFloat ||
+         self.dtype() == DType::ComplexDouble) &&
+        other.dtype() == self.dtype() && self.shape() == other.shape() &&
+        self.numel() >= 4096) {
+        Tensor self_contig = self.is_contiguous() ? self : self.contiguous();
+        Tensor other_contig = other.is_contiguous() ? other : other.contiguous();
+        Tensor out = Tensor::empty(
+            static_cast<std::vector<int64_t>>(self.shape()), self.dtype(),
+            self.device());
+        if (veccomplex::try_binary(self_contig.data_ptr(),
+                                   other_contig.data_ptr(), out.data_ptr(),
+                                   self.numel(), self.dtype(),
+                                   veccomplex::Op::Mul)) {
+            return out;
+        }
+    }
+
+#if defined(__x86_64__)
+    // AVX-512 runtime dispatch: contiguous same-shape real mul.
+    if ((self.dtype() == DType::Float32 || self.dtype() == DType::Float64) &&
+        other.dtype() == self.dtype() && self.shape() == other.shape() &&
+        self.numel() >= 4096 && cpu_has_avx512()) {
+        Tensor a = self.is_contiguous() ? self : self.contiguous();
+        Tensor b = other.is_contiguous() ? other : other.contiguous();
+        Tensor out = Tensor::empty(
+            static_cast<std::vector<int64_t>>(self.shape()), self.dtype(),
+            self.device());
+        const bool f32 = self.dtype() == DType::Float32;
+        parallel_for(0, self.numel(), GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+            if (f32)
+                binary_f32_avx512(BIN_MUL, a.data_ptr<float>() + begin,
+                                  b.data_ptr<float>() + begin,
+                                  out.data_ptr<float>() + begin, end - begin, 0.f);
+            else
+                binary_f64_avx512(BIN_MUL, a.data_ptr<double>() + begin,
+                                  b.data_ptr<double>() + begin,
+                                  out.data_ptr<double>() + begin, end - begin, 0.0);
+        });
+        return out;
+    }
+#endif
+
     auto op = [](auto a, auto b) { return a * b; };
     auto mkl_op = [](int n, float* a, float* b, float* y) {
         #ifdef USE_MKL
@@ -742,6 +1205,66 @@ Tensor div_kernel(const Tensor& self, const Tensor& other) {
     }
     #endif
 
+#if defined(__x86_64__)
+    if (self.dtype() == DType::BFloat16 && other.dtype() == DType::BFloat16 &&
+        self.is_contiguous() && other.is_contiguous() &&
+        self.shape() == other.shape()) {
+        Tensor result = Tensor::empty(
+            static_cast<std::vector<int64_t>>(self.shape()), DType::BFloat16,
+            self.device());
+        bf16_binary_contiguous(BIN_DIV, self.data_ptr<BFloat16>(),
+                               other.data_ptr<BFloat16>(),
+                               result.data_ptr<BFloat16>(), self.numel(), 1.0f);
+        return result;
+    }
+#endif
+
+    // AVX2 complex fast path (cpu/VecComplex.h): contiguous same-shape div
+    // (Smith's algorithm, true SIMD -- torch CPU divides via scalar loops).
+    if ((self.dtype() == DType::ComplexFloat ||
+         self.dtype() == DType::ComplexDouble) &&
+        other.dtype() == self.dtype() && self.shape() == other.shape() &&
+        self.numel() >= 4096) {
+        Tensor self_contig = self.is_contiguous() ? self : self.contiguous();
+        Tensor other_contig = other.is_contiguous() ? other : other.contiguous();
+        Tensor out = Tensor::empty(
+            static_cast<std::vector<int64_t>>(self.shape()), self.dtype(),
+            self.device());
+        if (veccomplex::try_binary(self_contig.data_ptr(),
+                                   other_contig.data_ptr(), out.data_ptr(),
+                                   self.numel(), self.dtype(),
+                                   veccomplex::Op::Div)) {
+            return out;
+        }
+    }
+
+#if defined(__x86_64__)
+    // AVX-512 runtime dispatch: contiguous same-shape real div (IEEE vdivps,
+    // bit-identical to the scalar path; torch needs its 512-bit path to keep
+    // up here).
+    if ((self.dtype() == DType::Float32 || self.dtype() == DType::Float64) &&
+        other.dtype() == self.dtype() && self.shape() == other.shape() &&
+        self.numel() >= 4096 && cpu_has_avx512()) {
+        Tensor a = self.is_contiguous() ? self : self.contiguous();
+        Tensor b = other.is_contiguous() ? other : other.contiguous();
+        Tensor out = Tensor::empty(
+            static_cast<std::vector<int64_t>>(self.shape()), self.dtype(),
+            self.device());
+        const bool f32 = self.dtype() == DType::Float32;
+        parallel_for(0, self.numel(), GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+            if (f32)
+                binary_f32_avx512(BIN_DIV, a.data_ptr<float>() + begin,
+                                  b.data_ptr<float>() + begin,
+                                  out.data_ptr<float>() + begin, end - begin, 0.f);
+            else
+                binary_f64_avx512(BIN_DIV, a.data_ptr<double>() + begin,
+                                  b.data_ptr<double>() + begin,
+                                  out.data_ptr<double>() + begin, end - begin, 0.0);
+        });
+        return out;
+    }
+#endif
+
     auto op = [](auto a, auto b) { 
         using T = std::decay_t<decltype(a)>;
         if constexpr (std::is_same_v<T, bool>) return static_cast<float>(a) / static_cast<float>(b);
@@ -830,6 +1353,44 @@ Tensor& add_inplace_kernel(Tensor& self, const Tensor& other, Scalar alpha) {
 
     if (self.shape() != other.shape()) {
     }
+
+#if defined(__x86_64__)
+    if (self.dtype() == DType::BFloat16 && other.dtype() == DType::BFloat16 &&
+        self.is_contiguous() && other.is_contiguous() &&
+        self.shape() == other.shape() && !alpha.isComplex()) {
+        bf16_binary_contiguous(BIN_ADD, self.data_ptr<BFloat16>(),
+                               other.data_ptr<BFloat16>(),
+                               self.data_ptr<BFloat16>(), self.numel(),
+                               static_cast<float>(static_cast<BFloat16>(
+                                   alpha.to<float>())));
+        return self;
+    }
+
+    // Muon's common mixed-precision update: FP32 parameter plus BF16 update.
+    // Compute in FP32 and keep the destination dtype unchanged, matching the
+    // native TensorIterator opmath path.
+    if (self.dtype() == DType::Float32 && other.dtype() == DType::BFloat16 &&
+        self.is_contiguous() && other.is_contiguous() &&
+        self.shape() == other.shape() && !alpha.isComplex() &&
+        cpu_has_avx512()) {
+        f32_bf16_add_inplace_contiguous(
+            self.data_ptr<float>(), other.data_ptr<BFloat16>(), self.numel(),
+            alpha.to<float>());
+        return self;
+    }
+
+    // Match the contiguous FP32 tensor-add path used by the native optimizer
+    // kernels without paying the generic iterator or BLAS wrapper overhead.
+    if (self.dtype() == DType::Float32 && other.dtype() == DType::Float32 &&
+        self.is_contiguous() && other.is_contiguous() &&
+        self.shape() == other.shape() && !alpha.isComplex() &&
+        cpu_has_avx512()) {
+        binary_f32_contiguous(BIN_ADD, self.data_ptr<float>(),
+                              other.data_ptr<float>(), self.data_ptr<float>(),
+                              self.numel(), alpha.to<float>());
+        return self;
+    }
+#endif
 
     #ifdef USE_ONEDNN
     if (OneDNNContext::is_enabled()) {
@@ -1149,11 +1710,11 @@ Tensor& add_inplace_kernel(Tensor& self, const Tensor& other, Scalar alpha) {
         Tensor other_c = (other.dtype() == self.dtype()) ? other : other.to(self.dtype());
         { auto op = [alpha](auto x, auto y) {
             using T = std::decay_t<decltype(x)>;
-            if constexpr (std::is_floating_point_v<T>) return x + alpha.to<T>() * y;
+            if constexpr (std::is_floating_point_v<T> || is_complex_type_v<T>) return x + alpha.to<T>() * y;
             else if (alpha.isFloatingPoint()) return static_cast<T>(x + alpha.toDouble() * y);
             else return static_cast<T>(x + alpha.to<int64_t>() * y);
         };
-            ti_apply_binary(self, self, other_c, op);
+            ti_apply_arith(self, self, other_c, op);
         }
     }
     return self;
@@ -1285,7 +1846,7 @@ Tensor& mul_inplace_kernel(Tensor& self, const Tensor& other) {
     if (!optimized) {
         Tensor other_c = (other.dtype() == self.dtype()) ? other : other.to(self.dtype());
         { auto op = [](auto x, auto y) { return x * y; };
-            ti_apply_binary(self, self, other_c, op);
+            ti_apply_arith(self, self, other_c, op);
         }
     }
     return self;
@@ -1294,6 +1855,44 @@ Tensor& mul_inplace_kernel(Tensor& self, const Tensor& other) {
 Tensor& div_inplace_kernel(Tensor& self, const Tensor& other) {
     std::vector<int64_t> out_shape = broadcast_shapes(static_cast<std::vector<int64_t>>(self.shape()), static_cast<std::vector<int64_t>>(other.shape()));
     if (static_cast<std::vector<int64_t>>(self.shape()) != out_shape) TP_THROW(RuntimeError, "div_: shape mismatch");
+
+#if defined(__x86_64__)
+    // Muon's norm is a 0-d FP32 tensor while the working matrix is BF16.
+    // TensorIterator handles that broadcast correctly, but its per-element
+    // dtype dispatch is needlessly expensive for this hot scalar-broadcast
+    // case.  Load the scalar once and use the same float32-widen/BF16-store
+    // kernel as the tensor-scalar operator.  A one-element tensor with a
+    // non-scalar shape (e.g. [1]) is broadcast identically here.
+    if (self.dtype() == DType::BFloat16 && self.is_contiguous() &&
+        self.numel() >= 4096 && other.numel() == 1 &&
+        other.is_contiguous() && !other.is_sparse()) {
+        float divisor = 0.0f;
+        bool scalar_loaded = true;
+        switch (other.dtype()) {
+            case DType::Float32:
+                divisor = other.data_ptr<float>()[0];
+                break;
+            case DType::Float64:
+                divisor = static_cast<float>(other.data_ptr<double>()[0]);
+                break;
+            case DType::Float16:
+                divisor = static_cast<float>(other.data_ptr<Half>()[0]);
+                break;
+            case DType::BFloat16:
+                divisor = static_cast<float>(other.data_ptr<BFloat16>()[0]);
+                break;
+            default:
+                scalar_loaded = false;
+                break;
+        }
+        if (scalar_loaded) {
+            bf16_scalar_contiguous(BIN_DIV, self.data_ptr<BFloat16>(),
+                                   self.data_ptr<BFloat16>(), self.numel(),
+                                   divisor);
+            return self;
+        }
+    }
+#endif
 
     #ifdef USE_ONEDNN
     if (OneDNNContext::is_enabled()) {
@@ -1410,7 +2009,7 @@ Tensor& div_inplace_kernel(Tensor& self, const Tensor& other) {
             if constexpr (std::is_same_v<T, bool>) return static_cast<bool>(static_cast<int>(x) / static_cast<int>(y));
             else return x / y;
         };
-            ti_apply_binary(self, self, other_c, op);
+            ti_apply_arith(self, self, other_c, op);
         }
     }
     return self;
@@ -1420,150 +2019,266 @@ Tensor& div_inplace_kernel(Tensor& self, const Tensor& other) {
 
 // --- Scalar Kernels ---
 
-Tensor add_scalar_kernel(const Tensor& self, Scalar other, Scalar alpha) {
-    DType result_dtype = self.dtype();
-    if (!isFloatingType(result_dtype) &&
-        (other.isFloatingPoint() || alpha.isFloatingPoint())) {
-        result_dtype = promoteTypes(result_dtype, DType::Float32);
+namespace {
+// ATen weak-scalar rules shared by the tensor-scalar kernels: a wrapped
+// complex scalar widens any REAL tensor to its complex width (float64 ->
+// complex128, everything else -> complex64); a wrapped float promotes
+// integral tensors to Float32.
+inline DType scalar_result_dtype(DType self_dt, const Scalar& other,
+                                 const Scalar* alpha = nullptr) {
+    const bool alpha_cplx = alpha && alpha->isComplex();
+    const bool alpha_float = alpha && alpha->isFloatingPoint();
+    if (isComplexType(self_dt)) return self_dt;
+    if (other.isComplex() || alpha_cplx) {
+        // Wrapped numbers participate weakly: the component width follows the
+        // TENSOR (float64 -> complex128, everything else -> complex64),
+        // never the scalar's own width.
+        return isFloatingType(self_dt) ? toComplexType(self_dt)
+                                       : DType::ComplexFloat;
     }
-    
+    if (!isFloatingType(self_dt) && (other.isFloatingPoint() || alpha_float)) {
+        return promoteTypes(self_dt, DType::Float32);
+    }
+    return self_dt;
+}
+} // namespace
+
+Tensor add_scalar_kernel(const Tensor& self, Scalar other, Scalar alpha) {
+    DType result_dtype = scalar_result_dtype(self.dtype(), other, &alpha);
+
+#if defined(__x86_64__)
+    // Native add.Scalar lowers a wrapped scalar to the same vectorized
+    // TensorIterator loop as add.Tensor.  Keep the scalar product in the
+    // tensor dtype before entering the AVX-512 loop so promotion and rounding
+    // agree with the generic path.
+    if (self.dtype() == DType::Float32 && result_dtype == DType::Float32 &&
+        !other.isComplex() && !alpha.isComplex() && self.is_contiguous() &&
+        cpu_has_avx512()) {
+        Tensor result = Tensor::empty(
+            static_cast<std::vector<int64_t>>(self.shape()), DType::Float32,
+            self.device());
+        const float scalar = alpha.to<float>() * other.to<float>();
+        scalar_f32_contiguous(BIN_ADD, self.data_ptr<float>(),
+                              result.data_ptr<float>(), self.numel(), scalar);
+        return result;
+    }
+    if (self.dtype() == DType::Float64 && result_dtype == DType::Float64 &&
+        !other.isComplex() && !alpha.isComplex() && self.is_contiguous() &&
+        cpu_has_avx512()) {
+        Tensor result = Tensor::empty(
+            static_cast<std::vector<int64_t>>(self.shape()), DType::Float64,
+            self.device());
+        const double scalar = alpha.to<double>() * other.to<double>();
+        scalar_f64_contiguous(BIN_ADD, self.data_ptr<double>(),
+                              result.data_ptr<double>(), self.numel(), scalar);
+        return result;
+    }
+#endif
+
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), result_dtype, self.device());
     Tensor self_casted = (self.dtype() == result_dtype) ? self : self.to(result_dtype);
-    
+
     #define OP_CASE(ctype, name) \
     case DType::name: { \
         auto op = [other, alpha](ctype a) -> ctype { \
-            if constexpr (std::is_floating_point_v<ctype>) { \
-                return a + alpha.to<ctype>() * other.to<ctype>(); \
-            } else { \
-                return static_cast<ctype>(a + alpha.toDouble() * other.toDouble()); \
-            } \
+            return static_cast<ctype>(a + alpha.to<ctype>() * other.to<ctype>()); \
         }; \
         apply_unary_op_recursive<ctype>(result.data_ptr<ctype>(), result.strides(), \
                                        self_casted, self_casted.strides(), \
                                        0, 0, 0, static_cast<std::vector<int64_t>>(self.shape()), op); \
         break; \
     }
-    
+
     switch (result_dtype) {
-        TENSORPLAY_FORALL_SCALAR_TYPES(OP_CASE)
+        TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(OP_CASE)
         default: TP_THROW(TypeError, "add_scalar: unsupported dtype");
     }
     #undef OP_CASE
-    
+
     return result;
 }
 
 Tensor sub_scalar_kernel(const Tensor& self, Scalar other, Scalar alpha) {
-    DType result_dtype = self.dtype();
-    if (!isFloatingType(result_dtype) &&
-        (other.isFloatingPoint() || alpha.isFloatingPoint())) {
-        result_dtype = promoteTypes(result_dtype, DType::Float32);
-    }
-    
+    DType result_dtype = scalar_result_dtype(self.dtype(), other, &alpha);
+
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), result_dtype, self.device());
     Tensor self_casted = (self.dtype() == result_dtype) ? self : self.to(result_dtype);
-    
+
     #define OP_CASE(ctype, name) \
     case DType::name: { \
         auto op = [other, alpha](ctype a) -> ctype { \
-            if constexpr (std::is_floating_point_v<ctype>) { \
-                return a - alpha.to<ctype>() * other.to<ctype>(); \
-            } else { \
-                return static_cast<ctype>(a - alpha.toDouble() * other.toDouble()); \
-            } \
+            return static_cast<ctype>(a - alpha.to<ctype>() * other.to<ctype>()); \
         }; \
         apply_unary_op_recursive<ctype>(result.data_ptr<ctype>(), result.strides(), \
                                        self_casted, self_casted.strides(), \
                                        0, 0, 0, static_cast<std::vector<int64_t>>(self.shape()), op); \
         break; \
     }
-    
+
     switch (result_dtype) {
-        TENSORPLAY_FORALL_SCALAR_TYPES(OP_CASE)
+        TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(OP_CASE)
         default: TP_THROW(TypeError, "sub_scalar: unsupported dtype");
     }
     #undef OP_CASE
-    
+
     return result;
 }
 
 Tensor mul_scalar_kernel(const Tensor& self, Scalar other) {
-    DType result_dtype = self.dtype();
-    if (!isFloatingType(result_dtype) && other.isFloatingPoint()) {
-        result_dtype = promoteTypes(result_dtype, DType::Float32);
+    DType result_dtype = scalar_result_dtype(self.dtype(), other);
+
+#if defined(__x86_64__)
+    if (self.dtype() == DType::Float32 && result_dtype == DType::Float32 &&
+        !other.isComplex() && self.is_contiguous() && cpu_has_avx512()) {
+        Tensor result = Tensor::empty(
+            static_cast<std::vector<int64_t>>(self.shape()), DType::Float32,
+            self.device());
+        scalar_f32_contiguous(BIN_MUL, self.data_ptr<float>(),
+                              result.data_ptr<float>(), self.numel(),
+                              other.to<float>());
+        return result;
     }
-    
+    if (self.dtype() == DType::Float64 && result_dtype == DType::Float64 &&
+        !other.isComplex() && self.is_contiguous() && cpu_has_avx512()) {
+        Tensor result = Tensor::empty(
+            static_cast<std::vector<int64_t>>(self.shape()), DType::Float64,
+            self.device());
+        scalar_f64_contiguous(BIN_MUL, self.data_ptr<double>(),
+                              result.data_ptr<double>(), self.numel(),
+                              other.to<double>());
+        return result;
+    }
+#endif
+
+#if defined(__x86_64__)
+    if (self.dtype() == DType::BFloat16 && result_dtype == DType::BFloat16 &&
+        !other.isComplex() && self.is_contiguous()) {
+        Tensor result = Tensor::empty(
+            static_cast<std::vector<int64_t>>(self.shape()), DType::BFloat16,
+            self.device());
+        bf16_scalar_contiguous(BIN_MUL, self.data_ptr<BFloat16>(),
+                               result.data_ptr<BFloat16>(), self.numel(),
+                               other.to<float>());
+        return result;
+    }
+#endif
+
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), result_dtype, self.device());
     Tensor self_casted = (self.dtype() == result_dtype) ? self : self.to(result_dtype);
-    
+
     #define OP_CASE(ctype, name) \
     case DType::name: { \
         auto op = [other](ctype a) -> ctype { \
-            if constexpr (std::is_floating_point_v<ctype>) { \
-                return a * other.to<ctype>(); \
-            } else { \
-                return static_cast<ctype>(a * other.toDouble()); \
-            } \
+            return static_cast<ctype>(a * other.to<ctype>()); \
         }; \
         apply_unary_op_recursive<ctype>(result.data_ptr<ctype>(), result.strides(), \
                                        self_casted, self_casted.strides(), \
                                        0, 0, 0, static_cast<std::vector<int64_t>>(self.shape()), op); \
         break; \
     }
-    
+
     switch (result_dtype) {
-        TENSORPLAY_FORALL_SCALAR_TYPES(OP_CASE)
+        TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(OP_CASE)
         default: TP_THROW(TypeError, "mul_scalar: unsupported dtype");
     }
     #undef OP_CASE
-    
+
     return result;
 }
 
 Tensor div_scalar_kernel(const Tensor& self, Scalar other) {
+    // True division promotes integral tensors to Float32 (or ComplexFloat
+    // for a wrapped complex divisor), while preserving floating tensor
+    // precision for a Python scalar (the PyTorch rule).
     DType result_dtype = self.dtype();
-    // True division promotes integral tensors, while preserving floating
-    // tensor precision for a Python scalar (the PyTorch rule).
-    if (!isFloatingType(result_dtype)) result_dtype = DType::Float32;
-    
+    if (!isFloatingOrComplexType(result_dtype)) {
+        result_dtype = other.isComplex() ? DType::ComplexFloat : DType::Float32;
+    } else if (!isComplexType(result_dtype) && other.isComplex()) {
+        result_dtype = promoteTypes(toComplexType(result_dtype), other.dtype());
+    }
+
+#if defined(__x86_64__)
+    if (self.dtype() == DType::Float32 && result_dtype == DType::Float32 &&
+        !other.isComplex() && self.is_contiguous() && cpu_has_avx512()) {
+        Tensor result = Tensor::empty(
+            static_cast<std::vector<int64_t>>(self.shape()), DType::Float32,
+            self.device());
+        scalar_f32_contiguous(BIN_DIV, self.data_ptr<float>(),
+                              result.data_ptr<float>(), self.numel(),
+                              other.to<float>());
+        return result;
+    }
+    if (self.dtype() == DType::Float64 && result_dtype == DType::Float64 &&
+        !other.isComplex() && self.is_contiguous() && cpu_has_avx512()) {
+        Tensor result = Tensor::empty(
+            static_cast<std::vector<int64_t>>(self.shape()), DType::Float64,
+            self.device());
+        scalar_f64_contiguous(BIN_DIV, self.data_ptr<double>(),
+                              result.data_ptr<double>(), self.numel(),
+                              other.to<double>());
+        return result;
+    }
+#endif
+
+#if defined(__x86_64__)
+    if (self.dtype() == DType::BFloat16 && result_dtype == DType::BFloat16 &&
+        !other.isComplex() && self.is_contiguous()) {
+        Tensor result = Tensor::empty(
+            static_cast<std::vector<int64_t>>(self.shape()), DType::BFloat16,
+            self.device());
+        bf16_scalar_contiguous(BIN_DIV, self.data_ptr<BFloat16>(),
+                               result.data_ptr<BFloat16>(), self.numel(),
+                               other.to<float>());
+        return result;
+    }
+#endif
+
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), result_dtype, self.device());
     Tensor self_casted = (self.dtype() == result_dtype) ? self : self.to(result_dtype);
-    
+
     #define OP_CASE(ctype, name) \
     case DType::name: { \
         auto op = [other](ctype a) -> ctype { \
-            if constexpr (std::is_same_v<ctype, bool>) { \
-                return static_cast<ctype>(static_cast<double>(a) / other.to<double>()); \
-            } else { \
-                return static_cast<ctype>(a / other.to<double>()); \
-            } \
+            return static_cast<ctype>(a / other.to<ctype>()); \
         }; \
         apply_unary_op_recursive<ctype>(result.data_ptr<ctype>(), result.strides(), \
                                        self_casted, self_casted.strides(), \
                                        0, 0, 0, static_cast<std::vector<int64_t>>(self.shape()), op); \
         break; \
     }
-    
+
     switch (result_dtype) {
-        TENSORPLAY_FORALL_SCALAR_TYPES(OP_CASE)
+        TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(OP_CASE)
         default: TP_THROW(TypeError, "div_scalar: unsupported dtype");
     }
     #undef OP_CASE
-    
+
     return result;
 }
 
 // Inplace Scalar
 Tensor& add_scalar_inplace_kernel(Tensor& self, Scalar other, Scalar alpha) {
+#if defined(__x86_64__)
+    if ((self.dtype() == DType::Float32 || self.dtype() == DType::Float64) &&
+        !other.isComplex() && !alpha.isComplex() && self.is_contiguous() &&
+        cpu_has_avx512()) {
+        if (self.dtype() == DType::Float32) {
+            const float scalar = alpha.to<float>() * other.to<float>();
+            scalar_f32_contiguous(BIN_ADD, self.data_ptr<float>(),
+                                  self.data_ptr<float>(), self.numel(), scalar);
+        } else {
+            const double scalar = alpha.to<double>() * other.to<double>();
+            scalar_f64_contiguous(BIN_ADD, self.data_ptr<double>(),
+                                  self.data_ptr<double>(), self.numel(), scalar);
+        }
+        return self;
+    }
+#endif
+
     #define OP_CASE(ctype, name) \
     case DType::name: { \
         auto op = [other, alpha](ctype a) -> ctype { \
-            if constexpr (std::is_floating_point_v<ctype>) { \
-                return a + alpha.to<ctype>() * other.to<ctype>(); \
-            } else { \
-                return static_cast<ctype>(a + alpha.toDouble() * other.toDouble()); \
-            } \
+            return static_cast<ctype>(a + alpha.to<ctype>() * other.to<ctype>()); \
         }; \
         apply_unary_op_recursive<ctype>(self.data_ptr<ctype>(), self.strides(), \
                                        self, self.strides(), \
@@ -1571,7 +2286,7 @@ Tensor& add_scalar_inplace_kernel(Tensor& self, Scalar other, Scalar alpha) {
         break; \
     }
     switch (self.dtype()) {
-        TENSORPLAY_FORALL_SCALAR_TYPES(OP_CASE)
+        TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(OP_CASE)
         default: TP_THROW(TypeError, "add_scalar_: unsupported dtype");
     }
     #undef OP_CASE
@@ -1582,11 +2297,7 @@ Tensor& sub_scalar_inplace_kernel(Tensor& self, Scalar other, Scalar alpha) {
     #define OP_CASE(ctype, name) \
     case DType::name: { \
         auto op = [other, alpha](ctype a) -> ctype { \
-            if constexpr (std::is_floating_point_v<ctype>) { \
-                return a - alpha.to<ctype>() * other.to<ctype>(); \
-            } else { \
-                return static_cast<ctype>(a - alpha.toDouble() * other.toDouble()); \
-            } \
+            return static_cast<ctype>(a - alpha.to<ctype>() * other.to<ctype>()); \
         }; \
         apply_unary_op_recursive<ctype>(self.data_ptr<ctype>(), self.strides(), \
                                        self, self.strides(), \
@@ -1594,7 +2305,7 @@ Tensor& sub_scalar_inplace_kernel(Tensor& self, Scalar other, Scalar alpha) {
         break; \
     }
     switch (self.dtype()) {
-        TENSORPLAY_FORALL_SCALAR_TYPES(OP_CASE)
+        TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(OP_CASE)
         default: TP_THROW(TypeError, "sub_scalar_: unsupported dtype");
     }
     #undef OP_CASE
@@ -1602,14 +2313,37 @@ Tensor& sub_scalar_inplace_kernel(Tensor& self, Scalar other, Scalar alpha) {
 }
 
 Tensor& mul_scalar_inplace_kernel(Tensor& self, Scalar other) {
+#if defined(__x86_64__)
+    if (self.dtype() == DType::Float32 && !other.isComplex() &&
+        self.is_contiguous() && cpu_has_avx512()) {
+        scalar_f32_contiguous(BIN_MUL, self.data_ptr<float>(),
+                              self.data_ptr<float>(), self.numel(),
+                              other.to<float>());
+        return self;
+    }
+    if (self.dtype() == DType::Float64 && !other.isComplex() &&
+        self.is_contiguous() && cpu_has_avx512()) {
+        scalar_f64_contiguous(BIN_MUL, self.data_ptr<double>(),
+                              self.data_ptr<double>(), self.numel(),
+                              other.to<double>());
+        return self;
+    }
+#endif
+
+#if defined(__x86_64__)
+    if (self.dtype() == DType::BFloat16 && !other.isComplex() &&
+        self.is_contiguous()) {
+        bf16_scalar_contiguous(BIN_MUL, self.data_ptr<BFloat16>(),
+                               self.data_ptr<BFloat16>(), self.numel(),
+                               other.to<float>());
+        return self;
+    }
+#endif
+
     #define OP_CASE(ctype, name) \
     case DType::name: { \
         auto op = [other](ctype a) -> ctype { \
-            if constexpr (std::is_floating_point_v<ctype>) { \
-                return a * other.to<ctype>(); \
-            } else { \
-                return static_cast<ctype>(a * other.toDouble()); \
-            } \
+            return static_cast<ctype>(a * other.to<ctype>()); \
         }; \
         apply_unary_op_recursive<ctype>(self.data_ptr<ctype>(), self.strides(), \
                                        self, self.strides(), \
@@ -1617,7 +2351,7 @@ Tensor& mul_scalar_inplace_kernel(Tensor& self, Scalar other) {
         break; \
     }
     switch (self.dtype()) {
-        TENSORPLAY_FORALL_SCALAR_TYPES(OP_CASE)
+        TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(OP_CASE)
         default: TP_THROW(TypeError, "mul_scalar_: unsupported dtype");
     }
     #undef OP_CASE
@@ -1625,18 +2359,37 @@ Tensor& mul_scalar_inplace_kernel(Tensor& self, Scalar other) {
 }
 
 Tensor& div_scalar_inplace_kernel(Tensor& self, Scalar other) {
+#if defined(__x86_64__)
+    if (self.dtype() == DType::Float32 && !other.isComplex() &&
+        self.is_contiguous() && cpu_has_avx512()) {
+        scalar_f32_contiguous(BIN_DIV, self.data_ptr<float>(),
+                              self.data_ptr<float>(), self.numel(),
+                              other.to<float>());
+        return self;
+    }
+    if (self.dtype() == DType::Float64 && !other.isComplex() &&
+        self.is_contiguous() && cpu_has_avx512()) {
+        scalar_f64_contiguous(BIN_DIV, self.data_ptr<double>(),
+                              self.data_ptr<double>(), self.numel(),
+                              other.to<double>());
+        return self;
+    }
+#endif
+
+#if defined(__x86_64__)
+    if (self.dtype() == DType::BFloat16 && !other.isComplex() &&
+        self.is_contiguous()) {
+        bf16_scalar_contiguous(BIN_DIV, self.data_ptr<BFloat16>(),
+                               self.data_ptr<BFloat16>(), self.numel(),
+                               other.to<float>());
+        return self;
+    }
+#endif
+
     #define OP_CASE(ctype, name) \
     case DType::name: { \
         auto op = [other](ctype a) -> ctype { \
-            if constexpr (std::is_floating_point_v<ctype>) { \
-                return a / other.to<ctype>(); \
-            } else { \
-                if constexpr (std::is_same_v<ctype, bool>) { \
-                    return static_cast<ctype>(static_cast<double>(a) / other.to<double>()); \
-                } else { \
-                    return static_cast<ctype>(a / other.to<ctype>()); \
-                } \
-            } \
+            return static_cast<ctype>(a / other.to<ctype>()); \
         }; \
         apply_unary_op_recursive<ctype>(self.data_ptr<ctype>(), self.strides(), \
                                        self, self.strides(), \
@@ -1644,7 +2397,7 @@ Tensor& div_scalar_inplace_kernel(Tensor& self, Scalar other) {
         break; \
     }
     switch (self.dtype()) {
-        TENSORPLAY_FORALL_SCALAR_TYPES(OP_CASE)
+        TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(OP_CASE)
         default: TP_THROW(TypeError, "div_scalar_: unsupported dtype");
     }
     #undef OP_CASE

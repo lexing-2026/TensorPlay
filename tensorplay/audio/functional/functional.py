@@ -5,8 +5,7 @@ import warnings
 from collections.abc import Sequence
 from typing import List, Optional, Tuple, Union
 
-import tensorplay as torch
-import tensorplay.audio as torchaudio
+import tensorplay as tensorplay
 from tensorplay import Tensor
 
 from .filtering import highpass_biquad, treble_biquad
@@ -105,13 +104,13 @@ def spectrogram(
     if return_complex is not None:
         warnings.warn(
             "`return_complex` argument is now deprecated and is not effective."
-            "`torchaudio.functional.spectrogram(power=None)` always returns a tensor with "
+            "`tensorplay.audio.functional.spectrogram(power=None)` always returns a tensor with "
             "complex dtype. Please remove the argument in the function call."
         )
 
     if pad > 0:
         # TODO add "with torch.no_grad():" back when JIT supports it
-        waveform = torch.nn.functional.pad(waveform, (pad, pad), "constant")
+        waveform = tensorplay.nn.functional.pad(waveform, (pad, pad), "constant")
 
     frame_length_norm, window_norm = _get_spec_norms(normalized)
 
@@ -120,7 +119,7 @@ def spectrogram(
     waveform = waveform.reshape(-1, shape[-1])
 
     # default values are consistent with librosa.core.spectrum._spectrogram
-    spec_f = torch.stft(
+    spec_f = tensorplay.stft(
         input=waveform,
         n_fft=n_fft,
         hop_length=hop_length,
@@ -202,7 +201,7 @@ def inverse_spectrogram(
     spectrogram = spectrogram.reshape(-1, shape[-2], shape[-1])
 
     # default values are consistent with librosa.core.spectrum._spectrogram
-    waveform = torch.istft(
+    waveform = tensorplay.istft(
         input=spectrogram,
         n_fft=n_fft,
         hop_length=hop_length,
@@ -227,14 +226,14 @@ def inverse_spectrogram(
 
 def _get_spec_norms(normalized: Union[str, bool]):
     frame_length_norm, window_norm = False, False
-    if torch.jit.isinstance(normalized, str):
+    if tensorplay.jit.isinstance(normalized, str):
         if normalized not in ["frame_length", "window"]:
             raise ValueError("Invalid normalized parameter: {}".format(normalized))
         if normalized == "frame_length":
             frame_length_norm = True
         elif normalized == "window":
             window_norm = True
-    elif torch.jit.isinstance(normalized, bool):
+    elif tensorplay.jit.isinstance(normalized, bool):
         if normalized:
             window_norm = True
     else:
@@ -242,13 +241,13 @@ def _get_spec_norms(normalized: Union[str, bool]):
     return frame_length_norm, window_norm
 
 
-def _get_complex_dtype(real_dtype: torch.dtype):
-    if real_dtype == torch.double:
-        return torch.cdouble
-    if real_dtype == torch.float:
-        return torch.cfloat
-    if real_dtype == torch.half:
-        return torch.complex32
+def _get_complex_dtype(real_dtype: tensorplay.dtype):
+    if real_dtype == tensorplay.double:
+        return tensorplay.cdouble
+    if real_dtype == tensorplay.float:
+        return tensorplay.cfloat
+    if real_dtype == tensorplay.half:
+        return tensorplay.complex32
     raise ValueError(f"Unexpected dtype {real_dtype}")
 
 
@@ -307,20 +306,20 @@ def griffinlim(
 
     # initialize the phase
     if rand_init:
-        angles = torch.rand(specgram.size(), dtype=_get_complex_dtype(specgram.dtype), device=specgram.device)
+        angles = tensorplay.rand(specgram.size(), dtype=_get_complex_dtype(specgram.dtype), device=specgram.device)
     else:
-        angles = torch.full(specgram.size(), 1, dtype=_get_complex_dtype(specgram.dtype), device=specgram.device)
+        angles = tensorplay.full(specgram.size(), 1, dtype=_get_complex_dtype(specgram.dtype), device=specgram.device)
 
     # And initialize the previous iterate to 0
-    tprev = torch.tensor(0.0, dtype=specgram.dtype, device=specgram.device)
+    tprev = tensorplay.tensor(0.0, dtype=specgram.dtype, device=specgram.device)
     for _ in range(n_iter):
         # Invert with our current estimate of the phases
-        inverse = torch.istft(
+        inverse = tensorplay.istft(
             specgram * angles, n_fft=n_fft, hop_length=hop_length, win_length=win_length, window=window, length=length
         )
 
         # Rebuild the spectrogram
-        rebuilt = torch.stft(
+        rebuilt = tensorplay.stft(
             input=inverse,
             n_fft=n_fft,
             hop_length=hop_length,
@@ -343,7 +342,7 @@ def griffinlim(
         tprev = rebuilt
 
     # Return the final phase estimates
-    waveform = torch.istft(
+    waveform = tensorplay.istft(
         specgram * angles, n_fft=n_fft, hop_length=hop_length, win_length=win_length, window=window, length=length
     )
 
@@ -387,7 +386,7 @@ def amplitude_to_DB(
     Returns:
         Tensor: Output tensor in decibel scale
     """
-    x_db = multiplier * torch.log10(torch.clamp(x, min=amin))
+    x_db = multiplier * tensorplay.log10(tensorplay.clamp(x, min=amin))
     x_db -= multiplier * db_multiplier
 
     if top_db is not None:
@@ -396,7 +395,7 @@ def amplitude_to_DB(
         packed_channels = shape[-3] if x_db.dim() > 2 else 1
         x_db = x_db.reshape(-1, packed_channels, shape[-2], shape[-1])
 
-        x_db = torch.max(x_db, (x_db.amax(dim=(-3, -2, -1)) - top_db).view(-1, 1, 1, 1))
+        x_db = tensorplay.max(x_db, (x_db.amax(dim=(-3, -2, -1)) - top_db).view(-1, 1, 1, 1))
 
         # Repack batch
         x_db = x_db.reshape(shape)
@@ -419,7 +418,7 @@ def DB_to_amplitude(x: Tensor, ref: float, power: float) -> Tensor:
     Returns:
         Tensor: Output tensor in power/amplitude scale.
     """
-    return ref * torch.pow(torch.pow(10.0, 0.1 * x), power)
+    return ref * tensorplay.pow(tensorplay.pow(10.0, 0.1 * x), power)
 
 
 def _hz_to_mel(freq: float, mel_scale: str = "htk") -> float:
@@ -484,7 +483,7 @@ def _mel_to_hz(mels: Tensor, mel_scale: str = "htk") -> Tensor:
     logstep = math.log(6.4) / 27.0
 
     log_t = mels >= min_log_mel
-    freqs[log_t] = min_log_hz * torch.exp(logstep * (mels[log_t] - min_log_mel))
+    freqs[log_t] = min_log_hz * tensorplay.exp(logstep * (mels[log_t] - min_log_mel))
 
     return freqs
 
@@ -507,10 +506,10 @@ def _create_triangular_filterbank(
     f_diff = f_pts[1:] - f_pts[:-1]  # (n_filter + 1)
     slopes = f_pts.unsqueeze(0) - all_freqs.unsqueeze(1)  # (n_freqs, n_filter + 2)
     # create overlapping triangles
-    zero = torch.zeros(1)
+    zero = tensorplay.zeros(1)
     down_slopes = (-1.0 * slopes[:, :-2]) / f_diff[:-1]  # (n_freqs, n_filter)
     up_slopes = slopes[:, 2:] / f_diff[1:]  # (n_freqs, n_filter)
-    fb = torch.max(zero, torch.min(down_slopes, up_slopes))
+    fb = tensorplay.max(zero, tensorplay.min(down_slopes, up_slopes))
 
     return fb
 
@@ -534,7 +533,7 @@ def melscale_fbanks(
         For the sake of the numerical compatibility with librosa, not all the coefficients
         in the resulting filter bank has magnitude of 1.
 
-        .. image:: https://download.pytorch.org/torchaudio/doc-assets/mel_fbanks.png
+        .. image:: https://download.pytorch.org/tensorplay.audio/doc-assets/mel_fbanks.png
            :alt: Visualization of generated filter bank
 
     Args:
@@ -560,13 +559,13 @@ def melscale_fbanks(
         raise ValueError('norm must be one of None or "slaney"')
 
     # freq bins
-    all_freqs = torch.linspace(0, sample_rate // 2, n_freqs)
+    all_freqs = tensorplay.linspace(0, sample_rate // 2, n_freqs)
 
     # calculate mel freq bins
     m_min = _hz_to_mel(f_min, mel_scale=mel_scale)
     m_max = _hz_to_mel(f_max, mel_scale=mel_scale)
 
-    m_pts = torch.linspace(m_min, m_max, n_mels + 2)
+    m_pts = tensorplay.linspace(m_min, m_max, n_mels + 2)
     f_pts = _mel_to_hz(m_pts, mel_scale=mel_scale)
 
     # create filterbank
@@ -604,7 +603,7 @@ def linear_fbanks(
         For the sake of the numerical compatibility with librosa, not all the coefficients
         in the resulting filter bank has magnitude of 1.
 
-        .. image:: https://download.pytorch.org/torchaudio/doc-assets/lin_fbanks.png
+        .. image:: https://download.pytorch.org/tensorplay.audio/doc-assets/lin_fbanks.png
            :alt: Visualization of generated filter bank
 
     Args:
@@ -622,10 +621,10 @@ def linear_fbanks(
         ``A * linear_fbanks(A.size(-1), ...)``.
     """
     # freq bins
-    all_freqs = torch.linspace(0, sample_rate // 2, n_freqs)
+    all_freqs = tensorplay.linspace(0, sample_rate // 2, n_freqs)
 
     # filter mid-points
-    f_pts = torch.linspace(f_min, f_max, n_filter + 2)
+    f_pts = tensorplay.linspace(f_min, f_max, n_filter + 2)
 
     # create filterbank
     fb = _create_triangular_filterbank(all_freqs, f_pts)
@@ -655,9 +654,9 @@ def create_dct(n_mfcc: int, n_mels: int, norm: Optional[str]) -> Tensor:
         raise ValueError('norm must be either "ortho" or None')
 
     # http://en.wikipedia.org/wiki/Discrete_cosine_transform#DCT-II
-    n = torch.arange(float(n_mels))
-    k = torch.arange(float(n_mfcc)).unsqueeze(1)
-    dct = torch.cos(math.pi / float(n_mels) * (n + 0.5) * k)  # size (n_mfcc, n_mels)
+    n = tensorplay.arange(float(n_mels))
+    k = tensorplay.arange(float(n_mfcc)).unsqueeze(1)
+    dct = tensorplay.cos(math.pi / float(n_mels) * (n + 0.5) * k)  # size (n_mfcc, n_mels)
 
     if norm is None:
         dct *= 2.0
@@ -693,10 +692,10 @@ def mu_law_encoding(x: Tensor, quantization_channels: int) -> Tensor:
             "The input Tensor must be of floating type. \
             This will be an error in the v0.12 release."
         )
-        x = x.to(torch.float)
-    mu = torch.tensor(mu, dtype=x.dtype)
-    x_mu = torch.sign(x) * torch.log1p(mu * torch.abs(x)) / torch.log1p(mu)
-    x_mu = ((x_mu + 1) / 2 * mu + 0.5).to(torch.int64)
+        x = x.to(tensorplay.float)
+    mu = tensorplay.tensor(mu, dtype=x.dtype)
+    x_mu = tensorplay.sign(x) * tensorplay.log1p(mu * tensorplay.abs(x)) / tensorplay.log1p(mu)
+    x_mu = ((x_mu + 1) / 2 * mu + 0.5).to(tensorplay.int64)
     return x_mu
 
 
@@ -722,10 +721,10 @@ def mu_law_decoding(x_mu: Tensor, quantization_channels: int) -> Tensor:
     """
     mu = quantization_channels - 1.0
     if not x_mu.is_floating_point():
-        x_mu = x_mu.to(torch.float)
-    mu = torch.tensor(mu, dtype=x_mu.dtype)
+        x_mu = x_mu.to(tensorplay.float)
+    mu = tensorplay.tensor(mu, dtype=x_mu.dtype)
     x = ((x_mu) / mu) * 2 - 1.0
-    x = torch.sign(x) * (torch.exp(torch.abs(x) * torch.log1p(mu)) - 1.0) / mu
+    x = tensorplay.sign(x) * (tensorplay.exp(tensorplay.abs(x) * tensorplay.log1p(mu)) - 1.0) / mu
     return x
 
 
@@ -750,13 +749,13 @@ def phase_vocoder(complex_specgrams: Tensor, rate: float, phase_advance: Tensor)
     Example
         >>> freq, hop_length = 1025, 512
         >>> # (channel, freq, time)
-        >>> complex_specgrams = torch.randn(2, freq, 300, dtype=torch.cfloat)
+        >>> complex_specgrams = tensorplay.randn(2, freq, 300, dtype=tensorplay.cfloat)
         >>> rate = 1.3 # Speed up by 30%
-        >>> phase_advance = torch.linspace(
+        >>> phase_advance = tensorplay.linspace(
         >>>    0, math.pi * hop_length, freq)[..., None]
         >>> x = phase_vocoder(complex_specgrams, rate, phase_advance)
         >>> x.shape # with 231 == ceil(300 / 1.3)
-        torch.Size([2, 1025, 231])
+        tensorplay.Size([2, 1025, 231])
     """
     if rate == 1.0:
         return complex_specgrams
@@ -767,14 +766,14 @@ def phase_vocoder(complex_specgrams: Tensor, rate: float, phase_advance: Tensor)
 
     # Figures out the corresponding real dtype, i.e. complex128 -> float64, complex64 -> float32
     # Note torch.real is a view so it does not incur any memory copy.
-    real_dtype = torch.real(complex_specgrams).dtype
-    time_steps = torch.arange(0, complex_specgrams.size(-1), rate, device=complex_specgrams.device, dtype=real_dtype)
+    real_dtype = tensorplay.real(complex_specgrams).dtype
+    time_steps = tensorplay.arange(0, complex_specgrams.size(-1), rate, device=complex_specgrams.device, dtype=real_dtype)
 
     alphas = time_steps % 1.0
     phase_0 = complex_specgrams[..., :1].angle()
 
     # Time Padding
-    complex_specgrams = torch.nn.functional.pad(complex_specgrams, [0, 2])
+    complex_specgrams = tensorplay.nn.functional.pad(complex_specgrams, [0, 2])
 
     # (new_bins, freq, 2)
     complex_specgrams_0 = complex_specgrams.index_select(-1, time_steps.long())
@@ -787,16 +786,16 @@ def phase_vocoder(complex_specgrams: Tensor, rate: float, phase_advance: Tensor)
     norm_1 = complex_specgrams_1.abs()
 
     phase = angle_1 - angle_0 - phase_advance
-    phase = phase - 2 * math.pi * torch.round(phase / (2 * math.pi))
+    phase = phase - 2 * math.pi * tensorplay.round(phase / (2 * math.pi))
 
     # Compute Phase Accum
     phase = phase + phase_advance
-    phase = torch.cat([phase_0, phase[..., :-1]], dim=-1)
-    phase_acc = torch.cumsum(phase, -1)
+    phase = tensorplay.cat([phase_0, phase[..., :-1]], dim=-1)
+    phase_acc = tensorplay.cumsum(phase, -1)
 
     mag = alphas * norm_1 + (1 - alphas) * norm_0
 
-    complex_specgrams_stretch = torch.polar(mag, phase_acc)
+    complex_specgrams_stretch = tensorplay.polar(mag, phase_acc)
 
     # unpack batch
     complex_specgrams_stretch = complex_specgrams_stretch.reshape(shape[:-2] + complex_specgrams_stretch.shape[1:])
@@ -861,19 +860,19 @@ def mask_along_axis_iid(
     device = specgrams.device
     dtype = specgrams.dtype
 
-    value = torch.rand(specgrams.shape[: (dim - 2)], device=device, dtype=dtype) * mask_param
-    min_value = torch.rand(specgrams.shape[: (dim - 2)], device=device, dtype=dtype) * (specgrams.size(axis) - value)
+    value = tensorplay.rand(specgrams.shape[: (dim - 2)], device=device, dtype=dtype) * mask_param
+    min_value = tensorplay.rand(specgrams.shape[: (dim - 2)], device=device, dtype=dtype) * (specgrams.size(axis) - value)
 
     # Create broadcastable mask
     mask_start = min_value.long()[..., None, None]
     mask_end = (min_value.long() + value.long())[..., None, None]
-    mask = torch.arange(0, specgrams.size(axis), device=device, dtype=dtype)
+    mask = tensorplay.arange(0, specgrams.size(axis), device=device, dtype=dtype)
 
     # Per batch example masking
     specgrams = specgrams.transpose(axis, -1)
     # this aims to avoid CPU-GPU sync from upstream
     specgrams = (
-        torch.where((mask >= mask_start) & (mask < mask_end), mask_value.repeat(specgrams.shape), specgrams)
+        tensorplay.where((mask >= mask_start) & (mask < mask_end), mask_value.repeat(specgrams.shape), specgrams)
         if isinstance(mask_value, Tensor)
         else specgrams.masked_fill((mask >= mask_start) & (mask < mask_end), mask_value)
     )
@@ -936,12 +935,12 @@ def mask_along_axis(
     specgram = specgram.reshape([-1] + list(shape[-2:]))
     # After packing, specgram is a 3D tensor, and the axis corresponding to the to-be-masked dimension
     # is now (axis - dim + 3), e.g. a tensor of shape (10, 2, 50, 10, 2) becomes a tensor of shape (1000, 10, 2).
-    value = torch.rand(1) * mask_param
-    min_value = torch.rand(1) * (specgram.size(axis - dim + 3) - value)
+    value = tensorplay.rand(1) * mask_param
+    min_value = tensorplay.rand(1) * (specgram.size(axis - dim + 3) - value)
 
     mask_start = (min_value.long()).squeeze()
     mask_end = (min_value.long() + value.long()).squeeze()
-    mask = torch.arange(0, specgram.shape[axis - dim + 3], device=specgram.device, dtype=specgram.dtype)
+    mask = tensorplay.arange(0, specgram.shape[axis - dim + 3], device=specgram.device, dtype=specgram.dtype)
     mask = (mask >= mask_start) & (mask < mask_end)
     # unsqueeze the mask if the axis is frequency
     if axis == dim - 2:
@@ -981,7 +980,7 @@ def compute_deltas(specgram: Tensor, win_length: int = 5, mode: str = "replicate
         Tensor: Tensor of deltas of dimension `(..., freq, time)`
 
     Example
-        >>> specgram = torch.randn(1, 40, 1000)
+        >>> specgram = tensorplay.randn(1, 40, 1000)
         >>> delta = compute_deltas(specgram)
         >>> delta2 = compute_deltas(delta)
     """
@@ -1000,11 +999,11 @@ def compute_deltas(specgram: Tensor, win_length: int = 5, mode: str = "replicate
     # twice sum of integer squared
     denom = n * (n + 1) * (2 * n + 1) / 3
 
-    specgram = torch.nn.functional.pad(specgram, (n, n), mode=mode)
+    specgram = tensorplay.nn.functional.pad(specgram, (n, n), mode=mode)
 
-    kernel = torch.arange(-n, n + 1, 1, device=device, dtype=dtype).repeat(specgram.shape[1], 1, 1)
+    kernel = tensorplay.arange(-n, n + 1, 1, device=device, dtype=dtype).repeat(specgram.shape[1], 1, 1)
 
-    output = torch.nn.functional.conv1d(specgram, kernel, groups=specgram.shape[1]) / denom
+    output = tensorplay.nn.functional.conv1d(specgram, kernel, groups=specgram.shape[1]) / denom
 
     # unpack batch
     output = output.reshape(shape)
@@ -1038,7 +1037,7 @@ def _compute_nccf(waveform: Tensor, sample_rate: int, frame_time: float, freq_lo
     num_of_frames = int(math.ceil(waveform_length / frame_size))
 
     p = lags + num_of_frames * frame_size - waveform_length
-    waveform = torch.nn.functional.pad(waveform, (0, p))
+    waveform = tensorplay.nn.functional.pad(waveform, (0, p))
 
     # Compute lags
     output_lag = []
@@ -1048,13 +1047,13 @@ def _compute_nccf(waveform: Tensor, sample_rate: int, frame_time: float, freq_lo
 
         output_frames = (
             (s1 * s2).sum(-1)
-            / (EPSILON + torch.linalg.vector_norm(s1, ord=2, dim=-1)).pow(2)
-            / (EPSILON + torch.linalg.vector_norm(s2, ord=2, dim=-1)).pow(2)
+            / (EPSILON + tensorplay.linalg.vector_norm(s1, ord=2, dim=-1)).pow(2)
+            / (EPSILON + tensorplay.linalg.vector_norm(s2, ord=2, dim=-1)).pow(2)
         )
 
         output_lag.append(output_frames.unsqueeze(-1))
 
-    nccf = torch.cat(output_lag, -1)
+    nccf = tensorplay.cat(output_lag, -1)
 
     return nccf
 
@@ -1082,10 +1081,10 @@ def _find_max_per_frame(nccf: Tensor, sample_rate: int, freq_high: int) -> Tenso
 
     # Find near enough max that is smallest
 
-    best = torch.max(nccf[..., lag_min:], -1)
+    best = tensorplay.max(nccf[..., lag_min:], -1)
 
     half_size = nccf.shape[-1] // 2
-    half = torch.max(nccf[..., lag_min:half_size], -1)
+    half = tensorplay.max(nccf[..., lag_min:half_size], -1)
 
     best = _combine_max(half, best)
     indices = best[1]
@@ -1107,12 +1106,12 @@ def _median_smoothing(indices: Tensor, win_length: int) -> Tensor:
     pad_length = (win_length - 1) // 2
 
     # "replicate" padding in any dimension
-    indices = torch.nn.functional.pad(indices, (pad_length, 0), mode="constant", value=0.0)
+    indices = tensorplay.nn.functional.pad(indices, (pad_length, 0), mode="constant", value=0.0)
 
-    indices[..., :pad_length] = torch.cat(pad_length * [indices[..., pad_length].unsqueeze(-1)], dim=-1)
+    indices[..., :pad_length] = tensorplay.cat(pad_length * [indices[..., pad_length].unsqueeze(-1)], dim=-1)
     roll = indices.unfold(-1, win_length, 1)
 
-    values, _ = torch.median(roll, -1)
+    values, _ = tensorplay.median(roll, -1)
     return values
 
 
@@ -1153,7 +1152,7 @@ def detect_pitch_frequency(
 
     # Convert indices to frequency
     EPSILON = 10 ** (-9)
-    freq = sample_rate / (EPSILON + indices.to(torch.float))
+    freq = sample_rate / (EPSILON + indices.to(tensorplay.float))
 
     # unpack batch
     freq = freq.reshape(shape[:-1] + list(freq.shape[-1:]))
@@ -1195,9 +1194,9 @@ def sliding_window_cmn(
     dtype = specgram.dtype
     device = specgram.device
     last_window_start = last_window_end = -1
-    cur_sum = torch.zeros(num_channels, num_feats, dtype=dtype, device=device)
-    cur_sumsq = torch.zeros(num_channels, num_feats, dtype=dtype, device=device)
-    cmn_specgram = torch.zeros(num_channels, num_frames, num_feats, dtype=dtype, device=device)
+    cur_sum = tensorplay.zeros(num_channels, num_feats, dtype=dtype, device=device)
+    cur_sumsq = tensorplay.zeros(num_channels, num_feats, dtype=dtype, device=device)
+    cmn_specgram = tensorplay.zeros(num_channels, num_frames, num_feats, dtype=dtype, device=device)
     for t in range(num_frames):
         window_start = 0
         window_end = 0
@@ -1220,9 +1219,9 @@ def sliding_window_cmn(
                 window_start = 0
         if last_window_start == -1:
             input_part = specgram[:, window_start : window_end - window_start, :]
-            cur_sum += torch.sum(input_part, 1)
+            cur_sum += tensorplay.sum(input_part, 1)
             if norm_vars:
-                cur_sumsq += torch.cumsum(input_part**2, 1)[:, -1, :]
+                cur_sumsq += tensorplay.cumsum(input_part**2, 1)[:, -1, :]
         else:
             if window_start > last_window_start:
                 frame_to_remove = specgram[:, last_window_start, :]
@@ -1240,12 +1239,12 @@ def sliding_window_cmn(
         cmn_specgram[:, t, :] = specgram[:, t, :] - cur_sum / window_frames
         if norm_vars:
             if window_frames == 1:
-                cmn_specgram[:, t, :] = torch.zeros(num_channels, num_feats, dtype=dtype, device=device)
+                cmn_specgram[:, t, :] = tensorplay.zeros(num_channels, num_feats, dtype=dtype, device=device)
             else:
                 variance = cur_sumsq
                 variance = variance / window_frames
                 variance -= (cur_sum**2) / (window_frames**2)
-                variance = torch.pow(variance, -0.5)
+                variance = tensorplay.pow(variance, -0.5)
                 cmn_specgram[:, t, :] *= variance
 
     cmn_specgram = cmn_specgram.view(input_shape[:-2] + (num_frames, num_feats))
@@ -1294,12 +1293,12 @@ def spectral_centroid(
         power=1.0,
         normalized=False,
     )
-    freqs = torch.linspace(0, sample_rate // 2, steps=1 + n_fft // 2, device=specgram.device).reshape((-1, 1))
+    freqs = tensorplay.linspace(0, sample_rate // 2, steps=1 + n_fft // 2, device=specgram.device).reshape((-1, 1))
     freq_dim = -2
     return (freqs * specgram).sum(dim=freq_dim) / specgram.sum(dim=freq_dim)
 
 
-_CPU = torch.device("cpu")
+_CPU = tensorplay.device("cpu")
 
 
 def _get_sinc_resample_kernel(
@@ -1310,8 +1309,8 @@ def _get_sinc_resample_kernel(
     rolloff: float = 0.99,
     resampling_method: str = "sinc_interp_hann",
     beta: Optional[float] = None,
-    device: torch.device = _CPU,
-    dtype: Optional[torch.dtype] = None,
+    device: tensorplay.device = _CPU,
+    dtype: Optional[tensorplay.dtype] = None,
 ):
     if not (int(orig_freq) == orig_freq and int(new_freq) == new_freq):
         raise Exception(
@@ -1320,7 +1319,7 @@ def _get_sinc_resample_kernel(
             "that maintain their resampling rate ratio before passing them into the function. "
             "Example: To downsample a 44100 hz waveform by a factor of 8, use "
             "`orig_freq=8` and `new_freq=1` instead of `orig_freq=44100` and `new_freq=5512.5`. "
-            "For more information, please refer to https://github.com/pytorch/audio/issues/1487."
+            "For more information, please refer to https://github.com/tensorplay/audio/issues/1487."
         )
 
     if resampling_method in ["sinc_interpolation", "kaiser_window"]:
@@ -1371,33 +1370,33 @@ def _get_sinc_resample_kernel(
     # they will have a lot of almost zero values to the left or to the right...
     # There is probably a way to evaluate those filters more efficiently, but this is kept for
     # future work.
-    idx_dtype = dtype if dtype is not None else torch.float64
+    idx_dtype = dtype if dtype is not None else tensorplay.float64
 
-    idx = torch.arange(-width, width + orig_freq, dtype=idx_dtype, device=device)[None, None] / orig_freq
+    idx = tensorplay.arange(-width, width + orig_freq, dtype=idx_dtype, device=device)[None, None] / orig_freq
 
-    t = torch.arange(0, -new_freq, -1, dtype=dtype, device=device)[:, None, None] / new_freq + idx
+    t = tensorplay.arange(0, -new_freq, -1, dtype=dtype, device=device)[:, None, None] / new_freq + idx
     t *= base_freq
     t = t.clamp_(-lowpass_filter_width, lowpass_filter_width)
 
     # we do not use built in torch windows here as we need to evaluate the window
     # at specific positions, not over a regular grid.
     if resampling_method == "sinc_interp_hann":
-        window = torch.cos(t * math.pi / lowpass_filter_width / 2) ** 2
+        window = tensorplay.cos(t * math.pi / lowpass_filter_width / 2) ** 2
     else:
         # sinc_interp_kaiser
         if beta is None:
             beta = 14.769656459379492
-        beta_tensor = torch.tensor(float(beta))
-        window = torch.i0(beta_tensor * torch.sqrt(1 - (t / lowpass_filter_width) ** 2)) / torch.i0(beta_tensor)
+        beta_tensor = tensorplay.tensor(float(beta))
+        window = tensorplay.i0(beta_tensor * tensorplay.sqrt(1 - (t / lowpass_filter_width) ** 2)) / tensorplay.i0(beta_tensor)
 
     t *= math.pi
 
     scale = base_freq / orig_freq
-    kernels = torch.where(t == 0, torch.tensor(1.0).to(t), t.sin() / t)
+    kernels = tensorplay.where(t == 0, tensorplay.tensor(1.0).to(t), t.sin() / t)
     kernels *= window * scale
 
     if dtype is None:
-        kernels = kernels.to(dtype=torch.float32)
+        kernels = kernels.to(dtype=tensorplay.float32)
 
     return kernels, width
 
@@ -1421,10 +1420,10 @@ def _apply_sinc_resample_kernel(
     waveform = waveform.view(-1, shape[-1])
 
     num_wavs, length = waveform.shape
-    waveform = torch.nn.functional.pad(waveform, (width, width + orig_freq))
-    resampled = torch.nn.functional.conv1d(waveform[:, None], kernel, stride=orig_freq)
+    waveform = tensorplay.nn.functional.pad(waveform, (width, width + orig_freq))
+    resampled = tensorplay.nn.functional.conv1d(waveform[:, None], kernel, stride=orig_freq)
     resampled = resampled.transpose(1, 2).reshape(num_wavs, -1)
-    target_length = torch.ceil(torch.as_tensor(new_freq * length / orig_freq)).long()
+    target_length = tensorplay.ceil(tensorplay.as_tensor(new_freq * length / orig_freq)).long()
     resampled = resampled[..., :target_length]
 
     # unpack batch
@@ -1490,7 +1489,7 @@ def resample(
     return resampled
 
 
-@torch.jit.unused
+@tensorplay.jit.unused
 def edit_distance(seq1: Sequence, seq2: Sequence) -> int:
     """
     Calculate the word level edit (Levenshtein) distance between two sequences.
@@ -1540,7 +1539,7 @@ def loudness(waveform: Tensor, sample_rate: int):
     .. properties:: TorchScript
 
     Args:
-        waveform(torch.Tensor): audio waveform of dimension `(..., channels, time)`
+        waveform(tensorplay.Tensor): audio waveform of dimension `(..., channels, time)`
         sample_rate (int): sampling rate of the waveform
 
     Returns:
@@ -1565,31 +1564,31 @@ def loudness(waveform: Tensor, sample_rate: int):
     waveform = highpass_biquad(waveform, sample_rate, 38.0, 0.5)
 
     # Compute the energy for each block
-    energy = torch.square(waveform).unfold(-1, gate_samples, step)
-    energy = torch.mean(energy, dim=-1)
+    energy = tensorplay.square(waveform).unfold(-1, gate_samples, step)
+    energy = tensorplay.mean(energy, dim=-1)
 
     # Compute channel-weighted summation
-    g = torch.tensor([1.0, 1.0, 1.0, 1.41, 1.41], dtype=waveform.dtype, device=waveform.device)
+    g = tensorplay.tensor([1.0, 1.0, 1.0, 1.41, 1.41], dtype=waveform.dtype, device=waveform.device)
     g = g[: energy.size(-2)]
 
-    energy_weighted = torch.sum(g.unsqueeze(-1) * energy, dim=-2)
-    loudness = -0.691 + 10 * torch.log10(energy_weighted)
+    energy_weighted = tensorplay.sum(g.unsqueeze(-1) * energy, dim=-2)
+    loudness = -0.691 + 10 * tensorplay.log10(energy_weighted)
 
     # Apply absolute gating of the blocks
     gated_blocks = loudness > gamma_abs
     gated_blocks = gated_blocks.unsqueeze(-2)
 
-    energy_filtered = torch.sum(gated_blocks * energy, dim=-1) / torch.count_nonzero(gated_blocks, dim=-1)
-    energy_weighted = torch.sum(g * energy_filtered, dim=-1)
-    gamma_rel = kweight_bias + 10 * torch.log10(energy_weighted) - 10
+    energy_filtered = tensorplay.sum(gated_blocks * energy, dim=-1) / tensorplay.count_nonzero(gated_blocks, dim=-1)
+    energy_weighted = tensorplay.sum(g * energy_filtered, dim=-1)
+    gamma_rel = kweight_bias + 10 * tensorplay.log10(energy_weighted) - 10
 
     # Apply relative gating of the blocks
-    gated_blocks = torch.logical_and(gated_blocks.squeeze(-2), loudness > gamma_rel.unsqueeze(-1))
+    gated_blocks = tensorplay.logical_and(gated_blocks.squeeze(-2), loudness > gamma_rel.unsqueeze(-1))
     gated_blocks = gated_blocks.unsqueeze(-2)
 
-    energy_filtered = torch.sum(gated_blocks * energy, dim=-1) / torch.count_nonzero(gated_blocks, dim=-1)
-    energy_weighted = torch.sum(g * energy_filtered, dim=-1)
-    LKFS = kweight_bias + 10 * torch.log10(energy_weighted)
+    energy_filtered = tensorplay.sum(gated_blocks * energy, dim=-1) / tensorplay.count_nonzero(gated_blocks, dim=-1)
+    energy_weighted = tensorplay.sum(g * energy_filtered, dim=-1)
+    LKFS = kweight_bias + 10 * tensorplay.log10(energy_weighted)
     return LKFS
 
 
@@ -1620,7 +1619,7 @@ def pitch_shift(
         hop_length (int or None, optional): Length of hop between STFT windows. If None, then
             ``win_length // 4`` is used (Default: ``None``).
         window (Tensor or None, optional): Window tensor that is applied/multiplied to each frame/window.
-            If None, then ``torch.hann_window(win_length)`` is used (Default: ``None``).
+            If None, then ``tensorplay.hann_window(win_length)`` is used (Default: ``None``).
 
 
     Returns:
@@ -1664,7 +1663,7 @@ def _stretch_waveform(
     if win_length is None:
         win_length = n_fft
     if window is None:
-        window = torch.hann_window(window_length=win_length, device=waveform.device)
+        window = tensorplay.hann_window(window_length=win_length, device=waveform.device)
 
     # pack batch
     shape = waveform.size()
@@ -1672,7 +1671,7 @@ def _stretch_waveform(
 
     ori_len = shape[-1]
     rate = 2.0 ** (-float(n_steps) / bins_per_octave)
-    spec_f = torch.stft(
+    spec_f = tensorplay.stft(
         input=waveform,
         n_fft=n_fft,
         hop_length=hop_length,
@@ -1684,10 +1683,10 @@ def _stretch_waveform(
         onesided=True,
         return_complex=True,
     )
-    phase_advance = torch.linspace(0, math.pi * hop_length, spec_f.shape[-2], device=spec_f.device)[..., None]
+    phase_advance = tensorplay.linspace(0, math.pi * hop_length, spec_f.shape[-2], device=spec_f.device)[..., None]
     spec_stretch = phase_vocoder(spec_f, rate, phase_advance)
     len_stretch = int(round(ori_len / rate))
-    waveform_stretch = torch.istft(
+    waveform_stretch = tensorplay.istft(
         spec_stretch, n_fft=n_fft, hop_length=hop_length, win_length=win_length, window=window, length=len_stretch
     )
     return waveform_stretch
@@ -1712,17 +1711,17 @@ def _fix_waveform_shape(
     if shift_len > ori_len:
         waveform_shift = waveform_shift[..., :ori_len]
     else:
-        waveform_shift = torch.nn.functional.pad(waveform_shift, [0, ori_len - shift_len])
+        waveform_shift = tensorplay.nn.functional.pad(waveform_shift, [0, ori_len - shift_len])
 
     # unpack batch
     waveform_shift = waveform_shift.view(shape[:-1] + waveform_shift.shape[-1:])
     return waveform_shift
 
 
-class RnntLoss(torch.autograd.Function):
+class RnntLoss(tensorplay.autograd.Function):
     @staticmethod
     def forward(ctx, *args):
-        output, saved = torch.ops.torchaudio.rnnt_loss_forward(*args)
+        output, saved = tensorplay.ops.tensorplay.audio.rnnt_loss_forward(*args)
         ctx.save_for_backward(saved)
         return output
 
@@ -1735,8 +1734,8 @@ class RnntLoss(torch.autograd.Function):
 
     @staticmethod
     def ts_apply(logits, targets, logit_lengths, target_lengths, blank: int, clamp: float, fused_log_softmax: bool):
-        if torch.jit.is_scripting():
-            output, saved = torch.ops.torchaudio.rnnt_loss_forward(
+        if tensorplay.jit.is_scripting():
+            output, saved = tensorplay.ops.tensorplay.audio.rnnt_loss_forward(
                 logits, targets, logit_lengths, target_lengths, blank, clamp, fused_log_softmax
             )
             return output
@@ -1809,21 +1808,21 @@ def psd(
     .. properties:: Autograd TorchScript
 
     Args:
-        specgram (torch.Tensor): Multi-channel complex-valued spectrum.
+        specgram (tensorplay.Tensor): Multi-channel complex-valued spectrum.
             Tensor with dimensions `(..., channel, freq, time)`.
-        mask (torch.Tensor or None, optional): Time-Frequency mask for normalization.
+        mask (tensorplay.Tensor or None, optional): Time-Frequency mask for normalization.
             Tensor with dimensions `(..., freq, time)`. (Default: ``None``)
         normalize (bool, optional): If ``True``, normalize the mask along the time dimension. (Default: ``True``)
         eps (float, optional): Value to add to the denominator in mask normalization. (Default: ``1e-15``)
 
     Returns:
-        torch.Tensor: The complex-valued PSD matrix of the input spectrum.
+        tensorplay.Tensor: The complex-valued PSD matrix of the input spectrum.
         Tensor with dimensions `(..., freq, channel, channel)`
     """
     specgram = specgram.transpose(-3, -2)  # shape (freq, channel, time)
     # outer product:
     # (..., ch_1, time) x (..., ch_2, time) -> (..., time, ch_1, ch_2)
-    psd = torch.einsum("...ct,...et->...tce", [specgram, specgram.conj()])
+    psd = tensorplay.einsum("...ct,...et->...tce", [specgram, specgram.conj()])
 
     if mask is not None:
         if mask.shape[:-1] != specgram.shape[:-2] or mask.shape[-1] != specgram.shape[-1]:
@@ -1841,11 +1840,11 @@ def psd(
     return psd
 
 
-def _compute_mat_trace(input: torch.Tensor, dim1: int = -1, dim2: int = -2) -> torch.Tensor:
+def _compute_mat_trace(input: tensorplay.Tensor, dim1: int = -1, dim2: int = -2) -> tensorplay.Tensor:
     r"""Compute the trace of a Tensor along ``dim1`` and ``dim2`` dimensions.
 
     Args:
-        input (torch.Tensor): Tensor with dimensions `(..., channel, channel)`.
+        input (tensorplay.Tensor): Tensor with dimensions `(..., channel, channel)`.
         dim1 (int, optional): The first dimension of the diagonal matrix.
             (Default: ``-1``)
         dim2 (int, optional): The second dimension of the diagonal matrix.
@@ -1858,15 +1857,15 @@ def _compute_mat_trace(input: torch.Tensor, dim1: int = -1, dim2: int = -2) -> t
         raise ValueError("The dimension of the tensor must be at least 2.")
     if input.shape[dim1] != input.shape[dim2]:
         raise ValueError("The size of ``dim1`` and ``dim2`` must be the same.")
-    input = torch.diagonal(input, 0, dim1=dim1, dim2=dim2)
+    input = tensorplay.diagonal(input, 0, dim1=dim1, dim2=dim2)
     return input.sum(dim=-1)
 
 
-def _tik_reg(mat: torch.Tensor, reg: float = 1e-7, eps: float = 1e-8) -> torch.Tensor:
+def _tik_reg(mat: tensorplay.Tensor, reg: float = 1e-7, eps: float = 1e-8) -> tensorplay.Tensor:
     """Perform Tikhonov regularization (only modifying real part).
 
     Args:
-        mat (torch.Tensor): Input matrix with dimensions `(..., channel, channel)`.
+        mat (tensorplay.Tensor): Input matrix with dimensions `(..., channel, channel)`.
         reg (float, optional): Regularization factor. (Default: 1e-8)
         eps (float, optional): Value to avoid the correlation matrix is all-zero. (Default: ``1e-8``)
 
@@ -1875,7 +1874,7 @@ def _tik_reg(mat: torch.Tensor, reg: float = 1e-7, eps: float = 1e-8) -> torch.T
     """
     # Add eps
     C = mat.size(-1)
-    eye = torch.eye(C, dtype=mat.dtype, device=mat.device)
+    eye = tensorplay.eye(C, dtype=mat.dtype, device=mat.device)
     epsilon = _compute_mat_trace(mat).real[..., None, None] * reg
     # in case that correlation_matrix is all-zero
     epsilon = epsilon + eps
@@ -1883,13 +1882,13 @@ def _tik_reg(mat: torch.Tensor, reg: float = 1e-7, eps: float = 1e-8) -> torch.T
     return mat
 
 
-def _assert_psd_matrices(psd_s: torch.Tensor, psd_n: torch.Tensor) -> None:
+def _assert_psd_matrices(psd_s: tensorplay.Tensor, psd_n: tensorplay.Tensor) -> None:
     """Assertion checks of the PSD matrices of target speech and noise.
 
     Args:
-        psd_s (torch.Tensor): The complex-valued power spectral density (PSD) matrix of target speech.
+        psd_s (tensorplay.Tensor): The complex-valued power spectral density (PSD) matrix of target speech.
             Tensor with dimensions `(..., freq, channel, channel)`.
-        psd_n (torch.Tensor): The complex-valued power spectral density (PSD) matrix of noise.
+        psd_n (tensorplay.Tensor): The complex-valued power spectral density (PSD) matrix of noise.
             Tensor with dimensions `(..., freq, channel, channel)`.
     """
     if psd_s.ndim < 3 or psd_n.ndim < 3:
@@ -1899,7 +1898,7 @@ def _assert_psd_matrices(psd_s: torch.Tensor, psd_n: torch.Tensor) -> None:
         )
     if not (psd_s.is_complex() and psd_n.is_complex()):
         raise TypeError(
-            "The type of psd_s and psd_n must be ``torch.cfloat`` or ``torch.cdouble``. "
+            "The type of psd_s and psd_n must be ``tensorplay.cfloat`` or ``tensorplay.cdouble``. "
             f"Found {psd_s.dtype} for psd_s and {psd_n.dtype} for psd_n."
         )
     if psd_s.shape != psd_n.shape:
@@ -1936,13 +1935,13 @@ def mvdr_weights_souden(
         {\text{Trace}({{{\bf{\Phi}_{\textbf{NN}}^{-1}}(f) \bf{\Phi}_{\textbf{SS}}}(f))}}\bm{u}
 
     Args:
-        psd_s (torch.Tensor): The complex-valued power spectral density (PSD) matrix of target speech.
+        psd_s (tensorplay.Tensor): The complex-valued power spectral density (PSD) matrix of target speech.
             Tensor with dimensions `(..., freq, channel, channel)`.
-        psd_n (torch.Tensor): The complex-valued power spectral density (PSD) matrix of noise.
+        psd_n (tensorplay.Tensor): The complex-valued power spectral density (PSD) matrix of noise.
             Tensor with dimensions `(..., freq, channel, channel)`.
-        reference_channel (int or torch.Tensor): Specifies the reference channel.
+        reference_channel (int or tensorplay.Tensor): Specifies the reference channel.
             If the dtype is ``int``, it represents the reference channel index.
-            If the dtype is ``torch.Tensor``, its shape is `(..., channel)`, where the ``channel`` dimension
+            If the dtype is ``tensorplay.Tensor``, its shape is `(..., channel)`, where the ``channel`` dimension
             is one-hot.
         diagonal_loading (bool, optional): If ``True``, enables applying diagonal loading to ``psd_n``.
             (Default: ``True``)
@@ -1952,21 +1951,21 @@ def mvdr_weights_souden(
             (Default: ``1e-8``)
 
     Returns:
-        torch.Tensor: The complex-valued MVDR beamforming weight matrix with dimensions `(..., freq, channel)`.
+        tensorplay.Tensor: The complex-valued MVDR beamforming weight matrix with dimensions `(..., freq, channel)`.
     """
     _assert_psd_matrices(psd_s, psd_n)
 
     if diagonal_loading:
         psd_n = _tik_reg(psd_n, reg=diag_eps)
-    numerator = torch.linalg.solve(psd_n, psd_s)  # psd_n.inv() @ psd_s
+    numerator = tensorplay.linalg.solve(psd_n, psd_s)  # psd_n.inv() @ psd_s
     # ws: (..., C, C) / (...,) -> (..., C, C)
     ws = numerator / (_compute_mat_trace(numerator)[..., None, None] + eps)
-    if torch.jit.isinstance(reference_channel, int):
+    if tensorplay.jit.isinstance(reference_channel, int):
         beamform_weights = ws[..., :, reference_channel]
-    elif torch.jit.isinstance(reference_channel, Tensor):
+    elif tensorplay.jit.isinstance(reference_channel, Tensor):
         reference_channel = reference_channel.to(psd_n.dtype)
         # h: (..., F, C_1, C_2) x (..., C_2) -> (..., F, C_1)
-        beamform_weights = torch.einsum("...c,...c->...", [ws, reference_channel[..., None, None, :]])
+        beamform_weights = tensorplay.einsum("...c,...c->...", [ws, reference_channel[..., None, None, :]])
     else:
         raise TypeError(f'Expected "int" or "Tensor" for reference_channel. Found: {type(reference_channel)}.')
 
@@ -2001,13 +2000,13 @@ def mvdr_weights_rtf(
     where :math:`(.)^{\mathsf{H}}` denotes the Hermitian Conjugate operation.
 
     Args:
-        rtf (torch.Tensor): The complex-valued RTF vector of target speech.
+        rtf (tensorplay.Tensor): The complex-valued RTF vector of target speech.
             Tensor with dimensions `(..., freq, channel)`.
-        psd_n (torch.Tensor): The complex-valued power spectral density (PSD) matrix of noise.
+        psd_n (tensorplay.Tensor): The complex-valued power spectral density (PSD) matrix of noise.
             Tensor with dimensions `(..., freq, channel, channel)`.
-        reference_channel (int or torch.Tensor): Specifies the reference channel.
+        reference_channel (int or tensorplay.Tensor): Specifies the reference channel.
             If the dtype is ``int``, it represents the reference channel index.
-            If the dtype is ``torch.Tensor``, its shape is `(..., channel)`, where the ``channel`` dimension
+            If the dtype is ``tensorplay.Tensor``, its shape is `(..., channel)`, where the ``channel`` dimension
             is one-hot.
         diagonal_loading (bool, optional): If ``True``, enables applying diagonal loading to ``psd_n``.
             (Default: ``True``)
@@ -2017,7 +2016,7 @@ def mvdr_weights_rtf(
             (Default: ``1e-8``)
 
     Returns:
-        torch.Tensor: The complex-valued MVDR beamforming weight matrix with dimensions `(..., freq, channel)`.
+        tensorplay.Tensor: The complex-valued MVDR beamforming weight matrix with dimensions `(..., freq, channel)`.
     """
     if rtf.ndim < 2:
         raise ValueError(f"Expected at least 2D Tensor (..., freq, channel) for rtf. Found {rtf.shape}.")
@@ -2025,7 +2024,7 @@ def mvdr_weights_rtf(
         raise ValueError(f"Expected at least 3D Tensor (..., freq, channel, channel) for psd_n. Found {psd_n.shape}.")
     if not (rtf.is_complex() and psd_n.is_complex()):
         raise TypeError(
-            "The type of rtf and psd_n must be ``torch.cfloat`` or ``torch.cdouble``. "
+            "The type of rtf and psd_n must be ``tensorplay.cfloat`` or ``tensorplay.cdouble``. "
             f"Found {rtf.dtype} for rtf and {psd_n.dtype} for psd_n."
         )
     if rtf.shape != psd_n.shape[:-1]:
@@ -2039,17 +2038,17 @@ def mvdr_weights_rtf(
     if diagonal_loading:
         psd_n = _tik_reg(psd_n, reg=diag_eps)
     # numerator = psd_n.inv() @ stv
-    numerator = torch.linalg.solve(psd_n, rtf.unsqueeze(-1)).squeeze(-1)  # (..., freq, channel)
+    numerator = tensorplay.linalg.solve(psd_n, rtf.unsqueeze(-1)).squeeze(-1)  # (..., freq, channel)
     # denominator = stv^H @ psd_n.inv() @ stv
-    denominator = torch.einsum("...d,...d->...", [rtf.conj(), numerator])
+    denominator = tensorplay.einsum("...d,...d->...", [rtf.conj(), numerator])
     beamform_weights = numerator / (denominator.real.unsqueeze(-1) + eps)
     # normalize the numerator
     if reference_channel is not None:
-        if torch.jit.isinstance(reference_channel, int):
+        if tensorplay.jit.isinstance(reference_channel, int):
             scale = rtf[..., reference_channel].conj()
-        elif torch.jit.isinstance(reference_channel, Tensor):
+        elif tensorplay.jit.isinstance(reference_channel, Tensor):
             reference_channel = reference_channel.to(psd_n.dtype)
-            scale = torch.einsum("...c,...c->...", [rtf.conj(), reference_channel[..., None, :]])
+            scale = tensorplay.einsum("...c,...c->...", [rtf.conj(), reference_channel[..., None, :]])
         else:
             raise TypeError(f'Expected "int" or "Tensor" for reference_channel. Found: {type(reference_channel)}.')
 
@@ -2074,10 +2073,10 @@ def rtf_evd(psd_s: Tensor) -> Tensor:
         Tensor of dimension `(..., freq, channel)`
     """
     if not psd_s.is_complex():
-        raise TypeError(f"The type of psd_s must be ``torch.cfloat`` or ``torch.cdouble``. Found {psd_s.dtype}.")
+        raise TypeError(f"The type of psd_s must be ``tensorplay.cfloat`` or ``tensorplay.cdouble``. Found {psd_s.dtype}.")
     if psd_s.shape[-1] != psd_s.shape[-2]:
         raise ValueError(f"The last two dimensions of psd_s should be the same. Found {psd_s.shape}.")
-    _, v = torch.linalg.eigh(psd_s)  # v is sorted along with eigenvalues in ascending order
+    _, v = tensorplay.linalg.eigh(psd_s)  # v is sorted along with eigenvalues in ascending order
     rtf = v[..., -1]  # choose the eigenvector with max eigenvalue
     return rtf
 
@@ -2097,13 +2096,13 @@ def rtf_power(
     .. properties:: Autograd TorchScript
 
     Args:
-        psd_s (torch.Tensor): The complex-valued power spectral density (PSD) matrix of target speech.
+        psd_s (tensorplay.Tensor): The complex-valued power spectral density (PSD) matrix of target speech.
             Tensor with dimensions `(..., freq, channel, channel)`.
-        psd_n (torch.Tensor): The complex-valued power spectral density (PSD) matrix of noise.
+        psd_n (tensorplay.Tensor): The complex-valued power spectral density (PSD) matrix of noise.
             Tensor with dimensions `(..., freq, channel, channel)`.
-        reference_channel (int or torch.Tensor): Specifies the reference channel.
+        reference_channel (int or tensorplay.Tensor): Specifies the reference channel.
             If the dtype is ``int``, it represents the reference channel index.
-            If the dtype is ``torch.Tensor``, its shape is `(..., channel)`, where the ``channel`` dimension
+            If the dtype is ``tensorplay.Tensor``, its shape is `(..., channel)`, where the ``channel`` dimension
             is one-hot.
         diagonal_loading (bool, optional): If ``True``, enables applying diagonal loading to ``psd_n``.
             (Default: ``True``)
@@ -2111,7 +2110,7 @@ def rtf_power(
             It is only effective when ``diagonal_loading`` is set to ``True``. (Default: ``1e-7``)
 
     Returns:
-        torch.Tensor: The estimated complex-valued RTF of target speech.
+        tensorplay.Tensor: The estimated complex-valued RTF of target speech.
         Tensor of dimension `(..., freq, channel)`.
     """
     _assert_psd_matrices(psd_s, psd_n)
@@ -2122,12 +2121,12 @@ def rtf_power(
     if diagonal_loading:
         psd_n = _tik_reg(psd_n, reg=diag_eps)
     # phi is regarded as the first iteration
-    phi = torch.linalg.solve(psd_n, psd_s)  # psd_n.inv() @ psd_s
-    if torch.jit.isinstance(reference_channel, int):
+    phi = tensorplay.linalg.solve(psd_n, psd_s)  # psd_n.inv() @ psd_s
+    if tensorplay.jit.isinstance(reference_channel, int):
         rtf = phi[..., reference_channel]
-    elif torch.jit.isinstance(reference_channel, Tensor):
+    elif tensorplay.jit.isinstance(reference_channel, Tensor):
         reference_channel = reference_channel.to(psd_n.dtype)
-        rtf = torch.einsum("...c,...c->...", [phi, reference_channel[..., None, None, :]])
+        rtf = tensorplay.einsum("...c,...c->...", [phi, reference_channel[..., None, None, :]])
     else:
         raise TypeError(f'Expected "int" or "Tensor" for reference_channel. Found: {type(reference_channel)}.')
     rtf = rtf.unsqueeze(-1)  # (..., freq, channel, 1)
@@ -2136,12 +2135,12 @@ def rtf_power(
         # because the `phi` above and `torch.matmul(psd_s, rtf)` are regarded as
         # two iterations.
         for _ in range(n_iter - 2):
-            rtf = torch.matmul(phi, rtf)
-        rtf = torch.matmul(psd_s, rtf)
+            rtf = tensorplay.matmul(phi, rtf)
+        rtf = tensorplay.matmul(psd_s, rtf)
     else:
         # if there is only one iteration, the rtf is the psd_s[..., referenc_channel]
         # which is psd_n @ phi @ ref_channel
-        rtf = torch.matmul(psd_n, rtf)
+        rtf = tensorplay.matmul(psd_n, rtf)
     return rtf.squeeze(-1)
 
 
@@ -2177,16 +2176,16 @@ def apply_beamforming(beamform_weights: Tensor, specgram: Tensor) -> Tensor:
 
     if not (beamform_weights.is_complex() and specgram.is_complex()):
         raise TypeError(
-            "The type of beamform_weights and specgram must be ``torch.cfloat`` or ``torch.cdouble``. "
+            "The type of beamform_weights and specgram must be ``tensorplay.cfloat`` or ``tensorplay.cdouble``. "
             f"Found {beamform_weights.dtype} for beamform_weights and {specgram.dtype} for specgram."
         )
 
     # (..., freq, channel) x (..., channel, freq, time) -> (..., freq, time)
-    specgram_enhanced = torch.einsum("...fc,...cft->...ft", [beamform_weights.conj(), specgram])
+    specgram_enhanced = tensorplay.einsum("...fc,...cft->...ft", [beamform_weights.conj(), specgram])
     return specgram_enhanced
 
 
-def _check_shape_compatible(x: torch.Tensor, y: torch.Tensor) -> None:
+def _check_shape_compatible(x: tensorplay.Tensor, y: tensorplay.Tensor) -> None:
     if x.ndim != y.ndim:
         raise ValueError(f"The operands must be the same dimension (got {x.ndim} and {y.ndim}).")
 
@@ -2204,7 +2203,7 @@ def _check_convolve_mode(mode: str) -> None:
         raise ValueError(f"Unrecognized mode value '{mode}'. Please specify one of {valid_convolve_modes}.")
 
 
-def _apply_convolve_mode(conv_result: torch.Tensor, x_length: int, y_length: int, mode: str) -> torch.Tensor:
+def _apply_convolve_mode(conv_result: tensorplay.Tensor, x_length: int, y_length: int, mode: str) -> tensorplay.Tensor:
     valid_convolve_modes = ["full", "valid", "same"]
     if mode == "full":
         return conv_result
@@ -2219,11 +2218,11 @@ def _apply_convolve_mode(conv_result: torch.Tensor, x_length: int, y_length: int
         raise ValueError(f"Unrecognized mode value '{mode}'. Please specify one of {valid_convolve_modes}.")
 
 
-def fftconvolve(x: torch.Tensor, y: torch.Tensor, mode: str = "full") -> torch.Tensor:
+def fftconvolve(x: tensorplay.Tensor, y: tensorplay.Tensor, mode: str = "full") -> tensorplay.Tensor:
     r"""
     Convolves inputs along their last dimension using FFT. For inputs with large last dimensions, this function
     is generally much faster than :meth:`convolve`.
-    Note that, in contrast to :meth:`torch.nn.functional.conv1d`, which actually applies the valid cross-correlation
+    Note that, in contrast to :meth:`tensorplay.nn.functional.conv1d`, which actually applies the valid cross-correlation
     operator, this function applies the true `convolution`_ operator.
     Also note that this function can only output float tensors (int tensor inputs will be cast to float).
 
@@ -2232,8 +2231,8 @@ def fftconvolve(x: torch.Tensor, y: torch.Tensor, mode: str = "full") -> torch.T
     .. properties:: Autograd TorchScript
 
     Args:
-        x (torch.Tensor): First convolution operand, with shape `(..., N)`.
-        y (torch.Tensor): Second convolution operand, with shape `(..., M)`
+        x (tensorplay.Tensor): First convolution operand, with shape `(..., N)`.
+        y (tensorplay.Tensor): Second convolution operand, with shape `(..., M)`
             (leading dimensions must be broadcast-able with those of ``x``).
         mode (str, optional): Must be one of ("full", "valid", "same").
 
@@ -2243,7 +2242,7 @@ def fftconvolve(x: torch.Tensor, y: torch.Tensor, mode: str = "full") -> torch.T
             * "same": Returns the center segment of the full convolution result, with shape `(..., N)`.
 
     Returns:
-        torch.Tensor: Result of convolving ``x`` and ``y``, with shape `(..., L)`, where
+        tensorplay.Tensor: Result of convolving ``x`` and ``y``, with shape `(..., L)`, where
         the leading dimensions match those of ``x`` and `L` is dictated by ``mode``.
 
     .. _convolution:
@@ -2253,15 +2252,15 @@ def fftconvolve(x: torch.Tensor, y: torch.Tensor, mode: str = "full") -> torch.T
     _check_convolve_mode(mode)
 
     n = x.size(-1) + y.size(-1) - 1
-    fresult = torch.fft.rfft(x, n=n) * torch.fft.rfft(y, n=n)
-    result = torch.fft.irfft(fresult, n=n)
+    fresult = tensorplay.fft.rfft(x, n=n) * tensorplay.fft.rfft(y, n=n)
+    result = tensorplay.fft.irfft(fresult, n=n)
     return _apply_convolve_mode(result, x.size(-1), y.size(-1), mode)
 
 
-def convolve(x: torch.Tensor, y: torch.Tensor, mode: str = "full") -> torch.Tensor:
+def convolve(x: tensorplay.Tensor, y: tensorplay.Tensor, mode: str = "full") -> tensorplay.Tensor:
     r"""
     Convolves inputs along their last dimension using the direct method.
-    Note that, in contrast to :meth:`torch.nn.functional.conv1d`, which actually applies the valid cross-correlation
+    Note that, in contrast to :meth:`tensorplay.nn.functional.conv1d`, which actually applies the valid cross-correlation
     operator, this function applies the true `convolution`_ operator.
 
     .. devices:: CPU CUDA
@@ -2269,8 +2268,8 @@ def convolve(x: torch.Tensor, y: torch.Tensor, mode: str = "full") -> torch.Tens
     .. properties:: Autograd TorchScript
 
     Args:
-        x (torch.Tensor): First convolution operand, with shape `(..., N)`.
-        y (torch.Tensor): Second convolution operand, with shape `(..., M)`
+        x (tensorplay.Tensor): First convolution operand, with shape `(..., N)`.
+        y (tensorplay.Tensor): Second convolution operand, with shape `(..., M)`
             (leading dimensions must be broadcast-able with those of ``x``).
         mode (str, optional): Must be one of ("full", "valid", "same").
 
@@ -2280,7 +2279,7 @@ def convolve(x: torch.Tensor, y: torch.Tensor, mode: str = "full") -> torch.Tens
             * "same": Returns the center segment of the full convolution result, with shape `(..., N)`.
 
     Returns:
-        torch.Tensor: Result of convolving ``x`` and ``y``, with shape `(..., L)`, where
+        tensorplay.Tensor: Result of convolving ``x`` and ``y``, with shape `(..., L)`, where
         the leading dimensions match those of ``x`` and `L` is dictated by ``mode``.
 
     .. _convolution:
@@ -2299,10 +2298,10 @@ def convolve(x: torch.Tensor, y: torch.Tensor, mode: str = "full") -> torch.Tens
         x = x.broadcast_to(new_shape + [x.shape[-1]])
         y = y.broadcast_to(new_shape + [y.shape[-1]])
 
-    num_signals = torch.tensor(x.shape[:-1]).prod()
+    num_signals = tensorplay.tensor(x.shape[:-1]).prod()
     reshaped_x = x.reshape((int(num_signals), x.size(-1)))
     reshaped_y = y.reshape((int(num_signals), y.size(-1)))
-    output = torch.nn.functional.conv1d(
+    output = tensorplay.nn.functional.conv1d(
         input=reshaped_x,
         weight=reshaped_y.flip(-1).unsqueeze(1),
         stride=1,
@@ -2315,8 +2314,8 @@ def convolve(x: torch.Tensor, y: torch.Tensor, mode: str = "full") -> torch.Tens
 
 
 def add_noise(
-    waveform: torch.Tensor, noise: torch.Tensor, snr: torch.Tensor, lengths: Optional[torch.Tensor] = None
-) -> torch.Tensor:
+    waveform: tensorplay.Tensor, noise: tensorplay.Tensor, snr: tensorplay.Tensor, lengths: Optional[tensorplay.Tensor] = None
+) -> tensorplay.Tensor:
     r"""Scales and adds noise to waveform per signal-to-noise ratio.
 
     Specifically, for each pair of waveform vector :math:`x \in \mathbb{R}^L` and noise vector
@@ -2333,22 +2332,22 @@ def add_noise(
     with :math:`\text{SNR}` being the desired signal-to-noise ratio between :math:`x` and :math:`n`, in dB.
 
     Note that this function broadcasts singleton leading dimensions in its inputs in a manner that is
-    consistent with the above formulae and PyTorch's broadcasting semantics.
+    consistent with the above formulae and TensorPlay's broadcasting semantics.
 
     .. devices:: CPU CUDA
 
     .. properties:: Autograd TorchScript
 
     Args:
-        waveform (torch.Tensor): Input waveform, with shape `(..., L)`.
-        noise (torch.Tensor): Noise, with shape `(..., L)` (same shape as ``waveform``).
-        snr (torch.Tensor): Signal-to-noise ratios in dB, with shape `(...,)`.
-        lengths (torch.Tensor or None, optional): Valid lengths of signals in ``waveform`` and ``noise``, with shape
+        waveform (tensorplay.Tensor): Input waveform, with shape `(..., L)`.
+        noise (tensorplay.Tensor): Noise, with shape `(..., L)` (same shape as ``waveform``).
+        snr (tensorplay.Tensor): Signal-to-noise ratios in dB, with shape `(...,)`.
+        lengths (tensorplay.Tensor or None, optional): Valid lengths of signals in ``waveform`` and ``noise``, with shape
             `(...,)` (leading dimensions must match those of ``waveform``). If ``None``, all elements in ``waveform``
             and ``noise`` are treated as valid. (Default: ``None``)
 
     Returns:
-        torch.Tensor: Result of scaling and adding ``noise`` to ``waveform``, with shape `(..., L)`
+        tensorplay.Tensor: Result of scaling and adding ``noise`` to ``waveform``, with shape `(..., L)`
         (same shape as ``waveform``).
     """
 
@@ -2362,7 +2361,7 @@ def add_noise(
 
     # compute scale
     if lengths is not None:
-        mask = torch.arange(0, L, device=lengths.device).expand(waveform.shape) < lengths.unsqueeze(
+        mask = tensorplay.arange(0, L, device=lengths.device).expand(waveform.shape) < lengths.unsqueeze(
             -1
         )  # (*, L) < (*, 1) = (*, L)
         masked_waveform = waveform * mask
@@ -2371,9 +2370,9 @@ def add_noise(
         masked_waveform = waveform
         masked_noise = noise
 
-    energy_signal = torch.linalg.vector_norm(masked_waveform, ord=2, dim=-1) ** 2  # (*,)
-    energy_noise = torch.linalg.vector_norm(masked_noise, ord=2, dim=-1) ** 2  # (*,)
-    original_snr_db = 10 * (torch.log10(energy_signal) - torch.log10(energy_noise))
+    energy_signal = tensorplay.linalg.vector_norm(masked_waveform, ord=2, dim=-1) ** 2  # (*,)
+    energy_noise = tensorplay.linalg.vector_norm(masked_noise, ord=2, dim=-1) ** 2  # (*,)
+    original_snr_db = 10 * (tensorplay.log10(energy_signal) - tensorplay.log10(energy_noise))
     scale = 10 ** ((original_snr_db - snr) / 20.0)  # (*,)
 
     # scale noise
@@ -2383,8 +2382,8 @@ def add_noise(
 
 
 def speed(
-    waveform: torch.Tensor, orig_freq: int, factor: float, lengths: Optional[torch.Tensor] = None
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    waveform: tensorplay.Tensor, orig_freq: int, factor: float, lengths: Optional[tensorplay.Tensor] = None
+) -> Tuple[tensorplay.Tensor, Optional[tensorplay.Tensor]]:
     r"""Adjusts waveform speed.
 
     .. devices:: CPU CUDA
@@ -2392,18 +2391,18 @@ def speed(
     .. properties:: Autograd TorchScript
 
     Args:
-        waveform (torch.Tensor): Input signals, with shape `(..., time)`.
+        waveform (tensorplay.Tensor): Input signals, with shape `(..., time)`.
         orig_freq (int): Original frequency of the signals in ``waveform``.
         factor (float): Factor by which to adjust speed of input. Values greater than 1.0
             compress ``waveform`` in time, whereas values less than 1.0 stretch ``waveform`` in time.
-        lengths (torch.Tensor or None, optional): Valid lengths of signals in ``waveform``, with shape `(...)`.
+        lengths (tensorplay.Tensor or None, optional): Valid lengths of signals in ``waveform``, with shape `(...)`.
             If ``None``, all elements in ``waveform`` are treated as valid. (Default: ``None``)
 
     Returns:
-        (torch.Tensor, torch.Tensor or None):
-            torch.Tensor
+        (tensorplay.Tensor, tensorplay.Tensor or None):
+            tensorplay.Tensor
                 Speed-adjusted waveform, with shape `(..., new_time).`
-            torch.Tensor or None
+            tensorplay.Tensor or None
                 If ``lengths`` is not ``None``, valid lengths of signals in speed-adjusted waveform,
                 with shape `(...)`; otherwise, ``None``.
     """
@@ -2418,12 +2417,12 @@ def speed(
     if lengths is None:
         out_lengths = None
     else:
-        out_lengths = torch.ceil(lengths * target_sample_rate / source_sample_rate).to(lengths.dtype)
+        out_lengths = tensorplay.ceil(lengths * target_sample_rate / source_sample_rate).to(lengths.dtype)
 
     return resample(waveform, source_sample_rate, target_sample_rate), out_lengths
 
 
-def preemphasis(waveform, coeff: float = 0.97) -> torch.Tensor:
+def preemphasis(waveform, coeff: float = 0.97) -> tensorplay.Tensor:
     r"""Pre-emphasizes a waveform along its last dimension, i.e.
     for each signal :math:`x` in ``waveform``, computes
     output :math:`y` as
@@ -2436,19 +2435,19 @@ def preemphasis(waveform, coeff: float = 0.97) -> torch.Tensor:
     .. properties:: Autograd TorchScript
 
     Args:
-        waveform (torch.Tensor): Waveform, with shape `(..., N)`.
+        waveform (tensorplay.Tensor): Waveform, with shape `(..., N)`.
         coeff (float, optional): Pre-emphasis coefficient. Typically between 0.0 and 1.0.
             (Default: 0.97)
 
     Returns:
-        torch.Tensor: Pre-emphasized waveform, with shape `(..., N)`.
+        tensorplay.Tensor: Pre-emphasized waveform, with shape `(..., N)`.
     """
     waveform = waveform.clone()
     waveform[..., 1:] -= coeff * waveform[..., :-1]
     return waveform
 
 
-def deemphasis(waveform, coeff: float = 0.97) -> torch.Tensor:
+def deemphasis(waveform, coeff: float = 0.97) -> tensorplay.Tensor:
     r"""De-emphasizes a waveform along its last dimension.
     Inverse of :meth:`preemphasis`. Concretely, for each signal
     :math:`x` in ``waveform``, computes output :math:`y` as
@@ -2461,16 +2460,16 @@ def deemphasis(waveform, coeff: float = 0.97) -> torch.Tensor:
     .. properties:: Autograd TorchScript
 
     Args:
-        waveform (torch.Tensor): Waveform, with shape `(..., N)`.
+        waveform (tensorplay.Tensor): Waveform, with shape `(..., N)`.
         coeff (float, optional): De-emphasis coefficient. Typically between 0.0 and 1.0.
             (Default: 0.97)
 
     Returns:
-        torch.Tensor: De-emphasized waveform, with shape `(..., N)`.
+        tensorplay.Tensor: De-emphasized waveform, with shape `(..., N)`.
     """
-    a_coeffs = torch.tensor([1.0, -coeff], dtype=waveform.dtype, device=waveform.device)
-    b_coeffs = torch.tensor([1.0, 0.0], dtype=waveform.dtype, device=waveform.device)
-    return torchaudio.functional.filtering.lfilter(waveform, a_coeffs=a_coeffs, b_coeffs=b_coeffs)
+    a_coeffs = tensorplay.tensor([1.0, -coeff], dtype=waveform.dtype, device=waveform.device)
+    b_coeffs = tensorplay.tensor([1.0, 0.0], dtype=waveform.dtype, device=waveform.device)
+    return tensorplay.audio.functional.filtering.lfilter(waveform, a_coeffs=a_coeffs, b_coeffs=b_coeffs)
 
 
 def frechet_distance(mu_x, sigma_x, mu_y, sigma_y):
@@ -2484,13 +2483,13 @@ def frechet_distance(mu_x, sigma_x, mu_y, sigma_y):
         + \text{Tr}\left( \Sigma_X + \Sigma_Y - 2 \sqrt{\Sigma_X \Sigma_Y} \right)
 
     Args:
-        mu_x (torch.Tensor): mean :math:`\mu_X` of multivariate Gaussian :math:`X`, with shape `(N,)`.
-        sigma_x (torch.Tensor): covariance matrix :math:`\Sigma_X` of :math:`X`, with shape `(N, N)`.
-        mu_y (torch.Tensor): mean :math:`\mu_Y` of multivariate Gaussian :math:`Y`, with shape `(N,)`.
-        sigma_y (torch.Tensor): covariance matrix :math:`\Sigma_Y` of :math:`Y`, with shape `(N, N)`.
+        mu_x (tensorplay.Tensor): mean :math:`\mu_X` of multivariate Gaussian :math:`X`, with shape `(N,)`.
+        sigma_x (tensorplay.Tensor): covariance matrix :math:`\Sigma_X` of :math:`X`, with shape `(N, N)`.
+        mu_y (tensorplay.Tensor): mean :math:`\mu_Y` of multivariate Gaussian :math:`Y`, with shape `(N,)`.
+        sigma_y (tensorplay.Tensor): covariance matrix :math:`\Sigma_Y` of :math:`Y`, with shape `(N, N)`.
 
     Returns:
-        torch.Tensor: the Fréchet distance between :math:`X` and :math:`Y`.
+        tensorplay.Tensor: the Fréchet distance between :math:`X` and :math:`Y`.
     """
     if len(mu_x.size()) != 1:
         raise ValueError(f"Input mu_x must be one-dimensional; got dimension {len(mu_x.size())}.")
@@ -2507,5 +2506,5 @@ def frechet_distance(mu_x, sigma_x, mu_y, sigma_y):
 
     a = (mu_x - mu_y).square().sum()
     b = sigma_x.trace() + sigma_y.trace()
-    c = torch.linalg.eigvals(sigma_x @ sigma_y).sqrt().real.sum()
+    c = tensorplay.linalg.eigvals(sigma_x @ sigma_y).sqrt().real.sum()
     return a + b - 2 * c

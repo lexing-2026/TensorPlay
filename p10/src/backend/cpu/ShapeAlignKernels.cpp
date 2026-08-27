@@ -111,7 +111,23 @@ Tensor expand_impl(const Tensor& self, const std::vector<int64_t>& size) {
             } else if (size_dim == new_sizes[i]) {
                 new_strides[i] = stride_dim;
             } else {
-                TP_THROW(RuntimeError, "expand(): incompatible dimensions");
+                std::string tgt = "[";
+                std::string own = "[";
+                for (int64_t d = 0; d < new_ndim; ++d) {
+                    if (d) { tgt += ", "; }
+                    tgt += std::to_string(new_sizes[d]);
+                }
+                const auto own_sizes = static_cast<std::vector<int64_t>>(self.shape());
+                for (size_t d = 0; d < own_sizes.size(); ++d) {
+                    if (d) { own += ", "; }
+                    own += std::to_string(own_sizes[d]);
+                }
+                tgt += "]";
+                own += "]";
+                TP_THROW(RuntimeError, "The expanded size of the tensor (", new_sizes[i],
+                         ") must match the existing size (", size_dim,
+                         ") at non-singleton dimension ", i,
+                         ".  Target sizes: ", tgt, ".  Tensor sizes: ", own);
             }
         } else {
             if (new_sizes[i] == -1) TP_THROW(RuntimeError, "expand(): invalid size -1");

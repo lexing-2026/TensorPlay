@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Union
 
 import numpy as np
-import tensorplay as torch
+import tensorplay as tensorplay
 from PIL import Image
 
 from ..io import decode_png, read_file
@@ -49,7 +49,7 @@ class FlowDataset(ABC, VisionDataset):
         self._image_list: list[list[str]] = []
         self._loader = loader
 
-    def _read_img(self, file_name: str) -> Union[Image.Image, torch.Tensor]:
+    def _read_img(self, file_name: str) -> Union[Image.Image, tensorplay.Tensor]:
         return self._loader(file_name)
 
     @abstractmethod
@@ -83,8 +83,8 @@ class FlowDataset(ABC, VisionDataset):
     def __len__(self) -> int:
         return len(self._image_list)
 
-    def __rmul__(self, v: int) -> torch.utils.data.ConcatDataset:
-        return torch.utils.data.ConcatDataset([self] * v)
+    def __rmul__(self, v: int) -> tensorplay.utils.data.ConcatDataset:
+        return tensorplay.utils.data.ConcatDataset([self] * v)
 
 
 class Sintel(FlowDataset):
@@ -125,10 +125,10 @@ class Sintel(FlowDataset):
         transforms (callable, optional): A function/transform that takes in
             ``img1, img2, flow, valid_flow_mask`` and returns a transformed version.
             ``valid_flow_mask`` is expected for consistency with other datasets which
-            return a built-in valid mask, such as :class:`~torchvision.datasets.KittiFlow`.
+            return a built-in valid mask, such as :class:`~tensorplay.vision.datasets.KittiFlow`.
         loader (callable, optional): A function to load an image given its path.
             By default, it uses PIL as its image loader, but users could also pass in
-            ``torchvision.io.decode_image`` for decoding image data into tensors directly.
+            ``tensorplay.vision.io.decode_image`` for decoding image data into tensors directly.
     """
 
     def __init__(
@@ -198,7 +198,7 @@ class KittiFlow(FlowDataset):
             ``img1, img2, flow, valid_flow_mask`` and returns a transformed version.
         loader (callable, optional): A function to load an image given its path.
             By default, it uses PIL as its image loader, but users could also pass in
-            ``torchvision.io.decode_image`` for decoding image data into tensors directly.
+            ``tensorplay.vision.io.decode_image`` for decoding image data into tensors directly.
     """
 
     _has_builtin_flow_mask = True
@@ -271,7 +271,7 @@ class FlyingChairs(FlowDataset):
         transforms (callable, optional): A function/transform that takes in
             ``img1, img2, flow, valid_flow_mask`` and returns a transformed version.
             ``valid_flow_mask`` is expected for consistency with other datasets which
-            return a built-in valid mask, such as :class:`~torchvision.datasets.KittiFlow`.
+            return a built-in valid mask, such as :class:`~tensorplay.vision.datasets.KittiFlow`.
     """
 
     def __init__(self, root: Union[str, Path], split: str = "train", transforms: Optional[Callable] = None) -> None:
@@ -342,10 +342,10 @@ class FlyingThings3D(FlowDataset):
         transforms (callable, optional): A function/transform that takes in
             ``img1, img2, flow, valid_flow_mask`` and returns a transformed version.
             ``valid_flow_mask`` is expected for consistency with other datasets which
-            return a built-in valid mask, such as :class:`~torchvision.datasets.KittiFlow`.
+            return a built-in valid mask, such as :class:`~tensorplay.vision.datasets.KittiFlow`.
         loader (callable, optional): A function to load an image given its path.
             By default, it uses PIL as its image loader, but users could also pass in
-            ``torchvision.io.decode_image`` for decoding image data into tensors directly.
+            ``tensorplay.vision.io.decode_image`` for decoding image data into tensors directly.
     """
 
     def __init__(
@@ -439,7 +439,7 @@ class HD1K(FlowDataset):
             ``img1, img2, flow, valid_flow_mask`` and returns a transformed version.
         loader (callable, optional): A function to load an image given its path.
             By default, it uses PIL as its image loader, but users could also pass in
-            ``torchvision.io.decode_image`` for decoding image data into tensors directly.
+            ``tensorplay.vision.io.decode_image`` for decoding image data into tensors directly.
     """
 
     _has_builtin_flow_mask = True
@@ -513,7 +513,7 @@ def _read_flo(file_name: str) -> np.ndarray:
 
 def _read_16bits_png_with_flow_and_valid_mask(file_name: str) -> tuple[np.ndarray, np.ndarray]:
 
-    flow_and_valid = decode_png(read_file(file_name)).to(torch.float32)
+    flow_and_valid = decode_png(read_file(file_name)).to(tensorplay.float32)
     flow, valid_flow_mask = flow_and_valid[:2, :, :], flow_and_valid[2, :, :]
     flow = (flow - 2**15) / 64  # This conversion is explained somewhere on the kitti archive
     valid_flow_mask = valid_flow_mask.bool()

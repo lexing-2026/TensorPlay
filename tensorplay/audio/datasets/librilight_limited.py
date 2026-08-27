@@ -2,12 +2,11 @@ import os
 from pathlib import Path
 from typing import List, Tuple, Union
 
-import tensorplay.audio as torchaudio
 from tensorplay import Tensor
-from torch.utils.data import Dataset
+from tensorplay.utils.data import Dataset
 from tensorplay.hub import download_url_to_file
-from torchaudio.datasets.librispeech import _get_librispeech_metadata
-from torchaudio.datasets.utils import _extract_tar
+from tensorplay.audio.datasets.librispeech import _get_librispeech_metadata
+from tensorplay.audio.datasets.utils import _extract_tar
 
 
 _ARCHIVE_NAME = "librispeech_finetuning"
@@ -104,7 +103,7 @@ class LibriLightLimited(Dataset):
         """
         file_path, fileid = self._fileids_paths[n]
         metadata = _get_librispeech_metadata(fileid, self._path, file_path, self._ext_audio, self._ext_txt)
-        waveform, _ = torchaudio.load(os.path.join(self._path, metadata[0]))
+        waveform, _ = tensorplay.audio.load(os.path.join(self._path, metadata[0]))
         return (waveform,) + metadata[1:]
 
     def __len__(self) -> int:

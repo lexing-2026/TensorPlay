@@ -1,21 +1,21 @@
 from typing import Optional, Tuple
 
-import tensorplay as torch
+import tensorplay as tensorplay
 
 
 __all__ = ["Conformer"]
 
 
-def _lengths_to_padding_mask(lengths: torch.Tensor) -> torch.Tensor:
+def _lengths_to_padding_mask(lengths: tensorplay.Tensor) -> tensorplay.Tensor:
     batch_size = lengths.shape[0]
-    max_length = int(torch.max(lengths).item())
-    padding_mask = torch.arange(max_length, device=lengths.device, dtype=lengths.dtype).expand(
+    max_length = int(tensorplay.max(lengths).item())
+    padding_mask = tensorplay.arange(max_length, device=lengths.device, dtype=lengths.dtype).expand(
         batch_size, max_length
     ) >= lengths.unsqueeze(1)
     return padding_mask
 
 
-class _ConvolutionModule(torch.nn.Module):
+class _ConvolutionModule(tensorplay.nn.Module):
     r"""Conformer convolution module.
 
     Args:
@@ -39,9 +39,9 @@ class _ConvolutionModule(torch.nn.Module):
         super().__init__()
         if (depthwise_kernel_size - 1) % 2 != 0:
             raise ValueError("depthwise_kernel_size must be odd to achieve 'SAME' padding.")
-        self.layer_norm = torch.nn.LayerNorm(input_dim)
-        self.sequential = torch.nn.Sequential(
-            torch.nn.Conv1d(
+        self.layer_norm = tensorplay.nn.LayerNorm(input_dim)
+        self.sequential = tensorplay.nn.Sequential(
+            tensorplay.nn.Conv1d(
                 input_dim,
                 2 * num_channels,
                 1,
@@ -49,8 +49,8 @@ class _ConvolutionModule(torch.nn.Module):
                 padding=0,
                 bias=bias,
             ),
-            torch.nn.GLU(dim=1),
-            torch.nn.Conv1d(
+            tensorplay.nn.GLU(dim=1),
+            tensorplay.nn.Conv1d(
                 num_channels,
                 num_channels,
                 depthwise_kernel_size,
@@ -59,11 +59,11 @@ class _ConvolutionModule(torch.nn.Module):
                 groups=num_channels,
                 bias=bias,
             ),
-            torch.nn.GroupNorm(num_groups=1, num_channels=num_channels)
+            tensorplay.nn.GroupNorm(num_groups=1, num_channels=num_channels)
             if use_group_norm
-            else torch.nn.BatchNorm1d(num_channels),
-            torch.nn.SiLU(),
-            torch.nn.Conv1d(
+            else tensorplay.nn.BatchNorm1d(num_channels),
+            tensorplay.nn.SiLU(),
+            tensorplay.nn.Conv1d(
                 num_channels,
                 input_dim,
                 kernel_size=1,
@@ -71,16 +71,16 @@ class _ConvolutionModule(torch.nn.Module):
                 padding=0,
                 bias=bias,
             ),
-            torch.nn.Dropout(dropout),
+            tensorplay.nn.Dropout(dropout),
         )
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
+    def forward(self, input: tensorplay.Tensor) -> tensorplay.Tensor:
         r"""
         Args:
-            input (torch.Tensor): with shape `(B, T, D)`.
+            input (tensorplay.Tensor): with shape `(B, T, D)`.
 
         Returns:
-            torch.Tensor: output, with shape `(B, T, D)`.
+            tensorplay.Tensor: output, with shape `(B, T, D)`.
         """
         x = self.layer_norm(input)
         x = x.transpose(1, 2)
@@ -88,7 +88,7 @@ class _ConvolutionModule(torch.nn.Module):
         return x.transpose(1, 2)
 
 
-class _FeedForwardModule(torch.nn.Module):
+class _FeedForwardModule(tensorplay.nn.Module):
     r"""Positionwise feed forward layer.
 
     Args:
@@ -99,27 +99,27 @@ class _FeedForwardModule(torch.nn.Module):
 
     def __init__(self, input_dim: int, hidden_dim: int, dropout: float = 0.0) -> None:
         super().__init__()
-        self.sequential = torch.nn.Sequential(
-            torch.nn.LayerNorm(input_dim),
-            torch.nn.Linear(input_dim, hidden_dim, bias=True),
-            torch.nn.SiLU(),
-            torch.nn.Dropout(dropout),
-            torch.nn.Linear(hidden_dim, input_dim, bias=True),
-            torch.nn.Dropout(dropout),
+        self.sequential = tensorplay.nn.Sequential(
+            tensorplay.nn.LayerNorm(input_dim),
+            tensorplay.nn.Linear(input_dim, hidden_dim, bias=True),
+            tensorplay.nn.SiLU(),
+            tensorplay.nn.Dropout(dropout),
+            tensorplay.nn.Linear(hidden_dim, input_dim, bias=True),
+            tensorplay.nn.Dropout(dropout),
         )
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
+    def forward(self, input: tensorplay.Tensor) -> tensorplay.Tensor:
         r"""
         Args:
-            input (torch.Tensor): with shape `(*, D)`.
+            input (tensorplay.Tensor): with shape `(*, D)`.
 
         Returns:
-            torch.Tensor: output, with shape `(*, D)`.
+            tensorplay.Tensor: output, with shape `(*, D)`.
         """
         return self.sequential(input)
 
 
-class ConformerLayer(torch.nn.Module):
+class ConformerLayer(tensorplay.nn.Module):
     r"""Conformer layer that constitutes Conformer.
 
     Args:
@@ -148,9 +148,9 @@ class ConformerLayer(torch.nn.Module):
 
         self.ffn1 = _FeedForwardModule(input_dim, ffn_dim, dropout=dropout)
 
-        self.self_attn_layer_norm = torch.nn.LayerNorm(input_dim)
-        self.self_attn = torch.nn.MultiheadAttention(input_dim, num_attention_heads, dropout=dropout)
-        self.self_attn_dropout = torch.nn.Dropout(dropout)
+        self.self_attn_layer_norm = tensorplay.nn.LayerNorm(input_dim)
+        self.self_attn = tensorplay.nn.MultiheadAttention(input_dim, num_attention_heads, dropout=dropout)
+        self.self_attn_dropout = tensorplay.nn.Dropout(dropout)
 
         self.conv_module = _ConvolutionModule(
             input_dim=input_dim,
@@ -162,10 +162,10 @@ class ConformerLayer(torch.nn.Module):
         )
 
         self.ffn2 = _FeedForwardModule(input_dim, ffn_dim, dropout=dropout)
-        self.final_layer_norm = torch.nn.LayerNorm(input_dim)
+        self.final_layer_norm = tensorplay.nn.LayerNorm(input_dim)
         self.convolution_first = convolution_first
 
-    def _apply_convolution(self, input: torch.Tensor) -> torch.Tensor:
+    def _apply_convolution(self, input: tensorplay.Tensor) -> tensorplay.Tensor:
         residual = input
         input = input.transpose(0, 1)
         input = self.conv_module(input)
@@ -173,14 +173,14 @@ class ConformerLayer(torch.nn.Module):
         input = residual + input
         return input
 
-    def forward(self, input: torch.Tensor, key_padding_mask: Optional[torch.Tensor]) -> torch.Tensor:
+    def forward(self, input: tensorplay.Tensor, key_padding_mask: Optional[tensorplay.Tensor]) -> tensorplay.Tensor:
         r"""
         Args:
-            input (torch.Tensor): input, with shape `(T, B, D)`.
-            key_padding_mask (torch.Tensor or None): key padding mask to use in self attention layer.
+            input (tensorplay.Tensor): input, with shape `(T, B, D)`.
+            key_padding_mask (tensorplay.Tensor or None): key padding mask to use in self attention layer.
 
         Returns:
-            torch.Tensor: output, with shape `(T, B, D)`.
+            tensorplay.Tensor: output, with shape `(T, B, D)`.
         """
         residual = input
         x = self.ffn1(input)
@@ -212,7 +212,7 @@ class ConformerLayer(torch.nn.Module):
         return x
 
 
-class Conformer(torch.nn.Module):
+class Conformer(tensorplay.nn.Module):
     r"""Conformer architecture introduced in
     *Conformer: Convolution-augmented Transformer for Speech Recognition*
     :cite:`gulati2020conformer`.
@@ -237,8 +237,8 @@ class Conformer(torch.nn.Module):
         >>>     num_layers=4,
         >>>     depthwise_conv_kernel_size=31,
         >>> )
-        >>> lengths = torch.randint(1, 400, (10,))  # (batch,)
-        >>> input = torch.rand(10, int(lengths.max()), input_dim)  # (batch, num_frames, input_dim)
+        >>> lengths = tensorplay.randint(1, 400, (10,))  # (batch,)
+        >>> input = tensorplay.rand(10, int(lengths.max()), input_dim)  # (batch, num_frames, input_dim)
         >>> output = conformer(input, lengths)
     """
 
@@ -255,7 +255,7 @@ class Conformer(torch.nn.Module):
     ):
         super().__init__()
 
-        self.conformer_layers = torch.nn.ModuleList(
+        self.conformer_layers = tensorplay.nn.ModuleList(
             [
                 ConformerLayer(
                     input_dim,
@@ -270,18 +270,18 @@ class Conformer(torch.nn.Module):
             ]
         )
 
-    def forward(self, input: torch.Tensor, lengths: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, input: tensorplay.Tensor, lengths: tensorplay.Tensor) -> Tuple[tensorplay.Tensor, tensorplay.Tensor]:
         r"""
         Args:
-            input (torch.Tensor): with shape `(B, T, input_dim)`.
-            lengths (torch.Tensor): with shape `(B,)` and i-th element representing
+            input (tensorplay.Tensor): with shape `(B, T, input_dim)`.
+            lengths (tensorplay.Tensor): with shape `(B,)` and i-th element representing
                 number of valid frames for i-th batch element in ``input``.
 
         Returns:
-            (torch.Tensor, torch.Tensor)
-                torch.Tensor
+            (tensorplay.Tensor, tensorplay.Tensor)
+                tensorplay.Tensor
                     output frames, with shape `(B, T, input_dim)`
-                torch.Tensor
+                tensorplay.Tensor
                     output lengths, with shape `(B,)` and i-th element representing
                     number of valid frames for i-th batch element in output frames.
         """

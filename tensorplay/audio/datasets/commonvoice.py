@@ -3,9 +3,8 @@ import os
 from pathlib import Path
 from typing import Dict, List, Tuple, Union
 
-import tensorplay.audio as torchaudio
 from tensorplay import Tensor
-from torch.utils.data import Dataset
+from tensorplay.utils.data import Dataset
 
 
 def load_commonvoice_item(
@@ -20,7 +19,7 @@ def load_commonvoice_item(
     filename = os.path.join(path, folder_audio, fileid)
     if not filename.endswith(ext_audio):
         filename += ext_audio
-    waveform, sample_rate = torchaudio.load(filename)
+    waveform, sample_rate = tensorplay.audio.load(filename)
 
     dic = dict(zip(header, line))
 

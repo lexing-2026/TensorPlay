@@ -18,20 +18,28 @@ from typing import Any, Callable, IO, Optional, TypeVar, Union
 from urllib.parse import urlparse
 
 import numpy as np
-import tensorplay as torch
-from torch.utils.model_zoo import tqdm
+import tensorplay as tensorplay
 
-from .._internally_replaced_utils import _download_file_from_remote_location, _is_remote_location_available
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
 
-USER_AGENT = "pytorch/vision"
+USER_AGENT = "tensorplay/vision"
 
 
 def _urlretrieve(url: str, filename: Union[str, pathlib.Path], chunk_size: int = 1024 * 32) -> None:
     with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": USER_AGENT})) as response:
-        with open(filename, "wb") as fh, tqdm(total=response.length, unit="B", unit_scale=True) as pbar:
-            while chunk := response.read(chunk_size):
-                fh.write(chunk)
-                pbar.update(len(chunk))
+        pbar = tqdm(total=response.length, unit="B", unit_scale=True) if tqdm is not None else None
+        try:
+            with open(filename, "wb") as fh:
+                while chunk := response.read(chunk_size):
+                    fh.write(chunk)
+                    if pbar is not None:
+                        pbar.update(len(chunk))
+        finally:
+            if pbar is not None:
+                pbar.close()
 
 
 def calculate_md5(fpath: Union[str, pathlib.Path], chunk_size: int = 1024 * 1024) -> str:
@@ -113,26 +121,23 @@ def download_url(
     if check_integrity(fpath, md5):
         return
 
-    if _is_remote_location_available():
-        _download_file_from_remote_location(fpath, url)
-    else:
-        # expand redirect chain if needed
-        url = _get_redirect_url(url, max_hops=max_redirect_hops)
+    # expand redirect chain if needed
+    url = _get_redirect_url(url, max_hops=max_redirect_hops)
 
-        # check if file is located on Google Drive
-        file_id = _get_google_drive_file_id(url)
-        if file_id is not None:
-            return download_file_from_google_drive(file_id, root, filename, md5)
+    # check if file is located on Google Drive
+    file_id = _get_google_drive_file_id(url)
+    if file_id is not None:
+        return download_file_from_google_drive(file_id, root, filename, md5)
 
-        # download the file
-        try:
+    # download the file
+    try:
+        _urlretrieve(url, fpath)
+    except (urllib.error.URLError, OSError) as e:  # type: ignore[attr-defined]
+        if url[:5] == "https":
+            url = url.replace("https:", "http:")
             _urlretrieve(url, fpath)
-        except (urllib.error.URLError, OSError) as e:  # type: ignore[attr-defined]
-            if url[:5] == "https":
-                url = url.replace("https:", "http:")
-                _urlretrieve(url, fpath)
-            else:
-                raise e
+        else:
+            raise e
 
     # check integrity of downloaded file
     if not check_integrity(fpath, md5):
@@ -464,7 +469,7 @@ def _read_pfm(file_name: Union[str, pathlib.Path], slice_channels: int = 2) -> n
     return data.astype(np.float32)
 
 
-def _flip_byte_order(t: torch.Tensor) -> torch.Tensor:
+def _flip_byte_order(t: tensorplay.Tensor) -> tensorplay.Tensor:
     return (
-        t.contiguous().view(torch.uint8).view(*t.shape, t.element_size()).flip(-1).view(*t.shape[:-1], -1).view(t.dtype)
+        t.contiguous().view(tensorplay.uint8).view(*t.shape, t.element_size()).flip(-1).view(*t.shape[:-1], -1).view(t.dtype)
     )

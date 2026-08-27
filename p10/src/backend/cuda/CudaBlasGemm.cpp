@@ -7,6 +7,7 @@
 
 #include "CudaGemm.h"
 #include "CUDAContext.h"
+#include "CUDAGraph.h"
 #include "CUDARuntime.h"
 #include "Exception.h"
 #include "Context.h"
@@ -283,7 +284,7 @@ Tensor& zero_matmul_output_cuda(Tensor& output) {
     return zero_matmul_output(output);
 }
 
-void gemm_impl(const Tensor& self, const Tensor& other, const Tensor& result,
+void gemm_impl(const Tensor& self, const Tensor& other, Tensor& result,
                double alpha, double beta, const Tensor* bias) {
     if (self.dim() != 2 || other.dim() != 2) {
         TP_THROW(RuntimeError, "mm: tensors must be 2D");
@@ -292,7 +293,22 @@ void gemm_impl(const Tensor& self, const Tensor& other, const Tensor& result,
         TP_THROW(RuntimeError, "mm: shape mismatch");
     }
 
-    Tensor self_contig = self.is_contiguous() ? self : self.contiguous();
+    const auto self_strides = self.strides();
+    const bool self_transposed_contiguous =
+        !self.is_contiguous() && self.dim() == 2 &&
+        self_strides[0] == 1 && self_strides[1] == self.shape()[0];
+    const bool native_cublas_dtype =
+        isComplexType(self.dtype()) || self.dtype() == DType::Float16 ||
+        self.dtype() == DType::BFloat16;
+    // A live transpose view is already a valid column-major operand for the
+    // row-major cuBLAS trick.  Keep it in place for the native cuBLAS dtypes;
+    // materializing this view five times is the dominant cost of tall Muon's
+    // Newton-Schulz loop.  The Lt path still receives a dense copy below.
+    Tensor self_contig = self.is_contiguous()
+        ? self
+        : (native_cublas_dtype && self_transposed_contiguous
+               ? self
+               : self.contiguous());
 
     // The decoder linear layer pattern ``x @ weight.t()``: keep the weight
     // view untouched (its memory already reads as the transposed operand).
@@ -328,20 +344,64 @@ void gemm_impl(const Tensor& self, const Tensor& other, const Tensor& result,
         const cublasComputeType_t compute_type = to_compute_type(dtype);
         void* alpha_ptr = to_scalar_ptr(alpha, dtype, 0);
         void* beta_ptr = to_scalar_ptr(beta, dtype, 1);
+        const cublasOperation_t trans_a =
+            other_transposed ? CUBLAS_OP_T : CUBLAS_OP_N;
+        const cublasOperation_t trans_b =
+            self_transposed_contiguous ? CUBLAS_OP_T : CUBLAS_OP_N;
+        const int lda = static_cast<int>(other_transposed ? K : N);
+        const int ldb = static_cast<int>(self_transposed_contiguous ? M : K);
         CUBLAS_CHECK(cublasGemmEx(
             CUDAContext::getCublasHandle(),
-            CUBLAS_OP_N, CUBLAS_OP_N,
+            trans_a, trans_b,
             static_cast<int>(N), static_cast<int>(M), static_cast<int>(K),
             alpha_ptr,
-            a_ptr, cuda_type, static_cast<int>(N),
-            b_ptr, cuda_type, static_cast<int>(K),
+            a_ptr, cuda_type, lda,
+            b_ptr, cuda_type, ldb,
             beta_ptr,
             result.data_ptr(), cuda_type, static_cast<int>(N),
             compute_type, CUBLAS_GEMM_DEFAULT));
         return;
     }
 
-    bool has_bias = (bias != nullptr);
+    // Match the native PyTorch default on this host: its preferred backend
+    // is cuBLAS (not cuBLASLt) for Half/BFloat16 GEMM.  Besides avoiding Lt's
+    // per-shape plan/autotune cost, this matters for tall Newton-Schulz
+    // products where the cuBLAS reduction policy is the reference numerical
+    // path.  Keep the Lt bias epilogue for vector-bias addmm below.
+    const bool has_bias = (bias != nullptr);
+    if (!has_bias && (dtype == DType::Float16 || dtype == DType::BFloat16)) {
+        const cudaDataType_t cuda_type = to_cublas_type(dtype);
+        const cublasComputeType_t compute_type = to_compute_type(dtype);
+        void* alpha_ptr = to_scalar_ptr(alpha, dtype, 0);
+        void* beta_ptr = to_scalar_ptr(beta, dtype, 1);
+        cublasHandle_t handle = CUDAContext::getCublasHandle();
+        // In the transposed-weights case `a_ptr` points at the underlying
+        // contiguous [N,K] row-major storage while the logical operand is
+        // its [K,N] transpose.  The row-major transpose trick therefore
+        // needs OP_T and the underlying column-major leading dimension K.
+        // OP_N/lda=N happens to work for some square/aligned shapes but
+        // silently reads the wrong reduction order for Muon's live .T view.
+        const cublasOperation_t trans_a =
+            other_transposed ? CUBLAS_OP_T : CUBLAS_OP_N;
+        const int lda = static_cast<int>(other_transposed ? K : N);
+        CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH));
+        const cublasStatus_t status = cublasGemmEx(
+            handle,
+            trans_a, CUBLAS_OP_N,
+            static_cast<int>(N), static_cast<int>(M), static_cast<int>(K),
+            alpha_ptr,
+            a_ptr, cuda_type, lda,
+            b_ptr, cuda_type, static_cast<int>(K),
+            beta_ptr,
+            result.data_ptr(), cuda_type, static_cast<int>(N),
+            compute_type, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        // Restore the default even when the call reports an error so later
+        // operators cannot inherit a transient math-mode setting.
+        CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH));
+        CUBLAS_CHECK(status);
+        return;
+    }
+
     auto plan = get_gemm_plan(dtype, M, N, K, has_bias, other_transposed);
     std::lock_guard<std::mutex> execution_lock(plan->execution_mutex);
 
@@ -358,11 +418,29 @@ void gemm_impl(const Tensor& self, const Tensor& other, const Tensor& result,
                                                        &bias_ptr, sizeof(void*)));
     }
 
+    const bool run_autotune = !plan->autotuned && !tensorplay::cuda::isCapturing();
+
+    // Autotune trials write D in place.  Preserve the caller's C only while
+    // those trials run and beta is non-zero, so the real beta*C + alpha*A*B
+    // execution below still sees the original accumulation buffer.  Without
+    // this, the trials' beta=0 output is fed into the final beta=1 call and
+    // the first GEMM using a broadcast addmm bias returns (roughly) 2*AB.
+    Tensor saved_result;
+    if (run_autotune && beta != 0.0) {
+        saved_result = result.clone();
+    }
+
     // One-time micro-autotune: time every heuristic candidate and keep the
     // measured winner at index 0.  cuBLASLt's top-1 estimate is not always
     // the fastest kernel for a given arch; this makes the choice empirical
     // while paying the cost only on the first call per (shape, dtype) key.
-    if (!plan->autotuned) {
+    //
+    // Skipped while a CUDA graph capture is live: the trials record events
+    // on the capturing stream, which aborts capture.  The plan is then
+    // PINNED to heuristic candidate 0 so captured and eager executions use
+    // bit-identical algorithms (mixing algorithms shows up as ulp-level
+    // divergence between replay and eager recompute).
+    if (run_autotune) {
         int best = 0;
         float best_ms = std::numeric_limits<float>::max();
         for (size_t c = 0; c < plan->candidates.size(); ++c) {
@@ -412,10 +490,17 @@ void gemm_impl(const Tensor& self, const Tensor& other, const Tensor& result,
             std::swap(plan->candidates[0], plan->candidates[static_cast<size_t>(best)]);
         }
         plan->autotuned = true;
+    } else if (!plan->autotuned) {
+        // First use happened under capture: pin heuristic candidate 0.
+        plan->autotuned = true;
     }
 
     // Restore the caller's beta for the real execution.
     beta_ptr = to_scalar_ptr(beta, dtype, 1);
+
+    if (run_autotune && beta != 0.0) {
+        result.copy_(saved_result);
+    }
 
     CUBLASLT_CHECK(cublasLtMatmul(
         CUDAContext::getCublasLtHandle(), plan->matmul_desc, alpha_ptr,

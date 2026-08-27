@@ -8,9 +8,9 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, Optional, Union
 
-import tensorplay as torch
-from torch import nn, Tensor
-from torchvision.ops import StochasticDepth
+import tensorplay as tensorplay
+from tensorplay import nn, Tensor
+from ..ops.stochastic_depth import StochasticDepth
 
 from ..ops.misc import Conv2dNormActivation, SqueezeExcitation
 from ..transforms._presets import ImageClassification, InterpolationMode
@@ -337,7 +337,7 @@ class EfficientNet(nn.Module):
         x = self.features(x)
 
         x = self.avgpool(x)
-        x = torch.flatten(x, 1)
+        x = tensorplay.flatten(x, 1)
 
         x = self.classifier(x)
 
@@ -429,14 +429,14 @@ _COMMON_META: dict[str, Any] = {
 _COMMON_META_V1 = {
     **_COMMON_META,
     "min_size": (1, 1),
-    "recipe": "https://github.com/pytorch/vision/tree/main/references/classification#efficientnet-v1",
+    "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#efficientnet-v1",
 }
 
 
 _COMMON_META_V2 = {
     **_COMMON_META,
     "min_size": (33, 33),
-    "recipe": "https://github.com/pytorch/vision/tree/main/references/classification#efficientnet-v2",
+    "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#efficientnet-v2",
 }
 
 
@@ -493,7 +493,7 @@ class EfficientNet_B1_Weights(WeightsEnum):
         meta={
             **_COMMON_META_V1,
             "num_params": 7794184,
-            "recipe": "https://github.com/pytorch/vision/issues/3995#new-recipe-with-lr-wd-crop-tuning",
+            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe-with-lr-wd-crop-tuning",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 79.838,
@@ -503,9 +503,9 @@ class EfficientNet_B1_Weights(WeightsEnum):
             "_ops": 0.687,
             "_file_size": 30.136,
             "_docs": """
-                These weights improve upon the results of the original paper by using a modified version of TorchVision's
+                These weights improve upon the results of the original paper by using a modified version of TensorPlay Vision's
                 `new training recipe
-                <https://pytorch.org/blog/how-to-train-state-of-the-art-models-using-torchvision-latest-primitives/>`_.
+                <https://tensorplay.org/blog/how-to-train-state-of-the-art-models-using-tensorplay.vision-latest-primitives/>`_.
             """,
         },
     )
@@ -677,9 +677,9 @@ class EfficientNet_V2_S_Weights(WeightsEnum):
             "_ops": 8.366,
             "_file_size": 82.704,
             "_docs": """
-                These weights improve upon the results of the original paper by using a modified version of TorchVision's
+                These weights improve upon the results of the original paper by using a modified version of TensorPlay Vision's
                 `new training recipe
-                <https://pytorch.org/blog/how-to-train-state-of-the-art-models-using-torchvision-latest-primitives/>`_.
+                <https://tensorplay.org/blog/how-to-train-state-of-the-art-models-using-tensorplay.vision-latest-primitives/>`_.
             """,
         },
     )
@@ -707,9 +707,9 @@ class EfficientNet_V2_M_Weights(WeightsEnum):
             "_ops": 24.582,
             "_file_size": 208.01,
             "_docs": """
-                These weights improve upon the results of the original paper by using a modified version of TorchVision's
+                These weights improve upon the results of the original paper by using a modified version of TensorPlay Vision's
                 `new training recipe
-                <https://pytorch.org/blog/how-to-train-state-of-the-art-models-using-torchvision-latest-primitives/>`_.
+                <https://tensorplay.org/blog/how-to-train-state-of-the-art-models-using-tensorplay.vision-latest-primitives/>`_.
             """,
         },
     )
@@ -754,18 +754,18 @@ def efficientnet_b0(
     Neural Networks <https://arxiv.org/abs/1905.11946>`_ paper.
 
     Args:
-        weights (:class:`~torchvision.models.EfficientNet_B0_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.EfficientNet_B0_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.EfficientNet_B0_Weights` below for
+            :class:`~tensorplay.vision.models.EfficientNet_B0_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.efficientnet.EfficientNet``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.efficientnet.EfficientNet``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/efficientnet.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/efficientnet.py>`_
             for more details about this class.
-    .. autoclass:: torchvision.models.EfficientNet_B0_Weights
+    .. autoclass:: tensorplay.vision.models.EfficientNet_B0_Weights
         :members:
     """
     weights = EfficientNet_B0_Weights.verify(weights)
@@ -785,18 +785,18 @@ def efficientnet_b1(
     Neural Networks <https://arxiv.org/abs/1905.11946>`_ paper.
 
     Args:
-        weights (:class:`~torchvision.models.EfficientNet_B1_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.EfficientNet_B1_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.EfficientNet_B1_Weights` below for
+            :class:`~tensorplay.vision.models.EfficientNet_B1_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.efficientnet.EfficientNet``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.efficientnet.EfficientNet``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/efficientnet.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/efficientnet.py>`_
             for more details about this class.
-    .. autoclass:: torchvision.models.EfficientNet_B1_Weights
+    .. autoclass:: tensorplay.vision.models.EfficientNet_B1_Weights
         :members:
     """
     weights = EfficientNet_B1_Weights.verify(weights)
@@ -816,18 +816,18 @@ def efficientnet_b2(
     Neural Networks <https://arxiv.org/abs/1905.11946>`_ paper.
 
     Args:
-        weights (:class:`~torchvision.models.EfficientNet_B2_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.EfficientNet_B2_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.EfficientNet_B2_Weights` below for
+            :class:`~tensorplay.vision.models.EfficientNet_B2_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.efficientnet.EfficientNet``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.efficientnet.EfficientNet``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/efficientnet.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/efficientnet.py>`_
             for more details about this class.
-    .. autoclass:: torchvision.models.EfficientNet_B2_Weights
+    .. autoclass:: tensorplay.vision.models.EfficientNet_B2_Weights
         :members:
     """
     weights = EfficientNet_B2_Weights.verify(weights)
@@ -847,18 +847,18 @@ def efficientnet_b3(
     Neural Networks <https://arxiv.org/abs/1905.11946>`_ paper.
 
     Args:
-        weights (:class:`~torchvision.models.EfficientNet_B3_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.EfficientNet_B3_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.EfficientNet_B3_Weights` below for
+            :class:`~tensorplay.vision.models.EfficientNet_B3_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.efficientnet.EfficientNet``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.efficientnet.EfficientNet``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/efficientnet.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/efficientnet.py>`_
             for more details about this class.
-    .. autoclass:: torchvision.models.EfficientNet_B3_Weights
+    .. autoclass:: tensorplay.vision.models.EfficientNet_B3_Weights
         :members:
     """
     weights = EfficientNet_B3_Weights.verify(weights)
@@ -883,18 +883,18 @@ def efficientnet_b4(
     Neural Networks <https://arxiv.org/abs/1905.11946>`_ paper.
 
     Args:
-        weights (:class:`~torchvision.models.EfficientNet_B4_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.EfficientNet_B4_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.EfficientNet_B4_Weights` below for
+            :class:`~tensorplay.vision.models.EfficientNet_B4_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.efficientnet.EfficientNet``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.efficientnet.EfficientNet``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/efficientnet.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/efficientnet.py>`_
             for more details about this class.
-    .. autoclass:: torchvision.models.EfficientNet_B4_Weights
+    .. autoclass:: tensorplay.vision.models.EfficientNet_B4_Weights
         :members:
     """
     weights = EfficientNet_B4_Weights.verify(weights)
@@ -919,18 +919,18 @@ def efficientnet_b5(
     Neural Networks <https://arxiv.org/abs/1905.11946>`_ paper.
 
     Args:
-        weights (:class:`~torchvision.models.EfficientNet_B5_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.EfficientNet_B5_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.EfficientNet_B5_Weights` below for
+            :class:`~tensorplay.vision.models.EfficientNet_B5_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.efficientnet.EfficientNet``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.efficientnet.EfficientNet``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/efficientnet.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/efficientnet.py>`_
             for more details about this class.
-    .. autoclass:: torchvision.models.EfficientNet_B5_Weights
+    .. autoclass:: tensorplay.vision.models.EfficientNet_B5_Weights
         :members:
     """
     weights = EfficientNet_B5_Weights.verify(weights)
@@ -956,18 +956,18 @@ def efficientnet_b6(
     Neural Networks <https://arxiv.org/abs/1905.11946>`_ paper.
 
     Args:
-        weights (:class:`~torchvision.models.EfficientNet_B6_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.EfficientNet_B6_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.EfficientNet_B6_Weights` below for
+            :class:`~tensorplay.vision.models.EfficientNet_B6_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.efficientnet.EfficientNet``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.efficientnet.EfficientNet``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/efficientnet.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/efficientnet.py>`_
             for more details about this class.
-    .. autoclass:: torchvision.models.EfficientNet_B6_Weights
+    .. autoclass:: tensorplay.vision.models.EfficientNet_B6_Weights
         :members:
     """
     weights = EfficientNet_B6_Weights.verify(weights)
@@ -993,18 +993,18 @@ def efficientnet_b7(
     Neural Networks <https://arxiv.org/abs/1905.11946>`_ paper.
 
     Args:
-        weights (:class:`~torchvision.models.EfficientNet_B7_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.EfficientNet_B7_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.EfficientNet_B7_Weights` below for
+            :class:`~tensorplay.vision.models.EfficientNet_B7_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.efficientnet.EfficientNet``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.efficientnet.EfficientNet``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/efficientnet.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/efficientnet.py>`_
             for more details about this class.
-    .. autoclass:: torchvision.models.EfficientNet_B7_Weights
+    .. autoclass:: tensorplay.vision.models.EfficientNet_B7_Weights
         :members:
     """
     weights = EfficientNet_B7_Weights.verify(weights)
@@ -1031,18 +1031,18 @@ def efficientnet_v2_s(
     `EfficientNetV2: Smaller Models and Faster Training <https://arxiv.org/abs/2104.00298>`_.
 
     Args:
-        weights (:class:`~torchvision.models.EfficientNet_V2_S_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.EfficientNet_V2_S_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.EfficientNet_V2_S_Weights` below for
+            :class:`~tensorplay.vision.models.EfficientNet_V2_S_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.efficientnet.EfficientNet``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.efficientnet.EfficientNet``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/efficientnet.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/efficientnet.py>`_
             for more details about this class.
-    .. autoclass:: torchvision.models.EfficientNet_V2_S_Weights
+    .. autoclass:: tensorplay.vision.models.EfficientNet_V2_S_Weights
         :members:
     """
     weights = EfficientNet_V2_S_Weights.verify(weights)
@@ -1069,18 +1069,18 @@ def efficientnet_v2_m(
     `EfficientNetV2: Smaller Models and Faster Training <https://arxiv.org/abs/2104.00298>`_.
 
     Args:
-        weights (:class:`~torchvision.models.EfficientNet_V2_M_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.EfficientNet_V2_M_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.EfficientNet_V2_M_Weights` below for
+            :class:`~tensorplay.vision.models.EfficientNet_V2_M_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.efficientnet.EfficientNet``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.efficientnet.EfficientNet``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/efficientnet.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/efficientnet.py>`_
             for more details about this class.
-    .. autoclass:: torchvision.models.EfficientNet_V2_M_Weights
+    .. autoclass:: tensorplay.vision.models.EfficientNet_V2_M_Weights
         :members:
     """
     weights = EfficientNet_V2_M_Weights.verify(weights)
@@ -1107,18 +1107,18 @@ def efficientnet_v2_l(
     `EfficientNetV2: Smaller Models and Faster Training <https://arxiv.org/abs/2104.00298>`_.
 
     Args:
-        weights (:class:`~torchvision.models.EfficientNet_V2_L_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.EfficientNet_V2_L_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.EfficientNet_V2_L_Weights` below for
+            :class:`~tensorplay.vision.models.EfficientNet_V2_L_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.efficientnet.EfficientNet``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.efficientnet.EfficientNet``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/efficientnet.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/efficientnet.py>`_
             for more details about this class.
-    .. autoclass:: torchvision.models.EfficientNet_V2_L_Weights
+    .. autoclass:: tensorplay.vision.models.EfficientNet_V2_L_Weights
         :members:
     """
     weights = EfficientNet_V2_L_Weights.verify(weights)

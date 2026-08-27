@@ -4,14 +4,14 @@ from os import PathLike
 from pathlib import Path
 from typing import Union
 
-import tensorplay as torch
-from torchaudio._internal import download_url_to_file
+import tensorplay as tensorplay
+from tensorplay.hub import download_url_to_file
 
 _LG = logging.getLogger(__name__)
 
 
 def _get_local_path(key):
-    path = Path(torch.hub.get_dir()) / "torchaudio" / Path(key)
+    path = Path(tensorplay.hub.get_dir()) / "tensorplay.audio" / Path(key)
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
 

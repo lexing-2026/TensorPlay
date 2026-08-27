@@ -190,6 +190,13 @@ static void pad_scatter_kernel(const T* go, T* gi, const PadNdPlan& p) {
     int64_t src_total = 1;
     for (int64_t d = 0; d < p.ndim; ++d) src_total *= p.src_sizes[d];
     std::memset(gi, 0, src_total * sizeof(T));
+    // ``o`` is an ordinal over the OUTER product only (dims [0, k_outer)),
+    // so it must be decoded with outer-only strides -- dividing by the
+    // full-tensor strides would fold the padded dims' sizes into the outer
+    // coordinates and misroute every non-trivial batch/channel slice.
+    std::vector<int64_t> outer_strides(k_outer, 1);
+    for (int64_t d = k_outer - 2; d >= 0; --d)
+        outer_strides[d] = outer_strides[d + 1] * p.src_sizes[d + 1];
     parallel_for(0, outer, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
         for (int64_t o = begin; o < end; ++o) {
             // decompose the outer prefix once; outer dims are unpadded so the
@@ -197,8 +204,8 @@ static void pad_scatter_kernel(const T* go, T* gi, const PadNdPlan& p) {
             int64_t rem = o;
             int64_t src_outer = 0, dst_outer = 0;
             for (int64_t d = 0; d < k_outer; ++d) {
-                const int64_t c = rem / p.src_strides[d];
-                rem -= c * p.src_strides[d];
+                const int64_t c = rem / outer_strides[d];
+                rem -= c * outer_strides[d];
                 src_outer += c * p.src_strides[d];
                 dst_outer += c * p.dst_strides[d];
             }
@@ -274,7 +281,7 @@ void pad_mode_check(const char* name, const Tensor& self, const std::vector<int6
 }
 
 Tensor pad_mode_forward(const Tensor& self, const std::vector<int64_t>& pad, PadIndexMode mode) {
-    Tensor src = self.is_contiguous() ? self : self.clone();
+    Tensor src = self.contiguous();
     PadNdPlan p = pad_plan(src, pad);
     Tensor out = Tensor::empty(p.dst_sizes, src.dtype(), src.device());
     switch (src.dtype()) {

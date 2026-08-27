@@ -225,6 +225,7 @@ __all__ = [
     "Fold",
     "FractionalMaxPool2d",
     "FractionalMaxPool3d",
+    "GELU",
     "GLU",
     "GRU",
     "GRUCell",

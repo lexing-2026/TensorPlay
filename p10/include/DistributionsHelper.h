@@ -19,15 +19,27 @@ namespace tensorplay {
 
 constexpr double pi_d = 3.14159265358979323846;
 
-// Accumulation type for distributions: float stays float, double stays double
-// (matches at::dist_acctype).
+// Accumulation type for distributions: Half/BFloat16 use float, float stays
+// float, and double stays double (matches at::dist_acctype).
 template <typename T>
 struct DistAccumType {};
+template <> struct DistAccumType<Half> { using type = float; };
+template <> struct DistAccumType<BFloat16> { using type = float; };
 template <> struct DistAccumType<float> { using type = float; };
 template <> struct DistAccumType<double> { using type = double; };
 
 template <typename T>
 using dist_acctype = typename DistAccumType<T>::type;
+
+// std::numeric_limits is not specialized for TensorPlay's storage wrappers.
+// Keep the distribution's mantissa width explicit so Half/BFloat16 consume
+// the same masked raw words as ATen's scalar-dtype CPU kernels.
+template <typename T>
+struct DistMantissaBits {
+    static constexpr int value = std::numeric_limits<T>::digits;
+};
+template <> struct DistMantissaBits<Half> { static constexpr int value = 11; };
+template <> struct DistMantissaBits<BFloat16> { static constexpr int value = 8; };
 
 // Computation precision for a storage dtype: Half/BFloat16 sample in float
 // (mirrors at::opmath_type).
@@ -38,6 +50,47 @@ template <> struct OpMathType<BFloat16> { using type = float; };
 
 template <typename T>
 using opmath_t = typename OpMathType<T>::type;
+
+// ATen includes c10's reduced-floating-point math overloads for its CPU
+// distribution kernels.  Those overloads return Half/BFloat16 after each
+// elementary function (std::log(Half), std::sqrt(Half), ...), rather than
+// leaving the result in float.  Keep the same storage-dtype boundary without
+// adding non-standard overloads to namespace std for TensorPlay's wrappers.
+template <typename T>
+inline T distribution_log(T value) {
+    if constexpr (std::is_same_v<T, Half> || std::is_same_v<T, BFloat16>) {
+        return static_cast<T>(std::log(static_cast<float>(value)));
+    } else {
+        return std::log(value);
+    }
+}
+
+template <typename T>
+inline T distribution_sqrt(T value) {
+    if constexpr (std::is_same_v<T, Half> || std::is_same_v<T, BFloat16>) {
+        return static_cast<T>(std::sqrt(static_cast<float>(value)));
+    } else {
+        return std::sqrt(value);
+    }
+}
+
+template <typename T>
+inline T distribution_cos(T value) {
+    if constexpr (std::is_same_v<T, Half> || std::is_same_v<T, BFloat16>) {
+        return static_cast<T>(std::cos(static_cast<float>(value)));
+    } else {
+        return std::cos(value);
+    }
+}
+
+template <typename T>
+inline T distribution_sin(T value) {
+    if constexpr (std::is_same_v<T, Half> || std::is_same_v<T, BFloat16>) {
+        return static_cast<T>(std::sin(static_cast<float>(value)));
+    } else {
+        return std::sin(value);
+    }
+}
 
 namespace transformation {
 
@@ -68,10 +121,17 @@ inline std::enable_if_t<!std::is_floating_point_v<T>, T> uniform_int(V val) {
 // mantissa bits of T. float consumes one 32-bit draw, double one 64-bit draw.
 template <typename T, typename V>
 inline dist_acctype<T> uniform_real(V val, T from, T to) {
-    constexpr auto MASK = static_cast<V>((static_cast<uint64_t>(1) << std::numeric_limits<T>::digits) - 1);
-    constexpr auto DIVISOR = static_cast<dist_acctype<T>>(1) / (static_cast<uint64_t>(1) << std::numeric_limits<T>::digits);
+    constexpr auto MASK = static_cast<V>((static_cast<uint64_t>(1) << DistMantissaBits<T>::value) - 1);
+    constexpr auto DIVISOR = static_cast<dist_acctype<T>>(1) /
+                             (static_cast<uint64_t>(1) << DistMantissaBits<T>::value);
     dist_acctype<T> x = (val & MASK) * DIVISOR;
-    return (x * (to - from) + from);
+    // c10::Half/BFloat16 round the storage-dtype subtraction first, but
+    // their mixed float/double operators keep the subsequent arithmetic in
+    // the accumulator type.  Spell that boundary out so custom storage
+    // wrappers cannot introduce an extra product/add round-trip.
+    const dist_acctype<T> range = static_cast<dist_acctype<T>>(to - from);
+    const dist_acctype<T> base = static_cast<dist_acctype<T>>(from);
+    return x * range + base;
 }
 
 template <typename T>
@@ -304,12 +364,15 @@ struct NormalFill16 {
 
     void operator()(T* data) const {
         for (int j = 0; j < 8; ++j) {
-            const T u1 = 1 - data[j]; // [0, 1) -> (0, 1] for log.
+            const T u1 = T(1) - data[j]; // [0, 1) -> (0, 1] for log.
             const T u2 = data[j + 8];
-            const T radius = std::sqrt(-2 * std::log(u1));
+            const T radius = distribution_sqrt<T>(T(-2) * distribution_log<T>(u1));
             const T theta = 2.0 * pi_d * u2;
-            data[j] = std::fma(radius * std::cos(theta), std_, mean_);
-            data[j + 8] = std::fma(radius * std::sin(theta), std_, mean_);
+            // Keep the scalar expression in the same order as ATen's
+            // normal_fill_16.  In particular, do not fuse the multiply-add:
+            // Half/BFloat16 must round at the storage-dtype operation points.
+            data[j] = radius * distribution_cos<T>(theta) * std_ + mean_;
+            data[j + 8] = radius * distribution_sin<T>(theta) * std_ + mean_;
         }
     }
 };

@@ -5,6 +5,7 @@
 #include <optional>
 #include <vector>
 #include <algorithm>
+#include <cmath>
 #include <limits>
 
 namespace tensorplay {
@@ -25,6 +26,8 @@ DEFINE_DISPATCH(any_dim_stub);
 DEFINE_DISPATCH(argmax_stub);
 DEFINE_DISPATCH(argmin_stub);
 DEFINE_DISPATCH(median_stub);
+DEFINE_DISPATCH(norm_stub);
+DEFINE_DISPATCH(norm_dim_stub);
 
 Tensor sum_kernel(const Tensor& self, DType dtype) {
     return sum_stub(DeviceType::CPU, self, dtype);
@@ -35,13 +38,14 @@ Tensor sum_dim_kernel(const Tensor& self, std::vector<int64_t> dims, bool keepdi
 }
 
 Tensor mean_kernel(const Tensor& self, DType dtype) {
-    DType out_dtype = (dtype == DType::Undefined) ? (isFloatingType(self.dtype()) ? self.dtype() : DType::Float32) : dtype;
+    // torch parity: mean over complex tensors stays complex
+    DType out_dtype = (dtype == DType::Undefined) ? (isFloatingOrComplexType(self.dtype()) ? self.dtype() : DType::Float32) : dtype;
     Tensor s = sum_kernel(self, out_dtype);
     return s / Scalar((float)self.numel());
 }
 
 Tensor mean_dim_kernel(const Tensor& self, std::vector<int64_t> dims, bool keepdim, DType dtype) {
-    DType out_dtype = (dtype == DType::Undefined) ? (isFloatingType(self.dtype()) ? self.dtype() : DType::Float32) : dtype;
+    DType out_dtype = (dtype == DType::Undefined) ? (isFloatingOrComplexType(self.dtype()) ? self.dtype() : DType::Float32) : dtype;
     Tensor s = sum_dim_kernel(self, dims, keepdim, out_dtype);
 
     int64_t count = 1;
@@ -105,8 +109,11 @@ Tensor sum_dim_backward_kernel(const Tensor& grad_output, const Tensor& self,
     std::sort(normalized.begin(), normalized.end());
     Tensor expanded = grad_output;
     if (!keepdim) {
-        for (auto it = normalized.rbegin(); it != normalized.rend(); ++it) {
-            expanded = expanded.unsqueeze(*it);
+        // Insert unit dims at the ORIGINAL (ascending) positions: after the
+        // reduction the surviving dims are left-packed, so ascending order
+        // restores the exact source layout (reverse order misaligns).
+        for (int64_t d : normalized) {
+            expanded = expanded.unsqueeze(d);
         }
     }
     return expanded.expand(static_cast<std::vector<int64_t>>(self.shape()));
@@ -158,6 +165,16 @@ Tensor argmin_kernel(const Tensor& self, std::optional<int64_t> dim, bool keepdi
 
 Tensor var_kernel(const Tensor& self, int64_t correction) {
     if (self.numel() == 0) return Tensor::empty({}, DType::Float32, self.device()).fill_(Scalar(std::numeric_limits<float>::quiet_NaN()));
+    if (isComplexType(self.dtype())) {
+        // Upstream ATen semantics (aten/src/ATen/native/ReduceOps.cpp):
+        // complex variance = E|z - mean|^2 == var(re) + var(imag), and the
+        // result dtype is the real counterpart.
+        Tensor diff = self - self.mean();
+        Tensor sum_sq = diff.abs().pow(Scalar(2)).sum();
+        int64_t n = self.numel();
+        double div_val = std::max<double>(0.0, static_cast<double>(n - correction));
+        return sum_sq / Scalar(div_val);
+    }
     Tensor mean = self.mean();
     Tensor diff = self - mean;
     Tensor sq_diff = diff * diff;
@@ -170,6 +187,22 @@ Tensor var_kernel(const Tensor& self, int64_t correction) {
 
 Tensor var_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, int64_t correction, bool keepdim) {
     if (self.numel() == 0) return Tensor::empty(compute_reduction_shape(self, dim, keepdim), DType::Float32, self.device()).fill_(Scalar(std::numeric_limits<float>::quiet_NaN()));
+    if (isComplexType(self.dtype())) {
+        // Complex: E|z - mean|^2 over the reduced dims (real-typed result).
+        std::vector<int64_t> dims = dim;
+        Tensor mean = self.mean(dims, true);
+        Tensor diff = self - mean;
+        std::vector<int64_t> dims_sum = dim;
+        Tensor sum_sq = diff.abs().pow(Scalar(2)).sum(dims_sum, keepdim);
+        std::vector<int64_t> shape = static_cast<std::vector<int64_t>>(self.shape());
+        int64_t n = 1;
+        for (int64_t d : dim) {
+            if (d < 0) d += shape.size();
+            n *= shape[d];
+        }
+        double div = std::max<double>(0.0, static_cast<double>(n - correction));
+        return sum_sq / Scalar(div);
+    }
     std::vector<int64_t> dims = dim;
     Tensor mean = self.mean(dims, true);
     std::vector<int64_t> dims_sum = dim;
@@ -195,6 +228,11 @@ Tensor std_dim_kernel(const Tensor& self, std::vector<int64_t> dim, int64_t corr
 }
 
 Tensor norm_kernel(const Tensor& self, double p) {
+    if (p == 2.0 &&
+        (self.dtype() == DType::Float32 || self.dtype() == DType::Float64 ||
+         self.dtype() == DType::Float16 || self.dtype() == DType::BFloat16)) {
+        return norm_stub(DeviceType::CPU, self, p);
+    }
     if (std::isinf(p)) {
         if (p > 0) return self.abs().max();
         else return self.abs().min();
@@ -203,6 +241,11 @@ Tensor norm_kernel(const Tensor& self, double p) {
 }
 
 Tensor norm_dim_kernel(const Tensor& self, std::vector<int64_t> dim, double p, bool keepdim) {
+    if (p == 2.0 &&
+        (self.dtype() == DType::Float32 || self.dtype() == DType::Float64 ||
+         self.dtype() == DType::Float16 || self.dtype() == DType::BFloat16)) {
+        return norm_dim_stub(DeviceType::CPU, self, dim, p, keepdim);
+    }
     if (std::isinf(p)) {
         Tensor abs = self.abs();
         if (p > 0) return Tensor::amax(abs, dim, keepdim);

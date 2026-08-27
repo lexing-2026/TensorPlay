@@ -328,13 +328,15 @@ class _LazyConvXdMixin(LazyModuleMixin):
     """
     cls_to_become = None
 
-    def __init__(self, in_channels, out_channels, kernel_size, stride,
-                 padding, dilation, transposed, output_padding,
-                 groups, bias, padding_mode, device=None, dtype=None):
+    def __init__(self, in_channels=0, out_channels=0, bias=True,
+                 device=None, dtype=None, **kwargs):
+        # ``kwargs`` carries the concrete ``Conv*.``__init__ arguments verbatim
+        # (kernel_size/stride/padding/...).  Routing through keywords avoids
+        # the positional mismatch between _ConvNd's transposed/output_padding
+        # slots and the public Conv classes' parameter order.
         factory_kwargs = {'device': device, 'dtype': dtype}
-        super().__init__(
-            in_channels, out_channels, kernel_size, stride, padding, dilation,
-            transposed, output_padding, groups, False, padding_mode, **factory_kwargs)
+        super().__init__(in_channels, out_channels, bias=bias,
+                         **kwargs, **factory_kwargs)
         if bias:
             self.bias = UninitializedParameter(**factory_kwargs)
         self.weight = UninitializedParameter(**factory_kwargs)
@@ -345,9 +347,10 @@ class _LazyConvXdMixin(LazyModuleMixin):
             super().reset_parameters()
 
     def initialize_parameters(self, *args, **kwargs) -> None:  # type: ignore[override]
-        self._infer_parameters(self, args[0])
+        self._infer_parameters(self, args, kwargs)
 
-    def _infer_parameters(self, module, input):
+    def _infer_parameters(self, module, args, kwargs=None):  # type: ignore[override]
+        input = args[0]
         module.in_channels = input.size(1)
         if module.transposed:
             module.weight = Parameter(tp.empty(
@@ -369,8 +372,10 @@ class LazyConv1d(_LazyConvXdMixin, Conv1d):
                  dilation=1, groups=1, bias=True, padding_mode='zeros',
                  device=None, dtype=None):
         super().__init__(
-            0, out_channels, _single(kernel_size), _single(stride), _single(padding),
-            _single(dilation), False, _single(0), groups, bias, padding_mode,
+            0, out_channels, bias=bias,
+            kernel_size=_single(kernel_size), stride=_single(stride),
+            padding=_single(padding), dilation=_single(dilation),
+            groups=groups, padding_mode=padding_mode,
             device=device, dtype=dtype)
 
     cls_to_become = Conv1d
@@ -381,8 +386,10 @@ class LazyConv2d(_LazyConvXdMixin, Conv2d):
                  dilation=1, groups=1, bias=True, padding_mode='zeros',
                  device=None, dtype=None):
         super().__init__(
-            0, out_channels, _pair(kernel_size), _pair(stride), _pair(padding),
-            _pair(dilation), False, _pair(0), groups, bias, padding_mode,
+            0, out_channels, bias=bias,
+            kernel_size=_pair(kernel_size), stride=_pair(stride),
+            padding=_pair(padding), dilation=_pair(dilation),
+            groups=groups, padding_mode=padding_mode,
             device=device, dtype=dtype)
 
     cls_to_become = Conv2d
@@ -393,8 +400,10 @@ class LazyConv3d(_LazyConvXdMixin, Conv3d):
                  dilation=1, groups=1, bias=True, padding_mode='zeros',
                  device=None, dtype=None):
         super().__init__(
-            0, out_channels, _triple(kernel_size), _triple(stride), _triple(padding),
-            _triple(dilation), False, _triple(0), groups, bias, padding_mode,
+            0, out_channels, bias=bias,
+            kernel_size=_triple(kernel_size), stride=_triple(stride),
+            padding=_triple(padding), dilation=_triple(dilation),
+            groups=groups, padding_mode=padding_mode,
             device=device, dtype=dtype)
 
     cls_to_become = Conv3d
@@ -405,9 +414,12 @@ class LazyConvTranspose1d(_LazyConvXdMixin, ConvTranspose1d):
                  output_padding=0, groups=1, bias=True, dilation=1,
                  padding_mode='zeros', device=None, dtype=None):
         super().__init__(
-            0, out_channels, _single(kernel_size), _single(stride), _single(padding),
-            _single(dilation), True, _single(output_padding), groups, bias,
-            padding_mode, device=device, dtype=dtype)
+            0, out_channels, bias=bias,
+            kernel_size=_single(kernel_size), stride=_single(stride),
+            padding=_single(padding), output_padding=_single(output_padding),
+            groups=groups, dilation=_single(dilation),
+            padding_mode=padding_mode,
+            device=device, dtype=dtype)
 
     cls_to_become = ConvTranspose1d
 
@@ -417,9 +429,12 @@ class LazyConvTranspose2d(_LazyConvXdMixin, ConvTranspose2d):
                  output_padding=0, groups=1, bias=True, dilation=1,
                  padding_mode='zeros', device=None, dtype=None):
         super().__init__(
-            0, out_channels, _pair(kernel_size), _pair(stride), _pair(padding),
-            _pair(dilation), True, _pair(output_padding), groups, bias,
-            padding_mode, device=device, dtype=dtype)
+            0, out_channels, bias=bias,
+            kernel_size=_pair(kernel_size), stride=_pair(stride),
+            padding=_pair(padding), output_padding=_pair(output_padding),
+            groups=groups, dilation=_pair(dilation),
+            padding_mode=padding_mode,
+            device=device, dtype=dtype)
 
     cls_to_become = ConvTranspose2d
 
@@ -429,8 +444,11 @@ class LazyConvTranspose3d(_LazyConvXdMixin, ConvTranspose3d):
                  output_padding=0, groups=1, bias=True, dilation=1,
                  padding_mode='zeros', device=None, dtype=None):
         super().__init__(
-            0, out_channels, _triple(kernel_size), _triple(stride), _triple(padding),
-            _triple(dilation), True, _triple(output_padding), groups, bias,
-            padding_mode, device=device, dtype=dtype)
+            0, out_channels, bias=bias,
+            kernel_size=_triple(kernel_size), stride=_triple(stride),
+            padding=_triple(padding), output_padding=_triple(output_padding),
+            groups=groups, dilation=_triple(dilation),
+            padding_mode=padding_mode,
+            device=device, dtype=dtype)
 
     cls_to_become = ConvTranspose3d

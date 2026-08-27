@@ -67,6 +67,9 @@ class Adam(Optimizer):
                         fused=fused,
                         decoupled_weight_decay=decoupled_weight_decay)
         super(Adam, self).__init__(params, defaults)
+        # Eager-only dispatch cache; it is intentionally not part of the
+        # serialized optimizer state.
+        self._tp_adam_layout_cache = {}
         if fused and differentiable:
             raise RuntimeError("`fused` does not support `differentiable`")
         if fused and foreach:
@@ -74,6 +77,8 @@ class Adam(Optimizer):
 
     def __setstate__(self, state):
         super().__setstate__(state)
+        if not hasattr(self, "_tp_adam_layout_cache"):
+            self._tp_adam_layout_cache = {}
         for group in self.param_groups:
             group.setdefault("amsgrad", False)
             group.setdefault("maximize", False)
@@ -111,11 +116,14 @@ class Adam(Optimizer):
                 state["step"] = tp.tensor(
                     0.0,
                     dtype=tp.float32,
-                    device=(
-                        p.device
-                        if group["capturable"] or group["fused"]
-                        else tp.device("cpu")
-                    ),
+                    # Match Torch's special host placement: a non-capturable,
+                    # non-fused optimizer keeps the scalar step on CPU even
+                    # when the parameter lives on CUDA.  This avoids a host
+                    # synchronization for every ordinary foreach step and is
+                    # also part of the native optimizer state contract.
+                    device=p.device
+                    if (group["capturable"] or group["fused"])
+                    else tp.device("cpu"),
                 )
                 state["exp_avg"] = zeros_like(p)
                 state["exp_avg_sq"] = zeros_like(p)
@@ -188,18 +196,186 @@ class Adam(Optimizer):
                 grad_scale=getattr(self, "grad_scale", None),
                 found_inf=getattr(self, "found_inf", None),
                 decoupled_weight_decay=group["decoupled_weight_decay"],
+                layout_cache=self._tp_adam_layout_cache.setdefault(id(group), {}),
             )
 
         return loss
+
+
+def _adam_layout_cache_key(
+        params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs, state_steps,
+        amsgrad, step_device):
+    """Build a cheap fingerprint for the fused-layout probe.
+
+    Materializing ``shape`` tuples for every tensor is costly for large
+    optimizer groups.  For the positive (contiguous) case, ``stride`` and
+    ``numel`` capture shape changes.  Parameter/state identities and data
+    pointers catch storage replacement; gradients intentionally use layout
+    metadata only so a newly allocated gradient from ``set_to_none=True``
+    does not invalidate an otherwise identical optimizer group.  The native
+    kernel still performs the authoritative full validation on every call.
+    """
+    key = [amsgrad, step_device, len(params)]
+    for p, g, m, v in zip(params, grads, exp_avgs, exp_avg_sqs, strict=True):
+        key.append((
+            id(p), id(m), id(v),
+            p.data_ptr(), m.data_ptr(), v.data_ptr(),
+            p.numel(), g.numel(), m.numel(), v.numel(),
+            g.dtype, g.device,
+            p.is_contiguous(), g.is_contiguous(),
+            m.is_contiguous(), v.is_contiguous(),
+            p.stride(), g.stride(), m.stride(), v.stride(),
+        ))
+    if amsgrad:
+        for p, max_v in zip(params, max_exp_avg_sqs, strict=True):
+            key.append((
+                id(p), id(max_v), max_v.data_ptr(), max_v.numel(),
+                max_v.is_contiguous(), max_v.stride(),
+            ))
+    for step in state_steps:
+        key.append((
+            id(step), step.data_ptr(), step.numel(),
+            step.is_contiguous(), step.stride(),
+        ))
+    return tuple(key)
+
+
+def _adam_fused_layout_ready(
+    params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs, state_steps,
+    amsgrad, step_device, layout_cache=None,
+):
+    """Check the layout accepted by the native fused Adam kernels.
+
+    The Python reference implementation accepts strided tensors.  Keeping
+    this check at the dispatch boundary is important: an explicit fused
+    attempt must not turn an otherwise valid foreach/single call into a
+    backend layout error, and a failed probe must not advance ``step`` twice.
+    """
+    if not params or len(params) != len(grads):
+        return False
+    first_device = params[0].device
+    first_dtype = params[0].dtype
+    if first_dtype not in (tp.float32, tp.float64):
+        # The exact low-precision path is only valid for the ordinary
+        # non-capturable host-step foreach sequence.  Device-step/capturable
+        # callers retain the existing fused or composed dispatch.
+        if step_device != "cpu" or first_dtype not in (tp.float16, tp.bfloat16):
+            return False
+    if first_device.type not in ("cpu", "cuda"):
+        return False
+    if len(exp_avgs) != len(params) or len(exp_avg_sqs) != len(params):
+        return False
+    if len(state_steps) != len(params):
+        return False
+    if amsgrad and len(max_exp_avg_sqs) != len(params):
+        return False
+    if not amsgrad and max_exp_avg_sqs:
+        return False
+
+    cache_key = None
+    if layout_cache is not None:
+        cache_key = _adam_layout_cache_key(
+            params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs,
+            state_steps, amsgrad, step_device,
+        )
+        if layout_cache.get("key") == cache_key:
+            return layout_cache["ready"]
+
+    ready = True
+    for p, g, m, v in zip(params, grads, exp_avgs, exp_avg_sqs, strict=True):
+        if (
+            p.device != first_device or p.dtype != first_dtype
+            or not p.is_contiguous()
+            or g.is_sparse or g.device != first_device
+            or g.dtype != first_dtype or g.shape != p.shape
+            or not g.is_contiguous()
+            or m.device != first_device or m.dtype != first_dtype
+            or m.shape != p.shape or not m.is_contiguous()
+            or v.device != first_device or v.dtype != first_dtype
+            or v.shape != p.shape or not v.is_contiguous()
+        ):
+            ready = False
+            break
+    if ready and amsgrad:
+        for p, max_v in zip(params, max_exp_avg_sqs, strict=True):
+            if (
+                max_v.device != first_device or max_v.dtype != first_dtype
+                or max_v.shape != p.shape or not max_v.is_contiguous()
+            ):
+                ready = False
+                break
+    if ready and step_device == "cpu":
+        ready = all(
+            step.device.type == "cpu"
+            and step.numel() == 1
+            and step.is_contiguous()
+            for step in state_steps
+        )
+    elif ready:
+        ready = all(
+            step.device == first_device
+            and step.numel() == 1
+            and step.is_contiguous()
+            for step in state_steps
+        )
+    if layout_cache is not None:
+        layout_cache["key"] = cache_key
+        layout_cache["ready"] = ready
+    return ready
 
 
 def _single_tensor_adam(
         params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs, state_steps,
         grad_scale, found_inf, *, amsgrad, has_complex, beta1, beta2, lr,
         weight_decay, eps, maximize, capturable, differentiable,
-        decoupled_weight_decay):
+        decoupled_weight_decay, layout_cache=None):
     if grad_scale is not None or found_inf is not None:
         raise AssertionError("Expected grad_scale and found_inf to be None")
+
+    # Common-case fast path: run each parameter through the native batch
+    # kernel independently (same per-parameter contract as the composed
+    # body below, one vectorized call instead of ~15 dispatched ops).
+    if not capturable and not differentiable:
+        lr_s = _to_scalar(lr)
+        b1_s = _to_scalar(beta1)
+        b2_s = _to_scalar(beta2)
+        fused_ready = (
+            isinstance(lr_s, (int, float))
+            and isinstance(b1_s, (int, float))
+            and isinstance(b2_s, (int, float))
+            and not isinstance(weight_decay, tp.Tensor)
+            and not isinstance(eps, tp.Tensor)
+            and _adam_fused_layout_ready(
+                params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs,
+                state_steps, amsgrad, "cpu",
+                layout_cache if not has_complex else None,
+            )
+        )
+        if fused_ready:
+            for i, param in enumerate(params):
+                plist = [param]
+                glist = [grads[i]]
+                mlist = [exp_avgs[i]]
+                vlist = [exp_avg_sqs[i]]
+                xlist = [max_exp_avg_sqs[i]] if amsgrad else []
+                step_t = state_steps[i]
+                host_cuda_step = (
+                    param.device.type == "cuda" and step_t.device.type == "cpu"
+                )
+                if not host_cuda_step:
+                    step_t.add_(1)
+                fused_fn = (
+                    tp._fused_adamw_
+                    if decoupled_weight_decay
+                    else tp._fused_adam_
+                )
+                fused_fn(
+                    plist, glist, mlist, vlist, xlist, [step_t],
+                    lr=lr_s, beta1=b1_s, beta2=b2_s,
+                    weight_decay=scalar_value(weight_decay, "weight_decay"),
+                    eps=scalar_value(eps, "eps"), amsgrad=amsgrad,
+                    maximize=maximize)
+            return
 
     lr = _to_scalar(lr)
     beta1 = _to_scalar(beta1)
@@ -209,6 +385,15 @@ def _single_tensor_adam(
         exp_avg = exp_avgs[i]
         exp_avg_sq = exp_avg_sqs[i]
         step_t = state_steps[i]
+
+        lr_param = (
+            lr.to(device=param.device) if isinstance(lr, tp.Tensor) else lr
+        )
+        weight_decay_param = (
+            weight_decay.to(device=param.device)
+            if isinstance(weight_decay, tp.Tensor)
+            else weight_decay
+        )
 
         if capturable:
             supported = _get_capturable_supported_devices()
@@ -221,9 +406,9 @@ def _single_tensor_adam(
 
         if weight_decay != 0:
             if decoupled_weight_decay:
-                param.mul_(1 - lr * weight_decay)
+                param.mul_(1 - lr_param * weight_decay_param)
             elif isinstance(weight_decay, tp.Tensor):
-                grad = grad + param * weight_decay
+                grad = grad + param * weight_decay_param
             else:
                 grad = grad.add(param, alpha=weight_decay)
 
@@ -236,13 +421,33 @@ def _single_tensor_adam(
             if amsgrad:
                 max_exp_avg_sqs[i] = tp.view_as_real(max_exp_avg_sqs[i])
 
-        exp_avg.mul_(beta1).add_(grad * (1 - beta1))
-        exp_avg_sq.mul_(beta2).add_(grad * grad * (1 - beta2))
+        beta1_param = (
+            beta1.to(device=exp_avg.device, dtype=exp_avg.dtype)
+            if isinstance(beta1, tp.Tensor) else beta1
+        )
+        beta2_param = (
+            beta2.to(device=exp_avg_sq.device, dtype=exp_avg_sq.dtype)
+            if isinstance(beta2, tp.Tensor) else beta2
+        )
+        if isinstance(beta1_param, tp.Tensor):
+            exp_avg.lerp_(grad, 1 - beta1_param)
+        else:
+            exp_avg.mul_(beta1_param).add_(grad * (1 - beta1_param))
+        if isinstance(beta2_param, tp.Tensor):
+            exp_avg_sq.lerp_(grad * grad, 1 - beta2_param)
+        else:
+            exp_avg_sq.mul_(beta2_param).add_(grad * grad * (1 - beta2_param))
 
-        if capturable or differentiable:
-            bias_correction1 = 1 - beta1 ** step_t
-            bias_correction2 = 1 - beta2 ** step_t
-            step_size = lr / bias_correction1
+        tensor_math = (
+            isinstance(lr_param, tp.Tensor)
+            or isinstance(beta1_param, tp.Tensor)
+            or isinstance(beta2_param, tp.Tensor)
+        )
+        if capturable or differentiable or tensor_math:
+            step = step_t if (capturable or differentiable) else _get_value(step_t)
+            bias_correction1 = 1 - beta1_param ** step
+            bias_correction2 = 1 - beta2_param ** step
+            step_size = lr_param / bias_correction1
             step_size_neg = -step_size
             if amsgrad:
                 max_exp_avg_sq = max_exp_avg_sqs[i]
@@ -250,7 +455,12 @@ def _single_tensor_adam(
                 numerator = max_exp_avg_sq.sqrt()
             else:
                 numerator = exp_avg_sq.sqrt()
-            denom = numerator / (bias_correction2.sqrt() * step_size_neg)
+            bias_correction2_sqrt = (
+                bias_correction2.sqrt()
+                if isinstance(bias_correction2, tp.Tensor)
+                else bias_correction2 ** 0.5
+            )
+            denom = numerator / (bias_correction2_sqrt * step_size_neg)
             denom.add_(eps / step_size_neg)
             update = exp_avg.clone() if differentiable else exp_avg
             param.addcdiv_(update, denom)
@@ -271,7 +481,7 @@ def _multi_tensor_adam(
         params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs, state_steps,
         grad_scale, found_inf, *, amsgrad, has_complex, beta1, beta2, lr,
         weight_decay, eps, maximize, capturable, differentiable,
-        decoupled_weight_decay):
+        decoupled_weight_decay, layout_cache=None):
     if not params:
         return
     if grad_scale is not None or found_inf is not None:
@@ -290,6 +500,17 @@ def _multi_tensor_adam(
         raise ValueError(
             "beta2 as a Tensor is not supported for capturable=False and foreach=True"
         )
+    if not tp.compiler.is_compiling() and capturable:
+        supported = _get_capturable_supported_devices()
+        if not all(
+            p.device.type == step.device.type
+            and p.device.type in supported
+            for p, step in zip(params, state_steps, strict=True)
+        ):
+            raise AssertionError(
+                "If capturable=True, params and state_steps must be on "
+                f"supported devices: {supported}."
+            )
 
     device_params = list(params)
     device_grads = list(grads)
@@ -308,9 +529,101 @@ def _multi_tensor_adam(
                 for v in device_max_exp_avg_sqs
             ]
 
+    native_host_steps = (
+        device_params
+        and device_params[0].device.type == "cuda"
+        and device_state_steps
+        and device_state_steps[0].device.type == "cpu"
+        and not capturable
+        and not has_complex
+        and not isinstance(lr, tp.Tensor)
+        and not isinstance(beta1, tp.Tensor)
+        and not isinstance(beta2, tp.Tensor)
+        and not isinstance(weight_decay, tp.Tensor)
+        and not isinstance(eps, tp.Tensor)
+        and _adam_fused_layout_ready(
+            device_params, device_grads, device_exp_avgs, device_exp_avg_sqs,
+            device_max_exp_avg_sqs, device_state_steps, amsgrad, "cpu",
+            layout_cache if not has_complex else None,
+        )
+    )
+    if not native_host_steps:
+        tp._foreach_add_(device_state_steps, 1)
+
+    # Torch keeps non-capturable Adam step counters on the host.  The native
+    # CUDA foreach entry point already has the same MTA layout as Torch's
+    # fused host-step path; use it before materialising the composed foreach
+    # intermediates.  The host kernel is minimizing internally, so materialize
+    # Torch's maximize convention as a negated gradient at the boundary.  This
+    # also preserves the native Adam/AdamW distinction: coupled decay is added
+    # to that gradient, while decoupled decay is applied to the parameter.
+    if native_host_steps:
+        fn_mta = (tp._fused_adamw_ if decoupled_weight_decay
+                  else tp._fused_adam_)
+        fn_mta(
+            device_params,
+            device_grads,
+            device_exp_avgs,
+            device_exp_avg_sqs,
+            device_max_exp_avg_sqs,
+            device_state_steps,
+            lr=lr,
+            beta1=beta1,
+            beta2=beta2,
+            weight_decay=weight_decay,
+            eps=eps,
+            amsgrad=amsgrad,
+            maximize=maximize,
+            exact=True,
+        )
+        return
+
+    # Native batch kernel: one dispatcher call advances the whole group
+    # (horizontally fused work list + vectorized inner loops), instead of
+    # ~15 foreach pointwise launches.  Math is identical to the composed
+    # path below; unsupported configurations fall through to it.
+    if (
+        not capturable
+        and not differentiable
+        and device_params
+        and device_params[0].dtype in (tp.float32, tp.float64)
+        and device_params[0].device.type in ("cpu", "cuda")
+        # fused kernels require state_steps colocated with params
+        and device_state_steps
+        and device_state_steps[0].device.type == device_params[0].device.type
+        and _adam_fused_layout_ready(
+            device_params, device_grads, device_exp_avgs, device_exp_avg_sqs,
+            device_max_exp_avg_sqs, device_state_steps, amsgrad, "device",
+            layout_cache if not has_complex else None,
+        )
+    ):
+        # Native fused kernels read state_steps on-device (no per-parameter
+        # host synchronization) and fuse the whole update into one launch.
+        simple_wd = not isinstance(weight_decay, tp.Tensor)
+        if simple_wd:
+            # state_steps were already incremented above.
+            fn_mta = (tp._fused_adamw_ if decoupled_weight_decay
+                      else tp._fused_adam_)
+            fn_mta(
+                device_params,
+                device_grads,
+                device_exp_avgs,
+                device_exp_avg_sqs,
+                list(device_max_exp_avg_sqs) if amsgrad else [],
+                device_state_steps,
+                lr=lr,
+                beta1=beta1,
+                beta2=beta2,
+                weight_decay=weight_decay,
+                eps=eps,
+                amsgrad=amsgrad,
+                maximize=maximize,
+                exact=True,
+            )
+            return
+
     if maximize:
         device_grads = tp._foreach_neg(device_grads)
-    tp._foreach_add_(device_state_steps, 1)
 
     if weight_decay != 0:
         if decoupled_weight_decay:
@@ -381,7 +694,7 @@ def _fused_adam(
         params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs, state_steps,
         grad_scale, found_inf, *, amsgrad, has_complex, beta1, beta2, lr,
         weight_decay, eps, maximize, capturable, differentiable,
-        decoupled_weight_decay):
+        decoupled_weight_decay, layout_cache=None):
     if not params:
         return
     if differentiable:
@@ -437,7 +750,13 @@ def _fused_adam(
             lr_dict[device] = lr.to(device=device, non_blocking=True)
             lr = lr_dict[device]
 
-        tp._foreach_add_(device_state_steps, 1)
+        host_cuda_steps = (
+            device.type == "cuda"
+            and device_state_steps
+            and device_state_steps[0].device.type == "cpu"
+        )
+        if not host_cuda_steps:
+            tp._foreach_add_(device_state_steps, 1)
         fn = tp._fused_adamw_ if decoupled_weight_decay else tp._fused_adam_
         fn(
             device_params,
@@ -469,7 +788,7 @@ def adam(
         foreach=None, capturable=False, differentiable=False, fused=None,
         grad_scale=None, found_inf=None, has_complex=False,
         decoupled_weight_decay=False, *, amsgrad, beta1, beta2, lr,
-        weight_decay, eps, maximize):
+        weight_decay, eps, maximize, layout_cache=None):
     """Functional API that performs the Adam algorithm computation."""
     if fused is None and foreach is None:
         _, foreach = _default_to_fused_or_foreach(
@@ -514,4 +833,5 @@ def adam(
         capturable=capturable,
         differentiable=differentiable,
         decoupled_weight_decay=decoupled_weight_decay,
+        layout_cache=layout_cache,
     )

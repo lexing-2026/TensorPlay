@@ -1,16 +1,19 @@
 """Private utilities shared across ``tensorplay.vision``.
 
-``_log_api_usage_once`` mirrors torchvision/utils.py (no-op unless a logger is
+``_log_api_usage_once`` mirrors tensorplay.vision/utils.py (no-op unless a logger is
 subscribed).  ``_Image_fromarray`` mirrors the PIL interop helper.
 """
 
 import logging
+import pathlib
 from types import FunctionType
-from typing import Any
+from typing import Any, BinaryIO, Optional, Union
+
+import tensorplay
 
 
 def _log_api_usage_once(obj: Any) -> None:
-    """Logs API usage(module and name) once per process (torchvision/utils.py)."""
+    """Logs API usage(module and name) once per process (tensorplay.vision/utils.py)."""
     module = obj.__module__
     if not module.startswith("tensorplay"):
         module = f"tensorplay.internal.{module}"
@@ -23,8 +26,8 @@ def _log_api_usage_once(obj: Any) -> None:
 
 
 def _make_ntuple(x: Any, n: int) -> tuple:
-    """Make n-tuple from input x (torchvision/utils.py _make_ntuple,
-    reference torch/nn/modules/utils.py)."""
+    """Make n-tuple from input x (tensorplay.vision/utils.py _make_ntuple,
+    reference tensorplay/nn/modules/utils.py)."""
     from itertools import repeat
 
     import collections.abc
@@ -35,7 +38,7 @@ def _make_ntuple(x: Any, n: int) -> tuple:
 
 
 def _Image_fromarray(data, mode=None):
-    """Converts a numpy array to a PIL Image (torchvision/utils.py).
+    """Converts a numpy array to a PIL Image (tensorplay.vision/utils.py).
 
     Kept as a function indirection so the tensor backend could be swapped in.
     """
@@ -49,14 +52,14 @@ def _Image_fromarray(data, mode=None):
 # only the torch -> tensorplay imports were rewritten.
 # ---------------------------------------------------------------------------
 def make_grid(
-    tensor: Union[torch.Tensor, list[torch.Tensor]],
+    tensor: Union[tensorplay.Tensor, list[tensorplay.Tensor]],
     nrow: int = 8,
     padding: int = 2,
     normalize: bool = False,
     value_range: Optional[tuple[int, int]] = None,
     scale_each: bool = False,
     pad_value: float = 0.0,
-) -> torch.Tensor:
+) -> tensorplay.Tensor:
     """
     Make a grid of images.
 
@@ -78,29 +81,29 @@ def make_grid(
     Returns:
         grid (Tensor): the tensor containing grid of images.
     """
-    if not torch.jit.is_scripting() and not torch.jit.is_tracing():
+    if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
         _log_api_usage_once(make_grid)
-    if not torch.is_tensor(tensor):
+    if not tensorplay.is_tensor(tensor):
         if isinstance(tensor, list):
             for t in tensor:
-                if not torch.is_tensor(t):
+                if not tensorplay.is_tensor(t):
                     raise TypeError(f"tensor or list of tensors expected, got a list containing {type(t)}")
         else:
             raise TypeError(f"tensor or list of tensors expected, got {type(tensor)}")
 
     # if list of tensors, convert to a 4D mini-batch Tensor
     if isinstance(tensor, list):
-        tensor = torch.stack(tensor, dim=0)
+        tensor = tensorplay.stack(tensor, dim=0)
 
     if tensor.dim() == 2:  # single image H x W
         tensor = tensor.unsqueeze(0)
     if tensor.dim() == 3:  # single image
         if tensor.size(0) == 1:  # if single-channel, convert to 3-channel
-            tensor = torch.cat((tensor, tensor, tensor), 0)
+            tensor = tensorplay.cat((tensor, tensor, tensor), 0)
         tensor = tensor.unsqueeze(0)
 
     if tensor.dim() == 4 and tensor.size(1) == 1:  # single-channel images
-        tensor = torch.cat((tensor, tensor, tensor), 1)
+        tensor = tensorplay.cat((tensor, tensor, tensor), 1)
 
     if normalize is True:
         tensor = tensor.clone()  # avoid modifying tensor in-place
@@ -123,8 +126,8 @@ def make_grid(
         else:
             norm_range(tensor, value_range)
 
-    if not isinstance(tensor, torch.Tensor):
-        raise TypeError("tensor should be of type torch.Tensor")
+    if not isinstance(tensor, tensorplay.Tensor):
+        raise TypeError("tensor should be of type tensorplay.Tensor")
     if tensor.size(0) == 1:
         return tensor.squeeze(0)
 
@@ -151,7 +154,7 @@ def make_grid(
 
 
 def save_image(
-    tensor: Union[torch.Tensor, list[torch.Tensor]],
+    tensor: Union[tensorplay.Tensor, list[tensorplay.Tensor]],
     fp: Union[str, pathlib.Path, BinaryIO],
     format: Optional[str] = None,
     **kwargs,
@@ -168,11 +171,11 @@ def save_image(
         **kwargs: Other arguments are documented in ``make_grid``.
     """
 
-    if not torch.jit.is_scripting() and not torch.jit.is_tracing():
+    if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
         _log_api_usage_once(save_image)
     grid = make_grid(tensor, **kwargs)
     # Add 0.5 after unnormalizing to [0, 255] to round to the nearest integer
-    ndarr = grid.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to("cpu", torch.uint8).numpy()
+    ndarr = grid.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to("cpu", tensorplay.uint8).numpy()
     im = Image.fromarray(ndarr)
     im.save(fp, format=format)
 

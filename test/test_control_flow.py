@@ -3,7 +3,6 @@
 import pytest
 
 import tensorplay as tp
-from tensorplay.compiler.graph import GraphCaptureError
 
 
 @pytest.fixture(autouse=True)
@@ -79,14 +78,25 @@ def test_len_of_proxy_uses_sample():
     assert out.tolist() == [1.0, 2.0]
 
 
-def test_data_dependent_control_flow_still_rejected():
+def test_data_dependent_control_flow_specializes_with_guards():
+    """D1: execute-mode capture bakes the traced branch and guards its data.
+
+    The symbolic tracer still rejects (see
+    ``test_compile.py::test_symbolic_tracer_still_rejects_data_dependent_control_flow``);
+    ``compile()`` captures with sample execution and promotes the feeding
+    placeholders into byte-exact data guards.
+    """
+
     def fn(x):
         if bool((x > 0).all()):
             return x * 2
         return x
 
-    with pytest.raises(GraphCaptureError):
-        tp.compile(fn, fullgraph=True)(tp.tensor([1.0, -1.0]))
+    compiled = tp.compile(fn, fullgraph=True)
+    mixed = tp.tensor([1.0, -1.0])
+    assert compiled(mixed).tolist() == [1.0, -1.0]
+    # Branch flip recompiles instead of reusing the wrong side.
+    assert compiled(tp.tensor([2.0, 3.0])).tolist() == [4.0, 6.0]
 
 
 def test_sample_inputs_recorded_on_graph_module():
@@ -116,3 +126,37 @@ def test_tracer_without_samples_keeps_symbolic_shape():
     # resolving to a concrete tuple in Python.
     assert any(getattr(t, "__name__", None) == "getattr" for t in targets)
     assert "sample_inputs" not in gm.meta
+
+
+def test_compiler_gate_keeps_scalar_symbolic():
+    """UPV-native path: gate() values flow as tensor proxies; one spec."""
+
+    def fn(x):
+        n = tp.compiler.gate(x.sum())
+        return x * n
+
+    compiled = tp.compile(fn, fullgraph=True)
+    results = [compiled(tp.tensor([float(i)])).tolist() for i in range(6)]
+    assert results == [[float(i * i)] for i in range(6)]
+    # Value recomputes inside the artifact; cache never fragments on it.
+    assert len(compiled._tensorplay_cache) == 1
+
+
+def test_plain_int_consumption_stays_baked_and_keyed():
+    """Without gate(), numeric consumption specializes into the key."""
+
+    def fn(x):
+        return x + int(x.sum().item())
+
+    compiled = tp.compile(fn, fullgraph=True)
+    assert compiled(tp.tensor([1.0])).tolist() == [2.0]
+    assert compiled(tp.tensor([5.0])).tolist() == [10.0]
+    assert compiled(tp.tensor([1.0])).tolist() == [2.0]
+    # Two distinct baked constants -> two entries; reuse only on same value.
+    assert len(compiled._tensorplay_cache) == 2
+
+
+def test_gate_outside_capture_raises():
+    t = tp.tensor([1.0])
+    with pytest.raises(tp.compiler.GraphCaptureError):
+        tp.compiler.gate(t.sum())

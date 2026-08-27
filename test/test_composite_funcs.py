@@ -361,7 +361,7 @@ class TestStats:
         p = tp.arange(12).to(DType.float64).reshape([3, 4])
         q64 = torch.tensor([0.25, 0.75], dtype=torch.float64)
         ref = torch.quantile(x, q64, dim=1)
-        got = tp.quantile(p, tp.tensor([0.25, 0.75]), dim=1)
+        got = tp.quantile(p, tp.tensor([0.25, 0.75], dtype=tp.float64), dim=1)
         assert tuple(got.shape) == tuple(ref.shape)
         assert close(got.tolist(), ref.tolist())
         refk = torch.quantile(x, torch.tensor(0.5, dtype=torch.float64),
@@ -733,3 +733,122 @@ class TestAtLeastSequenceRegression:
         ts = torch.tensor(7.0, requires_grad=True)
         torch.atleast_3d(ts).sum().backward()
         assert s.grad.tolist() == ts.grad.tolist()
+
+
+class TestNativeDropoutFamily:
+    """alpha/feature dropout: native fused kernels + generated backward."""
+
+    def test_alpha_dropout_saturation_constant(self):
+        import math as _m
+        p = 0.3
+        alpha = 1.7580993408473766
+        a = 1.0 / _m.sqrt((alpha * alpha * p + 1) * (1 - p))
+        sat = alpha * a * (p - 1)
+        xs = [5.0 + i for i in range(256)]
+        got = tp.alpha_dropout(tp.tensor([xs]), p, True).tolist()[0]
+        ref = torch.nn.functional.alpha_dropout(
+            torch.tensor([xs]), p, True)[0].tolist()
+        # both contain the exact saturation constant among their values
+        assert any(abs(v - sat) < 1e-6 for v in got)
+        assert any(abs(v - sat) < 1e-6 for v in ref)
+
+    def test_alpha_dropout_stats(self):
+        torch.manual_seed(3)
+        x = torch.randn(400) * 2 + 1
+        ya = torch.nn.functional.alpha_dropout(x, 0.25, True)
+        pa = tp.alpha_dropout(tp.tensor(x.tolist()), 0.25, True)
+        for t in (ya, pa):
+            flat = t.tolist()
+            m = sum(flat) / len(flat)
+            sd = (sum(v * v for v in flat) / len(flat)) ** .5
+            # SELU-domain invariants are only approximate on finite samples
+            assert abs(sd - 2.0) < 0.6
+
+    def test_feature_dropout_channel_zeroing(self):
+        xf = torch.randn(4, 32, 8, 8)
+        pf = tp.feature_dropout(tp.tensor(xf.tolist()), 0.9, True)
+        arr = pf.tolist()
+
+        def chan_max(a, c):
+            return max(abs(v) for s in a for ch in [s[c]]
+                       for row in ch for v in row)
+        zeroed = sum(1 for c in range(32) if chan_max(arr, c) == 0)
+        assert zeroed > 10  # p=0.9 -> most channels zeroed
+        # mask is independent per (sample, channel): kept entries of the
+        # output equal input scaled by exactly 1/(1-p) = 10
+        ratios = [arr[s][c][i][j] / x for s in range(4) for c in range(32)
+                  for i in range(8) for j in range(8)
+                  if (x := xf[s][c][i][j].item()) != 0
+                  and arr[s][c][i][j] != 0]
+        assert len(ratios) > 8 and all(abs(k - 10.0) < 1e-3 for k in ratios[:16])
+
+    def test_short_circuits(self):
+        x = tp.tensor([1.0, 2.0])
+        assert tp.alpha_dropout(x, 1.0, True).tolist() == [0.0, 0.0]
+        assert tp.alpha_dropout(x, 0.5, False).tolist() == [1.0, 2.0]
+        assert tp.feature_dropout(tp.ones([1, 2, 2]), 0.5, False).sum().item() == 4.0
+        with pytest.raises(RuntimeError):
+            tp.feature_dropout(tp.tensor([1.0]), 0.5, True)
+
+    def test_grads_flow(self):
+        a = tp.tensor([[1.5, -0.7], [0.3, 2.2]]).requires_grad_(True)
+        tp.alpha_dropout(a, 0.3, True).sum().backward()
+        assert a.grad is not None
+        b = tp.tensor([[[[1.0, 2.0], [3.0, 4.0]],
+                        [[5.0, 6.0], [7.0, 8.0]]]]).requires_grad_(True)
+        tp.feature_dropout(b, 0.4, True).sum().backward()
+        assert b.grad is not None
+
+    def test_top_level_reexports(self):
+        for n in ("dropout", "dropout_", "alpha_dropout", "feature_dropout",
+                  "feature_dropout_", "feature_alpha_dropout", "rrelu",
+                  "rrelu_", "bilinear", "ctc_loss", "embedding_bag",
+                  "conv_tbc", "max_pool3d", "max_pool1d_with_indices",
+                  "native_channel_shuffle"):
+            assert callable(getattr(tp, n)), n
+
+
+class TestNativeTrapezoid:
+    """trapezoid / cumulative_trapezoid: native fused kernels, values and
+    gradients must match torch exactly (weights rebuilt in the backward)."""
+
+    def test_forward_dx_x_dim(self):
+        y = tp.tensor([1.0, 4.0, 9.0, 16.0])
+        ry = torch.tensor([1., 4., 9., 16.])
+        assert tp.trapezoid(y, dx=2.0).item() == \
+            torch.trapezoid(ry, dx=2.0).item()
+        xs = tp.tensor([0.0, 1.0, 3.0, 6.0])
+        rxs = torch.tensor([0., 1., 3., 6.])
+        assert tp.trapezoid(y, xs).item() == \
+            torch.trapezoid(ry, rxs).item()
+        m = tp.arange(12).to(DType.float32).reshape([3, 4]).add(1)
+        rm = torch.arange(12.).reshape(3, 4) + 1
+        assert tp.trapezoid(m, dx=0.5, dim=1).tolist() == \
+            torch.trapezoid(rm, dx=0.5, dim=1).tolist()
+
+    def test_cumulative_forward(self):
+        y = tp.tensor([1.0, 4.0, 9.0, 16.0])
+        ry = torch.tensor([1., 4., 9., 16.])
+        assert tp.cumulative_trapezoid(y, dx=1.0).tolist() == \
+            torch.cumulative_trapezoid(ry, dx=1.0).tolist()
+
+    def test_grads_exact(self):
+        y = [1.0, 4.0, 9.0, 16.0]
+        # dx form
+        a = tp.tensor(y).requires_grad_(True)
+        tp.trapezoid(a, dx=2.0).backward()
+        b = torch.tensor(y, requires_grad=True)
+        torch.trapezoid(b, dx=2.0).backward()
+        assert a.grad.tolist() == b.grad.tolist() == [1.0, 2.0, 2.0, 1.0]
+        # x form
+        c = tp.tensor(y).requires_grad_(True)
+        tp.trapezoid(c, tp.tensor([0.0, 1.0, 3.0, 6.0])).backward()
+        d = torch.tensor(y, requires_grad=True)
+        torch.trapezoid(d, torch.tensor([0., 1., 3., 6.])).backward()
+        assert c.grad.tolist() == d.grad.tolist() == [0.5, 1.5, 2.5, 1.5]
+        # cumulative dx
+        e = tp.tensor(y).requires_grad_(True)
+        tp.cumulative_trapezoid(e, dx=1.0).sum().backward()
+        f = torch.tensor(y, requires_grad=True)
+        torch.cumulative_trapezoid(f, dx=1.0).sum().backward()
+        assert e.grad.tolist() == f.grad.tolist() == [1.5, 2.5, 1.5, 0.5]

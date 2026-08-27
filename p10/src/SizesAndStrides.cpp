@@ -145,6 +145,12 @@ bool SizesAndStrides::is_contiguous() const {
         return true;
     }
 
+    // Torch parity (c10 _compute_contiguous): zero-numel tensors are always
+    // contiguous regardless of strides.
+    for (size_t i = 0; i < size_; ++i) {
+        if (sizes_data()[i] == 0) return true;
+    }
+
     // Walk expected contiguous strides without materializing them. A
     // dimension of extent 1 accepts any stride, matching PyTorch semantics.
     int64_t expected = 1;
@@ -167,13 +173,168 @@ std::vector<int64_t> SizesAndStrides::compute_contiguous_strides(const std::vect
         return strides;
     }
 
-    // Compute strides from last dimension to first
+    // Torch parity (TensorImpl::empty_tensor_restride): compute from the last
+    // dim, never collapsing across a zero-sized dim -- stride[i] is
+    // stride[i+1] * max(size[i+1], 1), so e.g. shape (2, 0) gets (1, 1).
     strides.back() = 1;
     for (int64_t i = static_cast<int64_t>(sizes.size()) - 2; i >= 0; --i) {
-        strides[i] = strides[i + 1] * sizes[i + 1];
+        strides[i] = strides[i + 1] * std::max<int64_t>(sizes[i + 1], 1);
     }
 
     return strides;
+}
+
+// Port of at::detail::computeStride (aten/src/ATen/TensorUtils.cpp):
+// 1. separate `oldshape` into chunks of dimensions that are contiguous within
+//    each chunk, i.e. oldstride[i] == oldshape[i+1] * oldstride[i+1]
+// 2. `newshape` must split into the same number of chunks, each with matching
+//    numel.  Size-1 dims are skipped, so non-contiguous layouts that still
+//    admit the view (same-shape views, subspace views) succeed.
+std::optional<std::vector<int64_t>> SizesAndStrides::compute_view_strides(
+    const std::vector<int64_t>& oldshape,
+    const std::vector<int64_t>& oldstride,
+    const std::vector<int64_t>& newshape) {
+    if (oldshape.empty()) {
+        return std::vector<int64_t>(newshape.size(), 1);
+    }
+
+    int64_t numel = 1;
+    for (int64_t s : oldshape) numel *= s;
+
+    // NOTE: stride is arbitrary in the numel() == 0 case; to match NumPy
+    // behavior we copy the strides if the size matches, otherwise we use the
+    // stride as if it were computed via resize.
+    const bool zero_numel = (numel == 0);
+    if (zero_numel && oldshape == newshape) {
+        return oldstride;
+    }
+
+    std::vector<int64_t> newstride(newshape.size());
+    if (zero_numel) {
+        for (int64_t view_d = static_cast<int64_t>(newshape.size()) - 1; view_d >= 0; --view_d) {
+            if (view_d == static_cast<int64_t>(newshape.size()) - 1) {
+                newstride[view_d] = 1;
+            } else {
+                newstride[view_d] =
+                    std::max<int64_t>(newshape[view_d + 1], 1) * newstride[view_d + 1];
+            }
+        }
+        return newstride;
+    }
+
+    int64_t view_d = static_cast<int64_t>(newshape.size()) - 1;
+    // stride for each subspace in the chunk
+    int64_t chunk_base_stride = oldstride.back();
+    // numel in current chunk
+    int64_t tensor_numel = 1;
+    int64_t view_numel = 1;
+    for (int64_t tensor_d = static_cast<int64_t>(oldshape.size()) - 1; tensor_d >= 0; --tensor_d) {
+        tensor_numel *= oldshape[tensor_d];
+        // if end of tensor size chunk, check view
+        if ((tensor_d == 0) ||
+            (oldshape[tensor_d - 1] != 1 &&
+             oldstride[tensor_d - 1] != tensor_numel * chunk_base_stride)) {
+            while (view_d >= 0 &&
+                   (view_numel < tensor_numel || newshape[view_d] == 1)) {
+                newstride[view_d] = view_numel * chunk_base_stride;
+                view_numel *= newshape[view_d];
+                --view_d;
+            }
+            if (view_numel != tensor_numel) {
+                return std::nullopt;
+            }
+            if (tensor_d > 0) {
+                chunk_base_stride = oldstride[tensor_d - 1];
+                tensor_numel = 1;
+                view_numel = 1;
+            }
+        }
+    }
+    if (view_d != -1) {
+        return std::nullopt;
+    }
+    return newstride;
+}
+
+namespace {
+// Torch-style shape spelling for error messages: "[2, -1]".
+std::string shape_str(const std::vector<int64_t>& shape) {
+    std::ostringstream oss;
+    oss << "[";
+    for (size_t i = 0; i < shape.size(); ++i) {
+        if (i > 0) oss << ", ";
+        oss << shape[i];
+    }
+    oss << "]";
+    return oss.str();
+}
+} // namespace
+
+std::vector<int64_t> SizesAndStrides::infer_size(const std::vector<int64_t>& shape, int64_t numel) {
+    std::vector<int64_t> inferred = shape;
+    int64_t newsize = 1;
+    int64_t infer_dim = -1;
+    for (size_t dim = 0; dim < inferred.size(); ++dim) {
+        if (inferred[dim] == -1) {
+            if (infer_dim != -1) TP_THROW(RuntimeError, "only one dimension can be inferred");
+            infer_dim = static_cast<int64_t>(dim);
+        } else {
+            if (inferred[dim] < -1) {
+                TP_THROW(RuntimeError, "invalid shape dimension " + std::to_string(inferred[dim]));
+            }
+            newsize *= inferred[dim];
+        }
+    }
+
+    if (infer_dim != -1) {
+        if (!((newsize > 0 && numel % newsize == 0) || numel == newsize)) {
+            TP_THROW(RuntimeError, "shape '" + shape_str(shape) +
+                     "' is invalid for input of size " + std::to_string(numel));
+        }
+        if (newsize == 0) {
+            TP_THROW(RuntimeError, "cannot reshape tensor of 0 elements into shape " +
+                     shape_str(shape) +
+                     " because the unspecified dimension size -1 can be any value and is ambiguous");
+        }
+        inferred[infer_dim] = numel / newsize;
+    } else if (numel != newsize) {
+        TP_THROW(RuntimeError, "shape '" + shape_str(shape) +
+                 "' is invalid for input of size " + std::to_string(numel));
+    }
+    return inferred;
+}
+
+// Port of c10::_compute_non_overlapping_and_dense (c10/core/Contiguity.h):
+// sort dims by stride (size-0/1 dims sink to the end) and require each
+// remaining dim to pick up exactly the running product as its stride.
+bool SizesAndStrides::is_non_overlapping_and_dense(
+    const std::vector<int64_t>& sizes, const std::vector<int64_t>& strides) {
+    const int64_t dim = static_cast<int64_t>(sizes.size());
+    if (dim == 1) {
+        return sizes[0] < 2 || strides[0] == 1;
+    }
+    std::vector<int64_t> perm(dim);
+    for (int64_t i = 0; i < dim; ++i) perm[static_cast<size_t>(i)] = i;
+    std::sort(perm.begin(), perm.end(), [&](int64_t a, int64_t b) {
+        if (sizes[static_cast<size_t>(a)] < 2) {
+            return false;
+        } else if (sizes[static_cast<size_t>(b)] < 2) {
+            return true;
+        }
+        return strides[static_cast<size_t>(a)] < strides[static_cast<size_t>(b)];
+    });
+    int64_t require_stride = 1;
+    for (int64_t i = 0; i < dim; ++i) {
+        const int64_t size_perm_i = sizes[static_cast<size_t>(perm[static_cast<size_t>(i)])];
+        if (size_perm_i < 2) {
+            return true;
+        }
+        if (strides[static_cast<size_t>(perm[static_cast<size_t>(i)])] != require_stride) {
+            return false;
+        }
+        require_stride *= size_perm_i;
+    }
+    return true;
 }
 
 std::string SizesAndStrides::toString() const {
