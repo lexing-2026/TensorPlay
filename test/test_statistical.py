@@ -84,8 +84,27 @@ class TestStatisticalOps(unittest.TestCase):
                 # PyTorch max(dim) returns (values, indices). TensorPlay max.dim returns Tensor.
                 # So we should compare with data.amax(dim=...) or data.max(dim=...).values
                 
-                self.assertTensorClose(tp_tensor.max(dim=[0]), data.amax(dim=0))
-                self.assertTensorClose(tp_tensor.min(dim=[0], keepdim=True), data.amin(dim=0, keepdim=True))
+                self.assertTensorClose(tp_tensor.max(dim=0)[0], data.amax(dim=0))
+                self.assertTensorClose(tp_tensor.min(dim=0, keepdim=True)[0], data.amin(dim=0, keepdim=True))
+
+    def test_amax_amin_nan_propagates(self):
+        """torch treats NaN as greater than any number in amax/amin/aminmax."""
+        data = torch.tensor([1.0, float("nan"), 3.0])
+        x = tp.tensor(data.numpy())
+        self.assertTensorClose(tp.amax(x), torch.amax(data))
+        self.assertTensorClose(tp.amin(x), torch.amin(data))
+        mn, mx = tp.aminmax(x)
+        self.assertTensorClose(mn, torch.aminmax(data).min)
+        self.assertTensorClose(mx, torch.aminmax(data).max)
+        # NaN position must not matter (first-NaN wins under strict >)
+        data2 = torch.tensor([float("nan"), 1.0, float("nan"), -2.0])
+        x2 = tp.tensor(data2.numpy())
+        self.assertTensorClose(tp.amax(x2), torch.amax(data2))
+        self.assertTensorClose(tp.amin(x2), torch.amin(data2))
+        # dim-reduction variant on a NaN-free column must stay exact
+        m = torch.tensor([[1.0, float("nan")], [5.0, 2.0]])
+        mm = tp.tensor(m.numpy())
+        self.assertTensorClose(tp.amax(mm, dim=1), torch.amax(m, dim=1))
 
     def test_pow(self):
         shape = (5, 5)

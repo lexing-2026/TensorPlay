@@ -24,10 +24,15 @@ namespace tensorplay {
 namespace cuda {
 namespace foreach_mta {
 
+// Keep the metadata conservative enough for CUDA's pre-13 kernel argument
+// limit, but match Torch's block geometry.  The important part here is the
+// ILP=4 loop below: a 512-thread block covers a 64K chunk in 32 iterations
+// instead of 256 scalar iterations with the old 256-thread kernel.
 constexpr int32_t kMaxTensorsPerLaunch = 32;
-constexpr int32_t kMaxBlocksPerLaunch = 256;
+constexpr int32_t kMaxBlocksPerLaunch = 320;
 constexpr int64_t kChunkSize = 65536;
-constexpr int32_t kBlockSize = 256;
+constexpr int32_t kILP = 4;
+constexpr int32_t kBlockSize = 512;
 
 template <typename T>
 struct opmath_type {
@@ -44,6 +49,25 @@ struct opmath_type<BFloat16> {
 
 template <typename T>
 using opmath_t = typename opmath_type<T>::type;
+
+template <typename T>
+struct alignas(kILP * sizeof(T)) AlignedVec {
+    T values[kILP];
+};
+
+template <typename T>
+__device__ __forceinline__ bool is_aligned(const T* ptr) {
+    return (reinterpret_cast<uintptr_t>(ptr) &
+            ((kILP * sizeof(T)) - 1)) == 0;
+}
+
+template <typename T>
+__device__ __forceinline__ void load_store(
+        T* dst, const T* src, int64_t dst_offset, int64_t src_offset) {
+    using Vec = AlignedVec<T>;
+    reinterpret_cast<Vec*>(dst)[dst_offset] =
+        reinterpret_cast<const Vec*>(src)[src_offset];
+}
 
 inline bool supported_dtype(DType dtype) {
     return dtype == DType::Float16 || dtype == DType::BFloat16 ||
@@ -127,19 +151,65 @@ __global__ void multi_tensor_kernel(TensorListMetadata<Depth> metadata, Op op) {
                           kChunkSize;
     const int64_t end = metadata.numel_for_tensor[tensor_index];
 
-    for (int64_t index = begin + static_cast<int64_t>(threadIdx.x);
-         index < end; index += static_cast<int64_t>(blockDim.x)) {
-        M values[Depth];
+    const T* inputs[Depth];
+    T* output = const_cast<T*>(static_cast<const T*>(
+        metadata.addresses[OutputIndex][tensor_index]));
 #pragma unroll
-        for (int depth = 0; depth < Depth; ++depth) {
-            const T* input = static_cast<const T*>(
-                metadata.addresses[depth][tensor_index]);
-            values[depth] = static_cast<M>(input[index]);
+    for (int depth = 0; depth < Depth; ++depth) {
+        inputs[depth] = static_cast<const T*>(
+            metadata.addresses[depth][tensor_index]);
+    }
+
+    const int64_t count = end - begin;
+    bool aligned = (count % kILP == 0) && (kChunkSize % kILP == 0);
+#pragma unroll
+    for (int depth = 0; depth < Depth; ++depth) {
+        aligned = aligned && is_aligned(inputs[depth] + begin);
+    }
+    aligned = aligned && is_aligned(output + begin);
+
+    if (aligned) {
+        // Match ATen's aligned_vector path.  The vector index is in units of
+        // four scalar elements, so each thread performs four contiguous
+        // loads/stores and the block needs only 32 loop rounds per chunk.
+        alignas(kILP * sizeof(T)) T packed[Depth][kILP];
+        for (int64_t vector_index = static_cast<int64_t>(threadIdx.x);
+             vector_index * kILP < count &&
+                 vector_index * kILP < kChunkSize;
+             vector_index += static_cast<int64_t>(blockDim.x)) {
+#pragma unroll
+            for (int depth = 0; depth < Depth; ++depth) {
+                load_store(packed[depth], inputs[depth] + begin,
+                           0, vector_index);
+            }
+#pragma unroll
+            for (int lane = 0; lane < kILP; ++lane) {
+                M values[Depth];
+#pragma unroll
+                for (int depth = 0; depth < Depth; ++depth) {
+                    values[depth] = static_cast<M>(packed[depth][lane]);
+                }
+                packed[OutputIndex][lane] = static_cast<T>(op(values));
+            }
+            load_store(output + begin, packed[OutputIndex],
+                       vector_index, 0);
         }
-        const M result = op(values);
-        T* output = const_cast<T*>(static_cast<const T*>(
-            metadata.addresses[OutputIndex][tensor_index]));
-        output[index] = static_cast<T>(result);
+    } else {
+        for (int64_t i_start = 0; i_start < count && i_start < kChunkSize;
+             i_start += static_cast<int64_t>(blockDim.x) * kILP) {
+#pragma unroll
+            for (int lane = 0; lane < kILP; ++lane) {
+                const int64_t index = i_start + threadIdx.x +
+                                      static_cast<int64_t>(lane) * blockDim.x;
+                if (index >= count) continue;
+                M values[Depth];
+#pragma unroll
+                for (int depth = 0; depth < Depth; ++depth) {
+                    values[depth] = static_cast<M>(inputs[depth][begin + index]);
+                }
+                output[begin + index] = static_cast<T>(op(values));
+            }
+        }
     }
 }
 
@@ -155,19 +225,63 @@ __global__ void multi_tensor_scalar_list_kernel(
         ? static_cast<M>(metadata.scalar_values_float[tensor_index])
         : static_cast<M>(metadata.scalar_values_double[tensor_index]);
 
-    for (int64_t index = begin + static_cast<int64_t>(threadIdx.x);
-         index < end; index += static_cast<int64_t>(blockDim.x)) {
-        M values[Depth];
+    const T* inputs[Depth];
+    T* output = const_cast<T*>(static_cast<const T*>(
+        metadata.addresses[OutputIndex][tensor_index]));
 #pragma unroll
-        for (int depth = 0; depth < Depth; ++depth) {
-            const T* input = static_cast<const T*>(
-                metadata.addresses[depth][tensor_index]);
-            values[depth] = static_cast<M>(input[index]);
+    for (int depth = 0; depth < Depth; ++depth) {
+        inputs[depth] = static_cast<const T*>(
+            metadata.addresses[depth][tensor_index]);
+    }
+
+    const int64_t count = end - begin;
+    bool aligned = (count % kILP == 0) && (kChunkSize % kILP == 0);
+#pragma unroll
+    for (int depth = 0; depth < Depth; ++depth) {
+        aligned = aligned && is_aligned(inputs[depth] + begin);
+    }
+    aligned = aligned && is_aligned(output + begin);
+
+    if (aligned) {
+        alignas(kILP * sizeof(T)) T packed[Depth][kILP];
+        for (int64_t vector_index = static_cast<int64_t>(threadIdx.x);
+             vector_index * kILP < count &&
+                 vector_index * kILP < kChunkSize;
+             vector_index += static_cast<int64_t>(blockDim.x)) {
+#pragma unroll
+            for (int depth = 0; depth < Depth; ++depth) {
+                load_store(packed[depth], inputs[depth] + begin,
+                           0, vector_index);
+            }
+#pragma unroll
+            for (int lane = 0; lane < kILP; ++lane) {
+                M values[Depth];
+#pragma unroll
+                for (int depth = 0; depth < Depth; ++depth) {
+                    values[depth] = static_cast<M>(packed[depth][lane]);
+                }
+                packed[OutputIndex][lane] =
+                    static_cast<T>(op(values, scalar));
+            }
+            load_store(output + begin, packed[OutputIndex],
+                       vector_index, 0);
         }
-        const M result = op(values, scalar);
-        T* output = const_cast<T*>(static_cast<const T*>(
-            metadata.addresses[OutputIndex][tensor_index]));
-        output[index] = static_cast<T>(result);
+    } else {
+        for (int64_t i_start = 0; i_start < count && i_start < kChunkSize;
+             i_start += static_cast<int64_t>(blockDim.x) * kILP) {
+#pragma unroll
+            for (int lane = 0; lane < kILP; ++lane) {
+                const int64_t index = i_start + threadIdx.x +
+                                      static_cast<int64_t>(lane) * blockDim.x;
+                if (index >= count) continue;
+                M values[Depth];
+#pragma unroll
+                for (int depth = 0; depth < Depth; ++depth) {
+                    values[depth] = static_cast<M>(inputs[depth][begin + index]);
+                }
+                output[begin + index] = static_cast<T>(op(values, scalar));
+            }
+        }
     }
 }
 
@@ -357,21 +471,32 @@ template <typename M>
 struct TernaryAddcmul {
     M value;
     __device__ M operator()(M* values) const {
-        return values[0] + value * values[1] * values[2];
+        if (value == M(1)) {
+            return fma(values[1], values[2], values[0]);
+        }
+        return fma(value, values[1] * values[2], values[0]);
     }
 };
 template <typename M>
 struct TernaryAddcdiv {
     M value;
     __device__ M operator()(M* values) const {
-        return values[0] + value * values[1] / values[2];
+        const M quotient = values[1] / values[2];
+        if (value == M(1)) {
+            return values[0] + quotient;
+        }
+        return fma(value, quotient, values[0]);
     }
 };
 template <typename M>
 struct BinaryLerp {
     M weight;
     __device__ M operator()(M* values) const {
-        return values[0] + weight * (values[1] - values[0]);
+        // Match ATen's numerically stable lerp branch (Lerp.h): for large
+        // weights subtract from the end value to avoid cancellation.
+        return (weight > M(-0.5) && weight < M(0.5))
+            ? values[0] + weight * (values[1] - values[0])
+            : values[1] - (values[1] - values[0]) * (M(1) - weight);
     }
 };
 template <typename M>
@@ -522,19 +647,28 @@ struct BinaryDivScalarList {
 template <typename M>
 struct TernaryAddcmulScalarList {
     __device__ M operator()(M* values, M scalar) const {
-        return values[0] + scalar * values[1] * values[2];
+        if (scalar == M(1)) {
+            return fma(values[1], values[2], values[0]);
+        }
+        return fma(scalar, values[1] * values[2], values[0]);
     }
 };
 template <typename M>
 struct TernaryAddcdivScalarList {
     __device__ M operator()(M* values, M scalar) const {
-        return values[0] + scalar * values[1] / values[2];
+        const M quotient = values[1] / values[2];
+        if (scalar == M(1)) {
+            return values[0] + quotient;
+        }
+        return fma(scalar, quotient, values[0]);
     }
 };
 template <typename M>
 struct BinaryLerpScalarList {
     __device__ M operator()(M* values, M scalar) const {
-        return values[0] + scalar * (values[1] - values[0]);
+        return (scalar > M(-0.5) && scalar < M(0.5))
+            ? values[0] + scalar * (values[1] - values[0])
+            : values[1] - (values[1] - values[0]) * (M(1) - scalar);
     }
 };
 

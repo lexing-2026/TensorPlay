@@ -10,6 +10,65 @@
 #include "LinearAlgebraNames.h"
 #include <vector>
 #include <cmath>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
+#include <functional>
+#include <cstdlib>
+#include <optional>
+
+// Dispatcher-level primitives for the linear composite (defined in
+// TPXOpsGenerated.cpp; declared locally -- same pattern as Einsum.cpp).
+// Declared at global scope before `namespace tensorplay` below so the names
+// land in the real tensorplay::tpx::ops (inner-scope redeclaration would
+// shadow and break linkage).
+namespace tensorplay {
+namespace tpx {
+namespace ops {
+TENSORPLAY_API Tensor matmul(const Tensor& self, const Tensor& other);
+TENSORPLAY_API Tensor transpose(const Tensor& self, int64_t dim0, int64_t dim1);
+TENSORPLAY_API Tensor add(const Tensor& self, const Tensor& other, Scalar alpha);
+} // namespace ops
+} // namespace tpx
+} // namespace tensorplay
+
+#if defined(USE_MKL)
+// MKL dispatches AMD/Zen hosts to its generic kernel clones -- measured
+// ~100x off tuned throughput on Zen4 (512^3 f32 GEMM: 291ms vs ~11ms).
+// The documented debug knob doubles as the standard HPC workaround: force
+// the closest Intel-tuned ISA family.  Runs once at library load, BEFORE
+// the first MKL call initializes its CPU detection; an explicitly exported
+// MKL_DEBUG_CPU_LIST always wins (no overwrite).
+namespace {
+struct MklAmdKernelWorkaround {
+    MklAmdKernelWorkaround() {
+        // __builtin_cpu_is only knows a vendor whitelist; read CPUID directly.
+        unsigned __tp_ebx = 0, __tp_ecx = 0, __tp_edx = 0;
+        const bool amd = ([&]() {
+#if defined(__x86_64__) || defined(__i386__)
+            unsigned leaf0_eax = 0;
+            __asm__ volatile("cpuid"
+                             : "=a"(leaf0_eax), "=b"(__tp_ebx),
+                               "=c"(__tp_ecx), "=d"(__tp_edx)
+                             : "a"(0));
+            return __tp_ebx == 0x68747541u &&   // "Auth"
+                   __tp_ecx == 0x444d4163u &&   // "cAMD"
+                   __tp_edx == 0x69746e65u;     // "enti"
+#else
+            return false;
+#endif
+        })();
+        if (!amd) return;
+        if (!__builtin_cpu_supports("avx512f") &&
+            !__builtin_cpu_supports("avx2")) return;
+        if (std::getenv("MKL_DEBUG_CPU_LIST") != nullptr) return;
+        setenv("MKL_DEBUG_CPU_LIST",
+               __builtin_cpu_supports("avx512f") ? "SKX" : "CLX", 0);
+    }
+};
+static MklAmdKernelWorkaround g_mkl_amd_workaround;
+} // namespace
+#endif
 #include <algorithm>
 #include <cstring>
 #include <complex>
@@ -31,6 +90,11 @@
 
 namespace tensorplay {
 namespace cpu {
+
+// Native F.linear CPU kernel; defined below addmm_kernel (its fast path).
+Tensor linear_kernel(const Tensor& input, const Tensor& weight,
+                     const std::optional<Tensor>& bias_opt);
+
 using namespace tensorplay::parallel;
 
 namespace {
@@ -195,12 +259,262 @@ void gemm_strided_dispatch(
 #undef MATMUL_CASE
 }
 
+// The generic TensorIterator binary path is deliberately dtype-polymorphic,
+// but its per-element BF16/F16 conversion is too expensive for the GEMM
+// epilogue in Muon's Newton-Schulz loop.  Keep this narrow helper local to
+// addmm: one pass over the already-contiguous result, with the same
+// round-to-dtype store semantics as the public pointwise operation.
+template <typename T>
+void low_precision_gemm_epilogue(Tensor& result, const Tensor& seed,
+                                 bool has_seed, float alpha, float beta) {
+    T* dst = result.data_ptr<T>();
+    const T* src = has_seed ? seed.data_ptr<T>() : nullptr;
+    const int64_t n = result.numel();
+    parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        if (has_seed) {
+            if (alpha == 1.0f) {
+                for (int64_t i = begin; i < end; ++i) {
+                    dst[i] = static_cast<T>(static_cast<float>(dst[i]) +
+                                             beta * static_cast<float>(src[i]));
+                }
+            } else {
+                for (int64_t i = begin; i < end; ++i) {
+                    dst[i] = static_cast<T>(alpha * static_cast<float>(dst[i]) +
+                                             beta * static_cast<float>(src[i]));
+                }
+            }
+        } else if (alpha != 1.0f) {
+            for (int64_t i = begin; i < end; ++i) {
+                dst[i] = static_cast<T>(alpha * static_cast<float>(dst[i]));
+            }
+        }
+    });
+}
+
 #ifdef USE_ONEDNN
+// oneDNN primitive cache -- building a matmul::primitive_desc triggers JIT
+// kernel selection costing microseconds, which dominates tiny GEMMs (the
+// same reason upstream caches primitives).  Keyed by dims+strides+dtype of
+// all three operands; bounded to keep pathological shape variety honest.
 using namespace dnnl;
+
+namespace {
+std::mutex g_mm_pd_cache_mutex;
+struct VecKeyHash {
+    size_t operator()(const std::vector<int64_t>& v) const {
+        size_t h = 1469598103934665603ull;
+        for (const auto x : v) {
+            h ^= static_cast<size_t>(x) + 0x9e3779b97f4a7c15ull +
+                 (h << 6) + (h >> 2);
+        }
+        return h;
+    }
+};
+
+std::unordered_map<std::vector<int64_t>,
+    std::pair<std::unique_ptr<matmul::primitive_desc>,
+              std::shared_ptr<matmul>>, VecKeyHash>* g_mm_pd_cache =
+    nullptr;
+
+// Returns the shared, ready-to-execute primitive for the key.  Caching the
+// constructed primitive (not just its descriptor) removes the per-call
+// primitive re-wrap and refcount churn that dominated per-node dispatch
+// overhead once pd selection was already cached; primitives are immutable
+// after construction and safe to share under DNNL_ENABLE_CONCURRENT_EXEC.
+// `accum_sum_beta` bakes the addmm-style sum post-op into the primitive:
+// execution then computes prim_result + beta * dst_initial_contents.
+const matmul& cached_matmul_prim(
+        engine& eng, const memory::desc& s, const memory::desc& w,
+        const memory::desc& d, std::vector<int64_t> key,
+        std::optional<float> accum_sum_beta = std::nullopt,
+        std::optional<float> output_alpha = std::nullopt) {
+    std::lock_guard<std::mutex> lk(g_mm_pd_cache_mutex);
+    if (!g_mm_pd_cache) {
+        g_mm_pd_cache =
+            new std::unordered_map<std::vector<int64_t>,
+                std::pair<std::unique_ptr<matmul::primitive_desc>,
+                          std::shared_ptr<matmul>>, VecKeyHash>();
+    }
+    auto& cache = *g_mm_pd_cache;
+    if (accum_sum_beta) {
+        key.push_back(1);
+        float f = *accum_sum_beta;
+        uint32_t bits;
+        std::memcpy(&bits, &f, sizeof(bits));
+        key.push_back(static_cast<int64_t>(bits));
+    } else {
+        key.push_back(0);
+        key.push_back(0);
+    }
+    if (output_alpha) {
+        key.push_back(1);
+        float f = *output_alpha;
+        uint32_t bits;
+        std::memcpy(&bits, &f, sizeof(bits));
+        key.push_back(static_cast<int64_t>(bits));
+    } else {
+        key.push_back(0);
+        key.push_back(0);
+    }
+    auto it = cache.find(key);
+    if (it != cache.end() && it->second.first) return *it->second.second;
+    if (cache.size() >= 1024) cache.clear();  // simple bound
+    primitive_attr attr;
+    post_ops po;
+    bool has_post_ops = false;
+    if (output_alpha && *output_alpha != 1.0f) {
+        // Linear is applied to the GEMM result before the sum post-op, giving
+        // alpha * (mat1 @ mat2) + beta * seed in one low-precision primitive.
+        po.append_eltwise(algorithm::eltwise_linear, *output_alpha, 0.0f);
+        has_post_ops = true;
+    }
+    if (accum_sum_beta && *accum_sum_beta != 0.0f) {
+        po.append_sum(*accum_sum_beta);
+        has_post_ops = true;
+    }
+    if (has_post_ops) {
+        attr.set_post_ops(po);
+    }
+    auto pd = std::make_unique<matmul::primitive_desc>(eng, s, w, d, attr);
+    auto prim = std::make_shared<matmul>(*pd);
+    auto entry = std::make_pair(std::move(pd), std::move(prim));
+    const matmul& ref = *entry.second;
+    cache.emplace(std::move(key), std::move(entry));
+    return ref;
+}
+
+std::vector<int64_t> pd_key(const memory::desc& s, const memory::desc& w,
+                            const memory::desc& d) {
+    std::vector<int64_t> key;
+    key.reserve(24);
+    for (const auto v : s.get_dims()) key.push_back(v);
+    for (const auto v : s.get_strides()) key.push_back(v);
+    for (const auto v : w.get_dims()) key.push_back(v);
+    for (const auto v : w.get_strides()) key.push_back(v);
+    for (const auto v : d.get_dims()) key.push_back(v);
+    for (const auto v : d.get_strides()) key.push_back(v);
+    key.push_back(static_cast<int64_t>(s.get_data_type()));
+    return key;
+}
+} // namespace
+
+// oneDNN natively accelerates bf16/f16 matmul (f32 accumulate) -- routing
+// only f32 here left autocast GEMMs on a scalar fallback ~40x slower than
+// torch's oneDNN path.
+inline memory::data_type onednn_matmul_dt(DType t) {
+    switch (t) {
+        case DType::Float32:  return memory::data_type::f32;
+        case DType::BFloat16: return memory::data_type::bf16;
+        case DType::Float16:  return memory::data_type::f16;
+        default:              return memory::data_type::f32;
+    }
+}
+
+inline bool onednn_matmul_dtype_ok(DType t) {
+    return t == DType::Float32 || t == DType::BFloat16 || t == DType::Float16;
+}
+
+// Keep the layout tag visible to oneDNN for the two dense layouts it can
+// consume without a reorder.  An explicit-stride descriptor is semantically
+// equivalent, but the native Torch/oneDNN path presents a transposed dense
+// operand as `ba`; preserving that tag lets the primitive select its packed
+// transposed-weight kernel (important for Muon's X @ X.T loop).
+inline memory::desc onednn_2d_desc(const memory::dims& dims,
+                                    memory::data_type dt,
+                                    int64_t stride0, int64_t stride1) {
+    if (dims.size() == 2) {
+        if (stride0 == dims[1] && stride1 == 1) {
+            return memory::desc(dims, dt, memory::format_tag::ab);
+        }
+        if (stride0 == 1 && stride1 == dims[0]) {
+            return memory::desc(dims, dt, memory::format_tag::ba);
+        }
+    }
+    return memory::desc(dims, dt, {stride0, stride1});
+}
+
+// Fused bias/beta GEMM epilogue: executes mat1 @ mat2 accumulating into a
+// freshly allocated dst pre-seeded with `seed` (the broadcast-add operand),
+// using the sum post-op so the final value is dst_initial * sum_scale +
+// mat1@mat2 -- addmm's exact definition when alpha == 1, without ever
+// materializing a separate mm temporary or a standalone elementwise add
+// pass.  Weight strides are consumed natively (transposed views stay views).
+std::optional<Tensor> addmm_onednn(const Tensor& input, const Tensor& mat1,
+                                   const Tensor& mat2, double beta,
+                                   double alpha,
+                                   const Tensor& seed) {
+    const auto dt_in = mat1.dtype();
+    if (!onednn_matmul_dtype_ok(dt_in)) return std::nullopt;
+    if (dt_in != mat2.dtype() || dt_in != input.dtype()) return std::nullopt;
+
+    const int64_t M = mat1.size(0);
+    const int64_t N = mat2.size(1);
+    const bool has_seed = seed.defined();
+
+    try {
+        auto& engine = OneDNNContext::get_engine();
+        auto& stream = OneDNNContext::get_stream();
+        const memory::data_type dt = onednn_matmul_dt(dt_in);
+
+        // Source/destination live in the freshly seeded buffer; the kernel
+        // writes dst in place on top of the broadcast copy.
+        Tensor src_contig =
+            mat1.is_contiguous() ? mat1 : mat1.contiguous();
+
+        memory::dims src_dims = {M, static_cast<int64_t>(mat1.size(1))};
+        memory::dims src_strides = {src_contig.stride(0), src_contig.stride(1)};
+        auto src_md = onednn_2d_desc(src_dims, dt,
+                                     src_strides[0], src_strides[1]);
+
+        memory::dims weights_dims = {static_cast<int64_t>(mat2.size(0)), N};
+        memory::dims weights_strides = {mat2.stride(0), mat2.stride(1)};
+        auto weights_md = onednn_2d_desc(weights_dims, dt,
+                                         weights_strides[0], weights_strides[1]);
+
+        memory::dims dst_dims = {M, N};
+        memory::dims dst_strides = {N, 1};
+        auto dst_md = onednn_2d_desc(dst_dims, dt,
+                                     dst_strides[0], dst_strides[1]);
+
+        auto key = pd_key(src_md, weights_md, dst_md);
+        std::optional<float> sum_scale;
+        if (has_seed && beta != 0.0) sum_scale = static_cast<float>(beta);
+        const std::optional<float> output_alpha = static_cast<float>(alpha);
+        const auto& prim = cached_matmul_prim(engine, src_md, weights_md,
+                                              dst_md, std::move(key),
+                                              sum_scale, output_alpha);
+
+        auto src_mem = memory(src_md, engine, src_contig.data_ptr());
+        auto wei_mem = memory(weights_md, engine, mat2.data_ptr());
+        void* dst_ptr;
+        Tensor dst_holder;
+        if (has_seed) {
+            // seed was materialized contiguous {M,N} by the caller
+            dst_holder = seed;
+            dst_ptr = dst_holder.data_ptr();
+        } else {
+            dst_holder = Tensor::empty({M, N}, dt_in, mat1.device());
+            dst_ptr = dst_holder.data_ptr();
+        }
+        auto dst_mem = memory(dst_md, engine, dst_ptr);
+
+        prim.execute(stream, {
+            {DNNL_ARG_SRC, src_mem},
+            {DNNL_ARG_WEIGHTS, wei_mem},
+            {DNNL_ARG_DST, dst_mem}
+        });
+        stream.wait();
+        return dst_holder;
+    } catch (dnnl::error& e) {
+        return std::nullopt;
+    }
+}
+
 
 bool mm_onednn(const Tensor& self, const Tensor& mat2, Tensor& result) {
     if (!OneDNNContext::is_enabled()) return false;
-    if (self.dtype() != DType::Float32 || mat2.dtype() != DType::Float32) return false;
+    if (!onednn_matmul_dtype_ok(self.dtype()) || self.dtype() != mat2.dtype() ||
+        result.dtype() != self.dtype()) return false;
 
     // Dimensions
     int64_t M = self.size(0);
@@ -211,31 +525,34 @@ bool mm_onednn(const Tensor& self, const Tensor& mat2, Tensor& result) {
         auto& engine = OneDNNContext::get_engine();
         auto& stream = OneDNNContext::get_stream();
 
+        const memory::data_type dt = onednn_matmul_dt(self.dtype());
+
         // Memory descriptors with explicit strides
         memory::dims src_dims = {M, K};
         memory::dims src_strides = {self.stride(0), self.stride(1)};
-        auto src_md = memory::desc(src_dims, memory::data_type::f32, src_strides);
+        auto src_md = onednn_2d_desc(src_dims, dt,
+                                     src_strides[0], src_strides[1]);
 
         memory::dims weights_dims = {K, N};
         memory::dims weights_strides = {mat2.stride(0), mat2.stride(1)};
-        auto weights_md = memory::desc(weights_dims, memory::data_type::f32, weights_strides);
+        auto weights_md = onednn_2d_desc(weights_dims, dt,
+                                         weights_strides[0], weights_strides[1]);
 
         memory::dims dst_dims = {M, N};
         memory::dims dst_strides = {result.stride(0), result.stride(1)};
-        auto dst_md = memory::desc(dst_dims, memory::data_type::f32, dst_strides);
+        auto dst_md = onednn_2d_desc(dst_dims, dt,
+                                     dst_strides[0], dst_strides[1]);
 
         // Create memories sharing data pointers
-        auto src_mem = memory(src_md, engine, self.data_ptr<float>());
-        auto weights_mem = memory(weights_md, engine, mat2.data_ptr<float>());
-        auto dst_mem = memory(dst_md, engine, result.data_ptr<float>());
+        auto src_mem = memory(src_md, engine, self.data_ptr());
+        auto weights_mem = memory(weights_md, engine, mat2.data_ptr());
+        auto dst_mem = memory(dst_md, engine, result.data_ptr());
 
-        // Primitive descriptor
-        auto matmul_pd = matmul::primitive_desc(engine, src_md, weights_md, dst_md);
+        // Cached primitive (JIT selection happens once per shape)
+        const auto& matmul_prim = cached_matmul_prim(
+            engine, src_md, weights_md, dst_md,
+            pd_key(src_md, weights_md, dst_md));
 
-        // Primitive
-        auto matmul_prim = matmul(matmul_pd);
-
-        // Execute
         matmul_prim.execute(stream, {
             {DNNL_ARG_SRC, src_mem},
             {DNNL_ARG_WEIGHTS, weights_mem},
@@ -251,7 +568,8 @@ bool mm_onednn(const Tensor& self, const Tensor& mat2, Tensor& result) {
 
 bool matmul_onednn(const Tensor& src, const Tensor& weights, Tensor& dst) {
     if (!OneDNNContext::is_enabled()) return false;
-    if (src.dtype() != DType::Float32 || weights.dtype() != DType::Float32) return false;
+    if (!onednn_matmul_dtype_ok(src.dtype()) || src.dtype() != weights.dtype() ||
+        dst.dtype() != src.dtype()) return false;
 
     try {
         auto& engine = OneDNNContext::get_engine();
@@ -260,28 +578,27 @@ bool matmul_onednn(const Tensor& src, const Tensor& weights, Tensor& dst) {
         // Convert shapes and strides to memory::dims
         memory::dims src_dims = static_cast<std::vector<int64_t>>(src.shape());
         memory::dims src_strides = static_cast<std::vector<int64_t>>(src.strides());
-        auto src_md = memory::desc(src_dims, memory::data_type::f32, src_strides);
+        const memory::data_type mdt = onednn_matmul_dt(src.dtype());
+        auto src_md = memory::desc(src_dims, mdt, src_strides);
 
         memory::dims weights_dims = static_cast<std::vector<int64_t>>(weights.shape());
         memory::dims weights_strides = static_cast<std::vector<int64_t>>(weights.strides());
-        auto weights_md = memory::desc(weights_dims, memory::data_type::f32, weights_strides);
+        auto weights_md = memory::desc(weights_dims, mdt, weights_strides);
 
         memory::dims dst_dims = static_cast<std::vector<int64_t>>(dst.shape());
         memory::dims dst_strides = static_cast<std::vector<int64_t>>(dst.strides());
-        auto dst_md = memory::desc(dst_dims, memory::data_type::f32, dst_strides);
+        auto dst_md = memory::desc(dst_dims, mdt, dst_strides);
 
         // Create memories sharing data pointers
-        auto src_mem = memory(src_md, engine, src.data_ptr<float>());
-        auto weights_mem = memory(weights_md, engine, weights.data_ptr<float>());
-        auto dst_mem = memory(dst_md, engine, dst.data_ptr<float>());
+        auto src_mem = memory(src_md, engine, src.data_ptr());
+        auto weights_mem = memory(weights_md, engine, weights.data_ptr());
+        auto dst_mem = memory(dst_md, engine, dst.data_ptr());
 
-        // Primitive descriptor
-        auto matmul_pd = matmul::primitive_desc(engine, src_md, weights_md, dst_md);
+        // Cached primitive (JIT selection happens once per shape)
+        const auto& matmul_prim = cached_matmul_prim(
+            engine, src_md, weights_md, dst_md,
+            pd_key(src_md, weights_md, dst_md));
 
-        // Primitive
-        auto matmul_prim = matmul(matmul_pd);
-
-        // Execute
         matmul_prim.execute(stream, {
             {DNNL_ARG_SRC, src_mem},
             {DNNL_ARG_WEIGHTS, weights_mem},
@@ -298,41 +615,50 @@ bool matmul_onednn(const Tensor& src, const Tensor& weights, Tensor& dst) {
 
 } // anonymous namespace
 
-Tensor mm_kernel(const Tensor& self, const Tensor& mat2) {
-    if (self.dim() != 2) TP_THROW(RuntimeError, "self must be a matrix");
-    if (mat2.dim() != 2) TP_THROW(RuntimeError, "mat2 must be a matrix");
-    if (self.size(1) != mat2.size(0)) {
-        // Torch wording, e.g. "mat1 and mat2 shapes cannot be multiplied (2x3 and 5x4)".
-        TP_THROW(RuntimeError, "mat1 and mat2 shapes cannot be multiplied (", self.size(0), "x", self.size(1),
-                 " and ", mat2.size(0), "x", mat2.size(1), ")");
-    }
-
-    // torch.mm/matmul require the two matrix operands to have the same
-    // dtype.  This is intentionally stricter than elementwise promotion.
-    if (self.dtype() != mat2.dtype()) {
-        TP_THROW(RuntimeError, "expected m1 and m2 to have the same dtype, but got: ",
-                 c10_style_dtype_name(self.dtype()), " != ", c10_style_dtype_name(mat2.dtype()));
-    }
-    check_cpu_matmul_dtype(self.dtype());
-    const DType result_dtype = self.dtype();
-    const Tensor& self_p = self;
-    const Tensor& mat2_p = mat2;
-    
-    int64_t M = self_p.size(0);
-    int64_t K = self_p.size(1);
-    int64_t N = mat2_p.size(1);
-    
-    Tensor result = Tensor::empty({M, N}, result_dtype, self.device());
+// Core GEMM writing into a caller-owned contiguous {M,N} result.  Shared by
+// mm_kernel (fresh alloc) and the batched-matmul loops (output slice views)
+// so the broadcast path never pays temp-alloc + copy_ per slice.
+static void mm_into_impl(const Tensor& self_p, const Tensor& mat2_p,
+                         Tensor& result) {
+    const int64_t M = self_p.size(0);
+    const int64_t K = self_p.size(1);
+    const int64_t N = mat2_p.size(1);
     if (K == 0) {
         // oneDNN and some BLAS implementations leave C untouched for a
         // zero-inner-dimension GEMM, while torch.matmul defines the result as
         // beta*C + 0 and beta is zero for mm.
-        return result.fill_(Scalar(0));
+        result.fill_(Scalar(0));
+        return;
     }
     
+    // Small GEMMs go straight to the (ISA-tuned via MKL_DEBUG_CPU_LIST) BLAS
+    // call: oneDNN's pd-cache lookup + JIT launch + threaded-runner sync cost
+    // more than the GEMM itself below ~8k MACs (Zen4: 2.8us vs 7.7us), and
+    // still runs ~2x over MKL sgemm through the 32^3-64^3 band, while at
+    // >=96^3 oneDNN wins again.  The crossover is shape/system dependent, so
+    // the threshold is an env knob (TP_MM_ONEDNN_MIN_MACS) with a measured
+    // default.
+    static const int64_t onednn_min_macs = [] {
+        if (const char* e = std::getenv("TP_MM_ONEDNN_MIN_MACS")) {
+            char* end = nullptr;
+            const long long v = std::strtoll(e, &end, 10);
+            if (end != e && *end == '\0' && v >= 0) return static_cast<int64_t>(v);
+        }
+        return static_cast<int64_t>(524288);
+    }();
     #ifdef USE_ONEDNN
-    if (mm_onednn(self_p, mat2_p, result)) {
-        return result;
+    // Low-precision GEMM always prefers oneDNN (native bf16/f16 kernels with
+    // f32 accumulate); the scalar gemm_strided fallback is never competitive.
+    // f32 keeps the small-shape MKL shortcut via the MACs threshold.
+    const bool mm_low_precision = self_p.dtype() != DType::Float32;
+    // Decode is dominated by M=1 (and occasionally N=1) skinny GEMMs.
+    // oneDNN's primitive/runner path is slower than the already-linked BLAS
+    // kernel for these shapes; keep oneDNN for low precision and fat FP32
+    // matrices where its JIT path is beneficial.
+    const bool skinny_fp32 = self_p.dtype() == DType::Float32 && (M == 1 || N == 1);
+    if ((mm_low_precision || (!skinny_fp32 && (M * K * N) >= onednn_min_macs)) &&
+        mm_onednn(self_p, mat2_p, result)) {
+        return;
     }
     #endif
 
@@ -357,7 +683,7 @@ Tensor mm_kernel(const Tensor& self, const Tensor& mat2) {
             transA = true;
             lda = M; 
         } else {
-            a_input = self_p.clone();
+            a_input = detail::contiguous_clone(self_p);
             lda = K;
         }
         
@@ -368,7 +694,7 @@ Tensor mm_kernel(const Tensor& self, const Tensor& mat2) {
             transB = true;
             ldb = K;
         } else {
-            b_input = mat2_p.clone();
+            b_input = detail::contiguous_clone(mat2_p);
             ldb = N;
         }
         
@@ -391,21 +717,89 @@ Tensor mm_kernel(const Tensor& self, const Tensor& mat2) {
         #else
             // Fallback to naive (no transpose support in naive yet, force clone)
             if (transA || transB) {
-                 Tensor a_contig = self_p.is_contiguous() ? self_p : self_p.clone();
-                 Tensor b_contig = mat2_p.is_contiguous() ? mat2_p : mat2_p.clone();
+                 Tensor a_contig = self_p.contiguous();
+                 Tensor b_contig = mat2_p.contiguous();
                  gemm_naive(M, N, K, 1.0f, a_contig.data_ptr<float>(), K, b_contig.data_ptr<float>(), N, 0.0f, C, N);
             } else {
                  gemm_naive(M, N, K, 1.0f, A, K, B, N, 0.0f, C, N);
             }
         #endif
-        
-    } else {
-        // Keep the generic path stride-aware so mm/matmul also work for
-        // float64, reduced-float, integral and complex tensors where the
-        // optimized float32 kernels are unavailable.
-        gemm_strided_dispatch(self_p, mat2_p, result, M, N, K);
+        return;
     }
-    
+
+    if (self_p.dtype() == DType::Float64 && mat2_p.dtype() == DType::Float64) {
+#ifdef USE_MKL
+        bool transA = false;
+        bool transB = false;
+        int64_t lda = 0;
+        int64_t ldb = 0;
+        auto is_transposed = [](const Tensor& t) {
+            return t.stride(0) == 1 && t.stride(1) == t.size(0);
+        };
+        Tensor a_input = self_p;
+        if (self_p.is_contiguous()) {
+            lda = K;
+        } else if (is_transposed(self_p)) {
+            transA = true;
+            lda = M;
+        } else {
+            a_input = detail::contiguous_clone(self_p);
+            lda = K;
+        }
+        Tensor b_input = mat2_p;
+        if (mat2_p.is_contiguous()) {
+            ldb = N;
+        } else if (is_transposed(mat2_p)) {
+            transB = true;
+            ldb = K;
+        } else {
+            b_input = detail::contiguous_clone(mat2_p);
+            ldb = N;
+        }
+        cblas_dgemm(CblasRowMajor,
+                    transA ? CblasTrans : CblasNoTrans,
+                    transB ? CblasTrans : CblasNoTrans,
+                    M, N, K, 1.0, a_input.data_ptr<double>(), lda,
+                    b_input.data_ptr<double>(), ldb, 0.0,
+                    result.data_ptr<double>(), N);
+        return;
+#elif defined(USE_BLAS)
+        // LP64 reference CBLAS: narrow the sizes.
+        bool transA = false;
+        bool transB = false;
+        int64_t lda = K;
+        int64_t ldb = N;
+        Tensor a_input = self_p.contiguous();
+        Tensor b_input = mat2_p.contiguous();
+        cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    (int)M, (int)N, (int)K, 1.0,
+                    a_input.data_ptr<double>(), (int)lda,
+                    b_input.data_ptr<double>(), (int)ldb, 0.0,
+                    result.data_ptr<double>(), (int)N);
+        return;
+#endif
+    }
+    gemm_strided_dispatch(self_p, mat2_p, result, M, N, K);
+}
+
+Tensor mm_kernel(const Tensor& self, const Tensor& mat2) {
+    if (self.dim() != 2) TP_THROW(RuntimeError, "self must be a matrix");
+    if (mat2.dim() != 2) TP_THROW(RuntimeError, "mat2 must be a matrix");
+    if (self.size(1) != mat2.size(0)) {
+        // Torch wording, e.g. "mat1 and mat2 shapes cannot be multiplied (2x3 and 5x4)".
+        TP_THROW(RuntimeError, "mat1 and mat2 shapes cannot be multiplied (", self.size(0), "x", self.size(1),
+                 " and ", mat2.size(0), "x", mat2.size(1), ")");
+    }
+
+    // torch.mm/matmul require the two matrix operands to have the same
+    // dtype.  This is intentionally stricter than elementwise promotion.
+    if (self.dtype() != mat2.dtype()) {
+        TP_THROW(RuntimeError, "expected m1 and m2 to have the same dtype, but got: ",
+                 c10_style_dtype_name(self.dtype()), " != ", c10_style_dtype_name(mat2.dtype()));
+    }
+    check_cpu_matmul_dtype(self.dtype());
+    Tensor result = Tensor::empty({self.size(0), mat2.size(1)}, self.dtype(), self.device());
+    mm_into_impl(self, mat2, result);
     return result;
 }
 
@@ -428,14 +822,20 @@ Tensor expand_gemm_input(const Tensor& input, const std::vector<int64_t>& target
     }
 
     // Validate right-to-left so the reported dimension matches torch's.
+    // The offending-size text shows the tensor's real sizes, not the
+    // left-padded broadcast view.
     for (int64_t k = td - 1; k >= 0; --k) {
         if (src[k] != 1 && src[k] != target[k]) {
             std::string tgt = "[";
             std::string own = "[";
-            for (int64_t d = 0; d < td; ++d) {
-                if (d) { tgt += ", "; own += ", "; }
+            const auto own_sizes = static_cast<std::vector<int64_t>>(input.shape());
+            for (size_t d = 0; d < td; ++d) {
+                if (d) { tgt += ", "; }
                 tgt += std::to_string(target[d]);
-                own += std::to_string(src[d]);
+            }
+            for (size_t d = 0; d < own_sizes.size(); ++d) {
+                if (d) { own += ", "; }
+                own += std::to_string(own_sizes[d]);
             }
             tgt += "]";
             own += "]";
@@ -476,16 +876,167 @@ Tensor addmm_kernel(const Tensor& input, const Tensor& mat1, const Tensor& mat2,
     double beta_v = beta.toDouble();
 
     // out = beta * input + alpha * (mat1 @ mat2)
-    Tensor result;
-    if (beta_v == 0.0) {
-        result = Tensor::empty({M, N}, mat1.dtype(), mat1.device());
-    } else {
+    //
+    // Fused-seed strategy: materialize the broadcast of `input` ONCE as the
+    // destination buffer, then run a single accumulating GEMM over it --
+    // BLAS carries alpha/beta natively; oneDNN bakes beta into the sum
+    // post-op.  This removes the standalone mm temporary allocation and the
+    // full-MxN pointwise add pass the previous mm_kernel()+add() composite
+    // paid on every call.
+    const bool has_seed = beta_v != 0.0;
+    Tensor seed;
+    if (has_seed) {
         // Any broadcastable input works in torch, including 0-dim/(M,1)/(1,N).
-        result = expand_gemm_input(input, {M, N}).clone();
-        if (beta_v != 1.0) result.mul_(beta);
+        // Left unscaled: beta is applied by the GEMM accumulate itself
+        // (BLAS beta param / oneDNN sum scale), saving a mul_ pass here.
+        seed = detail::contiguous_clone(expand_gemm_input(input, {M, N}));
     }
 
-    // alpha * (self @ other) via mm_kernel, then add
+#ifdef USE_ONEDNN
+    {
+        const int64_t macs = M * N * mat1.size(1);
+        // Same routing policy as mm_into_impl: oneDNN owns low-precision and
+        // fat FP32 shapes; small FP32 goes to the already-linked BLAS call.
+        static const int64_t onednn_min_macs = [] {
+            if (const char* e = std::getenv("TP_MM_ONEDNN_MIN_MACS")) {
+                char* end = nullptr;
+                const long long v = std::strtoll(e, &end, 10);
+                if (end != e && *end == '\0' && v >= 0)
+                    return static_cast<int64_t>(v);
+            }
+            return static_cast<int64_t>(524288);
+        }();
+        const bool low_precision = mat1.dtype() != DType::Float32;
+        const bool skinny_f32 = !low_precision && (M == 1 || N == 1);
+        if (low_precision || (!skinny_f32 && macs >= onednn_min_macs)) {
+        if (low_precision) {
+                // Muon's Newton-Schulz update uses both alpha and beta.  Let
+                // oneDNN fuse the linear alpha post-op and the beta sum into
+                // the low-precision matmul; this avoids a scalar conversion
+                // pass over the full BF16/F16 result.
+                if (auto fused = addmm_onednn(
+                        input, mat1, mat2, beta_v, alpha_v, seed))
+                    return *fused;
+            }
+            if (alpha_v == 1.0) {
+                // oneDNN's sum post-op is unexpectedly expensive for BF16/F16
+                // addmm on this CPU (several times the standalone GEMM).  The
+                // low-precision split above avoids it; retain the fused
+                // primitive for FP32 and unusual layouts as a fallback.
+                if (auto fused = addmm_onednn(
+                        input, mat1, mat2, beta_v, alpha_v, seed))
+                    return *fused;
+            }
+        }
+    }
+#endif
+
+    if (mat1.dtype() == DType::Float32 && mat2.dtype() == DType::Float32 &&
+        input.dtype() == DType::Float32) {
+#if defined(USE_MKL) || defined(USE_BLAS)
+        bool transA = false;
+        bool transB = false;
+        int64_t lda = 0;
+        int64_t ldb = 0;
+        auto is_transposed = [](const Tensor& t) {
+            return t.stride(0) == 1 && t.stride(1) == t.size(0);
+        };
+        Tensor a_input = mat1;
+        if (mat1.is_contiguous()) {
+            lda = mat1.size(1);
+        } else if (is_transposed(mat1)) {
+            transA = true;
+            lda = M;
+        } else {
+            a_input = detail::contiguous_clone(mat1);
+            lda = mat1.size(1);
+        }
+        Tensor b_input = mat2;
+        if (mat2.is_contiguous()) {
+            ldb = N;
+        } else if (is_transposed(mat2)) {
+            transB = true;
+            ldb = mat1.size(1);
+        } else {
+            b_input = detail::contiguous_clone(mat2);
+            ldb = N;
+        }
+
+        Tensor result = has_seed ? seed : Tensor::empty({M, N}, mat1.dtype(), mat1.device());
+        float* C = result.data_ptr<float>();
+        const float fa = static_cast<float>(alpha_v);
+        const float fb = static_cast<float>(beta_v);
+        #ifdef USE_MKL
+        cblas_sgemm(CblasRowMajor,
+                    transA ? CblasTrans : CblasNoTrans,
+                    transB ? CblasTrans : CblasNoTrans,
+                    M, N, mat1.size(1), fa, a_input.data_ptr<float>(), lda,
+                    b_input.data_ptr<float>(), ldb, fb, C, N);
+        #else
+        cblas_sgemm(CblasRowMajor,
+                    transA ? CblasTrans : CblasNoTrans,
+                    transB ? CblasTrans : CblasNoTrans,
+                    (int)M, (int)N, (int)mat1.size(1), fa,
+                    a_input.data_ptr<float>(), (int)lda,
+                    b_input.data_ptr<float>(), (int)ldb, fb, C, (int)N);
+        #endif
+        return result;
+#endif  // USE_MKL || USE_BLAS
+    }
+
+    if (mat1.dtype() == DType::Float64 && mat2.dtype() == DType::Float64 &&
+        input.dtype() == DType::Float64) {
+#ifdef USE_MKL
+        bool transA = false;
+        bool transB = false;
+        int64_t lda = 0;
+        int64_t ldb = 0;
+        auto is_transposed = [](const Tensor& t) {
+            return t.stride(0) == 1 && t.stride(1) == t.size(0);
+        };
+        Tensor a_input = mat1;
+        if (mat1.is_contiguous()) {
+            lda = mat1.size(1);
+        } else if (is_transposed(mat1)) {
+            transA = true;
+            lda = M;
+        } else {
+            a_input = detail::contiguous_clone(mat1);
+            lda = mat1.size(1);
+        }
+        Tensor b_input = mat2;
+        if (mat2.is_contiguous()) {
+            ldb = N;
+        } else if (is_transposed(mat2)) {
+            transB = true;
+            ldb = mat1.size(1);
+        } else {
+            b_input = detail::contiguous_clone(mat2);
+            ldb = N;
+        }
+
+        Tensor result = has_seed ? seed : Tensor::empty({M, N}, mat1.dtype(), mat1.device());
+        double* C = result.data_ptr<double>();
+        cblas_dgemm(CblasRowMajor,
+                    transA ? CblasTrans : CblasNoTrans,
+                    transB ? CblasTrans : CblasNoTrans,
+                    M, N, mat1.size(1), alpha_v, a_input.data_ptr<double>(), lda,
+                    b_input.data_ptr<double>(), ldb, beta_v, C, N);
+        return result;
+#endif
+    }
+
+    // Generic tail for dtypes without an accelerated accumulator (int8 etc.)
+    // and builds without BLAS: decompose exactly as before.  A fresh seed is
+    // materialized here because a failing accelerated route may have left
+    // the previous buffer's contents unspecified.
+    Tensor result = Tensor::empty({M, N}, mat1.dtype(), mat1.device());
+    if (has_seed) {
+        // seed was already expanded to {M,N} (broadcast copy of bias) by the
+        // caller above; copy its contents in one shot instead of re-expanding.
+        result.copy_(seed);
+        if (beta_v != 1.0) result.mul_(beta);
+    }
     Tensor mm = mm_kernel(mat1, mat2);
     if (alpha_v != 1.0) {
         mm = mm.mul(alpha_v);
@@ -578,12 +1129,36 @@ Tensor matmul_batched_2d(
     }
 #endif
 
+    // Small or thin slices: per-call BLAS thread fan-up dominates, so spread
+    // the BATCH across tp's intra-op pool instead -- the same effect torch
+    // gets from a single batched-BLAS call.  Large, fat slices already fill
+    // the machine on their own and stay on the serial path below.
+    const int64_t slice_flops = M * N * K;
+    const int64_t threads = parallel::get_num_threads();
+    const bool batch_parallel =
+        batch_size > 4 && threads > 1 && batch_size >= threads &&
+        (slice_flops <= 131072 || M == 1 || N == 1);
+
+    if (batch_parallel) {
+        const int64_t grain = std::max<int64_t>(1, batch_size / (threads * 4));
+        parallel::parallel_for(0, batch_size, grain, [&](int64_t begin, int64_t end) {
+            for (int64_t linear = begin; linear < end; ++linear) {
+                const std::vector<int64_t> output_index = decode_batch_index(linear, batch_shape);
+                Tensor self_matrix = select_batch_matrix(self, self_batch_shape, batch_shape, output_index);
+                Tensor other_matrix = select_batch_matrix(other, other_batch_shape, batch_shape, output_index);
+                Tensor out_matrix = select_output_matrix(result, output_index);
+                mm_into_impl(self_matrix, other_matrix, out_matrix);
+            }
+        });
+        return result;
+    }
+
     for (int64_t linear = 0; linear < batch_size; ++linear) {
         const std::vector<int64_t> output_index = decode_batch_index(linear, batch_shape);
         Tensor self_matrix = select_batch_matrix(self, self_batch_shape, batch_shape, output_index);
         Tensor other_matrix = select_batch_matrix(other, other_batch_shape, batch_shape, output_index);
-        Tensor matrix_result = mm_kernel(self_matrix, other_matrix);
-        select_output_matrix(result, output_index).copy_(matrix_result);
+        Tensor out_matrix = select_output_matrix(result, output_index);
+        mm_into_impl(self_matrix, other_matrix, out_matrix);
     }
     return result;
 }
@@ -605,12 +1180,19 @@ Tensor matmul_kernel(const Tensor& self, const Tensor& other) {
     const auto self_shape = static_cast<std::vector<int64_t>>(self.shape());
     const auto other_shape = static_cast<std::vector<int64_t>>(other.shape());
 
+    // 2-D x 2-D is torch.mm semantics exactly: skip the batched machinery
+    // (per-slice select views + temp result + copy_ back) that otherwise
+    // costs ~3us on top of the GEMM itself.
+    if (dim1 == 2 && dim2 == 2) {
+        return mm_kernel(self, other);
+    }
+
     if (dim1 == 1 && dim2 == 1) {
         if (self.size(0) != other.size(0)) {
             TP_THROW(RuntimeError, "inconsistent tensor size, expected tensor [", self.size(0),
                      "] and src [", other.size(0),
                      "] to have the same number of elements, but got ", self.size(0), " and ",
-                     other.size(0), " elements respective");
+                     other.size(0), " elements respectively");
         }
     } else if (dim1 == 1) {
         const int64_t k = self.size(0);
@@ -939,13 +1521,74 @@ Tensor baddbmm_kernel(const Tensor& input, const Tensor& batch1, const Tensor& b
         result = Tensor::empty(target, batch1.dtype(), batch1.device());
     } else {
         // Any broadcastable input works in torch, including 0-dim/(N,)/(M,N).
-        result = expand_gemm_input(input, target).clone();
+        result = detail::contiguous_clone(expand_gemm_input(input, target));
         if (beta_v != 1.0) result.mul_(beta);
     }
 
     Tensor product = bmm_kernel(batch1, batch2);
     if (alpha_v != 1.0) product = product.mul(alpha_v);
     return result.add(product, 1.0);
+}
+
+// Row-range matrix-vector product over tp's own thread pool.  Handles both
+// row-major and transposed-view layouts; used for small/medium mv workloads
+// where BLAS-pool wake latency outweighs its kernel efficiency.
+template <typename acc_t>
+Tensor gemv_rows(const Tensor& self, const Tensor& vec) {
+    const int64_t M = self.size(0), K = self.size(1);
+    const acc_t* base = self.data_ptr<acc_t>();
+    const int64_t s_m = self.stride(0), s_k = self.stride(1);
+    const acc_t* x = vec.data_ptr<acc_t>();
+    Tensor result = Tensor::zeros({M}, self.dtype(), self.device());
+    acc_t* y = result.data_ptr<acc_t>();
+    const int64_t threads = parallel::get_num_threads();
+    if (M * K <= 2048) {
+        // Tiny: thread hand-off would dominate; a plain serial loop runs in
+        // low single-digit microseconds, matching BLAS hot-path latency.
+        for (int64_t m = 0; m < M; ++m) {
+            const acc_t* row = base + m * s_m;
+            acc_t acc{};
+            for (int64_t k = 0; k < K; ++k) {
+                acc += row[k * s_k] * x[k];
+            }
+            y[m] = acc;
+        }
+        return result;
+    }
+    if (s_k == 1) {
+        // Row-major: each thread owns whole rows (sequential k, unit stride).
+        const int64_t grain = std::max<int64_t>(1, M / (threads * 4));
+        parallel::parallel_for(0, M, grain, [&](int64_t begin, int64_t end) {
+            for (int64_t m = begin; m < end; ++m) {
+                const acc_t* row = base + m * s_m;
+                acc_t acc{};
+                for (int64_t k = 0; k < K; ++k) {
+                    acc += row[k] * x[k];
+                }
+                y[m] = acc;
+            }
+        });
+    } else {
+        // Transposed view: walk columns so A reads at unit stride and the
+        // accumulator vector stays hot in cache.
+        const int64_t grain = std::max<int64_t>(1, K / (threads * 4));
+        parallel::parallel_for(0, K, grain, [&](int64_t begin, int64_t end) {
+            for (int64_t k = begin; k < end; ++k) {
+                const acc_t xk = x[k];
+                const acc_t* col = base + k * s_k;
+                for (int64_t m = 0; m < M; ++m) {
+                    y[m] += col[m * s_m] * xk;
+                }
+            }
+        });
+    }
+    return result;
+}
+
+Tensor parallel_gemv(const Tensor& self, const Tensor& vec) {
+    if (self.dtype() == DType::Float32) return gemv_rows<float>(self, vec);
+    if (self.dtype() == DType::Float64) return gemv_rows<double>(self, vec);
+    TP_THROW(RuntimeError, "parallel_gemv: unsupported dtype");
 }
 
 Tensor mv_kernel(const Tensor& self, const Tensor& vec) {
@@ -966,6 +1609,61 @@ Tensor mv_kernel(const Tensor& self, const Tensor& vec) {
                  pretty_dtype_name(vec.dtype()));
     }
     check_cpu_matmul_dtype(self.dtype());
+
+    // BLAS gemv fast path (torch's mv also routes addmv -> gemv): skips the
+    // bmm-shaped wrapper's extra alloc/copy round-trip.  Both row-major and
+    // transposed-view layouts are accepted without a copy, mirroring
+    // mm_kernel's stride policy; anything else falls through to the generic
+    // batched path below.
+#if defined(USE_MKL) || defined(USE_BLAS)
+    if (self.dtype() == DType::Float32 || self.dtype() == DType::Float64) {
+        const bool is_f32 = self.dtype() == DType::Float32;
+        const int64_t M = self.size(0), K = self.size(1);
+        const bool row_major = self.is_contiguous();
+        const bool col_major_view = self.stride(0) == 1 && self.stride(1) == M;
+        if (M != 0 && K != 0 && (row_major || col_major_view) && vec.is_contiguous()) {
+            // Mid-size workloads run the row-range reduction on tp's own
+            // always-warm intra-op pool: external-BLAS pool wake/sleep jitter
+            // makes repeated small sgemv calls bimodal (fast when hot,
+            // >100us after the workers park), which dominates real
+            // einsum/attention workloads.  Tiny sizes stay serial (thread
+            // hand-off would dominate); large ones go to BLAS, whose tuned
+            // kernels win there.
+            const int64_t mv_elems = M * K;
+            if (mv_elems <= 2048) {
+                // Tiny: serial self-kernel avoids every dispatch/hand-off
+                // cost and runs in low single-digit microseconds.
+                return parallel_gemv(self, vec);
+            }
+            // Everything else goes to threaded MKL sgemv (torch's own
+            // runtime), which is healthy now that both stacks share gomp.
+            // Express both layouts in straight Fortran col-major terms (what
+            // the BLAS underneath validates): a row-major MxK matrix reads as
+            // a col-major KxM operand needing transposition; a transposed
+            // view's buffer already is the col-major MxK matrix.
+            Tensor result = Tensor::empty({M}, self.dtype(), self.device());
+            const CBLAS_TRANSPOSE trans = row_major ? CblasTrans : CblasNoTrans;
+            const int64_t cm_m = row_major ? K : M;   // col-major rows
+            const int64_t cm_n = row_major ? M : K;   // col-major cols
+            const int64_t lda = row_major ? K : M;
+            if (is_f32) {
+                cblas_sgemv(CblasColMajor, trans, (int)cm_m, (int)cm_n, 1.0f,
+                            self.data_ptr<float>(), (int)lda,
+                            vec.data_ptr<float>(), 1, 0.0f,
+                            result.data_ptr<float>(), 1);
+            } else {
+                cblas_dgemv(CblasColMajor, trans, (int)cm_m, (int)cm_n, 1.0,
+                            self.data_ptr<double>(), (int)lda,
+                            vec.data_ptr<double>(), 1, 0.0,
+                            result.data_ptr<double>(), 1);
+            }
+            return result;
+        }
+        if ((M == 0 || K == 0)) {
+            return Tensor::zeros({M}, self.dtype(), self.device());
+        }
+    }
+#endif
     return matmul_batched_2d(self, vec.unsqueeze(-1), {}, {}).squeeze(-1);
 }
 
@@ -978,7 +1676,7 @@ Tensor dot_kernel(const Tensor& self, const Tensor& other) {
         TP_THROW(RuntimeError, "inconsistent tensor size, expected tensor [", self.size(0),
                  "] and src [", other.size(0),
                  "] to have the same number of elements, but got ", self.size(0), " and ",
-                 other.size(0), " elements respective");
+                 other.size(0), " elements respectively");
     }
     if (self.dtype() != other.dtype()) {
         TP_THROW(RuntimeError, "dot : expected both vectors to have same dtype, but found ",
@@ -1118,7 +1816,7 @@ Tensor inner_backward_self_kernel(const Tensor& grad_output, const Tensor& self,
     // dA2 = grad2 @ B2 -- exactly matmul_backward_self on the flattened pair.
     Tensor grad2 = grad_output.reshape({prod_a, prod_b});
     Tensor other2 = other.reshape({-1, n});
-    Tensor da2 = matmul_kernel(grad2, transpose_last_two_view(other2));
+    Tensor da2 = matmul_kernel(grad2, other2);
     Tensor grad = sum_to_shape_cpu(da2, static_cast<std::vector<int64_t>>(self.shape()));
     return grad.reshape(static_cast<std::vector<int64_t>>(self.shape()));
 }
@@ -1146,6 +1844,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, LinearAlgebraKernels) {
     m.impl("matmul_backward_self", matmul_backward_self_kernel);
     m.impl("matmul_backward_other", matmul_backward_other_kernel);
     m.impl("addmm", addmm_kernel);
+    m.impl("linear", linear_kernel);
     m.impl("bmm", bmm_kernel);
     m.impl("baddbmm", baddbmm_kernel);
     m.impl("mv", mv_kernel);
@@ -1154,6 +1853,94 @@ TENSORPLAY_LIBRARY_IMPL(CPU, LinearAlgebraKernels) {
     m.impl("inner_backward_self", inner_backward_self_kernel);
     m.impl("inner_backward_other", inner_backward_other_kernel);
     m.impl("outer", outer_kernel);
+}
+
+// F.linear under Composite (einsum/gradient precedent): expressed through
+// dispatcher primitives so autograd records inner nodes on every backend,
+// while python callers drop a per-call addmm+t+add python-composite tax.
+// F.linear CPU kernel (aten Linear.cpp linear(): fused op "marginally
+// faster" route).  Everything composes into one seeded-GEMM addmm on the
+// flattened 2-D view, so the dispatcher records a single LinearBackward node
+// instead of the composite's matmul/add/t chain.  weight.t() is a raw
+// as_strided view -- no dispatch, no clone; its transposed layout is consumed
+// natively by both the BLAS and the oneDNN routes of addmm_kernel.
+Tensor linear_kernel(const Tensor& input, const Tensor& weight,
+                     const std::optional<Tensor>& bias_opt) {
+    const int64_t input_dim = input.dim();
+    if (input_dim == 0 || weight.dim() == 0) {
+        TP_THROW(RuntimeError,
+                 "both arguments to linear need to be at least 1D, but they are ",
+                 input_dim, "D and ", weight.dim(), "D");
+    }
+    if (weight.dim() != 2) {
+        TP_THROW(RuntimeError, "linear(): weight must be 2D (out_features, in_features), got ",
+                 weight.dim(), "D");
+    }
+
+    auto flipped_weight_view = [&] {
+        std::vector<int64_t> sizes =
+            static_cast<std::vector<int64_t>>(weight.shape());
+        std::vector<int64_t> strides = weight.strides();
+        std::swap(sizes[sizes.size() - 2], sizes[sizes.size() - 1]);
+        std::swap(strides[strides.size() - 2], strides[strides.size() - 1]);
+        return weight.as_strided(sizes, strides);
+    };
+    Tensor wt = flipped_weight_view();
+
+    if (input_dim == 1) {
+        // (K,) @ W^T -> (N,), torch treats it as a single row.
+        Tensor row = input.as_strided({1, input.size(0)},
+                                      {input.size(0), input.stride(0)});
+        Tensor out = bias_opt.has_value()
+            ? addmm_kernel(*bias_opt, row, wt, Scalar(1), Scalar(1))
+            : mm_kernel(row, wt);
+        return out.as_strided({wt.size(1)}, {1});
+    }
+
+    Tensor in_flat = input;
+    if (input_dim > 2) {
+        // aten _flatten_nd_linear contract: caller materialized contiguity.
+        in_flat = input.is_contiguous() ? input : input.contiguous();
+        in_flat = in_flat.as_strided({in_flat.numel() / weight.size(1),
+                                      weight.size(1)},
+                                     {weight.size(1), 1});
+    } else if (!input.is_contiguous()) {
+        in_flat = input.contiguous();
+    }
+
+    Tensor out = bias_opt.has_value()
+        ? addmm_kernel(*bias_opt, in_flat, wt, Scalar(1), Scalar(1))
+        : mm_kernel(in_flat, wt);
+
+    if (input_dim == 2) return out;
+    auto result_sizes =
+        static_cast<std::vector<int64_t>>(input.shape());
+    result_sizes[result_sizes.size() - 1] = weight.size(0);
+    std::vector<int64_t> result_strides(result_sizes.size(), 1);
+    for (int64_t d = static_cast<int64_t>(result_sizes.size()) - 2; d >= 0; --d)
+        result_strides[d] = result_strides[d + 1] * result_sizes[d + 1];
+    return out.as_strided(result_sizes, result_strides);
+}
+
+Tensor linear_composite(const Tensor& input, const Tensor& weight,
+                        const std::optional<Tensor>& bias_opt) {
+    if (input.dim() == 0 || weight.dim() == 0) {
+        TP_THROW(RuntimeError,
+                 "both arguments to linear need to be at least 1D, but they are ",
+                 input.dim(), "D and ", weight.dim(), "D");
+    }
+    if (weight.dim() != 2) {
+        TP_THROW(RuntimeError, "linear(): weight must be 2D (out_features, in_features), got ",
+                 weight.dim(), "D");
+    }
+    Tensor out = tpx::ops::matmul(input, tpx::ops::transpose(weight, 0, 1));
+    if (bias_opt.has_value() && bias_opt->defined())
+        out = tpx::ops::add(out, *bias_opt, Scalar(1));
+    return out;
+}
+
+TENSORPLAY_LIBRARY_IMPL(Composite, LinearAlgebraComposite) {
+    m.impl("linear", linear_composite);
 }
 
 } // namespace cpu

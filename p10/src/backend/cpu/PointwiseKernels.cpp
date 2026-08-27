@@ -1,17 +1,34 @@
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "Utils.h"
+#include "ErrorReporting.h"
 #include "TensorIteratorOps.h"
 #include "TypePromotion.h"
 #include "OneDNNContext.h"
 #include "Allocator.h"
 #include "Parallel.h"
 #include "cpu/VecUnary.h"
+#include "cpu/ComplexUnary.h"
+#include "cpu/VecComplex.h"
+#include "cpu/ActivationUnaryKernels.h"
 #include <iostream>
 #include <cmath>
 #include <algorithm>
 #include <limits>
 #include <type_traits>
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
+
+// DispatchStub instances for the tiered activation kernels; defined once here
+// because the tier objects (TP_CPU_KERNEL_SRCS) each compile their own copy
+// and would collide at link time.
+namespace tensorplay { namespace cpu {
+DEFINE_DISPATCH(sigmoid_f32_stub);
+DEFINE_DISPATCH(silu_f32_stub);
+DEFINE_DISPATCH(sigmoid_f64_stub);
+DEFINE_DISPATCH(silu_f64_stub);
+}} // namespace tensorplay::cpu
 
 #ifdef USE_ONEDNN
 #include "dnnl.hpp"
@@ -23,12 +40,6 @@
 
 #ifdef _OPENMP
 #include <omp.h>
-#endif
-
-#ifdef __AVX2__
-#if defined(__x86_64__) || defined(__i386__)
-#include <immintrin.h>
-#endif
 #endif
 
 namespace tensorplay {
@@ -104,7 +115,7 @@ Tensor unary_op_kernel(const Tensor& self, Func func,
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
     int64_t n = self.numel();
 
-    Tensor self_contig = self.is_contiguous() ? self : self.clone();
+    Tensor self_contig = self.contiguous();
     // Vector fast paths exist only for f32/f64; other dtypes take the
     // scalar-lambda fallback and must never instantiate the vec calls.
     const bool vec_ok = vecunary::vec_ready() && vec_op != vecunary::VOp::None
@@ -150,7 +161,7 @@ Tensor unary_float_op_kernel(const Tensor& self, Func func,
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), out_dtype, self.device());
     int64_t n = self.numel();
 
-    Tensor self_contig = self.is_contiguous() ? self : self.clone();
+    Tensor self_contig = self.contiguous();
     // Vector fast paths cover f32/f64 plus the widen-compute-narrow f16/bf16
     // kernels; integral inputs stay on the scalar-lambda fallback.
     const bool vec_ok = vecunary::vec_ready() && vec_op != vecunary::VOp::None
@@ -253,9 +264,88 @@ Tensor unary_float_op_kernel(const Tensor& self, Func func,
     return result;
 }
 
+// ATen alignment: abs over complex tensors returns the magnitude in the
+// corresponding real dtype (hypot(re, im)).
+Tensor complex_abs_kernel(const Tensor& self) {
+    DType out_dtype = toRealValueType(self.dtype());
+    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), out_dtype, self.device());
+    const int64_t n = self.numel();
+    Tensor self_contig = self.contiguous();
+
+    switch (self.dtype()) {
+        case DType::ComplexFloat: {
+            using c_t = std::complex<float>;
+            const c_t* src = reinterpret_cast<const c_t*>(self_contig.data_ptr());
+            float* dst = result.data_ptr<float>();
+            parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) {
+                for (int64_t i = begin; i < end; ++i) {
+                    dst[i] = std::hypot(src[i].real(), src[i].imag());
+                }
+            });
+            break;
+        }
+        case DType::ComplexDouble: {
+            using c_t = std::complex<double>;
+            const c_t* src = reinterpret_cast<const c_t*>(self_contig.data_ptr());
+            double* dst = result.data_ptr<double>();
+            parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) {
+                for (int64_t i = begin; i < end; ++i) {
+                    dst[i] = std::hypot(src[i].real(), src[i].imag());
+                }
+            });
+            break;
+        }
+        case DType::ComplexHalf:
+        case DType::BComplex32: {
+            // Reduced complexes compute the magnitude in float32.
+            if (self.dtype() == DType::ComplexHalf) {
+                const std::complex<Half>* src =
+                    reinterpret_cast<const std::complex<Half>*>(self_contig.data_ptr());
+                Half* dst = result.data_ptr<Half>();
+                parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) {
+                    for (int64_t i = begin; i < end; ++i) {
+                        float re = static_cast<float>(src[i].real());
+                        float im = static_cast<float>(src[i].imag());
+                        dst[i] = static_cast<Half>(std::hypot(re, im));
+                    }
+                });
+            } else {
+                const std::complex<BFloat16>* src =
+                    reinterpret_cast<const std::complex<BFloat16>*>(self_contig.data_ptr());
+                BFloat16* dst = result.data_ptr<BFloat16>();
+                parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) {
+                    for (int64_t i = begin; i < end; ++i) {
+                        float re = static_cast<float>(src[i].real());
+                        float im = static_cast<float>(src[i].imag());
+                        dst[i] = static_cast<BFloat16>(std::hypot(re, im));
+                    }
+                });
+            }
+            break;
+        }
+        default: TP_THROW(TypeError, "complex abs: unsupported dtype");
+    }
+    return result;
+}
+
 // Implementations
 
 Tensor abs_kernel(const Tensor& self) {
+    // ATen alignment: abs(complex) -> magnitude in the real dtype
+    if (isComplexType(self.dtype())) {
+        if ((self.dtype() == DType::ComplexFloat ||
+             self.dtype() == DType::ComplexDouble) &&
+            self.is_contiguous() && self.numel() > 0 &&
+            veccomplex::avx2_available()) {
+            Tensor out = Tensor::empty(
+                static_cast<std::vector<int64_t>>(self.shape()),
+                toRealValueType(self.dtype()), self.device());
+            if (veccomplex::try_abs(self.data_ptr(), out.data_ptr(),
+                                    self.numel(), self.dtype()))
+                return out;
+        }
+        return complex_abs_kernel(self);
+    }
     return unary_op_kernel(self, [](auto x) {
         using T = decltype(x);
         if constexpr (std::is_unsigned_v<T>) {
@@ -266,7 +356,16 @@ Tensor abs_kernel(const Tensor& self) {
     }, vecunary::VOp::Abs);
 }
 
+// Vectorized complex unary driver — defined below the float kernels; declared
+// here because neg/square route through it.
+template <typename F>
+static Tensor cplx_unary_vec(const Tensor& self, veccomplex::Op op, F fb);
+
 Tensor neg_kernel(const Tensor& self) {
+    if (isComplexType(self.dtype())) {
+        return cplx_unary_vec(self, veccomplex::Op::Neg,
+                              [](auto x) { return -x; });
+    }
     return unary_op_kernel(self, [](auto x) {
         if constexpr (std::is_same_v<decltype(x), bool>) {
              return x; // neg(bool) in same dtype is weird, just return x to avoid warning
@@ -277,10 +376,24 @@ Tensor neg_kernel(const Tensor& self) {
 }
 
 Tensor square_kernel(const Tensor& self) {
+    if (isComplexType(self.dtype())) {
+        return cplx_unary_vec(self, veccomplex::Op::Square,
+                              [](auto x) { return x * x; });
+    }
     return unary_op_kernel(self, [](auto x) { return x * x; }, vecunary::VOp::Square);
 }
 
 Tensor sign_kernel(const Tensor& self) {
+    // ATen alignment: sgn(z) = z / |z| for complex, 0 stays 0 (UnaryOpsKernel).
+    if (isComplexType(self.dtype())) {
+        return complex_unary_op_kernel(self, [](auto x) {
+            using C = decltype(x);
+            using T = typename C::value_type;
+            const T m = std::abs(x);
+            if (m == T(0)) return C(T(0), T(0));
+            return x / C(m, T(0));
+        });
+    }
     return unary_op_kernel(self, [](auto x) {
         if constexpr (std::is_same_v<decltype(x), bool>) {
             return x ? 1 : 0;
@@ -310,31 +423,185 @@ Tensor round_kernel(const Tensor& self) {
 }
 
 // Float ops
+//
+// torch parity: every function below except erf/erfc/lgamma is defined over
+// the complex dtypes (see docs/source/complex_numbers.md).  Complex inputs
+// route through complex_unary_op_kernel with std::complex math or the c10
+// formulas above; real dtypes keep the vectorized paths.
 
-Tensor acos_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::acos(x); }, vecunary::VOp::Acos); }
-Tensor acosh_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::acosh(x); }, vecunary::VOp::Acosh); }
-Tensor asin_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::asin(x); }, vecunary::VOp::Asin); }
-Tensor asinh_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::asinh(x); }, vecunary::VOp::Asinh); }
-Tensor atan_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::atan(x); }, vecunary::VOp::Atan); }
-Tensor atanh_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::atanh(x); }, vecunary::VOp::Atanh); }
-Tensor cos_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::cos(x); }, vecunary::VOp::Cos); }
-Tensor cosh_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::cosh(x); }, vecunary::VOp::Cosh); }
-Tensor sin_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::sin(x); }, vecunary::VOp::Sin); }
-Tensor sinh_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::sinh(x); }, vecunary::VOp::Sinh); }
-Tensor tan_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::tan(x); }, vecunary::VOp::Tan); }
-Tensor tanh_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::tanh(x); }, vecunary::VOp::Tanh); }
-Tensor exp_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::exp(x); }, vecunary::VOp::Exp); }
-Tensor expm1_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::expm1(x); }, vecunary::VOp::Expm1); }
+
+// Vectorized complex unary fast path (cpu/VecComplex.h): contiguous
+// Complex{Float,Double} inputs run the AVX2+libmvec cores; reduced complexes,
+// non-contiguous input and pre-AVX2 hosts keep the scalar driver below.
+template <typename F>
+static Tensor cplx_unary_vec(const Tensor& self, veccomplex::Op op, F fb) {
+    if ((self.dtype() == DType::ComplexFloat ||
+         self.dtype() == DType::ComplexDouble) &&
+        self.is_contiguous() && self.numel() > 0 &&
+        veccomplex::unary_supported(op) && veccomplex::avx2_available()) {
+        Tensor out = Tensor::empty(
+            static_cast<std::vector<int64_t>>(self.shape()), self.dtype(),
+            self.device());
+        if (veccomplex::try_unary(self.data_ptr(), out.data_ptr(),
+                                  self.numel(), self.dtype(), op))
+            return out;
+    }
+    return complex_unary_op_kernel(self, fb);
+}
+
+Tensor acos_kernel(const Tensor& self) {
+    if (isComplexType(self.dtype()))
+        return cplx_unary_vec(self, veccomplex::Op::Acos,
+                              [](auto x) { return std::acos(x);  });
+    return unary_float_op_kernel(self, [](auto x) { return std::acos(x); }, vecunary::VOp::Acos);
+}
+Tensor acosh_kernel(const Tensor& self) {
+    if (isComplexType(self.dtype()))
+        return cplx_unary_vec(self, veccomplex::Op::Acosh,
+                              [](auto x) { return std::acosh(x);  });
+    return unary_float_op_kernel(self, [](auto x) { return std::acosh(x); }, vecunary::VOp::Acosh);
+}
+Tensor asin_kernel(const Tensor& self) {
+    if (isComplexType(self.dtype()))
+        return cplx_unary_vec(self, veccomplex::Op::Asin,
+                              [](auto x) { return std::asin(x);  });
+    return unary_float_op_kernel(self, [](auto x) { return std::asin(x); }, vecunary::VOp::Asin);
+}
+Tensor asinh_kernel(const Tensor& self) {
+    if (isComplexType(self.dtype()))
+        return cplx_unary_vec(self, veccomplex::Op::Asinh,
+                              [](auto x) { return std::asinh(x);  });
+    return unary_float_op_kernel(self, [](auto x) { return std::asinh(x); }, vecunary::VOp::Asinh);
+}
+Tensor atan_kernel(const Tensor& self) {
+    if (isComplexType(self.dtype()))
+        return cplx_unary_vec(self, veccomplex::Op::Atan,
+                              [](auto x) { return std::atan(x);  });
+    return unary_float_op_kernel(self, [](auto x) { return std::atan(x); }, vecunary::VOp::Atan);
+}
+Tensor atanh_kernel(const Tensor& self) {
+    if (isComplexType(self.dtype()))
+        return cplx_unary_vec(self, veccomplex::Op::Atanh,
+                              [](auto x) { return std::atanh(x);  });
+    return unary_float_op_kernel(self, [](auto x) { return std::atanh(x); }, vecunary::VOp::Atanh);
+}
+Tensor cos_kernel(const Tensor& self) {
+    if (isComplexType(self.dtype()))
+        return cplx_unary_vec(self, veccomplex::Op::Cos,
+                              [](auto x) { return std::cos(x);  });
+    return unary_float_op_kernel(self, [](auto x) { return std::cos(x); }, vecunary::VOp::Cos);
+}
+Tensor cosh_kernel(const Tensor& self) {
+    if (isComplexType(self.dtype()))
+        return cplx_unary_vec(self, veccomplex::Op::Cosh,
+                              [](auto x) { return std::cosh(x);  });
+    return unary_float_op_kernel(self, [](auto x) { return std::cosh(x); }, vecunary::VOp::Cosh);
+}
+Tensor sin_kernel(const Tensor& self) {
+    if (isComplexType(self.dtype()))
+        return cplx_unary_vec(self, veccomplex::Op::Sin,
+                              [](auto x) { return std::sin(x);  });
+    return unary_float_op_kernel(self, [](auto x) { return std::sin(x); }, vecunary::VOp::Sin);
+}
+Tensor sinh_kernel(const Tensor& self) {
+    if (isComplexType(self.dtype()))
+        return cplx_unary_vec(self, veccomplex::Op::Sinh,
+                              [](auto x) { return std::sinh(x);  });
+    return unary_float_op_kernel(self, [](auto x) { return std::sinh(x); }, vecunary::VOp::Sinh);
+}
+Tensor tan_kernel(const Tensor& self) {
+    if (isComplexType(self.dtype()))
+        return cplx_unary_vec(self, veccomplex::Op::Tan,
+                              [](auto x) { return std::tan(x);  });
+    return unary_float_op_kernel(self, [](auto x) { return std::tan(x); }, vecunary::VOp::Tan);
+}
+Tensor tanh_kernel(const Tensor& self) {
+    if (isComplexType(self.dtype()))
+        return cplx_unary_vec(self, veccomplex::Op::Tanh,
+                              [](auto x) { return std::tanh(x);  });
+    return unary_float_op_kernel(self, [](auto x) { return std::tanh(x); }, vecunary::VOp::Tanh);
+}
+Tensor exp_kernel(const Tensor& self) {
+    if (isComplexType(self.dtype()))
+        return cplx_unary_vec(self, veccomplex::Op::Exp,
+                              [](auto x) { return std::exp(x);  });
+    return unary_float_op_kernel(self, [](auto x) { return std::exp(x); }, vecunary::VOp::Exp);
+}
+Tensor expm1_kernel(const Tensor& self) {
+    if (isComplexType(self.dtype()))
+        return cplx_unary_vec(self, veccomplex::Op::Expm1,
+                              [](auto x) { return cx_expm1(x);  });
+    return unary_float_op_kernel(self, [](auto x) { return std::expm1(x); }, vecunary::VOp::Expm1);
+}
 Tensor erf_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::erf(x); }, vecunary::VOp::Erf); }
 Tensor erfc_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::erfc(x); }, vecunary::VOp::Erfc); }
-Tensor log_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::log(x); }, vecunary::VOp::Log); }
-Tensor log10_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::log10(x); }, vecunary::VOp::Log10); }
-Tensor log1p_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::log1p(x); }, vecunary::VOp::Log1p); }
-Tensor log2_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::log2(x); }, vecunary::VOp::Log2); }
+Tensor log_kernel(const Tensor& self) {
+    if (isComplexType(self.dtype()))
+        return cplx_unary_vec(self, veccomplex::Op::Log,
+                              [](auto x) { return std::log(x);  });
+    return unary_float_op_kernel(self, [](auto x) { return std::log(x); }, vecunary::VOp::Log);
+}
+Tensor log10_kernel(const Tensor& self) {
+    if (isComplexType(self.dtype()))
+        return cplx_unary_vec(self, veccomplex::Op::Log10,
+                              [](auto x) { return std::log10(x);  });
+    return unary_float_op_kernel(self, [](auto x) { return std::log10(x); }, vecunary::VOp::Log10);
+}
+Tensor log1p_kernel(const Tensor& self) {
+    if (isComplexType(self.dtype()))
+        return cplx_unary_vec(self, veccomplex::Op::Log1p,
+                              [](auto x) { return cx_log1p(x);  });
+    return unary_float_op_kernel(self, [](auto x) { return std::log1p(x); }, vecunary::VOp::Log1p);
+}
+Tensor log2_kernel(const Tensor& self) {
+    if (isComplexType(self.dtype()))
+        return cplx_unary_vec(self, veccomplex::Op::Log2,
+                              [](auto x) { return cx_log2(x);  });
+    return unary_float_op_kernel(self, [](auto x) { return std::log2(x); }, vecunary::VOp::Log2);
+}
 Tensor lgamma_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::lgamma(x); }, vecunary::VOp::Lgamma); }
-Tensor sqrt_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { return std::sqrt(x); }, vecunary::VOp::Sqrt); }
-Tensor rsqrt_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { using T = decltype(x); return static_cast<T>(1) / std::sqrt(x); }, vecunary::VOp::Rsqrt); }
-Tensor sigmoid_kernel(const Tensor& self) { return unary_float_op_kernel(self, [](auto x) { using T = decltype(x); return static_cast<T>(1) / (static_cast<T>(1) + std::exp(-x)); }, vecunary::VOp::Sigmoid); }
+Tensor sqrt_kernel(const Tensor& self) {
+    if (isComplexType(self.dtype()))
+        return cplx_unary_vec(self, veccomplex::Op::Sqrt,
+                              [](auto x) { return std::sqrt(x);  });
+    return unary_float_op_kernel(self, [](auto x) { return std::sqrt(x); }, vecunary::VOp::Sqrt);
+}
+Tensor rsqrt_kernel(const Tensor& self) {
+    if (isComplexType(self.dtype()))
+        return cplx_unary_vec(self, veccomplex::Op::Rsqrt,
+                              [](auto x) { return cx_rsqrt(x);  });
+    return unary_float_op_kernel(self, [](auto x) { using T = decltype(x); return static_cast<T>(1) / std::sqrt(x); }, vecunary::VOp::Rsqrt);
+}
+Tensor sigmoid_kernel(const Tensor& self) {
+    if (isComplexType(self.dtype()))
+        return cplx_unary_vec(self, veccomplex::Op::Sigmoid,
+                              [](auto x) { return cx_sigmoid(x);  });
+    // Contiguous f32/f64 goes through the tier-compiled stub (three-tier
+    // build, compile-time ISA selection); everything else -- non-contiguous
+    // (normalized by clone below), f16/bf16 widen-compute-narrow, integral
+    // promotion -- stays on the generic runtime-dispatched path.
+    const DType dt = self.dtype();
+    if (self.is_contiguous() &&
+        (dt == DType::Float32 || dt == DType::Float64)) {
+        Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), dt, self.device());
+        const int64_t n = self.numel();
+        if (dt == DType::Float32) {
+            const float* src = self.data_ptr<float>();
+            float* dst = result.data_ptr<float>();
+            parallel_for(0, n, kUnaryGrain, [&](int64_t b, int64_t e) {
+                sigmoid_f32_stub(DeviceType::CPU, src + b, dst + b, e - b);
+            });
+        } else {
+            const double* src = self.data_ptr<double>();
+            double* dst = result.data_ptr<double>();
+            parallel_for(0, n, kUnaryGrain, [&](int64_t b, int64_t e) {
+                sigmoid_f64_stub(DeviceType::CPU, src + b, dst + b, e - b);
+            });
+        }
+        return result;
+    }
+    return unary_float_op_kernel(self, [](auto x) { using T = decltype(x); return static_cast<T>(1) / (static_cast<T>(1) + std::exp(-x)); }, vecunary::VOp::Sigmoid);
+}
 
 Tensor frac_kernel(const Tensor& self) {
     if (isIntegralType(self.dtype())) {
@@ -349,17 +616,11 @@ Tensor trunc_kernel(const Tensor& self) {
 }
 
 Tensor relu_kernel(const Tensor& self) {
-    #ifdef USE_ONEDNN
-    if (OneDNNContext::is_enabled() && self.dtype() == DType::Float32) {
-        try {
-            Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
-            onednn_eltwise(self, result, dnnl::algorithm::eltwise_relu);
-            return result;
-        } catch (const std::exception& e) {
-            // std::cerr << "OneDNN relu failed, falling back: " << e.what() << std::endl;
-        }
-    }
-    #endif
+    // oneDNN eltwise rejected here (was: numel >= 4096): primitive
+    // construction costs ~5us per call and measured *slower* than the native
+    // vector path even at 1M elements (54us vs 51us; torch does 28us), so it
+    // never amortized. ATen's Activation.cpp likewise uses its own vectorized
+    // kernels rather than oneDNN for ReLU.
 
     // Vectorized path for contiguous Float32 (see cpu/VecUnary.h).  The old
     // __AVX512F__/__AVX2__ blocks here were dead code: this TU compiles
@@ -457,10 +718,160 @@ Tensor gelu_backward_kernel(const Tensor& grad_output, const Tensor& self, const
 
 Tensor silu_kernel(const Tensor& self) {
     // SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
+    const DType dt = self.dtype();
+    if (self.is_contiguous() &&
+        (dt == DType::Float32 || dt == DType::Float64)) {
+        Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), dt, self.device());
+        const int64_t n = self.numel();
+        if (dt == DType::Float32) {
+            const float* src = self.data_ptr<float>();
+            float* dst = result.data_ptr<float>();
+            parallel_for(0, n, kUnaryGrain, [&](int64_t b, int64_t e) {
+                silu_f32_stub(DeviceType::CPU, src + b, dst + b, e - b);
+            });
+        } else {
+            const double* src = self.data_ptr<double>();
+            double* dst = result.data_ptr<double>();
+            parallel_for(0, n, kUnaryGrain, [&](int64_t b, int64_t e) {
+                silu_f64_stub(DeviceType::CPU, src + b, dst + b, e - b);
+            });
+        }
+        return result;
+    }
     return unary_float_op_kernel(self, [](auto x) {
         using T = decltype(x);
         return x / (static_cast<T>(1) + std::exp(-x));
     }, vecunary::VOp::Silu);
+}
+
+// Fused gated activation primitives.  These belong with the existing SiLU
+// implementation above, mirroring ATen/native/Activation.cpp and
+// native/GatedLinearUnit.cpp rather than introducing an LLM-specific kernel
+// bucket.  The packed form follows the decoder convention [gate | up].
+namespace {
+
+inline void check_silu_mul_inputs(const Tensor& gate, const Tensor& up,
+                                  const char* op) {
+    if (gate.device() != up.device()) {
+        TP_THROW(DeviceMismatchError, op,
+                 ": gate and up must be on the same device");
+    }
+    if (gate.shape() != up.shape()) {
+        TP_THROW(RuntimeError, op, ": gate and up must have the same shape");
+    }
+    if (gate.dtype() != up.dtype()) {
+        TP_THROW(RuntimeError, op, ": gate and up must have the same dtype");
+    }
+    if (!isFloatingType(gate.dtype())) {
+        TP_THROW(NotImplementedError, op,
+                 ": only floating point dtypes are supported");
+    }
+}
+
+template <typename T, typename Acc>
+void silu_mul_loop(const T* gate, const T* up, T* output, int64_t n) {
+    parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        for (int64_t i = begin; i < end; ++i) {
+            const Acc x = static_cast<Acc>(gate[i]);
+            const Acc y = static_cast<Acc>(up[i]);
+            const Acc sigmoid = Acc(1) / (Acc(1) + std::exp(-x));
+            output[i] = static_cast<T>(x * sigmoid * y);
+        }
+    });
+}
+
+template <typename T, typename Acc>
+void silu_and_mul_loop(const T* input, T* output, int64_t n,
+                       int64_t half_width) {
+    parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        for (int64_t i = begin; i < end; ++i) {
+            const int64_t row = i / half_width;
+            const int64_t col = i - row * half_width;
+            const int64_t base = row * (2 * half_width);
+            const Acc gate = static_cast<Acc>(input[base + col]);
+            const Acc up = static_cast<Acc>(input[base + half_width + col]);
+            const Acc sigmoid = Acc(1) / (Acc(1) + std::exp(-gate));
+            output[i] = static_cast<T>(gate * sigmoid * up);
+        }
+    });
+}
+
+template <typename T>
+Tensor silu_mul_typed(const Tensor& gate, const Tensor& up) {
+    Tensor gate_c = gate.is_contiguous() ? gate : gate.contiguous();
+    Tensor up_c = up.is_contiguous() ? up : up.contiguous();
+    Tensor output = Tensor::empty(
+        static_cast<std::vector<int64_t>>(gate_c.shape()), gate_c.dtype(),
+        gate_c.device());
+    using Acc = std::conditional_t<std::is_same_v<T, double>, double, float>;
+    silu_mul_loop<T, Acc>(gate_c.data_ptr<T>(), up_c.data_ptr<T>(),
+                          output.data_ptr<T>(), gate_c.numel());
+    return output;
+}
+
+template <typename T>
+Tensor silu_and_mul_typed(const Tensor& input) {
+    Tensor input_c = input.is_contiguous() ? input : input.contiguous();
+    std::vector<int64_t> output_shape =
+        static_cast<std::vector<int64_t>>(input_c.shape());
+    const int64_t packed_width = output_shape.back();
+    output_shape.back() = packed_width / 2;
+    Tensor output = Tensor::empty(output_shape, input_c.dtype(),
+                                  input_c.device());
+    using Acc = std::conditional_t<std::is_same_v<T, double>, double, float>;
+    silu_and_mul_loop<T, Acc>(input_c.data_ptr<T>(), output.data_ptr<T>(),
+                              input_c.numel() / 2, packed_width / 2);
+    return output;
+}
+
+} // namespace
+
+Tensor silu_mul_cpu(const Tensor& gate, const Tensor& up) {
+    check_silu_mul_inputs(gate, up, "silu_mul");
+    switch (gate.dtype()) {
+        case DType::Float32:
+            return silu_mul_typed<float>(gate, up);
+        case DType::Float64:
+            return silu_mul_typed<double>(gate, up);
+        case DType::Float16:
+            return silu_mul_typed<Half>(gate, up);
+        case DType::BFloat16:
+            return silu_mul_typed<BFloat16>(gate, up);
+        default:
+            TP_THROW(NotImplementedError, "silu_mul: unsupported dtype");
+    }
+}
+
+Tensor fused_swiglu_cpu(const Tensor& gate, const Tensor& up) {
+    return silu_mul_cpu(gate, up);
+}
+
+Tensor silu_and_mul_cpu(const Tensor& input) {
+    if (input.dim() < 1) {
+        TP_THROW(RuntimeError,
+                 "silu_and_mul: input must have at least one dimension");
+    }
+    const int64_t width = input.size(-1);
+    if ((width & 1) != 0) {
+        TP_THROW(RuntimeError,
+                 "silu_and_mul: the packed last dimension must be even");
+    }
+    if (!isFloatingType(input.dtype())) {
+        TP_THROW(NotImplementedError,
+                 "silu_and_mul: only floating point dtypes are supported");
+    }
+    switch (input.dtype()) {
+        case DType::Float32:
+            return silu_and_mul_typed<float>(input);
+        case DType::Float64:
+            return silu_and_mul_typed<double>(input);
+        case DType::Float16:
+            return silu_and_mul_typed<Half>(input);
+        case DType::BFloat16:
+            return silu_and_mul_typed<BFloat16>(input);
+        default:
+            TP_THROW(NotImplementedError, "silu_and_mul: unsupported dtype");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -487,8 +898,8 @@ Tensor activation_backward_kernel(const Tensor& grad_output, const Tensor& self,
     int64_t n = grad_output.numel();
     if (n == 0) return result;
 
-    Tensor grad_contig = grad_output.is_contiguous() ? grad_output : grad_output.clone();
-    Tensor self_contig = self.is_contiguous() ? self : self.clone();
+    Tensor grad_contig = grad_output.contiguous();
+    Tensor self_contig = self.contiguous();
 
     #define BACKWARD_CASE(ctype, name) \
     case DType::name: { \
@@ -773,6 +1184,44 @@ Tensor softplus_backward_kernel_impl(const Tensor& grad_output, const Tensor& se
 Tensor pow_scalar_kernel(const Tensor& self, Scalar exponent) {
     // ATen alignment: pow_tensor_scalar_optimized_kernel
     if (self.dtype() == DType::Bool) TP_THROW(TypeError, "pow is not supported for bool tensors");
+    if (isComplexType(self.dtype()) || exponent.isComplex()) {
+        // torch parity: complex ** real-scalar and real-tensor ** complex
+        // scalar both produce complex results.  Negative integer exponents
+        // are fine over complex.
+        DType base_dt = isComplexType(self.dtype())
+            ? self.dtype()
+            : (isFloatingType(self.dtype()) ? toComplexType(self.dtype())
+                                            : DType::ComplexFloat);
+        DType result_dtype = promoteTypes(base_dt,
+            isComplexType(exponent.dtype()) ? exponent.dtype() : toComplexType(base_dt));
+        Tensor base = self.to(result_dtype);
+        if (!isComplexType(exponent.dtype())) {
+            double ev = exponent.toDouble();
+            // Fast paths mirroring ATen pow_tensor_scalar_optimized_kernel
+            if (ev == 0.5) return sqrt_kernel(base);
+            if (ev == -0.5) return rsqrt_kernel(base);
+            if (ev == 1.0) return base.clone();
+            if (ev == 2.0) return square_kernel(base);
+            if (ev == 3.0) return complex_unary_op_kernel(base, [](auto x) { return x * x * x; });
+            return complex_unary_op_kernel(base, [ev](auto x) {
+                using V = typename decltype(x)::value_type;
+                return std::pow(x, static_cast<V>(ev));
+            });
+        }
+        // Complex exponent: promote the scalar into the result dtype once.
+        if (result_dtype == DType::ComplexDouble) {
+            auto e = exponent.to<std::complex<double>>();
+            return complex_unary_op_kernel(base, [e](auto x) {
+                using V = typename decltype(x)::value_type;
+                return std::pow(x, static_cast<std::complex<V>>(e));
+            });
+        }
+        auto e = exponent.to<std::complex<float>>();
+        return complex_unary_op_kernel(base, [e](auto x) {
+            using V = typename decltype(x)::value_type;
+            return std::pow(x, static_cast<std::complex<V>>(e));
+        });
+    }
     if (isIntegralType(self.dtype()) && exponent.isIntegral() && exponent.to<int64_t>() < 0) {
         TP_THROW(RuntimeError, "Integers to negative integer powers are not allowed.");
     }
@@ -811,10 +1260,82 @@ Tensor pow_scalar_kernel(const Tensor& self, Scalar exponent) {
 
 
 Tensor angle_kernel(const Tensor& self) {
+    // ATen alignment: angle(complex) -> atan2(imag, real) in the real dtype
+    if (isComplexType(self.dtype())) {
+        if ((self.dtype() == DType::ComplexFloat ||
+             self.dtype() == DType::ComplexDouble) &&
+            self.is_contiguous() && self.numel() > 0 &&
+            veccomplex::avx2_available()) {
+            Tensor out = Tensor::empty(
+                static_cast<std::vector<int64_t>>(self.shape()),
+                toRealValueType(self.dtype()), self.device());
+            if (veccomplex::try_angle(self.data_ptr(), out.data_ptr(),
+                                      self.numel(), self.dtype()))
+                return out;
+        }
+        DType out_dtype = toRealValueType(self.dtype());
+        Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), out_dtype, self.device());
+        const int64_t n = self.numel();
+        Tensor self_contig = self.contiguous();
+        switch (self.dtype()) {
+            case DType::ComplexHalf:
+            case DType::BComplex32: {
+                // Reduced complexes compute in float32.
+                if (self.dtype() == DType::ComplexHalf) {
+                    const std::complex<Half>* src =
+                        reinterpret_cast<const std::complex<Half>*>(self_contig.data_ptr());
+                    Half* dst = result.data_ptr<Half>();
+                    parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) {
+                        for (int64_t i = begin; i < end; ++i) {
+                            dst[i] = static_cast<Half>(std::atan2(
+                                static_cast<float>(src[i].imag()),
+                                static_cast<float>(src[i].real())));
+                        }
+                    });
+                } else {
+                    const std::complex<BFloat16>* src =
+                        reinterpret_cast<const std::complex<BFloat16>*>(self_contig.data_ptr());
+                    BFloat16* dst = result.data_ptr<BFloat16>();
+                    parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) {
+                        for (int64_t i = begin; i < end; ++i) {
+                            dst[i] = static_cast<BFloat16>(std::atan2(
+                                static_cast<float>(src[i].imag()),
+                                static_cast<float>(src[i].real())));
+                        }
+                    });
+                }
+                break;
+            }
+            case DType::ComplexFloat: {
+                using c_t = std::complex<float>;
+                const c_t* src = reinterpret_cast<const c_t*>(self_contig.data_ptr());
+                float* dst = result.data_ptr<float>();
+                parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) {
+                    for (int64_t i = begin; i < end; ++i) {
+                        dst[i] = std::atan2(src[i].imag(), src[i].real());
+                    }
+                });
+                break;
+            }
+            case DType::ComplexDouble: {
+                using c_t = std::complex<double>;
+                const c_t* src = reinterpret_cast<const c_t*>(self_contig.data_ptr());
+                double* dst = result.data_ptr<double>();
+                parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) {
+                    for (int64_t i = begin; i < end; ++i) {
+                        dst[i] = std::atan2(src[i].imag(), src[i].real());
+                    }
+                });
+                break;
+            }
+            default: TP_THROW(TypeError, "angle: unsupported dtype");
+        }
+        return result;
+    }
     // For real numbers, angle is 0 if >=0, pi if <0
-    return unary_float_op_kernel(self, [](auto x) { 
+    return unary_float_op_kernel(self, [](auto x) {
         if (x >= 0) return 0.0;
-        return 3.14159265358979323846; 
+        return 3.14159265358979323846;
     });
 }
 
@@ -824,7 +1345,7 @@ Tensor angle_kernel(const Tensor& self) {
 Tensor clamp_kernel(const Tensor& self, std::optional<Scalar> min, std::optional<Scalar> max) {
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
     int64_t n = self.numel();
-    Tensor self_contig = self.is_contiguous() ? self : self.clone();
+    Tensor self_contig = self.contiguous();
 
     #define OP_CASE(ctype, name) \
     case DType::name: { \
@@ -873,8 +1394,8 @@ Tensor clamp_backward_kernel(const Tensor& grad_output, const Tensor& self, std:
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(grad_output.shape()), grad_output.dtype(), grad_output.device());
     int64_t n = grad_output.numel();
     
-    Tensor self_contig = self.is_contiguous() ? self : self.clone();
-    Tensor grad_contig = grad_output.is_contiguous() ? grad_output : grad_output.clone();
+    Tensor self_contig = self.contiguous();
+    Tensor grad_contig = grad_output.contiguous();
     
     #define OP_CASE(ctype, name) \
     case DType::name: { \
@@ -909,8 +1430,8 @@ Tensor threshold_backward_kernel(const Tensor& grad_output, const Tensor& output
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(grad_output.shape()), grad_output.dtype(), grad_output.device());
     int64_t n = grad_output.numel();
     
-    Tensor output_contig = output.is_contiguous() ? output : output.clone();
-    Tensor grad_contig = grad_output.is_contiguous() ? grad_output : grad_output.clone();
+    Tensor output_contig = output.contiguous();
+    Tensor grad_contig = grad_output.contiguous();
     
     #define OP_CASE(ctype, name) \
     case DType::name: { \
@@ -946,6 +1467,9 @@ template <bool LogMode>
 static Tensor softmax_fused_kernel_impl(const Tensor& self, int64_t dim, DType out_dtype) {
     Tensor input = self.to(out_dtype);
     int64_t d = dim < 0 ? dim + input.dim() : dim;
+    if (d < 0 || d >= input.dim()) {
+        TP_THROW(IndexError, format_dim_range(input.dim(), dim));
+    }
 
     bool innermost = input.is_contiguous() && (d == input.dim() - 1);
     if (!innermost) {
@@ -1026,14 +1550,236 @@ Tensor pow_tensor_tensor_kernel(const Tensor& self, const Tensor& exponent) {
     Tensor self_c = (self.dtype() == result_dtype) ? self : self.to(result_dtype);
     Tensor exp_c = (exponent.dtype() == result_dtype) ? exponent : exponent.to(result_dtype);
 
+    if (isComplexType(result_dtype)) {
+        // Reduced complexes follow ATen's opmath rule: compute in complex64
+        // and narrow back (std::<complex> internals assume a real float type).
+        if (result_dtype == DType::ComplexHalf || result_dtype == DType::BComplex32) {
+            return pow_tensor_tensor_kernel(self.to(DType::ComplexFloat),
+                                            exponent.to(DType::ComplexFloat))
+                .to(result_dtype);
+        }
+        // torch parity: std::pow semantics over matching complex widths.
+        ti_apply_arith(result, self_c, exp_c,
+            [](auto b, auto e) {
+                using B = decltype(b);
+                if constexpr (is_complex_type_v<B>) {
+                    using V = typename B::value_type;
+                    if constexpr (std::is_same_v<V, float> || std::is_same_v<V, double>) {
+                        return std::pow(b, e);
+                    } else {
+                        // Reduced complexes are unreachable at runtime
+                        // (promoted above); instantiate in float so the
+                        // generic lambda is valid for every iterator slot.
+                        using F = std::complex<float>;
+                        const auto r =
+                            std::pow(F(static_cast<float>(b.real()), static_cast<float>(b.imag())),
+                                     F(static_cast<float>(e.real()), static_cast<float>(e.imag())));
+                        return B(static_cast<V>(r.real()), static_cast<V>(r.imag()));
+                    }
+                } else {
+                    return static_cast<B>(std::pow(static_cast<double>(b), static_cast<double>(e)));
+                }
+            });
+        return result;
+    }
+
     ti_apply_binary(result, self_c, exp_c,
         [](auto b, auto e) { return static_cast<decltype(b)>(std::pow(static_cast<double>(b), static_cast<double>(e))); });
-    return result;
-    
     return result;
 }
 
 // Lerp implementations using composition
+template <typename T, typename W>
+inline T lerp_scalar_value(T self, T end, W weight) {
+    using compute_t = std::conditional_t<
+        std::is_same_v<T, double>, double, float>;
+    const compute_t s = static_cast<compute_t>(self);
+    const compute_t e = static_cast<compute_t>(end);
+    const compute_t w = static_cast<compute_t>(weight);
+    // Keep the same numerically-stable branch as ATen's native Lerp.h.
+    const compute_t value = std::abs(w) < compute_t(0.5)
+        ? s + w * (e - s)
+        : e - (e - s) * (compute_t(1) - w);
+    return static_cast<T>(value);
+}
+
+inline bool lerp_same_shape(const Tensor& self, const Tensor& end) {
+    if (self.dim() != end.dim()) return false;
+    for (int64_t d = 0; d < self.dim(); ++d) {
+        if (self.size(d) != end.size(d)) return false;
+    }
+    return true;
+}
+
+#if defined(__x86_64__)
+namespace {
+
+inline bool pointwise_cpu_has_avx512() {
+    static const bool ok = __builtin_cpu_supports("avx512f") != 0 &&
+                           __builtin_cpu_supports("fma") != 0;
+    return ok;
+}
+
+inline bool pointwise_cpu_has_avx512_bf16() {
+    static const bool ok = pointwise_cpu_has_avx512() &&
+                           __builtin_cpu_supports("avx512bf16") != 0;
+    return ok;
+}
+
+__attribute__((target("avx512f,fma")))
+void lerp_f32_avx512(const float* self, const float* end, float* result,
+                     int64_t n, float weight) {
+    const __m512 w = _mm512_set1_ps(weight);
+    const __m512 coeff = std::abs(weight) < 0.5f
+        ? w : _mm512_sub_ps(w, _mm512_set1_ps(1.0f));
+    int64_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        const __m512 s = _mm512_loadu_ps(self + i);
+        const __m512 e = _mm512_loadu_ps(end + i);
+        const __m512 b = std::abs(weight) < 0.5f ? s : e;
+        _mm512_storeu_ps(result + i,
+                         _mm512_fmadd_ps(coeff, _mm512_sub_ps(e, s), b));
+    }
+    for (; i < n; ++i) {
+        result[i] = lerp_scalar_value(self[i], end[i], weight);
+    }
+}
+
+__attribute__((target("avx512f,fma")))
+void lerp_f64_avx512(const double* self, const double* end, double* result,
+                     int64_t n, double weight) {
+    const __m512d w = _mm512_set1_pd(weight);
+    const __m512d coeff = std::abs(weight) < 0.5
+        ? w : _mm512_sub_pd(w, _mm512_set1_pd(1.0));
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m512d s = _mm512_loadu_pd(self + i);
+        const __m512d e = _mm512_loadu_pd(end + i);
+        const __m512d b = std::abs(weight) < 0.5 ? s : e;
+        _mm512_storeu_pd(result + i,
+                         _mm512_fmadd_pd(coeff, _mm512_sub_pd(e, s), b));
+    }
+    for (; i < n; ++i) {
+        result[i] = lerp_scalar_value(self[i], end[i], weight);
+    }
+}
+
+__attribute__((target("avx512f,avx512bf16,fma")))
+void lerp_bf16_avx512(const uint16_t* self, const uint16_t* end,
+                      uint16_t* result, int64_t n, float weight) {
+    const __m512 w = _mm512_set1_ps(weight);
+    const bool small = std::abs(weight) < 0.5f;
+    const __m512 coeff = small ? w : _mm512_sub_ps(w, _mm512_set1_ps(1.0f));
+    int64_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        const __m256i sr = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i*>(self + i));
+        const __m256i er = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i*>(end + i));
+        const __m512 s = _mm512_castsi512_ps(
+            _mm512_slli_epi32(_mm512_cvtepu16_epi32(sr), 16));
+        const __m512 e = _mm512_castsi512_ps(
+            _mm512_slli_epi32(_mm512_cvtepu16_epi32(er), 16));
+        const __m512 base = small ? s : e;
+        const __m512 out = _mm512_fmadd_ps(coeff, _mm512_sub_ps(e, s), base);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(result + i),
+                            (__m256i)_mm512_cvtneps_pbh(out));
+    }
+    for (; i < n; ++i) {
+        const float s = detail::bfloat16_to_float_bits(self[i]);
+        const float e = detail::bfloat16_to_float_bits(end[i]);
+        result[i] = detail::float_to_bfloat16_bits(
+            lerp_scalar_value(s, e, weight));
+    }
+}
+
+} // namespace
+#endif
+
+template <typename T, typename W>
+void lerp_scalar_contiguous(const T* self, const T* end, T* result,
+                            int64_t n, W weight) {
+#if defined(__x86_64__)
+    if constexpr (std::is_same_v<T, float>) {
+        if (pointwise_cpu_has_avx512()) {
+            const float w = static_cast<float>(weight);
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t finish) {
+                lerp_f32_avx512(self + begin, end + begin, result + begin,
+                                finish - begin, w);
+            });
+            return;
+        }
+    } else if constexpr (std::is_same_v<T, double>) {
+        if (pointwise_cpu_has_avx512()) {
+            const double w = static_cast<double>(weight);
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t finish) {
+                lerp_f64_avx512(self + begin, end + begin, result + begin,
+                                finish - begin, w);
+            });
+            return;
+        }
+    } else if constexpr (std::is_same_v<T, BFloat16>) {
+        if (pointwise_cpu_has_avx512_bf16()) {
+            const auto* s = reinterpret_cast<const uint16_t*>(self);
+            const auto* e = reinterpret_cast<const uint16_t*>(end);
+            auto* r = reinterpret_cast<uint16_t*>(result);
+            const float w = static_cast<float>(weight);
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t finish) {
+                lerp_bf16_avx512(s + begin, e + begin, r + begin,
+                                 finish - begin, w);
+            });
+            return;
+        }
+    }
+#endif
+    parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t finish) {
+        for (int64_t i = begin; i < finish; ++i) {
+            result[i] = lerp_scalar_value(self[i], end[i], weight);
+        }
+    });
+}
+
+// TensorIterator's generic lerp composition is several full-tensor passes
+// for reduced floating types.  Muon calls scalar-weight lerp twice per
+// parameter, so keep the native Torch operation as one fused pass whenever
+// both operands are already dense and have the same dtype.  The general
+// broadcasting/promotion path below remains the semantic fallback.
+template <typename W>
+bool lerp_scalar_fast(const Tensor& self, const Tensor& end, Tensor& result,
+                      W weight) {
+    if (!self.is_contiguous() || !end.is_contiguous() ||
+        self.dtype() != end.dtype() || !lerp_same_shape(self, end)) {
+        return false;
+    }
+    const int64_t n = self.numel();
+    switch (self.dtype()) {
+        case DType::Float16:
+            lerp_scalar_contiguous(self.data_ptr<Half>(), end.data_ptr<Half>(),
+                                   result.data_ptr<Half>(), n,
+                                   static_cast<float>(weight));
+            return true;
+        case DType::BFloat16:
+            lerp_scalar_contiguous(self.data_ptr<BFloat16>(),
+                                   end.data_ptr<BFloat16>(),
+                                   result.data_ptr<BFloat16>(), n,
+                                   static_cast<float>(weight));
+            return true;
+        case DType::Float32:
+            lerp_scalar_contiguous(self.data_ptr<float>(), end.data_ptr<float>(),
+                                   result.data_ptr<float>(), n,
+                                   static_cast<float>(weight));
+            return true;
+        case DType::Float64:
+            lerp_scalar_contiguous(self.data_ptr<double>(),
+                                   end.data_ptr<double>(),
+                                   result.data_ptr<double>(), n,
+                                   static_cast<double>(weight));
+            return true;
+        default:
+            return false;
+    }
+}
+
 Tensor lerp_tensor_kernel(const Tensor& self, const Tensor& end, const Tensor& weight) {
     DType common_dtype = promoteTypes(self.dtype(), end.dtype());
     common_dtype = promoteTypes(common_dtype, weight.dtype());
@@ -1049,6 +1795,20 @@ Tensor lerp_tensor_kernel(const Tensor& self, const Tensor& end, const Tensor& w
 }
 
 Tensor lerp_scalar_kernel(const Tensor& self, const Tensor& end, Scalar weight) {
+    if (self.dtype() == end.dtype() && lerp_same_shape(self, end) &&
+        self.is_contiguous() && end.is_contiguous() &&
+        (self.dtype() == DType::Float16 || self.dtype() == DType::BFloat16 ||
+         self.dtype() == DType::Float32 || self.dtype() == DType::Float64)) {
+        // Native lerp keeps the reduced floating output dtype even though its
+        // arithmetic is performed in float32.  This also avoids the three
+        // temporary tensors used by the generic composition above.
+        Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()),
+                                      self.dtype(), self.device());
+        if (lerp_scalar_fast(self, end, result, weight.to<double>())) {
+            return result;
+        }
+    }
+
     DType common_dtype = promoteTypes(self.dtype(), end.dtype());
     if (weight.isFloatingPoint()) common_dtype = promoteTypes(common_dtype, DType::Float32);
     if (isIntegralType(common_dtype)) common_dtype = DType::Float32;
@@ -1065,6 +1825,14 @@ Tensor lerp_scalar_kernel(const Tensor& self, const Tensor& end, Scalar weight) 
 }
 
 Tensor& lerp_scalar_inplace_kernel(Tensor& self, const Tensor& end, Scalar weight) {
+    if (self.dtype() == end.dtype() && lerp_same_shape(self, end) &&
+        self.is_contiguous() && end.is_contiguous() &&
+        (self.dtype() == DType::Float16 || self.dtype() == DType::BFloat16 ||
+         self.dtype() == DType::Float32 || self.dtype() == DType::Float64)) {
+        if (lerp_scalar_fast(self, end, self, weight.to<double>())) {
+            return self;
+        }
+    }
     self.copy_(lerp_scalar_kernel(self, end, weight));
     return self;
 }
@@ -1133,6 +1901,9 @@ TENSORPLAY_LIBRARY_IMPL(CPU, PointwiseKernels) {
     m.impl("gelu", gelu_kernel);
     m.impl("gelu_backward", gelu_backward_kernel);
     m.impl("silu", silu_kernel);
+    m.impl("silu_mul", silu_mul_cpu);
+    m.impl("fused_swiglu", fused_swiglu_cpu);
+    m.impl("silu_and_mul", silu_and_mul_cpu);
     // Activations — see the ATen citations above each kernel.
     m.impl("hardtanh", hardtanh_kernel_impl);
     m.impl("hardtanh_backward", hardtanh_backward_kernel_impl);

@@ -60,13 +60,13 @@ class Flickr8k(VisionDataset):
     Args:
         root (str or ``pathlib.Path``): Root directory where images are downloaded to.
         ann_file (string): Path to annotation file.
-        transform (callable, optional): A function/transform that takes in a PIL image or torch.Tensor, depends on the given loader,
+        transform (callable, optional): A function/transform that takes in a PIL image or tensorplay.Tensor, depends on the given loader,
             and returns a transformed version. E.g, ``transforms.RandomCrop``
         target_transform (callable, optional): A function/transform that takes in the
             target and transforms it.
         loader (callable, optional): A function to load an image given its path.
             By default, it uses PIL as its image loader, but users could also pass in
-            ``torchvision.io.decode_image`` for decoding image data into tensors directly.
+            ``tensorplay.vision.io.decode_image`` for decoding image data into tensors directly.
     """
 
     def __init__(
@@ -121,13 +121,13 @@ class Flickr30k(VisionDataset):
     Args:
         root (str or ``pathlib.Path``): Root directory where images are downloaded to.
         ann_file (string): Path to annotation file.
-        transform (callable, optional): A function/transform that takes in a PIL image or torch.Tensor, depends on the given loader,
+        transform (callable, optional): A function/transform that takes in a PIL image or tensorplay.Tensor, depends on the given loader,
             and returns a transformed version. E.g, ``transforms.RandomCrop``
         target_transform (callable, optional): A function/transform that takes in the
             target and transforms it.
         loader (callable, optional): A function to load an image given its path.
             By default, it uses PIL as its image loader, but users could also pass in
-            ``torchvision.io.decode_image`` for decoding image data into tensors directly.
+            ``tensorplay.vision.io.decode_image`` for decoding image data into tensors directly.
     """
 
     def __init__(

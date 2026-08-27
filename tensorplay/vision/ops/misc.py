@@ -3,16 +3,16 @@ import warnings
 from collections.abc import Sequence
 from typing import Callable, Optional, Union
 
-import tensorplay as torch
+import tensorplay as tensorplay
 from tensorplay import Tensor
 
 from ..utils import _log_api_usage_once, _make_ntuple
 
 
-interpolate = torch.nn.functional.interpolate
+interpolate = tensorplay.nn.functional.interpolate
 
 
-class FrozenBatchNorm2d(torch.nn.Module):
+class FrozenBatchNorm2d(tensorplay.nn.Module):
     """
     BatchNorm2d where the batch statistics and the affine parameters are fixed
 
@@ -29,10 +29,10 @@ class FrozenBatchNorm2d(torch.nn.Module):
         super().__init__()
         _log_api_usage_once(self)
         self.eps = eps
-        self.register_buffer("weight", torch.ones(num_features))
-        self.register_buffer("bias", torch.zeros(num_features))
-        self.register_buffer("running_mean", torch.zeros(num_features))
-        self.register_buffer("running_var", torch.ones(num_features))
+        self.register_buffer("weight", tensorplay.ones(num_features))
+        self.register_buffer("bias", tensorplay.zeros(num_features))
+        self.register_buffer("running_mean", tensorplay.zeros(num_features))
+        self.register_buffer("running_var", tensorplay.ones(num_features))
 
     def _load_from_state_dict(
         self,
@@ -67,7 +67,7 @@ class FrozenBatchNorm2d(torch.nn.Module):
         return f"{self.__class__.__name__}({self.weight.shape[0]}, eps={self.eps})"
 
 
-class ConvNormActivation(torch.nn.Sequential):
+class ConvNormActivation(tensorplay.nn.Sequential):
     def __init__(
         self,
         in_channels: int,
@@ -76,12 +76,12 @@ class ConvNormActivation(torch.nn.Sequential):
         stride: Union[int, tuple[int, ...]] = 1,
         padding: Optional[Union[int, tuple[int, ...], str]] = None,
         groups: int = 1,
-        norm_layer: Optional[Callable[..., torch.nn.Module]] = torch.nn.BatchNorm2d,
-        activation_layer: Optional[Callable[..., torch.nn.Module]] = torch.nn.ReLU,
+        norm_layer: Optional[Callable[..., tensorplay.nn.Module]] = tensorplay.nn.BatchNorm2d,
+        activation_layer: Optional[Callable[..., tensorplay.nn.Module]] = tensorplay.nn.ReLU,
         dilation: Union[int, tuple[int, ...]] = 1,
         inplace: Optional[bool] = True,
         bias: Optional[bool] = None,
-        conv_layer: Callable[..., torch.nn.Module] = torch.nn.Conv2d,
+        conv_layer: Callable[..., tensorplay.nn.Module] = tensorplay.nn.Conv2d,
     ) -> None:
 
         if padding is None:
@@ -135,8 +135,8 @@ class Conv2dNormActivation(ConvNormActivation):
         stride (int, optional): Stride of the convolution. Default: 1
         padding (int, tuple or str, optional): Padding added to all four sides of the input. Default: None, in which case it will be calculated as ``padding = (kernel_size - 1) // 2 * dilation``
         groups (int, optional): Number of blocked connections from input channels to output channels. Default: 1
-        norm_layer (Callable[..., torch.nn.Module], optional): Norm layer that will be stacked on top of the convolution layer. If ``None`` this layer won't be used. Default: ``torch.nn.BatchNorm2d``
-        activation_layer (Callable[..., torch.nn.Module], optional): Activation function which will be stacked on top of the normalization layer (if not None), otherwise on top of the conv layer. If ``None`` this layer won't be used. Default: ``torch.nn.ReLU``
+        norm_layer (Callable[..., tensorplay.nn.Module], optional): Norm layer that will be stacked on top of the convolution layer. If ``None`` this layer won't be used. Default: ``tensorplay.nn.BatchNorm2d``
+        activation_layer (Callable[..., tensorplay.nn.Module], optional): Activation function which will be stacked on top of the normalization layer (if not None), otherwise on top of the conv layer. If ``None`` this layer won't be used. Default: ``tensorplay.nn.ReLU``
         dilation (int): Spacing between kernel elements. Default: 1
         inplace (bool): Parameter for the activation layer, which can optionally do the operation in-place. Default ``True``
         bias (bool, optional): Whether to use bias in the convolution layer. By default, biases are included if ``norm_layer is None``.
@@ -151,8 +151,8 @@ class Conv2dNormActivation(ConvNormActivation):
         stride: Union[int, tuple[int, int]] = 1,
         padding: Optional[Union[int, tuple[int, int], str]] = None,
         groups: int = 1,
-        norm_layer: Optional[Callable[..., torch.nn.Module]] = torch.nn.BatchNorm2d,
-        activation_layer: Optional[Callable[..., torch.nn.Module]] = torch.nn.ReLU,
+        norm_layer: Optional[Callable[..., tensorplay.nn.Module]] = tensorplay.nn.BatchNorm2d,
+        activation_layer: Optional[Callable[..., tensorplay.nn.Module]] = tensorplay.nn.ReLU,
         dilation: Union[int, tuple[int, int]] = 1,
         inplace: Optional[bool] = True,
         bias: Optional[bool] = None,
@@ -170,7 +170,7 @@ class Conv2dNormActivation(ConvNormActivation):
             dilation,
             inplace,
             bias,
-            torch.nn.Conv2d,
+            tensorplay.nn.Conv2d,
         )
 
 
@@ -185,8 +185,8 @@ class Conv3dNormActivation(ConvNormActivation):
         stride (int, optional): Stride of the convolution. Default: 1
         padding (int, tuple or str, optional): Padding added to all four sides of the input. Default: None, in which case it will be calculated as ``padding = (kernel_size - 1) // 2 * dilation``
         groups (int, optional): Number of blocked connections from input channels to output channels. Default: 1
-        norm_layer (Callable[..., torch.nn.Module], optional): Norm layer that will be stacked on top of the convolution layer. If ``None`` this layer won't be used. Default: ``torch.nn.BatchNorm3d``
-        activation_layer (Callable[..., torch.nn.Module], optional): Activation function which will be stacked on top of the normalization layer (if not None), otherwise on top of the conv layer. If ``None`` this layer won't be used. Default: ``torch.nn.ReLU``
+        norm_layer (Callable[..., tensorplay.nn.Module], optional): Norm layer that will be stacked on top of the convolution layer. If ``None`` this layer won't be used. Default: ``tensorplay.nn.BatchNorm3d``
+        activation_layer (Callable[..., tensorplay.nn.Module], optional): Activation function which will be stacked on top of the normalization layer (if not None), otherwise on top of the conv layer. If ``None`` this layer won't be used. Default: ``tensorplay.nn.ReLU``
         dilation (int): Spacing between kernel elements. Default: 1
         inplace (bool): Parameter for the activation layer, which can optionally do the operation in-place. Default ``True``
         bias (bool, optional): Whether to use bias in the convolution layer. By default, biases are included if ``norm_layer is None``.
@@ -200,8 +200,8 @@ class Conv3dNormActivation(ConvNormActivation):
         stride: Union[int, tuple[int, int, int]] = 1,
         padding: Optional[Union[int, tuple[int, int, int], str]] = None,
         groups: int = 1,
-        norm_layer: Optional[Callable[..., torch.nn.Module]] = torch.nn.BatchNorm3d,
-        activation_layer: Optional[Callable[..., torch.nn.Module]] = torch.nn.ReLU,
+        norm_layer: Optional[Callable[..., tensorplay.nn.Module]] = tensorplay.nn.BatchNorm3d,
+        activation_layer: Optional[Callable[..., tensorplay.nn.Module]] = tensorplay.nn.ReLU,
         dilation: Union[int, tuple[int, int, int]] = 1,
         inplace: Optional[bool] = True,
         bias: Optional[bool] = None,
@@ -219,11 +219,11 @@ class Conv3dNormActivation(ConvNormActivation):
             dilation,
             inplace,
             bias,
-            torch.nn.Conv3d,
+            tensorplay.nn.Conv3d,
         )
 
 
-class SqueezeExcitation(torch.nn.Module):
+class SqueezeExcitation(tensorplay.nn.Module):
     """
     This block implements the Squeeze-and-Excitation block from https://arxiv.org/abs/1709.01507 (see Fig. 1).
     Parameters ``activation``, and ``scale_activation`` correspond to ``delta`` and ``sigma`` in eq. 3.
@@ -231,22 +231,22 @@ class SqueezeExcitation(torch.nn.Module):
     Args:
         input_channels (int): Number of channels in the input image
         squeeze_channels (int): Number of squeeze channels
-        activation (Callable[..., torch.nn.Module], optional): ``delta`` activation. Default: ``torch.nn.ReLU``
-        scale_activation (Callable[..., torch.nn.Module]): ``sigma`` activation. Default: ``torch.nn.Sigmoid``
+        activation (Callable[..., tensorplay.nn.Module], optional): ``delta`` activation. Default: ``tensorplay.nn.ReLU``
+        scale_activation (Callable[..., tensorplay.nn.Module]): ``sigma`` activation. Default: ``tensorplay.nn.Sigmoid``
     """
 
     def __init__(
         self,
         input_channels: int,
         squeeze_channels: int,
-        activation: Callable[..., torch.nn.Module] = torch.nn.ReLU,
-        scale_activation: Callable[..., torch.nn.Module] = torch.nn.Sigmoid,
+        activation: Callable[..., tensorplay.nn.Module] = tensorplay.nn.ReLU,
+        scale_activation: Callable[..., tensorplay.nn.Module] = tensorplay.nn.Sigmoid,
     ) -> None:
         super().__init__()
         _log_api_usage_once(self)
-        self.avgpool = torch.nn.AdaptiveAvgPool2d(1)
-        self.fc1 = torch.nn.Conv2d(input_channels, squeeze_channels, 1)
-        self.fc2 = torch.nn.Conv2d(squeeze_channels, input_channels, 1)
+        self.avgpool = tensorplay.nn.AdaptiveAvgPool2d(1)
+        self.fc1 = tensorplay.nn.Conv2d(input_channels, squeeze_channels, 1)
+        self.fc2 = tensorplay.nn.Conv2d(squeeze_channels, input_channels, 1)
         self.activation = activation()
         self.scale_activation = scale_activation()
 
@@ -262,14 +262,14 @@ class SqueezeExcitation(torch.nn.Module):
         return scale * input
 
 
-class MLP(torch.nn.Sequential):
+class MLP(tensorplay.nn.Sequential):
     """This block implements the multi-layer perceptron (MLP) module.
 
     Args:
         in_channels (int): Number of channels of the input
         hidden_channels (List[int]): List of the hidden channel dimensions
-        norm_layer (Callable[..., torch.nn.Module], optional): Norm layer that will be stacked on top of the linear layer. If ``None`` this layer won't be used. Default: ``None``
-        activation_layer (Callable[..., torch.nn.Module], optional): Activation function which will be stacked on top of the normalization layer (if not None), otherwise on top of the linear layer. If ``None`` this layer won't be used. Default: ``torch.nn.ReLU``
+        norm_layer (Callable[..., tensorplay.nn.Module], optional): Norm layer that will be stacked on top of the linear layer. If ``None`` this layer won't be used. Default: ``None``
+        activation_layer (Callable[..., tensorplay.nn.Module], optional): Activation function which will be stacked on top of the normalization layer (if not None), otherwise on top of the linear layer. If ``None`` this layer won't be used. Default: ``tensorplay.nn.ReLU``
         inplace (bool, optional): Parameter for the activation layer, which can optionally do the operation in-place.
             Default is ``None``, which uses the respective default values of the ``activation_layer`` and Dropout layer.
         bias (bool): Whether to use bias in the linear layer. Default ``True``
@@ -280,8 +280,8 @@ class MLP(torch.nn.Sequential):
         self,
         in_channels: int,
         hidden_channels: list[int],
-        norm_layer: Optional[Callable[..., torch.nn.Module]] = None,
-        activation_layer: Optional[Callable[..., torch.nn.Module]] = torch.nn.ReLU,
+        norm_layer: Optional[Callable[..., tensorplay.nn.Module]] = None,
+        activation_layer: Optional[Callable[..., tensorplay.nn.Module]] = tensorplay.nn.ReLU,
         inplace: Optional[bool] = None,
         bias: bool = True,
         dropout: float = 0.0,
@@ -293,21 +293,21 @@ class MLP(torch.nn.Sequential):
         layers = []
         in_dim = in_channels
         for hidden_dim in hidden_channels[:-1]:
-            layers.append(torch.nn.Linear(in_dim, hidden_dim, bias=bias))
+            layers.append(tensorplay.nn.Linear(in_dim, hidden_dim, bias=bias))
             if norm_layer is not None:
                 layers.append(norm_layer(hidden_dim))
             layers.append(activation_layer(**params))
-            layers.append(torch.nn.Dropout(dropout, **params))
+            layers.append(tensorplay.nn.Dropout(dropout, **params))
             in_dim = hidden_dim
 
-        layers.append(torch.nn.Linear(in_dim, hidden_channels[-1], bias=bias))
-        layers.append(torch.nn.Dropout(dropout, **params))
+        layers.append(tensorplay.nn.Linear(in_dim, hidden_channels[-1], bias=bias))
+        layers.append(tensorplay.nn.Dropout(dropout, **params))
 
         super().__init__(*layers)
         _log_api_usage_once(self)
 
 
-class Permute(torch.nn.Module):
+class Permute(tensorplay.nn.Module):
     """This module returns a view of the tensor input with its dimensions permuted.
 
     Args:
@@ -319,4 +319,4 @@ class Permute(torch.nn.Module):
         self.dims = dims
 
     def forward(self, x: Tensor) -> Tensor:
-        return torch.permute(x, self.dims)
+        return tensorplay.permute(x, self.dims)

@@ -1,7 +1,10 @@
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "Exception.h"
+#include "Parallel.h"
+#include "cpu/VecUnary.h"
 
+#include <functional>
 #include <optional>
 #include <string>
 #include <utility>
@@ -10,6 +13,236 @@
 namespace tensorplay {
 namespace cpu {
 namespace {
+
+using namespace tensorplay::parallel;
+
+// ------------------------------------------------------------------
+// Horizontal batch scheduling for foreach ops.
+//
+// The naive map-over-tensors schedule pays one dispatcher round trip and
+// one parallel-region barrier per tensor; a transformer-like group of 100
+// small (128,128) tensors therefore runs serialized behind the slowest
+// worker.  These helpers flatten every tensor into one chunked work list
+// and schedule that list exactly once with plain vectorizable loops.
+// They require a uniform contiguous fp32/fp64 CPU group and fall back to
+// the per-tensor dispatcher path otherwise.
+// ------------------------------------------------------------------
+
+constexpr int64_t kForeachGrain = 32768;
+
+struct FlatChunk {
+    int64_t list_index;
+    int64_t begin;
+    int64_t end;
+};
+
+bool flat_group_ok(const std::vector<const std::vector<Tensor>*>& lists) {
+    if (lists.empty() || lists[0]->empty()) return false;
+    const size_t n = lists[0]->size();
+    const DType dtype = (*lists[0])[0].dtype();
+    if (dtype != DType::Float32 && dtype != DType::Float64) return false;
+    for (const std::vector<Tensor>* list : lists) {
+        if (list->size() != n) return false;
+        for (const Tensor& t : *list) {
+            if (!t.is_contiguous() || t.dtype() != dtype ||
+                t.device() != (*lists[0])[0].device() ||
+                t.device().type() != DeviceType::CPU) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+std::vector<FlatChunk> flat_chunks(const size_t n,
+                                   const std::vector<int64_t>& numels) {
+    std::vector<FlatChunk> work;
+    work.reserve(n * 2);
+    for (size_t i = 0; i < n; ++i) {
+        for (int64_t b = 0; b < numels[i]; b += kForeachGrain) {
+            work.push_back({static_cast<int64_t>(i), b,
+                            std::min<int64_t>(b + kForeachGrain, numels[i])});
+        }
+    }
+    return work;
+}
+
+void flat_bump(std::vector<Tensor>& xs) {
+    for (Tensor& t : xs) t.unsafeGetTensorImpl()->bump_version();
+}
+
+template <typename F32, typename F64>
+bool try_flat1_inplace(std::vector<Tensor>& xs, F32&& f32, F64&& f64) {
+    if (!flat_group_ok({&xs})) return false;
+    const bool is32 = xs[0].dtype() == DType::Float32;
+    const size_t n = xs.size();
+    std::vector<void*> ptrs(n);
+    std::vector<int64_t> numels(n);
+    for (size_t i = 0; i < n; ++i) {
+        ptrs[i] = xs[i].data_ptr();
+        numels[i] = xs[i].numel();
+    }
+    const auto work = flat_chunks(n, numels);
+    parallel_for(0, static_cast<int64_t>(work.size()), 1,
+                 [&](int64_t wb, int64_t we) {
+        for (int64_t k = wb; k < we; ++k) {
+            const FlatChunk c = work[static_cast<size_t>(k)];
+            void* p = ptrs[static_cast<size_t>(c.list_index)];
+            if (is32) f32(static_cast<float*>(p), c.begin, c.end);
+            else f64(static_cast<double*>(p), c.begin, c.end);
+        }
+    });
+    flat_bump(xs);
+    return true;
+}
+
+template <typename F32, typename F64>
+bool try_flat2_inplace(std::vector<Tensor>& xs, const std::vector<Tensor>& ys,
+                       F32&& f32, F64&& f64) {
+    if (!flat_group_ok({&xs, &ys})) return false;
+    const bool is32 = xs[0].dtype() == DType::Float32;
+    const size_t n = xs.size();
+    std::vector<void*> xp(n), yp(n);
+    std::vector<int64_t> numels(n);
+    for (size_t i = 0; i < n; ++i) {
+        if (ys[i].numel() != xs[i].numel()) return false;
+        xp[i] = xs[i].data_ptr();
+        yp[i] = ys[i].data_ptr();
+        numels[i] = xs[i].numel();
+    }
+    const auto work = flat_chunks(n, numels);
+    parallel_for(0, static_cast<int64_t>(work.size()), 1,
+                 [&](int64_t wb, int64_t we) {
+        for (int64_t k = wb; k < we; ++k) {
+            const FlatChunk c = work[static_cast<size_t>(k)];
+            const size_t li = static_cast<size_t>(c.list_index);
+            if (is32) {
+                f32(static_cast<float*>(xp[li]),
+                    static_cast<const float*>(yp[li]), c.begin, c.end);
+            } else {
+                f64(static_cast<double*>(xp[li]),
+                    static_cast<const double*>(yp[li]), c.begin, c.end);
+            }
+        }
+    });
+    flat_bump(xs);
+    return true;
+}
+
+template <typename F32, typename F64>
+bool try_flat2_scalar_inplace(std::vector<Tensor>& xs,
+                              const std::vector<Scalar>& sc,
+                              F32&& f32, F64&& f64) {
+    if (!flat_group_ok({&xs})) return false;
+    if (sc.size() == 1) {
+        // one scalar broadcast over the whole group
+        const bool is32 = xs[0].dtype() == DType::Float32;
+        const size_t n = xs.size();
+        std::vector<void*> ptrs(n);
+        std::vector<int64_t> numels(n);
+        for (size_t i = 0; i < n; ++i) {
+            ptrs[i] = xs[i].data_ptr();
+            numels[i] = xs[i].numel();
+        }
+        const auto work = flat_chunks(n, numels);
+        if (is32) {
+            const float v = sc[0].to<float>();
+            parallel_for(0, static_cast<int64_t>(work.size()), 1,
+                         [&](int64_t wb, int64_t we) {
+                for (int64_t k = wb; k < we; ++k) {
+                    const FlatChunk c = work[static_cast<size_t>(k)];
+                    f32(static_cast<float*>(
+                            ptrs[static_cast<size_t>(c.list_index)]),
+                        v, c.begin, c.end);
+                }
+            });
+        } else {
+            const double v = sc[0].to<double>();
+            parallel_for(0, static_cast<int64_t>(work.size()), 1,
+                         [&](int64_t wb, int64_t we) {
+                for (int64_t k = wb; k < we; ++k) {
+                    const FlatChunk c = work[static_cast<size_t>(k)];
+                    f64(static_cast<double*>(
+                            ptrs[static_cast<size_t>(c.list_index)]),
+                        v, c.begin, c.end);
+                }
+            });
+        }
+        flat_bump(xs);
+        return true;
+    }
+    // per-tensor scalars: same chunking, per-list value
+    if (sc.size() != xs.size()) return false;
+    const bool is32 = xs[0].dtype() == DType::Float32;
+    const size_t n = xs.size();
+    std::vector<void*> ptrs(n);
+    std::vector<int64_t> numels(n);
+    for (size_t i = 0; i < n; ++i) {
+        ptrs[i] = xs[i].data_ptr();
+        numels[i] = xs[i].numel();
+    }
+    const auto work = flat_chunks(n, numels);
+    parallel_for(0, static_cast<int64_t>(work.size()), 1,
+                 [&](int64_t wb, int64_t we) {
+        for (int64_t k = wb; k < we; ++k) {
+            const FlatChunk c = work[static_cast<size_t>(k)];
+            const size_t li = static_cast<size_t>(c.list_index);
+            if (is32) f32(static_cast<float*>(ptrs[li]),
+                          sc[li].to<float>(), c.begin, c.end);
+            else f64(static_cast<double*>(ptrs[li]),
+                     sc[li].to<double>(), c.begin, c.end);
+        }
+    });
+    flat_bump(xs);
+    return true;
+}
+
+template <typename F32, typename F64>
+bool try_flat3_inplace(std::vector<Tensor>& xs, const std::vector<Tensor>& t1,
+                       const std::vector<Tensor>& t2, Scalar value,
+                       F32&& f32, F64&& f64) {
+    if (!flat_group_ok({&xs, &t1, &t2})) return false;
+    const bool is32 = xs[0].dtype() == DType::Float32;
+    const size_t n = xs.size();
+    std::vector<void*> xp(n), x1(n), x2(n);
+    std::vector<int64_t> numels(n);
+    for (size_t i = 0; i < n; ++i) {
+        if (t1[i].numel() != xs[i].numel() || t2[i].numel() != xs[i].numel())
+            return false;
+        xp[i] = xs[i].data_ptr();
+        x1[i] = t1[i].data_ptr();
+        x2[i] = t2[i].data_ptr();
+        numels[i] = xs[i].numel();
+    }
+    const auto work = flat_chunks(n, numels);
+    if (is32) {
+        const float v = value.to<float>();
+        parallel_for(0, static_cast<int64_t>(work.size()), 1,
+                     [&](int64_t wb, int64_t we) {
+            for (int64_t k = wb; k < we; ++k) {
+                const FlatChunk c = work[static_cast<size_t>(k)];
+                const size_t li = static_cast<size_t>(c.list_index);
+                f32(static_cast<float*>(xp[li]),
+                    static_cast<const float*>(x1[li]),
+                    static_cast<const float*>(x2[li]), v, c.begin, c.end);
+            }
+        });
+    } else {
+        const double v = value.to<double>();
+        parallel_for(0, static_cast<int64_t>(work.size()), 1,
+                     [&](int64_t wb, int64_t we) {
+            for (int64_t k = wb; k < we; ++k) {
+                const FlatChunk c = work[static_cast<size_t>(k)];
+                const size_t li = static_cast<size_t>(c.list_index);
+                f64(static_cast<double*>(xp[li]),
+                    static_cast<const double*>(x1[li]),
+                    static_cast<const double*>(x2[li]), v, c.begin, c.end);
+            }
+        });
+    }
+    flat_bump(xs);
+    return true;
+}
 
 std::vector<Scalar> unpack_packed_scalar_tensor(const Tensor& scalars,
                                                 size_t expected_length) {
@@ -229,6 +462,22 @@ void foreach_add_scalar_list_inplace_cpu(std::vector<Tensor> self, const std::ve
     map_scalar_lists_inplace(std::move(self), scalars, [&](Tensor& value, Scalar scalar) { value.add_(scalar); });
 }
 void foreach_add_tensor_inplace_cpu(std::vector<Tensor> self, const Tensor& other, Scalar alpha) {
+    // Broadcast singleton fast path (optimizer state-step bumps): one flat
+    // schedule instead of 100+ dispatcher round trips.
+    if (other.defined() && other.numel() == 1 && other.is_contiguous() &&
+        !self.empty() && self[0].dtype() == other.dtype() &&
+        (other.dtype() == DType::Float32 || other.dtype() == DType::Float64)) {
+        const Scalar s = alpha.to<double>() != 1.0
+            ? Scalar(other.item().toDouble() * alpha.to<double>())
+            : Scalar(other.item().toDouble());
+        if (try_flat2_scalar_inplace(self, std::vector<Scalar>{s},
+                [](float* x, float v, int64_t b, int64_t e) {
+                    for (int64_t i = b; i < e; ++i) x[i] += v;
+                },
+                [](double* x, double v, int64_t b, int64_t e) {
+                    for (int64_t i = b; i < e; ++i) x[i] += v;
+                })) return;
+    }
     map_tensors_inplace(std::move(self), [&](Tensor& value) { value.add_(other, alpha); });
 }
 
@@ -278,6 +527,18 @@ std::vector<Tensor> foreach_sub_tensor_cpu(const std::vector<Tensor>& self, cons
     return map_tensors(self, [&](const Tensor& value) { return value.sub(other, alpha); });
 }
 void foreach_sub_tensor_inplace_cpu(std::vector<Tensor> self, const Tensor& other) {
+    if (other.defined() && other.numel() == 1 && other.is_contiguous() &&
+        !self.empty() && self[0].dtype() == other.dtype() &&
+        (other.dtype() == DType::Float32 || other.dtype() == DType::Float64)) {
+        const double v = other.item().toDouble();
+        if (try_flat2_scalar_inplace(self, std::vector<Scalar>{Scalar(v)},
+                [v](float* x, float, int64_t b, int64_t e) {
+                    for (int64_t i = b; i < e; ++i) x[i] -= static_cast<float>(v);
+                },
+                [v](double* x, double, int64_t b, int64_t e) {
+                    for (int64_t i = b; i < e; ++i) x[i] -= v;
+                })) return;
+    }
     map_tensors_inplace(std::move(self), [&](Tensor& value) { value.copy_(value.sub(other)); });
 }
 void foreach_sub_scalar_inplace_cpu(std::vector<Tensor> self, Scalar scalar) {
@@ -910,24 +1171,749 @@ void foreach_zero_out_cpu(const std::vector<Tensor>& self, std::vector<Tensor> o
 
 } // namespace
 
+
+// ------------------------------------------------------------------
+// Fast-path wrappers: flat single-schedule execution for the hot
+// optimizer foreach ops, falling back to the per-tensor dispatcher
+// implementations whenever the flat contract can't be met
+// (non-contiguous, mixed dtype/device, non-fp32/64, non-CPU).
+// ------------------------------------------------------------------
+
+void foreach_add_scalar_fast_cpu(std::vector<Tensor> self, Scalar s) {
+    if (try_flat2_scalar_inplace(self, std::vector<Scalar>{s},
+            [](float* x, float v, int64_t b, int64_t e) {
+                for (int64_t i = b; i < e; ++i) x[i] += v;
+            },
+            [](double* x, double v, int64_t b, int64_t e) {
+                for (int64_t i = b; i < e; ++i) x[i] += v;
+            })) return;
+    foreach_add_scalar_inplace_cpu(std::move(self), s);
+}
+
+void foreach_add_scalar_list_fast_cpu(std::vector<Tensor> self,
+                                      const std::vector<Scalar>& sc) {
+    if (try_flat2_scalar_inplace(self, sc,
+            [](float* x, float v, int64_t b, int64_t e) {
+                for (int64_t i = b; i < e; ++i) x[i] += v;
+            },
+            [](double* x, double v, int64_t b, int64_t e) {
+                for (int64_t i = b; i < e; ++i) x[i] += v;
+            })) return;
+    foreach_add_scalar_list_inplace_cpu(std::move(self), sc);
+}
+
+void foreach_add_list_fast_cpu(std::vector<Tensor> self,
+                               const std::vector<Tensor>& other, Scalar a) {
+    if (try_flat2_inplace(self, other,
+            [a](float* x, const float* y, int64_t b, int64_t e) {
+                const float av = a.to<float>();
+                for (int64_t i = b; i < e; ++i) x[i] += av * y[i];
+            },
+            [a](double* x, const double* y, int64_t b, int64_t e) {
+                const double av = a.to<double>();
+                for (int64_t i = b; i < e; ++i) x[i] += av * y[i];
+            })) return;
+    foreach_add_list_inplace_cpu(std::move(self), other, a);
+}
+
+#define TP_FAST_BINARY_SCALAR(NAME, OP)                                       \
+void foreach_##NAME##_scalar_fast_cpu(std::vector<Tensor> self, Scalar s) {   \
+    if (try_flat2_scalar_inplace(self, std::vector<Scalar>{s},                \
+            [](float* x, float v, int64_t b, int64_t e) {                     \
+                for (int64_t i = b; i < e; ++i) x[i] = x[i] OP v;             \
+            },                                                                \
+            [](double* x, double v, int64_t b, int64_t e) {                   \
+                for (int64_t i = b; i < e; ++i) x[i] = x[i] OP v;             \
+            })) return;                                                       \
+    foreach_##NAME##_scalar_inplace_cpu(std::move(self), s);                    \
+}                                                                             \
+void foreach_##NAME##_scalar_list_fast_cpu(std::vector<Tensor> self,            \
+                                         const std::vector<Scalar>& sc) {     \
+    if (try_flat2_scalar_inplace(self, sc,                                    \
+            [](float* x, float v, int64_t b, int64_t e) {                     \
+                for (int64_t i = b; i < e; ++i) x[i] = x[i] OP v;             \
+            },                                                                \
+            [](double* x, double v, int64_t b, int64_t e) {                   \
+                for (int64_t i = b; i < e; ++i) x[i] = x[i] OP v;             \
+            })) return;                                                       \
+    foreach_##NAME##_scalar_list_inplace_cpu(std::move(self), sc);              \
+}                                                                             \
+void foreach_##NAME##_list_fast_cpu(std::vector<Tensor> self,                   \
+                                  const std::vector<Tensor>& other) {         \
+    if (try_flat2_inplace(self, other,                                        \
+            [](float* x, const float* y, int64_t b, int64_t e) {              \
+                for (int64_t i = b; i < e; ++i) x[i] = x[i] OP y[i];          \
+            },                                                                \
+            [](double* x, const double* y, int64_t b, int64_t e) {            \
+                for (int64_t i = b; i < e; ++i) x[i] = x[i] OP y[i];          \
+            })) return;                                                       \
+    foreach_##NAME##_list_inplace_cpu(std::move(self), other);                  \
+}
+
+TP_FAST_BINARY_SCALAR(div, /)
+TP_FAST_BINARY_SCALAR(mul, *)
+#undef TP_FAST_BINARY_SCALAR
+
+void foreach_sub_scalar_list_fast_cpu(std::vector<Tensor> self,
+                                      const std::vector<Scalar>& sc) {
+    if (try_flat2_scalar_inplace(self, sc,
+            [](float* x, float v, int64_t b, int64_t e) {
+                for (int64_t i = b; i < e; ++i) x[i] -= v;
+            },
+            [](double* x, double v, int64_t b, int64_t e) {
+                for (int64_t i = b; i < e; ++i) x[i] -= v;
+            })) return;
+    foreach_sub_scalar_list_inplace_cpu(std::move(self), sc);
+}
+
+void foreach_sub_list_fast_cpu(std::vector<Tensor> self,
+                               const std::vector<Tensor>& other) {
+    if (try_flat2_inplace(self, other,
+            [](float* x, const float* y, int64_t b, int64_t e) {
+                for (int64_t i = b; i < e; ++i) x[i] -= y[i];
+            },
+            [](double* x, const double* y, int64_t b, int64_t e) {
+                for (int64_t i = b; i < e; ++i) x[i] -= y[i];
+            })) return;
+    foreach_sub_list_inplace_cpu(std::move(self), other);
+}
+
+void foreach_sub_scalar_fast_cpu(std::vector<Tensor> self, Scalar s) {
+    if (try_flat2_scalar_inplace(self, std::vector<Scalar>{s},
+            [](float* x, float v, int64_t b, int64_t e) {
+                for (int64_t i = b; i < e; ++i) x[i] -= v;
+            },
+            [](double* x, double v, int64_t b, int64_t e) {
+                for (int64_t i = b; i < e; ++i) x[i] -= v;
+            })) return;
+    foreach_sub_scalar_inplace_cpu(std::move(self), s);
+}
+
+void foreach_sqrt_fast_cpu(std::vector<Tensor> self) {
+    if (try_flat1_inplace(self,
+            [](float* x, int64_t b, int64_t e) {
+                vecunary::run_f32(vecunary::VOp::Sqrt, {}, x, x, b, e);
+            },
+            [](double* x, int64_t b, int64_t e) {
+                vecunary::run_f64(vecunary::VOp::Sqrt, {}, x, x, b, e);
+            })) return;
+    foreach_sqrt_inplace_cpu(std::move(self));
+}
+
+void foreach_rsqrt_fast_cpu(std::vector<Tensor> self) {
+    if (try_flat1_inplace(self,
+            [](float* x, int64_t b, int64_t e) {
+                vecunary::run_f32(vecunary::VOp::Rsqrt, {}, x, x, b, e);
+            },
+            [](double* x, int64_t b, int64_t e) {
+                vecunary::run_f64(vecunary::VOp::Rsqrt, {}, x, x, b, e);
+            })) return;
+    foreach_rsqrt_inplace_cpu(std::move(self));
+}
+
+void foreach_neg_fast_cpu(std::vector<Tensor> self) {
+    if (try_flat1_inplace(self,
+            [](float* x, int64_t b, int64_t e) {
+                vecunary::run_f32(vecunary::VOp::Neg, {}, x, x, b, e);
+            },
+            [](double* x, int64_t b, int64_t e) {
+                vecunary::run_f64(vecunary::VOp::Neg, {}, x, x, b, e);
+            })) return;
+    foreach_neg_inplace_cpu(std::move(self));
+}
+
+void foreach_abs_fast_cpu(std::vector<Tensor> self) {
+    if (try_flat1_inplace(self,
+            [](float* x, int64_t b, int64_t e) {
+                vecunary::run_f32(vecunary::VOp::Abs, {}, x, x, b, e);
+            },
+            [](double* x, int64_t b, int64_t e) {
+                vecunary::run_f64(vecunary::VOp::Abs, {}, x, x, b, e);
+            })) return;
+    foreach_abs_inplace_cpu(std::move(self));
+}
+
+void foreach_reciprocal_fast_cpu(std::vector<Tensor> self) {
+    if (try_flat1_inplace(self,
+            [](float* x, int64_t b, int64_t e) {
+                vecunary::run_f32(vecunary::VOp::Reciprocal, {}, x, x, b, e);
+            },
+            [](double* x, int64_t b, int64_t e) {
+                vecunary::run_f64(vecunary::VOp::Reciprocal, {}, x, x, b, e);
+            })) return;
+    foreach_reciprocal_inplace_cpu(std::move(self));
+}
+
+void foreach_maximum_list_fast_cpu(std::vector<Tensor> self,
+                                   const std::vector<Tensor>& other) {
+    if (try_flat2_inplace(self, other,
+            [](float* x, const float* y, int64_t b, int64_t e) {
+                for (int64_t i = b; i < e; ++i)
+                    if (y[i] > x[i]) x[i] = y[i];
+            },
+            [](double* x, const double* y, int64_t b, int64_t e) {
+                for (int64_t i = b; i < e; ++i)
+                    if (y[i] > x[i]) x[i] = y[i];
+            })) return;
+    foreach_maximum_list_inplace_cpu(std::move(self), other);
+}
+
+void foreach_lerp_scalar_fast_cpu(std::vector<Tensor> self,
+                                  const std::vector<Tensor>& end,
+                                  Scalar weight) {
+    if (try_flat2_inplace(self, end,
+            [weight](float* x, const float* y, int64_t b, int64_t e) {
+                const float w = weight.to<float>();
+                for (int64_t i = b; i < e; ++i) x[i] += w * (y[i] - x[i]);
+            },
+            [weight](double* x, const double* y, int64_t b, int64_t e) {
+                const double w = weight.to<double>();
+                for (int64_t i = b; i < e; ++i) x[i] += w * (y[i] - x[i]);
+            })) return;
+    foreach_lerp_scalar_inplace_cpu(std::move(self), end, weight);
+}
+
+void foreach_addcmul_scalar_fast_cpu(std::vector<Tensor> self,
+                                     const std::vector<Tensor>& t1,
+                                     const std::vector<Tensor>& t2,
+                                     Scalar value) {
+    if (!flat_group_ok({&self, &t1, &t2})) {
+        foreach_addcmul_scalar_inplace_cpu(std::move(self), t1, t2, value);
+        return;
+    }
+    const bool is32 = self[0].dtype() == DType::Float32;
+    const size_t n = self.size();
+    std::vector<void*> xp(n), x1(n), x2(n);
+    std::vector<int64_t> numels(n);
+    for (size_t i = 0; i < n; ++i) {
+        // Broadcast tensor lists are not supported by the flat schedule.
+        if (t1[i].numel() != self[i].numel() || t2[i].numel() != self[i].numel()) {
+            foreach_addcmul_scalar_inplace_cpu(std::move(self), t1, t2, value);
+            return;
+        }
+        xp[i] = self[i].data_ptr(); x1[i] = t1[i].data_ptr();
+        x2[i] = t2[i].data_ptr(); numels[i] = self[i].numel();
+    }
+    const auto work = flat_chunks(n, numels);
+    if (is32) {
+        const float v = value.to<float>();
+        parallel_for(0, static_cast<int64_t>(work.size()), 1,
+                     [&](int64_t wb, int64_t we) {
+            for (int64_t k = wb; k < we; ++k) {
+                const FlatChunk c = work[static_cast<size_t>(k)];
+                const size_t li = static_cast<size_t>(c.list_index);
+                auto* x = static_cast<float*>(xp[li]);
+                const auto* a = static_cast<const float*>(x1[li]);
+                const auto* b = static_cast<const float*>(x2[li]);
+                for (int64_t i = c.begin; i < c.end; ++i)
+                    x[i] += v * a[i] * b[i];
+            }
+        });
+    } else {
+        const double v = value.to<double>();
+        parallel_for(0, static_cast<int64_t>(work.size()), 1,
+                     [&](int64_t wb, int64_t we) {
+            for (int64_t k = wb; k < we; ++k) {
+                const FlatChunk c = work[static_cast<size_t>(k)];
+                const size_t li = static_cast<size_t>(c.list_index);
+                auto* x = static_cast<double*>(xp[li]);
+                const auto* a = static_cast<const double*>(x1[li]);
+                const auto* b = static_cast<const double*>(x2[li]);
+                for (int64_t i = c.begin; i < c.end; ++i)
+                    x[i] += v * a[i] * b[i];
+            }
+        });
+    }
+    flat_bump(self);
+}
+
+void foreach_addcdiv_scalar_fast_cpu(std::vector<Tensor> self,
+                                     const std::vector<Tensor>& t1,
+                                     const std::vector<Tensor>& t2,
+                                     Scalar value) {
+    if (!flat_group_ok({&self, &t1, &t2})) {
+        foreach_addcdiv_scalar_inplace_cpu(std::move(self), t1, t2, value);
+        return;
+    }
+    const bool is32 = self[0].dtype() == DType::Float32;
+    const size_t n = self.size();
+    std::vector<void*> xp(n), x1(n), x2(n);
+    std::vector<int64_t> numels(n);
+    std::vector<char> bcast1(n), bcast2(n);
+    for (size_t i = 0; i < n; ++i) {
+        if (t1[i].numel() != 1 && t1[i].numel() != self[i].numel()) {
+            foreach_addcdiv_scalar_inplace_cpu(std::move(self), t1, t2, value);
+            return;
+        }
+        if (t2[i].numel() != 1 && t2[i].numel() != self[i].numel()) {
+            foreach_addcdiv_scalar_inplace_cpu(std::move(self), t1, t2, value);
+            return;
+        }
+        bcast1[i] = t1[i].numel() == 1;
+        bcast2[i] = t2[i].numel() == 1;
+        xp[i] = self[i].data_ptr(); x1[i] = t1[i].data_ptr();
+        x2[i] = t2[i].data_ptr(); numels[i] = self[i].numel();
+    }
+    const auto work = flat_chunks(n, numels);
+    if (is32) {
+        const float v = value.to<float>();
+        parallel_for(0, static_cast<int64_t>(work.size()), 1,
+                     [&](int64_t wb, int64_t we) {
+            for (int64_t k = wb; k < we; ++k) {
+                const FlatChunk c = work[static_cast<size_t>(k)];
+                const size_t li = static_cast<size_t>(c.list_index);
+                auto* x = static_cast<float*>(xp[li]);
+                const auto* a = static_cast<const float*>(x1[li]);
+                const auto* b = static_cast<const float*>(x2[li]);
+                for (int64_t i = c.begin; i < c.end; ++i)
+                    x[i] += v * a[i] / b[i];
+            }
+        });
+    } else {
+        const double v = value.to<double>();
+        parallel_for(0, static_cast<int64_t>(work.size()), 1,
+                     [&](int64_t wb, int64_t we) {
+            for (int64_t k = wb; k < we; ++k) {
+                const FlatChunk c = work[static_cast<size_t>(k)];
+                const size_t li = static_cast<size_t>(c.list_index);
+                auto* x = static_cast<double*>(xp[li]);
+                const auto* a = static_cast<const double*>(x1[li]);
+                const auto* b = static_cast<const double*>(x2[li]);
+                for (int64_t i = c.begin; i < c.end; ++i)
+                    x[i] += v * a[i] / b[i];
+            }
+        });
+    }
+    flat_bump(self);
+}
+
+void foreach_clamp_min_scalar_fast_cpu(std::vector<Tensor> self, Scalar s) {
+    if (try_flat2_scalar_inplace(self, std::vector<Scalar>{s},
+            [](float* x, float v, int64_t b, int64_t e) {
+                for (int64_t i = b; i < e; ++i) if (x[i] < v) x[i] = v;
+            },
+            [](double* x, double v, int64_t b, int64_t e) {
+                for (int64_t i = b; i < e; ++i) if (x[i] < v) x[i] = v;
+            })) return;
+    foreach_clamp_min_scalar_inplace_cpu(std::move(self), s);
+}
+
+void foreach_clamp_max_scalar_fast_cpu(std::vector<Tensor> self, Scalar s) {
+    if (try_flat2_scalar_inplace(self, std::vector<Scalar>{s},
+            [](float* x, float v, int64_t b, int64_t e) {
+                for (int64_t i = b; i < e; ++i) if (x[i] > v) x[i] = v;
+            },
+            [](double* x, double v, int64_t b, int64_t e) {
+                for (int64_t i = b; i < e; ++i) if (x[i] > v) x[i] = v;
+            })) return;
+    foreach_clamp_max_scalar_inplace_cpu(std::move(self), s);
+}
+
+// ---- out-variant fast paths -------------------------------------------
+
+template <typename F32, typename F64>
+std::optional<std::vector<Tensor>> try_flat2_out(
+        const std::vector<Tensor>& xs, const std::vector<Tensor>& ys,
+        F32&& f32, F64&& f64) {
+    if (!flat_group_ok({&xs, &ys})) return std::nullopt;
+    std::vector<Tensor> out;
+    out.reserve(xs.size());
+    for (const Tensor& t : xs) out.push_back(Tensor::empty_like(t));
+    const bool is32 = xs[0].dtype() == DType::Float32;
+    const size_t n = xs.size();
+    std::vector<void*> dp(n);
+    std::vector<const void*> yp(n);
+    std::vector<int64_t> numels(n);
+    for (size_t i = 0; i < n; ++i) {
+        dp[i] = out[i].data_ptr();
+        yp[i] = ys[i].data_ptr();
+        numels[i] = xs[i].numel();
+    }
+    const auto work = flat_chunks(n, numels);
+    parallel_for(0, static_cast<int64_t>(work.size()), 1,
+                 [&](int64_t wb, int64_t we) {
+        for (int64_t k = wb; k < we; ++k) {
+            const FlatChunk c = work[static_cast<size_t>(k)];
+            const size_t li = static_cast<size_t>(c.list_index);
+            if (is32) {
+                f32(static_cast<float*>(dp[li]),
+                    static_cast<const float*>(yp[li]), c.begin, c.end);
+            } else {
+                f64(static_cast<double*>(dp[li]),
+                    static_cast<const double*>(yp[li]), c.begin, c.end);
+            }
+        }
+    });
+    return out;
+}
+
+template <typename F32, typename F64>
+std::optional<std::vector<Tensor>> try_flat1_out(const std::vector<Tensor>& xs,
+                                                 F32&& f32, F64&& f64);
+
+std::vector<Tensor> foreach_neg_out_fast_cpu(const std::vector<Tensor>& self);
+
+template <typename S32, typename S64>
+static std::optional<std::vector<Tensor>> flat_unary_scalar_out(
+        const std::vector<Tensor>& xs, S32&& s32, S64&& s64);
+
+void foreach_mul_scalar_out_fast_cpu(const std::vector<Tensor>& self,
+                                     Scalar s, std::vector<Tensor> out) {
+    if (!flat_group_ok({&self}) || out.size() != self.size()) {
+        foreach_mul_scalar_out_cpu(self, s, std::move(out));
+        return;
+    }
+    const bool is32 = self[0].dtype() == DType::Float32;
+    const size_t n = self.size();
+    std::vector<void*> dp(n);
+    std::vector<const void*> sp(n);
+    std::vector<int64_t> numels(n);
+    for (size_t i = 0; i < n; ++i) {
+        dp[i] = out[i].data_ptr(); sp[i] = self[i].data_ptr();
+        numels[i] = self[i].numel();
+    }
+    const auto work = flat_chunks(n, numels);
+    if (is32) {
+        const float v = s.to<float>();
+        parallel_for(0, static_cast<int64_t>(work.size()), 1,
+                     [&](int64_t wb, int64_t we) {
+            for (int64_t k = wb; k < we; ++k) {
+                const FlatChunk c = work[static_cast<size_t>(k)];
+                const size_t li = static_cast<size_t>(c.list_index);
+                auto* d = static_cast<float*>(dp[li]);
+                const auto* x = static_cast<const float*>(sp[li]);
+                for (int64_t i = c.begin; i < c.end; ++i) d[i] = x[i] * v;
+            }
+        });
+    } else {
+        const double v = s.to<double>();
+        parallel_for(0, static_cast<int64_t>(work.size()), 1,
+                     [&](int64_t wb, int64_t we) {
+            for (int64_t k = wb; k < we; ++k) {
+                const FlatChunk c = work[static_cast<size_t>(k)];
+                const size_t li = static_cast<size_t>(c.list_index);
+                auto* d = static_cast<double*>(dp[li]);
+                const auto* x = static_cast<const double*>(sp[li]);
+                for (int64_t i = c.begin; i < c.end; ++i) d[i] = x[i] * v;
+            }
+        });
+    }
+    return;
+}
+
+
+
+
+
+// ---- flat out-variant wrappers (hot optimizer ops); out filled in place --
+
+static bool flat_unary_out_fill(const std::vector<Tensor>& xs,
+                                std::vector<Tensor>& out,
+                                const std::function<void(float*, const float*, int64_t, int64_t)>& f32,
+                                const std::function<void(double*, const double*, int64_t, int64_t)>& f64) {
+    if (!flat_group_ok({&xs})) return false;
+    const bool is32 = xs[0].dtype() == DType::Float32;
+    const size_t n = xs.size();
+    std::vector<void*> dp(n);
+    std::vector<const void*> sp(n);
+    std::vector<int64_t> numels(n);
+    for (size_t i = 0; i < n; ++i) {
+        if (!out[i].defined() || out[i].numel() != xs[i].numel()) return false;
+        dp[i] = out[i].data_ptr(); sp[i] = xs[i].data_ptr();
+        numels[i] = xs[i].numel();
+    }
+    const auto work = flat_chunks(n, numels);
+    parallel_for(0, static_cast<int64_t>(work.size()), 1,
+                 [&](int64_t wb, int64_t we) {
+        for (int64_t k = wb; k < we; ++k) {
+            const FlatChunk c = work[static_cast<size_t>(k)];
+            const size_t li = static_cast<size_t>(c.list_index);
+            if (is32) f32(static_cast<float*>(dp[li]),
+                          static_cast<const float*>(sp[li]), c.begin, c.end);
+            else f64(static_cast<double*>(dp[li]),
+                     static_cast<const double*>(sp[li]), c.begin, c.end);
+        }
+    });
+    return true;
+}
+
+void foreach_sqrt_out_fast_cpu(const std::vector<Tensor>& self,
+                               std::vector<Tensor> out) {
+    if (!flat_unary_out_fill(self, out,
+            [](float* d, const float* x, int64_t b, int64_t e) {
+                vecunary::run_f32(vecunary::VOp::Sqrt, {}, x, d, b, e);
+            },
+            [](double* d, const double* x, int64_t b, int64_t e) {
+                vecunary::run_f64(vecunary::VOp::Sqrt, {}, x, d, b, e);
+            })) {
+        foreach_sqrt_out_cpu(self, std::move(out));
+    }
+}
+
+void foreach_neg_out_fast_cpu(const std::vector<Tensor>& self,
+                              std::vector<Tensor> out) {
+    if (!flat_unary_out_fill(self, out,
+            [](float* d, const float* x, int64_t b, int64_t e) {
+                vecunary::run_f32(vecunary::VOp::Neg, {}, x, d, b, e);
+            },
+            [](double* d, const double* x, int64_t b, int64_t e) {
+                vecunary::run_f64(vecunary::VOp::Neg, {}, x, d, b, e);
+            })) {
+        foreach_neg_out_cpu(self, std::move(out));
+    }
+}
+
+static bool flat_binary_scalar_out_fill(
+        const std::vector<Tensor>& xs, Scalar s, std::vector<Tensor>& out,
+        const std::function<void(float*, const float*, float, int64_t, int64_t)>& f32,
+        const std::function<void(double*, const double*, double, int64_t, int64_t)>& f64) {
+    if (!flat_group_ok({&xs})) return false;
+    const bool is32 = xs[0].dtype() == DType::Float32;
+    const size_t n = xs.size();
+    std::vector<void*> dp(n);
+    std::vector<const void*> sp(n);
+    std::vector<int64_t> numels(n);
+    for (size_t i = 0; i < n; ++i) {
+        if (!out[i].defined() || out[i].numel() != xs[i].numel()) return false;
+        dp[i] = out[i].data_ptr(); sp[i] = xs[i].data_ptr();
+        numels[i] = xs[i].numel();
+    }
+    const auto work = flat_chunks(n, numels);
+    if (is32) {
+        const float v = s.to<float>();
+        parallel_for(0, static_cast<int64_t>(work.size()), 1,
+                     [&](int64_t wb, int64_t we) {
+            for (int64_t k = wb; k < we; ++k) {
+                const FlatChunk c = work[static_cast<size_t>(k)];
+                const size_t li = static_cast<size_t>(c.list_index);
+                f32(static_cast<float*>(dp[li]),
+                    static_cast<const float*>(sp[li]), v, c.begin, c.end);
+            }
+        });
+    } else {
+        const double v = s.to<double>();
+        parallel_for(0, static_cast<int64_t>(work.size()), 1,
+                     [&](int64_t wb, int64_t we) {
+            for (int64_t k = wb; k < we; ++k) {
+                const FlatChunk c = work[static_cast<size_t>(k)];
+                const size_t li = static_cast<size_t>(c.list_index);
+                f64(static_cast<double*>(dp[li]),
+                    static_cast<const double*>(sp[li]), v, c.begin, c.end);
+            }
+        });
+    }
+    return true;
+}
+
+void foreach_add_scalar_out_fast_cpu(const std::vector<Tensor>& self,
+                                     Scalar s, std::vector<Tensor> out) {
+    if (!flat_binary_scalar_out_fill(self, s, out,
+            [](float* d, const float* x, float v, int64_t b, int64_t e) {
+                for (int64_t i = b; i < e; ++i) d[i] = x[i] + v;
+            },
+            [](double* d, const double* x, double v, int64_t b, int64_t e) {
+                for (int64_t i = b; i < e; ++i) d[i] = x[i] + v;
+            })) {
+        foreach_add_scalar_out_cpu(self, s, std::move(out));
+    }
+}
+
+void foreach_sub_scalar_out_fast_cpu(const std::vector<Tensor>& self,
+                                     Scalar s, std::vector<Tensor> out) {
+    if (!flat_binary_scalar_out_fill(self, s, out,
+            [](float* d, const float* x, float v, int64_t b, int64_t e) {
+                for (int64_t i = b; i < e; ++i) d[i] = x[i] - v;
+            },
+            [](double* d, const double* x, double v, int64_t b, int64_t e) {
+                for (int64_t i = b; i < e; ++i) d[i] = x[i] - v;
+            })) {
+        foreach_sub_scalar_out_cpu(self, s, std::move(out));
+    }
+}
+
+void foreach_div_scalar_out_fast_cpu(const std::vector<Tensor>& self,
+                                     Scalar s, std::vector<Tensor> out) {
+    if (!flat_binary_scalar_out_fill(self, s, out,
+            [](float* d, const float* x, float v, int64_t b, int64_t e) {
+                for (int64_t i = b; i < e; ++i) d[i] = x[i] / v;
+            },
+            [](double* d, const double* x, double v, int64_t b, int64_t e) {
+                for (int64_t i = b; i < e; ++i) d[i] = x[i] / v;
+            })) {
+        foreach_div_scalar_out_cpu(self, s, std::move(out));
+    }
+}
+
+void foreach_pow_scalar_out_fast_cpu(const std::vector<Tensor>& self,
+                                     Scalar s, std::vector<Tensor> out) {
+    if (!flat_binary_scalar_out_fill(self, s, out,
+            [](float* d, const float* x, float v, int64_t b, int64_t e) {
+                for (int64_t i = b; i < e; ++i) d[i] = std::pow(x[i], v);
+            },
+            [](double* d, const double* x, double v, int64_t b, int64_t e) {
+                for (int64_t i = b; i < e; ++i) d[i] = std::pow(x[i], v);
+            })) {
+        foreach_pow_scalar_out_cpu(self, s, std::move(out));
+    }
+}
+
+
+
+// ---- flat returning-variant wrappers (allocate once, single schedule) --
+
+std::vector<Tensor> foreach_alloc_like(const std::vector<Tensor>& xs) {
+    std::vector<Tensor> out;
+    out.reserve(xs.size());
+    for (const Tensor& t : xs) out.push_back(Tensor::empty_like(t));
+    return out;
+}
+
+template <typename S32, typename S64>
+static bool flat_binary_scalar_ret(const std::vector<Tensor>& xs, Scalar s,
+                                   std::vector<Tensor>& out,
+                                   S32&& s32, S64&& s64) {
+    if (!flat_group_ok({&xs})) return false;
+    const bool is32 = xs[0].dtype() == DType::Float32;
+    const size_t n = xs.size();
+    std::vector<void*> dp(n);
+    std::vector<const void*> sp(n);
+    std::vector<int64_t> numels(n);
+    for (size_t i = 0; i < n; ++i) {
+        dp[i] = out[i].data_ptr(); sp[i] = xs[i].data_ptr();
+        numels[i] = xs[i].numel();
+    }
+    const auto work = flat_chunks(n, numels);
+    if (is32) {
+        const float v = s.to<float>();
+        parallel_for(0, static_cast<int64_t>(work.size()), 1,
+                     [&](int64_t wb, int64_t we) {
+            for (int64_t k = wb; k < we; ++k) {
+                const FlatChunk c = work[static_cast<size_t>(k)];
+                const size_t li = static_cast<size_t>(c.list_index);
+                s32(static_cast<float*>(dp[li]),
+                    static_cast<const float*>(sp[li]), v, c.begin, c.end);
+            }
+        });
+    } else {
+        const double v = s.to<double>();
+        parallel_for(0, static_cast<int64_t>(work.size()), 1,
+                     [&](int64_t wb, int64_t we) {
+            for (int64_t k = wb; k < we; ++k) {
+                const FlatChunk c = work[static_cast<size_t>(k)];
+                const size_t li = static_cast<size_t>(c.list_index);
+                s64(static_cast<double*>(dp[li]),
+                    static_cast<const double*>(sp[li]), v, c.begin, c.end);
+            }
+        });
+    }
+    return true;
+}
+
+std::vector<Tensor> foreach_sub_scalar_ret_fast_cpu(
+        const std::vector<Tensor>& self, Scalar s) {
+    std::vector<Tensor> out = foreach_alloc_like(self);
+    if (flat_binary_scalar_ret(self, s, out,
+            [](float* d, const float* x, float v, int64_t b, int64_t e) {
+                for (int64_t i = b; i < e; ++i) d[i] = x[i] - v;
+            },
+            [](double* d, const double* x, double v, int64_t b, int64_t e) {
+                for (int64_t i = b; i < e; ++i) d[i] = x[i] - v;
+            })) return out;
+    return foreach_sub_scalar_cpu(self, s);
+}
+
+std::vector<Tensor> foreach_add_scalar_ret_fast_cpu(
+        const std::vector<Tensor>& self, Scalar s) {
+    std::vector<Tensor> out = foreach_alloc_like(self);
+    if (flat_binary_scalar_ret(self, s, out,
+            [](float* d, const float* x, float v, int64_t b, int64_t e) {
+                for (int64_t i = b; i < e; ++i) d[i] = x[i] + v;
+            },
+            [](double* d, const double* x, double v, int64_t b, int64_t e) {
+                for (int64_t i = b; i < e; ++i) d[i] = x[i] + v;
+            })) return out;
+    return foreach_add_scalar_cpu(self, s);
+}
+
+std::vector<Tensor> foreach_mul_scalar_ret_fast_cpu(
+        const std::vector<Tensor>& self, Scalar s) {
+    std::vector<Tensor> out = foreach_alloc_like(self);
+    if (flat_binary_scalar_ret(self, s, out,
+            [](float* d, const float* x, float v, int64_t b, int64_t e) {
+                for (int64_t i = b; i < e; ++i) d[i] = x[i] * v;
+            },
+            [](double* d, const double* x, double v, int64_t b, int64_t e) {
+                for (int64_t i = b; i < e; ++i) d[i] = x[i] * v;
+            })) return out;
+    return foreach_mul_scalar_cpu(self, s);
+}
+
+std::vector<Tensor> foreach_div_scalar_ret_fast_cpu(
+        const std::vector<Tensor>& self, Scalar s) {
+    std::vector<Tensor> out = foreach_alloc_like(self);
+    if (flat_binary_scalar_ret(self, s, out,
+            [](float* d, const float* x, float v, int64_t b, int64_t e) {
+                for (int64_t i = b; i < e; ++i) d[i] = x[i] / v;
+            },
+            [](double* d, const double* x, double v, int64_t b, int64_t e) {
+                for (int64_t i = b; i < e; ++i) d[i] = x[i] / v;
+            })) return out;
+    return foreach_div_scalar_cpu(self, s);
+}
+
+std::vector<Tensor> foreach_sqrt_ret_fast_cpu(const std::vector<Tensor>& self) {
+    if (!flat_group_ok({&self})) return foreach_sqrt_cpu(self);
+    std::vector<Tensor> out = foreach_alloc_like(self);
+    const bool is32 = self[0].dtype() == DType::Float32;
+    const size_t n = self.size();
+    std::vector<void*> dp(n);
+    std::vector<const void*> sp(n);
+    std::vector<int64_t> numels(n);
+    for (size_t i = 0; i < n; ++i) {
+        dp[i] = out[i].data_ptr(); sp[i] = self[i].data_ptr();
+        numels[i] = self[i].numel();
+    }
+    const auto work = flat_chunks(n, numels);
+    parallel_for(0, static_cast<int64_t>(work.size()), 1,
+                 [&](int64_t wb, int64_t we) {
+        for (int64_t k = wb; k < we; ++k) {
+            const FlatChunk c = work[static_cast<size_t>(k)];
+            const size_t li = static_cast<size_t>(c.list_index);
+            if (is32) {
+                auto* d = static_cast<float*>(dp[li]);
+                const auto* x = static_cast<const float*>(sp[li]);
+                vecunary::run_f32(vecunary::VOp::Sqrt, {}, x, d,
+                                  c.begin, c.end);
+            } else {
+                auto* d = static_cast<double*>(dp[li]);
+                const auto* x = static_cast<const double*>(sp[li]);
+                vecunary::run_f64(vecunary::VOp::Sqrt, {}, x, d,
+                                  c.begin, c.end);
+            }
+        }
+    });
+    return out;
+}
+
+
 TENSORPLAY_LIBRARY_IMPL(CPU, ForeachKernels) {
-    m.impl("_foreach_add.Scalar", foreach_add_scalar_cpu);
+    m.impl("_foreach_add.Scalar", foreach_add_scalar_ret_fast_cpu);
     m.impl("_foreach_add.List", foreach_add_list_cpu);
     m.impl("_foreach_add.ScalarList", foreach_add_scalar_list_cpu);
     m.impl("_foreach_add.Tensor", foreach_add_tensor_cpu);
-    m.impl("_foreach_add_.Scalar", foreach_add_scalar_inplace_cpu);
-    m.impl("_foreach_add_.List", foreach_add_list_inplace_cpu);
-    m.impl("_foreach_add_.ScalarList", foreach_add_scalar_list_inplace_cpu);
+    m.impl("_foreach_add_.Scalar", foreach_add_scalar_fast_cpu);
+    m.impl("_foreach_add_.List", foreach_add_list_fast_cpu);
+    m.impl("_foreach_add_.ScalarList", foreach_add_scalar_list_fast_cpu);
     m.impl("_foreach_add_.Tensor", foreach_add_tensor_inplace_cpu);
 
 #define REGISTER_FOREACH_BINARY(NAME) \
-    m.impl("_foreach_" #NAME ".Scalar", foreach_##NAME##_scalar_cpu); \
+    m.impl("_foreach_" #NAME ".Scalar", foreach_##NAME##_scalar_ret_fast_cpu); \
     m.impl("_foreach_" #NAME ".List", foreach_##NAME##_list_cpu); \
     m.impl("_foreach_" #NAME ".ScalarList", foreach_##NAME##_scalar_list_cpu); \
     m.impl("_foreach_" #NAME ".Tensor", foreach_##NAME##_tensor_cpu); \
-    m.impl("_foreach_" #NAME "_.Scalar", foreach_##NAME##_scalar_inplace_cpu); \
-    m.impl("_foreach_" #NAME "_.List", foreach_##NAME##_list_inplace_cpu); \
-    m.impl("_foreach_" #NAME "_.ScalarList", foreach_##NAME##_scalar_list_inplace_cpu); \
+    m.impl("_foreach_" #NAME "_.Scalar", foreach_##NAME##_scalar_fast_cpu); \
+    m.impl("_foreach_" #NAME "_.List", foreach_##NAME##_list_fast_cpu); \
+    m.impl("_foreach_" #NAME "_.ScalarList", foreach_##NAME##_scalar_list_fast_cpu); \
     m.impl("_foreach_" #NAME "_.Tensor", foreach_##NAME##_tensor_inplace_cpu);
     REGISTER_FOREACH_BINARY(sub)
     REGISTER_FOREACH_BINARY(mul)
@@ -936,25 +1922,27 @@ TENSORPLAY_LIBRARY_IMPL(CPU, ForeachKernels) {
 
     m.impl("_foreach_add.List_out", foreach_add_list_out_cpu);
     m.impl("_foreach_add.ScalarList_out", foreach_add_scalar_list_out_cpu);
-    m.impl("_foreach_add.Scalar_out", foreach_add_scalar_out_cpu);
+    m.impl("_foreach_add.Scalar_out", foreach_add_scalar_out_fast_cpu);
     m.impl("_foreach_add.Tensor_out", foreach_add_tensor_out_cpu);
     m.impl("_foreach_sub.List_out", foreach_sub_list_out_cpu);
     m.impl("_foreach_sub.ScalarList_out", foreach_sub_scalar_list_out_cpu);
-    m.impl("_foreach_sub.Scalar_out", foreach_sub_scalar_out_cpu);
+    m.impl("_foreach_sub.Scalar_out", foreach_sub_scalar_out_fast_cpu);
     m.impl("_foreach_mul.List_out", foreach_mul_list_out_cpu);
     m.impl("_foreach_mul.ScalarList_out", foreach_mul_scalar_list_out_cpu);
-    m.impl("_foreach_mul.Scalar_out", foreach_mul_scalar_out_cpu);
+    m.impl("_foreach_mul.Scalar_out", foreach_mul_scalar_out_fast_cpu);
     m.impl("_foreach_mul.Tensor_out", foreach_mul_tensor_out_cpu);
     m.impl("_foreach_div.List_out", foreach_div_list_out_cpu);
     m.impl("_foreach_div.ScalarList_out", foreach_div_scalar_list_out_cpu);
-    m.impl("_foreach_div.Scalar_out", foreach_div_scalar_out_cpu);
+    m.impl("_foreach_div.Scalar_out", foreach_div_scalar_out_fast_cpu);
     m.impl("_foreach_div.Tensor_out", foreach_div_tensor_out_cpu);
 
 #define REGISTER_FOREACH_UNARY(NAME) \
     m.impl("_foreach_" #NAME, foreach_##NAME##_cpu); \
     m.impl("_foreach_" #NAME "_", foreach_##NAME##_inplace_cpu); \
     m.impl("_foreach_" #NAME ".out", foreach_##NAME##_out_cpu);
-    REGISTER_FOREACH_UNARY(sqrt)
+    m.impl("_foreach_sqrt", foreach_sqrt_ret_fast_cpu);
+    m.impl("_foreach_sqrt_", foreach_sqrt_fast_cpu);
+    m.impl("_foreach_sqrt.out", foreach_sqrt_out_fast_cpu);
     REGISTER_FOREACH_UNARY(rsqrt)
     REGISTER_FOREACH_UNARY(neg)
     REGISTER_FOREACH_UNARY(abs)
@@ -987,7 +1975,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, ForeachKernels) {
 #undef REGISTER_FOREACH_UNARY
 
     m.impl("_foreach_addcmul.Scalar", foreach_addcmul_scalar_cpu);
-    m.impl("_foreach_addcmul_.Scalar", foreach_addcmul_scalar_inplace_cpu);
+    m.impl("_foreach_addcmul_.Scalar", foreach_addcmul_scalar_fast_cpu);
     m.impl("_foreach_addcmul.ScalarList", foreach_addcmul_scalar_list_cpu);
     m.impl("_foreach_addcmul_.ScalarList", foreach_addcmul_scalar_list_inplace_cpu);
     m.impl("_foreach_addcmul.Tensor", foreach_addcmul_tensor_cpu);
@@ -996,7 +1984,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, ForeachKernels) {
     m.impl("_foreach_addcmul.ScalarList_out", foreach_addcmul_scalar_list_out_cpu);
     m.impl("_foreach_addcmul.Tensor_out", foreach_addcmul_tensor_out_cpu);
     m.impl("_foreach_addcdiv.Scalar", foreach_addcdiv_scalar_cpu);
-    m.impl("_foreach_addcdiv_.Scalar", foreach_addcdiv_scalar_inplace_cpu);
+    m.impl("_foreach_addcdiv_.Scalar", foreach_addcdiv_scalar_fast_cpu);
     m.impl("_foreach_addcdiv.ScalarList", foreach_addcdiv_scalar_list_cpu);
     m.impl("_foreach_addcdiv_.ScalarList", foreach_addcdiv_scalar_list_inplace_cpu);
     m.impl("_foreach_addcdiv.Tensor", foreach_addcdiv_tensor_cpu);
@@ -1006,7 +1994,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, ForeachKernels) {
     m.impl("_foreach_addcdiv.Tensor_out", foreach_addcdiv_tensor_out_cpu);
     m.impl("_foreach_lerp.Scalar", foreach_lerp_scalar_cpu);
     m.impl("_foreach_lerp.List", foreach_lerp_list_cpu);
-    m.impl("_foreach_lerp_.Scalar", foreach_lerp_scalar_inplace_cpu);
+    m.impl("_foreach_lerp_.Scalar", foreach_lerp_scalar_fast_cpu);
     m.impl("_foreach_lerp_.List", foreach_lerp_list_inplace_cpu);
     m.impl("_foreach_lerp.ScalarList", foreach_lerp_scalar_list_cpu);
     m.impl("_foreach_lerp_.ScalarList", foreach_lerp_scalar_list_inplace_cpu);
@@ -1023,8 +2011,8 @@ TENSORPLAY_LIBRARY_IMPL(CPU, ForeachKernels) {
     m.impl("_foreach_pow_.ScalarList", foreach_pow_scalar_list_inplace_cpu);
     m.impl("_foreach_clamp_min.Scalar", foreach_clamp_min_scalar_cpu);
     m.impl("_foreach_clamp_max.Scalar", foreach_clamp_max_scalar_cpu);
-    m.impl("_foreach_clamp_min_.Scalar", foreach_clamp_min_scalar_inplace_cpu);
-    m.impl("_foreach_clamp_max_.Scalar", foreach_clamp_max_scalar_inplace_cpu);
+    m.impl("_foreach_clamp_min_.Scalar", foreach_clamp_min_scalar_fast_cpu);
+    m.impl("_foreach_clamp_max_.Scalar", foreach_clamp_max_scalar_fast_cpu);
     m.impl("_foreach_clamp_min.List", foreach_clamp_min_list_cpu);
     m.impl("_foreach_clamp_min_.List", foreach_clamp_min_list_inplace_cpu);
     m.impl("_foreach_clamp_min.ScalarList", foreach_clamp_min_scalar_list_cpu);
@@ -1038,7 +2026,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, ForeachKernels) {
     m.impl("_foreach_maximum_.Scalar", foreach_maximum_scalar_inplace_cpu);
     m.impl("_foreach_minimum_.Scalar", foreach_minimum_scalar_inplace_cpu);
     m.impl("_foreach_maximum.List", foreach_maximum_list_cpu);
-    m.impl("_foreach_maximum_.List", foreach_maximum_list_inplace_cpu);
+    m.impl("_foreach_maximum_.List", foreach_maximum_list_fast_cpu);
     m.impl("_foreach_maximum.ScalarList", foreach_maximum_scalar_list_cpu);
     m.impl("_foreach_maximum_.ScalarList", foreach_maximum_scalar_list_inplace_cpu);
     m.impl("_foreach_minimum.List", foreach_minimum_list_cpu);
@@ -1070,7 +2058,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, ForeachKernels) {
     m.impl("_foreach_copy.out", foreach_copy_out_cpu);
     m.impl("_foreach_max.out", foreach_max_out_cpu);
     m.impl("_foreach_norm.Scalar_out", foreach_norm_out_cpu);
-    m.impl("_foreach_pow.Scalar_out", foreach_pow_scalar_out_cpu);
+    m.impl("_foreach_pow.Scalar_out", foreach_pow_scalar_out_fast_cpu);
     m.impl("_foreach_pow.List_out", foreach_pow_list_out_cpu);
     m.impl("_foreach_pow.ScalarList_out", foreach_pow_scalar_list_out_cpu);
     m.impl("_foreach_powsum.Scalar_out", foreach_powsum_out_cpu);

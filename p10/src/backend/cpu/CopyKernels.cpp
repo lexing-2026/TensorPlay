@@ -1,11 +1,19 @@
 #include "Tensor.h"
 #include "Dispatcher.h"
+#include "Parallel.h"
 #include "Scalar.h"
 #include "TypePromotion.h"
 #include "Utils.h"
 #include "SparseKernels.h"
+#include <algorithm>
 #include <cstring>
+#include <numeric>
+#include <type_traits>
 #include <vector>
+
+#if defined(__x86_64__)
+#include <immintrin.h>
+#endif
 
 #ifdef USE_CUDA
 #include "CUDARuntime.h"
@@ -17,7 +25,7 @@ namespace cpu {
 
 Tensor to_kernel(Tensor& self, DType dtype, bool non_blocking, bool copy) {
     if (self.dtype() == dtype) {
-        return copy ? self.clone() : self; // clone not impl yet, use copy_
+        return copy ? detail::contiguous_clone(self) : self;
     }
     // Create new tensor
     Tensor result(static_cast<std::vector<int64_t>>(self.shape()), dtype, self.device());
@@ -25,36 +33,117 @@ Tensor to_kernel(Tensor& self, DType dtype, bool non_blocking, bool copy) {
     return result;
 }
 
-// Helper for recursive copy
-template <typename T_SELF, typename T_SRC>
-void copy_recursive(
-    T_SELF* self_data, const std::vector<int64_t>& self_strides,
-    const T_SRC* src_data, const std::vector<int64_t>& src_strides,
-    const std::vector<int64_t>& sizes,
-    int64_t dim,
-    int64_t self_offset, int64_t src_offset) {
-    
-    if (sizes.empty()) { // Scalar case
-        self_data[self_offset] = cast_value<T_SELF>(src_data[src_offset]);
+// Parallel ND strided copy, mirroring the throughput of ATen's
+// TensorIterator-driven copy for permuted/expanded operands: dims are visited
+// in destination-stride order so the innermost loop writes consecutive
+// memory (a unit-stride source there degrades into memcpy), size-1 dims are
+// dropped, and chunks beyond the grain threshold are spread across the
+// intra-op thread pool.  A single remaining dim is sliced directly so large
+// strided vectors parallelize too.
+// Contiguous dtype-conversion cast (defined below the SIMD helpers);
+// forward-declared here because parallel_strided_copy's inner range copy
+// dispatches to it.
+template <typename dst_t, typename src_t>
+void cast_contiguous(dst_t* dst, const src_t* src, int64_t len);
+
+template <typename self_t, typename src_t>
+void parallel_strided_copy(self_t* dst, const std::vector<int64_t>& dst_strides_in,
+                           const src_t* src, const std::vector<int64_t>& src_strides_in,
+                           const std::vector<int64_t>& sizes) {
+    const int ndim = static_cast<int>(sizes.size());
+    std::vector<int64_t> o_sizes, o_dstr, o_sstr;
+    o_sizes.reserve(ndim);
+    o_dstr.reserve(ndim);
+    o_sstr.reserve(ndim);
+    for (int i = 0; i < ndim; ++i) {
+        if (sizes[i] == 1) continue;  // stride irrelevant; contributes one element
+        if (sizes[i] == 0) return;    // nothing to copy
+        o_sizes.push_back(sizes[i]);
+        o_dstr.push_back(dst_strides_in[i]);
+        o_sstr.push_back(src_strides_in[i]);
+    }
+    const int m = static_cast<int>(o_sizes.size());
+    if (m == 0) {
+        *dst = cast_value<self_t>(src[0]);
         return;
     }
 
-    if (dim == sizes.size() - 1) {
-        int64_t n = sizes[dim];
-        int64_t self_stride = self_strides[dim];
-        int64_t src_stride = src_strides[dim];
-        for (int64_t i = 0; i < n; ++i) {
-            self_data[self_offset + i * self_stride] = cast_value<T_SELF>(src_data[src_offset + i * src_stride]);
-        }
-    } else {
-        int64_t n = sizes[dim];
-        int64_t self_stride = self_strides[dim];
-        int64_t src_stride = src_strides[dim];
-        for (int64_t i = 0; i < n; ++i) {
-            copy_recursive(self_data, self_strides, src_data, src_strides, sizes, dim + 1, 
-                           self_offset + i * self_stride, src_offset + i * src_stride);
-        }
+    // Largest destination stride first, so the last dim varies fastest in
+    // destination memory; ties break toward the larger source stride.
+    std::vector<int> order(m);
+    for (int i = 0; i < m; ++i) order[i] = i;
+    std::sort(order.begin(), order.end(), [&](int a, int b) {
+        if (o_dstr[a] != o_dstr[b]) return o_dstr[a] > o_dstr[b];
+        return o_sstr[a] > o_sstr[b];
+    });
+    std::vector<int64_t> c_sizes(m), c_dstr(m), c_sstr(m);
+    for (int i = 0; i < m; ++i) {
+        c_sizes[i] = o_sizes[order[i]];
+        c_dstr[i] = o_dstr[order[i]];
+        c_sstr[i] = o_sstr[order[i]];
     }
+
+    const int64_t inner_len = c_sizes[m - 1];
+    const int64_t d_is = c_dstr[m - 1];
+    const int64_t s_is = c_sstr[m - 1];
+
+    auto copy_range = [&](int64_t dst_off, int64_t src_off, int64_t len) {
+        if (d_is == 1 && s_is == 1) {
+            if constexpr (std::is_same_v<self_t, src_t>) {
+                std::memcpy(dst + dst_off, src + src_off,
+                            static_cast<size_t>(len) * sizeof(self_t));
+            } else {
+                cast_contiguous(dst + dst_off, src + src_off, len);
+            }
+        } else {
+            for (int64_t i = 0; i < len; ++i)
+                dst[dst_off + i * d_is] = cast_value<self_t>(src[src_off + i * s_is]);
+        }
+    };
+
+    if (m == 1) {
+        parallel::parallel_for(0, inner_len, parallel::GRAIN_SIZE,
+                               [&](int64_t b, int64_t e) {
+                                   copy_range(b * d_is, b * s_is, e - b);
+                               });
+        return;
+    }
+
+    const int od = m - 1;
+    const int64_t outer =
+        std::accumulate(c_sizes.begin(), c_sizes.begin() + od, int64_t{1},
+                        std::multiplies<int64_t>{});
+    const int64_t grain =
+        std::max<int64_t>(1, parallel::GRAIN_SIZE / std::max<int64_t>(inner_len, 1));
+    std::vector<int64_t> outer_sizes(c_sizes.begin(), c_sizes.end() - 1);
+    std::vector<int64_t> outer_dstr(c_dstr.begin(), c_dstr.end() - 1);
+    std::vector<int64_t> outer_sstr(c_sstr.begin(), c_sstr.end() - 1);
+
+    parallel::parallel_for(0, outer, grain, [&]([[maybe_unused]] int64_t b, int64_t e) {
+        // Decode the mixed-radix index once, then advance incrementally.
+        std::vector<int64_t> idx(od, 0);
+        int64_t d_off = 0, s_off = 0;
+        int64_t rest = b;
+        for (int i = od - 1; i >= 0; --i) {
+            const int64_t q = rest / outer_sizes[i];
+            idx[i] = rest - q * outer_sizes[i];
+            rest = q;
+            d_off += idx[i] * outer_dstr[i];
+            s_off += idx[i] * outer_sstr[i];
+        }
+        for (int64_t o = b; o < e; ++o) {
+            copy_range(d_off, s_off, inner_len);
+            for (int i = od - 1; i >= 0; --i) {  // odometer increment
+                ++idx[i];
+                d_off += outer_dstr[i];
+                s_off += outer_sstr[i];
+                if (idx[i] < outer_sizes[i]) break;
+                d_off -= outer_dstr[i] * idx[i];  // wrap this digit
+                s_off -= outer_sstr[i] * idx[i];
+                idx[i] = 0;
+            }
+        }
+    });
 }
 
 // Helper for dynamic dispatch
@@ -77,9 +166,137 @@ void dispatch_dtype(DType dtype, F&& callback) {
     #undef DISPATCH_CASE
 }
 
+// ---------------------------------------------------------------------------
+// Vectorized floating-point casts for contiguous ranges.
+//
+// The autocast weight-cast path (fp32 <-> fp16/bf16) is memory-bound; scalar
+// static_cast loops leave 4-8x bandwidth on the table.  F16C covers half,
+// AVX512-BF16 (vcvtneps2bf16) covers bfloat16 with round-to-nearest-even --
+// bit-identical to BFloat16.h's scalar float_to_bfloat16_bits.  Per-function
+// target attributes keep the rest of the TU at baseline -march.
+// ---------------------------------------------------------------------------
+#if defined(__x86_64__)
+__attribute__((target("avx2,f16c")))
+static void f32_to_f16_simd(const float* src, uint16_t* dst, int64_t n) {
+    constexpr int k = 8;
+    int64_t i = 0;
+    for (; i + k <= n; i += k) {
+        __m256 v = _mm256_loadu_ps(src + i);
+        __m128i h = _mm256_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i), h);
+    }
+    for (; i < n; ++i)
+        dst[i] = cast_value<Half>(src[i]).x;
+}
+
+__attribute__((target("avx2,f16c")))
+static void f16_to_f32_simd(const uint16_t* src, float* dst, int64_t n) {
+    constexpr int k = 8;
+    int64_t i = 0;
+    for (; i + k <= n; i += k) {
+        __m128i h = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + i));
+        _mm256_storeu_ps(dst + i, _mm256_cvtph_ps(h));
+    }
+    for (; i < n; ++i)
+        dst[i] = cast_value<float>(Half(src[i], Half::from_bits()));
+}
+
+__attribute__((target("avx512bf16,avx512f")))
+static void f32_to_bf16_avx512(const float* src, uint16_t* dst, int64_t n) {
+    constexpr int k = 16;
+    int64_t i = 0;
+    for (; i + k <= n; i += k) {
+        __m512 v = _mm512_loadu_ps(src + i);
+        __m256i bh = (__m256i)_mm512_cvtneps_pbh(v);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + i), bh);
+    }
+    for (; i < n; ++i)
+        dst[i] = cast_value<BFloat16>(src[i]).x;
+}
+
+__attribute__((target("avx2,ssse3")))
+static void f32_to_bf16_avx2_rne(const float* src, uint16_t* dst, int64_t n) {
+    // Round-to-nearest-even via the integer trick, matching
+    // detail::float_to_bfloat16_bits lane-wise; shuffle-based compaction.
+    const __m256i one = _mm256_set1_epi32(1);
+    const __m256i bias = _mm256_set1_epi32(0x7FFF);
+    const __m128i pick = _mm_set_epi8(
+        char(-1), char(-1), char(-1), char(-1),
+        char(-1), char(-1), char(-1), char(-1),
+        char(13), char(12), char(9), char(8),
+        char(5), char(4), char(1), char(0));
+    constexpr int k = 8;
+    int64_t i = 0;
+    for (; i + k <= n; i += k) {
+        __m256i u = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + i));
+        __m256i r = _mm256_and_si256(_mm256_srli_epi32(u, 16), one);
+        r = _mm256_add_epi32(_mm256_add_epi32(u, r), bias);
+        __m256i out = _mm256_srli_epi32(r, 16);
+        __m128i lo = _mm_shuffle_epi8(_mm256_castsi256_si128(out), pick);
+        __m128i hi = _mm_shuffle_epi8(_mm256_extracti128_si256(out, 1), pick);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i),
+                         _mm_unpacklo_epi64(lo, hi));
+    }
+    for (; i < n; ++i)
+        dst[i] = cast_value<BFloat16>(src[i]).x;
+}
+
+__attribute__((target("avx2")))
+static void bf16_to_f32_simd(const uint16_t* src, float* dst, int64_t n) {
+    constexpr int k = 8;
+    int64_t i = 0;
+    for (; i + k <= n; i += k) {
+        __m128i h = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + i));
+        __m256i w = _mm256_slli_epi32(_mm256_cvtepu16_epi32(h), 16);
+        _mm256_storeu_ps(dst + i, _mm256_castsi256_ps(w));
+    }
+    for (; i < n; ++i)
+        dst[i] = cast_value<float>(BFloat16(src[i], BFloat16::from_bits()));
+}
+
+inline bool cpu_has_f16c() {
+    static const bool ok = __builtin_cpu_supports("f16c") != 0;
+    return ok;
+}
+inline bool cpu_has_bf16() {
+    static const bool ok = __builtin_cpu_supports("avx512bf16") != 0;
+    return ok;
+}
+#endif // __x86_64__
+
+// Contiguous dtype-conversion cast; SIMD for the autocast-critical fp32
+// <-> fp16/bf16 pairs, scalar static_cast otherwise.
+template <typename dst_t, typename src_t>
+void cast_contiguous(dst_t* dst, const src_t* src, int64_t len) {
+#if defined(__x86_64__)
+    if constexpr (std::is_same_v<dst_t, Half> && std::is_same_v<src_t, float>) {
+        if (cpu_has_f16c()) { f32_to_f16_simd(src, &dst->x, len); return; }
+    } else if constexpr (std::is_same_v<dst_t, float> && std::is_same_v<src_t, Half>) {
+        if (cpu_has_f16c()) { f16_to_f32_simd(&src->x, dst, len); return; }
+    } else if constexpr (std::is_same_v<dst_t, BFloat16> && std::is_same_v<src_t, float>) {
+        if (cpu_has_bf16()) { f32_to_bf16_avx512(src, &dst->x, len); return; }
+        if (cpu_has_f16c() || __builtin_cpu_supports("avx2")) {
+            f32_to_bf16_avx2_rne(src, &dst->x, len); return;
+        }
+    } else if constexpr (std::is_same_v<dst_t, float> && std::is_same_v<src_t, BFloat16>) {
+        if (__builtin_cpu_supports("avx2")) { bf16_to_f32_simd(&src->x, dst, len); return; }
+    }
+#endif
+    for (int64_t i = 0; i < len; ++i)
+        dst[i] = cast_value<dst_t>(src[i]);
+}
+
+
+
 Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
     if (!self.device().is_cpu()) {
         throw std::runtime_error("copy_kernel (CPU) called with non-CPU destination");
+    }
+
+    // ATen parity (Copy.cpp:280): nothing to copy; also keeps NULL data_ptrs
+    // of empty tensors away from memcpy/cudaMemcpyAsync.
+    if (self.numel() == 0) {
+        return self;
     }
 
     if (src.device().is_cuda()) {
@@ -88,13 +305,22 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
         auto stream = cuda::getCurrentCUDAStream(static_cast<int>(src.device().index()));
 
         Tensor src_ready = src;
-        if (!src.is_contiguous() || src.dtype() != self.dtype()) {
+        // Row-major contiguity (not is_contiguous(), which channels-last
+        // tensors also report): flat cudaMemcpy only applies to canonical
+        // row-major layouts.
+        const auto cuda_rm_strides = SizesAndStrides::compute_contiguous_strides(
+            static_cast<std::vector<int64_t>>(src.shape()));
+        const bool src_row_major =
+            static_cast<std::vector<int64_t>>(src.strides()) == cuda_rm_strides;
+        if (!src_row_major || src.dtype() != self.dtype()) {
             src_ready = Tensor(static_cast<std::vector<int64_t>>(src.shape()), self.dtype(), src.device());
             src_ready.copy_(src);
         }
 
         const size_t nbytes = self.numel() * self.itemsize();
-        if (self.is_contiguous()) {
+        const auto self_rm_strides = SizesAndStrides::compute_contiguous_strides(
+            static_cast<std::vector<int64_t>>(self.shape()));
+        if (static_cast<std::vector<int64_t>>(self.strides()) == self_rm_strides) {
             cuda::checkCuda(cudaMemcpyAsync(self.data_ptr(), src_ready.data_ptr(), nbytes,
                                             cudaMemcpyDeviceToHost, stream.stream()),
                             "cudaMemcpyAsync (D2H)");
@@ -131,16 +357,41 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
         dispatch_dtype(src.dtype(), [&](auto src_tag) {
             using src_t = typename decltype(src_tag)::type;
             
-            // Optimization for contiguous same-dtype copy
-            if (std::is_same_v<self_t, src_t> && self.is_contiguous() && src.is_contiguous()) {
-                 size_t nbytes = self.numel() * self.itemsize();
-                 std::memcpy(self.data_ptr(), src.data_ptr(), nbytes);
-                 return;
+            // Fast path for contiguous same-shape copies: memcpy when the
+            // dtype matches, otherwise the vectorized cast (fp32 <-> fp16 /
+            // bf16 hits F16C / AVX512-BF16).  Skips the ND-iteration setup;
+            // large casts still spread across the intra-op pool.
+            // is_contiguous() alone is not enough: channels-last tensors
+            // report contiguous (single layout flag), yet a flat memcpy/cast
+            // between row-major and channels-last layouts would corrupt the
+            // data.  Require canonical row-major strides on both sides.
+            const auto rm_strides = SizesAndStrides::compute_contiguous_strides(
+                static_cast<std::vector<int64_t>>(self.shape()));
+            if (self.shape() == src.shape() &&
+                static_cast<std::vector<int64_t>>(self.strides()) == rm_strides &&
+                static_cast<std::vector<int64_t>>(src.strides()) == rm_strides) {
+                if (std::is_same_v<self_t, src_t>) {
+                    size_t nbytes = self.numel() * self.itemsize();
+                    std::memcpy(self.data_ptr(), src.data_ptr(), nbytes);
+                    return;
+                }
+                const int64_t n = self.numel();
+                auto* d = self.data_ptr<self_t>();
+                const auto* s = src.data_ptr<src_t>();
+                if (n > 1 && n >= parallel::GRAIN_SIZE) {
+                    parallel::parallel_for(0, n, parallel::GRAIN_SIZE,
+                        [&](int64_t b, int64_t e) {
+                            cast_contiguous(d + b, s + b, e - b);
+                        });
+                    return;
+                }
+                cast_contiguous(d, s, n);
+                return;
             }
-            
-            copy_recursive(self.data_ptr<self_t>(), self.strides(), 
-                           src.data_ptr<src_t>(), src.strides(), 
-                           static_cast<std::vector<int64_t>>(self.shape()), 0, 0, 0);
+
+            parallel_strided_copy(self.data_ptr<self_t>(), self.strides(),
+                                  src.data_ptr<src_t>(), src.strides(),
+                                  static_cast<std::vector<int64_t>>(self.shape()));
         });
     });
     
@@ -157,8 +408,8 @@ Tensor masked_select_cpu(const Tensor& self, const Tensor& mask) {
     Tensor mask_expanded = mask.expand(broadcast_shape);
     
     // 2. Make contiguous for simple iteration
-    Tensor self_contig = self_expanded.is_contiguous() ? self_expanded : self_expanded.clone();
-    Tensor mask_contig = mask_expanded.is_contiguous() ? mask_expanded : mask_expanded.clone();
+    Tensor self_contig = self_expanded.contiguous();
+    Tensor mask_contig = mask_expanded.contiguous();
     
     int64_t numel = self_contig.numel();
     const uint8_t* mask_ptr = nullptr;
@@ -226,8 +477,8 @@ Tensor embedding_cpu(const Tensor& weight, const Tensor& indices, int64_t paddin
     int64_t weight_size_0 = weight.size(0);
     
     // Contiguous access optimization
-    Tensor indices_contig = indices.is_contiguous() ? indices : indices.clone();
-    Tensor weight_contig = weight.is_contiguous() ? weight : weight.clone();
+    Tensor indices_contig = indices.contiguous();
+    Tensor weight_contig = weight.contiguous();
     
     dispatch_dtype(weight.dtype(), [&](auto tag) {
         using T = typename decltype(tag)::type;
@@ -287,8 +538,8 @@ Tensor embedding_dense_backward_cpu(const Tensor& grad_output, const Tensor& ind
     
     if (num_indices == 0) return grad_weight;
 
-    Tensor indices_contig = indices.is_contiguous() ? indices : indices.clone();
-    Tensor grad_output_contig = grad_output.is_contiguous() ? grad_output : grad_output.clone();
+    Tensor indices_contig = indices.contiguous();
+    Tensor grad_output_contig = grad_output.contiguous();
     
     dispatch_dtype(grad_output.dtype(), [&](auto tag) {
         using T = typename decltype(tag)::type;

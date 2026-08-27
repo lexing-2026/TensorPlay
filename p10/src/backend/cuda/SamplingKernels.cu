@@ -10,6 +10,15 @@
 #include <algorithm>
 #include <cmath>
 
+#define CUDA_CHECK(condition) \
+  do { \
+    cudaError_t error = condition; \
+    if (error != cudaSuccess) { \
+       TP_THROW(RuntimeError, std::string("CUDA Error: ") + cudaGetErrorString(error)); \
+    } \
+  } while (0)
+
+
 // LLM hot-path sampling operators.
 // References:
 //   - multinomial: third_party/pytorch/aten/src/ATen/native/cuda/MultinomialKernel.cu

@@ -1,3 +1,0 @@
-
-
-def load_library(path: str) -> None: ...

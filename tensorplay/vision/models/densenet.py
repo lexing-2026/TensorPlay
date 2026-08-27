@@ -6,7 +6,7 @@ from collections import OrderedDict
 from functools import partial
 from typing import Any, Optional
 
-import tensorplay as torch
+import tensorplay as tensorplay
 import tensorplay.nn as nn
 import tensorplay.nn.functional as F
 import tensorplay.utils.checkpoint as cp
@@ -48,7 +48,7 @@ class _DenseLayer(nn.Module):
         self.memory_efficient = memory_efficient
 
     def bn_function(self, inputs: list[Tensor]) -> Tensor:
-        concated_features = torch.cat(inputs, 1)
+        concated_features = tensorplay.cat(inputs, 1)
         bottleneck_output = self.conv1(self.relu1(self.norm1(concated_features)))  # noqa: T484
         return bottleneck_output
 
@@ -59,18 +59,18 @@ class _DenseLayer(nn.Module):
                 return True
         return False
 
-    @torch.jit.unused  # noqa: T484
+    @tensorplay.jit.unused  # noqa: T484
     def call_checkpoint_bottleneck(self, input: list[Tensor]) -> Tensor:
         def closure(*inputs):
             return self.bn_function(inputs)
 
         return cp.checkpoint(closure, *input, use_reentrant=False)
 
-    @torch.jit._overload_method  # noqa: F811
+    @tensorplay.jit._overload_method  # noqa: F811
     def forward(self, input: list[Tensor]) -> Tensor:  # noqa: F811
         pass
 
-    @torch.jit._overload_method  # noqa: F811
+    @tensorplay.jit._overload_method  # noqa: F811
     def forward(self, input: Tensor) -> Tensor:  # noqa: F811
         pass
 
@@ -83,7 +83,7 @@ class _DenseLayer(nn.Module):
             prev_features = input
 
         if self.memory_efficient and self.any_requires_grad(prev_features):
-            if torch.jit.is_scripting():
+            if tensorplay.jit.is_scripting():
                 raise Exception("Memory Efficient not supported in JIT")
 
             bottleneck_output = self.call_checkpoint_bottleneck(prev_features)
@@ -124,7 +124,7 @@ class _DenseBlock(nn.ModuleDict):
         for name, layer in self.items():
             new_features = layer(features)
             features.append(new_features)
-        return torch.cat(features, 1)
+        return tensorplay.cat(features, 1)
 
 
 class _Transition(nn.Sequential):
@@ -216,7 +216,7 @@ class DenseNet(nn.Module):
         features = self.features(x)
         out = F.relu(features, inplace=True)
         out = F.adaptive_avg_pool2d(out, (1, 1))
-        out = torch.flatten(out, 1)
+        out = tensorplay.flatten(out, 1)
         out = self.classifier(out)
         return out
 
@@ -262,7 +262,7 @@ def _densenet(
 _COMMON_META = {
     "min_size": (29, 29),
     "categories": _IMAGENET_CATEGORIES,
-    "recipe": "https://github.com/pytorch/vision/pull/116",
+    "recipe": "https://github.com/tensorplay/vision/pull/116",
     "_docs": """These weights are ported from LuaTorch.""",
 }
 
@@ -354,18 +354,18 @@ def densenet121(*, weights: Optional[DenseNet121_Weights] = None, progress: bool
     `Densely Connected Convolutional Networks <https://arxiv.org/abs/1608.06993>`_.
 
     Args:
-        weights (:class:`~torchvision.models.DenseNet121_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.DenseNet121_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.DenseNet121_Weights` below for
+            :class:`~tensorplay.vision.models.DenseNet121_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.densenet.DenseNet``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.densenet.DenseNet``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/densenet.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/densenet.py>`_
             for more details about this class.
 
-    .. autoclass:: torchvision.models.DenseNet121_Weights
+    .. autoclass:: tensorplay.vision.models.DenseNet121_Weights
         :members:
     """
     weights = DenseNet121_Weights.verify(weights)
@@ -380,18 +380,18 @@ def densenet161(*, weights: Optional[DenseNet161_Weights] = None, progress: bool
     `Densely Connected Convolutional Networks <https://arxiv.org/abs/1608.06993>`_.
 
     Args:
-        weights (:class:`~torchvision.models.DenseNet161_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.DenseNet161_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.DenseNet161_Weights` below for
+            :class:`~tensorplay.vision.models.DenseNet161_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.densenet.DenseNet``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.densenet.DenseNet``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/densenet.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/densenet.py>`_
             for more details about this class.
 
-    .. autoclass:: torchvision.models.DenseNet161_Weights
+    .. autoclass:: tensorplay.vision.models.DenseNet161_Weights
         :members:
     """
     weights = DenseNet161_Weights.verify(weights)
@@ -406,18 +406,18 @@ def densenet169(*, weights: Optional[DenseNet169_Weights] = None, progress: bool
     `Densely Connected Convolutional Networks <https://arxiv.org/abs/1608.06993>`_.
 
     Args:
-        weights (:class:`~torchvision.models.DenseNet169_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.DenseNet169_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.DenseNet169_Weights` below for
+            :class:`~tensorplay.vision.models.DenseNet169_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.densenet.DenseNet``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.densenet.DenseNet``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/densenet.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/densenet.py>`_
             for more details about this class.
 
-    .. autoclass:: torchvision.models.DenseNet169_Weights
+    .. autoclass:: tensorplay.vision.models.DenseNet169_Weights
         :members:
     """
     weights = DenseNet169_Weights.verify(weights)
@@ -432,18 +432,18 @@ def densenet201(*, weights: Optional[DenseNet201_Weights] = None, progress: bool
     `Densely Connected Convolutional Networks <https://arxiv.org/abs/1608.06993>`_.
 
     Args:
-        weights (:class:`~torchvision.models.DenseNet201_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.DenseNet201_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.DenseNet201_Weights` below for
+            :class:`~tensorplay.vision.models.DenseNet201_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.densenet.DenseNet``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.densenet.DenseNet``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/densenet.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/densenet.py>`_
             for more details about this class.
 
-    .. autoclass:: torchvision.models.DenseNet201_Weights
+    .. autoclass:: tensorplay.vision.models.DenseNet201_Weights
         :members:
     """
     weights = DenseNet201_Weights.verify(weights)

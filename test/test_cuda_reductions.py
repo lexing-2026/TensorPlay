@@ -58,7 +58,7 @@ class TestCUDAReductions(unittest.TestCase):
         self.assertAlmostEqual(t.max().item(), 4.0)
         self.assertAlmostEqual(t.min().item(), 1.0)
         
-        m0 = t.max(dim=[0]) # [2, 2] -> max over dim 0 -> [max(1,3), max(2,4)] = [3, 4]
+        m0 = t.max(dim=0) # [2, 2] -> max over dim 0 -> [max(1,3), max(2,4)] = [3, 4]
         self.assertEqual(m0.shape, [2])
         # Check values indirectly
         self.assertAlmostEqual(m0.sum().item(), 7.0) 
@@ -93,9 +93,58 @@ class TestCUDAReductions(unittest.TestCase):
     def test_argmax_argmin(self):
         t_cpu = tp.Tensor([1.0, 5.0, 2.0, 8.0])
         t = t_cpu.cuda()
-        
+
         self.assertEqual(t.argmax().item(), 3)
         self.assertEqual(t.argmin().item(), 0)
+
+    def test_argmax_packed_semantics(self):
+        """Packed u64 warp-shuffle argmax must reproduce ArgOps winners exactly:
+        strict '>' picks first occurrence; -0 == +0; any NaN outranks +inf and
+        the FIRST NaN wins; +inf beats every finite value.
+        """
+
+        def idx_equal(got, expected):
+            diff = (got.cpu() - tp.tensor(expected)).abs().sum().item()
+            self.assertEqual(diff, 0)
+
+        # tie -> lower index
+        t = tp.Tensor([1.0, 5.0, 5.0, 2.0]).cuda()
+        self.assertEqual(t.argmax(dim=0).item(), 1)
+        self.assertEqual(t.argmin(dim=0).item(), 0)
+
+        # -0 folds onto +0 -> IEEE-equal, first occurrence
+        t = tp.Tensor([-0.0, 0.0]).cuda()
+        self.assertEqual(t.argmax(dim=0).item(), 0)
+
+        # NaN ranks highest, first NaN wins
+        nan = float('nan')
+        t = tp.Tensor([3.0, nan, 7.0, nan]).cuda()
+        self.assertEqual(t.argmax(dim=0).item(), 1)
+
+        # infinites
+        t = tp.Tensor([float('inf'), 1e30]).cuda()
+        self.assertEqual(t.argmax(dim=0).item(), 0)
+        t = tp.Tensor([float('-inf'), -5.0]).cuda()
+        self.assertEqual(t.argmax(dim=0).item(), 1)
+
+        # full-tensor forms agree with dim=(last) compaction on 2D input
+        rows = [
+            [1.0, 9.0, 3.0],
+            [7.0, 7.0, 2.0],
+            [nan, -1.0, 4.0],
+        ]
+        t = tp.Tensor(rows).cuda()
+        idx_equal(t.argmax(dim=-1), [1, 0, 0])
+        self.assertEqual(t.argmax().item(), 6)   # flat order: NaN at pos 6
+
+        # long row crossing ValuesPerThread strides and the y-split layout;
+        # duplicate maximum later in the row must NOT steal first occurrence
+        n = 4096
+        vals = [(float((i * 2654435761) % 997) - 498.0) for i in range(n)]
+        vals[2000] = 999.5
+        vals[2500] = 999.5
+        t = tp.Tensor(vals).reshape([1, n]).cuda()
+        idx_equal(t.argmax(dim=-1), [2000])
 
 if __name__ == '__main__':
     unittest.main()

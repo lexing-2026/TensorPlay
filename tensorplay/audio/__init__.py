@@ -1,14 +1,14 @@
-"""tensorplay.audio — torchaudio-compatible API.
+"""tensorplay.audio — tensorplay.audio-compatible API.
 
-The Python surface is ported verbatim from torchaudio 2.11 (third_party/audio)
+The Python surface is ported verbatim from tensorplay.audio 2.11 (third_party/audio)
 with import rewriting; the DSP primitives (fft family, windows, stft/istft)
 are native p10 kernels mirroring ATen's SpectralOps semantics:
 
 * CPU: pocketfft (p10/include/pocketfft_hdronly.h)
 * CUDA: cuFFT   (p10/src/backend/cuda/SpectralKernels.cu)
 
-I/O follows the classic torchaudio backend model (soundfile/scipy) with
-torch-compatible load/save/info signatures.
+I/O follows the classic tensorplay.audio backend model (soundfile/scipy) with
+tensorplay-compatible load/save/info signatures.
 """
 from .backend import (
     check_available,

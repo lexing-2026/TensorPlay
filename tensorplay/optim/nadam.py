@@ -1,6 +1,6 @@
 import tensorplay as tp
 
-from ._utils import zeros_like
+from ._utils import scalar_value, zeros_like
 from .optimizer import (
     Optimizer,
     _default_to_fused_or_foreach,
@@ -183,6 +183,23 @@ class NAdam(Optimizer):
                 differentiable=group["differentiable"],
                 has_complex=has_complex,
             )
+            if group["differentiable"]:
+                # The differentiable path replaces state tensors with their
+                # graph-carrying out-of-place updates.  Keeping the new
+                # tensors in the optimizer state is required for a second
+                # optimizer step to remain differentiable; the ordinary path
+                # still updates these buffers in place.
+                for p, exp_avg, exp_avg_sq, mu_product in zip(
+                    params_with_grad,
+                    exp_avgs,
+                    exp_avg_sqs,
+                    mu_products,
+                    strict=True,
+                ):
+                    state = self.state[p]
+                    state["exp_avg"] = exp_avg
+                    state["exp_avg_sq"] = exp_avg_sq
+                    state["mu_product"] = mu_product
         return loss
 
 
@@ -215,7 +232,8 @@ def _single_tensor_nadam(
         mu_product = mu_products[i]
         step_t = state_steps[i]
 
-        if tp.is_complex(param):
+        is_complex = tp.is_complex(param)
+        if is_complex:
             param = tp.view_as_real(param)
             grad = tp.view_as_real(grad)
             exp_avg = tp.view_as_real(exp_avg)
@@ -247,18 +265,32 @@ def _single_tensor_nadam(
             1.0 - 0.5 * (0.96 ** ((step + 1) * momentum_decay))
         )
 
-        mu_product.mul_(mu)
-        exp_avg.lerp_(grad, 1 - beta1)
-        exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+        if differentiable:
+            # Keep each updated state as a new graph node.  TensorPlay's
+            # in-place lerp drops the source edge and retaining an in-place
+            # state update across multiple differentiable steps invalidates
+            # the earlier graph version.
+            mu_product = mu_product * mu
+            exp_avg = exp_avg * beta1 + grad * (1 - beta1)
+            exp_avg_sq = exp_avg_sq * beta2 + grad * grad * (1 - beta2)
+            updated_exp_avg = exp_avg
+            updated_exp_avg_sq = exp_avg_sq
+        else:
+            mu_product.mul_(mu)
+            # Native Torch uses lerp here.  TensorPlay's CUDA lerp promotes
+            # reduced dtypes to float for the complete recurrence, matching
+            # the native rounding contract.
+            exp_avg.lerp_(grad, 1 - beta1)
+            exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
         denom = exp_avg_sq.div(bias_correction2).sqrt()
 
         if differentiable or capturable:
             denom = denom.add(eps)
             mu_product_next = mu_product * mu_next
             grad = grad * (-lr * (1.0 - mu) / (1.0 - mu_product))
-            exp_avg = exp_avg * (-lr * mu_next / (1.0 - mu_product_next))
+            exp_avg_update = exp_avg * (-lr * mu_next / (1.0 - mu_product_next))
             param.addcdiv_(grad, denom)
-            param.addcdiv_(exp_avg, denom)
+            param.addcdiv_(exp_avg_update, denom)
         else:
             mu_product_next = _get_value(mu_product) * mu_next
             denom.add_(eps)
@@ -272,6 +304,15 @@ def _single_tensor_nadam(
                 denom,
                 value=(-lr * mu_next / (1.0 - mu_product_next)),
             )
+
+        if differentiable:
+            mu_products[i] = mu_product
+            if is_complex:
+                exp_avgs[i] = tp.view_as_complex(updated_exp_avg)
+                exp_avg_sqs[i] = tp.view_as_complex(updated_exp_avg_sq)
+            else:
+                exp_avgs[i] = updated_exp_avg
+                exp_avg_sqs[i] = updated_exp_avg_sq
 
 
 def _multi_tensor_nadam(
@@ -390,13 +431,18 @@ def _multi_tensor_nadam(
             tp._foreach_neg_(bias_correction_sqrt)
             tp._foreach_sqrt_(bias_correction_sqrt)
         else:
+            # One host transfer for all step counters instead of a
+            # synchronizing .item() per tensor.
+            if grouped_state_steps and grouped_state_steps[0].is_cuda:
+                steps_host = tp.stack(grouped_state_steps).tolist()
+            else:
+                steps_host = [_get_value(step) for step in grouped_state_steps]
             bias_correction_sqrt = [
-                (1 - beta2 ** _get_value(step)) ** 0.5
-                for step in grouped_state_steps
+                (1 - beta2 ** float(step)) ** 0.5 for step in steps_host
             ]
             mus = [
-                beta1 * (1.0 - 0.5 * (0.96 ** (_get_value(step) * momentum_decay)))
-                for step in grouped_state_steps
+                beta1 * (1.0 - 0.5 * (0.96 ** (float(step) * momentum_decay)))
+                for step in steps_host
             ]
             mu_nexts = [
                 beta1
@@ -499,6 +545,58 @@ def nadam(
             "API has changed, `mu_products` argument must contain a list of "
             "singleton tensors"
         )
+
+    native_device = params[0].device.type if params else None
+    native = (
+        not differentiable
+        and not capturable
+        and not has_complex
+        and native_device in ("cpu", "cuda")
+        and bool(params)
+        # The fused reduced-dtype kernel combines several updates that Torch
+        # performs as separate CUDA ops. Keep fp16/bf16 on the reference path
+        # so state/parameter rounding remains native-compatible.
+        and params[0].dtype in (tp.float32, tp.float64)
+        and all(
+            p.device.type == native_device
+            and p.is_contiguous()
+            and p.is_floating_point()
+            and p.dtype == params[0].dtype
+            for p in params
+        )
+        and all(
+            g.device.type == native_device
+            and g.is_contiguous()
+            and g.dtype == params[0].dtype
+            for g in grads
+        )
+        and all(
+            state.device.type == "cpu"
+            and state.is_contiguous()
+            and state.numel() == 1
+            and state.dtype in (tp.float32, tp.float64)
+            for state in (*mu_products, *state_steps)
+        )
+    )
+    if native:
+        tp._fused_nadam_(
+            params,
+            grads,
+            exp_avgs,
+            exp_avg_sqs,
+            mu_products,
+            state_steps,
+            lr=scalar_value(lr, "lr"),
+            beta1=beta1,
+            beta2=beta2,
+            eps=eps,
+            weight_decay=weight_decay,
+            momentum_decay=momentum_decay,
+            decoupled_weight_decay=decoupled_weight_decay,
+            maximize=maximize,
+        )
+        return
+
     if foreach is None:
         _, foreach = _default_to_fused_or_foreach(
             params, differentiable, use_fused=False

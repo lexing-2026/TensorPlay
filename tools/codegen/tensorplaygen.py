@@ -117,6 +117,7 @@ def generate_binding(funcs, module_name: str) -> str:
         "",
         "#include <optional>",
         "#include <string>",
+        "#include <type_traits>",
         "#include <vector>",
         "",
         "using namespace tensorplay;",
@@ -269,25 +270,43 @@ def generate_binding(funcs, module_name: str) -> str:
         call = ", ".join(f"v_{n}" for n, _, _, _ in slots)
         target = f"tp_custom::{module_name}::{f.cpp_name}_dispatch"
         kind = f.cpp_return_kind
-        L.append("        GilRelease _nogil;")
+        # Kernels run without the GIL (like upstream torch bindings), but
+        # every PyObject-producing step -- argument conversion aside, result
+        # wrapping AND error reporting -- must happen with the GIL held.
+        # Scope the release tightly around the raw C++ call only.
         if kind == "void":
-            L.append(f"        {target}({call});")
+            L.append("        {")
+            L.append("            GilRelease _nogil;")
+            L.append(f"            {target}({call});")
+            L.append("        }")
             L.append("        Py_RETURN_NONE;")
-        elif kind == "tuple":
-            L.append(f"        auto r = {target}({call});")
-            L.append("        return tpx_py_wrap_tuple(r);")
-        elif kind == "list":
-            L.append(f"        auto r = {target}({call});")
-            L.append("        return tpx_py_wrap_list(r);")
         elif kind == "mut_ref":
+            # Returns a reference into the caller's tensor: park its address,
+            # re-acquire the GIL, then wrap.
+            L.append(f"        std::remove_reference_t<"
+                     f"decltype({target}({call}))>* rp = nullptr;")
+            L.append("        {")
+            L.append("            GilRelease _nogil;")
+            L.append(f"            rp = &({target}({call}));")
+            L.append("        }")
             keep = f"tpx_py_keep_alive(s_{slots[0][0]});" if slots else ""
-            L.append(f"        auto& r = {target}({call});")
             if keep:
                 L.append(f"        {keep}")
-            L.append("        return tpx_py_wrap(r);")
-        else:  # value
-            L.append(f"        auto r = {target}({call});")
-            L.append("        return tpx_py_wrap(r);")
+            L.append("        return tpx_py_wrap(*rp);")
+        else:
+            # Value-category results are materialized into an optional
+            # inside the GIL-free region and wrapped after reacquiring it.
+            L.append(f"        std::optional<decltype({target}({call}))> rout;")
+            L.append("        {")
+            L.append("            GilRelease _nogil;")
+            L.append(f"            rout.emplace({target}({call}));")
+            L.append("        }")
+            if kind == "tuple":
+                L.append("        return tpx_py_wrap_tuple(*rout);")
+            elif kind == "list":
+                L.append("        return tpx_py_wrap_list(*rout);")
+            else:  # value
+                L.append("        return tpx_py_wrap(*rout);")
         L += [
             "    } catch (const std::exception& e) {",
             "        tpx_py_set_error(e);",

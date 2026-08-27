@@ -103,11 +103,14 @@ Tensor bernoulli_kernel(const Tensor& self) {
     auto& gen = default_generator();
 
     if (self.dtype() == DType::Float32) {
+        // torch parity: float bernoulli consumes the SAME random32 stream as
+        // rand() (24-bit mantissa mask) and compares strictly against p.
         const float* inp = self.data_ptr<float>();
         float* res = out.data_ptr<float>();
-        uniform_real_distribution<double> uniform(0.0, 1.0);
         for (int64_t i = 0; i < n; ++i) {
-            res[i] = uniform(&gen) < static_cast<double>(inp[i]) ? 1.0f : 0.0f;
+            const uint32_t r = gen.random();
+            const double u = (r & ((1u << 24) - 1)) * std::ldexp(1.0, -24);
+            res[i] = u < static_cast<double>(inp[i]) ? 1.0f : 0.0f;
         }
     } else if (self.dtype() == DType::Float64) {
         const double* inp = self.data_ptr<double>();
@@ -186,6 +189,17 @@ Tensor poisson_kernel(const Tensor& self) {
 Tensor& bernoulli_inplace_kernel(Tensor& self) {
     int64_t n = self.numel();
     auto& gen = default_generator();
+
+    if (self.dtype() == DType::Float32) {
+        // Same random32 stream as rand()/bernoulli out-of-place (torch parity).
+        float* data = self.data_ptr<float>();
+        for (int64_t i = 0; i < n; ++i) {
+            const uint32_t r = gen.random();
+            const double u = (r & ((1u << 24) - 1)) * std::ldexp(1.0, -24);
+            data[i] = u < static_cast<double>(data[i]) ? 1.0f : 0.0f;
+        }
+        return self;
+    }
 
     dispatch_floating(self.dtype(), [&](auto tag) {
         using scalar_t = decltype(tag);
@@ -278,9 +292,12 @@ Tensor& normal_inplace_kernel(Tensor& self, double mean, double std) {
                 }
             }
         } else {
-            // Half/BFloat16: sample in float precision through a stack buffer.
+            // Match native CPU normal_: Half/BFloat16 keep the storage dtype
+            // at every Box-Muller operation, including the inplace entrypoint.
             if (size >= 16 && self.is_contiguous()) {
-                normal_fill_cast<scalar_t>(data, size, mean, std, &gen);
+                normal_fill<scalar_t>(data, size,
+                                      static_cast<scalar_t>(mean),
+                                      static_cast<scalar_t>(std), &gen);
             } else {
                 normal_distribution<double> dist(mean, std);
                 for (int64_t i = 0; i < size; ++i) {
@@ -318,18 +335,27 @@ Tensor& uniform_kernel(Tensor& self, double from, double to) {
 
     dispatch_floating(self.dtype(), [&](auto tag) {
         using scalar_t = decltype(tag);
-        using math_t = opmath_t<scalar_t>;
         scalar_t* data = self.data_ptr<scalar_t>();
-        const math_t lo = static_cast<math_t>(from);
-        const math_t hi = static_cast<math_t>(to);
-        const scalar_t to_scalar = static_cast<scalar_t>(to);
-        const scalar_t from_scalar = static_cast<scalar_t>(from);
-        uniform_real_distribution<math_t> dist(lo, hi);
-        for (int64_t i = 0; i < n; ++i) {
-            math_t value = static_cast<math_t>(dist(&gen));
-            // Clamp if the cast rounded up to the upper bound.
-            data[i] = static_cast<scalar_t>(value) == to_scalar ? from_scalar
-                                                                : static_cast<scalar_t>(value);
+        if constexpr (std::is_same_v<scalar_t, float>) {
+            // torch parity: CPU float uniform_ consumes one random32 per
+            // element, masks to the float mantissa, and accumulates in
+            // acc_type<float> = double before storing back.
+            for (int64_t i = 0; i < n; ++i) {
+                const uint32_t r = gen.random();
+                const double x = (r & ((1u << 24) - 1)) *
+                                 std::ldexp(1.0, -24);
+                data[i] = static_cast<scalar_t>(x * (to - from) + from);
+            }
+        } else {
+            // Native CPU uniform_ constructs the distribution with the
+            // storage dtype for Half/BFloat16.  Using opmath_t here changes
+            // the mantissa mask from 11/8 bits to float's 24 bits and breaks
+            // exact seeded parity.
+            uniform_real_distribution<scalar_t> dist(
+                static_cast<scalar_t>(from), static_cast<scalar_t>(to));
+            for (int64_t i = 0; i < n; ++i) {
+                data[i] = static_cast<scalar_t>(dist(&gen));
+            }
         }
     });
     return self;

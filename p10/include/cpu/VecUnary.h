@@ -80,6 +80,28 @@ inline bool f16c_available() {
 #endif
 }
 
+// Zen4-class machines: full-width 512-bit datapath.  Runtime-checked; the
+// 512-bit kernels below carry their own target attributes so p10 keeps
+// compiling without global ISA flags.
+inline bool avx512_available() {
+#if defined(TP_VECUNARY_X86)
+    static const bool ok = __builtin_cpu_supports("avx512f") != 0 &&
+                           __builtin_cpu_supports("avx512vl") != 0 &&
+                           __builtin_cpu_supports("avx512dq") != 0;
+    return ok;
+#else
+    return false;
+#endif
+}
+
+// f64 kernels whose scalar reference rounds intermediates through float
+// (double(float(x)) games); they stay on the AVX2 path which already
+// reproduces those semantics lane-for-lane.
+inline bool f64_rounding_sensitive(VOp op) {
+    return op == VOp::Elu || op == VOp::Softplus || op == VOp::LeakyRelu ||
+           op == VOp::Celu || op == VOp::Hardswish || op == VOp::Hardsigmoid;
+}
+
 // ---------------------------------------------------------------------------
 // libmvec declarations (glibc >= 2.35 ships these inside libm/libmvec; p10
 // already links libmvec for the stax fused kernels).
@@ -127,6 +149,49 @@ __m256d _ZGVdN4v_sin(__m256d);
 __m256d _ZGVdN4v_sinh(__m256d);
 __m256d _ZGVdN4v_tan(__m256d);
 __m256d _ZGVdN4v_tanh(__m256d);
+
+// AVX-512 widths (Zen4 native); same glibc vector ABI.
+__m512 _ZGVeN16v_acosf(__m512);
+__m512 _ZGVeN16v_acoshf(__m512);
+__m512 _ZGVeN16v_asinf(__m512);
+__m512 _ZGVeN16v_asinhf(__m512);
+__m512 _ZGVeN16v_atanf(__m512);
+__m512 _ZGVeN16v_atanhf(__m512);
+__m512 _ZGVeN16v_cosf(__m512);
+__m512 _ZGVeN16v_coshf(__m512);
+__m512 _ZGVeN16v_erff(__m512);
+__m512 _ZGVeN16v_erfcf(__m512);
+__m512 _ZGVeN16v_expf(__m512);
+__m512 _ZGVeN16v_expm1f(__m512);
+__m512 _ZGVeN16v_logf(__m512);
+__m512 _ZGVeN16v_log10f(__m512);
+__m512 _ZGVeN16v_log1pf(__m512);
+__m512 _ZGVeN16v_log2f(__m512);
+__m512 _ZGVeN16v_sinf(__m512);
+__m512 _ZGVeN16v_sinhf(__m512);
+__m512 _ZGVeN16v_tanf(__m512);
+__m512 _ZGVeN16v_tanhf(__m512);
+
+__m512d _ZGVeN8v_acos(__m512d);
+__m512d _ZGVeN8v_acosh(__m512d);
+__m512d _ZGVeN8v_asin(__m512d);
+__m512d _ZGVeN8v_asinh(__m512d);
+__m512d _ZGVeN8v_atan(__m512d);
+__m512d _ZGVeN8v_atanh(__m512d);
+__m512d _ZGVeN8v_cos(__m512d);
+__m512d _ZGVeN8v_cosh(__m512d);
+__m512d _ZGVeN8v_erf(__m512d);
+__m512d _ZGVeN8v_erfc(__m512d);
+__m512d _ZGVeN8v_exp(__m512d);
+__m512d _ZGVeN8v_expm1(__m512d);
+__m512d _ZGVeN8v_log(__m512d);
+__m512d _ZGVeN8v_log10(__m512d);
+__m512d _ZGVeN8v_log1p(__m512d);
+__m512d _ZGVeN8v_log2(__m512d);
+__m512d _ZGVeN8v_sin(__m512d);
+__m512d _ZGVeN8v_sinh(__m512d);
+__m512d _ZGVeN8v_tan(__m512d);
+__m512d _ZGVeN8v_tanh(__m512d);
 }
 #endif // TP_VECUNARY_LIBMVEC
 
@@ -307,6 +372,17 @@ inline __m256d v_lgamma_pos_f64(__m256d x) {
     return _mm256_sub_pd(res, _mm256_and_pd(small, _ZGVdN4v_log(x)));
 }
 
+// Reciprocal via rcp + Newton-Raphson refinements: _mm256_rcp_ps seeds at
+// ~1.5*2^-12 rel err, two NR steps land well under float ulp -- a drop-in
+// for divps when the numerator is a vector (silu) or the inf/NaN corners
+// are repaired explicitly (sigmoid).
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256 v_rcp_nr_ps(__m256 d) {
+    __m256 r = _mm256_rcp_ps(d);
+    r = _mm256_mul_ps(r, _mm256_fnmadd_ps(d, r, _mm256_set1_ps(2.0f)));
+    return _mm256_mul_ps(r, _mm256_fnmadd_ps(d, r, _mm256_set1_ps(2.0f)));
+}
+
 // Applies op to one AVX2 float vector.  Always-inline: only ever folded into
 // target-attributed callers below.
 __attribute__((target("avx2,fma"), always_inline))
@@ -356,8 +432,17 @@ inline __m256 apply_f32(VOp op, VParams prm, __m256 x) {
             // Callers guarantee all lanes > 0 here.
             return v_lgamma_pos_f32(x);
         }
-        case VOp::Sigmoid:
-            return _mm256_div_ps(one, _mm256_add_ps(one, _ZGVdN8v_expf(_mm256_xor_ps(x, signbit))));
+        case VOp::Sigmoid: {
+            // rcp+NR instead of divps.  Division corners reproduced: den==inf
+            // (x <= -88.7, exp overflowed) must yield +0 like 1/inf, and a NaN
+            // denominator must stay NaN -- hence the two mask repairs.
+            __m256 den = _mm256_add_ps(one, _ZGVdN8v_expf(_mm256_xor_ps(x, signbit)));
+            __m256 r = v_rcp_nr_ps(den);
+            __m256 not_inf = _mm256_cmp_ps(den, _mm256_set1_ps(INFINITY), _CMP_NEQ_OQ);
+            __m256 zeroed = _mm256_and_ps(not_inf, r);
+            __m256 is_nan = _mm256_cmp_ps(den, den, _CMP_UNORD_Q);
+            return _mm256_blendv_ps(zeroed, r, is_nan);
+        }
         case VOp::GeluNone: {
             const __m256 kAlpha = _mm256_set1_ps(static_cast<float>(0.70710678118654752440));
             __m256 cdf = _mm256_add_ps(one, _ZGVdN8v_erff(_mm256_mul_ps(kAlpha, x)));
@@ -372,8 +457,11 @@ inline __m256 apply_f32(VOp op, VParams prm, __m256 x) {
             return _mm256_mul_ps(_mm256_mul_ps(_mm256_set1_ps(0.5f), x), cdf);
         }
         case VOp::Silu: {
+            // x * rcp_nr(den) matches x/den bit-for-bit in every corner here:
+            // den==inf makes the NR chain NaN exactly like -inf/+inf division,
+            // and finite dens get a float-exact reciprocal.
             __m256 den = _mm256_add_ps(one, _ZGVdN8v_expf(_mm256_xor_ps(x, signbit)));
-            return _mm256_div_ps(x, den);
+            return _mm256_mul_ps(x, v_rcp_nr_ps(den));
         }
         case VOp::Mish: {
             // Mirrors the scalar kernel: log((1 + exp(x))) * tanh(...) — plain
@@ -646,9 +734,364 @@ static void half_chunk_avx2(VOp op, VParams prm, const uint16_t* src, uint16_t* 
     }
 }
 
+// ---------------------------------------------------------------------------
+// AVX-512 layer (Zen4 native width).  Same formulas as the AVX2 kernels
+// above -- only the register width changes -- so results stay lane-identical
+// with the scalar fallbacks that mirror ATen.
+// ---------------------------------------------------------------------------
+constexpr float kSignBitF512 = -0.0f;  // (shared constant, kept for clarity)
+
+__attribute__((target("avx512f,avx512dq"), always_inline))
+inline __m512 v_lgamma_pos_f32_512(__m512 x) {
+    const __m512 one = _mm512_set1_ps(1.0f);
+    const __mmask16 small = _mm512_cmp_ps_mask(x, one, _CMP_LT_OQ);
+    const __m512 xp = _mm512_add_ps(x, _mm512_maskz_mov_ps(small, one));
+
+    __m512 z = _mm512_sub_ps(xp, one);
+    __m512 series = _mm512_set1_ps(static_cast<float>(kLanczos[0]));
+#pragma GCC unroll 8
+    for (int i = 1; i < 9; ++i) {
+        __m512 denom = _mm512_add_ps(z, _mm512_set1_ps(static_cast<float>(i)));
+        series = _mm512_fmadd_ps(_mm512_set1_ps(static_cast<float>(kLanczos[i])),
+                                 _mm512_div_ps(one, denom), series);
+    }
+    __m512 t = _mm512_add_ps(z, _mm512_set1_ps(7.5f));
+    __m512 res = _mm512_sub_ps(
+        _mm512_fmadd_ps(_mm512_add_ps(z, _mm512_set1_ps(0.5f)),
+                        _ZGVeN16v_logf(t), _mm512_set1_ps(static_cast<float>(kHalfLogTwoPi))),
+        t);
+    res = _mm512_add_ps(res, _ZGVeN16v_logf(series));
+    return _mm512_sub_ps(res, _mm512_maskz_mov_ps(small, _ZGVeN16v_logf(x)));
+}
+
+__attribute__((target("avx512f,avx512dq"), always_inline))
+inline __m512d v_lgamma_pos_f64_512(__m512d x) {
+    const __m512d one = _mm512_set1_pd(1.0);
+    const __mmask8 small = _mm512_cmp_pd_mask(x, one, _CMP_LT_OQ);
+    const __m512d xp = _mm512_add_pd(x, _mm512_maskz_mov_pd(small, one));
+
+    __m512d z = _mm512_sub_pd(xp, one);
+    __m512d series = _mm512_set1_pd(kLanczos[0]);
+#pragma GCC unroll 8
+    for (int i = 1; i < 9; ++i) {
+        __m512d denom = _mm512_add_pd(z, _mm512_set1_pd(static_cast<double>(i)));
+        series = _mm512_fmadd_pd(_mm512_set1_pd(kLanczos[i]),
+                                 _mm512_div_pd(one, denom), series);
+    }
+    __m512d t = _mm512_add_pd(z, _mm512_set1_pd(7.5));
+    __m512d res = _mm512_sub_pd(
+        _mm512_fmadd_pd(_mm512_add_pd(z, _mm512_set1_pd(0.5)),
+                        _ZGVeN8v_log(t), _mm512_set1_pd(kHalfLogTwoPi)),
+        t);
+    res = _mm512_add_pd(res, _ZGVeN8v_log(series));
+    return _mm512_sub_pd(res, _mm512_maskz_mov_pd(small, _ZGVeN8v_log(x)));
+}
+
+// Softplus: numerator stays float; the /beta happens in double with one
+// final round back to float, matching scalar_apply's mixed precision.
+__attribute__((target("avx512f,avx512dq"), always_inline))
+inline __m256 softplus_div_beta_8(__m256 v8, double beta) {
+    const __m512d beta_d8 = _mm512_set1_pd(beta);
+    __m512d w8 = _mm512_div_pd(_mm512_cvtps_pd(v8), beta_d8);
+    __m128 flo = _mm256_cvtpd_ps(_mm512_castpd512_pd256(w8));
+    __m128 fhi = _mm256_cvtpd_ps(_mm512_extractf64x4_pd(w8, 1));
+    return _mm256_insertf128_ps(_mm256_castps128_ps256(flo), fhi, 1);
+}
+
+// rcp14 seeds at <=2^-14; one NR step reaches ~2^-28, i.e. float-exact for
+// the sigmoid/silu denominators seen here.
+__attribute__((target("avx512f"), always_inline))
+inline __m512 v_rcp_nr_ps(__m512 d) {
+    __m512 r = _mm512_rcp14_ps(d);
+    return _mm512_mul_ps(r, _mm512_fnmadd_ps(d, r, _mm512_set1_ps(2.0f)));
+}
+
+__attribute__((target("avx512f,avx512dq"), always_inline))
+inline __m512 apply16_f32(VOp op, VParams prm, __m512 x) {
+    const __m512 one = _mm512_set1_ps(1.0f);
+    const __m512 zero = _mm512_setzero_ps();
+    const __m512 signbit = _mm512_set1_ps(kSignBitF512);
+    switch (op) {
+        case VOp::Abs: return _mm512_andnot_ps(signbit, x);
+        case VOp::Neg: return _mm512_xor_ps(x, signbit);
+        case VOp::Sign: {
+            const __m512 minus_one = _mm512_set1_ps(-1.0f);
+            __m512 r = _mm512_mask_mov_ps(zero,
+                                          _mm512_cmp_ps_mask(x, zero, _CMP_LT_OQ),
+                                          minus_one);
+            return _mm512_mask_mov_ps(r,
+                                      _mm512_cmp_ps_mask(x, zero, _CMP_GT_OQ),
+                                      one);
+        }
+        case VOp::Square: return _mm512_mul_ps(x, x);
+        case VOp::Reciprocal: return _mm512_div_ps(one, x);
+        case VOp::Sqrt: return _mm512_sqrt_ps(x);
+        case VOp::Rsqrt: return _mm512_div_ps(one, _mm512_sqrt_ps(x));
+        case VOp::Floor: return _mm512_floor_ps(x);
+        case VOp::Ceil: return _mm512_ceil_ps(x);
+        case VOp::Trunc: return _mm512_roundscale_ps(x, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC);
+        case VOp::Round: return _mm512_roundscale_ps(x, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+        case VOp::Frac: return _mm512_sub_ps(x, _mm512_roundscale_ps(x, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC));
+        case VOp::Relu: return _mm512_max_ps(zero, x);
+        case VOp::Exp: return _ZGVeN16v_expf(x);
+        case VOp::Expm1: return _ZGVeN16v_expm1f(x);
+        case VOp::Log: return _ZGVeN16v_logf(x);
+        case VOp::Log2: return _ZGVeN16v_log2f(x);
+        case VOp::Log10: return _ZGVeN16v_log10f(x);
+        case VOp::Log1p: return _ZGVeN16v_log1pf(x);
+        case VOp::Sin: return _ZGVeN16v_sinf(x);
+        case VOp::Cos: return _ZGVeN16v_cosf(x);
+        case VOp::Tan: return _ZGVeN16v_tanf(x);
+        case VOp::Asin: return _ZGVeN16v_asinf(x);
+        case VOp::Acos: return _ZGVeN16v_acosf(x);
+        case VOp::Atan: return _ZGVeN16v_atanf(x);
+        case VOp::Sinh: return _ZGVeN16v_sinhf(x);
+        case VOp::Cosh: return _ZGVeN16v_coshf(x);
+        case VOp::Tanh: return _ZGVeN16v_tanhf(x);
+        case VOp::Asinh: return _ZGVeN16v_asinhf(x);
+        case VOp::Acosh: return _ZGVeN16v_acoshf(x);
+        case VOp::Atanh: return _ZGVeN16v_atanhf(x);
+        case VOp::Erf: return _ZGVeN16v_erff(x);
+        case VOp::Erfc: return _ZGVeN16v_erfcf(x);
+        case VOp::Lgamma:
+            return v_lgamma_pos_f32_512(x);
+        case VOp::Sigmoid: {
+            // rcp14+NR instead of divps; see the 256-bit Sigmoid note for the
+            // inf/NaN corner repairs.
+            __m512 den = _mm512_add_ps(one, _ZGVeN16v_expf(_mm512_xor_ps(x, signbit)));
+            __m512 r = v_rcp_nr_ps(den);
+            __m512 zeroed = _mm512_maskz_mov_ps(
+                _mm512_cmp_ps_mask(den, _mm512_set1_ps(INFINITY), _CMP_NEQ_OQ), r);
+            return _mm512_mask_mov_ps(zeroed, _mm512_cmp_ps_mask(den, den, _CMP_UNORD_Q), r);
+        }
+        case VOp::GeluNone: {
+            const __m512 kAlpha = _mm512_set1_ps(static_cast<float>(0.70710678118654752440));
+            __m512 cdf = _mm512_add_ps(one, _ZGVeN16v_erff(_mm512_mul_ps(kAlpha, x)));
+            return _mm512_mul_ps(_mm512_mul_ps(_mm512_set1_ps(0.5f), x), cdf);
+        }
+        case VOp::GeluTanh: {
+            const __m512 kBeta = _mm512_set1_ps(static_cast<float>(1.41421356237309504880 * 1.12837916709551257390 * 0.5));
+            const __m512 kKappa = _mm512_set1_ps(0.044715f);
+            __m512 x_cube = _mm512_mul_ps(_mm512_mul_ps(x, x), x);
+            __m512 inner = _mm512_mul_ps(kBeta, _mm512_add_ps(x, _mm512_mul_ps(kKappa, x_cube)));
+            __m512 cdf = _mm512_add_ps(one, _ZGVeN16v_tanhf(inner));
+            return _mm512_mul_ps(_mm512_mul_ps(_mm512_set1_ps(0.5f), x), cdf);
+        }
+        case VOp::Silu: {
+            // x * rcp14_nr(den): corner-equivalent to x/den (see 256-bit note).
+            __m512 den = _mm512_add_ps(one, _ZGVeN16v_expf(_mm512_xor_ps(x, signbit)));
+            return _mm512_mul_ps(x, v_rcp_nr_ps(den));
+        }
+        case VOp::Mish: {
+            __m512 sp = _ZGVeN16v_logf(_mm512_add_ps(one, _ZGVeN16v_expf(x)));
+            return _mm512_mul_ps(x, _ZGVeN16v_tanhf(sp));
+        }
+        case VOp::Selu: {
+            const __m512 lambda = _mm512_set1_ps(static_cast<float>(1.0507009873554804934193349852946));
+            const __m512 alphalambda = _mm512_set1_ps(static_cast<float>(1.6732632423543772848170429916717 * 1.0507009873554804934193349852946));
+            __m512 pos = _mm512_mul_ps(x, lambda);
+            __m512 neg = _mm512_mul_ps(alphalambda, _ZGVeN16v_expm1f(x));
+            return _mm512_mask_mov_ps(neg, _mm512_cmp_ps_mask(x, zero, _CMP_GT_OQ), pos);
+        }
+        case VOp::Elu: {
+            const __m512 negcoef = _mm512_set1_ps(static_cast<float>(prm.p0));
+            const __m512 poscoef = _mm512_set1_ps(prm.p1);
+            const __m512 negipt = _mm512_set1_ps(prm.p2);
+            __m512 scaled = _mm512_mul_ps(x, negipt);
+            __m512 neg = _mm512_mul_ps(_ZGVeN16v_expm1f(scaled), negcoef);
+            __m512 pos = _mm512_mul_ps(x, poscoef);
+            return _mm512_mask_mov_ps(neg, _mm512_cmp_ps_mask(x, zero, _CMP_GE_OQ), pos);
+        }
+        case VOp::Softplus: {
+            // Scalar path: numerator computed in float (log1p(exp(float(x*beta)))),
+            // division by beta in double, one final round back to T.
+            const __m512 beta = _mm512_set1_ps(static_cast<float>(prm.p0));
+            const __m512 threshold = _mm512_set1_ps(static_cast<float>(prm.p1));
+            __m512 bx = _mm512_mul_ps(x, beta);
+            __m512 numf = _ZGVeN16v_log1pf(_ZGVeN16v_expf(bx));
+            __m256 sp_lo = softplus_div_beta_8(_mm512_castps512_ps256(numf), prm.p0);
+            __m256 sp_hi = softplus_div_beta_8(_mm512_extractf32x8_ps(numf, 1), prm.p0);
+            __m512 sp = _mm512_insertf32x8(_mm512_castps256_ps512(sp_lo), sp_hi, 1);
+            return _mm512_mask_mov_ps(sp, _mm512_cmp_ps_mask(bx, threshold, _CMP_GT_OQ), x);
+        }
+        case VOp::Hardswish: {
+            const __m512 three = _mm512_set1_ps(3.0f);
+            const __m512 six = _mm512_set1_ps(6.0f);
+            __m512 y = _mm512_add_ps(x, three);
+            y = _mm512_min_ps(_mm512_max_ps(y, zero), six);
+            return _mm512_div_ps(_mm512_mul_ps(x, y), six);
+        }
+        case VOp::Hardsigmoid: {
+            const __m512 three = _mm512_set1_ps(3.0f);
+            const __m512 six = _mm512_set1_ps(6.0f);
+            __m512 y = _mm512_add_ps(x, three);
+            y = _mm512_min_ps(_mm512_max_ps(y, zero), six);
+            return _mm512_div_ps(y, six);
+        }
+        case VOp::LeakyRelu: {
+            const __m512 slope = _mm512_set1_ps(static_cast<float>(prm.p0));
+            __m512 neg = _mm512_mul_ps(slope, x);
+            return _mm512_mask_mov_ps(x, _mm512_cmp_ps_mask(x, zero, _CMP_LT_OQ), neg);
+        }
+        case VOp::Hardtanh: {
+            const __m512 lo = _mm512_set1_ps(static_cast<float>(prm.p0));
+            const __m512 hi = _mm512_set1_ps(static_cast<float>(prm.p1));
+            return _mm512_min_ps(_mm512_max_ps(x, lo), hi);
+        }
+        case VOp::Relu6:
+            return _mm512_min_ps(_mm512_max_ps(x, zero), _mm512_set1_ps(6.0f));
+        case VOp::Celu: {
+            const __m512 a = _mm512_set1_ps(static_cast<float>(prm.p0));
+            __m512 neg = _mm512_mul_ps(a, _ZGVeN16v_expm1f(_mm512_div_ps(x, a)));
+            __m512 pos = _mm512_max_ps(zero, x);
+            __m512 minneg = _mm512_min_ps(neg, zero);
+            return _mm512_add_ps(pos, minneg);
+        }
+        default: return x;
+    }
+}
+
+__attribute__((target("avx512f,avx512dq"), noinline))
+static void f32_chunk_avx512(VOp op, VParams prm, const float* src, float* dst, int64_t b, int64_t e) {
+    src += b;
+    dst += b;
+    int64_t n = e - b;
+    int64_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m512 x = _mm512_loadu_ps(src + i);
+        if (op == VOp::Lgamma && _mm512_cmplt_ps_mask(x, _mm512_setzero_ps())) {
+            for (int64_t j = i; j < i + 16; ++j) dst[j] = scalar_apply(op, prm, src[j]);
+        } else {
+            _mm512_storeu_ps(dst + i, apply16_f32(op, prm, x));
+        }
+    }
+    for (; i < n; ++i) dst[i] = scalar_apply(op, prm, src[i]);
+}
+
+__attribute__((target("avx512f,avx512dq"), always_inline))
+inline __m512d apply16_f64(VOp op, VParams prm, __m512d x) {
+    const __m512d one = _mm512_set1_pd(1.0);
+    const __m512d zero = _mm512_setzero_pd();
+    const __m512d signbit = _mm512_set1_pd(-0.0);
+    switch (op) {
+        case VOp::Abs: return _mm512_andnot_pd(signbit, x);
+        case VOp::Neg: return _mm512_xor_pd(x, signbit);
+        case VOp::Sign: {
+            const __m512d minus_one = _mm512_set1_pd(-1.0);
+            __m512d r = _mm512_mask_mov_pd(zero,
+                                           _mm512_cmp_pd_mask(x, zero, _CMP_LT_OQ),
+                                           minus_one);
+            return _mm512_mask_mov_pd(r,
+                                      _mm512_cmp_pd_mask(x, zero, _CMP_GT_OQ),
+                                      one);
+        }
+        case VOp::Square: return _mm512_mul_pd(x, x);
+        case VOp::Reciprocal: return _mm512_div_pd(one, x);
+        case VOp::Sqrt: return _mm512_sqrt_pd(x);
+        case VOp::Rsqrt: return _mm512_div_pd(one, _mm512_sqrt_pd(x));
+        case VOp::Floor: return _mm512_floor_pd(x);
+        case VOp::Ceil: return _mm512_ceil_pd(x);
+        case VOp::Trunc: return _mm512_roundscale_pd(x, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC);
+        case VOp::Round: return _mm512_roundscale_pd(x, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+        case VOp::Frac: return _mm512_sub_pd(x, _mm512_roundscale_pd(x, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC));
+        case VOp::Relu: return _mm512_max_pd(zero, x);
+        case VOp::Exp: return _ZGVeN8v_exp(x);
+        case VOp::Expm1: return _ZGVeN8v_expm1(x);
+        case VOp::Log: return _ZGVeN8v_log(x);
+        case VOp::Log2: return _ZGVeN8v_log2(x);
+        case VOp::Log10: return _ZGVeN8v_log10(x);
+        case VOp::Log1p: return _ZGVeN8v_log1p(x);
+        case VOp::Sin: return _ZGVeN8v_sin(x);
+        case VOp::Cos: return _ZGVeN8v_cos(x);
+        case VOp::Tan: return _ZGVeN8v_tan(x);
+        case VOp::Asin: return _ZGVeN8v_asin(x);
+        case VOp::Acos: return _ZGVeN8v_acos(x);
+        case VOp::Atan: return _ZGVeN8v_atan(x);
+        case VOp::Sinh: return _ZGVeN8v_sinh(x);
+        case VOp::Cosh: return _ZGVeN8v_cosh(x);
+        case VOp::Tanh: return _ZGVeN8v_tanh(x);
+        case VOp::Asinh: return _ZGVeN8v_asinh(x);
+        case VOp::Acosh: return _ZGVeN8v_acosh(x);
+        case VOp::Atanh: return _ZGVeN8v_atanh(x);
+        case VOp::Erf: return _ZGVeN8v_erf(x);
+        case VOp::Erfc: return _ZGVeN8v_erfc(x);
+        case VOp::Lgamma: return v_lgamma_pos_f64_512(x);
+        case VOp::Sigmoid:
+            return _mm512_div_pd(one, _mm512_add_pd(one, _ZGVeN8v_exp(_mm512_xor_pd(x, signbit))));
+        case VOp::GeluNone: {
+            const __m512d kAlpha = _mm512_set1_pd(0.70710678118654752440);
+            __m512d cdf = _mm512_add_pd(one, _ZGVeN8v_erf(_mm512_mul_pd(kAlpha, x)));
+            return _mm512_mul_pd(_mm512_mul_pd(_mm512_set1_pd(0.5), x), cdf);
+        }
+        case VOp::GeluTanh: {
+            const __m512d kBeta = _mm512_set1_pd(1.41421356237309504880 * 1.12837916709551257390 * 0.5);
+            const __m512d kKappa = _mm512_set1_pd(0.044715);
+            __m512d x_cube = _mm512_mul_pd(_mm512_mul_pd(x, x), x);
+            __m512d inner = _mm512_mul_pd(kBeta, _mm512_add_pd(x, _mm512_mul_pd(kKappa, x_cube)));
+            __m512d cdf = _mm512_add_pd(one, _ZGVeN8v_tanh(inner));
+            return _mm512_mul_pd(_mm512_mul_pd(_mm512_set1_pd(0.5), x), cdf);
+        }
+        case VOp::Silu: {
+            __m512d den = _mm512_add_pd(one, _ZGVeN8v_exp(_mm512_xor_pd(x, signbit)));
+            return _mm512_div_pd(x, den);
+        }
+        case VOp::Mish: {
+            __m512d sp = _ZGVeN8v_log(_mm512_add_pd(one, _ZGVeN8v_exp(x)));
+            return _mm512_mul_pd(x, _ZGVeN8v_tanh(sp));
+        }
+        case VOp::Selu: {
+            const __m512d lambda = _mm512_set1_pd(1.0507009873554804934193349852946);
+            const __m512d alphalambda = _mm512_set1_pd(1.6732632423543772848170429916717 * 1.0507009873554804934193349852946);
+            __m512d pos = _mm512_mul_pd(x, lambda);
+            __m512d neg = _mm512_mul_pd(alphalambda, _ZGVeN8v_expm1(x));
+            return _mm512_mask_mov_pd(neg, _mm512_cmp_pd_mask(x, zero, _CMP_GT_OQ), pos);
+        }
+        case VOp::Hardswish: {
+            const __m512d three = _mm512_set1_pd(3.0);
+            const __m512d six = _mm512_set1_pd(6.0);
+            __m512d y = _mm512_add_pd(x, three);
+            y = _mm512_min_pd(_mm512_max_pd(y, zero), six);
+            return _mm512_div_pd(_mm512_mul_pd(x, y), six);
+        }
+        case VOp::Hardsigmoid: {
+            const __m512d three = _mm512_set1_pd(3.0);
+            const __m512d six = _mm512_set1_pd(6.0);
+            __m512d y = _mm512_add_pd(x, three);
+            y = _mm512_min_pd(_mm512_max_pd(y, zero), six);
+            return _mm512_div_pd(y, six);
+        }
+        case VOp::Hardtanh: {
+            const __m512d lo = _mm512_set1_pd(prm.p0);
+            const __m512d hi = _mm512_set1_pd(prm.p1);
+            return _mm512_min_pd(_mm512_max_pd(x, lo), hi);
+        }
+        case VOp::Relu6:
+            return _mm512_min_pd(_mm512_max_pd(x, zero), _mm512_set1_pd(6.0));
+        default: return x;
+    }
+}
+
+__attribute__((target("avx512f,avx512dq"), noinline))
+static void f64_chunk_avx512(VOp op, VParams prm, const double* src, double* dst, int64_t b, int64_t e) {
+    src += b;
+    dst += b;
+    int64_t n = e - b;
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m512d x = _mm512_loadu_pd(src + i);
+        if (op == VOp::Lgamma && _mm512_cmplt_pd_mask(x, _mm512_setzero_pd())) {
+            for (int64_t j = i; j < i + 8; ++j) dst[j] = scalar_apply(op, prm, src[j]);
+        } else {
+            _mm512_storeu_pd(dst + i, apply16_f64(op, prm, x));
+        }
+    }
+    for (; i < n; ++i) dst[i] = scalar_apply(op, prm, src[i]);
+}
+
 __attribute__((target("avx2,fma"), noinline))
 static void bf16_chunk_avx2(VOp op, VParams prm, const uint16_t* src, uint16_t* dst, int64_t b, int64_t e) {
     const __m256i shift = _mm256_set1_epi32(16);
+    (void)shift;
     src += b;
     dst += b;
     int64_t n = e - b;
@@ -685,6 +1128,16 @@ static void bf16_chunk_avx2(VOp op, VParams prm, const uint16_t* src, uint16_t* 
 // ---------------------------------------------------------------------------
 inline void run_f32(VOp op, VParams prm, const float* src, float* dst, int64_t b, int64_t e) {
 #ifdef TP_VECUNARY_LIBMVEC
+#if defined(CPU_CAPABILITY_AVX512)
+    // Tier-compiled copy: the ISA is guaranteed by the tier's -m flags, so
+    // the runtime CPUID branch disappears entirely.
+    f32_chunk_avx512(op, prm, src, dst, b, e);
+    return;
+#endif
+    if (avx512_available()) {
+        f32_chunk_avx512(op, prm, src, dst, b, e);
+        return;
+    }
     if (avx2_available()) {
         f32_chunk_avx2(op, prm, src, dst, b, e);
         return;
@@ -695,6 +1148,23 @@ inline void run_f32(VOp op, VParams prm, const float* src, float* dst, int64_t b
 
 inline void run_f64(VOp op, VParams prm, const double* src, double* dst, int64_t b, int64_t e) {
 #ifdef TP_VECUNARY_LIBMVEC
+#if defined(CPU_CAPABILITY_AVX512)
+    // Tier-compiled copy (see run_f32).  The f64_rounding_sensitive ops keep
+    // their AVX2-only contract: route them through the scalar loop here the
+    // same way the runtime path would.
+    if (!f64_rounding_sensitive(op)) {
+        f64_chunk_avx512(op, prm, src, dst, b, e);
+        return;
+    }
+    f64_chunk_avx2(op, prm, src, dst, b, e);
+    return;
+#endif
+    // Elu/Softplus/LeakyRelu/Celu keep double(float(x)) rounding semantics
+    // that only the AVX2 kernels reproduce; everything else goes 512-bit.
+    if (avx512_available() && !f64_rounding_sensitive(op)) {
+        f64_chunk_avx512(op, prm, src, dst, b, e);
+        return;
+    }
     if (avx2_available()) {
         f64_chunk_avx2(op, prm, src, dst, b, e);
         return;

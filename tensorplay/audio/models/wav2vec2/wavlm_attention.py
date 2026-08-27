@@ -25,13 +25,13 @@ SOFTWARE.
 import math
 from typing import Optional, Tuple
 
-import tensorplay as torch
-from torch import nn, Tensor
+import tensorplay as tensorplay
+from tensorplay import nn, Tensor
 
 
 class WavLMSelfAttention(nn.Module):
     """Multi-headed self-attention for WavLM model :cite:`chen2022wavlm`.
-    Wraps around ``torch.nn.MultiheadAttention``, creating relaive position embeddings and passing them to multi-headed
+    Wraps around ``tensorplay.nn.MultiheadAttention``, creating relaive position embeddings and passing them to multi-headed
     attention as a mask.
     Source: https://github.com/microsoft/unilm/blob/2d8302f09c99bca2b82e6e868d81d4281cceebc8/wavlm/modules.py#L303-L763
 
@@ -79,7 +79,7 @@ class WavLMSelfAttention(nn.Module):
         self.gru_rel_pos = gru_rel_pos
         if self.gru_rel_pos:
             self.gru_rel_pos_linear = nn.Linear(self.head_dim, 8)
-            self.gru_rel_pos_const = nn.Parameter(torch.ones(1, num_heads, 1, 1))
+            self.gru_rel_pos_const = nn.Parameter(tensorplay.ones(1, num_heads, 1, 1))
         self.has_position_bias = True
 
     def compute_bias(self, query_length: int, key_length: int) -> Tensor:
@@ -90,8 +90,8 @@ class WavLMSelfAttention(nn.Module):
         Returns:
             Tensor of shape `(num_heads, query_length, key_length)`, relative positions embeddings
         """
-        context_position = torch.arange(query_length, dtype=torch.long)[:, None]
-        memory_position = torch.arange(key_length, dtype=torch.long)[None, :]
+        context_position = tensorplay.arange(query_length, dtype=tensorplay.long)[:, None]
+        memory_position = tensorplay.arange(key_length, dtype=tensorplay.long)[None, :]
         relative_position = memory_position - context_position  # Shape (query_length, key_length)
         relative_position_bucket = self._relative_positions_bucket(relative_position, bidirectional=True)
         relative_position_bucket = relative_position_bucket.to(self.rel_attn_embed.weight.device)
@@ -114,28 +114,28 @@ class WavLMSelfAttention(nn.Module):
         num_buckets = self.num_buckets
         max_distance = self.max_distance
         # Shape (query_length, key_length)
-        relative_buckets = torch.zeros_like(relative_positions, dtype=torch.long)
+        relative_buckets = tensorplay.zeros_like(relative_positions, dtype=tensorplay.long)
 
         if bidirectional:
             num_buckets = num_buckets // 2
-            relative_buckets += (relative_positions > 0).to(torch.long) * num_buckets
-            relative_positions = torch.abs(relative_positions)
+            relative_buckets += (relative_positions > 0).to(tensorplay.long) * num_buckets
+            relative_positions = tensorplay.abs(relative_positions)
         else:
-            relative_positions = -torch.min(relative_positions, torch.zeros_like(relative_positions))
+            relative_positions = -tensorplay.min(relative_positions, tensorplay.zeros_like(relative_positions))
 
         max_exact = num_buckets // 2
         is_small = relative_positions < max_exact
 
         relative_postion_if_large = max_exact + (
-            torch.log(relative_positions.float() / max_exact)
+            tensorplay.log(relative_positions.float() / max_exact)
             / math.log(max_distance / max_exact)
             * (num_buckets - max_exact)
-        ).to(torch.long)
-        relative_postion_if_large = torch.min(
-            relative_postion_if_large, torch.full_like(relative_postion_if_large, num_buckets - 1)
+        ).to(tensorplay.long)
+        relative_postion_if_large = tensorplay.min(
+            relative_postion_if_large, tensorplay.full_like(relative_postion_if_large, num_buckets - 1)
         )
 
-        relative_buckets += torch.where(is_small, relative_positions, relative_postion_if_large)
+        relative_buckets += tensorplay.where(is_small, relative_positions, relative_postion_if_large)
         return relative_buckets
 
     def forward(
@@ -175,7 +175,7 @@ class WavLMSelfAttention(nn.Module):
                 query_layer = query.view(bsz, seq_len, self.num_heads, -1)
                 query_layer = query_layer.permute(0, 2, 1, 3)
 
-                gate_a, gate_b = torch.sigmoid(
+                gate_a, gate_b = tensorplay.sigmoid(
                     self.gru_rel_pos_linear(query_layer).view(bsz, self.num_heads, seq_len, 2, 4).sum(-1, keepdim=False)
                 ).chunk(2, dim=-1)
                 gate_a_1 = gate_a * (gate_b * self.gru_rel_pos_const - 1.0) + 2.0
@@ -185,23 +185,23 @@ class WavLMSelfAttention(nn.Module):
 
         if attn_mask_rel_pos is not None and key_padding_mask is not None:
             key_padding_mask = key_padding_mask.view(bsz, 1, 1, seq_len).expand(-1, self.num_heads, -1, -1)
-            key_padding_mask = torch.nn.functional._canonical_mask(
+            key_padding_mask = tensorplay.nn.functional._canonical_mask(
                 mask=key_padding_mask,
                 mask_name="key_padding_mask",
-                other_type=torch.nn.functional._none_or_dtype(attn_mask_rel_pos),
+                other_type=tensorplay.nn.functional._none_or_dtype(attn_mask_rel_pos),
                 other_name="",
                 target_type=query.dtype,
             )
         if attn_mask_rel_pos is not None and key_padding_mask is not None:
             attn_mask_rel_pos = attn_mask_rel_pos + key_padding_mask
-        query_projected = torch.nn.functional.linear(query, self.attention.in_proj_weight, self.attention.in_proj_bias)
+        query_projected = tensorplay.nn.functional.linear(query, self.attention.in_proj_weight, self.attention.in_proj_bias)
         query, key, value = query_projected.chunk(3, -1)
         shape = (bsz, seq_len, self.num_heads, self.head_dim)
         query = query.view(shape).transpose(2, 1)  # (batch, num_heads, seq_len, head_dim)
         key = key.view(shape).transpose(2, 1)  # (batch, num_heads, seq_len, head_dim)
         value = value.view(shape).transpose(2, 1)  # (batch, num_heads, seq_len, head_dim)
         dropout = self.dropout if self.training else 0.0
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
+        attn_output = tensorplay.nn.functional.scaled_dot_product_attention(
             query,
             key,
             value,

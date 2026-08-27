@@ -7,6 +7,31 @@
 #include <immintrin.h>
 #include "cpu/vec/vec_base.h"
 
+#if defined(CPU_CAPABILITY_AVX2) && defined(__GLIBC__)
+extern "C" {
+__m256d _ZGVdN4v_acos(__m256d);
+__m256d _ZGVdN4v_acosh(__m256d);
+__m256d _ZGVdN4v_asin(__m256d);
+__m256d _ZGVdN4v_asinh(__m256d);
+__m256d _ZGVdN4v_atan(__m256d);
+__m256d _ZGVdN4v_atanh(__m256d);
+__m256d _ZGVdN4v_cos(__m256d);
+__m256d _ZGVdN4v_cosh(__m256d);
+__m256d _ZGVdN4v_erf(__m256d);
+__m256d _ZGVdN4v_erfc(__m256d);
+__m256d _ZGVdN4v_exp2(__m256d);
+__m256d _ZGVdN4v_expm1(__m256d);
+__m256d _ZGVdN4v_log2(__m256d);
+__m256d _ZGVdN4v_log10(__m256d);
+__m256d _ZGVdN4v_log1p(__m256d);
+__m256d _ZGVdN4v_sin(__m256d);
+__m256d _ZGVdN4v_sinh(__m256d);
+__m256d _ZGVdN4v_tan(__m256d);
+}
+#endif
+
+#include "cpu/SpecialMath.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -125,9 +150,16 @@ struct Vectorized<double> {
         _mm256_set1_pd(-0.0), values); // clear sign bit
   }
   Vectorized<double> angle() const {
-    __m256d zero = _mm256_set1_pd(0.0);
-    return _mm256_cmp_pd(
-        values, zero, _CMP_LT_OQ); // zero for NaN and positive values
+    // ATen semantics: NaN -> NaN, negative -> pi, otherwise -> 0.
+    const auto zero_vec = _mm256_set1_pd(0.0);
+    const auto nan_vec = _mm256_set1_pd(std::numeric_limits<double>::quiet_NaN());
+    const auto not_nan_mask = _mm256_cmp_pd(values, values, _CMP_EQ_OQ);
+    const auto nan_mask = _mm256_cmp_pd(not_nan_mask, zero_vec, _CMP_EQ_OQ);
+    const auto pi = _mm256_set1_pd(3.141592653589793238463);
+    const auto neg_mask = _mm256_cmp_pd(values, zero_vec, _CMP_LT_OQ);
+    auto angle = _mm256_blendv_pd(zero_vec, pi, neg_mask);
+    angle = _mm256_blendv_pd(angle, nan_vec, nan_mask);
+    return angle;
   }
   Vectorized<double> real() const {
     return *this;
@@ -139,22 +171,46 @@ struct Vectorized<double> {
     return *this;
   }
   Vectorized<double> acos() const {
+    #if defined(__GLIBC__)
+    return _ZGVdN4v_acos(values);
+#else
     return map(std::acos);
+#endif
   }
   Vectorized<double> acosh() const {
+    #if defined(__GLIBC__)
+    return _ZGVdN4v_acosh(values);
+#else
     return map(std::acosh);
+#endif
   }
   Vectorized<double> asin() const {
+    #if defined(__GLIBC__)
+    return _ZGVdN4v_asin(values);
+#else
     return map(std::asin);
+#endif
   }
   Vectorized<double> asinh() const {
+    #if defined(__GLIBC__)
+    return _ZGVdN4v_asinh(values);
+#else
     return map(std::asinh);
+#endif
   }
   Vectorized<double> atan() const {
+    #if defined(__GLIBC__)
+    return _ZGVdN4v_atan(values);
+#else
     return map(std::atan);
+#endif
   }
   Vectorized<double> atanh() const {
+    #if defined(__GLIBC__)
+    return _ZGVdN4v_atanh(values);
+#else
     return map(std::atanh);
+#endif
   }
   Vectorized<double> atan2(const Vectorized<double>& exp) const {
     __at_align__ double tmp[size()];
@@ -173,19 +229,35 @@ struct Vectorized<double> {
         _mm256_and_pd(_mm256_set1_pd(-0.0), sign));
   }
   Vectorized<double> erf() const {
+    #if defined(__GLIBC__)
+    return _ZGVdN4v_erf(values);
+#else
     return map(std::erf);
+#endif
   }
   Vectorized<double> erfc() const {
+    #if defined(__GLIBC__)
+    return _ZGVdN4v_erfc(values);
+#else
     return map(std::erfc);
+#endif
   }
   Vectorized<double> exp() const {
     return map(std::exp);
   }
   Vectorized<double> exp2() const {
+    #if defined(__GLIBC__)
+    return _ZGVdN4v_exp2(values);
+#else
     return map(std::exp2);
+#endif
   }
   Vectorized<double> expm1() const {
+    #if defined(__GLIBC__)
+    return _ZGVdN4v_expm1(values);
+#else
     return map(std::expm1);
+#endif
   }
   Vectorized<double> exp_u20() const {
     return map(std::exp);
@@ -207,22 +279,42 @@ struct Vectorized<double> {
     return map(std::log);
   }
   Vectorized<double> log2() const {
+    #if defined(__GLIBC__)
+    return _ZGVdN4v_log2(values);
+#else
     return map(std::log2);
+#endif
   }
   Vectorized<double> log10() const {
+    #if defined(__GLIBC__)
+    return _ZGVdN4v_log10(values);
+#else
     return map(std::log10);
+#endif
   }
   Vectorized<double> log1p() const {
+    #if defined(__GLIBC__)
+    return _ZGVdN4v_log1p(values);
+#else
     return map(std::log1p);
+#endif
   }
   Vectorized<double> ceil() const {
     return _mm256_ceil_pd(values);
   }
   Vectorized<double> cos() const {
+    #if defined(__GLIBC__)
+    return _ZGVdN4v_cos(values);
+#else
     return map(std::cos);
+#endif
   }
   Vectorized<double> cosh() const {
+    #if defined(__GLIBC__)
+    return _ZGVdN4v_cosh(values);
+#else
     return map(std::cosh);
+#endif
   }
   Vectorized<double> floor() const {
     return _mm256_floor_pd(values);
@@ -253,13 +345,25 @@ struct Vectorized<double> {
         values, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
   }
   Vectorized<double> sin() const {
+    #if defined(__GLIBC__)
+    return _ZGVdN4v_sin(values);
+#else
     return map(std::sin);
+#endif
   }
   Vectorized<double> sinh() const {
+    #if defined(__GLIBC__)
+    return _ZGVdN4v_sinh(values);
+#else
     return map(std::sinh);
+#endif
   }
   Vectorized<double> tan() const {
+    #if defined(__GLIBC__)
+    return _ZGVdN4v_tan(values);
+#else
     return map(std::tan);
+#endif
   }
   Vectorized<double> tanh() const {
     return map(std::tanh);
@@ -269,6 +373,26 @@ struct Vectorized<double> {
   }
   Vectorized<double> lgamma() const {
     return map(std::lgamma);
+  }
+  Vectorized<double> digamma() const {
+    return map([](double v) { return calc_digamma(v); });
+  }
+  Vectorized<double> erfinv() const {
+    return map([](double v) { return calc_erfinv(v); });
+  }
+  Vectorized<double> igamma(const Vectorized<double>& x) const {
+    __at_align__ double tmp[size()];
+    __at_align__ double tmp_x[size()];
+    store(tmp); x.store(tmp_x);
+    for (const auto i : tensorplay::irange(size())) tmp[i] = calc_igamma(static_cast<double>(tmp[i]), static_cast<double>(tmp_x[i]));
+    return loadu(tmp);
+  }
+  Vectorized<double> igammac(const Vectorized<double>& x) const {
+    __at_align__ double tmp[size()];
+    __at_align__ double tmp_x[size()];
+    store(tmp); x.store(tmp_x);
+    for (const auto i : tensorplay::irange(size())) tmp[i] = calc_igammac(static_cast<double>(tmp[i]), static_cast<double>(tmp_x[i]));
+    return loadu(tmp);
   }
   Vectorized<double> sqrt() const {
     return _mm256_sqrt_pd(values);

@@ -5,7 +5,7 @@ import warnings
 from functools import partial
 from typing import Any, Optional
 
-import tensorplay as torch
+import tensorplay as tensorplay
 import tensorplay.nn as nn
 from tensorplay import Tensor
 
@@ -97,11 +97,11 @@ def _get_depths(alpha: float) -> list[int]:
     return [_round_to_multiple_of(depth * alpha, 8) for depth in depths]
 
 
-class MNASNet(torch.nn.Module):
+class MNASNet(tensorplay.nn.Module):
     """MNASNet, as described in https://arxiv.org/abs/1807.11626. This
     implements the B1 variant of the model.
     >>> model = MNASNet(1.0, num_classes=1000)
-    >>> x = torch.rand(1, 3, 224, 224)
+    >>> x = tensorplay.rand(1, 3, 224, 224)
     >>> y = model(x)
     >>> y.dim()
     2
@@ -248,7 +248,7 @@ class MNASNet0_75_Weights(WeightsEnum):
         transforms=partial(ImageClassification, crop_size=224, resize_size=232),
         meta={
             **_COMMON_META,
-            "recipe": "https://github.com/pytorch/vision/pull/6019",
+            "recipe": "https://github.com/tensorplay/vision/pull/6019",
             "num_params": 3170208,
             "_metrics": {
                 "ImageNet-1K": {
@@ -259,8 +259,8 @@ class MNASNet0_75_Weights(WeightsEnum):
             "_ops": 0.215,
             "_file_size": 12.303,
             "_docs": """
-                These weights were trained from scratch by using TorchVision's `new training recipe
-                <https://pytorch.org/blog/how-to-train-state-of-the-art-models-using-torchvision-latest-primitives/>`_.
+                These weights were trained from scratch by using TensorPlay Vision's `new training recipe
+                <https://tensorplay.org/blog/how-to-train-state-of-the-art-models-using-tensorplay.vision-latest-primitives/>`_.
             """,
         },
     )
@@ -294,7 +294,7 @@ class MNASNet1_3_Weights(WeightsEnum):
         transforms=partial(ImageClassification, crop_size=224, resize_size=232),
         meta={
             **_COMMON_META,
-            "recipe": "https://github.com/pytorch/vision/pull/6019",
+            "recipe": "https://github.com/tensorplay/vision/pull/6019",
             "num_params": 6282256,
             "_metrics": {
                 "ImageNet-1K": {
@@ -305,8 +305,8 @@ class MNASNet1_3_Weights(WeightsEnum):
             "_ops": 0.526,
             "_file_size": 24.246,
             "_docs": """
-                These weights were trained from scratch by using TorchVision's `new training recipe
-                <https://pytorch.org/blog/how-to-train-state-of-the-art-models-using-torchvision-latest-primitives/>`_.
+                These weights were trained from scratch by using TensorPlay Vision's `new training recipe
+                <https://tensorplay.org/blog/how-to-train-state-of-the-art-models-using-tensorplay.vision-latest-primitives/>`_.
             """,
         },
     )
@@ -333,19 +333,19 @@ def mnasnet0_5(*, weights: Optional[MNASNet0_5_Weights] = None, progress: bool =
     <https://arxiv.org/abs/1807.11626>`_ paper.
 
     Args:
-        weights (:class:`~torchvision.models.MNASNet0_5_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.MNASNet0_5_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.MNASNet0_5_Weights` below for
+            :class:`~tensorplay.vision.models.MNASNet0_5_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.mnasnet.MNASNet``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.mnasnet.MNASNet``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/mnasnet.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/mnasnet.py>`_
             for more details about this class.
 
-    .. autoclass:: torchvision.models.MNASNet0_5_Weights
+    .. autoclass:: tensorplay.vision.models.MNASNet0_5_Weights
         :members:
     """
     weights = MNASNet0_5_Weights.verify(weights)
@@ -361,19 +361,19 @@ def mnasnet0_75(*, weights: Optional[MNASNet0_75_Weights] = None, progress: bool
     <https://arxiv.org/abs/1807.11626>`_ paper.
 
     Args:
-        weights (:class:`~torchvision.models.MNASNet0_75_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.MNASNet0_75_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.MNASNet0_75_Weights` below for
+            :class:`~tensorplay.vision.models.MNASNet0_75_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.mnasnet.MNASNet``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.mnasnet.MNASNet``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/mnasnet.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/mnasnet.py>`_
             for more details about this class.
 
-    .. autoclass:: torchvision.models.MNASNet0_75_Weights
+    .. autoclass:: tensorplay.vision.models.MNASNet0_75_Weights
         :members:
     """
     weights = MNASNet0_75_Weights.verify(weights)
@@ -389,19 +389,19 @@ def mnasnet1_0(*, weights: Optional[MNASNet1_0_Weights] = None, progress: bool =
     <https://arxiv.org/abs/1807.11626>`_ paper.
 
     Args:
-        weights (:class:`~torchvision.models.MNASNet1_0_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.MNASNet1_0_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.MNASNet1_0_Weights` below for
+            :class:`~tensorplay.vision.models.MNASNet1_0_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.mnasnet.MNASNet``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.mnasnet.MNASNet``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/mnasnet.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/mnasnet.py>`_
             for more details about this class.
 
-    .. autoclass:: torchvision.models.MNASNet1_0_Weights
+    .. autoclass:: tensorplay.vision.models.MNASNet1_0_Weights
         :members:
     """
     weights = MNASNet1_0_Weights.verify(weights)
@@ -417,19 +417,19 @@ def mnasnet1_3(*, weights: Optional[MNASNet1_3_Weights] = None, progress: bool =
     <https://arxiv.org/abs/1807.11626>`_ paper.
 
     Args:
-        weights (:class:`~torchvision.models.MNASNet1_3_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.MNASNet1_3_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.MNASNet1_3_Weights` below for
+            :class:`~tensorplay.vision.models.MNASNet1_3_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.mnasnet.MNASNet``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.mnasnet.MNASNet``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/mnasnet.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/mnasnet.py>`_
             for more details about this class.
 
-    .. autoclass:: torchvision.models.MNASNet1_3_Weights
+    .. autoclass:: tensorplay.vision.models.MNASNet1_3_Weights
         :members:
     """
     weights = MNASNet1_3_Weights.verify(weights)

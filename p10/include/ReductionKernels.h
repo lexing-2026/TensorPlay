@@ -3,6 +3,7 @@
 #include "DispatchStub.h"
 #include "Tensor.h"
 
+#include "ErrorReporting.h"
 #include "Exception.h"
 
 #include <optional>
@@ -20,7 +21,7 @@ inline std::vector<int64_t> compute_reduction_shape(const Tensor& self, const st
         int64_t dim = d;
         if (dim < 0) dim += shape.size();
         if (dim < 0 || dim >= (int64_t)shape.size()) {
-             TP_THROW(RuntimeError, "Dimension out of range");
+             TP_THROW(IndexError, format_dim_range(shape.size(), d));
         }
         is_reduced[dim] = true;
     }
@@ -80,6 +81,16 @@ DECLARE_DISPATCH(argmin_fn, argmin_stub)
 
 using median_fn = Tensor (*)(const Tensor&);
 DECLARE_DISPATCH(median_fn, median_stub)
+
+// L2 norm is a hot reduction in Muon and in normalization-heavy models.
+// Keep it behind the same CPU capability dispatch as the other reductions so
+// AVX2/AVX512 copies can use their native Vectorized width without making the
+// generic dispatcher ISA-dependent.
+using norm_fn = Tensor (*)(const Tensor&, double);
+DECLARE_DISPATCH(norm_fn, norm_stub)
+
+using norm_dim_fn = Tensor (*)(const Tensor&, const std::vector<int64_t>&, double, bool);
+DECLARE_DISPATCH(norm_dim_fn, norm_dim_stub)
 
 } // namespace cpu
 } // namespace tensorplay

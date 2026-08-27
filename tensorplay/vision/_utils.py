@@ -1,6 +1,6 @@
 """Shared private helpers for ``tensorplay.vision``.
 
-Ported from torchvision/_utils.py (StrEnumMeta, StrEnum, sequence_to_str).
+Ported from tensorplay.vision/_utils.py (StrEnumMeta, StrEnum, sequence_to_str).
 """
 
 import enum

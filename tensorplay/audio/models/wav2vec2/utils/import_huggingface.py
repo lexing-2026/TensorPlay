@@ -1,10 +1,10 @@
-"""Import Hugging Face transformers's wav2vec2.0 pretrained weights to torchaudios's format.
+"""Import Hugging Face transformers's wav2vec2.0 pretrained weights to tensorplay.audios's format.
 """
 import logging
 from typing import Any, Dict
 
-import tensorplay as torch
-from torch.nn import Module
+import tensorplay as tensorplay
+from tensorplay.nn import Module
 
 from ..model import wav2vec2_model, Wav2Vec2Model, wavlm_model
 
@@ -84,7 +84,7 @@ def _build(config, original):
 
 def transform_wavlm_encoder_state(state: Dict[str, Any], encoder_num_layers: int):
     """Converts WavLM encoder state from HuggingFace format. In particular, concatenates linear projection weights and
-    biases to align with the structure of ``torch.nn.MultiheadAttention``.
+    biases to align with the structure of ``tensorplay.nn.MultiheadAttention``.
     """
     for i in range(encoder_num_layers):
         q_proj_bias = state.pop(f"layers.{i}.attention.q_proj.bias")
@@ -93,8 +93,8 @@ def transform_wavlm_encoder_state(state: Dict[str, Any], encoder_num_layers: int
         q_proj_weight = state.pop(f"layers.{i}.attention.q_proj.weight")
         k_proj_weight = state.pop(f"layers.{i}.attention.k_proj.weight")
         v_proj_weight = state.pop(f"layers.{i}.attention.v_proj.weight")
-        state[f"layers.{i}.attention.attention.in_proj_bias"] = torch.cat((q_proj_bias, k_proj_bias, v_proj_bias))
-        state[f"layers.{i}.attention.attention.in_proj_weight"] = torch.cat(
+        state[f"layers.{i}.attention.attention.in_proj_bias"] = tensorplay.cat((q_proj_bias, k_proj_bias, v_proj_bias))
+        state[f"layers.{i}.attention.attention.in_proj_weight"] = tensorplay.cat(
             (q_proj_weight, k_proj_weight, v_proj_weight)
         )
 
@@ -107,18 +107,18 @@ def import_huggingface_model(original: Module) -> Wav2Vec2Model:
     `Transformers <https://huggingface.co/transformers/>`_.
 
     Args:
-        original (torch.nn.Module): An instance of ``Wav2Vec2ForCTC`` from ``transformers``.
+        original (tensorplay.nn.Module): An instance of ``Wav2Vec2ForCTC`` from ``transformers``.
 
     Returns:
         Wav2Vec2Model: Imported model.
 
     Example
-        >>> from torchaudio.models.wav2vec2.utils import import_huggingface_model
+        >>> from tensorplay.audio.models.wav2vec2.utils import import_huggingface_model
         >>>
         >>> original = Wav2Vec2ForCTC.from_pretrained("facebook/wav2vec2-base-960h")
         >>> model = import_huggingface_model(original)
         >>>
-        >>> waveforms, _ = torchaudio.load("audio.wav")
+        >>> waveforms, _ = tensorplay.audio.load("audio.wav")
         >>> logits, _ = model(waveforms)
     """
     _LG.info("Importing model.")

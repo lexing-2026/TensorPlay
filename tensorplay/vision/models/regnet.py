@@ -6,8 +6,8 @@ from collections import OrderedDict
 from functools import partial
 from typing import Any, Callable, Optional
 
-import tensorplay as torch
-from torch import nn, Tensor
+import tensorplay as tensorplay
+from tensorplay import nn, Tensor
 
 from ..ops.misc import Conv2dNormActivation, SqueezeExcitation
 from ..transforms._presets import ImageClassification, InterpolationMode
@@ -240,9 +240,9 @@ class BlockParams:
         if w_a < 0 or w_0 <= 0 or w_m <= 1 or w_0 % 8 != 0:
             raise ValueError("Invalid RegNet settings")
         # Compute the block widths. Each stage has one unique block width
-        widths_cont = torch.arange(depth) * w_a + w_0
-        block_capacity = torch.round(torch.log(widths_cont / w_0) / math.log(w_m))
-        block_widths = (torch.round(torch.divide(w_0 * torch.pow(w_m, block_capacity), QUANT)) * QUANT).int().tolist()
+        widths_cont = tensorplay.arange(depth) * w_a + w_0
+        block_capacity = tensorplay.round(tensorplay.log(widths_cont / w_0) / math.log(w_m))
+        block_widths = (tensorplay.round(tensorplay.divide(w_0 * tensorplay.pow(w_m, block_capacity), QUANT)) * QUANT).int().tolist()
         num_stages = len(set(block_widths))
 
         # Convert to per stage parameters
@@ -255,7 +255,7 @@ class BlockParams:
         splits = [w != wp or r != rp for w, wp, r, rp in split_helper]
 
         stage_widths = [w for w, t in zip(block_widths, splits[:-1]) if t]
-        stage_depths = torch.diff(torch.tensor([d for d, t in enumerate(splits) if t])).int().tolist()
+        stage_depths = tensorplay.diff(tensorplay.tensor([d for d, t in enumerate(splits) if t])).int().tolist()
 
         strides = [STRIDE] * num_stages
         bottleneck_multipliers = [bottleneck_multiplier] * num_stages
@@ -424,7 +424,7 @@ class RegNet_Y_400MF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 4344144,
-            "recipe": "https://github.com/pytorch/vision/tree/main/references/classification#small-models",
+            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#small-models",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 74.046,
@@ -442,7 +442,7 @@ class RegNet_Y_400MF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 4344144,
-            "recipe": "https://github.com/pytorch/vision/issues/3995#new-recipe",
+            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 75.804,
@@ -452,9 +452,9 @@ class RegNet_Y_400MF_Weights(WeightsEnum):
             "_ops": 0.402,
             "_file_size": 16.806,
             "_docs": """
-                These weights improve upon the results of the original paper by using a modified version of TorchVision's
+                These weights improve upon the results of the original paper by using a modified version of TensorPlay Vision's
                 `new training recipe
-                <https://pytorch.org/blog/how-to-train-state-of-the-art-models-using-torchvision-latest-primitives/>`_.
+                <https://tensorplay.org/blog/how-to-train-state-of-the-art-models-using-tensorplay.vision-latest-primitives/>`_.
             """,
         },
     )
@@ -468,7 +468,7 @@ class RegNet_Y_800MF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 6432512,
-            "recipe": "https://github.com/pytorch/vision/tree/main/references/classification#small-models",
+            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#small-models",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 76.420,
@@ -486,7 +486,7 @@ class RegNet_Y_800MF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 6432512,
-            "recipe": "https://github.com/pytorch/vision/issues/3995#new-recipe",
+            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 78.828,
@@ -496,9 +496,9 @@ class RegNet_Y_800MF_Weights(WeightsEnum):
             "_ops": 0.834,
             "_file_size": 24.774,
             "_docs": """
-                These weights improve upon the results of the original paper by using a modified version of TorchVision's
+                These weights improve upon the results of the original paper by using a modified version of TensorPlay Vision's
                 `new training recipe
-                <https://pytorch.org/blog/how-to-train-state-of-the-art-models-using-torchvision-latest-primitives/>`_.
+                <https://tensorplay.org/blog/how-to-train-state-of-the-art-models-using-tensorplay.vision-latest-primitives/>`_.
             """,
         },
     )
@@ -512,7 +512,7 @@ class RegNet_Y_1_6GF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 11202430,
-            "recipe": "https://github.com/pytorch/vision/tree/main/references/classification#small-models",
+            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#small-models",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 77.950,
@@ -530,7 +530,7 @@ class RegNet_Y_1_6GF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 11202430,
-            "recipe": "https://github.com/pytorch/vision/issues/3995#new-recipe",
+            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 80.876,
@@ -540,9 +540,9 @@ class RegNet_Y_1_6GF_Weights(WeightsEnum):
             "_ops": 1.612,
             "_file_size": 43.152,
             "_docs": """
-                These weights improve upon the results of the original paper by using a modified version of TorchVision's
+                These weights improve upon the results of the original paper by using a modified version of TensorPlay Vision's
                 `new training recipe
-                <https://pytorch.org/blog/how-to-train-state-of-the-art-models-using-torchvision-latest-primitives/>`_.
+                <https://tensorplay.org/blog/how-to-train-state-of-the-art-models-using-tensorplay.vision-latest-primitives/>`_.
             """,
         },
     )
@@ -556,7 +556,7 @@ class RegNet_Y_3_2GF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 19436338,
-            "recipe": "https://github.com/pytorch/vision/tree/main/references/classification#medium-models",
+            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#medium-models",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 78.948,
@@ -574,7 +574,7 @@ class RegNet_Y_3_2GF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 19436338,
-            "recipe": "https://github.com/pytorch/vision/issues/3995#new-recipe",
+            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 81.982,
@@ -584,9 +584,9 @@ class RegNet_Y_3_2GF_Weights(WeightsEnum):
             "_ops": 3.176,
             "_file_size": 74.567,
             "_docs": """
-                These weights improve upon the results of the original paper by using a modified version of TorchVision's
+                These weights improve upon the results of the original paper by using a modified version of TensorPlay Vision's
                 `new training recipe
-                <https://pytorch.org/blog/how-to-train-state-of-the-art-models-using-torchvision-latest-primitives/>`_.
+                <https://tensorplay.org/blog/how-to-train-state-of-the-art-models-using-tensorplay.vision-latest-primitives/>`_.
             """,
         },
     )
@@ -600,7 +600,7 @@ class RegNet_Y_8GF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 39381472,
-            "recipe": "https://github.com/pytorch/vision/tree/main/references/classification#medium-models",
+            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#medium-models",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 80.032,
@@ -618,7 +618,7 @@ class RegNet_Y_8GF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 39381472,
-            "recipe": "https://github.com/pytorch/vision/issues/3995#new-recipe",
+            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 82.828,
@@ -628,9 +628,9 @@ class RegNet_Y_8GF_Weights(WeightsEnum):
             "_ops": 8.473,
             "_file_size": 150.701,
             "_docs": """
-                These weights improve upon the results of the original paper by using a modified version of TorchVision's
+                These weights improve upon the results of the original paper by using a modified version of TensorPlay Vision's
                 `new training recipe
-                <https://pytorch.org/blog/how-to-train-state-of-the-art-models-using-torchvision-latest-primitives/>`_.
+                <https://tensorplay.org/blog/how-to-train-state-of-the-art-models-using-tensorplay.vision-latest-primitives/>`_.
             """,
         },
     )
@@ -644,7 +644,7 @@ class RegNet_Y_16GF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 83590140,
-            "recipe": "https://github.com/pytorch/vision/tree/main/references/classification#large-models",
+            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#large-models",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 80.424,
@@ -662,7 +662,7 @@ class RegNet_Y_16GF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 83590140,
-            "recipe": "https://github.com/pytorch/vision/issues/3995#new-recipe",
+            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 82.886,
@@ -672,9 +672,9 @@ class RegNet_Y_16GF_Weights(WeightsEnum):
             "_ops": 15.912,
             "_file_size": 319.49,
             "_docs": """
-                These weights improve upon the results of the original paper by using a modified version of TorchVision's
+                These weights improve upon the results of the original paper by using a modified version of TensorPlay Vision's
                 `new training recipe
-                <https://pytorch.org/blog/how-to-train-state-of-the-art-models-using-torchvision-latest-primitives/>`_.
+                <https://tensorplay.org/blog/how-to-train-state-of-the-art-models-using-tensorplay.vision-latest-primitives/>`_.
             """,
         },
     )
@@ -707,7 +707,7 @@ class RegNet_Y_16GF_Weights(WeightsEnum):
         ),
         meta={
             **_COMMON_SWAG_META,
-            "recipe": "https://github.com/pytorch/vision/pull/5793",
+            "recipe": "https://github.com/tensorplay/vision/pull/5793",
             "num_params": 83590140,
             "_metrics": {
                 "ImageNet-1K": {
@@ -733,7 +733,7 @@ class RegNet_Y_32GF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 145046770,
-            "recipe": "https://github.com/pytorch/vision/tree/main/references/classification#large-models",
+            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#large-models",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 80.878,
@@ -751,7 +751,7 @@ class RegNet_Y_32GF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 145046770,
-            "recipe": "https://github.com/pytorch/vision/issues/3995#new-recipe",
+            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 83.368,
@@ -761,9 +761,9 @@ class RegNet_Y_32GF_Weights(WeightsEnum):
             "_ops": 32.28,
             "_file_size": 554.076,
             "_docs": """
-                These weights improve upon the results of the original paper by using a modified version of TorchVision's
+                These weights improve upon the results of the original paper by using a modified version of TensorPlay Vision's
                 `new training recipe
-                <https://pytorch.org/blog/how-to-train-state-of-the-art-models-using-torchvision-latest-primitives/>`_.
+                <https://tensorplay.org/blog/how-to-train-state-of-the-art-models-using-tensorplay.vision-latest-primitives/>`_.
             """,
         },
     )
@@ -796,7 +796,7 @@ class RegNet_Y_32GF_Weights(WeightsEnum):
         ),
         meta={
             **_COMMON_SWAG_META,
-            "recipe": "https://github.com/pytorch/vision/pull/5793",
+            "recipe": "https://github.com/tensorplay/vision/pull/5793",
             "num_params": 145046770,
             "_metrics": {
                 "ImageNet-1K": {
@@ -845,7 +845,7 @@ class RegNet_Y_128GF_Weights(WeightsEnum):
         ),
         meta={
             **_COMMON_SWAG_META,
-            "recipe": "https://github.com/pytorch/vision/pull/5793",
+            "recipe": "https://github.com/tensorplay/vision/pull/5793",
             "num_params": 644812894,
             "_metrics": {
                 "ImageNet-1K": {
@@ -871,7 +871,7 @@ class RegNet_X_400MF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 5495976,
-            "recipe": "https://github.com/pytorch/vision/tree/main/references/classification#small-models",
+            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#small-models",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 72.834,
@@ -889,7 +889,7 @@ class RegNet_X_400MF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 5495976,
-            "recipe": "https://github.com/pytorch/vision/issues/3995#new-recipe-with-fixres",
+            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe-with-fixres",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 74.864,
@@ -899,9 +899,9 @@ class RegNet_X_400MF_Weights(WeightsEnum):
             "_ops": 0.414,
             "_file_size": 21.257,
             "_docs": """
-                These weights improve upon the results of the original paper by using a modified version of TorchVision's
+                These weights improve upon the results of the original paper by using a modified version of TensorPlay Vision's
                 `new training recipe
-                <https://pytorch.org/blog/how-to-train-state-of-the-art-models-using-torchvision-latest-primitives/>`_.
+                <https://tensorplay.org/blog/how-to-train-state-of-the-art-models-using-tensorplay.vision-latest-primitives/>`_.
             """,
         },
     )
@@ -915,7 +915,7 @@ class RegNet_X_800MF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 7259656,
-            "recipe": "https://github.com/pytorch/vision/tree/main/references/classification#small-models",
+            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#small-models",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 75.212,
@@ -933,7 +933,7 @@ class RegNet_X_800MF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 7259656,
-            "recipe": "https://github.com/pytorch/vision/issues/3995#new-recipe-with-fixres",
+            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe-with-fixres",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 77.522,
@@ -943,9 +943,9 @@ class RegNet_X_800MF_Weights(WeightsEnum):
             "_ops": 0.8,
             "_file_size": 27.945,
             "_docs": """
-                These weights improve upon the results of the original paper by using a modified version of TorchVision's
+                These weights improve upon the results of the original paper by using a modified version of TensorPlay Vision's
                 `new training recipe
-                <https://pytorch.org/blog/how-to-train-state-of-the-art-models-using-torchvision-latest-primitives/>`_.
+                <https://tensorplay.org/blog/how-to-train-state-of-the-art-models-using-tensorplay.vision-latest-primitives/>`_.
             """,
         },
     )
@@ -959,7 +959,7 @@ class RegNet_X_1_6GF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 9190136,
-            "recipe": "https://github.com/pytorch/vision/tree/main/references/classification#small-models",
+            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#small-models",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 77.040,
@@ -977,7 +977,7 @@ class RegNet_X_1_6GF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 9190136,
-            "recipe": "https://github.com/pytorch/vision/issues/3995#new-recipe-with-fixres",
+            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe-with-fixres",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 79.668,
@@ -987,9 +987,9 @@ class RegNet_X_1_6GF_Weights(WeightsEnum):
             "_ops": 1.603,
             "_file_size": 35.339,
             "_docs": """
-                These weights improve upon the results of the original paper by using a modified version of TorchVision's
+                These weights improve upon the results of the original paper by using a modified version of TensorPlay Vision's
                 `new training recipe
-                <https://pytorch.org/blog/how-to-train-state-of-the-art-models-using-torchvision-latest-primitives/>`_.
+                <https://tensorplay.org/blog/how-to-train-state-of-the-art-models-using-tensorplay.vision-latest-primitives/>`_.
             """,
         },
     )
@@ -1003,7 +1003,7 @@ class RegNet_X_3_2GF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 15296552,
-            "recipe": "https://github.com/pytorch/vision/tree/main/references/classification#medium-models",
+            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#medium-models",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 78.364,
@@ -1021,7 +1021,7 @@ class RegNet_X_3_2GF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 15296552,
-            "recipe": "https://github.com/pytorch/vision/issues/3995#new-recipe",
+            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 81.196,
@@ -1031,9 +1031,9 @@ class RegNet_X_3_2GF_Weights(WeightsEnum):
             "_ops": 3.177,
             "_file_size": 58.756,
             "_docs": """
-                These weights improve upon the results of the original paper by using a modified version of TorchVision's
+                These weights improve upon the results of the original paper by using a modified version of TensorPlay Vision's
                 `new training recipe
-                <https://pytorch.org/blog/how-to-train-state-of-the-art-models-using-torchvision-latest-primitives/>`_.
+                <https://tensorplay.org/blog/how-to-train-state-of-the-art-models-using-tensorplay.vision-latest-primitives/>`_.
             """,
         },
     )
@@ -1047,7 +1047,7 @@ class RegNet_X_8GF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 39572648,
-            "recipe": "https://github.com/pytorch/vision/tree/main/references/classification#medium-models",
+            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#medium-models",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 79.344,
@@ -1065,7 +1065,7 @@ class RegNet_X_8GF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 39572648,
-            "recipe": "https://github.com/pytorch/vision/issues/3995#new-recipe",
+            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 81.682,
@@ -1075,9 +1075,9 @@ class RegNet_X_8GF_Weights(WeightsEnum):
             "_ops": 7.995,
             "_file_size": 151.456,
             "_docs": """
-                These weights improve upon the results of the original paper by using a modified version of TorchVision's
+                These weights improve upon the results of the original paper by using a modified version of TensorPlay Vision's
                 `new training recipe
-                <https://pytorch.org/blog/how-to-train-state-of-the-art-models-using-torchvision-latest-primitives/>`_.
+                <https://tensorplay.org/blog/how-to-train-state-of-the-art-models-using-tensorplay.vision-latest-primitives/>`_.
             """,
         },
     )
@@ -1091,7 +1091,7 @@ class RegNet_X_16GF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 54278536,
-            "recipe": "https://github.com/pytorch/vision/tree/main/references/classification#medium-models",
+            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#medium-models",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 80.058,
@@ -1109,7 +1109,7 @@ class RegNet_X_16GF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 54278536,
-            "recipe": "https://github.com/pytorch/vision/issues/3995#new-recipe",
+            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 82.716,
@@ -1119,9 +1119,9 @@ class RegNet_X_16GF_Weights(WeightsEnum):
             "_ops": 15.941,
             "_file_size": 207.627,
             "_docs": """
-                These weights improve upon the results of the original paper by using a modified version of TorchVision's
+                These weights improve upon the results of the original paper by using a modified version of TensorPlay Vision's
                 `new training recipe
-                <https://pytorch.org/blog/how-to-train-state-of-the-art-models-using-torchvision-latest-primitives/>`_.
+                <https://tensorplay.org/blog/how-to-train-state-of-the-art-models-using-tensorplay.vision-latest-primitives/>`_.
             """,
         },
     )
@@ -1135,7 +1135,7 @@ class RegNet_X_32GF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 107811560,
-            "recipe": "https://github.com/pytorch/vision/tree/main/references/classification#large-models",
+            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#large-models",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 80.622,
@@ -1153,7 +1153,7 @@ class RegNet_X_32GF_Weights(WeightsEnum):
         meta={
             **_COMMON_META,
             "num_params": 107811560,
-            "recipe": "https://github.com/pytorch/vision/issues/3995#new-recipe",
+            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 83.014,
@@ -1163,9 +1163,9 @@ class RegNet_X_32GF_Weights(WeightsEnum):
             "_ops": 31.736,
             "_file_size": 412.039,
             "_docs": """
-                These weights improve upon the results of the original paper by using a modified version of TorchVision's
+                These weights improve upon the results of the original paper by using a modified version of TensorPlay Vision's
                 `new training recipe
-                <https://pytorch.org/blog/how-to-train-state-of-the-art-models-using-torchvision-latest-primitives/>`_.
+                <https://tensorplay.org/blog/how-to-train-state-of-the-art-models-using-tensorplay.vision-latest-primitives/>`_.
             """,
         },
     )
@@ -1180,16 +1180,16 @@ def regnet_y_400mf(*, weights: Optional[RegNet_Y_400MF_Weights] = None, progress
     `Designing Network Design Spaces <https://arxiv.org/abs/2003.13678>`_.
 
     Args:
-        weights (:class:`~torchvision.models.RegNet_Y_400MF_Weights`, optional): The pretrained weights to use.
-            See :class:`~torchvision.models.RegNet_Y_400MF_Weights` below for more details and possible values.
+        weights (:class:`~tensorplay.vision.models.RegNet_Y_400MF_Weights`, optional): The pretrained weights to use.
+            See :class:`~tensorplay.vision.models.RegNet_Y_400MF_Weights` below for more details and possible values.
             By default, no pretrained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
-        **kwargs: parameters passed to either ``torchvision.models.regnet.RegNet`` or
-            ``torchvision.models.regnet.BlockParams`` class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/regnet.py>`_
+        **kwargs: parameters passed to either ``tensorplay.vision.models.regnet.RegNet`` or
+            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the `source code
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/regnet.py>`_
             for more detail about the classes.
 
-    .. autoclass:: torchvision.models.RegNet_Y_400MF_Weights
+    .. autoclass:: tensorplay.vision.models.RegNet_Y_400MF_Weights
         :members:
     """
     weights = RegNet_Y_400MF_Weights.verify(weights)
@@ -1206,16 +1206,16 @@ def regnet_y_800mf(*, weights: Optional[RegNet_Y_800MF_Weights] = None, progress
     `Designing Network Design Spaces <https://arxiv.org/abs/2003.13678>`_.
 
     Args:
-        weights (:class:`~torchvision.models.RegNet_Y_800MF_Weights`, optional): The pretrained weights to use.
-            See :class:`~torchvision.models.RegNet_Y_800MF_Weights` below for more details and possible values.
+        weights (:class:`~tensorplay.vision.models.RegNet_Y_800MF_Weights`, optional): The pretrained weights to use.
+            See :class:`~tensorplay.vision.models.RegNet_Y_800MF_Weights` below for more details and possible values.
             By default, no pretrained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
-        **kwargs: parameters passed to either ``torchvision.models.regnet.RegNet`` or
-            ``torchvision.models.regnet.BlockParams`` class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/regnet.py>`_
+        **kwargs: parameters passed to either ``tensorplay.vision.models.regnet.RegNet`` or
+            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the `source code
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/regnet.py>`_
             for more detail about the classes.
 
-    .. autoclass:: torchvision.models.RegNet_Y_800MF_Weights
+    .. autoclass:: tensorplay.vision.models.RegNet_Y_800MF_Weights
         :members:
     """
     weights = RegNet_Y_800MF_Weights.verify(weights)
@@ -1232,16 +1232,16 @@ def regnet_y_1_6gf(*, weights: Optional[RegNet_Y_1_6GF_Weights] = None, progress
     `Designing Network Design Spaces <https://arxiv.org/abs/2003.13678>`_.
 
     Args:
-        weights (:class:`~torchvision.models.RegNet_Y_1_6GF_Weights`, optional): The pretrained weights to use.
-            See :class:`~torchvision.models.RegNet_Y_1_6GF_Weights` below for more details and possible values.
+        weights (:class:`~tensorplay.vision.models.RegNet_Y_1_6GF_Weights`, optional): The pretrained weights to use.
+            See :class:`~tensorplay.vision.models.RegNet_Y_1_6GF_Weights` below for more details and possible values.
             By default, no pretrained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
-        **kwargs: parameters passed to either ``torchvision.models.regnet.RegNet`` or
-            ``torchvision.models.regnet.BlockParams`` class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/regnet.py>`_
+        **kwargs: parameters passed to either ``tensorplay.vision.models.regnet.RegNet`` or
+            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the `source code
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/regnet.py>`_
             for more detail about the classes.
 
-    .. autoclass:: torchvision.models.RegNet_Y_1_6GF_Weights
+    .. autoclass:: tensorplay.vision.models.RegNet_Y_1_6GF_Weights
         :members:
     """
     weights = RegNet_Y_1_6GF_Weights.verify(weights)
@@ -1260,16 +1260,16 @@ def regnet_y_3_2gf(*, weights: Optional[RegNet_Y_3_2GF_Weights] = None, progress
     `Designing Network Design Spaces <https://arxiv.org/abs/2003.13678>`_.
 
     Args:
-        weights (:class:`~torchvision.models.RegNet_Y_3_2GF_Weights`, optional): The pretrained weights to use.
-            See :class:`~torchvision.models.RegNet_Y_3_2GF_Weights` below for more details and possible values.
+        weights (:class:`~tensorplay.vision.models.RegNet_Y_3_2GF_Weights`, optional): The pretrained weights to use.
+            See :class:`~tensorplay.vision.models.RegNet_Y_3_2GF_Weights` below for more details and possible values.
             By default, no pretrained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
-        **kwargs: parameters passed to either ``torchvision.models.regnet.RegNet`` or
-            ``torchvision.models.regnet.BlockParams`` class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/regnet.py>`_
+        **kwargs: parameters passed to either ``tensorplay.vision.models.regnet.RegNet`` or
+            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the `source code
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/regnet.py>`_
             for more detail about the classes.
 
-    .. autoclass:: torchvision.models.RegNet_Y_3_2GF_Weights
+    .. autoclass:: tensorplay.vision.models.RegNet_Y_3_2GF_Weights
         :members:
     """
     weights = RegNet_Y_3_2GF_Weights.verify(weights)
@@ -1288,16 +1288,16 @@ def regnet_y_8gf(*, weights: Optional[RegNet_Y_8GF_Weights] = None, progress: bo
     `Designing Network Design Spaces <https://arxiv.org/abs/2003.13678>`_.
 
     Args:
-        weights (:class:`~torchvision.models.RegNet_Y_8GF_Weights`, optional): The pretrained weights to use.
-            See :class:`~torchvision.models.RegNet_Y_8GF_Weights` below for more details and possible values.
+        weights (:class:`~tensorplay.vision.models.RegNet_Y_8GF_Weights`, optional): The pretrained weights to use.
+            See :class:`~tensorplay.vision.models.RegNet_Y_8GF_Weights` below for more details and possible values.
             By default, no pretrained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
-        **kwargs: parameters passed to either ``torchvision.models.regnet.RegNet`` or
-            ``torchvision.models.regnet.BlockParams`` class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/regnet.py>`_
+        **kwargs: parameters passed to either ``tensorplay.vision.models.regnet.RegNet`` or
+            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the `source code
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/regnet.py>`_
             for more detail about the classes.
 
-    .. autoclass:: torchvision.models.RegNet_Y_8GF_Weights
+    .. autoclass:: tensorplay.vision.models.RegNet_Y_8GF_Weights
         :members:
     """
     weights = RegNet_Y_8GF_Weights.verify(weights)
@@ -1316,16 +1316,16 @@ def regnet_y_16gf(*, weights: Optional[RegNet_Y_16GF_Weights] = None, progress: 
     `Designing Network Design Spaces <https://arxiv.org/abs/2003.13678>`_.
 
     Args:
-        weights (:class:`~torchvision.models.RegNet_Y_16GF_Weights`, optional): The pretrained weights to use.
-            See :class:`~torchvision.models.RegNet_Y_16GF_Weights` below for more details and possible values.
+        weights (:class:`~tensorplay.vision.models.RegNet_Y_16GF_Weights`, optional): The pretrained weights to use.
+            See :class:`~tensorplay.vision.models.RegNet_Y_16GF_Weights` below for more details and possible values.
             By default, no pretrained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
-        **kwargs: parameters passed to either ``torchvision.models.regnet.RegNet`` or
-            ``torchvision.models.regnet.BlockParams`` class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/regnet.py>`_
+        **kwargs: parameters passed to either ``tensorplay.vision.models.regnet.RegNet`` or
+            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the `source code
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/regnet.py>`_
             for more detail about the classes.
 
-    .. autoclass:: torchvision.models.RegNet_Y_16GF_Weights
+    .. autoclass:: tensorplay.vision.models.RegNet_Y_16GF_Weights
         :members:
     """
     weights = RegNet_Y_16GF_Weights.verify(weights)
@@ -1344,16 +1344,16 @@ def regnet_y_32gf(*, weights: Optional[RegNet_Y_32GF_Weights] = None, progress: 
     `Designing Network Design Spaces <https://arxiv.org/abs/2003.13678>`_.
 
     Args:
-        weights (:class:`~torchvision.models.RegNet_Y_32GF_Weights`, optional): The pretrained weights to use.
-            See :class:`~torchvision.models.RegNet_Y_32GF_Weights` below for more details and possible values.
+        weights (:class:`~tensorplay.vision.models.RegNet_Y_32GF_Weights`, optional): The pretrained weights to use.
+            See :class:`~tensorplay.vision.models.RegNet_Y_32GF_Weights` below for more details and possible values.
             By default, no pretrained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
-        **kwargs: parameters passed to either ``torchvision.models.regnet.RegNet`` or
-            ``torchvision.models.regnet.BlockParams`` class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/regnet.py>`_
+        **kwargs: parameters passed to either ``tensorplay.vision.models.regnet.RegNet`` or
+            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the `source code
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/regnet.py>`_
             for more detail about the classes.
 
-    .. autoclass:: torchvision.models.RegNet_Y_32GF_Weights
+    .. autoclass:: tensorplay.vision.models.RegNet_Y_32GF_Weights
         :members:
     """
     weights = RegNet_Y_32GF_Weights.verify(weights)
@@ -1372,16 +1372,16 @@ def regnet_y_128gf(*, weights: Optional[RegNet_Y_128GF_Weights] = None, progress
     `Designing Network Design Spaces <https://arxiv.org/abs/2003.13678>`_.
 
     Args:
-        weights (:class:`~torchvision.models.RegNet_Y_128GF_Weights`, optional): The pretrained weights to use.
-            See :class:`~torchvision.models.RegNet_Y_128GF_Weights` below for more details and possible values.
+        weights (:class:`~tensorplay.vision.models.RegNet_Y_128GF_Weights`, optional): The pretrained weights to use.
+            See :class:`~tensorplay.vision.models.RegNet_Y_128GF_Weights` below for more details and possible values.
             By default, no pretrained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
-        **kwargs: parameters passed to either ``torchvision.models.regnet.RegNet`` or
-            ``torchvision.models.regnet.BlockParams`` class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/regnet.py>`_
+        **kwargs: parameters passed to either ``tensorplay.vision.models.regnet.RegNet`` or
+            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the `source code
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/regnet.py>`_
             for more detail about the classes.
 
-    .. autoclass:: torchvision.models.RegNet_Y_128GF_Weights
+    .. autoclass:: tensorplay.vision.models.RegNet_Y_128GF_Weights
         :members:
     """
     weights = RegNet_Y_128GF_Weights.verify(weights)
@@ -1400,16 +1400,16 @@ def regnet_x_400mf(*, weights: Optional[RegNet_X_400MF_Weights] = None, progress
     `Designing Network Design Spaces <https://arxiv.org/abs/2003.13678>`_.
 
     Args:
-        weights (:class:`~torchvision.models.RegNet_X_400MF_Weights`, optional): The pretrained weights to use.
-            See :class:`~torchvision.models.RegNet_X_400MF_Weights` below for more details and possible values.
+        weights (:class:`~tensorplay.vision.models.RegNet_X_400MF_Weights`, optional): The pretrained weights to use.
+            See :class:`~tensorplay.vision.models.RegNet_X_400MF_Weights` below for more details and possible values.
             By default, no pretrained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
-        **kwargs: parameters passed to either ``torchvision.models.regnet.RegNet`` or
-            ``torchvision.models.regnet.BlockParams`` class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/regnet.py>`_
+        **kwargs: parameters passed to either ``tensorplay.vision.models.regnet.RegNet`` or
+            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the `source code
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/regnet.py>`_
             for more detail about the classes.
 
-    .. autoclass:: torchvision.models.RegNet_X_400MF_Weights
+    .. autoclass:: tensorplay.vision.models.RegNet_X_400MF_Weights
         :members:
     """
     weights = RegNet_X_400MF_Weights.verify(weights)
@@ -1426,16 +1426,16 @@ def regnet_x_800mf(*, weights: Optional[RegNet_X_800MF_Weights] = None, progress
     `Designing Network Design Spaces <https://arxiv.org/abs/2003.13678>`_.
 
     Args:
-        weights (:class:`~torchvision.models.RegNet_X_800MF_Weights`, optional): The pretrained weights to use.
-            See :class:`~torchvision.models.RegNet_X_800MF_Weights` below for more details and possible values.
+        weights (:class:`~tensorplay.vision.models.RegNet_X_800MF_Weights`, optional): The pretrained weights to use.
+            See :class:`~tensorplay.vision.models.RegNet_X_800MF_Weights` below for more details and possible values.
             By default, no pretrained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
-        **kwargs: parameters passed to either ``torchvision.models.regnet.RegNet`` or
-            ``torchvision.models.regnet.BlockParams`` class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/regnet.py>`_
+        **kwargs: parameters passed to either ``tensorplay.vision.models.regnet.RegNet`` or
+            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the `source code
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/regnet.py>`_
             for more detail about the classes.
 
-    .. autoclass:: torchvision.models.RegNet_X_800MF_Weights
+    .. autoclass:: tensorplay.vision.models.RegNet_X_800MF_Weights
         :members:
     """
     weights = RegNet_X_800MF_Weights.verify(weights)
@@ -1452,16 +1452,16 @@ def regnet_x_1_6gf(*, weights: Optional[RegNet_X_1_6GF_Weights] = None, progress
     `Designing Network Design Spaces <https://arxiv.org/abs/2003.13678>`_.
 
     Args:
-        weights (:class:`~torchvision.models.RegNet_X_1_6GF_Weights`, optional): The pretrained weights to use.
-            See :class:`~torchvision.models.RegNet_X_1_6GF_Weights` below for more details and possible values.
+        weights (:class:`~tensorplay.vision.models.RegNet_X_1_6GF_Weights`, optional): The pretrained weights to use.
+            See :class:`~tensorplay.vision.models.RegNet_X_1_6GF_Weights` below for more details and possible values.
             By default, no pretrained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
-        **kwargs: parameters passed to either ``torchvision.models.regnet.RegNet`` or
-            ``torchvision.models.regnet.BlockParams`` class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/regnet.py>`_
+        **kwargs: parameters passed to either ``tensorplay.vision.models.regnet.RegNet`` or
+            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the `source code
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/regnet.py>`_
             for more detail about the classes.
 
-    .. autoclass:: torchvision.models.RegNet_X_1_6GF_Weights
+    .. autoclass:: tensorplay.vision.models.RegNet_X_1_6GF_Weights
         :members:
     """
     weights = RegNet_X_1_6GF_Weights.verify(weights)
@@ -1478,16 +1478,16 @@ def regnet_x_3_2gf(*, weights: Optional[RegNet_X_3_2GF_Weights] = None, progress
     `Designing Network Design Spaces <https://arxiv.org/abs/2003.13678>`_.
 
     Args:
-        weights (:class:`~torchvision.models.RegNet_X_3_2GF_Weights`, optional): The pretrained weights to use.
-            See :class:`~torchvision.models.RegNet_X_3_2GF_Weights` below for more details and possible values.
+        weights (:class:`~tensorplay.vision.models.RegNet_X_3_2GF_Weights`, optional): The pretrained weights to use.
+            See :class:`~tensorplay.vision.models.RegNet_X_3_2GF_Weights` below for more details and possible values.
             By default, no pretrained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
-        **kwargs: parameters passed to either ``torchvision.models.regnet.RegNet`` or
-            ``torchvision.models.regnet.BlockParams`` class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/regnet.py>`_
+        **kwargs: parameters passed to either ``tensorplay.vision.models.regnet.RegNet`` or
+            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the `source code
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/regnet.py>`_
             for more detail about the classes.
 
-    .. autoclass:: torchvision.models.RegNet_X_3_2GF_Weights
+    .. autoclass:: tensorplay.vision.models.RegNet_X_3_2GF_Weights
         :members:
     """
     weights = RegNet_X_3_2GF_Weights.verify(weights)
@@ -1504,16 +1504,16 @@ def regnet_x_8gf(*, weights: Optional[RegNet_X_8GF_Weights] = None, progress: bo
     `Designing Network Design Spaces <https://arxiv.org/abs/2003.13678>`_.
 
     Args:
-        weights (:class:`~torchvision.models.RegNet_X_8GF_Weights`, optional): The pretrained weights to use.
-            See :class:`~torchvision.models.RegNet_X_8GF_Weights` below for more details and possible values.
+        weights (:class:`~tensorplay.vision.models.RegNet_X_8GF_Weights`, optional): The pretrained weights to use.
+            See :class:`~tensorplay.vision.models.RegNet_X_8GF_Weights` below for more details and possible values.
             By default, no pretrained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
-        **kwargs: parameters passed to either ``torchvision.models.regnet.RegNet`` or
-            ``torchvision.models.regnet.BlockParams`` class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/regnet.py>`_
+        **kwargs: parameters passed to either ``tensorplay.vision.models.regnet.RegNet`` or
+            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the `source code
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/regnet.py>`_
             for more detail about the classes.
 
-    .. autoclass:: torchvision.models.RegNet_X_8GF_Weights
+    .. autoclass:: tensorplay.vision.models.RegNet_X_8GF_Weights
         :members:
     """
     weights = RegNet_X_8GF_Weights.verify(weights)
@@ -1530,16 +1530,16 @@ def regnet_x_16gf(*, weights: Optional[RegNet_X_16GF_Weights] = None, progress: 
     `Designing Network Design Spaces <https://arxiv.org/abs/2003.13678>`_.
 
     Args:
-        weights (:class:`~torchvision.models.RegNet_X_16GF_Weights`, optional): The pretrained weights to use.
-            See :class:`~torchvision.models.RegNet_X_16GF_Weights` below for more details and possible values.
+        weights (:class:`~tensorplay.vision.models.RegNet_X_16GF_Weights`, optional): The pretrained weights to use.
+            See :class:`~tensorplay.vision.models.RegNet_X_16GF_Weights` below for more details and possible values.
             By default, no pretrained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
-        **kwargs: parameters passed to either ``torchvision.models.regnet.RegNet`` or
-            ``torchvision.models.regnet.BlockParams`` class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/regnet.py>`_
+        **kwargs: parameters passed to either ``tensorplay.vision.models.regnet.RegNet`` or
+            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the `source code
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/regnet.py>`_
             for more detail about the classes.
 
-    .. autoclass:: torchvision.models.RegNet_X_16GF_Weights
+    .. autoclass:: tensorplay.vision.models.RegNet_X_16GF_Weights
         :members:
     """
     weights = RegNet_X_16GF_Weights.verify(weights)
@@ -1556,16 +1556,16 @@ def regnet_x_32gf(*, weights: Optional[RegNet_X_32GF_Weights] = None, progress: 
     `Designing Network Design Spaces <https://arxiv.org/abs/2003.13678>`_.
 
     Args:
-        weights (:class:`~torchvision.models.RegNet_X_32GF_Weights`, optional): The pretrained weights to use.
-            See :class:`~torchvision.models.RegNet_X_32GF_Weights` below for more details and possible values.
+        weights (:class:`~tensorplay.vision.models.RegNet_X_32GF_Weights`, optional): The pretrained weights to use.
+            See :class:`~tensorplay.vision.models.RegNet_X_32GF_Weights` below for more details and possible values.
             By default, no pretrained weights are used.
         progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
-        **kwargs: parameters passed to either ``torchvision.models.regnet.RegNet`` or
-            ``torchvision.models.regnet.BlockParams`` class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/regnet.py>`_
+        **kwargs: parameters passed to either ``tensorplay.vision.models.regnet.RegNet`` or
+            ``tensorplay.vision.models.regnet.BlockParams`` class. Please refer to the `source code
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/regnet.py>`_
             for more detail about the classes.
 
-    .. autoclass:: torchvision.models.RegNet_X_32GF_Weights
+    .. autoclass:: tensorplay.vision.models.RegNet_X_32GF_Weights
         :members:
     """
     weights = RegNet_X_32GF_Weights.verify(weights)

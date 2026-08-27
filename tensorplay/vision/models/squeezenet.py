@@ -4,7 +4,7 @@
 from functools import partial
 from typing import Any, Optional
 
-import tensorplay as torch
+import tensorplay as tensorplay
 import tensorplay.nn as nn
 import tensorplay.nn.init as init
 
@@ -29,9 +29,9 @@ class Fire(nn.Module):
         self.expand3x3 = nn.Conv2d(squeeze_planes, expand3x3_planes, kernel_size=3, padding=1)
         self.expand3x3_activation = nn.ReLU(inplace=True)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: tensorplay.Tensor) -> tensorplay.Tensor:
         x = self.squeeze_activation(self.squeeze(x))
-        return torch.cat(
+        return tensorplay.cat(
             [self.expand1x1_activation(self.expand1x1(x)), self.expand3x3_activation(self.expand3x3(x))], 1
         )
 
@@ -94,10 +94,10 @@ class SqueezeNet(nn.Module):
                 if m.bias is not None:
                     init.constant_(m.bias, 0)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: tensorplay.Tensor) -> tensorplay.Tensor:
         x = self.features(x)
         x = self.classifier(x)
-        return torch.flatten(x, 1)
+        return tensorplay.flatten(x, 1)
 
 
 def _squeezenet(
@@ -119,7 +119,7 @@ def _squeezenet(
 
 _COMMON_META = {
     "categories": _IMAGENET_CATEGORIES,
-    "recipe": "https://github.com/pytorch/vision/pull/49#issuecomment-277560717",
+    "recipe": "https://github.com/tensorplay/vision/pull/49#issuecomment-277560717",
     "_docs": """These weights reproduce closely the results of the paper using a simple training recipe.""",
 }
 
@@ -176,19 +176,19 @@ def squeezenet1_0(
     <https://arxiv.org/abs/1602.07360>`_ paper.
 
     Args:
-        weights (:class:`~torchvision.models.SqueezeNet1_0_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.SqueezeNet1_0_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.SqueezeNet1_0_Weights` below for
+            :class:`~tensorplay.vision.models.SqueezeNet1_0_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.squeezenet.SqueezeNet``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.squeezenet.SqueezeNet``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/squeezenet.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/squeezenet.py>`_
             for more details about this class.
 
-    .. autoclass:: torchvision.models.SqueezeNet1_0_Weights
+    .. autoclass:: tensorplay.vision.models.SqueezeNet1_0_Weights
         :members:
     """
     weights = SqueezeNet1_0_Weights.verify(weights)
@@ -207,19 +207,19 @@ def squeezenet1_1(
     than SqueezeNet 1.0, without sacrificing accuracy.
 
     Args:
-        weights (:class:`~torchvision.models.SqueezeNet1_1_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.SqueezeNet1_1_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.SqueezeNet1_1_Weights` below for
+            :class:`~tensorplay.vision.models.SqueezeNet1_1_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.squeezenet.SqueezeNet``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.squeezenet.SqueezeNet``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/squeezenet.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/squeezenet.py>`_
             for more details about this class.
 
-    .. autoclass:: torchvision.models.SqueezeNet1_1_Weights
+    .. autoclass:: tensorplay.vision.models.SqueezeNet1_1_Weights
         :members:
     """
     weights = SqueezeNet1_1_Weights.verify(weights)

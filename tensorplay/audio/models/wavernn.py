@@ -1,9 +1,9 @@
 import math
 from typing import List, Optional, Tuple
 
-import tensorplay as torch
+import tensorplay as tensorplay
 import tensorplay.nn.functional as F
-from torch import nn, Tensor
+from tensorplay import nn, Tensor
 
 __all__ = [
     "ResBlock",
@@ -22,7 +22,7 @@ class ResBlock(nn.Module):
 
     Examples
         >>> resblock = ResBlock()
-        >>> input = torch.rand(10, 128, 512)  # a random spectrogram
+        >>> input = tensorplay.rand(10, 128, 512)  # a random spectrogram
         >>> output = resblock(input)  # shape: (10, 128, 512)
     """
 
@@ -61,7 +61,7 @@ class MelResNet(nn.Module):
 
     Examples
         >>> melresnet = MelResNet()
-        >>> input = torch.rand(10, 128, 512)  # a random spectrogram
+        >>> input = tensorplay.rand(10, 128, 512)  # a random spectrogram
         >>> output = melresnet(input)  # shape: (10, 128, 508)
     """
 
@@ -102,7 +102,7 @@ class Stretch2d(nn.Module):
     Examples
         >>> stretch2d = Stretch2d(time_scale=10, freq_scale=5)
 
-        >>> input = torch.rand(10, 100, 512)  # a random spectrogram
+        >>> input = tensorplay.rand(10, 100, 512)  # a random spectrogram
         >>> output = stretch2d(input)  # shape: (10, 500, 5120)
     """
 
@@ -138,7 +138,7 @@ class UpsampleNetwork(nn.Module):
 
     Examples
         >>> upsamplenetwork = UpsampleNetwork(upsample_scales=[4, 4, 16])
-        >>> input = torch.rand(10, 128, 10)  # a random spectrogram
+        >>> input = tensorplay.rand(10, 128, 10)  # a random spectrogram
         >>> output = upsamplenetwork(input)  # shape: (10, 128, 1536), (10, 128, 1536)
     """
 
@@ -168,7 +168,7 @@ class UpsampleNetwork(nn.Module):
             conv = nn.Conv2d(
                 in_channels=1, out_channels=1, kernel_size=(1, scale * 2 + 1), padding=(0, scale), bias=False
             )
-            torch.nn.init.constant_(conv.weight, 1.0 / (scale * 2 + 1))
+            tensorplay.nn.init.constant_(conv.weight, 1.0 / (scale * 2 + 1))
             up_layers.append(stretch)
             up_layers.append(conv)
         self.upsample_layers = nn.Sequential(*up_layers)
@@ -205,8 +205,8 @@ class WaveRNN(nn.Module):
     The product of `upsample_scales` must equal `hop_length`.
 
     See Also:
-        * `Training example <https://github.com/pytorch/audio/tree/release/0.12/examples/pipeline_wavernn>`__
-        * :class:`torchaudio.pipelines.Tacotron2TTSBundle`: TTS pipeline with pretrained model.
+        * `Training example <https://github.com/tensorplay/audio/tree/release/0.12/examples/pipeline_wavernn>`__
+        * :class:`tensorplay.audio.pipelines.Tacotron2TTSBundle`: TTS pipeline with pretrained model.
 
     Args:
         upsample_scales: the list of upsample scales.
@@ -222,7 +222,7 @@ class WaveRNN(nn.Module):
 
     Example
         >>> wavernn = WaveRNN(upsample_scales=[5,5,8], n_classes=512, hop_length=200)
-        >>> waveform, sample_rate = torchaudio.load(file)
+        >>> waveform, sample_rate = tensorplay.audio.load(file)
         >>> # waveform shape: (n_batch, n_channel, (n_time - kernel_size + 1) * hop_length)
         >>> specgram = MelSpectrogram(sample_rate)(waveform)  # shape: (n_batch, n_channel, n_freq, n_time)
         >>> output = wavernn(waveform, specgram)
@@ -290,8 +290,8 @@ class WaveRNN(nn.Module):
         waveform, specgram = waveform.squeeze(1), specgram.squeeze(1)
 
         batch_size = waveform.size(0)
-        h1 = torch.zeros(1, batch_size, self.n_rnn, dtype=waveform.dtype, device=waveform.device)
-        h2 = torch.zeros(1, batch_size, self.n_rnn, dtype=waveform.dtype, device=waveform.device)
+        h1 = tensorplay.zeros(1, batch_size, self.n_rnn, dtype=waveform.dtype, device=waveform.device)
+        h2 = tensorplay.zeros(1, batch_size, self.n_rnn, dtype=waveform.dtype, device=waveform.device)
         # output of upsample:
         # specgram: (n_batch, n_freq, (n_time - kernel_size + 1) * total_scale)
         # aux: (n_batch, n_output, (n_time - kernel_size + 1) * total_scale)
@@ -305,22 +305,22 @@ class WaveRNN(nn.Module):
         a3 = aux[:, :, aux_idx[2] : aux_idx[3]]
         a4 = aux[:, :, aux_idx[3] : aux_idx[4]]
 
-        x = torch.cat([waveform.unsqueeze(-1), specgram, a1], dim=-1)
+        x = tensorplay.cat([waveform.unsqueeze(-1), specgram, a1], dim=-1)
         x = self.fc(x)
         res = x
         x, _ = self.rnn1(x, h1)
 
         x = x + res
         res = x
-        x = torch.cat([x, a2], dim=-1)
+        x = tensorplay.cat([x, a2], dim=-1)
         x, _ = self.rnn2(x, h2)
 
         x = x + res
-        x = torch.cat([x, a3], dim=-1)
+        x = tensorplay.cat([x, a3], dim=-1)
         x = self.fc1(x)
         x = self.relu1(x)
 
-        x = torch.cat([x, a4], dim=-1)
+        x = tensorplay.cat([x, a4], dim=-1)
         x = self.fc2(x)
         x = self.relu2(x)
         x = self.fc3(x)
@@ -328,7 +328,7 @@ class WaveRNN(nn.Module):
         # bring back channel dimension
         return x.unsqueeze(1)
 
-    @torch.jit.export
+    @tensorplay.jit.export
     def infer(self, specgram: Tensor, lengths: Optional[Tensor] = None) -> Tuple[Tensor, Optional[Tensor]]:
         r"""Inference method of WaveRNN.
 
@@ -361,7 +361,7 @@ class WaveRNN(nn.Module):
         device = specgram.device
         dtype = specgram.dtype
 
-        specgram = torch.nn.functional.pad(specgram, (self._pad, self._pad))
+        specgram = tensorplay.nn.functional.pad(specgram, (self._pad, self._pad))
         specgram, aux = self.upsample(specgram)
         if lengths is not None:
             lengths = lengths * self.upsample.total_scale
@@ -369,9 +369,9 @@ class WaveRNN(nn.Module):
         output: List[Tensor] = []
         b_size, _, seq_len = specgram.size()
 
-        h1 = torch.zeros((1, b_size, self.n_rnn), device=device, dtype=dtype)
-        h2 = torch.zeros((1, b_size, self.n_rnn), device=device, dtype=dtype)
-        x = torch.zeros((b_size, 1), device=device, dtype=dtype)
+        h1 = tensorplay.zeros((1, b_size, self.n_rnn), device=device, dtype=dtype)
+        h2 = tensorplay.zeros((1, b_size, self.n_rnn), device=device, dtype=dtype)
+        x = tensorplay.zeros((b_size, 1), device=device, dtype=dtype)
 
         aux_split = [aux[:, self.n_aux * i : self.n_aux * (i + 1), :] for i in range(4)]
 
@@ -381,29 +381,29 @@ class WaveRNN(nn.Module):
 
             a1_t, a2_t, a3_t, a4_t = [a[:, :, i] for a in aux_split]
 
-            x = torch.cat([x, m_t, a1_t], dim=1)
+            x = tensorplay.cat([x, m_t, a1_t], dim=1)
             x = self.fc(x)
             _, h1 = self.rnn1(x.unsqueeze(1), h1)
 
             x = x + h1[0]
-            inp = torch.cat([x, a2_t], dim=1)
+            inp = tensorplay.cat([x, a2_t], dim=1)
             _, h2 = self.rnn2(inp.unsqueeze(1), h2)
 
             x = x + h2[0]
-            x = torch.cat([x, a3_t], dim=1)
+            x = tensorplay.cat([x, a3_t], dim=1)
             x = F.relu(self.fc1(x))
 
-            x = torch.cat([x, a4_t], dim=1)
+            x = tensorplay.cat([x, a4_t], dim=1)
             x = F.relu(self.fc2(x))
 
             logits = self.fc3(x)
 
             posterior = F.softmax(logits, dim=1)
 
-            x = torch.multinomial(posterior, 1).float()
+            x = tensorplay.multinomial(posterior, 1).float()
             # Transform label [0, 2 ** n_bits - 1] to waveform [-1, 1]
             x = 2 * x / (2**self.n_bits - 1.0) - 1.0
 
             output.append(x)
 
-        return torch.stack(output).permute(1, 2, 0), lengths
+        return tensorplay.stack(output).permute(1, 2, 0), lengths

@@ -99,39 +99,24 @@ bool is_complex_cuda(const Tensor& self) {
 } // namespace
 
 Tensor reshape_kernel_cuda(const Tensor& self, const std::vector<int64_t>& shape) {
-    // Check if new shape is compatible with number of elements
-    int64_t new_numel = 1;
-    int64_t infer_dim = -1;
-    for (size_t i = 0; i < shape.size(); ++i) {
-        if (shape[i] == -1) {
-            if (infer_dim != -1) TP_THROW(RuntimeError, "only one dimension can be inferred");
-            infer_dim = i;
-        } else if (shape[i] < 0) {
-            TP_THROW(RuntimeError, "invalid shape dimension " + std::to_string(shape[i]));
-        } else {
-            new_numel *= shape[i];
-        }
+    // Torch parity (TensorShape.cpp reshape): the result aliases `self`
+    // whenever the layout admits the view (computeStride), otherwise it is a
+    // contiguous copy.  infer_size throws torch's exact errors (including
+    // the ambiguous 0-element -1 case that used to divide by zero).
+    if (self.is_sparse()) {
+        TP_THROW(RuntimeError, "reshape is not implemented for sparse tensors");
     }
-    
-    if (self.numel() == new_numel && infer_dim == -1) {
-        // Exact match
-    } else if (infer_dim != -1) {
-        int64_t missing = self.numel() / new_numel;
-        if (self.numel() % new_numel != 0) {
-             TP_THROW(RuntimeError, "shape '" + Size(shape).toString() + "' is invalid for input of size " + std::to_string(self.numel()));
-        }
-        std::vector<int64_t> mutable_shape = shape;
-        mutable_shape[infer_dim] = missing;
-        if (self.is_contiguous()) return self.view(mutable_shape);
-        return self.clone().view(mutable_shape);
-    } else {
-         TP_THROW(RuntimeError, "shape '" + Size(shape).toString() + "' is invalid for input of size " + std::to_string(self.numel()));
+    std::vector<int64_t> inferred = SizesAndStrides::infer_size(shape, self.numel());
+    auto stride = SizesAndStrides::compute_view_strides(
+        static_cast<std::vector<int64_t>>(self.shape()), self.strides(), inferred);
+    if (stride.has_value()) {
+        return self.as_strided(inferred, *stride);
     }
-
-    if (self.is_contiguous()) {
-         return self.view(shape);
-    }
-    return self.clone().view(shape);
+    // torch reshape_symint fallback: _unsafe_view(clone(Contiguous), shape).
+    // The clone must be explicitly contiguous: clone() with Preserve keeps
+    // non-overlapping-and-dense strides (e.g. transposed), which the
+    // subsequent view would reject.
+    return self.clone(static_cast<int64_t>(MemoryFormat::Contiguous)).view(inferred);
 }
 
 Tensor transpose_kernel_cuda(const Tensor& self, int64_t dim0, int64_t dim1) {
@@ -475,8 +460,11 @@ Tensor movedim_kernel_cuda(const Tensor& self, const std::vector<int64_t>& sourc
 // before the dense-stride math, matching the CPU guards.  (select/item use
 // skip_implementation -- their core Tensor methods are the implementation.)
 Tensor clone_kernel_cuda(const Tensor& self, std::optional<int64_t> memory_format) {
-    (void)memory_format;
-    return tensorplay::detail::clone_impl(self);
+    std::optional<MemoryFormat> format;
+    if (memory_format.has_value()) {
+        format = static_cast<MemoryFormat>(*memory_format);
+    }
+    return tensorplay::detail::clone_impl(self, format);
 }
 
 Tensor slice_kernel_cuda(const Tensor& self, int64_t dim,

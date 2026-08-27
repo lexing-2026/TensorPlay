@@ -1,6 +1,7 @@
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "Exception.h"
+#include "Parallel.h"
 #include <vector>
 #include <cmath>
 #include <algorithm>
@@ -530,8 +531,105 @@ Tensor layer_norm_cpu(const Tensor& input, const std::vector<int64_t>& normalize
                 out_ptr[offset + j] = normalized;
             }
         }
+    } else if (input.dtype() == DType::Float64) {
+        double* out_ptr = out.data_ptr<double>();
+        const double* in_ptr = input.data_ptr<double>();
+        const double* w_ptr = (weight_opt.has_value() && weight_opt->defined()) ? weight_opt->data_ptr<double>() : nullptr;
+        const double* b_ptr = (bias_opt.has_value() && bias_opt->defined()) ? bias_opt->data_ptr<double>() : nullptr;
+
+        for (int64_t i = 0; i < outer_size; ++i) {
+            double sum = 0.0;
+            double sq_sum = 0.0;
+            int64_t offset = i * inner_size;
+
+            for (int64_t j = 0; j < inner_size; ++j) {
+                double val = in_ptr[offset + j];
+                sum += val;
+                sq_sum += val * val;
+            }
+
+            double mean = sum / inner_size;
+            double var = (sq_sum / inner_size) - (mean * mean);
+            double inv_std = 1.0 / std::sqrt(var + eps);
+
+            for (int64_t j = 0; j < inner_size; ++j) {
+                double val = in_ptr[offset + j];
+                double normalized = (val - mean) * inv_std;
+
+                if (w_ptr) normalized *= w_ptr[j];
+                if (b_ptr) normalized += b_ptr[j];
+
+                out_ptr[offset + j] = normalized;
+            }
+        }
+    } else if (input.dtype() == DType::Float16 || input.dtype() == DType::BFloat16) {
+        // Reduced-precision inputs accumulate in float32 (ATen acc_type).
+        if (input.dtype() == DType::Float16) {
+            tensorplay::Half* out_ptr = out.data_ptr<tensorplay::Half>();
+            const tensorplay::Half* in_ptr = input.data_ptr<tensorplay::Half>();
+            const tensorplay::Half* w_ptr = (weight_opt.has_value() && weight_opt->defined()) ? weight_opt->data_ptr<tensorplay::Half>() : nullptr;
+            const tensorplay::Half* b_ptr = (bias_opt.has_value() && bias_opt->defined()) ? bias_opt->data_ptr<tensorplay::Half>() : nullptr;
+
+            for (int64_t i = 0; i < outer_size; ++i) {
+                float sum = 0.0f;
+                float sq_sum = 0.0f;
+                int64_t offset = i * inner_size;
+
+                for (int64_t j = 0; j < inner_size; ++j) {
+                    float val = static_cast<float>(in_ptr[offset + j]);
+                    sum += val;
+                    sq_sum += val * val;
+                }
+
+                float mean = sum / inner_size;
+                float var = (sq_sum / inner_size) - (mean * mean);
+                float inv_std = 1.0f / std::sqrt(var + static_cast<float>(eps));
+
+                for (int64_t j = 0; j < inner_size; ++j) {
+                    float val = static_cast<float>(in_ptr[offset + j]);
+                    float normalized = (val - mean) * inv_std;
+
+                    if (w_ptr) normalized *= static_cast<float>(w_ptr[j]);
+                    if (b_ptr) normalized += static_cast<float>(b_ptr[j]);
+
+                    out_ptr[offset + j] = static_cast<tensorplay::Half>(normalized);
+                }
+            }
+        } else {
+            tensorplay::BFloat16* out_ptr = out.data_ptr<tensorplay::BFloat16>();
+            const tensorplay::BFloat16* in_ptr = input.data_ptr<tensorplay::BFloat16>();
+            const tensorplay::BFloat16* w_ptr = (weight_opt.has_value() && weight_opt->defined()) ? weight_opt->data_ptr<tensorplay::BFloat16>() : nullptr;
+            const tensorplay::BFloat16* b_ptr = (bias_opt.has_value() && bias_opt->defined()) ? bias_opt->data_ptr<tensorplay::BFloat16>() : nullptr;
+
+            for (int64_t i = 0; i < outer_size; ++i) {
+                float sum = 0.0f;
+                float sq_sum = 0.0f;
+                int64_t offset = i * inner_size;
+
+                for (int64_t j = 0; j < inner_size; ++j) {
+                    float val = static_cast<float>(in_ptr[offset + j]);
+                    sum += val;
+                    sq_sum += val * val;
+                }
+
+                float mean = sum / inner_size;
+                float var = (sq_sum / inner_size) - (mean * mean);
+                float inv_std = 1.0f / std::sqrt(var + static_cast<float>(eps));
+
+                for (int64_t j = 0; j < inner_size; ++j) {
+                    float val = static_cast<float>(in_ptr[offset + j]);
+                    float normalized = (val - mean) * inv_std;
+
+                    if (w_ptr) normalized *= static_cast<float>(w_ptr[j]);
+                    if (b_ptr) normalized += static_cast<float>(b_ptr[j]);
+
+                    out_ptr[offset + j] = static_cast<tensorplay::BFloat16>(normalized);
+                }
+            }
+        }
     } else {
-        TP_THROW(NotImplementedError, "layer_norm only supports Float32");
+        TP_THROW(NotImplementedError,
+                 "layer_norm only supports Float32/Float64/Float16/BFloat16");
     }
     
     return out;
@@ -724,99 +822,243 @@ Tensor instance_norm_cpu(const Tensor& input, const std::optional<Tensor>& weigh
 
 
 // Backward for LayerNorm
-std::tuple<Tensor, Tensor, Tensor> layer_norm_backward_cpu(const Tensor& grad_output, const Tensor& input, 
-                              const std::vector<int64_t>& normalized_shape, 
-                              const std::optional<Tensor>& weight_opt, const std::optional<Tensor>& bias_opt, 
-                              double eps) {
-    
+// Typed kernel mirrors upstream ATen dispatch semantics
+// (aten/src/ATen/native/cpu/layer_norm_kernel.cpp): float/double compute
+// natively in their own type; reduced types accumulate via opmath (float).
+template <typename T>
+static std::tuple<Tensor, Tensor, Tensor> layer_norm_backward_cpu_typed(
+        const Tensor& grad_output, const Tensor& input,
+        const std::vector<int64_t>& normalized_shape,
+        const std::optional<Tensor>& weight_opt,
+        const std::optional<Tensor>& bias_opt,
+        double eps) {
+
     int64_t norm_ndim = normalized_shape.size();
     int64_t input_ndim = input.dim();
     int64_t outer_dims = input_ndim - norm_ndim;
     int64_t inner_size = 1;
     for (auto s : normalized_shape) inner_size *= s;
     int64_t outer_size = input.numel() / inner_size;
-    
-    if (input.dtype() != DType::Float32) TP_THROW(NotImplementedError, "layer_norm_backward only supports Float32");
-    
+
     Tensor grad_input = Tensor::empty_like(input);
     Tensor grad_weight;
     Tensor grad_bias;
-    
+
     if (weight_opt.has_value() && weight_opt->defined()) grad_weight = Tensor::empty_like(*weight_opt);
     if (bias_opt.has_value() && bias_opt->defined()) grad_bias = Tensor::empty_like(*bias_opt);
-    
-    float* grad_in_ptr = grad_input.data_ptr<float>();
-    const float* grad_out_ptr = grad_output.data_ptr<float>();
-    const float* in_ptr = input.data_ptr<float>();
-    
-    float* gw_ptr = (grad_weight.defined()) ? grad_weight.data_ptr<float>() : nullptr;
-    float* gb_ptr = (grad_bias.defined()) ? grad_bias.data_ptr<float>() : nullptr;
-    const float* w_ptr = (weight_opt.has_value() && weight_opt->defined()) ? weight_opt->data_ptr<float>() : nullptr;
-    
-    // Initialize grad_weight/grad_bias to 0
-    if (gw_ptr) std::fill(gw_ptr, gw_ptr + inner_size, 0.0f);
-    if (gb_ptr) std::fill(gb_ptr, gb_ptr + inner_size, 0.0f);
-    
-    // We iterate over outer_size (batches/sequences), and for each, compute gradients.
-    // Unlike BN, LN statistics are computed per-element in outer loop.
-    
+
+    T* grad_in_ptr = grad_input.data_ptr<T>();
+    const T* grad_out_ptr = grad_output.data_ptr<T>();
+    const T* in_ptr = input.data_ptr<T>();
+
+    T* gw_ptr = (grad_weight.defined()) ? grad_weight.data_ptr<T>() : nullptr;
+    T* gb_ptr = (grad_bias.defined()) ? grad_bias.data_ptr<T>() : nullptr;
+    const T* w_ptr = (weight_opt.has_value() && weight_opt->defined()) ? weight_opt->data_ptr<T>() : nullptr;
+
+    if (gw_ptr) std::fill(gw_ptr, gw_ptr + inner_size, T(0));
+    if (gb_ptr) std::fill(gb_ptr, gb_ptr + inner_size, T(0));
+
     for (int64_t i = 0; i < outer_size; ++i) {
         int64_t offset = i * inner_size;
-        
+
         // 1. Recompute statistics
-        float sum = 0.0f;
-        float sq_sum = 0.0f;
+        T sum = T(0);
+        T sq_sum = T(0);
         for (int64_t j = 0; j < inner_size; ++j) {
-            float val = in_ptr[offset + j];
+            T val = in_ptr[offset + j];
             sum += val;
             sq_sum += val * val;
         }
-        float mean = sum / inner_size;
-        float var = (sq_sum / inner_size) - (mean * mean);
-        float inv_std = 1.0f / std::sqrt(var + (float)eps);
-        
-        // 2. Compute local gradients
-        float s_dy = 0.0f;
-        float s_dy_x_hat = 0.0f;
-        
+        T mean = sum / inner_size;
+        T var = (sq_sum / inner_size) - (mean * mean);
+        T inv_std = T(1) / std::sqrt(var + static_cast<T>(eps));
+
+        // 2. Local gradients + dgamma/dbeta accumulation
+        T s_dy = T(0);
+        T s_dy_x_hat = T(0);
+
         for (int64_t j = 0; j < inner_size; ++j) {
-            float dy = grad_out_ptr[offset + j];
-            float x = in_ptr[offset + j];
-            float x_hat = (x - mean) * inv_std;
-            
-            // Accumulate grad_weight / grad_bias
+            T dy = grad_out_ptr[offset + j];
+            T x = in_ptr[offset + j];
+            T x_hat = (x - mean) * inv_std;
+
             if (gw_ptr) gw_ptr[j] += dy * x_hat;
             if (gb_ptr) gb_ptr[j] += dy;
-            
-            // For grad_input calculation:
-            // dL/dx depends on dL/dy * gamma.
-            // Let dy_eff = dL/dy * gamma
-            float gamma = (w_ptr) ? w_ptr[j] : 1.0f;
-            float dy_eff = dy * gamma;
-            
+
+            T gamma = (w_ptr) ? w_ptr[j] : T(1);
+            T dy_eff = dy * gamma;
+
             s_dy += dy_eff;
             s_dy_x_hat += dy_eff * x_hat;
         }
-        
-        // 3. Compute grad_input for this block
-        float term1 = inv_std / inner_size;
-        float M = (float)inner_size;
-        
+
+        // 3. grad_input for this block
+        T term1 = inv_std / inner_size;
+        T M = static_cast<T>(inner_size);
+
         for (int64_t j = 0; j < inner_size; ++j) {
-            float dy = grad_out_ptr[offset + j];
-            float x = in_ptr[offset + j];
-            float x_hat = (x - mean) * inv_std;
-            float gamma = (w_ptr) ? w_ptr[j] : 1.0f;
-            float dy_eff = dy * gamma;
-            
+            T dy = grad_out_ptr[offset + j];
+            T x = in_ptr[offset + j];
+            T x_hat = (x - mean) * inv_std;
+            T gamma = (w_ptr) ? w_ptr[j] : T(1);
+            T dy_eff = dy * gamma;
+
             grad_in_ptr[offset + j] = term1 * (M * dy_eff - s_dy - x_hat * s_dy_x_hat);
         }
     }
-    
+
     if (!weight_opt.has_value() || !weight_opt->defined()) grad_weight = Tensor();
     if (!bias_opt.has_value() || !bias_opt->defined()) grad_bias = Tensor();
 
     return std::make_tuple(grad_input, grad_weight, grad_bias);
+}
+
+static std::tuple<Tensor, Tensor, Tensor> layer_norm_backward_cpu_reduced(
+        const Tensor& grad_output, const Tensor& input,
+        const std::vector<int64_t>& normalized_shape,
+        const std::optional<Tensor>& weight_opt,
+        const std::optional<Tensor>& bias_opt,
+        double eps) {
+    // Reduced precision: promote to float32, reuse the typed kernel,
+    // cast grads back (ATen acc_type / opmath_t semantics).
+    const DType act_dt = input.dtype();
+    Tensor in_f = input.to(DType::Float32);
+    Tensor gy_f = grad_output.to(DType::Float32);
+    const bool has_w = weight_opt.has_value() && weight_opt->defined();
+    const bool has_b = bias_opt.has_value() && bias_opt->defined();
+    std::optional<Tensor> w_f = has_w
+        ? std::optional<Tensor>(weight_opt->to(DType::Float32)) : std::nullopt;
+    std::optional<Tensor> b_f = has_b
+        ? std::optional<Tensor>(bias_opt->to(DType::Float32)) : std::nullopt;
+    auto g = layer_norm_backward_cpu_typed<float>(
+        gy_f, in_f, normalized_shape, w_f, b_f, eps);
+    return std::make_tuple(
+        std::get<0>(g).to(act_dt),
+        std::get<1>(g).defined()
+            ? std::get<1>(g).to(has_w ? weight_opt->dtype() : act_dt)
+            : std::get<1>(g),
+        std::get<2>(g).defined()
+            ? std::get<2>(g).to(has_b ? bias_opt->dtype() : act_dt)
+            : std::get<2>(g));
+}
+
+std::tuple<Tensor, Tensor, Tensor> layer_norm_backward_cpu(const Tensor& grad_output, const Tensor& input, 
+                              const std::vector<int64_t>& normalized_shape, 
+                              const std::optional<Tensor>& weight_opt, const std::optional<Tensor>& bias_opt, 
+                              double eps) {
+    switch (input.dtype()) {
+        case DType::Float32:
+            return layer_norm_backward_cpu_typed<float>(
+                grad_output, input, normalized_shape, weight_opt, bias_opt, eps);
+        case DType::Float64:
+            return layer_norm_backward_cpu_typed<double>(
+                grad_output, input, normalized_shape, weight_opt, bias_opt, eps);
+        case DType::Float16:
+        case DType::BFloat16:
+            return layer_norm_backward_cpu_reduced(
+                grad_output, input, normalized_shape, weight_opt, bias_opt, eps);
+        default:
+            TP_THROW(NotImplementedError,
+                     "layer_norm_backward only supports Float32/Float64/Float16/BFloat16");
+    }
+}
+
+// rms_norm over the trailing normalized_shape dims: y = x * rsqrt(mean(x^2)+eps) * w.
+// fp32 accumulation for fp16/bf16 inputs (ATen rms_norm composite semantics).
+// Native single kernel replaces a 6-op python composite that cost ~24 extra
+// dispatches per Llama layer per token in the e2e profile.
+Tensor rms_norm_cpu(const Tensor& input, const std::vector<int64_t>& normalized_shape,
+                    const std::optional<Tensor>& weight_opt, double eps) {
+    const int64_t norm_ndim = (int64_t)normalized_shape.size();
+    const int64_t input_ndim = input.dim();
+    if (norm_ndim > input_ndim)
+        TP_THROW(RuntimeError, "rms_norm: normalized_shape dim larger than input dim");
+    int64_t inner_size = 1;
+    for (int64_t i = 0; i < norm_ndim; ++i) {
+        if (input.size(input_ndim - norm_ndim + i) != normalized_shape[i])
+            TP_THROW(RuntimeError, "rms_norm: Input shape mismatch with normalized_shape");
+        inner_size *= normalized_shape[i];
+    }
+    const int64_t outer_size = input.numel() / inner_size;
+    const bool has_w = weight_opt.has_value() && weight_opt->defined();
+
+    Tensor out = Tensor::empty_like(input);
+    Tensor wc = has_w ? weight_opt->contiguous() : Tensor();
+
+    const DType dt = input.dtype();
+    if (dt == DType::Float32 || dt == DType::Float64) {
+        const bool is_f64 = dt == DType::Float64;
+        const auto* in = is_f64 ? static_cast<const void*>(input.data_ptr<double>())
+                                : static_cast<const void*>(input.data_ptr<float>());
+        auto* op = is_f64 ? static_cast<void*>(out.data_ptr<double>())
+                          : static_cast<void*>(out.data_ptr<float>());
+        const auto* wp = has_w ? (is_f64 ? static_cast<const void*>(wc.data_ptr<double>())
+                                         : static_cast<const void*>(wc.data_ptr<float>()))
+                               : nullptr;
+        auto body = [&](int64_t b, int64_t e) {
+            for (int64_t i = b; i < e; ++i) {
+                const int64_t off = i * inner_size;
+                long double acc = 0.0L;
+                if (is_f64) {
+                    const double* r = static_cast<const double*>(in) + off;
+                    for (int64_t j = 0; j < inner_size; ++j) acc += double(r[j]) * r[j];
+                    const double inv = 1.0 / std::sqrt(double(acc) / inner_size + eps);
+                    double* o = static_cast<double*>(op) + off;
+                    const double* w = static_cast<const double*>(wp);
+                    for (int64_t j = 0; j < inner_size; ++j) o[j] = r[j] * inv * (w ? w[j] : 1.0);
+                } else {
+                    const float* r = static_cast<const float*>(in) + off;
+                    float acc32 = 0.0f;
+                    for (int64_t j = 0; j < inner_size; ++j) acc32 += r[j] * r[j];
+                    const float inv = 1.0f / std::sqrt(acc32 / inner_size + (float)eps);
+                    float* o = static_cast<float*>(op) + off;
+                    const float* w = static_cast<const float*>(wp);
+                    for (int64_t j = 0; j < inner_size; ++j) o[j] = r[j] * inv * (w ? w[j] : 1.0f);
+                }
+            }
+        };
+        if (outer_size > 1) {
+            const int64_t th = tensorplay::parallel::get_num_threads();
+            const int64_t grain = std::max<int64_t>(1, outer_size / (th * 4));
+            tensorplay::parallel::parallel_for(0, outer_size, grain, body);
+        } else body(0, outer_size);
+        return out;
+    }
+    if (dt == DType::Float16 || dt == DType::BFloat16) {
+        // fp32 accumulate + scale, store back at input precision.
+        const bool is_bf16 = dt == DType::BFloat16;
+        const auto readv = [&](const void* p, int64_t i) -> float {
+            return is_bf16 ? float(static_cast<const tensorplay::BFloat16*>(p)[i])
+                           : float(static_cast<const tensorplay::Half*>(p)[i]);
+        };
+        const auto writev = [&](void* p, int64_t i, float v) {
+            if (is_bf16) static_cast<tensorplay::BFloat16*>(p)[i] = tensorplay::BFloat16(v);
+            else static_cast<tensorplay::Half*>(p)[i] = tensorplay::Half(v);
+        };
+        const void* ip = input.data_ptr();
+        void* optr = out.data_ptr();
+        const void* wp = has_w ? wc.data_ptr() : nullptr;
+        const bool wb16 = has_w && wc.dtype() == DType::BFloat16;
+        const bool whalf = has_w && wc.dtype() == DType::Float16;
+        for (int64_t i = 0; i < outer_size; ++i) {
+            const int64_t off = i * inner_size;
+            float acc = 0.0f;
+            for (int64_t j = 0; j < inner_size; ++j) { float v = readv(ip, off + j); acc += v * v; }
+            const float inv = 1.0f / std::sqrt(acc / inner_size + (float)eps);
+            for (int64_t j = 0; j < inner_size; ++j) {
+                float v = readv(ip, off + j) * inv;
+                if (has_w) {
+                    float w = wb16 ? float(static_cast<const tensorplay::BFloat16*>(wp)[j])
+                             : whalf ? float(static_cast<const tensorplay::Half*>(wp)[j])
+                                     : static_cast<const float*>(wp)[j];
+                    v *= w;
+                }
+                writev(optr, off + j, v);
+            }
+        }
+        return out;
+    }
+    TP_THROW(NotImplementedError, "rms_norm_cpu: unsupported dtype");
 }
 
 // Registration
@@ -825,6 +1067,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, NormalizationKernels) {
     m.impl("layer_norm", layer_norm_cpu);
     m.impl("group_norm", group_norm_cpu);
     m.impl("instance_norm", instance_norm_cpu);
+    m.impl("rms_norm", rms_norm_cpu);
     
     m.impl("batch_norm_backward", batch_norm_backward_cpu);
     m.impl("layer_norm_backward", layer_norm_backward_cpu);

@@ -1,4 +1,4 @@
-"""Datasets, mirroring torchvision.datasets (video/optical-flow excluded)."""
+"""Datasets, mirroring tensorplay.vision.datasets (video/optical-flow excluded)."""
 
 from .caltech import Caltech101, Caltech256
 from .celeba import CelebA

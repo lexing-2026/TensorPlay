@@ -2,7 +2,7 @@ import math
 import warnings
 from typing import Optional
 
-import tensorplay as torch
+import tensorplay as tensorplay
 import tensorplay.nn.functional as F
 from tensorplay import Tensor
 
@@ -20,7 +20,7 @@ def _generate_wave_table(
     min: float,
     max: float,
     phase: float,
-    device: torch.device,
+    device: tensorplay.device,
 ) -> Tensor:
     r"""A helper function for phaser. Generates a table with given parameters.
 
@@ -31,24 +31,24 @@ def _generate_wave_table(
         min (float): desired min value
         max (float): desired max value
         phase (float): desired phase
-        device (torch.device): Torch device on which table must be generated
+        device (tensorplay.device): TensorPlay device on which table must be generated
     Returns:
         Tensor: A 1D tensor with wave table values
     """
 
     phase_offset = int(phase / math.pi / 2 * table_size + 0.5)
 
-    t = torch.arange(table_size, device=device, dtype=torch.int32)
+    t = tensorplay.arange(table_size, device=device, dtype=tensorplay.int32)
 
     point = (t + phase_offset) % table_size
 
-    d = torch.zeros_like(point, device=device, dtype=torch.float64)
+    d = tensorplay.zeros_like(point, device=device, dtype=tensorplay.float64)
 
     if wave_type == "SINE":
-        d = (torch.sin(point.to(torch.float64) / table_size * 2 * math.pi) + 1) / 2
+        d = (tensorplay.sin(point.to(tensorplay.float64) / table_size * 2 * math.pi) + 1) / 2
     elif wave_type == "TRIANGLE":
-        d = point.to(torch.float64) * 2 / table_size
-        value = torch.div(4 * point, table_size, rounding_mode="floor")
+        d = point.to(tensorplay.float64) * 2 / table_size
+        value = tensorplay.div(4 * point, table_size, rounding_mode="floor")
         d[value == 0] = d[value == 0] + 0.5
         d[value == 1] = 1.5 - d[value == 1]
         d[value == 2] = 1.5 - d[value == 2]
@@ -60,9 +60,9 @@ def _generate_wave_table(
         mask = d < 0
         d[mask] = d[mask] - 0.5
         d[~mask] = d[~mask] + 0.5
-        d = d.to(torch.int32)
+        d = d.to(tensorplay.int32)
     elif data_type == "FLOAT":
-        d = d.to(torch.float32)
+        d = d.to(tensorplay.float32)
 
     return d
 
@@ -75,10 +75,10 @@ def allpass_biquad(waveform: Tensor, sample_rate: int, central_freq: float, Q: f
     .. properties:: Autograd TorchScript
 
     Args:
-        waveform(torch.Tensor): audio waveform of dimension of `(..., time)`
+        waveform(tensorplay.Tensor): audio waveform of dimension of `(..., time)`
         sample_rate (int): sampling rate of the waveform, e.g. 44100 (Hz)
-        central_freq (float or torch.Tensor): central frequency (in Hz)
-        Q (float or torch.Tensor, optional): https://en.wikipedia.org/wiki/Q_factor (Default: ``0.707``)
+        central_freq (float or tensorplay.Tensor): central frequency (in Hz)
+        Q (float or tensorplay.Tensor, optional): https://en.wikipedia.org/wiki/Q_factor (Default: ``0.707``)
 
     Returns:
         Tensor: Waveform of dimension of `(..., time)`
@@ -89,18 +89,18 @@ def allpass_biquad(waveform: Tensor, sample_rate: int, central_freq: float, Q: f
     """
     dtype = waveform.dtype
     device = waveform.device
-    central_freq = torch.as_tensor(central_freq, dtype=dtype, device=device)
-    Q = torch.as_tensor(Q, dtype=dtype, device=device)
+    central_freq = tensorplay.as_tensor(central_freq, dtype=dtype, device=device)
+    Q = tensorplay.as_tensor(Q, dtype=dtype, device=device)
 
     w0 = 2 * math.pi * central_freq / sample_rate
 
-    alpha = torch.sin(w0) / 2 / Q
+    alpha = tensorplay.sin(w0) / 2 / Q
 
     b0 = 1 - alpha
-    b1 = -2 * torch.cos(w0)
+    b1 = -2 * tensorplay.cos(w0)
     b2 = 1 + alpha
     a0 = 1 + alpha
-    a1 = -2 * torch.cos(w0)
+    a1 = -2 * tensorplay.cos(w0)
     a2 = 1 - alpha
     return biquad(waveform, b0, b1, b2, a0, a1, a2)
 
@@ -121,8 +121,8 @@ def band_biquad(
     Args:
         waveform (Tensor): audio waveform of dimension of `(..., time)`
         sample_rate (int): sampling rate of the waveform, e.g. 44100 (Hz)
-        central_freq (float or torch.Tensor): central frequency (in Hz)
-        Q (float or torch.Tensor, optional): https://en.wikipedia.org/wiki/Q_factor (Default: ``0.707``).
+        central_freq (float or tensorplay.Tensor): central frequency (in Hz)
+        Q (float or tensorplay.Tensor, optional): https://en.wikipedia.org/wiki/Q_factor (Default: ``0.707``).
         noise (bool, optional) : If ``True``, uses the alternate mode for un-pitched audio (e.g. percussion).
             If ``False``, uses mode oriented to pitched audio, i.e. voice, singing,
             or instrumental music (Default: ``False``).
@@ -136,20 +136,20 @@ def band_biquad(
     """
     dtype = waveform.dtype
     device = waveform.device
-    central_freq = torch.as_tensor(central_freq, dtype=dtype, device=device)
-    Q = torch.as_tensor(Q, dtype=dtype, device=device)
+    central_freq = tensorplay.as_tensor(central_freq, dtype=dtype, device=device)
+    Q = tensorplay.as_tensor(Q, dtype=dtype, device=device)
 
     w0 = 2 * math.pi * central_freq / sample_rate
     bw_Hz = central_freq / Q
 
     a0 = 1.0
-    a2 = torch.exp(-2 * math.pi * bw_Hz / sample_rate)
-    a1 = -4 * a2 / (1 + a2) * torch.cos(w0)
+    a2 = tensorplay.exp(-2 * math.pi * bw_Hz / sample_rate)
+    a1 = -4 * a2 / (1 + a2) * tensorplay.cos(w0)
 
-    b0 = torch.sqrt(1 - a1 * a1 / (4 * a2)) * (1 - a2)
+    b0 = tensorplay.sqrt(1 - a1 * a1 / (4 * a2)) * (1 - a2)
 
     if noise:
-        mult = torch.sqrt(((1 + a2) * (1 + a2) - a1 * a1) * (1 - a2) / (1 + a2)) / b0
+        mult = tensorplay.sqrt(((1 + a2) * (1 + a2) - a1 * a1) * (1 - a2) / (1 + a2)) / b0
         b0 = mult * b0
 
     b1 = 0.0
@@ -174,8 +174,8 @@ def bandpass_biquad(
     Args:
         waveform (Tensor): audio waveform of dimension of `(..., time)`
         sample_rate (int): sampling rate of the waveform, e.g. 44100 (Hz)
-        central_freq (float or torch.Tensor): central frequency (in Hz)
-        Q (float or torch.Tensor, optional): https://en.wikipedia.org/wiki/Q_factor (Default: ``0.707``)
+        central_freq (float or tensorplay.Tensor): central frequency (in Hz)
+        Q (float or tensorplay.Tensor, optional): https://en.wikipedia.org/wiki/Q_factor (Default: ``0.707``)
         const_skirt_gain (bool, optional) : If ``True``, uses a constant skirt gain (peak gain = Q).
             If ``False``, uses a constant 0dB peak gain. (Default: ``False``)
 
@@ -188,18 +188,18 @@ def bandpass_biquad(
     """
     dtype = waveform.dtype
     device = waveform.device
-    central_freq = torch.as_tensor(central_freq, dtype=dtype, device=device)
-    Q = torch.as_tensor(Q, dtype=dtype, device=device)
+    central_freq = tensorplay.as_tensor(central_freq, dtype=dtype, device=device)
+    Q = tensorplay.as_tensor(Q, dtype=dtype, device=device)
 
     w0 = 2 * math.pi * central_freq / sample_rate
-    alpha = torch.sin(w0) / 2 / Q
+    alpha = tensorplay.sin(w0) / 2 / Q
 
-    temp = torch.sin(w0) / 2 if const_skirt_gain else alpha
+    temp = tensorplay.sin(w0) / 2 if const_skirt_gain else alpha
     b0 = temp
     b1 = 0.0
     b2 = -temp
     a0 = 1 + alpha
-    a1 = -2 * torch.cos(w0)
+    a1 = -2 * tensorplay.cos(w0)
     a2 = 1 - alpha
     return biquad(waveform, b0, b1, b2, a0, a1, a2)
 
@@ -214,8 +214,8 @@ def bandreject_biquad(waveform: Tensor, sample_rate: int, central_freq: float, Q
     Args:
         waveform (Tensor): audio waveform of dimension of `(..., time)`
         sample_rate (int): sampling rate of the waveform, e.g. 44100 (Hz)
-        central_freq (float or torch.Tensor): central frequency (in Hz)
-        Q (float or torch.Tensor, optional): https://en.wikipedia.org/wiki/Q_factor (Default: ``0.707``)
+        central_freq (float or tensorplay.Tensor): central frequency (in Hz)
+        Q (float or tensorplay.Tensor, optional): https://en.wikipedia.org/wiki/Q_factor (Default: ``0.707``)
 
     Returns:
         Tensor: Waveform of dimension of `(..., time)`
@@ -226,17 +226,17 @@ def bandreject_biquad(waveform: Tensor, sample_rate: int, central_freq: float, Q
     """
     dtype = waveform.dtype
     device = waveform.device
-    central_freq = torch.as_tensor(central_freq, dtype=dtype, device=device)
-    Q = torch.as_tensor(Q, dtype=dtype, device=device)
+    central_freq = tensorplay.as_tensor(central_freq, dtype=dtype, device=device)
+    Q = tensorplay.as_tensor(Q, dtype=dtype, device=device)
 
     w0 = 2 * math.pi * central_freq / sample_rate
-    alpha = torch.sin(w0) / 2 / Q
+    alpha = tensorplay.sin(w0) / 2 / Q
 
     b0 = 1.0
-    b1 = -2 * torch.cos(w0)
+    b1 = -2 * tensorplay.cos(w0)
     b2 = 1.0
     a0 = 1 + alpha
-    a1 = -2 * torch.cos(w0)
+    a1 = -2 * tensorplay.cos(w0)
     a2 = 1 - alpha
     return biquad(waveform, b0, b1, b2, a0, a1, a2)
 
@@ -257,9 +257,9 @@ def bass_biquad(
     Args:
         waveform (Tensor): audio waveform of dimension of `(..., time)`
         sample_rate (int): sampling rate of the waveform, e.g. 44100 (Hz)
-        gain (float or torch.Tensor): desired gain at the boost (or attenuation) in dB.
-        central_freq (float or torch.Tensor, optional): central frequency (in Hz). (Default: ``100``)
-        Q (float or torch.Tensor, optional): https://en.wikipedia.org/wiki/Q_factor (Default: ``0.707``).
+        gain (float or tensorplay.Tensor): desired gain at the boost (or attenuation) in dB.
+        central_freq (float or tensorplay.Tensor, optional): central frequency (in Hz). (Default: ``100``)
+        Q (float or tensorplay.Tensor, optional): https://en.wikipedia.org/wiki/Q_factor (Default: ``0.707``).
 
     Returns:
         Tensor: Waveform of dimension of `(..., time)`
@@ -270,17 +270,17 @@ def bass_biquad(
     """
     dtype = waveform.dtype
     device = waveform.device
-    central_freq = torch.as_tensor(central_freq, dtype=dtype, device=device)
-    Q = torch.as_tensor(Q, dtype=dtype, device=device)
-    gain = torch.as_tensor(gain, dtype=dtype, device=device)
+    central_freq = tensorplay.as_tensor(central_freq, dtype=dtype, device=device)
+    Q = tensorplay.as_tensor(Q, dtype=dtype, device=device)
+    gain = tensorplay.as_tensor(gain, dtype=dtype, device=device)
 
     w0 = 2 * math.pi * central_freq / sample_rate
-    alpha = torch.sin(w0) / 2 / Q
-    A = torch.exp(gain / 40 * math.log(10))
+    alpha = tensorplay.sin(w0) / 2 / Q
+    A = tensorplay.exp(gain / 40 * math.log(10))
 
-    temp1 = 2 * torch.sqrt(A) * alpha
-    temp2 = (A - 1) * torch.cos(w0)
-    temp3 = (A + 1) * torch.cos(w0)
+    temp1 = 2 * tensorplay.sqrt(A) * alpha
+    temp2 = (A - 1) * tensorplay.cos(w0)
+    temp3 = (A + 1) * tensorplay.cos(w0)
 
     b0 = A * ((A + 1) - temp2 + temp1)
     b1 = 2 * A * ((A - 1) - temp3)
@@ -301,12 +301,12 @@ def biquad(waveform: Tensor, b0: float, b1: float, b2: float, a0: float, a1: flo
 
     Args:
         waveform (Tensor): audio waveform of dimension of `(..., time)`
-        b0 (float or torch.Tensor): numerator coefficient of current input, x[n]
-        b1 (float or torch.Tensor): numerator coefficient of input one time step ago x[n-1]
-        b2 (float or torch.Tensor): numerator coefficient of input two time steps ago x[n-2]
-        a0 (float or torch.Tensor): denominator coefficient of current output y[n], typically 1
-        a1 (float or torch.Tensor): denominator coefficient of current output y[n-1]
-        a2 (float or torch.Tensor): denominator coefficient of current output y[n-2]
+        b0 (float or tensorplay.Tensor): numerator coefficient of current input, x[n]
+        b1 (float or tensorplay.Tensor): numerator coefficient of input one time step ago x[n-1]
+        b2 (float or tensorplay.Tensor): numerator coefficient of input two time steps ago x[n-2]
+        a0 (float or tensorplay.Tensor): denominator coefficient of current output y[n], typically 1
+        a1 (float or tensorplay.Tensor): denominator coefficient of current output y[n-1]
+        a2 (float or tensorplay.Tensor): denominator coefficient of current output y[n-2]
 
     Returns:
         Tensor: Waveform with dimension of `(..., time)`
@@ -318,17 +318,17 @@ def biquad(waveform: Tensor, b0: float, b1: float, b2: float, a0: float, a1: flo
     device = waveform.device
     dtype = waveform.dtype
 
-    b0 = torch.as_tensor(b0, dtype=dtype, device=device).view(1)
-    b1 = torch.as_tensor(b1, dtype=dtype, device=device).view(1)
-    b2 = torch.as_tensor(b2, dtype=dtype, device=device).view(1)
-    a0 = torch.as_tensor(a0, dtype=dtype, device=device).view(1)
-    a1 = torch.as_tensor(a1, dtype=dtype, device=device).view(1)
-    a2 = torch.as_tensor(a2, dtype=dtype, device=device).view(1)
+    b0 = tensorplay.as_tensor(b0, dtype=dtype, device=device).view(1)
+    b1 = tensorplay.as_tensor(b1, dtype=dtype, device=device).view(1)
+    b2 = tensorplay.as_tensor(b2, dtype=dtype, device=device).view(1)
+    a0 = tensorplay.as_tensor(a0, dtype=dtype, device=device).view(1)
+    a1 = tensorplay.as_tensor(a1, dtype=dtype, device=device).view(1)
+    a2 = tensorplay.as_tensor(a2, dtype=dtype, device=device).view(1)
 
     output_waveform = lfilter(
         waveform,
-        torch.cat([a0, a1, a2]),
-        torch.cat([b0, b1, b2]),
+        tensorplay.cat([a0, a1, a2]),
+        tensorplay.cat([b0, b1, b2]),
     )
     return output_waveform
 
@@ -361,8 +361,8 @@ def contrast(waveform: Tensor, enhancement_amount: float = 75.0) -> Tensor:
     contrast = enhancement_amount / 750.0
 
     temp1 = waveform * (math.pi / 2)
-    temp2 = contrast * torch.sin(temp1 * 4)
-    output_waveform = torch.sin(temp1 + temp2)
+    temp2 = contrast * tensorplay.sin(temp1 * 4)
+    output_waveform = tensorplay.sin(temp1 + temp2)
 
     return output_waveform
 
@@ -476,10 +476,10 @@ def _add_noise_shaping(dithered_waveform: Tensor, waveform: Tensor) -> Tensor:
     error = dithered_waveform - waveform
 
     # add error[n-1] to dithered_waveform[n], so offset the error by 1 index
-    zeros = torch.zeros(1, dtype=error.dtype, device=error.device)
+    zeros = tensorplay.zeros(1, dtype=error.dtype, device=error.device)
     for index in range(error.size()[0]):
         err = error[index]
-        error_offset = torch.cat((zeros, err))
+        error_offset = tensorplay.cat((zeros, err))
         error[index] = error_offset[: waveform.size()[1]]
 
     noise_shaped = dithered_waveform + error
@@ -520,7 +520,7 @@ def _apply_probability_distribution(waveform: Tensor, density_function: str = "T
 
     random_channel = (
         int(
-            torch.randint(
+            tensorplay.randint(
                 channel_size,
                 [
                     1,
@@ -532,7 +532,7 @@ def _apply_probability_distribution(waveform: Tensor, density_function: str = "T
     )
     random_time = (
         int(
-            torch.randint(
+            tensorplay.randint(
                 time_size,
                 [
                     1,
@@ -563,7 +563,7 @@ def _apply_probability_distribution(waveform: Tensor, density_function: str = "T
         gaussian = waveform[random_channel][random_time]
         for ws in num_rand_variables * [time_size]:
             rand_chan = int(
-                torch.randint(
+                tensorplay.randint(
                     channel_size,
                     [
                         1,
@@ -572,7 +572,7 @@ def _apply_probability_distribution(waveform: Tensor, density_function: str = "T
             )
             gaussian += waveform[rand_chan][
                 int(
-                    torch.randint(
+                    tensorplay.randint(
                         ws,
                         [
                             1,
@@ -584,11 +584,11 @@ def _apply_probability_distribution(waveform: Tensor, density_function: str = "T
         signal_scaled_dis = signal_scaled + gaussian
     else:
         # dtype needed for https://github.com/pytorch/pytorch/issues/32358
-        TPDF = torch.bartlett_window(time_size + 1, dtype=signal_scaled.dtype, device=signal_scaled.device)
+        TPDF = tensorplay.bartlett_window(time_size + 1, dtype=signal_scaled.dtype, device=signal_scaled.device)
         TPDF = TPDF.repeat((channel_size + 1), 1)
         signal_scaled_dis = signal_scaled + TPDF
 
-    quantised_signal_scaled = torch.round(signal_scaled_dis)
+    quantised_signal_scaled = tensorplay.round(signal_scaled_dis)
     quantised_signal = quantised_signal_scaled / down_scaling
 
     # unpack batch
@@ -644,27 +644,27 @@ def equalizer_biquad(
         waveform (Tensor): audio waveform of dimension of `(..., time)`
         sample_rate (int): sampling rate of the waveform, e.g. 44100 (Hz)
         center_freq (float): filter's central frequency
-        gain (float or torch.Tensor): desired gain at the boost (or attenuation) in dB
-        Q (float or torch.Tensor, optional): https://en.wikipedia.org/wiki/Q_factor (Default: ``0.707``)
+        gain (float or tensorplay.Tensor): desired gain at the boost (or attenuation) in dB
+        Q (float or tensorplay.Tensor, optional): https://en.wikipedia.org/wiki/Q_factor (Default: ``0.707``)
 
     Returns:
         Tensor: Waveform of dimension of `(..., time)`
     """
     dtype = waveform.dtype
     device = waveform.device
-    center_freq = torch.as_tensor(center_freq, dtype=dtype, device=device)
-    Q = torch.as_tensor(Q, dtype=dtype, device=device)
-    gain = torch.as_tensor(gain, dtype=dtype, device=device)
+    center_freq = tensorplay.as_tensor(center_freq, dtype=dtype, device=device)
+    Q = tensorplay.as_tensor(Q, dtype=dtype, device=device)
+    gain = tensorplay.as_tensor(gain, dtype=dtype, device=device)
 
     w0 = 2 * math.pi * center_freq / sample_rate
-    A = torch.exp(gain / 40.0 * math.log(10))
-    alpha = torch.sin(w0) / 2 / Q
+    A = tensorplay.exp(gain / 40.0 * math.log(10))
+    alpha = tensorplay.sin(w0) / 2 / Q
 
     b0 = 1 + alpha * A
-    b1 = -2 * torch.cos(w0)
+    b1 = -2 * tensorplay.cos(w0)
     b2 = 1 - alpha * A
     a0 = 1 + alpha / A
-    a1 = -2 * torch.cos(w0)
+    a1 = -2 * tensorplay.cos(w0)
     a2 = 1 - alpha / A
     return biquad(waveform, b0, b1, b2, a0, a1, a2)
 
@@ -799,8 +799,8 @@ def flanger(
     delay_buf_length = int((delay_min + delay_depth) * sample_rate + 0.5)
     delay_buf_length = delay_buf_length + 2
 
-    delay_bufs = torch.zeros(waveform.shape[0], n_channels, delay_buf_length, dtype=dtype, device=device)
-    delay_last = torch.zeros(waveform.shape[0], n_channels, dtype=dtype, device=device)
+    delay_bufs = tensorplay.zeros(waveform.shape[0], n_channels, delay_buf_length, dtype=dtype, device=device)
+    delay_last = tensorplay.zeros(waveform.shape[0], n_channels, dtype=dtype, device=device)
 
     lfo_length = int(sample_rate / speed)
 
@@ -817,22 +817,22 @@ def flanger(
         device=device,
     )
 
-    output_waveform = torch.zeros_like(waveform, dtype=dtype, device=device)
+    output_waveform = tensorplay.zeros_like(waveform, dtype=dtype, device=device)
 
     delay_buf_pos = 0
     lfo_pos = 0
-    channel_idxs = torch.arange(0, n_channels, device=device)
+    channel_idxs = tensorplay.arange(0, n_channels, device=device)
 
     for i in range(waveform.shape[-1]):
 
         delay_buf_pos = (delay_buf_pos + delay_buf_length - 1) % delay_buf_length
 
-        cur_channel_phase = (channel_idxs * lfo_length * channel_phase + 0.5).to(torch.int64)
+        cur_channel_phase = (channel_idxs * lfo_length * channel_phase + 0.5).to(tensorplay.int64)
         delay_tensor = lfo[(lfo_pos + cur_channel_phase) % lfo_length]
-        frac_delay = torch.frac(delay_tensor)
-        delay_tensor = torch.floor(delay_tensor)
+        frac_delay = tensorplay.frac(delay_tensor)
+        delay_tensor = tensorplay.floor(delay_tensor)
 
-        int_delay = delay_tensor.to(torch.int64)
+        int_delay = delay_tensor.to(tensorplay.int64)
 
         temp = waveform[:, :, i]
 
@@ -900,25 +900,25 @@ def highpass_biquad(waveform: Tensor, sample_rate: int, cutoff_freq: float, Q: f
     Args:
         waveform (Tensor): audio waveform of dimension of `(..., time)`
         sample_rate (int): sampling rate of the waveform, e.g. 44100 (Hz)
-        cutoff_freq (float or torch.Tensor): filter cutoff frequency
-        Q (float or torch.Tensor, optional): https://en.wikipedia.org/wiki/Q_factor (Default: ``0.707``)
+        cutoff_freq (float or tensorplay.Tensor): filter cutoff frequency
+        Q (float or tensorplay.Tensor, optional): https://en.wikipedia.org/wiki/Q_factor (Default: ``0.707``)
 
     Returns:
         Tensor: Waveform dimension of `(..., time)`
     """
     dtype = waveform.dtype
     device = waveform.device
-    cutoff_freq = torch.as_tensor(cutoff_freq, dtype=dtype, device=device)
-    Q = torch.as_tensor(Q, dtype=dtype, device=device)
+    cutoff_freq = tensorplay.as_tensor(cutoff_freq, dtype=dtype, device=device)
+    Q = tensorplay.as_tensor(Q, dtype=dtype, device=device)
 
     w0 = 2 * math.pi * cutoff_freq / sample_rate
-    alpha = torch.sin(w0) / 2.0 / Q
+    alpha = tensorplay.sin(w0) / 2.0 / Q
 
-    b0 = (1 + torch.cos(w0)) / 2
-    b1 = -1 - torch.cos(w0)
+    b0 = (1 + tensorplay.cos(w0)) / 2
+    b1 = -1 - tensorplay.cos(w0)
     b2 = b0
     a0 = 1 + alpha
-    a1 = -2 * torch.cos(w0)
+    a1 = -2 * tensorplay.cos(w0)
     a2 = 1 - alpha
     return biquad(waveform, b0, b1, b2, a0, a1, a2)
 
@@ -933,12 +933,12 @@ def _lfilter_core_generic_loop(input_signal_windows: Tensor, a_coeffs_flipped: T
 
 
 if _IS_AUDIO_EXT_AVAILABLE:
-    _lfilter_core_loop = torch.ops.torchaudio._lfilter_core_loop
+    _lfilter_core_loop = 
 else:
     _lfilter_core_loop = _lfilter_core_generic_loop
 
 
-class DifferentiableFIR(torch.autograd.Function):
+class DifferentiableFIR(tensorplay.autograd.Function):
     @staticmethod
     def forward(ctx, waveform, b_coeffs):
         n_order = b_coeffs.size(1)
@@ -946,7 +946,7 @@ class DifferentiableFIR(torch.autograd.Function):
         b_coeff_flipped = b_coeffs.flip(1).contiguous()
         padded_waveform = F.pad(waveform, (n_order - 1, 0))
         output = F.conv1d(padded_waveform, b_coeff_flipped.unsqueeze(1), groups=n_channel)
-        if not torch.jit.is_scripting() and not torch.jit.is_tracing():
+        if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
             ctx.save_for_backward(waveform, b_coeffs, output)
         return output
 
@@ -974,13 +974,13 @@ class DifferentiableFIR(torch.autograd.Function):
 
     @staticmethod
     def ts_apply(waveform, b_coeffs):
-        if torch.jit.is_scripting() or torch.jit.is_tracing():
-            return DifferentiableFIR.forward(torch.empty(0), waveform, b_coeffs)
+        if tensorplay.jit.is_scripting() or tensorplay.jit.is_tracing():
+            return DifferentiableFIR.forward(tensorplay.empty(0), waveform, b_coeffs)
         else:
             return DifferentiableFIR.apply(waveform, b_coeffs)
 
 
-class DifferentiableIIR(torch.autograd.Function):
+class DifferentiableIIR(tensorplay.autograd.Function):
     @staticmethod
     def forward(ctx, waveform, a_coeffs_normalized):
         n_batch, n_channel, n_sample = waveform.shape
@@ -988,12 +988,12 @@ class DifferentiableIIR(torch.autograd.Function):
         n_sample_padded = n_sample + n_order - 1
 
         a_coeff_flipped = a_coeffs_normalized.flip(1).contiguous()
-        padded_output_waveform = torch.zeros(
+        padded_output_waveform = tensorplay.zeros(
             n_batch, n_channel, n_sample_padded, device=waveform.device, dtype=waveform.dtype
         )
         _lfilter_core_loop(waveform, a_coeff_flipped, padded_output_waveform)
         output = padded_output_waveform[:, :, n_order - 1 :]
-        if not torch.jit.is_scripting() and not torch.jit.is_tracing():
+        if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
             ctx.save_for_backward(waveform, a_coeffs_normalized, output)
         return output
 
@@ -1018,8 +1018,8 @@ class DifferentiableIIR(torch.autograd.Function):
 
     @staticmethod
     def ts_apply(waveform, a_coeffs_normalized):
-        if torch.jit.is_scripting() or torch.jit.is_tracing():
-            return DifferentiableIIR.forward(torch.empty(0), waveform, a_coeffs_normalized)
+        if tensorplay.jit.is_scripting() or tensorplay.jit.is_tracing():
+            return DifferentiableIIR.forward(tensorplay.empty(0), waveform, a_coeffs_normalized)
         else:
             return DifferentiableIIR.apply(waveform, a_coeffs_normalized)
 
@@ -1080,7 +1080,7 @@ def lfilter(waveform: Tensor, a_coeffs: Tensor, b_coeffs: Tensor, clamp: bool = 
                     f"Found: coeffs batches: {a_coeffs.shape[0]}, waveform batches: {waveform.shape[-2]}"
                 )
         else:
-            waveform = torch.stack([waveform] * a_coeffs.shape[0], -2)
+            waveform = tensorplay.stack([waveform] * a_coeffs.shape[0], -2)
     else:
         a_coeffs = a_coeffs.unsqueeze(0)
         b_coeffs = b_coeffs.unsqueeze(0)
@@ -1091,7 +1091,7 @@ def lfilter(waveform: Tensor, a_coeffs: Tensor, b_coeffs: Tensor, clamp: bool = 
     output = _lfilter(waveform, a_coeffs, b_coeffs)
 
     if clamp:
-        output = torch.clamp(output, min=-1.0, max=1.0)
+        output = tensorplay.clamp(output, min=-1.0, max=1.0)
 
     # unpack batch
     output = output.reshape(shape[:-1] + output.shape[-1:])
@@ -1107,27 +1107,27 @@ def lowpass_biquad(waveform: Tensor, sample_rate: int, cutoff_freq: float, Q: fl
     .. properties:: Autograd TorchScript
 
     Args:
-        waveform (torch.Tensor): audio waveform of dimension of `(..., time)`
+        waveform (tensorplay.Tensor): audio waveform of dimension of `(..., time)`
         sample_rate (int): sampling rate of the waveform, e.g. 44100 (Hz)
-        cutoff_freq (float or torch.Tensor): filter cutoff frequency
-        Q (float or torch.Tensor, optional): https://en.wikipedia.org/wiki/Q_factor (Default: ``0.707``)
+        cutoff_freq (float or tensorplay.Tensor): filter cutoff frequency
+        Q (float or tensorplay.Tensor, optional): https://en.wikipedia.org/wiki/Q_factor (Default: ``0.707``)
 
     Returns:
         Tensor: Waveform of dimension of `(..., time)`
     """
     dtype = waveform.dtype
     device = waveform.device
-    cutoff_freq = torch.as_tensor(cutoff_freq, dtype=dtype, device=device)
-    Q = torch.as_tensor(Q, dtype=dtype, device=device)
+    cutoff_freq = tensorplay.as_tensor(cutoff_freq, dtype=dtype, device=device)
+    Q = tensorplay.as_tensor(Q, dtype=dtype, device=device)
 
     w0 = 2 * math.pi * cutoff_freq / sample_rate
-    alpha = torch.sin(w0) / 2 / Q
+    alpha = tensorplay.sin(w0) / 2 / Q
 
-    b0 = (1 - torch.cos(w0)) / 2
-    b1 = 1 - torch.cos(w0)
+    b0 = (1 - tensorplay.cos(w0)) / 2
+    b1 = 1 - tensorplay.cos(w0)
     b2 = b0
     a0 = 1 + alpha
-    a1 = -2 * torch.cos(w0)
+    a1 = -2 * tensorplay.cos(w0)
     a2 = 1 - alpha
     return biquad(waveform, b0, b1, b2, a0, a1, a2)
 
@@ -1142,7 +1142,7 @@ def _overdrive_core_loop_generic(
 
 
 if _IS_AUDIO_EXT_AVAILABLE:
-    _overdrive_core_loop_cpu = torch.ops.torchaudio._overdrive_core_loop
+    _overdrive_core_loop_cpu = 
 else:
     _overdrive_core_loop_cpu = _overdrive_core_loop_generic
 
@@ -1177,25 +1177,25 @@ def overdrive(waveform: Tensor, gain: float = 20, colour: float = 20) -> Tensor:
 
     gain = _dB2Linear(gain)
     colour = colour / 200
-    last_in = torch.zeros(waveform.shape[:-1], dtype=dtype, device=device)
-    last_out = torch.zeros(waveform.shape[:-1], dtype=dtype, device=device)
+    last_in = tensorplay.zeros(waveform.shape[:-1], dtype=dtype, device=device)
+    last_out = tensorplay.zeros(waveform.shape[:-1], dtype=dtype, device=device)
 
     temp = waveform * gain + colour
 
     mask1 = temp < -1
-    temp[mask1] = torch.tensor(-2.0 / 3.0, dtype=dtype, device=device)
+    temp[mask1] = tensorplay.tensor(-2.0 / 3.0, dtype=dtype, device=device)
     # Wrapping the constant with Tensor is required for Torchscript
 
     mask2 = temp > 1
-    temp[mask2] = torch.tensor(2.0 / 3.0, dtype=dtype, device=device)
+    temp[mask2] = tensorplay.tensor(2.0 / 3.0, dtype=dtype, device=device)
 
     mask3 = ~mask1 & ~mask2
     temp[mask3] = temp[mask3] - (temp[mask3] ** 3) * (1.0 / 3)
 
-    output_waveform = torch.zeros_like(waveform, dtype=dtype, device=device)
+    output_waveform = tensorplay.zeros_like(waveform, dtype=dtype, device=device)
 
     # Uses CPU optimized loop function if available for CPU device
-    if device == torch.device("cpu"):
+    if device == tensorplay.device("cpu"):
         _overdrive_core_loop_cpu(waveform, temp, last_in, last_out, output_waveform)
     else:
         _overdrive_core_loop_generic(waveform, temp, last_in, last_out, output_waveform)
@@ -1253,7 +1253,7 @@ def phaser(
     waveform = waveform.view(-1, actual_shape[-1])
 
     delay_buf_len = int((delay_ms * 0.001 * sample_rate) + 0.5)
-    delay_buf = torch.zeros(waveform.shape[0], delay_buf_len, dtype=dtype, device=device)
+    delay_buf = tensorplay.zeros(waveform.shape[0], delay_buf_len, dtype=dtype, device=device)
 
     mod_buf_len = int(sample_rate / mod_speed + 0.5)
 
@@ -1290,7 +1290,7 @@ def phaser(
         delay_buf_list[delay_pos] = temp * decay
         output_waveform_pre_gain_list.append(temp)
 
-    output_waveform = torch.stack(output_waveform_pre_gain_list, dim=1).to(dtype=dtype, device=device)
+    output_waveform = tensorplay.stack(output_waveform_pre_gain_list, dim=1).to(dtype=dtype, device=device)
     output_waveform.mul_(gain_out)
 
     return output_waveform.clamp(min=-1, max=1).view(actual_shape)
@@ -1376,9 +1376,9 @@ def treble_biquad(
     Args:
         waveform (Tensor): audio waveform of dimension of `(..., time)`
         sample_rate (int): sampling rate of the waveform, e.g. 44100 (Hz)
-        gain (float or torch.Tensor): desired gain at the boost (or attenuation) in dB.
-        central_freq (float or torch.Tensor, optional): central frequency (in Hz). (Default: ``3000``)
-        Q (float or torch.Tensor, optional): https://en.wikipedia.org/wiki/Q_factor (Default: ``0.707``).
+        gain (float or tensorplay.Tensor): desired gain at the boost (or attenuation) in dB.
+        central_freq (float or tensorplay.Tensor, optional): central frequency (in Hz). (Default: ``3000``)
+        Q (float or tensorplay.Tensor, optional): https://en.wikipedia.org/wiki/Q_factor (Default: ``0.707``).
 
     Returns:
         Tensor: Waveform of dimension of `(..., time)`
@@ -1389,17 +1389,17 @@ def treble_biquad(
     """
     dtype = waveform.dtype
     device = waveform.device
-    central_freq = torch.as_tensor(central_freq, dtype=dtype, device=device)
-    Q = torch.as_tensor(Q, dtype=dtype, device=device)
-    gain = torch.as_tensor(gain, dtype=dtype, device=device)
+    central_freq = tensorplay.as_tensor(central_freq, dtype=dtype, device=device)
+    Q = tensorplay.as_tensor(Q, dtype=dtype, device=device)
+    gain = tensorplay.as_tensor(gain, dtype=dtype, device=device)
 
     w0 = 2 * math.pi * central_freq / sample_rate
-    alpha = torch.sin(w0) / 2 / Q
-    A = torch.exp(gain / 40 * math.log(10))
+    alpha = tensorplay.sin(w0) / 2 / Q
+    A = tensorplay.exp(gain / 40 * math.log(10))
 
-    temp1 = 2 * torch.sqrt(A) * alpha
-    temp2 = (A - 1) * torch.cos(w0)
-    temp3 = (A + 1) * torch.cos(w0)
+    temp1 = 2 * tensorplay.sqrt(A) * alpha
+    temp2 = (A - 1) * tensorplay.cos(w0)
+    temp3 = (A + 1) * tensorplay.cos(w0)
 
     b0 = A * ((A + 1) + temp2 + temp1)
     b1 = -2 * A * ((A - 1) + temp3)
@@ -1438,12 +1438,12 @@ def _measure(
 
     dft_len_ws = spectrum.size()[-1]
 
-    dftBuf = torch.zeros(dft_len_ws, device=device)
+    dftBuf = tensorplay.zeros(dft_len_ws, device=device)
 
     dftBuf[:measure_len_ws] = samples * spectrum_window[:measure_len_ws]
 
     # lsx_safe_rdft((int)p->dft_len_ws, 1, c->dftBuf);
-    _dftBuf = torch.fft.rfft(dftBuf)
+    _dftBuf = tensorplay.fft.rfft(dftBuf)
 
     mult: float = boot_count / (1.0 + boot_count) if boot_count >= 0 else measure_smooth_time_mult
 
@@ -1451,11 +1451,11 @@ def _measure(
     spectrum[spectrum_start:spectrum_end].mul_(mult).add_(_d * (1 - mult))
     _d = spectrum[spectrum_start:spectrum_end] ** 2
 
-    _zeros = torch.zeros(spectrum_end - spectrum_start, device=device)
+    _zeros = tensorplay.zeros(spectrum_end - spectrum_start, device=device)
     _mult = (
         _zeros
         if boot_count >= 0
-        else torch.where(
+        else tensorplay.where(
             _d > noise_spectrum[spectrum_start:spectrum_end],
             noise_up_time_mult,  # if
             noise_down_time_mult,  # else,
@@ -1463,21 +1463,21 @@ def _measure(
     )
 
     noise_spectrum[spectrum_start:spectrum_end].mul_(_mult).add_(_d * (1 - _mult))
-    _d = torch.sqrt(
-        torch.max(
+    _d = tensorplay.sqrt(
+        tensorplay.max(
             _zeros,
             _d - noise_reduction_amount * noise_spectrum[spectrum_start:spectrum_end],
         ),
     )
 
-    _cepstrum_Buf: Tensor = torch.zeros(dft_len_ws >> 1, device=device)
+    _cepstrum_Buf: Tensor = tensorplay.zeros(dft_len_ws >> 1, device=device)
     _cepstrum_Buf[spectrum_start:spectrum_end] = _d * cepstrum_window
     _cepstrum_Buf[spectrum_end : dft_len_ws >> 1].zero_()
 
     # lsx_safe_rdft((int)p->dft_len_ws >> 1, 1, c->dftBuf);
-    _cepstrum_Buf = torch.fft.rfft(_cepstrum_Buf)
+    _cepstrum_Buf = tensorplay.fft.rfft(_cepstrum_Buf)
 
-    result: float = float(torch.sum(_cepstrum_Buf[cepstrum_start:cepstrum_end].abs().pow(2)))
+    result: float = float(tensorplay.sum(_cepstrum_Buf[cepstrum_start:cepstrum_end].abs().pow(2)))
     result = math.log(result / (cepstrum_end - cepstrum_start)) if result > 0 else -math.inf
     return max(0, 21 + result)
 
@@ -1572,8 +1572,8 @@ def vad(
             "Expected input tensor dimension of 1 for single channel"
             f" or 2 for multi-channel. Got {waveform.ndim} instead. "
             "Batch semantics is not supported. "
-            "Please refer to https://github.com/pytorch/audio/issues/1348"
-            " and https://github.com/pytorch/audio/issues/1468."
+            "Please refer to https://github.com/tensorplay/audio/issues/1348"
+            " and https://github.com/tensorplay/audio/issues/1468."
         )
 
     measure_duration: float = 2.0 / measure_freq if measure_duration is None else measure_duration
@@ -1593,23 +1593,23 @@ def vad(
     fixed_pre_trigger_len_ns = int(pre_trigger_time * sample_rate + 0.5)
     samplesLen_ns = fixed_pre_trigger_len_ns + search_pre_trigger_len_ns + measure_len_ns
 
-    spectrum_window = torch.zeros(measure_len_ws, device=device)
+    spectrum_window = tensorplay.zeros(measure_len_ws, device=device)
     for i in range(measure_len_ws):
         # sox.h:741 define SOX_SAMPLE_MIN (sox_sample_t)SOX_INT_MIN(32)
         spectrum_window[i] = 2.0 / math.sqrt(float(measure_len_ws))
     # lsx_apply_hann(spectrum_window, (int)measure_len_ws);
-    spectrum_window *= torch.hann_window(measure_len_ws, device=device, dtype=torch.float)
+    spectrum_window *= tensorplay.hann_window(measure_len_ws, device=device, dtype=tensorplay.float)
 
     spectrum_start: int = int(hp_filter_freq / sample_rate * dft_len_ws + 0.5)
     spectrum_start: int = max(spectrum_start, 1)
     spectrum_end: int = int(lp_filter_freq / sample_rate * dft_len_ws + 0.5)
     spectrum_end: int = min(spectrum_end, dft_len_ws // 2)
 
-    cepstrum_window = torch.zeros(spectrum_end - spectrum_start, device=device)
+    cepstrum_window = tensorplay.zeros(spectrum_end - spectrum_start, device=device)
     for i in range(spectrum_end - spectrum_start):
         cepstrum_window[i] = 2.0 / math.sqrt(float(spectrum_end) - spectrum_start)
     # lsx_apply_hann(cepstrum_window,(int)(spectrum_end - spectrum_start));
-    cepstrum_window *= torch.hann_window(spectrum_end - spectrum_start, device=device, dtype=torch.float)
+    cepstrum_window *= tensorplay.hann_window(spectrum_end - spectrum_start, device=device, dtype=tensorplay.float)
 
     cepstrum_start = math.ceil(sample_rate * 0.5 / lp_lifter_freq)
     cepstrum_end = math.floor(sample_rate * 0.5 / hp_lifter_freq)
@@ -1621,8 +1621,8 @@ def vad(
             f"Found: cepstrum_start: {cepstrum_start}, cepstrum_end: {cepstrum_end}."
         )
 
-    noise_up_time_mult = torch.tensor(math.exp(-1.0 / (noise_up_time * measure_freq)), device=device)
-    noise_down_time_mult = torch.tensor(math.exp(-1.0 / (noise_down_time * measure_freq)), device=device)
+    noise_up_time_mult = tensorplay.tensor(math.exp(-1.0 / (noise_up_time * measure_freq)), device=device)
+    noise_down_time_mult = tensorplay.tensor(math.exp(-1.0 / (noise_down_time * measure_freq)), device=device)
     measure_smooth_time_mult = math.exp(-1.0 / (measure_smooth_time * measure_freq))
     trigger_meas_time_mult = math.exp(-1.0 / (trigger_time * measure_freq))
 
@@ -1635,10 +1635,10 @@ def vad(
 
     n_channels, ilen = waveform.size()
 
-    mean_meas = torch.zeros(n_channels, device=device)
-    spectrum = torch.zeros(n_channels, dft_len_ws, device=device)
-    noise_spectrum = torch.zeros(n_channels, dft_len_ws, device=device)
-    measures = torch.zeros(n_channels, measures_len, device=device)
+    mean_meas = tensorplay.zeros(n_channels, device=device)
+    spectrum = tensorplay.zeros(n_channels, dft_len_ws, device=device)
+    noise_spectrum = tensorplay.zeros(n_channels, dft_len_ws, device=device)
+    measures = tensorplay.zeros(n_channels, measures_len, device=device)
 
     has_triggered: bool = False
     num_measures_to_flush: int = 0
@@ -1695,7 +1695,7 @@ def vad(
             break
     # end for window
     if not has_triggered and shape[-1] >= fixed_pre_trigger_len_ns:
-        return waveform[..., :fixed_pre_trigger_len_ns].view(shape[:-1] + torch.Size([fixed_pre_trigger_len_ns]))
+        return waveform[..., :fixed_pre_trigger_len_ns].view(shape[:-1] + tensorplay.Size([fixed_pre_trigger_len_ns]))
 
     res = waveform[:, max(pos - samplesLen_ns + flushedLen_ns, 0) :]
     # unpack batch

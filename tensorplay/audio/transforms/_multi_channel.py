@@ -3,7 +3,7 @@
 import warnings
 from typing import Optional, Union
 
-import tensorplay as torch
+import tensorplay as tensorplay
 from tensorplay import Tensor
 from tensorplay.audio import functional as F
 
@@ -12,22 +12,22 @@ __all__ = []
 
 
 def _get_mvdr_vector(
-    psd_s: torch.Tensor,
-    psd_n: torch.Tensor,
-    reference_vector: torch.Tensor,
+    psd_s: tensorplay.Tensor,
+    psd_n: tensorplay.Tensor,
+    reference_vector: tensorplay.Tensor,
     solution: str = "ref_channel",
     diagonal_loading: bool = True,
     diag_eps: float = 1e-7,
     eps: float = 1e-8,
-) -> torch.Tensor:
+) -> tensorplay.Tensor:
     r"""Compute the MVDR beamforming weights with ``solution`` argument.
 
     Args:
-        psd_s (torch.Tensor): The complex-valued power spectral density (PSD) matrix of target speech.
+        psd_s (tensorplay.Tensor): The complex-valued power spectral density (PSD) matrix of target speech.
             Tensor with dimensions `(..., freq, channel, channel)`.
-        psd_n (torch.Tensor): The complex-valued power spectral density (PSD) matrix of noise.
+        psd_n (tensorplay.Tensor): The complex-valued power spectral density (PSD) matrix of noise.
             Tensor with dimensions `(..., freq, channel, channel)`.
-        reference_vector (torch.Tensor): one-hot reference channel matrix.
+        reference_vector (tensorplay.Tensor): one-hot reference channel matrix.
         solution (str, optional): Solution to compute the MVDR beamforming weights.
             Options: [``ref_channel``, ``stv_evd``, ``stv_power``]. (Default: ``ref_channel``)
         diagonal_loading (bool, optional): If ``True``, enables applying diagonal loading to ``psd_n``.
@@ -38,7 +38,7 @@ def _get_mvdr_vector(
             (Default: ``1e-8``)
 
     Returns:
-        torch.Tensor: the mvdr beamforming weight matrix
+        tensorplay.Tensor: the mvdr beamforming weight matrix
     """
     if solution == "ref_channel":
         beamform_vector = F.mvdr_weights_souden(psd_s, psd_n, reference_vector, diagonal_loading, diag_eps, eps)
@@ -52,7 +52,7 @@ def _get_mvdr_vector(
     return beamform_vector
 
 
-class PSD(torch.nn.Module):
+class PSD(tensorplay.nn.Module):
     r"""Compute cross-channel power spectral density (PSD) matrix.
 
     .. devices:: CPU CUDA
@@ -71,18 +71,18 @@ class PSD(torch.nn.Module):
         self.normalize = normalize
         self.eps = eps
 
-    def forward(self, specgram: torch.Tensor, mask: Optional[torch.Tensor] = None):
+    def forward(self, specgram: tensorplay.Tensor, mask: Optional[tensorplay.Tensor] = None):
         """
         Args:
-            specgram (torch.Tensor): Multi-channel complex-valued spectrum.
+            specgram (tensorplay.Tensor): Multi-channel complex-valued spectrum.
                 Tensor with dimensions `(..., channel, freq, time)`.
-            mask (torch.Tensor or None, optional): Time-Frequency mask for normalization.
+            mask (tensorplay.Tensor or None, optional): Time-Frequency mask for normalization.
                 Tensor with dimensions `(..., freq, time)` if multi_mask is ``False`` or
                 with dimensions `(..., channel, freq, time)` if multi_mask is ``True``.
                 (Default: ``None``)
 
         Returns:
-            torch.Tensor: The complex-valued PSD matrix of the input spectrum.
+            tensorplay.Tensor: The complex-valued PSD matrix of the input spectrum.
                 Tensor with dimensions `(..., freq, channel, channel)`
         """
         if mask is not None:
@@ -94,7 +94,7 @@ class PSD(torch.nn.Module):
         return psd
 
 
-class MVDR(torch.nn.Module):
+class MVDR(tensorplay.nn.Module):
     """Minimum Variance Distortionless Response (MVDR) module that performs MVDR beamforming with Time-Frequency masks.
 
     .. devices:: CPU CUDA
@@ -154,7 +154,7 @@ class MVDR(torch.nn.Module):
 
     Note:
         To improve the numerical stability, the input spectrogram will be converted to double precision
-        (``torch.complex128`` or ``torch.cdouble``) dtype for internal computation. The output spectrogram
+        (``tensorplay.complex128`` or ``tensorplay.cdouble``) dtype for internal computation. The output spectrogram
         is converted to the dtype of the input spectrogram to be compatible with other modules.
 
     Note:
@@ -188,10 +188,10 @@ class MVDR(torch.nn.Module):
         self.online = online
         self.psd = PSD(multi_mask)
 
-        psd_s: torch.Tensor = torch.zeros(1)
-        psd_n: torch.Tensor = torch.zeros(1)
-        mask_sum_s: torch.Tensor = torch.zeros(1)
-        mask_sum_n: torch.Tensor = torch.zeros(1)
+        psd_s: tensorplay.Tensor = tensorplay.zeros(1)
+        psd_n: tensorplay.Tensor = tensorplay.zeros(1)
+        mask_sum_s: tensorplay.Tensor = tensorplay.zeros(1)
+        mask_sum_n: tensorplay.Tensor = tensorplay.zeros(1)
         self.register_buffer("psd_s", psd_s)
         self.register_buffer("psd_n", psd_n)
         self.register_buffer("mask_sum_s", mask_sum_s)
@@ -199,30 +199,30 @@ class MVDR(torch.nn.Module):
 
     def _get_updated_mvdr_vector(
         self,
-        psd_s: torch.Tensor,
-        psd_n: torch.Tensor,
-        mask_s: torch.Tensor,
-        mask_n: torch.Tensor,
-        reference_vector: torch.Tensor,
+        psd_s: tensorplay.Tensor,
+        psd_n: tensorplay.Tensor,
+        mask_s: tensorplay.Tensor,
+        mask_n: tensorplay.Tensor,
+        reference_vector: tensorplay.Tensor,
         solution: str = "ref_channel",
         diagonal_loading: bool = True,
         diag_eps: float = 1e-7,
         eps: float = 1e-8,
-    ) -> torch.Tensor:
+    ) -> tensorplay.Tensor:
         r"""Recursively update the MVDR beamforming vector.
 
         Args:
-            psd_s (torch.Tensor): The complex-valued power spectral density (PSD) matrix of target speech.
+            psd_s (tensorplay.Tensor): The complex-valued power spectral density (PSD) matrix of target speech.
                 Tensor with dimensions `(..., freq, channel, channel)`.
-            psd_n (torch.Tensor): The complex-valued power spectral density (PSD) matrix of noise.
+            psd_n (tensorplay.Tensor): The complex-valued power spectral density (PSD) matrix of noise.
                 Tensor with dimensions `(..., freq, channel, channel)`.
-            mask_s (torch.Tensor): Time-Frequency mask of the target speech.
+            mask_s (tensorplay.Tensor): Time-Frequency mask of the target speech.
                 Tensor with dimensions `(..., freq, time)` if multi_mask is ``False``
                 or with dimensions `(..., channel, freq, time)` if multi_mask is ``True``.
-            mask_n (torch.Tensor or None, optional): Time-Frequency mask of the noise.
+            mask_n (tensorplay.Tensor or None, optional): Time-Frequency mask of the noise.
                 Tensor with dimensions `(..., freq, time)` if multi_mask is ``False``
                 or with dimensions `(..., channel, freq, time)` if multi_mask is ``True``.
-            reference_vector (torch.Tensor): One-hot reference channel matrix.
+            reference_vector (tensorplay.Tensor): One-hot reference channel matrix.
             solution (str, optional): Solution to compute the MVDR beamforming weights.
                 Options: [``ref_channel``, ``stv_evd``, ``stv_power``]. (Default: ``ref_channel``)
             diagonal_loading (bool, optional): If ``True``, enables applying diagonal loading to ``psd_n``.
@@ -233,7 +233,7 @@ class MVDR(torch.nn.Module):
                 (Default: ``1e-8``)
 
         Returns:
-            torch.Tensor: The MVDR beamforming weight matrix.
+            tensorplay.Tensor: The MVDR beamforming weight matrix.
         """
         if self.multi_mask:
             # Averaging mask along channel dimension
@@ -254,34 +254,34 @@ class MVDR(torch.nn.Module):
             self.mask_sum_n = self.mask_sum_n + mask_n.sum(dim=-1)
             return _get_mvdr_vector(psd_s, psd_n, reference_vector, solution, diagonal_loading, diag_eps, eps)
 
-    def _get_updated_psd_speech(self, psd_s: torch.Tensor, mask_s: torch.Tensor) -> torch.Tensor:
+    def _get_updated_psd_speech(self, psd_s: tensorplay.Tensor, mask_s: tensorplay.Tensor) -> tensorplay.Tensor:
         r"""Update psd of speech recursively.
 
         Args:
-            psd_s (torch.Tensor): The complex-valued power spectral density (PSD) matrix of target speech.
+            psd_s (tensorplay.Tensor): The complex-valued power spectral density (PSD) matrix of target speech.
                 Tensor with dimensions `(..., freq, channel, channel)`.
-            mask_s (torch.Tensor): Time-Frequency mask of the target speech.
+            mask_s (tensorplay.Tensor): Time-Frequency mask of the target speech.
                 Tensor with dimensions `(..., freq, time)`.
 
         Returns:
-            torch.Tensor: The updated PSD matrix of target speech.
+            tensorplay.Tensor: The updated PSD matrix of target speech.
         """
         numerator = self.mask_sum_s / (self.mask_sum_s + mask_s.sum(dim=-1))
         denominator = 1 / (self.mask_sum_s + mask_s.sum(dim=-1))
         psd_s = self.psd_s * numerator[..., None, None] + psd_s * denominator[..., None, None]
         return psd_s
 
-    def _get_updated_psd_noise(self, psd_n: torch.Tensor, mask_n: torch.Tensor) -> torch.Tensor:
+    def _get_updated_psd_noise(self, psd_n: tensorplay.Tensor, mask_n: tensorplay.Tensor) -> tensorplay.Tensor:
         r"""Update psd of noise recursively.
 
         Args:
-            psd_n (torch.Tensor): The complex-valued power spectral density (PSD) matrix of noise.
+            psd_n (tensorplay.Tensor): The complex-valued power spectral density (PSD) matrix of noise.
                 Tensor with dimensions `(..., freq, channel, channel)`.
-            mask_n (torch.Tensor or None, optional): Time-Frequency mask of the noise.
+            mask_n (tensorplay.Tensor or None, optional): Time-Frequency mask of the noise.
                 Tensor with dimensions `(..., freq, time)`.
 
         Returns:
-            torch.Tensor:  The updated PSD matrix of noise.
+            tensorplay.Tensor:  The updated PSD matrix of noise.
         """
         numerator = self.mask_sum_n / (self.mask_sum_n + mask_n.sum(dim=-1))
         denominator = 1 / (self.mask_sum_n + mask_n.sum(dim=-1))
@@ -289,33 +289,33 @@ class MVDR(torch.nn.Module):
         return psd_n
 
     def forward(
-        self, specgram: torch.Tensor, mask_s: torch.Tensor, mask_n: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+        self, specgram: tensorplay.Tensor, mask_s: tensorplay.Tensor, mask_n: Optional[tensorplay.Tensor] = None
+    ) -> tensorplay.Tensor:
         """Perform MVDR beamforming.
 
         Args:
-            specgram (torch.Tensor): Multi-channel complex-valued spectrum.
+            specgram (tensorplay.Tensor): Multi-channel complex-valued spectrum.
                 Tensor with dimensions `(..., channel, freq, time)`
-            mask_s (torch.Tensor): Time-Frequency mask of target speech.
+            mask_s (tensorplay.Tensor): Time-Frequency mask of target speech.
                 Tensor with dimensions `(..., freq, time)` if multi_mask is ``False``
                 or with dimensions `(..., channel, freq, time)` if multi_mask is ``True``.
-            mask_n (torch.Tensor or None, optional): Time-Frequency mask of noise.
+            mask_n (tensorplay.Tensor or None, optional): Time-Frequency mask of noise.
                 Tensor with dimensions `(..., freq, time)` if multi_mask is ``False``
                 or with dimensions `(..., channel, freq, time)` if multi_mask is ``True``.
                 (Default: None)
 
         Returns:
-            torch.Tensor: Single-channel complex-valued enhanced spectrum with dimensions `(..., freq, time)`.
+            tensorplay.Tensor: Single-channel complex-valued enhanced spectrum with dimensions `(..., freq, time)`.
         """
         dtype = specgram.dtype
         if specgram.ndim < 3:
             raise ValueError(f"Expected at least 3D tensor (..., channel, freq, time). Found: {specgram.shape}")
         if not specgram.is_complex():
             raise ValueError(
-                f"The type of ``specgram`` tensor must be ``torch.cfloat`` or ``torch.cdouble``.\
+                f"The type of ``specgram`` tensor must be ``tensorplay.cfloat`` or ``tensorplay.cdouble``.\
                     Found: {specgram.dtype}"
             )
-        if specgram.dtype == torch.cfloat:
+        if specgram.dtype == tensorplay.cfloat:
             specgram = specgram.cdouble()  # Convert specgram to ``torch.cdouble``.
 
         if mask_n is None:
@@ -325,7 +325,7 @@ class MVDR(torch.nn.Module):
         psd_s = self.psd(specgram, mask_s)  # (..., freq, time, channel, channel)
         psd_n = self.psd(specgram, mask_n)  # (..., freq, time, channel, channel)
 
-        u = torch.zeros(specgram.size()[:-2], device=specgram.device, dtype=torch.cdouble)  # (..., channel)
+        u = tensorplay.zeros(specgram.size()[:-2], device=specgram.device, dtype=tensorplay.cdouble)  # (..., channel)
         u[..., self.ref_channel].fill_(1)
 
         if self.online:
@@ -340,7 +340,7 @@ class MVDR(torch.nn.Module):
         return specgram_enhanced.to(dtype)
 
 
-class RTFMVDR(torch.nn.Module):
+class RTFMVDR(tensorplay.nn.Module):
     r"""Minimum Variance Distortionless Response (*MVDR* :cite:`capon1969high`) module
     based on the relative transfer function (RTF) and power spectral density (PSD) matrix of noise.
 
@@ -379,15 +379,15 @@ class RTFMVDR(torch.nn.Module):
     ) -> Tensor:
         """
         Args:
-            specgram (torch.Tensor): Multi-channel complex-valued spectrum.
+            specgram (tensorplay.Tensor): Multi-channel complex-valued spectrum.
                 Tensor with dimensions `(..., channel, freq, time)`
-            rtf (torch.Tensor): The complex-valued RTF vector of target speech.
+            rtf (tensorplay.Tensor): The complex-valued RTF vector of target speech.
                 Tensor with dimensions `(..., freq, channel)`.
-            psd_n (torch.Tensor): The complex-valued power spectral density (PSD) matrix of noise.
+            psd_n (tensorplay.Tensor): The complex-valued power spectral density (PSD) matrix of noise.
                 Tensor with dimensions `(..., freq, channel, channel)`.
-            reference_channel (int or torch.Tensor): Specifies the reference channel.
+            reference_channel (int or tensorplay.Tensor): Specifies the reference channel.
                 If the dtype is ``int``, it represents the reference channel index.
-                If the dtype is ``torch.Tensor``, its shape is `(..., channel)`, where the ``channel`` dimension
+                If the dtype is ``tensorplay.Tensor``, its shape is `(..., channel)`, where the ``channel`` dimension
                 is one-hot.
             diagonal_loading (bool, optional): If ``True``, enables applying diagonal loading to ``psd_n``.
                 (Default: ``True``)
@@ -397,14 +397,14 @@ class RTFMVDR(torch.nn.Module):
                 (Default: ``1e-8``)
 
         Returns:
-            torch.Tensor: Single-channel complex-valued enhanced spectrum with dimensions `(..., freq, time)`.
+            tensorplay.Tensor: Single-channel complex-valued enhanced spectrum with dimensions `(..., freq, time)`.
         """
         w_mvdr = F.mvdr_weights_rtf(rtf, psd_n, reference_channel, diagonal_loading, diag_eps, eps)
         spectrum_enhanced = F.apply_beamforming(w_mvdr, specgram)
         return spectrum_enhanced
 
 
-class SoudenMVDR(torch.nn.Module):
+class SoudenMVDR(tensorplay.nn.Module):
     r"""Minimum Variance Distortionless Response (*MVDR* :cite:`capon1969high`) module
     based on the method proposed by *Souden et, al.* :cite:`souden2009optimal`.
 
@@ -439,18 +439,18 @@ class SoudenMVDR(torch.nn.Module):
         diagonal_loading: bool = True,
         diag_eps: float = 1e-7,
         eps: float = 1e-8,
-    ) -> torch.Tensor:
+    ) -> tensorplay.Tensor:
         """
         Args:
-            specgram (torch.Tensor): Multi-channel complex-valued spectrum.
+            specgram (tensorplay.Tensor): Multi-channel complex-valued spectrum.
                 Tensor with dimensions `(..., channel, freq, time)`.
-            psd_s (torch.Tensor): The complex-valued power spectral density (PSD) matrix of target speech.
+            psd_s (tensorplay.Tensor): The complex-valued power spectral density (PSD) matrix of target speech.
                 Tensor with dimensions `(..., freq, channel, channel)`.
-            psd_n (torch.Tensor): The complex-valued power spectral density (PSD) matrix of noise.
+            psd_n (tensorplay.Tensor): The complex-valued power spectral density (PSD) matrix of noise.
                 Tensor with dimensions `(..., freq, channel, channel)`.
-            reference_channel (int or torch.Tensor): Specifies the reference channel.
+            reference_channel (int or tensorplay.Tensor): Specifies the reference channel.
                 If the dtype is ``int``, it represents the reference channel index.
-                If the dtype is ``torch.Tensor``, its shape is `(..., channel)`, where the ``channel`` dimension
+                If the dtype is ``tensorplay.Tensor``, its shape is `(..., channel)`, where the ``channel`` dimension
                 is one-hot.
             diagonal_loading (bool, optional): If ``True``, enables applying diagonal loading to ``psd_n``.
                 (Default: ``True``)
@@ -460,7 +460,7 @@ class SoudenMVDR(torch.nn.Module):
                 (Default: ``1e-8``)
 
         Returns:
-            torch.Tensor: Single-channel complex-valued enhanced spectrum with dimensions `(..., freq, time)`.
+            tensorplay.Tensor: Single-channel complex-valued enhanced spectrum with dimensions `(..., freq, time)`.
         """
         w_mvdr = F.mvdr_weights_souden(psd_s, psd_n, reference_channel, diagonal_loading, diag_eps, eps)
         spectrum_enhanced = F.apply_beamforming(w_mvdr, specgram)

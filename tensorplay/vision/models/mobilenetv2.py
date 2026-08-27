@@ -4,8 +4,8 @@
 from functools import partial
 from typing import Any, Callable, Optional
 
-import tensorplay as torch
-from torch import nn, Tensor
+import tensorplay as tensorplay
+from tensorplay import nn, Tensor
 
 from ..ops.misc import Conv2dNormActivation
 from ..transforms._presets import ImageClassification
@@ -169,7 +169,7 @@ class MobileNetV2(nn.Module):
         x = self.features(x)
         # Cannot use "squeeze" as batch-size can be 1
         x = nn.functional.adaptive_avg_pool2d(x, (1, 1))
-        x = torch.flatten(x, 1)
+        x = tensorplay.flatten(x, 1)
         x = self.classifier(x)
         return x
 
@@ -190,7 +190,7 @@ class MobileNet_V2_Weights(WeightsEnum):
         transforms=partial(ImageClassification, crop_size=224),
         meta={
             **_COMMON_META,
-            "recipe": "https://github.com/pytorch/vision/tree/main/references/classification#mobilenetv2",
+            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#mobilenetv2",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 71.878,
@@ -207,7 +207,7 @@ class MobileNet_V2_Weights(WeightsEnum):
         transforms=partial(ImageClassification, crop_size=224, resize_size=232),
         meta={
             **_COMMON_META,
-            "recipe": "https://github.com/pytorch/vision/issues/3995#new-recipe-with-reg-tuning",
+            "recipe": "https://github.com/tensorplay/vision/issues/3995#new-recipe-with-reg-tuning",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 72.154,
@@ -217,9 +217,9 @@ class MobileNet_V2_Weights(WeightsEnum):
             "_ops": 0.301,
             "_file_size": 13.598,
             "_docs": """
-                These weights improve upon the results of the original paper by using a modified version of TorchVision's
+                These weights improve upon the results of the original paper by using a modified version of TensorPlay Vision's
                 `new training recipe
-                <https://pytorch.org/blog/how-to-train-state-of-the-art-models-using-torchvision-latest-primitives/>`_.
+                <https://tensorplay.org/blog/how-to-train-state-of-the-art-models-using-tensorplay.vision-latest-primitives/>`_.
             """,
         },
     )
@@ -235,19 +235,19 @@ def mobilenet_v2(
     Bottlenecks <https://arxiv.org/abs/1801.04381>`_ paper.
 
     Args:
-        weights (:class:`~torchvision.models.MobileNet_V2_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.MobileNet_V2_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.MobileNet_V2_Weights` below for
+            :class:`~tensorplay.vision.models.MobileNet_V2_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.mobilenetv2.MobileNetV2``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.mobilenetv2.MobileNetV2``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/mobilenetv2.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/mobilenetv2.py>`_
             for more details about this class.
 
-    .. autoclass:: torchvision.models.MobileNet_V2_Weights
+    .. autoclass:: tensorplay.vision.models.MobileNet_V2_Weights
         :members:
     """
     weights = MobileNet_V2_Weights.verify(weights)

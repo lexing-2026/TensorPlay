@@ -32,11 +32,26 @@ _H = [
 ]
 
 
+# Ops whose result aliases the input's storage (torch view ops).  Drives the
+# InplaceOrView slice below: version-counter sharing and the is_view flag used
+# by detach_()'s view rejection.  index_select is deliberately absent: it
+# copies (torch gives it a fresh version counter and _is_view() == False).
 _VIEW_OPS = {
     'view', 'reshape', 'expand', 'expand_as', 'squeeze', 'unsqueeze',
-    'permute', 'transpose', 't', 'select', 'index_select', 'slice',
+    'permute', 'transpose', 't', 'select', 'slice',
     'narrow', 'flatten', 'unflatten', 'as_strided', 'movedim', 'swapaxes',
     'swapdims', 'unfold', 'detach', 'diagonal', 'expand_as',
+}
+
+# Ops whose backward node is a view function in torch's ADInplaceOrView
+# sense (VariableTypeUtils.h check_inplace): in-place ops must reject
+# mutations of their outputs when the base chain ends at a leaf.  reshape is
+# not listed: it may copy, so its wrapper sets the flag conditionally on
+# storage aliasing.  index_select/detach deliberately excluded (copy / leaf).
+_VIEW_FN_OPS = {
+    'view', 'expand', 'squeeze', 'unsqueeze', 'permute', 'transpose', 't',
+    'select', 'slice', 'narrow', 'movedim', 'diagonal', 'as_strided',
+    'view_as_real', 'view_as_complex',
 }
 
 
@@ -121,11 +136,19 @@ def _emit_autocast_block(lines, f, arg_types):
 def _node_ctor_args(dv: OpDerivatives, f: NativeFunction,
                     core_result_var: str | None) -> list[str]:
     """Ordered constructor arguments for the backward node."""
+    arg_names = {a.name for a in f.args}
+    # Manual nodes (empty formulas, hand-written structs) are not extended.
     args: list[str] = []
     out_index = {n: i for i, n in enumerate(tuple_element_names(f))}
     for m, _t in dv.members:
         if m in dv.used_input_names:
-            args.append(m)
+            if (m == 'self' and f.func_name.endswith('_')
+                    and any(a.name == 'self' for a in f.args)):
+                # Pre-mutation capture hoisted by the wrapper (upstream
+                # `original_self`); the live `self` already holds the update.
+                args.append('__tp_original_self.value()')
+            else:
+                args.append(m)
         elif m == 'result':
             expr = 'result'
             if dv.node_name == 'ReluBackward':
@@ -168,12 +191,19 @@ def _emit_requires_grad_detection(lines, f):
 def _emit_leaf_checks(lines, f):
     for a in f.mutable_args:
         if a.type.is_mutable_ref:
+            lines.append(f'    if (requires_grad && {a.name}.requires_grad()) {{')
             lines.append(
-                f'    if (requires_grad && {a.name}.requires_grad() && '
-                f'tensorplay::tpx::impl::is_leaf({a.name})) {{')
+                f'        if (tensorplay::tpx::impl::is_view_of_leaf({a.name})) {{')
             lines.append(
-                '        TP_THROW(RuntimeError, "a leaf Variable that requires grad '
+                '            TP_THROW(RuntimeError, "a view of a leaf Variable '
+                'that requires grad is being used in an in-place operation.");')
+            lines.append('        }')
+            lines.append(
+                f'        if (tensorplay::tpx::impl::is_leaf({a.name})) {{')
+            lines.append(
+                '            TP_THROW(RuntimeError, "a leaf Variable that requires grad '
                 'is being used in an in-place operation");')
+            lines.append('        }')
             lines.append('    }')
 
 
@@ -255,6 +285,23 @@ def generate_tpx_ops_cpp(funcs: list[NativeFunction], *,
         if has_ag:
             _emit_requires_grad_detection(lines, f)
             _emit_leaf_checks(lines, f)
+            # In-place ops whose derivative references `self` must evaluate
+            # the slope at the PRE-mutation value (upstream gen_variable_type
+            # save_variables: `original_self = self.clone()`).  Capture the
+            # clone before the core call; _node_ctor_args splices it in.
+            _dv_pre = derivatives.get(f.func_name)
+            if (_dv_pre is not None and _dv_pre.formulas
+                    and f.base_name.endswith('_')
+                    and f.func_name.endswith('_')
+                    and 'self' in _dv_pre.used_input_names
+                    and any(a.name == 'self' for a in f.args)):
+                lines.append('    std::optional<Tensor> __tp_original_self;')
+                lines.append('    if (requires_grad) {')
+                lines.append('        const bool __tp_prev_gm = GradMode::is_enabled();')
+                lines.append('        GradMode::set_enabled(false);')
+                lines.append('        __tp_original_self = self.clone();')
+                lines.append('        GradMode::set_enabled(__tp_prev_gm);')
+                lines.append('    }')
 
         # ---- core invocation ----------------------------------------------
         rd = f'redispatch_{f.cpp_name}_{f.variants[0]}'
@@ -299,9 +346,27 @@ def generate_tpx_ops_cpp(funcs: list[NativeFunction], *,
             # double-count under the default autograd path.
             pass
         elif _is_view:
-            lines.append(
-                f'    result.unsafeGetTensorImpl()->share_version_counter('
-                f'*{_self.name}.unsafeGetTensorImpl());')
+            if f.base_name == 'reshape':
+                # reshape copies when the layout forbids a view; a copy must
+                # not share the base's version counter (torch only links
+                # versions for the aliasing _reshape_alias path) and is not a
+                # view either (torch _is_view() is False for copying
+                # reshapes).
+                lines.append(
+                    f'    if (result.unsafeGetTensorImpl()->storage().is_same('
+                    f'{_self.name}.unsafeGetTensorImpl()->storage())) {{')
+                lines.append(
+                    f'        result.unsafeGetTensorImpl()->share_version_counter('
+                    f'*{_self.name}.unsafeGetTensorImpl());')
+                lines.append(
+                    '        result.unsafeGetTensorImpl()->set_is_view(true);')
+                lines.append('    }')
+            else:
+                lines.append(
+                    f'    result.unsafeGetTensorImpl()->share_version_counter('
+                    f'*{_self.name}.unsafeGetTensorImpl());')
+                lines.append(
+                    '    result.unsafeGetTensorImpl()->set_is_view(true);')
 
         # ---- backward node --------------------------------------------------
         if has_ag:
@@ -317,6 +382,14 @@ def generate_tpx_ops_cpp(funcs: list[NativeFunction], *,
                 ctor_args = _node_ctor_args(dv, f, 'core_result')
                 lines.append(
                     f'        grad_fn = std::make_shared<{dv.node_name}>({", ".join(ctor_args)});')
+            if f.base_name == 'reshape' and _self is not None and kind == 'value':
+                # reshape aliases storage only when the layout permits; mark
+                # the node as a view function solely in that case.
+                lines.append(
+                    f'        grad_fn->set_view_fn(result.unsafeGetTensorImpl()->'
+                    f'storage().is_same({_self.name}.unsafeGetTensorImpl()->storage()));')
+            elif f.base_name in _VIEW_FN_OPS:
+                lines.append('        grad_fn->set_view_fn(true);')
             _emit_edges(lines, f)
             lines.append('    }')
 

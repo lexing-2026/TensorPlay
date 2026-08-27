@@ -42,16 +42,21 @@ def zeros_like(param):
     # TensorPlay's generated zeros_like currently materializes a contiguous
     # result, so reproduce preserve_format explicitly for strided parameters.
     if param.is_contiguous():
-        return tp.zeros(param.shape, dtype=param.dtype, device=param.device)
+        return tp.zeros(list(param.shape), dtype=param.dtype, device=param.device)
     strides = tuple(param.stride())
     if any(stride < 0 for stride in strides):
-        return tp.zeros(param.shape, dtype=param.dtype, device=param.device)
+        return tp.zeros(list(param.shape), dtype=param.dtype, device=param.device)
     storage_numel = 1
     for size, stride in zip(param.shape, strides):
         if size:
             storage_numel += (size - 1) * stride
-    storage = tp.empty((storage_numel,), dtype=param.dtype, device=param.device)
-    return storage.as_strided(param.shape, strides).zero_()
+    # Initialize the backing storage before creating the view.  TensorPlay's
+    # zero_ kernel intentionally follows the contiguous fast path for a raw
+    # strided view, which can leave the portion after the first contiguous
+    # chunk untouched.  Filling the 1-D storage itself is both safe for gaps
+    # and preserves Torch's state layout for non-contiguous parameters.
+    storage = tp.zeros((storage_numel,), dtype=param.dtype, device=param.device)
+    return storage.as_strided(param.shape, strides)
 
 
 def full_like(param, value):
@@ -64,8 +69,8 @@ def full_like(param, value):
     for size, stride in zip(param.shape, strides):
         if size:
             storage_numel += (size - 1) * stride
-    storage = tp.empty((storage_numel,), dtype=param.dtype, device=param.device)
-    return storage.as_strided(param.shape, strides).fill_(value)
+    storage = tp.full((storage_numel,), value, dtype=param.dtype, device=param.device)
+    return storage.as_strided(param.shape, strides)
 
 
 def state_step(state, *, param=None, device=None, capturable=False):
@@ -89,7 +94,12 @@ def ensure_state_step(state, *, param=None, device=None, capturable=False):
     """Return a Torch-style scalar step without incrementing it."""
 
     if device is None:
-        if capturable and param is not None:
+        if param is not None and param.device.type != "cpu":
+            # Keep step counters colocated with non-CPU params: the native
+            # fused/foreach kernels read them on-device, and a host-side
+            # bump would force a dispatcher round trip per parameter.
+            device = param.device
+        elif capturable and param is not None:
             device = param.device
         else:
             device = tp.device("cpu")

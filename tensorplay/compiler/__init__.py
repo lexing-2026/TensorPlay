@@ -1,7 +1,7 @@
 """TensorPlay compiler frontend and backend registry."""
 
 from .api import compile, is_compiling, reset
-from .graph import Graph, GraphCaptureError, GraphModule, Node, Proxy, Tracer
+from .graph import Graph, GraphCaptureError, GraphModule, Node, Proxy, Tracer, gate
 from .guards import Guard, GuardChain, format_recompile_reasons  # noqa: F401
 from .passes import (
     ConstFold,
@@ -39,6 +39,7 @@ __all__ = [
     "Tracer",
     "compile",
     "format_recompile_reasons",
+    "gate",
     "get_default_backend",
     "is_compiling",
     "list_backends",

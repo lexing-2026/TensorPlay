@@ -2,11 +2,10 @@ import os
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
-import tensorplay as torch
-import tensorplay.audio as torchaudio
-from torch.utils.data import Dataset
+import tensorplay as tensorplay
+from tensorplay.utils.data import Dataset
 from tensorplay.hub import download_url_to_file
-from torchaudio.datasets.utils import _extract_zip
+from tensorplay.audio.datasets.utils import _extract_zip
 
 _URL = "https://zenodo.org/record/3338373/files/musdb18hq.zip"
 _CHECKSUM = "baac80d0483c61d74b2e5f3be75fa557eec52898339e6aa45c1fa48833c5d21d"
@@ -81,13 +80,13 @@ class MUSDB_HQ(Dataset):
     def _get_track(self, name, source):
         return Path(self._path) / name / f"{source}{_EXT}"
 
-    def _load_sample(self, n: int) -> Tuple[torch.Tensor, int, int, str]:
+    def _load_sample(self, n: int) -> Tuple[tensorplay.Tensor, int, int, str]:
         name = self.names[n]
         wavs = []
         num_frames = None
         for source in self.sources:
             track = self._get_track(name, source)
-            wav, sr = torchaudio.load(str(track))
+            wav, sr = tensorplay.audio.load(str(track))
             if sr != _SAMPLE_RATE:
                 raise ValueError(f"expected sample rate {_SAMPLE_RATE}, but got {sr}")
             if num_frames is None:
@@ -97,7 +96,7 @@ class MUSDB_HQ(Dataset):
                     raise ValueError("num_frames do not match across sources")
             wavs.append(wav)
 
-        stacked = torch.stack(wavs)
+        stacked = tensorplay.stack(wavs)
 
         return stacked, _SAMPLE_RATE, num_frames, name
 
@@ -116,7 +115,7 @@ class MUSDB_HQ(Dataset):
             names.append(name)
         return sorted(names)
 
-    def __getitem__(self, n: int) -> Tuple[torch.Tensor, int, int, str]:
+    def __getitem__(self, n: int) -> Tuple[tensorplay.Tensor, int, int, str]:
         """Load the n-th sample from the dataset.
 
         Args:

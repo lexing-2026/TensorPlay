@@ -20,6 +20,11 @@ template <typename T> struct LossMath { using type = T; };
 template <> struct LossMath<tensorplay::Half> { using type = float; };
 template <> struct LossMath<tensorplay::BFloat16> { using type = float; };
 
+// DType of the accumulator matching LossMath<T>::type.
+template <typename M> struct LossAccDType;
+template <> struct LossAccDType<float> { static constexpr DType value = DType::Float32; };
+template <> struct LossAccDType<double> { static constexpr DType value = DType::Float64; };
+
 template <typename T, typename TargetT>
 __global__ void nll_loss_forward_kernel(
     int64_t n, int64_t C,
@@ -115,8 +120,9 @@ std::tuple<Tensor, Tensor> nll_loss_cuda(const Tensor& input, const Tensor& targ
         }                                                                   \
         Tensor result = Tensor::zeros({}, input.dtype(), input.device());   \
         Tensor total_weight = Tensor::zeros({}, input.dtype(), input.device()); \
-        Tensor loss_acc = Tensor::zeros({}, DType::Float32, input.device()); \
-        Tensor weight_acc = Tensor::zeros({}, DType::Float32, input.device()); \
+        constexpr DType acc_dt = LossAccDType<acc_t>::value;                 \
+        Tensor loss_acc = Tensor::zeros({}, acc_dt, input.device());        \
+        Tensor weight_acc = Tensor::zeros({}, acc_dt, input.device());      \
         nll_loss_atomic_kernel<ctype, acc_t><<<blocks, threads, 0, stream>>>( \
             N, C, input.data_ptr<ctype>(), target.data_ptr<int64_t>(),      \
             weight.defined() ? weight.data_ptr<ctype>() : nullptr,          \

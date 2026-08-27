@@ -9,7 +9,7 @@ from os import path
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
 
-from torch import Tensor
+from tensorplay import Tensor
 
 from .folder import find_classes, make_dataset
 from .utils import check_integrity, download_and_extract_archive, download_url, verify_str_arg
@@ -70,9 +70,9 @@ class Kinetics(VisionDataset):
     Returns:
         tuple: A 3-tuple with the following entries:
 
-            - video (Tensor[T, C, H, W] or Tensor[T, H, W, C]): the `T` video frames in torch.uint8 tensor
+            - video (Tensor[T, C, H, W] or Tensor[T, H, W, C]): the `T` video frames in tensorplay.uint8 tensor
             - audio(Tensor[K, L]): the audio frames, where `K` is the number of channels
-              and `L` is the number of points in torch.float tensor
+              and `L` is the number of points in tensorplay.float tensor
             - label (int): class of the video clip
 
     Raises:

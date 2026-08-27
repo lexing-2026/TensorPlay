@@ -126,8 +126,9 @@ Tensor avg_pool3d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_si
                               divisor_override).squeeze(0);
     }
     if (input.dim() != 5) TP_THROW(RuntimeError, "avg_pool3d: Expected 5D input");
-    const int64_t N = input.size(0), C = input.size(1);
-    const int64_t D = input.size(2), H = input.size(3), W = input.size(4);
+    const Tensor input_c = input.contiguous();
+    int64_t N = input_c.size(0), C = input_c.size(1);
+    const int64_t D = input_c.size(2), H = input_c.size(3), W = input_c.size(4);
     const int64_t kd = kernel_size[0], kh = kernel_size[1], kw = kernel_size[2];
     const int64_t sd = stride[0], sh = stride[1], sw = stride[2];
     const int64_t pd_ = padding[0], ph = padding[1], pw = padding[2];
@@ -141,7 +142,7 @@ Tensor avg_pool3d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_si
     Tensor out = Tensor::empty({N, C, oD, oH, oW}, input.dtype(), input.device());
     TP_DISPATCH_FLOATING_TYPES_AND_LONG(input.dtype(), "avg_pool3d", [&]() {
         scalar_t* out_ptr = out.data_ptr<scalar_t>();
-        const scalar_t* in_ptr = input.data_ptr<scalar_t>();
+        const scalar_t* in_ptr = input_c.data_ptr<scalar_t>();
         for (int64_t n = 0; n < N; ++n)
         for (int64_t c = 0; c < C; ++c)
         for (int64_t od = 0; od < oD; ++od)
@@ -174,11 +175,14 @@ Tensor max_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_si
                               dilation, ceil_mode).squeeze(0);
     }
     if (input.dim() != 4) TP_THROW(RuntimeError, "max_pool2d: Expected 4D input");
-    
-    int64_t N = input.size(0);
-    int64_t C = input.size(1);
-    int64_t H_in = input.size(2);
-    int64_t W_in = input.size(3);
+    // The kernel indexes raw NCHW pointers; normalize views (no-op when
+    // already contiguous) so non-contiguous inputs match torch's results.
+    const Tensor input_c = input.contiguous();
+
+    int64_t N = input_c.size(0);
+    int64_t C = input_c.size(1);
+    int64_t H_in = input_c.size(2);
+    int64_t W_in = input_c.size(3);
     
     auto [kH, kW] = get_pair(kernel_size);
     auto [sH, sW] = get_pair_from_kernel(stride, kernel_size);
@@ -203,7 +207,7 @@ Tensor max_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_si
     
     TP_DISPATCH_ALL_TYPES(input.dtype(), "max_pool2d", [&]() {
         scalar_t* out_ptr = out.data_ptr<scalar_t>();
-        const scalar_t* in_ptr = input.data_ptr<scalar_t>();
+        const scalar_t* in_ptr = input_c.data_ptr<scalar_t>();
 
         for (int64_t n = 0; n < N; ++n) {
             for (int64_t c = 0; c < C; ++c) {
@@ -251,6 +255,7 @@ Tensor avg_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_si
     }
     if (input.dim() != 4) TP_THROW(RuntimeError, "avg_pool2d: Expected 4D input");
     
+    const Tensor input_c = input.contiguous();
     int64_t N = input.size(0);
     int64_t C = input.size(1);
     int64_t H_in = input.size(2);
@@ -339,10 +344,11 @@ Tensor adaptive_avg_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& 
     }
     if (input.dim() != 4) TP_THROW(RuntimeError, "adaptive_avg_pool2d: Expected 4D input");
     
-    int64_t N = input.size(0);
-    int64_t C = input.size(1);
-    int64_t H_in = input.size(2);
-    int64_t W_in = input.size(3);
+    const Tensor input_c = input.contiguous();
+    int64_t N = input_c.size(0);
+    int64_t C = input_c.size(1);
+    int64_t H_in = input_c.size(2);
+    int64_t W_in = input_c.size(3);
     
     auto [H_out, W_out] = get_pair(output_size);
     if (H_out <= 0 || W_out <= 0) TP_THROW(RuntimeError, "adaptive_avg_pool2d: Invalid output size");
@@ -394,10 +400,11 @@ Tensor adaptive_max_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& 
     }
     if (input.dim() != 4) TP_THROW(RuntimeError, "adaptive_max_pool2d: Expected 4D input");
     
-    int64_t N = input.size(0);
-    int64_t C = input.size(1);
-    int64_t H_in = input.size(2);
-    int64_t W_in = input.size(3);
+    const Tensor input_c = input.contiguous();
+    int64_t N = input_c.size(0);
+    int64_t C = input_c.size(1);
+    int64_t H_in = input_c.size(2);
+    int64_t W_in = input_c.size(3);
     
     auto [H_out, W_out] = get_pair(output_size);
     if (H_out <= 0 || W_out <= 0) TP_THROW(RuntimeError, "adaptive_max_pool2d: Invalid output size");
@@ -406,7 +413,7 @@ Tensor adaptive_max_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& 
 
     TP_DISPATCH_ALL_TYPES(input.dtype(), "adaptive_max_pool2d", [&]() {
         scalar_t* out_ptr = out.data_ptr<scalar_t>();
-        const scalar_t* in_ptr = input.data_ptr<scalar_t>();
+        const scalar_t* in_ptr = input_c.data_ptr<scalar_t>();
 
         for (int64_t n = 0; n < N; ++n) {
             for (int64_t c = 0; c < C; ++c) {
@@ -442,11 +449,12 @@ Tensor adaptive_max_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& 
 
 Tensor max_pool2d_backward_cpu(const Tensor& grad_output, const Tensor& input, const std::vector<int64_t>& kernel_size, const std::vector<int64_t>& stride, const std::vector<int64_t>& padding, const std::vector<int64_t>& dilation, bool ceil_mode) {
     if (grad_output.dim() != 4 || input.dim() != 4) TP_THROW(RuntimeError, "max_pool2d_backward: Expected 4D input and grad_output");
-    
-    int64_t N = input.size(0);
-    int64_t C = input.size(1);
-    int64_t H_in = input.size(2);
-    int64_t W_in = input.size(3);
+    const Tensor input_c = input.contiguous();
+
+    int64_t N = input_c.size(0);
+    int64_t C = input_c.size(1);
+    int64_t H_in = input_c.size(2);
+    int64_t W_in = input_c.size(3);
     
     int64_t H_out = grad_output.size(2);
     int64_t W_out = grad_output.size(3);
@@ -461,7 +469,7 @@ Tensor max_pool2d_backward_cpu(const Tensor& grad_output, const Tensor& input, c
     TP_DISPATCH_ALL_TYPES(input.dtype(), "max_pool2d_backward", [&]() {
         scalar_t* grad_in_ptr = grad_input.data_ptr<scalar_t>();
         const scalar_t* grad_out_ptr = grad_output.data_ptr<scalar_t>();
-        const scalar_t* in_ptr = input.data_ptr<scalar_t>();
+        const scalar_t* in_ptr = input_c.data_ptr<scalar_t>();
 
         for (int64_t n = 0; n < N; ++n) {
             for (int64_t c = 0; c < C; ++c) {
@@ -503,11 +511,12 @@ Tensor max_pool2d_backward_cpu(const Tensor& grad_output, const Tensor& input, c
 
 Tensor avg_pool2d_backward_cpu(const Tensor& grad_output, const Tensor& input, const std::vector<int64_t>& kernel_size, const std::vector<int64_t>& stride, const std::vector<int64_t>& padding, bool ceil_mode, bool count_include_pad, std::optional<int64_t> divisor_override) {
     if (grad_output.dim() != 4 || input.dim() != 4) TP_THROW(RuntimeError, "avg_pool2d_backward: Expected 4D input and grad_output");
-    
-    int64_t N = input.size(0);
-    int64_t C = input.size(1);
-    int64_t H_in = input.size(2);
-    int64_t W_in = input.size(3);
+    const Tensor input_c = input.contiguous();
+
+    int64_t N = input_c.size(0);
+    int64_t C = input_c.size(1);
+    int64_t H_in = input_c.size(2);
+    int64_t W_in = input_c.size(3);
     
     int64_t H_out = grad_output.size(2);
     int64_t W_out = grad_output.size(3);

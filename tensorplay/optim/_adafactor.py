@@ -11,6 +11,7 @@ from .optimizer import (
     _to_scalar,
     Optimizer,
 )
+from ._utils import scalar_value
 
 
 __all__ = ["Adafactor", "adafactor"]
@@ -372,7 +373,11 @@ def _single_tensor_adafactor(
             raise AssertionError(f"Expected lr to be a float, but got {type(lr)}")
 
     else:
-        lr = _to_scalar(lr)
+        # Adafactor has no differentiable optimizer mode.  Materialize a
+        # scalar Tensor lr exactly once so the Python min/norm calculations
+        # and TensorPlay's alpha overloads receive a numeric scalar, matching
+        # Torch's eager behavior.
+        lr = scalar_value(lr, "lr")
 
     for i, param in enumerate(params):
         grad = grads[i] if not maximize else -grads[i]
@@ -495,7 +500,7 @@ def _multi_tensor_adafactor(
     if grad_scale is not None or found_inf is not None:
         raise AssertionError("Grad scaling should occur outside of optimizer.step()")
 
-    lr = _to_scalar(lr)
+    lr = scalar_value(lr, "lr")
 
     grouped_tensors = _group_tensors_by_device_dtype_and_is_multidim(
         [params, grads, row_vars, col_vars, variances, state_steps]  # type: ignore[list-item]
@@ -646,6 +651,95 @@ def adafactor(
         raise RuntimeError(
             "`state_steps` argument must contain a list of singleton tensors"
         )
+
+    # Native Adafactor keeps the scalar step counters on the host, performs
+    # the RMS/clipping reductions in the backend, and fuses the elementwise
+    # state/parameter update.  Split vector and factored tensors because their
+    # state layouts differ; CUDA's factored kernel currently targets the
+    # common 2-D parameter case, while CPU also handles higher-rank tensors.
+    native_groups = {}
+    native = (
+        not tp.compiler.is_compiling()
+        and grad_scale is None
+        and found_inf is None
+        and not has_complex
+        and not isinstance(lr, tp.Tensor)
+        and bool(params)
+        # Torch updates reduced-precision state with separate Python ops;
+        # the fused kernel's combined write rounds at a different point.
+        and params[0].dtype in (tp.float32, tp.float64)
+    )
+    if native:
+        for index, (param, grad, row_var, col_var, variance, step) in enumerate(
+            zip(params, grads, row_vars, col_vars, variances, state_steps)
+        ):
+            factored = param.dim() > 1
+            if param.device.type == "cuda" and factored and param.dim() != 2:
+                native = False
+                break
+            if not (
+                param.is_contiguous()
+                and param.is_floating_point()
+                and grad.device == param.device
+                and grad.is_contiguous()
+                and grad.dtype == param.dtype
+                and grad.shape == param.shape
+                and step.device.type == "cpu"
+                and step.is_contiguous()
+                and step.numel() == 1
+                and step.dtype in (tp.float32, tp.float64)
+            ):
+                native = False
+                break
+            if factored:
+                if row_var is None or col_var is None:
+                    native = False
+                    break
+                states = (row_var, col_var)
+            else:
+                if variance is None:
+                    native = False
+                    break
+                states = (variance,)
+            if not all(
+                state.device == param.device
+                and state.is_contiguous()
+                and state.dtype == param.dtype
+                for state in states
+            ):
+                native = False
+                break
+            key = (param.device, param.dtype, factored)
+            group = native_groups.setdefault(
+                key, {"params": [], "grads": [], "rows": [], "cols": [],
+                      "variances": [], "steps": []}
+            )
+            group["params"].append(param)
+            group["grads"].append(grad)
+            group["rows"].append(row_var)
+            group["cols"].append(col_var)
+            group["variances"].append(variance)
+            group["steps"].append(step)
+    if native:
+        native_lr = _to_scalar(lr)
+        for (_, dtype, factored), group in native_groups.items():
+            native_eps1 = eps1 if eps1 is not None else _dtype_epsilon(dtype)
+            if factored:
+                tp._fused_adafactor_factored_(
+                    group["params"], group["grads"], group["rows"],
+                    group["cols"], group["steps"], lr=native_lr,
+                    beta2_decay=beta2_decay, eps1=native_eps1, eps2=eps2,
+                    d=d, weight_decay=weight_decay, maximize=maximize,
+                )
+            else:
+                tp._fused_adafactor_(
+                    group["params"], group["grads"], group["variances"],
+                    group["steps"], lr=native_lr, beta2_decay=beta2_decay,
+                    eps1=native_eps1, eps2=eps2, d=d,
+                    weight_decay=weight_decay, maximize=maximize,
+                )
+        if native_groups:
+            return
 
     if foreach:
         func = _multi_tensor_adafactor

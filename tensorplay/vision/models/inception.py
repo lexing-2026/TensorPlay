@@ -6,9 +6,9 @@ from collections import namedtuple
 from functools import partial
 from typing import Any, Callable, Optional
 
-import tensorplay as torch
+import tensorplay as tensorplay
 import tensorplay.nn.functional as F
-from torch import nn, Tensor
+from tensorplay import nn, Tensor
 
 from ..transforms._presets import ImageClassification
 from ..utils import _log_api_usage_once
@@ -45,7 +45,7 @@ class Inception3(nn.Module):
         if init_weights is None:
             warnings.warn(
                 "The default weight initialization of inception_v3 will be changed in future releases of "
-                "torchvision. If you wish to keep the old behavior (which leads to long initialization times"
+                "tensorplay.vision. If you wish to keep the old behavior (which leads to long initialization times"
                 " due to scipy/scipy#11299), please set init_weights=True.",
                 FutureWarning,
             )
@@ -90,17 +90,17 @@ class Inception3(nn.Module):
             for m in self.modules():
                 if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
                     stddev = float(m.stddev) if hasattr(m, "stddev") else 0.1  # type: ignore
-                    torch.nn.init.trunc_normal_(m.weight, mean=0.0, std=stddev, a=-2, b=2)
+                    tensorplay.nn.init.trunc_normal_(m.weight, mean=0.0, std=stddev, a=-2, b=2)
                 elif isinstance(m, nn.BatchNorm2d):
                     nn.init.constant_(m.weight, 1)
                     nn.init.constant_(m.bias, 0)
 
     def _transform_input(self, x: Tensor) -> Tensor:
         if self.transform_input:
-            x_ch0 = torch.unsqueeze(x[:, 0], 1) * (0.229 / 0.5) + (0.485 - 0.5) / 0.5
-            x_ch1 = torch.unsqueeze(x[:, 1], 1) * (0.224 / 0.5) + (0.456 - 0.5) / 0.5
-            x_ch2 = torch.unsqueeze(x[:, 2], 1) * (0.225 / 0.5) + (0.406 - 0.5) / 0.5
-            x = torch.cat((x_ch0, x_ch1, x_ch2), 1)
+            x_ch0 = tensorplay.unsqueeze(x[:, 0], 1) * (0.229 / 0.5) + (0.485 - 0.5) / 0.5
+            x_ch1 = tensorplay.unsqueeze(x[:, 1], 1) * (0.224 / 0.5) + (0.456 - 0.5) / 0.5
+            x_ch2 = tensorplay.unsqueeze(x[:, 2], 1) * (0.225 / 0.5) + (0.406 - 0.5) / 0.5
+            x = tensorplay.cat((x_ch0, x_ch1, x_ch2), 1)
         return x
 
     def _forward(self, x: Tensor) -> tuple[Tensor, Optional[Tensor]]:
@@ -151,13 +151,13 @@ class Inception3(nn.Module):
         # N x 2048 x 1 x 1
         x = self.dropout(x)
         # N x 2048 x 1 x 1
-        x = torch.flatten(x, 1)
+        x = tensorplay.flatten(x, 1)
         # N x 2048
         x = self.fc(x)
         # N x 1000 (num_classes)
         return x, aux
 
-    @torch.jit.unused
+    @tensorplay.jit.unused
     def eager_outputs(self, x: Tensor, aux: Optional[Tensor]) -> InceptionOutputs:
         if self.training and self.aux_logits:
             return InceptionOutputs(x, aux)
@@ -168,7 +168,7 @@ class Inception3(nn.Module):
         x = self._transform_input(x)
         x, aux = self._forward(x)
         aux_defined = self.training and self.aux_logits
-        if torch.jit.is_scripting():
+        if tensorplay.jit.is_scripting():
             if not aux_defined:
                 warnings.warn("Scripted Inception3 always returns Inception3 Tuple")
             return InceptionOutputs(x, aux)
@@ -212,7 +212,7 @@ class InceptionA(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         outputs = self._forward(x)
-        return torch.cat(outputs, 1)
+        return tensorplay.cat(outputs, 1)
 
 
 class InceptionB(nn.Module):
@@ -240,7 +240,7 @@ class InceptionB(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         outputs = self._forward(x)
-        return torch.cat(outputs, 1)
+        return tensorplay.cat(outputs, 1)
 
 
 class InceptionC(nn.Module):
@@ -286,7 +286,7 @@ class InceptionC(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         outputs = self._forward(x)
-        return torch.cat(outputs, 1)
+        return tensorplay.cat(outputs, 1)
 
 
 class InceptionD(nn.Module):
@@ -317,7 +317,7 @@ class InceptionD(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         outputs = self._forward(x)
-        return torch.cat(outputs, 1)
+        return tensorplay.cat(outputs, 1)
 
 
 class InceptionE(nn.Module):
@@ -346,7 +346,7 @@ class InceptionE(nn.Module):
             self.branch3x3_2a(branch3x3),
             self.branch3x3_2b(branch3x3),
         ]
-        branch3x3 = torch.cat(branch3x3, 1)
+        branch3x3 = tensorplay.cat(branch3x3, 1)
 
         branch3x3dbl = self.branch3x3dbl_1(x)
         branch3x3dbl = self.branch3x3dbl_2(branch3x3dbl)
@@ -354,7 +354,7 @@ class InceptionE(nn.Module):
             self.branch3x3dbl_3a(branch3x3dbl),
             self.branch3x3dbl_3b(branch3x3dbl),
         ]
-        branch3x3dbl = torch.cat(branch3x3dbl, 1)
+        branch3x3dbl = tensorplay.cat(branch3x3dbl, 1)
 
         branch_pool = F.avg_pool2d(x, kernel_size=3, stride=1, padding=1)
         branch_pool = self.branch_pool(branch_pool)
@@ -364,7 +364,7 @@ class InceptionE(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         outputs = self._forward(x)
-        return torch.cat(outputs, 1)
+        return tensorplay.cat(outputs, 1)
 
 
 class InceptionAux(nn.Module):
@@ -391,7 +391,7 @@ class InceptionAux(nn.Module):
         # Adaptive average pooling
         x = F.adaptive_avg_pool2d(x, (1, 1))
         # N x 768 x 1 x 1
-        x = torch.flatten(x, 1)
+        x = tensorplay.flatten(x, 1)
         # N x 768
         x = self.fc(x)
         # N x 1000
@@ -418,7 +418,7 @@ class Inception_V3_Weights(WeightsEnum):
             "num_params": 27161264,
             "min_size": (75, 75),
             "categories": _IMAGENET_CATEGORIES,
-            "recipe": "https://github.com/pytorch/vision/tree/main/references/classification#inception-v3",
+            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#inception-v3",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 77.294,
@@ -445,19 +445,19 @@ def inception_v3(*, weights: Optional[Inception_V3_Weights] = None, progress: bo
         N x 3 x 299 x 299, so ensure your images are sized accordingly.
 
     Args:
-        weights (:class:`~torchvision.models.Inception_V3_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.Inception_V3_Weights`, optional): The
             pretrained weights for the model. See
-            :class:`~torchvision.models.Inception_V3_Weights` below for
+            :class:`~tensorplay.vision.models.Inception_V3_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.Inception3``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.Inception3``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/inception.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/inception.py>`_
             for more details about this class.
 
-    .. autoclass:: torchvision.models.Inception_V3_Weights
+    .. autoclass:: tensorplay.vision.models.Inception_V3_Weights
         :members:
     """
     weights = Inception_V3_Weights.verify(weights)

@@ -27,7 +27,7 @@ class Omniglot(VisionDataset):
             downloaded again.
         loader (callable, optional): A function to load an image given its path.
             By default, it uses PIL as its image loader, but users could also pass in
-            ``torchvision.io.decode_image`` for decoding image data into tensors directly.
+            ``tensorplay.vision.io.decode_image`` for decoding image data into tensors directly.
     """
 
     folder = "omniglot-py"

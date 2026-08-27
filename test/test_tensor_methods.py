@@ -204,3 +204,14 @@ class TestMiscMethods:
         (g.remainder(tp.tensor([2.0])) ** 2).sum().backward()
         (torch.remainder(gg, torch.tensor([2.0])) ** 2).sum().backward()
         assert g.grad.tolist() == gg.grad.tolist()
+
+    def test_bool_truthiness_matches_item(self):
+        """nb_bool contract (torch is_nonzero): was always-True before."""
+        assert not bool(tp.tensor(False))
+        assert not bool(tp.tensor(0.0))
+        assert bool(tp.tensor(3.0))
+        assert bool(tp.tensor(True))
+        with pytest.raises(RuntimeError, match="no values is ambiguous"):
+            bool(tp.zeros(0))
+        with pytest.raises(RuntimeError, match="more than one value is ambiguous"):
+            bool(tp.tensor([True, True]))

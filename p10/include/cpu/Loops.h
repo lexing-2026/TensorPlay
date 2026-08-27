@@ -15,14 +15,28 @@
 
 namespace tensorplay {
 
+namespace detail {
+
+// ATen parity (c10::function_traits): argument slots are computed
+// conditionally so that unary (project) and ternary (reduce with index)
+// member functions both introspect cleanly -- eager tuple_element on a
+// missing slot is a hard error otherwise.
+template <class Tuple, size_t I, bool Has = (I < std::tuple_size_v<Tuple>)>
+struct arg_at { using type = void; };
+
+template <class Tuple, size_t I>
+struct arg_at<Tuple, I, true> { using type = std::tuple_element_t<I, Tuple>; };
+
+} // namespace detail
+
 template <typename T>
 struct function_traits : function_traits<decltype(&T::operator())> {};
 
 template <typename R, typename... Args>
 struct function_traits<R (*)(Args...)> {
   using result_type = R;
-  using arg1_t = std::tuple_element_t<0, std::tuple<Args...>>;
-  using arg2_t = std::tuple_element_t<1, std::tuple<Args...>>;
+  using arg1_t = typename detail::arg_at<std::tuple<Args...>, 0>::type;
+  using arg2_t = typename detail::arg_at<std::tuple<Args...>, 1>::type;
   static constexpr size_t arity = sizeof...(Args);
 };
 

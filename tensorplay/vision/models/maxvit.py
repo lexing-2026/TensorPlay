@@ -8,16 +8,16 @@ from functools import partial
 from typing import Any, Callable, Optional
 
 import numpy as np
-import tensorplay as torch
+import tensorplay as tensorplay
 import tensorplay.nn.functional as F
-from torch import nn, Tensor
-from torchvision.models._api import register_model, Weights, WeightsEnum
-from torchvision.models._meta import _IMAGENET_CATEGORIES
-from torchvision.models._utils import _ovewrite_named_param, handle_legacy_interface
-from torchvision.ops.misc import Conv2dNormActivation, SqueezeExcitation
-from torchvision.ops.stochastic_depth import StochasticDepth
-from torchvision.transforms._presets import ImageClassification, InterpolationMode
-from torchvision.utils import _log_api_usage_once
+from tensorplay import nn, Tensor
+from ._api import register_model, Weights, WeightsEnum
+from ._meta import _IMAGENET_CATEGORIES
+from ._utils import _ovewrite_named_param, handle_legacy_interface
+from ..ops.misc import Conv2dNormActivation, SqueezeExcitation
+from ..ops.stochastic_depth import StochasticDepth
+from ..transforms._presets import ImageClassification, InterpolationMode
+from ..utils import _log_api_usage_once
 
 __all__ = [
     "MaxVit",
@@ -43,9 +43,9 @@ def _make_block_input_shapes(input_size: tuple[int, int], n_blocks: int) -> list
     return shapes
 
 
-def _get_relative_position_index(height: int, width: int) -> torch.Tensor:
-    coords = torch.stack(torch.meshgrid([torch.arange(height), torch.arange(width)], indexing="ij"))
-    coords_flat = torch.flatten(coords, 1)
+def _get_relative_position_index(height: int, width: int) -> tensorplay.Tensor:
+    coords = tensorplay.stack(tensorplay.meshgrid([tensorplay.arange(height), tensorplay.arange(width)], indexing="ij"))
+    coords_flat = tensorplay.flatten(coords, 1)
     relative_coords = coords_flat[:, :, None] - coords_flat[:, None, :]
     relative_coords = relative_coords.permute(1, 2, 0).contiguous()
     relative_coords[:, :, 0] += height - 1
@@ -171,14 +171,14 @@ class RelativePositionalMultiHeadAttention(nn.Module):
 
         self.merge = nn.Linear(self.head_dim * self.n_heads, feat_dim)
         self.relative_position_bias_table = nn.parameter.Parameter(
-            torch.empty(((2 * self.size - 1) * (2 * self.size - 1), self.n_heads), dtype=torch.float32),
+            tensorplay.empty(((2 * self.size - 1) * (2 * self.size - 1), self.n_heads), dtype=tensorplay.float32),
         )
 
         self.register_buffer("relative_position_index", _get_relative_position_index(self.size, self.size))
         # initialize with truncated normal the bias
-        torch.nn.init.trunc_normal_(self.relative_position_bias_table, std=0.02)
+        tensorplay.nn.init.trunc_normal_(self.relative_position_bias_table, std=0.02)
 
-    def get_relative_positional_bias(self) -> torch.Tensor:
+    def get_relative_positional_bias(self) -> tensorplay.Tensor:
         bias_index = self.relative_position_index.view(-1)  # type: ignore
         relative_bias = self.relative_position_bias_table[bias_index].view(self.max_seq_len, self.max_seq_len, -1)  # type: ignore
         relative_bias = relative_bias.permute(2, 0, 1).contiguous()
@@ -195,19 +195,19 @@ class RelativePositionalMultiHeadAttention(nn.Module):
         H, DH = self.n_heads, self.head_dim
 
         qkv = self.to_qkv(x)
-        q, k, v = torch.chunk(qkv, 3, dim=-1)
+        q, k, v = tensorplay.chunk(qkv, 3, dim=-1)
 
         q = q.reshape(B, G, P, H, DH).permute(0, 1, 3, 2, 4)
         k = k.reshape(B, G, P, H, DH).permute(0, 1, 3, 2, 4)
         v = v.reshape(B, G, P, H, DH).permute(0, 1, 3, 2, 4)
 
         k = k * self.scale_factor
-        dot_prod = torch.einsum("B G H I D, B G H J D -> B G H I J", q, k)
+        dot_prod = tensorplay.einsum("B G H I D, B G H J D -> B G H I J", q, k)
         pos_bias = self.get_relative_positional_bias()
 
         dot_prod = F.softmax(dot_prod + pos_bias, dim=-1)
 
-        out = torch.einsum("B G H I J, B G H J D -> B G H I D", dot_prod, v)
+        out = tensorplay.einsum("B G H I J, B G H J D -> B G H I D", dot_prod, v)
         out = out.permute(0, 1, 3, 2, 4).reshape(B, G, P, D)
 
         out = self.merge(out)
@@ -222,8 +222,8 @@ class SwapAxes(nn.Module):
         self.a = a
         self.b = b
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        res = torch.swapaxes(x, self.a, self.b)
+    def forward(self, x: tensorplay.Tensor) -> tensorplay.Tensor:
+        res = tensorplay.swapaxes(x, self.a, self.b)
         return res
 
 
@@ -370,7 +370,7 @@ class PartitionAttentionLayer(nn.Module):
         # Undefined behavior if H or W are not divisible by p
         # https://github.com/google-research/maxvit/blob/da76cf0d8a6ec668cc31b399c4126186da7da944/maxvit/models/maxvit.py#L766
         gh, gw = self.grid_size[0] // self.p, self.grid_size[1] // self.p
-        torch._assert(
+        tensorplay._assert(
             self.grid_size[0] % self.p == 0 and self.grid_size[1] % self.p == 0,
             "Grid size must be divisible by partition size. Got grid size of {} and partition size of {}".format(
                 self.grid_size, self.p
@@ -783,7 +783,7 @@ class MaxVit_T_Weights(WeightsEnum):
             "categories": _IMAGENET_CATEGORIES,
             "num_params": 30919624,
             "min_size": (224, 224),
-            "recipe": "https://github.com/pytorch/vision/tree/main/references/classification#maxvit",
+            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#maxvit",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 83.700,
@@ -807,19 +807,19 @@ def maxvit_t(*, weights: Optional[MaxVit_T_Weights] = None, progress: bool = Tru
     `MaxViT: Multi-Axis Vision Transformer <https://arxiv.org/abs/2204.01697>`_.
 
     Args:
-        weights (:class:`~torchvision.models.MaxVit_T_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.MaxVit_T_Weights`, optional): The
             pretrained weights to use. See
-            :class:`~torchvision.models.MaxVit_T_Weights` below for
+            :class:`~tensorplay.vision.models.MaxVit_T_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.maxvit.MaxVit``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.maxvit.MaxVit``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/maxvit.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/maxvit.py>`_
             for more details about this class.
 
-    .. autoclass:: torchvision.models.MaxVit_T_Weights
+    .. autoclass:: tensorplay.vision.models.MaxVit_T_Weights
         :members:
     """
     weights = MaxVit_T_Weights.verify(weights)

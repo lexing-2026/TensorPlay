@@ -600,7 +600,7 @@ def _test_undefined_backward_mode(func, outputs, inputs) -> bool:
     # All backward functions must work properly if all output grads are undefined
     outputs_to_check = [
         [
-            _UndefinedGrad()(o)
+            _UndefinedGrad.apply(o)
             for o in _differentiable_outputs(func(*inputs))
             # This check filters out Tensor-likes that aren't instances of Tensor.
             if isinstance(o, tensorplay.Tensor)
@@ -613,7 +613,7 @@ def _test_undefined_backward_mode(func, outputs, inputs) -> bool:
             output_to_check = _differentiable_outputs(func(*inputs))
             outputs_to_check.append(
                 [
-                    _UndefinedGrad()(o) if idx == undef_grad_idx else o
+                    _UndefinedGrad.apply(o) if idx == undef_grad_idx else o
                     for idx, o in enumerate(output_to_check)
                 ]
             )
@@ -809,12 +809,184 @@ def _gradcheck_helper(
     outputs = _differentiable_outputs(func_out)
     _check_outputs(outputs)
 
-    if any(isinstance(t, tensorplay.Tensor) and t.is_complex() for t in (*tupled_inputs, *outputs)):
-        raise NotImplementedError(
-            "tensorplay.autograd.gradcheck: complex tensor support is not "
-            "available in this engine yet; gradcheck only supports real-valued "
-            "inputs and outputs."
-        )
+    if any(isinstance(t, tensorplay.Tensor) and t.is_complex()
+           for t in (*tupled_inputs, *outputs)):
+        # torch parity: complex gradcheck via Wirtinger blocks.  Complex
+        # inputs split into (re, im) leaves re-assembled by the differentiable
+        # `complex` op; analytic blocks come from one-hot backwards over the
+        # SAME recorded graph; numeric blocks from central differences.
+        # Under the engine's stored-gradient convention (pointwise formulas
+        # multiply grad by conj(J)) a stored pair (gre, gim) corresponds to
+        # the real Jacobian block [[gre, gim], [-gim, gre]] -- Cauchy-Riemann
+        # structure included, so anti-holomorphic ops (abs, ...) check too.
+        import numpy as np
+
+        def _fail(msg):
+            raise GradcheckError(msg)
+
+        def _interleave(a, b):
+            out = np.empty(a.size + b.size)
+            out[0::2] = a
+            out[1::2] = b
+            return out
+
+        # ---- rebuild inputs as split real leaves ---------------------------
+        slots = []          # ('c', re_leaf, im_leaf, dtype) | ('r', leaf, dtype)
+        for t in tupled_inputs:
+            if isinstance(t, tensorplay.Tensor) and t.is_complex():
+                vr = t.view_as_real()
+                re = vr[..., 0].clone()
+                im = vr[..., 1].clone()
+                re.requires_grad_(True)
+                im.requires_grad_(True)
+                slots.append(('c', re, im, t.dtype))
+            elif isinstance(t, tensorplay.Tensor):
+                tc = t.clone()
+                tc.requires_grad_(t.requires_grad)
+                slots.append(('r', tc, None, t.dtype))
+            else:
+                slots.append(('o', t, None, None))
+
+        cslots = [s for s in slots if s[0] == 'c']
+        leaves = []
+        for s in slots:
+            if s[0] == 'c':
+                leaves.extend([s[1], s[2]])
+            elif s[0] == 'r':
+                leaves.append(s[1])
+
+        def _run():
+            args = []
+            for s in slots:
+                if s[0] == 'c':
+                    # parts stay REAL-typed here: converting them to the
+                    # complex dtype first would make complex_cpu mis-promote
+                    # the reconstructed output down to complex64.
+                    args.append(tensorplay.complex(s[1], s[2]))
+                elif s[0] == 'r':
+                    args.append(s[1])
+                else:
+                    args.append(s[1])
+            return func(*args)
+
+        def _flat(o):
+            if isinstance(o, tensorplay.Tensor) and o.is_complex():
+                return np.asarray(o.detach().cpu().view_as_real()).reshape(-1).astype(np.float64)
+            if isinstance(o, tensorplay.Tensor):
+                return np.asarray(o.detach().cpu()).reshape(-1).astype(np.float64)
+            return np.asarray(o, dtype=np.float64).reshape(-1)
+
+        out_tuple = _as_tuple(_run())
+        n_out = sum(o.numel() * (2 if o.is_complex() else 1)
+                    for o in out_tuple)
+
+        col_base, cb = {}, 0
+        for si, s in enumerate(cslots):
+            col_base[si] = cb
+            cb += 2 * s[1].numel()
+
+        # ---- numeric: central differences over every component -------------
+        J_n = np.zeros((n_out, cb))
+        for si, s in enumerate(cslots):
+            re, im, dt = s[1], s[2], s[3]
+            n_in = re.numel()
+            r_np = np.asarray(re.detach().cpu()).astype(np.float64).reshape(-1)
+            i_np = np.asarray(im.detach().cpu()).astype(np.float64).reshape(-1)
+            shp_r, shp_i = re.shape, im.shape
+            for j in range(n_in):
+                for comp in range(2):
+                    rp, rm = r_np.copy(), r_np.copy()
+                    ip, imm = i_np.copy(), i_np.copy()
+                    if comp == 0:
+                        rp[j] += eps; rm[j] -= eps
+                    else:
+                        ip[j] += eps; imm[j] -= eps
+
+                    dtr, dti = re.dtype, im.dtype
+                    dev_r, dev_i = re.device, im.device
+
+                    def bumped():
+                        return (tensorplay.tensor(rp.reshape(shp_r),
+                                                  dtype=dtr).to(dev_r),
+                                tensorplay.tensor(ip.reshape(shp_i),
+                                                  dtype=dti).to(dev_i))
+
+                    def bumped_neg():
+                        return (tensorplay.tensor(rm.reshape(shp_r),
+                                                  dtype=dtr).to(dev_r),
+                                tensorplay.tensor(imm.reshape(shp_i),
+                                                  dtype=dti).to(dev_i))
+                    saved_pos, saved_neg = bumped(), bumped_neg()
+                    s1, s2 = slots[si][1], slots[si][2]
+                    orig_pair = (s1, s2)
+                    slots[si] = ('c', saved_pos[0], saved_pos[1], dt)
+                    op = np.concatenate([_flat(o) for o in _as_tuple(_run())])
+                    slots[si] = ('c', saved_neg[0], saved_neg[1], dt)
+                    om = np.concatenate([_flat(o) for o in _as_tuple(_run())])
+                    slots[si] = ('c', orig_pair[0], orig_pair[1], dt)
+                    # column layout matches the analytic side: per input
+                    # slot all real-component columns, then imag ones.
+                    J_n[:, col_base[si] + comp * n_in + j] = (op - om) / (2 * eps)
+
+        # Row layout: upstream splits complex outputs into real/imag
+        # components (torch/autograd/gradcheck.py::_real_and_imag_output),
+        # so both Jacobians are compared in component-major order
+        # ([Re-block; Im-block]) instead of element-interleaved _flat order.
+        row_perm = []
+        _off = 0
+        for _o in out_tuple:
+            if _o.is_complex():
+                _m = _o.numel()
+                row_perm.extend(range(_off, _off + _m))
+                row_perm.extend(range(_off + _m, _off + 2 * _m))
+                _off += 2 * _m
+            else:
+                row_perm.extend(range(_off, _off + _o.numel()))
+                _off += _o.numel()
+        J_n = J_n[row_perm, :]
+
+        # ---- analytic: one-hot vjp per REAL output component ----------------
+        # Mirrors upstream's slow mode: outputs were split into real
+        # components above (view_as_real + select are differentiable views),
+        # and inputs are already split into real leaves, so the engine only
+        # ever sees real->real differentiation.  No stored-gradient
+        # conjugation convention is relied upon here.
+        out_comps = []
+        for o in out_tuple:
+            if o.is_complex():
+                vr = o.view_as_real()
+                out_comps.append(vr.select(-1, 0))
+                out_comps.append(vr.select(-1, 1))
+            else:
+                out_comps.append(o)
+
+        J_an = np.zeros((sum(c.numel() for c in out_comps), cb))
+        row = 0
+        for c in out_comps:
+            for e in range(c.numel()):
+                oh = np.zeros(c.shape, dtype=np.float64)
+                oh.reshape(-1)[e] = 1.0
+                go = tensorplay.tensor(oh).to(c.dtype).to(c.device).reshape(c.shape)
+                g = tensorplay.autograd.grad(
+                    [c], leaves, [go], retain_graph=True, allow_unused=True)
+                idx = 0
+                for si, sl in enumerate(cslots):
+                    ni = sl[1].numel()
+                    base = col_base[si]
+                    gre_t, gim_t = g[idx], g[idx + 1]
+                    idx += 2
+                    if gre_t is not None:
+                        J_an[row, base:base + ni] = np.asarray(
+                            gre_t.detach().cpu()).reshape(-1).astype(np.float64)[:ni]
+                    if gim_t is not None:
+                        J_an[row, base + ni:base + 2 * ni] = np.asarray(
+                            gim_t.detach().cpu()).reshape(-1).astype(np.float64)[:ni]
+                row += 1
+
+        if not np.allclose(J_an, J_n, rtol=rtol, atol=atol):
+            return _fail("Jacobian mismatch (complex):\n"
+                         "numerical:\n%s\nanalytical:\n%s" % (J_n, J_an))
+        return True
 
     _slow_gradcheck(
         func,

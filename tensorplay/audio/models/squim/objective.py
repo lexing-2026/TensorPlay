@@ -1,8 +1,8 @@
 import math
 from typing import List, Optional, Tuple
 
-import tensorplay as torch
-import torch.nn as nn
+import tensorplay as tensorplay
+import tensorplay.nn as nn
 import tensorplay.nn.functional as F
 
 
@@ -35,7 +35,7 @@ class RangeSigmoid(nn.Module):
         self.val_range: Tuple[float, float] = val_range
         self.sigmoid: nn.modules.Module = nn.Sigmoid()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: tensorplay.Tensor) -> tensorplay.Tensor:
         out = self.sigmoid(x) * (self.val_range[1] - self.val_range[0]) + self.val_range[0]
         return out
 
@@ -53,14 +53,14 @@ class Encoder(nn.Module):
 
         self.conv1d = nn.Conv1d(1, feat_dim, win_len, stride=win_len // 2, bias=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: tensorplay.Tensor) -> tensorplay.Tensor:
         """Apply waveforms to convolutional layer and ReLU layer.
 
         Args:
-            x (torch.Tensor): Input waveforms. Tensor with dimensions `(batch, time)`.
+            x (tensorplay.Tensor): Input waveforms. Tensor with dimensions `(batch, time)`.
 
         Returns:
-            (torch,Tensor): Feature Tensor with dimensions `(batch, channel, frame)`.
+            (tensorplay,Tensor): Feature Tensor with dimensions `(batch, channel, frame)`.
         """
         out = x.unsqueeze(dim=1)
         out = F.relu(self.conv1d(out))
@@ -86,7 +86,7 @@ class SingleRNN(nn.Module):
 
         self.proj = nn.Linear(hidden_size * 2, input_size)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: tensorplay.Tensor) -> tensorplay.Tensor:
         # input shape: batch, seq, dim
         out, _ = self.rnn(x)
         out = self.proj(out)
@@ -136,7 +136,7 @@ class DPRNN(nn.Module):
         self.chunk_size = chunk_size
         self.chunk_stride = chunk_stride
 
-    def pad_chunk(self, x: torch.Tensor) -> Tuple[torch.Tensor, int]:
+    def pad_chunk(self, x: tensorplay.Tensor) -> Tuple[tensorplay.Tensor, int]:
         # input shape: (B, N, T)
         seq_len = x.shape[-1]
 
@@ -145,18 +145,18 @@ class DPRNN(nn.Module):
 
         return out, rest
 
-    def chunking(self, x: torch.Tensor) -> Tuple[torch.Tensor, int]:
+    def chunking(self, x: tensorplay.Tensor) -> Tuple[tensorplay.Tensor, int]:
         out, rest = self.pad_chunk(x)
         batch_size, feat_dim, seq_len = out.shape
 
         segments1 = out[:, :, : -self.chunk_stride].contiguous().view(batch_size, feat_dim, -1, self.chunk_size)
         segments2 = out[:, :, self.chunk_stride :].contiguous().view(batch_size, feat_dim, -1, self.chunk_size)
-        out = torch.cat([segments1, segments2], dim=3)
+        out = tensorplay.cat([segments1, segments2], dim=3)
         out = out.view(batch_size, feat_dim, -1, self.chunk_size).transpose(2, 3).contiguous()
 
         return out, rest
 
-    def merging(self, x: torch.Tensor, rest: int) -> torch.Tensor:
+    def merging(self, x: tensorplay.Tensor, rest: int) -> tensorplay.Tensor:
         batch_size, dim, _, _ = x.shape
         out = x.transpose(2, 3).contiguous().view(batch_size, dim, -1, self.chunk_size * 2)
         out1 = out[:, :, :, : self.chunk_size].contiguous().view(batch_size, dim, -1)[:, :, self.chunk_stride :]
@@ -167,7 +167,7 @@ class DPRNN(nn.Module):
         out = out.contiguous()
         return out
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: tensorplay.Tensor) -> tensorplay.Tensor:
         x, rest = self.chunking(x)
         batch_size, _, dim1, dim2 = x.shape
         out = x
@@ -194,11 +194,11 @@ class AutoPool(nn.Module):
         super(AutoPool, self).__init__()
         self.pool_dim: int = pool_dim
         self.softmax: nn.modules.Module = nn.Softmax(dim=pool_dim)
-        self.register_parameter("alpha", nn.Parameter(torch.ones(1)))
+        self.register_parameter("alpha", nn.Parameter(tensorplay.ones(1)))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        weight = self.softmax(torch.mul(x, self.alpha))
-        out = torch.sum(torch.mul(x, weight), dim=self.pool_dim)
+    def forward(self, x: tensorplay.Tensor) -> tensorplay.Tensor:
+        weight = self.softmax(tensorplay.mul(x, self.alpha))
+        out = tensorplay.sum(tensorplay.mul(x, weight), dim=self.pool_dim)
         return out
 
 
@@ -207,9 +207,9 @@ class SquimObjective(nn.Module):
     for speech enhancement (e.g., STOI, PESQ, and SI-SDR).
 
     Args:
-        encoder (torch.nn.Module): Encoder module to transform 1D waveform to 2D feature representation.
-        dprnn (torch.nn.Module): DPRNN module to model sequential feature.
-        branches (torch.nn.ModuleList): Transformer branches in which each branch estimate one objective metirc score.
+        encoder (tensorplay.nn.Module): Encoder module to transform 1D waveform to 2D feature representation.
+        dprnn (tensorplay.nn.Module): DPRNN module to model sequential feature.
+        branches (tensorplay.nn.ModuleList): Transformer branches in which each branch estimate one objective metirc score.
     """
 
     def __init__(
@@ -223,17 +223,17 @@ class SquimObjective(nn.Module):
         self.dprnn = dprnn
         self.branches = branches
 
-    def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
+    def forward(self, x: tensorplay.Tensor) -> List[tensorplay.Tensor]:
         """
         Args:
-            x (torch.Tensor): Input waveforms. Tensor with dimensions `(batch, time)`.
+            x (tensorplay.Tensor): Input waveforms. Tensor with dimensions `(batch, time)`.
 
         Returns:
-            List(torch.Tensor): List of score Tenosrs. Each Tensor is with dimension `(batch,)`.
+            List(tensorplay.Tensor): List of score Tenosrs. Each Tensor is with dimension `(batch,)`.
         """
         if x.ndim != 2:
             raise ValueError(f"The input must be a 2D Tensor. Found dimension {x.ndim}.")
-        x = x / (torch.mean(x**2, dim=1, keepdim=True) ** 0.5 * 20)
+        x = x / (tensorplay.mean(x**2, dim=1, keepdim=True) ** 0.5 * 20)
         out = self.encoder(x)
         out = self.dprnn(out)
         scores = []
@@ -285,7 +285,7 @@ def squim_objective_model(
     chunk_size: int,
     chunk_stride: Optional[int] = None,
 ) -> SquimObjective:
-    """Build a custome :class:`torchaudio.models.squim.SquimObjective` model.
+    """Build a custome :class:`tensorplay.audio.models.squim.SquimObjective` model.
 
     Args:
         feat_dim (int, optional): The feature dimension after Encoder module.
@@ -313,7 +313,7 @@ def squim_objective_model(
 
 
 def squim_objective_base() -> SquimObjective:
-    """Build :class:`torchaudio.models.squim.SquimObjective` model with default arguments."""
+    """Build :class:`tensorplay.audio.models.squim.SquimObjective` model with default arguments."""
     return squim_objective_model(
         feat_dim=256,
         win_len=64,

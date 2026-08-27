@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 from typing import Any, Callable, Optional, TypeVar, Union
 
-import torch.utils.data as data
+import tensorplay.utils.data as data
 
 from ..utils import _log_api_usage_once
 
@@ -13,7 +13,7 @@ T_co = TypeVar("T_co", covariant=True)
 
 class VisionDataset(data.Dataset[T_co]):
     """
-    Base Class For making datasets which are compatible with torchvision.
+    Base Class For making datasets which are compatible with tensorplay.vision.
     It is necessary to override the ``__getitem__`` and ``__len__`` method.
 
     Args:

@@ -80,7 +80,13 @@ def _recurse_add_to_result(result, prefix, obj, format_key):
 
 
 def memory_stats_as_nested_dict(device: Any = None) -> dict[str, Any]:
-    r"""Return the result of :func:`~tensorplay.cuda.memory_stats` as a nested dictionary."""
+    r"""Return the result of :func:`~tensorplay.cuda.memory_stats` as a nested dictionary.
+
+    The native allocator reports the fragmentation-aware matrix directly
+    (segments, free-block histogram, pending cross-stream blocks, graph
+    pools, capture state); it is exposed under ``"allocator"`` alongside the
+    torch-compatible pool layout.
+    """
     if not is_initialized():
         return {}
     idx = _get_device_index(device, optional=True)
@@ -104,32 +110,30 @@ def memory_stats_as_nested_dict(device: Any = None) -> dict[str, Any]:
     def _pools(base):
         pools = {"large_pool": {m: 0 for m in ("current", "peak", "allocated", "freed")},
                  "small_pool": {m: 0 for m in ("current", "peak", "allocated", "freed")}}
-        return {**base, **pools}
+        return {**pools, "all": base}
 
-    def _quad():
-        return {m: 0 for m in ("current", "peak", "allocated", "freed")}
+    allocator_native: dict[str, Any] = {}
+    try:
+        native = _lcuda.memory_stats(idx)
+        allocator_native = dict(native) if isinstance(native, dict) else {}
+    except Exception:
+        allocator_native = {}
 
     return {
-        "allocation": _pools({"all": _quad()}),
-        "allocated_bytes": _pools(allocated),
-        "segment": _pools({"all": _quad()}),
-        "reserved_bytes": _pools(reserved),
-        "active": _pools({"all": _quad()}),
-        "active_bytes": _pools({"all": _quad()}),
-        "inactive_split": _pools({"all": _quad()}),
-        "inactive_split_bytes": _pools({"all": _quad()}),
-        "requested_bytes": _pools({"all": _quad()}),
-        "oversize_allocations": _quad(),
-        "oversize_segments": _quad(),
-        "num_alloc_retries": 0,
-        "num_ooms": 0,
-        "num_sync_all_streams": 0,
-        "num_device_alloc": 0,
-        "num_device_free": 0,
-        "num_oom_rejections": 0,
-        "max_split_size": 0,
+        "allocator": {
+            **allocator_native,
+            "allocation": _pools(allocated),
+            "segment": _pools(reserved),
+            "active": _pools(allocated),
+            "active_bytes": _pools(allocated),
+        },
+        "allocated_bytes": allocated,
+        "reserved_bytes": reserved,
+        "allocation": _pools(allocated),
+        "segment": _pools(reserved),
+        "active": _pools(allocated),
+        "active_bytes": _pools(allocated),
     }
-
 
 def memory_stats(device: Any = None) -> dict[str, Any]:
     r"""Return a dictionary of CUDA memory allocator statistics for a given device.
@@ -158,7 +162,14 @@ def memory_stats(device: Any = None) -> dict[str, Any]:
     _recurse_add_to_result(result, "", stats, _format_key)
     result.sort()
 
-    return collections.OrderedDict(result)
+    out = collections.OrderedDict(result)
+    # The fragmentation-aware native matrix stays addressable as a
+    # sub-dictionary (torch exposes it only through mem_get_info-free
+    # helpers); dotted torch-compatible keys above remain untouched.
+    allocator = stats.get("allocator")
+    if isinstance(allocator, dict):
+        out["allocator"] = collections.OrderedDict(allocator)
+    return out
 
 
 def reset_accumulated_memory_stats(device: Any = None) -> None:

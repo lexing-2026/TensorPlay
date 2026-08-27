@@ -868,7 +868,7 @@ _IMAGENET_CATEGORIES = [
     "toaster",
     "tobacco shop",
     "toilet seat",
-    "torch",
+    "tensorplay",
     "totem pole",
     "tow truck",
     "toyshop",

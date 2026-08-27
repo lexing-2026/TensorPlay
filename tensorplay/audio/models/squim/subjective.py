@@ -1,8 +1,7 @@
 from typing import Tuple
 
-import tensorplay as torch
-import torch.nn as nn
-import tensorplay.audio as torchaudio
+import tensorplay as tensorplay
+import tensorplay.nn as nn
 
 
 class AttPool(nn.Module):
@@ -19,20 +18,20 @@ class AttPool(nn.Module):
         self.linear1 = nn.Linear(input_dim, 1)
         self.linear2 = nn.Linear(input_dim, att_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: tensorplay.Tensor) -> tensorplay.Tensor:
         """Apply attention and pooling.
 
         Args:
-            x (torch.Tensor): Input Tensor with dimensions `(batch, time, feature_dim)`.
+            x (tensorplay.Tensor): Input Tensor with dimensions `(batch, time, feature_dim)`.
 
         Returns:
-            (torch.Tensor): Attention score with dimensions `(batch, att_dim)`.
+            (tensorplay.Tensor): Attention score with dimensions `(batch, att_dim)`.
         """
 
         att = self.linear1(x)  # (batch, time, 1)
         att = att.transpose(2, 1)  # (batch, 1, time)
         att = nn.functional.softmax(att, dim=2)
-        x = torch.matmul(att, x).squeeze(1)  # (batch, input_dim)
+        x = tensorplay.matmul(att, x).squeeze(1)  # (batch, input_dim)
         x = self.linear2(x)  # (batch, att_dim)
         return x
 
@@ -50,18 +49,18 @@ class Predictor(nn.Module):
         self.att_pool_layer = AttPool(input_dim, att_dim)
         self.att_dim = att_dim
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: tensorplay.Tensor) -> tensorplay.Tensor:
         """Predict subjective evaluation metric score.
 
         Args:
-            x (torch.Tensor): Input Tensor with dimensions `(batch, time, feature_dim)`.
+            x (tensorplay.Tensor): Input Tensor with dimensions `(batch, time, feature_dim)`.
 
         Returns:
-            (torch.Tensor): Subjective metric score. Tensor with dimensions `(batch,)`.
+            (tensorplay.Tensor): Subjective metric score. Tensor with dimensions `(batch,)`.
         """
         x = self.att_pool_layer(x)
         x = nn.functional.softmax(x, dim=1)
-        B = torch.linspace(0, 4, steps=self.att_dim, device=x.device)
+        B = tensorplay.linspace(0, 4, steps=self.att_dim, device=x.device)
         x = (x * B).sum(dim=1)
         return x
 
@@ -72,9 +71,9 @@ class SquimSubjective(nn.Module):
     :cite:`manocha2022speech` which predicts MOS scores given the input speech and a non-matching reference.
 
     Args:
-        ssl_model (torch.nn.Module): The self-supervised learning model for feature extraction.
-        projector (torch.nn.Module): Projection layer that projects SSL feature to a lower dimension.
-        predictor (torch.nn.Module): Predict the subjective scores.
+        ssl_model (tensorplay.nn.Module): The self-supervised learning model for feature extraction.
+        projector (tensorplay.nn.Module): Projection layer that projects SSL feature to a lower dimension.
+        predictor (tensorplay.nn.Module): Predict the subjective scores.
     """
 
     def __init__(self, ssl_model: nn.Module, projector: nn.Module, predictor: nn.Module):
@@ -83,38 +82,38 @@ class SquimSubjective(nn.Module):
         self.projector = projector
         self.predictor = predictor
 
-    def _align_shapes(self, waveform: torch.Tensor, reference: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _align_shapes(self, waveform: tensorplay.Tensor, reference: tensorplay.Tensor) -> Tuple[tensorplay.Tensor, tensorplay.Tensor]:
         """Cut or pad the reference Tensor to make it aligned with waveform Tensor.
 
         Args:
-            waveform (torch.Tensor): Input waveform for evaluation. Tensor with dimensions `(batch, time)`.
-            reference (torch.Tensor): Non-matching clean reference. Tensor with dimensions `(batch, time_ref)`.
+            waveform (tensorplay.Tensor): Input waveform for evaluation. Tensor with dimensions `(batch, time)`.
+            reference (tensorplay.Tensor): Non-matching clean reference. Tensor with dimensions `(batch, time_ref)`.
 
         Returns:
-            (torch.Tensor, torch.Tensor): The aligned waveform and reference Tensors
+            (tensorplay.Tensor, tensorplay.Tensor): The aligned waveform and reference Tensors
                 with same dimensions `(batch, time)`.
         """
         T_waveform = waveform.shape[-1]
         T_reference = reference.shape[-1]
         if T_reference < T_waveform:
             num_padding = T_waveform // T_reference + 1
-            reference = torch.cat([reference for _ in range(num_padding)], dim=1)
+            reference = tensorplay.cat([reference for _ in range(num_padding)], dim=1)
         return waveform, reference[:, :T_waveform]
 
-    def forward(self, waveform: torch.Tensor, reference: torch.Tensor):
+    def forward(self, waveform: tensorplay.Tensor, reference: tensorplay.Tensor):
         """Predict subjective evaluation metric score.
 
         Args:
-            waveform (torch.Tensor): Input waveform for evaluation. Tensor with dimensions `(batch, time)`.
-            reference (torch.Tensor): Non-matching clean reference. Tensor with dimensions `(batch, time_ref)`.
+            waveform (tensorplay.Tensor): Input waveform for evaluation. Tensor with dimensions `(batch, time)`.
+            reference (tensorplay.Tensor): Non-matching clean reference. Tensor with dimensions `(batch, time_ref)`.
 
         Returns:
-            (torch.Tensor): Subjective metric score. Tensor with dimensions `(batch,)`.
+            (tensorplay.Tensor): Subjective metric score. Tensor with dimensions `(batch,)`.
         """
         waveform, reference = self._align_shapes(waveform, reference)
         waveform = self.projector(self.ssl_model.extract_features(waveform)[0][-1])
         reference = self.projector(self.ssl_model.extract_features(reference)[0][-1])
-        concat = torch.cat((reference, waveform), dim=2)
+        concat = tensorplay.cat((reference, waveform), dim=2)
         score_diff = self.predictor(concat)  # Score difference compared to the reference
         return 5 - score_diff
 
@@ -125,7 +124,7 @@ def squim_subjective_model(
     proj_dim: int,
     att_dim: int,
 ) -> SquimSubjective:
-    """Build a custome :class:`torchaudio.prototype.models.SquimSubjective` model.
+    """Build a custome :class:`tensorplay.audio.prototype.models.SquimSubjective` model.
 
     Args:
         ssl_type (str): Type of self-supervised learning (SSL) models.
@@ -134,14 +133,14 @@ def squim_subjective_model(
         proj_dim (int): Output dimension of projection layer.
         att_dim (int): Dimension of attention scores.
     """
-    ssl_model = getattr(torchaudio.models, ssl_type)()
+    ssl_model = getattr(tensorplay.audio.models, ssl_type)()
     projector = nn.Linear(feat_dim, proj_dim)
     predictor = Predictor(proj_dim * 2, att_dim)
     return SquimSubjective(ssl_model, projector, predictor)
 
 
 def squim_subjective_base() -> SquimSubjective:
-    """Build :class:`torchaudio.prototype.models.SquimSubjective` model with default arguments."""
+    """Build :class:`tensorplay.audio.prototype.models.SquimSubjective` model with default arguments."""
     return squim_subjective_model(
         ssl_type="wav2vec2_base",
         feat_dim=768,

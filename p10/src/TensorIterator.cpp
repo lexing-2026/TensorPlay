@@ -1,6 +1,7 @@
 #include "TensorIterator.h"
 #include "TensorIteratorInternal.h"
 #include "Tensor.h"
+#include "ErrorReporting.h"
 #include "TypePromotion.h"
 #include "Utils.h"
 #include "irange.h"
@@ -39,15 +40,29 @@ inline void get_strides_impl(int64_t* strides, const std::vector<OperandInfo>& o
 }
 
 // Broadcasts a shape of size `a_size` against `b_size` (see torch
-// at::infer_size): every dim must be equal or one of them 1; result takes the
-// max.
+// at::infer_size): every dim must be equal or one of them 1; the result takes
+// the non-1 dim.  Taking the non-1 side (rather than the max) is what keeps a
+// 0-sized dimension at 0 when broadcast against a size-1 dim; a max() would
+// inflate it to 1 and make the iterator run over an empty tensor's storage.
 DimVector infer_size(const DimVector& a, const DimVector& b) {
   size_t ndim = std::max(a.size(), b.size());
   DimVector result(ndim, 1);
   for (size_t i = 0; i < ndim; ++i) {
-    int64_t dim = 1;
-    if (i < a.size()) dim = std::max(dim, a[a.size() - 1 - i]);
-    if (i < b.size()) dim = std::max(dim, b[b.size() - 1 - i]);
+    int64_t a_dim = (i < a.size()) ? a[a.size() - 1 - i] : 1;
+    int64_t b_dim = (i < b.size()) ? b[b.size() - 1 - i] : 1;
+    int64_t dim;
+    if (a_dim == 1) {
+      dim = b_dim;
+    } else if (b_dim == 1) {
+      dim = a_dim;
+    } else if (a_dim == b_dim) {
+      dim = a_dim;
+    } else {
+      TP_THROW(RuntimeError,
+               "The size of tensor a (", a_dim,
+               ") must match the size of tensor b (", b_dim,
+               ") at non-singleton dimension ", ndim - 1 - i);
+    }
     result[ndim - 1 - i] = dim;
   }
   return result;
@@ -195,6 +210,32 @@ ScalarType TensorIteratorBase::compute_common_dtype() {
 //
 // See their descriptions in TensorIterator.h for details.
 void TensorIteratorBase::compute_types(const TensorIteratorConfig& config) {
+  // Rich error context: renders every operand as
+  //   "operand <i> (input|output): shape=[..], dtype=.., device=.."
+  // so failures pinpoint exactly which argument is wrong and why.
+  auto describe_operand = [this](int64_t arg) {
+    const auto& op = operands_[arg];
+    std::ostringstream os;
+    os << "  operand " << arg << " (" << (op.is_output ? "output" : "input")
+       << "): ";
+    if (!op.tensor().defined()) {
+      // Not-yet-allocated outputs still carry their target metadata.
+      os << "shape=<to be allocated>, dtype="
+         << pretty_dtype_name(op.target_dtype) << ", device="
+         << (op.device.has_value() ? op.device->toString() : "<unknown>");
+    } else {
+      os << describe_tensor(op.tensor());
+    }
+    return os.str();
+  };
+  auto dump_operands = [this, &describe_operand]() {
+    std::string out;
+    for (const auto arg : irange(operands_.size())) {
+      out += "\n" + describe_operand(static_cast<int64_t>(arg));
+    }
+    return out;
+  };
+
   // Reviews operands (1/2)
   //   - validates that all input tensors are defined
   //   - computes common device
@@ -271,11 +312,29 @@ void TensorIteratorBase::compute_types(const TensorIteratorConfig& config) {
   }
 
   // Checks that either the computation type is computable or unneeded
-  TP_CHECK(
-      !(has_different_input_dtypes && !config.promote_inputs_to_common_dtype_ &&
-        (has_undefined_outputs || config.enforce_safe_casting_to_output_ ||
-         config.cast_common_dtype_to_outputs_)),
-      "no common dtype computable");
+  if (has_different_input_dtypes && !config.promote_inputs_to_common_dtype_ &&
+      (has_undefined_outputs || config.enforce_safe_casting_to_output_ ||
+       config.cast_common_dtype_to_outputs_)) {
+    std::ostringstream input_dtypes;
+    input_dtypes << "[";
+    bool first_dtype = true;
+    for (const auto& op : operands_) {
+      if (op.is_output || !op.is_type_defined()) {
+        continue;
+      }
+      if (!first_dtype) {
+        input_dtypes << ", ";
+      }
+      input_dtypes << pretty_dtype_name(op.target_dtype);
+      first_dtype = false;
+    }
+    input_dtypes << "]";
+    TP_THROW(RuntimeError,
+        "no common dtype computable: found inputs with different dtypes ",
+        input_dtypes.str(),
+        " but type promotion is disabled for this operation.",
+        dump_operands());
+  }
 
   // Checks that all inputs and defined outputs are the same dtype, if requested
   if (config.check_all_same_dtype_ &&
@@ -286,10 +345,16 @@ void TensorIteratorBase::compute_types(const TensorIteratorConfig& config) {
       if (!op.tensor().defined()) {
         continue;
       }
-      TP_CHECK(
-          op.target_dtype == common_dtype_,
-          "Found dtype ", static_cast<int>(op.target_dtype), " but expected ",
-          static_cast<int>(common_dtype_));
+      if (op.target_dtype != common_dtype_) {
+        TP_THROW(RuntimeError,
+            "Expected all tensors to have the same dtype, but found ",
+            pretty_dtype_name(op.target_dtype),
+            " on an operand while the computed common dtype is ",
+            pretty_dtype_name(common_dtype_), ".",
+            dump_operands(),
+            "\nHINT: create the arguments with the same dtype, or cast the "
+            "mismatching tensor(s) with .to(dtype).");
+      }
     }
   }
 
@@ -341,17 +406,23 @@ void TensorIteratorBase::compute_types(const TensorIteratorConfig& config) {
 
     // Checks all tensors are on the same device, if requested
     if (config.check_all_same_device_) {
-      TP_CHECK(
-          op.device.value_or(Device(DeviceType::CPU)) == common_device,
-          "Expected all tensors to be on the same device, but found at least "
-          "two devices");
+      Device op_device = op.device.value_or(Device(DeviceType::CPU));
+      if (!(op_device == common_device)) {
+        TP_THROW(DeviceMismatchError,
+            "Expected all tensors to be on the same device, but found ",
+            op_device.toString(), " on an operand while the common device is ",
+            common_device.toString(), ".", dump_operands());
+      }
     }
 
     // Checks safe casting, if requested
     if (config.enforce_safe_casting_to_output_ && op.is_output && op.current_dtype != common_dtype_) {
-      TP_CHECK(
-          can_cast(common_dtype_, op.current_dtype),
-          "result type can't be cast to the desired output type");
+      if (!can_cast(common_dtype_, op.current_dtype)) {
+        TP_THROW(RuntimeError,
+            "result type ", pretty_dtype_name(common_dtype_),
+            " can't be cast to the desired output type ",
+            pretty_dtype_name(op.current_dtype), ".", dump_operands());
+      }
     }
 
     // Creates temporaries for CPU operations, if needed and requested
@@ -389,7 +460,11 @@ DimVector TensorIteratorBase::invert_perm(const DimVector& input) const {
   // Invert the permutation caused by reorder_dimensions. This is not valid
   // after coalesce_dimensions is called.
   TP_CHECK(!has_coalesced_dimensions_, "cannot invert perm after coalescing");
-  TP_CHECK(input.size() == perm_.size(), "perm size mismatch");
+  if (input.size() != perm_.size()) {
+    TP_THROW(RuntimeError,
+        "invert_perm(): permutation size mismatch: got an input of size ",
+        input.size(), ", but the iterator holds ", perm_.size(), " dimensions");
+  }
   auto res = DimVector(input.size()); //no initialization needed, every value in res should be written to.
   for (const auto dim : irange(ndim())) {
     res[perm_[dim]] = input[dim];
@@ -399,7 +474,12 @@ DimVector TensorIteratorBase::invert_perm(const DimVector& input) const {
 
 DimVector TensorIteratorBase::apply_perm_and_mul(const DimVector& input, int mul) const {
   TP_CHECK(!has_coalesced_dimensions_, "cannot apply perm after coalescing");
-  TP_CHECK(input.size() == perm_.size(), "perm size mismatch");
+  if (input.size() != perm_.size()) {
+    TP_THROW(RuntimeError,
+        "apply_perm_and_mul(): permutation size mismatch: got an input of "
+        "size ", input.size(), ", but the iterator holds ", perm_.size(),
+        " dimensions");
+  }
   auto res = DimVector(input.size());
   for (const auto i : irange(perm_.size())) {
     res[i] = input[perm_[i]] * mul;

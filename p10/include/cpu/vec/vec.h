@@ -4,9 +4,8 @@
 // compiled for. Mirrors ATen/cpu/vec/vec.h.
 
 #if defined(CPU_CAPABILITY_AVX512)
-// AVX512 layer not ported yet; kernels compiled with CPU_CAPABILITY_AVX512
-// fall back to the generic (vec_base) layer.
-#include "cpu/vec/vec_base.h"
+// Full-width 512-bit layer (float/double; int32/int64 pending).
+#include "cpu/vec/vec512/vec512.h"
 #else
 #include "cpu/vec/vec128/vec128.h"
 #include "cpu/vec/vec256/vec256.h"

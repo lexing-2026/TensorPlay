@@ -19,12 +19,36 @@ namespace {
 
 constexpr size_t kStreamsPerPool = 32;
 constexpr unsigned int kStreamFlags = cudaStreamNonBlocking;
+// Upper bound for the flat per-thread current-stream table; devices beyond it
+// (exotic multi-GPU hosts) fall back to the map below.
+constexpr size_t kMaxFlatDevices = 64;
+
+// Per-thread cached current device (see currentDevice) - cold until the
+// first real query on this thread.
+thread_local int t_cached_device = -1;
+
+// Device count never changes within a process; caching it turns every
+// getCurrentCUDAStream()/guard construction into pure arithmetic instead of a
+// cudaGetDeviceCount round trip.
+std::atomic<int>& cachedDeviceCount() {
+    // Deliberately leaked: queried during interpreter teardown.
+    static auto* count = new std::atomic<int>(-1);
+    return *count;
+}
+
+int deviceCountCached() {
+    int count = cachedDeviceCount().load(std::memory_order_relaxed);
+    if (count < 0) {
+        checkCuda(cudaGetDeviceCount(&count), "cudaGetDeviceCount");
+        cachedDeviceCount().store(count, std::memory_order_relaxed);
+    }
+    return count;
+}
 
 int normalizeDevice(int device_index) {
-    int count = 0;
-    checkCuda(cudaGetDeviceCount(&count), "cudaGetDeviceCount");
+    const int count = deviceCountCached();
     if (device_index < 0) {
-        checkCuda(cudaGetDevice(&device_index), "cudaGetDevice");
+        device_index = currentDevice();
     }
     if (device_index < 0 || device_index >= count) {
         TP_THROW(ValueError,
@@ -90,7 +114,27 @@ void initializePool(StreamPool& pool, int device_index, bool high_priority) {
     initialized = true;
 }
 
-thread_local std::unordered_map<int, cudaStream_t> current_streams;
+// Per-thread current stream: flat array indexed by device for O(1) access on
+// the kernel-launch hot path (the previous unordered_map paid a hash lookup
+// per launch); oversized device indices spill into the map.
+thread_local std::array<cudaStream_t, kMaxFlatDevices> current_streams_flat{};
+thread_local std::unordered_map<int, cudaStream_t> current_streams_overflow;
+
+inline void setCurrentStreamRaw(int device_index, cudaStream_t stream) {
+    if (static_cast<size_t>(device_index) < kMaxFlatDevices) {
+        current_streams_flat[static_cast<size_t>(device_index)] = stream;
+    } else {
+        current_streams_overflow[device_index] = stream;
+    }
+}
+
+inline cudaStream_t getCurrentStreamRaw(int device_index) {
+    if (static_cast<size_t>(device_index) < kMaxFlatDevices) {
+        return current_streams_flat[static_cast<size_t>(device_index)];
+    }
+    auto it = current_streams_overflow.find(device_index);
+    return it == current_streams_overflow.end() ? nullptr : it->second;
+}
 
 } // namespace
 
@@ -104,22 +148,35 @@ void checkCuda(cudaError_t error, const char* operation) {
 }
 
 int currentDevice() {
-    int device = 0;
-    checkCuda(cudaGetDevice(&device), "cudaGetDevice");
+    // Thread-local cache: cudaGetDevice is per-thread state, so every set
+    // point in this translation unit refreshes the cache and the hot read
+    // path (kernel launches, stream queries, guards) costs one TLS load.
+    // All cudaSetDevice calls in the codebase are funnelled through
+    // setDeviceCached/CUDAGuard here; external .cu kernels only ever *read*
+    // the device, which cannot invalidate the cache.
+    int device = t_cached_device;
+    if (device < 0) {
+        checkCuda(cudaGetDevice(&device), "cudaGetDevice");
+        t_cached_device = device;
+    }
     return device;
 }
 
+void setDeviceCached(int device_index) {
+    if (currentDevice() == device_index) return;
+    checkCuda(cudaSetDevice(device_index), "cudaSetDevice");
+    t_cached_device = device_index;
+}
+
 int deviceCount() {
-    int count = 0;
-    checkCuda(cudaGetDeviceCount(&count), "cudaGetDeviceCount");
-    return count;
+    return deviceCountCached();
 }
 
 CUDAGuard::CUDAGuard(int device_index) {
-    checkCuda(cudaGetDevice(&original_device_), "cudaGetDevice");
+    original_device_ = currentDevice();
     device_index = normalizeDevice(device_index);
     if (device_index != original_device_) {
-        checkCuda(cudaSetDevice(device_index), "cudaSetDevice");
+        setDeviceCached(device_index);
         changed_ = true;
     }
 }
@@ -132,18 +189,23 @@ CUDAGuard::CUDAGuard(const Device& device)
 }
 
 CUDAGuard::~CUDAGuard() noexcept {
-    if (changed_) (void)cudaSetDevice(original_device_);
+    if (changed_) {
+        // Restore through the raw call: destructors must not throw, and the
+        // cache tracks exactly this value either way.
+        (void)cudaSetDevice(original_device_);
+        t_cached_device = original_device_;
+    }
 }
 
 int CUDAStream::priority() const {
-    CUDAGuard guard(device_index_);
+    // Stream handles carry their own context; querying the priority needs no
+    // device switch (matches c10::cuda::CUDAStream).
     int value = 0;
     checkCuda(cudaStreamGetPriority(stream_, &value), "cudaStreamGetPriority");
     return value;
 }
 
 bool CUDAStream::query() const {
-    CUDAGuard guard(device_index_);
     cudaError_t error = cudaStreamQuery(stream_);
     if (error == cudaSuccess) return true;
     if (error == cudaErrorNotReady) {
@@ -155,7 +217,6 @@ bool CUDAStream::query() const {
 }
 
 void CUDAStream::synchronize() const {
-    CUDAGuard guard(device_index_);
     checkCuda(cudaStreamSynchronize(stream_), "cudaStreamSynchronize");
 }
 
@@ -176,28 +237,29 @@ CUDAStream getDefaultCUDAStream(int device_index) {
 
 CUDAStream getCurrentCUDAStream(int device_index) {
     device_index = normalizeDevice(device_index);
-    auto it = current_streams.find(device_index);
-    return CUDAStream(device_index, it == current_streams.end() ? nullptr : it->second);
+    return CUDAStream(device_index, getCurrentStreamRaw(device_index));
 }
 
 void setCurrentCUDAStream(const CUDAStream& stream) {
-    (void)normalizeDevice(stream.device_index_);
-    current_streams[stream.device_index_] = stream.stream_;
+    setCurrentStreamRaw(stream.device_index_, stream.stream_);
 }
 
 CUDAStreamGuard::CUDAStreamGuard(const CUDAStream& stream) {
     original_device_ = currentDevice();
     stream_device_ = stream.device_index();
     original_stream_ = getCurrentCUDAStream(stream_device_).stream();
-    if (original_device_ != stream_device_) checkCuda(cudaSetDevice(stream_device_), "cudaSetDevice");
+    if (original_device_ != stream_device_) setDeviceCached(stream_device_);
     setCurrentCUDAStream(stream);
     active_ = true;
 }
 
 CUDAStreamGuard::~CUDAStreamGuard() noexcept {
     if (!active_) return;
-    current_streams[stream_device_] = original_stream_;
-    if (original_device_ != stream_device_) (void)cudaSetDevice(original_device_);
+    setCurrentStreamRaw(stream_device_, original_stream_);
+    if (original_device_ != stream_device_) {
+        (void)cudaSetDevice(original_device_);
+        t_cached_device = original_device_;
+    }
 }
 
 OptionalCUDAGuard::OptionalCUDAGuard(const Device& device) {

@@ -21,6 +21,8 @@ from .grad_mode import (
 )
 
 from .function import Function
+from .graph import saved_tensor_hooks as saved_tensors_hooks
+from . import forward_ad
 from .._C._autograd import (
     backward,
     grad as _grad,
@@ -132,3 +134,7 @@ from .gradcheck import (  # noqa: E402
     gradgradcheck,
     GradcheckError,
 )
+
+# torch.autograd.profiler parity: the native profiler surface is shared.
+from .. import profiler as profiler  # noqa: E402
+from ..profiler import emit_nvtx as emit_nvtx  # noqa: E402

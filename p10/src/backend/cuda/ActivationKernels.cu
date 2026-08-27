@@ -3,8 +3,20 @@
 #include "CUDARuntime.h"
 #include "CUDAContext.h"
 #include "Exception.h"
+#include "CUDAComplex.cuh"
 #include "CUDNNUtils.h"
 #include <cudnn.h>
+#include <thrust/complex.h>
+#include <type_traits>
+
+#define CUDA_CHECK(condition) \
+  do { \
+    cudaError_t error = condition; \
+    if (error != cudaSuccess) { \
+       TP_THROW(RuntimeError, std::string("CUDA Error: ") + cudaGetErrorString(error)); \
+    } \
+  } while (0)
+
 
 namespace tensorplay {
 namespace cuda {
@@ -217,7 +229,55 @@ __global__ void tanh_kernel_n_fp32(int64_t n, const T* input, T* output) {
     }
 }
 
+namespace {
+
+struct ActCxSigmoid {
+    template <typename T>
+    __device__ thrust::complex<T> operator()(thrust::complex<T> z) const {
+        return static_cast<T>(1) / (static_cast<T>(1) + thrust::exp(-z));
+    }
+};
+
+struct ActCxTanh {
+    template <typename T>
+    __device__ thrust::complex<T> operator()(thrust::complex<T> z) const {
+        return thrust::tanh(z);
+    }
+};
+
+}  // namespace
+
 static Tensor native_activation_dispatch(const Tensor& self, bool is_sigmoid) {
+    if (isComplexType(self.dtype())) {
+        if (self.dtype() != DType::ComplexFloat &&
+            self.dtype() != DType::ComplexDouble) {
+            TP_THROW(NotImplementedError,
+                     "activation: half complexes are not supported yet");
+        }
+        Tensor self_contig = self.is_contiguous() ? self : self.contiguous();
+        Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()),
+                                      self.dtype(), self.device());
+        int64_t n = self.numel();
+        if (n == 0) return result;
+        const auto stream = getCurrentCUDAStream().stream();
+        if (self.dtype() == DType::ComplexFloat) {
+            if (is_sigmoid)
+                cplx::launch_unary<float>(n, self_contig.data_ptr(), result.data_ptr(),
+                                          ActCxSigmoid{}, stream);
+            else
+                cplx::launch_unary<float>(n, self_contig.data_ptr(), result.data_ptr(),
+                                          ActCxTanh{}, stream);
+        } else {
+            if (is_sigmoid)
+                cplx::launch_unary<double>(n, self_contig.data_ptr(), result.data_ptr(),
+                                           ActCxSigmoid{}, stream);
+            else
+                cplx::launch_unary<double>(n, self_contig.data_ptr(), result.data_ptr(),
+                                           ActCxTanh{}, stream);
+        }
+        checkCuda(cudaGetLastError(), "native activation complex kernel");
+        return result;
+    }
     Tensor self_contig = self.is_contiguous() ? self : self.contiguous();
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()),
                                   self.dtype(), self.device());
@@ -411,6 +471,151 @@ Tensor threshold_backward_kernel(const Tensor& grad_output, const Tensor& output
 
 #endif
 
+// Fused gated activations stay in the activation translation unit, matching
+// ATen/native/Activation.cpp and its CUDA ActivationSilu/ActivationGlu
+// kernels.  The packed variant consumes [gate | up] on the last dimension.
+namespace {
+
+inline bool fused_activation_dtype(DType dtype) {
+    return dtype == DType::Float32 || dtype == DType::Float64 ||
+           dtype == DType::Float16 || dtype == DType::BFloat16;
+}
+
+inline void check_silu_mul_inputs(const Tensor& gate, const Tensor& up,
+                                  const char* op) {
+    if (gate.device() != up.device()) {
+        TP_THROW(DeviceMismatchError, op,
+                 ": gate and up must be on the same device");
+    }
+    if (gate.shape() != up.shape()) {
+        TP_THROW(RuntimeError, op, ": gate and up must have the same shape");
+    }
+    if (gate.dtype() != up.dtype()) {
+        TP_THROW(RuntimeError, op, ": gate and up must have the same dtype");
+    }
+    if (!fused_activation_dtype(gate.dtype())) {
+        TP_THROW(NotImplementedError, op,
+                 ": only floating point dtypes are supported");
+    }
+}
+
+template <typename T, typename Acc>
+__global__ void fused_silu_mul_kernel(const T* gate, const T* up, T* output,
+                                      int64_t n) {
+    const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x +
+                      threadIdx.x;
+    if (i >= n) return;
+    const Acc x = static_cast<Acc>(gate[i]);
+    const Acc y = static_cast<Acc>(up[i]);
+    const Acc sigmoid = Acc(1) / (Acc(1) + exp(-x));
+    output[i] = static_cast<T>(x * sigmoid * y);
+}
+
+template <typename T, typename Acc>
+__global__ void fused_silu_and_mul_kernel(const T* input, T* output,
+                                          int64_t n, int64_t half_width) {
+    const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x +
+                      threadIdx.x;
+    if (i >= n) return;
+    const int64_t row = i / half_width;
+    const int64_t col = i - row * half_width;
+    const int64_t base = row * (2 * half_width);
+    const Acc gate = static_cast<Acc>(input[base + col]);
+    const Acc up = static_cast<Acc>(input[base + half_width + col]);
+    const Acc sigmoid = Acc(1) / (Acc(1) + exp(-gate));
+    output[i] = static_cast<T>(gate * sigmoid * up);
+}
+
+template <typename T>
+Tensor fused_silu_mul_typed(const Tensor& gate, const Tensor& up) {
+    Tensor gate_c = gate.is_contiguous() ? gate : gate.contiguous();
+    Tensor up_c = up.is_contiguous() ? up : up.contiguous();
+    Tensor output = Tensor::empty(
+        static_cast<std::vector<int64_t>>(gate_c.shape()), gate_c.dtype(),
+        gate_c.device());
+    if (gate_c.numel() == 0) return output;
+    using Acc = std::conditional_t<std::is_same_v<T, double>, double, float>;
+    const dim3 block(256);
+    const dim3 grid(static_cast<unsigned>((gate_c.numel() + 255) / 256));
+    fused_silu_mul_kernel<T, Acc><<<grid, block, 0,
+                                   getCurrentCUDAStream().stream()>>>(
+        gate_c.data_ptr<T>(), up_c.data_ptr<T>(), output.data_ptr<T>(),
+        gate_c.numel());
+    checkCuda(cudaGetLastError(), "silu_mul CUDA kernel launch");
+    return output;
+}
+
+template <typename T>
+Tensor fused_silu_and_mul_typed(const Tensor& input, int64_t half_width) {
+    Tensor input_c = input.is_contiguous() ? input : input.contiguous();
+    std::vector<int64_t> output_shape =
+        static_cast<std::vector<int64_t>>(input_c.shape());
+    output_shape.back() = half_width;
+    Tensor output = Tensor::empty(output_shape, input_c.dtype(),
+                                  input_c.device());
+    if (output.numel() == 0) return output;
+    using Acc = std::conditional_t<std::is_same_v<T, double>, double, float>;
+    const dim3 block(256);
+    const dim3 grid(static_cast<unsigned>((output.numel() + 255) / 256));
+    fused_silu_and_mul_kernel<T, Acc><<<grid, block, 0,
+                                       getCurrentCUDAStream().stream()>>>(
+        input_c.data_ptr<T>(), output.data_ptr<T>(), output.numel(),
+        half_width);
+    checkCuda(cudaGetLastError(), "silu_and_mul CUDA kernel launch");
+    return output;
+}
+
+} // namespace
+
+Tensor silu_mul_cuda(const Tensor& gate, const Tensor& up) {
+    check_silu_mul_inputs(gate, up, "silu_mul");
+    switch (gate.dtype()) {
+        case DType::Float32:
+            return fused_silu_mul_typed<float>(gate, up);
+        case DType::Float64:
+            return fused_silu_mul_typed<double>(gate, up);
+        case DType::Float16:
+            return fused_silu_mul_typed<Half>(gate, up);
+        case DType::BFloat16:
+            return fused_silu_mul_typed<BFloat16>(gate, up);
+        default:
+            TP_THROW(NotImplementedError, "silu_mul: unsupported dtype");
+    }
+}
+
+Tensor fused_swiglu_cuda(const Tensor& gate, const Tensor& up) {
+    return silu_mul_cuda(gate, up);
+}
+
+Tensor silu_and_mul_cuda(const Tensor& input) {
+    if (input.dim() < 1) {
+        TP_THROW(RuntimeError,
+                 "silu_and_mul: input must have at least one dimension");
+    }
+    const int64_t width = input.size(-1);
+    if ((width & 1) != 0) {
+        TP_THROW(RuntimeError,
+                 "silu_and_mul: the packed last dimension must be even");
+    }
+    if (!fused_activation_dtype(input.dtype())) {
+        TP_THROW(NotImplementedError,
+                 "silu_and_mul: only floating point dtypes are supported");
+    }
+    const int64_t half_width = width / 2;
+    switch (input.dtype()) {
+        case DType::Float32:
+            return fused_silu_and_mul_typed<float>(input, half_width);
+        case DType::Float64:
+            return fused_silu_and_mul_typed<double>(input, half_width);
+        case DType::Float16:
+            return fused_silu_and_mul_typed<Half>(input, half_width);
+        case DType::BFloat16:
+            return fused_silu_and_mul_typed<BFloat16>(input, half_width);
+        default:
+            TP_THROW(NotImplementedError, "silu_and_mul: unsupported dtype");
+    }
+}
+
 TENSORPLAY_LIBRARY_IMPL(CUDA, ActivationKernels) {
 #ifdef USE_CUDNN
     m.impl("relu", relu_kernel_cudnn);
@@ -423,6 +628,9 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, ActivationKernels) {
     m.impl("log_softmax", log_softmax_kernel_cudnn);
     m.impl("threshold_backward", threshold_backward_kernel);
 #endif
+    m.impl("silu_mul", silu_mul_cuda);
+    m.impl("fused_swiglu", fused_swiglu_cuda);
+    m.impl("silu_and_mul", silu_and_mul_cuda);
 }
 
 } // namespace cuda

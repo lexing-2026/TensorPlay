@@ -6,7 +6,7 @@ from collections import namedtuple
 from functools import partial
 from typing import Any, Callable, Optional
 
-import tensorplay as torch
+import tensorplay as tensorplay
 import tensorplay.nn as nn
 import tensorplay.nn.functional as F
 from tensorplay import Tensor
@@ -49,7 +49,7 @@ class GoogLeNet(nn.Module):
         if init_weights is None:
             warnings.warn(
                 "The default weight initialization of GoogleNet will be changed in future releases of "
-                "torchvision. If you wish to keep the old behavior (which leads to long initialization times"
+                "tensorplay.vision. If you wish to keep the old behavior (which leads to long initialization times"
                 " due to scipy/scipy#11299), please set init_weights=True.",
                 FutureWarning,
             )
@@ -97,17 +97,17 @@ class GoogLeNet(nn.Module):
         if init_weights:
             for m in self.modules():
                 if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
-                    torch.nn.init.trunc_normal_(m.weight, mean=0.0, std=0.01, a=-2, b=2)
+                    tensorplay.nn.init.trunc_normal_(m.weight, mean=0.0, std=0.01, a=-2, b=2)
                 elif isinstance(m, nn.BatchNorm2d):
                     nn.init.constant_(m.weight, 1)
                     nn.init.constant_(m.bias, 0)
 
     def _transform_input(self, x: Tensor) -> Tensor:
         if self.transform_input:
-            x_ch0 = torch.unsqueeze(x[:, 0], 1) * (0.229 / 0.5) + (0.485 - 0.5) / 0.5
-            x_ch1 = torch.unsqueeze(x[:, 1], 1) * (0.224 / 0.5) + (0.456 - 0.5) / 0.5
-            x_ch2 = torch.unsqueeze(x[:, 2], 1) * (0.225 / 0.5) + (0.406 - 0.5) / 0.5
-            x = torch.cat((x_ch0, x_ch1, x_ch2), 1)
+            x_ch0 = tensorplay.unsqueeze(x[:, 0], 1) * (0.229 / 0.5) + (0.485 - 0.5) / 0.5
+            x_ch1 = tensorplay.unsqueeze(x[:, 1], 1) * (0.224 / 0.5) + (0.456 - 0.5) / 0.5
+            x_ch2 = tensorplay.unsqueeze(x[:, 2], 1) * (0.225 / 0.5) + (0.406 - 0.5) / 0.5
+            x = tensorplay.cat((x_ch0, x_ch1, x_ch2), 1)
         return x
 
     def _forward(self, x: Tensor) -> tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
@@ -158,14 +158,14 @@ class GoogLeNet(nn.Module):
 
         x = self.avgpool(x)
         # N x 1024 x 1 x 1
-        x = torch.flatten(x, 1)
+        x = tensorplay.flatten(x, 1)
         # N x 1024
         x = self.dropout(x)
         x = self.fc(x)
         # N x 1000 (num_classes)
         return x, aux2, aux1
 
-    @torch.jit.unused
+    @tensorplay.jit.unused
     def eager_outputs(self, x: Tensor, aux2: Tensor, aux1: Optional[Tensor]) -> GoogLeNetOutputs:
         if self.training and self.aux_logits:
             return _GoogLeNetOutputs(x, aux2, aux1)
@@ -176,7 +176,7 @@ class GoogLeNet(nn.Module):
         x = self._transform_input(x)
         x, aux2, aux1 = self._forward(x)
         aux_defined = self.training and self.aux_logits
-        if torch.jit.is_scripting():
+        if tensorplay.jit.is_scripting():
             if not aux_defined:
                 warnings.warn("Scripted GoogleNet always returns GoogleNetOutputs Tuple")
             return GoogLeNetOutputs(x, aux2, aux1)
@@ -228,7 +228,7 @@ class Inception(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         outputs = self._forward(x)
-        return torch.cat(outputs, 1)
+        return tensorplay.cat(outputs, 1)
 
 
 class InceptionAux(nn.Module):
@@ -254,7 +254,7 @@ class InceptionAux(nn.Module):
         # aux1: N x 512 x 4 x 4, aux2: N x 528 x 4 x 4
         x = self.conv(x)
         # N x 128 x 4 x 4
-        x = torch.flatten(x, 1)
+        x = tensorplay.flatten(x, 1)
         # N x 2048
         x = F.relu(self.fc1(x), inplace=True)
         # N x 1024
@@ -286,7 +286,7 @@ class GoogLeNet_Weights(WeightsEnum):
             "num_params": 6624904,
             "min_size": (15, 15),
             "categories": _IMAGENET_CATEGORIES,
-            "recipe": "https://github.com/pytorch/vision/tree/main/references/classification#googlenet",
+            "recipe": "https://github.com/tensorplay/vision/tree/main/references/classification#googlenet",
             "_metrics": {
                 "ImageNet-1K": {
                     "acc@1": 69.778,
@@ -308,18 +308,18 @@ def googlenet(*, weights: Optional[GoogLeNet_Weights] = None, progress: bool = T
     `Going Deeper with Convolutions <http://arxiv.org/abs/1409.4842>`_.
 
     Args:
-        weights (:class:`~torchvision.models.GoogLeNet_Weights`, optional): The
+        weights (:class:`~tensorplay.vision.models.GoogLeNet_Weights`, optional): The
             pretrained weights for the model. See
-            :class:`~torchvision.models.GoogLeNet_Weights` below for
+            :class:`~tensorplay.vision.models.GoogLeNet_Weights` below for
             more details, and possible values. By default, no pre-trained
             weights are used.
         progress (bool, optional): If True, displays a progress bar of the
             download to stderr. Default is True.
-        **kwargs: parameters passed to the ``torchvision.models.GoogLeNet``
+        **kwargs: parameters passed to the ``tensorplay.vision.models.GoogLeNet``
             base class. Please refer to the `source code
-            <https://github.com/pytorch/vision/blob/main/torchvision/models/googlenet.py>`_
+            <https://github.com/tensorplay/vision/blob/main/tensorplay.vision/models/googlenet.py>`_
             for more details about this class.
-    .. autoclass:: torchvision.models.GoogLeNet_Weights
+    .. autoclass:: tensorplay.vision.models.GoogLeNet_Weights
         :members:
     """
     weights = GoogLeNet_Weights.verify(weights)
