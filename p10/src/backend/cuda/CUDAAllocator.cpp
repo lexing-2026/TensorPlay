@@ -3,6 +3,7 @@
 #include "CUDARuntime.h"
 #include "Device.h"
 #include "Exception.h"
+#include "Profiler.h"
 
 #include <cuda_runtime.h>
 
@@ -302,6 +303,15 @@ public:
                 streams.assign(block->streams.begin(), block->streams.end());
                 allocation_stream = block->allocation_stream;
                 block->streams.clear();
+                // Allocator-level memory capture: exactly-once per block
+                // (only this erase site can free a live block).  Runs under
+                // mutex_ but the recorder takes its own lock afterwards and
+                // never reaches back into the allocator.
+                prof::mem_record_free(block->ptr,
+                                      static_cast<int64_t>(block->requested_size),
+                                      /*cuda=*/true,
+                                      static_cast<int32_t>(block->device),
+                                      reinterpret_cast<int64_t>(allocation_stream));
             }
 
             // The allocation stream is ordered with all work that used the
@@ -1237,6 +1247,12 @@ public:
             return DataPtr(nullptr, nullptr, Device(DeviceType::CUDA, device));
         }
         auto block = cuda::AllocatorState::instance().allocate(nbytes, device);
+        // Allocator-level memory capture (profile_memory sessions).  The
+        // allocation stream groups the event with the op that produced it.
+        prof::mem_record_alloc(
+            block->ptr, static_cast<int64_t>(nbytes), /*cuda=*/true,
+            static_cast<int32_t>(device),
+            reinterpret_cast<int64_t>(block->allocation_stream));
         return DataPtr(
             block->ptr,
             block.get(),

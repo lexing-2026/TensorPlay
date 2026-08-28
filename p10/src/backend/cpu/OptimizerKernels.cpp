@@ -67,6 +67,52 @@ bool have_avx512f() {
 }
 #endif
 
+// Torch's CPU foreach kernels execute reduced floating point pointwise ops in
+// float and write the result back to the tensor dtype after every op.  The
+// native optimizer loops below are intentionally scalar for Half/BFloat16,
+// so keep that observable cast point in one helper.  For float/double this is
+// a no-op and leaves the existing vector fast paths unchanged.
+template <typename scalar_t, typename math_t>
+inline math_t optimizer_round(math_t value) {
+    if constexpr (std::is_same_v<scalar_t, math_t>) {
+        return value;
+    } else {
+        return static_cast<math_t>(static_cast<scalar_t>(value));
+    }
+}
+
+template <typename math_t>
+inline math_t optimizer_sqrt(math_t value) {
+    return static_cast<math_t>(std::sqrt(value));
+}
+
+template <typename scalar_t, typename math_t>
+inline math_t optimizer_lerp(math_t self, math_t end, math_t weight) {
+    const math_t result = std::abs(weight) < math_t(0.5)
+        ? self + weight * (end - self)
+        : end - (end - self) * (math_t(1) - weight);
+    return optimizer_round<scalar_t, math_t>(result);
+}
+
+template <typename scalar_t, typename math_t>
+inline math_t optimizer_addcmul(
+        math_t input, math_t tensor1, math_t tensor2, math_t value) {
+    return optimizer_round<scalar_t, math_t>(
+        input + value * tensor1 * tensor2);
+}
+
+template <typename scalar_t, typename math_t>
+inline math_t optimizer_addcdiv(
+        math_t input, math_t tensor1, math_t tensor2, math_t value) {
+    return optimizer_round<scalar_t, math_t>(
+        input + value * tensor1 / tensor2);
+}
+
+template <typename scalar_t, typename math_t>
+inline math_t optimizer_add(math_t input, math_t value, math_t alpha) {
+    return optimizer_round<scalar_t, math_t>(input + alpha * value);
+}
+
 // Portable scalar fallbacks; also used for vector-loop tails.
 template <typename T>
 inline void adam_range_scalar(const T* grad, T* param, T* m, T* v, T* maxv,
@@ -178,16 +224,20 @@ inline void fused_adagrad_range_scalar(T* grad, T* param, T* state_sum,
     for (int64_t i = begin; i < end; ++i) {
         M g = static_cast<M>(grad[i]);
         if (has_scale) {
-            g = g / sc[3];
+            g = optimizer_round<T, M>(g / sc[3]);
             grad[i] = static_cast<T>(g);
         }
-        if (maximize) g = -g;
+        if (maximize) g = optimizer_round<T, M>(-g);
         M p = static_cast<M>(param[i]);
-        if (wd) g += sc[2] * p;
-        const M sum = static_cast<M>(state_sum[i]) + g * g;
+        if (wd) g = optimizer_round<T, M>(g + sc[2] * p);
+        const M sum = optimizer_round<T, M>(
+            static_cast<M>(state_sum[i]) + g * g);
         state_sum[i] = static_cast<T>(sum);
-        param[i] = static_cast<T>(
-            p - sc[0] * g / (std::sqrt(sum) + sc[1]));
+        M denom = optimizer_round<T, M>(optimizer_sqrt(sum));
+        denom = optimizer_round<T, M>(denom + sc[1]);
+        const M numerator = optimizer_round<T, M>(-sc[0] * g);
+        param[i] = static_cast<T>(optimizer_round<T, M>(
+            p + numerator / denom));
     }
 }
 
@@ -198,23 +248,31 @@ inline void fused_nadam_range_scalar(
         const math_t sc[10], int64_t begin, int64_t end) {
     for (int64_t i = begin; i < end; ++i) {
         math_t g = static_cast<math_t>(grad[i]);
-        if (maximize) g = -g;
+        if (maximize) g = optimizer_round<scalar_t, math_t>(-g);
         math_t p = static_cast<math_t>(param[i]);
         if (wd) {
-            if (decoupled_wd) p *= math_t(1) - sc[0] * sc[4];
-            else g += sc[4] * p;
+            if (decoupled_wd) {
+                p = optimizer_round<scalar_t, math_t>(
+                    p * (math_t(1) - sc[0] * sc[4]));
+            } else {
+                g = optimizer_round<scalar_t, math_t>(g + sc[4] * p);
+            }
         }
 
         const math_t old_m = static_cast<math_t>(exp_avg[i]);
-        const math_t m = old_m + sc[5] * (g - old_m);
+        const math_t m = optimizer_lerp<scalar_t, math_t>(
+            old_m, g, sc[5]);
         exp_avg[i] = static_cast<scalar_t>(m);
-        const math_t v = sc[2] * static_cast<math_t>(exp_avg_sq[i]) +
-            sc[6] * g * g;
+        math_t v = optimizer_round<scalar_t, math_t>(
+            sc[2] * static_cast<math_t>(exp_avg_sq[i]));
+        v = optimizer_addcmul<scalar_t, math_t>(v, g, g, sc[6]);
         exp_avg_sq[i] = static_cast<scalar_t>(v);
-        const math_t denom = static_cast<math_t>(std::sqrt(
-            static_cast<double>(v))) / sc[9] + sc[3];
-        p += sc[7] * g / denom;
-        p += sc[8] * m / denom;
+        math_t denom = optimizer_round<scalar_t, math_t>(
+            optimizer_sqrt(v));
+        denom = optimizer_round<scalar_t, math_t>(denom / sc[9]);
+        denom = optimizer_round<scalar_t, math_t>(denom + sc[3]);
+        p = optimizer_addcdiv<scalar_t, math_t>(p, g, denom, sc[7]);
+        p = optimizer_addcdiv<scalar_t, math_t>(p, m, denom, sc[8]);
         param[i] = static_cast<scalar_t>(p);
     }
 }
@@ -227,29 +285,36 @@ inline void fused_rmsprop_range_scalar(
         int64_t begin, int64_t end) {
     for (int64_t i = begin; i < end; ++i) {
         math_t g = static_cast<math_t>(grad[i]);
-        if (maximize) g = -g;
+        if (maximize) g = optimizer_round<scalar_t, math_t>(-g);
         math_t p = static_cast<math_t>(param[i]);
-        if (wd) g += sc[4] * p;
+        if (wd) g = optimizer_round<scalar_t, math_t>(g + sc[4] * p);
 
-        math_t square = sc[0] * static_cast<math_t>(square_avg[i]) +
-            sc[1] * g * g;
+        math_t square = optimizer_round<scalar_t, math_t>(
+            sc[0] * static_cast<math_t>(square_avg[i]));
+        square = optimizer_addcmul<scalar_t, math_t>(square, g, g, sc[1]);
         square_avg[i] = static_cast<scalar_t>(square);
         math_t avg = square;
         if (centered) {
-            math_t mean = sc[0] * static_cast<math_t>(grad_avg[i]) +
-                sc[1] * g;
+            math_t mean = optimizer_lerp<scalar_t, math_t>(
+                static_cast<math_t>(grad_avg[i]), g, sc[1]);
             grad_avg[i] = static_cast<scalar_t>(mean);
-            avg = square - mean * mean;
+            avg = optimizer_addcmul<scalar_t, math_t>(
+                square, mean, mean, math_t(-1));
         }
-        avg = static_cast<math_t>(std::sqrt(static_cast<double>(avg))) + sc[3];
-        math_t update = g / avg;
+        avg = optimizer_round<scalar_t, math_t>(optimizer_sqrt(avg));
+        avg = optimizer_round<scalar_t, math_t>(avg + sc[3]);
         if (has_momentum) {
-            math_t buffer = sc[5] * static_cast<math_t>(momentum_buffer[i]) +
-                update;
+            math_t buffer = optimizer_round<scalar_t, math_t>(
+                sc[5] * static_cast<math_t>(momentum_buffer[i]));
+            buffer = optimizer_addcdiv<scalar_t, math_t>(
+                buffer, g, avg, math_t(1));
             momentum_buffer[i] = static_cast<scalar_t>(buffer);
-            update = buffer;
+            p = optimizer_add<scalar_t, math_t>(p, buffer, -sc[2]);
+        } else {
+            p = optimizer_addcdiv<scalar_t, math_t>(
+                p, g, avg, -sc[2]);
         }
-        param[i] = static_cast<scalar_t>(p - sc[2] * update);
+        param[i] = static_cast<scalar_t>(p);
     }
 }
 
@@ -260,22 +325,28 @@ inline void fused_adadelta_range_scalar(
         int64_t begin, int64_t end) {
     for (int64_t i = begin; i < end; ++i) {
         math_t g = static_cast<math_t>(grad[i]);
-        if (maximize) g = -g;
+        if (maximize) g = optimizer_round<scalar_t, math_t>(-g);
         math_t p = static_cast<math_t>(param[i]);
-        if (wd) g += sc[4] * p;
+        if (wd) g = optimizer_round<scalar_t, math_t>(g + sc[4] * p);
 
-        const math_t square = sc[0] * static_cast<math_t>(square_avg[i]) +
-            sc[1] * g * g;
+        math_t square = optimizer_round<scalar_t, math_t>(
+            sc[0] * static_cast<math_t>(square_avg[i]));
+        square = optimizer_addcmul<scalar_t, math_t>(square, g, g, sc[1]);
         square_avg[i] = static_cast<scalar_t>(square);
-        const math_t std = static_cast<math_t>(std::sqrt(
-            static_cast<double>(square + sc[3])));
-        math_t delta = static_cast<math_t>(std::sqrt(
-            static_cast<double>(static_cast<math_t>(acc_delta[i]) + sc[3])));
-        delta = delta / std * g;
-        const math_t next_acc = sc[0] * static_cast<math_t>(acc_delta[i]) +
-            sc[1] * delta * delta;
+        math_t std = optimizer_round<scalar_t, math_t>(square + sc[3]);
+        std = optimizer_round<scalar_t, math_t>(optimizer_sqrt(std));
+        math_t delta = optimizer_round<scalar_t, math_t>(
+            static_cast<math_t>(acc_delta[i]) + sc[3]);
+        delta = optimizer_round<scalar_t, math_t>(optimizer_sqrt(delta));
+        delta = optimizer_round<scalar_t, math_t>(delta / std);
+        delta = optimizer_round<scalar_t, math_t>(delta * g);
+        math_t next_acc = optimizer_round<scalar_t, math_t>(
+            sc[0] * static_cast<math_t>(acc_delta[i]));
+        next_acc = optimizer_addcmul<scalar_t, math_t>(
+            next_acc, delta, delta, sc[1]);
         acc_delta[i] = static_cast<scalar_t>(next_acc);
-        param[i] = static_cast<scalar_t>(p - sc[2] * delta);
+        param[i] = static_cast<scalar_t>(optimizer_add<scalar_t, math_t>(
+            p, delta, -sc[2]));
     }
 }
 
@@ -2229,20 +2300,26 @@ void fused_adamax_math(
             scalar_t* exp_inf = exp_inf_ptrs[li];
             for (int64_t i = item.begin; i < item.end; ++i) {
                 math_t g = static_cast<math_t>(grad[i]);
-                if (maximize) g = -g;
+                if (maximize) g = optimizer_round<scalar_t, math_t>(-g);
                 math_t p = static_cast<math_t>(param[i]);
-                if (has_weight_decay) g += sc[4] * p;
+                if (has_weight_decay) {
+                    g = optimizer_round<scalar_t, math_t>(g + sc[4] * p);
+                }
 
                 const math_t old_avg = static_cast<math_t>(exp_avg[i]);
-                const math_t avg = old_avg + sc[1] * (g - old_avg);
+                const math_t avg = optimizer_lerp<scalar_t, math_t>(
+                    old_avg, g, sc[1]);
                 exp_avg[i] = static_cast<scalar_t>(avg);
-                math_t inf = sc[2] * static_cast<math_t>(exp_inf[i]);
-                const math_t candidate = static_cast<math_t>(std::abs(
-                    static_cast<double>(g))) + sc[3];
+                math_t inf = optimizer_round<scalar_t, math_t>(
+                    sc[2] * static_cast<math_t>(exp_inf[i]));
+                math_t candidate = optimizer_round<scalar_t, math_t>(
+                    static_cast<math_t>(std::abs(g)));
+                candidate = optimizer_round<scalar_t, math_t>(
+                    candidate + sc[3]);
                 if (inf < candidate) inf = candidate;
                 exp_inf[i] = static_cast<scalar_t>(inf);
-                param[i] = static_cast<scalar_t>(
-                    p + sc[5] * avg / inf);
+                param[i] = static_cast<scalar_t>(optimizer_addcdiv<
+                    scalar_t, math_t>(p, avg, inf, sc[5]));
             }
         }
     });
@@ -2423,24 +2500,47 @@ void fused_rprop_math(
             scalar_t* prev = prev_ptrs[li];
             scalar_t* step_size = step_size_ptrs[li];
             for (int64_t i = item.begin; i < item.end; ++i) {
-                math_t g = static_cast<math_t>(grad[i]);
-                if (maximize) g = -g;
-                const math_t product = g * static_cast<math_t>(prev[i]);
+                const math_t raw_grad = static_cast<math_t>(grad[i]);
+                math_t product = optimizer_round<scalar_t, math_t>(
+                    raw_grad * static_cast<math_t>(prev[i]));
+                if (maximize) {
+                    product = optimizer_round<scalar_t, math_t>(-product);
+                }
                 math_t sign = static_cast<math_t>(1);
                 if (product > static_cast<math_t>(0)) sign = vplus;
                 else if (product < static_cast<math_t>(0)) sign = vminus;
 
-                math_t next_step = static_cast<math_t>(step_size[i]) * sign;
+                // The foreach sign tensor has the parameter dtype, so both
+                // eta assignments and the subsequent step-size multiply are
+                // rounded at their individual operation boundaries.
+                sign = sign == vplus
+                    ? optimizer_round<scalar_t, math_t>(vplus)
+                    : sign == vminus
+                        ? optimizer_round<scalar_t, math_t>(vminus)
+                        : optimizer_round<scalar_t, math_t>(math_t(1));
+                math_t next_step = optimizer_round<scalar_t, math_t>(
+                    static_cast<math_t>(step_size[i]) * sign);
                 next_step = std::min(vmax, std::max(vmin, next_step));
+                next_step = optimizer_round<scalar_t, math_t>(next_step);
                 step_size[i] = static_cast<scalar_t>(next_step);
-                if (sign == vminus) g = static_cast<math_t>(0);
+                math_t stored_grad = maximize
+                    ? optimizer_round<scalar_t, math_t>(-raw_grad)
+                    : raw_grad;
+                const math_t masked_grad = sign ==
+                        optimizer_round<scalar_t, math_t>(vminus)
+                    ? math_t(0) : stored_grad;
                 const math_t grad_sign =
-                    g > static_cast<math_t>(0) ? static_cast<math_t>(1) :
-                    g < static_cast<math_t>(0) ? static_cast<math_t>(-1) :
+                    masked_grad > static_cast<math_t>(0) ? static_cast<math_t>(1) :
+                    masked_grad < static_cast<math_t>(0) ? static_cast<math_t>(-1) :
                     static_cast<math_t>(0);
-                param[i] = static_cast<scalar_t>(
-                    static_cast<math_t>(param[i]) - grad_sign * next_step);
-                prev[i] = static_cast<scalar_t>(g);
+                // Torch stores the post-backtracking gradient in ``prev``;
+                // a direction reversal therefore becomes zero for the next
+                // iteration.  Keeping the raw gradient here changes the
+                // following sign product and diverges after one step.
+                prev[i] = static_cast<scalar_t>(masked_grad);
+                param[i] = static_cast<scalar_t>(optimizer_addcmul<
+                    scalar_t, math_t>(static_cast<math_t>(param[i]),
+                                      grad_sign, next_step, math_t(-1)));
             }
         }
     });
@@ -2655,28 +2755,45 @@ void fused_radam_math(
             const math_t one_minus_beta1 = sc[5];
             for (int64_t i = item.begin; i < item.end; ++i) {
                 math_t g = static_cast<math_t>(grad[i]);
-                if (maximize) g = -g;
+                if (maximize) g = optimizer_round<scalar_t, math_t>(-g);
                 math_t p = static_cast<math_t>(param[i]);
                 if (weight_decay_value != math_t(0)) {
                     if (decoupled_weight_decay) {
-                        p *= math_t(1) - lr_value * weight_decay_value;
+                        p = optimizer_round<scalar_t, math_t>(
+                            p * (math_t(1) - lr_value * weight_decay_value));
                     } else {
-                        g += weight_decay_value * p;
+                        g = optimizer_round<scalar_t, math_t>(
+                            g + weight_decay_value * p);
                     }
                 }
                 const math_t old_m = static_cast<math_t>(exp_avg[i]);
-                const math_t m = old_m + one_minus_beta1 * (g - old_m);
+                const math_t m = optimizer_lerp<scalar_t, math_t>(
+                    old_m, g, one_minus_beta1);
                 exp_avg[i] = static_cast<scalar_t>(m);
-                const math_t v = beta2_value *
-                    static_cast<math_t>(exp_avg_sq[i]) +
-                    (math_t(1) - beta2_value) * g * g;
+                math_t v = optimizer_round<scalar_t, math_t>(
+                    beta2_value * static_cast<math_t>(exp_avg_sq[i]));
+                v = optimizer_addcmul<scalar_t, math_t>(
+                    v, g, g, math_t(1) - beta2_value);
                 exp_avg_sq[i] = static_cast<scalar_t>(v);
+
+                math_t buffer = optimizer_round<scalar_t, math_t>(
+                    optimizer_sqrt(v));
+                buffer = optimizer_round<scalar_t, math_t>(
+                    buffer + eps_value);
                 if (sc[7] != math_t(0)) {
-                    p += sc[7] * m / (static_cast<math_t>(std::sqrt(
-                        static_cast<double>(v))) + eps_value);
+                    buffer = optimizer_round<scalar_t, math_t>(
+                        buffer / sc[7]);
+                    buffer = optimizer_round<scalar_t, math_t>(
+                        math_t(1) / buffer);
                 } else {
-                    p += sc[6] * m;
+                    // Torch's zero rectification path obtains the same
+                    // value through divide-by-zero and reciprocal.  Avoid
+                    // manufacturing an infinity here; the surviving term is
+                    // the unrectified step size.
+                    buffer = optimizer_round<scalar_t, math_t>(sc[6]);
                 }
+                p = optimizer_addcmul<scalar_t, math_t>(
+                    p, m, buffer, math_t(1));
                 param[i] = static_cast<scalar_t>(p);
             }
         }

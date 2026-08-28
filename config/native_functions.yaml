@@ -927,6 +927,12 @@
     CPU: squeeze_dim_kernel
     CUDA: squeeze_dim_kernel_cuda
 
+- func: squeeze.dims(Tensor self, int[] dim) -> Tensor
+  variants: function, method
+  dispatch:
+    CPU: squeeze_dims_kernel
+    CUDA: squeeze_dims_kernel_cuda
+
 - func: unsqueeze(Tensor self, int dim) -> Tensor
   variants: function, method
   dispatch:
@@ -1065,6 +1071,12 @@
   dispatch:
     CPU: native_dropout_cpu
     CUDA: native_dropout_cuda
+
+- func: native_dropout_backward(Tensor grad_output, Tensor mask, float scale) -> Tensor
+  variants: function
+  dispatch:
+    CPU: native_dropout_backward_cpu
+    CUDA: native_dropout_backward_cuda
 
 # Alpha / feature dropout fused forward, same (output, mask) contract as
 # native_dropout so the backward can reapply the saved mask:
@@ -1489,6 +1501,12 @@
   dispatch:
     CPU: silu_kernel
 
+- func: silu_backward(Tensor grad_output, Tensor self) -> Tensor
+  variants: function
+  dispatch:
+    CPU: silu_backward_kernel_impl
+    CUDA: silu_backward_kernel_cuda
+
 - func: empty(int[] size, *, ScalarType? dtype=None, Device? device=None, bool pin_memory=false, bool requires_grad=false) -> Tensor
   variants: function
   dispatch:
@@ -1734,7 +1752,29 @@
   python_defaults: {dilation: '[1, 1]', padding: '[0, 0]', stride: '[]'}
   variants: function
   dispatch:
-    CPU: max_pool2d_cpu
+    Composite: max_pool2d_composite
+
+# ATen max_pool3d (aten/src/ATen/native/MaxPooling.cpp): 5-D (N, C, D, H, W)
+# or unbatched 4-D input; indices are linear offsets into the (D, H, W) volume.
+- func: max_pool3d(Tensor input, int[] kernel_size, int[] stride=[], int[] padding=[], int[] dilation=[], bool ceil_mode=false) -> Tensor
+  python_defaults: {dilation: '[1, 1, 1]', padding: '[0, 0, 0]', stride: '[]'}
+  variants: function
+  dispatch:
+    Composite: max_pool3d_composite
+
+- func: max_pool2d_with_indices(Tensor input, int[] kernel_size, int[] stride=[], int[] padding=[], int[] dilation=[], bool ceil_mode=false) -> (Tensor output, Tensor indices)
+  python_defaults: {dilation: '[1, 1]', padding: '[0, 0]', stride: '[]'}
+  variants: function
+  dispatch:
+    CPU: max_pool2d_with_indices_cpu
+    CUDA: max_pool2d_with_indices_cuda
+
+- func: max_pool3d_with_indices(Tensor input, int[] kernel_size, int[] stride=[], int[] padding=[], int[] dilation=[], bool ceil_mode=false) -> (Tensor output, Tensor indices)
+  python_defaults: {dilation: '[1, 1, 1]', padding: '[0, 0, 0]', stride: '[]'}
+  variants: function
+  dispatch:
+    CPU: max_pool3d_with_indices_cpu
+    CUDA: max_pool3d_with_indices_cuda
 
 - func: avg_pool2d(Tensor input, int[] kernel_size, int[] stride=[], int[] padding=[], bool ceil_mode=false, bool count_include_pad=true, int? divisor_override=None) -> Tensor
   python_defaults: {padding: '[0, 0]', stride: '[]'}
@@ -1772,7 +1812,109 @@
 - func: adaptive_max_pool2d(Tensor input, int[] output_size) -> Tensor
   variants: function
   dispatch:
-    CPU: adaptive_max_pool2d_cpu
+    Composite: adaptive_max_pool2d_composite
+
+# ATen adaptive_max_pool2d returns (values, indices); exposing the pair lets
+# autograd save indices and scatter in the backward (no argmax recompute).
+- func: adaptive_max_pool2d_with_indices(Tensor input, int[] output_size) -> (Tensor output, Tensor indices)
+  variants: function
+  dispatch:
+    CPU: adaptive_max_pool2d_with_indices_cpu
+    CUDA: adaptive_max_pool2d_with_indices_cuda
+
+# ATen adaptive_max_pool3d (aten/src/ATen/native/AdaptiveMaxPooling3d.cpp):
+# floor/ceil bin bounds identical to adaptive avg pool 3d.
+- func: adaptive_max_pool3d(Tensor input, int[] output_size) -> Tensor
+  variants: function
+  dispatch:
+    CPU: adaptive_max_pool3d_cpu
+    CUDA: adaptive_max_pool3d_cuda
+
+# ATen fractional_max_pool (aten/src/ATen/native/FractionalMaxPool2d.cpp,
+# cuda/FractionalMaxPool2d.cu): stochastic-step max pooling whose intervals
+# derive from the caller-provided random_samples tensor (no internal RNG).
+# indices are flat in-plane offsets (h * W + w / (d * H + h) * W + w), int64.
+- func: fractional_max_pool2d(Tensor self, int[] kernel_size, int[] output_size, Tensor random_samples) -> (Tensor output, Tensor indices)
+  variants: function
+  dispatch:
+    CPU: fractional_max_pool2d_cpu
+    CUDA: fractional_max_pool2d_cuda
+
+- func: fractional_max_pool2d_backward(Tensor grad_output, Tensor self, int[] kernel_size, int[] output_size, Tensor indices) -> Tensor
+  variants: function
+  dispatch:
+    CPU: fractional_max_pool2d_backward_cpu
+    CUDA: fractional_max_pool2d_backward_cuda
+
+- func: fractional_max_pool3d(Tensor self, int[] kernel_size, int[] output_size, Tensor random_samples) -> (Tensor output, Tensor indices)
+  variants: function
+  dispatch:
+    CPU: fractional_max_pool3d_cpu
+    CUDA: fractional_max_pool3d_cuda
+
+- func: fractional_max_pool3d_backward(Tensor grad_output, Tensor self, int[] kernel_size, int[] output_size, Tensor indices) -> Tensor
+  variants: function
+  dispatch:
+    CPU: fractional_max_pool3d_backward_cpu
+    CUDA: fractional_max_pool3d_backward_cuda
+
+# ATen max_unpool (aten/src/ATen/native/MaxUnpooling.cpp, cpu/MaxUnpoolKernel.cpp,
+# cuda/MaxUnpooling.cu): partial inverse of max_pool*_with_indices. Scatters
+# pooled values into a zero canvas at the flat in-plane int64 indices; the
+# backward gathers grad_output at those same positions. max_unpool3d carries
+# stride/padding for API parity with ATen (validation only).
+- func: max_unpool2d(Tensor self, Tensor indices, int[] output_size) -> Tensor
+  variants: function
+  dispatch:
+    CPU: max_unpool2d_cpu
+    CUDA: max_unpool2d_cuda
+
+- func: max_unpool2d_backward(Tensor grad_output, Tensor indices, int[] output_size) -> Tensor
+  variants: function
+  dispatch:
+    CPU: max_unpool2d_backward_cpu
+    CUDA: max_unpool2d_backward_cuda
+
+- func: max_unpool3d(Tensor self, Tensor indices, int[] output_size, int[] stride, int[] padding) -> Tensor
+  variants: function
+  dispatch:
+    CPU: max_unpool3d_cpu
+    CUDA: max_unpool3d_cuda
+
+- func: max_unpool3d_backward(Tensor grad_output, Tensor indices, int[] output_size) -> Tensor
+  variants: function
+  dispatch:
+    CPU: max_unpool3d_backward_cpu
+    CUDA: max_unpool3d_backward_cuda
+
+# ATen grid_sampler (aten/src/ATen/native/cuda/GridSampler.cu,
+# cpu/GridSamplerKernel.cpp): resamples input at sub-pixel locations given a
+# normalized flow-field grid. interpolation_mode: 0=Bilinear 1=Nearest
+# 2=Bicubic; padding_mode: 0=Zeros 1=Border 2=Reflection. backward's
+# output_mask selects which of (grad_input, grad_grid) is computed.
+- func: grid_sampler_2d(Tensor input, Tensor grid, int interpolation_mode, int padding_mode, bool align_corners) -> Tensor
+  variants: function
+  dispatch:
+    CPU: grid_sampler_2d_cpu
+    CUDA: grid_sampler_2d_cuda
+
+- func: grid_sampler_2d_backward(Tensor grad_output, Tensor input, Tensor grid, int interpolation_mode, int padding_mode, bool align_corners, bool[2] output_mask) -> (Tensor, Tensor)
+  variants: function
+  dispatch:
+    CPU: grid_sampler_2d_backward_cpu
+    CUDA: grid_sampler_2d_backward_cuda
+
+- func: grid_sampler_3d(Tensor input, Tensor grid, int interpolation_mode, int padding_mode, bool align_corners) -> Tensor
+  variants: function
+  dispatch:
+    CPU: grid_sampler_3d_cpu
+    CUDA: grid_sampler_3d_cuda
+
+- func: grid_sampler_3d_backward(Tensor grad_output, Tensor input, Tensor grid, int interpolation_mode, int padding_mode, bool align_corners, bool[2] output_mask) -> (Tensor, Tensor)
+  variants: function
+  dispatch:
+    CPU: grid_sampler_3d_backward_cpu
+    CUDA: grid_sampler_3d_backward_cuda
 
 - func: nll_loss(Tensor self, Tensor target, Tensor? weight=None, int reduction=1, int ignore_index=-100) -> (Tensor output, Tensor total_weight)
   variants: function
@@ -1783,6 +1925,20 @@
   variants: function
   dispatch:
     CPU: nll_loss_backward_kernel
+
+# ATen nll_loss2d (aten/src/ATen/native/LossNLL.cpp): (N, C, H, W) input with
+# (N, H, W) target; every spatial position is an independent batch row.
+- func: nll_loss2d(Tensor self, Tensor target, Tensor? weight=None, int reduction=1, int ignore_index=-100) -> (Tensor output, Tensor total_weight)
+  variants: function
+  dispatch:
+    CPU: nll_loss2d_kernel
+    CUDA: nll_loss2d_cuda
+
+- func: nll_loss2d_backward(Tensor grad_output, Tensor self, Tensor target, Tensor? weight=None, int reduction=1, int ignore_index=-100, Tensor? total_weight=None) -> Tensor
+  variants: function
+  dispatch:
+    CPU: nll_loss2d_backward_kernel
+    CUDA: nll_loss2d_backward_cuda
 
 # CTC loss native kernels (port of aten/src/ATen/native/LossCTC.cpp CPU).
 # Targets use the batch-first zero-padded layout (N, S); lengths are (N,)
@@ -1815,6 +1971,27 @@
   dispatch:
     CPU: max_pool2d_backward_cpu
 
+- func: max_pool3d_backward(Tensor grad_output, Tensor input, int[] kernel_size, int[] stride=[], int[] padding=[], int[] dilation=[], bool ceil_mode=false) -> Tensor
+  python_defaults: {dilation: '[1, 1, 1]', padding: '[0, 0, 0]', stride: '[]'}
+  variants: function
+  dispatch:
+    CPU: max_pool3d_backward_cpu
+    CUDA: max_pool3d_backward_cuda
+
+- func: max_pool2d_with_indices_backward(Tensor grad_output, Tensor input, int[] kernel_size, int[] stride=[], int[] padding=[], int[] dilation=[], bool ceil_mode=false, Tensor? indices=None) -> Tensor
+  python_defaults: {dilation: '[1, 1]', padding: '[0, 0]', stride: '[]'}
+  variants: function
+  dispatch:
+    CPU: max_pool2d_with_indices_backward_cpu
+    CUDA: max_pool2d_with_indices_backward_cuda
+
+- func: max_pool3d_with_indices_backward(Tensor grad_output, Tensor input, int[] kernel_size, int[] stride=[], int[] padding=[], int[] dilation=[], bool ceil_mode=false, Tensor? indices=None) -> Tensor
+  python_defaults: {dilation: '[1, 1, 1]', padding: '[0, 0, 0]', stride: '[]'}
+  variants: function
+  dispatch:
+    CPU: max_pool3d_with_indices_backward_cpu
+    CUDA: max_pool3d_with_indices_backward_cuda
+
 - func: avg_pool2d_backward(Tensor grad_output, Tensor input, int[] kernel_size, int[] stride=[], int[] padding=[], bool ceil_mode=false, bool count_include_pad=true, int? divisor_override=None) -> Tensor
   python_defaults: {padding: '[0, 0]', stride: '[]'}
   variants: function
@@ -1830,6 +2007,18 @@
   variants: function
   dispatch:
     CPU: adaptive_max_pool2d_backward_cpu
+
+- func: adaptive_max_pool2d_with_indices_backward(Tensor grad_output, Tensor input, int[] output_size, Tensor indices) -> Tensor
+  variants: function
+  dispatch:
+    CPU: adaptive_max_pool2d_with_indices_backward_cpu
+    CUDA: adaptive_max_pool2d_with_indices_backward_cuda
+
+- func: adaptive_max_pool3d_backward(Tensor grad_output, Tensor input) -> Tensor
+  variants: function
+  dispatch:
+    CPU: adaptive_max_pool3d_backward_cpu
+    CUDA: adaptive_max_pool3d_backward_cuda
 
 - func: batch_norm(Tensor input, Tensor? weight, Tensor? bias, Tensor? running_mean, Tensor? running_var, bool training, float momentum, float eps) -> Tensor
   variants: function
@@ -1912,26 +2101,6 @@
   dispatch:
     CPU: l1_loss_backward_kernel
 
-- func: tp_smooth_l1_loss(Tensor input, Tensor target, int64_t reduction=1, float beta=1.0) -> Tensor
-  variants: function
-  dispatch:
-    CPU: smooth_l1_loss_kernel
-
-- func: tp_smooth_l1_loss_backward(Tensor grad_output, Tensor input, Tensor target, int64_t reduction=1, float beta=1.0) -> Tensor
-  variants: function
-  dispatch:
-    CPU: smooth_l1_loss_backward_kernel
-
-- func: tp_huber_loss(Tensor input, Tensor target, int64_t reduction=1, float delta=1.0) -> Tensor
-  variants: function
-  dispatch:
-    CPU: huber_loss_kernel
-
-- func: tp_huber_loss_backward(Tensor grad_output, Tensor input, Tensor target, int64_t reduction=1, float delta=1.0) -> Tensor
-  variants: function
-  dispatch:
-    CPU: huber_loss_backward_kernel
-
 - func: tp_kl_div(Tensor input, Tensor target, int64_t reduction=1, bool log_target=false) -> Tensor
   variants: function
   dispatch:
@@ -1941,16 +2110,6 @@
   variants: function
   dispatch:
     CPU: kl_div_backward_kernel
-
-- func: tp_binary_cross_entropy(Tensor input, Tensor target, Tensor? weight=None, int64_t reduction=1) -> Tensor
-  variants: function
-  dispatch:
-    CPU: binary_cross_entropy_kernel
-
-- func: tp_binary_cross_entropy_backward(Tensor grad_output, Tensor input, Tensor target, Tensor? weight=None, int64_t reduction=1) -> Tensor
-  variants: function
-  dispatch:
-    CPU: binary_cross_entropy_backward_kernel
 
 - func: tp_margin_ranking_loss(Tensor input1, Tensor input2, Tensor target, float margin=0.0, int64_t reduction=1) -> Tensor
   variants: function
@@ -2307,6 +2466,11 @@
   dispatch:
     CPU: unfold_cpu
 
+- func: unfold_backward(Tensor grad_output, SymInt[] input_sizes, int dim, int size, int step) -> Tensor
+  variants: function
+  dispatch:
+    CPU: unfold_backward_cpu
+
 # ============================================================================
 # Declarations for ops whose CPU/CUDA kernels were registered directly via
 # m.impl but which had no schema here -- so codegen produced no Python
@@ -2338,6 +2502,35 @@
   dispatch:
     CPU: leaky_relu_backward_kernel_impl
     CUDA: leaky_relu_backward_kernel_cuda
+
+# ATen rrelu_with_noise (aten/src/ATen/native/Activation.cpp): training path
+# scales negative elements by the caller-provided noise tensor; eval path is
+# leaky_relu with slope (lower + upper) / 2.
+- func: rrelu_with_noise(Tensor self, Tensor noise, Scalar lower=0.125, Scalar upper=0.3333333333333333, bool training=False) -> Tensor
+  variants: function
+  dispatch:
+    CPU: rrelu_with_noise_kernel_impl
+    CUDA: rrelu_with_noise_kernel_cuda
+
+- func: rrelu_with_noise_backward(Tensor grad_output, Tensor self, Tensor noise, Scalar lower, Scalar upper, bool training, bool self_is_result) -> Tensor
+  variants: function
+  dispatch:
+    CPU: rrelu_with_noise_backward_kernel_impl
+    CUDA: rrelu_with_noise_backward_kernel_cuda
+
+# ATen log_sigmoid (aten/src/ATen/native/Activation.cpp): numerically stable
+# log(sigmoid(x)) = min(x, 0) - log1p(exp(-|x|)); backward is grad * sigmoid(-x).
+- func: log_sigmoid(Tensor self) -> Tensor
+  variants: function, method
+  dispatch:
+    CPU: log_sigmoid_kernel_impl
+    CUDA: log_sigmoid_kernel_cuda
+
+- func: log_sigmoid_backward(Tensor grad_output, Tensor self) -> Tensor
+  variants: function
+  dispatch:
+    CPU: log_sigmoid_backward_kernel_impl
+    CUDA: log_sigmoid_backward_kernel_cuda
 
 - func: hardtanh(Tensor self, Scalar min_val=-1, Scalar max_val=1) -> Tensor
   variants: function, method
@@ -2429,11 +2622,26 @@
     CPU: softshrink_cpu
     CUDA: softshrink_cuda
 
+# ATen Activation.cpp shrink_backward_kernel: shared by both backwards --
+# grad passes through where |self| > lambd (boundary inclusive-zero), i.e.
+# (self >= -lambd && self <= lambd) ? 0 : grad.
+- func: softshrink_backward(Tensor grad_output, Tensor self, Scalar lambd) -> Tensor
+  variants: function, method
+  dispatch:
+    CPU: softshrink_backward_cpu
+    CUDA: softshrink_backward_cuda
+
 - func: hardshrink(Tensor self, Scalar lambd=0.5) -> Tensor
   variants: function, method
   dispatch:
     CPU: hardshrink_cpu
     CUDA: hardshrink_cuda
+
+- func: hardshrink_backward(Tensor grad_out, Tensor self, Scalar lambd) -> Tensor
+  variants: function, method
+  dispatch:
+    CPU: hardshrink_backward_cpu
+    CUDA: hardshrink_backward_cuda
 
 - func: glu(Tensor self, int dim=-1) -> Tensor
   variants: function, method
@@ -2815,7 +3023,7 @@
     CPU: diag_cpu
     CUDA: diag_cuda
 
-- func: diag_embed(Tensor self, int offset=0, int dim1=0, int dim2=1) -> Tensor
+- func: diag_embed(Tensor self, int offset=0, int dim1=-2, int dim2=-1) -> Tensor
   variants: function, method
   dispatch:
     CPU: diag_embed_cpu
@@ -3128,7 +3336,7 @@
     CPU: renorm_cpu
     CUDA: renorm_cuda
 
-- func: rot90(Tensor self, int k=1, int[] dims=[]) -> Tensor
+- func: rot90(Tensor self, int k=1, int[] dims=[0,1]) -> Tensor
   variants: function, method
   dispatch:
     CPU: rot90_cpu
@@ -3278,6 +3486,24 @@
     CPU: logit_cpu
     CUDA: logit_cuda
 
+- func: logit_backward(Tensor grad_output, Tensor self, Scalar? eps=None) -> Tensor
+  variants: function, method
+  dispatch:
+    CPU: logit_backward_cpu
+    CUDA: logit_backward_cuda
+
+- func: sigmoid_backward(Tensor grad_output, Tensor output) -> Tensor
+  variants: function, method
+  dispatch:
+    CPU: sigmoid_backward_cpu
+    CUDA: sigmoid_backward_cuda
+
+- func: tanh_backward(Tensor grad_output, Tensor output) -> Tensor
+  variants: function, method
+  dispatch:
+    CPU: tanh_backward_cpu
+    CUDA: tanh_backward_cuda
+
 - func: gcd(Tensor self, Tensor other) -> Tensor
   variants: function, method
   dispatch:
@@ -3386,17 +3612,29 @@
     CPU: l1_loss_cpu
     CUDA: l1_loss_cuda
 
-- func: smooth_l1_loss(Tensor input, Tensor target, Scalar beta=1.0) -> Tensor
+- func: smooth_l1_loss(Tensor self, Tensor target, int reduction=1, float beta=1.0) -> Tensor
   variants: function
   dispatch:
     CPU: smooth_l1_loss_cpu
     CUDA: smooth_l1_loss_cuda
 
-- func: huber_loss(Tensor input, Tensor target, Scalar delta=1.0) -> Tensor
+- func: smooth_l1_loss_backward(Tensor grad_output, Tensor self, Tensor target, int reduction, float beta) -> Tensor
+  variants: function
+  dispatch:
+    CPU: smooth_l1_loss_backward_cpu
+    CUDA: smooth_l1_loss_backward_cuda
+
+- func: huber_loss(Tensor self, Tensor target, int reduction=1, float delta=1.0) -> Tensor
   variants: function
   dispatch:
     CPU: huber_loss_cpu
     CUDA: huber_loss_cuda
+
+- func: huber_loss_backward(Tensor grad_output, Tensor self, Tensor target, int reduction, float delta) -> Tensor
+  variants: function
+  dispatch:
+    CPU: huber_loss_backward_cpu
+    CUDA: huber_loss_backward_cuda
 
 - func: kl_div(Tensor input, Tensor target) -> Tensor
   variants: function
@@ -3404,11 +3642,17 @@
     CPU: kl_div_cpu
     CUDA: kl_div_cuda
 
-- func: binary_cross_entropy(Tensor input, Tensor target) -> Tensor
+- func: binary_cross_entropy(Tensor self, Tensor target, Tensor? weight=None, int reduction=1) -> Tensor
   variants: function
   dispatch:
     CPU: binary_cross_entropy_cpu
     CUDA: binary_cross_entropy_cuda
+
+- func: binary_cross_entropy_backward(Tensor grad_output, Tensor self, Tensor target, Tensor? weight=None, int reduction=1) -> Tensor
+  variants: function
+  dispatch:
+    CPU: binary_cross_entropy_backward_cpu
+    CUDA: binary_cross_entropy_backward_cuda
 
 - func: binary_cross_entropy_with_logits(Tensor self, Tensor target, Tensor? weight=None, Tensor? pos_weight=None) -> Tensor
   variants: function
@@ -3446,17 +3690,43 @@
     CPU: hinge_embedding_loss_cpu
     CUDA: hinge_embedding_loss_cuda
 
-- func: multi_margin_loss(Tensor input, Tensor target, Scalar margin=1.0, float p=1) -> Tensor
+# ATen multi_margin_loss (aten/src/ATen/native/LossMultiMargin.cpp): 1-D (C)
+# or 2-D (N, C) input with class-index target; per-row hinge
+# sum_{d != y} max(0, margin - x_y + x_d)^p * w[y] / C. reduction: 0=none
+# (per-row (N,) output), 1=mean, 2=sum; 1-D input always yields a scalar.
+- func: multi_margin_loss(Tensor self, Tensor target, Scalar p=1, Scalar margin=1, Tensor? weight=None, int reduction=1) -> Tensor
   variants: function
   dispatch:
     CPU: multi_margin_loss_cpu
     CUDA: multi_margin_loss_cuda
 
-- func: multilabel_margin_loss(Tensor input, Tensor target, Scalar margin=1.0) -> Tensor
+- func: multi_margin_loss_backward(Tensor grad_output, Tensor self, Tensor target, Scalar p, Scalar margin, Tensor? weight=None, int reduction=1) -> Tensor
   variants: function
   dispatch:
-    CPU: multilabel_margin_loss_cpu
-    CUDA: multilabel_margin_loss_cuda
+    CPU: multi_margin_loss_cpu_backward
+    CUDA: multi_margin_loss_cuda_backward
+
+# ATen multilabel_margin_loss (aten/src/ATen/native/LossMultiLabelMargin.cpp):
+# composite over multilabel_margin_loss_forward (get<0>), exactly like ATen's
+# registered-composite multilabel_margin_loss. forward emits the loss plus
+# the is_target mask consumed by the backward; target rows list class
+# indices and are terminated by -1.
+- func: multilabel_margin_loss(Tensor self, Tensor target, int reduction=1) -> Tensor
+  variants: function
+  dispatch:
+    Composite: multilabel_margin_loss_composite
+
+- func: multilabel_margin_loss_forward(Tensor self, Tensor target, int reduction) -> (Tensor output, Tensor is_target)
+  variants: function
+  dispatch:
+    CPU: multilabel_margin_loss_forward_cpu
+    CUDA: multilabel_margin_loss_forward_cuda
+
+- func: multilabel_margin_loss_backward(Tensor grad_output, Tensor self, Tensor target, int reduction, Tensor is_target) -> Tensor
+  variants: function
+  dispatch:
+    CPU: multilabel_margin_loss_backward_cpu
+    CUDA: multilabel_margin_loss_backward_cuda
 
 - func: multilabel_soft_margin_loss(Tensor input, Tensor target) -> Tensor
   variants: function

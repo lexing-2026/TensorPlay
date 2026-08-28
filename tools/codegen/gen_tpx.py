@@ -43,6 +43,23 @@ _VIEW_OPS = {
     'swapdims', 'unfold', 'detach', 'diagonal', 'expand_as',
 }
 
+# Ops returning a TensorList whose elements are all views of `self` (torch
+# ADInplaceOrView records a shared backward node with per-output output_nr,
+# shares the version counter and marks each output as a view).  Value:
+# (manual backward node name, torch forward_op_name used in the multi-output
+# in-place error, multi_output flag).  chunk maps to SplitBackward/"Split":
+# upstream chunk is CompositeImplicitAutograd through split, so torch records
+# SplitBackward0 for chunk outputs as well.  tensor_split outputs behave like
+# plain slice views upstream (DEFAULT creation meta), so its node is not
+# flagged multi-output and in-place falls through to the view-of-leaf check.
+_LIST_VIEW_OPS = {
+    'unbind': ('UnbindBackward', 'Unbind', True),
+    'split': ('SplitBackward', 'Split', True),
+    'split_with_sizes': ('SplitBackward', 'SplitWithSizes', True),
+    'chunk': ('SplitBackward', 'Split', True),
+    'tensor_split': ('SplitBackward', 'TensorSplit', False),
+}
+
 # Ops whose backward node is a view function in torch's ADInplaceOrView
 # sense (VariableTypeUtils.h check_inplace): in-place ops must reject
 # mutations of their outputs when the base chain ends at a leaf.  reshape is
@@ -192,6 +209,26 @@ def _emit_leaf_checks(lines, f):
     for a in f.mutable_args:
         if a.type.is_mutable_ref:
             lines.append(f'    if (requires_grad && {a.name}.requires_grad()) {{')
+            # Torch check_inplace (VariableTypeUtils.h can_mutate_inplace):
+            # views created by multi-output nodes (CreationMeta::
+            # MULTI_OUTPUT_NODE) can never be mutated in-place; this fires
+            # before the view-of-leaf / leaf checks.
+            lines.append('        {')
+            lines.append(
+                f'            auto __tp_gf = tensorplay::tpx::impl::grad_fn({a.name});')
+            lines.append(
+                f'            if (__tp_gf && {a.name}.unsafeGetTensorImpl()->is_view() '
+                '&& __tp_gf->is_multi_output_view()) {')
+            lines.append(
+                '                TP_THROW(RuntimeError, "Output ", '
+                f'tensorplay::tpx::impl::output_nr({a.name}), " of ", '
+                '__tp_gf->forward_op_name(), '
+                '" is a view and is being modified inplace." '
+                '" This view is the output of a function that returns multiple views." '
+                '" Such functions do not allow the output views to be modified inplace." '
+                '" You should replace the inplace operation by an out-of-place one.");')
+            lines.append('            }')
+            lines.append('        }')
             lines.append(
                 f'        if (tensorplay::tpx::impl::is_view_of_leaf({a.name})) {{')
             lines.append(
@@ -252,6 +289,10 @@ def generate_tpx_ops_cpp(funcs: list[NativeFunction], *,
         ret = cpp_return_type(f)
         ret_void = ret == 'void'
         has_ag = _has_autograd(f, derivatives)
+        _self_lv = f.self_arg()
+        _is_list_view = (f.cpp_return_kind == 'list' and _self_lv is not None
+                         and f.base_name in _LIST_VIEW_OPS
+                         and any(a.name == 'dim' for a in f.args))
 
         lines.append(f'{ret} {f.cpp_name}({", ".join(f"{t} {a.name}" for t, a in zip(arg_types, f.args))}) {{')
 
@@ -282,7 +323,7 @@ def generate_tpx_ops_cpp(funcs: list[NativeFunction], *,
             _emit_autocast_block(lines, f, arg_types)
 
         # ---- gradient bookkeeping -----------------------------------------
-        if has_ag:
+        if has_ag or _is_list_view:
             _emit_requires_grad_detection(lines, f)
             _emit_leaf_checks(lines, f)
             # In-place ops whose derivative references `self` must evaluate
@@ -392,6 +433,23 @@ def generate_tpx_ops_cpp(funcs: list[NativeFunction], *,
                 lines.append('        grad_fn->set_view_fn(true);')
             _emit_edges(lines, f)
             lines.append('    }')
+        elif _is_list_view:
+            # Multi-output view op: one shared manual node; each output is
+            # attached below with its own output_nr (torch VariableType
+            # as_view semantics for unbind/split/chunk).
+            node_name, fwd_name, multi_out = _LIST_VIEW_OPS[f.base_name]
+            if f.func_name == 'split.sizes':
+                fwd_name = 'SplitWithSizes'
+            lines.append('    std::shared_ptr<Node> grad_fn;')
+            lines.append('    if (requires_grad) {')
+            lines.append(
+                f'        grad_fn = std::make_shared<{node_name}>(dim, core_result);')
+            lines.append('        grad_fn->set_view_fn(true);')
+            lines.append(f'        grad_fn->set_forward_op_name("{fwd_name}");')
+            if multi_out:
+                lines.append('        grad_fn->set_multi_output_view(true);')
+            _emit_edges(lines, f)
+            lines.append('    }')
 
         # ---- result wrapping -----------------------------------------------
         if kind == 'tuple':
@@ -416,6 +474,25 @@ def generate_tpx_ops_cpp(funcs: list[NativeFunction], *,
                 lines.append('    }')
             lines.append('    return result;')
         elif kind == 'list':
+            if _is_list_view:
+                # Torch ADInplaceOrView: every list element is a view of
+                # `self` -- share the version counter, mark is_view, and
+                # attach the shared backward node with a per-element
+                # output_nr.  (Mirrors upstream as_view for unbind/split.)
+                lines.append('    for (size_t __tp_i = 0; __tp_i < core_result.size(); ++__tp_i) {')
+                lines.append(
+                    f'        core_result[__tp_i].unsafeGetTensorImpl()->share_version_counter('
+                    f'*{_self_lv.name}.unsafeGetTensorImpl());')
+                lines.append(
+                    '        core_result[__tp_i].unsafeGetTensorImpl()->set_is_view(true);')
+                lines.append('        if (requires_grad) {')
+                lines.append(
+                    '            tensorplay::tpx::impl::set_requires_grad(core_result[__tp_i], true);')
+                lines.append(
+                    '            tensorplay::tpx::impl::set_grad_fn(core_result[__tp_i], grad_fn, '
+                    'static_cast<uint32_t>(__tp_i));')
+                lines.append('        }')
+                lines.append('    }')
             lines.append('    return core_result;')
         elif kind == 'mut_ref':
             alias = next((a.name for a in f.mutable_args if a.type.is_mutable_ref),

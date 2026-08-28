@@ -1129,6 +1129,11 @@ Tensor nonzero_cuda(const Tensor& self) {
     Tensor self_c = self.contiguous();
     int64_t nd = self.dim();
     int64_t n = self_c.numel();
+    // Empty input: no matches. Launching with a 0-block grid is a CUDA error,
+    // and torch returns a (0, nd) tensor.
+    if (n == 0) {
+        return Tensor::zeros({0, nd}, DType::Int64, self.device());
+    }
     Tensor counter = Tensor::zeros({1}, DType::Int64, self.device());
     auto stream = getCurrentCUDAStream().stream();
 #define TP_NZC_CASE(ctype, name) \

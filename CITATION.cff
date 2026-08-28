@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use TensorPlay in your research or teaching, please cite it as below."
+title: "TensorPlay: A simple deep learning framework designed for educational purposes and small-scale experiments"
+type: software
+authors:
+  - name: zlx
+    email: 2095774200@shu.edu.cn
+    affiliation: Shanghai University
+repository-code: "https://github.com/lexing-2026/TensorPlay"
+url: "https://tensorplay.cn"
+license: Apache-2.0
+version: 1.0.0
+keywords:
+  - deep-learning
+  - autograd
+  - cuda
+  - education
+  - tensor

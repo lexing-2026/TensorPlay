@@ -553,10 +553,11 @@ def nadam(
         and not has_complex
         and native_device in ("cpu", "cuda")
         and bool(params)
-        # The fused reduced-dtype kernel combines several updates that Torch
-        # performs as separate CUDA ops. Keep fp16/bf16 on the reference path
-        # so state/parameter rounding remains native-compatible.
-        and params[0].dtype in (tp.float32, tp.float64)
+        # CPU and CUDA both round reduced floating point intermediates at the
+        # same foreach operation boundaries as Torch.
+        and params[0].dtype in (
+            tp.float16, tp.bfloat16, tp.float32, tp.float64
+        )
         and all(
             p.device.type == native_device
             and p.is_contiguous()

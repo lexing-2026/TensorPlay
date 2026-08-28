@@ -630,7 +630,20 @@ static void mm_into_impl(const Tensor& self_p, const Tensor& mat2_p,
         result.fill_(Scalar(0));
         return;
     }
-    
+
+    if (self_p.dtype() == DType::Float16) {
+        // ATen CPUBlas.cpp parity: on CPUs without an fp16 GEMM ISA oneDNN's
+        // fp16 matmul drops to a reference kernel (measured ~800x slower than
+        // sgemm on Zen4).  torch widens to fp32, runs sgemm and narrows back
+        // (its shgemm fallback converts the same way); do the same.
+        Tensor a32 = self_p.to(DType::Float32);
+        Tensor b32 = mat2_p.to(DType::Float32);
+        Tensor r32 = Tensor::empty({M, N}, DType::Float32, result.device());
+        mm_into_impl(a32, b32, r32);
+        result.copy_(r32);
+        return;
+    }
+
     // Small GEMMs go straight to the (ISA-tuned via MKL_DEBUG_CPU_LIST) BLAS
     // call: oneDNN's pd-cache lookup + JIT launch + threaded-runner sync cost
     // more than the GEMM itself below ~8k MACs (Zen4: 2.8us vs 7.7us), and

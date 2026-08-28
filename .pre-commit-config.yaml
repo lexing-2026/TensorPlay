@@ -1,0 +1,24 @@
+# Pre-commit hooks. Install with:
+#   pip install pre-commit
+#   pre-commit install --hook-type pre-commit --hook-type commit-msg
+#
+# The commit-msg hook enforces the Conventional Commits schema defined by
+# tools/commit_schema.py (the same validator the pr-title workflow runs on
+# PR titles). Versioning is NOT handled by commitizen/cz bump; versions
+# follow pytorch's rules (version.txt + tools/generate_tensorplay_version.py).
+
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.5
+    hooks:
+      - id: ruff
+        args: [--fix]
+
+  - repo: local
+    hooks:
+      - id: conventional-commit-msg
+        name: Conventional Commits commit-msg check
+        entry: python tools/commit_schema.py --commit-msg-file
+        language: python
+        stages: [commit-msg]
+        always_run: true

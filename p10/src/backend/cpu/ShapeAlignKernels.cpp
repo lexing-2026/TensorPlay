@@ -83,56 +83,93 @@ std::vector<Tensor> atleast_n_seq(const std::vector<Tensor>& tensors, int n) {
 
 namespace {
 
+// torch legacy type name used in expand()'s size-mismatch message
+// ("expand(torch.FloatTensor{[2, 3]}, size=[3]): ...").
+const char* torch_legacy_type_name(DType dt) {
+    switch (dt) {
+        case DType::Float32: return "torch.FloatTensor";
+        case DType::Float64: return "torch.DoubleTensor";
+        case DType::Float16: return "torch.HalfTensor";
+        case DType::BFloat16: return "torch.BFloat16Tensor";
+        case DType::Int64: return "torch.LongTensor";
+        case DType::Int32: return "torch.IntTensor";
+        case DType::Int16: return "torch.ShortTensor";
+        case DType::Int8: return "torch.CharTensor";
+        case DType::UInt8: return "torch.ByteTensor";
+        case DType::UInt16: return "torch.UInt16Tensor";
+        case DType::UInt32: return "torch.UInt32Tensor";
+        case DType::UInt64: return "torch.UInt64Tensor";
+        case DType::Bool: return "torch.BoolTensor";
+        case DType::ComplexFloat: return "torch.ComplexFloatTensor";
+        case DType::ComplexDouble: return "torch.ComplexDoubleTensor";
+        case DType::ComplexHalf: return "torch.ComplexHalfTensor";
+        default: return "torch.Tensor";
+    }
+}
+
+std::string fmt_dim_list(const std::vector<int64_t>& v) {
+    std::string s = "[";
+    for (size_t i = 0; i < v.size(); ++i) {
+        if (i) s += ", ";
+        s += std::to_string(v[i]);
+    }
+    s += "]";
+    return s;
+}
+
 Tensor expand_impl(const Tensor& self, const std::vector<int64_t>& size) {
+    // TensorShape.cpp expand + ExpandUtils.cpp inferExpandGeometryImpl.
     if (!self.defined()) TP_THROW(RuntimeError, "Tensor not defined");
     const int64_t ndim = self.dim();
     const int64_t new_ndim = static_cast<int64_t>(size.size());
 
     if (new_ndim < ndim) {
-        TP_THROW(RuntimeError,
-                 "expand(): the number of sizes provided must be greater or equal to the number "
-                 "of dimensions in the tensor.");
+        TP_THROW(RuntimeError, "expand(", torch_legacy_type_name(self.dtype()),
+                 "{", fmt_dim_list(static_cast<std::vector<int64_t>>(self.shape())),
+                 "}, size=", fmt_dim_list(size),
+                 "): the number of sizes provided (", new_ndim,
+                 ") must be greater or equal to the number of dimensions in the tensor (",
+                 ndim, ")");
     }
 
     std::vector<int64_t> new_sizes(size);
-    std::vector<int64_t> new_strides(new_ndim);
+    std::vector<int64_t> new_strides(new_ndim, 0);
+
+    // 0-d inputs expand to any shape with all-zero strides (upstream returns
+    // InferExpandGeometryResult(sizes, ndim) with zeroed strides).
+    if (ndim == 0) {
+        return self.as_strided(new_sizes, new_strides);
+    }
 
     for (int64_t i = new_ndim - 1; i >= 0; --i) {
-        const int64_t dim_index = ndim - 1 - (new_ndim - 1 - i);
-        if (dim_index >= 0) {
-            const int64_t size_dim = self.size(dim_index);
-            const int64_t stride_dim = self.stride(dim_index);
-            if (new_sizes[i] == -1) {
-                // torch ExpandUtils semantics: -1 infers the input dim size.
-                new_sizes[i] = size_dim;
-                new_strides[i] = stride_dim;
-            } else if (size_dim == 1 && new_sizes[i] > 1) {
-                new_strides[i] = 0;
-            } else if (size_dim == new_sizes[i]) {
-                new_strides[i] = stride_dim;
-            } else {
-                std::string tgt = "[";
-                std::string own = "[";
-                for (int64_t d = 0; d < new_ndim; ++d) {
-                    if (d) { tgt += ", "; }
-                    tgt += std::to_string(new_sizes[d]);
-                }
-                const auto own_sizes = static_cast<std::vector<int64_t>>(self.shape());
-                for (size_t d = 0; d < own_sizes.size(); ++d) {
-                    if (d) { own += ", "; }
-                    own += std::to_string(own_sizes[d]);
-                }
-                tgt += "]";
-                own += "]";
-                TP_THROW(RuntimeError, "The expanded size of the tensor (", new_sizes[i],
-                         ") must match the existing size (", size_dim,
-                         ") at non-singleton dimension ", i,
-                         ".  Target sizes: ", tgt, ".  Tensor sizes: ", own);
+        const int64_t offset = new_ndim - 1 - i;
+        const int64_t dim = ndim - 1 - offset;
+        int64_t sz = (dim >= 0) ? self.size(dim) : 1;
+        int64_t stride = (dim >= 0)
+                             ? self.stride(dim)
+                             : new_sizes[i + 1] * new_strides[i + 1];
+        int64_t target = new_sizes[i];
+        if (target == -1) {
+            if (dim < 0) {
+                TP_THROW(RuntimeError, "The expanded size of the tensor (", target,
+                         ") isn't allowed in a leading, non-existing dimension ", i);
             }
-        } else {
-            if (new_sizes[i] == -1) TP_THROW(RuntimeError, "expand(): invalid size -1");
-            new_strides[i] = 0;
+            target = sz;
         }
+        if (sz != target) {
+            if (sz != 1) {
+                TP_THROW(RuntimeError, "The expanded size of the tensor (", target,
+                         ") must match the existing size (", sz,
+                         ") at non-singleton dimension ", i,
+                         ".  Target sizes: ", fmt_dim_list(size),
+                         ".  Tensor sizes: ",
+                         fmt_dim_list(static_cast<std::vector<int64_t>>(self.shape())));
+            }
+            sz = target;
+            stride = 0;
+        }
+        new_sizes[i] = sz;
+        new_strides[i] = stride;
     }
     return self.as_strided(new_sizes, new_strides);
 }
@@ -168,9 +205,6 @@ void check_repeat_args(const Tensor& self, const std::vector<int64_t>& repeats,
         TP_THROW(RuntimeError,
                  "Number of dimensions of repeat dims can not be smaller than number of dimensions of tensor");
     }
-    for (const int64_t r : repeats) {
-        if (r < 0) TP_THROW(RuntimeError, "repeats can not be negative");
-    }
     const int64_t out_nd = static_cast<int64_t>(repeats.size());
     padded.assign(out_nd, 1);
     padded_strides.assign(out_nd, 0);
@@ -183,6 +217,20 @@ void check_repeat_args(const Tensor& self, const std::vector<int64_t>& repeats,
     for (int64_t i = 0; i < out_nd; ++i) {
         zero = zero || repeats[i] == 0;
         target[i] = padded[i] * repeats[i];
+    }
+    // Negative repeats surface through the output allocation exactly like
+    // upstream (at::empty -> check_size_nonnegative, EmptyTensor.h).
+    for (const int64_t x : target) {
+        if (x < 0) {
+            std::string sizes = "[";
+            for (size_t i = 0; i < target.size(); ++i) {
+                if (i) sizes += ", ";
+                sizes += std::to_string(target[i]);
+            }
+            sizes += "]";
+            TP_THROW(RuntimeError, "Trying to create tensor with negative dimension ",
+                     x, ": ", sizes);
+        }
     }
 }
 
@@ -472,38 +520,69 @@ Tensor tpsa_flatten(const Tensor& self, int64_t start_dim, int64_t end_dim) {
 }
 
 Tensor tpsa_unflatten(const Tensor& self, int64_t dim, const std::vector<int64_t>& sizes) {
+    // TensorShape.cpp unflatten_impl + handle_unflatten_exception: infer_size
+    // failures containing "is invalid for input of size" are rephrased; any
+    // other exception is re-raised prefixed with "unflatten got an unexpected
+    // error:".
     const int64_t nd = self.dim();
     dim = wrap_dim(dim, nd);
     if (sizes.empty()) TP_THROW(RuntimeError, "unflatten: sizes must be non-empty");
-    // at::infer_size semantics: at most one -1 may be inferred.
-    int64_t known = 1;
-    int64_t infer_idx = -1;
+
+    auto fmt = [&sizes]() {
+        std::string s = "[";
+        for (size_t i = 0; i < sizes.size(); ++i) {
+            if (i) s += ", ";
+            s += std::to_string(sizes[i]);
+        }
+        s += "]";
+        return s;
+    };
+    auto friendly_mismatch = [&]() {
+        TP_THROW(RuntimeError, "unflatten: Provided sizes ", fmt(),
+                 " don't multiply up to the size of dim ", dim, " (",
+                 self.size(dim), ") in the input tensor");
+    };
+    auto unexpected = [&](const std::string& what) {
+        TP_THROW(RuntimeError, "unflatten got an unexpected error:\n", what);
+    };
+
+    if (nd == 0) {
+        // torch reaches self.size(dim) on the 0-d tensor inside infer_size.
+        unexpected("Dimension specified as " + std::to_string(dim) +
+                   " but tensor has no dimensions");
+    }
+    const int64_t target = self.size(dim);
+
+    // at::infer_size_impl
+    std::vector<int64_t> inferred(sizes);
+    int64_t newsize = 1;
+    int64_t infer_dim = -1;
     for (size_t i = 0; i < sizes.size(); ++i) {
         if (sizes[i] == -1) {
-            if (infer_idx != -1) {
-                TP_THROW(RuntimeError, "unflatten: sizes must contain at most one -1");
-            }
-            infer_idx = static_cast<int64_t>(i);
-        } else if (sizes[i] < 0) {
-            TP_THROW(RuntimeError, "unflatten: sizes must be non-negative, got ", sizes[i]);
+            if (infer_dim != -1) unexpected("only one dimension can be inferred");
+            infer_dim = static_cast<int64_t>(i);
         } else {
-            known *= sizes[i];
+            if (sizes[i] <= -2) {
+                unexpected("invalid shape dimension " + std::to_string(sizes[i]) +
+                           " at index " + std::to_string(i) + " of shape " + fmt());
+            }
+            newsize *= sizes[i];
         }
     }
-    const int64_t target = (nd == 0) ? 1 : self.size(dim);
-    std::vector<int64_t> inferred(sizes);
-    if (infer_idx != -1) {
-        inferred[static_cast<size_t>(infer_idx)] = known == 0 ? 0 : target / known;
-        if (inferred[static_cast<size_t>(infer_idx)] * known != target) {
-            TP_THROW(RuntimeError,
-                     "unflatten: Provided sizes don't multiply up to the size of dim ",
-                     dim, " (", target, ") in the input tensor");
+    if (infer_dim != -1) {
+        if (!((newsize > 0 && target % newsize == 0) || target == newsize)) {
+            friendly_mismatch();
         }
-    } else if (known != target) {
-        TP_THROW(RuntimeError,
-                 "unflatten: Provided sizes don't multiply up to the size of dim ",
-                 dim, " (", target, ") in the input tensor");
+        if (newsize == 0) {
+            unexpected("cannot reshape tensor of 0 elements into shape " + fmt() +
+                       " because the unspecified dimension size -1 can be any "
+                       "value and is ambiguous");
+        }
+        inferred[static_cast<size_t>(infer_dim)] = target / newsize;
+    } else if (target != newsize) {
+        friendly_mismatch();
     }
+
     std::vector<int64_t> shape;
     shape.reserve(static_cast<size_t>(nd - 1) + inferred.size());
     for (int64_t i = 0; i < dim; ++i) shape.push_back(self.size(i));

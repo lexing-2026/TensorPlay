@@ -57,12 +57,12 @@ all = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/bluemoon-o2/tensorplay"
-Repository = "https://github.com/bluemoon-o2/tensorplay.git"
-Issues = "https://github.com/bluemoon-o2/tensorplay/issues"
-Changelog = "https://github.com/bluemoon-o2/tensorplay/blob/main/CHANGELOG.md"
-Documentation = "https://bluemoon-o2.github.io/tensorplay/"
-Contributing = "https://github.com/bluemoon-o2/tensorplay/blob/main/CONTRIBUTING.md"
+Homepage = "https://github.com/lexing-2026/TensorPlay"
+Repository = "https://github.com/lexing-2026/TensorPlay.git"
+Issues = "https://github.com/lexing-2026/TensorPlay/issues"
+Changelog = "https://github.com/lexing-2026/TensorPlay/blob/main/CHANGELOG.md"
+Documentation = "https://tensorplay.cn"
+Contributing = "https://github.com/lexing-2026/TensorPlay/blob/main/CONTRIBUTING.md"
 
 [[tool.dynamic-metadata]]
 # Delegates to tools/metadata/version.py which resolves the version from
@@ -141,8 +141,14 @@ dev = [
     "packaging>=24.2",
     "build",
     "pytest",
+    # Rerun flaky tests locally: pytest --reruns 2 (see CONTRIBUTING.md).
+    "pytest-rerunfailures",
     "numpy>=2.0.0",
     "typing-extensions>=4.0.0",
+    # Conventional Commits tooling: cz changelog drafts only; versions follow
+    # pytorch's rules, so cz bump is never used (see [tool.commitizen]).
+    "commitizen",
+    "pre-commit",
 ]
 
 # Linter tools #################################################################
@@ -172,3 +178,22 @@ ignore = [
 "__init__.py" = [
     "F401",  # re-exports
 ]
+
+# Conventional Commits (commitizen) ############################################
+# Used ONLY for changelog drafting (`cz changelog --dry-run`, see RELEASE.md).
+# cz bump is deliberately never run: versions follow pytorch's rules
+# (version.txt + tools/generate_tensorplay_version.py). Commit message
+# enforcement lives in tools/commit_schema.py (commit-msg hook + pr-title
+# workflow); its scope-enum maps 1:1 to the "release notes: *" labels.
+[tool.commitizen]
+name = "cz_conventional_commits"
+tag_format = "v$version"
+# Read the current version from git tags instead of duplicating version.txt.
+version_provider = "scm"
+changelog_merge_pr_sections = true
+
+[tool.commitizen.change_type_map]
+feat = "New Features"
+fix = "Bug fixes"
+perf = "Performance"
+refactor = "Improvements"

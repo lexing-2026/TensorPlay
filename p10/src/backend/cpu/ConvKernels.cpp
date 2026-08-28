@@ -40,7 +40,13 @@ struct ConvKey {
     int64_t groups;
     bool has_bias;
     bool fused_relu = false;
-    int type; // 0: fwd, 1: bwd_data, 2: bwd_weights
+    int type; // 0: fwd, 1: bwd_data, 2: bwd_weights, 4: deconv fwd, 6: deconv bwd_w
+    // Depth fields (3d convolutions / deconvolutions); defaulted so 2d keys
+    // keep working without touching them.
+    int64_t id = 1, od = 1, kd = 1;
+    int64_t sd = 1;
+    int64_t pd_f = 0, pd_k = 0;
+    int64_t dd = 1;
 
     bool operator==(const ConvKey& other) const {
         return n == other.n && ic == other.ic && ih == other.ih && iw == other.iw &&
@@ -50,7 +56,10 @@ struct ConvKey {
                ph_t == other.ph_t && ph_b == other.ph_b && pw_l == other.pw_l && pw_r == other.pw_r &&
                dh == other.dh && dw == other.dw &&
                groups == other.groups && has_bias == other.has_bias &&
-               fused_relu == other.fused_relu && type == other.type;
+               fused_relu == other.fused_relu && type == other.type &&
+               id == other.id && od == other.od && kd == other.kd &&
+               sd == other.sd && pd_f == other.pd_f && pd_k == other.pd_k &&
+               dd == other.dd;
     }
 };
 
@@ -68,6 +77,7 @@ namespace std {
             hc(k.ph_t); hc(k.ph_b); hc(k.pw_l); hc(k.pw_r);
             hc(k.dh); hc(k.dw);
             hc(k.groups); hc(k.has_bias); hc(k.fused_relu); hc(k.type);
+            hc(k.id); hc(k.od); hc(k.kd); hc(k.sd); hc(k.pd_f); hc(k.pd_k); hc(k.dd);
             return h;
         }
     };
@@ -957,6 +967,13 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
         auto expected_dst_md = pd.dst_desc();
 
         struct CachedWeight {
+            // The map is keyed by a raw TensorImpl pointer, which the heap
+            // can hand out again after the owning tensor dies.  Holding a
+            // weak_ptr per entry lets lookups detect that the key was
+            // recycled; without it a recycled impl/data address and a zeroed
+            // version counter falsely match and the conv silently runs with
+            // a dead tensor's reordered weights.
+            std::weak_ptr<TensorImpl> owner;
             const void* data;
             uint32_t version;
             memory::desc source_md;
@@ -964,13 +981,15 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
             Storage storage;
 
             CachedWeight(
+                std::weak_ptr<TensorImpl> owner_,
                 const void* data_,
                 uint32_t version_,
                 const memory::desc& source_md_,
                 const memory::desc& expected_md_,
                 const Storage& storage_)
-                : data(data_), version(version_), source_md(source_md_),
-                  expected_md(expected_md_), storage(storage_) {}
+                : owner(std::move(owner_)), data(data_), version(version_),
+                  source_md(source_md_), expected_md(expected_md_),
+                  storage(storage_) {}
         };
         static std::unordered_map<const TensorImpl*, std::vector<CachedWeight>> weight_cache;
         static std::mutex weight_cache_mutex;
@@ -1045,8 +1064,22 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
             std::lock_guard<std::mutex> lock(weight_cache_mutex);
             auto it = weight_cache.find(weight_impl);
             if (it == weight_cache.end()) return false;
-            for (const auto& cached : it->second) {
-                if (cached.data == weight_data && cached.version == weight_version &&
+            auto& entries = it->second;
+            // A cached entry whose owning TensorImpl died must never be
+            // reused: the raw key may now belong to an unrelated tensor.
+            entries.erase(
+                std::remove_if(entries.begin(), entries.end(),
+                               [](const CachedWeight& cached) {
+                                   return cached.owner.expired();
+                               }),
+                entries.end());
+            if (entries.empty()) {
+                weight_cache.erase(it);
+                return false;
+            }
+            for (const auto& cached : entries) {
+                if (cached.owner.lock().get() == weight_impl &&
+                    cached.data == weight_data && cached.version == weight_version &&
                     cached.source_md == source_md &&
                     cached.expected_md == expected_weights_md) {
                     reordered_weight_storage = cached.storage;
@@ -1062,17 +1095,20 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
             if (!cache_weight) return;
             std::lock_guard<std::mutex> lock(weight_cache_mutex);
             auto& entries = weight_cache[weight_impl];
+            // Expired entries under this key belong to a dead tensor whose
+            // address was recycled; drop them before inserting the live one.
             entries.erase(
                 std::remove_if(
                     entries.begin(), entries.end(),
                     [&](const CachedWeight& cached) {
-                        return cached.source_md == source_md &&
-                               cached.expected_md == expected_weights_md;
+                        return cached.owner.expired() ||
+                               (cached.source_md == source_md &&
+                                cached.expected_md == expected_weights_md);
                     }),
                 entries.end());
             entries.emplace_back(
-                weight_data, weight_version, source_md, expected_weights_md,
-                reordered_weight_storage);
+                weight.unsafeGetTensorImpl(), weight_data, weight_version,
+                source_md, expected_weights_md, reordered_weight_storage);
         };
         
         if (weight.unsafeGetTensorImpl()->has_onednn_md()) {
@@ -2444,7 +2480,9 @@ Tensor conv3d_cpu(const Tensor& input_arg, const Tensor& weight_arg, const Tenso
 // aten/src/ATen/native/mkldnn/Conv.cpp, the transpose is expressed as a
 // strides-only view (no copy); the reorder into the blocked layout the
 // primitive wants is cached per parameter (TensorImpl + version), so steady
-// state training pays it once.  output_padding extends padding_r.
+// state training pays it once.  oneDNN deconv computes
+// osize = (isize-1)*s - pad_l - pad_r + d*(k-1) + 1, hence
+// pad_l = padding, pad_r = padding - output_padding.
 namespace {
 
 struct CachedDeconvWeight {
@@ -2486,8 +2524,8 @@ static bool conv_transpose2d_onednn(const Tensor& input, const Tensor& weight, c
         key.oc = C_out; key.kh = kH; key.kw = kW;
         key.oh = H_out; key.ow = W_out;
         key.sh = stride[0]; key.sw = stride[1];
-        key.ph_t = padding[0]; key.ph_b = padding[0] + output_padding[0];
-        key.pw_l = padding[1]; key.pw_r = padding[1] + output_padding[1];
+        key.ph_t = padding[0]; key.ph_b = padding[0] - output_padding[0];
+        key.pw_l = padding[1]; key.pw_r = padding[1] - output_padding[1];
         key.dh = dilation[0]; key.dw = dilation[1];
         key.groups = groups;
         key.has_bias = (bias_c.defined() && bias_c.numel() > 0);
@@ -2526,7 +2564,12 @@ static bool conv_transpose2d_onednn(const Tensor& input, const Tensor& weight, c
         if (!found) {
             auto src_md = memory::desc(src_dims, memory::data_type::f32, memory::format_tag::any);
             auto dst_md = memory::desc(dst_dims, memory::data_type::f32, memory::format_tag::any);
-            auto weights_md = memory::desc(weights_dims, memory::data_type::f32, weight_strides);
+            // Weights must be queried as any: the fast brgemm deconv kernel
+            // (brgconv_strided) rejects the transposed-stride user view and
+            // would fall back to the gemm-based reference deconvolution.  The
+            // reorder from the transposed view into the blocked layout the
+            // primitive picks is cached below.
+            auto weights_md = memory::desc(weights_dims, memory::data_type::f32, memory::format_tag::any);
             memory::desc bias_md;
             if (key.has_bias) {
                 int64_t b_sz = (bias_c.dim() == 0) ? 1 : bias_c.size(0);
@@ -2538,8 +2581,10 @@ static bool conv_transpose2d_onednn(const Tensor& input, const Tensor& weight, c
             memory::dims strides_dims = {stride[0], stride[1]};
             memory::dims dilates_dims = {dilation[0] - 1, dilation[1] - 1};
             memory::dims padding_l_dims = {padding[0], padding[1]};
-            memory::dims padding_r_dims = {padding[0] + output_padding[0],
-                                           padding[1] + output_padding[1]};
+            // oneDNN deconv: osize = (isize-1)*s - pad_l - pad_r + d*(k-1) + 1,
+            // so pad_r = padding - output_padding (see torch mkldnn Utils.h).
+            memory::dims padding_r_dims = {padding[0] - output_padding[0],
+                                           padding[1] - output_padding[1]};
 
             auto deconv_pd = deconvolution_forward::primitive_desc(
                 eng, prop_kind::forward_inference, algorithm::deconvolution_direct,
@@ -2714,9 +2759,37 @@ static bool conv_transpose3d_onednn(const Tensor& input, const Tensor& weight, c
         const int64_t kD = weight_c.size(2), kH = weight_c.size(3), kW = weight_c.size(4);
         const int64_t C_out_g = weight_c.size(1), C_in_g = C_in / groups;
 
-        // ConvKey has no depth fields, so the 3d primitive descriptor is
-        // created per call (same as conv3d_onednn); the weight reorder cache
-        // below is keyed by TensorImpl/version and is safe regardless.
+        ConvKey key;
+        key.n = N; key.ic = C_in; key.ih = H_in; key.iw = W_in;
+        key.oc = C_out; key.kh = kH; key.kw = kW;
+        key.oh = H_out; key.ow = W_out;
+        key.sh = stride[1]; key.sw = stride[2];
+        key.ph_t = padding[1]; key.ph_b = padding[1] - output_padding[1];
+        key.pw_l = padding[2]; key.pw_r = padding[2] - output_padding[2];
+        key.dh = dilation[1]; key.dw = dilation[2];
+        key.id = D_in; key.od = D_out; key.kd = kD;
+        key.sd = stride[0]; key.pd_f = padding[0]; key.pd_k = padding[0] - output_padding[0];
+        key.dd = dilation[0];
+        key.groups = groups;
+        key.has_bias = (bias_c.defined() && bias_c.numel() > 0);
+        key.fused_relu = false;
+        key.type = 5; // Deconv3d forward
+
+        struct CachedDeconv3d {
+            deconvolution_forward::primitive_desc pd;
+            deconvolution_forward prim;
+        };
+        static std::unordered_map<ConvKey, CachedDeconv3d> cache;
+        static std::mutex mtx;
+
+        CachedDeconv3d cached_entry;
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            auto it = cache.find(key);
+            if (it != cache.end()) { cached_entry = it->second; found = true; }
+        }
+
         memory::dims src_dims = {N, C_in, D_in, H_in, W_in};
         memory::dims dst_dims = {N, C_out, D_out, H_out, W_out};
         // oneDNN deconv weights: [g, C_out/g, C_in/g, kD, kH, kW]; strides
@@ -2731,31 +2804,38 @@ static bool conv_transpose3d_onednn(const Tensor& input, const Tensor& weight, c
             weight_strides = {kD * kH * kW, C_out * kD * kH * kW, kH * kW, kW, 1};
         }
 
-        auto src_md = memory::desc(src_dims, memory::data_type::f32, memory::format_tag::any);
-        auto dst_md = memory::desc(dst_dims, memory::data_type::f32, memory::format_tag::any);
-        auto weights_md = memory::desc(weights_dims, memory::data_type::f32, weight_strides);
-        memory::desc bias_md;
-        if (bias_c.defined() && bias_c.numel() > 0) {
-            int64_t b_sz = (bias_c.dim() == 0) ? 1 : bias_c.size(0);
-            bias_md = memory::desc({b_sz}, memory::data_type::f32, memory::format_tag::any);
-        } else {
-            bias_md = memory::desc();
+        if (!found) {
+            auto src_md = memory::desc(src_dims, memory::data_type::f32, memory::format_tag::any);
+            auto dst_md = memory::desc(dst_dims, memory::data_type::f32, memory::format_tag::any);
+            // Weights queried as any so the brgemm deconv kernel is selected;
+            // the transposed-stride user view is reordered below (cached).
+            auto weights_md = memory::desc(weights_dims, memory::data_type::f32, memory::format_tag::any);
+            memory::desc bias_md;
+            if (key.has_bias) {
+                int64_t b_sz = (bias_c.dim() == 0) ? 1 : bias_c.size(0);
+                bias_md = memory::desc({b_sz}, memory::data_type::f32, memory::format_tag::any);
+            } else {
+                bias_md = memory::desc();
+            }
+
+            memory::dims strides_dims = {stride[0], stride[1], stride[2]};
+            memory::dims dilates_dims = {dilation[0] - 1, dilation[1] - 1, dilation[2] - 1};
+            memory::dims padding_l_dims = {padding[0], padding[1], padding[2]};
+            memory::dims padding_r_dims = {padding[0] - output_padding[0],
+                                           padding[1] - output_padding[1],
+                                           padding[2] - output_padding[2]};
+
+            auto deconv_pd = deconvolution_forward::primitive_desc(
+                eng, prop_kind::forward_inference, algorithm::deconvolution_direct,
+                src_md, weights_md, bias_md, dst_md,
+                strides_dims, dilates_dims, padding_l_dims, padding_r_dims);
+            cached_entry = {deconv_pd, deconvolution_forward(deconv_pd)};
+            std::lock_guard<std::mutex> lock(mtx);
+            cache.insert({key, cached_entry});
         }
 
-        memory::dims strides_dims = {stride[0], stride[1], stride[2]};
-        memory::dims dilates_dims = {dilation[0] - 1, dilation[1] - 1, dilation[2] - 1};
-        memory::dims padding_l_dims = {padding[0], padding[1], padding[2]};
-        memory::dims padding_r_dims = {padding[0] + output_padding[0],
-                                       padding[1] + output_padding[1],
-                                       padding[2] + output_padding[2]};
-
-        auto deconv_pd = deconvolution_forward::primitive_desc(
-            eng, prop_kind::forward_inference, algorithm::deconvolution_direct,
-            src_md, weights_md, bias_md, dst_md,
-            strides_dims, dilates_dims, padding_l_dims, padding_r_dims);
-        auto prim = deconvolution_forward(deconv_pd);
-
-        auto& pd = deconv_pd;
+        auto& prim = cached_entry.prim;
+        auto& pd = cached_entry.pd;
         auto expected_src_md = pd.src_desc();
         auto expected_weights_md = pd.weights_desc();
         auto expected_dst_md = pd.dst_desc();
@@ -2884,8 +2964,12 @@ static bool conv_transpose3d_onednn(const Tensor& input, const Tensor& weight, c
         }
         return true;
     } catch (dnnl::error& e) {
+        if (std::getenv("TP_DBG_DECONV"))
+            std::cerr << "[deconv3d] dnnl error: " << e.what() << " status=" << (int)e.status << std::endl;
         return false;
     } catch (...) {
+        if (std::getenv("TP_DBG_DECONV"))
+            std::cerr << "[deconv3d] unknown error" << std::endl;
         return false;
     }
 }
@@ -3716,16 +3800,20 @@ Tensor conv3d_grad_bias_cpu(const Tensor& grad_output, const Tensor& input, cons
     if (grad_output_contig.dtype() == DType::Float32) {
         float* gb_ptr = grad_bias.data_ptr<float>();
         const float* go_ptr = grad_output_contig.data_ptr<float>();
-        
-        for (int64_t n = 0; n < N; ++n) {
-            for (int64_t c = 0; c < C_out; ++c) {
-                float sum = 0.0f;
-                for (int64_t i = 0; i < D_out * H_out * W_out; ++i) {
-                    sum += go_ptr[(n * C_out + c) * D_out * H_out * W_out + i];
+
+        const int64_t spatial = D_out * H_out * W_out;
+        parallel_for(0, C_out, 1, [&](int64_t begin, int64_t end) {
+        for (int64_t c = begin; c < end; ++c) {
+            double sum = 0.0;
+            for (int64_t n = 0; n < N; ++n) {
+                const float* ptr = go_ptr + (n * C_out + c) * spatial;
+                for (int64_t i = 0; i < spatial; ++i) {
+                    sum += ptr[i];
                 }
-                gb_ptr[c] += sum;
             }
+            gb_ptr[c] = (float)sum;
         }
+        });
     } else {
          TP_THROW(NotImplementedError, "conv3d_grad_bias only supports Float32");
     }
@@ -3754,11 +3842,332 @@ Tensor conv_transpose2d_grad_input_cpu(const Tensor& grad_output, const Tensor& 
     return grad_input;
 }
 
+// oneDNN deconvolution backward_weights for conv_transpose grad_weight.
+// Delegating to conv_grad_weight with (input, grad_output) fails oneDNN's
+// channel check (transpose weights are IOHW, not OIHW) and silently falls
+// back to the slow im2col path.  Use the native deconvolution
+// backward_weights primitive instead: src=input, diff_dst=grad_output,
+// diff_weights produced in oneDNN's layout and reordered into the user's
+// IOHW buffer through a strides-only view.
+static bool conv_transpose2d_grad_weight_onednn(const Tensor& grad_output, const Tensor& input, const Tensor& weight,
+                                                const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
+                                                const std::vector<int64_t>& output_padding, const std::vector<int64_t>& dilation,
+                                                int64_t groups, Tensor& grad_weight) {
+    if (!OneDNNContext::is_enabled()) return false;
+    if (input.dtype() != DType::Float32) return false;
+
+    try {
+        auto& eng = OneDNNContext::get_engine();
+        auto& s = OneDNNContext::get_stream();
+
+        Tensor input_c = input.contiguous();
+        Tensor go_c = grad_output.contiguous();
+
+        const int64_t N = input_c.size(0), C_in = input_c.size(1);
+        const int64_t H_in = input_c.size(2), W_in = input_c.size(3);
+        const int64_t C_out = go_c.size(1);
+        const int64_t H_out = go_c.size(2), W_out = go_c.size(3);
+        const int64_t kH = weight.size(2), kW = weight.size(3);
+        const int64_t C_out_g = weight.size(1), C_in_g = C_in / groups;
+
+        ConvKey key;
+        key.n = N; key.ic = C_in; key.ih = H_in; key.iw = W_in;
+        key.oc = C_out; key.kh = kH; key.kw = kW;
+        key.oh = H_out; key.ow = W_out;
+        key.sh = stride[0]; key.sw = stride[1];
+        key.ph_t = padding[0]; key.ph_b = padding[0] - output_padding[0];
+        key.pw_l = padding[1]; key.pw_r = padding[1] - output_padding[1];
+        key.dh = dilation[0]; key.dw = dilation[1];
+        key.groups = groups;
+        key.has_bias = false;
+        key.fused_relu = false;
+        key.type = 6; // Deconv bwd weights
+
+        struct CachedDeconvBwdW {
+            deconvolution_forward::primitive_desc fwd_pd;
+            deconvolution_backward_weights::primitive_desc pd;
+            deconvolution_backward_weights prim;
+        };
+        static std::unordered_map<ConvKey, CachedDeconvBwdW> cache;
+        static std::mutex mtx;
+
+        CachedDeconvBwdW cached_entry;
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            auto it = cache.find(key);
+            if (it != cache.end()) { cached_entry = it->second; found = true; }
+        }
+
+        memory::dims src_dims = {N, C_in, H_in, W_in};
+        memory::dims dst_dims = {N, C_out, H_out, W_out};
+        // deconv weights in logical OIHW order; the strides below realize the
+        // user's IOHW grad_weight buffer (same transposed view as fwd weights).
+        memory::dims weights_dims, user_gw_strides;
+        if (groups > 1) {
+            weights_dims = {groups, C_out_g, C_in_g, kH, kW};
+            user_gw_strides = {C_in_g * C_out_g * kH * kW, kH * kW,
+                               C_out_g * kH * kW, kW, 1};
+        } else {
+            weights_dims = {C_out, C_in, kH, kW};
+            user_gw_strides = {kH * kW, C_out * kH * kW, kW, 1};
+        }
+
+        if (!found) {
+            auto src_md = memory::desc(src_dims, memory::data_type::f32, memory::format_tag::any);
+            auto dst_md = memory::desc(dst_dims, memory::data_type::f32, memory::format_tag::any);
+            auto weights_md = memory::desc(weights_dims, memory::data_type::f32, memory::format_tag::any);
+
+            memory::dims strides_dims = {stride[0], stride[1]};
+            memory::dims dilates_dims = {dilation[0] - 1, dilation[1] - 1};
+            memory::dims padding_l_dims = {padding[0], padding[1]};
+            memory::dims padding_r_dims = {padding[0] - output_padding[0],
+                                           padding[1] - output_padding[1]};
+
+            auto fwd_pd = deconvolution_forward::primitive_desc(
+                eng, prop_kind::forward_training, algorithm::deconvolution_direct,
+                src_md, weights_md, dst_md,
+                strides_dims, dilates_dims, padding_l_dims, padding_r_dims);
+            auto bwd_pd = deconvolution_backward_weights::primitive_desc(
+                eng, algorithm::deconvolution_direct,
+                src_md, weights_md, dst_md,
+                strides_dims, dilates_dims, padding_l_dims, padding_r_dims, fwd_pd);
+            cached_entry = {fwd_pd, bwd_pd, deconvolution_backward_weights(bwd_pd)};
+            std::lock_guard<std::mutex> lock(mtx);
+            cache.insert({key, cached_entry});
+        }
+
+        auto& prim = cached_entry.prim;
+        auto& pd = cached_entry.pd;
+        auto expected_src_md = pd.src_desc();
+        auto expected_diff_dst_md = pd.diff_dst_desc();
+        auto expected_dw_md = pd.diff_weights_desc();
+
+        // 1. src = input
+        memory src_mem;
+        Storage src_storage;
+        auto user_src_md = memory::desc(src_dims, memory::data_type::f32, memory::format_tag::nchw);
+        auto user_src_mem = memory(user_src_md, eng, input_c.data_ptr<float>());
+        if (expected_src_md != user_src_md) {
+            src_storage = Storage(expected_src_md.get_size(), getAllocator(input_c.device().type()));
+            src_mem = memory(expected_src_md, eng, src_storage.data());
+            reorder(user_src_mem, src_mem).execute(s, user_src_mem, src_mem);
+        } else {
+            src_mem = user_src_mem;
+        }
+
+        // 2. diff_dst = grad_output
+        memory diff_dst_mem;
+        Storage diff_dst_storage;
+        auto user_dst_md = memory::desc(dst_dims, memory::data_type::f32, memory::format_tag::nchw);
+        auto user_dst_mem = memory(user_dst_md, eng, go_c.data_ptr<float>());
+        if (expected_diff_dst_md != user_dst_md) {
+            diff_dst_storage = Storage(expected_diff_dst_md.get_size(), getAllocator(go_c.device().type()));
+            diff_dst_mem = memory(expected_diff_dst_md, eng, diff_dst_storage.data());
+            reorder(user_dst_mem, diff_dst_mem).execute(s, user_dst_mem, diff_dst_mem);
+        } else {
+            diff_dst_mem = user_dst_mem;
+        }
+
+        // 3. diff_weights into oneDNN's layout, then reorder to user IOHW.
+        Storage dw_storage(expected_dw_md.get_size(), getAllocator(grad_weight.device().type()));
+        memory dw_mem(expected_dw_md, eng, dw_storage.data());
+
+        std::unordered_map<int, memory> args;
+        args.insert({DNNL_ARG_SRC, src_mem});
+        args.insert({DNNL_ARG_DIFF_DST, diff_dst_mem});
+        args.insert({DNNL_ARG_DIFF_WEIGHTS, dw_mem});
+
+        Storage scratch_storage_handle;
+        if (pd.scratchpad_desc().get_size() > 0) {
+            scratch_storage_handle = Storage(pd.scratchpad_desc().get_size(),
+                                             getAllocator(grad_weight.device().type()));
+            args.insert({DNNL_ARG_SCRATCHPAD,
+                         memory(pd.scratchpad_desc(), eng, scratch_storage_handle.data())});
+        }
+
+        prim.execute(s, args);
+
+        auto user_gw_md = memory::desc(weights_dims, memory::data_type::f32, user_gw_strides);
+        auto user_gw_mem = memory(user_gw_md, eng, grad_weight.data_ptr<float>());
+        reorder(dw_mem, user_gw_mem).execute(s, dw_mem, user_gw_mem);
+
+        s.wait();
+        return true;
+    } catch (dnnl::error& e) {
+        if (std::getenv("TP_DBG_DECONV"))
+            std::cerr << "[deconv2d bwd_w] dnnl error: " << e.what() << std::endl;
+        return false;
+    } catch (...) {
+        return false;
+    }
+}
+
+static bool conv_transpose3d_grad_weight_onednn(const Tensor& grad_output, const Tensor& input, const Tensor& weight,
+                                                const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
+                                                const std::vector<int64_t>& output_padding, const std::vector<int64_t>& dilation,
+                                                int64_t groups, Tensor& grad_weight) {
+    if (!OneDNNContext::is_enabled()) return false;
+    if (input.dtype() != DType::Float32) return false;
+
+    try {
+        auto& eng = OneDNNContext::get_engine();
+        auto& s = OneDNNContext::get_stream();
+
+        Tensor input_c = input.contiguous();
+        Tensor go_c = grad_output.contiguous();
+
+        const int64_t N = input_c.size(0), C_in = input_c.size(1);
+        const int64_t D_in = input_c.size(2), H_in = input_c.size(3), W_in = input_c.size(4);
+        const int64_t C_out = go_c.size(1);
+        const int64_t D_out = go_c.size(2), H_out = go_c.size(3), W_out = go_c.size(4);
+        const int64_t kD = weight.size(2), kH = weight.size(3), kW = weight.size(4);
+        const int64_t C_out_g = weight.size(1), C_in_g = C_in / groups;
+
+        ConvKey key;
+        key.n = N; key.ic = C_in; key.ih = H_in; key.iw = W_in;
+        key.oc = C_out; key.kh = kH; key.kw = kW;
+        key.oh = H_out; key.ow = W_out;
+        key.sh = stride[1]; key.sw = stride[2];
+        key.ph_t = padding[1]; key.ph_b = padding[1] - output_padding[1];
+        key.pw_l = padding[2]; key.pw_r = padding[2] - output_padding[2];
+        key.dh = dilation[1]; key.dw = dilation[2];
+        key.id = D_in; key.od = D_out; key.kd = kD;
+        key.sd = stride[0]; key.pd_f = padding[0]; key.pd_k = padding[0] - output_padding[0];
+        key.dd = dilation[0];
+        key.groups = groups;
+        key.has_bias = false;
+        key.fused_relu = false;
+        key.type = 7; // Deconv3d bwd weights
+
+        struct CachedDeconv3dBwdW {
+            deconvolution_forward::primitive_desc fwd_pd;
+            deconvolution_backward_weights::primitive_desc bwd_pd;
+            deconvolution_backward_weights prim;
+        };
+        static std::unordered_map<ConvKey, CachedDeconv3dBwdW> cache;
+        static std::mutex mtx;
+
+        CachedDeconv3dBwdW cached_entry;
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            auto it = cache.find(key);
+            if (it != cache.end()) { cached_entry = it->second; found = true; }
+        }
+
+        memory::dims src_dims = {N, C_in, D_in, H_in, W_in};
+        memory::dims dst_dims = {N, C_out, D_out, H_out, W_out};
+        memory::dims weights_dims, user_gw_strides;
+        if (groups > 1) {
+            weights_dims = {groups, C_out_g, C_in_g, kD, kH, kW};
+            user_gw_strides = {C_in_g * C_out_g * kD * kH * kW, kD * kH * kW,
+                               C_out_g * kD * kH * kW, kH * kW, kW, 1};
+        } else {
+            weights_dims = {C_out, C_in, kD, kH, kW};
+            user_gw_strides = {kD * kH * kW, C_out * kD * kH * kW, kH * kW, kW, 1};
+        }
+
+        if (!found) {
+            auto src_md = memory::desc(src_dims, memory::data_type::f32, memory::format_tag::any);
+            auto dst_md = memory::desc(dst_dims, memory::data_type::f32, memory::format_tag::any);
+            auto weights_md = memory::desc(weights_dims, memory::data_type::f32, memory::format_tag::any);
+
+            memory::dims strides_dims = {stride[0], stride[1], stride[2]};
+            memory::dims dilates_dims = {dilation[0] - 1, dilation[1] - 1, dilation[2] - 1};
+            memory::dims padding_l_dims = {padding[0], padding[1], padding[2]};
+            memory::dims padding_r_dims = {padding[0] - output_padding[0],
+                                           padding[1] - output_padding[1],
+                                           padding[2] - output_padding[2]};
+
+            auto fwd_pd = deconvolution_forward::primitive_desc(
+                eng, prop_kind::forward_training, algorithm::deconvolution_direct,
+                src_md, weights_md, dst_md,
+                strides_dims, dilates_dims, padding_l_dims, padding_r_dims);
+            auto bwd_pd = deconvolution_backward_weights::primitive_desc(
+                eng, algorithm::deconvolution_direct,
+                src_md, weights_md, dst_md,
+                strides_dims, dilates_dims, padding_l_dims, padding_r_dims, fwd_pd);
+            cached_entry = {fwd_pd, bwd_pd, deconvolution_backward_weights(bwd_pd)};
+            std::lock_guard<std::mutex> lock(mtx);
+            cache.insert({key, cached_entry});
+        }
+
+        auto& prim = cached_entry.prim;
+        auto& pd = cached_entry.bwd_pd;
+        auto expected_src_md = pd.src_desc();
+        auto expected_diff_dst_md = pd.diff_dst_desc();
+        auto expected_dw_md = pd.diff_weights_desc();
+
+        memory src_mem;
+        Storage src_storage;
+        auto user_src_md = memory::desc(src_dims, memory::data_type::f32, memory::format_tag::ncdhw);
+        auto user_src_mem = memory(user_src_md, eng, input_c.data_ptr<float>());
+        if (expected_src_md != user_src_md) {
+            src_storage = Storage(expected_src_md.get_size(), getAllocator(input_c.device().type()));
+            src_mem = memory(expected_src_md, eng, src_storage.data());
+            reorder(user_src_mem, src_mem).execute(s, user_src_mem, src_mem);
+        } else {
+            src_mem = user_src_mem;
+        }
+
+        memory diff_dst_mem;
+        Storage diff_dst_storage;
+        auto user_dst_md = memory::desc(dst_dims, memory::data_type::f32, memory::format_tag::ncdhw);
+        auto user_dst_mem = memory(user_dst_md, eng, go_c.data_ptr<float>());
+        if (expected_diff_dst_md != user_dst_md) {
+            diff_dst_storage = Storage(expected_diff_dst_md.get_size(), getAllocator(go_c.device().type()));
+            diff_dst_mem = memory(expected_diff_dst_md, eng, diff_dst_storage.data());
+            reorder(user_dst_mem, diff_dst_mem).execute(s, user_dst_mem, diff_dst_mem);
+        } else {
+            diff_dst_mem = user_dst_mem;
+        }
+
+        Storage dw_storage(expected_dw_md.get_size(), getAllocator(grad_weight.device().type()));
+        memory dw_mem(expected_dw_md, eng, dw_storage.data());
+
+        std::unordered_map<int, memory> args;
+        args.insert({DNNL_ARG_SRC, src_mem});
+        args.insert({DNNL_ARG_DIFF_DST, diff_dst_mem});
+        args.insert({DNNL_ARG_DIFF_WEIGHTS, dw_mem});
+
+        Storage scratch_storage_handle;
+        if (pd.scratchpad_desc().get_size() > 0) {
+            scratch_storage_handle = Storage(pd.scratchpad_desc().get_size(),
+                                             getAllocator(grad_weight.device().type()));
+            args.insert({DNNL_ARG_SCRATCHPAD,
+                         memory(pd.scratchpad_desc(), eng, scratch_storage_handle.data())});
+        }
+
+        prim.execute(s, args);
+
+        auto user_gw_md = memory::desc(weights_dims, memory::data_type::f32, user_gw_strides);
+        auto user_gw_mem = memory(user_gw_md, eng, grad_weight.data_ptr<float>());
+        reorder(dw_mem, user_gw_mem).execute(s, dw_mem, user_gw_mem);
+
+        s.wait();
+        return true;
+    } catch (dnnl::error& e) {
+        if (std::getenv("TP_DBG_DECONV"))
+            std::cerr << "[deconv3d bwd_w] dnnl error: " << e.what() << std::endl;
+        return false;
+    } catch (...) {
+        return false;
+    }
+}
+
 Tensor conv_transpose2d_grad_weight_cpu(const Tensor& grad_output, const Tensor& input, const Tensor& weight, const std::vector<int64_t>& stride, const std::vector<int64_t>& padding, const std::vector<int64_t>& output_padding, int64_t groups, const std::vector<int64_t>& dilation) {
     // aten convolution_backward (transposed): swap input/grad_output and run the
     // plain conv weight gradient. im2col runs over grad_output (the large tensor),
     // the MM against input (the small one); output_padding rows fall outside the
     // conv windows and correctly do not contribute.
+    if (input.dtype() == DType::Float32) {
+        Tensor gw = Tensor::empty(static_cast<std::vector<int64_t>>(weight.shape()), input.dtype(), input.device());
+        if (conv_transpose2d_grad_weight_onednn(grad_output, input, weight, stride, padding,
+                                                output_padding, dilation, groups, gw)) {
+            return gw;
+        }
+    }
     return conv2d_grad_weight_cpu(input, grad_output, weight, stride, padding, dilation, groups);
 }
 
@@ -3780,6 +4189,13 @@ Tensor conv_transpose3d_grad_input_cpu(const Tensor& grad_output, const Tensor& 
 }
 
 Tensor conv_transpose3d_grad_weight_cpu(const Tensor& grad_output, const Tensor& input, const Tensor& weight, const std::vector<int64_t>& stride, const std::vector<int64_t>& padding, const std::vector<int64_t>& output_padding, int64_t groups, const std::vector<int64_t>& dilation) {
+    if (input.dtype() == DType::Float32) {
+        Tensor gw = Tensor::empty(static_cast<std::vector<int64_t>>(weight.shape()), input.dtype(), input.device());
+        if (conv_transpose3d_grad_weight_onednn(grad_output, input, weight, stride, padding,
+                                                output_padding, dilation, groups, gw)) {
+            return gw;
+        }
+    }
     return conv3d_grad_weight_cpu(input, grad_output, weight, stride, padding, dilation, groups);
 }
 
@@ -4439,7 +4855,7 @@ Tensor im2col_cpu(const Tensor& self, const std::vector<int64_t>& kernel_size,
         case DType::Float32: {
             const float* in_p = input.data_ptr<float>();
             float* out_p = out.data_ptr<float>();
-            parallel_for(0, N, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+            parallel_for(0, N, 1, [&](int64_t begin, int64_t end) {
                 for (int64_t n = begin; n < end; ++n)
                     im2col<float>(in_p + n * frame, C, H, W, kernel_size[0], kernel_size[1],
                                   padding[0], padding[1], stride[0], stride[1],
@@ -4450,7 +4866,7 @@ Tensor im2col_cpu(const Tensor& self, const std::vector<int64_t>& kernel_size,
         case DType::Float64: {
             const double* in_p = input.data_ptr<double>();
             double* out_p = out.data_ptr<double>();
-            parallel_for(0, N, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+            parallel_for(0, N, 1, [&](int64_t begin, int64_t end) {
                 for (int64_t n = begin; n < end; ++n)
                     im2col<double>(in_p + n * frame, C, H, W, kernel_size[0], kernel_size[1],
                                    padding[0], padding[1], stride[0], stride[1],
@@ -4528,7 +4944,7 @@ Tensor col2im_cpu(const Tensor& self, const std::vector<int64_t>& output_size,
         case DType::Float32: {
             const float* in_p = input.data_ptr<float>();
             float* out_p = out.data_ptr<float>();
-            parallel_for(0, N, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+            parallel_for(0, N, 1, [&](int64_t begin, int64_t end) {
                 for (int64_t n = begin; n < end; ++n)
                     col2im<float>(in_p + n * in_frame, C, H, W, kernel_size[0], kernel_size[1],
                                   padding[0], padding[1], stride[0], stride[1],
@@ -4539,7 +4955,7 @@ Tensor col2im_cpu(const Tensor& self, const std::vector<int64_t>& output_size,
         case DType::Float64: {
             const double* in_p = input.data_ptr<double>();
             double* out_p = out.data_ptr<double>();
-            parallel_for(0, N, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+            parallel_for(0, N, 1, [&](int64_t begin, int64_t end) {
                 for (int64_t n = begin; n < end; ++n)
                     col2im<double>(in_p + n * in_frame, C, H, W, kernel_size[0], kernel_size[1],
                                    padding[0], padding[1], stride[0], stride[1],

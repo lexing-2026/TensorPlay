@@ -9,6 +9,7 @@
 #include "Storage.h"
 #include "DataPtr.h"
 #include "Node.h" // For grad_fn
+#include "AccumulateGrad.h" // lazy grad_accumulator creation
 #include "Utils.h" // broadcast shape validation for indexed assignment
 #include "TypePromotion.h" // complex weak-scalar reflected-op dtype rules
 #include <mutex>
@@ -1798,7 +1799,24 @@ void init_tensor(py::module_& m) {
             return tensorplay::tpx::impl::output_nr(self);
         })
         .def_property_readonly("_accumulate_grad_node", [](const Tensor& self) -> std::shared_ptr<tensorplay::tpx::Node> {
-            return tensorplay::tpx::impl::grad_accumulator(self);
+            // torch parity (Variable::grad_accumulator): lazily create the
+            // AccumulateGrad node so leaf-only APIs (post-accumulate-grad
+            // hooks, DDP reducer) work before the first graph use. The meta
+            // only keeps a weak cache reference; callers that need the node
+            // to outlive this call (DDP) must hold the returned shared_ptr.
+            // NB: get_or_create -- a fresh leaf param has no meta until its
+            // first autograd-aware op, so a null meta must not short-circuit.
+            auto* meta = tensorplay::tpx::impl::get_or_create_autograd_meta(self);
+            if (meta == nullptr) return nullptr;
+            if (auto acc = meta->grad_accumulator()) return acc;
+            // Hold the strong ref locally and transfer it to the caller
+            // (torch parity): the meta only caches the node weakly, so
+            // handing the sole owning reference to set_grad_accumulator
+            // would destroy the node before the weak lock below.
+            std::shared_ptr<tensorplay::tpx::Node> acc =
+                std::make_shared<tensorplay::tpx::AccumulateGrad>(self);
+            meta->set_grad_accumulator(acc);
+            return acc;
         })
         .def("element_size", [](const Tensor& self) -> int64_t {
             return static_cast<int64_t>(self.itemsize());
@@ -2369,6 +2387,14 @@ void init_tensor(py::module_& m) {
             std::vector<int64_t> strides_vec = self.strides();
             
             return recurse(recurse, self.data_ptr(), self.dim(), shape_vec.data(), strides_vec.data(), self.dtype());
+        })
+
+        .def("__iter__", [](const Tensor& self) {
+            // Torch Tensor.__iter__: 0-d tensors are not iterable.
+            if (self.dim() == 0) {
+                TP_THROW(TypeError, "iteration over a 0-d tensor");
+            }
+            return py::iter(py::cast(tensorplay::tpx::ops::unbind(self, 0)));
         })
 
         .def("__getitem__", [](const Tensor& self, py::object index) -> Tensor {

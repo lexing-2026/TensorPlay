@@ -39,6 +39,10 @@ set(P10_SOURCES
     src/backend/cpu/Lapack.cpp
     src/backend/cpu/PointwiseKernels.cpp
     src/backend/cpu/PoolingKernels.cpp
+    src/backend/cpu/GridSamplerKernels.cpp
+    src/backend/cpu/FractionalMaxPoolKernels.cpp
+    src/backend/cpu/MaxUnpoolKernels.cpp
+    src/backend/cpu/MarginLossKernels.cpp
     src/backend/cpu/UpsampleKernels.cpp
     src/backend/cpu/MiscKernels.cpp
     src/backend/cpu/PadKernels.cpp
@@ -62,6 +66,7 @@ set(P10_SOURCES
     src/Einsum.cpp
     src/Profiler.cpp
     src/ProfilerGpu.cpp
+    src/ProfilerCupti.cpp
     src/ProfilerNvtx.cpp
     src/ProfilerItt.cpp
     src/TensorIterator.cpp
@@ -100,6 +105,10 @@ if(USE_CUDA)
         src/backend/cuda/ConvKernels.cu
         src/backend/cuda/PadKernels.cu
         src/backend/cuda/PoolingKernels.cu
+        src/backend/cuda/GridSamplerKernels.cu
+        src/backend/cuda/FractionalMaxPoolKernels.cu
+        src/backend/cuda/MaxUnpoolKernels.cu
+        src/backend/cuda/MarginLossKernels.cu
         src/backend/cuda/RandomKernels.cu
         src/backend/cuda/ReductionKernels.cu
         src/backend/cuda/ViewKernels.cu
@@ -329,6 +338,9 @@ endif()
 
 find_package(Threads REQUIRED)
 target_link_libraries(p10 PUBLIC Threads::Threads)
+# ProfilerCupti dlopen's libcupti at runtime; libdl is part of libc on
+# glibc >= 2.34 but must be linked explicitly elsewhere.
+target_link_libraries(p10 PRIVATE ${CMAKE_DL_LIBS})
 
 if(UNIX AND NOT APPLE)
     target_link_libraries(p10 PUBLIC m)

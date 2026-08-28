@@ -36,6 +36,7 @@ Tensor eq_tensor_kernel(const Tensor& self, const Tensor& other);
 // Defined below the registration table.
 Tensor& resize__cpu(Tensor& self, const std::vector<int64_t>& size);
 std::tuple<Tensor, Tensor> native_dropout_cpu(const Tensor& input, double p);
+Tensor native_dropout_backward_cpu(const Tensor& grad_output, const Tensor& mask, double scale);
 std::tuple<Tensor, Tensor> native_alpha_dropout_cpu(const Tensor& input, double p);
 Tensor alpha_dropout_backward_cpu(const Tensor& grad, const Tensor& mask, double p);
 std::tuple<Tensor, Tensor> native_feature_dropout_cpu(const Tensor& input, double p);
@@ -219,6 +220,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, MiscKernels) {
     m.impl("glu_backward", glu_backward_cpu);
     m.impl("resize_", resize__cpu);
     m.impl("native_dropout", native_dropout_cpu);
+    m.impl("native_dropout_backward", native_dropout_backward_cpu);
     m.impl("native_alpha_dropout", native_alpha_dropout_cpu);
     m.impl("_alpha_dropout_backward", alpha_dropout_backward_cpu);
     m.impl("native_feature_dropout", native_feature_dropout_cpu);
@@ -337,6 +339,11 @@ std::tuple<Tensor, Tensor> native_dropout_cpu(const Tensor& input, double p) {
                      "dropout is only supported on floating point tensors");
     }
     return {std::move(out), std::move(mask)};
+}
+
+// ATen Dropout.cpp native_dropout_backward: grad * mask * scale.
+Tensor native_dropout_backward_cpu(const Tensor& grad_output, const Tensor& mask, double scale) {
+    return grad_output * mask.to(grad_output.dtype()) * scale;
 }
 
 // ---------------------------------------------------------------------------

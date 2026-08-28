@@ -151,6 +151,17 @@ void init_device(py::module_& m) {
 #endif
     });
 
+    cuda.def("get_driver_version", []() {
+#ifdef USE_CUDA
+        int ver = 0;
+        cudaError_t err = cudaDriverGetVersion(&ver);
+        if (err != cudaSuccess) return 0;
+        return ver;
+#else
+        return 0;
+#endif
+    });
+
     cuda.def("is_available", []() {
 #ifdef USE_CUDA
         int count = 0;

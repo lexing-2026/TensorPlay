@@ -120,6 +120,114 @@ Tensor nll_loss_backward_kernel(const Tensor& grad_output, const Tensor& input, 
     TP_THROW(NotImplementedError, "nll_loss backward only supports Float32/Float64");
 }
 
+// NLL Loss 2D -- ATen LossNLL.cpp nll_loss2d_forward/backward: input is
+// (N, C, H, W), target (N, H, W); every spatial position is an independent
+// batch row, so the row layout is input[(n * C + t) * H * W + pos].
+template <typename scalar_t>
+std::tuple<Tensor, Tensor> nll_loss2d_impl(const Tensor& input, const Tensor& target,
+                                           const std::optional<Tensor>& weight,
+                                           int64_t reduction, int64_t ignore_index) {
+    if (input.dim() != 4) TP_THROW(RuntimeError, "nll_loss2d: Expected 4D input");
+    if (target.dim() != 3) TP_THROW(RuntimeError, "nll_loss2d: Expected 3D target");
+    const int64_t N = input.size(0), C = input.size(1), H = input.size(2), W = input.size(3);
+    if (target.size(0) != N || target.size(1) != H || target.size(2) != W)
+        TP_THROW(RuntimeError, "nll_loss2d: target shape must match input spatial dims");
+    const int64_t rows = N * H * W;
+
+    const Tensor input_c = input.contiguous();
+    const Tensor target_c = target.contiguous();
+    const scalar_t* input_data = input_c.data_ptr<scalar_t>();
+    const int64_t* target_data = target_c.data_ptr<int64_t>();
+    const scalar_t* weight_data = weight.has_value() && weight->defined() ? weight->data_ptr<scalar_t>() : nullptr;
+
+    std::vector<scalar_t> output_data(reduction == 0 ? rows : 1);
+    double total_weight = 0;
+    double sum = 0;
+
+    for (int64_t i = 0; i < rows; ++i) {
+        const int64_t t = target_data[i];
+        if (t == ignore_index) {
+            if (reduction == 0) output_data[i] = 0;
+            continue;
+        }
+        if (t < 0 || t >= C) TP_THROW(RuntimeError, "Target out of bounds");
+        const int64_t n = i / (H * W);
+        const int64_t pos = i % (H * W);
+        const double w = weight_data ? static_cast<double>(weight_data[t]) : 1.0;
+        const double loss = -static_cast<double>(input_data[(n * C + t) * H * W + pos]) * w;
+        total_weight += w;
+        sum += loss;
+        if (reduction == 0) output_data[i] = static_cast<scalar_t>(loss);
+    }
+
+    DType dt = input.dtype();
+    DType tw_dt = dt == DType::Float64 ? DType::Float64 : DType::Float32;
+    Tensor total_weight_tensor = Tensor::tensor({total_weight}, DType::Float64, input.device()).to(tw_dt);
+
+    if (reduction == 0) {
+        return std::make_tuple(Tensor::tensor(output_data, dt, input.device()).reshape({N, H, W}), total_weight_tensor);
+    }
+    if (reduction == 1 && total_weight > 0) sum /= total_weight;
+    if (reduction != 1 && reduction != 2) TP_THROW(ValueError, "Invalid reduction mode");
+    return std::make_tuple(Tensor::tensor({sum}, DType::Float64, input.device()).to(dt).reshape({}), total_weight_tensor);
+}
+
+std::tuple<Tensor, Tensor> nll_loss2d_kernel(const Tensor& input, const Tensor& target, const std::optional<Tensor>& weight, int64_t reduction, int64_t ignore_index) {
+    if (input.dtype() == DType::Float32) return nll_loss2d_impl<float>(input, target, weight, reduction, ignore_index);
+    if (input.dtype() == DType::Float64) return nll_loss2d_impl<double>(input, target, weight, reduction, ignore_index);
+    TP_THROW(NotImplementedError, "nll_loss2d only supports Float32/Float64");
+}
+
+template <typename scalar_t>
+Tensor nll_loss2d_backward_impl(const Tensor& grad_output, const Tensor& input, const Tensor& target,
+                                const std::optional<Tensor>& weight, int64_t reduction,
+                                int64_t ignore_index, const Tensor& total_weight) {
+    if (input.dim() != 4) TP_THROW(RuntimeError, "nll_loss2d_backward: Expected 4D input");
+    if (target.dim() != 3) TP_THROW(RuntimeError, "nll_loss2d_backward: Expected 3D target");
+    const int64_t N = input.size(0), C = input.size(1), H = input.size(2), W = input.size(3);
+    const int64_t rows = N * H * W;
+
+    const Tensor target_c = target.contiguous();
+    const int64_t* target_data = target_c.data_ptr<int64_t>();
+    const scalar_t* weight_data = weight.has_value() && weight->defined() ? weight->data_ptr<scalar_t>() : nullptr;
+
+    Tensor grad_input = Tensor::zeros({N, C, H, W}, input.dtype(), input.device());
+    scalar_t* grad_input_data = grad_input.data_ptr<scalar_t>();
+
+    double tw = 0;
+    if (total_weight.defined()) {
+        tw = total_weight.item().to<double>();
+    } else if (reduction == 1) {
+        for (int64_t i = 0; i < rows; ++i) {
+            const int64_t t = target_data[i];
+            if (t != ignore_index) tw += weight_data ? static_cast<double>(weight_data[t]) : 1.0;
+        }
+    }
+
+    const Tensor grad_out_c = reduction == 0 ? grad_output.contiguous() : Tensor();
+    const scalar_t* grad_out_data = reduction == 0 ? grad_out_c.data_ptr<scalar_t>() : nullptr;
+    const double grad_scalar = reduction == 0 ? 0.0 : grad_output.item().to<double>();
+
+    for (int64_t i = 0; i < rows; ++i) {
+        const int64_t t = target_data[i];
+        if (t == ignore_index) continue;
+        if (t < 0 || t >= C) TP_THROW(RuntimeError, "Target out of bounds");
+        const int64_t n = i / (H * W);
+        const int64_t pos = i % (H * W);
+        const double w = weight_data ? static_cast<double>(weight_data[t]) : 1.0;
+        double g = reduction == 0 ? static_cast<double>(grad_out_data[i]) : grad_scalar;
+        if (reduction == 1 && tw > 0) g /= tw;
+        grad_input_data[(n * C + t) * H * W + pos] = static_cast<scalar_t>(-w * g);
+    }
+    return grad_input;
+}
+
+Tensor nll_loss2d_backward_kernel(const Tensor& grad_output, const Tensor& input, const Tensor& target, const std::optional<Tensor>& weight, int64_t reduction, int64_t ignore_index, const Tensor& total_weight) {
+    if (input.dtype() == DType::Float32) return nll_loss2d_backward_impl<float>(grad_output, input, target, weight, reduction, ignore_index, total_weight);
+    if (input.dtype() == DType::Float64) return nll_loss2d_backward_impl<double>(grad_output, input, target, weight, reduction, ignore_index, total_weight);
+    TP_THROW(NotImplementedError, "nll_loss2d backward only supports Float32/Float64");
+}
+
 // MSE Loss
 Tensor mse_loss_kernel(const Tensor& input, const Tensor& target, int64_t reduction) {
     // reduction: 0=none, 1=mean, 2=sum
@@ -208,25 +316,36 @@ Tensor l1_loss_backward_kernel(const Tensor& grad_output, const Tensor& input,
     return scale_grad(g, reduction, input.numel());
 }
 
-Tensor smooth_l1_loss_kernel(const Tensor& input, const Tensor& target,
-                             int64_t reduction, double beta) {
+// ATen Loss.cpp + cpu/BinaryOpsKernel.cpp smooth_l1_kernel:
+// z = |x - t|; z < beta ? 0.5 z^2 / beta : z - 0.5 beta (equal at z == beta).
+Tensor smooth_l1_loss_cpu(const Tensor& input, const Tensor& target,
+                          int64_t reduction, double beta) {
+    if (beta < 0)
+        TP_THROW(ValueError, "smooth_l1_loss does not support negative values for beta.");
     Tensor diff = input - target;
     Tensor absd = diff.abs();
-    // |x| <= beta ? 0.5*x^2/beta : |x| - 0.5*beta
     Tensor loss = Tensor::where(absd.le(Scalar(beta)), diff * diff * (0.5 / beta),
                                 absd - 0.5 * beta);
     return loss_reduce(loss, reduction);
 }
 
-Tensor smooth_l1_loss_backward_kernel(const Tensor& grad_output, const Tensor& input,
-                                      const Tensor& target, int64_t reduction, double beta) {
+// ATen cpu/PointwiseOpsKernel.cpp smooth_l1_backward_cpu_kernel:
+// x = input - target; |x| <= beta ? norm * x / beta : norm * sign(x),
+// with norm = 1/numel for mean reduction (inclusive/exclusive boundary
+// forms agree since both give norm * grad at |x| == beta).
+Tensor smooth_l1_loss_backward_cpu(const Tensor& grad_output, const Tensor& input,
+                                   const Tensor& target, int64_t reduction, double beta) {
     Tensor diff = input - target;
     Tensor g = Tensor::where(diff.abs().le(Scalar(beta)), diff / beta, diff.sign()) * grad_output;
     return scale_grad(g, reduction, input.numel());
 }
 
-Tensor huber_loss_kernel(const Tensor& input, const Tensor& target,
-                         int64_t reduction, double delta) {
+// ATen Loss.cpp + cpu/BinaryOpsKernel.cpp huber_kernel:
+// z = |x - t|; z < delta ? 0.5 z^2 : delta (z - 0.5 delta).
+Tensor huber_loss_cpu(const Tensor& input, const Tensor& target,
+                      int64_t reduction, double delta) {
+    if (delta <= 0)
+        TP_THROW(ValueError, "huber_loss does not support non-positive values for delta.");
     Tensor diff = input - target;
     Tensor absd = diff.abs();
     Tensor loss = Tensor::where(absd.le(Scalar(delta)), diff * diff * 0.5,
@@ -234,8 +353,10 @@ Tensor huber_loss_kernel(const Tensor& input, const Tensor& target,
     return loss_reduce(loss, reduction);
 }
 
-Tensor huber_loss_backward_kernel(const Tensor& grad_output, const Tensor& input,
-                                  const Tensor& target, int64_t reduction, double delta) {
+// ATen cpu/PointwiseOpsKernel.cpp huber_backward_cpu_kernel:
+// x = input - target; |x| <= delta ? norm * x : norm * delta * sign(x).
+Tensor huber_loss_backward_cpu(const Tensor& grad_output, const Tensor& input,
+                               const Tensor& target, int64_t reduction, double delta) {
     Tensor diff = input - target;
     Tensor g = Tensor::where(diff.abs().le(Scalar(delta)), diff, delta * diff.sign()) * grad_output;
     return scale_grad(g, reduction, input.numel());
@@ -266,22 +387,39 @@ Tensor kl_div_backward_kernel(const Tensor& grad_output, const Tensor& input,
     return scale_grad(g, reduction, input.numel());
 }
 
-Tensor binary_cross_entropy_kernel(const Tensor& input, const Tensor& target,
-                                   const std::optional<Tensor>& weight, int64_t reduction) {
-    Tensor x = input.clamp(0.0, 1.0);
-    Tensor loss = -(x.log() * target + (-x + 1.0).log() * (-target + 1.0));
+// ATen Loss.cpp binary_cross_entropy_cpu: input and target must lie in
+// [0, 1] (checked up front, mirroring the per-element TORCH_CHECK); the
+// per-element loss is (t-1)*max(log(1-x),-100) - t*max(log(x),-100), then
+// optional weight multiply and reduction.
+void bce_check_01(const Tensor& t, const char* what) {
+    if (t.numel() == 0) return;
+    double bad = (t.lt(0.0).to(DType::Float64) + t.gt(1.0).to(DType::Float64))
+                     .sum().item().to<double>();
+    if (bad > 0)
+        TP_THROW(RuntimeError, std::string("all elements of ") + what +
+                 " should be between 0 and 1");
+}
+
+Tensor binary_cross_entropy_cpu(const Tensor& input, const Tensor& target,
+                                const std::optional<Tensor>& weight, int64_t reduction) {
+    bce_check_01(input, "input");
+    bce_check_01(target, "target");
+    Tensor log_x = clamp_min_shim(input.log(), Scalar(-100.0));
+    Tensor log_1mx = clamp_min_shim((-input + 1.0).log(), Scalar(-100.0));
+    Tensor loss = (target - 1.0) * log_1mx - target * log_x;
     if (weight.has_value() && weight->defined()) loss = loss * weight.value();
     return loss_reduce(loss, reduction);
 }
 
-Tensor binary_cross_entropy_backward_kernel(const Tensor& grad_output, const Tensor& input,
-                                            const Tensor& target,
-                                            const std::optional<Tensor>& weight, int64_t reduction) {
-    Tensor x = input.clamp(0.0, 1.0);
-    Tensor eps = Tensor::full_like(x, 1e-12);
-    Tensor g = (x - target) / Tensor::maximum(x * (-x + 1.0), eps);
+// ATen Loss.cpp binary_cross_entropy_backward_cpu:
+// grad * (x - t) / max((1 - x) * x, 1e-12), then weight multiply, and
+// division by input.numel() for mean reduction.
+Tensor binary_cross_entropy_backward_cpu(const Tensor& grad_output, const Tensor& input,
+                                         const Tensor& target,
+                                         const std::optional<Tensor>& weight, int64_t reduction) {
+    Tensor denom = clamp_min_shim(input * (-input + 1.0), Scalar(1e-12));
+    Tensor g = grad_output * (input - target) / denom;
     if (weight.has_value() && weight->defined()) g = g * weight.value();
-    g = g * grad_output;
     return scale_grad(g, reduction, input.numel());
 }
 
@@ -686,6 +824,8 @@ std::tuple<Tensor, Tensor> _ctc_loss_cpu(const Tensor& log_probs,
 TENSORPLAY_LIBRARY_IMPL(CPU, LossKernels) {
     m.impl("nll_loss", nll_loss_kernel);
     m.impl("nll_loss_backward", nll_loss_backward_kernel);
+    m.impl("nll_loss2d", nll_loss2d_kernel);
+    m.impl("nll_loss2d_backward", nll_loss2d_backward_kernel);
     m.impl("_ctc_loss", _ctc_loss_cpu);
     m.impl("_ctc_loss_backward", _ctc_loss_backward_cpu);
 
@@ -694,14 +834,14 @@ TENSORPLAY_LIBRARY_IMPL(CPU, LossKernels) {
 
     m.impl("tp_l1_loss", l1_loss_kernel);
     m.impl("tp_l1_loss_backward", l1_loss_backward_kernel);
-    m.impl("tp_smooth_l1_loss", smooth_l1_loss_kernel);
-    m.impl("tp_smooth_l1_loss_backward", smooth_l1_loss_backward_kernel);
-    m.impl("tp_huber_loss", huber_loss_kernel);
-    m.impl("tp_huber_loss_backward", huber_loss_backward_kernel);
+    m.impl("smooth_l1_loss", smooth_l1_loss_cpu);
+    m.impl("smooth_l1_loss_backward", smooth_l1_loss_backward_cpu);
+    m.impl("huber_loss", huber_loss_cpu);
+    m.impl("huber_loss_backward", huber_loss_backward_cpu);
     m.impl("tp_kl_div", kl_div_kernel);
     m.impl("tp_kl_div_backward", kl_div_backward_kernel);
-    m.impl("tp_binary_cross_entropy", binary_cross_entropy_kernel);
-    m.impl("tp_binary_cross_entropy_backward", binary_cross_entropy_backward_kernel);
+    m.impl("binary_cross_entropy", binary_cross_entropy_cpu);
+    m.impl("binary_cross_entropy_backward", binary_cross_entropy_backward_cpu);
     m.impl("tp_margin_ranking_loss", margin_ranking_loss_kernel);
     m.impl("tp_margin_ranking_loss_backward", margin_ranking_loss_backward_kernel);
     m.impl("tp_hinge_embedding_loss", hinge_embedding_loss_kernel);

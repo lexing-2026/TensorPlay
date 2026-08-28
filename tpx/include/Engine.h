@@ -67,6 +67,17 @@ public:
         }
     }
 
+    // Wake any thread blocked in pop_until without enqueuing work. Used to
+    // unblock the initiating thread the instant its GraphTask completes on a
+    // device worker; otherwise it would wait out a full poll interval above.
+    // The mutex is taken so the notify cannot be lost between pop_until's
+    // stop() check and its wait (same ordering guarantee torch gets by pushing
+    // a dummy wakeup task under the queue lock).
+    void notify() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        cv_.notify_all();
+    }
+
 private:
     std::mutex mutex_;
     std::condition_variable cv_;

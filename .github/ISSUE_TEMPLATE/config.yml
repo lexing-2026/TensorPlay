@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: TensorPlay website
+    url: https://tensorplay.cn
+    about: Documentation, wheel indexes and project overview.
+  - name: Security vulnerability
+    url: https://github.com/lexing-2026/TensorPlay/security
+    about: Please report security vulnerabilities privately via GitHub's private vulnerability reporting (see SECURITY.md), not as public issues.

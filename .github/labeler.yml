@@ -1,0 +1,64 @@
+# Path-based automatic labeling for pull requests, mirroring pytorch's
+# .github/labeler.yml (pytorch consumes it through pytorch-probot; this repo
+# consumes it through the actions/labeler workflow). The "release notes: *"
+# labels bucket merged PRs by subsystem so release notes can be compiled the
+# same way pytorch compiles theirs from its release-notes label family.
+
+"release notes: frontend":
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'tensorplay/**'
+          - 'src/bindings/**'
+          - 'demo*.py'
+          - '!tensorplay/autograd/**'
+          - '!tensorplay/compiler/**'
+          - '!tensorplay/cuda/**'
+
+"release notes: autograd":
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'tpx/**'
+          - 'tensorplay/autograd/**'
+          - 'config/derivatives.yaml'
+
+"release notes: compiler":
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'stax/**'
+          - 'tensorplay/compiler/**'
+          - 'tensorplay/graph.py'
+
+"release notes: kernels":
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'p10/**'
+          - 'config/native_functions.yaml'
+          - 'OptimizerMTA.cuh'
+
+"release notes: cuda":
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'tensorplay/cuda/**'
+          - 'p10/src/backend/cuda/**'
+          - 'p10/include/CUDA*'
+
+"release notes: build":
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'CMakeLists.txt'
+          - 'cmake/**'
+          - '.github/**'
+          - 'tools/**'
+          - 'pyproject.toml'
+          - 'version.txt'
+          - 'Makefile'
+          - 'requirements*.txt'
+          - 'wrangler.jsonc'
+
+"release notes: docs":
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'docs/**'
+          - 'README*.md'
+          - 'CHANGELOG.md'
+          - 'CONTRIBUTING.md'

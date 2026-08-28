@@ -1023,6 +1023,16 @@ Tensor hardswish_backward_kernel_impl(const Tensor& grad_output, const Tensor& s
         });
 }
 
+Tensor silu_backward_kernel_impl(const Tensor& grad_output, const Tensor& self) {
+    // ATen cpu/Activation.cpp silu_backward_kernel:
+    //   sigmoid = 1 / (1 + exp(-x)); dy * sigmoid * (1 + x * (1 - sigmoid))
+    return activation_backward_kernel(grad_output, self,
+        [](float dy, float x) -> float {
+            const float s = 1.0f / (1.0f + std::exp(-x));
+            return dy * s * (1.0f + x * (1.0f - s));
+        });
+}
+
 Tensor hardsigmoid_kernel_impl(const Tensor& self) {
     // ATen Activation.cpp hardsigmoid_kernel: clamp(x + 3, 0, 6) / 6
     return unary_float_op_kernel(self, [](auto x) {
@@ -1179,6 +1189,186 @@ Tensor softplus_backward_kernel_impl(const Tensor& grad_output, const Tensor& se
                 ? dy
                 : dy * (1.0f / (1.0f + std::exp(-a * static_cast<float>(beta_in))));
         });
+}
+
+// ---------------------------------------------------------------------------
+// ATen log_sigmoid (aten/src/ATen/native/cpu/Activation.cpp
+// log_sigmoid_cpu_kernel): out = min(x, 0) - log1p(exp(-|x|)).  The branch
+// split keeps exp() bounded for both large-positive and large-negative inputs.
+// ---------------------------------------------------------------------------
+Tensor log_sigmoid_kernel_impl(const Tensor& self) {
+    return unary_float_op_kernel(self, [](auto x) {
+        using T = decltype(x);
+        T z = std::min(x, static_cast<T>(0));
+        return static_cast<T>(z - std::log1p(std::exp(-std::abs(x))));
+    });
+}
+
+Tensor log_sigmoid_backward_kernel_impl(const Tensor& grad_output, const Tensor& self) {
+    // ATen cpu/Activation.cpp log_sigmoid_backward_cpu_kernel:
+    //   grad * sigmoid(-x), branch-split so exp() never overflows:
+    //     x >= 0: grad * exp(-x) / (1 + exp(-x))
+    //     x <  0: grad / (1 + exp(x))
+    // Computed in the storage dtype (f16/bf16 widen to float opmath) so that
+    // float64 inputs keep double precision, matching ATen's opmath_t.
+    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(grad_output.shape()),
+                                  grad_output.dtype(), grad_output.device());
+    const int64_t n = grad_output.numel();
+    if (n == 0) return result;
+    const Tensor gc = grad_output.contiguous();
+    const Tensor sc = self.contiguous();
+    #define LSIG_BWD_CASE(ctype, name) \
+    case DType::name: { \
+        const ctype* gp = gc.data_ptr<ctype>(); \
+        const ctype* xp = sc.data_ptr<ctype>(); \
+        ctype* yp = result.data_ptr<ctype>(); \
+        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) { \
+            for (int64_t i = begin; i < end; ++i) { \
+                const ctype dy = gp[i]; \
+                const ctype x = xp[i]; \
+                yp[i] = x >= ctype(0) \
+                    ? dy * (std::exp(-x) / (ctype(1) + std::exp(-x))) \
+                    : dy / (ctype(1) + std::exp(x)); \
+            } \
+        }); \
+        break; \
+    }
+    switch (grad_output.dtype()) {
+        LSIG_BWD_CASE(float, Float32)
+        LSIG_BWD_CASE(double, Float64)
+        case DType::Float16:
+        case DType::BFloat16: {
+            // Reduced precision computes in float (opmath_t), matching ATen.
+            if (grad_output.dtype() == DType::Float16) {
+                const Half* gp = gc.data_ptr<Half>();
+                const Half* xp = sc.data_ptr<Half>();
+                Half* yp = result.data_ptr<Half>();
+                parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                    for (int64_t i = begin; i < end; ++i) {
+                        const float dy = static_cast<float>(gp[i]);
+                        const float x = static_cast<float>(xp[i]);
+                        const float v = x >= 0.0f
+                            ? dy * (std::exp(-x) / (1.0f + std::exp(-x)))
+                            : dy / (1.0f + std::exp(x));
+                        yp[i] = Half(v);
+                    }
+                });
+            } else {
+                const BFloat16* gp = gc.data_ptr<BFloat16>();
+                const BFloat16* xp = sc.data_ptr<BFloat16>();
+                BFloat16* yp = result.data_ptr<BFloat16>();
+                parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                    for (int64_t i = begin; i < end; ++i) {
+                        const float dy = static_cast<float>(gp[i]);
+                        const float x = static_cast<float>(xp[i]);
+                        const float v = x >= 0.0f
+                            ? dy * (std::exp(-x) / (1.0f + std::exp(-x)))
+                            : dy / (1.0f + std::exp(x));
+                        yp[i] = BFloat16(v);
+                    }
+                });
+            }
+            break;
+        }
+        default: TP_THROW(TypeError, "Unsupported dtype for log_sigmoid_backward");
+    }
+    #undef LSIG_BWD_CASE
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// ATen rrelu_with_noise (aten/src/ATen/native/Activation.cpp): training scales
+// negative elements by the (caller-provided) noise tensor, eval is leaky_relu
+// with slope (lower + upper) / 2.  ATen's forward fills noise from a generator;
+// TensorPlay kernels consume the noise the caller generated (nn.functional.rrelu
+// draws it with rand), which keeps the kernel deterministic and RNG-free.
+// ---------------------------------------------------------------------------
+template <typename Func>
+static Tensor binary_float_kernel(const Tensor& a, const Tensor& b, Func func) {
+    if (a.shape() != b.shape())
+        TP_THROW(RuntimeError, "rrelu_with_noise: expected noise to have the same shape as input");
+    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(a.shape()), a.dtype(), a.device());
+    int64_t n = a.numel();
+    if (n == 0) return result;
+    Tensor ac = a.contiguous();
+    Tensor bc = b.contiguous();
+    #define RRELU_BIN_CASE(ctype, name) \
+    case DType::name: { \
+        const ctype* ap = ac.data_ptr<ctype>(); \
+        const ctype* bp = bc.data_ptr<ctype>(); \
+        ctype* yp = result.data_ptr<ctype>(); \
+        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) { \
+            for (int64_t i = begin; i < end; ++i) { \
+                yp[i] = static_cast<ctype>(func(static_cast<float>(ap[i]), static_cast<float>(bp[i]))); \
+            } \
+        }); \
+        break; \
+    }
+    switch (a.dtype()) {
+        TENSORPLAY_FORALL_SCALAR_TYPES(RRELU_BIN_CASE)
+        default: TP_THROW(TypeError, "Unsupported dtype for rrelu_with_noise");
+    }
+    #undef RRELU_BIN_CASE
+    return result;
+}
+
+Tensor rrelu_with_noise_kernel_impl(const Tensor& self, const Tensor& noise, Scalar lower, Scalar upper, bool training) {
+    const float slope = static_cast<float>((lower.toDouble() + upper.toDouble()) / 2.0);
+    if (training) {
+        // ATen _rrelu_with_noise_train: x <= 0 ? x * noise : x
+        return binary_float_kernel(self, noise, [](float x, float r) -> float {
+            return x <= 0.0f ? x * r : x;
+        });
+    }
+    return binary_float_kernel(self, noise, [slope](float x, float) -> float {
+        return x >= 0.0f ? x : x * slope;
+    });
+}
+
+Tensor rrelu_with_noise_backward_kernel_impl(const Tensor& grad_output, const Tensor& self, const Tensor& noise, Scalar lower, Scalar upper, bool training, bool self_is_result) {
+    // ATen Activation.cpp rrelu_with_noise_backward: training -> noise * grad;
+    // eval -> leaky_relu_backward with slope (lower + upper) / 2.  ATen's
+    // forward overwrites noise with 1 on positive elements, which lets its
+    // backward be a plain noise*grad; this kernel leaves the caller's noise
+    // untouched, so the training branch masks with self instead (same value).
+    const float slope = static_cast<float>((lower.toDouble() + upper.toDouble()) / 2.0);
+    if (training) {
+        if (grad_output.shape() != self.shape() || grad_output.shape() != noise.shape())
+            TP_THROW(RuntimeError, "rrelu_with_noise_backward: shape mismatch");
+        Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(grad_output.shape()),
+                                      grad_output.dtype(), grad_output.device());
+        const int64_t n = grad_output.numel();
+        if (n == 0) return result;
+        const Tensor gc = grad_output.contiguous();
+        const Tensor sc = self.contiguous();
+        const Tensor nc = noise.contiguous();
+        #define RRELU_TERN_CASE(ctype, name) \
+        case DType::name: { \
+            const ctype* gp = gc.data_ptr<ctype>(); \
+            const ctype* sp = sc.data_ptr<ctype>(); \
+            const ctype* np = nc.data_ptr<ctype>(); \
+            ctype* yp = result.data_ptr<ctype>(); \
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) { \
+                for (int64_t i = begin; i < end; ++i) { \
+                    const float x = static_cast<float>(sp[i]); \
+                    yp[i] = static_cast<ctype>(x <= 0.0f \
+                        ? static_cast<float>(gp[i]) * static_cast<float>(np[i]) \
+                        : static_cast<float>(gp[i])); \
+                } \
+            }); \
+            break; \
+        }
+        switch (grad_output.dtype()) {
+            TENSORPLAY_FORALL_SCALAR_TYPES(RRELU_TERN_CASE)
+            default: TP_THROW(TypeError, "Unsupported dtype for rrelu_with_noise_backward");
+        }
+        #undef RRELU_TERN_CASE
+        return result;
+    }
+    (void)self_is_result; // result >= 0 iff self >= 0 for a positive slope.
+    return binary_float_kernel(grad_output, self, [slope](float dy, float x) -> float {
+        return x >= 0.0f ? dy : dy * slope;
+    });
 }
 
 Tensor pow_scalar_kernel(const Tensor& self, Scalar exponent) {
@@ -1901,6 +2091,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, PointwiseKernels) {
     m.impl("gelu", gelu_kernel);
     m.impl("gelu_backward", gelu_backward_kernel);
     m.impl("silu", silu_kernel);
+    m.impl("silu_backward", silu_backward_kernel_impl);
     m.impl("silu_mul", silu_mul_cpu);
     m.impl("fused_swiglu", fused_swiglu_cpu);
     m.impl("silu_and_mul", silu_and_mul_cpu);
@@ -1920,6 +2111,10 @@ TENSORPLAY_LIBRARY_IMPL(CPU, PointwiseKernels) {
     m.impl("mish_backward", mish_backward_kernel_impl);
     m.impl("softplus", softplus_kernel_impl);
     m.impl("softplus_backward", softplus_backward_kernel_impl);
+    m.impl("log_sigmoid", log_sigmoid_kernel_impl);
+    m.impl("log_sigmoid_backward", log_sigmoid_backward_kernel_impl);
+    m.impl("rrelu_with_noise", rrelu_with_noise_kernel_impl);
+    m.impl("rrelu_with_noise_backward", rrelu_with_noise_backward_kernel_impl);
     m.impl("pow.Tensor_Scalar", pow_scalar_kernel);
     m.impl("angle", angle_kernel);
     m.impl("clamp", clamp_kernel);

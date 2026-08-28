@@ -1,0 +1,36 @@
+name: Feature request
+description: Suggest a new feature or improvement.
+title: "[FEAT] "
+labels: ["enhancement", "needs triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or motivation
+      description: What problem does this solve, or what does it enable?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Sketch the API or behavior you would like to see.
+      placeholder: |
+        ```python
+        y = tp.compile(f)(x)
+        ```
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Links to torch/numpy equivalents, papers, or related issues.
+    validations:
+      required: false

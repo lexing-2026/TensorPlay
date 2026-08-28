@@ -1,8 +1,8 @@
 """Numerical verification of the RNN ops against torch (reference).
 
 Cases: lstm / gru / rnn_tanh x {bidirectional, batch_first, num_layers,
-has_biases} x {fp32, fp64}.  Weights are copied from a torch module so both
-stacks compute the exact same function.
+has_biases} x {fp16, bf16, fp32, fp64}.  Weights are copied from a torch
+module so both stacks compute the exact same function.
 """
 import itertools
 import os
@@ -28,19 +28,22 @@ def _params_from_torch(mod, dt):
             tag = "_reverse" if d == 1 else ""
             w_ih = getattr(mod, f"weight_ih_l{l}{tag}")
             w_hh = getattr(mod, f"weight_hh_l{l}{tag}")
-            params.append(tp.tensor(w_ih.detach().numpy().tolist(), dtype=dt))
-            params.append(tp.tensor(w_hh.detach().numpy().tolist(), dtype=dt))
+            # .tolist() (not .numpy()) so reduced dtypes (bf16) work too.
+            params.append(tp.tensor(w_ih.detach().tolist(), dtype=dt))
+            params.append(tp.tensor(w_hh.detach().tolist(), dtype=dt))
             if mod.bias:
                 b_ih = getattr(mod, f"bias_ih_l{l}{tag}")
                 b_hh = getattr(mod, f"bias_hh_l{l}{tag}")
-                params.append(tp.tensor(b_ih.detach().numpy().tolist(), dtype=dt))
-                params.append(tp.tensor(b_hh.detach().numpy().tolist(), dtype=dt))
+                params.append(tp.tensor(b_ih.detach().tolist(), dtype=dt))
+                params.append(tp.tensor(b_hh.detach().tolist(), dtype=dt))
     return params
 
 
 def run_case(kind, T, N, feat, H, num_layers, bidir, batch_first, bias, dtype):
-    torch_dt = torch.float64 if dtype == "fp64" else torch.float32
-    tp_dt = tp.float64 if dtype == "fp64" else tp.float32
+    torch_dt = {"fp64": torch.float64, "fp32": torch.float32,
+                "fp16": torch.float16, "bf16": torch.bfloat16}[dtype]
+    tp_dt = {"fp64": tp.float64, "fp32": tp.float32,
+             "fp16": tp.float16, "bf16": tp.bfloat16}[dtype]
     rng = np.random.RandomState(0)
 
     # Array layout follows batch_first exactly as user code would supply it.
@@ -82,15 +85,16 @@ def run_case(kind, T, N, feat, H, num_layers, bidir, batch_first, bias, dtype):
     else:
         out_p, hy_p = fn(*args)
 
-    tol = 2e-4 if dtype == "fp32" else 1e-9
+    tol = {"fp32": 2e-4, "fp64": 1e-9, "fp16": 1e-2, "bf16": 1e-1}[dtype]
+    # .to(float64).numpy(): reduced-dtype torch tensors have no numpy view.
     out_err = np.abs(np.asarray(out_p.tolist(), dtype=np.float64) -
-                     out_t.detach().numpy().astype(np.float64)).max()
+                     out_t.detach().to(torch.float64).numpy()).max()
     hy_err = np.abs(np.asarray(hy_p.tolist(), dtype=np.float64) -
-                    hy_t.detach().numpy().astype(np.float64)).max()
+                    hy_t.detach().to(torch.float64).numpy()).max()
     errs = [out_err, hy_err]
     if kind == "lstm":
         cy_err = np.abs(np.asarray(cy_p.tolist(), dtype=np.float64) -
-                        cy_t.detach().numpy().astype(np.float64)).max()
+                        cy_t.detach().to(torch.float64).numpy()).max()
         errs.append(cy_err)
     return max(errs), tol
 
@@ -101,7 +105,7 @@ def main():
     for kind in ["lstm", "gru", "rnn_tanh"]:
         for bidir, bf, layers, bias, dtype in itertools.product(
                 [False, True], [False, True], [1, 2], [True],
-                ["fp32", "fp64"]):
+                ["fp16", "bf16", "fp32", "fp64"]):
             total += 1
             case = (kind, 6, 3, 4, 5, layers, bidir, bf, bias, dtype)
             try:

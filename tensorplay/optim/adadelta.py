@@ -285,6 +285,9 @@ def adadelta(
             p.device.type == "cpu"
             and p.is_contiguous()
             and p.is_floating_point()
+            and p.dtype in (
+                tp.float16, tp.bfloat16, tp.float32, tp.float64
+            )
             and p.dtype == params[0].dtype
             for p in params
         )

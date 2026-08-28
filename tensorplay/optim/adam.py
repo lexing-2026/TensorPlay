@@ -790,6 +790,32 @@ def adam(
         decoupled_weight_decay=False, *, amsgrad, beta1, beta2, lr,
         weight_decay, eps, maximize, layout_cache=None):
     """Functional API that performs the Adam algorithm computation."""
+    # Torch's default CPU policy selects its single-tensor implementation.
+    # TensorPlay has a native CPU fused body with the same state/update
+    # contract; select it only for the ordinary homogeneous eager layout so
+    # the public default avoids one Python/native dispatch per parameter.
+    default_dispatch = fused is None and foreach is None
+    if default_dispatch:
+        cpu_native_ready = (
+            not capturable
+            and not differentiable
+            and grad_scale is None
+            and found_inf is None
+            and not has_complex
+            and bool(params)
+            and params[0].device.type == "cpu"
+            and not isinstance(lr, tp.Tensor)
+            and not isinstance(beta1, tp.Tensor)
+            and not isinstance(beta2, tp.Tensor)
+            and not isinstance(weight_decay, tp.Tensor)
+            and not isinstance(eps, tp.Tensor)
+            and _adam_fused_layout_ready(
+                params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs,
+                state_steps, amsgrad, "cpu", layout_cache,
+            )
+        )
+        if cpu_native_ready:
+            fused, foreach = True, False
     if fused is None and foreach is None:
         _, foreach = _default_to_fused_or_foreach(
             params, differentiable, use_fused=False

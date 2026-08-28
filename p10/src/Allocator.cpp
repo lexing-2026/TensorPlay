@@ -1,5 +1,6 @@
 #include "Allocator.h"
 #include "Exception.h"
+#include "Profiler.h"
 #include <memory>
 #include <mutex>
 #include <cstdlib>
@@ -64,7 +65,13 @@ public:
         char* raw_ptr = static_cast<char*>(ptr) - HEADER_SIZE;
         Header* header = reinterpret_cast<Header*>(raw_ptr);
         size_t size = header->size;
-        
+
+        // Allocator-level memory capture (profile_memory sessions).  The
+        // requested size is not recoverable after 64-byte bucket rounding,
+        // so frees report the block's rounded size -- consistent with the
+        // alloc side, which also records the rounded size.
+        prof::mem_record_free(ptr, static_cast<int64_t>(size - HEADER_SIZE),
+                              /*cuda=*/false, /*device=*/-1, /*stream=*/-1);
         instance()->free(raw_ptr, size);
     }
 
@@ -104,7 +111,13 @@ public:
 
         // Return data pointer
         void* data_ptr = static_cast<char*>(ptr) + HEADER_SIZE;
-        
+
+        // Allocator-level memory capture (profile_memory sessions); reports
+        // the bucket-rounded block so alloc/free bytes stay consistent.
+        prof::mem_record_alloc(data_ptr,
+                               static_cast<int64_t>(total_size - HEADER_SIZE),
+                               /*cuda=*/false, /*device=*/-1, /*stream=*/-1);
+
         return DataPtr(data_ptr, deleter, Device(DeviceType::CPU));
     }
 };

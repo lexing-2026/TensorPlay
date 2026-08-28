@@ -63,6 +63,14 @@ public:
     bool is_view_fn() const { return is_view_fn_; }
     void set_view_fn(bool v) { is_view_fn_ = v; }
 
+    // Torch parity (DifferentiableViewMeta CreationMeta::MULTI_OUTPUT_NODE):
+    // views returned by multi-output ops (unbind/split/chunk) can never be
+    // modified in-place; check_inplace reports them with forward_op_name().
+    bool is_multi_output_view() const { return multi_output_view_; }
+    void set_multi_output_view(bool v) { multi_output_view_ = v; }
+    const std::string& forward_op_name() const { return forward_op_name_; }
+    void set_forward_op_name(std::string n) { forward_op_name_ = std::move(n); }
+
     // Backward-input (output-slot) metadata, filled by custom-function nodes
     // at attach time; empty for generated derivative nodes.
     const std::vector<OutputSlotMeta>& output_metas() const { return output_metas_; }
@@ -150,6 +158,8 @@ protected:
     uint64_t sequence_nr_ = 0;
     bool materialize_grads_ = true;
     bool is_view_fn_ = false;
+    bool multi_output_view_ = false;
+    std::string forward_op_name_;
     std::vector<OutputSlotMeta> output_metas_;
     uint64_t topological_nr_ = 0;
 

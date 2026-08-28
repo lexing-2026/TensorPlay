@@ -17,7 +17,8 @@ def _tp_tensor(a, dt, device):
 def run_native_case(kind, T, N, feat, H, num_layers, bidir, batch_first,
                     bias, dtype):
     """Returns max |cuda_out - cpu_out| over output/hy[/cy]."""
-    tp_dt = getattr(tp, "float64" if dtype == "fp64" else "float32")
+    tp_dt = {"fp64": tp.float64, "fp32": tp.float32,
+             "fp16": tp.float16, "bf16": tp.bfloat16}[dtype]
     np_dt = np.float64 if dtype == "fp64" else np.float32
     rng = np.random.RandomState(7)
     if batch_first:
@@ -117,12 +118,13 @@ def main():
     for kind in ["lstm", "gru", "rnn_tanh", "rnn_relu"]:
         for bidir, bf, layers, bias, dtype in itertools.product(
                 [False, True], [False, True], [1, 2], [True],
-                ["fp32", "fp64"]):
+                ["fp16", "bf16", "fp32", "fp64"]):
             total += 1
             case = (kind, 6, 3, 4, 5, layers, bidir, bf, bias, dtype)
             try:
                 err = run_native_case(*case)
-                tol = 2e-4 if dtype == "fp32" else 1e-9
+                tol = {"fp32": 2e-4, "fp64": 1e-9,
+                       "fp16": 1e-2, "bf16": 1e-1}[dtype]
                 ok = err < tol
             except Exception as e:
                 print(f"ERROR {case}: {type(e).__name__}: {e}")
