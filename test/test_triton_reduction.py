@@ -59,7 +59,8 @@ def test_single_block_sum_emits_direct_store():
     assert "tl.store(out_ptr0, reduced)" in src   # the value actually lands
     assert "[(1,)]" in src                        # one-block grid
     assert "ws_ptr" not in src.split("@triton.jit")[1]
-    assert "xnumel = 64" not in src               # literal passed positionally
+    assert "xnumel = 64" in src                   # literal scalar, fast-path guard
+    assert "_r[0](1, 1, 1, _s, _r[1], _r[2]" in src  # recorded-binary fast path
 
 
 def test_split_sum_emits_workspace_and_finalize():
@@ -74,9 +75,12 @@ def test_split_sum_emits_workspace_and_finalize():
     assert "fmask = findex < wsn" in src          # partials masked load
     assert "for fbase in tl.range(0, wsn, FBLOCK):" in src
     assert "acc_f = acc_f + tl.sum(fvals, axis=0)" in src
-    assert "FBLOCK=min(triton.next_power_of_2(wsn), 2048)" in src
+    assert "fb = min(triton.next_power_of_2(wsn), 2048)" in src
+    assert "FBLOCK=fb" in src
     assert "tp.empty((wsn,)" in src               # workspace allocation
     assert "xnumel = 100000" in src               # reference numel baked
+    assert "_r[6] == xnumel" in src               # fast-path scalar guard
+    assert "_rec = _g0 + _g1 + (xnumel,)" in src  # both kernels recorded
 
 
 def test_pointwise_emission_unchanged():
@@ -722,6 +726,12 @@ def test_split_persistent_emission():
     assert "tl.sum(in0" not in src
     # epilogue still lives in the finalize kernel
     assert "etmp1 = tl.maximum(reduced, 0.0)" in src
+    # static fast-launch: recorded-binary replay with the fixed program
+    # count and a literal FBLOCK (next_pow2(592) = 1024)
+    assert "_r[0](wsn, 1, 1, _s, _r[1], _r[2], None, None, None," in src
+    assert "wsn = 592" in src
+    assert "FBLOCK=1024" in src
+    assert "_rec = _g0 + _g1 + (xnumel,)" in src
 
 
 def test_split_persistent_emission_stride_exact():
@@ -809,3 +819,123 @@ def test_dims_rblock_candidates_run_and_match():
         assert tp.allclose(out, ref, rtol=1e-4, atol=1e-1), cfg
         ran += 1
     assert ran >= 2, "RBLOCK-override band must be tunable"
+
+
+# --- static fast-launch (fastlaunch) -------------------------------------------------
+
+
+def _sum_split_launch(x, cfg=(2048, 8, 592)):
+    from tensorplay.compiler.codegen.triton import _compile_program
+
+    return _compile_program(
+        [3, 0, -1], [2.0], (1,), [x],
+        fixed_config=cfg, reduction=ReductionSpec("sum"),
+        input_shapes=(tuple(x.shape),), reference_shape=tuple(x.shape),
+    )
+
+
+@pytest.mark.skipif(not runtime_available(), reason="Triton/CUDA unavailable")
+def test_fast_launch_records_and_recomputes():
+    """After the first dispatch records the CompiledKernel, later calls must
+    ride the direct kernel.run fast path AND still recompute fresh results
+    (no cached-output reuse, no stale workspace)."""
+
+    from tensorplay.compiler.runtime import fastlaunch
+
+    x = tp.rand(1 << 20, device="cuda")
+    launch = _sum_split_launch(x)
+    ref = (x * 2.0).sum()
+    tp.cuda.synchronize()
+    before = fastlaunch.FAST_CALLS
+    out1 = launch([x])
+    tp.cuda.synchronize()
+    assert tp.allclose(out1, ref, rtol=1e-4, atol=1e-1)
+    x.add_(1.0)
+    ref2 = (x * 2.0).sum()
+    out2 = launch([x])
+    tp.cuda.synchronize()
+    assert tp.allclose(out2, ref2, rtol=1e-4, atol=1e-1)
+    assert fastlaunch.FAST_CALLS > before, "fast path never engaged"
+
+
+@pytest.mark.skipif(not runtime_available(), reason="Triton/CUDA unavailable")
+def test_fast_launch_misaligned_input_falls_back():
+    """A storage-offset (non-16B-aligned) input must not ride the recorded
+    alignment-specialized binary: the guard fails, the normal dispatch
+    re-specializes, and the result stays exact."""
+
+    from tensorplay.compiler.runtime import fastlaunch
+
+    base = tp.rand((1 << 20) + 8, device="cuda")
+    x = base[1:]  # data_ptr % 16 == 4 for fp32
+    launch = _sum_split_launch(x, cfg=(512, 4))
+    ref = (x * 2.0).sum()
+    tp.cuda.synchronize()
+    before = fastlaunch.FAST_CALLS
+    out = launch([x])
+    tp.cuda.synchronize()
+    assert tp.allclose(out, ref, rtol=1e-4, atol=1e-1)
+    assert fastlaunch.FAST_CALLS == before, (
+        "misaligned call must not use the recorded aligned binary"
+    )
+    # A later aligned call records; from then on results still match.
+    y = tp.rand(x.numel(), device="cuda")
+    out2 = launch([y])
+    tp.cuda.synchronize()
+    assert tp.allclose(out2, (y * 2.0).sum(), rtol=1e-4, atol=1e-1)
+    out3 = launch([y])
+    tp.cuda.synchronize()
+    assert tp.allclose(out3, (y * 2.0).sum(), rtol=1e-4, atol=1e-1)
+
+
+@pytest.mark.skipif(not runtime_available(), reason="Triton/CUDA unavailable")
+def test_fast_launch_dims_and_single_paths():
+    """Dims-reduction and single-block launchers record and replay too."""
+
+    from tensorplay.compiler.codegen.triton import _compile_program
+    from tensorplay.compiler.runtime import fastlaunch
+
+    x = tp.rand(64, 4096, device="cuda")
+    dims = _compile_program(
+        [3, 0, -1], [2.0], (1,), [x],
+        fixed_config=(1, 16, 4096, 3), reduction=ReductionSpec("sum", (1,)),
+        input_shapes=(tuple(x.shape),), reference_shape=tuple(x.shape),
+    )
+    before = fastlaunch.FAST_CALLS
+    out = dims([x])
+    out = dims([x])
+    tp.cuda.synchronize()
+    assert tp.allclose(out, (x * 2.0).sum(dim=1), rtol=1e-4, atol=1e-1)
+    assert fastlaunch.FAST_CALLS > before
+
+    small = tp.rand(64, device="cuda")
+    single = _compile_program(
+        [3, 0, -1], [2.0], (1,), [small],
+        fixed_config=(64, 4), reduction=ReductionSpec("sum"),
+        input_shapes=(tuple(small.shape),), reference_shape=tuple(small.shape),
+    )
+    before = fastlaunch.FAST_CALLS
+    out = single([small])
+    out = single([small])
+    tp.cuda.synchronize()
+    assert tp.allclose(out, (small * 2.0).sum(), rtol=1e-4, atol=1e-1)
+    assert fastlaunch.FAST_CALLS > before
+
+
+@pytest.mark.skipif(not runtime_available(), reason="Triton/CUDA unavailable")
+def test_fast_launch_pointwise_path():
+    from tensorplay.compiler.codegen.triton import _compile_program
+    from tensorplay.compiler.runtime import fastlaunch
+
+    x = tp.rand(4096, device="cuda")
+    launch = _compile_program(
+        [3, 0, -1], [2.0], (1,), [x],
+        fixed_config=(256, 4),
+        input_shapes=(tuple(x.shape),), reference_shape=tuple(x.shape),
+    )
+    before = fastlaunch.FAST_CALLS
+    out = launch([x])
+    out = launch([x])
+    tp.cuda.synchronize()
+    assert tp.allclose(out, x * 2.0, rtol=1e-5, atol=1e-5)
+    assert fastlaunch.FAST_CALLS > before

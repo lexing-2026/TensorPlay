@@ -67,6 +67,12 @@ void tpx_py_check_types(PyObject* const* slots, Py_ssize_t n,
                         const char* op_name, const char* const* names,
                         const unsigned char* kinds, int max_pos);
 
+// Non-throwing per-object kind predicate used by the generated multi-overload
+// fast probe to pick a candidate overload without raising on a mismatch.
+// Returns false for a null object; treats Py_None as matching only when the
+// kind is flagged TPK_OPTIONAL.
+bool tpx_py_obj_matches_kind(PyObject* obj, unsigned char kind);
+
 // ---- unpacking -------------------------------------------------------------
 // Tensor getters come in three flavours: by value (legacy), and by reference
 // into the Python wrapper's storage.  The reference forms skip one

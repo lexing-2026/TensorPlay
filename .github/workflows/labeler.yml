@@ -1,0 +1,28 @@
+name: labeler
+
+# Path-based PR labeling, the plain-Actions stand-in for pytorch's
+# pytorch-probot labeler plugin. Label rules live in .github/labeler.yml;
+# the label inventory lives in .github/labels.yml. The "release notes: *"
+# labels bucket merged PRs for compiling release notes (see
+# docs/release-notes/TEMPLATE.md).
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  label:
+    name: label-pull-request
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/labeler@v5
+        with:
+          sync-labels: true

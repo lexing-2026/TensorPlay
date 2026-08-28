@@ -863,6 +863,36 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
         // alpha * y with per-dtype semantics; a template so the if constexpr
         // branches are truly discarded per instantiation.
         TensorIterator iter = TensorIterator::binary_op(result, self_casted, other_casted);
+
+#if defined(__x86_64__)
+        // torch cpu_kernel_vec parity: TensorIterator coalesces the innermost
+        // contiguous dim into each run (broadcast operands included), so runs
+        // whose strides all equal the element size vectorize exactly like the
+        // same-shape path.  This is the bias-add pattern ((N,G)+(G,)) that
+        // the RNN cells hit at every timestep; the scalar run loop below was
+        // ~10x off torch for it.
+        if (result_dtype == DType::Float32 && cpu_has_avx512()) {
+            const float alpha_val = alpha.to<float>();
+            iter.for_each([&](char** data, const int64_t* strides, int64_t n) {
+                if (strides[0] == 4 && strides[1] == 4 && strides[2] == 4) {
+                    binary_f32_avx512(BIN_ADD,
+                                      reinterpret_cast<const float*>(data[1]),
+                                      reinterpret_cast<const float*>(data[2]),
+                                      reinterpret_cast<float*>(data[0]),
+                                      n, alpha_val);
+                } else {
+                    for (int64_t i = 0; i < n; ++i)
+                        *reinterpret_cast<float*>(data[0] + i * strides[0]) =
+                            *reinterpret_cast<const float*>(data[1] + i * strides[1]) +
+                            alpha_val *
+                            *reinterpret_cast<const float*>(data[2] + i * strides[2]);
+                }
+            });
+            optimized = true;
+        }
+#endif
+
+        if (!optimized) {
         #define TI_ALPHA_CASE(ctype, name) \
         case DType::name: { \
             using ctype_ = ctype; \
@@ -882,6 +912,7 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
             default: TP_THROW(TypeError, "add_out: unsupported dtype");
         }
         #undef TI_ALPHA_CASE
+        }
     }
     return result;
 }

@@ -374,7 +374,23 @@ def generate_cpp(funcs: list[NativeFunction], *,
             if f.cpp_name == "copy_":
                 lines.append('    if (!impl_ || !src.impl_) TP_THROW(RuntimeError, "Tensor not defined");')
                 lines.append("    if (this->shape() != src.shape()) {")
-                lines.append('        TP_THROW(RuntimeError, "copy_(): shapes mismatch (broadcasting not yet supported)");')
+                lines.append('    TP_THROW(RuntimeError, "copy_(): shapes mismatch (broadcasting not yet supported)");')
+                lines.append("    }")
+
+            if f.cpp_name == "contiguous":
+                # torch parity (aten/src/ATen/core/TensorBase.h: TensorBase::
+                # contiguous): resolve contiguity BEFORE any dispatch. When the
+                # input is already contiguous the input tensor itself is
+                # returned; otherwise internal kernel call sites (e.g. the
+                # unary pointwise kernels) would route through the autograd
+                # `contiguous` wrapper, which tags the aliased input with a
+                # ContiguousBackward node and corrupts the graph (leaf inputs
+                # would silently become non-leaves).
+                self_expr = "(*this)" if variant == "method" else "self"
+                lines.append("    {")
+                lines.append("        auto __fmt = static_cast<MemoryFormat>(memory_format);")
+                lines.append("        if (__fmt == MemoryFormat::Preserve) __fmt = MemoryFormat::Contiguous;")
+                lines.append(f"        if ({self_expr}.is_contiguous(__fmt)) return {self_expr};")
                 lines.append("    }")
 
             _emit_device_checks(lines, f, variant, target_dev)

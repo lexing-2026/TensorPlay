@@ -5,6 +5,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <mutex>
 #include <queue>
@@ -353,7 +354,17 @@ void invoke_parallel_impl(
   // regions instead of futex-parking), which is what makes torch's small-op
   // dispatch cost microseconds.  The native pool below stays as the fallback
   // for non-OpenMP builds.
-  if (omp_get_max_threads() > 1 && !omp_in_parallel()) {
+  //
+  // TP_PARALLEL_BACKEND=native forces the in-house pool even in OpenMP builds.
+  // Back-to-back small regions (RNN cell loops) measured ~600us cheaper per
+  // region transition on Zen4 with the native pool: libgomp's post-barrier
+  // spin taxes the serial op that follows each region, and the native pool's
+  // futex park/wake matches torch's pthreadpool behavior.
+  static const bool force_native_pool = [] {
+      const char* e = std::getenv("TP_PARALLEL_BACKEND");
+      return e && std::strcmp(e, "native") == 0;
+  }();
+  if (!force_native_pool && omp_get_max_threads() > 1 && !omp_in_parallel()) {
     std::atomic_flag err_flag = ATOMIC_FLAG_INIT;
     std::exception_ptr eptr;
     const int64_t ntasks = static_cast<int64_t>(num_tasks);

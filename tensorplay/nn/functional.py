@@ -537,8 +537,10 @@ def adaptive_avg_pool2d(input, output_size):
     return _C.adaptive_avg_pool2d(input, output_size)
 
 def adaptive_max_pool2d(input, output_size):
-    output_size = _pair(output_size)
-    return _C.adaptive_max_pool2d(input, output_size)
+    output_size = list(_pair(output_size))
+    # Route through the (values, indices) op so autograd saves indices and the
+    # backward scatters instead of recomputing the argmax (matches ATen).
+    return _C.adaptive_max_pool2d_with_indices(input, output_size)[0]
 
 # Normalization functions
 
@@ -638,6 +640,14 @@ def nll_loss(input, target, weight=None, size_average=None, ignore_index=-100,
         output, _ = _C.nll_loss(input, target, weight, reduction_enum, ignore_index)
         return output
 
+    if input.dim() == 4:
+        # Native nll_loss2d kernel (ATen LossNLL.cpp parity): (N, C, H, W)
+        # input with (N, H, W) target; autograd flows through
+        # nll_loss2d_backward.
+        t = target if target.dtype == DType.int64 else target.to(DType.int64)
+        output, _ = _C.nll_loss2d(input, t, weight, reduction_enum, ignore_index)
+        return output
+
     # Port of at::native::nll_loss_nd_symint (aten/src/ATen/native/LossNLL.cpp:678):
     # every spatial position acts as its own batch row, so move classes last,
     # flatten to (-1, C), run the 2-D kernel and restore the target shape.
@@ -671,6 +681,19 @@ def cross_entropy(input, target, weight=None, size_average=None, ignore_index=-1
     """
     if size_average is not None or reduce is not None:
         reduction = _legacy_get_string(size_average, reduce)
+
+    # Hot path for the common training-loop case ((N, C) logits, int64
+    # class targets, no class weights / label smoothing): go straight to
+    # the native ops, skipping the legacy-reduction and N-d shape handling.
+    if (weight is None and label_smoothing == 0.0 and input.dim() == 2
+            and target.dtype == tensorplay.int64):
+        red = 1 if reduction == 'mean' else (
+            2 if reduction == 'sum' else (0 if reduction == 'none' else -1))
+        if red >= 0:
+            output, _ = _C.nll_loss(
+                _C.log_softmax(input, 1, tensorplay.undefined),
+                target, None, red, ignore_index)
+            return output
 
     class_dim = 0 if input.dim() == 1 else 1
     n_classes = input.size(class_dim)
@@ -1058,8 +1081,9 @@ def logsigmoid(input: Tensor) -> Tensor:
 
     See :class:`~tensorplay.nn.LogSigmoid` for more details.
     """
-    # log(sigmoid(x)) == -softplus(-x); softplus has an existing backward.
-    return -softplus(-input, beta=1.0, threshold=20.0)
+    # Native log_sigmoid kernel (ATen parity: min(x, 0) - log1p(exp(-|x|)));
+    # autograd flows through log_sigmoid_backward.
+    return _C.log_sigmoid(input)
 
 
 def softmin(input: Tensor, dim: Optional[int] = None, dtype=None) -> Tensor:
@@ -1140,9 +1164,11 @@ def rrelu(
     """
     if training:
         noise = lower + (upper - lower) * _C.rand(input.shape, device=input.device)
-        result = tensorplay.where(input > 0, input, input * noise)
+        result = _C.rrelu_with_noise(input, noise, lower, upper, True)
     else:
-        result = leaky_relu(input, (lower + upper) / 2.0)
+        # Eval ignores noise (leaky slope (lower+upper)/2); pass input itself
+        # to avoid an allocation.
+        result = _C.rrelu_with_noise(input, input, lower, upper, False)
     if inplace:
         return input.copy_(result)
     return result
@@ -1876,7 +1902,7 @@ def smooth_l1_loss(
     enum_ = _get_reduction_enum(reduction)
     if beta == 0.0:
         return _C.tp_l1_loss(expanded_input, expanded_target, enum_)
-    return _C.tp_smooth_l1_loss(expanded_input, expanded_target, enum_, beta)
+    return _C.smooth_l1_loss(expanded_input, expanded_target, enum_, beta)
 
 
 def huber_loss(
@@ -1902,11 +1928,11 @@ def huber_loss(
     expanded_input, expanded_target = _expand_pair(input, target)
     enum_ = _get_reduction_enum(reduction)
     if weight is None:
-        return _C.tp_huber_loss(expanded_input, expanded_target, enum_, delta)
+        return _C.huber_loss(expanded_input, expanded_target, enum_, delta)
 
     if weight.size() != input.size():
         raise ValueError("Weights and input must have the same size.")
-    unweighted = _C.tp_huber_loss(expanded_input, expanded_target, 0, delta)
+    unweighted = _C.huber_loss(expanded_input, expanded_target, 0, delta)
     weighted = unweighted * weight
     if reduction == "none":
         return weighted
@@ -1974,7 +2000,7 @@ def binary_cross_entropy(
     if weight is not None:
         new_size = _broadcast_shapes(tuple(target.size()), tuple(weight.size()))
         weight = weight.expand(new_size)
-    return _C.tp_binary_cross_entropy(input, target, weight, reduction_enum)
+    return _C.binary_cross_entropy(input, target, weight, reduction_enum)
 
 
 def binary_cross_entropy_with_logits(
@@ -2123,7 +2149,7 @@ def multi_margin_loss(
 ) -> Tensor:
     r"""Compute the multi margin loss, with optional weighting.
 
-    Vectorized composition of aten/src/ATen/native/LossMultiMargin.cpp:
+    Native ATen-aligned op (aten/src/ATen/native/LossMultiMargin.cpp):
     ``sum_d max(0, margin - x_y + x_d)^p * w_y / C`` over non-target classes.
     See :class:`~tensorplay.nn.MultiMarginLoss` for details.
     """
@@ -2133,21 +2159,8 @@ def multi_margin_loss(
         raise ValueError("only p == 1 and p == 2 supported")
     if weight is not None and weight.dim() != 1:
         raise ValueError("weight must be one-dimensional")
-
-    nframe = input.size(0)
-    dim = input.size(1)
-    t64 = target.to(DType.int64)
-    x_t = tensorplay.embedding(input.contiguous().reshape(-1), (tensorplay.arange(nframe, dtype=DType.int64, device=input.device) * dim + t64.reshape(-1))).view(nframe, 1)
-    z = margin - x_t + input
-    h = z.clamp(min=0.0)
-    if p == 2:
-        h = h * h
-    off_mask = one_hot(t64, dim).eq(0).to(h.dtype)
-    h = h * off_mask
-    if weight is not None:
-        h = h * weight.to(h.dtype).index_select(0, t64).unsqueeze(1)
-    loss = h.sum(1) / dim
-    return _apply_reduction(loss, reduction)
+    return _C.multi_margin_loss(input, target.to(DType.int64), p, margin, weight,
+                                _get_reduction_enum(reduction))
 
 
 def multilabel_margin_loss(
@@ -2159,50 +2172,17 @@ def multilabel_margin_loss(
 ) -> Tensor:
     r"""Compute the multilabel margin loss.
 
-    Composition of aten/src/ATen/native/LossMultiLabelMargin.cpp: for each
-    positive label ``y`` (targets are active until the first ``-1``), add
-    ``max(0, 1 - x[y] + x[d])`` over non-target labels ``d``; divide by C.
+    Native ATen-aligned op (aten/src/ATen/native/LossMultiLabelMargin.cpp):
+    for each positive label ``y`` (targets are active until the first
+    ``-1``), add ``max(0, 1 - x[y] + x[d])`` over non-target labels ``d``;
+    divide by C.
     See :class:`~tensorplay.nn.MultiLabelMarginLoss` for details.
     """
     if size_average is not None or reduce is not None:
         reduction = _legacy_get_string(size_average, reduce)
-    unbatched = input.dim() <= 1
-    if unbatched:
-        x = input.unsqueeze(0)
-        t = target.unsqueeze(0)
-    else:
-        x = input
-        t = target
-    nframe, dim = x.shape[0], x.shape[-1]
-    t64 = t.to(DType.int64)
-    valid = t64.ge(0)
-    # entries from the first -1 onward are ignored (ATen breaks out of the
-    # per-row loop when it sees -1)
-    idxs = tensorplay.arange(t64.size(-1), dtype=DType.int64, device=x.device)
-    neg = t64.eq(-1)
-    big = tensorplay.full((nframe, t64.size(-1)), t64.size(-1),
-                          dtype=DType.int64, device=x.device)
-    first_neg = _C.min(tensorplay.where(neg, idxs.unsqueeze(0).expand(nframe, t64.size(-1)), big), dim=1, keepdim=True)[0]
-    active = idxs.unsqueeze(0) < first_neg          # (nframe, dim) bool
-    active = active.reshape(valid.shape).to(x.dtype)
+    return _C.multilabel_margin_loss(input, target.to(DType.int64),
+                                     _get_reduction_enum(reduction))
 
-    # is_target[n, c] = 1 iff class c appears among the active targets of n
-    t_safe = t64.clamp(min=0)
-    hot = one_hot(t_safe, dim).to(x.dtype) * active.unsqueeze(-1)
-    is_target = _C.max(hot, dim=1)[0].clamp(max=1.0)
-
-    # gather x at each target column: (N, S)
-    gid = tensorplay.arange(nframe, dtype=DType.int64, device=x.device).unsqueeze(1) * dim + t_safe
-    x_t = tensorplay.embedding(x.contiguous().reshape(-1), gid.reshape(-1)).view(nframe, -1)
-
-    z = 1.0 - x_t.unsqueeze(-1) + x.unsqueeze(1)          # (N, S, C)
-    h = z.clamp(min=0.0)
-    mask = active.unsqueeze(-1) * (is_target.eq(0)).to(x.dtype).unsqueeze(1)
-    loss_per_sample = (h * mask).sum(dim=[1, 2]) / dim
-    if reduction == "none":
-        return loss_per_sample.squeeze(0) if unbatched else loss_per_sample
-    reduced = _apply_reduction(loss_per_sample, reduction)
-    return reduced
 
 
 def triplet_margin_loss(
@@ -2616,9 +2596,9 @@ def grid_sample(
         padding_mode (str): ``'zeros'`` | ``'border'`` | ``'reflection'``. Default: ``'zeros'``
         align_corners (bool, optional): extrema treatment, default ``False``.
 
-    Composed from dispatched primitives following
-    aten/src/ATen/native/GridSamplerUtils.h; autograd flows to both
-    :attr:`input` and :attr:`grid`.
+    Dispatches to the native grid_sampler_2d / grid_sampler_3d kernels
+    (aten/src/ATen/native/cuda/GridSampler.cu semantics); autograd flows to
+    both :attr:`input` and :attr:`grid`.
     """
     if mode not in GRID_SAMPLE_INTERPOLATION_MODES:
         raise ValueError(
@@ -2640,11 +2620,11 @@ def grid_sample(
     pad_enum = GRID_SAMPLE_PADDING_MODES.index(padding_mode)
 
     if input.dim() == 4:
-        return _grid_sampler_2d(input, grid, mode_enum, pad_enum, align_corners)
+        return _C.grid_sampler_2d(input, grid, mode_enum, pad_enum, align_corners)
     if input.dim() == 5:
         if mode_enum == 2:
             raise ValueError("nn.functional.grid_sample(): bicubic only supports 4D input")
-        return _grid_sampler_3d(input, grid, mode_enum, pad_enum, align_corners)
+        return _C.grid_sampler_3d(input, grid, mode_enum, pad_enum, align_corners)
     raise ValueError(f"nn.functional.grid_sample(): expected 4D or 5D input, got {input.dim()}D")
 
 
@@ -3315,15 +3295,11 @@ def max_pool2d_with_indices(
     stride = kernel_size if stride is None else _pair(stride)
     padding = _pair(padding)
     dilation = _pair(dilation)
-    unbatched = input.dim() == 3
-    x = input.unsqueeze(0) if unbatched else input
-    values = _C.max_pool2d(x.contiguous(), list(kernel_size), list(stride),
-                           list(padding), list(dilation), ceil_mode)
-    oH, oW = values.shape[-2], values.shape[-1]
-    indices = _max_pool2d_indices(x, kernel_size, stride, padding, dilation, oH, oW)
-    if unbatched:
-        return values.squeeze(0), indices.squeeze(0)
-    return values, indices
+    # Native kernel (ATen DilatedMaxPool2d.cpp parity): returns values plus
+    # int64 indices into each (n, c) input plane; autograd flows through
+    # max_pool2d_with_indices_backward.
+    return _C.max_pool2d_with_indices(input, list(kernel_size), list(stride),
+                                      list(padding), list(dilation), ceil_mode)
 
 
 def max_pool1d_with_indices(
@@ -3375,31 +3351,14 @@ def max_pool3d(
         return max_pool3d_with_indices(
             input, kernel_size, stride=stride, padding=padding,
             dilation=dilation, ceil_mode=ceil_mode)
-    unbatched = input.dim() == 4
-    x = input.unsqueeze(0) if unbatched else input
     kd, kh, kw = _triple(kernel_size)
     sd, sh, sw = _triple(stride) if stride is not None else (kd, kh, kw)
     pd_, ph, pw = _triple(padding)
     dd, dh, dw = _triple(dilation)
-    # Stage 1 pools (H, W) per depth plane: fold (N, C, D) into the batch so
-    # max_pool2d keeps its torch-mandated 4-D shape.
-    N, C, D, H, W = x.shape
-    m1 = _C.max_pool2d(
-        x.reshape(N * C * D, 1, H, W).contiguous(), (kh, kw), (sh, sw), (ph, pw),
-        (dh, dw), ceil_mode,
-    )
-    oH, oW = m1.shape[2], m1.shape[3]
-    # Stage 2 pools D: move depth last, fold everything else into batch.
-    mt = (
-        m1.reshape(N, C, D, oH, oW)
-        .permute(0, 1, 3, 4, 2)
-        .contiguous()
-        .reshape(N * C * oH * oW, 1, D)
-    )
-    out = max_pool1d(mt, kd, sd, pd_, dd, ceil_mode)
-    od = out.shape[-1]
-    out = out.reshape(N, C, oH, oW, od).permute(0, 1, 4, 2, 3).contiguous()
-    return out.squeeze(0) if unbatched else out
+    # Native kernel (ATen DilatedMaxPool3d.cpp parity); autograd flows through
+    # max_pool3d_backward.
+    return _C.max_pool3d(input, [kd, kh, kw], [sd, sh, sw], [pd_, ph, pw],
+                         [dd, dh, dw], ceil_mode)
 
 
 def max_pool3d_with_indices(
@@ -3416,47 +3375,14 @@ def max_pool3d_with_indices(
 
     See :class:`~tensorplay.nn.MaxPool3d` for details.
     """
-    unbatched = input.dim() == 4
-    x = input.unsqueeze(0) if unbatched else input
-    N, C, D = x.shape[0], x.shape[1], x.shape[2]
     kd, kh, kw = _triple(kernel_size)
     sd, sh, sw = _triple(stride) if stride is not None else (kd, kh, kw)
     pd_, ph, pw = _triple(padding)
     dd, dh, dw = _triple(dilation)
-    H, W = x.shape[3], x.shape[4]
-
-    values = max_pool3d(x, (kd, kh, kw), (sd, sh, sw), (pd_, ph, pw), (dd, dh, dw), ceil_mode)
-    oD, oH, oW = values.shape[-3], values.shape[-2], values.shape[-1]
-    with tensorplay.no_grad():
-        i64 = DType.int64
-        dev = x.device
-        entries = []
-        for od in range(oD):
-            d0 = od * sd - pd_
-            best_idx = None
-            best_vals = None
-            for i in range(kd):
-                di = d0 + i * dd
-                if di < 0 or di >= D:
-                    continue
-                # contiguous(): the native max_pool2d kernel assumes a
-                # contiguous layout; a select() view silently mis-strides.
-                sl = x.select(2, di).contiguous()
-                sl_vals = _C.max_pool2d(sl, (kh, kw), (sh, sw), (ph, pw), (dh, dw), ceil_mode)
-                sl_idx = _max_pool2d_indices(sl, (kh, kw), (sh, sw), (ph, pw), (dh, dw), oH, oW)
-                if best_idx is None:
-                    best_idx, best_vals = sl_idx + di * (H * W), sl_vals
-                else:
-                    better = sl_vals > best_vals
-                    best_idx = tensorplay.where(better, sl_idx + di * (H * W), best_idx)
-                    best_vals = tensorplay.where(better, sl_vals, best_vals)
-            if best_idx is None:
-                best_idx = tensorplay.zeros([N, C, oH, oW], dtype=i64, device=dev)
-            entries.append(best_idx)
-        indices = tensorplay.stack(entries, dim=2)
-    if unbatched:
-        return values.squeeze(0), indices.squeeze(0)
-    return values, indices
+    # Native kernel returns values plus int64 indices into each (n, c) input
+    # (D, H, W) volume; autograd flows through max_pool3d_with_indices_backward.
+    return _C.max_pool3d_with_indices(input, [kd, kh, kw], [sd, sh, sw],
+                                      [pd_, ph, pw], [dd, dh, dw], ceil_mode)
 
 
 def avg_pool3d(
@@ -3569,8 +3495,7 @@ def adaptive_max_pool2d_with_indices(input: Tensor, output_size, return_indices:
     output_size = list(_pair(output_size))
     unbatched = input.dim() == 3
     x = input.unsqueeze(0) if unbatched else input
-    values = _C.adaptive_max_pool2d(x, output_size)
-    _, indices = _adaptive_max_pool2d_wi(x, output_size[0], output_size[1])
+    values, indices = _C.adaptive_max_pool2d_with_indices(x, output_size)
     if unbatched:
         return values.squeeze(0), indices.squeeze(0)
     return values, indices
@@ -3618,6 +3543,22 @@ def _adaptive_max_values_3d(x5, od, oh, ow):
     return tensorplay.stack(vs, dim=2), tensorplay.stack(ixs, dim=2)
 
 
+def adaptive_max_pool3d(input: Tensor, output_size, return_indices: bool = False):
+    r"""adaptive_max_pool3d(input, output_size, return_indices=False)
+
+    Applies a 3D adaptive max pooling over an input signal composed of several
+    input planes. Input shape ``(N, C, D, H, W)`` or unbatched ``(C, D, H, W)``.
+
+    See :class:`~tensorplay.nn.AdaptiveMaxPool3d` for details.
+    """
+    od, oh, ow = _triple(output_size)
+    if return_indices:
+        return adaptive_max_pool3d_with_indices(input, (od, oh, ow))
+    # Native kernel (ATen AdaptiveMaxPooling3d.cpp parity); autograd flows
+    # through adaptive_max_pool3d_backward.
+    return _C.adaptive_max_pool3d(input, [od, oh, ow])
+
+
 def adaptive_max_pool3d_with_indices(input: Tensor, output_size, return_indices: bool = True):
     r"""Applies a 3D adaptive max pooling over an input signal, returning
     ``(output, indices)``.
@@ -3629,7 +3570,10 @@ def adaptive_max_pool3d_with_indices(input: Tensor, output_size, return_indices:
     x = input.unsqueeze(0) if unbatched else input
     N, C, D, H, W = x.shape
     with tensorplay.no_grad():
-        values, indices = _adaptive_max_values_3d(x, od, oh, ow)
+        _values, indices = _adaptive_max_values_3d(x, od, oh, ow)
+    # Values come from the native kernel so autograd flows through
+    # adaptive_max_pool3d_backward; indices stay a no-grad int64 tensor.
+    values = _C.adaptive_max_pool3d(x, [od, oh, ow])
     if unbatched:
         return values.squeeze(0), indices.squeeze(0)
     return values, indices
@@ -3746,21 +3690,9 @@ def fractional_max_pool2d_with_indices(
         _random_samples = tensorplay.rand(B, C, 2, dtype=input.dtype, device=input.device)
     _frac_pool_check(x, _random_samples, 2)
 
-    P = B * C
-    i64 = DType.int64
-    dev = x.device
-    seq_w = _frac_generate_intervals(_random_samples[..., 0].reshape(-1), W, oW, kw)
-    seq_h = _frac_generate_intervals(_random_samples[..., 1].reshape(-1), H, oH, kh)
-
-    rows = seq_h.reshape(P, oH, 1, 1, 1) + tensorplay.arange(kh, dtype=i64, device=dev).view(1, 1, kh, 1, 1)
-    # kw varies along the LAST dim so (P,1,1,oW,1) + (1,1,1,1,kw) broadcasts.
-    cols = seq_w.reshape(P, 1, 1, oW, 1) + tensorplay.arange(kw, dtype=i64, device=dev).view(1, 1, 1, 1, kw)
-    pos = rows * W + cols                       # (P, oH, kh, oW, kw)
-    pos = pos.permute(0, 1, 3, 2, 4).contiguous().reshape(P, oH * oW, kh * kw)
-
-    picked, idx = _frac_windowed_max(x.reshape(P, H * W), pos, H * W)
-    values = picked.view(B, C, oH, oW)
-    indices = idx.view(B, C, oH, oW)
+    # Native kernel (aten/src/ATen/native/FractionalMaxPool2d.cpp semantics):
+    # intervals derive from _random_samples, indices are flat in-plane offsets.
+    values, indices = _C.fractional_max_pool2d(x, [kh, kw], [oH, oW], _random_samples)
     if unbatched:
         return values.squeeze(0), indices.squeeze(0)
     return values, indices
@@ -3842,22 +3774,9 @@ def fractional_max_pool3d_with_indices(
         _random_samples = tensorplay.rand(B, C, 3, dtype=input.dtype, device=input.device)
     _frac_pool_check(x, _random_samples, 3)
 
-    P = B * C
-    i64 = DType.int64
-    dev = x.device
-    seq_t = _frac_generate_intervals(_random_samples[..., 0].reshape(-1), T, oT, kt)
-    seq_h = _frac_generate_intervals(_random_samples[..., 1].reshape(-1), H, oH, kh)
-    seq_w = _frac_generate_intervals(_random_samples[..., 2].reshape(-1), W, oW, kw)
-
-    ds = seq_t.reshape(P, oT, 1, 1, 1, 1, 1) + tensorplay.arange(kt, dtype=i64, device=dev).view(1, 1, 1, 1, kt, 1, 1)
-    hs = seq_h.reshape(P, 1, oH, 1, 1, 1, 1) + tensorplay.arange(kh, dtype=i64, device=dev).view(1, 1, 1, 1, 1, kh, 1)
-    ws = seq_w.reshape(P, 1, 1, oW, 1, 1, 1) + tensorplay.arange(kw, dtype=i64, device=dev).view(1, 1, 1, 1, 1, 1, kw)
-    pos = (ds * H + hs) * W + ws                # (P, oT, oH, oW, kt, kh, kw)
-    pos = pos.contiguous().reshape(P, oT * oH * oW, kt * kh * kw)
-
-    picked, idx = _frac_windowed_max(x.reshape(P, T * H * W), pos, T * H * W)
-    values = picked.reshape(B, C, oT, oH, oW)
-    indices = idx.reshape(B, C, oT, oH, oW)
+    # Native kernel (aten/src/ATen/native/FractionalMaxPool3d.cpp semantics);
+    # samples ordered (T, H, W), indices flat in-plane offsets.
+    values, indices = _C.fractional_max_pool3d(x, [kt, kh, kw], [oT, oH, oW], _random_samples)
     if unbatched:
         return values.squeeze(0), indices.squeeze(0)
     return values, indices
@@ -3945,27 +3864,6 @@ def _unpool_output_size(
     return ret
 
 
-def _max_unpool_scatter(input, indices, out_shape):
-    """Scatter pooled values into a zero canvas at ``indices``."""
-    N, C = input.shape[0], input.shape[1]
-    total = 1
-    for s in out_shape:
-        total *= s
-    P = N * C
-    if indices.numel():
-        imax = int(indices.max().item())
-        imin = int(indices.min().item())
-        if imax >= total or imin < -total:
-            raise ValueError(
-                f"Found an invalid max index: {imax if imax >= total else imin} "
-                f"(output sizes are {tuple(out_shape)})")
-    canvas = tensorplay.zeros(P * total, dtype=input.dtype, device=input.device)
-    base = (tensorplay.arange(P, dtype=DType.int64, device=input.device) * total).view(P, 1)
-    gid = base + indices.reshape(P, -1).to(DType.int64)
-    flat = tensorplay.index_add(canvas, 0, gid.reshape(-1), input.contiguous().reshape(-1))
-    return flat.view(N, C, *out_shape)
-
-
 def max_unpool1d(
     input: Tensor,
     indices: Tensor,
@@ -3982,12 +3880,11 @@ def max_unpool1d(
     _stride = _single(stride) if stride is not None else kernel_size
     padding = _single(padding)
     output_size = _unpool_output_size(input, kernel_size, _stride, padding, output_size)
-    unbatched = input.dim() == 2
-    x = input.unsqueeze(0) if unbatched else input
-    ix = indices.unsqueeze(0) if unbatched else indices
-    out = _max_unpool_scatter(x.unsqueeze(-1), ix.unsqueeze(-1), list(output_size) + [1])
-    out = out.squeeze(-1)
-    return out.squeeze(0) if unbatched else out
+    # ATen has no native max_unpool1d; torch routes it through the 2d kernel
+    # with a trailing singleton dimension (torch/nn/functional.py max_unpool1d).
+    return _C.max_unpool2d(
+        input.unsqueeze(-1), indices.unsqueeze(-1), list(output_size) + [1]
+    ).squeeze(-1)
 
 
 def max_unpool2d(
@@ -4006,11 +3903,9 @@ def max_unpool2d(
     _stride = _pair(stride) if stride is not None else kernel_size
     padding = _pair(padding)
     output_size = _unpool_output_size(input, kernel_size, _stride, padding, output_size)
-    unbatched = input.dim() == 3
-    x = input.unsqueeze(0) if unbatched else input
-    ix = indices.unsqueeze(0) if unbatched else indices
-    out = _max_unpool_scatter(x, ix, list(output_size))
-    return out.squeeze(0) if unbatched else out
+    # Native kernel (aten/src/ATen/native/MaxUnpooling.cpp semantics): scatter
+    # pooled values into a zero canvas at the flat in-plane int64 indices.
+    return _C.max_unpool2d(input, indices, list(output_size))
 
 
 def max_unpool3d(
@@ -4029,8 +3924,5 @@ def max_unpool3d(
     _stride = _triple(stride) if stride is not None else kernel_size
     padding = _triple(padding)
     output_size = _unpool_output_size(input, kernel_size, _stride, padding, output_size)
-    unbatched = input.dim() == 4
-    x = input.unsqueeze(0) if unbatched else input
-    ix = indices.unsqueeze(0) if unbatched else indices
-    out = _max_unpool_scatter(x, ix, list(output_size))
-    return out.squeeze(0) if unbatched else out
+    # Native kernel; stride/padding are validation-only, matching ATen.
+    return _C.max_unpool3d(input, indices, list(output_size), list(_stride), list(padding))

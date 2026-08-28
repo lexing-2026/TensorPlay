@@ -176,6 +176,27 @@ def claims_variant(claimed, f, variant: str) -> bool:
     return (variant, f.cpp_name) in claimed
 
 
+def _probe_info(f, variant: str):
+    """Positional kind signature for the multi-overload fast probe.
+
+    Returns None when the overload cannot be safely kind-probed (unknown kind
+    constant or a trailing IntList splat, whose positional folding changes
+    nargs semantics).  Otherwise a dict with the positional arity, the count
+    of required positionals, and the per-position kind constants -- consumed
+    by the generated dispatcher to pick a candidate overload without raising.
+    """
+    is_method = variant == "method"
+    off = 1 if is_method else 0
+    pos = [a for a in f.args[off:] if not a.kwonly]
+    if pos and pos[-1].type.is_list:
+        return None                       # splat folding: nargs not comparable
+    kinds = [_KIND_CONST.get(cpp_arg_type(a.type)) for a in pos]
+    if not kinds or any(k is None for k in kinds):
+        return None
+    required = sum(1 for a in pos if a.default is None)
+    return {"arity": len(pos), "required": required, "kinds": kinds}
+
+
 def _emit_op(out: list[str], f, variant: str, fn: str,
              own_catch: bool = True) -> bool:
     """Emit one overload entry point under `fn`; False if unsupported.
@@ -471,9 +492,44 @@ def _gen_python_capi(ctx: CodegenContext) -> None:
         # like upstream's PythonArgParser.
         if multi:
             doc = " | ".join(docs)
+            probes = [_probe_info(f, variant) for f in fs]
             out.append(
                 f"static PyObject* {base}(PyObject* self, PyObject* const* args,"
                 " Py_ssize_t nargs, PyObject* kwnames) {")
+            # Kind-probe fast path: for positional-only calls, pick the single
+            # compatible overload by argument kind instead of throwing on each
+            # mismatched candidate (mul_(1.0) etc.).  Enabled only when every
+            # candidate is probeable; a deeper mismatch in the chosen overload
+            # (std::invalid_argument) still falls through to full dispatch.
+            if all(p is not None for p in probes):
+                out.append(
+                    "    if (kwnames == nullptr || PyTuple_GET_SIZE(kwnames) == 0) {")
+                out.append("        int pick = -1;")
+                out.append("        int matches = 0;")
+                for k, p in enumerate(probes):
+                    conds = [f"nargs >= {p['required']}",
+                             f"nargs <= {p['arity']}"]
+                    for i, kc in enumerate(p["kinds"]):
+                        conds.append(
+                            f"(nargs <= {i} || "
+                            f"tpx_py_obj_matches_kind(args[{i}], {kc}))")
+                    out.append(f"        if ({' && '.join(conds)})"
+                               f" {{ pick = {k}; ++matches; }}")
+                out.append("        if (matches == 1) {")
+                out.append("            try {")
+                out.append("                switch (pick) {")
+                for k, ovn in enumerate(ovfns):
+                    out.append(f"                    case {k}: return {ovn}"
+                               "(self, args, nargs, kwnames);")
+                out.append("                }")
+                out.append("            } catch (const std::invalid_argument&) {")
+                out.append("                // deeper mismatch: full dispatch below")
+                out.append("            } catch (const std::exception& e) {")
+                out.append("                tpx_py_set_error(e);")
+                out.append("                return nullptr;")
+                out.append("            }")
+                out.append("        }")
+                out.append("    }")
             out.append("    try {")
             out.append("        std::exception_ptr arg_err;")
             for ovn in ovfns:

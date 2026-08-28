@@ -149,8 +149,10 @@ void TensorIteratorBase::foreach_reduced_elt(
       parallel::in_parallel_region() || !parallelize) {
     auto reduce_dims = num_reduce_dims();
 
+    // reorder_dimensions places reduced dims at the front, so the
+    // non-reduced dims are the trailing ndim - reduce_dims entries.
     DimVector non_reduced_shape(
-        shape.begin() + (shape.size() - reduce_dims), shape.end());
+        shape.begin() + reduce_dims, shape.end());
 
     int64_t non_reduced_numel = 1;
     for (const auto i : non_reduced_shape) {

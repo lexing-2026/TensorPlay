@@ -51,10 +51,20 @@ def _zeropower_via_newtonschulz(
         raise ValueError("Coefficients must be a tuple of exactly 3 values")
     a, b, c = ns_coefficients
     ortho_grad = grad.to(tp.bfloat16)
+    # Normalize before taking the transpose.  TensorPlay's CUDA in-place
+    # pointwise kernels do not safely scatter through a non-contiguous
+    # transpose view; Torch's ``div_`` does.  Keep the BF16 alias observable
+    # (the scalar reference mutates a BF16 momentum buffer) by copying the
+    # normalized result back to the original gradient in that case.
+    norm = ortho_grad.norm().clamp(min=eps)
+    normalized = ortho_grad / norm
+    if grad.dtype == tp.bfloat16:
+        grad.copy_(normalized)
+        ortho_grad = grad.to(tp.bfloat16)
+    else:
+        ortho_grad = normalized
     if grad.size(0) > grad.size(1):
         ortho_grad = ortho_grad.t()
-    # Ensure spectral norm is at most 1
-    ortho_grad.div_(ortho_grad.norm().clamp(min=eps))
     # Perform the NS iterations
     for _ in range(ns_steps):
         gram_matrix = ortho_grad @ ortho_grad.t()
@@ -66,6 +76,178 @@ def _zeropower_via_newtonschulz(
     if grad.size(0) > grad.size(1):
         ortho_grad = ortho_grad.t()
     return ortho_grad
+
+
+def _zeropower_batched_via_newtonschulz(
+    grads: list[Tensor],
+    ns_coefficients: tuple[float, float, float],
+    ns_steps: int,
+    eps: float,
+    *,
+    normalize: bool = True,
+) -> list[Tensor]:
+    """Run Muon's NS loop over one same-shaped CUDA tensor batch.
+
+    Torch's reference implementation intentionally operates on one matrix at
+    a time.  That is the right semantic baseline, but it launches three GEMMs
+    per NS iteration for every parameter.  Packing same-shaped matrices lets
+    CUDA execute the independent products as one strided-batched GEMM while
+    retaining the reference polynomial and dtype (BF16) at every step.
+    """
+    if ns_steps >= 100:
+        raise ValueError(
+            "Number of steps must be less than 100 for computational efficiency"
+        )
+    if len(ns_coefficients) != 3:
+        raise ValueError("Coefficients must be a tuple of exactly 3 values")
+    if not grads:
+        return []
+
+    rows, cols = grads[0].shape
+    ortho_grad = tp.stack(grads, dim=0).to(tp.bfloat16)
+    transposed = rows > cols
+    if transposed:
+        ortho_grad = ortho_grad.transpose(1, 2)
+
+    # The scalar reference calls norm() independently for each matrix.  The
+    # batched reduction has the same mathematical contract and keeps the one
+    # norm/divide stage on the device instead of reintroducing per-tensor
+    # dispatches.
+    if normalize:
+        norms = ortho_grad.norm(dim=(1, 2), keepdim=True).clamp(min=eps)
+        ortho_grad.div_(norms)
+
+    a, b, c = ns_coefficients
+    for _ in range(ns_steps):
+        gram_matrix = ortho_grad @ ortho_grad.transpose(1, 2)
+        gram_update = tp.baddbmm(
+            gram_matrix, gram_matrix, gram_matrix, beta=b, alpha=c
+        )
+        ortho_grad = tp.baddbmm(
+            ortho_grad, gram_update, ortho_grad, beta=a
+        )
+
+    if transposed:
+        ortho_grad = ortho_grad.transpose(1, 2)
+    # Unbind views of a transposed packed batch are not contiguous and cannot
+    # use the multi-tensor pointwise epilogue.  One pack copy is cheaper than
+    # falling back to one add/mul dispatch per parameter.
+    return list(ortho_grad.contiguous().unbind(0))
+
+
+def _try_batched_muon(
+    params: list[Tensor],
+    grads: list[Tensor],
+    muon_momentum_bufs: list[Tensor],
+    *,
+    lr: float,
+    weight_decay: float,
+    momentum: float,
+    nesterov: bool,
+    ns_coefficients: tuple[float, float, float],
+    ns_steps: int,
+    eps: float,
+    adjust_lr_fn: str | None,
+) -> bool:
+    """Use the grouped CUDA path when its layout contract is satisfied."""
+    if len(params) < 2 or isinstance(lr, Tensor):
+        return False
+    if tp.compiler.is_compiling():
+        return False
+
+    supported_dtypes = (tp.float16, tp.bfloat16, tp.float32, tp.float64)
+    buckets: dict[tuple[object, object, tuple[int, ...]], list[int]] = {}
+    for index, (param, grad, buf) in enumerate(
+        zip(params, grads, muon_momentum_bufs)
+    ):
+        if (
+            param.device.type != "cuda"
+            or param.dtype not in supported_dtypes
+            or grad.dtype != param.dtype
+            or buf.dtype != param.dtype
+            or tuple(param.shape) != tuple(grad.shape)
+            or tuple(param.shape) != tuple(buf.shape)
+            or not param.is_contiguous()
+            or not grad.is_contiguous()
+            or not buf.is_contiguous()
+        ):
+            return False
+        key = (param.device.type, param.dtype, tuple(param.shape))
+        buckets.setdefault(key, []).append(index)
+
+    # If every matrix is unique, batching only adds pack/unpack work.  Keep
+    # the exact scalar Torch-shaped route for that case.
+    if not any(len(indices) > 1 for indices in buckets.values()):
+        return False
+
+    for indices in buckets.values():
+        # Tall matrices are transposed inside the reference NS loop.  Keep
+        # those groups on the scalar route until the batched transpose path
+        # has identical reduction behavior; square/wide groups retain the
+        # grouped CUDA fast path below.
+        if (
+            len(indices) == 1
+            or params[indices[0]].shape[0] > params[indices[0]].shape[1]
+        ):
+            for index in indices:
+                buf = muon_momentum_bufs[index]
+                grad = grads[index]
+                buf.lerp_(grad, 1 - momentum)
+                update = grad.lerp(buf, momentum) if nesterov else buf
+                update = _zeropower_via_newtonschulz(
+                    update, ns_coefficients, ns_steps, eps
+                )
+                adjusted_lr = _adjust_lr(lr, adjust_lr_fn, params[index].shape)
+                params[index].mul_(1 - lr * weight_decay)
+                params[index].add_(update, alpha=-adjusted_lr)
+            continue
+
+        group_params = [params[index] for index in indices]
+        group_grads = [grads[index] for index in indices]
+        group_bufs = [muon_momentum_bufs[index] for index in indices]
+
+        # These two operations are the reference buf.lerp_ / grad.lerp pair,
+        # dispatched once for the whole same-dtype group.
+        tp._foreach_lerp_(group_bufs, group_grads, 1 - momentum)
+        group_updates = (
+            tp._foreach_lerp(group_grads, group_bufs, momentum)
+            if nesterov
+            else group_bufs
+        )
+
+        # Torch's scalar reference keeps ``grad.bfloat16()`` as an alias for
+        # BF16 gradients.  In the non-Nesterov case ``update`` is the
+        # momentum buffer itself, so its initial normalization is observable
+        # through optimizer.state.  Normalize the buffers before packing and
+        # skip the second normalization inside the batched NS loop; this
+        # retains the alias-visible state while keeping the GEMMs batched.
+        preserve_bf16_buffer = (
+            not nesterov and group_params[0].dtype == tp.bfloat16
+        )
+        if preserve_bf16_buffer:
+            packed = tp.stack(group_updates, dim=0).to(tp.bfloat16)
+            norms = packed.norm(dim=(1, 2), keepdim=True).clamp(min=eps)
+            normalized = packed / norms
+            tp._foreach_copy_(group_bufs, list(normalized.unbind(0)))
+            group_updates = group_bufs
+        orthogonal_updates = _zeropower_batched_via_newtonschulz(
+            group_updates,
+            ns_coefficients,
+            ns_steps,
+            eps,
+            normalize=not preserve_bf16_buffer,
+        )
+
+        # Muon's NS result is always BF16.  Cast the packed result once so the
+        # final parameter add can use the existing CUDA multi-tensor kernel.
+        if group_params[0].dtype != tp.bfloat16:
+            packed = tp.stack(orthogonal_updates, dim=0).to(group_params[0].dtype)
+            orthogonal_updates = list(packed.unbind(0))
+
+        adjusted_lr = _adjust_lr(lr, adjust_lr_fn, group_params[0].shape)
+        tp._foreach_mul_(group_params, 1 - lr * weight_decay)
+        tp._foreach_add_(group_params, orthogonal_updates, alpha=-adjusted_lr)
+    return True
 
 
 def _adjust_lr(lr: float, adjust_lr_fn: str | None, param_shape: tp.Size) -> float:
@@ -331,6 +513,21 @@ def _single_tensor_muon(
     lr = _to_scalar(lr)
     if has_complex:
         raise ValueError("Complex parameters are not supported")
+
+    if _try_batched_muon(
+        params,
+        grads,
+        muon_momentum_bufs,
+        lr=lr,
+        weight_decay=weight_decay,
+        momentum=momentum,
+        nesterov=nesterov,
+        ns_coefficients=ns_coefficients,
+        ns_steps=ns_steps,
+        eps=eps,
+        adjust_lr_fn=adjust_lr_fn,
+    ):
+        return
 
     for i, param in enumerate(params):
         grad = grads[i]

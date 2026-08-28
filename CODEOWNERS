@@ -1,0 +1,35 @@
+# This file routes review ownership per path, mirroring pytorch's CODEOWNERS.
+# Scopes align with the "release notes: *" label family (see .github/labels.yml).
+
+# Default owner for everything in the repo
+* @lexing-2026
+
+# Python frontend, Tensor API and bindings
+/tensorplay/ @lexing-2026
+/src/bindings/ @lexing-2026
+
+# TPX autograd engine
+/tpx/ @lexing-2026
+/config/derivatives.yaml @lexing-2026
+
+# Stax compiler and tensorplay.compile
+/stax/ @lexing-2026
+/tensorplay/compiler/ @lexing-2026
+
+# p10 core library and CPU/CUDA kernels
+/p10/ @lexing-2026
+/config/native_functions.yaml @lexing-2026
+
+# CUDA runtime, streams, graphs and caching allocator
+/tensorplay/cuda/ @lexing-2026
+
+# Build system, packaging, CI and release tooling
+/CMakeLists.txt @lexing-2026
+/cmake/ @lexing-2026
+/.github/ @lexing-2026
+/tools/ @lexing-2026
+/pyproject.toml @lexing-2026
+/version.txt @lexing-2026
+
+# Documentation
+/docs/ @lexing-2026

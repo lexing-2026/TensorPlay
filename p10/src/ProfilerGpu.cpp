@@ -140,8 +140,16 @@ GpuTimerPair::~GpuTimerPair() {
 }
 
 void GpuTimerPair::arm(const Device& device) {
-    if (!g_gpu_timing.load(std::memory_order_acquire) || !rec_.live_ ||
-        !device.is_cuda()) return;
+    if (!rec_.live_ || !device.is_cuda()) return;
+    // gpu_trace mode (CUPTI): bracket the dispatch with the op's slot as an
+    // external correlation id, so every kernel this op launches carries the
+    // id and joins back to the op (op -> runtime API -> kernel).  Push/pop
+    // is CUPTI's per-thread stack, so composite inner ops nest correctly.
+    if (g_gpu_trace.load(std::memory_order_acquire)) {
+        rec_.trace_pushed_ =
+            cupti_push_ext(static_cast<uint64_t>(rec_.slot_));
+    }
+    if (!g_gpu_timing.load(std::memory_order_acquire)) return;
     const auto stream = cuda::getCurrentCUDAStream();
     cudaEvent_t start = acquire_event(stream.device_index());
     if (!start || cudaEventRecord(start, stream.stream()) != cudaSuccess) {
@@ -155,6 +163,10 @@ void GpuTimerPair::arm(const Device& device) {
 }
 
 void GpuTimerPair::close() {
+    if (rec_.trace_pushed_) {
+        rec_.trace_pushed_ = false;
+        cupti_pop_ext();
+    }
     if (!armed_) return;
     armed_ = false;
     auto* start = static_cast<cudaEvent_t>(gpu_start_);

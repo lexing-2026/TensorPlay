@@ -1,7 +1,9 @@
 # Ported from torch/distributed/collective_utils.py.
 #
-# Adaptations: tp Generator state APIs are not exposed yet, so
-# _check_rng_sync raises NotImplementedError (torch's shape kept).
+# Adaptations: CUDA RNG state introspection is not exposed yet, so
+# _check_rng_sync's philox path raises NotImplementedError (torch's shape
+# kept); the CPU path hashes state bytes with hashlib instead of
+# torch.hash_tensor (deterministic, printable summaries).
 
 """
 A set of primitive functions for performing collective ops.
@@ -282,6 +284,53 @@ def _summarize_ranks(ranks: Iterable[int]) -> str:
 
 
 def _check_rng_sync(generator, group) -> str | None:
-    raise NotImplementedError(
-        "_check_rng_sync requires tp Generator state APIs; pending native work."
-    )
+    import hashlib
+
+    if generator is not None and getattr(generator, "device", None) is not None \
+            and generator.device.type != "cpu":
+        raise NotImplementedError(
+            f"Unsupported generator device: {generator.device.type}; "
+            "tp does not expose per-device CUDA RNG state yet"
+        )
+
+    if generator is not None:
+        state_tensor = generator.get_state()
+    else:
+        state_tensor = tp.get_rng_state()
+
+    # Summarize the state vector: (1) differs iff states differ, (2)
+    # printable (desync table must not print the 5k state vector). The
+    # digest is exchanged through the object collective because the raw
+    # state lives on CPU while NCCL groups only accept CUDA tensors
+    # (torch gathers the state tensor directly; only its gloo path does).
+    digest = hashlib.sha256(state_tensor.contiguous().numpy().tobytes())
+    local = int.from_bytes(digest.digest()[:8], "big")
+
+    size = group.size() if group is not None else dist.get_world_size()
+    digests = [None] * size
+    dist.all_gather_object(digests, local, group=group)
+
+    state_ranks: dict[Any, set] = defaultdict(set)
+    for rank, value in enumerate(digests):
+        state_ranks[value].add(rank)
+
+    return _check_rng_sync_log(state_ranks, "Generator state hash")
+
+
+def _check_rng_sync_log(value_ranks: dict[Any, set], tag: str) -> str | None:
+    log_str = None
+    if len(value_ranks) > 1:
+        headers = ["Ranks", f"{tag} values"]
+        rank_values = [
+            [_summarize_ranks(set(ranks)), str(value)]
+            for value, ranks in value_ranks.items()
+        ]
+        if importlib.util.find_spec("tabulate"):
+            from tabulate import tabulate
+
+            table = tabulate(rank_values, headers=headers)
+        else:
+            table = str(f"{headers}\n{rank_values}")
+        log_str = f"Generator desync detected:\n{table}"
+        logger.error(log_str)
+    return log_str

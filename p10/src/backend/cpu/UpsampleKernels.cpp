@@ -45,6 +45,16 @@ inline float compute_scales_value_f(const std::optional<double>& scale,
         : static_cast<float>(static_cast<double>(input_size) / output_size);
 }
 
+// ATen UpSample.cuh compute_scales_value_backwards: the nearest-backward
+// index math wants the output/input ratio, and an explicit scale_factor is
+// used as-is (not inverted like in the forward).
+inline float compute_scales_value_backwards_f(const std::optional<double>& scale,
+                                              int64_t src_size, int64_t dst_size) {
+    return (scale.has_value() && scale.value() > 0.)
+        ? static_cast<float>(scale.value())
+        : static_cast<float>(static_cast<double>(src_size) / dst_size);
+}
+
 inline float area_pixel_compute_scale_f(int64_t input_size, int64_t output_size,
                                         bool align_corners,
                                         const std::optional<double>& scale) {
@@ -139,7 +149,7 @@ Tensor upsample_nearest1d_cpu(const Tensor& self, std::vector<int64_t> output_si
         const scalar_t* idata = in.data_ptr<scalar_t>();
         scalar_t* odata = result.data_ptr<scalar_t>();
         const float width_scale = compute_scales_value_f(scales, W1, W2);
-        parallel_for(0, N * C * W2, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        parallel_for(0, N * C * W2, 1, [&](int64_t begin, int64_t end) {
             for (int64_t it = begin; it < end; ++it) {
                 const int64_t w2 = it % W2;
                 const int64_t nc = it / W2;
@@ -165,15 +175,23 @@ Tensor upsample_nearest2d_cpu(const Tensor& self, std::vector<int64_t> output_si
         scalar_t* odata = result.data_ptr<scalar_t>();
         const float height_scale = compute_scales_value_f(scales_h, H1, H2);
         const float width_scale = compute_scales_value_f(scales_w, W1, W2);
-        parallel_for(0, N * C * H2 * W2, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-            for (int64_t it = begin; it < end; ++it) {
-                const int64_t w2 = it % W2;
-                const int64_t h2 = (it / W2) % H2;
-                const int64_t nc = it / (H2 * W2);
+        // Parallel over (n, c, h2) output rows; each gathers one row.
+        parallel_for(0, N * C * H2, 1, [&](int64_t begin, int64_t end) {
+            for (int64_t idx = begin; idx < end; ++idx) {
+                const int64_t h2 = idx % H2;
+                const int64_t nc = idx / H2;
                 // ATen UpSampleNearest2d.cu upsample_nearest2d_out_frame
                 const int64_t h1 = (H1 == H2) ? h2 : nearest_neighbor_compute_source_index(height_scale, h2, H1);
-                const int64_t w1 = (W1 == W2) ? w2 : nearest_neighbor_compute_source_index(width_scale, w2, W1);
-                odata[it] = idata[(nc * H1 + h1) * W1 + w1];
+                const scalar_t* src_row = idata + (nc * H1 + h1) * W1;
+                scalar_t* dst_row = odata + idx * W2;
+                if (W1 == W2) {
+                    for (int64_t w2 = 0; w2 < W2; ++w2) dst_row[w2] = src_row[w2];
+                } else {
+                    for (int64_t w2 = 0; w2 < W2; ++w2) {
+                        const int64_t w1 = nearest_neighbor_compute_source_index(width_scale, w2, W1);
+                        dst_row[w2] = src_row[w1];
+                    }
+                }
             }
         });
     });
@@ -195,7 +213,7 @@ Tensor upsample_nearest3d_cpu(const Tensor& self, std::vector<int64_t> output_si
         const float depth_scale = compute_scales_value_f(scales_d, D1, D2);
         const float height_scale = compute_scales_value_f(scales_h, H1, H2);
         const float width_scale = compute_scales_value_f(scales_w, W1, W2);
-        parallel_for(0, N * C * D2 * H2 * W2, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        parallel_for(0, N * C * D2 * H2 * W2, 1, [&](int64_t begin, int64_t end) {
             for (int64_t it = begin; it < end; ++it) {
                 const int64_t w2 = it % W2;
                 const int64_t h2 = (it / W2) % H2;
@@ -228,22 +246,30 @@ Tensor upsample_linear1d_cpu(const Tensor& self, std::vector<int64_t> output_siz
         const scalar_t* idata = in.data_ptr<scalar_t>();
         scalar_t* odata = result.data_ptr<scalar_t>();
         const accscalar_t rwidth = area_pixel_compute_scale_f(W1, W2, align_corners, scales);
-        for (int64_t n = 0; n < N; ++n) {
-            for (int64_t c = 0; c < C; ++c) {
+        // ATen UpSampleLinear1d.cu upsample_linear1d_out_frame; per-column
+        // source index/weights hoisted into shared tables.
+        std::vector<int64_t> w1_tab(W2), w1p_tab(W2);
+        std::vector<accscalar_t> w1l_tab(W2), w0l_tab(W2);
+        for (int64_t w2 = 0; w2 < W2; ++w2) {
+            const accscalar_t w1r = area_pixel_compute_source_index_f(rwidth, w2, align_corners, /*cubic=*/false);
+            const int64_t w1 = static_cast<int64_t>(w1r);
+            w1_tab[w2] = w1;
+            w1p_tab[w2] = (w1 < W1 - 1) ? 1 : 0;
+            w1l_tab[w2] = w1r - static_cast<accscalar_t>(w1);
+            w0l_tab[w2] = static_cast<accscalar_t>(1) - w1l_tab[w2];
+        }
+        parallel_for(0, N * C, 1, [&](int64_t begin, int64_t end) {
+            for (int64_t nc = begin; nc < end; ++nc) {
+                const scalar_t* iptr = idata + nc * W1;
+                scalar_t* optr = odata + nc * W2;
                 for (int64_t w2 = 0; w2 < W2; ++w2) {
-                    // ATen UpSampleLinear1d.cu upsample_linear1d_out_frame
-                    const accscalar_t w1r = area_pixel_compute_source_index_f(rwidth, w2, align_corners, /*cubic=*/false);
-                    const int64_t w1 = static_cast<int64_t>(w1r);
-                    const int64_t w1p = (w1 < W1 - 1) ? 1 : 0;
-                    const accscalar_t w1lambda = w1r - static_cast<accscalar_t>(w1);
-                    const accscalar_t w0lambda = static_cast<accscalar_t>(1) - w1lambda;
+                    const int64_t w1 = w1_tab[w2];
                     const accscalar_t val =
-                        w0lambda * idata[(n * C + c) * W1 + w1] +
-                        w1lambda * idata[(n * C + c) * W1 + w1 + w1p];
-                    odata[(n * C + c) * W2 + w2] = static_cast<scalar_t>(val);
+                        w0l_tab[w2] * iptr[w1] + w1l_tab[w2] * iptr[w1 + w1p_tab[w2]];
+                    optr[w2] = static_cast<scalar_t>(val);
                 }
             }
-        }
+        });
     });
     return result;
 }
@@ -262,12 +288,25 @@ Tensor upsample_bilinear2d_cpu(const Tensor& self, std::vector<int64_t> output_s
         scalar_t* odata = result.data_ptr<scalar_t>();
         const accscalar_t rheight = area_pixel_compute_scale_f(height1, height2, align_corners, scales_h);
         const accscalar_t rwidth = area_pixel_compute_scale_f(width1, width2, align_corners, scales_w);
-        const int64_t num_kernels = height2 * width2;
-        parallel_for(0, num_kernels, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-            for (int64_t index = begin; index < end; ++index) {
-                // ATen UpSampleBilinear2d.cu upsample_bilinear2d_out_frame
-                const int64_t w2 = index % width2;
-                const int64_t h2 = index / width2;
+
+        // ATen UpSampleBilinear2d.cu upsample_bilinear2d_out_frame, but the
+        // per-column source index/weights depend only on w2, so hoist them
+        // into shared tables (read-only, computed once).
+        std::vector<int64_t> w1_tab(width2), w1p_tab(width2);
+        std::vector<accscalar_t> w1l_tab(width2), w0l_tab(width2);
+        for (int64_t w2 = 0; w2 < width2; ++w2) {
+            const accscalar_t w1r = area_pixel_compute_source_index_f(rwidth, w2, align_corners, /*cubic=*/false);
+            const int64_t w1 = static_cast<int64_t>(w1r);
+            w1_tab[w2] = w1;
+            w1p_tab[w2] = (w1 < width1 - 1) ? 1 : 0;
+            w1l_tab[w2] = w1r - static_cast<accscalar_t>(w1);
+            w0l_tab[w2] = static_cast<accscalar_t>(1) - w1l_tab[w2];
+        }
+
+        parallel_for(0, batchsize * channels * height2, 1, [&](int64_t begin, int64_t end) {
+            for (int64_t idx = begin; idx < end; ++idx) {
+                const int64_t h2 = idx % height2;
+                const int64_t nc = idx / height2;
 
                 const accscalar_t h1r = area_pixel_compute_source_index_f(rheight, h2, align_corners, /*cubic=*/false);
                 const int64_t h1 = static_cast<int64_t>(h1r);
@@ -275,24 +314,19 @@ Tensor upsample_bilinear2d_cpu(const Tensor& self, std::vector<int64_t> output_s
                 const accscalar_t h1lambda = h1r - static_cast<accscalar_t>(h1);
                 const accscalar_t h0lambda = static_cast<accscalar_t>(1) - h1lambda;
 
-                const accscalar_t w1r = area_pixel_compute_source_index_f(rwidth, w2, align_corners, /*cubic=*/false);
-                const int64_t w1 = static_cast<int64_t>(w1r);
-                const int64_t w1p = (w1 < width1 - 1) ? 1 : 0;
-                const accscalar_t w1lambda = w1r - static_cast<accscalar_t>(w1);
-                const accscalar_t w0lambda = static_cast<accscalar_t>(1) - w1lambda;
-
-                for (int64_t n = 0; n < batchsize; ++n) {
-                    for (int64_t c = 0; c < channels; ++c) {
-                        const scalar_t* iptr = idata + (n * channels + c) * height1 * width1;
-                        const accscalar_t val = h0lambda *
-                                (w0lambda * iptr[h1 * width1 + w1] +
-                                 w1lambda * iptr[h1 * width1 + w1 + w1p]) +
-                            h1lambda *
-                                (w0lambda * iptr[(h1 + h1p) * width1 + w1] +
-                                 w1lambda * iptr[(h1 + h1p) * width1 + w1 + w1p]);
-                        odata[(n * channels + c) * height2 * width2 + h2 * width2 + w2] =
-                            static_cast<scalar_t>(val);
-                    }
+                const scalar_t* row0 = idata + nc * height1 * width1 + h1 * width1;
+                const scalar_t* row1 = row0 + h1p * width1;
+                scalar_t* orow = odata + idx * width2;
+                for (int64_t w2 = 0; w2 < width2; ++w2) {
+                    const int64_t w1 = w1_tab[w2];
+                    const int64_t w1p = w1p_tab[w2];
+                    const accscalar_t w1lambda = w1l_tab[w2];
+                    const accscalar_t w0lambda = w0l_tab[w2];
+                    const accscalar_t val = h0lambda *
+                            (w0lambda * row0[w1] + w1lambda * row0[w1 + w1p]) +
+                        h1lambda *
+                            (w0lambda * row1[w1] + w1lambda * row1[w1 + w1p]);
+                    orow[w2] = static_cast<scalar_t>(val);
                 }
             }
         });
@@ -316,52 +350,59 @@ Tensor upsample_trilinear3d_cpu(const Tensor& self, std::vector<int64_t> output_
         const accscalar_t rdepth = area_pixel_compute_scale_f(depth1, depth2, align_corners, scales_d);
         const accscalar_t rheight = area_pixel_compute_scale_f(height1, height2, align_corners, scales_h);
         const accscalar_t rwidth = area_pixel_compute_scale_f(width1, width2, align_corners, scales_w);
-        for (int64_t n = 0; n < batchsize; ++n) {
-            for (int64_t c = 0; c < channels; ++c) {
-                const scalar_t* iptr = idata + (n * channels + c) * depth1 * height1 * width1;
-                scalar_t* optr = odata + (n * channels + c) * depth2 * height2 * width2;
-                for (int64_t t2 = 0; t2 < depth2; ++t2) {
-                    for (int64_t h2 = 0; h2 < height2; ++h2) {
-                        for (int64_t w2 = 0; w2 < width2; ++w2) {
-                            // ATen UpSampleTrilinear3d.cu upsample_trilinear3d_out_frame
-                            const accscalar_t t1r = area_pixel_compute_source_index_f(rdepth, t2, align_corners, false);
-                            const int64_t t1 = static_cast<int64_t>(t1r);
-                            const int64_t t1p = (t1 < depth1 - 1) ? 1 : 0;
-                            const accscalar_t t1lambda = t1r - static_cast<accscalar_t>(t1);
-                            const accscalar_t t0lambda = static_cast<accscalar_t>(1) - t1lambda;
 
-                            const accscalar_t h1r = area_pixel_compute_source_index_f(rheight, h2, align_corners, false);
-                            const int64_t h1 = static_cast<int64_t>(h1r);
-                            const int64_t h1p = (h1 < height1 - 1) ? 1 : 0;
-                            const accscalar_t h1lambda = h1r - static_cast<accscalar_t>(h1);
-                            const accscalar_t h0lambda = static_cast<accscalar_t>(1) - h1lambda;
+        // ATen UpSampleTrilinear3d.cu upsample_trilinear3d_out_frame;
+        // per-column weights hoisted into a shared table.
+        std::vector<int64_t> w1_tab(width2), w1p_tab(width2);
+        std::vector<accscalar_t> w1l_tab(width2), w0l_tab(width2);
+        for (int64_t w2 = 0; w2 < width2; ++w2) {
+            const accscalar_t w1r = area_pixel_compute_source_index_f(rwidth, w2, align_corners, false);
+            const int64_t w1 = static_cast<int64_t>(w1r);
+            w1_tab[w2] = w1;
+            w1p_tab[w2] = (w1 < width1 - 1) ? 1 : 0;
+            w1l_tab[w2] = w1r - static_cast<accscalar_t>(w1);
+            w0l_tab[w2] = static_cast<accscalar_t>(1) - w1l_tab[w2];
+        }
 
-                            const accscalar_t w1r = area_pixel_compute_source_index_f(rwidth, w2, align_corners, false);
-                            const int64_t w1 = static_cast<int64_t>(w1r);
-                            const int64_t w1p = (w1 < width1 - 1) ? 1 : 0;
-                            const accscalar_t w1lambda = w1r - static_cast<accscalar_t>(w1);
-                            const accscalar_t w0lambda = static_cast<accscalar_t>(1) - w1lambda;
+        parallel_for(0, batchsize * channels * depth2 * height2, 1, [&](int64_t begin, int64_t end) {
+            for (int64_t idx = begin; idx < end; ++idx) {
+                const int64_t h2 = idx % height2;
+                const int64_t t2 = (idx / height2) % depth2;
+                const int64_t nc = idx / (height2 * depth2);
 
-                            const accscalar_t val = t0lambda *
-                                    (h0lambda *
-                                         (w0lambda * iptr[(t1 * height1 + h1) * width1 + w1] +
-                                          w1lambda * iptr[(t1 * height1 + h1) * width1 + w1 + w1p]) +
-                                     h1lambda *
-                                         (w0lambda * iptr[(t1 * height1 + h1 + h1p) * width1 + w1] +
-                                          w1lambda * iptr[(t1 * height1 + h1 + h1p) * width1 + w1 + w1p])) +
-                                t1lambda *
-                                    (h0lambda *
-                                         (w0lambda * iptr[((t1 + t1p) * height1 + h1) * width1 + w1] +
-                                          w1lambda * iptr[((t1 + t1p) * height1 + h1) * width1 + w1 + w1p]) +
-                                     h1lambda *
-                                         (w0lambda * iptr[((t1 + t1p) * height1 + h1 + h1p) * width1 + w1] +
-                                          w1lambda * iptr[((t1 + t1p) * height1 + h1 + h1p) * width1 + w1 + w1p]));
-                            optr[(t2 * height2 + h2) * width2 + w2] = static_cast<scalar_t>(val);
-                        }
-                    }
+                const accscalar_t t1r = area_pixel_compute_source_index_f(rdepth, t2, align_corners, false);
+                const int64_t t1 = static_cast<int64_t>(t1r);
+                const int64_t t1p = (t1 < depth1 - 1) ? 1 : 0;
+                const accscalar_t t1lambda = t1r - static_cast<accscalar_t>(t1);
+                const accscalar_t t0lambda = static_cast<accscalar_t>(1) - t1lambda;
+
+                const accscalar_t h1r = area_pixel_compute_source_index_f(rheight, h2, align_corners, false);
+                const int64_t h1 = static_cast<int64_t>(h1r);
+                const int64_t h1p = (h1 < height1 - 1) ? 1 : 0;
+                const accscalar_t h1lambda = h1r - static_cast<accscalar_t>(h1);
+                const accscalar_t h0lambda = static_cast<accscalar_t>(1) - h1lambda;
+
+                const scalar_t* vol = idata + nc * depth1 * height1 * width1;
+                const scalar_t* s00 = vol + (t1 * height1 + h1) * width1;
+                const scalar_t* s01 = s00 + h1p * width1;
+                const scalar_t* s10 = s00 + t1p * height1 * width1;
+                const scalar_t* s11 = s10 + h1p * width1;
+                scalar_t* orow = odata + idx * width2;
+                for (int64_t w2 = 0; w2 < width2; ++w2) {
+                    const int64_t w1 = w1_tab[w2];
+                    const int64_t w1p = w1p_tab[w2];
+                    const accscalar_t w1lambda = w1l_tab[w2];
+                    const accscalar_t w0lambda = w0l_tab[w2];
+                    const accscalar_t val = t0lambda *
+                            (h0lambda * (w0lambda * s00[w1] + w1lambda * s00[w1 + w1p]) +
+                             h1lambda * (w0lambda * s01[w1] + w1lambda * s01[w1 + w1p])) +
+                        t1lambda *
+                            (h0lambda * (w0lambda * s10[w1] + w1lambda * s10[w1 + w1p]) +
+                             h1lambda * (w0lambda * s11[w1] + w1lambda * s11[w1 + w1p]));
+                    orow[w2] = static_cast<scalar_t>(val);
                 }
             }
-        }
+        });
     });
     return result;
 }
@@ -385,51 +426,47 @@ Tensor upsample_bicubic2d_cpu(const Tensor& self, std::vector<int64_t> output_si
         const accscalar_t height_scale = area_pixel_compute_scale_f(input_height, output_height, align_corners, scales_h);
         const accscalar_t width_scale = area_pixel_compute_scale_f(input_width, output_width, align_corners, scales_w);
 
-        auto get_value_bounded = [&](int64_t n, int64_t c, int64_t y, int64_t x) -> scalar_t {
-            // ATen UpSample.cuh upsample_get_value_bounded
-            const int64_t access_y = std::clamp(y, static_cast<int64_t>(0), input_height - 1);
-            const int64_t access_x = std::clamp(x, static_cast<int64_t>(0), input_width - 1);
-            return idata[(n * channels + c) * input_height * input_width + access_y * input_width + access_x];
-        };
+        // Parallel over (n, c, output_y) rows.
+        parallel_for(0, batchsize * channels * output_height, 1, [&](int64_t begin, int64_t end) {
+            for (int64_t idx = begin; idx < end; ++idx) {
+                const int64_t output_y = idx % output_height;
+                const int64_t nc = idx / output_height;
+                const scalar_t* plane = idata + nc * input_height * input_width;
+                scalar_t* orow = odata + idx * output_width;
 
-        const int64_t num_kernels = output_height * output_width;
-        parallel_for(0, num_kernels, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-            for (int64_t index = begin; index < end; ++index) {
-                const int64_t output_x = index % output_width;
-                const int64_t output_y = index / output_width;
                 if (input_height == output_height && input_width == output_width) {
-                    for (int64_t n = 0; n < batchsize; ++n) {
-                        for (int64_t c = 0; c < channels; ++c) {
-                            odata[(n * channels + c) * output_height * output_width + output_y * output_width + output_x] =
-                                idata[(n * channels + c) * input_height * input_width + output_y * input_width + output_x];
-                        }
-                    }
+                    const scalar_t* irow = plane + output_y * input_width;
+                    for (int64_t x = 0; x < output_width; ++x) orow[x] = irow[x];
                     continue;
                 }
 
-                const accscalar_t real_x = area_pixel_compute_source_index_f(width_scale, output_x, align_corners, /*cubic=*/true);
-                const int64_t in_x = static_cast<int64_t>(std::floor(real_x));
-                const accscalar_t t_x = real_x - static_cast<accscalar_t>(in_x);
+                // ATen UpSample.cuh upsample_get_value_bounded (per plane).
+                auto get_value_bounded = [&](int64_t y, int64_t x) -> scalar_t {
+                    const int64_t access_y = std::clamp(y, static_cast<int64_t>(0), input_height - 1);
+                    const int64_t access_x = std::clamp(x, static_cast<int64_t>(0), input_width - 1);
+                    return plane[access_y * input_width + access_x];
+                };
 
                 const accscalar_t real_y = area_pixel_compute_source_index_f(height_scale, output_y, align_corners, /*cubic=*/true);
                 const int64_t in_y = static_cast<int64_t>(std::floor(real_y));
                 const accscalar_t t_y = real_y - static_cast<accscalar_t>(in_y);
 
-                for (int64_t n = 0; n < batchsize; ++n) {
-                    for (int64_t c = 0; c < channels; ++c) {
-                        accscalar_t coefficients[4];
-                        for (int k = 0; k < 4; ++k) {
-                            coefficients[k] = cubic_interp1d(
-                                get_value_bounded(n, c, in_y - 1 + k, in_x - 1),
-                                get_value_bounded(n, c, in_y - 1 + k, in_x + 0),
-                                get_value_bounded(n, c, in_y - 1 + k, in_x + 1),
-                                get_value_bounded(n, c, in_y - 1 + k, in_x + 2),
-                                t_x);
-                        }
-                        odata[(n * channels + c) * output_height * output_width + output_y * output_width + output_x] =
-                            static_cast<scalar_t>(cubic_interp1d(
-                                coefficients[0], coefficients[1], coefficients[2], coefficients[3], t_y));
+                for (int64_t output_x = 0; output_x < output_width; ++output_x) {
+                    const accscalar_t real_x = area_pixel_compute_source_index_f(width_scale, output_x, align_corners, /*cubic=*/true);
+                    const int64_t in_x = static_cast<int64_t>(std::floor(real_x));
+                    const accscalar_t t_x = real_x - static_cast<accscalar_t>(in_x);
+
+                    accscalar_t coefficients[4];
+                    for (int k = 0; k < 4; ++k) {
+                        coefficients[k] = cubic_interp1d(
+                            get_value_bounded(in_y - 1 + k, in_x - 1),
+                            get_value_bounded(in_y - 1 + k, in_x + 0),
+                            get_value_bounded(in_y - 1 + k, in_x + 1),
+                            get_value_bounded(in_y - 1 + k, in_x + 2),
+                            t_x);
                     }
+                    orow[output_x] = static_cast<scalar_t>(cubic_interp1d(
+                        coefficients[0], coefficients[1], coefficients[2], coefficients[3], t_y));
                 }
             }
         });
@@ -458,8 +495,11 @@ Tensor upsample_nearest1d_backward_cpu(const Tensor& grad_output, std::vector<in
     UP_DISPATCH(go, {
         const scalar_t* grad_o = go.data_ptr<scalar_t>();
         scalar_t* grad_i = grad_input.data_ptr<scalar_t>();
-        const float width_scale = compute_scales_value_f(scales, dst_dim_w, src_dim_w);
-        parallel_for(0, dim_c * dst_dim_w, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        // ATen compute_scales_value_backwards(scales, output_size, input_size):
+        // the backward index math needs the output/input ratio (src = output
+        // pixels, dst = input pixels here).
+        const float width_scale = compute_scales_value_backwards_f(scales, src_dim_w, dst_dim_w);
+        parallel_for(0, dim_c * dst_dim_w, 1, [&](int64_t begin, int64_t end) {
             for (int64_t dst_idx = begin; dst_idx < end; ++dst_idx) {
                 const int64_t c = dst_idx / dst_dim_w;
                 const int64_t dst_x = dst_idx % dst_dim_w;
@@ -501,37 +541,49 @@ Tensor upsample_nearest2d_backward_cpu(const Tensor& grad_output, std::vector<in
     UP_DISPATCH(go, {
         const scalar_t* grad_o = go.data_ptr<scalar_t>();
         scalar_t* grad_i = grad_input.data_ptr<scalar_t>();
-        const float height_scale = compute_scales_value_f(scales_h, dst_dim_h, src_dim_h);
-        const float width_scale = compute_scales_value_f(scales_w, dst_dim_w, src_dim_w);
-        parallel_for(0, dim_c * dst_c_stride, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-            for (int64_t dst_idx = begin; dst_idx < end; ++dst_idx) {
-                const int64_t c = (dst_idx / dst_c_stride) % dim_c;
-                const int64_t dst_y = (dst_idx / dst_dim_w) % dst_dim_h;
-                // note that we do not want to clamp src_y to src_dim_y,
-                // since we might intentionally want to skip in case of
-                // scale_factor < 1.0
-                const int src_y = (src_dim_h == dst_dim_h)
-                    ? static_cast<int>(dst_y)
-                    : nearest_neighbor_bw_compute_source_index(height_scale, static_cast<int>(dst_y), static_cast<int>(src_dim_h));
-                const int src_y_up = (src_dim_h == dst_dim_h)
-                    ? static_cast<int>(dst_y + 1)
-                    : nearest_neighbor_bw_compute_source_index(height_scale, static_cast<int>(dst_y + 1), static_cast<int>(src_dim_h));
-                const int64_t dst_x = dst_idx % dst_dim_w;
-                const int src_x = (src_dim_w == dst_dim_w)
-                    ? static_cast<int>(dst_x)
-                    : nearest_neighbor_bw_compute_source_index(width_scale, static_cast<int>(dst_x), static_cast<int>(src_dim_w));
-                const int src_x_up = (src_dim_w == dst_dim_w)
-                    ? static_cast<int>(dst_x + 1)
-                    : nearest_neighbor_bw_compute_source_index(width_scale, static_cast<int>(dst_x + 1), static_cast<int>(src_dim_w));
+        // ATen compute_scales_value_backwards: output/input ratio (src = output).
+        const float height_scale = compute_scales_value_backwards_f(scales_h, src_dim_h, dst_dim_h);
+        const float width_scale = compute_scales_value_backwards_f(scales_w, src_dim_w, dst_dim_w);
 
-                for (int64_t b = 0; b < dim_b; ++b) {
-                    accscalar_t grad = 0;
-                    for (int y = src_y; y < src_y_up; ++y) {
-                        for (int x = src_x; x < src_x_up; ++x) {
-                            grad += grad_o[b * dim_c * src_c_stride + c * src_c_stride + y * src_dim_w + x];
+        // Per-column gather ranges depend only on dst_x: shared tables.
+        // (Not clamped to src_dim_w on purpose: scale_factor < 1.0 may skip.)
+        std::vector<int> sx_tab(dst_dim_w), sx_up_tab(dst_dim_w);
+        for (int64_t dst_x = 0; dst_x < dst_dim_w; ++dst_x) {
+            if (src_dim_w == dst_dim_w) {
+                sx_tab[dst_x] = static_cast<int>(dst_x);
+                sx_up_tab[dst_x] = static_cast<int>(dst_x + 1);
+            } else {
+                sx_tab[dst_x] = nearest_neighbor_bw_compute_source_index(width_scale, static_cast<int>(dst_x), static_cast<int>(src_dim_w));
+                sx_up_tab[dst_x] = nearest_neighbor_bw_compute_source_index(width_scale, static_cast<int>(dst_x + 1), static_cast<int>(src_dim_w));
+            }
+        }
+
+        // Gather into grad_input: parallel over (b, c) planes (race free).
+        parallel_for(0, dim_b * dim_c, 1, [&](int64_t begin, int64_t end) {
+            for (int64_t bc = begin; bc < end; ++bc) {
+                const scalar_t* go_base = grad_o + bc * src_c_stride;
+                scalar_t* gi_base = grad_i + bc * dst_c_stride;
+                for (int64_t dst_y = 0; dst_y < dst_dim_h; ++dst_y) {
+                    // note that we do not want to clamp src_y to src_dim_y,
+                    // since we might intentionally want to skip in case of
+                    // scale_factor < 1.0
+                    const int src_y = (src_dim_h == dst_dim_h)
+                        ? static_cast<int>(dst_y)
+                        : nearest_neighbor_bw_compute_source_index(height_scale, static_cast<int>(dst_y), static_cast<int>(src_dim_h));
+                    const int src_y_up = (src_dim_h == dst_dim_h)
+                        ? static_cast<int>(dst_y + 1)
+                        : nearest_neighbor_bw_compute_source_index(height_scale, static_cast<int>(dst_y + 1), static_cast<int>(src_dim_h));
+                    scalar_t* gi_row = gi_base + dst_y * dst_dim_w;
+                    for (int64_t dst_x = 0; dst_x < dst_dim_w; ++dst_x) {
+                        const int src_x = sx_tab[dst_x];
+                        const int src_x_up = sx_up_tab[dst_x];
+                        accscalar_t grad = 0;
+                        for (int y = src_y; y < src_y_up; ++y) {
+                            const scalar_t* go_row = go_base + y * src_dim_w;
+                            for (int x = src_x; x < src_x_up; ++x) grad += go_row[x];
                         }
+                        gi_row[dst_x] = static_cast<scalar_t>(grad);
                     }
-                    grad_i[dst_idx + b * dim_c * dst_c_stride] = static_cast<scalar_t>(grad);
                 }
             }
         });
@@ -556,10 +608,10 @@ Tensor upsample_nearest3d_backward_cpu(const Tensor& grad_output, std::vector<in
     UP_DISPATCH(go, {
         const scalar_t* grad_o = go.data_ptr<scalar_t>();
         scalar_t* grad_i = grad_input.data_ptr<scalar_t>();
-        const float depth_scale = compute_scales_value_f(scales_d, dst_dim_d, src_dim_d);
-        const float height_scale = compute_scales_value_f(scales_h, dst_dim_h, src_dim_h);
-        const float width_scale = compute_scales_value_f(scales_w, dst_dim_w, src_dim_w);
-        parallel_for(0, dim_c * dst_c_stride, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        const float depth_scale = compute_scales_value_backwards_f(scales_d, src_dim_d, dst_dim_d);
+        const float height_scale = compute_scales_value_backwards_f(scales_h, src_dim_h, dst_dim_h);
+        const float width_scale = compute_scales_value_backwards_f(scales_w, src_dim_w, dst_dim_w);
+        parallel_for(0, dim_c * dst_c_stride, 1, [&](int64_t begin, int64_t end) {
             for (int64_t dst_idx = begin; dst_idx < end; ++dst_idx) {
                 const int64_t c = (dst_idx / dst_c_stride) % dim_c;
                 const int64_t dst_t = (dst_idx / (dst_dim_h * dst_dim_w)) % dst_dim_d;
@@ -621,20 +673,29 @@ Tensor upsample_linear1d_backward_cpu(const Tensor& grad_output, std::vector<int
         const scalar_t* odata = go.data_ptr<scalar_t>();
         scalar_t* idata = grad_input.data_ptr<scalar_t>();
         const accscalar_t rwidth = area_pixel_compute_scale_f(W1, W2, align_corners, scales);
-        for (int64_t n = 0; n < N; ++n) {
-            for (int64_t c = 0; c < C; ++c) {
+        std::vector<int64_t> w1_tab(W2), w1p_tab(W2);
+        std::vector<accscalar_t> w1l_tab(W2), w0l_tab(W2);
+        for (int64_t w2 = 0; w2 < W2; ++w2) {
+            const accscalar_t w1r = area_pixel_compute_source_index_f(rwidth, w2, align_corners, /*cubic=*/false);
+            const int64_t w1 = static_cast<int64_t>(w1r);
+            w1_tab[w2] = w1;
+            w1p_tab[w2] = (w1 < W1 - 1) ? 1 : 0;
+            w1l_tab[w2] = w1r - static_cast<accscalar_t>(w1);
+            w0l_tab[w2] = static_cast<accscalar_t>(1) - w1l_tab[w2];
+        }
+        // Scatter: parallel over (n, c) planes (race free).
+        parallel_for(0, N * C, 1, [&](int64_t begin, int64_t end) {
+            for (int64_t nc = begin; nc < end; ++nc) {
+                const scalar_t* optr = odata + nc * W2;
+                scalar_t* iptr = idata + nc * W1;
                 for (int64_t w2 = 0; w2 < W2; ++w2) {
-                    const accscalar_t w1r = area_pixel_compute_source_index_f(rwidth, w2, align_corners, /*cubic=*/false);
-                    const int64_t w1 = static_cast<int64_t>(w1r);
-                    const int64_t w1p = (w1 < W1 - 1) ? 1 : 0;
-                    const accscalar_t w1lambda = w1r - static_cast<accscalar_t>(w1);
-                    const accscalar_t w0lambda = static_cast<accscalar_t>(1) - w1lambda;
-                    const accscalar_t val = odata[(n * C + c) * W2 + w2];
-                    idata[(n * C + c) * W1 + w1] += static_cast<scalar_t>(w0lambda * val);
-                    idata[(n * C + c) * W1 + w1 + w1p] += static_cast<scalar_t>(w1lambda * val);
+                    const int64_t w1 = w1_tab[w2];
+                    const accscalar_t val = optr[w2];
+                    iptr[w1] += static_cast<scalar_t>(w0l_tab[w2] * val);
+                    iptr[w1 + w1p_tab[w2]] += static_cast<scalar_t>(w1l_tab[w2] * val);
                 }
             }
-        }
+        });
     });
     return grad_input;
 }
@@ -656,31 +717,47 @@ Tensor upsample_bilinear2d_backward_cpu(const Tensor& grad_output, std::vector<i
         scalar_t* idata = grad_input.data_ptr<scalar_t>();
         const accscalar_t rheight = area_pixel_compute_scale_f(height1, height2, align_corners, scales_h);
         const accscalar_t rwidth = area_pixel_compute_scale_f(width1, width2, align_corners, scales_w);
-        for (int64_t n = 0; n < batchsize; ++n) {
-            for (int64_t c = 0; c < channels; ++c) {
-                const scalar_t* optr = odata + (n * channels + c) * height2 * width2;
-                scalar_t* iptr = idata + (n * channels + c) * height1 * width1;
+
+        // Per-column source index/weights depend only on w2: shared tables.
+        std::vector<int64_t> w1_tab(width2), w1p_tab(width2);
+        std::vector<accscalar_t> w1l_tab(width2), w0l_tab(width2);
+        for (int64_t w2 = 0; w2 < width2; ++w2) {
+            const accscalar_t w1r = area_pixel_compute_source_index_f(rwidth, w2, align_corners, false);
+            const int64_t w1 = static_cast<int64_t>(w1r);
+            w1_tab[w2] = w1;
+            w1p_tab[w2] = (w1 < width1 - 1) ? 1 : 0;
+            w1l_tab[w2] = w1r - static_cast<accscalar_t>(w1);
+            w0l_tab[w2] = static_cast<accscalar_t>(1) - w1l_tab[w2];
+        }
+
+        // Scatter into grad_input: parallel over (n, c) planes (race free).
+        parallel_for(0, batchsize * channels, 1, [&](int64_t begin, int64_t end) {
+            for (int64_t nc = begin; nc < end; ++nc) {
+                const scalar_t* optr = odata + nc * height2 * width2;
+                scalar_t* iptr = idata + nc * height1 * width1;
                 for (int64_t h2 = 0; h2 < height2; ++h2) {
                     const accscalar_t h1r = area_pixel_compute_source_index_f(rheight, h2, align_corners, false);
                     const int64_t h1 = static_cast<int64_t>(h1r);
                     const int64_t h1p = (h1 < height1 - 1) ? 1 : 0;
                     const accscalar_t h1lambda = h1r - static_cast<accscalar_t>(h1);
                     const accscalar_t h0lambda = static_cast<accscalar_t>(1) - h1lambda;
+                    scalar_t* row0 = iptr + h1 * width1;
+                    scalar_t* row1 = row0 + h1p * width1;
+                    const scalar_t* orow = optr + h2 * width2;
                     for (int64_t w2 = 0; w2 < width2; ++w2) {
-                        const accscalar_t w1r = area_pixel_compute_source_index_f(rwidth, w2, align_corners, false);
-                        const int64_t w1 = static_cast<int64_t>(w1r);
-                        const int64_t w1p = (w1 < width1 - 1) ? 1 : 0;
-                        const accscalar_t w1lambda = w1r - static_cast<accscalar_t>(w1);
-                        const accscalar_t w0lambda = static_cast<accscalar_t>(1) - w1lambda;
-                        const accscalar_t val = optr[h2 * width2 + w2];
-                        iptr[h1 * width1 + w1] += static_cast<scalar_t>(h0lambda * w0lambda * val);
-                        iptr[h1 * width1 + w1 + w1p] += static_cast<scalar_t>(h0lambda * w1lambda * val);
-                        iptr[(h1 + h1p) * width1 + w1] += static_cast<scalar_t>(h1lambda * w0lambda * val);
-                        iptr[(h1 + h1p) * width1 + w1 + w1p] += static_cast<scalar_t>(h1lambda * w1lambda * val);
+                        const int64_t w1 = w1_tab[w2];
+                        const int64_t w1p = w1p_tab[w2];
+                        const accscalar_t w1lambda = w1l_tab[w2];
+                        const accscalar_t w0lambda = w0l_tab[w2];
+                        const accscalar_t val = orow[w2];
+                        row0[w1] += static_cast<scalar_t>(h0lambda * w0lambda * val);
+                        row0[w1 + w1p] += static_cast<scalar_t>(h0lambda * w1lambda * val);
+                        row1[w1] += static_cast<scalar_t>(h1lambda * w0lambda * val);
+                        row1[w1 + w1p] += static_cast<scalar_t>(h1lambda * w1lambda * val);
                     }
                 }
             }
-        }
+        });
     });
     return grad_input;
 }
@@ -703,10 +780,21 @@ Tensor upsample_trilinear3d_backward_cpu(const Tensor& grad_output, std::vector<
         const accscalar_t rdepth = area_pixel_compute_scale_f(depth1, depth2, align_corners, scales_d);
         const accscalar_t rheight = area_pixel_compute_scale_f(height1, height2, align_corners, scales_h);
         const accscalar_t rwidth = area_pixel_compute_scale_f(width1, width2, align_corners, scales_w);
-        for (int64_t n = 0; n < batchsize; ++n) {
-            for (int64_t c = 0; c < channels; ++c) {
-                const scalar_t* optr = odata + (n * channels + c) * depth2 * height2 * width2;
-                scalar_t* iptr = idata + (n * channels + c) * depth1 * height1 * width1;
+        std::vector<int64_t> w1_tab(width2), w1p_tab(width2);
+        std::vector<accscalar_t> w1l_tab(width2), w0l_tab(width2);
+        for (int64_t w2 = 0; w2 < width2; ++w2) {
+            const accscalar_t w1r = area_pixel_compute_source_index_f(rwidth, w2, align_corners, false);
+            const int64_t w1 = static_cast<int64_t>(w1r);
+            w1_tab[w2] = w1;
+            w1p_tab[w2] = (w1 < width1 - 1) ? 1 : 0;
+            w1l_tab[w2] = w1r - static_cast<accscalar_t>(w1);
+            w0l_tab[w2] = static_cast<accscalar_t>(1) - w1l_tab[w2];
+        }
+        // Scatter: parallel over (n, c) planes (race free).
+        parallel_for(0, batchsize * channels, 1, [&](int64_t begin, int64_t end) {
+            for (int64_t nc = begin; nc < end; ++nc) {
+                const scalar_t* optr = odata + nc * depth2 * height2 * width2;
+                scalar_t* iptr = idata + nc * depth1 * height1 * width1;
                 for (int64_t t2 = 0; t2 < depth2; ++t2) {
                     const accscalar_t t1r = area_pixel_compute_source_index_f(rdepth, t2, align_corners, false);
                     const int64_t t1 = static_cast<int64_t>(t1r);
@@ -719,22 +807,30 @@ Tensor upsample_trilinear3d_backward_cpu(const Tensor& grad_output, std::vector<
                         const int64_t h1p = (h1 < height1 - 1) ? 1 : 0;
                         const accscalar_t h1lambda = h1r - static_cast<accscalar_t>(h1);
                         const accscalar_t h0lambda = static_cast<accscalar_t>(1) - h1lambda;
+                        scalar_t* d00 = iptr + (t1 * height1 + h1) * width1;
+                        scalar_t* d01 = d00 + h1p * width1;
+                        scalar_t* d10 = d00 + t1p * height1 * width1;
+                        scalar_t* d11 = d10 + h1p * width1;
+                        const scalar_t* orow = optr + (t2 * height2 + h2) * width2;
                         for (int64_t w2 = 0; w2 < width2; ++w2) {
-                            const accscalar_t w1r = area_pixel_compute_source_index_f(rwidth, w2, align_corners, false);
-                            const int64_t w1 = static_cast<int64_t>(w1r);
-                            const int64_t w1p = (w1 < width1 - 1) ? 1 : 0;
-                            const accscalar_t w1lambda = w1r - static_cast<accscalar_t>(w1);
-                            const accscalar_t w0lambda = static_cast<accscalar_t>(1) - w1lambda;
-                            const accscalar_t val = optr[(t2 * height2 + h2) * width2 + w2];
-                            iptr[(t1 * height1 + h1) * width1 + w1] += static_cast<scalar_t>(t0lambda * h0lambda * w0lambda * val);
-                            iptr[(t1 * height1 + h1) * width1 + w1 + w1p] += static_cast<scalar_t>(t0lambda * h0lambda * w1lambda * val);
-                            iptr[(t1 * height1 + h1 + h1p) * width1 + w1] += static_cast<scalar_t>(t0lambda * h1lambda * w0lambda * val);
-                            iptr[(t1 * height1 + h1 + h1p) * width1 + w1 + w1p] += static_cast<scalar_t>(t0lambda * h1lambda * w1lambda * val);
+                            const int64_t w1 = w1_tab[w2];
+                            const int64_t w1p = w1p_tab[w2];
+                            const accscalar_t w1lambda = w1l_tab[w2];
+                            const accscalar_t w0lambda = w0l_tab[w2];
+                            const accscalar_t val = orow[w2];
+                            d00[w1] += static_cast<scalar_t>(t0lambda * h0lambda * w0lambda * val);
+                            d00[w1 + w1p] += static_cast<scalar_t>(t0lambda * h0lambda * w1lambda * val);
+                            d01[w1] += static_cast<scalar_t>(t0lambda * h1lambda * w0lambda * val);
+                            d01[w1 + w1p] += static_cast<scalar_t>(t0lambda * h1lambda * w1lambda * val);
+                            d10[w1] += static_cast<scalar_t>(t1lambda * h0lambda * w0lambda * val);
+                            d10[w1 + w1p] += static_cast<scalar_t>(t1lambda * h0lambda * w1lambda * val);
+                            d11[w1] += static_cast<scalar_t>(t1lambda * h1lambda * w0lambda * val);
+                            d11[w1 + w1p] += static_cast<scalar_t>(t1lambda * h1lambda * w1lambda * val);
                         }
                     }
                 }
             }
-        }
+        });
     });
     return grad_input;
 }
@@ -757,16 +853,18 @@ Tensor upsample_bicubic2d_backward_cpu(const Tensor& grad_output, std::vector<in
         const accscalar_t height_scale = area_pixel_compute_scale_f(input_height, output_height, align_corners, scales_h);
         const accscalar_t width_scale = area_pixel_compute_scale_f(input_width, output_width, align_corners, scales_w);
 
-        auto increment_value_bounded = [&](int64_t n, int64_t c, int64_t y, int64_t x, accscalar_t value) {
-            // ATen UpSample.cuh upsample_increment_value_bounded
-            const int64_t access_y = std::clamp(y, static_cast<int64_t>(0), input_height - 1);
-            const int64_t access_x = std::clamp(x, static_cast<int64_t>(0), input_width - 1);
-            idata[(n * channels + c) * input_height * input_width + access_y * input_width + access_x] +=
-                static_cast<scalar_t>(value);
-        };
+        // Scatter: parallel over (n, c) planes (race free).
+        parallel_for(0, batchsize * channels, 1, [&](int64_t begin, int64_t end) {
+            for (int64_t nc = begin; nc < end; ++nc) {
+                scalar_t* plane = idata + nc * input_height * input_width;
+                const scalar_t* oplane = odata + nc * output_height * output_width;
+                // ATen UpSample.cuh upsample_increment_value_bounded
+                auto increment_value_bounded = [&](int64_t y, int64_t x, accscalar_t value) {
+                    const int64_t access_y = std::clamp(y, static_cast<int64_t>(0), input_height - 1);
+                    const int64_t access_x = std::clamp(x, static_cast<int64_t>(0), input_width - 1);
+                    plane[access_y * input_width + access_x] += static_cast<scalar_t>(value);
+                };
 
-        for (int64_t n = 0; n < batchsize; ++n) {
-            for (int64_t c = 0; c < channels; ++c) {
                 for (int64_t output_y = 0; output_y < output_height; ++output_y) {
                     const accscalar_t real_y = area_pixel_compute_source_index_f(height_scale, output_y, align_corners, /*cubic=*/true);
                     const int64_t input_y = static_cast<int64_t>(std::floor(real_y));
@@ -781,17 +879,17 @@ Tensor upsample_bicubic2d_backward_cpu(const Tensor& grad_output, std::vector<in
                         get_cubic_upsample_coefficients(x_coeffs, t_x);
                         get_cubic_upsample_coefficients(y_coeffs, t_y);
 
-                        const scalar_t out_value = odata[(n * channels + c) * output_height * output_width + output_y * output_width + output_x];
+                        const scalar_t out_value = oplane[output_y * output_width + output_x];
                         for (int i = 0; i < 4; ++i) {
                             for (int j = 0; j < 4; ++j) {
-                                increment_value_bounded(n, c, input_y - 1 + i, input_x - 1 + j,
+                                increment_value_bounded(input_y - 1 + i, input_x - 1 + j,
                                                         static_cast<accscalar_t>(out_value) * y_coeffs[i] * x_coeffs[j]);
                             }
                         }
                     }
                 }
             }
-        }
+        });
     });
     return grad_input;
 }

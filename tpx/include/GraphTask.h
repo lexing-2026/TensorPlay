@@ -71,14 +71,18 @@ struct GraphTask {
     }
 
     // Mark one dequeued task as fully evaluated; wakes the initiator when the
-    // last task finishes.
-    void task_completed() {
+    // last task finishes. Returns true iff this call transitioned the graph to
+    // completed, so the caller can wake the initiating thread's queue (which
+    // blocks on its own CV, not on cv_).
+    bool task_completed() {
         std::lock_guard<std::mutex> lock(mutex_);
         --outstanding_tasks_;
         if (outstanding_tasks_ == 0) {
             completed_ = true;
             cv_.notify_all();
+            return true;
         }
+        return false;
     }
 
     // Record the first node error; the initiator rethrows it after the graph

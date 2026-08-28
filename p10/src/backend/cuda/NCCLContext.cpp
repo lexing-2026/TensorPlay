@@ -371,17 +371,24 @@ void allToAllSingleEqualSplit(const void* sendbuff, void* recvbuff,
     int num_ranks = 0;
     checkNccl(ncclCommCount(static_cast<ncclComm_t>(comm), &num_ranks),
               "ncclCommCount");
-    size_t rankdiff = count_total / static_cast<size_t>(num_ranks);
+    // torch parity (nccl.cpp all2all_single_equal_split): `count` is the
+    // per-rank element count passed to NCCL, while the send/recv buffer
+    // offsets are in BYTES (rankdiff = nbytes / size). Using the element
+    // count as a byte stride mis-addresses every dtype wider than 1 byte.
+    size_t count = count_total / static_cast<size_t>(num_ranks);
+    size_t rankdiff = count * elementSize(dtype);
     auto type = toNcclDType(dtype);
     const char* sbuf = static_cast<const char*>(sendbuff);
     char* rbuf = static_cast<char*>(recvbuff);
     cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
     checkNccl(ncclGroupStart(), "ncclGroupStart");
     for (int r = 0; r < num_ranks; ++r) {
-        checkNccl(ncclSend(sbuf + r * rankdiff, rankdiff, type, r,
-                           static_cast<ncclComm_t>(comm), s), "ncclSend");
-        checkNccl(ncclRecv(rbuf + r * rankdiff, rankdiff, type, r,
-                           static_cast<ncclComm_t>(comm), s), "ncclRecv");
+        if (shouldSendRecv(count)) {
+            checkNccl(ncclSend(sbuf + r * rankdiff, count, type, r,
+                               static_cast<ncclComm_t>(comm), s), "ncclSend");
+            checkNccl(ncclRecv(rbuf + r * rankdiff, count, type, r,
+                               static_cast<ncclComm_t>(comm), s), "ncclRecv");
+        }
     }
     checkNccl(ncclGroupEnd(), "ncclGroupEnd");
 #endif

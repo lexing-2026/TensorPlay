@@ -136,6 +136,123 @@ def test_replace_all_uses_with_and_topological_guard():
         neg.erase_node()
 
 
+def test_inserting_before_keeps_creation_order():
+    g = Graph()
+    x = g.placeholder("x")
+    out = g.output(x)
+
+    with g.inserting_before(out):
+        a = g.call_function(operator.add, (x, x))
+        b = g.call_function(operator.mul, (a, x))
+    assert [n.name for n in g.nodes] == ["x", "add", "mul", "output"]
+
+    # Insert point restored after the block: new nodes append again.
+    c = g.call_function(operator.neg, (b,))
+    assert g.nodes[-1] is c
+
+    with g.inserting_before(None):
+        first = g.get_attr("w")
+    assert g.nodes[0] is first
+    g.lint()
+
+
+def test_inserting_after_splices_in_reverse_creation_order():
+    # torch.fx parity: every node lands directly after the anchor, so a
+    # creation sequence appears reversed in the graph.
+    g = Graph()
+    x = g.placeholder("x")
+
+    with g.inserting_after(x):
+        a = g.call_function(operator.add, (x, x))
+        b = g.call_function(operator.mul, (x, x))
+    assert [n.name for n in g.nodes] == ["x", "mul", "add"]
+
+    with g.inserting_after(None):
+        tail = g.call_function(operator.neg, (a,))
+    assert g.nodes[-1] is tail
+    g.output(tail)
+    g.lint()
+
+
+def test_insert_point_rejects_foreign_anchor():
+    g, other = Graph(), Graph()
+    foreign = other.placeholder("x")
+    with pytest.raises(GraphCaptureError, match="not part of this graph"):
+        g.inserting_before(foreign)
+    with pytest.raises(GraphCaptureError, match="not part of this graph"):
+        g.inserting_after(foreign)
+
+
+def test_graph_copy_remaps_through_val_map():
+    src = Graph()
+    px = src.placeholder("x")
+    py = src.placeholder("y")
+    sub = src.call_function(operator.sub, (px, py))
+    sub.meta["origin"] = "replacement"
+    src.output(sub)
+
+    dst = Graph()
+    x = dst.placeholder("x")
+    y = dst.placeholder("y")
+    out = dst.output(y)
+
+    val_map = {px: x, py: y}
+    with dst.inserting_before(out):
+        copied = dst.graph_copy(src, val_map)
+
+    assert copied.op == "call_function" and copied.target is operator.sub
+    assert copied.args == (x, y)
+    assert copied.meta == {"origin": "replacement"}
+    assert val_map[sub] is copied
+    assert [n.name for n in dst.nodes] == ["x", "y", "sub", "output"]
+    dst.lint()
+
+
+def test_subgraph_rewrite_addmul_to_sub():
+    # torch.fx subgraph_rewriter use case, natively:
+    #   f(x, y): x = x + y; x = x * y  ->  return x - y
+    def f(x, y):
+        x = x + y
+        x = x * y
+        return x
+
+    def replacement(x, y):
+        return x - y
+
+    sample = {"x": tp.tensor([1.0, 2.0]), "y": tp.tensor([0.5, 0.5])}
+    gm = Tracer().trace(f, sample_inputs=sample)
+    replacement_graph = Tracer().trace(replacement, sample_inputs=sample).graph
+
+    graph = gm.graph
+    mul = next(
+        n for n in graph.nodes
+        if n.op == "call_function" and n.target is operator.mul
+    )
+    add = mul.args[0]
+    assert add.op == "call_function" and add.target is operator.add
+    x_node, y_node = add.args
+    assert mul.args[1] is y_node
+
+    repl_phs = [n for n in replacement_graph.nodes if n.op == "placeholder"]
+    val_map = dict(zip(repl_phs, (x_node, y_node)))
+    insert_point = min(mul.users, key=graph.nodes.index)
+    with graph.inserting_before(insert_point):
+        copied = graph.graph_copy(replacement_graph, val_map)
+    mul.replace_all_uses_with(copied)
+    for node in (mul, add):
+        node.erase_node()
+    graph.lint()
+
+    assert [(n.op, n.target) for n in graph.nodes] == [
+        ("placeholder", "x"),
+        ("placeholder", "y"),
+        ("call_function", operator.sub),
+        ("output", "output"),
+    ]
+    x, y = tp.tensor([3.0, 4.0]), tp.tensor([1.0, 2.0])
+    assert tp.allclose(gm(x, y), x - y)
+
+
 # ---------------------------------------------------------------------------
 # Tracer: concrete_args, leaf modules, qualname map
 # ---------------------------------------------------------------------------

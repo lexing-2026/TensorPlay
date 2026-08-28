@@ -292,12 +292,13 @@ Tensor& normal_inplace_kernel(Tensor& self, double mean, double std) {
                 }
             }
         } else {
-            // Match native CPU normal_: Half/BFloat16 keep the storage dtype
-            // at every Box-Muller operation, including the inplace entrypoint.
+            // torch parity (aten/src/ATen/native/cpu/DistributionTemplates.h:
+            // normal_fill<scalar_t>): Half/BFloat16 draw uniforms in opmath
+            // (float) through a 16-element stack buffer, Box-Muller in float,
+            // then cast down to the storage dtype -- including the inplace
+            // entrypoint.
             if (size >= 16 && self.is_contiguous()) {
-                normal_fill<scalar_t>(data, size,
-                                      static_cast<scalar_t>(mean),
-                                      static_cast<scalar_t>(std), &gen);
+                normal_fill_cast<scalar_t>(data, size, mean, std, &gen);
             } else {
                 normal_distribution<double> dist(mean, std);
                 for (int64_t i = 0; i < size; ++i) {
@@ -347,14 +348,18 @@ Tensor& uniform_kernel(Tensor& self, double from, double to) {
                 data[i] = static_cast<scalar_t>(x * (to - from) + from);
             }
         } else {
-            // Native CPU uniform_ constructs the distribution with the
-            // storage dtype for Half/BFloat16.  Using opmath_t here changes
-            // the mantissa mask from 11/8 bits to float's 24 bits and breaks
-            // exact seeded parity.
-            uniform_real_distribution<scalar_t> dist(
-                static_cast<scalar_t>(from), static_cast<scalar_t>(to));
+            // torch parity (aten/src/ATen/native/cpu/DistributionTemplates.h:
+            // uniform_kernel_cpu): Half/BFloat16 sample in opmath_t (float,
+            // 24-bit mantissa mask) and cast to the storage dtype, clamping a
+            // cast that rounded up to the upper bound back to 'from'.
+            using math_t = opmath_t<scalar_t>;
+            uniform_real_distribution<math_t> dist(
+                static_cast<math_t>(from), static_cast<math_t>(to));
+            const scalar_t to_scalar = static_cast<scalar_t>(to);
+            const scalar_t from_scalar = static_cast<scalar_t>(from);
             for (int64_t i = 0; i < n; ++i) {
-                data[i] = static_cast<scalar_t>(dist(&gen));
+                scalar_t value = static_cast<scalar_t>(dist(&gen));
+                data[i] = value == to_scalar ? from_scalar : value;
             }
         }
     });

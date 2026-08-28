@@ -58,22 +58,30 @@ Tensor rand_kernel(const std::vector<int64_t>& size, DType dtype, Device device)
         }
         case DType::Float16:
         case DType::BFloat16: {
-            // PyTorch's CPU uniform_ uses the storage dtype for Half and
-            // BFloat16 (and therefore the dtype's mantissa mask), rather
-            // than sampling a 24-bit float and casting afterwards.
+            // torch parity (aten/src/ATen/native/cpu/DistributionTemplates.h:
+            // uniform_kernel_cpu): Half/BFloat16 sample in opmath_t (float,
+            // 24-bit mantissa mask) and cast to the storage dtype, clamping a
+            // cast that rounded up to the upper bound back to 'from'.
+            using math_t = float;
+            const math_t lo = static_cast<math_t>(0.0);
+            const math_t hi = static_cast<math_t>(1.0);
+            const math_t to_scalar = hi;
+            const math_t from_scalar = lo;
             if (dtype == DType::Float16) {
                 Half* data = t.data_ptr<Half>();
-                uniform_real_distribution<Half> dist(static_cast<Half>(0.0f),
-                                                      static_cast<Half>(1.0f));
+                uniform_real_distribution<math_t> dist(lo, hi);
                 for (int64_t i = 0; i < n; ++i) {
-                    data[i] = static_cast<Half>(dist(&gen));
+                    Half value = static_cast<Half>(dist(&gen));
+                    data[i] = static_cast<math_t>(value) == to_scalar
+                                  ? static_cast<Half>(from_scalar) : value;
                 }
             } else {
                 BFloat16* data = t.data_ptr<BFloat16>();
-                uniform_real_distribution<BFloat16> dist(static_cast<BFloat16>(0.0f),
-                                                          static_cast<BFloat16>(1.0f));
+                uniform_real_distribution<math_t> dist(lo, hi);
                 for (int64_t i = 0; i < n; ++i) {
-                    data[i] = static_cast<BFloat16>(dist(&gen));
+                    BFloat16 value = static_cast<BFloat16>(dist(&gen));
+                    data[i] = static_cast<math_t>(value) == to_scalar
+                                  ? static_cast<BFloat16>(from_scalar) : value;
                 }
             }
             break;
@@ -365,17 +373,15 @@ Tensor randn_kernel(const std::vector<int64_t>& size, DType dtype, Device device
         }
         case DType::Float16:
         case DType::BFloat16: {
-            // Match native CPU normal_: Half/BFloat16 use their storage dtype
-            // throughout the 16-value Box-Muller block.  This deliberately
-            // consumes the same raw 32-bit stream as the float path while
-            // retaining the storage-dtype rounding at every operation.
+            // torch parity (aten/src/ATen/native/cpu/DistributionTemplates.h:
+            // normal_fill<scalar_t>): Half/BFloat16 draw uniforms in opmath
+            // (float, 24-bit mantissa) through a 16-element stack buffer,
+            // Box-Muller in float, then cast down to the storage dtype.
             if (n >= 16 && t.is_contiguous()) {
                 if (dtype == DType::Float16) {
-                    normal_fill<Half>(t.data_ptr<Half>(), n,
-                                      static_cast<Half>(0.0f), static_cast<Half>(1.0f), &gen);
+                    normal_fill_cast<Half>(t.data_ptr<Half>(), n, 0.0, 1.0, &gen);
                 } else {
-                    normal_fill<BFloat16>(t.data_ptr<BFloat16>(), n,
-                                          static_cast<BFloat16>(0.0f), static_cast<BFloat16>(1.0f), &gen);
+                    normal_fill_cast<BFloat16>(t.data_ptr<BFloat16>(), n, 0.0, 1.0, &gen);
                 }
             } else {
                 normal_distribution<double> dist(0.0, 1.0);

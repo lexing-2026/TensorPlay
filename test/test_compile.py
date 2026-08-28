@@ -116,6 +116,24 @@ def test_stax_fusion_lowers_to_p10_and_keeps_autograd():
     assert x.grad.tolist() == pytest.approx([2.0, 2.0, 2.0])
 
 
+def test_stax_fusion_accepts_programs_beyond_64_instructions():
+    # Regression: the fused pointwise kernel used to reject programs with
+    # more than 64 instructions; long pointwise chains must fuse natively.
+    def fn(x, y):
+        for _ in range(100):
+            x = x - y
+        return x
+
+    x = tp.tensor([1.0, 2.0, 3.0])
+    y = tp.tensor([0.5, 0.5, 0.5])
+    compiled = tp.compile(fn, backend="stax", strict_native=True)
+    output = compiled(x, y)
+
+    lowering = next(iter(compiled._tensorplay_cache.values()))
+    assert [node.op_type for node in lowering.graph.nodes] == ["fused_pointwise"]
+    assert output.tolist() == pytest.approx(fn(x, y).tolist())
+
+
 def test_stax_fused_pointwise_extended_autograd_matches_eager():
     def fn(left, right):
         return ((left.abs() + right.sigmoid()).tanh() / (left.cos() + 2.0)).relu()

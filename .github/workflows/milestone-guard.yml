@@ -1,0 +1,55 @@
+name: milestone-guard
+
+# Ensures every PR against main belongs to a milestone, mirroring how pytorch
+# tracks releases through milestones. When a PR has no milestone, it is
+# assigned to the milestone matching version.txt (e.g. 1.0.0a0 -> v1.0.0).
+# Milestones carry no due dates; they only bucket work per release.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, ready_for_review]
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  assign-milestone:
+    name: assign-milestone
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # pull_request_target checks out the base ref by default; we only
+          # read version.txt from it, never code from the PR head.
+          submodules: false
+          show-progress: false
+
+      - name: Assign the current milestone when missing
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HAS_MILESTONE: ${{ github.event.pull_request.milestone != null }}
+        run: |
+          set -euo pipefail
+          if [[ "$HAS_MILESTONE" == "true" ]]; then
+            echo "PR #$PR_NUMBER already has milestone: ${{ github.event.pull_request.milestone.title }}"
+            exit 0
+          fi
+          # 1.0.0a0 / 1.2.1 -> v1.0.0 / v1.2.0 (major.minor releases only)
+          milestone="v$(sed -nE 's/^([0-9]+)\.([0-9]+)\..*/\1.\2.0/p' version.txt)"
+          if [[ "$milestone" == "v" ]]; then
+            echo "Could not derive a milestone from version.txt" >&2
+            exit 1
+          fi
+          milestone_number="$(gh api "repos/$GITHUB_REPOSITORY/milestones?state=open&per_page=100" \
+            --jq ".[] | select(.title == \"$milestone\") | .number" | head -n1)"
+          if [[ -z "$milestone_number" ]]; then
+            echo "Milestone $milestone does not exist; create it first (see RELEASE.md)" >&2
+            exit 1
+          fi
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER" \
+            -F "milestone=$milestone_number" >/dev/null
+          echo "Assigned milestone $milestone to PR #$PR_NUMBER"

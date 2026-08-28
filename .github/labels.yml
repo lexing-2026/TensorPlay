@@ -1,0 +1,117 @@
+# Label inventory for this repository, kept in sync by the label-sync
+# workflow (.github/workflows/label-sync.yml, powered by EndBug/label-sync).
+# The "release notes: *" family mirrors pytorch's label family used to bucket
+# PRs by subsystem when compiling release notes; the scope-enum of the
+# Conventional Commits schema (tools/commit_schema.py) maps 1:1 to it.
+
+# --- GitHub default labels ---------------------------------------------------
+
+- name: "bug"
+  color: "d73a4a"
+  description: Something isn't working.
+
+- name: "documentation"
+  color: "0075ca"
+  description: Improvements or additions to documentation.
+
+- name: "duplicate"
+  color: "cfd3d7"
+  description: This issue or pull request already exists.
+
+- name: "enhancement"
+  color: "a2eeef"
+  description: New feature or request.
+
+- name: "good first issue"
+  color: "7057ff"
+  description: Good for newcomers.
+
+- name: "help wanted"
+  color: "008672"
+  description: Extra attention is needed.
+
+- name: "invalid"
+  color: "e4e669"
+  description: This doesn't seem right.
+
+- name: "question"
+  color: "d876e3"
+  description: Further information is requested.
+
+- name: "wontfix"
+  color: "ffffff"
+  description: This will not be worked on.
+
+# --- Release notes buckets (1:1 with commit scopes) ---------------------------
+
+- name: "release notes: frontend"
+  color: "1d76db"
+  description: Python frontend, Tensor API and bindings. Counts toward release notes.
+
+- name: "release notes: autograd"
+  color: "7057ff"
+  description: TPX autograd engine, autograd.Function, forward-mode AD. Counts toward release notes.
+
+- name: "release notes: compiler"
+  color: "0e8a16"
+  description: tensorplay.compile, Stax graph, Triton codegen and autotuning. Counts toward release notes.
+
+- name: "release notes: kernels"
+  color: "d93f0b"
+  description: p10 core library and CPU/CUDA kernels. Counts toward release notes.
+
+- name: "release notes: cuda"
+  color: "006b75"
+  description: CUDA runtime, streams, graphs and caching allocator. Counts toward release notes.
+
+- name: "release notes: build"
+  color: "fbca04"
+  description: Build system, packaging, CI and release tooling. Counts toward release notes.
+
+- name: "release notes: docs"
+  color: "0052cc"
+  description: Documentation and examples. Counts toward release notes.
+
+# --- Triage and lifecycle -----------------------------------------------------
+
+- name: "needs triage"
+  color: "bfd4f2"
+  description: New issue/PR waiting for maintainer triage.
+
+- name: "kind/flaky"
+  color: "5319e7"
+  description: Flaky test or build; rerun with `pytest --reruns 2` to confirm.
+
+- name: "breaking change"
+  color: "dc143c"
+  description: Backwards-incompatible change; must appear in the release notes section of the same name.
+
+- name: "regression"
+  color: "e99695"
+  description: Behavior or performance that worked in a previous release.
+
+- name: "performance"
+  color: "f5a623"
+  description: Performance work; report regressions with measured numbers (see the performance issue template).
+
+- name: "spam"
+  color: "b60205"
+  description: Unsolicited or automated low-quality contribution.
+
+- name: "stale"
+  color: "cccccc"
+  description: No activity for a long time; will be closed soon by the stale bot.
+
+# --- Platforms ----------------------------------------------------------------
+
+- name: "platform: linux"
+  color: "00a550"
+  description: Linux-specific issue or change.
+
+- name: "platform: macos"
+  color: "555555"
+  description: macOS-specific issue or change.
+
+- name: "platform: windows"
+  color: "0078d6"
+  description: Windows-specific issue or change.

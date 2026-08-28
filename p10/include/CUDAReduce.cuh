@@ -18,9 +18,11 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <mutex>
 #include <type_traits>
 
 namespace tensorplay {
@@ -31,9 +33,49 @@ constexpr int kWarpSize = 32;
 constexpr int kMaxReduceDims = 64;
 constexpr int kMaxReduceThreads = 512;
 constexpr int kDefaultValuesPerThread = 4;
+constexpr int kMaxCachedReduceDevices = 64;
 // Bump when the header-only launch path changes; this also keeps generated
 // CUDA objects from silently reusing an older reduction implementation.
-constexpr int kReductionEngineRevision = 2;
+constexpr int kReductionEngineRevision = 4;
+
+// Per-device launch geometry, queried once via cudaDeviceGetAttribute and
+// cached: cudaGetDeviceProperties costs ~1ms per call on the target GPU and
+// this struct feeds the global-reduce CTA-count decision on every launch.
+struct DeviceReduceProps {
+    int multi_processor_count = 0;
+    int max_threads_per_sm = 0;
+};
+
+inline DeviceReduceProps query_reduce_device_props(int device) {
+    DeviceReduceProps props;
+    if (cudaDeviceGetAttribute(&props.multi_processor_count,
+                               cudaDevAttrMultiProcessorCount,
+                               device) != cudaSuccess ||
+        props.multi_processor_count <= 0) {
+        props.multi_processor_count = 128;
+    }
+    if (cudaDeviceGetAttribute(&props.max_threads_per_sm,
+                               cudaDevAttrMaxThreadsPerMultiProcessor,
+                               device) != cudaSuccess ||
+        props.max_threads_per_sm <= 0) {
+        props.max_threads_per_sm = 2048;
+    }
+    cudaGetLastError();  // clear any attribute-query error above
+    return props;
+}
+
+inline const DeviceReduceProps& reduce_device_props(int device) {
+    static std::array<DeviceReduceProps, kMaxCachedReduceDevices> cache;
+    static std::array<std::once_flag, kMaxCachedReduceDevices> flags;
+    if (device < 0 || device >= kMaxCachedReduceDevices) {
+        // Uncached fallback for out-of-range device indices; same geometry.
+        static const DeviceReduceProps fallback = query_reduce_device_props(device);
+        return fallback;
+    }
+    std::call_once(flags[device],
+                   [device] { cache[device] = query_reduce_device_props(device); });
+    return cache[device];
+}
 
 template <typename T>
 struct is_half_like : std::false_type {};
@@ -379,7 +421,18 @@ inline ReduceConfig make_reduce_config(const TensorIterator& iter) {
     // Keeping block.x at a full warp makes the CUDA warp layout independent of
     // block.y. Threads beyond a short reduction simply carry the identity.
     config.block_width = kWarpSize;
-    config.block_height = std::min(reduction_last_pow2(dim1), max_height);
+    int desired_height = static_cast<int>(reduction_last_pow2(dim1));
+    // Global-reduce prediction: a single-output (dim1 == 1) reduction large
+    // enough to trigger the multi-CTA branch below runs with a taller block —
+    // 8 warps share one CTA's completion-counter slot and staging partial,
+    // cutting same-address atomic traffic and the last-CTA fold length 8x
+    // versus torch's 32-thread block, at identical total thread parallelism.
+    // The 16384-element floor guarantees the warp-split below actually
+    // engages (input_mult[1] != 0), keeping output_mult clean for the gate.
+    if (reduction_on_fastest_dimension && dim1 == 1 && config.num_inputs >= 16384) {
+        desired_height = std::min(8, max_height);
+    }
+    config.block_height = std::min(desired_height, max_height);
     config.block_height = std::max(1, config.block_height);
     config.num_threads = config.block_width * config.block_height;
 
@@ -404,27 +457,53 @@ inline ReduceConfig make_reduce_config(const TensorIterator& iter) {
 
     // The generic TensorIterator path handles the usual case. For a very long
     // reduction with too few outputs, use more CTAs per output, matching the
-    // global-reduction branch in PyTorch's Reduce.cuh. This branch is restricted
-    // to one output per block so the partial buffer has a simple layout.
+    // global-reduction branch in PyTorch's Reduce.cuh (setReduceConfig): the
+    // CTA count is std::clamp'd between the SM-balanced target grid and
+    // values_per_thread / {min,max}_values_per_thread so the whole machine
+    // stays busy while each thread still reduces a useful number of elements.
+    // This branch is restricted to one output per block so the partial buffer
+    // has a simple layout.
     if (reduction_on_fastest_dimension &&
         config.output_mult[0] == 0 && config.output_mult[1] == 0 &&
-        values_per_thread >= 256 &&
         config.num_outputs > 0) {
-        int device = -1;
-        checkCuda(cudaGetDevice(&device), "cudaGetDevice");
-        cudaDeviceProp properties{};
-        checkCuda(cudaGetDeviceProperties(&properties, device), "cudaGetDeviceProperties");
-        const int blocks_per_sm = std::max(1, properties.maxThreadsPerMultiProcessor /
-                                                config.num_threads);
-        const int target_grid = std::max(1, properties.multiProcessorCount * blocks_per_sm);
-        const int64_t max_ctas = std::max<int64_t>(1, target_grid / config.num_outputs);
-        const int64_t needed_ctas =
-            (config.num_input_units + 15) / 16 / std::max<int64_t>(1, config.step_input);
-        const int64_t ctas = std::min<int64_t>(max_ctas, std::max<int64_t>(2, needed_ctas));
-        if (ctas > 1) {
-            config.ctas_per_output = static_cast<int>(std::min<int64_t>(ctas, 256));
-            config.input_mult[2] = config.split_input(config.ctas_per_output);
-            config.global_reduce = true;
+        // Element-based values per thread, matching torch's values_per_thread()
+        // (= div_up(num_inputs, step_input) in elements): num_input_units
+        // counts vectorized units, so a unit-based count would under-report
+        // by InputVecSize for vectorized loads.
+        const int64_t values_per_thread_elems =
+            (config.num_inputs + config.step_input - 1) / config.step_input;
+        if (values_per_thread_elems >= 256) {  // torch max_values_per_thread
+            int device = -1;
+            checkCuda(cudaGetDevice(&device), "cudaGetDevice");
+            // Geometry comes from the per-device cache below: querying
+            // cudaGetDeviceProperties here — on EVERY launch of every global
+            // reduction — costs ~0.9-1.5ms on the target GPU (the same pathology
+            // the Muon norm2 path hit; see ReductionKernels.cu), dwarfing a 20us
+            // kernel.  cudaDeviceGetAttribute is served from the runtime's own
+            // cache and the results are immutable per device.
+            const auto& properties = reduce_device_props(device);
+            const int blocks_per_sm = std::max(1, properties.max_threads_per_sm /
+                                                    config.num_threads);
+            const int target_grid = std::max(1, properties.multi_processor_count * blocks_per_sm);
+            // torch Reduce.cuh: ctas1 balances CTAs across SMs (per already
+            // scheduled output block), ctas2/ctas3 bound the split so each
+            // thread keeps >= min_values_per_thread(16) elements but no more
+            // than max_values_per_thread(256).
+            const int64_t grid_x = (config.num_outputs + config.step_output - 1) /
+                                   config.step_output;
+            const int64_t ctas_per_output1 = (target_grid + grid_x - 1) / grid_x;
+            const int64_t ctas_per_output2 = (values_per_thread_elems + 15) / 16;
+            const int64_t ctas_per_output3 = (values_per_thread_elems + 255) / 256;
+            // std::clamp(ctas1, lo=ctas3, hi=ctas2), torch Reduce.cuh L1183.
+            int64_t ctas = ctas_per_output1;
+            if (ctas < ctas_per_output3) ctas = ctas_per_output3;
+            if (ctas > ctas_per_output2) ctas = ctas_per_output2;
+            ctas = std::min<int64_t>(ctas, 65535);  // gridDim.y hardware limit
+            if (ctas > 1) {
+                config.ctas_per_output = static_cast<int>(ctas);
+                config.input_mult[2] = config.split_input(config.ctas_per_output);
+                config.global_reduce = true;
+            }
         }
     }
 
@@ -482,6 +561,9 @@ struct ReduceOp {
     const InputT* input;
     OutputT* output;
     AccT* partials;
+    unsigned long long* counters;
+    unsigned long long* flags;
+    unsigned long long tag;
     AccT identity;
     Ops ops;
 
@@ -525,40 +607,72 @@ struct ReduceOp {
         const int64_t end = config.num_input_units;
         const int64_t base = config.input_base_offset(output_index);
         const InputT* row = input + base;
+        using Vec = aligned_vector<InputT, InputVecSize>;
+        // Branchless fast path: when every unit maps to a full aligned vector
+        // (num_inputs divisible by the vector width, unit strides keep vector
+        // alignment — host-side config checks guarantee both), the hot loop
+        // needs no per-vector bounds check, matching torch's vectorized
+        // thread_reduce loop shape.
         const bool can_vec = InputVecSize > 1 &&
             config.input_strides[0] == 1 && config.vectorize_input;
+        const bool can_vec_full = can_vec && config.num_inputs % InputVecSize == 0;
 
-        int64_t unit = start;
-        while (unit + static_cast<int64_t>(ValuesPerThread - 1) * step < end) {
-            #pragma unroll
-            for (int i = 0; i < ValuesPerThread; ++i) {
-                const int64_t current = unit + static_cast<int64_t>(i) * step;
-                const int64_t logical_base = current * InputVecSize;
-                if (can_vec && logical_base + InputVecSize <= config.num_inputs) {
-                    using Vec = aligned_vector<InputT, InputVecSize>;
+        if (can_vec_full) {
+            int64_t unit = start;
+            while (unit + static_cast<int64_t>(ValuesPerThread - 1) * step < end) {
+                #pragma unroll
+                for (int i = 0; i < ValuesPerThread; ++i) {
+                    const int64_t logical_base =
+                        (unit + static_cast<int64_t>(i) * step) * InputVecSize;
                     const Vec loaded = *reinterpret_cast<const Vec*>(row + logical_base);
                     #pragma unroll
                     for (int j = 0; j < InputVecSize; ++j) {
                         values[i] = ops.reduce(values[i], loaded.val[j], logical_base + j);
                     }
-                } else {
-                    for (int j = 0; j < InputVecSize; ++j) {
-                        const int64_t logical = logical_base + j;
-                        if (logical < config.num_inputs) {
-                            values[i] = ops.reduce(
-                                values[i], row[config.input_offset(logical)], logical);
+                }
+                unit += step * ValuesPerThread;
+            }
+            while (unit < end) {
+                const int64_t logical_base = unit * InputVecSize;
+                const Vec loaded = *reinterpret_cast<const Vec*>(row + logical_base);
+                #pragma unroll
+                for (int j = 0; j < InputVecSize; ++j) {
+                    values[0] = ops.reduce(values[0], loaded.val[j], logical_base + j);
+                }
+                unit += step;
+            }
+        } else {
+            int64_t unit = start;
+            while (unit + static_cast<int64_t>(ValuesPerThread - 1) * step < end) {
+                #pragma unroll
+                for (int i = 0; i < ValuesPerThread; ++i) {
+                    const int64_t current = unit + static_cast<int64_t>(i) * step;
+                    const int64_t logical_base = current * InputVecSize;
+                    if (can_vec && logical_base + InputVecSize <= config.num_inputs) {
+                        const Vec loaded = *reinterpret_cast<const Vec*>(row + logical_base);
+                        #pragma unroll
+                        for (int j = 0; j < InputVecSize; ++j) {
+                            values[i] = ops.reduce(values[i], loaded.val[j], logical_base + j);
+                        }
+                    } else {
+                        for (int j = 0; j < InputVecSize; ++j) {
+                            const int64_t logical = logical_base + j;
+                            if (logical < config.num_inputs) {
+                                values[i] = ops.reduce(
+                                    values[i], row[config.input_offset(logical)], logical);
+                            }
                         }
                     }
                 }
+                unit += step * ValuesPerThread;
             }
-            unit += step * ValuesPerThread;
-        }
-        while (unit < end) {
-            values[0] = reduce_unit(values[0], row, unit, unit * InputVecSize);
-            // Threads stride by step_input; a plain ++unit makes every lane
-            // walk into its neighbours' units (each element counted
-            // (num_inputs - lane) times -> triangular sums).
-            unit += step;
+            while (unit < end) {
+                values[0] = reduce_unit(values[0], row, unit, unit * InputVecSize);
+                // Threads stride by step_input; a plain ++unit makes every lane
+                // walk into its neighbours' units (each element counted
+                // (num_inputs - lane) times -> triangular sums).
+                unit += step;
+            }
         }
 
         #pragma unroll
@@ -568,11 +682,25 @@ struct ReduceOp {
         return values[0];
     }
 
-    __device__ __forceinline__ void run() const {
+    __device__ __forceinline__ void run() {
         extern __shared__ unsigned char shared_raw[];
         AccT* shared = reinterpret_cast<AccT*>(shared_raw);
+        const bool block_leader = threadIdx.x == 0 && threadIdx.y == 0;
+        // Zero the per-output completion counter for THIS launch and publish
+        // the unique launch tag before any work: peers later check the tag
+        // (once, right before their single atomicAdd), so the counter is
+        // provably zero when the election starts. This replaces torch's
+        // per-launch cudaMemsetAsync (a ~1us GPU stream op per reduction)
+        // with an in-kernel initialization.
+        if (config.global_reduce &&
+            blockIdx.y == 0 && block_leader) {
+            counters[blockIdx.x] = 0;
+            __threadfence();  // counter zeroed before the tag is published
+            *(volatile unsigned long long*)(flags + blockIdx.x) = tag;
+        }
         const int64_t output_index = config.output_idx();
         AccT value = identity;
+        __shared__ bool is_last_block;
 
         if (output_index < config.num_outputs && config.input_idx() < config.num_input_units) {
             value = thread_reduce(output_index);
@@ -585,47 +713,72 @@ struct ReduceOp {
             value = block_y_reduce(value, config, ops, shared);
         }
 
+        // NB: the fold/staging paths below require the global-reduce buffers
+        // (partials/counters/flags), which are only allocated when
+        // config.global_reduce is set, so every branch touching them must be
+        // gated on it. Without the gate, small reductions dereference null
+        // staging pointers (illegal address on the first max/sum of a tiny
+        // tensor).
         if (config.global_reduce) {
-            if (threadIdx.x == 0 && threadIdx.y == 0) {
-                partials[output_index * config.ctas_per_output + blockIdx.y] = value;
+            const int64_t slot_base = output_index * config.ctas_per_output;
+            if (block_leader && output_index < config.num_outputs) {
+                partials[slot_base + static_cast<int64_t>(blockIdx.y)] = value;
+                __threadfence();  // partial globally visible before the count
+                // Wait until this launch's counter is initialized (CTA y==0
+                // does it once, near kernel start; the unique per-launch tag
+                // makes stale flag content from previous launches
+                // indistinguishable-safe: it can never match). One short
+                // bounded spin per CTA — no polling storm.
+                volatile unsigned long long* flag = flags + blockIdx.x;
+                while (*flag != tag) {}
+                __threadfence();  // acquire the counter==0 establishment
+                const unsigned long long prev =
+                    atomicAdd(counters + blockIdx.x, 1ULL);
+                is_last_block = prev == static_cast<unsigned long long>(
+                                          config.ctas_per_output - 1);
             }
-        } else         if (config.should_store(output_index)) {
+            __syncthreads();
+            if (is_last_block && output_index < config.num_outputs) {
+                __threadfence();  // acquire: peer partials are visible
+                const int tid = threadIdx.x + threadIdx.y * blockDim.x;
+                const int tcount = blockDim.x * blockDim.y;
+                // The fold is latency-bound: one small L2 load per CTA
+                // partial. Keep several independent accumulators in flight
+                // per thread to hide L2 latency.
+                constexpr int kFoldAcc = 8;
+                AccT accs[kFoldAcc];
+                #pragma unroll
+                for (int k = 0; k < kFoldAcc; ++k) accs[k] = identity;
+                int64_t i = tid;
+                for (; i + static_cast<int64_t>(kFoldAcc - 1) * tcount <
+                       config.ctas_per_output;
+                     i += static_cast<int64_t>(kFoldAcc) * tcount) {
+                    #pragma unroll
+                    for (int k = 0; k < kFoldAcc; ++k) {
+                        accs[k] = ops.combine(accs[k],
+                            partials[slot_base + i +
+                                     static_cast<int64_t>(k) * tcount]);
+                    }
+                }
+                for (; i < config.ctas_per_output; i += tcount) {
+                    accs[0] = ops.combine(accs[0], partials[slot_base + i]);
+                }
+                #pragma unroll
+                for (int k = 1; k < kFoldAcc; ++k) {
+                    accs[0] = ops.combine(accs[0], accs[k]);
+                }
+                AccT final_value = accs[0];
+                final_value = block_y_reduce(final_value, config, ops, shared);
+                final_value = block_x_reduce(final_value, identity, config, ops, shared);
+                if (block_leader) {
+                    output[config.output_offset(output_index)] = ops.project(final_value);
+                }
+            }
+        } else if (config.should_store(output_index)) {
             output[config.output_offset(output_index)] = ops.project(value);
         }
     }
 };
-
-template <typename AccT, typename OutputT, typename Ops>
-__global__ void finalize_reduce_kernel(
-        ReduceConfig config, const AccT* partials, OutputT* output,
-        AccT identity, Ops ops) {
-    extern __shared__ unsigned char shared_raw[];
-    AccT* shared = reinterpret_cast<AccT*>(shared_raw);
-    AccT value = identity;
-    const int64_t output_index = static_cast<int64_t>(blockIdx.x);
-    for (int64_t i = threadIdx.x; i < config.ctas_per_output; i += blockDim.x) {
-        value = ops.combine(value,
-            partials[output_index * config.ctas_per_output + i]);
-    }
-    shared[threadIdx.x] = value;
-    for (int offset = blockDim.x / 2; offset >= kWarpSize; offset >>= 1) {
-        __syncthreads();
-        if (threadIdx.x < offset) {
-            value = ops.combine(value, shared[threadIdx.x + offset]);
-            shared[threadIdx.x] = value;
-        }
-    }
-    __syncthreads();
-    if (threadIdx.x < kWarpSize) {
-        for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
-            value = ops.combine(value,
-                reduce_warp_shuffle_down(value, 0xffffffffu, offset));
-        }
-    }
-    if (threadIdx.x == 0) {
-        output[config.output_offset(output_index)] = ops.project(value);
-    }
-}
 
 template <typename InputT, typename AccT, typename OutputT, typename Ops,
           int ValuesPerThread, int InputVecSize>
@@ -652,43 +805,51 @@ inline void launch_reduce(
                                   config.step_output),
         static_cast<unsigned int>(config.global_reduce ? config.ctas_per_output : 1),
         1);
-    const int shared_bytes = config.shared_memory_size(sizeof(AccT));
+    int shared_bytes = config.shared_memory_size(sizeof(AccT));
+    if (config.global_reduce) {
+        // The last-CTA fold stages one accumulator per thread in shared
+        // memory (the normal path sizes this via should_block_y_reduce,
+        // which the fold path cannot rely on).
+        shared_bytes = std::max(shared_bytes,
+            static_cast<int>(config.num_threads * sizeof(AccT)));
+    }
     ReduceOp<InputT, AccT, OutputT, Ops, ValuesPerThread, InputVecSize> reduction{
         config,
         static_cast<const InputT*>(iter.data_ptr(1)),
         static_cast<OutputT*>(iter.data_ptr(0)),
         nullptr,
+        nullptr,
+        nullptr,
+        0,
         identity,
         ops};
 
     DataPtr partial_buffer;
     if (config.global_reduce) {
+        // Scratch layout: one completion counter + one init flag per output
+        // block (u64 each), then the partials. The counter is zeroed
+        // in-kernel by the (x, y==0) CTA and its readiness is published via
+        // the flag holding this launch's unique tag — no cudaMemsetAsync, no
+        // reliance on allocator-held state, and stale content from prior
+        // launches can never match the tag.
+        const size_t slots = static_cast<size_t>(config.num_outputs) *
+                             config.ctas_per_output;
+        const size_t head = static_cast<size_t>(grid.x) * 2 *
+                            sizeof(unsigned long long);
         partial_buffer = getAllocator(DeviceType::CUDA)->allocate(
-            static_cast<size_t>(config.num_outputs) * config.ctas_per_output * sizeof(AccT),
-            iter.device());
-        reduction.partials = static_cast<AccT*>(partial_buffer.get());
+            head + slots * sizeof(AccT), iter.device());
+        char* base = static_cast<char*>(partial_buffer.get());
+        reduction.counters = reinterpret_cast<unsigned long long*>(base);
+        reduction.flags = reinterpret_cast<unsigned long long*>(
+            base + static_cast<size_t>(grid.x) * sizeof(unsigned long long));
+        reduction.partials = reinterpret_cast<AccT*>(base + head);
+        static std::atomic<unsigned long long> tag_counter{1};
+        reduction.tag = tag_counter.fetch_add(1, std::memory_order_relaxed);
     }
 
     reduce_kernel<InputT, AccT, OutputT, Ops, ValuesPerThread, InputVecSize>
         <<<grid, block, shared_bytes, stream>>>(reduction);
     checkCuda(cudaGetLastError(), "CUDA reduction kernel launch");
-
-    if (config.global_reduce) {
-        int final_threads = kWarpSize;
-        while (final_threads < config.ctas_per_output && final_threads < 256) {
-            final_threads <<= 1;
-        }
-        const dim3 final_block(final_threads, 1, 1);
-        const dim3 final_grid(static_cast<unsigned int>(config.num_outputs), 1, 1);
-        finalize_reduce_kernel<AccT, OutputT, Ops>
-            <<<final_grid, final_block, final_threads * sizeof(AccT), stream>>>(
-                config,
-                static_cast<const AccT*>(partial_buffer.get()),
-                static_cast<OutputT*>(iter.data_ptr(0)),
-                identity,
-                ops);
-        checkCuda(cudaGetLastError(), "CUDA reduction finalize launch");
-    }
 }
 
 // Operations -----------------------------------------------------------------

@@ -68,17 +68,21 @@ def test_pick_config_benchmarks_once_then_uses_decision(cache_root):
         class FakeLaunch:
             pass
 
-        return FakeLaunch()
+        fake = FakeLaunch()
+        fake._cfg = config
+        return fake
 
     def bench_fn(launch, args):
         benches.append("called")  # type: ignore[attr-defined]
-        return times[builds[-1]]
+        return times[launch._cfg]
 
     config, launch = sa.pick_config(digest, 300, "cuda:0", build_launch,
                                     [], bench_fn=bench_fn)
     assert config == CANDIDATE_CONFIGS[-1]  # fastest candidate wins
     assert builds == list(sa.CANDIDATE_CONFIGS)  # every candidate compiled once
-    assert len(benches) == len(CANDIDATE_CONFIGS)
+    # Interleaved rounds (bench_candidates): every candidate is benched once
+    # per round so a clock transient hits the whole table, not one config.
+    assert len(benches) == 2 * len(CANDIDATE_CONFIGS)
 
     # Second call hits the persisted decision: single rebuild, no benchmarking.
     builds.clear()
@@ -108,7 +112,7 @@ def test_pick_config_skips_failing_candidates(cache_root):
     config, _ = sa.pick_config(digest, 64, "cuda:0", build_launch, [],
                                bench_fn=bench_fn)
     assert config == eligible[0]
-    assert calls["n"] == len(eligible)
+    assert calls["n"] == 2 * len(eligible)  # two interleaved rounds
 
 
 def test_pick_config_all_fail_raises(cache_root):
@@ -120,6 +124,66 @@ def test_pick_config_all_fail_raises(cache_root):
     with pytest.raises(RuntimeError, match="all candidate configs"):
         sa.pick_config(digest, 10, "cuda:0", build_launch, [],
                        bench_fn=lambda l, a: 1.0)
+
+
+def test_bench_candidates_later_round_failure_keeps_earlier_result():
+    """A candidate that benched fine in round 0 must not be discarded
+    because a later round hiccuped — that transient is exactly the clock
+    noise round-interleaving absorbs."""
+
+    candidates = [("a",), ("b",)]
+    built = []
+
+    def build(config):
+        built.append(config)
+        return object()
+
+    calls = {"n": 0}
+
+    def bench_fn(launch, args):
+        calls["n"] += 1
+        if calls["n"] == 3:  # ("b",) round 1: transient failure
+            raise RuntimeError("flaky")
+        return 1.0 if config_of(launch) == ("a",) else 5.0
+
+    launch_by_config = {}
+
+    def config_of(launch):
+        for cfg, obj in launch_by_config.items():
+            if obj is launch:
+                return cfg
+        raise AssertionError("unknown launch")
+
+    def build2(config):
+        obj = build(config)
+        launch_by_config[config] = obj
+        return obj
+
+    best_config, best_launch, best_time = sa.bench_candidates(
+        build2, candidates, [], bench_fn=bench_fn
+    )
+    assert best_config == ("a",)
+    assert best_time == 1.0
+    assert best_launch is launch_by_config[("a",)]
+
+
+def test_bench_candidates_min_across_rounds():
+    """Round-2 measurements below round-1 must lower the kept time (min)."""
+
+    candidates = [("only",)]
+    seq = [4.0, 2.0]
+    state = {"i": 0}
+
+    def build(config):
+        return object()
+
+    def bench_fn(launch, args):
+        value = seq[min(state["i"], len(seq) - 1)]
+        state["i"] += 1
+        return value
+
+    _, _, best_time = sa.bench_candidates(build, candidates, [], bench_fn=bench_fn)
+    assert best_time == 2.0
 
 
 def test_disabled_env(monkeypatch):
