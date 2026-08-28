@@ -1,0 +1,26 @@
+# Dependency update automation, mirroring pytorch's dependabot.yml.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "release notes: build"
+    commit-message:
+      prefix: "ci"
+      include: "scope"
+
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "release notes: build"
+    commit-message:
+      prefix: "build"
+      include: "scope"
+    ignore:
+      # cmake<4.0 is a deliberate project pin (see pyproject.toml).
+      - dependency-name: "cmake"
+        update-types: ["version-update:semver-major"]

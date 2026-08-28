@@ -1,6 +1,6 @@
 <div align="center">
     <p>
-        <img src="https://raw.githubusercontent.com/bluemoon-o2/TensorPlay/main/docs/images/tensorplay-mark.png" alt="TensorPlay 图形标志" width="180">
+        <img src="https://raw.githubusercontent.com/lexing-2026/TensorPlay/main/docs/images/tensorplay-mark.png" alt="TensorPlay 图形标志" width="180">
     </p>
 
 <!-- 语言切换 -->
@@ -31,16 +31,16 @@
     <a href="https://pepy.tech/projects/tensorplay">
         <img src="https://static.pepy.tech/badge/TensorPlay/month" alt="Monthly Downloads">
     </a>
-    <img src="https://img.shields.io/github/downloads/bluemoon-o2/TensorPlay/total.svg?label=Github%20Downloads" alt="Github Downloads">
+    <img src="https://img.shields.io/github/downloads/lexing-2026/TensorPlay/total.svg?label=Github%20Downloads" alt="Github Downloads">
 </p>
 
 <!-- 社区与支持 -->
 <p>
-    <a href="https://github.com/bluemoon-o2/TensorPlay/stargazers">
-        <img src="https://img.shields.io/github/stars/bluemoon-o2/TensorPlay?style=flat&logo=github&color=yellow" alt="GitHub Stars">
+    <a href="https://github.com/lexing-2026/TensorPlay/stargazers">
+        <img src="https://img.shields.io/github/stars/lexing-2026/TensorPlay?style=flat&logo=github&color=yellow" alt="GitHub Stars">
     </a>
-    <a href="https://github.com/bluemoon-o2/TensorPlay/commits/main">
-        <img src="https://img.shields.io/github/last-commit/bluemoon-o2/TensorPlay?logo=git&color=teal" alt="Last Commit">
+    <a href="https://github.com/lexing-2026/TensorPlay/commits/main">
+        <img src="https://img.shields.io/github/last-commit/lexing-2026/TensorPlay?logo=git&color=teal" alt="Last Commit">
     </a>
     <a href="https://discord.gg/u6T5e2kGJm">
         <img src="https://img.shields.io/discord/1467167983616000062?color=5865F2&label=Discord&logo=discord&logoColor=white" alt="Discord">
@@ -140,6 +140,22 @@ pip install tensorplay --index-url https://download.tensorplay.cn/whl/cu124/ --e
 
 > **注意：** 请确保 Python 版本与 wheel 标签匹配（如 `cp310` 对应 Python 3.10）。CUDA 版本要求驱动与运行时支持对应 CUDA 版本。
 
+### Nightly（预览版）
+
+预览版轮子通过手动发布到滚动的 `nightly` 通道，版本号规则对齐 pytorch nightly（`X.Y.0.dev<日期>+cuXXX` / `+cpu`），仅保留最新一次发布的版本。
+
+```bash
+# CUDA nightly（可选 cu124、cu126 或 cu130）
+pip install --pre tensorplay \
+  --index-url https://download.tensorplay.cn/whl/nightly/cu124/ \
+  --extra-index-url https://pypi.org/simple
+
+# CPU nightly
+pip install --pre tensorplay \
+  --index-url https://download.tensorplay.cn/whl/nightly/cpu/ \
+  --extra-index-url https://pypi.org/simple
+```
+
 ### 从源码构建
 
 源码构建得到的是可魔改、可调试的安装——推荐贡献者以及所有研究内核的开发者使用。
@@ -155,7 +171,7 @@ pip install tensorplay --index-url https://download.tensorplay.cn/whl/cu124/ --e
 #### 获取源码
 
 ```bash
-git clone https://github.com/bluemoon-o2/TensorPlay.git
+git clone https://github.com/lexing-2026/TensorPlay.git
 cd TensorPlay
 ```
 
@@ -287,19 +303,19 @@ CI 会在每个 PR 和 main 推送上构建完整 wheel 矩阵（Python 3.9–3.
 
 我们欢迎各种形式的贡献——bug 修复、文档改进、新功能建议。开发流程与编码规范见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
-<a href="https://github.com/bluemoon-o2/TensorPlay/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=bluemoon-o2/TensorPlay&columns=10" alt="Contributors" />
+<a href="https://github.com/lexing-2026/TensorPlay/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=lexing-2026/TensorPlay&columns=10" alt="Contributors" />
 </a>
 
 ## 许可证
 
 TensorPlay 采用 [Apache 2.0 许可证](LICENSE)。
 
-<a href="https://star-history.com/#bluemoon-o2/TensorPlay&Date">
+<a href="https://star-history.com/#lexing-2026/TensorPlay&Date">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=bluemoon-o2/TensorPlay&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=bluemoon-o2/TensorPlay&type=Date" />
-    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=bluemoon-o2/TensorPlay&type=Date" width="100%" />
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=lexing-2026/TensorPlay&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=lexing-2026/TensorPlay&type=Date" />
+    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=lexing-2026/TensorPlay&type=Date" width="100%" />
   </picture>
 </a>
 

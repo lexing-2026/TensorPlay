@@ -40,6 +40,14 @@ struct StaxPointwiseInstruction {
     int64_t rhs;
 };
 
+// Programs up to this size keep the original stack-allocated fast path;
+// larger fused regions spill to a heap buffer instead of failing, so whole
+// pointwise chains (e.g. unrolled residual sweeps) fuse into one kernel.
+constexpr int64_t kStackProgramLimit = 64;
+constexpr int64_t kMaxPointwiseInstructions = 65536;
+constexpr int64_t kMaxPointwiseConstants = 65536;
+constexpr int64_t kMaxPointwiseInputs = 64;
+
 template <typename Vec>
 void prepare_program(
     const std::vector<int64_t>& program,
@@ -47,7 +55,7 @@ void prepare_program(
     StaxPointwiseInstruction* instructions,
     Vec* constant_values) {
     const int64_t instruction_count = static_cast<int64_t>(program.size() / 3);
-    if (constants.size() > 64) {
+    if (static_cast<int64_t>(constants.size()) > kMaxPointwiseConstants) {
         throw std::runtime_error("Stax CPU fused pointwise constants are too large");
     }
     for (int64_t instruction = 0; instruction < instruction_count; ++instruction) {
@@ -134,15 +142,15 @@ Vec eval_program(
     int64_t constant_count,
     int64_t input_count,
     int64_t instruction_count,
+    Vec* input_values,
+    Vec* temporaries,
     int64_t index,
     int64_t count) {
-    Vec input_values[64];
     for (int64_t input = 0; input < input_count; ++input) {
         input_values[input] = Vec::loadu(
             input_ptrs[static_cast<size_t>(input)] + index,
             count);
     }
-    Vec temporaries[64];
     eval_program_cached(
         input_values,
         instructions,
@@ -208,7 +216,8 @@ Tensor stax_pointwise_kernel_impl(
     const std::vector<int64_t>& program,
     const std::vector<double>& constants) {
     if (inputs.empty() || program.empty() || program.size() % 3 != 0 ||
-        program.size() / 3 > 64) {
+        program.size() / 3 > kMaxPointwiseInstructions ||
+        static_cast<int64_t>(inputs.size()) > kMaxPointwiseInputs) {
         throw std::runtime_error("Stax CPU fused pointwise program is malformed");
     }
     const Tensor& first = inputs.front();
@@ -242,34 +251,59 @@ Tensor stax_pointwise_kernel_impl(
 
     const int64_t input_count = static_cast<int64_t>(inputs.size());
     const int64_t instruction_count = static_cast<int64_t>(program.size() / 3);
-    StaxPointwiseInstruction instructions[64];
-    Vec constant_values[64];
+    StaxPointwiseInstruction stack_instructions[kStackProgramLimit];
+    Vec stack_constant_values[kStackProgramLimit];
+    std::vector<StaxPointwiseInstruction> heap_instructions;
+    std::vector<Vec> heap_constant_values;
+    StaxPointwiseInstruction* instructions = stack_instructions;
+    Vec* constant_values = stack_constant_values;
+    if (instruction_count > kStackProgramLimit) {
+        heap_instructions.resize(instruction_count);
+        instructions = heap_instructions.data();
+    }
+    if (static_cast<int64_t>(constants.size()) > kStackProgramLimit) {
+        heap_constant_values.resize(constants.size());
+        constant_values = heap_constant_values.data();
+    }
     prepare_program(program, constants, instructions, constant_values);
     const int64_t n = first.numel();
     float* output = result.data_ptr<float>();
     const int64_t width = Vec::size();
+    const int64_t constant_count = static_cast<int64_t>(constants.size());
     parallel::parallel_for(0, n, parallel::GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        Vec input_values[kMaxPointwiseInputs];
+        Vec stack_temporaries[kStackProgramLimit];
+        std::vector<Vec> heap_temporaries;
+        Vec* temporaries = stack_temporaries;
+        if (instruction_count > kStackProgramLimit) {
+            heap_temporaries.resize(instruction_count);
+            temporaries = heap_temporaries.data();
+        }
         int64_t index = begin;
         for (; index + width <= end; index += width) {
-            auto value = eval_program<Vec>(
+            const auto value = eval_program<Vec>(
                 input_ptrs,
                 instructions,
                 constant_values,
-                static_cast<int64_t>(constants.size()),
+                constant_count,
                 input_count,
                 instruction_count,
+                input_values,
+                temporaries,
                 index,
                 width);
             value.store(output + index, width);
         }
         if (index < end) {
-            auto value = eval_program<Vec>(
+            const auto value = eval_program<Vec>(
                 input_ptrs,
                 instructions,
                 constant_values,
-                static_cast<int64_t>(constants.size()),
+                constant_count,
                 input_count,
                 instruction_count,
+                input_values,
+                temporaries,
                 index,
                 end - index);
             value.store(output + index, end - index);
@@ -295,7 +329,9 @@ std::vector<Tensor> stax_pointwise_multi_kernel_impl(
     const std::vector<double>& constants,
     const std::vector<int64_t>& output_refs) {
     if (inputs.empty() || program.empty() || program.size() % 3 != 0 ||
-        program.size() / 3 > 64 || output_refs.empty()) {
+        program.size() / 3 > kMaxPointwiseInstructions ||
+        static_cast<int64_t>(inputs.size()) > kMaxPointwiseInputs ||
+        output_refs.empty()) {
         throw std::runtime_error("Stax CPU multi-output pointwise program is malformed");
     }
     const Tensor& first = inputs.front();
@@ -315,8 +351,20 @@ std::vector<Tensor> stax_pointwise_multi_kernel_impl(
 
     const int64_t input_count = static_cast<int64_t>(inputs.size());
     const int64_t instruction_count = static_cast<int64_t>(program.size() / 3);
-    StaxPointwiseInstruction instructions[64];
-    Vec constant_values[64];
+    StaxPointwiseInstruction stack_instructions[kStackProgramLimit];
+    Vec stack_constant_values[kStackProgramLimit];
+    std::vector<StaxPointwiseInstruction> heap_instructions;
+    std::vector<Vec> heap_constant_values;
+    StaxPointwiseInstruction* instructions = stack_instructions;
+    Vec* constant_values = stack_constant_values;
+    if (instruction_count > kStackProgramLimit) {
+        heap_instructions.resize(instruction_count);
+        instructions = heap_instructions.data();
+    }
+    if (static_cast<int64_t>(constants.size()) > kStackProgramLimit) {
+        heap_constant_values.resize(constants.size());
+        constant_values = heap_constant_values.data();
+    }
     prepare_program(program, constants, instructions, constant_values);
     for (int64_t output_ref : output_refs) {
         if (output_ref < input_count ||
@@ -348,21 +396,28 @@ std::vector<Tensor> stax_pointwise_multi_kernel_impl(
 
     const int64_t n = first.numel();
     const int64_t width = Vec::size();
+    const int64_t constant_count = static_cast<int64_t>(constants.size());
     parallel::parallel_for(0, n, parallel::GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        Vec input_values[kMaxPointwiseInputs];
+        Vec stack_temporaries[kStackProgramLimit];
+        std::vector<Vec> heap_temporaries;
+        Vec* temporaries = stack_temporaries;
+        if (instruction_count > kStackProgramLimit) {
+            heap_temporaries.resize(instruction_count);
+            temporaries = heap_temporaries.data();
+        }
         int64_t index = begin;
         for (; index + width <= end; index += width) {
-            Vec input_values[64];
             for (int64_t input = 0; input < input_count; ++input) {
                 input_values[input] = Vec::loadu(
                     input_ptrs[static_cast<size_t>(input)] + index,
                     width);
             }
-            Vec temporaries[64];
             eval_program_cached(
                 input_values,
                 instructions,
                 constant_values,
-                static_cast<int64_t>(constants.size()),
+                constant_count,
                 input_count,
                 instruction_count,
                 temporaries);
@@ -374,18 +429,16 @@ std::vector<Tensor> stax_pointwise_multi_kernel_impl(
         }
         if (index < end) {
             const int64_t count = end - index;
-            Vec input_values[64];
             for (int64_t input = 0; input < input_count; ++input) {
                 input_values[input] = Vec::loadu(
                     input_ptrs[static_cast<size_t>(input)] + index,
                     count);
             }
-            Vec temporaries[64];
             eval_program_cached(
                 input_values,
                 instructions,
                 constant_values,
-                static_cast<int64_t>(constants.size()),
+                constant_count,
                 input_count,
                 instruction_count,
                 temporaries);

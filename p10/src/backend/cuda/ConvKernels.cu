@@ -286,6 +286,131 @@ ConvBwdKey make_conv_bwd_key(
         groups};
 }
 
+#ifndef TP_CONV_CUDA_CHECK
+#define TP_CONV_CUDA_CHECK(condition) \
+    do { \
+        cudaError_t tp_conv_err__ = (condition); \
+        if (tp_conv_err__ != cudaSuccess) { \
+            TP_THROW(RuntimeError, std::string("CUDA error: ") + \
+                                   cudaGetErrorString(tp_conv_err__)); \
+        } \
+    } while (0)
+#endif
+
+// ---- Algorithm cache + autotune for the legacy (v8) cuDNN paths -----------
+//
+// Parity/optimization notes vs aten's cudnn ConvShared.cpp:
+//  * torch caches the selected algorithm per shape (AlgorithmSearchCache);
+//    the conv3d / conv_transpose* paths used to re-run the v7 heuristic
+//    query on every call.  g_conv_nd_algo_cache fixes that.
+//  * torch.backends.cudnn.benchmark=True switches aten from the heuristic
+//    to cudnnFind*AlgorithmEx (real timing of candidate algorithms).  The
+//    autotune_* helpers implement the same for TensorPlay, gated on
+//    globalContext().cudnnBenchmark().
+//  * Autotune is skipped under deterministic mode, like torch does.
+
+static std::unordered_map<std::string, ConvBwdAlgo> g_conv_nd_algo_cache;
+static std::mutex g_conv_nd_cache_mutex;
+
+// Cap the workspace offered to the Find*Ex calls (torch similarly bounds it
+// by available memory; a fixed cap keeps autotune from grabbing all of VRAM).
+static constexpr size_t kConvAutotuneWorkspaceCap = 512ULL * 1024 * 1024;
+
+static bool conv_autotune_enabled() {
+    return tensorplay::globalContext().cudnnBenchmark() &&
+           !tensorplay::globalContext().deterministicAlgorithms();
+}
+
+static void key_append(std::string& key, const std::vector<int64_t>& v) {
+    for (int64_t d : v) key += ":" + std::to_string(d);
+}
+
+template <class XDesc, class WDesc, class CDesc, class YDesc>
+static ConvBwdAlgo autotune_conv_fwd(
+    cudnnHandle_t handle,
+    const XDesc& x_desc, const void* x_ptr,
+    const WDesc& w_desc, const void* w_ptr,
+    const CDesc& conv_desc,
+    const YDesc& y_desc, void* y_ptr,
+    const Device& device) {
+    auto workspace = getAllocator(DeviceType::CUDA)->allocate(
+        kConvAutotuneWorkspaceCap, device);
+    cudnnConvolutionFwdAlgoPerf_t perfs[16];
+    int returned = 0;
+    CUDNN_CHECK(cudnnFindConvolutionForwardAlgorithmEx(
+        handle, x_desc, x_ptr, w_desc, w_ptr, conv_desc, y_desc, y_ptr,
+        16, &returned, perfs, workspace.get(), kConvAutotuneWorkspaceCap));
+    for (int i = 0; i < returned; ++i) {
+        if (perfs[i].status == CUDNN_STATUS_SUCCESS) {
+            return ConvBwdAlgo{static_cast<int>(perfs[i].algo), perfs[i].memory};
+        }
+    }
+    TP_THROW(RuntimeError, "cuDNN: autotune found no forward convolution algorithm");
+}
+
+template <class WDesc, class DYDesc, class CDesc, class DXDesc>
+static ConvBwdAlgo autotune_conv_bwd_data(
+    cudnnHandle_t handle,
+    const WDesc& w_desc, const void* w_ptr,
+    const DYDesc& dy_desc, const void* dy_ptr,
+    const CDesc& conv_desc,
+    const DXDesc& dx_desc, void* dx_ptr,
+    const Device& device) {
+    auto workspace = getAllocator(DeviceType::CUDA)->allocate(
+        kConvAutotuneWorkspaceCap, device);
+    cudnnConvolutionBwdDataAlgoPerf_t perfs[16];
+    int returned = 0;
+    CUDNN_CHECK(cudnnFindConvolutionBackwardDataAlgorithmEx(
+        handle, w_desc, w_ptr, dy_desc, dy_ptr, conv_desc, dx_desc, dx_ptr,
+        16, &returned, perfs, workspace.get(), kConvAutotuneWorkspaceCap));
+    for (int i = 0; i < returned; ++i) {
+        if (perfs[i].status == CUDNN_STATUS_SUCCESS) {
+            return ConvBwdAlgo{static_cast<int>(perfs[i].algo), perfs[i].memory};
+        }
+    }
+    TP_THROW(RuntimeError, "cuDNN: autotune found no backward-data convolution algorithm");
+}
+
+template <class XDesc, class DYDesc, class CDesc, class DWDesc>
+static ConvBwdAlgo autotune_conv_bwd_filter(
+    cudnnHandle_t handle,
+    const XDesc& x_desc, const void* x_ptr,
+    const DYDesc& dy_desc, const void* dy_ptr,
+    const CDesc& conv_desc,
+    const DWDesc& dw_desc, void* dw_ptr,
+    const Device& device) {
+    auto workspace = getAllocator(DeviceType::CUDA)->allocate(
+        kConvAutotuneWorkspaceCap, device);
+    cudnnConvolutionBwdFilterAlgoPerf_t perfs[16];
+    int returned = 0;
+    CUDNN_CHECK(cudnnFindConvolutionBackwardFilterAlgorithmEx(
+        handle, x_desc, x_ptr, dy_desc, dy_ptr, conv_desc, dw_desc, dw_ptr,
+        16, &returned, perfs, workspace.get(), kConvAutotuneWorkspaceCap));
+    for (int i = 0; i < returned; ++i) {
+        if (perfs[i].status == CUDNN_STATUS_SUCCESS) {
+            return ConvBwdAlgo{static_cast<int>(perfs[i].algo), perfs[i].memory};
+        }
+    }
+    TP_THROW(RuntimeError, "cuDNN: autotune found no backward-filter convolution algorithm");
+}
+
+// Cached lookup-or-select for the legacy paths.  `select` runs only on a
+// cache miss (v7 heuristic or Find*Ex autotune depending on benchmark mode).
+template <class Select>
+static ConvBwdAlgo cached_conv_algo(const std::string& key, Select&& select) {
+    {
+        std::lock_guard<std::mutex> lock(g_conv_nd_cache_mutex);
+        auto it = g_conv_nd_algo_cache.find(key);
+        if (it != g_conv_nd_algo_cache.end()) return it->second;
+    }
+    ConvBwdAlgo entry = select();
+    {
+        std::lock_guard<std::mutex> lock(g_conv_nd_cache_mutex);
+        g_conv_nd_algo_cache.emplace(key, entry);
+    }
+    return entry;
+}
+
 #endif
 
 #ifdef USE_CUDNN
@@ -540,6 +665,7 @@ static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const 
         int device;
         bool has_bias;
         bool fused_relu;
+        bool autotune;
         std::array<int64_t, 4> x_stride;
         std::array<int64_t, 4> w_stride;
         std::array<int64_t, 4> y_stride;
@@ -549,6 +675,7 @@ static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const 
                    ph == o.ph && pw == o.pw && sh == o.sh && sw == o.sw &&
                    dh == o.dh && dw == o.dw && device == o.device &&
                    has_bias == o.has_bias && fused_relu == o.fused_relu &&
+                   autotune == o.autotune &&
                    x_stride == o.x_stride && w_stride == o.w_stride &&
                    y_stride == o.y_stride;
         }
@@ -562,6 +689,7 @@ static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const 
             h = h * 1000003 ^ std::hash<int>{}(k.device);
             h = h * 1000003 ^ std::hash<int>{}((int)k.has_bias);
             h = h * 1000003 ^ std::hash<int>{}((int)k.fused_relu);
+            h = h * 1000003 ^ std::hash<int>{}((int)k.autotune);
             for (auto v : k.x_stride) h = h * 1000003 ^ std::hash<int64_t>{}(v);
             for (auto v : k.w_stride) h = h * 1000003 ^ std::hash<int64_t>{}(v);
             for (auto v : k.y_stride) h = h * 1000003 ^ std::hash<int64_t>{}(v);
@@ -585,9 +713,96 @@ static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const 
     ConvKey key{dtype, N, C, H, W, K, R, S, groups,
                 padding[0], padding[1], stride[0], stride[1], dilation[0], dilation[1],
                 static_cast<int>(input.device().index()),
-                bias.defined(), fused_relu, x_stride, w_stride, y_stride};
+                bias.defined(), fused_relu, conv_autotune_enabled(),
+                x_stride, w_stride, y_stride};
 
     cudnnHandle_t handle = CUDAContext::getCudnnHandle();
+
+    // Executes one plan against this call's tensors (used both for the real
+    // compute and for timing candidate plans in benchmark mode).
+    auto run_plan = [&](const fe::ExecutionPlan& p, void* ws_ptr, size_t ws_size) {
+        if (key.has_bias) {
+            void* data_ptrs[4] = {input.data_ptr(), weight.data_ptr(), bias.data_ptr(), out.data_ptr()};
+            int64_t uids[4] = {'x', 'w', 'b', 'y'};
+            auto variant_pack = fe::VariantPackBuilder()
+                                    .setWorkspacePointer(ws_size ? ws_ptr : nullptr)
+                                    .setDataPointers(4, data_ptrs)
+                                    .setUids(4, uids)
+                                    .build();
+            CUDNN_CHECK(cudnnBackendExecute(handle, p.get_raw_desc(), variant_pack.get_raw_desc()));
+        } else {
+            void* data_ptrs[3] = {input.data_ptr(), weight.data_ptr(), out.data_ptr()};
+            int64_t uids[3] = {'x', 'w', 'y'};
+            auto variant_pack = fe::VariantPackBuilder()
+                                    .setWorkspacePointer(ws_size ? ws_ptr : nullptr)
+                                    .setDataPointers(3, data_ptrs)
+                                    .setUids(3, uids)
+                                    .build();
+            CUDNN_CHECK(cudnnBackendExecute(handle, p.get_raw_desc(), variant_pack.get_raw_desc()));
+        }
+    };
+
+    // Picks an execution plan for the graph.  Normally the first heuristic
+    // config (like torch's non-benchmark path); under cudnn.benchmark the
+    // fallback heuristics are asked for several configs and the fastest is
+    // selected by actual timing (like torch's benchmark mode).
+    auto pick_plan = [&](fe::OperationGraph& op_graph) -> std::shared_ptr<fe::ExecutionPlan> {
+        const bool autotune = conv_autotune_enabled();
+        auto heuristics = fe::EngineHeuristicsBuilder()
+                              .setOperationGraph(op_graph)
+                              .setHeurMode(autotune ? CUDNN_HEUR_MODE_FALLBACK
+                                                    : CUDNN_HEUR_MODE_INSTANT)
+                              .build();
+        auto& engine_configs = heuristics.getEngineConfig(autotune ? 8 : 1);
+        if (engine_configs.empty()) {
+            TP_THROW(RuntimeError, "cuDNN: no engine configs for conv2d");
+        }
+        if (!autotune || engine_configs.size() == 1) {
+            return std::make_shared<fe::ExecutionPlan>(
+                fe::ExecutionPlanBuilder()
+                    .setHandle(handle)
+                    .setEngineConfig(engine_configs[0])
+                    .build());
+        }
+        std::vector<std::shared_ptr<fe::ExecutionPlan>> candidates;
+        for (auto& ec : engine_configs) {
+            try {
+                candidates.push_back(std::make_shared<fe::ExecutionPlan>(
+                    fe::ExecutionPlanBuilder().setHandle(handle).setEngineConfig(ec).build()));
+            } catch (...) {
+                // Config failed to build an executable plan; skip it.
+            }
+        }
+        if (candidates.empty()) {
+            TP_THROW(RuntimeError, "cuDNN: no executable engine configs for conv2d");
+        }
+        if (candidates.size() == 1) return candidates[0];
+
+        cudaEvent_t ev_begin = nullptr, ev_end = nullptr;
+        TP_CONV_CUDA_CHECK(cudaEventCreate(&ev_begin));
+        TP_CONV_CUDA_CHECK(cudaEventCreate(&ev_end));
+        cudaStream_t stream = getCurrentCUDAStream().stream();
+        std::shared_ptr<fe::ExecutionPlan> best;
+        float best_ms = 0.0f;
+        for (auto& cand : candidates) {
+            size_t ws = cand->getWorkspaceSize();
+            auto ws_buf = getAllocator(DeviceType::CUDA)->allocate(ws ? ws : 1);
+            run_plan(*cand, ws_buf.get(), ws);  // warmup
+            TP_CONV_CUDA_CHECK(cudaEventRecord(ev_begin, stream));
+            for (int rep = 0; rep < 3; ++rep) run_plan(*cand, ws_buf.get(), ws);
+            TP_CONV_CUDA_CHECK(cudaEventRecord(ev_end, stream));
+            TP_CONV_CUDA_CHECK(cudaEventSynchronize(ev_end));
+            float ms = 0.0f;
+            TP_CONV_CUDA_CHECK(cudaEventElapsedTime(&ms, ev_begin, ev_end));
+            if (!best || ms < best_ms) {
+                best = cand;
+                best_ms = ms;
+            }
+        }
+        cudaEventDestroy(ev_begin);
+        cudaEventDestroy(ev_end);
+        return best;
+    };
 
     std::shared_ptr<fe::ExecutionPlan> plan;
     {
@@ -715,38 +930,14 @@ static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const 
                             .setOperationGraph(ops.size(), ops.data())
                             .build());
                 }
-                auto heuristics = fe::EngineHeuristicsBuilder()
-                                      .setOperationGraph(*op_graph_ptr)
-                                      .setHeurMode(CUDNN_HEUR_MODE_INSTANT)
-                                      .build();
-                auto& engine_configs = heuristics.getEngineConfig(1);
-                if (engine_configs.empty()) {
-                    TP_THROW(RuntimeError, "cuDNN: no engine configs for conv2d");
-                }
-                new_plan = std::make_shared<fe::ExecutionPlan>(
-                    fe::ExecutionPlanBuilder()
-                        .setHandle(handle)
-                        .setEngineConfig(engine_configs[0])
-                        .build());
+                new_plan = pick_plan(*op_graph_ptr);
             } else if (!key.fused_relu) {
                 std::array<fe::Operation const*, 1> ops = {&conv_op};
                 auto op_graph = fe::OperationGraphBuilder()
                                     .setHandle(handle)
                                     .setOperationGraph(ops.size(), ops.data())
                                     .build();
-                auto heuristics = fe::EngineHeuristicsBuilder()
-                                      .setOperationGraph(op_graph)
-                                      .setHeurMode(CUDNN_HEUR_MODE_INSTANT)
-                                      .build();
-                auto& engine_configs = heuristics.getEngineConfig(1);
-                if (engine_configs.empty()) {
-                    TP_THROW(RuntimeError, "cuDNN: no engine configs for conv2d");
-                }
-                new_plan = std::make_shared<fe::ExecutionPlan>(
-                    fe::ExecutionPlanBuilder()
-                        .setHandle(handle)
-                        .setEngineConfig(engine_configs[0])
-                        .build());
+                new_plan = pick_plan(op_graph);
             } else {
                 auto conv_out_desc = fe::TensorBuilder()
                                          .setDim(4, std::array<int64_t, 4>{N, K, OH, OW}.data())
@@ -778,19 +969,7 @@ static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const 
                                     .setHandle(handle)
                                     .setOperationGraph(ops.size(), ops.data())
                                     .build();
-                auto heuristics = fe::EngineHeuristicsBuilder()
-                                      .setOperationGraph(op_graph)
-                                      .setHeurMode(CUDNN_HEUR_MODE_INSTANT)
-                                      .build();
-                auto& engine_configs = heuristics.getEngineConfig(1);
-                if (engine_configs.empty()) {
-                    TP_THROW(RuntimeError, "cuDNN: no engine configs for fused conv2d_relu");
-                }
-                new_plan = std::make_shared<fe::ExecutionPlan>(
-                    fe::ExecutionPlanBuilder()
-                        .setHandle(handle)
-                        .setEngineConfig(engine_configs[0])
-                        .build());
+                new_plan = pick_plan(op_graph);
             }
             plan = new_plan;
             g_conv_plan_cache[key] = new_plan;
@@ -800,25 +979,7 @@ static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const 
     size_t workspace_size = plan->getWorkspaceSize();
     auto workspace = getAllocator(DeviceType::CUDA)->allocate(workspace_size ? workspace_size : 1);
 
-    if (key.has_bias) {
-        void* data_ptrs[4] = {input.data_ptr(), weight.data_ptr(), bias.data_ptr(), out.data_ptr()};
-        int64_t uids[4] = {'x', 'w', 'b', 'y'};
-        auto variant_pack = fe::VariantPackBuilder()
-                                .setWorkspacePointer(workspace_size ? workspace.get() : nullptr)
-                                .setDataPointers(4, data_ptrs)
-                                .setUids(4, uids)
-                                .build();
-        CUDNN_CHECK(cudnnBackendExecute(handle, plan->get_raw_desc(), variant_pack.get_raw_desc()));
-    } else {
-        void* data_ptrs[3] = {input.data_ptr(), weight.data_ptr(), out.data_ptr()};
-        int64_t uids[3] = {'x', 'w', 'y'};
-        auto variant_pack = fe::VariantPackBuilder()
-                                .setWorkspacePointer(workspace_size ? workspace.get() : nullptr)
-                                .setDataPointers(3, data_ptrs)
-                                .setUids(3, uids)
-                                .build();
-        CUDNN_CHECK(cudnnBackendExecute(handle, plan->get_raw_desc(), variant_pack.get_raw_desc()));
-    }
+    run_plan(*plan, workspace.get(), workspace_size);
 
     return out;
 #else
@@ -874,25 +1035,42 @@ Tensor conv2d_grad_input_cuda(const Tensor& grad_output, const Tensor& input, co
     cudnnConvolutionBwdDataAlgo_t algo;
     size_t workspace_size;
     {
-        std::lock_guard<std::mutex> lock(g_conv_bwd_cache_mutex);
-        auto it = g_conv_bwd_algo_cache.find(cache_key);
-        if (it == g_conv_bwd_algo_cache.end()) {
-            cudnnConvolutionBwdDataAlgoPerf_t perf_results;
-            int returned_algo_count = 0;
-            CUDNN_CHECK(cudnnGetConvolutionBackwardDataAlgorithm_v7(
-                handle, w_desc, dy_desc, conv_desc, dx_desc,
-                1, &returned_algo_count, &perf_results));
-            if (returned_algo_count == 0) {
-                TP_THROW(RuntimeError, "cuDNN: no backward-data convolution algorithm");
+        bool have = false;
+        {
+            std::lock_guard<std::mutex> lock(g_conv_bwd_cache_mutex);
+            auto it = g_conv_bwd_algo_cache.find(cache_key);
+            if (it != g_conv_bwd_algo_cache.end()) {
+                algo = static_cast<cudnnConvolutionBwdDataAlgo_t>(it->second.algorithm);
+                workspace_size = it->second.workspace_size;
+                have = true;
             }
-            algo = perf_results.algo;
-            CUDNN_CHECK(cudnnGetConvolutionBackwardDataWorkspaceSize(
-                handle, w_desc, dy_desc, conv_desc, dx_desc, algo, &workspace_size));
-            g_conv_bwd_algo_cache.emplace(
-                cache_key, ConvBwdAlgo{static_cast<int>(algo), workspace_size});
-        } else {
-            algo = static_cast<cudnnConvolutionBwdDataAlgo_t>(it->second.algorithm);
-            workspace_size = it->second.workspace_size;
+        }
+        if (!have) {
+            ConvBwdAlgo entry;
+            if (conv_autotune_enabled()) {
+                entry = autotune_conv_bwd_data(handle, w_desc, weight_c.data_ptr(),
+                                               dy_desc, grad_output_c.data_ptr(), conv_desc,
+                                               dx_desc, grad_input.data_ptr(), input_c.device());
+            } else {
+                cudnnConvolutionBwdDataAlgoPerf_t perf_results;
+                int returned_algo_count = 0;
+                CUDNN_CHECK(cudnnGetConvolutionBackwardDataAlgorithm_v7(
+                    handle, w_desc, dy_desc, conv_desc, dx_desc,
+                    1, &returned_algo_count, &perf_results));
+                if (returned_algo_count == 0) {
+                    TP_THROW(RuntimeError, "cuDNN: no backward-data convolution algorithm");
+                }
+                size_t ws_size = 0;
+                CUDNN_CHECK(cudnnGetConvolutionBackwardDataWorkspaceSize(
+                    handle, w_desc, dy_desc, conv_desc, dx_desc, perf_results.algo, &ws_size));
+                entry = ConvBwdAlgo{static_cast<int>(perf_results.algo), ws_size};
+            }
+            {
+                std::lock_guard<std::mutex> lock(g_conv_bwd_cache_mutex);
+                g_conv_bwd_algo_cache.emplace(cache_key, entry);
+            }
+            algo = static_cast<cudnnConvolutionBwdDataAlgo_t>(entry.algorithm);
+            workspace_size = entry.workspace_size;
         }
     }
     
@@ -940,25 +1118,42 @@ Tensor conv2d_grad_weight_cuda(const Tensor& grad_output, const Tensor& input, c
     cudnnConvolutionBwdFilterAlgo_t algo;
     size_t workspace_size;
     {
-        std::lock_guard<std::mutex> lock(g_conv_bwd_cache_mutex);
-        auto it = g_conv_bwd_algo_cache.find(cache_key);
-        if (it == g_conv_bwd_algo_cache.end()) {
-            cudnnConvolutionBwdFilterAlgoPerf_t perf_results;
-            int returned_algo_count = 0;
-            CUDNN_CHECK(cudnnGetConvolutionBackwardFilterAlgorithm_v7(
-                handle, x_desc, dy_desc, conv_desc, dw_desc,
-                1, &returned_algo_count, &perf_results));
-            if (returned_algo_count == 0) {
-                TP_THROW(RuntimeError, "cuDNN: no backward-filter convolution algorithm");
+        bool have = false;
+        {
+            std::lock_guard<std::mutex> lock(g_conv_bwd_cache_mutex);
+            auto it = g_conv_bwd_algo_cache.find(cache_key);
+            if (it != g_conv_bwd_algo_cache.end()) {
+                algo = static_cast<cudnnConvolutionBwdFilterAlgo_t>(it->second.algorithm);
+                workspace_size = it->second.workspace_size;
+                have = true;
             }
-            algo = perf_results.algo;
-            CUDNN_CHECK(cudnnGetConvolutionBackwardFilterWorkspaceSize(
-                handle, x_desc, dy_desc, conv_desc, dw_desc, algo, &workspace_size));
-            g_conv_bwd_algo_cache.emplace(
-                cache_key, ConvBwdAlgo{static_cast<int>(algo), workspace_size});
-        } else {
-            algo = static_cast<cudnnConvolutionBwdFilterAlgo_t>(it->second.algorithm);
-            workspace_size = it->second.workspace_size;
+        }
+        if (!have) {
+            ConvBwdAlgo entry;
+            if (conv_autotune_enabled()) {
+                entry = autotune_conv_bwd_filter(handle, x_desc, input_c.data_ptr(),
+                                                 dy_desc, grad_output_c.data_ptr(), conv_desc,
+                                                 dw_desc, grad_weight.data_ptr(), input_c.device());
+            } else {
+                cudnnConvolutionBwdFilterAlgoPerf_t perf_results;
+                int returned_algo_count = 0;
+                CUDNN_CHECK(cudnnGetConvolutionBackwardFilterAlgorithm_v7(
+                    handle, x_desc, dy_desc, conv_desc, dw_desc,
+                    1, &returned_algo_count, &perf_results));
+                if (returned_algo_count == 0) {
+                    TP_THROW(RuntimeError, "cuDNN: no backward-filter convolution algorithm");
+                }
+                size_t ws_size = 0;
+                CUDNN_CHECK(cudnnGetConvolutionBackwardFilterWorkspaceSize(
+                    handle, x_desc, dy_desc, conv_desc, dw_desc, perf_results.algo, &ws_size));
+                entry = ConvBwdAlgo{static_cast<int>(perf_results.algo), ws_size};
+            }
+            {
+                std::lock_guard<std::mutex> lock(g_conv_bwd_cache_mutex);
+                g_conv_bwd_algo_cache.emplace(cache_key, entry);
+            }
+            algo = static_cast<cudnnConvolutionBwdFilterAlgo_t>(entry.algorithm);
+            workspace_size = entry.workspace_size;
         }
     }
     
@@ -1075,6 +1270,14 @@ struct ConvDescNd {
                                                     CUDNN_CROSS_CORRELATION,
                                                     to_cudnn_compute_type(dtype)));
         CUDNN_CHECK(cudnnSetConvolutionGroupCount(desc, static_cast<int>(groups)));
+        // torch.backends.cudnn.allow_tf32 (default True); the 4-D ConvDesc
+        // sets this too -- without it conv3d/conv_transpose3d fp32 would
+        // silently skip tensor-op math.
+        cudnnMathType_t math_type = CUDNN_DEFAULT_MATH;
+        if (dtype == DType::Float32 && tensorplay::globalContext().allowTF32CuDNN()) {
+            math_type = CUDNN_TENSOR_OP_MATH;
+        }
+        CUDNN_CHECK(cudnnSetConvolutionMathType(desc, math_type));
     }
 };
 
@@ -1180,16 +1383,34 @@ Tensor conv3d_cuda(const Tensor& input, const Tensor& weight, const Tensor& bias
     ConvDescNd conv_desc;
     conv_desc.set(padding, stride, dilation, groups, input_c.dtype());
 
-    cudnnConvolutionFwdAlgoPerf_t perf;
-    int returned = 0;
-    CUDNN_CHECK(cudnnGetConvolutionForwardAlgorithm_v7(
-        handle, x_desc, w_desc, conv_desc, y_desc, 1, &returned, &perf));
-    if (returned == 0) TP_THROW(RuntimeError, "cuDNN: no forward convolution algorithm");
+    std::string algo_key = "c3fwd:" + std::to_string(static_cast<int>(input_c.dtype())) +
+                           ":" + std::to_string(static_cast<int>(input_c.device().index()));
+    key_append(algo_key, input_c.shape());
+    key_append(algo_key, weight_c.shape());
+    key_append(algo_key, padding);
+    key_append(algo_key, stride);
+    key_append(algo_key, dilation);
+    algo_key += ":" + std::to_string(groups);
 
-    size_t workspace_size = 0;
-    CUDNN_CHECK(cudnnGetConvolutionForwardWorkspaceSize(
-        handle, x_desc, w_desc, conv_desc, y_desc, perf.algo, &workspace_size));
-    auto workspace = getAllocator(DeviceType::CUDA)->allocate(workspace_size, input_c.device());
+    ConvBwdAlgo algo_entry = cached_conv_algo(algo_key, [&]() -> ConvBwdAlgo {
+        if (conv_autotune_enabled()) {
+            return autotune_conv_fwd(handle, x_desc, input_c.data_ptr(),
+                                     w_desc, weight_c.data_ptr(), conv_desc,
+                                     y_desc, out.data_ptr(), input_c.device());
+        }
+        cudnnConvolutionFwdAlgoPerf_t perf;
+        int returned = 0;
+        CUDNN_CHECK(cudnnGetConvolutionForwardAlgorithm_v7(
+            handle, x_desc, w_desc, conv_desc, y_desc, 1, &returned, &perf));
+        if (returned == 0) TP_THROW(RuntimeError, "cuDNN: no forward convolution algorithm");
+        size_t workspace_size = 0;
+        CUDNN_CHECK(cudnnGetConvolutionForwardWorkspaceSize(
+            handle, x_desc, w_desc, conv_desc, y_desc, perf.algo, &workspace_size));
+        return ConvBwdAlgo{static_cast<int>(perf.algo), workspace_size};
+    });
+
+    auto workspace = getAllocator(DeviceType::CUDA)->allocate(
+        algo_entry.workspace_size ? algo_entry.workspace_size : 1, input_c.device());
 
     float alpha = 1.0f, beta = 0.0f;
     double alpha_d = 1.0, beta_d = 0.0;
@@ -1197,8 +1418,9 @@ Tensor conv3d_cuda(const Tensor& input, const Tensor& weight, const Tensor& bias
     void* beta_p = input_c.dtype() == DType::Float64 ? static_cast<void*>(&beta_d)
                                                      : static_cast<void*>(&beta);
     CUDNN_CHECK(cudnnConvolutionForward(handle, alpha_p, x_desc, input_c.data_ptr(),
-                                        w_desc, weight_c.data_ptr(), conv_desc, perf.algo,
-                                        workspace.get(), workspace_size, beta_p,
+                                        w_desc, weight_c.data_ptr(), conv_desc,
+                                        static_cast<cudnnConvolutionFwdAlgo_t>(algo_entry.algorithm),
+                                        workspace.get(), algo_entry.workspace_size, beta_p,
                                         y_desc, out.data_ptr()));
     conv3d_add_bias(handle, out, bias);
     return out;
@@ -1229,16 +1451,35 @@ Tensor conv3d_grad_input_cuda(const Tensor& grad_output, const Tensor& input, co
 
     Tensor grad_input = Tensor::empty_like(input_c, DType::Undefined, input_c.device());
 
-    cudnnConvolutionBwdDataAlgoPerf_t perf;
-    int returned = 0;
-    CUDNN_CHECK(cudnnGetConvolutionBackwardDataAlgorithm_v7(
-        handle, w_desc, dy_desc, conv_desc, dx_desc, 1, &returned, &perf));
-    if (returned == 0) TP_THROW(RuntimeError, "cuDNN: no backward-data convolution algorithm");
+    std::string algo_key = "c3gi:" + std::to_string(static_cast<int>(input_c.dtype())) +
+                           ":" + std::to_string(static_cast<int>(input_c.device().index()));
+    key_append(algo_key, input_c.shape());
+    key_append(algo_key, weight_c.shape());
+    key_append(algo_key, grad_output_c.shape());
+    key_append(algo_key, padding);
+    key_append(algo_key, stride);
+    key_append(algo_key, dilation);
+    algo_key += ":" + std::to_string(groups);
 
-    size_t workspace_size = 0;
-    CUDNN_CHECK(cudnnGetConvolutionBackwardDataWorkspaceSize(
-        handle, w_desc, dy_desc, conv_desc, dx_desc, perf.algo, &workspace_size));
-    auto workspace = getAllocator(DeviceType::CUDA)->allocate(workspace_size, input_c.device());
+    ConvBwdAlgo algo_entry = cached_conv_algo(algo_key, [&]() -> ConvBwdAlgo {
+        if (conv_autotune_enabled()) {
+            return autotune_conv_bwd_data(handle, w_desc, weight_c.data_ptr(),
+                                          dy_desc, grad_output_c.data_ptr(), conv_desc,
+                                          dx_desc, grad_input.data_ptr(), input_c.device());
+        }
+        cudnnConvolutionBwdDataAlgoPerf_t perf;
+        int returned = 0;
+        CUDNN_CHECK(cudnnGetConvolutionBackwardDataAlgorithm_v7(
+            handle, w_desc, dy_desc, conv_desc, dx_desc, 1, &returned, &perf));
+        if (returned == 0) TP_THROW(RuntimeError, "cuDNN: no backward-data convolution algorithm");
+        size_t workspace_size = 0;
+        CUDNN_CHECK(cudnnGetConvolutionBackwardDataWorkspaceSize(
+            handle, w_desc, dy_desc, conv_desc, dx_desc, perf.algo, &workspace_size));
+        return ConvBwdAlgo{static_cast<int>(perf.algo), workspace_size};
+    });
+
+    auto workspace = getAllocator(DeviceType::CUDA)->allocate(
+        algo_entry.workspace_size ? algo_entry.workspace_size : 1, input_c.device());
 
     float alpha = 1.0f, beta = 0.0f;
     double alpha_d = 1.0, beta_d = 0.0;
@@ -1247,7 +1488,8 @@ Tensor conv3d_grad_input_cuda(const Tensor& grad_output, const Tensor& input, co
                                                      : static_cast<void*>(&beta);
     CUDNN_CHECK(cudnnConvolutionBackwardData(handle, alpha_p, w_desc, weight_c.data_ptr(),
                                              dy_desc, grad_output_c.data_ptr(), conv_desc,
-                                             perf.algo, workspace.get(), workspace_size,
+                                             static_cast<cudnnConvolutionBwdDataAlgo_t>(algo_entry.algorithm),
+                                             workspace.get(), algo_entry.workspace_size,
                                              beta_p, dx_desc, grad_input.data_ptr()));
     return grad_input;
 #else
@@ -1277,16 +1519,35 @@ Tensor conv3d_grad_weight_cuda(const Tensor& grad_output, const Tensor& input, c
 
     Tensor grad_weight = Tensor::empty_like(weight_c, DType::Undefined, weight_c.device());
 
-    cudnnConvolutionBwdFilterAlgoPerf_t perf;
-    int returned = 0;
-    CUDNN_CHECK(cudnnGetConvolutionBackwardFilterAlgorithm_v7(
-        handle, x_desc, dy_desc, conv_desc, dw_desc, 1, &returned, &perf));
-    if (returned == 0) TP_THROW(RuntimeError, "cuDNN: no backward-filter convolution algorithm");
+    std::string algo_key = "c3gw:" + std::to_string(static_cast<int>(input_c.dtype())) +
+                           ":" + std::to_string(static_cast<int>(input_c.device().index()));
+    key_append(algo_key, input_c.shape());
+    key_append(algo_key, weight_c.shape());
+    key_append(algo_key, grad_output_c.shape());
+    key_append(algo_key, padding);
+    key_append(algo_key, stride);
+    key_append(algo_key, dilation);
+    algo_key += ":" + std::to_string(groups);
 
-    size_t workspace_size = 0;
-    CUDNN_CHECK(cudnnGetConvolutionBackwardFilterWorkspaceSize(
-        handle, x_desc, dy_desc, conv_desc, dw_desc, perf.algo, &workspace_size));
-    auto workspace = getAllocator(DeviceType::CUDA)->allocate(workspace_size, input_c.device());
+    ConvBwdAlgo algo_entry = cached_conv_algo(algo_key, [&]() -> ConvBwdAlgo {
+        if (conv_autotune_enabled()) {
+            return autotune_conv_bwd_filter(handle, x_desc, input_c.data_ptr(),
+                                            dy_desc, grad_output_c.data_ptr(), conv_desc,
+                                            dw_desc, grad_weight.data_ptr(), input_c.device());
+        }
+        cudnnConvolutionBwdFilterAlgoPerf_t perf;
+        int returned = 0;
+        CUDNN_CHECK(cudnnGetConvolutionBackwardFilterAlgorithm_v7(
+            handle, x_desc, dy_desc, conv_desc, dw_desc, 1, &returned, &perf));
+        if (returned == 0) TP_THROW(RuntimeError, "cuDNN: no backward-filter convolution algorithm");
+        size_t workspace_size = 0;
+        CUDNN_CHECK(cudnnGetConvolutionBackwardFilterWorkspaceSize(
+            handle, x_desc, dy_desc, conv_desc, dw_desc, perf.algo, &workspace_size));
+        return ConvBwdAlgo{static_cast<int>(perf.algo), workspace_size};
+    });
+
+    auto workspace = getAllocator(DeviceType::CUDA)->allocate(
+        algo_entry.workspace_size ? algo_entry.workspace_size : 1, input_c.device());
 
     float alpha = 1.0f, beta = 0.0f;
     double alpha_d = 1.0, beta_d = 0.0;
@@ -1295,7 +1556,8 @@ Tensor conv3d_grad_weight_cuda(const Tensor& grad_output, const Tensor& input, c
                                                      : static_cast<void*>(&beta);
     CUDNN_CHECK(cudnnConvolutionBackwardFilter(handle, alpha_p, x_desc, input_c.data_ptr(),
                                                dy_desc, grad_output_c.data_ptr(), conv_desc,
-                                               perf.algo, workspace.get(), workspace_size,
+                                               static_cast<cudnnConvolutionBwdFilterAlgo_t>(algo_entry.algorithm),
+                                               workspace.get(), algo_entry.workspace_size,
                                                beta_p, dw_desc, grad_weight.data_ptr()));
     return grad_weight;
 #else
@@ -1376,16 +1638,34 @@ Tensor conv_transpose2d_cuda(const Tensor& input, const Tensor& weight, const Te
                   static_cast<int>(dilation[0]), static_cast<int>(dilation[1]),
                   static_cast<int>(groups), input_c.dtype());
 
-    cudnnConvolutionBwdDataAlgoPerf_t perf;
-    int returned = 0;
-    CUDNN_CHECK(cudnnGetConvolutionBackwardDataAlgorithm_v7(
-        handle, w_desc, dy_desc, conv_desc, dx_desc, 1, &returned, &perf));
-    if (returned == 0) TP_THROW(RuntimeError, "cuDNN: no backward-data convolution algorithm");
+    std::string algo_key = "ct2fwd:" + std::to_string(static_cast<int>(input_c.dtype())) +
+                           ":" + std::to_string(static_cast<int>(input_c.device().index()));
+    key_append(algo_key, input_c.shape());
+    key_append(algo_key, weight_c.shape());
+    key_append(algo_key, padding);
+    key_append(algo_key, stride);
+    key_append(algo_key, dilation);
+    algo_key += ":" + std::to_string(groups);
 
-    size_t workspace_size = 0;
-    CUDNN_CHECK(cudnnGetConvolutionBackwardDataWorkspaceSize(
-        handle, w_desc, dy_desc, conv_desc, dx_desc, perf.algo, &workspace_size));
-    auto workspace = getAllocator(DeviceType::CUDA)->allocate(workspace_size, input_c.device());
+    ConvBwdAlgo algo_entry = cached_conv_algo(algo_key, [&]() -> ConvBwdAlgo {
+        if (conv_autotune_enabled()) {
+            return autotune_conv_bwd_data(handle, w_desc, weight_c.data_ptr(),
+                                          dy_desc, input_c.data_ptr(), conv_desc,
+                                          dx_desc, out.data_ptr(), input_c.device());
+        }
+        cudnnConvolutionBwdDataAlgoPerf_t perf;
+        int returned = 0;
+        CUDNN_CHECK(cudnnGetConvolutionBackwardDataAlgorithm_v7(
+            handle, w_desc, dy_desc, conv_desc, dx_desc, 1, &returned, &perf));
+        if (returned == 0) TP_THROW(RuntimeError, "cuDNN: no backward-data convolution algorithm");
+        size_t workspace_size = 0;
+        CUDNN_CHECK(cudnnGetConvolutionBackwardDataWorkspaceSize(
+            handle, w_desc, dy_desc, conv_desc, dx_desc, perf.algo, &workspace_size));
+        return ConvBwdAlgo{static_cast<int>(perf.algo), workspace_size};
+    });
+
+    auto workspace = getAllocator(DeviceType::CUDA)->allocate(
+        algo_entry.workspace_size ? algo_entry.workspace_size : 1, input_c.device());
 
     float alpha = 1.0f, beta = 0.0f;
     double alpha_d = 1.0, beta_d = 0.0;
@@ -1393,8 +1673,9 @@ Tensor conv_transpose2d_cuda(const Tensor& input, const Tensor& weight, const Te
     void* beta_p = input_c.dtype() == DType::Float64 ? static_cast<void*>(&beta_d)
                                                      : static_cast<void*>(&beta);
     CUDNN_CHECK(cudnnConvolutionBackwardData(handle, alpha_p, w_desc, weight_c.data_ptr(),
-                                             dy_desc, input_c.data_ptr(), conv_desc, perf.algo,
-                                             workspace.get(), workspace_size, beta_p,
+                                             dy_desc, input_c.data_ptr(), conv_desc,
+                                             static_cast<cudnnConvolutionBwdDataAlgo_t>(algo_entry.algorithm),
+                                             workspace.get(), algo_entry.workspace_size, beta_p,
                                              dx_desc, out.data_ptr()));
     if (bias.defined() && bias.numel() > 0) {
         Tensor bias_view = bias.reshape({1, C_out, 1, 1});
@@ -1449,16 +1730,34 @@ Tensor conv_transpose3d_cuda(const Tensor& input, const Tensor& weight, const Te
     ConvDescNd conv_desc;
     conv_desc.set(padding, stride, dilation, groups, input_c.dtype());
 
-    cudnnConvolutionBwdDataAlgoPerf_t perf;
-    int returned = 0;
-    CUDNN_CHECK(cudnnGetConvolutionBackwardDataAlgorithm_v7(
-        handle, w_desc, dy_desc, conv_desc, dx_desc, 1, &returned, &perf));
-    if (returned == 0) TP_THROW(RuntimeError, "cuDNN: no backward-data convolution algorithm");
+    std::string algo_key = "ct3fwd:" + std::to_string(static_cast<int>(input_c.dtype())) +
+                           ":" + std::to_string(static_cast<int>(input_c.device().index()));
+    key_append(algo_key, input_c.shape());
+    key_append(algo_key, weight_c.shape());
+    key_append(algo_key, padding);
+    key_append(algo_key, stride);
+    key_append(algo_key, dilation);
+    algo_key += ":" + std::to_string(groups);
 
-    size_t workspace_size = 0;
-    CUDNN_CHECK(cudnnGetConvolutionBackwardDataWorkspaceSize(
-        handle, w_desc, dy_desc, conv_desc, dx_desc, perf.algo, &workspace_size));
-    auto workspace = getAllocator(DeviceType::CUDA)->allocate(workspace_size, input_c.device());
+    ConvBwdAlgo algo_entry = cached_conv_algo(algo_key, [&]() -> ConvBwdAlgo {
+        if (conv_autotune_enabled()) {
+            return autotune_conv_bwd_data(handle, w_desc, weight_c.data_ptr(),
+                                          dy_desc, input_c.data_ptr(), conv_desc,
+                                          dx_desc, out.data_ptr(), input_c.device());
+        }
+        cudnnConvolutionBwdDataAlgoPerf_t perf;
+        int returned = 0;
+        CUDNN_CHECK(cudnnGetConvolutionBackwardDataAlgorithm_v7(
+            handle, w_desc, dy_desc, conv_desc, dx_desc, 1, &returned, &perf));
+        if (returned == 0) TP_THROW(RuntimeError, "cuDNN: no backward-data convolution algorithm");
+        size_t workspace_size = 0;
+        CUDNN_CHECK(cudnnGetConvolutionBackwardDataWorkspaceSize(
+            handle, w_desc, dy_desc, conv_desc, dx_desc, perf.algo, &workspace_size));
+        return ConvBwdAlgo{static_cast<int>(perf.algo), workspace_size};
+    });
+
+    auto workspace = getAllocator(DeviceType::CUDA)->allocate(
+        algo_entry.workspace_size ? algo_entry.workspace_size : 1, input_c.device());
 
     float alpha = 1.0f, beta = 0.0f;
     double alpha_d = 1.0, beta_d = 0.0;
@@ -1466,8 +1765,9 @@ Tensor conv_transpose3d_cuda(const Tensor& input, const Tensor& weight, const Te
     void* beta_p = input_c.dtype() == DType::Float64 ? static_cast<void*>(&beta_d)
                                                      : static_cast<void*>(&beta);
     CUDNN_CHECK(cudnnConvolutionBackwardData(handle, alpha_p, w_desc, weight_c.data_ptr(),
-                                             dy_desc, input_c.data_ptr(), conv_desc, perf.algo,
-                                             workspace.get(), workspace_size, beta_p,
+                                             dy_desc, input_c.data_ptr(), conv_desc,
+                                             static_cast<cudnnConvolutionBwdDataAlgo_t>(algo_entry.algorithm),
+                                             workspace.get(), algo_entry.workspace_size, beta_p,
                                              dx_desc, out.data_ptr()));
     conv3d_add_bias(handle, out, bias);
     return out;
@@ -1545,7 +1845,16 @@ Tensor conv_transpose2d_grad_input_cuda(const Tensor& grad_output, const Tensor&
                                         const std::vector<int64_t>& output_padding,
                                         int64_t groups,
                                         const std::vector<int64_t>& dilation) {
-    return conv2d_cuda(grad_output, weight, Tensor(), stride, padding, dilation, groups);
+    Tensor grad_input = conv2d_cuda(grad_output, weight, Tensor(), stride, padding, dilation, groups);
+    // output_padding >= stride makes the adjoint convolution larger than the
+    // original input; aten slices grad_input back to input's size (same fix
+    // as the CPU path).
+    if (grad_input.size(2) != input.size(2) || grad_input.size(3) != input.size(3)) {
+        grad_input = grad_input.slice(2, 0, input.size(2))
+                         .slice(3, 0, input.size(3))
+                         .contiguous();
+    }
+    return grad_input;
 }
 
 Tensor conv_transpose2d_grad_weight_cuda(const Tensor& grad_output, const Tensor& input,
@@ -1575,7 +1884,15 @@ Tensor conv_transpose3d_grad_input_cuda(const Tensor& grad_output, const Tensor&
                                         const std::vector<int64_t>& output_padding,
                                         int64_t groups,
                                         const std::vector<int64_t>& dilation) {
-    return conv3d_cuda(grad_output, weight, Tensor(), stride, padding, dilation, groups);
+    Tensor grad_input = conv3d_cuda(grad_output, weight, Tensor(), stride, padding, dilation, groups);
+    if (grad_input.size(2) != input.size(2) || grad_input.size(3) != input.size(3) ||
+        grad_input.size(4) != input.size(4)) {
+        grad_input = grad_input.slice(2, 0, input.size(2))
+                         .slice(3, 0, input.size(3))
+                         .slice(4, 0, input.size(4))
+                         .contiguous();
+    }
+    return grad_input;
 }
 
 Tensor conv_transpose3d_grad_weight_cuda(const Tensor& grad_output, const Tensor& input,

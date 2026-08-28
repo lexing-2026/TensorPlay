@@ -1,0 +1,44 @@
+name: commit-lint
+
+# Advisory (non-blocking) Conventional Commits check for commits pushed to
+# main. History predates the convention, so this job is continue-on-error and
+# exists to surface violations of new commits, not to gate merges (the
+# pr-title workflow is the gate).
+
+on:
+  push:
+    branches: [main]
+
+permissions: read-all
+
+jobs:
+  commit-lint:
+    name: commit-lint
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          show-progress: false
+          fetch-depth: 0
+          sparse-checkout: |
+            tools/commit_schema.py
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Validate the pushed commits
+        shell: bash
+        run: |
+          set -euo pipefail
+          before="${{ github.event.before }}"
+          # Branch creation pushes report an all-zero before SHA.
+          if [[ -z "$before" || "$before" =~ ^0+$ ]]; then
+            range="HEAD~20..HEAD"
+          else
+            range="$before..${{ github.sha }}"
+          fi
+          python tools/commit_schema.py --range "$range"

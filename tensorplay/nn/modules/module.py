@@ -964,19 +964,19 @@ class Module:
             # If param_applied is the same object, no need to update
             if param_applied is param:
                 continue
-                
-            # Create new Parameter wrapping the applied tensor
-            # We must preserve requires_grad
-            out_param = Parameter(param_applied, requires_grad=param.requires_grad)
-            
-            # Update the parameter in the module
-            self._parameters[key] = out_param
-            
+
+            # torch parity (Module._apply): swap ``param.data`` so the SAME
+            # leaf Parameter object is preserved. Wrapping the applied tensor
+            # in a new Parameter would carry ``param_applied``'s grad_fn
+            # (``.to()`` is differentiable), turning the parameter non-leaf
+            # and breaking leaf-only APIs (post-accumulate-grad hooks, DDP).
+            param.data = param_applied
+
             # Handle gradients
             if param.grad is not None:
                 with tensorplay.no_grad():
                     grad_applied = fn(param.grad)
-                out_param.grad = grad_applied
+                param.grad = grad_applied
 
         for key, buf in self._buffers.items():
             if buf is not None:

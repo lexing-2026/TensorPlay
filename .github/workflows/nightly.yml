@@ -1,0 +1,349 @@
+name: nightly
+
+# Manually dispatched preview (nightly) channel, mirroring pytorch's nightly
+# versioning without the daily cron: versions follow the
+# X.Y.0.dev<UTC date>[+cuXXX|+cpu] rule computed by
+# tools/generate_tensorplay_version.py, wheels land on the rolling "nightly"
+# GitHub Release, and indexes are published under whl/nightly/<variant>/ on
+# the pypi-pages branch. Only the latest published version is retained.
+#
+# Two publish sources:
+#   - build-from-source: builds the wheel matrix from the current ref with an
+#     injected TENSORPLAY_BUILD_VERSION (defaults to today's dev version).
+#   - upload-wheels: publishes locally built wheels that were uploaded
+#     beforehand as an Actions artifact named "wheels".
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        required: false
+        type: choice
+        description: Where the wheels come from
+        options:
+          - build-from-source
+          - upload-wheels
+        default: build-from-source
+      version:
+        required: false
+        type: string
+        default: ""
+        description: >-
+          Base version without variant local labels. Defaults to the pytorch
+          nightly rule applied to version.txt, e.g. 1.0.0.dev20260828.
+      build_number:
+        required: false
+        type: string
+        default: "1"
+        description: >-
+          Values greater than 1 append .post<N> to the version, allowing a
+          same-day republish. Ignored by upload-wheels (the version is read
+          from the uploaded wheel filenames).
+      cpu_platforms:
+        required: false
+        type: string
+        default: ""
+        description: >-
+          Space-separated CPU platform names from .github/wheel-platforms.json
+          to build, for example "linux-x86_64 macos-arm64". Empty means all.
+          Only used by build-from-source.
+      cuda_variants:
+        required: false
+        type: string
+        default: ""
+        description: >-
+          Space-separated CUDA variants from .github/cuda-variants.json to
+          build, for example "cu124 cu126". Empty means all. Only used by
+          build-from-source.
+
+permissions: read-all
+
+concurrency:
+  group: nightly
+  cancel-in-progress: true
+
+jobs:
+  define-wheel-matrix:
+    name: define-wheel-matrix
+    if: ${{ inputs.source == 'build-from-source' }}
+    runs-on: ubuntu-latest
+    outputs:
+      cpu: ${{ steps.read-matrix.outputs.cpu }}
+      cuda: ${{ steps.read-matrix.outputs.cuda }}
+      variants: ${{ steps.read-matrix.outputs.variants }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          show-progress: false
+      - id: read-matrix
+        shell: bash
+        env:
+          CPU_PLATFORMS: ${{ inputs.cpu_platforms }}
+          CUDA_VARIANTS: ${{ inputs.cuda_variants }}
+        run: |
+          set -euo pipefail
+          # Turn the space-separated filters into JSON arrays; an empty array
+          # means "no filter".
+          cpu_list='[]'
+          if [[ -n "$CPU_PLATFORMS" ]]; then
+            cpu_list="$(printf '%s\n' $CPU_PLATFORMS | jq -R . | jq -s -c .)"
+          fi
+          cuda_list='[]'
+          if [[ -n "$CUDA_VARIANTS" ]]; then
+            cuda_list="$(printf '%s\n' $CUDA_VARIANTS | jq -R . | jq -s -c .)"
+          fi
+          cpu_matrix="$(jq -c --argjson cpu_list "$cpu_list" '
+            [
+              .cpu_platforms[] as $platform
+              | select(($cpu_list | length == 0) or ($platform.name | IN($cpu_list[])))
+              | .python_versions[] as $python
+              | {
+                  platform: $platform.name,
+                  runner: $platform.runner,
+                  python: $python,
+                  build_name: ("tensorplay-" + $platform.name + "-py" + ($python | gsub("\\."; "_")) + "-cpu-nightly")
+                }
+            ]
+          ' .github/wheel-platforms.json)"
+          cuda_matrix="$(jq -c \
+            --slurpfile variants .github/cuda-variants.json \
+            --argjson cuda_list "$cuda_list" '
+            [
+              .cuda_platforms[] as $platform
+              | .python_versions[] as $python
+              | $variants[0][] as $cuda
+              | select(($cuda_list | length == 0) or ($cuda.variant | IN($cuda_list[])))
+              | {
+                  platform: $platform.name,
+                  runner: $platform.runner,
+                  python: $python,
+                  variant: $cuda.variant,
+                  toolkit: $cuda.toolkit,
+                  build_name: ("tensorplay-" + $platform.name + "-" + $cuda.variant + "-py" + ($python | gsub("\\."; "_")) + "-nightly")
+                }
+            ]
+          ' .github/wheel-platforms.json)"
+          active_variants="$(jq -c \
+            --slurpfile variants .github/cuda-variants.json \
+            --argjson cuda_list "$cuda_list" '
+            [$variants[0][] | select(($cuda_list | length == 0) or (.variant | IN($cuda_list[])))]
+          ' .github/wheel-platforms.json)"
+          if [[ "$(jq 'length' <<< "$cpu_matrix")" == "0" && "$(jq 'length' <<< "$cuda_matrix")" == "0" ]]; then
+            echo "The platform/variant filters selected no wheels" >&2
+            exit 1
+          fi
+          echo "cpu=$cpu_matrix" >> "$GITHUB_OUTPUT"
+          echo "cuda=$cuda_matrix" >> "$GITHUB_OUTPUT"
+          echo "variants=$active_variants" >> "$GITHUB_OUTPUT"
+
+  prepare:
+    name: prepare-nightly-version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version-build.outputs.version || steps.version-upload.outputs.version }}
+      build_number: ${{ steps.version-build.outputs.build_number || steps.version-upload.outputs.build_number }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          show-progress: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install packaging
+        shell: bash
+        run: python -m pip install --disable-pip-version-check --quiet packaging
+      - name: Download the wheels artifact
+        if: ${{ inputs.source == 'upload-wheels' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: wheels
+          path: wheels
+      - name: Compute the nightly version from source
+        if: ${{ inputs.source != 'upload-wheels' }}
+        id: version-build
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_BUILD_NUMBER: ${{ inputs.build_number }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$INPUT_VERSION" ]]; then
+            version="$INPUT_VERSION"
+          else
+            version="$(python -c 'from tools.generate_tensorplay_version import compute_nightly_version; print(compute_nightly_version())')"
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "build_number=${INPUT_BUILD_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "Nightly base version: ${version} (build number ${INPUT_BUILD_NUMBER})"
+      - name: Read the version from the uploaded wheels
+        if: ${{ inputs.source == 'upload-wheels' }}
+        id: version-upload
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import os
+          import zipfile
+          from email.parser import Parser
+          from pathlib import Path
+
+          from packaging.utils import parse_wheel_filename
+
+          artifact_dir = Path("wheels")
+          wheels = sorted(artifact_dir.glob("*.whl")) if artifact_dir.is_dir() else []
+          if not wheels:
+              raise SystemExit(
+                  "No wheels found: upload the locally built .whl files as an "
+                  "Actions artifact named 'wheels' before dispatching"
+              )
+          versions = set()
+          for wheel in wheels:
+              _name, version, _build, _tags = parse_wheel_filename(wheel.name)
+              with zipfile.ZipFile(wheel) as archive:
+                  metadata_files = [n for n in archive.namelist() if n.endswith(".dist-info/METADATA")]
+                  if metadata_files:
+                      metadata = Parser().parsestr(archive.read(metadata_files[0]).decode("utf-8"))
+                      if metadata["Version"] != str(version):
+                          raise SystemExit(
+                              f"{wheel.name}: filename version {version} != METADATA version {metadata['Version']}"
+                          )
+              # Variant local labels (+cu124/+cpu/none) legitimately differ per
+              # wheel; the base version must be shared across the batch.
+              versions.add(str(version).partition("+")[0])
+          if len(versions) != 1:
+              raise SystemExit(f"All uploaded wheels must share one base version, got {sorted(versions)}")
+          version = versions.pop()
+          print(f"version={version}")
+          print("build_number=1")
+          PY
+
+  create-nightly-release:
+    name: create-nightly-release
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Ensure the rolling nightly release exists
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view nightly --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release nightly already exists"
+          else
+            gh release create nightly \
+              --repo "$GITHUB_REPOSITORY" \
+              --prerelease \
+              --title "TensorPlay nightly" \
+              --notes "Rolling preview channel. Only the latest published version is kept; older assets are pruned automatically. Install indexes live under /whl/nightly/<variant>/ on the Pages site."
+          fi
+
+  cpu-build:
+    name: ${{ matrix.build_name }}-build-test
+    if: ${{ inputs.source == 'build-from-source' }}
+    needs:
+      - define-wheel-matrix
+      - prepare
+      - create-nightly-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.define-wheel-matrix.outputs.cpu) }}
+    permissions:
+      contents: write
+    uses: ./.github/workflows/_binary-build-test.yml
+    with:
+      build_name: ${{ matrix.build_name }}
+      build_environment: ${{ format('nightly-{0}-py{1}-cpu', matrix.platform, matrix.python) }}
+      runs_on: ${{ matrix.runner }}
+      python_version: ${{ matrix.python }}
+      build_version: ${{ needs.prepare.outputs.version }}
+      build_number: ${{ needs.prepare.outputs.build_number }}
+      upload_release: true
+
+  cuda-build:
+    name: ${{ matrix.build_name }}-build-test
+    if: ${{ inputs.source == 'build-from-source' }}
+    needs:
+      - define-wheel-matrix
+      - prepare
+      - create-nightly-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.define-wheel-matrix.outputs.cuda) }}
+    permissions:
+      contents: write
+    uses: ./.github/workflows/_binary-build-test.yml
+    with:
+      build_name: ${{ matrix.build_name }}
+      build_environment: ${{ format('nightly-{0}-py{1}-{2}', matrix.platform, matrix.python, matrix.variant) }}
+      runs_on: ${{ matrix.runner }}
+      python_version: ${{ matrix.python }}
+      cuda: ${{ matrix.variant }}
+      cuda_toolkit: ${{ matrix.toolkit }}
+      build_version: ${{ needs.prepare.outputs.version }}
+      build_number: ${{ needs.prepare.outputs.build_number }}
+      upload_release: true
+
+  upload-local-wheels:
+    name: upload-local-wheels
+    if: ${{ inputs.source == 'upload-wheels' }}
+    needs:
+      - prepare
+      - create-nightly-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download the wheels artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: wheels
+          path: dist
+      - name: Upload wheels to the nightly release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          if (("${#wheels[@]}" == 0)); then
+            echo "The wheels artifact contains no .whl files" >&2
+            exit 1
+          fi
+          printf 'Uploading:\n%s\n' "${wheels[@]}"
+          gh release upload nightly "${wheels[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
+
+  publish-nightly-indexes:
+    name: publish-nightly-indexes
+    # Runs even when some matrix legs failed (partial nightlies are published,
+    # like pytorch), but only after the version was determined. The prune step
+    # inside aborts if no wheel of the new version made it to the release.
+    if: ${{ !cancelled() && needs.prepare.result == 'success' }}
+    needs:
+      - define-wheel-matrix
+      - prepare
+      - cpu-build
+      - cuda-build
+      - upload-local-wheels
+    uses: ./.github/workflows/_cuda-upload.yml
+    permissions:
+      contents: write
+    with:
+      build_environment: nightly
+      channel: nightly
+      release_tag: nightly
+      prune_keep_version: ${{ needs.prepare.outputs.version }}
+      cuda_variants_json: >-
+        ${{ inputs.source == 'build-from-source'
+            && needs.define-wheel-matrix.outputs.variants
+            || '[{"variant":"cu124","toolkit":"12.4.1"},{"variant":"cu126","toolkit":"12.6.3"},{"variant":"cu130","toolkit":"13.0.2"}]' }}
+      pages_branch: pypi-pages

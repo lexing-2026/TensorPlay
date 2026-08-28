@@ -305,6 +305,9 @@ def adamax(
         and bool(params)
         and params[0].device.type in ("cpu", "cuda")
         and params[0].is_floating_point()
+        and params[0].dtype in (
+            tp.float16, tp.bfloat16, tp.float32, tp.float64
+        )
     )
     if native_candidate:
         try:

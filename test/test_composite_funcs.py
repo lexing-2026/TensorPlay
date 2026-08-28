@@ -98,11 +98,16 @@ class TestAliases:
             with torch.no_grad():
                 base(xt)
             ref_grad = [analytic(x0)]
-        xp = tp.tensor(dom).requires_grad_(True)
+        # torch rejects in-place arc ops on a leaf that requires grad
+        # ("a leaf Variable that requires grad is being used in an in-place
+        # operation"); mirror the idiomatic torch pattern of doing the
+        # in-place op on a clone of the leaf.
+        leaf = tp.tensor(dom).requires_grad_(True)
+        xp = leaf.clone()
         getattr(tp, name)(xp)
         xp.sum().backward()
         assert close(xp.tolist(), xt.tolist())
-        assert close(xp.grad.tolist(), ref_grad)
+        assert close(leaf.grad.tolist(), ref_grad)
 
     def test_arctan2(self):
         a = tp.tensor([1.0, -1.0])

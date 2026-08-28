@@ -5,7 +5,7 @@ kernels.  Every cell reports median CUDA-event milliseconds over `iters`
 after `warmup` untimed iterations; "speedup" is torch_time / tp_time.
 
 Usage (remote):
-    python benchmark/benchmark_vs_torch.py [--matsize 4096] [--iters 50]
+    python benchmark/benchmark_vs_torch.py [--iters 200] [--warmup 10]
 """
 
 import argparse
@@ -456,6 +456,112 @@ def main():
         lambda x: x.argmax(dim=-1),
         lambda x: x.argmax(dim=-1),
         warmup=opts.warmup, iters=opts.iters))
+
+    # --- 7. RNN layer (TP native fused-cell path; torch rides cuDNN on CUDA) ----
+    for kind, dt, phase in [("rnn_tanh", "fp32", "fwd"),
+                            ("rnn_tanh", "fp32", "fwd+bwd"),
+                            ("rnn_tanh", "fp16", "fwd"),
+                            ("rnn_tanh", "fp16", "fwd+bwd"),
+                            ("gru", "fp32", "fwd+bwd"),
+                            ("lstm", "fp32", "fwd+bwd")]:
+        T, N, F, H, L = 64, 32, 512, 512, 2
+        g = 4 if kind == "lstm" else (3 if kind == "gru" else 1)
+        tp_op = getattr(tp, kind)
+        th_cls = {"rnn_tanh": torch.nn.RNN, "gru": torch.nn.GRU,
+                  "lstm": torch.nn.LSTM}[kind]
+
+        def make_rnn(kind=kind, dt=dt, phase=phase, g=g, T=T, N=N, F=F, H=H,
+                     L=L, th_cls=th_cls):
+            rng = np.random.default_rng(7)
+            params_np, fin = [], F
+            for _l in range(L):
+                params_np.append(
+                    (rng.standard_normal((g * H, fin)) / np.sqrt(fin)).astype(np.float32))
+                params_np.append(
+                    (rng.standard_normal((g * H, H)) / np.sqrt(H)).astype(np.float32))
+                params_np.append((rng.standard_normal(g * H) * 0.1).astype(np.float32))
+                params_np.append((rng.standard_normal(g * H) * 0.1).astype(np.float32))
+                fin = H
+            x_np = (rng.standard_normal((T, N, F)) * 0.2).astype(np.float32)
+            h0_np = (rng.standard_normal((L, N, H)) * 0.2).astype(np.float32)
+            c0_np = (rng.standard_normal((L, N, H)) * 0.2).astype(np.float32)
+
+            need_grad = phase == "fwd+bwd"
+            x = tp.from_numpy(x_np).to(dev).to(tdtype[dt])
+            h0 = tp.from_numpy(h0_np).to(dev).to(tdtype[dt])
+            c0 = tp.from_numpy(c0_np).to(dev).to(tdtype[dt])
+            params = [tp.from_numpy(p).to(dev).to(tdtype[dt]) for p in params_np]
+            if need_grad:
+                x.requires_grad_(True)
+                h0.requires_grad_(True)
+                c0.requires_grad_(True)
+                for p in params:
+                    p.requires_grad_(True)
+
+            kw = dict(bias=True, batch_first=False, bidirectional=False)
+            if kind == "rnn_tanh":
+                kw["nonlinearity"] = "tanh"
+            mod = th_cls(F, H, L, **kw).to(dev).to(tdtype_t[dt])
+            names = []
+            for l in range(L):
+                names += [f"weight_ih_l{l}", f"weight_hh_l{l}",
+                          f"bias_ih_l{l}", f"bias_hh_l{l}"]
+            with torch.no_grad():
+                for nm, p_np in zip(names, params_np):
+                    getattr(mod, nm).copy_(torch.from_numpy(p_np).to(dev))
+            xt = torch.from_numpy(x_np).to(dev).to(tdtype_t[dt])
+            h0t = torch.from_numpy(h0_np).to(dev).to(tdtype_t[dt])
+            c0t = torch.from_numpy(c0_np).to(dev).to(tdtype_t[dt])
+            if need_grad:
+                xt.requires_grad_(True)
+                h0t.requires_grad_(True)
+                c0t.requires_grad_(True)
+            if kind == "lstm":
+                return (x, h0, c0, params), (mod, xt, h0t, c0t)
+            return (x, h0, params), (mod, xt, h0t)
+
+        if kind == "lstm":
+            def tp_fn(x, h0, c0, params, tp_op=tp_op, L=L, phase=phase):
+                out, hy, cy = tp_op(x, [h0, c0], params, True, L, 0.0, True,
+                                    False, False)
+                if phase == "fwd+bwd":
+                    (out.sum() + hy.sum() + cy.sum()).backward()
+                return out
+
+            def th_fn(mod, xt, h0t, c0t, phase=phase):
+                out, (hy, cy) = mod(xt, (h0t, c0t))
+                if phase == "fwd+bwd":
+                    (out.sum() + hy.sum() + cy.sum()).backward()
+                return out
+        else:
+            def tp_fn(x, h0, params, tp_op=tp_op, L=L, phase=phase):
+                out, hy = tp_op(x, [h0], params, True, L, 0.0, True, False,
+                                False)
+                if phase == "fwd+bwd":
+                    (out.sum() + hy.sum()).backward()
+                return out
+
+            def th_fn(mod, xt, h0t, phase=phase):
+                out, hy = mod(xt, h0t)
+                if phase == "fwd+bwd":
+                    (out.sum() + hy.sum()).backward()
+                return out
+
+        if phase == "fwd":
+            _tp_fwd = tp_fn
+            _th_fwd = th_fn
+
+            def tp_fn(*a, _f=_tp_fwd):  # noqa: F811
+                return _f(*a)
+
+            def th_fn(*a, _f=_th_fwd):  # noqa: F811
+                with torch.no_grad():
+                    return _f(*a)
+        results.append(run_case(
+            f"rnn {kind} {phase} T={T} N={N} F={F} H={H} L={L} {dt}",
+            make_rnn, tp_fn, th_fn,
+            warmup=opts.warmup, iters=max(opts.iters // 5, 10),
+            compile_tp=False))
 
     print("\n=== summary ===")
     wins = sum(1 for r in results if r["speedup"] >= 1.0)

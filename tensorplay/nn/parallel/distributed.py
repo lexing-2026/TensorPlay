@@ -13,6 +13,7 @@ from typing import Any, List, Optional
 
 import tensorplay as tp
 import tensorplay.distributed as dist
+from tensorplay.distributed import distributed_c10d as _c10d
 from tensorplay.distributed.algorithms.join import Join, JoinHook, Joinable
 from tensorplay.nn.modules.module import Module
 
@@ -52,17 +53,31 @@ def _param_key(tensor) -> tuple:
 
 
 def _verify_param_shape_across_processes(process_group, tensors) -> bool:
-    """All-reduce MIN/MAX over tensor sizes; False on mismatch (torch parity)."""
+    """Verify every rank has the same param shapes (torch parity).
+
+    Mirrors Reducer::verify_params_across_processes: first check the param
+    count agrees, then compare per-param numels element-wise via MIN/MAX
+    all-reduce. All ranks agree iff min == max for every entry; comparing
+    the scalar min-of-mins to the max-of-maxes would only pass when every
+    parameter happens to have the same numel.
+    """
     if dist.get_world_size(process_group) == 1 or len(tensors) == 0:
         return True
     device = tensors[0].device
+    count = tp.tensor([len(tensors)], dtype=tp.int64, device=device)
+    cmin = count.clone()
+    dist.all_reduce(cmin, op=dist.ReduceOp.MIN, group=process_group)
+    cmax = count.clone()
+    dist.all_reduce(cmax, op=dist.ReduceOp.MAX, group=process_group)
+    if int(cmin.item()) != int(cmax.item()):
+        return False
     sizes = tp.tensor([t.numel() for t in tensors], dtype=tp.int64,
                       device=device)
     mins = sizes.clone()
     dist.all_reduce(mins, op=dist.ReduceOp.MIN, group=process_group)
     maxs = sizes.clone()
     dist.all_reduce(maxs, op=dist.ReduceOp.MAX, group=process_group)
-    return int(mins.min().item()) == int(maxs.max().item())
+    return int((maxs - mins).max().item()) == 0
 
 
 def _sync_params_and_buffers(process_group, module_states,
@@ -259,6 +274,9 @@ class DistributedDataParallel(Module, Joinable):
         self._comm_hooks = []
         self._static_expected = None
         self._next_bucket = 0
+        # Side stream used to overlap bucket all-reduces with backward compute
+        # (torch's reducer runs NCCL on a dedicated stream). Lazily created.
+        self._comm_stream = None
 
         # Build parameters for the reducer.
         parameters, expect_sparse_gradient = self._build_params_for_reducer()
@@ -280,6 +298,13 @@ class DistributedDataParallel(Module, Joinable):
             broadcast_buffers=broadcast_buffers,
         )
 
+        # Cache the NCCL communicator handle so bucket all-reduces bypass the
+        # dist.all_reduce wrapper (no per-call group resolution, lock, event
+        # record, or Work allocation); ordering is handled by the comm-stream
+        # joins instead of work.wait().
+        self._comm_handle = _c10d._ensure_comm(
+            self.process_group, _c10d.default_pg_timeout.total_seconds())
+
         # Builds reducer state and registers grad hooks.
         self._ddp_init_helper(parameters, expect_sparse_gradient)
 
@@ -295,7 +320,9 @@ class DistributedDataParallel(Module, Joinable):
         """Bucket the parameters and register post-accumulate grad hooks.
 
         Mirrors torch Reducer construction: buckets are passed reversed so
-        their readiness approximates gradient production order.
+        their readiness approximates gradient production order. Per-param
+        bucket views and identity keys are precomputed once (torch's
+        ``bucket_views_in``) so the backward hot path never recreates them.
         """
         bucket_indices, _ = dist._compute_bucket_assignment_by_size(
             parameters,
@@ -304,9 +331,16 @@ class DistributedDataParallel(Module, Joinable):
         )
 
         self._buckets = []
-        self._param_entries = {}  # param_key -> (bucket_state, offset, length)
+        self._param_entries = {}  # param_key -> (bucket_state, offset, length, idx)
         self._node_to_param_key = {}  # AccumulateGrad raw ptr -> param key
         self._grad_hooks = []
+        # Strong refs to each param's AccumulateGrad node: the meta only
+        # caches it weakly (c10 parity), so the reducer must keep the node
+        # (and its registered post-accumulate hooks) alive.
+        self._accum_nodes = []
+        # torch's require_finalize_: true while an iteration's reduction is
+        # outstanding; guards against unused params without find_unused.
+        self._require_finalize = False
 
         for bucket_index, indices in enumerate(reversed(bucket_indices)):
             params = [parameters[i] for i in indices]
@@ -319,6 +353,10 @@ class DistributedDataParallel(Module, Joinable):
                 acc += p.numel()
             buffer = tp.zeros(acc, dtype=params[0].dtype,
                               device=params[0].device)
+            views = [
+                buffer[off : off + ln].view(p.shape)
+                for off, ln, p in zip(offsets, lengths, params)
+            ]
             bstate = {
                 "index": bucket_index,
                 "buffer": buffer,
@@ -326,22 +364,54 @@ class DistributedDataParallel(Module, Joinable):
                 "lengths": lengths,
                 "shapes": shapes,
                 "params": params,
+                "views": views,
+                "keys": [_param_key(p) for p in params],
+                # find_unused_parameters path: expected/remaining param keys.
                 "pending": set(),
                 "expected_keys": set(),
+                # Fast path: countdown of grads not yet produced this
+                # iteration plus deferred copy-in indices (torch's
+                # batched_grad_copy_ / flush_deferred_copies).
+                "remaining": 0,
+                "deferred": [],
             }
             self._buckets.append(bstate)
-            for off, ln, p in zip(offsets, lengths, params):
-                self._param_entries[_param_key(p)] = (bstate, off, ln)
+            for i, p in enumerate(params):
+                self._param_entries[_param_key(p)] = (
+                    bstate, offsets[i], lengths[i], i)
 
         # Map each parameter's AccumulateGrad node to its key so backward
         # graph traversal can identify participating parameters.
         for p in parameters:
             node = p._accumulate_grad_node
             if node is not None:
+                self._accum_nodes.append(node)
                 self._node_to_param_key[node._raw_ptr()] = _param_key(p)
+
+        # C++ reducer fast path (torch C++ Reducer parity): post-accumulate
+        # hooks run as pure C++ callbacks (no GIL on the engine worker
+        # thread), copy-in is eager in the hook, and the copy-back after each
+        # bucket all-reduce is one fused multi-tensor copy on a dedicated
+        # comm stream. The Python bucket states above are kept for the join
+        # path (_match_all_reduce_for_bwd_pass), which shares the same
+        # buffers.
+        self._c_reducer = None
+        if not self.find_unused_parameters and not self._comm_hooks:
+            self._c_reducer = _C.DDPReducer(
+                [b["params"] for b in self._buckets],
+                [b["buffer"] for b in self._buckets],
+                self._comm_handle,
+                dist.get_world_size(self.process_group),
+                self.gradient_as_bucket_view,
+            )
 
         for index, param in enumerate(parameters):
             if not param.requires_grad:
+                continue
+            if self._c_reducer is not None:
+                # The C++ reducer owns the post-accumulate hooks (pure C++
+                # callbacks on the engine worker thread: no GIL, no Python
+                # dispatch per gradient).
                 continue
             self._grad_hooks.append(param.register_post_accumulate_grad_hook(
                 self._make_reducer_hook(param)))
@@ -355,8 +425,30 @@ class DistributedDataParallel(Module, Joinable):
             )
 
     def _make_reducer_hook(self, param):
-        def hook(_param):
-            self._mark_param_ready(param)
+        # Precompute the bucket entry once so the hot-path hook avoids a dict
+        # lookup and repeated data_ptr()/shape keying on every backward
+        # (torch's C++ reducer has no such per-param Python cost).
+        entry = self._param_entries.get(_param_key(param))
+        if entry is None:
+            return lambda _param: None
+        bstate, _offset, _length, idx = entry
+        if self.find_unused_parameters:
+            key = _param_key(param)
+
+            def hook(_param):
+                self._mark_param_ready(param, entry, key)
+
+            return hook
+        view = bstate["views"][idx]
+        if self.gradient_as_bucket_view:
+
+            def hook(_param):
+                self._mark_param_ready_fast(bstate, idx, view, True)
+
+        else:
+
+            def hook(_param):
+                self._mark_param_ready_fast(bstate, idx, view, False)
         return hook
 
     def _reset_iteration_state(self):
@@ -366,27 +458,51 @@ class DistributedDataParallel(Module, Joinable):
         zero-filled up front, mirroring the reducer marking unused
         parameters ready with zero gradients.
         """
+        if self._require_finalize:
+            # torch Reducer::ensure_prior_reduction_finished: a param did not
+            # receive a gradient last iteration, so its bucket never reduced.
+            self._log_and_throw(
+                RuntimeError,
+                "Expected to have finished reduction in the prior iteration "
+                "before starting a new one. This error indicates that your "
+                "module has parameters that were not used in producing loss. "
+                "You can enable find_unused_parameters=True in the "
+                "DistributedDataParallel constructor to work around this "
+                "error.",
+            )
         self._next_bucket = 0
+        if not self.find_unused_parameters:
+            if self._c_reducer is not None:
+                # The C++ reducer owns countdown/finalize bookkeeping; its
+                # prepare also enforces ensure_prior_reduction_finished.
+                self._c_reducer.prepare_for_iteration()
+                self._require_finalize = False
+                return
+            # Fast path: every param must produce a grad this iteration, so
+            # no key sets and no zeroing — just reset the countdowns.
+            for bstate in self._buckets:
+                bstate["remaining"] = len(bstate["params"])
+                bstate["deferred"].clear()
+            self._require_finalize = True
+            return
         for bid, bstate in enumerate(self._buckets):
-            if self.find_unused_parameters and self.static_graph \
-                    and getattr(self, "_static_expected", None) is not None:
+            if self.static_graph and getattr(self, "_static_expected", None) is not None:
                 expected = set(self._static_expected[bid])
-            elif self.find_unused_parameters:
+            else:
                 # Filled later by _prepare_for_backward after forward.
                 expected = None
-            else:
-                expected = {_param_key(p) for p in bstate["params"]}
             bstate["expected_keys"] = expected
             bstate["pending"] = set(expected) if expected is not None else None
             if expected is not None:
                 self._zero_unused_slices(bstate)
+        self._require_finalize = True
 
     def _zero_unused_slices(self, bstate):
+        pending = bstate["pending"]
         with tp.no_grad():
-            for off, ln, p in zip(bstate["offsets"], bstate["lengths"],
-                                  bstate["params"]):
-                if _param_key(p) not in bstate["pending"]:
-                    bstate["buffer"][off : off + ln].zero_()
+            for i, key in enumerate(bstate["keys"]):
+                if key not in pending:
+                    bstate["views"][i].zero_()
 
     def _try_flush_ready_buckets(self):
         """Reduce completed buckets strictly in index order.
@@ -397,10 +513,16 @@ class DistributedDataParallel(Module, Joinable):
         """
         while self._next_bucket < len(self._buckets):
             bstate = self._buckets[self._next_bucket]
-            if bstate["pending"] is None or bstate["pending"]:
+            pending = bstate["pending"]
+            if pending is None:
+                if bstate["remaining"] != 0:
+                    break
+            elif pending:
                 break
             self._reduce_bucket(bstate)
             self._next_bucket += 1
+        if self._next_bucket == len(self._buckets):
+            self._require_finalize = False
 
     def _prepare_for_backward(self, output):
         """Collect parameters reachable from outputs (find_unused path)."""
@@ -427,7 +549,7 @@ class DistributedDataParallel(Module, Joinable):
                     stack.append(nxt)
         self._next_bucket = 0
         for bid, bstate in enumerate(self._buckets):
-            member_keys = {_param_key(p) for p in bstate["params"]}
+            member_keys = set(bstate["keys"])
             bstate["expected_keys"] = member_keys & keys
             bstate["pending"] = set(bstate["expected_keys"])
             self._zero_unused_slices(bstate)
@@ -438,25 +560,89 @@ class DistributedDataParallel(Module, Joinable):
             }
         self._try_flush_ready_buckets()
 
-    def _mark_param_ready(self, param):
-        """Copy grad into the bucket; reduce once the bucket completes."""
+    def _mark_param_ready(self, param, entry=None, key=None):
+        """Copy grad into the bucket; reduce once the bucket completes.
+
+        find_unused_parameters path only; the default path uses
+        :meth:`_mark_param_ready_fast`.
+        """
         if not self.require_backward_grad_sync:
             return
-        entry = self._param_entries.get(_param_key(param))
         if entry is None:
-            return
-        bstate, offset, length = entry
+            entry = self._param_entries.get(_param_key(param))
+            if entry is None:
+                return
+        bstate, _offset, _length, idx = entry
         grad = param.grad
         if grad is None:
             return
-        key = _param_key(param)
+        if key is None:
+            key = _param_key(param)
         # Only wait on params that this iteration expects (find_unused).
         if key in bstate["pending"]:
             with tp.no_grad():
-                bstate["buffer"][offset : offset + length].copy_(
-                    grad.reshape(-1))
+                bstate["views"][idx].copy_(grad)
             bstate["pending"].discard(key)
             self._try_flush_ready_buckets()
+
+    def _mark_param_ready_fast(self, bstate, idx, view, as_bucket_view):
+        """Copy the grad into its bucket slot as soon as it is ready.
+
+        Copying eagerly (torch's default, non-batched reducer path) spreads
+        the copy work across the backward pass instead of serializing it
+        in front of the bucket all-reduce, so the collective starts as soon
+        as the last gradient lands. Copy-back after the all-reduce is the
+        batched direction (one fused ``_foreach_copy_`` launch).
+        """
+        if not self.require_backward_grad_sync:
+            return
+        grad = bstate["params"][idx].grad
+        if grad is None:
+            # Hook fires right after accumulate, so this should not happen;
+            # if it does the bucket stays incomplete and the next iteration
+            # raises (torch ensure_prior_reduction_finished parity).
+            return
+        if as_bucket_view and grad.data_ptr() == view.data_ptr() \
+                and grad.numel() == view.numel():
+            # gradient_as_bucket_view: grad already aliases the bucket slot
+            # (torch's is_alias_of check) — no copy needed.
+            pass
+        else:
+            view.copy_(grad)
+            if as_bucket_view:
+                # Re-alias grad to the bucket view so the reduced values are
+                # observed in-place and no copy-back is needed (torch parity).
+                bstate["params"][idx].grad = view
+        bstate["remaining"] -= 1
+        if bstate["remaining"] == 0:
+            self._try_flush_ready_buckets()
+
+    def _flush_deferred_copies(self, bstate):
+        """Batched copy-in of any deferred grads (torch flush_deferred_copies).
+
+        The default path copies eagerly in the grad hooks, so this only does
+        work for buckets filled outside the hook path (e.g. join shadowing).
+        """
+        deferred = bstate["deferred"]
+        if not deferred:
+            return
+        views = bstate["views"]
+        params = bstate["params"]
+        srcs = [params[i].grad for i in deferred]
+        for i, grad in zip(deferred, srcs):
+            if grad is None:
+                self._log_and_throw(
+                    RuntimeError,
+                    "Gradient became undefined between grad-ready and bucket "
+                    f"flush for parameter index {i} in bucket "
+                    f"{bstate['index']}. This indicates a bug — gradients "
+                    "should not be modified during backward.",
+                )
+        tp._foreach_copy_([views[i] for i in deferred], srcs)
+        if self.gradient_as_bucket_view:
+            for i in deferred:
+                params[i].grad = views[i]
+        deferred.clear()
 
     def _reduce_bucket(self, bstate):
         """Run the comm hook (or default allreduce) and copy grads back."""
@@ -465,24 +651,61 @@ class DistributedDataParallel(Module, Joinable):
             return
         bucket = bstate["grad_bucket"]
         if self._comm_hooks:
+            self._flush_deferred_copies(bstate)
             new_buffer = None
             for hook, state in self._comm_hooks:
                 new_buffer = hook(state, bucket).value()
             self._copy_bucket_back(bstate, new_buffer)
+            return
+        self._flush_deferred_copies(bstate)
+        buffer = bstate["buffer"]
+        # fp32: let NCCL average natively (ncclAvg) — no separate div_ pass
+        # over the bucket. Half precision keeps torch's pre-divide + SUM to
+        # avoid accumulating large unscaled values at reduced precision.
+        if buffer.dtype == tp.float32:
+            op = dist.ReduceOp.AVG
         else:
-            buffer = bstate["buffer"]
             buffer.div_(world_size)
-            work = dist.all_reduce(buffer, group=self.process_group,
-                                   async_op=True)
-            work.wait()
-            self._copy_bucket_back(bstate, buffer)
+            op = dist.ReduceOp.SUM
+        # Overlap communication with backward compute (torch's reducer runs
+        # NCCL on a dedicated stream). The copy-in above ran on the current
+        # stream; hand the bucket to the comm stream, all-reduce and copy the
+        # reduced grads back there, and only join the current stream once the
+        # final bucket has been reduced. This lets earlier buckets'
+        # all-reduces run while the autograd engine is still computing later
+        # gradients. Stream ordering (the optimizer step runs on the current
+        # stream after the join) guarantees the grads are reduced before they
+        # are consumed.
+        if self._comm_stream is None:
+            self._comm_stream = tp.cuda.Stream(device=buffer.device)
+        cur = tp.cuda.current_stream(buffer.device)
+        self._comm_stream.wait_stream(cur)
+        with tp.cuda.stream(self._comm_stream):
+            _c10d._C.all_reduce(buffer, int(op), self._comm_handle)
+            if not self.gradient_as_bucket_view:
+                self._copy_bucket_back(bstate, buffer)
+        if bstate["index"] == len(self._buckets) - 1:
+            cur.wait_stream(self._comm_stream)
 
     def _copy_bucket_back(self, bstate, buffer):
-        with tp.no_grad():
-            for off, ln, p in zip(bstate["offsets"], bstate["lengths"],
-                                  bstate["params"]):
+        """Batched copy of reduced bucket slices back into param grads."""
+        params = bstate["params"]
+        dsts = []
+        srcs = []
+        if buffer is bstate["buffer"]:
+            views = bstate["views"]
+            for i, p in enumerate(params):
                 if p.grad is not None:
-                    p.grad.copy_(buffer[off : off + ln].view(p.shape))
+                    dsts.append(p.grad)
+                    srcs.append(views[i])
+        else:
+            for off, ln, p in zip(bstate["offsets"], bstate["lengths"],
+                                  params):
+                if p.grad is not None:
+                    dsts.append(p.grad)
+                    srcs.append(buffer[off : off + ln].view(p.shape))
+        if dsts:
+            tp._foreach_copy_(dsts, srcs)
 
     def register_comm_hook(self, state: object, hook) -> None:
         r"""Register communication hook for custom gradient aggregation.
@@ -575,7 +798,8 @@ class DistributedDataParallel(Module, Joinable):
     def __getstate__(self):
         self._check_default_group()
         attrs = {k: v for k, v in self.__dict__.items()
-                 if k not in ("process_group", "_grad_hooks")}
+                 if k not in ("process_group", "_grad_hooks", "_comm_handle",
+                              "_c_reducer")}
         attrs["broadcast_buffers"] = self.broadcast_buffers
         return attrs
 
@@ -585,6 +809,8 @@ class DistributedDataParallel(Module, Joinable):
         self.__dict__.update(state)
         self.__dict__.setdefault("require_forward_param_sync", True)
         self.__dict__.setdefault("require_backward_grad_sync", True)
+        self._comm_handle = _c10d._ensure_comm(
+            self.process_group, _c10d.default_pg_timeout.total_seconds())
         parameters, expect_sparse_gradient = self._build_params_for_reducer()
         self._ddp_init_helper(parameters, expect_sparse_gradient)
 
@@ -596,10 +822,15 @@ class DistributedDataParallel(Module, Joinable):
     def no_sync(self):
         old_require_backward_grad_sync = self.require_backward_grad_sync
         self.require_backward_grad_sync = False
+        if self._c_reducer is not None:
+            self._c_reducer.set_require_sync(False)
         try:
             yield
         finally:
             self.require_backward_grad_sync = old_require_backward_grad_sync
+            if self._c_reducer is not None:
+                self._c_reducer.set_require_sync(
+                    old_require_backward_grad_sync)
 
     def _run_ddp_forward(self, *inputs, **kwargs):
         return self.module(*inputs, **kwargs)
@@ -612,18 +843,7 @@ class DistributedDataParallel(Module, Joinable):
             self._join_notify_work = work
 
         if tp.is_grad_enabled() and self.require_backward_grad_sync:
-            self._static_expected = getattr(self, "_static_expected", None)
-            if self.find_unused_parameters and self.static_graph \
-                    and self._static_expected is not None:
-                # Reuse the first-iteration traversal (static graph).
-                self._next_bucket = 0
-                for bid, keys in self._static_expected.items():
-                    bstate = self._buckets[bid]
-                    bstate["expected_keys"] = set(keys)
-                    bstate["pending"] = set(keys)
-                    self._zero_unused_slices(bstate)
-            else:
-                self._reset_iteration_state()
+            self._reset_iteration_state()
 
         if self.will_sync_module_buffers() and tp.is_grad_enabled():
             self._sync_buffers()
@@ -759,12 +979,19 @@ class DistributedDataParallel(Module, Joinable):
     def _match_all_reduce_for_bwd_pass(self):
         # Joined processes contribute zero gradient: zero every bucket then
         # run the normal reduction so collective counts match active ranks.
+        if self._c_reducer is not None:
+            # The shadow pass issued no real backward; drop the C++ reducer's
+            # outstanding finalize expectation (its hooks never fired).
+            self._c_reducer.abort_iteration()
+        self._next_bucket = 0
         for bstate in self._buckets:
             with tp.no_grad():
                 bstate["buffer"].zero_()
-            bstate["pending"] = set(bstate["expected_keys"]) \
-                if bstate["expected_keys"] is not None else set()
-            self._next_bucket = 0
+            if bstate["pending"] is not None:
+                bstate["pending"] = set(bstate["expected_keys"]) \
+                    if bstate["expected_keys"] is not None else set()
+            bstate["remaining"] = 0
+            bstate["deferred"].clear()
         self._try_flush_ready_buckets()
 
     def join_hook(self, **kwargs):

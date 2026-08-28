@@ -17,82 +17,6 @@ def ndimension(self) -> int:
     """
     return self.dim()
 
-def flatten(self, start_dim=0, end_dim=-1):
-    """
-    Flattens a contiguous range of dims.
-    """
-    input_dim = self.dim()
-    if start_dim < 0:
-        start_dim += input_dim
-    if end_dim < 0:
-        end_dim += input_dim
-        
-    if start_dim < 0 or start_dim >= input_dim:
-         raise IndexError(f"Dimension out of range (expected to be in range of [{0}, {input_dim-1}], but got {start_dim})")
-    if end_dim < 0 or end_dim >= input_dim:
-         raise IndexError(f"Dimension out of range (expected to be in range of [{0}, {input_dim-1}], but got {end_dim})")
-    
-    if start_dim > end_dim:
-        return self
-
-    new_shape = []
-    for i in range(start_dim):
-        new_shape.append(self.size(i))
-        
-    flattened_size = 1
-    for i in range(start_dim, end_dim + 1):
-        flattened_size *= self.size(i)
-    new_shape.append(flattened_size)
-    
-    for i in range(end_dim + 1, input_dim):
-        new_shape.append(self.size(i))
-        
-    return self.reshape(new_shape)
-
-def unflatten(self, dim, sizes):
-    """
-    Expands a dimension of the input tensor over multiple dimensions.
-    """
-    input_dim = self.dim()
-    if dim < 0:
-        dim += input_dim
-        
-    if dim < 0 or dim >= input_dim:
-         raise IndexError(f"Dimension out of range (expected to be in range of [{0}, {input_dim-1}], but got {dim})")
-    
-    current_size = self.size(dim)
-    
-    # Calculate product of explicit sizes and handle -1
-    product = 1
-    infer_idx = -1
-    for i, s in enumerate(sizes):
-        if s == -1:
-            if infer_idx >= 0:
-                raise RuntimeError("unflatten: only one dimension can be inferred (-1)")
-            infer_idx = i
-        else:
-            product *= s
-            
-    if infer_idx >= 0:
-        if current_size % product != 0:
-             raise RuntimeError(f"unflatten: provided sizes {sizes} don't match the size of dimension {dim} ({current_size})")
-        sizes = list(sizes)
-        sizes[infer_idx] = current_size // product
-    else:
-        if product != current_size:
-            raise RuntimeError(f"unflatten: provided sizes {sizes} don't match the size of dimension {dim} ({current_size})")
-            
-    new_shape = []
-    for i in range(dim):
-        new_shape.append(self.size(i))
-        
-    new_shape.extend(sizes)
-    
-    for i in range(dim + 1, input_dim):
-        new_shape.append(self.size(i))
-        
-    return self.reshape(new_shape)
-
 def long(self):
     return self.to(_C.int64)
 
@@ -187,8 +111,6 @@ def type(self, dtype=None, non_blocking=False, **kwargs):
 
 
 Tensor.ndimension = ndimension
-Tensor.flatten = flatten
-Tensor.unflatten = unflatten
 Tensor.long = long
 Tensor.float = float
 Tensor.int = int
@@ -206,24 +128,10 @@ def unfold(self, dimension, size, step):
     size :attr:`size` from :attr:`self` in the dimension :attr:`dimension`,
     stepping by :attr:`step` (torch's ``Tensor.unfold``).
 
-    Port of ``aten/src/ATen/native/TensorShape.cpp``: the view appends a new
-    trailing dimension of length ``size`` and re-strides ``dimension`` by
-    ``step``.
+    Delegates to the native ``unfold.Tensor`` kernel (torch-exact as_strided
+    view semantics, including 0-d inputs and error messages).
     """
-    sizes = list(self.shape)
-    strides = list(self.strides)
-    if dimension < 0:
-        dimension += len(sizes)
-    if dimension < 0 or dimension >= len(sizes):
-        raise IndexError(f"Dimension out of range (expected to be in range of [0, {len(sizes) - 1}], but got {dimension})")
-    if sizes[dimension] < size:
-        raise ValueError(f"maximum size for tensor at dimension {dimension} is {sizes[dimension]} but size is {size}")
-    sizes[dimension] = (sizes[dimension] - size) // step + 1
-    # torch appends the ORIGINAL stride of `dimension`, then scales it by step
-    strides.append(strides[dimension])
-    sizes.append(size)
-    strides[dimension] *= step
-    return self.as_strided(sizes, strides)
+    return _C.unfold(self, dimension, size, step)
 
 
 Tensor.unfold = unfold
@@ -350,12 +258,20 @@ Tensor.permute = _permute
 
 
 # ---------------------------------------------------------------------------
-# expand: accept both expand(size) and expand(*size), like torch.
+# expand: accept both expand(size) and expand(*size), like torch.  torch's
+# generated TensorMethods binding also names the parameter `size`, so
+# t.expand(size=[2, 3]) is valid there; keep that surface here.
 # ---------------------------------------------------------------------------
 _orig_expand = Tensor.expand
 
 
-def _expand(self, *size, implicit=False):
+def _expand(self, *args, size=None, implicit=False):
+    if size is not None:
+        if args:
+            raise TypeError("expand() got multiple values for argument 'size'")
+        size = size
+    else:
+        size = args
     if len(size) == 1:
         s0 = size[0]
         if isinstance(s0, (list, tuple)) or hasattr(s0, "__iter__"):

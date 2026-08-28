@@ -383,21 +383,20 @@ void gemm_impl(const Tensor& self, const Tensor& other, Tensor& result,
         // silently reads the wrong reduction order for Muon's live .T view.
         const cublasOperation_t trans_a =
             other_transposed ? CUBLAS_OP_T : CUBLAS_OP_N;
+        const cublasOperation_t trans_b =
+            self_transposed_contiguous ? CUBLAS_OP_T : CUBLAS_OP_N;
         const int lda = static_cast<int>(other_transposed ? K : N);
-        CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH));
         const cublasStatus_t status = cublasGemmEx(
             handle,
-            trans_a, CUBLAS_OP_N,
+            trans_a, trans_b,
             static_cast<int>(N), static_cast<int>(M), static_cast<int>(K),
             alpha_ptr,
             a_ptr, cuda_type, lda,
-            b_ptr, cuda_type, static_cast<int>(K),
+            b_ptr, cuda_type,
+            static_cast<int>(self_transposed_contiguous ? M : K),
             beta_ptr,
             result.data_ptr(), cuda_type, static_cast<int>(N),
             compute_type, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-        // Restore the default even when the call reports an error so later
-        // operators cannot inherit a transient math-mode setting.
-        CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH));
         CUBLAS_CHECK(status);
         return;
     }

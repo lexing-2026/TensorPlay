@@ -116,12 +116,14 @@ class TestExportAndAggregation:
         doc = json.load(open(path))
         evs = doc["traceEvents"]
         assert len(evs) >= 1
-        for e in evs:
-            assert e["ph"] == "X"
+        x_events = [e for e in evs if e["ph"] == "X"]
+        assert x_events and all(e["ts"] >= 0 for e in x_events)
+        for e in x_events:
             assert e["dur"] > 0
-            assert e["ts"] >= 0
             assert e["cat"] in ("cpu_op", "user_annotation", "backward")
             assert isinstance(e["tid"], int)
+        # metadata events ride along (ph "M") for the torch schema
+        assert any(e["ph"] == "M" for e in evs)
         # torch's own export loads as the same schema
         with torch.profiler.profile() as tprof:
             torch.ones(2) + torch.ones(2)
@@ -148,8 +150,10 @@ class TestExportAndAggregation:
 
 class TestInactiveContract:
     def test_no_session_stop_is_empty(self):
-        raw = tp._C._profiler_stop()  # never started
-        assert list(raw) == []
+        raw_ops, raw_gpu, raw_mem = tp._C._profiler_stop()  # never started
+        assert list(raw_ops) == []
+        assert list(raw_gpu) == []
+        assert list(raw_mem) == []
 
     def test_events_outside_context_not_captured(self):
         with tp_prof.profile():
@@ -317,6 +321,82 @@ class TestGpuTiming:
         assert prof.stop_ms >= 0
 
 
+class TestGpuTrace:
+    """CUPTI kernel-level tracing (gpu_trace=True, USE_CUDA builds)."""
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+    def test_kernels_runtime_and_correlation(self):
+        a = tp.ones([4096]).to("cuda")
+        with tp_prof.profile(gpu_trace=True) as prof:
+            b = a.add(a)
+            _ = b.mul(b)
+        acts = prof.gpu_activities
+        kinds = {k[1] for k in acts}
+        assert "k" in kinds, f"no kernel rows: {kinds}"
+        assert "r" in kinds, "no cuda_runtime rows"
+        kernels = [k for k in acts if k[1] == "k"]
+        # kernel names are real (non-empty, interned)
+        assert all(k[0] and k[0] != "unknown" for k in kernels)
+        # op -> kernel correlation via external id (OpRecord slot)
+        ops = prof.events
+        kNoExt = 0xFFFFFFFFFFFFFFFF
+        for k in kernels:
+            if k[7] != kNoExt:
+                assert k[7] < len(ops)
+        timed = [ev for ev in ops if len(ev) > 11 and ev[11] > 0]
+        assert timed, "no op received correlated kernels"
+        assert all(ev[8] >= 0 for ev in timed)  # summed kernel ms
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+    def test_memcpy_rows(self):
+        x = tp.ones([1024]).to("cuda")  # outside the session
+        with tp_prof.profile(gpu_trace=True) as prof:
+            _ = x.cpu()
+        kinds = {k[1] for k in prof.gpu_activities}
+        assert "m" in kinds, kinds
+        mc = [k for k in prof.gpu_activities if k[1] == "m"][0]
+        assert mc[10] == 4096  # 1024 * float32 bytes moved
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+    def test_trace_gpu_lanes_and_flows(self):
+        a = tp.ones([4096]).to("cuda")
+        with tp_prof.profile(gpu_trace=True) as prof:
+            _ = a.add(a)
+        path = os.path.join(tempfile.mkdtemp(), "gpu.json")
+        prof.export_chrome_trace(path)
+        doc = json.load(open(path))
+        evs = doc["traceEvents"]
+        cats = {e["cat"] for e in evs if "cat" in e}
+        assert "kernel" in cats
+        assert "cuda_runtime" in cats
+        assert "ac2g" in cats  # flow arrows op -> kernel
+        # GPU process lane labeled per torch schema
+        assert any(e.get("name") == "process_labels" and
+                   e["args"].get("labels", "").startswith("GPU ")
+                   for e in evs)
+        # kernel rows live on a GPU pid (>= 1000000), not the CPU pid
+        krows = [e for e in evs if e.get("cat") == "kernel"]
+        assert all(isinstance(e["pid"], int) and e["pid"] >= 1000000
+                   for e in krows)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+    def test_gpu_trace_and_timing_coexist(self):
+        a = tp.ones([4096]).to("cuda")
+        with tp_prof.profile(gpu_timing=True, gpu_trace=True) as prof:
+            _ = a.add(a)
+        assert any(ev[8] >= 0 for ev in prof.events)
+        assert any(k[1] == "k" for k in prof.gpu_activities)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+    def test_repeated_sessions_reusable(self):
+        a = tp.ones([1024]).to("cuda")
+        for _ in range(3):
+            with tp_prof.profile(gpu_trace=True) as prof:
+                _ = a.add(a)
+            assert any(k[1] == "k" for k in prof.gpu_activities)
+            assert not prof.mem_events  # unrelated to mem capture
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
 
@@ -361,3 +441,249 @@ class TestEmitNvtx:
             with tp_prof.emit_nvtx():
                 tp.ones([2]).add(tp.ones([2]))
         assert any("add" in ev[0] for ev in prof.events)
+
+
+class TestMemoryHooks:
+    """Allocator-level capture (profile_memory=True)."""
+
+    def test_alloc_and_free_balance(self):
+        with tp_prof.profile(profile_memory=True) as prof:
+            x = tp.zeros([1024])  # 4 KiB f32
+            del x
+            tp.zeros([512])
+        assert prof.mem_events, "no allocator events captured"
+        allocs = [e for e in prof.mem_events if e[3]]
+        frees = [e for e in prof.mem_events if not e[3]]
+        assert allocs and frees
+        # allocs carry the requested bytes; frees repeat the block size
+        assert all(e[2] > 0 for e in allocs)
+
+    def test_timeline_and_summary(self):
+        with tp_prof.profile(profile_memory=True) as prof:
+            a = tp.zeros([4096])
+            b = tp.zeros([4096])
+            del a
+        total, peak, tl = prof.memory_summary()
+        assert total > 0
+        assert peak >= total or peak > 0
+        assert any(kind == "alloc" for _, _, kind in tl)
+        assert any(kind == "free" for _, _, kind in tl)
+
+    def test_export_memory_timeline_csv(self):
+        with tp_prof.profile(profile_memory=True) as prof:
+            tp.zeros([256])
+        path = os.path.join(tempfile.mkdtemp(), "mem.csv")
+        prof.export_memory_timeline(path)
+        lines = open(path).read().strip().splitlines()
+        assert lines[0] == "timestamp_ns,device,allocated_bytes"
+        assert len(lines) >= 2
+        assert "cpu" in lines[1]
+
+    def test_no_mem_events_without_flag(self):
+        with tp_prof.profile() as prof:
+            tp.zeros([128])
+        assert prof.mem_events == []
+
+
+class TestFullStack:
+    """with_stack captures the full Python frame chain."""
+
+    def test_stack_captured(self):
+        with tp_prof.profile(with_stack=True) as prof:
+            tp.randn([4, 4])
+        stacks = [ev[10] for ev in prof.events if ev[10]]
+        assert stacks
+        # leaf frame is the test file itself; chain contains profiler.py's
+        # module or the test frame
+        joined = ";".join(stacks[0])
+        assert "test_profiler.py" in joined
+
+    def test_inner_ops_have_no_stack(self):
+        with tp_prof.profile(with_stack=True) as prof:
+            tp.gradient(tp.arange(8).to(tp.float64))
+        inner = [ev for ev in prof.events
+                 if ev[0].split(".")[0] in ("sub", "div", "cat")]
+        assert inner
+        assert all(ev[10] is None for ev in inner)
+
+    def test_stack_absent_without_flag(self):
+        with tp_prof.profile() as prof:
+            tp.randn([4, 4])
+        assert all(ev[10] is None for ev in prof.events)
+
+    def test_export_stacks_folded(self):
+        with tp_prof.profile(with_stack=True) as prof:
+            a = tp.randn([8, 8])
+            a.matmul(a)
+        path = os.path.join(tempfile.mkdtemp(), "stacks.txt")
+        prof.export_stacks(path)
+        content = open(path).read()
+        assert content
+        line = content.splitlines()[0]
+        # "<frames> <self_us>" folded format
+        frames, us = line.rsplit(" ", 1)
+        assert float(us) > 0
+        assert ";" in frames or "(" in frames
+
+
+class TestSampling:
+    """Python stack sampler (with_samples=True)."""
+
+    def test_samples_collected(self, monkeypatch):
+        monkeypatch.setenv("TP_PROFILER_SAMPLE_MS", "1")
+        with tp_prof.profile(with_samples=True) as prof:
+            x = tp.ones([64])
+            for _ in range(3000):  # outlast GIL switch interval (~5 ms)
+                y = x.mul(x)
+            _ = y.sum()
+        assert prof._sampler is not None
+        assert len(prof._sampler.samples) >= 1
+        ts, os_tid, chain = prof._sampler.samples[0]
+        assert chain and os_tid
+
+    def test_samples_in_trace(self, monkeypatch):
+        monkeypatch.setenv("TP_PROFILER_SAMPLE_MS", "1")
+        with tp_prof.profile(with_samples=True) as prof:
+            x = tp.ones([64])
+            for _ in range(3000):  # outlast GIL switch interval (~5 ms)
+                _ = x.mul(x)
+        path = os.path.join(tempfile.mkdtemp(), "s.json")
+        prof.export_chrome_trace(path)
+        doc = json.load(open(path))
+        samples = [e for e in doc["traceEvents"]
+                   if e.get("cat") == "python_function"]
+        assert samples
+        assert samples[0]["ph"] == "i"
+        assert samples[0]["args"]["stack"]
+
+    def test_sampler_stops(self):
+        p = tp_prof.profile(with_samples=True)
+        p.__enter__()
+        sampler = p._sampler
+        p.__exit__(None, None, None)
+        assert sampler._stop.is_set()      # loop asked to finish
+        assert sampler._thread is None     # joined and cleared
+
+
+class TestDistributed:
+    """Rank tagging + multi-process trace merge."""
+
+    def test_rank_in_args_and_metadata(self, monkeypatch):
+        monkeypatch.setenv("RANK", "2")
+        monkeypatch.setenv("WORLD_SIZE", "8")
+        with tp_prof.profile() as prof:
+            tp.ones([2]).add(tp.ones([2]))
+        path = os.path.join(tempfile.mkdtemp(), "r.json")
+        prof.export_chrome_trace(path, torch_compat=True)
+        doc = json.load(open(path))
+        assert doc["distributedInfo"] == {"rank": 2, "world_size": 8,
+                                          "backend": "tensorplay.distributed"}
+        ops = [e for e in doc["traceEvents"] if e.get("cat") == "cpu_op"]
+        assert ops and all(e["args"]["rank"] == 2 for e in ops)
+
+    def test_merge_two_ranks(self, monkeypatch):
+        paths = []
+        for rank in (0, 1):
+            monkeypatch.setenv("RANK", str(rank))
+            monkeypatch.setenv("WORLD_SIZE", "2")
+            with tp_prof.profile() as prof:
+                tp.ones([2]).add(tp.ones([2]))
+            p = os.path.join(tempfile.mkdtemp(), f"rank{rank}.json")
+            prof.export_chrome_trace(p, torch_compat=True)
+            paths.append(p)
+        out = os.path.join(tempfile.mkdtemp(), "merged.json")
+        tp_prof.merge_distributed_traces(paths, out)
+        doc = json.load(open(out))
+        pids = {e["pid"] for e in doc["traceEvents"] if "pid" in e}
+        assert 0 in pids and 10_000_000 in pids
+        assert doc["distributedInfo"]["merged_ranks"] == [0, 1]
+        assert len(doc["traceEvents"]) >= 2
+
+
+class TestTensorboardExport:
+    """torch_tb_profiler-compatible artifact."""
+
+    def test_torch_schema_keys(self):
+        with tp_prof.profile(record_shapes=True) as prof:
+            x = tp.randn([4, 4])
+            _ = x.matmul(x)
+        outdir = tempfile.mkdtemp()
+        written = prof.export_tensorboard_trace(outdir)
+        assert written.endswith(".pt.trace.json")
+        doc = json.load(open(written))
+        for key in ("schemaVersion", "deviceProperties",
+                    "baseTimeNanoseconds", "traceName", "with_flops",
+                    "record_shapes"):
+            assert key in doc, key
+        assert doc["schemaVersion"] == 1
+        assert doc["traceName"].endswith(".pt.trace.json")
+        evs = doc["traceEvents"]
+        # process/thread metadata events, torch-style
+        assert any(e["ph"] == "M" and e["name"] == "process_name"
+                   for e in evs)
+        assert any(e["ph"] == "M" and e["name"] == "process_labels"
+                   for e in evs)
+        # Record Window End marker (torch's export contract)
+        assert any(e.get("name") == "Record Window End" for e in evs)
+        # cpu_op rows kept, backward span re-catgorized to user_annotation
+        assert any(e.get("cat") == "cpu_op" for e in evs)
+
+    def test_schema_matches_torch_export(self):
+        with torch.profiler.profile() as tprof:
+            torch.ones(2) + torch.ones(2)
+        tpath = os.path.join(tempfile.mkdtemp(), "tt.pt.trace.json")
+        tprof.export_chrome_trace(tpath)
+        tdoc = json.load(open(tpath))
+        with tp_prof.profile() as prof:
+            tp.ones([2]).add(tp.ones([2]))
+        ppath = os.path.join(tempfile.mkdtemp(), "p")
+        prof.export_tensorboard_trace(ppath)
+        import glob
+        pfile = glob.glob(os.path.join(ppath, "*.pt.trace.json"))[0]
+        pdoc = json.load(open(pfile))
+        assert set(tdoc.keys()) - {"traceEvents"} <= set(pdoc.keys()) | {
+            "with_stack", "distributedInfo", "traceName", "trace_events"}
+
+    def test_backward_cat_remaps(self):
+        x = tp.ones([4], requires_grad=True)
+        with tp_prof.profile() as prof:
+            y = (x * 2.0).sum()
+            y.backward()
+        path = os.path.join(tempfile.mkdtemp(), "b.json")
+        prof.export_chrome_trace(path, torch_compat=True)
+        cats = {e.get("cat") for e in json.load(open(path))["traceEvents"]}
+        assert "backward" not in cats
+        assert "user_annotation" in cats
+
+
+class TestGpuTraceCpuBuild:
+    """gpu_trace degrades gracefully without CUDA."""
+
+    def test_warning_and_empty_gpu(self):
+        if torch.cuda.is_available():
+            pytest.skip("exercises CPU-build degradation only")
+        with pytest.warns(RuntimeWarning, match="gpu_trace unavailable"):
+            with tp_prof.profile(gpu_trace=True) as prof:
+                tp.ones([2]).add(tp.ones([2]))
+        assert prof.gpu_activities == []
+        assert any("add" in ev[0] for ev in prof.events)
+
+    def test_cupti_available_flag(self):
+        avail = tp._C and hasattr(tp._C, "_profiler_stop")
+        assert avail  # binding surface intact
+
+
+class TestKeyAveragesGpuColumns:
+    def test_no_gpu_columns_on_cpu(self):
+        with tp_prof.profile() as prof:
+            tp.ones([2]).add(tp.ones([2]))
+        table = str(prof.key_averages())
+        assert "Self CUDA" not in table
+        assert "Self CPU time total" in table
+
+    def test_sort_by_cuda_key_accepted(self):
+        with tp_prof.profile() as prof:
+            tp.ones([2]).add(tp.ones([2]))
+        # unknown keys still raise; cuda keys parse without GPU data
+        rows = prof.key_averages(sort_by="cuda_time").rows
+        assert rows

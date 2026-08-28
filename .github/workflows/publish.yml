@@ -4,12 +4,17 @@ name: publish
 # validate every wheel, publish CPU wheels to PyPI via trusted publishing, and
 # publish every configured CUDA variant through GitHub Releases plus the
 # pypi-pages branch consumed by Cloudflare Pages.
+#
+# Release candidates (v*.*.0-rc*) run the same matrix and create a GitHub
+# *prerelease*, but never touch PyPI or the stable wheel indexes (see
+# RELEASE.md for the full process).
 
 on:
   push:
-    # Publish only major/minor releases: v1.0.0, v1.2.0, v2.0.0.
+    # Publish only major/minor releases and their release candidates:
+    # v1.0.0, v1.2.0, v2.0.0, v1.0.0-rc1, ...
     # Patch tags such as v1.2.1 do not start this workflow.
-    tags: ['v*.*.0']
+    tags: ['v*.*.0', 'v*.*.0-rc*']
   workflow_dispatch:
 
 concurrency:
@@ -74,8 +79,12 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          show-progress: false
       - name: Create release for an eligible tag
-        if: ${{ startsWith(github.ref, 'refs/tags/v') && endsWith(github.ref_name, '.0') }}
+        if: ${{ startsWith(github.ref, 'refs/tags/v') && matches(github.ref_name, '^v\d+\.\d+\.\d+(-rc\d+)?$') }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -84,11 +93,27 @@ jobs:
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "Release $GITHUB_REF_NAME already exists"
           else
+            # Curated notes live in docs/release-notes/<tag>.md, compiled from
+            # the "release notes: *" PR labels the way pytorch compiles theirs
+            # (see docs/release-notes/TEMPLATE.md). Fall back to GitHub's
+            # auto-generated notes when the file is missing.
+            notes_args=(--generate-notes)
+            notes_file="docs/release-notes/${GITHUB_REF_NAME}.md"
+            if [[ -f "$notes_file" ]]; then
+              notes_args=(--notes-file "$notes_file")
+            fi
+            # Release candidates ship as prereleases and never reach PyPI or
+            # the stable indexes.
+            release_args=()
+            if [[ "$GITHUB_REF_NAME" == *-rc* ]]; then
+              release_args=(--prerelease)
+            fi
             gh release create "$GITHUB_REF_NAME" \
               --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
               --title "TensorPlay $GITHUB_REF_NAME" \
-              --generate-notes
+              "${release_args[@]}" \
+              "${notes_args[@]}"
           fi
 
   cpu-build:
@@ -108,7 +133,7 @@ jobs:
       build_environment: ${{ format('release-{0}-py{1}-cpu', matrix.platform, matrix.python) }}
       runs_on: ${{ matrix.runner }}
       python_version: ${{ matrix.python }}
-      upload_release: ${{ startsWith(github.ref, 'refs/tags/v') && endsWith(github.ref_name, '.0') }}
+      upload_release: ${{ startsWith(github.ref, 'refs/tags/v') && matches(github.ref_name, '^v\d+\.\d+\.\d+(-rc\d+)?$') }}
 
   cuda-build:
     name: ${{ matrix.build_name }}-build-test
@@ -129,12 +154,13 @@ jobs:
       python_version: ${{ matrix.python }}
       cuda: ${{ matrix.variant }}
       cuda_toolkit: ${{ matrix.toolkit }}
-      upload_release: ${{ startsWith(github.ref, 'refs/tags/v') && endsWith(github.ref_name, '.0') }}
+      upload_release: ${{ startsWith(github.ref, 'refs/tags/v') && matches(github.ref_name, '^v\d+\.\d+\.\d+(-rc\d+)?$') }}
 
   pypi-upload:
-    # CPU wheels remain on PyPI. Release assets are downloaded after every
-    # CPU build has tested and uploaded its own wheel.
-    if: startsWith(github.ref, 'refs/tags/v') && endsWith(github.ref_name, '.0')
+    # CPU wheels remain on PyPI -- stable releases only, never release
+    # candidates. Release assets are downloaded after every CPU build has
+    # tested and uploaded its own wheel.
+    if: startsWith(github.ref, 'refs/tags/v') && matches(github.ref_name, '^v\d+\.\d+\.0$')
     needs: cpu-build
     runs-on: ubuntu-latest
     environment:
@@ -173,8 +199,9 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
 
   cuda-upload:
-    # Publish one complete static index to the branch tracked by Pages.
-    if: startsWith(github.ref, 'refs/tags/v') && endsWith(github.ref_name, '.0')
+    # Publish one complete static index to the branch tracked by Pages --
+    # stable releases only, never release candidates.
+    if: startsWith(github.ref, 'refs/tags/v') && matches(github.ref_name, '^v\d+\.\d+\.0$')
     needs:
       - define-wheel-matrix
       - cuda-build

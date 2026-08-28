@@ -467,7 +467,7 @@ def _adagrad_fused_layout_ready(
     first_dtype = params[0].dtype
     if first_device.type not in ("cpu", "cuda"):
         return False
-    if first_dtype not in (tp.float32, tp.float64):
+    if first_dtype not in (tp.float16, tp.bfloat16, tp.float32, tp.float64):
         return False
 
     cache_key = None
@@ -525,6 +525,11 @@ def adagrad(
         and params[0].device.type in ("cpu", "cuda")
         and _adagrad_fused_layout_ready(
             params, grads, state_sums, state_steps, layout_cache,
+        )
+        # Both CPU and CUDA native bodies preserve the reduced-dtype foreach
+        # cast boundary after every pointwise operation.
+        and params[0].dtype in (
+            tp.float16, tp.bfloat16, tp.float32, tp.float64
         )
         and all(
             step.device.type == "cpu"

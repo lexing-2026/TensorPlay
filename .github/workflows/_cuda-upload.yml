@@ -1,9 +1,16 @@
 name: cuda-upload
 
-# CUDA wheels are uploaded by their build-and-test jobs directly to the
-# current GitHub Release. This job downloads those release assets, builds one
-# static PEP 503 index for every configured variant, and publishes the complete
-# site to the pypi-pages branch. Cloudflare Pages follows that branch.
+# Wheel indexes are uploaded by their build-and-test jobs directly to the
+# current GitHub Release. This job downloads those release assets, builds PEP 503
+# indexes, and publishes the site to the pypi-pages branch. Cloudflare Pages
+# follows that branch.
+#
+# Two channels:
+#   - release (default): one complete static index for every configured CUDA
+#     variant, regenerated from all stable releases (whl/<variant>/).
+#   - nightly: indexes only the rolling "nightly" release under
+#     whl/nightly/<variant>/ (plus a cpu pseudo-variant) and overlays that
+#     subtree onto the existing pages site, leaving the stable indexes intact.
 
 on:
   workflow_call:
@@ -23,6 +30,24 @@ on:
         type: string
         default: pypi-pages
         description: Branch tracked by Cloudflare Pages
+      channel:
+        required: false
+        type: string
+        default: release
+        description: Index channel, release or nightly
+      release_tag:
+        required: false
+        type: string
+        default: ""
+        description: Release to download wheels from (defaults to the current ref name)
+      prune_keep_version:
+        required: false
+        type: string
+        default: ""
+        description: >-
+          Nightly retention: when set, delete every asset on the nightly
+          release whose wheel version differs from this one, keeping only the
+          latest published preview.
 
 permissions: read-all
 
@@ -44,28 +69,78 @@ jobs:
           submodules: false
           show-progress: false
 
-      - name: Download CUDA wheels from GitHub Release
+      - name: Prune stale nightly assets
+        if: ${{ inputs.channel == 'nightly' && inputs.prune_keep_version != '' }}
         shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+          KEEP_VERSION: ${{ inputs.prune_keep_version }}
+        run: |
+          set -euo pipefail
+          # Runs before the download/index steps so stale wheels never reach
+          # the dist directory or the generated indexes.
+          python - <<'PY'
+          import os
+          import re
+          import subprocess
+
+          release_tag = os.environ["RELEASE_TAG"]
+          keep_base = os.environ["KEEP_VERSION"].partition("+")[0]
+          assets = subprocess.run(
+              ["gh", "api", f"repos/{os.environ['GITHUB_REPOSITORY']}/releases/tags/{release_tag}",
+               "--jq", r'.assets[] | "\(.id) \(.name)"'],
+              capture_output=True, text=True, check=True,
+          ).stdout.splitlines()
+          parsed = []
+          for line in assets:
+              asset_id, _, name = line.partition(" ")
+              match = re.search(r"-(\d[^-]*)-(?:cp|py)[0-9]", name)
+              if match:
+                  parsed.append((asset_id, name, match.group(1).partition("+")[0]))
+          if not any(version == keep_base for _id, _name, version in parsed):
+              raise SystemExit(
+                  f"No wheel of version {keep_base} on release {release_tag}; "
+                  "refusing to prune the previous nightly"
+              )
+          for asset_id, name, version in parsed:
+              if version != keep_base:
+                  print(f"Deleting stale nightly asset {name} (version {version})")
+                  subprocess.run(
+                      ["gh", "api", "-X", "DELETE",
+                       f"repos/{os.environ['GITHUB_REPOSITORY']}/releases/assets/{asset_id}"],
+                      check=True,
+                  )
+          PY
+
+      - name: Download wheels from GitHub Release
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
           set -euo pipefail
           mkdir -p dist
-          gh release download "$GITHUB_REF_NAME" \
+          gh release download "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --dir dist
 
           shopt -s nullglob
-          cuda_wheels=(dist/*+cu*.whl)
-          if (("${#cuda_wheels[@]}" == 0)); then
-            echo "No CUDA wheels found in release assets" >&2
+          if [[ "${{ inputs.channel }}" == "nightly" ]]; then
+            # The nightly channel also carries +cpu and suffix-less macOS wheels.
+            wheels=(dist/*.whl)
+          else
+            wheels=(dist/*+cu*.whl)
+            for wheel in dist/*.whl; do
+              case "$wheel" in
+                *+cu*.whl) ;;
+                *) rm -f "$wheel" ;;
+              esac
+            done
+          fi
+          if (("${#wheels[@]}" == 0)); then
+            echo "No wheels found in release $RELEASE_TAG" >&2
             exit 1
           fi
-          for wheel in dist/*.whl; do
-            case "$wheel" in
-              *+cu*.whl) ;;
-              *) rm -f "$wheel" ;;
-            esac
-          done
-          printf 'CUDA wheels:\n%s\n' "${cuda_wheels[@]}"
+          printf 'Wheels:\n%s\n' "${wheels[@]}"
 
       - name: Collect all CUDA release assets
         shell: bash
@@ -76,10 +151,11 @@ jobs:
             --jq '.[] | select(.draft == false) | {tag_name: .tag_name, assets: [.assets[] | {name: .name, browser_download_url: .browser_download_url}]}' \
             > "$RUNNER_TEMP/tensorplay-releases.jsonl"
 
-      - name: Build all CUDA PEP 503 indexes
+      - name: Build PEP 503 indexes
         shell: bash
         env:
           CUDA_VARIANTS_JSON: ${{ inputs.cuda_variants_json }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
           set -euo pipefail
           python -m pip install --disable-pip-version-check --quiet packaging
@@ -88,18 +164,27 @@ jobs:
           for variant in "${variants[@]}"; do
             variant_args+=(--variant "$variant")
           done
+          channel_args=()
+          if [[ "${{ inputs.channel }}" == "nightly" ]]; then
+            # The nightly release holds CPU wheels too; index them under the
+            # cpu pseudo-variant next to the CUDA ones.
+            variant_args+=(--variant cpu)
+            channel_args+=(--nightly)
+          fi
           python tools/build_simple_index.py \
             --dist-dir dist \
             --output-dir release_site \
-            --release-tag "$GITHUB_REF_NAME" \
+            --release-tag "$RELEASE_TAG" \
             --release-base-url "https://github.com/${GITHUB_REPOSITORY}/releases/download" \
             --releases-json "$RUNNER_TEMP/tensorplay-releases.jsonl" \
-            "${variant_args[@]}"
+            "${variant_args[@]}" \
+            "${channel_args[@]}"
 
       - name: Publish static indexes to the Pages branch
         shell: bash
         env:
           PAGES_BRANCH: ${{ inputs.pages_branch }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
@@ -112,13 +197,27 @@ jobs:
             git worktree add --orphan -b "$PAGES_BRANCH" pages-branch
           fi
 
-          find pages-branch -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf -- {} +
-          cp -a release_site/. pages-branch/
+          if [[ "${{ inputs.channel }}" == "nightly" ]]; then
+            # Overlay: replace only the nightly subtree so the stable indexes
+            # published by release runs stay intact.
+            mkdir -p pages-branch/whl
+            rm -rf pages-branch/whl/nightly
+            cp -a release_site/whl/nightly pages-branch/whl/nightly
+            if [[ ! -f pages-branch/_headers ]]; then
+              printf '/whl/*\n  Cache-Control: public, max-age=300, must-revalidate\n' \
+                > pages-branch/_headers
+            fi
+            commit_message="Update nightly indexes for $RELEASE_TAG"
+          else
+            find pages-branch -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf -- {} +
+            cp -a release_site/. pages-branch/
+            commit_message="Update CUDA indexes for $RELEASE_TAG"
+          fi
           git -C pages-branch add --all
 
           if git -C pages-branch diff --cached --quiet; then
             echo "No static index changes to publish"
           else
-            git -C pages-branch commit -m "Update CUDA indexes for $GITHUB_REF_NAME"
+            git -C pages-branch commit -m "$commit_message"
             git -C pages-branch push origin "$PAGES_BRANCH"
           fi

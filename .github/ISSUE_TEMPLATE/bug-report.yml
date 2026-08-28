@@ -1,0 +1,86 @@
+name: Bug report
+description: Something isn't working.
+title: "[BUG] "
+labels: ["bug", "needs triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to fill out this bug report!
+  - type: textarea
+    id: version
+    attributes:
+      label: TensorPlay version
+      description: |
+        Paste the output of:
+        ```bash
+        python -c "import tensorplay; print(tensorplay.__version__)"
+        ```
+      placeholder: "1.0.0a0+gite7c5c3d"
+    validations:
+      required: true
+  - type: dropdown
+    id: install-source
+    attributes:
+      label: Install source
+      options:
+        - PyPI (CPU wheel)
+        - CUDA index (cu124)
+        - CUDA index (cu126)
+        - CUDA index (cu130)
+        - Nightly index (whl/nightly/*)
+        - Built from source
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Linux x86_64
+        - Linux arm64
+        - macOS arm64
+        - Windows x86_64
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: "3.11"
+    validations:
+      required: true
+  - type: input
+    id: cuda
+    attributes:
+      label: CUDA Toolkit / driver version (GPU issues only)
+      placeholder: "12.4 / 550.xx"
+    validations:
+      required: false
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: A self-contained script we can run to reproduce the issue.
+      render: python
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior / error output
+      description: Include the full traceback or wrong-result details.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+    validations:
+      required: false

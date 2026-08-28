@@ -47,6 +47,16 @@ inline float compute_scales_value_h(const std::optional<double>& scale, int64_t 
         : static_cast<float>(static_cast<double>(input_size) / output_size);
 }
 
+// ATen UpSample.cuh compute_scales_value_backwards: nearest-backward index
+// math wants the output/input ratio, and an explicit scale_factor is used
+// as-is (not inverted like in the forward).
+inline float compute_scales_value_backwards_h(const std::optional<double>& scale,
+                                              int64_t src_size, int64_t dst_size) {
+    return (scale.has_value() && scale.value() > 0.)
+        ? static_cast<float>(scale.value())
+        : static_cast<float>(static_cast<double>(src_size) / dst_size);
+}
+
 inline float area_pixel_compute_scale_h(int64_t input_size, int64_t output_size,
                                         bool align_corners, const std::optional<double>& scale) {
     if (align_corners) {
@@ -209,11 +219,11 @@ __global__ void upsample_nearest1d_backward_out_frame(
     // intentionally want to skip in case of scale_factor < 1.0
     const int src_x = nearest_neighbor_bw_compute_source_index(width_scale, dst_x, static_cast<int>(src_dim_w));
     const int src_x_up = nearest_neighbor_bw_compute_source_index(width_scale, dst_x + 1, static_cast<int>(src_dim_w));
-    accscalar_t grad = 0;
-    for (int x = src_x; x < src_x_up; ++x) {
-        grad += grad_o[c * src_dim_w + x];
-    }
     for (int64_t b = 0; b < dim_b; ++b) {
+        accscalar_t grad = 0;
+        for (int x = src_x; x < src_x_up; ++x) {
+            grad += grad_o[b * dim_c * src_dim_w + c * src_dim_w + x];
+        }
         grad_i[b * dim_c * dst_dim_w + dst_idx] = grad;
     }
 }
@@ -735,7 +745,8 @@ Tensor upsample_nearest1d_backward_cuda(const Tensor& grad_output, std::vector<i
         upsample_nearest1d_backward_out_frame<accscalar_t, scalar_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
             go.data_ptr<scalar_t>(), dim_b, dim_c, W2, W1,
             reinterpret_cast<accscalar_t*>(grad_input.data_ptr<scalar_t>()),
-            compute_scales_value_h(scales, W1, W2));
+            // ATen compute_scales_value_backwards: output/input ratio.
+            compute_scales_value_backwards_h(scales, W2, W1));
     });
     CUDA_CHECK(cudaGetLastError());
     return grad_input;
@@ -754,7 +765,7 @@ Tensor upsample_nearest2d_backward_cuda(const Tensor& grad_output, std::vector<i
         upsample_nearest2d_backward_out_frame<accscalar_t, scalar_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
             go.data_ptr<scalar_t>(), dim_b, dim_c, H2, W2, H1, W1,
             reinterpret_cast<accscalar_t*>(grad_input.data_ptr<scalar_t>()),
-            compute_scales_value_h(scales_h, H1, H2), compute_scales_value_h(scales_w, W1, W2));
+            compute_scales_value_backwards_h(scales_h, H2, H1), compute_scales_value_backwards_h(scales_w, W2, W1));
     });
     CUDA_CHECK(cudaGetLastError());
     return grad_input;
@@ -773,8 +784,8 @@ Tensor upsample_nearest3d_backward_cuda(const Tensor& grad_output, std::vector<i
         upsample_nearest3d_backward_out_frame<accscalar_t, scalar_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
             go.data_ptr<scalar_t>(), dim_b, dim_c, D2, H2, W2, D1, H1, W1,
             reinterpret_cast<accscalar_t*>(grad_input.data_ptr<scalar_t>()),
-            compute_scales_value_h(scales_d, D1, D2), compute_scales_value_h(scales_h, H1, H2),
-            compute_scales_value_h(scales_w, W1, W2));
+            compute_scales_value_backwards_h(scales_d, D2, D1), compute_scales_value_backwards_h(scales_h, H2, H1),
+            compute_scales_value_backwards_h(scales_w, W2, W1));
     });
     CUDA_CHECK(cudaGetLastError());
     return grad_input;

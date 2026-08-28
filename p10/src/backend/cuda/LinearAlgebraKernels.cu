@@ -325,7 +325,10 @@ Tensor addmm_kernel_cuda(const Tensor& input, const Tensor& mat1, const Tensor& 
         return result;
     }
 
-    Tensor result = expand_gemm_input_cuda(input, {M, N}).clone();
+    // cuBLAS writes a dense row-major C matrix.  clone() alone may preserve
+    // a transposed input's non-contiguous strides, so materialize the seed
+    // as an independent contiguous destination before GEMM.
+    Tensor result = expand_gemm_input_cuda(input, {M, N}).clone().contiguous();
     gemm_impl(mat1, mat2, result, alpha_v, beta_v, nullptr);
     return result;
 }
@@ -745,7 +748,14 @@ Tensor baddbmm_kernel_cuda(const Tensor& input, const Tensor& batch1, const Tens
         result = Tensor::empty(target, batch1.dtype(), batch1.device());
     } else {
         // Any broadcastable input works in torch, including 0-dim/(N,)/(M,N).
-        result = expand_gemm_input_cuda(input, target).contiguous();
+        // clone() is required even when input is already contiguous: unlike
+        // addmm's internal destination, baddbmm's out-of-place result may
+        // alias batch1/batch2 (Muon passes the same tensor as input and
+        // batch2).  A contiguous() no-op would let the beta pre-scale mutate
+        // an operand before GEMM and corrupt every subsequent NS iteration.
+        // As with addmm above, preserve out-of-place aliasing while ensuring
+        // the destination has the dense layout expected by cuBLAS.
+        result = expand_gemm_input_cuda(input, target).clone().contiguous();
         if (beta_v != 1.0) result.mul_(beta);
     }
 

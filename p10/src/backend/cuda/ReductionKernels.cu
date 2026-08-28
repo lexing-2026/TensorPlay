@@ -229,7 +229,7 @@ template <typename InputT, typename AccT, typename OutputT, typename Ops,
 Tensor run_reduction_typed(
         const Tensor& input, const ReductionSpec& spec, bool keepdim,
         DType output_dtype, Ops ops, AccT identity) {
-    static_assert(reduction::kReductionEngineRevision == 2);
+    static_assert(reduction::kReductionEngineRevision == 4);
     Tensor result = Tensor::empty(
         reduction_output_shape(input, spec, keepdim), output_dtype, input.device());
     if (input.numel() == 0 || result.numel() == 0) return result;

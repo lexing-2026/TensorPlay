@@ -1,6 +1,7 @@
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "Exception.h"
+#include "TypePromotion.h"
 #include "Utils.h"
 #include <vector>
 #include <numeric>
@@ -107,12 +108,52 @@ bool is_complex_cpu(const Tensor& self) {
 
 } // namespace
 
+// Torch parity helpers (WrapDimUtils.h maybe_wrap_dims_n / IntArrayRef print).
+namespace join_detail {
+
+std::string fmt_sizes(const std::vector<int64_t>& sizes) {
+    std::string r = "[";
+    for (size_t i = 0; i < sizes.size(); ++i) {
+        if (i) r += ", ";
+        r += std::to_string(sizes[i]);
+    }
+    r += "]";
+    return r;
+}
+
+int64_t wrap_dim(int64_t dim, int64_t ndim) {
+    const int64_t min = -ndim;
+    const int64_t max = ndim - 1;
+    if (dim < min || dim > max) {
+        TP_THROW(IndexError, "Dimension out of range (expected to be in range of [",
+                 min, ", ", max, "], but got ", dim, ")");
+    }
+    return dim < 0 ? dim + ndim : dim;
+}
+
+// c10::maybe_wrap_dim defaults to wrap_scalar=true: rank-0 tensors accept
+// dims [-1, 0] (both wrap to 0).
+int64_t wrap_dim_scalar(int64_t dim, int64_t ndim) {
+    return wrap_dim(dim, ndim == 0 ? 1 : ndim);
+}
+
+// TensorShape.h cat_should_skip_tensor: size-[0] 1-d tensors are skipped for
+// wrap-dim / shape-check purposes (backwards compatibility).
+bool should_skip(const Tensor& t) {
+    return t.numel() == 0 && t.dim() == 1;
+}
+
+} // namespace join_detail
+
 Tensor transpose_kernel(const Tensor& self, int64_t dim0, int64_t dim1) {
-    int64_t ndim = self.dim();
-    if (dim0 < 0) dim0 += ndim;
-    if (dim1 < 0) dim1 += ndim;
-    if (dim0 < 0 || dim0 >= ndim || dim1 < 0 || dim1 >= ndim) {
-        TP_THROW(IndexError, "Dimension out of range");
+    // TensorShape.cpp transpose: maybe_wrap_dim both dims (wrap_scalar=true
+    // makes transpose(0, 0) a no-op on 0-d tensors), then swap sizes/strides.
+    const int64_t ndim = self.dim();
+    dim0 = join_detail::wrap_dim_scalar(dim0, ndim);
+    dim1 = join_detail::wrap_dim_scalar(dim1, ndim);
+    if (dim0 == dim1) {
+        return self.as_strided(static_cast<std::vector<int64_t>>(self.shape()),
+                               self.strides());
     }
     std::vector<int64_t> new_sizes = static_cast<std::vector<int64_t>>(self.shape());
     std::vector<int64_t> new_strides = self.strides();
@@ -133,18 +174,21 @@ Tensor t_kernel(const Tensor& self) {
 
 
 Tensor permute_kernel(const Tensor& self, const std::vector<int64_t>& dims) {
-    int64_t ndim = self.dim();
-    if (dims.size() != (size_t)ndim) {
-        TP_THROW(RuntimeError, "permute: number of dimensions mismatch");
+    // TensorShape.cpp _permute_size_stride_estimation.
+    const int64_t ndim = self.dim();
+    if (dims.size() != static_cast<size_t>(ndim)) {
+        TP_THROW(RuntimeError,
+                 "permute(sparse_coo): number of dimensions in the tensor input ",
+                 "does not match the length of the desired ordering of dimensions ",
+                 "i.e. input.dim() = ", ndim,
+                 " is not equal to len(dims) = ", dims.size());
     }
     std::vector<int64_t> new_sizes(ndim);
     std::vector<int64_t> new_strides(ndim);
     std::vector<bool> seen(ndim, false);
     for (int64_t i = 0; i < ndim; ++i) {
-        int64_t d = dims[i];
-        if (d < 0) d += ndim;
-        if (d < 0 || d >= ndim) TP_THROW(IndexError, "permute: dimension out of range");
-        if (seen[d]) TP_THROW(RuntimeError, "permute: duplicate dimension");
+        const int64_t d = join_detail::wrap_dim_scalar(dims[i], ndim);
+        if (seen[d]) TP_THROW(RuntimeError, "permute(): duplicate dims are not allowed.");
         seen[d] = true;
         new_sizes[i] = self.size(d);
         new_strides[i] = self.stride(d);
@@ -167,13 +211,14 @@ Tensor squeeze_kernel(const Tensor& self) {
 
 
 Tensor squeeze_dim_kernel(const Tensor& self, int64_t dim) {
-    int64_t ndim = self.dim();
-    if (dim < 0) dim += ndim;
-    if (dim < 0 || dim >= ndim) {
-        TP_THROW(IndexError, "Dimension out of range");
-    }
-    if (self.size(dim) != 1) {
-        return self;
+    // TensorShape.cpp squeeze(dim): maybe_wrap_dim (wrap_scalar=true makes
+    // squeeze(0) a no-op on 0-d tensors); non-singleton dims return an
+    // equivalent view.
+    const int64_t ndim = self.dim();
+    dim = join_detail::wrap_dim_scalar(dim, ndim);
+    if (ndim == 0 || self.size(dim) != 1) {
+        return self.as_strided(static_cast<std::vector<int64_t>>(self.shape()),
+                               self.strides());
     }
     std::vector<int64_t> new_sizes;
     std::vector<int64_t> new_strides;
@@ -187,30 +232,50 @@ Tensor squeeze_dim_kernel(const Tensor& self, int64_t dim) {
 }
 
 
-Tensor unsqueeze_kernel(const Tensor& self, int64_t dim) {
-    int64_t ndim = self.dim();
-    if (dim < -(ndim + 1) || dim > ndim) {
-         TP_THROW(IndexError, "Dimension out of range");
+Tensor squeeze_dims_kernel(const Tensor& self, const std::vector<int64_t>& dims) {
+    // TensorShape.cpp squeeze(dims): dim_list_to_bitset (WrapDimUtilsMulti.h)
+    // wraps with wrap_scalar=true and rejects duplicates, then squeezes every
+    // listed size-1 dim.
+    const int64_t ndim = self.dim();
+    std::vector<bool> seen(ndim > 0 ? ndim : 1, false);
+    std::vector<bool> mask(ndim, false);
+    for (auto d : dims) {
+        const int64_t w = join_detail::wrap_dim_scalar(d, ndim);
+        if (ndim > 0) {
+            if (seen[w]) {
+                TP_THROW(RuntimeError, "dim ", w,
+                         " appears multiple times in the list of dims");
+            }
+            seen[w] = true;
+            mask[w] = true;
+        }
     }
-    if (dim < 0) dim += (ndim + 1);
-    
+    std::vector<int64_t> new_sizes;
+    std::vector<int64_t> new_strides;
+    for (int64_t i = 0; i < ndim; ++i) {
+        if (!(mask[i] && self.size(i) == 1)) {
+            new_sizes.push_back(self.size(i));
+            new_strides.push_back(self.stride(i));
+        }
+    }
+    return self.as_strided(new_sizes, new_strides);
+}
+
+
+Tensor unsqueeze_kernel(const Tensor& self, int64_t dim) {
+    // TensorShape.cpp unsqueeze + inferUnsqueezeGeometry: the inserted dim
+    // stride is size(dim)*stride(dim) (1 when appended at the end).
+    const int64_t ndim = self.dim();
+    dim = join_detail::wrap_dim(dim, ndim + 1);
+
     std::vector<int64_t> new_sizes = static_cast<std::vector<int64_t>>(self.shape());
     std::vector<int64_t> new_strides = self.strides();
-    
+
+    const int64_t new_stride =
+        (dim == ndim) ? 1 : self.size(dim) * self.stride(dim);
     new_sizes.insert(new_sizes.begin() + dim, 1);
-    // Use stride of next dimension or 1
-    int64_t stride = 1;
-    // For unsqueeze, the stride of the new dimension (size 1) doesn't strictly matter for addressing,
-    // but using the stride of the next dimension (or 1 if last) is conventional.
-    if (dim < ndim) {
-        stride = new_strides[dim]; // Note: new_strides already has size ndim, but we inserted into new_sizes.
-                                   // new_strides is still size ndim here. 'dim' index refers to old stride at that pos.
-                                   // Wait, new_strides is not inserted yet.
-                                   // So self.stride(dim) corresponds to the dimension AFTER the inserted one (in the new tensor).
-    }
-    // Actually simpler:
-    new_strides.insert(new_strides.begin() + dim, stride);
-    
+    new_strides.insert(new_strides.begin() + dim, new_stride);
+
     return self.as_strided(new_sizes, new_strides);
 }
 
@@ -218,60 +283,104 @@ Tensor unsqueeze_kernel(const Tensor& self, int64_t dim) {
 // --- Joining Ops ---
 
 Tensor cat_kernel(const std::vector<Tensor>& tensors, int64_t dim) {
-    if (tensors.empty()) {
-        TP_THROW(RuntimeError, "cat(): expected a non-empty list of tensors");
-    }
-    
-    const Tensor& t0 = tensors[0];
-    int64_t ndim = t0.dim();
-    if (dim < 0) dim += ndim;
-    if (dim < 0 || dim >= ndim) TP_THROW(IndexError, "cat(): dimension out of range");
-    
-    // Validate shapes and dtype
-    int64_t cat_dim_size = 0;
-    for (const auto& t : tensors) {
-        if (t.dim() != ndim) TP_THROW(RuntimeError, "cat(): all tensors must have same number of dimensions");
-        if (t.dtype() != t0.dtype()) TP_THROW(TypeError, "cat(): all tensors must have same dtype (type promotion not impl)");
-        
-        for (int64_t i = 0; i < ndim; ++i) {
-            if (i != dim && t.size(i) != t0.size(i)) {
-                TP_THROW(RuntimeError, "cat(): Sizes of tensors must match except in dimension " + std::to_string(dim));
-            }
+    // Torch order (TensorShape.cpp cat precompute meta):
+    // check_cat_no_zero_dim -> legacy_cat_wrap_dim -> non-empty check ->
+    // first-valid-tensor selection -> shape checks -> result_type promotion.
+    for (size_t i = 0; i < tensors.size(); ++i) {
+        if (tensors[i].dim() == 0) {
+            TP_THROW(RuntimeError, "zero-dimensional tensor (at position ", i,
+                     ") cannot be concatenated");
         }
-        cat_dim_size += t.size(dim);
     }
-    
-    std::vector<int64_t> out_shape = static_cast<std::vector<int64_t>>(t0.shape());
-    out_shape[dim] = cat_dim_size;
-    
-    Tensor out = Tensor::empty(out_shape, t0.dtype(), t0.device());
-    
-    // Copy data
+    // legacy_cat_wrap_dim: wrap against the first non-skipped tensor.
+    for (const auto& t : tensors) {
+        if (!join_detail::should_skip(t)) {
+            dim = join_detail::wrap_dim(dim, t.dim());
+            break;
+        }
+    }
+    if (tensors.empty()) {
+        TP_THROW(ValueError, "torch.cat(): expected a non-empty list of Tensors");
+    }
+
+    DType out_dtype = tensors[0].dtype();
+    for (size_t i = 1; i < tensors.size(); ++i) {
+        out_dtype = promoteTypes(out_dtype, tensors[i].dtype());
+    }
+
+    int64_t valid = -1;
+    for (size_t i = 0; i < tensors.size(); ++i) {
+        if (!join_detail::should_skip(tensors[i])) { valid = static_cast<int64_t>(i); break; }
+    }
+
+    std::vector<int64_t> out_shape{0};
+    if (valid >= 0) {
+        const Tensor& first = tensors[valid];
+        if (dim > first.dim()) {
+            TP_THROW(IndexError, "torch.cat(): dimension ", dim, " out of range");
+        }
+        int64_t size_at_dim = 0;
+        for (size_t i = 0; i < tensors.size(); ++i) {
+            const Tensor& t = tensors[i];
+            if (join_detail::should_skip(t)) continue;
+            // check_cat_shape_except_dim
+            if (t.dim() != first.dim()) {
+                TP_THROW(RuntimeError, "Tensors must have same number of dimensions: got ",
+                         first.dim(), " and ", t.dim());
+            }
+            for (int64_t d = 0; d < first.dim(); ++d) {
+                if (d == dim) continue;
+                if (t.size(d) != first.size(d)) {
+                    TP_THROW(RuntimeError, "Sizes of tensors must match except in dimension ",
+                             dim, ". Expected size ", first.size(d), " but got size ",
+                             t.size(d), " for tensor number ", i, " in the list.");
+                }
+            }
+            size_at_dim += t.size(dim);
+        }
+        out_shape = static_cast<std::vector<int64_t>>(first.shape());
+        out_shape[dim] = size_at_dim;
+    }
+
+    Tensor out = Tensor::empty(out_shape, out_dtype, tensors[0].device());
+
     int64_t offset = 0;
     for (const auto& t : tensors) {
-        int64_t size = t.size(dim);
+        if (join_detail::should_skip(t)) continue;
+        const int64_t size = t.size(dim);
         if (size > 0) {
             Tensor out_slice = out.slice(dim, offset, offset + size);
             out_slice.copy_(t);
             offset += size;
         }
     }
-    
     return out;
 }
 
 
 Tensor stack_kernel(const std::vector<Tensor>& tensors, int64_t dim) {
+    // Torch stack (TensorShape.cpp): non-empty check, maybe_wrap_dim(dim, ndim+1),
+    // check_stack_inputs, then cat of unsqueezed inputs (dtype promotion
+    // happens inside cat, mirroring at::_stack's result_type).
     if (tensors.empty()) {
-        TP_THROW(RuntimeError, "stack(): expected a non-empty list of tensors");
+        TP_THROW(RuntimeError, "stack expects a non-empty TensorList");
     }
-    int64_t ndim = tensors[0].dim();
-    if (dim < 0) dim += (ndim + 1);
-    if (dim < 0 || dim > ndim) TP_THROW(IndexError, "stack(): dimension out of range");
-    
+    const int64_t ndim = tensors[0].dim();
+    dim = join_detail::wrap_dim(dim, ndim + 1);
+
+    const std::vector<int64_t> entry_shape = static_cast<std::vector<int64_t>>(tensors[0].shape());
+    for (size_t i = 1; i < tensors.size(); ++i) {
+        const std::vector<int64_t> sh = static_cast<std::vector<int64_t>>(tensors[i].shape());
+        if (sh != entry_shape) {
+            TP_THROW(RuntimeError, "stack expects each tensor to be equal size, but got ",
+                     join_detail::fmt_sizes(entry_shape), " at entry 0 and ",
+                     join_detail::fmt_sizes(sh), " at entry ", i);
+        }
+    }
+
     std::vector<Tensor> unsqueezed;
     unsqueezed.reserve(tensors.size());
-    for(const auto& t : tensors) {
+    for (const auto& t : tensors) {
         unsqueezed.push_back(t.unsqueeze(dim));
     }
     return cat_kernel(unsqueezed, dim);
@@ -281,54 +390,81 @@ Tensor stack_kernel(const std::vector<Tensor>& tensors, int64_t dim) {
 // --- Splitting Ops ---
 
 std::vector<Tensor> split_kernel(const Tensor& self, int64_t split_size, int64_t dim) {
-    int64_t ndim = self.dim();
-    if (dim < 0) dim += ndim;
-    if (dim < 0 || dim >= ndim) TP_THROW(IndexError, "split(): dimension out of range");
-    
-    if (split_size <= 0) TP_THROW(RuntimeError, "split(): split_size must be positive");
-    
-    int64_t dim_size = self.size(dim);
+    // Torch get_num_splits + split (TensorShape.h/.cpp).
+    if (self.dim() == 0) {
+        TP_THROW(RuntimeError, "split expects at least a 1-dimensional tensor");
+    }
+    if (split_size < 0) {
+        TP_THROW(RuntimeError, "split expects split_size be non-negative, but got split_size=",
+                 split_size);
+    }
+    dim = join_detail::wrap_dim(dim, self.dim());
+    const int64_t dim_size = self.size(dim);
+    if (!(split_size > 0 || dim_size == 0)) {
+        TP_THROW(RuntimeError, "split_size can only be 0 if dimension size is 0, "
+                 "but got dimension size of ", dim_size);
+    }
+    // split_size == 0 && dim_size == 0 yields exactly one empty split.
+    int64_t num_splits = 1;
+    if (split_size != 0) {
+        num_splits = std::max<int64_t>((dim_size + split_size - 1) / split_size, 1);
+    }
+    const int64_t last_split_size = split_size - (split_size * num_splits - dim_size);
     std::vector<Tensor> result;
-    for (int64_t i = 0; i < dim_size; i += split_size) {
-        int64_t end = std::min(i + split_size, dim_size);
-        result.push_back(self.slice(dim, i, end));
+    result.reserve(num_splits);
+    for (int64_t i = 0; i < num_splits; ++i) {
+        const int64_t length = i < num_splits - 1 ? split_size : last_split_size;
+        result.push_back(self.slice(dim, i * split_size, i * split_size + length));
     }
     return result;
 }
 
 
 std::vector<Tensor> split_sizes_kernel(const Tensor& self, const std::vector<int64_t>& split_sizes, int64_t dim) {
-    int64_t ndim = self.dim();
-    if (dim < 0) dim += ndim;
-    if (dim < 0 || dim >= ndim) TP_THROW(IndexError, "split(): dimension out of range");
-    
-    int64_t dim_size = self.size(dim);
-    int64_t sum_sizes = 0;
-    for (auto s : split_sizes) sum_sizes += s;
-    if (sum_sizes != dim_size) {
-        TP_THROW(RuntimeError, "split(): sum of split_sizes must equal dimension size");
+    // Torch split_with_sizes (TensorShape.cpp).
+    if (self.dim() == 0) {
+        TP_THROW(RuntimeError, "split expects at least a 1-dimensional tensor");
     }
-    
+    dim = join_detail::wrap_dim(dim, self.dim());
+    const int64_t dim_size = self.size(dim);
+
     std::vector<Tensor> result;
-    int64_t offset = 0;
-    for (auto s : split_sizes) {
-        result.push_back(self.slice(dim, offset, offset + s));
-        offset += s;
+    result.reserve(split_sizes.size());
+    int64_t start_idx = 0;
+    for (const auto length : split_sizes) {
+        if (length < 0) {
+            TP_THROW(RuntimeError, "split_with_sizes expects split_sizes have only non-negative "
+                     "entries, but got split_sizes=", join_detail::fmt_sizes(split_sizes));
+        }
+        result.push_back(self.slice(dim, start_idx, start_idx + length));
+        start_idx += length;
+    }
+    if (start_idx != dim_size) {
+        TP_THROW(RuntimeError, "split_with_sizes expects split_sizes to sum exactly to ",
+                 dim_size, " (input tensor's size at dimension ", dim,
+                 "), but got split_sizes=", join_detail::fmt_sizes(split_sizes));
     }
     return result;
 }
 
 
 std::vector<Tensor> chunk_kernel(const Tensor& self, int64_t chunks, int64_t dim) {
-    int64_t ndim = self.dim();
-    if (dim < 0) dim += ndim;
-    if (dim < 0 || dim >= ndim) TP_THROW(IndexError, "chunk(): dimension out of range");
-    
-    if (chunks <= 0) TP_THROW(RuntimeError, "chunk(): chunks must be positive");
-    
-    int64_t dim_size = self.size(dim);
-    int64_t split_size = (dim_size + chunks - 1) / chunks;
-    
+    // Torch chunk (TensorShape.cpp): the split_size==0 && dim_size==0 case must
+    // still produce `chunks` empty chunks, so it routes through split_with_sizes.
+    if (self.dim() == 0) {
+        TP_THROW(RuntimeError, "chunk expects at least a 1-dimensional tensor");
+    }
+    if (chunks <= 0) {
+        TP_THROW(RuntimeError, "chunk expects `chunks` to be greater than 0, got: ", chunks);
+    }
+    dim = join_detail::wrap_dim(dim, self.dim());
+    const int64_t dim_size = self.size(dim);
+    const int64_t split_size = (dim_size + chunks - 1) / chunks;
+    if (split_size == 0 && dim_size == 0) {
+        std::vector<int64_t> split_sizes(static_cast<size_t>(chunks), 0);
+        split_sizes[static_cast<size_t>(chunks - 1)] = split_size - (split_size * chunks - dim_size);
+        return split_sizes_kernel(self, split_sizes, dim);
+    }
     return split_kernel(self, split_size, dim);
 }
 
@@ -356,8 +492,17 @@ Tensor reshape_kernel(const Tensor& self, const std::vector<int64_t>& shape) {
 
 
 std::vector<Tensor> unbind_kernel(const Tensor& self, int64_t dim) {
-    int64_t d = dim < 0 ? dim + self.dim() : dim;
-    if (d < 0 || d >= self.dim()) TP_THROW(IndexError, "Dimension out of range");
+    // Torch unbind (TensorShape.cpp): maybe_wrap_dim(dim, self.dim()) with
+    // scalar wrapping, then size() raises the no-dimensions error for 0-d.
+    const int64_t ndim = self.dim();
+    int64_t d;
+    if (ndim == 0) {
+        if (dim < -1 || dim > 0) {
+            TP_THROW(IndexError, "Dimension out of range (expected to be in range of [-1, 0], but got ", dim, ")");
+        }
+        TP_THROW(IndexError, "Dimension specified as ", 0, " but tensor has no dimensions");
+    }
+    d = join_detail::wrap_dim(dim, ndim);
     std::vector<Tensor> result;
     int64_t size_dim = self.size(d);
     result.reserve(size_dim);
@@ -385,14 +530,17 @@ Tensor squeeze_backward_kernel(const Tensor& grad, const Tensor& self) {
 
 // ATen semantics: remove dim1/dim2 and append the diagonal axis at the end.
 Tensor diagonal_kernel(const Tensor& self, int64_t offset, int64_t dim1, int64_t dim2) {
+    // TensorShape.cpp diagonal: wrap first (so 0/1-d inputs raise the
+    // maybe_wrap_dim IndexError), then reject identical dims reporting the
+    // original arguments.
     const int64_t ndim = self.dim();
-    if (ndim < 2) TP_THROW(RuntimeError, "diagonal(): input must be at least 2-dimensional");
-    if (dim1 < 0) dim1 += ndim;
-    if (dim2 < 0) dim2 += ndim;
-    if (dim1 < 0 || dim1 >= ndim || dim2 < 0 || dim2 >= ndim) {
-        TP_THROW(IndexError, "Dimension out of range");
+    const int64_t dim1_ = dim1, dim2_ = dim2;
+    dim1 = join_detail::wrap_dim_scalar(dim1, ndim);
+    dim2 = join_detail::wrap_dim_scalar(dim2, ndim);
+    if (dim1 == dim2) {
+        TP_THROW(RuntimeError, "diagonal dimensions cannot be identical ",
+                 dim1_, ", ", dim2_);
     }
-    if (dim1 == dim2) TP_THROW(RuntimeError, "diagonal(): dim1 and dim2 cannot be equal");
 
     const int64_t size1 = self.size(dim1);
     const int64_t size2 = self.size(dim2);
@@ -414,10 +562,17 @@ Tensor diagonal_kernel(const Tensor& self, int64_t offset, int64_t dim1, int64_t
     int64_t new_offset = static_cast<int64_t>(self.unsafeGetTensorImpl()->storage_offset());
     if (offset >= 0) {
         diag_size = std::max<int64_t>(std::min(size1, size2 - offset), 0);
-        new_offset += offset * stride2;
     } else {
         diag_size = std::max<int64_t>(std::min(size1 + offset, size2), 0);
-        new_offset -= offset * stride1;
+    }
+    // NumPy allows offsets "off the end"; don't set a ridiculous storage
+    // offset when the diagonal is empty (upstream comment).
+    if (diag_size != 0) {
+        if (offset >= 0) {
+            new_offset += offset * stride2;
+        } else {
+            new_offset -= offset * stride1;
+        }
     }
     sizes.push_back(diag_size);
     strides.push_back(stride1 + stride2);
@@ -437,32 +592,38 @@ Tensor diagonal_backward_kernel(const Tensor& grad, const std::vector<int64_t>& 
 
 Tensor movedim_kernel(const Tensor& self, const std::vector<int64_t>& source,
                       const std::vector<int64_t>& destination) {
+    // TensorShape.cpp movedim.
     const int64_t ndim = self.dim();
     if (source.size() != destination.size()) {
-        TP_THROW(RuntimeError, "movedim: Source and destination dims must have same number of elements");
+        TP_THROW(RuntimeError, "movedim: Invalid source or destination dims: source (",
+                 join_detail::fmt_sizes(source),
+                 " dims) should contain the same number of dims as destination (",
+                 join_detail::fmt_sizes(destination), " dims)");
     }
     std::vector<int64_t> src(source), dst(destination);
+    for (auto& d : src) d = join_detail::wrap_dim_scalar(d, ndim);
+    for (auto& d : dst) d = join_detail::wrap_dim_scalar(d, ndim);
+    auto all_unique = [](std::vector<int64_t> dims) {
+        std::sort(dims.begin(), dims.end());
+        return std::adjacent_find(dims.begin(), dims.end()) == dims.end();
+    };
+    if (!all_unique(src)) {
+        TP_THROW(RuntimeError, "movedim: repeated dim in `source` (",
+                 join_detail::fmt_sizes(source), ")");
+    }
+    if (!all_unique(dst)) {
+        TP_THROW(RuntimeError, "movedim: repeated dim in `destination` (",
+                 join_detail::fmt_sizes(destination), ")");
+    }
+    // handle the case of scalar tensor as a no-op
+    if (ndim == 0) {
+        return self.as_strided(static_cast<std::vector<int64_t>>(self.shape()),
+                               self.strides());
+    }
+
     std::vector<bool> src_seen(ndim, false), dst_seen(ndim, false);
-    for (auto& d : src) {
-        const int64_t orig = d;
-        if (d < 0) d += ndim;
-        if (d < 0 || d >= ndim) {
-            TP_THROW(IndexError, "movedim: Tried to move to index ", orig,
-                     ", but the tensor has ", ndim, " dimensions");
-        }
-        if (src_seen[d]) TP_THROW(RuntimeError, "movedim: repeated source dimension");
-        src_seen[d] = true;
-    }
-    for (auto& d : dst) {
-        const int64_t orig = d;
-        if (d < 0) d += ndim;
-        if (d < 0 || d >= ndim) {
-            TP_THROW(IndexError, "movedim: Tried to move to index ", orig,
-                     ", but the tensor has ", ndim, " dimensions");
-        }
-        if (dst_seen[d]) TP_THROW(RuntimeError, "movedim: repeated destination dimension");
-        dst_seen[d] = true;
-    }
+    for (const int64_t d : src) src_seen[d] = true;
+    for (const int64_t d : dst) dst_seen[d] = true;
 
     // Destination slots take the moved dimensions in order; every other slot
     // keeps its original dimension, preserving ascending input order.
@@ -546,6 +707,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, ViewKernels) {
     m.impl("squeeze", squeeze_kernel);
     m.impl("squeeze_backward", squeeze_backward_kernel);
     m.impl("squeeze.dim", squeeze_dim_kernel);
+    m.impl("squeeze.dims", squeeze_dims_kernel);
     m.impl("unsqueeze", unsqueeze_kernel);
     m.impl("clone", clone_kernel);
     m.impl("slice", slice_kernel);

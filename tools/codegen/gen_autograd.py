@@ -105,6 +105,12 @@ class Braced(Expr):
     items: tuple[Expr, ...]
 
 @dataclass(frozen=True)
+class Paren(Expr):
+    """Parenthesized subexpression; keeps the author's grouping so re-emitted
+    formulas do not lose precedence (e.g. `1.0 / (1.0 - p)`)."""
+    value: Expr
+
+@dataclass(frozen=True)
 class Neg(Expr):
     value: Expr
 
@@ -232,7 +238,7 @@ class ExprParser:
         if val == "(":
             e = self.parse_add()
             self.expect(")")
-            return e
+            return Paren(e)
         if val == "{":
             items = []
             if self.peek()[1] != "}":
@@ -309,6 +315,8 @@ class Emitter:
 
     # -- static tensor-ness analysis ----------------------------------------
     def _is_tensor(self, e: Expr) -> bool:
+        if isinstance(e, Paren):
+            return self._is_tensor(e.value)
         if isinstance(e, Var):
             return e.name in self.tensor_syms
         if isinstance(e, Neg):
@@ -326,6 +334,8 @@ class Emitter:
         return False
 
     def _looks_tensor(self, e: Expr) -> bool:
+        if isinstance(e, Paren):
+            return self._looks_tensor(e.value)
         if self._is_tensor(e):
             return True
         if isinstance(e, BinOp):
@@ -353,6 +363,8 @@ class Emitter:
             return f"-{inner}"
         if isinstance(e, Braced):
             return "{" + ", ".join(self.emit(a) for a in e.items) + "}"
+        if isinstance(e, Paren):
+            return f"({self.emit(e.value)})"
         if isinstance(e, Call):
             args = ", ".join(self.emit(a) for a in e.args)
             leaf = e.callee.split("::")[-1].split("<")[0]
@@ -402,6 +414,8 @@ def _iter_call_nodes(expr: Expr):
             yield e
         if isinstance(e, Neg):
             stack.append(e.value)
+        elif isinstance(e, Paren):
+            stack.append(e.value)
         elif isinstance(e, Braced):
             stack.extend(e.items)
         elif isinstance(e, Call):
@@ -418,6 +432,8 @@ def collect_vars(expr: Expr, out: set[str]) -> None:
     if isinstance(expr, Var):
         out.add(expr.name)
     elif isinstance(expr, Neg):
+        collect_vars(expr.value, out)
+    elif isinstance(expr, Paren):
         collect_vars(expr.value, out)
     elif isinstance(expr, Call):
         for a in expr.args:
@@ -461,6 +477,26 @@ MANUAL_DERIVATIVES: dict[str, dict] = {
     # Dim-dependent case split (dot / vec@mat / mat@vec / batched); the node
     # composes recordable primitives so double-backward through `@` records.
     "matmul": {"saved": ["self", "other"]},
+    # List-gradient alignment: apply() pads the index slots so outputs line
+    # up with the per-element edges collected for the Tensor[] indices.
+    "index_put": {"saved": ["indices", "values", "accumulate"]},
+    "index_put_": {"saved": ["indices", "values", "accumulate"]},
+    # Two differentiable outputs: the node reads grads[0]/grads[1].
+    "aminmax": {"saved": ["self", "dim", "keepdim"]},
+    "std_mean": {"saved": ["self", "dim", "unbiased", "keepdim"]},
+    "var_mean": {"saved": ["self", "dim", "unbiased", "keepdim"]},
+    # RNN layer backwards: replay-based native nodes (RNNBackward.h); grads
+    # flow to input, every hx element and every parameter in schema order.
+    "lstm": {"saved": ["input", "hx", "params", "has_biases", "num_layers",
+                       "dropout_p", "training", "bidirectional", "batch_first"]},
+    "gru": {"saved": ["input", "hx", "params", "has_biases", "num_layers",
+                      "dropout_p", "training", "bidirectional", "batch_first"]},
+    "rnn_tanh": {"saved": ["input", "hx", "params", "has_biases", "num_layers",
+                           "dropout_p", "training", "bidirectional",
+                           "batch_first"]},
+    "rnn_relu": {"saved": ["input", "hx", "params", "has_biases", "num_layers",
+                           "dropout_p", "training", "bidirectional",
+                           "batch_first"]},
 }
 
 # Ops whose backward node is provided hand-written elsewhere; skip emitting a

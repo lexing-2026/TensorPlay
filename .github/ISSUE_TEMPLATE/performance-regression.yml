@@ -1,0 +1,56 @@
+name: Performance regression
+description: Something got slower than it used to be.
+title: "[PERF] "
+labels: ["performance", "regression", "needs triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Performance reports need measured numbers with hardware, shapes and
+        methodology (e.g. "min-of-200, RTX 4090 D"), the same convention used
+        in CHANGELOG.md. Reports without numbers will be closed.
+  - type: textarea
+    id: version
+    attributes:
+      label: Versions compared
+      description: |
+        Good version and bad version, e.g. `v1.0.0` vs `1.0.0.dev20260828+cu124`,
+        plus the output of:
+        ```bash
+        python -c "import tensorplay; print(tensorplay.__version__)"
+        ```
+    validations:
+      required: true
+  - type: input
+    id: hardware
+    attributes:
+      label: Hardware
+      placeholder: "RTX 4090 D / Intel i7-12700"
+    validations:
+      required: true
+  - type: textarea
+    id: workload
+    attributes:
+      label: Workload
+      description: Operation(s), shapes, dtypes, CPU or CUDA.
+    validations:
+      required: true
+  - type: textarea
+    id: numbers
+    attributes:
+      label: Measured numbers
+      description: Include methodology (min/median-of-N, warmup count).
+      placeholder: |
+        | version | latency | methodology |
+        | ------- | ------- | ----------- |
+        | v1.0.0  | 42 us   | min-of-200  |
+        | main    | 61 us   | min-of-200  |
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction / benchmark script
+      render: python
+    validations:
+      required: true

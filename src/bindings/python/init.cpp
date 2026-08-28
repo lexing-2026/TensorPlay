@@ -14,27 +14,45 @@ namespace tensorplay {
 namespace python {
 
 // with_stack hook: called from every generated METH_FASTCALL entry while the
-// GIL is held, before its GIL-releasing invoke.  Extracts the caller's
-// frame (C functions add no frames, so the current frame IS user code) and
-// hands plain bytes to the profiler; the next OpRecord on this thread adopts
-// it and clears the slot, so composite inner ops record no site.
+// GIL is held, before its GIL-releasing invoke.  Extracts the caller's full
+// Python frame chain (C functions add no frames, so the chain starts at user
+// code) and hands plain bytes to the profiler; the next OpRecord on this
+// thread adopts it and clears the slot, so composite inner ops record no
+// stack instead of inheriting the outermost call's.
 void tpx_prof_capture_site() {
     if (!tensorplay::prof::g_active.load(std::memory_order_acquire)) return;
     if (!tensorplay::prof::g_capture_sites.load(std::memory_order_acquire)) {
         return;
     }
-    PyFrameObject* frame = PyEval_GetFrame();
+    PyFrameObject* frame = PyEval_GetFrame();  // borrowed
     if (frame == nullptr) return;
-    PyCodeObject* code = PyFrame_GetCode(frame);
+    std::vector<tensorplay::prof::ProfFrame> frames;
+    frames.reserve(8);
+    PyFrameObject* owned = nullptr;  // frame refs from PyFrame_GetBack
+    int depth = 0;
+    while (frame != nullptr && depth < 64) {
+        PyCodeObject* code = PyFrame_GetCode(frame);  // new reference
 #if PY_VERSION_HEX >= 0x030D0000
-    const char* file = PyCode_GetFilename(code);   // borrowed (3.13+)
+        const char* file = PyCode_GetFilename(code);   // borrowed (3.13+)
 #else
-    // pre-3.13: co_filename is a directly accessible member
-    const char* file = PyUnicode_AsUTF8(code->co_filename);
+        // pre-3.13: co_filename is a directly accessible member
+        const char* file = PyUnicode_AsUTF8(code->co_filename);
 #endif
-    const int line = PyFrame_GetLineNumber(frame);
-    tensorplay::prof::set_python_site(file ? file : "<unknown>", line);
-    Py_DECREF(code);
+        // co_name stays an immediate PyCodeObject member through 3.13
+        const char* func = PyUnicode_AsUTF8(code->co_name);
+        const int line = PyFrame_GetLineNumber(frame);
+        frames.push_back({file ? file : "<unknown>",
+                          func ? func : "<module>", line});
+        Py_DECREF(code);
+        PyFrameObject* next = PyFrame_GetBack(frame);  // new reference
+        Py_XDECREF(owned);
+        owned = next;
+        frame = next;
+        ++depth;
+    }
+    Py_XDECREF(owned);
+    if (frames.empty()) return;
+    tensorplay::prof::set_python_stack(std::move(frames));
 }
 
 } // namespace python
@@ -439,6 +457,12 @@ PYBIND11_MODULE(_C, m) {
     m.def("_set_cudnn_allow_tf32", [](bool enabled) {
         tensorplay::globalContext().setAllowTF32CuDNN(enabled);
     }, "enabled"_a);
+    m.def("_get_cudnn_benchmark", []() {
+        return tensorplay::globalContext().cudnnBenchmark();
+    });
+    m.def("_set_cudnn_benchmark", [](bool enabled) {
+        tensorplay::globalContext().setCudnnBenchmark(enabled);
+    }, "enabled"_a);
 
     m.def("set_printoptions", &tensorplay::set_printoptions, 
           "Set print options", 
@@ -452,15 +476,34 @@ PYBIND11_MODULE(_C, m) {
     m.def("is_mkldnn_enabled", &tensorplay::OneDNNContext::is_enabled);
     m.def("set_mkldnn_enabled", &tensorplay::OneDNNContext::set_enabled);
 
-    // ---- Native profiler (torch.profiler subset; see p10/include/Profiler.h)
+    // ---- Native profiler (torch.profiler counterpart; see p10/include/Profiler.h)
     using tensorplay::prof::Event;
     m.def("_profiler_start", [](bool capture_shapes, bool with_stack,
-                                bool gpu_timing) {
+                                bool gpu_timing, bool gpu_trace,
+                                bool mem_capture) {
         // This is a session option, not a process-global sticky mode.  In
         // particular, a later CPU profile must not arm CUDA events for CPU
         // redispatches after a timed CUDA profile has finished.
         tensorplay::prof::g_gpu_timing.store(
             gpu_timing, std::memory_order_release);
+        tensorplay::prof::g_mem_capture.store(
+            mem_capture, std::memory_order_release);
+        if (gpu_trace) {
+            // Arm CUPTI before the first op so no kernel is missed; flag is
+            // stored first because GpuTimerPair::arm consults it from the
+            // very first redispatch of the session.
+            tensorplay::prof::g_gpu_trace.store(true,
+                                                std::memory_order_release);
+            if (!tensorplay::prof::cupti_start()) {
+                tensorplay::prof::g_gpu_trace.store(
+                    false, std::memory_order_release);
+                const std::string reason =
+                    tensorplay::prof::cupti_last_error();
+                PyErr_WarnEx(PyExc_RuntimeWarning,
+                             ("gpu_trace unavailable: " + reason).c_str(),
+                             1);
+            }
+        }
         if (with_stack) {
             tensorplay::prof::profiler_start_full();
         } else if (capture_shapes) {
@@ -469,9 +512,16 @@ PYBIND11_MODULE(_C, m) {
             tensorplay::prof::profiler_start();
         }
     }, "capture_shapes"_a = false, "with_stack"_a = false,
-       "gpu_timing"_a = false);
-    // Returns (name, kind, start_ns, end_ns, tid, shapes|None, dtypes|None,
-    // site_str|None, gpu_ms, out_bytes) tuples ordered by start.
+       "gpu_timing"_a = false, "gpu_trace"_a = false,
+       "mem_capture"_a = false);
+    // Returns (op_events, gpu_activities, mem_events).
+    //   op_events: (name, kind, start_ns, end_ns, tid, shapes|None,
+    //     dtypes|None, site_str|None, gpu_ms, out_bytes, stack|None,
+    //     kernel_count) tuples ordered by start.
+    //   gpu_activities: (name, kind, start_ns, end_ns, device, stream,
+    //     correlation, external_id, tid, cbid, bytes, copy_kind, value).
+    //   mem_events: (ts_ns, ptr, bytes, is_alloc, is_cuda, device, stream,
+    //     tid).
     m.def("_profiler_stop", []() {
         py::gil_scoped_release release;
         std::vector<Event> events = tensorplay::prof::profiler_stop();
@@ -482,8 +532,32 @@ PYBIND11_MODULE(_C, m) {
             events, [](Event&, float) {});
         tensorplay::prof::g_gpu_timing.store(false,
                                              std::memory_order_release);
+        const bool trace_on =
+            tensorplay::prof::g_gpu_trace.exchange(false,
+                std::memory_order_acq_rel);
+        std::vector<tensorplay::prof::GpuActivity> gpu_acts;
+        if (trace_on) {
+            tensorplay::prof::cupti_stop_and_collect(gpu_acts);
+            // Correlate GPU activity back to the op that launched it via
+            // the external-correlation id (the OpRecord slot).
+            for (auto& a : gpu_acts) {
+                if (a.kind == 'r' || a.kind == 'd') continue;
+                if (a.external_id == tensorplay::prof::GpuActivity::kNoExt ||
+                    a.external_id >= events.size()) {
+                    continue;
+                }
+                auto& op = events[a.external_id];
+                const double ms =
+                    static_cast<double>(a.end_ns - a.start_ns) / 1e6;
+                op.gpu_ms = (op.gpu_ms < 0.f ? 0.f : op.gpu_ms) +
+                            static_cast<float>(ms);
+                op.kernel_count += 1;
+            }
+        }
+        std::vector<tensorplay::prof::MemEvent> mem_events =
+            tensorplay::prof::mem_take();
         py::gil_scoped_acquire acquire;
-        py::list out;
+        py::list out_ops;
         for (const auto& e : events) {
             py::object shapes = py::none();
             if (e.shapes) {
@@ -499,12 +573,36 @@ PYBIND11_MODULE(_C, m) {
             if (e.site_id != Event::kNoSite) {
                 site = py::str(tensorplay::prof::site_string(e.site_id));
             }
-            out.append(py::make_tuple(
+            py::object stack = py::none();
+            if (e.stack_id != Event::kNoSite) {
+                py::list fr;
+                for (const auto& f : tensorplay::prof::stack_frames(e.stack_id)) {
+                    fr.append(f.file + ":" + std::to_string(f.line) +
+                              " (" + f.func + ")");
+                }
+                stack = std::move(fr);
+            }
+            out_ops.append(py::make_tuple(
                 std::string(e.name), char(e.kind), e.start_ns, e.end_ns,
                 e.tid, std::move(shapes), std::move(dtypes),
-                std::move(site), e.gpu_ms, e.out_bytes));
+                std::move(site), e.gpu_ms, e.out_bytes,
+                std::move(stack), e.kernel_count));
         }
-        return out;
+        py::list out_gpu;
+        for (const auto& a : gpu_acts) {
+            out_gpu.append(py::make_tuple(
+                std::string(a.name), char(a.kind), a.start_ns, a.end_ns,
+                a.device, a.stream, a.correlation, a.external_id,
+                a.thread_id, a.cbid, a.bytes, a.copy_kind, a.value));
+        }
+        py::list out_mem;
+        for (const auto& e : mem_events) {
+            out_mem.append(py::make_tuple(
+                e.ts_ns, reinterpret_cast<uintptr_t>(e.ptr), e.bytes,
+                e.alloc, e.cuda, e.device, e.stream, e.tid));
+        }
+        return py::make_tuple(std::move(out_ops), std::move(out_gpu),
+                              std::move(out_mem));
     });
     m.def("_profiler_user_begin", [](const std::string& name) {
         // Capture the caller's frame while we still hold the GIL; the span
@@ -523,7 +621,11 @@ PYBIND11_MODULE(_C, m) {
         tensorplay::prof::g_emit_itt.store(on,
                                            std::memory_order_release);
     });
-    
+    // CUPTI library version for trace-export schema metadata (0 = n/a).
+    m.def("_profiler_cupti_version", []() {
+        return static_cast<int64_t>(tensorplay::prof::cupti_version());
+    });
+
     m.def("has_mkl", []() {
 #ifdef USE_MKL
         return true;

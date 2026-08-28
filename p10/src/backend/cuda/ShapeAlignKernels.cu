@@ -62,20 +62,32 @@ Tensor repeat_cuda(const Tensor& self, const std::vector<int64_t>& repeats) {
         TP_THROW(RuntimeError,
                  "Number of dimensions of repeat dims can not be smaller than number of dimensions of tensor");
     }
-    for (const int64_t r : repeats) {
-        if (r < 0) TP_THROW(RuntimeError, "repeats can not be negative");
-    }
 
     const int64_t out_nd = static_cast<int64_t>(repeats.size());
+    Tensor sc = self.contiguous();
     std::vector<int64_t> padded(out_nd, 1), padded_strides(out_nd, 0), target(out_nd);
     for (int64_t i = 0; i < nd; ++i) {
-        padded[out_nd - nd + i] = self.size(i);
-        padded_strides[out_nd - nd + i] = self.stride(i);
+        padded[out_nd - nd + i] = sc.size(i);
+        padded_strides[out_nd - nd + i] = sc.stride(i);
     }
     bool zero = false;
     for (int64_t i = 0; i < out_nd; ++i) {
         zero = zero || repeats[i] == 0;
         target[i] = padded[i] * repeats[i];
+    }
+    // Negative repeats surface through the output allocation exactly like
+    // upstream (at::empty -> check_size_nonnegative, EmptyTensor.h).
+    for (const int64_t x : target) {
+        if (x < 0) {
+            std::string sizes = "[";
+            for (size_t i = 0; i < target.size(); ++i) {
+                if (i) sizes += ", ";
+                sizes += std::to_string(target[i]);
+            }
+            sizes += "]";
+            TP_THROW(RuntimeError, "Trying to create tensor with negative dimension ",
+                     x, ": ", sizes);
+        }
     }
 
     OptionalCUDAGuard device_guard(self.device());
@@ -100,7 +112,6 @@ Tensor repeat_cuda(const Tensor& self, const std::vector<int64_t>& repeats) {
     const int64_t* padded_d = tstrides_d + out_nd;
     const int64_t* pstrides_d = padded_d + out_nd;
 
-    auto src_c = self.contiguous();
     const int blocks = static_cast<int>(
         std::min<int64_t>((total + kThreads - 1) / kThreads, kMaxBlocks));
     auto stream = getCurrentCUDAStream().stream();
@@ -109,7 +120,7 @@ Tensor repeat_cuda(const Tensor& self, const std::vector<int64_t>& repeats) {
     case DType::name:                                                                   \
         repeat_gather_kernel<ctype><<<blocks, kThreads, 0, stream>>>(                   \
             total, out_nd, tstrides_d, padded_d, pstrides_d,                            \
-            src_c.data_ptr<ctype>(), out.data_ptr<ctype>());                            \
+            sc.data_ptr<ctype>(), out.data_ptr<ctype>());                               \
         break;
 
     switch (self.dtype()) {

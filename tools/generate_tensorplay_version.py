@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import email
 import os
 import re
@@ -106,6 +107,25 @@ def get_tensorplay_version(sha: str | None = None) -> str:
                 f"Source part '{source_version}' of version '{version}' from "
                 f"{origin} does not match version '{sdist_version}' from PKG-INFO"
             )
+    return version
+
+
+def compute_nightly_version(today: str | None = None) -> str:
+    """Compute the nightly base version from version.txt.
+
+    Mirrors pytorch's nightly version rule (.ci/pytorch/binary_populate_env.sh):
+    the prerelease suffix is stripped from version.txt ("1.0.0a0" -> "1.0.0")
+    and a calendar dev segment is appended, e.g. "1.0.0.dev20260828". Variant
+    local labels such as "+cu124" or "+cpu" are appended by the packaging
+    layer, not here.
+    """
+    tensorplay_root = Path(__file__).absolute().parent.parent
+    base = Path(tensorplay_root / "version.txt").read_text().strip().partition("a")[0]
+    if today is None:
+        today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d")
+    version = f"{base}.dev{today}"
+    # Validate that the version is PEP 440 compliant
+    Version(version)
     return version
 
 

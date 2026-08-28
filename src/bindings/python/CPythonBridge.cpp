@@ -436,6 +436,46 @@ const char* kind_want(unsigned char k) {
 
 }  // namespace
 
+// Non-throwing kind predicate shared by tpx_py_check_types and the generated
+// multi-overload fast probe (tools/codegen/gen_python_c.py): picking the
+// right overload by kind avoids throwing/catching std::invalid_argument on
+// every scalar-argument call (mul_(1.0) etc.).
+bool tpx_py_obj_matches_kind(PyObject* obj, unsigned char kind) {
+    if (obj == nullptr) return false;
+    if (obj == Py_None) return (kind & TPK_OPTIONAL) != 0;
+    switch (static_cast<tpx_py_type_kind>(kind & ~TPK_OPTIONAL)) {
+        case TPK_TENSOR:     return obj_is_tensor(obj);
+        case TPK_NUMBER:     return seq_item_is_number(obj);
+        case TPK_INT:
+            // Upstream toInt() accepts floats with an exact integral value.
+            if (PyIndex_Check(obj)) return true;
+            return PyFloat_Check(obj) &&
+                   std::fmod(PyFloat_AS_DOUBLE(obj), 1.0) == 0;
+        case TPK_FLOAT:      return PyFloat_Check(obj) || PyIndex_Check(obj);
+        case TPK_BOOL:       return PyBool_Check(obj);
+        case TPK_STR:        return PyUnicode_Check(obj);
+        case TPK_DTYPE:
+        case TPK_DEVICE:     return true;  // enum casters own these
+        case TPK_INTLIST:    return check_list(obj, true);
+        case TPK_FLOATLIST:  return check_list(obj, false);
+        case TPK_TENSORLIST:
+            if (!PyTuple_Check(obj) && !PyList_Check(obj)) return false;
+            {
+                Py_ssize_t m = PyTuple_Check(obj) ? PyTuple_GET_SIZE(obj)
+                                                  : PyList_GET_SIZE(obj);
+                for (Py_ssize_t j = 0; j < m; ++j) {
+                    PyObject* el = PyTuple_Check(obj)
+                                       ? PyTuple_GET_ITEM(obj, j)
+                                       : PyList_GET_ITEM(obj, j);
+                    if (!obj_is_tensor(el)) return false;
+                }
+                return true;
+            }
+        case TPK_SCALARLIST: return check_list(obj, false);
+    }
+    return false;
+}
+
 void tpx_py_check_types(PyObject* const* slots, Py_ssize_t n,
                         const char* op_name, const char* const* names,
                         const unsigned char* kinds, int max_pos) {
@@ -447,42 +487,7 @@ void tpx_py_check_types(PyObject* const* slots, Py_ssize_t n,
     for (Py_ssize_t i = 0; i < n; ++i) {
         PyObject* obj = slots[i];
         if (obj == nullptr || obj == Py_None) continue;  // absent/optional-None
-        unsigned char k = kinds[i];
-        bool ok = true;
-        switch (static_cast<tpx_py_type_kind>(k & ~TPK_OPTIONAL)) {
-            case TPK_TENSOR:     ok = obj_is_tensor(obj); break;
-            case TPK_NUMBER:     ok = seq_item_is_number(obj); break;
-            case TPK_INT:
-                // Upstream toInt() accepts floats with an exact integral
-                // value (e.g. divisor_override=3.0 on an int? argument).
-                ok = PyIndex_Check(obj);
-                if (!ok && PyFloat_Check(obj)) {
-                    ok = std::fmod(PyFloat_AS_DOUBLE(obj), 1.0) == 0;
-                }
-                break;
-            case TPK_FLOAT:      ok = PyFloat_Check(obj) || PyIndex_Check(obj); break;
-            case TPK_BOOL:       ok = PyBool_Check(obj); break;
-            case TPK_STR:        ok = PyUnicode_Check(obj); break;
-            case TPK_DTYPE:
-            case TPK_DEVICE:     ok = true; break;  // enum casters own these
-            case TPK_INTLIST:    ok = check_list(obj, true); break;
-            case TPK_FLOATLIST:  ok = check_list(obj, false); break;
-            case TPK_TENSORLIST:
-                if (!PyTuple_Check(obj) && !PyList_Check(obj)) { ok = false; break; }
-                {
-                    Py_ssize_t m = PyTuple_Check(obj) ? PyTuple_GET_SIZE(obj)
-                                                      : PyList_GET_SIZE(obj);
-                    for (Py_ssize_t j = 0; j < m && ok; ++j) {
-                        PyObject* el = PyTuple_Check(obj)
-                                           ? PyTuple_GET_ITEM(obj, j)
-                                           : PyList_GET_ITEM(obj, j);
-                        ok = obj_is_tensor(el);
-                    }
-                }
-                break;
-            case TPK_SCALARLIST: ok = check_list(obj, false); break;
-        }
-        if (!ok) fail(static_cast<int>(i), obj);
+        if (!tpx_py_obj_matches_kind(obj, kinds[i])) fail(static_cast<int>(i), obj);
     }
 }
 

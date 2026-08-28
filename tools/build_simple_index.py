@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a PEP 503-compatible static index for CUDA wheel releases."""
+"""Build PEP 503-compatible static indexes for stable and nightly wheel releases."""
 
 from __future__ import annotations
 
@@ -15,6 +15,12 @@ from pathlib import Path
 from urllib.parse import quote
 
 from packaging.utils import canonicalize_name, parse_wheel_filename
+
+
+# Rolling GitHub Release that holds the manually published preview (nightly)
+# wheels. Its assets are indexed under whl/nightly/ and never leak into the
+# stable per-variant indexes, mirroring download.pytorch.org's whl/nightly/.
+NIGHTLY_RELEASE_TAG = "nightly"
 
 
 def _read_release_records(path: Path) -> list[dict]:
@@ -63,17 +69,31 @@ def _fallback_asset_url(base_url: str, tag: str, filename: str) -> str:
     return f"{base_url.rstrip('/')}/{quote(tag, safe='')}/{quote(filename, safe='')}"
 
 
-def _matches_variant(filename: str, variant: str) -> bool:
-    """Match CUDA-local wheel versions, with a legacy cu124 fallback."""
-    if f"+{variant}" in filename:
+def _matches_variant(filename: str, variant: str, nightly: bool = False) -> bool:
+    """Match wheels against an index variant.
+
+    Wheel versions carry a PEP 440 local label naming the build variant
+    ("+cu124", "+cpu"). Wheels without any local label are legacy cu124
+    builds on the stable channel, but cpu builds on the nightly one: pytorch
+    appends its variant label only on non-Darwin platforms, so macOS
+    nightlies have none.
+    """
+    version = filename.split("-", 2)[1] if filename.count("-") >= 2 else ""
+    local_label = version.partition("+")[2]
+    if variant == "cpu":
+        return local_label in ("", "cpu")
+    if local_label == variant:
         return True
-    return variant == "cu124" and not re.search(r"\+cu[0-9]+(?:[-_.]|$)", filename)
+    return variant == "cu124" and local_label == "" and not nightly
 
 
 def _release_wheels(
     records: list[dict],
     release_base_url: str,
     variant: str,
+    only_tag: str | None = None,
+    skip_tags: frozenset[str] = frozenset(),
+    nightly: bool = False,
 ) -> dict[str, list[dict[str, str | None]]]:
     packages: dict[str, list[dict[str, str | None]]] = {}
     for release in records:
@@ -82,11 +102,15 @@ def _release_wheels(
         tag = str(release.get("tag_name", "")).strip()
         if not tag:
             continue
+        if only_tag is not None and tag != only_tag:
+            continue
+        if tag in skip_tags:
+            continue
         for asset in release.get("assets", []):
             filename = str(asset.get("name", ""))
             if not filename.lower().endswith(".whl"):
                 continue
-            if not _matches_variant(filename, variant):
+            if not _matches_variant(filename, variant, nightly):
                 continue
             try:
                 package_name, _version, _build, _tags = parse_wheel_filename(filename)
@@ -106,9 +130,10 @@ def _add_current_wheels(
     release_base_url: str,
     release_tag: str,
     variant: str,
+    nightly: bool = False,
 ) -> None:
     for path in sorted(dist_dir.glob("*.whl")):
-        if not _matches_variant(path.name, variant):
+        if not _matches_variant(path.name, variant, nightly):
             continue
         project, requires_python = _wheel_metadata(path)
         filename = path.name
@@ -161,6 +186,19 @@ def _landing_index(variants: list[str]) -> str:
     )
 
 
+def _nightly_landing_index(variants: list[str]) -> str:
+    links = "\n".join(
+        f'<p><a href="{html.escape(variant)}/">{html.escape(variant)} nightly index</a></p>'
+        for variant in variants
+    )
+    return (
+        "<!doctype html>\n<html><body>\n"
+        "<h1>TensorPlay nightly wheels</h1>\n"
+        f"{links}\n"
+        "</body></html>\n"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dist-dir", type=Path, required=True, help="Directory containing the current CUDA wheels")
@@ -177,14 +215,23 @@ def main() -> None:
         action="append",
         dest="variants",
         default=None,
-        help="CUDA index variant, repeat for multiple variants, for example cu124",
+        help="Index variant, repeat for multiple variants, for example cu124; "
+        "the cpu pseudo-variant is only valid with --nightly",
+    )
+    parser.add_argument(
+        "--nightly",
+        action="store_true",
+        help="Nightly channel mode: index only the --release-tag release (the rolling "
+        "nightly release) under whl/nightly/<variant>/ instead of the stable indexes",
     )
     args = parser.parse_args()
 
     variants = args.variants or ["cu124"]
-    invalid = [variant for variant in variants if not re.fullmatch(r"cu[0-9]+", variant)]
+    invalid = [variant for variant in variants if not re.fullmatch(r"cu[0-9]+|cpu", variant)]
     if invalid:
-        raise SystemExit(f"Invalid CUDA variant(s): {invalid!r}")
+        raise SystemExit(f"Invalid variant(s): {invalid!r}")
+    if not args.nightly and "cpu" in variants:
+        raise SystemExit("The cpu variant is only valid with --nightly")
     if not args.dist_dir.is_dir():
         raise SystemExit(f"Wheel directory does not exist: {args.dist_dir}")
 
@@ -192,26 +239,54 @@ def main() -> None:
 
     if args.output_dir.exists():
         shutil.rmtree(args.output_dir)
+    published_variants: list[str] = []
     for variant in variants:
-        packages = _release_wheels(release_records, args.release_base_url, variant)
-        _add_current_wheels(packages, args.dist_dir, args.release_base_url, args.release_tag, variant)
+        if args.nightly:
+            packages = _release_wheels(
+                release_records, args.release_base_url, variant,
+                only_tag=args.release_tag, nightly=True,
+            )
+        else:
+            packages = _release_wheels(
+                release_records, args.release_base_url, variant,
+                skip_tags=frozenset({NIGHTLY_RELEASE_TAG}),
+            )
+        _add_current_wheels(
+            packages, args.dist_dir, args.release_base_url, args.release_tag, variant,
+            nightly=args.nightly,
+        )
         if not packages:
+            if args.nightly:
+                # Manual preview publishes may ship only a subset of variants.
+                print(f"No wheels found for variant {variant}, skipping")
+                continue
             raise SystemExit(f"No CUDA wheel assets found for {variant}")
 
-        index_root = args.output_dir / "whl" / variant
+        if args.nightly:
+            index_root = args.output_dir / "whl" / "nightly" / variant
+        else:
+            index_root = args.output_dir / "whl" / variant
         index_root.mkdir(parents=True)
         (index_root / "index.html").write_text(_root_index(sorted(packages), variant), encoding="utf-8")
         for project, entries in sorted(packages.items()):
             project_dir = index_root / project
             project_dir.mkdir()
             (project_dir / "index.html").write_text(_package_index(entries), encoding="utf-8")
+        published_variants.append(variant)
 
-    (args.output_dir / "index.html").write_text(_landing_index(variants), encoding="utf-8")
-    (args.output_dir / "_headers").write_text(
-        "/whl/*\n"
-        "  Cache-Control: public, max-age=300, must-revalidate\n",
-        encoding="utf-8",
-    )
+    if args.nightly:
+        if not published_variants:
+            raise SystemExit("No nightly wheels found for any configured variant")
+        (args.output_dir / "whl" / "nightly" / "index.html").write_text(
+            _nightly_landing_index(published_variants), encoding="utf-8"
+        )
+    else:
+        (args.output_dir / "index.html").write_text(_landing_index(variants), encoding="utf-8")
+        (args.output_dir / "_headers").write_text(
+            "/whl/*\n"
+            "  Cache-Control: public, max-age=300, must-revalidate\n",
+            encoding="utf-8",
+        )
 
 
 if __name__ == "__main__":

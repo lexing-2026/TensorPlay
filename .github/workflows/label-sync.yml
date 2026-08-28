@@ -1,0 +1,36 @@
+name: label-sync
+
+# Keeps the repository labels in sync with the declarative inventory in
+# .github/labels.yml (powered by EndBug/label-sync, the same approach pytorch
+# uses to manage its label taxonomy). Dispatch manually; dry-run defaults to
+# true so a dispatch previews the diff before applying it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Preview the sync without applying changes
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  sync:
+    name: sync-labels
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          show-progress: false
+
+      - uses: EndBug/label-sync@v2
+        with:
+          config-file: .github/labels.yml
+          dry-run: ${{ inputs.dry_run }}
+          # Never delete labels that are not in the inventory: release-notes
+          # labels already applied to merged PRs must survive.
+          delete-other-labels: false

@@ -18,6 +18,37 @@ __device__ __forceinline__ math_t round_to_scalar(math_t value) {
     return static_cast<math_t>(static_cast<scalar_t>(value));
 }
 
+// These helpers mirror the CUDA foreach pointwise implementation.  In
+// particular, addcmul(alpha=1) is the only path that fuses the two tensor
+// operands with the input; addcdiv(alpha=1) deliberately remains divide then
+// add.  Keeping the distinction here avoids accidentally changing the
+// low-precision rounding boundary while the optimizer stays one MTA launch.
+template <typename scalar_t, typename math_t>
+__device__ __forceinline__ math_t exact_addcmul(
+        math_t input, math_t tensor1, math_t tensor2, math_t alpha) {
+    if (alpha == math_t(1)) {
+        return round_to_scalar<scalar_t>(fma(tensor1, tensor2, input));
+    }
+    return round_to_scalar<scalar_t>(
+        fma(alpha, tensor1 * tensor2, input));
+}
+
+template <typename scalar_t, typename math_t>
+__device__ __forceinline__ math_t exact_addcdiv(
+        math_t input, math_t tensor1, math_t tensor2, math_t alpha) {
+    const math_t quotient = tensor1 / tensor2;
+    if (alpha == math_t(1)) {
+        return round_to_scalar<scalar_t>(input + quotient);
+    }
+    return round_to_scalar<scalar_t>(fma(alpha, quotient, input));
+}
+
+template <typename scalar_t, typename math_t>
+__device__ __forceinline__ math_t exact_add(
+        math_t input, math_t value, math_t alpha) {
+    return round_to_scalar<scalar_t>(input + alpha * value);
+}
+
 template <typename scalar_t, typename math_t>
 __device__ __forceinline__ math_t exact_lerp(
         math_t start, math_t end, math_t weight) {
@@ -49,8 +80,8 @@ struct RmspropExactBody {
 
         math_t square = round_to_scalar<scalar_t>(
             values[2][lane] * alpha);
-        square = round_to_scalar<scalar_t>(
-            fma(one_minus_alpha, g * g, square));
+        square = exact_addcmul<scalar_t>(
+            square, g, g, one_minus_alpha);
         values[2][lane] = square;
 
         math_t average = square;
@@ -60,8 +91,8 @@ struct RmspropExactBody {
             const math_t mean = exact_lerp<scalar_t>(
                 old_mean, g, one_minus_alpha);
             values[kGradAvgIndex][lane] = mean;
-            average = round_to_scalar<scalar_t>(
-                fma(math_t(-1), mean * mean, square));
+            average = exact_addcmul<scalar_t>(
+                square, mean, mean, math_t(-1));
         }
 
         math_t denominator = round_to_scalar<scalar_t>(sqrt(average));
@@ -70,14 +101,13 @@ struct RmspropExactBody {
             constexpr int kMomentumIndex = Centered ? 4 : 3;
             math_t buffer = round_to_scalar<scalar_t>(
                 values[kMomentumIndex][lane] * momentum);
-            buffer = round_to_scalar<scalar_t>(
-                fma(math_t(1), g / denominator, buffer));
+            buffer = exact_addcdiv<scalar_t>(
+                buffer, g, denominator, math_t(1));
             values[kMomentumIndex][lane] = buffer;
-            values[0][lane] = round_to_scalar<scalar_t>(
-                fma(-lr, buffer, p));
+            values[0][lane] = exact_add<scalar_t>(p, buffer, -lr);
         } else {
-            values[0][lane] = round_to_scalar<scalar_t>(
-                fma(-lr, g / denominator, p));
+            values[0][lane] = exact_addcdiv<scalar_t>(
+                p, g, denominator, -lr);
         }
     }
 };
@@ -104,8 +134,8 @@ struct AdadeltaExactBody {
 
         math_t square = round_to_scalar<scalar_t>(
             values[2][lane] * rho);
-        square = round_to_scalar<scalar_t>(
-            fma(one_minus_rho, g * g, square));
+        square = exact_addcmul<scalar_t>(
+            square, g, g, one_minus_rho);
         values[2][lane] = square;
 
         math_t std = round_to_scalar<scalar_t>(sqrt(
@@ -117,11 +147,11 @@ struct AdadeltaExactBody {
 
         math_t acc = round_to_scalar<scalar_t>(
             values[3][lane] * rho);
-        acc = round_to_scalar<scalar_t>(
-            fma(one_minus_rho, delta * delta, acc));
+        acc = exact_addcmul<scalar_t>(
+            acc, delta, delta, one_minus_rho);
         values[3][lane] = acc;
-        values[0][lane] = round_to_scalar<scalar_t>(
-            fma(-lr, delta, p));
+        const math_t update = round_to_scalar<scalar_t>(-lr * delta);
+        values[0][lane] = exact_add<scalar_t>(p, update, math_t(1));
     }
 };
 
@@ -151,14 +181,15 @@ struct AdagradExactBody {
             g = round_to_scalar<scalar_t>(g + weight_decay * p);
         }
         const math_t sum = round_to_scalar<scalar_t>(
-            fma(math_t(1), g * g, values[2][lane]));
+            exact_addcmul<scalar_t>(
+                values[2][lane], g, g, math_t(1)));
         values[2][lane] = sum;
         math_t denominator = round_to_scalar<scalar_t>(sqrt(sum));
         denominator = round_to_scalar<scalar_t>(denominator + eps);
         const math_t numerator = round_to_scalar<scalar_t>(
             corrected_lr * g);
-        values[0][lane] = round_to_scalar<scalar_t>(
-            fma(math_t(1), numerator / denominator, p));
+        values[0][lane] = exact_addcdiv<scalar_t>(
+            p, numerator, denominator, math_t(1));
     }
 };
 
@@ -220,8 +251,10 @@ struct RpropExactBody {
         // _foreach_mul(grads, prevs) writes a low-precision temporary before
         // sign() is evaluated.  Keep the direction code separately so the
         // etaminus comparison is independent of scalar representation.
-        const math_t product = round_to_scalar<scalar_t>(
-            g * values[2][lane]);
+        const math_t raw_grad = values[1][lane];
+        math_t product = round_to_scalar<scalar_t>(
+            raw_grad * values[2][lane]);
+        if (maximize) product = round_to_scalar<scalar_t>(-product);
         const int direction = product > math_t(0) ? 1 :
             (product < math_t(0) ? -1 : 0);
         const math_t sign = direction > 0 ?
@@ -234,11 +267,13 @@ struct RpropExactBody {
             step_size_max, fmax(step_size_min, step_size)));
         values[3][lane] = step_size;
 
-        const math_t masked_grad = direction < 0 ? math_t(0) : g;
+        math_t stored_grad = maximize
+            ? round_to_scalar<scalar_t>(-raw_grad) : raw_grad;
+        const math_t masked_grad = direction < 0 ? math_t(0) : stored_grad;
         const math_t grad_sign = masked_grad > math_t(0) ? math_t(1) :
             (masked_grad < math_t(0) ? math_t(-1) : math_t(0));
-        values[0][lane] = round_to_scalar<scalar_t>(
-            fma(math_t(-1), grad_sign * step_size, values[0][lane]));
+        values[0][lane] = exact_addcmul<scalar_t>(
+            values[0][lane], grad_sign, step_size, math_t(-1));
         values[2][lane] = round_to_scalar<scalar_t>(masked_grad);
     }
 };
@@ -295,18 +330,18 @@ struct NadamExactBody {
             values[2][lane], g, one_minus_beta1);
         math_t second = round_to_scalar<scalar_t>(
             values[3][lane] * beta2);
-        second = round_to_scalar<scalar_t>(
-            fma(one_minus_beta2, g * g, second));
+        second = exact_addcmul<scalar_t>(
+            second, g, g, one_minus_beta2);
         values[3][lane] = second;
 
         math_t denominator = round_to_scalar<scalar_t>(sqrt(second));
         denominator = round_to_scalar<scalar_t>(
             denominator / correction2_sqrt);
         denominator = round_to_scalar<scalar_t>(denominator + eps);
-        p = round_to_scalar<scalar_t>(
-            fma(step_size_grads, g / denominator, p));
-        p = round_to_scalar<scalar_t>(
-            fma(step_size_expavg, values[2][lane] / denominator, p));
+        p = exact_addcdiv<scalar_t>(
+            p, g, denominator, step_size_grads);
+        p = exact_addcdiv<scalar_t>(
+            p, values[2][lane], denominator, step_size_expavg);
         values[0][lane] = p;
     }
 };
@@ -347,8 +382,8 @@ struct RadamExactBody {
             values[2][lane], g, one_minus_beta1);
         math_t second = round_to_scalar<scalar_t>(
             values[3][lane] * beta2);
-        second = round_to_scalar<scalar_t>(
-            fma(one_minus_beta2, g * g, second));
+        second = exact_addcmul<scalar_t>(
+            second, g, g, one_minus_beta2);
         values[3][lane] = second;
 
         // Torch's non-capturable path first builds a low-precision buffer:
@@ -361,7 +396,7 @@ struct RadamExactBody {
         buffer = round_to_scalar<scalar_t>(math_t(1) / buffer);
         buffer = round_to_scalar<scalar_t>(
             buffer + unrectified_step_size);
-        values[0][lane] = round_to_scalar<scalar_t>(
-            fma(math_t(1), values[2][lane] * buffer, p));
+        values[0][lane] = exact_addcmul<scalar_t>(
+            p, values[2][lane], buffer, math_t(1));
     }
 };

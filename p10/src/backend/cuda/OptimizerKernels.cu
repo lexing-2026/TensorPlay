@@ -590,7 +590,10 @@ void fused_adagrad_cuda_impl(std::vector<Tensor> params,
                 if (exact) {
                     std::vector<double> corrected_lrs(steps.size());
                     for (size_t i = 0; i < steps.size(); ++i) {
-                        corrected_lrs[i] = scalar_lr /
+                        // The foreach path materializes minus_clr before
+                        // addcdiv_; keep the negative scalar in metadata so
+                        // the final add has the same sign as Torch.
+                        corrected_lrs[i] = -scalar_lr /
                             (1.0 + (steps[i] - 1.0) * lr_decay);
                     }
                     optimizer_mta::launch_adagrad_host_exact<scalar_t, math_t>(
@@ -1606,7 +1609,39 @@ void foreach_minimum_scalar_list_inplace_cuda(
         std::vector<Tensor> self, const std::vector<Scalar>& scalars) {
     foreach_clamp_max_scalar_list_inplace_cuda(std::move(self), scalars);
 }
+template <typename M>
+struct CopyListOp {
+    __device__ M operator()(M* values) const { return values[1]; }
+};
+
 void foreach_copy_inplace_cuda(std::vector<Tensor> self, const std::vector<Tensor>& src, bool non_blocking) {
+    // Fused multi-tensor copy (one launch for the whole list) for the common
+    // case: matching dtypes/shapes, contiguous, supported float dtype — the
+    // DDP reducer's bucket copy-in/copy-back and optimizer buffer syncs all
+    // hit this path.  Falls back to per-tensor copy_ otherwise.
+    if (!self.empty() && foreach_mta::eligible_pair(self, src)) {
+        const DType dt = self[0].dtype();
+        if (dt == DType::Float32) {
+            foreach_mta::launch<2, 0, float, float, CopyListOp<float>>(
+                {&self, &src}, CopyListOp<float>{}, "_foreach_copy_");
+            return;
+        }
+        if (dt == DType::Float64) {
+            foreach_mta::launch<2, 0, double, double, CopyListOp<double>>(
+                {&self, &src}, CopyListOp<double>{}, "_foreach_copy_");
+            return;
+        }
+        if (dt == DType::Float16) {
+            foreach_mta::launch<2, 0, Half, float, CopyListOp<float>>(
+                {&self, &src}, CopyListOp<float>{}, "_foreach_copy_");
+            return;
+        }
+        if (dt == DType::BFloat16) {
+            foreach_mta::launch<2, 0, BFloat16, float, CopyListOp<float>>(
+                {&self, &src}, CopyListOp<float>{}, "_foreach_copy_");
+            return;
+        }
+    }
     foreach_map_pair_inplace(self, src, [&](Tensor& value, const Tensor& rhs) { value.copy_(rhs, non_blocking); });
 }
 void foreach_zero_inplace_cuda(std::vector<Tensor> self) {

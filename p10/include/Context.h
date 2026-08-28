@@ -88,6 +88,13 @@ public:
     bool allowTF32CuDNN() const { return allow_tf32_cudnn_; }
     void setAllowTF32CuDNN(bool b) { allow_tf32_cudnn_ = b; }
 
+    // Mirrors torch.backends.cudnn.benchmark: when enabled, convolution
+    // algorithm selection times the candidate algorithms on first use of a
+    // shape and caches the fastest (instead of trusting the heuristic).
+    // Defaults to False like PyTorch.
+    bool cudnnBenchmark() const { return cudnn_benchmark_; }
+    void setCudnnBenchmark(bool b) { cudnn_benchmark_ = b; }
+
 private:
     Context(const Context&) = delete;
     Context& operator=(const Context&) = delete;
@@ -101,6 +108,7 @@ private:
     bool deterministic_algorithms_warn_only_ = false;
     Float32MatmulPrecision float32_matmul_precision_ = Float32MatmulPrecision::HIGHEST;
     bool allow_tf32_cudnn_ = true;
+    bool cudnn_benchmark_ = false;
 };
 
 P10_API Context& globalContext();

@@ -707,22 +707,33 @@ Tensor Tensor::view_dtype(DType dtype) const {
 
 Tensor Tensor::select(int64_t dim, int64_t index) const {
     if (!impl_) TP_THROW(RuntimeError, "Tensor not defined");
-    int64_t ndim = this->dim();
+    // TensorShape.cpp select_symint: 0-dim rejection, maybe_wrap_dim, then an
+    // index range check phrased against the original (unwrapped) index.
+    const int64_t ndim = this->dim();
+    if (ndim == 0) {
+        TP_THROW(IndexError, "select() cannot be applied to a 0-dim tensor.");
+    }
+    const int64_t orig_dim = dim;
     if (dim < 0) dim += ndim;
-    if (dim < 0 || dim >= ndim) TP_THROW(IndexError, format_dim_range(ndim, dim));
+    if (dim < 0 || dim >= ndim) TP_THROW(IndexError, format_dim_range(ndim, orig_dim));
 
-    int64_t size_dim = size(dim);
+    const int64_t size_dim = size(dim);
+    if (size_dim <= -1 - index || size_dim <= index) {
+        TP_THROW(IndexError, "select(): index ", index,
+                 " out of range for tensor of size ",
+                 format_sizes(static_cast<std::vector<int64_t>>(shape())),
+                 " at dimension ", dim);
+    }
     if (index < 0) index += size_dim;
-    if (index < 0 || index >= size_dim) TP_THROW(IndexError, "Index out of range");
-    
+
     std::vector<int64_t> new_sizes = static_cast<std::vector<int64_t>>(shape());
     std::vector<int64_t> new_strides = strides();
-    
+
     size_t new_offset = impl_->storage_offset() + index * new_strides[dim];
-    
+
     new_sizes.erase(new_sizes.begin() + dim);
     new_strides.erase(new_strides.begin() + dim);
-    
+
     return as_strided(new_sizes, new_strides, new_offset);
 }
 

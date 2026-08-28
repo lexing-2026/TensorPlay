@@ -18,10 +18,19 @@ std::mutex g_mutex;
 // All events of the current session, appended under g_mutex.  Slots are
 // stable for the whole session (append-only), so OpRecord can hold an index.
 std::vector<Event>* g_events = nullptr;
+// Allocator-level memory events of the current session (profile_memory).
+std::vector<MemEvent>* g_mem_events = nullptr;
 // Arenas keeping session-lifetime bytes alive (user names, deduped sites).
 std::deque<std::string>* g_name_arena = nullptr;
 std::vector<std::pair<std::string, int>>* g_site_table = nullptr;
 std::unordered_map<std::string, uint32_t>* g_site_index = nullptr;
+// Interned stacks: frames and full frame chains dedupe across the process
+// lifetime (source locations repeat for every op), so keep one arena for
+// frames and one id->chain table per session.
+std::deque<std::string>* g_frame_arena = nullptr;
+std::unordered_map<std::string, uint32_t>* g_frame_index = nullptr;
+std::vector<std::vector<uint32_t>>* g_stack_table = nullptr;
+std::deque<ProfFrame>* g_frame_store = nullptr;
 
 // A redispatch record can outlive the Python call that is stopping a
 // session (for example, a CUDA/CPU worker may still be unwinding).  Stop
@@ -54,15 +63,22 @@ uint64_t this_thread_id() {
 thread_local struct {
     bool valid = false;
     uint32_t site_id = Event::kNoSite;
+    uint32_t stack_id = Event::kNoSite;
 } t_pending_site;
 
 void clear_session_locked() {
     if (!g_events) g_events = new std::vector<Event>();
+    if (!g_mem_events) g_mem_events = new std::vector<MemEvent>();
     if (!g_name_arena) g_name_arena = new std::deque<std::string>();
     if (!g_site_table) g_site_table = new std::vector<std::pair<std::string, int>>();
     if (!g_site_index) g_site_index = new std::unordered_map<std::string, uint32_t>();
+    if (!g_stack_table) g_stack_table = new std::vector<std::vector<uint32_t>>();
     g_events->clear();
+    g_mem_events->clear();
     g_name_arena->clear();
+    // Frame arena / stacks dedupe process-lifetime; the id->chain table is
+    // session-scoped (ids are resolved before the next start).
+    g_stack_table->clear();
 }
 
 } // namespace
@@ -70,6 +86,7 @@ void clear_session_locked() {
 TENSORPLAY_API std::atomic<bool> g_active{false};
 TENSORPLAY_API std::atomic<bool> g_capture_shapes{false};
 TENSORPLAY_API std::atomic<bool> g_capture_sites{false};
+TENSORPLAY_API std::atomic<bool> g_mem_capture{false};
 
 void profiler_start() {
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -93,6 +110,7 @@ std::vector<Event> profiler_stop() {
     g_active.store(false, std::memory_order_release);
     g_capture_shapes.store(false, std::memory_order_release);
     g_capture_sites.store(false, std::memory_order_release);
+    g_mem_capture.store(false, std::memory_order_release);
     {
         std::unique_lock<std::mutex> wait_lock(g_inflight_mutex);
         g_inflight_cv.wait(wait_lock, [] {
@@ -123,6 +141,117 @@ void set_python_site(const char* file, int line) {
     const uint32_t id = intern_site(file, line);
     t_pending_site.valid = true;
     t_pending_site.site_id = id;
+}
+
+void set_python_stack(std::vector<ProfFrame>&& frames) {
+    if (!g_active.load(std::memory_order_acquire)) return;
+    if (frames.empty()) return;
+    // The outermost frame doubles as the single-line site id, so the
+    // legacy site accessor (Event::site_id -> site_string) keeps working
+    // alongside the full chain.
+    const uint32_t site_id = intern_site(frames.front().file.c_str(),
+                                         frames.front().line);
+    const uint32_t stack_id = intern_stack(std::move(frames));
+    if (stack_id == Event::kNoSite) return;
+    t_pending_site.valid = true;
+    t_pending_site.site_id = site_id;
+    t_pending_site.stack_id = stack_id;
+}
+
+uint32_t intern_stack(std::vector<ProfFrame>&& frames) {
+    if (frames.empty()) return Event::kNoSite;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_frame_arena) {
+        g_frame_arena = new std::deque<std::string>();
+        g_frame_index = new std::unordered_map<std::string, uint32_t>();
+        g_frame_store = new std::deque<ProfFrame>();
+        g_stack_table = new std::vector<std::vector<uint32_t>>();
+    }
+    std::vector<uint32_t> ids;
+    ids.reserve(frames.size());
+    for (auto& f : frames) {
+        // "file:line (func)" dedup key; line varies per call site, so the
+        // cache keys on the exact frame tuple.
+        std::string key = f.file;
+        key += ":";
+        key += std::to_string(f.line);
+        key += " (";
+        key += f.func;
+        key += ")";
+        auto it = g_frame_index->find(key);
+        uint32_t fid;
+        if (it != g_frame_index->end()) {
+            fid = it->second;
+        } else {
+            fid = static_cast<uint32_t>(g_frame_store->size());
+            g_frame_store->push_back(std::move(f));
+            g_frame_index->emplace(std::move(key), fid);
+        }
+        ids.push_back(fid);
+    }
+    const uint32_t id = static_cast<uint32_t>(g_stack_table->size());
+    g_stack_table->push_back(std::move(ids));
+    return id;
+}
+
+std::vector<ProfFrame> stack_frames(uint32_t id) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    std::vector<ProfFrame> out;
+    if (!g_stack_table || !g_frame_store || id >= g_stack_table->size()) {
+        return out;
+    }
+    out.reserve(g_stack_table->at(id).size());
+    for (uint32_t fid : g_stack_table->at(id)) {
+        out.push_back(g_frame_store->at(fid));
+    }
+    return out;
+}
+
+// ---- Allocator-level memory capture ---------------------------------------
+void mem_record_alloc(void* ptr, int64_t bytes, bool cuda, int32_t device,
+                      int64_t stream) {
+    if (!g_mem_capture.load(std::memory_order_acquire)) return;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_mem_capture.load(std::memory_order_relaxed)) return;
+    if (!g_mem_events) g_mem_events = new std::vector<MemEvent>();
+    MemEvent e;
+    e.ts_ns = now_ns();
+    e.ptr = ptr;
+    e.bytes = bytes;
+    e.alloc = true;
+    e.cuda = cuda;
+    e.device = device;
+    e.stream = stream;
+    e.tid = this_thread_id();
+    g_mem_events->push_back(e);
+}
+
+void mem_record_free(void* ptr, int64_t bytes, bool cuda, int32_t device,
+                     int64_t stream) {
+    if (!g_mem_capture.load(std::memory_order_acquire)) return;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_mem_capture.load(std::memory_order_relaxed)) return;
+    if (!g_mem_events) g_mem_events = new std::vector<MemEvent>();
+    MemEvent e;
+    e.ts_ns = now_ns();
+    e.ptr = ptr;
+    e.bytes = bytes;
+    e.alloc = false;
+    e.cuda = cuda;
+    e.device = device;
+    e.stream = stream;
+    e.tid = this_thread_id();
+    g_mem_events->push_back(e);
+}
+
+std::vector<MemEvent> mem_take() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    std::vector<MemEvent> out;
+    if (g_mem_events) {
+        out = std::move(*g_mem_events);
+        g_mem_events->clear();
+    }
+    return out;
 }
 
 uint32_t intern_site(const char* file, int line) {
@@ -191,6 +320,7 @@ void OpRecord::begin(const char* static_name, const std::string* owned_name,
     }
     if (t_pending_site.valid) {
         e.site_id = t_pending_site.site_id;
+        e.stack_id = t_pending_site.stack_id;
         t_pending_site.valid = false;  // consume: inner ops record no site
     }
     if ((nvtx_on || itt_on) && e.name != nullptr) {
@@ -273,6 +403,7 @@ void user_span_begin(const std::string& name) {
     e.end_ns = start;
     if (t_pending_site.valid) {
         e.site_id = t_pending_site.site_id;
+        e.stack_id = t_pending_site.stack_id;
         t_pending_site.valid = false;
     }
     g_events->push_back(e);

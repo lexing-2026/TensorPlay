@@ -185,7 +185,9 @@ void Engine::execute_task(ReadyQueue::NodeTask&& task, ReadyQueue& cpu_queue,
         // and account for this task so the graph still drains naturally; the
         // initiator rethrows once every queued task has been evaluated.
         graph.record_exception(std::current_exception());
-        graph.task_completed();
+        if (graph.task_completed()) {
+            queue_for_device(-1)->notify();
+        }
     }
 }
 
@@ -351,7 +353,9 @@ void Engine::evaluate_function(GraphTask& task, Node* func, InputBuffer& inputs,
         }
         if (!fn_info.needed_) {
             // Skip execution if we don't need to execute the function.
-            task.task_completed();
+            if (task.task_completed()) {
+                queue_for_device(-1)->notify();
+            }
             return;
         }
     }
@@ -594,7 +598,16 @@ void Engine::evaluate_function(GraphTask& task, Node* func, InputBuffer& inputs,
         func->release_variables();
     }
 
-    task.task_completed();
+    if (task.task_completed()) {
+        // The graph just finished on this (possibly device-worker) thread.
+        // Wake the initiating thread, which blocks in pop_until() on the CPU
+        // queue (queue_for_device(-1)). Completion only signalled task.cv_, so
+        // without this the initiator would wait out a full poll interval. Note
+        // the local `cpu_queue` param is the *device* queue when running on a
+        // device worker (see worker_main), so notify the true CPU queue.
+        // Mirrors torch's dummy-wakeup task (engine.cpp thread_main).
+        queue_for_device(-1)->notify();
+    }
 }
 
 void Engine::enqueue_task(GraphTask& task, ReadyQueue::NodeTask&& node_task,

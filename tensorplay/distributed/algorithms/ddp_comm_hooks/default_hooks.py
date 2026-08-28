@@ -68,8 +68,13 @@ def _compress_hook(dtype, process_group, bucket):
         decompressed_tensor = buffer
         # Decompress in place to reduce the peak memory.
         # See: https://github.com/pytorch/pytorch/issues/45968
-        value = fut_or_tensor.value() \
-            if hasattr(fut_or_tensor, "value") else fut_or_tensor
+        # torch parity: a Work future resolves to a list of tensors, so take
+        # element [0]; a bare tensor is used as-is.
+        value = (
+            fut_or_tensor
+            if isinstance(fut_or_tensor, tp.Tensor)
+            else fut_or_tensor.value()[0]
+        )
         decompressed_tensor.copy_(value)
         return decompressed_tensor
 

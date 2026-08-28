@@ -469,6 +469,15 @@ struct SiluFunctor {
         return x / (static_cast<T>(1) + exp(-x));
     }
 };
+struct SiluBackwardFunctor {
+    template<typename T> __device__ T operator()(T dy, T x) const {
+        // ATen cpu/Activation.cpp silu_backward_kernel (shared math):
+        // sigmoid = 1 / (1 + exp(-x)); dy * sigmoid * (1 + x * (1 - sigmoid))
+        const T one = static_cast<T>(1);
+        const T s = one / (one + exp(-x));
+        return dy * s * (one + x * (one - s));
+    }
+};
 
 Tensor exp_kernel_cuda(const Tensor& self) {
     if (isComplexType(self.dtype())) return complex_math_kernel_cuda(self, CxExp{});
@@ -553,6 +562,11 @@ Tensor angle_kernel_cuda(const Tensor& self) {
 Tensor relu_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, ReluFunctor()); }
 Tensor gelu_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, GeluFunctor()); }
 Tensor silu_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, SiluFunctor()); }
+template<typename Functor>
+Tensor activation_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self, Functor functor);
+Tensor silu_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self) {
+    return activation_backward_kernel_cuda(grad_output, self, SiluBackwardFunctor());
+}
 
 // ---------------------------------------------------------------------------
 // Activations (CUDA).  Formulas ported from ATen:
@@ -864,6 +878,114 @@ Tensor softplus_kernel_cuda(const Tensor& self, Scalar beta, Scalar threshold) {
 }
 Tensor softplus_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self, Scalar beta, Scalar threshold) {
     return activation_backward_kernel_cuda(grad_output, self, SoftplusBackwardFunctor(beta.toDouble(), threshold.toDouble()));
+}
+
+// ATen cpu/Activation.cpp log_sigmoid_cpu_kernel:
+//   out = min(x, 0) - log1p(exp(-|x|))
+struct LogSigmoidFunctor {
+    template<typename T> __device__ T operator()(T x) const {
+        T z = x < static_cast<T>(0) ? x : static_cast<T>(0);
+        T neg_abs = x < static_cast<T>(0) ? x : -x;
+        return z - log1p(exp(neg_abs));
+    }
+};
+// ATen cpu/Activation.cpp log_sigmoid_backward_cpu_kernel: grad * sigmoid(-x),
+// branch-split so exp() never overflows.
+struct LogSigmoidBackwardFunctor {
+    template<typename T> __device__ T operator()(T dy, T x) const {
+        if (x >= static_cast<T>(0)) {
+            T e = exp(-x);
+            return dy * (e / (static_cast<T>(1) + e));
+        }
+        return dy / (static_cast<T>(1) + exp(x));
+    }
+};
+Tensor log_sigmoid_kernel_cuda(const Tensor& self) {
+    return unary_float_op_kernel_v2(self, LogSigmoidFunctor());
+}
+Tensor log_sigmoid_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self) {
+    return activation_backward_kernel_cuda(grad_output, self, LogSigmoidBackwardFunctor());
+}
+
+// ATen Activation.cpp rrelu_with_noise: training scales negative elements by
+// the caller-provided noise; eval is leaky_relu with slope (lower+upper)/2.
+template<typename Functor>
+Tensor binary_float_op_kernel_v2(const Tensor& self, const Tensor& other, Functor functor);
+
+struct RreluWithNoiseFunctor {
+    double lower_, upper_;
+    bool training_;
+    RreluWithNoiseFunctor(double l, double u, bool t) : lower_(l), upper_(u), training_(t) {}
+    template<typename T> __device__ T operator()(T x, T r) const {
+        if (training_) return x <= static_cast<T>(0) ? x * r : x;
+        T slope = static_cast<T>((lower_ + upper_) / 2.0);
+        return x >= static_cast<T>(0) ? x : x * slope;
+    }
+};
+struct RreluWithNoiseTrainBackwardFunctor {
+    // d/dx [x <= 0 ? x*noise : x] = x <= 0 ? noise : 1 (ATen's forward writes
+    // noise=1 for positive elements; this kernel masks with self instead).
+    template<typename T> __device__ T operator()(T dy, T x, T r) const {
+        return x <= static_cast<T>(0) ? dy * r : dy;
+    }
+};
+struct RreluWithNoiseEvalBackwardFunctor {
+    double slope_;
+    explicit RreluWithNoiseEvalBackwardFunctor(double s) : slope_(s) {}
+    template<typename T> __device__ T operator()(T dy, T x) const {
+        return x >= static_cast<T>(0) ? dy : dy * static_cast<T>(slope_);
+    }
+};
+
+template <typename T, typename Func>
+__global__ void ternary_kernel_cuda_impl(int64_t n, const T* a, const T* b, const T* c, T* out, Func func) {
+    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    for (; i < n; i += stride) out[i] = func(a[i], b[i], c[i]);
+}
+
+// Forward declaration: first call sites (rrelu_with_noise) precede the
+// definition below, and nvcc's two-phase lookup needs the template declared.
+template<typename Functor>
+Tensor binary_float_op_kernel_v2(const Tensor& self, const Tensor& other, Functor functor);
+
+Tensor rrelu_with_noise_kernel_cuda(const Tensor& self, const Tensor& noise, Scalar lower, Scalar upper, bool training) {
+    return binary_float_op_kernel_v2(self, noise,
+        RreluWithNoiseFunctor(lower.toDouble(), upper.toDouble(), training));
+}
+Tensor rrelu_with_noise_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self, const Tensor& noise, Scalar lower, Scalar upper, bool training, bool self_is_result) {
+    // ATen Activation.cpp rrelu_with_noise_backward: training -> noise * grad
+    // (masked by self here, see functor note); eval -> leaky_relu_backward
+    // with slope (lower + upper) / 2.
+    if (training) {
+        if (grad_output.shape() != self.shape() || grad_output.shape() != noise.shape())
+            TP_THROW(RuntimeError, "rrelu_with_noise_backward: shape mismatch");
+        DType dt = grad_output.dtype();
+        if (dt != DType::Float32 && dt != DType::Float64)
+            TP_THROW(TypeError, "rrelu_with_noise_backward CUDA supports Float32/Float64 only");
+        Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(grad_output.shape()), dt, grad_output.device());
+        const int64_t n = grad_output.numel();
+        if (n == 0) return result;
+        const Tensor gc = grad_output.contiguous();
+        const Tensor sc = self.contiguous();
+        const Tensor nc = noise.contiguous();
+        dim3 block(256);
+        dim3 grid((unsigned)((n + 255) / 256));
+        if (dt == DType::Float32) {
+            ternary_kernel_cuda_impl<float><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
+                n, gc.data_ptr<float>(), sc.data_ptr<float>(), nc.data_ptr<float>(),
+                result.data_ptr<float>(), RreluWithNoiseTrainBackwardFunctor());
+        } else {
+            ternary_kernel_cuda_impl<double><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
+                n, gc.data_ptr<double>(), sc.data_ptr<double>(), nc.data_ptr<double>(),
+                result.data_ptr<double>(), RreluWithNoiseTrainBackwardFunctor());
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return result;
+    }
+    (void)self_is_result; // result >= 0 iff self >= 0 for a positive slope.
+    const double slope = (lower.toDouble() + upper.toDouble()) / 2.0;
+    return binary_float_op_kernel_v2(grad_output, self, RreluWithNoiseEvalBackwardFunctor(slope));
 }
 
 struct AcosFunctor { template<typename T> __device__ T operator()(T x) const { return acos(x); } };
@@ -1775,6 +1897,7 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, PointwiseKernels) {
     m.impl("gelu", gelu_kernel_cuda_v2);
     m.impl("gelu_backward", gelu_backward_kernel_cuda);
     m.impl("silu", silu_kernel_cuda);
+    m.impl("silu_backward", silu_backward_kernel_cuda);
     // Activations — see the ATen citations above each functor.
     m.impl("hardtanh", hardtanh_kernel_cuda);
     m.impl("hardtanh_backward", hardtanh_backward_kernel_cuda);
@@ -1793,6 +1916,10 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, PointwiseKernels) {
     m.impl("celu", celu_kernel_cuda);
     m.impl("softplus", softplus_kernel_cuda);
     m.impl("softplus_backward", softplus_backward_kernel_cuda);
+    m.impl("log_sigmoid", log_sigmoid_kernel_cuda);
+    m.impl("log_sigmoid_backward", log_sigmoid_backward_kernel_cuda);
+    m.impl("rrelu_with_noise", rrelu_with_noise_kernel_cuda);
+    m.impl("rrelu_with_noise_backward", rrelu_with_noise_backward_kernel_cuda);
     
     m.impl("clamp", clamp_kernel_cuda);
     m.impl("clamp_backward", clamp_backward_kernel_cuda);

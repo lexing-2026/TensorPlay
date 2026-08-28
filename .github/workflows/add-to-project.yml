@@ -1,0 +1,45 @@
+name: add-to-project
+
+# Adds every new issue and PR to the TensorPlay Roadmap project board, the
+# same way pytorch routes new work onto its project boards.
+#
+# NOTE: the default GITHUB_TOKEN cannot write to Projects. Create a fine-grained
+# PAT with read/write access to the "TensorPlay Roadmap" project and store it
+# as the PROJECT_TOKEN repository secret. Also update the project URL below
+# once the board exists (create it per RELEASE.md "Project board setup"; the
+# current token could not create it via API).
+
+on:
+  issues:
+    types: [opened]
+  pull_request_target:
+    types: [opened]
+
+permissions: {}
+
+jobs:
+  add-to-project:
+    name: add-to-project
+    runs-on: ubuntu-latest
+    steps:
+      # Secrets cannot be referenced in job/step `if` directly, so probe it
+      # through an env var first; the job no-ops until PROJECT_TOKEN exists.
+      - name: Check the PROJECT_TOKEN secret
+        id: check
+        env:
+          PROJECT_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+        shell: bash
+        run: |
+          if [[ -n "$PROJECT_TOKEN" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "PROJECT_TOKEN secret is not set; skipping project routing"
+          fi
+
+      - uses: actions/add-to-project@v1.0.2
+        if: ${{ steps.check.outputs.enabled == 'true' }}
+        with:
+          # TODO: replace <NUMBER> with the real project number once the
+          # TensorPlay Roadmap board has been created.
+          project-url: https://github.com/users/lexing-2026/projects/3
+          github-token: ${{ secrets.PROJECT_TOKEN }}

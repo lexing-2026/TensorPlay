@@ -203,7 +203,9 @@ Tensor cumsum_cpu(const Tensor& self, int64_t dim, std::optional<DType> dtype) {
     int64_t nd = self.dim();
     if (nd == 0) TP_THROW(RuntimeError, "cumsum: dimension not supported for scalar tensors");
     dim = wrap_dim(dim, nd);
-    DType out_dtype = dtype.value_or(self.dtype());
+    // ATen parity: bool inputs accumulate in int64 unless dtype overrides.
+    DType out_dtype = dtype.value_or(self.dtype() == DType::Bool ? DType::Int64
+                                                                 : self.dtype());
     Tensor src = (self.dtype() == out_dtype) ? self.contiguous() : self.to(out_dtype).contiguous();
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(src.shape()), out_dtype, src.device());
     int64_t d_size = src.size(dim);
