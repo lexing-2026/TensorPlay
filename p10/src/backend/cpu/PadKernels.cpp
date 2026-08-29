@@ -12,7 +12,6 @@ namespace tensorplay {
 namespace cpu {
 using namespace tensorplay::parallel;
 
-// Port of at::native::constant_pad_nd (aten/src/ATen/native/PadNd.cpp:29).
 // Composite over narrow/fill_/copy_ so one body serves CPU and CUDA; negative
 // pads crop the input through narrow, positive pads fill an output canvas.
 Tensor constant_pad_nd_cpu(const Tensor& self, const std::vector<int64_t>& pad, Scalar value) {
@@ -87,8 +86,6 @@ Tensor constant_pad_nd_cpu(const Tensor& self, const std::vector<int64_t>& pad, 
     return output;
 }
 
-// Port of torch::autograd::generated::constant_pad_nd_backward
-// (torch/csrc/autograd/FunctionsManual.cpp): the co-gradient is
 // constant_pad_nd(grad, -pad, 0), which uniformly zero-fills cropped regions
 // and slices padded ones.
 Tensor constant_pad_nd_backward_cpu(const Tensor& grad_output, const std::vector<int64_t>& pad) {
@@ -99,16 +96,13 @@ Tensor constant_pad_nd_backward_cpu(const Tensor& grad_output, const std::vector
 
 // ===========================================================================
 // Non-constant padding modes used by nn.Conv* padding_mode and F.pad
-// (torch: reflection_pad1d/2d/3d, replication_pad1d/2d/3d, circular_pad1d/2d/3d;
 // TensorPlay keeps the *_pad_nd spelling of its existing constant_pad_nd and
 // handles any rank in one kernel).
 // ===========================================================================
 namespace {
 
 // Maps a padded coordinate q back to a source coordinate for one padded dim.
-// Reflection mirrors once (the op layer enforces torch's pad < dim-size
 // rule), replication clamps to the edges, circular wraps modulo the dim
-// size -- the same index math as aten's ReflectionPad / ReplicationPadding
 // and the pad+roll composite used for circular.
 enum class PadIndexMode { Reflect, Replicate, Circular };
 
@@ -135,7 +129,7 @@ struct PadNdPlan {
     std::vector<int64_t> src_strides;  // contiguous strides of self
     std::vector<int64_t> dst_sizes;
     std::vector<int64_t> dst_strides;
-    std::vector<int64_t> pad_pairs;    // torch order: [l(last), r(last), ...]
+    std::vector<int64_t> pad_pairs;
 };
 
 inline PadNdPlan pad_plan(const Tensor& self, const std::vector<int64_t>& pad) {
@@ -266,13 +260,11 @@ void pad_mode_check(const char* name, const Tensor& self, const std::vector<int6
     for (int64_t i = 0; i < k; ++i) {
         const int64_t dim = self.dim() - 1 - i;
         if (mode == PadIndexMode::Reflect) {
-            // torch: "Padding size should be less than the corresponding
             // input dimension"
             if (pad[2 * i] >= self.size(dim) || pad[2 * i + 1] >= self.size(dim))
                 TP_THROW(ValueError, name,
                          ": padding size should be less than the corresponding input dimension");
         } else if (mode == PadIndexMode::Circular) {
-            // torch allows at most one wrap-around per side
             if (pad[2 * i] > self.size(dim) || pad[2 * i + 1] > self.size(dim))
                 TP_THROW(ValueError, name,
                          ": padding value causes wrapping around more than once");

@@ -67,7 +67,6 @@ bool have_avx512f() {
 }
 #endif
 
-// Torch's CPU foreach kernels execute reduced floating point pointwise ops in
 // float and write the result back to the tensor dtype after every op.  The
 // native optimizer loops below are intentionally scalar for Half/BFloat16,
 // so keep that observable cast point in one helper.  For float/double this is
@@ -152,7 +151,6 @@ inline void sgd_range_scalar(const T* grad, T* param, T* buf, bool has_buf,
 }
 
 // Fused-SGD scalar range.  sc holds {lr, momentum, 1-dampening,
-// weight_decay, grad_scale}; mirrors torch's _fused_sgd_ math.
 template <typename T>
 inline void fused_sgd_range_scalar(T* grad, T* param, T* buf, bool has_buf,
                                    bool first_step, bool nesterov,
@@ -175,7 +173,6 @@ inline void fused_sgd_range_scalar(T* grad, T* param, T* buf, bool has_buf,
 
 // Fused-Adam scalar range.  sc holds {beta1, lerp_weight(1-beta1), beta2,
 // 1-beta2, step_size, correction2_sqrt, eps, decay, wd_factor, grad_scale};
-// preserves torch _fused_adam_'s lerp branch selection for parity.
 template <typename T>
 inline void fused_adam_range_scalar(T* grad, T* param, T* m, T* v, T* maxv,
                                     bool amsgrad, bool adamw, bool coupled_wd,
@@ -214,7 +211,6 @@ inline void fused_adam_range_scalar(T* grad, T* param, T* m, T* v, T* maxv,
 }
 
 // Fused-Adagrad scalar range.  sc holds {corrected_lr, eps, weight_decay,
-// grad_scale}; the vector path below follows Torch's fused CPU kernel and
 // keeps the scalar helper for tails and non-x86 dtypes.
 template <typename T, typename M = T>
 inline void fused_adagrad_range_scalar(T* grad, T* param, T* state_sum,
@@ -1202,7 +1198,6 @@ void sgd_impl(const std::vector<Tensor>& params,
         static_cast<scalar_t>(weight_decay),
     };
 
-    // Match Torch's foreach optimizer contract: split all parameter tensors
     // into one horizontally fused work list, then schedule that list once.
     // Scheduling each parameter independently leaves large ResNet tensors
     // serialized behind a single worker and pays one barrier per tensor.
@@ -1289,10 +1284,8 @@ void adam_impl(const std::vector<Tensor>& params,
 }
 
 // Fused optimizers deliberately live in the native backend, just like
-// ATen's Fused{SGD,Adam,Adagrad}.  The Python optimizer only groups tensors
 // and selects the overload; it must not rebuild these algorithms from
 // pointwise Python calls.  `math_t` is the accumulation type used by the
-// half/bfloat16 paths, matching the opmath type used by Torch's CPU kernels.
 bool fused_found_inf(const std::optional<Tensor>& found_inf) {
     return found_inf.has_value() && found_inf->defined() &&
         found_inf->numel() == 1 && found_inf->item().toDouble() == 1.0;
@@ -1380,7 +1373,7 @@ void validate_fused_steps(const std::vector<Tensor>& params,
 }
 
 // Fused-SGD inner range.  sc holds {lr, momentum, 1-dampening,
-// weight_decay, grad_scale}; mirrors the original per-element math.
+// weight_decay, grad_scale}; implements the per-element update math.
 template <typename T, typename Ops>
 inline void fused_sgd_vec_range(T* grad, T* param, T* buf, bool has_buf,
                                 bool first_step, bool nesterov,
@@ -1512,8 +1505,7 @@ void fused_sgd_math(const std::vector<Tensor>& params,
 
 // Fused-Adam inner range.  sc holds {beta1, lerp_weight(1-beta1), beta2,
 // 1-beta2, step_size, correction2_sqrt, eps, decay, wd_factor,
-// grad_scale}; mirrors the original per-element math (lerp branch
-// preserved for numerical parity with torch's _fused_adam_).
+// grad_scale}; implements the per-element math (lerp branch
 template <typename T, typename Ops>
 inline void fused_adam_vec_range(T* grad, T* param, T* m, T* v, T* maxv,
                                  bool amsgrad, bool adamw, bool coupled_wd,
@@ -2009,7 +2001,6 @@ void fused_adagrad_tensor_lr_cpu(std::vector<Tensor> params,
 }
 
 // RMSprop is exposed as a single native CPU pass for the non-complex,
-// contiguous path.  Torch's Python implementation composes this algorithm
 // from five-to-eight foreach calls; keeping the state-step increment and the
 // element update in the same horizontal schedule removes those intermediate
 // tensor lists and barriers while preserving the scalar operation order.
@@ -2533,7 +2524,6 @@ void fused_rprop_math(
                     masked_grad > static_cast<math_t>(0) ? static_cast<math_t>(1) :
                     masked_grad < static_cast<math_t>(0) ? static_cast<math_t>(-1) :
                     static_cast<math_t>(0);
-                // Torch stores the post-backtracking gradient in ``prev``;
                 // a direction reversal therefore becomes zero for the next
                 // iteration.  Keeping the raw gradient here changes the
                 // following sign product and diverges after one step.
@@ -2786,7 +2776,6 @@ void fused_radam_math(
                     buffer = optimizer_round<scalar_t, math_t>(
                         math_t(1) / buffer);
                 } else {
-                    // Torch's zero rectification path obtains the same
                     // value through divide-by-zero and reciprocal.  Avoid
                     // manufacturing an infinity here; the surviving term is
                     // the unrectified step size.
@@ -2963,7 +2952,6 @@ TP_ADAFACTOR_APPLY_VEC(factored_apply_f64, double, __m512d, 512, pd, 8)
 #undef TP_ADAFACTOR_APPLY_VEC
 
 // The row/column variance updates are reductions over the gradient.  Keep
-// them in the same shape as ATen's vectorized norm kernels: rows reduce
 // contiguous data, while columns reduce a block of adjacent columns at once
 // so the strided dimension is still read as contiguous cache lines.
 #pragma GCC push_options

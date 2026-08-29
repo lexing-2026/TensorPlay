@@ -91,7 +91,6 @@ std::vector<int64_t> compute_reduction_shape(const Tensor& self, const std::vect
     return out_shape;
 }
 
-// Port of torch's review_reduce_result: as_strided the output to the input's
 // ndim, inserting size-1 dims with stride 0 at the reduced positions so the
 // iterator can identify the reduced dims from the output's strides.
 Tensor review_reduce_result(const Tensor& result, int64_t ndim, const std::vector<bool>& mask, bool keepdim) {
@@ -110,7 +109,6 @@ Tensor review_reduce_result(const Tensor& result, int64_t ndim, const std::vecto
 }
 
 // ops-based accumulator for the complex dtypes (no Vectorized<complex>
-// kernels exist here, mirroring the reduced ATen port): reduce/combine over
 // operator+ with per-thread partials combined by binary_kernel_reduce.
 template <typename scalar_t>
 struct CxSumOps {
@@ -122,7 +120,6 @@ struct CxSumOps {
 
 // Scalar accumulator used for reduced-precision norm paths. TensorIterator
 // promotes Half/BFloat16 input to float when the output is float, matching
-// ATen's opmath accumulation while retaining one reduction pass.
 template <typename scalar_t, typename acc_t, typename out_t = acc_t>
 struct NormTwoOps {
     acc_t reduce(acc_t acc, scalar_t data, int64_t) const {
@@ -137,7 +134,6 @@ struct NormTwoOps {
 };
 
 // L2 norm fast path. The previous TensorPlay implementation composed
-// abs -> pow -> sum -> pow, materializing several full tensors. Torch's
 // native path reduces squares directly; this is particularly important for
 // Muon's bfloat16 normalization step.
 Tensor norm_kernel_impl(const Tensor& self, double p) {
@@ -161,7 +157,6 @@ Tensor norm_kernel_impl(const Tensor& self, double p) {
     if (self.dtype() == DType::Float16 || self.dtype() == DType::BFloat16) {
         // Keep the input type in the reduction op and accumulate in float.
         // TensorIterator's reduced-precision path performs the same
-        // opmath-style promotion as ATen without materializing abs/pow/sum.
         Tensor out = Tensor::zeros({}, DType::Float32, self.device());
         TensorIterator iter = TensorIterator::reduce_op(out, self);
         if (self.dtype() == DType::Float16) {
@@ -301,7 +296,6 @@ static bool try_sum_real_avx512(const void* xv, int64_t n, DType dt,
 
 // TensorIterator-based reduction kernel: adds one input element into the
 // output elementwise (out = out + in), vectorized over 4 accumulators.
-// Accumulation happens in the output dtype, matching torch's CPU semantics
 // (the input is pre-cast to out_dtype by the caller).
 static void sum_kernel_iter(TensorIteratorBase& iter) {
 #define OP_CASE(ctype, name) \
@@ -339,7 +333,6 @@ Tensor sum_kernel_impl(const Tensor& self, DType dtype) {
          }
     }
 
-    // ATen alignment: Half/BFloat16 sums accumulate in float32 (acc type);
     // reduced complexes accumulate in complex64.
     DType acc_dtype = out_dtype;
     if (isReducedFloatingType(out_dtype)) {
@@ -350,7 +343,6 @@ Tensor sum_kernel_impl(const Tensor& self, DType dtype) {
 
     Tensor out = Tensor::zeros({}, acc_dtype, self.device());
 
-    // torch's make_reduction: pre-cast the input to the output dtype so the
     // iterator's common dtype matches out_dtype.
     Tensor input = self;
     if (self.dtype() != acc_dtype) {
@@ -413,7 +405,6 @@ Tensor sum_dim_kernel_impl(const Tensor& self, const std::vector<int64_t>& dims,
     }
     
     std::vector<int64_t> out_shape = compute_reduction_shape(self, dims, keepdim);
-    // ATen alignment: accumulate reduced floats in float32; reduced
     // complexes in complex64.
     DType acc_dtype = out_dtype;
     if (isReducedFloatingType(out_dtype)) {
@@ -423,7 +414,6 @@ Tensor sum_dim_kernel_impl(const Tensor& self, const std::vector<int64_t>& dims,
     }
     Tensor out = Tensor::zeros(out_shape, acc_dtype, self.device());
     
-    // torch's make_reduction: pre-cast the input to the output dtype.
     Tensor input = self;
     if (self.dtype() != acc_dtype) {
         input = self.to(acc_dtype);
@@ -468,7 +458,6 @@ T get_highest() {
     }
 }
 
-// zmath.h max_impl/min_impl: NaN propagates for floating types (torch.max
 // returns NaN when any element is NaN), plain compare otherwise.
 template <typename T>
 inline T nan_max(T a, T b) {
@@ -487,8 +476,6 @@ inline T nan_min(T a, T b) {
 }
 
 // Pair-tracking ops for reductions whose identity value cannot round-trip
-// through binary_kernel_reduce_vec's double ident (ATen's int64 min special
-// case, github.com/pytorch/pytorch/issues/43254): INT64_MAX/UINT64_MAX lose
 // precision as doubles and would corrupt the identity fill.
 template <typename scalar_t>
 struct ExtremumValuePairOps {
@@ -505,12 +492,10 @@ struct ExtremumValuePairOps {
     bool (*cmp)(scalar_t, scalar_t);
 };
 
-// Full-tensor t.max(): port of ATen max_values_kernel_impl — iterator-driven,
 // so the scan is parallelized with SIMD accumulators inside
 // binary_kernel_reduce_vec instead of one serial scalar pass.
 Tensor max_kernel_impl(const Tensor& self) {
     if (self.numel() == 0) {
-        // ATen parity (ReduceOpsUtils.h zero_numel_check_dims): full reduction
         // over an empty tensor has no identity.
         TP_THROW(RuntimeError, "max(): Expected reduction dim to be specified for input.numel() == 0. "
                  "Specify the reduction dim with the 'dim' argument.");
@@ -536,8 +521,6 @@ Tensor max_kernel_impl(const Tensor& self) {
 }
 
 std::tuple<Tensor, Tensor> max_dim_kernel_impl(const Tensor& self, int64_t dim0, bool keepdim) {
-    // torch.max(input, dim) -> (values, indices); strict compare keeps the
-    // FIRST maximal index, matching ATen's argmax pairing.
     const int64_t nd = self.dim();
     TP_CHECK(nd > 0, "max(): Expected input to have at least one dimension");
     const int64_t dim = dim0 < 0 ? dim0 + nd : dim0;
@@ -616,9 +599,7 @@ Tensor min_kernel_impl(const Tensor& self) {
     Tensor out = Tensor::empty({}, self.dtype(), self.device());
     TensorIterator iter = TensorIterator::reduce_op(out, input);
 
-    // ATen parity: int64 min cannot express upper_bound<int64_t>() through
     // the vec path's double ident, so it reduces with pair-tracking ops
-    // instead (github.com/pytorch/pytorch/issues/43254). Same holds for the
     // unsigned 64-bit variant whose maximum also rounds up as a double.
     if (input.dtype() == DType::Int64 || input.dtype() == DType::UInt64) {
         #define TP_MIN_INT64_CASE(ctype, name) \
@@ -654,7 +635,6 @@ Tensor min_kernel_impl(const Tensor& self) {
 }
 
 std::tuple<Tensor, Tensor> min_dim_kernel_impl(const Tensor& self, int64_t dim0, bool keepdim) {
-    // torch.min(input, dim) -> (values, indices); strict compare keeps the
     // FIRST minimal index.
     const int64_t nd = self.dim();
     TP_CHECK(nd > 0, "min(): Expected input to have at least one dimension");
@@ -751,7 +731,6 @@ Tensor prod_kernel_impl(const Tensor& self, DType dtype) {
     }
     
     switch (out_dtype) {
-        // Complex parity with ATen: prod is defined over complex dtypes.
         TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(OP_CASE)
         default: TP_THROW(NotImplementedError, "prod not implemented for this dtype");
     }
@@ -1003,7 +982,6 @@ Tensor any_dim_kernel_impl(const Tensor& self, const std::vector<int64_t>& dims,
 // Argmax/Argmin
 Tensor argmax_kernel_impl(const Tensor& self, std::optional<int64_t> dim, bool keepdim) {
     if (!dim.has_value()) {
-        // ATen parity (ReduceOps.cpp check_argmax_argmin): argmax over an
         // empty flatten has no well-defined index.
         if (self.numel() == 0) {
             TP_THROW(IndexError,
@@ -1041,7 +1019,6 @@ Tensor argmax_kernel_impl(const Tensor& self, std::optional<int64_t> dim, bool k
     
     int64_t d = dim.value();
     if (d < 0) d += self.dim();
-    // ATen parity: reducing a size-0 dim would divide numel by size below.
     if (self.size(d) == 0) {
         TP_THROW(IndexError, "argmax(): Expected reduction dim ", d, " to have non-zero size.");
     }
@@ -1178,7 +1155,6 @@ Tensor median_kernel_impl(const Tensor& self) {
     Tensor t = detail::contiguous_clone(self).view({-1});
     int64_t n = t.numel();
     if (n == 0) {
-        // torch Sorting.cpp:752: full({}, NaN).to(self.options()) — NaN stays
         // NaN for float dtypes, converts to true for bool, lowest() for
         // signed ints and 0 for unsigned ints.
         Tensor out = Tensor::empty({}, self.dtype(), t.device());
@@ -1200,7 +1176,6 @@ Tensor median_kernel_impl(const Tensor& self) {
     }
 
     // nth_element finds the n-th smallest element.
-    // For even n, PyTorch returns the smaller of the two middle elements.
     // (n-1)/2 gives the lower index.
     int64_t mid = (n - 1) / 2;
     

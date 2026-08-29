@@ -38,7 +38,6 @@ Tensor sum_dim_kernel(const Tensor& self, std::vector<int64_t> dims, bool keepdi
 }
 
 Tensor mean_kernel(const Tensor& self, DType dtype) {
-    // torch parity: mean over complex tensors stays complex
     DType out_dtype = (dtype == DType::Undefined) ? (isFloatingOrComplexType(self.dtype()) ? self.dtype() : DType::Float32) : dtype;
     Tensor s = sum_kernel(self, out_dtype);
     return s / Scalar((float)self.numel());
@@ -93,7 +92,6 @@ Tensor max_kernel(const Tensor& self) {
     return max_stub(DeviceType::CPU, self);
 }
 
-// Autograd helper for sum.dim_IntList (torch's sum_to_size): restore reduced
 // singleton dims and broadcast back to the input shape.
 Tensor sum_dim_backward_kernel(const Tensor& grad_output, const Tensor& self,
                                const std::vector<int64_t>& dims, bool keepdim) {
@@ -166,7 +164,6 @@ Tensor argmin_kernel(const Tensor& self, std::optional<int64_t> dim, bool keepdi
 Tensor var_kernel(const Tensor& self, int64_t correction) {
     if (self.numel() == 0) return Tensor::empty({}, DType::Float32, self.device()).fill_(Scalar(std::numeric_limits<float>::quiet_NaN()));
     if (isComplexType(self.dtype())) {
-        // Upstream ATen semantics (aten/src/ATen/native/ReduceOps.cpp):
         // complex variance = E|z - mean|^2 == var(re) + var(imag), and the
         // result dtype is the real counterpart.
         Tensor diff = self - self.mean();

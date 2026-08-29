@@ -9,6 +9,7 @@ set(P10_SOURCES
     src/Dispatcher.cpp
     src/DispatchStub.cpp
     src/Exception.cpp
+    src/FileCheck.cpp
     src/Generator.cpp
     src/GradMode.cpp
     src/InferenceMode.cpp
@@ -30,6 +31,7 @@ set(P10_SOURCES
     src/backend/cpu/ComparisonKernels.cpp
     src/backend/cpu/ConvKernels.cpp
     src/backend/cpu/CopyKernels.cpp
+    src/backend/cpu/Cross.cpp
     src/backend/cpu/SparseKernels.cpp
     src/backend/cpu/QuantKernels.cpp
     src/backend/cpu/ForwardKernels.cpp
@@ -45,6 +47,14 @@ set(P10_SOURCES
     src/backend/cpu/MarginLossKernels.cpp
     src/backend/cpu/UpsampleKernels.cpp
     src/backend/cpu/MiscKernels.cpp
+    # TensorShape.cpp, LinearAlgebra.cpp, TensorFactories.cpp, Itertools.cpp.
+    src/backend/cpu/UnaryOps.cpp
+    src/backend/cpu/Pooling.cpp
+    src/backend/cpu/MaxPooling.cpp
+    src/backend/cpu/TensorShape.cpp
+    src/backend/cpu/LinearAlgebra.cpp
+    src/backend/cpu/TensorFactories.cpp
+    src/backend/cpu/Itertools.cpp
     src/backend/cpu/PadKernels.cpp
     src/backend/cpu/NormalizationKernels.cpp
     src/backend/cpu/RandomKernels.cpp
@@ -63,6 +73,32 @@ set(P10_SOURCES
     src/backend/cpu/SpecialKernels.cpp
     src/backend/cpu/SpectralKernels.cpp
     src/backend/cpu/InplaceCompletionKernels.cpp
+
+    # Backend-neutral composite kernels, one file per operator category
+    # (CompositeCommon.h holds the shared helpers).
+    # Registered under the Composite dispatch key; see the files themselves.
+    src/backend/composite/Activation.cpp
+    src/backend/composite/ChanelShuffle.cpp
+    src/backend/composite/CompositeViewCopyKernels.cpp
+    src/backend/composite/ConvolutionTBC.cpp
+    src/backend/composite/Distance.cpp
+    src/backend/composite/Dropout.cpp
+    src/backend/composite/Histogram.cpp
+    src/backend/composite/Integration.cpp
+    src/backend/composite/Itertools.cpp
+    src/backend/composite/Linear.cpp
+    src/backend/composite/LinearAlgebra.cpp
+    src/backend/composite/Pointwise.cpp
+    src/backend/composite/RNN.cpp
+    src/backend/composite/TensorAdvancedIndexing.cpp
+    src/backend/composite/TensorCompare.cpp
+    src/backend/composite/TensorFactories.cpp
+    src/backend/composite/TensorProperties.cpp
+    src/backend/composite/TensorShape.cpp
+    src/backend/composite/TypeProperties.cpp
+    src/backend/composite/UnaryOps.cpp
+    src/backend/composite/Unique.cpp
+
     src/Einsum.cpp
     src/Profiler.cpp
     src/ProfilerGpu.cpp
@@ -88,21 +124,33 @@ if(USE_CUDA)
         src/backend/cuda/CUDARuntimeKernels.cu
         src/backend/cuda/ArithmeticKernels.cu
         src/backend/cuda/CopyKernels.cu
+        src/backend/cuda/Cross.cu
         src/backend/cuda/SparseKernels.cu
         src/backend/cuda/QuantKernels.cu
         src/backend/cuda/ForwardKernels.cu
         src/backend/cuda/FactoryKernels.cu
         src/backend/cuda/EmbeddingKernels.cu
         src/backend/cuda/PointwiseKernels.cu
+        src/backend/cuda/UnaryOps.cu
+        src/backend/cuda/Pooling.cu
+        src/backend/cuda/MaxPooling.cu
+        src/backend/cuda/AveragePool3d.cu
+        src/backend/cuda/AdaptiveAveragePooling3d.cu
+        src/backend/cuda/TensorShape.cu
+        src/backend/cuda/LinearAlgebra.cu
+        src/backend/cuda/TensorFactories.cu
+        src/backend/cuda/Itertools.cu
         src/backend/cuda/MiscKernels.cu
         src/backend/cuda/UpsampleKernels.cu
         src/backend/cuda/LinearAlgebraKernels.cu
         src/backend/cuda/LinalgKernels.cu
         src/backend/cuda/LinalgSVD.cu
+        src/backend/cuda/LinalgLDL.cu
         src/backend/cuda/CudaBlasGemm.cpp
         src/backend/cuda/ActivationKernels.cu
         src/backend/cuda/NormalizationKernels.cu
         src/backend/cuda/LossKernels.cu
+        src/backend/cuda/LossCTC.cu
         src/backend/cuda/ConvKernels.cu
         src/backend/cuda/PadKernels.cu
         src/backend/cuda/PoolingKernels.cu
@@ -135,7 +183,6 @@ set_source_files_properties(${GEN_CPP} PROPERTIES GENERATED TRUE)
 # ------------------------------------------------------------------
 # CPU kernel multi-version compilation (DEFAULT + AVX2)
 # ------------------------------------------------------------------
-# Kernels in TP_CPU_KERNEL_SRCS are compiled twice, mirroring PyTorch's
 # native/cpu mechanism: once with no ISA-specific flags
 # (CPU_CAPABILITY=DEFAULT) and once with AVX2 enabled
 # (CPU_CAPABILITY_AVX2 -DCPU_CAPABILITY=AVX2 -mavx2 -mfma). Both copies are
@@ -153,7 +200,6 @@ set(TP_CPU_KERNEL_SRCS
 )
 
 if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
-    # Probe AVX512 support the way torch's Codegen.cmake does
     # (CXX_AVX512_FOUND): only build the tier when the compiler accepts the
     # ISA flags, mirroring CPU_CAPABILITY_NAMES/FLAGS there.
     include(CheckCXXCompilerFlag)
@@ -164,7 +210,6 @@ if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
         add_library(p10_kernel_default_${KERNEL_NAME} OBJECT ${KERNEL_SRC})
         set_target_properties(p10_kernel_default_${KERNEL_NAME} PROPERTIES
             POSITION_INDEPENDENT_CODE ON)
-        # torch parity (Codegen.cmake): HAVE_* capability macros are global
         # (add_compile_definitions), so every tier sees the same DispatchStub
         # layout; only CPU_CAPABILITY differs per copy.
         target_compile_definitions(p10_kernel_default_${KERNEL_NAME} PRIVATE
@@ -253,7 +298,6 @@ endif()
 if(USE_CUDA)
     # The native aligned flash path consumes only the standalone CUTE/CUTLASS
     # headers and flash kernels.  It intentionally does not include or link
-    # ATen; when the local Torch source tree is absent the TensorPlay fallback
     # kernels remain buildable.
     set(TP_NATIVE_FLASH_SRC
         "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/pytorch/third_party/flash-attention/csrc/flash_attn/src")
@@ -285,6 +329,12 @@ target_include_directories(p10 PUBLIC
     ${GEN_BASE_DIR}
 )
 
+# hand-written tpx headers (Autograd.h, Node.h).  Expose tpx/include so those
+# generated/native translation units resolve.
+target_include_directories(p10 PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../tpx/include>
+)
+
 target_compile_definitions(p10 PRIVATE P10_EXPORTS)
 target_compile_definitions(p10 PRIVATE ${BLAS_COMPILE_DEFS})
 
@@ -306,7 +356,6 @@ if(USE_CUDA)
         target_include_directories(p10 PRIVATE "${CUDAToolkit_INCLUDE_DIRS}/cccl")
     endif()
 
-    # NCCL, mirroring pytorch's Dependencies.cmake: option + FindNCCL.cmake,
     # positive USE_NCCL define, graceful downgrade when absent.
     option(USE_NCCL "Use NCCL for tensorplay.distributed" ON)
     if(USE_NCCL)

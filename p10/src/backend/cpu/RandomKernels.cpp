@@ -2,16 +2,20 @@
 #include "Dispatcher.h"
 #include "Generator.h"
 #include "DistributionsHelper.h"
+#include "DistributionDispatch.h"
 #include "Exception.h"
+#include "tensorplay/ops/TPXOpsGenerated.h"
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
+#include <vector>
 
 namespace tensorplay {
 namespace cpu {
 
 namespace {
 
-// Port of torch's sample_poisson (adapted from Numpy's distributions.c):
 // transformed rejection for lambda >= 10, multiplication (Knuth) otherwise.
 int64_t sample_poisson(double lambda, Generator* generator) {
     uniform_real_distribution<double> standard_uniform(0.0, 1.0);
@@ -58,7 +62,6 @@ int64_t sample_poisson(double lambda, Generator* generator) {
     }
 }
 
-// Dispatch over floating dtypes torch's distribution kernels support
 // (AT_DISPATCH_FLOATING_TYPES_AND2(Half, BFloat16)).
 template <typename Func>
 void dispatch_floating(DType dtype, Func&& fn) {
@@ -72,7 +75,6 @@ void dispatch_floating(DType dtype, Func&& fn) {
     }
 }
 
-// Dispatch over all dtypes torch's random_/geometric_ kernels support
 // (AT_DISPATCH_ALL_TYPES_AND2(Half, BFloat16) plus Bool).
 template <typename Func>
 void dispatch_all(DType dtype, Func&& fn) {
@@ -95,46 +97,136 @@ void dispatch_all(DType dtype, Func&& fn) {
     }
 }
 
+// In-place sampling requires each destination element to be independently
+// addressable: a stride-0 dimension with more than one element aliases the
+// whole dimension and would make the draw order observable.
+void check_writable_inplace(const Tensor& t) {
+    const auto sizes = static_cast<std::vector<int64_t>>(t.shape());
+    const auto strides = t.strides();
+    for (size_t i = 0; i < sizes.size(); ++i) {
+        if (strides[i] == 0 && sizes[i] > 1) {
+            TP_THROW(RuntimeError,
+                     "unsupported operation: more than one element of the written-to tensor "
+                     "refers to a single memory location. Please clone() the tensor before "
+                     "performing the operation.");
+        }
+    }
+}
+
+// Row-major traversal (last dimension fastest) over an arbitrary strided
+// layout, invoking fn with a reference to each element.  Contiguous tensors
+// take a flat fast path; strided tensors recurse dimension by dimension so
+// expanded/transposed views stay in bounds.  The pointer's constness decides
+// whether fn receives mutable references.
+template <typename scalar_t, typename Func>
+void strided_for_each(scalar_t* data, const std::vector<int64_t>& sizes,
+                      const std::vector<int64_t>& strides, int64_t dim, Func&& fn) {
+    if (dim == static_cast<int64_t>(sizes.size())) {
+        fn(*data);
+        return;
+    }
+    const int64_t count = sizes[dim];
+    const int64_t stride = strides[dim];
+    for (int64_t i = 0; i < count; ++i) {
+        strided_for_each(data + i * stride, sizes, strides, dim + 1, fn);
+    }
+}
+
+template <typename scalar_t, typename Func>
+void for_each_element(Tensor& t, Func&& fn) {
+    scalar_t* data = t.data_ptr<scalar_t>();
+    if (t.is_contiguous()) {
+        const int64_t n = t.numel();
+        for (int64_t i = 0; i < n; ++i) {
+            fn(data[i]);
+        }
+        return;
+    }
+    const auto sizes = static_cast<std::vector<int64_t>>(t.shape());
+    const auto strides = t.strides();
+    strided_for_each(data, sizes, strides, 0, fn);
+}
+
+template <typename scalar_t, typename Func>
+void for_each_element_const(const Tensor& t, Func&& fn) {
+    const scalar_t* data = t.data_ptr<scalar_t>();
+    if (t.is_contiguous()) {
+        const int64_t n = t.numel();
+        for (int64_t i = 0; i < n; ++i) {
+            fn(data[i]);
+        }
+        return;
+    }
+    const auto sizes = static_cast<std::vector<int64_t>>(t.shape());
+    const auto strides = t.strides();
+    strided_for_each(data, sizes, strides, 0, fn);
+}
+
+// Lockstep row-major traversal of two same-shape tensors, invoking fn with
+// one element of each.
+template <typename scalar_t, typename Func>
+void strided_for_each_pair(const scalar_t* a, const std::vector<int64_t>& strides_a,
+                           const scalar_t* b, const std::vector<int64_t>& strides_b,
+                           const std::vector<int64_t>& sizes, int64_t dim, Func&& fn) {
+    if (dim == static_cast<int64_t>(sizes.size())) {
+        fn(*a, *b);
+        return;
+    }
+    for (int64_t i = 0; i < sizes[dim]; ++i) {
+        strided_for_each_pair(a + i * strides_a[dim], strides_a,
+                              b + i * strides_b[dim], strides_b, sizes, dim + 1, fn);
+    }
+}
+
+template <typename scalar_t, typename Func>
+void for_each_element_pair(const Tensor& a, const Tensor& b, Func&& fn) {
+    const scalar_t* pa = a.data_ptr<scalar_t>();
+    const scalar_t* pb = b.data_ptr<scalar_t>();
+    if (a.is_contiguous() && b.is_contiguous()) {
+        const int64_t n = a.numel();
+        for (int64_t i = 0; i < n; ++i) {
+            fn(pa[i], pb[i]);
+        }
+        return;
+    }
+    const auto sizes = static_cast<std::vector<int64_t>>(a.shape());
+    strided_for_each_pair(pa, a.strides(), pb, b.strides(), sizes, 0, fn);
+}
+
 } // namespace
 
 Tensor bernoulli_kernel(const Tensor& self) {
     Tensor out(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
-    int64_t n = self.numel();
     auto& gen = default_generator();
 
     if (self.dtype() == DType::Float32) {
-        // torch parity: float bernoulli consumes the SAME random32 stream as
         // rand() (24-bit mantissa mask) and compares strictly against p.
-        const float* inp = self.data_ptr<float>();
         float* res = out.data_ptr<float>();
-        for (int64_t i = 0; i < n; ++i) {
+        for_each_element_const<float>(self, [&](const float& p) {
             const uint32_t r = gen.random();
             const double u = (r & ((1u << 24) - 1)) * std::ldexp(1.0, -24);
-            res[i] = u < static_cast<double>(inp[i]) ? 1.0f : 0.0f;
-        }
+            *res++ = u < static_cast<double>(p) ? 1.0f : 0.0f;
+        });
     } else if (self.dtype() == DType::Float64) {
-        const double* inp = self.data_ptr<double>();
         double* res = out.data_ptr<double>();
         uniform_real_distribution<double> uniform(0.0, 1.0);
-        for (int64_t i = 0; i < n; ++i) {
-            res[i] = uniform(&gen) < inp[i] ? 1.0 : 0.0;
-        }
+        for_each_element_const<double>(self, [&](const double& p) {
+            *res++ = uniform(&gen) < p ? 1.0 : 0.0;
+        });
     } else if (self.dtype() == DType::Float16 || self.dtype() == DType::BFloat16) {
         // Probabilities are read in float precision; output keeps self dtype.
         if (self.dtype() == DType::Float16) {
-            const Half* inp = self.data_ptr<Half>();
             Half* res = out.data_ptr<Half>();
             uniform_real_distribution<double> uniform(0.0, 1.0);
-            for (int64_t i = 0; i < n; ++i) {
-                res[i] = static_cast<Half>(uniform(&gen) < static_cast<double>(inp[i]) ? 1.0f : 0.0f);
-            }
+            for_each_element_const<Half>(self, [&](const Half& p) {
+                *res++ = static_cast<Half>(uniform(&gen) < static_cast<double>(p) ? 1.0f : 0.0f);
+            });
         } else {
-            const BFloat16* inp = self.data_ptr<BFloat16>();
             BFloat16* res = out.data_ptr<BFloat16>();
             uniform_real_distribution<double> uniform(0.0, 1.0);
-            for (int64_t i = 0; i < n; ++i) {
-                res[i] = static_cast<BFloat16>(uniform(&gen) < static_cast<double>(inp[i]) ? 1.0f : 0.0f);
-            }
+            for_each_element_const<BFloat16>(self, [&](const BFloat16& p) {
+                *res++ = static_cast<BFloat16>(uniform(&gen) < static_cast<double>(p) ? 1.0f : 0.0f);
+            });
         }
     } else {
         TP_THROW(NotImplementedError, "bernoulli only supports floating dtype inputs");
@@ -147,7 +239,6 @@ Tensor normal_kernel(const Tensor& mean, const Tensor& std) {
         TP_THROW(RuntimeError, "normal: mean and std must have same size (broadcasting not implemented yet)");
     }
     Tensor out(static_cast<std::vector<int64_t>>(mean.shape()), mean.dtype(), mean.device());
-    int64_t n = mean.numel();
     auto& gen = default_generator();
     if (mean.dtype() != std.dtype()) {
         TP_THROW(RuntimeError, "normal: mean and std must have the same dtype");
@@ -155,30 +246,28 @@ Tensor normal_kernel(const Tensor& mean, const Tensor& std) {
 
     dispatch_floating(mean.dtype(), [&](auto tag) {
         using scalar_t = decltype(tag);
-        const scalar_t* m_data = mean.data_ptr<scalar_t>();
-        const scalar_t* s_data = std.data_ptr<scalar_t>();
         scalar_t* out_data = out.data_ptr<scalar_t>();
-        for (int64_t i = 0; i < n; ++i) {
-            normal_distribution<double> dist(static_cast<double>(m_data[i]),
-                                             static_cast<double>(s_data[i]));
-            out_data[i] = static_cast<scalar_t>(dist(&gen));
-        }
+        int64_t k = 0;
+        for_each_element_pair<scalar_t>(mean, std, [&](const scalar_t& m, const scalar_t& s) {
+            normal_distribution<double> dist(static_cast<double>(m),
+                                             static_cast<double>(s));
+            out_data[k++] = static_cast<scalar_t>(dist(&gen));
+        });
     });
     return out;
 }
 
 Tensor poisson_kernel(const Tensor& self) {
     Tensor out(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
-    int64_t n = self.numel();
     auto& gen = default_generator();
 
     dispatch_floating(self.dtype(), [&](auto tag) {
         using scalar_t = decltype(tag);
-        const scalar_t* inp = self.data_ptr<scalar_t>();
         scalar_t* res = out.data_ptr<scalar_t>();
-        for (int64_t i = 0; i < n; ++i) {
-            res[i] = static_cast<scalar_t>(sample_poisson(static_cast<double>(inp[i]), &gen));
-        }
+        int64_t k = 0;
+        for_each_element_const<scalar_t>(self, [&](const scalar_t& p) {
+            res[k++] = static_cast<scalar_t>(sample_poisson(static_cast<double>(p), &gen));
+        });
     });
     return out;
 }
@@ -187,123 +276,127 @@ Tensor poisson_kernel(const Tensor& self) {
 // Note: Must take Tensor& and return Tensor& to match DispatchStub signature for Tensor(a!)
 
 Tensor& bernoulli_inplace_kernel(Tensor& self) {
-    int64_t n = self.numel();
     auto& gen = default_generator();
+    if (self.numel() == 0) return self;
+    check_writable_inplace(self);
 
     if (self.dtype() == DType::Float32) {
-        // Same random32 stream as rand()/bernoulli out-of-place (torch parity).
-        float* data = self.data_ptr<float>();
-        for (int64_t i = 0; i < n; ++i) {
+        // rand() (24-bit mantissa mask) and compares strictly against p.
+        for_each_element<float>(self, [&](float& v) {
             const uint32_t r = gen.random();
             const double u = (r & ((1u << 24) - 1)) * std::ldexp(1.0, -24);
-            data[i] = u < static_cast<double>(data[i]) ? 1.0f : 0.0f;
-        }
+            v = u < static_cast<double>(v) ? 1.0f : 0.0f;
+        });
         return self;
     }
 
     dispatch_floating(self.dtype(), [&](auto tag) {
         using scalar_t = decltype(tag);
-        scalar_t* data = self.data_ptr<scalar_t>();
         uniform_real_distribution<double> uniform(0.0, 1.0);
-        for (int64_t i = 0; i < n; ++i) {
-            data[i] = static_cast<scalar_t>(
-                uniform(&gen) < static_cast<double>(data[i]) ? 1.0 : 0.0);
-        }
+        for_each_element<scalar_t>(self, [&](scalar_t& v) {
+            v = static_cast<scalar_t>(uniform(&gen) < static_cast<double>(v) ? 1.0 : 0.0);
+        });
     });
     return self;
 }
 
 Tensor& cauchy_kernel(Tensor& self, double median, double sigma) {
-    int64_t n = self.numel();
     auto& gen = default_generator();
+    TP_THROW_IF(sigma <= 0.0, RuntimeError, "cauchy_ expects sigma > 0.0, but found sigma=", sigma);
+    if (self.numel() == 0) return self;
+    check_writable_inplace(self);
     cauchy_distribution<double> dist(median, sigma);
 
     dispatch_floating(self.dtype(), [&](auto tag) {
         using scalar_t = decltype(tag);
-        scalar_t* data = self.data_ptr<scalar_t>();
-        for (int64_t i = 0; i < n; ++i) {
-            data[i] = static_cast<scalar_t>(dist(&gen));
-        }
+        for_each_element<scalar_t>(self, [&](scalar_t& v) {
+            v = static_cast<scalar_t>(dist(&gen));
+        });
     });
     return self;
 }
 
 Tensor& exponential_kernel(Tensor& self, double lambd) {
-    int64_t n = self.numel();
     auto& gen = default_generator();
+    TP_THROW_IF(lambd <= 0.0, RuntimeError, "exponential_ expects lambda > 0.0, but found lambda=", lambd);
+    if (self.numel() == 0) return self;
+    check_writable_inplace(self);
     exponential_distribution<double> dist(lambd);
 
     dispatch_floating(self.dtype(), [&](auto tag) {
         using scalar_t = decltype(tag);
-        scalar_t* data = self.data_ptr<scalar_t>();
-        for (int64_t i = 0; i < n; ++i) {
-            data[i] = static_cast<scalar_t>(dist(&gen));
-        }
+        for_each_element<scalar_t>(self, [&](scalar_t& v) {
+            v = static_cast<scalar_t>(dist(&gen));
+        });
     });
     return self;
 }
 
 Tensor& geometric_kernel(Tensor& self, double p) {
-    int64_t n = self.numel();
     auto& gen = default_generator();
+    TP_THROW_IF(!(0.0 < p && p < 1.0), RuntimeError, "geometric_ expects p to be in (0, 1), but got p=", p);
+    if (self.numel() == 0) return self;
+    check_writable_inplace(self);
     geometric_distribution<double> dist(p);
 
     dispatch_all(self.dtype(), [&](auto tag) {
         using scalar_t = decltype(tag);
-        scalar_t* data = self.data_ptr<scalar_t>();
-        for (int64_t i = 0; i < n; ++i) {
-            data[i] = static_cast<scalar_t>(dist(&gen));
-        }
+        for_each_element<scalar_t>(self, [&](scalar_t& v) {
+            v = static_cast<scalar_t>(dist(&gen));
+        });
     });
     return self;
 }
 
 Tensor& log_normal_kernel(Tensor& self, double mean, double std) {
-    int64_t n = self.numel();
     auto& gen = default_generator();
+    TP_THROW_IF(std <= 0.0, RuntimeError, "log_normal_ expects std > 0.0, but found std=", std);
+    if (self.numel() == 0) return self;
+    check_writable_inplace(self);
     lognormal_distribution<double> dist(mean, std);
 
     dispatch_floating(self.dtype(), [&](auto tag) {
         using scalar_t = decltype(tag);
-        scalar_t* data = self.data_ptr<scalar_t>();
-        for (int64_t i = 0; i < n; ++i) {
-            data[i] = static_cast<scalar_t>(dist(&gen));
-        }
+        for_each_element<scalar_t>(self, [&](scalar_t& v) {
+            v = static_cast<scalar_t>(dist(&gen));
+        });
     });
     return self;
 }
 
 Tensor& normal_inplace_kernel(Tensor& self, double mean, double std) {
-    int64_t size = self.numel();
     auto& gen = default_generator();
+    TP_THROW_IF(std < 0.0, RuntimeError, "normal expects std >= 0.0, but found std ", std);
+    if (self.numel() == 0) return self;
+    check_writable_inplace(self);
+    const int64_t size = self.numel();
 
     dispatch_floating(self.dtype(), [&](auto tag) {
         using scalar_t = decltype(tag);
         using math_t = opmath_t<scalar_t>;
-        scalar_t* data = self.data_ptr<scalar_t>();
         if constexpr (std::is_same_v<scalar_t, math_t>) {
             if (size >= 16 && self.is_contiguous()) {
+                scalar_t* data = self.data_ptr<scalar_t>();
                 normal_fill<math_t>(data, size, static_cast<math_t>(mean),
                                     static_cast<math_t>(std), &gen);
             } else {
                 normal_distribution<double> dist(mean, std);
-                for (int64_t i = 0; i < size; ++i) {
-                    data[i] = static_cast<scalar_t>(dist(&gen));
-                }
+                for_each_element<scalar_t>(self, [&](scalar_t& v) {
+                    v = static_cast<scalar_t>(dist(&gen));
+                });
             }
         } else {
-            // torch parity (aten/src/ATen/native/cpu/DistributionTemplates.h:
-            // normal_fill<scalar_t>): Half/BFloat16 draw uniforms in opmath
-            // (float) through a 16-element stack buffer, Box-Muller in float,
-            // then cast down to the storage dtype -- including the inplace
-            // entrypoint.
+            // Half/BFloat16 draw uniforms in opmath (float) through a
+            // 16-element stack buffer, Box-Muller in float, then cast down
+            // to the storage dtype -- including the inplace entrypoint.
             if (size >= 16 && self.is_contiguous()) {
+                scalar_t* data = self.data_ptr<scalar_t>();
                 normal_fill_cast<scalar_t>(data, size, mean, std, &gen);
             } else {
                 normal_distribution<double> dist(mean, std);
-                for (int64_t i = 0; i < size; ++i) {
-                    data[i] = static_cast<scalar_t>(dist(&gen));
-                }
+                for_each_element<scalar_t>(self, [&](scalar_t& v) {
+                    v = static_cast<scalar_t>(dist(&gen));
+                });
             }
         }
     });
@@ -311,56 +404,87 @@ Tensor& normal_inplace_kernel(Tensor& self, double mean, double std) {
 }
 
 Tensor& random_kernel(Tensor& self, int64_t low, int64_t high) {
-    if (high <= low) {
-        TP_THROW(RuntimeError, "random_: high must be greater than low");
-    }
-    const uint64_t range = static_cast<uint64_t>(high - low);
-    const int64_t base = low;
-    int64_t n = self.numel();
+    TP_THROW_IF(high <= low, RuntimeError,
+                "random_ expects 'from' to be less than 'to', but got from=",
+                low, " >= to=", high);
     auto& gen = default_generator();
 
+    distribution::check_random_from_to_bounds(low, high, self.dtype());
+
+    if (self.numel() == 0) return self;
+    check_writable_inplace(self);
+
+    const uint64_t range = static_cast<uint64_t>(high - low);
+    const int64_t base = low;
     dispatch_all(self.dtype(), [&](auto tag) {
         using scalar_t = decltype(tag);
-        scalar_t* data = self.data_ptr<scalar_t>();
         uniform_int_from_to_distribution<scalar_t> dist(range, base);
-        for (int64_t i = 0; i < n; ++i) {
-            data[i] = dist(&gen);
-        }
+        for_each_element<scalar_t>(self, [&](scalar_t& v) {
+            v = dist(&gen);
+        });
     });
     return self;
 }
 
 Tensor& uniform_kernel(Tensor& self, double from, double to) {
-    int64_t n = self.numel();
+    // Complex tensors fill both components: recurse over the interleaved
+    // real view, which keeps the [from, to) contract per component.
+    if (isComplexType(self.dtype())) {
+        Tensor real_view = tpx::ops::view_as_real(self);
+        return uniform_kernel(real_view, from, to);
+    }
+    if (!isFloatingType(self.dtype())) {
+        TP_THROW(NotImplementedError, "\"check_uniform_bounds\" not implemented for '",
+                 toString(self.dtype()), "'");
+    }
+
+    const char* dtype_name = distribution::bounds_dtype_name(self.dtype());
+    dispatch_floating(self.dtype(), [&](auto tag) {
+        using scalar_t = decltype(tag);
+        const double min = distribution::fp_dtype_lowest<scalar_t>();
+        const double max = distribution::fp_dtype_max<scalar_t>();
+        TP_THROW_IF(!(from >= min && from <= max), RuntimeError,
+                    "from is out of bounds for ", dtype_name);
+        TP_THROW_IF(!(to >= min && to <= max), RuntimeError,
+                    "to is out of bounds for ", dtype_name);
+        TP_THROW_IF(from > to, RuntimeError,
+                    "uniform_ expects to return a [from, to) range, but found from=",
+                    from, " > to=", to);
+        TP_THROW_IF((to - from) > distribution::fp_dtype_max<scalar_t>(), RuntimeError,
+                    "uniform_ expects to-from <= std::numeric_limits<", dtype_name,
+                    ">::max(), but found to=", to, " and from=", from,
+                    " which result in to-from to exceed the limit");
+        from = std::clamp(from, min, max);
+        to = std::clamp(to, min, max);
+    });
+
+    if (self.numel() == 0) return self;
+    check_writable_inplace(self);
     auto& gen = default_generator();
 
     dispatch_floating(self.dtype(), [&](auto tag) {
         using scalar_t = decltype(tag);
-        scalar_t* data = self.data_ptr<scalar_t>();
         if constexpr (std::is_same_v<scalar_t, float>) {
-            // torch parity: CPU float uniform_ consumes one random32 per
-            // element, masks to the float mantissa, and accumulates in
-            // acc_type<float> = double before storing back.
-            for (int64_t i = 0; i < n; ++i) {
+            // 24-bit mantissa draw scaled to [from, to); the product
+            // accumulates in double before storing back.
+            for_each_element<scalar_t>(self, [&](scalar_t& v) {
                 const uint32_t r = gen.random();
-                const double x = (r & ((1u << 24) - 1)) *
-                                 std::ldexp(1.0, -24);
-                data[i] = static_cast<scalar_t>(x * (to - from) + from);
-            }
+                const double x = (r & ((1u << 24) - 1)) * std::ldexp(1.0, -24);
+                v = static_cast<scalar_t>(x * (to - from) + from);
+            });
         } else {
-            // torch parity (aten/src/ATen/native/cpu/DistributionTemplates.h:
-            // uniform_kernel_cpu): Half/BFloat16 sample in opmath_t (float,
-            // 24-bit mantissa mask) and cast to the storage dtype, clamping a
-            // cast that rounded up to the upper bound back to 'from'.
+            // Half/BFloat16 sample in opmath_t (float, 24-bit mantissa mask)
+            // and cast to the storage dtype, clamping a cast that rounded up
+            // to the upper bound back to 'from'.
             using math_t = opmath_t<scalar_t>;
             uniform_real_distribution<math_t> dist(
                 static_cast<math_t>(from), static_cast<math_t>(to));
             const scalar_t to_scalar = static_cast<scalar_t>(to);
             const scalar_t from_scalar = static_cast<scalar_t>(from);
-            for (int64_t i = 0; i < n; ++i) {
+            for_each_element<scalar_t>(self, [&](scalar_t& v) {
                 scalar_t value = static_cast<scalar_t>(dist(&gen));
-                data[i] = value == to_scalar ? from_scalar : value;
-            }
+                v = value == to_scalar ? from_scalar : value;
+            });
         }
     });
     return self;

@@ -20,7 +20,6 @@
 // CPU sampling/selection operators: multinomial, topk, and the LLM
 // token sampler (temperature / top-k / top-p).  Canonical serial
 // implementations; the CUDA kernels mirror their semantics.
-// Attention lives in TransformersKernels.cpp (torch native/transformers
 // layout).
 
 namespace tensorplay {
@@ -29,7 +28,6 @@ namespace cpu {
 namespace {
 
 // Discrete sampling via inverse-CDF with a single double uniform per draw,
-// matching the consumption pattern of torch's multinomial.
 template <typename It>
 int64_t sample_discrete(Generator& gen, It begin, It end) {
   using T = typename std::iterator_traits<It>::value_type;
@@ -94,7 +92,6 @@ Tensor multinomial_kernel_cpu(const Tensor& self, int64_t num_samples, bool repl
       }
     } else {
       // Without replacement: repeatedly sample from the remaining mass,
-      // zeroing the chosen category (torch CPU semantics).
       std::vector<double> remaining(cols);
       for (int64_t c = 0; c < cols; ++c) remaining[c] = row[c];
       for (int64_t s = 0; s < num_samples; ++s) {
@@ -120,7 +117,6 @@ std::tuple<Tensor, Tensor> topk_kernel_cpu(const Tensor& self, int64_t k, int64_
     TP_THROW(RuntimeError, "topk: k must be in [0, cols]");
   }
   if (input.dtype() != DType::Float32 && input.dtype() != DType::Float64) {
-    // torch topk supports all numeric types; extend alongside pooling.
     TP_THROW(NotImplementedError, "topk: only Float32/Float64 are supported for now");
   }
 
@@ -183,7 +179,6 @@ Tensor sample_kernel_cpu(const Tensor& logits, double temperature, int64_t top_k
   std::vector<int64_t> order(cols);
   for (int64_t r = 0; r < rows; ++r) {
     const float* row = idata + r * cols;
-    // temperature + softmax (double precision, like the torch reference)
     double mx = -INFINITY;
     for (int64_t c = 0; c < cols; ++c) mx = std::max(mx, (double)row[c]);
     double total = 0.0;

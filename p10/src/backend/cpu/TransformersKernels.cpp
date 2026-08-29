@@ -1,5 +1,4 @@
 // CPU scaled-dot-product attention kernels.
-// Mirrors aten/src/ATen/native/transformers/cpu/attention.cpp naming: SDPA
 // lives under transformers/, not an "llm" grab-bag.
 //
 // Forward f32/f16/bf16 path: BLAS sgemm for QK^T and PV, fused causal-prefix
@@ -101,7 +100,6 @@ Tensor sdpa_kernel_cpu(const Tensor& query, const Tensor& key,
   }
   int64_t B = q.size(0), H = q.size(1), T = q.size(2), D = q.size(3);
   // Cross-attention: query length may differ from key/value length
-  // (torch.math reference supports Tq != Skv).
   int64_t Tq = T;
   int64_t Skv = k.size(2);
   if (k.size(0) != B || k.size(1) != H || v.size(0) != B || v.size(1) != H ||
@@ -116,7 +114,7 @@ Tensor sdpa_kernel_cpu(const Tensor& query, const Tensor& key,
   const DType original_dtype = q.dtype();
 
   if (original_dtype == DType::Float64) {
-    // Serial double oracle for parity checks.
+    // Serial double reference for validation.
     Tensor out = Tensor::empty({B, H, Tq, D}, DType::Float64, q.device());
     const double* qd = q.data_ptr<double>();
     const double* kd = k.data_ptr<double>();
@@ -125,7 +123,6 @@ Tensor sdpa_kernel_cpu(const Tensor& query, const Tensor& key,
     const double scale = 1.0 / std::sqrt(static_cast<double>(D));
     for (int64_t b = 0; b < B; ++b) {
       for (int64_t h = 0; h < H; ++h) {
-        // torch is_causal aligns the mask top-left: query t attends kv j <= t.
         const double* qh = qd + ((b * H + h) * Tq) * D;
         const double* kh = kd + ((b * H + h) * Skv) * D;
         const double* vh = vd + ((b * H + h) * Skv) * D;
@@ -187,7 +184,6 @@ Tensor sdpa_kernel_cpu(const Tensor& query, const Tensor& key,
   const float scale = 1.0f / std::sqrt(static_cast<float>(D));
   // Scores scratch reused across calls: a fresh 134MB allocation per prefill
   // pays ~32k page faults before the first GEMM lane runs (measured as the
-  // dominant cost vs torch's pooled workspace).  Grow-only, thread-local so
   // concurrent GIL-released callers don't share.
   static thread_local std::vector<float> scores_scratch;
   if (scores_scratch.size() < static_cast<size_t>(B * H * Tq * Skv))
@@ -201,7 +197,6 @@ Tensor sdpa_kernel_cpu(const Tensor& query, const Tensor& key,
   if (Tq == 1) {
     // Decode: one query row per head.  Per-head work is dot-products +
     // softmax + a D-wide axpy accumulation -- pure SIMD loops beat 64 tiny
-    // BLAS calls whose launch overhead dominates (measured 2.5x over torch
     // before this path).  Heads parallelize across cores.
     parallel::parallel_for(0, bh_total, 1, [&](int64_t b0, int64_t b1) {
       std::vector<float> probs(Skv);
@@ -426,7 +421,6 @@ std::tuple<Tensor, Tensor, Tensor> sdpa_backward_kernel_cpu(
 }
 
 // ---------------------------------------------------------------------------
-// grouped GEMM for MoE expert compute (2D x 3D ragged, torch._grouped_mm
 // semantics): self [M_total, K] @ mat2 [G, K, N] -> [M_total, N]; offs [G]
 // holds cumulative END offsets, group g spans [prev_end, offs[g]).
 // No-grad path is one dispatcher op wrapping per-group cblas_sgemm calls --
@@ -551,7 +545,6 @@ Tensor grouped_mm_cpu(const Tensor& self, const Tensor& mat2,
 }
 
 // RoPE primitives follow the transformer attention path.  The layout matches
-// the local ATen flash-attention contract: the last dimension is interleaved
 // [x0, x1, x2, x3, ...], while cos/sin are [positions, head_dim / 2].
 namespace {
 

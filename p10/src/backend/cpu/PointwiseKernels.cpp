@@ -185,7 +185,6 @@ Tensor unary_float_op_kernel(const Tensor& self, Func func,
         }
         #undef INT_CASE
     } else if (self.dtype() == DType::Float16 || self.dtype() == DType::BFloat16) {
-        // ATen alignment: reduced floating types compute in float (opmath_t)
         int64_t n = self.numel();
         if (self.dtype() == DType::Float16) {
             const Half* src = self_contig.data_ptr<Half>();
@@ -264,7 +263,6 @@ Tensor unary_float_op_kernel(const Tensor& self, Func func,
     return result;
 }
 
-// ATen alignment: abs over complex tensors returns the magnitude in the
 // corresponding real dtype (hypot(re, im)).
 Tensor complex_abs_kernel(const Tensor& self) {
     DType out_dtype = toRealValueType(self.dtype());
@@ -331,7 +329,6 @@ Tensor complex_abs_kernel(const Tensor& self) {
 // Implementations
 
 Tensor abs_kernel(const Tensor& self) {
-    // ATen alignment: abs(complex) -> magnitude in the real dtype
     if (isComplexType(self.dtype())) {
         if ((self.dtype() == DType::ComplexFloat ||
              self.dtype() == DType::ComplexDouble) &&
@@ -384,7 +381,6 @@ Tensor square_kernel(const Tensor& self) {
 }
 
 Tensor sign_kernel(const Tensor& self) {
-    // ATen alignment: sgn(z) = z / |z| for complex, 0 stays 0 (UnaryOpsKernel).
     if (isComplexType(self.dtype())) {
         return complex_unary_op_kernel(self, [](auto x) {
             using C = decltype(x);
@@ -418,13 +414,11 @@ Tensor ceil_kernel(const Tensor& self) {
 
 Tensor round_kernel(const Tensor& self) {
     if (isIntegralType(self.dtype())) return self.clone();
-    // ATen alignment: round uses nearbyint (round-half-to-even), not roundf
     return unary_op_kernel(self, [](auto x) { return std::nearbyint(x); }, vecunary::VOp::Round);
 }
 
 // Float ops
 //
-// torch parity: every function below except erf/erfc/lgamma is defined over
 // the complex dtypes (see docs/source/complex_numbers.md).  Complex inputs
 // route through complex_unary_op_kernel with std::complex math or the c10
 // formulas above; real dtypes keep the vectorized paths.
@@ -618,8 +612,6 @@ Tensor trunc_kernel(const Tensor& self) {
 Tensor relu_kernel(const Tensor& self) {
     // oneDNN eltwise rejected here (was: numel >= 4096): primitive
     // construction costs ~5us per call and measured *slower* than the native
-    // vector path even at 1M elements (54us vs 51us; torch does 28us), so it
-    // never amortized. ATen's Activation.cpp likewise uses its own vectorized
     // kernels rather than oneDNN for ReLU.
 
     // Vectorized path for contiguous Float32 (see cpu/VecUnary.h).  The old
@@ -643,7 +635,6 @@ Tensor relu_kernel(const Tensor& self) {
         if constexpr (std::is_unsigned_v<T>) {
             return x;
         } else {
-            // clamp_min semantics: NaN propagates (matches torch.relu)
             return x < static_cast<T>(0) ? static_cast<T>(0) : x;
         }
     });
@@ -699,7 +690,6 @@ Tensor gelu_backward_impl(const Tensor& grad_output, const Tensor& self, const s
 
 Tensor gelu_kernel(const Tensor& self, const std::string& approximate) {
     // GELU(x) = 0.5 * x * (1 + erf(x / sqrt(2))); tanh approximation from
-    // ATen cpu/Gelu.h scalar_gelu_approximated_with_tanh.
     if (approximate == "tanh") {
         return gelu_tanh_impl(self);
     } else if (approximate != "none") {
@@ -745,7 +735,6 @@ Tensor silu_kernel(const Tensor& self) {
 }
 
 // Fused gated activation primitives.  These belong with the existing SiLU
-// implementation above, mirroring ATen/native/Activation.cpp and
 // native/GatedLinearUnit.cpp rather than introducing an LLM-specific kernel
 // bucket.  The packed form follows the decoder convention [gate | up].
 namespace {
@@ -875,21 +864,13 @@ Tensor silu_and_mul_cpu(const Tensor& input) {
 }
 
 // ---------------------------------------------------------------------------
-// Activations.  The element-wise formulas are ported from ATen:
-//   third_party/pytorch/aten/src/ATen/native/cpu/Activation.cpp
 //     (hardsigmoid_kernel, hardtanh_backward_kernel, hardswish_kernel,
 //      leaky_relu_kernel)
-//   third_party/pytorch/aten/src/ATen/native/cpu/Gelu.h
 //     (scalar_gelu_approximated_with_tanh)
-//   third_party/pytorch/aten/src/ATen/native/cpu/Elu.h
 //     (get_scalar_elu_elementwise_func)
-//   third_party/pytorch/aten/src/ATen/native/cuda/ActivationGeluKernel.cu
 //     (GeluBackwardCUDAKernelImpl — the reference backward formulas)
-//   third_party/pytorch/aten/src/ATen/native/cuda/ActivationMishKernel.cu
 //     (MishBackwardCUDAKernelImpl)
-//   third_party/pytorch/aten/src/ATen/native/cuda/ActivationSoftplusKernel.cu
 //     (SoftplusBackwardCUDAKernelImpl)
-// Reduced-precision inputs compute in float (opmath), matching ATen.
 // ---------------------------------------------------------------------------
 template<typename Func>
 Tensor activation_backward_kernel(const Tensor& grad_output, const Tensor& self, Func func) {
@@ -921,7 +902,6 @@ Tensor activation_backward_kernel(const Tensor& grad_output, const Tensor& self,
     return result;
 }
 
-// ATen cpu/Gelu.h: scalar_gelu_approximated_with_tanh + GeluCUDAKernelImpl 'none'
 static inline float gelu_none_scalar(float x) {
     constexpr float kAlpha = 0.70710678118654752440f; // M_SQRT1_2
     return x * 0.5f * (1.0f + std::erf(x * kAlpha));
@@ -934,7 +914,6 @@ static inline float gelu_tanh_scalar(float x) {
     return 0.5f * x * (1.0f + std::tanh(inner));
 }
 static inline float gelu_backward_none_scalar(float dy, float x) {
-    // ATen ActivationGeluKernel.cu GeluBackwardCUDAKernelImpl ('none'):
     //   kAlpha = M_SQRT1_2; kBeta = M_2_SQRTPI * M_SQRT1_2 * 0.5
     //   cdf = 0.5*(1+erf(x*kAlpha)); pdf = kBeta*exp(-x*x*0.5); return dy*(cdf + x*pdf);
     constexpr float kAlpha = 0.70710678118654752440f;
@@ -944,7 +923,6 @@ static inline float gelu_backward_none_scalar(float dy, float x) {
     return dy * (cdf + x * pdf);
 }
 static inline float gelu_backward_tanh_scalar(float dy, float x) {
-    // ATen ActivationGeluKernel.cu GeluBackwardCUDAKernelImpl ('Tanh')
     constexpr float kBeta = 1.41421356237309504880f * 1.12837916709551257390f * 0.5f;
     constexpr float kKappa = 0.044715f;
     float x_sq = x * x;
@@ -977,7 +955,6 @@ Tensor gelu_backward_impl(const Tensor& grad_output, const Tensor& self, const s
 }
 
 Tensor hardtanh_kernel_impl(const Tensor& self, Scalar min_val, Scalar max_val) {
-    // ATen Activation.cpp hardtanh: std::clamp(x, min_val, max_val)
     vecunary::VParams prm;
     prm.p0 = min_val.toDouble();
     prm.p1 = max_val.toDouble();
@@ -990,7 +967,6 @@ Tensor hardtanh_kernel_impl(const Tensor& self, Scalar min_val, Scalar max_val) 
 }
 
 Tensor hardtanh_backward_kernel_impl(const Tensor& grad_output, const Tensor& self, Scalar min_val, Scalar max_val) {
-    // ATen Activation.cpp (~line 714): (self <= min || self >= max) ? 0 : grad
     double lo = min_val.toDouble();
     double hi = max_val.toDouble();
     return activation_backward_kernel(grad_output, self,
@@ -998,12 +974,10 @@ Tensor hardtanh_backward_kernel_impl(const Tensor& grad_output, const Tensor& se
 }
 
 Tensor relu6_kernel_impl(const Tensor& self) {
-    // relu6 == hardtanh(0, 6) (torch.nn.functional.relu6 documentation)
     return hardtanh_kernel_impl(self, Scalar(0.0), Scalar(6.0));
 }
 
 Tensor hardswish_kernel_impl(const Tensor& self) {
-    // ATen Activation.cpp hardswish_kernel: x * clamp(x + 3, 0, 6) / 6
     return unary_float_op_kernel(self, [](auto x) {
         using T = decltype(x);
         T xf = static_cast<T>(static_cast<float>(x));
@@ -1013,7 +987,6 @@ Tensor hardswish_kernel_impl(const Tensor& self) {
 }
 
 Tensor hardswish_backward_kernel_impl(const Tensor& grad_output, const Tensor& self) {
-    // ATen Activation.h hardswish_backward:
     //   x <= -3 -> 0 ; x >= 3 -> dy ; else dy * (x/6 + 0.5)
     return activation_backward_kernel(grad_output, self,
         [](float dy, float x) -> float {
@@ -1024,7 +997,6 @@ Tensor hardswish_backward_kernel_impl(const Tensor& grad_output, const Tensor& s
 }
 
 Tensor silu_backward_kernel_impl(const Tensor& grad_output, const Tensor& self) {
-    // ATen cpu/Activation.cpp silu_backward_kernel:
     //   sigmoid = 1 / (1 + exp(-x)); dy * sigmoid * (1 + x * (1 - sigmoid))
     return activation_backward_kernel(grad_output, self,
         [](float dy, float x) -> float {
@@ -1034,7 +1006,6 @@ Tensor silu_backward_kernel_impl(const Tensor& grad_output, const Tensor& self) 
 }
 
 Tensor hardsigmoid_kernel_impl(const Tensor& self) {
-    // ATen Activation.cpp hardsigmoid_kernel: clamp(x + 3, 0, 6) / 6
     return unary_float_op_kernel(self, [](auto x) {
         using T = decltype(x);
         T xf = static_cast<T>(static_cast<float>(x));
@@ -1045,7 +1016,6 @@ Tensor hardsigmoid_kernel_impl(const Tensor& self) {
 }
 
 Tensor hardsigmoid_backward_kernel_impl(const Tensor& grad_output, const Tensor& self) {
-    // ATen Activation.h hardsigmoid_backward:
     //   x <= -3 -> 0 ; x >= 3 -> 0 ; else dy * (x/6 + 0.5)
     return activation_backward_kernel(grad_output, self,
         [](float dy, float x) -> float {
@@ -1055,7 +1025,6 @@ Tensor hardsigmoid_backward_kernel_impl(const Tensor& grad_output, const Tensor&
 }
 
 Tensor leaky_relu_kernel_impl(const Tensor& self, Scalar negative_slope) {
-    // ATen Activation.cpp leaky_relu_kernel: x >= 0 ? x : negative_slope * x
     double slope = negative_slope.toDouble();
     vecunary::VParams prm;
     prm.p0 = slope;
@@ -1067,7 +1036,6 @@ Tensor leaky_relu_kernel_impl(const Tensor& self, Scalar negative_slope) {
 }
 
 Tensor leaky_relu_backward_kernel_impl(const Tensor& grad_output, const Tensor& self, Scalar negative_slope, bool self_is_result) {
-    // ATen Activation.cpp leaky_relu_backward_kernel: x > 0 ? grad : grad*negative_slope
     (void)self_is_result; // out-of-place call always receives the input itself
     double slope = negative_slope.toDouble();
     return activation_backward_kernel(grad_output, self,
@@ -1075,7 +1043,6 @@ Tensor leaky_relu_backward_kernel_impl(const Tensor& grad_output, const Tensor& 
 }
 
 Tensor elu_kernel_impl(const Tensor& self, Scalar alpha, Scalar scale, Scalar input_scale) {
-    // ATen cpu/Elu.h get_scalar_elu_elementwise_func:
     //   a < 0 ? expm1(a * input_scale) * negcoef : a * poscoef
     double negcoef = alpha.toDouble() * scale.toDouble();
     double poscoef = scale.toDouble();
@@ -1094,7 +1061,6 @@ Tensor elu_kernel_impl(const Tensor& self, Scalar alpha, Scalar scale, Scalar in
 }
 
 Tensor elu_backward_kernel_impl(const Tensor& grad_output, Scalar alpha, Scalar scale, Scalar input_scale, bool is_result, const Tensor& self_or_result) {
-    // ATen cpu/Activation.cpp elu_backward_kernel (lines 213-265):
     //   is_result: b <= 0 ? a*negiptcoef*(b + negcoef) : a*poscoef
     //   else:      b <= 0 ? a*negiptcoef*negcoef*exp(b*negiptcoef) : a*poscoef
     double negcoef = alpha.toDouble() * scale.toDouble();
@@ -1111,7 +1077,6 @@ Tensor elu_backward_kernel_impl(const Tensor& grad_output, Scalar alpha, Scalar 
 }
 
 Tensor mish_kernel_impl(const Tensor& self) {
-    // ATen ActivationMishKernel: mish(x) = x * tanh(softplus(x))
     return unary_float_op_kernel(self, [](auto x) {
         using T = decltype(x);
         T xf = static_cast<T>(static_cast<float>(x));
@@ -1121,7 +1086,6 @@ Tensor mish_kernel_impl(const Tensor& self) {
 }
 
 Tensor mish_backward_kernel_impl(const Tensor& grad_output, const Tensor& self) {
-    // ATen ActivationMishKernel.cu MishBackwardCUDAKernelImpl:
     //   sp = log1p(exp(x)); tanh_sp = tanh(sp); sech2 = 1 - tanh_sp^2
     //   return dy * (tanh_sp + x * sech2 * sigmoid(x))
     return activation_backward_kernel(grad_output, self,
@@ -1135,7 +1099,6 @@ Tensor mish_backward_kernel_impl(const Tensor& grad_output, const Tensor& self) 
 }
 
 Tensor selu_kernel_impl(const Tensor& self) {
-    // ATen Activation.h selu constants:
     //   lambda_ = 1.0507009873554804934193349852946
     //   alpha_  = 1.6732632423543772848170429916717
     constexpr double lambda_ = 1.0507009873554804934193349852946;
@@ -1149,7 +1112,6 @@ Tensor selu_kernel_impl(const Tensor& self) {
 }
 
 Tensor celu_kernel_impl(const Tensor& self, Scalar alpha) {
-    // ATen Activation.h celu: max(0,x) + min(0, alpha * expm1(x / alpha))
     double a = alpha.toDouble();
     vecunary::VParams prm;
     prm.p0 = a;
@@ -1161,7 +1123,6 @@ Tensor celu_kernel_impl(const Tensor& self, Scalar alpha) {
 }
 
 Tensor softplus_kernel_impl(const Tensor& self, Scalar beta, Scalar threshold) {
-    // ATen ActivationSoftplusKernel.cu SoftplusCUDAKernelImpl:
     //   beta_in * a > threshold ? a : log1p(exp(beta_in * a)) / beta_in
     double beta_in = beta.toDouble();
     double threshold_in = threshold.toDouble();
@@ -1179,7 +1140,6 @@ Tensor softplus_kernel_impl(const Tensor& self, Scalar beta, Scalar threshold) {
 }
 
 Tensor softplus_backward_kernel_impl(const Tensor& grad_output, const Tensor& self, Scalar beta, Scalar threshold) {
-    // ATen ActivationSoftplusKernel.cu SoftplusBackwardCUDAKernelImpl:
     //   beta_in * a > threshold ? dy : dy * sigmoid(beta_in * a)
     double beta_in = beta.toDouble();
     double threshold_in = threshold.toDouble();
@@ -1192,7 +1152,6 @@ Tensor softplus_backward_kernel_impl(const Tensor& grad_output, const Tensor& se
 }
 
 // ---------------------------------------------------------------------------
-// ATen log_sigmoid (aten/src/ATen/native/cpu/Activation.cpp
 // log_sigmoid_cpu_kernel): out = min(x, 0) - log1p(exp(-|x|)).  The branch
 // split keeps exp() bounded for both large-positive and large-negative inputs.
 // ---------------------------------------------------------------------------
@@ -1205,12 +1164,10 @@ Tensor log_sigmoid_kernel_impl(const Tensor& self) {
 }
 
 Tensor log_sigmoid_backward_kernel_impl(const Tensor& grad_output, const Tensor& self) {
-    // ATen cpu/Activation.cpp log_sigmoid_backward_cpu_kernel:
     //   grad * sigmoid(-x), branch-split so exp() never overflows:
     //     x >= 0: grad * exp(-x) / (1 + exp(-x))
     //     x <  0: grad / (1 + exp(x))
     // Computed in the storage dtype (f16/bf16 widen to float opmath) so that
-    // float64 inputs keep double precision, matching ATen's opmath_t.
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(grad_output.shape()),
                                   grad_output.dtype(), grad_output.device());
     const int64_t n = grad_output.numel();
@@ -1238,7 +1195,6 @@ Tensor log_sigmoid_backward_kernel_impl(const Tensor& grad_output, const Tensor&
         LSIG_BWD_CASE(double, Float64)
         case DType::Float16:
         case DType::BFloat16: {
-            // Reduced precision computes in float (opmath_t), matching ATen.
             if (grad_output.dtype() == DType::Float16) {
                 const Half* gp = gc.data_ptr<Half>();
                 const Half* xp = sc.data_ptr<Half>();
@@ -1277,9 +1233,7 @@ Tensor log_sigmoid_backward_kernel_impl(const Tensor& grad_output, const Tensor&
 }
 
 // ---------------------------------------------------------------------------
-// ATen rrelu_with_noise (aten/src/ATen/native/Activation.cpp): training scales
 // negative elements by the (caller-provided) noise tensor, eval is leaky_relu
-// with slope (lower + upper) / 2.  ATen's forward fills noise from a generator;
 // TensorPlay kernels consume the noise the caller generated (nn.functional.rrelu
 // draws it with rand), which keeps the kernel deterministic and RNG-free.
 // ---------------------------------------------------------------------------
@@ -1315,7 +1269,6 @@ static Tensor binary_float_kernel(const Tensor& a, const Tensor& b, Func func) {
 Tensor rrelu_with_noise_kernel_impl(const Tensor& self, const Tensor& noise, Scalar lower, Scalar upper, bool training) {
     const float slope = static_cast<float>((lower.toDouble() + upper.toDouble()) / 2.0);
     if (training) {
-        // ATen _rrelu_with_noise_train: x <= 0 ? x * noise : x
         return binary_float_kernel(self, noise, [](float x, float r) -> float {
             return x <= 0.0f ? x * r : x;
         });
@@ -1326,8 +1279,6 @@ Tensor rrelu_with_noise_kernel_impl(const Tensor& self, const Tensor& noise, Sca
 }
 
 Tensor rrelu_with_noise_backward_kernel_impl(const Tensor& grad_output, const Tensor& self, const Tensor& noise, Scalar lower, Scalar upper, bool training, bool self_is_result) {
-    // ATen Activation.cpp rrelu_with_noise_backward: training -> noise * grad;
-    // eval -> leaky_relu_backward with slope (lower + upper) / 2.  ATen's
     // forward overwrites noise with 1 on positive elements, which lets its
     // backward be a plain noise*grad; this kernel leaves the caller's noise
     // untouched, so the training branch masks with self instead (same value).
@@ -1372,10 +1323,8 @@ Tensor rrelu_with_noise_backward_kernel_impl(const Tensor& grad_output, const Te
 }
 
 Tensor pow_scalar_kernel(const Tensor& self, Scalar exponent) {
-    // ATen alignment: pow_tensor_scalar_optimized_kernel
     if (self.dtype() == DType::Bool) TP_THROW(TypeError, "pow is not supported for bool tensors");
     if (isComplexType(self.dtype()) || exponent.isComplex()) {
-        // torch parity: complex ** real-scalar and real-tensor ** complex
         // scalar both produce complex results.  Negative integer exponents
         // are fine over complex.
         DType base_dt = isComplexType(self.dtype())
@@ -1387,7 +1336,6 @@ Tensor pow_scalar_kernel(const Tensor& self, Scalar exponent) {
         Tensor base = self.to(result_dtype);
         if (!isComplexType(exponent.dtype())) {
             double ev = exponent.toDouble();
-            // Fast paths mirroring ATen pow_tensor_scalar_optimized_kernel
             if (ev == 0.5) return sqrt_kernel(base);
             if (ev == -0.5) return rsqrt_kernel(base);
             if (ev == 1.0) return base.clone();
@@ -1417,7 +1365,6 @@ Tensor pow_scalar_kernel(const Tensor& self, Scalar exponent) {
     }
     if (exponent.isFloatingPoint()) {
         double exp_val = exponent.toDouble();
-        // Fast paths mirroring ATen pow_tensor_scalar_optimized_kernel
         if (exp_val == 0.5 && self.dtype() != DType::Float64) return sqrt_kernel(self);
         if (exp_val == -0.5 && self.dtype() != DType::Float64) return rsqrt_kernel(self);
         if (exp_val == 1.0) return self.clone();
@@ -1433,7 +1380,6 @@ Tensor pow_scalar_kernel(const Tensor& self, Scalar exponent) {
         }
         return unary_op_kernel(self, [exp_val](auto x) {
              using T = decltype(x);
-             // repeated multiplication (ipow), matches ATen integral behavior
              T base = x;
              T acc = static_cast<T>(1);
              int64_t e = exp_val;
@@ -1450,7 +1396,6 @@ Tensor pow_scalar_kernel(const Tensor& self, Scalar exponent) {
 
 
 Tensor angle_kernel(const Tensor& self) {
-    // ATen alignment: angle(complex) -> atan2(imag, real) in the real dtype
     if (isComplexType(self.dtype())) {
         if ((self.dtype() == DType::ComplexFloat ||
              self.dtype() == DType::ComplexDouble) &&
@@ -1562,7 +1507,6 @@ Tensor clamp_kernel(const Tensor& self, std::optional<Scalar> min, std::optional
     return result;
 }
 
-// clamp_min/clamp_max family -- ATen implements these as composites over
 // clamp(self, bound, nullopt); delegate to the same kernel here.
 Tensor clamp_min_kernel(const Tensor& self, Scalar min) {
     return clamp_kernel(self, min, std::nullopt);
@@ -1650,7 +1594,6 @@ Tensor threshold_backward_kernel(const Tensor& grad_output, const Tensor& output
     return result;
 }
 
-// Softmax — ATen alignment: single fused kernel over the reduction dim
 // (max pass, exp+sum pass, write pass) instead of materializing 5 temporaries.
 // Fast path: contiguous input, reduction over last dim. Fallback: composition.
 template <bool LogMode>
@@ -1713,14 +1656,12 @@ static Tensor softmax_fused_kernel_impl(const Tensor& self, int64_t dim, DType o
 Tensor softmax_kernel(const Tensor& self, int64_t dim, DType dtype) {
     DType out_dtype = (dtype != DType::Undefined) ? dtype : self.dtype();
     if (isIntegralType(out_dtype)) out_dtype = DType::Float32;
-    // ATen alignment: reduced floats compute in float32
     if (isReducedFloatingType(out_dtype)) {
         return softmax_fused_kernel_impl<false>(self, dim, DType::Float32).to(out_dtype);
     }
     return softmax_fused_kernel_impl<false>(self, dim, out_dtype);
 }
 
-// Log Softmax — same fused structure as ATen (_log_softmax_vec)
 Tensor log_softmax_kernel(const Tensor& self, int64_t dim, DType dtype) {
     DType out_dtype = (dtype != DType::Undefined) ? dtype : self.dtype();
     if (isIntegralType(out_dtype)) out_dtype = DType::Float32;
@@ -1741,14 +1682,12 @@ Tensor pow_tensor_tensor_kernel(const Tensor& self, const Tensor& exponent) {
     Tensor exp_c = (exponent.dtype() == result_dtype) ? exponent : exponent.to(result_dtype);
 
     if (isComplexType(result_dtype)) {
-        // Reduced complexes follow ATen's opmath rule: compute in complex64
         // and narrow back (std::<complex> internals assume a real float type).
         if (result_dtype == DType::ComplexHalf || result_dtype == DType::BComplex32) {
             return pow_tensor_tensor_kernel(self.to(DType::ComplexFloat),
                                             exponent.to(DType::ComplexFloat))
                 .to(result_dtype);
         }
-        // torch parity: std::pow semantics over matching complex widths.
         ti_apply_arith(result, self_c, exp_c,
             [](auto b, auto e) {
                 using B = decltype(b);
@@ -1786,7 +1725,6 @@ inline T lerp_scalar_value(T self, T end, W weight) {
     const compute_t s = static_cast<compute_t>(self);
     const compute_t e = static_cast<compute_t>(end);
     const compute_t w = static_cast<compute_t>(weight);
-    // Keep the same numerically-stable branch as ATen's native Lerp.h.
     const compute_t value = std::abs(w) < compute_t(0.5)
         ? s + w * (e - s)
         : e - (e - s) * (compute_t(1) - w);
@@ -1931,7 +1869,6 @@ void lerp_scalar_contiguous(const T* self, const T* end, T* result,
 
 // TensorIterator's generic lerp composition is several full-tensor passes
 // for reduced floating types.  Muon calls scalar-weight lerp twice per
-// parameter, so keep the native Torch operation as one fused pass whenever
 // both operands are already dense and have the same dtype.  The general
 // broadcasting/promotion path below remains the semantic fallback.
 template <typename W>
@@ -2006,7 +1943,6 @@ Tensor lerp_scalar_kernel(const Tensor& self, const Tensor& end, Scalar weight) 
     Tensor s = self.to(common_dtype);
     Tensor e = end.to(common_dtype);
 
-    // ATen alignment: numerically stable branch chosen once for a scalar weight
     double w = weight.toDouble();
     if (std::abs(w) < 0.5) {
         return s + weight * (e - s);
@@ -2095,7 +2031,6 @@ TENSORPLAY_LIBRARY_IMPL(CPU, PointwiseKernels) {
     m.impl("silu_mul", silu_mul_cpu);
     m.impl("fused_swiglu", fused_swiglu_cpu);
     m.impl("silu_and_mul", silu_and_mul_cpu);
-    // Activations — see the ATen citations above each kernel.
     m.impl("hardtanh", hardtanh_kernel_impl);
     m.impl("hardtanh_backward", hardtanh_backward_kernel_impl);
     m.impl("relu6", relu6_kernel_impl);

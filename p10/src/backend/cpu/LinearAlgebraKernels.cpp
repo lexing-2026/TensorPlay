@@ -105,7 +105,6 @@ void check_cpu_matmul_dtype(DType dtype) {
         case DType::UInt16:
         case DType::UInt32:
         case DType::UInt64:
-            // Torch routes CPU matmul through addmm_impl_cpu_, whose dtype
             // rejection reads "addmm_impl_cpu_" not implemented for 'Bool'.
             TP_THROW(NotImplementedError, "\"addmm_impl_cpu_\" not implemented for '",
                      pretty_dtype_name(dtype), "'");
@@ -163,7 +162,6 @@ struct MatmulAccumType {
 
 // Integral matmul returns the input dtype.  Accumulate in unsigned arithmetic
 // wide enough to make the two's-complement wrap explicit instead of relying on
-// signed-overflow behavior; the low bits are the same values Torch stores.
 template <> struct MatmulAccumType<int8_t> { using type = uint32_t; };
 template <> struct MatmulAccumType<int16_t> { using type = uint32_t; };
 template <> struct MatmulAccumType<int32_t> { using type = uint64_t; };
@@ -215,7 +213,6 @@ void gemm_strided_dispatch(
     const Tensor& self, const Tensor& other, Tensor& result,
     int64_t M, int64_t N, int64_t K) {
     if (self.dtype() == DType::Bool) {
-        // PyTorch's CPU addmm/matmul backend does not implement Bool GEMM.
         TP_THROW(NotImplementedError, "matmul: Bool is not supported on CPU");
     }
 
@@ -400,7 +397,6 @@ std::vector<int64_t> pd_key(const memory::desc& s, const memory::desc& w,
 
 // oneDNN natively accelerates bf16/f16 matmul (f32 accumulate) -- routing
 // only f32 here left autocast GEMMs on a scalar fallback ~40x slower than
-// torch's oneDNN path.
 inline memory::data_type onednn_matmul_dt(DType t) {
     switch (t) {
         case DType::Float32:  return memory::data_type::f32;
@@ -416,7 +412,6 @@ inline bool onednn_matmul_dtype_ok(DType t) {
 
 // Keep the layout tag visible to oneDNN for the two dense layouts it can
 // consume without a reorder.  An explicit-stride descriptor is semantically
-// equivalent, but the native Torch/oneDNN path presents a transposed dense
 // operand as `ba`; preserving that tag lets the primitive select its packed
 // transposed-weight kernel (important for Muon's X @ X.T loop).
 inline memory::desc onednn_2d_desc(const memory::dims& dims,
@@ -625,16 +620,13 @@ static void mm_into_impl(const Tensor& self_p, const Tensor& mat2_p,
     const int64_t N = mat2_p.size(1);
     if (K == 0) {
         // oneDNN and some BLAS implementations leave C untouched for a
-        // zero-inner-dimension GEMM, while torch.matmul defines the result as
         // beta*C + 0 and beta is zero for mm.
         result.fill_(Scalar(0));
         return;
     }
 
     if (self_p.dtype() == DType::Float16) {
-        // ATen CPUBlas.cpp parity: on CPUs without an fp16 GEMM ISA oneDNN's
         // fp16 matmul drops to a reference kernel (measured ~800x slower than
-        // sgemm on Zen4).  torch widens to fp32, runs sgemm and narrows back
         // (its shgemm fallback converts the same way); do the same.
         Tensor a32 = self_p.to(DType::Float32);
         Tensor b32 = mat2_p.to(DType::Float32);
@@ -799,12 +791,10 @@ Tensor mm_kernel(const Tensor& self, const Tensor& mat2) {
     if (self.dim() != 2) TP_THROW(RuntimeError, "self must be a matrix");
     if (mat2.dim() != 2) TP_THROW(RuntimeError, "mat2 must be a matrix");
     if (self.size(1) != mat2.size(0)) {
-        // Torch wording, e.g. "mat1 and mat2 shapes cannot be multiplied (2x3 and 5x4)".
         TP_THROW(RuntimeError, "mat1 and mat2 shapes cannot be multiplied (", self.size(0), "x", self.size(1),
                  " and ", mat2.size(0), "x", mat2.size(1), ")");
     }
 
-    // torch.mm/matmul require the two matrix operands to have the same
     // dtype.  This is intentionally stricter than elementwise promotion.
     if (self.dtype() != mat2.dtype()) {
         TP_THROW(RuntimeError, "expected m1 and m2 to have the same dtype, but got: ",
@@ -816,7 +806,6 @@ Tensor mm_kernel(const Tensor& self, const Tensor& mat2) {
     return result;
 }
 
-// Torch broadcasts `input` against the GEMM output shape right-aligned and
 // reports mismatches through its expand wording.  Returns a (possibly
 // zero-stride) view; callers materialize with clone() before mutating.
 Tensor expand_gemm_input(const Tensor& input, const std::vector<int64_t>& target) {
@@ -834,7 +823,6 @@ Tensor expand_gemm_input(const Tensor& input, const std::vector<int64_t>& target
         src_strides[td - 1 - i] = input.stride(sd - 1 - i);
     }
 
-    // Validate right-to-left so the reported dimension matches torch's.
     // The offending-size text shows the tensor's real sizes, not the
     // left-padded broadcast view.
     for (int64_t k = td - 1; k >= 0; --k) {
@@ -872,7 +860,6 @@ Tensor addmm_kernel(const Tensor& input, const Tensor& mat1, const Tensor& mat2,
         TP_THROW(RuntimeError, "mat1 and mat2 shapes cannot be multiplied (", mat1.size(0), "x", mat1.size(1),
                  " and ", mat2.size(0), "x", mat2.size(1), ")");
     }
-    // Torch requires all three operands to share one dtype; it checks
     // self-vs-mat2 first, then mat1-vs-mat2 (LinearAlgebra.cpp:185-186).
     if (input.dtype() != mat2.dtype()) {
         TP_THROW(RuntimeError, "self and mat2 must have the same dtype, but got ",
@@ -899,7 +886,6 @@ Tensor addmm_kernel(const Tensor& input, const Tensor& mat1, const Tensor& mat2,
     const bool has_seed = beta_v != 0.0;
     Tensor seed;
     if (has_seed) {
-        // Any broadcastable input works in torch, including 0-dim/(M,1)/(1,N).
         // Left unscaled: beta is applied by the GEMM accumulate itself
         // (BLAS beta param / oneDNN sum scale), saving a mul_ pass here.
         seed = detail::contiguous_clone(expand_gemm_input(input, {M, N}));
@@ -1143,7 +1129,6 @@ Tensor matmul_batched_2d(
 #endif
 
     // Small or thin slices: per-call BLAS thread fan-up dominates, so spread
-    // the BATCH across tp's intra-op pool instead -- the same effect torch
     // gets from a single batched-BLAS call.  Large, fat slices already fill
     // the machine on their own and stay on the serial path below.
     const int64_t slice_flops = M * N * K;
@@ -1183,7 +1168,6 @@ Tensor matmul_kernel(const Tensor& self, const Tensor& other) {
         TP_THROW(RuntimeError, "matmul(): input operands must be at least 1D");
     }
 
-    // Shape contract first, using torch's exact wording.  Torch folds
     // vector/batch dimensions into matrix rows before reporting mismatches,
     // so the reported shapes depend on operand ranks:
     //   vec @ mat      -> "mat1 and mat2 shapes cannot be multiplied (1xN and KxM)"
@@ -1193,7 +1177,6 @@ Tensor matmul_kernel(const Tensor& self, const Tensor& other) {
     const auto self_shape = static_cast<std::vector<int64_t>>(self.shape());
     const auto other_shape = static_cast<std::vector<int64_t>>(other.shape());
 
-    // 2-D x 2-D is torch.mm semantics exactly: skip the batched machinery
     // (per-slice select views + temp result + copy_ back) that otherwise
     // costs ~3us on top of the GEMM itself.
     if (dim1 == 2 && dim2 == 2) {
@@ -1215,7 +1198,6 @@ Tensor matmul_kernel(const Tensor& self, const Tensor& other) {
                      " and ", other_k, "x", other_shape.back(), ")");
         }
     } else if (dim2 == 1) {
-        // (batch..., M, K) @ (K,) folds batch into mat1's rows like torch.
         int64_t folded_m = self_shape[self_shape.size() - 2];
         for (size_t i = 0; i + 2 < self_shape.size(); ++i) folded_m *= self_shape[i];
         const int64_t k = self_shape.back();
@@ -1296,7 +1278,6 @@ Tensor& matmul_out_kernel(const Tensor& self, const Tensor& other, Tensor& out) 
                  "but one of the arguments requires grad.");
     }
 
-    // Compute before touching `out`: Torch permits `out` to alias either input.
     Tensor result = matmul_kernel(self, other);
     if (out.shape() == result.shape()) {
         out.copy_(result);
@@ -1505,7 +1486,6 @@ Tensor bmm_kernel(const Tensor& self, const Tensor& batch2) {
 
 Tensor baddbmm_kernel(const Tensor& input, const Tensor& batch1, const Tensor& batch2,
                       Scalar beta, Scalar alpha) {
-    // Torch validates the GEMM shapes through the broadcast of the result
     // against `input`, so a wrong K shows up as an expand error.
     if (batch1.dim() != 3) TP_THROW(RuntimeError, "batch1 must be a 3D tensor");
     if (batch2.dim() != 3) TP_THROW(RuntimeError, "batch2 must be a 3D tensor");
@@ -1533,7 +1513,6 @@ Tensor baddbmm_kernel(const Tensor& input, const Tensor& batch1, const Tensor& b
     if (beta_v == 0.0) {
         result = Tensor::empty(target, batch1.dtype(), batch1.device());
     } else {
-        // Any broadcastable input works in torch, including 0-dim/(N,)/(M,N).
         result = detail::contiguous_clone(expand_gemm_input(input, target));
         if (beta_v != 1.0) result.mul_(beta);
     }
@@ -1605,8 +1584,6 @@ Tensor parallel_gemv(const Tensor& self, const Tensor& vec) {
 }
 
 Tensor mv_kernel(const Tensor& self, const Tensor& vec) {
-    // Torch routes mv through addmv; mirror its meta checks verbatim
-    // (aten/src/ATen/native/Blas.cpp ADDMV_META).
     if (self.dim() != 2 || vec.dim() != 1) {
         TP_THROW(RuntimeError, "vector + matrix @ vector expected, got ", 1, ", ",
                  self.dim(), ", ", vec.dim());
@@ -1623,7 +1600,6 @@ Tensor mv_kernel(const Tensor& self, const Tensor& vec) {
     }
     check_cpu_matmul_dtype(self.dtype());
 
-    // BLAS gemv fast path (torch's mv also routes addmv -> gemv): skips the
     // bmm-shaped wrapper's extra alloc/copy round-trip.  Both row-major and
     // transposed-view layouts are accepted without a copy, mirroring
     // mm_kernel's stride policy; anything else falls through to the generic
@@ -1648,7 +1624,6 @@ Tensor mv_kernel(const Tensor& self, const Tensor& vec) {
                 // cost and runs in low single-digit microseconds.
                 return parallel_gemv(self, vec);
             }
-            // Everything else goes to threaded MKL sgemv (torch's own
             // runtime), which is healthy now that both stacks share gomp.
             // Express both layouts in straight Fortran col-major terms (what
             // the BLAS underneath validates): a row-major MxK matrix reads as
@@ -1780,7 +1755,6 @@ Tensor dot_kernel(const Tensor& self, const Tensor& other) {
 }
 
 Tensor inner_kernel(const Tensor& self, const Tensor& other) {
-    // Torch: scalar operands go through plain multiplication (with
     // promotion); otherwise this is tensordot over the last dimension.
     if (self.dim() == 0 || other.dim() == 0) {
         return self * other;
@@ -1871,7 +1845,6 @@ TENSORPLAY_LIBRARY_IMPL(CPU, LinearAlgebraKernels) {
 // F.linear under Composite (einsum/gradient precedent): expressed through
 // dispatcher primitives so autograd records inner nodes on every backend,
 // while python callers drop a per-call addmm+t+add python-composite tax.
-// F.linear CPU kernel (aten Linear.cpp linear(): fused op "marginally
 // faster" route).  Everything composes into one seeded-GEMM addmm on the
 // flattened 2-D view, so the dispatcher records a single LinearBackward node
 // instead of the composite's matmul/add/t chain.  weight.t() is a raw
@@ -1901,7 +1874,6 @@ Tensor linear_kernel(const Tensor& input, const Tensor& weight,
     Tensor wt = flipped_weight_view();
 
     if (input_dim == 1) {
-        // (K,) @ W^T -> (N,), torch treats it as a single row.
         Tensor row = input.as_strided({1, input.size(0)},
                                       {input.size(0), input.stride(0)});
         Tensor out = bias_opt.has_value()
@@ -1912,7 +1884,6 @@ Tensor linear_kernel(const Tensor& input, const Tensor& weight,
 
     Tensor in_flat = input;
     if (input_dim > 2) {
-        // aten _flatten_nd_linear contract: caller materialized contiguity.
         in_flat = input.is_contiguous() ? input : input.contiguous();
         in_flat = in_flat.as_strided({in_flat.numel() / weight.size(1),
                                       weight.size(1)},

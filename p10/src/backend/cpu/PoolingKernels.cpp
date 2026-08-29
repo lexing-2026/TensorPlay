@@ -42,7 +42,6 @@ static std::pair<int64_t, int64_t> get_pair_from_kernel(const std::vector<int64_
     return get_pair(list);
 }
 
-// Upstream ATen/Dispatch.h AT_DISPATCH_FLOATING_TYPES parity: immediately
 // invoked lambda, scalar_t hint inside, Double before Float, and the exact
 // '"kernel" not implemented for '<Type>'' wording on the default branch.
 #define TP_DISPATCH_FLOATING_TYPES(TYPE, NAME, ...)                        \
@@ -66,7 +65,7 @@ static std::pair<int64_t, int64_t> get_pair_from_kernel(const std::vector<int64_
         }                                                                  \
     }()
 
-// AT_DISPATCH_ALL_TYPES parity: Byte, Char, Short, Int, Long, Float, Double.
+// Numeric dispatch covers byte, char, short, int, long, float, and double.
 #define TP_DISPATCH_ALL_TYPES(TYPE, NAME, ...)                             \
     [&]() {                                                                \
         const auto& the_type = TYPE;                                       \
@@ -135,13 +134,11 @@ static std::pair<int64_t, int64_t> get_pair_from_kernel(const std::vector<int64_
         }                                                                  \
     }()
 
-// Upstream aten/src/ATen/native/AveragePool3d.cpp parity.
 Tensor avg_pool3d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_size,
                       const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
                       bool ceil_mode, bool count_include_pad,
                       std::optional<int64_t> divisor_override) {
     if (input.dim() == 4) {
-        // torch accepts unbatched (C,D,H,W): pool as a batch of one.
         return avg_pool3d_cpu(input.unsqueeze(0), kernel_size, stride, padding,
                               ceil_mode, count_include_pad,
                               divisor_override).squeeze(0);
@@ -199,13 +196,11 @@ Tensor avg_pool3d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_si
 
 Tensor max_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_size, const std::vector<int64_t>& stride, const std::vector<int64_t>& padding, const std::vector<int64_t>& dilation, bool ceil_mode) {
     if (input.dim() == 3) {
-        // torch accepts unbatched (C,H,W): pool as a batch of one.
         return max_pool2d_cpu(input.unsqueeze(0), kernel_size, stride, padding,
                               dilation, ceil_mode).squeeze(0);
     }
     if (input.dim() != 4) TP_THROW(RuntimeError, "max_pool2d: Expected 4D input");
     // The kernel indexes raw NCHW pointers; normalize views (no-op when
-    // already contiguous) so non-contiguous inputs match torch's results.
     const Tensor input_c = input.contiguous();
 
     int64_t N = input_c.size(0);
@@ -230,7 +225,6 @@ Tensor max_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_si
     if (H_out <= 0 || W_out <= 0) TP_THROW(RuntimeError, "max_pool2d: Calculated output size is too small");
     
     // Ensure padding doesn't make us start reading out of bounds if ceil_mode used?
-    // Usually PyTorch clamps the window end.
     
     Tensor out = Tensor::empty({N, C, H_out, W_out}, input.dtype(), input.device());
     
@@ -294,7 +288,6 @@ Tensor max_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_si
 
 Tensor avg_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_size, const std::vector<int64_t>& stride, const std::vector<int64_t>& padding, bool ceil_mode, bool count_include_pad, std::optional<int64_t> divisor_override) {
     if (input.dim() == 3) {
-        // torch accepts unbatched (C,H,W): pool as a batch of one.
         return avg_pool2d_cpu(input.unsqueeze(0), kernel_size, stride, padding,
                               ceil_mode, count_include_pad, divisor_override).squeeze(0);
     }
@@ -314,7 +307,6 @@ Tensor avg_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_si
     if (ceil_mode) {
         H_out = (int64_t)(std::ceil((float)(H_in + 2 * pH - kH) / sH)) + 1;
         W_out = (int64_t)(std::ceil((float)(W_in + 2 * pW - kW) / sW)) + 1;
-        // ATen alignment: last window must start strictly inside (input + padding)
         if (H_out > 1 && (H_out - 1) * sH >= H_in + pH) --H_out;
         if (W_out > 1 && (W_out - 1) * sW >= W_in + pW) --W_out;
     } else {
@@ -360,7 +352,6 @@ Tensor avg_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_si
                     if (divisor_override.has_value()) {
                         divisor = (scalar_t)divisor_override.value();
                     } else if (count_include_pad) {
-                        // ATen alignment: window area clipped to (input + padding)
                         divisor = (scalar_t)(clip_h * clip_w);
                     } else {
                         divisor = (scalar_t)((ih1 - ih0) * (iw1 - iw0));
@@ -376,7 +367,6 @@ Tensor avg_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_si
 
 Tensor adaptive_avg_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& output_size) {
     if (input.dim() == 3) {
-        // torch accepts unbatched (C,H,W): pool as a batch of one.
         return adaptive_avg_pool2d_cpu(input.unsqueeze(0), output_size).squeeze(0);
     }
     if (input.dim() != 4) TP_THROW(RuntimeError, "adaptive_avg_pool2d: Expected 4D input");
@@ -404,7 +394,6 @@ Tensor adaptive_avg_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& 
                 scalar_t* out_row = out_ptr + idx * W_out;
 
                 const int64_t h_start = (h * H_in) / H_out;
-                // Match PyTorch's adaptive pooling bins: floor(start), ceil(end).
                 const int64_t h_end = ((h + 1) * H_in + H_out - 1) / H_out;
 
                 for (int64_t w = 0; w < W_out; ++w) {
@@ -427,7 +416,6 @@ Tensor adaptive_avg_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& 
 
 Tensor adaptive_max_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& output_size) {
     if (input.dim() == 3) {
-        // torch accepts unbatched (C,H,W): pool as a batch of one.
         return adaptive_max_pool2d_cpu(input.unsqueeze(0), output_size).squeeze(0);
     }
     if (input.dim() != 4) TP_THROW(RuntimeError, "adaptive_max_pool2d: Expected 4D input");
@@ -505,7 +493,6 @@ Tensor max_pool2d_backward_cpu(const Tensor& grad_output, const Tensor& input, c
         const scalar_t* in_ptr = input_c.data_ptr<scalar_t>();
 
         // Scatter into grad_input: parallel over (n, c) planes (each plane is
-        // independent, so the += is race free), matching ATen MaxPoolKernel.
         parallel_for(0, N * C, 1, [&](int64_t begin, int64_t end) {
             for (int64_t nc = begin; nc < end; ++nc) {
                 const scalar_t* in_base = in_ptr + nc * H_in * W_in;
@@ -586,7 +573,6 @@ Tensor avg_pool2d_backward_cpu(const Tensor& grad_output, const Tensor& input, c
         const scalar_t* grad_out_ptr = grad_output.data_ptr<scalar_t>();
 
         // Scatter into grad_input: parallel over (n, c) planes (independent,
-        // race free), matching ATen AvgPoolKernel.
         parallel_for(0, N * C, 1, [&](int64_t begin, int64_t end) {
             for (int64_t nc = begin; nc < end; ++nc) {
                 scalar_t* gi_base = grad_in_ptr + nc * H_in * W_in;
@@ -608,7 +594,6 @@ Tensor avg_pool2d_backward_cpu(const Tensor& grad_output, const Tensor& input, c
                         if (divisor_override.has_value()) {
                             divisor = (scalar_t)divisor_override.value();
                         } else if (count_include_pad) {
-                            // ATen alignment: window area clipped to (input + padding)
                             divisor = (scalar_t)(clip_h * clip_w);
                         } else {
                             divisor = (scalar_t)((ih1 - ih0) * (iw1 - iw0));
@@ -727,9 +712,7 @@ Tensor adaptive_max_pool2d_backward_cpu(const Tensor& grad_output, const Tensor&
     return grad_input;
 }
 
-// ATen adaptive_max_pool2d returns (values, indices); the indices let the
 // backward scatter instead of recomputing the argmax.  Indices are plane
-// linear offsets (ih * W_in + iw), matching ATen AdaptiveMaxPoolKernel.
 std::tuple<Tensor, Tensor> adaptive_max_pool2d_with_indices_cpu(const Tensor& input, const std::vector<int64_t>& output_size) {
     if (input.dim() == 3) {
         auto r = adaptive_max_pool2d_with_indices_cpu(input.unsqueeze(0), output_size);
@@ -818,7 +801,6 @@ Tensor adaptive_max_pool2d_with_indices_backward_cpu(const Tensor& grad_output, 
     return grad_input;
 }
 
-// Upstream aten/src/ATen/native/AveragePool3d.cpp avg_pool3d_backward_out_frame.
 Tensor avg_pool3d_backward_cpu(const Tensor& grad_output, const Tensor& input,
                                const std::vector<int64_t>& kernel_size,
                                const std::vector<int64_t>& stride,
@@ -875,7 +857,6 @@ Tensor avg_pool3d_backward_cpu(const Tensor& grad_output, const Tensor& input,
     return grad_input;
 }
 
-// Upstream ATen/native/AdaptiveAveragePooling3d.cpp: window bounds are
 // start = floor(i * in / out), end = ceil((i+1) * in / out).
 Tensor adaptive_avg_pool3d_cpu(const Tensor& input, const std::vector<int64_t>& output_size) {
     if (input.dim() == 4)
@@ -963,11 +944,8 @@ Tensor adaptive_avg_pool3d_backward_cpu(const Tensor& grad_output, const Tensor&
 }
 
 // ---------------------------------------------------------------------------
-// Max pool with indices / 3-D max pool (ports of aten/src/ATen/native/
-// DilatedMaxPool2d.cpp + DilatedMaxPool3d.cpp).  Output sizes follow ATen
 // Pool.h pooling_output_shape_pad_lr; indices are linear offsets into the
 // per-(n, c) input plane (H*W for 2d, D*H*W for 3d); NaN wins the window and
-// ties keep the first element in scan order, matching ATen.
 // ---------------------------------------------------------------------------
 
 static inline int64_t div_rtn(int64_t a, int64_t b) {
@@ -1272,7 +1250,6 @@ Tensor max_pool3d_backward_cpu(const Tensor& grad_output, const Tensor& input,
                                const std::vector<int64_t>& stride,
                                const std::vector<int64_t>& padding,
                                const std::vector<int64_t>& dilation, bool ceil_mode) {
-    // ATen MaxUnpooling-style recompute: rerun the forward window scan and
     // scatter the gradient onto each window's argmax (first-max wins ties).
     if (grad_output.dim() == 4 && input.dim() == 4) {
         return max_pool3d_backward_cpu(grad_output.unsqueeze(0), input.unsqueeze(0),
@@ -1421,7 +1398,6 @@ Tensor max_pool3d_with_indices_backward_cpu(
     return grad_input;
 }
 
-// ATen AdaptiveMaxPooling3d.cpp: same floor/ceil bin bounds as the adaptive
 // average pool; indices are linear offsets into the (D, H, W) volume.
 Tensor adaptive_max_pool3d_cpu(const Tensor& input, const std::vector<int64_t>& output_size) {
     if (input.dim() == 4)
@@ -1554,10 +1530,8 @@ TENSORPLAY_LIBRARY_IMPL(CPU, PoolingKernels) {
 } // namespace cpu
 } // namespace tensorplay
 
-// ATen max_pool2d / max_pool3d / adaptive_max_pool2d are
 // CompositeImplicitAutograd over their *_with_indices variants: routing the
 // forward through with_indices lets autograd save the indices and scatter in
-// the backward instead of recomputing the argmax (matches ATen, whose
 // max_poolNd backward is the indices scatter, not a re-scan).
 namespace tensorplay {
 namespace cpu {

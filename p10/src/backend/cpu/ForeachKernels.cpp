@@ -941,7 +941,6 @@ void foreach_zero_inplace_cpu(std::vector<Tensor> self) {
     for (Tensor& value : self) value.zero_();
 }
 
-// The ATen out= overloads write the complete result list into caller-owned
 // tensors.  Compute the list first so aliasing between `out` and an input has
 // the same non-destructive behavior as the native foreach kernels, then copy
 // each result into its corresponding output handle.

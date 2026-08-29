@@ -1,19 +1,12 @@
 // Upsampling kernels.
 //
-// Direct port of the ATen upsample kernels.  Each function mirrors its
 // counterpart frame kernel; citations at each site:
-//   third_party/pytorch/aten/src/ATen/native/UpSample.h
 //     compute_scales_value / area_pixel_compute_scale /
 //     area_pixel_compute_source_index / nearest_neighbor_compute_source_index
-//   third_party/pytorch/aten/src/ATen/native/cuda/UpSample.cuh
 //     nearest_neighbor_bw_compute_source_index
-//   third_party/pytorch/aten/src/ATen/native/cuda/UpSampleNearest2d.cu
 //     upsample_nearest2d_out_frame / upsample_nearest2d_backward_out_frame
-//   third_party/pytorch/aten/src/ATen/native/cuda/UpSampleBilinear2d.cu
 //     upsample_bilinear2d_out_frame / upsample_bilinear2d_backward_out_frame
-//   third_party/pytorch/aten/src/ATen/native/cuda/UpSampleBicubic2d.cu
 //     upsample_bicubic2d_out_frame / upsample_bicubic2d_backward_out_frame
-//   third_party/pytorch/aten/src/ATen/native/cuda/UpSampleTrilinear3d.cu
 //     upsample_trilinear3d_out_frame / upsample_trilinear3d_backward_out_frame
 //
 // Tensors must be contiguous NCW / NCHW / NCDHW.  The linear/bicubic backwards
@@ -35,7 +28,6 @@ namespace {
 
 // ---------------------------------------------------------------------------
 // UpSample.h index/weight helpers (float scale path; double tensors compute
-// scales in float exactly like the ATen CUDA kernels' accscalar_t=float path).
 // ---------------------------------------------------------------------------
 
 inline float compute_scales_value_f(const std::optional<double>& scale,
@@ -45,7 +37,6 @@ inline float compute_scales_value_f(const std::optional<double>& scale,
         : static_cast<float>(static_cast<double>(input_size) / output_size);
 }
 
-// ATen UpSample.cuh compute_scales_value_backwards: the nearest-backward
 // index math wants the output/input ratio, and an explicit scale_factor is
 // used as-is (not inverted like in the forward).
 inline float compute_scales_value_backwards_f(const std::optional<double>& scale,
@@ -134,7 +125,6 @@ inline std::vector<int64_t> out_shape(const Tensor& self, const std::vector<int6
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
-// Nearest forwards — ATen UpSampleNearest{1d,2d,3d}.cu *_out_frame
 // ---------------------------------------------------------------------------
 
 Tensor upsample_nearest1d_cpu(const Tensor& self, std::vector<int64_t> output_size,
@@ -180,7 +170,6 @@ Tensor upsample_nearest2d_cpu(const Tensor& self, std::vector<int64_t> output_si
             for (int64_t idx = begin; idx < end; ++idx) {
                 const int64_t h2 = idx % H2;
                 const int64_t nc = idx / H2;
-                // ATen UpSampleNearest2d.cu upsample_nearest2d_out_frame
                 const int64_t h1 = (H1 == H2) ? h2 : nearest_neighbor_compute_source_index(height_scale, h2, H1);
                 const scalar_t* src_row = idata + (nc * H1 + h1) * W1;
                 scalar_t* dst_row = odata + idx * W2;
@@ -230,7 +219,6 @@ Tensor upsample_nearest3d_cpu(const Tensor& self, std::vector<int64_t> output_si
 }
 
 // ---------------------------------------------------------------------------
-// Linear/bilinear/trilinear forwards — ATen UpSampleLinear1d.cu /
 // UpSampleBilinear2d.cu / UpSampleTrilinear3d.cu *_out_frame
 // ---------------------------------------------------------------------------
 
@@ -246,7 +234,6 @@ Tensor upsample_linear1d_cpu(const Tensor& self, std::vector<int64_t> output_siz
         const scalar_t* idata = in.data_ptr<scalar_t>();
         scalar_t* odata = result.data_ptr<scalar_t>();
         const accscalar_t rwidth = area_pixel_compute_scale_f(W1, W2, align_corners, scales);
-        // ATen UpSampleLinear1d.cu upsample_linear1d_out_frame; per-column
         // source index/weights hoisted into shared tables.
         std::vector<int64_t> w1_tab(W2), w1p_tab(W2);
         std::vector<accscalar_t> w1l_tab(W2), w0l_tab(W2);
@@ -289,7 +276,6 @@ Tensor upsample_bilinear2d_cpu(const Tensor& self, std::vector<int64_t> output_s
         const accscalar_t rheight = area_pixel_compute_scale_f(height1, height2, align_corners, scales_h);
         const accscalar_t rwidth = area_pixel_compute_scale_f(width1, width2, align_corners, scales_w);
 
-        // ATen UpSampleBilinear2d.cu upsample_bilinear2d_out_frame, but the
         // per-column source index/weights depend only on w2, so hoist them
         // into shared tables (read-only, computed once).
         std::vector<int64_t> w1_tab(width2), w1p_tab(width2);
@@ -351,7 +337,6 @@ Tensor upsample_trilinear3d_cpu(const Tensor& self, std::vector<int64_t> output_
         const accscalar_t rheight = area_pixel_compute_scale_f(height1, height2, align_corners, scales_h);
         const accscalar_t rwidth = area_pixel_compute_scale_f(width1, width2, align_corners, scales_w);
 
-        // ATen UpSampleTrilinear3d.cu upsample_trilinear3d_out_frame;
         // per-column weights hoisted into a shared table.
         std::vector<int64_t> w1_tab(width2), w1p_tab(width2);
         std::vector<accscalar_t> w1l_tab(width2), w0l_tab(width2);
@@ -408,7 +393,6 @@ Tensor upsample_trilinear3d_cpu(const Tensor& self, std::vector<int64_t> output_
 }
 
 // ---------------------------------------------------------------------------
-// Bicubic forward — ATen UpSampleBicubic2d.cu upsample_bicubic2d_out_frame
 // ---------------------------------------------------------------------------
 
 Tensor upsample_bicubic2d_cpu(const Tensor& self, std::vector<int64_t> output_size,
@@ -440,7 +424,6 @@ Tensor upsample_bicubic2d_cpu(const Tensor& self, std::vector<int64_t> output_si
                     continue;
                 }
 
-                // ATen UpSample.cuh upsample_get_value_bounded (per plane).
                 auto get_value_bounded = [&](int64_t y, int64_t x) -> scalar_t {
                     const int64_t access_y = std::clamp(y, static_cast<int64_t>(0), input_height - 1);
                     const int64_t access_x = std::clamp(x, static_cast<int64_t>(0), input_width - 1);
@@ -475,13 +458,11 @@ Tensor upsample_bicubic2d_cpu(const Tensor& self, std::vector<int64_t> output_si
 }
 
 // ---------------------------------------------------------------------------
-// Nearest backwards — ATen UpSampleNearest{1d,2d,3d}.cu
 // *_backward_out_frame (gather formulation, race free)
 // ---------------------------------------------------------------------------
 
 Tensor upsample_nearest1d_backward_cpu(const Tensor& grad_output, std::vector<int64_t> output_size,
                                        std::vector<int64_t> input_size, std::optional<double> scales) {
-    // ATen UpSampleNearest1d.cu upsample_nearest1d_backward_out_frame.
     // "src" = output pixels, "dst" = input pixels; every input pixel gathers
     // the outputs that map onto it (race free, plain assignment).
     Tensor go = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
@@ -495,7 +476,6 @@ Tensor upsample_nearest1d_backward_cpu(const Tensor& grad_output, std::vector<in
     UP_DISPATCH(go, {
         const scalar_t* grad_o = go.data_ptr<scalar_t>();
         scalar_t* grad_i = grad_input.data_ptr<scalar_t>();
-        // ATen compute_scales_value_backwards(scales, output_size, input_size):
         // the backward index math needs the output/input ratio (src = output
         // pixels, dst = input pixels here).
         const float width_scale = compute_scales_value_backwards_f(scales, src_dim_w, dst_dim_w);
@@ -528,7 +508,6 @@ Tensor upsample_nearest1d_backward_cpu(const Tensor& grad_output, std::vector<in
 
 Tensor upsample_nearest2d_backward_cpu(const Tensor& grad_output, std::vector<int64_t> output_size,
                                        std::vector<int64_t> input_size, std::optional<double> scales_h, std::optional<double> scales_w) {
-    // ATen UpSampleNearest2d.cu upsample_nearest2d_backward_out_frame.
     Tensor go = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
     Tensor grad_input = Tensor::zeros(out_shape(go, input_size), go.dtype(), go.device());
     const int64_t dim_b = go.size(0), dim_c = go.size(1);
@@ -541,7 +520,6 @@ Tensor upsample_nearest2d_backward_cpu(const Tensor& grad_output, std::vector<in
     UP_DISPATCH(go, {
         const scalar_t* grad_o = go.data_ptr<scalar_t>();
         scalar_t* grad_i = grad_input.data_ptr<scalar_t>();
-        // ATen compute_scales_value_backwards: output/input ratio (src = output).
         const float height_scale = compute_scales_value_backwards_f(scales_h, src_dim_h, dst_dim_h);
         const float width_scale = compute_scales_value_backwards_f(scales_w, src_dim_w, dst_dim_w);
 
@@ -594,7 +572,6 @@ Tensor upsample_nearest2d_backward_cpu(const Tensor& grad_output, std::vector<in
 Tensor upsample_nearest3d_backward_cpu(const Tensor& grad_output, std::vector<int64_t> output_size,
                                        std::vector<int64_t> input_size, std::optional<double> scales_d,
                                        std::optional<double> scales_h, std::optional<double> scales_w) {
-    // ATen UpSampleNearest3d.cu upsample_nearest3d_backward_out_frame.
     Tensor go = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
     Tensor grad_input = Tensor::zeros(out_shape(go, input_size), go.dtype(), go.device());
     const int64_t dim_b = go.size(0), dim_c = go.size(1);
@@ -654,7 +631,6 @@ Tensor upsample_nearest3d_backward_cpu(const Tensor& grad_output, std::vector<in
 }
 
 // ---------------------------------------------------------------------------
-// Linear backwards — ATen UpSampleLinear1d.cu / UpSampleBilinear2d.cu /
 // UpSampleTrilinear3d.cu *_backward_out_frame (scatter formulation with
 // atomicAdd on CUDA; serial accumulation here preserves the same semantics).
 // ---------------------------------------------------------------------------
@@ -662,7 +638,6 @@ Tensor upsample_nearest3d_backward_cpu(const Tensor& grad_output, std::vector<in
 Tensor upsample_linear1d_backward_cpu(const Tensor& grad_output, std::vector<int64_t> output_size,
                                       std::vector<int64_t> input_size, bool align_corners,
                                       std::optional<double> scales) {
-    // ATen UpSampleLinear1d.cu upsample_linear1d_backward_out_frame.
     Tensor go = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
     Tensor grad_input = Tensor::zeros(out_shape(go, input_size), go.dtype(), go.device());
     const int64_t N = go.size(0), C = go.size(1);
@@ -703,7 +678,6 @@ Tensor upsample_linear1d_backward_cpu(const Tensor& grad_output, std::vector<int
 Tensor upsample_bilinear2d_backward_cpu(const Tensor& grad_output, std::vector<int64_t> output_size,
                                         std::vector<int64_t> input_size, bool align_corners,
                                         std::optional<double> scales_h, std::optional<double> scales_w) {
-    // ATen UpSampleBilinear2d.cu upsample_bilinear2d_backward_out_frame
     // (non-ROCm path): iterate output pixels, distribute to the four corners.
     Tensor go = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
     Tensor grad_input = Tensor::zeros(out_shape(go, input_size), go.dtype(), go.device());
@@ -766,7 +740,6 @@ Tensor upsample_trilinear3d_backward_cpu(const Tensor& grad_output, std::vector<
                                          std::vector<int64_t> input_size, bool align_corners,
                                          std::optional<double> scales_d, std::optional<double> scales_h,
                                          std::optional<double> scales_w) {
-    // ATen UpSampleTrilinear3d.cu upsample_trilinear3d_backward_out_frame.
     Tensor go = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
     Tensor grad_input = Tensor::zeros(out_shape(go, input_size), go.dtype(), go.device());
     const int64_t batchsize = go.size(0), channels = go.size(1);
@@ -838,7 +811,6 @@ Tensor upsample_trilinear3d_backward_cpu(const Tensor& grad_output, std::vector<
 Tensor upsample_bicubic2d_backward_cpu(const Tensor& grad_output, std::vector<int64_t> output_size,
                                        std::vector<int64_t> input_size, bool align_corners,
                                        std::optional<double> scales_h, std::optional<double> scales_w) {
-    // ATen UpSampleBicubic2d.cu upsample_bicubic2d_backward_out_frame:
     // scatter each output gradient into the bounded 4x4 input window.
     Tensor go = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
     Tensor grad_input = Tensor::zeros(out_shape(go, input_size), go.dtype(), go.device());
@@ -858,7 +830,6 @@ Tensor upsample_bicubic2d_backward_cpu(const Tensor& grad_output, std::vector<in
             for (int64_t nc = begin; nc < end; ++nc) {
                 scalar_t* plane = idata + nc * input_height * input_width;
                 const scalar_t* oplane = odata + nc * output_height * output_width;
-                // ATen UpSample.cuh upsample_increment_value_bounded
                 auto increment_value_bounded = [&](int64_t y, int64_t x, accscalar_t value) {
                     const int64_t access_y = std::clamp(y, static_cast<int64_t>(0), input_height - 1);
                     const int64_t access_x = std::clamp(x, static_cast<int64_t>(0), input_width - 1);

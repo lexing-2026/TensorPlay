@@ -663,7 +663,6 @@ void im2col(const T* data_im, int64_t channels, int64_t height, int64_t width,
     });
 }
 
-// Derives the column (output) size from the input size, like aten's im2col
 // callers that do not pass an explicit output size.
 template <typename T>
 void im2col(const T* data_im, int64_t channels, int64_t height, int64_t width,
@@ -1000,7 +999,6 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
         // but cache the oneDNN-layout copy across training calls as well.
         // The TensorImpl version is bumped by every in-place optimizer update,
         // so a new parameter value naturally invalidates the cached reorder.
-        // TorchInductor applies the same principle by reusing transformed
         // convolution parameters inside its compiled training graph.
         const bool cache_weight = true;
         
@@ -2474,10 +2472,8 @@ Tensor conv3d_cpu(const Tensor& input_arg, const Tensor& weight_arg, const Tenso
 
 // oneDNN deconvolution forward for conv_transpose2d/3d.
 //
-// PyTorch transpose-conv weights are IOHW/OIDHW (C_in, C_out/g, ...), while
 // oneDNN deconvolution expects them in OIHW order (C_out/g, C_in/g per
 // group).  Like mkldnn_convolution_transpose in
-// aten/src/ATen/native/mkldnn/Conv.cpp, the transpose is expressed as a
 // strides-only view (no copy); the reorder into the blocked layout the
 // primitive wants is cached per parameter (TensorImpl + version), so steady
 // state training pays it once.  oneDNN deconv computes
@@ -2582,7 +2578,6 @@ static bool conv_transpose2d_onednn(const Tensor& input, const Tensor& weight, c
             memory::dims dilates_dims = {dilation[0] - 1, dilation[1] - 1};
             memory::dims padding_l_dims = {padding[0], padding[1]};
             // oneDNN deconv: osize = (isize-1)*s - pad_l - pad_r + d*(k-1) + 1,
-            // so pad_r = padding - output_padding (see torch mkldnn Utils.h).
             memory::dims padding_r_dims = {padding[0] - output_padding[0],
                                            padding[1] - output_padding[1]};
 
@@ -3822,12 +3817,10 @@ Tensor conv3d_grad_bias_cpu(const Tensor& grad_output, const Tensor& input, cons
 
 // ConvTranspose2d Backward (Reuse Conv2d)
 //
-// Alignment with ATen (Convolution.cpp convolution_backward, transposed case):
 // grad_input is a plain forward convolution of grad_output with the same
 // weight/stride/padding/dilation, grad_weight is the forward-conv weight
 // gradient with input and grad_output swapped (oneDNN implements its deconv
 // bwd primitives exactly this way). output_padding does not change the
-// adjoints except when output_padding >= stride: aten allows that as long as
 // output_padding < dilation (NaiveConvolutionTranspose2d.cpp check), and the
 // plain convolution then produces floor(op/s) extra trailing elements per
 // spatial axis that lie outside the input support; slow_conv_transpose2d_backward
@@ -4157,7 +4150,6 @@ static bool conv_transpose3d_grad_weight_onednn(const Tensor& grad_output, const
 }
 
 Tensor conv_transpose2d_grad_weight_cpu(const Tensor& grad_output, const Tensor& input, const Tensor& weight, const std::vector<int64_t>& stride, const std::vector<int64_t>& padding, const std::vector<int64_t>& output_padding, int64_t groups, const std::vector<int64_t>& dilation) {
-    // aten convolution_backward (transposed): swap input/grad_output and run the
     // plain conv weight gradient. im2col runs over grad_output (the large tensor),
     // the MM against input (the small one); output_padding rows fall outside the
     // conv windows and correctly do not contribute.
@@ -4204,15 +4196,11 @@ Tensor conv_transpose3d_grad_bias_cpu(const Tensor& grad_output, const Tensor& i
 }
 
 // =========================================================================
-// Conv-family alignment with ATen.
 //
 // * unfold / fold: public im2col / col2im entry points wrap the templates
-//   the conv2d/conv3d fallback already uses; the adjoints mirror aten's
 //   unfold_backward / col2im_backward.
 // * conv_transpose1d: mapped onto conv_transpose2d exactly the way
 //   conv1d_cpu maps onto conv2d (unsqueeze the spatial axis).
-// * dtype coverage mirrors torch CPU: Float64 runs a naive direct
-//   convolution (the aten slow_conv path -- oneDNN has no f64 conv here),
 //   Float16/BFloat16 are computed in Float32 and cast back.
 // =========================================================================
 
@@ -4809,10 +4797,8 @@ static Tensor conv_grad_bias_generic(const Tensor& grad_output) {
     return gb;
 }
 
-// torch's CPU conv computes fp16/bf16 operands in float32 and stores back;
 // mirror that by upcasting around the Float32 path.
 
-// --- unfold / fold (aten im2col / col2im) -----------------------------------
 
 static void im2col_check_args(const char* op, const Tensor& input,
                               const std::vector<int64_t>& kernel_size,

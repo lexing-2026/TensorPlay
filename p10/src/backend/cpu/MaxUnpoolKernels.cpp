@@ -1,11 +1,8 @@
 // max_unpool2d / max_unpool3d CPU kernels.
 //
-// Port of aten/src/ATen/native/MaxUnpooling.cpp (shape checks) +
 // cpu/MaxUnpoolKernel.cpp (scatter/gather): the forward scatters pooled values
 // into a zero canvas at the flat in-plane int64 indices recorded by
 // max_pool*_with_indices; the backward gathers grad_output at those same
-// positions (ATen expresses it as max_pool_double_backward == gather).
-// Duplicate indices are last-write-wins, matching ATen.
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "Exception.h"
@@ -129,7 +126,6 @@ std::vector<int64_t> unpool_output_shape(const Tensor& self, int64_t spatial_dim
     return shape;
 }
 
-// ATen max_unpooling3d_shape_check gradOutput branch: same ndim and same
 // batch/channel dims as the (indices) input; spatial dims checked separately
 // against output_size.
 void unpool_check_grad(const Tensor& grad_output, const Tensor& indices,

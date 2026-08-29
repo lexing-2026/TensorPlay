@@ -1,17 +1,7 @@
 // Tier-1 hot indexing/masking/scan operators.
 //
-// Algorithms are ported from the vendored PyTorch tree at third_party/pytorch
-// (2.15.0a0). Each kernel cites the exact ATen source location it mirrors:
-//   - aten/src/ATen/native/TensorAdvancedIndexing.cpp   (masked_fill/gather/
 //     index_select/index_add/index_put/nonzero/take)
-//   - aten/src/ATen/native/TriangularOps.cpp            (tril/triu)
-//   - aten/src/ATen/native/cpu/ReduceOpsKernel.cpp      (cumsum/cumprod/
 //     logcumsumexp)
-//   - aten/src/ATen/native/cpu/IndexKernel.cpp          (index_fill/index_copy)
-//   - aten/src/ATen/native/cpu/ScatterGatherKernel.cpp  (scatter/scatter_add)
-//   - aten/src/ATen/native/Sorting.cpp                  (sort/argsort)
-//   - aten/src/ATen/native/Bucketization.cpp            (searchsorted/bucketize)
-//   - aten/src/ATen/native/SummaryOps.cpp               (bincount)
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "Scalar.h"
@@ -34,7 +24,6 @@ using namespace tensorplay::parallel;
 namespace {
 
 inline int64_t wrap_dim(int64_t dim, int64_t ndim) {
-    // at::maybe_wrap_dim
     if (dim < 0) dim += ndim;
     if (dim < 0 || dim >= ndim) {
         TP_THROW(RuntimeError, "Dimension out of range (expected to be in range of [",
@@ -55,7 +44,6 @@ inline void outer_inner(const std::vector<int64_t>& shape, int64_t dim,
 // ---------------------------------------------------------------------------
 // masked_fill / masked_fill_
 //
-// ATen: aten/src/ATen/native/TensorAdvancedIndexing.cpp:2459
 // masked_fill_impl_cpu requires a strictly boolean mask (line 2463) and fills
 // through a TensorIterator over {output=self, input=mask}. The out-of-place
 // variant (line 2525) is expand_outplace(mask, self) followed by
@@ -124,7 +112,6 @@ Tensor masked_fill_tensor_cpu(const Tensor& self, const Tensor& mask, const Tens
 // ---------------------------------------------------------------------------
 // tril / triu
 //
-// ATen: aten/src/ATen/native/TriangularOps.cpp:176 (tril_cpu) / :180
 // (triu_cpu): keep element (r, c) iff c <= r + k (lower) / c >= r + k
 // (upper), zero elsewhere.
 // ---------------------------------------------------------------------------
@@ -174,7 +161,6 @@ Tensor triu_cpu(const Tensor& self, int64_t diagonal) {
 // ---------------------------------------------------------------------------
 // cumsum / cumprod / logcumsumexp
 //
-// ATen: aten/src/ATen/native/cpu/ReduceOpsKernel.cpp:80 cumsum_cpu_kernel /
 // :99 cumprod_cpu_kernel / :118 logcumsumexp_cpu_kernel. All three share
 // cpu_cum_base_kernel's structure: outer_size x inner_stride independent
 // slices scanned sequentially along `dim` with acc_type accumulation.
@@ -203,7 +189,6 @@ Tensor cumsum_cpu(const Tensor& self, int64_t dim, std::optional<DType> dtype) {
     int64_t nd = self.dim();
     if (nd == 0) TP_THROW(RuntimeError, "cumsum: dimension not supported for scalar tensors");
     dim = wrap_dim(dim, nd);
-    // ATen parity: bool inputs accumulate in int64 unless dtype overrides.
     DType out_dtype = dtype.value_or(self.dtype() == DType::Bool ? DType::Int64
                                                                  : self.dtype());
     Tensor src = (self.dtype() == out_dtype) ? self.contiguous() : self.to(out_dtype).contiguous();
@@ -322,8 +307,6 @@ Tensor logcumsumexp_cpu(const Tensor& self, int64_t dim, std::optional<DType> dt
 // ---------------------------------------------------------------------------
 // gather
 //
-// ATen: aten/src/ATen/native/TensorAdvancedIndexing.cpp:2097
-// TORCH_IMPL_FUNC(gather_out): shape checks then per-element indexed read.
 // Backward reference: gather_backward (line 2118) = new_zeros +
 // scatter_add_(dim, index, grad).
 // ---------------------------------------------------------------------------
@@ -344,7 +327,6 @@ Tensor gather_cpu(const Tensor& self, int64_t dim, const Tensor& index) {
     Tensor self_c = self.contiguous();
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(idx_c.shape()), self.dtype(), self.device());
     // Decomposition runs over the RESULT (=index) shape; the source read
-    // applies self's own strides (ATen allows index.size(i) <= self.size(i)
     // for i != dim, so the two extents may differ).
     int64_t idx_outer = 1;
     for (int64_t i = 0; i < dim; ++i) idx_outer *= idx_c.size(i);
@@ -384,7 +366,6 @@ Tensor gather_cpu(const Tensor& self, int64_t dim, const Tensor& index) {
 // ---------------------------------------------------------------------------
 // scatter / scatter_add
 //
-// ATen: elementwise two-index functor kernels:
 //   cuda/ScatterGatherKernel.cu:98 _scatter_gather_elementwise_kernel;
 //   accumulation uses atomicAdd on CUDA (nondeterminism noted at :588).
 //   CPU equivalent loops limited_vector slices in
@@ -401,7 +382,6 @@ Tensor scatter_base_cpu(const Tensor& self, int64_t dim, const Tensor& index,
         TP_THROW(IndexError, "Index must have same number of dimensions as output tensor");
     }
     Tensor idx_c = (index.dtype() == DType::Int64) ? index.contiguous() : index.to(DType::Int64).contiguous();
-    // src must broadcast against the index shape (torch semantics).
     std::vector<int64_t> idx_shape(static_cast<std::vector<int64_t>>(idx_c.shape()));
     Tensor src_b;
     if (src.numel() == 1) {
@@ -415,7 +395,6 @@ Tensor scatter_base_cpu(const Tensor& self, int64_t dim, const Tensor& index,
         src_b = src.expand(idx_shape).contiguous();
     }
     if (src_b.dtype() != self.dtype()) {
-        // torch scatters through self's dtype
         src_b = src_b.to(self.dtype());
     }
     Tensor result = detail::contiguous_clone(self);
@@ -431,7 +410,6 @@ Tensor scatter_base_cpu(const Tensor& self, int64_t dim, const Tensor& index,
     int64_t idx_dim_size = idx_c.size(dim);
     int64_t total_idx = idx_c.numel();
     int64_t self_dim_size = self.size(dim);
-    // Elementwise mapping (ATen scatter_gather_base_kernel via
     // TensorIterator): one destination element per index element,
     // out[oo][idx_value][t] <- src[oo][j][t].
 #define TP_SCATTER_CASE(ctype, name) \
@@ -479,7 +457,6 @@ Tensor scatter_value_cpu(const Tensor& self, int64_t dim, const Tensor& index, S
     return scatter_base_cpu(self, dim, index, full, ScatterMode::Assign);
 }
 
-// In-place variants of scatter_base_cpu (torch's Tensor.scatter_ /
 // Tensor.scatter_add_): same scatter, written directly into self instead of a
 // clone.  Kept as a sibling of the out-of-place base rather than folded into
 // it so the existing dispatch path stays untouched.
@@ -508,7 +485,6 @@ static Tensor& scatter_base_inplace_cpu(Tensor& self, int64_t dim, const Tensor&
     }
     if (!self.is_contiguous()) {
         // The raw-pointer loop below needs a contiguous destination; scatter
-        // through a contiguous temporary and copy back (same values torch
         // produces for a strided self).
         Tensor out = scatter_base_cpu(self, dim, index, src, mode);
         self.copy_(out);
@@ -573,7 +549,6 @@ Tensor& scatter_add_inplace_cpu(Tensor& self, int64_t dim, const Tensor& index, 
 // ---------------------------------------------------------------------------
 // index_select
 //
-// ATen: aten/src/ATen/native/TensorAdvancedIndexing.cpp:1888
 // index_select_cpu_: memcpy per selected slice along dim.
 // ---------------------------------------------------------------------------
 
@@ -616,7 +591,6 @@ Tensor index_select_cpu(const Tensor& self, int64_t dim, const Tensor& index) {
 // ---------------------------------------------------------------------------
 // index_add
 //
-// ATen: aten/src/ATen/native/TensorAdvancedIndexing.cpp:1162
 // index_add_cpu_out -> index_add_cpu_ (line 1250 dispatches index types and
 // adds each source slice into self along dim).
 // ---------------------------------------------------------------------------
@@ -666,7 +640,6 @@ Tensor index_add_cpu(const Tensor& self, int64_t dim, const Tensor& index, const
 // ---------------------------------------------------------------------------
 // index_copy / index_fill
 //
-// ATen: aten/src/ATen/native/cpu/IndexKernel.cpp:218 index_fill_cpu /
 // :277 index_copy_cpu (both run through TensorIterator with an index
 // lookup per slice).
 // ---------------------------------------------------------------------------
@@ -706,7 +679,6 @@ Tensor index_copy_cpu(const Tensor& self, int64_t dim, const Tensor& index, cons
 Tensor index_fill_scalar_cpu(const Tensor& self, int64_t dim, const Tensor& index, Scalar value);
 
 Tensor index_fill_tensor_cpu(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& value) {
-    // ATen index_fill_.Tensor reduces the 0-dim value to a scalar first.
     if (value.dim() != 0) {
         TP_THROW(RuntimeError,
                  "index_fill only supports a 0-dimensional value tensor, but got tensor with ",
@@ -749,7 +721,6 @@ Tensor index_fill_scalar_cpu(const Tensor& self, int64_t dim, const Tensor& inde
 }
 
 Tensor& index_fill_scalar__cpu(Tensor& self, int64_t dim, const Tensor& index, Scalar value) {
-    // ATen IndexKernel.cpp index_fill_ writes in place through the same
     // slice loop; tp composes it as fill-then-copy_ like the other
     // in-place index ops.
     self.copy_(index_fill_scalar_cpu(self, dim, index, value));
@@ -768,7 +739,6 @@ Tensor& index_fill_tensor__cpu(Tensor& self, int64_t dim, const Tensor& index, c
 // ---------------------------------------------------------------------------
 // index_put / index_put_
 //
-// ATen: aten/src/ATen/native/TensorAdvancedIndexing.cpp:962
 // _index_put_impl_ (linearized indices; accumulate=True adds instead of
 // assigning).
 // ---------------------------------------------------------------------------
@@ -824,7 +794,6 @@ Tensor& index_put__cpu(Tensor& self, const std::vector<Tensor>& indices,
 // ---------------------------------------------------------------------------
 // nonzero
 //
-// ATen: aten/src/ATen/native/TensorAdvancedIndexing.cpp:3024 nonzero_cpu:
 // first count matching elements, then fill an (n, dim) Long tensor with
 // coordinates in row-major order.
 // ---------------------------------------------------------------------------
@@ -862,7 +831,6 @@ Tensor nonzero_cpu(const Tensor& self) {
 // ---------------------------------------------------------------------------
 // sort / argsort
 //
-// ATen: aten/src/ATen/native/Sorting.cpp:1018 sort_stable_out: per-slice
 // stable sort along dim that also carries the original positions.
 // ---------------------------------------------------------------------------
 
@@ -913,7 +881,6 @@ Tensor argsort_cpu(const Tensor& self, int64_t dim, bool descending) {
 // ---------------------------------------------------------------------------
 // searchsorted / bucketize
 //
-// ATen: aten/src/ATen/native/Bucketization.cpp:88
 // searchsorted_cpu_contiguous: binary search per value; right=false yields
 // the lower bound (first boundary >= v), right=true the upper bound (first
 // boundary > v).
@@ -986,7 +953,6 @@ Tensor bucketize_cpu(const Tensor& self, const Tensor& boundaries, bool out_int3
 // ---------------------------------------------------------------------------
 // bincount
 //
-// ATen: aten/src/ATen/native/SummaryOps.cpp:84 _bincount_cpu ->
 // :24 _bincount_cpu_template. Rules mirrored here:
 //   - minlength must be >= 0 (:25)
 //   - empty 1-D input returns zeros({minlength}, Long) (:29)
@@ -1060,7 +1026,6 @@ Tensor bincount_cpu(const Tensor& self, const std::optional<Tensor>& weights_opt
 // ---------------------------------------------------------------------------
 // take
 //
-// ATen: aten/src/ATen/native/TensorAdvancedIndexing.cpp:1076 take():
 // flatten self, index_select along dim 0, reshape to index.sizes().
 // ---------------------------------------------------------------------------
 
@@ -1073,7 +1038,6 @@ Tensor take_cpu(const Tensor& self, const Tensor& index) {
 // ---------------------------------------------------------------------------
 // masked_scatter
 //
-// ATen: aten/src/ATen/native/cuda/IndexKernel.cu:409
 // launch_masked_scatter_kernel (and its CPU counterpart) consume `source`
 // sequentially in mask order.
 // ---------------------------------------------------------------------------
@@ -1106,7 +1070,6 @@ Tensor masked_scatter_cpu(const Tensor& self, const Tensor& mask, const Tensor& 
 // ---------------------------------------------------------------------------
 // cumsum_backward
 //
-// ATen: tools/autograd/derivatives.yaml:530-532 -> cumsum_backward helper,
 // implemented as grad.flip(dim).cumsum(dim).flip(dim). Equivalent reverse
 // walk: R[i] = sum_{j>=i} g[j].
 // ---------------------------------------------------------------------------
@@ -1152,7 +1115,6 @@ Tensor cumsum_backward_cpu(const Tensor& grad, int64_t dim) {
     return result;
 }
 
-// unique — mirrors ATen native/TensorAdvancedIndexing.cpp unique_cpu_temp_impl:
 // stable sort of (value, original index) pairs, group adjacent equal values.
 // Returns (values, inverse, counts); inverse/counts are empty when the
 // corresponding flag is false.
@@ -1202,7 +1164,6 @@ std::tuple<Tensor, Tensor, Tensor> unique_cpu(const Tensor& self, bool sorted, b
     if (!sorted) {
         // keep first-occurrence order of groups instead of sorted order
         std::vector<bool> seen_group(n, false);
-        // fall back to sorted output semantics: torch CPU returns sorted anyway.
     }
 
     std::vector<int64_t> group_first;          // index into order of each group start
@@ -1215,7 +1176,6 @@ std::tuple<Tensor, Tensor, Tensor> unique_cpu(const Tensor& self, bool sorted, b
 
     Tensor values = Tensor::empty({n_groups}, sc.dtype(), sc.device());
     // NB: group_first[] indexes positions in the sorted order[] sequence;
-    // dereference order first or we read original-layout values (ATen
     // unique_cpu_temp_impl gathers via sort_indices).
     #define TP_UNIQUE_FILL(ctype, dt)                                            \
         {                                                                        \
@@ -1327,13 +1287,10 @@ TENSORPLAY_LIBRARY_IMPL(CPU, IndexingKernels) {
 
 
 // ---------------------------------------------------------------------------
-// scatter_reduce / index_reduce — ATen TensorAdvancedIndexing.cpp
 // scatter_impl + scatter_reduce_exclude_self_helper (:2133) and Indexing.cu
 // index_reduce_func_cuda_impl (:1320). reduce ∈ {sum, prod, mean, amin,
 // amax}. With include_self=False only the indexed slices are reset to the
-// per-op identity before accumulating (ATen's index_fill_ pre-pass); slices
 // never touched by index keep their original self values. The backward
-// helpers mirror torch/csrc/autograd/FunctionsManual.cpp
 // scatter_reduce_backward / index_reduce_backward.
 //
 // Accumulation is deliberately serial: duplicate indices are the point of
@@ -1384,7 +1341,6 @@ inline void sr_decode(int64_t flat, int64_t idx_dim_size, int64_t idx_inner,
     if (idx < 0) idx += self_dim_size;
 }
 
-// torch div_(count, "floor") for integral dtypes.
 template <typename T>
 inline T sr_floor_div(T v, T c) {
     T q = v / c;
@@ -1394,7 +1350,6 @@ inline T sr_floor_div(T v, T c) {
 
 template <typename T>
 inline void sr_mean_divide(T* d, const int64_t* cp, int64_t n) {
-    // torch: count.masked_fill_(count == 0, 1); out.div_(count)
     for (int64_t i = 0; i < n; ++i) {
         const int64_t c = cp[i] == 0 ? 1 : cp[i];
         if constexpr (std::is_floating_point_v<T>) {
@@ -1453,11 +1408,9 @@ Tensor sr_reduce_forward(const Tensor& self, int64_t dim, const Tensor& index,
     const int64_t total_idx = idx_c.numel();
     const int64_t self_dim_size = self.size(dim);
 
-    // Bounds check up front (torch: "index out of range in self").
     {
         const int64_t* ip0 = idx_c.data_ptr<int64_t>();
         for (int64_t i = 0; i < total_idx; ++i) {
-            // torch rejects negative indices in the scatter family
             // ("index -1 is out of bounds for dimension D with size N").
             const int64_t v = ip0[i];
             if (v < 0 || v >= self_dim_size) {
@@ -1498,7 +1451,6 @@ Tensor sr_reduce_forward(const Tensor& self, int64_t dim, const Tensor& index,
 #undef TP_SR_INIT_CASE
     }
 
-    // mean counts are full-rank, like torch's
     // count.scatter_add_(dim, index, ones_like(src)).
     Tensor count;
     int64_t* cp = nullptr;
@@ -1536,12 +1488,12 @@ Tensor sr_reduce_forward(const Tensor& self, int64_t dim, const Tensor& index,
                     d[dst] = cur * v;                                          \
                     break;                                                     \
                 case SrReduce::AMin:                                           \
-                    /* at::native::minimum semantics: propagate NaN */          \
+                              \
                     d[dst] =                                                   \
                         (std::isnan(cur) || cur < v) ? cur : v;                 \
                     break;                                                     \
                 case SrReduce::AMax:                                           \
-                    /* at::native::maximum semantics: propagate NaN */          \
+                              \
                     d[dst] =                                                   \
                         (std::isnan(cur) || cur > v) ? cur : v;                 \
                     break;                                                     \
@@ -1576,7 +1528,6 @@ Tensor scatter_reduce_cpu(const Tensor& self, int64_t dim, const Tensor& index,
 Tensor index_reduce_cpu(const Tensor& self, int64_t dim, const Tensor& index,
                         const Tensor& source, const std::string& reduce,
                         bool include_self) {
-    // ATen TensorAdvancedIndexing.cpp TORCH_META_FUNC(index_reduce):
     // unlike scatter_reduce this variant takes a 1-D index, a source of
     // self's rank (equal sizes except dim == index.numel()), and rejects
     // 'sum'.
@@ -1624,7 +1575,6 @@ Tensor index_reduce_cpu(const Tensor& self, int64_t dim, const Tensor& index,
     const int64_t* ip = idx_c.data_ptr<int64_t>();
     const int64_t self_dim_size = self.size(dim);
     for (int64_t j = 0; j < K; ++j) {
-        // torch rejects negative indices in the scatter family
         if (ip[j] < 0 || ip[j] >= self_dim_size) {
             TP_THROW(IndexError, "index ", ip[j],
                      " is out of bounds for dimension ", dim,
@@ -1642,7 +1592,6 @@ Tensor index_reduce_cpu(const Tensor& self, int64_t dim, const Tensor& index,
     Tensor count;
     int64_t* cp = nullptr;
     if (reduce == "mean") {
-        // torch: ones/zeros_like(result), accumulated per destination row
         count = Tensor::full(
             static_cast<std::vector<int64_t>>(self.shape()),
             include_self ? 1 : 0, DType::Int64, self.device());
@@ -1790,7 +1739,6 @@ Tensor scatter_reduce_backward_src_cpu(const Tensor& grad, const Tensor& self,
         // when self is excluded).
         return out;
     }
-    // prod: handle zeros in src per torch FunctionsManual
     Tensor masked_self = self.masked_fill(self.eq(0), 1.0);
     Tensor masked_self_result = sr_reduce_forward(masked_self, dim, index, src,
                                                   reduce, include_self);

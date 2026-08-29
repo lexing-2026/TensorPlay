@@ -46,7 +46,6 @@ Tensor& relu_inplace_kernel(Tensor& self);
 // --- AVX-512 runtime-dispatched contiguous binary kernels -------------------
 // Zen4-class CPUs run zmm natively; the build carries no global -mavx512f so
 // these carry their own target attribute and are gated by cpuid at runtime.
-// Formulas match ATen's reduced-precision CPU kernels: vector add uses the
 // native fused multiply-add path, while mul/div are single IEEE ops.
 #if defined(__x86_64__)
 namespace {
@@ -228,7 +227,6 @@ inline bool cpu_has_avx512_bf16() {
 }
 
 // BF16 arithmetic is performed in float32 and rounded once on store, just as
-// ATen's reduced-precision CPU kernels do.  Keep the conversion in this
 // target-attributed routine: the rest of p10 remains safe to load on hosts
 // without AVX-512 BF16, while Zen4-class hosts get the native 16-lane path.
 __attribute__((target("avx512f,avx512bw,avx512bf16,fma")))
@@ -247,7 +245,6 @@ void bf16_binary_avx512(int code, const uint16_t* a, const uint16_t* b,
             _mm512_slli_epi32(_mm512_cvtepu16_epi32(br), 16));
         __m512 out;
         switch (code) {
-            // ATen's Vectorized BF16 add uses vec::fmadd(other, alpha, self).
             // Match that accumulation order before the single BF16 store.
             case BIN_ADD: out = _mm512_fmadd_ps(valpha, bf, af); break;
             case BIN_MUL: out = _mm512_mul_ps(af, bf); break;
@@ -423,7 +420,6 @@ Tensor binary_op_kernel_impl(const Tensor& self, const Tensor& other, Op op, Mkl
         }
 
         switch (result_dtype) {
-            // Complex parity with ATen BinaryOpsKernel: +, -, *, / are
             // defined component-wise over the complex dtypes.
             TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TI_OP_CASE)
             default: TP_THROW(TypeError, "binary_op: unsupported dtype");
@@ -865,12 +861,10 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
         TensorIterator iter = TensorIterator::binary_op(result, self_casted, other_casted);
 
 #if defined(__x86_64__)
-        // torch cpu_kernel_vec parity: TensorIterator coalesces the innermost
         // contiguous dim into each run (broadcast operands included), so runs
         // whose strides all equal the element size vectorize exactly like the
         // same-shape path.  This is the bias-add pattern ((N,G)+(G,)) that
         // the RNN cells hit at every timestep; the scalar run loop below was
-        // ~10x off torch for it.
         if (result_dtype == DType::Float32 && cpu_has_avx512()) {
             const float alpha_val = alpha.to<float>();
             iter.for_each([&](char** data, const int64_t* strides, int64_t n) {
@@ -1251,7 +1245,6 @@ Tensor div_kernel(const Tensor& self, const Tensor& other) {
 #endif
 
     // AVX2 complex fast path (cpu/VecComplex.h): contiguous same-shape div
-    // (Smith's algorithm, true SIMD -- torch CPU divides via scalar loops).
     if ((self.dtype() == DType::ComplexFloat ||
          self.dtype() == DType::ComplexDouble) &&
         other.dtype() == self.dtype() && self.shape() == other.shape() &&
@@ -1271,7 +1264,6 @@ Tensor div_kernel(const Tensor& self, const Tensor& other) {
 
 #if defined(__x86_64__)
     // AVX-512 runtime dispatch: contiguous same-shape real div (IEEE vdivps,
-    // bit-identical to the scalar path; torch needs its 512-bit path to keep
     // up here).
     if ((self.dtype() == DType::Float32 || self.dtype() == DType::Float64) &&
         other.dtype() == self.dtype() && self.shape() == other.shape() &&
@@ -2051,7 +2043,6 @@ Tensor& div_inplace_kernel(Tensor& self, const Tensor& other) {
 // --- Scalar Kernels ---
 
 namespace {
-// ATen weak-scalar rules shared by the tensor-scalar kernels: a wrapped
 // complex scalar widens any REAL tensor to its complex width (float64 ->
 // complex128, everything else -> complex64); a wrapped float promotes
 // integral tensors to Float32.
@@ -2220,7 +2211,6 @@ Tensor mul_scalar_kernel(const Tensor& self, Scalar other) {
 Tensor div_scalar_kernel(const Tensor& self, Scalar other) {
     // True division promotes integral tensors to Float32 (or ComplexFloat
     // for a wrapped complex divisor), while preserving floating tensor
-    // precision for a Python scalar (the PyTorch rule).
     DType result_dtype = self.dtype();
     if (!isFloatingOrComplexType(result_dtype)) {
         result_dtype = other.isComplex() ? DType::ComplexFloat : DType::Float32;
@@ -2435,7 +2425,6 @@ Tensor& div_scalar_inplace_kernel(Tensor& self, Scalar other) {
     return self;
 }
 
-// Torch's optimizer kernels use these compound pointwise operators directly.
 // Keep the common contiguous float32 case fused, and use one native ternary
 // traversal for every broadcasted/promotion path.  The latter is important:
 // composing mul() and add() here would reintroduce the Python/composite

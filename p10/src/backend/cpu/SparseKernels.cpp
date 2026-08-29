@@ -58,7 +58,6 @@ std::vector<int64_t> dense_shape_for(const Tensor& sparse) {
 Tensor sparse_coo_tensor_cpu(const Tensor& indices, const Tensor& values,
                              std::optional<std::vector<int64_t>> size,
                              bool is_coalesced) {
-    // torch infers missing sizes from the coordinates (sparse dims: max+1)
     // and the values shape (dense dims).  The reduction needs host data, so
     // CUDA indices are staged through the CPU like coalesce_cuda does.
     if (!size.has_value()) {
@@ -162,7 +161,6 @@ Tensor sparse_mask_cpu(const Tensor& dense, const Tensor& mask) {
         TP_THROW(RuntimeError,
                  "sparse_mask(): operands have incompatible sizes; self and mask must have the same shape");
     }
-    // Torch projects the dense values onto the mask's existing COO entries;
     // it does not coalesce an uncoalesced mask or change its duplicate/order
     // semantics.  SparseAdam passes a coalesced gradient when it needs the
     // canonical form explicitly.
@@ -564,7 +562,6 @@ Tensor sparse_mm_cpu(const Tensor& self, const Tensor& dense) {
     return out;
 }
 
-// ATen SparseTensorMath.cpp::_sparse_sum semantics: reducing every sparse dim
 // returns a dense tensor (the values summed); a partial reduction keeps the
 // surviving coordinate rows, rebuilds the COO over the kept dims and folds
 // duplicate coordinates via coalesce(), returning a sparse tensor.  ``dtype``
@@ -746,7 +743,6 @@ Tensor sparse_mul_cpu(const Tensor& self, const Tensor& other) {
     return result_storage;
 }
 
-// ATen SparseFactories.cpp::spdiags + _spdiags_kernel_cpu: diagonal ``d``
 // stores ``min(d+M, L)`` entries when ``d <= 0`` and ``min(N, L) - d``
 // otherwise, placed starting at cell ``(max(d,0)-d, max(d,0))``; values are
 // read from row ``j`` of ``diagonals`` beginning at column ``max(d, 0)``.
@@ -814,7 +810,6 @@ Tensor spdiags_cpu(const Tensor& diagonals, const Tensor& offsets,
     int64_t total_nnz = 0;
     for (int64_t j = 0; j < n_diag; ++j) {
         const int64_t d = off_host[static_cast<size_t>(j)];
-        // Out-of-range offsets clamp to zero stored elements where torch
         // would produce undefined content.
         const int64_t count = d <= 0 ? std::min(d + m_size, length)
                                      : std::min(n_size, length) - d;

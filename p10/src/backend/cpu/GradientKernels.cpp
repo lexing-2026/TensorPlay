@@ -1,18 +1,14 @@
-// torch.gradient (ATen Gradient.cpp / numpy semantics).
 //
 // Upstream registers gradient.* with no dispatch section -- the default
 // CompositeImplicitAutograd: forward is a pure composition of differentiable
 // primitives, autograd is derived from the inner calls and no derivatives.yaml
 // entry exists.  Every returned tensor keeps the grad_fn its inner calls
-// recorded, so backward AND double-backward work exactly like torch
-// (torch 2.13 exposes a Cat -> Div -> Sub -> Slice chain, never a fused
 // GradientBackward node).  We mirror that by registering one device-generic
 // composition under the backend-neutral Composite key;
 // OperatorHandle::getKernel falls through to it for every dense backend
 // (p10/include/Dispatcher.h) and, since the op has no generated autograd
 // wrapper, nothing stands between the caller and the inner recording.
 //
-// Edge formulas (numpy.gradient / ATen np_gradient):
 //   edge_order selects the BORDER accuracy only -- eo1 one-sided chord
 //   slopes, eo2 3-point Lagrange stencils.  The interior ALWAYS uses the
 //   second-order central (3-point quadratic-fit) weights
@@ -60,7 +56,7 @@ Tensor gradient_axis(const Tensor& src, int64_t d, const Tensor& coord,
     const int64_t n = src.size(d);
     if (n <= edge_order) {
         TP_THROW(RuntimeError,
-                 "torch.gradient expected each dimension size to be at least "
+                 "gradient expected each dimension size to be at least "
                  "edge_order+1");
     }
     const Tensor c = coord.to(src.dtype());
@@ -92,15 +88,13 @@ Tensor gradient_axis(const Tensor& src, int64_t d, const Tensor& coord,
 
     if (c.numel() != n) {
         TP_THROW(RuntimeError,
-                 "torch.gradient expected one coordinate per position along "
+                 "gradient expected one coordinate per position along "
                  "the differentiated dimension (got ",
                  c.numel(), " coordinates for ", n, " positions)");
     }
 
     // Non-uniform coordinates.  All weights stay tensors so that gradients
-    // wrt the coordinates themselves would flow exactly like torch's.
     // Interior (k = 1 .. n-2), quadratic fit through (k-1, k, k+1) -- this
-    // is numpy/torch's second-order central difference, used for BOTH edge
     // orders; edge_order only changes the borders below.
     const Tensor hl = c.narrow(0, 1, n - 2).sub(c.narrow(0, 0, n - 2));
     const Tensor hr = c.narrow(0, 2, n - 2).sub(c.narrow(0, 1, n - 2));
@@ -151,18 +145,17 @@ Tensor gradient_axis(const Tensor& src, int64_t d, const Tensor& coord,
 // Empty `dim` differentiates along every axis; empty `spacing` means unit
 // step for every requested axis; otherwise both lists are parallel (the
 // Python wrapper guarantees the pairing).  Integral / bool inputs promote to
-// Float32 exactly like torch's result_type(self, 1.0) behavior.
 std::vector<Tensor> gradient_composite(const Tensor& self,
                                        const std::vector<Tensor>& spacing,
                                        const std::vector<int64_t>& dims,
                                        int64_t edge_order) {
     if (edge_order != 1 && edge_order != 2) {
         TP_THROW(RuntimeError,
-                 "torch.gradient only supports edge_order=1 and edge_order=2.");
+                 "gradient only supports edge_order=1 and edge_order=2.");
     }
     if (!spacing.empty() && spacing.size() != dims.size()) {
         TP_THROW(RuntimeError,
-                 "torch.gradient expected one spacing per differentiated "
+                 "gradient expected one spacing per differentiated "
                  "dimension");
     }
     const int64_t ndim = self.dim();
@@ -188,7 +181,6 @@ std::vector<Tensor> gradient_composite(const Tensor& self,
             coord = Tensor::full({1}, 1, work.dtype(), work.device());
         } else if (spacing.size() == 1) {
             // A single spacing broadcasts across every requested axis
-            // (torch's scalar / one-tensor spacing form).
             coord = spacing[0];
         } else {
             coord = spacing[i];

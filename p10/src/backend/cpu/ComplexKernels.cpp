@@ -583,7 +583,6 @@ void binary_core(
                 yi = O::add(O::mul(ar, bi), O::mul(ai, br));
                 break;
             case Op::Div: {
-                // Smith, scaled by max(|br|, |bi|) -- ATen parity
                 V m = O::max(vabs(br), vabs(bi));
                 V inv = O::div(O::one(), m);
                 V b2r = O::mul(br, inv);

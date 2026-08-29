@@ -11,7 +11,6 @@
 namespace tensorplay {
 namespace cpu {
 
-// NLL Loss -- templated over real input dtype (torch supports f32/f64).
 template <typename scalar_t>
 std::tuple<Tensor, Tensor> nll_loss_impl(const Tensor& input, const Tensor& target,
                                          const std::optional<Tensor>& weight,
@@ -120,7 +119,6 @@ Tensor nll_loss_backward_kernel(const Tensor& grad_output, const Tensor& input, 
     TP_THROW(NotImplementedError, "nll_loss backward only supports Float32/Float64");
 }
 
-// NLL Loss 2D -- ATen LossNLL.cpp nll_loss2d_forward/backward: input is
 // (N, C, H, W), target (N, H, W); every spatial position is an independent
 // batch row, so the row layout is input[(n * C + t) * H * W + pos].
 template <typename scalar_t>
@@ -273,8 +271,6 @@ Tensor mse_loss_backward_kernel(const Tensor& grad_output, const Tensor& input, 
 
 
 
-// Torch-aligned loss family (reduction-aware forward + explicit backward),
-// ported from aten/src/ATen/native/Loss.cpp. Composed from dispatcher ops
 // following the mse_loss_kernel house style.
 // reduction: 0=none, 1=mean, 2=sum
 // -----------------------------------------------------------------------------
@@ -316,7 +312,6 @@ Tensor l1_loss_backward_kernel(const Tensor& grad_output, const Tensor& input,
     return scale_grad(g, reduction, input.numel());
 }
 
-// ATen Loss.cpp + cpu/BinaryOpsKernel.cpp smooth_l1_kernel:
 // z = |x - t|; z < beta ? 0.5 z^2 / beta : z - 0.5 beta (equal at z == beta).
 Tensor smooth_l1_loss_cpu(const Tensor& input, const Tensor& target,
                           int64_t reduction, double beta) {
@@ -329,7 +324,6 @@ Tensor smooth_l1_loss_cpu(const Tensor& input, const Tensor& target,
     return loss_reduce(loss, reduction);
 }
 
-// ATen cpu/PointwiseOpsKernel.cpp smooth_l1_backward_cpu_kernel:
 // x = input - target; |x| <= beta ? norm * x / beta : norm * sign(x),
 // with norm = 1/numel for mean reduction (inclusive/exclusive boundary
 // forms agree since both give norm * grad at |x| == beta).
@@ -340,7 +334,6 @@ Tensor smooth_l1_loss_backward_cpu(const Tensor& grad_output, const Tensor& inpu
     return scale_grad(g, reduction, input.numel());
 }
 
-// ATen Loss.cpp + cpu/BinaryOpsKernel.cpp huber_kernel:
 // z = |x - t|; z < delta ? 0.5 z^2 : delta (z - 0.5 delta).
 Tensor huber_loss_cpu(const Tensor& input, const Tensor& target,
                       int64_t reduction, double delta) {
@@ -353,7 +346,6 @@ Tensor huber_loss_cpu(const Tensor& input, const Tensor& target,
     return loss_reduce(loss, reduction);
 }
 
-// ATen cpu/PointwiseOpsKernel.cpp huber_backward_cpu_kernel:
 // x = input - target; |x| <= delta ? norm * x : norm * delta * sign(x).
 Tensor huber_loss_backward_cpu(const Tensor& grad_output, const Tensor& input,
                                const Tensor& target, int64_t reduction, double delta) {
@@ -387,8 +379,6 @@ Tensor kl_div_backward_kernel(const Tensor& grad_output, const Tensor& input,
     return scale_grad(g, reduction, input.numel());
 }
 
-// ATen Loss.cpp binary_cross_entropy_cpu: input and target must lie in
-// [0, 1] (checked up front, mirroring the per-element TORCH_CHECK); the
 // per-element loss is (t-1)*max(log(1-x),-100) - t*max(log(x),-100), then
 // optional weight multiply and reduction.
 void bce_check_01(const Tensor& t, const char* what) {
@@ -411,7 +401,6 @@ Tensor binary_cross_entropy_cpu(const Tensor& input, const Tensor& target,
     return loss_reduce(loss, reduction);
 }
 
-// ATen Loss.cpp binary_cross_entropy_backward_cpu:
 // grad * (x - t) / max((1 - x) * x, 1e-12), then weight multiply, and
 // division by input.numel() for mean reduction.
 Tensor binary_cross_entropy_backward_cpu(const Tensor& grad_output, const Tensor& input,
@@ -440,7 +429,6 @@ std::tuple<Tensor, Tensor> margin_ranking_loss_backward_kernel(
 
 Tensor hinge_embedding_loss_kernel(const Tensor& input, const Tensor& target,
                                    double margin, int64_t reduction) {
-    // ATen Loss.cpp:185 — loss = where(t != 1, clamp_min(margin - x, 0), 0)
     //                        + where(t != -1, x, 0)
     Tensor z = zeros_like_shim(input);
     Tensor margin_part = Tensor::where(target.ne(1),
@@ -451,7 +439,6 @@ Tensor hinge_embedding_loss_kernel(const Tensor& input, const Tensor& target,
 
 Tensor hinge_embedding_loss_backward_kernel(const Tensor& grad_output, const Tensor& input,
                                             const Tensor& target, double margin, int64_t reduction) {
-    // d/dx of the ATen form above:
     //   y == 1          -> 1
     //   y == -1         -> (margin - x > 0) ? -1 : 0
     //   otherwise       -> 1 + ((margin - x > 0) ? -1 : 0)
@@ -482,7 +469,6 @@ Tensor cosine_embedding_loss_kernel(const Tensor& x1, const Tensor& x2,
     Tensor d = (n1 * n2).sqrt();
     Tensor cos = (x1 * x2).sum(std::vector<int64_t>{1}) / d;
     Tensor zero = zeros_like_shim(cos);
-    // ATen Loss.cpp cosine_embedding_loss_out:
     //   t ==  1 -> 1 - cos
     //   t == -1 -> max(0, cos - margin)
     //   else    -> 0
@@ -549,11 +535,9 @@ Tensor poisson_nll_loss_backward_kernel(const Tensor& grad_output, const Tensor&
 }
 
 // ---------------------------------------------------------------------------
-// CTC loss -- port of aten/src/ATen/native/LossCTC.cpp CPU templates.
 //
 // `_ctc_loss` returns the RAW per-sequence negative log likelihood (entries
 // stay +inf for impossible alignments; `zero_infinity` is honored only by
-// the backward, mirroring ATen where the flag gates grad zeroing) together
 // with the log-alpha table (N, T, 2S+1) consumed by the backward.
 // Targets use the batch-first zero-padded layout (N, S); lengths are (N,).
 
@@ -672,7 +656,6 @@ Tensor ctc_loss_backward_impl(const Tensor& grad_out, const Tensor& log_probs,
     int64_t S = targets.size(1);
     int64_t M = 2 * S + 1;
 
-    // ATen semantics: grad starts as "the log of an empty sum" (-inf); the
     // eq (16) collection detects untouched entries via that sentinel.
     Tensor grad = Tensor::empty_like(log_probs);
     scalar_t* gp_init = grad.data_ptr<scalar_t>();
@@ -754,7 +737,6 @@ Tensor ctc_loss_backward_impl(const Tensor& grad_out, const Tensor& log_probs,
         }
 
         // wrap up with the remaining items of eq (16); note the dense softmax
-        // coupling term exp(lp): ATen applies the gradient as if through the
         // training-time log_softmax, so unused labels receive exp(lp) * gr.
         scalar_t gr = gop[b];
         for (int64_t t = 0; t < il; ++t) {
@@ -805,7 +787,7 @@ std::tuple<Tensor, Tensor> _ctc_loss_cpu(const Tensor& log_probs,
                                          const Tensor& input_lengths,
                                          const Tensor& target_lengths,
                                          int64_t blank, bool zero_infinity) {
-    (void)zero_infinity;  // honored by the backward, mirroring ATen
+    (void)zero_infinity;
     auto in_l = input_lengths.contiguous();
     auto tg_l = target_lengths.contiguous();
     std::vector<int64_t> il(in_l.data_ptr<int64_t>(),
