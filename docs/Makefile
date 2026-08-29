@@ -1,7 +1,5 @@
-# Minimal makefile for Sphinx documentation (mirrors upstream
-# third_party/pytorch/docs/Makefile; torch-specific targets that depend on
-# scripts this repo does not carry -- figures/opset/exportdb/docset -- are not
-# included, see docs/README.md).
+# Minimal makefile for Sphinx documentation. Targets that require unavailable
+# repository-specific scripts are omitted; see docs/README.md.
 
 # You can set these variables from the command line.
 SPHINXOPTS    ?= -j $(shell nproc) -WT --keep-going

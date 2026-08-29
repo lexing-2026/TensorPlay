@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Generate TensorPlay docs/source/*.md aligned with third_party/pytorch/docs/source.
+"""Generate TensorPlay reference pages from the bundled source pages.
 
-Strategy: parse each upstream torch page for (section heading, autosummary
-entries, active currentmodule); resolve every entry against the corresponding
-tensorplay module; emit pages with identical section structure containing the
-symbols that actually exist today. Entries missing from tensorplay are dropped;
-public tensorplay-only symbols are appended as an explicit additions section.
+The script parses each source page for section headings, autosummary entries,
+and active currentmodule directives; resolves every entry against the
+corresponding TensorPlay module; and emits pages containing the symbols that
+exist today. Missing entries are dropped, and public TensorPlay-only symbols
+are appended as an explicit additions section.
 """
 import inspect
 import os
@@ -13,7 +13,7 @@ import re
 import sys
 
 TP_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-UPSTREAM = os.path.join(TP_ROOT, "third_party", "pytorch", "docs", "source")
+REFERENCE_SOURCE = os.path.join(TP_ROOT, "third_party", "pytorch", "docs", "source")
 OUT = os.path.join(TP_ROOT, "docs", "source")
 
 def map_module(name):
@@ -154,7 +154,7 @@ def parse_page(path):
 
 
 def public_additions(tp_mod_name, known_names):
-    """Public symbols of tp module not covered by upstream lists."""
+    """Public symbols of a TensorPlay module not covered by source lists."""
     try:
         import importlib
         mod = importlib.import_module(tp_mod_name)
@@ -241,7 +241,7 @@ def render(page_title, sections, extras=None):
                 resolved_total += 1
                 row.append((mod, name, True))
         rendered.append((level, title, row))
-    # manual injections for APIs whose upstream scoping doesn't map cleanly
+    # Manual injections for APIs whose source scoping does not map cleanly.
     if extras:
         extra_by_title = {}
         for sec_title, names in extras.items():
@@ -262,7 +262,7 @@ def render(page_title, sections, extras=None):
                 row_mods = {map_module(e[0]) or e[0] for e in row if e[2]}
                 # currentmodule emission handled below via union
                 pass
-        # any extras whose section didn't appear upstream go at the end
+        # Any extras whose section did not appear in the source go at the end.
         for sec_title, (mods, pairs) in extra_by_title.items():
             rendered.append((2, sec_title, [(m, n, True) for m, n in pairs]))
     for level, title, row in rendered:
@@ -270,13 +270,12 @@ def render(page_title, sections, extras=None):
         if not ok:
             continue
         # clamp heading levels so the document never jumps (H1 -> H3), which
-        # myst reports as a warning; upstream occasionally skips levels.
+        # MyST reports this as a warning; source pages occasionally skip levels.
         prev_level = getattr(render, "_prev_level", 1)
         level = min(level, prev_level + 1)
         render._prev_level = level
         buf.append(f"{'#' * level} {title}\n")
         # Fully-qualified names anchored at each symbol's real home module:
-        # upstream pages lean on torch's root re-exports, tensorplay's root
         # namespace does not re-export everything, so short names under a
         # page-level currentmodule break sphinx's stub imports.
         seen_names = page_seen
@@ -323,7 +322,6 @@ PAGES = [
     ("quantization.md", "quantization.md"),
 ]
 
-# Manual injections: page -> {section heading: [(torch_module, name)]}
 EXTRAS = {
     "amp.md": {
         "Autocasting": [("torch.amp", "autocast")],
@@ -351,7 +349,7 @@ EXTRAS = {
 }
 
 # Pages that get an explicit trailing section listing public tensorplay-only
-# symbols not covered by the upstream lists. value = (tp module, exclude set)
+# Symbols not covered by the source lists. Value = (TensorPlay module, exclude set).
 ADDITIONS = {
     "tensorplay.md": ("tensorplay", {"autocast_decrement_nesting", "autocast_increment_nesting"}),
     "nn.md": ("tensorplay.nn", set()),
@@ -361,11 +359,11 @@ ADDITIONS = {
 }
 
 for src, dst in PAGES:
-    path = f"{UPSTREAM}/{src}"
+    path = f"{REFERENCE_SOURCE}/{src}"
     try:
         title, sections = parse_page(path)
     except FileNotFoundError:
-        print(f"skip {src}: upstream missing")
+        print(f"skip {src}: source page missing")
         continue
     if title is None:
         title = dst.replace(".md", "")

@@ -1,5 +1,4 @@
 # TensorPlay documentation build configuration file, adapted from
-# third_party/pytorch/docs/source/conf.py (trimmed to the extensions this
 # repo actually uses; see docs/README.md for the deviation list).
 
 import os
@@ -47,7 +46,7 @@ source_suffix = {
 exclude_patterns = []
 master_doc = "index"
 
-# MyST options (mirrors upstream settings)
+# MyST options used by this documentation build.
 myst_enable_extensions = [
     "colon_fence",
     "deflist",
@@ -60,10 +59,10 @@ myst_enable_extensions = [
 myst_dmath_allow_space = False
 myst_heading_anchors = 4
 
-# The following is used to show the correct "next/previous" banners; upstream
-# relies on theme machinery we do not carry.
+# The following options show the correct "next/previous" banners when supported
+# by the selected theme.
 
-# autodoc / autosummary options (mirrors upstream)
+# autodoc / autosummary options
 autosummary_generate = True
 numpydoc_show_class_members = False
 
@@ -71,7 +70,7 @@ numpydoc_show_class_members = False
 # Do not throw a warning for duplicated section names in different documents.
 autosectionlabel_prefix_document = True
 
-# Disable docstring inheritance (mirrors upstream)
+# Disable docstring inheritance.
 autodoc_inherit_docstrings = False
 
 # The name of the Pygments (syntax highlighting) style to use.
@@ -104,9 +103,8 @@ import re
 _SIGNATURE_ONLY = re.compile(r"^\s*[\w.]+\([^()]*\)\s*->", re.S)
 
 
-def _strip_upstream_assets(app, what, name, obj, options, lines):
-    # Docstrings carried over verbatim from torch reference assets that are
-    # generated upstream (docs/source/scripts/*_images) and are not shipped
+def _strip_reference_assets(app, what, name, obj, options, lines):
+    # Generated assets under docs/source/scripts/*_images are not shipped
     # here; the directives would otherwise emit one unreadable-image warning
     # per scheduler/activation entry.
     lines[:] = [
@@ -124,4 +122,4 @@ def _strip_upstream_assets(app, what, name, obj, options, lines):
 
 
 def setup(app):
-    app.connect("autodoc-process-docstring", _strip_upstream_assets)
+    app.connect("autodoc-process-docstring", _strip_reference_assets)
