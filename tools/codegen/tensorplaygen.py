@@ -1,14 +1,14 @@
-"""
+"""Generate a standalone custom-operator extension.
 
 
 * ``OpsGenerated.h``  -- declarations the user must implement, one per
-  dispatch entry (``myop_cpu`` / ``myop_cuda``), exactly like implementing
+  dispatch entry (``myop_cpu`` / ``myop_cuda``), ready for implementation
 * ``OpsBinding.cpp``  -- dispatcher registration for every backend entry
   public wrapper per op that routes through p10's Dispatcher/DispatchStub,
   and a raw CPython ``PyInit_<module>`` exposing those wrappers through
   ``METH_FASTCALL | METH_KEYWORDS`` entry points on the shared
-  ``tensorplay::python_c`` bridge surface (same shape as the main pipeline's
-  gen_python_c.py layer; no pybind11 in generated code).
+  ``tensorplay::python_c`` bridge surface; generated code does not use
+  pybind11.
 
 Usage (see cmake/TensorPlayCustomOp.cmake):
     python3 tensorplaygen.py --yaml ops.yaml --out_dir gen --module_name myops
@@ -167,7 +167,7 @@ def generate_binding(funcs, module_name: str) -> str:
         L.append("")
     L += [f"}} // namespace {module_name}", "} // namespace tp_custom", ""]
 
-    # ---- CPython METH_FASTCALL module (no pybind11; mirrors gen_python_c.py) ----
+    # ---- CPython METH_FASTCALL module (no pybind11) ----
     L += [
         "namespace {",
         "struct GilRelease {",
@@ -309,7 +309,7 @@ def generate_binding(funcs, module_name: str) -> str:
             "}",
             "",
         ]
-        # Upstream exposes op schemas as the PyMethodDef docstring.
+        # Expose op schemas as the PyMethodDef docstring.
         doc = f.schema.replace("\\", "\\\\").replace('"', '\\"')
         table.append(f'    {{"{pyname}", (PyCFunction)(void*){fn}, '
                      f'METH_FASTCALL | METH_KEYWORDS, "{doc}"}},')

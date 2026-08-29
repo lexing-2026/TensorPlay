@@ -221,7 +221,7 @@
     CPU: div_cpu
     CUDA: div_cuda
 
-# Stax/Inductor pointwise fusion primitive.  The generated p10/tpx wrappers
+# Stax pointwise fusion primitive.  The generated p10/tpx wrappers
 # keep the normal dispatcher and autograd contracts while CPU/CUDA provide a
 # single pass for the common mul+add fusion group.
 - func: fused_mul_add(Tensor self, Tensor other, Tensor addend) -> Tensor
@@ -4614,7 +4614,7 @@
 # ------------------------------------------------------------------
 # In-place family completion.  In-place counterparts (name + '_',
 # mutable self/return) of existing functional ops whose kernels both
-# backends already provide; argument schemas mirror the repo's own
+# backends already provide; argument schemas follow the repo's own
 # functional entries so generated bindings type-check verbatim.
 # Deviations from the established native schema set:
 #   - index_add_ has no `alpha` kwarg (repo index_add lacks it)

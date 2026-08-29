@@ -1,11 +1,9 @@
 """Generators for TPXOpsGenerated.h/.cpp -- the Autograd-key kernels.
 
-Every operator exposes a free function ``tensorplay::tpx::ops::<name>`` that:
-routes through the Autocast key first (casts precede VariableType, mirroring
-mutation under GradMode, invokes the backend through ``detail::redispatch_*``,
-builds the backward node with its saved variables, and attaches history to
-the outputs.  This is TensorPlay's counterpart of the generated
-``variable.cpp`` VariableType kernels upstream.
+Every operator exposes a free function ``tensorplay::tpx::ops::<name>`` that
+routes through the Autocast key first, applies mutation under GradMode,
+invokes the backend through ``detail::redispatch_*``, builds the backward node
+with its saved variables, and attaches history to the outputs.
 """
 
 from __future__ import annotations
@@ -44,8 +42,8 @@ _VIEW_OPS = {
 # shares the version counter and marks each output as a view).  Value:
 # in-place error, multi_output flag).  chunk maps to SplitBackward/"Split":
 # SplitBackward0 for chunk outputs as well.  tensor_split outputs behave like
-# plain slice views upstream (DEFAULT creation meta), so its node is not
-# flagged multi-output and in-place falls through to the view-of-leaf check.
+# plain slice views (DEFAULT creation meta), so its node is not flagged
+# multi-output and in-place falls through to the view-of-leaf check.
 _LIST_VIEW_OPS = {
     'unbind': ('UnbindBackward', 'Unbind', True),
     'split': ('SplitBackward', 'Split', True),
@@ -154,8 +152,8 @@ def _node_ctor_args(dv: OpDerivatives, f: NativeFunction,
         if m in dv.used_input_names:
             if (m == 'self' and f.func_name.endswith('_')
                     and any(a.name == 'self' for a in f.args)):
-                # Pre-mutation capture hoisted by the wrapper (upstream
-                # `original_self`); the live `self` already holds the update.
+                # Pre-mutation capture is hoisted by the wrapper; the live
+                # `self` already holds the update.
                 args.append('__tp_original_self.value()')
             else:
                 args.append(m)
@@ -290,7 +288,7 @@ def generate_tpx_ops_cpp(funcs: list[NativeFunction], *,
         # ---- factory global-default resolution ------------------------------
         # Factory-style ops (no leading tensor receiver) honor the global
         # default dtype/device when the caller leaves them unset, like
-        # upstream's TensorOptions fallthrough.  arange-family dtypes are
+        # TensorOptions fallthrough.  arange-family dtypes are
         # excluded: their kernels infer from the scalar inputs instead.
         if not (f.args and f.args[0].type.is_tensor_like):
             for a in f.args:
@@ -318,8 +316,7 @@ def generate_tpx_ops_cpp(funcs: list[NativeFunction], *,
             _emit_requires_grad_detection(lines, f)
             _emit_leaf_checks(lines, f)
             # In-place ops whose derivative references `self` must evaluate
-            # the slope at the PRE-mutation value (upstream gen_variable_type
-            # save_variables: `original_self = self.clone()`).  Capture the
+            # the slope at the PRE-mutation value.  Capture the
             # clone before the core call; _node_ctor_args splices it in.
             _dv_pre = derivatives.get(f.func_name)
             if (_dv_pre is not None and _dv_pre.formulas
@@ -361,8 +358,8 @@ def generate_tpx_ops_cpp(funcs: list[NativeFunction], *,
             lines.append(f'    {core_call};')
 
         # ---- InplaceOrView semantics ---------------------------------------
-        # Mirrors upstream tools/autograd InplaceOrView slice: in-place ops
-        # bump their version counter after mutation; view ops share the
+        # InplaceOrView semantics: in-place ops bump their version counter
+        # after mutation; view ops share the
         # base's counter so writes through the view are tracked.
         _self = f.self_arg()
         _is_inplace = (f.base_name.endswith('_') and _self is not None
@@ -373,8 +370,8 @@ def generate_tpx_ops_cpp(funcs: list[NativeFunction], *,
         if _is_inplace:
             # Version bumping is owned exclusively by the below-autograd
             # redispatch layer (gen_api.py emits it inside
-            # detail::redispatch_*), mirroring upstream where InplaceOrView
-            # kernels sit beneath VariableType; bumping here again would
+            # detail::redispatch_*); the InplaceOrView layer sits below the
+            # autograd wrapper; bumping here again would
             # double-count under the default autograd path.
             pass
         elif _is_view:
@@ -465,7 +462,7 @@ def generate_tpx_ops_cpp(funcs: list[NativeFunction], *,
             if _is_list_view:
                 # `self` -- share the version counter, mark is_view, and
                 # attach the shared backward node with a per-element
-                # output_nr.  (Mirrors upstream as_view for unbind/split.)
+                # output_nr for unbind/split views.
                 lines.append('    for (size_t __tp_i = 0; __tp_i < core_result.size(); ++__tp_i) {')
                 lines.append(
                     f'        core_result[__tp_i].unsafeGetTensorImpl()->share_version_counter('
