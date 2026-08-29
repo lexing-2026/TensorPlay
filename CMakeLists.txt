@@ -897,6 +897,7 @@ pybind11_add_module(_C
     src/bindings/python/Size.cpp
     src/bindings/python/Generator.cpp
     src/bindings/python/Autograd.cpp
+    src/bindings/python/FileCheck.cpp
     src/bindings/python/autocast_mode.cpp
     src/bindings/python/Ops.cpp
     src/bindings/python/Tensor.cpp
