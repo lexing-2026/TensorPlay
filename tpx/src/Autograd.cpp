@@ -318,7 +318,7 @@ Tensor narrow(const Tensor& self, int64_t dim, int64_t start, int64_t length) {
     return tensorplay::tpx::ops::slice(self, dim, start, start + length, 1);
 }
 
-// expand() moved to the generated dispatcher surface (native_functions.yaml);
+// expand() moved to the generated dispatcher surface;
 // the derivative formulas in derivatives.yaml now resolve against
 // tensorplay::tpx::ops::expand, which carries autograd routing.
 

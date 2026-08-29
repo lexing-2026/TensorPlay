@@ -442,7 +442,7 @@ class Function(metaclass=FunctionMeta):
 
         ctx = _Context()
 
-        # ---- unpack_input mirror: needs bits + next_edges pre-forward ----
+        # ---- unpack_input path: needs bits + next_edges pre-forward ----
         if fast:
             fn = _PyNode(ctx)
             needs, any_rg = _setup_graph(fn, args)
@@ -501,7 +501,7 @@ class Function(metaclass=FunctionMeta):
             fn.set_materialize_grads(bool(ctx.materialize_grads))
             ctx._engine_materializes = bool(ctx.materialize_grads)
 
-        # ---- _wrap_outputs mirror: mark + attach in one pass ----
+        # ---- _wrap_outputs path: mark + attach in one pass ----
         if isinstance(output, tuple):
             ctx._outputs = output
         elif isinstance(output, list):
