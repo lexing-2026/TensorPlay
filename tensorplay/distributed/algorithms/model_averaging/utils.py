@@ -1,4 +1,3 @@
-# Ported from torch/distributed/algorithms/model_averaging/utils.py.
 import itertools
 from collections.abc import Iterable, Iterator
 

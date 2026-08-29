@@ -1,4 +1,3 @@
-# Ported from torch/distributed/algorithms/ddp_comm_hooks/mixed_precision_hooks.py.
 #
 # Adaptation: tp's DDP has no side-stream upcast machinery; the hook
 # performs the reduce-precision allreduce and upcast numerics inline.
@@ -17,7 +16,6 @@ class _AllreduceUpcastHookState:
     State to manage DDP mixed precision in backward / gradient communication.
 
     This contains a weakref to the DDP module for access to reducer and process
-    group. The upcast stream of torch is not used in tp; casts run inline.
     """
 
     ddp_weakref: Any

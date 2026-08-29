@@ -1,4 +1,3 @@
-# Ported from torch/distributed/nn/api/__init__.py: distributed autograd +
 # RPC-backed functional wrappers. All entry points require the RPC runtime.
 __all__: list[str] = []
 

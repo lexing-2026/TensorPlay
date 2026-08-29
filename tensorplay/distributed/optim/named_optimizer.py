@@ -1,4 +1,3 @@
-# Ported from torch/distributed/optim/named_optimizer.py.
 import logging
 import warnings
 from collections.abc import Callable, Collection, Mapping

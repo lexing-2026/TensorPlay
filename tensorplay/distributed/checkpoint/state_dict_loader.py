@@ -1,4 +1,3 @@
-# Ported from torch/distributed/checkpoint/state_dict_loader.py.
 from typing import Any
 
 import tensorplay as tp
@@ -17,7 +16,7 @@ def _default_reader(checkpoint_id):
 
 def load(state_dict, *, checkpoint_id=None, storage_reader=None,
          planner=None, process_group=None, no_dist=False) -> None:
-    """Load a distributed checkpoint in place (torch parity).
+    """
 
     Args:
         state_dict: the (possibly partially empty) state dict to load into;

@@ -1,4 +1,3 @@
-# Ported from torch/distributed/utils.py.
 #
 # Adaptations for tp: no typed-storage API (_alloc_storage/_free_storage are
 # absent), no PackedSequence-aware recursion beyond tp.nn.utils.rnn, and

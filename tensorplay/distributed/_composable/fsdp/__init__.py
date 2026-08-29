@@ -1,4 +1,3 @@
-# Ported from torch/distributed/_composable/fsdp/__init__.py.
 #
 # fully_shard requires the DTensor stack (tensor/) for sharded parameter
 # placement; tracked in docs/gap_analysis.md.
@@ -9,6 +8,6 @@ def __getattr__(name):
     if name == "fully_shard":
         raise NotImplementedError(
             "fully_shard requires the DTensor stack "
-            "(tensorplay.distributed.tensor), which is not yet ported."
+            "(tensorplay.distributed.tensor), which is not yet implemented."
         )
     raise AttributeError(name)

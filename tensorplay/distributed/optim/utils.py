@@ -1,4 +1,3 @@
-# Ported from torch/distributed/optim/utils.py.
 from tensorplay import optim
 
 from .functional_adadelta import _FunctionalAdadelta

@@ -1,4 +1,3 @@
-# Ported from torch/distributed/algorithms/model_averaging/__init__.py.
 from tensorplay.distributed.algorithms.model_averaging.averagers import (
     ModelAverager,
     PeriodicModelAverager,

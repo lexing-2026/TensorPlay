@@ -1,4 +1,3 @@
-# Ported from torch/distributed/optim/functional_adam.py.
 import tensorplay as tp
 from tensorplay.optim import adam as F
 from tensorplay import Tensor

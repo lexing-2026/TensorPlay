@@ -1,4 +1,3 @@
-# Ported from torch/distributed/logging_handlers.py.
 import logging
 
 __all__: list[str] = []

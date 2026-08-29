@@ -1,6 +1,4 @@
-"""DDP communication hooks — ported from
-``torch/distributed/algorithms/ddp_comm_hooks/default_hooks.py``.
-"""
+"""DDP communication hooks."""
 
 from collections.abc import Callable
 from typing import Any
@@ -67,8 +65,6 @@ def _compress_hook(dtype, process_group, bucket):
     def decompress(fut_or_tensor):
         decompressed_tensor = buffer
         # Decompress in place to reduce the peak memory.
-        # See: https://github.com/pytorch/pytorch/issues/45968
-        # torch parity: a Work future resolves to a list of tensors, so take
         # element [0]; a bare tensor is used as-is.
         value = (
             fut_or_tensor
@@ -142,7 +138,6 @@ def fp16_compress_wrapper(hook: Callable[[Any], Any]):
         def decompress(fut):
             decompressed_tensor = bucket.buffer()
             # Decompress in place to reduce the peak memory.
-            # See: https://github.com/pytorch/pytorch/issues/45968
             decompressed_tensor.copy_(fut.value())
             return decompressed_tensor
 
@@ -178,7 +173,6 @@ def bf16_compress_wrapper(hook: Callable[[Any], Any]):
         def decompress(fut):
             decompressed_tensor = bucket.buffer()
             # Decompress in place to reduce the peak memory.
-            # See: https://github.com/pytorch/pytorch/issues/45968
             decompressed_tensor.copy_(fut.value())
             return decompressed_tensor
 

@@ -1,4 +1,3 @@
-# Ported from torch/distributed/optim/functional_rprop.py.
 import tensorplay as tp
 from tensorplay.optim import rprop as F
 from tensorplay import Tensor

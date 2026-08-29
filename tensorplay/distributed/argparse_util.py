@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# Ported from torch/distributed/argparse_util.py.
 import os
 from argparse import Action
 

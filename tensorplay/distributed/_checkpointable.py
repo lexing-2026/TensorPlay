@@ -1,4 +1,3 @@
-# Ported from torch/distributed/_checkpointable.py.
 from typing_extensions import Protocol, runtime_checkable
 
 import tensorplay as tp

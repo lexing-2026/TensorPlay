@@ -1,9 +1,6 @@
-# Ported from torch/distributed/autograd/__init__.py.
 #
-# torch's distributed autograd is part of the RPC framework: gradients are
 # accumulated in a distributed context keyed by RPC context ids. tp ships no
 # RPC runtime, so every entry point reports that requirement, matching the
-# error torch raises when RPC is not initialized.
 __all__ = ["backward", "get_gradients", "is_initialized"]
 
 

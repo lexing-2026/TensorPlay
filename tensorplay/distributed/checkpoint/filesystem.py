@@ -1,7 +1,5 @@
-# Ported from torch/distributed/checkpoint/filesystem.py.
 #
 # Adaptation: tp implements a consolidated single-file layout
-# (``<checkpoint_id>/__0_0.distcp`` + ``metadata.pkl``) instead of torch's
 # sharded-planner file matrix; the FileSystemReader/FileSystemWriter public
 # API is preserved.
 import dataclasses
@@ -21,7 +19,6 @@ class _StoragePrefix:
 
 
 class StorageWriter(ABC):
-    """Interface for ``save()`` storage backends (torch parity subset)."""
 
     @abstractmethod
     def set_up_storage_writer(self, is_coordinator: bool) -> None: ...
@@ -36,7 +33,6 @@ class StorageWriter(ABC):
 
 
 class StorageReader(ABC):
-    """Interface for ``load()`` storage backends (torch parity subset)."""
 
     @abstractmethod
     def read_metadata(self): ...

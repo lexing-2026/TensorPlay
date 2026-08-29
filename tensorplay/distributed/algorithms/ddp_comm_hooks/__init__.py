@@ -1,4 +1,3 @@
-# Ported from torch/distributed/algorithms/ddp_comm_hooks/__init__.py.
 from tensorplay.distributed.algorithms.ddp_comm_hooks import (
     debugging_hooks,
     default_hooks,

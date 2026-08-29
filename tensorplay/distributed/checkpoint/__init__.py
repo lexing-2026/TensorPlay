@@ -1,4 +1,3 @@
-# Ported from torch/distributed/checkpoint/__init__.py (core subset).
 from tensorplay.distributed.checkpoint.filesystem import (
     FileSystemReader,
     FileSystemWriter,

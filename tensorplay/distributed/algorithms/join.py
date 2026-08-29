@@ -1,4 +1,3 @@
-# Ported from torch/distributed/algorithms/join.py.
 import warnings
 from abc import ABC, abstractmethod
 from types import TracebackType

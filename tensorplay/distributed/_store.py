@@ -1,6 +1,5 @@
 """Key-value stores for rendezvous and in-group coordination.
 
-Mirrors ``torch.distributed.FileStore`` / ``torch.distributed.TCPStore``
 semantics: blocking ``get``, atomic ``add``, ``compare_set``, ``wait`` with
 timeout. Pure Python by design so the rendezvous layer stays transparent.
 """
@@ -148,7 +147,6 @@ class FileStore(Store):
             fcntl.flock(f.fileno(), fcntl.LOCK_EX)
             try:
                 # A missing key compares equal to the empty string
-                # (torch.distributed Store semantics).
                 current = b""
                 if os.fstat(f.fileno()).st_size > 0:
                     f.seek(0)
@@ -269,7 +267,7 @@ class _TCPServer(threading.Thread):
 
 
 class TCPStore(Store):
-    """Client for a threaded TCP key-value server (``torch.distributed.TCPStore``
+    """
     subset: set/get/add/delete/check as used by rendezvous and barriers)."""
 
     def __init__(
