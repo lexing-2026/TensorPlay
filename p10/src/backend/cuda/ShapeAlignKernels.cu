@@ -1,12 +1,11 @@
 // batch (see cpu/ShapeAlignKernels.cpp for the composite commentary).
 //
 // The device-generic composites of this batch are registered once under the
-// backend-neutral Composite key (p10/src/RegisterComposites.cpp, upstream's
-// CompositeExplicitAutograd mapping) and are served to CUDA tensors by the
+// backend-neutral Composite key (p10/src/RegisterComposites.cpp) and are
+// served to CUDA tensors by the
 // dispatcher's composite fallthrough.  The only op with real per-device code
-// is repeat(): a single-pass index-math gather mirroring upstream's
-// here as a per-backend override -- the same pattern upstream uses for MPS
-// (native_functions.yaml: MPS: repeat_mps).
+// is repeat(): a single-pass index-math gather implemented here as a
+// per-backend override. Other shape operations use the composite fallthrough.
 
 #include "Tensor.h"
 #include "CUDARuntime.h"
@@ -131,10 +130,9 @@ Tensor repeat_cuda(const Tensor& self, const std::vector<int64_t>& repeats) {
 
 // Composite shapeops kernels (expand/stack/split/atleast/fill/equal/allclose
 // families) are registered ONCE under the backend-neutral Composite key from
-// p10/src/RegisterComposites.cpp -- TensorPlay's analog of the generated
+// p10/src/RegisterComposites.cpp -- TensorPlay's composite registration
 // serves them to every dense backend until overridden.  This TU only carries
-// repeat(), whose gather is real device code -- the same per-backend override
-// pattern upstream uses for MPS (native_functions.yaml: MPS: repeat_mps).
+// repeat(), whose gather is real device code.
 } // namespace cuda
 
 namespace cuda {

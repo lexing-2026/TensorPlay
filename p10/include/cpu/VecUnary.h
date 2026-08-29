@@ -195,7 +195,7 @@ __m512d _ZGVeN8v_tanh(__m512d);
 #endif // TP_VECUNARY_LIBMVEC
 
 // ---------------------------------------------------------------------------
-// Scalar reference implementations.  These mirror the lambdas in
+// Scalar reference implementations.  These reuse the formulas in
 // PointwiseKernels.cpp one-for-one; they serve as both the non-AVX2 fallback
 // and the vector-loop tail.
 // ---------------------------------------------------------------------------

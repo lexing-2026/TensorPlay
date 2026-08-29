@@ -511,7 +511,7 @@ DEFINE_FOREACH_OP(mul, mul)
 DEFINE_FOREACH_OP(div, div)
 #undef DEFINE_FOREACH_OP
 
-// sub's out variants call the base kernels with an alpha (mirroring the
+// sub's out variants call the base kernels with an alpha, following the
 // hand-written add kernels above), so spell them out instead of using
 // DEFINE_FOREACH_OP.
 std::vector<Tensor> foreach_sub_scalar_cpu(const std::vector<Tensor>& self, Scalar scalar) {

@@ -135,7 +135,7 @@ inline bool shouldSendRecv(size_t count) { return count > 0; }
 bool available() { return true; }
 
 const char* version() {
-    // Runtime version, same source of truth c10d uses. NCCL packs the
+    // Runtime version is cached after the first query. NCCL packs the
     // version as 1000 * major + 100 * minor + patch.
     static std::string v;
     static bool cached = false;

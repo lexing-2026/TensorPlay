@@ -38,7 +38,7 @@ public:
         if (default_device_.has_value()) return *default_device_;
         return Device(DeviceType::CPU);
     }
-    // Scoped override backing `with tensorplay.device(...):`, mirroring
+    // Scoped override backing `with tensorplay.device(...):`,
     void pushDefaultDevice(Device device);
     void popDefaultDevice();
 

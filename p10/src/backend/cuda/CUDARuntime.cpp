@@ -198,7 +198,7 @@ CUDAGuard::~CUDAGuard() noexcept {
 
 int CUDAStream::priority() const {
     // Stream handles carry their own context; querying the priority needs no
-    // device switch (matches c10::cuda::CUDAStream).
+    // device switch because the stream handle carries its own context.
     int value = 0;
     checkCuda(cudaStreamGetPriority(stream_, &value), "cudaStreamGetPriority");
     return value;

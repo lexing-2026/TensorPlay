@@ -4,7 +4,7 @@
 //     upsample_bilinear2d_out_frame / upsample_bilinear2d_backward_out_frame
 //     upsample_bicubic2d_out_frame / upsample_bicubic2d_backward_out_frame
 //   and UpSample.h / UpSample.cuh for the shared index helpers (the same
-//   helpers are ported in backend/cpu/UpsampleKernels.cpp).
+//   helpers are implemented in backend/cpu/UpsampleKernels.cpp).
 //
 // Kernels operate on contiguous NCT(D)HW tensors and support Float32/Float64,
 // ("Nondeterministic because of atomicAdd usage", UpSampleBicubic2d.cu).

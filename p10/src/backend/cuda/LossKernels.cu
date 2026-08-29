@@ -532,7 +532,7 @@ Tensor mse_loss_backward_cuda(const Tensor& grad_output, const Tensor& input, co
 }
 
 // primitives (where/log/exp/sigmoid/clamp/sum/mean) dispatch to their CUDA
-// implementations, so these mirror the CPU compositions exactly.
+// implementations, so these use the same CPU compositions.
 // -----------------------------------------------------------------------------
 
 namespace {

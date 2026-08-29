@@ -1,13 +1,9 @@
 //
-// Upstream registers gradient.* with no dispatch section -- the default
-// CompositeImplicitAutograd: forward is a pure composition of differentiable
-// primitives, autograd is derived from the inner calls and no derivatives.yaml
-// entry exists.  Every returned tensor keeps the grad_fn its inner calls
-// GradientBackward node).  We mirror that by registering one device-generic
-// composition under the backend-neutral Composite key;
-// OperatorHandle::getKernel falls through to it for every dense backend
-// (p10/include/Dispatcher.h) and, since the op has no generated autograd
-// wrapper, nothing stands between the caller and the inner recording.
+// The gradient operation is a pure composition of differentiable primitives.
+// Automatic differentiation is derived from the inner calls, so one
+// device-generic composition is registered under the backend-neutral
+// Composite key.  Dispatcher fallthrough serves every dense backend and the
+// inner operations retain the complete gradient recording.
 //
 //   edge_order selects the BORDER accuracy only -- eo1 one-sided chord
 //   slopes, eo2 3-point Lagrange stencils.  The interior ALWAYS uses the
@@ -196,4 +192,3 @@ TENSORPLAY_LIBRARY_IMPL(Composite, GradientKernels) {
 
 } // namespace gradientops
 } // namespace tensorplay
-

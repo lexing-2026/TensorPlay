@@ -144,7 +144,7 @@ cudaDataType_t to_cublas_type(DType t) {
 cublasComputeType_t to_compute_type(DType t) {
     switch (t) {
         // (float32_matmul_precision == "highest"), and its CUDABlas helpers
-        // accumulate Half/BFloat16 in FP32 with float alpha/beta.  Mirror
+        // accumulate Half/BFloat16 in FP32 with float alpha/beta.  Preserve
         // that contract; "high"/"medium" enable TF32 compute for Float32,
         // matching Context::allowTF32CuBLAS.
         case DType::Float32:

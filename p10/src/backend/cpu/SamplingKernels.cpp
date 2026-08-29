@@ -19,7 +19,7 @@
 
 // CPU sampling/selection operators: multinomial, topk, and the LLM
 // token sampler (temperature / top-k / top-p).  Canonical serial
-// implementations; the CUDA kernels mirror their semantics.
+// implementations; the CUDA kernels use the same semantics.
 // layout).
 
 namespace tensorplay {

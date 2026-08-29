@@ -55,7 +55,7 @@ uint32_t deviceAttribute(cudaDeviceAttr attr) {
     return static_cast<uint32_t>(value);
 }
 
-// Utility function that calculates the proper philox_offset, mirroring
+// Utility function that calculates the proper philox_offset for the
 std::tuple<uint64_t, dim3, dim3> calc_execution_policy(int64_t total_elements,
                                                        uint32_t unroll_factor) {
     const uint64_t numel = static_cast<uint64_t>(total_elements);

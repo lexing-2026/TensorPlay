@@ -291,7 +291,8 @@ void low_precision_gemm_epilogue(Tensor& result, const Tensor& seed,
 #ifdef USE_ONEDNN
 // oneDNN primitive cache -- building a matmul::primitive_desc triggers JIT
 // kernel selection costing microseconds, which dominates tiny GEMMs (the
-// same reason upstream caches primitives).  Keyed by dims+strides+dtype of
+// same reason the cache avoids repeated primitive construction.  Keyed by
+// dims+strides+dtype of
 // all three operands; bounded to keep pathological shape variety honest.
 using namespace dnnl;
 
@@ -1601,7 +1602,7 @@ Tensor mv_kernel(const Tensor& self, const Tensor& vec) {
     check_cpu_matmul_dtype(self.dtype());
 
     // bmm-shaped wrapper's extra alloc/copy round-trip.  Both row-major and
-    // transposed-view layouts are accepted without a copy, mirroring
+    // transposed-view layouts are accepted without a copy, following
     // mm_kernel's stride policy; anything else falls through to the generic
     // batched path below.
 #if defined(USE_MKL) || defined(USE_BLAS)
