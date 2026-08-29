@@ -32,6 +32,8 @@ Tensor gammaincc_cuda(const Tensor& a, const Tensor& x) {
 TENSORPLAY_LIBRARY_IMPL(CUDA, IncompleteGammaKernels) {
     m.impl("gammainc", gammainc_cuda);
     m.impl("gammaincc", gammaincc_cuda);
+    m.impl("igamma", gammainc_cuda);
+    m.impl("igammac", gammaincc_cuda);
 }
 
 }  // namespace tensorplay::cuda
