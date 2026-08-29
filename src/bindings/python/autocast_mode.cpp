@@ -45,7 +45,7 @@ void init_autocast(py::module_& m) {
         autocast::set_autocast_dtype(device_type_from_string(device_type), dtype);
     }, "device_type"_a, "dtype"_a);
 
-    // deprecated CUDA/CPU-specific autocast APIs (kept for BC, mirroring the
+    // deprecated CUDA/CPU-specific autocast APIs (kept for BC, matching the
     m.def("get_autocast_gpu_dtype", []() {
         return autocast::get_autocast_dtype(DeviceType::CUDA);
     });

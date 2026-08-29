@@ -44,8 +44,7 @@ namespace {
 PyObject* g_device_mismatch_type = nullptr;
 }  // namespace
 
-// Single source of truth for C++ -> Python error mapping (see
-// python_bindings.h).
+// Central C++ -> Python error mapping (see python_bindings.h).
 PyObject* translate_exception(const Exception& e) {
     if (dynamic_cast<const IndexError*>(&e)) return PyExc_IndexError;
     if (dynamic_cast<const ValueError*>(&e)) return PyExc_ValueError;

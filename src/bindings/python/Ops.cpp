@@ -321,7 +321,7 @@ void init_ops(py::module_& m) {
         }
     }, "path"_a);
 
-    // Python custom-op bridge: mirror tensorplay.library kernels into the
+    // Python custom-op bridge: expose tensorplay.library kernels through the
     // native Dispatcher and invoke them through the real dispatch path.
     m.def("_register_python_op_kernel", [](const std::string& op_name,
                                            const std::string& device_type,
