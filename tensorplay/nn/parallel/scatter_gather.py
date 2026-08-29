@@ -1,4 +1,3 @@
-# Ported from torch/nn/parallel/scatter_gather.py.
 #
 # The multi-device scatter/gather paths are single-process utilities; tp
 # keeps the recursive container walk and delegates tensor movement to .to().
@@ -50,7 +49,6 @@ def _chunk_tensor(tensor: tp.Tensor, chunks: int, dim: int):
         return [tensor]
     size = tensor.size(dim)
     if size < chunks:
-        # torch pads by repeating the last slice; keep it simple with chunk()
         return list(tp.chunk(tensor, chunks, dim=dim))[:chunks] or [tensor]
     return list(tp.chunk(tensor, chunks, dim=dim))
 

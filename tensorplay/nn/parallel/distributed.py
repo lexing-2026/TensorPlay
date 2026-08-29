@@ -1,8 +1,6 @@
-"""DistributedDataParallel — ported from ``torch/nn/parallel/distributed.py``.
+"""Distributed data parallel training support.
 
-The public API and reduction machinery mirror torch's DDP: gradient
 bucketing via ``_compute_bucket_assignment_by_size``, post-accumulate grad
-hooks (torch's ``register_post_accumulate_grad_hook`` reducer path),
 ``find_unused_parameters`` via output-graph traversal, communication hooks
 returning ``tensorplay.futures.Future``, and coalesced buffer broadcasts.
 """
@@ -21,7 +19,6 @@ __all__ = ["DistributedDataParallel", "_DDPJoinHook"]
 
 
 def _recursive_to(inputs: Any, target_device: str) -> Any:
-    """Recursively moves input tensors to target_device (torch _recursive_to)."""
     if isinstance(inputs, tp.Tensor):
         return inputs.to(target_device) if inputs.device != tp.device(target_device) else inputs
     if isinstance(inputs, tuple) and len(inputs) > 0:
@@ -53,9 +50,9 @@ def _param_key(tensor) -> tuple:
 
 
 def _verify_param_shape_across_processes(process_group, tensors) -> bool:
-    """Verify every rank has the same param shapes (torch parity).
+    """Verify parameter counts and element counts across all ranks.
 
-    Mirrors Reducer::verify_params_across_processes: first check the param
+    First check the parameter
     count agrees, then compare per-param numels element-wise via MIN/MAX
     all-reduce. All ranks agree iff min == max for every entry; comparing
     the scalar min-of-mins to the max-of-maxes would only pass when every
@@ -82,7 +79,6 @@ def _verify_param_shape_across_processes(process_group, tensors) -> bool:
 
 def _sync_params_and_buffers(process_group, module_states,
                              broadcast_bucket_size, src_global_rank: int) -> None:
-    """Synchronize module_states by coalesced broadcast (torch parity)."""
     if len(module_states) == 0:
         return
     src = dist.get_global_rank(process_group, src_global_rank)
@@ -94,7 +90,6 @@ def _sync_module_states(module: Module, process_group,
                         broadcast_bucket_size: int, src: int,
                         params_and_buffers_to_ignore,
                         broadcast_buffers: bool = True) -> None:
-    """Sync ``module``'s parameters and buffers state (torch parity)."""
     module_states: List[tp.Tensor] = []
     for name, param in module.named_parameters():
         if name not in params_and_buffers_to_ignore:
@@ -147,9 +142,8 @@ class _DDPJoinHook(JoinHook):
 
 
 class DistributedDataParallel(Module, Joinable):
-    r"""Implements distributed data parallelism (torch parity).
+    r"""
 
-    Arguments mirror ``torch.nn.parallel.DistributedDataParallel``. Gradient
     reduction uses buckets built by
     ``dist._compute_bucket_assignment_by_size``; each parameter's post
     accumulate hook copies its gradient into its bucket buffer and, when the
@@ -275,7 +269,6 @@ class DistributedDataParallel(Module, Joinable):
         self._static_expected = None
         self._next_bucket = 0
         # Side stream used to overlap bucket all-reduces with backward compute
-        # (torch's reducer runs NCCL on a dedicated stream). Lazily created.
         self._comm_stream = None
 
         # Build parameters for the reducer.
@@ -319,9 +312,7 @@ class DistributedDataParallel(Module, Joinable):
     def _ddp_init_helper(self, parameters, expect_sparse_gradient):
         """Bucket the parameters and register post-accumulate grad hooks.
 
-        Mirrors torch Reducer construction: buckets are passed reversed so
         their readiness approximates gradient production order. Per-param
-        bucket views and identity keys are precomputed once (torch's
         ``bucket_views_in``) so the backward hot path never recreates them.
         """
         bucket_indices, _ = dist._compute_bucket_assignment_by_size(
@@ -335,10 +326,9 @@ class DistributedDataParallel(Module, Joinable):
         self._node_to_param_key = {}  # AccumulateGrad raw ptr -> param key
         self._grad_hooks = []
         # Strong refs to each param's AccumulateGrad node: the meta only
-        # caches it weakly (c10 parity), so the reducer must keep the node
+        # caches it weakly, so the reducer must keep the node
         # (and its registered post-accumulate hooks) alive.
         self._accum_nodes = []
-        # torch's require_finalize_: true while an iteration's reduction is
         # outstanding; guards against unused params without find_unused.
         self._require_finalize = False
 
@@ -370,7 +360,6 @@ class DistributedDataParallel(Module, Joinable):
                 "pending": set(),
                 "expected_keys": set(),
                 # Fast path: countdown of grads not yet produced this
-                # iteration plus deferred copy-in indices (torch's
                 # batched_grad_copy_ / flush_deferred_copies).
                 "remaining": 0,
                 "deferred": [],
@@ -388,7 +377,6 @@ class DistributedDataParallel(Module, Joinable):
                 self._accum_nodes.append(node)
                 self._node_to_param_key[node._raw_ptr()] = _param_key(p)
 
-        # C++ reducer fast path (torch C++ Reducer parity): post-accumulate
         # hooks run as pure C++ callbacks (no GIL on the engine worker
         # thread), copy-in is eager in the hook, and the copy-back after each
         # bucket all-reduce is one fused multi-tensor copy on a dedicated
@@ -427,7 +415,6 @@ class DistributedDataParallel(Module, Joinable):
     def _make_reducer_hook(self, param):
         # Precompute the bucket entry once so the hot-path hook avoids a dict
         # lookup and repeated data_ptr()/shape keying on every backward
-        # (torch's C++ reducer has no such per-param Python cost).
         entry = self._param_entries.get(_param_key(param))
         if entry is None:
             return lambda _param: None
@@ -452,14 +439,13 @@ class DistributedDataParallel(Module, Joinable):
         return hook
 
     def _reset_iteration_state(self):
-        """Prepare per-iteration pending sets (torch prepare_for_forward).
+        """
 
         Parameters not expected this iteration get their bucket slice
-        zero-filled up front, mirroring the reducer marking unused
+        zero-filled up front, allowing the reducer to mark unused
         parameters ready with zero gradients.
         """
         if self._require_finalize:
-            # torch Reducer::ensure_prior_reduction_finished: a param did not
             # receive a gradient last iteration, so its bucket never reduced.
             self._log_and_throw(
                 RuntimeError,
@@ -588,7 +574,6 @@ class DistributedDataParallel(Module, Joinable):
     def _mark_param_ready_fast(self, bstate, idx, view, as_bucket_view):
         """Copy the grad into its bucket slot as soon as it is ready.
 
-        Copying eagerly (torch's default, non-batched reducer path) spreads
         the copy work across the backward pass instead of serializing it
         in front of the bucket all-reduce, so the collective starts as soon
         as the last gradient lands. Copy-back after the all-reduce is the
@@ -600,25 +585,22 @@ class DistributedDataParallel(Module, Joinable):
         if grad is None:
             # Hook fires right after accumulate, so this should not happen;
             # if it does the bucket stays incomplete and the next iteration
-            # raises (torch ensure_prior_reduction_finished parity).
             return
         if as_bucket_view and grad.data_ptr() == view.data_ptr() \
                 and grad.numel() == view.numel():
             # gradient_as_bucket_view: grad already aliases the bucket slot
-            # (torch's is_alias_of check) — no copy needed.
             pass
         else:
             view.copy_(grad)
             if as_bucket_view:
                 # Re-alias grad to the bucket view so the reduced values are
-                # observed in-place and no copy-back is needed (torch parity).
                 bstate["params"][idx].grad = view
         bstate["remaining"] -= 1
         if bstate["remaining"] == 0:
             self._try_flush_ready_buckets()
 
     def _flush_deferred_copies(self, bstate):
-        """Batched copy-in of any deferred grads (torch flush_deferred_copies).
+        """
 
         The default path copies eagerly in the grad hooks, so this only does
         work for buckets filled outside the hook path (e.g. join shadowing).
@@ -660,14 +642,12 @@ class DistributedDataParallel(Module, Joinable):
         self._flush_deferred_copies(bstate)
         buffer = bstate["buffer"]
         # fp32: let NCCL average natively (ncclAvg) — no separate div_ pass
-        # over the bucket. Half precision keeps torch's pre-divide + SUM to
         # avoid accumulating large unscaled values at reduced precision.
         if buffer.dtype == tp.float32:
             op = dist.ReduceOp.AVG
         else:
             buffer.div_(world_size)
             op = dist.ReduceOp.SUM
-        # Overlap communication with backward compute (torch's reducer runs
         # NCCL on a dedicated stream). The copy-in above ran on the current
         # stream; hand the bucket to the comm stream, all-reduce and copy the
         # reduced grads back there, and only join the current stream once the
@@ -711,7 +691,6 @@ class DistributedDataParallel(Module, Joinable):
         r"""Register communication hook for custom gradient aggregation.
 
         The hook has signature ``hook(state, bucket) -> Future[Tensor]``
-        where the future holds the reduced bucket buffer (torch contract;
         completion is resolved synchronously on ``wait``).
         """
         if not callable(hook):
@@ -839,7 +818,6 @@ class DistributedDataParallel(Module, Joinable):
         # Notify the join context that this process has not joined, if needed
         work = Join.notify_join_context(self)
         if work:
-            # Keep a handle; the allreduce is stream-ordered like torch's.
             self._join_notify_work = work
 
         if tp.is_grad_enabled() and self.require_backward_grad_sync:
@@ -932,7 +910,7 @@ class DistributedDataParallel(Module, Joinable):
             self._log_and_throw(
                 ValueError,
                 "BUG! Expected rank_cond to be true for at least one process."
-                " This indicates a bug in PyTorch, please report an issue.",
+                " This indicates a bug, please report an issue.",
             )
         return int(rank_to_use.item())
 
@@ -996,7 +974,8 @@ class DistributedDataParallel(Module, Joinable):
 
     def join_hook(self, **kwargs):
         r"""
-        DDP join hook enables training on uneven inputs by mirroring communications in forward and backward passes.
+        DDP join hook enables training on uneven inputs by coordinating
+        communications in forward and backward passes.
 
         Arguments:
             kwargs (dict): a :class:`dict` containing any keyword arguments
@@ -1034,7 +1013,6 @@ class DistributedDataParallel(Module, Joinable):
         This context manager will keep track of already-joined DDP processes,
         and "shadow" the forward and backward passes by inserting collective
         communication operations to match with the ones created by non-joined
-        DDP processes. See torch's ``Join`` docs for details.
         """
         return Join(
             [self],

@@ -604,7 +604,6 @@ class SyncBatchNorm(_BatchNorm):
     r"""Applies Batch Normalization over a N-Dimensional input with
     synchronized batch statistics across all processes in the group.
 
-    See :class:`~tensorplay.nn.BatchNorm2d` (and torch's ``SyncBatchNorm``)
     for the semantics; during training the per-rank mean/invstd are gathered
     and combined with a count-weighted parallel-variance formula, so every
     rank normalizes with identical global statistics. Eval mode and
@@ -766,7 +765,6 @@ def _sync_batch_norm(input, weight, bias, running_mean, running_var,
                      eps, momentum, process_group, world_size):
     # Composed entirely of differentiable primitives, so backward flows through
     # the standard autograd graph (no custom Function needed). Statistics sync
-    # mirrors torch.nn.modules._functions.SyncBatchNorm.forward.
     dist = tensorplay.distributed
     num_channels = input.shape[1]
     ndim = input.dim()

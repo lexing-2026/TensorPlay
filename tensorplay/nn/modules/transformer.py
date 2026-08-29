@@ -70,9 +70,7 @@ class Transformer(Module):
     intent of this layer is as a reference implementation for foundational understanding
     and thus it contains only limited features relative to newer Transformer architectures.
     Given the fast pace of innovation in transformer-like architectures, we recommend
-    exploring this `tutorial <https://pytorch.org/tutorials/intermediate/transformer_building_blocks.html>`_
     to build an efficient transformer layer from building blocks in core or using higher
-    level libraries from the `PyTorch Ecosystem <https://landscape.pytorch.org/>`_.
 
     Args:
         d_model: the number of expected features in the encoder/decoder inputs (default=512).
@@ -97,12 +95,9 @@ class Transformer(Module):
         >>> transformer_model = nn.Transformer(
         ...     nhead=16, num_encoder_layers=12, batch_first=True
         ... )
-        >>> src = torch.rand((32, 10, 512))
-        >>> tgt = torch.rand((32, 20, 512))
         >>> out = transformer_model(src, tgt)
 
     Note: A full example to apply nn.Transformer module for the word language model is available in
-    https://github.com/pytorch/examples/tree/master/word_language_model
     """
 
     def __init__(
@@ -204,7 +199,6 @@ class Transformer(Module):
             If a boolean tensor is provided for any of the [src/tgt/memory]_mask arguments, positions with a ``True`` value are
             not allowed to participate in the attention,
             which is the opposite of the definition for :attr:`attn_mask`
-            in :func:`torch.nn.functional.scaled_dot_product_attention`.
 
         Args:
             src: the sequence to the encoder (required).
@@ -330,9 +324,7 @@ class TransformerEncoder(Module):
     intent of this layer is as a reference implementation for foundational understanding
     and thus it contains only limited features relative to newer Transformer architectures.
     Given the fast pace of innovation in transformer-like architectures, we recommend
-    exploring this `tutorial <https://pytorch.org/tutorials/intermediate/transformer_building_blocks.html>`_
     to build efficient layers from building blocks in core or using higher
-    level libraries from the `PyTorch Ecosystem <https://landscape.pytorch.org/>`_.
 
     .. warning::
         All layers in the TransformerEncoder are initialized with the same parameters.
@@ -351,7 +343,6 @@ class TransformerEncoder(Module):
         ...     d_model=512, nhead=8, batch_first=True
         ... )
         >>> transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=6)
-        >>> src = torch.rand(32, 10, 512)
         >>> out = transformer_encoder(src)
     """
 
@@ -397,7 +388,6 @@ class TransformerEncoder(Module):
                 compatibility.
 
         Shape:
-            see the docs in :class:`~torch.nn.Transformer`.
         """
         src_key_padding_mask = F._canonical_mask(
             mask=src_key_padding_mask,
@@ -445,9 +435,7 @@ class TransformerDecoder(Module):
     intent of this layer is as a reference implementation for foundational understanding
     and thus it contains only limited features relative to newer Transformer architectures.
     Given the fast pace of innovation in transformer-like architectures, we recommend
-    exploring this `tutorial <https://pytorch.org/tutorials/intermediate/transformer_building_blocks.html>`_
     to build efficient layers from building blocks in core or using higher
-    level libraries from the `PyTorch Ecosystem <https://landscape.pytorch.org/>`_.
 
     .. warning::
         All layers in the TransformerDecoder are initialized with the same parameters.
@@ -461,8 +449,6 @@ class TransformerDecoder(Module):
     Examples:
         >>> decoder_layer = nn.TransformerDecoderLayer(d_model=512, nhead=8)
         >>> transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=6)
-        >>> memory = torch.rand(10, 32, 512)
-        >>> tgt = torch.rand(20, 32, 512)
         >>> out = transformer_decoder(tgt, memory)
     """
 
@@ -516,7 +502,6 @@ class TransformerDecoder(Module):
                 forward and backward compatibility.
 
         Shape:
-            see the docs in :class:`~torch.nn.Transformer`.
         """
         output = tgt
 
@@ -549,9 +534,7 @@ class TransformerEncoderLayer(Module):
     intent of this layer is as a reference implementation for foundational understanding
     and thus it contains only limited features relative to newer Transformer architectures.
     Given the fast pace of innovation in transformer-like architectures, we recommend
-    exploring this `tutorial <https://pytorch.org/tutorials/intermediate/transformer_building_blocks.html>`_
     to build efficient layers from building blocks in core or using higher
-    level libraries from the `PyTorch Ecosystem <https://landscape.pytorch.org/>`_.
 
     Args:
         d_model: the number of expected features in the input (required).
@@ -570,14 +553,12 @@ class TransformerEncoderLayer(Module):
 
     Examples:
         >>> encoder_layer = nn.TransformerEncoderLayer(d_model=512, nhead=8)
-        >>> src = torch.rand(10, 32, 512)
         >>> out = encoder_layer(src)
 
     Alternatively, when ``batch_first`` is ``True``:
         >>> encoder_layer = nn.TransformerEncoderLayer(
         ...     d_model=512, nhead=8, batch_first=True
         ... )
-        >>> src = torch.rand(32, 10, 512)
         >>> out = encoder_layer(src)
     """
 
@@ -621,7 +602,6 @@ class TransformerEncoderLayer(Module):
         if isinstance(activation, str):
             activation = _get_activation_fn(activation)
 
-        # We can't test self.activation in forward() in TorchScript,
         # so stash some information about it instead.
         if activation is F.relu or isinstance(activation, ReLU):
             self.activation_relu_or_gelu = 1
@@ -658,7 +638,6 @@ class TransformerEncoderLayer(Module):
                 compatibility.
 
         Shape:
-            see the docs in :class:`~torch.nn.Transformer`.
         """
         src_key_padding_mask = F._canonical_mask(
             mask=src_key_padding_mask,
@@ -726,9 +705,7 @@ class TransformerDecoderLayer(Module):
     intent of this layer is as a reference implementation for foundational understanding
     and thus it contains only limited features relative to newer Transformer architectures.
     Given the fast pace of innovation in transformer-like architectures, we recommend
-    exploring this `tutorial <https://pytorch.org/tutorials/intermediate/transformer_building_blocks.html>`_
     to build efficient layers from building blocks in core or using higher
-    level libraries from the `PyTorch Ecosystem <https://landscape.pytorch.org/>`_.
 
     Args:
         d_model: the number of expected features in the input (required).
@@ -748,16 +725,12 @@ class TransformerDecoderLayer(Module):
 
     Examples:
         >>> decoder_layer = nn.TransformerDecoderLayer(d_model=512, nhead=8)
-        >>> memory = torch.rand(10, 32, 512)
-        >>> tgt = torch.rand(20, 32, 512)
         >>> out = decoder_layer(tgt, memory)
 
     Alternatively, when ``batch_first`` is ``True``:
         >>> decoder_layer = nn.TransformerDecoderLayer(
         ...     d_model=512, nhead=8, batch_first=True
         ... )
-        >>> memory = torch.rand(32, 10, 512)
-        >>> tgt = torch.rand(32, 20, 512)
         >>> out = decoder_layer(tgt, memory)
     """
 
@@ -854,7 +827,6 @@ class TransformerDecoderLayer(Module):
                 forward and backward compatibility.
 
         Shape:
-            see the docs in :class:`~torch.nn.Transformer`.
         """
         # see Fig. 1 of https://arxiv.org/pdf/2002.04745v1.pdf
 
@@ -977,7 +949,6 @@ def _detect_is_causal_mask(
             sz, device=mask.device, dtype=mask.dtype
         )
 
-        # Do not use `torch.equal` so we handle batched masks by
         # broadcasting the comparison.
         if mask.size() == causal_comparison.size():
             make_causal = bool((mask == causal_comparison).all())

@@ -36,8 +36,6 @@ class PairwiseDistance(Module):
 
     Examples:
         >>> pdist = nn.PairwiseDistance(p=2)
-        >>> input1 = torch.randn(100, 128)
-        >>> input2 = torch.randn(100, 128)
         >>> output = pdist(input1, input2)
     """
 
@@ -78,8 +76,6 @@ class CosineSimilarity(Module):
         - Output: :math:`(\ast_1, \ast_2)`
 
     Examples:
-        >>> input1 = torch.randn(100, 128)
-        >>> input2 = torch.randn(100, 128)
         >>> cos = nn.CosineSimilarity(dim=1, eps=1e-6)
         >>> output = cos(input1, input2)
     """

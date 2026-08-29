@@ -1,10 +1,9 @@
-"""DataParallel — ported from ``torch/nn/parallel/data_parallel.py``.
+"""Single-process, multi-device data parallelism.
 
 Single-process, multi-device data parallelism: the input batch is scattered
 along ``dim`` across devices, a replica of the module runs on each device in
 its own thread (each with its device guard and current stream), and outputs
 are gathered back to ``output_device``. Replication uses ``copy.deepcopy``
-plus per-device parameter moves instead of torch's C++ broadcast coalescer.
 """
 
 import copy
@@ -20,7 +19,6 @@ __all__ = ["DataParallel", "data_parallel", "gather", "replicate", "scatter"]
 
 
 def _get_device_index(device, optional=False, allow_cpu=False) -> int:
-    # Mirrors torch._utils._get_device_index for device args like "cuda"/"cuda:1".
     if isinstance(device, int):
         return device
     if isinstance(device, str):
@@ -104,7 +102,6 @@ def parallel_apply(modules, inputs, devices=None):
     Arguments:
         modules (list): modules to be replicated
         inputs (list): inputs to corresponding modules
-        devices (list of int or torch.device): CUDA devices
     """
     assert len(modules) == len(inputs)
     if devices is None:
@@ -164,8 +161,6 @@ def data_parallel(module, inputs, device_ids=None, output_device=None, dim=0, mo
     Args:
         module: the module to evaluate in parallel
         inputs: inputs to the module
-        device_ids (int or torch.device or list): GPU ids on which to replicate module
-        output_device (int or torch.device): GPU location of the output
         dim (int): dimension along which to split the input
     """
     if not isinstance(inputs, tuple):
@@ -217,8 +212,6 @@ class DataParallel(Module):
 
     Args:
         module: module to be parallelized
-        device_ids (int or torch.device or list): CUDA devices (default: all devices)
-        output_device (int or torch.device): device location of output (default: device_ids[0])
     """
 
     def __init__(self, module, device_ids=None, output_device=None, dim=0) -> None:
