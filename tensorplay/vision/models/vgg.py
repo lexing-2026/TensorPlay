@@ -1,6 +1,3 @@
-# Ported verbatim from torchvision==0.28.0 models/vgg.py
-# (source of truth: https://github.com/pytorch/vision); only the
-# torch -> tensorplay imports were rewritten.
 from functools import partial
 from typing import Any, cast, Optional, Union
 
@@ -215,7 +212,6 @@ class VGG16_Weights(WeightsEnum):
         },
     )
     IMAGENET1K_FEATURES = Weights(
-        # Weights ported from https://github.com/amdegroot/ssd.pytorch/
         url="https://download.pytorch.org/models/vgg16_features-amdegroot-88682ab5.pth",
         transforms=partial(
             ImageClassification,

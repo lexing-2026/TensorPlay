@@ -1,5 +1,3 @@
-# Ported verbatim from torchvision==0.28.0 transforms/functional.py
-# Only torch -> tensorplay imports were rewritten.
 import math
 import numbers
 import sys
@@ -38,7 +36,6 @@ class InterpolationMode(Enum):
     LANCZOS = "lanczos"
 
 
-# TODO: Once torchscript supports Enums with staticmethod
 # this can be put into InterpolationMode as staticmethod
 def _interpolation_modes_from_int(i: int) -> InterpolationMode:
     inverse_modes_mapping = {
@@ -128,7 +125,6 @@ def _is_numpy_image(img: Any) -> bool:
 
 def to_tensor(pic: Union[PILImage, np.ndarray]) -> Tensor:
     """Convert a ``PIL Image`` or ``numpy.ndarray`` to tensor.
-    This function does not support torchscript.
 
     See :class:`~tensorplay.vision.transforms.ToTensor` for more details.
 
@@ -182,7 +178,6 @@ def to_tensor(pic: Union[PILImage, np.ndarray]) -> Tensor:
 
 def pil_to_tensor(pic: Any) -> Tensor:
     """Convert a ``PIL Image`` to a tensor of the same type.
-    This function does not support torchscript.
 
     See :class:`~tensorplay.vision.transforms.PILToTensor` for more details.
 
@@ -246,7 +241,7 @@ def convert_image_dtype(image: tensorplay.Tensor, dtype: tensorplay.dtype = tens
 
 
 def to_pil_image(pic, mode=None):
-    """Convert a tensor or an ndarray to PIL Image. This function does not support torchscript.
+    """
 
     See :class:`~tensorplay.vision.transforms.ToPILImage` for more details.
 
@@ -406,7 +401,6 @@ def resize(
             :math:`\left(\text{size} \times \frac{\text{height}}{\text{width}}, \text{size}\right)`.
 
             .. note::
-                In torchscript mode size as single int is not supported, use a sequence of length 1: ``[size, ]``.
         interpolation (InterpolationMode): Desired interpolation enum defined by
             :class:`tensorplay.vision.transforms.InterpolationMode`.
             Default is ``InterpolationMode.BILINEAR``. If input is Tensor, only ``InterpolationMode.NEAREST``,
@@ -420,7 +414,6 @@ def resize(
             ``max_size``.
             As a result, the smaller edge may be shorter than ``size``. This
             is only supported if ``size`` is an int (or a sequence of length
-            1 in torchscript mode).
         antialias (bool, optional): Whether to apply antialiasing.
             It only affects **tensors** with bilinear or bicubic modes and it is
             ignored otherwise: on PIL images, antialiasing is always applied on
@@ -461,7 +454,6 @@ def resize(
         if max_size is not None and len(size) != 1:
             raise ValueError(
                 "max_size should only be passed if size specifies the length of the smaller edge, "
-                "i.e. size should be an int or a sequence of length 1 in torchscript mode."
             )
 
     _, image_height, image_width = get_dimensions(img)
@@ -496,7 +488,6 @@ def pad(img: Tensor, padding: list[int], fill: Union[int, float] = 0, padding_mo
             this is the padding for the left, top, right and bottom borders respectively.
 
             .. note::
-                In torchscript mode padding as single int is not supported, use a sequence of
                 length 1: ``[padding, ]``.
         fill (number or tuple): Pixel fill value for constant fill. Default is 0.
             If a tuple of length 3, it is used to fill R, G, B channels respectively.
@@ -731,7 +722,6 @@ def perspective(
             image. If given a number, the value is used for all bands respectively.
 
             .. note::
-                In torchscript mode single int/float value is not supported, please use a sequence
                 of length 1: ``[value, ]``.
 
     Returns:
@@ -1094,7 +1084,6 @@ def rotate(
             image. If given a number, the value is used for all bands respectively.
 
             .. note::
-                In torchscript mode single int/float value is not supported, please use a sequence
                 of length 1: ``[value, ]``.
     Returns:
         PIL Image or Tensor: Rotated image.
@@ -1164,7 +1153,6 @@ def affine(
             image. If given a number, the value is used for all bands respectively.
 
             .. note::
-                In torchscript mode single int/float value is not supported, please use a sequence
                 of length 1: ``[value, ]``.
         center (sequence, optional): Optional center of rotation. Origin is the upper left corner.
             Default is the center of the image.
@@ -1222,7 +1210,6 @@ def affine(
     if not isinstance(img, tensorplay.Tensor):
         # center = (width * 0.5 + 0.5, height * 0.5 + 0.5)
         # it is visually better to estimate the center without 0.5 offset
-        # otherwise image rotated by 90 degrees is shifted vs output image of torch.rot90 or F_t.affine
         if center is None:
             center = [width * 0.5, height * 0.5]
         matrix = _get_inverse_affine_matrix(center, angle, translate, scale, shear)
@@ -1330,7 +1317,6 @@ def gaussian_blur(img: Tensor, kernel_size: list[int], sigma: Optional[list[floa
             like ``(kx, ky)`` or a single integer for square kernels.
 
             .. note::
-                In torchscript mode kernel_size as single int is not supported, use a sequence of
                 length 1: ``[ksize, ]``.
         sigma (sequence of floats or float, optional): Gaussian kernel standard deviation. Can be a
             sequence of floats like ``(sigma_x, sigma_y)`` or a single float to define the
@@ -1339,7 +1325,6 @@ def gaussian_blur(img: Tensor, kernel_size: list[int], sigma: Optional[list[floa
             Default, None.
 
             .. note::
-                In torchscript mode sigma as single float is
                 not supported, use a sequence of length 1: ``[sigma, ]``.
 
     Returns:

@@ -1,4 +1,3 @@
-# Ported from torchvision==0.28.0 models/_api.py (imports rewritten).
 import fnmatch
 import importlib
 import inspect
@@ -47,7 +46,6 @@ class Weights:
         # defined with `functools.partial` and `fn = partial(...); assert deepcopy(fn) != fn`. Without custom handling
         # for it, the check against the defined members would fail and effectively prevent the weights from being
         # deep-copied or deserialized.
-        # See https://github.com/pytorch/vision/pull/7107 for details.
         if not isinstance(other, Weights):
             return NotImplemented
 

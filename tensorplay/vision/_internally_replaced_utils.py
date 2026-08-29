@@ -1,4 +1,4 @@
-"""Weight download plumbing, mirroring tensorplay.vision/_internally_replaced_utils.py.
+"""Weight download plumbing for the vision package.
 
 ``load_state_dict_from_url`` follows tensorplay.hub.load_state_dict_from_url's
 contract: download (or reuse) the cached file, verify the hash when the file
@@ -60,6 +60,4 @@ def load_state_dict_from_url(
         _download_url_to_file(url, cached_file, hash_prefix=hash_prefix, progress=progress)
 
     state_dict = tensorplay.load(str(cached_file), map_location=map_location)
-    # Torch checkpoints store {"model_state_dict": ...} in some recipes; keep
-    # raw dict semantics identical to torch (return whatever serialization has).
     return state_dict

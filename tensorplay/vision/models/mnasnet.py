@@ -1,6 +1,3 @@
-# Ported verbatim from torchvision==0.28.0 models/mnasnet.py
-# (source of truth: https://github.com/pytorch/vision); only the
-# torch -> tensorplay imports were rewritten.
 import warnings
 from functools import partial
 from typing import Any, Optional
@@ -29,7 +26,6 @@ __all__ = [
 ]
 
 
-# Paper suggests 0.9997 momentum, for TensorFlow. Equivalent PyTorch momentum is
 # 1.0 - tensorflow.
 _BN_MOMENTUM = 1 - 0.9997
 

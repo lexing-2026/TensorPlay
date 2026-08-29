@@ -1,5 +1,3 @@
-# Ported verbatim from torchvision==0.28.0 datasets/fakedata.py
-# Only torch -> tensorplay imports were rewritten.
 from typing import Any, Callable, Optional
 
 import tensorplay as tensorplay

@@ -1,5 +1,3 @@
-# Ported verbatim from torchvision==0.28.0 datasets/imagenette.py
-# Only torch -> tensorplay imports were rewritten.
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
 

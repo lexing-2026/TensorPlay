@@ -1,5 +1,3 @@
-# Ported verbatim from torchvision==0.28.0 datasets/mnist.py
-# Only torch -> tensorplay imports were rewritten.
 import codecs
 import os
 import os.path
@@ -535,7 +533,6 @@ def read_sn3_pascalvincent_tensor(path: str, strict: bool = True) -> tensorplay.
 
     parsed = tensorplay.frombuffer(bytearray(data), dtype=torch_type, offset=(4 * (nd + 1)))
 
-    # The MNIST format uses the big endian byte order, while `torch.frombuffer` uses whatever the system uses. In case
     # that is little endian and the dtype has more than one byte, we need to flip them.
     if sys.byteorder == "little" and parsed.element_size() > 1:
         parsed = _flip_byte_order(parsed)

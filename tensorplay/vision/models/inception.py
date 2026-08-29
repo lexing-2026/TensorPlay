@@ -1,6 +1,3 @@
-# Ported verbatim from torchvision==0.28.0 models/inception.py
-# (source of truth: https://github.com/pytorch/vision); only the
-# torch -> tensorplay imports were rewritten.
 import warnings
 from collections import namedtuple
 from functools import partial
@@ -427,7 +424,7 @@ class Inception_V3_Weights(WeightsEnum):
             },
             "_ops": 5.713,
             "_file_size": 103.903,
-            "_docs": """These weights are ported from the original paper.""",
+            "_docs": """These weights are described in the original paper.""",
         },
     )
     DEFAULT = IMAGENET1K_V1

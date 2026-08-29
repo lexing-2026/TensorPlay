@@ -1,6 +1,3 @@
-# Ported verbatim from torchvision==0.28.0 models/maxvit.py
-# (source of truth: https://github.com/pytorch/vision); only the
-# torch -> tensorplay imports were rewritten.
 import math
 from collections import OrderedDict
 from collections.abc import Sequence

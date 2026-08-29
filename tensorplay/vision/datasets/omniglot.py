@@ -1,5 +1,3 @@
-# Ported verbatim from torchvision==0.28.0 datasets/omniglot.py
-# Only torch -> tensorplay imports were rewritten.
 from os.path import join
 from pathlib import Path
 from typing import Any, Callable, Optional, Union

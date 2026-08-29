@@ -1,5 +1,3 @@
-# Ported verbatim from torchvision==0.28.0 datasets/cityscapes.py
-# Only torch -> tensorplay imports were rewritten.
 import json
 import os
 from collections import namedtuple

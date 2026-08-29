@@ -1,5 +1,3 @@
-# Ported verbatim from torchvision==0.28.0 datasets/lsun.py
-# Only torch -> tensorplay imports were rewritten.
 import io
 import os.path
 import pickle

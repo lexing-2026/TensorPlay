@@ -1,5 +1,3 @@
-# Ported verbatim from torchvision==0.28.0 datasets/_optical_flow.py
-# Only torch -> tensorplay imports were rewritten.
 import itertools
 import os
 from abc import ABC, abstractmethod

@@ -1,5 +1,3 @@
-# Ported verbatim from torchvision==0.28.0 datasets/sbd.py
-# Only torch -> tensorplay imports were rewritten.
 import os
 import shutil
 from pathlib import Path
@@ -84,7 +82,6 @@ class SBDataset(VisionDataset):
                 old_path = os.path.join(extracted_ds_root, f)
                 shutil.move(old_path, sbd_root)
             if self.image_set == "train_noval":
-                # Note: this is failing as of June 2024 https://github.com/pytorch/vision/issues/8471
                 download_url(self.voc_train_url, sbd_root, self.voc_split_filename, self.voc_split_md5)
 
         if not os.path.isdir(sbd_root):

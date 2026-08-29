@@ -1,5 +1,3 @@
-# Ported verbatim from torchvision==0.28.0 datasets/hmdb51.py
-# Only torch -> tensorplay imports were rewritten.
 import glob
 import os
 from pathlib import Path

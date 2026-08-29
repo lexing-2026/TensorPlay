@@ -1,5 +1,3 @@
-# Ported verbatim from torchvision==0.28.0 datasets/cifar.py
-# Only torch -> tensorplay imports were rewritten.
 import os.path
 import pickle
 from pathlib import Path

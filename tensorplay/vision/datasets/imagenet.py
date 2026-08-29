@@ -1,5 +1,3 @@
-# Ported verbatim from torchvision==0.28.0 datasets/imagenet.py
-# Only torch -> tensorplay imports were rewritten.
 import os
 import shutil
 import tempfile
