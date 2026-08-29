@@ -26,57 +26,73 @@ inline bool topk_is_nan(T value) {
   }
 }
 
-template <typename T>
-inline bool topk_before(T lhs, int64_t lhs_index, T rhs, int64_t rhs_index,
-                        bool largest) {
-  const bool lhs_nan = topk_is_nan(lhs);
-  const bool rhs_nan = topk_is_nan(rhs);
-  if (lhs_nan != rhs_nan) return largest ? lhs_nan : !lhs_nan;
-  if (lhs_nan) return lhs_index < rhs_index;
-  if (lhs < rhs) return !largest;
-  if (rhs < lhs) return largest;
-  return lhs_index < rhs_index;
+template <typename T, bool HasNaN>
+struct TopKCompare {
+  bool largest;
+
+  bool operator()(const std::pair<T, int64_t>& lhs,
+                  const std::pair<T, int64_t>& rhs) const {
+    if constexpr (HasNaN) {
+      const bool lhs_nan = topk_is_nan(lhs.first);
+      const bool rhs_nan = topk_is_nan(rhs.first);
+      if (largest) {
+        return (lhs_nan && !rhs_nan) || (lhs.first > rhs.first);
+      }
+      return (!lhs_nan && rhs_nan) || (lhs.first < rhs.first);
+    }
+    return largest ? (lhs.first > rhs.first) : (lhs.first < rhs.first);
+  }
+};
+
+template <typename T, typename Compare>
+inline void select_topk(std::vector<std::pair<T, int64_t>>& queue,
+                        int64_t k, bool sorted, Compare compare) {
+  const int64_t dim_size = static_cast<int64_t>(queue.size());
+  if (k <= dim_size / 64) {
+    std::partial_sort(queue.begin(), queue.begin() + k, queue.end(), compare);
+  } else {
+    std::nth_element(queue.begin(), queue.begin() + k - 1, queue.end(), compare);
+    if (sorted) {
+      std::sort(queue.begin(), queue.begin() + k - 1, compare);
+    }
+  }
 }
 
-template <typename T>
+template <typename scalar_t, typename accscalar_t>
 void topk_kernel_cpu_impl(const Tensor& input, Tensor& values, Tensor& indices,
                           int64_t k, bool largest, bool sorted,
                           int64_t outer, int64_t inner, int64_t dim_size) {
-  const T* input_data = input.data_ptr<T>();
-  T* value_data = values.data_ptr<T>();
+  using elem_t = std::pair<accscalar_t, int64_t>;
+  const scalar_t* input_data = input.data_ptr<scalar_t>();
+  scalar_t* value_data = values.data_ptr<scalar_t>();
   int64_t* index_data = indices.data_ptr<int64_t>();
   const int64_t rows = outer * inner;
   if (rows == 0 || k == 0) return;
 
 #pragma omp parallel
   {
-    std::vector<std::pair<T, int64_t>> queue(static_cast<size_t>(dim_size));
+    std::vector<elem_t> queue(static_cast<size_t>(dim_size));
 #pragma omp for schedule(static)
     for (int64_t row = 0; row < rows; ++row) {
       const int64_t outer_index = row / inner;
       const int64_t inner_index = row % inner;
       const int64_t input_base = outer_index * dim_size * inner + inner_index;
       const int64_t output_base = outer_index * k * inner + inner_index;
+      bool has_nan = false;
       for (int64_t column = 0; column < dim_size; ++column) {
-        queue[static_cast<size_t>(column)] = {
-            input_data[input_base + column * inner], column};
+        const accscalar_t value = static_cast<accscalar_t>(
+            input_data[input_base + column * inner]);
+        queue[static_cast<size_t>(column)] = {value, column};
+        has_nan |= topk_is_nan(value);
       }
-      auto comparator = [largest](const auto& lhs, const auto& rhs) {
-        return topk_before(lhs.first, lhs.second, rhs.first, rhs.second, largest);
-      };
-      if (sorted) {
-        if (k <= dim_size / 64) {
-          std::partial_sort(queue.begin(), queue.begin() + k, queue.end(), comparator);
-        } else {
-          std::nth_element(queue.begin(), queue.begin() + k - 1, queue.end(), comparator);
-          std::sort(queue.begin(), queue.begin() + k, comparator);
-        }
+      if (has_nan) {
+        select_topk(queue, k, sorted, TopKCompare<accscalar_t, true>{largest});
       } else {
-        std::nth_element(queue.begin(), queue.begin() + k - 1, queue.end(), comparator);
+        select_topk(queue, k, sorted, TopKCompare<accscalar_t, false>{largest});
       }
       for (int64_t column = 0; column < k; ++column) {
         value_data[output_base + column * inner] =
-            queue[static_cast<size_t>(column)].first;
+            static_cast<scalar_t>(queue[static_cast<size_t>(column)].first);
         index_data[output_base + column * inner] =
             queue[static_cast<size_t>(column)].second;
       }
@@ -115,40 +131,40 @@ std::tuple<Tensor, Tensor> topk_kernel_cpu(const Tensor& self, int64_t k, int64_
 
   switch (input.dtype()) {
     case DType::UInt8:
-      topk_kernel_cpu_impl<uint8_t>(input, values, indices, k, largest, sorted, outer, inner, dim_size);
+      topk_kernel_cpu_impl<uint8_t, uint8_t>(input, values, indices, k, largest, sorted, outer, inner, dim_size);
       break;
     case DType::Int8:
-      topk_kernel_cpu_impl<int8_t>(input, values, indices, k, largest, sorted, outer, inner, dim_size);
+      topk_kernel_cpu_impl<int8_t, int8_t>(input, values, indices, k, largest, sorted, outer, inner, dim_size);
       break;
     case DType::Int16:
-      topk_kernel_cpu_impl<int16_t>(input, values, indices, k, largest, sorted, outer, inner, dim_size);
+      topk_kernel_cpu_impl<int16_t, int16_t>(input, values, indices, k, largest, sorted, outer, inner, dim_size);
       break;
     case DType::Int32:
-      topk_kernel_cpu_impl<int32_t>(input, values, indices, k, largest, sorted, outer, inner, dim_size);
+      topk_kernel_cpu_impl<int32_t, int32_t>(input, values, indices, k, largest, sorted, outer, inner, dim_size);
       break;
     case DType::Int64:
-      topk_kernel_cpu_impl<int64_t>(input, values, indices, k, largest, sorted, outer, inner, dim_size);
+      topk_kernel_cpu_impl<int64_t, int64_t>(input, values, indices, k, largest, sorted, outer, inner, dim_size);
       break;
     case DType::UInt16:
-      topk_kernel_cpu_impl<uint16_t>(input, values, indices, k, largest, sorted, outer, inner, dim_size);
+      topk_kernel_cpu_impl<uint16_t, uint16_t>(input, values, indices, k, largest, sorted, outer, inner, dim_size);
       break;
     case DType::UInt32:
-      topk_kernel_cpu_impl<uint32_t>(input, values, indices, k, largest, sorted, outer, inner, dim_size);
+      topk_kernel_cpu_impl<uint32_t, uint32_t>(input, values, indices, k, largest, sorted, outer, inner, dim_size);
       break;
     case DType::UInt64:
-      topk_kernel_cpu_impl<uint64_t>(input, values, indices, k, largest, sorted, outer, inner, dim_size);
+      topk_kernel_cpu_impl<uint64_t, uint64_t>(input, values, indices, k, largest, sorted, outer, inner, dim_size);
       break;
     case DType::Float16:
-      topk_kernel_cpu_impl<Half>(input, values, indices, k, largest, sorted, outer, inner, dim_size);
+      topk_kernel_cpu_impl<Half, Half>(input, values, indices, k, largest, sorted, outer, inner, dim_size);
       break;
     case DType::BFloat16:
-      topk_kernel_cpu_impl<BFloat16>(input, values, indices, k, largest, sorted, outer, inner, dim_size);
+      topk_kernel_cpu_impl<BFloat16, float>(input, values, indices, k, largest, sorted, outer, inner, dim_size);
       break;
     case DType::Float32:
-      topk_kernel_cpu_impl<float>(input, values, indices, k, largest, sorted, outer, inner, dim_size);
+      topk_kernel_cpu_impl<float, float>(input, values, indices, k, largest, sorted, outer, inner, dim_size);
       break;
     case DType::Float64:
-      topk_kernel_cpu_impl<double>(input, values, indices, k, largest, sorted, outer, inner, dim_size);
+      topk_kernel_cpu_impl<double, double>(input, values, indices, k, largest, sorted, outer, inner, dim_size);
       break;
     case DType::Bool:
     case DType::ComplexFloat:
