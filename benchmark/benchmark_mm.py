@@ -10,7 +10,7 @@ def benchmark_mm():
     
     sizes = [32, 64, 128, 512, 1024, 2048, 4096]
     
-    print(f"{'Size':<10} | {'TP GFLOPS':<12} | {'Torch GFLOPS':<12} | {'Ratio (TP/Torch)':<15}")
+    print(f"{'Size':<10} | {'TP GFLOPS':<12} | {'ref GFLOPS':<12} | {'Ratio (TP/ref)':<15}")
     print("-" * 60)
     
     device_tp = tp.device("cuda")
@@ -39,7 +39,6 @@ def benchmark_mm():
         time_tp = (end - start) / iters
         gflops_tp = (2 * N**3) / time_tp / 1e9
         
-        # PyTorch
         a_torch = torch.rand((N, N), device=device_torch)
         b_torch = torch.rand((N, N), device=device_torch)
         

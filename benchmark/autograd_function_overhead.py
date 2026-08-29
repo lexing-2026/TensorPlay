@@ -1,4 +1,4 @@
-"""autograd.Function framework-overhead benchmark: TensorPlay vs torch.
+"""Autograd function framework-overhead benchmark.
 
 Measures ns/iter of forward+backward through a custom Function minus the
 bare-op floor, isolating each framework's apply()/graph-attach cost.
@@ -77,7 +77,7 @@ def main():
         results[label] = (b, f, f - b)
 
     # keep grads from accumulating across iterations (correctness of timing)
-    print(f"{'metric':<28}{'torch':>12}{'tensorplay':>14}")
+    print(f"{'metric':<28}{'ref':>12}{'tensorplay':>14}")
     rows = [
         ("bare fwd+bwd (ns)", *[(results[k][0]) for k in ("torch", "tensorplay")]),
         ("Function fwd+bwd (ns)", *[(results[k][1]) for k in ("torch", "tensorplay")]),
@@ -86,7 +86,7 @@ def main():
     for name, tv, tpv in rows:
         print(f"{name:<28}{tv:>12,.0f}{tpv:>14,.0f}")
     ratio = results["torch"][2] / results["tensorplay"][2]
-    print(f"\nframework-loss ratio torch/tensorplay: {ratio:.2f}x")
+    print(f"\nframework-loss ratio ref/tensorplay: {ratio:.2f}x")
 
 
 if __name__ == "__main__":

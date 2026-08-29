@@ -1,11 +1,9 @@
-"""TensorPlay vs torch performance matrix on one CUDA device.
+"""TensorPlay performance matrix on one CUDA device.
 
-Motifs mirror the compiler's fusion targets plus the standard GEMM/norm
+Motifs target the compiler's fusion targets plus the standard GEMM/norm
 kernels.  Every cell reports median CUDA-event milliseconds over `iters`
-after `warmup` untimed iterations; "speedup" is torch_time / tp_time.
 
 Usage (remote):
-    python benchmark/benchmark_vs_torch.py [--iters 200] [--warmup 10]
 """
 
 import argparse
@@ -120,7 +118,6 @@ def _llama_parameter_count(vocab_size, hidden_size, intermediate_size,
 
 
 class _TinyLlamaE2E:
-    """Minimal Llama decoder with identical weights in Torch and TensorPlay."""
 
     def __init__(self, state, *, hidden_size, num_heads, intermediate_size,
                  num_layers, device, backend):
@@ -225,7 +222,7 @@ class _TinyLlamaE2E:
 def _run_llm_e2e(device, opts):
     if device == "cuda" and (not torch.cuda.is_available() or
                               not tp.cuda.is_available()):
-        raise SystemExit("Both PyTorch and TensorPlay CUDA must be available")
+        raise SystemExit("Reference framework and TensorPlay CUDA must be available")
 
     if device == "cpu":
         torch.set_num_threads(opts.threads)
@@ -260,7 +257,7 @@ def _run_llm_e2e(device, opts):
     tp_next = tp_logits[:, -1, :].argmax(dim=-1).cpu().numpy()
     if not np.array_equal(torch_next, tp_next):
         raise AssertionError(
-            f"next-token mismatch: torch={torch_next} tensorplay={tp_next}")
+            f"next-token mismatch: ref={torch_next} tensorplay={tp_next}")
 
     with torch.inference_mode():
         torch_ms = _time_eager(
@@ -282,16 +279,16 @@ def _run_llm_e2e(device, opts):
     parameters = _llama_parameter_count(
         opts.vocab, opts.hidden, opts.intermediate, opts.layers)
     print(f"parameters: {parameters:,} ({parameters / 1e9:.3f}B)")
-    print(f"torch eager decoder : {torch_ms:.4f} ms/iteration")
+    print(f"ref eager decoder : {torch_ms:.4f} ms/iteration")
     print(f"tensorplay fused    : {tp_ms:.4f} ms/iteration")
-    print(f"speedup (torch/tp)  : {speedup:.3f}x")
+    print(f"speedup (ref/tp)  : {speedup:.3f}x")
     return {"device": device, "torch_ms": torch_ms, "tensorplay_ms": tp_ms,
             "speedup": speedup}
 
 
 def run_case(name, make_args, tp_fn, torch_fn, warmup=10, iters=50,
              compile_tp=True, compile_torch=False, dtype_note=""):
-    """``make_args()`` returns ``(tp_args, torch_args)`` — independent
+    """
     tensors with matching shapes/dtypes (values need not correspond)."""
     tp_args, th_args = make_args()
     rows = {}
@@ -340,7 +337,7 @@ def main():
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--max-seq", type=int, default=4096)
     parser.add_argument("--threads", type=int, default=16,
-                        help="matched Torch/TensorPlay CPU thread count")
+                        help="matched ref/TensorPlay CPU thread count")
     parser.add_argument("--seed", type=int, default=20260827)
     parser.add_argument("--require-win", action="store_true",
                         help="fail unless TensorPlay wins every E2E device")
@@ -457,7 +454,6 @@ def main():
         lambda x: x.argmax(dim=-1),
         warmup=opts.warmup, iters=opts.iters))
 
-    # --- 7. RNN layer (TP native fused-cell path; torch rides cuDNN on CUDA) ----
     for kind, dt, phase in [("rnn_tanh", "fp32", "fwd"),
                             ("rnn_tanh", "fp32", "fwd+bwd"),
                             ("rnn_tanh", "fp16", "fwd"),
@@ -565,7 +561,7 @@ def main():
 
     print("\n=== summary ===")
     wins = sum(1 for r in results if r["speedup"] >= 1.0)
-    print(f"TP >= torch on {wins}/{len(results)} cases "
+    print(f"TP >= ref on {wins}/{len(results)} cases "
           f"(geomean speedup of best-vs-best: "
           f"{statistics.geometric_mean(max(r['speedup'], 0.01) for r in results):.2f}x)")
     print(json.dumps(results, indent=2))

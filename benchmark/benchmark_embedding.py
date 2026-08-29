@@ -1,4 +1,4 @@
-"""Compare TensorPlay CUDA embedding with PyTorch on the same GPU.
+"""Compare TensorPlay CUDA embedding with a reference runtime.
 
 Run from the repository root:
 
@@ -70,18 +70,18 @@ def run_case(name: str, vocab: int, dim: int, n_indices: int, iterations: int) -
 
     tp_weight = tp.randn((vocab, dim), device="cuda")
     torch_weight = torch.randn((vocab, dim), device="cuda")
-    # Use equal deterministic weights for the parity check without making the
+    # Use equal deterministic weights for the validation check without making the
     # timed path pay for a conversion.
-    parity_vocab = min(vocab, 16)
-    parity_indices = [i % parity_vocab for i in range(min(n_indices, 32))]
-    parity_values = np.arange(parity_vocab * dim, dtype=np.float32).reshape(parity_vocab, dim)
-    tp_parity_weight = to_tp(parity_values.tolist(), tp.float32)
-    torch_parity_weight = torch.from_numpy(parity_values).to("cuda")
+    check_vocab = min(vocab, 16)
+    check_indices = [i % check_vocab for i in range(min(n_indices, 32))]
+    check_values = np.arange(check_vocab * dim, dtype=np.float32).reshape(check_vocab, dim)
+    tp_check_weight = to_tp(check_values.tolist(), tp.float32)
+    ref_check_weight = torch.from_numpy(check_values).to("cuda")
     check_forward(
-        tp_parity_weight,
-        to_tp(parity_indices, tp.int64),
-        torch_parity_weight,
-        torch.tensor(parity_indices, dtype=torch.int64, device="cuda"),
+        tp_check_weight,
+        to_tp(check_indices, tp.int64),
+        ref_check_weight,
+        torch.tensor(check_indices, dtype=torch.int64, device="cuda"),
     )
 
     tp_us = measure(
@@ -92,7 +92,7 @@ def run_case(name: str, vocab: int, dim: int, n_indices: int, iterations: int) -
         warmup=10,
         iterations=iterations,
     )
-    print(f"{name:16s} forward {tp_us:10.2f} us  {torch_us:10.2f} us  TP/Torch {tp_us / torch_us:6.3f}x")
+    print(f"{name:16s} forward {tp_us:10.2f} us  {torch_us:10.2f} us  TP/ref {tp_us / torch_us:6.3f}x")
 
     tp_grad = tp.randn((n_indices, dim), device="cuda")
     torch_grad = torch.randn((n_indices, dim), device="cuda")
@@ -104,7 +104,7 @@ def run_case(name: str, vocab: int, dim: int, n_indices: int, iterations: int) -
     )
     tp_bwd_us = measure(tp_backward, warmup=10, iterations=iterations)
     torch_bwd_us = measure(torch_backward, warmup=10, iterations=iterations)
-    print(f"{'':16s} backward {tp_bwd_us:10.2f} us  {torch_bwd_us:10.2f} us  TP/Torch {tp_bwd_us / torch_bwd_us:6.3f}x")
+    print(f"{'':16s} backward {tp_bwd_us:10.2f} us  {torch_bwd_us:10.2f} us  TP/ref {tp_bwd_us / torch_bwd_us:6.3f}x")
 
     del tp_weight, torch_weight, tp_indices, torch_indices, tp_grad, torch_grad
     gc.collect()
@@ -117,9 +117,9 @@ def main() -> None:
     args = parser.parse_args()
 
     if not torch.cuda.is_available() or not tp.cuda.is_available():
-        raise SystemExit("Both PyTorch and TensorPlay CUDA must be available")
+        raise SystemExit("Both reference framework and TensorPlay CUDA must be available")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print("case             direction       TensorPlay       PyTorch       ratio")
+    print("case             direction       TensorPlay         ref       ratio")
     for name, vocab, dim, n_indices in CASES:
         iterations = 20 if args.quick else 100
         if n_indices == 1:
