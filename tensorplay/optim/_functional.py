@@ -42,7 +42,6 @@ def sparse_adam(
         grad = grads[i]
         if maximize:
             # Unary negation is not implemented for TensorPlay sparse COO
-            # tensors.  Torch negates the sparse values while preserving the
             # index structure, so keep the operation sparse at this boundary
             # instead of materializing a dense gradient.
             grad = tp.sparse_coo_tensor(

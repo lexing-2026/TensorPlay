@@ -474,7 +474,6 @@ def radam(
         and native_device in ("cpu", "cuda")
         and bool(params)
         # CPU and CUDA both round reduced floating point intermediates at the
-        # same foreach operation boundaries as Torch.
         and params[0].dtype in (
             tp.float16, tp.bfloat16, tp.float32, tp.float64
         )

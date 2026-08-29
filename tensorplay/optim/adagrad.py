@@ -74,7 +74,6 @@ class Adagrad(Optimizer):
             self._need_device_dtype_check_for_fused = True
             self._step_supports_amp_scaling = True
 
-        # Torch initializes Adagrad's state eagerly in the constructor.
         for group in self.param_groups:
             for p in group["params"]:
                 state = self.state[p]
@@ -226,7 +225,6 @@ def _single_tensor_adagrad(
         step_t += 1
         step = _get_value(step_t)
         if maximize:
-            # Keep sparse gradients sparse when applying Torch's maximize
             # convention; TensorPlay's generic unary neg does not accept COO.
             if grad.is_sparse:
                 grad = tp.sparse_coo_tensor(
@@ -513,7 +511,6 @@ def adagrad(
 
     # The fused entry point requires a homogeneous contiguous group.  Keep the
     # full check at this dispatch boundary: non-contiguous tensors are valid
-    # Torch foreach/single inputs and must not be probed through a backend
     # kernel that cannot consume their strides.
     native_layout_ready = (
         not differentiable

@@ -23,8 +23,6 @@ from tensorplay.utils.hooks import RemovableHandle
 
 
 # These helpers intentionally keep the names and the contracts used by
-# torch.optim.optimizer.  Optimizer implementations can therefore be
-# mechanically ported from the installed Torch source; backend-specific work
 # stays below this layer.
 _T = TypeVar("_T")
 _P = ParamSpec("_P")
@@ -141,7 +139,6 @@ def _disable_dynamo(func):
 
 
 def _disable_dynamo_if_unsupported(single_tensor_fn=None):
-    # Keep the single-tensor function in the module globals for TorchScript-
     # compatible callers that still inspect this decorator's closure.
     if single_tensor_fn is not None:
         globals()[single_tensor_fn.__name__] = single_tensor_fn
@@ -188,7 +185,6 @@ def _default_to_fused_or_foreach(params, differentiable, use_fused=False):
     if differentiable:
         return False, False
     fused_supported_devices = _get_fused_kernels_supported_devices()
-    # Match Torch's default selection exactly: foreach is an implicit
     # accelerator path, while CPU falls back to the single-tensor route unless
     # the optimizer has an explicit native CPU kernel of its own.
     foreach_supported_devices = _get_foreach_kernels_supported_devices()
@@ -274,9 +270,8 @@ def register_optimizer_step_post_hook(hook: GlobalOptimizerPostHook) -> Removabl
 
 
 def _use_grad_for_differentiable(func):
-    """Mirror torch.optim's grad-mode wrapper around ``step``.
+    """
 
-    Torch runs the complete optimizer step under ``no_grad`` by default and
     enables grad recording only when ``differentiable=True``.  The closure is
     always evaluated with grad enabled.  Keeping this policy in one wrapper
     avoids individual optimizers accidentally mixing the two modes.
@@ -295,9 +290,9 @@ def _use_grad_for_differentiable(func):
             disable_capture = getattr(tp.compiler, "_disable_capture", None)
             if disable_capture is None:
                 return func(self, grad_closure)
-            # Torch places graph breaks immediately around optimizer.step so
-            # AOTAutograd does not functionalize the in-place optimizer state
-            # mutation into the model graph.  Stax uses the same boundary.
+            # The ahead-of-time backward pass does not functionalize the
+            # in-place optimizer-state mutation into the model graph.  Stax
+            # uses the same boundary.
             with disable_capture():
                 return func(self, grad_closure)
 
@@ -536,9 +531,7 @@ class Optimizer:
         
         # Validate state_dict
         groups = self.param_groups
-        # Torch deep-copies the group metadata because it rewrites the saved
         # ``params`` lists in place below.  TensorPlay tensors support the
-        # same deepcopy contract as tensors used by torch optimizers.
         saved_groups = copy.deepcopy(state_dict['param_groups'])
 
         if len(groups) != len(saved_groups):
@@ -643,7 +636,7 @@ class Optimizer:
         self.defaults.setdefault('differentiable', False)
 
     def _accelerator_graph_capture_health_check(self):
-        """Compatibility hook for Torch's graph-capture health check.
+        """
 
         TensorPlay validates the eager capturable contract when each optimizer
         resolves its parameter group.  The backend does not expose a public
@@ -654,8 +647,7 @@ class Optimizer:
     _cuda_graph_capture_health_check = _accelerator_graph_capture_health_check
 
     def _optimizer_step_code(self):
-        """Profiler integration point matching ``torch.optim.Optimizer``."""
-
+        ""
     @staticmethod
     def profile_hook_step(func):
         @functools.wraps(func)

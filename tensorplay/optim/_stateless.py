@@ -1,4 +1,3 @@
-"""Stateless optimizer parameter/state swapping, matching torch.optim."""
 
 import contextlib
 from collections import defaultdict

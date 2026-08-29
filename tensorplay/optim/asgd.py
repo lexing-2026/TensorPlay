@@ -387,7 +387,6 @@ def asgd(
         and not has_complex
         and bool(params)
         # The fused reduced-dtype update combines parameter operations that
-        # Torch performs as separate kernels, changing the cast point. Keep
         # fp16/bf16 on the native-compatible reference path.
         and params[0].dtype in (tp.float32, tp.float64)
         and all(

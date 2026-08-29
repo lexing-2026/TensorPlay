@@ -1,9 +1,7 @@
 """Shared implementation details for TensorPlay optimizers.
 
-The public optimizer classes intentionally stay close to ``torch.optim``.
-These helpers keep validation, state allocation, and the small pieces of
-elementwise math identical across the implementations without adding a
-dependency on PyTorch itself.
+These helpers centralize validation, state allocation, and small pieces of
+elementwise math without adding a
 """
 
 import math
@@ -38,7 +36,6 @@ def validate_unit_interval(value, name, *, inclusive_one=False):
 
 
 def zeros_like(param):
-    # Torch uses memory_format=torch.preserve_format for optimizer state.
     # TensorPlay's generated zeros_like currently materializes a contiguous
     # result, so reproduce preserve_format explicitly for strided parameters.
     if param.is_contiguous():
@@ -54,7 +51,6 @@ def zeros_like(param):
     # zero_ kernel intentionally follows the contiguous fast path for a raw
     # strided view, which can leave the portion after the first contiguous
     # chunk untouched.  Filling the 1-D storage itself is both safe for gaps
-    # and preserves Torch's state layout for non-contiguous parameters.
     storage = tp.zeros((storage_numel,), dtype=param.dtype, device=param.device)
     return storage.as_strided(param.shape, strides)
 
@@ -74,9 +70,8 @@ def full_like(param, value):
 
 
 def state_step(state, *, param=None, device=None, capturable=False):
-    """Increment Torch-compatible scalar-tensor optimizer state.
+    """
 
-    Torch stores optimizer ``step`` as a float32 scalar tensor.  It is hosted
     on CPU for the ordinary path and on the parameter device for capturable
     paths.  Keeping the value tensorized is important for both state_dict
     compatibility and CUDA graph capture.
@@ -91,7 +86,6 @@ def state_step(state, *, param=None, device=None, capturable=False):
 
 
 def ensure_state_step(state, *, param=None, device=None, capturable=False):
-    """Return a Torch-style scalar step without incrementing it."""
 
     if device is None:
         if param is not None and param.device.type != "cpu":
@@ -127,7 +121,6 @@ def scalar_tensor(value, *, device=None):
 
 
 def capturable_supported(param):
-    """Torch's eager capturable path is accelerator-only."""
 
     if not param.is_cuda:
         raise RuntimeError(
@@ -136,7 +129,6 @@ def capturable_supported(param):
 
 
 def foreach_enabled(group, params):
-    """Resolve Torch's ``foreach=None`` default for an eager parameter group."""
 
     setting = group.get("foreach", None)
     if setting is True and group.get("differentiable", False):
@@ -148,7 +140,6 @@ def foreach_enabled(group, params):
         return bool(setting)
     if group.get("differentiable", False):
         return False
-    # Torch selects foreach by default for accelerator groups and keeps the
     # ordinary CPU path scalar.  Mixed-device groups are split by the caller
     # only when foreach was requested explicitly.
     return bool(params) and all(param.is_cuda for param in params)
@@ -175,7 +166,6 @@ def decoupled_weight_decay(param, lr, weight_decay):
 
 
 def elementwise_max(lhs, rhs):
-    """Torch maximum semantics, including NaN propagation."""
 
     return tp.maximum(lhs, rhs)
 

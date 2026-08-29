@@ -23,7 +23,6 @@ __all__ = ["Adamax", "adamax"]
 
 
 class Adamax(Optimizer):
-    """Adamax optimizer matching ``torch.optim.Adamax``."""
 
     def __init__(self, params, lr=2e-3, betas=(0.9, 0.999), eps=1e-8,
                  weight_decay=0, foreach=None, *, maximize=False,
