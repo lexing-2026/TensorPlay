@@ -17,7 +17,7 @@ namespace tpx {
 // Tensor were merged into one type).
 using Tensor = tensorplay::Tensor;
 
-// Free-function accessors over the AutogradMeta extension point. These mirror
+// Free-function accessors over the AutogradMeta extension point. These expose
 namespace impl {
 
 TENSORPLAY_API AutogradMeta* get_autograd_meta(const Tensor& t);

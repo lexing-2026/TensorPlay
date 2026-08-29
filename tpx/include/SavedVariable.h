@@ -8,7 +8,7 @@
 namespace tensorplay {
 namespace tpx {
 
-// Saved forward tensor of a backward node, mirroring
+// Saved forward tensor of a backward node, preserving
 // save time; unpack() fails loudly if the tensor (or a view base sharing its
 // counter) was mutated in-place between the forward and the backward, instead
 // of silently producing wrong gradients.
