@@ -4,8 +4,7 @@
 //     moveaxis/swapaxes/swapdims/broadcast_to
 // Every composite invokes its primitives through the generated Tensor members,
 // so each inner call routes through the Dispatcher (device + autograd keys)
-// real device code (single-pass index-math gather, the same materialization
-// upstream achieves via unfold + copy_); its CUDA twin lives in
+// real device code (single-pass index-math gather); its CUDA twin lives in
 // cuda/ShapeAlignKernels.cu.
 
 #include "Tensor.h"
@@ -32,7 +31,7 @@ Tensor tpsa_atleast_3d(const Tensor& self);
 namespace {
 
 inline int64_t wrap_dim(int64_t dim, int64_t ndim) {
-    // c10::maybe_wrap_dim, including the zero-dim special case that keeps
+    // Dimension wrapping includes the zero-dim special case that keeps
     // flatten(0-dim tensor) legal.
     if (ndim == 0) {
         if (dim != 0 && dim != -1) {
@@ -125,8 +124,7 @@ Tensor expand_impl(const Tensor& self, const std::vector<int64_t>& size) {
     std::vector<int64_t> new_sizes(size);
     std::vector<int64_t> new_strides(new_ndim, 0);
 
-    // 0-d inputs expand to any shape with all-zero strides (upstream returns
-    // InferExpandGeometryResult(sizes, ndim) with zeroed strides).
+    // 0-d inputs expand to any shape with all-zero strides.
     if (ndim == 0) {
         return self.as_strided(new_sizes, new_strides);
     }
@@ -688,11 +686,11 @@ Tensor tpsa_repeat_cpu(const Tensor& self, const std::vector<int64_t>& repeats) 
 TENSORPLAY_LIBRARY_IMPL(CPU, ShapeAlign) {
     // repeat is the only op in this batch with real per-device code (the
     // single-pass gather below); its CUDA twin overrides it in
-    // cuda/ShapeAlignKernels.cu -- upstream's MPS: repeat_mps pattern.
+    // cuda/ShapeAlignKernels.cu.
     m.impl("repeat", shapeops::tpsa_repeat_cpu);
     // Everything else in this batch maps to CompositeExplicitAutograd or the
-    // default CompositeImplicitAutograd in native_functions.yaml and is
-    // registered once under the backend-neutral Composite key from
+    // default composite dispatch key and is registered once under the
+    // backend-neutral Composite key from
     // src/RegisterComposites.cpp; the dispatcher's composite fallthrough
     // serves CPU tensors from there.
 }

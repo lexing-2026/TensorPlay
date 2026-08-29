@@ -38,7 +38,7 @@ P10_API void commAbort(Comm comm);
 P10_API int commCount(Comm comm);
 
 // All collectives enqueue on `stream` and return once enqueued (async),
-// mirroring NCCL semantics; synchronization is the caller's job.
+// matching NCCL semantics; synchronization is the caller's job.
 
 P10_API void allReduce(void* buffer, size_t count, DType dtype, ReduceOp op,
                        Comm comm, void* stream);

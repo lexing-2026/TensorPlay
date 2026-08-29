@@ -1,8 +1,8 @@
 // Native spectral kernels for the audio stack.
 //
-// public fft_* entry points follow upstream's norm_from_string /
-// resize_fft_input flow, stft/istft follow upstream framing and overlap-add
-// exactly. The FFT engine is vendored pocketfft (pocketfft_hdronly.h) — the
+// Public fft_* entry points use norm_from_string / resize_fft_input flow, and
+// stft/istft use the documented framing and overlap-add rules. The FFT engine
+// is vendored pocketfft (pocketfft_hdronly.h) — the
 
 #include "Tensor.h"
 #include "Dispatcher.h"
@@ -384,7 +384,7 @@ Tensor fft_rfft_backward_cpu(const Tensor& grad, const Tensor& self, int64_t dim
 
 namespace {
 // r2c of the real gradient with the forward's normalization, then double the
-// bins whose conjugate mirror fell outside the onesided range
+// bins whose conjugate counterpart fell outside the onesided range
 // (indices 1 .. N - onesided_length).
 template <typename T>
 Tensor irfft_backward_core(const Tensor& grad, int64_t freq_bins, int64_t dim,
@@ -394,7 +394,7 @@ Tensor irfft_backward_core(const Tensor& grad, int64_t freq_bins, int64_t dim,
     const int64_t got_bins = sizes_of(t)[dim];
     const int64_t double_length = freq_bins - got_bins;
     if (double_length > 0) {
-        // bins 1 .. N - onesided_length receive their conjugate mirror twice.
+        // bins 1 .. N - onesided_length receive their conjugate counterpart twice.
         Tensor scaled = t.slice(dim, 1, 1 + double_length).mul(Scalar(2.0));
         t.slice(dim, 1, 1 + double_length).copy_(scaled);
     }
@@ -520,7 +520,7 @@ Tensor pad_time_axis(const Tensor& contig, int64_t pad, const std::string& mode)
     return out;
 }
 
-// Adjoint of pad_time_axis: crop (constant) or mirror-scatter (reflect).
+// Adjoint of pad_time_axis: crop (constant) or reflect-scatter (reflect).
 template <typename T>
 void unpad_scatter_time_axis(const T* padded_grad, int64_t batch, int64_t padded_len,
                              int64_t pad, const std::string& mode, T* out_grad) {

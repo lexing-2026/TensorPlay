@@ -3,7 +3,7 @@
 // runtime-resolved ILP64 LAPACK (see cpu/Lapack.h).  All matrices follow the
 // Fortran (batched column-major) layout that LAPACK expects, produced with
 // cloneBatchedColumnMajor.  Complex inputs are rejected until the complex
-// paths are ported.
+// paths are implemented.
 
 #include "Tensor.h"
 #include "Dispatcher.h"

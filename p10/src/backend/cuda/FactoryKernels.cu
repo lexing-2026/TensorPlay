@@ -221,7 +221,7 @@ static Device resolve_factory_device(const std::optional<Device>& device) {
     return device.has_value() ? *device : Device(globalContext().defaultDevice());
 }
 
-// Signatures mirror the CPU backend's registration stubs exactly:
+// Signatures match the CPU backend's registration stubs:
 // std::optional<Device>, no requires_grad (dispatcher-owned).
 Tensor arange_start_step_cuda(Scalar start, Scalar end, Scalar step,
                               DType dtype, std::optional<Device> device) {
@@ -235,7 +235,8 @@ Tensor arange_start_step_cuda(Scalar start, Scalar end, Scalar step,
         }
     }
 
-    // (upstream dispatches over AT_DISPATCH_ALL_TYPES_AND2(Half, BFloat16)).
+    // (the dispatcher selects all supported types, including Half and
+    // BFloat16).
     const bool arange_dtype_supported =
         dtype == DType::Float32 || dtype == DType::Float64 ||
         dtype == DType::Int64 || dtype == DType::Int32 || dtype == DType::Int16 ||

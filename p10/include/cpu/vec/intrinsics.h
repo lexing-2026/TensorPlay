@@ -3,8 +3,8 @@
 //
 // CPU_CAPABILITY_* macros are normally supplied by the build system when a
 // kernel translation unit is compiled for a specific instruction set
-// (e.g. -DCPU_CAPABILITY_AVX2 -DCPU_CAPABILITY=AVX2 -mavx2 -mfma), mirroring
-// without those flags, the macros are derived from the compiler's own ISA
+// (e.g. -DCPU_CAPABILITY_AVX2 -DCPU_CAPABILITY=AVX2 -mavx2 -mfma).  When those
+// flags are absent, the macros are derived from the compiler's own ISA
 // macros so that e.g. -mavx2 builds automatically get the AVX2 vec layer.
 
 #if !defined(CPU_CAPABILITY_AVX512) && !defined(CPU_CAPABILITY_AVX2)

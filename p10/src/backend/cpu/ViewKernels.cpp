@@ -130,8 +130,8 @@ int64_t wrap_dim(int64_t dim, int64_t ndim) {
     return dim < 0 ? dim + ndim : dim;
 }
 
-// c10::maybe_wrap_dim defaults to wrap_scalar=true: rank-0 tensors accept
-// dims [-1, 0] (both wrap to 0).
+// Scalar wrapping defaults to true: rank-0 tensors accept dims [-1, 0]
+// (both wrap to 0).
 int64_t wrap_dim_scalar(int64_t dim, int64_t ndim) {
     return wrap_dim(dim, ndim == 0 ? 1 : ndim);
 }
@@ -554,7 +554,7 @@ Tensor diagonal_kernel(const Tensor& self, int64_t offset, int64_t dim1, int64_t
         diag_size = std::max<int64_t>(std::min(size1 + offset, size2), 0);
     }
     // NumPy allows offsets "off the end"; don't set a ridiculous storage
-    // offset when the diagonal is empty (upstream comment).
+    // offset when the diagonal is empty.
     if (diag_size != 0) {
         if (offset >= 0) {
             new_offset += offset * stride2;

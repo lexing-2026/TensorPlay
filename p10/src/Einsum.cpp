@@ -160,7 +160,7 @@ std::vector<int64_t> plan_exact(const std::vector<std::vector<char>>& occ,
 }
 
 // Greedy over live operands: contract the pair producing the smallest
-// intermediate tensor (flops as tie-break), mirroring opt_einsum's default
+// intermediate tensor (flops as tie-break), following opt_einsum's default
 // heuristic so large operand counts stay near-optimal.
 std::vector<int64_t> plan_greedy(const std::vector<std::vector<char>>& occ,
                                  const std::vector<int64_t>& slot_sizes,

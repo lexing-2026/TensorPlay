@@ -201,7 +201,7 @@ set(TP_CPU_KERNEL_SRCS
 
 if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
     # (CXX_AVX512_FOUND): only build the tier when the compiler accepts the
-    # ISA flags, mirroring CPU_CAPABILITY_NAMES/FLAGS there.
+    # ISA flags defined by the capability tables.
     include(CheckCXXCompilerFlag)
     check_cxx_compiler_flag("-mavx512f -mavx512bw -mavx512vl -mavx512dq -mfma"
         TP_CXX_AVX512_FOUND)

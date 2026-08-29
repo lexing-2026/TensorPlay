@@ -204,7 +204,7 @@ class IntraopThreadPool {
   mutable std::mutex mutex_;
   std::condition_variable condition_;
   std::atomic<bool> running_{true};
-  // Queue length mirror for lock-free polling by spinning workers; own cache
+  // Queue length snapshot for lock-free polling by spinning workers; own cache
   // line so producer mutex/queue traffic doesn't invalidate the polled line.
   alignas(64) std::atomic<size_t> pending_{0};
 };

@@ -4797,7 +4797,7 @@ static Tensor conv_grad_bias_generic(const Tensor& grad_output) {
     return gb;
 }
 
-// mirror that by upcasting around the Float32 path.
+// preserve that behavior by upcasting around the Float32 path.
 
 
 static void im2col_check_args(const char* op, const Tensor& input,

@@ -61,7 +61,7 @@ struct Block {
     // submitted to one stream is totally ordered, so a block can be returned
     // to that stream's cache immediately after release.  Other streams are
     // protected by recorded events, matching the stream-ordered reuse rule of
-    // c10::cuda::CUDACachingAllocator.
+    // the caching allocator.
     cudaStream_t allocation_stream = nullptr;
     std::unordered_set<cudaStream_t> streams;
     std::vector<cudaEvent_t> events;
@@ -187,8 +187,8 @@ public:
         // Raw cudaMalloc is a "potentially unsafe" API: while a Global-mode
         // capture is open anywhere in the process it would abort the capture
         // with cudaErrorStreamCaptureUnsupported (error 900), yet segments
-        // must grow mid-capture to serve graph-pool allocations.  Mirror
-        // capture mode around the driver call only.
+        // must grow mid-capture to serve graph-pool allocations.  Temporarily
+        // relax capture mode around the driver call only.
         cudaStreamCaptureMode previous_mode = cudaStreamCaptureModeGlobal;
         const bool relax = !active_captures_.empty();
         if (relax) {

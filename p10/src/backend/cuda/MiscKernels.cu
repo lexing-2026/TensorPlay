@@ -1,6 +1,6 @@
 // Misc CUDA kernels: meshgrid / roll / diff / masked_fill / one_hot / glu.
 //
-// These mirror the CPU composites in cpu/MiscKernels.cpp; every primitive
+// These follow the CPU composites in cpu/MiscKernels.cpp; every primitive
 // invoked (slice/view/expand/cat/sigmoid/where/eq) is itself dispatched to the
 
 #include "Tensor.h"
@@ -176,7 +176,7 @@ uint32_t deviceAttribute(cudaDeviceAttr attr) {
 }
 
 // Grid-stride fused dropout: each thread draws curand uniforms and writes
-// both the scaled output element and the bool keep-mask, mirroring the
+// both the scaled output element and the bool keep-mask, using one
 // philox counter discipline of RandomKernels.cu (offsets reserved host-side
 // so results are launch-geometry independent).  Under CUDA graph capture the
 // (seed, offset) pair is read from the graph's device buffer instead and
@@ -357,7 +357,7 @@ std::tuple<Tensor, Tensor> native_dropout_cuda(const Tensor& input, double p) {
 // take the 8-wide vectorized path when size and alignment allow.
 Tensor native_dropout_backward_cuda(const Tensor& grad_output, const Tensor& mask, double scale) {
     if (mask.dtype() != DType::Bool) {
-        // Mirror the CPU composite (grad * mask.to(grad.dtype()) * scale);
+        // Use the CPU composite (grad * mask.to(grad.dtype()) * scale);
         // the fused fast path below assumes the bool mask from native_dropout.
         return grad_output * mask.to(grad_output.dtype()) * scale;
     }

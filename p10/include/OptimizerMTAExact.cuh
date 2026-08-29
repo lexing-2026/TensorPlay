@@ -16,7 +16,7 @@ __device__ __forceinline__ math_t round_to_scalar(math_t value) {
     return static_cast<math_t>(static_cast<scalar_t>(value));
 }
 
-// These helpers mirror the CUDA foreach pointwise implementation.  In
+// These helpers reuse the CUDA foreach pointwise implementation.  In
 // particular, addcmul(alpha=1) is the only path that fuses the two tensor
 // operands with the input; addcdiv(alpha=1) deliberately remains divide then
 // add.  Keeping the distinction here avoids accidentally changing the

@@ -55,8 +55,8 @@ private:
     std::shared_ptr<SharedState> shared_state_;
 
     // COO/CSR sparse tensors have no dense storage of their own.  Keep the
-    // sparse metadata next to the dense metadata, mirroring TensorImpl's
-    // split between logical sizes and the storage implementation.  The
+    // sparse metadata next to the dense metadata, split between logical sizes
+    // and the storage implementation.  The
     // component tensors are shared handles, so ordinary Tensor copies
     // (shape [sparse_dim, nnz]); CSR (2D only) stores row pointers in
     // `crow` (shape [rows+1]) and column coordinates in `col` (shape [nnz]).
@@ -142,8 +142,8 @@ public:
     bool is_view() const { return is_view_; }
     void set_is_view(bool v) { is_view_ = v; }
 
-    // Stride-set equality against `format`'s canonical layout, mirroring
-    // dims are not special-cased here.
+    // Stride-set equality against `format`'s canonical layout; singleton
+    // dimensions are not special-cased here.
     bool is_contiguous_in(MemoryFormat format) const {
         const auto sz = sizes_and_strides_.sizes().vec();
         const auto st = sizes_and_strides_.strides().vec();
