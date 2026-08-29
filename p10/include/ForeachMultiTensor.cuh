@@ -407,7 +407,7 @@ struct UnaryNeg {
 template <typename M>
 struct UnaryAbs {
     __device__ M operator()(M* values) const {
-        return values[0] < M(0) ? -values[0] : values[0];
+        return fabs(values[0]);
     }
 };
 template <typename M>
@@ -498,38 +498,38 @@ template <typename M>
 struct BinaryMaximum {
     M scalar;
     __device__ M operator()(M* values) const {
-        return values[0] > scalar ? values[0] : scalar;
+        return isnan(values[0]) || values[0] > scalar ? values[0] : scalar;
     }
 };
 template <typename M>
 struct BinaryMinimum {
     M scalar;
     __device__ M operator()(M* values) const {
-        return values[0] < scalar ? values[0] : scalar;
+        return isnan(values[0]) || values[0] < scalar ? values[0] : scalar;
     }
 };
 template <typename M>
 struct BinaryMaximumList {
     __device__ M operator()(M* values) const {
-        return values[0] > values[1] ? values[0] : values[1];
+        return isnan(values[0]) || values[0] > values[1] ? values[0] : values[1];
     }
 };
 template <typename M>
 struct BinaryMinimumList {
     __device__ M operator()(M* values) const {
-        return values[0] < values[1] ? values[0] : values[1];
+        return isnan(values[0]) || values[0] < values[1] ? values[0] : values[1];
     }
 };
 template <typename M>
 struct BinaryMaximumScalarList {
     __device__ M operator()(M* values, M scalar) const {
-        return values[0] > scalar ? values[0] : scalar;
+        return isnan(values[0]) || values[0] > scalar ? values[0] : scalar;
     }
 };
 template <typename M>
 struct BinaryMinimumScalarList {
     __device__ M operator()(M* values, M scalar) const {
-        return values[0] < scalar ? values[0] : scalar;
+        return isnan(values[0]) || values[0] < scalar ? values[0] : scalar;
     }
 };
 template <typename M>
