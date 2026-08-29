@@ -334,7 +334,6 @@ class GELU(Module):
     Examples::
 
         >>> m = nn.GELU()
-        >>> input = torch.randn(2)
         >>> output = m(input)
     """
 
@@ -360,7 +359,6 @@ class GELU(Module):
 class ReLU6(Module):
     r"""Applies the element-wise function ``ReLU6(x) = min(max(0, x), 6)``.
 
-    Mirrors torch.nn.ReLU6; the kernel is the ATen hardtanh(0, 6) port.
     """
 
     def __init__(self, inplace: bool = False) -> None:
@@ -377,7 +375,6 @@ class ReLU6(Module):
 class Hardswish(Module):
     r"""Applies hardswish, element-wise: ``x * ReLU6(x + 3) / 6``.
 
-    Mirrors torch.nn.Hardswish (ATen Activation.cpp hardswish_kernel).
     """
 
     def __init__(self, inplace: bool = False) -> None:
@@ -394,7 +391,6 @@ class Hardswish(Module):
 class Hardsigmoid(Module):
     r"""Applies hardsigmoid, element-wise: ``ReLU6(x + 3) / 6``.
 
-    Mirrors torch.nn.Hardsigmoid (ATen Activation.cpp hardsigmoid_kernel).
     """
 
     def __init__(self, inplace: bool = False) -> None:
@@ -411,7 +407,6 @@ class Hardsigmoid(Module):
 class LeakyReLU(Module):
     r"""Applies leaky_relu: ``max(0, x) + negative_slope * min(0, x)``.
 
-    Mirrors torch.nn.LeakyReLU.
     """
 
     __constants__ = ["negative_slope", "inplace"]
@@ -431,7 +426,6 @@ class LeakyReLU(Module):
 class ELU(Module):
     r"""Applies elu: ``max(0, x) + min(0, alpha * (exp(x) - 1))``.
 
-    Mirrors torch.nn.ELU.
     """
 
     __constants__ = ["alpha", "inplace"]
@@ -451,7 +445,6 @@ class ELU(Module):
 class Mish(Module):
     r"""Applies mish: ``x * tanh(softplus(x))``.
 
-    Mirrors torch.nn.Mish (ATen ActivationMishKernel).
     """
 
     def __init__(self, inplace: bool = False) -> None:
@@ -466,7 +459,6 @@ class Mish(Module):
 
 
 class SELU(Module):
-    r"""Applies selu with ATen's fixed lambda/alpha constants."""
 
     def __init__(self, inplace: bool = False) -> None:
         super().__init__()
@@ -514,7 +506,6 @@ class Softplus(Module):
 
 
 class Softmax(Module):
-    r"""Softmax over ``dim``, mirroring torch.nn.Softmax."""
 
     __constants__ = ["dim"]
 
@@ -530,7 +521,6 @@ class Softmax(Module):
 
 
 class LogSoftmax(Module):
-    r"""Log-softmax over ``dim``, mirroring torch.nn.LogSoftmax."""
 
     __constants__ = ["dim"]
 

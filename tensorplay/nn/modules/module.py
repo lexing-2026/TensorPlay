@@ -965,7 +965,6 @@ class Module:
             if param_applied is param:
                 continue
 
-            # torch parity (Module._apply): swap ``param.data`` so the SAME
             # leaf Parameter object is preserved. Wrapping the applied tensor
             # in a new Parameter would carry ``param_applied``'s grad_fn
             # (``.to()`` is differentiable), turning the parameter non-leaf
@@ -2923,7 +2922,6 @@ class Module:
 
         See :func:`tensorplay.compile` for details on the arguments for this function.
         """
-        # Match torch.nn.Module.compile(): the public compiler frontend owns
         # capture and backend selection. Passing the module itself lets the
         # frontend see its forward signature and registered submodules.
         self._compiled_call_impl = tensorplay.compile(self, *args, **kwargs)

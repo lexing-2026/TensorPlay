@@ -107,7 +107,6 @@ class _ConvNd(Module):
         if self.transposed and self.padding_mode != 'zeros':
             raise ValueError('Only "zeros" padding mode is supported for ConvTranspose')
         if self.padding_mode != 'zeros':
-            # torch's _conv_forward: pad the input with the requested mode and
             # run the convolution itself unpadded.  The asymmetric-'same'
             # branch above may already have built the reversed padding list.
             if self._reversed_padding_repeated_twice is None:
@@ -323,7 +322,7 @@ class ConvTranspose3d(_ConvNd):
 
 
 class _LazyConvXdMixin(LazyModuleMixin):
-    r"""Lazily-initialized conv mixin (torch nn.LazyConv*): parameters are
+    r"""
     created on the first forward pass from the input's channel dimension.
     """
     cls_to_become = None

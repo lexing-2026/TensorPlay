@@ -1,8 +1,6 @@
 r"""Utilities for packed (variable-length) sequences.
 
-Port of ``torch/nn/utils/rnn.py`` and the ``_pack_padded_sequence`` /
-``_pad_packed_sequence`` / ``pad_sequence`` kernels from
-``aten/src/ATen/native/PackedSequence.cpp``.
+``_pad_packed_sequence`` and ``pad_sequence`` helpers for sequence packing.
 """
 
 from typing import Any, Callable, NamedTuple, Optional, TypeVar
@@ -177,7 +175,6 @@ class PackedSequence(PackedSequence_):
         return self.data.is_pinned()
 
 
-# TorchScript doesn't support constructors on named tuples, so we use this helper
 # method to construct PackedSequence
 def _packed_sequence_init_args(
     data,
@@ -200,7 +197,6 @@ def _packed_sequence_init_args(
                 "Instances of PackedSequence should never be created manually. "
                 "They should be instantiated by functions like pack_sequence "
                 "and pack_padded_sequences in nn.utils.rnn. "
-                "https://pytorch.org/docs/stable/nn.html#torch.nn.utils.rnn.pack_sequence"
             )
         return data, batch_sizes, sorted_indices, unsorted_indices
 
@@ -242,8 +238,6 @@ def invert_permutation(permutation: Optional[Tensor]) -> Optional[Tensor]:
 
 
 def _pack_padded_sequence(input: Tensor, lengths: Tensor, batch_first: bool):
-    # Port of at::_pack_padded_sequence
-    # (aten/src/ATen/native/PackedSequence.cpp:34-110).
     if input.numel() <= 0:
         raise RuntimeError("Cannot pack empty tensors.")
     input = input.transpose(0, 1) if batch_first else input
@@ -325,8 +319,6 @@ def _pad_packed_sequence(
     padding_value: float,
     total_length: int,
 ):
-    # Port of at::_pad_packed_sequence
-    # (aten/src/ATen/native/PackedSequence.cpp:142-204).  Values are read via
     # tolist(), so no contiguity normalization of batch_sizes is needed.
     if batch_sizes.dim() != 1 or batch_sizes.device.type != "cpu" or batch_sizes.dtype != tp.int64:
         raise RuntimeError(

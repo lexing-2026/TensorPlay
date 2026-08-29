@@ -1,4 +1,3 @@
-# Ported from torch/nn/modules/adaptive.py, adapted to tensorplay primitives
 # (no gather/index_copy_/index_fill_: per-row column picks go through
 # embedding-on-flattened, cluster contributions are masked instead of scattered).
 

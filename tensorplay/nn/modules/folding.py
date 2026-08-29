@@ -8,7 +8,6 @@ __all__ = ['Fold', 'Unfold']
 
 class Fold(Module):
     r"""Combines an array of sliding local blocks into a large containing
-    tensor (torch ``torch.nn.Fold``).
 
     Examples::
 
@@ -38,7 +37,6 @@ class Fold(Module):
 
 class Unfold(Module):
     r"""Extracts sliding local blocks from a batched input tensor
-    (torch ``torch.nn.Unfold``).
 
     Examples::
 

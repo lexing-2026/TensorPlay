@@ -39,10 +39,8 @@ class PixelShuffle(Module):
     Examples::
 
         >>> pixel_shuffle = nn.PixelShuffle(3)
-        >>> input = torch.randn(1, 9, 4, 4)
         >>> output = pixel_shuffle(input)
         >>> print(output.size())
-        torch.Size([1, 1, 12, 12])
 
     .. _Real-Time Single Image and Video Super-Resolution Using an Efficient Sub-Pixel Convolutional Neural Network:
         https://arxiv.org/abs/1609.05158
@@ -71,7 +69,6 @@ class PixelShuffle(Module):
 class PixelUnshuffle(Module):
     r"""Reverse the PixelShuffle operation.
 
-    Reverses the :class:`~torch.nn.PixelShuffle` operation by rearranging elements
     in a tensor of shape :math:`(*, C, H \times r, W \times r)` to a tensor of shape
     :math:`(*, C \times r^2, H, W)`, where r is a downscale factor.
 
@@ -98,10 +95,8 @@ class PixelUnshuffle(Module):
     Examples::
 
         >>> pixel_unshuffle = nn.PixelUnshuffle(3)
-        >>> input = torch.randn(1, 1, 12, 12)
         >>> output = pixel_unshuffle(input)
         >>> print(output.size())
-        torch.Size([1, 9, 4, 4])
 
     .. _Real-Time Single Image and Video Super-Resolution Using an Efficient Sub-Pixel Convolutional Neural Network:
         https://arxiv.org/abs/1609.05158
