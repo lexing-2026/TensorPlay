@@ -2,7 +2,6 @@
 
 Exposes real quantize/dequantize kernels (per-tensor and per-channel),
 post-training calibration observers, FakeQuantize with a straight-through
-estimator, and Quant/DeQuant stubs — the essentials of ``torch.ao.quantization``.
 """
 
 from tensorplay._C import (
