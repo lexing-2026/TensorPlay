@@ -45,7 +45,6 @@ template <typename T>
 void quantize_kernel(const T* input, int8_t* output, int64_t numel,
                      double scale, int64_t zero_point, int64_t quant_min,
                      int64_t quant_max) {
-    // nearbyint matches ATen's round-to-even quantization semantics.
     for (int64_t i = 0; i < numel; ++i) {
         const double rounded =
             std::nearbyint(static_cast<double>(input[i]) / scale) +

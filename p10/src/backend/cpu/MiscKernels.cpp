@@ -1,15 +1,8 @@
 // Misc kernels: meshgrid / roll / diff / masked_fill / one_hot / glu.
 //
-// Each function is a faithful port of the corresponding ATen composite:
-//   third_party/pytorch/aten/src/ATen/native/TensorShape.cpp  meshgrid()
-//   third_party/pytorch/aten/src/ATen/native/TensorTransformations.cpp
 //     roll() (single-dim narrow+cat) and TensorTransformations.h roll_common()
-//   third_party/pytorch/aten/src/ATen/native/ReduceOps.cpp
 //     diff() / diff_helper()
-//   third_party/pytorch/aten/src/ATen/native/Onehot.cpp        one_hot()
-//   third_party/pytorch/aten/src/ATen/native/GatedLinearUnit.cpp glu()
 //     and cpu/Activation.cpp glu_kernel (first * sigmoid(second))
-// ATen's ``narrow(dim, start, length)`` is expressed with the dispatched
 #// Tensor::slice(dim, start, start + length), which has identical semantics.
 
 #include "Tensor.h"
@@ -89,16 +82,12 @@ inline int64_t wrap_dim_local(int64_t dim, int64_t ndim) {
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
-// meshgrid — ATen native/TensorShape.cpp meshgrid(tensors, indexing)
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
-// roll — ATen native/TensorTransformations.cpp roll() + roll_common()
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
-// diff — ATen native/ReduceOps.cpp diff()/diff_helper()
 // ---------------------------------------------------------------------------
 static Tensor diff_helper(const Tensor& self, int64_t n, int64_t dim) {
-    // ATen diff_helper: repeated narrow(dim,1,out_len) - narrow(dim,0,out_len)
     Tensor result = self;
     n = n > self.size(dim) ? self.size(dim) : n;
     for (int64_t i = 0; i < n; ++i) {
@@ -110,7 +99,6 @@ static Tensor diff_helper(const Tensor& self, int64_t n, int64_t dim) {
 
 Tensor diff_cpu(const Tensor& self, int64_t n, int64_t dim, const std::optional<Tensor>& prepend_opt, const std::optional<Tensor>& append_opt) {
     const int64_t d = wrap_dim_local(dim, self.dim());
-    // ATen diff(): concatenate prepend/append first when present.
     const Tensor prepend = prepend_opt.value_or(Tensor());
     const Tensor append = append_opt.value_or(Tensor());
     const bool has_prepend = prepend.defined();
@@ -127,12 +115,9 @@ Tensor diff_cpu(const Tensor& self, int64_t n, int64_t dim, const std::optional<
 }
 
 // ---------------------------------------------------------------------------
-// masked_fill — ATen broadcasts mask against self and selects; expressed here
 // through the dispatched where op (same semantics, see
-// aten/src/ATen/native/TensorAdvancedIndexing.cpp masked_fill_impl).
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
-// one_hot — ATen native/Onehot.cpp one_hot(): CPU path validates class values
 // then scatters ones; the eq-vs-arange formulation from the same file
 // (the "functional version" branch) produces the identical result without
 // requiring a scatter dispatch.
@@ -175,7 +160,6 @@ Tensor one_hot_cpu(const Tensor& self, int64_t num_classes) {
 }
 
 // ---------------------------------------------------------------------------
-// glu — ATen native/GatedLinearUnit.cpp + cpu/Activation.cpp glu_kernel:
 //   out = first_half * sigmoid(second_half)
 // ---------------------------------------------------------------------------
 Tensor glu_cpu(const Tensor& self, int64_t dim) {
@@ -241,7 +225,6 @@ TENSORPLAY_LIBRARY_IMPL(CPU, MiscKernels) {
 
 // resize_ grows the storage in place (preserving the old contents) and then
 // adopts contiguous strides; shrinking only changes the logical shape, like
-// ATen. The metadata half is TensorImpl::set_sizes_contiguous.
 Tensor& resize__cpu(Tensor& self, const std::vector<int64_t>& size) {
     auto* impl = self.unsafeGetTensorImpl().get();
     int64_t new_numel = 1;
@@ -259,7 +242,6 @@ Tensor& resize__cpu(Tensor& self, const std::vector<int64_t>& size) {
         }
     } else if (new_bytes > impl->storage().nbytes()) {
         // Throws when the storage wraps foreign memory (resizable=false),
-        // mirroring torch's resize error surface for such storages.
         Storage storage = impl->storage();
         storage.set_nbytes(new_bytes);
     }
@@ -341,13 +323,11 @@ std::tuple<Tensor, Tensor> native_dropout_cpu(const Tensor& input, double p) {
     return {std::move(out), std::move(mask)};
 }
 
-// ATen Dropout.cpp native_dropout_backward: grad * mask * scale.
 Tensor native_dropout_backward_cpu(const Tensor& grad_output, const Tensor& mask, double scale) {
     return grad_output * mask.to(grad_output.dtype()) * scale;
 }
 
 // ---------------------------------------------------------------------------
-// Alpha / feature dropout — ATen _dropout_impl<feature, alpha> fused as
 // (output, mask) pairs so the backward can reapply the saved mask. The
 // Bernoulli noise reuses the registered bernoulli_ kernel; the affine math
 // is expressed through dispatched mul/add so both backends share one path.
@@ -414,7 +394,6 @@ Tensor feature_dropout_backward_cpu(const Tensor& grad, const Tensor& mask,
 
 
 // ---------------------------------------------------------------------------
-// Trapezoid integration — ATen native Sum.cpp trapezoid/cumulative_trapezoid
 // expressed as dispatcher composites (narrow/add/mul/sum|cumsum). x=None
 // selects uniform spacing dx. Backward rebuilds the per-element weights:
 //   sum form:   w = dx * [0.5, 1, ..., 1, 0.5]
@@ -569,14 +548,12 @@ Tensor cumulative_trapezoid_backward_cpu(const Tensor& grad, const std::optional
 }
 
 // ---------------------------------------------------------------------------
-// cov / corrcoef — ATen native/Correlation.cpp verbatim port. Each row is a
 // variable, each column an observation; fweights are frequencies (integral),
 // aweights reliability weights (floating). Arithmetic stays in the input
 // dtype exactly like upstream (no upcast). The 1-observation single-weight
 // corner zeroes `in` through its aliasing view precisely as upstream does.
 // Backwards are explicit helpers (_cov_backward / _corrcoef_backward) since
 // tp has no composite-implicit-autograd; formulas derived from the closed
-// form and validated against torch's composite autograd numerically.
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -591,7 +568,6 @@ struct CovParts {
     bool had_aw;
 };
 
-// at::is_scalar_tensor_true for 0-dim tensors.
 bool cov_scalar_true(const Tensor& t) {
     if (t.dtype() == DType::Bool) return t.item().to<bool>();
     if (isIntegralType(t.dtype(), /*includeBool=*/false)) {
@@ -822,11 +798,9 @@ Tensor corrcoef_backward_cpu(const Tensor& grad, const Tensor& self) {
 
 
 // ---------------------------------------------------------------------------
-// quantile / nanquantile — ATen native/Sorting.cpp quantile_impl expressed as
 // a dispatcher composite over sort/gather/lerp (upstream's CPU nth_element
 // fast path is a pure optimization; the sort path is semantically identical,
 // NaN sorts last to match the rank masking below).  One body serves both
-// dense backends, like ATen's device-generic native function.  Upstream has
 // no derivatives.yaml entry: quantile is non-differentiable.
 // ---------------------------------------------------------------------------
 namespace {
@@ -969,7 +943,6 @@ Tensor quantile_compute(const Tensor& self, const Tensor& q,
     if (interpolate) {
         if (interpolation == QuantileInterp::Midpoint) {
             // Weight 0.5 in the *value* dtype, like upstream's
-            // at::full_like(ranks, 0.5, self.options()).
             weights = Tensor::full_like(ranks, 0.5, self.dtype());
         } else {
             weights = ranks.sub(ranks_below).to(self.dtype());
@@ -1003,7 +976,6 @@ Tensor quantile_kernel(const Tensor& self, const Tensor& q,
     quantile_checks(self, q);
     const QuantileInterp mode = get_quantile_interpolation_mode(interpolation);
     int64_t wrapped_dim = dim.has_value() ? dim.value() : 0;
-    // at::maybe_wrap_dim(dim.value_or(0), ndim) with wrap_scalar=true: a
     // 0-dim tensor wraps against a virtual 1-D range.
     const int64_t ndim = self.dim() == 0 ? 1 : self.dim();
     if (wrapped_dim < 0) wrapped_dim += ndim;
@@ -1034,7 +1006,6 @@ Tensor nanquantile_kernel(const Tensor& self, const Tensor& q,
 }
 
 // ---------------------------------------------------------------------------
-// histogram — ATen native/Histogram.cpp + cpu/HistogramKernel.cpp.  The 1-D
 // entry points reshape to (M, 1) and reuse the histogramdd machinery; the
 // outer edges come from `range` or aminmax (NaN propagates, all-NaN input
 // raises), with the empty-range ±0.5 expansion.  Per-element bin mapping
@@ -1050,7 +1021,7 @@ namespace {
 void histogram_check_weight(const Tensor& self, const std::optional<Tensor>& weight) {
     if (weight && weight->dtype() != self.dtype()) {
         TP_THROW(ValueError,
-                 "torch.histogramdd: if weight tensor is provided, input "
+                 "histogramdd: if weight tensor is provided, input "
                  "tensor and weight tensor should have the same dtype");
     }
 }
@@ -1062,7 +1033,7 @@ std::pair<double, double> histogram_outer_edges_1d(
     if (range) {
         if (range->size() != 2) {
             TP_THROW(ValueError,
-                     "torch.histogramdd: for a 1-dimensional histogram range "
+                     "histogramdd: for a 1-dimensional histogram range "
                      "should have 2 elements, but got ", range->size());
         }
         leftmost = (*range)[0];
@@ -1073,12 +1044,12 @@ std::pair<double, double> histogram_outer_edges_1d(
         rightmost = std::get<1>(mm).item<double>();
     }
     if (!std::isfinite(leftmost) || !std::isfinite(rightmost)) {
-        TP_THROW(ValueError, "torch.histogramdd: dimension 0's range [",
+        TP_THROW(ValueError, "histogramdd: dimension 0's range [",
                  leftmost, ", ", rightmost, "] is not finite");
     }
     if (leftmost > rightmost) {
         TP_THROW(ValueError,
-                 "torch.histogramdd: min should not exceed max, but got min ",
+                 "histogramdd: min should not exceed max, but got min ",
                  leftmost, " max ", rightmost);
     }
     // Expand an empty range like numpy to avoid a zero bin width.
@@ -1093,16 +1064,14 @@ Tensor histogram_bin_counts(const Tensor& self, const Tensor& edges,
                             const std::optional<Tensor>& weight, bool density) {
     const int64_t nb = edges.numel() - 1;
     if (nb < 1) {
-        TP_THROW(ValueError, "torch.histogram(): bins must be > 0, but got ",
+        TP_THROW(ValueError, "histogram(): bins must be > 0, but got ",
                  nb, " for dimension 0");
     }
     Tensor hist = Tensor::zeros({nb}, self.dtype(), self.device());
-    // Empty input: every bin stays zero (numpy/torch parity).  Skip the
     // searchsorted/index_add path entirely -- besides having nothing to
     // count, zero-element tensors may carry no storage, and broadcasting a
     // size-0 dim against the size-1 edge slices would otherwise drive the
     // elementwise kernels over unallocated memory.  density still applies
-    // below, so an empty density histogram is all-NaN exactly like torch.
     if (self.numel() > 0) {
         Tensor v = self.reshape({self.numel()});
         // In-range compares against the edge tensor in the input dtype (NaN
@@ -1135,13 +1104,13 @@ std::tuple<Tensor, Tensor> histogram_bins_tensor_kernel(
         const std::optional<Tensor>& weight, bool density) {
     if (bins.dim() != 1) {
         TP_THROW(ValueError,
-                 "torch.histogramdd: bins tensor should have one dimension, "
+                 "histogramdd: bins tensor should have one dimension, "
                  "but got ", bins.dim(), " dimensions in the bins tensor for "
                  "dimension 0");
     }
     if (bins.dtype() != self.dtype()) {
         TP_THROW(ValueError,
-                 "torch.histogramdd: input tensor and bins tensors should "
+                 "histogramdd: input tensor and bins tensors should "
                  "have the same dtype, but got input with dtype ",
                  toString(self.dtype()), " and bins with dtype ",
                  toString(bins.dtype()));
@@ -1158,7 +1127,7 @@ std::tuple<Tensor, Tensor> histogram_bin_ct_kernel(
         const std::optional<std::vector<double>>& range,
         const std::optional<Tensor>& weight, bool density) {
     if (bins < 1) {
-        TP_THROW(ValueError, "torch.histogram(): bins must be > 0, but got ",
+        TP_THROW(ValueError, "histogram(): bins must be > 0, but got ",
                  bins, " for dimension 0");
     }
     histogram_check_weight(self, weight);

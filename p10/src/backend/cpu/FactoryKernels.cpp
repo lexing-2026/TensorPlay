@@ -2,6 +2,7 @@
 #include "Dispatcher.h"
 #include "Generator.h"
 #include "DistributionsHelper.h"
+#include "DistributionDispatch.h"
 #include "Scalar.h"
 #include "Exception.h"
 #include "Context.h"
@@ -58,7 +59,6 @@ Tensor rand_kernel(const std::vector<int64_t>& size, DType dtype, Device device)
         }
         case DType::Float16:
         case DType::BFloat16: {
-            // torch parity (aten/src/ATen/native/cpu/DistributionTemplates.h:
             // uniform_kernel_cpu): Half/BFloat16 sample in opmath_t (float,
             // 24-bit mantissa mask) and cast to the storage dtype, clamping a
             // cast that rounded up to the upper bound back to 'from'.
@@ -114,7 +114,6 @@ Tensor rand_kernel(const std::vector<int64_t>& size, DType dtype, Device device)
 }
 
 namespace {
-// torch parity: complex randn draws both components from N(0, 1/sqrt(2)) so
 // E|z|^2 == 1; complex rand draws components uniform on [0, 1).
 constexpr double kComplexComponentStd = 0.7071067811865476;  // 1/sqrt(2)
 }  // namespace
@@ -202,7 +201,6 @@ Tensor arange_start_step_kernel(Scalar start, Scalar end, Scalar step, DType dty
     
     Tensor t({len}, dtype, device);
 
-    // Torch parity: upstream dispatches arange over
     // AT_DISPATCH_ALL_TYPES_AND2(Half, BFloat16) -- Bool, UInt16/32/64 and
     // complex are not implemented.  The sub-32-bit types supported below
     // were previously left uninitialized.
@@ -373,7 +371,6 @@ Tensor randn_kernel(const std::vector<int64_t>& size, DType dtype, Device device
         }
         case DType::Float16:
         case DType::BFloat16: {
-            // torch parity (aten/src/ATen/native/cpu/DistributionTemplates.h:
             // normal_fill<scalar_t>): Half/BFloat16 draw uniforms in opmath
             // (float, 24-bit mantissa) through a 16-element stack buffer,
             // Box-Muller in float, then cast down to the storage dtype.
@@ -401,7 +398,6 @@ Tensor randn_kernel(const std::vector<int64_t>& size, DType dtype, Device device
         }
         case DType::ComplexFloat:
         case DType::ComplexDouble: {
-            // ATen DistributionTemplates.h normal_impl_ parity: complex
             // normal samples view_as_real(self) with std/sqrt(2); with the
             // standard-normal factory that is N(0, 1/sqrt(2)) per component.
             const double comp_std = kComplexComponentStd;
@@ -430,46 +426,32 @@ Tensor randn_kernel(const std::vector<int64_t>& size, DType dtype, Device device
 }
 
 Tensor randint_kernel(int64_t low, int64_t high, const std::vector<int64_t>& size, DType dtype, Device device) {
+    TP_THROW_IF(high <= low, RuntimeError,
+                "randint expects 'from' to be less than 'to', but got from=",
+                low, " >= to=", high);
+
     Tensor t(size, dtype, device);
-    int64_t n = t.numel();
     auto& gen = default_generator();
     const uint64_t range = static_cast<uint64_t>(high - low);
     const int64_t base = low;
 
-    if (dtype == DType::Int64) {
-        int64_t* data = t.data_ptr<int64_t>();
-        uniform_int_from_to_distribution<int64_t> dist(range, base);
+    distribution::check_random_from_to_bounds(low, high, dtype);
+
+    int64_t n = t.numel();
+    distribution::dispatch_dtype(dtype, [&](auto tag) {
+        using scalar_t = decltype(tag);
+        scalar_t* data = t.data_ptr<scalar_t>();
+        uniform_int_from_to_distribution<scalar_t> dist(range, base);
         for (int64_t i = 0; i < n; ++i) {
             data[i] = dist(&gen);
         }
-    } else if (dtype == DType::Int32) {
-        int32_t* data = t.data_ptr<int32_t>();
-        uniform_int_from_to_distribution<int32_t> dist(range, base);
-        for (int64_t i = 0; i < n; ++i) {
-            data[i] = dist(&gen);
-        }
-    } else if (dtype == DType::Float32) {
-        float* data = t.data_ptr<float>();
-        uniform_int_from_to_distribution<float> dist(range, base);
-        for (int64_t i = 0; i < n; ++i) {
-            data[i] = dist(&gen);
-        }
-    } else if (dtype == DType::Float64) {
-        double* data = t.data_ptr<double>();
-        uniform_int_from_to_distribution<double> dist(range, base);
-        for (int64_t i = 0; i < n; ++i) {
-            data[i] = dist(&gen);
-        }
-    } else {
-         TP_THROW(NotImplementedError, "randint() only supports Int64/Int32/Float32/Float64");
-    }
+    });
     return t;
 }
 
 Tensor randperm_kernel(int64_t n, DType dtype, Device device) {
     Tensor t({n}, dtype, device);
     if (dtype == DType::Int64 || dtype == DType::Int32) {
-        // Fisher-Yates with the same draw pattern as torch's randperm_cpu:
         // one 32-bit draw modulo the remaining tail per position.
         auto& gen = default_generator();
         if (dtype == DType::Int64) {
@@ -548,7 +530,6 @@ Tensor& zero_kernel(Tensor& self) {
 // The dispatcher invokes kernels with schema-level argument types
 // (std::optional<DType> / std::optional<Device>), while the raw kernels above
 // keep concrete parameters for internal reuse.  These thin wrappers bridge the
-// two and resolve schema-level None the way torch factories do.
 namespace {
 
 Device resolve_factory_device(const std::optional<Device>& device) {

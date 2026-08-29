@@ -1,6 +1,5 @@
 // multi_margin_loss / multilabel_margin_loss CPU kernels.
 //
-// Port of aten/src/ATen/native/LossMultiMargin.cpp and
 // LossMultiLabelMargin.cpp (shape checks from LossMulti.h):
 //
 // * multi_margin_loss: 0-D/1-D/2-D input with class-index target; per-row
@@ -11,9 +10,7 @@
 // * multilabel_margin_loss_forward: rows of target list class indices
 //   terminated by -1; emits the loss plus the is_target mask (input dtype,
 //   target shape) consumed by the backward.  multilabel_margin_loss is the
-//   ATen composite get<0>(forward).
 //
-// Backwards mirror the ATen formulas: multi_margin scales by
 // 1/(nframe*dim) for mean else 1/dim and then multiplies by grad_output
 // (scalar or per-row); multilabel accumulates +-g for every active
 // (target, non-target) pair with positive margin.
@@ -60,7 +57,6 @@ Tensor as_long_contiguous(const Tensor& target) {
     return t;
 }
 
-// ATen LossMulti.h multi_margin_loss_shape_check.
 void multi_margin_shape_check(int64_t& nframe, int64_t& dim, const Tensor& input,
                               const Tensor& target, const std::optional<Tensor>& weight) {
     const int64_t ndims = input.dim();
@@ -84,7 +80,6 @@ void multi_margin_shape_check(int64_t& nframe, int64_t& dim, const Tensor& input
     }
 }
 
-// ATen LossMulti.h multilabel_margin_loss_shape_check.
 void multilabel_shape_check(int64_t& nframe, int64_t& dim, const Tensor& input,
                             const Tensor& target) {
     const int64_t ndims = input.dim();

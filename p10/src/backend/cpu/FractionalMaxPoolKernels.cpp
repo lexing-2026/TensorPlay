@@ -1,6 +1,5 @@
 // fractional_max_pool2d / fractional_max_pool3d CPU kernels.
 //
-// Port of aten/src/ATen/native/FractionalMaxPool2d.cpp / FractionalMaxPool3d.cpp
 // (shared interval logic from FractionalMaxPooling.h): pooling window starts
 // follow generate_intervals(sample, ...) driven by the caller-provided
 // random_samples tensor, so the kernel itself is RNG-free and deterministic.
@@ -23,7 +22,6 @@ using namespace tensorplay::parallel;
 
 namespace {
 
-// ATen FractionalMaxPooling.h generate_intervals.
 template <typename compute_t>
 static std::vector<int64_t> generate_intervals(compute_t sample, int64_t inputSize,
                                                int64_t outputSize, int64_t poolSize) {
@@ -70,7 +68,6 @@ static void fractional_max_pool2d_single_batch(
                         for (int64_t w2 = inputWStart; w2 < inputWStart + poolSizeW; ++w2) {
                             const int64_t planeIndex = h2 * inputW + w2;
                             const compute_t val = static_cast<compute_t>(inputForPlane[planeIndex]);
-                            // ATen: favor the first max; NaNs propagate forward.
                             if (val > maxVal || std::isnan(val)) {
                                 maxVal = val;
                                 maxIndex = planeIndex;
@@ -182,7 +179,6 @@ static void fractional_max_pool3d_single_batch(
     parallel_for(0, numPlanes, 1, [&](int64_t begin, int64_t end) {
         for (int64_t plane = begin; plane < end; ++plane) {
             const storage_t* samplesForPlane = randomSamples + plane * 3;
-            // ATen FractionalMaxPool3d: sample order is (T, H, W).
             auto sequenceT = generate_intervals<compute_t>(
                 static_cast<compute_t>(samplesForPlane[0]), inputT, outputT, poolSizeT);
             auto sequenceH = generate_intervals<compute_t>(
@@ -389,7 +385,6 @@ std::tuple<Tensor, Tensor> fractional_max_pool3d_cpu(
     const int64_t inputT = self.size(self.dim() - 3);
     const int64_t inputH = self.size(self.dim() - 2);
     const int64_t inputW = self.size(self.dim() - 1);
-    // ATen FractionalMaxPool3d.cpp:74-82 requires output + pool - 1 < input
     // (strict, unlike the 2D variant which allows equality).
     if (output_size[0] + kernel_size[0] - 1 >= inputT ||
         output_size[1] + kernel_size[1] - 1 >= inputH ||

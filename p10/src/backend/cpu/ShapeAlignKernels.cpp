@@ -1,15 +1,9 @@
-// Shape & view alignment kernels (torch native-parity batch).
 //
-// Schemas live in config/native_functions.yaml; composites mirror the ATen
 // implementations op-for-op:
-//   aten/src/ATen/native/TensorShape.cpp   expand/repeat/tile/hstack/vstack/
 //     dstack/row_stack/column_stack/tensor_split/flatten/unflatten/ravel/
 //     moveaxis/swapaxes/swapdims/broadcast_to
-//   aten/src/ATen/native/TensorTransformations.cpp  atleast_*
-//   aten/src/ATen/native/Fill.cpp          fill()
 // Every composite invokes its primitives through the generated Tensor members,
 // so each inner call routes through the Dispatcher (device + autograd keys)
-// exactly like an at:: call inside an ATen composite.  Only repeat() carries
 // real device code (single-pass index-math gather, the same materialization
 // upstream achieves via unfold + copy_); its CUDA twin lives in
 // cuda/ShapeAlignKernels.cu.
@@ -74,8 +68,6 @@ std::vector<Tensor> atleast_n_seq(const std::vector<Tensor>& tensors, int n) {
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
-// expand family -- ATen: broadcast_to == self.expand(size); expand_as expands
-// to other.sizes().  -1 in `size` infers the existing dimension (torch
 // ExpandUtils semantics); -1 in a leading, non-existing dimension errors.
 // The stride computation used to live on the handwritten Tensor::expand
 // member; it moved here when expand became a dispatcher op.
@@ -83,27 +75,25 @@ std::vector<Tensor> atleast_n_seq(const std::vector<Tensor>& tensors, int n) {
 
 namespace {
 
-// torch legacy type name used in expand()'s size-mismatch message
-// ("expand(torch.FloatTensor{[2, 3]}, size=[3]): ...").
-const char* torch_legacy_type_name(DType dt) {
+const char* legacy_type_name(DType dt) {
     switch (dt) {
-        case DType::Float32: return "torch.FloatTensor";
-        case DType::Float64: return "torch.DoubleTensor";
-        case DType::Float16: return "torch.HalfTensor";
-        case DType::BFloat16: return "torch.BFloat16Tensor";
-        case DType::Int64: return "torch.LongTensor";
-        case DType::Int32: return "torch.IntTensor";
-        case DType::Int16: return "torch.ShortTensor";
-        case DType::Int8: return "torch.CharTensor";
-        case DType::UInt8: return "torch.ByteTensor";
-        case DType::UInt16: return "torch.UInt16Tensor";
-        case DType::UInt32: return "torch.UInt32Tensor";
-        case DType::UInt64: return "torch.UInt64Tensor";
-        case DType::Bool: return "torch.BoolTensor";
-        case DType::ComplexFloat: return "torch.ComplexFloatTensor";
-        case DType::ComplexDouble: return "torch.ComplexDoubleTensor";
-        case DType::ComplexHalf: return "torch.ComplexHalfTensor";
-        default: return "torch.Tensor";
+        case DType::Float32: return "FloatTensor";
+        case DType::Float64: return "DoubleTensor";
+        case DType::Float16: return "HalfTensor";
+        case DType::BFloat16: return "BFloat16Tensor";
+        case DType::Int64: return "LongTensor";
+        case DType::Int32: return "IntTensor";
+        case DType::Int16: return "ShortTensor";
+        case DType::Int8: return "CharTensor";
+        case DType::UInt8: return "ByteTensor";
+        case DType::UInt16: return "UInt16Tensor";
+        case DType::UInt32: return "UInt32Tensor";
+        case DType::UInt64: return "UInt64Tensor";
+        case DType::Bool: return "BoolTensor";
+        case DType::ComplexFloat: return "ComplexFloatTensor";
+        case DType::ComplexDouble: return "ComplexDoubleTensor";
+        case DType::ComplexHalf: return "ComplexHalfTensor";
+        default: return "Tensor";
     }
 }
 
@@ -124,7 +114,7 @@ Tensor expand_impl(const Tensor& self, const std::vector<int64_t>& size) {
     const int64_t new_ndim = static_cast<int64_t>(size.size());
 
     if (new_ndim < ndim) {
-        TP_THROW(RuntimeError, "expand(", torch_legacy_type_name(self.dtype()),
+        TP_THROW(RuntimeError, "expand(", legacy_type_name(self.dtype()),
                  "{", fmt_dim_list(static_cast<std::vector<int64_t>>(self.shape())),
                  "}, size=", fmt_dim_list(size),
                  "): the number of sizes provided (", new_ndim,
@@ -189,7 +179,6 @@ Tensor tpsa_broadcast_to(const Tensor& self, const std::vector<int64_t>& size) {
 }
 
 // ---------------------------------------------------------------------------
-// repeat / tile -- ATen TensorShape.cpp repeat(): repeats.len >= self.dim(),
 // leading unit dims pad the source, zero repeat yields an empty target.
 // The copy itself is a single-pass gather (see repeat_cpu below / .cu twin);
 // tile() prepends ones to short reps and otherwise defers to repeat.
@@ -219,7 +208,6 @@ void check_repeat_args(const Tensor& self, const std::vector<int64_t>& repeats,
         target[i] = padded[i] * repeats[i];
     }
     // Negative repeats surface through the output allocation exactly like
-    // upstream (at::empty -> check_size_nonnegative, EmptyTensor.h).
     for (const int64_t x : target) {
         if (x < 0) {
             std::string sizes = "[";
@@ -249,7 +237,6 @@ Tensor tpsa_tile(const Tensor& self, const std::vector<int64_t>& dims) {
 }
 
 // ---------------------------------------------------------------------------
-// stacking family -- ATen TensorShape.cpp hstack/vstack/dstack/row_stack/
 // column_stack: promote inputs with atleast_Nd, then cat along the axis.
 // ---------------------------------------------------------------------------
 
@@ -288,7 +275,6 @@ Tensor& tpsa_dstack_out(const std::vector<Tensor>& tensors, Tensor& out) {
 }
 
 Tensor tpsa_row_stack(const std::vector<Tensor>& tensors) {
-    // torch.row_stack is a documented alias of torch.vstack.
     return tpsa_vstack(tensors);
 }
 
@@ -318,7 +304,6 @@ Tensor& tpsa_column_stack_out(const std::vector<Tensor>& tensors, Tensor& out) {
 }
 
 // ---------------------------------------------------------------------------
-// tensor_split & friends -- ATen TensorShape.cpp tensor_split_sections /
 // _tensor_split_indices; hsplit/vsplit/dsplit are fixed-dim aliases.
 // ---------------------------------------------------------------------------
 
@@ -392,20 +377,19 @@ std::vector<Tensor> tpsa_tensor_split_tensor(const Tensor& self,
     return tensor_split_indices_impl(self, indices, wrap_dim(dim, self.dim()));
 }
 
-// hsplit/vsplit/dsplit -- ATen TensorShape.cpp: dimension floor checks,
 // hsplit falls back to dim 0 for 1-D inputs, and the sections variants
 // demand divisibility along the split dimension.
 
 std::vector<Tensor> tpsa_hsplit_int(const Tensor& self, int64_t sections) {
     if (self.dim() < 1) {
         TP_THROW(RuntimeError,
-                 "torch.hsplit requires a tensor with at least 1 dimension, but got a tensor with ",
+                 "hsplit requires a tensor with at least 1 dimension, but got a tensor with ",
                  self.dim(), " dimensions!");
     }
     const int64_t d = (self.dim() == 1) ? 0 : 1;
     if (sections == 0 || self.size(d) % sections != 0) {
         TP_THROW(RuntimeError,
-                 "torch.hsplit attempted to split along dimension ", d,
+                 "hsplit attempted to split along dimension ", d,
                  ", but the size of the dimension ", self.size(d),
                  " is not divisible by the split_size ", sections, "!");
     }
@@ -414,7 +398,7 @@ std::vector<Tensor> tpsa_hsplit_int(const Tensor& self, int64_t sections) {
 std::vector<Tensor> tpsa_hsplit_array(const Tensor& self, const std::vector<int64_t>& indices) {
     if (self.dim() < 1) {
         TP_THROW(RuntimeError,
-                 "torch.hsplit requires a tensor with at least 1 dimension, but got a tensor with ",
+                 "hsplit requires a tensor with at least 1 dimension, but got a tensor with ",
                  self.dim(), " dimensions!");
     }
     return tensor_split_indices_impl(self, indices, (self.dim() == 1) ? 0 : 1);
@@ -422,12 +406,12 @@ std::vector<Tensor> tpsa_hsplit_array(const Tensor& self, const std::vector<int6
 std::vector<Tensor> tpsa_vsplit_int(const Tensor& self, int64_t sections) {
     if (self.dim() < 2) {
         TP_THROW(RuntimeError,
-                 "torch.vsplit requires a tensor with at least 2 dimension, but got a tensor with ",
+                 "vsplit requires a tensor with at least 2 dimension, but got a tensor with ",
                  self.dim(), " dimensions!");
     }
     if (sections == 0 || self.size(0) % sections != 0) {
         TP_THROW(RuntimeError,
-                 "torch.vsplit attempted to split along dimension 0",
+                 "vsplit attempted to split along dimension 0",
                  ", but the size of the dimension ", self.size(0),
                  " is not divisible by the split_size ", sections, "!");
     }
@@ -436,7 +420,7 @@ std::vector<Tensor> tpsa_vsplit_int(const Tensor& self, int64_t sections) {
 std::vector<Tensor> tpsa_vsplit_array(const Tensor& self, const std::vector<int64_t>& indices) {
     if (self.dim() < 2) {
         TP_THROW(RuntimeError,
-                 "torch.vsplit requires a tensor with at least 2 dimension, but got a tensor with ",
+                 "vsplit requires a tensor with at least 2 dimension, but got a tensor with ",
                  self.dim(), " dimensions!");
     }
     return tensor_split_indices_impl(self, indices, 0);
@@ -444,12 +428,12 @@ std::vector<Tensor> tpsa_vsplit_array(const Tensor& self, const std::vector<int6
 std::vector<Tensor> tpsa_dsplit_int(const Tensor& self, int64_t sections) {
     if (self.dim() < 3) {
         TP_THROW(RuntimeError,
-                 "torch.dsplit requires a tensor with at least 3 dimension, but got a tensor with ",
+                 "dsplit requires a tensor with at least 3 dimension, but got a tensor with ",
                  self.dim(), " dimensions!");
     }
     if (sections == 0 || self.size(2) % sections != 0) {
         TP_THROW(RuntimeError,
-                 "torch.dsplit attempted to split along dimension 2",
+                 "dsplit attempted to split along dimension 2",
                  ", but the size of the dimension ", self.size(2),
                  " is not divisible by the split_size ", sections, "!");
     }
@@ -458,14 +442,13 @@ std::vector<Tensor> tpsa_dsplit_int(const Tensor& self, int64_t sections) {
 std::vector<Tensor> tpsa_dsplit_array(const Tensor& self, const std::vector<int64_t>& indices) {
     if (self.dim() < 3) {
         TP_THROW(RuntimeError,
-                 "torch.dsplit requires a tensor with at least 3 dimension, but got a tensor with ",
+                 "dsplit requires a tensor with at least 3 dimension, but got a tensor with ",
                  self.dim(), " dimensions!");
     }
     return tensor_split_indices_impl(self, indices, 2);
 }
 
 // ---------------------------------------------------------------------------
-// atleast_Nd -- ATen TensorTransformations.cpp.
 // ---------------------------------------------------------------------------
 
 Tensor tpsa_atleast_1d(const Tensor& self) {
@@ -497,7 +480,6 @@ std::vector<Tensor> tpsa_atleast_3d_seq(const std::vector<Tensor>& tensors) {
 }
 
 // ---------------------------------------------------------------------------
-// flatten / unflatten / ravel -- ATen TensorShape.cpp.
 // ---------------------------------------------------------------------------
 
 Tensor tpsa_flatten(const Tensor& self, int64_t start_dim, int64_t end_dim) {
@@ -547,13 +529,11 @@ Tensor tpsa_unflatten(const Tensor& self, int64_t dim, const std::vector<int64_t
     };
 
     if (nd == 0) {
-        // torch reaches self.size(dim) on the 0-d tensor inside infer_size.
         unexpected("Dimension specified as " + std::to_string(dim) +
                    " but tensor has no dimensions");
     }
     const int64_t target = self.size(dim);
 
-    // at::infer_size_impl
     std::vector<int64_t> inferred(sizes);
     int64_t newsize = 1;
     int64_t infer_dim = -1;
@@ -592,7 +572,6 @@ Tensor tpsa_unflatten(const Tensor& self, int64_t dim, const std::vector<int64_t
 }
 
 Tensor tpsa_ravel(const Tensor& self) {
-    // ATen ravel(): contiguous().view(-1)
     return self.contiguous().view({-1});
 }
 
@@ -620,7 +599,6 @@ Tensor tpsa_swapdims(const Tensor& self, int64_t dim0, int64_t dim1) {
 
 // ---------------------------------------------------------------------------
 // argwhere / equal / allclose -- argwhere is nonzero's (nnz, ndim) layout;
-// equal/allclose compose eq/all/isclose exactly like ATen's native impls.
 // ---------------------------------------------------------------------------
 
 Tensor tpsa_argwhere(const Tensor& self) {
@@ -646,7 +624,6 @@ bool tpsa_allclose(const Tensor& self, const Tensor& other, double rtol, double 
 }
 
 // ---------------------------------------------------------------------------
-// fill -- ATen Fill.cpp: empty_like(self).fill_(value); full_like preserves
 // dtype/device identically.
 // ---------------------------------------------------------------------------
 
