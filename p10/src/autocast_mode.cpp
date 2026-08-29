@@ -28,7 +28,6 @@ thread_local std::array<DType, kNumDeviceTypes> autocast_dtype = {
 // Should we enable the cache inside autocast.
 thread_local bool cache_enabled = true;
 
-// Per-device enabled flags.  torch models these through the dispatcher's TLS
 // excluded set (all Autocast keys start excluded); a plain flag per device is
 // the equivalent contract for TensorPlay's explicit-key dispatch.
 thread_local std::array<bool, kNumDeviceTypes> autocast_enabled = {
@@ -40,13 +39,11 @@ thread_local std::array<bool, kNumDeviceTypes> autocast_enabled = {
 // ------------------------------------------------------------------
 // Cast cache: thread-local, lock-free on the hot path.
 //
-// torch keeps one process-global map behind a mutex that every eligible
 // op takes twice (lookup + store); under intra-op workers this both
 // serializes and cache-line-pings.  A thread-local map needs no locking
 // at all and is cleared by the same thread's context-manager exit.
 // Entries additionally record the fp32 source's version counter so an
 // in-place mutation invalidates the cached copy -- which is what makes
-// caching inference tensors safe (torch only ever caches requires_grad
 // leaves).
 // ------------------------------------------------------------------
 

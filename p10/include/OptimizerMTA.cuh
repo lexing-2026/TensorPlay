@@ -5,7 +5,6 @@
 // This is intentionally separate from the generic foreach header: optimizer
 // updates write more than one tensor (parameter plus optimizer state), and
 // fused optimizers also carry a device-side step list.  The layout follows
-// ATen's MultiTensorApply contract: bounded metadata is passed by value,
 // chunks from all tensors are packed into one launch, and each thread handles
 // four contiguous scalar values in the aligned path.
 
@@ -32,7 +31,6 @@ constexpr int kILP = 4;
 constexpr int64_t kChunkSize = 65536;
 constexpr int kBlockSize = 512;
 
-// The plain metadata mirrors Torch's MTA layout and keeps the common
 // optimizer kernels within the conservative 4 KiB kernel-argument limit.
 template <int Depth>
 constexpr int kMaxTensorsForDepth =
@@ -506,7 +504,6 @@ __device__ __forceinline__ void adam_math(
     param -= step_size * exp_avg / denom;
 }
 
-// Exact low-precision host-step Adam.  Torch's ordinary foreach path is not
 // the same operation as its explicit fused kernel: every foreach call writes
 // a Half/BFloat16 result before the next call consumes it.  Keep those write
 // boundaries in one launch so the Python/C++ composition is removed without
@@ -900,10 +897,9 @@ __global__ __launch_bounds__(kBlockSize) void adagrad_kernel(
     }
 }
 
-// RMSprop is one of the common CUDA paths without an upstream fused kernel.
+// RMSprop is a common CUDA path without a fused kernel.
 // Keep the metadata depth exact for each option combination instead of
 // carrying two dummy lists and branching on runtime flags for every element.
-// The explicit r_args form mirrors Torch's CUDA foreach functors and avoids
 // the generic Body/should_load indirection in the hot loop.
 template <typename scalar_t, typename math_t, int Depth,
           bool Centered, bool HasMomentum>
@@ -1086,7 +1082,6 @@ struct AdagradHostBody {
     }
 };
 
-// Host-step Adagrad follows Torch's dedicated fused-Adagrad functor.  The
 // generic pointwise kernel is useful for the less regular optimizers, but its
 // per-element should_load/should_store dispatch leaves avoidable branches in
 // this three-list hot path.  Keep the host step correction in metadata and
@@ -2448,7 +2443,6 @@ void launch_adam_host_exact(
         const double bc2 = 1.0 - std::pow(beta2, static_cast<double>(steps[i]));
         // The composed foreach path uses addcdiv(..., value=-step_size).
         // Keep the negative scalar in metadata so the final fma has the same
-        // sign and rounding as Torch's pointwise implementation.
         step_sizes[i] = -(lr / bc1);
         correction2_sqrts[i] = std::sqrt(bc2);
     }

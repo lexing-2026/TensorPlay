@@ -19,7 +19,6 @@ namespace tensorplay {
 namespace tpx {
 
 // Thread-safe ready queue ordered by sequence_nr (max first), mirroring
-// torch::autograd::ReadyQueue. One queue per execution device plus one for
 // CPU work; the thread that initiates backward() drains the CPU queue itself.
 class TENSORPLAY_API ReadyQueue {
 public:
@@ -71,7 +70,6 @@ public:
     // unblock the initiating thread the instant its GraphTask completes on a
     // device worker; otherwise it would wait out a full poll interval above.
     // The mutex is taken so the notify cannot be lost between pop_until's
-    // stop() check and its wait (same ordering guarantee torch gets by pushing
     // a dummy wakeup task under the queue lock).
     void notify() {
         std::lock_guard<std::mutex> lock(mutex_);

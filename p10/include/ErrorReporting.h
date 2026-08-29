@@ -7,7 +7,6 @@
 // instead of raw enum integers ("Found dtype 6 but expected 1").
 //
 // These are header-only so any kernel or iterator site can build richer
-// messages than torch's TORCH_CHECK one-liners at zero cost.
 
 #include <sstream>
 #include <string>
@@ -45,7 +44,6 @@ inline std::string describe_tensor(const Tensor& t) {
     return os.str();
 }
 
-// Torch-parity dimension-range wording, e.g. for ndim=2, dim=5:
 //   "Dimension out of range (expected to be in range of [-2, 1], but got 5)"
 inline std::string format_dim_range(int64_t ndim, int64_t dim) {
     std::ostringstream os;

@@ -1,7 +1,4 @@
-// Native einsum: faithful port of ATen's implementation
-// (aten/src/ATen/native/Linear.cpp, einsum + sumproduct_pair).
 //
-// Like torch's CompositeImplicitAutograd operator, the kernel is expressed
 // through differentiable primitives (mul/sum/bmm/diagonal/movedim/permute),
 // so autograd is derived automatically from those inner calls and no
 // derivatives.yaml entry is needed.  The device-agnostic implementation is
@@ -60,7 +57,6 @@ uint8_t subscript_of(unsigned char label) {
 // ---------------------------------------------------------------------------
 // Native contraction-path planning.
 //
-// torch's einsum reorders contractions only when the optional opt-einsum
 // package is installed on the Python side; without it every pairwise step
 // contracts strictly left to right, which can inflate an intermediate tensor
 // exponentially (e.g. "abc,cde,bd,de->ab").  We plan natively instead: an
@@ -241,7 +237,6 @@ std::vector<int64_t> plan_greedy(const std::vector<std::vector<char>>& occ,
 // mm / bmm / mv / dot / outer over permuted views plus an optional output
 // permutation view -- skipping the align-and-bmm pipeline (~9 dispatched ops
 // per pair).  Every precondition miss returns nullopt so the general
-// machinery keeps producing torch-exact errors and semantics.
 // ---------------------------------------------------------------------------
 
 std::optional<Tensor> try_two_operand_fast(
@@ -266,8 +261,8 @@ std::optional<Tensor> try_two_operand_fast(
         }
     }
 
-    // Output labels, in order: explicit RHS, or implicit = singles ascending
-    // by subscript value (mirrors label_perm_index assignment).
+    // Output labels, in order: explicit RHS, or implicit singles in ascending
+    // subscript order.
     std::vector<uint8_t> out_seq;
     if (arrow_pos != std::string::npos) {
         for (const char rc : equation.substr(arrow_pos + 2)) {
@@ -503,9 +498,8 @@ Tensor sumproduct_pair(const Tensor& left_, const Tensor& right_,
     // the autograd graph (CompositeImplicitAutograd semantics).  reshape()
     // tolerates non-contiguous intermediates where view() would reject them.
     Tensor result = ops::bmm(left, right);
-    // view matches ATen's sumproduct_pair; its backward is generated as
-    // reshape(grad, ...) per upstream derivatives.yaml, so non-contiguous
-    // grads from reordered contraction paths are handled.
+    // Reshape the result so non-contiguous gradients from reordered
+    // contraction paths are handled.
     result = ops::view(result, out_size).permute(opermutation);
 
     // Finally squeeze summed dimensions if desired.
@@ -635,7 +629,6 @@ Tensor einsum_kernel(const std::string& equation,
 
     // Two-operand equations without ellipsis or diagonals reduce to a single
     // BLAS call; anything unusual falls through to the general machinery
-    // below, which keeps producing torch-exact errors and semantics.
     if (auto fast = try_two_operand_fast(equation, arrow_pos, operands,
                                          op_labels, label_count)) {
         return *fast;
@@ -771,7 +764,6 @@ Tensor einsum_kernel(const std::string& equation,
     }
 
     // Contract.  Without a caller-supplied path, plan the contraction order
-    // natively (exact DP for few operands, greedy beyond) instead of torch's
     // left-to-right fallback, which can blow up intermediate sizes.
     std::vector<int64_t> contract_path(path_arg);
     bool use_path = has_path;

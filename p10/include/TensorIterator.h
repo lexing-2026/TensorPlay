@@ -117,10 +117,9 @@ enum class FastSetupType : uint8_t {
 
 struct TensorIterator;
 
-// Port of ATen/TensorIterator.h (TensorIteratorBase). Adaptations:
 //   - tensorplay:: namespace, Tensor held by value (shared_ptr semantics)
 //   - IntArrayRef -> std::vector<int64_t>, SmallVector -> std::vector
-//   - c10::function_ref -> std::function
+//   - function_ref -> std::function
 //   - no meta tensors, no MemoryFormat (fast setup only allocates
 //     contiguous), no TensorOptions (DType+Device passed directly)
 struct TensorIteratorBase {
@@ -422,7 +421,6 @@ struct TensorIterator final : public TensorIteratorBase {
   // Slicing is OK, TensorIterator guaranteed NOT to have any fields
   TensorIterator(const TensorIteratorBase& iter) : TensorIteratorBase(iter) {}
 
-  /// ATen-style factory for broadcast binary ops: output resized to the
   /// broadcast shape, inputs promoted to the common dtype.  Inputs may be
   /// arbitrarily strided; reorder/coalesce apply.
   static TensorIterator binary_op(Tensor& out, const Tensor& a, const Tensor& b);

@@ -1,6 +1,5 @@
 #pragma once
 
-// Port of ATen/native/DispatchStub.h. Implements instruction-set specific
 // function dispatch:
 //
 // Kernels that may make use of specialized instruction sets (e.g. AVX2) are
@@ -126,7 +125,6 @@ struct P10_API CPUDispatchStubImpl {
   );
 
   // Fixing dispatch error in Windows debug builds.
-  // See https://github.com/pytorch/pytorch/issues/22681 for more details.
   #if defined(_MSC_VER) && defined(_DEBUG)
     std::atomic<void*> cpu_dispatch_ptr;
   #else

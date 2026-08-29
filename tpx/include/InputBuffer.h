@@ -40,7 +40,6 @@ inline void accumulate(std::vector<Tensor>& buffer, size_t pos, Tensor&& var, bo
 }
 
 // Accumulates gradients for a single Node input at a fixed index (input_nr).
-// Mirrors torch/csrc/autograd/input_buffer.{h,cpp}.
 struct InputBuffer {
     InputBuffer() = default;
     explicit InputBuffer(size_t size) : buffer(size) {}
@@ -62,8 +61,7 @@ struct InputBuffer {
     Tensor operator[](size_t pos) { return buffer[pos]; }
 
     // Device of the first defined input; used by the engine to route a
-    // NodeTask to the owning device's ready queue (mirrors
-    // torch::autograd::InputBuffer::device()).
+    // NodeTask to the owning device's ready queue.
     int device_index() const {
         for (const auto& t : buffer) {
             if (t.defined() && t.device().is_cuda()) {

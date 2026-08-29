@@ -1,6 +1,5 @@
 #pragma once
 
-// Minimal port of the parts of ATen/native/cpu/Loops.h needed by cpu/Reduce.h.
 //
 // basic_loop applies a scalar binary op elementwise as
 //   out[i] = op(out[i], in[i])
@@ -17,7 +16,6 @@ namespace tensorplay {
 
 namespace detail {
 
-// ATen parity (c10::function_traits): argument slots are computed
 // conditionally so that unary (project) and ternary (reduce with index)
 // member functions both introspect cleanly -- eager tuple_element on a
 // missing slot is a hard error otherwise.

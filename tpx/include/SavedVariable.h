@@ -9,7 +9,6 @@ namespace tensorplay {
 namespace tpx {
 
 // Saved forward tensor of a backward node, mirroring
-// torch::autograd::SavedVariable. Records the tensor's version counter at
 // save time; unpack() fails loudly if the tensor (or a view base sharing its
 // counter) was mutated in-place between the forward and the backward, instead
 // of silently producing wrong gradients.
@@ -25,7 +24,6 @@ public:
 
     // Returns the saved tensor, or an undefined Tensor if nothing was saved.
     // Throws RuntimeError when the saved tensor was modified in-place after
-    // being captured (same contract as torch's SavedVariable::unpack).
     Tensor unpack() const;
 
     // Frees the stored tensor (Node::release_variables path); a later

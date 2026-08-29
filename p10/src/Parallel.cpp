@@ -47,7 +47,6 @@ inline void cpu_relax() { _mm_pause(); }
 inline void cpu_relax() { std::this_thread::yield(); }
 #endif
 
-// Physical-core count for the default thread pool size, mirroring ATen's
 // TaskThreadPoolBase::defaultNumThreads() (cpuinfo "cores" vs "processors"):
 // SMT siblings share execution ports, so defaulting to logical CPUs
 // oversubscribes compute-bound elementwise kernels.
@@ -249,7 +248,6 @@ void init_num_threads() {
 
 #ifdef _OPENMP
   // oneDNN is invoked outside TensorPlay's native elementwise pool.  Keep its
-  // OpenMP team aligned with the public intra-op setting, as PyTorch does in
   // ParallelOpenMP.cpp; forcing one thread here serializes every convolution.
   omp_set_num_threads(nthreads);
 #endif
@@ -280,7 +278,6 @@ void set_num_threads(int nthreads) {
     }
   }
 
-  // Match PyTorch's thread contract for the oneDNN/OpenMP kernels as well as
   // TensorPlay's own native parallel regions.
 #ifdef _OPENMP
   omp_set_num_threads(nthreads);
@@ -349,9 +346,7 @@ void invoke_parallel_impl(
   const size_t num_tasks = static_cast<size_t>((numiter + chunk_size - 1) / chunk_size);
 
 #ifdef _OPENMP
-  // Mirror ATen's OpenMP backend (ParallelOpenMP.cpp): run the chunk loop as
   // an OpenMP region so libgomp keeps the team warm (threads spin between
-  // regions instead of futex-parking), which is what makes torch's small-op
   // dispatch cost microseconds.  The native pool below stays as the fallback
   // for non-OpenMP builds.
   //
@@ -359,7 +354,6 @@ void invoke_parallel_impl(
   // Back-to-back small regions (RNN cell loops) measured ~600us cheaper per
   // region transition on Zen4 with the native pool: libgomp's post-barrier
   // spin taxes the serial op that follows each region, and the native pool's
-  // futex park/wake matches torch's pthreadpool behavior.
   static const bool force_native_pool = [] {
       const char* e = std::getenv("TP_PARALLEL_BACKEND");
       return e && std::strcmp(e, "native") == 0;

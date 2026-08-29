@@ -155,7 +155,6 @@ std::vector<Tensor> Graph::execute(const std::vector<Tensor>& inputs) const {
 
     // Keep only values that still have a downstream consumer.  TensorPlay's
     // allocator can recycle the storage as soon as the last use retires,
-    // matching the lifetime planning done by TorchInductor instead of
     // retaining every intermediate until the whole graph returns.
     std::vector<size_t> remaining_uses(this->values.size(), 0);
     std::vector<bool> keep_alive(this->values.size(), false);
@@ -220,9 +219,7 @@ std::vector<Tensor> Graph::execute(const std::vector<Tensor>& inputs) const {
         Tensor result;
         bool handled_by_custom_op = false;
         if (node.op_type == "channels_last") {
-            // TorchInductor's CUDA layout pass represents a logical NCHW
             // tensor with NHWC physical storage (see
-            // torch/_inductor/graph.py::find_nodes_prefer_channels_last and
             // the generated empty_strided/reinterpret_tensor wrapper).  The
             // native graph keeps that same logical shape and stride contract.
             if (node.inputs.size() != 1) {
@@ -662,7 +659,6 @@ std::vector<Tensor> Graph::execute(const std::vector<Tensor>& inputs) const {
                     throw std::runtime_error("Stax fused mul-add has invalid inputs");
                 }
                 if (!add_scalar.has_value() && node.inputs.size() == 3) {
-                    // This is the p10/ATen fused primitive.  Going through tpx
                     // keeps the generated autograd contract attached while
                     // dispatching the single CPU/CUDA kernel in p10.
                     result = tpx::ops::fused_mul_add(

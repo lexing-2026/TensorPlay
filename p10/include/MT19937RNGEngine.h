@@ -13,8 +13,6 @@ constexpr uint32_t MATRIX_A = 0x9908b0df;
 constexpr uint32_t UMASK = 0x80000000;
 constexpr uint32_t LMASK = 0x7fffffff;
 
-// Port of at::mt19937 (ATen/core/MT19937RNGEngine.h): the standard MT19937
-// algorithm with a 32-bit state array, kept bit-compatible with PyTorch so a
 // given seed produces the same uint32 stream on both frameworks. We do not use
 // std::mt19937 because the distribution layer must consume the raw engine
 // output directly (std::distributions are implementation-defined).

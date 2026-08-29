@@ -17,7 +17,6 @@ namespace tensorplay {
 namespace tpx {
 
 // Holds metadata for a single execution of backward()/grad().
-// Mirrors torch/csrc/autograd/graph_task.h. With the multithreaded engine,
 // several worker threads may evaluate functions of one GraphTask
 // concurrently, so the shared bookkeeping is guarded by mutex_.
 struct GraphTask {
@@ -86,7 +85,6 @@ struct GraphTask {
     }
 
     // Record the first node error; the initiator rethrows it after the graph
-    // has fully drained (mirrors torch::autograd::GraphTask::set_exception).
     void record_exception(std::exception_ptr exc) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!exception_) exception_ = std::move(exc);

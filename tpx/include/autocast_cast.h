@@ -11,10 +11,8 @@
 namespace tensorplay {
 namespace autocast {
 
-// Graph-aware autocast casting, mirroring ATen/autocast_mode.h.  The pure
 // state lives in p10's autocast_mode.h; the casting helpers live in tpx
 // because differentiability comes from the differentiable `to`
-// (ToCopyBackward), matching torch's _to_copy_backward.
 
 // Policies correspond to op categories that need code-divergent handling.
 enum class CastPolicy : uint8_t {
@@ -32,7 +30,6 @@ enum class CastPolicy : uint8_t {
 };
 
 // ------------------------------------------------------------------
-// Eligibility (mirrors at::autocast::is_autocast_eligible / is_eligible)
 // ------------------------------------------------------------------
 
 inline bool is_autocast_eligible(const Tensor& tensor, DeviceType device_type) {
@@ -64,12 +61,11 @@ inline bool is_eligible(const Tensor& arg, DeviceType device_type) {
 
 // ------------------------------------------------------------------
 // Logic to extract the promote type from any Tensor or TensorList args
-// (mirrors at::autocast::prioritize / promote_type)
 // ------------------------------------------------------------------
 
 inline DType prioritize(DType current, const Tensor& nextArg, DeviceType device_type) {
     if (current == DType::Float64) {
-        TP_CHECK(false, "promote type is double in at::autocast::prioritize");
+        TP_CHECK(false, "promote type is double in promote_type");
         return current;
     }
     DType lower_precision_fp = get_lower_precision_fp_from_device_type(device_type);
@@ -88,7 +84,7 @@ inline DType prioritize(DType current, const Tensor& nextArg, DeviceType device_
             // rejecting -- matches the repo's amp contract for promote ops.
             return lower_precision_fp;
         } else {
-            TP_CHECK(false, "Unexpected floating ScalarType in at::autocast::prioritize");
+            TP_CHECK(false, "Unexpected floating ScalarType in promote_type");
             return current;
         }
     } else {
@@ -122,7 +118,6 @@ inline DType promote_type(DType current, DeviceType device_type, Arg0 arg0, Args
 }
 
 // ------------------------------------------------------------------
-// Cached casting (mirrors at::autocast::cached_cast).  The cast is
 // differentiable through `to` (ToCopyBackward), so no custom node is needed.
 // ------------------------------------------------------------------
 
@@ -158,7 +153,6 @@ inline T cached_cast(DType /*to_type*/, T arg, DeviceType /*device_type*/) {
 }
 
 // ------------------------------------------------------------------
-// Logic to flip an output dtype flag (mirrors at::autocast::set_opt_dtype).
 // If the user has explicitly specified a dtype, respect it. Otherwise, set it
 // to the requested type.
 // ------------------------------------------------------------------

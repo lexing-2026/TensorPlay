@@ -7,8 +7,6 @@
 namespace tensorplay {
 
 // Promotion rules for the dtypes implemented by TensorPlay.  The ordering is
-// based on c10::promoteTypes in the vendored PyTorch tree.  In particular,
-// uint16/uint32/uint64 are storage dtypes, but PyTorch deliberately does not
 // define integral promotion for them; only promotion with a floating dtype is
 // accepted.
 inline DType promoteTypes(DType type1, DType type2) {
@@ -31,7 +29,6 @@ inline DType promoteTypes(DType type1, DType type2) {
                  toString(type1), " and ", toString(type2));
     }
 
-    // The remaining table is the standard PyTorch table for
     // {uint8, int8..int64, float16, float32, float64, complex32..complex128,
     // bool, bfloat16, bcomplex32}.
     const bool is_complex1 = isComplexType(type1);
@@ -43,8 +40,8 @@ inline DType promoteTypes(DType type1, DType type2) {
         }
 
         // ComplexFloat is the result of complex32 with bfloat16/float32, and
-        // dominates all integral, bool, and float32 inputs.  float64 still
-        // wins (c10: promote_types(double, complex64) == complex128).
+        // dominates all integral, bool, and float32 inputs. Float64 still
+        // wins over ComplexFloat.
         if (type1 == DType::ComplexFloat || type2 == DType::ComplexFloat) {
             if (type1 == DType::Float64 || type2 == DType::Float64) {
                 return DType::ComplexDouble;
@@ -83,7 +80,6 @@ inline DType promoteTypes(DType type1, DType type2) {
     if (is_float1 || is_float2) {
         if (type1 == DType::Float64 || type2 == DType::Float64) return DType::Float64;
         if (type1 == DType::Float32 || type2 == DType::Float32) return DType::Float32;
-        // PyTorch promotes half + bfloat16 to float32, unlike a size-only
         // rule (both occupy two bytes).
         if ((type1 == DType::Float16 && type2 == DType::BFloat16) ||
             (type2 == DType::Float16 && type1 == DType::BFloat16)) {
@@ -93,7 +89,6 @@ inline DType promoteTypes(DType type1, DType type2) {
         return DType::Float16;
     }
 
-    // Bool is a distinct category in PyTorch, but bool + integral uses the
     // integral operand.  uint8 + int8 is the one asymmetric integer case and
     // promotes to int16.
     if (type1 == DType::Bool) return type2;

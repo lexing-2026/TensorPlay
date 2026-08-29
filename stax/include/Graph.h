@@ -16,7 +16,6 @@ namespace stax {
 struct OpNode;
 struct Graph;
 
-// Native escape hatch for user-defined operators (torch.library parity):
 // a "custom_op" node carries its qualified "ns::op" name as a string
 // attribute and hands its tensor inputs to the installed executor — the
 // Python↔dispatcher bridge in the bindings.  Kernels keep full eager

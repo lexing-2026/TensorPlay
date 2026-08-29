@@ -93,7 +93,6 @@ Tensor Tensor::make_sparse_coo_tensor(const Tensor& indices,
         TP_THROW(ValueError, "sparse_coo_tensor: indices must be a 2-D tensor");
     }
     if (indices.dtype() != DType::Int64) {
-        // ATen canonicalizes both int32 and int64 COO indices to int64.
         if (indices.dtype() != DType::Int32) {
             TP_THROW(TypeError, "sparse_coo_tensor: indices must be Int32 or Int64");
         }
@@ -213,7 +212,6 @@ void Tensor::set_requires_grad(bool requires_grad) {
     } else if (requires_grad) {
         // No autograd metadata attached yet. The tpx layer owns the concrete
         // AutogradMeta type; without it, requires_grad cannot be enabled.
-        // This mirrors a fresh TensorImpl in PyTorch, where requires_grad is
         // only meaningful once the autograd layer attaches metadata.
     }
 }
@@ -535,7 +533,6 @@ std::string Tensor::toString() const {
     std::stringstream ss;
 
     // 为了支持非CPU张量的打印（如CUDA），我们需要将其拷贝到CPU
-    // 这样可以保持与PyTorch一致的体验
     Tensor tensor_to_print = *this;
     if (device().type() != DeviceType::CPU) {
         try {
@@ -606,7 +603,6 @@ Tensor Tensor::as_strided(const std::vector<int64_t>& size, const std::vector<in
     Tensor out = Tensor(impl_->storage(), size, stride, impl_->dtype(), offset);
     // A view aliases the base memory: share the version counter so that
     // in-place writes through either alias are visible to mutation tracking
-    // (mirrors PyTorch view semantics).
     out.unsafeGetTensorImpl()->share_version_counter(*impl_);
     return out;
 }
@@ -614,10 +610,8 @@ Tensor Tensor::as_strided(const std::vector<int64_t>& size, const std::vector<in
 Tensor Tensor::view(const std::vector<int64_t>& shape) const {
     if (!impl_) TP_THROW(RuntimeError, "Tensor not defined");
 
-    // Torch parity (at::infer_size_dv): resolve a single -1 against numel().
     std::vector<int64_t> inferred = SizesAndStrides::infer_size(shape, numel());
 
-    // Torch parity (at::detail::computeStride, TensorShape.cpp view_impl): the
     // view is valid whenever the layout admits it -- not only for contiguous
     // tensors -- and the resulting strides follow the input's layout.
     auto stride = SizesAndStrides::compute_view_strides(
@@ -630,18 +624,14 @@ Tensor Tensor::view(const std::vector<int64_t>& shape) const {
     return as_strided(inferred, *stride);
 }
 
-// Mirrors aten's view_dtype (Tensor.view(dtype)): reinterprets the raw
 // element stream as `dtype` while aliasing the same storage.  Same-size
 // dtypes keep shape/strides; otherwise only the last dimension may change
-// and it must be contiguous, matching PyTorch's documented constraints.
 Tensor Tensor::view_dtype(DType dtype) const {
     if (!impl_) TP_THROW(RuntimeError, "Tensor not defined");
     const DType self_dtype = impl_->dtype();
     if (dtype == self_dtype) {
-        // torch view_dtype parity: even the same-dtype view is a fresh impl
         // aliasing the storage (metadata changes on it must not leak back to
         // the original tensor), carrying the base's version counter.  Note
-        // torch does NOT mark view(dtype) results as autograd views:
         // x.view(dtype).detach_() is legal and _is_view() is False.
         Tensor out = Tensor(impl_->storage(),
                             static_cast<std::vector<int64_t>>(shape()),
@@ -669,7 +659,6 @@ Tensor Tensor::view_dtype(DType dtype) const {
     std::vector<int64_t> new_sizes = self_sizes;
     std::vector<int64_t> new_strides = self_strides;
     // Storage offset is measured in elements, so it must be rescaled by the
-    // element-size ratio (torch view_dtype parity: offset * ratio when
     // downsizing, offset / ratio when upsizing).
     size_t new_offset = impl_->storage_offset();
 
@@ -811,13 +800,10 @@ namespace detail {
 // backend kernels.  Kept free-standing so kernels never re-enter the
 // dispatcher for a plain byte copy.
 //
-// Torch at::native::clone parity (aten/src/ATen/native/TensorFactories.cpp):
 // with no/Preserve memory_format the result keeps the input's exact strides
 // when they are non-overlapping and dense (e.g. transposed tensors), and
 // falls back to contiguous otherwise (expanded/overlapping inputs).  An
-// explicit format materializes that layout, with torch's rank checks for the
 // channels-last formats.  Sparse clones reject any memory_format like
-// at::native::clone_sparse.
 Tensor clone_impl(const Tensor& self, std::optional<MemoryFormat> memory_format) {
     if (!self.defined()) return Tensor();
     if (self.is_sparse()) {
@@ -836,7 +822,6 @@ Tensor clone_impl(const Tensor& self, std::optional<MemoryFormat> memory_format)
     if (format == MemoryFormat::Preserve) {
         const auto strides_v = static_cast<std::vector<int64_t>>(self.strides());
         if (SizesAndStrides::is_non_overlapping_and_dense(sizes_v, strides_v)) {
-            // Copy all strides, mirroring at::empty_strided(sizes, strides).
             strides = strides_v;
         } else {
             strides = SizesAndStrides::compute_contiguous_strides(sizes_v);
@@ -868,7 +853,6 @@ Tensor clone_impl(const Tensor& self, std::optional<MemoryFormat> memory_format)
     }
     out_impl->set_memory_format(result_format);
     Tensor t(std::move(out_impl));
-    // Match the native contiguous clone path used by Torch: avoid routing
     // every same-dtype contiguous clone through the dispatcher.  Optimizer
     // momentum initialization creates one clone per parameter, so this
     // dispatch overhead is visible even though the operation is just a byte
@@ -886,7 +870,6 @@ Tensor clone_impl(const Tensor& self, std::optional<MemoryFormat> memory_format)
         t.copy_(self);
     }
     // copy_ records a mutation on the destination; the clone result is a
-    // freshly materialized tensor and must start unmutated (PyTorch: version
     // 0), so clear the counter the internal copy bumped.
     t.unsafeGetTensorImpl()->reset_version();
     return t;
@@ -907,7 +890,6 @@ Tensor contiguous_impl(const Tensor& self, int64_t memory_format_raw) {
             (format == MemoryFormat::ChannelsLast && self.dim() != 4) ||
             (format == MemoryFormat::ChannelsLast3d && self.dim() != 5)) {
             // Channels-last layouts are only representable at these ranks;
-            // fall back to row-major like ATen's empty_like handling.
             format = MemoryFormat::Contiguous;
         }
     }

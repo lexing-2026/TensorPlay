@@ -10,8 +10,7 @@ namespace tensorplay {
 namespace tpx {
 
 struct AccumulateGrad : public Node {
-    // The leaf tensor this node accumulates gradients into. Mirrors
-    // torch::autograd::AccumulateGrad::variable_.
+    // The leaf tensor this node accumulates gradients into.
     Tensor value_;
 
     // AccumulateGrad sets sequence_nr to the max value so it's always called
@@ -66,7 +65,6 @@ struct AccumulateGrad : public Node {
 
         if (auto* meta = impl::get_autograd_meta(value_)) {
             // Materialize strided gradients (e.g. a .t() view produced by a
-            // transpose in the backward formula) so stored grads match torch's
             // contiguous layout; downstream consumers (foreach optimizers,
             // .numpy()) rely on dense storage.
             if (!grad.is_contiguous()) {

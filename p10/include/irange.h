@@ -5,8 +5,7 @@
 
 namespace tensorplay {
 
-// Lightweight equivalent of c10::irange: for (const auto i : irange(n)) { ... }
-// yields i in [0, n) with the same signed/unsigned semantics as torch.
+// Lightweight integer range: for (const auto i : irange(n)) { ... }
 template <typename T>
 class irange {
   static_assert(std::is_integral_v<T>, "irange requires an integral type");
@@ -30,8 +29,8 @@ class irange {
     T value_;
   };
 
-  // c10 parity: [begin, end) with end<=begin yielding an EMPTY range -- the
-  // range-for end test is `!=`, so the terminator is clamped up to begin.
+  // [begin, end) with end<=begin yields an empty range. The range-for end
+  // test is `!=`, so the terminator is clamped up to begin.
   // reorder_dimensions relies on this for 0-dim reductions
   // (irange(1, ndim()) must not iterate when ndim()==0).
   irange(T begin, T end) : begin_(begin), end_(std::max(begin, end)) {}

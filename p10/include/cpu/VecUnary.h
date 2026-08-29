@@ -15,7 +15,6 @@
 // * lgamma has no libmvec entry point; it uses a Lanczos expansion restricted
 //   to strictly positive inputs (blocks containing non-positive or NaN values
 //   fall back to the scalar std::lgamma, which handles the reflection domain).
-// * All scalar fallbacks mirror the ATen-aligned formulas in
 //   PointwiseKernels.cpp element-for-element, including multiplication order,
 //   so vector and fallback paths produce identical values.
 
@@ -464,7 +463,7 @@ inline __m256 apply_f32(VOp op, VParams prm, __m256 x) {
             return _mm256_mul_ps(x, v_rcp_nr_ps(den));
         }
         case VOp::Mish: {
-            // Mirrors the scalar kernel: log((1 + exp(x))) * tanh(...) — plain
+            // Uses the scalar expression: log((1 + exp(x))) * tanh(...) — plain
             // log, not log1p, and overflow-to-inf semantics are preserved.
             __m256 sp = _ZGVdN8v_logf(_mm256_add_ps(one, _ZGVdN8v_expf(x)));
             return _mm256_mul_ps(x, _ZGVdN8v_tanhf(sp));
@@ -737,7 +736,6 @@ static void half_chunk_avx2(VOp op, VParams prm, const uint16_t* src, uint16_t* 
 // ---------------------------------------------------------------------------
 // AVX-512 layer (Zen4 native width).  Same formulas as the AVX2 kernels
 // above -- only the register width changes -- so results stay lane-identical
-// with the scalar fallbacks that mirror ATen.
 // ---------------------------------------------------------------------------
 constexpr float kSignBitF512 = -0.0f;  // (shared constant, kept for clarity)
 

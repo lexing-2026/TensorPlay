@@ -1,6 +1,5 @@
 #pragma once
 
-// Port of ATen/cpu/vec/vec512/vec512_double.h with the TensorPlay vec layer,
 // derived from the vec256 port (same interface, 512-bit width).  Math
 // functions that depend on Sleef resolve to glibc libmvec's 512-bit vector
 // ABI when available (_ZGVeN8v_* = eight doubles per call) and fall back to
@@ -201,7 +200,6 @@ struct Vectorized<double> {
         _mm512_set1_pd(-0.0), values); // clear sign bit
   }
   Vectorized<double> angle() const {
-    // ATen semantics: NaN -> NaN, negative -> pi, otherwise -> 0.
     const auto zero_vec = _mm512_set1_pd(0.0);
     const auto nan_vec = _mm512_set1_pd(std::numeric_limits<double>::quiet_NaN());
     const auto nan_mask = _mm512_cmp_pd_mask(values, values, _CMP_UNORD_Q);

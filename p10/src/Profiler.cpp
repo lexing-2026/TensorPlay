@@ -290,10 +290,8 @@ const char* intern_name(const std::string& name) {
 
 void OpRecord::begin(const char* static_name, const std::string* owned_name,
                      EventKind kind) {
-    // emit_nvtx parity: NVTX ranges fire even without a profiling session
-    // (torch.autograd.profiler.emit_nvtx semantics).  Static/arena names are
-    // durable; user-annotation bytes are only durable under a session, so
-    // spans keep requiring one.
+    // NVTX ranges can fire without a profiling session; user-annotation bytes
+    // are retained only during a session, so spans still require one.
     const bool nvtx_on =
         g_emit_nvtx.load(std::memory_order_relaxed) && kind == EventKind::kOp;
     const bool itt_on =

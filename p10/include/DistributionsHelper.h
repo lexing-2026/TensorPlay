@@ -1,9 +1,5 @@
 #pragma once
 
-// Port of ATen's distribution layer (ATen/core/TransformationHelper.h and
-// ATen/core/DistributionsHelper.h). The transformation formulas and the number
-// of engine draws per sample must match PyTorch exactly so that a given seed
-// reproduces torch's random tensors; std:: distributions cannot be used
 // because their algorithms are implementation-defined.
 
 #include <array>
@@ -20,7 +16,6 @@ namespace tensorplay {
 constexpr double pi_d = 3.14159265358979323846;
 
 // Accumulation type for distributions: Half/BFloat16 use float, float stays
-// float, and double stays double (matches at::dist_acctype).
 template <typename T>
 struct DistAccumType {};
 template <> struct DistAccumType<Half> { using type = float; };
@@ -33,7 +28,6 @@ using dist_acctype = typename DistAccumType<T>::type;
 
 // std::numeric_limits is not specialized for TensorPlay's storage wrappers.
 // Keep the distribution's mantissa width explicit so Half/BFloat16 consume
-// the same masked raw words as ATen's scalar-dtype CPU kernels.
 template <typename T>
 struct DistMantissaBits {
     static constexpr int value = std::numeric_limits<T>::digits;
@@ -42,7 +36,6 @@ template <> struct DistMantissaBits<Half> { static constexpr int value = 11; };
 template <> struct DistMantissaBits<BFloat16> { static constexpr int value = 8; };
 
 // Computation precision for a storage dtype: Half/BFloat16 sample in float
-// (mirrors at::opmath_type).
 template <typename T>
 struct OpMathType { using type = T; };
 template <> struct OpMathType<Half> { using type = float; };
@@ -51,7 +44,6 @@ template <> struct OpMathType<BFloat16> { using type = float; };
 template <typename T>
 using opmath_t = typename OpMathType<T>::type;
 
-// ATen includes c10's reduced-floating-point math overloads for its CPU
 // distribution kernels.  Those overloads return Half/BFloat16 after each
 // elementary function (std::log(Half), std::sqrt(Half), ...), rather than
 // leaving the result in float.  Keep the same storage-dtype boundary without
@@ -125,10 +117,10 @@ inline dist_acctype<T> uniform_real(V val, T from, T to) {
     constexpr auto DIVISOR = static_cast<dist_acctype<T>>(1) /
                              (static_cast<uint64_t>(1) << DistMantissaBits<T>::value);
     dist_acctype<T> x = (val & MASK) * DIVISOR;
-    // c10::Half/BFloat16 round the storage-dtype subtraction first, but
-    // their mixed float/double operators keep the subsequent arithmetic in
-    // the accumulator type.  Spell that boundary out so custom storage
-    // wrappers cannot introduce an extra product/add round-trip.
+    // Storage wrappers round the storage-dtype subtraction first, while
+    // mixed float/double operators keep subsequent arithmetic in the
+    // accumulator type. Spell that boundary out so custom storage wrappers
+    // cannot introduce an extra product/add round-trip.
     const dist_acctype<T> range = static_cast<dist_acctype<T>>(to - from);
     const dist_acctype<T> base = static_cast<dist_acctype<T>>(from);
     return x * range + base;
@@ -262,7 +254,6 @@ private:
 };
 
 // (val % range) + base over the raw engine draw; a range >= 2^28 switches to
-// 64-bit draws, mirroring torch's uniform_int_from_to_distribution.
 template <typename T>
 struct uniform_int_from_to_distribution {
     uniform_int_from_to_distribution(uint64_t range, int64_t base) : range_(range), base_(base) {}
@@ -354,7 +345,6 @@ private:
 };
 
 // Box-Muller applied in-place to blocks of 16 uniforms; scalar variant of
-// torch's NormalFill16.
 template <typename T>
 struct NormalFill16 {
     T mean_;
@@ -368,7 +358,6 @@ struct NormalFill16 {
             const T u2 = data[j + 8];
             const T radius = distribution_sqrt<T>(T(-2) * distribution_log<T>(u1));
             const T theta = 2.0 * pi_d * u2;
-            // Keep the scalar expression in the same order as ATen's
             // normal_fill_16.  In particular, do not fuse the multiply-add:
             // Half/BFloat16 must round at the storage-dtype operation points.
             data[j] = radius * distribution_cos<T>(theta) * std_ + mean_;
@@ -392,8 +381,6 @@ inline bool cpu_supports_avx2() {
     return cached;
 }
 
-// AVX2 variant of torch's NormalFill16<float, true> (avx_mathfun polynomial
-// approximations). Bit-identical to torch's AVX2-dispatched kernel; the
 // scalar fallback above only runs on pre-AVX2 machines.
 struct NormalFill16AVX2 {
     float mean_;
@@ -426,7 +413,6 @@ struct NormalFill16AVX2 {
 #endif // TENSORPLAY_X86_AVX2_DISPATCH
 
 // Fast path for contiguous tensors with >= 16 elements: fill with uniforms,
-// then convert to normals in-place block by block. Mirrors torch's
 // normal_fill consumption pattern element for element.
 template <typename T, typename RNG>
 void normal_fill(T* data, int64_t size, T mean, T std, RNG* generator) {
@@ -470,7 +456,6 @@ void normal_fill(T* data, int64_t size, T mean, T std, RNG* generator) {
     }
 }
 
-// Half/BFloat16 variant of torch's normal_fill: sample in float precision
 // through a 16-element stack buffer, Box-Muller in-place, then cast down.
 template <typename scalar_t, typename RNG>
 void normal_fill_cast(scalar_t* data, int64_t size, double mean, double std, RNG* generator) {

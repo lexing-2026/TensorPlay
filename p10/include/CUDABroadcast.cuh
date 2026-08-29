@@ -11,7 +11,7 @@ namespace tensorplay {
 namespace cuda {
 
 // Broadcast metadata used by the existing CUDA arithmetic and comparison
-// kernels.  The output shape is right-aligned with every input shape, just as
+// kernels.  The output shape is right-aligned to every input shape, just as
 // TensorIterator aligns broadcast dimensions.  A singleton input dimension
 // gets a zero stride so all output coordinates read the same element.
 constexpr int CUDA_BROADCAST_MAX_DIMS = 8;
@@ -77,8 +77,7 @@ __host__ __device__ inline int64_t logical_stride(
 }
 
 // The CUDA pointwise launch index is in logical contiguous order even when
-// the destination uses channels-last physical strides.  This mirrors the
-// indexing used by TorchInductor's generated Triton pointwise kernels.
+// the destination uses channels-last physical strides. This helper maps the
 __host__ __device__ inline int64_t get_logical_coordinate(
     int64_t linear_index,
     const TensorDesc& output,

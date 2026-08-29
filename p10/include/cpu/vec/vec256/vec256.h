@@ -1,6 +1,5 @@
 #pragma once
 
-// Port of ATen/cpu/vec/vec256/vec256.h. Only the AVX2 path is ported:
 // float/double/int32/int64 specializations. AVX512 and reduced-precision
 // types can be added later following the same pattern.
 
@@ -24,7 +23,6 @@ namespace tensorplay::vec {
 // intrinsics. So we need to make sure they aren't inadvertently
 // linked together. We do this by declaring objects in an `inline
 // namespace` which changes the name mangling, but can still be
-// accessed as `at::vec`.
 inline namespace CPU_CAPABILITY {
 
 #ifdef CPU_CAPABILITY_AVX2

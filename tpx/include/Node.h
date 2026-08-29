@@ -17,7 +17,6 @@ using Tensor = tensorplay::Tensor;
 using variable_list = std::vector<Tensor>;
 using edge_list = std::vector<Edge>;
 
-// torch InputMetadata analog for BACKWARD input slots.  For custom-function
 // nodes the gradients arriving from consumers correspond to the node's
 // forward OUTPUTS, so their zero-fill metadata is captured at output-attach
 // time (PyNode::attach_outputs) rather than derived from next_edges.
@@ -29,21 +28,18 @@ struct OutputSlotMeta {
 };
 
 // Thread-local monotonically increasing sequence number, assigned at Node
-// construction. Mirrors at::sequence_number::get_and_increment().
 inline uint64_t get_and_increment_sequence_nr() {
     static thread_local uint64_t counter = 0;
     return counter++;
 }
 
 #if defined(__GNUG__) && !defined(TP_NO_CXA_DEMANGLE)
-// Demangles a typeid name and keeps only the class component (torch prints
 // backward nodes as e.g. "MulBackward0", never namespace-qualified).
 inline std::string demangle_node_name(const char* mangled);
 #endif
 
 class TENSORPLAY_API Node : public std::enable_shared_from_this<Node> {
 public:
-    // Hooks mirror torch::autograd::Node: pre-hooks may rewrite the incoming
     // gradients before apply(), post-hooks may rewrite the outputs after.
     using PreHookFn = std::function<variable_list(variable_list&&)>;
     using PostHookFn = std::function<variable_list(const variable_list&, variable_list&&)>;
@@ -51,19 +47,16 @@ public:
     Node() : sequence_nr_(get_and_increment_sequence_nr()) { init_anomaly_metadata(); }
     explicit Node(uint64_t sequence_nr) : sequence_nr_(sequence_nr) { init_anomaly_metadata(); }
 
-    // torch parity (ctx.set_materialize_grads): when false the engine hands
     // undefined input gradients through as-is instead of zero-filling them
     // from the edge's recorded InputMetadata.
     bool materialize_grads() const { return materialize_grads_; }
     void set_materialize_grads(bool v) { materialize_grads_ = v; }
 
-    // Torch parity (ADInplaceOrView "view functions"): set by the generated
     // view wrappers / tpx::as_strided so in-place ops can reject mutations
     // of views of leaf variables (check_inplace, VariableTypeUtils.h).
     bool is_view_fn() const { return is_view_fn_; }
     void set_view_fn(bool v) { is_view_fn_ = v; }
 
-    // Torch parity (DifferentiableViewMeta CreationMeta::MULTI_OUTPUT_NODE):
     // views returned by multi-output ops (unbind/split/chunk) can never be
     // modified in-place; check_inplace reports them with forward_op_name().
     bool is_multi_output_view() const { return multi_output_view_; }
@@ -78,7 +71,6 @@ public:
 
     virtual variable_list apply(variable_list&& inputs) = 0;
 
-    // Mirrors at::Node::name(): demangled class name for introspection and
     // anomaly-mode error messages.
     virtual std::string name() const {
 #if defined(__GNUG__) && !defined(TP_NO_CXA_DEMANGLE)
@@ -107,7 +99,6 @@ public:
 
     // Virtual so generated/hand-written nodes can also free the forward
     // tensors they saved (SavedVariable::reset_data) when the graph is
-    // released, mirroring torch::autograd::Node::release_variables.
     virtual void release_variables() {
         next_edges_.clear();
     }
@@ -133,7 +124,6 @@ public:
     }
 
 private:
-    // Mirrors torch::autograd::Node's constructor: when anomaly mode is on,
     // capture where (in which stack) this node was created and record the
     // node being evaluated (if any) as its parent.
     void init_anomaly_metadata() {

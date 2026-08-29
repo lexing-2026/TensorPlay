@@ -14,7 +14,7 @@
 
 namespace tensorplay {
 
-// Scalar class aligned with Tensor DType system
+// Scalar class integrated with the Tensor DType system
 class P10_API Scalar {
 public:
     Scalar() : type_(DType::Undefined) {}
@@ -69,7 +69,6 @@ public:
                     return T(static_cast<target_value_t>(value), target_value_t(0));
                 }
             } else if constexpr (is_complex_type_v<source_t>) {
-                // Match torch's copy semantics: casting complex to real keeps
                 // the real component and discards the imaginary component.
                 return static_cast<T>(value.real());
             } else {

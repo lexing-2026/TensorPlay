@@ -1,5 +1,4 @@
 // TensorIteratorOps.h -- thin dtype-dispatched helpers on top of
-// TensorIterator for elementwise kernels.  Mirrors ATen's cpu_kernel_vec role: kernels hand in an output tensor plus broadcast inputs and a
 // binary functor; iteration (reorder / coalesce / parallel chunks /
 // byte-stride addressing) is owned by TensorIterator.
 #pragma once
@@ -53,7 +52,6 @@ inline void ti_apply_binary(Tensor& out, const Tensor& a, const Tensor& b,
 /// (+, -, *, /, std::pow): dispatch additionally covers the four complex
 /// dtypes.  Call sites whose functor relies on operator< / fmod / casts to
 /// real types (clamp, gcd, remainder, ...) must stay on ti_apply_binary --
-/// those ops are not defined for complex inputs, mirroring ATen.
 template <typename Op>
 inline void ti_apply_arith(Tensor& out, const Tensor& a, const Tensor& b,
                            Op op) {
@@ -113,7 +111,6 @@ inline void ti_apply_arith(Tensor& out, const Tensor& a, const Tensor& b,
         TP_TI_CX_STD(std::complex<float>, ComplexFloat)
         TP_TI_CX_STD(std::complex<double>, ComplexDouble)
 #undef TP_TI_CX_STD
-        // Reduced complexes compute in complex<float> (ATen opmath rule).
 #define TP_TI_CX_RED_CASE(halftype, name)                                  \
         case DType::name: {                                                \
             using cxh_t = std::complex<halftype>;                          \
@@ -146,7 +143,6 @@ inline void ti_apply_arith(Tensor& out, const Tensor& a, const Tensor& b,
     }
 }
 
-/// Equality-only comparison flavor: eq/ne are the sole comparisons ATen
 /// defines over complex tensors (component-wise), so they get their own
 /// applier instead of teaching the ordering-only ti_apply_compare about
 /// complex dtypes (std::complex has no operator<).
