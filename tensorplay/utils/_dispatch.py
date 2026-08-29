@@ -90,7 +90,6 @@ def is_traceable_wrapper_subclass(t: object) -> TypeIs[TensorWithFlatten]:
     """
     Returns whether a tensor subclass that implements __tensorplay_dispatch__
     is 'traceable' with tensorplay.compile.
-    In order for a tensor subclass to support TorchDispatchMode-style tracing in PT2,
     It must implement two magic methods: __tensor_flatten__ and __tensor_unflatten__.
     It is also expected to obey some restrictions around traceability and aliasing:
         * The subclass's __tensorplay_dispatch__() implementation should desugar into pytensorplay
@@ -146,7 +145,8 @@ def transform_subclass(t, callback, outer_size=None, outer_stride=None):
 
     Note: this function will not handle ensuring that the fresh subclass
     gets the same (autograd, and aliasing) metadata as the original tensor.
-    This is generally handled in other subsystems like AOTAutograd.
+    This is generally handled in other ahead-of-time differentiation
+    subsystems.
     """
     outer_size = outer_size if outer_size is not None else t.size()
     outer_stride = outer_stride if outer_stride is not None else t.stride()

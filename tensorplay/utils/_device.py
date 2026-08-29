@@ -1,8 +1,7 @@
-"""Default-device context, mirroring ``torch.utils._device``.
+"""Context manager for the thread-local default device.
 
 ``tensorplay.device.__enter__``/``__exit__`` (C++ side) push/pop the
-thread-local default device so factory functions allocate on it; this module
-exposes the equivalent ``DeviceContext`` object for API parity with torch.
+thread-local default device so factory functions allocate on it. This module
 """
 
 from __future__ import annotations
