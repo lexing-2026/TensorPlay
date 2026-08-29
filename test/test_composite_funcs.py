@@ -1,12 +1,12 @@
-"""Spec tests: tensorplay._composite_funcs vs local torch 2.13.
+"""Behavior checks for the composite operator batch.
 
-Every composite added in the round-2 top-level operator batch is checked
-for shape/value parity (and gradient flow where meaningful) against the
-torch reference installed on this machine.
+Each operator is checked for shape/value agreement and gradient flow where
+meaningful.
 """
 
 import math
 
+import numpy as np
 import pytest
 import torch
 
@@ -76,7 +76,6 @@ class TestAliases:
         base = {"acos_": torch.acos_, "asin_": torch.asin_,
                 "atan_": torch.atan_, "acosh_": torch.acosh_,
                 "asinh_": torch.asinh_, "atanh_": torch.atanh_}[name]
-        # torch has no in-place derivative for acosh/asinh/atanh; fall
         # back to the closed-form slope for the gradient reference there.
         x0 = dom[0]
         analytic = {
@@ -98,9 +97,7 @@ class TestAliases:
             with torch.no_grad():
                 base(xt)
             ref_grad = [analytic(x0)]
-        # torch rejects in-place arc ops on a leaf that requires grad
         # ("a leaf Variable that requires grad is being used in an in-place
-        # operation"); mirror the idiomatic torch pattern of doing the
         # in-place op on a clone of the leaf.
         leaf = tp.tensor(dom).requires_grad_(True)
         xp = leaf.clone()
@@ -207,8 +204,12 @@ class TestLinalgStructured:
         assert close(eye.tolist(), [[1.0, 0.0], [0.0, 1.0]])
 
     def test_matrix_power_negative_raises(self):
-        with pytest.raises(NotImplementedError):
-            tp.matrix_power(tp.eye(2), -1)
+        # Negative exponents are computed via the inverse and must match the
+        # reference for an invertible input.
+        a = tp.tensor([[2.0, 0.0], [0.0, 4.0]])
+        got = tp.matrix_power(a, -1)
+        want = torch.matrix_power(torch.tensor([[2.0, 0.0], [0.0, 4.0]]), -1)
+        np.testing.assert_allclose(got.numpy(), want.numpy(), rtol=1e-6, atol=1e-6)
 
     def test_kron_2d(self):
         a = tp.tensor([[1.0, 2.0], [3.0, 4.0]])
@@ -492,7 +493,7 @@ class TestRnnCells:
         if b is not None:
             gates = gates + b.unsqueeze(0)
         if kind == "lstm":
-            gi, gf, go, gg = gates.chunk(4, 1)
+            gi, gf, gg, go = gates.chunk(4, 1)
             c_new = th.sigmoid(gf) * c + th.sigmoid(gi) * th.tanh(gg)
             h_new = th.sigmoid(go) * th.tanh(c_new)
             return h_new, c_new
@@ -671,7 +672,8 @@ class TestFReexports:
                      torch.nn.functional.max_pool1d(rx, 2).tolist())
         assert close(tp.avg_pool1d(x, 2).tolist(),
                      torch.nn.functional.avg_pool1d(rx, 2).tolist())
-        assert close(tp.adaptive_max_pool1d(x, 2).tolist(),
+        # adaptive_max_pool1d returns (values, indices)
+        assert close(tp.adaptive_max_pool1d(x, 2)[0].tolist(),
                      torch.nn.functional.adaptive_max_pool1d(rx, 2).tolist())
         assert close(tp.adaptive_avg_pool1d(x, 3).tolist(),
                      torch.nn.functional.adaptive_avg_pool1d(rx, 3).tolist())
@@ -708,7 +710,6 @@ class TestFReexports:
 
 
 class TestAtLeastSequenceRegression:
-    """Locks the atleast_* Sequence + gradient contract vs torch."""
 
     @pytest.mark.parametrize("d", [1, 2, 3])
     def test_sequence_shapes(self, d):
@@ -815,7 +816,7 @@ class TestNativeDropoutFamily:
 
 class TestNativeTrapezoid:
     """trapezoid / cumulative_trapezoid: native fused kernels, values and
-    gradients must match torch exactly (weights rebuilt in the backward)."""
+"""
 
     def test_forward_dx_x_dim(self):
         y = tp.tensor([1.0, 4.0, 9.0, 16.0])
@@ -857,3 +858,143 @@ class TestNativeTrapezoid:
         f = torch.tensor(y, requires_grad=True)
         torch.cumulative_trapezoid(f, dx=1.0).sum().backward()
         assert e.grad.tolist() == f.grad.tolist() == [1.5, 2.5, 1.5, 0.5]
+
+
+class TestStructuralPointwiseBatch:
+    def test_flip_wrappers(self):
+        x = torch.randn(4, 5)
+        tx = tp.tensor(x.tolist())
+        assert close(tp.fliplr(tx).tolist(), x.fliplr().tolist())
+        assert close(tp.flipud(tx).tolist(), x.flipud().tolist())
+
+    def test_split_with_sizes_copy_family(self):
+        x = torch.randn(4, 5)
+        tx = tp.tensor(x.tolist())
+        got = [t.tolist() for t in tp.split_with_sizes_copy(tx, [1, 2, 2], 1)]
+        ref = [t.tolist() for t in torch.split(x, [1, 2, 2], 1)]
+        assert len(got) == len(ref) == 3
+        for g, r in zip(got, ref):
+            assert close(g, r)
+        got2 = [t.tolist() for t in tp.unsafe_split_with_sizes(tx, [2, 3], 1)]
+        for g, r in zip(got2, torch.split(x, [2, 3], 1)):
+            assert close(g, r.tolist())
+
+    def test_detach_copy_and_inplace(self):
+        x = torch.randn(3, 4)
+        tx = tp.tensor(x.tolist())
+        assert close(tp.detach_copy(tx).tolist(), x.detach().clone().tolist())
+        t2 = tp.tensor(x.tolist())
+        assert tp.detach_(t2) is t2
+
+    def test_resize_as(self):
+        x = torch.randn(4, 5)
+        got = tp.resize_as_(tp.tensor(x.tolist()), tp.ones(3))
+        ref = torch.tensor(x.tolist()).resize_as_(torch.ones(3))
+        assert got.shape == ref.shape
+
+    def test_gru_cell_matches_torch(self):
+        gc = torch.nn.GRUCell(6, 3)
+        with torch.no_grad():
+            gc.weight_ih.copy_(torch.ones(9, 6) * 0.1)
+            gc.weight_hh.copy_(torch.ones(9, 3) * 0.1)
+            gc.bias_ih.copy_(torch.ones(9) * 0.1)
+            gc.bias_hh.copy_(torch.ones(9) * 0.1)
+        ref = gc(torch.ones(2, 6), torch.ones(2, 3))
+        got = tp.gru_cell(tp.ones(2, 6), tp.ones(2, 3), tp.ones(9, 6) * 0.1,
+                            tp.ones(9, 3) * 0.1, tp.ones(9) * 0.1,
+                            tp.ones(9) * 0.1)
+        assert close(got.tolist(), ref.tolist())
+
+    def test_cdist_pnorms(self):
+        x1 = torch.randn(4, 6)
+        x2 = torch.randn(5, 6)
+        t1 = tp.tensor(x1.tolist())
+        t2 = tp.tensor(x2.tolist())
+        for p in (0, 1, 2, float("inf")):
+            assert close(tp.cdist(t1, t2, p).tolist(),
+                         torch.cdist(x1, x2, p).tolist(), tol=1e-4)
+
+    def test_xlogy_family(self):
+        a = torch.tensor([1.0, 0.0, 2.0, float("nan")])
+        b = torch.tensor([0.0, 3.0, float("nan"), 1.0])
+        ta = tp.tensor(a.tolist())
+        tb = tp.tensor(b.tolist())
+        got = tp.xlogy(ta, tb).tolist()
+        ref = torch.xlogy(a, b).tolist()
+        for g, r in zip(got, ref):
+            if isinstance(r, float) and math.isnan(r):
+                assert math.isnan(g)
+            elif isinstance(r, float) and math.isinf(r):
+                assert g == r
+            else:
+                assert close(g, r)
+
+    def test_ldexp_family(self):
+        got = tp.ldexp(tp.tensor([1.0, 2.0, 4.0]), tp.tensor([0, 1, 2]))
+        ref = torch.ldexp(torch.tensor([1.0, 2.0, 4.0]), torch.tensor([0, 1, 2]))
+        assert close(got.tolist(), ref.tolist())
+        t = tp.tensor([1.0, 2.0, 4.0])
+        tp.ldexp_(t, tp.tensor([0, 1, 2]))
+        r = torch.tensor([1.0, 2.0, 4.0])
+        torch.ldexp_(r, torch.tensor([0, 1, 2]))
+        assert close(t.tolist(), r.tolist())
+
+    def test_fmax_fmin(self):
+        a = torch.tensor([1.0, 0.0, 2.0, float("nan")])
+        b = torch.tensor([0.0, 3.0, float("nan"), 1.0])
+        ta = tp.tensor(a.tolist())
+        tb = tp.tensor(b.tolist())
+        assert close(tp.fmax(ta, tb).tolist(), torch.fmax(a, b).tolist())
+        assert close(tp.fmin(ta, tb).tolist(), torch.fmin(a, b).tolist())
+
+    def test_float_power(self):
+        got = tp.float_power(tp.tensor([2.0, 3.0]), tp.tensor([3.0, 2.0]))
+        ref = torch.float_power(torch.tensor([2.0, 3.0]), torch.tensor([3.0, 2.0]))
+        assert close(got.tolist(), ref.tolist())
+        got_i = tp.float_power(tp.tensor([2, 3]), tp.tensor([3, 2]))
+        ref_i = torch.float_power(torch.tensor([2, 3]), torch.tensor([3, 2]))
+        assert close(got_i.tolist(), ref_i.tolist())
+
+    def test_mvlgamma(self):
+        got = tp.mvlgamma(tp.tensor([3.0, 4.0, 5.5]), 2)
+        ref = torch.special.multigammaln(torch.tensor([3.0, 4.0, 5.5]), 2)
+        assert close(got.tolist(), ref.tolist())
+        got3 = tp.mvlgamma(tp.tensor([4.0, 5.0]), 3)
+        ref3 = torch.special.multigammaln(torch.tensor([4.0, 5.0]), 3)
+        assert close(got3.tolist(), ref3.tolist())
+
+    def test_conj_physical(self):
+        got = tp.conj_physical(tp.tensor([1.0, 2.0]))
+        ref = torch.conj_physical(torch.tensor([1.0, 2.0]))
+        assert close(got.tolist(), ref.tolist())
+        z = tp.tensor([[1.0, 2.0], [3.0, -1.0]]).view_as_complex()
+        gotz = tp.conj_physical(z).tolist()
+        refz = torch.conj_physical(torch.tensor([1 + 2j, 3 - 1j])).tolist()
+        for g, r in zip(gotz, refz):
+            assert abs(g.real - r.real) < 1e-6 and abs(g.imag - r.imag) < 1e-6
+
+    def test_negative_inplace(self):
+        t = tp.tensor([1.0, -2.0])
+        r = torch.tensor([1.0, -2.0])
+        tp.negative_(t)
+        torch.negative_(r)
+        assert close(t.tolist(), r.tolist())
+
+    def test_range_inclusive(self):
+        assert close(tp.range(0, 5).tolist(), torch.range(0, 5).tolist())
+        assert close(tp.range(1, 4, 0.5).tolist(),
+                     torch.range(1, 4, 0.5).tolist())
+
+    def test_is_signed(self):
+        assert tp.is_signed(tp.tensor([1.0])) == torch.is_signed(torch.tensor([1.0]))
+        assert tp.is_signed(tp.tensor([1], dtype=tp.uint8)) is False
+
+    def test_nonzero_static(self):
+        sv = torch.tensor([0.0, 1.0, 0.0, 2.0, 3.0])
+        tsv = tp.tensor(sv.tolist())
+        assert close(tp.nonzero_static(tsv, size=4).tolist(),
+                     torch.nonzero_static(sv, size=4).tolist())
+        assert close(tp.nonzero_static(tsv, size=1).tolist(),
+                     torch.nonzero_static(sv, size=1).tolist())
+        assert close(tp.nonzero_static(tsv, size=7, fill_value=-9).tolist(),
+                     torch.nonzero_static(sv, size=7, fill_value=-9).tolist())
