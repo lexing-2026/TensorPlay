@@ -1,6 +1,5 @@
-# Ported from torch/distributed/__init__.py: thin facade re-exporting the
-# c10d surface implemented in ``distributed_c10d`` plus the pure-Python
-# store layer.
+# Distributed process-group surface implemented in ``distributed_c10d`` plus
+# the pure-Python store layer.
 from tensorplay.distributed import distributed_c10d as _c10d
 from tensorplay.distributed._store import FileStore, Store, StoreTimeoutError, TCPStore
 from tensorplay.distributed.constants import (
@@ -9,8 +8,6 @@ from tensorplay.distributed.constants import (
 )
 from tensorplay.distributed.distributed_c10d import *  # noqa: F401,F403
 
-# Private-but-de-facto-public names: torch exposes
-# ``torch.distributed._get_default_group`` and friends, and tp call sites
 # (DDP, DDP comm hooks, checkpoint) rely on them, so re-export the internal
 # accessors too.
 _get_default_group = _c10d._get_default_group

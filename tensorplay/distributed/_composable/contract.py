@@ -1,4 +1,3 @@
-# Ported from torch/distributed/_composable/contract.py.
 from collections.abc import Callable
 from typing import Protocol, TypeVar
 
@@ -56,7 +55,6 @@ def contract(
 
 
 def _get_registry(module: Module) -> dict[str, RegistryItem] | None:
-    """Get the ``Module``'s registry, creating it if necessary (torch parity)."""
     if not hasattr(module, "__dict__"):
         raise TypeError(
             "tensorplay.distributed composable APIs do not support modules "

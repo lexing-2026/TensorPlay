@@ -1,10 +1,9 @@
 """MEGA storage backends for tensorplay.distributed.checkpoint.
 
-Where torch.distributed.checkpoint ships HuggingFace safetensors backends
 (``HuggingFaceStorageWriter/Reader`` — Xet-backed chunk storage), tensorplay
 ships the MEGA equivalents: shards are written in tp's native ``.mega``
-format plus a ``model.mega.index.json`` weight-map (mirroring HF's
-``model.safetensors.index.json``), and paths of the form
+format plus a ``model.mega.index.json`` weight-map that interoperates with
+``model.safetensors.index.json`` files, and paths of the form
 
     mega://<repo-id>[@<revision>]/<path/in/repo>
     mega://buckets/<bucket-id>/<path/in/bucket>
@@ -180,7 +179,6 @@ class MegaStorageWriter(FileSystemWriter):
             "weight_map": self.weight_map,
         }
         self.resolver.put_bytes(_META_FN, json.dumps(index_doc, indent=2).encode())
-        # Keep torch-parity sidecar so FileSystemReader-based tooling can also
         # discover the checkpoint.
         if not self.resolver.remote:
             import pickle

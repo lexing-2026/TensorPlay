@@ -1,6 +1,4 @@
-# Ported from torch/distributed/algorithms/ddp_comm_hooks/powerSGD_hook.py.
 #
-# Adaptations for tp: no torch.bmm (per-batch matmul loop), no
 # linalg.qr(out=) (copy the Q factor back in place), and no resize_ (the
 # batched variant pads via a temporary buffer and returns it).
 import logging
@@ -28,7 +26,6 @@ def _not_none(x):
 
 
 def _bmm_out(a, b, out):
-    """torch.bmm(a, b, out=out) for tp: per-batch matmul."""
     batch = a.shape[0]
     for i in range(batch):
         out[i].copy_(a[i] @ b[i])

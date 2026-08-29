@@ -1,8 +1,6 @@
-# Ported from torch/distributed/rendezvous.py.
 #
 # Adaptations: tp's FileStore/TCPStore are pure Python (no libuv backend,
 # no multi_tenant option), and the TCPStore server lives on rank 0 exactly
-# as in torch's start_daemon path.
 try:
     from urllib.parse import urlparse, urlunparse
 except ImportError as e:
@@ -165,7 +163,7 @@ def _agent_store_serves(hostname, port) -> bool:
 def _create_c10d_store(
     hostname, port, rank, world_size, timeout,
 ) -> Store:
-    """Create the rendezvous store on ``rank`` (torch parity).
+    """
 
     When the elastic agent serves ``hostname:port`` itself, every rank
     creates a client-only store; otherwise rank 0 hosts the server.

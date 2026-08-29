@@ -1,6 +1,6 @@
-"""``torch.distributed.checkpoint.state_dict`` compatible surface.
+"""State-dict helpers for plain modules, DDP, and optimizers.
 
-Ported subset: the plain-module and DDP paths of get_state_dict /
+The supported subset covers the plain-module and DDP paths of get_state_dict /
 set_state_dict / get_model_state_dict / set_model_state_dict /
 get_optimizer_state_dict / set_optimizer_state_dict. FSDP/DTensor-specific
 options are accepted-and-ignored or raise, matching what tp can honor.
@@ -20,7 +20,6 @@ __all__ = [
 
 
 def _unwrap(model):
-    # DDP wrapper: tp DDP keeps the inner module under `.module` like torch.
     return getattr(model, "module", model)
 
 
@@ -29,7 +28,6 @@ def get_model_state_dict(
     *,
     options=None,
 ) -> Dict[str, Any]:
-    """Model state dict; DDP ``module.`` prefix stripped (torch semantics)."""
     inner = _unwrap(model)
     sd = {k: (v.detach().clone() if isinstance(v, tp.Tensor) else v)
           for k, v in inner.state_dict().items()}
@@ -74,7 +72,6 @@ def set_optimizer_state_dict(
 
 
 def get_state_dict(model, optimizers, *, options=None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Combined model+optimizer state dicts (torch.distributed.checkpoint.state_dict)."""
     return get_model_state_dict(model), get_optimizer_state_dict(model, optimizers)
 
 

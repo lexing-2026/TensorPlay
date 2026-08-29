@@ -1,6 +1,4 @@
-# Ported from torch/distributed/device_mesh.py.
 #
-# Adaptation: torch's layout internals (_MeshLayout/_pycute) are replaced by
 # plain sizes/strides bookkeeping; the public API (init_device_mesh,
 # get_group, get_local_rank, get_coordinate, submesh __getitem__, context
 # manager, from_group) is preserved.
@@ -30,7 +28,6 @@ class _MeshEnv(threading.local):
 
 
 class _MeshResources:
-    """Per-thread mesh resources (torch _mesh_resources singleton)."""
 
     def __init__(self) -> None:
         # map from root_mesh to list of all meshes with root_mesh as parent
@@ -80,7 +77,6 @@ def _coord_at(sizes, strides, flat_idx):
 
 class DeviceMesh:
     """
-    DeviceMesh represents a mesh of devices (torch parity).
 
     The mesh is an n-d array whose values are global ranks. Process groups
     are created per mesh dimension so collectives can run on each dimension
@@ -259,7 +255,6 @@ class DeviceMesh:
     # public API
     # ------------------------------------------------------------------
     def get_group(self, mesh_dim=None):
-        """Returns the process group along ``mesh_dim`` (torch parity)."""
         if mesh_dim is None:
             if self._mesh_dim_names and len(self._mesh_dim_names) == 1:
                 mesh_dim = 0
@@ -286,7 +281,6 @@ class DeviceMesh:
         return len(self._sizes)
 
     def get_local_rank(self, mesh_dim=None) -> int:
-        """Returns local rank along ``mesh_dim`` (torch parity)."""
         my_global = dist.get_rank()
         pos = self._rank_map.index(my_global)
         coords = self._coords_of(pos)
@@ -309,7 +303,6 @@ class DeviceMesh:
         return self._coords_of(pos)
 
     def __getitem__(self, mesh_dim_names) -> "DeviceMesh":
-        """Slice the current DeviceMesh to create a submesh (torch parity)."""
         if isinstance(mesh_dim_names, str):
             mesh_dim_names = (mesh_dim_names,)
         if self._mesh_dim_names is None:
@@ -410,7 +403,6 @@ def init_device_mesh(
     backend_override=None,
 ) -> DeviceMesh:
     """
-    Initializes a `DeviceMesh` based on `device_type` and `mesh_shape` (torch parity).
 
     This creates a DeviceMesh with an n-dimensional array layout, where `n`
     is the length of `mesh_shape`. If `mesh_dim_names` is provided, each

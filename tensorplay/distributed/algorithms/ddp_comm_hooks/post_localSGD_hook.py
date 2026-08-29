@@ -1,4 +1,3 @@
-# Ported from torch/distributed/algorithms/ddp_comm_hooks/post_localSGD_hook.py.
 import logging
 
 import tensorplay as tp

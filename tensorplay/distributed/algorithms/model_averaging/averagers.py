@@ -1,4 +1,3 @@
-# Ported from torch/distributed/algorithms/model_averaging/averagers.py.
 import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Iterable

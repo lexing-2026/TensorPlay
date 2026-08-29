@@ -1,4 +1,3 @@
-# Ported from torch/distributed/algorithms/model_averaging/hierarchical_model_averager.py.
 # Copyright 2022 Cruise LLC
 import logging
 import warnings

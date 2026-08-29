@@ -1,4 +1,3 @@
-# Ported from torch/distributed/_composable/replicate.py.
 import copy
 import weakref
 from collections.abc import Iterable
@@ -132,7 +131,7 @@ def replicate(
     ignored_modules: Iterable[Module] | None = None,
     **kwargs,
 ) -> Module:
-    r"""Replicates a module (torch composable-API parity).
+    r"""
 
     Args:
         module (nn.Module): module to replicate
@@ -169,7 +168,6 @@ def replicate(
     return module
 
 
-# Attach torch's ``state`` classmethod pattern (registry-backed).
 def _replicate_state_factory():
     return _ReplicateState()
 

@@ -1,8 +1,5 @@
-# Ported from torch/distributed/algorithms/ddp_comm_hooks/quantization_hooks.py.
 #
-# Adaptation: tp has no torch.ao.quantization yet, so minimal MinMax /
 # PerChannelMinMax observers (uint8 affine, qmin=0/qmax=255) are embedded
-# here with torch's calculate_qparams semantics.
 import tensorplay as tp
 import tensorplay.distributed as dist
 from tensorplay import nn
@@ -36,7 +33,6 @@ def _dequantize_per_channel_backend(y, scale, zero_point):
 
 
 class _MinMaxObserver:
-    """uint8 affine min/max observer (torch.ao.quantization.MinMaxObserver)."""
 
     def __init__(self):
         self.min_val = None

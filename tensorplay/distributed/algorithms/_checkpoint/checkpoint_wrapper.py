@@ -1,8 +1,5 @@
-# Ported from torch/distributed/algorithms/_checkpoint/checkpoint_wrapper.py.
 #
 # Adaptations for tp: ``apply_activation_checkpointing`` implements the
-# check_fn/auto-wrap walk inline (torch delegates to FSDP wrap utilities),
-# and OffloadWrapper requires torch-style save_on_cpu which tp does not
 # expose yet.
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator
@@ -116,7 +113,6 @@ class OffloadWrapper(ActivationWrapper):
     def forward(self, *args, **kwargs):
         raise NotImplementedError(
             "OffloadWrapper requires autograd-graph save_on_cpu support "
-            "(torch.autograd.graph.save_on_cpu); pending in tp."
         )
 
 
@@ -184,7 +180,6 @@ class CheckpointWrapper(ActivationWrapper):
 
 def offload_wrapper(module: nn.Module) -> nn.Module:
     """
-    Wrap a module for activation offloading to CPU (torch parity).
 
     Requires save_on_cpu support; see OffloadWrapper.
     """

@@ -1,4 +1,3 @@
-# Ported from torch/distributed/constants.py. tp's default timeouts live in
 # Python (the store layer is pure Python), so the C++ fallbacks are absent.
 from datetime import timedelta
 

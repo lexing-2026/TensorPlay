@@ -1,4 +1,3 @@
-# Ported from torch/distributed/optim/functional_adamw.py.
 import tensorplay as tp
 from tensorplay.optim import adamw as F
 from tensorplay import Tensor

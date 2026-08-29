@@ -1,6 +1,5 @@
-"""
+"""Distributed optimizer utilities.
 :mod:`tensorplay.distributed.optim` exposes distributed optimizer utilities
-ported from ``torch/distributed/optim``.
 """
 
 import warnings
@@ -24,7 +23,6 @@ from .utils import as_functional_optim
 
 
 # DistributedOptimizer imports tensorplay.distributed.rpc names, so gate availability
-# based on RPC being available (torch parity).
 try:
     from .optimizer import DistributedOptimizer
 except RuntimeError:  # pragma: no cover - rpc gate raises lazily instead

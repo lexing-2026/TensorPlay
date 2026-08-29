@@ -1,8 +1,6 @@
-# Ported from torch/distributed/checkpoint/state_dict_saver.py.
 #
 # Adaptation: tp's DCP consolidates each rank's local state on the
 # coordinator rank via object collectives, then writes through the storage
-# writer. Torch's sharded-planner write path (parallel per-shard files) is
 # tracked in docs/gap_analysis.md.
 import warnings
 from typing import Any
@@ -59,7 +57,7 @@ def _exchange_local_states(state_dict, pg) -> list[Any] | None:
 
 def save(state_dict, *, checkpoint_id=None, storage_writer=None,
          planner=None, process_group=None, no_dist=False) -> Any:
-    """Save a distributed state dict (torch ``dist.checkpoint.save`` parity).
+    """
 
     Args:
         state_dict: the state dict to save.
@@ -113,7 +111,6 @@ def save(state_dict, *, checkpoint_id=None, storage_writer=None,
 
 def async_save(state_dict, *, checkpoint_id=None, storage_writer=None,
                process_group=None) -> Any:
-    """Async save (torch parity); tp currently performs it synchronously."""
     warnings.warn(
         "tp DCP async_save currently performs a synchronous save.",
         stacklevel=2,
