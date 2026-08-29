@@ -1,8 +1,7 @@
 name: periodic
 
-# Weekly full-matrix build+smoke-test sweep of the default branch, mirroring
-# pytorch's periodic/scheduled builds. Catches breakage that lands between PRs
-# (toolchain updates, CUDA toolkit images, dependency drift). Nothing is
+# Weekly full-matrix build+smoke-test sweep of the default branch. It catches
+# toolchain updates, CUDA toolkit images, and dependency drift. Nothing is
 # uploaded: this is a health check only.
 
 on:

@@ -1,9 +1,6 @@
 # Helper for building custom operators.
 #
-# Layout mirrors upstream torch: the tensorplay::python_c conversion surface
-# (CPythonBridge.cpp) plays the role of torch_python and lives in its own
 # shared library; every op module is a plain Python_add_library(MODULE
-# WITH_SOABI) linking it plus p10 (the libtorch analog).  Generated bindings
 # are raw CPython (PyMethodDef/METH_FASTCALL) with no pybind11 in the
 # extension itself.
 
@@ -42,7 +39,6 @@ function(add_tensorplay_op)
 
     # Conversion surface shared across op modules -- one copy keeps the
     # pybind11 caster substrate (used internally by the bridge) registered
-    # from a single module boundary, like torch_python.
     if(NOT TARGET tp_python)
         find_package(pybind11 CONFIG REQUIRED)
         add_library(tp_python SHARED "${TP_REPO_DIR}/src/bindings/python/CPythonBridge.cpp")

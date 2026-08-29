@@ -1,6 +1,5 @@
 # Build system requirements
 # Kept in sync with [build-system].requires and [dependency-groups] dev in
-# pyproject.toml (mirrors pytorch's requirements-build.txt). Needed only for
 # --no-build-isolation builds; isolated PEP 517 builds fetch these
 # automatically.
 scikit-build-core>=1.0

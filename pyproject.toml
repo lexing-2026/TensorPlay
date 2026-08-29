@@ -67,7 +67,6 @@ Contributing = "https://github.com/lexing-2026/TensorPlay/blob/main/CONTRIBUTING
 [[tool.dynamic-metadata]]
 # Delegates to tools/metadata/version.py which resolves the version from
 # TENSORPLAY_BUILD_VERSION / TENSORPLAY_BUILD_NUMBER (release), PKG-INFO
-# (sdist), or version.txt + git SHA (dev builds) -- mirroring pytorch's
 # tools/metadata provider chain.
 provider = { path = "tools/metadata", module = "version" }
 
@@ -78,10 +77,8 @@ minimum-version = "build-system.requires"
 build-dir = "build"
 # cmake.build-type is deliberately not set: it defaults to Release, and
 # leaving it unconfigured lets scikit-build-core honor a CMAKE_BUILD_TYPE
-# set in the environment (mirrors pytorch's pyproject.toml).
 
 [tool.scikit-build.env]
-# MAX_JOBS is pytorch's umbrella parallelism knob; alias it to the variable
 # CMake natively honors for `cmake --build`. setdefault semantics: a
 # user-set CMAKE_BUILD_PARALLEL_LEVEL always wins.
 CMAKE_BUILD_PARALLEL_LEVEL = { env = "MAX_JOBS" }
@@ -100,7 +97,6 @@ strip = false
 
 [tool.scikit-build.sdist]
 # Ship the buildable sources, not repo/CI plumbing or the reference-only
-# third_party checkouts (pytorch/audio are 1.7G+ gitlinks used for alignment
 # work, never consumed by the build).
 exclude = [
     "**/.github/**",
@@ -130,7 +126,6 @@ exclude = [
 ]
 
 [dependency-groups]
-# Kept in sync with requirements-build.txt (mirrors pytorch keeping its
 # requirements-build.txt in sync with [dependency-groups] dev).
 dev = [
     "scikit-build-core>=1.0",
@@ -146,7 +141,6 @@ dev = [
     "numpy>=2.0.0",
     "typing-extensions>=4.0.0",
     # Conventional Commits tooling: cz changelog drafts only; versions follow
-    # pytorch's rules, so cz bump is never used (see [tool.commitizen]).
     "commitizen",
     "pre-commit",
 ]
@@ -165,7 +159,6 @@ select = [
 ]
 ignore = [
     # Pre-existing debt across the codebase; tighten over time
-    # (mirrors pytorch keeping an explicit ignore list).
     "E402",                 # module level import not at top of file
     "E701", "E702", "E731", # colon/semicolon compound statements, lambda assign
     "E741",                 # ambiguous variable name `l`; used in math-heavy code
@@ -181,7 +174,6 @@ ignore = [
 
 # Conventional Commits (commitizen) ############################################
 # Used ONLY for changelog drafting (`cz changelog --dry-run`, see RELEASE.md).
-# cz bump is deliberately never run: versions follow pytorch's rules
 # (version.txt + tools/generate_tensorplay_version.py). Commit message
 # enforcement lives in tools/commit_schema.py (commit-msg hook + pr-title
 # workflow); its scope-enum maps 1:1 to the "release notes: *" labels.
