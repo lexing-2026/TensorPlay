@@ -538,7 +538,6 @@ Tensor embedding_cuda(
     TP_THROW(TypeError, "embedding: indices must be Int64 or Int32");
   }
   // scale_grad_by_freq affects only the derivative; accepting it here is
-  // required for the forward half of the Torch API contract.
   (void)scale_grad_by_freq;
   (void)padding_idx;
 

@@ -178,7 +178,6 @@ void validate_fused_steps(const std::vector<Tensor>& params,
 }
 
 // Non-capturable optimizer state keeps the scalar step counters on CPU, just
-// like Torch.  The CUDA algorithm kernels consume one host value per tensor;
 // incrementing the counters here avoids a separate device foreach launch and
 // leaves graph-capture/device-step cases on their existing fallback path.
 void validate_host_steps(const std::vector<Tensor>& params,
@@ -419,7 +418,6 @@ void fused_adam_cuda_impl(std::vector<Tensor> params,
     }
     const float* scale_ptr = optional_fused_float_ptr(grad_scale, "grad_scale");
     const float* found_ptr = optional_fused_float_ptr(found_inf, "found_inf");
-    // Non-capturable Torch optimizers deliberately keep their step tensors on
     // CPU.  Update them and materialize the host snapshot in one pass, then
     // use the same native MTA kernel as the device-step fused path.  AMP
     // metadata is intentionally excluded here because the host-step kernel
@@ -442,7 +440,6 @@ void fused_adam_cuda_impl(std::vector<Tensor> params,
                 // intermediate foreach boundary.  Keep the explicit fused
                 // kernel's all-opmath behavior for its public API, while the
                 // private exact route used by _multi_tensor_adam_ gets the
-                // native equivalent of Torch's composed sequence.
                 const bool use_exact = exact &&
                     (params[0].dtype() == DType::Float16 ||
                      params[0].dtype() == DType::BFloat16);
@@ -592,7 +589,6 @@ void fused_adagrad_cuda_impl(std::vector<Tensor> params,
                     for (size_t i = 0; i < steps.size(); ++i) {
                         // The foreach path materializes minus_clr before
                         // addcdiv_; keep the negative scalar in metadata so
-                        // the final add has the same sign as Torch.
                         corrected_lrs[i] = -scalar_lr /
                             (1.0 + (steps[i] - 1.0) * lr_decay);
                     }
@@ -799,7 +795,6 @@ void fused_nadam_cuda(
             0.96, steps[i] * momentum_decay));
         next_mu_products[i] = read_host_scalar(mu_products[i], op_name) * mu;
         write_host_scalar(mu_products[i], next_mu_products[i], op_name);
-        // Torch's scalar state is stored through its dtype before the next
         // foreach launch observes it.  Feed the rounded value to the kernel,
         // not the pre-store double temporary.
         next_mu_products[i] = read_host_scalar(mu_products[i], op_name);
@@ -1075,7 +1070,6 @@ std::vector<Tensor> foreach_sgd_cuda(const std::vector<Tensor>& params,
         TP_THROW(NotImplementedError,
                  "_foreach_sgd supports floating CUDA tensors");
     }
-    // Match PyTorch's in-place optimizer contract: the parameter version
     // changes immediately after the queued update, even though the CUDA
     // kernel itself executes asynchronously.
     for (const auto& param : params) {
@@ -1651,9 +1645,9 @@ void foreach_zero_inplace_cuda(std::vector<Tensor> self) {
 } // namespace
 
 // ---------------------------------------------------------------------------
-// Gap-fill: remaining functional foreach ops + the _out variant family.
-// Mirrors cpu/ForeachKernels.cpp: _out computes functionally, then copies
-// each result into the matching output handle.
+// Remaining functional foreach operations and the _out variant family.
+// The _out variants compute functionally, then copy each result into the
+// matching output handle.
 // ---------------------------------------------------------------------------
 
 static void copy_foreach_out_cuda(std::vector<Tensor> result,
@@ -2028,7 +2022,6 @@ void foreach_powsum_out_cuda(const std::vector<Tensor>& self, Scalar ord,
 //
 // The per-tensor foreach_map_* implementations pay one kernel launch per
 // tensor per op; a transformer-like group of 100+ small tensors therefore
-// spends its whole step in launch overhead (torch's CUDA foreach uses
 // MultiTensorApply for exactly this reason).  These wrappers route
 // eligible fp16/bf16/fp32/fp64 groups through foreach_mta::launch -- one
 // launch walks chunks from every tensor -- and fall back to the

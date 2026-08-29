@@ -100,7 +100,6 @@ namespace {
 #ifdef USE_CUDNN
 
 // Shared dtype mapping for the descriptor helpers below.  Half/BFloat16 run
-// with FLOAT compute type (torch's tensor-core path), so the alpha/beta
 // float scalars stay valid for them.
 inline cudnnDataType_t to_cudnn_data_type(DType d) {
     if (d == DType::Float32) return CUDNN_DATA_FLOAT;
@@ -161,7 +160,6 @@ struct ConvDesc {
     void set(int pad_h, int pad_w, int str_h, int str_w, int dil_h, int dil_w, int groups, DType dtype) {
         CUDNN_CHECK(cudnnSetConvolution2dDescriptor(desc, pad_h, pad_w, str_h, str_w, dil_h, dil_w, CUDNN_CROSS_CORRELATION, to_cudnn_compute_type(dtype)));
         CUDNN_CHECK(cudnnSetConvolutionGroupCount(desc, groups));
-        // torch.backends.cudnn.allow_tf32 (default True); only meaningful for
         // Float32 convolutions.
         cudnnMathType_t math_type = CUDNN_DEFAULT_MATH;
         if (dtype == DType::Float32 && tensorplay::globalContext().allowTF32CuDNN()) {
@@ -212,7 +210,6 @@ std::string make_conv_fwd_cache_key(
 }
 
 // Backward convolution algorithm selection is shape- and dtype-dependent,
-// but not iteration-dependent.  PyTorch's compiled path amortizes this
 // decision; caching it here removes a cuDNN v7 heuristic query from every
 // training convolution.
 struct ConvBwdKey {
@@ -299,20 +296,15 @@ ConvBwdKey make_conv_bwd_key(
 
 // ---- Algorithm cache + autotune for the legacy (v8) cuDNN paths -----------
 //
-// Parity/optimization notes vs aten's cudnn ConvShared.cpp:
-//  * torch caches the selected algorithm per shape (AlgorithmSearchCache);
 //    the conv3d / conv_transpose* paths used to re-run the v7 heuristic
 //    query on every call.  g_conv_nd_algo_cache fixes that.
-//  * torch.backends.cudnn.benchmark=True switches aten from the heuristic
 //    to cudnnFind*AlgorithmEx (real timing of candidate algorithms).  The
 //    autotune_* helpers implement the same for TensorPlay, gated on
 //    globalContext().cudnnBenchmark().
-//  * Autotune is skipped under deterministic mode, like torch does.
 
 static std::unordered_map<std::string, ConvBwdAlgo> g_conv_nd_algo_cache;
 static std::mutex g_conv_nd_cache_mutex;
 
-// Cap the workspace offered to the Find*Ex calls (torch similarly bounds it
 // by available memory; a fixed cap keeps autotune from grabbing all of VRAM).
 static constexpr size_t kConvAutotuneWorkspaceCap = 512ULL * 1024 * 1024;
 
@@ -647,15 +639,11 @@ static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const 
     else if (input.dtype() == DType::BFloat16) dtype = CUDNN_DATA_BFLOAT16;
     else TP_THROW(NotImplementedError, "cuDNN: only float/double/half/bfloat16 supported");
 
-    // Compute type: FLOAT for fp32/half/bf16, DOUBLE for fp64 (matches torch).
     cudnnDataType_t compute = (dtype == CUDNN_DATA_DOUBLE) ? CUDNN_DATA_DOUBLE : CUDNN_DATA_FLOAT;
-    // torch.backends.cudnn.allow_tf32 (default True): run Float32 convolutions
-    // with TF32 compute, matching at::Context::allowTF32CuDNN.
     if (dtype == CUDNN_DATA_FLOAT && tensorplay::globalContext().allowTF32CuDNN()) {
         compute = CUDNN_DATA_FLOAT;
     }
 
-    // Cache key: everything that determines the plan.  TorchInductor's
     // Conv_v8 path builds descriptors from actual sizes and strides, so the
     // layout is part of the plan identity as well.
     struct ConvKey {
@@ -743,9 +731,7 @@ static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const 
     };
 
     // Picks an execution plan for the graph.  Normally the first heuristic
-    // config (like torch's non-benchmark path); under cudnn.benchmark the
     // fallback heuristics are asked for several configs and the fastest is
-    // selected by actual timing (like torch's benchmark mode).
     auto pick_plan = [&](fe::OperationGraph& op_graph) -> std::shared_ptr<fe::ExecutionPlan> {
         const bool autotune = conv_autotune_enabled();
         auto heuristics = fe::EngineHeuristicsBuilder()
@@ -1205,8 +1191,6 @@ Tensor conv2d_grad_bias_cuda(const Tensor& grad_output, const Tensor& input, con
 }
 
 // =========================================================================
-// Conv-family alignment with ATen: conv1d / conv3d / conv_transpose* on
-// CUDA, and the unfold/fold kernels (aten Im2Col.cu / Col2Im.cu).
 // =========================================================================
 
 #ifdef USE_CUDNN
@@ -1270,7 +1254,6 @@ struct ConvDescNd {
                                                     CUDNN_CROSS_CORRELATION,
                                                     to_cudnn_compute_type(dtype)));
         CUDNN_CHECK(cudnnSetConvolutionGroupCount(desc, static_cast<int>(groups)));
-        // torch.backends.cudnn.allow_tf32 (default True); the 4-D ConvDesc
         // sets this too -- without it conv3d/conv_transpose3d fp32 would
         // silently skip tensor-op math.
         cudnnMathType_t math_type = CUDNN_DEFAULT_MATH;
@@ -1281,7 +1264,6 @@ struct ConvDescNd {
     }
 };
 
-// Adds a channel bias to a 5-D tensor (cudnnAddTensor is how torch's cudnn
 // conv path applies the bias too).
 static void conv3d_add_bias(cudnnHandle_t handle, const Tensor& out, const Tensor& bias) {
     if (!bias.defined() || bias.numel() == 0) return;
@@ -1597,11 +1579,9 @@ Tensor conv3d_grad_bias_cuda(const Tensor& grad_output, const Tensor& input, con
 // --- transpose convolutions --------------------------------------------------
 //
 // A transpose convolution forward is the backward-data pass of its adjoint
-// convolution (the same mapping torch's cudnn convolution_transpose path
 // uses): the transpose input plays dy, the (C_in, C_out/g, k, k) weight is
 // already the adjoint filter layout, and the declared dx shape is the
 // transpose output.  Valid whenever output_padding < stride, which is
-// torch's constraint on transpose convs.
 
 Tensor conv_transpose2d_cuda(const Tensor& input, const Tensor& weight, const Tensor& bias,
                              const std::vector<int64_t>& stride_arg,
@@ -1847,7 +1827,6 @@ Tensor conv_transpose2d_grad_input_cuda(const Tensor& grad_output, const Tensor&
                                         const std::vector<int64_t>& dilation) {
     Tensor grad_input = conv2d_cuda(grad_output, weight, Tensor(), stride, padding, dilation, groups);
     // output_padding >= stride makes the adjoint convolution larger than the
-    // original input; aten slices grad_input back to input's size (same fix
     // as the CPU path).
     if (grad_input.size(2) != input.size(2) || grad_input.size(3) != input.size(3)) {
         grad_input = grad_input.slice(2, 0, input.size(2))
@@ -1915,7 +1894,6 @@ Tensor conv_transpose3d_grad_bias_cuda(const Tensor& grad_output, const Tensor& 
     return conv3d_grad_bias_cuda(grad_output, input, weight, stride, padding, dilation, groups);
 }
 
-// --- unfold / fold (aten Im2Col.cu / Col2Im.cu) ------------------------------
 
 namespace {
 
@@ -2004,7 +1982,6 @@ Tensor im2col_cuda(const Tensor& self, const std::vector<int64_t>& kernel_size,
     const bool batched = input.dim() == 4;
     if (!batched && input.dim() != 3)
         TP_THROW(ValueError, "im2col: expected 3D (unbatched) or 4D input");
-    // fp16/bf16: compute in float32 like torch's CUDA opmath kernels, then
     // cast back (im2col only moves values, so this is exact).
     const bool lowp = input.dtype() == DType::Float16 || input.dtype() == DType::BFloat16;
     Tensor work = lowp ? input.to(DType::Float32) : input;

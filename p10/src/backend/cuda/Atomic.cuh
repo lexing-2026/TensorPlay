@@ -1,7 +1,3 @@
-// Vendored from pytorch aten/src/ATen/cuda/Atomic.cuh
-// (third_party/pytorch @ 893b6406afc1a6384ab6fae8a2247d03cc230d87).
-// Adaptation is dependency-only: at::Half/at::BFloat16 -> tensorplay::Half/
-// tensorplay::BFloat16, at::_isnan -> tp_at_isnan, c10::complex overloads
 // dropped (p10 uses std::complex and has no atomic complex users). The
 // algorithm bodies are kept verbatim.
 #pragma once

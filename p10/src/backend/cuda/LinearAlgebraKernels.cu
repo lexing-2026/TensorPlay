@@ -47,10 +47,9 @@ bool is_bias_vector(const Tensor& b, int64_t M, int64_t N) {
     return false;
 }
 
-// Torch broadcasts `input` against the GEMM output shape right-aligned and
 // reports mismatches through its expand wording.  Returns a (possibly
 // zero-stride) view; callers materialize with clone()/contiguous() before
-// mutating.  Mirrors expand_gemm_input in the CPU kernel.
+// mutating.  The CPU and CUDA paths use the same expansion rules.
 Tensor expand_gemm_input_cuda(const Tensor& input, const std::vector<int64_t>& target) {
     const int64_t td = target.size();
     const int64_t sd = input.dim();
@@ -108,7 +107,6 @@ Tensor mm_kernel_cuda(const Tensor& self, const Tensor& other) {
                  c10_style_dtype_name(self.dtype()), " != ", c10_style_dtype_name(other.dtype()));
     }
     const DType result_dtype = self.dtype();
-    // Validate the dtype before any empty/K==0 fast path.  Torch rejects
     // integer and bool CUDA matmul even when the mathematical result is empty
     // or identically zero.
     check_cublas_gemm_dtype(result_dtype);
@@ -258,7 +256,6 @@ Tensor matmul_batched_2d_cuda(
         return mm_kernel_cuda(self, other);
     }
 
-    // Torch lowers ``(batch..., M, K) @ (K, N)`` to one large 2-D mm by
     // folding the batch into M.  Besides matching that execution contract,
     // this avoids launching a strided-batched kernel for the common linear
     // layer pattern with one shared weight matrix.
@@ -294,7 +291,6 @@ Tensor addmm_kernel_cuda(const Tensor& input, const Tensor& mat1, const Tensor& 
         TP_THROW(RuntimeError, "mat1 and mat2 shapes cannot be multiplied (", mat1.size(0), "x", mat1.size(1),
                  " and ", mat2.size(0), "x", mat2.size(1), ")");
     }
-    // Torch requires all three operands to share one dtype; it checks
     // self-vs-mat2 first, then mat1-vs-mat2 (LinearAlgebra.cpp:185-186).
     if (input.dtype() != mat2.dtype()) {
         TP_THROW(RuntimeError, "self and mat2 must have the same dtype, but got ",
@@ -316,7 +312,6 @@ Tensor addmm_kernel_cuda(const Tensor& input, const Tensor& mat1, const Tensor& 
         return result;
     }
 
-    // Broadcast like torch: any input broadcastable to (M, N) is accepted.
     // The cuBLASLt bias epilogue stays as the fast path for the common
     // vector/(1,N) bias with beta == 1.
     if (beta_v == 1.0 && is_bias_vector(input, M, N)) {
@@ -340,7 +335,6 @@ Tensor matmul_kernel_cuda(const Tensor& self, const Tensor& other) {
         TP_THROW(RuntimeError, "matmul(): input operands must be at least 1D");
     }
 
-    // Shape contract first, using torch's exact wording (mirrors the CPU
     // kernel; see the comment there for the folding rules).
     const auto self_shape = static_cast<std::vector<int64_t>>(self.shape());
     const auto other_shape = static_cast<std::vector<int64_t>>(other.shape());
@@ -441,7 +435,6 @@ Tensor& matmul_out_kernel_cuda(const Tensor& self, const Tensor& other, Tensor& 
                  "but one of the arguments requires grad.");
     }
 
-    // Compute before touching `out`: Torch permits `out` to alias either input.
     Tensor result = matmul_kernel_cuda(self, other);
     if (out.shape() == result.shape()) {
         out.copy_(result);
@@ -502,7 +495,6 @@ Tensor adjoint_last_two_cuda(const Tensor& input) {
     return result;
 }
 
-// Keep matmul's shape metadata in line with Torch's maximum tensor rank.
 constexpr int kMatmulShapeMaxDims = 64;
 
 struct MatmulSumShapeInfo {
@@ -715,7 +707,6 @@ Tensor bmm_kernel_cuda(const Tensor& self, const Tensor& batch2) {
         TP_THROW(RuntimeError, "expected scalar type ", pretty_dtype_name(self.dtype()),
                  " but found ", pretty_dtype_name(batch2.dtype()));
     }
-    // Reject unsupported dtypes before touching memory, like torch.
     check_cublas_gemm_dtype(self.dtype());
     return matmul_batched_2d_cuda(self, batch2, {self.size(0)}, {batch2.size(0)});
 }
@@ -747,7 +738,6 @@ Tensor baddbmm_kernel_cuda(const Tensor& input, const Tensor& batch1, const Tens
     if (beta_v == 0.0) {
         result = Tensor::empty(target, batch1.dtype(), batch1.device());
     } else {
-        // Any broadcastable input works in torch, including 0-dim/(N,)/(M,N).
         // clone() is required even when input is already contiguous: unlike
         // addmm's internal destination, baddbmm's out-of-place result may
         // alias batch1/batch2 (Muon passes the same tensor as input and
@@ -771,8 +761,6 @@ Tensor baddbmm_kernel_cuda(const Tensor& input, const Tensor& batch1, const Tens
 }
 
 Tensor mv_kernel_cuda(const Tensor& self, const Tensor& vec) {
-    // Torch routes mv through addmv; mirror its meta checks verbatim
-    // (aten/src/ATen/native/Blas.cpp ADDMV_META).
     if (self.dim() != 2 || vec.dim() != 1) {
         TP_THROW(RuntimeError, "vector + matrix @ vector expected, got ", 1, ", ",
                  self.dim(), ", ", vec.dim());
@@ -820,7 +808,6 @@ Tensor dot_kernel_cuda(const Tensor& self, const Tensor& other) {
     }
 
     const DType dtype = self.dtype();
-    // Torch's CUDA dot only implements floating and complex dtypes.
     if (!isFloatingType(dtype) && !isComplexType(dtype)) {
         TP_THROW(NotImplementedError, "\"dot\" not implemented for '",
                  pretty_dtype_name(dtype), "'");
@@ -861,7 +848,6 @@ Tensor dot_kernel_cuda(const Tensor& self, const Tensor& other) {
 }
 
 Tensor inner_kernel_cuda(const Tensor& self, const Tensor& other) {
-    // Torch: scalar operands go through plain multiplication (with
     // promotion); otherwise this is tensordot over the last dimension.
     if (self.dim() == 0 || other.dim() == 0) {
         return self * other;
@@ -929,6 +915,45 @@ Tensor inner_backward_other_kernel_cuda(const Tensor& grad_output, const Tensor&
     return grad.reshape(static_cast<std::vector<int64_t>>(other.shape()));
 }
 
+// F.linear on CUDA: flatten the leading dims, run one cuBLASLt GEMM with the
+// when a bias is present).  The composite fallback issued matmul + broadcast
+// add as two kernels, leaving the GPU idle between them on small batches.
+Tensor linear_kernel_cuda(const Tensor& input, const Tensor& weight,
+                          const std::optional<Tensor>& bias_opt) {
+    if (input.dim() == 0 || weight.dim() == 0) {
+        TP_THROW(RuntimeError,
+                 "both arguments to linear need to be at least 1D, but they are ",
+                 input.dim(), "D and ", weight.dim(), "D");
+    }
+    if (weight.dim() != 2) {
+        TP_THROW(RuntimeError,
+                 "linear(): weight must be 2D (out_features, in_features), got ",
+                 weight.dim(), "D");
+    }
+    const int64_t k = weight.size(1);
+    const int64_t n = weight.size(0);
+    if (input.size(input.dim() - 1) != k) {
+        TP_THROW(RuntimeError,
+                 "mat1 and mat2 shapes cannot be multiplied (",
+                 input.size(input.dim() - 1), " and ", k, ")");
+    }
+    Tensor in2 = input.dim() == 1 ? input.reshape({1, k}) : input.reshape({-1, k});
+    Tensor wt = transpose_last_two_view_cuda(weight);
+    Tensor out2;
+    if (bias_opt.has_value() && bias_opt->defined()) {
+        out2 = addmm_kernel_cuda(*bias_opt, in2, wt, Scalar(1), Scalar(1));
+    } else {
+        out2 = matmul_kernel_cuda(in2, wt);
+    }
+    if (input.dim() == 1) return out2.reshape({n});
+    std::vector<int64_t> out_shape;
+    const auto in_shape = static_cast<std::vector<int64_t>>(input.shape());
+    out_shape.reserve(in_shape.size());
+    out_shape.insert(out_shape.end(), in_shape.begin(), in_shape.end() - 1);
+    out_shape.push_back(n);
+    return out2.reshape(out_shape);
+}
+
 TENSORPLAY_LIBRARY_IMPL(CUDA, LinearAlgebraKernels) {
     m.impl("mm", mm_kernel_cuda);
     m.impl("matmul", matmul_kernel_cuda);
@@ -936,6 +961,7 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, LinearAlgebraKernels) {
     m.impl("matmul_backward_self", matmul_backward_self_kernel_cuda);
     m.impl("matmul_backward_other", matmul_backward_other_kernel_cuda);
     m.impl("addmm", addmm_kernel_cuda);
+    m.impl("linear", linear_kernel_cuda);
     m.impl("bmm", bmm_kernel_cuda);
     m.impl("baddbmm", baddbmm_kernel_cuda);
     m.impl("mv", mv_kernel_cuda);

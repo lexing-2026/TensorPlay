@@ -310,7 +310,6 @@ std::tuple<Tensor, Tensor, Tensor> batch_norm_backward_cuda(
 // ============================================================================
 // Layer Normalization (custom kernels, no cuDNN dependency)
 //
-// Algorithm mirrors third_party/pytorch/aten/src/ATen/native/cuda/
 // layer_norm_kernel.cu: per-row Welford moments combined through warp
 // shuffles and shared memory, fp32 accumulation for Half/BFloat16 inputs,
 // fused stats+apply forward pass with vectorized loads when N % 4 == 0.
@@ -771,9 +770,6 @@ std::tuple<Tensor, Tensor, Tensor> layer_norm_backward_cuda(
 
 // ===========================================================================
 // GroupNorm / InstanceNorm.
-// Ports of ATen group_norm_kernel + group_norm_backward:
-//   aten/src/ATen/native/cuda/group_norm_kernel.cu
-//   aten/src/ATen/native/cuda/group_norm_backward_kernel.cu
 // Layout: input (N, C, ...) contiguous; one row == one (n, g) group with
 // inner = (C/G) * spatial elements.  Reuses the layer-norm block reducers.
 // ===========================================================================
@@ -1113,7 +1109,6 @@ std::tuple<Tensor, Tensor, Tensor> instance_norm_backward_cuda(
 
 // ---------------------------------------------------------------------------
 // rms_norm: y = x * rsqrt(mean(x^2)+eps) * w over trailing dims.
-// One block per row; fp32 accumulation for reduced dtypes (ATen semantics).
 // Native single kernel replaces the 6-op python composite (~24 extra
 // dispatches per Llama layer per token in the e2e decode profile).
 // ---------------------------------------------------------------------------

@@ -43,7 +43,6 @@ struct Segment {
     // Number of live, cached, or event-pending block metadata objects that
     // still refer to this cudaMalloc allocation.  A segment is returned to
     // CUDA only after this reaches zero; a live split block therefore keeps
-    // the rest of its segment reserved, exactly like Torch's inactive-split
     // accounting.
     size_t block_count = 0;
 };
@@ -132,7 +131,6 @@ struct GraphPool {
     std::vector<Segment*> segments;
     // Set when the last referencing graph reset while captured tensors were
     // still alive.  Segments are reclaimed lazily by the free path (or
-    // empty_cache) once those tensors die, mirroring torch's refcounted
     // private pools.
     bool pending_release = false;
 };
@@ -190,7 +188,6 @@ public:
         // capture is open anywhere in the process it would abort the capture
         // with cudaErrorStreamCaptureUnsupported (error 900), yet segments
         // must grow mid-capture to serve graph-pool allocations.  Mirror
-        // torch's CUDAStreamCaptureModeGuard by relaxing this thread's
         // capture mode around the driver call only.
         cudaStreamCaptureMode previous_mode = cudaStreamCaptureModeGlobal;
         const bool relax = !active_captures_.empty();
@@ -441,7 +438,7 @@ public:
     // -- graph-private pools (CUDAGraph.h) ------------------------------------
 
     // Reserves a fresh pool id without creating the pool; capture-time routing
-    // creates it lazily (mirrors c10's graph_pool_handle).
+    // creates it lazily when capture begins.
     uint64_t newGraphPoolId() {
         std::lock_guard<std::mutex> lock(mutex_);
         return next_pool_id_++;
@@ -557,7 +554,6 @@ public:
         if (poolLiveRefsLocked(it->second) != 0) {
             // Static input/output tensors of a reset graph are still alive;
             // defer segment reclamation to their deallocation instead of
-            // failing the reset (torch's private pools are refcounted).
             it->second.pending_release = true;
             return;
         }
@@ -663,7 +659,6 @@ private:
     // Insert a completed block and merge adjacent free blocks from the same
     // allocation stream.  Blocks from different owner streams deliberately
     // remain separate: they cannot be handed to one another without an
-    // explicit cross-stream event, matching Torch's per-stream free pools.
     static void insertCachedLocked(DeviceCache& cache,
                                    const std::shared_ptr<Block>& original) {
         auto block = original;
@@ -712,7 +707,6 @@ private:
         // A block used by another stream is moved to ``pending`` on release
         // and only returns here after all recorded events complete.  Keeping
         // the owner-stream partition prevents an un-fenced owner block from
-        // being handed to a different stream, as in Torch's stream-keyed
         // caching pools.
         for (auto it = pool.lower_bound(rounded); it != pool.end(); ++it) {
             auto& bucket = it->second;

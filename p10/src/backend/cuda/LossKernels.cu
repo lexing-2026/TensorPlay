@@ -15,7 +15,6 @@
 namespace tensorplay {
 namespace cuda {
 
-// ATen alignment: reduced floating types (Half/BFloat16) compute in float32.
 template <typename T> struct LossMath { using type = T; };
 template <> struct LossMath<tensorplay::Half> { using type = float; };
 template <> struct LossMath<tensorplay::BFloat16> { using type = float; };
@@ -53,7 +52,6 @@ __global__ void nll_loss_forward_kernel(
 }
 
 // Reduced-precision outputs accumulate in fp32 scalars: BF16 atomicAdd is
-// sm_90+ only, and fp32 accumulation matches ATen's acc_type semantics.
 template <typename T, typename ACC>
 __global__ void nll_loss_atomic_kernel(
     int64_t n, int64_t C,
@@ -86,7 +84,6 @@ __global__ void nll_loss_atomic_kernel(
 // losses and reduces them within the block (warp shuffles + shared memory),
 // writing the final reduced loss and total weight directly. Replaces the
 // zero-init + atomics + finalize sequence (6 launches) with one launch,
-// which dominates small-input latency (ATen fuses similarly).
 template <typename T, typename TargetT>
 __global__ void nll_loss_reduce_kernel(
     int64_t n, int64_t C,
@@ -291,7 +288,6 @@ Tensor nll_loss_backward_cuda(const Tensor& grad_output, const Tensor& input, co
     return grad_input;
 }
 
-// ATen LossNLL.cpp nll_loss2d: input (N, C, H, W), target (N, H, W); every
 // spatial position is an independent batch row with input offset
 // (n * C + t) * H * W + pos.
 template <typename T, typename TargetT>
@@ -535,7 +531,6 @@ Tensor mse_loss_backward_cuda(const Tensor& grad_output, const Tensor& input, co
     return grad_input;
 }
 
-// Torch-aligned loss family: composition-style CUDA kernels. All elementwise
 // primitives (where/log/exp/sigmoid/clamp/sum/mean) dispatch to their CUDA
 // implementations, so these mirror the CPU compositions exactly.
 // -----------------------------------------------------------------------------
@@ -566,7 +561,6 @@ Tensor l1_loss_backward_cuda2(const Tensor& grad_output, const Tensor& input,
     return cuda_scale_grad(g, reduction, input.numel());
 }
 
-// ATen Loss.cpp + cuda/BinaryMiscOpsKernels.cu smooth_l1_kernel_cuda:
 // z = |x - t|; z < beta ? 0.5 z^2 / beta : z - 0.5 beta (equal at z == beta).
 Tensor smooth_l1_loss_cuda(const Tensor& input, const Tensor& target,
                            int64_t reduction, double beta) {
@@ -579,7 +573,6 @@ Tensor smooth_l1_loss_cuda(const Tensor& input, const Tensor& target,
     return cuda_loss_reduce(loss, reduction);
 }
 
-// ATen cuda/PointwiseOpsKernel.cu smooth_l1_backward_cuda_kernel:
 // x = input - target; |x| <= beta ? norm * x / beta : norm * sign(x),
 // with norm = 1/numel for mean reduction.
 Tensor smooth_l1_loss_backward_cuda(const Tensor& grad_output, const Tensor& input,
@@ -589,7 +582,6 @@ Tensor smooth_l1_loss_backward_cuda(const Tensor& grad_output, const Tensor& inp
     return cuda_scale_grad(g, reduction, input.numel());
 }
 
-// ATen Loss.cpp + cuda/BinaryMiscOpsKernels.cu huber_kernel_cuda:
 // z = |x - t|; z < delta ? 0.5 z^2 : delta (z - 0.5 delta).
 Tensor huber_loss_cuda(const Tensor& input, const Tensor& target,
                        int64_t reduction, double delta) {
@@ -602,7 +594,6 @@ Tensor huber_loss_cuda(const Tensor& input, const Tensor& target,
     return cuda_loss_reduce(loss, reduction);
 }
 
-// ATen cuda/PointwiseOpsKernel.cu huber_backward_cuda_kernel:
 // x = input - target; |x| <= delta ? norm * x : norm * delta * sign(x).
 Tensor huber_loss_backward_cuda(const Tensor& grad_output, const Tensor& input,
                                 const Tensor& target, int64_t reduction, double delta) {
@@ -637,8 +628,6 @@ Tensor kl_div_backward_cuda2(const Tensor& grad_output, const Tensor& input,
     return cuda_scale_grad(g, reduction, input.numel());
 }
 
-// ATen cuda/Loss.cu binary_cross_entropy_out_cuda: per-element
-// (t-1)*max(log(1-x),-100) - t*max(log(x),-100) (ATen asserts x,t in [0,1]
 // device-side), then optional weight multiply and reduction.
 Tensor binary_cross_entropy_cuda(const Tensor& input, const Tensor& target,
                                  const std::optional<Tensor>& weight, int64_t reduction) {
@@ -649,7 +638,6 @@ Tensor binary_cross_entropy_cuda(const Tensor& input, const Tensor& target,
     return cuda_loss_reduce(loss, reduction);
 }
 
-// ATen cuda/Loss.cu binary_cross_entropy_backward_out_cuda:
 // grad * (x - t) / max((1 - x) * x, 1e-12), then weight multiply, and
 // division by input.numel() for mean reduction.
 Tensor binary_cross_entropy_backward_cuda(const Tensor& grad_output, const Tensor& input,

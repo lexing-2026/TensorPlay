@@ -30,7 +30,6 @@ __global__ void sparse_embedding_keep_kernel(
     const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index < num_indices) {
         // This intentionally does not normalize or range-check indices.  The
-        // ATen sparse backward helper filters only the exact padding index;
         // embedding's forward/backward wrapper owns the normal validation.
         keep[index] = static_cast<int64_t>(indices[index]) != padding_idx;
     }
@@ -321,7 +320,6 @@ void dispatch_coalesce_dtype(DType dtype, F&& f) {
 // Zero detection at the byte level: every numeric encoding in use (IEEE
 // floats incl. +/-0, two's-complement ints, bool, complex pairs) is all-zero
 // bytes exactly when the value equals zero, and NaN carries nonzero bytes
-// like torch's nonzero semantics require.
 
 __global__ void nonzero_mask_bytes_kernel(int64_t n, int64_t elem_size,
                                           const unsigned char* data,
@@ -406,7 +404,6 @@ Tensor sparse_coo_tensor_cuda(const Tensor& indices, const Tensor& values,
     if (size.has_value()) {
         return Tensor::make_sparse_coo_tensor(indices, values, *size, is_coalesced);
     }
-    // Size inference (ATen SparseTensorConstructor.cpp): each sparse dim is
     // max(coord)+1; trailing dense dims come from the values' shape.
     if (!indices.is_contiguous()) {
         TP_THROW(RuntimeError,
@@ -605,7 +602,6 @@ Tensor sparse_mask_cuda(const Tensor& dense, const Tensor& mask) {
                  "sparse_mask(): operands have incompatible sizes; self and mask must have the same shape");
     }
     // Preserve the mask's COO ordering and duplicate entries.  This is the
-    // same projection semantics as ATen::sparse_mask; coalescing belongs to
     // callers that explicitly request it.
     Tensor canonical_mask = mask;
     Tensor dense_contiguous = dense.is_contiguous() ? dense : dense.contiguous();
@@ -765,7 +761,6 @@ Tensor embedding_sparse_backward_cuda(const Tensor& grad,
     Tensor output_indices;
     Tensor output_values;
 
-    // With no padding filtering, the ATen helper is just a pair of views plus
     // the canonical int64 index conversion.  This avoids both a launch and a
     // device-to-host synchronization for the common embedding case.
     if (padding_idx == -1) {
@@ -872,7 +867,7 @@ Tensor embedding_sparse_backward_cuda(const Tensor& grad,
 namespace {
 
 // Layout of a freshly allocated contiguous dense output, passed by value so
-// kernels read it from parameter space (mirrors SparseGatherInfo).
+// kernels read it from parameter space.
 struct DenseLayoutInfo {
     int64_t ndim;
     int64_t shape[kMaxSparseDims];
@@ -1258,7 +1253,6 @@ Tensor sparse_sum_cuda(const Tensor& self,
     Tensor canonical = input.is_coalesced() ? input : input.coalesce();
     const bool reduce_all = !dim.has_value() || dim->empty();
 
-    // Partial reduction (ATen _sparse_sum semantics): keep the surviving
     // coordinate rows on-device, rebuild an uncoalesced COO over the kept
     // dims and fold duplicates through the native coalesce.
     if (!reduce_all) {
@@ -1346,7 +1340,6 @@ Tensor sparse_sum_cuda(const Tensor& self,
 }
 
 // Coordinate-union addition: concatenate both COO component sets on-device
-// and fold duplicates through the native coalesce (ATen add semantics for
 // alpha=1).
 Tensor sparse_add_cuda(const Tensor& self, const Tensor& other) {
     if (!self.is_sparse() || self.is_sparse_csr() ||

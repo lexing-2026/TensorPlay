@@ -21,9 +21,7 @@
 
 // LLM hot-path sampling operators.
 // References:
-//   - multinomial: third_party/pytorch/aten/src/ATen/native/cuda/MultinomialKernel.cu
 //     (renormRowsL1 + prefix-sum binary search; sampleMultinomialOnce block scan)
-//   - topk:        third_party/pytorch/aten/src/ATen/native/cuda/TensorTopK.cu
 //     (block bitonic sort for small inputs)
 //   - sample:      fused temperature/top-k/top-p decoder sampler (single kernel)
 
@@ -41,7 +39,6 @@ namespace {
   } while (0)
 
 // ---------------------------------------------------------------------------
-// Block reduction helpers (warp shuffle, torch block_reduce.cuh style)
 // ---------------------------------------------------------------------------
 
 template <typename T>
@@ -89,7 +86,6 @@ __device__ inline T blockReduceMax(T val, T* smem) {
 }
 
 // ---------------------------------------------------------------------------
-// multinomial — impl 0: torch-style renorm + prefix sum + binary search.
 // Computes the normalized inclusive prefix sum of every row in a single
 // kernel (renormRowsL1 + cumsum fused), so the input tensor is never mutated.
 // ---------------------------------------------------------------------------
@@ -152,7 +148,6 @@ __global__ void binary_search_sample_kernel(
 }
 
 // ---------------------------------------------------------------------------
-// multinomial — impl 1: cooperative block scan (torch sampleMultinomialOnce).
 // One block per row; supports num_samples == 1 (the LLM decode hot path).
 // ---------------------------------------------------------------------------
 
@@ -230,7 +225,6 @@ __global__ void scan_sample_kernel(
 }
 
 // ---------------------------------------------------------------------------
-// topk — impl 0: block bitonic sort (torch SortingCommon bitonicSort style).
 // Requires cols (padded to a power of two) <= 4096 to fit in shared memory.
 // ---------------------------------------------------------------------------
 
@@ -358,7 +352,6 @@ __global__ void temp_softmax_kernel(float* logits, int64_t rows, int64_t cols, f
 }
 
 // Exact top-k filter in place: keeps exactly the k largest entries per row,
-// ties broken by lowest column index (matches torch.topk on equal values).
 __global__ void topk_mask_kernel(float* probs, int64_t rows, int64_t cols, int64_t k) {
   extern __shared__ float smem[];  // 2*blockDim floats + k floats + k int64
   float* red = smem;
@@ -408,7 +401,6 @@ __global__ void topp_mask_kernel(float* probs, int64_t rows, int64_t cols, float
   int64_t row = blockIdx.x;
   float* row_probs = probs + row * cols;
 
-  // If the total mass cannot reach top_p, keep everything (torch parity: the
   // filtered set is the whole distribution when its sum is below the threshold).
   float total = 0.f;
   for (int64_t c = threadIdx.x; c < cols; c += blockDim.x)
@@ -605,7 +597,6 @@ __global__ void fused_sample_kernel(
 
 Tensor multinomial_kernel_cuda(const Tensor& self, int64_t num_samples, bool replacement, int64_t impl) {
   if (!replacement) {
-    // torch parity: CUDA multinomial only supports replacement=true
     TP_THROW(NotImplementedError, "multinomial: replacement=False is not implemented for CUDA");
   }
   if (num_samples < 0) {
@@ -639,13 +630,11 @@ Tensor multinomial_kernel_cuda(const Tensor& self, int64_t num_samples, bool rep
   size_t smem = kThreads * sizeof(float);
 
   if (impl == 1 && num_samples == 1) {
-    // Cooperative block scan (torch sampleMultinomialOnce); one block per row.
     size_t smem_once = (kThreads + 2) * sizeof(float);
     scan_sample_kernel<<<rows, kThreads, smem_once, getCurrentCUDAStream().stream()>>>(
         prob.data_ptr<float>(), uniforms.data_ptr<float>(), result.data_ptr<int64_t>(), rows, cols);
     TP_CUDA_CHECK(cudaGetLastError());
   } else {
-    // torch-style: renorm + prefix sum -> binary search.
     prefix_renorm_kernel<<<rows, kThreads, smem, getCurrentCUDAStream().stream()>>>(
         prob.data_ptr<float>(), cumdist.data_ptr<float>(), rows, cols);
     TP_CUDA_CHECK(cudaGetLastError());

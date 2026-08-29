@@ -17,7 +17,6 @@
 
 // Native aligned flash reference.  This is the standalone CUDA/CUTE kernel
 // source used for the schedule comparison; FLASHATTENTION_DISABLE_DROPOUT
-// keeps the translation unit independent of ATen and its Philox ABI.
 #if __has_include("../../../../third_party/pytorch/third_party/flash-attention/csrc/flash_attn/src/flash.h") && \
     __has_include("../../../../third_party/pytorch/third_party/cutlass/include/cute/tensor.hpp")
 #define TP_HAS_NATIVE_CUTE_FLASH 1
@@ -49,7 +48,6 @@
 //   - impl 0 (naive): textbook O(T^2 * D) math attention, scores in smem.
 //   - impl 1 (flash): flash-attention-v1 style tiling with online softmax
 //     (rescaling), no O(T^2) memory; kv tiled in blocks of Br.
-//     Structure follows third_party/pytorch/aten/src/ATen/native/transformers/
 //     cuda/attention.cu (FlashAttentionForwardKernel) — simplified to a
 //     non-cutlass reference implementation.
 
@@ -498,7 +496,6 @@ __global__ void sdpa_softmax_kernel(
 
 // A compact FP16 Tensor Core attention path for the Llama head shape
 // (D=128).  It follows the same fused QK -> online softmax -> PV structure
-// as the local Torch/CUTLASS attention implementation, but keeps the
 // TensorPlay tensor ABI and dispatcher independent.  One block owns 16 query
 // rows of one head; four warps compute QK tiles and eight warps compute the
 // PV output tiles.  The 16 remaining warps each own one online-softmax row.
@@ -671,11 +668,9 @@ __global__ void sdpa_wmma_flash_half_kernel(
   }
 }
 
-// Torch's CUDA attention source uses a 64-row query tile and keeps the
 // Q/K/V tiles on chip while the online softmax advances through the keys.
 // The first WMMA prototype above used 512 threads for a 16-row tile; most of
 // those warps were idle in each phase.  This variant follows the useful part
-// of the Torch tiling strategy without including ATen: four warps own a
 // 64x64 tile, Q is loaded once, and each warp carries two 16-column output
 // fragments.  The Q/accumulator buffers are overlaid because Q is dead after
 // the last PV iteration.
@@ -771,7 +766,6 @@ __global__ void sdpa_wmma_flash_half_4warp_kernel(
 
     // QK^T: warp w owns one 16-column key strip and walks the four query
     // strips.  This is the same 16x16 Tensor Core decomposition used by the
-    // Torch/CUTLASS kernel, but with only four resident warps.
     if (warp < warps) {
       const int n0 = warp * 16;
 #pragma unroll
@@ -929,8 +923,6 @@ __global__ void sdpa_wmma_flash_half_4warp_kernel(
 #endif
 
 // Aligned native flash path for the benchmark's Llama head shape.  This is
-// intentionally a TensorPlay/CUDA implementation: the local Torch source is
-// used only for the 64x64 tile and online-softmax schedule; no ATen headers or
 // symbols are part of the dependency graph.
 struct TpWmmaFlashAlignedShared {
   // Keep the aligned Q/V tiles on chip for the whole Q block.  Q is reused for
@@ -1122,7 +1114,6 @@ __global__ __launch_bounds__(256, 2) void sdpa_wmma_flash_half_aligned_kernel(
     // Tensor Core PV update.  For the native SM89 16x16 row-major accumulator
     // layout, each lane's fragment elements map to local rows
     // (lane >> 2) + ((i & 2) ? 8 : 0).  Keeping this rescale in registers is
-    // the same role as Torch's accumulator iterator and avoids an O(q*d)
     // shared-memory round trip per key tile.
     if (!first_tile) {
       if (warp < warps) {
@@ -1205,7 +1196,6 @@ __global__ __launch_bounds__(256, 2) void sdpa_wmma_flash_half_aligned_kernel(
 #if defined(TP_HAS_NATIVE_CUTE_FLASH)
 // This is the exact native 64x64/4-warp schedule used by the aligned CUDA
 // path.  The wrapper only translates TensorPlay's [B,H,T,D] strides into the
-// standalone Flash_fwd_params ABI; no Torch tensor or ATen symbol crosses the
 // boundary.
 template <bool IsCausal, bool IsEvenMN>
 __global__ void tp_native_flash_hdim128_fp16_kernel(
@@ -1833,7 +1823,6 @@ namespace cuda {
         {__FILE__, __func__, __LINE__},                                       \
         ::tensorplay::detail::format_msg(__VA_ARGS__))
 
-// RoPE is part of the transformer attention path in local ATen (including
 // flash-attention's rotary Q/K handling), so keep these kernels beside SDPA
 // and grouped attention rather than under an LLM-specific translation unit.
 namespace {
@@ -2242,7 +2231,6 @@ std::tuple<Tensor, Tensor> fused_rope_cuda(
 //     cublasLt entry (gemm_impl) on zero-copy slice views, writing straight
 //     into preallocated output -- no per-group dispatcher round-trips, no
 //     cat copy pass.  Zero-fill allocation covers uncovered tail rows,
-//     matching torch._grouped_mm's zeroed-tail semantics.
 //   - GradMode path: differentiable composite (narrow/mm/cat through the
 //     dispatcher) so CIA records inner nodes automatically.
 Tensor grouped_mm_cuda(const Tensor& self, const Tensor& mat2,

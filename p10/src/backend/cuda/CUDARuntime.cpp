@@ -75,7 +75,6 @@ std::mutex& poolTableMutex() {
 
 std::vector<StreamPool*>& poolTable() {
     // CUDA streams are deliberately leaked. Destroying process-global streams
-    // after the CUDA runtime has begun shutting down is unsafe, and PyTorch's
     // stream pools follow the same lifetime rule.
     static auto* pools = new std::vector<StreamPool*>();
     return *pools;

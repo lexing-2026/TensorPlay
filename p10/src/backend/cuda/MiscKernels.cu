@@ -2,12 +2,6 @@
 //
 // These mirror the CPU composites in cpu/MiscKernels.cpp; every primitive
 // invoked (slice/view/expand/cat/sigmoid/where/eq) is itself dispatched to the
-// device backend, matching ATen where these ops are composite functions:
-//   aten/src/ATen/native/TensorShape.cpp        meshgrid()
-//   aten/src/ATen/native/TensorTransformations.{h,cpp}  roll()/roll_common()
-//   aten/src/ATen/native/ReduceOps.cpp          diff()/diff_helper()
-//   aten/src/ATen/native/Onehot.cpp             one_hot()
-//   aten/src/ATen/native/GatedLinearUnit.cpp    glu()/glu_backward()
 
 #include "Tensor.h"
 #include "CUDARuntime.h"
@@ -72,7 +66,6 @@ inline int64_t wrap_dim_local(int64_t dim, int64_t ndim) {
 } // anonymous namespace
 
 static Tensor diff_helper(const Tensor& self, int64_t n, int64_t dim) {
-    // ATen ReduceOps.cpp diff_helper.
     Tensor result = self;
     n = n > self.size(dim) ? self.size(dim) : n;
     for (int64_t i = 0; i < n; ++i) {
@@ -95,7 +88,6 @@ Tensor diff_cuda(const Tensor& self, int64_t n, int64_t dim, const Tensor& prepe
 }
 
 Tensor one_hot_cuda(const Tensor& self, int64_t num_classes) {
-    // ATen Onehot.cpp functional branch: eq(self.unsqueeze(-1), arange)
     if (self.dtype() != DType::Int64) {
         TP_THROW(RuntimeError, "one_hot is only applicable to index tensor of type LongTensor.");
     }
@@ -113,7 +105,6 @@ Tensor one_hot_cuda(const Tensor& self, int64_t num_classes) {
 }
 
 Tensor glu_cuda(const Tensor& self, int64_t dim) {
-    // ATen GatedLinearUnit.cpp / cpu Activation.cpp glu_kernel.
     if (self.dim() == 0) TP_THROW(RuntimeError, "glu does not support 0-dimensional tensors");
     const int64_t d = wrap_dim_local(dim, self.dim());
     const int64_t nIn = self.size(d);
@@ -128,7 +119,6 @@ Tensor glu_cuda(const Tensor& self, int64_t dim) {
 }
 
 Tensor glu_backward_cuda(const Tensor& grad_output, const Tensor& self, int64_t dim) {
-    // ATen GatedLinearUnit.cpp glu_backward_cpu_out semantics.
     if (self.dim() == 0) TP_THROW(RuntimeError, "glu does not support 0-dimensional tensors");
     const int64_t d = wrap_dim_local(dim, self.dim());
     const int64_t nIn = self.size(d);
@@ -230,7 +220,6 @@ __global__ void native_dropout_kernel(int64_t numel, PhiloxCudaState philox_args
     }
 }
 
-// ATen Dropout.cpp native_dropout_backward: grad * mask * scale. The mask
 // saved by the forward is bool, so mask.to(grad.dtype()) folds into the
 // masked load instead of materializing a cast. One thread per element on a
 // full grid (the SM-capped grid-stride shape of the forward measurably
@@ -280,8 +269,8 @@ __global__ void native_dropout_backward_kernel_vec8(int64_t nvec, float scale,
 
 } // namespace
 
-// Mirrors resize__cpu: grow storage in place preserving contents, shrink is
-// logical-only. Allocation/copy go through the CUDA caching allocator and
+// Grow storage in place while preserving contents; shrinking is logical-only.
+// Allocation and copying go through the CUDA caching allocator and
 // copyAllocationBytes, so no explicit memcpy or stream handling is needed.
 Tensor& resize__cuda(Tensor& self, const std::vector<int64_t>& size) {
     auto* impl = self.unsafeGetTensorImpl().get();
@@ -363,7 +352,6 @@ std::tuple<Tensor, Tensor> native_dropout_cuda(const Tensor& input, double p) {
     return {std::move(out), std::move(mask)};
 }
 
-// ATen Dropout.cpp native_dropout_backward: grad * mask * scale, reapplying
 // the bool mask saved by the forward. One thread per element on a full grid
 // (capped at the hardware grid.x limit, grid-stride above that); half/bf16
 // take the 8-wide vectorized path when size and alignment allow.
@@ -504,7 +492,6 @@ Tensor feature_dropout_backward_cuda(const Tensor& grad, const Tensor& mask,
 
 
 // ---------------------------------------------------------------------------
-// Trapezoid integration — ATen native Sum.cpp trapezoid/cumulative_trapezoid
 // expressed as dispatcher composites (narrow/add/mul/sum|cumsum). x=None
 // selects uniform spacing dx. Backward rebuilds the per-element weights:
 //   sum form:   w = dx * [0.5, 1, ..., 1, 0.5]
@@ -658,7 +645,6 @@ Tensor cumulative_trapezoid_backward_cuda(const Tensor& grad,
 }
 
 // ---------------------------------------------------------------------------
-// cov / corrcoef — mirror of the CPU composite port of ATen
 // native/Correlation.cpp; every primitive invoked is itself dispatched to
 // the CUDA backend.
 // ---------------------------------------------------------------------------

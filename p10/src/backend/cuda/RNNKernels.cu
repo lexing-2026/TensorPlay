@@ -1,10 +1,8 @@
 // Fused RNN cell kernels — port of
-// third_party/pytorch/aten/src/ATen/native/cuda/RNN.cu
 // (_thnn_fused_lstm_cell_cuda / _thnn_fused_gru_cell_cuda and their
 // backward impls).  TensorInfo addressing is replaced by flat contiguous
 // pointers: gates are row-major (N, G) with G = 4*H (LSTM) / 3*H (GRU),
 // states are (N, H), biases are (G,) or absent.
-// Half/BFloat16 accumulate in float32 (at::acc_type parity).
 
 #include "RNNCudaKernels.h"
 
@@ -258,7 +256,6 @@ __global__ void gru_cell_backward_kernel(
 
 inline Tensor cont(const Tensor& t) { return t.is_contiguous() ? t : t.contiguous(); }
 
-// Dispatch helper: invokes FN<T> for the floating dtype family (ATen
 // AT_DISPATCH_FLOATING_TYPES_AND2(kHalf, kBFloat16) equivalent).
 #define TP_RNN_DISPATCH(FN)                                             \
     switch (dtype) {                                                    \
@@ -403,7 +400,6 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> fused_gru_cell_backward(
     TP_RNN_DISPATCH(launch)
 
     Tensor zero;
-    // ATen computes the bias gradients as column sums of the gate gradients
     // at the composite level (RNN.cpp _thnn_fused_gru_cell_backward).
     return {grad_ig, grad_hg, grad_hx, zero, zero};
 }

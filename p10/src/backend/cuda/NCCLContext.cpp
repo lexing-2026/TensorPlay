@@ -3,7 +3,6 @@
 #include "Exception.h"
 
 // Older NCCL releases predate NCCL_VERSION_STRING; fall back to expanding
-// NCCL_VERSION_CODE (mirrors torch's version handling).
 #ifndef NCCL_VERSION_STRING
 #define TP_STRINGIZE_IMPL(x) #x
 #define TP_STRINGIZE(x) TP_STRINGIZE_IMPL(x)
@@ -12,7 +11,6 @@
 
 #ifndef USE_NCCL
 
-// Mirrors pytorch: without NCCL the whole implementation compiles out and
 // every entry point degrades to a runtime error.
 
 namespace tensorplay {
@@ -129,7 +127,6 @@ ncclRedOp_t toNcclRedOp(ReduceOp op) {
     }
 }
 
-// torch's _nccl_should_send_recv: skip zero-size p2p legs (NCCL errors on
 // zero-count send/recv).
 inline bool shouldSendRecv(size_t count) { return count > 0; }
 
@@ -164,7 +161,7 @@ Comm commInitRank(int rank, int world_size, const uint8_t* uid128) {
     ncclUniqueId uid;
     for (int i = 0; i < kUniqueIdBytes; ++i) uid.internal[i] = uid128[i];
     ncclComm_t comm = nullptr;
-    // Mirrors ProcessGroupNCCL: init can take minutes on slow networks.
+    // Initialization can take minutes on slow networks.
     checkNccl(ncclCommInitRank(&comm, world_size, uid, rank), "ncclCommInitRank");
     return static_cast<Comm>(comm);
 }
@@ -225,7 +222,6 @@ void reduceScatter(void* sendbuff, void* recvbuff, size_t count, DType dtype,
 
 // Byte size of one element for the flat-buffer slot arithmetic below.
 // (NCCL 2.x ships no rooted ncclGather/ncclScatter; the slot layout matches
-// torch::cuda::nccl::gather/scatter where root's buffers hold numranks
 // contiguous per-rank chunks.)
 inline size_t ncclElemSize(ncclDataType_t type) {
     switch (type) {
@@ -254,7 +250,6 @@ inline size_t ncclElemSize(ncclDataType_t type) {
 
 void gather(const void* sendbuff, void* recvbuff, size_t count, DType dtype,
             int root, Comm comm, void* stream) {
-    // Port of torch::cuda::nccl::gather: grouped point-to-point ops. The
     // root posts one recv per peer into its flat recv slots and copies its
     // own chunk device-to-device; every peer sends its chunk to the root.
     ncclComm_t c = static_cast<ncclComm_t>(comm);
@@ -292,7 +287,6 @@ void gather(const void* sendbuff, void* recvbuff, size_t count, DType dtype,
 
 void scatter(const void* sendbuff, void* recvbuff, size_t count, DType dtype,
              int root, Comm comm, void* stream) {
-    // Port of torch::cuda::nccl::scatter: the root sends one chunk per peer
     // from its flat send buffer and copies its own chunk; every peer receives
     // its chunk from the root.
     ncclComm_t c = static_cast<ncclComm_t>(comm);
@@ -351,7 +345,6 @@ void groupEnd() { checkNccl(ncclGroupEnd(), "ncclGroupEnd"); }
 void allToAllSingleEqualSplit(const void* sendbuff, void* recvbuff,
                               size_t count_total, DType dtype,
                               Comm comm, void* stream) {
-    // torch::cuda::nccl::all2all_single_equal_split
 #if defined(NCCL_ALLTOALL_SUPPORTED) || \
     NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
     int num_ranks = 0;
@@ -371,7 +364,6 @@ void allToAllSingleEqualSplit(const void* sendbuff, void* recvbuff,
     int num_ranks = 0;
     checkNccl(ncclCommCount(static_cast<ncclComm_t>(comm), &num_ranks),
               "ncclCommCount");
-    // torch parity (nccl.cpp all2all_single_equal_split): `count` is the
     // per-rank element count passed to NCCL, while the send/recv buffer
     // offsets are in BYTES (rankdiff = nbytes / size). Using the element
     // count as a byte stride mis-addresses every dtype wider than 1 byte.
@@ -398,7 +390,6 @@ void allToAllSingleUnequalSplit(
     const void* sendbuff, const size_t* sendcounts, const size_t* senddispls,
     void* recvbuff, const size_t* recvcounts, const size_t* recvdispls,
     size_t element_size, DType dtype, Comm comm, void* stream) {
-    // torch::cuda::nccl::all2all_single_unequal_split (send/recv group form;
     // used whenever NCCL lacks ncclAlltoAllv, i.e. always on stock builds).
     auto type = toNcclDType(dtype);
     ncclComm_t c = static_cast<ncclComm_t>(comm);
