@@ -323,8 +323,8 @@ public:
 P10_API Tensor operator-(const Tensor& t);
 
 // Dispatcher-level implementations shared by the backend kernels; the
-// clone/contiguous Tensor members are codegen-owned (native_functions.yaml)
-// and route here through the dispatcher.
+// clone/contiguous Tensor members are generated and route here through the
+// dispatcher.
 namespace detail {
 P10_API Tensor clone_impl(const Tensor& self,
                           std::optional<MemoryFormat> memory_format = std::nullopt);
