@@ -12,9 +12,7 @@
 namespace tensorplay {
 namespace cuda {
 
-// Non-constant padding modes (torch: reflection_padNd / replication_padNd /
-// circular_padNd).  Index math mirrors p10/src/backend/cpu/PadKernels.cpp,
-// which is verified bit-exact against torch's F.pad for all three modes.
+// circular_padNd). Index math supports reflect, replicate, and circular modes,
 
 namespace {
 
@@ -23,7 +21,7 @@ enum class PadIndexMode { Reflect = 0, Replicate = 1, Circular = 2 };
 struct PadPlan {
     int ndim;
     int k_padded;
-    int pad_pairs[8];      // torch order: [l(last), r(last), ...]
+    int pad_pairs[8];
     int src_sizes[8];
     long long src_strides[8];
     int dst_sizes[8];
@@ -43,7 +41,6 @@ __device__ inline long long pad_map_coord(long long q, long long left, long long
         return min(max(src, 0LL), size - 1);
     }
     // circular: python-style positive modulo (pad <= size enforced host-side,
-    // matching torch's "wrapping around more than once" check)
     return ((src % size) + size) % size;
 }
 
@@ -143,8 +140,6 @@ void pad_mode_check(const char* name, const Tensor& self, const std::vector<int6
 }
 
 // half/bf16 pads move values without arithmetic, so computing them in float32
-// and casting back (torch's CUDA opmath convention) is exact for the forward
-// and matches torch's accumulation for the backward.
 Tensor pad_mode_forward(const Tensor& self, const std::vector<int64_t>& pad, int mode) {
     Tensor src = self.is_contiguous() ? self : self.contiguous();
     const bool lowp = src.dtype() == DType::Float16 || src.dtype() == DType::BFloat16;
@@ -234,7 +229,6 @@ Tensor circular_pad_nd_backward_cuda(const Tensor& grad_output, const Tensor& se
 }
 
 // constant_pad_nd is a composite over slice/fill_/copy_ (see the CPU implementation of
-// aten/src/ATen/native/PadNd.cpp:29); every primitive used has a CUDA kernel,
 // so the same body serves both backends.
 static Tensor constant_pad_nd_cuda(const Tensor& self, const std::vector<int64_t>& pad,
                                    Scalar value) {

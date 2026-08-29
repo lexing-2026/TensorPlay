@@ -24,7 +24,6 @@ namespace cuda {
     } \
   } while (0)
 
-// ATen alignment: grid-stride loops (cuda::detail::elementwise_kernel) so any
 // grid size is correct and huge tensors don't overflow gridDim.x.
 template <typename T, typename Func>
 __global__ void unary_kernel_cuda_impl(int64_t n, const T* input, T* output, Func func) {
@@ -35,11 +34,8 @@ __global__ void unary_kernel_cuda_impl(int64_t n, const T* input, T* output, Fun
     }
 }
 
-// ATen alignment: vectorized fast path — each thread processes 4 elements via
-// float4/double4 loads when the pointers are 16B aligned (mirrors
-// vectorize_elementwise_kernel<4>). Falls back to scalar loop otherwise.
-// ATen alignment: vectorized fast path — each thread processes 4 elements via
-// aligned wide loads (mirrors vectorize_elementwise_kernel<4>).
+// Use float4/double4 loads when pointers are 16B aligned. Fall back to a
+// scalar loop otherwise.
 template <typename T, int VecSize>
 struct alignas(VecSize * sizeof(T)) VecPack { T v[VecSize]; };
 
@@ -87,7 +83,6 @@ __global__ void binary_vectorized_kernel_cuda_impl(int64_t n, const T* a, const 
     }
 }
 
-// ATen alignment: reduced floating types (Half/BFloat16) compute in float32
 // (opmath_t). Load -> convert -> op -> convert back, all in one kernel.
 template <typename T, typename Func>
 __global__ void unary_reduced_float_kernel_cuda_impl(int64_t n, const T* input, T* output, Func func) {
@@ -100,7 +95,6 @@ __global__ void unary_reduced_float_kernel_cuda_impl(int64_t n, const T* input, 
 
 // --- Dispatchers ---
 
-// ATen alignment: elementwise launch config mirrors ATen's
 // elementwise_kernel: 128 threads/block, 4 elems/thread when vectorized,
 // grid capped at a few blocks per SM.
 inline int device_sms() {
@@ -268,7 +262,6 @@ Tensor abs_kernel_cuda(const Tensor& self) {
 }
 // neg/square complex paths are defined after complex_math_kernel_cuda and the
 // Cx* functors below (translation-unit ordering; see #undef CX_FUNCTOR).
-// ATen alignment: sgn(z) = z / |z| for complex, 0 stays 0. Operates on the
 // interleaved re/im storage directly.
 __global__ void sign_cplx_f32_kernel(int64_t n, const float* __restrict__ src, float* __restrict__ dst) {
     const int64_t i = blockIdx.x * int64_t(blockDim.x) + threadIdx.x;
@@ -314,7 +307,6 @@ Tensor sign_kernel_cuda(const Tensor& self) {
 }
 
 // --- complex elementwise math (thrust::complex on interleaved storage) -----
-// Reduced complexes (ComplexHalf/BComplex32) are rejected like torch CUDA.
 template <typename F>
 Tensor complex_math_kernel_cuda(const Tensor& self, F f) {
     const DType dt = self.dtype();
@@ -410,7 +402,6 @@ Tensor unary_float_op_kernel_v2(const Tensor& self, Functor functor) {
     Tensor self_contig = self.contiguous();
     
     if (out_dtype == DType::Float16 || out_dtype == DType::BFloat16) {
-        // ATen alignment: compute in float32 (opmath_t), single fused kernel.
         #define REDUCED_FLOAT_CASE(ctype, name) \
         case DType::name: { \
             launch_unary_reduced_float<ctype>(n, self_contig.data_ptr<ctype>(), result.data_ptr<ctype>(), functor); \
@@ -435,7 +426,6 @@ Tensor unary_float_op_kernel_v2(const Tensor& self, Functor functor) {
     return result;
 }
 
-// ATen alignment: all functors compute in scalar_t (T-typed literals) so
 // float32 tensors never fall into slow double-precision device math.
 struct ExpFunctor { template<typename T> __device__ T operator()(T x) const { return exp(x); } };
 struct Expm1Functor { template<typename T> __device__ T operator()(T x) const { return expm1(x); } };
@@ -456,7 +446,6 @@ struct SigmoidFunctor {
         return static_cast<T>(1) / (static_cast<T>(1) + exp(-x));
     }
 };
-// ATen alignment: relu == clamp_min(0), NaN propagates.
 struct ReluFunctor { template<typename T> __device__ T operator()(T x) const { return x < T(0) ? T(0) : x; } };
 struct GeluFunctor {
     template<typename T> __device__ T operator()(T x) const {
@@ -471,7 +460,6 @@ struct SiluFunctor {
 };
 struct SiluBackwardFunctor {
     template<typename T> __device__ T operator()(T dy, T x) const {
-        // ATen cpu/Activation.cpp silu_backward_kernel (shared math):
         // sigmoid = 1 / (1 + exp(-x)); dy * sigmoid * (1 + x * (1 - sigmoid))
         const T one = static_cast<T>(1);
         const T s = one / (one + exp(-x));
@@ -530,7 +518,6 @@ Tensor sigmoid_kernel_cuda(const Tensor& self) {
     if (isComplexType(self.dtype())) return complex_math_kernel_cuda(self, CxSigmoid{});
     return unary_float_op_kernel_v2(self, SigmoidFunctor());
 }
-// angle (torch angle_kernel for real input): 0 if x >= 0 else pi.
 struct AngleFunctor {
     template<typename T> __device__ T operator()(T x) const {
         return x >= T(0) ? T(0) : static_cast<T>(3.14159265358979323846);
@@ -569,17 +556,7 @@ Tensor silu_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self) 
 }
 
 // ---------------------------------------------------------------------------
-// Activations (CUDA).  Formulas ported from ATen:
-//   aten/src/ATen/native/cuda/ActivationGeluKernel.cu
 //     (GeluCUDAKernelImpl / GeluBackwardCUDAKernelImpl)
-//   aten/src/ATen/native/cuda/ActivationHardswishKernel.cu
-//   aten/src/ATen/native/cuda/ActivationHardsigmoidKernel.cu
-//   aten/src/ATen/native/cuda/ActivationLeakyReluKernel.cu
-//   aten/src/ATen/native/cuda/ActivationEluKernel.cu
-//   aten/src/ATen/native/cuda/ActivationMishKernel.cu
-//   aten/src/ATen/native/cuda/ActivationSoftplusKernel.cu
-//   aten/src/ATen/native/cpu/Activation.cpp (hardtanh / hardtanh_backward)
-// Reduced-precision inputs compute in float32 opmath like ATen.
 // ---------------------------------------------------------------------------
 
 template<typename Functor>
@@ -634,7 +611,6 @@ Tensor activation_backward_kernel_cuda(const Tensor& grad_output, const Tensor& 
     return result;
 }
 
-// ATen ActivationGeluKernel.cu: kBeta = M_SQRT2 * M_2_SQRTPI * 0.5; kKappa = 0.044715
 struct GeluTanhFunctor {
     template<typename T> __device__ T operator()(T x) const {
         const T kBeta = static_cast<T>(1.41421356237309504880) * static_cast<T>(1.12837916709551257390) * static_cast<T>(0.5);
@@ -648,7 +624,6 @@ struct HardtanhFunctor {
     double min_val_, max_val_;
     HardtanhFunctor(double lo, double hi) : min_val_(lo), max_val_(hi) {}
     template<typename T> __device__ T operator()(T x) const {
-        // ATen cpu/Activation.cpp hardtanh: std::min(std::max(a, min_val), max_val)
         T lo = static_cast<T>(min_val_), hi = static_cast<T>(max_val_);
         return x < lo ? lo : (x > hi ? hi : x);
     }
@@ -657,13 +632,11 @@ struct HardtanhBackwardFunctor {
     double min_val_, max_val_;
     HardtanhBackwardFunctor(double lo, double hi) : min_val_(lo), max_val_(hi) {}
     template<typename T> __device__ T operator()(T dy, T x) const {
-        // ATen cpu/Activation.cpp: (self <= min || self >= max) ? 0 : grad
         return (x <= static_cast<T>(min_val_) || x >= static_cast<T>(max_val_)) ? static_cast<T>(0) : dy;
     }
 };
 struct HardswishFunctor {
     template<typename T> __device__ T operator()(T x) const {
-        // ATen ActivationHardswishKernel.cu: x * clamp(x + 3, 0, 6) / 6
         T v = x + static_cast<T>(3);
         v = v < static_cast<T>(0) ? static_cast<T>(0) : (v > static_cast<T>(6) ? static_cast<T>(6) : v);
         return x * v / static_cast<T>(6);
@@ -671,7 +644,6 @@ struct HardswishFunctor {
 };
 struct HardswishBackwardFunctor {
     template<typename T> __device__ T operator()(T dy, T x) const {
-        // ATen Activation.h hardswish_backward
         return x <= static_cast<T>(-3) ? static_cast<T>(0)
              : x >= static_cast<T>(3)  ? dy
              : dy * (x / static_cast<T>(6) + static_cast<T>(0.5));
@@ -679,7 +651,6 @@ struct HardswishBackwardFunctor {
 };
 struct HardsigmoidFunctor {
     template<typename T> __device__ T operator()(T x) const {
-        // ATen ActivationHardsigmoidKernel.cu: clamp(x + 3, 0, 6) / 6
         T v = x + static_cast<T>(3);
         v = v < static_cast<T>(0) ? static_cast<T>(0) : (v > static_cast<T>(6) ? static_cast<T>(6) : v);
         return v / static_cast<T>(6);
@@ -687,7 +658,6 @@ struct HardsigmoidFunctor {
 };
 struct HardsigmoidBackwardFunctor {
     template<typename T> __device__ T operator()(T dy, T x) const {
-        // ATen Activation.h hardsigmoid_backward
         return (x <= static_cast<T>(-3) || x >= static_cast<T>(3)) ? static_cast<T>(0)
                                                                    : dy * (x / static_cast<T>(6) + static_cast<T>(0.5));
     }
@@ -696,7 +666,6 @@ struct LeakyReluFunctor {
     double negative_slope_;
     LeakyReluFunctor(double s) : negative_slope_(s) {}
     template<typename T> __device__ T operator()(T x) const {
-        // ATen ActivationLeakyReluKernel.cu: x > 0 ? x : negative_slope * x
         return x > static_cast<T>(0) ? x : static_cast<T>(negative_slope_) * x;
     }
 };
@@ -704,7 +673,6 @@ struct LeakyReluBackwardFunctor {
     double negative_slope_;
     LeakyReluBackwardFunctor(double s) : negative_slope_(s) {}
     template<typename T> __device__ T operator()(T dy, T x) const {
-        // ATen Activation.h leaky_relu_backward
         return x > static_cast<T>(0) ? dy : static_cast<T>(negative_slope_) * dy;
     }
 };
@@ -713,7 +681,6 @@ struct EluFunctor {
     EluFunctor(double alpha, double scale, double input_scale)
         : negcoef_(alpha * scale), poscoef_(scale), negiptcoef_(input_scale) {}
     template<typename T> __device__ T operator()(T a) const {
-        // ATen cpu/Elu.h get_scalar_elu_elementwise_func:
         //   a < 0 ? expm1(a*input_scale)*negcoef : a*poscoef
         return a < static_cast<T>(0)
             ? expm1(a * static_cast<T>(negiptcoef_)) * static_cast<T>(negcoef_)
@@ -726,7 +693,6 @@ struct EluBackwardFunctor {
     EluBackwardFunctor(double alpha, double scale, double input_scale, bool is_result)
         : negcoef_(alpha * scale), poscoef_(scale), negiptcoef_(input_scale), is_result_(is_result) {}
     template<typename T> __device__ T operator()(T dy, T b) const {
-        // ATen cpu/Activation.cpp elu_backward_kernel:
         //   is_result: b <= 0 ? dy*negiptcoef*(b+negcoef) : dy*poscoef
         //   else:      b <= 0 ? dy*negiptcoef*negcoef*exp(b*negiptcoef) : dy*poscoef
         return b <= static_cast<T>(0)
@@ -738,14 +704,12 @@ struct EluBackwardFunctor {
 };
 struct MishFunctor {
     template<typename T> __device__ T operator()(T x) const {
-        // ATen ActivationMishKernel.cu: mish(x) = x * tanh(softplus(x))
         T sp = log1p(exp(x));
         return x * tanh(sp);
     }
 };
 struct MishBackwardFunctor {
     template<typename T> __device__ T operator()(T dy, T x) const {
-        // ATen ActivationMishKernel.cu MishBackwardCUDAKernelImpl
         T sp = log1p(exp(x));
         T tanh_sp = tanh(sp);
         T sech2 = static_cast<T>(1) - tanh_sp * tanh_sp;
@@ -755,7 +719,6 @@ struct MishBackwardFunctor {
 };
 struct SeluFunctor {
     template<typename T> __device__ T operator()(T x) const {
-        // ATen Activation.h selu: lambda_ = 1.0507009873554804; alpha_ = 1.6732632423543772
         constexpr double lambda_ = 1.0507009873554804934193349852946;
         constexpr double alpha_ = 1.6732632423543772848170429916717;
         return x > static_cast<T>(0) ? static_cast<T>(lambda_) * x
@@ -766,7 +729,6 @@ struct CeluFunctor {
     double alpha_;
     CeluFunctor(double a) : alpha_(a) {}
     template<typename T> __device__ T operator()(T x) const {
-        // ATen Activation.h celu: max(0,x) + min(0, alpha * expm1(x / alpha))
         return x > static_cast<T>(0) ? x : static_cast<T>(alpha_) * expm1(x / static_cast<T>(alpha_));
     }
 };
@@ -774,7 +736,6 @@ struct SoftplusFunctor {
     double beta_, threshold_;
     SoftplusFunctor(double beta, double threshold) : beta_(beta), threshold_(threshold) {}
     template<typename T> __device__ T operator()(T a) const {
-        // ATen ActivationSoftplusKernel.cu:
         //   beta*a > threshold ? a : log1p(exp(beta*a)) / beta
         T beta_in = static_cast<T>(beta_);
         return a * beta_in > static_cast<T>(threshold_)
@@ -786,7 +747,6 @@ struct SoftplusBackwardFunctor {
     double beta_, threshold_;
     SoftplusBackwardFunctor(double beta, double threshold) : beta_(beta), threshold_(threshold) {}
     template<typename T> __device__ T operator()(T dy, T a) const {
-        // ATen ActivationSoftplusKernel.cu:
         //   beta*a > threshold ? dy : dy * sigmoid(beta*a)
         T beta_in = static_cast<T>(beta_);
         return a * beta_in > static_cast<T>(threshold_)
@@ -797,7 +757,6 @@ struct SoftplusBackwardFunctor {
 
 struct GeluBackwardNoneFunctor {
     template<typename T> __device__ T operator()(T dy, T x) const {
-        // ATen ActivationGeluKernel.cu ('none'):
         //   kAlpha = M_SQRT1_2; kBeta = M_2_SQRTPI*M_SQRT1_2*0.5
         //   cdf = 0.5*(1+erf(x*kAlpha)); pdf = kBeta*exp(-0.5*x*x)
         constexpr T kAlpha = static_cast<T>(0.70710678118654752440);
@@ -809,7 +768,6 @@ struct GeluBackwardNoneFunctor {
 };
 struct GeluBackwardTanhFunctor {
     template<typename T> __device__ T operator()(T dy, T x) const {
-        // ATen ActivationGeluKernel.cu ('Tanh')
         constexpr T kBeta = static_cast<T>(1.41421356237309504880) * static_cast<T>(1.12837916709551257390) * static_cast<T>(0.5);
         constexpr T kKappa = static_cast<T>(0.044715);
         T x_sq = x * x;
@@ -827,13 +785,11 @@ struct GeluBackwardTanhFunctor {
 };
 
 Tensor gelu_kernel_cuda_v2(const Tensor& self, const std::string& approximate) {
-    // ATen ActivationGeluKernel.cu GeluCUDAKernelImpl
     if (approximate == "tanh") return unary_float_op_kernel_v2(self, GeluTanhFunctor());
     else if (approximate != "none") TP_THROW(ValueError, "approximate argument must be either none or tanh, but got " + approximate);
     return unary_float_op_kernel_v2(self, GeluFunctor());
 }
 Tensor gelu_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self, const std::string& approximate) {
-    // ATen ActivationGeluKernel.cu GeluBackwardCUDAKernelImpl
     if (approximate == "tanh") return activation_backward_kernel_cuda(grad_output, self, GeluBackwardTanhFunctor());
     else if (approximate != "none") TP_THROW(ValueError, "approximate argument must be either none or tanh, but got " + approximate);
     return activation_backward_kernel_cuda(grad_output, self, GeluBackwardNoneFunctor());
@@ -880,7 +836,6 @@ Tensor softplus_backward_kernel_cuda(const Tensor& grad_output, const Tensor& se
     return activation_backward_kernel_cuda(grad_output, self, SoftplusBackwardFunctor(beta.toDouble(), threshold.toDouble()));
 }
 
-// ATen cpu/Activation.cpp log_sigmoid_cpu_kernel:
 //   out = min(x, 0) - log1p(exp(-|x|))
 struct LogSigmoidFunctor {
     template<typename T> __device__ T operator()(T x) const {
@@ -889,7 +844,6 @@ struct LogSigmoidFunctor {
         return z - log1p(exp(neg_abs));
     }
 };
-// ATen cpu/Activation.cpp log_sigmoid_backward_cpu_kernel: grad * sigmoid(-x),
 // branch-split so exp() never overflows.
 struct LogSigmoidBackwardFunctor {
     template<typename T> __device__ T operator()(T dy, T x) const {
@@ -907,7 +861,6 @@ Tensor log_sigmoid_backward_kernel_cuda(const Tensor& grad_output, const Tensor&
     return activation_backward_kernel_cuda(grad_output, self, LogSigmoidBackwardFunctor());
 }
 
-// ATen Activation.cpp rrelu_with_noise: training scales negative elements by
 // the caller-provided noise; eval is leaky_relu with slope (lower+upper)/2.
 template<typename Functor>
 Tensor binary_float_op_kernel_v2(const Tensor& self, const Tensor& other, Functor functor);
@@ -923,7 +876,6 @@ struct RreluWithNoiseFunctor {
     }
 };
 struct RreluWithNoiseTrainBackwardFunctor {
-    // d/dx [x <= 0 ? x*noise : x] = x <= 0 ? noise : 1 (ATen's forward writes
     // noise=1 for positive elements; this kernel masks with self instead).
     template<typename T> __device__ T operator()(T dy, T x, T r) const {
         return x <= static_cast<T>(0) ? dy * r : dy;
@@ -954,7 +906,6 @@ Tensor rrelu_with_noise_kernel_cuda(const Tensor& self, const Tensor& noise, Sca
         RreluWithNoiseFunctor(lower.toDouble(), upper.toDouble(), training));
 }
 Tensor rrelu_with_noise_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self, const Tensor& noise, Scalar lower, Scalar upper, bool training, bool self_is_result) {
-    // ATen Activation.cpp rrelu_with_noise_backward: training -> noise * grad
     // (masked by self here, see functor note); eval -> leaky_relu_backward
     // with slope (lower + upper) / 2.
     if (training) {
@@ -1063,8 +1014,6 @@ Tensor frac_kernel_cuda(const Tensor& self) {
 }
 
 // --- Comparison ---
-// ATen alignment: comparisons broadcast and promote to a common dtype like
-// torch (TensorIterator). Fast path for same-shape contiguous inputs;
 // generic strided path reuses the TensorDesc broadcast mapping.
 template <typename T, typename Func>
 __global__ void comparison_kernel_cuda_impl(int64_t n, const T* a, const T* b, bool* output, Func func) {
@@ -1096,7 +1045,6 @@ __global__ void comparison_scalar_kernel_cuda_impl(int64_t n, const T* a, T b, b
     }
 }
 
-// ATen alignment: wrapped Python scalars participate weakly in promotion.
 static DType result_type_with_scalar_cuda(const Tensor& t, const Scalar& s) {
     DType td = t.dtype();
     if (s.dtype() == DType::Bool) return td;
@@ -1155,7 +1103,6 @@ Tensor comparison_op_kernel(const Tensor& self, const Tensor& other, Functor fun
 
 template<typename Functor>
 Tensor comparison_scalar_op_kernel(const Tensor& self, Scalar other, Functor functor) {
-    // ATen alignment: weak scalar promotion before comparing
     DType common = result_type_with_scalar_cuda(self, other);
     Tensor in = (self.dtype() == common) ? self : self.to(common);
     Scalar o = other;
@@ -1186,7 +1133,6 @@ struct LeFunctor { template<typename T> __device__ bool operator()(T a, T b) con
 struct GtFunctor { template<typename T> __device__ bool operator()(T a, T b) const { return a > b; } };
 struct GeFunctor { template<typename T> __device__ bool operator()(T a, T b) const { return a >= b; } };
 
-// torch parity: eq/ne are component-wise over complex; ordering comparisons
 // stay rejected by comparison_op_kernel's real-only dispatch.
 template <typename CxOp>
 Tensor complex_comparison_kernel(const Tensor& self, const Tensor& other,
@@ -1526,7 +1472,6 @@ Tensor binary_float_op_kernel_v2(const Tensor& self, const Tensor& other, Functo
 }
 
 struct PowFunctor { template<typename T> __device__ T operator()(T a, T b) const { return pow(a, b); } };
-// ATen alignment: keep the exponent in double so Float64 tensors don't lose precision
 struct PowScalarFunctor {
     double exponent;
     PowScalarFunctor(double e) : exponent(e) {}
@@ -1583,7 +1528,6 @@ Tensor pow_kernel_cuda(const Tensor& self, const Tensor& other) {
     return binary_float_op_kernel_v2(self, other, PowFunctor());
 }
 Tensor pow_scalar_kernel_cuda(const Tensor& self, Scalar exponent) {
-    // ATen alignment: integer base with negative integer exponent is rejected
     if (!isComplexType(self.dtype()) && !exponent.isComplex() &&
         isIntegralType(self.dtype()) && !exponent.isFloatingPoint() &&
         exponent.to<int64_t>() < 0) {
@@ -1615,8 +1559,6 @@ Tensor pow_scalar_kernel_cuda(const Tensor& self, Scalar exponent) {
 Tensor atan2_kernel_cuda(const Tensor& self, const Tensor& other) { return binary_float_op_kernel_v2(self, other, Atan2Functor()); }
 
 // --- Lerp ---
-// ATen alignment: |w| < 0.5 uses s + w*(e-s), else e - (e-s)*(1-w)
-// (numerically stable branch, see ATen native/cuda/Lerp.cu)
 template <typename T>
 __global__ void lerp_scalar_kernel_cuda_impl(int64_t n, const T* start, const T* end, T* output, T weight) {
     int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1638,7 +1580,6 @@ __global__ void lerp_tensor_kernel_cuda_impl(int64_t n, const T* start, const T*
     }
 }
 
-// ATen's lerp promotes Half/BFloat16 inputs to float for the complete
 // numerically-stable calculation and casts only once on store.  Keep that
 // contract for TensorPlay's reduced floating types as well; doing the
 // recurrence through separate mul/add TensorIterator launches rounds twice
@@ -1898,7 +1839,6 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, PointwiseKernels) {
     m.impl("gelu_backward", gelu_backward_kernel_cuda);
     m.impl("silu", silu_kernel_cuda);
     m.impl("silu_backward", silu_backward_kernel_cuda);
-    // Activations — see the ATen citations above each functor.
     m.impl("hardtanh", hardtanh_kernel_cuda);
     m.impl("hardtanh_backward", hardtanh_backward_kernel_cuda);
     m.impl("relu6", relu6_kernel_cuda);

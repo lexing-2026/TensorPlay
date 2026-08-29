@@ -1,10 +1,8 @@
 // grid_sampler_2d / grid_sampler_3d CUDA kernels.
 //
-// Port of aten/src/ATen/native/cuda/GridSampler.cu (grid_sampler_{2d,3d}_kernel
 // and grid_sampler_{2d,3d}_backward_kernel) over contiguous tensors:
 //   interpolation_mode: 0=Bilinear 1=Nearest 2=Bicubic(2d only)
 //   padding_mode:       0=Zeros 1=Border 2=Reflection
-// Reduced-precision inputs (f16/bf16) compute in float (ATen opmath_t);
 // grad_input scatter uses gpuAtomicAdd (Atomic.cuh).
 #include "Tensor.h"
 #include "Dispatcher.h"
@@ -402,7 +400,6 @@ __global__ void grid_sampler_3d_backward_kernel(
             wgt[5] = (ix - ix0)     * (iy0 + 1 - iy) * (iz - iz0);
             wgt[6] = (ix0 + 1 - ix) * (iy - iy0)     * (iz - iz0);
             wgt[7] = (ix - ix0)     * (iy - iy0)     * (iz - iz0);
-            // d weight / d (ix, iy, iz) per corner (ATen
             // grid_sampler_3d_backward_kernel sign pattern).
             const compute_t dwx[8] = {-(iy0 + 1 - iy) * (iz0 + 1 - iz),
                                        (iy0 + 1 - iy) * (iz0 + 1 - iz),

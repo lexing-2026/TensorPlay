@@ -11,7 +11,6 @@
 namespace tensorplay {
 namespace cuda {
 
-// Torch permits tensors with up to 64 dimensions.  Matmul can reach that
 // rank through broadcasted batch dimensions, so the strided clone path must
 // not impose the old eight-dimension limit.
 static constexpr int MAX_DIMS = 64;
@@ -237,7 +236,6 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
     }
 
     // --- mixed real<->complex casts ----------------------------------------
-    // torch semantics: real -> complex zero-fills imag; complex -> real keeps
     // the real component.  Width pairs only (f32<->c64, f64<->c128).
     #define TP_CUDA_CPLX_CAST_R2C(DT_REAL, CU_C)                                \
         if (self.dtype() == dtype_of_complex<CU_C>::value &&                    \

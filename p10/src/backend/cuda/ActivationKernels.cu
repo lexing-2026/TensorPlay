@@ -70,7 +70,6 @@ __global__ void silu_kernel_n(int64_t n, const T* input, T* output) {
 }
 
 // Half/bfloat16 do not have a native device exp implementation in the
-// lightweight scalar wrappers used by TensorPlay.  Match PyTorch's usual
 // mixed-precision behavior by evaluating the sigmoid in FP32 and rounding only
 // the final result back to the input dtype.
 template <typename T>
@@ -422,7 +421,6 @@ Tensor threshold_backward_kernel(const Tensor& grad_output, const Tensor& output
     // Reduction backward can pass an expanded scalar tangent.  Its logical
     // shape matches ``output``, but its storage has a zero stride and is not
     // safe to consume as a flat CUDA pointer.  Materialize the same contiguous
-    // tangent contract used by PyTorch's autograd kernels before launching.
     Tensor grad_contig = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
     Tensor output_contig = output.is_contiguous() ? output : output.contiguous();
     
@@ -472,7 +470,6 @@ Tensor threshold_backward_kernel(const Tensor& grad_output, const Tensor& output
 #endif
 
 // Fused gated activations stay in the activation translation unit, matching
-// ATen/native/Activation.cpp and its CUDA ActivationSilu/ActivationGlu
 // kernels.  The packed variant consumes [gate | up] on the last dimension.
 namespace {
 

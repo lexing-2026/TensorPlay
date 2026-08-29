@@ -143,7 +143,6 @@ cudaDataType_t to_cublas_type(DType t) {
 
 cublasComputeType_t to_compute_type(DType t) {
     switch (t) {
-        // PyTorch's default is torch.backends.cuda.matmul.allow_tf32=False
         // (float32_matmul_precision == "highest"), and its CUDABlas helpers
         // accumulate Half/BFloat16 in FP32 with float alpha/beta.  Mirror
         // that contract; "high"/"medium" enable TF32 compute for Float32,
@@ -272,7 +271,6 @@ void check_cublas_gemm_dtype(DType t) {
         case DType::ComplexDouble:
             return;
         default:
-            // Torch wording: CUDA matmul rejects non-floating dtypes through
             // addmm_cuda ("addmm_cuda" not implemented for 'Int' etc.), even
             // when the mathematical result would be empty.
             TP_THROW(NotImplementedError, "\"addmm_cuda\" not implemented for '",
@@ -312,9 +310,12 @@ void gemm_impl(const Tensor& self, const Tensor& other, Tensor& result,
 
     // The decoder linear layer pattern ``x @ weight.t()``: keep the weight
     // view untouched (its memory already reads as the transposed operand).
+    // Also applies to the bias-epilogue path (F.linear): cuBLASLt supports
+    // CUBLASLT_EPILOGUE_BIAS with TRANSA=T, and materializing the transposed
+    // weight per forward doubled the fused-linear cost.
     const auto other_strides = other.strides();
     const bool transposed_contiguous =
-        bias == nullptr && !other.is_contiguous() && other.dim() == 2 &&
+        !other.is_contiguous() && other.dim() == 2 &&
         other_strides[0] == 1 && other_strides[1] == self_contig.shape()[1];
 
     Tensor other_contig;
@@ -363,7 +364,6 @@ void gemm_impl(const Tensor& self, const Tensor& other, Tensor& result,
         return;
     }
 
-    // Match the native PyTorch default on this host: its preferred backend
     // is cuBLAS (not cuBLASLt) for Half/BFloat16 GEMM.  Besides avoiding Lt's
     // per-shape plan/autotune cost, this matters for tall Newton-Schulz
     // products where the cuBLAS reduction policy is the reference numerical
@@ -528,7 +528,6 @@ void gemm_strided_batched_3d(const Tensor& self_3d, const Tensor& other_3d,
     void* alpha_ptr = to_scalar_ptr(alpha, dtype, 0);
     void* beta_ptr = to_scalar_ptr(beta, dtype, 1);
     const long long stride_c = static_cast<long long>(M) * N;
-    // Torch leaves the algorithm choice to cuBLAS defaults; the TENSOR_OP
     // hint only affects kernel selection, never the FP32-accumulate contract.
     const cublasGemmAlgo_t algorithm = isComplexType(dtype)
         ? CUBLAS_GEMM_DEFAULT

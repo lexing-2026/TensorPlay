@@ -23,7 +23,6 @@ public:
     static cusolverDnHandle_t getCusolverDnHandle();
     // Creates every lazy library handle for the current device up front.
     // Handle creation performs internal allocations, which are illegal once
-    // stream capture is active (ATen pre-warms for the same reason), so
     // CUDAGraph::capture_begin calls this before cudaStreamBeginCapture.
     static void warmupHandles();
 };
@@ -33,7 +32,6 @@ public:
 P10_API bool isCudaInitialized();
 
 // True in a forked child that inherited initialized CUDA state; CUDA calls are
-// unusable there and must be skipped (mirrors torch.cuda._is_in_bad_fork).
 P10_API bool isInBadFork();
 
 // Records that a CUDA runtime call succeeded. Called from checkCuda.

@@ -1,10 +1,7 @@
 // max_unpool2d / max_unpool3d CUDA kernels.
 //
-// Port of aten/src/ATen/native/cuda/MaxUnpooling.cu: one thread per pooled
 // element. Forward scatters each value into the zero canvas at its flat
-// in-plane index (duplicate indices are last-write-wins, matching ATen);
 // backward gathers grad_output at those same positions. Out-of-range indices
-// trip a device-side assert, mirroring ATen's CUDA_KERNEL_ASSERT.
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "Context.h"
@@ -83,7 +80,6 @@ std::vector<int64_t> unpool_output_shape(const Tensor& self, int64_t spatial_dim
     return shape;
 }
 
-// ATen max_unpooling3d_shape_check gradOutput branch: same ndim and same
 // batch/channel dims as the (indices) input; spatial dims checked separately
 // against output_size.
 void unpool_check_grad(const Tensor& grad_output, const Tensor& indices,

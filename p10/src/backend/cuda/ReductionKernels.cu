@@ -278,7 +278,6 @@ Tensor minmax_same_dtype(
         const Tensor& input, const ReductionSpec& spec, bool keepdim) {
     // Empty inputs are legal here: callers (max_kernel/min_kernel for full
     // reductions, max_dim_kernel/min_dim_kernel for dim reductions) already
-    // raised on zero-numel inputs per ATen semantics; what remains is a
     // reduction over non-empty dims of a zero-element tensor, which yields
     // an empty result (run_reduction_typed returns it untouched).
     using AccT = same_dtype_acc_t<T>;
@@ -372,11 +371,9 @@ Tensor welford_same_dtype(
 template <typename T>
 Tensor argmax_same_dtype(
         const Tensor& input, const ReductionSpec& spec, bool keepdim) {
-    // Compile-time pruning: bool has no argmax (matches torch); blocking it
     // here kills the whole ArgPair<int> instantiation tree.
     static_assert(!std::is_same_v<T, bool>, "argmax is not implemented for bool");
     // Zero-element inputs with a non-empty reduction dim produce empty
-    // results (ATen parity); the entry points raise on the invalid cases.
     using ValueT = same_dtype_acc_t<T>;
     // Warp-shuffle fast path: float-family reductions whose logical index
     // fits int32 run the packed-u64 max form (identical winners — value
@@ -425,7 +422,6 @@ Tensor argmin_same_dtype(
         default: TP_THROW(NotImplementedError, "CUDA reduction: unsupported dtype"); \
     }
 
-// ATen alignment: argmax/argmin don't support Bool — excluding it here prunes
 // the entire bool instantiation tree (major ptxas time sink).
 #define TP_DISPATCH_REDUCTION_NO_BOOL(FN, DTYPE, ...) \
     switch (DTYPE) { \
@@ -552,7 +548,6 @@ Tensor mean_kernel(const Tensor& self, DType dtype) {
     return mean_dim_kernel(self, {}, false, dtype);
 }
 
-// Autograd helper for sum.dim_IntList (torch's sum_to_size).
 Tensor sum_dim_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self,
                                     const std::vector<int64_t>& dims, bool keepdim) {
     std::vector<int64_t> normalized;
@@ -597,7 +592,6 @@ Tensor prod_kernel(const Tensor& self, DType dtype) {
 
 // Max
 std::tuple<Tensor, Tensor> max_dim_kernel(const Tensor& self, int64_t dim0, bool keepdim) {
-    // torch.max(input, dim) -> (values, indices).  Values come from the
     // existing min/max reduction machinery; indices from the ArgOps pass.
     // Both share the same first-occurrence tie rule (strict >).
     const int64_t nd = self.dim();
@@ -684,7 +678,6 @@ Tensor min_kernel(const Tensor& self) {
 // reduction configuration can split a single scalar across many CTAs and
 // then allocate/finalize a partial buffer.  That overhead is visible in the
 // hot Muon path, which normalizes one matrix per optimizer step.  Keep a
-// narrow, contiguous p=2 path with the same opmath accumulation as Torch's
 // native norm kernel: one coalesced grid pass and one small final reduction.
 template <typename InputT, typename AccT>
 __global__ void norm2_partial_kernel(
@@ -896,7 +889,6 @@ Tensor norm2_global_fast_typed(const Tensor& self) {
 
 Tensor norm_global_kernel(const Tensor& self, double p) {
     if (isComplexType(self.dtype())) {
-        // torch norm(complex, p=2) = (sum |z|^p)^(1/p); abs() maps complex to
         // the real counterpart so the float path below handles the reduction.
         Tensor areal = self.abs();
         if (std::isinf(p)) return p > 0 ? areal.max() : areal.min();
@@ -963,7 +955,6 @@ Tensor any_kernel(const Tensor& self) {
 // Var / Std
 Tensor var_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, int64_t correction, bool keepdim) {
     if (isComplexType(self.dtype())) {
-        // Upstream ATen semantics (aten/src/ATen/native/ReduceOps.cpp):
         // complex variance = E|z - mean|^2 == var(re) + var(imag); the result
         // dtype is the real counterpart.  Built from dispatched complex-safe
         // ops (mean/sub/abs/sum) so both backends share one definition.
@@ -1012,7 +1003,6 @@ Tensor std_kernel(const Tensor& self, int64_t correction) {
 }
 
 Tensor argmax_kernel(const Tensor& self, std::optional<int64_t> dim, bool keepdim) {
-    // ATen parity (ReduceOps.cpp check_argmax_argmin).
     if (!dim.has_value()) {
         TP_CHECK_INDEX(self.numel() != 0,
                        "argmax(): Expected reduction dim to be specified for input.numel() == 0.");
@@ -1044,13 +1034,10 @@ Tensor argmin_kernel(const Tensor& self, std::optional<int64_t> dim, bool keepdi
     TP_DISPATCH_REDUCTION_NO_BOOL(argmin_same_dtype, input.dtype(), input, spec, keepdim);
 }
 
-// median (torch median): lower-middle element of the sorted flatten.
-// Sort-based like torch's median_cuda small-slice path; index (n-1)/2.
 Tensor median_kernel(const Tensor& self) {
     Tensor flat = self.contiguous().reshape({-1});
     const int64_t n = flat.numel();
     if (n == 0) {
-        // torch Sorting.cpp:752: full({}, NaN).to(self.options()) — NaN stays
         // NaN for float dtypes, converts to true for bool, lowest() for
         // signed ints and 0 for unsigned ints.
         Scalar fill(std::numeric_limits<double>::quiet_NaN());

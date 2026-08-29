@@ -1,17 +1,7 @@
 // Tier-1 hot indexing/masking/scan operators - CUDA kernels.
 //
-// Algorithms are ported from the vendored PyTorch tree at third_party/pytorch
-// (2.15.0a0). Each kernel cites the exact ATen source location it mirrors:
-//   - aten/src/ATen/native/cuda/ScanUtils.cuh            (cumulative scans)
-//   - aten/src/ATen/native/cuda/ScatterGatherKernel.cu   (scatter/scatter_add,
 //     atomicAdd nondeterminism noted at :588)
-//   - aten/src/ATen/native/cuda/Indexing.cu              (index_select)
-//   - aten/src/ATen/native/cuda/IndexKernel.cu           (index_put/
 //     masked_scatter :409/:425)
-//   - aten/src/ATen/native/cuda/Nonzero.cu               (nonzero two-pass)
-//   - aten/src/ATen/native/cuda/Bucketization.cu         (searchsorted)
-//   - aten/src/ATen/native/cuda/SortingKernels.cu        (sort)
-//   - aten/src/ATen/native/cuda/BincountKernel.cu        (bincount)
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "Scalar.h"
@@ -23,7 +13,6 @@
 #include <cuda_runtime.h>
 
 // fp16/bf16 (and narrow-width integer) atomics: vendored from
-// ATen/cuda/Atomic.cuh — no native 16-bit CAS before sm_70, so the Half/
 // BFloat16 overloads align back to the containing 32-bit word and swap the
 // target half via atomicCAS(uint32_t*). Must stay at global scope: the
 // tensorplay::Half/BFloat16 qualified names inside would otherwise resolve
@@ -87,7 +76,6 @@ inline void outer_inner(const std::vector<int64_t>& shape, int64_t dim,
 }
 
 // ---------------------------------------------------------------------------
-// Elementwise select used by masked_fill (ATen runs this through
 // TensorIterator; see TensorAdvancedIndexing.cpp:2459).
 // ---------------------------------------------------------------------------
 template <typename T>
@@ -98,7 +86,7 @@ __global__ void masked_fill_kernel(int64_t n, const T* self, const bool* mask,
     for (; i < n; i += stride) out[i] = mask[i] ? value : self[i];
 }
 
-// tril/triu keep-predicate ported from TriangularOps.cpp:176/:180.
+// Keep-predicate for lower and upper triangular masks.
 template <typename T, bool Lower>
 __global__ void triangular_mask_kernel(int64_t batch_rows, int64_t rows, int64_t cols,
                                        const T* in, T* out, int64_t diagonal) {
@@ -116,8 +104,7 @@ __global__ void triangular_mask_kernel(int64_t batch_rows, int64_t rows, int64_t
 }
 
 // Cumulative scan, one thread per (outer, inner) slice scanned sequentially
-// along dim. Mirrors ScanUtils.cuh:154 tensor_kernel_scan_outer_dim*
-// (sequential walk along the scanned dimension).
+// along the selected dimension.
 template <typename T, typename Op>
 __global__ void scan_kernel(int64_t n_slices, int64_t d_size, int64_t inner,
                             const T* in, T* out, T init_val, Op op) {
@@ -165,7 +152,6 @@ __global__ void gather_kernel(int64_t n, int64_t idx_dim_size, int64_t idx_inner
                               int64_t self_dim_size, int64_t self_inner,
                               const T* s, const int64_t* ip, T* d) {
     // Decomposition runs over the result (=index) shape; the source read
-    // applies self's own strides (ATen allows index.size(i) <= self.size(i)
     // for i != dim, so idx_inner and self_inner may differ).
     int64_t flat = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
@@ -207,7 +193,6 @@ __global__ void scatter_kernel(int64_t total_idx, int64_t idx_dim_size, int64_t 
                                int64_t self_dim_size, int64_t self_inner,
                                T* d, const int64_t* ip, const T* vp) {
     // One thread per index element: elementwise mapping out[oo][idx][t] <->
-    // src[oo][j][t] (ATen _scatter_gather_elementwise_kernel via
     // TensorIterator). Colliding indices serialize through atomics in Add
     // mode.
     int64_t flat = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -376,7 +361,7 @@ template <typename T>
 __global__ void bincount_count_kernel(int64_t n, const T* x, int64_t* bins) {
     int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += stride) atomic_add_rel(bins, static_cast<int64_t>(x[i]));
+    for (; i < n; i += stride) atomic_add_rel(&bins[x[i]], static_cast<int64_t>(1));
 }
 
 template <typename W>
@@ -387,7 +372,6 @@ __global__ void bincount_weighted_kernel(int64_t n, const int64_t* x, const W* w
 }
 
 // Per-slice in-place heapsort carrying original positions. Deviation note:
-// ATen CUDA uses bitonic shared-memory sorts (SortingKernels.cu
 // sortKeyValueInplace); a global-memory heapsort keeps arbitrary slice sizes
 // without shared-memory limits while preserving the stable-order contract of
 // the reference implementation.
@@ -719,7 +703,6 @@ Tensor scatter_base_cuda(const Tensor& self, int64_t dim, const Tensor& index,
     if (total_idx == 0) return result;
     auto stream = getCurrentCUDAStream().stream();
     // atomicAdd supports float/double/int32/int64(via ull); other dtypes fall
-    // back to non-deterministic-free error, matching the restricted set ATen
     // accelerates.
     if (Add) {
         switch (self.dtype()) {
@@ -760,9 +743,8 @@ Tensor scatter_value_cuda(const Tensor& self, int64_t dim, const Tensor& index, 
     return scatter_base_cuda<false>(self, dim, index, full);
 }
 
-// In-place variants (torch's Tensor.scatter_ / Tensor.scatter_add_): same
-// scatter, written directly into self instead of a clone.  Mirrors
-// scatter_base_cuda's prep; non-contiguous self falls back to the out-of-place
+// scatter, written directly into self instead of a clone.  Non-contiguous self
+// falls back to the out-of-place
 // kernel plus a copy back so any layout works.
 static Tensor& scatter_base_inplace_cuda(Tensor& self, int64_t dim, const Tensor& index,
                                          const Tensor& src, bool add) {
@@ -1130,7 +1112,6 @@ Tensor nonzero_cuda(const Tensor& self) {
     int64_t nd = self.dim();
     int64_t n = self_c.numel();
     // Empty input: no matches. Launching with a 0-block grid is a CUDA error,
-    // and torch returns a (0, nd) tensor.
     if (n == 0) {
         return Tensor::zeros({0, nd}, DType::Int64, self.device());
     }
@@ -1152,6 +1133,10 @@ Tensor nonzero_cuda(const Tensor& self) {
                           cudaMemcpyDeviceToHost));
     Tensor result = Tensor::zeros({count_host, nd}, DType::Int64, self.device());
     if (count_host == 0) return result;
+    // The fill pass reuses counter as a slot allocator, so rewind it to zero
+    // (the count pass left the match total in it).
+    CUDA_CHECK(cudaMemsetAsync(counter.data_ptr<int64_t>(), 0, sizeof(int64_t),
+                               stream));
     // sizes live on the host; stage them on-device for the fill kernel
     std::vector<int64_t> h_sizes(static_cast<std::vector<int64_t>>(self_c.shape()));
     Tensor sizes_d = Tensor::empty({nd}, DType::Int64, self.device());
@@ -1379,7 +1364,6 @@ Tensor argsort_cuda(const Tensor& self, int64_t dim, bool descending) {
 }
 
 // ---------------------------------------------------------------------------
-// unique (torch unique_cuda_temp_impl semantics via sort + adjacent-diff):
 //   flags[i] = (i == 0) || sorted[i] != sorted[i-1]
 //   group id = inclusive cumsum(flags) - 1
 //   inverse[order[i]] = gid[i]; counts[g] = next boundary - boundary
@@ -1648,7 +1632,6 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, IndexingKernels) {
 } // namespace cuda
 
 // ---------------------------------------------------------------------------
-// scatter_reduce / index_reduce (CUDA) — port of ATen ScatterGatherKernel.cu
 // reduce functors (gpuAtomicAdd/Mul/Min/Max from the vendored Atomic.cuh,
 // safe_min/safe_max NaN semantics) and Indexing.cu index_reduce_func_cuda_impl
 // (:1320): with include_self=False only the indexed slices are reset to the
@@ -1656,7 +1639,6 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, IndexingKernels) {
 // touched by index keep their original self values. Mean divides by
 // full-rank counts with zero-counts masked to 1 (Indexing.cu:1517-1526).
 // Floating-point dtypes only: the atomic primitives cover Float32/Float64.
-// Backward helpers mirror torch/csrc/autograd/FunctionsManual.cpp
 // scatter_reduce_backward / index_reduce_backward.
 // ---------------------------------------------------------------------------
 
@@ -1701,7 +1683,6 @@ __global__ void sr_exclude_init_kernel(int64_t total_idx, int64_t idx_dim_size,
                                        int64_t self_inner, T* d,
                                        const int64_t* ip, T init_v) {
     // One thread per index element: reset that destination slot to the op
-    // identity (idempotent writes; mirrors ATen's index_fill_ pre-pass).
     int64_t flat = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (flat >= total_idx) return;
     int64_t rem = flat;
@@ -1757,7 +1738,6 @@ __global__ void sr_exclude_init_rows_kernel(int64_t total, int64_t K,
                                             int64_t self_inner, T* d,
                                             const int64_t* ip, T init_v) {
     // index_reduce: the index is a vector, so each destination is a whole
-    // slice of self_inner values (ATen's index_fill_ pre-pass).
     int64_t w = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
     for (; w < total; w += stride) {
@@ -1776,7 +1756,6 @@ __global__ void sr_accum_rows_kernel(int64_t total, int64_t K,
                                      const int64_t* ip, const T* vp,
                                      int64_t* cp, int op_int) {
     // One thread per source element; collisions go through atomics exactly
-    // like ATen's indexFuncLargeIndex path.
     int64_t w = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
     const SrReduceCuda op = static_cast<SrReduceCuda>(op_int);
@@ -1876,11 +1855,9 @@ Tensor sr_forward_cuda_impl(const Tensor& self, int64_t dim,
     const int64_t total_idx = idx_c.numel();
     const int64_t self_dim_size = self.size(dim);
 
-    // Bounds check up front (torch: "index out of range in self").
     {
         const int64_t* ip0 = idx_c.data_ptr<int64_t>();
         for (int64_t i = 0; i < total_idx; ++i) {
-            // torch rejects negative indices in the scatter family
             // ("index -1 is out of bounds for dimension D with size N").
             const int64_t v = ip0[i];
             if (v < 0 || v >= self_dim_size) {
@@ -1950,7 +1927,6 @@ Tensor scatter_reduce_cuda(const Tensor& self, int64_t dim, const Tensor& index,
     return sr_forward_cuda_impl(self, dim, index, src, reduce, include_self);
 }
 
-// ATen Indexing.cu TORCH_IMPL_FUNC(index_reduce_cuda_out) semantics: unlike
 // scatter_reduce this variant takes a 1-D index, a source of self's rank
 // (equal sizes except dim == index.numel()), and rejects 'sum'.
 Tensor ir_forward_cuda_impl(const Tensor& self, int64_t dim,
@@ -1965,7 +1941,6 @@ Tensor index_reduce_cuda(const Tensor& self, int64_t dim, const Tensor& index,
                                 include_self);
 }
 
-// ATen Indexing.cu TORCH_IMPL_FUNC(index_reduce_cuda_out) semantics: unlike
 // scatter_reduce this variant takes a 1-D index, a source of self's rank
 // (equal sizes except dim == index.numel()), and rejects 'sum'.
 Tensor ir_forward_cuda_impl(const Tensor& self, int64_t dim,
@@ -2025,7 +2000,6 @@ Tensor ir_forward_cuda_impl(const Tensor& self, int64_t dim,
     const int64_t* ip = idx_c.data_ptr<int64_t>();
     const int64_t self_dim_size = self.size(dim);
     for (int64_t j = 0; j < K; ++j) {
-        // torch rejects negative indices in the scatter family
         if (ip[j] < 0 || ip[j] >= self_dim_size) {
             TP_THROW(IndexError, "index ", ip[j],
                      " is out of bounds for dimension ", dim,
@@ -2165,7 +2139,6 @@ Tensor scatter_reduce_backward_src_cuda(const Tensor& grad,
         // only; grad_src always receives gradient.
         return out;
     }
-    // prod: handle zeros in src per torch FunctionsManual
     Tensor masked_self = self.masked_fill(self.eq(0), 1.0);
     Tensor masked_self_result = sr_result_for_backward_cuda(
         masked_self, dim, index, src, reduce, include_self);

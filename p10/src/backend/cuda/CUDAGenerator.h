@@ -10,7 +10,6 @@ class Tensor;
 
 namespace cuda {
 
-// Philox4_32_10 counter-based RNG state, mirroring torch's CUDAGeneratorImpl:
 // the state is (seed, offset) and each kernel launch atomically reserves
 // `increment` counter values so results are independent of launch geometry
 // and reproducible across runs and architectures.
@@ -26,8 +25,6 @@ P10_API void set_offset(uint64_t offset);
 // device and returns the (seed, offset) the launching kernel should consume.
 P10_API std::pair<uint64_t, uint64_t> philox_engine_inputs(uint64_t increment);
 
-// Graph-safe philox state handed to RNG kernels, mirroring torch's
-// at::PhiloxCudaState (Note [CUDA Graph-safe RNG states]).  Outside a CUDA
 // graph capture kernels consume the plain (seed, offset) values; while a
 // capture is underway they instead read seed/offset from device buffers owned
 // by the capturing graph plus a per-kernel intragraph offset, so replay
@@ -73,12 +70,10 @@ P10_API void rng_replay_prologue(uint64_t id, uint64_t wholegraph_increment);
 P10_API void rng_unregister_graph(uint64_t id);
 
 // Serializes (seed, offset) to a 16-byte CPU UInt8 tensor, matching
-// torch.cuda.get_rng_state.
 P10_API Tensor get_rng_state();
 P10_API void set_rng_state(const Tensor& new_state);
 
 // Seeding before CUDA initialization is stashed and replayed at the first
-// real CUDA runtime call (mirrors torch.cuda._lazy_call).
 P10_API void stash_pending_seed_all(uint64_t seed);
 P10_API void apply_pending_seed();
 

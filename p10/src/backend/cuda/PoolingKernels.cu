@@ -175,11 +175,8 @@ Tensor adaptive_avg_pool2d_backward_cuda(const Tensor& grad_output, const Tensor
     return grad_input;
 }
 
-// Port of at::native::adaptivemaxpool
-// (aten/src/ATen/native/cuda/AdaptiveMaxPooling2d.cu:46), flattened to one
 // thread per output element in tp's pooling-kernel style. Window bounds come
 // from AdaptivePooling.h start_index/end_index (floor start, ceil end); NaN
-// wins the argmax scan like ATen's `(val > max) || isnan(val)`.
 __global__ void adaptive_max_pool2d_forward_kernel(
     const float* input,
     float* output,
@@ -214,8 +211,6 @@ __global__ void adaptive_max_pool2d_forward_kernel(
     output[output_index] = max_val;
 }
 
-// Port of at::native::atomicadaptivemaxgradinput
-// (aten/src/ATen/native/cuda/AdaptiveMaxPooling2d.cu:159): re-derive the
 // window argmax (the dispatcher op returns values only) and scatter
 // grad_output atomically, since windows overlap.
 __global__ void adaptive_max_pool2d_backward_kernel(
@@ -260,7 +255,6 @@ __global__ void adaptive_max_pool2d_backward_kernel(
 }
 
 // with_indices variants: the forward also records the plane-linear argmax so
-// the backward scatters via the saved indices (ATen AdaptiveMaxPooling2d.cu).
 __global__ void adaptive_max_pool2d_with_indices_forward_kernel(
     const float* input,
     float* output,
@@ -437,7 +431,6 @@ struct TensorDesc {
         int w = static_cast<int>(t.size(3));
 
         // cuDNN's Ex descriptor preserves the actual logical tensor strides,
-        // matching the descriptor construction in PyTorch's cuDNN v8 path.
         CUDNN_CHECK(cudnnSetTensor4dDescriptorEx(
             desc, dtype, n, c, h, w,
             static_cast<int>(t.stride(0)),
@@ -620,7 +613,6 @@ Tensor avg_pool2d_backward_cuda(const Tensor& grad_output, const Tensor& input, 
 }
 
 // ---------------------------------------------------------------------------
-// Custom max-pool-with-indices and 3-D max-pool kernels (ports of ATen
 // DilatedMaxPool2d.cpp / DilatedMaxPool3d.cpp / AdaptiveMaxPooling3d.cpp).
 // cuDNN pooling exposes neither dilation nor argmax indices, so these run as
 // plain CUDA kernels: one thread per output element, grid-stride, atomicAdd
@@ -636,7 +628,6 @@ inline int64_t pool_grid_blocks(int64_t n, int threads) {
     return blocks > 65535 ? 65535 : blocks;
 }
 
-// ATen Pool.h pooling_output_shape_pad_lr (floor division + ceil adjustment).
 static inline int64_t pool_div_rtn(int64_t a, int64_t b) {
     int64_t q = a / b;
     if ((a % b != 0) && ((a < 0) != (b < 0))) --q;
@@ -1023,7 +1014,6 @@ Tensor max_pool3d_backward_cuda(const Tensor& grad_output, const Tensor& input,
                                 const std::vector<int64_t>& padding,
                                 const std::vector<int64_t>& dilation, bool ceil_mode) {
     // Reuse the indices path: recompute argmax via the forward kernel, then
-    // scatter (matches ATen's recompute-based max_pool3d_backward).
     if (grad_output.dim() == 4 && input.dim() == 4) {
         return max_pool3d_backward_cuda(grad_output.unsqueeze(0), input.unsqueeze(0),
                                         kernel_size, stride, padding, dilation,

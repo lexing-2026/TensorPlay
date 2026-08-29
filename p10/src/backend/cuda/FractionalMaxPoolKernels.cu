@@ -1,6 +1,5 @@
 // fractional_max_pool2d / fractional_max_pool3d CUDA kernels.
 //
-// Port of aten/src/ATen/native/cuda/FractionalMaxPool2d.cu /
 // FractionalMaxPool3d.cu: one thread per output point, window starts from
 // get_interval(sample, ...) driven by the caller-provided random_samples
 // tensor (no internal RNG). Backward scatters grad via gpuAtomicAdd.
@@ -25,7 +24,6 @@ namespace {
 
 constexpr int kThreads = 256;
 
-// ATen cuda/FractionalMaxPool2d.cu get_interval.
 template <typename compute_t>
 __device__ inline int64_t get_interval(compute_t sample, int64_t index,
                                        int64_t inputSize, int64_t outputSize,
@@ -70,7 +68,6 @@ __global__ void fractional_max_pool2d_fwd_kernel(
     for (int64_t h = poolH; h < poolH + poolSizeH; ++h) {
         for (int64_t w = poolW; w < poolW + poolSizeW; ++w) {
             const compute_t val = static_cast<compute_t>(inputForPlane[h * inputW + w]);
-            // ATen: favor the first max; NaNs propagate forward.
             if (val > maxVal || isnan(val)) {
                 maxVal = val;
                 maxIndex = h * inputW + w;
@@ -123,7 +120,6 @@ __global__ void fractional_max_pool3d_fwd_kernel(
     const int64_t outputTIdx = ourOutputPoint / (outputH * outputW);
 
     const storage_t* samplesForPlane = samples + (batch * numPlanes + plane) * 3;
-    // ATen FractionalMaxPool3d: sample order is (T, H, W).
     const int64_t poolT = get_interval<compute_t>(
         static_cast<compute_t>(samplesForPlane[0]), outputTIdx, inputT, outputT, poolSizeT);
     const int64_t poolH = get_interval<compute_t>(
@@ -373,7 +369,6 @@ std::tuple<Tensor, Tensor> fractional_max_pool3d_cuda(
     const int64_t inputT = self.size(self.dim() - 3);
     const int64_t inputH = self.size(self.dim() - 2);
     const int64_t inputW = self.size(self.dim() - 1);
-    // ATen FractionalMaxPool3d.cpp:74-82 requires output + pool - 1 < input
     // (strict, unlike the 2D variant which allows equality).
     if (output_size[0] + kernel_size[0] - 1 >= inputT ||
         output_size[1] + kernel_size[1] - 1 >= inputH ||

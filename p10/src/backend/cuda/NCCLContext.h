@@ -1,9 +1,7 @@
 #pragma once
 
-// NCCL communicator context, mirroring the core of torch.distributed's
 // ProcessGroupNCCL: communicator lifecycle plus collectives on raw device
 // buffers. Group/rendezvous policy lives in the Python layer
-// (tensorplay/distributed), matching torch's c10d/distributed_c10d split.
 
 #include "DType.h"
 #include "Macros.h"
@@ -62,18 +60,15 @@ P10_API void send(const void* buffer, size_t count, DType dtype, int peer,
 P10_API void recv(void* buffer, size_t count, DType dtype, int peer,
                   Comm comm, void* stream);
 
-// Group semantics (torch ProcessGroupNCCL::groupStart/groupEnd): batch
 // multiple p2p ops between a start/end pair so they enqueue as one NCCL
 // group. Must bracket matching send/recv pairs on every rank.
 P10_API void groupStart();
 P10_API void groupEnd();
 
-// torch::cuda::nccl::all2all_single_equal_split: single flat input/output
 // buffer, each rank exchanges `count = numel / world_size` elements.
 P10_API void allToAllSingleEqualSplit(const void* sendbuff, void* recvbuff,
                                       size_t count_total, DType dtype,
                                       Comm comm, void* stream);
-// torch::cuda::nccl::all2all_single_unequal_split: per-rank counts/displacements.
 P10_API void allToAllSingleUnequalSplit(
     const void* sendbuff, const size_t* sendcounts, const size_t* senddispls,
     void* recvbuff, const size_t* recvcounts, const size_t* recvdispls,

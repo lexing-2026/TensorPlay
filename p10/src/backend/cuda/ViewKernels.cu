@@ -99,7 +99,6 @@ bool is_complex_cuda(const Tensor& self) {
 
 } // namespace
 
-// Torch parity helpers (WrapDimUtils.h maybe_wrap_dims_n / IntArrayRef print).
 namespace join_detail {
 
 std::string fmt_sizes(const std::vector<int64_t>& sizes) {
@@ -137,9 +136,7 @@ bool should_skip(const Tensor& t) {
 } // namespace join_detail
 
 Tensor reshape_kernel_cuda(const Tensor& self, const std::vector<int64_t>& shape) {
-    // Torch parity (TensorShape.cpp reshape): the result aliases `self`
     // whenever the layout admits the view (computeStride), otherwise it is a
-    // contiguous copy.  infer_size throws torch's exact errors (including
     // the ambiguous 0-element -1 case that used to divide by zero).
     if (self.is_sparse()) {
         TP_THROW(RuntimeError, "reshape is not implemented for sparse tensors");
@@ -150,7 +147,6 @@ Tensor reshape_kernel_cuda(const Tensor& self, const std::vector<int64_t>& shape
     if (stride.has_value()) {
         return self.as_strided(inferred, *stride);
     }
-    // torch reshape_symint fallback: _unsafe_view(clone(Contiguous), shape).
     // The clone must be explicitly contiguous: clone() with Preserve keeps
     // non-overlapping-and-dense strides (e.g. transposed), which the
     // subsequent view would reject.
@@ -289,7 +285,6 @@ Tensor unsqueeze_kernel_cuda(const Tensor& self, int64_t dim) {
 // and non-blocking copy semantics; this keeps the implementation correct for
 // non-contiguous inputs while avoiding a second bespoke concatenation kernel.
 Tensor cat_kernel_cuda(const std::vector<Tensor>& tensors, int64_t dim) {
-    // Torch order (TensorShape.cpp cat precompute meta):
     // check_cat_no_zero_dim -> legacy_cat_wrap_dim -> non-empty check ->
     // first-valid-tensor selection -> shape checks -> result_type promotion.
     for (size_t i = 0; i < tensors.size(); ++i) {
@@ -305,7 +300,7 @@ Tensor cat_kernel_cuda(const std::vector<Tensor>& tensors, int64_t dim) {
         }
     }
     if (tensors.empty()) {
-        TP_THROW(ValueError, "torch.cat(): expected a non-empty list of Tensors");
+        TP_THROW(ValueError, "cat(): expected a non-empty list of Tensors");
     }
 
     DType out_dtype = tensors[0].dtype();
@@ -322,7 +317,7 @@ Tensor cat_kernel_cuda(const std::vector<Tensor>& tensors, int64_t dim) {
     if (valid >= 0) {
         const Tensor& first = tensors[valid];
         if (dim > first.dim()) {
-            TP_THROW(IndexError, "torch.cat(): dimension ", dim, " out of range");
+            TP_THROW(IndexError, "cat(): dimension ", dim, " out of range");
         }
         int64_t size_at_dim = 0;
         for (size_t i = 0; i < tensors.size(); ++i) {
@@ -365,7 +360,6 @@ Tensor cat_kernel_cuda(const std::vector<Tensor>& tensors, int64_t dim) {
 }
 
 std::vector<Tensor> split_kernel_cuda(const Tensor& self, int64_t split_size, int64_t dim) {
-    // Torch get_num_splits + split (TensorShape.h/.cpp).
     if (self.dim() == 0) {
         TP_THROW(RuntimeError, "split expects at least a 1-dimensional tensor");
     }
@@ -396,7 +390,6 @@ std::vector<Tensor> split_kernel_cuda(const Tensor& self, int64_t split_size, in
 std::vector<Tensor> split_sizes_kernel_cuda(const Tensor& self,
                                             const std::vector<int64_t>& split_sizes,
                                             int64_t dim) {
-    // Torch split_with_sizes (TensorShape.cpp).
     if (self.dim() == 0) {
         TP_THROW(RuntimeError, "split expects at least a 1-dimensional tensor");
     }
@@ -423,7 +416,6 @@ std::vector<Tensor> split_sizes_kernel_cuda(const Tensor& self,
 }
 
 std::vector<Tensor> chunk_kernel_cuda(const Tensor& self, int64_t chunks, int64_t dim) {
-    // Torch chunk (TensorShape.cpp): the split_size==0 && dim_size==0 case must
     // still produce `chunks` empty chunks, so it routes through split_with_sizes.
     if (self.dim() == 0) {
         TP_THROW(RuntimeError, "chunk expects at least a 1-dimensional tensor");
@@ -443,7 +435,6 @@ std::vector<Tensor> chunk_kernel_cuda(const Tensor& self, int64_t chunks, int64_
 }
 
 std::vector<Tensor> unbind_kernel_cuda(const Tensor& self, int64_t dim) {
-    // Torch unbind (TensorShape.cpp): maybe_wrap_dim with scalar wrapping, then
     // size() raises the no-dimensions error for 0-d.
     const int64_t ndim = self.dim();
     int64_t d;
@@ -464,9 +455,7 @@ std::vector<Tensor> unbind_kernel_cuda(const Tensor& self, int64_t dim) {
 }
 
 Tensor stack_kernel_cuda(const std::vector<Tensor>& tensors, int64_t dim) {
-    // Torch stack (TensorShape.cpp): non-empty check, maybe_wrap_dim(dim, ndim+1),
     // check_stack_inputs, then cat of unsqueezed inputs (dtype promotion
-    // happens inside cat, mirroring at::_stack's result_type).
     if (tensors.empty()) {
         TP_THROW(RuntimeError, "stack expects a non-empty TensorList");
     }
@@ -507,7 +496,6 @@ Tensor squeeze_backward_kernel_cuda(const Tensor& grad, const Tensor& self) {
     return grad.reshape(static_cast<std::vector<int64_t>>(self.shape()));
 }
 
-// ATen semantics: remove dim1/dim2 and append the diagonal axis at the end.
 // Pure metadata op: identical to the CPU kernel, safe on any device.
 Tensor diagonal_kernel_cuda(const Tensor& self, int64_t offset, int64_t dim1, int64_t dim2) {
     // TensorShape.cpp diagonal: wrap first (so 0/1-d inputs raise the

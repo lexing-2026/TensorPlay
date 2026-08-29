@@ -1,6 +1,5 @@
 // multi_margin_loss / multilabel_margin_loss CUDA kernels.
 //
-// Port of aten/src/ATen/native/cuda/MultiMarginLoss.cu and
 // MultiLabelMarginCriterion.cu: one block (128 threads) per batch row; each
 // block computes its row's hinge sum through a shared-memory buffer and
 // finalizes either a per-row output (reduction=none) or a per-row partial
@@ -8,7 +7,6 @@
 // (self-contained reduction -- does not go through the dispatched sum op).
 // Arithmetic runs in double on device (same convention as
 // Tier5LossesKernels.cu) and results are cast back to the input dtype.
-// Out-of-range targets trip a device-side assert, mirroring ATen's
 // CUDA_KERNEL_ASSERT.
 #include "Tensor.h"
 #include "Dispatcher.h"
@@ -61,7 +59,6 @@ Tensor as_long_contiguous(const Tensor& target) {
     return t;
 }
 
-// ATen LossMulti.h multi_margin_loss_shape_check.
 void multi_margin_shape_check(int64_t& nframe, int64_t& dim, const Tensor& input,
                               const Tensor& target, const std::optional<Tensor>& weight) {
     const int64_t ndims = input.dim();
@@ -85,7 +82,6 @@ void multi_margin_shape_check(int64_t& nframe, int64_t& dim, const Tensor& input
     }
 }
 
-// ATen LossMulti.h multilabel_margin_loss_shape_check.
 void multilabel_shape_check(int64_t& nframe, int64_t& dim, const Tensor& input,
                             const Tensor& target) {
     const int64_t ndims = input.dim();
