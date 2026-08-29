@@ -550,8 +550,8 @@ Tensor cumulative_trapezoid_backward_cpu(const Tensor& grad, const std::optional
 // ---------------------------------------------------------------------------
 // variable, each column an observation; fweights are frequencies (integral),
 // aweights reliability weights (floating). Arithmetic stays in the input
-// dtype exactly like upstream (no upcast). The 1-observation single-weight
-// corner zeroes `in` through its aliasing view precisely as upstream does.
+// dtype without an upcast. The 1-observation single-weight corner zeroes
+// `in` through its aliasing view.
 // Backwards are explicit helpers (_cov_backward / _corrcoef_backward) since
 // tp has no composite-implicit-autograd; formulas derived from the closed
 // ---------------------------------------------------------------------------
@@ -675,7 +675,7 @@ CovParts cov_parts(const Tensor& self, int64_t correction,
 
     if (p.num_observations == 1 && p.had_fw != p.had_aw) {
         // algebraically the weighted avg == the input so the centered matrix
-        // would be zero; upstream zeroes `in` through its aliasing view.
+        // would be zero; zero `in` through its aliasing view.
         in.zero_();
         if (isIntegralType(in.dtype(), false)) {
             in = in.to(DType::Float32);
@@ -798,7 +798,7 @@ Tensor corrcoef_backward_cpu(const Tensor& grad, const Tensor& self) {
 
 
 // ---------------------------------------------------------------------------
-// a dispatcher composite over sort/gather/lerp (upstream's CPU nth_element
+// a dispatcher composite over sort/gather/lerp (the CPU nth_element
 // fast path is a pure optimization; the sort path is semantically identical,
 // NaN sorts last to match the rank masking below).  One body serves both
 // no derivatives.yaml entry: quantile is non-differentiable.
@@ -864,7 +864,7 @@ Tensor quantile_compute(const Tensor& self, const Tensor& q,
                         bool keepdim, QuantileInterp interpolation,
                         bool ignore_nan, int64_t wrapped_dim,
                         std::vector<int64_t> out_shape) {
-    // Upstream range-checks q only on the CPU to avoid a device sync.
+    // Range-check q only on the CPU to avoid a device sync.
     if (self.device().is_cpu()) {
         Tensor q_in_range = Tensor::logical_and(q.ge(0), q.le(1)).all();
         if (!q_in_range.item<bool>()) {
@@ -892,7 +892,7 @@ Tensor quantile_compute(const Tensor& self, const Tensor& q,
     reduced = reduced.reshape(in_shape);
 
     // Ranks use double (exact to 2^53) on both dense backends, matching
-    // upstream's non-MPS path.  Upstream relies on NaN sorting last; tp's
+    // non-MPS path.  The implementation relies on NaN sorting last; tp's
     // sort places NaN first (ascending), so NaN handling is made explicit
     // below instead of depending on the sort's NaN order.
     Tensor ranks;
@@ -942,7 +942,7 @@ Tensor quantile_compute(const Tensor& self, const Tensor& q,
     Tensor weights, ranks_above;
     if (interpolate) {
         if (interpolation == QuantileInterp::Midpoint) {
-            // Weight 0.5 in the *value* dtype, like upstream's
+            // Weight 0.5 in the *value* dtype, matching the interpolation
             weights = Tensor::full_like(ranks, 0.5, self.dtype());
         } else {
             weights = ranks.sub(ranks_below).to(self.dtype());
@@ -1010,10 +1010,10 @@ Tensor nanquantile_kernel(const Tensor& self, const Tensor& q,
 // outer edges come from `range` or aminmax (NaN propagates, all-NaN input
 // raises), with the empty-range ±0.5 expansion.  Per-element bin mapping
 // reproduces BINARY_SEARCH (std::upper_bound == searchsorted right=True);
-// upstream documents LINEAR_INTERPOLATION_WITH_LOCAL_SEARCH as producing the
+// LINEAR_INTERPOLATION_WITH_LOCAL_SEARCH mode produces the
 // same classification for linspace edges, so both paths share one
 // formulation.  Elements outside [edges[0], edges[-1]] (and NaN) are skipped
-// upstream, which equals zeroing their weight; accumulation goes through the
+// implementation, which equals zeroing their weight; accumulation goes through the
 // dispatched index_add so the same body registers for CPU and CUDA.
 // ---------------------------------------------------------------------------
 namespace {
@@ -1028,7 +1028,7 @@ void histogram_check_weight(const Tensor& self, const std::optional<Tensor>& wei
 
 std::pair<double, double> histogram_outer_edges_1d(
         const Tensor& self, const std::optional<std::vector<double>>& range) {
-    // Defaults for empty input match numpy.histogram, like upstream.
+    // Defaults for empty input match numpy.histogram.
     double leftmost = 0.0, rightmost = 1.0;
     if (range) {
         if (range->size() != 2) {
@@ -1075,18 +1075,18 @@ Tensor histogram_bin_counts(const Tensor& self, const Tensor& edges,
     if (self.numel() > 0) {
         Tensor v = self.reshape({self.numel()});
         // In-range compares against the edge tensor in the input dtype (NaN
-        // fails both comparisons, matching the upstream
+        // fails both comparisons, so it is skipped by
         // `elt >= lo && elt <= hi` skip).
         Tensor in_range = Tensor::logical_and(
             v.ge(edges.narrow(0, 0, 1)), v.le(edges.narrow(0, nb, 1)));
         // searchsorted right=True == std::upper_bound over the edges;
-        // pos = idx-1 is the upstream BINARY_SEARCH classification, clamped
+        // pos = idx-1 is the BINARY_SEARCH classification, clamped
         // so the rightmost bin includes its right edge.
         Tensor idx = Tensor::searchsorted(edges, v, false, true).sub(1)
                          .clamp(0, nb - 1);
         Tensor w = weight.has_value() ? weight->reshape({self.numel()})
                                       : Tensor::ones_like(v);
-        // Skipped elements contribute zero weight == upstream's skip.
+        // Skipped elements contribute zero weight.
         w = w.mul(in_range.to(self.dtype()));
         hist = hist.index_add(0, idx, w);
     }
@@ -1116,7 +1116,7 @@ std::tuple<Tensor, Tensor> histogram_bins_tensor_kernel(
                  toString(bins.dtype()));
     }
     histogram_check_weight(self, weight);
-    // Upstream copies the bins into an empty self.options() tensor.
+    // Copy the bins into an empty self.options() tensor.
     Tensor bin_edges = bins.clone();
     Tensor hist = histogram_bin_counts(self, bin_edges, weight, density);
     return {std::move(hist), std::move(bin_edges)};

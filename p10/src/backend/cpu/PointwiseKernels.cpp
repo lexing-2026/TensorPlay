@@ -420,7 +420,7 @@ Tensor round_kernel(const Tensor& self) {
 // Float ops
 //
 // the complex dtypes (see docs/source/complex_numbers.md).  Complex inputs
-// route through complex_unary_op_kernel with std::complex math or the c10
+// route through complex_unary_op_kernel with std::complex math or the
 // formulas above; real dtypes keep the vectorized paths.
 
 

@@ -665,7 +665,7 @@ Tensor fft_irfft_cuda(const Tensor& self, int64_t n, int64_t dim, std::string no
 // ---------------------------------------------------------------------------
 // Backward helpers — adjoint = same internal transform with flipped direction
 // and identical normalization enum, then resize back to the primal support.
-// Formulas mirror upstream tools/autograd/derivatives.yaml:2963-2974:
+// Formulas for the framing and overlap-add derivatives:
 //   _fft_r2c: fft_r2c_backward(grad, dim, normalization, onesided, size)
 //   _fft_c2r: fft_c2r_backward(grad, dim, normalization)
 //   _fft_c2c: _fft_c2c(grad, dim, normalization, !forward)
@@ -737,7 +737,7 @@ Tensor fft_rfft_backward_cuda(const Tensor& grad, const Tensor& self, int64_t di
 }
 
 // R2C of the real gradient with the primal normalization, then double the bins
-// whose conjugate mirror fell outside the onesided range.
+// whose conjugate counterpart fell outside the onesided range.
 namespace {
 template <bool IsDouble>
 Tensor irfft_backward_core(const Tensor& g, int64_t freq_bins, fft_norm_mode mode) {
@@ -1223,7 +1223,7 @@ __global__ void ola_scatter_kernel(int64_t batch, int64_t frames, int64_t n_fft,
     }
 }
 
-// Adjoint of pad_time_axis_kernel: crop (constant) / mirror-scatter (reflect).
+// Adjoint of pad_time_axis_kernel: crop (constant) / reflect-scatter (reflect).
 template <typename T>
 __global__ void unpad_gather_kernel(int64_t batch, int64_t padded_len, int64_t pad,
                                     bool reflect, const T* __restrict__ padded,

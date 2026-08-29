@@ -436,7 +436,7 @@ Tensor binary_op_kernel_impl(const Tensor& self, const Tensor& other, Op op, Mkl
 // instantiation only compiles its own branch (a non-template context would
 // semantically check discarded branches too, breaking e.g. y.real() on
 // integral dtypes).  Complex values scale the low-precision components via
-// double, mirroring the real-path alpha.toDouble() behavior.
+// double, matching the real-path alpha.toDouble() behavior.
 template <typename T>
 inline T tp_alpha_scaled(const tensorplay::Scalar& alpha, const T& y) {
     if constexpr (is_complex_type_v<T>) {

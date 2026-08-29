@@ -843,7 +843,7 @@ Tensor clone_impl(const Tensor& self, std::optional<MemoryFormat> memory_format)
                     getAllocator(self.device().type()), self.device());
     auto out_impl = std::make_shared<TensorImpl>(storage, sizes_v, strides, self.dtype(), 0);
     if (format == MemoryFormat::Preserve) {
-        // Mirror TensorImpl::set_sizes_and_strides layout tagging so a
+        // Apply TensorImpl::set_sizes_and_strides layout tagging so a
         // preserved channels-last input clones into a channels-last tensor.
         if (strides == get_channels_last_strides(sizes_v) &&
             strides != SizesAndStrides::compute_contiguous_strides(sizes_v)) {

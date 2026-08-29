@@ -1,5 +1,5 @@
 // Generated batch completion of the in-place op family ("In-place family
-// completion" section of config/native_functions.yaml).  Every wrapper
+// completion" section of the native schema).  Every wrapper
 // re-dispatches the functional op on `self` and lands the result back via
 // copy_ -- the established abs_/lerp_ pattern -- under a local grad-disabled
 // guard so the composite does not record autograd nodes.
@@ -18,7 +18,7 @@ namespace cuda {
 
 namespace {
 
-// RAII over thread-local GradMode (mirrors c10::NoGradGuard).
+// RAII over thread-local GradMode for mutation-free sections.
 struct NoGradGuard {
     bool prev;
     NoGradGuard() : prev(GradMode::is_enabled()) { GradMode::set_enabled(false); }
