@@ -1,3 +1,5 @@
+from tensorplay._C import FileCheck as FileCheck
+
 from . import _comparison
 from ._comparison import (
     assert_allclose as assert_allclose,
@@ -8,6 +10,7 @@ from ._comparison import (
 from ._creation import make_tensor as make_tensor
 
 __all__ = [
+    "FileCheck",
     "assert_close",
     "assert_allclose",
     "default_tolerances",
