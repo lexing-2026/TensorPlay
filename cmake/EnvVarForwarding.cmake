@@ -5,8 +5,7 @@
 # _ENV_PASSTHROUGH list below. Anything else is not forwarded -- set it as a
 # CMake option with -D / cmake.define instead.
 #
-# Ported from pytorch's cmake/EnvVarForwarding.cmake (the mechanism is kept
-# verbatim; the variable tables are scaled to TensorPlay's knobs).
+# The variable tables below are scaled to TensorPlay's knobs.
 #
 # Everyday knobs:
 #   USE_CUDA=0               disable the CUDA build
@@ -46,7 +45,7 @@ foreach(_var IN LISTS _ENV_PASSTHROUGH)
 endforeach()
 
 # Forward all BUILD_*, USE_*, CMAKE_* environment variables into the CMake
-# cache, mirroring the -D flags setup.py used to pass.
+# cache, matching the -D flags setup.py used to pass.
 #
 # CMake cannot enumerate environment variables, and serializing the whole
 # environment to text and re-parsing it in CMake is unsafe: values such as PS1

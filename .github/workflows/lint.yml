@@ -1,6 +1,5 @@
 name: lint
 
-# Lint checks for Python sources (mirrors pytorch's lint.yml trigger shape;
 # the lint rules live in [tool.ruff] in pyproject.toml).
 
 on:

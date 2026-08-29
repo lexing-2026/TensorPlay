@@ -45,7 +45,7 @@ on:
         description: >-
           Explicit PEP 440 base version (nightly/preview channel), for example
           1.0.0.dev20260828. The variant local label (+cu124, +cpu) is appended
-          here, mirroring pytorch's binary_populate_env.sh. Wheels are uploaded
+          here, following the repository's binary versioning rule. Wheels are uploaded
           to the rolling "nightly" release instead of the current tag.
       build_number:
         required: false
@@ -90,7 +90,6 @@ jobs:
 
       # Nightly/preview channel: the caller computed the base version
       # (X.Y.0.dev<date>, see tools/generate_tensorplay_version.py). Variant
-      # local labels follow pytorch's binary_populate_env.sh rule: CUDA tags
       # are appended as-is, CPU gets +cpu except on macOS.
       - name: Set TENSORPLAY_BUILD_VERSION for nightly
         if: ${{ inputs.build_version != '' }}

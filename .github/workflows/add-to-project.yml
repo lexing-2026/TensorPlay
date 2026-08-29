@@ -1,7 +1,6 @@
 name: add-to-project
 
 # Adds every new issue and PR to the TensorPlay Roadmap project board, the
-# same way pytorch routes new work onto its project boards.
 #
 # NOTE: the default GITHUB_TOKEN cannot write to Projects. Create a fine-grained
 # PAT with read/write access to the "TensorPlay Roadmap" project and store it

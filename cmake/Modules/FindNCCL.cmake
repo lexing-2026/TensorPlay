@@ -1,6 +1,5 @@
 # FindNCCL
 # -------
-# Mirrors pytorch's cmake/Modules/FindNCCL.cmake.
 #
 # Input:
 #   NCCL_ROOT / ENV{NCCL_ROOT} - install prefix to search first
@@ -20,7 +19,6 @@ find_path(NCCL_INCLUDE_DIR
 )
 
 # The pip wheel ships only the versioned soname (libnccl.so.2), so search for
-# that explicitly in addition to the dev names torch looks for.
 find_library(NCCL_LIBRARY
     NAMES nccl libnccl nccl_static libnccl.so.2
     HINTS
@@ -31,7 +29,6 @@ find_library(NCCL_LIBRARY
         ${CUDA_HOME}/lib64
 )
 
-# Extra hint beyond torch: the nvidia-nccl-cuXX pip wheel layout.
 if(DEFINED Python_EXECUTABLE AND NOT NCCL_LIBRARY)
     execute_process(
         COMMAND "${Python_EXECUTABLE}" -c

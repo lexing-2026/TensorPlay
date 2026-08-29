@@ -1,7 +1,6 @@
 name: stale
 
 # Marks issues/PRs with no activity for 60 days as stale and closes them 14
-# days later, mirroring pytorch's stale-bot hygiene. Labeling something
 # "good first issue" or "help wanted" exempts it.
 
 on:
