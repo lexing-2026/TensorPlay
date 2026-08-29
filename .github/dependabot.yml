@@ -1,4 +1,3 @@
-# Dependency update automation, mirroring pytorch's dependabot.yml.
 version: 2
 updates:
   - package-ecosystem: "github-actions"

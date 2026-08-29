@@ -1,6 +1,5 @@
 name: nightly
 
-# Manually dispatched preview (nightly) channel, mirroring pytorch's nightly
 # versioning without the daily cron: versions follow the
 # X.Y.0.dev<UTC date>[+cuXXX|+cpu] rule computed by
 # tools/generate_tensorplay_version.py, wheels land on the rolling "nightly"
@@ -29,8 +28,8 @@ on:
         type: string
         default: ""
         description: >-
-          Base version without variant local labels. Defaults to the pytorch
-          nightly rule applied to version.txt, e.g. 1.0.0.dev20260828.
+          Base version without variant local labels. Defaults to the nightly
+          rule applied to version.txt, e.g. 1.0.0.dev20260828.
       build_number:
         required: false
         type: string
@@ -325,7 +324,6 @@ jobs:
   publish-nightly-indexes:
     name: publish-nightly-indexes
     # Runs even when some matrix legs failed (partial nightlies are published,
-    # like pytorch), but only after the version was determined. The prune step
     # inside aborts if no wheel of the new version made it to the release.
     if: ${{ !cancelled() && needs.prepare.result == 'success' }}
     needs:

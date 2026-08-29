@@ -94,7 +94,6 @@ jobs:
             echo "Release $GITHUB_REF_NAME already exists"
           else
             # Curated notes live in docs/release-notes/<tag>.md, compiled from
-            # the "release notes: *" PR labels the way pytorch compiles theirs
             # (see docs/release-notes/TEMPLATE.md). Fall back to GitHub's
             # auto-generated notes when the file is missing.
             notes_args=(--generate-notes)

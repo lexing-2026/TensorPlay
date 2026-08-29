@@ -1,6 +1,5 @@
 # Label inventory for this repository, kept in sync by the label-sync
 # workflow (.github/workflows/label-sync.yml, powered by EndBug/label-sync).
-# The "release notes: *" family mirrors pytorch's label family used to bucket
 # PRs by subsystem when compiling release notes; the scope-enum of the
 # Conventional Commits schema (tools/commit_schema.py) maps 1:1 to it.
 

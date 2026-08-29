@@ -1,6 +1,5 @@
 name: milestone-guard
 
-# Ensures every PR against main belongs to a milestone, mirroring how pytorch
 # tracks releases through milestones. When a PR has no milestone, it is
 # assigned to the milestone matching version.txt (e.g. 1.0.0a0 -> v1.0.0).
 # Milestones carry no due dates; they only bucket work per release.

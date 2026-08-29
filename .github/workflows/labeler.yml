@@ -1,7 +1,5 @@
 name: labeler
 
-# Path-based PR labeling, the plain-Actions stand-in for pytorch's
-# pytorch-probot labeler plugin. Label rules live in .github/labeler.yml;
 # the label inventory lives in .github/labels.yml. The "release notes: *"
 # labels bucket merged PRs for compiling release notes (see
 # docs/release-notes/TEMPLATE.md).

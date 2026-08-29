@@ -1,7 +1,6 @@
 name: label-sync
 
 # Keeps the repository labels in sync with the declarative inventory in
-# .github/labels.yml (powered by EndBug/label-sync, the same approach pytorch
 # uses to manage its label taxonomy). Dispatch manually; dry-run defaults to
 # true so a dispatch previews the diff before applying it.
 
