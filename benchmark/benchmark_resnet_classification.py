@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
-"""Train and benchmark ResNet-18 on ``test/data`` against PyTorch.
+"""Train and benchmark a ResNet-18 against a reference runtime.
 
 The benchmark has two complementary checks:
 
-1. Torch and TensorPlay start from the same state and train independently on
-   the same preprocessed samples and batch order.  Their train/evaluate/test
+1. Both runtimes start from the same state and use the same preprocessed
+   samples and batch order. Their train/evaluate/test
    accuracy and wall time are reported separately.
-2. The final Torch state is copied into a fresh TensorPlay model.  The two
-   models then run on the same test batches.  This is the strict operator
-   parity gate: logits must be numerically close and Top-1 predictions must
-   be identical.  The same model-only boundary is used for compiled training
-   so TorchInductor's and TensorPlay's AOTAutograd-style forward/backward
-   paths are reported separately.
+2. The final reference state is loaded into a fresh TensorPlay model. Both
+   models then run on the same test batches. Logits must be numerically close
+   and Top-1 predictions must be identical. The same model-only boundary is
+   used for compiled training paths.
 
 Image decoding and preprocessing are deliberately implemented once here and
 shared by both frameworks.  The training timer includes that work, while the
@@ -45,7 +43,6 @@ from typing import Any, Callable, Iterable, Sequence
 # checkout's TensorPlay package rather than requiring an editable install.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-# Import Torch before TensorPlay.  This avoids runtime-library load-order
 # conflicts on installations that contain both CUDA-enabled packages.
 import numpy as np
 import torch
@@ -67,7 +64,6 @@ IMAGENET_STD = np.asarray((0.229, 0.224, 0.225), dtype=np.float32)
 
 @dataclass(frozen=True)
 class DeviceContext:
-    """The matching Torch and TensorPlay device used by one benchmark run."""
 
     name: str
     torch_device: torch.device
@@ -105,7 +101,6 @@ class IndexedImageDataset(TensorPlayDataset):
     """Small Dataset wrapper used to validate the TensorPlay data path.
 
     The actual training loop uses explicit, shared batch indices so that the
-    Torch and TensorPlay runs see exactly the same order.  This class keeps a
     normal ``Dataset`` implementation available for callers that want to
     benchmark the project DataLoader separately.
     """
@@ -187,7 +182,6 @@ def make_epoch_indices(
 def torch_state_to_tensorplay(
     state_dict: dict[str, torch.Tensor], device: tp.Device
 ) -> dict[str, tp.Tensor]:
-    """Copy a Torch state dict without retaining Torch storage or autograd."""
 
     converted: dict[str, tp.Tensor] = {}
     for name, value in state_dict.items():
@@ -203,7 +197,6 @@ def load_torch_state_into_tensorplay(
     model: tp_nn.Module, state_dict: dict[str, torch.Tensor], device: tp.Device
 ) -> None:
     # Use an explicit copy here instead of Module.load_state_dict.  The
-    # checkout currently carries an incomplete torch-compatibility shim for
     # ``tensorplay.__future__``; the benchmark must still be able to provide
     # a strict, auditable cross-framework weight transfer.
     source = torch_state_to_tensorplay(state_dict, device)
@@ -681,13 +674,11 @@ def benchmark_compiled_training(
     compile_mode: str,
     optimizer_foreach: bool | None,
 ) -> dict[str, dict[str, object]]:
-    """Compare ``torch.compile(model)`` and ``tp.compile(model)`` in training.
+    """
 
-    This deliberately mirrors the PyTorch API boundary instead of compiling a
     hand-written training loop: the model is the only compiled object, while
     CrossEntropyLoss, ``backward()``, and the SGD update remain outside.  It
   keeps the API boundary visible: both frameworks compile the model, while
-  TorchInductor and Stax each own a separate AOT forward/backward graph.
     """
 
     if not epoch_orders or not epoch_orders[0]:
@@ -914,10 +905,7 @@ def parse_args() -> argparse.Namespace:
         "--optimizer-foreach",
         choices=("default", "true", "false"),
         default="true",
-        help=(
-            "use the same Torch foreach dispatch on both optimizers; "
-            "default=true, 'default' leaves Torch's device default unchanged"
-        ),
+        help="use the same foreach dispatch choice for both optimizers",
     )
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--seed", type=int, default=20260821)
@@ -953,7 +941,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-fail-on-mismatch",
         action="store_true",
-        help="report parity failures without returning a non-zero status",
+        help="report agreement failures without returning a non-zero status",
     )
     args = parser.parse_args()
     if args.epochs < 1:
@@ -973,7 +961,7 @@ def make_device_context(name: str) -> DeviceContext:
     if name != "cuda":
         raise ValueError(f"unknown device: {name}")
     if not torch.cuda.is_available():
-        raise RuntimeError("PyTorch CUDA is not available")
+        raise RuntimeError("Reference framework CUDA is not available")
     if not tp.cuda.is_available():
         raise RuntimeError("TensorPlay CUDA is not available")
     if torch.cuda.device_count() < 1 or tp.cuda.device_count() < 1:
@@ -1010,7 +998,6 @@ def run_benchmark(
     }[args.optimizer_foreach]
 
     # Reset both frameworks before each device run.  The TensorPlay model is
-    # then explicitly loaded from the Torch initialization, so initialization
     # differences cannot masquerade as training differences.
     torch.manual_seed(args.seed)
     if context.name == "cuda":
@@ -1067,7 +1054,7 @@ def run_benchmark(
     ]
 
     print("=" * 78)
-    print(f"TensorPlay / PyTorch ResNet-18 classification benchmark [{context.name}]")
+    print(f"TensorPlay / ref ResNet-18 classification benchmark [{context.name}]")
     print(f"data_root={data_root}")
     print(
         f"splits=train:{len(train_split)}, evaluate:{len(evaluate_split)}, "
@@ -1079,7 +1066,6 @@ def run_benchmark(
         f"shuffle={not args.no_shuffle}, optimizer_foreach={optimizer_foreach!r}"
     )
     print(
-        f"torch_device={context.torch_device}, "
         f"tensorplay_device={context.tensorplay_device}"
     )
     if context.name == "cuda":
@@ -1090,7 +1076,7 @@ def run_benchmark(
     torch_history: list[dict[str, float]] = []
     tensorplay_history: list[dict[str, float]] = []
 
-    print("[1/6] Training PyTorch reference")
+    print("[1/6] Training reference framework")
     for epoch, batch_indices in enumerate(epoch_orders, start=1):
         train_metrics = train_torch_epoch(
             torch_model,
@@ -1176,7 +1162,7 @@ def run_benchmark(
             f"({train_metrics['samples_per_second']:.1f} samples/s)"
         )
 
-    print("[3/6] Strict Torch-checkpoint -> TensorPlay parity")
+    print("[3/6] Strict checkpoint -> TensorPlay agreement")
     strict_tensorplay_model = tensorplay_resnet18(num_classes=NUM_CLASSES).to(
         context.tensorplay_device
     )
@@ -1215,7 +1201,6 @@ def run_benchmark(
     print(f"  max_rel_logit_error={max_rel_logit_error:.6g}")
     print(f"  predictions_identical={prediction_match}; labels_identical={label_match}")
     print(
-        f"  Torch test accuracy={torch_accuracy:.3%}; "
         f"TensorPlay transferred accuracy={tensorplay_accuracy:.3%}"
     )
 
@@ -1244,7 +1229,7 @@ def run_benchmark(
         inference["tensorplay"]["p50_seconds"]
         / inference["torch"]["p50_seconds"]
     )
-    print(f"  TensorPlay/PyTorch latency ratio={latency_ratio:.3f}x (target < 1)")
+    print(f"  TensorPlay/ref latency ratio={latency_ratio:.3f}x (target < 1)")
 
     compiled_training: dict[str, dict[str, object]] | None = None
     compiled_training_ok = True
@@ -1254,7 +1239,7 @@ def run_benchmark(
         print("[5/6] Compiled training/inference comparison skipped (--no-compile)")
     else:
         if args.compiled_training_epochs:
-            print("[5/6] Compiled training: TorchInductor/AOTAutograd contract")
+            print("[5/6] Compiled training: compiler contract")
             compiled_training = benchmark_compiled_training(
                 torch_model,
                 train_split,
@@ -1299,7 +1284,6 @@ def run_benchmark(
                 )
                 compiled_training_ok = first_loss_close
                 print(
-                    f"  first_step_loss: Torch={torch_first_loss:.6g}, "
                     f"TensorPlay={tensorplay_first_loss:.6g}, "
                     f"close={first_loss_close}"
                 )
@@ -1356,7 +1340,6 @@ def run_benchmark(
                 / compiled_inference["torch"]["p50_seconds"]
             )
             print(
-                "  TensorPlay/PyTorch compiled inference latency ratio="
                 f"{compiled_latency_ratio:.3f}x (target < 1)"
             )
         if compile_ok:
@@ -1393,7 +1376,7 @@ def run_benchmark(
         },
         "torch_training": torch_history,
         "tensorplay_training": tensorplay_history,
-        "strict_parity": {
+        "strict_agreement": {
             "max_abs_logit_error": max_abs_logit_error,
             "max_rel_logit_error": max_rel_logit_error,
             "logits_close": logits_close,
@@ -1419,17 +1402,17 @@ def run_benchmark(
         )
     result["compile_ok"] = compile_ok
     result["compiled_training_ok"] = compiled_training_ok
-    parity_ok = logits_close and prediction_match and label_match
-    if not parity_ok or not compile_ok:
-        if parity_ok and not compile_ok:
-            message = "FAIL: compiled Torch/TensorPlay ResNet comparison did not pass"
+    agreement_ok = logits_close and prediction_match and label_match
+    if not agreement_ok or not compile_ok:
+        if agreement_ok and not compile_ok:
+            message = "FAIL: compiled ref/TensorPlay ResNet comparison did not pass"
         else:
-            message = "FAIL: strict Torch/TensorPlay ResNet parity check did not pass"
+            message = "FAIL: strict ref/TensorPlay ResNet agreement check did not pass"
         print(message, file=sys.stderr)
-        result["parity_ok"] = False
+        result["agreement_ok"] = False
         return result
-    print("PASS: strict accuracy/logit parity check passed")
-    result["parity_ok"] = True
+    print("PASS: strict accuracy/logit agreement check passed")
+    result["agreement_ok"] = True
     return result
 
 
@@ -1488,17 +1471,17 @@ def main() -> int:
         args.json_out.write_text(json.dumps(output, indent=2) + "\n", encoding="utf-8")
         print(f"wrote {args.json_out}")
 
-    parity_ok = all(
-        result["parity_ok"] and result["compile_ok"]
+    agreement_ok = all(
+        result["agreement_ok"] and result["compile_ok"]
         for result in results.values()
     )
-    if not parity_ok:
+    if not agreement_ok:
         print(
-            "FAIL: Torch/TensorPlay ResNet parity or compile comparison did not pass",
+            "FAIL: ref/TensorPlay ResNet agreement or compile comparison did not pass",
             file=sys.stderr,
         )
         return 0 if args.no_fail_on_mismatch else 1
-    print("PASS: strict accuracy/logit parity check passed on all requested devices")
+    print("PASS: strict accuracy/logit agreement check passed on all requested devices")
     return 0
 
 

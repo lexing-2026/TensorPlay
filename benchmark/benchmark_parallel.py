@@ -8,7 +8,6 @@
 #   python benchmark/benchmark_parallel.py
 #   python benchmark/benchmark_parallel.py --iters 100000
 #
-# Compare against PyTorch (torch.set_num_threads + torch.add).
 
 import argparse
 import os
@@ -54,7 +53,7 @@ def bench_torch(nthreads, n_elem, iters):
     a = torch.tensor([1.0] * n_elem)
     b = torch.tensor([2.0] * n_elem)
     ns = bench(lambda: a + b, iters)
-    print(f"PyTorch    n={n_elem:>9} threads={nthreads}:              {ns:9.1f} ns/call")
+    print(f"ref        n={n_elem:>9} threads={nthreads}:              {ns:9.1f} ns/call")
     return ns
 
 
@@ -89,9 +88,9 @@ def main():
 
         tr1 = bench_torch(1, 1, args.iters)
         tr8 = bench_torch(8, 1, args.iters)
-        print(f"PyTorch    ratio (8t/1t): {tr8 / tr1:.3f}x")
-        print(f"TensorPlay 8t vs PyTorch 8t: {tp8 / tr8:.2f}x")
-        print(f"TensorPlay 1t vs PyTorch 1t: {tp1 / tr1:.2f}x")
+        print(f"ref        ratio (8t/1t): {tr8 / tr1:.3f}x")
+        print(f"TensorPlay 8t vs ref 8t: {tp8 / tr8:.2f}x")
+        print(f"TensorPlay 1t vs ref 1t: {tp1 / tr1:.2f}x")
 
     # --- Large add: pool should engage and speed up ---
     N = args.large_n

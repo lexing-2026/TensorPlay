@@ -4,11 +4,9 @@ Measures pure host-side cost per iteration (GPU work is identical across
 variants; the wall time of an enqueue-only loop is host overhead):
 
 * eager:            launch one small op per input per iteration (baseline)
-* graph.manual:     N x tensor.copy_() + CUDAGraph.replay()  (torch's shape)
 * graph.bulk:       CUDAGraph.stage_and_launch(...)          (one native call)
 * manager.bulk:     CudaGraphManager.replay(key, ...)        (adds key/signature check)
 
-When PyTorch is importable in the same environment its eager + graph replay
 paths are measured side by side for reference.
 
 Usage:
@@ -118,8 +116,8 @@ def main():
                 tg.replay()
 
             torch_rows = [
-                ("torch.eager (%d ops)" % args.n, torch_eager),
-                ("torch.graph copy_+replay", torch_manual),
+                ("ref.eager (%d ops)" % args.n, torch_eager),
+                ("ref.graph copy_+replay", torch_manual),
             ]
     except ImportError:
         pass
@@ -139,10 +137,10 @@ def main():
     for name, fn in rows:
         base[name] = report(name, fn)
 
-    tm = base.get("torch.graph copy_+replay")
+    tm = base.get("ref.graph copy_+replay")
     bm = base["manager.bulk"]
     if tm:
-        print(f"\nTensorPlay/torch bulk-replay ratio: {bm / tm:.2f}x "
+        print(f"\nTensorPlay/ref bulk-replay ratio: {bm / tm:.2f}x "
               f"({'faster' if bm < tm else 'slower'})")
 
 

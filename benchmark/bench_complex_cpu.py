@@ -1,8 +1,7 @@
-"""CPU complex elementwise benchmark: tensorplay vs torch.
+"""CPU complex elementwise benchmark.
 
-The point of comparison is ATen's CPU complex path: transcendentals and
-abs/angle there are scalar std::complex loops (vec256_complex maps them),
-while tensorplay runs AVX2+libmvec split-lane kernels (cpu/VecComplex.h).
+The suite compares scalar complex reference operations with TensorPlay's
+AVX2+libmvec split-lane kernels (cpu/VecComplex.h).
 
 Usage: PYTHONPATH=. python3 benchmark/bench_complex_cpu.py [--dtype c128]
 """
@@ -67,9 +66,9 @@ def main():
         if hasattr(tp, "set_num_threads"):
             tp.set_num_threads(args.threads)
 
-    print(f"torch {torch.__version__} threads={torch.get_num_threads()}  "
+    print(f"ref {torch.__version__} threads={torch.get_num_threads()}  "
           f"dtype={args.dtype}")
-    hdr = f"{'op':>6} {'n_complex':>10} {'tp_ms':>9} {'torch_ms':>9} {'speedup':>8}"
+    hdr = f"{'op':>6} {'n_complex':>10} {'tp_ms':>9} {'ref_ms':>9} {'speedup':>8}"
     print(hdr)
     slow = []
     for n in (4096, 1 << 16, 1 << 20, 1 << 22):
@@ -109,11 +108,11 @@ def main():
                 slow.append((name, n, sp))
 
     if slow:
-        print("\nBEHIND torch:")
+        print("\nBEHIND ref:")
         for name, n, sp in slow:
             print(f"  {name} @{n}: {sp:.2f}x")
     else:
-        print("\nAll ops >= torch CPU")
+        print("\nAll ops >= ref CPU")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
-"""CPU fp32 train-step benchmark: F.linear forward + backward vs torch.
+"""CPU fp32 train-step benchmark.
 
-Mirrors the layer shapes that dominate a Transformer/MLP train step.
+Uses layer shapes that dominate a Transformer/MLP train step.
 Usage: python3 benchmark/bench_train_fp32_cpu.py [--threads N] [--reps R]
 """
 import argparse
@@ -81,7 +81,7 @@ def main():
         torch.set_num_threads(args.threads)
         if hasattr(tp, "set_num_threads"):
             tp.set_num_threads(args.threads)
-    print(f"threads: torch={torch.get_num_threads()} "
+    print(f"threads: ref={torch.get_num_threads()} "
           f"tp={tp.get_num_threads() if hasattr(tp, 'get_num_threads') else '?'}")
     print(f"{'layer':>10} {'M':>5} {'K':>6} {'N':>6} "
           f"{'fwd_tp_ms':>10} {'fwd_th_ms':>10} {'step_tp_ms':>11} {'step_th_ms':>11}")
@@ -98,7 +98,7 @@ def main():
         if tp_fwd > 1.15 * th_fwd or tp_step > 1.15 * th_step:
             behind.append(tag)
     if behind:
-        print("BEHIND torch (>15%):", ", ".join(behind))
+        print("BEHIND ref (>15%):", ", ".join(behind))
 
 
 if __name__ == "__main__":

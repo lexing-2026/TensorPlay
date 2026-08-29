@@ -1,4 +1,4 @@
-"""LLM end-to-end benchmark: identical Llama-shaped block-stack, tp vs torch.
+"""
 
 Prefill (one causal pass over prompt) + autoregressive decode loop.
 Paired min-of-R; run serially on the GPU box.
@@ -54,9 +54,7 @@ class TorchLlama(torch.nn.Module):
             }))
         self.final = torch.nn.RMSNorm(h, eps=1e-5)
         self.lm_head = torch.nn.Linear(h, c["vocab"], bias=False)
-        # Keep the Torch baseline architecturally identical to TP: the
         # benchmark is specifically exercising fused interleaved RoPE, so a
-        # baseline that omits it would charge TP for work Torch never did.
         half_dim = c["head_dim"] // 2
         positions = torch.arange(c["max_seq"], dtype=torch.float32)
         inv_freq = 1.0 / (10000.0 ** (
@@ -98,7 +96,6 @@ classTPLlama_ready = None
 
 
 def tp_forward(model, ids, attn_impl=2):
-    """model: dict of tp tensors mirroring TorchLlama weights."""
     import math
     c = CFG
     B, T = ids.shape
@@ -108,7 +105,6 @@ def tp_forward(model, ids, attn_impl=2):
         return tp.rms_norm(x, [x.shape[-1]], w, 1e-5)
 
     def lin(x, w):
-        # Match torch.nn.Linear's flatten-to-2D path for [B,T,H] inputs.
         # The reshape pair is a view; it avoids the batched-matmul slice path
         # for decode's common [1,1,H] shape.
         if len(x.shape) > 2:
@@ -156,7 +152,6 @@ def build_tp_model(dev="cuda", dtype_name="float32"):
     c = CFG; h = c["hidden"]; H = c["heads"]; D = c["head_dim"]
     def to_device(t):
         # NumPy has no portable bfloat16 dtype.  Construct those weights as
-        # f32 and perform the same explicit narrowing as Torch's .to(dtype).
         if dtype_name == "bfloat16":
             t = t.to(tp.bfloat16)
         return t.to(dev)
@@ -363,7 +358,7 @@ def main():
                     )
                     res[fw].append((pf, mt))
             for fw in ("t", "p"):
-                name = "torch" if fw == "t" else "tp   "
+                name = "ref  " if fw == "t" else "tp   "
                 ds = sorted(m for _, m in res[fw])
                 ps = sorted(p for p, _ in res[fw])
                 print(
@@ -378,7 +373,7 @@ def main():
             torch_prefill_med = sorted(p for p, _ in res["t"])[len(res["t"]) // 2]
             tp_prefill_med = sorted(p for p, _ in res["p"])[len(res["p"]) // 2]
             print(
-                f"  speedup torch/tp: decode med={torch_decode_med / tp_decode_med:.3f}x "
+                f"  speedup ref/tp: decode med={torch_decode_med / tp_decode_med:.3f}x "
                 f"best={torch_decode_best / tp_decode_best:.3f}x | "
                 f"prefill med={torch_prefill_med / tp_prefill_med:.3f}x"
             )
