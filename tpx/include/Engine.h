@@ -18,7 +18,7 @@
 namespace tensorplay {
 namespace tpx {
 
-// Thread-safe ready queue ordered by sequence_nr (max first), mirroring
+// Thread-safe ready queue ordered by sequence_nr (max first), matching
 // CPU work; the thread that initiates backward() drains the CPU queue itself.
 class TENSORPLAY_API ReadyQueue {
 public:
