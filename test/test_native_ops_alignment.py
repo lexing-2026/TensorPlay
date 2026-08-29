@@ -1,6 +1,5 @@
-"""Native fwd/bwd op alignment vs torch (CPU + CUDA).
+"""
 
-Covers the ops added natively to close the gap against ATen:
   log_sigmoid, rrelu_with_noise, nll_loss2d, max_pool3d,
   max_pool2d_with_indices, max_pool3d_with_indices, adaptive_max_pool3d
 (each together with its backward kernel).
@@ -106,7 +105,7 @@ class TestRreluWithNoise(unittest.TestCase):
             out = F.rrelu(x, lower=0.1, upper=0.4, training=True)
             out.backward(tp.tensor(g.numpy(), device=dev))
 
-            # noise is random: check structural parity instead of bit equality.
+            # Noise is random, so check structure instead of bit equality.
             out_np, ref_np = _np(out), _np(ref)
             x_np = x_t.detach().numpy()
             pos = x_np > 0
@@ -132,7 +131,6 @@ class TestRreluWithNoise(unittest.TestCase):
             x_t = torch.randn(5, 9)
             noise_t = torch.rand(5, 9) * 0.3 + 0.1
             # With a pre-filled noise tensor the math is x <= 0 ? x*r : x
-            # (ATen's own kernel instead draws r from a generator).
             x_np = x_t.detach().numpy()
             r_np = noise_t.numpy()
             expected = np.where(x_np <= 0, x_np * r_np, x_np)
@@ -324,7 +322,7 @@ class TestAdaptiveMaxPool3d(unittest.TestCase):
 
 
 class TestDoubleBackwardDtype(unittest.TestCase):
-    """float64 parity (gradcheck-style) for the new pointwise ops."""
+    """Float64 gradient checks for the new pointwise ops."""
 
     def test_log_sigmoid_f64(self):
         for dev in _devices():

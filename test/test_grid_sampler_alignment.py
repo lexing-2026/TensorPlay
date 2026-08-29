@@ -1,6 +1,5 @@
-"""Native grid_sampler_2d / grid_sampler_3d alignment vs torch (CPU + CUDA).
+"""
 
-Covers the grid sampling family added natively to close the gap against ATen:
   grid_sampler_2d / grid_sampler_3d and their backward kernels, exercised
 through tp.nn.functional.grid_sample for every interpolation mode, padding
 mode and align_corners setting, plus direct native-op calls with output_mask.

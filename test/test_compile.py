@@ -296,7 +296,6 @@ def test_linear_lowering_keeps_live_parameters_and_autograd():
     x = tp.randn(4, 3, requires_grad=True)
     result = compiled(x)
     lowering = next(iter(compiled._tensorplay_cache.values()))
-    # Training-mode modules lower through the Torch-style AOTAutograd split
     # (forward_graph + backward_graph); eval-mode uses the single native
     # forward graph.
     graph = getattr(lowering, "forward_graph", None) or lowering.graph

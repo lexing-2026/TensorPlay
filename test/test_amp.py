@@ -1,8 +1,6 @@
-"""AMP alignment tests: tensorplay.amp vs torch.amp semantics.
+"""
 
 Runs against the C++ dispatcher implementation (Autocast dispatch keys,
-thread-local state in p10, native _amp_* kernels).  Torch-parity cases are
-skipped when torch is not importable.
 """
 
 import pickle
@@ -25,7 +23,6 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Autocast state API (torch top-level binding surface)
 # ---------------------------------------------------------------------------
 
 def test_top_level_state_api():
@@ -89,7 +86,6 @@ def test_enter_exit_restores_state():
 
 
 def test_cache_flag_is_inherited_not_forced():
-    # Mirrors torch: cache_enabled=None inherits the ambient flag.
     tp.set_autocast_cache_enabled(False)
     try:
         with autocast(device_type="cpu"):
@@ -376,10 +372,9 @@ def test_pickle_roundtrip():
 
 
 # ---------------------------------------------------------------------------
-# Torch parity (CPU)
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skipif(not HAS_TORCH, reason="torch not installed")
+@pytest.mark.skipif(not HAS_TORCH, reason="reference package not installed")
 def test_parity_with_torch_cpu():
     import torch
 
@@ -430,7 +425,7 @@ def test_parity_with_torch_cpu():
     assert tp_steps == th_steps
 
 
-@pytest.mark.skipif(not HAS_TORCH, reason="torch not installed")
+@pytest.mark.skipif(not HAS_TORCH, reason="reference package not installed")
 def test_parity_autocast_dtypes_cpu():
     import torch
 
@@ -453,7 +448,7 @@ def test_parity_autocast_dtypes_cpu():
 
 
 # ---------------------------------------------------------------------------
-# Upstream policy-list alignment (ops added to match AT_FORALL_*)
+# Policy-list coverage (ops included in AT_FORALL_*)
 # ---------------------------------------------------------------------------
 
 def test_lower_precision_ops_added():
@@ -467,8 +462,6 @@ def test_lower_precision_ops_added():
         assert tp.addbmm(a, b.unsqueeze(0).expand(3, 4, 4),
                          b.unsqueeze(0).expand(3, 4, 4)).dtype == tp.bfloat16
         assert F.prelu(a, w.abs()).dtype == tp.bfloat16
-        # torch's KERNEL_CPU list does NOT wrap addmv/addr/mv/einsum: they run
-        # in their input dtype (fp32 here), matching ATen/autocast_mode.cpp.
         assert tp.addmv(a[0], b, b[0]).dtype == tp.float32
         assert tp.addr(a[0], b[0], b[1]).dtype == tp.float32
 
@@ -513,7 +506,7 @@ def test_promote_ops_added():
         assert tp.scatter_add(
             tp.zeros(4, 4), 0,
             idx[:2].unsqueeze(1).expand(2, 4), src) is not None
-        # promote semantics: fp32 present -> fp32 out (matches upstream)
+        # Promote semantics: fp32 present -> fp32 output.
         assert tp.atan2(a, half_a).dtype == tp.float32
 
 
@@ -522,7 +515,7 @@ def test_promote_ops_added():
 # ---------------------------------------------------------------------------
 
 def test_inference_weights_cached_not_recast_every_op():
-    """Under no_grad torch recasts every weight on every call; with the
+    """
     version-validated cache every repeat must be bit-identical to the first
     (the cached low-precision weights are reused)."""
     w = tp.randn(4, 4)
@@ -576,7 +569,7 @@ def test_enter_exit_on_exception_restores_state():
     assert tp.get_autocast_dtype("cpu") == prev_dtype
 
 
-@pytest.mark.skipif(not HAS_TORCH, reason="torch not installed")
+@pytest.mark.skipif(not HAS_TORCH, reason="reference package not installed")
 def test_parity_new_policy_ops_cpu():
     import torch
 
@@ -605,8 +598,6 @@ def test_parity_new_policy_ops_cpu():
 
 
 # ---------------------------------------------------------------------------
-# CPU list parity with ATen/autocast_mode.cpp's hand-written KERNEL_CPU block
-# (verified against torch with bf16 inputs: softmax/layer_norm/pow stay low
 # precision on CPU; the fp32 loss family and BCE are wrapped).
 # ---------------------------------------------------------------------------
 
@@ -615,7 +606,7 @@ def _bf16_pair(d=8):
     return a, a.to(tp.float16)
 
 
-@pytest.mark.skipif(not HAS_TORCH, reason="torch not installed")
+@pytest.mark.skipif(not HAS_TORCH, reason="reference package not installed")
 def test_parity_cpu_unwrapped_ops_stay_low_precision():
     import torch
 
@@ -637,7 +628,7 @@ def test_parity_cpu_unwrapped_ops_stay_low_precision():
     assert run(tp, ta) == run(torch, xa), (run(tp, ta), run(torch, xa))
 
 
-@pytest.mark.skipif(not HAS_TORCH, reason="torch not installed")
+@pytest.mark.skipif(not HAS_TORCH, reason="reference package not installed")
 def test_parity_cpu_wrapped_fp32_ops():
     import torch
 
@@ -666,7 +657,7 @@ def test_parity_cpu_wrapped_fp32_ops():
 
 
 def test_cpu_binary_cross_entropy_runs_fp32_not_banned():
-    # Upstream KERNEL_CPU(binary_cross_entropy, fp32): inputs cast to fp32 and
+    # The CPU binary-cross-entropy path casts inputs to fp32 and
     # the op runs (the `banned` error exists only on CUDA-class backends).
     p = tp.rand(8).clamp(1e-3, 1 - 1e-3)
     t = tp.zeros(8)

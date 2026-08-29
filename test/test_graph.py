@@ -1,5 +1,5 @@
 """Tests for the tensorplay.graph facade: capture primitives, visualization
-and torchvision-style feature extraction."""
+"""
 
 import operator
 
@@ -157,7 +157,6 @@ def test_inserting_before_keeps_creation_order():
 
 
 def test_inserting_after_splices_in_reverse_creation_order():
-    # torch.fx parity: every node lands directly after the anchor, so a
     # creation sequence appears reversed in the graph.
     g = Graph()
     x = g.placeholder("x")
@@ -209,7 +208,6 @@ def test_graph_copy_remaps_through_val_map():
 
 
 def test_subgraph_rewrite_addmul_to_sub():
-    # torch.fx subgraph_rewriter use case, natively:
     #   f(x, y): x = x + y; x = x * y  ->  return x - y
     def f(x, y):
         x = x + y

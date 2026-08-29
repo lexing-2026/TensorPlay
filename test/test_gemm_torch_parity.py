@@ -1,7 +1,6 @@
-"""Torch-parity tests for the full GEMM family: mm/matmul/addmm/bmm/baddbmm/
+"""
 mv/dot/inner/outer/einsum on CPU and CUDA.
 
-Covers shapes, dtypes, numerics, autograd and torch's exact error wording.
 """
 
 import numpy as np
@@ -29,7 +28,6 @@ def _torch_mk(array, device):
 
 
 # ---------------------------------------------------------------------------
-# Numerics: every op must match torch (bit-exact for fp32/fp64 where BLAS
 # orders coincide; tolerance for reduced precision).
 # ---------------------------------------------------------------------------
 
@@ -74,7 +72,6 @@ def test_blas_family_numerics(device):
 
 @pytest.mark.parametrize("device", DEVICES)
 def test_addmm_broadcast_inputs(device):
-    """torch accepts any input broadcastable to (M, N): 0-dim, (N,), (M,1), (1,N)."""
     if device == "cuda" and not tp.cuda.is_available():
         pytest.skip("no cuda")
     rng = np.random.RandomState(1)
@@ -104,7 +101,6 @@ def test_baddbmm_broadcast_inputs(device):
 
 
 # ---------------------------------------------------------------------------
-# Error messages must match torch verbatim.
 # ---------------------------------------------------------------------------
 
 def _err(fn):
@@ -122,7 +118,6 @@ def test_error_messages_match_torch(device):
     f32, f64 = np.float32, np.float64
 
     pairs = [
-        # (name, tp_fn, torch_fn)
         ("mm dtype", lambda: tp.mm(_mk(np.ones((2, 3), f32), device), _mk(np.ones((3, 4), f64), device)),
          lambda: torch.mm(torch.ones(2, 3, device=device), torch.ones(3, 4, dtype=torch.float64, device=device))),
         ("mm shape", lambda: tp.mm(_mk(np.ones((2, 3), f32), device), _mk(np.ones((5, 4), f32), device)),
@@ -153,7 +148,7 @@ def test_error_messages_match_torch(device):
     for name, tp_fn, torch_fn in pairs:
         got = _err(tp_fn)
         want = _err(torch_fn)
-        assert got == want, f"{name}:\n  tp   = {got!r}\n  torch= {want!r}"
+        assert got == want, f"{name}:\n  tp   = {got!r}\n  reference= {want!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +220,7 @@ def test_einsum_fast_path_noncontig_inputs():
 def test_einsum_native_path_reorders_contraction():
     """With >2 operands and no explicit path, the kernel plans an order whose
     result still equals numpy's path-independent ground truth -- and avoids
-    torch's left-to-right blow-up when opt-einsum is absent."""
+"""
     rng = np.random.RandomState(13)
     # Left-to-right materializes a 40x40x40 intermediate here; the planned
     # order contracts the small pairs first.
@@ -253,7 +248,6 @@ def test_einsum_explicit_path_kwarg():
                                    path=[0, 1, 0, 1, 0, 1]))
     want = np.einsum("ab,bc,cd,de->ae", *xs)
     np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-5)
-    # Invalid paths must raise exactly like torch.
     with pytest.raises(Exception) as exc:
         tp.functional.einsum("ab,bc,cd,de->ae", *[_mk(x, "cpu") for x in xs],
                              path=[0, 0])
@@ -262,7 +256,7 @@ def test_einsum_explicit_path_kwarg():
 
 def test_einsum_fuzz_matches_numpy_and_torch():
     """Random equations (ellipsis, repeats, implicit output, broadcasts-free)
-    must agree with numpy's ground truth and torch's result."""
+"""
     from collections import Counter
     rng = np.random.RandomState(42)
     LET = "abcde"

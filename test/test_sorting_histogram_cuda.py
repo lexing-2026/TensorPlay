@@ -1,16 +1,15 @@
-"""CUDA parity tests for the native quantile / nanquantile / histogram batch.
+"""CUDA behavior tests for the native quantile / nanquantile / histogram batch.
 
 Same device-generic composite bodies as the CPU tests
 (test_sorting_histogram.py) run on the CUDA backend via the shared
 registration in MiscKernels.cpp.  Skipped when no GPU is present (local
-CPU-only builds); on the GPU box, import torch before tensorplay (cudart
 12.8-vs-12.4 coexistence, see .remote_build.md).
 """
 import unittest
 
 import numpy as np
 
-import torch  # must precede tensorplay on the GPU box
+import torch  # load the reference package before TensorPlay on the GPU box
 
 import tensorplay as tp
 
@@ -73,7 +72,6 @@ class TestSortingHistogramCuda(unittest.TestCase):
     def test_histogram_bins(self):
         x = self.x32.to(self.dev)
         h_tp, e_tp = tp.histogram(t2tp(x, self.dev), 7)
-        # torch.histogram is CPU-only in ATen; take the reference there.
         h_t, e_t = torch.histogram(self.x32, 7)
         self.assertParity(h_tp, h_t)
         self.assertParity(e_tp, e_t)

@@ -9,7 +9,6 @@ class TestParameter(unittest.TestCase):
         self.assertTrue(p.requires_grad)
         self.assertEqual(p.shape, t.shape)
         # Verify data sharing (if implemented via copy_metadata/pointer share)
-        # Note: tensorplay Python bindings might behave differently than PyTorch regarding exact handle sharing
         # but let's check values.
         self.assertEqual(p[0].item(), 1.)
         
@@ -47,7 +46,6 @@ class TestParameter(unittest.TestCase):
         
         # Check buffers? 
         # t is not registered as buffer automatically unless register_buffer called?
-        # PyTorch: self.t = tensor -> just attribute.
         # My implementation: object.__setattr__ -> attribute.
         self.assertNotIn('t', m._buffers)
         self.assertNotIn('t', m._parameters)

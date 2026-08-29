@@ -1,4 +1,3 @@
-"""Torch parity tests for matmul's shape, dtype, layout, and autograd contract."""
 
 import numpy as np
 import pytest
@@ -115,7 +114,6 @@ def test_matmul_forward_matches_torch_across_shapes(device):
             atol=2e-4,
         )
 
-    # A transposed matrix and a broadcasted batch must retain Torch's
     # non-contiguous/zero-stride semantics.
     a_base, b = _torch_inputs((2, 3, 4), (1, 3, 5))
     torch_a = a_base.transpose(-1, -2).to(device)

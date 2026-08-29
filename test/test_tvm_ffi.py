@@ -1,6 +1,5 @@
 """Custom operators backed by raw C++/CUDA via Apache TVM's ``tvm_ffi``.
 
-torch has no first-party TVM integration: TVM ships its own Python API
 (``tvm_ffi``) whose exported functions accept any DLPack-compatible tensor
 directly (``tvm::ffi::TensorView``).  TensorPlay implements the DLPack
 protocol on :class:`tensorplay.Tensor`, so TP tensors pass through
@@ -41,7 +40,7 @@ void scale_cpu(tvm::ffi::TensorView x, tvm::ffi::TensorView y) {
 
 @unittest.skipUnless(_HAS_TVM_FFI, "tvm_ffi is not installed")
 class TvmFfiInteropTest(unittest.TestCase):
-    """Raw tvm-ffi usage: exactly the upstream API, TP tensors in."""
+    """Raw tvm-ffi usage with TensorPlay tensors."""
 
     def test_jit_load_inline_accepts_tp_tensors(self):
         mod = tvm_ffi.cpp.load_inline(

@@ -12,7 +12,6 @@ class TestAutogradEngine(unittest.TestCase):
         self.assertEqual(x.grad.item(), 4.0)
         
         # Second backward should fail or do nothing effectively because graph is cleared
-        # In PyTorch this raises RuntimeError.
         # In our current implementation, clearing edges means the graph is disconnected.
         # So x.grad should NOT increase.
         

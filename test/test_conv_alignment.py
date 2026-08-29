@@ -1,7 +1,6 @@
-"""Conv-family alignment tests against PyTorch.
+"""
 
 Every case compares forward values and (where differentiable) all gradients
-against the installed torch, mirroring the alignment contract:
 conv1d/2d/3d, conv_transpose1d/2d/3d, unfold/fold, pad modes, padding_mode
 in nn.Conv*, Tensor.unfold and conv_tbc.
 """
@@ -32,7 +31,6 @@ def _grads_torch(fn, *inputs):
 def _grads_tp(fn, *inputs, tangent=None):
     t_inputs = [x.clone().requires_grad_(True) for x in inputs]
     out = fn(*t_inputs)
-    # The torch-side helper draws its tangent from torch's RNG; comparing
     # gradients requires BOTH sides to consume the same tangent (the two RNG
     # streams are unrelated).
     if tangent is not None:
@@ -104,7 +102,6 @@ class TestUnfoldFold(unittest.TestCase):
         _assert_close(grads_p[0], grads_t[0], "F.unfold backward")
 
     def test_fold_forward_and_grad(self):
-        # fold input built from torch's own unfold so shapes are canonical
         x_img = _make((2, 3, 8, 8), seed=5)
         col = TF.unfold(x_img, kernel_size=3, padding=1, stride=2)
         ref = lambda c: TF.fold(c, output_size=(8, 8), kernel_size=3, padding=1, stride=2)
@@ -205,7 +202,7 @@ class TestTensorUnfoldView(unittest.TestCase):
 class TestConvTbc(unittest.TestCase):
     def test_matches_torch(self):
         x_t = _make((6, 2, 3))       # (T, B, C)
-        w_t = _make((3, 3, 5))       # (k, C_in, C_out) -- torch contract
+        w_t = _make((3, 3, 5))
         b_t = _make((5,))
         ref = torch.conv_tbc(x_t, w_t, b_t, 2)
         got = F.conv_tbc(_to_tp(x_t), _to_tp(w_t), _to_tp(b_t), 2)
@@ -263,7 +260,6 @@ class TestFloat64Conv(unittest.TestCase):
 
 class TestLowPrecisionCPU(unittest.TestCase):
     def _check(self, fwd_tp, fwd_torch, inputs, tol):
-        # inputs are torch tensors already; a numpy detour would drop
         # bfloat16 (numpy has no bf16) and perturb fp16.
         outs_t = [fwd_torch(*[x.clone() for x in inputs])]
         outs_p = [fwd_tp(*[_to_tp(x) for x in inputs])]

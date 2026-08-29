@@ -1,4 +1,3 @@
-"""Interoperability: torch .pt archives (zip/stream/tar) and safetensors."""
 
 import copyreg
 import io
@@ -25,7 +24,6 @@ def _raw_bytes(tensor) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# torch zip format (PyTorch >= 1.6)
 # ---------------------------------------------------------------------------
 
 
@@ -135,7 +133,6 @@ def _storage_class_for(tensor):
 
 
 def _build_magic_number_stream(tensors: dict) -> bytes:
-    """Synthesize a torch <1.6 stream checkpoint for ``{name: tensor}``."""
 
     buf = io.BytesIO()
     pickle.dump(TORCH_MAGIC_NUMBER, buf, protocol=2)
@@ -321,7 +318,6 @@ def test_safetensors_corrupt_offsets_rejected(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# cross-validation against real torch when available
 # ---------------------------------------------------------------------------
 
 
@@ -333,7 +329,7 @@ def _torch_available():
         return False
 
 
-@pytest.mark.skipif(not _torch_available(), reason="torch not installed")
+@pytest.mark.skipif(not _torch_available(), reason="reference package not installed")
 def test_real_torch_loads_our_pt(tmp_path: Path):
     import torch
 
@@ -350,7 +346,7 @@ def test_real_torch_loads_our_pt(tmp_path: Path):
     assert reference["tied_a"].data_ptr() == reference["tied_b"].data_ptr()
 
 
-@pytest.mark.skipif(not _torch_available(), reason="torch not installed")
+@pytest.mark.skipif(not _torch_available(), reason="reference package not installed")
 def test_we_load_real_torch_save(tmp_path: Path):
     import torch
 

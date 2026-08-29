@@ -1,7 +1,6 @@
-"""Native fractional_max_pool2d / fractional_max_pool3d alignment vs torch.
+"""
 
 Covers the fractional pooling family added natively to close the gap against
-ATen (FractionalMaxPool2d.cpp / FractionalMaxPool3d.cpp, cuda/*.cu): forward
 values + flat in-plane indices, backward through autograd, direct native-op
 calls, batched and unbatched inputs. Determinism comes from the
 caller-provided _random_samples tensor (no internal RNG).
@@ -124,7 +123,7 @@ class TestFractionalMaxPool2d(unittest.TestCase):
 
     def test_module_smoke(self):
         # The module draws its own random samples, so only shape/grad flow is
-        # checked here; value parity is covered by the fixed-sample tests.
+        # checked here; value behavior is covered by the fixed-sample tests.
         torch.manual_seed(7)
         input_t = torch.randn(2, 2, 12, 12)
         for dev in _devices():

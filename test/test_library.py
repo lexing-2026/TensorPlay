@@ -225,7 +225,6 @@ class NativeBridgeTest(unittest.TestCase):
         self.assertFalse(has("bridgens::missing_op"))
 
     def test_native_mirror_outlives_python_kernels(self):
-        # torch parity: operator registrations are process-lifetime. Clearing
         # the Python-side kernel table must not corrupt the native mirror;
         # run_native keeps dispatching the registered callable.
         @library.custom_op("bridgens::bare", mutates_args=())
@@ -268,7 +267,6 @@ class CompilerCaptureTest(unittest.TestCase):
         self.assertEqual(compiled(x).tolist(), [22.0, 24.0])
 
     def test_custom_op_lowers_into_native_graph_not_interpreter(self):
-        # torch parity: a captured custom op must execute through the native
         # dispatcher bridge inside the compiled artifact, never via the
         # Python GraphModule interpreter.
         from tensorplay.backends.stax import stax
@@ -377,7 +375,6 @@ class WrapTritonTest(unittest.TestCase):
 
 
 class CustomOpSignatureParityTest(unittest.TestCase):
-    """torch 2.13 signature surface: fn positional + schema attachment."""
 
     def test_fn_positional(self):
         def body(x):
@@ -813,7 +810,6 @@ class TileLangOpCaptureTest(unittest.TestCase):
 class RealTritonJITFunctionTest(unittest.TestCase):
     """Level-2 plumbing against a genuine ``@triton.jit`` kernel object.
 
-    torch's custom-op suite exercises Triton integration with real
     JITFunctions; an actual launch additionally needs a supported GPU
     (sm_70+), which neither the local box nor the sm_61 remote provides.
     Everything that is launch-free is covered here with the real object:

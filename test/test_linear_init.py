@@ -18,7 +18,6 @@ class TestLinearInit(unittest.TestCase):
         # Kaiming uniform
         # std = gain / sqrt(fan_in) * sqrt(3)
         # gain for leaky_relu(sqrt(5)) -> sqrt(2/(1+5))? No, a=sqrt(5) is passed to kaiming_uniform
-        # Wait, PyTorch Linear uses kaiming_uniform with a=sqrt(5)
         # The gain for a=sqrt(5) (negative_slope) is sqrt(2/(1+5)) = sqrt(1/3) approx 0.577
         # fan_in = 10
         # std = 0.577 / sqrt(10) ~= 0.18

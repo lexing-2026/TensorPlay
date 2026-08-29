@@ -1,8 +1,6 @@
-"""Native binary_cross_entropy / binary_cross_entropy_backward alignment vs torch.
+"""
 
-Closes BCE against ATen (Loss.cpp binary_cross_entropy_cpu /
 binary_cross_entropy_backward_cpu, cuda/Loss.cu): the forward is realigned to
-the ATen signature (self, target, weight?, reduction) with the ATen semantics
 (input/target must lie in [0, 1], per-element logs clamped at -100 instead of
 input clamping), the new native binary_cross_entropy_backward matches
 grad * (x - t) / max((1 - x) * x, 1e-12) with weight multiply and
@@ -73,7 +71,6 @@ class TestBCEForward(unittest.TestCase):
                         self._run(shape, reduction, dev, 5, with_weight)
 
     def test_boundary_zero_one(self):
-        # ATen clamps the per-element logs at -100 (not the input), so
         # input=0/target=1 and input=1/target=0 contribute exactly 100.
         for dev in _devices():
             input_t = torch.tensor([0.0, 1.0, 0.5, 0.25])
@@ -88,7 +85,6 @@ class TestBCEForward(unittest.TestCase):
                               msg=f"bce boundary reduction={reduction} ({dev})")
 
     def test_input_out_of_range_raises(self):
-        # ATen TORCH_CHECK: all elements of input/target in [0, 1].
         for bad_in, bad_tgt in ((torch.tensor([1.5]), torch.tensor([1.0])),
                                 (torch.tensor([0.5]), torch.tensor([-0.1]))):
             with self.assertRaises(RuntimeError) as cm:

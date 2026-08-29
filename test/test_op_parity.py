@@ -29,15 +29,15 @@ def compare(name, tp_out, torch_out, tol=1e-4):
     t_out = to_torch(tp_out)
     # Check shape
     if t_out.shape != torch_out.shape:
-        print(f"FAIL: {name} shape mismatch. TP: {t_out.shape}, Torch: {torch_out.shape}")
+        print(f"FAIL: {name} shape mismatch. TP: {t_out.shape}, reference: {torch_out.shape}")
         return False
         
     diff = (t_out - torch_out).abs().max().item()
     if diff > tol:
         print(f"FAIL: {name} max diff: {diff}")
         # Print some stats
-        print(f"    TP mean: {t_out.float().mean().item()}, Torch mean: {torch_out.float().mean().item()}")
-        print(f"    TP std: {t_out.float().std().item()}, Torch std: {torch_out.float().std().item()}")
+        print(f"    TP mean: {t_out.float().mean().item()}, reference mean: {torch_out.float().mean().item()}")
+        print(f"    TP std: {t_out.float().std().item()}, reference std: {torch_out.float().std().item()}")
         return False
     print(f"PASS: {name} max diff: {diff}")
     return True
@@ -165,7 +165,6 @@ def test_nll_loss():
     tp_input = to_tp(input); tp_input.requires_grad = True
     tp_target = to_tp(target) # int64
     
-    # PyTorch NLLLoss
     torch_out = F.nll_loss(input, target, reduction='mean')
     tp_out = tp_F.nll_loss(tp_input, tp_target, reduction='mean')
     
@@ -228,19 +227,13 @@ def test_matmul_transpose():
 #     # A.t(): (8, 4)
 #     # contiguous(A.t()) should be (8, 4) physically transposed.
 #     
-#     A = torch.arange(32, device=torch_device, dtype=torch.float32).reshape(4, 8)
 #     tp_A = to_tp(A)
 #     
 #     tp_At = tp_A.t()
 #     tp_At_contig = tp_At.contiguous()
 #     
-#     torch_At = A.t()
-#     torch_At_contig = torch_At.contiguous()
 #     
-#     if not compare("Contiguous Transpose", tp_At_contig, torch_At_contig):
 #         print("Debugging Contiguous Transpose:")
-#         print("Torch:\n", torch_At_contig)
-#         print("TP:\n", to_torch(tp_At_contig))
 #         return
 
 if __name__ == "__main__":

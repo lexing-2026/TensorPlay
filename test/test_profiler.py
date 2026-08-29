@@ -1,7 +1,6 @@
-"""Native profiler (torch.profiler subset parity) vs local torch 2.13.
+"""
 
 Checks that tensorplay.profiler captures the same observable surface as
-torch.profiler for an identical workload -- forward op names, backward ops,
 user annotations -- plus chrome-trace export validity and the inactive-path
 performance contract (one atomic load per op).
 """
@@ -40,8 +39,6 @@ class TestCaptureParity:
 
         tp_names = {name for name, *_ in pprof.events}
         assert {"matmul", "relu", "sum", "randn"} <= tp_names
-        # torch must observe at least the math ops too (it records mm as
-        # "aten::mm" family names; check the suffixes exist).
         tnames = {e.key for e in tprof.key_averages()}
         joined = " ".join(tnames)
         assert any(k in joined for k in ("mm", "matmul"))
@@ -61,9 +58,8 @@ class TestCaptureParity:
         assert "__backward__" in {n for n, *_ in prof.events}
 
     def test_composite_inner_ops_recorded_individually(self):
-        # gradient is a backend-neutral composite (CIA analog): its inner
-        # narrow/sub/div/cat calls must each appear, like upstream counts
-        # decomposed aten calls.
+        # Gradient is a backend-neutral composite: its inner narrow/sub/div/cat
+        # calls must each appear as separate events.
         x = tp.arange(8).to(tp.float64)
         with tp_prof.profile() as prof:
             tp.gradient(x)
@@ -122,9 +118,7 @@ class TestExportAndAggregation:
             assert e["dur"] > 0
             assert e["cat"] in ("cpu_op", "user_annotation", "backward")
             assert isinstance(e["tid"], int)
-        # metadata events ride along (ph "M") for the torch schema
         assert any(e["ph"] == "M" for e in evs)
-        # torch's own export loads as the same schema
         with torch.profiler.profile() as tprof:
             torch.ones(2) + torch.ones(2)
         tpath = os.path.join(tempfile.mkdtemp(), "tt.json")
@@ -370,7 +364,6 @@ class TestGpuTrace:
         assert "kernel" in cats
         assert "cuda_runtime" in cats
         assert "ac2g" in cats  # flow arrows op -> kernel
-        # GPU process lane labeled per torch schema
         assert any(e.get("name") == "process_labels" and
                    e["args"].get("labels", "").startswith("GPU ")
                    for e in evs)
@@ -601,7 +594,6 @@ class TestDistributed:
 
 
 class TestTensorboardExport:
-    """torch_tb_profiler-compatible artifact."""
 
     def test_torch_schema_keys(self):
         with tp_prof.profile(record_shapes=True) as prof:
@@ -618,12 +610,10 @@ class TestTensorboardExport:
         assert doc["schemaVersion"] == 1
         assert doc["traceName"].endswith(".pt.trace.json")
         evs = doc["traceEvents"]
-        # process/thread metadata events, torch-style
         assert any(e["ph"] == "M" and e["name"] == "process_name"
                    for e in evs)
         assert any(e["ph"] == "M" and e["name"] == "process_labels"
                    for e in evs)
-        # Record Window End marker (torch's export contract)
         assert any(e.get("name") == "Record Window End" for e in evs)
         # cpu_op rows kept, backward span re-catgorized to user_annotation
         assert any(e.get("cat") == "cpu_op" for e in evs)

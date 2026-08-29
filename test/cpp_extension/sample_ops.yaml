@@ -1,6 +1,5 @@
 # Sample custom-op definitions for the compile-time (C++) extension path.
 # Consumed by tools/codegen/tensorplaygen.py via add_tensorplay_op();
-# schemas use the same ATen grammar as native_functions.yaml.
 - func: myext::scale_add(Tensor self, float factor, Scalar bias=0) -> Tensor
   dispatch:
     CPU: scale_add_cpu

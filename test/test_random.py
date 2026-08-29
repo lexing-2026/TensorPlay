@@ -165,9 +165,9 @@ class TestRandom(unittest.TestCase):
         self.assertEqual(len(set(vals)), n)
 
 
-@unittest.skipUnless(HAS_TORCH, "torch not installed")
+@unittest.skipUnless(HAS_TORCH, "reference package not installed")
 class TestTorchParity(unittest.TestCase):
-    """Same seed must produce the same sequences as torch for ops whose CPU
+    """
     algorithms are pure integer/bit operations (no transcendental functions)."""
 
     def _tp_torch(self, fn_tp, fn_torch, exact=True, tol=0.0):
@@ -261,11 +261,9 @@ class TestTorchParity(unittest.TestCase):
 
     def test_randn_large_parity(self):
         # >= 16 elements uses the AVX2 normal_fill path with the same
-        # avx_mathfun polynomial approximations as torch: bit-exact.
         self._tp_torch(lambda: tp.randn([1024]), lambda: torch.randn(1024))
 
     def test_rng_state_cross_compatible(self):
-        # A state saved by tensorplay must load into torch and continue its
         # sequence (both use the same 5056-byte POD layout).  The state must
         # be captured BEFORE drawing the reference sequence.
         tp.manual_seed(SEED)
@@ -279,7 +277,6 @@ class TestTorchParity(unittest.TestCase):
 
     def test_randn_half_bfloat16_parity(self):
         # Native CPU Half/BFloat16 path uses storage-dtype uniforms and
-        # storage-dtype Box-Muller math, with the same raw stream as torch.
         self._tp_torch(lambda: tp.randn([1024], dtype=tp.float16),
                        lambda: torch.randn(1024, dtype=torch.float16))
         self._tp_torch(lambda: tp.randn([1024], dtype=tp.bfloat16),
@@ -299,8 +296,7 @@ class TestTorchParity(unittest.TestCase):
         self._tp_torch(tp_fn, th_fn)
 
     def test_random_wide_int_parity(self):
-        # NOTE: torch 2.x rejects random_ on bool tensors ("to - 1 is out of
-        # bounds for bool"), so bool cannot be parity-checked here.
+        # bounds for bool"), so bool is not checked in this case.
         for tp_dt, th_dt in [(tp.int8, torch.int8), (tp.uint8, torch.uint8),
                              (tp.int16, torch.int16), (tp.uint16, torch.uint16),
                              (tp.uint32, torch.uint32)]:

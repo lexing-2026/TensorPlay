@@ -1,5 +1,5 @@
 """Tests for tensorplay.distributed (stores, NCCL process group) and
-DistributedSampler parity against torch."""
+"""
 
 import os
 import subprocess
@@ -172,7 +172,6 @@ dist._reduce_scatter_base(rs_out, flat_in)
 assert L(rs_out) == [float(world)] * 2, f"_reduce_scatter_base {L(rs_out)}"
 
 # _functional_collectives: coalesced family (single groupStart/groupEnd
-# window per call; torch C++ coalescing-manager parity)
 from tensorplay.distributed import _functional_collectives as fc
 
 ins_c = [tp.full((3,), float(rank + 1), dtype=tp.float32, device=dev),
@@ -185,7 +184,6 @@ assert L(outs_c[0]) == [total] * 3, f"all_reduce_coalesced[0] {L(outs_c[0])}"
 assert L(outs_c[1]) == [2.0 * total] * 2, f"all_reduce_coalesced[1] {L(outs_c[1])}"
 assert L(ins_c[0]) == [float(rank + 1)] * 3, \
     f"all_reduce_coalesced modified input {L(ins_c[0])}"
-# autograd: backward all_reduces grads (sum, no division; torch parity)
 xa = tp.full((2,), float(rank + 1), dtype=tp.float32,
              device=dev).requires_grad_(True)
 outa = fc.all_reduce_coalesced([xa], "sum", dist.group.WORLD)[0]
@@ -210,13 +208,11 @@ assert L(outr.reshape(-1)) == [row_sum] * 2, f"reduce_scatter_coalesced {L(outr)
 outr.sum().backward()
 assert L(ra.grad.reshape(-1)) == [1.0] * (world * 2), f"reduce_scatter_coalesced bwd {L(ra.grad)}"
 
-# scatter_dim != 0 normalization (torch chunk+cat layout)
 rb = tp.full((2, world), float(rank + 1), dtype=tp.float32, device=dev)
 outb = fc.reduce_scatter_single_coalesced([rb], "sum", [1], dist.group.WORLD)[0]
 assert list(outb.shape) == [2, 1], f"reduce_scatter dim1 shape {outb.shape}"
 assert L(outb) == [[row_sum]] * 2, f"reduce_scatter dim1 {L(outb)}"
 
-# group-rank translation APIs (torch: get_process_group_ranks takes a group)
 assert dist.get_process_group_ranks(dist.group.WORLD) == list(range(world))
 sub_all = dist.new_group(ranks=list(range(world)))
 assert dist.get_global_rank(sub_all, rank) == rank
@@ -329,7 +325,6 @@ slist = [{"to": i} for i in range(world)] if rank == 0 else None
 dist.scatter_object_list(so, slist, src=0)
 assert so[0] == {"to": rank}, f"scatter_object_list {so[0]}"
 
-# RNG sync check (collective_utils, torch parity): identical seeds -> no desync
 tp.manual_seed(1234)
 from tensorplay.distributed import collective_utils as _cu
 rng_msg = _cu._check_rng_sync(None, dist.group.WORLD)
@@ -349,7 +344,6 @@ if world >= 2:
 
 dist.barrier()
 
-# top-level coalesced collectives + monitored_barrier (torch surface parity)
 total = float(sum(range(1, world + 1)))
 ca = [tp.full((3,), float(rank + 1), dtype=tp.float32, device=dev),
       tp.full((2,), 2.0 * (rank + 1), dtype=tp.float32, device=dev)]
@@ -485,7 +479,6 @@ for _it in range(2):
         ddp_g.module.fc.weight, ddp_g.module.fc.bias)).abs().max().item()
     assert diff < 1e-4, f"gradient_as_bucket_view grad mismatch {diff}"
 # set_to_none=False: grads persist as bucket-view aliases and are reused
-# in place (torch's is_alias_of no-copy path)
 for _it in range(2):
     ddp_g.zero_grad(set_to_none=False)
     loss = ddp_g(x).pow(2).sum()
@@ -648,7 +641,7 @@ class TestNCCLProcessGroup(unittest.TestCase):
         self._run_ranks(world=2)
 
 
-@unittest.skipUnless(HAS_TORCH, "torch not available")
+@unittest.skipUnless(HAS_TORCH, "reference package not available")
 class TestDistributedSamplerParity(unittest.TestCase):
     def test_lengths_and_coverage(self):
         for n, num_replicas, drop_last in [(10, 3, False), (10, 3, True),

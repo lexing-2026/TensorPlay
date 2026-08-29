@@ -1,7 +1,6 @@
-"""Numerical verification of the RNN ops against torch (reference).
+"""
 
 Cases: lstm / gru / rnn_tanh x {bidirectional, batch_first, num_layers,
-has_biases} x {fp16, bf16, fp32, fp64}.  Weights are copied from a torch
 module so both stacks compute the exact same function.
 """
 import itertools
@@ -86,7 +85,6 @@ def run_case(kind, T, N, feat, H, num_layers, bidir, batch_first, bias, dtype):
         out_p, hy_p = fn(*args)
 
     tol = {"fp32": 2e-4, "fp64": 1e-9, "fp16": 1e-2, "bf16": 1e-1}[dtype]
-    # .to(float64).numpy(): reduced-dtype torch tensors have no numpy view.
     out_err = np.abs(np.asarray(out_p.tolist(), dtype=np.float64) -
                      out_t.detach().to(torch.float64).numpy()).max()
     hy_err = np.abs(np.asarray(hy_p.tolist(), dtype=np.float64) -

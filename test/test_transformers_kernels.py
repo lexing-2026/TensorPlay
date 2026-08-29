@@ -1,4 +1,3 @@
-"""Transformers kernels: SDPA fast path + MoE grouped GEMM parity vs torch."""
 
 import numpy as np
 import pytest
@@ -45,7 +44,6 @@ def test_sdpa_prefill_large_causal():
 @pytest.mark.skipif(not tp.cuda.is_available(), reason="CUDA unavailable")
 @pytest.mark.parametrize("dtype", [np.float32, np.float16])
 def test_sdpa_gemm_cuda_parity(dtype):
-    """The native GEMM-backed path remains numerically equivalent to Torch."""
     rng = np.random.default_rng(91)
     q = rng.standard_normal((1, 2, 33, 16)).astype(dtype)
     k = rng.standard_normal((1, 2, 33, 16)).astype(dtype)

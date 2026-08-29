@@ -5,7 +5,6 @@ import tensorplay as tp
 
 
 class TestVersionCounter(unittest.TestCase):
-    """Mutation tracking aligned with PyTorch's version counter semantics."""
 
     def test_inplace_op_bumps_version(self):
         x = tp.ones([2, 2])

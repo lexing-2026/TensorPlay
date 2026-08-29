@@ -11,7 +11,7 @@ class TestConvLayers(unittest.TestCase):
         self.dtype = tensorplay.float32
         
     def _compare_tensors(self, tp_tensor, torch_tensor, rtol=1e-4, atol=1e-5):
-        self.assertTrue(torch_tensor is not None, "Torch tensor is None")
+        self.assertTrue(torch_tensor is not None, "reference tensor is None")
         self.assertTrue(tp_tensor is not None, "TensorPlay tensor is None")
         tp_np = tp_tensor.detach().numpy()
         torch_np = torch_tensor.detach().numpy()
@@ -23,7 +23,6 @@ class TestConvLayers(unittest.TestCase):
         C_out, K = 3, 3
         stride, padding = 1, 1
         
-        # PyTorch
         t_in = torch.randn(N, C_in, L, requires_grad=True)
         t_conv = torch.nn.Conv1d(C_in, C_out, K, stride=stride, padding=padding, bias=True)
         t_out = t_conv(t_in)
@@ -56,7 +55,6 @@ class TestConvLayers(unittest.TestCase):
         C_out, K = 3, 3
         stride, padding = 1, 1
         
-        # PyTorch
         t_in = torch.randn(N, C_in, H, W, requires_grad=True)
         t_conv = torch.nn.Conv2d(C_in, C_out, K, stride=stride, padding=padding, bias=True)
         t_out = t_conv(t_in)
@@ -85,7 +83,6 @@ class TestConvLayers(unittest.TestCase):
         C_out, K = 4, 3
         stride, padding = 1, 1
         
-        # PyTorch
         t_in = torch.randn(N, C_in, D, H, W, requires_grad=True)
         t_conv = torch.nn.Conv3d(C_in, C_out, K, stride=stride, padding=padding, bias=True)
         t_out = t_conv(t_in)
@@ -115,7 +112,6 @@ class TestConvLayers(unittest.TestCase):
         stride, padding = 2, 1
         output_padding = 1
         
-        # PyTorch
         t_in = torch.randn(N, C_in, H, W, requires_grad=True)
         t_conv = torch.nn.ConvTranspose2d(C_in, C_out, K, stride=stride, padding=padding, output_padding=output_padding, bias=True)
         t_out = t_conv(t_in)
@@ -145,7 +141,6 @@ class TestConvLayers(unittest.TestCase):
         stride, padding = 2, 1
         output_padding = 1
         
-        # PyTorch
         t_in = torch.randn(N, C_in, D, H, W, requires_grad=True)
         t_conv = torch.nn.ConvTranspose3d(C_in, C_out, K, stride=stride, padding=padding, output_padding=output_padding, bias=True)
         t_out = t_conv(t_in)
@@ -175,7 +170,6 @@ class TestConvLayers(unittest.TestCase):
         stride, padding = 1, 1
         groups = C_in
         
-        # PyTorch
         t_in = torch.randn(N, C_in, H, W, requires_grad=True)
         t_conv = torch.nn.Conv2d(C_in, C_out, K, stride=stride, padding=padding, groups=groups, bias=True)
         t_out = t_conv(t_in)
@@ -204,7 +198,6 @@ class TestConvLayers(unittest.TestCase):
         C_out, K = 2, 3
         stride, padding = 2, 1
         
-        # PyTorch
         t_in = torch.randn(N, C_in, H, W)
         t_conv = torch.nn.ConvTranspose2d(C_in, C_out, K, stride=stride, padding=padding, bias=False)
         
