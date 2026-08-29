@@ -113,7 +113,6 @@ def grad(
     if allow_unused is None:
         allow_unused = False
 
-    # torch semantics: a None entry in grad_outputs seeds that output with
     # ones; the C++ binding cannot carry None elements, so materialize them.
     if grad_outputs is not None:
         if not isinstance(grad_outputs, (list, tuple)):
@@ -135,6 +134,5 @@ from .gradcheck import (  # noqa: E402
     GradcheckError,
 )
 
-# torch.autograd.profiler parity: the native profiler surface is shared.
 from .. import profiler as profiler  # noqa: E402
 from ..profiler import emit_nvtx as emit_nvtx  # noqa: E402

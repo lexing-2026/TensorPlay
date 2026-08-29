@@ -23,9 +23,7 @@ __all__ = [
     "custom_bwd",
 ]
 
-# The autocast state lives in the dispatcher (tensorplay._C), mirroring
-# torch, where is_autocast_enabled/get_autocast_dtype/... are C++ bindings
-# into at::autocast.  Re-export them here under the same names.
+# The autocast state lives in the dispatcher (tensorplay._C), shared by all
 is_autocast_enabled = _C.is_autocast_enabled
 get_autocast_dtype = _C.get_autocast_dtype
 set_autocast_enabled = _C.set_autocast_enabled
@@ -185,8 +183,8 @@ class autocast:
             raise ValueError(
                 f"Expected `device_type` of type `str`, got: `{type(device_type)}`"
             )
-        # Upstream checks availability BEFORE resolving the default dtype so
-        # unsupported devices raise RuntimeError (not the binding's ValueError).
+        # Check availability before resolving the default dtype so unsupported
+        # devices raise RuntimeError rather than the binding's ValueError.
         self.device = device_type
         if not is_autocast_available(self.device):
             raise RuntimeError(

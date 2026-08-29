@@ -1,9 +1,8 @@
 # mypy: allow-untyped-defs
 r"""Functional utilities for computing higher-order derivatives.
 
-Ported from ``torch/autograd/functional.py``. The engine has no forward-mode
-AD or vmap support yet, so ``vectorize=True`` and ``strategy="forward-mode"``
-raise ``NotImplementedError``; everything else follows torch's semantics.
+The current engine does not provide every AD or vmap mode, so
+``vectorize=True`` and ``strategy="forward-mode"``
 """
 
 import tensorplay

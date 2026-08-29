@@ -1,12 +1,10 @@
-"""Forward-mode AD (torch.autograd.forward_ad parity).
+"""Forward-mode automatic differentiation support.
 
-Architecture mirrors torch/csrc/autograd/forward_grad: tangents live on a
-per-level stack, ``make_dual`` pairs a primal with its tangent at the
+The per-level stack lets ``make_dual`` pair a primal with its tangent at the
 current level, and arithmetic on duals propagates tangents analytically
 (Jacobian-vector products computed inline -- no graph, no backward pass).
 
-Scope note vs torch: torch propagates tangents inside every generated ATen
-kernel.  Here the propagation rules are implemented explicitly per supported
+kernel. Here the propagation rules are implemented explicitly per supported
 op (the seed set below covers linear/algebraic composition); unsupported
 operations raise instead of silently dropping tangents.
 """
@@ -36,13 +34,13 @@ def _depth() -> int:
 
 def current_dual_level() -> int:
     """Returns the current forward-AD nesting level (-1 = none active,
-    matching torch where the first entered level is 0)."""
+"""
     return _depth() - 1
 
 
 def enter_dual_level() -> int:
     """Enters a new forward gradient level and returns its index
-    (0 for the first level, like torch)."""
+"""
     lvl = _depth()
     _levels.d = lvl + 1
     return lvl
@@ -52,7 +50,6 @@ def exit_dual_level(level: int | None = None):
     """Exits the given (default: most recent) forward gradient level.
 
     Any levels nested inside ``level`` are exited as well, matching
-    ``torch.autograd.forward_ad.exit_dual_level``.
     """
     d = _depth()
     if d == 0:
@@ -195,7 +192,6 @@ def is_dual_tensor(obj) -> bool:
 def make_dual(primal, tangent, *, level: int | None = None):
     """Pairs ``primal`` with ``tangent`` at ``level`` (default: current).
 
-    torch parity: ``tensorplay.autograd.forward_ad.make_dual``.
     """
     lvl = current_dual_level() if level is None else level
     if lvl < 0:
