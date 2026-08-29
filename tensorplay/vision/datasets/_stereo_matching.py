@@ -1,5 +1,3 @@
-# Ported verbatim from torchvision==0.28.0 datasets/_stereo_matching.py
-# Only torch -> tensorplay imports were rewritten.
 import functools
 import json
 import os

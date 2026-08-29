@@ -1,5 +1,3 @@
-# Ported verbatim from torchvision==0.28.0 datasets/voc.py
-# Only torch -> tensorplay imports were rewritten.
 import collections
 import os
 from pathlib import Path

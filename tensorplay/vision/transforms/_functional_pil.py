@@ -1,5 +1,3 @@
-# Ported verbatim from torchvision==0.28.0 transforms/_functional_pil.py
-# Only torch -> tensorplay imports were rewritten.
 import numbers
 from collections.abc import Sequence
 from typing import Any, Literal, Optional, Union

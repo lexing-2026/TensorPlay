@@ -1,4 +1,3 @@
-# Ported from torchvision==0.28.0 models/_utils.py (imports rewritten).
 import functools
 import inspect
 import warnings

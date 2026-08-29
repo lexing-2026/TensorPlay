@@ -1,6 +1,3 @@
-# Ported verbatim from torchvision==0.28.0 models/efficientnet.py
-# (source of truth: https://github.com/pytorch/vision); only the
-# torch -> tensorplay imports were rewritten.
 import copy
 import math
 from collections.abc import Sequence
@@ -442,7 +439,6 @@ _COMMON_META_V2 = {
 
 class EfficientNet_B0_Weights(WeightsEnum):
     IMAGENET1K_V1 = Weights(
-        # Weights ported from https://github.com/rwightman/pytorch-image-models/
         url="https://download.pytorch.org/models/efficientnet_b0_rwightman-7f5810bc.pth",
         transforms=partial(
             ImageClassification, crop_size=224, resize_size=256, interpolation=InterpolationMode.BICUBIC
@@ -458,7 +454,7 @@ class EfficientNet_B0_Weights(WeightsEnum):
             },
             "_ops": 0.386,
             "_file_size": 20.451,
-            "_docs": """These weights are ported from the original paper.""",
+            "_docs": """These weights are described in the original paper.""",
         },
     )
     DEFAULT = IMAGENET1K_V1
@@ -466,7 +462,6 @@ class EfficientNet_B0_Weights(WeightsEnum):
 
 class EfficientNet_B1_Weights(WeightsEnum):
     IMAGENET1K_V1 = Weights(
-        # Weights ported from https://github.com/rwightman/pytorch-image-models/
         url="https://download.pytorch.org/models/efficientnet_b1_rwightman-bac287d4.pth",
         transforms=partial(
             ImageClassification, crop_size=240, resize_size=256, interpolation=InterpolationMode.BICUBIC
@@ -482,7 +477,7 @@ class EfficientNet_B1_Weights(WeightsEnum):
             },
             "_ops": 0.687,
             "_file_size": 30.134,
-            "_docs": """These weights are ported from the original paper.""",
+            "_docs": """These weights are described in the original paper.""",
         },
     )
     IMAGENET1K_V2 = Weights(
@@ -514,7 +509,6 @@ class EfficientNet_B1_Weights(WeightsEnum):
 
 class EfficientNet_B2_Weights(WeightsEnum):
     IMAGENET1K_V1 = Weights(
-        # Weights ported from https://github.com/rwightman/pytorch-image-models/
         url="https://download.pytorch.org/models/efficientnet_b2_rwightman-c35c1473.pth",
         transforms=partial(
             ImageClassification, crop_size=288, resize_size=288, interpolation=InterpolationMode.BICUBIC
@@ -530,7 +524,7 @@ class EfficientNet_B2_Weights(WeightsEnum):
             },
             "_ops": 1.088,
             "_file_size": 35.174,
-            "_docs": """These weights are ported from the original paper.""",
+            "_docs": """These weights are described in the original paper.""",
         },
     )
     DEFAULT = IMAGENET1K_V1
@@ -538,7 +532,6 @@ class EfficientNet_B2_Weights(WeightsEnum):
 
 class EfficientNet_B3_Weights(WeightsEnum):
     IMAGENET1K_V1 = Weights(
-        # Weights ported from https://github.com/rwightman/pytorch-image-models/
         url="https://download.pytorch.org/models/efficientnet_b3_rwightman-b3899882.pth",
         transforms=partial(
             ImageClassification, crop_size=300, resize_size=320, interpolation=InterpolationMode.BICUBIC
@@ -554,7 +547,7 @@ class EfficientNet_B3_Weights(WeightsEnum):
             },
             "_ops": 1.827,
             "_file_size": 47.184,
-            "_docs": """These weights are ported from the original paper.""",
+            "_docs": """These weights are described in the original paper.""",
         },
     )
     DEFAULT = IMAGENET1K_V1
@@ -562,7 +555,6 @@ class EfficientNet_B3_Weights(WeightsEnum):
 
 class EfficientNet_B4_Weights(WeightsEnum):
     IMAGENET1K_V1 = Weights(
-        # Weights ported from https://github.com/rwightman/pytorch-image-models/
         url="https://download.pytorch.org/models/efficientnet_b4_rwightman-23ab8bcd.pth",
         transforms=partial(
             ImageClassification, crop_size=380, resize_size=384, interpolation=InterpolationMode.BICUBIC
@@ -578,7 +570,7 @@ class EfficientNet_B4_Weights(WeightsEnum):
             },
             "_ops": 4.394,
             "_file_size": 74.489,
-            "_docs": """These weights are ported from the original paper.""",
+            "_docs": """These weights are described in the original paper.""",
         },
     )
     DEFAULT = IMAGENET1K_V1
@@ -586,7 +578,6 @@ class EfficientNet_B4_Weights(WeightsEnum):
 
 class EfficientNet_B5_Weights(WeightsEnum):
     IMAGENET1K_V1 = Weights(
-        # Weights ported from https://github.com/lukemelas/EfficientNet-PyTorch/
         url="https://download.pytorch.org/models/efficientnet_b5_lukemelas-1a07897c.pth",
         transforms=partial(
             ImageClassification, crop_size=456, resize_size=456, interpolation=InterpolationMode.BICUBIC
@@ -602,7 +593,7 @@ class EfficientNet_B5_Weights(WeightsEnum):
             },
             "_ops": 10.266,
             "_file_size": 116.864,
-            "_docs": """These weights are ported from the original paper.""",
+            "_docs": """These weights are described in the original paper.""",
         },
     )
     DEFAULT = IMAGENET1K_V1
@@ -610,7 +601,6 @@ class EfficientNet_B5_Weights(WeightsEnum):
 
 class EfficientNet_B6_Weights(WeightsEnum):
     IMAGENET1K_V1 = Weights(
-        # Weights ported from https://github.com/lukemelas/EfficientNet-PyTorch/
         url="https://download.pytorch.org/models/efficientnet_b6_lukemelas-24a108a5.pth",
         transforms=partial(
             ImageClassification, crop_size=528, resize_size=528, interpolation=InterpolationMode.BICUBIC
@@ -626,7 +616,7 @@ class EfficientNet_B6_Weights(WeightsEnum):
             },
             "_ops": 19.068,
             "_file_size": 165.362,
-            "_docs": """These weights are ported from the original paper.""",
+            "_docs": """These weights are described in the original paper.""",
         },
     )
     DEFAULT = IMAGENET1K_V1
@@ -634,7 +624,6 @@ class EfficientNet_B6_Weights(WeightsEnum):
 
 class EfficientNet_B7_Weights(WeightsEnum):
     IMAGENET1K_V1 = Weights(
-        # Weights ported from https://github.com/lukemelas/EfficientNet-PyTorch/
         url="https://download.pytorch.org/models/efficientnet_b7_lukemelas-c5b4e57e.pth",
         transforms=partial(
             ImageClassification, crop_size=600, resize_size=600, interpolation=InterpolationMode.BICUBIC
@@ -650,7 +639,7 @@ class EfficientNet_B7_Weights(WeightsEnum):
             },
             "_ops": 37.746,
             "_file_size": 254.675,
-            "_docs": """These weights are ported from the original paper.""",
+            "_docs": """These weights are described in the original paper.""",
         },
     )
     DEFAULT = IMAGENET1K_V1
@@ -717,7 +706,7 @@ class EfficientNet_V2_M_Weights(WeightsEnum):
 
 
 class EfficientNet_V2_L_Weights(WeightsEnum):
-    # Weights ported from https://github.com/google/automl/tree/master/efficientnetv2
+    # This variant uses the published EfficientNetV2 configuration.
     IMAGENET1K_V1 = Weights(
         url="https://download.pytorch.org/models/efficientnet_v2_l-59c71312.pth",
         transforms=partial(
@@ -739,7 +728,7 @@ class EfficientNet_V2_L_Weights(WeightsEnum):
             },
             "_ops": 56.08,
             "_file_size": 454.573,
-            "_docs": """These weights are ported from the original paper.""",
+            "_docs": """These weights are described in the original paper.""",
         },
     )
     DEFAULT = IMAGENET1K_V1

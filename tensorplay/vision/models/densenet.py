@@ -1,6 +1,3 @@
-# Ported verbatim from torchvision==0.28.0 models/densenet.py
-# (source of truth: https://github.com/pytorch/vision); only the
-# torch -> tensorplay imports were rewritten.
 import re
 from collections import OrderedDict
 from functools import partial
@@ -52,7 +49,6 @@ class _DenseLayer(nn.Module):
         bottleneck_output = self.conv1(self.relu1(self.norm1(concated_features)))  # noqa: T484
         return bottleneck_output
 
-    # todo: rewrite when torchscript supports any
     def any_requires_grad(self, input: list[Tensor]) -> bool:
         for tensor in input:
             if tensor.requires_grad:
@@ -74,7 +70,6 @@ class _DenseLayer(nn.Module):
     def forward(self, input: Tensor) -> Tensor:  # noqa: F811
         pass
 
-    # torchscript does not yet support *args, so we overload method
     # allowing it to take either a List[Tensor] or single Tensor
     def forward(self, input: Tensor) -> Tensor:  # noqa: F811
         if isinstance(input, Tensor):
@@ -202,7 +197,6 @@ class DenseNet(nn.Module):
         # Linear layer
         self.classifier = nn.Linear(num_features, num_classes)
 
-        # Official init from torch repo.
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight)
@@ -263,7 +257,7 @@ _COMMON_META = {
     "min_size": (29, 29),
     "categories": _IMAGENET_CATEGORIES,
     "recipe": "https://github.com/tensorplay/vision/pull/116",
-    "_docs": """These weights are ported from LuaTorch.""",
+    "_docs": """Pretrained weights.""",
 }
 
 

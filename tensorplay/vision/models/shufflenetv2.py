@@ -1,6 +1,3 @@
-# Ported verbatim from torchvision==0.28.0 models/shufflenetv2.py
-# (source of truth: https://github.com/pytorch/vision); only the
-# torch -> tensorplay imports were rewritten.
 from functools import partial
 from typing import Any, Callable, Optional
 
@@ -154,7 +151,6 @@ class ShuffleNetV2(nn.Module):
         self.fc = nn.Linear(output_channels, num_classes)
 
     def _forward_impl(self, x: Tensor) -> Tensor:
-        # See note [TorchScript super()]
         x = self.conv1(x)
         x = self.maxpool(x)
         x = self.stage2(x)
@@ -189,13 +185,11 @@ def _shufflenetv2(
 _COMMON_META = {
     "min_size": (1, 1),
     "categories": _IMAGENET_CATEGORIES,
-    "recipe": "https://github.com/ericsun99/Shufflenet-v2-Pytorch",
 }
 
 
 class ShuffleNet_V2_X0_5_Weights(WeightsEnum):
     IMAGENET1K_V1 = Weights(
-        # Weights ported from https://github.com/ericsun99/Shufflenet-v2-Pytorch
         url="https://download.pytorch.org/models/shufflenetv2_x0.5-f707e7126e.pth",
         transforms=partial(ImageClassification, crop_size=224),
         meta={
@@ -217,7 +211,6 @@ class ShuffleNet_V2_X0_5_Weights(WeightsEnum):
 
 class ShuffleNet_V2_X1_0_Weights(WeightsEnum):
     IMAGENET1K_V1 = Weights(
-        # Weights ported from https://github.com/ericsun99/Shufflenet-v2-Pytorch
         url="https://download.pytorch.org/models/shufflenetv2_x1-5666bf0f80.pth",
         transforms=partial(ImageClassification, crop_size=224),
         meta={

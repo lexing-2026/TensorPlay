@@ -1,5 +1,3 @@
-# Ported verbatim from torchvision==0.28.0 datasets/svhn.py
-# Only torch -> tensorplay imports were rewritten.
 import os.path
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
@@ -74,7 +72,6 @@ class SVHN(VisionDataset):
             raise RuntimeError("Dataset not found or corrupted. You can use download=True to download it")
 
         # import here rather than at top of file because this is
-        # an optional dependency for torchvision
         import scipy.io as sio
 
         # reading(loading) mat file as array

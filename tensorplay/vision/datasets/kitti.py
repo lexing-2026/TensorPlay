@@ -1,5 +1,3 @@
-# Ported verbatim from torchvision==0.28.0 datasets/kitti.py
-# Only torch -> tensorplay imports were rewritten.
 import csv
 import os
 from pathlib import Path

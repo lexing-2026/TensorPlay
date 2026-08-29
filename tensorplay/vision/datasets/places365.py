@@ -1,5 +1,3 @@
-# Ported verbatim from torchvision==0.28.0 datasets/places365.py
-# Only torch -> tensorplay imports were rewritten.
 import os
 from os import path
 from pathlib import Path

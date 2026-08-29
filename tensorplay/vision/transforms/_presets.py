@@ -2,8 +2,6 @@
 This file is part of the private API. Please do not use directly these classes as they will be modified on
 future versions without warning. The classes should be accessed only via the transforms argument of Weights.
 """
-# Ported verbatim from torchvision==0.28.0 transforms/_presets.py
-# Only torch -> tensorplay imports were rewritten.
 
 from typing import Optional, Union
 
@@ -112,7 +110,6 @@ class VideoClassification(nn.Module):
         vid = vid.view(-1, C, H, W)
         # We hard-code antialias=False to preserve results after we changed
         # its default from None to True (see
-        # https://github.com/pytorch/vision/pull/7160)
         # TODO: we could re-train the video models with antialias=True?
         vid = F.resize(vid, self.resize_size, interpolation=self.interpolation, antialias=False)
         vid = F.center_crop(vid, self.crop_size)

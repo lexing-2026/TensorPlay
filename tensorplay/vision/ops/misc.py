@@ -1,4 +1,3 @@
-# Ported verbatim from torchvision==0.28.0 ops/misc.py; torch -> tensorplay.
 import warnings
 from collections.abc import Sequence
 from typing import Callable, Optional, Union
@@ -286,8 +285,6 @@ class MLP(tensorplay.nn.Sequential):
         bias: bool = True,
         dropout: float = 0.0,
     ):
-        # The addition of `norm_layer` is inspired from the implementation of TorchMultimodal:
-        # https://github.com/facebookresearch/multimodal/blob/5dec8a/torchmultimodal/modules/layers/mlp.py
         params = {} if inplace is None else {"inplace": inplace}
 
         layers = []

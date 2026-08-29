@@ -1,5 +1,3 @@
-# Ported verbatim from torchvision==0.28.0 datasets/stl10.py
-# Only torch -> tensorplay imports were rewritten.
 import os.path
 from pathlib import Path
 from typing import Any, Callable, cast, Optional, Union

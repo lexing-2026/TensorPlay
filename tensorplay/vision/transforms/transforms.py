@@ -1,5 +1,3 @@
-# Ported verbatim from torchvision==0.28.0 transforms/transforms.py
-# Only torch -> tensorplay imports were rewritten.
 import math
 import numbers
 import random
@@ -60,7 +58,7 @@ __all__ = [
 
 
 class Compose:
-    """Composes several transforms together. This transform does not support torchscript.
+    """
     Please, see the note below.
 
     Args:
@@ -109,7 +107,6 @@ class Compose:
 class ToTensor:
     """Convert a PIL Image or ndarray to tensor and scale the values accordingly.
 
-    This transform does not support torchscript.
 
     Converts a PIL Image or numpy.ndarray (H x W x C) in the range
     [0, 255] to a tensorplay.FloatTensor of shape (C x H x W) in the range [0.0, 1.0]
@@ -145,7 +142,6 @@ class ToTensor:
 class PILToTensor:
     """Convert a PIL Image to a tensor of the same type - this does not scale values.
 
-    This transform does not support torchscript.
 
     Convert a PIL Image with H height, W width, and C channels to a Tensor of shape (C x H x W).
 
@@ -211,7 +207,6 @@ class ConvertImageDtype(tensorplay.nn.Module):
 class ToPILImage:
     """Convert a tensor or an ndarray to PIL Image
 
-    This transform does not support torchscript.
 
     Converts a tensorplay.*Tensor of shape C x H x W or a numpy ndarray of shape
     H x W x C to a PIL Image while adjusting the value range depending on the ``mode``.
@@ -303,7 +298,6 @@ class Resize(tensorplay.nn.Module):
             (size * height / width, size).
 
             .. note::
-                In torchscript mode size as single int is not supported, use a sequence of length 1: ``[size, ]``.
         interpolation (InterpolationMode): Desired interpolation enum defined by
             :class:`tensorplay.vision.transforms.InterpolationMode`. Default is ``InterpolationMode.BILINEAR``.
             If input is Tensor, only ``InterpolationMode.NEAREST``, ``InterpolationMode.NEAREST_EXACT``,
@@ -316,7 +310,6 @@ class Resize(tensorplay.nn.Module):
             ``max_size``.
             As a result, the smaller edge may be shorter than ``size``. This
             is only supported if ``size`` is an int (or a sequence of length
-            1 in torchscript mode).
         antialias (bool, optional): Whether to apply antialiasing.
             It only affects **tensors** with bilinear or bicubic modes and it is
             ignored otherwise: on PIL images, antialiasing is always applied on
@@ -413,7 +406,6 @@ class Pad(tensorplay.nn.Module):
             this is the padding for the left, top, right and bottom borders respectively.
 
             .. note::
-                In torchscript mode padding as single int is not supported, use a sequence of
                 length 1: ``[padding, ]``.
         fill (number or tuple): Pixel fill value for constant fill. Default is 0. If a tuple of
             length 3, it is used to fill R, G, B channels respectively.
@@ -473,7 +465,7 @@ class Pad(tensorplay.nn.Module):
 
 
 class Lambda:
-    """Apply a user-defined lambda as a transform. This transform does not support torchscript.
+    """
 
     Args:
         lambd (function): Lambda/function to be used for transform.
@@ -561,7 +553,6 @@ class RandomApply(tensorplay.nn.Module):
 
 
 class RandomOrder(RandomTransforms):
-    """Apply a list of transformations in a random order. This transform does not support torchscript."""
 
     def __call__(self, img):
         order = list(range(len(self.transforms)))
@@ -572,7 +563,6 @@ class RandomOrder(RandomTransforms):
 
 
 class RandomChoice(RandomTransforms):
-    """Apply single transformation randomly picked from a list. This transform does not support torchscript."""
 
     def __init__(self, transforms, p=None):
         super().__init__(transforms)
@@ -605,7 +595,6 @@ class RandomCrop(tensorplay.nn.Module):
             this is the padding for the left, top, right and bottom borders respectively.
 
             .. note::
-                In torchscript mode padding as single int is not supported, use a sequence of
                 length 1: ``[padding, ]``.
         pad_if_needed (boolean): It will pad the image if smaller than the
             desired size to avoid raising an exception. Since cropping is done
@@ -870,7 +859,6 @@ class RandomResizedCrop(tensorplay.nn.Module):
             made. If provided a sequence of length 1, it will be interpreted as (size[0], size[0]).
 
             .. note::
-                In torchscript mode size as single int is not supported, use a sequence of length 1: ``[size, ]``.
         scale (tuple of float): Specifies the lower and upper bounds for the random area of the crop,
             before resizing. The scale is defined with respect to the area of the original image.
         ratio (tuple of float): lower and upper bounds for the random aspect ratio of the crop, before

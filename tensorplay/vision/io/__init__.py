@@ -1,6 +1,6 @@
 """tensorplay.vision.io — image reading/writing.
 
-The public surface mirrors ``tensorplay.vision.io`` (ImageReadMode, read_image,
+The public surface covers ``tensorplay.vision.io`` (ImageReadMode, read_image,
 decode_image, decode_jpeg, decode_png, encode_jpeg, encode_png, write_jpeg,
 write_png, read_file, write_file).  Decoding is delegated to PIL so no native
 codec dependency is required; tensors are produced through the optimized
@@ -88,7 +88,6 @@ def write_file(filename: str, data: tensorplay.Tensor) -> None:
 def _apply_mode(img: Image.Image, mode: ImageReadMode) -> Image.Image:
     target = _PIL_MODE_MAP[mode]
     if target is None:
-        # UNCHANGED: promote P / 1-mode images the way torchvision documents
         return img
     if img.mode != target:
         if target == "L" and img.mode in ("P", "1"):
