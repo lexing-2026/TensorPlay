@@ -64,7 +64,7 @@ from tensorplay.backends.stax import stax
 
 
 # sec/csc/cot/tanhshrink/squared_difference/swish 的表层包装尚未生成
-# （native_functions.yaml 缺条目，属另一 agent 的算子面工作）；分解规则保留，
+# （当前 schema 尚缺条目，分解规则保留）；
 # 测试仅覆盖当前已暴露的算子面。
 _CASES = {
     "softplus": (lambda x: tp.softplus(x), math.log1p(math.exp(0.7))),
