@@ -1,10 +1,7 @@
-"""``torch.utils.checkpoint`` compatibility.
+"""Activation-checkpointing helpers.
 
-torchvision's densenet accepts ``memory_efficient=True`` and wraps block
-computation in ``torch.utils.checkpoint.sequential``.  TensorPlay does not
-yet implement activation recomputation, so checkpoint executes the function
+This build does not yet implement activation recomputation, so checkpoint executes the function
 eagerly — numerically identical, without the memory savings.  The call
-signature mirrors torch so model code needs no changes.
 """
 
 import warnings
@@ -19,7 +16,6 @@ def checkpoint(function: Callable[..., Any], *args: Any, use_reentrant: bool = T
                debug: bool = False, **kwargs: Any) -> Any:
     """Runs ``function(*args, **kwargs)`` eagerly (no recomputation).
 
-    Mirrors torch.utils.checkpoint.checkpoint's signature; emits a warning
     once when grad is enabled because backward will re-run the graph normally.
     """
     if any(isinstance(a, tp.Tensor) and a.requires_grad for a in args):
@@ -36,7 +32,7 @@ def checkpoint_sequential(
     *args: Any,
     **kwargs: Any,
 ) -> Any:
-    """torch.utils.checkpoint.checkpoint_sequential compatibility.
+    """
 
     With ``chunks`` segments the sequential would be evaluated in chunks with
     recomputation; TensorPlay runs it as one eager segment.
@@ -50,7 +46,7 @@ def checkpoint_sequential(
 
 
 def set_checkpoint_early_stop(enabled: bool) -> None:
-    """No-op for API parity."""
+    """No-op retained for API compatibility."""
 
 
 class CheckpointPolicy:
