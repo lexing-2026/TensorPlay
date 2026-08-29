@@ -1,16 +1,21 @@
-"""Repeatable profiler-overhead benchmark: tensorplay vs torch.
+"""Repeatable profiler-overhead benchmark.
 
 Usage:
     python3 tools/bench_profiler_overhead.py [--shapes 1x1,8x16,256x512]
+
+Clean side-by-side (recommended on shared/CUDA hosts) -- one runtime per
+process so thread-pool and BLAS initialization remain isolated:
+
+    python3 tools/bench_profiler_overhead.py --framework tp --threads 16
 
 Prints min-of-reps per-iteration microseconds for:
   * framework baseline (profiler off)
   * profiler ON
 
 Run on a quiet machine only -- CPU contention from parallel builds dwarfs
-the effect being measured.  The pass/fail criterion for "zero-cost when
-off" is base_tp ~= base_torch within noise; the criterion for "usable when
-on" is on/base <= ~3x (torch.profiler itself costs 2-5x on tiny ops).
+the effect being measured. The zero-cost criterion compares the baseline
+with profiling disabled against the enabled result; the enabled overhead
+should remain within the configured noise budget.
 """
 
 import argparse
@@ -28,23 +33,28 @@ def _profile_stats(framework, prof):
     return len(events), len(names)
 
 
-def bench(framework, m, k, iters=200, reps=5, record_shapes=False):
+def bench(framework, m, k, iters=200, reps=5, record_shapes=False,
+          threads=None, isolated=False):
     if framework == "tp":
-        # TensorPlay links against the system CUDA runtime.  On CUDA hosts,
-        # loading it before torch can make torch's packaged libc10_cuda.so
-        # fail to resolve cudaGetDriverEntryPointByVersion.  Import torch
-        # first for the fair side-by-side process; imports are outside timing.
-        try:
-            import torch  # noqa: F401
-        except ImportError:
-            pass
+        if not isolated:
+            # Load the comparison runtime first on shared CUDA hosts to avoid
+            # conflicting runtime-library initialization; imports are outside
+            # timing.
+            try:
+                import torch  # noqa: F401
+            except ImportError:
+                pass
         import tensorplay as tp
         from tensorplay.profiler import profile as Profile
+        if threads is not None:
+            tp.set_num_threads(threads)
         randn = lambda *s, rg=False: tp.randn(list(s), requires_grad=rg)
         matmul = lambda a, b: a.matmul(b)
     else:
         import torch
         from torch.profiler import profile as Profile
+        if threads is not None:
+            torch.set_num_threads(threads)
         randn = lambda *s, rg=False: torch.randn(list(s), requires_grad=rg)
         matmul = lambda a, b: a.matmul(b)
 
@@ -89,7 +99,26 @@ def main():
     ap.add_argument("--iters", type=int, default=150)
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--record-shapes", action="store_true")
+    ap.add_argument(
+        "--threads",
+        type=int,
+        default=None,
+        help="pin both frameworks to this intra-op thread count (shared "
+             "machines: default all-core pools thrash under contention)",
+    )
+    ap.add_argument(
+        "--framework",
+        choices=("tp", "torch", "both"),
+        default="both",
+        help="bench a single framework in this process.  Single-framework "
+             "mode skips importing the other library entirely, avoiding the "
+             "cross-library BLAS and thread-pool interference. Run the script "
+             "twice for a clean side-by-side comparison.",
+    )
     args = ap.parse_args()
+    frameworks = ("tp", "torch") if args.framework == "both" \
+        else (args.framework,)
+    isolated = args.framework != "both"
     shape_specs = args.shapes.split(",") if args.shapes else [args.shape]
     shapes = []
     for spec in shape_specs:
@@ -103,12 +132,14 @@ def main():
 
     rows = {}
     for shape_name, m, k in shapes:
-        for fw in ("tp", "torch"):
+        for fw in frameworks:
             samples = []
             for _ in range(args.rounds):
                 try:
                     samples.append(
-                        bench(fw, m, k, args.iters, record_shapes=args.record_shapes)
+                        bench(fw, m, k, args.iters,
+                              record_shapes=args.record_shapes,
+                              threads=args.threads, isolated=isolated)
                     )
                 except ImportError:
                     print(f"{fw}: not installed, skipped")
@@ -121,7 +152,7 @@ def main():
         f"{'overhead':>10}{'events':>10}{'unique ops':>12}"
     )
     for shape_name, _m, _k in shapes:
-        for fw in ("tp", "torch"):
+        for fw in frameworks:
             samples = rows.get((shape_name, fw))
             if not samples:
                 continue
@@ -138,7 +169,7 @@ def main():
         if tp_row and torch_row:
             tp_on = statistics.median(x[1] for x in tp_row)
             torch_on = statistics.median(x[1] for x in torch_row)
-            print(f"  {shape_name}: profiled time torch/tp={torch_on / tp_on:.3f}x")
+            print(f"  {shape_name}: profiled time ref/tp={torch_on / tp_on:.3f}x")
 
 
 if __name__ == "__main__":

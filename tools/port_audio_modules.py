@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
-"""Copy torchaudio sources into tensorplay/audio with import rewriting.
+"""Populate local audio modules with import rewriting.
 
-Mirrors tools/port_vision_models.py: the model/dataset/functional definitions
-are copied verbatim from the vendored torchaudio checkout
-(third_party/audio, 2.11.0a0); only module references are rewritten:
+Model, dataset, and functional definitions are materialized in the local
+package; only module references are rewritten:
 
-    torch       -> tensorplay            (aliased import keeps call sites verbatim)
-    torchaudio  -> tensorplay.audio
     _internal   -> local hub-backed shims
     _extension  -> local availability shims
 

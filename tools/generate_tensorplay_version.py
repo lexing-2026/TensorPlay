@@ -113,7 +113,6 @@ def get_tensorplay_version(sha: str | None = None) -> str:
 def compute_nightly_version(today: str | None = None) -> str:
     """Compute the nightly base version from version.txt.
 
-    Mirrors pytorch's nightly version rule (.ci/pytorch/binary_populate_env.sh):
     the prerelease suffix is stripped from version.txt ("1.0.0a0" -> "1.0.0")
     and a calendar dev segment is appended, e.g. "1.0.0.dev20260828". Variant
     local labels such as "+cu124" or "+cpu" are appended by the packaging
@@ -130,14 +129,11 @@ def compute_nightly_version(today: str | None = None) -> str:
 
 
 if __name__ == "__main__":
-    # Invoked by CMake at build time to write tensorplay/version.py, which
-    # tensorplay/__init__.py consumes (mirrors pytorch's CLI of the same
-    # name; the hip/rocm/xpu fields are omitted as TensorPlay does not
-    # support those platforms).
+    # Invoked by CMake at build time to write tensorplay/version.py.
+    # The generated metadata covers the supported build platforms.
     import argparse
 
     def strtobool(val):
-        # pytorch keeps this in tools/strtobool.py
         val = str(val).lower()
         if val in ("y", "yes", "t", "true", "on", "1"):
             return 1

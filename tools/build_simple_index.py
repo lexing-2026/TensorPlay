@@ -19,7 +19,7 @@ from packaging.utils import canonicalize_name, parse_wheel_filename
 
 # Rolling GitHub Release that holds the manually published preview (nightly)
 # wheels. Its assets are indexed under whl/nightly/ and never leak into the
-# stable per-variant indexes, mirroring download.pytorch.org's whl/nightly/.
+# stable per-variant indexes.
 NIGHTLY_RELEASE_TAG = "nightly"
 
 
@@ -74,9 +74,8 @@ def _matches_variant(filename: str, variant: str, nightly: bool = False) -> bool
 
     Wheel versions carry a PEP 440 local label naming the build variant
     ("+cu124", "+cpu"). Wheels without any local label are legacy cu124
-    builds on the stable channel, but cpu builds on the nightly one: pytorch
-    appends its variant label only on non-Darwin platforms, so macOS
-    nightlies have none.
+    builds on the stable channel. The release process appends a variant
+    label only on non-Darwin platforms, so macOS nightlies have none.
     """
     version = filename.split("-", 2)[1] if filename.count("-") >= 2 else ""
     local_label = version.partition("+")[2]

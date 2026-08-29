@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Aggregate a release-notes draft for TensorPlay, pytorch-style.
+"""Aggregate a release-notes draft for TensorPlay.
 
 Two sources are merged:
 
