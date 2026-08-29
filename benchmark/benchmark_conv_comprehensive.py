@@ -20,7 +20,6 @@ def benchmark_op(name, torch_func, tp_func, iterations=20):
         print(f"Warmup failed: {e}")
         return
 
-    # Torch Benchmark
     start = time.time()
     for _ in range(iterations):
         torch_func()
@@ -33,16 +32,15 @@ def benchmark_op(name, torch_func, tp_func, iterations=20):
     tp_time = (time.time() - start) / iterations
     
     print(f"{name}:")
-    print(f"  PyTorch:    {torch_time*1000:.3f} ms")
+    print(f"  ref:        {torch_time*1000:.3f} ms")
     print(f"  TensorPlay: {tp_time*1000:.3f} ms")
     ratio = torch_time/tp_time if tp_time > 0 else 0
-    print(f"  Efficiency (TP/Torch): {ratio:.2f}x")
+    print(f"  Efficiency (TP/ref): {ratio:.2f}x")
     print("-" * 40)
 
 def run_conv_benchmark(N, C, H, W, OutC, K, name):
     print(f"Benchmarking {name}: Input({N},{C},{H},{W}) -> Out({OutC}), Kernel({K})")
     
-    # Torch
     t_input = torch.randn(N, C, H, W, requires_grad=True)
     t_conv = torch.nn.Conv2d(C, OutC, K, padding=K//2)
     

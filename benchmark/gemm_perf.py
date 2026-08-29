@@ -1,4 +1,4 @@
-"""GEMM performance comparison: TensorPlay vs torch.
+"""GEMM performance comparison: TensorPlay and a reference runtime.
 
 Usage: python benchmark/gemm_perf.py [device]
 """
@@ -73,7 +73,7 @@ def main():
             ("fp64 1024^3", np.float64, (1024, 1024), (1024, 1024)),
         ]
 
-    print(f"{'case':<28}{'torch ms':>10}{'tp ms':>10}{'t TFLOP/s':>11}{'p TFLOP/s':>11}{'ratio':>7}")
+    print(f"{'case':<28}{'ref ms':>10}{'tp ms':>10}{'t TFLOP/s':>11}{'p TFLOP/s':>11}{'ratio':>7}")
     for name, dt, sa, sb in shapes:
         m, k = sa
         k2, n = sb

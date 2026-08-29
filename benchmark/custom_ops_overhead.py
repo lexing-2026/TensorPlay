@@ -1,8 +1,8 @@
-"""Custom-operator dispatch overhead: TensorPlay vs torch.
+"""Custom-operator dispatch overhead benchmark.
 
 Isolates the per-call framework cost of invoking a user-defined operator
 in eager mode (the ``op(x)`` hot path), on top of an identical trivial
-kernel body, against the frameworks' own baselines:
+kernel body, against each runtime's own baseline:
 
 - ``python_fn``   : bare Python call — the theoretical floor
 - ``direct``      : calling the registered kernel callable directly
@@ -55,11 +55,10 @@ def main():
         lambda: tp.mul(x_tp, 1.0), args.iters
     )
 
-    # ---- torch -------------------------------------------------------------
     try:
         import torch
     except ImportError:
-        print("torch not installed; skipping comparison")
+        print("Reference framework not installed; skipping comparison")
         torch = None
 
     if torch is not None:
@@ -73,10 +72,10 @@ def main():
         def _(x):
             return torch.empty_like(x)
 
-        results["torch/custom_op"] = bench_ns_per_call(
+        results["ref/custom_op"] = bench_ns_per_call(
             lambda: torch_body(x_torch), args.iters
         )
-        results["torch/direct_kernel"] = bench_ns_per_call(
+        results["ref/direct_kernel"] = bench_ns_per_call(
             lambda: x_torch * 1.0, args.iters
         )
 
@@ -87,19 +86,19 @@ def main():
         print(f"{name:<{width}}  {ns:8.0f}")
 
     if torch is not None:
-        ratio = results["torch/custom_op"] / results["tensorplay/custom_op"]
-        print(f"\ntorch.custom_op / tensorplay.custom_op : {ratio:.2f}x")
+        ratio = results["ref/custom_op"] / results["tensorplay/custom_op"]
+        print(f"\nref.custom_op / tensorplay.custom_op : {ratio:.2f}x")
         # Dispatch-layer overhead = custom_op call minus its own bare-kernel
         # cost; this isolates registration machinery from native-op speed.
         overhead_tp = (
             results["tensorplay/custom_op"] - results["tensorplay/direct_kernel"]
         )
         overhead_torch = (
-            results["torch/custom_op"] - results["torch/direct_kernel"]
+            results["ref/custom_op"] - results["ref/direct_kernel"]
         )
         print(f"dispatch-layer overhead  tensorplay    : {overhead_tp:8.0f} ns/call")
-        print(f"dispatch-layer overhead  torch         : {overhead_torch:8.0f} ns/call")
-        print(f"torch overhead / tensorplay overhead   : {overhead_torch / overhead_tp:.2f}x")
+        print(f"dispatch-layer overhead  ref           : {overhead_torch:8.0f} ns/call")
+        print(f"ref overhead / tensorplay overhead     : {overhead_torch / overhead_tp:.2f}x")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""CPU real (float32/float64) elementwise benchmark: tensorplay vs torch.
+"""
 
 Usage:
   taskset -c 8-15 env PYTHONPATH=. python3 benchmark/bench_real_cpu.py --dtype f32
@@ -42,9 +42,9 @@ def main():
         if hasattr(tp, "set_num_threads"):
             tp.set_num_threads(args.threads)
 
-    print(f"torch {torch.__version__} threads={torch.get_num_threads()}  "
+    print(f"ref {torch.__version__} threads={torch.get_num_threads()}  "
           f"dtype={args.dtype}")
-    print(f"{'op':>6} {'n':>10} {'tp_ms':>9} {'torch_ms':>9} {'speedup':>8}")
+    print(f"{'op':>6} {'n':>10} {'tp_ms':>9} {'ref_ms':>9} {'speedup':>8}")
     behind = []
     for n in (4096, 1 << 16, 1 << 20, 1 << 22):
         rng = np.random.RandomState(11)
@@ -75,11 +75,11 @@ def main():
                 behind.append((name, n, sp))
 
     if behind:
-        print("\nBEHIND torch:")
+        print("\nBEHIND ref:")
         for name, n, sp in behind:
             print(f"  {name} @{n}: {sp:.2f}x")
     else:
-        print("\nAll ops >= torch CPU")
+        print("\nAll ops >= ref CPU")
 
 
 if __name__ == "__main__":

@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""CPU autocast benchmark: TensorPlay vs PyTorch.
+"""CPU autocast benchmark.
 
 Measures the AMP-critical paths where dispatch/cast overhead dominates:
   1. context-manager enter/exit micro (per-iteration cost)
   2. single linear under autocast (cache-hit weight-cast path)
-  3. MLP inference loop under autocast (torch recasts every weight each step
-     under no_grad; tensorplay caches them with version validation)
+  3. MLP inference loop under autocast with version-validated weight caching
   4. MLP train step under autocast (GradMode on, leaf caching both sides)
   5. raw fp32 -> bfloat16 cast throughput
 
@@ -117,7 +116,7 @@ def main():
     keys = list(next(iter(rows.values())).keys())
     hdr = f"{'metric':24s}" + "".join(f"{k:>14s}" for k in rows)
     if len(rows) == 2 and "torch" in rows and "tensorplay" in rows:
-        hdr += f"{'tp/torch':>10s}"
+        hdr += f"{'tp/ref':>10s}"
     print(hdr)
     print("-" * len(hdr))
     for k in keys:

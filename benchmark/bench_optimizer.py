@@ -1,13 +1,12 @@
-"""Optimizer step() benchmark: TensorPlay vs PyTorch.
+"""Optimizer step benchmark.
 
 Compares optimizer.step() wall time for identical parameter groups across
-the four execution paths torch exposes (default / foreach / single-tensor /
-fused).  Run on CPU locally or on a CUDA box:
+the reference library's default, foreach, single-tensor, and fused paths.
+Run on CPU locally or on a CUDA box:
 
     python3 benchmark/bench_optimizer.py                 # cpu
-    python3 benchmark/bench_optimizer.py --device cuda   # needs torch+cuda
 
-The parameter mix mirrors a small transformer: many (128,128) blocks plus
+The parameter mix uses a small transformer shape: many (128,128) blocks plus
 a few (1024,1024) matrices (~25 MiB of fp32 state per optimizer).
 """
 
@@ -15,8 +14,7 @@ import argparse
 import sys
 import time
 
-# Load torch first on the CUDA host: TensorPlay and the vendored torch build
-# may expose different CUDA runtime versions.
+# The reference library may expose a different CUDA runtime version.
 import torch
 import tensorplay as tp
 
@@ -80,7 +78,7 @@ def main():
     print(f"device={args.device}  params={len(SHAPES)} tensors, "
           f"{sum(a * b for a, b in SHAPES) * 4 / 2**20:.1f} MiB fp32\n")
 
-    header = f"{'case':30s} {'tp ms':>10s} {'torch ms':>10s} {'speedup':>8s}"
+    header = f"{'case':30s} {'tp ms':>10s} {'ref ms':>10s} {'speedup':>8s}"
     print(header)
     print("-" * len(header))
 

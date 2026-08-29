@@ -10,7 +10,7 @@ def benchmark():
     device = torch.device("cpu")
 
     print("="*50)
-    print(f"PyTorch Benchmark: LeNet-5 on MNIST ({device})")
+    print(f"Ref Benchmark: LeNet-5 on MNIST ({device})")
     print("="*50) 
 
     # 1. Data Setup
