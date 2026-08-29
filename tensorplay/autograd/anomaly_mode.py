@@ -1,7 +1,8 @@
 # mypy: allow-untyped-defs
 r"""Autograd anomaly mode.
 
-Ported from ``torch/autograd/anomaly_mode.py``.
+Anomaly checks record useful operation context and can surface the operation
+that created a failing backward node.
 """
 
 import warnings

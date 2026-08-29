@@ -2,7 +2,6 @@
 
 A :class:`DualTensor` carries a (primal, tangent) pair.  Operators and the
 supported method set propagate BOTH components forward in a single kernel
-pass per op — no backward graph, O(1) memory.  This mirrors torch.func.jvp
 (native dual numbers) as opposed to the double-backward trick used by
 ``autograd.functional.jvp(mode="reversed")``.
 
@@ -247,7 +246,6 @@ def _as_plain_tuple(x):
 def jacfwd(func, inputs):
     """Computes the full Jacobian by forward-mode column scanning.
 
-    Mirrors ``torch.func.jacfwd`` loosely: returns one Jacobian block per
     (output, input) pair with shape ``out_shape + in_shape``, computed with
     num_cols(func cost) forward passes and no backward graph.
     """
@@ -288,7 +286,6 @@ def jacfwd(func, inputs):
                 jacobian_blocks[o][i] = tensorplay.zeros(out_shape +
                                                          tuple(x.shape))
 
-    # torch.autograd.functional.jacobian conventions:
     #   single in/out            -> Tensor
     #   one side a tuple         -> tuple of Tensors
     #   both sides tuples        -> tuple of tuples (Jacobian[i][j])

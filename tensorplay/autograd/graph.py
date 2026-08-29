@@ -1,6 +1,5 @@
 """autograd.graph -- context managers around graph bookkeeping.
 
-``saved_tensors_hooks`` mirrors ``torch.autograd.graph.saved_tensors_hooks``:
 pack hooks run when tensors are stashed via ``save_for_backward``; the
 matching unpack hook runs when ``saved_tensors`` is later read (typically
 inside ``backward``, after the pack context has exited).
@@ -27,7 +26,7 @@ def saved_tensor_hooks(pack_hook, unpack_hook):
       and must return an equivalent :class:`tensorplay.Tensor`.
 
     If either hook raises, the exception is surfaced from the corresponding
-    operation, matching upstream behavior.
+    operation.
     """
     _hook_stack.append((pack_hook, unpack_hook))
     try:

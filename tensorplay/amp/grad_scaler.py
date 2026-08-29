@@ -27,7 +27,7 @@ def _cuda_amp_definitely_not_available() -> bool:
 
 
 def _device_key(device: Any) -> tuple[str, int]:
-    """Hashable stand-in for ``torch.device`` dict keys.
+    """
 
     ``tensorplay.Device`` is not hashable, so per-device maps are keyed by
     ``(type, index)`` tuples instead.
@@ -457,7 +457,6 @@ class GradScaler:
                     found_sum = (
                         moved if found_sum is None else found_sum + moved
                     )
-                # Mirrors torch's sum([...]): an empty collection yields the int 0.
                 found_inf_combined = 0 if found_sum is None else found_sum
                 # Take the product of the scales, if the user has already set `optimizer.grad_scale`.
                 optimizer.grad_scale = (  # type: ignore[attr-defined]

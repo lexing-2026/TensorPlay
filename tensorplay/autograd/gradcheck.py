@@ -1,8 +1,7 @@
 # mypy: allow-untyped-defs
 r"""Gradient checking via finite differences.
 
-Ported from ``torch/autograd/gradcheck.py`` (slow mode). Features that rely on
-machinery this engine does not have yet -- forward-mode AD, vmap/batched
+Advanced machinery not provided by this engine -- forward-mode AD, vmap/batched
 gradients, sparse/mkldnn layouts and fast_mode -- raise
 :class:`NotImplementedError` with an explicit message.
 """
@@ -14,8 +13,7 @@ from itertools import product
 
 import tensorplay
 
-# Upstream uses the C++ torch._C._functions.UndefinedGrad here; this repo has
-# no such binding yet, so the ported Python subclass stands in for it.
+# no such binding yet, so the Python subclass supplies the required behavior.
 from .function import Function
 
 
@@ -62,7 +60,6 @@ class GradcheckError(RuntimeError):
 
 
 class _UndefinedGrad(Function):
-    # Port of torch._C._functions.UndefinedGrad: passes the input through in
     # the forward but makes backward *ignore* whatever gradient it receives
     # and propagate undefined (None) grads instead. Used by gradcheck to test
     # that functions handle undefined output gradients.
@@ -186,7 +183,6 @@ def get_numerical_jacobian(fn, inputs, target=None, eps=1e-3, grad_out=1.0):
     """Compute the numerical Jacobian for a given fn and its inputs.
 
     .. warning::
-        ``get_numerical_jacobian`` was part of PyTorch's private API and is kept
         only for backward compatibility.
 
     Args:
@@ -205,7 +201,6 @@ def get_numerical_jacobian(fn, inputs, target=None, eps=1e-3, grad_out=1.0):
     **very careful** in this to not clone `target`.
     """
     warnings.warn(
-        "`get_numerical_jacobian` was part of PyTorch's private API and not "
         "meant to be exposed. We are deprecating it and it will be removed "
         "in a future version.",
         FutureWarning,
@@ -423,7 +418,6 @@ def get_analytical_jacobian(inputs, output, nondet_tol=0.0, grad_out=1.0):
     # Replicates the behavior of the old get_analytical_jacobian before the refactor
     # This shares much of its code with _check_analytical_jacobian_attributes
     warnings.warn(
-        "`get_analytical_jacobian` was part of PyTorch's private API and not "
         "meant to be exposed. We are deprecating it and it will be removed "
         "in a future version.",
         FutureWarning,
@@ -758,7 +752,6 @@ def gradcheck(
             backward mode AD to be implemented. Defaults to ``True``.
         fast_mode (bool, optional): Only the slow implementation exists in this
             engine; ``True`` raises :class:`NotImplementedError`. Defaults to False.
-        masked (bool, optional): Kept for signature parity with torch; has no
             effect since this engine has no sparse layouts. Defaults to ``False``.
     Returns:
         ``True`` if all differences satisfy allclose condition
@@ -811,7 +804,6 @@ def _gradcheck_helper(
 
     if any(isinstance(t, tensorplay.Tensor) and t.is_complex()
            for t in (*tupled_inputs, *outputs)):
-        # torch parity: complex gradcheck via Wirtinger blocks.  Complex
         # inputs split into (re, im) leaves re-assembled by the differentiable
         # `complex` op; analytic blocks come from one-hot backwards over the
         # SAME recorded graph; numeric blocks from central differences.
@@ -928,9 +920,8 @@ def _gradcheck_helper(
                     # slot all real-component columns, then imag ones.
                     J_n[:, col_base[si] + comp * n_in + j] = (op - om) / (2 * eps)
 
-        # Row layout: upstream splits complex outputs into real/imag
-        # components (torch/autograd/gradcheck.py::_real_and_imag_output),
-        # so both Jacobians are compared in component-major order
+        # Row layout splits complex outputs into real/imag components so both
+        # Jacobians are compared in component-major order
         # ([Re-block; Im-block]) instead of element-interleaved _flat order.
         row_perm = []
         _off = 0
@@ -946,8 +937,8 @@ def _gradcheck_helper(
         J_n = J_n[row_perm, :]
 
         # ---- analytic: one-hot vjp per REAL output component ----------------
-        # Mirrors upstream's slow mode: outputs were split into real
-        # components above (view_as_real + select are differentiable views),
+        # Slow analytic mode: outputs were split into real components above
+        # (view_as_real + select are differentiable views),
         # and inputs are already split into real leaves, so the engine only
         # ever sees real->real differentiation.  No stored-gradient
         # conjugation convention is relied upon here.
@@ -1067,7 +1058,6 @@ def gradgradcheck(
             are supported and treated as zeros
         check_batched_grad (bool, optional): Not supported by this engine yet.
         fast_mode (bool, optional): Not supported by this engine yet.
-        masked (bool, optional): Kept for signature parity with torch.
     Returns:
         True if all differences satisfy allclose condition
     """

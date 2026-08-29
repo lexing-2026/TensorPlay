@@ -1,7 +1,7 @@
-"""torch.autograd.profiler parity shim over the native profiler.
+"""Profiler import aliases.
 
 The modern surface lives in :mod:`tensorplay.profiler`; this module keeps
-``torch.autograd.profiler`` import paths working.
+the legacy import names available.
 """
 
 from ..profiler import (  # noqa: F401
