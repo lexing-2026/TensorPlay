@@ -1,6 +1,5 @@
 """Real Int8 modules for inference after quantization.
 
-``QuantizedLinear`` mirrors ``torch.nn.quantized.Linear`` for the affine
 Int8 closed loop: activations are pre-quantized Int8 [M,K] tensors, weights
 are stored as per-channel Int8 with their scales/zero_points, and the fused
 native kernel produces a Float32 [M,N] output.

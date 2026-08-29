@@ -2,7 +2,6 @@
 
 An Observer records activation/weight ranges during calibration passes and
 derives affine Int8 quantization parameters (scale, zero_point) from them,
-mirroring the essentials of ``torch.ao.quantization.observer``.
 
 Usage:
     obs = MinMaxObserver()
@@ -40,7 +39,7 @@ QUANT_MAX = 127
 
 
 class _PartialWrapper:
-    """Minimal port of torch.ao.quantization.observer._PartialWrapper: lets
+    """
     observer classes be specialized with constructor arguments while staying
     callable as ``observer_cls(**kwargs)``."""
 
@@ -84,7 +83,6 @@ class ObserverBase(nn.Module):
         self.dtype = dtype
         self.quant_min = quant_min
         self.quant_max = quant_max
-        # torch.finfo(torch.float32).eps by default (as in torch observers).
         self.eps = 1.1920928955078125e-07 if eps is None else eps
 
     @classmethod
@@ -107,7 +105,6 @@ class ObserverBase(nn.Module):
     @staticmethod
     def _calculate_qparams(min_val, max_val, quant_min=QUANT_MIN,
                            quant_max=QUANT_MAX):
-        """Affine parameters from observed range (torch's _calculate_qparams)."""
         min_val = float(min_val)
         max_val = float(max_val)
         min_val = min(0.0, min_val)
@@ -270,8 +267,7 @@ class PerChannelMinMaxObserver(ObserverBase):
 
 
 class MovingAveragePerChannelMinMaxObserver(PerChannelMinMaxObserver):
-    """Exponential moving average of per-channel min/max, mirroring
-    ``torch.ao.quantization.MovingAveragePerChannelMinMaxObserver``."""
+    """Exponential moving average of per-channel min/max values."""
 
     def __init__(self, averaging_constant=0.01, ch_axis=0,
                  dtype=tensorplay.int8, quant_min=QUANT_MIN,
@@ -306,7 +302,7 @@ class MovingAveragePerChannelMinMaxObserver(PerChannelMinMaxObserver):
 
 
 def _histc(x, bins, lo, hi):
-    """``torch.histc`` equivalent: bins equal-width buckets over [lo, hi].
+    """
 
     Values outside the range are clamped into the edge bins; a degenerate
     range is widened by an epsilon so every value lands in one bucket.
@@ -320,14 +316,12 @@ def _histc(x, bins, lo, hi):
 
 
 class HistogramObserver(ObserverBase):
-    """Running-histogram observer mirroring
-    ``torch.ao.quantization.HistogramObserver``.
+    """Running-histogram observer.
 
     Records a running histogram of incoming values together with the global
     min/max; ``calculate_qparams`` narrows the range with the L2-quantization-
     error search (the norm-minimization formulation) before deriving affine
     parameters, which filters outliers instead of trusting raw extremes.
-    Per-tensor only (like torch).
     """
 
     def __init__(self, bins=2048, dtype=tensorplay.int8,
@@ -338,7 +332,6 @@ class HistogramObserver(ObserverBase):
         self.histogram = None   # tp tensor of shape [bins]
         self.min_val = float("inf")
         self.max_val = float("-inf")
-        # 256 = 2 ** bits(int8); torch derives it from its dtype.
         self.dst_nbins = 256
         self.upsample_rate = 16
 
@@ -392,7 +385,6 @@ class HistogramObserver(ObserverBase):
         with tensorplay.no_grad():
             x_min = float(x.min().item())
             x_max = float(x.max().item())
-            # Ignore infinities like torch: they would stretch the range to
             # uselessness while real inputs get clamped at saturation.
             if x_min == -float("inf") or x_max == float("inf"):
                 mask = x.abs() != float("inf")
@@ -530,7 +522,7 @@ class HistogramObserver(ObserverBase):
 class FixedQParamsObserver(ObserverBase):
     """Reports fixed scale/zero_point without observing data; used when the
     quantization parameters are dictated by construction (sigmoid/tanh style
-    ranges in torch's default qconfigs)."""
+"""
 
     def __init__(self, scale, zero_point, dtype=tensorplay.int8,
                  quant_min=QUANT_MIN, quant_max=QUANT_MAX):
@@ -577,7 +569,6 @@ class PlaceholderObserver(ObserverBase):
             "calculate_qparams should not be called for PlaceholderObserver")
 
 
-# Default observer presets, mirroring torch.ao.quantization defaults for the
 # Int8 loop (activations unsigned-style range, weights full signed range).
 default_observer = MinMaxObserver.with_args(quant_min=0, quant_max=127)
 default_weight_observer = MinMaxObserver.with_args(dtype=tensorplay.int8,

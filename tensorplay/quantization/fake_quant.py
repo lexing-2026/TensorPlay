@@ -4,7 +4,6 @@ The forward pass maps values through the real affine Int8 grid
 (dequantize(quantize(x))) using the native ``quantize_per_tensor`` /
 ``dequantize_per_tensor`` kernels.  The backward pass passes gradients
 through where the input lies inside the representable range and blocks them
-outside, matching torch's default FakeQuantize behavior.
 """
 
 import tensorplay
@@ -73,7 +72,6 @@ class FakeQuantize(nn.Module):
         self.zero_point = zero_point
         self.frozen = scale is not None
         # When True, calibration is suspended: forward keeps fake-quantizing
-        # with the current qparams but the observer sees no new data (torch's
         # FakeQuantize.disable_observer).
         self.disable_observer = bool(disable_observer)
 
