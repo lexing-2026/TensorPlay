@@ -237,6 +237,81 @@ class TestDeviceTypeExtras(TestCase):
         )
 
 
+class TestFileCheck(TestCase):
+    """Behavioral checks for the native FileCheck utility."""
+
+    def _fc(self):
+        from tensorplay.testing import FileCheck
+
+        return FileCheck()
+
+    def test_basic_and_chaining(self):
+        self._fc().check("foo").run("foo bar")
+        self._fc().check("a").check("b").run("a\nb")
+        with self.assertRaisesRegex(RuntimeError, 'Expected to find "foo"'):
+            self._fc().check("foo").run("bar")
+        # Checks apply sequentially: each continues after the previous match.
+        with self.assertRaisesRegex(RuntimeError, 'Expected to find "a"'):
+            self._fc().check("b").check("a").run("a\nb")
+
+    def test_check_next(self):
+        self._fc().check("a").check_next("b").run("a\nb")
+        with self.assertRaisesRegex(RuntimeError, 'Expected to not find "\\n"'):
+            self._fc().check("a").check_next("b").run("a\nx\nb")
+
+    def test_check_same(self):
+        self._fc().check("a").check_same("b").run("a b")
+        with self.assertRaisesRegex(RuntimeError, 'Expected to not find "\\n"'):
+            self._fc().check("a").check_same("b").run("a\nb")
+
+    def test_check_not(self):
+        self._fc().check("a").check_not("b").run("a c")
+        with self.assertRaisesRegex(RuntimeError, 'Expected to not find "b"'):
+            self._fc().check("a").check_not("b").run("a b")
+        # A NOT group covers the region up to the next match only.
+        self._fc().check("a").check("c").check_not("b").run("a\nb\nc")
+
+    def test_check_count(self):
+        self._fc().check_count("x", 2, exactly=True).run("x\ny\nx")
+        self._fc().check_count("x", 2, exactly=False).run("x\ny\nx\nx")
+        with self.assertRaisesRegex(RuntimeError, 'Expected to find "x"'):
+            self._fc().check_count("x", 3, exactly=True).run("x\ny\nx")
+
+    def test_check_dag(self):
+        self._fc().check_dag("b").check_dag("a").run("b\na")
+        with self.assertRaisesRegex(RuntimeError, 'Expected to find "b"'):
+            self._fc().check_dag("b").check_dag("a").run("a\nc")
+
+    def test_check_source_highlighted(self):
+        self._fc().check_source_highlighted("foo").run("some foo here\n     ~~~\nnext")
+        with self.assertRaisesRegex(RuntimeError, "highlighted but it is not"):
+            self._fc().check_source_highlighted("foo").run("some foo here\n    ~~~~~~\nnext")
+
+    def test_check_regex(self):
+        self._fc().check_regex("[0-9]+ items").run("there are 42 items")
+        with self.assertRaisesRegex(RuntimeError, 'Expected to find regex'):
+            self._fc().check_regex("[0-9]+ items").run("no numbers")
+
+    def test_error_message_format(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            self._fc().check("foo").run("bar baz")
+        message = str(ctx.exception)
+        self.assertIn('Expected to find "foo" but did not find it', message)
+        self.assertIn("Searched string:", message)
+        self.assertIn("From CHECK: foo", message)
+
+    def test_error_from_real_exception_text(self):
+        # FileCheck applied to actual runtime error output.
+        t = tp.empty([2, 1, 4]).expand(2, 3, 4)
+        try:
+            t.uniform_(0, 1)
+            raise AssertionError("expected uniform_ to reject overlapping input")
+        except RuntimeError as e:
+            self._fc().check("more than one element").check(
+                "Please clone() the tensor"
+            ).run(str(e))
+
+
 class TestAssertClose(TestCase):
     def test_tensor_pass(self):
         assert_close(tp.tensor([1.0, 2.0]), tp.tensor([1.0, 2.0]))
