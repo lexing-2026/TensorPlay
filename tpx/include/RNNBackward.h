@@ -1,9 +1,6 @@
 #pragma once
 // Native sequence-level RNN backward (lstm / gru / rnn_tanh / rnn_relu).
 //
-// ATen provides no CPU sequence backward (torch rides mkldnn/cudnn there);
-// this is a replay-based port of the cell math in aten/src/ATen/native/
-// RNN.cpp + cuda/RNN.cu, structured like ATen's lstm_backward: replay the
 // forward per layer to recover hidden states and gates, then step backwards
 // through time accumulating gate gradients, and reduce the weight gradients
 // with one GEMM per direction.  Every step is a dispatched recordable op, so
@@ -12,6 +9,9 @@
 #include "Node.h"
 #include "Autograd.h"
 #include "SavedVariable.h"
+#include "GradMode.h"
+#include "RNNCpuKernels.h"
+#include "RNNOneDNN.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 
 #include <tuple>
@@ -57,6 +57,12 @@ inline std::vector<LayerReplay> replay(
         bool bidirectional, int64_t T, int64_t N) {
     const int64_t dirs = bidirectional ? 2 : 1;
     const int64_t H = hx[0].size(-1);
+    // Fused-cell replay fast path: only when the graph is not being recorded
+    // (create_graph=False -> GradMode disabled by the engine) and fp32/fp64.
+    // create_graph=True must keep the recordable decomposed ops below.
+    const DType rdt = x0.dtype();
+    const bool fused = !GradMode::is_enabled() &&
+                       (rdt == DType::Float32 || rdt == DType::Float64);
     std::vector<LayerReplay> layers;
     Tensor x = x0;
     size_t ppi = 0;
@@ -101,31 +107,52 @@ inline std::vector<LayerReplay> replay(
                 Tensor hg = ops::mm(h, w_hh_t);
                 if (kind != 1 && b_hh.defined()) hg = ops::add(hg, b_hh);
                 if (kind == 0) {
-                    Tensor i_ = ops::sigmoid(narrow_gate(ig, 0, H) + narrow_gate(hg, 0, H));
-                    Tensor f_ = ops::sigmoid(narrow_gate(ig, H, H) + narrow_gate(hg, H, H));
-                    Tensor g_ = ops::tanh(narrow_gate(ig, 2 * H, H) + narrow_gate(hg, 2 * H, H));
-                    Tensor o_ = ops::sigmoid(narrow_gate(ig, 3 * H, H) + narrow_gate(hg, 3 * H, H));
-                    c = f_ * c + i_ * g_;
-                    h = o_ * ops::tanh(c);
-                    dr.h_hist.push_back(h);
-                    dr.c_hist.push_back(c);
-                    dr.gates_hist.push_back(ops::cat({i_, f_, g_, o_}, 1));
+                    if (fused) {
+                        auto rr = (rdt == DType::Float32)
+                            ? rnn_cpu::lstm_cell_replay<float>(ig, hg, c)
+                            : rnn_cpu::lstm_cell_replay<double>(ig, hg, c);
+                        h = std::get<0>(rr);
+                        c = std::get<1>(rr);
+                        dr.h_hist.push_back(h);
+                        dr.c_hist.push_back(c);
+                        dr.gates_hist.push_back(std::get<2>(rr));
+                    } else {
+                        Tensor i_ = ops::sigmoid(narrow_gate(ig, 0, H) + narrow_gate(hg, 0, H));
+                        Tensor f_ = ops::sigmoid(narrow_gate(ig, H, H) + narrow_gate(hg, H, H));
+                        Tensor g_ = ops::tanh(narrow_gate(ig, 2 * H, H) + narrow_gate(hg, 2 * H, H));
+                        Tensor o_ = ops::sigmoid(narrow_gate(ig, 3 * H, H) + narrow_gate(hg, 3 * H, H));
+                        c = f_ * c + i_ * g_;
+                        h = o_ * ops::tanh(c);
+                        dr.h_hist.push_back(h);
+                        dr.c_hist.push_back(c);
+                        dr.gates_hist.push_back(ops::cat({i_, f_, g_, o_}, 1));
+                    }
                 } else if (kind == 1) {
-                    Tensor r_ = ops::sigmoid(
-                        narrow_gate(ig, 0, H) +
-                        (b_r.defined() ? b_r + narrow_gate(hg, 0, H)
-                                       : narrow_gate(hg, 0, H)));
-                    Tensor z_ = ops::sigmoid(
-                        narrow_gate(ig, H, H) +
-                        (b_z.defined() ? b_z + narrow_gate(hg, H, H)
-                                       : narrow_gate(hg, H, H)));
-                    Tensor hn_lin = narrow_gate(hg, 2 * H, H);
-                    if (b_n.defined()) hn_lin = hn_lin + b_n;
-                    Tensor n_ = ops::tanh(narrow_gate(ig, 2 * H, H) + r_ * hn_lin);
-                    h = (z_ * (-1) + 1) * n_ + z_ * h;
-                    dr.h_hist.push_back(h);
-                    dr.gates_hist.push_back(ops::cat({r_, z_, n_}, 1));
-                    dr.hn_lin_hist.push_back(hn_lin);
+                    if (fused) {
+                        auto rr = (rdt == DType::Float32)
+                            ? rnn_cpu::gru_cell_replay<float>(ig, hg, h, b_hh)
+                            : rnn_cpu::gru_cell_replay<double>(ig, hg, h, b_hh);
+                        h = std::get<0>(rr);
+                        dr.h_hist.push_back(h);
+                        dr.gates_hist.push_back(std::get<1>(rr));
+                        dr.hn_lin_hist.push_back(std::get<2>(rr));
+                    } else {
+                        Tensor r_ = ops::sigmoid(
+                            narrow_gate(ig, 0, H) +
+                            (b_r.defined() ? b_r + narrow_gate(hg, 0, H)
+                                           : narrow_gate(hg, 0, H)));
+                        Tensor z_ = ops::sigmoid(
+                            narrow_gate(ig, H, H) +
+                            (b_z.defined() ? b_z + narrow_gate(hg, H, H)
+                                           : narrow_gate(hg, H, H)));
+                        Tensor hn_lin = narrow_gate(hg, 2 * H, H);
+                        if (b_n.defined()) hn_lin = hn_lin + b_n;
+                        Tensor n_ = ops::tanh(narrow_gate(ig, 2 * H, H) + r_ * hn_lin);
+                        h = (z_ * (-1) + 1) * n_ + z_ * h;
+                        dr.h_hist.push_back(h);
+                        dr.gates_hist.push_back(ops::cat({r_, z_, n_}, 1));
+                        dr.hn_lin_hist.push_back(hn_lin);
+                    }
                 } else {
                     Tensor pre = ig + hg;
                     h = kind == 2 ? ops::tanh(pre) : ops::relu(pre);
@@ -169,10 +196,29 @@ rnn_backward_impl(int kind, const Tensor& grad_y_in, const Tensor& grad_hy_in,
     const int64_t dirs = bidirectional ? 2 : 1;
     const int64_t H = hx[0].size(-1);
     const DType dt = input.dtype();
+    // Same fused gate as replay(): only when not recording (create_graph=False)
+    // and fp32/fp64.  Must match replay() so gates_hist layout is consistent.
+    const bool fused = !GradMode::is_enabled() &&
+                       (dt == DType::Float32 || dt == DType::Float64);
 
     Tensor grad_y = batch_first
         ? ops::contiguous(ops::transpose(grad_y_in, 0, 1))
         : ops::contiguous(grad_y_in);
+
+#ifdef USE_ONEDNN
+    // lstm fast path: fused oneDNN lstm_backward (one primitive per
+    // layer+direction).  Only when not recording a graph -- create_graph=True
+    // must keep the recordable decomposed sweep below so double-backward works.
+    // onednn_lstm_backward itself gates on fp32 + oneDNN availability and
+    // returns nullopt to fall through to the replay path.
+    if (kind == 0 && !GradMode::is_enabled()) {
+        if (auto r = ::tensorplay::cpu::onednn_lstm_backward(grad_y_in, grad_hy_in, grad_cy_in,
+                                               input, hx, params, has_biases,
+                                               num_layers, bidirectional,
+                                               batch_first))
+            return *r;
+    }
+#endif
 
     const auto layers = replay(kind, x0, hx, params, has_biases, L,
                                bidirectional, T, N);
@@ -236,36 +282,55 @@ rnn_backward_impl(int kind, const Tensor& grad_y_in, const Tensor& grad_hy_in,
                     const Tensor c = dr.c_hist[t];
                     const Tensor c_prev = t == 0 ? dr.c0 : dr.c_hist[t - 1];
                     const Tensor gates = dr.gates_hist[t];
-                    const Tensor i_ = ops::narrow(gates, 1, 0, H);
-                    const Tensor f_ = ops::narrow(gates, 1, H, H);
-                    const Tensor g_ = ops::narrow(gates, 1, 2 * H, H);
-                    const Tensor o_ = ops::narrow(gates, 1, 3 * H, H);
-                    const Tensor tanh_c = ops::tanh(c);
-                    const Tensor dc = dc_next + dh * o_ * (tanh_c * tanh_c * (-1) + 1);
-                    const Tensor dpre_i = sig_back(dc * g_, i_);
-                    const Tensor dpre_f = sig_back(dc * c_prev, f_);
-                    const Tensor dpre_g = tanh_back(dc * i_, g_);
-                    const Tensor dpre_o = sig_back(dh * tanh_c, o_);
-                    dc_next = dc * f_;
-                    dpre = ops::cat({dpre_i, dpre_f, dpre_g, dpre_o}, 1);
-                    dhid = dpre;
-                    dh_next = ops::mm(dhid, w_hh);
+                    if (fused) {
+                        auto rr = (dt == DType::Float32)
+                            ? rnn_cpu::lstm_cell_backward<float>(dh, dc_next, c, c_prev, gates)
+                            : rnn_cpu::lstm_cell_backward<double>(dh, dc_next, c, c_prev, gates);
+                        dpre = std::get<0>(rr);
+                        dc_next = std::get<1>(rr);
+                        dhid = dpre;
+                        dh_next = ops::mm(dhid, w_hh);
+                    } else {
+                        const Tensor i_ = ops::narrow(gates, 1, 0, H);
+                        const Tensor f_ = ops::narrow(gates, 1, H, H);
+                        const Tensor g_ = ops::narrow(gates, 1, 2 * H, H);
+                        const Tensor o_ = ops::narrow(gates, 1, 3 * H, H);
+                        const Tensor tanh_c = ops::tanh(c);
+                        const Tensor dc = dc_next + dh * o_ * (tanh_c * tanh_c * (-1) + 1);
+                        const Tensor dpre_i = sig_back(dc * g_, i_);
+                        const Tensor dpre_f = sig_back(dc * c_prev, f_);
+                        const Tensor dpre_g = tanh_back(dc * i_, g_);
+                        const Tensor dpre_o = sig_back(dh * tanh_c, o_);
+                        dc_next = dc * f_;
+                        dpre = ops::cat({dpre_i, dpre_f, dpre_g, dpre_o}, 1);
+                        dhid = dpre;
+                        dh_next = ops::mm(dhid, w_hh);
+                    }
                 } else if (kind == 1) {
                     const Tensor gates = dr.gates_hist[t];
-                    const Tensor r_ = ops::narrow(gates, 1, 0, H);
-                    const Tensor z_ = ops::narrow(gates, 1, H, H);
-                    const Tensor n_ = ops::narrow(gates, 1, 2 * H, H);
                     const Tensor hn_lin = dr.hn_lin_hist[t];
-                    const Tensor dz = dh * (h_prev - n_);
-                    const Tensor dn = dh * (z_ * (-1) + 1);
-                    const Tensor dpre_n = tanh_back(dn, n_);
-                    const Tensor dr_ = dpre_n * hn_lin;
-                    const Tensor dhn = dpre_n * r_;
-                    const Tensor dpre_r = sig_back(dr_, r_);
-                    const Tensor dpre_z = sig_back(dz, z_);
-                    dpre = ops::cat({dpre_r, dpre_z, dpre_n}, 1);
-                    dhid = ops::cat({dpre_r, dpre_z, dhn}, 1);
-                    dh_next = dh * z_ + ops::mm(dhid, w_hh);
+                    if (fused) {
+                        auto rr = (dt == DType::Float32)
+                            ? rnn_cpu::gru_cell_backward<float>(dh, h_prev, gates, hn_lin)
+                            : rnn_cpu::gru_cell_backward<double>(dh, h_prev, gates, hn_lin);
+                        dpre = std::get<0>(rr);
+                        dhid = std::get<1>(rr);
+                        dh_next = std::get<2>(rr) + ops::mm(dhid, w_hh);
+                    } else {
+                        const Tensor r_ = ops::narrow(gates, 1, 0, H);
+                        const Tensor z_ = ops::narrow(gates, 1, H, H);
+                        const Tensor n_ = ops::narrow(gates, 1, 2 * H, H);
+                        const Tensor dz = dh * (h_prev - n_);
+                        const Tensor dn = dh * (z_ * (-1) + 1);
+                        const Tensor dpre_n = tanh_back(dn, n_);
+                        const Tensor dr_ = dpre_n * hn_lin;
+                        const Tensor dhn = dpre_n * r_;
+                        const Tensor dpre_r = sig_back(dr_, r_);
+                        const Tensor dpre_z = sig_back(dz, z_);
+                        dpre = ops::cat({dpre_r, dpre_z, dpre_n}, 1);
+                        dhid = ops::cat({dpre_r, dpre_z, dhn}, 1);
+                        dh_next = dh * z_ + ops::mm(dhid, w_hh);
+                    }
                 } else {
                     dpre = kind == 2 ? tanh_back(dh, dr.h_hist[t])
                                      : dh * ops::gt(dr.h_hist[t], Scalar(0));
