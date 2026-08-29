@@ -19,14 +19,11 @@ def factory_kwargs(kwargs):
     r"""Return a canonicalized dict of factory kwargs.
 
     Given kwargs, returns a canonicalized dict of factory kwargs that can be directly passed
-    to factory functions like torch.empty, or errors if unrecognized kwargs are present.
 
     This function makes it simple to write code like this::
 
         class MyModule(nn.Module):
             def __init__(self, **kwargs):
-                factory_kwargs = torch.nn.factory_kwargs(kwargs)
-                self.weight = Parameter(torch.empty(10, **factory_kwargs))
 
     Why should you use this function instead of just passing `kwargs` along directly?
 

@@ -1,17 +1,13 @@
-"""Multi-head attention, mirroring ``torch.nn.MultiheadAttention``.
+"""Multi-head attention modules.
 
-The parameter/state-dict layout follows torch exactly so torchvision
 checkpoints (e.g. ViT weights) load without key translation:
 
 * ``in_proj_weight`` / ``q_proj_weight``, ``k_proj_weight``, ``v_proj_weight``
 * ``in_proj_bias``
-* ``out_proj`` — a Linear registered under the name torch uses
-  (torch calls it NonDynamicallyQuantizableLinear)
 * ``bias_k`` / ``bias_v`` when add_bias_kv=True
 
 The functional path delegates to
 ``tensorplay.nn.functional.multi_head_attention_forward`` which composes the
-same math as ATen's native implementation.
 """
 
 from typing import Optional
@@ -28,7 +24,6 @@ from .module import Module
 __all__ = ["MultiheadAttention", "NonDynamicallyQuantizableLinear"]
 
 
-# torch defines this alias so state dict keys stay stable across versions.
 class NonDynamicallyQuantizableLinear(Linear):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -39,8 +34,6 @@ class MultiheadAttention(Module):
     representation subspaces, as described in the paper *Attention Is All You
     Need*.
 
-    Args mirror torch.nn.MultiheadAttention; ``batch_first=True`` is required
-    by the torchvision transformer models and is supported here.
     """
 
     bias_k: Optional[Parameter]
@@ -88,7 +81,6 @@ class MultiheadAttention(Module):
         else:
             self.register_parameter("in_proj_bias", None)
 
-        # torch registers out_proj as NonDynamicallyQuantizableLinear so that
         # the state dict keys ("out_proj.weight"/"out_proj.bias") are stable.
         self.out_proj = NonDynamicallyQuantizableLinear(embed_dim, embed_dim, bias=bias)
 
@@ -103,7 +95,6 @@ class MultiheadAttention(Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        # Mirrors torch.nn.MultiheadAttention._reset_parameters
         if self._qkv_same_embed_dim:
             init.xavier_uniform_(self.in_proj_weight)
         else:
@@ -118,7 +109,6 @@ class MultiheadAttention(Module):
             init.constant_(self.bias_v, 0.0)
 
     def __setstate__(self, state) -> None:
-        # Support loading older torch checkpoints that lack batch_first.
         state.setdefault("batch_first", True)
         super().__setstate__(state)
 

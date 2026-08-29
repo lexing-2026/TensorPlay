@@ -20,7 +20,6 @@ class ChannelShuffle(Module):
     Examples::
 
         >>> channel_shuffle = nn.ChannelShuffle(2)
-        >>> input = torch.arange(1, 17, dtype=torch.float32).view(1, 4, 2, 2)
         >>> input
         tensor([[[[ 1.,  2.],
                   [ 3.,  4.]],

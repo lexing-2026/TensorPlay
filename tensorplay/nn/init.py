@@ -143,8 +143,6 @@ def trunc_normal_(tensor, mean=0.0, std=1.0, a=-2.0, b=2.0):
 
     Method is based on the rejection-sampling scheme in
     https://people.sc.fsu.edu/~jburkardt/presentations/truncated_normal.pdf —
-    a direct port of ``torch.nn.init._no_grad_trunc_normal_`` (torch/nn/init.py),
-    which torchvision transformer models use for positional embeddings.
     """
     import math
     import warnings
@@ -203,7 +201,6 @@ def trunc_normal_(tensor, mean=0.0, std=1.0, a=-2.0, b=2.0):
         return tensor
 
 def _qr_reduced(a):
-    # torch.nn.init.orthogonal_ relies on ATen's linalg_qr.  TensorPlay has no
     # native QR yet, so this pure-tensor Householder reduction provides the
     # same reduced-QR contract (Q: m x n with orthonormal columns, R: n x n).
     m, n = a.shape

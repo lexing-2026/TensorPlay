@@ -28,7 +28,7 @@ T = TypeVar("T", bound=Module)
 _V = TypeVar("_V")
 
 
-# Copied from tensorplay.nn.modules.module, required for a custom __repr__ for ModuleList
+# Shared indentation helper required for the custom ModuleList repr.
 def _add_indent(s_, num_spaces: int):
     s = s_.split("\n")
     # don't do anything for single-line stuff
@@ -218,7 +218,6 @@ class Sequential(Module):
     # NB: We can't really type check this function as the type of input
     # may change dynamically (as is tested in
     # TestScript.test_sequential_intermediary_types).  Cannot annotate
-    # with Any as TorchScript expects a more precise type
     def forward(self, input):
         """
         Runs the forward pass.

@@ -1,11 +1,9 @@
 r"""Recurrent modules: RNN, LSTM, GRU and their single-step cells.
 
 The recurrence kernels are Python ports of the CPU cell functors and the
-layer/stack combinators of ``aten/src/ATen/native/RNN.cpp`` (``SimpleCell``,
 ``LSTMCell``, ``GRUCell``, ``FullLayer``, ``FullBidirectionalLayer``,
 ``PackedLayer``, ``ReversedPackedLayer``, ``apply_layer_stack``), including
 the one-GEMM input pre-computation the CPU path performs per layer.  The
-module classes mirror ``torch/nn/modules/rnn.py``.
 """
 
 import math
@@ -47,9 +45,7 @@ def apply_permutation(tensor: Tensor, permutation: Tensor, dim: int = 1) -> Tens
 
 
 # ---------------------------------------------------------------------------
-# Cell kernels (aten/src/ATen/native/RNN.cpp CPU paths)
 #
-# Each cell has the aten signature
 #   cell(input, hidden, params, pre_compute_input=False) -> hidden
 # where params is the (w_ih, w_hh, b_ih, b_hh, w_hr) tuple of CellParams and
 # pre_compute_input indicates that `input` already holds linear_ih(input).
@@ -57,7 +53,6 @@ def apply_permutation(tensor: Tensor, permutation: Tensor, dim: int = 1) -> Tens
 
 
 def _rnn_tanh_cell(input, hidden, params, pre_compute_input=False):
-    # SimpleCell<tanh_f> (aten RNN.cpp:736-746)
     w_ih, w_hh, b_ih, b_hh, _ = params
     # Out-of-place add: in-place add_ on an op result drops the input-side
     # branch from the autograd graph (no version-counter fixup here).
@@ -67,7 +62,6 @@ def _rnn_tanh_cell(input, hidden, params, pre_compute_input=False):
 
 
 def _rnn_relu_cell(input, hidden, params, pre_compute_input=False):
-    # SimpleCell<relu_f> (aten RNN.cpp:736-746)
     w_ih, w_hh, b_ih, b_hh, _ = params
     out = F.linear(hidden, w_hh, b_hh) + (
         input if pre_compute_input else F.linear(input, w_ih, b_ih))
@@ -75,7 +69,6 @@ def _rnn_relu_cell(input, hidden, params, pre_compute_input=False):
 
 
 def _lstm_cell(input, hidden, params, pre_compute_input=False):
-    # LSTMCell CPU path (aten RNN.cpp:772-782)
     w_ih, w_hh, b_ih, b_hh, w_hr = params
     hx, cx = hidden
 
@@ -96,7 +89,6 @@ def _lstm_cell(input, hidden, params, pre_compute_input=False):
 
 
 def _gru_cell(input, hidden, params, pre_compute_input=False):
-    # GRUCell CPU path (aten RNN.cpp:805-816)
     w_ih, w_hh, b_ih, b_hh, _ = params
 
     igates = input if pre_compute_input else F.linear(input, w_ih, b_ih)
@@ -117,7 +109,6 @@ def _gru_cell(input, hidden, params, pre_compute_input=False):
 
 # ---------------------------------------------------------------------------
 # Generic helpers over "hidden" values (Tensor for RNN/GRU, (h, c) for LSTM);
-# ports of hidden_slice / hidden_concat / hidden_as_output (aten RNN.cpp:594+)
 # ---------------------------------------------------------------------------
 
 
@@ -144,12 +135,10 @@ def _hidden_as_output(hidden):
 
 
 # ---------------------------------------------------------------------------
-# Layers: scan a cell over a sequence (aten RNN.cpp:848-1093)
 # ---------------------------------------------------------------------------
 
 
 def _layer_scan(step_inputs, hidden, params, cell, pre_compute_input):
-    # The step-loop body of FullLayer (aten RNN.cpp:857-869)
     step_outputs = []
     for inp in step_inputs:
         hidden = cell(inp, hidden, params, pre_compute_input)
@@ -158,7 +147,6 @@ def _layer_scan(step_inputs, hidden, params, cell, pre_compute_input):
 
 
 def _full_layer(input, input_hidden, params, cell, is_cpu):
-    # FullLayer::operator()(Tensor) (aten RNN.cpp:871-887).  On CPU the whole
     # input projection is computed as one GEMM before the scan
     # (pre_compute_input).
     if is_cpu:
@@ -181,7 +169,6 @@ def _full_layer(input, input_hidden, params, cell, is_cpu):
 
 
 def _full_bidirectional_layer(input, input_hidden, params_pair, cell, is_cpu):
-    # FullBidirectionalLayer (aten RNN.cpp:902-948)
     fw_params, rev_params = params_pair
     fw_hidden, rev_hidden = input_hidden
     if is_cpu:
@@ -221,7 +208,6 @@ def _full_bidirectional_layer(input, input_hidden, params_pair, cell, is_cpu):
 
 
 def _packed_layer(packed_input, input_hidden, params, cell, is_cpu):
-    # PackedLayer (aten RNN.cpp:951-1009)
     data = packed_input.data
     batch_sizes = packed_input.batch_sizes.tolist()
     step_outputs = []
@@ -264,7 +250,6 @@ def _packed_layer(packed_input, input_hidden, params, cell, is_cpu):
 
 
 def _reversed_packed_layer(packed_input, input_hidden, params, cell, is_cpu):
-    # ReversedPackedLayer (aten RNN.cpp:1012-1063)
     data = packed_input.data
     batch_sizes = packed_input.batch_sizes.tolist()
     step_outputs = []
@@ -300,7 +285,6 @@ def _reversed_packed_layer(packed_input, input_hidden, params, cell, is_cpu):
 
 
 def _packed_bidirectional_layer(packed_input, input_hidden, params_pair, cell, is_cpu):
-    # PackedBidirectionalLayer (aten RNN.cpp:1066-1093)
     fw_params, rev_params = params_pair
     fw_hidden, rev_hidden = input_hidden
     fw_result = _packed_layer(packed_input, fw_hidden, fw_params, cell, is_cpu)
@@ -312,14 +296,12 @@ def _packed_bidirectional_layer(packed_input, input_hidden, params_pair, cell, i
 
 
 def _rnn_dropout(input, p):
-    # aten RNN.cpp:1103-1109
     if isinstance(input, PackedSequence):
         return PackedSequence(F.dropout(input.data, p, True), input.batch_sizes)
     return F.dropout(input, p, True)
 
 
 def _apply_layer_stack(layer_fn, input, hiddens, params, num_layers, dropout_p, train):
-    # apply_layer_stack (aten RNN.cpp:1111-1135)
     if num_layers != len(hiddens):
         raise RuntimeError("Expected more hidden states in stacked_rnn")
     if num_layers != len(params):
@@ -340,8 +322,7 @@ def _apply_layer_stack(layer_fn, input, hiddens, params, num_layers, dropout_p, 
 
 def _gather_params(flat_weights, has_biases, has_projections=False):
     # Parses a flat list of parameter tensors into per-(layer, direction)
-    # (w_ih, w_hh, b_ih, b_hh, w_hr) tuples; port of gather_params
-    # (aten RNN.cpp:613-645).
+    # (w_ih, w_hh, b_ih, b_hh, w_hr) tuples; gather parameter blocks.
     result = []
     if has_biases:
         if has_projections:
@@ -371,7 +352,6 @@ def _gather_params(flat_weights, has_biases, has_projections=False):
 
 
 def _check_attributes(input, flat_weights, hiddens):
-    # Port of check_attributes (aten RNN.cpp): all parameters, the input and
     # the hidden states must share one dtype and live on one device.
     for tensor in flat_weights:
         if tensor is None:
@@ -391,7 +371,6 @@ def _check_attributes(input, flat_weights, hiddens):
 
 def _one_hidden_rnn(cell, input, hx, flat_weights, has_biases, num_layers,
                     dropout_p, train, bidirectional, batch_first):
-    # Port of the ONE_HIDDEN_RNN macro body for RNN/GRU (aten RNN.cpp:1228-1289)
     _check_attributes(input, flat_weights, [hx])
     input = input.transpose(0, 1) if batch_first else input
     params = _gather_params(flat_weights, has_biases)
@@ -406,7 +385,6 @@ def _one_hidden_rnn(cell, input, hx, flat_weights, has_biases, num_layers,
         layer_input, final_hidden = _apply_layer_stack(
             layer_fn, input, hiddens, params, num_layers, dropout_p, train
         )
-        # unpair_vec: [fw_l0, rev_l0, fw_l1, rev_l1, ...] (aten RNN.cpp:602-610)
         flat_hiddens = []
         for pair in final_hidden:
             flat_hiddens.extend(pair)
@@ -429,7 +407,6 @@ def _one_hidden_rnn(cell, input, hx, flat_weights, has_biases, num_layers,
 
 def _one_hidden_rnn_packed(cell, data, batch_sizes, hx, flat_weights, has_biases,
                            num_layers, dropout_p, train, bidirectional):
-    # Port of the packed ONE_HIDDEN_RNN overload (aten RNN.cpp:1291-1349)
     packed_input = PackedSequence(data, batch_sizes)
     _check_attributes(data, flat_weights, [hx])
     params = _gather_params(flat_weights, has_biases)
@@ -464,7 +441,6 @@ def _one_hidden_rnn_packed(cell, data, batch_sizes, hx, flat_weights, has_biases
 
 def _lstm_impl(cell, packed_input, hx, cx, params, num_layers, dropout_p, train,
                bidirectional, is_cpu):
-    # Port of _lstm_impl (aten RNN.cpp:1168-1195): transpose the (hx, cx) pair
     # into per-layer pairs, run the stack, and stack hy/cy back.
     layer_hx = [hx.select(0, i) for i in range(hx.size(0))]
     layer_cx = [cx.select(0, i) for i in range(cx.size(0))]
@@ -514,7 +490,6 @@ def _lstm_impl(cell, packed_input, hx, cx, params, num_layers, dropout_p, train,
 
 def _lstm(input, hx, flat_weights, has_biases, num_layers, dropout_p, train,
           bidirectional, batch_first):
-    # Port of at::lstm for the non-packed input (aten RNN.cpp:1464-1526).
     if len(hx) != 2:
         raise RuntimeError("lstm expects two hidden states")
     _check_attributes(input, flat_weights, hx)
@@ -534,7 +509,6 @@ def _lstm(input, hx, flat_weights, has_biases, num_layers, dropout_p, train,
 
 def _lstm_packed(data, batch_sizes, hx, flat_weights, has_biases, num_layers,
                  dropout_p, train, bidirectional):
-    # Port of at::lstm for packed input (aten RNN.cpp:1528+)
     if len(hx) != 2:
         raise RuntimeError("lstm expects two hidden states")
     packed_input = PackedSequence(data, batch_sizes)
@@ -551,7 +525,6 @@ def _lstm_packed(data, batch_sizes, hx, flat_weights, has_biases, num_layers,
 
 
 def _any_autocast_enabled() -> bool:
-    # Stand-in for torch._C._is_any_autocast_enabled(): autocast can be
     # enabled per device type.
     return tp.is_autocast_enabled("cpu") or tp.is_autocast_enabled("cuda")
 
@@ -752,7 +725,6 @@ class RNNBase(Module):
         Otherwise, it's a no-op.
 
         TensorPlay has no cuDNN-backed fused RNN, so this is always a no-op
-        here; the method is kept for torch API compatibility.
         """
         # Short-circuits if _flat_weights is only partially instantiated
         if len(self._flat_weights) != len(self._flat_weights_names):
@@ -900,8 +872,6 @@ class RNNBase(Module):
         super().__setstate__(d)
         if "all_weights" in d:
             self._all_weights = d["all_weights"]
-        # In PyTorch 1.8 we added a proj_size member variable to LSTM.
-        # LSTMs that were serialized via save(module) before PyTorch 1.8
         # don't have it, so to preserve compatibility we set proj_size here.
         if "proj_size" not in d:
             self.proj_size = 0
@@ -1602,7 +1572,6 @@ class GRU(RNNBase):
         self._update_flat_weights()
 
         orig_input = input
-        # xxx: isinstance check needs to be in conditional for TorchScript to compile
         batch_sizes = None
         num_directions = 2 if self.bidirectional else 1
         if isinstance(orig_input, PackedSequence):
@@ -1712,7 +1681,6 @@ class RNNCellBase(Module):
     weight_ih: Tensor
     weight_hh: Tensor
     # WARNING: bias_ih and bias_hh purposely not defined here.
-    # See https://github.com/pytorch/pytorch/issues/39670
 
     def __init__(
         self,
