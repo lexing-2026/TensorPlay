@@ -7,8 +7,8 @@
 
 namespace tensorplay {
 
-// Tensor memory layouts, mirroring c10::MemoryFormat. A tensor carries at
-// most one format tag: Contiguous (row-major) or one of the channels-last
+// Tensor memory layouts. A tensor carries at most one format tag: Contiguous
+// (row-major) or one of the channels-last
 // layouts; Preserve is a request-level sentinel (factories/clones) and is
 // never stored on a TensorImpl.
 enum class MemoryFormat : int8_t {
@@ -22,7 +22,6 @@ P10_API const char* toString(MemoryFormat format);
 
 // Channel-second strides ("dim 1 moves to the end"): for sizes
 // [N,C,H,W] -> [C*H*W, 1, C*W, C]; [N,C,D,H,W] -> [C*D*H*W, 1, C*H*W, C*W, C].
-// Same arithmetic as ATen's channels-last stride computation; ranks below 3
 // fall back to row-major (the layout is not representable there).
 inline std::vector<int64_t> get_channels_last_strides(
     const std::vector<int64_t>& sizes) {

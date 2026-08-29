@@ -1,7 +1,6 @@
 #pragma once
 
 // Dispatch header: selects the vec layer for the CPU capability this TU is
-// compiled for. Mirrors ATen/cpu/vec/vec.h.
 
 #if defined(CPU_CAPABILITY_AVX512)
 // Full-width 512-bit layer (float/double; int32/int64 pending).

@@ -21,10 +21,7 @@ namespace tensorplay {
 
 namespace {
 
-// POD layout mirrors torch's CPUGeneratorImplState so RNG states are
-// byte-compatible with torch.get_rng_state / torch.set_rng_state (5056 bytes).
 // The legacy state array holds 64-bit entries even though the engine now uses
-// 32-bit ones; torch keeps the same quirk for checkpoint compatibility.
 struct CPUGeneratorStateLegacy {
     uint64_t the_initial_seed;
     int left;
@@ -171,8 +168,7 @@ void Generator::set_state(const Tensor& new_state) {
 
 namespace detail {
 
-// Nondeterministic seed from the platform entropy source (torch uses
-// c10::detail::getNonDeterministicRandom for its default generators).
+// the default generators).
 uint64_t getNonDeterministicRandom() {
     std::random_device rd;
     return (static_cast<uint64_t>(rd()) << 32) | rd();
@@ -188,7 +184,6 @@ Generator& default_generator() {
 void manual_seed(uint64_t seed) {
     default_generator().manual_seed(seed);
 #ifdef USE_CUDA
-    // torch semantics: torch.manual_seed seeds every device RNG. The CUDA
     // backend applies this lazily (never initializing CUDA) and skips it in
     // bad-fork children.
     tensorplay::cuda::manual_seed_all(seed);

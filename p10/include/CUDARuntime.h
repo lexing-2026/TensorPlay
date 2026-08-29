@@ -35,7 +35,6 @@ private:
 };
 
 // A value object around a CUDA stream. Non-default streams come from a
-// per-device pool and intentionally outlive user wrappers, matching PyTorch's
 // cheap, reusable Stream semantics.
 class P10_API CUDAStream {
 public:
@@ -52,8 +51,8 @@ public:
     }
     bool operator!=(const CUDAStream& other) const noexcept { return !(*this == other); }
 
-    // Unbound placeholder ("no stream yet"), mirroring c10's default-constructed
-    // Stream. Needed by components like CUDAGraph that stash a stream slot
+    // Unbound placeholder ("no stream yet"). Needed by components like
+    // CUDAGraph that stash a stream slot
     // before capture begins; not a usable launch stream.
     static CUDAStream undefined() noexcept { return CUDAStream(-1, nullptr); }
 

@@ -2,7 +2,6 @@
 
 /// Defines the Half type (IEEE half-precision floating point, fp16).
 /// Arithmetic is performed by converting to float and back, which is the
-/// portable approach used by ATen's memory-bound elementwise kernels.
 
 #include <bit>
 #include <cstdint>

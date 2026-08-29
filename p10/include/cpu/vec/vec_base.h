@@ -16,7 +16,6 @@
 // because there's no way to guard the global initializers with CPU capability
 // detection.
 //
-// See https://github.com/pytorch/pytorch/issues/37577 for an instance
 // of this bug in the past.
 
 #include <algorithm>
@@ -936,7 +935,6 @@ static inline Vectorized<T> bitwise_binary_op(
       sizeof(buffer) == sizeof(Vectorized<T>),
       "sizeof(buffer) must match sizeof(Vectorized<T>)");
   // We should be using memcpy in order to respect the strict aliasing rule
-  // see: https://github.com/pytorch/pytorch/issues/66119
   // Using char* is defined in the C11 standard 6.5 Expression paragraph 7
   // (http://www.open-std.org/jtc1/sc22/wg14/www/docs/n1570.pdf)
   const auto* a_data = a.as_bytes();

@@ -1,6 +1,5 @@
 #pragma once
 
-// Port of ATen/native/cpu/Reduce.h (reduction loop helpers), restricted to the
 // pieces needed by the CPU reduction kernels:
 //   - binary_kernel_reduce: ops-based (reduce/combine/project) reduction over
 //     foreach_reduced_elt, with per-thread partials combined at the end.

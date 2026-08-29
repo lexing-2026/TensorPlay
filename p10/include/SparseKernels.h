@@ -35,12 +35,10 @@ Tensor sparse_mm_cpu(const Tensor& self, const Tensor& dense);
 // addition; both require same dtype/shape and non-hybrid values.
 Tensor sparse_mul_cpu(const Tensor& self, const Tensor& other);
 Tensor sparse_add_cpu(const Tensor& self, const Tensor& other);
-// ATen _sparse_sum semantics: no dim -> dense sum of values; partial dim ->
 // coalesced COO over the kept dims (duplicates folded); all sparse dims ->
 // dense tensor.  ``dtype`` converts the input first (accumulation dtype).
 Tensor sparse_sum_cpu(const Tensor& self, std::optional<std::vector<int64_t>> dim,
                       std::optional<DType> dtype);
-// torch.sparse.spdiags: builds an (uncoalesced) COO from diagonal rows.
 // ``layout`` selects the output: 0 = sparse COO, 1 = sparse CSR.
 Tensor spdiags_cpu(const Tensor& diagonals, const Tensor& offsets,
                    std::vector<int64_t> shape,

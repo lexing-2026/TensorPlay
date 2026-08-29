@@ -1,7 +1,5 @@
 #pragma once
 
-// Port of ATen/cpu/vec/vec256/vec256_double.h with the TensorPlay vec layer.
-// Interface matches PyTorch's Vectorized<double>; math functions that
 // depend on Sleef fall back to a scalar map, everything else uses AVX2.
 
 #include <immintrin.h>
@@ -150,7 +148,6 @@ struct Vectorized<double> {
         _mm256_set1_pd(-0.0), values); // clear sign bit
   }
   Vectorized<double> angle() const {
-    // ATen semantics: NaN -> NaN, negative -> pi, otherwise -> 0.
     const auto zero_vec = _mm256_set1_pd(0.0);
     const auto nan_vec = _mm256_set1_pd(std::numeric_limits<double>::quiet_NaN());
     const auto not_nan_mask = _mm256_cmp_pd(values, values, _CMP_EQ_OQ);

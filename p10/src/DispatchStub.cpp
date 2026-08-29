@@ -1,4 +1,3 @@
-// Port of ATen/native/DispatchStub.cpp.
 
 #include "DispatchStub.h"
 

@@ -36,17 +36,12 @@ private:
     // bool so the full format (including 3-D) is representable.
     MemoryFormat memory_format_ = MemoryFormat::Contiguous;
 
-    // Autograd extension point (mirrors c10::TensorImpl::autograd_meta_).
+    // Autograd extension point.
     // Never copied by TensorImpl copy operations: copies start without
-    // autograd metadata, matching PyTorch semantics.
     std::shared_ptr<AutogradMetaBase> autograd_meta_;
 
-    // View identity (mirrors the DifferentiableViewMeta is_view_ bit carried
-    // by torch's autograd layer): set by the InplaceOrView-level wrappers for
-    // ops that alias their input's storage, so detach_() can reject views
-    // exactly like torch.  Deliberately NOT copied by the TensorImpl copy
-    // constructor: detach() strips view identity, matching torch's
-    // shallow_copy_and_detach (x.t().detach()._is_view() == False).
+    // View identity for operations that alias the input storage, so detach_()
+    // can reject views created by shallow_copy_and_detach.
     bool is_view_ = false;
 
     // Opaque pointer to OneDNN memory descriptor (std::shared_ptr<dnnl::memory::desc>)
@@ -63,8 +58,6 @@ private:
     // sparse metadata next to the dense metadata, mirroring TensorImpl's
     // split between logical sizes and the storage implementation.  The
     // component tensors are shared handles, so ordinary Tensor copies
-    // preserve the aliasing rules of torch.sparse_coo_tensor(...).
-    // Layout mirrors at::Layout: COO stores coordinates in `indices`
     // (shape [sparse_dim, nnz]); CSR (2D only) stores row pointers in
     // `crow` (shape [rows+1]) and column coordinates in `col` (shape [nnz]).
     struct SparseState {
@@ -79,7 +72,6 @@ private:
     std::shared_ptr<SparseState> sparse_state_;
 
 public:
-    // Layout tags mirroring at::Layout; used by Tensor sparse predicates.
     static constexpr int kSparseCOOLayout = 0;
     static constexpr int kSparseCSRLayout = 1;
     TensorImpl();
@@ -120,9 +112,8 @@ public:
     Device device() const { return device_; }
 
     // The dispatch key set describing this tensor: its backend key plus the
-    // matching autograd key (mirrors c10::TensorImpl::key_set_, which always
-    // carries an Autograd key for dense tensors; the autograd kernel itself
-    // decides whether to record based on GradMode/requires_grad).
+    // matching autograd key. The autograd kernel decides whether to record
+    // based on GradMode and requires_grad.
     DispatchKeySet key_set() const {
         DispatchKey backend = computeDispatchKey(device_);
         DispatchKeySet ks;
@@ -134,7 +125,6 @@ public:
     size_t itemsize() const { return elementSize(dtype_); }
     bool is_contiguous() const { return is_contiguous_; }
 
-    // Layout accessors (torch Tensor API surface).
     MemoryFormat memory_format() const {
         return memory_format_ == MemoryFormat::Preserve ? MemoryFormat::Contiguous
                                                         : memory_format_;
@@ -149,12 +139,10 @@ public:
     bool is_channels_last_3d() const { return memory_format_ == MemoryFormat::ChannelsLast3d; }
 
     // View identity: true when this tensor was created by a view op at the
-    // InplaceOrView layer (torch Tensor::_is_view() parity).
     bool is_view() const { return is_view_; }
     void set_is_view(bool v) { is_view_ = v; }
 
     // Stride-set equality against `format`'s canonical layout, mirroring
-    // at::TensorImpl::is_contiguous(MemoryFormat). Strict comparison: size-1
     // dims are not special-cased here.
     bool is_contiguous_in(MemoryFormat format) const {
         const auto sz = sizes_and_strides_.sizes().vec();
@@ -227,7 +215,6 @@ public:
         clear_storage();
     }
 
-    // Version counter access (PyTorch-style mutation tracking). Views share
     // the counter with their base via share_version_counter().
     uint32_t version() const { return version_counter_.current_version(); }
     void bump_version() { version_counter_.bump(); }

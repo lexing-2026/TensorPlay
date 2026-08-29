@@ -7,7 +7,6 @@ namespace tensorplay {
 namespace cuda {
 
 // Throws NotImplementedError when `t` has no cuBLAS GEMM path (integers,
-// bool), mirroring torch's "addmm_cuda" not implemented wording upstream.
 void check_cublas_gemm_dtype(DType t);
 
 // Row-major single GEMM: result(M,N) = alpha * self(M,K) @ other(K,N) + beta * result.

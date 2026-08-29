@@ -12,15 +12,13 @@ namespace tpx {
 class Node;
 
 // Concrete autograd metadata, attached to a p10 TensorImpl through the
-// AutogradMetaBase extension point. Mirrors torch::autograd::AutogradMeta.
 class TENSORPLAY_API AutogradMeta : public AutogradMetaBase {
 private:
     bool requires_grad_ = false;
     bool retains_grad_ = false;
     tensorplay::Tensor grad_;
     std::shared_ptr<Node> grad_fn_;
-    // NB: weak reference, mirroring c10::AutogradMeta::grad_accumulator_
-    // (weak_intrusive_ptr). The AccumulateGrad node strongly owns the leaf
+    // NB: weak reference. The AccumulateGrad node strongly owns the leaf
     // tensor; if the tensor also strongly owned the node the two would form
     // an uncollectable shared_ptr cycle and leak every leaf that ever took
     // part in a graph.
@@ -45,7 +43,6 @@ public:
 
     void set_grad_accumulator(std::shared_ptr<Node> grad_accumulator) { grad_accumulator_ = std::move(grad_accumulator); }
     // Returns nullptr when the accumulator has expired (the tensor outlived
-    // its graph, as with PyTorch's try_get_grad_accumulator).
     std::shared_ptr<Node> grad_accumulator() const { return grad_accumulator_.lock(); }
 
     uint32_t output_nr() const { return output_nr_; }

@@ -1,6 +1,5 @@
 #pragma once
 
-// Port of ATen/cpu/vec/vec512/vec512_float.h with the TensorPlay vec layer,
 // derived from the vec256 port (same interface, 512-bit width).  Math
 // functions that depend on Sleef resolve to glibc libmvec's 512-bit vector
 // ABI when available and fall back to a scalar map otherwise; everything
@@ -15,7 +14,6 @@
 #include <cstdint>
 
 #if defined(CPU_CAPABILITY_AVX512) && defined(__GLIBC__)
-// PyTorch's AVX512 Vectorized<float> uses Sleef for transcendental functions.
 // On glibc systems libmvec exposes the same vector ABI at full 512-bit width
 // (_ZGVeN16v_* = sixteen floats per call).
 extern "C" {
@@ -260,7 +258,6 @@ struct Vectorized<float> {
         _mm512_set1_ps(-0.0f), values); // clear sign bit
   }
   Vectorized<float> angle() const {
-    // ATen semantics: NaN -> NaN, negative -> pi, otherwise -> 0.
     const auto zero_vec = _mm512_set1_ps(0.f);
     const auto nan_vec = _mm512_set1_ps(std::numeric_limits<float>::quiet_NaN());
     const auto nan_mask = _mm512_cmp_ps_mask(values, values, _CMP_UNORD_Q);

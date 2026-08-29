@@ -1,6 +1,5 @@
 #pragma once
 
-// Port of ATen/cpu/vec/vec512/vec512_int.h with the TensorPlay vec layer,
 // derived from the vec256 port (same interface, 512-bit width).
 // Only int32/int64 specializations are provided (int8/16/uint8 can be added
 // when kernels need them).

@@ -17,7 +17,6 @@ std::function<std::string()>& stack_capture_fn() {
 }
 
 // The engine may evaluate several nodes of one graph concurrently; the parent
-// link is per-thread exactly like torch's tls_current_evaluating_node.
 thread_local std::weak_ptr<Node> tls_current_evaluating_node;
 
 } // namespace

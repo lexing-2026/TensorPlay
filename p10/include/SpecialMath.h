@@ -1,15 +1,7 @@
 #pragma once
 
-// Special-function math ported VERBATIM from
-// third_party/pytorch/aten/src/ATen/native/Math.h (torch 2.15.0a0).
-// Mechanical changes only:
-//   * C10_HOST_DEVICE / JITERATOR_HOST_DEVICE -> TP_HOST_DEVICE
-//   * c10::Half / c10::BFloat16 -> tensorplay:: equivalents
-//   * c10 math constants -> local constexpr values (identical bits)
-//   * at::acc_type<scalar_t,is_cuda> -> double accumulation
-//   * complex exp2_impl overload dropped (real dtypes only here)
-//   * jiterator stringify wrapper around chbevl/calc_i0e unwrapped
-// Cephes-derived sections keep ATen's license notes verbatim.
+// Special-function helpers shared by the CPU and CUDA implementations.
+// Device annotations and scalar wrappers are provided by this project.
 
 #include <BFloat16.h>
 #include <Half.h>

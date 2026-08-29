@@ -1,6 +1,5 @@
 #pragma once
 
-// Port of ATen/cpu/vec/vec512/vec512.h: float/double/int32/int64
 // specializations.  Reduced-precision types (bf16/qint/float8) and complex
 // live outside this layer in TensorPlay.
 

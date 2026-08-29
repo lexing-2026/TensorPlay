@@ -8,7 +8,6 @@
 //     historical stub, preserving its documented contract.
 //
 // This gives nsight-systems users op-name annotated timelines through
-// profile(emit_nvtx=True) / torch-parity cuda.nvtx.range_* calls without
 // pulling CUPTI in-process (kernel-level tracing remains nsys's job via its
 // own injection -- it already sees TensorPlay's real CUDA API calls).
 

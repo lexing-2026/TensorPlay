@@ -6,13 +6,12 @@
 
 namespace tensorplay {
 
-// Dispatch keys, mirroring c10::DispatchKey (proportionate subset).
+// Dispatch keys used by the runtime.
 //
-// Layout follows PyTorch's two-axis design in spirit: backend keys occupy the
-// low bits, the autograd keys sit above them and the autocast keys above
-// those.  Dispatch walks from the numerically largest key down, so the
-// priority order matches PyTorch's ("Autocasting precedes VariableType, to
-// ensure casts are autograd-exposed"): Autocast > Autograd > backend.
+// Backend keys occupy the low bits, autograd keys sit above them, and
+// autocast keys sit above the autograd keys. Dispatch walks from the
+// numerically largest key down, so the priority is Autocast > Autograd >
+// backend.
 enum class DispatchKey : uint8_t {
     // Backend component keys (dense backends).
     CPU = 0,
@@ -27,14 +26,10 @@ enum class DispatchKey : uint8_t {
     AutocastCPU = 4,
     AutocastCUDA = 5,
 
-    // Backend-neutral composite key, TensorPlay's proportionate stand-in for
-    // c10's CompositeExplicitAutograd alias key: getRuntimeDispatchKeySet()
-    // expands it to backend_dispatch_keyset (c10/core/DispatchKeySet.cpp) and
-    // DefaultBackend aliases it -- one registration serves every dense backend
-    // until a backend registers its own kernel ("valid to explicitly override
-    // on a per-backend basis", DispatchKey.h).  Lookups never walk this key
-    // from a tensor key set; the dispatcher consults it only when a backend
-    // slot is empty.
+    // Backend-neutral composite key. One registration serves every dense
+    // backend until a backend registers its own kernel. Lookups never walk
+    // this key from a tensor key set; the dispatcher consults it only when a
+    // backend slot is empty.
     Composite = 6,
 
     EndOfKeys // Sentinel
@@ -65,7 +60,7 @@ inline constexpr bool is_autograd_key(DispatchKey key) {
     return k >= kAutogradKeyOffset && k < kAutogradKeyOffset + kBackendKeyCount;
 }
 
-// True for the dense backend component keys (c10 isBackendDispatchKey).
+// True for the dense backend component keys.
 inline constexpr bool is_backend_key(DispatchKey key) {
     return key == DispatchKey::CPU || key == DispatchKey::CUDA;
 }
@@ -92,7 +87,7 @@ inline std::string toString(DispatchKey key) {
     }
 }
 
-// A small bitset over DispatchKey, mirroring c10::DispatchKeySet. Tensors
+// A small bitset over DispatchKey. Tensors
 // carry one (TensorImpl::key_set_); dispatch walks it from highest-priority
 // (autograd) to lowest (backend) bit.
 class DispatchKeySet {
@@ -130,7 +125,6 @@ public:
     }
 
     // Remove every autograd key (used for redispatch below the autograd layer,
-    // mirroring PyTorch's `key_set | DispatchKeySet(autograd_keys_removed)`).
     DispatchKeySet remove_autograd() const {
         raw_t autograd_mask = 0;
         for (size_t i = 0; i < kBackendKeyCount; ++i) {
@@ -139,8 +133,7 @@ public:
         return DispatchKeySet(mask_ & ~autograd_mask);
     }
 
-    // Remove every autocast key (used to re-enter dispatch below the autocast
-    // layer, mirroring c10::impl::ExcludeDispatchKeyGuard for Autocast keys).
+    // Remove every autocast key to re-enter dispatch below the autocast layer.
     DispatchKeySet remove_autocast() const {
         raw_t autocast_mask = 0;
         for (size_t i = 0; i < kBackendKeyCount; ++i) {

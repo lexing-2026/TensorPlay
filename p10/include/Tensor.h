@@ -97,7 +97,6 @@ public:
     // Constructor with Scalar fill value
     Tensor(const std::vector<int64_t>& sizes, Scalar fill_value, const Device& device = Device());
 
-    // C++ Factory Methods (mirroring torch::tensor)
     template <typename T>
     static Tensor tensor(const std::vector<T>& data, std::optional<DType> dtype = std::nullopt, const Device& device = Device(DeviceType::CPU)) {
         DType inferred_dtype = dtype.value_or(TypeTraits<T>::dtype);
@@ -189,8 +188,8 @@ public:
                                          const Tensor& values,
                                          const std::vector<int64_t>& size,
                                          bool is_coalesced = false);
-    // Internal CSR constructor used by to_sparse_csr; mirrors
-    // make_sparse_coo_tensor but installs crow/col components.
+    // Internal CSR constructor used by to_sparse_csr; it installs crow/col
+    // components alongside the values tensor.
     static Tensor make_sparse_csr_tensor(const Tensor& crow,
                                          const Tensor& col,
                                          const Tensor& values,
@@ -332,7 +331,6 @@ P10_API Tensor clone_impl(const Tensor& self,
 P10_API Tensor contiguous_impl(const Tensor& self, int64_t memory_format);
 // Fresh row-major copy for internal kernels that do flat/contiguous pointer
 // arithmetic: unlike clone() (which preserves non-overlapping-and-dense
-// strides, torch parity) and contiguous() (which aliases already-contiguous
 // inputs), this always materializes a new contiguous buffer.
 P10_API Tensor contiguous_clone(const Tensor& self);
 } // namespace detail

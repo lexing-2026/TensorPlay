@@ -2,11 +2,9 @@
 //
 // This file is included by OptimizerMTA.cuh after the common metadata and
 // load/store helpers have been declared.  Keeping these bodies in a separate
-// fragment follows ATen's split between the optimizer entry points and the
 // foreach functors, while still allowing the CUDA compiler to inline the
 // body into the one MTA kernel template.
 
-// Torch's CUDA foreach kernels do the arithmetic in opmath, but write the
 // result back to the tensor scalar type after every operation.  The reduced
 // opmath bodies in OptimizerMTA.cuh intentionally keep everything in opmath,
 // which is the right behavior for the explicit fused API but not for the
@@ -291,7 +289,6 @@ struct NadamExactBody {
             const Metadata& metadata, int tensor_index) {
         // Keep the host step and the already-rounded CPU mu_product in the
         // two metadata arrays.  The scalar-list coefficients and bias
-        // correction are Python doubles in Torch, then converted to CUDA's
         // opmath type by the foreach kernel; reproduce that conversion here.
         const double step = metadata.step_metadata.host.step_sizes[
             tensor_index];
@@ -386,7 +383,6 @@ struct RadamExactBody {
             second, g, g, one_minus_beta2);
         values[3][lane] = second;
 
-        // Torch's non-capturable path first builds a low-precision buffer:
         // sqrt(v), add eps, divide by the rectified coefficient, reciprocal,
         // then add the unrectified coefficient.
         math_t buffer = round_to_scalar<scalar_t>(sqrt(second));

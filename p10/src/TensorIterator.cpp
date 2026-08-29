@@ -39,8 +39,6 @@ inline void get_strides_impl(int64_t* strides, const std::vector<OperandInfo>& o
   }
 }
 
-// Broadcasts a shape of size `a_size` against `b_size` (see torch
-// at::infer_size): every dim must be equal or one of them 1; the result takes
 // the non-1 dim.  Taking the non-1 side (rather than the max) is what keeps a
 // 0-sized dimension at 0 when broadcast against a size-1 dim; a max() would
 // inflate it to 1 and make the iterator run over an empty tensor's storage.
@@ -904,7 +902,6 @@ void TensorIteratorBase::compute_shape(const TensorIteratorConfig& config) {
 
     // For now, don't include output tensors when we're resizing outputs.
     // These shapes don't participate in shape computation.
-    // This preserves the legacy behavior where torch.add(..., out=dst) resizes
     // the destination tensor.  If the output tensor is also an input, we'll
     // pick it up later in the operands.
     if (config.resize_outputs_ && op.is_output) continue;
@@ -995,7 +992,6 @@ int TensorIteratorBase::get_dim_to_split() const {
     }
     for (auto& op : operands_) {
       // std::abs is necessary to handle some special cases where we support negative strides
-      // see the CUDA backend of at::flip
       const int64_t extent = (size - 1) * std::abs(op.stride_bytes[dim]);
       if (extent > max_extent) {
         max_extent = extent;

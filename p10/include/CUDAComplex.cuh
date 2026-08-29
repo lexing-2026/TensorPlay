@@ -1,9 +1,7 @@
 // CUDAComplex.cuh -- shared complex-elementwise building blocks for the
 // CUDA backend.  Storage is the standard interleaved (re, im) layout; device
 // math uses thrust::complex<T> (full __device__ overloads for exp/log/pow/
-// trig), reinterpreting the raw buffers exactly like ATen's complex CUDA
 // kernels.  Reduced complexes (ComplexHalf/BComplex32) are intentionally not
-// wired here: torch's own CUDA coverage for chalf is minimal, and every
 // call site rejects them with NotImplementedError next to the real dtypes.
 #pragma once
 
@@ -34,7 +32,6 @@ struct RecipOp {
 inline constexpr float kInvSqrt2f = 0.70710678118654752f;
 inline constexpr double kInvSqrt2 = 0.70710678118654752440;
 
-// ATen weak-scalar rules for tensor-scalar kernels: a wrapped complex scalar
 // keeps an already-complex tensor unchanged and widens a REAL tensor to its
 // own complex width (float64 -> complex128, everything else -> complex64).
 inline DType scalar_result_dtype(DType self_dt, const Scalar& other,
@@ -132,7 +129,6 @@ struct MulOp {
         return a * b;
     }
 };
-// add/sub carry the ATen alpha on the rhs operand.  Callers pass alpha in
 // the opmath complex type (s2c<T>), so the member is complex, not bare T.
 template <typename T>
 struct AddAlphaOp {
@@ -183,7 +179,7 @@ inline void launch_binary(int64_t n, const void* a, const void* b, void* y,
         static_cast<thrust::complex<T>*>(y), f);
 }
 
-// --- binary broadcast (TensorDesc driven, mirrors add_broadcast_kernel) ------
+// --- binary broadcast (TensorDesc driven) -----------------------------------
 #define TP_CPLX_GRIDSTRIDE(i)                                                \
     int64_t i = blockIdx.x * int64_t(blockDim.x) + threadIdx.x;              \
     int64_t tp_cplx_stride = static_cast<int64_t>(blockDim.x) * gridDim.x;   \

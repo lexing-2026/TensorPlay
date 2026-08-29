@@ -1,11 +1,9 @@
 #pragma once
 
-// Lightweight equivalent of ATen/cpu/vec/intrinsics.h.
 //
 // CPU_CAPABILITY_* macros are normally supplied by the build system when a
 // kernel translation unit is compiled for a specific instruction set
 // (e.g. -DCPU_CAPABILITY_AVX2 -DCPU_CAPABILITY=AVX2 -mavx2 -mfma), mirroring
-// PyTorch's native/cpu multi-version compilation. For standalone compilation
 // without those flags, the macros are derived from the compiler's own ISA
 // macros so that e.g. -mavx2 builds automatically get the AVX2 vec layer.
 
@@ -17,10 +15,8 @@
 #endif
 #endif
 
-// Mirror of torch's intrinsics.h: on x86 the full <x86intrin.h> is always
 // included so that vector type declarations (__m256 etc.) are visible in
 // every TU. Intrinsic *functions* are only usable where the ISA is enabled
-// (via build-system flags), matching torch's DEFAULT/AVX2 compilation model;
 // uninstantiated class members in the vec256 headers therefore compile fine
 // under DEFAULT.
 #if defined(__GNUC__) || defined(__clang__)
@@ -56,6 +52,5 @@ inline bool tp_cpu_supports_avx512() {
 #endif
 }
 
-// No-op under normal builds (torch uses this only to silence ubsan on
-// float division by zero); kept for interface parity.
+// float division by zero); kept for interface compatibility.
 #define TP_UBSAN_IGNORE_FLOAT_DIV

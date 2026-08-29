@@ -1,6 +1,5 @@
 #pragma once
 
-// A compact TensorPlay equivalent of ATen's CUDA MultiTensorApply.  Torch's
 // foreach CUDA kernels fuse the tensor list horizontally: one launch walks
 // chunks from many tensors instead of dispatching one elementwise kernel per
 // Tensor.  This header keeps the same chunked metadata model while using
@@ -25,7 +24,6 @@ namespace cuda {
 namespace foreach_mta {
 
 // Keep the metadata conservative enough for CUDA's pre-13 kernel argument
-// limit, but match Torch's block geometry.  The important part here is the
 // ILP=4 loop below: a 512-thread block covers a 64K chunk in 32 iterations
 // instead of 256 scalar iterations with the old 256-thread kernel.
 constexpr int32_t kMaxTensorsPerLaunch = 32;
@@ -137,7 +135,6 @@ struct TensorListMetadata {
     int32_t block_to_tensor[kMaxBlocksPerLaunch]{};
     int32_t block_to_chunk[kMaxBlocksPerLaunch]{};
     // Used only by ScalarList overloads.  Keeping it in the same metadata
-    // object preserves Torch's one-launch-per-batch shape.
     float scalar_values_float[kMaxTensorsPerLaunch]{};
     double scalar_values_double[kMaxTensorsPerLaunch]{};
     int32_t scalar_value_kind = 0;
@@ -169,7 +166,6 @@ __global__ void multi_tensor_kernel(TensorListMetadata<Depth> metadata, Op op) {
     aligned = aligned && is_aligned(output + begin);
 
     if (aligned) {
-        // Match ATen's aligned_vector path.  The vector index is in units of
         // four scalar elements, so each thread performs four contiguous
         // loads/stores and the block needs only 32 loop rounds per chunk.
         alignas(kILP * sizeof(T)) T packed[Depth][kILP];
@@ -492,7 +488,6 @@ template <typename M>
 struct BinaryLerp {
     M weight;
     __device__ M operator()(M* values) const {
-        // Match ATen's numerically stable lerp branch (Lerp.h): for large
         // weights subtract from the end value to avoid cancellation.
         return (weight > M(-0.5) && weight < M(0.5))
             ? values[0] + weight * (values[1] - values[0])

@@ -2,7 +2,6 @@
 
 // TensorPlay's CUDA reduction engine.
 //
-// This is intentionally shaped after PyTorch's gpu_reduce_kernel:
 //   * reduced dimensions are mapped to block.x / block.y;
 //   * warp shuffle handles the intra-warp tree;
 //   * shared memory handles inter-warp reduction;
@@ -161,7 +160,6 @@ __device__ __forceinline__ T reduce_warp_shuffle_down(
 }
 
 // thrust::complex has no intrinsic __shfl_down_sync overload; shuffle the
-// real/imag components separately (ATen does the same for complex reduce).
 __device__ __forceinline__ thrust::complex<float> reduce_warp_shuffle_down(
         thrust::complex<float> value, unsigned mask, int offset) {
     float re = __shfl_down_sync(mask, value.real(), offset);
@@ -397,7 +395,6 @@ inline ReduceConfig make_reduce_config(const TensorIterator& iter) {
 
     if (reduction_on_fastest_dimension && config.num_reduce_dims == 1 &&
         config.input_strides[0] == 1 && config.num_inputs >= 128) {
-        // torch caps reduction vectorization at 4 (memory::can_vectorize_up_to);
         // vec=8 instantiations triple reduce_kernel PTX for negligible gain.
         config.input_vec_size = 4;
         const size_t vector_bytes = sizeof(InputT) * static_cast<size_t>(config.input_vec_size);
@@ -426,7 +423,6 @@ inline ReduceConfig make_reduce_config(const TensorIterator& iter) {
     // enough to trigger the multi-CTA branch below runs with a taller block —
     // 8 warps share one CTA's completion-counter slot and staging partial,
     // cutting same-address atomic traffic and the last-CTA fold length 8x
-    // versus torch's 32-thread block, at identical total thread parallelism.
     // The 16384-element floor guarantees the warp-split below actually
     // engages (input_mult[1] != 0), keeping output_mult clean for the gate.
     if (reduction_on_fastest_dimension && dim1 == 1 && config.num_inputs >= 16384) {
@@ -457,7 +453,6 @@ inline ReduceConfig make_reduce_config(const TensorIterator& iter) {
 
     // The generic TensorIterator path handles the usual case. For a very long
     // reduction with too few outputs, use more CTAs per output, matching the
-    // global-reduction branch in PyTorch's Reduce.cuh (setReduceConfig): the
     // CTA count is std::clamp'd between the SM-balanced target grid and
     // values_per_thread / {min,max}_values_per_thread so the whole machine
     // stays busy while each thread still reduces a useful number of elements.
@@ -466,13 +461,12 @@ inline ReduceConfig make_reduce_config(const TensorIterator& iter) {
     if (reduction_on_fastest_dimension &&
         config.output_mult[0] == 0 && config.output_mult[1] == 0 &&
         config.num_outputs > 0) {
-        // Element-based values per thread, matching torch's values_per_thread()
         // (= div_up(num_inputs, step_input) in elements): num_input_units
         // counts vectorized units, so a unit-based count would under-report
         // by InputVecSize for vectorized loads.
         const int64_t values_per_thread_elems =
             (config.num_inputs + config.step_input - 1) / config.step_input;
-        if (values_per_thread_elems >= 256) {  // torch max_values_per_thread
+        if (values_per_thread_elems >= 256) {
             int device = -1;
             checkCuda(cudaGetDevice(&device), "cudaGetDevice");
             // Geometry comes from the per-device cache below: querying
@@ -485,7 +479,6 @@ inline ReduceConfig make_reduce_config(const TensorIterator& iter) {
             const int blocks_per_sm = std::max(1, properties.max_threads_per_sm /
                                                     config.num_threads);
             const int target_grid = std::max(1, properties.multi_processor_count * blocks_per_sm);
-            // torch Reduce.cuh: ctas1 balances CTAs across SMs (per already
             // scheduled output block), ctas2/ctas3 bound the split so each
             // thread keeps >= min_values_per_thread(16) elements but no more
             // than max_values_per_thread(256).
@@ -494,7 +487,6 @@ inline ReduceConfig make_reduce_config(const TensorIterator& iter) {
             const int64_t ctas_per_output1 = (target_grid + grid_x - 1) / grid_x;
             const int64_t ctas_per_output2 = (values_per_thread_elems + 15) / 16;
             const int64_t ctas_per_output3 = (values_per_thread_elems + 255) / 256;
-            // std::clamp(ctas1, lo=ctas3, hi=ctas2), torch Reduce.cuh L1183.
             int64_t ctas = ctas_per_output1;
             if (ctas < ctas_per_output3) ctas = ctas_per_output3;
             if (ctas > ctas_per_output2) ctas = ctas_per_output2;
@@ -593,7 +585,6 @@ struct ReduceOp {
         return value;
     }
 
-    // torch Reduce.cuh pattern: the vectorized fast path is selected once per
     // thread with loop-invariant state and purely affine addressing, so the
     // multi-dim div/mod offset decomposition never lands inside an unrolled
     // region. Only the rare ragged tail goes through input_offset.
@@ -611,7 +602,6 @@ struct ReduceOp {
         // Branchless fast path: when every unit maps to a full aligned vector
         // (num_inputs divisible by the vector width, unit strides keep vector
         // alignment — host-side config checks guarantee both), the hot loop
-        // needs no per-vector bounds check, matching torch's vectorized
         // thread_reduce loop shape.
         const bool can_vec = InputVecSize > 1 &&
             config.input_strides[0] == 1 && config.vectorize_input;
@@ -689,7 +679,6 @@ struct ReduceOp {
         // Zero the per-output completion counter for THIS launch and publish
         // the unique launch tag before any work: peers later check the tag
         // (once, right before their single atomicAdd), so the counter is
-        // provably zero when the election starts. This replaces torch's
         // per-launch cudaMemsetAsync (a ~1us GPU stream op per reduction)
         // with an in-kernel initialization.
         if (config.global_reduce &&

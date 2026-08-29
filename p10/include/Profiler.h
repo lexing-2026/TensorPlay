@@ -1,12 +1,7 @@
-// Native op-level profiler -- TensorPlay's torch.profiler counterpart.
-//
-// Scope:
-//   * every dispatched op is recorded exactly once, at the below-autograd
+// Profiler scope:
+//   * every dispatched op is recorded exactly once at the below-autograd
 //     redispatch funnel (detail::redispatch_* in TensorRedispatchGenerated.h,
-//     instrumented by tools/codegen/gen_api.py) -- the same granularity
-//     upstream gets from RecordFunction guards around aten dispatch;
-//     composite inner calls therefore show up individually, matching
-//     upstream's CompositeImplicitAutograd behavior;
+//     instrumented by tools/codegen/gen_api.py);
 //   * user annotations (`record_function`) nest naturally as spans;
 //   * the autograd engine emits a "__backward__" span covering each
 //     backward()/grad() execution;
@@ -20,17 +15,15 @@
 //     op->runtime->kernel correlation via CUPTI external correlation ids
 //     (see ProfilerCupti.cpp);
 //   * Python stack sampling runs binding-side (tensorplay/profiler.py);
-//   * export to Chrome Trace JSON (torch's schema) happens Python-side.
 //
 // Performance contract: when inactive the only hot-path cost is one
 // acquire-load of a static atomic bool per op plus (when shape/site capture
 // is requested) one further load each -- the same class of guard as
-// GradMode/InferenceMode checks already emitted around every call.  When
+// GradMode/InferenceMode checks already emitted around every call. When
 // active, recording costs a timestamp pair plus a short critical section.
 //
 // The CUPTI collector is dlopen'd (never a hard link dependency) and only
-// runs during a gpu_trace session; validated against CUDA 12.4 headers on
-// the remote sm_89 box (.remote_build.md).
+// runs during a gpu_trace session.
 
 #pragma once
 
@@ -89,9 +82,8 @@ struct Event {
     static constexpr uint32_t kNoSite = 0xffffffffu;
 };
 
-// Allocator-level memory event (profile_memory sessions).  One per user
-// allocation / user free observed at the caching-allocator boundary -- the
-// same vantage point upstream's MemoryProfiler uses.
+    // Allocator-level memory event (profile_memory sessions). One per user
+    // allocation or user free observed at the caching-allocator boundary.
 struct MemEvent {
     uint64_t ts_ns;
     void* ptr;
@@ -104,7 +96,6 @@ struct MemEvent {
 };
 
 // GPU activity record produced by the CUPTI collector (gpu_trace mode).
-// `kind` selects the record class and mirrors torch's chrome-trace cats:
 //   'k' kernel ('kernel'), 'm' memcpy ('gpu_memcpy'), 's' memset
 //   ('gpu_memset'), 'r' runtime API ('cuda_runtime'), 'd' driver API
 //   ('cuda_driver').
@@ -135,7 +126,6 @@ TENSORPLAY_API extern std::atomic<bool> g_capture_shapes;
 TENSORPLAY_API extern std::atomic<bool> g_capture_sites;
 
 // Begins a session; clears any previously collected events.  Nesting
-// sessions is not supported (matches torch.profiler's outermost-wins).
 TENSORPLAY_API void profiler_start();
 TENSORPLAY_API void profiler_start_with_shapes();
 TENSORPLAY_API void profiler_start_full();  // shapes + python sites
@@ -293,7 +283,7 @@ TENSORPLAY_API void nvtx_span_begin(const char* name);
 TENSORPLAY_API void nvtx_span_end();
 
 // ---- ITT bridge (runtime-loaded libittnotify; VTune/Advisor) ------------
-// Same contract as the NVTX bridge: emit_itt() mirrors task begin/end onto
+// The ITT bridge emits task begin/end events onto
 // the "tensorplay" domain; silent no-op without the library.
 TENSORPLAY_API extern std::atomic<bool> g_emit_itt;
 TENSORPLAY_API bool itt_available();

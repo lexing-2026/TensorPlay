@@ -9,7 +9,6 @@ namespace tensorplay {
 
 class Tensor;
 
-// Matches c10::default_rng_seed_val: the seed torch.Generator() starts from.
 constexpr uint64_t default_rng_seed_val = 67280421310721ULL;
 
 class P10_API Generator {
@@ -37,7 +36,6 @@ public:
     void set_next_double_normal_sample(std::optional<double> randn);
 
     // Serializes the full engine state to a CPU UInt8 tensor using the same
-    // POD layout as torch.get_rng_state (5056 bytes).
     Tensor get_state() const;
     void set_state(const Tensor& new_state);
 
