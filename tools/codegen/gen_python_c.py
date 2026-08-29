@@ -1,5 +1,4 @@
-"""CPython C-API fast-path generator -- upstream gen_python_functions
-alignment slice 1.
+"""Generate CPython C-API fast-path wrappers.
 
 Per op emits one ``METH_FASTCALL | METH_KEYWORDS`` function that parses
 positional/keyword args against the schema, unpacks through the
@@ -7,8 +6,8 @@ positional/keyword args against the schema, unpacks through the
 packs the result.  pybind11 overload dispatch is bypassed; the existing
 binding surface stays untouched.
 
-Types without a bridge mapping are skipped and counted, mirroring
-upstream's "unsupported signature" fallthrough.
+Types without a bridge mapping are skipped and counted; unsupported
+signatures therefore remain on the fallback binding surface.
 """
 
 from __future__ import annotations
@@ -101,8 +100,8 @@ _BRIDGE = {
     "std::optional<Device>": "tpx_py_opt_device({n})",
 }
 
-# C++ argument type -> tpx_py_type_kind byte (see CPythonBridge.h).  Mirrors
-# _BRIDGE's key set; entries absent here disable the eager check for ops
+# C++ argument type -> tpx_py_type_kind byte (see CPythonBridge.h).  The map
+# uses the same key set as _BRIDGE; entries absent here disable the eager check
 # using them rather than changing which ops get FASTCALL bindings.
 _KIND_CONST = {
     "const Tensor&": "TPK_TENSOR",
@@ -256,8 +255,7 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
     # GIL at binding entry, before the GIL-releasing invoke.  The helper
     # itself re-checks the capture flags, so inactive cost is one load.
     site_hook = "tensorplay::python::tpx_prof_capture_site();\n        "
-    # Upstream gen_python_functions wraps every dispatch in an unconditional
-    # `gil_scoped_release`; mirror that with the RAII equivalent so kernels
+    # Wrap every dispatch in an unconditional GIL release so kernels
     # run multithreaded.  The lambda restores the GIL before the result is
     # wrapped (all Python C-API stays under the GIL).
     if kind == "void":
@@ -311,8 +309,8 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
         f"        PyObject* slots[{nargs}];",
     ]
 
-    # Upstream PythonArgParser folds surplus positionals into a trailing
-    # IntList parameter (t.view(2, 3) == t.view([2, 3])).  Replicate that:
+    # Fold surplus positionals into a trailing IntList parameter
+    # (t.view(2, 3) == t.view([2, 3])).  This keeps the public call form:
     # when the last positional parameter is list-typed, pack args[P-1..]
     # into a tuple before parsing instead of rejecting extra positionals.
     _pos = [a for a in f.args[(1 if is_method else 0):] if not a.kwonly]
@@ -385,7 +383,7 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
             body.append("        }")
     out.extend(body)
 
-    # Eager type validation with upstream error wording: one static kind
+    # Eager type validation with one static kind
     # table per overload, consumed by tpx_py_check_types right after slot
     # merging.  Unknown argument types simply skip the check (casters stay
     # authoritative); this never changes operator support.
@@ -486,7 +484,7 @@ def _gen_python_capi(ctx: CodegenContext) -> None:
         # Multi-overload names dispatch by trying candidates in declaration
         # order; only argument-shape mismatches (std::invalid_argument from
         # parse/unpack) fall through -- kernel failures convert immediately,
-        # like upstream's PythonArgParser.
+        # used by the argument parser.
         if multi:
             doc = " | ".join(docs)
             probes = [_probe_info(f, variant) for f in fs]

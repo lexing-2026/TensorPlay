@@ -1,12 +1,12 @@
-"""InplaceOrView generator -- upstream tools/autograd analog (skeleton).
+"""Generate view and in-place dispatch wrappers.
 
 InplaceOrView / View-replay.  This module owns the third slice: for every
 canonical *view* op we declare a replay entry point that re-dispatches the
 view on a version-stripped alias, and for every in-place variant a wrapper
 that bumps versions after mutation.  Bodies are emitted as thin forwarders
-to the already-generated TensorMethods symbols so the dispatcher graph
-matches upstream's shape; deep semantics land when p10 gains
-`Tensor::_version` bumping hooks.
+to the generated TensorMethods symbols so the dispatcher graph remains
+consistent; deeper version tracking is enabled when the tensor implementation
+provides the required hooks.
 """
 
 from __future__ import annotations

@@ -1,7 +1,6 @@
-"""Derivatives loading, expression AST, and backward-node generation.
+"""Load derivative formulas and generate backward-node metadata.
 
-
-  ``- name: <schema>`` plus one gradient formula per differentiable input /
+The input contains a schema name plus one gradient formula per differentiable input /
   output) into typed objects.
 * Gradient formulas are compiled through a real expression AST (tokenizer +
   precedence-climbing parser + emitter) instead of regex rewriting.
@@ -10,9 +9,8 @@
   every call site agree by construction.
 * Ops whose backward cannot be expressed in the formula DSL (list-mapping
   backwards like ``cat``/``stack``/``roll``) are declared in
-  ``MANUAL_DERIVATIVES`` -- the same information upstream records as
-  hand-written ``derivatives.yaml`` entries -- instead of being special-cased
-  inline in the orchestrator.
+  ``MANUAL_DERIVATIVES`` instead of being special-cased inline in the
+  orchestrator.
 """
 
 from __future__ import annotations
@@ -26,8 +24,8 @@ def _normalize_comparisons(formula: str) -> str:
 
     formulas (they produce bool masks); TensorPlay's expression DSL has no
     infix comparisons, so translate them to the dispatched gt/lt/... ops.
-    Handles both parenthesized groups and bare `a > b` operands (upstream
-    clamp_min/clamp_max style).
+    Handles both parenthesized groups and bare `a > b` operands used by
+    clamp_min/clamp_max formulas.
     """
     out = formula
     for _ in range(10):
@@ -277,7 +275,7 @@ BACKWARD_HELPERS = {
 }
 
 # Tensor-returning methods that the DSL lowers to tpx::ops free functions,
-# matching upstream's treatment of view/shape primitives in derivatives.
+# used for view/shape primitives in derivatives.
 TENSOR_METHODS = {
     "neg": "neg", "t": "t", "mm": "mm", "matmul": "matmul",
     "transpose": "transpose", "squeeze": "squeeze", "unsqueeze": "unsqueeze",
@@ -462,7 +460,7 @@ class OpDerivatives:
 
 
 # Backwards that cannot be written in the formula DSL because they map over a
-# tensor list.  Declared here (upstream keeps equivalent hand-written nodes);
+# tensor list.  Declared here as hand-written nodes;
 # `saved` lists forward inputs stored by the manual node in ManualNodes.h.
 MANUAL_DERIVATIVES: dict[str, dict] = {
     "block_diag": {"saved": ["tensors"]},
@@ -665,7 +663,7 @@ def generate_autograd_nodes(derivatives: dict[str, OpDerivatives]) -> str:
 
         # Common-subexpression elimination: identical Call sub-expressions
         # shared across gradient slots are evaluated once (generalizes
-        # upstream's hand-written `shared` blocks, e.g. batch_norm's
+        # hand-written `shared` blocks, e.g. batch_norm's
         # three-way backward kernel call).
         cse_temps: dict[str, str] = {}
         call_counts: dict[str, int] = {}

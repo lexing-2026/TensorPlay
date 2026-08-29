@@ -241,7 +241,7 @@ std::vector<Tensor> Graph::execute(const std::vector<Tensor>& inputs) const {
                 // Clone the logical NHWC view, then reinterpret its
                 // contiguous storage as logical NCHW with channels-last
                 // strides.  This is the same one-copy reorder emitted by
-                // Inductor before a convolution when the user input is
+                // before a convolution when the user input is
                 // still contiguous NCHW.
                 const std::vector<int64_t> physical_shape{n, h, w, c};
                 const std::vector<int64_t> physical_strides{
