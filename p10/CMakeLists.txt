@@ -98,6 +98,7 @@ if(USE_CUDA)
         src/backend/cuda/UpsampleKernels.cu
         src/backend/cuda/LinearAlgebraKernels.cu
         src/backend/cuda/LinalgKernels.cu
+        src/backend/cuda/LinalgSVD.cu
         src/backend/cuda/CudaBlasGemm.cpp
         src/backend/cuda/ActivationKernels.cu
         src/backend/cuda/NormalizationKernels.cu
