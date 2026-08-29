@@ -1,5 +1,4 @@
 # mypy: allow-untyped-defs
-r"""NVIDIA Tools Extension (NVTX) tracing, mirroring :mod:`torch.cuda.nvtx`."""
 
 from contextlib import contextmanager
 

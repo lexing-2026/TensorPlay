@@ -1,5 +1,5 @@
 # mypy: allow-untyped-defs
-r"""jiterator-based elementwise kernels, mirroring :mod:`torch.cuda.jiterator`.
+r"""
 
 Requires NVRTC-backed jiterator support this TensorPlay build does not
 expose; instantiation raises.

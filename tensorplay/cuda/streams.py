@@ -1,9 +1,9 @@
 # mypy: allow-untyped-defs
 # pylint: disable=useless-parent-delegation
-r"""CUDA stream and event wrappers, mirroring :mod:`torch.cuda.streams`.
+r"""CUDA stream and event wrappers.
 
 The underlying objects are ``tensorplay._C._cuda._CudaStream`` /
-``_CudaEvent``; this module adds the torch-compatible Python surface on top.
+``tensorplay._C._cuda._CudaEvent`` when native CUDA support is available.
 """
 
 from __future__ import annotations

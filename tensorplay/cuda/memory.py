@@ -1,10 +1,9 @@
 # mypy: allow-untyped-defs
-r"""Device memory management, mirroring :mod:`torch.cuda.memory`.
+r"""CUDA memory allocation and accounting helpers.
 
 The native runtime currently exposes the ``allocated``/``reserved``,
 current/peak counters and their peak resets. The remaining statistics of the
-torch matrix are reported as zero, mirroring torch's own behaviour under
-allocator backends where "some stats are not meaningful". Snapshot/history
+allocator backends are unavailable. Snapshot/history
 APIs require allocator instrumentation this build does not expose.
 """
 
@@ -85,7 +84,6 @@ def memory_stats_as_nested_dict(device: Any = None) -> dict[str, Any]:
     The native allocator reports the fragmentation-aware matrix directly
     (segments, free-block histogram, pending cross-stream blocks, graph
     pools, capture state); it is exposed under ``"allocator"`` alongside the
-    torch-compatible pool layout.
     """
     if not is_initialized():
         return {}
@@ -139,7 +137,6 @@ def memory_stats(device: Any = None) -> dict[str, Any]:
     r"""Return a dictionary of CUDA memory allocator statistics for a given device.
 
     The return value of this function is a dictionary of statistics, each of
-    which is a non-negative integer. See :func:`torch.cuda.memory_stats` for
     the full key layout; keys that are not tracked by this TensorPlay build
     are always reported as zero.
 
@@ -164,8 +161,6 @@ def memory_stats(device: Any = None) -> dict[str, Any]:
 
     out = collections.OrderedDict(result)
     # The fragmentation-aware native matrix stays addressable as a
-    # sub-dictionary (torch exposes it only through mem_get_info-free
-    # helpers); dotted torch-compatible keys above remain untouched.
     allocator = stats.get("allocator")
     if isinstance(allocator, dict):
         out["allocator"] = collections.OrderedDict(allocator)
@@ -529,14 +524,15 @@ def caching_allocator_enable(value: bool = True) -> None:
 @contextlib.contextmanager
 def caching_allocator_disabled():
     r"""Context manager that temporarily disables the CUDA caching allocator."""
-    # The allocator cannot be disabled in this build; provided for API parity.
+    # The allocator cannot be disabled in this build; retain the context API.
     yield
 
 
 def set_per_process_memory_fraction(fraction, device: Any = None) -> None:
     r"""Set memory fraction for a process.
 
-    Not enforced by this TensorPlay build; validated for signature parity.
+    Not enforced by this TensorPlay build; the signature is retained for API
+    compatibility.
 
     Args:
         fraction(float): Range: 0~1. Allowed memory equals total_memory * fraction.

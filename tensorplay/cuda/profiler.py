@@ -1,5 +1,4 @@
 # mypy: allow-untyped-defs
-r"""CUDA profiler control, mirroring :mod:`torch.cuda.profiler`."""
 
 import contextlib
 
@@ -40,7 +39,6 @@ def profile():
 
     Context Manager to enabling profile collection by the active profiling tool from CUDA backend.
     Example:
-        >>> # xdoctest: +REQUIRES(env:TORCH_DOCTEST_CUDA)
         >>> import tensorplay as tp
         >>> model = tp.nn.Linear(20, 30).cuda()
         >>> inputs = tp.randn(128, 20).cuda()
