@@ -76,7 +76,7 @@ class TestStatisticalOps(unittest.TestCase):
             self.assertTensorClose(tp_tensor.min(), data.min())
             
             if len(shape) > 1:
-                # Wait, let's check native_functions.yaml for max.dim return type.
+                # Check the schema for the max.dim return type.
                 # - func: max.dim(Tensor self, int64_t[] dim, bool keepdim=false) -> Tensor
                 
                 # So we should compare with data.amax(dim=...) or data.max(dim=...).values

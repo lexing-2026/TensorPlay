@@ -224,8 +224,8 @@ class NativeBridgeTest(unittest.TestCase):
         self.assertTrue(has("bridgens::probe"))
         self.assertFalse(has("bridgens::missing_op"))
 
-    def test_native_mirror_outlives_python_kernels(self):
-        # the Python-side kernel table must not corrupt the native mirror;
+    def test_native_table_outlives_python_kernels(self):
+        # the Python-side kernel table must not corrupt the native table;
         # run_native keeps dispatching the registered callable.
         @library.custom_op("bridgens::bare", mutates_args=())
         def bare(x):
@@ -374,7 +374,7 @@ class WrapTritonTest(unittest.TestCase):
             self.fail("expected GraphCaptureError for raw triton launch")
 
 
-class CustomOpSignatureParityTest(unittest.TestCase):
+class CustomOpSignatureBehaviorTest(unittest.TestCase):
 
     def test_fn_positional(self):
         def body(x):
