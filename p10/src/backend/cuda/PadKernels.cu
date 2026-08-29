@@ -32,7 +32,7 @@ __device__ inline long long pad_map_coord(long long q, long long left, long long
                                           int mode) {
     long long src = q - left;
     if (src >= 0 && src < size) return src;
-    if (mode == 0) {          // reflect: single mirror (pad < size enforced host-side)
+    if (mode == 0) {          // reflect: single reflected index (pad < size enforced host-side)
         if (src < 0) src = -src;
         else src = 2 * size - 2 - src;
         return src;
