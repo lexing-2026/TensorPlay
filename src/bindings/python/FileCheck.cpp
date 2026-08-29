@@ -2,8 +2,7 @@
 
 #include "FileCheck.h"
 
-namespace tensorplay {
-namespace python {
+using tensorplay::FileCheck;
 
 void init_filecheck(py::module_& m) {
     py::class_<FileCheck>(m, "FileCheck")
@@ -28,6 +27,3 @@ void init_filecheck(py::module_& m) {
              py::return_value_policy::reference_internal)
         .def("run", &FileCheck::run, py::arg("test_string"));
 }
-
-} // namespace python
-} // namespace tensorplay

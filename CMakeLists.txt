@@ -2,7 +2,6 @@ cmake_minimum_required(VERSION 3.18)
 project(TensorPlay LANGUAGES CXX)
 
 # EnvVarForwarding reads os.environ via Python (see module header), so the
-# interpreter must be resolved first -- same ordering constraint as pytorch's
 # CMakeLists.txt. Forwarded BUILD_*/USE_*/CMAKE_* env vars become cache
 # variables before the USE_CUDA auto-detection below consumes them.
 find_package(Python COMPONENTS Interpreter REQUIRED)
@@ -225,7 +224,6 @@ if(WIN32)
         # /Gm-: Disable minimal rebuild
         set(MSVC_COMMON_FLAGS /EHsc /wd4251 /wd4275 /wd4819 /MP /Gm-)
         # M_PI and friends are gated behind this define on MSVC
-        # (same treatment as upstream PyTorch's Windows builds).
         add_compile_definitions($<$<COMPILE_LANGUAGE:CXX>:_USE_MATH_DEFINES>)
         set(MSVC_REL_FLAGS /O2 /arch:AVX2)
         
@@ -288,7 +286,6 @@ set(GEN_TPX_REDISPATCH_H "${GEN_INCLUDE_DIR}/TensorRedispatchGenerated.h")
 set(TP_PACKAGE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tensorplay")
 
 # Generate tensorplay/version.py from version.txt + git metadata
-# (mirrors pytorch building torch/version.py via generate_torch_version.py)
 set(TP_VERSION_PY "${TP_PACKAGE_DIR}/version.py")
 add_custom_command(
     OUTPUT ${TP_VERSION_PY}
@@ -364,13 +361,11 @@ set(BLAS_COMPILE_OPTIONS "")
 if(USE_BLAS)
     # Default MKL; when it is absent the detector falls through to OpenBLAS
     # (system, then the vendored copy below) so wheels never ship the
-    # naive-GEMM fallback -- torch bundles real BLAS the same way.
     set(BLAS_PROVIDER "MKL" CACHE STRING "BLAS provider (MKL/OpenBLAS)")
     set_property(CACHE BLAS_PROVIDER PROPERTY STRINGS "MKL" "OpenBLAS")
 
     if(BLAS_PROVIDER STREQUAL "MKL")
         # 1. Try MKL Config mode (Best for OneAPI)
-        # torch's recipe: GNU-OpenMP-threaded MKL (mkl_gnu_thread) linked
         # statically into our .so -- shares the libgomp runtime with our own
         # parallel_for pool, so no second threading runtime is loaded.
         set(MKL_THREADING "gnu_thread")
@@ -494,7 +489,7 @@ if(USE_BLAS)
     
     # Last resort for CI runners / clean machines: build the vendored OpenBLAS
     # (C-only BLAS, no LAPACK/Fortran) as static PIC and link it in, so shipped
-    # wheels never fall back to gemm_naive.  Mirrors how oneDNN is vendored.
+    # wheels never fall back to gemm_naive.  Same pattern as the oneDNN vendoring.
     if(NOT BLAS_FOUND AND NOT BLAS_PROVIDER STREQUAL "None"
        AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/OpenBLAS-0.3.29.tar.gz")
         message(STATUS "Configuring vendored OpenBLAS 0.3.29 (static, C-only)...")
@@ -852,7 +847,6 @@ set_source_files_properties(
 )
 
 option(BUILD_SHARED_LIBS "Build shared libraries" ON)
-# Mirror upstream PyTorch's Windows layout: all internal libraries are
 # statically linked into the single Python extension (_C.pyd).  This avoids
 # needing __declspec(dllexport) annotations on every p10 symbol that crosses
 # the DLL boundary, which the codebase does not carry.
@@ -870,7 +864,6 @@ add_subdirectory(tpx)
 # Add stax (Optional)
 add_subdirectory(stax)
 
-# Conversion surface shared by every extension -- the libtorch_python analog.
 # ONE shared copy keeps the pybind11 caster substrate and the wrap-identity
 # cache registered from a single module boundary: _C registers the Tensor
 # type through it at import time, and user op modules (add_tensorplay_op)
@@ -897,7 +890,6 @@ pybind11_add_module(_C
     src/bindings/python/Size.cpp
     src/bindings/python/Generator.cpp
     src/bindings/python/Autograd.cpp
-    src/bindings/python/FileCheck.cpp
     src/bindings/python/autocast_mode.cpp
     src/bindings/python/Ops.cpp
     src/bindings/python/Tensor.cpp
@@ -905,6 +897,7 @@ pybind11_add_module(_C
     src/bindings/python/Parallel.cpp
     src/bindings/python/Distributed.cpp
     src/bindings/python/CudaGraph.cpp
+    src/bindings/python/FileCheck.cpp
 )
 set_target_properties(_C PROPERTIES UNITY_BUILD ON)
 if(NOT WIN32)
