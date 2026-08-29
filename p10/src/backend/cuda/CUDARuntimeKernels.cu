@@ -9,7 +9,6 @@ namespace {
 __global__ void sleepKernel(uint64_t cycles) {
     const uint64_t start = clock64();
     while (clock64() - start < cycles) {
-        // Intentional busy wait, matching torch.cuda._sleep's testing utility.
     }
 }
 

@@ -166,7 +166,6 @@ Tensor& zero_inplace_kernel(Tensor& self) {
     return fill_kernel(self, 0);
 }
 
-// --- Range / lattice factory kernels (torch-aligned) ---
 
 template <typename T>
 __global__ void arange_fill_impl(int64_t n, double start, double step, T* out) {
@@ -236,7 +235,6 @@ Tensor arange_start_step_cuda(Scalar start, Scalar end, Scalar step,
         }
     }
 
-    // Torch parity: reject unsupported dtypes even for empty results
     // (upstream dispatches over AT_DISPATCH_ALL_TYPES_AND2(Half, BFloat16)).
     const bool arange_dtype_supported =
         dtype == DType::Float32 || dtype == DType::Float64 ||
@@ -298,7 +296,6 @@ Tensor linspace_cuda(Scalar start, Scalar end, int64_t steps,
 
     double s = start.toDouble();
     double e = end.toDouble();
-    // torch.linspace(x, y, 1) == [x]; step is irrelevant when steps == 1.
     double step = (steps == 1) ? 0.0 : (e - s) / (steps - 1);
 
     int threads = 256;
@@ -334,7 +331,6 @@ Tensor logspace_cuda(Scalar start, Scalar end, int64_t steps, double base,
 
     double s = start.toDouble();
     double e = end.toDouble();
-    // torch.logspace(x, y, 1) == [base**x]; step is irrelevant when steps == 1.
     double step = (steps == 1) ? 0.0 : (e - s) / (steps - 1);
 
     int threads = 256;

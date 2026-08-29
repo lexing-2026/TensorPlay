@@ -31,8 +31,6 @@ namespace cuda {
     } \
   } while (0)
 
-// ATen alignment: scalars are converted to the opmath type of T so reduced
-// floating types (Half/BFloat16) receive float32 scalars, matching aten
 // native/cuda binary kernels.
 template <typename T> struct BinaryOpMath { using type = T; };
 template <> struct BinaryOpMath<tensorplay::Half> { using type = float; };
@@ -133,7 +131,6 @@ static void run_cplx_div_scalar(Tensor& x, const Scalar& other, Tensor& y) {
     CUDA_CHECK(cudaGetLastError());
 }
 
-// Grid-stride wrapper so any launch config is correct (ATen elementwise style)
 #define TP_CUDA_GRIDSTRIDE(i) \
     int64_t i = blockIdx.x * blockDim.x + threadIdx.x; \
     int64_t tp_stride = static_cast<int64_t>(blockDim.x) * gridDim.x; \
@@ -311,9 +308,7 @@ __global__ void div_scalar_kernel_cuda_impl(int64_t n, const T* a, typename Bina
 }
 
 // --- Vectorized same-shape fast path ---
-// ATen alignment: contiguous same-numel operands address elements identically
 // (get_offset == identity), so the general broadcast machinery is skipped in
-// favor of 4-wide packed loads, mirroring ATen's vectorized_elementwise_kernel.
 
 template <typename T, int VecSize>
 struct alignas(VecSize * sizeof(T)) TPVecPack { T v[VecSize]; };
@@ -519,7 +514,6 @@ __global__ void add_relu_same_shape_kernel(
     }
 }
 
-// TorchInductor's pointwise epilogue fusion writes relu(add(...)) directly
 // to the final output, including when the add operands broadcast.
 __global__ void add_relu_broadcast_kernel(
     int64_t n,
@@ -597,10 +591,17 @@ Tensor& add_inplace_kernel(Tensor& self, const Tensor& other, Scalar alpha) {
     }
     int64_t n = self.numel();
     if (n == 0) return self;
-    dim3 grid, block; get_grid_block(n, grid, block);
-    
+
     // For inplace, we cast other to self.dtype()
     Tensor b = (other.dtype() == self.dtype()) ? other : other.to(self.dtype());
+
+    // the out-of-place add); the broadcast machinery below is only needed
+    // when shapes/strides actually differ.
+    if (try_binary_vectorized(n, self, b, self, alpha, BinaryAddVecOp{})) {
+        return self;
+    }
+
+    dim3 grid, block; get_grid_block(n, grid, block);
 
     TensorDesc a_desc = make_desc(self, self.dim());
     TensorDesc b_desc = make_desc(b, self.dim());
@@ -697,9 +698,14 @@ Tensor sub_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
 Tensor& sub_inplace_kernel(Tensor& self, const Tensor& other, Scalar alpha) {
     int64_t n = self.numel();
     if (n == 0) return self;
-    dim3 grid, block; get_grid_block(n, grid, block);
-    
+
     Tensor b = (other.dtype() == self.dtype()) ? other : other.to(self.dtype());
+
+    if (try_binary_vectorized(n, self, b, self, alpha, BinarySubVecOp{})) {
+        return self;
+    }
+
+    dim3 grid, block; get_grid_block(n, grid, block);
 
     TensorDesc a_desc = make_desc(self, self.dim());
     TensorDesc b_desc = make_desc(b, self.dim());
@@ -794,9 +800,14 @@ Tensor mul_kernel(const Tensor& self, const Tensor& other) {
 Tensor& mul_inplace_kernel(Tensor& self, const Tensor& other) {
     int64_t n = self.numel();
     if (n == 0) return self;
-    dim3 grid, block; get_grid_block(n, grid, block);
-    
+
     Tensor b = (other.dtype() == self.dtype()) ? other : other.to(self.dtype());
+
+    if (try_binary_vectorized(n, self, b, self, Scalar(1), BinaryMulVecOp{})) {
+        return self;
+    }
+
+    dim3 grid, block; get_grid_block(n, grid, block);
 
     TensorDesc a_desc = make_desc(self, self.dim());
     TensorDesc b_desc = make_desc(b, self.dim());
@@ -924,14 +935,18 @@ Tensor div_kernel(const Tensor& self, const Tensor& other) {
 Tensor& div_inplace_kernel(Tensor& self, const Tensor& other) {
     int64_t n = self.numel();
     if (n == 0) return self;
-    dim3 grid, block; get_grid_block(n, grid, block);
-    
+
     // Inplace div might change dtype if self is int (e.g. 5/2 = 2 or 2.5?)
-    // In PyTorch, in-place div on int tensor performs floor division or cast?
     // "RuntimeError: result type Float can't be cast to the desired output type Long" usually.
     // For now, let's assume we do standard div and cast back.
-    
+
     Tensor b = (other.dtype() == self.dtype()) ? other : other.to(self.dtype());
+
+    if (try_binary_vectorized(n, self, b, self, Scalar(1), BinaryDivVecOp{})) {
+        return self;
+    }
+
+    dim3 grid, block; get_grid_block(n, grid, block);
 
     TensorDesc a_desc = make_desc(self, self.dim());
     TensorDesc b_desc = make_desc(b, self.dim());
@@ -1220,7 +1235,6 @@ Tensor& mul_scalar_inplace_kernel(Tensor& self, Scalar other) {
 Tensor div_scalar_kernel(const Tensor& self, Scalar other) {
     DType result_dtype = self.dtype();
     // True division promotes integral tensors to Float32 (ComplexFloat for a
-    // wrapped complex divisor), preserving floating widths like torch.
     if (!isFloatingOrComplexType(result_dtype)) {
         result_dtype = other.isComplex() ? DType::ComplexFloat : DType::Float32;
     } else if (!isComplexType(result_dtype) && other.isComplex()) {
@@ -1270,7 +1284,6 @@ Tensor& div_scalar_inplace_kernel(Tensor& self, Scalar other) {
     }
     
     // Inplace division on integer tensor?
-    // PyTorch: "RuntimeError: result type Float can't be cast to the desired output type Long"
     // Unless floor_divide.
     // Here we implement standard C++ division which for int is floor/trunc.
     // If float, it's float div.

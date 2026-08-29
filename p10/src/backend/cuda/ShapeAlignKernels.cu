@@ -1,4 +1,3 @@
-// Shape & view alignment kernels -- CUDA side of the torch native-parity
 // batch (see cpu/ShapeAlignKernels.cpp for the composite commentary).
 //
 // The device-generic composites of this batch are registered once under the
@@ -6,7 +5,6 @@
 // CompositeExplicitAutograd mapping) and are served to CUDA tensors by the
 // dispatcher's composite fallthrough.  The only op with real per-device code
 // is repeat(): a single-pass index-math gather mirroring upstream's
-// unfold + copy_ materialization (ATen TensorShape.cpp repeat()), registered
 // here as a per-backend override -- the same pattern upstream uses for MPS
 // (native_functions.yaml: MPS: repeat_mps).
 
@@ -76,7 +74,6 @@ Tensor repeat_cuda(const Tensor& self, const std::vector<int64_t>& repeats) {
         target[i] = padded[i] * repeats[i];
     }
     // Negative repeats surface through the output allocation exactly like
-    // upstream (at::empty -> check_size_nonnegative, EmptyTensor.h).
     for (const int64_t x : target) {
         if (x < 0) {
             std::string sizes = "[";
@@ -135,7 +132,6 @@ Tensor repeat_cuda(const Tensor& self, const std::vector<int64_t>& repeats) {
 // Composite shapeops kernels (expand/stack/split/atleast/fill/equal/allclose
 // families) are registered ONCE under the backend-neutral Composite key from
 // p10/src/RegisterComposites.cpp -- TensorPlay's analog of the generated
-// build/aten/src/ATen/RegisterCompositeExplicitAutograd.cpp; the dispatcher
 // serves them to every dense backend until overridden.  This TU only carries
 // repeat(), whose gather is real device code -- the same per-backend override
 // pattern upstream uses for MPS (native_functions.yaml: MPS: repeat_mps).

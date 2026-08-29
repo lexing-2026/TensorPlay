@@ -1,21 +1,12 @@
 // Upsampling CUDA kernels.
 //
-// Direct port of the ATen frame kernels; each site cites its source:
-//   aten/src/ATen/native/cuda/UpSampleNearest1d.cu
-//   aten/src/ATen/native/cuda/UpSampleNearest2d.cu
 //     upsample_nearest2d_out_frame / upsample_nearest2d_backward_out_frame
-//   aten/src/ATen/native/cuda/UpSampleNearest3d.cu
-//   aten/src/ATen/native/cuda/UpSampleLinear1d.cu
-//   aten/src/ATen/native/cuda/UpSampleBilinear2d.cu
 //     upsample_bilinear2d_out_frame / upsample_bilinear2d_backward_out_frame
-//   aten/src/ATen/native/cuda/UpSampleBicubic2d.cu
 //     upsample_bicubic2d_out_frame / upsample_bicubic2d_backward_out_frame
-//   aten/src/ATen/native/cuda/UpSampleTrilinear3d.cu
 //   and UpSample.h / UpSample.cuh for the shared index helpers (the same
 //   helpers are ported in backend/cpu/UpsampleKernels.cpp).
 //
 // Kernels operate on contiguous NCT(D)HW tensors and support Float32/Float64,
-// matching the CPU dispatch.  Scatter backwards use atomicAdd like ATen
 // ("Nondeterministic because of atomicAdd usage", UpSampleBicubic2d.cu).
 
 #include "Tensor.h"
@@ -38,7 +29,7 @@ namespace cuda {
 namespace {
 
 // ---------------------------------------------------------------------------
-// UpSample.h helpers (mirrors backend/cpu/UpsampleKernels.cpp)
+// Scaling and index helpers.
 // ---------------------------------------------------------------------------
 
 inline float compute_scales_value_h(const std::optional<double>& scale, int64_t input_size, int64_t output_size) {
@@ -47,7 +38,6 @@ inline float compute_scales_value_h(const std::optional<double>& scale, int64_t 
         : static_cast<float>(static_cast<double>(input_size) / output_size);
 }
 
-// ATen UpSample.cuh compute_scales_value_backwards: nearest-backward index
 // math wants the output/input ratio, and an explicit scale_factor is used
 // as-is (not inverted like in the forward).
 inline float compute_scales_value_backwards_h(const std::optional<double>& scale,
@@ -139,7 +129,6 @@ inline void launch_dims(int64_t total, dim3& block, dim3& grid) {
 } // anonymous namespace
 
 // ===========================================================================
-// Nearest forwards — ATen UpSampleNearest{1d,2d,3d}.cu *_out_frame
 // ===========================================================================
 
 template <typename scalar_t>
@@ -168,7 +157,6 @@ __global__ void upsample_nearest2d_out_frame(
     const int64_t h2 = (index / width2) % height2;
     const int64_t n_c = index / (height2 * width2);
 
-    // ATen: size equality fast path, else nn index fn
     const int h1 = height1 == height2 ? static_cast<int>(h2)
                                       : nearest_neighbor_compute_source_index(height_scale, static_cast<int>(h2), static_cast<int>(height1));
     const int w1 = width1 == width2 ? static_cast<int>(w2)
@@ -202,7 +190,6 @@ __global__ void upsample_nearest3d_out_frame(
 }
 
 // ===========================================================================
-// Nearest backwards — ATen UpSampleNearest{1d,2d,3d}.cu *_backward_out_frame
 // (gather formulation over input pixels; no atomics needed)
 // ===========================================================================
 
@@ -297,7 +284,6 @@ __global__ void upsample_nearest3d_backward_out_frame(
 }
 
 // ===========================================================================
-// Linear forwards — ATen UpSampleLinear1d.cu / UpSampleBilinear2d.cu /
 // UpSampleTrilinear3d.cu *_out_frame
 // ===========================================================================
 
@@ -313,7 +299,6 @@ __global__ void upsample_bilinear2d_out_frame(
     const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= num_kernels) return;
 
-    // ATen UpSampleBilinear2d.cu upsample_bilinear2d_out_frame
     const int64_t w2 = index % width2;
     const int64_t h2 = index / width2;
 
@@ -356,7 +341,6 @@ __global__ void upsample_trilinear3d_out_frame(
     const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= num_kernels) return;
 
-    // ATen UpSampleTrilinear3d.cu upsample_trilinear3d_out_frame
     const int64_t w2 = index % width2;
     const int64_t h2 = (index / width2) % height2;
     const int64_t t2 = index / (height2 * width2);
@@ -411,7 +395,6 @@ __global__ void upsample_linear1d_out_frame(
     const int64_t width1, const int64_t width2) {
     const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= num_kernels) return;
-    // ATen UpSampleLinear1d.cu upsample_linear1d_out_frame
     const int64_t w2 = index;
     const accscalar_t w1r = area_pixel_compute_source_index(rwidth, w2, align_corners, false);
     const int64_t w1 = static_cast<int64_t>(w1r);
@@ -429,7 +412,6 @@ __global__ void upsample_linear1d_out_frame(
 }
 
 // ===========================================================================
-// Bicubic forward — ATen UpSampleBicubic2d.cu upsample_bicubic2d_out_frame
 // ===========================================================================
 
 template <typename accscalar_t, typename scalar_t>
@@ -466,7 +448,6 @@ __global__ void upsample_bicubic2d_out_frame(
     const accscalar_t t_y = real_y - static_cast<accscalar_t>(in_y);
 
     auto get_value_bounded = [&](int64_t n, int64_t c, int64_t y, int64_t x) -> scalar_t {
-        // ATen UpSample.cuh upsample_get_value_bounded
         const int64_t access_y = max(min(y, input_height - 1), static_cast<int64_t>(0));
         const int64_t access_x = max(min(x, input_width - 1), static_cast<int64_t>(0));
         return idata[(n * channels + c) * input_height * input_width + access_y * input_width + access_x];
@@ -490,7 +471,6 @@ __global__ void upsample_bicubic2d_out_frame(
 }
 
 // ===========================================================================
-// Scatter backwards (linear/bicubic/trilinear) — ATen frame kernels with
 #// atomicAdd accumulation ("Nondeterministic because of atomicAdd usage").
 // ===========================================================================
 
@@ -506,7 +486,6 @@ __global__ void upsample_bilinear2d_backward_out_frame(
     const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= o_numel) return;
 
-    // ATen UpSampleBilinear2d.cu upsample_bilinear2d_backward_out_frame
     // (non-ROCm branch).
     const int64_t w2 = index % width2;
     const int64_t h2 = (index / width2) % height2;
@@ -525,7 +504,6 @@ __global__ void upsample_bilinear2d_backward_out_frame(
     const accscalar_t w0lambda = static_cast<accscalar_t>(1) - w1lambda;
 
     const accscalar_t val = odata[n_c * height2 * width2 + h2 * width2 + w2];
-    // ATen uses gpuAtomicAddNoReturn; atomicAdd overloads cover float/double.
     scalar_t* base = idata + n_c * height1 * width1;
     atomicAdd(base + h1 * width1 + w1, static_cast<scalar_t>(h0lambda * w0lambda * val));
     atomicAdd(base + h1 * width1 + w1 + w1p, static_cast<scalar_t>(h0lambda * w1lambda * val));
@@ -565,7 +543,6 @@ __global__ void upsample_trilinear3d_backward_out_frame(
     const int64_t batchsize, const int64_t channels,
     const int64_t depth1, const int64_t height1, const int64_t width1,
     const int64_t depth2, const int64_t height2, const int64_t width2) {
-    // ATen UpSampleTrilinear3d.cu upsample_trilinear3d_backward_out_frame:
     // eight-corner scatter with atomicAdd.
     const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= o_numel) return;
@@ -620,7 +597,6 @@ __global__ void upsample_bicubic2d_backward_out_frame(
     const int64_t batchsize, const int64_t channels,
     const int64_t input_height, const int64_t input_width,
     const int64_t output_height, const int64_t output_width) {
-    // ATen UpSampleBicubic2d.cu upsample_bicubic2d_backward_out_frame:
     // scatter each output gradient into the bounded 4x4 input window.
     const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= num_elements) return;
@@ -737,7 +713,6 @@ Tensor upsample_nearest1d_backward_cuda(const Tensor& grad_output, std::vector<i
     const int64_t W2 = output_size[0], W1 = input_size[0];
     if (go.numel() == 0 || W2 == 0 || W1 == 0) return grad_input;
     UP_DISPATCH(go, {
-        // ATen computes backward in opmath precision then casts down; here the
         // zeroed buffer is already scalar_t so accumulate via an accscalar
         // staging is unnecessary for f32/f64 (accscalar_t == scalar_t).
         dim3 block, grid;
@@ -745,7 +720,6 @@ Tensor upsample_nearest1d_backward_cuda(const Tensor& grad_output, std::vector<i
         upsample_nearest1d_backward_out_frame<accscalar_t, scalar_t><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
             go.data_ptr<scalar_t>(), dim_b, dim_c, W2, W1,
             reinterpret_cast<accscalar_t*>(grad_input.data_ptr<scalar_t>()),
-            // ATen compute_scales_value_backwards: output/input ratio.
             compute_scales_value_backwards_h(scales, W2, W1));
     });
     CUDA_CHECK(cudaGetLastError());
@@ -901,7 +875,6 @@ Tensor upsample_bilinear2d_backward_cuda(const Tensor& grad_output, std::vector<
 Tensor upsample_trilinear3d_backward_cuda(const Tensor& grad_output, std::vector<int64_t> output_size, std::vector<int64_t> input_size, bool align_corners, std::optional<double> scales_d, std::optional<double> scales_h, std::optional<double> scales_w) {
     // Accumulates with atomicAdd (no deterministic variant implemented).
     globalContext().alertNotDeterministic("upsample_trilinear3d_backward_cuda");
-    // ATen UpSampleTrilinear3d.cu upsample_trilinear3d_backward_out_frame:
     // trilinear scatter with atomicAdd; implemented as two chained bilinear
     // scatters per depth slice pair (identical weight decomposition).
     Tensor go = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();

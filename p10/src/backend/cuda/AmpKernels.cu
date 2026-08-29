@@ -44,7 +44,6 @@ private:
 
 // One block per grad tensor: scan the tensor for non-finite values; if any is
 // found, raise the shared found_inf flag, otherwise rescale the tensor in
-// place.  Mirrors ATen's _foreach_non_finite_check_and_unscale chunk logic.
 template <typename scalar_t>
 __global__ void amp_non_finite_check_and_unscale_kernel(
     scalar_t* const* grads, const int64_t* numels, float* found_inf,

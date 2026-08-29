@@ -144,7 +144,6 @@ int64_t first_nonzero_info(const Tensor& infos_host) {
     return -1;
 }
 
-// Port of at::native::_linalg_check_errors on a host copy of the info codes.
 void check_infos(const Tensor& infos_dev, std::string_view api_name, bool is_matrix) {
     Tensor infos = infos_dev.to(Device(DeviceType::CPU), DType::Int32).contiguous();
     const int64_t first = first_nonzero_info(infos);
@@ -243,6 +242,21 @@ struct CusolverTraits<float> {
         return cusolverDnSsyevd(h, jobz, fill_mode(uplo), n, a, lda, w, work,
                                 lwork, info);
     }
+    static cusolverStatus_t syevj_bufferSize(
+            cusolverDnHandle_t h, cusolverEigMode_t jobz,
+            cublasFillMode_t uplo, int n, const float* a, int lda,
+            const float* w, int* lwork, syevjInfo_t params, int batch) {
+        return cusolverDnSsyevjBatched_bufferSize(
+                h, jobz, uplo, n, a, lda, w, lwork, params, batch);
+    }
+    static cusolverStatus_t syevj(
+            cusolverDnHandle_t h, cusolverEigMode_t jobz,
+            cublasFillMode_t uplo, int n, float* a, int lda, float* w,
+            float* work, int lwork, int* info, syevjInfo_t params,
+            int batch) {
+        return cusolverDnSsyevjBatched(
+                h, jobz, uplo, n, a, lda, w, work, lwork, info, params, batch);
+    }
     static cusolverStatus_t gesvd(cusolverDnHandle_t h, signed char jobu,
                                   signed char jobvt, int m, int n, float* a,
                                   int lda, float* s, float* u, int ldu, float* vt,
@@ -310,6 +324,21 @@ struct CusolverTraits<double> {
         return cusolverDnDsyevd(h, jobz, fill_mode(uplo), n, a, lda, w, work,
                                 lwork, info);
     }
+    static cusolverStatus_t syevj_bufferSize(
+            cusolverDnHandle_t h, cusolverEigMode_t jobz,
+            cublasFillMode_t uplo, int n, const double* a, int lda,
+            const double* w, int* lwork, syevjInfo_t params, int batch) {
+        return cusolverDnDsyevjBatched_bufferSize(
+                h, jobz, uplo, n, a, lda, w, lwork, params, batch);
+    }
+    static cusolverStatus_t syevj(
+            cusolverDnHandle_t h, cusolverEigMode_t jobz,
+            cublasFillMode_t uplo, int n, double* a, int lda, double* w,
+            double* work, int lwork, int* info, syevjInfo_t params,
+            int batch) {
+        return cusolverDnDsyevjBatched(
+                h, jobz, uplo, n, a, lda, w, work, lwork, info, params, batch);
+    }
     static cusolverStatus_t gesvd(cusolverDnHandle_t h, signed char jobu,
                                   signed char jobvt, int m, int n, double* a,
                                   int lda, double* s, double* u, int ldu,
@@ -351,7 +380,7 @@ void apply_getrf(const Tensor& input, const Tensor& pivots, const Tensor& info) 
 
 std::tuple<Tensor, Tensor, Tensor> lu_factor_ex_cuda_impl(const Tensor& A,
                                                           bool check_errors) {
-    square_check_inputs(A, "linalg.lu_factor_ex");
+    check_is_matrix(A, "linalg.lu_factor_ex");
     Tensor LU = clone_batched_column_major(A);
     const auto batch = batch_shape_of(A);
     const int64_t k = std::min(A.size(-2), A.size(-1));
@@ -361,14 +390,14 @@ std::tuple<Tensor, Tensor, Tensor> lu_factor_ex_cuda_impl(const Tensor& A,
         using T = std::remove_pointer_t<decltype(tag)>;
         apply_getrf<T>(LU, pivots, info);
     });
-    if (check_errors) check_infos(info, "torch.linalg.lu_factor_ex", A.dim() == 2);
+    if (check_errors) check_infos(info, "linalg.lu_factor_ex", A.dim() == 2);
     return {LU.contiguous(), pivots.contiguous(), info.contiguous()};
 }
 
 std::tuple<Tensor, Tensor> linalg_lu_factor_kernel_cuda(const Tensor& A, bool pivot) {
-    (void)pivot;  // pivoting always on (torch CPU/CUDA parity).
+    (void)pivot;
     auto [LU, pivots, info] = lu_factor_ex_cuda_impl(A, false);
-    check_infos(info, "torch.linalg.lu_factor", A.dim() == 2);
+    check_infos(info, "linalg.lu_factor", A.dim() == 2);
     return {LU, pivots};
 }
 
@@ -398,10 +427,10 @@ void host_det_slogdet(const Tensor& LU_h, const Tensor& piv_h, Tensor& det_out,
             logdet += std::log(std::abs(v));
             sgn *= v < scalar_t(0) ? scalar_t(-1) : scalar_t(1);
         }
-        int64_t parity = 0;
+        int64_t sign_changes = 0;
         for (int64_t i = 0; i < n; ++i)
-            if (pv[b * n + i] - 1 != static_cast<int32_t>(i)) ++parity;
-        const scalar_t perm_sign = (parity % 2 == 0) ? scalar_t(1) : scalar_t(-1);
+            if (pv[b * n + i] - 1 != static_cast<int32_t>(i)) ++sign_changes;
+        const scalar_t perm_sign = (sign_changes % 2 == 0) ? scalar_t(1) : scalar_t(-1);
         if (want_log) {
             signs[b] = singular ? scalar_t(0) : sgn * perm_sign;
             logs[b] = singular ? -std::numeric_limits<scalar_t>::infinity() : logdet;
@@ -409,11 +438,15 @@ void host_det_slogdet(const Tensor& LU_h, const Tensor& piv_h, Tensor& det_out,
             dets[b] = singular ? scalar_t(0) : det * perm_sign;
         }
     }
-    cudaMemcpyAsync(det_out.data_ptr(), want_log ? signs.data() : dets.data(),
-                    sizeof(scalar_t) * bs, cudaMemcpyHostToDevice,
-                    getCurrentCUDAStream().stream());
     if (want_log) {
+        cudaMemcpyAsync(sign_out->data_ptr(), signs.data(),
+                        sizeof(scalar_t) * bs, cudaMemcpyHostToDevice,
+                        getCurrentCUDAStream().stream());
         cudaMemcpyAsync(logabsdet_out->data_ptr(), logs.data(),
+                        sizeof(scalar_t) * bs, cudaMemcpyHostToDevice,
+                        getCurrentCUDAStream().stream());
+    } else {
+        cudaMemcpyAsync(det_out.data_ptr(), dets.data(),
                         sizeof(scalar_t) * bs, cudaMemcpyHostToDevice,
                         getCurrentCUDAStream().stream());
     }
@@ -421,7 +454,6 @@ void host_det_slogdet(const Tensor& LU_h, const Tensor& piv_h, Tensor& det_out,
 
 Tensor linalg_det_kernel_cuda(const Tensor& A) {
     square_check_inputs(A, "linalg.det");
-    // det(A^T) = det(A): reuse the contiguous layout like torch.
     const Tensor src = A.is_contiguous() ? A.transpose(-2, -1) : A;
     auto [LU, pivots, info] = lu_factor_ex_cuda_impl(src, false);
     (void)info;
@@ -507,7 +539,6 @@ std::tuple<Tensor, Tensor> linalg_solve_ex_kernel_cuda(const Tensor& A,
     Tensor result;
     if (left) {
         // op(A) = A or conj-transposed A; real dtypes: adjoint handled via 'T'.
-        // torch.linalg.solve has no adjoint flag; plain AX = B.
         Tensor B_cm = clone_batched_column_major(expand_to_batch(B, batch));
         run_real(A.dtype(), [&](auto tag) {
             using T = std::remove_pointer_t<decltype(tag)>;
@@ -537,7 +568,6 @@ Tensor linalg_solve_kernel_cuda(const Tensor& A, const Tensor& B, bool left) {
 std::tuple<Tensor, Tensor> linalg_inv_ex_kernel_cuda(const Tensor& A,
                                                      bool check_errors) {
     square_check_inputs(A, "linalg.inv_ex");
-    // torch composes inv through solve_ex against the identity.
     const int64_t n = A.size(-1);
     const int64_t ms = n * n;
     const int64_t bs = linear_batch_size(batch_shape_of(A));
@@ -567,6 +597,20 @@ Tensor linalg_inv_kernel_cuda(const Tensor& A) {
 // ------------------------------------------------------------- potrf -------
 
 template <typename scalar_t>
+__global__ void zero_potrf_opposite_triangle_kernel(
+    scalar_t* data, int64_t total, int64_t n, int64_t matrix_stride,
+    char uplo) {
+    const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= total) return;
+    const int64_t local = index % matrix_stride;
+    const int64_t row = local % n;
+    const int64_t col = local / n;
+    if ((uplo == 'U' && row > col) || (uplo == 'L' && row < col)) {
+        data[index] = scalar_t(0);
+    }
+}
+
+template <typename scalar_t>
 void apply_potrf(const Tensor& L, const Tensor& info, char uplo) {
     using Tr = CusolverTraits<scalar_t>;
     auto* a = L.data_ptr<scalar_t>();
@@ -585,6 +629,13 @@ void apply_potrf(const Tensor& L, const Tensor& info, char uplo) {
     for (int64_t i = 0; i < batch; ++i) {
         CUSOLVER_CHECK(Tr::potrf(handle, uplo, n, &a[i * ms], lda, work_ptr,
                                  lwork, &info_data[i]));
+    }
+    const int64_t total = batch * ms;
+    if (total > 0) {
+        zero_potrf_opposite_triangle_kernel<scalar_t>
+            <<<static_cast<unsigned>((total + 255) / 256), 256, 0,
+                                      getCurrentCUDAStream().stream()>>>(
+                a, total, n, ms, uplo);
     }
 }
 
@@ -801,43 +852,63 @@ Tensor linalg_householder_product_kernel_cuda(const Tensor& input, const Tensor&
     return result.contiguous();
 }
 
-// --------------------------------------------------------------- syevd -----
+// --------------------------------------------------------------- syevj ----
+
+template <typename scalar_t>
+void apply_syevj_batched(const Tensor& values, const Tensor& vectors,
+                         const Tensor& infos, bool upper,
+                         bool compute_eigenvectors) {
+    using Tr = CusolverTraits<scalar_t>;
+    const int n = static_cast<int>(vectors.size(-1));
+    const int lda = std::max(1, n);
+    const int batch = static_cast<int>(batch_count_of(vectors));
+    auto* vectors_data = vectors.data_ptr<scalar_t>();
+    auto* values_data = values.data_ptr<scalar_t>();
+    auto* infos_data = infos.data_ptr<int32_t>();
+    const auto handle = CUDAContext::getCusolverDnHandle();
+    const cublasFillMode_t uplo = upper ? CUBLAS_FILL_MODE_UPPER
+                                        : CUBLAS_FILL_MODE_LOWER;
+    const cusolverEigMode_t jobz =
+            compute_eigenvectors ? CUSOLVER_EIG_MODE_VECTOR
+                                  : CUSOLVER_EIG_MODE_NOVECTOR;
+
+    syevjInfo_t params = nullptr;
+    CUSOLVER_CHECK(cusolverDnCreateSyevjInfo(&params));
+    CUSOLVER_CHECK(cusolverDnXsyevjSetSortEig(params, 1));
+
+    int lwork = 0;
+    CUSOLVER_CHECK(Tr::syevj_bufferSize(
+            handle, jobz, uplo, n, vectors_data, lda, values_data, &lwork,
+            params, batch));
+    Tensor work = Tensor::empty({std::max(lwork, 1)}, vectors.dtype(),
+                                 vectors.device());
+    auto* work_data = work.data_ptr<scalar_t>();
+    CUSOLVER_CHECK(Tr::syevj(
+            handle, jobz, uplo, n, vectors_data, lda, values_data, work_data,
+            lwork, infos_data, params, batch));
+    CUSOLVER_CHECK(cusolverDnDestroySyevjInfo(params));
+}
 
 std::tuple<Tensor, Tensor> eigh_impl_cuda(const Tensor& A, bool upper,
                                           bool compute_eigenvectors) {
     square_check_inputs(A, "linalg.eigh");
-    Tensor vectors = clone_batched_column_major(A);
     const auto batch = batch_shape_of(A);
     const int64_t n = A.size(-1);
+    if (A.numel() == 0) {
+        Tensor values = Tensor::empty(cat_batch(batch, {n}), A.dtype(),
+                                      A.device());
+        Tensor vectors = compute_eigenvectors
+                ? Tensor::empty(cat_batch(batch, {n, n}), A.dtype(), A.device())
+                : Tensor::empty({0}, A.dtype(), A.device());
+        return {values, vectors};
+    }
+    Tensor vectors = clone_batched_column_major(A);
     Tensor values = Tensor::empty(cat_batch(batch, {n}), A.dtype(), A.device());
     Tensor info = Tensor::zeros(batch, DType::Int32, A.device());
     run_real(A.dtype(), [&](auto tag) {
-        using Tr = CusolverTraits<std::remove_pointer_t<decltype(tag)>>;
-        using T = typename Tr::T;
-        auto* v = vectors.data_ptr<T>();
-        auto* w = values.data_ptr<T>();
-        auto* info_data = info.data_ptr<int32_t>();
-        const int64_t ms = matrix_stride_of(vectors);
-        const int64_t batch_n = batch_count_of(vectors);
-        const int nn = static_cast<int>(n);
-        const int lda = std::max(1, nn);
-        const char uplo = upper ? 'U' : 'L';
-        const cusolverEigMode_t jobz =
-            compute_eigenvectors ? CUSOLVER_EIG_MODE_VECTOR : CUSOLVER_EIG_MODE_NOVECTOR;
-        const auto handle = CUDAContext::getCusolverDnHandle();
-        int lwork = 0;
-        CUSOLVER_CHECK(Tr::syevd_bufferSize(handle, jobz, uplo, nn, v, lda, w, &lwork));
-        Tensor work = Tensor::empty({std::max(lwork, 1)}, A.dtype(), A.device());
-        T* work_ptr =
-            Tr::is_float
-                ? reinterpret_cast<T*>(static_cast<void*>(work.data_ptr<float>()))
-                : reinterpret_cast<T*>(static_cast<void*>(work.data_ptr<double>()));
-        for (int64_t i = 0; i < batch_n; ++i) {
-            CUSOLVER_CHECK(Tr::syevd(handle, jobz, uplo, nn, &v[i * ms], lda,
-                                     &w[i * n], work_ptr, lwork, &info_data[i]));
-            // torch returns early on the first failure.
-            if (info_data[i] != 0) break;
-        }
+        using T = std::remove_pointer_t<decltype(tag)>;
+        apply_syevj_batched<T>(values, vectors, info, upper,
+                               compute_eigenvectors);
     });
     check_infos(info, "linalg.eigh", A.dim() == 2);
     return {values.contiguous(), vectors.contiguous()};
@@ -856,7 +927,6 @@ Tensor linalg_eigvalsh_kernel_cuda(const Tensor& A, std::string UPLO) {
     }
     return std::get<0>(eigh_impl_cuda(A, UPLO == "U", false));
 }
-
 
 // ---------------------------------------------------- triangular solve -----
 
@@ -877,7 +947,6 @@ Tensor linalg_solve_triangular_kernel_cuda(const Tensor& A, const Tensor& B,
         const cublasFillMode_t uplo = upper ? CUBLAS_FILL_MODE_UPPER : CUBLAS_FILL_MODE_LOWER;
         const cublasDiagType_t diag =
             unitriangular ? CUBLAS_DIAG_UNIT : CUBLAS_DIAG_NON_UNIT;
-        // This allows rectangular A when left = True (torch parity).
         const int m = static_cast<int>(B.size(-2));
         const int n = static_cast<int>(B.size(-1));
         const int lda = std::max<int>(1, static_cast<int>(A.size(-2)));
@@ -920,7 +989,7 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> linalg_lstsq_kernel_cuda(
         TP_THROW(RuntimeError, api,
                  ": The input tensor A should have at least as many rows as columns.");
     }
-    (void)rcond;  // ignored by the gels driver (torch parity)
+    (void)rcond;
 
     const auto batch = broadcast_batch(A, B);
     const int64_t nrhs = B.size(-1);
@@ -1033,7 +1102,7 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> linalg_lstsq_kernel_cuda(
 
 std::tuple<Tensor, Tensor, Tensor> linalg_lu_kernel_cuda(const Tensor& A, bool pivot) {
     (void)pivot;
-    square_check_inputs(A, "linalg.lu");
+    check_is_matrix(A, "linalg.lu");
     auto [LU, pivots, info] = lu_factor_ex_cuda_impl(A, false);
     (void)info;
     const int64_t m = A.size(-2);
@@ -1055,17 +1124,16 @@ std::tuple<Tensor, Tensor, Tensor> linalg_lu_kernel_cuda(const Tensor& A, bool p
         std::vector<T> u_host(static_cast<size_t>(bs * kk * n));
         for (int64_t b = 0; b < bs; ++b) {
             const T* lu = &lu_all[b * m * n];
-            // LU is column-major (lda=m): element (i, j) at lu[j*m + i].
             for (int64_t col = 0; col < kk; ++col) {
                 for (int64_t row = 0; row < m; ++row)
                     l_host[(b * m + row) * kk + col] =
                         row < col ? T(0)
-                                  : (row == col ? T(1) : lu[col * m + row]);
+                                  : (row == col ? T(1) : lu[row * n + col]);
             }
             for (int64_t col = 0; col < n; ++col)
                 for (int64_t row = 0; row < kk; ++row)
                     u_host[(b * kk + row) * n + col] =
-                        row <= col ? lu[col * m + row] : T(0);
+                        row <= col ? lu[row * n + col] : T(0);
             std::vector<int64_t> perm(static_cast<size_t>(m));
             for (int64_t i = 0; i < m; ++i) perm[i] = i;
             for (int64_t i = 0; i < kk; ++i) {
@@ -1073,7 +1141,7 @@ std::tuple<Tensor, Tensor, Tensor> linalg_lu_kernel_cuda(const Tensor& A, bool p
                 if (p_ != i) std::swap(perm[i], perm[p_]);
             }
             for (int64_t j = 0; j < m; ++j)
-                p_host[(b * m + j) * m + perm[j]] = T(1);
+                p_host[(b * m + perm[j]) * m + j] = T(1);
         }
         Tensor p_stage = Tensor::tensor(p_host);
         Tensor l_stage = Tensor::tensor(l_host);
@@ -1095,18 +1163,18 @@ std::tuple<Tensor, Tensor, Tensor> linalg_lu_kernel_cuda(const Tensor& A, bool p
 
 [[noreturn]] void throw_no_magma(const char* api) {
     TP_THROW(RuntimeError, "Calling ", api,
-             " on a CUDA tensor requires compiling PyTorch with MAGMA. "
+             " on a CUDA tensor requires MAGMA support. "
              "Please move the tensor to the CPU.");
 }
 
 std::tuple<Tensor, Tensor> linalg_eig_kernel_cuda(const Tensor& A) {
     square_check_inputs(A, "linalg.eig");
-    throw_no_magma("torch.linalg.eig");
+    throw_no_magma("linalg.eig");
 }
 
 Tensor linalg_eigvals_kernel_cuda(const Tensor& A) {
     square_check_inputs(A, "linalg.eigvals");
-    throw_no_magma("torch.linalg.eigvals");
+    throw_no_magma("linalg.eigvals");
 }
 
 // --------------------------------------------------------------- diagonal --

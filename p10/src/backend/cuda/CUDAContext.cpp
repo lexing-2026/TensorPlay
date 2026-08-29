@@ -22,10 +22,8 @@ namespace cuda {
 namespace {
 
 // CUDA initialization tracking. A forked child inherits unusable CUDA state
-// ("bad fork", torch terminology): runtime calls there fail with
 // cudaErrorInitializationError. Seeding must therefore be lazy (never
 // initialize CUDA) and skipped in bad-fork children, mirroring
-// torch.cuda.manual_seed_all's _lazy_call + _is_in_bad_fork behavior.
 std::atomic<bool> g_cuda_initialized{false};
 std::atomic<pid_t> g_cuda_init_pid{0};
 

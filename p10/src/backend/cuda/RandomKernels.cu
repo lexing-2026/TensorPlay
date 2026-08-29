@@ -15,8 +15,6 @@
 namespace tensorplay {
 namespace cuda {
 
-// Random number generation mirrors torch's CUDA distribution kernels
-// (ATen/native/cuda/DistributionTemplates.h): a grid-stride kernel where each
 // thread drives an independent curandStatePhilox4_32_10_t subsequence seeded
 // with (seed, thread index, offset). The (seed, offset) pair comes from the
 // host-side generator, which reserves counter values per launch, so results
@@ -58,7 +56,6 @@ uint32_t deviceAttribute(cudaDeviceAttr attr) {
 }
 
 // Utility function that calculates the proper philox_offset, mirroring
-// torch's calc_execution_policy.
 std::tuple<uint64_t, dim3, dim3> calc_execution_policy(int64_t total_elements,
                                                        uint32_t unroll_factor) {
     const uint64_t numel = static_cast<uint64_t>(total_elements);
@@ -123,6 +120,30 @@ void distribution_nullary_kernel(scalar_t* out_data, int64_t numel,
     }
 }
 
+
+// In-place sampling writes through a contiguous buffer: non-contiguous
+// destinations are filled via a contiguous temporary copied back with the
+// strided copy kernel.  A stride-0 dimension with more than one element
+// aliases the whole dimension, makes the draw order observable, and is
+// rejected.
+template <typename FillFn>
+Tensor& fill_via_contiguous(Tensor& self, FillFn&& fill) {
+    const auto sizes = static_cast<std::vector<int64_t>>(self.shape());
+    const auto strides = self.strides();
+    for (size_t i = 0; i < sizes.size(); ++i) {
+        if (strides[i] == 0 && sizes[i] > 1) {
+            TP_THROW(RuntimeError,
+                     "unsupported operation: more than one element of the written-to tensor "
+                     "refers to a single memory location. Please clone() the tensor before "
+                     "performing the operation.");
+        }
+    }
+    Tensor tmp = Tensor::empty(sizes, self.dtype(), self.device());
+    fill(tmp);
+    self.copy_(tmp);
+    return self;
+}
+
 } // namespace
 
 Tensor rand_kernel_cuda(const std::vector<int64_t>& size, DType dtype, Device device) {
@@ -131,7 +152,6 @@ Tensor rand_kernel_cuda(const std::vector<int64_t>& size, DType dtype, Device de
 
     if (dtype == DType::Float32) {
         float* data = t.data_ptr<float>();
-        // curand_uniform4 yields (0, 1]; torch maps it linearly to [from, to).
         distribution_nullary_kernel<float, float4, 4>(
             data, n,
             [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
@@ -143,7 +163,6 @@ Tensor rand_kernel_cuda(const std::vector<int64_t>& size, DType dtype, Device de
             [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform2_double(state); },
             [] __device__ (double rand) { return rand; });
     } else if (dtype == DType::Float16 || dtype == DType::BFloat16) {
-        // Same consumption as float32 (accscalar float), cast down like torch.
         if (dtype == DType::Float16) {
             Half* data = t.data_ptr<Half>();
             distribution_nullary_kernel<Half, float4, 4>(
@@ -158,7 +177,6 @@ Tensor rand_kernel_cuda(const std::vector<int64_t>& size, DType dtype, Device de
                 [] __device__ (float rand) { return static_cast<BFloat16>(rand); });
         }
     } else if (dtype == DType::ComplexFloat || dtype == DType::ComplexDouble) {
-        // torch parity: each component draws U[0,1) independently -- sample
         // the interleaved component buffer as a real array.
         const int64_t comps = t.numel() * 2;
         if (dtype == DType::ComplexFloat) {
@@ -211,7 +229,6 @@ Tensor randn_kernel_cuda(const std::vector<int64_t>& size, DType dtype, Device d
                 [] __device__ (float rand) { return static_cast<BFloat16>(rand); });
         }
     } else if (dtype == DType::ComplexFloat || dtype == DType::ComplexDouble) {
-        // ATen normal_impl_ parity: view_as_real(self) with std/sqrt(2); the
         // standard-normal factory is N(0, 1/sqrt(2)) per component.
         constexpr float kInvSqrt2f = 0.70710678118654752f;
         constexpr double kInvSqrt2 = 0.70710678118654752440;
@@ -250,13 +267,38 @@ Tensor randn_like_kernel_cuda(const Tensor& self, DType dtype, std::optional<Dev
 }
 
 Tensor& uniform_kernel_cuda(Tensor& self, double from, double to) {
+    if (self.numel() == 0) return self;
+    if (!self.is_contiguous()) {
+        return fill_via_contiguous(self, [&](Tensor& t) { return uniform_kernel_cuda(t, from, to); });
+    }
     int64_t n = self.numel();
-    if (n == 0) return self;
+    // Bounds of the [from, to) range against the destination dtype.
+    if (self.dtype() == DType::Float32) {
+        TP_THROW_IF(!(from >= -std::numeric_limits<float>::max() && from <= std::numeric_limits<float>::max()),
+                    RuntimeError, "from is out of bounds for float");
+        TP_THROW_IF(!(to >= -std::numeric_limits<float>::max() && to <= std::numeric_limits<float>::max()),
+                    RuntimeError, "to is out of bounds for float");
+    } else if (self.dtype() == DType::Float64) {
+        TP_THROW_IF(!(from >= -std::numeric_limits<double>::max() && from <= std::numeric_limits<double>::max()),
+                    RuntimeError, "from is out of bounds for double");
+        TP_THROW_IF(!(to >= -std::numeric_limits<double>::max() && to <= std::numeric_limits<double>::max()),
+                    RuntimeError, "to is out of bounds for double");
+    }
+    TP_THROW_IF(from > to, RuntimeError,
+                "uniform_ expects to return a [from, to) range, but found from=",
+                from, " > to=", to);
+    TP_THROW_IF((to - from) > (self.dtype() == DType::Float32
+                                   ? static_cast<double>(std::numeric_limits<float>::max())
+                                   : std::numeric_limits<double>::max()),
+                RuntimeError,
+                "uniform_ expects to-from <= std::numeric_limits<",
+                self.dtype() == DType::Float32 ? "float" : "double",
+                ">::max(), but found to=", to, " and from=", from,
+                " which result in to-from to exceed the limit");
     if (self.dtype() == DType::Float32) {
         float* data = self.data_ptr<float>();
         const float lo = static_cast<float>(from);
         const float hi = static_cast<float>(to);
-        // curand_uniform4 yields (0, 1]; torch maps it linearly to [from, to).
         distribution_nullary_kernel<float, float4, 4>(
             data, n,
             [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
@@ -274,8 +316,14 @@ Tensor& uniform_kernel_cuda(Tensor& self, double from, double to) {
 }
 
 Tensor& normal_kernel_cuda(Tensor& self, double mean, double std) {
+    if (self.numel() == 0) return self;
+    if (!self.is_contiguous()) {
+        return fill_via_contiguous(self, [&](Tensor& t) { return normal_kernel_cuda(t, mean, std); });
+    }
     int64_t n = self.numel();
-    if (n == 0) return self;
+    if (std < 0.0) {
+        TP_THROW(RuntimeError, "normal expects std >= 0.0, but found std ", std);
+    }
     if (self.dtype() == DType::Float32) {
         float* data = self.data_ptr<float>();
         const float mu = static_cast<float>(mean);
@@ -296,15 +344,15 @@ Tensor& normal_kernel_cuda(Tensor& self, double mean, double std) {
     return self;
 }
 
-// Port of at::native::templates::cuda::exponential_kernel
-// (aten/src/ATen/native/cuda/DistributionTemplates.h:561) +
 // transformation::exponential CUDA branch
-// (aten/src/ATen/core/TransformationHelper.h:128): curand_uniform yields
 // (0, 1]; log(1) is 0 and the exponential distribution excludes 0, so values
 // within epsilon/2 of 1 clamp their log to -epsilon/2.
 Tensor& exponential_kernel_cuda(Tensor& self, double lambd) {
+    if (self.numel() == 0) return self;
+    if (!self.is_contiguous()) {
+        return fill_via_contiguous(self, [&](Tensor& t) { return exponential_kernel_cuda(t); });
+    }
     int64_t n = self.numel();
-    if (n == 0) return self;
     if (self.dtype() == DType::Float32) {
         float* data = self.data_ptr<float>();
         const float lambda = static_cast<float>(lambd);
@@ -328,7 +376,6 @@ Tensor& exponential_kernel_cuda(Tensor& self, double lambd) {
                 return -1. / lambda * log;
             });
     } else if (self.dtype() == DType::Float16 || self.dtype() == DType::BFloat16) {
-        // torch dispatches half/bfloat16 through accscalar_t = float.
         if (self.dtype() == DType::Float16) {
             Half* data = self.data_ptr<Half>();
             const float lambda = static_cast<float>(lambd);
@@ -358,15 +405,17 @@ Tensor& exponential_kernel_cuda(Tensor& self, double lambd) {
     return self;
 }
 
-// --- torch-aligned distribution ports (DistributionKernels.cu + -----------
 // --- TransformationHelper.h): random_ / randint / geometric_ / -------------
 // --- log_normal_ / cauchy_ / poisson / randperm ----------------------------
 
 Tensor& geometric_kernel_cuda(Tensor& self, double p) {
+    if (self.numel() == 0) return self;
+    if (!self.is_contiguous()) {
+        return fill_via_contiguous(self, [&](Tensor& t) { return geometric_kernel_cuda(t, p); });
+    }
     int64_t n = self.numel();
-    if (n == 0) return self;
     if (!(p > 0.0 && p < 1.0)) {
-        TP_THROW(RuntimeError, "geometric_(): p must be in the interval (0, 1)");
+        TP_THROW(RuntimeError, "geometric_ expects p to be in (0, 1), but got p=", p);
     }
     if (self.dtype() == DType::Float32) {
         float* data = self.data_ptr<float>();
@@ -394,10 +443,13 @@ Tensor& geometric_kernel_cuda(Tensor& self, double p) {
 }
 
 Tensor& log_normal_kernel_cuda(Tensor& self, double mean, double std) {
+    if (self.numel() == 0) return self;
+    if (!self.is_contiguous()) {
+        return fill_via_contiguous(self, [&](Tensor& t) { return log_normal_kernel_cuda(t, mean, std); });
+    }
     int64_t n = self.numel();
-    if (n == 0) return self;
     if (std <= 0.0) {
-        TP_THROW(RuntimeError, "log_normal_(): std must be positive");
+        TP_THROW(RuntimeError, "log_normal_ expects std > 0.0, but found std=", std);
     }
     if (self.dtype() == DType::Float32) {
         float* data = self.data_ptr<float>();
@@ -421,10 +473,13 @@ Tensor& log_normal_kernel_cuda(Tensor& self, double mean, double std) {
 }
 
 Tensor& cauchy_kernel_cuda(Tensor& self, double median, double sigma) {
+    if (self.numel() == 0) return self;
+    if (!self.is_contiguous()) {
+        return fill_via_contiguous(self, [&](Tensor& t) { return cauchy_kernel_cuda(t, median, sigma); });
+    }
     int64_t n = self.numel();
-    if (n == 0) return self;
     if (sigma <= 0.0) {
-        TP_THROW(RuntimeError, "cauchy_(): sigma must be positive");
+        TP_THROW(RuntimeError, "cauchy_ expects sigma > 0.0, but found sigma=", sigma);
     }
     constexpr double kPi = 3.14159265358979323846;
     if (self.dtype() == DType::Float32) {
@@ -456,9 +511,7 @@ Tensor& cauchy_kernel_cuda(Tensor& self, double median, double sigma) {
     return self;
 }
 
-// From-to integer draw kernels (torch random_from_to_kernel /
 // random_from_to_64_kernel, DistributionTemplates.h:292-336).  Int64 pairs two
-// adjacent philox words per draw like torch's random64.
 
 __global__ void randint32_fill_impl(int64_t numel, PhiloxCudaState philox_args,
                                     uint64_t range, int64_t base,
@@ -567,15 +620,17 @@ Tensor randint_like_kernel_cuda(const Tensor& self, int64_t low, int64_t high,
 }
 
 Tensor& random_kernel_cuda(Tensor& self, int64_t low, int64_t high) {
+    if (self.numel() == 0) return self;
+    if (!self.is_contiguous()) {
+        return fill_via_contiguous(self, [&](Tensor& t) { return random_kernel_cuda(t, low, high); });
+    }
     int64_t n = self.numel();
-    if (n == 0) return self;
     const bool full_range = (low == 0 && high == 0);
     if (!full_range && low >= high) {
-        TP_THROW(RuntimeError, "random_(): upper bound must be larger than lower bound");
+        TP_THROW(RuntimeError, "random_ expects 'from' to be less than 'to', but got from=", low, " >= to=", high);
     }
 
     if (full_range && (self.dtype() == DType::Float32 || self.dtype() == DType::Float64)) {
-        // torch random_() on floats fills [0, 1).
         return uniform_kernel_cuda(self, 0.0, 1.0);
     }
     if (full_range) {
@@ -607,7 +662,6 @@ Tensor& random_kernel_cuda(Tensor& self, int64_t low, int64_t high) {
     return self;
 }
 
-// poisson (torch poisson_kernel): one thread per element since each element
 // carries its own lambda and consumes a variable number of philox counters.
 template <typename scalar_t>
 __global__ void poisson_fill_impl(int64_t numel, PhiloxCudaState philox_args,
@@ -653,7 +707,6 @@ Tensor poisson_kernel_cuda(const Tensor& self) {
     return t;
 }
 
-// bernoulli_ (torch bernoulli_tensor_cuda_): p taken elementwise from self;
 // one thread per element keeps the threshold read race-free.
 template <typename scalar_t>
 __global__ void bernoulli_fill_impl(int64_t numel, PhiloxCudaState philox_args,
@@ -671,8 +724,11 @@ __global__ void bernoulli_fill_impl(int64_t numel, PhiloxCudaState philox_args,
 }
 
 Tensor& bernoulli_inplace_kernel_cuda(Tensor& self) {
+    if (self.numel() == 0) return self;
+    if (!self.is_contiguous()) {
+        return fill_via_contiguous(self, [&](Tensor& t) { return bernoulli_inplace_kernel_cuda(t); });
+    }
     int64_t n = self.numel();
-    if (n == 0) return self;
     const int threads = 256;
     const int blocks = static_cast<int>((n + threads - 1) / threads);
     auto philox_args = philox_cuda_state(kMaxGeneratorOffsetsPerCall *
@@ -695,8 +751,6 @@ Tensor& bernoulli_inplace_kernel_cuda(Tensor& self) {
     return self;
 }
 
-// randperm: fp32 keys sorted by argsort (torch uses random keys + sort too,
-// aten/src/ATen/native/cuda/TensorFactories.cu randperm_handle_duplicate_keys).
 Tensor randperm_kernel_cuda(int64_t n, DType dtype, Device device) {
     if (dtype != DType::Int64 && dtype != DType::Int32) {
         TP_THROW(NotImplementedError, "randperm() only supports Int64/Int32 on CUDA");
@@ -749,7 +803,6 @@ Tensor randperm_stub_cuda(int64_t n, DType dtype, std::optional<Device> device) 
     return randperm_kernel_cuda(n, dtype, device.value_or(Device(DeviceType::CUDA)));
 }
 
-// bernoulli(p) -- ATen DistributionTemplates.h bernoulli_impl: result is a
 // fresh tensor of the same shape/dtype, filled by the same philox kernel that
 // backs bernoulli_, with p read from `self` (separate in/out pointers).
 Tensor bernoulli_out_kernel_cuda(const Tensor& self) {
@@ -778,7 +831,6 @@ Tensor bernoulli_out_kernel_cuda(const Tensor& self) {
     return out;
 }
 
-// normal(mean, std) -- ATen DistributionTemplates.h normal_out_impl
 // (tensor-tensor): ret = empty(infer_size(mean.sizes(), std.sizes()));
 // ret.normal_(0, 1); ret.mul_(std).add_(mean);
 Tensor normal_broadcast_kernel_cuda(const Tensor& mean, const Tensor& std) {

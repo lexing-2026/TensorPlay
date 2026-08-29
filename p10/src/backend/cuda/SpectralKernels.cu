@@ -1,11 +1,9 @@
 // CUDA spectral kernels for the audio stack — cuFFT backend.
 //
-// Mirrors upstream ATen's CUDA spectral path (aten/src/ATen/native/cuda):
 // batched cuFFT plans execute the transforms; CUFFT_CHECK is adapted from
 // the vendored CuFFTUtils.h. Transforms along an interior dim gather lines
 // into a packed (lines, n) buffer, run a batched cufftPlan1d, and scatter
 // back — semantically identical to the CPU pocketfft path in
-// cpu/SpectralKernels.cpp (norm semantics copied from ATen
 // native/SpectralOpsUtils.h).
 
 #include "Tensor.h"
@@ -34,7 +32,6 @@ namespace cuda {
     } \
   } while (0)
 
-// Adapted from third_party/pytorch/aten/src/ATen/native/cuda/CuFFTUtils.h
 inline std::string cufft_error_string(cufftResult error) {
     switch (error) {
         case CUFFT_SUCCESS: return "CUFFT_SUCCESS";
@@ -91,7 +88,6 @@ inline DType real_of_complex(DType cdt) {
 }
 
 // ---------------------------------------------------------------------------
-// Normalization copied from ATen native/SpectralOpsUtils.h
 // ---------------------------------------------------------------------------
 enum class fft_norm_mode { none, by_root_n, by_n };
 
@@ -116,7 +112,6 @@ inline fft_norm_mode norm_from_string(const std::string& norm, bool forward) {
 inline int64_t infer_onesided(int64_t real_size) { return real_size / 2 + 1; }
 
 // ---------------------------------------------------------------------------
-// Plan cache — simplified analogue of ATen CuFFTPlanCache
 // ---------------------------------------------------------------------------
 cufftHandle acquire_plan(cufftType type, int64_t n, int64_t batch) {
     struct Key {
@@ -282,7 +277,6 @@ __global__ void fill_r_kernel(T* data, int64_t n, T value) {
     if (i < n) data[i] = value;
 }
 
-// Window formulas copied from ATen native/TensorFactories.cpp:1879-2010.
 template <typename T>
 __global__ void window_fill_kernel(T* w, int64_t n, int64_t L,
                                    double alpha, double beta, int kind) {
@@ -325,9 +319,7 @@ inline DType complex_dtype_of(DType dt) {
 }
 
 // ---------------------------------------------------------------------------
-// c2c core — mirrors ATen _fft_c2c_cuda (aten/src/ATen/native/cuda/FFT.cpp):
 // batched cuFFT plan over contiguous lines, normalization factor applied to
-// the OUTPUT exactly like ATen's norm_from_string convention.
 // ---------------------------------------------------------------------------
 
 template <bool IsDouble>
@@ -355,7 +347,7 @@ Tensor core_c2c_impl(const Tensor& x, int64_t n_eff, fft_norm_mode mode, bool fo
         CUDA_CHECK(cudaGetLastError());
     }
 
-    // zero-length guard mirrors util::prod check inside pocketfft calls
+    // Guard zero-length transforms before creating a plan.
     if (n_eff > 0 && li.lines > 0) {
         cufftHandle plan = acquire_plan(IsDouble ? CUFFT_Z2Z : CUFFT_C2C, n_eff, li.lines);
         if (IsDouble) {
@@ -387,7 +379,6 @@ Tensor core_c2c_impl(const Tensor& x, int64_t n_eff, fft_norm_mode mode, bool fo
 }
 
 // ---------------------------------------------------------------------------
-// r2c core — mirrors ATen _fft_r2c_cuda: cuFFT R2C produces the onesided
 // spectrum (N/2+1 bins), matching infer_ft_real_to_complex_onesided_size.
 // ---------------------------------------------------------------------------
 
@@ -443,7 +434,6 @@ Tensor core_r2c_impl(const Tensor& x, int64_t n_eff, fft_norm_mode mode) {
 }
 
 // ---------------------------------------------------------------------------
-// c2r core — mirrors ATen _fft_c2r_cuda: input holds the Hermitian half
 // (N/2+1 bins); strided prefix-copy then batched C2R.
 // ---------------------------------------------------------------------------
 
@@ -515,7 +505,6 @@ Tensor core_c2r_impl(const Tensor& x, int64_t n_eff, fft_norm_mode mode) {
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// Public fft entry points — wrapper structure copied from ATen
 // native/SpectralOps.cpp fft_c2c / fft_r2c / fft_c2r (:215-330):
 //   n defaults to size(dim); resize_fft_input slices from 0 or zero-pads;
 //   norm_from_string picks the output factor per direction.
@@ -539,7 +528,6 @@ Tensor finish_layout(Tensor&& t, const std::vector<int64_t>& inv_perm) {
 
 namespace {
 
-// ATen parity: torch.fft.fft/ifft accept real input — materialize a
 // zero-imaginary complex copy (SpectralOps.cpp fft_r2c "fft"/"ifft" path).
 template <bool IsDouble>
 __global__ void real_to_cplx_kernel(
@@ -603,7 +591,6 @@ Tensor extract_real_part_cuda(const Tensor& z) {
 
 }  // namespace
 
-// ATen: aten/src/ATen/native/SpectralOps.cpp fft_c2c (fft/ifft public API)
 Tensor fft_fft_cuda(const Tensor& self, int64_t n, int64_t dim, std::string norm) {
     const bool real_in = !is_cplx(self.dtype());
     Tensor inp = real_in
@@ -644,9 +631,8 @@ Tensor fft_ifft_cuda(const Tensor& self, int64_t n, int64_t dim, std::string nor
     return finish_layout(std::move(out), inv);
 }
 
-// ATen: fft_r2c wrapper — real input, onesided output by default.
 Tensor fft_rfft_cuda(const Tensor& self, int64_t n, int64_t dim, std::string norm) {
-    TP_CHECK(!is_cplx(self.dtype()), "torch.fft.rfft expects a real input");
+    TP_CHECK(!is_cplx(self.dtype()), "fft.rfft expects a real input");
     TP_CHECK(self.dim() >= 1, "rfft expects at least 1 dimension");
     dim = wrap_dim(dim, self.dim());
     auto [x, inv] = prepare_lastdim(self, dim);
@@ -661,9 +647,8 @@ Tensor fft_rfft_cuda(const Tensor& self, int64_t n, int64_t dim, std::string nor
     return finish_layout(std::move(out), inv);
 }
 
-// ATen: fft_c2r wrapper — n defaults to 2*(bins-1) (SpectralOps.cpp:218).
 Tensor fft_irfft_cuda(const Tensor& self, int64_t n, int64_t dim, std::string norm) {
-    TP_CHECK(is_cplx(self.dtype()), "torch.fft.irfft expects a complex input");
+    TP_CHECK(is_cplx(self.dtype()), "fft.irfft expects a complex input");
     TP_CHECK(self.dim() >= 1, "irfft expects at least 1 dimension");
     dim = wrap_dim(dim, self.dim());
     auto [x, inv] = prepare_lastdim(self, dim);
@@ -721,7 +706,6 @@ Tensor fft_ifft_backward_cuda(const Tensor& grad, const Tensor& self, int64_t di
         : std::move(out);
 }
 
-// ATen fft_r2c_backward (torch/csrc/autograd/FunctionsManual.cpp :5135):
 // onesided r2c == [zero-fill imag, c2c fwd, drop half]; backward ==
 // [zero-fill twosided spectrum, INVERSE c2c with the forward's normalization,
 // take real part].
@@ -752,7 +736,6 @@ Tensor fft_rfft_backward_cuda(const Tensor& grad, const Tensor& self, int64_t di
     return finish_layout(std::move(out), inv);
 }
 
-// irfft adjoint — ATen fft_c2r_backward (FunctionsManual.cpp :5095): forward
 // R2C of the real gradient with the primal normalization, then double the bins
 // whose conjugate mirror fell outside the onesided range.
 namespace {
@@ -783,7 +766,6 @@ Tensor fft_irfft_backward_cuda(const Tensor& grad, const Tensor& self, int64_t d
 }
 
 // ---------------------------------------------------------------------------
-// Window factories — formulas mirror ATen native/TensorFactories.cpp
 // (:1879-2010): bartlett/blackman/hamming/hann computed over the periodic
 // length L = window_length + (periodic ? 1 : 0), hann = hamming(0.5, 0.5).
 // ---------------------------------------------------------------------------
@@ -813,7 +795,6 @@ Tensor window_cuda(int64_t out_len, int64_t formula_len, std::optional<DType> dt
 }
 }  // namespace
 
-// ATen denominator semantics: periodic -> N, symmetric -> N - 1.
 inline int64_t window_denominator_cuda(int64_t window_length, bool periodic) {
     return window_length - (periodic ? 0 : 1);
 }
@@ -839,7 +820,6 @@ Tensor blackman_window_cuda(int64_t window_length, bool periodic, std::optional<
 }
 
 // ---------------------------------------------------------------------------
-// stft / istft / stft_backward — mirror ATen native/SpectralOps.cpp:
 //   stft (:940-1030): center pad -> time2col (as_strided) -> window mul ->
 //                     batched rfft/c2c with by_root_n normalization ->
 //                     transpose to (..., freq, frames)
@@ -857,7 +837,6 @@ template <typename T>
 __global__ void pad_time_axis_kernel(int64_t batch, int64_t len, int64_t pad,
                                      bool reflect,
                                      const T* __restrict__ src, T* __restrict__ dst) {
-    // one block per batch row; mirrors at::pad "reflect" (edge-excluded)
     const int64_t b = blockIdx.x;
     if (b >= batch) return;
     const int64_t out_len = len + 2 * pad;
@@ -887,7 +866,6 @@ __global__ void pad_time_axis_kernel(int64_t batch, int64_t len, int64_t pad,
     }
 }
 
-// ATen stft time2col step: input.as_strided({batch, n_frames, n_fft},
 // {stride0, hop*stride1, stride1}) then mul(window_).
 template <typename T>
 __global__ void build_frames_kernel(int64_t batch, int64_t plen, int64_t n_fft,
@@ -904,7 +882,6 @@ __global__ void build_frames_kernel(int64_t batch, int64_t plen, int64_t n_fft,
     }
 }
 
-// ATen: out.transpose_(1, 2) — write spec columns into (batch, freq, frames).
 template <typename T, typename C>
 __global__ void transpose_spec_kernel(int64_t batch, int64_t n_freq, int64_t n_frames,
                                       const C* __restrict__ packed, C* __restrict__ out) {
@@ -929,7 +906,6 @@ Tensor stft_cuda_impl(const Tensor& work, int64_t n_fft, int64_t hop, int64_t wi
     const int64_t n_frames = 1 + (plen - n_fft) / hop;
     const int64_t n_freq = infer_onesided(n_fft);
 
-    // window padded to n_fft on device (ATen builds window_ the same way)
     Tensor win_t = Tensor::zeros({n_fft}, real_dtype_of(work.dtype()), work.device());
     {
         auto stream = getCurrentCUDAStream().stream();
@@ -972,7 +948,6 @@ Tensor stft_cuda_impl(const Tensor& work, int64_t n_fft, int64_t hop, int64_t wi
         CUDA_CHECK(cudaGetLastError());
     }
 
-    // ATen: norm = normalized ? fft_norm_mode::by_root_n : fft_norm_mode::none
     const auto mode = normalized ? fft_norm_mode::by_root_n : fft_norm_mode::none;
     Tensor spec = core_r2c_impl<IsDouble>(frames, n_fft, mode);
     TP_CHECK(spec.size(-1) == n_freq, "stft: unexpected spectrum width");
@@ -1013,7 +988,6 @@ Tensor stft_cuda(const Tensor& self, int64_t n_fft, std::optional<int64_t> hop_l
     const bool was_1d = x.dim() == 1;
     if (was_1d) x = x.unsqueeze(0);
     if (center) {
-        // ATen: input = at::pad(input.view(...), {pad_amount, pad_amount}, mode)
         const int64_t pad = n_fft / 2;
         Tensor padded(std::vector<int64_t>{x.size(0), x.size(1) + 2 * pad}, x.dtype());
         auto stream = getCurrentCUDAStream().stream();
@@ -1039,7 +1013,6 @@ Tensor stft_cuda(const Tensor& self, int64_t n_fft, std::optional<int64_t> hop_l
         : stft_cuda_impl<false>(x, n_fft, hop, win, window, normalized, onesided, was_1d);
 }
 
-// istft overlap-add — ATen unfold_backward semantics: y[p] = sum over frames
 // t covering p of frame[t][p - t*hop] * win[p - t*hop]; envelope likewise
 // with win^2. One thread per output sample, sequential deterministic adds.
 template <typename T>
@@ -1078,7 +1051,6 @@ __global__ void gather_cols_kernel(int64_t batch, int64_t fft_size, int64_t fram
     cols[bt * bins + k] = in[(b * fft_size + k) * frames + t];
 }
 
-// istft finalize: crop [start,end), divide by envelope (ATen y/window_envelop)
 template <typename T>
 __global__ void istft_finalize_kernel(int64_t batch, int64_t expected_len,
                                       int64_t start, int64_t out_len,
@@ -1098,7 +1070,6 @@ Tensor istft_cuda_impl(const Tensor& input, int64_t n_fft, int64_t hop, int64_t 
     using R = typename CudaTypes<IsDouble>::R;
     using C = typename CudaTypes<IsDouble>::C;
     std::vector<int64_t> isizes = sizes_of(input);
-    // ATen checks the real view (3 or 4 dims); on the complex tensor this is
     // 2D (freq, frames) -> (len,) or 3D (batch, freq, frames) -> (B, len).
     TP_CHECK(isizes.size() == 2 || isizes.size() == 3,
              "istft: expected a complex tensor with 2 or 3 dimensions");
@@ -1109,7 +1080,6 @@ Tensor istft_cuda_impl(const Tensor& input, int64_t n_fft, int64_t hop, int64_t 
     const int64_t batch = was_2d ? 1 : isizes[0];
     const int64_t expected_len = n_fft + hop * (frames - 1);
 
-    // ATen: window_tmp = window or ones(win_length); center-pad into n_fft.
     Tensor win_t = Tensor::zeros({n_fft}, real_dtype_of(input.dtype()), input.device());
     {
         auto stream = getCurrentCUDAStream().stream();
@@ -1128,7 +1098,6 @@ Tensor istft_cuda_impl(const Tensor& input, int64_t n_fft, int64_t hop, int64_t 
         CUDA_CHECK(cudaGetLastError());
     }
 
-    // gather Hermitian-half columns -> batched c2r (ATen _fft_c2r step with
     // norm = normalized ? by_root_n : by_n, SpectralOps.cpp:1160)
     const int64_t bins = n_fft / 2 + 1;
     Tensor cols({batch * frames, bins}, input.dtype());
@@ -1174,7 +1143,6 @@ Tensor istft_cuda_impl(const Tensor& input, int64_t n_fft, int64_t hop, int64_t 
         CUDA_CHECK(cudaGetLastError());
     }
 
-    // crop / length handling (ATen start/end logic)
     const int64_t start = center ? n_fft / 2 : 0;
     int64_t end;
     if (length.has_value()) end = start + *length;
@@ -1208,7 +1176,6 @@ Tensor istft_cuda_impl(const Tensor& input, int64_t n_fft, int64_t hop, int64_t 
     return out;
 }
 
-// ATen istft wrapper — checks copied from native/SpectralOps.cpp:1046-1130.
 Tensor istft_cuda(const Tensor& input, int64_t n_fft, std::optional<int64_t> hop_length,
                   std::optional<int64_t> win_length, const std::optional<Tensor>& window,
                   bool center, bool normalized, bool onesided, std::optional<int64_t> length,
@@ -1234,7 +1201,6 @@ Tensor istft_cuda(const Tensor& input, int64_t n_fft, std::optional<int64_t> hop
 }
 
 // ---------------------------------------------------------------------------
-// stft_backward — adjoint of ATen stft. The C2R primitive performs the
 // conjugate-symmetry fill + unscaled inverse + real projection (see
 // [Fourier Transform Conjugate Symmetry] in SpectralOpsUtils.h), so the
 // backward reduces to: gather grad columns -> C2R scaled by the primal
@@ -1344,7 +1310,6 @@ Tensor stft_backward_cuda_impl(const Tensor& grad_output, const Tensor& self, in
         CUDA_CHECK(cudaGetLastError());
     }
 
-    // ATen composes the spectral adjoint via fft_r2c_backward: zero-fill the
     // twosided spectrum from the onesided grad, run the INVERSE c2c carrying
     // the forward's normalization, then project to the real part.
     Tensor full = Tensor::zeros(std::vector<int64_t>{batch * frames, n_fft},
@@ -1433,8 +1398,7 @@ Tensor stft_backward_cuda(const Tensor& grad_output, const Tensor& self, int64_t
 
 }  // namespace
 
-// Registration — mirrors TENSORPLAY_LIBRARY_IMPL(CUDA, XxxKernels) usage in
-// every other backend file (e.g. IndexingKernels.cu).
+// CUDA registration for the spectral kernel family.
 TENSORPLAY_LIBRARY_IMPL(CUDA, SpectralKernels) {
     m.impl("fft_fft", fft_fft_cuda);
     m.impl("fft_ifft", fft_ifft_cuda);

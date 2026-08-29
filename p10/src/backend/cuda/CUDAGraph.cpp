@@ -119,7 +119,6 @@ void CUDAGraph::capture_begin(uint64_t pool_id, CaptureMode mode,
 
     // The legacy default stream cannot participate in capture; run the graph
     // on the dedicated side stream unless the caller supplied one, as
-    // torch.cuda.graph does.
     CUDAStream side = CUDAStream::undefined();
     {
         std::lock_guard<std::mutex> lock(state.mutex);
@@ -151,14 +150,12 @@ void CUDAGraph::capture_begin(uint64_t pool_id, CaptureMode mode,
 
     // Pre-create every lazy library handle (cuBLAS/cuBLASLt/cuSOLVER/cuDNN)
     // for this device: handle creation allocates internally, which aborts a
-    // live capture with an opaque library error (ATen warms hipblasLt for
     // the same reason).  Must run before pool routing so warmup allocations
     // land on the normal allocator.
     CUDAContext::warmupHandles();
 
     // Pool routing must be armed before cudaStreamBeginCapture: once capture
     // starts, an allocator free() issuing an event record would abort it
-    // (same ordering as ATen's CUDAGraph::capture_begin).  RNG state goes
     // first: it allocates on the default stream and synchronizes, both of
     // which are unsafe inside a live capture.
     const uint64_t rng_state_id = rng_register_graph(device);
@@ -283,7 +280,6 @@ void CUDAGraph::instantiateLocked() {
     // The expensive driver call, paid eagerly here instead of on first
     // replay.  No special flags: AutoFreeOnLaunch (for cudaMallocAsync-pool
     // graphs) made repeated launches of plain-cudaMalloc graphs silently skip
-    // node execution on this driver; torch instantiates with flags=0 as well.
     cudaGraphExec_t exec = nullptr;
     cudaError_t error = cudaGraphInstantiateWithFlags(&exec, graph_, 0);
     if (error != cudaSuccess) {
