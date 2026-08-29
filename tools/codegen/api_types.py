@@ -207,7 +207,7 @@ def node_member_type(t: Type) -> str:
 # Default value translation
 # ---------------------------------------------------------------------------
 
-# Single source of truth for MemoryFormat's ABI-stable integer values; the
+# Canonical definition for MemoryFormat's ABI-stable integer values; the
 # dispatcher rides the enum as int64_t everywhere ("enum not exposed" in the
 # C++ atomics above), so every target language renders defaults from here.
 _MEMORY_FORMAT_VALUES = {"Contiguous": 0, "Preserve": 1,

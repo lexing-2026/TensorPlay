@@ -144,7 +144,7 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
         if name in seen or 'function' not in f.variants and 'method' not in f.variants:
             continue
 
-        # Overload-group facts, mirroring upstream PythonArgParser behavior:
+        # Overload-group facts used by the Python argument parser:
         #    keyword on the public function;
         #  - a base+dim reduction pair (sum/mean/prod/max/min/all/any/
         #    dim=None routing to the base overload (_reduction_union_lines);

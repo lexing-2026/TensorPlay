@@ -1,8 +1,8 @@
-"""
+"""Schema records and validation helpers consumed by the code generators.
 
-Type/Argument/NativeFunction records consumed by this repo's generators, so
-every generator shares exactly upstream's grammar, validation, and error
-messages.  No legacy dialect parser exists anymore: native_functions.yaml is
+Type, Argument, and NativeFunction records provide one schema grammar,
+validation path, and error vocabulary for all generated targets.  The parser
+accepts the current schema format used by this repository.
 """
 
 from __future__ import annotations
@@ -24,8 +24,7 @@ _TORCHGEN_READY = False
 
 
 def _ensure_torchgen():
-    """
-    grammar predates this checkout)."""
+    """Load the schema parser from a supported vendored location."""
     global _TORCHGEN_READY
     global _TORCHGEN_MODULE
     if _TORCHGEN_READY:
@@ -40,8 +39,7 @@ def _ensure_torchgen():
             pt = str(cand / "third_party" / "pytorch")
             break
     else:
-        raise RuntimeError(
-            "or the legacy third_party/pytorch/ layout)")
+        raise RuntimeError("cannot locate the schema parser package")
 
     for m in [k for k in list(_sys.modules)
               if k == "torchgen" or k.startswith("torchgen.")]:
