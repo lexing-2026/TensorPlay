@@ -1,13 +1,5 @@
-// CUDA linalg kernels — cusolverDn ports of the CPU paths, following
-// third_party/pytorch/aten/src/ATen/native/cuda/linalg/BatchLinearAlgebraLib.cpp.
-//
-// Every routine loops over batch elements (as torch does for its non-batched
-// cusolver paths), works on batched column-major buffers produced with
-// clone_batched_column_major / empty_column_major, and reports LAPACK-style
-// info codes through device int32 tensors.
-//
-// Not ported here: linalg_eig / linalg_eigvals raise torch's no-MAGMA error
-// (torch's geev path needs MAGMA), and linalg_ldl_* stay CPU-only.
+// CUDA linear algebra kernels using column-major batched buffers and device
+// error-code tensors.
 
 #include "Tensor.h"
 #include "Dispatcher.h"
@@ -865,86 +857,6 @@ Tensor linalg_eigvalsh_kernel_cuda(const Tensor& A, std::string UPLO) {
     return std::get<0>(eigh_impl_cuda(A, UPLO == "U", false));
 }
 
-// --------------------------------------------------------------- gesvd -----
-
-std::tuple<Tensor, Tensor, Tensor> svd_impl_cuda(const Tensor& A, bool full_matrices,
-                                                 bool compute_uv) {
-    check_is_matrix(A, "linalg.svd");
-    Tensor a_copy = clone_batched_column_major(A);  // gesvd destroys its input
-    const int64_t m = A.size(-2);
-    const int64_t n = A.size(-1);
-    const int64_t k = std::min(m, n);
-    const auto batch = batch_shape_of(A);
-    const int64_t bs = linear_batch_size(batch);
-    Tensor U, S, Vh;
-    if (compute_uv) {
-        U = empty_column_major(cat_batch(batch, {m, full_matrices ? m : k}),
-                               A.dtype(), A.device());
-        Vh = empty_column_major(cat_batch(batch, {full_matrices ? n : k, n}),
-                                A.dtype(), A.device());
-    } else {
-        U = Tensor::empty(cat_batch(batch, {m, 0}), A.dtype(), A.device());
-        Vh = Tensor::empty(cat_batch(batch, {0, n}), A.dtype(), A.device());
-    }
-    S = Tensor::empty(cat_batch(batch, {k}), A.dtype(), A.device());
-    Tensor info = Tensor::zeros(batch, DType::Int32, A.device());
-    run_real(A.dtype(), [&](auto tag) {
-        using Tr = CusolverTraits<std::remove_pointer_t<decltype(tag)>>;
-        using T = typename Tr::T;
-        auto* a = a_copy.data_ptr<T>();
-        auto* s = S.data_ptr<T>();
-        auto* u = compute_uv ? U.data_ptr<T>() : nullptr;
-        auto* vt = compute_uv ? Vh.data_ptr<T>() : nullptr;
-        auto* info_data = info.data_ptr<int32_t>();
-        const signed char jobz = compute_uv ? (full_matrices ? 'A' : 'S') : 'N';
-        const int mm = static_cast<int>(m);
-        const int nn = static_cast<int>(n);
-        const int lda = std::max(1, mm);
-        const int ldu = compute_uv ? static_cast<int>(U.stride(-1)) : 1;
-        const int ldvt = compute_uv ? static_cast<int>(Vh.stride(-1)) : 1;
-        const auto handle = CUDAContext::getCusolverDnHandle();
-        int lwork = 0;
-        CUSOLVER_CHECK(Tr::gesvd(handle, jobz, jobz, mm, nn, a, lda, nullptr,
-                                 nullptr, ldu, nullptr, ldvt, nullptr, -1, nullptr,
-                                 &lwork));
-        Tensor work = Tensor::empty({std::max(lwork, 1)}, A.dtype(), A.device());
-        Tensor rwork = Tensor::empty({std::max<int64_t>(5 * k, 1)},
-                                     A.dtype(), A.device());
-        T* work_ptr =
-            Tr::is_float
-                ? reinterpret_cast<T*>(static_cast<void*>(work.data_ptr<float>()))
-                : reinterpret_cast<T*>(static_cast<void*>(work.data_ptr<double>()));
-        T* rwork_ptr =
-            Tr::is_float
-                ? reinterpret_cast<T*>(static_cast<void*>(rwork.data_ptr<float>()))
-                : reinterpret_cast<T*>(static_cast<void*>(rwork.data_ptr<double>()));
-        for (int64_t i = 0; i < bs; ++i) {
-            CUSOLVER_CHECK(Tr::gesvd(handle, jobz, jobz, mm, nn, &a[i * m * n],
-                                     lda, &s[i * k],
-                                     compute_uv ? &u[i * matrix_stride_of(U)] : nullptr,
-                                     ldu,
-                                     compute_uv ? &vt[i * matrix_stride_of(Vh)] : nullptr,
-                                     ldvt, work_ptr, lwork, rwork_ptr,
-                                     &info_data[i]));
-        }
-    });
-    check_infos(info, "linalg.svd", A.dim() == 2);
-    return {U.contiguous(), S.contiguous(), Vh.contiguous()};
-}
-
-std::tuple<Tensor, Tensor, Tensor> linalg_svd_kernel_cuda(
-        const Tensor& A, bool full_matrices, std::optional<std::string> driver) {
-    if (driver.has_value() && driver.value() != "gesvd" && driver.value() != "gesvdj") {
-        TP_THROW(RuntimeError, "linalg.svd(): driver ", driver.value(),
-                 " is not supported on CUDA");
-    }
-    return svd_impl_cuda(A, full_matrices, true);
-}
-
-Tensor linalg_svdvals_kernel_cuda(const Tensor& A, std::optional<std::string> driver) {
-    (void)driver;
-    return std::get<1>(svd_impl_cuda(A, false, false));
-}
 
 // ---------------------------------------------------- triangular solve -----
 
@@ -1310,8 +1222,6 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, LinalgKernels) {
     m.impl("linalg_eigvalsh", linalg_eigvalsh_kernel_cuda);
     m.impl("linalg_eig", linalg_eig_kernel_cuda);
     m.impl("linalg_eigvals", linalg_eigvals_kernel_cuda);
-    m.impl("linalg_svd", linalg_svd_kernel_cuda);
-    m.impl("linalg_svdvals", linalg_svdvals_kernel_cuda);
     m.impl("linalg_lstsq", linalg_lstsq_kernel_cuda);
     m.impl("linalg_qr", linalg_qr_kernel_cuda);
     m.impl("linalg_householder_product", linalg_householder_product_kernel_cuda);
