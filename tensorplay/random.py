@@ -1,8 +1,6 @@
-"""Random number generation utilities, mirroring ``torch.random``.
+"""
 
-The underlying generator is a bit-compatible port of PyTorch's MT19937-based
 CPU RNG: for a given seed, ``tensorplay`` produces the same random sequences
-as ``torch`` for the ops sharing torch's transformation formulas.
 """
 
 import contextlib
@@ -32,9 +30,8 @@ def fork_rng(devices=None, enabled=True, _caller="fork_rng", _devices_kw="device
     """Forks the RNG state: code inside the context gets a pristine RNG.
 
     Saves the CPU RNG state on entry and restores it on exit, so random
-    operations inside the block do not advance the outer stream (mirrors
-    ``torch.random.fork_rng``). CUDA devices are not forked; pass
-    ``devices=[]`` explicitly to acknowledge that (same contract as torch).
+    operations inside the block do not advance the outer stream. The saved
+    state is restored
     """
     if not enabled:
         yield

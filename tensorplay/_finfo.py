@@ -1,4 +1,3 @@
-"""torch-parity ``finfo`` / ``iinfo`` dtype property queries."""
 
 from __future__ import annotations
 

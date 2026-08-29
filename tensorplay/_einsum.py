@@ -1,7 +1,4 @@
-# Python layer for einsum, mirroring torch/functional.py's structure: this
-# shim only parses torch's sublist calling format; everything else -- error
 # checking, contraction-order planning and the algorithm itself -- lives in
-# the native kernel (p10/src/Einsum.cpp).  Unlike torch, no opt-einsum
 # dependency is needed: with more than two operands the kernel plans the
 # contraction order itself (exact search for small counts, greedy beyond).
 
@@ -16,7 +13,6 @@ def _parse_subscript(n):
 
 
 def parse_equation(args):
-    """Split torch's two calling conventions into ``(equation, operands)``."""
     import tensorplay
 
     if isinstance(args[0], tensorplay.Tensor):
@@ -48,7 +44,6 @@ def einsum(*args):
     specified using a notation based on the Einstein summation convention,
     e.g. ``tp.einsum("ij,jk->ik", A, B)`` computes a matrix multiplication.
 
-    Also supports torch's sublist format:
     ``tp.einsum(A, [..., 0, 1], B, [..., 1, 2], [..., 0, 2])``.
     """
     import tensorplay

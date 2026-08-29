@@ -933,7 +933,6 @@ Args:
 Keyword args:
     {out}
 
-.. note:: Starting in PyTorch 1.8, angle returns pi for negative real numbers,
           zero for non-negative real numbers, and propagates NaNs. Previously
           the function would return zero for all real numbers and not propagate
           floating-point NaNs.
@@ -1264,7 +1263,6 @@ and, by default, be on the CPU device and share memory with the buffer.
 
 When :attr:`obj` is a NumPy scalar, the returned tensor will be a 0-dimensional tensor on
 the CPU and that doesn't share its memory (i.e. ``copy=True``). By default datatype will
-be the PyTorch datatype corresponding to the NumPy's scalar's datatype.
 
 When :attr:`obj` is none of the above but a scalar, or a sequence of scalars then the
 returned tensor will, by default, infer its datatype from the scalar values, be on the
@@ -2184,7 +2182,6 @@ add_docstr(
     r"""
 can_cast(from_, to) -> bool
 
-Determines if a type conversion is allowed under PyTorch casting rules
 described in the type promotion :ref:`documentation <type-promotion-doc>`.
 
 Args:
@@ -2597,7 +2594,6 @@ matrices.
 .. warning::
 
     :func:`tensorplay.cholesky` is deprecated in favor of :func:`tensorplay.linalg.cholesky`
-    and will be removed in a future PyTorch release.
 
     ``L = tensorplay.cholesky(A)`` should be replaced with
 
@@ -4222,7 +4218,6 @@ floor_divide(input, other, *, out=None) -> Tensor
 
 .. note::
 
-    Before PyTorch 1.13 :func:`tensorplay.floor_divide` incorrectly performed
     truncation division. To restore the previous behavior use
     :func:`tensorplay.div` with ``rounding_mode='trunc'``.
 
@@ -4939,7 +4934,6 @@ ger(input, vec2, *, out=None) -> Tensor
 Alias of :func:`tensorplay.outer`.
 
 .. warning::
-    This function is deprecated and will be removed in a future PyTorch release.
     Use :func:`tensorplay.outer` instead.
 """,
 )
@@ -5978,7 +5972,6 @@ spaced from :attr:`start` to :attr:`end`, inclusive. That is, the value are:
 """
     + """
 
-From PyTorch 1.11 linspace requires the steps argument. Use steps=100 to restore the previous behavior.
 
 Args:
     start (float or Tensor): the starting value for the set of points. If `Tensor`, it must be 0-dimensional
@@ -6340,7 +6333,6 @@ with base :attr:`base`. That is, the values are:
     + """
 
 
-From PyTorch 1.11 logspace requires the steps argument. Use steps=100 to restore the previous behavior.
 
 Args:
     start (float or Tensor): the starting value for the set of points. If `Tensor`, it must be 0-dimensional
@@ -6506,7 +6498,6 @@ This function supports ``float``, ``double``, ``cfloat`` and ``cdouble`` dtypes 
 .. warning::
 
     :func:`tensorplay.lu_solve` is deprecated in favor of :func:`tensorplay.linalg.lu_solve`.
-    :func:`tensorplay.lu_solve` will be removed in a future PyTorch release.
     ``X = tensorplay.lu_solve(B, LU, pivots)`` should be replaced with
 
     .. code:: python
@@ -8821,7 +8812,6 @@ Otherwise, if :attr:`some` is ``False``, this function returns the complete QR f
 .. warning::
 
     :func:`tensorplay.qr` is deprecated in favor of :func:`tensorplay.linalg.qr`
-    and will be removed in a future PyTorch release. The boolean parameter :attr:`some` has been
     replaced with a string parameter :attr:`mode`.
 
     ``Q, R = tensorplay.qr(A)`` should be replaced with
@@ -10962,7 +10952,6 @@ always be real-valued, even if :attr:`input` is complex.
 .. warning::
 
     :func:`tensorplay.svd` is deprecated in favor of :func:`tensorplay.linalg.svd`
-    and will be removed in a future PyTorch release.
 
     ``U, S, V = tensorplay.svd(A, some=some, compute_uv=True)`` (default) should be replaced with
 
@@ -11557,7 +11546,6 @@ Supports input of float, double, cfloat and cdouble data types.
 .. warning::
 
     :func:`tensorplay.triangular_solve` is deprecated in favor of :func:`tensorplay.linalg.solve_triangular`
-    and will be removed in a future PyTorch release.
     :func:`tensorplay.linalg.solve_triangular` has its arguments reversed and does not return a
     copy of one of the inputs.
 
@@ -13558,7 +13546,6 @@ Returns:
 
 Example::
 
-    >>> # xdoctest: +REQUIRES(env:TORCH_DOCTEST_CUDA)
     >>> with tensorplay.Stream(device='cuda') as s_cuda:
     >>>     a = tensorplay.randn(10, 5, device='cuda')
     >>>     b = tensorplay.randn(5, 10, device='cuda')
@@ -13579,7 +13566,6 @@ Returns:
 
 Example::
 
-    >>> # xdoctest: +REQUIRES(env:TORCH_DOCTEST_CUDA)
     >>> s_cuda = tensorplay.Stream(device='cuda')
     >>> s_cuda.query()
     True
@@ -13602,7 +13588,6 @@ Returns:
 
 Example::
 
-    >>> # xdoctest: +REQUIRES(env:TORCH_DOCTEST_CUDA)
     >>> s_cuda = tensorplay.Stream(device='cuda')
     >>> e_cuda = s_cuda.record_event()
 """,
@@ -13618,7 +13603,6 @@ Wait for all the kernels in this stream to complete.
 
 Example::
 
-    >>> # xdoctest: +REQUIRES(env:TORCH_DOCTEST_CUDA)
     >>> s_cuda = tensorplay.Stream(device='cuda')
     >>> s_cuda.synchronize()
 """,
@@ -13637,7 +13621,6 @@ Arguments:
 
 Example::
 
-    >>> # xdoctest: +REQUIRES(env:TORCH_DOCTEST_CUDA)
     >>> s1_cuda = tensorplay.Stream(device='cuda')
     >>> s2_cuda = tensorplay.Stream(device='cuda')
     >>> e_cuda = s1_cuda.record_event()
@@ -13659,7 +13642,6 @@ Arguments:
 
 Example::
 
-    >>> # xdoctest: +REQUIRES(env:TORCH_DOCTEST_CUDA)
     >>> s1_cuda = tensorplay.Stream(device='cuda')
     >>> s2_cuda = tensorplay.Stream(device='cuda')
     >>> s2_cuda.wait_stream(s1_cuda)
@@ -13690,7 +13672,6 @@ Returns:
 
 Example::
 
-    >>> # xdoctest: +REQUIRES(env:TORCH_DOCTEST_CUDA)
     >>> event = tensorplay.Event()
     >>> e_cuda = tensorplay.Event(device='cuda')
 """,
@@ -13713,7 +13694,6 @@ Returns:
 
 Example::
 
-    >>> # xdoctest: +REQUIRES(env:TORCH_DOCTEST_CUDA)
     >>> s_cuda = tensorplay.Stream(device='cuda')
     >>> e1_cuda = s_cuda.record_event()
     >>> e2_cuda = s_cuda.record_event()
@@ -13735,7 +13715,6 @@ Returns:
 
 Example::
 
-    >>> # xdoctest: +REQUIRES(env:TORCH_DOCTEST_CUDA)
     >>> s_cuda = tensorplay.Stream(device='cuda')
     >>> e_cuda = s_cuda.record_event()
     >>> e_cuda.query()
@@ -13758,7 +13737,6 @@ Arguments:
 
 Example::
 
-    >>> # xdoctest: +REQUIRES(env:TORCH_DOCTEST_CUDA)
     >>> e_cuda = tensorplay.Event(device='cuda')
     >>> e_cuda.record()
 """,
@@ -13774,7 +13752,6 @@ Wait for the event to complete. This prevents the CPU thread from proceeding unt
 
 Example::
 
-    >>> # xdoctest: +REQUIRES(env:TORCH_DOCTEST_CUDA)
     >>> s_cuda = tensorplay.Stream(device='cuda')
     >>> e_cuda = s_cuda.record_event()
     >>> e_cuda.synchronize()
@@ -13795,7 +13772,6 @@ Arguments:
 
 Example::
 
-    >>> # xdoctest: +REQUIRES(env:TORCH_DOCTEST_CUDA)
     >>> s1_cuda = tensorplay.Stream(device='cuda')
     >>> s2_cuda = tensorplay.Stream(device='cuda')
     >>> e_cuda = s1_cuda.record()
@@ -13821,7 +13797,6 @@ Returns:
 
 Example::
 
-    >>> # xdoctest: +REQUIRES(env:TORCH_DOCTEST_CUDA)
     >>> g_cpu = tensorplay.Generator()
     >>> g_cuda = tensorplay.Generator(device='cuda')
 """,
@@ -14001,7 +13976,6 @@ CUDA tensors, we DO NOT synchronize and you may only find out the assertion
 failed at a later CUDA kernel launch.  Asynchronous assertion can be helpful for
 testing invariants in CUDA tensors without giving up performance.  This function
 is NOT intended to be used for regular error checking, as it will trash your CUDA
-context if the assert fails (forcing you to restart your PyTorch process.)
 
 Args:
     tensor (Tensor): a one element tensor to test to see if it is nonzero.  Zero
