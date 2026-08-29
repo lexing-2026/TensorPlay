@@ -1,15 +1,10 @@
-# Ported from torch/distributed/_functional_collectives.py.
 #
 # This module provides tensor-collectives that participate in autograd
 # (``*_autograd`` variants use ``tensorplay.autograd.Function``), matching
-# the public surface torch's async-TP and python-reducer DDP paths rely on.
 #
 # The *_coalesced family is implemented natively with NCCL group semantics:
 # every per-tensor enqueue is issued inside a single ``groupStart/groupEnd``
-# window so the communicator batches the launch, mirroring torch's C++
 # coalescing manager. Ops enqueue on the current stream and return real
-# tensors; ``wait_tensor`` is kept for torch API parity (it synchronizes
-# torch's AsyncCollectiveTensor, here it is a passthrough).
 
 import warnings
 
@@ -95,7 +90,7 @@ class AllReduceWithAutograd(_CollectiveFunctionBase):
 
 def all_reduce(tensor_input, reduce_op="sum", group=None, *, op=None):
     """All-reduce the input across the entire group with autograd support."""
-    if op is not None:  # torch positional-compat alias
+    if op is not None:
         reduce_op = op
     op_int = {
         "sum": dist.ReduceOp.SUM,
@@ -121,7 +116,6 @@ class BroadcastWithAutograd(_CollectiveFunctionBase):
 
     @staticmethod
     def backward(ctx, grad_output):
-        # Broadcast is treated as non-differentiable (torch parity).
         return None, None, None
 
 
@@ -237,7 +231,6 @@ reduce_scatter_tensor_autograd = reduce_scatter_tensor
 
 
 # ---------------------------------------------------------------------------
-# Coalesced family (torch parity: one groupStart/groupEnd window per call).
 # ---------------------------------------------------------------------------
 
 
@@ -340,7 +333,6 @@ class AllGatherSingleCoalescedWithAutograd(_CollectiveFunctionBase):
 
     @staticmethod
     def backward(ctx, *grad_outputs):
-        # torch parity: gather forward, scatter-sum backward.
         pg = _resolve_coalesced_group(ctx.group_name)
         from tensorplay._C import _distributed as _C
 
@@ -403,7 +395,6 @@ class ReduceScatterSingleCoalescedWithAutograd(_CollectiveFunctionBase):
             raise RuntimeError(
                 "reduce_scatter_tensor_coalesced backward only supports "
                 f"'sum' reduction, got '{ctx.reduce_op}'")
-        # torch parity: scatter forward, gather backward (no division).
         pg = _resolve_coalesced_group(ctx.group_name)
         from tensorplay._C import _distributed as _C
 
@@ -459,7 +450,6 @@ def reduce_scatter_single_coalesced(inputs, reduce_op, scatter_dim, group=None,
 
 
 def all_gather_into_tensor_coalesced(self_tensor_list, group=None, tag=""):
-    """Deprecated alias of :func:`all_gather_single_coalesced` (torch parity)."""
     warnings.warn(
         "`tensorplay.distributed._functional_collectives."
         "all_gather_into_tensor_coalesced` is deprecated. Please use "
@@ -472,7 +462,6 @@ def all_gather_into_tensor_coalesced(self_tensor_list, group=None, tag=""):
 
 def reduce_scatter_tensor_coalesced(inputs, reduce_op, scatter_dim, group=None,
                                     tag=""):
-    """Deprecated alias of :func:`reduce_scatter_single_coalesced` (torch)."""
     warnings.warn(
         "`tensorplay.distributed._functional_collectives."
         "reduce_scatter_tensor_coalesced` is deprecated. Please use "

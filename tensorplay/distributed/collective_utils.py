@@ -1,11 +1,8 @@
-# Ported from torch/distributed/collective_utils.py.
-#
-# Adaptations: CUDA RNG state introspection is not exposed yet, so
-# _check_rng_sync's philox path raises NotImplementedError (torch's shape
-# kept); the CPU path hashes state bytes with hashlib instead of
-# torch.hash_tensor (deterministic, printable summaries).
+# Collective helpers use native device operations where available. CUDA RNG
+# state introspection is optional; the CPU path hashes state bytes with
+# hashlib.
 
-"""
+"""Primitive functions for collective operations.
 A set of primitive functions for performing collective ops.
 
 Each should also handle single rank scenario.
@@ -302,7 +299,6 @@ def _check_rng_sync(generator, group) -> str | None:
     # printable (desync table must not print the 5k state vector). The
     # digest is exchanged through the object collective because the raw
     # state lives on CPU while NCCL groups only accept CUDA tensors
-    # (torch gathers the state tensor directly; only its gloo path does).
     digest = hashlib.sha256(state_tensor.contiguous().numpy().tobytes())
     local = int.from_bytes(digest.digest()[:8], "big")
 

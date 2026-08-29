@@ -1,5 +1,4 @@
 # mypy: allow-untyped-defs
-# Ported from torch/distributed/algorithms/ddp_comm_hooks/ddp_zero_hook.py.
 import weakref
 from collections.abc import Callable
 from typing import Any

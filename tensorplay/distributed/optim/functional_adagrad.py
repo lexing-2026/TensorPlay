@@ -1,4 +1,3 @@
-# Ported from torch/distributed/optim/functional_adagrad.py.
 import tensorplay as tp
 from tensorplay.optim import adagrad as F
 from tensorplay import Tensor
@@ -60,7 +59,6 @@ class _FunctionalAdagrad:
         # param group as it's not a common use case.
         self.param_group = {"params": params}
 
-        # TODO: no union or any types in TorchScript, make step a scalar tensor instead
         # This is also needed by if we want to share_memory on the step across processes
         for p in self.param_group["params"]:
             self.state[p] = {

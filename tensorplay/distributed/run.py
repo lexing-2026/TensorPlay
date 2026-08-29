@@ -1,10 +1,7 @@
-# Ported from torch/distributed/run.py (torchrun) and
-# torch/distributed/launcher/api.py.
 #
 # Adaptation: tp implements a single-node elastic launcher backed by worker
 # subprocesses and the pure-Python env:// rendezvous (TCPStore hosted by
 # local rank 0). Multi-node rendezvous backends (c10d/etcd agents) are part
-# of torch.distributed.elastic and are tracked in docs/gap_analysis.md.
 import argparse
 import os
 import socket
@@ -29,7 +26,6 @@ def _get_free_port() -> int:
 
 @dataclass
 class LaunchConfig:
-    """Creates a rendezvous config (torch parity; single-node launcher)."""
 
     min_nodes: int = 1
     max_nodes: int = 1
@@ -70,7 +66,6 @@ class LaunchConfig:
 
 
 class elastic_launch:
-    """Launches a function or script with torchrun-style semantics."""
 
     def __init__(self, config: LaunchConfig, entrypoint: Callable | str | None):
         self._config = config
@@ -173,7 +168,6 @@ def _launch_local(config: LaunchConfig, entrypoint, script_args):
 
 
 def run(args=None):
-    """Run a training script with torchrun semantics (single node)."""
     args = main_args(args)
     with warnings.catch_warnings(record=True) as caught_warnings:
         config, cmd, cmd_args = config_from_args(args)

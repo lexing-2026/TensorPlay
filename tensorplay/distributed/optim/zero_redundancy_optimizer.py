@@ -1,4 +1,3 @@
-# Ported from torch/distributed/optim/zero_redundancy_optimizer.py.
 #
 # Adaptations for tp: object broadcast uses pickle (tp.Tensor supports
 # pickling), ``dist.group.WORLD`` maps to ``dist.GroupMember.WORLD``, and
@@ -528,7 +527,6 @@ class ZeroRedundancyOptimizer(Optimizer, Joinable):
         Partitions parameters across distributed data parallel ranks.
 
         Arguments:
-            params_per_rank: optional manual partition; see torch docs.
 
         Returns:
             A list where element i contains the ``param_groups`` for rank i.

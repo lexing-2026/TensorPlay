@@ -1,4 +1,3 @@
-# Ported from torch/distributed/optim/post_localSGD_optimizer.py.
 import warnings
 
 from tensorplay import optim

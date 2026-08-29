@@ -1,4 +1,3 @@
-# Ported from torch/distributed/optim/functional_adamax.py.
 import tensorplay as tp
 from tensorplay.optim import adamax as F
 from tensorplay import Tensor

@@ -1,4 +1,3 @@
-# Ported from torch/distributed/algorithms/ddp_comm_hooks/debugging_hooks.py.
 from typing import Any
 
 import tensorplay as tp

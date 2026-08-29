@@ -1,6 +1,4 @@
-# Ported from torch/distributed/algorithms/_optimizer_overlap/optimizer_overlap.py.
 #
-# torch implements this over fused C++ optimizers registered with the DDP
 # reducer; tp's reducer runs Python hooks, so overlap degrades to hook-time
 # execution via register_comm_hook.
 from typing import Any

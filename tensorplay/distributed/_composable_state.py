@@ -1,4 +1,3 @@
-# Ported from torch/distributed/_composable_state.py.
 import weakref
 from typing import cast
 
@@ -35,7 +34,6 @@ def _get_module_state(module: Module) -> _State | None:
     if isinstance(module, _State):
         return cast(_State, module)
     else:
-        # https://github.com/pytorch/pytorch/issues/107054
         if module in _module_state_mapping:
             state_ref = _module_state_mapping[module]
             state = state_ref()

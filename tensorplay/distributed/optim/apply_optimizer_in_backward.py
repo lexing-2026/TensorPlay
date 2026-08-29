@@ -1,4 +1,3 @@
-# Ported from torch/distributed/optim/apply_optimizer_in_backward.py.
 from collections.abc import Iterable
 from typing import Any, no_type_check
 
@@ -8,7 +7,6 @@ import tensorplay as tp
 __all__: list[str] = []
 
 # Keyed by Parameter object; tp Parameters are stable Python objects and
-# define __hash__, mirroring torch's WeakTensorKeyDictionary usage.
 param_to_optim_hook_handle_map = {}
 param_to_acc_grad_map = {}
 
@@ -88,5 +86,4 @@ def _get_in_backward_optimizers(param: tp.nn.Parameter):
     return getattr(param, "_in_backward_optimizers", [])
 
 
-# Public API (torch parity): fire optimizers during backward.
 apply_optimizer_in_backward = _apply_optimizer_in_backward

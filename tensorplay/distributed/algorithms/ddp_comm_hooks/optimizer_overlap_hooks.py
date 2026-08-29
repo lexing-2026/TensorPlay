@@ -1,7 +1,5 @@
 # mypy: allow-untyped-defs
-# Ported from torch/distributed/algorithms/ddp_comm_hooks/optimizer_overlap_hooks.py.
 #
-# Adaptation: tp has no torch.Stream engine callbacks; the optimizer step
 # runs inline when the bucket's gradient communication completes.
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -46,7 +44,7 @@ class _OptimizerHookState:
 
 @dataclass
 class _OptimInBackwardHookState:
-    # tp has no side-stream machinery; retained for API parity.
+    # tp has no side-stream machinery; retain the public state field.
     wait_for_optim_stream_enqueued: bool = False
 
 

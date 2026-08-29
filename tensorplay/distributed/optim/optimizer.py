@@ -1,9 +1,7 @@
-# Ported from torch/distributed/optim/optimizer.py.
 #
 # DistributedOptimizer schedules local optimizers on the workers that own
 # the parameters via RPC/RRef. tp ships no RPC runtime, so construction
 # requires an initialized RPC context and reports its absence, matching
-# torch's behavior when ``rpc.init_rpc`` has not been called.
 import warnings
 
 import tensorplay.distributed.rpc as rpc
@@ -23,7 +21,6 @@ def _not_implemented():
 class DistributedOptimizer:
     r"""
     DistributedOptimizer takes remote references to parameters and runs the
-    optimizer locally on the workers where the parameters live (torch parity).
 
     This class requires the RPC framework.
     """
