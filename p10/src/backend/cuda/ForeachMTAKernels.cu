@@ -508,6 +508,8 @@ TP_MTA_LIST_RET(minimum, foreach_mta::BinaryMinimumList)
 TP_MTA_LIST_RET(clamp_min, foreach_mta::BinaryMaximumList)
 TP_MTA_LIST_RET(clamp_max, foreach_mta::BinaryMinimumList)
 TP_MTA_LIST_RET(pow, foreach_mta::BinaryPowList)
+TP_MTA_LIST_RET(mul, foreach_mta::BinaryMulList)
+TP_MTA_LIST_RET(div, foreach_mta::BinaryDivList)
 #undef TP_MTA_LIST_RET
 
 #define TP_MTA_LIST_ALPHA_RET(NAME, FUNCTOR)                                  \
