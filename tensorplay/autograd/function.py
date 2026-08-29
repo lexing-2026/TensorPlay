@@ -13,7 +13,6 @@ def _current_saved_hooks_pair():
     return _hook_stack[-1] if _hook_stack else None
 
 
-# Fused C++ helpers (mirror torch's unpack_input / _wrap_outputs).  When a
 # build without them is loaded, the generic Python fallbacks run instead.
 _FAST_GRAPH = hasattr(_autograd, "setup_custom_function_graph")
 _FAST_ATTACH = hasattr(_autograd, "PyNode") and hasattr(
@@ -60,12 +59,11 @@ def _materialize(ctx, grads):
 
 
 def _make_backward(ctx, cls):
-    """Per-call backward entry.  Hooks default to torch signatures:
+    """
     prehook(grads_tuple) -> replacement; hook(grad_inputs, grad_outputs)
     -> replacement grad_inputs.
 
     When the engine materializes missing gradients itself (Node::
-    set_materialize_grads, torch InputMetadata parity), the Python
     zero-fill branch is compiled out entirely.
     """
     hooks = ctx._hooks
@@ -74,7 +72,6 @@ def _make_backward(ctx, cls):
     materialize_default = getattr(ctx, "materialize_grads", True) and not engine_materializes
     backward_fn = ctx.backward_fn
     n_in = len(ctx.needs_input_grad)
-    # Incoming gradient slots correspond to forward OUTPUTS (torch
     # CustomFunctionNode semantics); unused outputs arrive absent/None.
     n_out = max(len(getattr(ctx, "_outputs", ())), n_in)
 
@@ -138,7 +135,6 @@ class _Context:
         self._outputs: tuple = ()
         self._output_grad_metas: list = []
         self.backward_fn = None
-        # Legacy torch.FunctionCtx surface (C++ _FunctionBase parity).
         self._metadata = None
         self.requires_grad = False
         self.next_functions: tuple = ()
@@ -149,19 +145,16 @@ class _Context:
 
     @property
     def metadata(self):
-        """Arbitrary user metadata dict (torch ``ctx.metadata`` parity)."""
         if self._metadata is None:
             self._metadata = {}
         return self._metadata
 
     @property
     def non_differentiable(self):
-        """Outputs marked non-differentiable (torch parity)."""
         return self._non_differentiable
 
     @property
     def to_save(self):
-        """Legacy tensor tuple (torch parity; torch returns a tuple)."""
         return self._saved_tensors
 
     @to_save.setter
@@ -173,13 +166,13 @@ class _Context:
         self.save_for_backward(*tensors)
 
     def register_hook(self, hook):
-        """Post-backward hook (torch signature): called with
+        """
         ``(grad_inputs, grad_outputs)`` after :meth:`Function.backward`;
         may return a replacement for ``grad_inputs``."""
         self._hooks.append(hook)
 
     def register_prehook(self, hook):
-        """Pre-backward hook (torch signature): called with
+        """
         ``(grad_outputs,)`` before :meth:`Function.backward` runs; may
         return replacement ``grad_outputs``."""
         self._prehooks.append(hook)
@@ -189,7 +182,6 @@ class _Context:
 
         When a ``saved_tensors_hooks`` context is active, each tensor is
         passed through the pack hook at save time (and through the unpack
-        hook on access); ``None`` entries bypass hooks, like torch.
         """
         for t in tensors:
             if t is not None and not isinstance(t, tensorplay.Tensor):
@@ -215,7 +207,6 @@ class _Context:
         r"""Returns saved tensors.
 
         Raises if any saved tensor was modified in-place since saving,
-        mirroring :class:`torch.autograd.Function` version-counter checks.
         """
         tensors = self._saved_tensors
         versions = getattr(self, "_saved_versions", ())
@@ -251,7 +242,6 @@ class _Context:
     def mark_dirty(self, *args):
         r"""Marks given tensors as modified in an in-place operation.
 
-        torch parity: each marked tensor's version counter is bumped
         immediately (``_mark_dirty`` in python_function.cpp), so later
         ``saved_tensors`` access and double-backward detect the mutation.
         """
@@ -301,7 +291,7 @@ def once_differentiable(fn):
 
 
 class FunctionMeta(type):
-    """Metaclass mirroring torch.autograd.function.FunctionMeta: provides
+    """
     the ``name`` classproperty (``"<Cls>Backward"``, used for node naming)
     and a friendlier repr for subclasses."""
 
@@ -313,7 +303,6 @@ class FunctionMeta(type):
 class Function(metaclass=FunctionMeta):
     r"""Records operation history and defines formulas for differentiating ops.
 
-    Supports two styles, mirroring torch.autograd.Function:
 
     1. Legacy style: ``forward(ctx, ...)`` / ``backward(ctx, ...)``
        (forward receives a context object).
@@ -382,7 +371,7 @@ class Function(metaclass=FunctionMeta):
     def jvp(ctx, *grad_inputs):
         r"""Defines a formula for computing the jacobian-vector product.
 
-        Not yet supported by this engine; provided for API parity.
+        Not yet supported by this engine; provided for API compatibility.
         """
         raise NotImplementedError(
             "You must implement the jvp method for your custom autograd "
@@ -394,7 +383,7 @@ class Function(metaclass=FunctionMeta):
     def vmap(info, in_dims, *args):
         r"""Defines a formula for vectorizing the operation.
 
-        Not yet supported by this engine; provided for API parity.
+        Not yet supported by this engine; provided for API compatibility.
         """
         raise RuntimeError(
             "You tried to vmap over a custom Function that does not have "
@@ -406,14 +395,12 @@ class Function(metaclass=FunctionMeta):
         raise RuntimeError(
             "legacy autograd function with non-static forward method is deprecated. "
             "Please use new-style autograd function with static forward method. "
-            "(Example: https://pytorch.org/docs/stable/notes/extending.html#extending-torch-autograd)"
         )
 
     @classmethod
     def apply(cls, *args, **kwargs):
         r"""Runs the operation and attaches gradient bookkeeping to outputs.
 
-        Structure mirrors torch's ``THPFunction_apply``: one pass over the
         flat arguments computes ``needs_input_grad`` and wires next-edges
         BEFORE forward; outputs are marked and attached AFTER
         ``setup_context``.  When the fused C++ helpers are present the hot
@@ -426,7 +413,7 @@ class Function(metaclass=FunctionMeta):
         flat = not any(
             isinstance(a, (list, tuple, dict)) for a in args)
 
-        # ---- THPFunction_apply wholesale mirror: ONE crossing ----
+        # ---- C++ boundary: ONE crossing ----
         if _APPLY_ALL is not None and flat and not kwargs and grad_enabled:
             output, ctx, needs, executable, fn = _APPLY_ALL(
                 _Context,
@@ -482,8 +469,8 @@ class Function(metaclass=FunctionMeta):
             ctx.backward_fn = cls.backward
 
         # Run forward with grad disabled (engine semantics).  The fused
-        # crossing mirrors THPFunction_apply's AutoGradMode(false) block:
-        # toggle, call forward (+ setup_context), restore -- all in C++.
+        # Crossing the C++ autograd boundary disables gradient recording for
+        # the forward call, then restores the previous state.
         if fast:
             output = _RUN_FWD(
                 ctx, cls.forward,
@@ -508,7 +495,6 @@ class Function(metaclass=FunctionMeta):
         if not executable:
             return output
 
-        # torch InputMetadata parity: hand the user's materialize_grads
         # choice (possibly set inside setup_context) to the ENGINE, so
         # zero-filling of missing gradient slots happens in C++.
         if fn is not None and hasattr(fn, "set_materialize_grads"):
@@ -578,7 +564,7 @@ class Function(metaclass=FunctionMeta):
 
 
 class InplaceFunction(Function):
-    """Legacy marker base for in-place custom Functions (torch parity).
+    """
 
     In-place operations must call ``ctx.mark_dirty`` on the mutated inputs
     inside ``forward``; this subclass exists only so historical code that
@@ -587,7 +573,7 @@ class InplaceFunction(Function):
 
 
 class NestedIOFunction(Function):
-    """Legacy pre-0.4 style Function (torch parity).
+    """
 
     Kept only for import compatibility; the modern contract is to define
     ``forward`` + ``backward`` on :class:`Function` directly.
