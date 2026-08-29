@@ -1,6 +1,5 @@
 """InplaceOrView generator -- upstream tools/autograd analog (skeleton).
 
-Upstream torchgen splits autograd into VariableType / TraceType /
 InplaceOrView / View-replay.  This module owns the third slice: for every
 canonical *view* op we declare a replay entry point that re-dispatches the
 view on a version-stripped alias, and for every in-place variant a wrapper

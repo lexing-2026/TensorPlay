@@ -23,7 +23,6 @@ void init_autocast(py::module_& m) {
     using namespace tensorplay;
     namespace autocast = tensorplay::autocast;
 
-    // torch.amp.autocast_mode.is_autocast_available returns False (never
     // raises) for unsupported device types.
     m.def("_is_autocast_available", [](const std::string& device_type) {
         if (device_type != "cpu" && device_type != "cuda") return false;
@@ -47,7 +46,6 @@ void init_autocast(py::module_& m) {
     }, "device_type"_a, "dtype"_a);
 
     // deprecated CUDA/CPU-specific autocast APIs (kept for BC, mirroring the
-    // deprecated at::autocast inline helpers)
     m.def("get_autocast_gpu_dtype", []() {
         return autocast::get_autocast_dtype(DeviceType::CUDA);
     });

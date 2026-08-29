@@ -132,7 +132,6 @@ inline DType infer_dtype(PyObject* list, int depth = 0) {
     }
     
     if (has_complex) {
-        // Mirrors torch: the default complex dtype follows the default
         // floating point dtype (float64 -> complex128, else complex64).
         if (has_complex_double || globalContext().defaultDType() == DType::Float64) {
             return DType::ComplexDouble;

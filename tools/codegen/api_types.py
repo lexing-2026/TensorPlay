@@ -1,6 +1,5 @@
 """C++ / stub / pybind / pyi type mapping for the schema model.
 
-This mirrors torchgen's api layer (api/cpp.py, api/types.py): the schema
 `Type` is translated exactly once into each target spelling, and generators
 never re-derive C++ signatures from raw strings.
 """
@@ -12,11 +11,9 @@ import re
 from .model import Argument, NativeFunction, Type, make_type
 
 # ---------------------------------------------------------------------------
-# p10 backend registration on torchgen's CType algebra
 #
-# Mirrors how out-of-tree backends adopt torchgen: provide the target's atomics
 # and reference/value conventions, then every signature composes through the
-# SAME CType classes upstream uses (ConstRef/MutRef/Optional/Vector).
+# Shared CType classes (ConstRef/MutRef/Optional/Vector).
 # ---------------------------------------------------------------------------
 from tools.codegen.model import _ensure_torchgen
 _ensure_torchgen()
@@ -40,7 +37,7 @@ _GENERATOR = BaseCType(_P10("", "Generator"))
 
 
 class StdOptionalCType(OptionalCType):
-    """upstream emits c10::optional; p10 uses std::optional."""
+    """Use std::optional for optional arguments."""
     def cpp_type(self) -> str:
         return f"std::optional<{self.elem.cpp_type()}>"
 
@@ -66,7 +63,6 @@ _RAW_ATOMIC = {
 
 
 def p10_ctype(t: Type):
-    """Compose the p10 C++ type for a schema Type via torchgen algebra."""
     atom = BaseCType(_RAW_ATOMIC[t.kind])
     if t.is_list and t.is_opt:
         # ``int[]?`` composes optional over the vector type.
@@ -217,7 +213,6 @@ def node_member_type(t: Type) -> str:
 _MEMORY_FORMAT_VALUES = {"Contiguous": 0, "Preserve": 1,
                          "ChannelsLast": 2, "ChannelsLast3d": 3}
 
-# torch spelling for generated Python surfaces (`torch.contiguous_format`
 # analog): tensorplay exposes these as IntEnum members, which ARE their
 # integer ABI values.
 _MEMORY_FORMAT_PY = {
@@ -256,10 +251,21 @@ def cpp_default(t: Type, default: str) -> str:
         name = _memory_format_name(d)
         if name is not None:
             return str(_MEMORY_FORMAT_VALUES[name])
+    # schema (`int[1] padding=0`, `int[2] dilation=1`, ...).  TensorPlay's
+    # public ABI represents every list as std::vector, so retain the exact
+    # schema while making the generated C++ default a valid one-element
+    # vector.  The CPython bridge deliberately keeps accepting the scalar at
+    # the Python boundary, matching PythonArgParser.
+    if t.is_list and d.lstrip("+-").isdigit():
+        return "{" + d + "}"
     if d.startswith("{") or d.startswith("["):
         body = d[1:-1].strip()
         if t.is_list or t.kind.endswith("[]"):
             return "{" + body + "}"
+    if t.is_list or t.kind.endswith("[]"):
+        # Scalar default for an array param (e.g. "int[1] padding=0"): brace it
+        # so it initializes std::vector / IntArrayRef ("= 0" is not convertible).
+        return "{" + d + "}"
     return d
 
 
@@ -282,7 +288,6 @@ _PYI_DEFAULT_MAP = {
 def pyi_default(t: Type, default: str) -> str:
     if t.kind == "MemoryFormat":
         # Bare `Contiguous` would be an undefined name in generated Python;
-        # emit the torch-style module-level enum spelling instead.
         name = _memory_format_name(default)
         if name is not None:
             return _MEMORY_FORMAT_PY[name]
@@ -382,7 +387,7 @@ def sanitize_name(name: str) -> str:
 
 
 def autograd_node_name(func_name: str) -> str:
-    """Torch-style backward node name (`add.Tensor` -> AddBackward).
+    """
 
     In-place overloads share the functional overload's node: canonicalizing
     `_.` to `.` also prevents duplicate node definitions.
@@ -400,7 +405,6 @@ _NUM_RE = re.compile(r"^-?\d+(\.\d+)?$")
 # ---------------------------------------------------------------------------
 
 # Ops whose backend kernels take `const Tensor&` for arguments the canonical
-# schema spells as `Tensor?`.  ATen behaves identically: optionality is
 # unwrapped in generated glue (nullopt -> undefined Tensor), kernels keep the
 # reference ABI.  Generated call sites route through call_arg_expr().
 UNWRAP_OPT_TENSOR: dict[str, set[str]] = {

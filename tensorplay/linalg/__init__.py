@@ -1,12 +1,10 @@
-"""tensorplay.linalg — port of torch.linalg.
+"""
 
-The public surface mirrors third_party/pytorch/torch/linalg/__init__.py: the
-LAPACK-backed decompositions bind to native kernels (p10/src/backend/cpu/
-LinalgKernels.cpp, ported from BatchLinearAlgebraKernel.cpp), while composite
-ops are expressed through differentiable TensorPlay primitives.
+LAPACK/cuSOLVER-backed decompositions bind to native kernels in the CPU and
+CUDA backends. The public functions expose differentiable TensorPlay
+primitives.
 
-Current scope: real float32/float64.  Complex inputs raise NotImplementedError;
-CUDA tensors fall back to the dispatcher error until cusolver kernels land.
+Current scope: real float32/float64. Complex inputs raise NotImplementedError.
 """
 
 from collections import namedtuple
@@ -22,6 +20,7 @@ from tensorplay._C import (
     linalg_eigvals,
     linalg_eigh,
     linalg_eigvalsh,
+    linalg_cross,
     linalg_householder_product as householder_product,
     linalg_inv_ex,
     linalg_ldl_factor as ldl_factor,
@@ -54,8 +53,7 @@ SVDResult = namedtuple("SVDResult", ["U", "S", "Vh"])
 
 
 class LinAlgError(RuntimeError):
-    """Raised when a linear algebra operation fails (torch parity)."""
-
+    ""
 
 def _check_floating(A, name):
     if A.dtype not in (tensorplay.float32, tensorplay.float64):
@@ -65,7 +63,6 @@ def _check_floating(A, name):
 
 
 # ---------------------------------------------------------------------------
-# Native bindings with torch-parity docstrings.
 # ---------------------------------------------------------------------------
 
 def cholesky(A, *, upper=False):
@@ -146,7 +143,6 @@ def qr(A, mode="reduced"):
     """qr(A, mode='reduced') -> QRResult(Q, R)"""
     Q, R = _C.linalg_qr(A, mode)
     if mode in ("r", "R"):
-        # torch parity: only R is computed; Q comes back empty.
         empty = tensorplay.empty(list(A.shape[:-2]) + [A.shape[-2], 0], dtype=A.dtype)
         return QRResult(empty, R)
     return QRResult(Q, R)
@@ -162,7 +158,6 @@ def matrix_exp(A):
     """matrix_exp(A) -> Tensor
 
     Square matrix exponential via Pade approximation with scaling and
-    squaring (the algorithm of torch's linalg_matrix_exp, Higham 2005).
     """
     _check_floating(A, "matrix_exp")
     n = A.shape[-1]
@@ -230,14 +225,7 @@ _abs = tensorplay.abs
 
 def cross(input, other, *, dim=-1):
     """cross(input, other, *, dim=-1) -> Tensor"""
-    a = [input.select(dim, i) for i in range(input.size(dim))]
-    b = [other.select(dim, i) for i in range(other.size(dim))]
-    out = [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    ]
-    return tensorplay.stack(out, dim=dim)
+    return linalg_cross(input, other, dim=dim)
 
 
 def vecdot(x, y, *, dim=-1):
@@ -358,7 +346,6 @@ def multi_dot(tensors):
     shapes = [list(t.shape) for t in tensors]
     n = len(shapes)
     dims = [shapes[0][-2]] + [shapes[i][-1] for i in range(n)]
-    # Classic DP for the minimal multiplication cost (as in torch's multi_dot).
     m = [[0] * n for _ in range(n)]
     split = [[0] * n for _ in range(n)]
     for length in range(2, n):

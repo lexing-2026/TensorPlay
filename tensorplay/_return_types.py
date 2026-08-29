@@ -1,10 +1,8 @@
-"""Named-tuple containers mirroring ``torch.return_types``.
+"""
 
-The codegen binds dim-reductions like ``max``/``min`` as plain tuples; torch's
 public contract exposes named fields (``values``/``indices``). Namedtuples are
 tuple subclasses so existing positional unpacking keeps working.
 
-Mirroring torch, attribute access beyond the named fields (``.shape``,
 ``.sum()``, ...) is forwarded to the ``values`` component, so
 ``m = t.max(dim=0); m.shape == m.values.shape``.
 """

@@ -1,4 +1,4 @@
-"""``tensorplay.ops`` namespace, mirroring ``torch._ops``.
+"""
 
 Two kinds of entries resolve here:
 
@@ -8,7 +8,6 @@ Two kinds of entries resolve here:
 2. Natively loaded extension libraries: ``tensorplay.ops.load_library(path)``
    dlopens a shared object whose static registrars feed the p10 dispatcher
    (the ``TENSORPLAY_LIBRARY_IMPL`` macro family) and attaches the module
-   under this namespace, exactly like ``torch.ops.load_library``.
 """
 
 from __future__ import annotations

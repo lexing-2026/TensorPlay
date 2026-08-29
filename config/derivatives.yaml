@@ -20,7 +20,6 @@
   self: grad.t()
 
 # The complex optimizer path uses the same storage-reinterpretation views as
-# Torch.  Their backward operations are the inverse view and must remain
 # views, so higher-order optimizer differentiation does not insert a copy.
 - name: view_as_real(Tensor self) -> Tensor
   self: tensorplay::tpx::ops::view_as_complex(grad)
@@ -28,9 +27,8 @@
 - name: view_as_complex(Tensor self) -> Tensor
   self: tensorplay::tpx::ops::view_as_real(grad)
 
-# Fused dropout (torch's native_dropout): the mask output is saved by the
 # backward node and the scale folds in here. F.dropout rejects p == 1
-# upstream, so 1 - p is never zero.
+# the denominator is never zero, so 1 - p is never zero.
 - name: native_dropout(Tensor input, float p) -> (Tensor output, Tensor mask)
   input: native_dropout_backward(grad, mask, 1.0 / (1.0 - p))
 
@@ -47,7 +45,6 @@
   self: grad
   other: maybe_multiply(grad, alpha)
 
-# In-place arithmetic is used by torch.optim's differentiable single-tensor
 # implementations.  Keep the same backward formulas as the functional
 # overloads; the generated wrapper attaches the new history to the mutated
 # non-leaf tensor and rejects leaf mutation under GradMode.
@@ -58,13 +55,23 @@
 - name: add_.Scalar(Tensor(a!) self, Scalar other, Scalar alpha=1) -> Tensor(a!)
   self: grad
 
-# TorchInductor keeps residual add+ReLU as one training forward node and
 # materializes the ReLU mask from the output in its backward graph.  The
 # TensorPlay native primitive has the same output contract for the equal-shape
 # residual case used by ResNet.
 - name: add_relu(Tensor self, Tensor other) -> Tensor
   self: threshold_backward(grad, result, 0)
   other: threshold_backward(grad, result, 0)
+
+# Cross.cpp/CrossKernel.cpp use the same conjugate-aware formulas as
+# default while delegating the actual three-component calculation to the same
+# native backend kernel.
+- name: cross(Tensor self, Tensor other, int? dim=None) -> Tensor
+  self: tensorplay::tpx::ops::cross(tensorplay::tpx::ops::conj(other), grad, dim)
+  other: tensorplay::tpx::ops::cross(grad, tensorplay::tpx::ops::conj(self), dim)
+
+- name: linalg_cross(Tensor self, Tensor other, int dim=-1) -> Tensor
+  self: tensorplay::tpx::ops::linalg_cross(tensorplay::tpx::ops::conj(other), grad, dim)
+  other: tensorplay::tpx::ops::linalg_cross(grad, tensorplay::tpx::ops::conj(self), dim)
 
 - name: sub.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor
   self: grad
@@ -154,7 +161,7 @@
 - name: clamp(Tensor self, Scalar? min=None, Scalar? max=None) -> Tensor
   self: clamp_backward(grad, self, min, max)
 
-# Verbatim upstream formulas (tools/autograd/derivatives.yaml).
+# Explicit derivative formulas for generated autograd nodes.
 - name: clamp_min(Tensor self, Scalar min) -> Tensor
   self: where(self > min, grad, zeros_like(self))
 
@@ -179,7 +186,6 @@
 - name: embedding(Tensor weight, Tensor indices, int padding_idx=-1, bool scale_grad_by_freq=false, bool sparse=false) -> Tensor
   weight: tensorplay::tpx::ops::embedding_dense_backward(grad, indices, weight.size(0), padding_idx, scale_grad_by_freq)
 
-# Upstream torch uses `grad.reshape_symint(self.sym_sizes())`
 # (tools/autograd/derivatives.yaml): reshape falls back to a copy when the
 # incoming grad is not viewable, so non-contiguous grads never error here.
 - name: view(Tensor self, int[] shape) -> Tensor
@@ -197,17 +203,16 @@
 - name: slice(Tensor self, int dim=0, int? start=None, int? end=None, int step=1) -> Tensor
   self: tensorplay::tpx::ops::slice_backward(grad, self, dim, start, end, step)
 
-# Upstream narrow is CompositeImplicitAutograd == slice(dim, start, start+length);
+# Narrow is a slice(dim, start, start+length);
 # our kernel materializes the slice view, backward reuses the slice formula.
 - name: narrow(Tensor self, int dim, int start, int length) -> Tensor
   self: tensorplay::tpx::ops::slice_backward(grad, self, dim, start, start + length, 1)
 
-# ATen unfold_backward (UnfoldBackward.cpp): zeros(input_sizes) with the
 # windows scattered back onto `dim`, accumulating where step < size overlaps.
 - name: unfold(Tensor self, int dimension, int size, int step) -> Tensor
   self: unfold_backward(grad, self.shape(), dimension, size, step)
 
-# Upstream unflatten is CompositeImplicitAutograd (a view); backward is the
+# Unflatten is a view; backward is the
 # inverse reshape, recorded through reshape's own derivative.
 - name: unflatten.int(Tensor self, int dim, int[] sizes) -> Tensor
   self: grad.reshape(self.shape())
@@ -216,15 +221,14 @@
 # batched), which the formula DSL cannot express.  The hand-written node in
 # tpx/include/ManualNodes.h (MatmulBackward, registered via
 # MANUAL_DERIVATIVES) composes recordable primitives so create_graph /
-# double-backward sees a graph through `@` -- mirroring upstream, whose
-# matmul_backward native calls dispatched at:: ops.
+# double-backward sees a graph through `@`.
 
 - name: mm(Tensor self, Tensor mat2) -> Tensor
   self: grad.mm(mat2.t())
   mat2: self.t().mm(grad)
 
 # Native F.linear (CPU kernel; other backends fall through to the composite).
-# Per-slot compositions keep double-backward alive, mirroring upstream's
+# Per-slot compositions keep double-backward alive.
 # linear_backward contract (tools/autograd/derivatives.yaml:2388-2391).
 - name: linear(Tensor input, Tensor weight, Tensor? bias=None) -> Tensor
   input: linear_backward_input(grad, input, weight)
@@ -304,7 +308,6 @@
   self: grad / self.conj()
 
 - name: square(Tensor self) -> Tensor
-  # analytic J = 2*self; torch convention stores grad * conj(J)
   self: grad * 2 * self.conj()
 
 - name: sqrt(Tensor self) -> Tensor
@@ -329,7 +332,6 @@
   # double-backward the same way matmul's did.
   self: tensorplay::tpx::broadcast_mean_backward(grad, self, dim, keepdim)
 
-# torch routes these through value_selecting_reduction_backward (an opaque
 # native that composes dispatched ops).  Same structure here: a recordable
 # tpx-level helper so create_graph sees through max/min(dim).
 - name: max.dim(Tensor self, int64_t dim, bool keepdim=False) -> (Tensor values, Tensor indices)
@@ -356,7 +358,6 @@
 - name: nll_loss2d(Tensor self, Tensor target, Tensor? weight=None, int reduction=1, int ignore_index=-100) -> (Tensor output, Tensor total_weight)
   self: nll_loss2d_backward(grad, self, target, weight, reduction, ignore_index, total_weight)
 
-# ATen derivatives.yaml:2099-2105: multi_margin_loss differentiates through
 # its native backward (target is class indices, non-differentiable);
 # multilabel_margin_loss is composite over multilabel_margin_loss_forward,
 # whose backward consumes the saved is_target mask.
@@ -368,7 +369,6 @@
 
 # CTC: grad flows only to log_probs; the backward consumes the saved forward
 # outputs (raw per-sequence NLL keeps +inf for impossible alignments so the
-# kernel's zero_infinity gating works) and applies aten LossCTC.cpp eq(16).
 - name: _ctc_loss(Tensor log_probs, Tensor targets, Tensor input_lengths, Tensor target_lengths, int blank=0, bool zero_infinity=False) -> (Tensor neg_log_likelihood, Tensor log_alpha)
   log_probs: _ctc_loss_backward(grad, log_probs, targets, input_lengths, target_lengths, neg_log_likelihood, log_alpha, blank, zero_infinity)
 
@@ -399,7 +399,6 @@
 - name: adaptive_avg_pool2d(Tensor input, int[] output_size) -> Tensor
   input: adaptive_avg_pool2d_backward(grad, input)
 
-# ATen wires adaptive_max_pool2d through the (values, indices) op so the
 # backward scatters onto the saved indices instead of recomputing the argmax.
 - name: adaptive_max_pool2d_with_indices(Tensor input, int[] output_size) -> (Tensor output, Tensor indices)
   input: adaptive_max_pool2d_with_indices_backward(grad, input, output_size, indices)
@@ -407,7 +406,6 @@
 - name: adaptive_max_pool3d(Tensor input, int[] output_size) -> Tensor
   input: adaptive_max_pool3d_backward(grad, input)
 
-# ATen derivatives.yaml: fractional max pool scatters grad onto the recorded
 # argmax positions; kernel_size is unused by the backward.
 - name: fractional_max_pool2d(Tensor self, int[] kernel_size, int[] output_size, Tensor random_samples) -> (Tensor output, Tensor indices)
   self: fractional_max_pool2d_backward(grad, self, kernel_size, output_size, indices)
@@ -415,7 +413,6 @@
 - name: fractional_max_pool3d(Tensor self, int[] kernel_size, int[] output_size, Tensor random_samples) -> (Tensor output, Tensor indices)
   self: fractional_max_pool3d_backward(grad, self, kernel_size, output_size, indices)
 
-# ATen derivatives.yaml:2413-2421 differentiates max_unpool through
 # max_pool_double_backward (a gather of grad at the recorded indices); the
 # native backward kernels implement exactly that gather. indices is int64 and
 # therefore not differentiable.
@@ -425,7 +422,6 @@
 - name: max_unpool3d(Tensor self, Tensor indices, int[] output_size, int[] stride, int[] padding) -> Tensor
   self: max_unpool3d_backward(grad, indices, output_size)
 
-# ATen derivatives.yaml:770-780 wires grid_sampler_{2d,3d} through the
 # corresponding *_backward with an output_mask selecting the needed result.
 # The masked-out slot is returned as zeros and never consumed.
 - name: grid_sampler_2d(Tensor input, Tensor grid, int interpolation_mode, int padding_mode, bool align_corners) -> Tensor
@@ -489,7 +485,6 @@
   weight: conv_transpose1d_grad_weight(grad, input, weight, stride, padding, output_padding, groups, dilation)
   bias: conv_transpose1d_grad_bias(grad, input, weight, stride, padding, output_padding, groups, dilation)
 
-# ATen expresses the unfold (im2col) derivative through unfold_backward, which
 # is the col2im kernel plus input-shape bookkeeping; same for col2im_backward.
 - name: im2col(Tensor self, int[] kernel_size, int[] dilation, int[] padding, int[] stride) -> Tensor
   self: im2col_backward(grad, self.shape(), kernel_size, dilation, padding, stride)
@@ -541,71 +536,55 @@
 
 # ---------------------------------------------------------------------------
 # Activations / upsample — derivative formulas mirror
-# third_party/pytorch/tools/autograd/derivatives.yaml (SymInt -> int64_t,
 # self.sym_sizes() -> self.shape()).
 # ---------------------------------------------------------------------------
 
-# ATen: - name: gelu(Tensor self, *, str approximate='none') -> Tensor
 - name: gelu(Tensor self, str approximate="none") -> Tensor
   self: tensorplay::tpx::ops::gelu_backward(grad, self, approximate)
 
-# ATen: hardtanh(Tensor self, Scalar min_val=-1, Scalar max_val=1)
 - name: hardtanh(Tensor self, Scalar min_val=-1, Scalar max_val=1) -> Tensor
   self: hardtanh_backward(grad, self, min_val, max_val)
 
-# ATen: relu6 is sugar for hardtanh(0, 6); its entry uses the same backward.
 - name: relu6(Tensor self) -> Tensor
   self: hardtanh_backward(grad, self, 0, 6)
 
-# ATen: - name: hardswish(Tensor self) -> Tensor
 - name: hardswish(Tensor self) -> Tensor
   self: hardswish_backward(grad, self)
 
-# ATen: - name: hardsigmoid(Tensor self) -> Tensor
 - name: hardsigmoid(Tensor self) -> Tensor
   self: hardsigmoid_backward(grad, self)
 
-# ATen: leaky_relu(Tensor self, Scalar negative_slope=0.01)
 - name: leaky_relu(Tensor self, Scalar negative_slope=0.01) -> Tensor
   self: leaky_relu_backward(grad, self, negative_slope, false)
 
-# ATen: rrelu_with_noise(Tensor self, Tensor noise, Scalar lower=0.125,
 # Scalar upper=0.3333333333333333, bool training=False, bool inplace=False)
 - name: rrelu_with_noise(Tensor self, Tensor noise, Scalar lower=0.125, Scalar upper=0.3333333333333333, bool training=False) -> Tensor
   self: rrelu_with_noise_backward(grad, self, noise, lower, upper, training, false)
 
-# ATen: log_sigmoid backward is grad * sigmoid(-self); the native kernel keeps
 # the numerically stable branch split (no exp overflow for large |self|).
 - name: log_sigmoid(Tensor self) -> Tensor
   self: log_sigmoid_backward(grad, self)
 
-# ATen: elu(Tensor self, Scalar alpha=1, Scalar scale=1, Scalar input_scale=1)
 - name: elu(Tensor self, Scalar alpha=1, Scalar scale=1, Scalar input_scale=1) -> Tensor
   self: elu_backward(grad, alpha, scale, input_scale, false, self)
 
-# ATen: celu routes through elu_backward with input_scale = 1/alpha.
 - name: celu(Tensor self, Scalar alpha=1.0) -> Tensor
   self: elu_backward(grad, alpha, 1, 1.0/alpha, false, self)
 
-# ATen: - name: mish(Tensor self) -> Tensor (GradMode branch handled by the
 # generated node; TensorPlay always uses the finite kernel).
 - name: mish(Tensor self) -> Tensor
   self: mish_backward(grad, self)
 
-# ATen: selu is elu with fixed constants; torch's derivatives.yaml expresses it
 # through elu_backward(scale=lambda, alpha=lambda*alpha_, input_scale=1).
 - name: selu(Tensor self) -> Tensor
   self: elu_backward(grad, 1.6732632423543772848170429916717, 1.0507009873554804934193349852946, 1, false, self)
 
-# ATen: - name: softplus(Tensor self, Scalar beta=1, Scalar threshold=20)
 - name: softplus(Tensor self, Scalar beta=1, Scalar threshold=20) -> Tensor
   self: softplus_backward(grad, self, beta, threshold)
 
-# ATen: - name: glu(Tensor self, int dim=-1) -> Tensor
 - name: glu(Tensor self, int dim=-1) -> Tensor
   self: glu_backward(grad, self, dim)
 
-# ATen: - name: upsample_nearest1d(Tensor self, SymInt[1] output_size, float? scales=None)
 - name: upsample_nearest1d(Tensor self, int[] output_size, float? scales=None) -> Tensor
   self: upsample_nearest1d_backward(grad, output_size, self.shape(), scales)
 
@@ -627,13 +606,11 @@
 - name: upsample_trilinear3d(Tensor self, int[] output_size, bool align_corners, float? scales_d=None, float? scales_h=None, float? scales_w=None) -> Tensor
   self: upsample_trilinear3d_backward(grad, output_size, self.shape(), align_corners, scales_d, scales_h, scales_w)
 
-# ATen expresses masked_fill's derivative as masked_fill(grad, mask, 0).
 - name: masked_fill(Tensor self, Tensor mask, Scalar value) -> Tensor
   self: masked_fill(grad, mask, 0)
 
 # ===========================================================================
 # Tier-1 indexing/masking/scan autograd rules. Formulas follow
-# third_party/pytorch/tools/autograd/derivatives.yaml (cited per entry),
 # expressed with TensorPlay-native operators.
 # ===========================================================================
 
@@ -656,7 +633,6 @@
 - name: triu(Tensor self, int diagonal=0) -> Tensor
   self: grad.triu(diagonal)
 
-# derivatives.yaml:531 + torch/csrc/autograd/FunctionsManual.cpp:1136
 # cumsum_backward = grad.flip(dim).cumsum(dim).flip(dim)
 - name: cumsum(Tensor self, int dim, ScalarType? dtype=None) -> Tensor
   self: tensorplay::tpx::ops::flip(tensorplay::tpx::ops::cumsum(tensorplay::tpx::ops::flip(grad, {dim}), dim), {dim})
@@ -682,7 +658,6 @@
 
 # ===========================================================================
 # Tier 2-4 autograd rules. Formulas follow
-# third_party/pytorch/tools/autograd/derivatives.yaml where expressible with
 # TensorPlay-native operators; otherwise omitted (no entry = no autograd).
 # ===========================================================================
 
@@ -747,7 +722,6 @@
 - name: rad2deg(Tensor self) -> Tensor
   self: grad * 57.29577951308232087680
 
-# Activation.cpp hardshrink/softshrink: both route through ATen's shared
 # shrink_backward_kernel ((self >= -lambd && self <= lambd) ? 0 : grad),
 # exposed here as the native hardshrink_backward / softshrink_backward ops.
 - name: hardshrink(Tensor self, Scalar lambd=0.5) -> Tensor
@@ -763,11 +737,10 @@
 - name: celu(Tensor self, Scalar alpha=1.0) -> Tensor
   self: grad * (self > 0) + grad * (self <= 0) * ((self / alpha).exp() * alpha / alpha)
 
-# threshold_backward(grad, self, threshold), mirrors clamp_backward style
+# threshold_backward(grad, self, threshold) uses the same threshold rule.
 - name: threshold(Tensor self, Scalar threshold, Scalar value) -> Tensor
   self: threshold_backward(grad, self, threshold)
 
-# clamp_min/clamp_max via comparisons (NaN caveat vs ATen helpers noted)
 - name: clamp_min.Scalar(Tensor self, Scalar min) -> Tensor
   self: grad * (self >= min)
 
@@ -805,7 +778,6 @@
   self: grad.conj()
 
 # adjoint is transpose(-2,-1) composed with conj; both are self-inverse on
-# the gradient (torch: grad.adjoint()).
 - name: adjoint(Tensor self) -> Tensor
   self: grad.adjoint()
 
@@ -815,7 +787,6 @@
   angle: -(abs_ * grad * sin(angle))
 
 # ---------------------------------------------------------------------------
-# Torch-aligned loss family derivatives.
 # ---------------------------------------------------------------------------
 
 - name: tp_l1_loss(Tensor input, Tensor target, int64_t reduction=1) -> Tensor
@@ -851,7 +822,6 @@
   input: tp_poisson_nll_loss_backward(grad, input, target, log_input, full, eps, reduction)
 
 # ===========================================================================
-# Spectral / audio ops — adjoints per ATen conventions (see SpectralKernels)
 # ===========================================================================
 - name: fft_fft(Tensor self, SymInt n=-1, int dim=-1, str norm="backward") -> Tensor
   self: tensorplay::tpx::ops::fft_fft_backward(grad, self, dim, norm)
@@ -871,7 +841,7 @@
 - name: flip(Tensor self, int[] dims=[]) -> Tensor
   self: tensorplay::tpx::ops::flip(grad, dims)
 
-# TensorTransformations.cpp rot90 is an involution up to sign: upstream
+# TensorTransformations.cpp rot90 is an involution up to sign:
 # differentiates as grad.rot90(-k, dims).
 - name: rot90(Tensor self, int k=1, int[] dims=[0,1]) -> Tensor
   self: tensorplay::tpx::ops::rot90(grad, -k, dims)
@@ -894,16 +864,12 @@
 - name: to_dense(Tensor self) -> Tensor
   self: grad.sparse_mask(self)
 
-# --- 2026-08-24: torch 对齐补齐（silu 公式修正 + 双曲/反双曲/logit/expm1 新增）---
-# 公式逐条对照 third_party/pytorch/tools/autograd/derivatives.yaml（去 complex 分支）。
 # silu 旧式 `grad * self.sigmoid() * (self + 1)` 漏 (1 - sigmoid) 因子，
 # 有限差分验证: x=0.49 处旧值 0.9239 vs 真值 0.7354。
 
 - name: sinh(Tensor self) -> Tensor
   self: grad * self.cosh().conj()
 
-# --- torch 对齐补齐(第 2 批):反三角/误差函数/lgamma/log2 ---
-# 公式逐条对照 third_party/pytorch/tools/autograd/derivatives.yaml
 # (去 .conj() 复数分支;M_2_SQRTPI/M_LN2 常量内联为数值)。
 
 - name: acos(Tensor self) -> Tensor
@@ -943,10 +909,8 @@
   self: grad * 1 / (1 - self.pow(2)).conj()
 
 # In-place arc variants reuse the out-of-place formula.  The saved `self` is
-# captured before the mutation (gen_tpx hoists a clone, matching upstream
+# captured before the mutation (gen_tpx hoists a clone,
 # gen_variable_type's `original_self = self.clone()`), so the slope is
-# evaluated at the pre-update value like torch's auto-derived in-place
-# backwards.  torch itself leaves acosh_/asinh_/atanh_ unimplemented; TP
 # provides them via the closed-form slope (spec: test_composite_funcs).
 - name: acos_(Tensor(a!) self) -> Tensor(a!)
   self: grad * -((-self * self + 1).rsqrt()).conj()
@@ -972,30 +936,24 @@
 - name: expm1(Tensor self) -> Tensor
   self: grad * (result.conj() + 1)
 
-# torch derivatives.yaml: angle backward is zero at z == 0, else grad * i*z/|z|^2
 - name: angle(Tensor self) -> Tensor
   self: angle_backward(grad, self)
 
-# torch: complex(r, i) routes the stored (conjugated) gradient components
 # straight back to the parts: dL/dr = g.real, dL/di = g.imag.
 - name: complex(Tensor real, Tensor imag) -> Tensor
   real: grad.real()
   imag: grad.imag()
 
-# torch: pow.Tensor_Tensor uses pow_backward_self / pow_backward_exponent with
 # conjugated Jacobians; see FunctionsManual.cpp.
 - name: pow.Tensor_Tensor(Tensor self, Tensor exponent) -> Tensor
   self: pow_backward_self(grad, self, exponent)
   exponent: pow_backward_exponent(grad, self, exponent, result)
 
 - name: prod(Tensor self, *, ScalarType dtype=Undefined) -> Tensor
-  # torch prod_backward: exact including the single-zero case
   self: prod_backward(grad, self, result)
 
-# ---- Shape & view alignment batch: formulas mirror upstream
-# tools/autograd/derivatives.yaml (`at::sum_to(grad, self.sym_sizes())`,
+# ---- Shape & view derivative formulas
 # `repeat_backward(grad, repeats, self.sym_sizes())`); the helpers are ports
-# of at::sum_to_size / autograd::repeat_backward and live in ManualNodes.h.
 
 - name: expand(Tensor self, int[] size, *, bool implicit=False) -> Tensor
   self: sum_to_size(grad, self.shape())
@@ -1027,7 +985,6 @@
   self: _index_reduce_backward_self(grad, self, dim, index, source, reduce, include_self)
   source: _index_reduce_backward_src(grad, self, dim, index, source, reduce, include_self)
 
-# Covariance / correlation (ATen Correlation.cpp): C = M diag(w) M^T / fact
 # with M = X - weighted_avg. dL/dX = G_M - rowsum(G_M) * (w / wsum) where
 # G_M = ((grad + grad^T) M diag(w)) / fact. corrcoef chains through the clip
 # mask, the D^-1 C D^-1 normalization and cov's formula.
@@ -1038,11 +995,9 @@
   self: _corrcoef_backward(grad, self)
 
 # ===========================================================================
-# Native backward completion batch (ports of upstream derivatives.yaml +
+# Native backward completion batch.
 # FunctionsManual.cpp).  Helper functions live in tpx/include/ManualNodes.h;
-# every formula lowers to dispatched recordable ops (torch's own backward
 # implementations are the same compositions), so values and performance
-# follow ATen.
 # ===========================================================================
 
 # --- scatter / index family (derivatives.yaml:856-880, 1090-1110) ---------
@@ -1096,7 +1051,7 @@
   src: diagonal(grad, offset, dim1, dim2)
 
 # --- blas-family (derivatives.yaml:190-210): beta/alpha elide via
-# maybe_multiply exactly like upstream. -------------------------------------
+# maybe_multiply. ------------------------------------------------------------
 
 - name: addbmm(Tensor self, Tensor batch1, Tensor batch2, *, Scalar beta=1, Scalar alpha=1) -> Tensor
   self: maybe_multiply(grad, beta)

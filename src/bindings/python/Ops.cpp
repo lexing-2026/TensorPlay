@@ -23,7 +23,6 @@ namespace {
 namespace {
 
 // ---------------------------------------------------------------------------
-// Python custom-op bridge (torch.library native alignment).
 //
 // Kernels registered from Python via ``tensorplay.library`` are mirrored into
 // the p10 Dispatcher under their qualified ``"ns::op"`` name so native code
@@ -33,7 +32,6 @@ namespace {
 // Python-backed operators is
 //     std::vector<Tensor>(const std::vector<Tensor>&)
 // i.e. tensors in, tensors out; scalar arguments stay on the Python dispatch
-// path exactly like torch's boxed Python fallback.
 // ---------------------------------------------------------------------------
 
 struct PyOpKernelEntry {
@@ -67,7 +65,6 @@ py::object select_py_kernel(const std::string& op_name, const std::vector<Tensor
     py::object fn = (is_cuda ? entry->cuda : entry->cpu);
     // A device-specific kernel shadows the composite slot; an operator
     // registered without device_types covers every backend, matching
-    // torch.library.custom_op semantics.
     if (!fn) {
         fn = entry->composite;
     }
@@ -110,7 +107,6 @@ std::vector<Tensor> python_op_trampoline(const std::vector<Tensor>& inputs) {
 
 // Executor for stax native-graph "custom_op" nodes: routes through the
 // Python operator entry so device dispatch AND register_autograd semantics
-// survive inside compiled graphs (torch dispatches custom ops through its
 // Autograd key the same way).
 void ensure_stax_custom_op_executor() {
     static bool installed = false;
@@ -181,7 +177,6 @@ void init_ops(py::module_& m) {
     "tensor(data, *, dtype: Optional[DType] = None, device: Optional[Device] = None, pin_memory: bool = False, requires_grad: bool = False) -> Tensor");
 
 
-    // Torch keeps this optimizer hot path in C++ (torch._C._group...).  The
     // Python implementation is functionally correct but spends most of a
     // small multi-tensor optimizer step in per-element Python list/dict work.
     // Keep the same contract here: grouping is keyed by the first tensor list;

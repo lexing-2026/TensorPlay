@@ -98,7 +98,6 @@ def linear(input: Tensor, weight: Tensor, bias: Optional[Tensor] = None) -> Tens
 
     # _matmul_impl checks this again later, but the native flatten path does
     # not work on scalar inputs, so try to catch this here already
-    # (aten/src/ATen/native/Linear.cpp:87-92).
     input_dim = input.dim()
     weight_dim = weight.dim()
     if input_dim == 0 or weight_dim == 0:
@@ -195,8 +194,6 @@ def prelu(input, weight):
         view_shape[1] = weight.numel()
         weight = weight.view(view_shape)
 
-    # Route through the aten-aligned `prelu` op (single dispatch, autocast-
-    # aware) instead of a relu decomposition, matching torch's F.prelu.
     return _C.prelu(input, weight)
 
 def flatten(input, start_dim=0, end_dim=-1):
@@ -223,13 +220,11 @@ def dropout(input, p=0.5, training=True, inplace=False):
         return input
 
     if inplace:
-        # Composite fallback until a fused dropout_ op exists (torch's
         # dropout_ mutates self and records the mask for backward).
         mask = (_C.rand(input.shape, device=input.device) > p).to(input.dtype)
         return input.mul_(mask).mul_(1.0 / (1.0 - p))
 
     if p == 1:
-        # native_dropout rejects p >= 1 (its scale is undefined); torch
         # zeroes everything in this case.
         return _C.zeros_like(input)
 
@@ -266,10 +261,8 @@ def alpha_dropout(input, p=0.5, training=True, inplace=False):
     if not training or p == 0:
         return input
 
-    # Native fused forward (native_alpha_dropout) + generated backward via
-    # the saved mask; mirrors how F.dropout sits on native_dropout.
+    # Native fused forward plus generated backward through the saved mask.
     if p == 1:
-        # ATen _dropout_impl short-circuits p == 1 to multiply-by-zeros.
         result = _C.zeros_like(input)
     else:
         result, _mask = _C.native_alpha_dropout(input, p)
@@ -280,7 +273,7 @@ def alpha_dropout(input, p=0.5, training=True, inplace=False):
 
 def feature_dropout(input, p=0.5, training=False, inplace=False):
     r"""Randomly zeroes entire channels (dim 1), port of
-    at::_feature_dropout: the Bernoulli noise has shape (N, C, 1..., ...)."""
+"""
     if p < 0 or p > 1:
         raise ValueError("dropout probability has to be between 0 and 1, but got {}".format(p))
     if input.dim() < 2:
@@ -454,9 +447,7 @@ def conv_transpose1d(input, weight, bias=None, stride=1, padding=0, output_paddi
     return _C.conv_transpose1d(input, weight, bias, stride, padding, output_padding, groups, dilation)
 
 def unfold(input, kernel_size, dilation=1, padding=0, stride=1):
-    r"""Extract sliding local blocks from a batched input tensor (torch
-    F.unfold, i.e. aten::im2col).  4-D batched input is the common case;
-    unbatched 3-D input is accepted like aten's im2col.
+    r"""
     """
     if input.dim() not in (3, 4):
         raise ValueError(
@@ -465,7 +456,6 @@ def unfold(input, kernel_size, dilation=1, padding=0, stride=1):
 
 def fold(input, output_size, kernel_size, dilation=1, padding=0, stride=1):
     r"""Combine an array of sliding local blocks into a tensor containing
-    them all (torch F.fold, i.e. aten::col2im).
     """
     if input.dim() not in (2, 3):
         raise ValueError(
@@ -475,7 +465,6 @@ def fold(input, output_size, kernel_size, dilation=1, padding=0, stride=1):
 
 def conv_tbc(input, weight, bias=None, pad=0):
     r"""Applies a 1D convolution over an input of shape (T, B, C) along the
-    time dimension (torch.conv_tbc).  ``weight`` follows the torch contract
     ``(kernel_width, in_channels, out_channels)``; the math is a standard
     cross-channel conv1d after permuting to (B, C, T).
     """
@@ -515,7 +504,6 @@ def max_pool2d(input, kernel_size, stride=None, padding=0, dilation=1, ceil_mode
     if captured is not None:
         return captured
     # native kernel assumes contiguous layout; normalize views (no-op when
-    # already contiguous) so non-contiguous inputs match torch's results.
     return _C.max_pool2d(input.contiguous(), kernel_size, stride, padding,
                          dilation, ceil_mode)
 
@@ -539,7 +527,6 @@ def adaptive_avg_pool2d(input, output_size):
 def adaptive_max_pool2d(input, output_size):
     output_size = list(_pair(output_size))
     # Route through the (values, indices) op so autograd saves indices and the
-    # backward scatters instead of recomputing the argmax (matches ATen).
     return _C.adaptive_max_pool2d_with_indices(input, output_size)[0]
 
 # Normalization functions
@@ -566,9 +553,7 @@ def instance_norm(input, running_mean=None, running_var=None, weight=None, bias=
 
 def pad(input, pad, mode='constant', value=0):
     r"""Pads tensor.  ``pad`` values are described starting from the last
-    dimension and moving forward, exactly like torch.nn.functional.pad.
     Non-constant modes support the last 3 dimensions of a 3D/4D/5D input
-    (torch's restriction).
     """
     if mode == 'constant':
         return _C.constant_pad_nd(input, list(pad), value)
@@ -619,9 +604,7 @@ def nll_loss(input, target, weight=None, size_average=None, ignore_index=-100,
              reduce=None, reduction='mean'):
     r"""The negative log likelihood loss.
 
-    Supports the same shapes as :func:`torch.nn.functional.nll_loss`: 1D
     ``input`` with a scalar ``target``, 2D ``(N, C)``, and N-d
-    ``(N, C, d_1, ..., d_k)`` (torch's ``nll_loss_nd``) with matching
     ``target``.
 
     See :class:`~tensorplay.nn.NLLLoss` for details.
@@ -641,14 +624,12 @@ def nll_loss(input, target, weight=None, size_average=None, ignore_index=-100,
         return output
 
     if input.dim() == 4:
-        # Native nll_loss2d kernel (ATen LossNLL.cpp parity): (N, C, H, W)
         # input with (N, H, W) target; autograd flows through
         # nll_loss2d_backward.
         t = target if target.dtype == DType.int64 else target.to(DType.int64)
         output, _ = _C.nll_loss2d(input, t, weight, reduction_enum, ignore_index)
         return output
 
-    # Port of at::native::nll_loss_nd_symint (aten/src/ATen/native/LossNLL.cpp:678):
     # every spatial position acts as its own batch row, so move classes last,
     # flatten to (-1, C), run the 2-D kernel and restore the target shape.
     if tuple(target.size())[1:] != tuple(input.size())[2:]:
@@ -671,8 +652,6 @@ def cross_entropy(input, target, weight=None, size_average=None, ignore_index=-1
                   reduce=None, reduction='mean', label_smoothing=0.0):
     r"""Compute the cross entropy loss between input logits and target.
 
-    Port of at::native::cross_entropy_loss_symint
-    (aten/src/ATen/native/LossNLL.cpp:633): equal input/target shapes select
     the class-probability path, positive ``label_smoothing`` blends the NLL
     with a smoothed uniform term, and otherwise this is
     ``nll_loss(log_softmax(input), target)`` with N-d support.
@@ -765,7 +744,6 @@ def cross_entropy(input, target, weight=None, size_average=None, ignore_index=-1
 # -----------------------------------------------------------------------------
 # Activation / misc functions.  These are thin wrappers over the native
 # dispatcher ops declared in config/native_functions.yaml; the element-wise
-# formulas live in the C++ kernels ported from ATen Activation*.cpp/.cu.
 # -----------------------------------------------------------------------------
 
 def gelu(input: Tensor, approximate: str = 'none') -> Tensor:
@@ -783,7 +761,6 @@ def gelu(input: Tensor, approximate: str = 'none') -> Tensor:
 def relu6(input: Tensor, inplace: bool = False) -> Tensor:
     r"""relu6(input, inplace=False) -> Tensor
 
-    ReLU6: :math:`\min(\max(0, x), 6)` — torch.nn.functional.relu6.
     """
     out = tensorplay.relu6(input)
     return input.copy_(out) if inplace else out
@@ -849,7 +826,6 @@ def normalize(input: Tensor, p: float = 2.0, dim: int = 1, eps: float = 1e-12) -
     r"""normalize(input, p=2, dim=1, eps=1e-12) -> Tensor
 
     Performs :math:`L_p` normalization over the specified dimension —
-    torch.nn.functional.normalize divides by clamp_min(norm, eps).
     """
     denom = input.norm([dim], p, True).clamp_min(eps)
     return input / denom
@@ -873,7 +849,6 @@ def interpolate(
     align_corners=None) -> Tensor
 
     Routes to the native ``upsample_*`` ops exactly like
-    torch.nn.functional.interpolate routes to ATen's upsample family.
     """
     if antialias:
         raise NotImplementedError("interpolate: antialias=True is not supported")
@@ -883,7 +858,6 @@ def interpolate(
         raise ValueError("only one of size or scale_factor should be defined")
 
     ndim = input.dim()
-    # Derive output size from scale_factor (torch: floor(in * scale)) so all
     # mode branches can operate on a concrete size.
     if size is None and scale_factor is not None:
         spatial = ndim - 2
@@ -908,7 +882,6 @@ def interpolate(
             return tensorplay.upsample_nearest3d(input, size_)
         raise ValueError(f"Expected 3D, 4D or 5D input, got {ndim}D")
 
-    # linear family requires align_corners (torch default False when omitted)
     if align_corners is None:
         align_corners = False
 
@@ -966,10 +939,9 @@ def multi_head_attention_forward(
     average_attn_weights: bool = True,
     is_causal: bool = False,
 ):
-    r"""torch-compatible multi_head_attention_forward.
+    r"""
 
     Follows the structure of
-    third_party/pytorch/aten/src/ATen/native/transformers/attention.cpp
     _scaled_dot_product_attention paths composed from dispatched primitives.
     """
     tgt_len, bsz, embed_dim = query.shape
@@ -1043,10 +1015,7 @@ def multi_head_attention_forward(
 
 
 # -----------------------------------------------------------------------------
-# Functions ported from torch.nn.functional (alignment pass).
-# Ops that are native in torch are implemented as compositions over the
 # dispatcher ops available here, following the formulas in
-# aten/src/ATen/native/*.cpp.
 # -----------------------------------------------------------------------------
 
 
@@ -1061,7 +1030,6 @@ def _get_reduction_enum(reduction: str) -> int:
 
 
 def _legacy_get_string(size_average, reduce):
-    """Port of torch._Reduction.legacy_get_string for deprecated args."""
     if size_average is None:
         size_average = True
     if reduce is None:
@@ -1081,7 +1049,6 @@ def logsigmoid(input: Tensor) -> Tensor:
 
     See :class:`~tensorplay.nn.LogSigmoid` for more details.
     """
-    # Native log_sigmoid kernel (ATen parity: min(x, 0) - log1p(exp(-|x|)));
     # autograd flows through log_sigmoid_backward.
     return _C.log_sigmoid(input)
 
@@ -1337,7 +1304,6 @@ def local_response_norm(
         return input
 
     # Windowed sum of squares along the channel axis (dim 1), equivalent to
-    # torch's pad + avg_pool formulation but computed with a cumulative sum.
     div = input.mul(input)
     pad_left = size // 2
     pad_right = (size - 1) // 2
@@ -1364,7 +1330,6 @@ def local_response_norm(
     lo = tensorplay.narrow(cs, 1, pad_left, c)
     window_sum = hi - lo
 
-    # torch divides the windowed sum by `size` via avg_pool before scaling.
     div = window_sum.mul(alpha / size).add(k).pow(beta)
     return input / div
 
@@ -1433,8 +1398,6 @@ def feature_alpha_dropout(
     if not training or p == 0 or input.numel() == 0:
         return input
 
-    # Port of at::_dropout_impl<feature=true, alpha=true> from
-    # aten/src/ATen/native/Dropout.cpp.
     alpha_c = 1.7580993408473766
     a = 1.0 / math.sqrt((alpha_c * alpha_c * p + 1) * (1 - p))
     b_coeff = alpha_c * a
@@ -1508,7 +1471,6 @@ def _none_or_dtype(input: Optional[Tensor]):
 
 
 # -----------------------------------------------------------------------------
-# Losses implemented in Python by torch (ported verbatim; native-backed losses
 # live in config/native_functions.yaml + p10 kernels).
 # -----------------------------------------------------------------------------
 
@@ -1662,10 +1624,8 @@ def triplet_margin_with_distance_loss(
 
 
 # =============================================================================
-# Alignment with third_party/pytorch torch/nn/functional.py (torch
 # 2.15.0a0 @ 893b6406).  Ops that are native in this repo call the dispatcher
 # directly; the rest are composed from dispatched primitives following the
-# formulas in aten/src/ATen/native/*.cpp so that autograd flows through the
 # same math without new kernels.
 # =============================================================================
 
@@ -1702,7 +1662,6 @@ def one_hot(tensor: Tensor, num_classes: int = -1) -> Tensor:
     r"""one_hot(tensor, num_classes=-1) -> LongTensor
 
     Returns long tensor shaped ``tensor.shape + (num_classes,)`` with a 1 at
-    each label position — port of ATen one_hot.
     """
     if num_classes < 0:
         if tensor.numel() == 0:
@@ -1739,7 +1698,6 @@ def rms_norm(
 
     Dispatches to the native fused kernel (single dispatch, CPU vectorized
     rows / CUDA block-per-row); falls back to the composite below under
-    autograd so gradients flow exactly like torch's
     CompositeImplicitAutograd rms_norm."""
     return _rms_norm_impl(input, normalized_shape, weight, eps)
 
@@ -1750,7 +1708,7 @@ def _rms_norm_composite(
     weight: Optional[Tensor] = None,
     eps: Optional[float] = None,
 ) -> Tensor:
-    r"""Composite reference — composed per the ATen
+    r"""
     rms_norm composite (fp32 compute for reduced dtypes)."""
     shape = list(normalized_shape) if isinstance(normalized_shape, (list, tuple)) else [int(normalized_shape)]
     ndim = len(shape)
@@ -1777,7 +1735,6 @@ def _rms_norm_impl(
     """Native fused kernel (CPU vectorized rows / CUDA block-per-row).
 
     Falls back to the composite above under autograd: the native forward has
-    no backward, and torch's rms_norm is CompositeImplicitAutograd (grad
     flows through its inner ops), so training graphs must keep composing."""
     needs_grad = tensorplay.is_grad_enabled() and (
         input.requires_grad
@@ -1802,7 +1759,6 @@ def gumbel_softmax(
 ) -> Tensor:
     r"""Sample from the Gumbel-Softmax distribution and optionally discretize.
 
-    Port of torch.nn.functional.gumbel_softmax (reparametrization trick;
     straight-through when ``hard=True``).
     """
     if eps != 1e-10:
@@ -2014,8 +1970,6 @@ def binary_cross_entropy_with_logits(
 ) -> Tensor:
     r"""Compute Binary Cross Entropy between target and input logits.
 
-    Numerically stable port of aten::binary_cross_entropy_with_logits
-    (aten/src/ATen/native/Loss.cpp): ``(1 - z) * x - pos_weight_scaled_log_sigmoid(x)``,
     optionally rescaled by ``weight``, then reduced.
     See :class:`~tensorplay.nn.BCEWithLogitsLoss` for details.
     """
@@ -2149,7 +2103,6 @@ def multi_margin_loss(
 ) -> Tensor:
     r"""Compute the multi margin loss, with optional weighting.
 
-    Native ATen-aligned op (aten/src/ATen/native/LossMultiMargin.cpp):
     ``sum_d max(0, margin - x_y + x_d)^p * w_y / C`` over non-target classes.
     See :class:`~tensorplay.nn.MultiMarginLoss` for details.
     """
@@ -2172,7 +2125,6 @@ def multilabel_margin_loss(
 ) -> Tensor:
     r"""Compute the multilabel margin loss.
 
-    Native ATen-aligned op (aten/src/ATen/native/LossMultiLabelMargin.cpp):
     for each positive label ``y`` (targets are active until the first
     ``-1``), add ``max(0, 1 - x[y] + x[d])`` over non-target labels ``d``;
     divide by C.
@@ -2228,7 +2180,6 @@ def ctc_loss(
 ) -> Tensor:
     r"""Compute the Connectionist Temporal Classification loss.
 
-    Vectorized dynamic-programming port of aten/src/ATen/native/LossCTC.cpp
     (alpha recurrence over the blank-extended target sequence); autograd flows
     through ``log_probs`` via the composed primitives.
 
@@ -2315,7 +2266,6 @@ def pixel_shuffle(input: Tensor, upscale_factor: int) -> Tensor:
     r"""Rearranges elements in a tensor of shape ``(*, C x r^2, H, W)`` to a
     tensor of shape ``(*, C, H x r, W x r)``.
 
-    Port of aten::pixel_shuffle: ``output[n, c, h*r+i, w*r+j] =
     input[n, c*r^2 + i*r + j, h, w]``.
     """
     r = int(upscale_factor)
@@ -2364,7 +2314,6 @@ def channel_shuffle(input: Tensor, groups: int) -> Tensor:
 
 
 def native_channel_shuffle(input: Tensor, groups: int) -> Tensor:
-    r"""Native channel shuffle primitive (torch.native_channel_shuffle)."""
     return channel_shuffle(input, groups)
 
 
@@ -2386,7 +2335,6 @@ def affine_grid(theta: Tensor, size, align_corners=None) -> Tensor:
     r"""Generate 2D or 3D flow field (sampling grid), given a batch of affine
     matrices :attr:`theta`.
 
-    Port of aten/src/ATen/native/AffineGridGenerator.cpp.
     """
     if align_corners is None:
         warnings.warn(
@@ -2429,7 +2377,6 @@ def _gs_unnormalize(coord, size, align_corners):
 
 
 def _gs_adjust(coord, size, padding_mode, align_corners=False):
-    """Port of ATen GridSampler.h compute_coordinates (border/reflection)."""
     if isinstance(padding_mode, str):
         padding_mode = GRID_SAMPLE_PADDING_MODES.index(padding_mode)
     if padding_mode == 1:  # border
@@ -2478,7 +2425,6 @@ def _grid_sample_gather(input, xs, ys, in_bounds):
         [N, C, xs.shape[-2], xs.shape[-1]])
     if in_bounds is not None:
         # expand (not broadcast): our engine lacks the sum-to-shape reduction
-        # torch applies in Engine::validate_outputs, so broadcast muls would
         # propagate wrong-shaped grads to non-leaf operands mid-graph.
         vals = vals * in_bounds.unsqueeze(1).expand(
             [N, C, xs.shape[-2], xs.shape[-1]]).to(vals.dtype)
@@ -2492,7 +2438,6 @@ def _grid_sampler_2d(input, grid, interpolation_mode, padding_mode, align_corner
     H_out, W_out = grid.shape[1], grid.shape[2]
     x = _gs_unnormalize(grid[..., 0], W_in, align_corners)
     y = _gs_unnormalize(grid[..., 1], H_in, align_corners)
-    # ATen bicubic skips coordinate-level padding: each cubic tap index is
     # padding-adjusted individually instead (GridSamplerKernel.cpp
     # Bicubic::get_value_bounded -> compute_coordinates).
     if padding_mode != 0 and interpolation_mode != 2:
@@ -2500,7 +2445,6 @@ def _grid_sampler_2d(input, grid, interpolation_mode, padding_mode, align_corner
         y = _gs_adjust(y, H_in, padding_mode, align_corners)
 
     if interpolation_mode == 1:  # nearest
-        # ATen uses nearbyint (round half to even) on the padded coordinate.
         xi = tensorplay.round(x).to(DType.int64)
         yi = tensorplay.round(y).to(DType.int64)
         ib = tensorplay.logical_and(
@@ -2508,7 +2452,6 @@ def _grid_sampler_2d(input, grid, interpolation_mode, padding_mode, align_corner
             tensorplay.logical_and(yi >= 0, yi < H_in)) if padding_mode == 0 else None
         vals = _grid_sample_gather(input, xi, yi, ib)
         if x.requires_grad:
-            # torch's nearest backward hand-writes an all-zero d/dgrid; our
             # composite has no such automatic path (embedding backward emits
             # gradients for weights only), so bridge an exact-zero term.
             vals = vals + (x * 0).sum()
@@ -2597,7 +2540,6 @@ def grid_sample(
         align_corners (bool, optional): extrema treatment, default ``False``.
 
     Dispatches to the native grid_sampler_2d / grid_sampler_3d kernels
-    (aten/src/ATen/native/cuda/GridSampler.cu semantics); autograd flows to
     both :attr:`input` and :attr:`grid`.
     """
     if mode not in GRID_SAMPLE_INTERPOLATION_MODES:
@@ -2633,7 +2575,6 @@ def _grid_sampler_3d(input, grid, interpolation_mode, padding_mode, align_corner
         padding_mode = GRID_SAMPLE_PADDING_MODES.index(padding_mode)
     N, C, D_in, H_in, W_in = input.shape
     D_out, H_out, W_out = grid.shape[1], grid.shape[2], grid.shape[3]
-    # ATen: grid[...,0]->x (W), grid[...,1]->y (H), grid[...,2]->z (D).
     x = _gs_unnormalize(grid[..., 0], W_in, align_corners)
     y = _gs_unnormalize(grid[..., 1], H_in, align_corners)
     z = _gs_unnormalize(grid[..., 2], D_in, align_corners)
@@ -2679,7 +2620,6 @@ def _grid_sampler_3d(input, grid, interpolation_mode, padding_mode, align_corner
         ib = bounds3(xi, yi, zi) if padding_mode == 0 else None
         vals = gather3(xi, yi, zi, ib)
         if x.requires_grad:
-            # See the 2D nearest branch: torch writes an explicit zero
             # d/dgrid; bridge one so grid.grad stays defined.
             vals = vals + (x * 0).sum()
         return vals
@@ -2710,7 +2650,7 @@ def _is_float_dtype(dt):
 
 def _vector_norm(vec, p, keepdim=False):
     """Norm over the last dim of a broadcast difference, matching
-    at::norm(x1 - x2 + eps, p, innermost_dim, keepdim)."""
+"""
     dim = vec.dim() - 1
     if p == float("inf"):
         return _C.max(vec.abs(), dim=dim, keepdim=keepdim)[0]
@@ -2724,7 +2664,6 @@ def _vector_norm(vec, p, keepdim=False):
 def pairwise_distance(x1: Tensor, x2: Tensor, p: float = 2.0, eps: float = 1e-6, keepdim: bool = False) -> Tensor:
     r"""Computes the pairwise distance between input vectors.
 
-    Port of aten::pairwise_distance: ``norm(x1 - x2 + eps, p)`` over the last
     dimension.
     """
     return _vector_norm(x1 - x2 + eps, p, keepdim)
@@ -2734,7 +2673,6 @@ def pdist(input: Tensor, p: float = 2.0) -> Tensor:
     r"""Computes the pairwise distance between rows of :attr:`input`.
 
     Returns the flattened upper triangle of the ``N x N`` distance matrix —
-    port of aten::pdist semantics.
     """
     if input.dim() != 2:
         raise RuntimeError(f"pdist expects a 2D input, got {input.dim()}D")
@@ -2748,7 +2686,7 @@ def pdist(input: Tensor, p: float = 2.0) -> Tensor:
 
 def _no_grad_embedding_renorm_(weight: Tensor, input, max_norm: float, norm_type: float) -> Tensor:
     """Renorm referenced embedding rows in-place under no_grad (port of
-    at::_no_grad_embedding_renorm_)."""
+"""
     with tensorplay.no_grad():
         if input.numel() == 0 or weight.numel() == 0:
             return weight
@@ -2781,7 +2719,6 @@ def embedding_bag(
 ) -> Tensor:
     r"""Compute sums, means or maxes of ``bags`` of embeddings.
 
-    Composition of aten::embedding_bag from dispatched primitives; supports
     1-D inputs with :attr:`offsets` (incl. ``include_last_offset``), fixed
     length 2-D inputs, ``per_sample_weights`` (sum mode), ``padding_idx``
     exclusion and ``max_norm`` renormalization.
@@ -2931,7 +2868,6 @@ def scaled_dot_product_attention(
     dropout_p=0.0, is_causal=False, scale=None, backend=None) -> Tensor
 
     Computes scaled dot product attention on query, key and value. Routes to
-    the fused native kernel when possible, otherwise follows torch's math
     reference:
 
     .. math::
@@ -2942,7 +2878,6 @@ def scaled_dot_product_attention(
             ``'math'``, or ``None`` to pick automatically. ``'flash'``
             selects the fused flash-attention kernel (impl=1), ``'math'``
             forces the composed reference path; ``'mem_efficient'``,
-            matching torch's memory-efficient backend, is not available in
             this build.
     """
     if attn_mask is not None and is_causal:
@@ -3087,7 +3022,6 @@ def scaled_mm(*args, **kwargs):
 
 
 # -----------------------------------------------------------------------------
-# Private helpers ported for API parity with torch.nn.functional.
 # -----------------------------------------------------------------------------
 
 
@@ -3100,7 +3034,6 @@ def _get_softmax_dim(name: str, ndim: int, stacklevel: int = 3) -> int:
 
 
 def _mha_shape_check(query, key, value, key_padding_mask, attn_mask, num_heads):
-    """Port of torch.nn.functional._mha_shape_check."""
     if query.dim() == 3:
         bsz, tgt_len, embed_dim_to_check = query.shape
         assert query.shape == (bsz, tgt_len, embed_dim_to_check)
@@ -3143,7 +3076,7 @@ def _in_projection(
     b_k=None,
     b_v=None,
 ):
-    """Port of torch.nn.functional._in_projection: a triple of linear
+    """
     projections with shape constraints ensuring embedding uniformity."""
     Eq, Ek, Ev = q.size(-1), k.size(-1), v.size(-1)
     if w_q.shape != (Eq, Eq):
@@ -3162,12 +3095,10 @@ def _in_projection(
 
 
 def _in_projection_packed(q, k, v, w, b=None):
-    """Port of torch.nn.functional._in_projection_packed."""
     E = q.size(-1)
     if k is v:
         if q is k:
             # self-attention: one packed projection. Reshape (not chunk) so an
-            # out-feature count that is not 3*E raises, matching torch's
             # unflatten(-1, (3, E)) validation.
             proj = linear(q, w, b)
             p = proj.reshape(tuple(proj.shape[:-1]) + (3, E))
@@ -3188,7 +3119,6 @@ def _in_projection_packed(q, k, v, w, b=None):
         kv_proj = linear(k, w_kv, b_kv)
         p_k, p_v = tensorplay.chunk(kv_proj, 2, dim=-1)
         return q_proj, p_k.contiguous(), p_v.contiguous()
-    # separate tensors: three packed projections (torch unflattens dim 0 to
     # (3, -1), which requires the row count to be divisible by three).
     if w.size(0) % 3 != 0:
         raise RuntimeError(
@@ -3210,9 +3140,7 @@ def _in_projection_packed(q, k, v, w, b=None):
 # -----------------------------------------------------------------------------
 # Pooling family (F-alignment).  Native kernels exist for 2-D pooling only;
 # 3-D pools decompose into 2-D + 1-D stages (window placement factors per
-# dimension, so results match ATen exactly, including ceil_mode/padding).
 # Index-returning variants reuse the native/composed values and recover
-# torch's per-plane linear indices through an embedding-gather argmax.
 # -----------------------------------------------------------------------------
 
 
@@ -3230,7 +3158,6 @@ def _pool_out_size(in_size, k, s, p, d, ceil_mode):
 def _max_pool2d_indices(x4, kernel_size, stride, padding, dilation, oH=None, oW=None):
     """Per-plane linear indices of a 2-D max pool over ``(N, C, H, W)``.
 
-    Mirrors ATen's convention: indices address the *unpadded* input plane as
     ``row * W + col``; first occurrence wins ties.
     """
     with tensorplay.no_grad():
@@ -3295,7 +3222,6 @@ def max_pool2d_with_indices(
     stride = kernel_size if stride is None else _pair(stride)
     padding = _pair(padding)
     dilation = _pair(dilation)
-    # Native kernel (ATen DilatedMaxPool2d.cpp parity): returns values plus
     # int64 indices into each (n, c) input plane; autograd flows through
     # max_pool2d_with_indices_backward.
     return _C.max_pool2d_with_indices(input, list(kernel_size), list(stride),
@@ -3355,7 +3281,6 @@ def max_pool3d(
     sd, sh, sw = _triple(stride) if stride is not None else (kd, kh, kw)
     pd_, ph, pw = _triple(padding)
     dd, dh, dw = _triple(dilation)
-    # Native kernel (ATen DilatedMaxPool3d.cpp parity); autograd flows through
     # max_pool3d_backward.
     return _C.max_pool3d(input, [kd, kh, kw], [sd, sh, sw], [pd_, ph, pw],
                          [dd, dh, dw], ceil_mode)
@@ -3408,8 +3333,9 @@ def avg_pool3d(
     else:
         sd, sh, sw = _triple(stride)
     pd_, ph, pw = _triple(padding)
-    return _C.avg_pool3d(x, (kd, kh, kw), (sd, sh, sw), (pd_, ph, pw),
-                         ceil_mode, count_include_pad, divisor_override)
+    output = _C.avg_pool3d(x, (kd, kh, kw), (sd, sh, sw), (pd_, ph, pw),
+                            ceil_mode, count_include_pad, divisor_override)
+    return output.squeeze(0) if unbatched else output
 
 
 def adaptive_avg_pool3d(input: Tensor, output_size) -> Tensor:
@@ -3479,7 +3405,6 @@ def _adaptive_max_pool2d_wi(x4, oH, oW):
                                       device=x4.device).view(1, 1, -1, 1))
                 col = tensorplay.where(sel, ci, ci * 0).sum(2).view(N, C)
                 vals.append(rv.view(N, C))
-                # ATen stores absolute plane-linear indices: y * W + x.
                 idxs.append((hs_list[i] + ri) * W + (ws_list[j] + col))
         v = tensorplay.stack(vals, dim=2).reshape(N, C, oH, oW)
         ix = tensorplay.stack(idxs, dim=2).reshape(N, C, oH, oW)
@@ -3518,7 +3443,6 @@ def adaptive_max_pool1d_with_indices(input: Tensor, output_size, return_indices:
 
 
 def _adaptive_max_values_3d(x5, od, oh, ow):
-    """Returns ``(values, indices)``; torch-style linear index into CHW."""
     N, C, D, H, W = x5.shape
     hs, he = _adaptive_window_bounds(D, od)
     vs, ixs = [], []
@@ -3537,7 +3461,6 @@ def _adaptive_max_values_3d(x5, od, oh, ow):
         z = zt_idx.reshape(N, C, ow, oh).transpose(2, 3)
         sel = z.unsqueeze(2).eq(tensorplay.arange(dsz, dtype=DType.int64,
                                                  device=x5.device).view(1, 1, -1, 1, 1))
-        # torch linear index spans the full CHW plane: (z*H + y)*W + x.
         win_idx = (pi * sel).sum(2) + (hs[d] + z) * (H * W)
         ixs.append(win_idx)
     return tensorplay.stack(vs, dim=2), tensorplay.stack(ixs, dim=2)
@@ -3554,7 +3477,6 @@ def adaptive_max_pool3d(input: Tensor, output_size, return_indices: bool = False
     od, oh, ow = _triple(output_size)
     if return_indices:
         return adaptive_max_pool3d_with_indices(input, (od, oh, ow))
-    # Native kernel (ATen AdaptiveMaxPooling3d.cpp parity); autograd flows
     # through adaptive_max_pool3d_backward.
     return _C.adaptive_max_pool3d(input, [od, oh, ow])
 
@@ -3580,14 +3502,13 @@ def adaptive_max_pool3d_with_indices(input: Tensor, output_size, return_indices:
 
 
 # -----------------------------------------------------------------------------
-# Fractional max pooling (port of aten/src/ATen/native/FractionalMaxPooling.h
 # generate_intervals + FractionalMaxPool{2d,3d}.cpp window scan, vectorized
 # through an embedding gather so autograd flows to the input).
 # -----------------------------------------------------------------------------
 
 
 def _frac_generate_intervals(sample, in_size, out_size, pool_size):
-    """Port of at::native::generate_intervals for one sample column.
+    """
 
     ``sample`` is a ``(P,)`` float tensor; returns ``(P, out_size)`` int64
     window start positions.
@@ -3607,7 +3528,6 @@ def _frac_generate_intervals(sample, in_size, out_size, pool_size):
 
 
 def _frac_pool_check(input, _random_samples, ndim_spatial):
-    """Port of at::native::fractional_max_pool_check_shape."""
     if _random_samples.dim() != 3:
         raise ValueError(f"Expect _random_samples to have 3 dimensions, got {_random_samples.dim()}")
     nbatch = 1 if input.dim() == ndim_spatial + 1 else input.size(0)
@@ -3624,7 +3544,6 @@ def _frac_windowed_max(x_planes, pos, plane_size):
     """Max + argmax of windows gathered per-plane through an embedding lookup.
 
     x_planes: ``(P, V)``; pos: ``(P, M, K)`` int64 within-plane positions.
-    Returns ``(values (P, M), indices (P, M))``. NaNs win like ATen's
     ``val > maxVal || isnan(val)`` scan.
     """
     P = x_planes.size(0)
@@ -3632,7 +3551,6 @@ def _frac_windowed_max(x_planes, pos, plane_size):
     base = (tensorplay.arange(P, dtype=DType.int64, device=x_planes.device) * plane_size).view(P, 1)
     gid = base + pos.reshape(P, M * K)
     vals = tensorplay.embedding(x_planes.contiguous().reshape(-1), gid).view(P, M, K)
-    # NaN beats any finite value (ATen takes NaN preferentially)
     sub = tensorplay.where(vals.ne(vals), tensorplay.full_like(vals, float("inf")), vals)
     am = _C.argmax(sub, 2, False)  # window-max index along K
     kar = tensorplay.arange(K, dtype=DType.int64, device=x_planes.device).view(1, 1, K)
@@ -3690,7 +3608,6 @@ def fractional_max_pool2d_with_indices(
         _random_samples = tensorplay.rand(B, C, 2, dtype=input.dtype, device=input.device)
     _frac_pool_check(x, _random_samples, 2)
 
-    # Native kernel (aten/src/ATen/native/FractionalMaxPool2d.cpp semantics):
     # intervals derive from _random_samples, indices are flat in-plane offsets.
     values, indices = _C.fractional_max_pool2d(x, [kh, kw], [oH, oW], _random_samples)
     if unbatched:
@@ -3745,7 +3662,6 @@ def fractional_max_pool3d_with_indices(
     several input planes, returning ``(output, indices)``.
 
     Each plane consumes three random samples ordered ``(T, H, W)``, matching
-    aten/src/ATen/native/FractionalMaxPool3d.cpp.
     """
     if output_size is None and output_ratio is None:
         raise ValueError("fractional_max_pool3d requires specifying either an output_size or an output_ratio")
@@ -3774,7 +3690,6 @@ def fractional_max_pool3d_with_indices(
         _random_samples = tensorplay.rand(B, C, 3, dtype=input.dtype, device=input.device)
     _frac_pool_check(x, _random_samples, 3)
 
-    # Native kernel (aten/src/ATen/native/FractionalMaxPool3d.cpp semantics);
     # samples ordered (T, H, W), indices flat in-plane offsets.
     values, indices = _C.fractional_max_pool3d(x, [kt, kh, kw], [oT, oH, oW], _random_samples)
     if unbatched:
@@ -3830,7 +3745,6 @@ def _unpool_output_size(
     padding,
     output_size,
 ):
-    """Port of torch.nn.functional._unpool_output_size."""
     input_size = input.size()
     n = len(kernel_size)
     default_size = [
@@ -3880,8 +3794,6 @@ def max_unpool1d(
     _stride = _single(stride) if stride is not None else kernel_size
     padding = _single(padding)
     output_size = _unpool_output_size(input, kernel_size, _stride, padding, output_size)
-    # ATen has no native max_unpool1d; torch routes it through the 2d kernel
-    # with a trailing singleton dimension (torch/nn/functional.py max_unpool1d).
     return _C.max_unpool2d(
         input.unsqueeze(-1), indices.unsqueeze(-1), list(output_size) + [1]
     ).squeeze(-1)
@@ -3903,7 +3815,6 @@ def max_unpool2d(
     _stride = _pair(stride) if stride is not None else kernel_size
     padding = _pair(padding)
     output_size = _unpool_output_size(input, kernel_size, _stride, padding, output_size)
-    # Native kernel (aten/src/ATen/native/MaxUnpooling.cpp semantics): scatter
     # pooled values into a zero canvas at the flat in-plane int64 indices.
     return _C.max_unpool2d(input, indices, list(output_size))
 
@@ -3924,5 +3835,4 @@ def max_unpool3d(
     _stride = _triple(stride) if stride is not None else kernel_size
     padding = _triple(padding)
     output_size = _unpool_output_size(input, kernel_size, _stride, padding, output_size)
-    # Native kernel; stride/padding are validation-only, matching ATen.
     return _C.max_unpool3d(input, indices, list(output_size), list(_stride), list(padding))

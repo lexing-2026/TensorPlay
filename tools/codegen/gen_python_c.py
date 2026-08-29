@@ -45,7 +45,7 @@ def _default_pyobject(a, expr: str) -> str:
         if not (expr.startswith('"') and expr.endswith('"')):
             raise SystemExit(
                 f"unsupported string default {expr!r} "
-                "(expected double-quoted ATen spelling)")
+                "(expected double-quoted spelling)")
         return f"PyUnicode_FromString({expr})"
     if a.type.is_list:
         return expr  # marker: caller emits a list-builder helper
@@ -347,7 +347,6 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
         ]
         arg_arr, arg_n = "ap", "an"
         # A bare Tensor passed to a TensorList splat folds to a singleton
-        # (torch.block_diag(t)); lists/tuples pass through untouched.
         if "tensorlist" in _BRIDGE.get(cpp_arg_type(_pos[-1].type), ""):
             body += [
                 "        if (an == " + str(P) + " && ap[" + str(P - 1) + "] != nullptr &&",
@@ -416,7 +415,6 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
             out.append(
                 f"        PyObject* r_{i} = {src} ? {src} : k{i};")
         elif i == splat_slot:
-            # Zero folded positionals (torch.block_diag()) parse as an empty
             # trailing list instead of a missing required argument.
             out.append(f"        PyObject* r_{i} = {src} ? {src} : PyTuple_New(0);")
         else:
@@ -463,7 +461,6 @@ def _gen_python_capi(ctx: CodegenContext) -> None:
     ]
     fn_table: list[str] = []
     meth_table: list[str] = []
-    # torch parity: Tensor.real / Tensor.imag are properties (getset
     # descriptors), not methods -- their zero-arg method wrappers double as
     # property getters.
     property_methods = {"real", "imag"}
@@ -582,7 +579,7 @@ def _gen_python_capi(ctx: CodegenContext) -> None:
         "    {nullptr, nullptr, 0, nullptr},",
         "};",
         "",
-        "// torch parity: Tensor.real / Tensor.imag surface as properties.",
+        "// Tensor.real / Tensor.imag surface as properties.",
         "inline PyGetSetDef generated_tensor_properties[] = {",
         *prop_table,
         "    {nullptr, nullptr, nullptr, nullptr, nullptr},",

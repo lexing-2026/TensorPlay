@@ -1,6 +1,6 @@
 """Generators for TensorGenerated.h/.cpp and TensorRedispatchGenerated.h.
 
-Structure mirrors upstream's gen_api.py + RegisterGeneratedKernels output:
+Structure follows the generator's split between redispatch and public methods:
 every op gets (1) a backend `redispatch` entry point that resolves its kernel
 through the Dispatcher, bumps versions of mutated arguments, and is shared by
 the eager path and the autograd wrappers, and (2) a public Tensor method that
@@ -124,7 +124,11 @@ def generate_header(funcs: list[NativeFunction]) -> str:
             # not declare the same member twice.
             continue
         for variant in _variant_instances(f):
-            key = method_signature(f, variant, declaration=True)
+            # (`int[]`) intentionally share the same std::vector ABI.  Their
+            # schema defaults may differ (`padding=0` vs `padding=[]`), but
+            # C++ cannot overload those declarations.  Deduplicate on the
+            # signature without defaults, matching generate_cpp's definition
+            key = method_signature(f, variant, declaration=False)
             if key in seen_decl:
                 continue
             seen_decl.add(key)
@@ -184,7 +188,6 @@ def _emit_redispatch(lines, f, variant, dev_src):
     lines.append(f"TENSORPLAY_API {ret} {redispatch_name}({', '.join(rd_args)}) {{")
     # Op-level profiler record: every dispatched execution passes through
     # exactly one redispatch funnel, so this is the single instrumentation
-    # point (upstream's analog is the RecordFunction guard around aten
     # dispatch).  Inactive cost: one acquire-load of a static atomic.
     lines.append(
         f'    tensorplay::prof::OpRecord __tp_prof_rec("{f.func_name}");')
@@ -350,8 +353,7 @@ def generate_cpp(funcs: list[NativeFunction], *,
     lines = [_CPP_INCLUDES.rstrip("\n"), "", "namespace tensorplay {", ""]
 
     # Ops declared `variants: function, method` but without a `self` argument
-    # produce identical signatures for both variants; emit only the first
-    # (mirrors generate_header's seen_decl dedup).
+    # produce identical signatures for both variants; emit only the first.
     seen_def = set()
     for f in funcs:
         if f.skip_implementation:
@@ -378,7 +380,6 @@ def generate_cpp(funcs: list[NativeFunction], *,
                 lines.append("    }")
 
             if f.cpp_name == "contiguous":
-                # torch parity (aten/src/ATen/core/TensorBase.h: TensorBase::
                 # contiguous): resolve contiguity BEFORE any dispatch. When the
                 # input is already contiguous the input tensor itself is
                 # returned; otherwise internal kernel call sites (e.g. the

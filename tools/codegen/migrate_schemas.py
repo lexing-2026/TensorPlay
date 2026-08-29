@@ -1,10 +1,8 @@
-"""Migrate config/native_functions.yaml schemas to ATen canonical spelling.
+"""
 
-For every TensorPlay operator that also exists upstream, adopt ATen's exact
 `- func:` string (argument names, kwarg-only markers, defaults, tuple-return
 spelling) whenever the mapped C++ ABI is identical -- same argument types in
 the same order and the same return kind.  Entries whose ABI differs from
-ATen (kernel signatures were written against the TP dialect) are kept as-is
 and reported, so backend work can catch up op by op.
 
 Usage:
@@ -33,7 +31,6 @@ ATEN_YAML = (ROOT / "third_party" / "pytorch" /
              "aten" / "src" / "ATen" / "native" / "native_functions.yaml")
 
 # Repo root must WIN over any vendored tree that also ships a `tools`
-# package (e.g. the pytorch checkout under third_party/).
 sys.path.insert(0, str(ROOT))
 
 from tools.codegen.api_types import cpp_arg_type  # noqa: E402
@@ -64,7 +61,6 @@ def load_aten_schemas() -> dict[str, str]:
         if not func:
             continue
         name = func.split("(", 1)[0]
-        # First definition wins, matching torchgen's duplicate rejection.
         out.setdefault(name, func)
     return out
 
@@ -72,7 +68,6 @@ def load_aten_schemas() -> dict[str, str]:
 
 # ---------------------------------------------------------------------------
 # Pure spelling canonicalization (no semantic/ABI change beyond the
-# documented Tensor-x={} -> Tensor?-x=None sugar, which matches ATen).
 # ---------------------------------------------------------------------------
 
 _TUPLE_RE = re.compile(r"->\s*std::tuple<([^>]*)>\s*$")
@@ -83,15 +78,12 @@ _LIST_DEFAULT_RE = re.compile(
 
 
 def _canonicalize_schema(func: str, extras: dict | None = None) -> str:
-    """Rewrite one `- func:` string into ATen-canonical grammar.
+    """
 
     Non-empty list defaults (`int[] stride={1, 1}`) are not representable in
     upstream's grammar (only broadcast scalars or `[]`); they are moved to the
     entry-level `python_defaults` table so the Python/pybind surface keeps
-    torch-compatible defaults while kernels keep receiving full vectors.
     """
-    # 0) spelling normalization FIRST so later stages see ATen names
-    #    (ATen: int == int64, float == double, ScalarType is the enum)
     func = re.sub(r"\bint64_t(\??)", r"int\1", func)
     func = re.sub(r"(?<=[\s(])double(?=\s+[A-Za-z_])", "float", func)
     func = re.sub(r"\bDType(\??)", r"ScalarType\1", func)
@@ -106,7 +98,6 @@ def _canonicalize_schema(func: str, extras: dict | None = None) -> str:
     func = _LIST_DEFAULT_RE.sub(_sub_list_default, func)
 
     # 2) multi-mutable in-place ops: only `self` keeps its write annotation
-    #     (torchgen requires returns[0].annotation == self.annotation).
     if re.search(r"Tensor\([a-z]!\)\s+growth_tracker", func):
         func = re.sub(r"Tensor\([a-z]!\)(\s+growth_tracker)", r"Tensor\1", func)
 

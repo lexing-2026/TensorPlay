@@ -126,9 +126,7 @@ Tensor.type = type
 def unfold(self, dimension, size, step):
     """Returns a view of the original tensor which contains all slices of
     size :attr:`size` from :attr:`self` in the dimension :attr:`dimension`,
-    stepping by :attr:`step` (torch's ``Tensor.unfold``).
 
-    Delegates to the native ``unfold.Tensor`` kernel (torch-exact as_strided
     view semantics, including 0-d inputs and error messages).
     """
     return _C.unfold(self, dimension, size, step)
@@ -138,7 +136,7 @@ Tensor.unfold = unfold
 
 
 def register_hook(self, hook):
-    """Registers a backward hook (torch's ``Tensor.register_hook``).
+    """
 
     The hook is called every time a gradient with respect to this tensor is
     computed. It may modify the gradient by returning a replacement Tensor;
@@ -196,7 +194,7 @@ Tensor.register_hook = register_hook
 
 
 def register_post_accumulate_grad_hook(self, hook):
-    """Registers a hook (torch's ``Tensor.register_post_accumulate_grad_hook``).
+    """
 
     The hook runs after the gradient has been accumulated into ``self.grad``.
     It receives the tensor (the parameter) and its return value is ignored;
@@ -242,7 +240,6 @@ Tensor.register_post_accumulate_grad_hook = register_post_accumulate_grad_hook
 
 
 # ---------------------------------------------------------------------------
-# permute: accept both permute(*dims) and permute(dims_list), like torch.
 # The C++ binding takes a single sequence; normalize the variadic form here.
 # ---------------------------------------------------------------------------
 _orig_permute = Tensor.permute
@@ -258,7 +255,6 @@ Tensor.permute = _permute
 
 
 # ---------------------------------------------------------------------------
-# expand: accept both expand(size) and expand(*size), like torch.  torch's
 # generated TensorMethods binding also names the parameter `size`, so
 # t.expand(size=[2, 3]) is valid there; keep that surface here.
 # ---------------------------------------------------------------------------
@@ -285,7 +281,6 @@ Tensor.expand = _expand
 
 
 # ---------------------------------------------------------------------------
-# item: torch's Tensor.item() returns a native Python number.  The generated
 # binding boxes into a tp Scalar wrapper, so route through _C.item_python
 # which unboxes in C++ (bool/int/float/complex by dtype) — one frame, no
 # per-call imports.
@@ -299,12 +294,9 @@ Tensor.item = item
 # ---------------------------------------------------------------------------
 # __bool__ lives in the C extension (nb_bool slot on TensorBase): empty ->
 # RuntimeError "no values is ambiguous", one element -> value != 0, more ->
-# RuntimeError "more than one value is ambiguous", verbatim torch.
 
 
 # ---------------------------------------------------------------------------
-# new_* factory methods (torch parity): result keeps device, takes explicit
-# dtype override like torch (defaults to self.dtype).
 # ---------------------------------------------------------------------------
 def _norm_new_size(size):
     if len(size) == 1 and hasattr(size[0], "__iter__") and \
@@ -373,7 +365,6 @@ Tensor.new_tensor = _new_tensor
 
 
 # ---------------------------------------------------------------------------
-# dtype shortcut methods (torch parity). float/int/long/double already exist
 # as generated bindings; add the rest of the family.
 # ---------------------------------------------------------------------------
 _DTYPE_SHORTCUTS = {
@@ -400,7 +391,6 @@ del _attr, _dt
 
 # ---------------------------------------------------------------------------
 # pointwise method forms routed through the top-level composites so the
-# integer-division direction matches torch (floor vs trunc).
 # ---------------------------------------------------------------------------
 def _cf(name):
     from . import _composite_funcs
@@ -453,10 +443,8 @@ Tensor.repeat_interleave = repeat_interleave
 
 
 # ---------------------------------------------------------------------------
-# torch.Tensor.max / .min overload parity: the native binding exposes the
 # reduction faces returning plain tuples.  Restore (a) the elementwise binary
 # form ``t.max(Tensor)`` and (b) the named-tuple contract with
-# ``values``/``indices`` for dim reductions (torch.return_types).
 # ---------------------------------------------------------------------------
 _native_tensor_max = Tensor.max
 _native_tensor_min = Tensor.min
@@ -519,7 +507,6 @@ Tensor.nonzero = nonzero
 
 
 def unique(self, sorted=True, return_inverse=False, return_counts=False):
-    # native op always computes all three outputs; mirror torch.unique's
     # public contract of returning 1/2/3 tensors depending on the flags.
     values, inverse, counts = _C.unique(self, sorted, True, True)
     outs = [values]
@@ -658,7 +645,6 @@ Tensor.__index__ = __index__
 
 
 # ---------------------------------------------------------------------------
-# Device / layout query face (torch.Tensor parity).  The movement family
 # (cpu/cuda/to/pin_memory/record_stream) is bound natively; these are the
 # remaining queries and aliases.
 # ---------------------------------------------------------------------------
@@ -685,7 +671,6 @@ del _is_cpu, _is_cuda
 
 
 def xpu(self, device=None):
-    """Moves to the XPU device (torch parity; raises without an XPU backend)."""
     if device is None:
         return self.to(_C.Device(_C.DeviceType.XPU))
     if builtins_int(device) == device and not isinstance(device, str):

@@ -1,13 +1,9 @@
-"""Custom-operator code generator (TensorPlay's TORCH_LIBRARY analog).
+"""
 
-Given a custom-op yaml in ATen schema grammar (the same parser as the main
-pipeline -- vendored torchgen), emits:
 
 * ``OpsGenerated.h``  -- declarations the user must implement, one per
   dispatch entry (``myop_cpu`` / ``myop_cuda``), exactly like implementing
-  kernels for a TORCH_LIBRARY.
 * ``OpsBinding.cpp``  -- dispatcher registration for every backend entry
-  (mirroring ``TORCH_LIBRARY_IMPL(<ns>, CPU/CUDA)``), a device-resolving
   public wrapper per op that routes through p10's Dispatcher/DispatchStub,
   and a raw CPython ``PyInit_<module>`` exposing those wrappers through
   ``METH_FASTCALL | METH_KEYWORDS`` entry points on the shared
@@ -125,7 +121,7 @@ def generate_binding(funcs, module_name: str) -> str:
         "namespace tp_custom {",
         f"namespace {module_name} {{",
         "",
-        "// ---- dispatcher registration (TORCH_LIBRARY_IMPL analog) ----",
+        "// ---- dispatcher registration ----",
         "namespace {",
         "struct RegisterKernels {",
         "    RegisterKernels() {",
@@ -172,7 +168,6 @@ def generate_binding(funcs, module_name: str) -> str:
     L += [f"}} // namespace {module_name}", "} // namespace tp_custom", ""]
 
     # ---- CPython METH_FASTCALL module (no pybind11; mirrors gen_python_c.py) ----
-    # Kernels run with the GIL released, like upstream torch bindings.
     L += [
         "namespace {",
         "struct GilRelease {",
@@ -270,7 +265,6 @@ def generate_binding(funcs, module_name: str) -> str:
         call = ", ".join(f"v_{n}" for n, _, _, _ in slots)
         target = f"tp_custom::{module_name}::{f.cpp_name}_dispatch"
         kind = f.cpp_return_kind
-        # Kernels run without the GIL (like upstream torch bindings), but
         # every PyObject-producing step -- argument conversion aside, result
         # wrapping AND error reporting -- must happen with the GIL held.
         # Scope the release tightly around the raw C++ call only.

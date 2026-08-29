@@ -21,7 +21,6 @@ _capturing = _compiler_graph.capturing
 
 def _ensure_device(device):
     # None stays None so the C++ factory layer resolves it against
-    # globalContext().defaultDevice() (torch TensorOptions fallthrough);
     # only spellings the bindings cannot parse are normalized here.
     if device is None or device is Ellipsis:
         return None
@@ -54,16 +53,14 @@ def _sig_param(a) -> str:
     if a.default:
         return s + '=' + python_default(a.type, a.default)
     # Added positional (e.g. `int[] dim`) with no schema default: the Python
-    # sentinel None selects the base overload, mirroring torch's
     # `int[1]? dim=None`.
     return s + '=None'
 
 
 def _reduction_union_lines(name, base, sib) -> list[str] | None:
-    """torch unifies `<op>(self, *, dtype)` and
+    """
     `<op>.dim_IntList(self, dim, keepdim, *, dtype)` behind one public
     signature `op(input, dim=None, keepdim=False, *, dtype=...)`; dim=None
-    delegates to the base overload (ATen ReduceOps.cpp precedent). Emits that
     union wrapper when the overload pair has exactly that shape: identical
     kwonly sets, and the sibling's positionals are the base's with new
     defaulted/list params inserted (subsequence check)."""
@@ -148,10 +145,8 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
             continue
 
         # Overload-group facts, mirroring upstream PythonArgParser behavior:
-        #  - a sibling `.out` overload exposes the torch-style `*, out=None`
         #    keyword on the public function;
         #  - a base+dim reduction pair (sum/mean/prod/max/min/all/any/
-        #    squeeze/var/std/norm) gets the torch union signature with
         #    dim=None routing to the base overload (_reduction_union_lines);
         #  - remaining non-out overloads must be selected by positional shape
         #    (tensor_split's int vs int[] vs Tensor), so the wrapper forwards
@@ -161,7 +156,6 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
         multi_overload = sum(1 for g in group if g.overload_name != 'out') > 1
 
         # linalg ops are exposed through the tensorplay.linalg package only
-        # (mirrors torch, where they live under torch.linalg).
         if name.startswith('linalg_'):
             continue
 
@@ -242,7 +236,6 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
 
         if name == 'arange' and 'function' in f.variants:
             seen.add(name)
-            # Resolve DType.undefined here (torch PythonArgParser behavior):
             # integral args -> int64, any float arg -> default float dtype.
             # Passing Undefined through the binding crashes on some builds.
             lines += [
@@ -272,11 +265,86 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
             ]
             continue
 
+        if name == 'squeeze_copy' and 'function' in f.variants:
+            seen.add(name)
+            # routes to the base overload, an int to .dim, a sequence to
+            # .dims (positional forwarding lets the group dispatcher pick).
+            lines += [
+                'def squeeze_copy(input, dim=None):',
+                '    if _capturing():',
+                '        _captured = _capture_call(squeeze_copy, (input, dim), {})',
+                '        if _captured is not None:',
+                '            return _captured',
+                '    if dim is None:',
+                '        return _C.squeeze_copy(input)',
+                '    if isinstance(dim, (list, tuple)):',
+                '        return _C.squeeze_copy(input, list(dim))',
+                '    return _C.squeeze_copy(input, dim)',
+                '',
+            ]
+            continue
+
+        if name == 'unique_consecutive' and 'function' in f.variants:
+            seen.add(name)
+            # flags false only the output tensor is returned.
+            lines += [
+                'def unique_consecutive(input, return_inverse=False, return_counts=False, dim=None):',
+                '    if _capturing():',
+                '        _captured = _capture_call(unique_consecutive, (input, return_inverse, return_counts, dim), {})',
+                '        if _captured is not None:',
+                '            return _captured',
+                '    _result = _C.unique_consecutive(input, return_inverse, return_counts, dim)',
+                '    if not return_inverse and not return_counts:',
+                '        return _result[0]',
+                '    if not return_inverse:',
+                '        return _result[0], _result[2]',
+                '    if not return_counts:',
+                '        return _result[0], _result[1]',
+                '    return _result',
+                '',
+            ]
+            continue
+
+        if name == 'trapz' and 'function' in f.variants:
+            seen.add(name)
+            # x-Tensor form routes to trapz.x, the scalar form to trapz.dx
+            # (positional forwarding lets the FASTCALL group dispatcher pick).
+            lines += [
+                'def trapz(y, x=None, dx=None, dim=-1):',
+                '    if _capturing():',
+                '        _captured = _capture_call(trapz, (y, x, dx, dim), {})',
+                '        if _captured is not None:',
+                '            return _captured',
+                '    if x is not None:',
+                '        return _C.trapz(y, x, dim=dim)',
+                '    if dx is None:',
+                '        dx = 1.0',
+                '    return _C.trapz(y, dx=dx, dim=dim)',
+                '',
+            ]
+            continue
+
+        if name == 'kaiser_window' and 'function' in f.variants:
+            seen.add(name)
+            # .beta overloads: kaiser_window(window_length, periodic=True,
+            # beta=12.0, *, dtype, device, pin_memory).  Always forward to
+            lines += [
+                'def kaiser_window(window_length, periodic=True, beta=12.0, *, dtype=None, device=None, pin_memory=False):',
+                '    if _capturing():',
+                '        _captured = _capture_call(kaiser_window, (window_length, periodic, beta, dtype, device, pin_memory), {})',
+                '        if _captured is not None:',
+                '            return _captured',
+                '    if dtype is None:',
+                '        dtype = DType.undefined',
+                '    return _C.kaiser_window(window_length, periodic, beta, dtype=dtype, device=_ensure_device(device), pin_memory=pin_memory)',
+                '',
+            ]
+            continue
+
         if 'function' in f.variants:
             seen.add(name)
 
             if out_variant is not None:
-                # torch: `def op(<args>, *, out=None)`; the out branch skips
                 # autograd capture (matching the matmul special-case this
                 # generalizes).
                 pos = [_param_name(a) for a in f.args]
@@ -289,7 +357,6 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
                 lines.append('')
                 continue
 
-            # torch exposes sole-TensorList-argument ops as varargs
             # (broadcast_tensors(*tensors), block_diag(*tensors)); the
             # FASTCALL layer folds surplus positionals into the list.
             seq_varargs = any(
@@ -298,7 +365,6 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
                 for g in group)
             if (len(f.args) >= 2 and f.args[0].type.kind == 'str'
                     and f.args[1].type.is_tensor_like and f.args[1].type.is_list):
-                # torch.einsum(equation, *operands[, ...]): fold the tail.
                 head = [_param_name(a) for a in f.args[:1]]
                 rest = f.args[1:]
                 sig = head[0] + ", *" + rest[0].python_name
@@ -365,7 +431,6 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
                         f'    if not isinstance({pname}, (tensorplay.Scalar, tensorplay.Tensor)):')
                     lines.append(f'        {pname} = tensorplay.Scalar({pname})')
                 elif t.kind == 'int64_t' and t.is_list:
-                    # torch's PythonArgParser lifts a scalar int into a
                     # one-element list for `int[]` slots (`amax(x, dim=1)`);
                     # the generated FASTCALL binding only parses sequences.
                     lines.append(

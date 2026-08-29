@@ -17,7 +17,6 @@ if __package__ in (None, ''):
 from .model import parse_native_yaml  # noqa: F401 (re-exported)
 
 # ---------------------------------------------------------------------------
-# Registry (torchgen.gen.Registration analog)
 # ---------------------------------------------------------------------------
 
 _GENERATORS: dict[str, Callable] = {}
