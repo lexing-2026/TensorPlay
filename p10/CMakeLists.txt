@@ -248,7 +248,7 @@ if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
             target_compile_definitions(p10_kernel_avx2_${KERNEL_NAME} PRIVATE
                 HAVE_AVX512_CPU_DEFINITION)
         endif()
-        target_compile_options(p10_kernel_avx2_${KERNEL_NAME} PRIVATE -mavx2 -mfma)
+        target_compile_options(p10_kernel_avx2_${KERNEL_NAME} PRIVATE -mavx2 -mfma -mf16c)
         if(KERNEL_NAME STREQUAL "ComplexKernels")
             target_compile_definitions(p10_kernel_avx2_${KERNEL_NAME} PRIVATE
                 TP_COMPLEX_KERNELS_NO_DISPATCH_DEFINITION)

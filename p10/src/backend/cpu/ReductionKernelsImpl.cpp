@@ -6,6 +6,7 @@
 #include "Parallel.h"
 #include "ReductionKernels.h"
 #include "TensorIterator.h"
+#include "cpu/CascadeSum.h"
 #include "cpu/Reduce.h"
 #include "cpu/vec/vec.h"
 #include "cpu/VecComplex.h"
@@ -16,6 +17,9 @@
 #include <cmath>
 #include <limits>
 #include <tuple>
+#if defined(__x86_64__)
+#include <immintrin.h>
+#endif
 
 namespace tensorplay {
 namespace cpu {
@@ -324,6 +328,34 @@ static void sum_kernel_iter(TensorIteratorBase& iter) {
     #undef OP_CASE
 }
 
+static bool should_use_acc_buffer(const TensorIteratorBase& iter) {
+    if (iter.noutputs() != 1 ||
+        !isReducedFloatingType(iter.common_dtype()) ||
+        iter.ndim() < 2) {
+        return false;
+    }
+    const auto& output_strides = iter.strides(0);
+    return output_strides[0] == 0 && output_strides[1] == 0;
+}
+
+Tensor sum_kernel_impl(const Tensor& self, DType dtype);
+Tensor sum_dim_kernel_impl(const Tensor& self,
+                           const std::vector<int64_t>& dims,
+                           bool keepdim,
+                           DType dtype);
+
+static Tensor sum_to_float(const Tensor& self,
+                           const std::vector<int64_t>& dims,
+                           bool keepdim) {
+    Tensor input = self.dtype() == DType::Float32
+        ? self
+        : self.to(DType::Float32);
+    if (dims.empty()) {
+        return sum_kernel_impl(input, DType::Float32);
+    }
+    return sum_dim_kernel_impl(input, dims, keepdim, DType::Float32);
+}
+
 Tensor sum_kernel_impl(const Tensor& self, DType dtype) {
     DType out_dtype = dtype;
     if (out_dtype == DType::Undefined) {
@@ -341,12 +373,46 @@ Tensor sum_kernel_impl(const Tensor& self, DType dtype) {
         acc_dtype = DType::ComplexFloat;
     }
 
-    Tensor out = Tensor::zeros({}, acc_dtype, self.device());
+    Tensor out = Tensor::zeros({}, out_dtype, self.device());
 
-    // iterator's common dtype matches out_dtype.
     Tensor input = self;
-    if (self.dtype() != acc_dtype) {
-        input = self.to(acc_dtype);
+    if (self.dtype() != out_dtype) {
+        input = self.to(out_dtype);
+    }
+
+#if defined(__x86_64__)
+    if ((acc_dtype == DType::Float32 || acc_dtype == DType::Float64) &&
+        input.dtype() == acc_dtype && input.is_contiguous() &&
+        input.numel() > 0) {
+        double s = 0.0;
+        if (try_sum_real_avx512(input.data_ptr(), input.numel(), acc_dtype, &s)) {
+            if (acc_dtype == DType::Float32) {
+                *out.data_ptr<float>() = static_cast<float>(s);
+            } else {
+                *out.data_ptr<double>() = s;
+            }
+            return out;
+        }
+    }
+#endif
+
+    if (acc_dtype == DType::Float32 || acc_dtype == DType::Float64) {
+        TensorIterator iter = TensorIterator::reduce_op(out, input);
+        if (iter.numel() != 0 && should_use_acc_buffer(iter)) {
+            Tensor tmp = sum_to_float(self, {}, false);
+            out.copy_(tmp);
+            return out;
+        }
+        if (out_dtype == DType::Float16) {
+            sum_detail::cascade_sum<float, Half>(iter);
+        } else if (out_dtype == DType::BFloat16) {
+            sum_detail::cascade_sum<float, BFloat16>(iter);
+        } else if (out_dtype == DType::Float32) {
+            sum_detail::cascade_sum<float>(iter);
+        } else {
+            sum_detail::cascade_sum<double>(iter);
+        }
+        return out;
     }
 
     // AVX2 complex full-reduction fast path (cpu/VecComplex.h): two vector
@@ -369,22 +435,6 @@ Tensor sum_kernel_impl(const Tensor& self, DType dtype) {
         }
     }
 
-#if defined(__x86_64__)
-    // AVX-512 full-reduction fast path for contiguous real sums.
-    if ((acc_dtype == DType::Float32 || acc_dtype == DType::Float64) &&
-        input.is_contiguous() && input.numel() > 0) {
-        double s = 0.0;
-        if (try_sum_real_avx512(input.data_ptr(), input.numel(), acc_dtype, &s)) {
-            Tensor o = Tensor::zeros({}, acc_dtype, self.device());
-            if (acc_dtype == DType::Float32)
-                *o.data_ptr<float>() = static_cast<float>(s);
-            else
-                *o.data_ptr<double>() = s;
-            return acc_dtype == out_dtype ? o : o.to(out_dtype);
-        }
-    }
-#endif
-
     TensorIterator iter = TensorIterator::reduce_op(out, input);
     sum_kernel_iter(iter);
 
@@ -403,10 +453,181 @@ Tensor sum_dim_kernel_impl(const Tensor& self, const std::vector<int64_t>& dims,
     if (dims.empty()) {
         return sum_kernel_impl(self, dtype);
     }
-    
+
     std::vector<int64_t> out_shape = compute_reduction_shape(self, dims, keepdim);
-    // complexes in complex64.
+
     DType acc_dtype = out_dtype;
+    if (isReducedFloatingType(out_dtype)) {
+        acc_dtype = DType::Float32;
+    } else if (out_dtype == DType::ComplexHalf || out_dtype == DType::BComplex32) {
+        acc_dtype = DType::ComplexFloat;
+    }
+    if (acc_dtype == DType::Float32 || acc_dtype == DType::Float64) {
+        Tensor out = Tensor::zeros(out_shape, out_dtype, self.device());
+        Tensor input = self;
+        if (self.dtype() != out_dtype) {
+            input = self.to(out_dtype);
+        }
+
+        const int64_t ndim = self.dim();
+        std::vector<bool> mask(ndim, false);
+        for (int64_t d : dims) {
+            if (d < 0) d += ndim;
+            mask[d] = true;
+        }
+        if (dims.size() == 1) {
+            const int64_t dim = dims[0] < 0 ? dims[0] + ndim : dims[0];
+            bool handled = false;
+            if (out_dtype == DType::Float16) {
+                handled = sum_detail::contiguous_sum_dim<float, Half>(input, out, dim);
+            } else if (out_dtype == DType::BFloat16) {
+                handled = sum_detail::contiguous_sum_dim<float, BFloat16>(input, out, dim);
+            } else if (out_dtype == DType::Float32) {
+                handled = sum_detail::contiguous_sum_dim<float>(input, out, dim);
+            } else {
+                handled = sum_detail::contiguous_sum_dim<double>(input, out, dim);
+            }
+            if (handled) {
+                return out;
+            }
+        }
+        Tensor viewed = review_reduce_result(out, ndim, mask, keepdim);
+        TensorIterator iter = TensorIterator::reduce_op(viewed, input);
+        if (iter.numel() != 0 && should_use_acc_buffer(iter)) {
+            Tensor tmp = sum_to_float(self, dims, keepdim);
+            out.copy_(tmp);
+            return out;
+        }
+        if (out_dtype == DType::Float16) {
+            sum_detail::cascade_sum<float, Half>(iter);
+        } else if (out_dtype == DType::BFloat16) {
+            sum_detail::cascade_sum<float, BFloat16>(iter);
+        } else if (out_dtype == DType::Float32) {
+            sum_detail::cascade_sum<float>(iter);
+        } else {
+            sum_detail::cascade_sum<double>(iter);
+        }
+        return out;
+    }
+
+    // Fast path: reducing the leading dim of a contiguous real tensor.
+    // Accumulate whole rows into per-thread column buffers (row-major reads
+    // stay contiguous), then fold the buffers; per-thread partials avoid
+    // cross-thread contention on the output.
+    if (dims.size() == 1 && (self.dtype() == DType::Float32 || self.dtype() == DType::Float64) &&
+        self.is_contiguous()) {
+        const int64_t ndim0 = self.dim();
+        int64_t d0 = dims[0] < 0 ? dims[0] + ndim0 : dims[0];
+        if (d0 == 0 && ndim0 >= 1) {
+            const int64_t rows = self.size(0);
+            const int64_t cols = self.numel() / std::max<int64_t>(rows, 1);
+            Tensor out = Tensor::zeros(out_shape, self.dtype(), self.device());
+            if (self.numel() == 0) return out;
+            const int64_t nthreads = std::max<int64_t>(1, tensorplay::parallel::get_num_threads());
+            if (self.dtype() == DType::Float32) {
+                const float* in = self.data_ptr<float>();
+                float* outp = out.data_ptr<float>();
+                std::vector<std::vector<float>> partials(
+                    nthreads, std::vector<float>(cols, 0.f));
+                const int64_t row_grain = std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(cols, 1));
+                tensorplay::parallel::parallel_for(0, rows, row_grain, [&](int64_t rb, int64_t re) {
+                    float* __restrict__ acc = partials[tensorplay::parallel::get_thread_num()].data();
+                    const float* __restrict__ rp = in + rb * cols;
+                    for (int64_t r = rb; r < re; ++r, rp += cols) {
+                        const float* __restrict__ rowp = rp;
+                        for (int64_t j = 0; j < cols; ++j) acc[j] += rowp[j];
+                    }
+                });
+                std::vector<float> total(cols, 0.f);
+                for (int64_t t = 0; t < nthreads; ++t)
+                    for (int64_t j = 0; j < cols; ++j) total[j] += partials[t][j];
+                for (int64_t j = 0; j < cols; ++j) outp[j] = total[j];
+            } else {
+                const double* in = self.data_ptr<double>();
+                double* outp = out.data_ptr<double>();
+                std::vector<std::vector<double>> partials(
+                    nthreads, std::vector<double>(cols, 0.0));
+                const int64_t row_grain = std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(cols, 1));
+                tensorplay::parallel::parallel_for(0, rows, row_grain, [&](int64_t rb, int64_t re) {
+                    double* __restrict__ acc = partials[tensorplay::parallel::get_thread_num()].data();
+                    const double* __restrict__ rp = in + rb * cols;
+                    for (int64_t r = rb; r < re; ++r, rp += cols) {
+                        const double* __restrict__ rowp = rp;
+                        for (int64_t j = 0; j < cols; ++j) acc[j] += rowp[j];
+                    }
+                });
+                std::vector<double> total(cols, 0.0);
+                for (int64_t t = 0; t < nthreads; ++t)
+                    for (int64_t j = 0; j < cols; ++j) total[j] += partials[t][j];
+                for (int64_t j = 0; j < cols; ++j) outp[j] = total[j];
+            }
+            return out;
+        }
+    }
+
+    // Fast path: reducing the trailing dim of a contiguous real tensor.
+    // Every output item owns one contiguous input row, so rows can be split
+    // independently and each row can use the wide reduction loop.
+    if (dims.size() == 1 && out_dtype == self.dtype() &&
+        (self.dtype() == DType::Float32 || self.dtype() == DType::Float64) &&
+        self.is_contiguous()) {
+        const int64_t ndim0 = self.dim();
+        const int64_t d0 = dims[0] < 0 ? dims[0] + ndim0 : dims[0];
+        if (d0 == ndim0 - 1 && ndim0 >= 1) {
+            const int64_t d_size = self.size(d0);
+            Tensor out = Tensor::zeros(out_shape, self.dtype(), self.device());
+            const int64_t rows = d_size > 0 ? self.numel() / d_size : out.numel();
+            if (rows == 0 || d_size == 0) return out;
+            const int64_t row_grain = std::max<int64_t>(
+                1, GRAIN_SIZE / std::max<int64_t>(d_size, 1));
+#if defined(__x86_64__)
+            const bool use_avx512 = reduce_avx512_available() && d_size >= 16;
+#else
+            const bool use_avx512 = false;
+#endif
+            if (self.dtype() == DType::Float32) {
+                const float* in = self.data_ptr<float>();
+                float* outp = out.data_ptr<float>();
+                parallel_for(0, rows, row_grain, [&](int64_t rb, int64_t re) {
+                    for (int64_t r = rb; r < re; ++r) {
+                        const float* row = in + r * d_size;
+                        float total = 0.0f;
+#if defined(__x86_64__)
+                        if (use_avx512) {
+                            total = sum_f32_chunk_avx512(row, 0, d_size);
+                        } else
+#endif
+                        {
+                            for (int64_t j = 0; j < d_size; ++j) total += row[j];
+                        }
+                        outp[r] = total;
+                    }
+                });
+            } else {
+                const double* in = self.data_ptr<double>();
+                double* outp = out.data_ptr<double>();
+                parallel_for(0, rows, row_grain, [&](int64_t rb, int64_t re) {
+                    for (int64_t r = rb; r < re; ++r) {
+                        const double* row = in + r * d_size;
+                        double total = 0.0;
+#if defined(__x86_64__)
+                        if (use_avx512) {
+                            total = sum_f64_chunk_avx512(row, 0, d_size);
+                        } else
+#endif
+                        {
+                            for (int64_t j = 0; j < d_size; ++j) total += row[j];
+                        }
+                        outp[r] = total;
+                    }
+                });
+            }
+            return out;
+        }
+    }
+
+    // complexes in complex64.
+    acc_dtype = out_dtype;
     if (isReducedFloatingType(out_dtype)) {
         acc_dtype = DType::Float32;
     } else if (out_dtype == DType::ComplexHalf || out_dtype == DType::BComplex32) {
@@ -1200,8 +1421,14 @@ Tensor median_kernel_impl(const Tensor& self) {
 
 } // anonymous namespace
 
-REGISTER_DISPATCH(sum_stub, &sum_kernel_impl);
-REGISTER_DISPATCH(sum_dim_stub, &sum_dim_kernel_impl);
+#ifdef CPU_CAPABILITY_AVX512
+#define REGISTER_SUM_DISPATCH(name, fn) ALSO_REGISTER_AVX512_DISPATCH(name, fn)
+#else
+#define REGISTER_SUM_DISPATCH(name, fn) REGISTER_DISPATCH(name, fn)
+#endif
+REGISTER_SUM_DISPATCH(sum_stub, &sum_kernel_impl);
+REGISTER_SUM_DISPATCH(sum_dim_stub, &sum_dim_kernel_impl);
+#undef REGISTER_SUM_DISPATCH
 REGISTER_DISPATCH(max_stub, &max_kernel_impl);
 REGISTER_DISPATCH(max_dim_stub, &max_dim_kernel_impl);
 REGISTER_DISPATCH(min_stub, &min_kernel_impl);
