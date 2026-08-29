@@ -445,10 +445,10 @@ from .functional import *
 
 
 def unique(input, sorted=True, return_inverse=False, return_counts=False):
-    """
+    """Return unique values and optionally inverse indices and counts.
 
-    The native op always computes all three outputs; this wrapper mirrors
-    ``return_inverse`` / ``return_counts``.
+    The native op always computes all three outputs; this wrapper selects the
+    requested ``return_inverse`` / ``return_counts`` values.
     """
     values, inverse, counts = _C.unique(input, sorted, True, True)
     if return_inverse and return_counts:
@@ -476,7 +476,7 @@ from . import profiler
 from . import cuda
 from . import stax
 from . import backends
-# nn before optim (upstream order): optim.swa_utils pulls in tensorplay.nn,
+# Import nn before optim because optim.swa_utils pulls in tensorplay.nn,
 # which must be fully initialized by then to avoid a partial-import cycle.
 from . import nn
 from . import optim
@@ -590,7 +590,8 @@ def as_tensor(data, dtype=None, device=None):
     r"""Convert ``data`` into a tensor, sharing storage when possible.
 
     If ``data`` is already a tensor with the requested dtype and device, it is
-    returned as-is (no copy).  Otherwise it is converted, mirroring
+    returned as-is (no copy).  Otherwise it is converted to the requested
+    dtype and device.
 
     Args:
         data (tensor, list, or scalar): Initial data for the tensor.
@@ -789,7 +790,7 @@ def use_deterministic_algorithms(
         >>> # xdoctest: +SKIP
         >>> tensorplay.use_deterministic_algorithms(True)
     """
-    # has no Inductor counterpart.
+    # This flag has no compiler-specific counterpart.
     _C._set_deterministic_algorithms(mode, warn_only=warn_only)
 
 

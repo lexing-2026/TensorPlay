@@ -1,4 +1,4 @@
-"""
+"""Custom operator registration and compiler integration.
 
 Four public layers are provided:
 
@@ -11,7 +11,7 @@ Four public layers are provided:
    :func:`wrap_tilelang` integrate user-written Triton / TileLang kernels:
    such operators behave like any other custom operator in eager mode and
    are captured as one opaque graph node by ``tensorplay.compile`` —
-   exactly the fusion-boundary semantics Inductor gives
+   preserving the fusion boundary through compilation.
 3. Registered operators compose with every compiler backend: during capture
    a call whose arguments are symbolic records a single ``call_function``
    node targeting the :class:`CustomOpDef`; backends that cannot lower it
@@ -338,7 +338,7 @@ class CustomOpDef:
         for slot in slots:
             try:
                 bridge(self._name, slot, fn)
-            except Exception:  # noqa: BLE001 - mirroring is an optimization
+            except Exception:  # noqa: BLE001 - this is an optimization
                 return
 
     def register_fake(self, fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -365,8 +365,9 @@ class CustomOpDef:
     ) -> None:
         """
 
-        ``backward(ctx, *grad_outputs)`` mirrors
-        output)`` may save tensors via ``ctx.save_for_backward``.  When no
+        ``backward(ctx, *grad_outputs)`` receives the saved context.  The
+        ``setup_context`` callback may save tensors via
+        ``ctx.save_for_backward``.  When no
         ``setup_context`` is given the context stays empty, so backward must
         derive its result purely from ``grad_outputs`` (or close over module
         state).
@@ -385,9 +386,8 @@ class CustomOpDef:
     def register_vmap(self, fn: Callable[..., Any]) -> Callable[..., Any]:
         """
 
-        The engine does not batch yet (parity hook, like
-        ``tensorplay.autograd.Function.vmap``); the registration is stored
-        and surfaced through :func:`get_kernel`-style introspection.
+        The engine does not batch yet; the registration is stored and surfaced
+        through :func:`get_kernel`-style introspection.
         """
 
         if not callable(fn):
@@ -742,7 +742,7 @@ def triton_op(
     :func:`wrap_triton` and only mutate arguments listed in
     ``mutates_args``.  Under ``tensorplay.compile`` the whole operator is
     captured as a single opaque node — the compiler never traces into the
-    Triton launches, matching Inductor's contract.  ``device_types`` is a
+    Triton launches.  ``device_types`` is a
     """
 
     _validate_name(name)
@@ -1510,7 +1510,7 @@ def opcheck(
     Returns the failure mapping; empty means all checks passed.
     """
 
-    del atol, rtol  # accepted for signature parity; comparisons are exact
+    del atol, rtol  # accepted for signature compatibility; comparisons are exact
     op_def = _resolve_op(op)
     kwargs = dict(kwargs or {})
     if isinstance(test_utils, str):

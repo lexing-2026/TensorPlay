@@ -1,4 +1,4 @@
-// Python bindings for the NCCL communicator context, mirroring the
+// Python bindings for the NCCL communicator context.
 
 #include "python_bindings.h"
 
