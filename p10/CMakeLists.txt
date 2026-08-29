@@ -164,6 +164,9 @@ if(USE_CUDA)
         src/backend/cuda/ReductionKernels.cu
         src/backend/cuda/ViewKernels.cu
         src/backend/cuda/ShapeAlignKernels.cu
+        src/backend/cuda/ForeachFallbackKernels.cu
+        src/backend/cuda/ForeachOutKernels.cu
+        src/backend/cuda/ForeachMTAKernels.cu
         src/backend/cuda/OptimizerKernels.cu
         src/backend/cuda/AmpKernels.cu
         src/backend/cuda/SamplingKernels.cu
