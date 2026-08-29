@@ -286,17 +286,12 @@ def download_url_to_file(
 
 
 # ---------------------------------------------------------------------------
-# Unified remote-model hub: MEGA (default) + GitHub/torch.hub compatibility.
 #
 #   tp.hub.load_state_dict("org/model", "weights.mst")                 # mega
 #   tp.hub.load_model("org/model", model_class="...resnet50")          # mega
-#   tp.hub.load("pytorch/vision", "resnet50")                          # github
 #   sd = tp.hub.load_state_dict(
-#       "https://download.pytorch.org/models/resnet50.pth",
 #       source="github")                                               # url
 #
-# The GitHub path mirrors torch.hub.load: shallow-clone the repo into the hub
-# cache, execute its ``hubconf.py`` under a torch->tensorplay module aliasing,
 # then invoke the requested entrypoint.
 # ---------------------------------------------------------------------------
 
@@ -313,7 +308,6 @@ _WEIGHT_URL_RE = re.compile(r"^https?://.*\.(pth|pt|ckpt|safetensors|mst)([?#].*
 
 
 # ---------------------------------------------------------------------------
-# torch -> tensorplay module aliasing (for executing foreign hubconf.py)
 # ---------------------------------------------------------------------------
 
 class _LazyAlias(ModuleType):
@@ -328,8 +322,7 @@ class _LazyAlias(ModuleType):
 
 
 class torch_hub_alias:
-    """Temporarily aliases ``torch*`` modules onto tensorplay so that foreign
-    hubconf.py files (written against PyTorch) import our implementation.
+    """
 
     Restores the previous ``sys.modules`` entries on exit.
     """
@@ -439,7 +432,6 @@ def _exec_hubconf(repo_dir: Path):
 
 
 def list_entrypoints(repo_id: str, ref: str | None = None) -> list[str]:
-    """Entrypoints declared by a GitHub repo's hubconf.py (torch.hub.list)."""
     repo_dir = _github_repo_dir(repo_id, ref)
     module = _exec_hubconf(repo_dir)
     deps = {"dependencies", "verbose"}
@@ -451,10 +443,8 @@ def load(repo_id: str, model: str | None = None, *args, ref: str | None = None, 
     """Unified model loader.
 
     mega:    tp.hub.load("org/repo", filename="weights.mst", model_class=...)
-    github:  tp.hub.load("pytorch/vision", "resnet50")  # torch.hub.load equivalent
 
     Dispatches on ``source`` exactly like :func:`load_model`; the two-argument
-    form is the torch.hub.load shape.
     """
     repo_dir = _github_repo_dir(repo_id, ref)
     module = _exec_hubconf(repo_dir)
@@ -468,7 +458,6 @@ def load(repo_id: str, model: str | None = None, *args, ref: str | None = None, 
 
 def load_state_dict_from_url(url: str, progress: bool = True, check_hash: bool = False,
                              map_location=None, **kwargs) -> dict:
-    """Downloads a raw checkpoint URL and loads it (torch semantics)."""
     parts = url.rstrip("/").split("/")
     cached = get_dir() / "checkpoints" / parts[-1]
     cached.parent.mkdir(parents=True, exist_ok=True)
@@ -479,7 +468,6 @@ def load_state_dict_from_url(url: str, progress: bool = True, check_hash: bool =
     if not cached.exists():
         download_url_to_file(url, str(cached), hash_prefix=hash_prefix, progress=progress)
 
-    # Delegate deserialization to the torch-compat serialization layer.
     try:
         from tensorplay import _serialization_torch as ser_torch
     except ImportError:
@@ -606,7 +594,6 @@ def load_model(
     Architecture resolution (mega backend): ``model`` instance >
     ``model_class`` callable/dotted-path > repository metadata
     (``model.class`` / ``model.init.*`` via megatensors).
-    For the github backend this is exactly ``torch.hub.load``.
     """
     src = source
     if src == "auto":
