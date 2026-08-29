@@ -20,7 +20,6 @@ def forced_align(
 
     .. devices:: CPU CUDA
 
-    .. properties:: TorchScript
 
     Args:
         log_probs (Tensor): log probability of CTC emission output.
@@ -65,7 +64,6 @@ def forced_align(
         batch_size, length = targets.size(0), targets.size(1)
         target_lengths = tensorplay.full((batch_size,), length, dtype=tensorplay.int64, device=targets.device)
 
-    # For TorchScript compatibility
     assert input_lengths is not None
     assert target_lengths is not None
 

@@ -1033,7 +1033,7 @@ class Tacotron2(nn.Module):
         if lengths is None:
             lengths = tensorplay.tensor([max_length]).expand(n_batch).to(tokens.device, tokens.dtype)
 
-        assert lengths is not None  # For TorchScript compiler
+        assert lengths is not None
         embedded_inputs = self.embedding(tokens).transpose(1, 2)
         encoder_outputs = self.encoder(embedded_inputs, lengths)
         mel_specgram, mel_specgram_lengths, _, alignments = self.decoder.infer(encoder_outputs, lengths)

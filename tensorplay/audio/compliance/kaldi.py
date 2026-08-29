@@ -70,7 +70,6 @@ def _get_strided(waveform: Tensor, window_size: int, window_shift: int, snip_edg
         pad = window_size // 2 - window_shift // 2
         pad_right = reversed_waveform
         if pad > 0:
-            # torch.nn.functional.pad returns [2,1,0,1,2] for 'reflect'
             # but we want [2, 1, 0, 0, 1, 2]
             pad_left = reversed_waveform[-pad:]
             waveform = tensorplay.cat((pad_left, waveform, pad_right), dim=0)
@@ -102,7 +101,6 @@ def _feature_window_function(
     elif window_type == BLACKMAN:
         a = 2 * math.pi / (window_size - 1)
         window_function = tensorplay.arange(window_size, device=device, dtype=dtype)
-        # can't use torch.blackman_window as they use different coefficients
         return (
             blackman_coeff
             - 0.5 * tensorplay.cos(a * window_function)

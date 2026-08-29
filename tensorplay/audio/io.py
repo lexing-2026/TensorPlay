@@ -11,7 +11,6 @@ import numpy as np
 import tensorplay as tp
 from .backend import get_audio_backend, _SCIPY_AVAILABLE, _SOUNDFILE_AVAILABLE
 
-# torchaudio AudioMetaData (torchaudio/AudioMetaData.py)
 AudioMetaData = namedtuple(
     "AudioMetaData",
     ["sample_rate", "num_frames", "num_channels", "bits_per_sample", "encoding"],
@@ -129,7 +128,6 @@ def save(filepath, src, sample_rate, channels_first=True, format=None):
 
     arr = np.asarray(arr)
     if channels_first:
-        # torchaudio expects backend-facing (Time, Channels)
         if arr.ndim == 1:
             arr = arr[:, None]
         else:

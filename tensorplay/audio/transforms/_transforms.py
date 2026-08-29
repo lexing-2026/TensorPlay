@@ -27,7 +27,6 @@ class Spectrogram(tensorplay.nn.Module):
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Args:
         n_fft (int, optional): Size of FFT, creates ``n_fft // 2 + 1`` bins. (Default: ``400``)
@@ -80,7 +79,6 @@ class Spectrogram(tensorplay.nn.Module):
         tensorplay._C._log_api_usage_once("tensorplay.audio.transforms.Spectrogram")
         self.n_fft = n_fft
         # number of FFT bins. the returned STFT result will have n_fft // 2 + 1
-        # number of frequencies due to onesided=True in torch.stft
         self.win_length = win_length if win_length is not None else n_fft
         self.hop_length = hop_length if hop_length is not None else self.win_length // 2
         window = window_fn(self.win_length) if wkwargs is None else window_fn(self.win_length, **wkwargs)
@@ -128,7 +126,6 @@ class InverseSpectrogram(tensorplay.nn.Module):
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Args:
         n_fft (int, optional): Size of FFT, creates ``n_fft // 2 + 1`` bins. (Default: ``400``)
@@ -174,7 +171,6 @@ class InverseSpectrogram(tensorplay.nn.Module):
         super(InverseSpectrogram, self).__init__()
         self.n_fft = n_fft
         # number of FFT bins. the returned STFT result will have n_fft // 2 + 1
-        # number of frequencies due to onesided=True in torch.stft
         self.win_length = win_length if win_length is not None else n_fft
         self.hop_length = hop_length if hop_length is not None else self.win_length // 2
         window = window_fn(self.win_length) if wkwargs is None else window_fn(self.win_length, **wkwargs)
@@ -214,9 +210,8 @@ class GriffinLim(tensorplay.nn.Module):
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
-    Implementation ported from
+    Implementation follows
     *librosa* :cite:`brian_mcfee-proc-scipy-2015`, *A fast Griffin-Lim algorithm* :cite:`6701851`
     and *Signal estimation from modified short-time Fourier transform* :cite:`1172092`.
 
@@ -302,7 +297,6 @@ class AmplitudeToDB(tensorplay.nn.Module):
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     This output depends on the maximum value in the input tensor, and so
     may return different values for an audio clip split into snippets vs. a
@@ -351,7 +345,6 @@ class MelScale(tensorplay.nn.Module):
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Args:
         n_mels (int, optional): Number of mel filterbanks. (Default: ``128``)
@@ -517,7 +510,6 @@ class MelSpectrogram(tensorplay.nn.Module):
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     This is a composition of :py:func:`tensorplay.audio.transforms.Spectrogram`
     and :py:func:`tensorplay.audio.transforms.MelScale`.
@@ -636,7 +628,6 @@ class MFCC(tensorplay.nn.Module):
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     By default, this calculates the MFCC on the DB-scaled Mel spectrogram.
     This is not the textbook implementation, but is implemented here to
@@ -723,7 +714,6 @@ class LFCC(tensorplay.nn.Module):
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     By default, this calculates the LFCC on the DB-scaled linear filtered spectrogram.
     This is not the textbook implementation, but is implemented here to
@@ -833,7 +823,6 @@ class MuLawEncoding(tensorplay.nn.Module):
 
     .. devices:: CPU CUDA
 
-    .. properties:: TorchScript
 
     For more info see the
     `Wikipedia Entry <https://en.wikipedia.org/wiki/%CE%9C-law_algorithm>`_
@@ -872,7 +861,6 @@ class MuLawDecoding(tensorplay.nn.Module):
 
     .. devices:: CPU CUDA
 
-    .. properties:: TorchScript
 
     For more info see the
     `Wikipedia Entry <https://en.wikipedia.org/wiki/%CE%9C-law_algorithm>`_
@@ -910,7 +898,6 @@ class Resample(tensorplay.nn.Module):
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Note:
         If resampling on waveforms of higher precision than float32, there may be a small loss of precision
@@ -994,7 +981,6 @@ class ComputeDeltas(tensorplay.nn.Module):
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     See `tensorplay.audio.functional.compute_deltas` for more details.
 
@@ -1025,7 +1011,6 @@ class TimeStretch(tensorplay.nn.Module):
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Proposed in *SpecAugment* :cite:`specaugment`.
 
@@ -1041,14 +1026,11 @@ class TimeStretch(tensorplay.nn.Module):
        The expected input is raw, complex-valued spectrogram.
 
     Example
-        >>> spectrogram = torchaudio.transforms.Spectrogram(power=None)
-        >>> stretch = torchaudio.transforms.TimeStretch()
         >>>
         >>> original = spectrogram(waveform)
         >>> stretched_1_2 = stretch(original, 1.2)
         >>> stretched_0_9 = stretch(original, 0.9)
 
-        .. image:: https://download.pytorch.org/torchaudio/doc-assets/specaugment_time_stretch.png
            :width: 600
            :alt: The visualization of stretched spectrograms.
     """
@@ -1097,7 +1079,6 @@ class Fade(tensorplay.nn.Module):
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Args:
         fade_in_len (int, optional): Length of fade-in (time frames). (Default: ``0``)
@@ -1220,7 +1201,6 @@ class FrequencyMasking(_AxisMasking):
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Proposed in *SpecAugment* :cite:`specaugment`.
 
@@ -1232,16 +1212,12 @@ class FrequencyMasking(_AxisMasking):
             This option is applicable only when the input tensor >= 3D.
 
     Example
-        >>> spectrogram = torchaudio.transforms.Spectrogram()
-        >>> masking = torchaudio.transforms.FrequencyMasking(freq_mask_param=80)
         >>>
         >>> original = spectrogram(waveform)
         >>> masked = masking(original)
 
-        .. image::  https://download.pytorch.org/torchaudio/doc-assets/specaugment_freq_masking1.png
            :alt: The original spectrogram
 
-        .. image::  https://download.pytorch.org/torchaudio/doc-assets/specaugment_freq_masking2.png
            :alt: The spectrogram masked along frequency axis
     """
 
@@ -1254,7 +1230,6 @@ class TimeMasking(_AxisMasking):
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Proposed in *SpecAugment* :cite:`specaugment`.
 
@@ -1268,16 +1243,12 @@ class TimeMasking(_AxisMasking):
             Must be within range [0.0, 1.0]. (Default: 1.0)
 
     Example
-        >>> spectrogram = torchaudio.transforms.Spectrogram()
-        >>> masking = torchaudio.transforms.TimeMasking(time_mask_param=80)
         >>>
         >>> original = spectrogram(waveform)
         >>> masked = masking(original)
 
-        .. image::  https://download.pytorch.org/torchaudio/doc-assets/specaugment_time_masking1.png
            :alt: The original spectrogram
 
-        .. image::  https://download.pytorch.org/torchaudio/doc-assets/specaugment_time_masking2.png
            :alt: The spectrogram masked along time axis
     """
 
@@ -1363,7 +1334,6 @@ class Loudness(tensorplay.nn.Module):
 
     .. devices:: CPU CUDA
 
-    .. properties:: TorchScript
 
     Args:
         sample_rate (int): Sample rate of audio signal.
@@ -1398,7 +1368,6 @@ class Vol(tensorplay.nn.Module):
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Args:
         gain (float): Interpreted according to the given gain_type:
@@ -1447,7 +1416,6 @@ class SlidingWindowCmn(tensorplay.nn.Module):
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Args:
         cmn_window (int, optional): Window in frames for running average CMN computation (int, default = 600)
@@ -1489,7 +1457,6 @@ class Vad(tensorplay.nn.Module):
 
     .. devices:: CPU CUDA
 
-    .. properties:: TorchScript
 
     Attempts to trim silence and quiet background sounds from the ends of recordings of speech.
     The algorithm currently uses a simple cepstral power measurement to detect voice,
@@ -1625,7 +1592,6 @@ class SpectralCentroid(tensorplay.nn.Module):
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     The spectral centroid is defined as the weighted average of the
     frequency values, weighted by their magnitude.
@@ -1685,7 +1651,6 @@ class PitchShift(LazyModuleMixin, tensorplay.nn.Module):
 
     .. devices:: CPU CUDA
 
-    .. properties:: TorchScript
 
     Args:
         waveform (Tensor): The input waveform of shape `(..., time)`.
@@ -1795,7 +1760,6 @@ class RNNTLoss(tensorplay.nn.Module):
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     The RNN Transducer loss extends the CTC loss by defining a distribution over output
     sequences of all lengths, and by jointly modelling both input-output and output-output
@@ -1877,7 +1841,6 @@ class Convolve(tensorplay.nn.Module):
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Args:
         mode (str, optional): Must be one of ("full", "valid", "same").
@@ -1922,7 +1885,6 @@ class FFTConvolve(tensorplay.nn.Module):
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Args:
         mode (str, optional): Must be one of ("full", "valid", "same").
@@ -1969,7 +1931,6 @@ class Speed(tensorplay.nn.Module):
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Args:
         orig_freq (int): Original frequency of the signals in ``waveform``.
@@ -2018,7 +1979,6 @@ class SpeedPerturbation(tensorplay.nn.Module):
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Args:
         orig_freq (int): Original frequency of the signals in ``waveform``.
@@ -2056,7 +2016,6 @@ class SpeedPerturbation(tensorplay.nn.Module):
         """
 
         idx = int(tensorplay.randint(len(self.speeders), ()))
-        # NOTE: we do this because TorchScript doesn't allow for
         # indexing ModuleList instances with non-literals.
         for speeder_idx, speeder in enumerate(self.speeders):
             if idx == speeder_idx:
@@ -2070,7 +2029,6 @@ class AddNoise(tensorplay.nn.Module):
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
     """
 
     def forward(
@@ -2098,7 +2056,6 @@ class Preemphasis(tensorplay.nn.Module):
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Args:
         coeff (float, optional): Pre-emphasis coefficient. Typically between 0.0 and 1.0.
@@ -2126,7 +2083,6 @@ class Deemphasis(tensorplay.nn.Module):
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Args:
         coeff (float, optional): De-emphasis coefficient. Typically between 0.0 and 1.0.
