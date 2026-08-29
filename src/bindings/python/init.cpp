@@ -9,6 +9,7 @@
 
 // Extern declarations (if not in header)
 void init_scalar(py::module_& m);
+void init_filecheck(py::module_& m);
 
 namespace tensorplay {
 namespace python {
@@ -367,6 +368,7 @@ PYBIND11_MODULE(_C, m) {
     init_stax(m);
     init_parallel(m);
     init_distributed(m);
+    init_filecheck(m);
     init_cuda_graph(m);
 
     // CUDA availability
