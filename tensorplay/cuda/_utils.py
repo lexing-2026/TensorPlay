@@ -1,10 +1,8 @@
 # mypy: allow-untyped-defs
 r"""Internal helpers for the ``tensorplay.cuda`` package.
 
-``_dummy_type``, ``_ClassPropertyDescriptor``, ``classproperty`` and
-``_LazySeedTracker`` are ported verbatim from ``torch._utils`` so that this
-package keeps the same graceful-degradation behaviour as torch when a feature
-is unavailable in the current build.
+``_dummy_type``, ``_ClassPropertyDescriptor``, and ``classproperty`` provide
+small fallbacks when native CUDA support is unavailable in the current build.
 """
 
 from typing import Any, Callable, Optional
@@ -93,7 +91,6 @@ def _get_device_index(
                 return current_device()
             if idx is None or idx < 0 and device.is_cuda():
                 raise ValueError(
-                    f"Expected a torch.device with a specified index or an integer, but got:{device}"
                 )
         return int(idx)
     if isinstance(device, str):

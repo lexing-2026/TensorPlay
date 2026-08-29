@@ -1,5 +1,6 @@
 # mypy: allow-untyped-defs
-r"""
+r"""CUDA namespace and runtime helpers.
+
 This package adds support for CUDA tensor types.
 
 It implements the same function as CPU tensors, but they utilize
@@ -8,8 +9,6 @@ GPUs for computation.
 It is lazily initialized, so you can always import it, and use
 :func:`is_available()` to determine if your system supports CUDA.
 
-Ported from ``torch.cuda`` (PyTorch @ 893b6406afc1a6384ab6fae8a2247d03cc230d87).
-Divergences from torch, forced by the native runtime surface:
 
 - legacy per-dtype ``Storage``/``Tensor`` classes are not provided
   (tensorplay has no typed storages);
@@ -54,7 +53,6 @@ except ImportError:
 
 
 class version:
-    """Minimal stand-in for ``torch.version`` scoped to this package."""
 
     hip: str | None = None
     cuda: str | None = None
@@ -373,7 +371,6 @@ def _lazy_init():
             )
         # This function throws if there's a driver initialization error, no GPUs
         # are found or any other error occurs. The native runtime initializes
-        # its context lazily; touching it here mirrors torch._C._cuda_init().
         _lcuda.current_device()
         _tls.is_initializing = True
 
@@ -904,7 +901,8 @@ def current_solver_handle():
 def set_sync_debug_mode(debug_mode: int | str) -> None:
     r"""Set the debug mode for cuda synchronizing operations.
 
-    Not enforced by this TensorPlay build; validated for signature parity.
+    Not enforced by this TensorPlay build; the signature is retained for API
+    compatibility.
 
     Args:
         debug_mode(str or int): if "default" or 0, don't error or warn on synchronizing operations,

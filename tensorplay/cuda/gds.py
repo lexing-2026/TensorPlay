@@ -1,5 +1,4 @@
 # mypy: allow-untyped-defs
-r"""GPU Direct Storage (GDS) support, mirroring :mod:`torch.cuda.gds`."""
 
 __all__ = ["GdsFile", "is_gds_available"]
 

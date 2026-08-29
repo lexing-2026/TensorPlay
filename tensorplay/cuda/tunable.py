@@ -1,5 +1,5 @@
 # mypy: allow-untyped-defs
-r"""TunableOp, mirroring :mod:`torch.cuda.tunable`.
+r"""CUDA tunable-operation controls.
 
 The TunableOp tuning framework requires runtime instrumentation this
 TensorPlay build does not expose; all controls are present and report as
