@@ -47,8 +47,8 @@ Scalar Scalar::operator OP(const Scalar& other) const { \
     } else if (result_dtype == DType::Bool) { \
         bool v1 = this->to<bool>(); \
         bool v2 = other.to<bool>(); \
-        /* Arithmetic on bools usually promotes to int in C++, mimicking PyTorch behavior */ \
-        /* PyTorch: True + True = 2 (Long). Bool + Bool -> Long usually? */ \
+        /* Arithmetic on boolean scalars uses int64 intermediates. */ \
+        /* Arithmetic results from boolean operands use the promoted type. */ \
         /* For now, let's cast to int64 if operation is arithmetic */ \
         return Scalar(static_cast<int64_t>(v1) OP static_cast<int64_t>(v2)); \
     } \
@@ -62,7 +62,6 @@ SCALAR_BINARY_OP(*, mul)
 // Division is special (float division vs integer division)
 Scalar Scalar::operator/(const Scalar& other) const {
     DType result_dtype = promote_types(type_, other.type_);
-    // In PyTorch, division usually results in float, unless floor_divide
     // Here we implement standard C++ division behavior but promoted
     
     if (result_dtype == DType::ComplexDouble) {

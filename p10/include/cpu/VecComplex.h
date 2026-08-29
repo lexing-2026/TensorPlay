@@ -3,13 +3,12 @@
 // Vectorized fast paths for CPU complex elementwise kernels (AVX2 + glibc
 // libmvec).  Layout is the standard interleaved (re, im) stream.
 //
-// Why this beats torch's CPU complex path: ATen vec256_complex_float.h runs
 // transcendentals as `map(std::exp)` -- a scalar loop over four lanes -- and
 // abs/atan2 as scalar loops too.  Here exp/log/sqrt/trig/hypot/div are true
 // 4-lane-per-vector SIMD via polar/Smith formulations, ULP-close to glibc.
 //
-// Formulas mirror cpu/ComplexUnary.h (the c10/util/complex_math.h ports) so
-// vector and fallback paths agree:
+// Formulas share the scalar complex implementation so vector and fallback
+// paths agree:
 //   exp(z)   = e^x * (cos y + i sin y)
 //   expm1(z) = expm1(x)*cos(y) - 2*sin(y/2)^2 + i*e^x*sin(y)
 //   log(z)   = log|z| + i*atan2(y, x)
@@ -21,7 +20,6 @@
 //   asin(z)  = -i*asinh(i z); acos(z) = pi/2 - asin(z)
 //   atan(z)  = (i/2)*log((1 - i z)/(1 + i z))
 //   atanh(z) = (log(1+z) - log(1-z)) / 2
-//   div      = Smith's algorithm scaled by max(|c|, |d|)   (ATen parity)
 
 #include <immintrin.h>
 #include "cpu/ComplexKernels.h"

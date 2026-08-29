@@ -145,14 +145,12 @@ bool SizesAndStrides::is_contiguous() const {
         return true;
     }
 
-    // Torch parity (c10 _compute_contiguous): zero-numel tensors are always
     // contiguous regardless of strides.
     for (size_t i = 0; i < size_; ++i) {
         if (sizes_data()[i] == 0) return true;
     }
 
     // Walk expected contiguous strides without materializing them. A
-    // dimension of extent 1 accepts any stride, matching PyTorch semantics.
     int64_t expected = 1;
     for (size_t i = size_; i > 0; --i) {
         if (strides_data()[i - 1] != expected && sizes_data()[i - 1] != 1) {
@@ -173,7 +171,6 @@ std::vector<int64_t> SizesAndStrides::compute_contiguous_strides(const std::vect
         return strides;
     }
 
-    // Torch parity (TensorImpl::empty_tensor_restride): compute from the last
     // dim, never collapsing across a zero-sized dim -- stride[i] is
     // stride[i+1] * max(size[i+1], 1), so e.g. shape (2, 0) gets (1, 1).
     strides.back() = 1;
@@ -184,7 +181,6 @@ std::vector<int64_t> SizesAndStrides::compute_contiguous_strides(const std::vect
     return strides;
 }
 
-// Port of at::detail::computeStride (aten/src/ATen/TensorUtils.cpp):
 // 1. separate `oldshape` into chunks of dimensions that are contiguous within
 //    each chunk, i.e. oldstride[i] == oldshape[i+1] * oldstride[i+1]
 // 2. `newshape` must split into the same number of chunks, each with matching
@@ -257,7 +253,6 @@ std::optional<std::vector<int64_t>> SizesAndStrides::compute_view_strides(
 }
 
 namespace {
-// Torch-style shape spelling for error messages: "[2, -1]".
 std::string shape_str(const std::vector<int64_t>& shape) {
     std::ostringstream oss;
     oss << "[";
@@ -304,9 +299,8 @@ std::vector<int64_t> SizesAndStrides::infer_size(const std::vector<int64_t>& sha
     return inferred;
 }
 
-// Port of c10::_compute_non_overlapping_and_dense (c10/core/Contiguity.h):
-// sort dims by stride (size-0/1 dims sink to the end) and require each
-// remaining dim to pick up exactly the running product as its stride.
+// Sort dimensions by stride (size-0/1 dimensions sink to the end) and
+// require each remaining dimension to pick up exactly the running product.
 bool SizesAndStrides::is_non_overlapping_and_dense(
     const std::vector<int64_t>& sizes, const std::vector<int64_t>& strides) {
     const int64_t dim = static_cast<int64_t>(sizes.size());

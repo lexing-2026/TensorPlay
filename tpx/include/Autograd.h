@@ -14,12 +14,10 @@ namespace tensorplay {
 namespace tpx {
 
 // The single tensor type exposed by tpx is the p10 Tensor; tpx attaches
-// autograd metadata to its TensorImpl (mirroring torch, where Variable and
 // Tensor were merged into one type).
 using Tensor = tensorplay::Tensor;
 
 // Free-function accessors over the AutogradMeta extension point. These mirror
-// torch::autograd::impl::* helpers.
 namespace impl {
 
 TENSORPLAY_API AutogradMeta* get_autograd_meta(const Tensor& t);
@@ -35,7 +33,6 @@ TENSORPLAY_API void set_requires_grad(const Tensor& t, bool requires_grad);
 inline Tensor grad(const Tensor& t) { return t.grad(); }
 
 // Gradient metadata is mutable even when the value tensor is passed as a
-// const reference, matching torch::Tensor's metadata semantics.
 inline void set_grad(const Tensor& t, const Tensor& grad) {
     if (auto* meta = get_or_create_autograd_meta(t)) meta->set_grad(grad);
 }
@@ -74,7 +71,6 @@ inline bool is_leaf(const Tensor& t) {
     return grad_fn(t) == nullptr;
 }
 
-// Torch parity (torch/csrc/autograd/VariableTypeUtils.h can_mutate_inplace):
 // true when `t` is a differentiable view whose base chain ends at a leaf
 // (its grad_fn chain walks through view nodes down to an AccumulateGrad).
 TENSORPLAY_API bool is_view_of_leaf(const Tensor& t);
@@ -107,14 +103,11 @@ std::vector<Edge> collect_next_edges(const Args&... args) {
 TENSORPLAY_API Tensor as_strided(const Tensor& self, const std::vector<int64_t>& size,
                                  const std::vector<int64_t>& stride,
                                  std::optional<int64_t> storage_offset = std::nullopt);
-// at::native::narrow is slice(dim, start, start + length); routing through
 // the generated slice op reuses its backward.
 TENSORPLAY_API Tensor narrow(const Tensor& self, int64_t dim, int64_t start, int64_t length);
 // expand() likewise moved to the generated tpx::ops surface.
 
-// Differentiable `to`, mirroring torch: the forward cast records a
 // ToCopyBackward node whose backward casts the gradient back to the source
-// tensor's dtype/device (see _to_copy_backward in torch).
 TENSORPLAY_API Tensor to(const Tensor& self, DType dtype, bool non_blocking = false, bool copy = false);
 TENSORPLAY_API Tensor to(const Tensor& self, Device device, bool non_blocking = false, bool copy = false);
 TENSORPLAY_API Tensor to(const Tensor& self, Device device, DType dtype, bool non_blocking = false, bool copy = false);
@@ -133,11 +126,11 @@ TENSORPLAY_API std::vector<Tensor> grad(
     bool allow_unused = false);
 
 
-// GradMode moved to the p10 layer (c10-level TLS) so dispatch code can
-// consult it; re-exported here for source compatibility.
+// GradMode lives in the p10 layer so dispatch code can consult it; it is
+// re-exported here for source compatibility.
 using GradMode = tensorplay::GradMode;
 
-// InferenceMode likewise lives at the p10 layer; re-exported for the
+// InferenceMode likewise lives at the p10 layer; it is re-exported for the
 // generated tpx wrappers and the Python bindings.
 using InferenceMode = tensorplay::InferenceMode;
 

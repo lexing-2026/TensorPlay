@@ -1,5 +1,4 @@
 // CUPTI kernel-level GPU tracing for the native profiler (USE_CUDA builds;
-// this TU compiles to nothing otherwise).  The torch.profiler equivalent of
 // this file is kineto's cupti_activity.cpp: the activity API is driven with
 // CONCURRENT_KERNEL + MEMCPY + MEMSET + RUNTIME + EXTERNAL_CORRELATION and
 // buffer-request/completion callbacks, and CUDA dispatch brackets push/pop

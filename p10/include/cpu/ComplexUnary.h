@@ -1,7 +1,5 @@
 // ComplexUnary.h -- shared elementwise complex-math dispatch used by the
-// CPU pointwise/tier kernels.  Mirrors ATen's approach: each supported
 // functor runs over std::complex<float>/<double>; ComplexHalf/BComplex32
-// compute in complex<float> (opmath), matching ATen's reduced-type rule.
 #pragma once
 
 #include <complex>
@@ -19,12 +17,10 @@ namespace cpu {
 inline constexpr int64_t kComplexGrain = 8192;
 
 // --- Complex math helpers ----------------------------------------------------
-// Formulas ported from c10/util/complex_math.h (the vendored ATen tree) so
-// numerics match torch's CPU kernels.
 
 template <typename T>
 inline std::complex<T> cx_log1p(const std::complex<T>& z) {
-    // numpy/numpy#22611 formulation, identical to c10::log1p on CPU.
+    // Stable complex log1p formulation.
     std::complex<T> u = z + T(1);
     if (u == T(1)) return z;
     std::complex<T> log_u = std::log(u);

@@ -7,7 +7,6 @@ namespace autocast {
 
 Tensor cached_cast(DType to_type, const Tensor& arg, DeviceType device_type) {
     if (is_eligible(arg, device_type) && (arg.dtype() != to_type)) {
-        // Transposed-view fast path (torch parity via aten::linear wrapping):
         // callers hand GEMMs a fresh `weight.t()` view every call, so caching
         // on the view's TensorImpl* never hits and the fallback would redo a
         // strided scalar cast each iteration.  Cast the dense parent instead
@@ -36,12 +35,10 @@ Tensor cached_cast(DType to_type, const Tensor& arg, DeviceType device_type) {
              arg.dtype() == DType::Float32 && is_autocast_cache_enabled());
 
         if (can_try_cache) {
-            // Upstream/Apex heuristic caches fp32 leaves that require grad.
-            // Non-grad tensors (inference weights) are safe to cache too --
-            // lookup validates the source's version counter, so an in-place
-            // mutation drops the stale copy -- and skipping their per-op
-            // recasts is a large inference-loop win over torch, which recasts
-            // every weight on every forward under no_grad.
+            // Cache eligible fp32 leaves that require grad. Non-grad tensors
+            // are safe to cache too: the source version counter invalidates a
+            // stale copy after an in-place mutation, avoiding repeated
+            // conversion of every weight during a no-grad forward.
             if (arg.requires_grad() && !tpx::impl::is_leaf(arg)) {
                 can_try_cache = false;
             }

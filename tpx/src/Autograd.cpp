@@ -56,7 +56,6 @@ std::vector<Edge> collect_next_edges(const Tensor& t) {
     if (impl::requires_grad(t)) {
         // Record the forward shape on every edge regardless of target kind:
         // the engine reduces broadcast-inflated grads back to it.  The dtype
-        // is recorded too (torch's InputMetadata::grad_dtype): the engine
         // casts floating gradients to it before the consumer node runs.
         const auto shape = static_cast<std::vector<int64_t>>(t.shape());
         const DType dt = t.dtype();
@@ -71,9 +70,8 @@ std::vector<Edge> collect_next_edges(const Tensor& t) {
             // Leaf
             auto* meta = impl::get_autograd_meta(t);
             if (meta) {
-                // Hold a strong ref locally: the graph edge becomes its owner,
-                // while the tensor only keeps a weak cache reference (mirrors
-                // c10's weak grad_accumulator_).
+                // Hold a strong reference locally: the graph edge becomes its
+                // owner, while the tensor only keeps a weak cache reference.
                 std::shared_ptr<Node> acc = meta->grad_accumulator();
                 if (!acc) {
                     acc = std::make_shared<AccumulateGrad>(t);
@@ -301,7 +299,6 @@ Tensor as_strided(const Tensor& self, const std::vector<int64_t>& size,
     }
 
     Tensor result = self.as_strided(size, stride, storage_offset);
-    // torch parity: as_strided always returns a view (ADInplaceOrView marks it
     // regardless of grad mode); detach_() must reject it.
     if (result.defined()) {
         result.unsafeGetTensorImpl()->set_is_view(true);
@@ -313,7 +310,6 @@ Tensor as_strided(const Tensor& self, const std::vector<int64_t>& size,
 }
 
 Tensor narrow(const Tensor& self, int64_t dim, int64_t start, int64_t length) {
-    // torch's narrow is a slice of `length` elements starting at `start`;
     // routing through the generated slice op carries the gradient via
     // SliceBackward.
     if (length < 0) {
@@ -326,7 +322,6 @@ Tensor narrow(const Tensor& self, int64_t dim, int64_t start, int64_t length) {
 // the derivative formulas in derivatives.yaml now resolve against
 // tensorplay::tpx::ops::expand, which carries autograd routing.
 
-// Mirrors torch's ToCopyBackward / _to_copy_backward: the gradient is cast
 // back to the source tensor's dtype and device.
 struct ToCopyBackward : public Node {
     DType dtype_;
@@ -344,7 +339,6 @@ struct ToCopyBackward : public Node {
 
 Tensor to(const Tensor& self, DType dtype, bool non_blocking, bool copy) {
     bool requires_grad = self.requires_grad();
-    // torch parity: casting to a non-differentiable dtype (int/bool) detaches
     // -- integer tensors cannot require grad, so no ToCopyBackward node is
     // registered and the result sits outside the graph.  Letting the node
     // through would push floating grads into the integer subgraph.

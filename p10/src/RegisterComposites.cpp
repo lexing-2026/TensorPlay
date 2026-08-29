@@ -1,15 +1,8 @@
-// Registration of backend-neutral composite kernels -- TensorPlay's analog of
-// the generated build/aten/src/ATen/RegisterCompositeExplicitAutograd.cpp.
+// Registration of backend-neutral composite kernels.
 //
-// native_functions.yaml maps this batch to CompositeExplicitAutograd
-// (expand/allclose/fill/repeat) or to no dispatch section, i.e. the default
-// CompositeImplicitAutograd (broadcast_to/tensor_split/tile/unflatten and the
-// stacking/split/atleast/flatten/moveaxis aliases); upstream `equal` carries
-// real per-backend kernels where p10 serves both dense keys from one
-// device-generic composition.  The kernels themselves live beside their ATen
-// counterparts in backend/cpu/ShapeAlignKernels.cpp; repeat() keeps explicit
-// CPU/CUDA registrations (its gather has real device code) and is therefore
-// not listed here.
+// These helpers build their results from dispatcher-visible tensor
+// operations. Operations with explicit CPU/CUDA implementations are
+// registered in their backend translation units.
 
 #include "ShapeAlignKernels.h"
 #include "Dispatcher.h"

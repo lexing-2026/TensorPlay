@@ -5,11 +5,8 @@
 
 namespace tensorplay {
 
-// Torch prints two different dtype-name styles in its BLAS error messages:
-//   1. c10 type names for the mm/matmul same-dtype check
-//      ("expected m1 and m2 to have the same dtype, but got: float != c10::Half")
-//   2. pretty scalar-type names elsewhere
-//      ("addmm_impl_cpu_" not implemented for 'Bool', "dot" not implemented for 'Int')
+// Human-readable dtype spellings used by matrix-operation diagnostics and
+// general operation errors.
 inline const char* c10_style_dtype_name(DType dtype) {
     switch (dtype) {
         case DType::Bool: return "bool";

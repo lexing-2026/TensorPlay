@@ -15,9 +15,7 @@
 
 namespace tensorplay {
 
-// Autocast state and helpers, mirroring ATen/autocast_mode.{h,cpp}.
 //
-// PyTorch implements the enable/disable switch through the dispatcher's TLS
 // excluded set: every Autocast* key lives in `default_excluded_set`, so
 // `set_autocast_enabled(device_type, true)` merely removes the key from that
 // set and lets the dispatcher consult Autocast kernels.  TensorPlay's
@@ -25,14 +23,12 @@ namespace tensorplay {
 // so the same contract is provided by a thread-local enabled flag per device;
 // call sites check `is_enabled(key)` before routing to the Autocast key.
 //
-// The cast-cache mirrors Apex/torch: the key is the fp32 source tensor's
 // TensorImpl*, kept alive by a weak reference so a recycled pointer can never
 // falsely hit.  `clear_cache()` is called by the Python context manager when
 // the nesting level drops to zero.
 namespace autocast {
 
 // ------------------------------------------------------------------
-// Device/key helpers (mirrors at::autocast inline helpers)
 // ------------------------------------------------------------------
 
 inline constexpr DispatchKey get_autocast_dispatch_key_from_device_type(
@@ -72,7 +68,6 @@ inline bool is_autocast_available(DeviceType device_type) {
 }
 
 // ------------------------------------------------------------------
-// Thread-local state (mirrors at::autocast state in autocast_mode.cpp)
 // ------------------------------------------------------------------
 
 P10_API bool is_enabled(DispatchKey autocast_key);
@@ -95,8 +90,7 @@ P10_API void set_autocast_cache_enabled(bool enabled);
 
 P10_API void clear_cache();
 
-// Mirrors c10::impl::ExcludeDispatchKeyGuard for the Autocast keys: while
-// alive, autocast is disabled for the given device so nested dispatch from an
+// Exclude the autocast dispatch key while alive so nested dispatch from an
 // autocast kernel cannot recurse.
 class ExcludeAutocastGuard {
 public:
@@ -119,12 +113,10 @@ private:
 // ------------------------------------------------------------------
 // Cast cache storage (populated by tpx's cached_cast)
 //
-// torch guards a process-global map with a mutex taken on every eligible
 // op; the cache here is thread-local instead, so the hot path is
 // lock-free and multi-threaded inference/training never contends.
 // Entries carry the source's version counter: an in-place mutation of the
 // fp32 source invalidates its cached low-precision copy (this is what makes
-// caching inference tensors -- which torch does not -- safe).
 // ------------------------------------------------------------------
 
 using val_type = std::pair<std::weak_ptr<TensorImpl>, Tensor>;

@@ -15,20 +15,17 @@ struct TENSORPLAY_API Edge {
     std::shared_ptr<Node> function;
     uint32_t input_nr;
     // Shape of the forward input this edge was created from. The engine uses
-    // it as torch's InputMetadata: gradients arriving with a different
     // (broadcast-inflated) shape are sum-reduced back to it before reaching
     // the consumer node.  `has_shape_hint` distinguishes a recorded scalar
     // shape () from "no hint" -- both are empty vectors.
     std::vector<int64_t> shape_hint;
     bool has_shape_hint = false;
     // Dtype of the forward input this edge was created from. The engine casts
-    // incoming floating gradients to it (torch's InputMetadata::grad_dtype /
     // validate_outputs contract); this is what lets an fp32 gradient produced
     // by unwrapped promote ops re-enter autocast backward nodes whose saved
     // tensors are low precision.
     std::optional<DType> grad_dtype;
     // Device (type + index) of the forward input this edge was created from.
-    // Together with shape/dtype hints this is the complete torch-style
     // InputMetadata triple, letting the ENGINE materialize missing gradients
     // (zeros) without crossing into Python.  The type is recorded separately
     // from the index because CPU tensors may carry index 0 (DLPack imports

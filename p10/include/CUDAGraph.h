@@ -26,11 +26,9 @@ namespace cuda {
 // the allocator handed to unrelated tensors.  While a capture scope is open,
 // allocations issued on the capturing stream are routed into graph-private
 // pool ``pool_id``; blocks in that pool are never recycled outside the pool
-// until :cpp:func:`releasePool`, mirroring c10's beginAllocateToPool /
-// endAllocateToPool / releasePool triple.
+// until :cpp:func:`releasePool`, across the begin/end/release pool lifecycle.
 //
 // ``requested_pool_id != 0`` routes into an existing pool instead of creating
-// a fresh one, so several graphs can share one pool (torch's ``pool=`` /
 // ``graph_pool_handle()``).  The pool is created on first use when unknown.
 
 P10_API uint64_t beginAllocateToPool(int device, const CUDAStream& stream,
@@ -56,7 +54,6 @@ P10_API bool isCapturing();
 
 namespace graph {
 
-// Capture-safety mode passed to cudaStreamBeginCapture, mirroring torch's
 // capture_error_mode ("global" | "thread_local" | "relaxed").
 enum class CaptureMode {
     Global,
@@ -64,12 +61,10 @@ enum class CaptureMode {
     Relaxed,
 };
 
-// Parses torch's capture_error_mode strings ("global", "thread_local",
 // "relaxed"); throws ValueError on anything else.
 P10_API CaptureMode captureModeFromName(const std::string& name);
 
 // One captured CUDA graph: capture once, instantiate at capture_end, replay
-// against static buffers.  Mirrors at::cuda::CUDAGraph:
 //
 //   CUDAGraph g;
 //   g.capture_begin(pool_id);          // 0 = fresh private pool
@@ -92,7 +87,6 @@ public:
     // routed to: 0 creates a fresh private pool, any id previously returned by
     // beginAllocateToPool / graph_pool_handle shares that pool with other
     // graphs.  ``stream`` overrides the dedicated per-device side stream.
-    // ``mode`` maps onto torch's capture_error_mode.
     void capture_begin(uint64_t pool_id = 0,
                        CaptureMode mode = CaptureMode::Global,
                        const CUDAStream& stream = CUDAStream::undefined());
@@ -123,7 +117,6 @@ public:
     void enable_debug_mode() { debug_ = true; }
     void debug_dump(const std::string& path);
 
-    // --- conditional nodes (torch's if/while graph capture, CUDA >= 12.4) ---
     //
     // Inside an open capture, splits the remaining work into a driver-level
     // conditional node: ``pred`` (device Bool scalar) is sampled by a

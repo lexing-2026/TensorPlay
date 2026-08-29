@@ -1,9 +1,7 @@
 #pragma once
 
-// Port of ATen/cpu/vec/vec256/vec256_int.h with the TensorPlay vec layer.
-// Interface matches PyTorch's Vectorized<int32_t>/Vectorized<int64_t>;
-// only int32/int64 specializations are ported (int8/16/uint8 can be added
-// when reduction kernels need them).
+// only int32/int64 specializations are currently provided (int8/16/uint8 can
+// be added when reduction kernels need them).
 
 #include <immintrin.h>
 #include "cpu/vec/vec_base.h"

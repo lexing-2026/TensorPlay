@@ -1,9 +1,6 @@
 #pragma once
 
-// Scalar special-function helpers ported from
-// third_party/pytorch/aten/src/ATen/native/Math.h (BSD licensed) so the vec
-// layer provides torch-parity digamma/erfinv/igamma/igammac without
-// depending on ATen headers.
+// Scalar special-function helpers.
 
 #include <cmath>
 #include <cstdint>

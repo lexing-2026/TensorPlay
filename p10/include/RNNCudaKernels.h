@@ -1,11 +1,9 @@
 #pragma once
 
-// Fused RNN cell primitives ported from
-// third_party/pytorch/aten/src/ATen/native/cuda/RNN.cu.
+// Fused RNN cell primitives.
 // Layout contract: gate tensors are contiguous row-major (N, G) with
 // G = 4*H (LSTM) or 3*H (GRU); states are contiguous (N, H); biases are
 // contiguous (G,) or undefined. Half/BFloat16 compute in float32
-// (at::acc_type parity); Float64 computes in double.
 
 #include "Tensor.h"
 #include <tuple>

@@ -1,7 +1,5 @@
 #pragma once
 
-// Port of ATen/cpu/vec/vec256/vec256_float.h with the TensorPlay vec layer.
-// Interface matches PyTorch's Vectorized<float>; math functions that
 // depend on Sleef fall back to a scalar map (auto-vectorized by the
 // compiler at -O3 -mavx2), everything else uses AVX2 intrinsics.
 
@@ -14,7 +12,6 @@
 #include <cstdint>
 
 #if defined(CPU_CAPABILITY_AVX2) && defined(__GLIBC__)
-// PyTorch's AVX2 Vectorized<float> uses Sleef for transcendental functions.
 // On glibc systems libmvec exposes the same vector ABI, which gives Stax's
 // fused CPU codegen a real vector math implementation instead of falling
 // back to eight scalar calls through map().
@@ -192,7 +189,6 @@ struct Vectorized<float> {
         _mm256_set1_ps(-0.0f), values); // clear sign bit
   }
   Vectorized<float> angle() const {
-    // ATen semantics: NaN -> NaN, negative -> pi, otherwise -> 0.
     const auto zero_vec = _mm256_set1_ps(0.f);
     const auto nan_vec = _mm256_set1_ps(std::numeric_limits<float>::quiet_NaN());
     const auto not_nan_mask = _mm256_cmp_ps(values, values, _CMP_EQ_OQ);

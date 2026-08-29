@@ -4,7 +4,7 @@
 
 namespace tensorplay {
 
-// Thread-local autograd recording switch, mirroring c10::GradMode. Lives at
+// Thread-local autograd recording switch. Lives at
 // the p10 layer so dispatch code can consult it without depending on tpx;
 // tpx re-exports it as tensorplay::tpx::GradMode.
 class P10_API GradMode {
@@ -14,7 +14,6 @@ public:
 
 private:
     // True thread-local storage: no_grad() in one thread must not leak into
-    // engine workers or other user threads (PyTorch semantics).
     static thread_local bool enabled_;
 };
 

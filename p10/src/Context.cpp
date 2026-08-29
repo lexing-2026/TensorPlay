@@ -37,8 +37,6 @@ bool isFloatingPoint(DType dtype) {
 }
 
 void Context::setDefaultDType(DType dtype) {
-    // Mirrors torch._C._set_default_dtype's check in
-    // torch/csrc/tensor/python_tensor.cpp.
     if (!isFloatingPoint(dtype)) {
         TP_THROW(TypeError, "invalid dtype object: only floating-point types are supported as the default type");
     }
@@ -52,7 +50,7 @@ void Context::alertNotDeterministic(const std::string& caller) const {
     static const std::string error_msg =
         " does not have a deterministic implementation, but you set "
         "'use_deterministic_algorithms(True)'. You can turn off determinism "
-        "by calling 'torch.use_deterministic_algorithms(False)', or call "
+        "by calling 'use_deterministic_algorithms(False)', or call "
         "'use_deterministic_algorithms(True, warn_only=True)' to only receive warnings.";
     if (deterministicAlgorithms()) {
         if (deterministicAlgorithmsWarnOnly()) {

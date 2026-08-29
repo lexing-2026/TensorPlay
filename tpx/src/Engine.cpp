@@ -38,7 +38,7 @@ inline bool engine_trace_enabled() {
 // ---------------------------------------------------------------------------
 // Structured backward-graph tracing (TP_ENGINE_TRACE).
 //
-// A lightweight debugging surface the upstream engine does not have:
+// A lightweight debugging surface for tracing engine events:
 //   TP_ENGINE_TRACE=0/unset  off (single static check on the hot path)
 //   TP_ENGINE_TRACE=1        lifecycle events only
 //   TP_ENGINE_TRACE=2        + per-node apply (shapes) and every delivery
@@ -144,7 +144,6 @@ bool tensor_has_nan(const Tensor& t) {
 
 Engine& Engine::get_default_engine() {
     // Deliberately leaked: worker threads and queued tasks may outlive static
-    // destruction order (same rationale as torch::autograd::Engine).
     static Engine* engine = new Engine();
     return *engine;
 }
@@ -158,7 +157,6 @@ ReadyQueue* Engine::queue_for_device(int device_index) {
     ready_queues_[device_index] = queue;
     if (device_index >= 0) {
         // Spawn one persistent worker per CUDA device on first use, mirroring
-        // torch::autograd::Engine::initialize_device_threads_pool().
         device_threads_.emplace(
             device_index, std::thread([this, queue] { worker_main(*queue); }));
     }
@@ -294,12 +292,10 @@ void GraphTask::init_to_execute(Node& graph_root, const edge_list& outputs,
     }
 }
 
-// Mirrors torch's validate_outputs/at::sum_to: reduce a gradient whose shape
 // doesn't match the recorded forward-input shape of its destination slot.
 // Without this, gradients of broadcast operands keep their broadcast-inflated
 // shape mid-graph and break consumers expecting the operand's true shape.
 static Tensor sum_to_shape(const Tensor& grad, const std::vector<int64_t>& target) {
-    // Mirrors ATen ExpandUtils.h::_sum_to: sum the extra leading dims and any
     // broadcast-inflated (target==1) dims with keepdim=true, then view down
     // to the exact target rank.
     if (target.empty()) {
@@ -362,8 +358,8 @@ void Engine::evaluate_function(GraphTask& task, Node* func, InputBuffer& inputs,
 
     variable_list outputs;
     {
-        // Per-node backward event ("backward::MulBackward0" style, matching
-        // upstream's profiler surface).  Inactive cost: one atomic load;
+        // Per-node backward event ("backward::MulBackward0" style). Inactive
+        // cost: one atomic load;
         // the virtual demangle runs only when a session is live, and names
         // are interned so long training loops don't grow any arena.
         const bool __tp_prof_on =
@@ -387,7 +383,6 @@ void Engine::evaluate_function(GraphTask& task, Node* func, InputBuffer& inputs,
             EngineTrace::emit(task.trace_id_, "%s", in.c_str());
         }
         variable_list vars = InputBuffer::variables(std::move(inputs));
-        // torch parity (InputMetadata + materialize_grads): zero-fill any
         // undefined input gradient so user backward functions never see None
         // unless they opted out via set_materialize_grads(false).
         //
@@ -467,7 +462,6 @@ void Engine::evaluate_function(GraphTask& task, Node* func, InputBuffer& inputs,
     }
 
     // Shape-validate gradients against the forward-input shapes recorded on
-    // this node's edges (see Edge::shape_hint). Mirrors torch's
     // Engine::validate_outputs; under create_graph the reduction ops join the
     // second-order graph because GradMode is active here.
     {
@@ -490,7 +484,6 @@ void Engine::evaluate_function(GraphTask& task, Node* func, InputBuffer& inputs,
                     outputs[i] = sum_to_shape(outputs[i], hint);
                 }
             }
-            // Dtype contract (torch InputMetadata::grad_dtype via
             // validate_outputs): a floating gradient crossing an edge must be
             // the forward input's dtype.  Autocast graphs depend on this --
             // unwrapped promote ops emit fp32 grads that must re-enter
@@ -605,7 +598,6 @@ void Engine::evaluate_function(GraphTask& task, Node* func, InputBuffer& inputs,
         // without this the initiator would wait out a full poll interval. Note
         // the local `cpu_queue` param is the *device* queue when running on a
         // device worker (see worker_main), so notify the true CPU queue.
-        // Mirrors torch's dummy-wakeup task (engine.cpp thread_main).
         queue_for_device(-1)->notify();
     }
 }

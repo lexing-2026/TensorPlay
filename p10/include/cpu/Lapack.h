@@ -1,6 +1,5 @@
 // Runtime LAPACK binding (ILP64).
 //
-// Torch builds against an external LAPACK; TensorPlay instead resolves one at
 // runtime.  The default provider is numpy's bundled scipy-openblas wheel
 // library (libscipy_openblas64_*), which exports the full LAPACK with 64-bit
 // integers (`scipy_<name>_64_`).  `TP_LAPACK_LIB` may point at any other
@@ -8,7 +7,6 @@
 //
 // The raw entries follow the Fortran ABI (everything by pointer, no return
 // value); the typed `lapack_*` helpers below wrap them with C++ value
-// semantics and mirror the argument order of third_party/pytorch's
 // BatchLinearAlgebra.h so the kernel ports read the same way.
 
 #pragma once

@@ -76,7 +76,6 @@ TensorImpl::TensorImpl(Storage storage, const std::vector<int64_t>& sizes, const
 }
 
 // Copy does not carry autograd metadata: copies start fresh, matching
-// PyTorch (autograd metadata is attached by the autograd layer, never copied).
 TensorImpl::TensorImpl(const TensorImpl& other)
     : storage_offset_(other.storage_offset_),
       sizes_and_strides_(other.sizes_and_strides_),
@@ -101,7 +100,6 @@ void TensorImpl::set_requires_grad(bool requires_grad) {
                 autograd_meta_->set_requires_grad(true);
             } else {
                 // If no factory, we can't enable autograd. 
-                // In PyTorch this might throw or use default. 
                 // For now, let's warn or throw.
                 std::cerr << "Warning: AutogradMetaFactory not registered. cannot set requires_grad=true" << std::endl;
             }

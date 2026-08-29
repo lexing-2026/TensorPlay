@@ -1,7 +1,5 @@
 #pragma once
-// Shared host/device coordinate math for the grid_sampler kernels.  Port of
-// third_party/pytorch/aten/src/ATen/native/GridSampler.h (coordinate mapping)
-// plus the cubic-convolution helpers of aten/src/ATen/native/UpSample.h.
+// Shared host/device coordinate math for the grid_sampler kernels.
 
 #ifdef __CUDACC__
 #define TP_GS_INLINE __host__ __device__ inline
@@ -15,9 +13,7 @@
 namespace tensorplay {
 namespace gridsampler {
 
-// interpolation_mode values (ATen GridSamplerUtils.h GridSamplerInterpolation)
 enum Interp : int { Bilinear = 0, Nearest = 1, Bicubic = 2 };
-// padding_mode values (ATen GridSamplerUtils.h GridSamplerPadding)
 enum Pad : int { Zeros = 0, Border = 1, Reflection = 2 };
 
 // Unnormalizes a coordinate from the -1..+1 scale to its pixel index value,
@@ -189,7 +185,6 @@ TP_GS_INLINE scalar_t get_value_bounded(const storage_t* data, scalar_t x, scala
     return static_cast<scalar_t>(0);
 }
 
-// --- cubic convolution (alpha = -0.75), ATen UpSample.h -------------------
 template <typename scalar_t>
 TP_GS_INLINE scalar_t cubic_convolution1(scalar_t x, scalar_t A) {
     return ((A + 2) * x - (A + 3)) * x * x + 1;
@@ -209,7 +204,6 @@ TP_GS_INLINE void get_cubic_upsampling_coefficients(scalar_t coeffs[4], scalar_t
     coeffs[3] = cubic_convolution2<scalar_t>(2 - t, A);
 }
 
-// d coeff / d t, matching get_cubic_upsampling_coefficients (ATen GridSampler.h
 // get_cubic_coefficients_grad).
 template <typename scalar_t>
 TP_GS_INLINE void get_cubic_coefficients_grad(scalar_t coeffs[4], scalar_t t) {

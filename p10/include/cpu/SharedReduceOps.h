@@ -1,6 +1,5 @@
 #pragma once
 
-// Port of ATen/native/SharedReduceOps.h: reduce/combine/project ops for
 // binary_kernel_reduce. Scalar-only variants (vectorized ops live directly in
 // the sum kernels via binary_kernel_reduce_vec lambdas).
 

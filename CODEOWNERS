@@ -1,4 +1,3 @@
-# This file routes review ownership per path, mirroring pytorch's CODEOWNERS.
 # Scopes align with the "release notes: *" label family (see .github/labels.yml).
 
 # Default owner for everything in the repo

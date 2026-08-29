@@ -185,7 +185,6 @@ inline constexpr bool is_complex_type_v = is_complex_type<T>::value;
     _(std::complex<tensorplay::BFloat16>, BComplex32)
 
 // Float8 family: opt-in tier -- only conversion/copy/item paths dispatch on
-// these initially (mirrors ATen keeping float8 out of the generic kernel
 // lists until per-op support lands).
 #define TENSORPLAY_FORALL_FP8_TYPES(_) \
     _(tensorplay::Float8_e4m3fn, Float8_e4m3fn)   \
@@ -215,9 +214,9 @@ TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(SPECIALIZE_TYPE_TRAITS)
 
 // Helper functions for ScalarType
 inline const char* toString(ScalarType t) {
-    // c10::toString parity -- these spellings appear verbatim in user-facing
-    // messages like '"avg_pool2d" not implemented for 'Long''.  Enum entry
-    // names stay p10-style (Int64 etc.); only the message spelling maps.
+    // These spellings appear verbatim in user-facing messages such as
+    // '"avg_pool2d" not implemented for 'Long''. Enum entry names stay
+    // p10-style (Int64 etc.); only the message spelling maps.
 #define TP_TOSTRING_CASE(name, str) \
     case ScalarType::name:          \
         return str;
