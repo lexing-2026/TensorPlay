@@ -527,9 +527,10 @@ def cumulative_trapezoid(y, x=None, *, dx=None, dim=-1):
 
 
 def quantile(input, q, dim=None, keepdim=False, *, interpolation="linear"):
-    """
-    quantile_impl composite): all five interpolation modes, float32/float64,
-    NaN semantics and output shapes match upstream.  A Python-number q is
+    """Compute quantiles through the dispatcher composite implementation.
+
+    All five interpolation modes, float32/float64, NaN semantics, and output
+    shapes are handled here.  A Python-number q is
 """
     if isinstance(q, tensorplay.Tensor):
         qs = q

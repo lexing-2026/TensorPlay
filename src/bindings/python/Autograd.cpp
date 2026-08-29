@@ -9,7 +9,7 @@
 
 namespace {
 // Cached tensor PyTypeObject for ns-scale type checks on the custom-function
-// hot path (mirrors CPythonBridge's g_tensor_type trick).
+// hot path (using a cached CPython tensor type).
 PyTypeObject* g_fast_tensor_type = nullptr;
 inline bool fast_is_tensor(PyObject* obj) {
     if (g_fast_tensor_type)
@@ -244,7 +244,7 @@ void init_autograd(py::module_& m) {
         },
         "node"_a, "args"_a);
 
-    // Mirror of THPFunction_apply's inner block: toggles grad off, calls
+    // Custom-function forward block: toggles grad off, calls
     // the user forward, then setup_context -- all inside ONE crossing so
     // the Python layer pays no per-step pybind/GIL-mode round-trips.
     autograd.def("run_custom_function_forward",
@@ -279,8 +279,7 @@ void init_autograd(py::module_& m) {
         },
         "ctx"_a, "forward_fn"_a, "setup_ctx_fn"_a.none(), "args"_a);
 
-    // THE single-entry hot path -- a wholesale mirror of THPFunction_apply
-    // (python_function.cpp:1699): node creation, unpack_input, the
+    // THE single-entry hot path: node creation, unpack_input, the
     // AutoGradMode(false) forward block, setup_context and _wrap_outputs
     // all happen inside ONE pybind crossing.  Returns (output, ctx, needs,
     // executable); Python only builds the backward closure afterwards.
@@ -292,7 +291,7 @@ void init_autograd(py::module_& m) {
             auto node = node_factory(ctx);
             auto* py_node = node.cast<PyNode*>();
 
-            // ---- unpack_input mirror ----
+            // ---- unpack_input ----
             Py_ssize_t n_args = PyTuple_GET_SIZE(args.ptr());
             py::tuple needs(n_args);
             bool any_rg = false;
@@ -364,7 +363,7 @@ void init_autograd(py::module_& m) {
             }
             tensorplay::tpx::GradMode::set_enabled(prev_grad);
 
-            // ---- _wrap_outputs mirror (executable only) ----
+            // ---- _wrap_outputs (executable only) ----
             if (executable) {
                 auto shared = std::shared_ptr<tensorplay::tpx::Node>(
                     std::static_pointer_cast<tensorplay::tpx::Node>(

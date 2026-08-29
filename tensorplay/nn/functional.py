@@ -743,7 +743,7 @@ def cross_entropy(input, target, weight=None, size_average=None, ignore_index=-1
 
 # -----------------------------------------------------------------------------
 # Activation / misc functions.  These are thin wrappers over the native
-# dispatcher ops declared in config/native_functions.yaml; the element-wise
+# dispatcher ops declared in the native schema; the element-wise
 # -----------------------------------------------------------------------------
 
 def gelu(input: Tensor, approximate: str = 'none') -> Tensor:
@@ -1427,7 +1427,7 @@ def cosine_similarity(x1: Tensor, x2: Tensor, dim: int = 1, eps: float = 1e-8) -
 
 
 # -----------------------------------------------------------------------------
-# Mask helpers used by Transformer modules (ported verbatim).
+# Mask helpers used by Transformer modules.
 # -----------------------------------------------------------------------------
 
 
@@ -1471,7 +1471,7 @@ def _none_or_dtype(input: Optional[Tensor]):
 
 
 # -----------------------------------------------------------------------------
-# live in config/native_functions.yaml + p10 kernels).
+# live in the native schema and backend kernels).
 # -----------------------------------------------------------------------------
 
 
