@@ -376,7 +376,6 @@ def _single_tensor_adafactor(
         # Adafactor has no differentiable optimizer mode.  Materialize a
         # scalar Tensor lr exactly once so the Python min/norm calculations
         # and TensorPlay's alpha overloads receive a numeric scalar, matching
-        # Torch's eager behavior.
         lr = scalar_value(lr, "lr")
 
     for i, param in enumerate(params):
@@ -626,8 +625,6 @@ def adafactor(
     col_vars: list[Tensor | None],
     variances: list[Tensor | None],
     state_steps: list[Tensor],
-    # kwonly args with defaults are not supported by functions compiled with torchscript issue #70627
-    # setting this as kwarg for now as functional API is compiled by torch/distributed/optim
     foreach: bool | None = None,
     grad_scale: Tensor | None = None,
     found_inf: Tensor | None = None,
@@ -643,7 +640,6 @@ def adafactor(
 ) -> None:
     r"""Functional API that performs Adafactor algorithm computation.
 
-    See :class:`~torch.optim.Adafactor` for details.
     """
     if not tp.compiler.is_compiling() and not all(
         isinstance(t, tp.Tensor) for t in state_steps
@@ -665,7 +661,6 @@ def adafactor(
         and not has_complex
         and not isinstance(lr, tp.Tensor)
         and bool(params)
-        # Torch updates reduced-precision state with separate Python ops;
         # the fused kernel's combined write rounds at a different point.
         and params[0].dtype in (tp.float32, tp.float64)
     )

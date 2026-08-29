@@ -24,7 +24,6 @@ from .optimizer import (
 
 
 class Adadelta(Optimizer):
-    """Adadelta optimizer matching ``torch.optim.Adadelta``."""
 
     def __init__(self, params, lr=1.0, rho=0.9, eps=1e-6,
                  weight_decay=0, foreach=None, *, capturable=False,
@@ -174,7 +173,6 @@ def _single_tensor_adadelta(
         square_avg.mul_(rho).addcmul_(grad, grad, value=1 - rho)
         if differentiable:
             # Do not mutate the temporary saved by add() in-place before its
-            # backward pass; Torch's differentiable path treats these as
             # out-of-place temporaries.
             std = square_avg.add(eps).sqrt()
             delta = acc_delta.add(eps).sqrt()

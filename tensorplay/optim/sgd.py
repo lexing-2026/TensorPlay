@@ -97,7 +97,6 @@ class SGD(Optimizer):
             if grad.is_sparse:
                 has_sparse_grad = True
                 native_cuda_group = False
-            # Torch's default/foreach CUDA implementation materializes the
             # momentum multiply and add separately.  For half and bfloat16
             # that intermediate write is observable, whereas the fused MTA
             # kernel intentionally keeps the update in opmath precision.  Keep
@@ -243,7 +242,6 @@ def _single_tensor_sgd(
             else:
                 grad = buf
         if isinstance(lr, tp.Tensor):
-            # The native Torch alpha overload accepts a scalar Tensor in
             # eager mode.  TensorPlay's overload does not, so use the
             # equivalent elementwise product for both grad-tracked and
             # ordinary scalar Tensor learning rates.
@@ -309,7 +307,6 @@ def _multi_tensor_sgd(
             # A partially initialized state list cannot be handed to the
             # fused helper; leave that uncommon transition on the grouped
             # foreach path so state initialization remains identical to
-            # torch.optim.SGD.
             if momentum_buffer_state == 2:
                 native_cuda_group = False
             elif momentum_buffer_state is None:
@@ -612,7 +609,6 @@ def sgd(
 ):
     if foreach is None and fused is None:
         # The group initializer already established the common CUDA native
-        # candidate.  Avoid repeating Torch's full parameter capability scan
         # on every step; the native helper still validates the complete list.
         if (
             native_cuda_group

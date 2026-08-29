@@ -15,7 +15,6 @@ def _dot(lhs, rhs):
 
 
 def _cubic_interpolate(x1, f1, g1, x2, f2, g2, bounds=None):
-    """Torch's two-point cubic interpolation used by strong Wolfe search."""
 
     if bounds is not None:
         xmin_bound, xmax_bound = bounds
@@ -51,7 +50,6 @@ def _strong_wolfe(
     tolerance_change=1e-9,
     max_ls=25,
 ):
-    """Direct port of ``torch.optim.lbfgs._strong_wolfe``."""
 
     d_norm = max_abs(d)
     g = g.clone()
@@ -177,7 +175,6 @@ def _strong_wolfe(
 
 
 class LBFGS(Optimizer):
-    """Limited-memory BFGS optimizer, aligned with ``torch.optim.LBFGS``."""
 
     def __init__(
         self,

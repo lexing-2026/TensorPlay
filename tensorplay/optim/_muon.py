@@ -53,7 +53,6 @@ def _zeropower_via_newtonschulz(
     ortho_grad = grad.to(tp.bfloat16)
     # Normalize before taking the transpose.  TensorPlay's CUDA in-place
     # pointwise kernels do not safely scatter through a non-contiguous
-    # transpose view; Torch's ``div_`` does.  Keep the BF16 alias observable
     # (the scalar reference mutates a BF16 momentum buffer) by copying the
     # normalized result back to the original gradient in that case.
     norm = ortho_grad.norm().clamp(min=eps)
@@ -88,7 +87,6 @@ def _zeropower_batched_via_newtonschulz(
 ) -> list[Tensor]:
     """Run Muon's NS loop over one same-shaped CUDA tensor batch.
 
-    Torch's reference implementation intentionally operates on one matrix at
     a time.  That is the right semantic baseline, but it launches three GEMMs
     per NS iteration for every parameter.  Packing same-shaped matrices lets
     CUDA execute the independent products as one strided-batched GEMM while
@@ -176,7 +174,6 @@ def _try_batched_muon(
         buckets.setdefault(key, []).append(index)
 
     # If every matrix is unique, batching only adds pack/unpack work.  Keep
-    # the exact scalar Torch-shaped route for that case.
     if not any(len(indices) > 1 for indices in buckets.values()):
         return False
 
@@ -215,7 +212,6 @@ def _try_batched_muon(
             else group_bufs
         )
 
-        # Torch's scalar reference keeps ``grad.bfloat16()`` as an alias for
         # BF16 gradients.  In the non-Nesterov case ``update`` is the
         # momentum buffer itself, so its initial normalization is observable
         # through optimizer.state.  Normalize the buffers before packing and
@@ -472,10 +468,8 @@ Muon.__doc__ = (
         >>> other_params = [
         ...     p for p in model.parameters() if p.ndim != 2
         ... ]
-        >>> optim_muon = torch.optim.Muon(
         ...     muon_params, lr=0.02, momentum=0.95
         ... )
-        >>> optim_adamw = torch.optim.AdamW(
         ...     other_params, lr=3e-4, weight_decay=0.01
         ... )
         >>> optim_muon.zero_grad()
@@ -565,7 +559,6 @@ def muon(
 ) -> None:
     r"""Functional API that performs Muon algorithm computation.
 
-    See :class:`~torch.optim.Muon` for details.
     """
     if foreach is not None and foreach:
         raise RuntimeError("Foreach is not supported for Muon yet")

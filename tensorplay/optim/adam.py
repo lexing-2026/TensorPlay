@@ -116,7 +116,6 @@ class Adam(Optimizer):
                 state["step"] = tp.tensor(
                     0.0,
                     dtype=tp.float32,
-                    # Match Torch's special host placement: a non-capturable,
                     # non-fused optimizer keeps the scalar step on CPU even
                     # when the parameter lives on CUDA.  This avoids a host
                     # synchronization for every ordinary foreach step and is
@@ -550,11 +549,8 @@ def _multi_tensor_adam(
     if not native_host_steps:
         tp._foreach_add_(device_state_steps, 1)
 
-    # Torch keeps non-capturable Adam step counters on the host.  The native
-    # CUDA foreach entry point already has the same MTA layout as Torch's
     # fused host-step path; use it before materialising the composed foreach
     # intermediates.  The host kernel is minimizing internally, so materialize
-    # Torch's maximize convention as a negated gradient at the boundary.  This
     # also preserves the native Adam/AdamW distinction: coupled decay is added
     # to that gradient, while decoupled decay is applied to the parameter.
     if native_host_steps:
@@ -790,7 +786,6 @@ def adam(
         decoupled_weight_decay=False, *, amsgrad, beta1, beta2, lr,
         weight_decay, eps, maximize, layout_cache=None):
     """Functional API that performs the Adam algorithm computation."""
-    # Torch's default CPU policy selects its single-tensor implementation.
     # TensorPlay has a native CPU fused body with the same state/update
     # contract; select it only for the ordinary homogeneous eager layout so
     # the public default avoids one Python/native dispatch per parameter.

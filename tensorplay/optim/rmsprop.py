@@ -18,7 +18,6 @@ from .optimizer import (
 
 
 class RMSprop(Optimizer):
-    """RMSprop optimizer matching Torch's centered and momentum variants."""
 
     def __init__(self, params, lr=1e-2, alpha=0.99, eps=1e-8,
                  weight_decay=0, momentum=0, centered=False,
@@ -322,7 +321,6 @@ def rmsprop(
 
     # The native CPU/CUDA kernels validate every tensor pair and state list
     # in C++.  Probe the cheap first tensor metadata here and let an
-    # unsupported layout fall through to Torch's foreach implementation.  A
     # Python all(...) over every parameter was measurably more expensive than
     # the optimizer kernel for the many-small-tensor case.
     native_candidate = (
@@ -357,7 +355,6 @@ def rmsprop(
         except NotImplementedError:
             # The C++ validator uses NotImplementedError for layouts and
             # dtypes that the fused path cannot consume.  Those are valid
-            # foreach inputs, so retain Torch's fallback semantics.
             pass
 
     if foreach is None:
