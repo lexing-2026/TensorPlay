@@ -238,7 +238,6 @@ class CTCDecoder:
             )
         else:
             self.decoder = _LexiconFreeDecoder(decoder_options, lm, silence, self.blank, transitions)
-        # https://github.com/pytorch/audio/issues/3218
         # If lm is passed like rvalue reference, the lm object gets garbage collected,
         # and later call to the lm fails.
         # This ensures that lm object is not deleted as long as the decoder is alive.

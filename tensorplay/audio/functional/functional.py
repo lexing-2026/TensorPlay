@@ -69,7 +69,6 @@ def spectrogram(
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Args:
         waveform (Tensor): Tensor of audio of dimension `(..., time)`
@@ -109,7 +108,6 @@ def spectrogram(
         )
 
     if pad > 0:
-        # TODO add "with torch.no_grad():" back when JIT supports it
         waveform = tensorplay.nn.functional.pad(waveform, (pad, pad), "constant")
 
     frame_length_norm, window_norm = _get_spec_norms(normalized)
@@ -162,7 +160,6 @@ def inverse_spectrogram(
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Args:
         spectrogram (Tensor): Complex tensor of audio of dimension (..., freq, time).
@@ -267,9 +264,8 @@ def griffinlim(
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
-    Implementation ported from
+    Implementation follows
     *librosa* :cite:`brian_mcfee-proc-scipy-2015`, *A fast Griffin-Lim algorithm* :cite:`6701851`
     and *Signal estimation from modified short-time Fourier transform* :cite:`1172092`.
 
@@ -359,7 +355,6 @@ def amplitude_to_DB(
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     The output of each tensor in a batch depends on the maximum value of that tensor,
     and so may return different values for an audio clip split into snippets vs. a full clip.
@@ -408,7 +403,6 @@ def DB_to_amplitude(x: Tensor, ref: float, power: float) -> Tensor:
 
     .. devices:: CPU CUDA
 
-    .. properties:: TorchScript
 
     Args:
         x (Tensor): Input tensor before being converted to power/amplitude scale.
@@ -527,13 +521,11 @@ def melscale_fbanks(
 
     .. devices:: CPU
 
-    .. properties:: TorchScript
 
     Note:
         For the sake of the numerical compatibility with librosa, not all the coefficients
         in the resulting filter bank has magnitude of 1.
 
-        .. image:: https://download.pytorch.org/tensorplay.audio/doc-assets/mel_fbanks.png
            :alt: Visualization of generated filter bank
 
     Args:
@@ -597,13 +589,11 @@ def linear_fbanks(
 
     .. devices:: CPU
 
-    .. properties:: TorchScript
 
     Note:
         For the sake of the numerical compatibility with librosa, not all the coefficients
         in the resulting filter bank has magnitude of 1.
 
-        .. image:: https://download.pytorch.org/tensorplay.audio/doc-assets/lin_fbanks.png
            :alt: Visualization of generated filter bank
 
     Args:
@@ -638,7 +628,6 @@ def create_dct(n_mfcc: int, n_mels: int, norm: Optional[str]) -> Tensor:
 
     .. devices:: CPU
 
-    .. properties:: TorchScript
 
     Args:
         n_mfcc (int): Number of mfc coefficients to retain
@@ -671,7 +660,6 @@ def mu_law_encoding(x: Tensor, quantization_channels: int) -> Tensor:
 
     .. devices:: CPU CUDA
 
-    .. properties:: TorchScript
 
     For more info see the
     `Wikipedia Entry <https://en.wikipedia.org/wiki/%CE%9C-law_algorithm>`_
@@ -704,7 +692,6 @@ def mu_law_decoding(x_mu: Tensor, quantization_channels: int) -> Tensor:
 
     .. devices:: CPU CUDA
 
-    .. properties:: TorchScript
 
     For more info see the
     `Wikipedia Entry <https://en.wikipedia.org/wiki/%CE%9C-law_algorithm>`_
@@ -733,7 +720,6 @@ def phase_vocoder(complex_specgrams: Tensor, rate: float, phase_advance: Tensor)
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Args:
         complex_specgrams (Tensor):
@@ -765,7 +751,6 @@ def phase_vocoder(complex_specgrams: Tensor, rate: float, phase_advance: Tensor)
     complex_specgrams = complex_specgrams.reshape([-1] + list(shape[-2:]))
 
     # Figures out the corresponding real dtype, i.e. complex128 -> float64, complex64 -> float32
-    # Note torch.real is a view so it does not incur any memory copy.
     real_dtype = tensorplay.real(complex_specgrams).dtype
     time_steps = tensorplay.arange(0, complex_specgrams.size(-1), rate, device=complex_specgrams.device, dtype=real_dtype)
 
@@ -820,7 +805,6 @@ def mask_along_axis_iid(
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Mask will be applied from indices ``[v_0, v_0 + v)``,
     where ``v`` is sampled from ``uniform(0, max_v)`` and
@@ -870,7 +854,7 @@ def mask_along_axis_iid(
 
     # Per batch example masking
     specgrams = specgrams.transpose(axis, -1)
-    # this aims to avoid CPU-GPU sync from upstream
+    # Keep the mask construction on the selected device to avoid CPU-GPU sync.
     specgrams = (
         tensorplay.where((mask >= mask_start) & (mask < mask_end), mask_value.repeat(specgrams.shape), specgrams)
         if isinstance(mask_value, Tensor)
@@ -892,7 +876,6 @@ def mask_along_axis(
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Mask will be applied from indices ``[v_0, v_0 + v)``,
     where ``v`` is sampled from ``uniform(0, max_v)`` and
@@ -962,7 +945,6 @@ def compute_deltas(specgram: Tensor, win_length: int = 5, mode: str = "replicate
 
     .. devices:: CPU CUDA
 
-    .. properties:: TorchScript
 
     .. math::
        d_t = \frac{\sum_{n=1}^{\text{N}} n (c_{t+n} - c_{t-n})}{2 \sum_{n=1}^{\text{N}} n^2}
@@ -1127,7 +1109,6 @@ def detect_pitch_frequency(
 
     .. devices:: CPU CUDA
 
-    .. properties:: TorchScript
 
     It is implemented using normalized cross-correlation function and median smoothing.
 
@@ -1172,7 +1153,6 @@ def sliding_window_cmn(
 
     .. devices:: CPU CUDA
 
-    .. properties:: TorchScript
 
     Args:
         specgram (Tensor): Tensor of spectrogram of dimension `(..., time, freq)`
@@ -1266,7 +1246,6 @@ def spectral_centroid(
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     The spectral centroid is defined as the weighted average of the
     frequency values, weighted by their magnitude.
@@ -1378,7 +1357,6 @@ def _get_sinc_resample_kernel(
     t *= base_freq
     t = t.clamp_(-lowpass_filter_width, lowpass_filter_width)
 
-    # we do not use built in torch windows here as we need to evaluate the window
     # at specific positions, not over a regular grid.
     if resampling_method == "sinc_interp_hann":
         window = tensorplay.cos(t * math.pi / lowpass_filter_width / 2) ** 2
@@ -1444,7 +1422,6 @@ def resample(
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Note:
         ``transforms.Resample`` precomputes and reuses the resampling kernel, so using it will result in
@@ -1536,7 +1513,6 @@ def loudness(waveform: Tensor, sample_rate: int):
 
     .. devices:: CPU CUDA
 
-    .. properties:: TorchScript
 
     Args:
         waveform(tensorplay.Tensor): audio waveform of dimension `(..., channels, time)`
@@ -1607,7 +1583,6 @@ def pitch_shift(
 
     .. devices:: CPU CUDA
 
-    .. properties:: TorchScript
 
     Args:
         waveform (Tensor): The input waveform of shape `(..., time)`.
@@ -1758,7 +1733,6 @@ def rnnt_loss(
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     The RNN Transducer loss extends the CTC loss by defining a distribution over output
     sequences of all lengths, and by jointly modelling both input-output and output-output
@@ -1805,7 +1779,6 @@ def psd(
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Args:
         specgram (tensorplay.Tensor): Multi-channel complex-valued spectrum.
@@ -1922,7 +1895,6 @@ def mvdr_weights_souden(
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Given the power spectral density (PSD) matrix of target speech :math:`\bf{\Phi}_{\textbf{SS}}`,
     the PSD matrix of noise :math:`\bf{\Phi}_{\textbf{NN}}`, and a one-hot vector that represents the
@@ -1985,7 +1957,6 @@ def mvdr_weights_rtf(
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Given the relative transfer function (RTF) matrix or the steering vector of target speech :math:`\bm{v}`,
     the PSD matrix of noise :math:`\bf{\Phi}_{\textbf{NN}}`, and a one-hot vector that represents the
@@ -2062,7 +2033,6 @@ def rtf_evd(psd_s: Tensor) -> Tensor:
 
     .. devices:: CPU CUDA
 
-    .. properties:: TorchScript
 
     Args:
         psd_s (Tensor): The complex-valued power spectral density (PSD) matrix of target speech.
@@ -2093,7 +2063,6 @@ def rtf_power(
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Args:
         psd_s (tensorplay.Tensor): The complex-valued power spectral density (PSD) matrix of target speech.
@@ -2132,7 +2101,6 @@ def rtf_power(
     rtf = rtf.unsqueeze(-1)  # (..., freq, channel, 1)
     if n_iter >= 2:
         # The number of iterations in the for loop is `n_iter - 2`
-        # because the `phi` above and `torch.matmul(psd_s, rtf)` are regarded as
         # two iterations.
         for _ in range(n_iter - 2):
             rtf = tensorplay.matmul(phi, rtf)
@@ -2149,7 +2117,6 @@ def apply_beamforming(beamform_weights: Tensor, specgram: Tensor) -> Tensor:
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     .. math::
         \hat{\textbf{S}}(f) = \textbf{w}_{\text{bf}}(f)^{\mathsf{H}} \textbf{Y}(f)
@@ -2228,7 +2195,6 @@ def fftconvolve(x: tensorplay.Tensor, y: tensorplay.Tensor, mode: str = "full") 
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Args:
         x (tensorplay.Tensor): First convolution operand, with shape `(..., N)`.
@@ -2265,7 +2231,6 @@ def convolve(x: tensorplay.Tensor, y: tensorplay.Tensor, mode: str = "full") -> 
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Args:
         x (tensorplay.Tensor): First convolution operand, with shape `(..., N)`.
@@ -2336,7 +2301,6 @@ def add_noise(
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Args:
         waveform (tensorplay.Tensor): Input waveform, with shape `(..., L)`.
@@ -2388,7 +2352,6 @@ def speed(
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Args:
         waveform (tensorplay.Tensor): Input signals, with shape `(..., time)`.
@@ -2432,7 +2395,6 @@ def preemphasis(waveform, coeff: float = 0.97) -> tensorplay.Tensor:
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Args:
         waveform (tensorplay.Tensor): Waveform, with shape `(..., N)`.
@@ -2457,7 +2419,6 @@ def deemphasis(waveform, coeff: float = 0.97) -> tensorplay.Tensor:
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Args:
         waveform (tensorplay.Tensor): Waveform, with shape `(..., N)`.

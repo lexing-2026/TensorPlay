@@ -1,8 +1,7 @@
 """tensorplay.audio — tensorplay.audio-compatible API.
 
-The Python surface is ported verbatim from tensorplay.audio 2.11 (third_party/audio)
-with import rewriting; the DSP primitives (fft family, windows, stft/istft)
-are native p10 kernels mirroring ATen's SpectralOps semantics:
+The Python surface provides the audio module family with local imports; the
+DSP primitives (fft family, windows, stft/istft)
 
 * CPU: pocketfft (p10/include/pocketfft_hdronly.h)
 * CUDA: cuFFT   (p10/src/backend/cuda/SpectralKernels.cu)
