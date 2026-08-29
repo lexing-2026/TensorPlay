@@ -9,7 +9,6 @@
 #include <cstdint>
 #include <cstring>
 #include <numeric>
-#include <tuple>
 
 #if defined(USE_MKL)
 #include <mkl.h>
@@ -104,52 +103,6 @@ Tensor multinomial_kernel_cpu(const Tensor& self, int64_t num_samples, bool repl
   return result;
 }
 
-std::tuple<Tensor, Tensor> topk_kernel_cpu(const Tensor& self, int64_t k, int64_t dim, bool largest, bool sorted, int64_t impl) {
-  Tensor input = self.contiguous();
-  int64_t ndim = input.dim();
-  if (dim < 0) dim += ndim;
-  if (dim != ndim - 1) {
-    TP_THROW(NotImplementedError, "topk: only the last dim is supported for now");
-  }
-  int64_t rows = input.numel() / input.size(ndim - 1);
-  int64_t cols = input.size(ndim - 1);
-  if (k < 0 || k > cols) {
-    TP_THROW(RuntimeError, "topk: k must be in [0, cols]");
-  }
-  if (input.dtype() != DType::Float32 && input.dtype() != DType::Float64) {
-    TP_THROW(NotImplementedError, "topk: only Float32/Float64 are supported for now");
-  }
-
-  std::vector<int64_t> shape = static_cast<std::vector<int64_t>>(input.shape());
-  shape[ndim - 1] = k;
-  Tensor values = Tensor::empty(shape, input.dtype(), input.device());
-  Tensor indices = Tensor::empty(shape, DType::Int64, input.device());
-  if (k == 0) return {values, indices};
-
-  auto run = [&](auto st) {
-    using scalar_t = decltype(st);
-    const scalar_t* idata = input.data_ptr<scalar_t>();
-    scalar_t* vdata = values.data_ptr<scalar_t>();
-    int64_t* idxdata = indices.data_ptr<int64_t>();
-
-    std::vector<int64_t> perm(cols);
-    std::iota(perm.begin(), perm.end(), 0);
-    for (int64_t r = 0; r < rows; ++r) {
-      const scalar_t* row = idata + r * cols;
-      std::partial_sort(perm.begin(), perm.begin() + k, perm.end(),
-                        [row, largest](int64_t a, int64_t b) {
-                          return largest ? (row[a] > row[b]) : (row[a] < row[b]);
-                        });
-      for (int64_t i = 0; i < k; ++i) {
-        vdata[r * k + i] = row[perm[i]];
-        idxdata[r * k + i] = perm[i];
-      }
-    }
-  };
-  if (input.dtype() == DType::Float64) run(double{}); else run(float{});
-  return {values, indices};
-}
-
 Tensor sample_kernel_cpu(const Tensor& logits, double temperature, int64_t top_k, double top_p, int64_t impl) {
   if (temperature <= 0) {
     TP_THROW(RuntimeError, "sample: temperature must be > 0");
@@ -226,7 +179,6 @@ Tensor sample_kernel_cpu(const Tensor& logits, double temperature, int64_t top_k
 
 TENSORPLAY_LIBRARY_IMPL(CPU, SamplingKernels) {
   m.impl("multinomial", multinomial_kernel_cpu);
-  m.impl("topk", topk_kernel_cpu);
   m.impl("sample", sample_kernel_cpu);
 }
 
