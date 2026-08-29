@@ -54,7 +54,6 @@ void init_dtype(py::module_& m) {
         .value("undefined", DType::Undefined)
         .def("__str__", [](DType d) { return dtype_repr(d); })
         .def("__repr__", [](DType d) { return dtype_repr(d); })
-        // Match torch.dtype's read-only classification attributes.
         .def_property_readonly("is_floating_point", [](DType d) {
             return tensorplay::isFloatingType(d);
         })
@@ -68,7 +67,6 @@ void init_dtype(py::module_& m) {
             return tensorplay::elementSize(d);
         });
 
-    // Canonical module-level names and the aliases used by torch.
     m.attr("uint8") = DType::UInt8;
     m.attr("int8") = DType::Int8;
     m.attr("int16") = DType::Int16;

@@ -13,7 +13,6 @@ void init_generator(py::module_& m) {
 
     m.def("default_generator", &default_generator, py::return_value_policy::reference);
     m.def("manual_seed", &manual_seed, "seed"_a);
-    // torch.seed(): reseed the default generator nondeterministically and
     // return the new seed.
     m.def("seed", []() { return default_generator().seed(); });
     m.def("initial_seed", []() { return default_generator().initial_seed(); });

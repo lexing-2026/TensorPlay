@@ -1,5 +1,4 @@
 // Python bindings for the NCCL communicator context, mirroring the
-// torch.distributed._C collective entry points used by distributed_c10d.py.
 
 #include "python_bindings.h"
 
@@ -22,7 +21,6 @@ namespace py = pybind11;
 #ifdef USE_CUDA
 namespace {
 
-// C++ gradient reducer for DistributedDataParallel (torch Reducer parity,
 // fast path: find_unused_parameters=False, no comm hook).
 //
 // Post-accumulate grad hooks are registered as pure C++ callbacks on each
@@ -30,7 +28,6 @@ namespace {
 // into Python and never takes the GIL (the Python hook bridge acquires the
 // GIL per hook on the engine worker thread, which dominated small-model DDP
 // overhead).  Copy-in happens eagerly in the hook (spreading copies across
-// the backward pass, torch's default reducer semantics); the copy-back after
 // the bucket all-reduce is one fused multi-tensor copy on a dedicated comm
 // stream, joined into the compute stream once the final bucket is reduced.
 class DDPReducer : public std::enable_shared_from_this<DDPReducer> {
@@ -105,7 +102,6 @@ public:
         }
     }
 
-    // Main thread, before each forward (torch prepare_for_forward +
     // ensure_prior_reduction_finished).
     void prepare_for_iteration() {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -150,13 +146,11 @@ public:
         Tensor grad = (meta != nullptr) ? meta->grad() : Tensor();
         if (!grad.defined()) {
             // Leave the bucket incomplete; prepare_for_iteration raises on
-            // the next forward (torch ensure_prior_reduction_finished).
             return;
         }
         const Tensor& view_ref = b.views[idx];
         if (gabv_ && grad.data_ptr() == view_ref.data_ptr() &&
             grad.numel() == view_ref.numel()) {
-            // grad already aliases the bucket slot (torch is_alias_of).
         } else {
             Tensor view = view_ref;  // copy_ is non-const
             view.copy_(grad);
@@ -186,7 +180,6 @@ private:
         namespace nccl = tensorplay::nccl;
         nccl::ReduceOp op = nccl::ReduceOp::Avg;
         if (b.buffer.dtype() != tensorplay::DType::Float32) {
-            // Half precision: pre-divide then sum (torch parity) to avoid
             // accumulating unscaled values at reduced precision.
             b.buffer.div_(tensorplay::Scalar(static_cast<int64_t>(world_size_)));
             op = nccl::ReduceOp::Sum;
@@ -474,7 +467,6 @@ void init_distributed(py::module_& m) {
         }
     };
 
-    // torch.distributed.all_to_all_single with equal splits
     dist.def("all_to_all_single_equal_split", [&](Tensor& output, Tensor& input, uint64_t handle) {
 #ifdef USE_CUDA
         void* send_ptr = require_cuda(input);
@@ -493,7 +485,6 @@ void init_distributed(py::module_& m) {
 #endif
     }, "recv"_a, "send"_a, "comm"_a);
 
-    // torch.distributed.all_to_all_single with explicit per-rank splits
     dist.def("all_to_all_single_unequal_split",
              [&](Tensor& output, Tensor& input,
                  std::vector<int64_t> output_split_sizes,
@@ -535,7 +526,6 @@ void init_distributed(py::module_& m) {
 #endif
     }, "recv"_a, "send"_a, "output_split_sizes"_a, "input_split_sizes"_a, "comm"_a);
 
-    // Group semantics for batched p2p (torch batch_isend_irecv support)
     dist.def("group_start", []() {
 #ifdef USE_CUDA
         tensorplay::nccl::groupStart();

@@ -5,7 +5,6 @@ void init_size(py::module_& m) {
         .def(py::init<std::vector<int64_t>>())
         .def("__len__", &Size::size)
         .def("__getitem__", [](const Size& s, py::object idx) -> py::object {
-            // torch.Size parity: integer indexing with negative wrap ...
             try {
                 int64_t i = py::cast<int64_t>(idx);
                 if (i < 0) i += s.size();
@@ -35,7 +34,6 @@ void init_size(py::module_& m) {
         .def("__repr__", &Size::toString)
         .def("__str__", &Size::toString)
         .def("__add__", [](const Size& s, const py::sequence& other) {
-            // torch.Size concat: Size(...) + Size(...)/tuple/list
             std::vector<int64_t> out(s.begin(), s.end());
             for (auto item : other) out.push_back(py::cast<int64_t>(item));
             return Size(out);

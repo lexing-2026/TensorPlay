@@ -1,4 +1,4 @@
-"""Hand-written top-level shape/stack utilities (torch parity).
+"""
 
 Complements the codegen-generated ``tensorplay/functional.py``. These
 composites are expressed over existing primitives (reshape/permute/
@@ -256,7 +256,6 @@ def tensor_split(input, indices_or_sections, dim=0):
     """Splits ``input`` into multiple views along ``dim``.
 
     ``indices_or_sections`` is either an int (near-equal sections) or a
-    sequence of split points. Outputs alias the input like torch views.
     """
     _captured = _capture_call(tensor_split, (input, indices_or_sections, dim), {})
     if _captured is not None:
@@ -292,7 +291,6 @@ def hsplit(input, indices_or_sections):
         return _captured
     if input.dim() < 1:
         raise RuntimeError(
-            "torch.hsplit requires a tensor with at least 1 dimension"
         )
     dim = 0 if input.dim() == 1 else 1
     return tensor_split(input, indices_or_sections, dim=dim)
@@ -305,7 +303,6 @@ def vsplit(input, indices_or_sections):
         return _captured
     if input.dim() < 2:
         raise RuntimeError(
-            "torch.vsplit requires a tensor with at least 2 dimensions"
         )
     return tensor_split(input, indices_or_sections, dim=0)
 
@@ -317,7 +314,6 @@ def dsplit(input, indices_or_sections):
         return _captured
     if input.dim() < 3:
         raise RuntimeError(
-            "torch.dsplit requires a tensor with at least 3 dimensions"
         )
     return tensor_split(input, indices_or_sections, dim=2)
 
@@ -376,10 +372,8 @@ def tensordot(input, other, dims=2):
     free_a = [i for i in range(nd_a) if i not in set(dims_a)]
     free_b = [i for i in range(nd_b) if i not in set(dims_b)]
 
-    # ATen tensordot pairing: flatten both sides so the t-th contracted axis
     # of `input` aligns with the t-th of `other`.  The joint order is fixed by
     # `other`'s axis indices (sorted), and `input`'s pairing follows it --
-    # summation commutes, so any consistent joint order is torch-equivalent.
     pair_order = sorted(range(len(dims_a)), key=lambda t: dims_b[t])
     da_ordered = [dims_a[t] for t in pair_order]
     db_sorted = sorted(dims_b)
@@ -439,7 +433,6 @@ def block_diag(*tensors):
     """Builds a block diagonal matrix from the given blocks.
 
     0-D blocks become 1x1 matrices and 1-D blocks become diagonal
-    matrices. With no arguments returns a (1, 0) matrix like torch.
     """
     _captured = _capture_call(block_diag, tensors, {})
     if _captured is not None:
@@ -494,7 +487,6 @@ def block_diag(*tensors):
 def unravel_index(indices, shape):
     """Converts flat indices into coordinate tuples (one LongTensor per dim).
 
-    Indices wrap around modulo the total size, matching torch semantics.
     """
     _captured = _capture_call(unravel_index, (indices, shape), {})
     if _captured is not None:

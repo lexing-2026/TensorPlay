@@ -1,10 +1,9 @@
-"""Hand-written top-level operator batch (torch parity), round 2.
+"""
 
 Complements ``functional.py`` (codegen) and ``_shape_funcs.py``. Every
 public name here is expressed over existing differentiable primitives
 (mm/cat/narrow/gather/index_select/pow/sort/searchsorted/bincount/...),
 so autograd flows through composition wherever the underlying ops are
-differentiable. Spec tests against local torch live in
 ``test/test_composite_funcs.py``.
 
 Deliberate narrows (documented per function):
@@ -48,7 +47,6 @@ __all__ = [
     "rms_norm", "cosine_similarity",
     "max_pool1d", "avg_pool1d", "adaptive_avg_pool1d",
     "adaptive_max_pool1d",
-    # F-layer names torch also exposes at top level
     "dropout", "dropout_", "alpha_dropout", "feature_dropout",
     "feature_dropout_", "feature_alpha_dropout", "rrelu", "rrelu_",
     "bilinear", "ctc_loss", "embedding_bag", "conv_tbc",
@@ -177,7 +175,7 @@ def arctanh(input):
 def arctan2(input, other):
     """atan2(y, x) = 2*atan(y / (hypot + x)); native atan2 CPU kernel is
     currently unregistered in this tree, so compose. Edge narrows vs
-    torch: negative-zero y with x < 0 returns +pi instead of -pi."""
+"""
     y = input if isinstance(input, tensorplay.Tensor) else _as_tensor(input)
     x = other if isinstance(other, tensorplay.Tensor) else _as_tensor(other)
     xd = x.to(DType.float64)
@@ -274,7 +272,6 @@ def floor_divide(input, other, *, out=None):
 
 
 def _int_pair_target(input, other):
-    # torch result_type for two integral operands stays integral (a Python
     # int counts as integral).
     def _is_int(v):
         if isinstance(v, tensorplay.Tensor):
@@ -530,11 +527,10 @@ def cumulative_trapezoid(y, x=None, *, dx=None, dim=-1):
 
 
 def quantile(input, q, dim=None, keepdim=False, *, interpolation="linear"):
-    """torch.quantile parity via the native dispatcher op (Sorting.cpp
+    """
     quantile_impl composite): all five interpolation modes, float32/float64,
     NaN semantics and output shapes match upstream.  A Python-number q is
-    wrapped in the input's dtype/device like torch's arg parser; lists are
-    rejected the way torch rejects them."""
+"""
     if isinstance(q, tensorplay.Tensor):
         qs = q
     elif isinstance(q, (int, float)):
@@ -548,7 +544,6 @@ def quantile(input, q, dim=None, keepdim=False, *, interpolation="linear"):
 
 
 def nanquantile(input, q, dim=None, keepdim=False, *, interpolation="linear"):
-    """torch.nanquantile parity via the native dispatcher op."""
     if isinstance(q, tensorplay.Tensor):
         qs = q
     elif isinstance(q, (int, float)):
@@ -583,12 +578,11 @@ def histc(input, bins=100, min=0, max=0):
 
 
 def histogram(input, bins=100, range=None, *, weight=None, density=False):
-    """torch.histogram parity via the native dispatcher op (Histogram.cpp
+    """
     composite): hist/bin_edges in the input dtype, linspace edges, aminmax
     outer-edge inference with the numpy empty-range expansion, weight in the
     input dtype and density normalization."""
     if isinstance(bins, tensorplay.Tensor):
-        # The bins_tensor overload has no `range` parameter (torch parity).
         return tensorplay._C.histogram(input, bins, weight=weight,
                                        density=density)
     return tensorplay._C.histogram(input, bins, range=range, weight=weight,
@@ -980,7 +974,6 @@ def view_copy(input, size):
 
 
 def reshape_as(input, other):
-    # torch CompositeImplicitAutograd parity: reshape_as(input, other) is
     # input.reshape(other.shape).
     return input.reshape(list(other.shape))
 
@@ -1002,7 +995,6 @@ def unsafe_split(input, split_size, dim=0):
 
 
 # ---------------------------------------------------------------------------
-# F-layer re-exports (torch exposes these names at top level too)
 # ---------------------------------------------------------------------------
 
 def rms_norm(input, normalized_shape, weight=None, eps=None):
@@ -1041,7 +1033,6 @@ def adaptive_max_pool1d(input, output_size):
 
 
 # ---------------------------------------------------------------------------
-# top-level re-exports of nn.functional names that upstream torch also
 # exposes at top level. Lazy import: nn.functional is not available during
 # the tensorplay bootstrap (this module loads before the nn package).
 # ---------------------------------------------------------------------------

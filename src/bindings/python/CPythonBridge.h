@@ -39,9 +39,8 @@ void tpx_py_parse_into(PyObject* const* args, Py_ssize_t nargs,
 
 // ---- eager argument type validation ----------------------------------------
 // Generated bindings pass a parallel table of slot kinds so type mismatches
-// raise with upstream python_arg_parser wording while full context (op name,
-// argument name, positional index) is still available.  Kinds are the base
-// category optionally ORed with TPK_OPTIONAL (None tolerated).
+// include the operation name, argument name, and positional index.  Kinds are
+// the base category optionally ORed with TPK_OPTIONAL (None tolerated).
 enum tpx_py_type_kind : unsigned char {
     TPK_TENSOR = 1,
     TPK_NUMBER,
@@ -60,9 +59,8 @@ constexpr unsigned char TPK_OPTIONAL = 0x80;
 
 // `slots[first .. first+n)` hold merged arguments whose names are `names`
 // (the kwlist array) and kinds `kinds`; `max_pos` is how many leading slots
-// may be passed positionally -- torch only annotates "(position N)" for
-// those.  Null slots are skipped: required-missing and default injection are
-// handled by the generated prologue around this call.
+// may be passed positionally.  Null slots are skipped: required-missing and
+// default injection are handled by the generated prologue around this call.
 void tpx_py_check_types(PyObject* const* slots, Py_ssize_t n,
                         const char* op_name, const char* const* names,
                         const unsigned char* kinds, int max_pos);
@@ -95,8 +93,8 @@ std::optional<Scalar> tpx_py_opt_scalar(PyObject* obj);
 std::optional<Device> tpx_py_opt_device(PyObject* obj);
 std::vector<int64_t> tpx_py_intlist(PyObject* obj);
 std::vector<double> tpx_py_doublelist(PyObject* obj);
-// Upstream parity (python_arg_parser.cpp TENSOR_LIST): only tuple/list are
-// accepted -- arbitrary sequences fall through to overload dispatch.
+// Tensor lists accept tuple/list containers; other sequences fall through to
+// overload dispatch.
 std::vector<Tensor> tpx_py_tensorlist(PyObject* obj);
 std::vector<Scalar> tpx_py_scalarlist(PyObject* obj);
 std::optional<std::vector<int64_t>> tpx_py_opt_intlist(PyObject* obj);
@@ -106,10 +104,9 @@ DType tpx_py_dtype(PyObject* obj);
 std::optional<DType> tpx_py_opt_dtype(PyObject* obj);
 
 // ---- GIL -------------------------------------------------------------------
-// Upstream releases the GIL around every dispatched kernel
-// (gen_python_functions emits `gil_scoped_release` unconditionally); this is
-// the pybind-free equivalent for the FASTCALL layer.  Never hold it across
-// a Python C-API call: every use site must restore before touching PyObject.
+// The wrapper releases the GIL around every dispatched kernel.  This is the
+// pybind-free equivalent for the FASTCALL layer.  Never hold it across a
+// Python C-API call: every use site must restore before touching PyObject.
 struct tpx_py_GilRelease {
     PyThreadState* state;
     tpx_py_GilRelease() : state(PyEval_SaveThread()) {}

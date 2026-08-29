@@ -2,7 +2,6 @@
 
 Every operator exposes a free function ``tensorplay::tpx::ops::<name>`` that:
 routes through the Autocast key first (casts precede VariableType, mirroring
-PyTorch's dispatch order), detects gradient-requiring inputs, rejects leaf
 mutation under GradMode, invokes the backend through ``detail::redispatch_*``,
 builds the backward node with its saved variables, and attaches history to
 the outputs.  This is TensorPlay's counterpart of the generated
@@ -32,10 +31,8 @@ _H = [
 ]
 
 
-# Ops whose result aliases the input's storage (torch view ops).  Drives the
 # InplaceOrView slice below: version-counter sharing and the is_view flag used
 # by detach_()'s view rejection.  index_select is deliberately absent: it
-# copies (torch gives it a fresh version counter and _is_view() == False).
 _VIEW_OPS = {
     'view', 'reshape', 'expand', 'expand_as', 'squeeze', 'unsqueeze',
     'permute', 'transpose', 't', 'select', 'slice',
@@ -43,12 +40,9 @@ _VIEW_OPS = {
     'swapdims', 'unfold', 'detach', 'diagonal', 'expand_as',
 }
 
-# Ops returning a TensorList whose elements are all views of `self` (torch
 # ADInplaceOrView records a shared backward node with per-output output_nr,
 # shares the version counter and marks each output as a view).  Value:
-# (manual backward node name, torch forward_op_name used in the multi-output
 # in-place error, multi_output flag).  chunk maps to SplitBackward/"Split":
-# upstream chunk is CompositeImplicitAutograd through split, so torch records
 # SplitBackward0 for chunk outputs as well.  tensor_split outputs behave like
 # plain slice views upstream (DEFAULT creation meta), so its node is not
 # flagged multi-output and in-place falls through to the view-of-leaf check.
@@ -60,7 +54,6 @@ _LIST_VIEW_OPS = {
     'tensor_split': ('SplitBackward', 'TensorSplit', False),
 }
 
-# Ops whose backward node is a view function in torch's ADInplaceOrView
 # sense (VariableTypeUtils.h check_inplace): in-place ops must reject
 # mutations of their outputs when the base chain ends at a leaf.  reshape is
 # not listed: it may copy, so its wrapper sets the flag conditionally on
@@ -209,7 +202,6 @@ def _emit_leaf_checks(lines, f):
     for a in f.mutable_args:
         if a.type.is_mutable_ref:
             lines.append(f'    if (requires_grad && {a.name}.requires_grad()) {{')
-            # Torch check_inplace (VariableTypeUtils.h can_mutate_inplace):
             # views created by multi-output nodes (CreationMeta::
             # MULTI_OUTPUT_NODE) can never be mutated in-place; this fires
             # before the view-of-leaf / leaf checks.
@@ -266,7 +258,6 @@ def _emit_edges(lines, f):
             f'        grad_fn->add_next_edge_list(collect_next_edges({", ".join(tensor_args)}));')
 
 
-# Factories whose None dtype resolves to the global default (torch parity).
 # arange/linspace/logspace infer from their scalar inputs; full infers from
 # fill_value; randint/randperm/eye keep concrete integral/float defaults.
 _DTYPE_GLOBAL_DEFAULT_OPS = {"rand", "randn", "empty", "zeros", "ones"}
@@ -389,9 +380,7 @@ def generate_tpx_ops_cpp(funcs: list[NativeFunction], *,
         elif _is_view:
             if f.base_name == 'reshape':
                 # reshape copies when the layout forbids a view; a copy must
-                # not share the base's version counter (torch only links
                 # versions for the aliasing _reshape_alias path) and is not a
-                # view either (torch _is_view() is False for copying
                 # reshapes).
                 lines.append(
                     f'    if (result.unsafeGetTensorImpl()->storage().is_same('
@@ -435,7 +424,6 @@ def generate_tpx_ops_cpp(funcs: list[NativeFunction], *,
             lines.append('    }')
         elif _is_list_view:
             # Multi-output view op: one shared manual node; each output is
-            # attached below with its own output_nr (torch VariableType
             # as_view semantics for unbind/split/chunk).
             node_name, fwd_name, multi_out = _LIST_VIEW_OPS[f.base_name]
             if f.func_name == 'split.sizes':
@@ -475,7 +463,6 @@ def generate_tpx_ops_cpp(funcs: list[NativeFunction], *,
             lines.append('    return result;')
         elif kind == 'list':
             if _is_list_view:
-                # Torch ADInplaceOrView: every list element is a view of
                 # `self` -- share the version counter, mark is_view, and
                 # attach the shared backward node with a per-element
                 # output_nr.  (Mirrors upstream as_view for unbind/split.)

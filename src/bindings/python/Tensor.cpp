@@ -92,7 +92,6 @@ static DType from_dlpack_dtype(DLDataType dt) {
 
 static DLDevice to_dlpack_device(Device device) {
     DLDevice d;
-    // DLPack requires a concrete device id; torch exports CPU as 0 and
     // resolves "current device" (-1) the same way.
     int64_t index = device.index();
     if (index < 0) index = 0;
@@ -517,7 +516,6 @@ struct PreparedTensorIndex {
     bool scalar = false;
 };
 
-// PyTorch still accepts uint8 masks for backward compatibility (with a
 // deprecation warning).  Keep that interpretation at this boundary instead
 // of treating a byte mask as an integer index tensor.
 static bool is_boolean_mask_dtype(DType dtype) {
@@ -588,8 +586,6 @@ static bool is_python_bool_vector(py::handle object) {
     if (!PyList_Check(object.ptr()) && !PyTuple_Check(object.ptr())) return false;
     py::sequence sequence = py::reinterpret_borrow<py::sequence>(object);
     const Py_ssize_t length = sequence.size();
-    // An empty Python list is an integer index with shape [0] in torch; it
-    // cannot be distinguished from an empty bool mask, so keep torch's
     // integer-list behavior here.
     if (length == 0) return false;
     for (Py_ssize_t i = 0; i < length; ++i) {
@@ -1162,7 +1158,6 @@ static NativeIndexPlan build_native_index_plan(
 
     // The planner is used for advanced tuples only.  Decode the output in
     // row-major order, then map each coordinate back to one source element.
-    // This is linear in the result size and preserves the exact torch output
     // order for both contiguous and non-contiguous advanced groups.
     for (int64_t linear = 0; linear < output_numel; ++linear) {
         std::vector<int64_t> output_coords(plan.output_shape.size(), 0);
@@ -1222,7 +1217,6 @@ static void assign_native_index_plan(Tensor& self, const NativeIndexPlan& plan,
     // A single index tensor is deliberately used here: index_put_'s backend
     // interprets one index as a linear offset, which is exactly what the
     // planner produced.  Cloning rhs makes overlapping assignments (e.g.
-    // x[[1, 0]] = x[[0, 1]]) deterministic like torch's temporary RHS.
     // The backend's linear writer is contiguous-only, however.  Stage through
     // a contiguous clone for a transposed/sliced destination, then copy the
     // logical result back through TensorIterator so the view's strides are
@@ -1508,7 +1502,6 @@ void init_tensor(py::module_& m) {
     // item -> native Python number: the generated fastcall binding boxes the
     // result into a tp.Scalar object which the _tensor.py wrapper then
     // unboxes per dtype (with a per-call `import builtins`).  Returning raw
-    // Python numbers here matches torch's Tensor.item() contract and skips
     // both extra layers.
     m.def("item_python", [](const Tensor& t) -> py::object {
         const Scalar v = t.item();
@@ -1526,10 +1519,8 @@ void init_tensor(py::module_& m) {
         return py::int_(v.to<int64_t>());
     });
 
-    // from_numpy — direct port of torch/csrc/utils/tensor_numpy.cpp
     // tensor_from_numpy(): zero-copy from_blob view; non-writable arrays warn
     // once instead of failing; byte-stride divisibility, negative strides and
-    // foreign byte order are rejected with torch's exact messages.
     static bool warned_numpy_not_writeable = false;
     m.def("from_numpy", [](py::object obj) -> Tensor {
         py::array array = py::array::ensure(obj);
@@ -1565,7 +1556,6 @@ void init_tensor(py::module_& m) {
             }
         }
         // Byte-order check (tensor_numpy.cpp): only native-order arrays are
-        // accepted, matching ATen's PyArray_EquivByteorders gate.
         {
             static char native_order = []() {
                 int one = 1;
@@ -1598,12 +1588,10 @@ void init_tensor(py::module_& m) {
         // Route through create_tensor's numpy branch: dtype mapping + zero-copy
         // DataPtr (keeps the array alive) are shared with tp.tensor().
         // create_tensor uses mutable_data(); for read-only arrays fall back to
-        // const data cast — writes are UB exactly as torch documents above.
         Tensor t = create_tensor(std::move(obj), std::nullopt, std::nullopt);
         return t;
     }, "ndarray"_a);
 
-    // frombuffer — direct port of torch/csrc/utils/tensor_new.cpp
     // tensor_frombuffer(): buffer-protocol view, zero-copy, writable preferred
     // with the same non-writable warn-once fallback and value checks.
     static bool warned_non_writable = false;
@@ -1681,8 +1669,6 @@ void init_tensor(py::module_& m) {
     m.def("to_dlpack", &to_dlpack, "obj"_a, "stream"_a = py::none());
 
     // from_numpy: zero-copy view over the numpy array's memory when dtypes
-    // match (same contract as ATen torch.from_numpy; the array is kept alive
-    // by the DataPtr deleter, and negative strides are rejected like torch).
     m.def("from_numpy", [](py::array array) -> Tensor {
         if (array.ndim() > 0) {
             for (size_t i = 0; i < (size_t)array.ndim(); ++i) {
@@ -1711,7 +1697,6 @@ void init_tensor(py::module_& m) {
     
     tensor
         .def(py::init<>())
-        // Constructor from data (torch.tensor equivalent)
         .def(py::init([](py::object data, std::optional<DType> dtype, std::optional<Device> device, bool requires_grad) {
             Tensor t = create_tensor(data, dtype, device);
             tensorplay::tpx::impl::set_requires_grad(t, requires_grad);
@@ -1754,11 +1739,9 @@ void init_tensor(py::module_& m) {
         .def("_values", &Tensor::_values)
         .def("_crow_indices", &Tensor::_crow_indices)
         .def("_col_indices", &Tensor::_col_indices)
-        // torch-style public aliases for the sparse component accessors.
         .def("values", [](const Tensor& t) { return t._values(); })
         .def("crow_indices", &Tensor::_crow_indices)
         .def("col_indices", &Tensor::_col_indices)
-        // Mirrors torch.layout loosely: 0 = sparse COO, 1 = sparse CSR,
         // 2 = strided (dense). Compare against tensorplay.sparse_coo etc.
         .def_property_readonly("layout", [](const Tensor& t) -> int64_t {
             if (!t.is_sparse()) return 2;
@@ -1790,7 +1773,6 @@ void init_tensor(py::module_& m) {
             tensorplay::tpx::impl::set_grad_fn(self, std::move(node), output_nr);
         }, "node"_a, "output_nr"_a = 0)
         .def("_bump_version", [](Tensor& self) {
-            // torch parity for ctx.mark_dirty: in-place custom Functions
             // must advance the version counter so saved-tensor checks and
             // double-backward see the mutation.
             self.unsafeGetTensorImpl()->bump_version();
@@ -1799,7 +1781,6 @@ void init_tensor(py::module_& m) {
             return tensorplay::tpx::impl::output_nr(self);
         })
         .def_property_readonly("_accumulate_grad_node", [](const Tensor& self) -> std::shared_ptr<tensorplay::tpx::Node> {
-            // torch parity (Variable::grad_accumulator): lazily create the
             // AccumulateGrad node so leaf-only APIs (post-accumulate-grad
             // hooks, DDP reducer) work before the first graph use. The meta
             // only keeps a weak cache reference; callers that need the node
@@ -1810,7 +1791,6 @@ void init_tensor(py::module_& m) {
             if (meta == nullptr) return nullptr;
             if (auto acc = meta->grad_accumulator()) return acc;
             // Hold the strong ref locally and transfer it to the caller
-            // (torch parity): the meta only caches the node weakly, so
             // handing the sole owning reference to set_grad_accumulator
             // would destroy the node before the weak lock below.
             std::shared_ptr<tensorplay::tpx::Node> acc =
@@ -1828,7 +1808,6 @@ void init_tensor(py::module_& m) {
             return static_cast<int64_t>(self.unsafeGetTensorImpl()->storage_offset());
         })
         .def("get_device", [](const Tensor& self) -> int64_t {
-            // torch parity: device index, -1 for CPU.
             const auto dev = self.device();
             return dev.is_cuda() || dev.type() != DeviceType::CPU ? dev.index() : -1;
         })
@@ -1840,7 +1819,6 @@ void init_tensor(py::module_& m) {
                         std::optional<int64_t> storage_offset,
                         std::optional<std::vector<int64_t>> size,
                         std::optional<std::vector<int64_t>> stride) -> Tensor& {
-            // torch.Tensor.set_ parity: re-point this tensor at `source`'s
             // storage.  Autograd metadata on the impl stays untouched.
             auto impl = self.unsafeGetTensorImpl();
             const auto& src_impl = *source.unsafeGetTensorImpl();
@@ -1880,7 +1858,6 @@ void init_tensor(py::module_& m) {
 #ifdef USE_CUDA
         .def("record_stream", [](const Tensor& self, py::object stream_object) {
              // Accept both tensorplay.cuda.Stream and the underlying
-             // tensorplay._C._cuda._CudaStream, as PyTorch does for its
              // public Tensor.record_stream API.
              py::object core_stream = py::hasattr(stream_object, "_stream")
                  ? stream_object.attr("_stream")
@@ -1907,7 +1884,6 @@ void init_tensor(py::module_& m) {
             [](Tensor& self, const Tensor* grad) {
                 // Route through tpx::impl::set_grad so autograd metadata is
                 // lazily created -- assigning .grad to a leaf that never
-                // required grad must not silently drop (torch semantics).
                 if (grad) {
                     tensorplay::tpx::impl::set_grad(self, *grad);
                 } else {
@@ -1930,7 +1906,6 @@ void init_tensor(py::module_& m) {
         }, "gradient"_a = py::none(), "retain_graph"_a = py::none(), "create_graph"_a = false)
         .def_property("data",
             [](const Tensor& self) {
-                // torch parity: `.data` shares storage but carries a FRESH
                 // version counter, so in-place writes through it stay
                 // invisible to mutation tracking on the original tensor.
                 Tensor out = self.detach();
@@ -1953,7 +1928,6 @@ void init_tensor(py::module_& m) {
         })
         .def("detach_", [](py::object self_obj) {
             Tensor& self = py::cast<Tensor&>(self_obj);
-            // torch VariableType::detach_ parity: in-place detach is only
             // legal on non-views (a view's impl is shared with its base, so
             // stripping its autograd edge in place would corrupt the base's
             // graph bookkeeping).
@@ -1963,9 +1937,8 @@ void init_tensor(py::module_& m) {
                     "If you are using DistributedDataParallel (DDP) for training, "
                     "and gradient_as_bucket_view is set as True, gradients are "
                     "views of DDP buckets, and hence detach_() cannot be called "
-                    "on these gradients. To fix this error, please refer to the "
-                    "Optimizer.zero_grad() function in torch/optim/optimizer.py "
-                    "as the solution.");
+                    "on these gradients. To fix this error, call "
+                    "Optimizer.zero_grad() as the solution.");
             }
             tensorplay::tpx::impl::set_requires_grad(self, false);
             tensorplay::tpx::impl::set_grad_fn(self, nullptr, 0);
@@ -1985,7 +1958,6 @@ void init_tensor(py::module_& m) {
             return self.size(dim);
         })
         // expand: served by the generated METH_FASTCALL layer (dispatcher op).
-        // view: torch accepts varargs ints (t.view(8, 1)), a sequence
         // ([8, 1] / Size / tuple), -1 inference, and a dtype reinterpret.
         // Route through tpx::ops::view (NOT Tensor::view): the generated
         // wrapper records ViewBackward; the raw method silently detaches.
@@ -2006,7 +1978,6 @@ void init_tensor(py::module_& m) {
             for (auto a : args) shape.push_back(a.cast<int64_t>());
             return tensorplay::tpx::ops::view(self, shape);
         })
-        // reshape_as: torch exposes it only as a method
         // (CompositeImplicitAutograd -> reshape(other.shape)).
         .def("reshape_as", [](const Tensor& self, const Tensor& other) -> Tensor {
             return tensorplay::tpx::ops::reshape(
@@ -2185,7 +2156,6 @@ void init_tensor(py::module_& m) {
         // Bind generated methods
         bind_generated_tensor_methods(tensor);
 
-        // torch.Tensor.movedim accepts Union[int, int[]]; the generated
         // binding covers the list form, so add the scalar-int overloads here.
         tensor                        
                         
@@ -2213,10 +2183,8 @@ void init_tensor(py::module_& m) {
         }, "device"_a, "dtype"_a, "non_blocking"_a = false, "copy"_a = false)
 
         .def("__array__", [](py::object self_obj, py::object dtype, bool copy) {
-            // Port of torch/_tensor.py Tensor.__array__(dtype=None): delegate
             // to .numpy() so both share one conversion path (grad/device/
             // reduced-dtype handling included), then optionally cast.
-            // Default is a zero-copy view, matching numpy.asarray and torch.
             py::object arr = self_obj.attr("numpy")();
             if (!dtype.is_none()) {
                 return arr.attr("astype")(dtype, "copy"_a = false);
@@ -2256,7 +2224,6 @@ void init_tensor(py::module_& m) {
 
             if (dtype == DType::ComplexHalf || dtype == DType::BComplex32) {
                 // NumPy has no complex-half or complex-bfloat16 dtype. Match
-                // torch's practical interop behavior by widening to complex64.
                 size_t numel = self.numel();
                 std::vector<std::complex<float>> buf(numel);
                 auto sizes = self.shape();
@@ -2390,7 +2357,6 @@ void init_tensor(py::module_& m) {
         })
 
         .def("__iter__", [](const Tensor& self) {
-            // Torch Tensor.__iter__: 0-d tensors are not iterable.
             if (self.dim() == 0) {
                 TP_THROW(TypeError, "iteration over a 0-d tensor");
             }
@@ -2477,7 +2443,6 @@ void init_tensor(py::module_& m) {
                              target_dim += static_cast<int64_t>(prepared.shape.size());
                          }
                       } else if (idx.ptr() == Py_Ellipsis) {
-                         // torch semantics: "..." expands to full slices over
                          // every dimension not covered by the other indices.
                          if (ellipsis_seen) {
                              TP_THROW(IndexError, "an index can only have a single ellipsis");
@@ -2606,7 +2571,6 @@ void init_tensor(py::module_& m) {
         .def("__sub__", [](const Tensor& a, const Tensor& b) { return tensorplay::tpx::ops::sub(a, b); })
         .def("__mul__", [](const Tensor& a, const Tensor& b) { return tensorplay::tpx::ops::mul(a, b); })
         .def("__truediv__", [](const Tensor& a, const Tensor& b) { return tensorplay::tpx::ops::div(a, b); })
-        // Integral scalars must keep integer-tensor dtypes (torch wraps them
         // as int64 scalars); the double overloads below handle real scalars.
         .def("__add__", [](const Tensor& t, int64_t s) { return tensorplay::tpx::ops::add(t, Scalar(s)); })
         .def("__sub__", [](const Tensor& t, int64_t s) { return tensorplay::tpx::ops::sub(t, Scalar(s)); })
@@ -2615,7 +2579,6 @@ void init_tensor(py::module_& m) {
         .def("__sub__", [](const Tensor& t, double s) { return tensorplay::tpx::ops::sub(t, Scalar(s)); })
         .def("__mul__", [](const Tensor& t, double s) { return tensorplay::tpx::ops::mul(t, Scalar(s)); })
         .def("__truediv__", [](const Tensor& t, double s) { return tensorplay::tpx::ops::div(t, Scalar(s)); })
-        // torch parity: python complex scalars wrap as complex128 and follow
         // the weak-scalar promotion rules in the kernels.
         .def("__add__", [](const Tensor& t, std::complex<double> s) { return tensorplay::tpx::ops::add(t, Scalar(s)); })
         .def("__sub__", [](const Tensor& t, std::complex<double> s) { return tensorplay::tpx::ops::sub(t, Scalar(s)); })
@@ -2814,7 +2777,6 @@ void init_tensor(py::module_& m) {
         // String repr
         .def("__repr__", &Tensor::toString)
         .def("__str__", &Tensor::toString)
-        // Truthiness: torch raises for empty/multi-element tensors instead of
         // pybind's default always-true object truthiness (which made a 0-d
         // Bool tensor bool(t) == True even when t.item() == False).
         .def("__bool__", [](const Tensor& self) -> bool {
