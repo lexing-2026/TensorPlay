@@ -267,22 +267,21 @@ Tensor c2r_plane(const Tensor& input, int64_t output_width, FFTNorm norm,
 
 template <typename T>
 Tensor fft2_c2c_impl(const Tensor& self, const FFT2Args& args,
-                     const std::string& norm, bool forward) {
+                     FFTNorm norm, bool forward) {
     Tensor input = promote_complex(self);
     auto [moved, inverse] = move_fft_dims_last(input, args.first_dim, args.last_dim);
     Tensor resized = resize_fft_plane(moved, args.first_size, args.last_size);
     const pocketfft::shape_t axes{
         static_cast<size_t>(resized.dim() - 2),
         static_cast<size_t>(resized.dim() - 1)};
-    Tensor output = c2c_plane<T>(resized, forward,
-                                 norm_from_string(norm, forward),
+    Tensor output = c2c_plane<T>(resized, forward, norm,
                                  args.first_size * args.last_size, axes);
     return finish_fft_layout(std::move(output), inverse);
 }
 
 template <typename T>
 Tensor fft2_r2c_impl(const Tensor& self, const FFT2Args& args,
-                     const std::string& norm) {
+                     FFTNorm norm) {
     TP_CHECK(!is_complex(self.dtype()), "RFFT2 expects a real input");
     TP_CHECK(self.dtype() == DType::Float32 || self.dtype() == DType::Float64,
              "Unsupported real dtype for FFT");
@@ -290,8 +289,7 @@ Tensor fft2_r2c_impl(const Tensor& self, const FFT2Args& args,
                                                args.first_dim, args.last_dim);
     Tensor resized = resize_fft_plane(moved, args.first_size, args.last_size);
     const int64_t transform_size = args.first_size * args.last_size;
-    Tensor spectrum = r2c_plane<T>(resized, norm_from_string(norm, true),
-                                   transform_size);
+    Tensor spectrum = r2c_plane<T>(resized, norm, transform_size);
     const pocketfft::shape_t axes{static_cast<size_t>(spectrum.dim() - 2)};
     Tensor output = c2c_plane<T>(spectrum, true, FFTNorm::none, 1, axes);
     return finish_fft_layout(std::move(output), inverse);
@@ -299,7 +297,7 @@ Tensor fft2_r2c_impl(const Tensor& self, const FFT2Args& args,
 
 template <typename T>
 Tensor fft2_c2r_impl(const Tensor& self, const FFT2Args& args,
-                     const std::string& norm) {
+                     FFTNorm norm) {
     TP_CHECK(is_complex(self.dtype()), "IRFFT2 expects a complex input");
     auto [moved, inverse] = move_fft_dims_last(self.contiguous(),
                                                args.first_dim, args.last_dim);
@@ -307,9 +305,77 @@ Tensor fft2_c2r_impl(const Tensor& self, const FFT2Args& args,
     const int64_t transform_size = args.first_size * args.last_size;
     const pocketfft::shape_t axes{static_cast<size_t>(resized.dim() - 2)};
     Tensor transformed = c2c_plane<T>(resized, false, FFTNorm::none, 1, axes);
-    Tensor output = c2r_plane<T>(transformed, args.last_size,
-                                 norm_from_string(norm, false), transform_size);
+    Tensor output = c2r_plane<T>(transformed, args.last_size, norm, transform_size);
     return finish_fft_layout(std::move(output), inverse);
+}
+
+Tensor resize_fft_support(const Tensor& input, int64_t first_dim,
+                          int64_t last_dim, int64_t first_size,
+                          int64_t last_size) {
+    auto [moved, inverse] = move_fft_dims_last(input.contiguous(), first_dim, last_dim);
+    Tensor resized = resize_fft_plane(moved, first_size, last_size);
+    return finish_fft_layout(std::move(resized), inverse);
+}
+
+template <typename T>
+Tensor fft2_c2c_backward_impl(const Tensor& grad, const Tensor& self,
+                              const FFT2Args& args, const std::string& norm,
+                              bool forward_was) {
+    TP_CHECK(is_complex(grad.dtype()), "FFT2 backward expects a complex gradient");
+    auto [moved, inverse] = move_fft_dims_last(grad.contiguous(),
+                                               args.first_dim, args.last_dim);
+    const pocketfft::shape_t axes{
+        static_cast<size_t>(moved.dim() - 2),
+        static_cast<size_t>(moved.dim() - 1)};
+    const int64_t transform_size = moved.size(-2) * moved.size(-1);
+    Tensor transformed = c2c_plane<T>(moved, !forward_was,
+                                      norm_from_string(norm, forward_was),
+                                      transform_size, axes);
+    Tensor output = finish_fft_layout(std::move(transformed), inverse);
+    output = resize_fft_support(output, args.first_dim, args.last_dim,
+                                self.size(args.first_dim), self.size(args.last_dim));
+    return is_complex(self.dtype()) ? output : extract_real<T>(output);
+}
+
+template <typename T>
+Tensor fft2_rfft_backward_impl(const Tensor& grad, const Tensor& self,
+                               const FFT2Args& args, const std::string& norm) {
+    TP_CHECK(is_complex(grad.dtype()), "RFFT2 backward expects a complex gradient");
+    auto [moved, inverse] = move_fft_dims_last(grad.contiguous(),
+                                               args.first_dim, args.last_dim);
+    Tensor full = resize_fft_plane(moved, args.first_size, args.last_size);
+    const pocketfft::shape_t axes{
+        static_cast<size_t>(full.dim() - 2),
+        static_cast<size_t>(full.dim() - 1)};
+    Tensor transformed = c2c_plane<T>(full, false,
+                                      norm_from_string(norm, true),
+                                      args.first_size * args.last_size, axes);
+    Tensor output = extract_real<T>(transformed);
+    output = finish_fft_layout(std::move(output), inverse);
+    return resize_fft_support(output, args.first_dim, args.last_dim,
+                              self.size(args.first_dim), self.size(args.last_dim));
+}
+
+template <typename T>
+Tensor fft2_irfft_backward_impl(const Tensor& grad, const Tensor& self,
+                                const FFT2Args& args, const std::string& norm) {
+    TP_CHECK(!is_complex(grad.dtype()), "IRFFT2 backward expects a real gradient");
+    Tensor spectrum = fft2_r2c_impl<T>(grad, args,
+                                       norm_from_string(norm, false));
+    auto [moved, inverse] = move_fft_dims_last(spectrum, args.first_dim,
+                                               args.last_dim);
+    Tensor resized = resize_fft_plane(moved, self.size(args.first_dim),
+                                      self.size(args.last_dim));
+    using C = std::complex<T>;
+    C* data = static_cast<C*>(resized.data_ptr());
+    const int64_t width = resized.size(-1);
+    const int64_t interior_end = (args.last_size + 1) / 2;
+    const int64_t count = resized.numel();
+    for (int64_t index = 0; index < count; ++index) {
+        const int64_t column = index % width;
+        if (column > 0 && column < interior_end) data[index] *= T(2);
+    }
+    return finish_fft_layout(std::move(resized), inverse);
 }
 
 }  // namespace
@@ -318,32 +384,68 @@ Tensor fft_fft2_cpu(const Tensor& self, std::optional<std::vector<int64_t>> s,
                    const std::vector<int64_t>& dim, std::string norm) {
     const FFT2Args args = canonicalize_fft2(self, s, dim, false);
     return self.dtype() == DType::ComplexDouble || self.dtype() == DType::Float64
-        ? fft2_c2c_impl<double>(self, args, norm, true)
-        : fft2_c2c_impl<float>(self, args, norm, true);
+        ? fft2_c2c_impl<double>(self, args, norm_from_string(norm, true), true)
+        : fft2_c2c_impl<float>(self, args, norm_from_string(norm, true), true);
 }
 
 Tensor fft_ifft2_cpu(const Tensor& self, std::optional<std::vector<int64_t>> s,
                     const std::vector<int64_t>& dim, std::string norm) {
     const FFT2Args args = canonicalize_fft2(self, s, dim, false);
     return self.dtype() == DType::ComplexDouble || self.dtype() == DType::Float64
-        ? fft2_c2c_impl<double>(self, args, norm, false)
-        : fft2_c2c_impl<float>(self, args, norm, false);
+        ? fft2_c2c_impl<double>(self, args, norm_from_string(norm, false), false)
+        : fft2_c2c_impl<float>(self, args, norm_from_string(norm, false), false);
 }
 
 Tensor fft_rfft2_cpu(const Tensor& self, std::optional<std::vector<int64_t>> s,
                     const std::vector<int64_t>& dim, std::string norm) {
     const FFT2Args args = canonicalize_fft2(self, s, dim, false);
     return self.dtype() == DType::Float64
-        ? fft2_r2c_impl<double>(self, args, norm)
-        : fft2_r2c_impl<float>(self, args, norm);
+        ? fft2_r2c_impl<double>(self, args, norm_from_string(norm, true))
+        : fft2_r2c_impl<float>(self, args, norm_from_string(norm, true));
 }
 
 Tensor fft_irfft2_cpu(const Tensor& self, std::optional<std::vector<int64_t>> s,
                      const std::vector<int64_t>& dim, std::string norm) {
     const FFT2Args args = canonicalize_fft2(self, s, dim, true);
     return self.dtype() == DType::ComplexDouble
-        ? fft2_c2r_impl<double>(self, args, norm)
-        : fft2_c2r_impl<float>(self, args, norm);
+        ? fft2_c2r_impl<double>(self, args, norm_from_string(norm, false))
+        : fft2_c2r_impl<float>(self, args, norm_from_string(norm, false));
+}
+
+Tensor fft_fft2_backward_cpu(const Tensor& grad, const Tensor& self,
+                             std::optional<std::vector<int64_t>> s,
+                             const std::vector<int64_t>& dim, std::string norm) {
+    const FFT2Args args = canonicalize_fft2(self, s, dim, false);
+    return grad.dtype() == DType::ComplexDouble
+        ? fft2_c2c_backward_impl<double>(grad, self, args, norm, true)
+        : fft2_c2c_backward_impl<float>(grad, self, args, norm, true);
+}
+
+Tensor fft_ifft2_backward_cpu(const Tensor& grad, const Tensor& self,
+                              std::optional<std::vector<int64_t>> s,
+                              const std::vector<int64_t>& dim, std::string norm) {
+    const FFT2Args args = canonicalize_fft2(self, s, dim, false);
+    return grad.dtype() == DType::ComplexDouble
+        ? fft2_c2c_backward_impl<double>(grad, self, args, norm, false)
+        : fft2_c2c_backward_impl<float>(grad, self, args, norm, false);
+}
+
+Tensor fft_rfft2_backward_cpu(const Tensor& grad, const Tensor& self,
+                              std::optional<std::vector<int64_t>> s,
+                              const std::vector<int64_t>& dim, std::string norm) {
+    const FFT2Args args = canonicalize_fft2(self, s, dim, false);
+    return grad.dtype() == DType::ComplexDouble
+        ? fft2_rfft_backward_impl<double>(grad, self, args, norm)
+        : fft2_rfft_backward_impl<float>(grad, self, args, norm);
+}
+
+Tensor fft_irfft2_backward_cpu(const Tensor& grad, const Tensor& self,
+                               std::optional<std::vector<int64_t>> s,
+                               const std::vector<int64_t>& dim, std::string norm) {
+    const FFT2Args args = canonicalize_fft2(self, s, dim, true);
+    return grad.dtype() == DType::Float64
+        ? fft2_irfft_backward_impl<double>(grad, self, args, norm)
+        : fft2_irfft_backward_impl<float>(grad, self, args, norm);
 }
 
 TENSORPLAY_LIBRARY_IMPL(CPU, Spectral2DKernels) {
@@ -351,6 +453,10 @@ TENSORPLAY_LIBRARY_IMPL(CPU, Spectral2DKernels) {
     m.impl("fft_ifft2", fft_ifft2_cpu);
     m.impl("fft_rfft2", fft_rfft2_cpu);
     m.impl("fft_irfft2", fft_irfft2_cpu);
+    m.impl("fft_fft2_backward", fft_fft2_backward_cpu);
+    m.impl("fft_ifft2_backward", fft_ifft2_backward_cpu);
+    m.impl("fft_rfft2_backward", fft_rfft2_backward_cpu);
+    m.impl("fft_irfft2_backward", fft_irfft2_backward_cpu);
 }
 
 }  // namespace cpu

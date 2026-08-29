@@ -17,6 +17,18 @@ Tensor fft_rfft2_cpu(const Tensor& self, std::optional<std::vector<int64_t>> s,
                     const std::vector<int64_t>& dim, std::string norm);
 Tensor fft_irfft2_cpu(const Tensor& self, std::optional<std::vector<int64_t>> s,
                      const std::vector<int64_t>& dim, std::string norm);
+Tensor fft_fft2_backward_cpu(const Tensor& grad, const Tensor& self,
+                             std::optional<std::vector<int64_t>> s,
+                             const std::vector<int64_t>& dim, std::string norm);
+Tensor fft_ifft2_backward_cpu(const Tensor& grad, const Tensor& self,
+                              std::optional<std::vector<int64_t>> s,
+                              const std::vector<int64_t>& dim, std::string norm);
+Tensor fft_rfft2_backward_cpu(const Tensor& grad, const Tensor& self,
+                              std::optional<std::vector<int64_t>> s,
+                              const std::vector<int64_t>& dim, std::string norm);
+Tensor fft_irfft2_backward_cpu(const Tensor& grad, const Tensor& self,
+                               std::optional<std::vector<int64_t>> s,
+                               const std::vector<int64_t>& dim, std::string norm);
 
 }  // namespace cpu
 
@@ -30,6 +42,18 @@ Tensor fft_rfft2_cuda(const Tensor& self, std::optional<std::vector<int64_t>> s,
                      const std::vector<int64_t>& dim, std::string norm);
 Tensor fft_irfft2_cuda(const Tensor& self, std::optional<std::vector<int64_t>> s,
                       const std::vector<int64_t>& dim, std::string norm);
+Tensor fft_fft2_backward_cuda(const Tensor& grad, const Tensor& self,
+                              std::optional<std::vector<int64_t>> s,
+                              const std::vector<int64_t>& dim, std::string norm);
+Tensor fft_ifft2_backward_cuda(const Tensor& grad, const Tensor& self,
+                               std::optional<std::vector<int64_t>> s,
+                               const std::vector<int64_t>& dim, std::string norm);
+Tensor fft_rfft2_backward_cuda(const Tensor& grad, const Tensor& self,
+                               std::optional<std::vector<int64_t>> s,
+                               const std::vector<int64_t>& dim, std::string norm);
+Tensor fft_irfft2_backward_cuda(const Tensor& grad, const Tensor& self,
+                                std::optional<std::vector<int64_t>> s,
+                                const std::vector<int64_t>& dim, std::string norm);
 
 }  // namespace cuda
 }  // namespace tensorplay

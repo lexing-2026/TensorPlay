@@ -2799,6 +2799,50 @@ def fft_irfft2(input, s=None, dim=[-2,-1], norm="backward"):
         dim = [dim]
     return _C.fft_irfft2(input, s, dim, norm)
 
+def fft_fft2_backward(grad, input, s=None, dim=[-2,-1], norm="backward"):
+    if _capturing():
+        _captured = _capture_call(fft_fft2_backward, (grad, input, s, dim, norm), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(s, int) and not isinstance(s, bool):
+        s = [s]
+    if isinstance(dim, int) and not isinstance(dim, bool):
+        dim = [dim]
+    return _C.fft_fft2_backward(grad, input, s, dim, norm)
+
+def fft_ifft2_backward(grad, input, s=None, dim=[-2,-1], norm="backward"):
+    if _capturing():
+        _captured = _capture_call(fft_ifft2_backward, (grad, input, s, dim, norm), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(s, int) and not isinstance(s, bool):
+        s = [s]
+    if isinstance(dim, int) and not isinstance(dim, bool):
+        dim = [dim]
+    return _C.fft_ifft2_backward(grad, input, s, dim, norm)
+
+def fft_rfft2_backward(grad, input, s=None, dim=[-2,-1], norm="backward"):
+    if _capturing():
+        _captured = _capture_call(fft_rfft2_backward, (grad, input, s, dim, norm), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(s, int) and not isinstance(s, bool):
+        s = [s]
+    if isinstance(dim, int) and not isinstance(dim, bool):
+        dim = [dim]
+    return _C.fft_rfft2_backward(grad, input, s, dim, norm)
+
+def fft_irfft2_backward(grad, input, s=None, dim=[-2,-1], norm="backward"):
+    if _capturing():
+        _captured = _capture_call(fft_irfft2_backward, (grad, input, s, dim, norm), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(s, int) and not isinstance(s, bool):
+        s = [s]
+    if isinstance(dim, int) and not isinstance(dim, bool):
+        dim = [dim]
+    return _C.fft_irfft2_backward(grad, input, s, dim, norm)
+
 def fft_fft_backward(grad, input, dim, norm):
     if _capturing():
         _captured = _capture_call(fft_fft_backward, (grad, input, dim, norm), {})

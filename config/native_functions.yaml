@@ -2182,6 +2182,30 @@
     CPU: fft_irfft2_cpu
     CUDA: fft_irfft2_cuda
 
+- func: fft_fft2_backward(Tensor grad, Tensor self, int[]? s=None, int[] dim=[-2,-1], str norm="backward") -> Tensor
+  variants: function
+  dispatch:
+    CPU: fft_fft2_backward_cpu
+    CUDA: fft_fft2_backward_cuda
+
+- func: fft_ifft2_backward(Tensor grad, Tensor self, int[]? s=None, int[] dim=[-2,-1], str norm="backward") -> Tensor
+  variants: function
+  dispatch:
+    CPU: fft_ifft2_backward_cpu
+    CUDA: fft_ifft2_backward_cuda
+
+- func: fft_rfft2_backward(Tensor grad, Tensor self, int[]? s=None, int[] dim=[-2,-1], str norm="backward") -> Tensor
+  variants: function
+  dispatch:
+    CPU: fft_rfft2_backward_cpu
+    CUDA: fft_rfft2_backward_cuda
+
+- func: fft_irfft2_backward(Tensor grad, Tensor self, int[]? s=None, int[] dim=[-2,-1], str norm="backward") -> Tensor
+  variants: function
+  dispatch:
+    CPU: fft_irfft2_backward_cpu
+    CUDA: fft_irfft2_backward_cuda
+
 - func: fft_fft_backward(Tensor grad, Tensor self, int dim, str norm) -> Tensor
   variants: function
   dispatch:
