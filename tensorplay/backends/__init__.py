@@ -1,8 +1,7 @@
 # mypy: allow-untyped-defs
-"""Backend configuration modules, mirroring ``torch.backends``.
+"""Backend property helpers.
 
-Provides the flag plumbing (``ContextProp``/``PropModule``/freezing) copied
-from torch/backends/__init__.py, plus the ``cuda`` and ``cudnn`` flag
+Provides the flag plumbing (``ContextProp``/``PropModule``/freezing) and the
 surfaces for the TF32 switches backed by ``tensorplay._C``.
 """
 
