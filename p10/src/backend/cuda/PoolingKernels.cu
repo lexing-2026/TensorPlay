@@ -1161,7 +1161,7 @@ Tensor adaptive_max_pool3d_backward_cuda(const Tensor& grad_output, const Tensor
 
 TENSORPLAY_LIBRARY_IMPL(CUDA, PoolingKernels) {
     // max_pool2d / max_pool3d / adaptive_max_pool2d are Composite over their
-    // *_with_indices variants (see native_functions.yaml); only the with_indices
+    // *_with_indices variants (see the schema); only the with_indices
     // kernels are registered here so the dispatcher falls back to the Composite
     // forward, which records the indices-scatter autograd node.
     m.impl("max_pool2d_backward", max_pool2d_backward_cuda);
