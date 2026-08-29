@@ -2138,76 +2138,115 @@
   variants: function
   dispatch:
     CPU: fft_fft_cpu
+    CUDA: fft_fft_cuda
 
 - func: fft_ifft(Tensor self, SymInt n=-1, int dim=-1, str norm="backward") -> Tensor
   variants: function
   dispatch:
     CPU: fft_ifft_cpu
+    CUDA: fft_ifft_cuda
 
 - func: fft_rfft(Tensor self, SymInt n=-1, int dim=-1, str norm="backward") -> Tensor
   variants: function
   dispatch:
     CPU: fft_rfft_cpu
+    CUDA: fft_rfft_cuda
 
 - func: fft_irfft(Tensor self, SymInt n=-1, int dim=-1, str norm="backward") -> Tensor
   variants: function
   dispatch:
     CPU: fft_irfft_cpu
+    CUDA: fft_irfft_cuda
+
+- func: fft_fft2(Tensor self, int[]? s=None, int[] dim=[-2,-1], str norm="backward") -> Tensor
+  variants: function
+  dispatch:
+    CPU: fft_fft2_cpu
+    CUDA: fft_fft2_cuda
+
+- func: fft_ifft2(Tensor self, int[]? s=None, int[] dim=[-2,-1], str norm="backward") -> Tensor
+  variants: function
+  dispatch:
+    CPU: fft_ifft2_cpu
+    CUDA: fft_ifft2_cuda
+
+- func: fft_rfft2(Tensor self, int[]? s=None, int[] dim=[-2,-1], str norm="backward") -> Tensor
+  variants: function
+  dispatch:
+    CPU: fft_rfft2_cpu
+    CUDA: fft_rfft2_cuda
+
+- func: fft_irfft2(Tensor self, int[]? s=None, int[] dim=[-2,-1], str norm="backward") -> Tensor
+  variants: function
+  dispatch:
+    CPU: fft_irfft2_cpu
+    CUDA: fft_irfft2_cuda
 
 - func: fft_fft_backward(Tensor grad, Tensor self, int dim, str norm) -> Tensor
   variants: function
   dispatch:
     CPU: fft_fft_backward_cpu
+    CUDA: fft_fft_backward_cuda
 
 - func: fft_ifft_backward(Tensor grad, Tensor self, int dim, str norm) -> Tensor
   variants: function
   dispatch:
     CPU: fft_ifft_backward_cpu
+    CUDA: fft_ifft_backward_cuda
 
 - func: fft_rfft_backward(Tensor grad, Tensor self, int dim, str norm) -> Tensor
   variants: function
   dispatch:
     CPU: fft_rfft_backward_cpu
+    CUDA: fft_rfft_backward_cuda
 
 - func: fft_irfft_backward(Tensor grad, Tensor self, int dim, str norm) -> Tensor
   variants: function
   dispatch:
     CPU: fft_irfft_backward_cpu
+    CUDA: fft_irfft_backward_cuda
 
 - func: hann_window(int window_length, bool periodic=True, ScalarType? dtype=None) -> Tensor
   variants: function
   dispatch:
     CPU: hann_window_cpu
+    CUDA: hann_window_cuda
 
 - func: hamming_window(int window_length, bool periodic=True, float alpha=0.54, float beta=0.46, ScalarType? dtype=None) -> Tensor
   variants: function
   dispatch:
     CPU: hamming_window_cpu
+    CUDA: hamming_window_cuda
 
 - func: bartlett_window(int window_length, bool periodic=True, ScalarType? dtype=None) -> Tensor
   variants: function
   dispatch:
     CPU: bartlett_window_cpu
+    CUDA: bartlett_window_cuda
 
 - func: blackman_window(int window_length, bool periodic=True, ScalarType? dtype=None) -> Tensor
   variants: function
   dispatch:
     CPU: blackman_window_cpu
+    CUDA: blackman_window_cuda
 
 - func: stft(Tensor self, int n_fft, int? hop_length=None, int? win_length=None, Tensor? window=None, bool center=True, str pad_mode="reflect", bool normalized=False, bool onesided=True, bool return_complex=True) -> Tensor
   variants: function
   dispatch:
     CPU: stft_cpu
+    CUDA: stft_cuda
 
 - func: istft(Tensor input, int n_fft, int? hop_length=None, int? win_length=None, Tensor? window=None, bool center=True, bool normalized=False, bool onesided=True, int? length=None, bool return_complex=False) -> Tensor
   variants: function
   dispatch:
     CPU: istft_cpu
+    CUDA: istft_cuda
 
 - func: stft_backward(Tensor grad_output, Tensor self, int n_fft, int? hop_length=None, int? win_length=None, Tensor? window=None, bool center=True, str pad_mode="reflect", bool normalized=False, bool onesided=True) -> Tensor
   variants: function
   dispatch:
     CPU: stft_backward_cpu
+    CUDA: stft_backward_cuda
 
 # ===========================================================================
 # ===========================================================================

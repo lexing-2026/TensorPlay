@@ -72,6 +72,7 @@ set(P10_SOURCES
     src/backend/cpu/Tier5OpsKernels.cpp
     src/backend/cpu/SpecialKernels.cpp
     src/backend/cpu/SpectralKernels.cpp
+    src/backend/cpu/Spectral2DKernels.cpp
     src/backend/cpu/InplaceCompletionKernels.cpp
 
     # Backend-neutral composite kernels, one file per operator category
@@ -174,6 +175,7 @@ if(USE_CUDA)
         src/backend/cuda/Tier5LossesKernels.cu
         src/backend/cuda/SpecialKernels.cu
         src/backend/cuda/SpectralKernels.cu
+        src/backend/cuda/Spectral2DKernels.cu
         src/backend/cuda/InplaceCompletionKernels.cu
     )
 endif()
