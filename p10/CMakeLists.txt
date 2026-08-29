@@ -178,7 +178,9 @@ if(USE_CUDA)
         src/backend/cuda/RNNKernels.cu
         src/backend/cuda/Tier5OpsKernels.cu
         src/backend/cuda/Tier5LossesKernels.cu
-        src/backend/cuda/SpecialKernels.cu
+        src/backend/cuda/SpecialUnaryKernels.cu
+        src/backend/cuda/SpecialBinaryKernels.cu
+        src/backend/cuda/IncompleteGammaKernels.cu
         src/backend/cuda/SpectralKernels.cu
         src/backend/cuda/Spectral2DKernels.cu
         src/backend/cuda/InplaceCompletionKernels.cu
