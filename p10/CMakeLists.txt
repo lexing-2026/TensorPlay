@@ -66,6 +66,7 @@ set(P10_SOURCES
     src/backend/cpu/ForeachKernels.cpp
     src/backend/cpu/OptimizerKernels.cpp
     src/backend/cpu/SamplingKernels.cpp
+    src/backend/cpu/TopKKernels.cpp
     src/backend/cpu/TransformersKernels.cpp
     src/backend/cpu/IndexingKernels.cpp
     src/backend/cpu/TierOpsKernels.cpp
@@ -166,6 +167,7 @@ if(USE_CUDA)
         src/backend/cuda/OptimizerKernels.cu
         src/backend/cuda/AmpKernels.cu
         src/backend/cuda/SamplingKernels.cu
+        src/backend/cuda/TopKKernels.cu
         src/backend/cuda/AttentionKernels.cu
         src/backend/cuda/IndexingKernels.cu
         src/backend/cuda/TierOpsKernels.cu
