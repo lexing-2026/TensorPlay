@@ -1,8 +1,7 @@
-"""Native sigmoid / tanh / logit backward alignment vs torch.
+"""
 
-Covers the activation-backward family closed against ATen (cpu/Activation.cpp
 sigmoid_backward_kernel / tanh_backward_kernel, cpu/LogitKernel.cpp
-logit_backward_kernel, and the matching CUDA kernels): native op parity for
+logit_backward_kernel, and the matching CUDA kernels): native op behavior for
 sigmoid_backward / tanh_backward / logit_backward, logit forward eps
 semantics (eps=None -> no clamp, eps>=0 -> clamp to [eps, 1-eps]), autograd
 through tensorplay's sigmoid / tanh / logit now routing to the native
@@ -48,7 +47,6 @@ class TestSigmoidTanhBackwardNative(unittest.TestCase):
         from tensorplay import _C
         torch.manual_seed(seed)
         grad_t = torch.randn(*shape)
-        # ATen sigmoid_backward / tanh_backward take the saved forward OUTPUT.
         output_t = out_fn(torch.randn(*shape))
         ref = aten_fn(grad_t, output_t)
         got = getattr(_C, tp_fn_name)(_tp_tensor(grad_t, dev),
@@ -105,7 +103,6 @@ class TestLogitBackwardNative(unittest.TestCase):
                               msg=f"logit_backward eps masking eps={eps} ({dev})")
 
     def test_out_of_domain(self):
-        # ATen without eps: NaN outside [0, 1], dy*inf at exact 0/1.
         from tensorplay import _C
         for dev in _devices():
             vals = torch.tensor([-0.5, 0.0, 0.25, 0.5, 0.75, 1.0, 1.5])
@@ -130,7 +127,6 @@ class TestLogitBackwardNative(unittest.TestCase):
 
 class TestLogitForwardEps(unittest.TestCase):
     def test_configs(self):
-        # ATen: eps=None -> no clamp; eps>=0 -> clamp into [eps, 1-eps]
         # (including eps=0, which clamps into [0, 1]).
         for dev in _devices():
             vals = torch.tensor([-0.5, 0.0, 0.05, 0.2, 0.5, 0.8, 0.95, 1.0, 1.5])
@@ -187,7 +183,6 @@ class TestActivationAutograd(unittest.TestCase):
                               msg=f"logit eps grad masking eps={eps} ({dev})")
 
     def test_logit_out_of_domain_grad(self):
-        # ATen: without eps, inputs outside [0, 1] give NaN forward and NaN
         # gradient (logit_backward masks out-of-domain to NaN).
         for dev in _devices():
             vals = torch.tensor([-0.5, 0.25, 0.5, 0.75, 1.5])

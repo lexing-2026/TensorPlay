@@ -103,7 +103,6 @@ class TestSparseSum(unittest.TestCase):
         self.assertAlmostEqual(float(out.reshape(-1)[0]), 3.5, places=6)
 
     def test_sum_partial_dim_is_sparse(self):
-        # ATen semantics: partial reduction returns a coalesced SPARSE tensor.
         s = self.make_input()
         out = sparse.sum(s, dim=[1])
         self.assertTrue(out.is_sparse)
@@ -164,12 +163,10 @@ class TestSparseBinaryOps(unittest.TestCase):
 
 class TestSpdiags(unittest.TestCase):
     def test_negative_offsets(self):
-        # torch.sparse.spdiags doc example (arange(9)).
         diagonals = tp.tensor([[0.0, 1.0, 2.0], [3.0, 4.0, 5.0],
                                [6.0, 7.0, 8.0]])
         offsets = tp.tensor([0, -1, -2], dtype=tp.int64)
         s = sparse.spdiags(diagonals, offsets, (3, 3))
-        # Entry order matches torch: diagonal by diagonal, uncoalesced.
         self.assertEqual(s.values().tolist(), [0.0, 1.0, 2.0, 3.0, 4.0, 6.0])
         dense = dense_from_coo(s)
         self.assertTrue(tp.allclose(

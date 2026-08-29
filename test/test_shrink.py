@@ -1,9 +1,8 @@
-"""Native hardshrink / softshrink backward alignment vs torch.
+"""
 
-Covers the shrink family closed against ATen (Activation.cpp
 hardshrink/softshrink + the shared shrink_backward_kernel, cuda
 ActivationHardshrinkKernel.cu / ActivationSoftshrinkKernel.cu): forward
-parity (including the NaN pass-through and inclusive +/-lambd zero band),
+behavior checks (including the NaN pass-through and inclusive +/-lambd zero band),
 the new native hardshrink_backward / softshrink_backward ops, autograd
 through tensorplay.nn.functional, and nn module smoke tests. Backwards use
 explicit grads (no .sum().backward()) so the suite is immune to unrelated
@@ -65,7 +64,6 @@ class TestShrinkForward(unittest.TestCase):
                         _assert_close(self, got, ref, msg=tag)
 
     def test_nan_inf_passthrough(self):
-        # ATen: hardshrink/softshrink propagate NaN (a*0 / isnan branch);
         # inf passes through as outside the band.
         for dev in _devices():
             vals = torch.tensor([float("nan"), float("inf"), float("-inf"),
@@ -107,7 +105,6 @@ class TestShrinkBackwardNative(unittest.TestCase):
                               "softshrink_backward")
 
     def test_broadcast(self):
-        # ATen shrink_backward broadcasts grad/self through TensorIterator.
         from tensorplay import _C
         for dev in _devices():
             grad_t = torch.randn(4, 1)

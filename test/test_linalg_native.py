@@ -1,9 +1,8 @@
-"""Native linalg alignment tests — tensorplay.linalg vs the installed torch.
+"""
 
 Locked in after the LAPACK runtime-resolution + kernel-fix campaign:
   - runtime ILP64 LAPACK discovery (numpy's bundled scipy_openblas64)
   - rfft-style backward conventions are spectral; here we lock the dense face
-Every case compares against the local torch as oracle on float64 CPU.
 """
 import numpy as np
 import pytest
@@ -68,7 +67,6 @@ def test_cholesky_zero_triangle_and_values(upper):
     got = tp.linalg.cholesky(P(A), upper=upper).numpy()
     ref = np.linalg.cholesky(A)
     ref = ref.T if upper else ref
-    # exact factor + strict zeros in the opposite triangle (torch contract)
     tri = lambda x: np.tril(x) if not upper else np.triu(x)
     np.testing.assert_allclose(tri(got), tri(ref), rtol=1e-12)
     off = lambda x: np.triu(x, 1) if not upper else np.tril(x, -1)
@@ -135,7 +133,6 @@ def test_matrix_norm_numeric_ords():
 
 
 def test_fft_real_input_torch_parity():
-    # adjacent native fix locked here: fft/ifft accept real input like torch
     x = np.random.randn(16)
     ref = torch.fft.fft(T(x)).numpy()
     got = to_torch(tp.fft_fft(P(x))).numpy()
@@ -165,13 +162,12 @@ def test_max_min_binary_and_namedtuple_faces():
 # ---------------------------------------------------------------------------
 
 def test_tensor_device_method_face():
-    t = tp.tensor([1.0, 2.0])  # default dtype float32, same as torch
+    t = tp.tensor([1.0, 2.0])
     assert t.is_cpu and not t.is_cuda and not t.is_meta
     assert t.nbytes() == 8
     assert tp.tensor([1.0, 2.0], dtype=tp.float64).nbytes() == 16
     assert t.storage_offset() == 0
-    assert t.get_device() == -1  # torch: -1 for CPU
-    # .cpu() is a no-copy identity on CPU tensors (torch semantics)
+    assert t.get_device() == -1
     assert t.cpu().data_ptr() == t.data_ptr()
 
 

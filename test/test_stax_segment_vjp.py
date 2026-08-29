@@ -3,7 +3,7 @@
 The orchestration contract is verified locally with fake launches that
 execute the true per-segment math eagerly: forward chaining, tangent
 expansion for sum/mean reduction segments, fan-out gradient accumulation,
-and placeholder-aligned gradient returns.  Numeric parity against eager
+and placeholder-aligned gradient returns.  Numeric behavior checks against eager
 autograd on a real GPU is gated on ``runtime_available()``.
 """
 
@@ -169,7 +169,7 @@ def test_untrainable_reduction_still_falls_back(monkeypatch):
     assert calls == []
 
 
-# --- numeric parity on a real GPU --------------------------------------------------
+# --- numeric checks on a real GPU -------------------------------------------------
 
 
 @pytest.mark.skipif(not st.runtime_available(), reason="Triton/CUDA unavailable")

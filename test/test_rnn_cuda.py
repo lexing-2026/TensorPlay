@@ -1,4 +1,4 @@
-"""CUDA verification of the RNN ops: device-consistency against the (torch-
+"""
 verified) CPU implementation plus an end-to-end training smoke test that
 exercises the differentiable python path (chunk/split/linear on GPU)."""
 import os

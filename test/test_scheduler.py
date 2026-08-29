@@ -192,7 +192,7 @@ def test_pw_red_pw_fuses_to_single_segment_with_epilogue_program():
     # main program: pointwise chain folded with its sum tail -> one scalar
     assert prog0 is not None and len(prog0[1]) > 0
 
-    # epilogue program mirrors compile_graph_module's construction
+    # epilogue program follows compile_graph_module's construction
     from tensorplay.compiler.codegen.triton import _extract_segment_view
     from tensorplay.backends.stax import _build_pointwise_program
     from types import SimpleNamespace as NS

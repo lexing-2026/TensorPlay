@@ -113,7 +113,7 @@ class TestStack:
     def test_hstack_zero_dim(self):
         out = tp.hstack([scalar0(1), scalar0(2)])
         assert tuple(out.size()) == (2,)
-        assert out.tolist() == [1.0, 2.0]  # torch: values pass through
+        assert out.tolist() == [1.0, 2.0]
 
     def test_hstack_mixed_ndim_raises(self):
         with pytest.raises(RuntimeError):
@@ -248,7 +248,6 @@ class TestBlockDiag:
         v = tp.arange(2).to(DType.float32) + 1
         s = scalar0(5)
         out = tp.block_diag(m, v, s)
-        # ATen TensorShape.cpp block_diag: 1-D input becomes a (1, n)
         # diagonal row block, so mixed shapes yield a rectangular result.
         assert tuple(out.size()) == (4, 5)
         expect = [

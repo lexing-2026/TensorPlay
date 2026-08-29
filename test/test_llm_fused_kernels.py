@@ -1,4 +1,4 @@
-"""CPU parity tests for the decoder activation and RoPE primitives."""
+"""CPU behavior tests for the decoder activation and RoPE primitives."""
 
 import numpy as np
 import pytest
@@ -80,4 +80,3 @@ def test_fused_decoder_ops_reject_bad_rope_table_cpu():
     sin = tp.randn(2, 4)
     with pytest.raises(Exception):
         tp.rotary_embedding(x, cos, sin, position_offset=1)
-

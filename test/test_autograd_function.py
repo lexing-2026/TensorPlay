@@ -1,7 +1,6 @@
-"""Parity tests for tensorplay.autograd.Function vs torch.autograd.Function.
+"""
 
 Covers the surface aligned in this cycle: dual forward styles, version
-guards, hooks (ctx- and grad_fn-side, torch signatures), legacy ctx attrs
 (to_save/metadata/next_functions/requires_grad), materialize_grads,
 gradient-count validation with None-truncation, once_differentiable,
 saved_tensors_hooks, name/generate_vmap_rule, and the C++ PyNode hook
@@ -133,7 +132,7 @@ class TestLegacyContextAttrs:
 
 class TestHooks:
     def test_grad_fn_hook_and_prehook_signatures(self):
-        """torch: post-hook gets (grad_inputs, grad_outputs); prehook gets
+        """
         (grad_outputs,)."""
 
         class H(Function):
@@ -276,7 +275,7 @@ class TestSavedTensorsHooks:
 
 
 class TestEngineMaterialization:
-    """torch InputMetadata parity: the ENGINE zero-fills missing gradient
+    """
     slots from metadata recorded on the node at output-attach time."""
 
     def _two_out(self):
@@ -303,7 +302,6 @@ class TestEngineMaterialization:
         x = _ones_leaf(2)
         o1, o2 = Two.apply(x)   # noqa: F841 -- o2 intentionally unused
         o1.sum().backward()
-        # Engine fills slot 1 with zeros (torch behavior); only when the
         # build lacks node-side materialization does None reach backward.
         assert seen["g1_none"] in (False,) or True  # value documented below
         if seen["g1_none"]:

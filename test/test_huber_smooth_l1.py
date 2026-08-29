@@ -1,10 +1,8 @@
-"""Native smooth_l1_loss / huber_loss (+ backwards) alignment vs torch.
+"""
 
-Closes the robust-regression loss pair against ATen (Loss.cpp +
 cpu/BinaryOpsKernel.cpp smooth_l1_kernel / huber_kernel,
 cpu/PointwiseOpsKernel.cpp smooth_l1_backward_cpu_kernel /
 huber_backward_cpu_kernel, cuda/BinaryMiscOpsKernels.cu +
-cuda/PointwiseOpsKernel.cu): forwards realigned to the ATen signature
 (self, target, reduction, beta/delta), new native smooth_l1_loss_backward /
 huber_loss_backward, parameter validation (beta >= 0, delta > 0), autograd
 through tensorplay.nn.functional, and nn module smoke tests. Backwards use

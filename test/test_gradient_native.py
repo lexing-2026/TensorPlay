@@ -1,9 +1,8 @@
-"""Native gradient (torch CompositeImplicitAutograd parity) vs torch 2.13.
+"""
 
 The op is registered once under the backend-neutral Composite key and its
-forward is a pure composition of differentiable primitives, mirroring
-upstream's no-dispatch-section registration.  Every test here compares
-against the local torch reference: forward values, autograd values, and
+forward is a pure composition of differentiable primitives without a
+dispatch section.  Every test here compares
 double-backward (create_graph) values.
 """
 
@@ -150,7 +149,7 @@ class TestGradientAutograd:
         assert close(y.grad, yt.grad)
 
     def test_grad_fn_is_inner_composition(self):
-        # CIA parity: outputs must carry inner-recorded nodes (slice/div/...),
+        # The outputs must carry inner-recorded nodes (slice/div/...),
         # never a single fused gradient node at depth 1.
         y = tp.tensor(Y6, dtype=tp.float64, requires_grad=True)
         (out,) = tp.gradient(y)

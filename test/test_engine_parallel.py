@@ -48,7 +48,7 @@ class TestEngineParallel(unittest.TestCase):
                 y = (x * 3.0).sum()
                 y.backward()
                 assert x.grad is not None
-                assert tp.allclose(x.grad, tp.full([4, 4], 3.0))
+                assert tp.allclose(x.grad, tp.full([4, 4], 3.0, dtype=tp.float32))
             except Exception as e:  # pragma: no cover
                 errors.append(e)
 
@@ -81,7 +81,7 @@ class TestEngineParallel(unittest.TestCase):
         self.assertEqual(seen.get("pre"), 1)
         self.assertEqual(seen.get("post"), 1)
         # grad 1 -> pre-hook x10 -> apply(*2) -> post-hook +1 => 21
-        self.assertTrue(tp.allclose(x.grad, tp.full([2, 2], 21.0)))
+        self.assertTrue(tp.allclose(x.grad, tp.full([2, 2], 21.0, dtype=tp.float32)))
 
     def test_no_leak_after_many_iterations(self):
         if not tp.cuda.is_available():

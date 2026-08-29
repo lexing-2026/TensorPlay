@@ -76,19 +76,15 @@ class TestStatisticalOps(unittest.TestCase):
             self.assertTensorClose(tp_tensor.min(), data.min())
             
             if len(shape) > 1:
-                # Test max(dim) / min(dim) - Note: PyTorch returns (values, indices), TensorPlay currently returns values only based on implementation
                 # Wait, let's check native_functions.yaml for max.dim return type.
                 # - func: max.dim(Tensor self, int64_t[] dim, bool keepdim=false) -> Tensor
-                # It returns Tensor, not (Tensor, Tensor). So it behaves like max(dim).values if matched with torch.max(dim).values or torch.amax
                 
-                # PyTorch max(dim) returns (values, indices). TensorPlay max.dim returns Tensor.
                 # So we should compare with data.amax(dim=...) or data.max(dim=...).values
                 
                 self.assertTensorClose(tp_tensor.max(dim=0)[0], data.amax(dim=0))
                 self.assertTensorClose(tp_tensor.min(dim=0, keepdim=True)[0], data.amin(dim=0, keepdim=True))
 
     def test_amax_amin_nan_propagates(self):
-        """torch treats NaN as greater than any number in amax/amin/aminmax."""
         data = torch.tensor([1.0, float("nan"), 3.0])
         x = tp.tensor(data.numpy())
         self.assertTensorClose(tp.amax(x), torch.amax(data))

@@ -1,5 +1,5 @@
 """Spec tests: Tensor method surface batch (new_* factories, dtype
-shortcuts, pointwise method forms, operator dunders) vs local torch."""
+"""
 
 import pytest
 import torch
@@ -206,7 +206,6 @@ class TestMiscMethods:
         assert g.grad.tolist() == gg.grad.tolist()
 
     def test_bool_truthiness_matches_item(self):
-        """nb_bool contract (torch is_nonzero): was always-True before."""
         assert not bool(tp.tensor(False))
         assert not bool(tp.tensor(0.0))
         assert bool(tp.tensor(3.0))

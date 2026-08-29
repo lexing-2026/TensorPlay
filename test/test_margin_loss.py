@@ -1,6 +1,5 @@
-"""Native multi_margin_loss / multilabel_margin_loss alignment vs torch.
+"""
 
-Covers the ATen-aligned margin-loss family (LossMultiMargin.cpp /
 LossMultiLabelMargin.cpp, cuda/MultiMarginLoss.cu /
 MultiLabelMarginCriterion.cu): forward with weight + none/mean/sum
 reductions, batched and unbatched inputs, the multilabel is_target mask,

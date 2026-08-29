@@ -92,7 +92,6 @@ class TestJVP(unittest.TestCase):
         v = tp.tensor([1.0, 1.0], dtype=tp.float64)
         out, jvpval = jvp(f, x, v)
         # f maps R^2 -> R, so the jvp is the scalar <2t, v> = 6
-        # (matches torch.autograd.functional.jvp).
         self.assertAlmostEqual(out.item(), 5.0, places=10)
         self.assertAlmostEqual(jvpval.item(), 6.0, places=10)
 
@@ -124,7 +123,6 @@ class TestJacobian(unittest.TestCase):
         x = tp.rand(2, dtype=tp.float64)
         y = tp.rand(2, dtype=tp.float64)
         jxx, jxy = jacobian(exp_adder, (x, y))
-        # torch: single output + tuple inputs -> tuple of Tensors (per input)
         self.assertIsInstance(jxx, tp.Tensor)
         self.assertEqual(tuple(jxx.shape), (2, 2))
         xd = x.detach()

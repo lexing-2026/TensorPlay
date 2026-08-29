@@ -15,7 +15,6 @@ except ImportError:
 
 
 def _ignore_unraisable(fn):
-    """Ignore torch's known unraisable from half-initialized MP iterators."""
     if HAS_TORCH:
         try:
             import pytest
@@ -38,7 +37,7 @@ class _DS(td.Dataset):
         return tp.tensor([i])
 
 
-@unittest.skipUnless(HAS_TORCH, "torch not available")
+@unittest.skipUnless(HAS_TORCH, "reference package not available")
 class TestDatasetParity(unittest.TestCase):
     def test_dataset_error_message(self):
         class D(td.Dataset):
@@ -204,7 +203,7 @@ class _TDS(torch.utils.data.Dataset):
         return torch.tensor([i])
 
 
-@unittest.skipUnless(HAS_TORCH, "torch not available")
+@unittest.skipUnless(HAS_TORCH, "reference package not available")
 class TestSamplerParity(unittest.TestCase):
     def test_sequential(self):
         self.assertEqual(
@@ -265,7 +264,7 @@ class TestSamplerParity(unittest.TestCase):
             torchdata.BatchSampler(torchdata.SequentialSampler(_TDS(10)), 3, "x")
 
 
-@unittest.skipUnless(HAS_TORCH, "torch not available")
+@unittest.skipUnless(HAS_TORCH, "reference package not available")
 class TestCollateParity(unittest.TestCase):
     def _check(self, batch):
         out = td.default_collate(batch)
@@ -336,7 +335,7 @@ class TestCollateParity(unittest.TestCase):
         self.assertEqual(out[1], tout[1])
 
 
-@unittest.skipUnless(HAS_TORCH, "torch not available")
+@unittest.skipUnless(HAS_TORCH, "reference package not available")
 class TestDataLoaderParity(unittest.TestCase):
     def _check_batches(self, tp_loader, t_loader):
         # ``len()`` raises TypeError for IterableDatasets without __len__ on
@@ -350,8 +349,8 @@ class TestDataLoaderParity(unittest.TestCase):
         except TypeError:
             t_len = None
         if tp_len is None or t_len is None:
-            self.assertIsNone(tp_len, "len(dataloader) should raise TypeError like torch")
-            self.assertIsNone(t_len, "len(dataloader) should raise TypeError like torch")
+            self.assertIsNone(tp_len, "len(dataloader) should raise TypeError")
+            self.assertIsNone(t_len, "len(dataloader) should raise TypeError")
         else:
             self.assertEqual(tp_len, t_len)
         for b, tb in zip(tp_loader, t_loader):
@@ -467,7 +466,6 @@ class TestDataLoaderParity(unittest.TestCase):
     @_ignore_unraisable
     def test_mp_option_validation(self):
         # prefetch_factor / persistent_workers / multiprocessing_context follow
-        # torch's validation messages.
         self._check_raises(
             lambda: td.DataLoader(_DS(5), num_workers=0, prefetch_factor=2),
             lambda: torchdata.DataLoader(_TDS(5), num_workers=0, prefetch_factor=2),
@@ -478,14 +476,11 @@ class TestDataLoaderParity(unittest.TestCase):
             lambda: torchdata.DataLoader(_TDS(5), num_workers=2, prefetch_factor=-1),
             ValueError, "prefetch_factor option should be non-negative",
         )
-        # prefetch_factor=0 passes construction but fails at iteration (torch
-        # parity). torch's own half-initialized iterator leaks an unraisable
         # from __del__, so ignore that warning for this test.
         self._check_raises(
             lambda: list(td.DataLoader(_DS(5), num_workers=2, prefetch_factor=0)),
             lambda: list(torchdata.DataLoader(_TDS(5), num_workers=2, prefetch_factor=0)),
             AssertionError, "prefetch_factor must be greater than 0",
-            # PyTorch 2.8 still implements this validation as a bare assert,
             # so its exception text is empty even though TensorPlay reports
             # the native diagnostic above.
             torch_msg="",
@@ -537,7 +532,6 @@ class TestDataLoaderFunctional(unittest.TestCase):
         import multiprocessing
         manager = multiprocessing.Manager()
         # A plain list cannot propagate appends from forked children; use a
-        # managed list (same approach as torch's own DataLoader tests).
         seen = manager.list()
 
         def worker_init_fn(worker_id):
@@ -551,7 +545,6 @@ class TestDataLoaderFunctional(unittest.TestCase):
         self.assertEqual(len(seen), 2)
         self.assertEqual(sorted(w[0] for w in seen), [0, 1])
         self.assertTrue(all(w[1] == 2 for w in seen))
-        # per-worker seeds are base_seed + worker_id (torch contract), where
         # base_seed is drawn from the loader generator
         seeds = sorted(w[2] for w in seen)
         self.assertEqual(seeds[1], seeds[0] + 1)
@@ -570,7 +563,6 @@ class TestDataLoaderFunctional(unittest.TestCase):
                 info = td.get_worker_info()
                 if info is None:
                     return iter(range(self.n))
-                # split workload across workers (torch docs pattern)
                 per_worker = (self.n + info.num_workers - 1) // info.num_workers
                 start = info.id * per_worker
                 return iter(range(start, min(start + per_worker, self.n)))
@@ -578,7 +570,6 @@ class TestDataLoaderFunctional(unittest.TestCase):
         loader = td.DataLoader(ShardIDS(9), batch_size=2, num_workers=3)
         got = sorted(x.item() for b in loader for x in b)
         self.assertEqual(got, list(range(9)))
-        # no __len__ on the dataset -> len(dataloader) raises (torch parity)
         with self.assertRaises(TypeError):
             len(loader)
 
@@ -617,7 +608,6 @@ class TestDataLoaderFunctional(unittest.TestCase):
                     raise ValueError("boom at 2")
                 return tp.tensor([i])
 
-        # torch re-raises the original exception type, wrapped with the
         # worker origin and original traceback
         with self.assertRaises(ValueError) as cm:
             list(td.DataLoader(BadDS(), batch_size=2, num_workers=2))

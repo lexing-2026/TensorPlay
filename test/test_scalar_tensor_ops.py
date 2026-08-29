@@ -190,9 +190,7 @@ class TestScalarTensorOps(unittest.TestCase):
             expected = [2, 4, 6]
             self.assertEqual(res.cpu().numpy().tolist(), expected, f"int t * 2 failed on {device}")
             
-            # Div int (should result in float/int depending on implementation, PyTorch does floor div for int tensors? No, it promotes to float usually for true div)
             # TP implementation of div depends on kernel. 
-            # If we follow PyTorch: int / int -> float
             # Let's check logic.
             res = t / 2
             # Our current implementation might promote or use integer division.

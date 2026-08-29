@@ -1,7 +1,5 @@
-"""Audio stack alignment tests — tensorplay.audio vs torch/torchaudio 2.x.
+"""
 
-Every DSP primitive is compared against the installed torch (oracle):
-windows, fft family, stft/istft, autograd, and the ported torchaudio
 functional/transforms layers. Native kernels live in
 p10/src/backend/cpu/SpectralKernels.cpp (pocketfft) and
 p10/src/backend/cuda/SpectralKernels.cu (cuFFT).
@@ -30,7 +28,6 @@ SIZES = [1, 2, 3, 4, 5, 7, 8, 12, 15, 16, 30, 64, 100, 1024]
 
 
 # ---------------------------------------------------------------------------
-# window factories vs ATen TensorFactories formulas (torch oracle)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("n", [0, 1, 4, 16, 512])
@@ -61,7 +58,6 @@ def test_window_dtype():
 
 
 # ---------------------------------------------------------------------------
-# FFT family vs pocketfft-equivalent numpy / torch
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("n", SIZES)
@@ -71,7 +67,6 @@ def test_fft_ifft_match_numpy(n, norm, batch):
     shape = (batch,) if batch else ()
     # numpy.fft always computes in double precision; construct the input in
     # complex128 so the 1e-9 bound measures transform accuracy, not f32
-    # storage rounding.  (tp.tensor(list) infers complex64 — same as torch.)
     x_np = np.random.randn(*shape, n).astype(np.float64) + \
         1j * np.random.randn(*shape, n).astype(np.float64)
     ref_f = np.fft.fft(x_np, axis=-1, norm=norm)
@@ -107,7 +102,6 @@ def test_rfft_irfft_match_numpy(n, norm):
 def test_fft_interior_dim():
     x_np = np.random.randn(2, 5, 16).astype(np.float64)
     ref = np.fft.fft(x_np, axis=1)
-    # torch.fft.fft accepts real input and promotes to complex; same here.
     x = tp.from_dlpack(torch.from_numpy(
         np.ascontiguousarray(x_np)).__dlpack__())
     got = to_torch(tp.fft_fft(x, -1, 1, "backward")).numpy()
@@ -127,7 +121,6 @@ def test_fft_resize_semantics():
 
 
 # ---------------------------------------------------------------------------
-# stft/istft vs torch.stft/torch.istft (ATen SpectralOps semantics)
 # ---------------------------------------------------------------------------
 
 STFT_CASES = [
@@ -182,7 +175,6 @@ def test_istft_roundtrip_and_match_torch(kw):
     hop = kw["hop"] or n_fft // 4
     win_len = kw["win"] or n_fft
     window = torch.hann_window(win_len, dtype=torch.float64, periodic=True)
-    # torch.istft requires a complex input matching stft(return_complex=True)
     spec = torch.randn(2, n_fft // 2 + 1, 40, dtype=torch.float64) * (1 + 1j)
 
     ref = torch.istft(spec, n_fft, hop_length=hop, win_length=win_len,
@@ -229,14 +221,12 @@ def test_stft_backward_matches_torch_grad():
 
 
 # ---------------------------------------------------------------------------
-# functional layer parity (ported from torchaudio 2.11)
 # ---------------------------------------------------------------------------
 
 def test_melscale_fbanks_shape_and_rows():
     F = ta.functional.melscale_fbanks(201, 0.0, 8000.0, 40, 16000)
     t = to_torch(F)
     assert t.shape == (201, 40)
-    # torchaudio's own invariant: every mel FILTER has positive mass.  Rows
     # (freq bins) below/above all triangles legitimately sum to zero.
     col_sums = t.sum(-2)
     assert bool((col_sums > 0).all())
@@ -245,7 +235,6 @@ def test_melscale_fbanks_shape_and_rows():
 def test_amplitude_to_db_db_to_amplitude_roundtrip():
     x = torch.rand(8, 100, dtype=torch.float64) + 1e-6
     ref_a2db = 20.0 * torch.log10(torch.clamp(x, min=1e-5))
-    # torchaudio 2.11 API: amplitude_to_DB(x, multiplier, amin, db_multiplier,
     # top_db); db_multiplier=log10(max(ref, amin))=0 for ref=1.
     got = to_torch(ta.functional.amplitude_to_DB(
         to_tp(x), 20.0, 1e-5, 0.0)).numpy()
@@ -259,14 +248,12 @@ def test_mu_law_roundtrip():
     assert enc.min().item() >= 0 and enc.max().item() < q
     dec = to_torch(ta.functional.mu_law_decoding(to_tp(enc), q))
     # mu-law companding is not linear: the decode grid spacing near |x|=1 is
-    # coarser than 1/q.  torchaudio itself shows max roundtrip err ~= 0.0198
     # for q=256 on this exact input; our port matches bit-for-bit.
     assert float((dec - x).abs().max()) < 0.02
 
 
 def test_create_dct():
     d = to_torch(ta.functional.create_dct(13, 40, "ortho"))
-    # torchaudio returns the (n_mels, n_mfcc) matrix, right-multiplied to
     # row-wise (n_mels, n_mfcc) mel data.
     assert d.shape == (40, 13)
     # orthonormal columns
@@ -330,7 +317,6 @@ def test_melspectrogram_values_close_reference():
                       window=torch.hann_window(400, dtype=torch.float64),
                       center=True, onesided=True, return_complex=True)
     mag = spec.abs() ** 2
-    # torchaudio MelScale: (fb.T @ specgram) per channel; wav is (1, T) so
     # spec/mag carry a leading channel dim of 1.
     ref = (mag.transpose(-1, -2) @ fb).transpose(-1, -2)  # MelScale contract
     got = to_torch(m)
@@ -398,12 +384,10 @@ def test_backend_registry():
 
 
 # ---------------------------------------------------------------------------
-# models smoke tests (ported verbatim from torchaudio.models)
 # ---------------------------------------------------------------------------
 
 def test_deepspeech_forward_shape():
     from tensorplay.audio.models import DeepSpeech
-    # torchaudio 2.11 signature: DeepSpeech(n_feature, n_hidden, n_class,
     # dropout); forward(x) -> (batch, time, n_class).
     m = DeepSpeech(n_feature=40, n_hidden=32, n_class=11)
     m.eval()
@@ -414,7 +398,6 @@ def test_deepspeech_forward_shape():
 
 def test_wav2letter_forward_shape():
     from tensorplay.audio.models import Wav2Letter
-    # torchaudio 2.11 signature: Wav2Letter(num_classes, input_type, num_features)
     m = Wav2Letter(num_classes=11, num_features=1)
     m.eval()
     with torch.no_grad():
@@ -434,7 +417,7 @@ def test_datasets_importable():
 
 
 # ---------------------------------------------------------------------------
-# CUDA parity (skipped when no GPU)
+# CUDA behavior checks (skipped when no GPU)
 # ---------------------------------------------------------------------------
 
 CUDA = pytest.mark.skipif(not (hasattr(tp, "cuda") and tp.cuda.is_available()),
