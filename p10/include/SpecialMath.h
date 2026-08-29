@@ -21,11 +21,28 @@
 #endif
 #endif
 
+#ifndef TP_HOST_DEVICE_NOINLINE
+#ifdef __CUDACC__
+#define TP_HOST_DEVICE_NOINLINE __noinline__ __host__ __device__
+#else
+#define TP_HOST_DEVICE_NOINLINE
+#endif
+#endif
+
 namespace tensorplay {
 namespace special_math {
 
 template <typename T>
 TP_HOST_DEVICE inline T kPi() { return T(3.141592653589793238462643383279502884197169L); }
+
+// Infinity test that resolves the same way on the host toolchain and inside
+// device code: the global-namespace C spelling is not declared by every
+// host <cmath>, and the comparison form needs neither.
+template <typename T>
+TP_HOST_DEVICE inline bool is_infinite(T v) {
+  return v == std::numeric_limits<T>::infinity() ||
+         v == -std::numeric_limits<T>::infinity();
+}
 
 /* The next function is taken from  https://github.com/antelopeusersgroup/antelope_contrib/blob/master/lib/location/libgenloc/erfinv.c.
 Below is the copyright.
@@ -524,7 +541,7 @@ inline TP_HOST_DEVICE scalar_t calc_polygamma(scalar_t x, int n) {
  * See NOTICE for the licenses.
  */
 template <typename scalar_t>
-scalar_t ratevl(scalar_t x, const scalar_t num[], int64_t M,
+TP_HOST_DEVICE scalar_t ratevl(scalar_t x, const scalar_t num[], int64_t M,
     const scalar_t denom[], int64_t N) {
   // evaluating rational function, i.e., the ratio of two polynomials
   // the coefficients for numerator are given by `num` while coeffs for
@@ -532,7 +549,7 @@ scalar_t ratevl(scalar_t x, const scalar_t num[], int64_t M,
 
   int64_t i, dir;
   scalar_t y, num_ans, denom_ans;
-  scalar_t absx = std::fabs(x);
+  scalar_t absx = ::fabs(x);
   const scalar_t *p;
 
   if (absx > 1) {
@@ -570,7 +587,7 @@ scalar_t ratevl(scalar_t x, const scalar_t num[], int64_t M,
   }
   if (absx > 1) {
     i = N - M;
-    return std::pow(x, i) * num_ans / denom_ans;
+    return ::pow(x, static_cast<scalar_t>(i)) * num_ans / denom_ans;
   }
   else {
     return num_ans / denom_ans;
@@ -584,7 +601,7 @@ scalar_t ratevl(scalar_t x, const scalar_t num[], int64_t M,
  * https://www.boost.org/LICENSE_1_0.txt or see NOTICE.
  */
 template <typename scalar_t>
-static scalar_t lanczos_sum_expg_scaled(scalar_t x) {
+TP_HOST_DEVICE static scalar_t lanczos_sum_expg_scaled(scalar_t x) {
   // lanczos approximation
   static constexpr scalar_t lanczos_sum_expg_scaled_num[13] = {
     0.006061842346248906525783753964555936883222,
@@ -623,45 +640,45 @@ static scalar_t lanczos_sum_expg_scaled(scalar_t x) {
 }
 
 template <typename scalar_t>
-static scalar_t _igam_helper_fac(scalar_t a, scalar_t x) {
+TP_HOST_DEVICE static scalar_t _igam_helper_fac(scalar_t a, scalar_t x) {
   // compute x^a * exp(-a) / gamma(a)
   // corrected from (15) and (16) in [igam2] by replacing exp(x - a) with
   // exp(a - x).
 
   scalar_t ax, fac, res, num, numfac;
-  static scalar_t MAXLOG = std::is_same_v<scalar_t,double> ?
+  constexpr scalar_t MAXLOG = std::is_same_v<scalar_t,double> ?
     7.09782712893383996843E2 : 88.72283905206835;
-  static scalar_t EXP1 = 2.718281828459045;
-  static scalar_t lanczos_g = 6.024680040776729583740234375;
+  constexpr scalar_t EXP1 = 2.718281828459045;
+  constexpr scalar_t lanczos_g = 6.024680040776729583740234375;
 
-  if (std::fabs(a - x) > 0.4 * std::fabs(a)) {
-    ax = a * std::log(x) - x - std::lgamma(a);
+  if (::fabs(a - x) > 0.4 * ::fabs(a)) {
+    ax = a * ::log(x) - x - ::lgamma(a);
     if (ax < -MAXLOG) {
       return 0.0;
     }
-    return std::exp(ax);
+    return ::exp(ax);
   }
 
   fac = a + lanczos_g - 0.5;
-  res = std::sqrt(fac / EXP1) / lanczos_sum_expg_scaled(a);
+  res = ::sqrt(fac / EXP1) / lanczos_sum_expg_scaled(a);
 
   if ((a < 200) && (x < 200)) {
-    res *= std::exp(a - x) * std::pow(x / fac, a);
+    res *= ::exp(a - x) * ::pow(x / fac, a);
   }
   else {
     num = x - a - lanczos_g + 0.5;
     numfac = num / fac;
-    res *= std::exp(a * (std::log1p(numfac) - numfac) + x * (0.5 - lanczos_g) / fac);
+    res *= ::exp(a * (::log1p(numfac) - numfac) + x * (0.5 - lanczos_g) / fac);
   }
   return res;
 }
 
 template <typename scalar_t>
-static scalar_t _igam_helper_series(scalar_t a, scalar_t x) {
+TP_HOST_DEVICE static scalar_t _igam_helper_series(scalar_t a, scalar_t x) {
   // Compute igam using DLMF 8.11.4. [igam1]
-  static scalar_t MACHEP = std::is_same_v<scalar_t, double> ?
+  constexpr scalar_t MACHEP = std::is_same_v<scalar_t, double> ?
     1.11022302462515654042E-16 : 5.9604644775390625E-8;
-  static int MAXITER = 2000;
+  constexpr int MAXITER = 2000;
 
   int i;
   scalar_t ans, ax, c, r;
@@ -688,7 +705,7 @@ static scalar_t _igam_helper_series(scalar_t a, scalar_t x) {
 }
 
 template <typename scalar_t>
-static scalar_t _igamc_helper_series(scalar_t a, scalar_t x) {
+TP_HOST_DEVICE static scalar_t _igamc_helper_series(scalar_t a, scalar_t x) {
   // Compute igamc using DLMF 8.7.3 [igam1]. This is related to the series in
   // _igam_helper_series but extra care is taken to avoid cancellation.
 
@@ -696,26 +713,26 @@ static scalar_t _igamc_helper_series(scalar_t a, scalar_t x) {
   scalar_t fac = 1;
   scalar_t sum = 0;
   scalar_t term, logx;
-  static scalar_t MAXITER = 2000;
-  static scalar_t MACHEP = std::is_same_v<scalar_t, double> ?
+  constexpr int MAXITER = 2000;
+  constexpr scalar_t MACHEP = std::is_same_v<scalar_t, double> ?
     1.11022302462515654042E-16 : 5.9604644775390625E-8;
 
   for (n = 1; n < MAXITER; n++) {
     fac *= -x / n;
     term = fac / (a + n);
     sum += term;
-    if (std::fabs(term) <= MACHEP * std::fabs(sum)) {
+    if (::fabs(term) <= MACHEP * ::fabs(sum)) {
         break;
     }
   }
 
-  logx = std::log(x);
-  term = -std::expm1(a * logx - std::lgamma(1+a));
-  return term - std::exp(a * logx - std::lgamma(a)) * sum;
+  logx = ::log(x);
+  term = -::expm1(a * logx - ::lgamma(1+a));
+  return term - ::exp(a * logx - ::lgamma(a)) * sum;
 }
 
 template <typename scalar_t>
-static scalar_t _igam_helper_asymptotic_series(scalar_t a, scalar_t x, bool igam) {
+TP_HOST_DEVICE static scalar_t _igam_helper_asymptotic_series(scalar_t a, scalar_t x, bool igam) {
   // Compute igam/igamc using DLMF 8.12.3/8.12.4 [igam1]
   static constexpr scalar_t d[25][25] =
     {{-3.3333333333333333e-1, 8.3333333333333333e-2, -1.4814814814814815e-2,
@@ -946,7 +963,7 @@ static scalar_t _igam_helper_asymptotic_series(scalar_t a, scalar_t x, bool igam
 
   int k, n, sgn;
   int maxpow = 0;
-  static scalar_t MACHEP = std::is_same_v<scalar_t, double> ?
+  constexpr scalar_t MACHEP = std::is_same_v<scalar_t, double> ?
     1.11022302462515654042E-16 : 5.9604644775390625E-8;
   scalar_t lambda = x / a;
   scalar_t sigma = (x - a) / a;
@@ -964,15 +981,15 @@ static scalar_t _igam_helper_asymptotic_series(scalar_t a, scalar_t x, bool igam
   }
 
   if (lambda > 1) {
-    eta = std::sqrt(-2 * (std::log1p(sigma) - sigma));
+    eta = ::sqrt(-2 * (::log1p(sigma) - sigma));
   }
   else if (lambda < 1) {
-    eta = -std::sqrt(-2 * (std::log1p(sigma) - sigma));
+    eta = -::sqrt(-2 * (::log1p(sigma) - sigma));
   }
   else {
     eta = 0;
   }
-  res = 0.5 * std::erfc(sgn * eta * std::sqrt(a / 2));
+  res = 0.5 * ::erfc(sgn * eta * ::sqrt(a / 2));
 
   for (k = 0; k < 25; k++) {
     ck = d[k][0];
@@ -983,39 +1000,39 @@ static scalar_t _igam_helper_asymptotic_series(scalar_t a, scalar_t x, bool igam
       }
       ckterm = d[k][n]*etapow[n];
       ck += ckterm;
-      if (std::fabs(ckterm) < MACHEP * std::fabs(ck)) {
+      if (::fabs(ckterm) < MACHEP * ::fabs(ck)) {
         break;
       }
     }
     term = ck * afac;
-    absterm = std::fabs(term);
+    absterm = ::fabs(term);
     if (absterm > absoldterm) {
       break;
     }
     sum += term;
-    if (absterm < MACHEP * std::fabs(sum)) {
+    if (absterm < MACHEP * ::fabs(sum)) {
       break;
     }
     absoldterm = absterm;
     afac /= a;
   }
-  res += sgn * std::exp(-0.5 * a * eta * eta) * sum / std::sqrt(2 * (3.14159274101257324f) * a);
+  res += sgn * ::exp(-0.5 * a * eta * eta) * sum / ::sqrt(2 * (3.14159274101257324f) * a);
 
   return res;
 }
 
 template <typename scalar_t>
-static scalar_t _igamc_helper_continued_fraction(scalar_t a, scalar_t x) {
+TP_HOST_DEVICE static scalar_t _igamc_helper_continued_fraction(scalar_t a, scalar_t x) {
   // Compute igamc using DLMF 8.9.2. [igam1]
   int i;
   scalar_t ans, ax, c, yc, r, t, y, z;
   scalar_t pk, pkm1, pkm2, qk, qkm1, qkm2;
-  int MAXITER = 2000;
-  static scalar_t MACHEP = std::is_same_v<scalar_t, double> ?
+  constexpr int MAXITER = 2000;
+  constexpr scalar_t MACHEP = std::is_same_v<scalar_t, double> ?
     1.11022302462515654042E-16 : 5.9604644775390625E-8;
-  static scalar_t BIG = std::is_same_v<scalar_t,double> ?
+  constexpr scalar_t BIG = std::is_same_v<scalar_t,double> ?
     4.503599627370496e15 : 16777216.;
-  static scalar_t BIGINV = std::is_same_v<scalar_t,double> ?
+  constexpr scalar_t BIGINV = std::is_same_v<scalar_t,double> ?
     2.22044604925031308085e-16 : 5.9604644775390625E-8;
 
   ax = _igam_helper_fac(a, x);
@@ -1042,7 +1059,7 @@ static scalar_t _igamc_helper_continued_fraction(scalar_t a, scalar_t x) {
     qk = qkm1 * z - qkm2 * yc;
     if (qk != 0) {
       r = pk / qk;
-      t = std::fabs((ans - r) / r);
+      t = ::fabs((ans - r) / r);
       ans = r;
     }
     else {
@@ -1052,7 +1069,7 @@ static scalar_t _igamc_helper_continued_fraction(scalar_t a, scalar_t x) {
     pkm1 = pk;
     qkm2 = qkm1;
     qkm1 = qk;
-    if (std::fabs(pk) > BIG) {
+    if (::fabs(pk) > BIG) {
       pkm2 *= BIGINV;
       pkm1 *= BIGINV;
       qkm2 *= BIGINV;
@@ -1066,7 +1083,7 @@ static scalar_t _igamc_helper_continued_fraction(scalar_t a, scalar_t x) {
 }
 
 template <typename scalar_t>
-inline scalar_t calc_igammac(scalar_t a, scalar_t x) {
+TP_HOST_DEVICE_NOINLINE scalar_t calc_igammac(scalar_t a, scalar_t x) {
   /* the calculation of the regularized upper incomplete gamma function
    * is done differently based on the values of a and x:
    * - if x and/or a is at the boundary of defined region, then assign the
@@ -1079,10 +1096,10 @@ inline scalar_t calc_igammac(scalar_t a, scalar_t x) {
    */
   scalar_t absxma_a;
 
-  static scalar_t SMALL = 20.0;
-  static scalar_t LARGE = 200.0;
-  static scalar_t SMALLRATIO = 0.3;
-  static scalar_t LARGERATIO = 4.5;
+  constexpr scalar_t SMALL = 20.0;
+  constexpr scalar_t LARGE = 200.0;
+  constexpr scalar_t SMALLRATIO = 0.3;
+  constexpr scalar_t LARGERATIO = 4.5;
 
   // note that in SciPy, a and x are non-negative, with exclusive 0s (i.e.,
   // at most 1 of them can be 0), where igammac(0, x) = 0.0 iff x > 0.
@@ -1101,21 +1118,21 @@ inline scalar_t calc_igammac(scalar_t a, scalar_t x) {
   else if (x == 0) {
     return 1.0;
   }
-  else if (std::isinf(a)) {
-    if (std::isinf(x)) {
+  else if (is_infinite(a)) {
+    if (is_infinite(x)) {
       return std::numeric_limits<scalar_t>::quiet_NaN();
     }
     return 1.0;
   }
-  else if (std::isinf(x)) {
+  else if (is_infinite(x)) {
     return 0.0;
   }
 
-  absxma_a = std::fabs(x - a) / a;
+  absxma_a = ::fabs(x - a) / a;
   if ((a > SMALL) && (a < LARGE) && (absxma_a < SMALLRATIO)) {
      return _igam_helper_asymptotic_series(a, x, 0);
   }
-  else if ((a > LARGE) && (absxma_a < LARGERATIO / std::sqrt(a))) {
+  else if ((a > LARGE) && (absxma_a < LARGERATIO / ::sqrt(a))) {
      return _igam_helper_asymptotic_series(a, x, 0);
   }
 
@@ -1128,7 +1145,7 @@ inline scalar_t calc_igammac(scalar_t a, scalar_t x) {
     }
   }
   else if (x <= 0.5) {
-    if (-0.4 / std::log(x) < a) {
+    if (-0.4 / ::log(x) < a) {
       return 1.0 - _igam_helper_series(a, x);
     }
     else {
@@ -1146,7 +1163,7 @@ inline scalar_t calc_igammac(scalar_t a, scalar_t x) {
 }
 
 template <typename scalar_t>
-scalar_t calc_igamma(scalar_t a, scalar_t x) {
+TP_HOST_DEVICE_NOINLINE scalar_t calc_igamma(scalar_t a, scalar_t x) {
   /* the calculation of the regularized lower incomplete gamma function
    * is done differently based on the values of a and x:
    * - if x and/or a is at the boundary of defined region, then assign the
@@ -1158,10 +1175,10 @@ scalar_t calc_igamma(scalar_t a, scalar_t x) {
    * - otherwise, calculate the series from [igam2] eq (4)
    */
   scalar_t absxma_a;
-  static scalar_t SMALL = 20.0;
-  static scalar_t LARGE = 200.0;
-  static scalar_t SMALLRATIO = 0.3;
-  static scalar_t LARGERATIO = 4.5;
+  constexpr scalar_t SMALL = 20.0;
+  constexpr scalar_t LARGE = 200.0;
+  constexpr scalar_t SMALLRATIO = 0.3;
+  constexpr scalar_t LARGERATIO = 4.5;
 
   // boundary values following SciPy
   // note that in SciPy, a and x are non-negative, with exclusive 0s (i.e.,
@@ -1181,22 +1198,22 @@ scalar_t calc_igamma(scalar_t a, scalar_t x) {
   else if (x == 0) {
     return 0.0; // zero integration limit
   }
-  else if (std::isinf(a)) {
-    if (std::isinf(x)) {
+  else if (is_infinite(a)) {
+    if (is_infinite(x)) {
       return std::numeric_limits<scalar_t>::quiet_NaN();
     }
     return 0.0;
   }
-  else if (std::isinf(x)) {
+  else if (is_infinite(x)) {
     return 1.0;
   }
 
   /* Asymptotic regime where a ~ x. See [igam2] */
-  absxma_a = std::fabs(x - a) / a;
+  absxma_a = ::fabs(x - a) / a;
   if ((a > SMALL) && (a < LARGE) && (absxma_a < SMALLRATIO)) {
     return _igam_helper_asymptotic_series(a, x, 1);
   }
-  else if ((a > LARGE) && (absxma_a < LARGERATIO / std::sqrt(a))) {
+  else if ((a > LARGE) && (absxma_a < LARGERATIO / ::sqrt(a))) {
     return _igam_helper_asymptotic_series(a, x, 1);
   }
 
@@ -1368,7 +1385,7 @@ inline std::tuple<const T*, size_t> chebyshev_coefficients_i0e_B() {
 }
 
 template <typename T>
-inline typename std::enable_if_t<std::is_same_v<double, T>, std::tuple<const T*, size_t>>
+TP_HOST_DEVICE inline typename std::enable_if_t<std::is_same_v<double, T>, std::tuple<const T*, size_t>>
 chebyshev_coefficients_i1e_A() {
   /* Chebyshev coefficients for exp(-x) I1(x)
    * in the interval [0,8].
@@ -1395,7 +1412,7 @@ chebyshev_coefficients_i1e_A() {
 }
 
 template <typename T>
-inline typename std::enable_if_t<std::is_same_v<float, T>, std::tuple<const T*, size_t>>
+TP_HOST_DEVICE inline typename std::enable_if_t<std::is_same_v<float, T>, std::tuple<const T*, size_t>>
 chebyshev_coefficients_i1e_A() {
   /* Chebyshev coefficients for exp(-x) I1(x)
    * in the interval [0,8].
@@ -1424,7 +1441,7 @@ chebyshev_coefficients_i1e_A() {
 }
 
 template <typename T>
-inline typename std::enable_if_t<std::is_same_v<double, T>, std::tuple<const T*, size_t>>
+TP_HOST_DEVICE inline typename std::enable_if_t<std::is_same_v<double, T>, std::tuple<const T*, size_t>>
 chebyshev_coefficients_i1e_B() {
   /* Chebyshev coefficients for exp(-x) sqrt(x) I1(x)
    * in the inverted interval [8,infinity].
@@ -1450,7 +1467,7 @@ chebyshev_coefficients_i1e_B() {
 }
 
 template <typename T>
-inline typename std::enable_if_t<std::is_same_v<float, T>, std::tuple<const T*, size_t>>
+TP_HOST_DEVICE inline typename std::enable_if_t<std::is_same_v<float, T>, std::tuple<const T*, size_t>>
 chebyshev_coefficients_i1e_B() {
   /* Chebyshev coefficients for exp(-x) sqrt(x) I1(x)
    * in the inverted interval [8,infinity].
@@ -1527,25 +1544,24 @@ inline tensorplay::Half calc_i1(tensorplay::Half a) { return calc_i1(static_cast
  * of all inputs to convert them into the domain of the approximation.
  */
 template <typename T>
-inline typename std::enable_if_t<std::is_floating_point_v<T>, T>
+TP_HOST_DEVICE inline typename std::enable_if_t<std::is_floating_point_v<T>, T>
 calc_i1e(T _x) {
-  T x = std::abs(_x);
+  const T x = std::abs(_x);
 
   if (x <= T{8.0}) {
     auto [A, len] = chebyshev_coefficients_i1e_A<T>();
-    T y = (x / T{2.0}) - T{2.0};
+    const T y = (x / T{2.0}) - T{2.0};
     const T out = chbevl(y, A, len) * x;
     return (_x < T{0.0}) ? -out : out;
   }
   auto [B, len] = chebyshev_coefficients_i1e_B<T>();
-  const auto out = chbevl(T{32.0} / x - T{2.0}, B, len) / std::sqrt(x);
+  const T out = chbevl(T{32.0} / x - T{2.0}, B, len) / ::sqrt(x);
   return (_x < T{0.0}) ? -out : out;
 }
 
 // Upcast bfloat16/half input to float for numerical accuracy purposes
 inline tensorplay::BFloat16 calc_i1e(tensorplay::BFloat16 a) { return calc_i1e(static_cast<float>(a)); }
 inline tensorplay::Half calc_i1e(tensorplay::Half a) { return calc_i1e(static_cast<float>(a)); }
-
 
 /*
  * This function is derived from the implementation of the i1e function in the Cephes Math Library.
@@ -2203,6 +2219,57 @@ inline TP_HOST_DEVICE T calc_log_ndtr(T x) {
   }
 }
 
+/*
+ * Gaussian cumulative distribution function,
+ *   Phi(x) = erfc(-x / sqrt(2)) / 2.
+ * The equivalent (1 + erf(x/sqrt(2)))/2 cancels the whole left tail away:
+ * erf saturates at -1 by x = -8.3, so everything below that would come back
+ * as exactly zero.  Through erfc the tail keeps full relative accuracy until
+ * the result itself underflows near x = -38; below that log_ndtr is the form
+ * that still carries digits.
+ */
+template <typename T>
+inline TP_HOST_DEVICE T calc_ndtr(T x) {
+  T t = x * T(0.70710678118654752440084436210484903928483593768847);
+  return T(0.5) * std::erfc(-t);
+}
+
+/*
+ * Entropy term -x * log(x) of a single probability element.
+ * Defined as 0 at x == 0 (the limit) and -inf for x < 0, where the term has
+ * no real value; NaN propagates.
+ */
+template <typename T>
+inline TP_HOST_DEVICE T calc_entr(T x) {
+  if (x != x) return x;
+  if (x > T(0)) return -x * std::log(x);
+  if (x == T(0)) return T(0);
+  return -std::numeric_limits<T>::infinity();
+}
+
+/*
+ * x * log(y) with the convention 0 * log(y) = 0 for every finite or infinite
+ * y. A NaN y still poisons the result, so the zero shortcut is taken only
+ * after the NaN test.
+ */
+template <typename T>
+inline TP_HOST_DEVICE T calc_xlogy(T x, T y) {
+  if (y != y) return y;
+  if (x == T(0)) return T(0);
+  return x * std::log(y);
+}
+
+/*
+ * x * log1p(y), the same convention as calc_xlogy shifted by one so the
+ * singular point sits at y == -1.
+ */
+template <typename T>
+inline TP_HOST_DEVICE T calc_xlog1py(T x, T y) {
+  if (y != y) return y;
+  if (x == T(0)) return T(0);
+  return x * std::log1p(y);
+}
+
 template<typename T>
 inline TP_HOST_DEVICE T airy_ai_forward(T x) {
     static const T AN[] = {
@@ -2282,7 +2349,7 @@ inline TP_HOST_DEVICE T airy_ai_forward(T x) {
 
     T ai = T(0.0);
 
-    if (std::isinf(x)) {
+    if (is_infinite(x)) {
         return std::numeric_limits<T>::quiet_NaN();
     }
 
@@ -3088,7 +3155,7 @@ inline TP_HOST_DEVICE T hermite_polynomial_h_forward(T x, T n) {
 
 template<typename T, bool is_cuda=false, std::enable_if_t<std::is_floating_point_v<T>, int> = 0>
 inline TP_HOST_DEVICE T hermite_polynomial_h_forward(T x, T n) {
-    return hermite_polynomial_h_forward(x, (!std::isinf(n) && !std::isnan(n)) ? static_cast<int64_t>(n) : static_cast<int64_t>(-1));
+    return hermite_polynomial_h_forward(x, (!is_infinite(n) && !std::isnan(n)) ? static_cast<int64_t>(n) : static_cast<int64_t>(-1));
 } // hermite_polynomial_h_forward(T x, T n)
 
 template<typename T>
@@ -3912,7 +3979,7 @@ inline TP_HOST_DEVICE T shifted_chebyshev_polynomial_w_forward(T x, T n) {
 
 template<typename T>
 inline TP_HOST_DEVICE T spherical_bessel_j0_forward(T x) {
-    if (std::isinf(x)) {
+    if (is_infinite(x)) {
         return T(0.0);
     }
 
