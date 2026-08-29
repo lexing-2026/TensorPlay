@@ -1,5 +1,5 @@
 # mypy: allow-untyped-defs
-r"""NCCL collectives on CUDA tensors, mirroring :mod:`torch.cuda.nccl`.
+r"""NCCL collective-operation shims.
 
 Requires NCCL bindings this TensorPlay build does not expose; every public
 name reports availability honestly via :func:`is_available`.

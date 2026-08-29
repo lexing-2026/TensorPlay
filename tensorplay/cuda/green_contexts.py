@@ -1,5 +1,5 @@
 # mypy: allow-untyped-defs
-r"""Green contexts, mirroring :mod:`torch.cuda.green_contexts`.
+r"""
 
 Green context partitioning requires driver-level support this TensorPlay
 build does not expose.

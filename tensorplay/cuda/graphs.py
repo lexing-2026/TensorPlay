@@ -1,12 +1,11 @@
 # mypy: allow-untyped-defs
-r"""CUDA graph capture, mirroring :mod:`torch.cuda.graphs`.
+r"""CUDA graph capture and replay helpers.
 
 Backed by the native :class:`tensorplay._C.CUDAGraph` class (capture on a
 dedicated side stream or a user-supplied one, graph-private allocator pools
 shareable across graphs, eager instantiation at ``capture_end``, replay of the
 cached executable, graph-safe RNG refresh per replay).
 
-Typical use follows torch.cuda.graph::
 
     g = tensorplay.cuda.CUDAGraph()
     static_input = x.clone()
@@ -26,7 +25,6 @@ Static input/output tensors must stay alive for as long as the graph; their
 addresses are baked into the executable.  Random ops captured inside the graph
 read their (seed, offset) from a graph-owned device buffer that every
 :meth:`CUDAGraph.replay` refreshes from the generator, so each replay draws a
-fresh, disjoint slice of the random stream (mirroring torch's graph-safe RNG).
 """
 
 import contextlib
@@ -82,7 +80,6 @@ def _resolve_pool(pool):
 
 
 class CUDAGraph:
-    r"""Wrapper around a CUDA graph, mirroring ``torch.cuda.CUDAGraph``."""
 
     def __init__(self):
         self._c = _native().CUDAGraph()
@@ -316,9 +313,8 @@ def export_dot(file_path: str) -> str:
     return file_path
 
 
-# --- minimal pytree (tree_flatten/tree_unflatten parity) ---------------------
+# --- minimal pytree (tree_flatten/tree_unflatten compatibility) -------------
 #
-# torch leans on torch.utils._pytree; TensorPlay ships no pytree module, so a
 # small structural flatten covers the tensor/tuple/list/dict shapes that
 # make_graphed_callables deals with.
 
@@ -370,13 +366,11 @@ def make_graphed_callables(
 ):
     r"""Callables that run per-iteration with CUDA graph capture.
 
-    Port of ``torch.cuda.make_graphed_callables``: captures each callable's
     forward (and backward, via :func:`tensorplay.autograd.grad`) into CUDA
     graphs sharing one private memory pool, then wraps them in autograd
     Functions whose forward/backward are graph replays.  Per-iteration host
     overhead drops to two graph launches.
 
-    See torch's documentation for the full contract.  Key requirements
     carried over verbatim: ``sample_args`` must contain only Tensors whose
     ``requires_grad`` matches the live workload; modules may not carry hooks
     or trainable buffers; arguments must keep their order and shapes.
@@ -478,7 +472,6 @@ def make_graphed_callables(
     tp.cuda.synchronize()
 
     # Captures share one mempool, so capture in live order:
-    # fwd 1..N, then bwd N..1 (torch's corruption-avoidance rule).
 
     per_callable_static_outputs = []
     per_callable_output_unflatten_spec = []
@@ -580,7 +573,6 @@ def make_graphed_autograd_function(
 ):
     r"""Wrap captured forward/backward graphs in one autograd Function.
 
-    Port of ``torch.cuda.make_graphed_autograd_function``: returns a callable
     whose forward stages fresh user args onto the captured static inputs and
     replays the forward graph; its backward (once-differentiable) stages
     incoming grads and replays the backward graph.

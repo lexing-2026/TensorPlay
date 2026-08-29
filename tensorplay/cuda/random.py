@@ -1,5 +1,5 @@
 # mypy: allow-untyped-defs
-r"""CUDA random number generation, mirroring :mod:`torch.cuda.random`.
+r"""CUDA random-number generator helpers.
 
 Seeding APIs drive the per-device generators of the native runtime. State
 introspection (``get_rng_state``/``set_rng_state``) requires per-device
