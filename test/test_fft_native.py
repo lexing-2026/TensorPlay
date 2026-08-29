@@ -73,3 +73,35 @@ def test_fft2_native_cuda(operation):
     cpu = getattr(tp.fft, operation)(cpu_value, s=[5, 6], dim=[-2, -1])
     np.testing.assert_allclose(
         as_numpy(result), as_numpy(cpu), rtol=2e-5, atol=2e-5)
+
+
+@pytest.mark.parametrize("operation", ["fft2", "ifft2", "rfft2", "irfft2"])
+def test_fft2_native_autograd(operation):
+    devices = ["cpu"]
+    if tp.cuda.is_available():
+        devices.append("cuda")
+    rng = np.random.default_rng(15)
+    backward_name = {
+        "fft2": "fft_fft2_backward",
+        "ifft2": "fft_ifft2_backward",
+        "rfft2": "fft_rfft2_backward",
+        "irfft2": "fft_irfft2_backward",
+    }[operation]
+    for device in devices:
+        if operation == "irfft2":
+            array = rng.standard_normal((2, 3, 3)) + 1j * rng.standard_normal((2, 3, 3))
+        elif operation in {"fft2", "ifft2"}:
+            array = rng.standard_normal((2, 3, 4)) + 1j * rng.standard_normal((2, 3, 4))
+        else:
+            array = rng.standard_normal((2, 3, 4))
+        value = as_tensor(array, device).requires_grad_(True)
+        result = getattr(tp.fft, operation)(value, s=[3, 4], dim=[1, 2], norm="ortho")
+        if operation == "irfft2":
+            gradient_array = rng.standard_normal(tuple(result.shape))
+        else:
+            gradient_array = rng.standard_normal(tuple(result.shape)) + 1j * rng.standard_normal(tuple(result.shape))
+        gradient = as_tensor(gradient_array, device)
+        result.backward(gradient)
+        expected = getattr(tp, backward_name)(gradient, value, [3, 4], [1, 2], "ortho")
+        np.testing.assert_allclose(
+            as_numpy(value.grad), as_numpy(expected), rtol=2e-5, atol=2e-5)

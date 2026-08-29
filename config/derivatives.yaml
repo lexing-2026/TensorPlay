@@ -823,6 +823,18 @@
 
 # ===========================================================================
 # ===========================================================================
+- name: fft_fft2(Tensor self, int[]? s=None, int[] dim=[-2,-1], str norm="backward") -> Tensor
+  self: tensorplay::tpx::ops::fft_fft2_backward(grad, self, s, dim, norm)
+
+- name: fft_ifft2(Tensor self, int[]? s=None, int[] dim=[-2,-1], str norm="backward") -> Tensor
+  self: tensorplay::tpx::ops::fft_ifft2_backward(grad, self, s, dim, norm)
+
+- name: fft_rfft2(Tensor self, int[]? s=None, int[] dim=[-2,-1], str norm="backward") -> Tensor
+  self: tensorplay::tpx::ops::fft_rfft2_backward(grad, self, s, dim, norm)
+
+- name: fft_irfft2(Tensor self, int[]? s=None, int[] dim=[-2,-1], str norm="backward") -> Tensor
+  self: tensorplay::tpx::ops::fft_irfft2_backward(grad, self, s, dim, norm)
+
 - name: fft_fft(Tensor self, SymInt n=-1, int dim=-1, str norm="backward") -> Tensor
   self: tensorplay::tpx::ops::fft_fft_backward(grad, self, dim, norm)
 
