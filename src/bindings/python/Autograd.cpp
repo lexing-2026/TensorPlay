@@ -26,7 +26,6 @@ public:
     PyNode(py::object py_ctx) : py_ctx_(std::move(py_ctx)) {}
 
     // Backward input slots correspond to forward OUTPUTS for custom
-    // functions (torch CustomFunctionNode semantics), so the engine sizes
     // this node's incoming gradient buffer by the attached output count.
     size_t num_inputs() const override {
         return output_metas().empty() ? Node::num_inputs()
@@ -163,7 +162,6 @@ void init_autograd(py::module_& m) {
                 // tensor output as requiring grad and wires this node as
                 // its grad_fn.  Non-tensor slots are skipped so multi-output
                 // functions can return Nones mixed with Tensors.  Also
-                // records torch-style per-output InputMetadata used by the
                 // engine to zero-fill missing gradients.
                 auto node = std::shared_ptr<tensorplay::tpx::Node>(
                     std::static_pointer_cast<tensorplay::tpx::Node>(
@@ -210,7 +208,6 @@ void init_autograd(py::module_& m) {
         return result;
     });
 
-        // Mirror of torch's unpack_input(): one C++ pass over the flat argument
     // tuple producing needs_input_grad bits AND wiring this node's
     // next_edges.  Returns (needs_list, any_requires_grad) so the Python
     // layer avoids N per-input pybind round-trips.
@@ -425,8 +422,6 @@ void init_autograd(py::module_& m) {
         std::vector<Tensor> grads;
         if (grad_outputs) grads = *grad_outputs;
         // Undefined gradients (unused inputs, or grads that arrive as
-        // undefined through the graph) surface as None, matching torch.
-        // torch.autograd.grad returns a tuple; functional.py's vjp/jvp rely
         // on it.
         std::vector<tensorplay::Tensor> captured;
         {
@@ -446,10 +441,8 @@ void init_autograd(py::module_& m) {
     autograd.def("is_grad_enabled", &tensorplay::tpx::GradMode::is_enabled);
     autograd.def("set_grad_enabled", &tensorplay::tpx::GradMode::set_enabled);
 
-    // Inference mode (mirrors torch._C._InferenceMode): a context object the
     // Python wrapper drives through __enter__/__exit__. Entering disables
     // autograd recording and freezes version counters; exit restores the
-    // previous state so nested contexts behave like torch's guard stack.
     struct PyInferenceMode {
         bool prev_ = false;
         explicit PyInferenceMode(bool mode) {
@@ -471,7 +464,6 @@ void init_autograd(py::module_& m) {
 
     autograd.def("is_inference_mode_enabled", &tensorplay::tpx::InferenceMode::is_enabled);
 
-    // Anomaly mode (mirrors torch._C._autograd anomaly bindings). Node
     // creation happens deep inside C++ op wrappers while the calling thread
     // holds the GIL, so capturing the Python traceback at that point records
     // the user-level call site of each forward op.
@@ -488,7 +480,6 @@ void init_autograd(py::module_& m) {
     py::module_ parallel = m.def_submodule("parallel", "Parallel computing");
 
     // Install the anomaly-mode stack capturer: records the Python traceback
-    // of the forward op call site (mirrors torch's PyAnomalyMetadata, which
     // overrides the C++ backtrace default for the Python engine).
     tensorplay::tpx::set_anomaly_stack_capture([]() -> std::string {
         if (!Py_IsInitialized()) return {};

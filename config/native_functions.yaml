@@ -249,8 +249,6 @@
   dispatch:
     CPU: foreach_adam_cpu
 
-# AMP support, mirroring torch._amp_foreach_non_finite_check_and_unscale_ and
-# torch._amp_update_scale_.  The foreach kernel checks every grad for
 # inf/NaN: if any non-finite value is found, found_inf is set to 1 and no
 # grad is rescaled; otherwise every grad is multiplied in place by inv_scale.
 - func: _amp_foreach_non_finite_check_and_unscale_(Tensor(a!)[] self, Tensor(b!) found_inf, Tensor inv_scale) -> ()
@@ -263,9 +261,7 @@
   dispatch:
     CPU: _amp_update_scale_cpu
 
-# Torch's fused optimizer entry points.  The underscore is part of the
 # operator name: these mutate every tensor list in one backend launch and
-# return void, just like ATen's fused kernels.
 - func: _fused_adam_(Tensor(a!)[] self, Tensor(b!)[] grads, Tensor(c!)[] exp_avgs, Tensor(d!)[] exp_avg_sqs, Tensor(e!)[] max_exp_avg_sqs, Tensor[] state_steps, *, float lr, float beta1, float beta2, float weight_decay, float eps, bool amsgrad, bool maximize, Tensor? grad_scale=None, Tensor? found_inf=None, bool exact=False) -> ()
   variants: function
   dispatch: {CPU: fused_adam_cpu, CUDA: fused_adam_cuda}
@@ -295,7 +291,6 @@
   device_check: NoCheck
   dispatch: {CPU: fused_adagrad_tensor_lr_cpu, CUDA: fused_adagrad_tensor_lr_cuda}
 
-# Native CPU algorithm kernels for optimizers whose Torch implementation is
 # composed from many foreach calls.  Python keeps the existing foreach/single
 # paths for unsupported layouts, CUDA graph capture, complex tensors, and
 # differentiable mode; contiguous CPU floating groups take one backend call
@@ -337,7 +332,6 @@
   device_check: NoCheck
   dispatch: {CPU: fused_adafactor_factored_cpu, CUDA: fused_adafactor_factored_cuda}
 
-# Public Torch foreach primitives.  The optimizer fast paths above are fused
 # algorithm kernels; these schemas cover the list-wise arithmetic building
 # blocks used by the remaining optimizer source ports and by user code.
 - func: _foreach_add.Scalar(Tensor[] self, Scalar scalar) -> Tensor[]
@@ -651,7 +645,6 @@
     CPU: div_scalar_cpu
     CUDA: div_scalar_cuda
 
-# Optimizer source ports use Torch's fused compound arithmetic methods.  Keep
 # them as native dispatches so the Python optimizer never materializes the
 # product/quotient through a Python-level composite implementation.
 - func: addcmul(Tensor self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor
@@ -674,7 +667,6 @@
   dispatch:
     CPU: addcdiv_inplace_cpu
 
-# Native comparison/selection dependencies used by Torch's differentiable
 # optimizer paths.  Keep all overloads in the dispatcher; the generated
 # Python functional surface is only a thin binding to these kernels.
 - func: where.self(Tensor condition, Tensor self, Tensor other) -> Tensor
@@ -711,7 +703,6 @@
   dispatch:
     CPU: minimum_cpu
 
-# Complex/real reinterpretation views used by Torch optimizer kernels.  These
 # are metadata-only views: the backend must preserve storage and the shared
 # version counter rather than materializing a copy.
 - func: view_as_real(Tensor self) -> Tensor
@@ -763,7 +754,6 @@
   dispatch:
     CPU: matmul_backward_other_kernel
 
-# Batched GEMM family, mirroring torch's BLAS3 surface.
 - func: bmm(Tensor self, Tensor mat2) -> Tensor
   variants: function, method
   dispatch:
@@ -804,11 +794,8 @@
   dispatch:
     CPU: outer_kernel
 
-# CompositeImplicitAutograd like torch: the kernel is expressed through
 # differentiable primitives, so autograd is derived from the inner calls.
-# The Python layer mirrors torch.functional.einsum (sublist parsing); with
 # no explicit path and >2 operands the kernel plans the contraction order
-# natively (exact search for small counts, greedy beyond) -- torch instead
 # depends on the optional opt-einsum package or degrades to left-to-right.
 - func: einsum(str equation, Tensor[] operands, int[] path=[]) -> Tensor
   python_defaults: {path: '[]'}
@@ -1062,7 +1049,6 @@
 - func: bernoulli(Tensor self) -> Tensor
   variants: method, function
 
-# Fused dropout forward (torch's native_dropout): returns the scaled output
 # and the bool keep-mask. The public F.dropout gates training/p==0/p==1 and
 # calls this; autograd flows through the generated node whose formula is
 # grad * mask / (1 - p).
@@ -1107,11 +1093,9 @@
     CPU: feature_dropout_backward_cpu
     CUDA: feature_dropout_backward_cuda
 
-# Quantile family (ATen native/Sorting.cpp quantile_impl): device-generic
-# composite over sort/gather/lerp -- upstream's CPU nth_element fast path is
+# composite over sort/gather/lerp -- the CPU nth_element fast path is
 # a pure optimization and the sort path is semantically identical, so one
 # body serves both dense backends (Einsum.cpp registration precedent).
-# No derivatives.yaml entry upstream: torch.quantile is non-differentiable.
 - func: quantile(Tensor self, Tensor q, int? dim=None, bool keepdim=False, *, str interpolation="linear") -> Tensor
   variants: function
   dispatch:
@@ -1122,10 +1106,9 @@
   dispatch:
     CPU: nanquantile_kernel
 
-# Histogram (ATen native/Histogram.cpp + cpu/HistogramKernel.cpp): returns
 # (hist, bin_edges) in the input dtype.  The per-element bin mapping for both
 # the bins-tensor path (BINARY_SEARCH) and the linspace-edges path
-# (LINEAR_INTERPOLATION_WITH_LOCAL_SEARCH, documented upstream to match
+# (LINEAR_INTERPOLATION_WITH_LOCAL_SEARCH, documented to match
 # BINARY_SEARCH exactly) is expressed with searchsorted over the edge tensor;
 # weight accumulation goes through the dispatched index_add, so the same body
 # registers for CPU and CUDA.
@@ -1139,7 +1122,6 @@
   dispatch:
     CPU: histogram_bin_ct_kernel
 
-# Trapezoid integration (ATen native Sum.cpp trapezoid/cumulative_trapezoid):
 # forward is a weighted sum along `dim`; x=None selects uniform spacing dx.
 # Backward rebuilds the per-element weights from x / ysizes and reuses
 # dispatched arithmetic.
@@ -1167,7 +1149,6 @@
     CPU: cumulative_trapezoid_backward_cpu
     CUDA: cumulative_trapezoid_backward_cuda
 
-# torch.gradient (ATen Gradient.cpp): upstream registers gradient.* with no
 # dispatch section, i.e. the default CompositeImplicitAutograd -- forward is a
 # pure composition of differentiable primitives (narrow/sub/mul/div/cat), no
 # derivatives.yaml entry exists and every returned tensor keeps the grad_fn
@@ -1176,18 +1157,15 @@
 # under the backend-neutral Composite key; OperatorHandle::getKernel serves it
 # to every dense backend until overridden (p10/include/Dispatcher.h).
 # spacing/dim are non-optional lists on purpose: empty = "all dims with unit
-# step"; the Python wrapper (functional.gradient) normalizes torch's scalar /
 # tensor / tuple surface into these lists.
 - func: gradient(Tensor self, Tensor[] spacing=[], int[] dim=[], int edge_order=1) -> Tensor[]
   variants: function
   dispatch:
     Composite: gradient_composite
 
-# Covariance / correlation (ATen native Correlation.cpp verbatim): each row
 # a variable, each column an observation; fweights are frequencies
 # (integral), aweights reliability weights (floating); arithmetic stays in
 # the input dtype. Backwards are explicit helpers — tp has no
-# composite-implicit-autograd, formulas validated vs torch autograd.
 - func: cov(Tensor self, *, int correction=1, Tensor? fweights=None, Tensor? aweights=None) -> Tensor
   variants: function, method
   dispatch:
@@ -1214,7 +1192,6 @@
 
 # resize_ grows the storage in place when needed (preserving contents) and
 # adopts contiguous strides; shrinking is logical-only. Non-differentiable,
-# matching torch.
 - func: resize_(Tensor(a!) self, int[] size) -> Tensor(a!)
   variants: method
   dispatch:
@@ -1754,7 +1731,6 @@
   dispatch:
     Composite: max_pool2d_composite
 
-# ATen max_pool3d (aten/src/ATen/native/MaxPooling.cpp): 5-D (N, C, D, H, W)
 # or unbatched 4-D input; indices are linear offsets into the (D, H, W) volume.
 - func: max_pool3d(Tensor input, int[] kernel_size, int[] stride=[], int[] padding=[], int[] dilation=[], bool ceil_mode=false) -> Tensor
   python_defaults: {dilation: '[1, 1, 1]', padding: '[0, 0, 0]', stride: '[]'}
@@ -1783,26 +1759,30 @@
     CPU: avg_pool2d_cpu
 
 - func: avg_pool3d(Tensor input, int[] kernel_size, int[] stride=[], int[] padding=[], bool ceil_mode=false, bool count_include_pad=true, int? divisor_override=None) -> Tensor
-  python_defaults: {padding: '[0, 0]', stride: '[]'}
+  python_defaults: {padding: '[0, 0, 0]', stride: '[]'}
   variants: function
   dispatch:
     CPU: avg_pool3d_cpu
+    CUDA: avg_pool3d_native_cuda
 
 - func: avg_pool3d_backward(Tensor grad_output, Tensor input, int[] kernel_size, int[] stride=[], int[] padding=[], bool ceil_mode=false, bool count_include_pad=true, int? divisor_override=None) -> Tensor
-  python_defaults: {padding: '[0, 0]', stride: '[]'}
+  python_defaults: {padding: '[0, 0, 0]', stride: '[]'}
   variants: function
   dispatch:
     CPU: avg_pool3d_backward_cpu
+    CUDA: avg_pool3d_backward_native_cuda
 
 - func: adaptive_avg_pool3d(Tensor input, int[] output_size) -> Tensor
   variants: function
   dispatch:
     CPU: adaptive_avg_pool3d_cpu
+    CUDA: adaptive_avg_pool3d_native_cuda
 
 - func: adaptive_avg_pool3d_backward(Tensor grad_output, Tensor input) -> Tensor
   variants: function
   dispatch:
     CPU: adaptive_avg_pool3d_backward_cpu
+    CUDA: adaptive_avg_pool3d_backward_native_cuda
 
 - func: adaptive_avg_pool2d(Tensor input, int[] output_size) -> Tensor
   variants: function
@@ -1814,7 +1794,6 @@
   dispatch:
     Composite: adaptive_max_pool2d_composite
 
-# ATen adaptive_max_pool2d returns (values, indices); exposing the pair lets
 # autograd save indices and scatter in the backward (no argmax recompute).
 - func: adaptive_max_pool2d_with_indices(Tensor input, int[] output_size) -> (Tensor output, Tensor indices)
   variants: function
@@ -1822,7 +1801,6 @@
     CPU: adaptive_max_pool2d_with_indices_cpu
     CUDA: adaptive_max_pool2d_with_indices_cuda
 
-# ATen adaptive_max_pool3d (aten/src/ATen/native/AdaptiveMaxPooling3d.cpp):
 # floor/ceil bin bounds identical to adaptive avg pool 3d.
 - func: adaptive_max_pool3d(Tensor input, int[] output_size) -> Tensor
   variants: function
@@ -1830,7 +1808,6 @@
     CPU: adaptive_max_pool3d_cpu
     CUDA: adaptive_max_pool3d_cuda
 
-# ATen fractional_max_pool (aten/src/ATen/native/FractionalMaxPool2d.cpp,
 # cuda/FractionalMaxPool2d.cu): stochastic-step max pooling whose intervals
 # derive from the caller-provided random_samples tensor (no internal RNG).
 # indices are flat in-plane offsets (h * W + w / (d * H + h) * W + w), int64.
@@ -1858,11 +1835,9 @@
     CPU: fractional_max_pool3d_backward_cpu
     CUDA: fractional_max_pool3d_backward_cuda
 
-# ATen max_unpool (aten/src/ATen/native/MaxUnpooling.cpp, cpu/MaxUnpoolKernel.cpp,
 # cuda/MaxUnpooling.cu): partial inverse of max_pool*_with_indices. Scatters
 # pooled values into a zero canvas at the flat in-plane int64 indices; the
 # backward gathers grad_output at those same positions. max_unpool3d carries
-# stride/padding for API parity with ATen (validation only).
 - func: max_unpool2d(Tensor self, Tensor indices, int[] output_size) -> Tensor
   variants: function
   dispatch:
@@ -1887,7 +1862,6 @@
     CPU: max_unpool3d_backward_cpu
     CUDA: max_unpool3d_backward_cuda
 
-# ATen grid_sampler (aten/src/ATen/native/cuda/GridSampler.cu,
 # cpu/GridSamplerKernel.cpp): resamples input at sub-pixel locations given a
 # normalized flow-field grid. interpolation_mode: 0=Bilinear 1=Nearest
 # 2=Bicubic; padding_mode: 0=Zeros 1=Border 2=Reflection. backward's
@@ -1926,7 +1900,6 @@
   dispatch:
     CPU: nll_loss_backward_kernel
 
-# ATen nll_loss2d (aten/src/ATen/native/LossNLL.cpp): (N, C, H, W) input with
 # (N, H, W) target; every spatial position is an independent batch row.
 - func: nll_loss2d(Tensor self, Tensor target, Tensor? weight=None, int reduction=1, int ignore_index=-100) -> (Tensor output, Tensor total_weight)
   variants: function
@@ -1940,20 +1913,20 @@
     CPU: nll_loss2d_backward_kernel
     CUDA: nll_loss2d_backward_cuda
 
-# CTC loss native kernels (port of aten/src/ATen/native/LossCTC.cpp CPU).
 # Targets use the batch-first zero-padded layout (N, S); lengths are (N,)
 # int64 tensors. `_ctc_loss` returns the raw per-sequence NLL (impossible
 # alignments keep +inf; `zero_infinity` gates only the backward's grad
-# zeroing, mirroring ATen) together with the log-alpha table (N, T, 2S+1).
 - func: _ctc_loss(Tensor log_probs, Tensor targets, Tensor input_lengths, Tensor target_lengths, int blank=0, bool zero_infinity=False) -> (Tensor neg_log_likelihood, Tensor log_alpha)
   variants: function
   dispatch:
     CPU: _ctc_loss_cpu
+    CUDA: _ctc_loss_cuda
 
 - func: _ctc_loss_backward(Tensor grad, Tensor log_probs, Tensor targets, Tensor input_lengths, Tensor target_lengths, Tensor neg_log_likelihood, Tensor log_alpha, int blank, bool zero_infinity) -> Tensor
   variants: function
   dispatch:
     CPU: _ctc_loss_backward_cpu
+    CUDA: _ctc_loss_backward_cuda
 
 - func: mse_loss(Tensor self, Tensor target, int reduction=1) -> Tensor
   variants: function
@@ -2086,8 +2059,6 @@
     CPU: sdpa_backward_kernel_cpu
 
 # ---------------------------------------------------------------------------
-# Torch-aligned loss family (kernels: p10/src/backend/cpu/LossKernels.cpp,
-# cuda/LossKernels.cu). Signatures follow torch.nn.functional; reduction is
 # the enum form (0=none, 1=mean, 2=sum).
 # ---------------------------------------------------------------------------
 
@@ -2162,7 +2133,6 @@
     CPU: poisson_nll_loss_backward_kernel
 
 # ===========================================================================
-# Spectral / audio ops (torch.fft + torch.stft family, window factories)
 # ===========================================================================
 - func: fft_fft(Tensor self, SymInt n=-1, int dim=-1, str norm="backward") -> Tensor
   variants: function
@@ -2240,7 +2210,6 @@
     CPU: stft_backward_cpu
 
 # ===========================================================================
-# Support ops needed by the torchaudio functional/transforms/datasets port
 # ===========================================================================
 - func: cumsum(Tensor self, int dim=0, ScalarType? dtype=None) -> Tensor
   variants: function, method
@@ -2319,8 +2288,15 @@
   dispatch:
     CPU: logical_and_cpu
 
+# Native cross-product entry points.
+# live in p10/src/backend/cpu/Cross.cpp and p10/src/backend/cuda/Cross.cu.
+- func: cross(Tensor self, Tensor other, int? dim=None) -> Tensor
+  variants: function
+  dispatch:
+    CPU: cross_cpu
+    CUDA: cross_cuda
+
 # ============================================================================
-# torch.linalg namespace (ported from aten/src/ATen/native/BatchLinearAlgebra*)
 # Exposed via tensorplay.linalg, not the top-level namespace.
 # Complex dtypes and CUDA are staged: complex paths raise NotImplementedError,
 # CUDA kernels land in p10/src/backend/cuda/LinalgKernels.cu.
@@ -2330,131 +2306,163 @@
   variants: function
   dispatch:
     CPU: linalg_cholesky_kernel
+    CUDA: linalg_cholesky_kernel_cuda
 
 - func: linalg_cholesky_ex(Tensor A, *, bool upper=False, bool check_errors=False) -> (Tensor L, Tensor info)
   variants: function
   dispatch:
     CPU: linalg_cholesky_ex_kernel
+    CUDA: linalg_cholesky_ex_kernel_cuda
 
 - func: linalg_inv(Tensor A) -> Tensor
   variants: function
   dispatch:
     CPU: linalg_inv_kernel
+    CUDA: linalg_inv_kernel_cuda
 
 - func: linalg_inv_ex(Tensor A, *, bool check_errors=False) -> (Tensor result, Tensor info)
   variants: function
   dispatch:
     CPU: linalg_inv_ex_kernel
+    CUDA: linalg_inv_ex_kernel_cuda
 
 - func: linalg_det(Tensor A) -> Tensor
   variants: function
   dispatch:
     CPU: linalg_det_kernel
+    CUDA: linalg_det_kernel_cuda
 
 - func: linalg_slogdet(Tensor A) -> (Tensor sign, Tensor logabsdet)
   variants: function
   dispatch:
     CPU: linalg_slogdet_kernel
+    CUDA: linalg_slogdet_kernel_cuda
 
 - func: linalg_solve(Tensor A, Tensor B, *, bool left=True) -> Tensor
   variants: function
   dispatch:
     CPU: linalg_solve_kernel
+    CUDA: linalg_solve_kernel_cuda
 
 - func: linalg_solve_ex(Tensor A, Tensor B, *, bool left=True, bool check_errors=False) -> (Tensor result, Tensor info)
   variants: function
   dispatch:
     CPU: linalg_solve_ex_kernel
+    CUDA: linalg_solve_ex_kernel_cuda
 
 - func: linalg_lu_factor(Tensor A, *, bool pivot=True) -> (Tensor LU, Tensor pivots)
   variants: function
   dispatch:
     CPU: linalg_lu_factor_kernel
+    CUDA: linalg_lu_factor_kernel_cuda
 
 - func: linalg_lu_factor_ex(Tensor A, *, bool pivot=True, bool check_errors=False) -> (Tensor LU, Tensor pivots, Tensor info)
   variants: function
   dispatch:
     CPU: linalg_lu_factor_ex_kernel
+    CUDA: linalg_lu_factor_ex_kernel_cuda
 
 - func: linalg_lu(Tensor A, *, bool pivot=True) -> (Tensor P, Tensor L, Tensor U)
   variants: function
   dispatch:
     CPU: linalg_lu_kernel
+    CUDA: linalg_lu_kernel_cuda
 
 - func: linalg_lu_solve(Tensor LU, Tensor pivots, Tensor B, *, bool left=True, bool adjoint=False) -> Tensor
   variants: function
   dispatch:
     CPU: linalg_lu_solve_kernel
+    CUDA: linalg_lu_solve_kernel_cuda
 
 - func: linalg_solve_triangular(Tensor A, Tensor B, *, bool upper, bool left=True, bool unitriangular=False) -> Tensor
   variants: function
   dispatch:
     CPU: linalg_solve_triangular_kernel
+    CUDA: linalg_solve_triangular_kernel_cuda
 
 - func: linalg_eigh(Tensor A, str UPLO="L") -> (Tensor eigenvalues, Tensor eigenvectors)
   variants: function
   dispatch:
     CPU: linalg_eigh_kernel
+    CUDA: linalg_eigh_kernel_cuda
 
 - func: linalg_eigvalsh(Tensor A, str UPLO="L") -> Tensor
   variants: function
   dispatch:
     CPU: linalg_eigvalsh_kernel
+    CUDA: linalg_eigvalsh_kernel_cuda
 
 - func: linalg_eig(Tensor A) -> (Tensor eigenvalues, Tensor eigenvectors)
   variants: function
   dispatch:
     CPU: linalg_eig_kernel
+    CUDA: linalg_eig_kernel_cuda
 
 - func: linalg_eigvals(Tensor A) -> Tensor
   variants: function
   dispatch:
     CPU: linalg_eigvals_kernel
+    CUDA: linalg_eigvals_kernel_cuda
 
 - func: linalg_svd(Tensor A, bool full_matrices=True, *, str? driver=None) -> (Tensor U, Tensor S, Tensor Vh)
   variants: function
   dispatch:
     CPU: linalg_svd_kernel
+    CUDA: linalg_svd_kernel_cuda
 
 - func: linalg_svdvals(Tensor A, *, str? driver=None) -> Tensor
   variants: function
   dispatch:
     CPU: linalg_svdvals_kernel
+    CUDA: linalg_svdvals_kernel_cuda
 
 - func: linalg_lstsq(Tensor A, Tensor B, float? rcond=None, *, str? driver=None) -> (Tensor solution, Tensor residuals, Tensor rank, Tensor coefficients)
   variants: function
   dispatch:
     CPU: linalg_lstsq_kernel
+    CUDA: linalg_lstsq_kernel_cuda
 
 - func: linalg_qr(Tensor A, str mode="reduced") -> (Tensor Q, Tensor R)
   variants: function
   dispatch:
     CPU: linalg_qr_kernel
+    CUDA: linalg_qr_kernel_cuda
 
 - func: linalg_householder_product(Tensor input, Tensor tau) -> Tensor
   variants: function
   dispatch:
     CPU: linalg_householder_product_kernel
+    CUDA: linalg_householder_product_kernel_cuda
+
+- func: linalg_cross(Tensor self, Tensor other, *, int dim=-1) -> Tensor
+  variants: function
+  dispatch:
+    CPU: linalg_cross_cpu
+    CUDA: linalg_cross_cuda
 
 - func: linalg_ldl_factor(Tensor A, *, bool hermitian=False) -> (Tensor LD, Tensor pivots)
   variants: function
   dispatch:
     CPU: linalg_ldl_factor_kernel
+    CUDA: linalg_ldl_factor_cuda
 
 - func: linalg_ldl_factor_ex(Tensor A, *, bool hermitian=False, bool check_errors=False) -> (Tensor LD, Tensor pivots, Tensor info)
   variants: function
   dispatch:
     CPU: linalg_ldl_factor_ex_kernel
+    CUDA: linalg_ldl_factor_ex_cuda
 
 - func: linalg_ldl_solve(Tensor LD, Tensor pivots, Tensor B, *, bool hermitian=False) -> Tensor
   variants: function
   dispatch:
     CPU: ldl_solve_impl
+    CUDA: linalg_ldl_solve_cuda
 
 - func: linalg_diagonal(Tensor A, *, int offset=0, int dim1=-2, int dim2=-1) -> Tensor
   variants: function
   dispatch:
     CPU: linalg_diagonal_kernel
+    CUDA: linalg_diagonal_kernel_cuda
 
 - func: roll(Tensor self, int[] shifts, int[] dims=[]) -> Tensor
   variants: function
@@ -2475,7 +2483,6 @@
 # Declarations for ops whose CPU/CUDA kernels were registered directly via
 # m.impl but which had no schema here -- so codegen produced no Python
 # bindings and dropped their derivatives.yaml entries (nn.functional callers
-# hit AttributeError).  Schemas follow ATen native_functions.yaml; dispatch
 # names are the existing p10 kernels.
 # ============================================================================
 
@@ -2503,7 +2510,6 @@
     CPU: leaky_relu_backward_kernel_impl
     CUDA: leaky_relu_backward_kernel_cuda
 
-# ATen rrelu_with_noise (aten/src/ATen/native/Activation.cpp): training path
 # scales negative elements by the caller-provided noise tensor; eval path is
 # leaky_relu with slope (lower + upper) / 2.
 - func: rrelu_with_noise(Tensor self, Tensor noise, Scalar lower=0.125, Scalar upper=0.3333333333333333, bool training=False) -> Tensor
@@ -2518,7 +2524,6 @@
     CPU: rrelu_with_noise_backward_kernel_impl
     CUDA: rrelu_with_noise_backward_kernel_cuda
 
-# ATen log_sigmoid (aten/src/ATen/native/Activation.cpp): numerically stable
 # log(sigmoid(x)) = min(x, 0) - log1p(exp(-|x|)); backward is grad * sigmoid(-x).
 - func: log_sigmoid(Tensor self) -> Tensor
   variants: function, method
@@ -2622,7 +2627,6 @@
     CPU: softshrink_cpu
     CUDA: softshrink_cuda
 
-# ATen Activation.cpp shrink_backward_kernel: shared by both backwards --
 # grad passes through where |self| > lambd (boundary inclusive-zero), i.e.
 # (self >= -lambd && self <= lambd) ? 0 : grad.
 - func: softshrink_backward(Tensor grad_output, Tensor self, Scalar lambd) -> Tensor
@@ -2849,7 +2853,6 @@
 
 # ============================================================================
 # Tier-5 dispatcher surface: kernels existed via m.impl only; schemas follow
-# ATen native_functions.yaml (defaults included), arities match the kernels.
 # ============================================================================
 
 - func: addbmm(Tensor self, Tensor batch1, Tensor batch2, *, Scalar beta=1, Scalar alpha=1) -> Tensor
@@ -2953,21 +2956,25 @@
   variants: function, method
   dispatch:
     CPU: clamp_min_kernel
+    CUDA: clamp_min_scalar_cuda
 
 - func: clamp_max(Tensor self, Scalar max) -> Tensor
   variants: function, method
   dispatch:
     CPU: clamp_max_kernel
+    CUDA: clamp_max_scalar_cuda
 
 - func: clamp_min_(Tensor(a!) self, Scalar min) -> Tensor(a!)
   variants: function, method
   dispatch:
     CPU: clamp_min__kernel
+    CUDA: clamp_min__scalar_cuda
 
 - func: clamp_max_(Tensor(a!) self, Scalar max) -> Tensor(a!)
   variants: function, method
   dispatch:
     CPU: clamp_max__kernel
+    CUDA: clamp_max__scalar_cuda
 
 - func: complex(Tensor real, Tensor imag) -> Tensor
   variants: function
@@ -3690,7 +3697,6 @@
     CPU: hinge_embedding_loss_cpu
     CUDA: hinge_embedding_loss_cuda
 
-# ATen multi_margin_loss (aten/src/ATen/native/LossMultiMargin.cpp): 1-D (C)
 # or 2-D (N, C) input with class-index target; per-row hinge
 # sum_{d != y} max(0, margin - x_y + x_d)^p * w[y] / C. reduction: 0=none
 # (per-row (N,) output), 1=mean, 2=sum; 1-D input always yields a scalar.
@@ -3706,8 +3712,6 @@
     CPU: multi_margin_loss_cpu_backward
     CUDA: multi_margin_loss_cuda_backward
 
-# ATen multilabel_margin_loss (aten/src/ATen/native/LossMultiLabelMargin.cpp):
-# composite over multilabel_margin_loss_forward (get<0>), exactly like ATen's
 # registered-composite multilabel_margin_loss. forward emits the loss plus
 # the is_target mask consumed by the backward; target rows list class
 # indices and are terminated by -1.
@@ -3783,9 +3787,7 @@
     CUDA: triu_cuda
 
 # ---------------------------------------------------------------------------
-# torch.special family (2026-08-22): kernels in
 # p10/src/backend/{cpu/SpecialKernels.cpp,cuda/SpecialKernels.cu}, math
-# ported from aten/src/ATen/native/Math.h. Pointwise forward ops.
 # ---------------------------------------------------------------------------
 - func: bessel_j0(Tensor self) -> Tensor
   variants: function, method
@@ -3969,7 +3971,6 @@
 
 # ---------------------------------------------------------------------------
 # Sparse COO/CSR.  Exposes the COO machinery plus dense<->sparse conversions
-# and sparse-dense matmul to Python.  Non-differentiable, matching torch:
 # sparse training paths use embedding(sparse=True)/embedding_sparse_backward.
 - func: sparse_coo_tensor(Tensor indices, Tensor values, int[]? size=None, *, bool is_coalesced=False) -> Tensor
   variants: function
@@ -4025,7 +4026,6 @@
     CPU: sparse_mul_cpu
     CUDA: sparse_mul_cuda
 
-# torch.sparse.spdiags: layout is the tp Layout tag (0 = sparse COO,
 # 1 = sparse CSR); None defaults to COO.
 - func: spdiags(Tensor diagonals, Tensor offsets, int[] shape, int? layout=None) -> Tensor
   variants: function
@@ -4166,10 +4166,7 @@
     CUDA: forward_mm_cuda
 
 # ---------------------------------------------------------------------------
-# Shape & view alignment batch (torch native parity).
 #
-# Schemas mirror third_party/pytorch/aten/src/ATen/native/native_functions.yaml
-# with SymInt rendered as int.  Composite kernels mirror the ATen composites:
 #   TensorShape.cpp          expand/repeat/tile/hstack/vstack/dstack/
 #                            row_stack/column_stack/tensor_split/flatten/
 #                            unflatten/ravel/moveaxis/swapaxes/swapdims
@@ -4430,8 +4427,6 @@
     CPU: tpsa_allclose
     CUDA: tpsa_allclose
 
-# scatter_reduce / index_reduce (ATen ScatterGatherKernel / TensorAdvanced
-# Indexing): fused reduce-scatter. Backward helpers mirror torch/csrc/autograd
 # FunctionsManual.cpp; index is non-differentiable.
 - func: scatter_reduce(Tensor self, int dim, Tensor index, Tensor src, str reduce, *, bool include_self=True) -> Tensor
   variants: function, method
@@ -4469,7 +4464,6 @@
     CPU: index_reduce_backward_src_cpu
     CUDA: index_reduce_backward_src_cuda
 
-# MoE expert compute: ragged grouped GEMM (torch._grouped_mm 2D x 3D
 # semantics).  offs holds cumulative end offsets; the no-grad path is a
 # single dispatch wrapping per-group sgemm calls, GradMode falls back to
 # the differentiable narrow/mm/cat composite.
@@ -4479,7 +4473,6 @@
     CPU: grouped_mm_cpu
     CUDA: grouped_mm_cuda
 
-# rms_norm native: single fused kernel both devices (ATen composite semantics:
 # fp32 accumulation for reduced dtypes).  Replaces the 6-op python composite.
 - func: rms_norm(Tensor input, int[] normalized_shape, Tensor? weight=None, float? eps=None) -> Tensor
   variants: function
@@ -4488,12 +4481,97 @@
     CUDA: rms_norm_cuda
 
 # F.linear: fused CPU kernel (bias epilogue / nD flatten live in C++ next to
-# the seeded-GEMM addmm); other backends fall through to the composite.
+# the seeded-GEMM addmm); CUDA folds the bias into the cuBLASLt epilogue.
 - func: linear(Tensor input, Tensor weight, Tensor? bias=None) -> Tensor
   variants: function
   dispatch:
     CPU: linear_kernel
+    CUDA: linear_kernel_cuda
     Composite: linear_composite
+
+# ------------------------------------------------------------------
+#
+# These entries intentionally keep the established schemas. The implementations
+# of routing through tensorplay's Python composite layer:
+#   native/UnaryOps.cpp       absolute/arcs* aliases
+#   native/Pooling.cpp        the 1-D pooling adapters
+#   native/TensorShape.cpp    concat/concatenate/diagflat
+#   native/LinearAlgebra.cpp ger/kron/matrix_power
+#   native/TensorFactories.cpp vander
+#   native/Itertools.cpp      cartesian_prod
+# ------------------------------------------------------------------
+- func: absolute(Tensor self) -> Tensor
+  variants: function, method
+
+- func: absolute_(Tensor(a!) self) -> Tensor(a!)
+  variants: method
+
+- func: arccos(Tensor self) -> Tensor
+  variants: function, method
+
+- func: arccos_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: arccosh(Tensor self) -> Tensor
+  variants: function, method
+
+- func: arccosh_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: arcsin(Tensor self) -> Tensor
+  variants: function, method
+
+- func: arcsin_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: arcsinh(Tensor self) -> Tensor
+  variants: function, method
+
+- func: arcsinh_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: arctan(Tensor self) -> Tensor
+  variants: function, method
+
+- func: arctan_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: arctanh(Tensor self) -> Tensor
+  variants: function, method
+
+- func: arctanh_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: avg_pool1d(Tensor self, int[1] kernel_size, int[1] stride=[], int[1] padding=0, bool ceil_mode=False, bool count_include_pad=True) -> Tensor
+
+- func: adaptive_avg_pool1d(Tensor self, int[1] output_size) -> Tensor
+
+- func: adaptive_max_pool1d(Tensor self, int[1] output_size) -> (Tensor, Tensor)
+
+- func: max_pool1d_with_indices(Tensor self, int[1] kernel_size, int[1] stride=[], int[1] padding=0, int[1] dilation=1, bool ceil_mode=False) -> (Tensor, Tensor)
+
+- func: max_pool1d(Tensor self, int[1] kernel_size, int[1] stride=[], int[1] padding=0, int[1] dilation=1, bool ceil_mode=False) -> Tensor
+
+- func: concat(Tensor[] tensors, int dim=0) -> Tensor
+
+- func: concatenate(Tensor[] tensors, int dim=0) -> Tensor
+
+- func: diagflat(Tensor self, int offset=0) -> Tensor
+  variants: function, method
+
+- func: ger(Tensor self, Tensor vec2) -> Tensor
+  variants: function, method
+
+- func: kron(Tensor self, Tensor other) -> Tensor
+  variants: function, method
+
+- func: matrix_power(Tensor self, int n) -> Tensor
+  variants: function, method
+
+- func: vander(Tensor x, int? N=None, bool increasing=False) -> Tensor
+
+- func: cartesian_prod(Tensor[] tensors) -> Tensor
+  variants: function
 
 # Decode-time LLM primitives.  These are inference-oriented native kernels:
 # `silu_mul` is the elementwise SwiGLU epilogue, while `fused_rope` rotates Q
@@ -4538,7 +4616,7 @@
 # mutable self/return) of existing functional ops whose kernels both
 # backends already provide; argument schemas mirror the repo's own
 # functional entries so generated bindings type-check verbatim.
-# Deviations from upstream native_functions.yaml:
+# Deviations from the established native schema set:
 #   - index_add_ has no `alpha` kwarg (repo index_add lacks it)
 #   - nan_to_num_ takes `Scalar nan=0.0`, logit_/nan_to_num_ use Scalar?
 #     not float?  (repo functional forms)
@@ -4771,3 +4849,318 @@
 
 - func: i0_(Tensor(a!) self) -> Tensor(a!)
   variants: function, method
+
+# ---------------------------------------------------------------------------
+# closure).  Part A -- the unary numpy aliases (absolute/arccos/...), the 1-D
+# pooling adapters, concat/concatenate/diagflat/ger/kron/matrix_power/vander/
+# cartesian_prod and the in-place alias variants -- is declared above next to
+# linear; their implementations live in the matching CPU/CUDA native source
+# files listed in p10/CMakeLists.txt.
+#
+# which the TensorPlay dialect does not carry).  Implementations are
+# backend-neutral compositions over already-tuned TensorPlay primitives,
+# registered under the Composite dispatch key in
+# p10/src/NativeCompositeKernels.cpp; CPU and CUDA share the same semantics
+# while the primitives keep their device-specific hot paths.  Autograd is
+# tracked through the inner primitive calls (CompositeImplicitAutograd
+# semantics), so no derivatives.yaml entries are needed.
+# ---------------------------------------------------------------------------
+
+# in place of optimal-parenthesization multi_dot).
+- func: chain_matmul(Tensor[] matrices) -> Tensor
+  variants: function
+
+- func: tril_indices(int row, int col, int offset=0, *, ScalarType dtype=Int64, Device? device=None, bool pin_memory=False) -> Tensor
+  variants: function
+
+- func: triu_indices(int row, int col, int offset=0, *, ScalarType dtype=Int64, Device? device=None, bool pin_memory=False) -> Tensor
+  variants: function
+
+- func: combinations(Tensor self, int r=2, bool with_replacement=False) -> Tensor
+  variants: function, method
+
+- func: trapz.x(Tensor y, Tensor x, *, int dim=-1) -> Tensor
+  variants: function
+
+- func: trapz.dx(Tensor y, *, float dx=1, int dim=-1) -> Tensor
+  variants: function
+
+# Unique.cpp semantics reproduced over bucketize/bincount/compare primitives).
+- func: histc(Tensor self, int bins=100, Scalar min=0, Scalar max=0) -> Tensor
+  variants: function, method
+
+- func: isin.Tensor_Tensor(Tensor elements, Tensor test_elements, *, bool assume_unique=False, bool invert=False) -> Tensor
+  variants: function
+
+- func: isin.Tensor_Scalar(Tensor elements, Scalar test_element, *, bool assume_unique=False, bool invert=False) -> Tensor
+  variants: function
+
+- func: isin.Scalar_Tensor(Scalar element, Tensor test_elements, *, bool assume_unique=False, bool invert=False) -> Tensor
+  variants: function
+
+- func: unique_consecutive(Tensor self, bool return_inverse=False, bool return_counts=False, int? dim=None) -> (Tensor output, Tensor inverse_indices, Tensor counts)
+  variants: function
+
+# TypeProperties.cpp).
+- func: scalar_tensor(Scalar s, *, ScalarType? dtype=None, Device? device=None, bool pin_memory=False) -> Tensor
+  variants: function
+
+- func: is_conj(Tensor self) -> bool
+  variants: function, method
+
+- func: is_neg(Tensor self) -> bool
+  variants: function, method
+
+- func: is_nonzero(Tensor self) -> bool
+  variants: function, method
+
+- func: is_same_size(Tensor self, Tensor other) -> bool
+  variants: function, method
+
+- func: get_device(Tensor self) -> int
+  variants: function, method
+
+- func: can_cast(ScalarType from_, ScalarType to) -> bool
+  variants: function
+
+- func: promote_types(ScalarType type1, ScalarType type2) -> ScalarType
+  variants: function
+
+- func: result_type.Tensor(Tensor tensor, Tensor other) -> ScalarType
+  variants: function
+
+- func: result_type.Scalar(Tensor tensor, Scalar other) -> ScalarType
+  variants: function
+
+- func: result_type.Scalar_Tensor(Scalar scalar, Tensor tensor) -> ScalarType
+  variants: function
+
+- func: result_type.Scalar_Scalar(Scalar scalar1, Scalar scalar2) -> ScalarType
+  variants: function
+
+# clone(Preserve) then flat index_copy_/index_add_).
+- func: put(Tensor self, Tensor index, Tensor source, bool accumulate=False) -> Tensor
+  variants: function, method
+
+# Conj/neg resolution: TensorPlay carries no lazy conj/neg bits, so these
+- func: resolve_conj(Tensor(a) self) -> Tensor(a)
+  variants: function, method
+
+- func: resolve_neg(Tensor(a) self) -> Tensor(a)
+  variants: function, method
+
+# view op + clone(MemoryFormat::Contiguous)).
+- func: alias_copy(Tensor self) -> Tensor
+  variants: function
+
+- func: t_copy(Tensor self) -> Tensor
+  variants: function
+
+- func: permute_copy(Tensor self, int[] dims) -> Tensor
+  variants: function
+
+- func: transpose_copy.int(Tensor self, int dim0, int dim1) -> Tensor
+  variants: function
+
+- func: squeeze_copy(Tensor self) -> Tensor
+  variants: function
+
+- func: squeeze_copy.dim(Tensor self, int dim) -> Tensor
+  variants: function
+
+- func: squeeze_copy.dims(Tensor self, int[] dim) -> Tensor
+  variants: function
+
+- func: unsqueeze_copy(Tensor self, int dim) -> Tensor
+  variants: function
+
+- func: select_copy.int(Tensor self, int dim, SymInt index) -> Tensor
+  variants: function
+
+- func: slice_copy.Tensor(Tensor self, int dim=0, SymInt? start=None, SymInt? end=None, SymInt step=1) -> Tensor
+  variants: function
+
+- func: narrow_copy(Tensor self, int dim, SymInt start, SymInt length) -> Tensor
+  variants: function
+
+- func: diagonal_copy(Tensor self, int offset=0, int dim1=0, int dim2=1) -> Tensor
+  variants: function
+
+- func: unbind_copy.int(Tensor self, int dim=0) -> Tensor[]
+  variants: function
+
+- func: split_copy.Tensor(Tensor self, SymInt split_size, int dim=0) -> Tensor[]
+- func: split_copy.sizes(Tensor self, int[] split_size, int dim=0) -> Tensor[]
+  variants: function
+
+- func: view_copy(Tensor self, SymInt[] size) -> Tensor
+  variants: function
+
+- func: view_copy.dtype(Tensor self, ScalarType dtype) -> Tensor
+  variants: function
+
+- func: unfold_copy(Tensor self, int dimension, int size, int step) -> Tensor
+  variants: function
+
+- func: expand_copy(Tensor self, SymInt[] size, *, bool implicit=False) -> Tensor
+  variants: function
+
+- func: reshape_as(Tensor(a) self, Tensor other) -> Tensor(a)
+  variants: function, method
+
+# TensorShape.cpp; used by autograd internals).
+- func: unsafe_chunk(Tensor self, int chunks, int dim=0) -> Tensor[]
+  variants: function
+
+- func: unsafe_split.Tensor(Tensor self, SymInt split_size, int dim=0) -> Tensor[]
+  variants: function
+
+- func: cosine_similarity(Tensor x1, Tensor x2, int dim=1, float eps=1e-8) -> Tensor
+  variants: function
+
+# primitives carry the bernoulli noise on both backends).
+- func: dropout(Tensor input, float p=0.5, bool train=True) -> Tensor
+  variants: function
+
+- func: dropout_(Tensor(a!) self, float p=0.5, bool train=True) -> Tensor(a!)
+  variants: function, method
+
+- func: alpha_dropout(Tensor input, float p=0.5, bool train=True) -> Tensor
+  variants: function
+
+- func: alpha_dropout_(Tensor(a!) self, float p=0.5, bool train=True) -> Tensor(a!)
+  variants: function, method
+
+- func: feature_dropout(Tensor input, float p=0.5, bool train=True) -> Tensor
+  variants: function
+
+- func: feature_dropout_(Tensor(a!) self, float p=0.5, bool train=True) -> Tensor(a!)
+  variants: function, method
+
+- func: feature_alpha_dropout(Tensor input, float p=0.5, bool train=True) -> Tensor
+  variants: function
+
+- func: feature_alpha_dropout_(Tensor(a!) self, float p=0.5, bool train=True) -> Tensor(a!)
+  variants: function, method
+
+# rrelu_with_noise in training).
+- func: rrelu(Tensor self, Scalar lower=0.125, Scalar upper=0.3333333333333333, bool training=False) -> Tensor
+  variants: function, method
+
+- func: rrelu_(Tensor(a!) self, Scalar lower=0.125, Scalar upper=0.3333333333333333, bool training=False) -> Tensor(a!)
+  variants: function, method
+
+# ConvolutionTBC.cpp / RNN.cpp).
+- func: bilinear(Tensor input1, Tensor input2, Tensor weight, Tensor? bias=None) -> Tensor
+  variants: function
+
+- func: conv_tbc(Tensor self, Tensor weight, Tensor bias, int pad=0) -> Tensor
+  variants: function
+
+- func: lstm_cell(Tensor input, Tensor hx, Tensor cx, Tensor w_ih, Tensor w_hh, Tensor? b_ih=None, Tensor? b_hh=None) -> (Tensor, Tensor)
+  variants: function
+
+- func: rnn_relu_cell(Tensor input, Tensor hx, Tensor w_ih, Tensor w_hh, Tensor? b_ih=None, Tensor? b_hh=None) -> Tensor
+  variants: function
+
+- func: rnn_tanh_cell(Tensor input, Tensor hx, Tensor w_ih, Tensor w_hh, Tensor? b_ih=None, Tensor? b_hh=None) -> Tensor
+  variants: function
+
+# math_channel_shuffle).
+- func: native_channel_shuffle(Tensor self, SymInt groups) -> Tensor
+  variants: function, method
+
+# cpu/UnaryOpsKernel.cpp).
+- func: kaiser_window(int window_length, *, ScalarType? dtype=None, Device? device=None, bool pin_memory=False) -> Tensor
+  variants: function
+
+- func: kaiser_window.periodic(int window_length, bool periodic, *, ScalarType? dtype=None, Device? device=None, bool pin_memory=False) -> Tensor
+  variants: function
+
+- func: kaiser_window.beta(int window_length, bool periodic, float beta, *, ScalarType? dtype=None, Device? device=None, bool pin_memory=False) -> Tensor
+  variants: function
+
+# ---------------------------------------------------------------------------
+# Structural + numeric point composite kernels (backend/composite/): each op
+# is implemented over already-dispatched primitives, registered under the
+# Composite dispatch key; autograd flows through the inner calls.
+# ---------------------------------------------------------------------------
+
+# TensorShape.cpp: flip wrappers, split-with-sizes view-copy, in-place detach
+# and resize-as.
+- func: fliplr(Tensor self) -> Tensor
+  variants: function, method
+
+- func: flipud(Tensor self) -> Tensor
+  variants: function, method
+
+- func: split_with_sizes_copy(Tensor self, int[] split_sizes, int dim=0) -> Tensor[]
+  variants: function
+
+- func: unsafe_split_with_sizes(Tensor self, int[] split_sizes, int dim=0) -> Tensor[]
+  variants: function
+
+- func: detach_copy(Tensor self) -> Tensor
+  variants: function, method
+
+- func: detach_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: resize_as_(Tensor(a!) self, Tensor other, *, int memory_format=0) -> Tensor(a!)
+  variants: function, method
+
+# RNN.cpp: gated recurrent cell (reset/update/new gates, hy=(1-z)*n+z*h).
+- func: gru_cell(Tensor input, Tensor hx, Tensor w_ih, Tensor w_hh, Tensor? b_ih=None, Tensor? b_hh=None) -> Tensor
+  variants: function
+
+# Distance.cpp: pairwise p-norm distances, p in {0, 1, 2, inf}, 2-D inputs.
+- func: cdist(Tensor x1, Tensor x2, float p=2) -> Tensor
+  variants: function
+
+# Pointwise.cpp: numerically-special elementwise ops.  xlogy collapses the
+# x==0 branch to 0 for any y; fmax/fmin propagate the non-NaN operand;
+# float_power computes in Float64 and casts back to the natural result type.
+- func: xlogy(Tensor self, Tensor other) -> Tensor
+  variants: function, method
+
+- func: xlogy_(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  variants: function, method
+
+- func: ldexp(Tensor self, Tensor other) -> Tensor
+  variants: function, method
+
+- func: ldexp_(Tensor(a!) self, Tensor other) -> Tensor(a!)
+  variants: function, method
+
+- func: fmax(Tensor self, Tensor other) -> Tensor
+  variants: function, method
+
+- func: fmin(Tensor self, Tensor other) -> Tensor
+  variants: function, method
+
+- func: float_power(Tensor self, Tensor exponent) -> Tensor
+  variants: function, method
+
+- func: mvlgamma(Tensor self, int p) -> Tensor
+  variants: function, method
+
+- func: conj_physical(Tensor self) -> Tensor
+  variants: function, method
+
+- func: conj_physical_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+- func: negative_(Tensor(a!) self) -> Tensor(a!)
+  variants: function, method
+
+# TensorFactories.cpp: inclusive arange (end participates in the interval).
+- func: range(Scalar start, Scalar end, Scalar step=1, *, ScalarType? dtype=None, Device? device=None) -> Tensor
+  variants: function
+
+# TensorProperties.cpp.
+- func: is_signed(Tensor self) -> bool
+  variants: function, method
+
+# TensorAdvancedIndexing.cpp: fixed-size nonzero indices, padded/truncated.
+- func: nonzero_static(Tensor self, *, int? size=None, int fill_value=-1) -> Tensor
+  variants: function

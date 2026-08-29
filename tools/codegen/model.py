@@ -1,13 +1,8 @@
-"""Typed schema model -- powered by the vendored upstream torchgen.
+"""
 
-The single source of truth for schema parsing is PyTorch's own
-``torchgen.model.FunctionSchema`` (third_party/pytorch).  TensorPlay keeps a
-thin adapter that converts torchgen's algebraic IR into the compact
 Type/Argument/NativeFunction records consumed by this repo's generators, so
 every generator shares exactly upstream's grammar, validation, and error
 messages.  No legacy dialect parser exists anymore: native_functions.yaml is
-required to be ATen-canonical (enforced by migrate_schemas.py --canonicalize
-and by torchgen itself rejecting anything else).
 """
 
 from __future__ import annotations
@@ -21,7 +16,6 @@ import yaml
 
 
 # ---------------------------------------------------------------------------
-# torchgen bridge
 # ---------------------------------------------------------------------------
 
 import sys as _sys
@@ -30,17 +24,13 @@ _TORCHGEN_READY = False
 
 
 def _ensure_torchgen():
-    """Import the VENDORED upstream torchgen, never the one shipped inside
-    an installed torch wheel (site-packages carries an older copy whose
+    """
     grammar predates this checkout)."""
     global _TORCHGEN_READY
     global _TORCHGEN_MODULE
     if _TORCHGEN_READY:
         return
     root = Path(__file__).resolve()
-    # Preferred layout: torchgen vendored standalone (keeps CI/remote syncs
-    # free of the 1.7GB pytorch tree).  Legacy fallback: the full vendored
-    # pytorch checkout.
     for cand in root.parents:
         standalone = cand / "third_party" / "torchgen"
         if (standalone / "torchgen" / "model.py").exists():
@@ -51,7 +41,6 @@ def _ensure_torchgen():
             break
     else:
         raise RuntimeError(
-            "vendored torchgen not found (expected third_party/torchgen/ "
             "or the legacy third_party/pytorch/ layout)")
 
     for m in [k for k in list(_sys.modules)
@@ -77,13 +66,12 @@ def _ensure_torchgen_imported():
 
 
 # ---------------------------------------------------------------------------
-# Type model (compact view of torchgen's algebraic Type)
 # ---------------------------------------------------------------------------
 
 _KIND_ALIASES = {
     "int": "int64_t",
     "SymInt": "int64_t",
-    "float": "double",       # ATen schema `float` means C++ double
+    "float": "double",
     "ScalarType": "DType",
 }
 
@@ -236,7 +224,6 @@ class NativeFunction:
 
 
 # ---------------------------------------------------------------------------
-# Parsing (single engine: upstream torchgen)
 # ---------------------------------------------------------------------------
 
 def _norm_default(d):
@@ -248,13 +235,11 @@ def _norm_default(d):
 
 
 def parse_schema(schema: str) -> NativeFunction:
-    # Normalize TensorPlay yaml spellings to upstream ATen grammar.
     schema = schema.replace("int64_t", "int")
     tgm = _ensure_torchgen_imported()
     BaseType = tgm.BaseType
 
     ts = tgm.FunctionSchema.parse(schema)
-    # Upstream torchgen has no KeywordArgument wrapper: it splits arguments
     # into positional / kwarg-only / out buckets at parse time and `.all`
     # flattens them.  Recover the distinction via the kwarg-only bucket.
     kwarg_names = {a.name for a in ts.arguments.flat_kwarg_only}
@@ -301,7 +286,6 @@ def parse_schema(schema: str) -> NativeFunction:
     name = ts.name
     bon = name.name                      # BaseOperatorName
     base_op = bon.base + ("_" if bon.inplace else "")
-    # torchgen strips the trailing underscore into an `inplace` flag;
     # TensorPlay symbols keep it (`add_.Tensor` -> add_).
     if getattr(name.name.base, "inplace", False) and not base_op.endswith("_"):
         base_op += "_"

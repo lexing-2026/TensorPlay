@@ -64,9 +64,7 @@ namespace {
 // Factory fast paths
 //
 // The generated METH_FASTCALL layer already parses empty/zeros/ones/rand/
-// randn/full faster than torch's PythonArgParser, but the Python functional
 // wrappers in front of them cost ~0.5us of frame/checks per call -- which is
-// the whole remaining gap vs torch.empty.  install_factory_fast_paths()
 // rebinds those public names onto C trampolines:
 //
 //   * while a Tracer capture is live (tensorplay.compiler.graph._TRACE_DEPTH
@@ -327,7 +325,6 @@ PYBIND11_MODULE(_C, m) {
     m.doc() = "The C extension module of tensorplay";
 
     // Catchable device-mismatch exception (RuntimeError subclass), so users
-    // can write `except tensorplay.DeviceMismatchError:` like torch's
     // FakeTensorDeviceMismatchError but for real tensors. Auto re-exported at
     // top level by tensorplay/__init__.py.
     tensorplay::set_device_mismatch_error_type(
@@ -387,8 +384,6 @@ PYBIND11_MODULE(_C, m) {
     m.def("_parallel_info", &tensorplay::_parallel_info);
     m.def("_get_build_info", &tensorplay::get_build_info);
 
-    // Global default dtype/device (mirrors torch._C bindings of the same
-    // names; see torch/csrc/Module.cpp and torch/__init__.py).
     m.def("get_default_dtype", []() {
         return tensorplay::globalContext().defaultDType();
     }, "get_default_dtype() -> DType\n\n"
@@ -418,7 +413,6 @@ PYBIND11_MODULE(_C, m) {
         tensorplay::globalContext().popDefaultDevice();
     });
 
-    // Deterministic algorithms (torch/csrc/Module.cpp:
     // _set_deterministic_algorithms / _get_deterministic_algorithms /
     // _get_deterministic_algorithms_warn_only)
     m.def("_set_deterministic_algorithms",
@@ -433,7 +427,6 @@ PYBIND11_MODULE(_C, m) {
         return tensorplay::globalContext().deterministicAlgorithmsWarnOnly();
     });
 
-    // Float32 matmul precision (torch/csrc/Module.cpp:
     // _set_float32_matmul_precision / _get_float32_matmul_precision)
     m.def("get_float32_matmul_precision", []() {
         return tensorplay::globalContext().getFloat32MatmulPrecisionStr();
@@ -443,7 +436,6 @@ PYBIND11_MODULE(_C, m) {
         tensorplay::globalContext().setFloat32MatmulPrecision(precision);
     }, "precision"_a);
 
-    // TF32 flags (torch/csrc/Module.cpp: _get/_set_cublas_allow_tf32,
     // _get/_set_cudnn_allow_tf32)
     m.def("_get_cublas_allow_tf32", []() {
         return tensorplay::globalContext().allowTF32CuBLAS();
@@ -476,7 +468,6 @@ PYBIND11_MODULE(_C, m) {
     m.def("is_mkldnn_enabled", &tensorplay::OneDNNContext::is_enabled);
     m.def("set_mkldnn_enabled", &tensorplay::OneDNNContext::set_enabled);
 
-    // ---- Native profiler (torch.profiler counterpart; see p10/include/Profiler.h)
     using tensorplay::prof::Event;
     m.def("_profiler_start", [](bool capture_shapes, bool with_stack,
                                 bool gpu_timing, bool gpu_trace,

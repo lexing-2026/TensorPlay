@@ -13,8 +13,6 @@
 #include <string>
 #include <vector>
 
-// Native CUDA graph surface, mirroring torch.cuda.CUDAGraph /
-// torch.cuda.graphs.  Everything goes through the tensorplay::cuda::graph
 // CUDAGraph class: capture_begin/capture_end manage the side stream, the
 // graph-private allocator pool and graph-safe RNG; replay() launches the
 // cached executable directly (no registry lookups).  stage_and_launch is the
@@ -167,7 +165,7 @@ void init_cuda_graph(py::module_& m) {
               return status == cudaStreamCaptureStatusActive;
           },
           "True when this thread's current stream is participating in a "
-          "capture (mirrors at::cuda::currentStreamCaptureStatus)");
+          "capture status)");
 #else
     // Non-CUDA builds expose no CUDA graph names; the Python layer
     // (tensorplay/cuda/graphs.py) raises descriptive errors on use.

@@ -1,8 +1,6 @@
 """Derivatives loading, expression AST, and backward-node generation.
 
-Mirrors PyTorch's tools/autograd layer:
 
-* ``load_derivatives`` parses derivatives.yaml entries (ATen spelling:
   ``- name: <schema>`` plus one gradient formula per differentiable input /
   output) into typed objects.
 * Gradient formulas are compiled through a real expression AST (tokenizer +
@@ -26,7 +24,6 @@ _COMPARISON_OPS = {"<=": "le", ">=": "ge", "==": "eq", "!=": "ne", "<": "lt", ">
 def _normalize_comparisons(formula: str) -> str:
     """Rewrite (a OP b) comparisons into dispatched op calls.
 
-    torch's derivatives.yaml permits comparison operators inside derivative
     formulas (they produce bool masks); TensorPlay's expression DSL has no
     infix comparisons, so translate them to the dispatched gt/lt/... ops.
     Handles both parenthesized groups and bare `a > b` operands (upstream
@@ -256,7 +253,6 @@ def parse_expr(formula: str) -> Expr:
 
 
 # ---------------------------------------------------------------------------
-# Formula rendering (the equivalent of torchgen's autograd codegen emit)
 # ---------------------------------------------------------------------------
 
 # Free functions invoked by formulas that live in tensorplay::tpx::ops and

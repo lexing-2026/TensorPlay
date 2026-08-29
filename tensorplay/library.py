@@ -1,4 +1,4 @@
-"""User-defined operator registration, mirroring ``torch.library``.
+"""
 
 Four public layers are provided:
 
@@ -12,24 +12,19 @@ Four public layers are provided:
    such operators behave like any other custom operator in eager mode and
    are captured as one opaque graph node by ``tensorplay.compile`` —
    exactly the fusion-boundary semantics Inductor gives
-   ``torch.library.triton_op``.
 3. Registered operators compose with every compiler backend: during capture
    a call whose arguments are symbolic records a single ``call_function``
    node targeting the :class:`CustomOpDef`; backends that cannot lower it
    treat the node as a barrier and fall back to the interpreter, which
    dispatches to the registered kernel.
-4. The torch utility surface is covered end to end: top-level
    :func:`define`/:func:`impl`/:func:`impl_abstract`, :func:`infer_schema`,
    :func:`get_kernel`, :meth:`CustomOpDef.set_kernel_enabled` and the
    validation harness :func:`opcheck`.
 
-Like ``torch.library.custom_op``, operators are identified by a qualified
 ``"namespace::name"`` string.  Schemas are not modeled by a C++ dispatcher;
 the optional ``schema=`` strings and :func:`infer_schema` output attach to
 the operator for introspection, documentation and ``opcheck``.
 
-Deviations from ``torch.library`` (infrastructure TensorPlay does not have):
-``EffectType``/``register_effect``, ``register_torch_dispatch``,
 ``OpOverload``/``overload``/``deprecated``/``fallthrough_kernel``/
 ``NAMELESS_SCHEMA`` and ``get_ctx`` are absent, ``Library.fallback`` raises
 ``NotImplementedError``, and re-registering a kernel replaces the previous
@@ -87,7 +82,6 @@ _DEFINED_LIBRARY_NAMESPACES: set[str] = set()
 # tensorplay/__init__, so every attribute below already exists).
 _is_grad_enabled = tensorplay.is_grad_enabled
 
-# Device-type spellings accepted by Library.impl, following torch.library.
 _COMPOSITE_KEYS = frozenset(
     {"CompositeExplicitAutograd", "CompositeImplicitAutograd"}
 )
@@ -121,7 +115,6 @@ def _validate_name(name: str) -> tuple[str, str]:
 def _normalize_device_types(device_types: Any) -> list[str] | None:
     """Normalize ``device_types`` into registry keys.
 
-    ``None`` means "one kernel covers every device" (torch's default when
     ``device_types`` is omitted); strings and iterables of strings map onto
     per-device entries keyed by ``"cpu"``/``"cuda"``/...
     """
@@ -143,7 +136,7 @@ def _normalize_device_types(device_types: Any) -> list[str] | None:
 
 
 def _bridge_slot_key(device_types: Any) -> Any:
-    """Map a torch-style ``device_types`` value onto one registry slot.
+    """
 
     ``None``/empty iterables/composite spellings select the device-agnostic
     slot (``None`` key); concrete devices lowercase into their own slot.
@@ -181,7 +174,7 @@ def _validate_mutates_args(mutates_args: Any) -> tuple[str, ...]:
 
 
 def _validate_schema(schema: Any) -> str | None:
-    """Light schema validation: torch parses these with the C++ parser;
+    """
 
     TensorPlay keeps them verbatim for introspection/opcheck, so only the
     qualified-name head is checked.
@@ -197,7 +190,7 @@ def _validate_schema(schema: Any) -> str | None:
 
 
 class CustomOpDef:
-    """A single registered custom operator (``torch.library.CustomOpDef``).
+    """
 
     Instances are callable.  Calling with symbolic (tracer proxy) arguments
     records one opaque graph node; calling with real tensors dispatches to
@@ -235,7 +228,6 @@ class CustomOpDef:
     def _install_default_kernel(self, fn: Callable[..., Any]) -> None:
         """Use ``fn`` as the initial kernel (the ``@custom_op`` body).
 
-        Mirrors torch: the decorated function implements the operator for
         the advertised ``device_types`` — every device when omitted.
         """
 
@@ -306,7 +298,6 @@ class CustomOpDef:
         iterable of them.  Usable directly
         (``op.register_kernel("cpu", my_fn)``) or as a decorator
         (``@op.register_kernel("cpu")``).  Re-registering the same device
-        replaces the previous kernel (torch raises instead; TensorPlay
         allows hot swaps for interactive sessions and tests).
 
         CPU/CUDA kernels are additionally mirrored into the native p10
@@ -372,10 +363,9 @@ class CustomOpDef:
         *,
         setup_context: Callable[..., Any] | None = None,
     ) -> None:
-        """Attach a gradient formula (``torch.library`` parity).
+        """
 
         ``backward(ctx, *grad_outputs)`` mirrors
-        ``torch.autograd.Function.backward``; ``setup_context(ctx, inputs,
         output)`` may save tensors via ``ctx.save_for_backward``.  When no
         ``setup_context`` is given the context stays empty, so backward must
         derive its result purely from ``grad_outputs`` (or close over module
@@ -393,9 +383,8 @@ class CustomOpDef:
         self._autograd_cls = self._build_autograd_class()
 
     def register_vmap(self, fn: Callable[..., Any]) -> Callable[..., Any]:
-        """Attach a vectorization formula (``torch.library`` parity).
+        """
 
-        ``fn(info, in_dims, *args)`` mirrors ``torch.autograd.Function.vmap``.
         The engine does not batch yet (parity hook, like
         ``tensorplay.autograd.Function.vmap``); the registration is stored
         and surfaced through :func:`get_kernel`-style introspection.
@@ -413,12 +402,10 @@ class CustomOpDef:
     def register_autocast(
         self, device_type: str, cast_inputs: Any
     ) -> None:
-        """Register an autocast cast rule (``torch.library`` parity).
+        """
 
         When autocast is enabled for ``device_type``, floating-point tensor
         arguments are cast to ``cast_inputs`` before any kernel runs — the
-        dispatcher ``Autocast*``-key behavior torch documents for
-        ``torch.library.register_autocast``.
         """
 
         if not isinstance(device_type, str):
@@ -437,9 +424,8 @@ class CustomOpDef:
 
     @contextlib.contextmanager
     def set_kernel_enabled(self, device_type: str, enabled: bool = True):
-        """Temporarily disable/re-enable a kernel (``torch`` parity).
+        """
 
-        Mirrors ``torch.library.CustomOpDef.set_kernel_enabled``: while the
         context is active the concrete kernel for ``device_type`` is skipped
         and dispatch falls back to the device-agnostic kernel (if any).
         Disabling an already-disabled (or enabling an already-enabled)
@@ -531,7 +517,6 @@ class CustomOpDef:
             if fn is not None and key not in self._disabled_kernels:
                 return fn
             # Disabled/shadowed concrete kernels fall back to the composite
-            # slot, exactly like torch's set_kernel_enabled example.
         fn = kernels.get(None)
         if fn is not None:
             return fn
@@ -690,7 +675,7 @@ def custom_op(
     device_types: Any = None,
     schema: str | None = None,
 ) -> Callable[[Callable[..., Any]], CustomOpDef]:
-    """Define a user operator; use as a decorator (torch parity).
+    """
 
     Example::
 
@@ -704,7 +689,6 @@ def custom_op(
 
     ``fn`` may also be passed positionally
     (``custom_op("mylib::op", my_fn, mutates_args=())``), matching
-    ``torch.library.custom_op``.  The decorated function becomes the
     operator's default kernel for the advertised ``device_types`` (every
     device when omitted).
 
@@ -752,14 +736,13 @@ def triton_op(
     device_types: Any = None,
     schema: str | None = None,
 ) -> Callable[[Callable[..., Any]], CustomOpDef]:
-    """Define a Triton-backed operator (``torch.library.triton_op``).
+    """
 
     The registered kernel(s) must launch their Triton kernels through
     :func:`wrap_triton` and only mutate arguments listed in
     ``mutates_args``.  Under ``tensorplay.compile`` the whole operator is
     captured as a single opaque node — the compiler never traces into the
     Triton launches, matching Inductor's contract.  ``device_types`` is a
-    TensorPlay extension beyond the torch signature.
     """
 
     _validate_name(name)
@@ -932,7 +915,6 @@ def _looks_like_tilelang_kernel(kernel: Any) -> bool:
     """Duck-typing for TileLang objects without importing tilelang.
 
     Recognizes ``tilelang.jit.kernel.JITKernel`` (compiled, exposes
-    ``adapter``/``torch_function``), ``tilelang.jit.JITImpl`` (lazy
     factory, exposes ``get_tir``/``out_idx``) and plain adapters that opt
     in via a ``_tilelang_kernel`` marker attribute.
     """
@@ -949,7 +931,6 @@ def wrap_tilelang(kernel: Any) -> TileLangKernelWrapper:
 
     Accepts a compiled ``tilelang.jit.kernel.JITKernel``, the lazy-mode
     ``JITImpl`` factory returned by ``@tilelang.jit``, or any duck-typed
-    launcher exposing ``adapter``/``torch_function``/``get_tir``; plain
     callables are rejected so typos surface early.  Idempotent on
     wrappers.
     """
@@ -976,7 +957,6 @@ def wrap_tilelang(kernel: Any) -> TileLangKernelWrapper:
         raise TypeError(
             "wrap_tilelang expects a tilelang JITKernel/JITImpl (see "
             "https://github.com/tile-ai/tilelang) or a duck-typed adapter "
-            f"exposing 'adapter'/'torch_function'/'get_tir', got "
             f"{type(kernel)!r}; plain callables are rejected — set "
             f"'_tilelang_kernel = True' on custom launchers to opt in"
         )
@@ -996,7 +976,7 @@ def register_kernel(
     *,
     lib: Any = None,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    """Top-level kernel registration (``torch.library.register_kernel``).
+    """
 
     Accepts a :class:`CustomOpDef` or a qualified operator name.
     ``device_types=None`` or an empty iterable means the device-agnostic
@@ -1018,7 +998,6 @@ def register_fake(
     lib: Any = None,
     allow_override: bool = True,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    """Top-level fake-kernel registration (``torch.library.register_fake``)."""
 
     del lib, allow_override
     op_def = _resolve_op(op)
@@ -1033,7 +1012,6 @@ def register_autograd(
     setup_context: Callable[..., Any] | None = None,
     lib: Any = None,
 ) -> None:
-    """Top-level autograd registration (``torch.library.register_autograd``)."""
 
     del lib
     op_def = _resolve_op(op)
@@ -1047,7 +1025,6 @@ def register_vmap(
     *,
     lib: Any = None,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    """Top-level vmap registration (``torch.library.register_vmap`` parity)."""
 
     del lib
     op_def = _resolve_op(op)
@@ -1062,7 +1039,6 @@ def register_autocast(
     *,
     lib: Any = None,
 ) -> None:
-    """Top-level autocast registration (``torch.library.register_autocast``)."""
 
     del lib
     _resolve_op(op).register_autocast(device_type, cast_inputs)
@@ -1071,11 +1047,10 @@ def register_autocast(
 def define(
     qualname: str, schema: str | None = None, *, lib: Any = None, tags: Any = ()
 ) -> None:
-    """Define an operator by qualified name (top-level ``torch.library.define``).
+    """
 
     Creates the :class:`CustomOpDef` if absent (kernels are then attached
     with :func:`impl` or ``Library("ns", "IMPL").impl``).  ``tags`` is
-    accepted and ignored, mirroring the deprecated-but-working torch API.
     Like ``Library.define``, a full ``"ns::op(Tensor) -> Tensor"`` string
     may be pasted as ``qualname``.
     """
@@ -1096,7 +1071,7 @@ def impl(
     *,
     lib: Any = None,
 ) -> Callable[..., Any] | Callable[[Callable[..., Any]], Callable[..., Any]]:
-    """Top-level kernel registration by qualified name (``torch.library.impl``).
+    """
 
     ``types`` accepts concrete devices (``"CPU"``/``"CUDA"``) or composite
     spellings (``CompositeExplicitAutograd`` → the device-agnostic slot).
@@ -1113,7 +1088,6 @@ def impl_abstract(
     *,
     lib: Any = None,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    """Deprecated torch alias of :func:`register_fake` (kept for parity)."""
 
     return register_fake(qualname, func, lib=lib)
 
@@ -1121,7 +1095,7 @@ def impl_abstract(
 def get_kernel(
     op: str | CustomOpDef, dispatch_key: str
 ) -> Callable[..., Any]:
-    """Return the kernel registered for ``dispatch_key`` (``torch`` parity).
+    """
 
     ``dispatch_key`` accepts ``"cpu"``/``"cuda"``/``"default"`` and the
     composite spellings.  Raises ``LookupError`` when nothing usable is
@@ -1140,7 +1114,6 @@ def get_kernel(
         if lowered in _COMPOSITE_KEYS_LOWERED or lowered in ("default", "composite")
         else lowered
     )
-    # Strict per-key lookup, matching torch.get_kernel: a composite kernel
     # does NOT satisfy a concrete-device query (use "default" for that).
     fn = op_def._kernels.get(key)
     if fn is not None and (
@@ -1203,10 +1176,9 @@ def infer_schema(
     op_name: str | None = None,
     tags: Any = (),
 ) -> str:
-    """Infer a schema string from a typed prototype (``torch`` parity).
+    """
 
     Produces ``"ns::op(Tensor self, SymInt n, Tensor(a!) out) -> Tensor"``
-    style strings from type hints.  Mutated arguments receive the torch
     alias-annotation ``(<type>(<letter>!))`` marker.  Parameters without
     annotations are treated as tensors; ``*args``/``**kwargs`` are skipped.
     """
@@ -1333,7 +1305,6 @@ def _opcheck_test_schema(
                 "not declared in mutates_args; declare it or stop mutating"
             )
     # Outputs must be fresh allocations, never aliases of an input storage
-    # (torch's custom-op contract: aliasing requires explicit schema).
     input_ptrs = {t.data_ptr() for t in named_before.values()}
     for tensor in _flatten_tensors(output):
         if tensor.data_ptr() in input_ptrs:
@@ -1520,7 +1491,7 @@ def opcheck(
     atol: float | None = None,
     rtol: float | None = None,
 ) -> dict[str, str]:
-    """Validate an operator's registrations (``torch.library.opcheck``).
+    """
 
     Runs each selected check and reports failures keyed by test name:
 
@@ -1535,7 +1506,6 @@ def opcheck(
     - ``test_faketensor``: the fake kernel reproduces the real outputs'
       metadata.
     - ``test_aot_dispatch_dynamic``: capture + execution reproduce the
-      eager result (TensorPlay's analog of torch's AOTAutograd probe).
 
     Returns the failure mapping; empty means all checks passed.
     """
@@ -1572,9 +1542,8 @@ def opcheck(
 
 
 class Library:
-    """Scoped registration bundle (``torch.library.Library`` subset).
+    """
 
-    Kinds mirror torch: ``"DEF"`` defines operators in a namespace (only
     one DEF library per process/namespace), ``"IMPL"`` adds kernels, and
     ``"FRAGMENT"`` extends an existing namespace from multiple locations.
     """
@@ -1617,7 +1586,6 @@ class Library:
         """Define an operator from a schema like ``"ns::add(Tensor, Tensor)"``.
 
         Only the qualified name is meaningful (TensorPlay models no schema
-        grammar); the parenthesized remainder is ignored so torch-style
         schema strings can be pasted verbatim.  ``alias_analysis`` and
         ``tags`` are accepted and ignored for call-site compatibility.
         """
@@ -1647,11 +1615,10 @@ class Library:
         dispatch_key: str = "",
         allow_override: bool = True,
     ) -> Callable[..., Any]:
-        """Register a kernel, torch.library.impl-style.
+        """
 
         ``device_type`` accepts composite spellings (``Composite…`` → the
         device-agnostic slot) or concrete devices (``"CPU"``/``"CUDA"``);
-        ``dispatch_key`` is a torch-2.13-style alias for the same value
         (non-empty wins).  May be used directly or as a decorator.
         """
 
@@ -1678,10 +1645,9 @@ class Library:
         return wrapper(fn) if fn is not None else wrapper
 
     def fallback(self, kind: str) -> None:
-        """Register a fallback kernel (torch parity stub).
+        """
 
         TensorPlay's dispatcher has no per-key fallthrough table, so this
-        torch API has no meaningful implementation; it fails loudly instead
         of silently mis-dispatching.
         """
 

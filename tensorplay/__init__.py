@@ -24,7 +24,6 @@ from typing import (
 from typing_extensions import TypeIs as _TypeIs
 
 # Generated at build time by tools/generate_tensorplay_version.py (CMake
-# generate_code target); mirrors torch importing __version__ from a
 # generated version module.
 from tensorplay.version import __version__ as __version__
 
@@ -137,9 +136,7 @@ if sys.platform == 'win32':
     del _load_dll_libraries
 
 # -------------------------------------------------------------------------
-# Linux CUDA dependency preload (PyTorch-compatible fallback)
 # -------------------------------------------------------------------------
-# PyTorch first lets the extension loader resolve its normal RUNPATH and only
 # preloads component CUDA wheels when the extension reports a missing SONAME.
 # Keep the same behavior here: a normal CPU-only import does not eagerly load
 # CUDA, while a CUDA build remains importable from NVIDIA Python wheels.
@@ -149,7 +146,6 @@ elif sys.platform.startswith('linux'):
         # Exact wheel layout only (nvidia/cuda_runtime, nvidia/cublas, ...).
         # A broad 'nvidia/cu*' glob would also swallow foreign major-version
         # wheels like nvidia/cu13 and dlopen the wrong libcudart SONAME,
-        # poisoning later loads of the versioned .so.12 that torch needs.
         paths.extend(glob.glob(os.path.join(path, 'nvidia', lib_folder, 'lib', lib_name)))
         paths.extend(glob.glob(os.path.join(path, lib_folder, 'lib', lib_name)))
         if not paths and '.so.' in lib_name:
@@ -185,7 +181,6 @@ elif sys.platform.startswith('linux'):
             if not cuda_error:
                 raise err
 
-        # Match PyTorch's ordering: cublasLt must win before cublas, avoiding
         # a mixed CUDA installation through cublas' transitive RUNPATH.
         for lib_folder, lib_name, required in (
             ('cublas', 'libcublasLt.so.*[0-9]', True),
@@ -209,7 +204,6 @@ except (ImportError, OSError) as _load_error:
     else:
         raise
 
-# torch._C._log_api_usage_once parity: usage telemetry hook; a no-op here.
 if not hasattr(_C, "_log_api_usage_once"):
     _C._log_api_usage_once = lambda *args, **kwargs: None
 
@@ -249,7 +243,6 @@ bcomplex32 = DType.bcomplex32
 bool = DType.bool
 undefined = DType.undefined
 
-# Torch-compatible legacy aliases.
 half = DType.float16
 float = DType.float32
 double = DType.float64
@@ -262,12 +255,10 @@ chalf = DType.complex32
 
 
 class MemoryFormat(IntEnum):
-    """Tensor memory layout, mirroring torch.MemoryFormat."""
     CONTIGUOUS = 0
     PRESERVE = 1
     CHANNELS_LAST = 2
     CHANNELS_LAST_3D = 3
-    # Lowercase aliases (enum value-aliases), matching torch.MemoryFormat.
     contiguous_format = 0
     preserve_format = 1
     channels_last = 2
@@ -276,7 +267,7 @@ class MemoryFormat(IntEnum):
 
 
 class Layout(IntEnum):
-    """Sparse/dense storage layout tags (mirrors torch.layout loosely).
+    """
 
     ``tensor.layout`` returns one of these values; dense tensors report
     STRIDED.
@@ -285,7 +276,6 @@ class Layout(IntEnum):
     SPARSE_COO = 0
     SPARSE_CSR = 1
     STRIDED = 2
-    # Lowercase value aliases, torch spelling.
     sparse_coo = 0
     sparse_csr = 1
     strided = 2
@@ -358,7 +348,6 @@ __all__.extend([
 # assert __all__ == sorted(__all__)
 
 # The tensorplay._C submodule is already loaded above; import multiprocessing
-# here for the same top-level namespace behavior as torch.
 from . import multiprocessing
 
 import functools
@@ -456,10 +445,9 @@ from .functional import *
 
 
 def unique(input, sorted=True, return_inverse=False, return_counts=False):
-    """torch-compatible unique: arity follows the request flags.
+    """
 
     The native op always computes all three outputs; this wrapper mirrors
-    torch.unique's public contract of returning 1/2/3 tensors depending on
     ``return_inverse`` / ``return_counts``.
     """
     values, inverse, counts = _C.unique(input, sorted, True, True)
@@ -603,7 +591,6 @@ def as_tensor(data, dtype=None, device=None):
 
     If ``data`` is already a tensor with the requested dtype and device, it is
     returned as-is (no copy).  Otherwise it is converted, mirroring
-    ``torch.as_tensor``.
 
     Args:
         data (tensor, list, or scalar): Initial data for the tensor.
@@ -631,9 +618,7 @@ def as_tensor(data, dtype=None, device=None):
 
 _GLOBAL_DEVICE_CONTEXT = threading.local()
 
-# The default device is a thread-local global in _C (mirroring torch's
 # thread-local mode stack semantics); _GLOBAL_DEVICE_CONTEXT is kept for API
-# parity with torch/__init__.py.
 
 
 def get_default_device() -> "tensorplay.device":
@@ -804,7 +789,6 @@ def use_deterministic_algorithms(
         >>> # xdoctest: +SKIP
         >>> tensorplay.use_deterministic_algorithms(True)
     """
-    # NOTE: torch also toggles Inductor's deterministic mode here; TensorPlay
     # has no Inductor counterpart.
     _C._set_deterministic_algorithms(mode, warn_only=warn_only)
 
@@ -978,12 +962,10 @@ from tensorplay import functional as functional
 from tensorplay.functional import *
 
 # Re-pin the einsum shim: functional.py's thin wrapper predates the sublist
-# calling convention; _einsum.einsum supersedes it (torch/functional parity).
 # quantile/nanquantile/histogram need the same treatment: the generated
 # functional.py wrappers forward a raw Python-number `q` (the _C binding
 # requires a Tensor) and drop `histogram`'s `range` keyword, so the
 # hand-written _composite_funcs versions (scalar-q -> input-dtype Tensor
-# coercion, range kwarg, torch-parity validation) are re-pinned here.
 from ._einsum import einsum as einsum
 from ._composite_funcs import quantile as quantile
 from ._composite_funcs import nanquantile as nanquantile
@@ -992,13 +974,9 @@ from ._finfo import finfo, iinfo
 from . import jit
 
 # Python's ``import *`` intentionally omits underscore-prefixed names, but
-# Torch exposes the foreach dispatcher family at the top level.  Re-export
 # only generated ``_foreach_*`` wrappers; their implementation is still the
 # native dispatcher/backend and this block does not introduce a Python
 # composite operator.  ``_amp_*`` dispatcher hooks follow the same rule
-# (torch._amp_foreach_non_finite_check_and_unscale_ / torch._amp_update_scale_)
-# and the fused optimizer entry points mirror torch._fused_adam_/torch._fused_adamw_/
-# torch._fused_sgd_/torch._fused_adagrad_.
 for _foreach_name in dir(functional):
     if (_foreach_name.startswith("_foreach_") or _foreach_name.startswith("_amp_")
             or _foreach_name.startswith("_fused_")):
@@ -1009,12 +987,9 @@ del _foreach_name
 
 
 # -------------------------------------------------------------------------
-# torch.max / torch.min overload parity (must follow the final
 # ``from tensorplay.functional import *`` above, which shadows earlier defs).
 #
-# torch exposes three faces on these names: global reduction, (dim, keepdim)
 # reduction returning a named tuple with ``values``/``indices``, and the
-# elementwise binary form ``torch.max(input, other)``.  The codegen binds the
 # reduction faces only, so the binary face and the named-tuple contract are
 # restored here at the package boundary.
 # -------------------------------------------------------------------------
@@ -1043,14 +1018,14 @@ def min(input, other=None, *, dim=None, keepdim=False):
 
 
 def gradient(input, *, spacing=None, dim=None, edge_order=1):
-    """``torch.gradient`` parity: accept scalar / mixed scalar-or-Tensor lists.
+    """
 
     The native binding only takes ``Tensor[]`` spacing / ``int[]`` dim;
     materialize python numbers into scalar tensors typed like ``input`` (a
     single scalar applies to every dimension).
     """
     dims = [dim] if isinstance(dim, builtins.int) else (
-        list(dim) if dim is not None else list(range(input.dim())))
+        list(dim) if dim is not None else list(builtins.range(input.dim())))
     if spacing is None:
         sp = []
     elif isinstance(spacing, (builtins.int, builtins.float)):

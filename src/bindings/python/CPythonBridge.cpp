@@ -27,7 +27,6 @@ namespace python_c {
 
 namespace {
 
-// torch python_arg_parser parity suffix: "... must be int, not tuple".
 [[noreturn]] void type_error(PyObject* obj, const char* op, int index,
                              const char* want) {
     const char* got = obj ? Py_TYPE(obj)->tp_name : "None";
@@ -168,7 +167,6 @@ Scalar as_scalar(PyObject* obj, const char* op, int idx) {
     }
     if (PyFloat_Check(obj)) return Scalar(PyFloat_AS_DOUBLE(obj));
     if (PyComplex_Check(obj)) {
-        // torch parity: a wrapped python complex becomes a complex128 scalar.
         return Scalar(std::complex<double>(PyComplex_RealAsDouble(obj),
                                            PyComplex_ImagAsDouble(obj)));
     }
@@ -188,8 +186,8 @@ DType as_dtype(PyObject* obj, const char* op, int idx) {
 }
 
 int64_t as_int(PyObject* obj, const char* op, int idx) {
-    // Upstream PythonArgParser accepts integral-valued floats for int slots
-    // (e.g. divisor_override=3.0); non-integral floats still raise.
+    // Integral-valued floats are accepted for integer slots; non-integral
+    // floats still raise.
     if (PyFloat_Check(obj)) {
         const double d = PyFloat_AS_DOUBLE(obj);
         if (static_cast<double>(static_cast<int64_t>(d)) == d) {
@@ -285,9 +283,8 @@ std::optional<Tensor> tpx_py_opt_tensor(PyObject* obj) {
 int64_t tpx_py_int64(PyObject* obj) { return as_int(obj, "op", 0); }
 double tpx_py_double(PyObject* obj) { return as_double(obj, "op", 0); }
 bool tpx_py_bool(PyObject* obj) {
-    // Only real bools, matching the pybind11 bool caster the m.def surface
-    // enforced (and upstream's PythonArgParser): truthiness of arbitrary
-    // objects is a silent behavior change.
+    // Only real bools are accepted by this conversion.  Truthiness of
+    // arbitrary objects would silently change the call contract.
     if (PyBool_Check(obj)) return obj == Py_True;
     type_error(obj, "op", 0, "a bool");
 }
@@ -357,7 +354,6 @@ std::optional<std::vector<int64_t>> tpx_py_opt_intlist(PyObject* obj) {
 }
 
 // ---------------------------------------------------------------------------
-// eager typed validation: torch python_arg_parser parity for error wording
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -366,8 +362,8 @@ namespace {
                                  int index, const char* want, PyObject* obj) {
     std::string msg = std::string(op_name) + "(): argument '" + (name ? name : "?")
                       + "'";
-    // Upstream annotates a position only for arguments that can be passed
-    // positionally; kw-only args get the bare form.
+    // Report a position only for arguments that can be passed positionally;
+    // keyword-only arguments get the bare form.
     if (index >= 0) {
         msg += " (position " + std::to_string(index + 1) + ")";
     }
@@ -388,7 +384,7 @@ bool obj_is_tensor(PyObject* obj) {
 bool seq_item_is_number(PyObject* o) {
     // Python numbers plus the registered tensorplay.Scalar wrapper, which
     // generated wrappers (e.g. addmm's beta/alpha) pass through directly.
-    // Complex numbers count as Number for python_arg_parser parity.
+    // Complex numbers are part of the Number category.
     if (PyIndex_Check(o) || PyFloat_Check(o) || PyComplex_Check(o)) return true;
     try {
         return py::isinstance<tensorplay::Scalar>(py::handle(o));
@@ -397,9 +393,8 @@ bool seq_item_is_number(PyObject* o) {
     }
 }
 
-// INT_LIST / FLOAT_LIST upstream semantics: a bare scalar folds to a
-// singleton list, otherwise only tuple/list qualify -- plus tensorplay._C.Size,
-// a pybind sequence that mirrors torch.Size (a tuple subclass upstream).
+// For INT_LIST / FLOAT_LIST, a bare scalar folds to a singleton list;
+// otherwise tuple/list and tensorplay._C.Size containers are accepted.
 bool check_list(PyObject* obj, bool integral) {
     bool single = integral ? PyIndex_Check(obj) != 0 : seq_item_is_number(obj);
     if (single) return true;
@@ -447,7 +442,7 @@ bool tpx_py_obj_matches_kind(PyObject* obj, unsigned char kind) {
         case TPK_TENSOR:     return obj_is_tensor(obj);
         case TPK_NUMBER:     return seq_item_is_number(obj);
         case TPK_INT:
-            // Upstream toInt() accepts floats with an exact integral value.
+            // Integral-valued floats are accepted for integer arguments.
             if (PyIndex_Check(obj)) return true;
             return PyFloat_Check(obj) &&
                    std::fmod(PyFloat_AS_DOUBLE(obj), 1.0) == 0;
@@ -492,10 +487,9 @@ void tpx_py_check_types(PyObject* const* slots, Py_ssize_t n,
 }
 
 
-// Upstream parity (python_arg_parser.cpp is_tensor_list_and_append_overloaded):
-// only tuple/list qualify; each element must be a Tensor wrapper.  Element
-// errors stay std::invalid_argument so multi-overload dispatch can fall
-// through to the next candidate signature.
+// Only tuple/list containers qualify; each element must be a Tensor wrapper.
+// Element errors stay std::invalid_argument so multi-overload dispatch can
+// fall through to the next candidate signature.
 std::vector<Tensor> tpx_py_tensorlist(PyObject* obj) {
     std::vector<Tensor> r;
     if (!PyTuple_Check(obj) && !PyList_Check(obj)) {
@@ -544,13 +538,12 @@ std::optional<DType> tpx_py_opt_dtype(PyObject* obj) {
 
 namespace {
 
-// Identity cache for returned wrappers, keyed by TensorImpl pointer: like
-// upstream THPVariable_Wrap, re-wrapping the same impl yields the *same*
-// Python object instead of a fresh copy each call.  Invalidation needs no
-// p10 changes -- each cached object carries an attribute capsule whose
-// destructor runs when the wrapper dies and erases the entry.  The map
-// stores borrowed pointers only (the owning reference is the object's own);
-// all access happens under the GIL.
+// Identity cache for returned wrappers, keyed by TensorImpl pointer:
+// re-wrapping the same impl yields the *same* Python object instead of a fresh
+// copy each call.  Invalidation needs no p10 changes -- each cached object
+// carries an attribute capsule whose destructor runs when the wrapper dies and
+// erases the entry.  The map stores borrowed pointers only (the owning
+// reference is the object's own); all access happens under the GIL.
 std::unordered_map<const void*, PyObject*> g_wrap_cache;
 
 void wrap_cache_capsule_destructor(PyObject* caps) {
@@ -632,8 +625,8 @@ PyObject* tpx_py_wrap_list(const std::vector<Tensor>& v) {
 void tpx_py_keep_alive(PyObject*) {
     // No-op by construction: p10 views share their base's Storage
     // (shared_ptr) and VariableVersion (shared counter), so the returned
-    // alias keeps both alive without an explicit keep-alive edge.  This is
-    // where upstream installs view metadata once saved-view replay lands.
+    // alias keeps both alive without an explicit keep-alive edge.  View
+    // metadata can be added here when saved-view replay is enabled.
 }
 
 void tpx_py_set_error(const std::exception& e) {

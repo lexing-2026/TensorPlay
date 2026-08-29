@@ -46,7 +46,6 @@ void init_device(py::module_& m) {
         .def("__hash__", [](const Device& d) {
             return std::hash<std::string>()(d.toString());
         })
-        // Mirrors torch/csrc/Device.cpp THPDevice_enter/exit: entering a
         // device object scopes the default device for factory functions, so
         // `with tensorplay.device('cuda'):` allocates on that device.
         .def("__enter__", [](py::object self) {
