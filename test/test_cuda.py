@@ -24,13 +24,11 @@ class TestCUDA(unittest.TestCase):
         available = tensorplay.cuda.is_available()
         print(f"tensorplay.cuda.is_available(): {available}")
         
-        # Verify against torch if torch has cuda
         if torch.cuda.is_available():
-            print(f"torch.cuda.is_available(): {torch.cuda.is_available()}")
-            self.assertTrue(available, "CUDA should be available if torch finds it (assuming environment matches)")
+            print(f"reference cuda availability: {torch.cuda.is_available()}")
+            self.assertTrue(available, "CUDA should be available when the reference package detects it")
         else:
-            print("torch.cuda.is_available(): False")
-            # If torch doesn't find it but we built with it, it might be fine, or not.
+            print("reference cuda availability: False")
             # But here we expect it to be True as we saw in config.
         
         if available:
@@ -113,7 +111,7 @@ class TestCUDA(unittest.TestCase):
         if not tensorplay.cuda.is_available():
             return
 
-        print("\nAligning with Torch...")
+        print("\nRunning reference comparison...")
         shape = (128, 128)
         
         # Matrix Multiplication

@@ -1,6 +1,5 @@
 """CUDA graph tests that need a real GPU (skipped without CUDA).
 
-Covers native alignment with torch.cuda.CUDAGraph semantics:
 capture/replay correctness, eager-instantiate at capture_end, shared memory
 pools with refcounted release, graph-safe RNG freshness, bulk staging
 (stage_and_launch), custom streams/capture error modes and DOT debug dumps.
@@ -349,7 +348,6 @@ def test_make_graphed_callables_matches_eager():
     device = _cuda_device()
     tp.manual_seed(0)
 
-    # torch's contract: tensors that must receive gradients have to be
     # Module parameters (plain closure tensors are invisible to the
     # per-callable static input surface).
     class Fn(tp.nn.Module):

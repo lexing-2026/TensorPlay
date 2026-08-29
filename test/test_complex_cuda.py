@@ -1,4 +1,3 @@
-"""CUDA complex support -- torch parity suite (skipped without CUDA)."""
 import unittest
 
 import numpy as np

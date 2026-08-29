@@ -1,7 +1,7 @@
 """L5-M5a Triton reduction-epilogue emission and minimal broadcast support.
 
 Structure/source tests run everywhere (pure string generation).  Numeric
-parity tests are gated on ``runtime_available()`` because Triton needs a
+Numeric checks are gated on ``runtime_available()`` because Triton needs a
 real sm_70+ CUDA device (the local CI box has neither).
 """
 
@@ -95,7 +95,7 @@ def test_pointwise_emission_unchanged():
 
 def test_pointwise_streaming_cache_annotations():
     """Unmasked reference-layout loads skip L1 (.cg); masked/broadcast keep
-    the plain form (Inductor's read-once heuristic, same input conditions).
+    the plain form (the read-once heuristic under the same input conditions).
     """
 
     # numel % XBLOCK == 0 -> predicate-free fast path -> .cg on coalesced loads
@@ -154,15 +154,15 @@ def test_scalar_input_loads_once():
     assert "off1" not in src
 
 
-# --- numeric parity (GPU-gated) ----------------------------------------------------
+# --- numeric checks (GPU-gated) ---------------------------------------------------
 
 
 def _run_parity(fn, args):
     """Compile through the default stax pipeline and compare with eager.
 
     Also asserts the Triton lowering was actually selected (via the
-    specialization cache holding the backend's tagged closure) — numeric
-    parity alone would silently pass on the interpreted fallback.
+    specialization cache holding the backend's tagged closure); a numeric
+    check alone would silently pass on the interpreted fallback.
     """
 
     from tensorplay.compiler import compile
@@ -260,7 +260,6 @@ def test_axis_reduction_detection():
     assert _split_reduction_epilogue(
         _trace(lambda t: t.max(dim=0), x)
     ) is None
-    # amax() without axes is invalid ATen
     assert _split_reduction_epilogue(_trace(lambda t: t.amax(), x)) is None
 
 
@@ -445,7 +444,6 @@ def test_argmax_codegen_structure():
     assert "hit = ((cval > acc) | (cval == 1.0e38)) & live" in src
     assert "+ roffset" not in src
     # strict > keeps the earlier chunk on ties -> first occurrence overall;
-    # the x!=x clause makes NaN the greatest value (first NaN wins, torch
     # argmax ordering)
     assert "prio = tl.where(isnan_, 1.0e38, tmp0)" in src
     assert "hit = ((cval > acc) | (cval == 1.0e38)) & live" in src
@@ -512,14 +510,13 @@ def test_axis_argmax_keepdim_and_ties_match_eager():
     _run_parity(keepdim_fn, (x,))
     # A broadcast producer feeding an AXIS reduction needs generalized
     # tile addressing (scheduler gate #19, M5d+); until then the whole
-    # graph falls back to eager, which parity cannot attribute to triton.
+    # graph falls back to eager, which the check cannot attribute to Triton.
     pytest.xfail("broadcast producer + axis argmax waits for M5d indexing")
     _run_parity(tie_fn, (x, b))
 
 
 @pytest.mark.skipif(not runtime_available(), reason="Triton/CUDA unavailable")
 def test_axis_argmax_nan_matches_eager():
-    # torch ordering: NaN is the greatest value, first NaN wins
     x = tp.rand(8, 32, device="cuda")
     x[3, 7] = float("nan")
     x[5, 2] = float("nan")

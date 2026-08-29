@@ -3,6 +3,7 @@
 and the device-type parametrization helpers.
 """
 
+import re
 import unittest
 
 import numpy as np
@@ -68,10 +69,11 @@ class TestTestingSurface(TestCase):
     """Asserts the inventory of testing utilities exposed by the package."""
 
     def test_public_api(self):
+        # The public surface matches the aligned testing module family.
         import tensorplay.testing as tt
 
-        for name in ("assert_close", "assert_allclose", "make_tensor",
-                     "default_tolerances", "get_tolerances"):
+        for name in ("FileCheck", "assert_close", "assert_allclose",
+                     "make_tensor", "default_tolerances", "get_tolerances"):
             self.assertTrue(hasattr(tt, name), name)
 
     def test_common_utils_api(self):
@@ -256,12 +258,12 @@ class TestFileCheck(TestCase):
 
     def test_check_next(self):
         self._fc().check("a").check_next("b").run("a\nb")
-        with self.assertRaisesRegex(RuntimeError, 'Expected to not find "\\n"'):
+        with self.assertRaisesRegex(RuntimeError, 'Expected to not find "' + re.escape('\\n') + '"'):
             self._fc().check("a").check_next("b").run("a\nx\nb")
 
     def test_check_same(self):
         self._fc().check("a").check_same("b").run("a b")
-        with self.assertRaisesRegex(RuntimeError, 'Expected to not find "\\n"'):
+        with self.assertRaisesRegex(RuntimeError, 'Expected to not find "' + re.escape('\\n') + '"'):
             self._fc().check("a").check_same("b").run("a\nb")
 
     def test_check_not(self):
@@ -283,9 +285,14 @@ class TestFileCheck(TestCase):
             self._fc().check_dag("b").check_dag("a").run("a\nc")
 
     def test_check_source_highlighted(self):
+        # The '~' run on the next line must cover exactly the match span.
         self._fc().check_source_highlighted("foo").run("some foo here\n     ~~~\nnext")
-        with self.assertRaisesRegex(RuntimeError, "highlighted but it is not"):
+        # A '~' run longer than the span violates the boundary check.
+        with self.assertRaisesRegex(RuntimeError, 'Expected to not find "' + re.escape('~') + '"'):
             self._fc().check_source_highlighted("foo").run("some foo here\n    ~~~~~~\nnext")
+        # No '~' row at all: the highlighting complaint.
+        with self.assertRaisesRegex(RuntimeError, "highlighted but it is not"):
+            self._fc().check_source_highlighted("foo").run("some foo here\nnext line")
 
     def test_check_regex(self):
         self._fc().check_regex("[0-9]+ items").run("there are 42 items")

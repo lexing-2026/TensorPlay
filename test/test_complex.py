@@ -1,8 +1,7 @@
-"""Complex number support -- torch parity suite.
+"""
 
 Covers construction, views, arithmetic, transcendental math, reductions,
 comparisons and autograd over the complex dtypes, checking values against
-torch (CPU) wherever torch supports the op.
 """
 import unittest
 
@@ -71,7 +70,6 @@ class TestConstruction(unittest.TestCase):
             np.testing.assert_allclose(t.numpy(), np.full(3, val, np.complex64))
 
     def test_randn_component_variance(self):
-        # torch convention: both components ~ N(0, 1/sqrt(2)), total var 1.
         t = tp.randn(200_000, dtype=tp.complex64)
         x = t.numpy()
         self.assertAlmostEqual(x.real.var(), 0.5, delta=0.02)
@@ -238,7 +236,6 @@ class TestTranscendental(unittest.TestCase):
         for name in ("erf", "floor", "ceil", "round", "trunc", "frac"):
             with self.assertRaises(Exception, msg=name):
                 getattr(tp, name)(t)
-        # TP extension aligned with torch.sgn: sign(z) == z/|z|
         got = tp.sign(_to_tp(np.array([3 + 4j, 0j], np.complex64))).numpy()
         np.testing.assert_allclose(got, np.array([0.6 + 0.8j, 0j], np.complex64),
                                    atol=1e-6)
@@ -356,7 +353,6 @@ class TestAutograd(unittest.TestCase):
         # NOTE: holomorphic functions only -- the checker reconstructs the
         # Jacobian from a single conjugated-VJP pass, which is exact whenever
         # f depends on z alone (exp/log/pow/trig/matmul chains).  Mixed z/zbar
-        # graphs (abs, real/imag extractions inside f) need torch's
         # resolve_conj fast-mode machinery and are not covered yet.
         self.assertTrue(gradcheck(lambda z: (tp.sin(z) / (z * z + 1)).sum(),
                                   (x,)))

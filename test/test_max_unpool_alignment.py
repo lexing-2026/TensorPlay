@@ -1,6 +1,5 @@
-"""Native max_unpool2d / max_unpool3d alignment vs torch.
+"""
 
-Covers the max_unpool family added natively to close the gap against ATen
 (MaxUnpooling.cpp / cpu/MaxUnpoolKernel.cpp / cuda/MaxUnpooling.cu): forward
 scatter at the flat in-plane indices recorded by max_pool*_with_indices,
 backward gather through autograd, direct native-op calls, round trips through

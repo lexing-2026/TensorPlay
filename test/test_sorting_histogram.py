@@ -1,16 +1,14 @@
-"""Parity tests for the native quantile / nanquantile / histogram batch.
+"""Behavior tests for the native quantile / nanquantile / histogram batch.
 
 The three ops are device-generic dispatcher composites in
-p10/src/backend/cpu/MiscKernels.cpp, ported from ATen native/Sorting.cpp
 (quantile_impl) and native/Histogram.cpp + cpu/HistogramKernel.cpp; one
 registration serves CPU and CUDA.  These cases compare against the local
-torch runtime on CPU; CUDA execution of the same bodies is exercised on the
 GPU machine (see .remote_build.md).
 """
 import unittest
 
 import numpy as np
-import torch  # keep first: tp/_C and torch may share libcudart (remote note)
+import torch
 
 import tensorplay as tp
 
@@ -102,7 +100,6 @@ class TestQuantile(QuantileTestBase):
         )
 
     def test_python_number_q_wraps_input_dtype(self):
-        # torch wraps a python-number q in the *input's* dtype: f64 stays f64.
         self.assertParity(
             tp.quantile(t2tp(self.x64), 0.5),
             torch.quantile(self.x64, 0.5),
@@ -125,7 +122,7 @@ class TestQuantile(QuantileTestBase):
         with self.assertRaises(Exception):
             tp.quantile(tp.tensor([]), 0.5)
         with self.assertRaises(Exception):
-            tp.quantile(tp.arange(4), 0.5)  # integral input rejected, as torch
+            tp.quantile(tp.arange(4), 0.5)
 
 
 class TestHistogram(QuantileTestBase):
@@ -226,4 +223,3 @@ class TestHistogram(QuantileTestBase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
-

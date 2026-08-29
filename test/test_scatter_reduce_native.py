@@ -1,10 +1,9 @@
-"""Spec tests: native scatter_reduce / index_reduce vs local torch 2.13.
+"""
 
-The fused reduce-scatter family was ported down to real CPU kernels
+The fused reduce-scatter family is exercised through real CPU kernels
 (p10/src/backend/cpu/IndexingKernels.cpp) with CUDA ports pending remote
-compilation. Forward mirrors ATen scatter_impl +
 scatter_reduce_exclude_self_helper + the mean count epilogue; backward
-mirrors FunctionsManual.cpp scatter_reduce_backward / index_reduce_backward.
+and covers scatter_reduce_backward / index_reduce_backward behavior.
 Covers all five reduce ops x include_self on/off, multi-inner layouts,
 negative dims/indices, autograd through both self and src/source, and the
 Tensor method bindings.
@@ -69,7 +68,6 @@ def test_scatter_reduce_forward(reduce, include_self):
 
 
 def _ir_cases():
-    # torch index_reduce contract: index is 1-D; source has self's rank with
     # source.size(dim) == index.numel() and equal sizes elsewhere.
     yield (
         torch.arange(8.0).reshape(2, 4),
@@ -199,7 +197,6 @@ def test_prod_gradient_zero_handling():
 
 
 def test_include_self_false_keeps_unwritten_positions():
-    # ATen resets only the indexed slices; untouched positions keep self.
     self_t = torch.tensor([1.0, 2.0, 3.0, 4.0])
     idx = torch.tensor([0])
     src_t = torch.tensor([7.0])
@@ -217,7 +214,6 @@ def test_include_self_false_keeps_unwritten_positions():
 
 
 def test_mean_int_dtype_floor_division():
-    # torch: integral mean divides with floor rounding
     self_t = torch.tensor([[7, 5], [3, 9]], dtype=torch.int64)
     idx = torch.tensor([[0, 1], [0, 1]])
     src_t = torch.tensor([[2, 4], [3, 1]], dtype=torch.int64)
@@ -250,7 +246,6 @@ def test_out_of_range_index_raises():
 
 
 def test_negative_index_rejected_like_torch():
-    # torch rejects negative indices in the scatter family
     with pytest.raises(Exception):
         tp.scatter_reduce(
             tp.tensor([1.0, 2.0, 3.0]), 0, tp.tensor([-1]),

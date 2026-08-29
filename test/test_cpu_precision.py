@@ -3,7 +3,6 @@ import tensorplay as tp
 import tensorplay.nn as tp_nn
 import numpy as np
 
-# Helper to copy torch tensor to tensorplay tensor
 def to_tp(t_torch, requires_grad=False):
     t_np = t_torch.detach().numpy()
     t_tp = tp.tensor(t_np, dtype=tp.float32, device=tp.device("cpu"), requires_grad=requires_grad)
@@ -28,7 +27,6 @@ def check(name, tp_tensor, torch_tensor, atol=1e-4, rtol=1e-3):
     if not np.allclose(tp_np, torch_np, atol=atol, rtol=rtol):
         print(f"FAIL {name}: Max diff {max_diff}")
         # print("TP sample:", tp_np.flatten()[:5])
-        # print("Torch sample:", torch_np.flatten()[:5])
         return False
     else:
         print(f"PASS {name}: Max diff {max_diff}")

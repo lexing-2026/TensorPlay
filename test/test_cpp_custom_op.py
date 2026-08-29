@@ -2,7 +2,7 @@
 yaml -> tools/codegen/tensorplaygen.py -> g++ extension linked against
 libp10 + libtp_python (single-copy bridge) -> dispatcher-backed calls.
 
-Mirrors the add_tensorplay_op() flow from cmake/TensorPlayCustomOp.cmake,
+Exercises the add_tensorplay_op() flow from cmake/TensorPlayCustomOp.cmake,
 but compiles directly so the test does not need a second CMake binary dir.
 """
 

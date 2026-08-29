@@ -1,7 +1,6 @@
-"""Spec tests: cov / corrcoef native ops vs local torch oracle.
+"""
 
-Covers ATen Correlation.cpp semantics ported to native kernels:
-forward parity (dtype preservation, weighted/unweighted, corner cases),
+forward behavior checks (dtype preservation, weighted/unweighted, corner cases),
 autograd through the explicit _cov_backward/_corrcoef_backward helpers,
 and error surfaces.
 """
@@ -134,7 +133,6 @@ class TestCorrcoefForward(unittest.TestCase):
                                   dtype=tp.float32)).item()))
 
     def test_constant_row_nan_propagation(self):
-        # constant row produces 0 std; nan propagates like torch's composition
         m = [[1.0, 2.0, 3.0], [1.0, 2.0, 3.0]]
         r_torch = torch.corrcoef(torch.tensor(m))
         r_tp = tp.corrcoef(tp.tensor(m, dtype=tp.float32))
@@ -143,13 +141,12 @@ class TestCorrcoefForward(unittest.TestCase):
 
 
 class TestCovCorner(unittest.TestCase):
-    def test_single_observation_zeroes_input_like_upstream(self):
+    def test_single_observation_zeroes_input(self):
         x = torch.tensor([[1.0], [2.0]])
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             torch.cov(x, fweights=torch.tensor([1], dtype=torch.int64))
-        # upstream zeroes the caller's data through its aliasing view;
-        # our kernel replicates this verbatim
+        # The caller's data is zeroed through its aliasing view.
         x_tp = tp.tensor([[1.0], [2.0]], dtype=tp.float32)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -228,7 +225,6 @@ class TestCorrcoefBackward(unittest.TestCase):
 
 class TestErrors(unittest.TestCase):
     def test_bool_rejected(self):
-        # upstream TORCH_CHECK_NOT_IMPLEMENTED surfaces as NotImplementedError
         with self.assertRaises(NotImplementedError):
             tp.cov(tp.tensor([True, False], dtype=tp.bool))
 

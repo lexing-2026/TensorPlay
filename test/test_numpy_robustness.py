@@ -36,7 +36,7 @@ if __name__ == "__main__":
         test_requires_grad_error()
         print("test_requires_grad_error passed")
         test_torch_conversion()
-        print("test_torch_conversion passed")
+        print("test_reference_conversion passed")
     except Exception as e:
         print(f"Test failed: {e}")
         import traceback
