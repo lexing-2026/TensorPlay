@@ -277,7 +277,6 @@ def _single_tensor_nadam(
             updated_exp_avg_sq = exp_avg_sq
         else:
             mu_product.mul_(mu)
-            # Native Torch uses lerp here.  TensorPlay's CUDA lerp promotes
             # reduced dtypes to float for the complete recurrence, matching
             # the native rounding contract.
             exp_avg.lerp_(grad, 1 - beta1)
@@ -554,7 +553,6 @@ def nadam(
         and native_device in ("cpu", "cuda")
         and bool(params)
         # CPU and CUDA both round reduced floating point intermediates at the
-        # same foreach operation boundaries as Torch.
         and params[0].dtype in (
             tp.float16, tp.bfloat16, tp.float32, tp.float64
         )
