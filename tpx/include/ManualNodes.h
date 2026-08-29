@@ -10,10 +10,10 @@
 namespace tensorplay {
 namespace tpx {
 
-// Backward components of the native F.linear (aten Linear.cpp linear_backward
-// reduced to its 2-D-weight contract).  Like MatmulBackward, every step
-// composes dispatched recordable primitives so create_graph sees a graph
-// through the op (double-backward).
+// Backward components of native linear (reduced to its 2-D-weight contract).
+// Every step composes dispatched
+// recordable primitives so create_graph sees a graph through the op
+// (double-backward).
 //
 // Shapes: out = in_flat @ W^T (+ bias), where in_flat is `input` viewed as
 // {prod_leading, K} (1-D input behaves as a single row).
@@ -54,14 +54,15 @@ inline Tensor linear_backward_weight(const Tensor& grad, const Tensor& input,
 inline Tensor linear_backward_bias(const Tensor& grad) {
     if (!grad.defined()) return Tensor();
     if (grad.dim() == 1) {
-        return ops::sum(grad);
+        // a single-row (1-D input) forward where the bias broadcast was an
+        // identity, so the bias gradient is the grad itself -- not its sum.
+        return grad;
     }
     std::vector<int64_t> dims;
     for (int64_t d = 0; d < grad.dim() - 1; ++d) dims.push_back(d);
     return ops::sum(grad, dims);
 }
 
-// Port of at::is_expandable_to (aten/src/ATen/ExpandUtils.h): can `shape`
 // be expanded to `desired`?  Dims are aligned at the trailing side; a dim
 // may differ from the target only when the *source* dim is 1.
 inline bool is_expandable_to(const std::vector<int64_t>& shape,
@@ -77,7 +78,6 @@ inline bool is_expandable_to(const std::vector<int64_t>& shape,
     return true;
 }
 
-// Port of at::_sum_to / at::sum_to (aten/src/ATen/ExpandUtils.h): reduce
 // `tensor` down to `shape` with a single batched keepdim sum over the
 // leading extra dims and any dim whose target size is 1, then view back.
 inline Tensor sum_to(Tensor tensor, const std::vector<int64_t>& shape) {
@@ -99,7 +99,6 @@ inline Tensor sum_to(Tensor tensor, const std::vector<int64_t>& shape) {
     return leading_dims > 0 ? tensor.view(shape) : tensor;
 }
 
-// ATen native op sum_to_size (aten/src/ATen/native/TensorShape.cpp):
 // expandability check + sum_to.
 inline Tensor sum_to_size(const Tensor& self, const std::vector<int64_t>& size) {
     TP_CHECK(
@@ -110,8 +109,7 @@ inline Tensor sum_to_size(const Tensor& self, const std::vector<int64_t>& size) 
     return sum_to(self, size);
 }
 
-// Port of autograd::maybe_multiply
-// (torch/csrc/autograd/FunctionsManual.cpp:138): derivatives expressed as
+// Scalar multiplier helper for autograd formulas.
 // `expr * alpha` elide the pointwise multiply entirely when the scalar is 1,
 // so beta=alpha=1 backwards (every F.linear/addmm training step) no longer
 // pay a full-tensor mul + allocation per gradient slot.
@@ -120,8 +118,7 @@ inline Tensor maybe_multiply(const Tensor& t, const Scalar& s) {
     return t.mul(s);
 }
 
-// Faithful port of autograd::repeat_backward
-// (torch/csrc/autograd/FunctionsManual.cpp): guard zero repeats, sum away
+// Repeat backward helper.
 // unsqueezed leading dims, then one reshape to interleaved (repeat, size)
 // pairs — only where repeat != 1 — followed by a single batched sum.
 inline Tensor repeat_backward(Tensor grad, const std::vector<int64_t>& repeats,
@@ -155,8 +152,7 @@ inline Tensor repeat_backward(Tensor grad, const std::vector<int64_t>& repeats,
     return grad;
 }
 
-// Faithful port of autograd::unsqueeze_to
-// (torch/csrc/autograd/FunctionsManual.cpp): squeeze backward re-inserts
+// Unsqueeze backward helper.
 // exactly the size-1 dims that the forward removed; dims listed but not
 // squeezed (size != 1) pass through untouched.  Ascending sequential
 // unsqueeze keeps later insertion indices valid.
@@ -178,9 +174,7 @@ inline Tensor unsqueeze_to(const Tensor& grad, const std::vector<int64_t>& dims,
 }
 
 // Derivative of max/min(dim, keepdim): route the incoming gradient to the
-// winning positions.  Recordable composition of unsqueeze/eq/mul -- the
-// upstream namesake native (FunctionsManual.cpp) does the same with
-// dispatched at:: ops, so create_graph sees through max/min(dim).
+// winning positions through recorded unsqueeze/eq/mul operations.
 inline Tensor value_selecting_reduction_backward(const Tensor& grad, int64_t dim,
                                                  const Tensor& indices,
                                                  const Tensor& self, bool keepdim) {
@@ -231,8 +225,7 @@ inline Tensor broadcast_mean_backward(const Tensor& grad, const Tensor& self,
 }
 
 // block_diag backward: scatter each output-block gradient back to its input.
-// Upstream derives this from CopySlices on the zeros+slice+copy_ composite;
-// our copy_ does not yet record view mutation, so the layout is explicit.
+// The layout is explicit because view mutation is not recorded by copy_.
 // Block extents follow the forward promotion: 0-D -> 1x1, 1-D -> (1, n).
 struct BlockDiagBackward : public Node {
     std::vector<SavedVariable> tensors_;
@@ -318,7 +311,6 @@ struct AsStridedBackward : public Node {
 // here but was never instantiated -- the generated autograd node (from
 // derivatives.yaml) is authoritative and avoids the double bookkeeping.
 // mean(dtype=...) may accumulate in a wider dtype, but its derivative must be
-// represented in the input dtype (the same contract as torch).  Keep this
 // cast in the manual node so a float32 reduction of an fp16/bf16 tensor does
 // not leak a float32 gradient into the leaf or into the SDPA backward node.
 struct MeanBackward : public Node {
@@ -341,10 +333,9 @@ struct MeanBackward : public Node {
 };
 
 // matmul backward over every dim combination (dot / vec@mat / mat@vec /
-// batched with broadcasting).  Upstream likewise keeps a hand-written native
-// (matmul_backward, LinearAlgebra.cpp) because derivative formulas cannot
-// branch on dim(); like upstream, every step composes dispatched recordable
-// primitives, so create_graph sees a graph through `@` (double-backward).
+// batched with broadcasting).  The hand-written node branches on dim(); every
+// step composes dispatched recordable primitives, so create_graph sees a graph
+// through `@` (double-backward).
 struct MatmulBackward : public Node {
     SavedVariable self_;
     SavedVariable other_;
@@ -361,17 +352,15 @@ struct MatmulBackward : public Node {
         const bool other_vector = other.dim() == 1;
 
         if (isComplexType(self.dtype())) {
-            // The complex adjoint is the conjugate transpose; the recordable
-            // conj building blocks (select/slice derivatives) are not wired
-            // yet, so delegate to the retained native helper ops -- values
-            // match upstream exactly, but the complex branch does not record
-            // (same depth as before this node existed).
+            // The complex adjoint is the conjugate transpose.  The complex
+            // branch delegates to the retained helper ops because its view
+            // operations are not recordable yet.
             return {ops::matmul_backward_self(grad, self, other),
                     ops::matmul_backward_other(grad, self, other)};
         }
 
-        // Normalize vectors into matrix space (same convention as the fused
-        // matmul_backward kernels and upstream LinearAlgebra.cpp).
+        // Normalize vectors into matrix space before applying the batched
+        // matrix formulas.
         Tensor self_m = self_vector ? ops::unsqueeze(self, 0) : self;
         Tensor other_m = other_vector ? ops::unsqueeze(other, -1) : other;
         Tensor grad_m = grad;
@@ -386,7 +375,7 @@ struct MatmulBackward : public Node {
         auto adjoint = [](const Tensor& t) {
             return t.dim() == 2 ? ops::t(t) : ops::transpose(t, -2, -1);
         };
-        // Broadcast-accumulate `g` down to `target` (port of the kernels'
+        // Broadcast-accumulate `g` down to `target` (using the kernels'
         // sum_to_shape_cpu, expressed with a recordable batched keepdim sum).
         auto reduce_to = [](const Tensor& g, const Tensor& target) {
             const auto src = static_cast<std::vector<int64_t>>(g.shape());
@@ -463,7 +452,6 @@ struct CatBackward : public Node {
 
 // ===========================================================================
 // Multi-output view ops: unbind / split / split.sizes / chunk
-// (torch FunctionsManual.cpp unbind_backward / split_with_sizes_backward).
 // One shared node serves all forward outputs; each output carries the same
 // grad_fn with its own output_nr, which indexes the node's input slots.
 // Unused output slots are zero-filled: the engine materializes them from
@@ -524,7 +512,6 @@ struct UnbindBackward : public Node {
     size_t num_inputs() const override { return shapes_.size(); }
 
     variable_list apply(variable_list&& inputs) override {
-        // torch unbind_backward: stack(grads, dim) with undefined grads
         // replaced by zeros.
         std::vector<Tensor> grads = detail::materialize_grads(inputs, shapes_, dtype_, device_);
         if (grads.empty()) return {Tensor()};
@@ -532,7 +519,6 @@ struct UnbindBackward : public Node {
     }
 };
 
-// Shared by split, split.sizes and chunk: torch records SplitBackward0 for
 // all three (chunk is CompositeImplicitAutograd through split).
 struct SplitBackward : public Node {
     int64_t dim_;
@@ -547,7 +533,6 @@ struct SplitBackward : public Node {
     size_t num_inputs() const override { return shapes_.size(); }
 
     variable_list apply(variable_list&& inputs) override {
-        // torch split_with_sizes_backward: cat(grads, dim) with undefined
         // grads replaced by zeros sized to each split.
         std::vector<Tensor> grads = detail::materialize_grads(inputs, shapes_, dtype_, device_);
         if (grads.empty()) return {Tensor()};
@@ -555,11 +540,9 @@ struct SplitBackward : public Node {
     }
 };
 
-// torch differentiates roll as grad.roll(-shifts, dims) (derivatives.yaml:
-// "self: grad.roll_symint(fmap(reverse_list_symint(shifts), [](c10::SymInt i)
-// {return -i;}), reverse_list(dims))").  TensorPlay's formula DSL cannot map
-// over int64 lists, so the element-wise negation happens here and the node
-// simply re-rolls the gradient with the negated shifts.
+// Roll backward negates each requested shift and preserves dimension order.
+// TensorPlay's formula DSL cannot map over int64 lists, so the element-wise
+// negation happens here and the node simply re-rolls the gradient.
 struct RollBackward : public Node {
     std::vector<int64_t> shifts_;
     std::vector<int64_t> dims_;
@@ -607,15 +590,13 @@ struct StackBackward : public Node {
 };
 
 // ===========================================================================
-// Manual backward helpers -- port of torch/csrc/autograd/FunctionsManual.cpp
-// for the elementwise formulas that carry torch's complex convention: every
-// pointwise Jacobian J is applied as grad * J.conj(), so the stored leaf
-// gradient matches torch's conjugated-gradient representation.
+// Manual backward helpers: each pointwise Jacobian J is applied as grad *
+// J.conj(), so the stored leaf
 // conj over real dtypes is an alias (see conj_cpu), so the real training
 // path stays copy-free.
 // ===========================================================================
 
-// FunctionsManual.cpp handle_r_to_c: if the forward output dtype is real but
+// Complex-gradient rule: if the forward output dtype is real but
 // the formula produced a complex gradient, keep only the real part.
 inline Tensor handle_r_to_c(DType self_st, Tensor gradient_result) {
     if (!isComplexType(self_st) && isComplexType(gradient_result.dtype())) {
@@ -632,7 +613,7 @@ inline Scalar scalar_conj_if_complex(const Scalar& s) {
     return Scalar(std::complex<double>(c.real(), -c.imag()));
 }
 
-// FunctionsManual.cpp mul_tensor_backward: grad * other.conj()
+// Complex multiplication backward: grad * other.conj()
 template <typename T>
 inline Tensor mul_tensor_backward(const Tensor& grad, const T& other,
                                   DType self_st) {
@@ -645,7 +626,7 @@ inline Tensor mul_tensor_backward(const Tensor& grad, const T& other,
     return handle_r_to_c(self_st, std::move(scaled));
 }
 
-// FunctionsManual.cpp div_tensor_self_backward: grad / other.conj()
+// Complex division backward: grad / other.conj()
 template <typename T>
 inline Tensor div_tensor_self_backward(const Tensor& grad, const T& other,
                                        DType self_st) {
@@ -659,7 +640,7 @@ inline Tensor div_tensor_self_backward(const Tensor& grad, const T& other,
 }
 
 // div_tensor_other_backward: -grad * conj((self / other) / other)
-// (FunctionsManual.cpp conjugates the whole quotient, self included).
+// The quotient is conjugated as a whole, including self.
 inline Tensor div_tensor_other_backward(const Tensor& grad,
                                         const Tensor& self,
                                         const Tensor& other) {
@@ -667,7 +648,7 @@ inline Tensor div_tensor_other_backward(const Tensor& grad,
         other.dtype(), -(grad * ops::conj(self / other / other)));
 }
 
-// FunctionsManual.cpp pow_backward (scalar exponent): zero exponent short
+// Scalar-exponent power backward: zero exponent short
 // circuits; otherwise exponent * self^(exponent-1) under conj.
 inline Tensor pow_backward(const Tensor& grad, const Tensor& self,
                            const Scalar& exponent) {
@@ -700,7 +681,7 @@ inline Tensor pow_backward_exponent(const Tensor& grad, const Tensor& self,
                       grad * ops::conj(result * self.log()));
 }
 
-// FunctionsManual.cpp log1p_backward: grad / (self + 1).conj()
+// log1p backward: grad / (self + 1).conj()
 inline Tensor log1p_backward(const Tensor& grad, const Tensor& self) {
     return grad / ops::conj(self + 1);
 }
@@ -714,7 +695,7 @@ inline Tensor acosh_backward(const Tensor& grad, const Tensor& self) {
     return grad * ops::conj(ops::rsqrt(self + 1) * ops::rsqrt(self - 1));
 }
 
-// FunctionsManual.cpp angle_backward: zero at z == 0, otherwise
+// Angle backward: zero at z == 0, otherwise
 // grad * i * z / |z|^2 (already the conjugated Jacobian).
 inline Tensor angle_backward(const Tensor& grad, const Tensor& self) {
     if (!isComplexType(self.dtype())) {
@@ -729,7 +710,7 @@ inline Tensor angle_backward(const Tensor& grad, const Tensor& self) {
     return ops::where(zero_c, zero, out.to(self.dtype()));
 }
 
-// FunctionsManual.cpp prod_backward fast path: exact when no element is zero;
+// Product backward fast path: exact when no element is zero;
 // all-zero gradient when more than one zero exists (the single-zero scatter
 // case needs nonzero(), which p10 does not expose yet).
 inline Tensor prod_backward_fast(const Tensor& grad, const Tensor& input,
@@ -744,9 +725,7 @@ inline Tensor prod_backward_fast(const Tensor& grad, const Tensor& input,
 
 // ===========================================================================
 // Reduction / indexing / special-function backward helpers.
-// Faithful ports of torch/csrc/autograd/FunctionsManual.cpp (and the ATen
 // natives it delegates to), expressed as compositions of dispatched recordable
-// primitives so first-order values match torch and create_graph records.
 // ===========================================================================
 
 inline std::vector<int64_t> wrap_dims(const std::vector<int64_t>& dims,
@@ -763,7 +742,7 @@ inline std::vector<int64_t> all_dims(int64_t ndim) {
     return d;
 }
 
-// FunctionsManual.cpp restore_reduced_dims: re-insert size-1 dims removed by
+// Restore reduced dimensions by re-inserting size-1 dims removed by
 // a keepdim=False reduction so the gradient broadcasts against the input.
 inline Tensor restore_reduced_dims(const Tensor& output,
                                    const std::vector<int64_t>& dims,
@@ -783,14 +762,14 @@ inline Tensor restore_reduced_dims(const Tensor& output,
     return ops::reshape(output, target);
 }
 
-// FunctionsManual.cpp scale_grad_by_count.
+// Scale a gradient by the number of contributing elements.
 inline Tensor scale_grad_by_count(const Tensor& grad, const Tensor& mask,
                                   const std::vector<int64_t>& dims) {
     Tensor mask_f = mask.dtype() == grad.dtype() ? mask : mask.to(grad.dtype());
     return ops::mul(ops::div(grad, ops::sum(mask_f, dims, true)), mask_f);
 }
 
-// amax/amin backward (FunctionsManual.cpp: restore dims, mask the argmax
+// amax/amin backward: restore dims, mask the argmax
 // positions, split the gradient across ties).
 inline Tensor amax_amin_backward(const Tensor& grad, const Tensor& self,
                                  const Tensor& result,
@@ -803,7 +782,7 @@ inline Tensor amax_amin_backward(const Tensor& grad, const Tensor& self,
     return scale_grad_by_count(g, ops::eq(r, self), dims);
 }
 
-// FunctionsManual.cpp evenly_distribute_backward (device-generic branch):
+// Evenly distribute a reduction gradient across contributing elements:
 // full-reduction max/min/median spread the gradient evenly across all
 // positions that attained the reduced value (NaN matches NaN).
 inline Tensor evenly_distribute_backward(const Tensor& grad,
@@ -816,7 +795,6 @@ inline Tensor evenly_distribute_backward(const Tensor& grad,
     return ops::mul(mask_f, ops::div(grad, ops::sum(mask_f)));
 }
 
-// ATen value_selecting_reduction_backward (ReduceOps.cpp): route the gradient
 // to the winning positions via scatter (O(n); used by topk/sort/mode/kthvalue
 // and dim-reductions returning indices).
 inline Tensor value_selecting_backward(const Tensor& grad, int64_t dim,
@@ -833,7 +811,6 @@ inline Tensor value_selecting_backward(const Tensor& grad, int64_t dim,
     return ops::scatter(ops::zeros_like(self), d, idx, g);
 }
 
-// ATen cummaxmin_backward (ReduceOps.cpp): duplicate winning positions are
 // accumulated with scatter_add.
 inline Tensor cummaxmin_backward(const Tensor& grad, const Tensor& input,
                                  const Tensor& indices, int64_t dim) {
@@ -844,7 +821,7 @@ inline Tensor cummaxmin_backward(const Tensor& grad, const Tensor& input,
     return ops::scatter_add(ops::zeros_like(input), d, indices, g);
 }
 
-// FunctionsManual.cpp sum_backward: restore reduced dims, expand back.
+// Sum backward: restore reduced dims, expand back.
 inline Tensor sum_backward(const Tensor& grad,
                            const std::vector<int64_t>& sizes,
                            std::vector<int64_t> dims, bool keepdim) {
@@ -854,7 +831,7 @@ inline Tensor sum_backward(const Tensor& grad,
     return ops::expand(restore_reduced_dims(grad, dims, keepdim), sizes);
 }
 
-// FunctionsManual.cpp nansum_backward.
+// NaN-aware sum backward.
 inline Tensor nansum_backward(const Tensor& grad, const Tensor& self,
                               const std::vector<int64_t>& dims, bool keepdim) {
     const auto sizes = static_cast<std::vector<int64_t>>(self.shape());
@@ -881,7 +858,7 @@ inline Tensor nanmean_backward(const Tensor& grad, const Tensor& self,
     return ops::mul(ops::div(g, count), non_nan);
 }
 
-// FunctionsManual.cpp norm_backward (both arities).  Real-dtype port; the
+// Norm backward (both arities). Real-dtype path; the
 // p == 0 norm is a count and has no gradient (undefined, engine treats as 0).
 inline Tensor norm_backward(Tensor grad, const Tensor& self, double p,
                             Tensor norm, std::vector<int64_t> dims,
@@ -938,7 +915,7 @@ inline Tensor norm_backward(const Tensor& grad, const Tensor& self,
     return norm_backward(grad, self, p.to<double>(), norm, {}, true);
 }
 
-// FunctionsManual.cpp prod_safe_zeros_backward: exclusive normal/reverse
+// Product backward with zeros: exclusive normal/reverse
 // cumprod pair -- exact even when the input contains zeros.
 inline Tensor prod_safe_zeros_backward(const Tensor& grad, const Tensor& inp,
                                        int64_t dim) {
@@ -960,7 +937,7 @@ inline Tensor prod_safe_zeros_backward(const Tensor& grad, const Tensor& inp,
     return grad * ops::conj(excl_normal * excl_reverse);
 }
 
-// FunctionsManual.cpp prod_backward (full reduction): exact including the
+// Product backward (full reduction): exact including the
 // single-zero case (the safe path handles it; >1 zeros naturally give 0).
 inline Tensor prod_backward(const Tensor& grad, const Tensor& input,
                             const Tensor& result) {
@@ -1016,7 +993,6 @@ inline Tensor prod_backward(Tensor grad, const Tensor& input, Tensor result,
     return ops::permute(out_perm, inv);
 }
 
-// ATen cumprod_backward (ReduceOps.cpp): O(n) zero-aware composition
 // (reversed cumsum of output*grad divided by the input, with the first-zero
 // mask gymnastics for slices containing zeros).
 inline Tensor reversed_cumsum(const Tensor& w, int64_t dim) {
@@ -1068,7 +1044,7 @@ inline Tensor cumprod_backward(const Tensor& grad, const Tensor& input,
     return grad_input;
 }
 
-// FunctionsManual.cpp logcumsumexp_backward (real branch): split positive /
+// logcumsumexp backward (real branch): split positive /
 // negative gradient mass, run a reversed logcumsumexp, re-exponentiate.
 inline Tensor logcumsumexp_backward(const Tensor& grad, const Tensor& self,
                                     const Tensor& result, int64_t dim) {
@@ -1089,7 +1065,7 @@ inline Tensor logcumsumexp_backward(const Tensor& grad, const Tensor& self,
     return out_pos - out_neg;
 }
 
-// FunctionsManual.cpp renorm_backward, with linalg_vector_norm expressed as
+// renorm backward, with linalg_vector_norm expressed as
 // the dispatched norm(dim) reduction (same value for strided dense inputs).
 inline Tensor renorm_backward(const Tensor& grad, const Tensor& self,
                               const Scalar& p, int64_t dim,
@@ -1108,7 +1084,7 @@ inline Tensor renorm_backward(const Tensor& grad, const Tensor& self,
     return ops::where(ops::gt(norm, maxnorm), grad_norm.to(grad.dtype()), grad);
 }
 
-// FunctionsManual.cpp sinc_backward.
+// sinc backward.
 inline Tensor sinc_backward(const Tensor& grad, const Tensor& self) {
     const double pi = 3.14159265358979323846;
     const Tensor self_pi = self * pi;
@@ -1119,7 +1095,7 @@ inline Tensor sinc_backward(const Tensor& grad, const Tensor& self) {
                       ops::zeros_like(grad), out);
 }
 
-// FunctionsManual.cpp take_backward: flatten + accumulating put.
+// take backward: flatten + accumulating put.
 inline Tensor take_backward(const Tensor& grad, const Tensor& self,
                             const Tensor& indices) {
     const auto sizes = static_cast<std::vector<int64_t>>(self.shape());
@@ -1130,7 +1106,6 @@ inline Tensor take_backward(const Tensor& grad, const Tensor& self,
     return ops::reshape(grad_flat, sizes);
 }
 
-// ATen masked_select_backward (TensorAdvancedIndexing.cpp).
 inline Tensor masked_select_backward(const Tensor& grad, const Tensor& input,
                                      const Tensor& mask) {
     const auto a = static_cast<std::vector<int64_t>>(input.shape());
@@ -1146,7 +1121,6 @@ inline Tensor masked_select_backward(const Tensor& grad, const Tensor& input,
         ops::zeros(bshape, input.dtype(), input.device()), mask, grad);
 }
 
-// ATen masked_scatter_backward_symint: the source gradient is the masked
 // slice of grad, zero-padded to the source numel and reshaped back.
 inline Tensor masked_scatter_backward(const Tensor& grad, const Tensor& mask,
                                       const Tensor& source) {
@@ -1160,14 +1134,13 @@ inline Tensor masked_scatter_backward(const Tensor& grad, const Tensor& mask,
     return ops::reshape(sel, sizes);
 }
 
-// ATen trace_backward_symint: gradient lives on the diagonal.
 inline Tensor trace_backward(const Tensor& grad, const Tensor& self) {
     return ops::eye(self.size(0), self.size(1), grad.dtype(), grad.device()) *
            grad;
 }
 
-// FunctionsManual.cpp var_backward (dim-list flavor; empty dims == full
-// reduction), ported for TP's int correction.
+// var backward (dim-list flavor; empty dims == full reduction), with TP's
+// integer correction.
 inline Tensor var_backward(Tensor grad, const Tensor& self,
                            std::vector<int64_t> dims, int64_t correction,
                            bool keepdim) {
@@ -1194,7 +1167,7 @@ inline Tensor var_backward(Tensor grad, const Tensor& self,
                     Scalar(2.0 / dof));
 }
 
-// FunctionsManual.cpp std_backward.
+// std backward.
 inline Tensor std_backward(const Tensor& result, const Tensor& grad,
                            const Tensor& self,
                            const std::vector<int64_t>& dims,
@@ -1205,7 +1178,7 @@ inline Tensor std_backward(const Tensor& result, const Tensor& grad,
     return var_backward(grad_var, self, dims, correction, keepdim);
 }
 
-// FunctionsManual.cpp mean_backward (sizes/dims flavor).
+// mean backward (sizes/dims flavor).
 inline Tensor mean_backward(const Tensor& grad,
                             const std::vector<int64_t>& sizes,
                             std::vector<int64_t> dims, bool keepdim) {
@@ -1262,7 +1235,6 @@ inline Tensor index_nd(const Tensor& grad, const std::vector<Tensor>& indices) {
     return ops::reshape(sel, out_shape);
 }
 
-// ATen index_put backward pair (FunctionsManual.cpp via derivatives.yaml):
 // self keeps grad except at overwritten positions (unless accumulate);
 // values gather grad at the indexed positions.
 inline std::tuple<Tensor, Tensor> index_put_backward(
@@ -1343,7 +1315,6 @@ struct AminmaxBackward : public Node {
         auto dims = wrap_dims(dims_, nd);
         if (dims.empty()) dims = all_dims(nd);
         // Recompute min/max positions from the saved input: the forward
-        // outputs are not saved (torch saves only self as well).
         auto [minv, maxv] = ops::aminmax(self, dims_, keepdim_);
         Tensor result;
         if (grad_min.defined()) {
