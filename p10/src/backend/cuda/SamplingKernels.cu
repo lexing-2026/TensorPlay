@@ -225,105 +225,6 @@ __global__ void scan_sample_kernel(
 }
 
 // ---------------------------------------------------------------------------
-// Requires cols (padded to a power of two) <= 4096 to fit in shared memory.
-// ---------------------------------------------------------------------------
-
-__device__ __forceinline__ void bitonic_swap(float* vals, int64_t* idxs, int i, int j, bool ascending) {
-  if ((vals[i] > vals[j]) == ascending) {
-    float t = vals[i]; vals[i] = vals[j]; vals[j] = t;
-    int64_t ti = idxs[i]; idxs[i] = idxs[j]; idxs[j] = ti;
-  }
-}
-
-__global__ void bitonic_topk_kernel(
-    const float* __restrict__ in,
-    float* __restrict__ out_vals,
-    int64_t* __restrict__ out_idxs,
-    int64_t rows, int64_t cols, int64_t k, bool largest, int64_t n) {
-  extern __shared__ float smem_vals[];  // n floats
-  int64_t* smem_idxs = reinterpret_cast<int64_t*>(smem_vals + n);  // n int64
-  int64_t row = blockIdx.x;
-  const float* row_in = in + row * cols;
-
-  for (int i = threadIdx.x; i < n; i += blockDim.x) {
-    smem_vals[i] = (i < cols) ? row_in[i] : (largest ? -INFINITY : INFINITY);
-    smem_idxs[i] = i;
-  }
-  __syncthreads();
-
-  bool ascending = !largest;
-  for (int size = 2; size <= n; size <<= 1) {
-    for (int stride = size >> 1; stride > 0; stride >>= 1) {
-      for (int i = threadIdx.x; i < n; i += blockDim.x) {
-        int j = i ^ stride;
-        if (j > i) {
-          bool up = ((i & size) == 0) == ascending;
-          bitonic_swap(smem_vals, smem_idxs, i, j, up);
-        }
-      }
-      __syncthreads();
-    }
-  }
-
-  for (int i = threadIdx.x; i < k; i += blockDim.x) {
-    out_vals[row * k + i] = smem_vals[i];
-    out_idxs[row * k + i] = smem_idxs[i];
-  }
-}
-
-// ---------------------------------------------------------------------------
-// topk — impl 1: iterative argmax selection, one occurrence removed per
-// iteration. Works for any cols / k; O(k * cols) work. `largest=false`
-// selects the smallest values.
-// ---------------------------------------------------------------------------
-
-__global__ void iterative_topk_kernel(
-    float* __restrict__ scratch,
-    const float* __restrict__ in,
-    float* __restrict__ out_vals,
-    int64_t* __restrict__ out_idxs,
-    int64_t rows, int64_t cols, int64_t k, bool largest) {
-  extern __shared__ float smem[];  // 2 * blockDim floats
-  int64_t row = blockIdx.x;
-  const float* row_in = in + row * cols;
-  float* row_scratch = scratch + row * cols;
-  int nthreads = blockDim.x;
-
-  for (int64_t c = threadIdx.x; c < cols; c += nthreads)
-    row_scratch[c] = row_in[c];
-  __syncthreads();
-
-  for (int64_t t = 0; t < k; ++t) {
-    float best = largest ? -INFINITY : INFINITY;
-    int64_t best_idx = -1;
-    for (int64_t c = threadIdx.x; c < cols; c += nthreads) {
-      float v = row_scratch[c];
-      if ((largest && v > best) || (!largest && v < best)) {
-        best = v;
-        best_idx = c;
-      }
-    }
-    smem[threadIdx.x * 2] = best;
-    smem[threadIdx.x * 2 + 1] = (float)best_idx;
-    __syncthreads();
-    if (threadIdx.x == 0) {
-      for (int i = 1; i < nthreads; ++i) {
-        float v = smem[i * 2];
-        if ((largest && v > smem[0]) || (!largest && v < smem[0])) {
-          smem[0] = v;
-          smem[1] = smem[i * 2 + 1];
-        }
-      }
-      out_vals[row * k + t] = smem[0];
-      out_idxs[row * k + t] = (int64_t)smem[1];
-      if (smem[1] >= 0.f)
-        row_scratch[(int64_t)smem[1]] = largest ? -INFINITY : INFINITY;
-    }
-    __syncthreads();
-  }
-}
-
-// ---------------------------------------------------------------------------
 // sample — impl 0 reference pipeline: temp+softmax -> exact top-k mask ->
 // exact top-p mask -> multinomial (prefix sum + binary search). Multi-kernel.
 // ---------------------------------------------------------------------------
@@ -647,56 +548,6 @@ Tensor multinomial_kernel_cuda(const Tensor& self, int64_t num_samples, bool rep
   return result;
 }
 
-std::tuple<Tensor, Tensor> topk_kernel_cuda(const Tensor& self, int64_t k, int64_t dim, bool largest, bool sorted, int64_t impl) {
-  Tensor input = self.contiguous();
-  int64_t ndim = input.dim();
-  if (dim < 0) dim += ndim;
-  if (dim != ndim - 1) {
-    TP_THROW(NotImplementedError, "topk: only the last dim is supported for now");
-  }
-  int64_t rows = input.numel() / input.size(ndim - 1);
-  int64_t cols = input.size(ndim - 1);
-  if (k < 0 || k > cols) {
-    TP_THROW(RuntimeError, "topk: k must be in [0, cols]");
-  }
-  if (input.dtype() != DType::Float32) {
-    TP_THROW(NotImplementedError, "topk: only float32 is supported for now");
-  }
-
-  std::vector<int64_t> shape = static_cast<std::vector<int64_t>>(input.shape());
-  shape[ndim - 1] = k;
-  Tensor values = Tensor::empty(shape, input.dtype(), input.device());
-  Tensor indices = Tensor::empty(shape, DType::Int64, input.device());
-  if (k == 0) return {values, indices};
-
-  constexpr int kThreads = 256;
-  int64_t padded = 1;
-  while (padded < cols) padded <<= 1;
-
-  if (impl == 0) {
-    if (padded > 4096) {
-      TP_THROW(NotImplementedError, "topk impl=0 (bitonic) supports cols <= 4096; use impl=1 for larger inputs");
-    }
-    int threads = (int)std::min<int64_t>(padded, 512);
-    size_t smem = padded * (sizeof(float) + sizeof(int64_t));
-    bitonic_topk_kernel<<<rows, threads, smem, getCurrentCUDAStream().stream()>>>(
-        input.data_ptr<float>(), values.data_ptr<float>(), indices.data_ptr<int64_t>(),
-        rows, cols, k, largest, padded);
-    TP_CUDA_CHECK(cudaGetLastError());
-  } else if (impl == 1) {
-    Tensor scratch = Tensor::empty({rows, cols}, DType::Float32, input.device());
-    size_t smem = kThreads * 2 * sizeof(float);
-    iterative_topk_kernel<<<rows, kThreads, smem, getCurrentCUDAStream().stream()>>>(
-        scratch.data_ptr<float>(), input.data_ptr<float>(),
-        values.data_ptr<float>(), indices.data_ptr<int64_t>(),
-        rows, cols, k, largest);
-    TP_CUDA_CHECK(cudaGetLastError());
-  } else {
-    TP_THROW(RuntimeError, "topk: unknown impl " + std::to_string(impl));
-  }
-  return {values, indices};
-}
-
 Tensor sample_kernel_cuda(const Tensor& logits, double temperature, int64_t top_k, double top_p, int64_t impl) {
   if (temperature <= 0) {
     TP_THROW(RuntimeError, "sample: temperature must be > 0");
@@ -766,7 +617,6 @@ Tensor sample_kernel_cuda(const Tensor& logits, double temperature, int64_t top_
 
 TENSORPLAY_LIBRARY_IMPL(CUDA, SamplingKernels) {
   m.impl("multinomial", multinomial_kernel_cuda);
-  m.impl("topk", topk_kernel_cuda);
   m.impl("sample", sample_kernel_cuda);
 }
 
