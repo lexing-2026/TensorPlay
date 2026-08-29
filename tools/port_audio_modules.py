@@ -100,7 +100,7 @@ def main():
         text = rewrite(src.read_text())
         dst.write_text(text)
         copied += 1
-    print(f"ported {copied} files into {DST}")
+    print(f"updated {copied} files in {DST}")
 
 
 if __name__ == "__main__":
