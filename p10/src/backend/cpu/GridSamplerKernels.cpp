@@ -1,10 +1,7 @@
 // grid_sampler_2d / grid_sampler_3d CPU kernels.
 //
-// Port of aten/src/ATen/native/cpu/GridSamplerKernel.cpp (which mirrors the
-// per-output-element formulation of aten/src/ATen/native/cuda/GridSampler.cu):
 //   interpolation_mode: 0=Bilinear 1=Nearest 2=Bicubic(2d only)
 //   padding_mode:       0=Zeros 1=Border 2=Reflection
-// Reduced-precision inputs (f16/bf16) compute in float, matching ATen's
 // opmath_t usage.
 #include "Tensor.h"
 #include "Dispatcher.h"
@@ -88,7 +85,6 @@ static Tensor grid_sampler_2d_cpu_impl(const Tensor& input, const Tensor& grid,
                             out_ptr_N[(c * out_H + h) * out_W + w] = v;
                         }
                     } else {  // Bicubic
-                        // ATen bicubic skips coordinate-level padding: each
                         // cubic tap is padding-adjusted individually.
                         compute_t x = unnormalize<compute_t>(
                             static_cast<compute_t>(grid_ptr_NHW[0]), inp_W, align_corners);
@@ -451,7 +447,6 @@ static std::tuple<Tensor, Tensor> grid_sampler_3d_backward_cpu_impl(
                             wgt[6] = (ix_tnw + 1 - ix) * (iy - iy_tnw)     * (iz - iz_tnw);
                             wgt[7] = (ix - ix_tnw)     * (iy - iy_tnw)     * (iz - iz_tnw);
                             // d weight / d (ix, iy, iz) per corner; sign pattern
-                            // follows ATen grid_sampler_3d_backward_kernel.
                             const compute_t dwx[8] = {-(iy_tnw + 1 - iy) * (iz_tnw + 1 - iz),
                                                        (iy_tnw + 1 - iy) * (iz_tnw + 1 - iz),
                                                        -(iy - iy_tnw)     * (iz_tnw + 1 - iz),

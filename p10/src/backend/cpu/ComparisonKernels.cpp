@@ -14,14 +14,12 @@
 namespace tensorplay {
 namespace cpu {
 
-// ATen alignment: wrapped Python scalars participate weakly in type promotion
 // (result_type(int_tensor, 2.5) == Float32), and the scalar must never be
 // truncated into the tensor's dtype before comparing.
 static DType result_type_with_scalar(const Tensor& t, const Scalar& s) {
     DType td = t.dtype();
     if (s.dtype() == DType::Bool) return td;
     if (isComplexType(s.dtype())) {
-        // ATen weak-scalar rule: int tensors compare as complex64,
         // float64 widens to complex128.
         if (isFloatingOrComplexType(td)) return td;
         return promoteTypes(td, DType::ComplexFloat);
@@ -36,9 +34,7 @@ static DType result_type_with_scalar(const Tensor& t, const Scalar& s) {
 
 // Helper for comparison ops.
 // kEquality=false: ordering ops (lt/le/gt/ge) -- undefined over complex in
-// torch, so complex inputs raise NotImplementedError before instantiation
 // (std::complex has no operator<).
-// kEquality=true: eq/ne -- component-wise over complex, per torch.
 template<bool kEquality, typename Op>
 Tensor comparison_kernel_impl(const Tensor& self, const Tensor& other, Op op) {
     std::vector<int64_t> out_shape = broadcast_shapes(static_cast<std::vector<int64_t>>(self.shape()), static_cast<std::vector<int64_t>>(other.shape()));
@@ -47,7 +43,6 @@ Tensor comparison_kernel_impl(const Tensor& self, const Tensor& other, Op op) {
     Tensor result = Tensor::empty(out_shape, DType::Bool, self.device());
 
     // For comparison, we usually don't promote types to a common type for the operation,
-    // but C++ requires it. PyTorch promotes to common type before comparison.
     DType common_dtype = promoteTypes(self.dtype(), other.dtype());
 
     if (!kEquality && isComplexType(common_dtype)) {
@@ -182,7 +177,6 @@ static DType where_scalar_dtype(const Scalar& self, const Scalar& other) {
         return self.dtype() == DType::Float64 || other.dtype() == DType::Float64
             ? DType::Float64 : DType::Float32;
     }
-    // Python integer scalars use the default integral result type in Torch.
     return DType::Int64;
 }
 

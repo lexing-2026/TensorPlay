@@ -232,11 +232,8 @@ Tensor batch_norm_cpu(const Tensor& input, const std::optional<Tensor>& weight_o
             float* rm_ptr = running_mean_opt->data_ptr<float>();
             float* rv_ptr = running_var_opt->data_ptr<float>();
             
-            // Unbiased var for running stats? PyTorch uses unbiased=False for batch stats but unbiased for running var updates?
-            // Actually PyTorch doc says: running_mean = (1 - m) * running_mean + m * batch_mean
             // running_var = (1 - m) * running_var + m * batch_var (unbiased?)
             // Usually batch_var is biased in calculation, but running_var update might use unbiased.
-            // PyTorch default momentum is 0.1.
             // Let's assume simple update for now.
             
             float m = (float)momentum;
@@ -563,7 +560,6 @@ Tensor layer_norm_cpu(const Tensor& input, const std::vector<int64_t>& normalize
             }
         }
     } else if (input.dtype() == DType::Float16 || input.dtype() == DType::BFloat16) {
-        // Reduced-precision inputs accumulate in float32 (ATen acc_type).
         if (input.dtype() == DType::Float16) {
             tensorplay::Half* out_ptr = out.data_ptr<tensorplay::Half>();
             const tensorplay::Half* in_ptr = input.data_ptr<tensorplay::Half>();
@@ -722,7 +718,6 @@ Tensor instance_norm_cpu(const Tensor& input, const std::optional<Tensor>& weigh
     
     // Instance Norm is Group Norm with num_groups = C
     // But it also has optional running stats tracking (mostly for tracking, not used in inference usually unless track_running_stats=True and training=False?)
-    // Actually PyTorch InstanceNorm:
     // "InstanceNorm is applied per channel of each sample."
     // "If track_running_stats is set to True, during training this layer keeps running estimates of its computed mean and variance, which are then used for evaluation."
     // "If track_running_stats is set to False, this layer does not keep running estimates, and batch statistics are always used during evaluation."
@@ -737,7 +732,6 @@ Tensor instance_norm_cpu(const Tensor& input, const std::optional<Tensor>& weigh
         // Equivalent to GroupNorm(num_groups=C)
         // But we might need to update running stats
         // Running stats for InstanceNorm are usually averaged over N as well?
-        // PyTorch docs: "The running mean and variance are computed using the momentum strategy... based on the values of the current mini-batch."
         
         // Let's reuse GroupNorm logic for calculation, but handle running stats manually?
         // GroupNorm doesn't take running stats.
@@ -798,7 +792,7 @@ Tensor instance_norm_cpu(const Tensor& input, const std::optional<Tensor>& weigh
                  
                  for (int64_t c = 0; c < C; ++c) {
                      float bm = batch_mean[c] / N;
-                     float bv = batch_var[c] / N; // Average variance across batch? Or variance of combined? PyTorch does average.
+                     float bv = batch_var[c] / N;
                      // Note: Unbiased?
                      float unbiased_scale = (spatial_size > 1) ? ((float)spatial_size / (spatial_size - 1)) : 1.0f;
                      
@@ -822,8 +816,6 @@ Tensor instance_norm_cpu(const Tensor& input, const std::optional<Tensor>& weigh
 
 
 // Backward for LayerNorm
-// Typed kernel mirrors upstream ATen dispatch semantics
-// (aten/src/ATen/native/cpu/layer_norm_kernel.cpp): float/double compute
 // natively in their own type; reduced types accumulate via opmath (float).
 template <typename T>
 static std::tuple<Tensor, Tensor, Tensor> layer_norm_backward_cpu_typed(
@@ -920,7 +912,6 @@ static std::tuple<Tensor, Tensor, Tensor> layer_norm_backward_cpu_reduced(
         const std::optional<Tensor>& bias_opt,
         double eps) {
     // Reduced precision: promote to float32, reuse the typed kernel,
-    // cast grads back (ATen acc_type / opmath_t semantics).
     const DType act_dt = input.dtype();
     Tensor in_f = input.to(DType::Float32);
     Tensor gy_f = grad_output.to(DType::Float32);
@@ -964,7 +955,6 @@ std::tuple<Tensor, Tensor, Tensor> layer_norm_backward_cpu(const Tensor& grad_ou
 }
 
 // rms_norm over the trailing normalized_shape dims: y = x * rsqrt(mean(x^2)+eps) * w.
-// fp32 accumulation for fp16/bf16 inputs (ATen rms_norm composite semantics).
 // Native single kernel replaces a 6-op python composite that cost ~24 extra
 // dispatches per Llama layer per token in the e2e profile.
 Tensor rms_norm_cpu(const Tensor& input, const std::vector<int64_t>& normalized_shape,

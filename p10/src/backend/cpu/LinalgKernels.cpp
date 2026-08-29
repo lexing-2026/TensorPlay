@@ -1,11 +1,7 @@
-// CPU linalg kernels — ported from third_party/pytorch
-// aten/src/ATen/native/BatchLinearAlgebraKernel.cpp (and the composite
 // wrappers in BatchLinearAlgebra.cpp / LinearAlgebra.cpp).
 //
-// Torch calls LAPACK through at::lapack; here the same routines come from a
 // runtime-resolved ILP64 LAPACK (see cpu/Lapack.h).  All matrices follow the
 // Fortran (batched column-major) layout that LAPACK expects, produced with
-// clone_batched_column_major / empty_column_major just like torch's
 // cloneBatchedColumnMajor.  Complex inputs are rejected until the complex
 // paths are ported.
 
@@ -44,7 +40,7 @@ decltype(auto) run_real(DType dt, Kernel&& k) {
         default:
             TP_THROW(NotImplementedError,
                      "unsupported dtype ", pretty_dtype_name(dt),
-                     " for torch.linalg on CPU (only float32/float64 are implemented)");
+                     " for linalg on CPU (only float32/float64 are implemented)");
     }
 }
 
@@ -87,7 +83,6 @@ int64_t batch_count_of(const Tensor& t) {
     return plane == 0 ? 0 : t.numel() / plane;
 }
 
-// torch::cloneBatchedColumnMajor — logical shape unchanged, Fortran-contiguous
 // memory so LAPACK can work in place with lda = size(-2).
 Tensor clone_batched_column_major(const Tensor& src) {
     auto result = src.transpose(-2, -1).clone(static_cast<int64_t>(MemoryFormat::Contiguous));
@@ -124,7 +119,6 @@ Tensor expand_to_batch(const Tensor& t, const std::vector<int64_t>& batch) {
     return t.expand(shape);
 }
 
-// Port of at::native::_linalg_check_errors (BatchLinearAlgebra.cpp:1610).
 void linalg_check_errors(const Tensor& infos, std::string_view api_name, bool is_matrix) {
     if (!infos.any().item<bool>()) return;
 
@@ -252,7 +246,6 @@ void apply_lu_factor(const Tensor& input, const Tensor& pivots, const Tensor& in
     const int64_t leading_dimension = std::max<int64_t>(1, m);
     constexpr bool is_float = std::is_same_v<scalar_t, float>;
 
-    // Parallel-grain heuristic copied from torch (PR #93037 discussion).
     const int64_t matrix_rank = std::min(m, n);
     const int64_t chunk_size_per_thread = static_cast<int64_t>(
         std::min(1.0, 3200.0 / (static_cast<double>(matrix_rank * matrix_rank * matrix_rank))));
@@ -296,11 +289,11 @@ std::tuple<Tensor, Tensor, Tensor> lu_factor_ex_impl(
 
 // As P is a permutation matrix: det(P) = (-1)^{#swaps}.  Port of lu_det_P.
 int64_t lu_perm_sign(const int32_t* pivots, int64_t k) {
-    int64_t parity = 0;
+            int64_t sign_changes = 0;
     for (int64_t i = 0; i < k; ++i) {
-        if (pivots[i] - 1 != static_cast<int32_t>(i)) ++parity;
+                if (pivots[i] - 1 != static_cast<int32_t>(i)) ++sign_changes;
     }
-    return (parity % 2 == 0) ? 1 : -1;
+            return (sign_changes % 2 == 0) ? 1 : -1;
 }
 
 Tensor linalg_det_kernel(const Tensor& A) {
@@ -373,7 +366,7 @@ std::tuple<Tensor, Tensor> linalg_slogdet_kernel(const Tensor& A) {
 // ------------------------------------------------------------- getrs solve --
 
 // Core: solve op(A) X = B given LU/ipiv of A.  B is overwritten in place and
-// must be column-major with ldb = B.size(-2).  Mirrors apply_lu_solve without
+// must be column-major with ldb = B.size(-2).  Uses the same solve core without
 // broadcasting (broadcasting resolved by callers).
 template <typename scalar_t>
 void getrs_inplace(char trans, const Tensor& LU, const int32_t* pivots,
@@ -444,14 +437,12 @@ std::tuple<Tensor, Tensor> linalg_solve_ex_kernel(
 
 Tensor linalg_solve_kernel(const Tensor& A, const Tensor& B, bool left) {
     auto [result, info] = linalg_solve_ex_kernel(A, B, left, false);
-    linalg_check_errors(info, "torch.linalg.solve", A.dim() == 2);
+    linalg_check_errors(info, "linalg.solve", A.dim() == 2);
     return result;
 }
 
-// torch::linalg_inv_ex: solve A X = I in place (torch composes this through
 // linalg_solve_ex_out with result pre-filled with the identity).
 std::tuple<Tensor, Tensor> linalg_inv_ex_kernel(const Tensor& A, bool check_errors) {
-    // Identity RHS has the FULL shape of A (torch fills (..., n, n)); using
     // batch_shape_of here collapsed 2-D inputs to a 0-D scalar and made
     // linalg.inv reject its own RHS.
     Tensor identity = Tensor::empty(static_cast<std::vector<int64_t>>(A.shape()),
@@ -498,7 +489,6 @@ void apply_cholesky(const Tensor& input, const Tensor& info, bool upper) {
         } else {
             err = lapack_dpotrf(uplo, n, a, lda);
         }
-        // torch parity: the triangle opposite `uplo` is zeroed in the result
         // (LAPACK leaves the input's untouched entries there).
         if (err == 0) {
             for (int64_t r = 0; r < n; ++r) {
@@ -585,7 +575,6 @@ Tensor linalg_lu_solve_kernel(const Tensor& LU, const Tensor& pivots,
     require_lapack(api);
     square_check_inputs(LU, api, "LU");
     check_is_matrix(B, api, "B");
-    // Sanity checks copied from torch (lu_solve_kernel).
     {
         const int64_t np = pivots.numel();
         const auto* pv = pivots.data_ptr<int32_t>();
@@ -661,7 +650,6 @@ void apply_syevd(const Tensor& vectors, const Tensor& values, const Tensor& info
     const int64_t n = vectors.size(-1);
     const int64_t lda = std::max<int64_t>(1, n);
 
-    // Workspace query once for the whole batch (torch: apply_lapack_eigh).
     int64_t lwork = -1;
     int64_t liwork = -1;
     std::vector<scalar_t> work(1);
@@ -690,7 +678,6 @@ void apply_syevd(const Tensor& vectors, const Tensor& values, const Tensor& info
                                 iwork.data(), liwork);
         }
         infos_data[i] = static_cast<int32_t>(err);
-        // torch returns early on the first failure (BatchLinearAlgebraKernel.cpp:364).
         if (err != 0) break;
     }
 }
@@ -743,7 +730,6 @@ void apply_geev(const Tensor& input, const Tensor& wr, const Tensor& wi,
     const int64_t ldvr = compute_eigenvectors ? lda : 1;
     const int64_t input_matrix_stride = matrix_stride_of(input);
 
-    // Workspace query once (apply_linalg_eig in torch).
     std::vector<scalar_t> work(1);
     int64_t info_q = 0;
     if constexpr (is_float) {
@@ -809,7 +795,6 @@ std::tuple<Tensor, Tensor> eig_impl(const Tensor& A, bool compute_eigenvectors) 
     require_lapack("linalg.eig");
     square_check_inputs(A, "linalg.eig");
     const bool is_float_input = A.dtype() == DType::Float32;
-    // Working copy in Fortran layout (destroyed by geev), as torch does.
     Tensor input = clone_batched_column_major(A);
     const auto batch = batch_shape_of(A);
     const int64_t n = A.size(-1);
@@ -915,7 +900,6 @@ std::tuple<Tensor, Tensor, Tensor> svd_impl(const Tensor& A, bool full_matrices,
                                             bool compute_uv) {
     require_lapack("linalg.svd");
     check_is_matrix(A, "linalg.svd");
-    // gesdd destroys its input: column-major working copy (svd_kernel in torch).
     Tensor a_copy = clone_batched_column_major(A);
     const int64_t m = A.size(-2);
     const int64_t n = A.size(-1);
@@ -949,7 +933,7 @@ std::tuple<Tensor, Tensor, Tensor> linalg_svd_kernel(const Tensor& A, bool full_
                                                      std::optional<std::string> driver) {
     if (driver.has_value() && driver.value() != "gesvd" && driver.value() != "gesvdj") {
         TP_THROW(RuntimeError, "linalg.svd(): driver ", driver.value(),
-                 " is not supported on CPU. Consider torch.linalg.svd(A, full_matrices) instead.");
+                 " is not supported on CPU. Consider linalg.svd(A, full_matrices) instead.");
     }
     return svd_impl(A, full_matrices, true);
 }
@@ -979,7 +963,6 @@ void apply_geqrf(const Tensor& input, const Tensor& tau) {
     } else {
         lapack_dgeqrf(m, n, input_data, lda, tau_data, work.data(), lwork);
     }
-    // torch clamps to at least n (MKL requirement), see apply_geqrf.
     lwork = std::max<int64_t>(n, static_cast<int64_t>(work[0]));
     work.resize(lwork);
 
@@ -1029,7 +1012,6 @@ void apply_orgqr(Tensor& self, const Tensor& tau) {
     }
 }
 
-// torch::linalg_qr composite: geqrf + orgqr + triangular extraction.
 std::tuple<Tensor, Tensor> linalg_qr_kernel(const Tensor& A, std::string mode) {
     require_lapack("linalg.qr");
     check_is_matrix(A, "linalg.qr");
@@ -1128,7 +1110,6 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> linalg_lstsq_kernel(
                  ": The input tensor A should have at least as many rows as columns, "
                  "but they are ", m, " by ", n);
     }
-    // rcond is ignored for the gels driver (torch warns; keep silent parity).
     (void)rcond;
 
     const auto batch = broadcast_batch(A, B);
@@ -1275,7 +1256,6 @@ Tensor ldl_solve_impl(const Tensor& LD, const Tensor& pivots, const Tensor& B,
     require_lapack(api);
     square_check_inputs(LD, api, "LD");
     check_is_matrix(B, api, "B");
-    // Sanity checks ported from torch's ldl_solve_kernel.
     {
         Tensor pv64 = pivots.to(DType::Int64);
         const auto* pv = pv64.data_ptr<int64_t>();
@@ -1325,7 +1305,7 @@ std::tuple<Tensor, Tensor, Tensor> linalg_lu_kernel(const Tensor& A, bool pivot)
     }
     square_check_inputs(A, "linalg.lu");
     auto [LU, pivots, info] = lu_factor_ex_impl(A, pivot, false,
-                                                "torch.linalg.lu_factor_ex");
+                                                "linalg.lu_factor_ex");
     (void)info;
     const int64_t m = A.size(-2);
     const int64_t n = A.size(-1);
@@ -1371,7 +1351,6 @@ std::tuple<Tensor, Tensor, Tensor> linalg_lu_kernel(const Tensor& A, bool pivot)
 
 // --------------------------------------------------------------- diagonal --
 
-// torch::linalg.diagonal: extract diagonals along dims (dim1, dim2).
 Tensor linalg_diagonal_kernel(const Tensor& A, int64_t offset, int64_t dim1, int64_t dim2) {
     const char* api = "linalg.diagonal";
     check_is_matrix(A, api);
@@ -1453,7 +1432,7 @@ Tensor linalg_diagonal_kernel(const Tensor& A, int64_t offset, int64_t dim1, int
 
 std::tuple<Tensor, Tensor> linalg_lu_factor_kernel(const Tensor& A, bool pivot) {
     auto [LU, pivots, info] =
-        lu_factor_ex_impl(A, pivot, false, "torch.linalg.lu_factor");
+        lu_factor_ex_impl(A, pivot, false, "linalg.lu_factor");
     (void)info;
     return {LU, pivots};
 }
@@ -1461,7 +1440,7 @@ std::tuple<Tensor, Tensor> linalg_lu_factor_kernel(const Tensor& A, bool pivot) 
 std::tuple<Tensor, Tensor, Tensor> linalg_lu_factor_ex_kernel(const Tensor& A,
                                                               bool pivot,
                                                               bool check_errors) {
-    return lu_factor_ex_impl(A, pivot, check_errors, "torch.linalg.lu_factor_ex");
+    return lu_factor_ex_impl(A, pivot, check_errors, "linalg.lu_factor_ex");
 }
 
 std::tuple<Tensor, Tensor> linalg_ldl_factor_kernel(const Tensor& A, bool hermitian) {

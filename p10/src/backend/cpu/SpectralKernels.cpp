@@ -1,10 +1,8 @@
 // Native spectral kernels for the audio stack.
 //
-// Structure mirrors ATen's native/SpectralOps.cpp + SpectralOpsUtils.h:
 // public fft_* entry points follow upstream's norm_from_string /
 // resize_fft_input flow, stft/istft follow upstream framing and overlap-add
 // exactly. The FFT engine is vendored pocketfft (pocketfft_hdronly.h) — the
-// same backend ATen's CPU kernels use.
 
 #include "Tensor.h"
 #include "Dispatcher.h"
@@ -68,7 +66,6 @@ pocketfft::shape_t to_pshape(const std::vector<int64_t>& v) {
 }
 
 // ---------------------------------------------------------------------------
-// Normalization copied from ATen native/SpectralOpsUtils.h
 // ---------------------------------------------------------------------------
 enum class fft_norm_mode {
     none,       // No normalization
@@ -76,7 +73,6 @@ enum class fft_norm_mode {
     by_n,       // Divide by signal_size
 };
 
-// Copy of ATen norm_from_string: strings have direction-specific meaning.
 inline fft_norm_mode norm_from_string(const std::string& norm, bool forward) {
     if (norm == "backward") return forward ? fft_norm_mode::none : fft_norm_mode::by_n;
     if (norm == "forward")  return forward ? fft_norm_mode::by_n : fft_norm_mode::none;
@@ -101,7 +97,6 @@ inline int64_t infer_ft_real_to_complex_onesided_size(int64_t real_size) {
 
 }  // namespace
 
-// Copy of ATen resize_fft_input for one dim on a contiguous tensor:
 // slice from 0 when larger, zero-pad at the end when smaller.
 Tensor resize_input_dim(const Tensor& contig, int64_t dim, int64_t want) {
     std::vector<int64_t> sizes = sizes_of(contig);
@@ -221,11 +216,9 @@ Tensor core_c2r(const Tensor& contig, int64_t dim, int64_t out_len, fft_norm_mod
 }
 
 // ---------------------------------------------------------------------------
-// Public fft entry points (mirror ATen fft_c2c / fft_r2c / fft_c2r wrappers)
 // ---------------------------------------------------------------------------
 
 namespace {
-// ATen parity: torch.fft.fft/ifft accept real input and promote it to complex
 // with a zero imaginary part (SpectralOps.cpp fft_r2c "fft"/"ifft" entry).
 template <typename T>
 Tensor materialize_real_as_complex(const Tensor& x) {
@@ -275,7 +268,7 @@ Tensor fft_ifft_cpu(const Tensor& self, int64_t n, int64_t dim, std::string norm
 }
 
 Tensor fft_rfft_cpu(const Tensor& self, int64_t n, int64_t dim, std::string norm) {
-    TP_CHECK(!is_cplx(self.dtype()), "torch.fft.rfft expects a real input");
+    TP_CHECK(!is_cplx(self.dtype()), "fft.rfft expects a real input");
     TP_CHECK(self.dim() >= 1, "rfft expects at least 1 dimension");
     dim = wrap_dim(dim, self.dim());
     Tensor x = self.contiguous();
@@ -290,7 +283,7 @@ Tensor fft_rfft_cpu(const Tensor& self, int64_t n, int64_t dim, std::string norm
 }
 
 Tensor fft_irfft_cpu(const Tensor& self, int64_t n, int64_t dim, std::string norm) {
-    TP_CHECK(is_cplx(self.dtype()), "torch.fft.irfft expects a complex input");
+    TP_CHECK(is_cplx(self.dtype()), "fft.irfft expects a complex input");
     TP_CHECK(self.dim() >= 1, "irfft expects at least 1 dimension");
     dim = wrap_dim(dim, self.dim());
     Tensor x = self.contiguous();
@@ -305,12 +298,10 @@ Tensor fft_irfft_cpu(const Tensor& self, int64_t n, int64_t dim, std::string nor
 
 // ---------------------------------------------------------------------------
 // Backward helpers — adjoint = same internal transform with the flipped
-// direction and the identical normalization enum (verified against ATen's
 // convention), followed by resize back to the primal input support.
 // ---------------------------------------------------------------------------
 
 namespace {
-// ATen parity: the adjoint of "materialize real as complex" is taking the
 // real part, so fft/ifft on a real primal yields a real gradient.
 template <typename T>
 Tensor extract_real_part(const Tensor& z) {
@@ -359,7 +350,6 @@ Tensor fft_ifft_backward_cpu(const Tensor& grad, const Tensor& self, int64_t dim
 }
 
 namespace {
-// rfft adjoint — ATen fft_r2c_backward (torch/csrc/autograd/FunctionsManual.cpp
 // :5135): view onesided r2c as [zero-fill imag, c2c forward, drop half], so the
 // backward is [zero-fill the twosided spectrum, c2c INVERSE with the forward's
 // normalization, take the real part].
@@ -393,7 +383,6 @@ Tensor fft_rfft_backward_cpu(const Tensor& grad, const Tensor& self, int64_t dim
 }
 
 namespace {
-// irfft adjoint — ATen fft_c2r_backward (FunctionsManual.cpp :5095):
 // r2c of the real gradient with the forward's normalization, then double the
 // bins whose conjugate mirror fell outside the onesided range
 // (indices 1 .. N - onesided_length).
@@ -422,7 +411,6 @@ Tensor fft_irfft_backward_cpu(const Tensor& grad, const Tensor& self, int64_t di
 }
 
 // ---------------------------------------------------------------------------
-// Window factories — formulas mirror ATen native/TensorFactories.cpp
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -431,7 +419,6 @@ Tensor window_tensor(int64_t out_len, int64_t formula_len, std::optional<DType> 
     if (out_len < 0) {
         TP_THROW(ValueError, name, ": window_length must be non-negative");
     }
-    // Python layer passes DType::Undefined for "no dtype given" (torch
     // default-floating semantics); normalize before the support check.
     DType dt = dtype_opt.value_or(DType::Float32);
     if (dt == DType::Undefined) dt = DType::Float32;
@@ -456,7 +443,6 @@ Tensor window_tensor(int64_t out_len, int64_t formula_len, std::optional<DType> 
 }
 }  // namespace
 
-// ATen denominator semantics: periodic -> N, symmetric -> N - 1.
 inline int64_t window_denominator(int64_t window_length, bool periodic) {
     return window_length - (periodic ? 0 : 1);
 }
@@ -488,20 +474,17 @@ Tensor bartlett_window_cpu(int64_t window_length, bool periodic, std::optional<D
 Tensor blackman_window_cpu(int64_t window_length, bool periodic, std::optional<DType> dtype) {
     const int64_t L = window_denominator(window_length, periodic);
     return window_tensor(window_length, L, dtype, "blackman_window", [L](int64_t n) {
-        // ATen blackman_window: a0 - a1*cos(x) + a2*cos(2x), x = 2*pi*n/L.
         const double x = 2.0 * kPiD * n / static_cast<double>(L);
         return 0.42 - 0.5 * std::cos(x) + 0.08 * std::cos(2 * x);
     });
 }
 
 // ---------------------------------------------------------------------------
-// stft / istft / stft_backward — algorithms mirror ATen SpectralOps.cpp
 // ---------------------------------------------------------------------------
 
 namespace {
 
 // Reflect/constant padding along the last axis of a contiguous (batch, len)
-// real tensor. Mirrors ATen at::pad semantics ("reflect" excludes the edge).
 template <typename T>
 Tensor pad_time_axis(const Tensor& contig, int64_t pad, const std::string& mode) {
     std::vector<int64_t> sizes = sizes_of(contig);
@@ -566,7 +549,6 @@ void unpad_scatter_time_axis(const T* padded_grad, int64_t batch, int64_t padded
 template <typename T>
 void fill_win_full(std::vector<T>& win_full, const std::optional<Tensor>& window,
                    int64_t win_length, int64_t n_fft) {
-    // ATen SpectralOps.cpp stft: no window -> rectangular (ones); a defined
     // window of win_length < n_fft is zero-padded on both sides.
     if (!window.has_value()) {
         win_full.assign(n_fft, T(1));
@@ -604,7 +586,6 @@ Tensor stft_impl(const Tensor& work, int64_t n_fft, int64_t hop, int64_t win,
     std::vector<T> win_full;
     fill_win_full(win_full, window, win, n_fft);
 
-    // frames buffer (batch*n_frames, n_fft) — ATen's time2col as_strided step
     Tensor frames({batch * n_frames, n_fft}, work.dtype());
     {
         const T* srcp = static_cast<const T*>(work.data_ptr());
@@ -714,7 +695,6 @@ Tensor stft_cpu(const Tensor& self, int64_t n_fft, std::optional<int64_t> hop_le
 
 namespace {
 
-// istft core: input (batch, freq, frames) complex; mirrors ATen istft.
 template <typename T>
 Tensor istft_impl(const Tensor& input, int64_t n_fft, int64_t hop, int64_t win,
                   const std::optional<Tensor>& window, bool center, bool normalized,
@@ -722,7 +702,6 @@ Tensor istft_impl(const Tensor& input, int64_t n_fft, int64_t hop, int64_t win,
     using C = std::complex<T>;
     const auto mode = normalized ? fft_norm_mode::by_root_n : fft_norm_mode::by_n;
     std::vector<int64_t> isizes = sizes_of(input);
-    // ATen istft checks the *real view* (3 or 4 dims); on the complex tensor
     // this is 2D (freq, frames) -> (len,) or 3D (batch, freq, frames) -> (B, len).
     TP_CHECK(isizes.size() == 2 || isizes.size() == 3,
              "istft: expected a complex tensor with 2 or 3 dimensions");
@@ -738,7 +717,6 @@ Tensor istft_impl(const Tensor& input, int64_t n_fft, int64_t hop, int64_t win,
         TP_CHECK(fft_size == n_fft, "istft: frequency dim must equal n_fft when onesided=False");
     }
 
-    // window center-padded to n_fft with zeros when defined (ATen constant_pad_nd),
     // rectangular ones only when the window is absent.
     std::vector<T> win_full(n_fft, window.has_value() ? T(0) : T(1));
     {
@@ -761,7 +739,6 @@ Tensor istft_impl(const Tensor& input, int64_t n_fft, int64_t hop, int64_t win,
             for (int64_t i = 0; i < win; ++i) win_full[left + i] = tmp[i];
         }
     }
-    // gather columns into (batch*frames, bins) — ATen's transpose(1,2) step.
     // For c2r pocketfft reads only the first n/2+1 Hermitian bins.
     const int64_t bins = n_fft / 2 + 1;
     Tensor cols({batch * frames, bins}, input.dtype());
@@ -775,7 +752,6 @@ Tensor istft_impl(const Tensor& input, int64_t n_fft, int64_t hop, int64_t win,
                         src[(size_t(b) * fft_size + k) * frames + t];
     }
 
-    // batched inverse rfft: fct implements ATen's by_n/by_root_n choice
     Tensor time_frames({batch * frames, n_fft}, real_of_complex(input.dtype()));
     {
         auto pshape_out = pocketfft::shape_t{size_t(batch * frames), size_t(n_fft)};
@@ -804,7 +780,6 @@ Tensor istft_impl(const Tensor& input, int64_t n_fft, int64_t hop, int64_t win,
         }
     }
 
-    // crop / length handling (mirrors ATen)
     const int64_t start = center ? n_fft / 2 : 0;
     int64_t end;
     if (length.has_value()) end = start + *length;
@@ -862,7 +837,6 @@ Tensor stft_backward_impl(const Tensor& grad_output, const Tensor& self, int64_t
                         gsrc[(size_t(b) * n_freq + k) * frames + t];
     }
 
-    // ATen composes the spectral adjoint via fft_r2c_backward: zero-fill the
     // twosided spectrum from the onesided grad, run the INVERSE c2c carrying
     // the forward's normalization, then project to the real part.
     Tensor full({batch * frames, n_fft}, complex_of_real(self.dtype()));

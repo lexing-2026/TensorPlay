@@ -1,13 +1,6 @@
-// Special-function pointwise kernels (torch.special family) - CPU.
 //
-// Math ported VERBATIM from third_party/pytorch/aten/src/ATen/native/Math.h
 // (2.15.0a0) via p10/include/SpecialMath.h; the wrappers follow the house
 // float_math_kernel / binary_float_kernel pattern from TierOpsKernels.cpp.
-// ATen anchors:
-//   aten/src/ATen/native/cuda/bessel_j0.cu        special_bessel_j0
-//   aten/src/ATen/native/cuda/UnaryGammaKernels.cu polygamma/gammainc(gamma cc)
-//   aten/src/ATen/native/cuda/ZetaKernel.cu       special_zeta
-//   aten/src/ATen/native/Math.h                   *_forward device formulas
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "Scalar.h"
@@ -172,8 +165,6 @@ Tensor i1e_cpu(const Tensor& self) {
 }
 
 // ---------------------------------------------------------------------------
-// Polynomial family P(x, n): torch passes n as an integer-valued Tensor.
-// ATen's forward takes (T x, T n); fractional/edge handling is inside.
 // ---------------------------------------------------------------------------
 
 Tensor chebyshev_polynomial_t_cpu(const Tensor& x, const Tensor& n) {

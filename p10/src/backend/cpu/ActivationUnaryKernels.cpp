@@ -6,7 +6,6 @@
 // p10/CMakeLists.txt).  Each copy lands in the CPU_CAPABILITY inline
 // namespace; DispatchStub picks the best registered tier at runtime.
 // NB: REGISTER_DISPATCH under CPU_CAPABILITY_AVX512 intentionally registers
-// nullptr (torch parity); the AVX512 slot must be filled explicitly via
 // REGISTER_AVX512_DISPATCH below, otherwise these ops silently fall back to
 // the AVX2 copy.
 

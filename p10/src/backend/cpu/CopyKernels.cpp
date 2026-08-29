@@ -33,7 +33,6 @@ Tensor to_kernel(Tensor& self, DType dtype, bool non_blocking, bool copy) {
     return result;
 }
 
-// Parallel ND strided copy, mirroring the throughput of ATen's
 // TensorIterator-driven copy for permuted/expanded operands: dims are visited
 // in destination-stride order so the innermost loop writes consecutive
 // memory (a unit-stride source there degrades into memcpy), size-1 dims are
@@ -293,7 +292,6 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
         throw std::runtime_error("copy_kernel (CPU) called with non-CPU destination");
     }
 
-    // ATen parity (Copy.cpp:280): nothing to copy; also keeps NULL data_ptrs
     // of empty tensors away from memcpy/cudaMemcpyAsync.
     if (self.numel() == 0) {
         return self;
