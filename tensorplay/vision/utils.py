@@ -1,7 +1,7 @@
 """Private utilities shared across ``tensorplay.vision``.
 
-``_log_api_usage_once`` mirrors tensorplay.vision/utils.py (no-op unless a logger is
-subscribed).  ``_Image_fromarray`` mirrors the PIL interop helper.
+The API-usage helper is a no-op unless a logger is subscribed. The image
+conversion helper wraps the required PIL interoperation.
 """
 
 import logging
@@ -13,7 +13,7 @@ import tensorplay
 
 
 def _log_api_usage_once(obj: Any) -> None:
-    """Logs API usage(module and name) once per process (tensorplay.vision/utils.py)."""
+    """Log API usage (module and name) once per process."""
     module = obj.__module__
     if not module.startswith("tensorplay"):
         module = f"tensorplay.internal.{module}"
@@ -48,8 +48,6 @@ def _Image_fromarray(data, mode=None):
 
 
 # ---------------------------------------------------------------------------
-# Ported verbatim from torchvision==0.28.0 utils.py (make_grid / save_image);
-# only the torch -> tensorplay imports were rewritten.
 # ---------------------------------------------------------------------------
 def make_grid(
     tensor: Union[tensorplay.Tensor, list[tensorplay.Tensor]],
@@ -144,7 +142,6 @@ def make_grid(
             if k >= nmaps:
                 break
             # Tensor.copy_() is a valid method but seems to be missing from the stubs
-            # https://pytorch.org/docs/stable/tensors.html#torch.Tensor.copy_
             grid.narrow(1, y * height + padding, height - padding).narrow(  # type: ignore[attr-defined]
                 2, x * width + padding, width - padding
             ).copy_(tensor[k])
@@ -178,5 +175,4 @@ def save_image(
     ndarr = grid.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to("cpu", tensorplay.uint8).numpy()
     im = Image.fromarray(ndarr)
     im.save(fp, format=format)
-
 

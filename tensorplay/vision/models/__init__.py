@@ -1,7 +1,7 @@
-"""Classification models, mirroring tensorplay.vision==0.28.0 models/__init__.py.
+"""Classification models exposed by the vision package.
 
 The detection / optical_flow / quantization / segmentation / video
-subpackages are not ported; everything else follows tensorplay.vision.
+subpackages are not included; everything else follows tensorplay.vision.
 """
 
 from .alexnet import *
@@ -23,7 +23,6 @@ from .swin_transformer import *
 from .maxvit import *
 
 # The Weights and WeightsEnum are developer-facing utils that we make public
-# for downstream libs (torchvision/models/__init__.py).
 from ._api import (
     get_model,
     get_model_builder,

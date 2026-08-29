@@ -1,5 +1,3 @@
-# Ported verbatim from torchvision==0.28.0 datasets/widerface.py
-# Only torch -> tensorplay imports were rewritten.
 import os
 from os.path import abspath, expanduser
 from pathlib import Path

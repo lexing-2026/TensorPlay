@@ -1,5 +1,3 @@
-# Ported verbatim from torchvision==0.28.0 datasets/stanford_cars.py
-# Only torch -> tensorplay imports were rewritten.
 import pathlib
 from typing import Any, Callable, Optional, Union
 

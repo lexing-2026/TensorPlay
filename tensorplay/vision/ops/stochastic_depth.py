@@ -1,4 +1,3 @@
-# Ported from upstream vision ops/stochastic_depth.py; torch -> tensorplay.
 
 import tensorplay
 from tensorplay import nn, Tensor

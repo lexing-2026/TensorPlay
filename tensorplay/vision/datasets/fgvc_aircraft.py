@@ -1,5 +1,3 @@
-# Ported verbatim from torchvision==0.28.0 datasets/fgvc_aircraft.py
-# Only torch -> tensorplay imports were rewritten.
 from __future__ import annotations
 
 import os

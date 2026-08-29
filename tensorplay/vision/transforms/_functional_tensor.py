@@ -1,5 +1,3 @@
-# Ported verbatim from torchvision==0.28.0 transforms/_functional_tensor.py
-# Only torch -> tensorplay imports were rewritten.
 import warnings
 from typing import Optional, Union
 
@@ -71,7 +69,6 @@ def convert_image_dtype(image: tensorplay.Tensor, dtype: tensorplay.dtype = tens
 
     if image.is_floating_point():
 
-        # TODO: replace with dtype.is_floating_point when torchscript supports it
         if tensorplay.tensor(0, dtype=dtype).is_floating_point():
             return image.to(dtype)
 
@@ -82,7 +79,6 @@ def convert_image_dtype(image: tensorplay.Tensor, dtype: tensorplay.dtype = tens
             msg = f"The cast from {image.dtype} to {dtype} cannot be performed safely."
             raise RuntimeError(msg)
 
-        # https://github.com/pytorch/vision/pull/2078#issuecomment-612045321
         # For data in the range 0-1, (float * 255).to(uint) is only 255
         # when float is exactly 1.0.
         # `max + 1 - epsilon` provides more evenly distributed mapping of
@@ -95,7 +91,6 @@ def convert_image_dtype(image: tensorplay.Tensor, dtype: tensorplay.dtype = tens
         input_max = float(_max_value(image.dtype))
 
         # int to float
-        # TODO: replace with dtype.is_floating_point when torchscript supports it
         if tensorplay.tensor(0, dtype=dtype).is_floating_point():
             image = image.to(dtype)
             return image / input_max
@@ -104,13 +99,11 @@ def convert_image_dtype(image: tensorplay.Tensor, dtype: tensorplay.dtype = tens
 
         # int to int
         if input_max > output_max:
-            # factor should be forced to int for torch jit script
             # otherwise factor is a float and image // factor can produce different results
             factor = int((input_max + 1) // (output_max + 1))
             image = tensorplay.div(image, factor, rounding_mode="floor")
             return image.to(dtype)
         else:
-            # factor should be forced to int for torch jit script
             # otherwise factor is a float and image * factor can produce different results
             factor = int((output_max + 1) // (input_max + 1))
             image = image.to(dtype)
@@ -358,7 +351,7 @@ def _parse_pad_padding(padding: Union[int, list[int]]) -> list[int]:
     if isinstance(padding, int):
         if tensorplay.jit.is_scripting():
             # This maybe unreachable
-            raise ValueError("padding can't be an int while torchscripting, set it as a list [value, ]")
+            raise ValueError("padding can't be an int while scripting, set it as a list [value, ]")
         pad_left = pad_right = pad_top = pad_bottom = padding
     elif len(padding) == 1:
         pad_left = pad_right = pad_top = pad_bottom = padding[0]
@@ -394,7 +387,6 @@ def pad(
 
     if isinstance(padding, list):
         # TODO: Jit is failing on loading this op when scripted and saved
-        # https://github.com/pytorch/pytorch/issues/81100
         if len(padding) not in [1, 2, 4]:
             raise ValueError(
                 f"Padding must be an int or a 1, 2, or 4 element tuple, not a {len(padding)} element tuple"
@@ -421,8 +413,6 @@ def pad(
     need_cast = False
     if (padding_mode != "constant") and img.dtype not in (tensorplay.float32, tensorplay.float64):
         # Here we temporarily cast input tensor to float
-        # until pytorch issue is resolved :
-        # https://github.com/pytorch/pytorch/issues/40763
         need_cast = True
         img = img.to(tensorplay.float32)
 
@@ -585,7 +575,6 @@ def _gen_affine_grid(
     ow: int,
     oh: int,
 ) -> Tensor:
-    # https://github.com/pytorch/pytorch/blob/74b65c32be68b15dc7c9e8bb62459efbfbde33d8/aten/src/ATen/native/
     # AffineGridGenerator.cpp#L18
     # Difference with AffineGridGenerator is that:
     # 1) we normalize grid values after applying theta
@@ -626,7 +615,6 @@ def _compute_affine_output_size(matrix: list[float], w: int, h: int) -> tuple[in
     # https://github.com/python-pillow/Pillow/blob/11de3318867e4398057373ee9f12dcb33db7335c/src/PIL/Image.py#L2054
 
     # pts are Top-Left, Top-Right, Bottom-Left, Bottom-Right points.
-    # Points are shifted due to affine matrix torch convention about
     # the center point. Center is (0, 0) for image center pivot point (w * 0.5, h * 0.5)
     pts = tensorplay.tensor(
         [
@@ -865,7 +853,6 @@ def autocontrast(img: Tensor) -> Tensor:
 def _scale_channel(img_chan: Tensor) -> Tensor:
     # TODO: we should expect bincount to always be faster than histc, but this
     # isn't always the case. Once
-    # https://github.com/pytorch/pytorch/issues/53194 is fixed, remove the if
     # block and only use bincount.
     if img_chan.is_cuda:
         hist = tensorplay.histc(img_chan.to(tensorplay.float32), bins=256, min=0, max=255)

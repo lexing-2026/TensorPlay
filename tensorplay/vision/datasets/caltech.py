@@ -1,5 +1,3 @@
-# Ported verbatim from torchvision==0.28.0 datasets/caltech.py
-# Only torch -> tensorplay imports were rewritten.
 import os
 import os.path
 import shutil

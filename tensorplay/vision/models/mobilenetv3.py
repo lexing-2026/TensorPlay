@@ -1,6 +1,3 @@
-# Ported verbatim from torchvision==0.28.0 models/mobilenetv3.py
-# (source of truth: https://github.com/pytorch/vision); only the
-# torch -> tensorplay imports were rewritten.
 from collections.abc import Sequence
 from functools import partial
 from typing import Any, Callable, Optional

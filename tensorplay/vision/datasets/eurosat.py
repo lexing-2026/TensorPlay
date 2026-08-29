@@ -1,5 +1,3 @@
-# Ported verbatim from torchvision==0.28.0 datasets/eurosat.py
-# Only torch -> tensorplay imports were rewritten.
 import os
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
@@ -12,7 +10,6 @@ class EuroSAT(ImageFolder):
     """RGB version of the `EuroSAT <https://github.com/phelber/eurosat>`_ Dataset.
 
     For the MS version of the dataset, see
-    `TorchGeo <https://torchgeo.readthedocs.io/en/stable/api/datasets.html#eurosat>`__.
 
     Args:
         root (str or ``pathlib.Path``): Root directory of dataset where ``root/eurosat`` exists.

@@ -1,10 +1,8 @@
-# Ported from torchvision==0.28.0 models/_meta.py (imports rewritten).
 """
 This file is part of the private API. Please do not refer to any variables defined here directly as they will be
 removed on future versions without warning.
 """
 
-# This will eventually be replaced with a call at torchvision.datasets.info("imagenet").categories
 _IMAGENET_CATEGORIES = [
     "tench",
     "goldfish",
@@ -1008,7 +1006,6 @@ _IMAGENET_CATEGORIES = [
     "toilet tissue",
 ]
 
-# To be replaced with torchvision.datasets.info("coco").categories
 _COCO_CATEGORIES = [
     "__background__",
     "person",
@@ -1103,7 +1100,6 @@ _COCO_CATEGORIES = [
     "toothbrush",
 ]
 
-# To be replaced with torchvision.datasets.info("coco_kp")
 _COCO_PERSON_CATEGORIES = ["no person", "person"]
 _COCO_PERSON_KEYPOINT_NAMES = [
     "nose",
@@ -1125,7 +1121,6 @@ _COCO_PERSON_KEYPOINT_NAMES = [
     "right_ankle",
 ]
 
-# To be replaced with torchvision.datasets.info("voc").categories
 _VOC_CATEGORIES = [
     "__background__",
     "aeroplane",
@@ -1150,7 +1145,6 @@ _VOC_CATEGORIES = [
     "tvmonitor",
 ]
 
-# To be replaced with torchvision.datasets.info("kinetics400").categories
 _KINETICS400_CATEGORIES = [
     "abseiling",
     "air drumming",

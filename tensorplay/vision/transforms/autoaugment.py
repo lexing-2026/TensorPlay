@@ -1,5 +1,3 @@
-# Ported verbatim from torchvision==0.28.0 transforms/autoaugment.py
-# Only torch -> tensorplay imports were rewritten.
 import math
 from enum import Enum
 from typing import Optional
@@ -20,8 +18,6 @@ def _apply_op(
         # official autoaug: (1, level, 0, 0, 1, 0)
         # https://github.com/tensorflow/models/blob/dd02069717128186b88afa8d857ce57d17957f03/research/autoaugment/augmentation_transforms.py#L290
         # compared to
-        # torchvision:      (1, tan(level), 0, 0, 1, 0)
-        # https://github.com/pytorch/vision/blob/0c2373d0bba3499e95776e7936e207d8a1676e65/torchvision/transforms/functional.py#L976
         img = F.affine(
             img,
             angle=0.0,

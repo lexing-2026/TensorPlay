@@ -1,5 +1,3 @@
-# Ported verbatim from torchvision==0.28.0 datasets/flickr.py
-# Only torch -> tensorplay imports were rewritten.
 import glob
 import os
 from collections import defaultdict

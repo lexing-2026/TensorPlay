@@ -1,5 +1,3 @@
-# Ported verbatim from torchvision==0.28.0 datasets/phototour.py
-# Only torch -> tensorplay imports were rewritten.
 import os
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
@@ -166,7 +164,6 @@ class PhotoTour(VisionDataset):
             os.unlink(fpath)
 
     def cache(self) -> None:
-        # process and save as torch files
 
         dataset = (
             read_image_file(self.data_dir, self.image_ext, self.lens[self.name]),

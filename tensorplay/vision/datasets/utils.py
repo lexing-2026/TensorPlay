@@ -1,5 +1,3 @@
-# Ported verbatim from torchvision==0.28.0 datasets/utils.py
-# Only torch -> tensorplay imports were rewritten.
 import bz2
 import gzip
 import hashlib
@@ -45,7 +43,6 @@ def _urlretrieve(url: str, filename: Union[str, pathlib.Path], chunk_size: int =
 def calculate_md5(fpath: Union[str, pathlib.Path], chunk_size: int = 1024 * 1024) -> str:
     # Setting the `usedforsecurity` flag does not change anything about the functionality, but indicates that we are
     # not using the MD5 checksum for cryptography. This enables its usage in restricted environments like FIPS. Without
-    # it torchvision.datasets is unusable in these environments since we perform a MD5 check everywhere.
     md5 = hashlib.md5(usedforsecurity=False)
     with open(fpath, "rb") as f:
         while chunk := f.read(chunk_size):
