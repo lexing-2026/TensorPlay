@@ -156,7 +156,7 @@ ReadyQueue* Engine::queue_for_device(int device_index) {
     auto* queue = new ReadyQueue();
     ready_queues_[device_index] = queue;
     if (device_index >= 0) {
-        // Spawn one persistent worker per CUDA device on first use, mirroring
+        // Spawn one persistent worker per CUDA device on first use, matching
         device_threads_.emplace(
             device_index, std::thread([this, queue] { worker_main(*queue); }));
     }
