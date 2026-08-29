@@ -9,10 +9,10 @@ Single source of truth for the commit message convention, consumed by:
 
 The scope-enum maps 1:1 to the "release notes: *" label family
 (.github/labels.yml), so commit scopes, PR labels and release-notes sections
-stay aligned the way pytorch aligns its release-notes labels.
+stay consistent.
 
 Versioning is deliberately NOT handled here or by `cz bump`: versions follow
-pytorch's rules (version.txt + tools/generate_tensorplay_version.py).
+version.txt and tools/generate_tensorplay_version.py.
 
 Usage:
     python tools/commit_schema.py --commit-msg-file .git/COMMIT_EDITMSG

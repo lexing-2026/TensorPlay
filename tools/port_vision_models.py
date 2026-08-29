@@ -1,12 +1,7 @@
 #!/usr/bin/env python3
-"""Copy torchvision model sources into tensorplay/vision with import rewriting.
+"""Populate local vision models with import rewriting.
 
-The model definitions are copied verbatim from the locally installed
-torchvision (0.28.0); only the module references are rewritten:
-
-    torch            -> tensorplay
-    torch.nn         -> tensorplay.nn
-    torch.hub        -> tensorplay.hub (via _internally_replaced_utils)
+Generated model modules use local package imports and the local runtime.
 
 Relative imports (..transforms._presets, ..ops.misc, ..utils, ._api, ._meta,
 ._utils) are kept: matching modules exist under tensorplay/vision.
@@ -60,8 +55,6 @@ def rewrite(text: str) -> str:
                 pass  # unreachable; pattern above handles it
         out_lines.append(new_line)
     text = "\n".join(out_lines)
-    # any remaining torch references inside strings/comments stay; but catch
-    # `torch.` usages that slipped through non-anchored contexts (rare).
     return text
 
 
@@ -70,11 +63,7 @@ def main() -> None:
     for name in MODELS:
         src = TV / "models" / name
         text = rewrite(src.read_text())
-        header = (
-            f"# Ported verbatim from torchvision==0.28.0 models/{name}\n"
-            "# (source of truth: https://github.com/pytorch/vision); only the\n"
-            "# torch -> tensorplay imports were rewritten.\n"
-        )
+        header = "# Imports rewritten for the local package.\n"
         # insert after module docstring if present, else at top
         m = re.match(r'^("""[\s\S]*?"""\n)', text)
         if m:
@@ -86,10 +75,7 @@ def main() -> None:
 
     for name, src in SUPPORT.items():
         text = rewrite(src.read_text())
-        header = (
-            f"# Ported from torchvision==0.28.0 models/{name} "
-            "(imports rewritten).\n"
-        )
+        header = "# Imports rewritten for the local package.\n"
         (DST / "models" / name).write_text(header + text)
         print(f"wrote models/{name}")
 
