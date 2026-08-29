@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Conventional Commits schema validator for TensorPlay.
 
-Single source of truth for the commit message convention, consumed by:
+Central definition of the commit message convention, consumed by:
 
   - the commit-msg pre-commit hook        (.pre-commit-config.yaml)
   - the PR title check                    (.github/workflows/pr-title.yml)
