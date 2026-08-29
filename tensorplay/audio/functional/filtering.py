@@ -72,7 +72,6 @@ def allpass_biquad(waveform: Tensor, sample_rate: int, central_freq: float, Q: f
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Args:
         waveform(tensorplay.Tensor): audio waveform of dimension of `(..., time)`
@@ -116,7 +115,6 @@ def band_biquad(
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Args:
         waveform (Tensor): audio waveform of dimension of `(..., time)`
@@ -169,7 +167,6 @@ def bandpass_biquad(
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Args:
         waveform (Tensor): audio waveform of dimension of `(..., time)`
@@ -209,7 +206,6 @@ def bandreject_biquad(waveform: Tensor, sample_rate: int, central_freq: float, Q
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Args:
         waveform (Tensor): audio waveform of dimension of `(..., time)`
@@ -252,7 +248,6 @@ def bass_biquad(
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Args:
         waveform (Tensor): audio waveform of dimension of `(..., time)`
@@ -297,7 +292,6 @@ def biquad(waveform: Tensor, b0: float, b1: float, b2: float, a0: float, a1: flo
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Args:
         waveform (Tensor): audio waveform of dimension of `(..., time)`
@@ -338,7 +332,6 @@ def contrast(waveform: Tensor, enhancement_amount: float = 75.0) -> Tensor:
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Comparable with compression, this effect modifies an audio signal to make it sound louder
 
@@ -372,7 +365,6 @@ def dcshift(waveform: Tensor, shift: float, limiter_gain: Optional[float] = None
 
     .. devices:: CPU CUDA
 
-    .. properties:: TorchScript
 
     This can be useful to remove a DC offset
     (caused perhaps by a hardware problem in the recording chain) from the audio
@@ -419,7 +411,6 @@ def deemph_biquad(waveform: Tensor, sample_rate: int) -> Tensor:
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Args:
         waveform (Tensor): audio waveform of dimension of `(..., time)`
@@ -555,8 +546,6 @@ def _apply_probability_distribution(waveform: Tensor, density_function: str = "T
         signal_scaled_dis = signal_scaled + RPDF
     elif density_function == "GPDF":
         # TODO Replace by distribution code once
-        # https://github.com/pytorch/pytorch/issues/29843 is resolved
-        # gaussian = torch.distributions.normal.Normal(torch.mean(waveform, -1), 1).sample()
 
         num_rand_variables = 6
 
@@ -583,7 +572,6 @@ def _apply_probability_distribution(waveform: Tensor, density_function: str = "T
 
         signal_scaled_dis = signal_scaled + gaussian
     else:
-        # dtype needed for https://github.com/pytorch/pytorch/issues/32358
         TPDF = tensorplay.bartlett_window(time_size + 1, dtype=signal_scaled.dtype, device=signal_scaled.device)
         TPDF = TPDF.repeat((channel_size + 1), 1)
         signal_scaled_dis = signal_scaled + TPDF
@@ -600,7 +588,6 @@ def dither(waveform: Tensor, density_function: str = "TPDF", noise_shaping: bool
 
     .. devices:: CPU CUDA
 
-    .. properties:: TorchScript
 
     Dither increases the perceived dynamic range of audio stored at a
     particular bit-depth by eliminating nonlinear truncation distortion
@@ -638,7 +625,6 @@ def equalizer_biquad(
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Args:
         waveform (Tensor): audio waveform of dimension of `(..., time)`
@@ -679,7 +665,6 @@ def filtfilt(
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Inspired by https://docs.scipy.org/doc/scipy/reference/generated/scipy.signal.filtfilt.html
 
@@ -726,7 +711,6 @@ def flanger(
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Args:
         waveform (Tensor): audio waveform of dimension of `(..., channel, time)` .
@@ -873,7 +857,6 @@ def gain(waveform: Tensor, gain_db: float = 1.0) -> Tensor:
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Args:
        waveform (Tensor): Tensor of audio of dimension (..., time).
@@ -895,7 +878,6 @@ def highpass_biquad(waveform: Tensor, sample_rate: int, cutoff_freq: float, Q: f
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Args:
         waveform (Tensor): audio waveform of dimension of `(..., time)`
@@ -1036,7 +1018,6 @@ def lfilter(waveform: Tensor, a_coeffs: Tensor, b_coeffs: Tensor, clamp: bool = 
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Note:
         To avoid numerical problems, small filter order is preferred.
@@ -1104,7 +1085,6 @@ def lowpass_biquad(waveform: Tensor, sample_rate: int, cutoff_freq: float, Q: fl
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Args:
         waveform (tensorplay.Tensor): audio waveform of dimension of `(..., time)`
@@ -1152,7 +1132,6 @@ def overdrive(waveform: Tensor, gain: float = 20, colour: float = 20) -> Tensor:
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     This effect applies a non linear distortion to the audio signal.
 
@@ -1184,7 +1163,6 @@ def overdrive(waveform: Tensor, gain: float = 20, colour: float = 20) -> Tensor:
 
     mask1 = temp < -1
     temp[mask1] = tensorplay.tensor(-2.0 / 3.0, dtype=dtype, device=device)
-    # Wrapping the constant with Tensor is required for Torchscript
 
     mask2 = temp > 1
     temp[mask2] = tensorplay.tensor(2.0 / 3.0, dtype=dtype, device=device)
@@ -1217,7 +1195,6 @@ def phaser(
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Args:
         waveform (Tensor): audio waveform of dimension of `(..., time)`
@@ -1301,7 +1278,6 @@ def riaa_biquad(waveform: Tensor, sample_rate: int) -> Tensor:
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Args:
         waveform (Tensor): audio waveform of dimension of `(..., time)`
@@ -1371,7 +1347,6 @@ def treble_biquad(
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Args:
         waveform (Tensor): audio waveform of dimension of `(..., time)`
@@ -1507,7 +1482,6 @@ def vad(
 
     .. devices:: CPU CUDA
 
-    .. properties:: TorchScript
 
     Attempts to trim silence and quiet background sounds from the ends of recordings of speech.
     The algorithm currently uses a simple cepstral power measurement to detect voice,

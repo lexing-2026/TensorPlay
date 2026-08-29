@@ -1,6 +1,5 @@
 """Availability shims for the functional layer (see ``audio._extension``).
 
-Mirrors ``torchaudio.functional._extension``: optional native features are
 gated behind flags so importing the functional layer never fails.
 """
 from functools import wraps

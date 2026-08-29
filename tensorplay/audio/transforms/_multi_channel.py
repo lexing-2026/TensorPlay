@@ -57,7 +57,6 @@ class PSD(tensorplay.nn.Module):
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Args:
         multi_mask (bool, optional): If ``True``, only accepts multi-channel Time-Frequency masks. (Default: ``False``)
@@ -99,7 +98,6 @@ class MVDR(tensorplay.nn.Module):
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Based on https://github.com/espnet/espnet/blob/master/espnet2/enh/layers/beamformer.py
 
@@ -316,7 +314,7 @@ class MVDR(tensorplay.nn.Module):
                     Found: {specgram.dtype}"
             )
         if specgram.dtype == tensorplay.cfloat:
-            specgram = specgram.cdouble()  # Convert specgram to ``torch.cdouble``.
+            specgram = specgram.cdouble()
 
         if mask_n is None:
             warnings.warn("``mask_n`` is not provided, use ``1 - mask_s`` as ``mask_n``.")
@@ -346,7 +344,6 @@ class RTFMVDR(tensorplay.nn.Module):
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Given the multi-channel complex-valued spectrum :math:`\textbf{Y}`, the relative transfer function (RTF) matrix
     or the steering vector of target speech :math:`\bm{v}`, the PSD matrix of noise :math:`\bf{\Phi}_{\textbf{NN}}`, and
@@ -410,7 +407,6 @@ class SoudenMVDR(tensorplay.nn.Module):
 
     .. devices:: CPU CUDA
 
-    .. properties:: Autograd TorchScript
 
     Given the multi-channel complex-valued spectrum :math:`\textbf{Y}`, the power spectral density (PSD) matrix
     of target speech :math:`\bf{\Phi}_{\textbf{SS}}`, the PSD matrix of noise :math:`\bf{\Phi}_{\textbf{NN}}`, and

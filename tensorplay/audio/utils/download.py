@@ -38,7 +38,7 @@ def _download_asset(
     *,
     progress: bool = True,
 ) -> str:
-    """Download and store torchaudio assets to local file system.
+    """
 
     If a file exists at the download path, then that path is returned with or without
     hash validation.
@@ -52,7 +52,6 @@ def _download_asset(
             is returned as-is without verifying the identity of the file.
         path (path-like object, optional):
             By default, the downloaded asset is saved in a directory under
-            :py:func:`torch.hub.get_dir` and intermediate directories based on the given `key`
             are created.
             This argument can be used to overwrite the target location.
             When this argument is provided, all the intermediate directories have to be
@@ -60,7 +59,6 @@ def _download_asset(
         progress (bool): Whether to show progress bar for downloading. Default: ``True``.
 
     Note:
-        Currently the valid key values are the route on ``download.pytorch.org/torchaudio``,
         but this is an implementation detail.
 
     Returns:

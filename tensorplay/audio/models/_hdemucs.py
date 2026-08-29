@@ -471,7 +471,6 @@ class HDemucs(tensorplay.nn.Module):
         # that the size of the output is exactly the size of the input
         # divided by the stride (here hop_length), when divisible.
         # This is achieved by padding by 1/4th of the kernel size (here nfft).
-        # which is not supported by torch.stft.
         # Having all convolution operations follow this convention allow to easily
         # align the time and frequency branches later on.
         if hl != nfft // 4:

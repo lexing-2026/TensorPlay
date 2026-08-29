@@ -727,7 +727,6 @@ def _get_encoder(
     pos_conv = ConvolutionalPositionalEmbedding(embed_dim, pos_conv_kernel, pos_conv_groups)
 
     # Original impl
-    # https://github.com/pytorch/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/fairseq/models/wav2vec/wav2vec2.py#L768-L782
     encoder_layers = nn.ModuleList()
     for _ in range(num_layers):
         attention = SelfAttention(
@@ -803,7 +802,6 @@ def _get_wavlm_encoder(
     pos_conv = ConvolutionalPositionalEmbedding(embed_dim, pos_conv_kernel, pos_conv_groups)
 
     # Original impl
-    # https://github.com/pytorch/fairseq/blob/425c36eafff535fe7337f8bdd5ace22ebacc78cb/fairseq/models/wav2vec/wav2vec2.py#L768-L782
     encoder_layers = nn.ModuleList()
     for i in range(num_layers):
         attention = WavLMSelfAttention(
@@ -1050,7 +1048,6 @@ class MaskGenerator(Module):
             )
             mask_indices = mask_indices.to(x.device)
             # change dtype of mask_embedding to x for mixed-precision training.
-            # see https://github.com/pytorch/audio/issues/2847 for details.
             x[mask_indices] = self.mask_embedding.to(x.dtype)
         else:
             mask_indices = None
