@@ -350,7 +350,9 @@ Tensor& normal_kernel_cuda(Tensor& self, double mean, double std) {
 Tensor& exponential_kernel_cuda(Tensor& self, double lambd) {
     if (self.numel() == 0) return self;
     if (!self.is_contiguous()) {
-        return fill_via_contiguous(self, [&](Tensor& t) { return exponential_kernel_cuda(t); });
+        return fill_via_contiguous(self, [&](Tensor& t) {
+            return exponential_kernel_cuda(t, lambd);
+        });
     }
     int64_t n = self.numel();
     if (self.dtype() == DType::Float32) {
