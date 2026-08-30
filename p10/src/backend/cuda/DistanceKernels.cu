@@ -13,6 +13,7 @@
 #include <complex>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <type_traits>
 #include <vector>
 
@@ -403,6 +404,54 @@ void launch_pdist_family(
     DISTANCE_CUDA_CHECK(cudaGetLastError());
 }
 
+template <typename InputT, typename AccT, typename OutputT, typename Family>
+__global__ void cdist_kernel(
+        OutputT* output, const InputT* lhs, const InputT* rhs,
+        int64_t batches, int64_t rows1, int64_t rows2, int64_t width,
+        AccT p) {
+    const int64_t pair_count = rows1 * rows2;
+    const int64_t linear = static_cast<int64_t>(blockIdx.x);
+    const int64_t batch = linear / pair_count;
+    if (batch >= batches) return;
+    const int64_t pair = linear % pair_count;
+    const int64_t row1 = pair / rows2;
+    const int64_t row2 = pair % rows2;
+
+    const InputT* lhs_row = lhs + (batch * rows1 + row1) * width;
+    const InputT* rhs_row = rhs + (batch * rows2 + row2) * width;
+    AccT aggregate = std::is_same_v<Family, DistanceMin<AccT>>
+        ? std::numeric_limits<AccT>::infinity()
+        : AccT(0);
+    for (int64_t column = threadIdx.x; column < width; column += blockDim.x) {
+        Family::inc(aggregate,
+                    distance_absdiff(lhs_row[column], rhs_row[column], AccT(0)),
+                    p);
+    }
+
+    const AccT identity = std::is_same_v<Family, DistanceMin<AccT>>
+        ? std::numeric_limits<AccT>::infinity()
+        : AccT(0);
+    aggregate = distance_block_reduce<AccT, Family>(aggregate, identity);
+    if (threadIdx.x == 0) {
+        output[linear] = static_cast<OutputT>(Family::finish(aggregate, p));
+    }
+}
+
+template <typename InputT, typename AccT, typename OutputT, typename Family>
+void launch_cdist_family(
+        Tensor& output, const Tensor& lhs, const Tensor& rhs,
+        int64_t batches, int64_t rows1, int64_t rows2, int64_t width,
+        double p) {
+    const dim3 grid(static_cast<unsigned>(output.numel()));
+    const dim3 block(kDistanceThreads);
+    cdist_kernel<InputT, AccT, OutputT, Family><<<
+        grid, block, 0, getCurrentCUDAStream().stream()>>>(
+        output.data_ptr<OutputT>(), distance_data_ptr<InputT>(lhs),
+        distance_data_ptr<InputT>(rhs), batches, rows1, rows2, width,
+        static_cast<AccT>(p));
+    DISTANCE_CUDA_CHECK(cudaGetLastError());
+}
+
 template <typename InputT, typename AccT, typename OutputT>
 void launch_pdist(
         Tensor& output, const Tensor& input, int64_t n, int64_t width, double p) {
@@ -421,6 +470,30 @@ void launch_pdist(
     } else {
         launch_pdist_family<InputT, AccT, OutputT, DistanceP<AccT>>(
             output, input, n, width, p);
+    }
+}
+
+template <typename InputT, typename AccT, typename OutputT>
+void launch_cdist(
+        Tensor& output, const Tensor& lhs, const Tensor& rhs,
+        int64_t batches, int64_t rows1, int64_t rows2, int64_t width,
+        double p) {
+    if (p == 0.0) {
+        launch_cdist_family<InputT, AccT, OutputT, DistanceZeroCount<AccT>>(
+            output, lhs, rhs, batches, rows1, rows2, width, p);
+    } else if (p == 1.0) {
+        launch_cdist_family<InputT, AccT, OutputT, DistanceOne<AccT>>(
+            output, lhs, rhs, batches, rows1, rows2, width, p);
+    } else if (p == 2.0) {
+        launch_cdist_family<InputT, AccT, OutputT, DistanceTwo<AccT>>(
+            output, lhs, rhs, batches, rows1, rows2, width, p);
+    } else if (p == std::numeric_limits<double>::infinity()) {
+        launch_cdist_family<InputT, AccT, OutputT,
+                           DistanceMaxIgnoreNan<AccT>>(
+            output, lhs, rhs, batches, rows1, rows2, width, p);
+    } else {
+        launch_cdist_family<InputT, AccT, OutputT, DistanceP<AccT>>(
+            output, lhs, rhs, batches, rows1, rows2, width, p);
     }
 }
 
@@ -575,7 +648,88 @@ Tensor dist_cuda(const Tensor& self, const Tensor& other, Scalar p_scalar) {
     return output;
 }
 
+Tensor cdist_cuda(
+        const Tensor& x1, const Tensor& x2, double p,
+        std::optional<int64_t> compute_mode) {
+    if (x1.dim() < 2) {
+        TP_THROW(RuntimeError,
+                 "cdist only supports at least 2D tensors, X1 got: ",
+                 x1.dim(), "D");
+    }
+    if (x2.dim() < 2) {
+        TP_THROW(RuntimeError,
+                 "cdist only supports at least 2D tensors, X2 got: ",
+                 x2.dim(), "D");
+    }
+    if (x1.size(-1) != x2.size(-1)) {
+        TP_THROW(RuntimeError,
+                 "X1 and X2 must have the same number of columns. X1: ",
+                 x1.size(-1), " X2: ", x2.size(-1));
+    }
+    if (!isFloatingType(x1.dtype())) {
+        TP_THROW(TypeError, "cdist only supports floating-point dtypes");
+    }
+    if (!isFloatingType(x2.dtype())) {
+        TP_THROW(TypeError, "cdist only supports floating-point dtypes");
+    }
+    if (x1.dtype() != x2.dtype()) {
+        TP_THROW(RuntimeError,
+                 "expected scalar type ", toString(x1.dtype()),
+                 " but found ", toString(x2.dtype()));
+    }
+    if (!(p >= 0.0)) {
+        TP_THROW(RuntimeError, "cdist only supports non-negative p values");
+    }
+    const int64_t mode = compute_mode.value_or(0);
+    if (mode < 0 || mode > 2) {
+        TP_THROW(RuntimeError, "possible modes: 0, 1, 2, but was: ", mode);
+    }
+
+    const std::vector<int64_t> shape1 =
+        static_cast<std::vector<int64_t>>(x1.shape());
+    const std::vector<int64_t> shape2 =
+        static_cast<std::vector<int64_t>>(x2.shape());
+    const std::vector<int64_t> batch1(shape1.begin(), shape1.end() - 2);
+    const std::vector<int64_t> batch2(shape2.begin(), shape2.end() - 2);
+    const std::vector<int64_t> batch_shape = broadcast_shapes(batch1, batch2);
+    const int64_t rows1 = x1.size(-2);
+    const int64_t rows2 = x2.size(-2);
+    const int64_t width = x1.size(-1);
+    const int64_t batches = product_all(batch_shape);
+
+    std::vector<int64_t> expanded1 = batch_shape;
+    expanded1.push_back(rows1);
+    expanded1.push_back(width);
+    std::vector<int64_t> expanded2 = batch_shape;
+    expanded2.push_back(rows2);
+    expanded2.push_back(width);
+    Tensor lhs = x1.expand(expanded1).contiguous();
+    Tensor rhs = x2.expand(expanded2).contiguous();
+
+    std::vector<int64_t> output_shape = batch_shape;
+    output_shape.push_back(rows1);
+    output_shape.push_back(rows2);
+    Tensor output = Tensor::empty(output_shape, x1.dtype(), x1.device());
+    if (rows1 == 0 || rows2 == 0 || batches == 0) return output;
+    if (width == 0) return output.fill_(Scalar(0));
+
+    switch (x1.dtype()) {
+        case DType::Float32:
+            launch_cdist<float, float, float>(
+                output, lhs, rhs, batches, rows1, rows2, width, p);
+            break;
+        case DType::Float64:
+            launch_cdist<double, double, double>(
+                output, lhs, rhs, batches, rows1, rows2, width, p);
+            break;
+        default:
+            TP_THROW(NotImplementedError, "cdist: unsupported CUDA dtype");
+    }
+    return output;
+}
+
 TENSORPLAY_LIBRARY_IMPL(CUDA, DistanceKernels) {
+    m.impl("cdist", cdist_cuda);
     m.impl("dist", dist_cuda);
     m.impl("pdist", pdist_cuda);
     m.impl("pairwise_distance", pairwise_distance_cuda);
