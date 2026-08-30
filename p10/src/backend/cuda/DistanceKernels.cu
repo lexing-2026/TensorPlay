@@ -5,6 +5,7 @@
 #include "TypePromotion.h"
 #include "Utils.h"
 #include "CUDARuntime.h"
+#include "tensorplay/ops/TPXOpsGenerated.h"
 
 #include <cuda_runtime.h>
 #include <thrust/complex.h>
@@ -511,6 +512,24 @@ inline DType distance_output_dtype(DType dtype) {
     return isComplexType(dtype) ? toRealValueType(dtype) : dtype;
 }
 
+Tensor euclidean_distance_matmul(const Tensor& x1, const Tensor& x2) {
+    Tensor x1_norm = x1.pow(Scalar(2)).sum(
+        std::vector<int64_t>{-1}, true);
+    Tensor x1_pad = Tensor::ones_like(x1_norm);
+    Tensor x2_norm = x2.pow(Scalar(2)).sum(
+        std::vector<int64_t>{-1}, true);
+    Tensor x2_pad = Tensor::ones_like(x2_norm);
+    Tensor x1_augmented = Tensor::cat(
+        {x1.mul(Scalar(-2)), x1_norm, x1_pad}, -1);
+    Tensor x2_augmented = Tensor::cat(
+        {x2, x2_pad, x2_norm}, -1);
+    Tensor result = tpx::ops::matmul(
+        x1_augmented, x2_augmented.transpose(-2, -1));
+    result.clamp_min_(Scalar(0));
+    result.sqrt_();
+    return result;
+}
+
 } // anonymous namespace
 
 Tensor pairwise_distance_cuda(
@@ -712,6 +731,11 @@ Tensor cdist_cuda(
     Tensor output = Tensor::empty(output_shape, x1.dtype(), x1.device());
     if (rows1 == 0 || rows2 == 0 || batches == 0) return output;
     if (width == 0) return output.fill_(Scalar(0));
+
+    if (p == 2.0 &&
+        (mode == 1 || (mode == 0 && (rows1 > 25 || rows2 > 25)))) {
+        return euclidean_distance_matmul(lhs, rhs);
+    }
 
     switch (x1.dtype()) {
         case DType::Float32:
