@@ -407,7 +407,7 @@ template <typename InputT, typename AccT, typename OutputT>
 void launch_pdist(
         Tensor& output, const Tensor& input, int64_t n, int64_t width, double p) {
     if (p == 0.0) {
-        launch_pdist_family<InputT, AccT, OutputT, DistanceZero<AccT>>(
+        launch_pdist_family<InputT, AccT, OutputT, DistanceZeroCount<AccT>>(
             output, input, n, width, p);
     } else if (p == 1.0) {
         launch_pdist_family<InputT, AccT, OutputT, DistanceOne<AccT>>(
