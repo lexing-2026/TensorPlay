@@ -162,6 +162,7 @@ if(USE_CUDA)
         src/backend/cuda/MarginLossKernels.cu
         src/backend/cuda/RandomKernels.cu
         src/backend/cuda/ReductionKernels.cu
+        src/backend/cuda/DistanceKernels.cu
         src/backend/cuda/ViewKernels.cu
         src/backend/cuda/ShapeAlignKernels.cu
         src/backend/cuda/ForeachFallbackKernels.cu
