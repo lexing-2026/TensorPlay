@@ -621,50 +621,7 @@ Tensor pdist_cuda(const Tensor& self, double p) {
 }
 
 Tensor dist_cuda(const Tensor& self, const Tensor& other, Scalar p_scalar) {
-    const std::vector<int64_t> shape = broadcast_shapes(
-        static_cast<std::vector<int64_t>>(self.shape()),
-        static_cast<std::vector<int64_t>>(other.shape()));
-    const DType compute_dtype = promoteTypes(self.dtype(), other.dtype());
-    if (!isFloatingOrComplexType(compute_dtype)) {
-        TP_THROW(TypeError,
-                 "dist: input dtype must be floating point or complex");
-    }
-
-    Tensor lhs = self.to(compute_dtype).expand(shape).contiguous();
-    Tensor rhs = other.to(compute_dtype).expand(shape).contiguous();
-    Tensor output = Tensor::empty({}, distance_output_dtype(compute_dtype), self.device());
-    const int64_t width = product_all(shape);
-    const double p = p_scalar.toDouble();
-    if (width == 0) {
-        check_empty_distance(p);
-        return output.fill_(Scalar(0));
-    }
-
-    switch (compute_dtype) {
-        case DType::Float32:
-            dist_typed<float, float, float>(output, lhs, rhs, width, p);
-            break;
-        case DType::Float64:
-            dist_typed<double, double, double>(output, lhs, rhs, width, p);
-            break;
-        case DType::Float16:
-            dist_typed<Half, float, Half>(output, lhs, rhs, width, p);
-            break;
-        case DType::BFloat16:
-            dist_typed<BFloat16, float, BFloat16>(output, lhs, rhs, width, p);
-            break;
-        case DType::ComplexFloat:
-            dist_typed<thrust::complex<float>, float, float>(
-                output, lhs, rhs, width, p);
-            break;
-        case DType::ComplexDouble:
-            dist_typed<thrust::complex<double>, double, double>(
-                output, lhs, rhs, width, p);
-            break;
-        default:
-            TP_THROW(NotImplementedError, "dist: unsupported CUDA dtype");
-    }
-    return output;
+    return tpx::ops::norm(tpx::ops::sub(self, other), p_scalar.toDouble());
 }
 
 Tensor cdist_cuda(
