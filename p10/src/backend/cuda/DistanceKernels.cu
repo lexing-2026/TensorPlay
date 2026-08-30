@@ -95,6 +95,23 @@ struct DistanceZero {
 };
 
 template <typename T>
+struct DistanceZeroCount {
+    static __device__ __forceinline__ void inc(T& acc, T value, T) {
+        if (value != T(0)) {
+            acc += T(1);
+        }
+    }
+
+    static __device__ __forceinline__ T combine(T lhs, T rhs) {
+        return lhs + rhs;
+    }
+
+    static __device__ __forceinline__ T finish(T value, T) {
+        return value;
+    }
+};
+
+template <typename T>
 struct DistanceOne {
     static __device__ __forceinline__ void inc(T& acc, T value, T) {
         acc += value;
@@ -280,7 +297,7 @@ void launch_distance(
         int64_t rows, int64_t width, double p, double addend,
         bool propagate_max_nan) {
     if (p == 0.0) {
-        launch_distance_family<InputT, AccT, OutputT, DistanceZero<AccT>>(
+        launch_distance_family<InputT, AccT, OutputT, DistanceZeroCount<AccT>>(
             output, lhs, rhs, rows, width, p, addend);
     } else if (p == 1.0) {
         launch_distance_family<InputT, AccT, OutputT, DistanceOne<AccT>>(
