@@ -138,9 +138,14 @@ using reduction::ArgOps;
 using reduction::ArgPair;
 using reduction::AllOps;
 using reduction::AnyOps;
+using reduction::AbsMaxOps;
+using reduction::AbsMinOps;
 using reduction::MeanOps;
 using reduction::MinMaxOps;
+using reduction::NormOps;
+using reduction::NormOneOps;
 using reduction::NormTwoOps;
+using reduction::NormZeroOps;
 using reduction::ProdOps;
 using reduction::SumOps;
 using reduction::WelfordData;
@@ -338,17 +343,40 @@ Tensor mean_same_dtype(
 template <typename T>
 Tensor norm_same_dtype(
         const Tensor& input, const ReductionSpec& spec, bool keepdim, double p) {
-    if (p != 2.0) {
-        TP_THROW(NotImplementedError, "norm: only p=2 supported on CUDA");
-    }
     using AccT = same_dtype_acc_t<T>;
     if (input.numel() == 0) {
-        return Tensor::full(
-            reduction_output_shape(input, spec, keepdim),
-            Scalar(std::numeric_limits<float>::quiet_NaN()), input.dtype(), input.device());
+        if (spec.reduced_numel == 0 &&
+            (p < 0.0 || p == std::numeric_limits<double>::infinity())) {
+            TP_THROW(RuntimeError,
+                     "norm cannot reduce an empty dimension for this order");
+        }
+        return Tensor::zeros(
+            reduction_output_shape(input, spec, keepdim), input.dtype(), input.device());
+    }
+    if (p == 0.0) {
+        return run_reduction_typed<T, AccT, T>(
+            input, spec, keepdim, input.dtype(), NormZeroOps<T, AccT, T>{}, AccT(0));
+    }
+    if (p == 1.0) {
+        return run_reduction_typed<T, AccT, T>(
+            input, spec, keepdim, input.dtype(), NormOneOps<T, AccT, T>{}, AccT(0));
+    }
+    if (p == 2.0) {
+        return run_reduction_typed<T, AccT, T>(
+            input, spec, keepdim, input.dtype(), NormTwoOps<AccT, T>{}, AccT(0));
+    }
+    if (p == std::numeric_limits<double>::infinity()) {
+        return run_reduction_typed<T, AccT, T>(
+            input, spec, keepdim, input.dtype(), AbsMaxOps<T, AccT, T>{}, AccT(0));
+    }
+    if (p == -std::numeric_limits<double>::infinity()) {
+        return run_reduction_typed<T, AccT, T>(
+            input, spec, keepdim, input.dtype(), AbsMinOps<T, AccT, T>{},
+            std::numeric_limits<AccT>::infinity());
     }
     return run_reduction_typed<T, AccT, T>(
-        input, spec, keepdim, input.dtype(), NormTwoOps<AccT, T>{}, AccT(0));
+        input, spec, keepdim, input.dtype(), NormOps<T, AccT, T>{static_cast<AccT>(p)},
+        AccT(0));
 }
 
 template <typename T>

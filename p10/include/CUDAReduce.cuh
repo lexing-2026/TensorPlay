@@ -980,6 +980,90 @@ struct MeanOps {
     }
 };
 
+template <typename ScalarT, typename AccT>
+__device__ __forceinline__ AccT norm_abs(ScalarT value) {
+    const AccT converted = static_cast<AccT>(value);
+    if constexpr (std::is_same_v<AccT, float>) {
+        return ::fabsf(converted);
+    } else {
+        return ::fabs(converted);
+    }
+}
+
+template <typename T>
+__device__ __forceinline__ T norm_pow(T value, T exponent) {
+    if constexpr (std::is_same_v<T, float>) {
+        return ::powf(value, exponent);
+    } else {
+        return ::pow(value, exponent);
+    }
+}
+
+template <typename ScalarT, typename AccT, typename OutputT>
+struct NormZeroOps {
+    __device__ AccT reduce(AccT acc, ScalarT value, int64_t) const {
+        return acc + (value == static_cast<ScalarT>(0) ? AccT(0) : AccT(1));
+    }
+    __device__ AccT combine(AccT a, AccT b) const { return a + b; }
+    __device__ OutputT project(AccT value) const {
+        return static_cast<OutputT>(value);
+    }
+};
+
+template <typename ScalarT, typename AccT, typename OutputT>
+struct NormOneOps {
+    __device__ AccT reduce(AccT acc, ScalarT value, int64_t) const {
+        return acc + norm_abs<ScalarT, AccT>(value);
+    }
+    __device__ AccT combine(AccT a, AccT b) const { return a + b; }
+    __device__ OutputT project(AccT value) const {
+        return static_cast<OutputT>(value);
+    }
+};
+
+template <typename ScalarT, typename AccT, typename OutputT>
+struct AbsMinOps {
+    __device__ AccT reduce(AccT acc, ScalarT value, int64_t) const {
+        return combine(acc, norm_abs<ScalarT, AccT>(value));
+    }
+    __device__ AccT combine(AccT a, AccT b) const {
+        if (reduce_isnan(a)) return a;
+        if (reduce_isnan(b)) return b;
+        return a < b ? a : b;
+    }
+    __device__ OutputT project(AccT value) const {
+        return static_cast<OutputT>(value);
+    }
+};
+
+template <typename ScalarT, typename AccT, typename OutputT>
+struct AbsMaxOps {
+    __device__ AccT reduce(AccT acc, ScalarT value, int64_t) const {
+        return combine(acc, norm_abs<ScalarT, AccT>(value));
+    }
+    __device__ AccT combine(AccT a, AccT b) const {
+        if (reduce_isnan(a)) return a;
+        if (reduce_isnan(b)) return b;
+        return a > b ? a : b;
+    }
+    __device__ OutputT project(AccT value) const {
+        return static_cast<OutputT>(value);
+    }
+};
+
+template <typename ScalarT, typename AccT, typename OutputT>
+struct NormOps {
+    AccT norm;
+
+    __device__ AccT reduce(AccT acc, ScalarT value, int64_t) const {
+        return acc + norm_pow(norm_abs<ScalarT, AccT>(value), norm);
+    }
+    __device__ AccT combine(AccT a, AccT b) const { return a + b; }
+    __device__ OutputT project(AccT value) const {
+        return static_cast<OutputT>(norm_pow(value, AccT(1) / norm));
+    }
+};
+
 template <typename AccT, typename OutputT>
 struct NormTwoOps {
     __device__ AccT reduce(AccT acc, AccT value, int64_t) const {
