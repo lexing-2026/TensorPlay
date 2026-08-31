@@ -69,23 +69,117 @@ def _graph_bool_to_int(value: Any) -> int:
 
 
 def _graph_sym_min(left: Any, right: Any) -> Any:
+    from .experimental.sym_node import SymNode
+
+    if isinstance(left, SymNode):
+        return left.sym_min(right)
+    if isinstance(right, SymNode):
+        return right.sym_min(left)
     return min(left, right)
 
 
 def _graph_sym_max(left: Any, right: Any) -> Any:
+    from .experimental.sym_node import SymNode
+
+    if isinstance(left, SymNode):
+        return left.sym_max(right)
+    if isinstance(right, SymNode):
+        return right.sym_max(left)
     return max(left, right)
 
 
-def _graph_floor(value: Any) -> int:
+def _graph_floor(value: Any) -> Any:
+    from .experimental.sym_node import SymNode
+
+    if isinstance(value, SymNode):
+        return value.floor()
     return math.floor(value)
 
 
-def _graph_ceil(value: Any) -> int:
+def _graph_ceil(value: Any) -> Any:
+    from .experimental.sym_node import SymNode
+
+    if isinstance(value, SymNode):
+        return value.ceil()
     return math.ceil(value)
 
 
 def _graph_abs(value: Any) -> Any:
+    from .experimental.sym_node import SymNode
+
+    if isinstance(value, SymNode):
+        return value.abs()
     return abs(value)
+
+
+def _graph_sym_and(left: Any, right: Any) -> Any:
+    from .experimental.sym_node import SymNode
+
+    if isinstance(left, SymNode):
+        return left.and_(right)
+    if isinstance(right, SymNode):
+        return right.and_(left)
+    return bool(left) and bool(right)
+
+
+def _graph_sym_or(left: Any, right: Any) -> Any:
+    from .experimental.sym_node import SymNode
+
+    if isinstance(left, SymNode):
+        return left.or_(right)
+    if isinstance(right, SymNode):
+        return right.or_(left)
+    return bool(left) or bool(right)
+
+
+def _graph_sym_xor(left: Any, right: Any) -> Any:
+    from .experimental.sym_node import SymNode
+
+    if isinstance(left, SymNode):
+        return left.xor(right)
+    if isinstance(right, SymNode):
+        return right.xor(left)
+    return bool(left) != bool(right)
+
+
+def _graph_sym_not(value: Any) -> Any:
+    from .experimental.sym_node import SymNode
+
+    if isinstance(value, SymNode):
+        return value.sym_not()
+    return not bool(value)
+
+
+def _graph_sym_ite(condition: Any, true_value: Any, false_value: Any) -> Any:
+    from .experimental.sym_node import SymNode, sym_ite
+
+    if isinstance(condition, SymNode):
+        return sym_ite(condition, true_value, false_value)
+    return true_value if bool(condition) else false_value
+
+
+def _graph_sym_is_integer(value: Any) -> Any:
+    from .experimental.sym_node import SymNode
+
+    if isinstance(value, SymNode):
+        return value.is_integer()
+    return float(value).is_integer()
+
+
+def _graph_sym_trunc(value: Any) -> Any:
+    from .experimental.sym_node import SymNode
+
+    if isinstance(value, SymNode):
+        return value.trunc()
+    return math.trunc(value)
+
+
+def _graph_sym_float(value: Any) -> Any:
+    from .experimental.sym_node import SymNode
+
+    if isinstance(value, SymNode):
+        return value.sym_float()
+    return float(value)
 
 
 def _snake_case(value: str) -> str:
@@ -1300,36 +1394,61 @@ class Graph:
 
         return value.expr if hasattr(value, "expr") else sympy.sympify(value)
 
-    def materialize_symints(self, values: Sequence[Any]) -> list[Node | int]:
+    def materialize_symints(self, values: Sequence[Any]) -> list[Any]:
+        import math
         import sympy
+        from sympy.logic.boolalg import BooleanAtom
 
+        from .experimental.sym_node import SymNode
+
+        expression_to_value: dict[sympy.Basic, Any] = {}
         symbol_to_node: dict[sympy.Symbol, Node] = {}
-        expression_to_node: dict[Any, Node | int] = {}
         size_sources: dict[sympy.Symbol, tuple[Node, int, int]] = {}
         binding_sources: dict[sympy.Symbol, tuple[Node, tuple[Any, ...]]] = {}
 
         def node_value(node: Node) -> Any:
-            return node.meta.get("val", node.meta.get("example_value"))
+            value = node.meta.get("val")
+            return value if value is not None else node.meta.get("example_value")
 
-        def add_shape_sources(node: Node, value: Any) -> None:
+        def symbolic_expr(value: Any) -> sympy.Basic:
+            expression = self._symbolic_expr(value)
+            if not isinstance(expression, sympy.Basic):
+                expression = sympy.sympify(expression)
+            return expression
+
+        def record_shape_source(node: Node, value: Any) -> None:
             shape = getattr(value, "shape", None)
             if callable(shape):
                 shape = shape()
             if shape is None:
                 return
             for dim, item in enumerate(shape):
-                if hasattr(item, "expr"):
-                    expr = self._symbolic_expr(item)
-                    if isinstance(expr, sympy.Symbol):
-                        size_sources.setdefault(expr, (node, dim, 1))
+                if not isinstance(item, SymNode):
+                    continue
+                expression = symbolic_expr(item)
+                if isinstance(expression, sympy.Symbol):
+                    size_sources.setdefault(expression, (node, dim, 1))
+                    continue
+                if not isinstance(expression, sympy.Mul) or len(expression.args) != 2:
+                    continue
+                first, second = expression.args
+                if isinstance(first, sympy.Integer) and isinstance(second, sympy.Symbol):
+                    first, second = second, first
+                if (
+                    isinstance(first, sympy.Symbol)
+                    and isinstance(second, sympy.Integer)
+                    and int(second) > 0
+                ):
+                    size_sources.setdefault(first, (node, dim, int(second)))
 
         for node in self.nodes:
             value = node_value(node)
-            if hasattr(value, "expr"):
-                expr = self._symbolic_expr(value)
-                if isinstance(expr, sympy.Symbol):
-                    symbol_to_node.setdefault(expr, node)
-            add_shape_sources(node, value)
+            if node.op == "placeholder" and isinstance(value, SymNode):
+                expression = symbolic_expr(value)
+                if isinstance(expression, sympy.Symbol):
+                    symbol_to_node.setdefault(expression, node)
+            if node.op == "placeholder":
+                record_shape_source(node, value)
             symbol = node.meta.get("symbol")
             if isinstance(symbol, sympy.Symbol):
                 symbol_to_node.setdefault(symbol, node)
@@ -1339,18 +1458,26 @@ class Graph:
                     if isinstance(symbol, sympy.Symbol):
                         binding_sources.setdefault(symbol, (node, tuple(keypath)))
 
-        def ensure_symbol(symbol: sympy.Symbol) -> Node | int:
+        def set_node_value(node: Node, value: Any) -> None:
+            node.meta["val"] = value
+            if any(
+                isinstance(input_node, Node)
+                and "example_value" in input_node.meta
+                for input_node in node.all_input_nodes
+            ):
+                node.meta["example_value"] = value
+
+        def ensure_symbol(symbol: sympy.Symbol) -> Node:
             existing = symbol_to_node.get(symbol)
             if existing is not None:
                 return existing
             source = size_sources.get(symbol)
             if source is not None:
                 producer, dim, divisor = source
-                result: Node | int = self.create_size_node(producer, dim)
+                result = self.create_size_node(producer, dim)
                 if divisor != 1:
                     result = self.call_function(operator.floordiv, (result, divisor))
-                if isinstance(result, Node):
-                    symbol_to_node[symbol] = result
+                symbol_to_node[symbol] = result
                 return result
             binding = binding_sources.get(symbol)
             if binding is not None:
@@ -1358,69 +1485,183 @@ class Graph:
                 for item in keypath:
                     divisor = getattr(item, "divisor", None)
                     if hasattr(divisor, "expr"):
-                        for free_symbol in self._symbolic_expr(divisor).free_symbols:
+                        for free_symbol in symbolic_expr(divisor).free_symbols:
                             ensure_symbol(free_symbol)
-                result = self._resolve_unbacked_binding(producer, keypath, lower_symint=materialize)
+                result = self._resolve_unbacked_binding(
+                    producer,
+                    keypath,
+                    lower_symint=materialize,
+                )
                 symbol_to_node[symbol] = result
                 return result
             raise GraphCaptureError(f"symbol {symbol} has no graph producer")
 
-        def materialize(value: Any) -> Node | int:
-            if isinstance(value, bool):
-                return int(value)
-            if isinstance(value, int) and not hasattr(value, "expr"):
+        def annotate_result(value: Any) -> Any:
+            if not isinstance(value, Node):
                 return value
-            expression = self._symbolic_expr(value)
-            cached = expression_to_node.get(expression)
-            if cached is not None:
-                return cached
-            if getattr(expression, "is_number", False):
-                result = int(expression)
-                expression_to_node[expression] = result
-                return result
-            if isinstance(expression, sympy.Symbol):
-                result = ensure_symbol(expression)
-            elif isinstance(expression, sympy.Add):
-                terms = [materialize(item) for item in expression.args]
-                result = terms[0]
-                for term in terms[1:]:
-                    result = self.call_function(operator.add, (result, term))
-            elif isinstance(expression, sympy.Mul):
-                terms = [materialize(item) for item in expression.args]
-                result = terms[0]
-                for term in terms[1:]:
-                    result = self.call_function(operator.mul, (result, term))
-            elif isinstance(expression, sympy.Pow):
-                result = self.call_function(operator.pow, tuple(materialize(item) for item in expression.args))
-            elif isinstance(expression, sympy.Mod):
-                result = self.call_function(operator.mod, tuple(materialize(item) for item in expression.args))
-            elif expression.func is sympy.floor:
-                result = self.call_function(_graph_floor, (materialize(expression.args[0]),))
-            elif expression.func is sympy.ceiling:
-                result = self.call_function(_graph_ceil, (materialize(expression.args[0]),))
-            elif expression.func is sympy.Abs:
-                result = self.call_function(_graph_abs, (materialize(expression.args[0]),))
-            elif expression.func is sympy.Min:
-                result = self.call_function(_graph_sym_min, tuple(materialize(item) for item in expression.args))
-            elif expression.func is sympy.Max:
-                result = self.call_function(_graph_sym_max, tuple(materialize(item) for item in expression.args))
-            else:
-                raise GraphCaptureError(f"cannot materialize symbolic expression {expression!r}")
-            expression_to_node[expression] = result
+            target = value.target
+            if not callable(target):
+                return value
+            try:
+                args = map_arg(value.args, lambda node: node_value(node))
+                kwargs = map_arg(value.kwargs, lambda node: node_value(node))
+                set_node_value(value, target(*args, **kwargs))
+            except (AttributeError, TypeError, ValueError):
+                pass
+            return value
+
+        def fold(function: Callable[..., Any], arguments: list[Any]) -> Any:
+            if not arguments:
+                raise GraphCaptureError(
+                    f"cannot materialize empty {getattr(function, '__name__', function)}"
+                )
+            result = arguments[0]
+            for argument in arguments[1:]:
+                result = annotate_result(self.call_function(function, (result, argument)))
             return result
 
-        result_values: list[Node | int] = []
+        comparison_functions: dict[Any, Callable[..., Any]] = {
+            sympy.Eq: operator.eq,
+            sympy.Ne: operator.ne,
+            sympy.Gt: operator.gt,
+            sympy.Lt: operator.lt,
+            sympy.Ge: operator.ge,
+            sympy.Le: operator.le,
+        }
+        boolean_functions: dict[Any, Callable[..., Any]] = {
+            sympy.And: _graph_sym_and,
+            sympy.Or: _graph_sym_or,
+            sympy.Xor: _graph_sym_xor,
+        }
+        function_targets: dict[str, Callable[..., Any]] = {
+            "lshift": operator.lshift,
+            "rshift": operator.rshift,
+            "trunc": _graph_sym_trunc,
+            "to_float": _graph_sym_float,
+            "is_integer": _graph_sym_is_integer,
+            "bitwise_and": operator.and_,
+            "bitwise_or": operator.or_,
+            "bitwise_xor": operator.xor,
+        }
+
+        def materialize(value: Any) -> Any:
+            if isinstance(value, Node):
+                return value
+            if isinstance(value, bool):
+                return bool(value)
+            if isinstance(value, int) and not isinstance(value, SymNode):
+                return int(value)
+            if isinstance(value, float) and not isinstance(value, SymNode):
+                return float(value)
+
+            expression = symbolic_expr(value)
+            if expression in expression_to_value:
+                return expression_to_value[expression]
+            if isinstance(expression, BooleanAtom):
+                result: Any = bool(expression)
+            elif isinstance(expression, sympy.Integer):
+                result = int(expression)
+            elif isinstance(expression, sympy.Float):
+                result = float(expression)
+            elif isinstance(expression, sympy.Rational):
+                result = int(expression) if expression.q == 1 else float(expression)
+            elif isinstance(expression, sympy.Symbol):
+                result = ensure_symbol(expression)
+            elif isinstance(expression, sympy.Add):
+                result = fold(operator.add, [materialize(item) for item in expression.args])
+            elif isinstance(expression, sympy.Mul):
+                result = fold(operator.mul, [materialize(item) for item in expression.args])
+            elif isinstance(expression, sympy.Pow):
+                result = annotate_result(
+                    self.call_function(
+                        operator.pow,
+                        tuple(materialize(item) for item in expression.args),
+                    )
+                )
+            elif isinstance(expression, sympy.Mod):
+                result = annotate_result(
+                    self.call_function(
+                        operator.mod,
+                        tuple(materialize(item) for item in expression.args),
+                    )
+                )
+            elif expression.func is sympy.floor:
+                result = annotate_result(
+                    self.call_function(_graph_floor, (materialize(expression.args[0]),))
+                )
+            elif expression.func is sympy.ceiling:
+                result = annotate_result(
+                    self.call_function(_graph_ceil, (materialize(expression.args[0]),))
+                )
+            elif expression.func is sympy.Abs:
+                result = annotate_result(
+                    self.call_function(_graph_abs, (materialize(expression.args[0]),))
+                )
+            elif expression.func is sympy.Min:
+                result = fold(_graph_sym_min, [materialize(item) for item in expression.args])
+            elif expression.func is sympy.Max:
+                result = fold(_graph_sym_max, [materialize(item) for item in expression.args])
+            elif expression.func in comparison_functions:
+                result = annotate_result(
+                    self.call_function(
+                        comparison_functions[expression.func],
+                        tuple(materialize(item) for item in expression.args),
+                    )
+                )
+            elif expression.func in boolean_functions:
+                result = fold(
+                    boolean_functions[expression.func],
+                    [materialize(item) for item in expression.args],
+                )
+            elif expression.func is sympy.Not:
+                result = annotate_result(
+                    self.call_function(
+                        _graph_sym_not,
+                        (materialize(expression.args[0]),),
+                    )
+                )
+            elif expression.func is sympy.Piecewise:
+                pairs = list(expression.args)
+                result = materialize(pairs[-1].args[0])
+                for pair in reversed(pairs[:-1]):
+                    result = annotate_result(
+                        self.call_function(
+                            _graph_sym_ite,
+                            (
+                                materialize(pair.args[1]),
+                                materialize(pair.args[0]),
+                                result,
+                            ),
+                        )
+                    )
+            else:
+                function = function_targets.get(getattr(expression.func, "__name__", ""))
+                if function is None:
+                    raise GraphCaptureError(
+                        f"cannot materialize symbolic expression {expression!r}"
+                    )
+                result = annotate_result(
+                    self.call_function(
+                        function,
+                        tuple(materialize(item) for item in expression.args),
+                    )
+                )
+
+            if isinstance(result, Node):
+                expression_to_value[expression] = annotate_result(result)
+            else:
+                expression_to_value[expression] = result
+            return result
+
+        result_values: list[Any] = []
         for value in values:
-            if isinstance(value, int) and not hasattr(value, "expr"):
-                result_values.append(int(value))
-                continue
             result = materialize(value)
-            if isinstance(result, Node) and hasattr(value, "expr"):
-                result.meta["val"] = value
+            if isinstance(result, Node) and isinstance(value, SymNode):
+                set_node_value(result, value)
             result_values.append(result)
         return result_values
 
-    def materialize_symint(self, value: Any) -> Node | int:
+    def materialize_symint(self, value: Any) -> Any:
         return self.materialize_symints([value])[0]
 
     def process_inputs(self, *args: Any) -> Any:
