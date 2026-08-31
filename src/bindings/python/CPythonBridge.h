@@ -16,6 +16,9 @@
 #include <DType.h>
 #include <Device.h>
 #include <Generator.h>
+#include <SymBool.h>
+#include <SymFloat.h>
+#include <SymInt.h>
 
 namespace tensorplay {
 namespace python_c {
@@ -173,6 +176,21 @@ PyObject* tpx_py_wrap(const Tensor& t);
 PyObject* tpx_py_wrap_optional_tensor(const std::optional<Tensor>& t);
 PyObject* tpx_py_wrap_scalar(const Scalar& s);
 PyObject* tpx_py_wrap_optional_scalar(const std::optional<Scalar>& s);
+PyObject* tpx_py_wrap_symint(const SymInt& value);
+PyObject* tpx_py_wrap_symbool(const SymBool& value);
+PyObject* tpx_py_wrap_symfloat(const SymFloat& value);
+PyObject* tpx_py_wrap_optional_symint(const std::optional<SymInt>& value);
+PyObject* tpx_py_wrap_optional_symbool(const std::optional<SymBool>& value);
+PyObject* tpx_py_wrap_optional_symfloat(const std::optional<SymFloat>& value);
+PyObject* tpx_py_wrap_symintlist(const std::vector<SymInt>& values);
+PyObject* tpx_py_wrap_symboollist(const std::vector<SymBool>& values);
+PyObject* tpx_py_wrap_symfloatlist(const std::vector<SymFloat>& values);
+PyObject* tpx_py_wrap_optional_symintlist(
+    const std::optional<std::vector<SymInt>>& values);
+PyObject* tpx_py_wrap_optional_symboollist(
+    const std::optional<std::vector<SymBool>>& values);
+PyObject* tpx_py_wrap_optional_symfloatlist(
+    const std::optional<std::vector<SymFloat>>& values);
 PyObject* tpx_py_wrap_generator(const Generator& g);
 PyObject* tpx_py_wrap_dtype(const DType& dt);
 PyObject* tpx_py_wrap_device(const Device& d);

@@ -147,6 +147,8 @@ class Type:
     is_opt: bool = False
     mutability: str | None = None
     symint: bool = False
+    symbool: bool = False
+    symfloat: bool = False
     list_elem_opt: bool = False
     list_size: int | None = None
 
@@ -163,7 +165,14 @@ class Type:
         return self.is_tensor_like and not self.is_list and self.mutability is not None
 
     def __str__(self) -> str:
-        s = "SymInt" if self.symint else self.kind
+        if self.symint:
+            s = "SymInt"
+        elif self.symbool:
+            s = "SymBool"
+        elif self.symfloat:
+            s = "SymFloat"
+        else:
+            s = self.kind
         if self.mutability is not None:
             s = f"{s}({self.mutability}!)"
         if self.list_elem_opt:
@@ -180,10 +189,11 @@ _TYPE_CACHE: dict[tuple, Type] = {}
 
 def make_type(kind: str, is_list: bool = False, is_opt: bool = False,
               mutability: str | None = None, symint: bool = False,
+              symbool: bool = False, symfloat: bool = False,
               list_elem_opt: bool = False,
               list_size: int | None = None) -> Type:
-    key = (kind, is_list, is_opt, mutability, symint, list_elem_opt,
-           list_size)
+    key = (kind, is_list, is_opt, mutability, symint, symbool, symfloat,
+           list_elem_opt, list_size)
     t = _TYPE_CACHE.get(key)
     if t is None:
         t = Type(*key)
@@ -203,9 +213,11 @@ def _type_from_tg(t) -> Type:
     list_size = inner.size if is_list else None
     name = elem.name.name if hasattr(elem.name, "name") else str(elem.name)
     symint = str(name) == "SymInt"
+    symbool = str(name) == "SymBool"
+    symfloat = str(name) == "SymFloat"
     kind = _KIND_ALIASES.get(str(name), str(name))
-    return make_type(kind, is_list, is_opt, None, symint, list_elem_opt,
-                     list_size)
+    return make_type(kind, is_list, is_opt, None, symint, symbool, symfloat,
+                     list_elem_opt, list_size)
 
 
 # ---------------------------------------------------------------------------
@@ -551,7 +563,8 @@ def parse_schema(schema: str, parsed_schema=None) -> NativeFunction:
         t = _type_from_tg(a.type)
         if mut and t.is_tensor_like:
             t = make_type(t.kind, t.is_list, t.is_opt, mut, t.symint,
-                          t.list_elem_opt, t.list_size)
+                          t.symbool, t.symfloat, t.list_elem_opt,
+                          t.list_size)
         kwonly = a.name in kwarg_names
         return Argument(name=a.name, type=t,
                         default=_norm_default(a.default), kwonly=kwonly,
@@ -595,7 +608,8 @@ def parse_schema(schema: str, parsed_schema=None) -> NativeFunction:
         t = _type_from_tg(r.type)
         if mut and t.is_tensor_like:
             t = make_type(t.kind, t.is_list, t.is_opt, mut, t.symint,
-                          t.list_elem_opt, t.list_size)
+                          t.symbool, t.symfloat, t.list_elem_opt,
+                          t.list_size)
         returns.append(ReturnDecl(t, getattr(r, "name", None),
                                   source_return=r))
 

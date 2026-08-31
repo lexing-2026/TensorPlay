@@ -187,6 +187,30 @@ def _pack_expr(cpp_type: str, value: str) -> str | None:
         return f"tpx_py_wrap_dtype({value})"
     if cpp_type == "Device":
         return f"tpx_py_wrap_device({value})"
+    if cpp_type == "SymInt":
+        return f"tpx_py_wrap_symint({value})"
+    if cpp_type == "SymBool":
+        return f"tpx_py_wrap_symbool({value})"
+    if cpp_type == "SymFloat":
+        return f"tpx_py_wrap_symfloat({value})"
+    if cpp_type == "std::optional<SymInt>":
+        return f"tpx_py_wrap_optional_symint({value})"
+    if cpp_type == "std::optional<SymBool>":
+        return f"tpx_py_wrap_optional_symbool({value})"
+    if cpp_type == "std::optional<SymFloat>":
+        return f"tpx_py_wrap_optional_symfloat({value})"
+    if cpp_type == "std::vector<SymInt>":
+        return f"tpx_py_wrap_symintlist({value})"
+    if cpp_type == "std::vector<SymBool>":
+        return f"tpx_py_wrap_symboollist({value})"
+    if cpp_type == "std::vector<SymFloat>":
+        return f"tpx_py_wrap_symfloatlist({value})"
+    if cpp_type == "std::optional<std::vector<SymInt>>":
+        return f"tpx_py_wrap_optional_symintlist({value})"
+    if cpp_type == "std::optional<std::vector<SymBool>>":
+        return f"tpx_py_wrap_optional_symboollist({value})"
+    if cpp_type == "std::optional<std::vector<SymFloat>>":
+        return f"tpx_py_wrap_optional_symfloatlist({value})"
     if cpp_type == "bool":
         return f"PyBool_FromLong({value})"
     if cpp_type == "std::optional<bool>":

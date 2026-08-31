@@ -344,6 +344,7 @@ PYBIND11_MODULE(_C, m) {
     init_dtype(m);
     init_device(m);
     init_scalar(m); // Initialize scalar after DType/Device as it might be used? Actually scalar is independent.
+    init_symint(m);
     init_size(m);
     init_generator(m);
     init_tensor(m);

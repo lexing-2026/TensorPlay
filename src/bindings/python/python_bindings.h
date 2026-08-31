@@ -16,6 +16,9 @@
 #include "DType.h"
 #include "Exception.h"
 #include "Generator.h"
+#include "SymBool.h"
+#include "SymFloat.h"
+#include "SymInt.h"
 
 namespace py = pybind11;
 using namespace py::literals;
@@ -26,6 +29,9 @@ using tensorplay::DType;
 using tensorplay::Size;
 using tensorplay::Scalar;
 using tensorplay::Generator;
+using tensorplay::SymBool;
+using tensorplay::SymFloat;
+using tensorplay::SymInt;
 using tensorplay::default_generator;
 using tensorplay::manual_seed;
 using Tensor = tensorplay::Tensor;
@@ -46,6 +52,7 @@ void init_autocast(py::module_& m);
 void init_transforms(py::module_& m);
 void init_ops(py::module_& m);
 void init_scalar(py::module_& m);
+void init_symint(py::module_& m);
 void init_stax(py::module_& m);
 void init_parallel(py::module_& m);
 void init_distributed(py::module_& m);

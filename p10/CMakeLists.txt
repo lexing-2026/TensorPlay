@@ -15,6 +15,10 @@ set(P10_SOURCES
     src/InferenceMode.cpp
     src/Parallel.cpp
     src/Scalar.cpp
+    src/SymNodeImpl.cpp
+    src/SymInt.cpp
+    src/SymBool.cpp
+    src/SymFloat.cpp
     src/SizesAndStrides.cpp
     src/Stacktrace.cpp
     src/TensorImpl.cpp
@@ -84,6 +88,7 @@ set(P10_SOURCES
     src/backend/cpu/SpectralKernels.cpp
     src/backend/cpu/Spectral2DKernels.cpp
     src/backend/cpu/InplaceCompletionKernels.cpp
+    src/backend/cpu/SymScalarKernels.cpp
 
     # Backend-neutral composite kernels, one file per operator category
     # (CompositeCommon.h holds the shared helpers).
