@@ -28,6 +28,9 @@ from tensorplay.types import (
 from tensorplay._C import (
     Device,
     DType,
+    SymBool,
+    SymFloat,
+    SymInt,
     TensorBase,
 )
 

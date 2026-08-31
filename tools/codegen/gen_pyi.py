@@ -93,6 +93,9 @@ _PYI_ATOMS = {
     "MemoryFormat": "MemoryFormat",
     "Layout": "int",
     "Generator": "Generator",
+    "SymInt": "SymInt",
+    "SymBool": "SymBool",
+    "SymFloat": "SymFloat",
 }
 
 # Return types prefer the concrete spelling: argument unions widen the input
@@ -130,6 +133,12 @@ def pyi_type(t: Type, *, list_default: str | None = None) -> str:
 def _return_elem(t: Type) -> str:
     if t.kind == "Device":
         return _RETURN_DEVICE
+    if t.symint:
+        return "SymInt"
+    if t.symbool:
+        return "SymBool"
+    if t.symfloat:
+        return "SymFloat"
     return _PYI_ATOMS.get(t.kind, t.kind)
 
 

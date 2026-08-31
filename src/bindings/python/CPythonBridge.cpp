@@ -1372,6 +1372,63 @@ PyObject* tpx_py_wrap_optional_scalar(const std::optional<Scalar>& s) {
     }
     return tpx_py_wrap_scalar(*s);
 }
+PyObject* tpx_py_wrap_symint(const SymInt& value) {
+    return py::cast(value).release().ptr();
+}
+PyObject* tpx_py_wrap_symbool(const SymBool& value) {
+    return py::cast(value).release().ptr();
+}
+PyObject* tpx_py_wrap_symfloat(const SymFloat& value) {
+    return py::cast(value).release().ptr();
+}
+PyObject* tpx_py_wrap_optional_symint(const std::optional<SymInt>& value) {
+    if (!value.has_value()) {
+        Py_RETURN_NONE;
+    }
+    return tpx_py_wrap_symint(*value);
+}
+PyObject* tpx_py_wrap_optional_symbool(const std::optional<SymBool>& value) {
+    if (!value.has_value()) {
+        Py_RETURN_NONE;
+    }
+    return tpx_py_wrap_symbool(*value);
+}
+PyObject* tpx_py_wrap_optional_symfloat(const std::optional<SymFloat>& value) {
+    if (!value.has_value()) {
+        Py_RETURN_NONE;
+    }
+    return tpx_py_wrap_symfloat(*value);
+}
+PyObject* tpx_py_wrap_symintlist(const std::vector<SymInt>& values) {
+    return py::cast(values).release().ptr();
+}
+PyObject* tpx_py_wrap_symboollist(const std::vector<SymBool>& values) {
+    return py::cast(values).release().ptr();
+}
+PyObject* tpx_py_wrap_symfloatlist(const std::vector<SymFloat>& values) {
+    return py::cast(values).release().ptr();
+}
+PyObject* tpx_py_wrap_optional_symintlist(
+    const std::optional<std::vector<SymInt>>& values) {
+    if (!values.has_value()) {
+        Py_RETURN_NONE;
+    }
+    return tpx_py_wrap_symintlist(*values);
+}
+PyObject* tpx_py_wrap_optional_symboollist(
+    const std::optional<std::vector<SymBool>>& values) {
+    if (!values.has_value()) {
+        Py_RETURN_NONE;
+    }
+    return tpx_py_wrap_symboollist(*values);
+}
+PyObject* tpx_py_wrap_optional_symfloatlist(
+    const std::optional<std::vector<SymFloat>>& values) {
+    if (!values.has_value()) {
+        Py_RETURN_NONE;
+    }
+    return tpx_py_wrap_symfloatlist(*values);
+}
 PyObject* tpx_py_wrap_generator(const Generator& g) {
     return py::cast(g).release().ptr();
 }

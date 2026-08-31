@@ -38,6 +38,16 @@ _DEVICE = BaseCType(_P10("", "Device"))
 _GENERATOR = BaseCType(_P10("", "Generator"))
 
 
+def _symbolic_kind(t: Type, symbolic: bool = False) -> str:
+    if symbolic and t.symint:
+        return "SymInt"
+    if symbolic and t.symbool:
+        return "SymBool"
+    if symbolic and t.symfloat:
+        return "SymFloat"
+    return t.kind
+
+
 class StdOptionalCType(OptionalCType):
     """Use std::optional for optional arguments."""
     def cpp_type(self) -> str:
@@ -55,6 +65,9 @@ _RAW_ATOMIC = {
     "DType": _P10("", "DType"),
     "Device": _P10("", "Device"),
     "Generator": _P10("", "Generator"),
+    "SymInt": _P10("", "SymInt"),
+    "SymBool": _P10("", "SymBool"),
+    "SymFloat": _P10("", "SymFloat"),
     "int64_t": tg_longT,
     "double": tg_doubleT,
     "bool": tg_boolT,
@@ -64,8 +77,8 @@ _RAW_ATOMIC = {
 }
 
 
-def p10_ctype(t: Type):
-    atom = BaseCType(_RAW_ATOMIC[t.kind])
+def p10_ctype(t: Type, symbolic: bool = False):
+    atom = BaseCType(_RAW_ATOMIC[_symbolic_kind(t, symbolic)])
     if t.list_elem_opt:
         atom = StdOptionalCType(atom)
     if t.is_list and t.is_opt:
@@ -97,6 +110,9 @@ _CPP_ARG_TYPES = {
                                 # keep the schema optional and ABI-stable.
     "Layout": "int64_t",
     "Generator": "Generator",
+    "SymInt": "SymInt",
+    "SymBool": "SymBool",
+    "SymFloat": "SymFloat",
     "void": "void",
 }
 
@@ -137,6 +153,19 @@ def _cpp_value_type(t: Type) -> str:
     return f"std::optional<{value}>" if t.is_opt else value
 
 
+def _cpp_symbolic_value_type(t: Type) -> str:
+    if t.is_tensor_like:
+        return _cpp_value_type(t)
+    kind = _symbolic_kind(t, True)
+    if t.is_list:
+        atom = _CPP_ARG_TYPES.get(kind, kind)
+        elem = f"std::optional<{atom}>" if t.list_elem_opt else atom
+        value = f"std::vector<{elem}>"
+    else:
+        value = _CPP_ARG_TYPES.get(kind, kind)
+    return f"std::optional<{value}>" if t.is_opt else value
+
+
 def cpp_return_type(f: NativeFunction) -> str:
     kind = f.cpp_return_kind
     if kind == "void":
@@ -144,18 +173,18 @@ def cpp_return_type(f: NativeFunction) -> str:
     if kind == "mut_ref":
         return "Tensor&"
     if kind == "list":
-        return _cpp_value_type(f.returns[0].type)
+        return _cpp_symbolic_value_type(f.returns[0].type)
     if kind == "tuple":
-        parts = [_cpp_value_type(r.type) for r in f.returns]
+        parts = [_cpp_symbolic_value_type(r.type) for r in f.returns]
         return f"std::tuple<{', '.join(parts)}>"
-    return _cpp_value_type(f.returns[0].type)
+    return _cpp_symbolic_value_type(f.returns[0].type)
 
 
 def tuple_element_cpp_types(f: NativeFunction) -> list[str]:
     assert f.cpp_return_kind == "tuple"
     out = []
     for r in f.returns:
-        out.append(_cpp_value_type(r.type))
+        out.append(_cpp_symbolic_value_type(r.type))
     return out
 
 
@@ -477,7 +506,7 @@ def _unwrap_targeted(op_base: str, a) -> bool:
 def stub_arg_type_for(op_base: str, a) -> str:
     """Dispatcher-stub ABI type honoring the unwrap boundary."""
     if _unwrap_targeted(op_base, a):
-        t = make_type("Tensor", False, False, None, False)
+        t = make_type("Tensor", False, False, None, False, False, False)
         return stub_arg_type(t)
     return stub_arg_type(a.type)
 
