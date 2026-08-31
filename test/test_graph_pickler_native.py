@@ -2,6 +2,7 @@ import operator
 
 import tensorplay as tp
 from tensorplay.graph import Graph, GraphModule
+from tensorplay.graph.interpreter import Transformer
 from tensorplay.graph._graph_pickler import (
     GraphPickler,
     Options,
@@ -99,3 +100,23 @@ def test_lazy_graph_module_selection_is_scoped() -> None:
     with _use_lazy_graph_module(True):
         assert _get_graph_module_cls() is _LazyGraphModule
     assert _get_graph_module_cls() is GraphModule
+
+
+def test_transformer_preserves_placeholder_defaults_and_node_metadata() -> None:
+    graph = Graph()
+    value = graph.placeholder("value", type_expr=int, default_value=3)
+    value.meta["source"] = "input"
+    result = graph.call_function(operator.add, (value, 1), type_expr=int)
+    result.meta["source"] = "add"
+    graph.output(result)
+
+    transformed = Transformer(GraphModule(None, graph)).transform()
+
+    placeholder = transformed.graph.placeholders[0]
+    output_value = list(transformed.graph.nodes)[1]
+    assert placeholder.args == (3,)
+    assert placeholder.type is int
+    assert placeholder.meta["source"] == "input"
+    assert output_value.type is int
+    assert output_value.meta["source"] == "add"
+    assert transformed() == 4

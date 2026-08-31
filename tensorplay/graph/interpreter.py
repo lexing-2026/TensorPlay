@@ -266,7 +266,7 @@ class Transformer(Interpreter):
         return self.tracer.create_proxy(
             "placeholder", target, (), {},
         ) if default is inspect.Parameter.empty else Proxy(
-            self.new_graph.placeholder(target, default), self.tracer
+            self.new_graph.placeholder(target, default_value=default), self.tracer
         )
 
     def get_attr(self, target: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Proxy:
@@ -288,9 +288,10 @@ class Transformer(Interpreter):
 
     def run_node(self, node: Node) -> Any:
         result = super().run_node(node)
-        if isinstance(result, Proxy):
+        if isinstance(result, Proxy) and node.op != "output":
             result.node.meta.update(node.meta)
-            result.node.type = node.type
+            if node.type is not None:
+                result.node.type = node.type
         return result
 
     def transform(self) -> GraphModule:
