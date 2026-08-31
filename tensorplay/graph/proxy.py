@@ -153,10 +153,10 @@ class TracerBase:
         name: str | None = None,
         type_expr: Any | None = None,
     ) -> Node:
-        if self.check_mutable_operations:
+        if kind == "call_function" and self.check_mutable_operations:
             from .operator_schemas import check_for_mutable_operation
 
-            check_for_mutable_operation(kind, target, args, kwargs)
+            check_for_mutable_operation(target, args, kwargs)
         graph = getattr(self, "graph", None)
         if graph is None:
             raise TraceError("tracer has no graph")
