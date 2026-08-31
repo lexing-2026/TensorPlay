@@ -209,6 +209,7 @@ if not hasattr(_C, "_log_api_usage_once"):
 
 from ._tensor import Tensor
 from ._C import (tensor, DType, Size, Scalar, SymInt, SymBool, SymFloat,
+                sym_float, sym_int, sym_not, sym_min, sym_max, sym_ite, sym_sum,
                 Device, DeviceType,
                 from_dlpack, to_dlpack, from_numpy, frombuffer, set_printoptions,
                 default_generator, manual_seed, seed, initial_seed, Generator,
@@ -293,6 +294,7 @@ channels_last_3d = MemoryFormat.CHANNELS_LAST_3D
 
 __all__ = [
     "Tensor", "tensor", "from_dlpack", "Scalar", "SymInt", "SymBool", "SymFloat",
+    "sym_float", "sym_int", "sym_not", "sym_min", "sym_max", "sym_ite", "sym_sum",
     "DeviceType", "device", "dtype", "Size",
     "MemoryFormat", "contiguous_format", "preserve_format", "channels_last", "channels_last_3d",
     "uint8", "int8", "int16", "uint16", "uint32", "uint64", "int32", "int64",

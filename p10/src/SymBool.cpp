@@ -1,5 +1,6 @@
 #include "SymBool.h"
 
+#include "SymFloat.h"
 #include "SymInt.h"
 
 #include <utility>
@@ -70,9 +71,33 @@ SymBool SymBool::sym_or(const SymBool& other) const {
     return SymBool(values.left->sym_or(values.right));
 }
 
+SymBool SymBool::sym_xor(const SymBool& other) const {
+    if (auto left = maybe_as_bool()) {
+        if (auto right = other.maybe_as_bool()) return SymBool(*left != *right);
+    }
+    auto values = normalize(*this, other);
+    return SymBool(values.left->sym_xor(values.right));
+}
+
 SymBool SymBool::sym_not() const {
     if (auto value = maybe_as_bool()) return SymBool(!*value);
     return SymBool(toSymNodeImplUnowned()->sym_not());
+}
+
+SymBool SymBool::sym_eq(const SymBool& other) const {
+    if (auto left = maybe_as_bool()) {
+        if (auto right = other.maybe_as_bool()) return SymBool(*left == *right);
+    }
+    auto values = normalize(*this, other);
+    return SymBool(values.left->eq(values.right));
+}
+
+SymBool SymBool::sym_ne(const SymBool& other) const {
+    if (auto left = maybe_as_bool()) {
+        if (auto right = other.maybe_as_bool()) return SymBool(*left != *right);
+    }
+    auto values = normalize(*this, other);
+    return SymBool(values.left->ne(values.right));
 }
 
 bool SymBool::equals(const SymBool& other) const {
@@ -126,6 +151,11 @@ SymInt SymBool::toSymInt() const {
     if (auto value = maybe_as_bool()) return SymInt(*value ? 1 : 0);
     SymNode node = toSymNodeImpl();
     return SymInt(node->sym_ite(node->wrap_int(1), node->wrap_int(0)));
+}
+
+SymFloat SymBool::toSymFloat() const {
+    if (auto value = maybe_as_bool()) return SymFloat(*value ? 1.0 : 0.0);
+    return SymFloat(toSymNodeImplUnowned()->sym_float());
 }
 
 std::ostream& operator<<(std::ostream& os, const SymBool& value) {

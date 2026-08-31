@@ -11,6 +11,7 @@
 namespace tensorplay {
 
 class SymInt;
+class SymFloat;
 
 class P10_API SymBool {
 public:
@@ -37,7 +38,10 @@ public:
 
     SymBool sym_and(const SymBool& other) const;
     SymBool sym_or(const SymBool& other) const;
+    SymBool sym_xor(const SymBool& other) const;
     SymBool sym_not() const;
+    SymBool sym_eq(const SymBool& other) const;
+    SymBool sym_ne(const SymBool& other) const;
 
     SymBool operator&(const SymBool& other) const { return sym_and(other); }
     SymBool operator|(const SymBool& other) const { return sym_or(other); }
@@ -57,6 +61,7 @@ public:
     bool has_hint() const;
 
     SymInt toSymInt() const;
+    SymFloat toSymFloat() const;
 
 private:
     bool data_ = false;
