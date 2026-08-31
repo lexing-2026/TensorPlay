@@ -40,6 +40,7 @@ Tensor cov_backward_cuda(const Tensor& grad, const Tensor& self, int64_t correct
                          const std::optional<Tensor>& fweights_opt,
                          const std::optional<Tensor>& aweights_opt);
 Tensor corrcoef_backward_cuda(const Tensor& grad, const Tensor& self);
+bool is_set_to_cuda(const Tensor& self, const Tensor& other);
 
 // Defined in PointwiseKernels.cu.
 Tensor eq_kernel_cuda(const Tensor& self, const Tensor& other);
@@ -135,6 +136,27 @@ Tensor glu_backward_cuda(const Tensor& grad_output, const Tensor& self, int64_t 
     return Tensor::cat({grad_input_first, grad_input_second}, d);
 }
 
+bool is_set_to_cuda(const Tensor& self, const Tensor& other) {
+    const auto self_impl = self.unsafeGetTensorImpl();
+    const auto other_impl = other.unsafeGetTensorImpl();
+    if (!self_impl || !other_impl || !self_impl->has_storage() ||
+        !other_impl->has_storage()) {
+        return false;
+    }
+    if (!self_impl->storage().is_same(other_impl->storage()) ||
+        self_impl->storage_offset() != other_impl->storage_offset() ||
+        self.dim() != other.dim()) {
+        return false;
+    }
+    for (int64_t dim = 0; dim < self.dim(); ++dim) {
+        if (self.size(dim) != other.size(dim) ||
+            self.stride(dim) != other.stride(dim)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 TENSORPLAY_LIBRARY_IMPL(CUDA, MiscKernels) {
     m.impl("diff", diff_cuda);
     m.impl("one_hot", one_hot_cuda);
@@ -155,6 +177,7 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, MiscKernels) {
     m.impl("corrcoef", corrcoef_cuda);
     m.impl("_cov_backward", cov_backward_cuda);
     m.impl("_corrcoef_backward", corrcoef_backward_cuda);
+    m.impl("is_set_to", is_set_to_cuda);
 }
 
 namespace {

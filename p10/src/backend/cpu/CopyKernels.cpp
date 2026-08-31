@@ -20,6 +20,13 @@
 #include <cuda_runtime.h>
 #endif
 
+#ifdef USE_VULKAN
+#include "VulkanRuntime.h"
+#include "backend/vulkan/api/Tensor.h"
+#include "backend/vulkan/ops/Convert.h"
+#include "backend/vulkan/ops/Copy.h"
+#endif
+
 namespace tensorplay {
 namespace cpu {
 
@@ -363,9 +370,18 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
         throw std::runtime_error("CUDA source but USE_CUDA not enabled");
 #endif
     }
-    
+
+#ifdef USE_VULKAN
+    if (src.device().is_vulkan()) {
+        tensorplay::vulkan::api::vTensor v_src =
+            tensorplay::vulkan::ops::convert(src);
+        tensorplay::vulkan::ops::transfer_vulkan_to_cpu_impl(v_src, self);
+        return self;
+    }
+#endif
+
     if (!src.device().is_cpu()) {
-        throw std::runtime_error("copy_kernel only supports CPU or CUDA source");
+        throw std::runtime_error("copy_kernel only supports CPU, CUDA or Vulkan source");
     }
 
     if (self.dtype() == src.dtype() && self.dim() == 2 && self.numel() >= 60 * 60 &&

@@ -25,7 +25,7 @@ current_replay_node: Node | None = None
 should_preserve_node_meta = False
 _should_preserve_node_meta = False
 _regional_name = threading.local()
-_FX_METADATA_REGISTRY: dict[str, dict[str, Any]] = {}
+_GRAPH_METADATA_REGISTRY: dict[str, dict[str, Any]] = {}
 
 GRADIENT_ACC_SPECIAL_STACK = "Gradient accumulation node due to repeated use"
 
@@ -160,7 +160,7 @@ class NodeSource:
 
 @compatibility(is_backward_compatible=False)
 def _register_graph_metadata(module_name: str, metadata: dict[str, Any]) -> None:
-    _FX_METADATA_REGISTRY[module_name] = metadata
+    _GRAPH_METADATA_REGISTRY[module_name] = metadata
 
 
 @compatibility(is_backward_compatible=False)

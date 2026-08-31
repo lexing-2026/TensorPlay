@@ -117,6 +117,7 @@ _BRIDGE = {
     "std::optional<DType>": "tpx_py_opt_dtype({n})",
     "std::optional<Device>": "tpx_py_opt_device({n})",
     "Device": "tpx_py_device({n})",
+    "Storage": "tpx_py_storage({n})",
 }
 
 # C++ argument type -> tpx_py_type_kind byte (see CPythonBridge.h).
@@ -144,6 +145,7 @@ _KIND_CONST = {
     "DType": "TPK_DTYPE",
     "Device": "TPK_DEVICE",
     "Generator": "TPK_GENERATOR",
+    "Storage": "TPK_STORAGE",
 }
 _OPT = {
     "std::optional<Tensor>": "TPK_TENSOR",
@@ -356,6 +358,22 @@ def _probe_info(f, variant: str):
         return None
     required = sum(1 for a in pos if a.default is None)
     return {"arity": len(pos), "required": required, "kinds": kinds}
+
+
+def _unique_keyword_probes(funcs, variant: str):
+    """Return keyword names that identify one overload in a group."""
+    offset = 1 if variant == "method" else 0
+    names = [
+        {a.name for a in f.args[offset:]}
+        for f in funcs
+    ]
+    probes = []
+    for index, own_names in enumerate(names):
+        other_names = set().union(*(names[:index] + names[index + 1:]))
+        unique = sorted(own_names - other_names)
+        if unique:
+            probes.append((index, unique))
+    return probes
 
 
 def _emit_op(out: list[str], f, variant: str, fn: str,
@@ -710,6 +728,30 @@ def _gen_python_capi(ctx: CodegenContext) -> None:
             # mismatched candidate (mul_(1.0) etc.).  Enabled only when every
             # candidate is probeable; a deeper mismatch in the chosen overload
             # (std::invalid_argument) still falls through to full dispatch.
+            unique_keyword_probes = _unique_keyword_probes(fs, variant)
+            if unique_keyword_probes:
+                out.append(
+                    "    if (kwnames != nullptr && "
+                    "PyTuple_GET_SIZE(kwnames) != 0) {")
+                for k, names in unique_keyword_probes:
+                    checks = " || ".join(
+                        f'tpx_py_kwnames_has(kwnames, "{name}")'
+                        for name in names
+                    )
+                    out.extend([
+                        f"        if ({checks}) {{",
+                        "            try {",
+                        f"                return {ovfns[k]}"
+                        "(self, args, nargs, kwnames);",
+                        "            } catch (const std::invalid_argument&) {",
+                        "                // Continue with ordinary overload checks.",
+                        "            } catch (const std::exception& e) {",
+                        "                tpx_py_set_error(e);",
+                        "                return nullptr;",
+                        "            }",
+                        "        }",
+                    ])
+                out.append("    }")
             if all(p is not None for p in probes):
                 out.append(
                     "    if (kwnames == nullptr || PyTuple_GET_SIZE(kwnames) == 0) {")

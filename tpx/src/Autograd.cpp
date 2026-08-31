@@ -79,8 +79,16 @@ std::shared_ptr<Node> grad_fn(const Tensor& t) {
 }
 
 void set_requires_grad(const Tensor& t, bool requires_grad) {
-    if (auto* meta = get_or_create_autograd_meta(t)) {
-        meta->set_requires_grad(requires_grad);
+    auto impl = t.unsafeGetTensorImpl();
+    if (!impl) return;
+    if (!requires_grad && !impl->autograd_meta()) return;
+
+    // The p10 layer performs the invariant check before metadata allocation.
+    impl->set_requires_grad(requires_grad);
+    if (requires_grad && !impl->autograd_meta()) {
+        if (auto* meta = get_or_create_autograd_meta(t)) {
+            meta->set_requires_grad(true);
+        }
     }
 }
 
@@ -94,6 +102,7 @@ void set_view_metadata(
     auto view_impl = view.unsafeGetTensorImpl();
     auto base_impl = base.unsafeGetTensorImpl();
     if (!view_impl || !base_impl || view_impl == base_impl) return;
+    if (view_impl->is_inference()) return;
     if (!view_impl->has_storage() || !base_impl->has_storage() ||
         !view_impl->storage().is_same(base_impl->storage())) {
         return;

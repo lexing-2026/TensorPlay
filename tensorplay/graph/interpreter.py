@@ -5,13 +5,15 @@ from __future__ import annotations
 import inspect
 import logging
 from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
+from . import traceback as graph_traceback
 from ._compatibility import compatibility
 from ._utils import _iter_nodes, _map_arg
 from .graph import Graph
 from .graph_module import GraphModule
-from .node import Node
+from .node import Node, map_aggregate
 from .proxy import Proxy
 from .tracer import Tracer
 
@@ -41,6 +43,8 @@ class Interpreter:
         graph: Graph | None = None,
     ) -> None:
         self.module = module
+        named_modules = getattr(module, "named_modules", None)
+        self.submodules = dict(named_modules()) if callable(named_modules) else {}
         self.graph = graph if graph is not None else module.graph
         self.env: dict[Node, Any] = {}
         self.name = "Interpreter"
@@ -69,8 +73,9 @@ class Interpreter:
     ) -> Any:
         """Execute the graph and return the value of its output node."""
 
-        del enable_io_processing
         self.env = initial_env if initial_env is not None else {}
+        if enable_io_processing:
+            args = self.graph.process_inputs(*args)
         self.args_iter = iter(args)
         self._keyword_args = dict(kwargs)
         self._placeholder_defaults = {
@@ -87,40 +92,57 @@ class Interpreter:
                 self.env[node] = value
             except Exception as exc:
                 if self.extra_traceback:
-                    detail = f"While executing {_format_node(node)}"
-                    message = f"{exc}\n\n{detail}"
+                    detail = f"While executing {node.format_node()}"
+                    message = f"{exc.args[0] if exc.args else exc}\n\n{detail}"
+                    if node.stack_trace:
+                        message += f"\nOriginal traceback:\n{node.stack_trace}"
+                    exc.args = (message, *exc.args[1:])
                     if isinstance(exc, KeyError):
-                        raise RuntimeError(message) from exc
+                        raise RuntimeError(*exc.args) from exc
                 raise
             if self.garbage_collect_values:
                 for old_value in self.user_to_last_uses.get(node, ()):
                     self.env.pop(old_value, None)
             if node.op == "output":
-                return self.env[node]
+                value = self.env[node]
+                return self.graph.process_outputs(value) if enable_io_processing else value
         raise RuntimeError("graph has no output node")
 
     @compatibility(is_backward_compatible=True)
     def boxed_run(self, args_list: list[Any]) -> Any:
         """Run with a mutable positional argument list and clear that list."""
 
-        expected = len(self.graph.placeholders)
+        placeholder_nodes = [node for node in self.graph.nodes if node.op == "placeholder"]
+        expected = len(placeholder_nodes)
         if len(args_list) != expected:
             detail = "extra arguments" if len(args_list) > expected else "missing arguments"
             raise RuntimeError(
                 f"Interpreter.boxed_run expected {expected} arguments for "
                 f"placeholders but received {len(args_list)} ({detail})"
             )
-        values = list(args_list)
+        initial_env = dict(zip(placeholder_nodes, args_list))
         args_list.clear()
-        return self.run(*values)
+        return self.run(initial_env=initial_env)
+
+    @contextmanager
+    def _set_current_node(self, node: Node) -> Iterator[None]:
+        with graph_traceback.set_current_meta(
+            node, f"Interpreter_{self.__class__.__name__}"
+        ):
+            yield
 
     @compatibility(is_backward_compatible=True)
     def run_node(self, node: Node) -> Any:
         """Dispatch one node to its operation-specific hook."""
 
         log.debug("run_node %s", _format_node(node))
-        args, kwargs = self.fetch_args_kwargs_from_env(node)
-        return getattr(self, node.op)(node.target, args, kwargs)
+        with self._set_current_node(node):
+            args, kwargs = self.fetch_args_kwargs_from_env(node)
+            if not isinstance(args, tuple):
+                raise AssertionError(f"Expected args to be tuple, got {type(args)}")
+            if not isinstance(kwargs, dict):
+                raise AssertionError(f"Expected kwargs to be dict, got {type(kwargs)}")
+            return getattr(self, node.op)(node.target, args, kwargs)
 
     @compatibility(is_backward_compatible=True)
     def placeholder(self, target: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
@@ -228,9 +250,15 @@ class Transformer(Interpreter):
     def __init__(self, module: GraphModule) -> None:
         super().__init__(module, garbage_collect_values=False)
         self.new_graph = Graph()
-        self.tracer = Tracer()
+        self.new_graph.set_codegen(module.graph._codegen)
+        class TransformerTracer(Tracer):
+            def is_leaf_module(self, module: Any, qualified_name: str) -> bool:
+                del module, qualified_name
+                return True
+
+        self.tracer = TransformerTracer()
         self.tracer.graph = self.new_graph
-        self.tracer.root = module.root
+        self.tracer.root = module
 
     def placeholder(self, target: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Proxy:
         del kwargs
@@ -251,7 +279,12 @@ class Transformer(Interpreter):
         return self.tracer.create_proxy("call_method", target, args, kwargs)
 
     def call_module(self, target: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Proxy:
-        return self.tracer.create_proxy("call_module", target, args, kwargs)
+        if not isinstance(target, str):
+            raise TypeError(f"module target must be a string, got {type(target).__name__}")
+        submodule = self.fetch_attr(target)
+        return self.tracer.call_module(
+            submodule, getattr(submodule, "forward"), args, kwargs
+        )
 
     def run_node(self, node: Node) -> Any:
         result = super().run_node(node)
@@ -261,23 +294,18 @@ class Transformer(Interpreter):
         return result
 
     def transform(self) -> GraphModule:
-        result = super().run(enable_io_processing=False)
+        with graph_traceback.preserve_node_meta():
+            result = super().run(enable_io_processing=False)
 
         def strip(value: Any) -> Any:
-            if isinstance(value, Proxy):
-                return value.node
-            if isinstance(value, tuple):
-                return tuple(strip(item) for item in value)
-            if isinstance(value, list):
-                return [strip(item) for item in value]
-            if isinstance(value, dict):
-                return {key: strip(item) for key, item in value.items()}
-            if isinstance(value, slice):
-                return slice(strip(value.start), strip(value.stop), strip(value.step))
-            return value
+            return value.node if isinstance(value, Proxy) else value
 
-        output = self.new_graph.output(strip(result))
+        output = self.new_graph.output(map_aggregate(result, strip))
         old_output = self.graph.outputs[-1]
+        if old_output.op != "output":
+            raise AssertionError(f"Expected output node, got op={old_output.op}")
         output.meta.update(old_output.meta)
         self.new_graph.lint()
-        return GraphModule(self.module.root, self.new_graph, self.module.signature)
+        from ._lazy_graph_module import _make_graph_module
+
+        return _make_graph_module(self.module, self.new_graph, self.module.signature)

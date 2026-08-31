@@ -51,6 +51,7 @@ from ..cpp_builder import (
     package_paths,
 )
 from ..cpu_vec_isa import VecISA, pick_vec_isa
+from .index_expr import Const as _IxC, Symbol as _IxS, affine_coeff as _ix_affine, render as _ix_render
 
 # The four-way unrolled loop is emitted only when replicating the program
 # four times keeps live temporaries within reason; longer programs use the
@@ -118,6 +119,26 @@ def _const_text(value: float) -> str:
     if not any(ch in text for ch in ".eE"):
         text += ".0"
     return f"V({text}f)"
+
+
+_I_i = _IxS("i")
+_I_W = _IxS("W")
+
+
+def _lane_offset(lane: int) -> str:
+    """Address of one unroll lane, derived and verified in the index algebra.
+
+    Lane ``k`` reads element ``i + k*W``; the algebra confirms the address is
+    unit-stride in the induction variable (any ``W``-bearing terms are
+    loop-invariant constants at kernel time), which is the precondition for
+    the contiguous ``V::loadu`` path.
+    """
+
+    expr = _I_i if lane == 0 else _I_i + _IxC(lane) * _I_W
+    coeff = _ix_affine(expr, _I_i)
+    if coeff != 1:
+        raise _ProgramError(f"non-unit-stride lane addressing (stride {coeff})")
+    return _ix_render(expr)
 
 
 def _check_ref(
@@ -318,13 +339,11 @@ def _emit_body(
 
     if unrolled:
         for lane in range(4):
-            offset = "i" if lane == 0 else f"i + {lane} * W"
-            emit_loads(lane, offset)
+            emit_loads(lane, _lane_offset(lane))
         for lane in range(4):
             emit_steps(lane)
         for lane in range(4):
-            offset = "i" if lane == 0 else f"i + {lane} * W"
-            emit_store(lane, offset)
+            emit_store(lane, _lane_offset(lane))
     else:
         emit_loads(0, "i")
         emit_steps(0)
@@ -417,8 +436,8 @@ def render_kernel_source(
             "    }\n"
         )
 
-    # Worksharing policy, mirroring the parallel-depth decision of the
-    # in-tree CPU kernels: a region runs on the shared pool only when each
+    # Worksharing policy follows the parallel-depth decision of the
+    # CPU kernels: a region runs on the shared pool only when each
     # thread would still receive at least one minimum chunk (otherwise the
     # body runs inline, serially), and the chunk size is an even static
     # split of the trip count.  ``min_chunk`` matches the in-tree kernel
@@ -429,10 +448,12 @@ def render_kernel_source(
 
     entry_call_tail = ""
     runner_section = ""
+    direct_section = ""
     extra_includes = ""
     if out_shape is not None and out_device is not None:
         shape_init = ", ".join(f"{int(d)}LL" for d in out_shape)
-        dev_name, dev_index = out_device
+        dev_ordinal, dev_index = out_device
+        dev_name = {0: "CPU", 1: "CUDA"}[dev_ordinal]
         ptr_args = "".join(f", in[{i}]" for i in range(input_count))
         numel = 1
         for d in out_shape:
@@ -475,7 +496,41 @@ def render_kernel_source(
             "    METH_FASTCALL, nullptr};\n"
             "\n"
             'extern "C" PyObject* tp_make_runner(void) {\n'
-            "    return PyCFunction_New(&tp_runner_def, nullptr);\n"
+            "// The factory may be invoked through a GIL-releasing foreign-call\n"
+            "// bridge; object creation needs the interpreter held.\n"
+            "    PyGILState_STATE gil = PyGILState_Ensure();\n"
+            "    PyObject* runner = PyCFunction_New(&tp_runner_def, nullptr);\n"
+            "    PyGILState_Release(gil);\n"
+            "    return runner;\n"
+            "}\n"
+        )
+        # Direct entry for the compiled-call trampoline: takes the C array
+        # of data pointers the steady-state guard has already validated,
+        # allocates the pinned output, runs the kernel, and returns the
+        # wrapped result.  No Python containers cross this boundary in
+        # either direction.
+        direct_section = (
+            'extern "C" PyObject* tp_direct(const void* const* ins) {\n'
+            "    try {\n"
+            f"        const float* in[{input_count}];\n"
+            f"        for (int i = 0; i < {input_count}; ++i)\n"
+            "            in[i] = static_cast<const float*>(ins[i]);\n"
+            "        tensorplay::Tensor out = tensorplay::Tensor::empty(\n"
+            f"            std::vector<int64_t>{{{shape_init}}},\n"
+            "            tensorplay::ScalarType::Float32,\n"
+            f"            tensorplay::Device(tensorplay::DeviceType::{dev_name}, "
+            f"{int(dev_index)}LL), false);\n"
+            f"        {entry}({numel}LL"
+            + "".join(f", in[{i}]" for i in range(input_count))
+            + ", out.data_ptr<float>());\n"
+            "        return tensorplay::python_c::tpx_py_wrap(out);\n"
+            "    } catch (const std::exception& e) {\n"
+            "        PyErr_SetString(PyExc_RuntimeError, e.what());\n"
+            "        return nullptr;\n"
+            "    } catch (...) {\n"
+            "        PyErr_SetString(PyExc_RuntimeError, \"unhandled kernel error\");\n"
+            "        return nullptr;\n"
+            "    }\n"
             "}\n"
         )
         extra_includes = (
@@ -531,6 +586,8 @@ def render_kernel_source(
         f"        tp_parallel_for_c(0, n, {min_chunk}LL, tp_body, &ctx);\n"
         "    }\n"
         "}\n"
+        f"{runner_section}"
+        f"{direct_section}"
     )
 
 
@@ -591,7 +648,7 @@ def build_cpu_native_kernel(
     ``shape``/``device`` pin the specialization: the lowering route already
     verified every input against them, so with both present the unit emits
     a METH_FASTCALL runner that keeps the steady-state call entirely in C
-    (pointer extraction, output allocation, result wrapping), mirroring the
+    (pointer extraction, output allocation, result wrapping), matching the
     binding pattern of the in-tree kernel loader.
     """
 
@@ -636,7 +693,7 @@ def build_cpu_native_kernel(
     if out_device_code is None:
         pinned_shape = None
 
-    entry = f"tp_native_{digest_entry_key(instructions, constants, input_count, output_ref, isa.name, version_info)}"
+    entry = f"tp_native_{_digest_entry_key(instructions, constants, input_count, output_ref, isa.name, version_info)}"
     source = render_kernel_source(
         instructions,
         constants,
@@ -654,7 +711,7 @@ def build_cpu_native_kernel(
         "flags": " ".join(isa.build_arch_flags()),
         "ver": version_info[:32],
         "entry": entry,
-        "bind": "runner-v1" if pinned else "py",
+        "bind": "plan-v1" if pinned else "py",
     }
     key = cache.cache_key(source, entry, key_options)
     source_path = cache.path_for(key, "cpp")
@@ -665,19 +722,27 @@ def build_cpu_native_kernel(
             import sysconfig
 
             python_include = sysconfig.get_paths()["include"]
+            generated_ops_include = os.path.join(
+                os.path.dirname(generated_include_dir), "generated"
+            )
             os.makedirs(os.path.dirname(source_path), exist_ok=True)
             with file_lock(output_path + ".lock"):
                 if not os.path.exists(output_path):
                     with open(source_path, "w") as fh:
                         fh.write(source)
+                    include_dirs = [
+                        include_dir,
+                        generated_include_dir,
+                        python_include,
+                    ]
+                    if os.path.isdir(generated_ops_include):
+                        # Tensor.h pulls the generated op declarations when
+                        # the runtime headers are present.
+                        include_dirs.append(generated_ops_include)
                     options = CppOptions(
                         compiler=compiler,
                         definitions=isa.definitions(),
-                        include_dirs=[
-                            include_dir,
-                            generated_include_dir,
-                            python_include,
-                        ],
+                        include_dirs=include_dirs,
                         cflags=[
                             "-std=c++20",
                             "-O3",
@@ -722,19 +787,32 @@ def build_cpu_native_kernel(
 
     import tensorplay
 
+    runner: Any = None
+    direct_addr = 0
     if pinned:
         # The generated unit carries a METH_FASTCALL runner: it receives the
         # input tensor list, extracts the data pointers in C, allocates the
         # output in C, and wraps the result — the steady-state call never
-        # re-enters Python.
+        # re-enters Python.  The ``tp_direct`` export additionally hands the
+        # compiled-call trampoline a pointer-level entry, skipping the list
+        # hop entirely.
         make_runner = getattr(lib, "tp_make_runner", None)
         if make_runner is not None:
             make_runner.restype = ctypes.py_object
             make_runner.argtypes = []
             try:
-                return make_runner()
+                runner = make_runner()
             except Exception:
                 return None
+        direct_fn = getattr(lib, "tp_direct", None)
+        if direct_fn is not None:
+            try:
+                direct_addr = ctypes.cast(direct_fn, ctypes.c_void_p).value or 0
+            except (ValueError, TypeError, OSError):
+                direct_addr = 0
+        if runner is not None:
+            return (runner, direct_addr)
+        return None
 
     if pinned_shape is None:
         # Unpinned builds keep the runtime shape read; the route check

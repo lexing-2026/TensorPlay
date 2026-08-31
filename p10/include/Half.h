@@ -158,7 +158,11 @@ inline float half_to_float_bits(uint16_t h) {
 
 } // namespace detail
 
-inline Half::Half(float value) {
+// The out-of-class definitions repeat TP_HOST_DEVICE so the annotation set
+// matches the in-class declarations on every device compiler (clang's HIP
+// frontend rejects a bare __host__ definition overloading a __host__
+// __device__ declaration; nvcc merely tolerates the mismatch).
+inline TP_HOST_DEVICE Half::Half(float value) {
 #if defined(__CUDA_ARCH__) || defined(__CUDACC__)
   x = __half_as_short(__float2half(value));
 #else
@@ -166,7 +170,7 @@ inline Half::Half(float value) {
 #endif
 }
 
-inline Half::operator float() const {
+inline TP_HOST_DEVICE Half::operator float() const {
 #if defined(__CUDA_ARCH__) || defined(__CUDACC__)
   return __half2float(*reinterpret_cast<const __half*>(&x));
 #else

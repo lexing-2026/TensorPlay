@@ -189,7 +189,7 @@ from .proxy_tensor import (
     get_proxy_node,
     unwrap_proxy,
     wrap_with_proxy,
-    wrapper_and_args_for_make_fx,
+    wrapper_and_args_for_make_graph,
 )
 from .meta_tracer import (
     MetaAttribute,
@@ -203,10 +203,10 @@ from .meta_tracer import (
     nn_layernorm_override,
     proxys_to_metas,
     symbolic_trace as meta_symbolic_trace,
-    torch_abs_override,
-    torch_nn_relu_override,
-    torch_relu_override,
-    torch_where_override,
+    abs_override,
+    nn_relu_override,
+    relu_override,
+    where_override,
 )
 from .sym_node import DynamicInt, SymBool, SymFloat, SymInt, SymNode, SymTypes
 
@@ -391,7 +391,7 @@ __all__ = [
     "get_proxy_node",
     "unwrap_proxy",
     "wrap_with_proxy",
-    "wrapper_and_args_for_make_fx",
+    "wrapper_and_args_for_make_graph",
     "MetaAttribute",
     "MetaDeviceAttribute",
     "MetaProxy",
@@ -403,8 +403,8 @@ __all__ = [
     "nn_layernorm_override",
     "proxys_to_metas",
     "meta_symbolic_trace",
-    "torch_abs_override",
-    "torch_nn_relu_override",
-    "torch_relu_override",
-    "torch_where_override",
+    "abs_override",
+    "nn_relu_override",
+    "relu_override",
+    "where_override",
 ]

@@ -150,6 +150,16 @@ bool has_function_dispatch(PyObject* value) {
            has_attribute(type, "__torch_function__");
 }
 
+bool is_builtin_dispatch_free(PyObject* value) {
+    PyTypeObject* type = Py_TYPE(value);
+    return type == &PyBool_Type || type == &PyLong_Type ||
+           type == &PyFloat_Type || type == &PyComplex_Type ||
+           type == &PyUnicode_Type || type == &PyBytes_Type ||
+           type == &PySet_Type || type == &PyFrozenSet_Type ||
+           type == &PySlice_Type || type == Py_TYPE(Py_None) ||
+           type == Py_TYPE(Py_Ellipsis) || type == Py_TYPE(Py_NotImplemented);
+}
+
 bool insert_candidate(
     PyObject* value, std::vector<PyObject*>& candidates,
     std::vector<PyTypeObject*>& candidate_types, bool require_subclass) {
@@ -175,6 +185,16 @@ bool insert_candidate(
                 return false;
             }
         }
+        return true;
+    }
+    if (g_tensor_type != nullptr && Py_TYPE(value) == g_tensor_type) {
+        return true;
+    }
+    if (is_builtin_dispatch_free(value)) return true;
+    if (g_tensor_type == nullptr) {
+        (void)is_tensor_object(value);
+    }
+    if (g_tensor_type != nullptr && Py_TYPE(value) == g_tensor_type) {
         return true;
     }
     if (require_subclass && !is_tensor_object(value)) return true;
@@ -236,6 +256,13 @@ PyObject* make_call_kwargs(
         }
     }
     return call_kwargs;
+}
+
+PyObject* call_dispatch_hook(
+    PyObject* hook, PyObject* func, PyObject* types, PyObject* call_args,
+    PyObject* call_kwargs) {
+    PyObject* hook_args[] = {func, types, call_args, call_kwargs};
+    return PyObject_Vectorcall(hook, hook_args, 4, nullptr);
 }
 
 PyObject* make_public_api(const char* op_name, bool is_method) {
@@ -351,41 +378,34 @@ int tpx_py_try_tensor_function_dispatch(
     }
 
     const Py_ssize_t nkw = kwnames == nullptr ? 0 : PyTuple_GET_SIZE(kwnames);
-    PyObject* call_args = make_call_args(receiver, is_method, args, nargs);
-    if (call_args == nullptr) return -1;
-    PyObject* call_kwargs = make_call_kwargs(args, nargs, kwnames);
-    if (call_kwargs == nullptr) {
-        Py_DECREF(call_args);
-        return -1;
-    }
 
     std::vector<PyObject*> candidates;
     std::vector<PyTypeObject*> candidate_types;
     if (is_method && !insert_candidate(receiver, candidates, candidate_types,
                                        false)) {
-        Py_DECREF(call_kwargs);
-        Py_DECREF(call_args);
         return -1;
     }
     for (Py_ssize_t i = 0; i < nargs; ++i) {
         if (!insert_candidate(args[i], candidates, candidate_types, false)) {
-            Py_DECREF(call_kwargs);
-            Py_DECREF(call_args);
             return -1;
         }
     }
     for (Py_ssize_t i = 0; i < nkw; ++i) {
         if (!insert_candidate(args[nargs + i], candidates, candidate_types,
                               false)) {
-            Py_DECREF(call_kwargs);
-            Py_DECREF(call_args);
             return -1;
         }
     }
     if (candidates.empty()) {
-        Py_DECREF(call_kwargs);
-        Py_DECREF(call_args);
         return 0;
+    }
+
+    PyObject* call_args = make_call_args(receiver, is_method, args, nargs);
+    if (call_args == nullptr) return -1;
+    PyObject* call_kwargs = make_call_kwargs(args, nargs, kwnames);
+    if (call_kwargs == nullptr) {
+        Py_DECREF(call_args);
+        return -1;
     }
 
     PyObject* func = make_public_api(op_name, is_method);
@@ -428,8 +448,8 @@ int tpx_py_try_tensor_function_dispatch(
             throw;
         }
         DispatchLayerGuard layer_guard(kDispatchFunctionLayer);
-        PyObject* dispatched = PyObject_CallFunctionObjArgs(
-            hook, func, types, call_args, call_kwargs, nullptr);
+        PyObject* dispatched = call_dispatch_hook(
+            hook, func, types, call_args, call_kwargs);
         pop_active_function_hook(op_name, type);
         Py_DECREF(hook);
         if (dispatched == nullptr) {
@@ -477,43 +497,35 @@ int tpx_py_try_tensor_subclass_dispatch(
 
     const Py_ssize_t nkw = kwnames == nullptr ? 0 : PyTuple_GET_SIZE(kwnames);
 
-    PyObject* call_args = make_call_args(receiver, is_method, args, nargs);
-    if (call_args == nullptr) return -1;
-    PyObject* call_kwargs = make_call_kwargs(args, nargs, kwnames);
-    if (call_kwargs == nullptr) {
-        Py_DECREF(call_args);
-        return -1;
-    }
-
     std::vector<PyObject*> candidates;
     std::vector<PyTypeObject*> candidate_types;
     if (is_method && !collect_tensor_subclass_candidate(
                          receiver, candidates, candidate_types)) {
-        Py_DECREF(call_kwargs);
-        Py_DECREF(call_args);
         return -1;
     }
     for (Py_ssize_t i = 0; i < nargs; ++i) {
         if (!collect_tensor_subclass_candidate(
                 args[i], candidates, candidate_types)) {
-            Py_DECREF(call_kwargs);
-            Py_DECREF(call_args);
             return -1;
         }
     }
     for (Py_ssize_t i = 0; i < nkw; ++i) {
         if (!collect_tensor_subclass_candidate(
                 args[nargs + i], candidates, candidate_types)) {
-            Py_DECREF(call_kwargs);
-            Py_DECREF(call_args);
             return -1;
         }
     }
 
     if (candidates.empty()) {
-        Py_DECREF(call_kwargs);
-        Py_DECREF(call_args);
         return 0;
+    }
+
+    PyObject* call_args = make_call_args(receiver, is_method, args, nargs);
+    if (call_args == nullptr) return -1;
+    PyObject* call_kwargs = make_call_kwargs(args, nargs, kwnames);
+    if (call_kwargs == nullptr) {
+        Py_DECREF(call_args);
+        return -1;
     }
 
     PyObject* func = make_public_api(op_name, is_method);
@@ -549,8 +561,8 @@ int tpx_py_try_tensor_subclass_dispatch(
         }
         push_active_hook(op_name, type);
         DispatchLayerGuard layer_guard(kDispatchSubclassLayer);
-        PyObject* dispatched = PyObject_CallFunctionObjArgs(
-            hook, func, types, call_args, call_kwargs, nullptr);
+        PyObject* dispatched = call_dispatch_hook(
+            hook, func, types, call_args, call_kwargs);
         pop_active_hook(op_name, type);
         Py_DECREF(hook);
         if (dispatched == nullptr) {
@@ -735,8 +747,8 @@ int tpx_py_try_function_mode_dispatch(
         return 0;
     }
     DispatchLayerGuard layer_guard(kDispatchModeLayer);
-    PyObject* dispatched = PyObject_CallFunctionObjArgs(
-        hook, func, types, call_args, call_kwargs, nullptr);
+    PyObject* dispatched = call_dispatch_hook(
+        hook, func, types, call_args, call_kwargs);
     Py_DECREF(hook);
     try {
         g_python_dispatch_tls.function_modes.push_back(mode);
@@ -828,6 +840,19 @@ void tpx_py_parse_into(PyObject* const* args, Py_ssize_t nargs,
         }
         out[u] = args[nargs + i];
     }
+}
+
+bool tpx_py_kwnames_has(PyObject* kwnames, const char* name) {
+    if (kwnames == nullptr) return false;
+    const Py_ssize_t size = PyTuple_GET_SIZE(kwnames);
+    for (Py_ssize_t i = 0; i < size; ++i) {
+        PyObject* key = PyTuple_GET_ITEM(kwnames, i);
+        if (PyUnicode_Check(key) &&
+            PyUnicode_CompareWithASCIIString(key, name) == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 ParsedArgs tpx_py_parse(PyObject* const* args, Py_ssize_t nargs,
@@ -955,9 +980,8 @@ Tensor tpx_py_tensor(PyObject* obj) { return as_tensor(obj, "op", 0); }
 
 const Tensor& tpx_py_tensor_cref(PyObject* obj) {
     if (g_tensor_type != nullptr && PyObject_TypeCheck(obj, g_tensor_type)) {
-        // Registered Tensor wrappers are pybind11 `instance` objects; with
-        // the simple layout the C++ value sits at value_holder[0].  This is
-        // the THPVariable-style direct access, minus the registry hop.
+        // Registered wrappers use a simple value-holder layout, so direct
+        // access avoids a registry lookup for the common case.
         auto* inst = reinterpret_cast<py::detail::instance*>(obj);
         if (inst->simple_layout && inst->simple_value_holder[0] != nullptr) {
             return *static_cast<const Tensor*>(inst->simple_value_holder[0]);
@@ -1015,6 +1039,13 @@ Generator tpx_py_generator(PyObject* obj) {
 std::optional<Generator> tpx_py_opt_generator(PyObject* obj) {
     if (obj == Py_None) return std::nullopt;
     return tpx_py_generator(obj);
+}
+Storage tpx_py_storage(PyObject* obj) {
+    try {
+        return py::cast<Storage>(py::reinterpret_borrow<py::object>(obj));
+    } catch (const py::cast_error&) {
+        type_error(obj, "op", 0, "a Storage");
+    }
 }
 Device tpx_py_device(PyObject* obj) {
     try {
@@ -1115,6 +1146,14 @@ bool obj_is_tensor(PyObject* obj) {
     return is_tensor_object(obj);
 }
 
+bool obj_is_storage(PyObject* obj) {
+    try {
+        return py::isinstance<Storage>(py::handle(obj));
+    } catch (...) {
+        return false;
+    }
+}
+
 bool seq_item_is_number(PyObject* o) {
     // Python numbers plus the registered tensorplay.Scalar wrapper, which
     // generated wrappers (e.g. addmm's beta/alpha) pass through directly.
@@ -1162,6 +1201,7 @@ const char* kind_want(unsigned char k) {
         case TPK_BOOLLIST:   return "bool[]";
         case TPK_TENSORLIST_OPTIONAL: return "Tensor?[]";
         case TPK_GENERATOR:  return "Generator";
+        case TPK_STORAGE:    return "Storage";
     }
     return "?";
 }
@@ -1226,6 +1266,7 @@ bool tpx_py_obj_matches_kind(PyObject* obj, unsigned char kind) {
             } catch (...) {
                 return false;
             }
+        case TPK_STORAGE:    return obj_is_storage(obj);
     }
     return false;
 }
@@ -1432,6 +1473,9 @@ PyObject* tpx_py_wrap_optional_symfloatlist(
 PyObject* tpx_py_wrap_generator(const Generator& g) {
     return py::cast(g).release().ptr();
 }
+PyObject* tpx_py_wrap_storage(const Storage& storage) {
+    return py::cast(storage).release().ptr();
+}
 PyObject* tpx_py_wrap_optional_tensor(const std::optional<Tensor>& t) {
     if (!t.has_value()) {
         Py_RETURN_NONE;
@@ -1560,6 +1604,32 @@ void tpx_py_keep_alive(PyObject*) {
     // (shared_ptr) and VariableVersion (shared counter), so the returned
     // alias keeps both alive without an explicit keep-alive edge.  View
     // metadata can be added here when saved-view replay is enabled.
+}
+
+long long tpx_tensor_version(PyObject* obj) {
+    // Version-counter read straight off the C++ value holder: the steady
+    // state guard needs one integer per argument per call, so it must not
+    // traverse Python attribute machinery.
+    try {
+        const Tensor& t = tpx_py_tensor_cref(obj);
+        auto impl = t.unsafeGetTensorImpl();
+        if (!impl) return -1;
+        return static_cast<long long>(impl->version());
+    } catch (...) {
+        PyErr_Clear();
+        return -1;
+    }
+}
+
+int tpx_tensor_requires_grad(PyObject* obj) {
+    try {
+        const Tensor& t = tpx_py_tensor_cref(obj);
+        if (!t.unsafeGetTensorImpl()) return -1;
+        return t.requires_grad() ? 1 : 0;
+    } catch (...) {
+        PyErr_Clear();
+        return -1;
+    }
 }
 
 void tpx_py_set_error(const std::exception& e) {

@@ -438,14 +438,14 @@ def conv_transpose3d_grad_bias(grad_output, input, weight, stride, padding, outp
         dilation = [dilation]
     return _C.conv_transpose3d_grad_bias(grad_output, input, weight, stride, padding, output_padding, groups, dilation)
 
-def add(input, other, alpha=1):
+def add(input, other, *, alpha=1, out=None):
+    if out is not None:
+        return _C.add(self=input, other=other, alpha=alpha, out=out)
     if _capturing():
-        _captured = _capture_call(add, (input, other, alpha), {})
+        _captured = _capture_call(add, (input, other), {})
         if _captured is not None:
             return _captured
-    if not isinstance(input, tensorplay.Tensor):
-        input = tensorplay.as_tensor(input)
-    return input.add(other=other, alpha=alpha)
+    return _C.add(self=input, other=other, alpha=alpha)
 
 def add_(input, other, alpha=1):
     return input.add_(other=other, alpha=alpha)
@@ -10995,8 +10995,8 @@ def _pad_packed_sequence(data, batch_sizes, batch_first, padding_value, total_le
         padding_value = tensorplay.Scalar(padding_value)
     return _C._pad_packed_sequence(data, batch_sizes, batch_first, padding_value, total_length)
 
-def set_(input, source, storage_offset, size, stride=[]):
-    return input.set_(source=source, storage_offset=storage_offset, size=size, stride=stride)
+def set_(input, source):
+    return input.set_(source=source)
 
 def lift(input):
     if _capturing():

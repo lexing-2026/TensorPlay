@@ -1,9 +1,7 @@
 #include "TensorImpl.h"
 #include "Allocator.h"
 #include "Storage.h"
-// #include "AutogradMetaInterface.h"
 #include "Tensor.h"
-#include <iostream>
 
 namespace tensorplay {
 
@@ -33,7 +31,7 @@ TensorImpl::TensorImpl(const std::vector<int64_t>& sizes, DType dtype,
     
     shared_state_ = std::make_shared<SharedState>();
     int64_t num_elements = sizes_and_strides_.numel();
-    if (allocate_storage && num_elements > 0) {
+    if (allocate_storage) {
         size_t total_bytes = static_cast<size_t>(num_elements) * elementSize(dtype);
         Allocator* allocator = getAllocator(device.type());
         shared_state_->storage = Storage(total_bytes, allocator, device);
@@ -49,12 +47,10 @@ TensorImpl::TensorImpl(const std::vector<int64_t>& sizes, const std::vector<int6
     is_contiguous_ = sizes_and_strides_.is_contiguous();
     
     int64_t num_elements = sizes_and_strides_.numel();
-    if (num_elements > 0) {
-        size_t total_bytes = static_cast<size_t>(num_elements) * elementSize(dtype);
-        Allocator* allocator = getAllocator(device.type());
-        shared_state_->storage = Storage(total_bytes, allocator, device);
-        device_ = shared_state_->storage.device();
-    }
+    size_t total_bytes = static_cast<size_t>(num_elements) * elementSize(dtype);
+    Allocator* allocator = getAllocator(device.type());
+    shared_state_->storage = Storage(total_bytes, allocator, device);
+    device_ = shared_state_->storage.device();
 }
 
 TensorImpl::TensorImpl(Storage storage, const std::vector<int64_t>& sizes, DType dtype, size_t storage_offset)
@@ -93,6 +89,7 @@ TensorImpl::TensorImpl(const TensorImpl& other)
       dtype_(other.dtype_),
       device_(other.device_),
       version_counter_(other.version_counter_),
+      inference_tensor_(other.inference_tensor_),
       is_contiguous_(other.is_contiguous_),
       memory_format_(other.memory_format_),
       shared_state_(other.shared_state_),
@@ -104,73 +101,17 @@ TensorImpl::TensorImpl(TensorImpl&& other) noexcept = default;
 TensorImpl& TensorImpl::operator=(const TensorImpl& other) = default;
 TensorImpl& TensorImpl::operator=(TensorImpl&& other) noexcept = default;
 
-/*
 void TensorImpl::set_requires_grad(bool requires_grad) {
-    if (requires_grad) {
-        if (!autograd_meta_) {
-            AutogradMetaFactory* factory = GetAutogradMetaFactory();
-            if (factory) {
-                autograd_meta_ = factory->make();
-                autograd_meta_->set_requires_grad(true);
-            } else {
-                // If no factory, we can't enable autograd. 
-                // For now, let's warn or throw.
-                std::cerr << "Warning: AutogradMetaFactory not registered. cannot set requires_grad=true" << std::endl;
-            }
-        } else {
-            autograd_meta_->set_requires_grad(true);
-        }
-    } else {
-        if (autograd_meta_) {
-            autograd_meta_->set_requires_grad(false);
-        }
+    if (requires_grad && inference_tensor_ && !InferenceMode::is_enabled()) {
+        throw std::runtime_error(
+            "Setting requires_grad=True on an inference tensor outside inference mode is not allowed.");
     }
-}
-*/
-
-/*
-void TensorImpl::retain_grad() {
-    if (!autograd_meta_) {
-        AutogradMetaFactory* factory = GetAutogradMetaFactory();
-        if (factory) {
-            autograd_meta_ = factory->make();
-        } else {
-             // Handle error
-             return;
-        }
-    }
-    autograd_meta_->set_retain_grad(true);
-}
-
-void TensorImpl::set_grad_fn(std::shared_ptr<Node> grad_fn) {
-    if (!autograd_meta_) {
-        AutogradMetaFactory* factory = GetAutogradMetaFactory();
-        if (factory) {
-            autograd_meta_ = factory->make();
-        } else {
-             return;
-        }
-    }
-    autograd_meta_->set_grad_fn(std::move(grad_fn));
-    if (autograd_meta_->grad_fn()) {
-        autograd_meta_->set_requires_grad(true);
-    }
-}
-
-std::shared_ptr<Node> TensorImpl::grad_fn() const {
     if (autograd_meta_) {
-        return autograd_meta_->grad_fn();
+        autograd_meta_->set_requires_grad(requires_grad);
     }
-    return nullptr;
 }
-
-void TensorImpl::set_autograd_meta(std::shared_ptr<AutogradMetaInterface> autograd_meta) {
-    autograd_meta_ = std::move(autograd_meta);
-}
-*/
 
 void TensorImpl::copy_metadata_from(const TensorImpl& other) {
-    // storage_ = other.storage_; // Replaced by shared_state_
     shared_state_ = other.shared_state_;
     storage_offset_ = other.storage_offset_;
     sizes_and_strides_ = other.sizes_and_strides_;
@@ -182,28 +123,6 @@ void TensorImpl::copy_metadata_from(const TensorImpl& other) {
     transform_value_ = other.transform_value_;
     transform_batch_dim_ = other.transform_batch_dim_;
     transform_level_ = other.transform_level_;
-    // onednn_md_ = other.onednn_md_; // Replaced by shared_state_
 }
-
-/*
-Tensor TensorImpl::grad() const {
-    if (autograd_meta_) {
-        return autograd_meta_->grad();
-    }
-    return Tensor();
-}
-
-void TensorImpl::set_grad(const Tensor& grad) {
-    if (!autograd_meta_) {
-         AutogradMetaFactory* factory = GetAutogradMetaFactory();
-         if (factory) {
-             autograd_meta_ = factory->make();
-         } else {
-             return;
-         }
-    }
-    autograd_meta_->set_grad(grad);
-}
-*/
 
 } // namespace tensorplay

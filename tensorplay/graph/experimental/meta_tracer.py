@@ -28,10 +28,10 @@ __all__ = [
     "nn_layernorm_override",
     "proxys_to_metas",
     "symbolic_trace",
-    "torch_abs_override",
-    "torch_nn_relu_override",
-    "torch_relu_override",
-    "torch_where_override",
+    "abs_override",
+    "nn_relu_override",
+    "relu_override",
+    "where_override",
 ]
 
 
@@ -51,11 +51,11 @@ def nn_layernorm_override(module: Any, input: Any) -> Any:
     return input
 
 
-def torch_relu_override(value: Any) -> Any:
+def relu_override(value: Any) -> Any:
     return value
 
 
-def torch_nn_relu_override(module: Any, value: Any) -> Any:
+def nn_relu_override(module: Any, value: Any) -> Any:
     del module
     return value
 
@@ -66,11 +66,11 @@ def functional_relu_override(value: Any, inplace: bool = False) -> Any:
     return value
 
 
-def torch_where_override(condition: Any, x: Any, y: Any) -> Any:
+def where_override(condition: Any, x: Any, y: Any) -> Any:
     return condition + x + y
 
 
-def torch_abs_override(value: Any, *, out: Any = None) -> Any:
+def abs_override(value: Any, *, out: Any = None) -> Any:
     if out is not None:
         raise ValueError("out= is not supported by metadata tracing")
     return value
@@ -79,11 +79,11 @@ def torch_abs_override(value: Any, *, out: Any = None) -> Any:
 manual_meta_overrides: dict[Callable[..., Any] | type, Callable[..., Any]] = {
     nn.Embedding: embedding_override,
     nn.LayerNorm: nn_layernorm_override,
-    tp.relu: torch_relu_override,
+    tp.relu: relu_override,
     nn.functional.relu: functional_relu_override,
-    nn.ReLU: torch_nn_relu_override,
-    tp.where: torch_where_override,
-    tp.abs: torch_abs_override,
+    nn.ReLU: nn_relu_override,
+    tp.where: where_override,
+    tp.abs: abs_override,
 }
 
 

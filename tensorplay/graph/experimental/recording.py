@@ -80,8 +80,8 @@ def retlog(value: _R) -> _R:
     return value
 
 
-def is_create_fx_call_function(event: ShapeEnvEvent) -> bool:
-    return event.name in {"_create_graph_call", "create_graph_call", "_create_fx_call_function"}
+def is_create_graph_call_function(event: ShapeEnvEvent) -> bool:
+    return event.name in {"_create_graph_call", "create_graph_call"}
 
 
 def decorator(fn: Callable[_P, _R]) -> Callable[_P, _R]:

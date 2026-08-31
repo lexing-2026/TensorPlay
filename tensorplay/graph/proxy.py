@@ -106,6 +106,33 @@ def _iter_values(value: Any) -> Iterator[Any]:
         yield value
 
 
+_PRESERVED_NODE_META_FIELDS = (
+    "module_stack",
+    "nn_module_stack",
+    "source_fn",
+    "source_fn_stack",
+    "from_node",
+    "custom",
+    "partitioner_tag",
+)
+
+
+def _apply_preserved_node_meta(node: Node) -> None:
+    from . import traceback as graph_traceback
+
+    if not graph_traceback.has_preserved_node_meta():
+        return
+    current_meta = graph_traceback.get_current_meta()
+    stack_trace = current_meta.get("stack_trace")
+    if stack_trace:
+        node.stack_trace = stack_trace
+    for field in _PRESERVED_NODE_META_FIELDS:
+        if field in current_meta:
+            node.meta[field] = copy.copy(current_meta[field])
+    if current_meta.get("autograd_backward", False):
+        node.meta["autograd_backward"] = True
+
+
 class TracerBase:
     """Base protocol for tracers that append operations to a graph."""
 
@@ -134,6 +161,7 @@ class TracerBase:
         if graph is None:
             raise TraceError("tracer has no graph")
         node = graph.create_node(kind, target, args, kwargs, name, type_expr)
+        _apply_preserved_node_meta(node)
         scope = getattr(self, "scope", None)
         if scope is not None:
             node_scope = getattr(self, "node_name_to_scope", None)

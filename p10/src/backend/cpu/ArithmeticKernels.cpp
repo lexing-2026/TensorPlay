@@ -10,6 +10,7 @@
 #include "Parallel.h"
 #include "OneDNNContext.h"
 #include "Allocator.h"
+#include "GradMode.h"
 #include "cpu/VecComplex.h"
 #include <iostream>
 #include <vector>
@@ -494,6 +495,124 @@ inline T tp_alpha_scaled(const tensorplay::Scalar& alpha, const T& y) {
     }
 }
 
+DType add_result_dtype(DType self_dtype, DType other_dtype,
+                       const Scalar& alpha) {
+    DType result_dtype = promoteTypes(self_dtype, other_dtype);
+    if (alpha.isFloatingPoint() && !isFloatingType(result_dtype)) {
+        result_dtype = promoteTypes(result_dtype, DType::Float32);
+    }
+    return result_dtype;
+}
+
+bool has_output_alias(const Tensor& out, const Tensor& input) {
+    auto out_impl = out.unsafeGetTensorImpl();
+    auto input_impl = input.unsafeGetTensorImpl();
+    return out_impl != nullptr && input_impl != nullptr &&
+           out_impl->storage().defined() && input_impl->storage().defined() &&
+           out_impl->storage().is_same(input_impl->storage());
+}
+
+bool try_add_float32_out(const Tensor& self, const Tensor& other,
+                         Scalar alpha, Tensor& out) {
+    if (self.dtype() != DType::Float32 || other.dtype() != DType::Float32 ||
+        out.dtype() != DType::Float32 || self.shape() != other.shape() ||
+        self.shape() != out.shape() || !self.is_contiguous() ||
+        !other.is_contiguous() || !out.is_contiguous() ||
+        has_output_alias(out, self) || has_output_alias(out, other)) {
+        return false;
+    }
+
+    const int64_t n = self.numel();
+    const float alpha_val = alpha.to<float>();
+    const float* self_ptr = self.data_ptr<float>();
+    const float* other_ptr = other.data_ptr<float>();
+    float* out_ptr = out.data_ptr<float>();
+
+#if defined(__x86_64__)
+    if (cpu_has_avx512()) {
+        if (alpha_val == 1.0f) {
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                add_f32_avx512(self_ptr + begin, other_ptr + begin,
+                               out_ptr + begin, end - begin);
+            });
+        } else {
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                binary_f32_avx512(BIN_ADD, self_ptr + begin,
+                                  other_ptr + begin, out_ptr + begin,
+                                  end - begin, alpha_val);
+            });
+        }
+        return true;
+    }
+#endif
+
+    parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        for (int64_t i = begin; i < end; ++i) {
+            out_ptr[i] = self_ptr[i] + alpha_val * other_ptr[i];
+        }
+    });
+    return true;
+}
+
+bool try_add_tensor_iterator_out(const Tensor& self, const Tensor& other,
+                                 Scalar alpha, DType result_dtype,
+                                 Tensor& out) {
+    if (has_output_alias(out, self) || has_output_alias(out, other)) {
+        return false;
+    }
+
+    Tensor self_casted =
+        (self.dtype() == result_dtype) ? self : self.to(result_dtype);
+    Tensor other_casted =
+        (other.dtype() == result_dtype) ? other : other.to(result_dtype);
+    TensorIterator iter =
+        TensorIterator::binary_op(out, self_casted, other_casted);
+
+#if defined(__x86_64__)
+    if (result_dtype == DType::Float32 && cpu_has_avx512()) {
+        const float alpha_val = alpha.to<float>();
+        iter.for_each([&](char** data, const int64_t* strides, int64_t n) {
+            if (strides[0] == 4 && strides[1] == 4 && strides[2] == 4) {
+                binary_f32_avx512(
+                    BIN_ADD, reinterpret_cast<const float*>(data[1]),
+                    reinterpret_cast<const float*>(data[2]),
+                    reinterpret_cast<float*>(data[0]), n, alpha_val);
+                return;
+            }
+            for (int64_t i = 0; i < n; ++i) {
+                *reinterpret_cast<float*>(data[0] + i * strides[0]) =
+                    *reinterpret_cast<const float*>(data[1] + i * strides[1]) +
+                    alpha_val *
+                        *reinterpret_cast<const float*>(data[2] + i * strides[2]);
+            }
+        });
+        return true;
+    }
+#endif
+
+#define TI_ADD_OUT_CASE(ctype, name) \
+    case DType::name: { \
+        using ctype_ = ctype; \
+        iter.for_each([&alpha](char** data, const int64_t* strides, int64_t n) { \
+            for (int64_t i = 0; i < n; ++i) { \
+                auto* dst = reinterpret_cast<ctype_*>(data[0] + i * strides[0]); \
+                const auto* lhs = reinterpret_cast<const ctype_*>( \
+                    data[1] + i * strides[1]); \
+                const auto* rhs = reinterpret_cast<const ctype_*>( \
+                    data[2] + i * strides[2]); \
+                *dst = *lhs + tp_alpha_scaled(alpha, *rhs); \
+            } \
+        }); \
+        break; \
+    }
+    switch (result_dtype) {
+        TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TI_ADD_OUT_CASE)
+        default: TP_THROW(TypeError, "add.out: unsupported dtype");
+    }
+#undef TI_ADD_OUT_CASE
+    return true;
+}
+
 Tensor add_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
 #if defined(__x86_64__)
     bool plain_layout = true;
@@ -691,10 +810,7 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
     #endif
 
     std::vector<int64_t> out_shape = broadcast_shapes(static_cast<std::vector<int64_t>>(self.shape()), static_cast<std::vector<int64_t>>(other.shape()));
-    DType result_dtype = promoteTypes(self.dtype(), other.dtype());
-    if (alpha.isFloatingPoint() && !isFloatingType(result_dtype)) {
-        result_dtype = promoteTypes(result_dtype, DType::Float32);
-    }
+    DType result_dtype = add_result_dtype(self.dtype(), other.dtype(), alpha);
     Tensor result = Tensor::empty(out_shape, result_dtype, self.device());
 
     bool optimized = false;
@@ -987,6 +1103,47 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
         }
     }
     return result;
+}
+
+Tensor& add_out_kernel(const Tensor& self, const Tensor& other, Scalar alpha,
+                       Tensor& out) {
+    if (self.device() != other.device() || self.device() != out.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "add.out: all tensors must be on the same device");
+    }
+    if (GradMode::is_enabled() &&
+        (self.requires_grad() || other.requires_grad() || out.requires_grad())) {
+        TP_THROW(RuntimeError,
+                 "add.out: functions with out arguments do not support automatic differentiation");
+    }
+
+    const DType result_dtype =
+        add_result_dtype(self.dtype(), other.dtype(), alpha);
+    if (out.dtype() != result_dtype) {
+        TP_THROW(RuntimeError,
+                 "add.out: expected output dtype ",
+                 static_cast<int>(result_dtype), ", but got ",
+                 static_cast<int>(out.dtype()));
+    }
+
+    const std::vector<int64_t> out_shape = broadcast_shapes(
+        static_cast<std::vector<int64_t>>(self.shape()),
+        static_cast<std::vector<int64_t>>(other.shape()));
+    if (static_cast<std::vector<int64_t>>(out.shape()) == out_shape) {
+        if (try_add_float32_out(self, other, alpha, out) ||
+            try_add_tensor_iterator_out(self, other, alpha, result_dtype, out)) {
+            return out;
+        }
+    }
+
+    Tensor result = add_kernel(self, other, alpha);
+    if (out.shape() == result.shape()) {
+        out.copy_(result);
+    } else {
+        out.unsafeGetTensorImpl()->copy_metadata_from(
+            *result.unsafeGetTensorImpl());
+    }
+    return out;
 }
 
 Tensor add_relu_same_shape(const Tensor& self, const Tensor& other) {
@@ -2798,6 +2955,7 @@ Tensor& addcdiv_inplace_cpu(Tensor& self, const Tensor& tensor1,
 // Registration
 TENSORPLAY_LIBRARY_IMPL(CPU, ArithmeticKernels) {
     m.impl("add.Tensor", add_kernel);
+    m.impl("add.out", add_out_kernel);
     m.impl("add_relu", add_relu_cpu);
     m.impl("sub.Tensor", sub_kernel);
     m.impl("mul.Tensor", mul_kernel);

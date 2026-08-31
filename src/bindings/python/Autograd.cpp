@@ -444,15 +444,19 @@ void init_autograd(py::module_& m) {
     // autograd recording and freezes version counters; exit restores the
     struct PyInferenceMode {
         bool prev_ = false;
+        bool prev_grad_ = true;
         explicit PyInferenceMode(bool mode) {
             prev_ = tensorplay::tpx::InferenceMode::is_enabled();
+            prev_grad_ = tensorplay::tpx::GradMode::is_enabled();
             tensorplay::tpx::InferenceMode::set_enabled(mode);
+            tensorplay::tpx::GradMode::set_enabled(!mode);
         }
         void enter() {}
         void exit(const std::optional<py::object>&,
                   const std::optional<py::object>&,
                   const std::optional<py::object>&) {
             tensorplay::tpx::InferenceMode::set_enabled(prev_);
+            tensorplay::tpx::GradMode::set_enabled(prev_grad_);
         }
     };
 

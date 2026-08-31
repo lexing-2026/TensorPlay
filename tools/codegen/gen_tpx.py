@@ -539,7 +539,7 @@ def generate_autograd_registration(funcs: list[NativeFunction], *,
         seen.add(_dedup_key(f))
         fn_type = (f'{cpp_return_type(f)} (*)({", ".join(cpp_arg_type(a.type) for a in f.args)})')
         cast = f'static_cast<{fn_type}>(&::tensorplay::tpx::ops::{f.cpp_name})'
-        for key in ('AutogradCPU', 'AutogradCUDA'):
+        for key in ('AutogradCPU', 'AutogradCUDA', 'AutogradVulkan'):
             lines.append(f'        D.registerKernel("{f.func_name}", DispatchKey::{key}, (KernelFunction){cast});')
     lines += [
         '    }',

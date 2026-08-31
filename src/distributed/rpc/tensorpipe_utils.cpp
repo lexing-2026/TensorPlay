@@ -8,7 +8,7 @@
 
 #include <pybind11/stl.h>
 
-#ifdef USE_CUDA
+#ifdef TENSORPLAY_TENSORPIPE_CUDA
 #include "CUDARuntime.h"
 #include <tensorpipe/tensorpipe_cuda.h>
 #endif
@@ -38,7 +38,7 @@ tensorplay::Device from_tensorpipe_device(const tensorpipe::Device& device) {
         return tensorplay::Device(tensorplay::DeviceType::CPU);
     }
     if (device.type == tensorpipe::kCudaDeviceType) {
-#ifdef USE_CUDA
+#ifdef TENSORPLAY_TENSORPIPE_CUDA
         return tensorplay::Device(
             tensorplay::DeviceType::CUDA,
             static_cast<int64_t>(device.index));
@@ -73,7 +73,7 @@ tensorpipe::Buffer make_tensorpipe_buffer(
     if (device.is_cpu()) {
         return tensorpipe::CpuBuffer{storage.data()};
     }
-#ifdef USE_CUDA
+#ifdef TENSORPLAY_TENSORPIPE_CUDA
     if (device.is_cuda()) {
         tensorplay::cuda::CUDAGuard guard(static_cast<int>(device.index()));
         return tensorpipe::CudaBuffer{
@@ -362,7 +362,7 @@ TensorPipeReadAllocation allocate_tensorpipe_message(
                 tensorpipe::CpuBuffer{state->storages.back().data()}});
             continue;
         }
-#ifdef USE_CUDA
+#ifdef TENSORPLAY_TENSORPIPE_CUDA
         if (device.is_cuda()) {
             tensorplay::cuda::CUDAGuard guard(static_cast<int>(device.index()));
             state->storages.emplace_back(

@@ -93,7 +93,7 @@ inline float bfloat16_to_float_bits(uint16_t b) {
 
 } // namespace detail
 
-inline BFloat16::BFloat16(float value) {
+inline TP_HOST_DEVICE BFloat16::BFloat16(float value) {
 #if defined(__CUDA_ARCH__) || defined(__CUDACC__)
   x = __bfloat16_as_ushort(__float2bfloat16(value));
 #else
@@ -101,7 +101,7 @@ inline BFloat16::BFloat16(float value) {
 #endif
 }
 
-inline BFloat16::operator float() const {
+inline TP_HOST_DEVICE BFloat16::operator float() const {
 #if defined(__CUDA_ARCH__) || defined(__CUDACC__)
   return __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&x));
 #else

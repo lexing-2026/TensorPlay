@@ -17,10 +17,11 @@ namespace tensorplay {
 namespace cuda {
 namespace topk_detail {
 
-__device__ inline uint64_t topk_linear_block_id() {
-  return static_cast<uint64_t>(blockIdx.x) +
-      static_cast<uint64_t>(gridDim.x) * blockIdx.y +
-      static_cast<uint64_t>(gridDim.x) * gridDim.y * blockIdx.z;
+template <typename IndexType = uint64_t>
+__device__ inline IndexType topk_linear_block_id() {
+  return static_cast<IndexType>(blockIdx.x) +
+      static_cast<IndexType>(gridDim.x) * blockIdx.y +
+      static_cast<IndexType>(gridDim.x) * gridDim.y * blockIdx.z;
 }
 
 template <typename T>
@@ -415,6 +416,63 @@ __global__ void topk_pack_sort_kernel(
         inner_index;
     keys[position] = Traits::encode(values[offset]);
     positions[position] = position;
+  }
+}
+
+template <typename T, typename Key, int BlockThreads, int ItemsPerThread>
+__launch_bounds__(BlockThreads)
+__global__ void radix_sort_all_topk_indices_kernel(
+    const T* __restrict__ input, T* __restrict__ values,
+    int64_t* __restrict__ indices, int64_t rows, int64_t cols, int64_t k,
+    int64_t inner, bool largest) {
+  using IndexSort = cub::BlockRadixSort<
+      Key, BlockThreads, ItemsPerThread, int32_t>;
+  using LoadValues = cub::BlockLoad<
+      T, BlockThreads, ItemsPerThread, cub::BLOCK_LOAD_TRANSPOSE>;
+  __shared__ union {
+    typename LoadValues::TempStorage load_values;
+    typename IndexSort::TempStorage sort;
+  } temp_storage;
+  const uint64_t row_index = topk_linear_block_id();
+  if (row_index >= static_cast<uint64_t>(rows)) return;
+
+  const int64_t row = static_cast<int64_t>(row_index);
+  const int64_t outer_index = row / inner;
+  const int64_t inner_index = row % inner;
+  const int64_t input_base = outer_index * cols * inner + inner_index;
+  const int64_t output_base = outer_index * k * inner + inner_index;
+  TopKStridedReadAccessor<T> input_accessor{input + input_base, inner};
+  T local_values[ItemsPerThread];
+  int32_t local_indices[ItemsPerThread];
+  Key keys[ItemsPerThread];
+  LoadValues(temp_storage.load_values).Load(
+      input_accessor, local_values, static_cast<int>(cols), static_cast<T>(0));
+  __syncthreads();
+  for (int item = 0; item < ItemsPerThread; ++item) {
+    const int position = static_cast<int>(threadIdx.x) * ItemsPerThread + item;
+    const bool valid = position < cols;
+    local_indices[item] = valid ? position : -1;
+    keys[item] = valid ? TopKRadixTraits<T>::encode(local_values[item])
+                       : (largest ? static_cast<Key>(0)
+                                   : std::numeric_limits<Key>::max());
+  }
+
+  if (largest) {
+    IndexSort(temp_storage.sort).SortDescending(keys, local_indices);
+  } else {
+    IndexSort(temp_storage.sort).Sort(keys, local_indices);
+  }
+  __syncthreads();
+  for (int item = 0; item < ItemsPerThread; ++item) {
+    const int position = static_cast<int>(threadIdx.x) * ItemsPerThread + item;
+    if (position < k) {
+      const int32_t source = local_indices[item];
+      const int64_t output_offset =
+          output_base + static_cast<int64_t>(position) * inner;
+      values[output_offset] = topk_load(
+          input + input_base + static_cast<int64_t>(source) * inner);
+      indices[output_offset] = static_cast<int64_t>(source);
+    }
   }
 }
 

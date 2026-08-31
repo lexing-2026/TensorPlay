@@ -347,6 +347,7 @@ PYBIND11_MODULE(_C, m) {
     init_symint(m);
     init_size(m);
     init_generator(m);
+    init_storage(m);
     init_tensor(m);
     init_autograd(m);
     init_autocast(m);
