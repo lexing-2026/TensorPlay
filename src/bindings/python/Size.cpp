@@ -50,12 +50,20 @@ PyObject* size_from_tuple(PyObject* tup) {
 }
 
 // Wrap any slot borrowed from the tuple implementation: tuple results come
-// back as Size so slicing/concatenation keeps the type.  The wrapper is
-// instantiated with the exact slot signature, mirroring the tuple delegate
-// pattern used for the reference implementation of this type.
-template <typename FnType, FnType fn, typename... Args>
-PyObject* wrap_tuple_result(Args... args) {
-    PyObject* result = (*fn)(std::forward<Args>(args)...);
+// back as Size so slicing/concatenation keeps the type.  The borrowed slots
+// are resolved through file-scope pointers set at static-init time.
+static PyObject* size_repeat(PyObject* self, Py_ssize_t count) {
+    PyObject* result = tuple_repeat(self, count);
+    if (result == nullptr) return nullptr;
+    PyObject* wrapped = size_from_tuple(result);
+    Py_DECREF(result);
+    return wrapped;
+}
+
+static PyObject* size_subscript(PyObject* self, PyObject* key) {
+    // tuple's subscript covers int (negative indexing, bounds errors) and
+    // slices; only the slice result needs re-wrapping into a Size.
+    PyObject* result = tuple_subscript(self, key);
     if (result == nullptr) return nullptr;
     PyObject* wrapped = size_from_tuple(result);
     Py_DECREF(result);
@@ -187,20 +195,20 @@ PyNumberMethods size_as_number = {
 };
 
 PySequenceMethods size_as_sequence = {
-    nullptr,  /* sq_length (inherited) */
-    &size_concat, /* sq_concat */
-    &wrap_tuple_result<decltype(tuple_repeat), tuple_repeat>, /* sq_repeat */
-    nullptr,  /* sq_item (inherited) */
-    nullptr,  /* was_sq_slice */
-    nullptr,  /* sq_ass_item */
-    nullptr,  /* was_sq_ass_slice */
-    nullptr,  /* sq_contains (inherited) */
+    nullptr,       /* sq_length (inherited) */
+    &size_concat,  /* sq_concat */
+    &size_repeat,  /* sq_repeat */
+    nullptr,       /* sq_item (inherited) */
+    nullptr,       /* was_sq_slice */
+    nullptr,       /* sq_ass_item */
+    nullptr,       /* was_sq_ass_slice */
+    nullptr,       /* sq_contains (inherited) */
 };
 
 PyMappingMethods size_as_mapping = {
-    nullptr, /* mp_length (inherited) */
-    &wrap_tuple_result<decltype(tuple_subscript), tuple_subscript>, /* mp_subscript */
-    nullptr, /* mp_ass_subscript (immutable) */
+    nullptr,        /* mp_length (inherited) */
+    &size_subscript, /* mp_subscript */
+    nullptr,        /* mp_ass_subscript (immutable) */
 };
 
 PyObject* size_richcompare(PyObject* self, PyObject* other, int op) {
