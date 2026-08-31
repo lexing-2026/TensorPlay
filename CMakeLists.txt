@@ -960,6 +960,7 @@ pybind11_add_module(_C
     src/bindings/python/init.cpp
     src/bindings/python/DType.cpp
     src/bindings/python/Scalar.cpp
+    src/bindings/python/SymInt.cpp
     src/bindings/python/Device.cpp
     src/bindings/python/Size.cpp
     src/bindings/python/Generator.cpp

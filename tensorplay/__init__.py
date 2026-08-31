@@ -208,7 +208,8 @@ if not hasattr(_C, "_log_api_usage_once"):
     _C._log_api_usage_once = lambda *args, **kwargs: None
 
 from ._tensor import Tensor
-from ._C import (tensor, DType, Size, Scalar, Device, DeviceType,
+from ._C import (tensor, DType, Size, Scalar, SymInt, SymBool, SymFloat,
+                Device, DeviceType,
                 from_dlpack, to_dlpack, from_numpy, frombuffer, set_printoptions,
                 default_generator, manual_seed, seed, initial_seed, Generator,
                 get_rng_state, set_rng_state,
@@ -291,7 +292,8 @@ channels_last_3d = MemoryFormat.CHANNELS_LAST_3D
 
 
 __all__ = [
-    "Tensor", "tensor", "from_dlpack", "Scalar", "DeviceType", "device", "dtype", "Size",
+    "Tensor", "tensor", "from_dlpack", "Scalar", "SymInt", "SymBool", "SymFloat",
+    "DeviceType", "device", "dtype", "Size",
     "MemoryFormat", "contiguous_format", "preserve_format", "channels_last", "channels_last_3d",
     "uint8", "int8", "int16", "uint16", "uint32", "uint64", "int32", "int64",
     "float16", "bfloat16", "float32", "float64", "complex32", "complex64", "complex128", "bcomplex32", "bool",
