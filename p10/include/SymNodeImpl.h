@@ -79,6 +79,12 @@ public:
         return floordiv(other);
     }
     virtual SymNode mod(const SymNode& other);
+    virtual SymNode bitwise_and(const SymNode& other);
+    virtual SymNode bitwise_or(const SymNode& other);
+    virtual SymNode bitwise_xor(const SymNode& other);
+    virtual SymNode lshift(const SymNode& other);
+    virtual SymNode rshift(const SymNode& other);
+    virtual SymNode sym_xor(const SymNode& other);
 
     virtual SymNode eq(const SymNode& other);
     virtual SymNode ne(const SymNode& other);
@@ -89,7 +95,25 @@ public:
 
     virtual SymNode ceil();
     virtual SymNode floor();
+    virtual SymNode trunc();
+    virtual SymNode round();
+    virtual SymNode round(const SymNode& ndigits);
+    virtual SymNode pos();
+    virtual SymNode abs();
     virtual SymNode neg();
+    virtual SymNode is_integer();
+    virtual SymNode sym_int();
+    virtual SymNode sqrt();
+    virtual SymNode cos();
+    virtual SymNode cosh();
+    virtual SymNode sin();
+    virtual SymNode sinh();
+    virtual SymNode tan();
+    virtual SymNode tanh();
+    virtual SymNode asin();
+    virtual SymNode acos();
+    virtual SymNode atan();
+    virtual SymNode log2();
     virtual SymNode sym_min(const SymNode& other);
     virtual SymNode sym_max(const SymNode& other);
     virtual SymNode sym_or(const SymNode& other);

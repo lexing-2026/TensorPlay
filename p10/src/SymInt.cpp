@@ -33,6 +33,59 @@ int64_t checked_mul(int64_t left, int64_t right) {
     return static_cast<int64_t>(result);
 }
 
+int64_t checked_left_shift(int64_t left, int64_t right) {
+    TP_CHECK_VALUE(right >= 0,
+                   "symbolic integer shift count must be non-negative");
+    TP_CHECK_VALUE(right < 127,
+                   "symbolic integer shift count is too large");
+    const __int128 multiplier = static_cast<__int128>(1) << right;
+    const __int128 result = static_cast<__int128>(left) * multiplier;
+    TP_CHECK_VALUE(
+        result >= std::numeric_limits<int64_t>::min() &&
+            result <= std::numeric_limits<int64_t>::max(),
+        "symbolic integer left shift overflow");
+    return static_cast<int64_t>(result);
+}
+
+int64_t checked_right_shift(int64_t left, int64_t right) {
+    TP_CHECK_VALUE(right >= 0,
+                   "symbolic integer shift count must be non-negative");
+    if (right >= 63) return left < 0 ? -1 : 0;
+    const int64_t divisor = static_cast<int64_t>(1ULL << right);
+    int64_t quotient = left / divisor;
+    const int64_t remainder = left % divisor;
+    if (remainder != 0 && left < 0) --quotient;
+    return quotient;
+}
+
+int64_t bitwise_and(int64_t left, int64_t right) {
+    return static_cast<int64_t>(static_cast<uint64_t>(left) &
+                                static_cast<uint64_t>(right));
+}
+
+int64_t bitwise_or(int64_t left, int64_t right) {
+    return static_cast<int64_t>(static_cast<uint64_t>(left) |
+                                static_cast<uint64_t>(right));
+}
+
+int64_t bitwise_xor(int64_t left, int64_t right) {
+    return static_cast<int64_t>(static_cast<uint64_t>(left) ^
+                                static_cast<uint64_t>(right));
+}
+
+int64_t checked_pow(int64_t base, int64_t exponent) {
+    TP_CHECK_VALUE(exponent >= 0,
+                   "symbolic integer exponent must be non-negative");
+    int64_t result = 1;
+    uint64_t remaining = static_cast<uint64_t>(exponent);
+    while (remaining != 0) {
+        if (remaining & 1U) result = checked_mul(result, base);
+        remaining >>= 1U;
+        if (remaining != 0) base = checked_mul(base, base);
+    }
+    return result;
+}
+
 } // namespace
 
 SymInt::SymInt(int64_t value) : data_(value) {
@@ -161,6 +214,11 @@ SymInt SymInt::binary_slow(const SymInt& other, int operation) const {
         case 4: result = left->mod(right); break;
         case 5: result = left->sym_min(right); break;
         case 6: result = left->sym_max(right); break;
+        case 7: result = left->bitwise_and(right); break;
+        case 8: result = left->bitwise_or(right); break;
+        case 9: result = left->bitwise_xor(right); break;
+        case 10: result = left->lshift(right); break;
+        case 11: result = left->rshift(right); break;
         default: TP_THROW(RuntimeError, "unknown symbolic integer operation");
     }
     return SymInt(std::move(result));
@@ -235,6 +293,51 @@ SymInt SymInt::operator%(const SymInt& other) const {
     return binary_slow(other, 4);
 }
 
+SymInt SymInt::operator&(const SymInt& other) const {
+    if (auto left = maybe_as_int()) {
+        if (auto right = other.maybe_as_int()) {
+            return SymInt(bitwise_and(*left, *right));
+        }
+    }
+    return binary_slow(other, 7);
+}
+
+SymInt SymInt::operator|(const SymInt& other) const {
+    if (auto left = maybe_as_int()) {
+        if (auto right = other.maybe_as_int()) {
+            return SymInt(bitwise_or(*left, *right));
+        }
+    }
+    return binary_slow(other, 8);
+}
+
+SymInt SymInt::operator^(const SymInt& other) const {
+    if (auto left = maybe_as_int()) {
+        if (auto right = other.maybe_as_int()) {
+            return SymInt(bitwise_xor(*left, *right));
+        }
+    }
+    return binary_slow(other, 9);
+}
+
+SymInt SymInt::operator<<(const SymInt& other) const {
+    if (auto left = maybe_as_int()) {
+        if (auto right = other.maybe_as_int()) {
+            return SymInt(checked_left_shift(*left, *right));
+        }
+    }
+    return binary_slow(other, 10);
+}
+
+SymInt SymInt::operator>>(const SymInt& other) const {
+    if (auto left = maybe_as_int()) {
+        if (auto right = other.maybe_as_int()) {
+            return SymInt(checked_right_shift(*left, *right));
+        }
+    }
+    return binary_slow(other, 11);
+}
+
 void SymInt::operator+=(const SymInt& other) { *this = *this + other; }
 void SymInt::operator-=(const SymInt& other) { *this = *this - other; }
 void SymInt::operator*=(const SymInt& other) { *this = *this * other; }
@@ -299,6 +402,47 @@ SymInt SymInt::max(const SymInt& other) const {
         if (auto right = other.maybe_as_int()) return SymInt(std::max(*left, *right));
     }
     return binary_slow(other, 6);
+}
+
+SymInt SymInt::pow_by_natural(const SymInt& exponent) const {
+    if (auto value = exponent.maybe_as_int()) {
+        TP_CHECK_VALUE(*value >= 0,
+                       "symbolic integer exponent must be non-negative");
+        if (auto base = maybe_as_int()) return SymInt(checked_pow(*base, *value));
+    } else {
+        TP_CHECK(exponent.sym_ge(SymInt(0)).expect_true(__FILE__, __LINE__),
+                 "symbolic integer exponent must be non-negative");
+    }
+
+    SymNode left;
+    SymNode right;
+    if (!maybe_as_int()) left = toSymNode();
+    if (!exponent.maybe_as_int()) right = exponent.toSymNode();
+    SymNodeImpl* base = left ? left.get() : right.get();
+    TP_CHECK(base != nullptr, "at least one symbolic integer is required");
+    if (!left) left = base->wrap_int(*maybe_as_int());
+    if (!right) right = base->wrap_int(*exponent.maybe_as_int());
+    return SymInt(left->pow_by_natural(right));
+}
+
+SymInt SymInt::ceil() const {
+    return clone();
+}
+
+SymInt SymInt::floor() const {
+    return clone();
+}
+
+SymInt SymInt::trunc() const {
+    return clone();
+}
+
+SymInt SymInt::round() const {
+    return clone();
+}
+
+SymFloat SymInt::sym_float() const {
+    return static_cast<SymFloat>(*this);
 }
 
 bool SymInt::is_same(const SymInt& other) const {

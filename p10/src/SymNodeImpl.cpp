@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <numeric>
 #include <sstream>
@@ -21,6 +22,11 @@ enum class ExprOp : uint8_t {
     FloorDiv,
     Mod,
     Pow,
+    BitwiseAnd,
+    BitwiseOr,
+    BitwiseXor,
+    LShift,
+    RShift,
     Eq,
     Ne,
     Gt,
@@ -29,14 +35,33 @@ enum class ExprOp : uint8_t {
     Ge,
     Ceil,
     Floor,
+    Trunc,
+    Round,
+    RoundDecimal,
+    IsInteger,
+    Pos,
+    Abs,
     Neg,
     Min,
     Max,
     Or,
     And,
+    Xor,
     Not,
     Ite,
     ToFloat,
+    ToInt,
+    Sqrt,
+    Cos,
+    Cosh,
+    Sin,
+    Sinh,
+    Tan,
+    Tanh,
+    Asin,
+    Acos,
+    Atan,
+    Log2,
     Contiguous,
     ChannelsLastContiguous2d,
     ChannelsLastContiguous3d,
@@ -56,6 +81,11 @@ const char* op_name(ExprOp op) {
         case ExprOp::FloorDiv: return "//";
         case ExprOp::Mod: return "%";
         case ExprOp::Pow: return "**";
+        case ExprOp::BitwiseAnd: return "&";
+        case ExprOp::BitwiseOr: return "|";
+        case ExprOp::BitwiseXor: return "^";
+        case ExprOp::LShift: return "<<";
+        case ExprOp::RShift: return ">>";
         case ExprOp::Eq: return "==";
         case ExprOp::Ne: return "!=";
         case ExprOp::Gt: return ">";
@@ -66,8 +96,28 @@ const char* op_name(ExprOp op) {
         case ExprOp::Max: return "max";
         case ExprOp::Or: return "|";
         case ExprOp::And: return "&";
+        case ExprOp::Xor: return "^";
+        case ExprOp::Not: return "not";
+        case ExprOp::Pos: return "+";
+        case ExprOp::Abs: return "abs";
+        case ExprOp::Trunc: return "trunc";
+        case ExprOp::Round:
+        case ExprOp::RoundDecimal: return "round";
+        case ExprOp::IsInteger: return "is_integer";
+        case ExprOp::Sqrt: return "sqrt";
+        case ExprOp::Cos: return "cos";
+        case ExprOp::Cosh: return "cosh";
+        case ExprOp::Sin: return "sin";
+        case ExprOp::Sinh: return "sinh";
+        case ExprOp::Tan: return "tan";
+        case ExprOp::Tanh: return "tanh";
+        case ExprOp::Asin: return "asin";
+        case ExprOp::Acos: return "acos";
+        case ExprOp::Atan: return "atan";
         case ExprOp::Ite: return "ite";
         case ExprOp::ToFloat: return "float";
+        case ExprOp::ToInt: return "int";
+        case ExprOp::Log2: return "log2";
         default: return "?";
     }
 }
@@ -187,6 +237,107 @@ int64_t checked_pow(int64_t base, int64_t exponent) {
     return result;
 }
 
+int64_t checked_float_to_int(double value, const char* operation) {
+    TP_CHECK_VALUE(std::isfinite(value), operation, " requires a finite value");
+    const long double truncated = std::trunc(static_cast<long double>(value));
+    TP_CHECK_VALUE(
+        truncated >= static_cast<long double>(std::numeric_limits<int64_t>::min()) &&
+            truncated <= static_cast<long double>(std::numeric_limits<int64_t>::max()),
+        operation,
+        " result is outside the representable integer range");
+    return static_cast<int64_t>(truncated);
+}
+
+int64_t bits_to_int(uint64_t value) {
+    int64_t result;
+    std::memcpy(&result, &value, sizeof(result));
+    return result;
+}
+
+int64_t checked_left_shift(int64_t left, int64_t right) {
+    TP_CHECK_VALUE(right >= 0, "symbolic integer shift count must be non-negative");
+    TP_CHECK_VALUE(right < 127, "symbolic integer shift count is too large");
+    const __int128 multiplier = static_cast<__int128>(1) << right;
+    const __int128 result = static_cast<__int128>(left) * multiplier;
+    TP_CHECK_VALUE(
+        result >= std::numeric_limits<int64_t>::min() &&
+            result <= std::numeric_limits<int64_t>::max(),
+        "symbolic integer left shift overflow");
+    return static_cast<int64_t>(result);
+}
+
+int64_t checked_right_shift(int64_t left, int64_t right) {
+    TP_CHECK_VALUE(right >= 0, "symbolic integer shift count must be non-negative");
+    if (right >= 63) return left < 0 ? -1 : 0;
+    const int64_t divisor = static_cast<int64_t>(1ULL << right);
+    return floor_divide(left, divisor);
+}
+
+double round_even(double value) {
+    if (!std::isfinite(value)) return value;
+    const double lower = std::floor(value);
+    const double fraction = value - lower;
+    if (fraction < 0.5) return lower;
+    if (fraction > 0.5) return lower + 1.0;
+    return std::fmod(std::fabs(lower), 2.0) == 0.0 ? lower : lower + 1.0;
+}
+
+double round_decimal(double value, int64_t ndigits) {
+    if (!std::isfinite(value) || ndigits > 308 || ndigits < -323) {
+        return value;
+    }
+    if (ndigits >= 0) {
+        const double scale = std::pow(10.0, static_cast<double>(ndigits));
+        if (!std::isfinite(scale) || scale == 0.0) return value;
+        return round_even(value * scale) / scale;
+    }
+    const double scale = std::pow(10.0, static_cast<double>(-ndigits));
+    if (!std::isfinite(scale) || scale == 0.0) return value;
+    return round_even(value / scale) * scale;
+}
+
+bool is_numeric_value(const Value& value) {
+    return value.index() == 0 || value.index() == 1 || value.index() == 2;
+}
+
+double numeric_as_double(const Value& value) {
+    if (value.index() == 0) return static_cast<double>(std::get<int64_t>(value));
+    if (value.index() == 1) return std::get<bool>(value) ? 1.0 : 0.0;
+    return std::get<double>(value);
+}
+
+long double numeric_as_long_double(const Value& value) {
+    if (value.index() == 0) {
+        return static_cast<long double>(std::get<int64_t>(value));
+    }
+    if (value.index() == 1) return std::get<bool>(value) ? 1.0L : 0.0L;
+    return static_cast<long double>(std::get<double>(value));
+}
+
+bool compare_values(const Value& left, const Value& right, ExprOp op) {
+    if (left.index() == 1 && right.index() == 1) {
+        const bool a = std::get<bool>(left);
+        const bool b = std::get<bool>(right);
+        switch (op) {
+            case ExprOp::Eq: return a == b;
+            case ExprOp::Ne: return a != b;
+            default: return false;
+        }
+    }
+    if (!is_numeric_value(left) || !is_numeric_value(right)) return false;
+    const long double a = numeric_as_long_double(left);
+    const long double b = numeric_as_long_double(right);
+    switch (op) {
+        case ExprOp::Eq: return a == b;
+        case ExprOp::Ne: return a != b;
+        case ExprOp::Gt: return a > b;
+        case ExprOp::Lt: return a < b;
+        case ExprOp::Le: return a <= b;
+        case ExprOp::Ge: return a >= b;
+        default: return false;
+    }
+}
+
 std::optional<Value> value_for(const SymNode& node, bool exact) {
     if (!node) return std::nullopt;
     if (node->is_int()) {
@@ -215,35 +366,55 @@ std::optional<Value> apply_scalar(ExprOp op,
         values.push_back(*value);
     }
 
-    auto int_value = [&](size_t index) {
-        return std::get<int64_t>(values[index]);
-    };
-    auto bool_value = [&](size_t index) {
-        return std::get<bool>(values[index]);
-    };
-    auto float_value = [&](size_t index) {
-        return std::get<double>(values[index]);
-    };
+    auto require_unary = [&]() { return inputs.size() == 1; };
+    auto require_binary = [&]() { return inputs.size() == 2; };
 
     if (result_type == SymNodeValueType::Integer) {
-        if ((op == ExprOp::Neg || op == ExprOp::Ceil ||
-             op == ExprOp::Floor) && inputs.size() != 1) {
+        if (op == ExprOp::Ceil || op == ExprOp::Floor ||
+            op == ExprOp::Trunc || op == ExprOp::Round || op == ExprOp::ToInt) {
+            if (!require_unary() || !is_numeric_value(values[0])) {
+                return std::nullopt;
+            }
+            if (values[0].index() == 0 &&
+                (op == ExprOp::Ceil || op == ExprOp::Floor ||
+                 op == ExprOp::Trunc || op == ExprOp::Round ||
+                 op == ExprOp::ToInt)) {
+                return values[0];
+            }
+            const double value = numeric_as_double(values[0]);
+            if (op == ExprOp::Ceil) {
+                return Value(checked_float_to_int(std::ceil(value), "ceil"));
+            }
+            if (op == ExprOp::Floor) {
+                return Value(checked_float_to_int(std::floor(value), "floor"));
+            }
+            if (op == ExprOp::Trunc || op == ExprOp::ToInt) {
+                return Value(checked_float_to_int(std::trunc(value), "trunc"));
+            }
+            return Value(checked_float_to_int(round_even(value), "round"));
+        }
+        if (op == ExprOp::Neg || op == ExprOp::Pos || op == ExprOp::Abs) {
+            if (!require_unary() || values[0].index() != 0) {
+                return std::nullopt;
+            }
+            const int64_t value = std::get<int64_t>(values[0]);
+            if (op == ExprOp::Neg) return Value(checked_neg(value));
+            if (op == ExprOp::Abs) {
+                return Value(value < 0 ? checked_neg(value) : value);
+            }
+            return Value(value);
+        }
+        if (!require_binary() || values[0].index() != 0 ||
+            values[1].index() != 0) {
             return std::nullopt;
         }
-        if (op != ExprOp::Neg && op != ExprOp::Ceil &&
-            op != ExprOp::Floor && inputs.size() != 2) {
-            return std::nullopt;
-        }
-        const int64_t left = int_value(0);
-        if (op == ExprOp::Neg) return Value(checked_neg(left));
-        if (op == ExprOp::Ceil || op == ExprOp::Floor) return Value(left);
-        if (op == ExprOp::ToFloat) return std::nullopt;
-        const int64_t right = int_value(1);
+        const int64_t left = std::get<int64_t>(values[0]);
+        const int64_t right = std::get<int64_t>(values[1]);
         switch (op) {
             case ExprOp::Add: return Value(checked_add(left, right));
             case ExprOp::Sub: return Value(checked_sub(left, right));
             case ExprOp::Mul: return Value(checked_mul(left, right));
-            case ExprOp::FloorDiv: return Value(floor_divide(left, right));
+            case ExprOp::FloorDiv:
             case ExprOp::TrueDiv: return Value(floor_divide(left, right));
             case ExprOp::Mod:
                 TP_CHECK_VALUE(right != 0, "symbolic integer remainder by zero");
@@ -251,93 +422,133 @@ std::optional<Value> apply_scalar(ExprOp op,
                                  right == -1),
                                "symbolic integer remainder overflow");
                 return Value(left % right);
-            case ExprOp::Pow: return Value(checked_pow(left, right));
+            case ExprOp::Pow:
+            case ExprOp::BitwiseAnd:
+            case ExprOp::BitwiseOr:
+            case ExprOp::BitwiseXor:
+            case ExprOp::LShift:
+            case ExprOp::RShift:
+                if (op == ExprOp::Pow) return Value(checked_pow(left, right));
+                if (op == ExprOp::BitwiseAnd) {
+                    return Value(bits_to_int(
+                        static_cast<uint64_t>(left) & static_cast<uint64_t>(right)));
+                }
+                if (op == ExprOp::BitwiseOr) {
+                    return Value(bits_to_int(
+                        static_cast<uint64_t>(left) | static_cast<uint64_t>(right)));
+                }
+                if (op == ExprOp::BitwiseXor) {
+                    return Value(bits_to_int(
+                        static_cast<uint64_t>(left) ^ static_cast<uint64_t>(right)));
+                }
+                if (op == ExprOp::LShift) return Value(checked_left_shift(left, right));
+                return Value(checked_right_shift(left, right));
             case ExprOp::Min: return Value(std::min(left, right));
             case ExprOp::Max: return Value(std::max(left, right));
-            default: break;
+            default: return std::nullopt;
         }
-    } else if (result_type == SymNodeValueType::Floating) {
-        if ((op == ExprOp::ToFloat || op == ExprOp::Neg ||
-             op == ExprOp::Ceil || op == ExprOp::Floor) && inputs.size() != 1) {
+    }
+
+    if (result_type == SymNodeValueType::Floating) {
+        const bool unary = op == ExprOp::ToFloat || op == ExprOp::Neg ||
+            op == ExprOp::Pos || op == ExprOp::Abs || op == ExprOp::Sqrt ||
+            op == ExprOp::Cos || op == ExprOp::Cosh || op == ExprOp::Sin ||
+            op == ExprOp::Sinh || op == ExprOp::Tan || op == ExprOp::Tanh ||
+            op == ExprOp::Asin || op == ExprOp::Acos || op == ExprOp::Atan ||
+            op == ExprOp::Log2;
+        if (unary) {
+            if (!require_unary() || !is_numeric_value(values[0])) {
+                return std::nullopt;
+            }
+            const double value = numeric_as_double(values[0]);
+            switch (op) {
+                case ExprOp::ToFloat: return Value(value);
+                case ExprOp::Neg: return Value(-value);
+                case ExprOp::Pos: return Value(value);
+                case ExprOp::Abs: return Value(std::fabs(value));
+                case ExprOp::Sqrt:
+                    TP_CHECK_VALUE(value >= 0.0, "sqrt domain error");
+                    return Value(std::sqrt(value));
+                case ExprOp::Cos: return Value(std::cos(value));
+                case ExprOp::Cosh: return Value(std::cosh(value));
+                case ExprOp::Sin: return Value(std::sin(value));
+                case ExprOp::Sinh: return Value(std::sinh(value));
+                case ExprOp::Tan: return Value(std::tan(value));
+                case ExprOp::Tanh: return Value(std::tanh(value));
+                case ExprOp::Asin:
+                    TP_CHECK_VALUE(value >= -1.0 && value <= 1.0,
+                                   "asin domain error");
+                    return Value(std::asin(value));
+                case ExprOp::Acos:
+                    TP_CHECK_VALUE(value >= -1.0 && value <= 1.0,
+                                   "acos domain error");
+                    return Value(std::acos(value));
+                case ExprOp::Atan: return Value(std::atan(value));
+                case ExprOp::Log2:
+                    TP_CHECK_VALUE(value > 0.0, "log2 domain error");
+                    return Value(std::log2(value));
+                default: return std::nullopt;
+            }
+        }
+        if (!require_binary() || !is_numeric_value(values[0]) ||
+            !is_numeric_value(values[1])) {
             return std::nullopt;
         }
-        if (op != ExprOp::ToFloat && op != ExprOp::Neg &&
-            op != ExprOp::Ceil && op != ExprOp::Floor && inputs.size() != 2) {
-            return std::nullopt;
-        }
-        const double left = op == ExprOp::ToFloat
-            ? (values[0].index() == 0
-                   ? static_cast<double>(std::get<int64_t>(values[0]))
-                   : float_value(0))
-            : float_value(0);
-        if (op == ExprOp::Neg) return Value(-left);
-        if (op == ExprOp::Ceil) return Value(std::ceil(left));
-        if (op == ExprOp::Floor) return Value(std::floor(left));
-        if (op == ExprOp::ToFloat) return Value(left);
-        const double right = float_value(1);
+        const double left = numeric_as_double(values[0]);
+        const double right = numeric_as_double(values[1]);
         switch (op) {
             case ExprOp::Add: return Value(left + right);
             case ExprOp::Sub: return Value(left - right);
             case ExprOp::Mul: return Value(left * right);
-            case ExprOp::TrueDiv: return Value(left / right);
+            case ExprOp::TrueDiv:
+            case ExprOp::FloorDiv:
+                TP_CHECK_VALUE(right != 0.0, "symbolic floating division by zero");
+                if (op == ExprOp::FloorDiv) return Value(std::floor(left / right));
+                return Value(left / right);
+            case ExprOp::Mod: {
+                TP_CHECK_VALUE(right != 0.0, "symbolic floating remainder by zero");
+                double result = std::fmod(left, right);
+                if (result != 0.0 && ((result < 0.0) != (right < 0.0))) {
+                    result += right;
+                }
+                return Value(result);
+            }
             case ExprOp::Pow: return Value(std::pow(left, right));
             case ExprOp::Min: return Value(std::min(left, right));
             case ExprOp::Max: return Value(std::max(left, right));
-            default: break;
+            case ExprOp::RoundDecimal:
+                if (values[1].index() != 0) return std::nullopt;
+                return Value(round_decimal(
+                    left, std::get<int64_t>(values[1])));
+            default: return std::nullopt;
         }
-    } else if (result_type == SymNodeValueType::Boolean &&
-               (op == ExprOp::Not || op == ExprOp::And || op == ExprOp::Or)) {
-        if ((op == ExprOp::Not && inputs.size() != 1) ||
-            (op != ExprOp::Not && inputs.size() != 2)) {
-            return std::nullopt;
-        }
-        const bool left = bool_value(0);
-        if (op == ExprOp::Not) return Value(!left);
-        const bool right = bool_value(1);
-        if (op == ExprOp::And) return Value(left && right);
-        if (op == ExprOp::Or) return Value(left || right);
     }
 
     if (result_type == SymNodeValueType::Boolean) {
-        const bool result = [&]() {
-            if (inputs.size() < 2) return false;
-            const Value& left = values[0];
-            const Value& right = values[1];
-            if (left.index() == 0 && right.index() == 0) {
-                const auto a = std::get<int64_t>(left);
-                const auto b = std::get<int64_t>(right);
-                switch (op) {
-                    case ExprOp::Eq: return a == b;
-                    case ExprOp::Ne: return a != b;
-                    case ExprOp::Gt: return a > b;
-                    case ExprOp::Lt: return a < b;
-                    case ExprOp::Le: return a <= b;
-                    case ExprOp::Ge: return a >= b;
-                    default: return false;
-                }
+        if (op == ExprOp::Not || op == ExprOp::IsInteger) {
+            if (!require_unary()) return std::nullopt;
+            if (op == ExprOp::Not) {
+                if (values[0].index() != 1) return std::nullopt;
+                return Value(!std::get<bool>(values[0]));
             }
-            if (left.index() == 1 && right.index() == 1) {
-                const auto a = std::get<bool>(left);
-                const auto b = std::get<bool>(right);
-                switch (op) {
-                    case ExprOp::Eq: return a == b;
-                    case ExprOp::Ne: return a != b;
-                    default: return false;
-                }
+            if (!is_numeric_value(values[0])) return std::nullopt;
+            if (values[0].index() != 2) return Value(true);
+            const double value = std::get<double>(values[0]);
+            return Value(std::isfinite(value) && std::trunc(value) == value);
+        }
+        if (op == ExprOp::And || op == ExprOp::Or || op == ExprOp::Xor) {
+            if (!require_binary() || values[0].index() != 1 ||
+                values[1].index() != 1) {
+                return std::nullopt;
             }
-            const auto a = std::get<double>(left);
-            const auto b = std::get<double>(right);
-            switch (op) {
-                case ExprOp::Eq: return a == b;
-                case ExprOp::Ne: return a != b;
-                case ExprOp::Gt: return a > b;
-                case ExprOp::Lt: return a < b;
-                case ExprOp::Le: return a <= b;
-                case ExprOp::Ge: return a >= b;
-                default: return false;
-            }
-        }();
-        return Value(result);
+            const bool left = std::get<bool>(values[0]);
+            const bool right = std::get<bool>(values[1]);
+            if (op == ExprOp::And) return Value(left && right);
+            if (op == ExprOp::Or) return Value(left || right);
+            return Value(left != right);
+        }
+        if (!require_binary()) return std::nullopt;
+        return Value(compare_values(values[0], values[1], op));
     }
     return std::nullopt;
 }
@@ -554,28 +765,57 @@ public:
         return binary(ExprOp::TrueDiv, other, type_);
     }
     SymNode float_truediv(const SymNode& other) override {
-        return binary(ExprOp::TrueDiv, other, type_);
+        return binary(ExprOp::TrueDiv, other, SymNodeValueType::Floating,
+                      SymNodeValueType::Floating);
     }
     SymNode int_truediv(const SymNode& other) override {
-        return binary(ExprOp::FloorDiv, other, type_);
+        return binary(ExprOp::TrueDiv, other, SymNodeValueType::Floating,
+                      SymNodeValueType::Integer);
     }
     SymNode pow(const SymNode& other) override {
         return binary(ExprOp::Pow, other, type_);
     }
     SymNode float_pow(const SymNode& other) override {
-        return binary(ExprOp::Pow, other, type_);
+        return binary(ExprOp::Pow, other, SymNodeValueType::Floating,
+                      SymNodeValueType::Floating);
     }
     SymNode pow_by_natural(const SymNode& other) override {
-        return binary(ExprOp::Pow, other, type_);
+        return binary(ExprOp::Pow, other, SymNodeValueType::Integer,
+                      SymNodeValueType::Integer);
     }
     SymNode floordiv(const SymNode& other) override {
         return binary(ExprOp::FloorDiv, other, type_);
     }
     SymNode int_floordiv(const SymNode& other) override {
-        return binary(ExprOp::FloorDiv, other, type_);
+        return binary(ExprOp::FloorDiv, other, SymNodeValueType::Integer,
+                      SymNodeValueType::Integer);
     }
     SymNode mod(const SymNode& other) override {
         return binary(ExprOp::Mod, other, type_);
+    }
+    SymNode bitwise_and(const SymNode& other) override {
+        return binary(ExprOp::BitwiseAnd, other, SymNodeValueType::Integer,
+                      SymNodeValueType::Integer);
+    }
+    SymNode bitwise_or(const SymNode& other) override {
+        return binary(ExprOp::BitwiseOr, other, SymNodeValueType::Integer,
+                      SymNodeValueType::Integer);
+    }
+    SymNode bitwise_xor(const SymNode& other) override {
+        return binary(ExprOp::BitwiseXor, other, SymNodeValueType::Integer,
+                      SymNodeValueType::Integer);
+    }
+    SymNode lshift(const SymNode& other) override {
+        return binary(ExprOp::LShift, other, SymNodeValueType::Integer,
+                      SymNodeValueType::Integer);
+    }
+    SymNode rshift(const SymNode& other) override {
+        return binary(ExprOp::RShift, other, SymNodeValueType::Integer,
+                      SymNodeValueType::Integer);
+    }
+    SymNode sym_xor(const SymNode& other) override {
+        return binary(ExprOp::Xor, other, SymNodeValueType::Boolean,
+                      SymNodeValueType::Boolean);
     }
 
     SymNode eq(const SymNode& other) override {
@@ -597,9 +837,73 @@ public:
         return binary(ExprOp::Ge, other, SymNodeValueType::Boolean);
     }
 
-    SymNode ceil() override { return unary(ExprOp::Ceil, type_); }
-    SymNode floor() override { return unary(ExprOp::Floor, type_); }
+    SymNode ceil() override {
+        return unary(ExprOp::Ceil, SymNodeValueType::Integer);
+    }
+    SymNode floor() override {
+        return unary(ExprOp::Floor, SymNodeValueType::Integer);
+    }
+    SymNode trunc() override {
+        return unary(ExprOp::Trunc, SymNodeValueType::Integer);
+    }
+    SymNode round() override {
+        return unary(ExprOp::Round, SymNodeValueType::Integer);
+    }
+    SymNode round(const SymNode& ndigits) override {
+        TP_CHECK_TYPE(ndigits && ndigits->is_int(),
+                      "round precision must be a symbolic integer");
+        if (type_ == SymNodeValueType::Integer) {
+            return SymNode::reclaim_copy(this);
+        }
+        return binary(ExprOp::RoundDecimal, ndigits,
+                      SymNodeValueType::Floating,
+                      SymNodeValueType::Integer);
+    }
+    SymNode pos() override { return unary(ExprOp::Pos, type_); }
+    SymNode abs() override { return unary(ExprOp::Abs, type_); }
     SymNode neg() override { return unary(ExprOp::Neg, type_); }
+    SymNode is_integer() override {
+        return unary(ExprOp::IsInteger, SymNodeValueType::Boolean);
+    }
+    SymNode sym_int() override {
+        if (type_ == SymNodeValueType::Integer) {
+            return SymNode::reclaim_copy(this);
+        }
+        return unary(ExprOp::ToInt, SymNodeValueType::Integer);
+    }
+    SymNode sqrt() override {
+        return unary(ExprOp::Sqrt, SymNodeValueType::Floating);
+    }
+    SymNode cos() override {
+        return unary(ExprOp::Cos, SymNodeValueType::Floating);
+    }
+    SymNode cosh() override {
+        return unary(ExprOp::Cosh, SymNodeValueType::Floating);
+    }
+    SymNode sin() override {
+        return unary(ExprOp::Sin, SymNodeValueType::Floating);
+    }
+    SymNode sinh() override {
+        return unary(ExprOp::Sinh, SymNodeValueType::Floating);
+    }
+    SymNode tan() override {
+        return unary(ExprOp::Tan, SymNodeValueType::Floating);
+    }
+    SymNode tanh() override {
+        return unary(ExprOp::Tanh, SymNodeValueType::Floating);
+    }
+    SymNode asin() override {
+        return unary(ExprOp::Asin, SymNodeValueType::Floating);
+    }
+    SymNode acos() override {
+        return unary(ExprOp::Acos, SymNodeValueType::Floating);
+    }
+    SymNode atan() override {
+        return unary(ExprOp::Atan, SymNodeValueType::Floating);
+    }
+    SymNode log2() override {
+        return unary(ExprOp::Log2, SymNodeValueType::Floating);
+    }
     SymNode sym_min(const SymNode& other) override {
         return binary(ExprOp::Min, other, type_);
     }
@@ -629,11 +933,16 @@ public:
         auto type = then_value->value_type();
         auto exact_then = value_for(then_value, true);
         auto exact_else = value_for(else_value, true);
-        if (exact_then && exact_else) {
+        if (exact_then && exact_else && *exact_then == *exact_else) {
             return make_constant_value(type, *exact_then);
         }
+        std::optional<Value> hint;
+        if (auto condition_hint = hinted_value<bool>(inputs[0])) {
+            hint = value_for(
+                inputs[*condition_hint ? 1 : 2], false);
+        }
         return SymNode::reclaim(new ExpressionSymNode(
-            type, ExprOp::Ite, std::move(inputs), {}, 0, std::nullopt));
+            type, ExprOp::Ite, std::move(inputs), {}, 0, std::move(hint)));
     }
 
     SymNode is_contiguous(const std::vector<SymNode>& sizes,
@@ -676,10 +985,14 @@ public:
         if (type_ == SymNodeValueType::Floating) {
             return SymNode::reclaim_copy(this);
         }
-        TP_CHECK_TYPE(type_ == SymNodeValueType::Integer,
-                      "only symbolic integers can convert to symbolic floats");
+        TP_CHECK_TYPE(type_ == SymNodeValueType::Integer ||
+                          type_ == SymNodeValueType::Boolean,
+                      "only numeric symbolic values can convert to symbolic floats");
         if (auto value = constant_int()) {
             return make_constant_float(static_cast<double>(*value));
+        }
+        if (auto value = constant_bool()) {
+            return make_constant_float(*value ? 1.0 : 0.0);
         }
         return unary(ExprOp::ToFloat, SymNodeValueType::Floating);
     }
@@ -804,8 +1117,12 @@ private:
         TP_THROW(RuntimeError, "unknown symbolic value type");
     }
 
-    SymNode binary(ExprOp op, const SymNode& other, SymNodeValueType result_type) {
-        TP_CHECK_TYPE(other && other->value_type() == type_,
+    SymNode binary(ExprOp op,
+                   const SymNode& other,
+                   SymNodeValueType result_type,
+                   std::optional<SymNodeValueType> expected_other = std::nullopt) {
+        const SymNodeValueType other_type = expected_other.value_or(type_);
+        TP_CHECK_TYPE(other && other->value_type() == other_type,
                       "symbolic operands must have the same type");
         std::vector<SymNode> inputs = {SymNode::reclaim_copy(this), other};
         if (other.get() == this && result_type == SymNodeValueType::Boolean) {
@@ -1028,6 +1345,12 @@ TP_SYM_UNSUPPORTED(truediv(const SymNode&));
 TP_SYM_UNSUPPORTED(pow(const SymNode&));
 TP_SYM_UNSUPPORTED(floordiv(const SymNode&));
 TP_SYM_UNSUPPORTED(mod(const SymNode&));
+TP_SYM_UNSUPPORTED(bitwise_and(const SymNode&));
+TP_SYM_UNSUPPORTED(bitwise_or(const SymNode&));
+TP_SYM_UNSUPPORTED(bitwise_xor(const SymNode&));
+TP_SYM_UNSUPPORTED(lshift(const SymNode&));
+TP_SYM_UNSUPPORTED(rshift(const SymNode&));
+TP_SYM_UNSUPPORTED(sym_xor(const SymNode&));
 TP_SYM_UNSUPPORTED(eq(const SymNode&));
 TP_SYM_UNSUPPORTED(ne(const SymNode&));
 TP_SYM_UNSUPPORTED(gt(const SymNode&));
@@ -1036,7 +1359,25 @@ TP_SYM_UNSUPPORTED(le(const SymNode&));
 TP_SYM_UNSUPPORTED(ge(const SymNode&));
 TP_SYM_UNSUPPORTED(ceil());
 TP_SYM_UNSUPPORTED(floor());
+TP_SYM_UNSUPPORTED(trunc());
+TP_SYM_UNSUPPORTED(round());
+TP_SYM_UNSUPPORTED(round(const SymNode&));
+TP_SYM_UNSUPPORTED(pos());
+TP_SYM_UNSUPPORTED(abs());
 TP_SYM_UNSUPPORTED(neg());
+TP_SYM_UNSUPPORTED(is_integer());
+TP_SYM_UNSUPPORTED(sym_int());
+TP_SYM_UNSUPPORTED(sqrt());
+TP_SYM_UNSUPPORTED(cos());
+TP_SYM_UNSUPPORTED(cosh());
+TP_SYM_UNSUPPORTED(sin());
+TP_SYM_UNSUPPORTED(sinh());
+TP_SYM_UNSUPPORTED(tan());
+TP_SYM_UNSUPPORTED(tanh());
+TP_SYM_UNSUPPORTED(asin());
+TP_SYM_UNSUPPORTED(acos());
+TP_SYM_UNSUPPORTED(atan());
+TP_SYM_UNSUPPORTED(log2());
 TP_SYM_UNSUPPORTED(sym_min(const SymNode&));
 TP_SYM_UNSUPPORTED(sym_max(const SymNode&));
 TP_SYM_UNSUPPORTED(sym_or(const SymNode&));

@@ -12,6 +12,8 @@
 
 namespace tensorplay {
 
+class SymInt;
+
 class P10_API SymFloat {
 public:
     SymFloat() noexcept : data_(0.0) {}
@@ -39,7 +41,19 @@ public:
     SymFloat operator-(const SymFloat& other) const;
     SymFloat operator*(const SymFloat& other) const;
     SymFloat operator/(const SymFloat& other) const;
+    SymFloat operator%(const SymFloat& other) const;
     SymFloat operator-() const;
+    SymFloat operator+() const;
+    SymFloat abs() const;
+    SymFloat pow(const SymFloat& exponent) const;
+    SymFloat floor_div(const SymFloat& other) const;
+    SymInt ceil() const;
+    SymInt floor() const;
+    SymInt trunc() const;
+    SymInt round() const;
+    SymFloat round(const SymInt& ndigits) const;
+    SymBool is_integer() const;
+    SymInt sym_int() const;
 
     SymBool sym_eq(const SymFloat& other) const;
     SymBool sym_ne(const SymFloat& other) const;
@@ -70,6 +84,16 @@ public:
     SymFloat min(const SymFloat& other) const;
     SymFloat max(const SymFloat& other) const;
     SymFloat sqrt() const;
+    SymFloat cos() const;
+    SymFloat cosh() const;
+    SymFloat sin() const;
+    SymFloat sinh() const;
+    SymFloat tan() const;
+    SymFloat tanh() const;
+    SymFloat asin() const;
+    SymFloat acos() const;
+    SymFloat atan() const;
+    SymFloat log2() const;
     double guard_float(const char* file, int64_t line) const;
 
 private:
