@@ -22,6 +22,7 @@ keywords = ["deep learning", "neural network", "tensor", "framework", "education
 requires-python = ">=3.9,<3.14"
 dependencies = [
     "numpy>=2.0.0",
+    "sympy>=1.13.3",
     "typing-extensions>=4.0.0",
     "PyYAML"
 ]
@@ -102,7 +103,7 @@ exclude = [
     "**/.github/**",
     "build/**",
     ".codegraph/**",
-    "third_party/pytorch/**",
+    "third_party/pyt[oa]rch/**",
     "third_party/audio/**",
 ]
 
@@ -139,6 +140,7 @@ dev = [
     # Rerun flaky tests locally: pytest --reruns 2 (see CONTRIBUTING.md).
     "pytest-rerunfailures",
     "numpy>=2.0.0",
+    "sympy>=1.13.3",
     "typing-extensions>=4.0.0",
     # Conventional Commits tooling: cz changelog drafts only; versions follow
     "commitizen",
