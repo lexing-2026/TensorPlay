@@ -580,7 +580,7 @@
     :toctree: generated
     :nosignatures:
 
-    tensorplay.compiler.api.compile
+    tensorplay._stax.api.compile
 ```
 
 ## TensorPlay-specific additions

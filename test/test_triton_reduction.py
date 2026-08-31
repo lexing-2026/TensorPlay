@@ -7,7 +7,7 @@ real sm_70+ CUDA device (the local CI box has neither).
 
 import tensorplay as tp
 import pytest
-from tensorplay.compiler.codegen.triton import (
+from tensorplay._stax.codegen.triton import (
     _SINGLE_BLOCK_MAX,
     ReductionSpec,
     _broadcast_reference_shape,
@@ -157,7 +157,7 @@ def test_scalar_input_loads_once():
 # --- numeric checks (GPU-gated) ---------------------------------------------------
 
 
-def _run_parity(fn, args):
+def _run_reference(fn, args):
     """Compile through the default stax pipeline and compare with eager.
 
     Also asserts the Triton lowering was actually selected (via the
@@ -165,7 +165,7 @@ def _run_parity(fn, args):
     check alone would silently pass on the interpreted fallback.
     """
 
-    from tensorplay.compiler import compile
+    from tensorplay._stax import compile
 
     eager = fn(*args)
     optimized = compile(fn, backend="stax")
@@ -187,7 +187,7 @@ def test_sum_epilogue_small_matches_eager():
     def fn(x, w):
         return ((x * w).relu()).sum()
 
-    _run_parity(fn, (x, w))
+    _run_reference(fn, (x, w))
 
 
 @pytest.mark.skipif(not runtime_available(), reason="Triton/CUDA unavailable")
@@ -198,7 +198,7 @@ def test_sum_epilogue_large_matches_eager():
     def fn(x, w):
         return ((x * w - 0.25).sigmoid()).sum()
 
-    _run_parity(fn, (x, w))
+    _run_reference(fn, (x, w))
 
 
 @pytest.mark.skipif(not runtime_available(), reason="Triton/CUDA unavailable")
@@ -209,7 +209,7 @@ def test_pointwise_with_broadcast_bias_matches_eager():
     def fn(x, b):
         return (x + b).relu()
 
-    _run_parity(fn, (x, b))
+    _run_reference(fn, (x, b))
 
 
 @pytest.mark.skipif(not runtime_available(), reason="Triton/CUDA unavailable")
@@ -220,14 +220,14 @@ def test_sum_epilogue_over_broadcast_chain_matches_eager():
     def fn(x, b):
         return ((x + b).square()).sum()
 
-    _run_parity(fn, (x, b))
+    _run_reference(fn, (x, b))
 
 
 # --- M5b: axis reductions (sum/mean/amax over dims) ------------------------------
 
 
 def _trace(fn, *args):
-    from tensorplay.compiler.graph import Tracer
+    from tensorplay.graph import Tracer
 
     sample = {name: value for name, value in zip(("x", "w"), args)}
     return Tracer().trace(fn, sample_inputs=sample)
@@ -264,7 +264,7 @@ def test_axis_reduction_detection():
 
 
 def test_legacy_sum_entry_point_still_works():
-    from tensorplay.compiler.codegen.triton import _split_sum_epilogue
+    from tensorplay._stax.codegen.triton import _split_sum_epilogue
 
     x = tp.tensor([1.0, 2.0])
     detected = _split_sum_epilogue(_trace(lambda t: (t * 2.0).sum(), x))
@@ -376,7 +376,7 @@ def test_axis_sum_matches_eager():
     def fn(x):
         return ((x * 2.0).sigmoid()).sum(dim=1)
 
-    _run_parity(fn, (x,))
+    _run_reference(fn, (x,))
 
 
 @pytest.mark.skipif(not runtime_available(), reason="Triton/CUDA unavailable")
@@ -389,8 +389,8 @@ def test_axis_mean_and_amax_match_eager():
     def amax_fn(x):
         return (x * 3.0).amax(dim=-1, keepdim=True)
 
-    _run_parity(mean_fn, (x,))
-    _run_parity(amax_fn, (x,))
+    _run_reference(mean_fn, (x,))
+    _run_reference(amax_fn, (x,))
 
 
 # --- M5b closure: argmax dual-stream index reduction ------------------------------
@@ -488,7 +488,7 @@ def test_axis_argmax_matches_eager():
     def fn(x):
         return ((x * 2.0).sigmoid()).argmax(dim=1)
 
-    _run_parity(fn, (x,))
+    _run_reference(fn, (x,))
 
 
 @pytest.mark.skipif(not runtime_available(), reason="Triton/CUDA unavailable")
@@ -507,12 +507,12 @@ def test_axis_argmax_keepdim_and_ties_match_eager():
     def tie_fn(x, b):
         return ((x + b)).argmax(dim=2)
 
-    _run_parity(keepdim_fn, (x,))
+    _run_reference(keepdim_fn, (x,))
     # A broadcast producer feeding an AXIS reduction needs generalized
     # tile addressing (scheduler gate #19, M5d+); until then the whole
     # graph falls back to eager, which the check cannot attribute to Triton.
     pytest.xfail("broadcast producer + axis argmax waits for M5d indexing")
-    _run_parity(tie_fn, (x, b))
+    _run_reference(tie_fn, (x, b))
 
 
 @pytest.mark.skipif(not runtime_available(), reason="Triton/CUDA unavailable")
@@ -524,7 +524,7 @@ def test_axis_argmax_nan_matches_eager():
     def fn(x):
         return (x * 2.0).argmax(dim=1)
 
-    _run_parity(fn, (x,))
+    _run_reference(fn, (x,))
 
 
 @pytest.mark.skipif(not runtime_available(), reason="Triton/CUDA unavailable")
@@ -536,7 +536,7 @@ def test_two_segment_graph_matches_eager():
     def fn(x):
         return ((x * 2.0).sigmoid()).sum(dim=1) * 3.0 + 1.0
 
-    _run_parity(fn, (x,))
+    _run_reference(fn, (x,))
 
 
 @pytest.mark.skipif(not runtime_available(), reason="Triton/CUDA unavailable")
@@ -546,7 +546,7 @@ def test_scalar_chain_segments_match_eager():
     def fn(x):
         return ((x * x).relu().sum() + 1.0).sqrt()
 
-    _run_parity(fn, (x,))
+    _run_reference(fn, (x,))
 
 
 # --- M5e: red->pw store epilogue ---------------------------------------------------
@@ -653,7 +653,7 @@ def test_pw_red_pw_single_kernel_epilogue():
     def fn(x):
         return ((x * 2.0).relu()).sum(dim=1).sqrt()
 
-    from tensorplay.compiler import compile
+    from tensorplay._stax import compile
 
     eager = fn(x)
     optimized = compile(fn, backend="stax")
@@ -674,7 +674,7 @@ def test_full_reduction_scalar_chain_epilogue():
     def fn(x):
         return (x - 1.0).abs().sum() * 2.0 + 1.0
 
-    _run_parity(fn, (x,))
+    _run_reference(fn, (x,))
 
 
 @pytest.mark.skipif(not runtime_available(), reason="Triton/CUDA unavailable")
@@ -688,7 +688,7 @@ def test_two_segment_cross_kernel_wiring():
         s = (x * 2.0).sum(dim=1)
         return s.relu() * w.sum(dim=1)
 
-    _run_parity(fn, (x, w))
+    _run_reference(fn, (x, w))
 
 
 # --- persistent grid-stride split form ----------------------------------------------
@@ -757,7 +757,7 @@ def test_split_persistent_amax_uses_neutral_fill():
 
 
 def test_split_candidates_include_persistent():
-    from tensorplay.compiler.codegen.triton import _SPLIT_CANDIDATES
+    from tensorplay._stax.codegen.triton import _SPLIT_CANDIDATES
 
     assert any(len(c) > 2 for c in _SPLIT_CANDIDATES)
     assert any(len(c) == 2 for c in _SPLIT_CANDIDATES)
@@ -769,7 +769,7 @@ def test_all_split_candidates_compile_and_run():
     candidate die at first launch, and the tuner silently disqualified the
     whole family.  Each candidate must compile, launch and match eager."""
 
-    from tensorplay.compiler.codegen.triton import _compile_program, _SPLIT_CANDIDATES
+    from tensorplay._stax.codegen.triton import _compile_program, _SPLIT_CANDIDATES
 
     x = tp.rand(1 << 20, device="cuda")
     spec = ReductionSpec("sum")
@@ -791,7 +791,7 @@ def test_dims_rblock_candidates_run_and_match():
     num_stages=1024/2048 and died; they must now emit an RBLOCK override and
     produce eager-matching results."""
 
-    from tensorplay.compiler.codegen.triton import (
+    from tensorplay._stax.codegen.triton import (
         _compile_program,
         _DIM_REDUCTION_CANDIDATES,
     )
@@ -822,7 +822,7 @@ def test_dims_rblock_candidates_run_and_match():
 
 
 def _sum_split_launch(x, cfg=(2048, 8, 592)):
-    from tensorplay.compiler.codegen.triton import _compile_program
+    from tensorplay._stax.codegen.triton import _compile_program
 
     return _compile_program(
         [3, 0, -1], [2.0], (1,), [x],
@@ -837,7 +837,7 @@ def test_fast_launch_records_and_recomputes():
     ride the direct kernel.run fast path AND still recompute fresh results
     (no cached-output reuse, no stale workspace)."""
 
-    from tensorplay.compiler.runtime import fastlaunch
+    from tensorplay._stax.runtime import fastlaunch
 
     x = tp.rand(1 << 20, device="cuda")
     launch = _sum_split_launch(x)
@@ -861,7 +861,7 @@ def test_fast_launch_misaligned_input_falls_back():
     alignment-specialized binary: the guard fails, the normal dispatch
     re-specializes, and the result stays exact."""
 
-    from tensorplay.compiler.runtime import fastlaunch
+    from tensorplay._stax.runtime import fastlaunch
 
     base = tp.rand((1 << 20) + 8, device="cuda")
     x = base[1:]  # data_ptr % 16 == 4 for fp32
@@ -889,8 +889,8 @@ def test_fast_launch_misaligned_input_falls_back():
 def test_fast_launch_dims_and_single_paths():
     """Dims-reduction and single-block launchers record and replay too."""
 
-    from tensorplay.compiler.codegen.triton import _compile_program
-    from tensorplay.compiler.runtime import fastlaunch
+    from tensorplay._stax.codegen.triton import _compile_program
+    from tensorplay._stax.runtime import fastlaunch
 
     x = tp.rand(64, 4096, device="cuda")
     dims = _compile_program(
@@ -921,8 +921,8 @@ def test_fast_launch_dims_and_single_paths():
 
 @pytest.mark.skipif(not runtime_available(), reason="Triton/CUDA unavailable")
 def test_fast_launch_pointwise_path():
-    from tensorplay.compiler.codegen.triton import _compile_program
-    from tensorplay.compiler.runtime import fastlaunch
+    from tensorplay._stax.codegen.triton import _compile_program
+    from tensorplay._stax.runtime import fastlaunch
 
     x = tp.rand(4096, device="cuda")
     launch = _compile_program(

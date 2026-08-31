@@ -21,14 +21,13 @@ import numpy as np
 import tensorplay
 from tensorplay._C import DType
 from tensorplay.autograd.function import Function
+from tensorplay.graph import capture_call as _capture_call
 
 __all__ = [
     "absolute", "arccos", "arccosh", "arcsin", "arcsinh", "arctan",
     "arctanh", "arctan2",
     "acos_", "asin_", "atan_", "acosh_", "asinh_", "atanh_",
-    "concat", "concatenate", "ger", "rsub", "adjoint",
-    "divide", "multiply", "subtract", "true_divide", "floor_divide",
-    "remainder", "fmod", "clamp_max", "clamp_min", "copysign",
+    "concat", "concatenate", "ger", "adjoint",
     "detach", "diagflat", "numel", "scalar_tensor",
     "chain_matmul", "matrix_power", "kron", "vander",
     "tril_indices", "triu_indices", "cartesian_prod", "combinations",
@@ -210,110 +209,12 @@ def ger(input, vec2):
     return input.outer(vec2)
 
 
-def rsub(input, other, *, alpha=1):
-    if alpha != 1:
-        other = other * alpha
-    return _as_tensor(other) - input
-
-
 def adjoint(input):
     out = input.transpose(-2, -1)
     if input.dtype in (DType.complex64, DType.complex128,
                        DType.bcomplex32, DType.complex32):
         out = tensorplay.conj(out)
     return out
-
-
-def divide(input, other, *, rounding_mode=None, out=None):
-    if rounding_mode is not None:
-        raise NotImplementedError("divide(rounding_mode=) is not supported")
-    if isinstance(input, tensorplay.Tensor):
-        return input.div(other)
-    return _as_tensor(input).div(other)
-
-
-def multiply(input, other, *, out=None):
-    if isinstance(input, tensorplay.Tensor):
-        return input.mul(other)
-    return _as_tensor(input).mul(other)
-
-
-def subtract(input, other, *, alpha=1, out=None):
-    if isinstance(input, tensorplay.Tensor):
-        return input.sub(_as_tensor(other)) if alpha == 1 else \
-            input.sub(_as_tensor(other).mul(alpha))
-    return _as_tensor(input).sub(
-        _as_tensor(other) if alpha == 1 else _as_tensor(other).mul(alpha))
-
-
-def true_divide(input, other, *, rounding_mode=None, out=None):
-    return divide(input, other, rounding_mode=rounding_mode, out=out)
-
-
-def _true_quotient(input, other):
-    a = input if isinstance(input, tensorplay.Tensor) else \
-        _as_tensor(input)
-    b = other if isinstance(other, tensorplay.Tensor) else \
-        _as_tensor(other)
-    integral = a.dtype in _INT_DTYPES and b.dtype in _INT_DTYPES
-    if integral:
-        return a.to(DType.float64).div(b.to(DType.float64))
-    return a.div(b)
-
-
-def floor_divide(input, other, *, out=None):
-    q = _true_quotient(input, other).floor()
-    target = input.dtype if isinstance(input, tensorplay.Tensor) and \
-        input.dtype in _INT_DTYPES and isinstance(other, tensorplay.Tensor) \
-        and other.dtype in _INT_DTYPES else None
-    if target is not None:
-        return q.to(target)
-    return q
-
-
-def _int_pair_target(input, other):
-    # int counts as integral).
-    def _is_int(v):
-        if isinstance(v, tensorplay.Tensor):
-            return v.dtype in _INT_DTYPES
-        return isinstance(v, (int, np.integer)) and not isinstance(v, bool)
-    a_ok = _is_int(input)
-    b_ok = _is_int(other)
-    if a_ok and b_ok:
-        return input.dtype if isinstance(input, tensorplay.Tensor) else None
-    return None
-
-
-def remainder(input, other, *, out=None):
-    q = _true_quotient(input, other).floor()
-    prod = multiply(q, _as_tensor(other).to(q.dtype))
-    base = input if isinstance(input, tensorplay.Tensor) else _as_tensor(input)
-    res = base.to(prod.dtype).sub(prod)
-    target = _int_pair_target(input, other)
-    return res.to(target) if target is not None else res
-
-
-def fmod(input, other, *, out=None):
-    q = _true_quotient(input, other).trunc()
-    prod = multiply(q, _as_tensor(other).to(q.dtype))
-    base = input if isinstance(input, tensorplay.Tensor) else _as_tensor(input)
-    res = base.to(prod.dtype).sub(prod)
-    target = _int_pair_target(input, other)
-    return res.to(target) if target is not None else res
-
-
-def clamp_max(input, max):
-    return tensorplay.minimum(input, _as_tensor(max).to(input.dtype))
-
-
-def clamp_min(input, min):
-    return tensorplay.maximum(input, _as_tensor(min).to(input.dtype))
-
-
-def copysign(input, other):
-    mag = input.abs()
-    neg = _as_tensor(other).to(input.dtype).lt(0)
-    return tensorplay.where(neg, mag.neg(), mag)
 
 
 def detach(input):
@@ -664,9 +565,10 @@ def repeat_interleave(input, repeats, dim=None, *, output_size=None):
         rep = repeats.to(DType.int64).reshape([-1])
         if rep.numel() == 1 and src.size(axis) != 1:
             rep = tensorplay.full([src.size(axis)], int(rep[0].item()),
-                                  DType.int64)
+                                  dtype=DType.int64)
     else:
-        rep = tensorplay.full([src.size(axis)], int(repeats), DType.int64)
+        rep = tensorplay.full([src.size(axis)], int(repeats),
+                              dtype=DType.int64)
     if rep.numel() != src.size(axis):
         raise RuntimeError(
             "repeat_interleave(): repeats must have the same length as the "

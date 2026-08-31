@@ -29,6 +29,7 @@ P10_API bool is_enabled(DispatchKey autocast_key);
 // Helper to determine the backend dispatch key for a device
 inline DispatchKey computeDispatchKey(const Device& device) {
     if (device.is_cuda()) return DispatchKey::CUDA;
+    if (device.is_vulkan()) return DispatchKey::Vulkan;
     return DispatchKey::CPU;
 }
 

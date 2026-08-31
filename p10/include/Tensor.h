@@ -160,6 +160,12 @@ public:
     bool is_channels_last() const;
     bool is_channels_last_2d() const;
     bool is_channels_last_3d() const;
+    DispatchKeySet key_set() const { return impl_ ? impl_->key_set() : DispatchKeySet(); }
+    bool is_batched() const { return impl_ && impl_->is_batched(); }
+    int64_t batch_dim() const { return is_batched() ? impl_->batch_dim() : -1; }
+    int64_t batch_level() const { return is_batched() ? impl_->batch_level() : -1; }
+    int64_t batch_size() const { return is_batched() ? impl_->batch_size() : 0; }
+    Tensor transform_value() const;
     bool is_pinned() const;
     Tensor pin_memory() const;
     // Tensor contiguous() const; // Generated
@@ -203,9 +209,8 @@ public:
     void set_grad(const Tensor& grad);
     bool retains_grad() const;
     void set_retains_grad(bool retains_grad);
-    // Creates a new tensor that shares storage but carries no autograd history.
     Tensor detach() const;
-    
+
     // Data access
     template<typename T>
     T* data_ptr() const {
@@ -226,7 +231,9 @@ public:
     Tensor view(const std::vector<int64_t>& shape) const;
     Tensor view_dtype(DType dtype) const;
     // Tensor reshape(const std::vector<int64_t>& shape) const; // Generated
-    Tensor as_strided(const std::vector<int64_t>& size, const std::vector<int64_t>& stride, std::optional<int64_t> storage_offset = std::nullopt) const;
+    Tensor as_strided(const std::vector<int64_t>& size,
+                     const std::vector<int64_t>& stride,
+                     std::optional<int64_t> storage_offset = std::nullopt) const;
     Tensor select(int64_t dim, int64_t index) const;
     Tensor slice(int64_t dim, int64_t start, int64_t end, int64_t step = 1) const;
     // Tensor expand(const std::vector<int64_t>& size) const; // Generated
@@ -342,6 +349,80 @@ P10_API inline Tensor operator*(Scalar s, const Tensor& t) { return t * s; }
 // inline Tensor operator/(Scalar s, const Tensor& t) { ... } // Need specialized impl
 
 P10_API std::ostream& operator<<(std::ostream& os, const Tensor& t);
+
+inline DispatchKey dispatchKeyForTensor(const Tensor& tensor) {
+    const DispatchKey key = tensor.key_set().highest_priority_key();
+    return key == DispatchKey::EndOfKeys ? computeDispatchKey(tensor.device()) : key;
+}
+
+inline DispatchKey dispatchKeyForTensorArg(const Tensor& tensor) {
+    return dispatchKeyForTensor(tensor);
+}
+
+inline DispatchKey dispatchKeyForTensorArg(const std::optional<Tensor>& tensor) {
+    return tensor.has_value() ? dispatchKeyForTensor(*tensor) : DispatchKey::EndOfKeys;
+}
+
+inline DispatchKey dispatchKeyForTensorArg(const std::vector<Tensor>& tensors) {
+    if (tensors.empty()) return DispatchKey::EndOfKeys;
+    DispatchKey result = DispatchKey::EndOfKeys;
+    for (const Tensor& tensor : tensors) {
+        const DispatchKey key = dispatchKeyForTensor(tensor);
+        if (result == DispatchKey::EndOfKeys ||
+            static_cast<uint8_t>(key) > static_cast<uint8_t>(result)) {
+            result = key;
+        }
+    }
+    return result;
+}
+
+inline DispatchKey dispatchKeyForTensorArg(
+    const std::vector<std::optional<Tensor>>& tensors) {
+    DispatchKey result = DispatchKey::EndOfKeys;
+    for (const auto& tensor : tensors) {
+        if (!tensor.has_value()) continue;
+        const DispatchKey key = dispatchKeyForTensor(*tensor);
+        if (result == DispatchKey::EndOfKeys ||
+            static_cast<uint8_t>(key) > static_cast<uint8_t>(result)) {
+            result = key;
+        }
+    }
+    return result;
+}
+
+inline Device deviceForTensorArg(const std::vector<Tensor>& tensors) {
+    for (const auto& tensor : tensors) return tensor.device();
+    return Device(DeviceType::CPU);
+}
+
+inline Device deviceForTensorArg(
+    const std::vector<std::optional<Tensor>>& tensors) {
+    for (const auto& tensor : tensors) {
+        if (tensor.has_value()) return tensor->device();
+    }
+    return Device(DeviceType::CPU);
+}
+
+// Non-tensor arguments carry no dispatch key of their own; they are simply
+// ignored when deriving a key from an argument pack.
+template <typename T>
+inline DispatchKey dispatchKeyForTensorArg(const T&) {
+    return DispatchKey::EndOfKeys;
+}
+
+template <typename... Args>
+inline DispatchKey dispatchKeyForTensorArgs(const Args&... args) {
+    DispatchKey result = DispatchKey::EndOfKeys;
+    const auto consider = [&result](DispatchKey key) {
+        if (key == DispatchKey::EndOfKeys) return;
+        if (result == DispatchKey::EndOfKeys ||
+            static_cast<uint8_t>(key) > static_cast<uint8_t>(result)) {
+            result = key;
+        }
+    };
+    (consider(dispatchKeyForTensorArg(args)), ...);
+    return result;
+}
 
 P10_API void set_printoptions(int64_t edge_items = -1, int64_t threshold = -1, int64_t precision = -1, int64_t linewidth = -1);
 

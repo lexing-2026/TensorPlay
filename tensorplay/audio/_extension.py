@@ -1,10 +1,11 @@
-"""Availability shims standing in for tensorplay.audio's C++ extension.
+"""Availability helpers for optional native audio features.
 
-tensorplay.audio gates optional native features behind ``tensorplay.audio._extension``.
-TensorPlay implements the audio ops natively in p10 (see
-p10/src/backend/cpu/SpectralKernels.cpp), so the extension-dependent
-features degrade to their documented unavailable state instead of failing
-at import time (mirrors tensorplay.audio/_extension/loader.py semantics).
+tensorplay.audio gates optional native features behind
+``tensorplay.audio._extension``. Audio kernels are provided by the native
+backend, while optional extension-only features report their documented
+unavailable state instead of failing at import time.  The flag is kept at
+module scope so callers can make one inexpensive capability check before
+selecting an optional code path.
 """
 _IS_AUDIO_EXT_AVAILABLE = False
 

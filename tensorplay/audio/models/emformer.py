@@ -253,7 +253,7 @@ class _EmformerAttention(tensorplay.nn.Module):
         output, output_mems, _, _ = self._forward_impl(utterance, lengths, right_context, summary, mems, attention_mask)
         return output, output_mems[:-1]
 
-    @tensorplay.jit.export
+    @tensorplay.compiler.export
     def infer(
         self,
         utterance: tensorplay.Tensor,
@@ -539,7 +539,7 @@ class _EmformerLayer(tensorplay.nn.Module):
         output_utterance, output_right_context = self._apply_post_attention_ffn(rc_output, utterance, right_context)
         return output_utterance, output_right_context, output_mems
 
-    @tensorplay.jit.export
+    @tensorplay.compiler.export
     def infer(
         self,
         utterance: tensorplay.Tensor,
@@ -741,7 +741,7 @@ class _EmformerImpl(tensorplay.nn.Module):
             output, right_context, mems = layer(output, lengths, right_context, mems, attention_mask)
         return output.permute(1, 0, 2), lengths
 
-    @tensorplay.jit.export
+    @tensorplay.compiler.export
     def infer(
         self,
         input: tensorplay.Tensor,

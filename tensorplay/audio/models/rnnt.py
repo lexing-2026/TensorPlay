@@ -246,7 +246,7 @@ class _EmformerEncoder(tensorplay.nn.Module, _Transcriber):
         layer_norm_out = self.layer_norm(output_linear_out)
         return layer_norm_out, transformer_lengths
 
-    @tensorplay.jit.export
+    @tensorplay.compiler.export
     def infer(
         self,
         input: tensorplay.Tensor,
@@ -540,7 +540,7 @@ class RNNT(tensorplay.nn.Module):
             predictor_state,
         )
 
-    @tensorplay.jit.export
+    @tensorplay.compiler.export
     def transcribe_streaming(
         self,
         sources: tensorplay.Tensor,
@@ -577,7 +577,7 @@ class RNNT(tensorplay.nn.Module):
         """
         return self.transcriber.infer(sources, source_lengths, state)
 
-    @tensorplay.jit.export
+    @tensorplay.compiler.export
     def transcribe(
         self,
         sources: tensorplay.Tensor,
@@ -606,7 +606,7 @@ class RNNT(tensorplay.nn.Module):
         """
         return self.transcriber(sources, source_lengths)
 
-    @tensorplay.jit.export
+    @tensorplay.compiler.export
     def predict(
         self,
         targets: tensorplay.Tensor,
@@ -641,7 +641,7 @@ class RNNT(tensorplay.nn.Module):
         """
         return self.predictor(input=targets, lengths=target_lengths, state=state)
 
-    @tensorplay.jit.export
+    @tensorplay.compiler.export
     def join(
         self,
         source_encodings: tensorplay.Tensor,

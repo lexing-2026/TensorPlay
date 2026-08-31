@@ -11,7 +11,7 @@ using namespace tensorplay::stax;
 // ---------------------------------------------------------------------------
 // Compiled-call trampoline (steady-state METH_FASTCALL entry).
 //
-// Mirrors the factory_trampoline pattern in init.cpp: a capsule-carried
+// Uses the same capsule-carried
 // PyCFunction that absorbs the per-call Python dispatch layers
 // (api.optimized key memo -> lowering.__call__ route/bind memos -> execute)
 // for the exact steady state -- same tensor objects, unchanged versions.
@@ -228,8 +228,7 @@ void init_stax(py::module_& m) {
         py::arg("constants"),
         py::arg("output_refs"));
     // Compiled-call trampoline installer: see the CallTrampolineState block
-    // above for the fast-path/divert contract.  Soft failures here must never
-    // break compilation -- callers fall back to the plain lowering object.
+    // above for the fast-path/divert contract.
     stax_m.def(
         "install_call_trampoline",
         [](py::object lowering, py::object exec_fn, py::list tail,
@@ -266,5 +265,29 @@ void init_stax(py::module_& m) {
         py::arg("lowering"), py::arg("exec_fn"), py::arg("tail"),
         py::arg("tensor_type"), py::arg("nargs_expected"),
         py::arg("output_count"), py::arg("gradient_plan"));
+
+    stax_m.def(
+        "capture_state_enter",
+        [](bool compiling, bool exporting, bool disabled) {
+            enterCaptureState(compiling, exporting, disabled);
+        },
+        py::arg("compiling") = false,
+        py::arg("exporting") = false,
+        py::arg("disabled") = false);
+    stax_m.def(
+        "capture_state_exit",
+        [](bool compiling, bool exporting, bool disabled) {
+            exitCaptureState(compiling, exporting, disabled);
+        },
+        py::arg("compiling") = false,
+        py::arg("exporting") = false,
+        py::arg("disabled") = false);
+    stax_m.def("capture_state", []() {
+        CaptureState state = currentCaptureState();
+        return py::make_tuple(
+            state.compile_depth,
+            state.disabled_depth,
+            state.exporting_depth);
+    });
 
 }

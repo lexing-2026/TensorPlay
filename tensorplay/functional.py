@@ -3,9 +3,9 @@
 import tensorplay
 import tensorplay._C as _C
 from tensorplay._C import DType
-import tensorplay.compiler.graph as _compiler_graph
-from tensorplay.compiler.graph import capture_call as _capture_call
-_capturing = _compiler_graph.capturing
+import tensorplay.graph as _graph
+from tensorplay.graph import capture_call as _capture_call
+_capturing = _graph.capturing
 
 def _ensure_device(device):
     # None stays None so the C++ factory layer resolves it against
@@ -15,6 +15,8 @@ def _ensure_device(device):
     if isinstance(device, str):
         return tensorplay.device(device)
     return device
+
+_MISSING = object()
 
 def embedding(weight, indices, padding_idx=-1, scale_grad_by_freq=False, sparse=False):
     if _capturing():
@@ -29,6 +31,96 @@ def embedding_dense_backward(grad_output, indices, num_weights, padding_idx, sca
         if _captured is not None:
             return _captured
     return _C.embedding_dense_backward(grad_output, indices, num_weights, padding_idx, scale_grad_by_freq)
+
+def _embedding_bag(weight, indices, offsets, scale_grad_by_freq=False, mode=0, sparse=False, per_sample_weights=None, include_last_offset=False, padding_idx=-1):
+    if _capturing():
+        _captured = _capture_call(_embedding_bag, (weight, indices, offsets, scale_grad_by_freq, mode, sparse, per_sample_weights, include_last_offset, padding_idx), {})
+        if _captured is not None:
+            return _captured
+    return _C._embedding_bag(weight, indices, offsets, scale_grad_by_freq, mode, sparse, per_sample_weights, include_last_offset, padding_idx)
+
+def _embedding_bag_forward_only(weight, indices, offsets, scale_grad_by_freq=False, mode=0, sparse=False, per_sample_weights=None, include_last_offset=False, padding_idx=-1):
+    if _capturing():
+        _captured = _capture_call(_embedding_bag_forward_only, (weight, indices, offsets, scale_grad_by_freq, mode, sparse, per_sample_weights, include_last_offset, padding_idx), {})
+        if _captured is not None:
+            return _captured
+    return _C._embedding_bag_forward_only(weight, indices, offsets, scale_grad_by_freq, mode, sparse, per_sample_weights, include_last_offset, padding_idx)
+
+def _embedding_bag_dense_backward(grad, indices, offset2bag, bag_size, maximum_indices, num_weights, scale_grad_by_freq, mode, per_sample_weights=None, padding_idx=-1):
+    if _capturing():
+        _captured = _capture_call(_embedding_bag_dense_backward, (grad, indices, offset2bag, bag_size, maximum_indices, num_weights, scale_grad_by_freq, mode, per_sample_weights, padding_idx), {})
+        if _captured is not None:
+            return _captured
+    return _C._embedding_bag_dense_backward(grad, indices, offset2bag, bag_size, maximum_indices, num_weights, scale_grad_by_freq, mode, per_sample_weights, padding_idx)
+
+def _embedding_bag_per_sample_weights_backward(grad, weight, indices, offsets, offset2bag, mode, padding_idx=-1):
+    if _capturing():
+        _captured = _capture_call(_embedding_bag_per_sample_weights_backward, (grad, weight, indices, offsets, offset2bag, mode, padding_idx), {})
+        if _captured is not None:
+            return _captured
+    return _C._embedding_bag_per_sample_weights_backward(grad, weight, indices, offsets, offset2bag, mode, padding_idx)
+
+def convolution(input, weight, bias, stride, padding, dilation, transposed, output_padding, groups):
+    if _capturing():
+        _captured = _capture_call(convolution, (input, weight, bias, stride, padding, dilation, transposed, output_padding, groups), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    if isinstance(dilation, int) and not isinstance(dilation, bool):
+        dilation = [dilation]
+    if isinstance(output_padding, int) and not isinstance(output_padding, bool):
+        output_padding = [output_padding]
+    return _C.convolution(input, weight, bias, stride, padding, dilation, transposed, output_padding, groups)
+
+def convolution_backward(grad_output, input, weight, bias_sizes, stride, padding, dilation, transposed, output_padding, groups, output_mask):
+    if _capturing():
+        _captured = _capture_call(convolution_backward, (grad_output, input, weight, bias_sizes, stride, padding, dilation, transposed, output_padding, groups, output_mask), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(bias_sizes, int) and not isinstance(bias_sizes, bool):
+        bias_sizes = [bias_sizes]
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    if isinstance(dilation, int) and not isinstance(dilation, bool):
+        dilation = [dilation]
+    if isinstance(output_padding, int) and not isinstance(output_padding, bool):
+        output_padding = [output_padding]
+    return _C.convolution_backward(grad_output, input, weight, bias_sizes, stride, padding, dilation, transposed, output_padding, groups, output_mask)
+
+def convolution_overrideable(input, weight, bias, stride, padding, dilation, transposed, output_padding, groups):
+    if _capturing():
+        _captured = _capture_call(convolution_overrideable, (input, weight, bias, stride, padding, dilation, transposed, output_padding, groups), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    if isinstance(dilation, int) and not isinstance(dilation, bool):
+        dilation = [dilation]
+    if isinstance(output_padding, int) and not isinstance(output_padding, bool):
+        output_padding = [output_padding]
+    return _C.convolution_overrideable(input, weight, bias, stride, padding, dilation, transposed, output_padding, groups)
+
+def convolution_backward_overrideable(grad_output, input, weight, stride, padding, dilation, transposed, output_padding, groups, output_mask):
+    if _capturing():
+        _captured = _capture_call(convolution_backward_overrideable, (grad_output, input, weight, stride, padding, dilation, transposed, output_padding, groups, output_mask), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    if isinstance(dilation, int) and not isinstance(dilation, bool):
+        dilation = [dilation]
+    if isinstance(output_padding, int) and not isinstance(output_padding, bool):
+        output_padding = [output_padding]
+    return _C.convolution_backward_overrideable(grad_output, input, weight, stride, padding, dilation, transposed, output_padding, groups, output_mask)
 
 def conv1d(input, weight, bias=None, stride=([1]), padding=([0]), dilation=([1]), groups=1):
     if _capturing():
@@ -351,6 +443,8 @@ def add(input, other, alpha=1):
         _captured = _capture_call(add, (input, other, alpha), {})
         if _captured is not None:
             return _captured
+    if not isinstance(input, tensorplay.Tensor):
+        input = tensorplay.as_tensor(input)
     return input.add(other=other, alpha=alpha)
 
 def add_(input, other, alpha=1):
@@ -361,6 +455,8 @@ def sub(input, other, alpha=1):
         _captured = _capture_call(sub, (input, other, alpha), {})
         if _captured is not None:
             return _captured
+    if not isinstance(input, tensorplay.Tensor):
+        input = tensorplay.as_tensor(input)
     return input.sub(other=other, alpha=alpha)
 
 def sub_(input, other, alpha=1):
@@ -371,17 +467,122 @@ def mul(input, other):
         _captured = _capture_call(mul, (input, other), {})
         if _captured is not None:
             return _captured
+    if not isinstance(input, tensorplay.Tensor):
+        input = tensorplay.as_tensor(input)
     return input.mul(other=other)
 
 def mul_(input, other):
     return input.mul_(other=other)
 
-def div(input, other):
+def div(input, other, rounding_mode=None):
     if _capturing():
-        _captured = _capture_call(div, (input, other), {})
+        _captured = _capture_call(div, (input, other), {'rounding_mode': rounding_mode})
         if _captured is not None:
             return _captured
-    return input.div(other=other)
+    if not isinstance(input, tensorplay.Tensor):
+        input = tensorplay.as_tensor(input)
+    if rounding_mode is None:
+        return input.div(other=other)
+    return input.div(other=other, rounding_mode=rounding_mode)
+
+def divide(input, other, rounding_mode=None):
+    if _capturing():
+        _captured = _capture_call(divide, (input, other), {'rounding_mode': rounding_mode})
+        if _captured is not None:
+            return _captured
+    if not isinstance(input, tensorplay.Tensor):
+        input = tensorplay.as_tensor(input)
+    if rounding_mode is None:
+        return input.divide(other=other)
+    return input.divide(other=other, rounding_mode=rounding_mode)
+
+def true_divide(input, other):
+    if _capturing():
+        _captured = _capture_call(true_divide, (input, other), {})
+        if _captured is not None:
+            return _captured
+    if not isinstance(input, tensorplay.Tensor):
+        input = tensorplay.as_tensor(input)
+    return input.true_divide(other=other)
+
+def floor_divide(input, other):
+    if _capturing():
+        _captured = _capture_call(floor_divide, (input, other), {})
+        if _captured is not None:
+            return _captured
+    if not isinstance(input, tensorplay.Tensor):
+        input = tensorplay.as_tensor(input)
+    return input.floor_divide(other=other)
+
+def multiply(input, other):
+    if _capturing():
+        _captured = _capture_call(multiply, (input, other), {})
+        if _captured is not None:
+            return _captured
+    if not isinstance(input, tensorplay.Tensor):
+        input = tensorplay.as_tensor(input)
+    return input.multiply(other=other)
+
+def subtract(input, other, alpha=1):
+    if _capturing():
+        _captured = _capture_call(subtract, (input, other, alpha), {})
+        if _captured is not None:
+            return _captured
+    if not isinstance(input, tensorplay.Tensor):
+        input = tensorplay.as_tensor(input)
+    return input.subtract(other=other, alpha=alpha)
+
+def remainder(input, other):
+    if _capturing():
+        _captured = _capture_call(remainder, (input, other), {})
+        if _captured is not None:
+            return _captured
+    return _C.remainder(input, other)
+
+def fmod(input, other):
+    if _capturing():
+        _captured = _capture_call(fmod, (input, other), {})
+        if _captured is not None:
+            return _captured
+    if not isinstance(input, tensorplay.Tensor):
+        input = tensorplay.as_tensor(input)
+    return input.fmod(other=other)
+
+def copysign(input, other):
+    if _capturing():
+        _captured = _capture_call(copysign, (input, other), {})
+        if _captured is not None:
+            return _captured
+    if not isinstance(input, tensorplay.Tensor):
+        input = tensorplay.as_tensor(input)
+    return input.copysign(other=other)
+
+def clamp_min(input, min):
+    if _capturing():
+        _captured = _capture_call(clamp_min, (input, min), {})
+        if _captured is not None:
+            return _captured
+    if not isinstance(input, tensorplay.Tensor):
+        input = tensorplay.as_tensor(input)
+    return input.clamp_min(min=min)
+
+def clamp_max(input, max):
+    if _capturing():
+        _captured = _capture_call(clamp_max, (input, max), {})
+        if _captured is not None:
+            return _captured
+    if not isinstance(input, tensorplay.Tensor):
+        input = tensorplay.as_tensor(input)
+    return input.clamp_max(max=max)
+
+def rsub(input, other, alpha=1):
+    if _capturing():
+        _captured = _capture_call(rsub, (input, other, alpha), {})
+        if _captured is not None:
+            return _captured
+    if not isinstance(alpha, (tensorplay.Scalar, tensorplay.Tensor)):
+        alpha = tensorplay.Scalar(alpha)
+    return _C.rsub(input, other, alpha=alpha)
 
 def fused_mul_add(input, other, addend):
     if _capturing():
@@ -775,29 +976,37 @@ def _foreach_zero_(input, *args, **kwargs):
             return _captured
     return _C._foreach_zero_(input, *args, **kwargs)
 
-def div_(input, other):
-    return input.div_(other=other)
-
-def addcmul(input, tensor1, tensor2, value=1):
+def div_(input, other, rounding_mode=None):
     if _capturing():
-        _captured = _capture_call(addcmul, (input, tensor1, tensor2, value), {})
+        _captured = _capture_call(div_, (input, other), {'rounding_mode': rounding_mode})
         if _captured is not None:
             return _captured
-    if not isinstance(value, (tensorplay.Scalar, tensorplay.Tensor)):
-        value = tensorplay.Scalar(value)
-    return _C.addcmul(input, tensor1, tensor2, value=value)
+    if not isinstance(input, tensorplay.Tensor):
+        input = tensorplay.as_tensor(input)
+    if rounding_mode is None:
+        return input.div_(other=other)
+    return input.div_(other=other, rounding_mode=rounding_mode)
+
+def addcmul(input, tensor1, tensor2, *, value=1, out=None):
+    if out is not None:
+        return _C.addcmul(self=input, tensor1=tensor1, tensor2=tensor2, value=value, out=out)
+    if _capturing():
+        _captured = _capture_call(addcmul, (input, tensor1, tensor2), {})
+        if _captured is not None:
+            return _captured
+    return _C.addcmul(self=input, tensor1=tensor1, tensor2=tensor2, value=value)
 
 def addcmul_(input, tensor1, tensor2, value=1):
     return input.addcmul_(tensor1=tensor1, tensor2=tensor2, value=value)
 
-def addcdiv(input, tensor1, tensor2, value=1):
+def addcdiv(input, tensor1, tensor2, *, value=1, out=None):
+    if out is not None:
+        return _C.addcdiv(self=input, tensor1=tensor1, tensor2=tensor2, value=value, out=out)
     if _capturing():
-        _captured = _capture_call(addcdiv, (input, tensor1, tensor2, value), {})
+        _captured = _capture_call(addcdiv, (input, tensor1, tensor2), {})
         if _captured is not None:
             return _captured
-    if not isinstance(value, (tensorplay.Scalar, tensorplay.Tensor)):
-        value = tensorplay.Scalar(value)
-    return _C.addcdiv(input, tensor1, tensor2, value=value)
+    return _C.addcdiv(self=input, tensor1=tensor1, tensor2=tensor2, value=value)
 
 def addcdiv_(input, tensor1, tensor2, value=1):
     return input.addcdiv_(tensor1=tensor1, tensor2=tensor2, value=value)
@@ -815,19 +1024,23 @@ def where(condition, input, other):
         other = tensorplay.Scalar(other)
     return _C.where(condition=condition, self=input, other=other)
 
-def maximum(input, other):
+def maximum(input, other, *, out=None):
+    if out is not None:
+        return _C.maximum(self=input, other=other, out=out)
     if _capturing():
         _captured = _capture_call(maximum, (input, other), {})
         if _captured is not None:
             return _captured
-    return _C.maximum(input, other)
+    return _C.maximum(self=input, other=other)
 
-def minimum(input, other):
+def minimum(input, other, *, out=None):
+    if out is not None:
+        return _C.minimum(self=input, other=other, out=out)
     if _capturing():
         _captured = _capture_call(minimum, (input, other), {})
         if _captured is not None:
             return _captured
-    return _C.minimum(input, other)
+    return _C.minimum(self=input, other=other)
 
 def view_as_real(input):
     if _capturing():
@@ -862,20 +1075,16 @@ def addmm(input, mat1, mat2, beta=1, alpha=1):
         _captured = _capture_call(addmm, (input, mat1, mat2, beta, alpha), {})
         if _captured is not None:
             return _captured
-    if not isinstance(beta, (tensorplay.Scalar, tensorplay.Tensor)):
-        beta = tensorplay.Scalar(beta)
-    if not isinstance(alpha, (tensorplay.Scalar, tensorplay.Tensor)):
-        alpha = tensorplay.Scalar(alpha)
     return _C.addmm(input, mat1, mat2, beta=beta, alpha=alpha)
 
 def matmul(input, other, *, out=None):
     if out is not None:
-        return _C.matmul(self=input, other=other, out=out)
+        return _C.matmul(input, other, out=out)
     if _capturing():
         _captured = _capture_call(matmul, (input, other), {})
         if _captured is not None:
             return _captured
-    return _C.matmul(self=input, other=other)
+    return _C.matmul(input, other)
 
 def matmul_backward_self(grad_output, input, other):
     if _capturing():
@@ -891,44 +1100,50 @@ def matmul_backward_other(grad_output, input, other):
             return _captured
     return _C.matmul_backward_other(grad_output, input, other)
 
-def bmm(input, mat2):
+def bmm(input, mat2, *, out=None):
+    if out is not None:
+        return _C.bmm(self=input, mat2=mat2, out=out)
     if _capturing():
         _captured = _capture_call(bmm, (input, mat2), {})
         if _captured is not None:
             return _captured
-    return _C.bmm(input, mat2)
+    return _C.bmm(self=input, mat2=mat2)
 
-def baddbmm(input, batch1, batch2, beta=1, alpha=1):
+def baddbmm(input, batch1, batch2, *, beta=1, alpha=1, out=None):
+    if out is not None:
+        return _C.baddbmm(self=input, batch1=batch1, batch2=batch2, beta=beta, alpha=alpha, out=out)
     if _capturing():
-        _captured = _capture_call(baddbmm, (input, batch1, batch2, beta, alpha), {})
+        _captured = _capture_call(baddbmm, (input, batch1, batch2), {})
         if _captured is not None:
             return _captured
-    if not isinstance(beta, (tensorplay.Scalar, tensorplay.Tensor)):
-        beta = tensorplay.Scalar(beta)
-    if not isinstance(alpha, (tensorplay.Scalar, tensorplay.Tensor)):
-        alpha = tensorplay.Scalar(alpha)
-    return _C.baddbmm(input, batch1, batch2, beta=beta, alpha=alpha)
+    return _C.baddbmm(self=input, batch1=batch1, batch2=batch2, beta=beta, alpha=alpha)
 
-def mv(input, vec):
+def mv(input, vec, *, out=None):
+    if out is not None:
+        return _C.mv(self=input, vec=vec, out=out)
     if _capturing():
         _captured = _capture_call(mv, (input, vec), {})
         if _captured is not None:
             return _captured
-    return _C.mv(input, vec)
+    return _C.mv(self=input, vec=vec)
 
-def dot(input, tensor):
+def dot(input, tensor, *, out=None):
+    if out is not None:
+        return _C.dot(self=input, tensor=tensor, out=out)
     if _capturing():
         _captured = _capture_call(dot, (input, tensor), {})
         if _captured is not None:
             return _captured
-    return _C.dot(input, tensor)
+    return _C.dot(self=input, tensor=tensor)
 
-def inner(input, other):
+def inner(input, other, *, out=None):
+    if out is not None:
+        return _C.inner(self=input, other=other, out=out)
     if _capturing():
         _captured = _capture_call(inner, (input, other), {})
         if _captured is not None:
             return _captured
-    return _C.inner(input, other)
+    return _C.inner(self=input, other=other)
 
 def inner_backward_self(grad_output, input, other):
     if _capturing():
@@ -944,12 +1159,14 @@ def inner_backward_other(grad_output, input, other):
             return _captured
     return _C.inner_backward_other(grad_output, input, other)
 
-def outer(input, vec2):
+def outer(input, vec2, *, out=None):
+    if out is not None:
+        return _C.outer(self=input, vec2=vec2, out=out)
     if _capturing():
         _captured = _capture_call(outer, (input, vec2), {})
         if _captured is not None:
             return _captured
-    return _C.outer(input, vec2)
+    return _C.outer(self=input, vec2=vec2)
 
 def einsum(equation, *operands, path=None):
     if _capturing():
@@ -1093,19 +1310,23 @@ def movedim(input, source, destination):
         destination = [destination]
     return _C.movedim(input, source, destination)
 
-def cat(tensors, dim=0):
+def cat(tensors, dim=0, *, out=None):
+    if out is not None:
+        return _C.cat(tensors=tensors, dim=dim, out=out)
     if _capturing():
         _captured = _capture_call(cat, (tensors, dim), {})
         if _captured is not None:
             return _captured
-    return _C.cat(tensors, dim)
+    return _C.cat(tensors=tensors, dim=dim)
 
-def stack(tensors, dim=0):
+def stack(tensors, dim=0, *, out=None):
+    if out is not None:
+        return _C.stack(tensors=tensors, dim=dim, out=out)
     if _capturing():
         _captured = _capture_call(stack, (tensors, dim), {})
         if _captured is not None:
             return _captured
-    return _C.stack(tensors, dim)
+    return _C.stack(tensors=tensors, dim=dim)
 
 def split(input, split_size, dim=0):
     if _capturing():
@@ -1136,13 +1357,6 @@ def unbind(input, dim=0):
         if _captured is not None:
             return _captured
     return _C.unbind(input, dim)
-
-def select(input, dim, index):
-    if _capturing():
-        _captured = _capture_call(select, (input, dim, index), {})
-        if _captured is not None:
-            return _captured
-    return input.select(dim=dim, index=index)
 
 def slice(input, dim=0, start=None, end=None, step=1):
     if _capturing():
@@ -1217,14 +1431,14 @@ def rand_like(input, dtype=DType.undefined, device=None, requires_grad=False):
             return _captured
     return _C.rand_like(input, dtype=dtype, device=device, requires_grad=requires_grad)
 
-def randint(low, high, size, dtype=DType.int64, device=None, requires_grad=False):
+def randint(low, high, size, *, dtype=DType.int64, device=None, requires_grad=False, out=None):
+    if out is not None:
+        return _C.randint(low=low, high=high, size=size, dtype=dtype, device=device, requires_grad=requires_grad, out=out)
     if _capturing():
-        _captured = _capture_call(randint, (low, high, size, dtype, device, requires_grad), {})
+        _captured = _capture_call(randint, (low, high, size), {})
         if _captured is not None:
             return _captured
-    if isinstance(size, int) and not isinstance(size, bool):
-        size = [size]
-    return _C.randint(low, high, size, dtype=dtype, device=_ensure_device(device), requires_grad=requires_grad)
+    return _C.randint(low=low, high=high, size=size, dtype=dtype, device=device, requires_grad=requires_grad)
 
 def randint_like(input, low, high, dtype=DType.undefined, device=None, requires_grad=False):
     if _capturing():
@@ -1264,19 +1478,31 @@ def randn_like(input, dtype=DType.undefined, device=None, requires_grad=False):
             return _captured
     return _C.randn_like(input, dtype=dtype, device=device, requires_grad=requires_grad)
 
-def randperm(n, dtype=DType.int64, device=None, requires_grad=False):
+def randperm(n, *, dtype=DType.int64, device=None, requires_grad=False, out=None):
+    if out is not None:
+        return _C.randperm(n=n, dtype=dtype, device=device, requires_grad=requires_grad, out=out)
     if _capturing():
-        _captured = _capture_call(randperm, (n, dtype, device, requires_grad), {})
+        _captured = _capture_call(randperm, (n,), {})
         if _captured is not None:
             return _captured
-    return _C.randperm(n, dtype=dtype, device=_ensure_device(device), requires_grad=requires_grad)
+    return _C.randperm(n=n, dtype=dtype, device=device, requires_grad=requires_grad)
 
-def bernoulli(input):
+def bernoulli(input, p=_MISSING, *, generator=None, out=None):
+    if p is _MISSING:
+        if out is not None:
+            return _C.bernoulli(self=input, generator=generator, out=out)
+        if _capturing():
+            _captured = _capture_call(bernoulli, (input,), {"generator": generator})
+            if _captured is not None:
+                return _captured
+        return _C.bernoulli(self=input, generator=generator)
+    if out is not None:
+        return _C.bernoulli(self=input, p=p, generator=generator, out=out)
     if _capturing():
-        _captured = _capture_call(bernoulli, (input,), {})
+        _captured = _capture_call(bernoulli, (input, p), {"generator": generator})
         if _captured is not None:
             return _captured
-    return _C.bernoulli(input)
+    return _C.bernoulli(self=input, p=p, generator=generator)
 
 def native_dropout(input, p):
     if _capturing():
@@ -1320,19 +1546,23 @@ def _feature_dropout_backward(grad_output, mask, p):
             return _captured
     return _C._feature_dropout_backward(grad_output, mask, p)
 
-def quantile(input, q, dim=None, keepdim=False, interpolation="linear"):
+def quantile(input, q, dim=None, keepdim=False, *, interpolation='linear', out=None):
+    if out is not None:
+        return _C.quantile(self=input, q=q, dim=dim, keepdim=keepdim, interpolation=interpolation, out=out)
     if _capturing():
-        _captured = _capture_call(quantile, (input, q, dim, keepdim, interpolation), {})
+        _captured = _capture_call(quantile, (input, q, dim, keepdim), {})
         if _captured is not None:
             return _captured
-    return _C.quantile(input, q, dim, keepdim, interpolation=interpolation)
+    return _C.quantile(self=input, q=q, dim=dim, keepdim=keepdim, interpolation=interpolation)
 
-def nanquantile(input, q, dim=None, keepdim=False, interpolation="linear"):
+def nanquantile(input, q, dim=None, keepdim=False, *, interpolation='linear', out=None):
+    if out is not None:
+        return _C.nanquantile(self=input, q=q, dim=dim, keepdim=keepdim, interpolation=interpolation, out=out)
     if _capturing():
-        _captured = _capture_call(nanquantile, (input, q, dim, keepdim, interpolation), {})
+        _captured = _capture_call(nanquantile, (input, q, dim, keepdim), {})
         if _captured is not None:
             return _captured
-    return _C.nanquantile(input, q, dim, keepdim, interpolation=interpolation)
+    return _C.nanquantile(self=input, q=q, dim=dim, keepdim=keepdim, interpolation=interpolation)
 
 def histogram(input, bins, weight=None, density=False):
     if _capturing():
@@ -1426,61 +1656,77 @@ def normal(mean, std):
             return _captured
     return _C.normal(mean, std)
 
-def abs(input):
+def abs(input, *, out=None):
+    if out is not None:
+        return _C.abs(self=input, out=out)
     if _capturing():
         _captured = _capture_call(abs, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.abs(input)
+    return _C.abs(self=input)
 
-def acos(input):
+def acos(input, *, out=None):
+    if out is not None:
+        return _C.acos(self=input, out=out)
     if _capturing():
         _captured = _capture_call(acos, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.acos(input)
+    return _C.acos(self=input)
 
-def acosh(input):
+def acosh(input, *, out=None):
+    if out is not None:
+        return _C.acosh(self=input, out=out)
     if _capturing():
         _captured = _capture_call(acosh, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.acosh(input)
+    return _C.acosh(self=input)
 
-def angle(input):
+def angle(input, *, out=None):
+    if out is not None:
+        return _C.angle(self=input, out=out)
     if _capturing():
         _captured = _capture_call(angle, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.angle(input)
+    return _C.angle(self=input)
 
-def asin(input):
+def asin(input, *, out=None):
+    if out is not None:
+        return _C.asin(self=input, out=out)
     if _capturing():
         _captured = _capture_call(asin, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.asin(input)
+    return _C.asin(self=input)
 
-def asinh(input):
+def asinh(input, *, out=None):
+    if out is not None:
+        return _C.asinh(self=input, out=out)
     if _capturing():
         _captured = _capture_call(asinh, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.asinh(input)
+    return _C.asinh(self=input)
 
-def atan(input):
+def atan(input, *, out=None):
+    if out is not None:
+        return _C.atan(self=input, out=out)
     if _capturing():
         _captured = _capture_call(atan, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.atan(input)
+    return _C.atan(self=input)
 
-def atan2(input, other):
+def atan2(input, other, *, out=None):
+    if out is not None:
+        return _C.atan2(self=input, other=other, out=out)
     if _capturing():
         _captured = _capture_call(atan2, (input, other), {})
         if _captured is not None:
             return _captured
-    return _C.atan2(input, other)
+    return _C.atan2(self=input, other=other)
 
 def poisson(input):
     if _capturing():
@@ -1489,30 +1735,32 @@ def poisson(input):
             return _captured
     return _C.poisson(input)
 
-def atanh(input):
+def atanh(input, *, out=None):
+    if out is not None:
+        return _C.atanh(self=input, out=out)
     if _capturing():
         _captured = _capture_call(atanh, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.atanh(input)
+    return _C.atanh(self=input)
 
-def ceil(input):
+def ceil(input, *, out=None):
+    if out is not None:
+        return _C.ceil(self=input, out=out)
     if _capturing():
         _captured = _capture_call(ceil, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.ceil(input)
+    return _C.ceil(self=input)
 
-def clamp(input, min=None, max=None):
+def clamp(input, min=None, max=None, *, out=None):
+    if out is not None:
+        return _C.clamp(self=input, min=min, max=max, out=out)
     if _capturing():
         _captured = _capture_call(clamp, (input, min, max), {})
         if _captured is not None:
             return _captured
-    if min is not None and not isinstance(min, (tensorplay.Scalar, tensorplay.Tensor)):
-        min = tensorplay.Scalar(min)
-    if max is not None and not isinstance(max, (tensorplay.Scalar, tensorplay.Tensor)):
-        max = tensorplay.Scalar(max)
-    return _C.clamp(input, min, max)
+    return _C.clamp(self=input, min=min, max=max)
 
 def clamp_backward(grad_output, input, min=None, max=None):
     if _capturing():
@@ -1525,82 +1773,104 @@ def clamp_backward(grad_output, input, min=None, max=None):
         max = tensorplay.Scalar(max)
     return _C.clamp_backward(grad_output, input, min, max)
 
-def cos(input):
+def cos(input, *, out=None):
+    if out is not None:
+        return _C.cos(self=input, out=out)
     if _capturing():
         _captured = _capture_call(cos, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.cos(input)
+    return _C.cos(self=input)
 
-def cosh(input):
+def cosh(input, *, out=None):
+    if out is not None:
+        return _C.cosh(self=input, out=out)
     if _capturing():
         _captured = _capture_call(cosh, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.cosh(input)
+    return _C.cosh(self=input)
 
-def erf(input):
+def erf(input, *, out=None):
+    if out is not None:
+        return _C.erf(self=input, out=out)
     if _capturing():
         _captured = _capture_call(erf, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.erf(input)
+    return _C.erf(self=input)
 
-def erfc(input):
+def erfc(input, *, out=None):
+    if out is not None:
+        return _C.erfc(self=input, out=out)
     if _capturing():
         _captured = _capture_call(erfc, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.erfc(input)
+    return _C.erfc(self=input)
 
-def expm1(input):
+def expm1(input, *, out=None):
+    if out is not None:
+        return _C.expm1(self=input, out=out)
     if _capturing():
         _captured = _capture_call(expm1, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.expm1(input)
+    return _C.expm1(self=input)
 
-def lgamma(input):
+def lgamma(input, *, out=None):
+    if out is not None:
+        return _C.lgamma(self=input, out=out)
     if _capturing():
         _captured = _capture_call(lgamma, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.lgamma(input)
+    return _C.lgamma(self=input)
 
-def log2(input):
+def log2(input, *, out=None):
+    if out is not None:
+        return _C.log2(self=input, out=out)
     if _capturing():
         _captured = _capture_call(log2, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.log2(input)
+    return _C.log2(self=input)
 
-def reciprocal(input):
+def reciprocal(input, *, out=None):
+    if out is not None:
+        return _C.reciprocal(self=input, out=out)
     if _capturing():
         _captured = _capture_call(reciprocal, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.reciprocal(input)
+    return _C.reciprocal(self=input)
 
-def trunc(input):
+def trunc(input, *, out=None):
+    if out is not None:
+        return _C.trunc(self=input, out=out)
     if _capturing():
         _captured = _capture_call(trunc, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.trunc(input)
+    return _C.trunc(self=input)
 
-def exp(input):
+def exp(input, *, out=None):
+    if out is not None:
+        return _C.exp(self=input, out=out)
     if _capturing():
         _captured = _capture_call(exp, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.exp(input)
+    return _C.exp(self=input)
 
-def floor(input):
+def floor(input, *, out=None):
+    if out is not None:
+        return _C.floor(self=input, out=out)
     if _capturing():
         _captured = _capture_call(floor, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.floor(input)
+    return _C.floor(self=input)
 
 def lerp(input, end, weight):
     if _capturing():
@@ -1626,19 +1896,23 @@ def sqrt_(input):
 def rsqrt_(input):
     return input.rsqrt_()
 
-def log(input):
+def log(input, *, out=None):
+    if out is not None:
+        return _C.log(self=input, out=out)
     if _capturing():
         _captured = _capture_call(log, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.log(input)
+    return _C.log(self=input)
 
-def neg(input):
+def neg(input, *, out=None):
+    if out is not None:
+        return _C.neg(self=input, out=out)
     if _capturing():
         _captured = _capture_call(neg, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.neg(input)
+    return _C.neg(self=input)
 
 def pow(input, exponent):
     if _capturing():
@@ -1649,47 +1923,59 @@ def pow(input, exponent):
         exponent = tensorplay.Scalar(exponent)
     return _C.pow(input, exponent)
 
-def round(input):
+def round(input, *, out=None):
+    if out is not None:
+        return _C.round(self=input, out=out)
     if _capturing():
         _captured = _capture_call(round, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.round(input)
+    return _C.round(self=input)
 
-def rsqrt(input):
+def rsqrt(input, *, out=None):
+    if out is not None:
+        return _C.rsqrt(self=input, out=out)
     if _capturing():
         _captured = _capture_call(rsqrt, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.rsqrt(input)
+    return _C.rsqrt(self=input)
 
-def sigmoid(input):
+def sigmoid(input, *, out=None):
+    if out is not None:
+        return _C.sigmoid(self=input, out=out)
     if _capturing():
         _captured = _capture_call(sigmoid, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.sigmoid(input)
+    return _C.sigmoid(self=input)
 
-def sign(input):
+def sign(input, *, out=None):
+    if out is not None:
+        return _C.sign(self=input, out=out)
     if _capturing():
         _captured = _capture_call(sign, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.sign(input)
+    return _C.sign(self=input)
 
-def sin(input):
+def sin(input, *, out=None):
+    if out is not None:
+        return _C.sin(self=input, out=out)
     if _capturing():
         _captured = _capture_call(sin, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.sin(input)
+    return _C.sin(self=input)
 
-def sinh(input):
+def sinh(input, *, out=None):
+    if out is not None:
+        return _C.sinh(self=input, out=out)
     if _capturing():
         _captured = _capture_call(sinh, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.sinh(input)
+    return _C.sinh(self=input)
 
 def softmax(input, dim, dtype=DType.undefined):
     if _capturing():
@@ -1705,33 +1991,41 @@ def log_softmax(input, dim, dtype=DType.undefined):
             return _captured
     return _C.log_softmax(input, dim, dtype)
 
-def sqrt(input):
+def sqrt(input, *, out=None):
+    if out is not None:
+        return _C.sqrt(self=input, out=out)
     if _capturing():
         _captured = _capture_call(sqrt, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.sqrt(input)
+    return _C.sqrt(self=input)
 
-def square(input):
+def square(input, *, out=None):
+    if out is not None:
+        return _C.square(self=input, out=out)
     if _capturing():
         _captured = _capture_call(square, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.square(input)
+    return _C.square(self=input)
 
-def tan(input):
+def tan(input, *, out=None):
+    if out is not None:
+        return _C.tan(self=input, out=out)
     if _capturing():
         _captured = _capture_call(tan, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.tan(input)
+    return _C.tan(self=input)
 
-def tanh(input):
+def tanh(input, *, out=None):
+    if out is not None:
+        return _C.tanh(self=input, out=out)
     if _capturing():
         _captured = _capture_call(tanh, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.tanh(input)
+    return _C.tanh(self=input)
 
 def relu(input):
     if _capturing():
@@ -1756,26 +2050,30 @@ def threshold_backward(grad_output, input, threshold):
         threshold = tensorplay.Scalar(threshold)
     return _C.threshold_backward(grad_output, input, threshold)
 
-def gelu(input, approximate="none"):
+def gelu(input, approximate='none', *, out=None):
+    if out is not None:
+        return _C.gelu(self=input, approximate=approximate, out=out)
     if _capturing():
         _captured = _capture_call(gelu, (input, approximate), {})
         if _captured is not None:
             return _captured
-    return _C.gelu(input, approximate)
+    return _C.gelu(self=input, approximate=approximate)
 
-def gelu_backward(grad_output, input, approximate="none"):
+def gelu_backward(grad_output, input, approximate='none'):
     if _capturing():
         _captured = _capture_call(gelu_backward, (grad_output, input, approximate), {})
         if _captured is not None:
             return _captured
     return _C.gelu_backward(grad_output, input, approximate)
 
-def silu(input):
+def silu(input, *, out=None):
+    if out is not None:
+        return _C.silu(self=input, out=out)
     if _capturing():
         _captured = _capture_call(silu, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.silu(input)
+    return _C.silu(self=input)
 
 def silu_backward(grad_output, input):
     if _capturing():
@@ -1808,16 +2106,14 @@ def empty(*size, dtype=None, device=None, pin_memory=False, requires_grad=False)
         return _c_empty(size)
     return _C.empty(size=size, dtype=dtype, device=device, pin_memory=pin_memory, requires_grad=requires_grad)
 
-def full(size, fill_value, dtype=DType.undefined, device=None, pin_memory=False, requires_grad=False):
+def full(size, fill_value, *, dtype=DType.undefined, device=None, pin_memory=False, requires_grad=False, out=None):
+    if out is not None:
+        return _C.full(size=size, fill_value=fill_value, dtype=dtype, device=device, pin_memory=pin_memory, requires_grad=requires_grad, out=out)
     if _capturing():
-        _captured = _capture_call(full, (size, fill_value, dtype, device, pin_memory, requires_grad), {})
+        _captured = _capture_call(full, (size, fill_value), {})
         if _captured is not None:
             return _captured
-    if isinstance(size, int) and not isinstance(size, bool):
-        size = [size]
-    if not isinstance(fill_value, (tensorplay.Scalar, tensorplay.Tensor)):
-        fill_value = tensorplay.Scalar(fill_value)
-    return _C.full(size, fill_value, dtype=dtype, device=_ensure_device(device), pin_memory=pin_memory, requires_grad=requires_grad)
+    return _C.full(size=size, fill_value=fill_value, dtype=dtype, device=device, pin_memory=pin_memory, requires_grad=requires_grad)
 
 _c_zeros = _C.zeros
 
@@ -1867,12 +2163,14 @@ def ones(*size, dtype=None, device=None, pin_memory=False, requires_grad=False):
         return _c_ones(size)
     return _C.ones(size=size, dtype=dtype, device=device, pin_memory=pin_memory, requires_grad=requires_grad)
 
-def eye(n, m=-1, dtype=DType.float32, device=None, requires_grad=False):
+def eye(n, m=-1, *, dtype=DType.float32, device=None, requires_grad=False, out=None):
+    if out is not None:
+        return _C.eye(n=n, m=m, dtype=dtype, device=device, requires_grad=requires_grad, out=out)
     if _capturing():
-        _captured = _capture_call(eye, (n, m, dtype, device, requires_grad), {})
+        _captured = _capture_call(eye, (n, m), {})
         if _captured is not None:
             return _captured
-    return _C.eye(n, m, dtype=dtype, device=_ensure_device(device), requires_grad=requires_grad)
+    return _C.eye(n=n, m=m, dtype=dtype, device=device, requires_grad=requires_grad)
 
 def arange(*args, dtype=DType.undefined, device=None, requires_grad=False):
     _captured = _capture_call(arange, tuple(args), {'dtype': dtype, 'device': device, 'requires_grad': requires_grad})
@@ -1897,45 +2195,39 @@ def arange(*args, dtype=DType.undefined, device=None, requires_grad=False):
     else:
         raise TypeError(f'arange expected 1-3 positional arguments, got {len(args)}')
 
-def linspace(start, end, steps, dtype=DType.float32, device=None, requires_grad=False):
+def linspace(start, end, steps, *, dtype=DType.float32, device=None, requires_grad=False, out=None):
+    if out is not None:
+        return _C.linspace(start=start, end=end, steps=steps, dtype=dtype, device=device, requires_grad=requires_grad, out=out)
     if _capturing():
-        _captured = _capture_call(linspace, (start, end, steps, dtype, device, requires_grad), {})
+        _captured = _capture_call(linspace, (start, end, steps), {})
         if _captured is not None:
             return _captured
-    if not isinstance(start, (tensorplay.Scalar, tensorplay.Tensor)):
-        start = tensorplay.Scalar(start)
-    if not isinstance(end, (tensorplay.Scalar, tensorplay.Tensor)):
-        end = tensorplay.Scalar(end)
-    return _C.linspace(start, end, steps, dtype=dtype, device=_ensure_device(device), requires_grad=requires_grad)
+    return _C.linspace(start=start, end=end, steps=steps, dtype=dtype, device=device, requires_grad=requires_grad)
 
-def logspace(start, end, steps, base=10.0, dtype=DType.float32, device=None, requires_grad=False):
+def logspace(start, end, steps, base=10.0, *, dtype=DType.float32, device=None, requires_grad=False, out=None):
+    if out is not None:
+        return _C.logspace(start=start, end=end, steps=steps, base=base, dtype=dtype, device=device, requires_grad=requires_grad, out=out)
     if _capturing():
-        _captured = _capture_call(logspace, (start, end, steps, base, dtype, device, requires_grad), {})
+        _captured = _capture_call(logspace, (start, end, steps, base), {})
         if _captured is not None:
             return _captured
-    if not isinstance(start, (tensorplay.Scalar, tensorplay.Tensor)):
-        start = tensorplay.Scalar(start)
-    if not isinstance(end, (tensorplay.Scalar, tensorplay.Tensor)):
-        end = tensorplay.Scalar(end)
-    return _C.logspace(start, end, steps, base, dtype=dtype, device=_ensure_device(device), requires_grad=requires_grad)
+    return _C.logspace(start=start, end=end, steps=steps, base=base, dtype=dtype, device=device, requires_grad=requires_grad)
 
-def sum(input, dim=None, keepdim=False, *, dtype=DType.undefined):
+def sum(input, dtype=DType.undefined):
     if _capturing():
-        _captured = _capture_call(sum, (input, dim, keepdim, dtype), {})
+        _captured = _capture_call(sum, (input, dtype), {})
         if _captured is not None:
             return _captured
-    if dim is None:
-        return _C.sum(input, dtype=dtype)
-    return _C.sum(input, dim, keepdim, dtype=dtype)
+    return _C.sum(input, dtype=dtype)
 
-def mean(input, dim=None, keepdim=False, *, dtype=DType.undefined):
+def mean(input, *, dtype=DType.undefined, out=None):
+    if out is not None:
+        return _C.mean(self=input, dtype=dtype, out=out)
     if _capturing():
-        _captured = _capture_call(mean, (input, dim, keepdim, dtype), {})
+        _captured = _capture_call(mean, (input,), {})
         if _captured is not None:
             return _captured
-    if dim is None:
-        return _C.mean(input, dtype=dtype)
-    return _C.mean(input, dim, keepdim, dtype=dtype)
+    return _C.mean(self=input, dtype=dtype)
 
 def _sum_dim_backward(grad_output, input, dim, keepdim=False):
     if _capturing():
@@ -1955,82 +2247,84 @@ def mean_dim_backward(grad_output, input, dim, keepdim=False):
         dim = [dim]
     return _C.mean_dim_backward(grad_output, input, dim, keepdim)
 
-def max(input, dim=None, keepdim=False):
+def max(input, *, out=None):
+    if out is not None:
+        return _C.max(self=input, out=out)
     if _capturing():
-        _captured = _capture_call(max, (input, dim, keepdim), {})
+        _captured = _capture_call(max, (input,), {})
         if _captured is not None:
             return _captured
-    if dim is None:
-        return _C.max(input)
-    return _C.max(input, dim, keepdim)
+    return _C.max(self=input)
 
-def min(input, dim=None, keepdim=False):
+def min(input, *, out=None):
+    if out is not None:
+        return _C.min(self=input, out=out)
     if _capturing():
-        _captured = _capture_call(min, (input, dim, keepdim), {})
+        _captured = _capture_call(min, (input,), {})
         if _captured is not None:
             return _captured
-    if dim is None:
-        return _C.min(input)
-    return _C.min(input, dim, keepdim)
+    return _C.min(self=input)
 
-def prod(input, dim=None, keepdim=False, *, dtype=DType.undefined):
+def prod(input, dtype=DType.undefined):
     if _capturing():
-        _captured = _capture_call(prod, (input, dim, keepdim, dtype), {})
+        _captured = _capture_call(prod, (input, dtype), {})
         if _captured is not None:
             return _captured
-    if dim is None:
-        return _C.prod(input, dtype=dtype)
-    return _C.prod(input, dim, keepdim, dtype=dtype)
+    return _C.prod(input, dtype=dtype)
 
-def argmax(input, dim=None, keepdim=False):
+def argmax(input, dim=None, keepdim=False, *, out=None):
+    if out is not None:
+        return _C.argmax(self=input, dim=dim, keepdim=keepdim, out=out)
     if _capturing():
         _captured = _capture_call(argmax, (input, dim, keepdim), {})
         if _captured is not None:
             return _captured
-    return _C.argmax(input, dim, keepdim)
+    return _C.argmax(self=input, dim=dim, keepdim=keepdim)
 
-def argmin(input, dim=None, keepdim=False):
+def argmin(input, dim=None, keepdim=False, *, out=None):
+    if out is not None:
+        return _C.argmin(self=input, dim=dim, keepdim=keepdim, out=out)
     if _capturing():
         _captured = _capture_call(argmin, (input, dim, keepdim), {})
         if _captured is not None:
             return _captured
-    return _C.argmin(input, dim, keepdim)
+    return _C.argmin(self=input, dim=dim, keepdim=keepdim)
 
-def all(input, dim=None, keepdim=False):
+def all(input, dim=None, keepdim=False, *, out=None):
+    if out is not None:
+        return _C.all(self=input, dim=dim, keepdim=keepdim, out=out)
     if _capturing():
         _captured = _capture_call(all, (input, dim, keepdim), {})
         if _captured is not None:
             return _captured
-    if dim is None:
-        return _C.all(input)
-    return _C.all(input, dim, keepdim)
+    return _C.all(self=input, dim=dim, keepdim=keepdim)
 
-def any(input, dim=None, keepdim=False):
+def any(input, dim=None, keepdim=False, *, out=None):
+    if out is not None:
+        return _C.any(self=input, dim=dim, keepdim=keepdim, out=out)
     if _capturing():
         _captured = _capture_call(any, (input, dim, keepdim), {})
         if _captured is not None:
             return _captured
-    if dim is None:
-        return _C.any(input)
-    return _C.any(input, dim, keepdim)
+    return _C.any(self=input, dim=dim, keepdim=keepdim)
 
-def var(input, correction=1, dim=None, keepdim=False):
+def var(input, correction=1, *, out=None):
+    if out is not None:
+        return _C.var(self=input, correction=correction, out=out)
     if _capturing():
-        _captured = _capture_call(var, (input, correction, dim, keepdim), {})
+        _captured = _capture_call(var, (input, correction), {})
         if _captured is not None:
             return _captured
-    if dim is None:
-        return _C.var(input, correction)
-    return _C.var(input, dim, correction, keepdim)
+    return _C.var(self=input, correction=correction)
 
-def std(input, correction=1, dim=None, keepdim=False):
+def std(input, correction=1, *, out=None):
+    if out is not None:
+        return _C.std(self=input, correction=correction, out=out)
     if _capturing():
-        _captured = _capture_call(std, (input, correction, dim, keepdim), {})
+        _captured = _capture_call(std, (input, correction), {})
         if _captured is not None:
             return _captured
-    if dim is None:
-        return _C.std(input, correction)
-    return _C.std(input, dim, correction, keepdim)
+    return _C.std(self=input, correction=correction)
 
 def median(input):
     if _capturing():
@@ -2039,14 +2333,14 @@ def median(input):
             return _captured
     return _C.median(input)
 
-def norm(input, p=2.0, dim=None, keepdim=False):
+def norm(input, p=2.0, *, out=None):
+    if out is not None:
+        return _C.norm(self=input, p=p, out=out)
     if _capturing():
-        _captured = _capture_call(norm, (input, p, dim, keepdim), {})
+        _captured = _capture_call(norm, (input, p), {})
         if _captured is not None:
             return _captured
-    if dim is None:
-        return _C.norm(input, p)
-    return _C.norm(input, dim, p, keepdim)
+    return _C.norm(self=input, p=p)
 
 def exponential_(input, lambd=1.0):
     return input.exponential_(lambd=lambd)
@@ -2057,8 +2351,8 @@ def geometric_(input, p):
 def log_normal_(input, mean=1.0, std=2.0):
     return input.log_normal_(mean=mean, std=std)
 
-def normal_(input, mean=0.0, std=1.0):
-    return input.normal_(mean=mean, std=std)
+def normal_(input, mean=0.0, std=1.0, generator=None):
+    return input.normal_(mean=mean, std=std, generator=generator)
 
 def random_(input, low=0, high=0):
     return input.random_(low=low, high=high)
@@ -2066,8 +2360,8 @@ def random_(input, low=0, high=0):
 def uniform_(input, from_=0.0, to=1.0):
     return input.uniform_(from_=from_, to=to)
 
-def bernoulli_(input):
-    return input.bernoulli_()
+def bernoulli_(input, p, generator=None):
+    return input.bernoulli_(p=p, generator=generator)
 
 def cauchy_(input, median=0.0, sigma=1.0):
     return input.cauchy_(median=median, sigma=sigma)
@@ -2102,12 +2396,14 @@ def full_like(input, fill_value, dtype=DType.undefined, device=None, requires_gr
         fill_value = tensorplay.Scalar(fill_value)
     return _C.full_like(input, fill_value, dtype=dtype, device=device, requires_grad=requires_grad)
 
-def masked_select(input, mask):
+def masked_select(input, mask, *, out=None):
+    if out is not None:
+        return _C.masked_select(self=input, mask=mask, out=out)
     if _capturing():
         _captured = _capture_call(masked_select, (input, mask), {})
         if _captured is not None:
             return _captured
-    return _C.masked_select(input, mask)
+    return _C.masked_select(self=input, mask=mask)
 
 def zero_(input):
     return input.zero_()
@@ -2142,61 +2438,41 @@ def max_pool3d(input, kernel_size, stride=([]), padding=([0, 0, 0]), dilation=([
         dilation = [dilation]
     return _C.max_pool3d(input, kernel_size, stride, padding, dilation, ceil_mode)
 
-def max_pool2d_with_indices(input, kernel_size, stride=([]), padding=([0, 0]), dilation=([1, 1]), ceil_mode=False):
+def max_pool2d_with_indices(input, kernel_size, stride=[], padding=[], dilation=[], ceil_mode=False, *, out=None):
+    if out is not None:
+        return _C.max_pool2d_with_indices(input=input, kernel_size=kernel_size, stride=stride, padding=padding, dilation=dilation, ceil_mode=ceil_mode, out=out)
     if _capturing():
         _captured = _capture_call(max_pool2d_with_indices, (input, kernel_size, stride, padding, dilation, ceil_mode), {})
         if _captured is not None:
             return _captured
-    if isinstance(kernel_size, int) and not isinstance(kernel_size, bool):
-        kernel_size = [kernel_size]
-    if isinstance(stride, int) and not isinstance(stride, bool):
-        stride = [stride]
-    if isinstance(padding, int) and not isinstance(padding, bool):
-        padding = [padding]
-    if isinstance(dilation, int) and not isinstance(dilation, bool):
-        dilation = [dilation]
-    return _C.max_pool2d_with_indices(input, kernel_size, stride, padding, dilation, ceil_mode)
+    return _C.max_pool2d_with_indices(input=input, kernel_size=kernel_size, stride=stride, padding=padding, dilation=dilation, ceil_mode=ceil_mode)
 
-def max_pool3d_with_indices(input, kernel_size, stride=([]), padding=([0, 0, 0]), dilation=([1, 1, 1]), ceil_mode=False):
+def max_pool3d_with_indices(input, kernel_size, stride=[], padding=[], dilation=[], ceil_mode=False, *, out=None):
+    if out is not None:
+        return _C.max_pool3d_with_indices(input=input, kernel_size=kernel_size, stride=stride, padding=padding, dilation=dilation, ceil_mode=ceil_mode, out=out)
     if _capturing():
         _captured = _capture_call(max_pool3d_with_indices, (input, kernel_size, stride, padding, dilation, ceil_mode), {})
         if _captured is not None:
             return _captured
-    if isinstance(kernel_size, int) and not isinstance(kernel_size, bool):
-        kernel_size = [kernel_size]
-    if isinstance(stride, int) and not isinstance(stride, bool):
-        stride = [stride]
-    if isinstance(padding, int) and not isinstance(padding, bool):
-        padding = [padding]
-    if isinstance(dilation, int) and not isinstance(dilation, bool):
-        dilation = [dilation]
-    return _C.max_pool3d_with_indices(input, kernel_size, stride, padding, dilation, ceil_mode)
+    return _C.max_pool3d_with_indices(input=input, kernel_size=kernel_size, stride=stride, padding=padding, dilation=dilation, ceil_mode=ceil_mode)
 
-def avg_pool2d(input, kernel_size, stride=([]), padding=([0, 0]), ceil_mode=False, count_include_pad=True, divisor_override=None):
+def avg_pool2d(input, kernel_size, stride=[], padding=[], ceil_mode=False, count_include_pad=True, divisor_override=None, *, out=None):
+    if out is not None:
+        return _C.avg_pool2d(input=input, kernel_size=kernel_size, stride=stride, padding=padding, ceil_mode=ceil_mode, count_include_pad=count_include_pad, divisor_override=divisor_override, out=out)
     if _capturing():
         _captured = _capture_call(avg_pool2d, (input, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override), {})
         if _captured is not None:
             return _captured
-    if isinstance(kernel_size, int) and not isinstance(kernel_size, bool):
-        kernel_size = [kernel_size]
-    if isinstance(stride, int) and not isinstance(stride, bool):
-        stride = [stride]
-    if isinstance(padding, int) and not isinstance(padding, bool):
-        padding = [padding]
-    return _C.avg_pool2d(input, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override)
+    return _C.avg_pool2d(input=input, kernel_size=kernel_size, stride=stride, padding=padding, ceil_mode=ceil_mode, count_include_pad=count_include_pad, divisor_override=divisor_override)
 
-def avg_pool3d(input, kernel_size, stride=([]), padding=([0, 0, 0]), ceil_mode=False, count_include_pad=True, divisor_override=None):
+def avg_pool3d(input, kernel_size, stride=[], padding=[], ceil_mode=False, count_include_pad=True, divisor_override=None, *, out=None):
+    if out is not None:
+        return _C.avg_pool3d(input=input, kernel_size=kernel_size, stride=stride, padding=padding, ceil_mode=ceil_mode, count_include_pad=count_include_pad, divisor_override=divisor_override, out=out)
     if _capturing():
         _captured = _capture_call(avg_pool3d, (input, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override), {})
         if _captured is not None:
             return _captured
-    if isinstance(kernel_size, int) and not isinstance(kernel_size, bool):
-        kernel_size = [kernel_size]
-    if isinstance(stride, int) and not isinstance(stride, bool):
-        stride = [stride]
-    if isinstance(padding, int) and not isinstance(padding, bool):
-        padding = [padding]
-    return _C.avg_pool3d(input, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override)
+    return _C.avg_pool3d(input=input, kernel_size=kernel_size, stride=stride, padding=padding, ceil_mode=ceil_mode, count_include_pad=count_include_pad, divisor_override=divisor_override)
 
 def avg_pool3d_backward(grad_output, input, kernel_size, stride=([]), padding=([0, 0, 0]), ceil_mode=False, count_include_pad=True, divisor_override=None):
     if _capturing():
@@ -2211,14 +2487,14 @@ def avg_pool3d_backward(grad_output, input, kernel_size, stride=([]), padding=([
         padding = [padding]
     return _C.avg_pool3d_backward(grad_output, input, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override)
 
-def adaptive_avg_pool3d(input, output_size):
+def adaptive_avg_pool3d(input, output_size, *, out=None):
+    if out is not None:
+        return _C.adaptive_avg_pool3d(input=input, output_size=output_size, out=out)
     if _capturing():
         _captured = _capture_call(adaptive_avg_pool3d, (input, output_size), {})
         if _captured is not None:
             return _captured
-    if isinstance(output_size, int) and not isinstance(output_size, bool):
-        output_size = [output_size]
-    return _C.adaptive_avg_pool3d(input, output_size)
+    return _C.adaptive_avg_pool3d(input=input, output_size=output_size)
 
 def adaptive_avg_pool3d_backward(grad_output, input):
     if _capturing():
@@ -2227,23 +2503,23 @@ def adaptive_avg_pool3d_backward(grad_output, input):
             return _captured
     return _C.adaptive_avg_pool3d_backward(grad_output, input)
 
-def adaptive_avg_pool2d(input, output_size):
+def adaptive_avg_pool2d(input, output_size, *, out=None):
+    if out is not None:
+        return _C.adaptive_avg_pool2d(input=input, output_size=output_size, out=out)
     if _capturing():
         _captured = _capture_call(adaptive_avg_pool2d, (input, output_size), {})
         if _captured is not None:
             return _captured
-    if isinstance(output_size, int) and not isinstance(output_size, bool):
-        output_size = [output_size]
-    return _C.adaptive_avg_pool2d(input, output_size)
+    return _C.adaptive_avg_pool2d(input=input, output_size=output_size)
 
-def adaptive_max_pool2d(input, output_size):
+def adaptive_max_pool2d(input, output_size, *, out=None):
+    if out is not None:
+        return _C.adaptive_max_pool2d(input=input, output_size=output_size, out=out)
     if _capturing():
         _captured = _capture_call(adaptive_max_pool2d, (input, output_size), {})
         if _captured is not None:
             return _captured
-    if isinstance(output_size, int) and not isinstance(output_size, bool):
-        output_size = [output_size]
-    return _C.adaptive_max_pool2d(input, output_size)
+    return _C.adaptive_max_pool2d(input=input, output_size=output_size)
 
 def adaptive_max_pool2d_with_indices(input, output_size):
     if _capturing():
@@ -2254,14 +2530,14 @@ def adaptive_max_pool2d_with_indices(input, output_size):
         output_size = [output_size]
     return _C.adaptive_max_pool2d_with_indices(input, output_size)
 
-def adaptive_max_pool3d(input, output_size):
+def adaptive_max_pool3d(input, output_size, *, out=None):
+    if out is not None:
+        return _C.adaptive_max_pool3d(input=input, output_size=output_size, out=out)
     if _capturing():
         _captured = _capture_call(adaptive_max_pool3d, (input, output_size), {})
         if _captured is not None:
             return _captured
-    if isinstance(output_size, int) and not isinstance(output_size, bool):
-        output_size = [output_size]
-    return _C.adaptive_max_pool3d(input, output_size)
+    return _C.adaptive_max_pool3d(input=input, output_size=output_size)
 
 def fractional_max_pool2d(input, kernel_size, output_size, random_samples):
     if _capturing():
@@ -2307,14 +2583,14 @@ def fractional_max_pool3d_backward(grad_output, input, kernel_size, output_size,
         output_size = [output_size]
     return _C.fractional_max_pool3d_backward(grad_output, input, kernel_size, output_size, indices)
 
-def max_unpool2d(input, indices, output_size):
+def max_unpool2d(input, indices, output_size, *, out=None):
+    if out is not None:
+        return _C.max_unpool2d(self=input, indices=indices, output_size=output_size, out=out)
     if _capturing():
         _captured = _capture_call(max_unpool2d, (input, indices, output_size), {})
         if _captured is not None:
             return _captured
-    if isinstance(output_size, int) and not isinstance(output_size, bool):
-        output_size = [output_size]
-    return _C.max_unpool2d(input, indices, output_size)
+    return _C.max_unpool2d(self=input, indices=indices, output_size=output_size)
 
 def max_unpool2d_backward(grad_output, indices, output_size):
     if _capturing():
@@ -2325,18 +2601,14 @@ def max_unpool2d_backward(grad_output, indices, output_size):
         output_size = [output_size]
     return _C.max_unpool2d_backward(grad_output, indices, output_size)
 
-def max_unpool3d(input, indices, output_size, stride, padding):
+def max_unpool3d(input, indices, output_size, stride, padding, *, out=None):
+    if out is not None:
+        return _C.max_unpool3d(self=input, indices=indices, output_size=output_size, stride=stride, padding=padding, out=out)
     if _capturing():
         _captured = _capture_call(max_unpool3d, (input, indices, output_size, stride, padding), {})
         if _captured is not None:
             return _captured
-    if isinstance(output_size, int) and not isinstance(output_size, bool):
-        output_size = [output_size]
-    if isinstance(stride, int) and not isinstance(stride, bool):
-        stride = [stride]
-    if isinstance(padding, int) and not isinstance(padding, bool):
-        padding = [padding]
-    return _C.max_unpool3d(input, indices, output_size, stride, padding)
+    return _C.max_unpool3d(self=input, indices=indices, output_size=output_size, stride=stride, padding=padding)
 
 def max_unpool3d_backward(grad_output, indices, output_size):
     if _capturing():
@@ -2375,12 +2647,14 @@ def grid_sampler_3d_backward(grad_output, input, grid, interpolation_mode, paddi
             return _captured
     return _C.grid_sampler_3d_backward(grad_output, input, grid, interpolation_mode, padding_mode, align_corners, output_mask)
 
-def nll_loss(input, target, weight=None, reduction=1, ignore_index=-100):
+def nll_loss(input, target, weight=None, reduction=1, ignore_index=-100, *, out=None):
+    if out is not None:
+        return _C.nll_loss(self=input, target=target, weight=weight, reduction=reduction, ignore_index=ignore_index, out=out)
     if _capturing():
         _captured = _capture_call(nll_loss, (input, target, weight, reduction, ignore_index), {})
         if _captured is not None:
             return _captured
-    return _C.nll_loss(input, target, weight, reduction, ignore_index)
+    return _C.nll_loss(self=input, target=target, weight=weight, reduction=reduction, ignore_index=ignore_index)
 
 def nll_loss_backward(grad_output, input, target, weight=None, reduction=1, ignore_index=-100, total_weight=None):
     if _capturing():
@@ -2389,12 +2663,14 @@ def nll_loss_backward(grad_output, input, target, weight=None, reduction=1, igno
             return _captured
     return _C.nll_loss_backward(grad_output, input, target, weight, reduction, ignore_index, total_weight)
 
-def nll_loss2d(input, target, weight=None, reduction=1, ignore_index=-100):
+def nll_loss2d(input, target, weight=None, reduction=1, ignore_index=-100, *, out=None):
+    if out is not None:
+        return _C.nll_loss2d(self=input, target=target, weight=weight, reduction=reduction, ignore_index=ignore_index, out=out)
     if _capturing():
         _captured = _capture_call(nll_loss2d, (input, target, weight, reduction, ignore_index), {})
         if _captured is not None:
             return _captured
-    return _C.nll_loss2d(input, target, weight, reduction, ignore_index)
+    return _C.nll_loss2d(self=input, target=target, weight=weight, reduction=reduction, ignore_index=ignore_index)
 
 def nll_loss2d_backward(grad_output, input, target, weight=None, reduction=1, ignore_index=-100, total_weight=None):
     if _capturing():
@@ -2417,12 +2693,14 @@ def _ctc_loss_backward(grad, log_probs, targets, input_lengths, target_lengths, 
             return _captured
     return _C._ctc_loss_backward(grad, log_probs, targets, input_lengths, target_lengths, neg_log_likelihood, log_alpha, blank, zero_infinity)
 
-def mse_loss(input, target, reduction=1):
+def mse_loss(input, target, reduction=1, *, out=None):
+    if out is not None:
+        return _C.mse_loss(self=input, target=target, reduction=reduction, out=out)
     if _capturing():
         _captured = _capture_call(mse_loss, (input, target, reduction), {})
         if _captured is not None:
             return _captured
-    return _C.mse_loss(input, target, reduction)
+    return _C.mse_loss(self=input, target=target, reduction=reduction)
 
 def mse_loss_backward(grad_output, input, target, reduction=1):
     if _capturing():
@@ -2594,12 +2872,14 @@ def instance_norm_backward(grad_output, input, weight=None, bias=None, running_m
             return _captured
     return _C.instance_norm_backward(grad_output, input, weight, bias, running_mean, running_var, use_input_stats, eps)
 
-def multinomial(input, num_samples, replacement=False, impl=0):
+def multinomial(input, num_samples, replacement=False, impl=0, *, out=None):
+    if out is not None:
+        return _C.multinomial(self=input, num_samples=num_samples, replacement=replacement, impl=impl, out=out)
     if _capturing():
         _captured = _capture_call(multinomial, (input, num_samples, replacement, impl), {})
         if _captured is not None:
             return _captured
-    return _C.multinomial(input, num_samples, replacement, impl)
+    return _C.multinomial(self=input, num_samples=num_samples, replacement=replacement, impl=impl)
 
 def topk(input, k, dim=-1, largest=True, sorted=True, impl=0):
     if _capturing():
@@ -2727,79 +3007,79 @@ def tp_poisson_nll_loss_backward(grad_output, input, target, log_input=True, ful
             return _captured
     return _C.tp_poisson_nll_loss_backward(grad_output, input, target, log_input, full, eps, reduction)
 
-def fft_fft(input, n=-1, dim=-1, norm="backward"):
+def fft_fft(input, n=-1, dim=-1, norm='backward', *, out=None):
+    if out is not None:
+        return _C.fft_fft(self=input, n=n, dim=dim, norm=norm, out=out)
     if _capturing():
         _captured = _capture_call(fft_fft, (input, n, dim, norm), {})
         if _captured is not None:
             return _captured
-    return _C.fft_fft(input, n, dim, norm)
+    return _C.fft_fft(self=input, n=n, dim=dim, norm=norm)
 
-def fft_ifft(input, n=-1, dim=-1, norm="backward"):
+def fft_ifft(input, n=-1, dim=-1, norm='backward', *, out=None):
+    if out is not None:
+        return _C.fft_ifft(self=input, n=n, dim=dim, norm=norm, out=out)
     if _capturing():
         _captured = _capture_call(fft_ifft, (input, n, dim, norm), {})
         if _captured is not None:
             return _captured
-    return _C.fft_ifft(input, n, dim, norm)
+    return _C.fft_ifft(self=input, n=n, dim=dim, norm=norm)
 
-def fft_rfft(input, n=-1, dim=-1, norm="backward"):
+def fft_rfft(input, n=-1, dim=-1, norm='backward', *, out=None):
+    if out is not None:
+        return _C.fft_rfft(self=input, n=n, dim=dim, norm=norm, out=out)
     if _capturing():
         _captured = _capture_call(fft_rfft, (input, n, dim, norm), {})
         if _captured is not None:
             return _captured
-    return _C.fft_rfft(input, n, dim, norm)
+    return _C.fft_rfft(self=input, n=n, dim=dim, norm=norm)
 
-def fft_irfft(input, n=-1, dim=-1, norm="backward"):
+def fft_irfft(input, n=-1, dim=-1, norm='backward', *, out=None):
+    if out is not None:
+        return _C.fft_irfft(self=input, n=n, dim=dim, norm=norm, out=out)
     if _capturing():
         _captured = _capture_call(fft_irfft, (input, n, dim, norm), {})
         if _captured is not None:
             return _captured
-    return _C.fft_irfft(input, n, dim, norm)
+    return _C.fft_irfft(self=input, n=n, dim=dim, norm=norm)
 
-def fft_fft2(input, s=None, dim=[-2,-1], norm="backward"):
+def fft_fft2(input, s=None, dim=[-2,-1], norm='backward', *, out=None):
+    if out is not None:
+        return _C.fft_fft2(self=input, s=s, dim=dim, norm=norm, out=out)
     if _capturing():
         _captured = _capture_call(fft_fft2, (input, s, dim, norm), {})
         if _captured is not None:
             return _captured
-    if isinstance(s, int) and not isinstance(s, bool):
-        s = [s]
-    if isinstance(dim, int) and not isinstance(dim, bool):
-        dim = [dim]
-    return _C.fft_fft2(input, s, dim, norm)
+    return _C.fft_fft2(self=input, s=s, dim=dim, norm=norm)
 
-def fft_ifft2(input, s=None, dim=[-2,-1], norm="backward"):
+def fft_ifft2(input, s=None, dim=[-2,-1], norm='backward', *, out=None):
+    if out is not None:
+        return _C.fft_ifft2(self=input, s=s, dim=dim, norm=norm, out=out)
     if _capturing():
         _captured = _capture_call(fft_ifft2, (input, s, dim, norm), {})
         if _captured is not None:
             return _captured
-    if isinstance(s, int) and not isinstance(s, bool):
-        s = [s]
-    if isinstance(dim, int) and not isinstance(dim, bool):
-        dim = [dim]
-    return _C.fft_ifft2(input, s, dim, norm)
+    return _C.fft_ifft2(self=input, s=s, dim=dim, norm=norm)
 
-def fft_rfft2(input, s=None, dim=[-2,-1], norm="backward"):
+def fft_rfft2(input, s=None, dim=[-2,-1], norm='backward', *, out=None):
+    if out is not None:
+        return _C.fft_rfft2(self=input, s=s, dim=dim, norm=norm, out=out)
     if _capturing():
         _captured = _capture_call(fft_rfft2, (input, s, dim, norm), {})
         if _captured is not None:
             return _captured
-    if isinstance(s, int) and not isinstance(s, bool):
-        s = [s]
-    if isinstance(dim, int) and not isinstance(dim, bool):
-        dim = [dim]
-    return _C.fft_rfft2(input, s, dim, norm)
+    return _C.fft_rfft2(self=input, s=s, dim=dim, norm=norm)
 
-def fft_irfft2(input, s=None, dim=[-2,-1], norm="backward"):
+def fft_irfft2(input, s=None, dim=[-2,-1], norm='backward', *, out=None):
+    if out is not None:
+        return _C.fft_irfft2(self=input, s=s, dim=dim, norm=norm, out=out)
     if _capturing():
         _captured = _capture_call(fft_irfft2, (input, s, dim, norm), {})
         if _captured is not None:
             return _captured
-    if isinstance(s, int) and not isinstance(s, bool):
-        s = [s]
-    if isinstance(dim, int) and not isinstance(dim, bool):
-        dim = [dim]
-    return _C.fft_irfft2(input, s, dim, norm)
+    return _C.fft_irfft2(self=input, s=s, dim=dim, norm=norm)
 
-def fft_fft2_backward(grad, input, s=None, dim=[-2,-1], norm="backward"):
+def fft_fft2_backward(grad, input, s=None, dim=[-2,-1], norm='backward'):
     if _capturing():
         _captured = _capture_call(fft_fft2_backward, (grad, input, s, dim, norm), {})
         if _captured is not None:
@@ -2810,7 +3090,7 @@ def fft_fft2_backward(grad, input, s=None, dim=[-2,-1], norm="backward"):
         dim = [dim]
     return _C.fft_fft2_backward(grad, input, s, dim, norm)
 
-def fft_ifft2_backward(grad, input, s=None, dim=[-2,-1], norm="backward"):
+def fft_ifft2_backward(grad, input, s=None, dim=[-2,-1], norm='backward'):
     if _capturing():
         _captured = _capture_call(fft_ifft2_backward, (grad, input, s, dim, norm), {})
         if _captured is not None:
@@ -2821,7 +3101,7 @@ def fft_ifft2_backward(grad, input, s=None, dim=[-2,-1], norm="backward"):
         dim = [dim]
     return _C.fft_ifft2_backward(grad, input, s, dim, norm)
 
-def fft_rfft2_backward(grad, input, s=None, dim=[-2,-1], norm="backward"):
+def fft_rfft2_backward(grad, input, s=None, dim=[-2,-1], norm='backward'):
     if _capturing():
         _captured = _capture_call(fft_rfft2_backward, (grad, input, s, dim, norm), {})
         if _captured is not None:
@@ -2832,7 +3112,7 @@ def fft_rfft2_backward(grad, input, s=None, dim=[-2,-1], norm="backward"):
         dim = [dim]
     return _C.fft_rfft2_backward(grad, input, s, dim, norm)
 
-def fft_irfft2_backward(grad, input, s=None, dim=[-2,-1], norm="backward"):
+def fft_irfft2_backward(grad, input, s=None, dim=[-2,-1], norm='backward'):
     if _capturing():
         _captured = _capture_call(fft_irfft2_backward, (grad, input, s, dim, norm), {})
         if _captured is not None:
@@ -2907,7 +3187,7 @@ def blackman_window(window_length, periodic=True, dtype=None):
             dtype = DType.undefined
     return _C.blackman_window(window_length, periodic, dtype)
 
-def stft(input, n_fft, hop_length=None, win_length=None, window=None, center=True, pad_mode="reflect", normalized=False, onesided=True, return_complex=True):
+def stft(input, n_fft, hop_length=None, win_length=None, window=None, center=True, pad_mode='reflect', normalized=False, onesided=True, return_complex=True):
     if _capturing():
         _captured = _capture_call(stft, (input, n_fft, hop_length, win_length, window, center, pad_mode, normalized, onesided, return_complex), {})
         if _captured is not None:
@@ -2921,19 +3201,21 @@ def istft(input, n_fft, hop_length=None, win_length=None, window=None, center=Tr
             return _captured
     return _C.istft(input, n_fft, hop_length, win_length, window, center, normalized, onesided, length, return_complex)
 
-def stft_backward(grad_output, input, n_fft, hop_length=None, win_length=None, window=None, center=True, pad_mode="reflect", normalized=False, onesided=True):
+def stft_backward(grad_output, input, n_fft, hop_length=None, win_length=None, window=None, center=True, pad_mode='reflect', normalized=False, onesided=True):
     if _capturing():
         _captured = _capture_call(stft_backward, (grad_output, input, n_fft, hop_length, win_length, window, center, pad_mode, normalized, onesided), {})
         if _captured is not None:
             return _captured
     return _C.stft_backward(grad_output, input, n_fft, hop_length, win_length, window, center, pad_mode, normalized, onesided)
 
-def cumsum(input, dim=0, dtype=None):
+def cumsum(input, dim=0, dtype=None, *, out=None):
+    if out is not None:
+        return _C.cumsum(self=input, dim=dim, dtype=dtype, out=out)
     if _capturing():
         _captured = _capture_call(cumsum, (input, dim, dtype), {})
         if _captured is not None:
             return _captured
-    return _C.cumsum(input, dim, dtype)
+    return _C.cumsum(self=input, dim=dim, dtype=dtype)
 
 def flip(input, dims=[]):
     if _capturing():
@@ -2944,26 +3226,32 @@ def flip(input, dims=[]):
         dims = [dims]
     return _C.flip(input, dims)
 
-def index_select(input, dim, index):
+def index_select(input, dim, index, *, out=None):
+    if out is not None:
+        return _C.index_select(self=input, dim=dim, index=index, out=out)
     if _capturing():
         _captured = _capture_call(index_select, (input, dim, index), {})
         if _captured is not None:
             return _captured
-    return _C.index_select(input, dim, index)
+    return _C.index_select(self=input, dim=dim, index=index)
 
-def index_add(input, dim, index, source):
+def index_add(input, dim, index, source, *, out=None):
+    if out is not None:
+        return _C.index_add(self=input, dim=dim, index=index, source=source, out=out)
     if _capturing():
         _captured = _capture_call(index_add, (input, dim, index, source), {})
         if _captured is not None:
             return _captured
-    return _C.index_add(input, dim, index, source)
+    return _C.index_add(self=input, dim=dim, index=index, source=source)
 
-def nonzero(input):
+def nonzero(input, *, out=None):
+    if out is not None:
+        return _C.nonzero(self=input, out=out)
     if _capturing():
         _captured = _capture_call(nonzero, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.nonzero(input)
+    return _C.nonzero(self=input)
 
 def unique(input, sorted=True, return_inverse=False, return_counts=False):
     if _capturing():
@@ -2981,40 +3269,50 @@ def count_nonzero(input, dim=[]):
         dim = [dim]
     return _C.count_nonzero(input, dim)
 
-def log10(input):
+def log10(input, *, out=None):
+    if out is not None:
+        return _C.log10(self=input, out=out)
     if _capturing():
         _captured = _capture_call(log10, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.log10(input)
+    return _C.log10(self=input)
 
-def log1p(input):
+def log1p(input, *, out=None):
+    if out is not None:
+        return _C.log1p(self=input, out=out)
     if _capturing():
         _captured = _capture_call(log1p, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.log1p(input)
+    return _C.log1p(self=input)
 
-def frac(input):
+def frac(input, *, out=None):
+    if out is not None:
+        return _C.frac(self=input, out=out)
     if _capturing():
         _captured = _capture_call(frac, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.frac(input)
+    return _C.frac(self=input)
 
-def i0(input):
+def i0(input, *, out=None):
+    if out is not None:
+        return _C.i0(self=input, out=out)
     if _capturing():
         _captured = _capture_call(i0, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.i0(input)
+    return _C.i0(self=input)
 
-def polar(abs, angle):
+def polar(abs, angle, *, out=None):
+    if out is not None:
+        return _C.polar(abs=abs, angle=angle, out=out)
     if _capturing():
         _captured = _capture_call(polar, (abs, angle), {})
         if _captured is not None:
             return _captured
-    return _C.polar(abs, angle)
+    return _C.polar(abs=abs, angle=angle)
 
 def real(input):
     if _capturing():
@@ -3023,26 +3321,32 @@ def real(input):
             return _captured
     return _C.real(input)
 
-def diff(input, n=1, dim=-1, prepend=None, append=None):
+def diff(input, n=1, dim=-1, prepend=None, append=None, *, out=None):
+    if out is not None:
+        return _C.diff(self=input, n=n, dim=dim, prepend=prepend, append=append, out=out)
     if _capturing():
         _captured = _capture_call(diff, (input, n, dim, prepend, append), {})
         if _captured is not None:
             return _captured
-    return _C.diff(input, n, dim, prepend, append)
+    return _C.diff(self=input, n=n, dim=dim, prepend=prepend, append=append)
 
-def logical_and(input, other):
+def logical_and(input, other, *, out=None):
+    if out is not None:
+        return _C.logical_and(self=input, other=other, out=out)
     if _capturing():
         _captured = _capture_call(logical_and, (input, other), {})
         if _captured is not None:
             return _captured
-    return _C.logical_and(input, other)
+    return _C.logical_and(self=input, other=other)
 
-def cross(input, other, dim=None):
+def cross(input, other, dim=None, *, out=None):
+    if out is not None:
+        return _C.cross(self=input, other=other, dim=dim, out=out)
     if _capturing():
         _captured = _capture_call(cross, (input, other, dim), {})
         if _captured is not None:
             return _captured
-    return _C.cross(input, other, dim)
+    return _C.cross(self=input, other=other, dim=dim)
 
 def roll(input, shifts, dims=[]):
     if _capturing():
@@ -3071,16 +3375,14 @@ def unfold_backward(grad_output, input_sizes, dim, size, step):
         input_sizes = [input_sizes]
     return _C.unfold_backward(grad_output, input_sizes, dim, size, step)
 
-def threshold(input, threshold, value):
+def threshold(input, threshold, value, *, out=None):
+    if out is not None:
+        return _C.threshold(self=input, threshold=threshold, value=value, out=out)
     if _capturing():
         _captured = _capture_call(threshold, (input, threshold, value), {})
         if _captured is not None:
             return _captured
-    if not isinstance(threshold, (tensorplay.Scalar, tensorplay.Tensor)):
-        threshold = tensorplay.Scalar(threshold)
-    if not isinstance(value, (tensorplay.Scalar, tensorplay.Tensor)):
-        value = tensorplay.Scalar(value)
-    return _C.threshold(input, threshold, value)
+    return _C.threshold(self=input, threshold=threshold, value=value)
 
 def relu6(input):
     if _capturing():
@@ -3089,14 +3391,14 @@ def relu6(input):
             return _captured
     return _C.relu6(input)
 
-def leaky_relu(input, negative_slope=0.01):
+def leaky_relu(input, negative_slope=0.01, *, out=None):
+    if out is not None:
+        return _C.leaky_relu(self=input, negative_slope=negative_slope, out=out)
     if _capturing():
         _captured = _capture_call(leaky_relu, (input, negative_slope), {})
         if _captured is not None:
             return _captured
-    if not isinstance(negative_slope, (tensorplay.Scalar, tensorplay.Tensor)):
-        negative_slope = tensorplay.Scalar(negative_slope)
-    return _C.leaky_relu(input, negative_slope)
+    return _C.leaky_relu(self=input, negative_slope=negative_slope)
 
 def leaky_relu_backward(grad_output, input, negative_slope, self_is_result):
     if _capturing():
@@ -3107,16 +3409,14 @@ def leaky_relu_backward(grad_output, input, negative_slope, self_is_result):
         negative_slope = tensorplay.Scalar(negative_slope)
     return _C.leaky_relu_backward(grad_output, input, negative_slope, self_is_result)
 
-def rrelu_with_noise(input, noise, lower=0.125, upper=0.3333333333333333, training=False):
+def rrelu_with_noise(input, noise, lower=0.125, upper=0.3333333333333333, training=False, *, out=None):
+    if out is not None:
+        return _C.rrelu_with_noise(self=input, noise=noise, lower=lower, upper=upper, training=training, out=out)
     if _capturing():
         _captured = _capture_call(rrelu_with_noise, (input, noise, lower, upper, training), {})
         if _captured is not None:
             return _captured
-    if not isinstance(lower, (tensorplay.Scalar, tensorplay.Tensor)):
-        lower = tensorplay.Scalar(lower)
-    if not isinstance(upper, (tensorplay.Scalar, tensorplay.Tensor)):
-        upper = tensorplay.Scalar(upper)
-    return _C.rrelu_with_noise(input, noise, lower, upper, training)
+    return _C.rrelu_with_noise(self=input, noise=noise, lower=lower, upper=upper, training=training)
 
 def rrelu_with_noise_backward(grad_output, input, noise, lower, upper, training, self_is_result):
     if _capturing():
@@ -3129,12 +3429,14 @@ def rrelu_with_noise_backward(grad_output, input, noise, lower, upper, training,
         upper = tensorplay.Scalar(upper)
     return _C.rrelu_with_noise_backward(grad_output, input, noise, lower, upper, training, self_is_result)
 
-def log_sigmoid(input):
+def log_sigmoid(input, *, out=None):
+    if out is not None:
+        return _C.log_sigmoid(self=input, out=out)
     if _capturing():
         _captured = _capture_call(log_sigmoid, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.log_sigmoid(input)
+    return _C.log_sigmoid(self=input)
 
 def log_sigmoid_backward(grad_output, input):
     if _capturing():
@@ -3143,16 +3445,14 @@ def log_sigmoid_backward(grad_output, input):
             return _captured
     return _C.log_sigmoid_backward(grad_output, input)
 
-def hardtanh(input, min_val=-1, max_val=1):
+def hardtanh(input, min_val=-1, max_val=1, *, out=None):
+    if out is not None:
+        return _C.hardtanh(self=input, min_val=min_val, max_val=max_val, out=out)
     if _capturing():
         _captured = _capture_call(hardtanh, (input, min_val, max_val), {})
         if _captured is not None:
             return _captured
-    if not isinstance(min_val, (tensorplay.Scalar, tensorplay.Tensor)):
-        min_val = tensorplay.Scalar(min_val)
-    if not isinstance(max_val, (tensorplay.Scalar, tensorplay.Tensor)):
-        max_val = tensorplay.Scalar(max_val)
-    return _C.hardtanh(input, min_val, max_val)
+    return _C.hardtanh(self=input, min_val=min_val, max_val=max_val)
 
 def hardtanh_backward(grad_output, input, min_val, max_val):
     if _capturing():
@@ -3165,12 +3465,14 @@ def hardtanh_backward(grad_output, input, min_val, max_val):
         max_val = tensorplay.Scalar(max_val)
     return _C.hardtanh_backward(grad_output, input, min_val, max_val)
 
-def hardswish(input):
+def hardswish(input, *, out=None):
+    if out is not None:
+        return _C.hardswish(self=input, out=out)
     if _capturing():
         _captured = _capture_call(hardswish, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.hardswish(input)
+    return _C.hardswish(self=input)
 
 def hardswish_backward(grad_output, input):
     if _capturing():
@@ -3179,12 +3481,14 @@ def hardswish_backward(grad_output, input):
             return _captured
     return _C.hardswish_backward(grad_output, input)
 
-def hardsigmoid(input):
+def hardsigmoid(input, *, out=None):
+    if out is not None:
+        return _C.hardsigmoid(self=input, out=out)
     if _capturing():
         _captured = _capture_call(hardsigmoid, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.hardsigmoid(input)
+    return _C.hardsigmoid(self=input)
 
 def hardsigmoid_backward(grad_output, input):
     if _capturing():
@@ -3193,16 +3497,14 @@ def hardsigmoid_backward(grad_output, input):
             return _captured
     return _C.hardsigmoid_backward(grad_output, input)
 
-def softplus(input, beta=1, threshold=20):
+def softplus(input, beta=1, threshold=20, *, out=None):
+    if out is not None:
+        return _C.softplus(self=input, beta=beta, threshold=threshold, out=out)
     if _capturing():
         _captured = _capture_call(softplus, (input, beta, threshold), {})
         if _captured is not None:
             return _captured
-    if not isinstance(beta, (tensorplay.Scalar, tensorplay.Tensor)):
-        beta = tensorplay.Scalar(beta)
-    if not isinstance(threshold, (tensorplay.Scalar, tensorplay.Tensor)):
-        threshold = tensorplay.Scalar(threshold)
-    return _C.softplus(input, beta, threshold)
+    return _C.softplus(self=input, beta=beta, threshold=threshold)
 
 def softplus_backward(grad_output, input, beta, threshold):
     if _capturing():
@@ -3215,18 +3517,14 @@ def softplus_backward(grad_output, input, beta, threshold):
         threshold = tensorplay.Scalar(threshold)
     return _C.softplus_backward(grad_output, input, beta, threshold)
 
-def elu(input, alpha=1, scale=1, input_scale=1):
+def elu(input, alpha=1, scale=1, input_scale=1, *, out=None):
+    if out is not None:
+        return _C.elu(self=input, alpha=alpha, scale=scale, input_scale=input_scale, out=out)
     if _capturing():
         _captured = _capture_call(elu, (input, alpha, scale, input_scale), {})
         if _captured is not None:
             return _captured
-    if not isinstance(alpha, (tensorplay.Scalar, tensorplay.Tensor)):
-        alpha = tensorplay.Scalar(alpha)
-    if not isinstance(scale, (tensorplay.Scalar, tensorplay.Tensor)):
-        scale = tensorplay.Scalar(scale)
-    if not isinstance(input_scale, (tensorplay.Scalar, tensorplay.Tensor)):
-        input_scale = tensorplay.Scalar(input_scale)
-    return _C.elu(input, alpha, scale, input_scale)
+    return _C.elu(self=input, alpha=alpha, scale=scale, input_scale=input_scale)
 
 def elu_backward(grad_output, alpha, scale, input_scale, is_result, self_or_result):
     if _capturing():
@@ -3257,12 +3555,14 @@ def celu(input, alpha=1.0):
         alpha = tensorplay.Scalar(alpha)
     return _C.celu(input, alpha)
 
-def mish(input):
+def mish(input, *, out=None):
+    if out is not None:
+        return _C.mish(self=input, out=out)
     if _capturing():
         _captured = _capture_call(mish, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.mish(input)
+    return _C.mish(self=input)
 
 def mish_backward(grad_output, input):
     if _capturing():
@@ -3271,14 +3571,14 @@ def mish_backward(grad_output, input):
             return _captured
     return _C.mish_backward(grad_output, input)
 
-def softshrink(input, lambd=0.5):
+def softshrink(input, lambd=0.5, *, out=None):
+    if out is not None:
+        return _C.softshrink(self=input, lambd=lambd, out=out)
     if _capturing():
         _captured = _capture_call(softshrink, (input, lambd), {})
         if _captured is not None:
             return _captured
-    if not isinstance(lambd, (tensorplay.Scalar, tensorplay.Tensor)):
-        lambd = tensorplay.Scalar(lambd)
-    return _C.softshrink(input, lambd)
+    return _C.softshrink(self=input, lambd=lambd)
 
 def softshrink_backward(grad_output, input, lambd):
     if _capturing():
@@ -3289,14 +3589,14 @@ def softshrink_backward(grad_output, input, lambd):
         lambd = tensorplay.Scalar(lambd)
     return _C.softshrink_backward(grad_output, input, lambd)
 
-def hardshrink(input, lambd=0.5):
+def hardshrink(input, lambd=0.5, *, out=None):
+    if out is not None:
+        return _C.hardshrink(self=input, lambd=lambd, out=out)
     if _capturing():
         _captured = _capture_call(hardshrink, (input, lambd), {})
         if _captured is not None:
             return _captured
-    if not isinstance(lambd, (tensorplay.Scalar, tensorplay.Tensor)):
-        lambd = tensorplay.Scalar(lambd)
-    return _C.hardshrink(input, lambd)
+    return _C.hardshrink(self=input, lambd=lambd)
 
 def hardshrink_backward(grad_out, input, lambd):
     if _capturing():
@@ -3307,12 +3607,14 @@ def hardshrink_backward(grad_out, input, lambd):
         lambd = tensorplay.Scalar(lambd)
     return _C.hardshrink_backward(grad_out, input, lambd)
 
-def glu(input, dim=-1):
+def glu(input, dim=-1, *, out=None):
+    if out is not None:
+        return _C.glu(self=input, dim=dim, out=out)
     if _capturing():
         _captured = _capture_call(glu, (input, dim), {})
         if _captured is not None:
             return _captured
-    return _C.glu(input, dim)
+    return _C.glu(self=input, dim=dim)
 
 def glu_backward(grad_output, input, dim=-1):
     if _capturing():
@@ -3403,20 +3705,14 @@ def circular_pad_nd_backward(grad_output, input, pad):
         pad = [pad]
     return _C.circular_pad_nd_backward(grad_output, input, pad)
 
-def im2col(input, kernel_size, dilation=[], padding=[], stride=[]):
+def im2col(input, kernel_size, dilation=[], padding=[], stride=[], *, out=None):
+    if out is not None:
+        return _C.im2col(self=input, kernel_size=kernel_size, dilation=dilation, padding=padding, stride=stride, out=out)
     if _capturing():
         _captured = _capture_call(im2col, (input, kernel_size, dilation, padding, stride), {})
         if _captured is not None:
             return _captured
-    if isinstance(kernel_size, int) and not isinstance(kernel_size, bool):
-        kernel_size = [kernel_size]
-    if isinstance(dilation, int) and not isinstance(dilation, bool):
-        dilation = [dilation]
-    if isinstance(padding, int) and not isinstance(padding, bool):
-        padding = [padding]
-    if isinstance(stride, int) and not isinstance(stride, bool):
-        stride = [stride]
-    return _C.im2col(input, kernel_size, dilation, padding, stride)
+    return _C.im2col(self=input, kernel_size=kernel_size, dilation=dilation, padding=padding, stride=stride)
 
 def im2col_backward(grad_output, input_size, kernel_size, dilation, padding, stride):
     if _capturing():
@@ -3435,22 +3731,14 @@ def im2col_backward(grad_output, input_size, kernel_size, dilation, padding, str
         stride = [stride]
     return _C.im2col_backward(grad_output, input_size, kernel_size, dilation, padding, stride)
 
-def col2im(input, output_size, kernel_size, dilation=[], padding=[], stride=[]):
+def col2im(input, output_size, kernel_size, dilation=[], padding=[], stride=[], *, out=None):
+    if out is not None:
+        return _C.col2im(self=input, output_size=output_size, kernel_size=kernel_size, dilation=dilation, padding=padding, stride=stride, out=out)
     if _capturing():
         _captured = _capture_call(col2im, (input, output_size, kernel_size, dilation, padding, stride), {})
         if _captured is not None:
             return _captured
-    if isinstance(output_size, int) and not isinstance(output_size, bool):
-        output_size = [output_size]
-    if isinstance(kernel_size, int) and not isinstance(kernel_size, bool):
-        kernel_size = [kernel_size]
-    if isinstance(dilation, int) and not isinstance(dilation, bool):
-        dilation = [dilation]
-    if isinstance(padding, int) and not isinstance(padding, bool):
-        padding = [padding]
-    if isinstance(stride, int) and not isinstance(stride, bool):
-        stride = [stride]
-    return _C.col2im(input, output_size, kernel_size, dilation, padding, stride)
+    return _C.col2im(self=input, output_size=output_size, kernel_size=kernel_size, dilation=dilation, padding=padding, stride=stride)
 
 def col2im_backward(grad_output, input_size, output_size, kernel_size, dilation, padding, stride):
     if _capturing():
@@ -3531,14 +3819,14 @@ def conv_transpose1d_grad_bias(grad_output, input, weight, stride, padding, outp
         dilation = [dilation]
     return _C.conv_transpose1d_grad_bias(grad_output, input, weight, stride, padding, output_padding, groups, dilation)
 
-def upsample_nearest1d(input, output_size, scales=None):
+def upsample_nearest1d(input, output_size, scales=None, *, out=None):
+    if out is not None:
+        return _C.upsample_nearest1d(self=input, output_size=output_size, scales=scales, out=out)
     if _capturing():
         _captured = _capture_call(upsample_nearest1d, (input, output_size, scales), {})
         if _captured is not None:
             return _captured
-    if isinstance(output_size, int) and not isinstance(output_size, bool):
-        output_size = [output_size]
-    return _C.upsample_nearest1d(input, output_size, scales)
+    return _C.upsample_nearest1d(self=input, output_size=output_size, scales=scales)
 
 def upsample_nearest1d_backward(grad_output, output_size, input_size, scales=None):
     if _capturing():
@@ -3551,14 +3839,14 @@ def upsample_nearest1d_backward(grad_output, output_size, input_size, scales=Non
         input_size = [input_size]
     return _C.upsample_nearest1d_backward(grad_output, output_size, input_size, scales)
 
-def upsample_nearest2d(input, output_size, scales_h=None, scales_w=None):
+def upsample_nearest2d(input, output_size, scales_h=None, scales_w=None, *, out=None):
+    if out is not None:
+        return _C.upsample_nearest2d(self=input, output_size=output_size, scales_h=scales_h, scales_w=scales_w, out=out)
     if _capturing():
         _captured = _capture_call(upsample_nearest2d, (input, output_size, scales_h, scales_w), {})
         if _captured is not None:
             return _captured
-    if isinstance(output_size, int) and not isinstance(output_size, bool):
-        output_size = [output_size]
-    return _C.upsample_nearest2d(input, output_size, scales_h, scales_w)
+    return _C.upsample_nearest2d(self=input, output_size=output_size, scales_h=scales_h, scales_w=scales_w)
 
 def upsample_nearest2d_backward(grad_output, output_size, input_size, scales_h=None, scales_w=None):
     if _capturing():
@@ -3571,14 +3859,14 @@ def upsample_nearest2d_backward(grad_output, output_size, input_size, scales_h=N
         input_size = [input_size]
     return _C.upsample_nearest2d_backward(grad_output, output_size, input_size, scales_h, scales_w)
 
-def upsample_nearest3d(input, output_size, scales_d=None, scales_h=None, scales_w=None):
+def upsample_nearest3d(input, output_size, scales_d=None, scales_h=None, scales_w=None, *, out=None):
+    if out is not None:
+        return _C.upsample_nearest3d(self=input, output_size=output_size, scales_d=scales_d, scales_h=scales_h, scales_w=scales_w, out=out)
     if _capturing():
         _captured = _capture_call(upsample_nearest3d, (input, output_size, scales_d, scales_h, scales_w), {})
         if _captured is not None:
             return _captured
-    if isinstance(output_size, int) and not isinstance(output_size, bool):
-        output_size = [output_size]
-    return _C.upsample_nearest3d(input, output_size, scales_d, scales_h, scales_w)
+    return _C.upsample_nearest3d(self=input, output_size=output_size, scales_d=scales_d, scales_h=scales_h, scales_w=scales_w)
 
 def upsample_nearest3d_backward(grad_output, output_size, input_size, scales_d=None, scales_h=None, scales_w=None):
     if _capturing():
@@ -3591,14 +3879,14 @@ def upsample_nearest3d_backward(grad_output, output_size, input_size, scales_d=N
         input_size = [input_size]
     return _C.upsample_nearest3d_backward(grad_output, output_size, input_size, scales_d, scales_h, scales_w)
 
-def upsample_linear1d(input, output_size, align_corners, scales=None):
+def upsample_linear1d(input, output_size, align_corners, scales=None, *, out=None):
+    if out is not None:
+        return _C.upsample_linear1d(self=input, output_size=output_size, align_corners=align_corners, scales=scales, out=out)
     if _capturing():
         _captured = _capture_call(upsample_linear1d, (input, output_size, align_corners, scales), {})
         if _captured is not None:
             return _captured
-    if isinstance(output_size, int) and not isinstance(output_size, bool):
-        output_size = [output_size]
-    return _C.upsample_linear1d(input, output_size, align_corners, scales)
+    return _C.upsample_linear1d(self=input, output_size=output_size, align_corners=align_corners, scales=scales)
 
 def upsample_linear1d_backward(grad_output, output_size, input_size, align_corners, scales=None):
     if _capturing():
@@ -3611,14 +3899,14 @@ def upsample_linear1d_backward(grad_output, output_size, input_size, align_corne
         input_size = [input_size]
     return _C.upsample_linear1d_backward(grad_output, output_size, input_size, align_corners, scales)
 
-def upsample_bilinear2d(input, output_size, align_corners, scales_h=None, scales_w=None):
+def upsample_bilinear2d(input, output_size, align_corners, scales_h=None, scales_w=None, *, out=None):
+    if out is not None:
+        return _C.upsample_bilinear2d(self=input, output_size=output_size, align_corners=align_corners, scales_h=scales_h, scales_w=scales_w, out=out)
     if _capturing():
         _captured = _capture_call(upsample_bilinear2d, (input, output_size, align_corners, scales_h, scales_w), {})
         if _captured is not None:
             return _captured
-    if isinstance(output_size, int) and not isinstance(output_size, bool):
-        output_size = [output_size]
-    return _C.upsample_bilinear2d(input, output_size, align_corners, scales_h, scales_w)
+    return _C.upsample_bilinear2d(self=input, output_size=output_size, align_corners=align_corners, scales_h=scales_h, scales_w=scales_w)
 
 def upsample_bilinear2d_backward(grad_output, output_size, input_size, align_corners, scales_h=None, scales_w=None):
     if _capturing():
@@ -3631,14 +3919,14 @@ def upsample_bilinear2d_backward(grad_output, output_size, input_size, align_cor
         input_size = [input_size]
     return _C.upsample_bilinear2d_backward(grad_output, output_size, input_size, align_corners, scales_h, scales_w)
 
-def upsample_bicubic2d(input, output_size, align_corners, scales_h=None, scales_w=None):
+def upsample_bicubic2d(input, output_size, align_corners, scales_h=None, scales_w=None, *, out=None):
+    if out is not None:
+        return _C.upsample_bicubic2d(self=input, output_size=output_size, align_corners=align_corners, scales_h=scales_h, scales_w=scales_w, out=out)
     if _capturing():
         _captured = _capture_call(upsample_bicubic2d, (input, output_size, align_corners, scales_h, scales_w), {})
         if _captured is not None:
             return _captured
-    if isinstance(output_size, int) and not isinstance(output_size, bool):
-        output_size = [output_size]
-    return _C.upsample_bicubic2d(input, output_size, align_corners, scales_h, scales_w)
+    return _C.upsample_bicubic2d(self=input, output_size=output_size, align_corners=align_corners, scales_h=scales_h, scales_w=scales_w)
 
 def upsample_bicubic2d_backward(grad_output, output_size, input_size, align_corners, scales_h=None, scales_w=None):
     if _capturing():
@@ -3651,14 +3939,14 @@ def upsample_bicubic2d_backward(grad_output, output_size, input_size, align_corn
         input_size = [input_size]
     return _C.upsample_bicubic2d_backward(grad_output, output_size, input_size, align_corners, scales_h, scales_w)
 
-def upsample_trilinear3d(input, output_size, align_corners, scales_d=None, scales_h=None, scales_w=None):
+def upsample_trilinear3d(input, output_size, align_corners, scales_d=None, scales_h=None, scales_w=None, *, out=None):
+    if out is not None:
+        return _C.upsample_trilinear3d(self=input, output_size=output_size, align_corners=align_corners, scales_d=scales_d, scales_h=scales_h, scales_w=scales_w, out=out)
     if _capturing():
         _captured = _capture_call(upsample_trilinear3d, (input, output_size, align_corners, scales_d, scales_h, scales_w), {})
         if _captured is not None:
             return _captured
-    if isinstance(output_size, int) and not isinstance(output_size, bool):
-        output_size = [output_size]
-    return _C.upsample_trilinear3d(input, output_size, align_corners, scales_d, scales_h, scales_w)
+    return _C.upsample_trilinear3d(self=input, output_size=output_size, align_corners=align_corners, scales_d=scales_d, scales_h=scales_h, scales_w=scales_w)
 
 def upsample_trilinear3d_backward(grad_output, output_size, input_size, align_corners, scales_d=None, scales_h=None, scales_w=None):
     if _capturing():
@@ -3671,65 +3959,59 @@ def upsample_trilinear3d_backward(grad_output, output_size, input_size, align_co
         input_size = [input_size]
     return _C.upsample_trilinear3d_backward(grad_output, output_size, input_size, align_corners, scales_d, scales_h, scales_w)
 
-def addbmm(input, batch1, batch2, beta=1, alpha=1):
+def addbmm(input, batch1, batch2, *, beta=1, alpha=1, out=None):
+    if out is not None:
+        return _C.addbmm(self=input, batch1=batch1, batch2=batch2, beta=beta, alpha=alpha, out=out)
     if _capturing():
-        _captured = _capture_call(addbmm, (input, batch1, batch2, beta, alpha), {})
+        _captured = _capture_call(addbmm, (input, batch1, batch2), {})
         if _captured is not None:
             return _captured
-    if not isinstance(beta, (tensorplay.Scalar, tensorplay.Tensor)):
-        beta = tensorplay.Scalar(beta)
-    if not isinstance(alpha, (tensorplay.Scalar, tensorplay.Tensor)):
-        alpha = tensorplay.Scalar(alpha)
-    return _C.addbmm(input, batch1, batch2, beta=beta, alpha=alpha)
+    return _C.addbmm(self=input, batch1=batch1, batch2=batch2, beta=beta, alpha=alpha)
 
-def addmv(input, mat, vec, beta=1, alpha=1):
+def addmv(input, mat, vec, *, beta=1, alpha=1, out=None):
+    if out is not None:
+        return _C.addmv(self=input, mat=mat, vec=vec, beta=beta, alpha=alpha, out=out)
     if _capturing():
-        _captured = _capture_call(addmv, (input, mat, vec, beta, alpha), {})
+        _captured = _capture_call(addmv, (input, mat, vec), {})
         if _captured is not None:
             return _captured
-    if not isinstance(beta, (tensorplay.Scalar, tensorplay.Tensor)):
-        beta = tensorplay.Scalar(beta)
-    if not isinstance(alpha, (tensorplay.Scalar, tensorplay.Tensor)):
-        alpha = tensorplay.Scalar(alpha)
-    return _C.addmv(input, mat, vec, beta=beta, alpha=alpha)
+    return _C.addmv(self=input, mat=mat, vec=vec, beta=beta, alpha=alpha)
 
-def addr(input, vec1, vec2, beta=1, alpha=1):
+def addr(input, vec1, vec2, *, beta=1, alpha=1, out=None):
+    if out is not None:
+        return _C.addr(self=input, vec1=vec1, vec2=vec2, beta=beta, alpha=alpha, out=out)
     if _capturing():
-        _captured = _capture_call(addr, (input, vec1, vec2, beta, alpha), {})
+        _captured = _capture_call(addr, (input, vec1, vec2), {})
         if _captured is not None:
             return _captured
-    if not isinstance(beta, (tensorplay.Scalar, tensorplay.Tensor)):
-        beta = tensorplay.Scalar(beta)
-    if not isinstance(alpha, (tensorplay.Scalar, tensorplay.Tensor)):
-        alpha = tensorplay.Scalar(alpha)
-    return _C.addr(input, vec1, vec2, beta=beta, alpha=alpha)
+    return _C.addr(self=input, vec1=vec1, vec2=vec2, beta=beta, alpha=alpha)
 
-def amax(input, dim=[], keepdim=False):
+def amax(input, dim=[], keepdim=False, *, out=None):
+    if out is not None:
+        return _C.amax(self=input, dim=dim, keepdim=keepdim, out=out)
     if _capturing():
         _captured = _capture_call(amax, (input, dim, keepdim), {})
         if _captured is not None:
             return _captured
-    if isinstance(dim, int) and not isinstance(dim, bool):
-        dim = [dim]
-    return _C.amax(input, dim, keepdim)
+    return _C.amax(self=input, dim=dim, keepdim=keepdim)
 
-def amin(input, dim=[], keepdim=False):
+def amin(input, dim=[], keepdim=False, *, out=None):
+    if out is not None:
+        return _C.amin(self=input, dim=dim, keepdim=keepdim, out=out)
     if _capturing():
         _captured = _capture_call(amin, (input, dim, keepdim), {})
         if _captured is not None:
             return _captured
-    if isinstance(dim, int) and not isinstance(dim, bool):
-        dim = [dim]
-    return _C.amin(input, dim, keepdim)
+    return _C.amin(self=input, dim=dim, keepdim=keepdim)
 
-def aminmax(input, dim=[], keepdim=False):
+def aminmax(input, dim=[], keepdim=False, *, out=None):
+    if out is not None:
+        return _C.aminmax(self=input, dim=dim, keepdim=keepdim, out=out)
     if _capturing():
         _captured = _capture_call(aminmax, (input, dim, keepdim), {})
         if _captured is not None:
             return _captured
-    if isinstance(dim, int) and not isinstance(dim, bool):
-        dim = [dim]
-    return _C.aminmax(input, dim, keepdim)
+    return _C.aminmax(self=input, dim=dim, keepdim=keepdim)
 
 def argsort(input, dim=-1, descending=False):
     if _capturing():
@@ -3773,30 +4055,32 @@ def cholesky(input, upper=False):
             return _captured
     return _C.cholesky(input, upper)
 
-def cholesky_inverse(input, upper=False):
+def cholesky_inverse(input, upper=False, *, out=None):
+    if out is not None:
+        return _C.cholesky_inverse(self=input, upper=upper, out=out)
     if _capturing():
         _captured = _capture_call(cholesky_inverse, (input, upper), {})
         if _captured is not None:
             return _captured
-    return _C.cholesky_inverse(input, upper)
+    return _C.cholesky_inverse(self=input, upper=upper)
 
-def cholesky_solve(input, input2, upper=False):
+def cholesky_solve(input, input2, upper=False, *, out=None):
+    if out is not None:
+        return _C.cholesky_solve(self=input, input2=input2, upper=upper, out=out)
     if _capturing():
         _captured = _capture_call(cholesky_solve, (input, input2, upper), {})
         if _captured is not None:
             return _captured
-    return _C.cholesky_solve(input, input2, upper)
+    return _C.cholesky_solve(self=input, input2=input2, upper=upper)
 
-def clip(input, min=None, max=None):
+def clip(input, min=None, max=None, *, out=None):
+    if out is not None:
+        return _C.clip(self=input, min=min, max=max, out=out)
     if _capturing():
         _captured = _capture_call(clip, (input, min, max), {})
         if _captured is not None:
             return _captured
-    if min is not None and not isinstance(min, (tensorplay.Scalar, tensorplay.Tensor)):
-        min = tensorplay.Scalar(min)
-    if max is not None and not isinstance(max, (tensorplay.Scalar, tensorplay.Tensor)):
-        max = tensorplay.Scalar(max)
-    return _C.clip(input, min, max)
+    return _C.clip(self=input, min=min, max=max)
 
 def clamp_(input, min=None, max=None):
     if _capturing():
@@ -3808,24 +4092,6 @@ def clamp_(input, min=None, max=None):
     if max is not None and not isinstance(max, (tensorplay.Scalar, tensorplay.Tensor)):
         max = tensorplay.Scalar(max)
     return _C.clamp_(input, min, max)
-
-def clamp_min(input, min):
-    if _capturing():
-        _captured = _capture_call(clamp_min, (input, min), {})
-        if _captured is not None:
-            return _captured
-    if not isinstance(min, (tensorplay.Scalar, tensorplay.Tensor)):
-        min = tensorplay.Scalar(min)
-    return _C.clamp_min(input, min)
-
-def clamp_max(input, max):
-    if _capturing():
-        _captured = _capture_call(clamp_max, (input, max), {})
-        if _captured is not None:
-            return _captured
-    if not isinstance(max, (tensorplay.Scalar, tensorplay.Tensor)):
-        max = tensorplay.Scalar(max)
-    return _C.clamp_max(input, max)
 
 def clamp_min_(input, min):
     if _capturing():
@@ -3845,12 +4111,14 @@ def clamp_max_(input, max):
         max = tensorplay.Scalar(max)
     return _C.clamp_max_(input, max)
 
-def complex(real, imag):
+def complex(real, imag, *, out=None):
+    if out is not None:
+        return _C.complex(real=real, imag=imag, out=out)
     if _capturing():
         _captured = _capture_call(complex, (real, imag), {})
         if _captured is not None:
             return _captured
-    return _C.complex(real, imag)
+    return _C.complex(real=real, imag=imag)
 
 def conj(input):
     if _capturing():
@@ -3873,40 +4141,50 @@ def imag(input):
             return _captured
     return _C.imag(input)
 
-def cummax(input, dim):
+def cummax(input, dim, *, out=None):
+    if out is not None:
+        return _C.cummax(self=input, dim=dim, out=out)
     if _capturing():
         _captured = _capture_call(cummax, (input, dim), {})
         if _captured is not None:
             return _captured
-    return _C.cummax(input, dim)
+    return _C.cummax(self=input, dim=dim)
 
-def cummin(input, dim):
+def cummin(input, dim, *, out=None):
+    if out is not None:
+        return _C.cummin(self=input, dim=dim, out=out)
     if _capturing():
         _captured = _capture_call(cummin, (input, dim), {})
         if _captured is not None:
             return _captured
-    return _C.cummin(input, dim)
+    return _C.cummin(self=input, dim=dim)
 
-def cumprod(input, dim, dtype=None):
+def cumprod(input, dim, dtype=None, *, out=None):
+    if out is not None:
+        return _C.cumprod(self=input, dim=dim, dtype=dtype, out=out)
     if _capturing():
         _captured = _capture_call(cumprod, (input, dim, dtype), {})
         if _captured is not None:
             return _captured
-    return _C.cumprod(input, dim, dtype)
+    return _C.cumprod(self=input, dim=dim, dtype=dtype)
 
-def logcumsumexp(input, dim, dtype=None):
+def logcumsumexp(input, dim, dtype=None, *, out=None):
+    if out is not None:
+        return _C.logcumsumexp(self=input, dim=dim, dtype=dtype, out=out)
     if _capturing():
         _captured = _capture_call(logcumsumexp, (input, dim, dtype), {})
         if _captured is not None:
             return _captured
-    return _C.logcumsumexp(input, dim, dtype)
+    return _C.logcumsumexp(self=input, dim=dim, dtype=dtype)
 
-def diag(input, diagonal=0):
+def diag(input, diagonal=0, *, out=None):
+    if out is not None:
+        return _C.diag(self=input, diagonal=diagonal, out=out)
     if _capturing():
         _captured = _capture_call(diag, (input, diagonal), {})
         if _captured is not None:
             return _captured
-    return _C.diag(input, diagonal)
+    return _C.diag(self=input, diagonal=diagonal)
 
 def diag_embed(input, offset=0, dim1=-2, dim2=-1):
     if _capturing():
@@ -3924,26 +4202,32 @@ def dist(input, other, p=2):
         p = tensorplay.Scalar(p)
     return _C.dist(input, other, p)
 
-def gather(input, dim, index):
+def gather(input, dim, index, *, out=None):
+    if out is not None:
+        return _C.gather(self=input, dim=dim, index=index, out=out)
     if _capturing():
         _captured = _capture_call(gather, (input, dim, index), {})
         if _captured is not None:
             return _captured
-    return _C.gather(input, dim, index)
+    return _C.gather(self=input, dim=dim, index=index)
 
-def take(input, index):
+def take(input, index, *, out=None):
+    if out is not None:
+        return _C.take(self=input, index=index, out=out)
     if _capturing():
         _captured = _capture_call(take, (input, index), {})
         if _captured is not None:
             return _captured
-    return _C.take(input, index)
+    return _C.take(self=input, index=index)
 
-def take_along_dim(input, indices, dim=None):
+def take_along_dim(input, indices, dim=None, *, out=None):
+    if out is not None:
+        return _C.take_along_dim(self=input, indices=indices, dim=dim, out=out)
     if _capturing():
         _captured = _capture_call(take_along_dim, (input, indices, dim), {})
         if _captured is not None:
             return _captured
-    return _C.take_along_dim(input, indices, dim)
+    return _C.take_along_dim(self=input, indices=indices, dim=dim)
 
 def select_scatter(input, src, dim, index):
     if _capturing():
@@ -3966,19 +4250,23 @@ def diagonal_scatter(input, src, offset=0, dim1=0, dim2=1):
             return _captured
     return _C.diagonal_scatter(input, src, offset, dim1, dim2)
 
-def msort(input):
+def msort(input, *, out=None):
+    if out is not None:
+        return _C.msort(self=input, out=out)
     if _capturing():
         _captured = _capture_call(msort, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.msort(input)
+    return _C.msort(self=input)
 
-def nanmean(input, dim=None, keepdim=False, dtype=None):
+def nanmean(input, dim=None, keepdim=False, *, dtype=None, out=None):
+    if out is not None:
+        return _C.nanmean(self=input, dim=dim, keepdim=keepdim, dtype=dtype, out=out)
     if _capturing():
-        _captured = _capture_call(nanmean, (input, dim, keepdim, dtype), {})
+        _captured = _capture_call(nanmean, (input, dim, keepdim), {})
         if _captured is not None:
             return _captured
-    return _C.nanmean(input, dim, keepdim, dtype=dtype)
+    return _C.nanmean(self=input, dim=dim, keepdim=keepdim, dtype=dtype)
 
 def isclose(input, other, rtol=1e-05, atol=1e-08, equal_nan=False):
     if _capturing():
@@ -3994,12 +4282,14 @@ def isreal(input):
             return _captured
     return _C.isreal(input)
 
-def bitwise_not(input):
+def bitwise_not(input, *, out=None):
+    if out is not None:
+        return _C.bitwise_not(self=input, out=out)
     if _capturing():
         _captured = _capture_call(bitwise_not, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.bitwise_not(input)
+    return _C.bitwise_not(self=input)
 
 def bitwise_and(input, other):
     if _capturing():
@@ -4036,12 +4326,14 @@ def bitwise_right_shift(input, other):
             return _captured
     return _C.bitwise_right_shift(input, other)
 
-def index_copy(input, dim, index, source):
+def index_copy(input, dim, index, source, *, out=None):
+    if out is not None:
+        return _C.index_copy(self=input, dim=dim, index=index, source=source, out=out)
     if _capturing():
         _captured = _capture_call(index_copy, (input, dim, index, source), {})
         if _captured is not None:
             return _captured
-    return _C.index_copy(input, dim, index, source)
+    return _C.index_copy(self=input, dim=dim, index=index, source=source)
 
 def index_fill(input, dim, index, value):
     if _capturing():
@@ -4124,12 +4416,14 @@ def masked_scatter(input, mask, source):
             return _captured
     return _C.masked_scatter(input, mask, source)
 
-def scatter_add(input, dim, index, src):
+def scatter_add(input, dim, index, src, *, out=None):
+    if out is not None:
+        return _C.scatter_add(self=input, dim=dim, index=index, src=src, out=out)
     if _capturing():
         _captured = _capture_call(scatter_add, (input, dim, index, src), {})
         if _captured is not None:
             return _captured
-    return _C.scatter_add(input, dim, index, src)
+    return _C.scatter_add(self=input, dim=dim, index=index, src=src)
 
 def scatter_add_(input, dim, index, src):
     if _capturing():
@@ -4166,14 +4460,14 @@ def nanmedian(input):
             return _captured
     return _C.nanmedian(input)
 
-def nansum(input, dim=[], keepdim=False):
+def nansum(input, dim=[], keepdim=False, *, out=None):
+    if out is not None:
+        return _C.nansum(self=input, dim=dim, keepdim=keepdim, out=out)
     if _capturing():
         _captured = _capture_call(nansum, (input, dim, keepdim), {})
         if _captured is not None:
             return _captured
-    if isinstance(dim, int) and not isinstance(dim, bool):
-        dim = [dim]
-    return _C.nansum(input, dim, keepdim)
+    return _C.nansum(self=input, dim=dim, keepdim=keepdim)
 
 def std_mean(input, dim=[], unbiased=True, keepdim=False):
     if _capturing():
@@ -4200,16 +4494,14 @@ def trace(input):
             return _captured
     return _C.trace(input)
 
-def renorm(input, p, dim, maxnorm):
+def renorm(input, p, dim, maxnorm, *, out=None):
+    if out is not None:
+        return _C.renorm(self=input, p=p, dim=dim, maxnorm=maxnorm, out=out)
     if _capturing():
         _captured = _capture_call(renorm, (input, p, dim, maxnorm), {})
         if _captured is not None:
             return _captured
-    if not isinstance(p, (tensorplay.Scalar, tensorplay.Tensor)):
-        p = tensorplay.Scalar(p)
-    if not isinstance(maxnorm, (tensorplay.Scalar, tensorplay.Tensor)):
-        maxnorm = tensorplay.Scalar(maxnorm)
-    return _C.renorm(input, p, dim, maxnorm)
+    return _C.renorm(self=input, p=p, dim=dim, maxnorm=maxnorm)
 
 def rot90(input, k=1, dims=[0,1]):
     if _capturing():
@@ -4229,7 +4521,7 @@ def split_with_sizes(input, split_sizes, dim=0):
         split_sizes = [split_sizes]
     return _C.split_with_sizes(input, split_sizes, dim)
 
-def meshgrid(tensors, indexing="ij"):
+def meshgrid(tensors, indexing='ij'):
     if _capturing():
         _captured = _capture_call(meshgrid, (tensors, indexing), {})
         if _captured is not None:
@@ -4271,126 +4563,193 @@ def not_equal(input, other):
             return _captured
     return _C.not_equal(input, other)
 
-def logical_not(input):
+def logical_not(input, *, out=None):
+    if out is not None:
+        return _C.logical_not(self=input, out=out)
     if _capturing():
         _captured = _capture_call(logical_not, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.logical_not(input)
+    return _C.logical_not(self=input)
 
-def logical_or(input, other):
+def logical_or(input, other, *, out=None):
+    if out is not None:
+        return _C.logical_or(self=input, other=other, out=out)
     if _capturing():
         _captured = _capture_call(logical_or, (input, other), {})
         if _captured is not None:
             return _captured
-    return _C.logical_or(input, other)
+    return _C.logical_or(self=input, other=other)
 
-def logical_xor(input, other):
+def logical_xor(input, other, *, out=None):
+    if out is not None:
+        return _C.logical_xor(self=input, other=other, out=out)
     if _capturing():
         _captured = _capture_call(logical_xor, (input, other), {})
         if _captured is not None:
             return _captured
-    return _C.logical_xor(input, other)
+    return _C.logical_xor(self=input, other=other)
 
-def deg2rad(input):
+def deg2rad(input, *, out=None):
+    if out is not None:
+        return _C.deg2rad(self=input, out=out)
     if _capturing():
         _captured = _capture_call(deg2rad, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.deg2rad(input)
+    return _C.deg2rad(self=input)
 
-def rad2deg(input):
+def rad2deg(input, *, out=None):
+    if out is not None:
+        return _C.rad2deg(self=input, out=out)
     if _capturing():
         _captured = _capture_call(rad2deg, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.rad2deg(input)
+    return _C.rad2deg(self=input)
 
-def exp2(input):
+def exp2(input, *, out=None):
+    if out is not None:
+        return _C.exp2(self=input, out=out)
     if _capturing():
         _captured = _capture_call(exp2, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.exp2(input)
+    return _C.exp2(self=input)
 
-def fix(input):
+def fix(input, *, out=None):
+    if out is not None:
+        return _C.fix(self=input, out=out)
     if _capturing():
         _captured = _capture_call(fix, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.fix(input)
+    return _C.fix(self=input)
 
-def digamma(input):
+def digamma(input, *, out=None):
+    if out is not None:
+        return _C.digamma(self=input, out=out)
     if _capturing():
         _captured = _capture_call(digamma, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.digamma(input)
+    return _C.digamma(self=input)
 
-def erfinv(input):
+def erfinv(input, *, out=None):
+    if out is not None:
+        return _C.erfinv(self=input, out=out)
     if _capturing():
         _captured = _capture_call(erfinv, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.erfinv(input)
+    return _C.erfinv(self=input)
 
-def sgn(input):
+def erfcx(input):
+    if _capturing():
+        _captured = _capture_call(erfcx, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.erfcx(input)
+
+def ndtr(input):
+    if _capturing():
+        _captured = _capture_call(ndtr, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.ndtr(input)
+
+def ndtri(input):
+    if _capturing():
+        _captured = _capture_call(ndtri, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.ndtri(input)
+
+def log_ndtr(input):
+    if _capturing():
+        _captured = _capture_call(log_ndtr, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.log_ndtr(input)
+
+def entr(input):
+    if _capturing():
+        _captured = _capture_call(entr, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.entr(input)
+
+def sgn(input, *, out=None):
+    if out is not None:
+        return _C.sgn(self=input, out=out)
     if _capturing():
         _captured = _capture_call(sgn, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.sgn(input)
+    return _C.sgn(self=input)
 
-def signbit(input):
+def signbit(input, *, out=None):
+    if out is not None:
+        return _C.signbit(self=input, out=out)
     if _capturing():
         _captured = _capture_call(signbit, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.signbit(input)
+    return _C.signbit(self=input)
 
-def sinc(input):
+def sinc(input, *, out=None):
+    if out is not None:
+        return _C.sinc(self=input, out=out)
     if _capturing():
         _captured = _capture_call(sinc, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.sinc(input)
+    return _C.sinc(self=input)
 
-def heaviside(input, values):
+def heaviside(input, values, *, out=None):
+    if out is not None:
+        return _C.heaviside(self=input, values=values, out=out)
     if _capturing():
         _captured = _capture_call(heaviside, (input, values), {})
         if _captured is not None:
             return _captured
-    return _C.heaviside(input, values)
+    return _C.heaviside(self=input, values=values)
 
-def hypot(input, other):
+def hypot(input, other, *, out=None):
+    if out is not None:
+        return _C.hypot(self=input, other=other, out=out)
     if _capturing():
         _captured = _capture_call(hypot, (input, other), {})
         if _captured is not None:
             return _captured
-    return _C.hypot(input, other)
+    return _C.hypot(self=input, other=other)
 
-def logaddexp(input, other):
+def logaddexp(input, other, *, out=None):
+    if out is not None:
+        return _C.logaddexp(self=input, other=other, out=out)
     if _capturing():
         _captured = _capture_call(logaddexp, (input, other), {})
         if _captured is not None:
             return _captured
-    return _C.logaddexp(input, other)
+    return _C.logaddexp(self=input, other=other)
 
-def logaddexp2(input, other):
+def logaddexp2(input, other, *, out=None):
+    if out is not None:
+        return _C.logaddexp2(self=input, other=other, out=out)
     if _capturing():
         _captured = _capture_call(logaddexp2, (input, other), {})
         if _captured is not None:
             return _captured
-    return _C.logaddexp2(input, other)
+    return _C.logaddexp2(self=input, other=other)
 
-def logit(input, eps=None):
+def logit(input, eps=None, *, out=None):
+    if out is not None:
+        return _C.logit(self=input, eps=eps, out=out)
     if _capturing():
         _captured = _capture_call(logit, (input, eps), {})
         if _captured is not None:
             return _captured
-    if eps is not None and not isinstance(eps, (tensorplay.Scalar, tensorplay.Tensor)):
-        eps = tensorplay.Scalar(eps)
-    return _C.logit(input, eps)
+    return _C.logit(self=input, eps=eps)
 
 def logit_backward(grad_output, input, eps=None):
     if _capturing():
@@ -4415,26 +4774,32 @@ def tanh_backward(grad_output, output):
             return _captured
     return _C.tanh_backward(grad_output, output)
 
-def gcd(input, other):
+def gcd(input, other, *, out=None):
+    if out is not None:
+        return _C.gcd(self=input, other=other, out=out)
     if _capturing():
         _captured = _capture_call(gcd, (input, other), {})
         if _captured is not None:
             return _captured
-    return _C.gcd(input, other)
+    return _C.gcd(self=input, other=other)
 
-def lcm(input, other):
+def lcm(input, other, *, out=None):
+    if out is not None:
+        return _C.lcm(self=input, other=other, out=out)
     if _capturing():
         _captured = _capture_call(lcm, (input, other), {})
         if _captured is not None:
             return _captured
-    return _C.lcm(input, other)
+    return _C.lcm(self=input, other=other)
 
-def nextafter(input, other):
+def nextafter(input, other, *, out=None):
+    if out is not None:
+        return _C.nextafter(self=input, other=other, out=out)
     if _capturing():
         _captured = _capture_call(nextafter, (input, other), {})
         if _captured is not None:
             return _captured
-    return _C.nextafter(input, other)
+    return _C.nextafter(self=input, other=other)
 
 def isfinite(input):
     if _capturing():
@@ -4457,39 +4822,41 @@ def isnan(input):
             return _captured
     return _C.isnan(input)
 
-def isneginf(input):
+def isneginf(input, *, out=None):
+    if out is not None:
+        return _C.isneginf(self=input, out=out)
     if _capturing():
         _captured = _capture_call(isneginf, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.isneginf(input)
+    return _C.isneginf(self=input)
 
-def isposinf(input):
+def isposinf(input, *, out=None):
+    if out is not None:
+        return _C.isposinf(self=input, out=out)
     if _capturing():
         _captured = _capture_call(isposinf, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.isposinf(input)
+    return _C.isposinf(self=input)
 
-def nan_to_num(input, nan=0.0, posinf=None, neginf=None):
+def nan_to_num(input, nan=0.0, posinf=None, neginf=None, *, out=None):
+    if out is not None:
+        return _C.nan_to_num(self=input, nan=nan, posinf=posinf, neginf=neginf, out=out)
     if _capturing():
         _captured = _capture_call(nan_to_num, (input, nan, posinf, neginf), {})
         if _captured is not None:
             return _captured
-    if not isinstance(nan, (tensorplay.Scalar, tensorplay.Tensor)):
-        nan = tensorplay.Scalar(nan)
-    if posinf is not None and not isinstance(posinf, (tensorplay.Scalar, tensorplay.Tensor)):
-        posinf = tensorplay.Scalar(posinf)
-    if neginf is not None and not isinstance(neginf, (tensorplay.Scalar, tensorplay.Tensor)):
-        neginf = tensorplay.Scalar(neginf)
-    return _C.nan_to_num(input, nan, posinf, neginf)
+    return _C.nan_to_num(self=input, nan=nan, posinf=posinf, neginf=neginf)
 
-def negative(input):
+def negative(input, *, out=None):
+    if out is not None:
+        return _C.negative(self=input, out=out)
     if _capturing():
         _captured = _capture_call(negative, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.negative(input)
+    return _C.negative(self=input)
 
 def positive(input):
     if _capturing():
@@ -4512,12 +4879,14 @@ def triangular_solve(input, A, upper=False, transpose=False, unitriangular=False
             return _captured
     return _C.triangular_solve(input, A, upper, transpose, unitriangular)
 
-def vdot(input, other):
+def vdot(input, other, *, out=None):
+    if out is not None:
+        return _C.vdot(self=input, other=other, out=out)
     if _capturing():
         _captured = _capture_call(vdot, (input, other), {})
         if _captured is not None:
             return _captured
-    return _C.vdot(input, other)
+    return _C.vdot(self=input, other=other)
 
 def prelu(input, weight):
     if _capturing():
@@ -4547,12 +4916,14 @@ def l1_loss(input, target):
             return _captured
     return _C.l1_loss(input, target)
 
-def smooth_l1_loss(input, target, reduction=1, beta=1.0):
+def smooth_l1_loss(input, target, reduction=1, beta=1.0, *, out=None):
+    if out is not None:
+        return _C.smooth_l1_loss(self=input, target=target, reduction=reduction, beta=beta, out=out)
     if _capturing():
         _captured = _capture_call(smooth_l1_loss, (input, target, reduction, beta), {})
         if _captured is not None:
             return _captured
-    return _C.smooth_l1_loss(input, target, reduction, beta)
+    return _C.smooth_l1_loss(self=input, target=target, reduction=reduction, beta=beta)
 
 def smooth_l1_loss_backward(grad_output, input, target, reduction, beta):
     if _capturing():
@@ -4561,19 +4932,23 @@ def smooth_l1_loss_backward(grad_output, input, target, reduction, beta):
             return _captured
     return _C.smooth_l1_loss_backward(grad_output, input, target, reduction, beta)
 
-def huber_loss(input, target, reduction=1, delta=1.0):
+def huber_loss(input, target, reduction=1, delta=1.0, *, out=None):
+    if out is not None:
+        return _C.huber_loss(self=input, target=target, reduction=reduction, delta=delta, out=out)
     if _capturing():
         _captured = _capture_call(huber_loss, (input, target, reduction, delta), {})
         if _captured is not None:
             return _captured
-    return _C.huber_loss(input, target, reduction, delta)
+    return _C.huber_loss(self=input, target=target, reduction=reduction, delta=delta)
 
-def huber_loss_backward(grad_output, input, target, reduction, delta):
+def huber_loss_backward(grad_output, input, target, reduction, delta, *, out=None):
+    if out is not None:
+        return _C.huber_loss_backward(grad_output=grad_output, self=input, target=target, reduction=reduction, delta=delta, out=out)
     if _capturing():
         _captured = _capture_call(huber_loss_backward, (grad_output, input, target, reduction, delta), {})
         if _captured is not None:
             return _captured
-    return _C.huber_loss_backward(grad_output, input, target, reduction, delta)
+    return _C.huber_loss_backward(grad_output=grad_output, self=input, target=target, reduction=reduction, delta=delta)
 
 def kl_div(input, target):
     if _capturing():
@@ -4582,12 +4957,14 @@ def kl_div(input, target):
             return _captured
     return _C.kl_div(input, target)
 
-def binary_cross_entropy(input, target, weight=None, reduction=1):
+def binary_cross_entropy(input, target, weight=None, reduction=1, *, out=None):
+    if out is not None:
+        return _C.binary_cross_entropy(self=input, target=target, weight=weight, reduction=reduction, out=out)
     if _capturing():
         _captured = _capture_call(binary_cross_entropy, (input, target, weight, reduction), {})
         if _captured is not None:
             return _captured
-    return _C.binary_cross_entropy(input, target, weight, reduction)
+    return _C.binary_cross_entropy(self=input, target=target, weight=weight, reduction=reduction)
 
 def binary_cross_entropy_backward(grad_output, input, target, weight=None, reduction=1):
     if _capturing():
@@ -4610,12 +4987,14 @@ def poisson_nll_loss(input, target, log_input=True, full=False, eps=1e-08):
             return _captured
     return _C.poisson_nll_loss(input, target, log_input, full, eps)
 
-def soft_margin_loss(input, target):
+def soft_margin_loss(input, target, *, out=None):
+    if out is not None:
+        return _C.soft_margin_loss(input=input, target=target, out=out)
     if _capturing():
         _captured = _capture_call(soft_margin_loss, (input, target), {})
         if _captured is not None:
             return _captured
-    return _C.soft_margin_loss(input, target)
+    return _C.soft_margin_loss(input=input, target=target)
 
 def cosine_embedding_loss(x1, x2, target, margin=0):
     if _capturing():
@@ -4644,16 +5023,14 @@ def hinge_embedding_loss(input, target, margin=1.0):
         margin = tensorplay.Scalar(margin)
     return _C.hinge_embedding_loss(input, target, margin)
 
-def multi_margin_loss(input, target, p=1, margin=1, weight=None, reduction=1):
+def multi_margin_loss(input, target, p=1, margin=1, weight=None, reduction=1, *, out=None):
+    if out is not None:
+        return _C.multi_margin_loss(self=input, target=target, p=p, margin=margin, weight=weight, reduction=reduction, out=out)
     if _capturing():
         _captured = _capture_call(multi_margin_loss, (input, target, p, margin, weight, reduction), {})
         if _captured is not None:
             return _captured
-    if not isinstance(p, (tensorplay.Scalar, tensorplay.Tensor)):
-        p = tensorplay.Scalar(p)
-    if not isinstance(margin, (tensorplay.Scalar, tensorplay.Tensor)):
-        margin = tensorplay.Scalar(margin)
-    return _C.multi_margin_loss(input, target, p, margin, weight, reduction)
+    return _C.multi_margin_loss(self=input, target=target, p=p, margin=margin, weight=weight, reduction=reduction)
 
 def multi_margin_loss_backward(grad_output, input, target, p, margin, weight=None, reduction=1):
     if _capturing():
@@ -4666,12 +5043,14 @@ def multi_margin_loss_backward(grad_output, input, target, p, margin, weight=Non
         margin = tensorplay.Scalar(margin)
     return _C.multi_margin_loss_backward(grad_output, input, target, p, margin, weight, reduction)
 
-def multilabel_margin_loss(input, target, reduction=1):
+def multilabel_margin_loss(input, target, reduction=1, *, out=None):
+    if out is not None:
+        return _C.multilabel_margin_loss(self=input, target=target, reduction=reduction, out=out)
     if _capturing():
         _captured = _capture_call(multilabel_margin_loss, (input, target, reduction), {})
         if _captured is not None:
             return _captured
-    return _C.multilabel_margin_loss(input, target, reduction)
+    return _C.multilabel_margin_loss(self=input, target=target, reduction=reduction)
 
 def multilabel_margin_loss_forward(input, target, reduction):
     if _capturing():
@@ -4731,26 +5110,32 @@ def rnn_tanh(input, hx, params, has_biases=True, num_layers=1, dropout_p=0.0, tr
             return _captured
     return _C.rnn_tanh(input, hx, params, has_biases, num_layers, dropout_p, training, bidirectional, batch_first)
 
-def logsumexp(input, dim, keepdim=False):
+def logsumexp(input, dim, keepdim=False, *, out=None):
+    if out is not None:
+        return _C.logsumexp(self=input, dim=dim, keepdim=keepdim, out=out)
     if _capturing():
         _captured = _capture_call(logsumexp, (input, dim, keepdim), {})
         if _captured is not None:
             return _captured
-    return _C.logsumexp(input, dim, keepdim)
+    return _C.logsumexp(self=input, dim=dim, keepdim=keepdim)
 
-def tril(input, diagonal=0):
+def tril(input, diagonal=0, *, out=None):
+    if out is not None:
+        return _C.tril(self=input, diagonal=diagonal, out=out)
     if _capturing():
         _captured = _capture_call(tril, (input, diagonal), {})
         if _captured is not None:
             return _captured
-    return _C.tril(input, diagonal)
+    return _C.tril(self=input, diagonal=diagonal)
 
-def triu(input, diagonal=0):
+def triu(input, diagonal=0, *, out=None):
+    if out is not None:
+        return _C.triu(self=input, diagonal=diagonal, out=out)
     if _capturing():
         _captured = _capture_call(triu, (input, diagonal), {})
         if _captured is not None:
             return _captured
-    return _C.triu(input, diagonal)
+    return _C.triu(self=input, diagonal=diagonal)
 
 def bessel_j0(input):
     if _capturing():
@@ -4793,6 +5178,13 @@ def spherical_bessel_j0(input):
         if _captured is not None:
             return _captured
     return _C.spherical_bessel_j0(input)
+
+def modified_bessel_i0(input):
+    if _capturing():
+        _captured = _capture_call(modified_bessel_i0, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.modified_bessel_i0(input)
 
 def modified_bessel_i1(input):
     if _capturing():
@@ -4955,12 +5347,14 @@ def gammaincc(a, x):
             return _captured
     return _C.gammaincc(a, x)
 
-def polygamma(n, input):
+def polygamma(n, input, *, out=None):
+    if out is not None:
+        return _C.polygamma(n=n, self=input, out=out)
     if _capturing():
         _captured = _capture_call(polygamma, (n, input), {})
         if _captured is not None:
             return _captured
-    return _C.polygamma(n, input)
+    return _C.polygamma(n=n, self=input)
 
 def sparse_coo_tensor(indices, values, size=None, is_coalesced=False):
     if _capturing():
@@ -4978,12 +5372,14 @@ def to_dense(input):
             return _captured
     return _C.to_dense(input)
 
-def to_sparse(input):
+def to_sparse(input, sparse_dim=None):
     if _capturing():
-        _captured = _capture_call(to_sparse, (input,), {})
+        _captured = _capture_call(to_sparse, (input, sparse_dim), {})
         if _captured is not None:
             return _captured
-    return _C.to_sparse(input)
+    if sparse_dim is None:
+        return _C.to_sparse(input)
+    return _C.to_sparse(input, sparse_dim)
 
 def to_sparse_csr(input):
     if _capturing():
@@ -5005,6 +5401,59 @@ def sparse_mm(input, dense):
         if _captured is not None:
             return _captured
     return _C.sparse_mm(input, dense)
+
+def _to_sparse_semi_structured(dense):
+    if _capturing():
+        _captured = _capture_call(_to_sparse_semi_structured, (dense,), {})
+        if _captured is not None:
+            return _captured
+    return _C._to_sparse_semi_structured(dense)
+
+def _sparse_semi_structured_to_dense(packed, meta):
+    if _capturing():
+        _captured = _capture_call(_sparse_semi_structured_to_dense, (packed, meta), {})
+        if _captured is not None:
+            return _captured
+    return _C._sparse_semi_structured_to_dense(packed, meta)
+
+def _sparse_semi_structured_mask_grad(grad, packed, meta):
+    if _capturing():
+        _captured = _capture_call(_sparse_semi_structured_mask_grad, (grad, packed, meta), {})
+        if _captured is not None:
+            return _captured
+    return _C._sparse_semi_structured_mask_grad(grad, packed, meta)
+
+def _sparse_semi_structured_gather_grad(grad, packed, meta):
+    if _capturing():
+        _captured = _capture_call(_sparse_semi_structured_gather_grad, (grad, packed, meta), {})
+        if _captured is not None:
+            return _captured
+    return _C._sparse_semi_structured_gather_grad(grad, packed, meta)
+
+def _sparse_semi_structured_mm(mat1, mat1_meta, mat2, out_dtype=None):
+    if _capturing():
+        _captured = _capture_call(_sparse_semi_structured_mm, (mat1, mat1_meta, mat2, out_dtype), {})
+        if _captured is not None:
+            return _captured
+    return _C._sparse_semi_structured_mm(mat1, mat1_meta, mat2, out_dtype=out_dtype)
+
+def _sparse_semi_structured_mm_right(mat2, mat1, mat1_meta, out_dtype=None):
+    if _capturing():
+        _captured = _capture_call(_sparse_semi_structured_mm_right, (mat2, mat1, mat1_meta, out_dtype), {})
+        if _captured is not None:
+            return _captured
+    return _C._sparse_semi_structured_mm_right(mat2, mat1, mat1_meta, out_dtype=out_dtype)
+
+def _sparse_semi_structured_addmm(input, mat1, mat1_meta, mat2, alpha=1, beta=1, out_dtype=None):
+    if _capturing():
+        _captured = _capture_call(_sparse_semi_structured_addmm, (input, mat1, mat1_meta, mat2, alpha, beta, out_dtype), {})
+        if _captured is not None:
+            return _captured
+    if not isinstance(alpha, (tensorplay.Scalar, tensorplay.Tensor)):
+        alpha = tensorplay.Scalar(alpha)
+    if not isinstance(beta, (tensorplay.Scalar, tensorplay.Tensor)):
+        beta = tensorplay.Scalar(beta)
+    return _C._sparse_semi_structured_addmm(input, mat1, mat1_meta, mat2, alpha=alpha, beta=beta, out_dtype=out_dtype)
 
 def sparse_sum(input, dim=None, dtype=None):
     if _capturing():
@@ -5217,50 +5666,40 @@ def tile(input, dims):
         dims = [dims]
     return _C.tile(input, dims)
 
-def hstack(tensors, *, out=None):
-    if out is not None:
-        return _C.hstack(tensors=tensors, out=out)
+def hstack(*args):
     if _capturing():
-        _captured = _capture_call(hstack, (tensors,), {})
+        _captured = _capture_call(hstack, (*args,), {})
         if _captured is not None:
             return _captured
-    return _C.hstack(tensors=tensors)
+    return _C.hstack(*args)
 
-def vstack(tensors, *, out=None):
-    if out is not None:
-        return _C.vstack(tensors=tensors, out=out)
+def vstack(*args):
     if _capturing():
-        _captured = _capture_call(vstack, (tensors,), {})
+        _captured = _capture_call(vstack, (*args,), {})
         if _captured is not None:
             return _captured
-    return _C.vstack(tensors=tensors)
+    return _C.vstack(*args)
 
-def dstack(tensors, *, out=None):
-    if out is not None:
-        return _C.dstack(tensors=tensors, out=out)
+def dstack(*args):
     if _capturing():
-        _captured = _capture_call(dstack, (tensors,), {})
+        _captured = _capture_call(dstack, (*args,), {})
         if _captured is not None:
             return _captured
-    return _C.dstack(tensors=tensors)
+    return _C.dstack(*args)
 
-def row_stack(tensors, *, out=None):
-    if out is not None:
-        return _C.row_stack(tensors=tensors, out=out)
+def row_stack(*args):
     if _capturing():
-        _captured = _capture_call(row_stack, (tensors,), {})
+        _captured = _capture_call(row_stack, (*args,), {})
         if _captured is not None:
             return _captured
-    return _C.row_stack(tensors=tensors)
+    return _C.row_stack(*args)
 
-def column_stack(tensors, *, out=None):
-    if out is not None:
-        return _C.column_stack(tensors=tensors, out=out)
+def column_stack(*args):
     if _capturing():
-        _captured = _capture_call(column_stack, (tensors,), {})
+        _captured = _capture_call(column_stack, (*args,), {})
         if _captured is not None:
             return _captured
-    return _C.column_stack(tensors=tensors)
+    return _C.column_stack(*args)
 
 def tensor_split(input, sections, dim=0):
     if _capturing():
@@ -5396,12 +5835,14 @@ def scatter_reduce(input, dim, index, src, reduce, include_self=True):
             return _captured
     return _C.scatter_reduce(input, dim, index, src, reduce, include_self=include_self)
 
-def index_reduce(input, dim, index, source, reduce, include_self=True):
+def index_reduce(input, dim, index, source, reduce, *, include_self=True, out=None):
+    if out is not None:
+        return _C.index_reduce(self=input, dim=dim, index=index, source=source, reduce=reduce, include_self=include_self, out=out)
     if _capturing():
-        _captured = _capture_call(index_reduce, (input, dim, index, source, reduce, include_self), {})
+        _captured = _capture_call(index_reduce, (input, dim, index, source, reduce), {})
         if _captured is not None:
             return _captured
-    return _C.index_reduce(input, dim, index, source, reduce, include_self=include_self)
+    return _C.index_reduce(self=input, dim=dim, index=index, source=source, reduce=reduce, include_self=include_self)
 
 def _scatter_reduce_backward_self(grad, input, dim, index, src, reduce, include_self):
     if _capturing():
@@ -5454,22 +5895,26 @@ def linear(input, weight, bias=None):
             return _captured
     return _C.linear(input, weight, bias)
 
-def absolute(input):
+def absolute(input, *, out=None):
+    if out is not None:
+        return _C.absolute(self=input, out=out)
     if _capturing():
         _captured = _capture_call(absolute, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.absolute(input)
+    return _C.absolute(self=input)
 
 def absolute_(input):
     return input.absolute_()
 
-def arccos(input):
+def arccos(input, *, out=None):
+    if out is not None:
+        return _C.arccos(self=input, out=out)
     if _capturing():
         _captured = _capture_call(arccos, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.arccos(input)
+    return _C.arccos(self=input)
 
 def arccos_(input):
     if _capturing():
@@ -5478,12 +5923,14 @@ def arccos_(input):
             return _captured
     return _C.arccos_(input)
 
-def arccosh(input):
+def arccosh(input, *, out=None):
+    if out is not None:
+        return _C.arccosh(self=input, out=out)
     if _capturing():
         _captured = _capture_call(arccosh, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.arccosh(input)
+    return _C.arccosh(self=input)
 
 def arccosh_(input):
     if _capturing():
@@ -5492,12 +5939,14 @@ def arccosh_(input):
             return _captured
     return _C.arccosh_(input)
 
-def arcsin(input):
+def arcsin(input, *, out=None):
+    if out is not None:
+        return _C.arcsin(self=input, out=out)
     if _capturing():
         _captured = _capture_call(arcsin, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.arcsin(input)
+    return _C.arcsin(self=input)
 
 def arcsin_(input):
     if _capturing():
@@ -5506,12 +5955,14 @@ def arcsin_(input):
             return _captured
     return _C.arcsin_(input)
 
-def arcsinh(input):
+def arcsinh(input, *, out=None):
+    if out is not None:
+        return _C.arcsinh(self=input, out=out)
     if _capturing():
         _captured = _capture_call(arcsinh, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.arcsinh(input)
+    return _C.arcsinh(self=input)
 
 def arcsinh_(input):
     if _capturing():
@@ -5520,12 +5971,14 @@ def arcsinh_(input):
             return _captured
     return _C.arcsinh_(input)
 
-def arctan(input):
+def arctan(input, *, out=None):
+    if out is not None:
+        return _C.arctan(self=input, out=out)
     if _capturing():
         _captured = _capture_call(arctan, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.arctan(input)
+    return _C.arctan(self=input)
 
 def arctan_(input):
     if _capturing():
@@ -5534,12 +5987,14 @@ def arctan_(input):
             return _captured
     return _C.arctan_(input)
 
-def arctanh(input):
+def arctanh(input, *, out=None):
+    if out is not None:
+        return _C.arctanh(self=input, out=out)
     if _capturing():
         _captured = _capture_call(arctanh, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.arctanh(input)
+    return _C.arctanh(self=input)
 
 def arctanh_(input):
     if _capturing():
@@ -5609,19 +6064,23 @@ def max_pool1d(input, kernel_size, stride=[], padding=0, dilation=1, ceil_mode=F
         dilation = [dilation]
     return _C.max_pool1d(input, kernel_size, stride, padding, dilation, ceil_mode)
 
-def concat(tensors, dim=0):
+def concat(tensors, dim=0, *, out=None):
+    if out is not None:
+        return _C.concat(tensors=tensors, dim=dim, out=out)
     if _capturing():
         _captured = _capture_call(concat, (tensors, dim), {})
         if _captured is not None:
             return _captured
-    return _C.concat(tensors, dim)
+    return _C.concat(tensors=tensors, dim=dim)
 
-def concatenate(tensors, dim=0):
+def concatenate(tensors, dim=0, *, out=None):
+    if out is not None:
+        return _C.concatenate(tensors=tensors, dim=dim, out=out)
     if _capturing():
         _captured = _capture_call(concatenate, (tensors, dim), {})
         if _captured is not None:
             return _captured
-    return _C.concatenate(tensors, dim)
+    return _C.concatenate(tensors=tensors, dim=dim)
 
 def diagflat(input, offset=0):
     if _capturing():
@@ -5630,26 +6089,32 @@ def diagflat(input, offset=0):
             return _captured
     return _C.diagflat(input, offset)
 
-def ger(input, vec2):
+def ger(input, vec2, *, out=None):
+    if out is not None:
+        return _C.ger(self=input, vec2=vec2, out=out)
     if _capturing():
         _captured = _capture_call(ger, (input, vec2), {})
         if _captured is not None:
             return _captured
-    return _C.ger(input, vec2)
+    return _C.ger(self=input, vec2=vec2)
 
-def kron(input, other):
+def kron(input, other, *, out=None):
+    if out is not None:
+        return _C.kron(self=input, other=other, out=out)
     if _capturing():
         _captured = _capture_call(kron, (input, other), {})
         if _captured is not None:
             return _captured
-    return _C.kron(input, other)
+    return _C.kron(self=input, other=other)
 
-def matrix_power(input, n):
+def matrix_power(input, n, *, out=None):
+    if out is not None:
+        return _C.matrix_power(self=input, n=n, out=out)
     if _capturing():
         _captured = _capture_call(matrix_power, (input, n), {})
         if _captured is not None:
             return _captured
-    return _C.matrix_power(input, n)
+    return _C.matrix_power(self=input, n=n)
 
 def vander(x, N=None, increasing=False):
     if _capturing():
@@ -5938,7 +6403,7 @@ def gcd_(input, other):
             return _captured
     return _C.gcd_(input, other)
 
-def gelu_(input, approximate="none"):
+def gelu_(input, approximate='none'):
     if _capturing():
         _captured = _capture_call(gelu_, (input, approximate), {})
         if _captured is not None:
@@ -6321,16 +6786,14 @@ def trapz(y, x=None, dx=None, dim=-1):
         dx = 1.0
     return _C.trapz(y, dx=dx, dim=dim)
 
-def histc(input, bins=100, min=0, max=0):
+def histc(input, bins=100, min=0, max=0, *, out=None):
+    if out is not None:
+        return _C.histc(self=input, bins=bins, min=min, max=max, out=out)
     if _capturing():
         _captured = _capture_call(histc, (input, bins, min, max), {})
         if _captured is not None:
             return _captured
-    if not isinstance(min, (tensorplay.Scalar, tensorplay.Tensor)):
-        min = tensorplay.Scalar(min)
-    if not isinstance(max, (tensorplay.Scalar, tensorplay.Tensor)):
-        max = tensorplay.Scalar(max)
-    return _C.histc(input, bins, min, max)
+    return _C.histc(self=input, bins=bins, min=min, max=max)
 
 def isin(elements, test_elements, assume_unique=False, invert=False):
     if _capturing():
@@ -6503,12 +6966,14 @@ def slice_copy(input, dim=0, start=None, end=None, step=1):
             return _captured
     return _C.slice_copy(input, dim, start, end, step)
 
-def narrow_copy(input, dim, start, length):
+def narrow_copy(input, dim, start, length, *, out=None):
+    if out is not None:
+        return _C.narrow_copy(self=input, dim=dim, start=start, length=length, out=out)
     if _capturing():
         _captured = _capture_call(narrow_copy, (input, dim, start, length), {})
         if _captured is not None:
             return _captured
-    return _C.narrow_copy(input, dim, start, length)
+    return _C.narrow_copy(self=input, dim=dim, start=start, length=length)
 
 def diagonal_copy(input, offset=0, dim1=0, dim2=1):
     if _capturing():
@@ -6517,12 +6982,14 @@ def diagonal_copy(input, offset=0, dim1=0, dim2=1):
             return _captured
     return _C.diagonal_copy(input, offset, dim1, dim2)
 
-def unbind_copy(input, dim=0):
+def unbind_copy(input, dim=0, out=None):
     if _capturing():
-        _captured = _capture_call(unbind_copy, (input, dim), {})
+        _captured = _capture_call(unbind_copy, (input, dim, out), {})
         if _captured is not None:
             return _captured
-    return _C.unbind_copy(input, dim)
+    if out is None:
+        return _C.unbind_copy(input, dim)
+    return _C.unbind_copy(input, dim, out)
 
 def split_copy(input, split_size, dim=0):
     if _capturing():
@@ -6706,7 +7173,7 @@ def native_channel_shuffle(input, groups):
 
 def kaiser_window(window_length, periodic=True, beta=12.0, *, dtype=None, device=None, pin_memory=False):
     if _capturing():
-        _captured = _capture_call(kaiser_window, (window_length, periodic, beta, dtype, device, pin_memory), {})
+        _captured = _capture_call(kaiser_window, (window_length, periodic, beta), {'dtype': dtype, 'device': device, 'pin_memory': pin_memory})
         if _captured is not None:
             return _captured
     if dtype is None:
@@ -6727,14 +7194,14 @@ def flipud(input):
             return _captured
     return _C.flipud(input)
 
-def split_with_sizes_copy(input, split_sizes, dim=0):
+def split_with_sizes_copy(input, split_sizes, dim=0, *, out=None):
+    if out is not None:
+        return _C.split_with_sizes_copy(self=input, split_sizes=split_sizes, dim=dim, out=out)
     if _capturing():
         _captured = _capture_call(split_with_sizes_copy, (input, split_sizes, dim), {})
         if _captured is not None:
             return _captured
-    if isinstance(split_sizes, int) and not isinstance(split_sizes, bool):
-        split_sizes = [split_sizes]
-    return _C.split_with_sizes_copy(input, split_sizes, dim)
+    return _C.split_with_sizes_copy(self=input, split_sizes=split_sizes, dim=dim)
 
 def unsafe_split_with_sizes(input, split_sizes, dim=0):
     if _capturing():
@@ -6773,12 +7240,12 @@ def gru_cell(input, hx, w_ih, w_hh, b_ih=None, b_hh=None):
             return _captured
     return _C.gru_cell(input, hx, w_ih, w_hh, b_ih, b_hh)
 
-def cdist(x1, x2, p=2):
+def cdist(x1, x2, p=2, compute_mode=None):
     if _capturing():
-        _captured = _capture_call(cdist, (x1, x2, p), {})
+        _captured = _capture_call(cdist, (x1, x2, p, compute_mode), {})
         if _captured is not None:
             return _captured
-    return _C.cdist(x1, x2, p)
+    return _C.cdist(x1, x2, p, compute_mode=compute_mode)
 
 def xlogy(input, other):
     if _capturing():
@@ -6794,12 +7261,28 @@ def xlogy_(input, other):
             return _captured
     return _C.xlogy_(input, other)
 
-def ldexp(input, other):
+def xlog1py(input, other):
+    if _capturing():
+        _captured = _capture_call(xlog1py, (input, other), {})
+        if _captured is not None:
+            return _captured
+    return _C.xlog1py(input, other)
+
+def xlog1py_(input, other):
+    if _capturing():
+        _captured = _capture_call(xlog1py_, (input, other), {})
+        if _captured is not None:
+            return _captured
+    return _C.xlog1py_(input, other)
+
+def ldexp(input, other, *, out=None):
+    if out is not None:
+        return _C.ldexp(self=input, other=other, out=out)
     if _capturing():
         _captured = _capture_call(ldexp, (input, other), {})
         if _captured is not None:
             return _captured
-    return _C.ldexp(input, other)
+    return _C.ldexp(self=input, other=other)
 
 def ldexp_(input, other):
     if _capturing():
@@ -6808,19 +7291,23 @@ def ldexp_(input, other):
             return _captured
     return _C.ldexp_(input, other)
 
-def fmax(input, other):
+def fmax(input, other, *, out=None):
+    if out is not None:
+        return _C.fmax(self=input, other=other, out=out)
     if _capturing():
         _captured = _capture_call(fmax, (input, other), {})
         if _captured is not None:
             return _captured
-    return _C.fmax(input, other)
+    return _C.fmax(self=input, other=other)
 
-def fmin(input, other):
+def fmin(input, other, *, out=None):
+    if out is not None:
+        return _C.fmin(self=input, other=other, out=out)
     if _capturing():
         _captured = _capture_call(fmin, (input, other), {})
         if _captured is not None:
             return _captured
-    return _C.fmin(input, other)
+    return _C.fmin(self=input, other=other)
 
 def float_power(input, exponent):
     if _capturing():
@@ -6829,19 +7316,23 @@ def float_power(input, exponent):
             return _captured
     return _C.float_power(input, exponent)
 
-def mvlgamma(input, p):
+def mvlgamma(input, p, *, out=None):
+    if out is not None:
+        return _C.mvlgamma(self=input, p=p, out=out)
     if _capturing():
         _captured = _capture_call(mvlgamma, (input, p), {})
         if _captured is not None:
             return _captured
-    return _C.mvlgamma(input, p)
+    return _C.mvlgamma(self=input, p=p)
 
-def conj_physical(input):
+def conj_physical(input, *, out=None):
+    if out is not None:
+        return _C.conj_physical(self=input, out=out)
     if _capturing():
         _captured = _capture_call(conj_physical, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.conj_physical(input)
+    return _C.conj_physical(self=input)
 
 def conj_physical_(input):
     if _capturing():
@@ -6857,20 +7348,14 @@ def negative_(input):
             return _captured
     return _C.negative_(input)
 
-def range(start, end, step=1, dtype=None, device=None):
+def range(start, end, step=1, *, dtype=None, device=None, out=None):
+    if out is not None:
+        return _C.range(start=start, end=end, step=step, dtype=dtype, device=device, out=out)
     if _capturing():
-        _captured = _capture_call(range, (start, end, step, dtype, device), {})
+        _captured = _capture_call(range, (start, end, step), {})
         if _captured is not None:
             return _captured
-    if not isinstance(start, (tensorplay.Scalar, tensorplay.Tensor)):
-        start = tensorplay.Scalar(start)
-    if not isinstance(end, (tensorplay.Scalar, tensorplay.Tensor)):
-        end = tensorplay.Scalar(end)
-    if not isinstance(step, (tensorplay.Scalar, tensorplay.Tensor)):
-        step = tensorplay.Scalar(step)
-    if dtype is None:
-            dtype = DType.undefined
-    return _C.range(start, end, step, dtype=dtype, device=_ensure_device(device))
+    return _C.range(start=start, end=end, step=step, dtype=dtype, device=device)
 
 def is_signed(input):
     if _capturing():
@@ -6879,12 +7364,6120 @@ def is_signed(input):
             return _captured
     return _C.is_signed(input)
 
-def nonzero_static(input, size=None, fill_value=-1):
+def nonzero_static(input, *, size=None, fill_value=-1, out=None):
+    if out is not None:
+        return _C.nonzero_static(self=input, size=size, fill_value=fill_value, out=out)
     if _capturing():
-        _captured = _capture_call(nonzero_static, (input, size, fill_value), {})
+        _captured = _capture_call(nonzero_static, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.nonzero_static(input, size=size, fill_value=fill_value)
+    return _C.nonzero_static(self=input, size=size, fill_value=fill_value)
+
+def frexp(input):
+    if _capturing():
+        _captured = _capture_call(frexp, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.frexp(input)
+
+def igamma(a, x, *, out=None):
+    if out is not None:
+        return _C.igamma(a=a, x=x, out=out)
+    if _capturing():
+        _captured = _capture_call(igamma, (a, x), {})
+        if _captured is not None:
+            return _captured
+    return _C.igamma(a=a, x=x)
+
+def igammac(a, x, *, out=None):
+    if out is not None:
+        return _C.igammac(a=a, x=x, out=out)
+    if _capturing():
+        _captured = _capture_call(igammac, (a, x), {})
+        if _captured is not None:
+            return _captured
+    return _C.igammac(a=a, x=x)
+
+def empty_strided(size, stride, dtype=None, device=None, pin_memory=False):
+    if _capturing():
+        _captured = _capture_call(empty_strided, (size, stride, dtype, device, pin_memory), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(size, int) and not isinstance(size, bool):
+        size = [size]
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if dtype is None:
+            dtype = DType.undefined
+    return _C.empty_strided(size, stride, dtype=dtype, device=_ensure_device(device), pin_memory=pin_memory)
+
+def _cast_Byte(input, non_blocking=False):
+    if _capturing():
+        _captured = _capture_call(_cast_Byte, (input, non_blocking), {})
+        if _captured is not None:
+            return _captured
+    return _C._cast_Byte(input, non_blocking)
+
+def _cast_Char(input, non_blocking=False):
+    if _capturing():
+        _captured = _capture_call(_cast_Char, (input, non_blocking), {})
+        if _captured is not None:
+            return _captured
+    return _C._cast_Char(input, non_blocking)
+
+def _cast_Double(input, non_blocking=False):
+    if _capturing():
+        _captured = _capture_call(_cast_Double, (input, non_blocking), {})
+        if _captured is not None:
+            return _captured
+    return _C._cast_Double(input, non_blocking)
+
+def _cast_Float(input, non_blocking=False):
+    if _capturing():
+        _captured = _capture_call(_cast_Float, (input, non_blocking), {})
+        if _captured is not None:
+            return _captured
+    return _C._cast_Float(input, non_blocking)
+
+def _cast_Int(input, non_blocking=False):
+    if _capturing():
+        _captured = _capture_call(_cast_Int, (input, non_blocking), {})
+        if _captured is not None:
+            return _captured
+    return _C._cast_Int(input, non_blocking)
+
+def _cast_Long(input, non_blocking=False):
+    if _capturing():
+        _captured = _capture_call(_cast_Long, (input, non_blocking), {})
+        if _captured is not None:
+            return _captured
+    return _C._cast_Long(input, non_blocking)
+
+def _cast_Short(input, non_blocking=False):
+    if _capturing():
+        _captured = _capture_call(_cast_Short, (input, non_blocking), {})
+        if _captured is not None:
+            return _captured
+    return _C._cast_Short(input, non_blocking)
+
+def _cast_Half(input, non_blocking=False):
+    if _capturing():
+        _captured = _capture_call(_cast_Half, (input, non_blocking), {})
+        if _captured is not None:
+            return _captured
+    return _C._cast_Half(input, non_blocking)
+
+def _backward(input, inputs, gradient=None, retain_graph=None, create_graph=False):
+    if _capturing():
+        _captured = _capture_call(_backward, (input, inputs, gradient, retain_graph, create_graph), {})
+        if _captured is not None:
+            return _captured
+    return input._backward(inputs=inputs, gradient=gradient, retain_graph=retain_graph, create_graph=create_graph)
+
+def set_data(input, new_data):
+    if _capturing():
+        _captured = _capture_call(set_data, (input, new_data), {})
+        if _captured is not None:
+            return _captured
+    return input.set_data(new_data=new_data)
+
+def data(input):
+    if _capturing():
+        _captured = _capture_call(data, (input,), {})
+        if _captured is not None:
+            return _captured
+    return input.data()
+
+def is_leaf(input):
+    if _capturing():
+        _captured = _capture_call(is_leaf, (input,), {})
+        if _captured is not None:
+            return _captured
+    return input.is_leaf()
+
+def output_nr(input):
+    if _capturing():
+        _captured = _capture_call(output_nr, (input,), {})
+        if _captured is not None:
+            return _captured
+    return input.output_nr()
+
+def _version(input):
+    if _capturing():
+        _captured = _capture_call(_version, (input,), {})
+        if _captured is not None:
+            return _captured
+    return input._version()
+
+def requires_grad_(input, requires_grad=True):
+    return input.requires_grad_(requires_grad=requires_grad)
+
+def retain_grad(input):
+    if _capturing():
+        _captured = _capture_call(retain_grad, (input,), {})
+        if _captured is not None:
+            return _captured
+    return input.retain_grad()
+
+def retains_grad(input):
+    if _capturing():
+        _captured = _capture_call(retains_grad, (input,), {})
+        if _captured is not None:
+            return _captured
+    return input.retains_grad()
+
+def _fw_primal(input, level):
+    if _capturing():
+        _captured = _capture_call(_fw_primal, (input, level), {})
+        if _captured is not None:
+            return _captured
+    return input._fw_primal(level=level)
+
+def _make_dual(primal, tangent, level):
+    if _capturing():
+        _captured = _capture_call(_make_dual, (primal, tangent, level), {})
+        if _captured is not None:
+            return _captured
+    return _C._make_dual(primal, tangent, level)
+
+def _unpack_dual(dual, level):
+    if _capturing():
+        _captured = _capture_call(_unpack_dual, (dual, level), {})
+        if _captured is not None:
+            return _captured
+    return _C._unpack_dual(dual, level)
+
+def _new_zeros_with_same_feature_meta(input, other, self_num_batch_dims=0):
+    if _capturing():
+        _captured = _capture_call(_new_zeros_with_same_feature_meta, (input, other, self_num_batch_dims), {})
+        if _captured is not None:
+            return _captured
+    return _C._new_zeros_with_same_feature_meta(input, other, self_num_batch_dims=self_num_batch_dims)
+
+def _has_same_storage_numel(input, other):
+    if _capturing():
+        _captured = _capture_call(_has_same_storage_numel, (input, other), {})
+        if _captured is not None:
+            return _captured
+    return _C._has_same_storage_numel(input, other)
+
+def _assert_async(input):
+    if _capturing():
+        _captured = _capture_call(_assert_async, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C._assert_async(input)
+
+def _assert_scalar(input, assert_msg):
+    if _capturing():
+        _captured = _capture_call(_assert_scalar, (input, assert_msg), {})
+        if _captured is not None:
+            return _captured
+    if not isinstance(input, (tensorplay.Scalar, tensorplay.Tensor)):
+        input = tensorplay.Scalar(input)
+    return _C._assert_scalar(input, assert_msg)
+
+def _functional_assert_scalar(input, assert_msg, dep_token):
+    if _capturing():
+        _captured = _capture_call(_functional_assert_scalar, (input, assert_msg, dep_token), {})
+        if _captured is not None:
+            return _captured
+    if not isinstance(input, (tensorplay.Scalar, tensorplay.Tensor)):
+        input = tensorplay.Scalar(input)
+    return _C._functional_assert_scalar(input, assert_msg, dep_token)
+
+def _functional_assert_async(input, assert_msg, dep_token):
+    if _capturing():
+        _captured = _capture_call(_functional_assert_async, (input, assert_msg, dep_token), {})
+        if _captured is not None:
+            return _captured
+    return _C._functional_assert_async(input, assert_msg, dep_token)
+
+def _assert_tensor_metadata(a, size=None, stride=None, dtype=None, device=None, layout=None):
+    if _capturing():
+        _captured = _capture_call(_assert_tensor_metadata, (a, size, stride, dtype, device, layout), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(size, int) and not isinstance(size, bool):
+        size = [size]
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    return _C._assert_tensor_metadata(a, size, stride, dtype, device=_ensure_device(device), layout=layout)
+
+def _print(s):
+    if _capturing():
+        _captured = _capture_call(_print, (s,), {})
+        if _captured is not None:
+            return _captured
+    return _C._print(s)
+
+def sym_constrain_range(size, min=None, max=None):
+    if _capturing():
+        _captured = _capture_call(sym_constrain_range, (size, min, max), {})
+        if _captured is not None:
+            return _captured
+    if not isinstance(size, (tensorplay.Scalar, tensorplay.Tensor)):
+        size = tensorplay.Scalar(size)
+    return _C.sym_constrain_range(size, min=min, max=max)
+
+def sym_constrain_range_for_size(size, min=None, max=None):
+    if _capturing():
+        _captured = _capture_call(sym_constrain_range_for_size, (size, min, max), {})
+        if _captured is not None:
+            return _captured
+    if not isinstance(size, (tensorplay.Scalar, tensorplay.Tensor)):
+        size = tensorplay.Scalar(size)
+    return _C.sym_constrain_range_for_size(size, min=min, max=max)
+
+def _functional_sym_constrain_range(size, min, max, dep_token):
+    if _capturing():
+        _captured = _capture_call(_functional_sym_constrain_range, (size, min, max, dep_token), {})
+        if _captured is not None:
+            return _captured
+    if not isinstance(size, (tensorplay.Scalar, tensorplay.Tensor)):
+        size = tensorplay.Scalar(size)
+    return _C._functional_sym_constrain_range(size, min, max, dep_token)
+
+def _functional_sym_constrain_range_for_size(size, min, max, dep_token):
+    if _capturing():
+        _captured = _capture_call(_functional_sym_constrain_range_for_size, (size, min, max, dep_token), {})
+        if _captured is not None:
+            return _captured
+    if not isinstance(size, (tensorplay.Scalar, tensorplay.Tensor)):
+        size = tensorplay.Scalar(size)
+    return _C._functional_sym_constrain_range_for_size(size, min, max, dep_token)
+
+def _make_dep_token(dtype=None, layout=None, device=None, pin_memory=None, memory_format=None):
+    if _capturing():
+        _captured = _capture_call(_make_dep_token, (dtype, layout, device, pin_memory, memory_format), {})
+        if _captured is not None:
+            return _captured
+    if dtype is None:
+            dtype = DType.undefined
+    return _C._make_dep_token(dtype=dtype, layout=layout, device=_ensure_device(device), pin_memory=pin_memory, memory_format=memory_format)
+
+def _use_cudnn_ctc_loss(log_probs, targets, input_lengths, target_lengths, blank):
+    if _capturing():
+        _captured = _capture_call(_use_cudnn_ctc_loss, (log_probs, targets, input_lengths, target_lengths, blank), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(input_lengths, int) and not isinstance(input_lengths, bool):
+        input_lengths = [input_lengths]
+    if isinstance(target_lengths, int) and not isinstance(target_lengths, bool):
+        target_lengths = [target_lengths]
+    return _C._use_cudnn_ctc_loss(log_probs, targets, input_lengths, target_lengths, blank)
+
+def _cudnn_ctc_loss(log_probs, targets, input_lengths, target_lengths, blank, deterministic, zero_infinity):
+    if _capturing():
+        _captured = _capture_call(_cudnn_ctc_loss, (log_probs, targets, input_lengths, target_lengths, blank, deterministic, zero_infinity), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(input_lengths, int) and not isinstance(input_lengths, bool):
+        input_lengths = [input_lengths]
+    if isinstance(target_lengths, int) and not isinstance(target_lengths, bool):
+        target_lengths = [target_lengths]
+    return _C._cudnn_ctc_loss(log_probs, targets, input_lengths, target_lengths, blank, deterministic, zero_infinity)
+
+def _use_cudnn_rnn_flatten_weight():
+    if _capturing():
+        _captured = _capture_call(_use_cudnn_rnn_flatten_weight, (), {})
+        if _captured is not None:
+            return _captured
+    return _C._use_cudnn_rnn_flatten_weight()
+
+def _cudnn_rnn_flatten_weight(weight_arr, weight_stride0, input_size, mode, hidden_size, proj_size, num_layers, batch_first, bidirectional):
+    if _capturing():
+        _captured = _capture_call(_cudnn_rnn_flatten_weight, (weight_arr, weight_stride0, input_size, mode, hidden_size, proj_size, num_layers, batch_first, bidirectional), {})
+        if _captured is not None:
+            return _captured
+    return _C._cudnn_rnn_flatten_weight(weight_arr, weight_stride0, input_size, mode, hidden_size, proj_size, num_layers, batch_first, bidirectional)
+
+def _cudnn_rnn(input, weight, weight_stride0, weight_buf, hx, cx, mode, hidden_size, proj_size, num_layers, batch_first, dropout, train, bidirectional, batch_sizes, dropout_state):
+    if _capturing():
+        _captured = _capture_call(_cudnn_rnn, (input, weight, weight_stride0, weight_buf, hx, cx, mode, hidden_size, proj_size, num_layers, batch_first, dropout, train, bidirectional, batch_sizes, dropout_state), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(batch_sizes, int) and not isinstance(batch_sizes, bool):
+        batch_sizes = [batch_sizes]
+    return _C._cudnn_rnn(input, weight, weight_stride0, weight_buf, hx, cx, mode, hidden_size, proj_size, num_layers, batch_first, dropout, train, bidirectional, batch_sizes, dropout_state)
+
+def _cudnn_rnn_backward(input, weight, weight_stride0, weight_buf, hx, cx, output, grad_output, grad_hy, grad_cy, mode, hidden_size, proj_size, num_layers, batch_first, dropout, train, bidirectional, batch_sizes, dropout_state, reserve, output_mask):
+    if _capturing():
+        _captured = _capture_call(_cudnn_rnn_backward, (input, weight, weight_stride0, weight_buf, hx, cx, output, grad_output, grad_hy, grad_cy, mode, hidden_size, proj_size, num_layers, batch_first, dropout, train, bidirectional, batch_sizes, dropout_state, reserve, output_mask), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(batch_sizes, int) and not isinstance(batch_sizes, bool):
+        batch_sizes = [batch_sizes]
+    return _C._cudnn_rnn_backward(input, weight, weight_stride0, weight_buf, hx, cx, output, grad_output, grad_hy, grad_cy, mode, hidden_size, proj_size, num_layers, batch_first, dropout, train, bidirectional, batch_sizes, dropout_state, reserve, output_mask)
+
+def _cudnn_init_dropout_state(dropout, train, dropout_seed, dtype=None, layout=None, device=None, pin_memory=False):
+    if _capturing():
+        _captured = _capture_call(_cudnn_init_dropout_state, (dropout, train, dropout_seed, dtype, layout, device, pin_memory), {})
+        if _captured is not None:
+            return _captured
+    if dtype is None:
+            dtype = DType.undefined
+    return _C._cudnn_init_dropout_state(dropout, train, dropout_seed, dtype=dtype, layout=layout, device=_ensure_device(device), pin_memory=pin_memory)
+
+def _debug_has_internal_overlap(input):
+    if _capturing():
+        _captured = _capture_call(_debug_has_internal_overlap, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C._debug_has_internal_overlap(input)
+
+def _fused_dropout(input, p, generator=None):
+    if _capturing():
+        _captured = _capture_call(_fused_dropout, (input, p, generator), {})
+        if _captured is not None:
+            return _captured
+    return _C._fused_dropout(input, p, generator)
+
+def _masked_scale(input, mask, scale):
+    if _capturing():
+        _captured = _capture_call(_masked_scale, (input, mask, scale), {})
+        if _captured is not None:
+            return _captured
+    return _C._masked_scale(input, mask, scale)
+
+def _sobol_engine_draw(quasi, n, sobolstate, dimension, num_generated, dtype):
+    if _capturing():
+        _captured = _capture_call(_sobol_engine_draw, (quasi, n, sobolstate, dimension, num_generated, dtype), {})
+        if _captured is not None:
+            return _captured
+    return _C._sobol_engine_draw(quasi, n, sobolstate, dimension, num_generated, dtype)
+
+def _sobol_engine_ff_(input, n, sobolstate, dimension, num_generated):
+    if _capturing():
+        _captured = _capture_call(_sobol_engine_ff_, (input, n, sobolstate, dimension, num_generated), {})
+        if _captured is not None:
+            return _captured
+    return _C._sobol_engine_ff_(input, n, sobolstate, dimension, num_generated)
+
+def _sobol_engine_scramble_(input, ltm, dimension):
+    if _capturing():
+        _captured = _capture_call(_sobol_engine_scramble_, (input, ltm, dimension), {})
+        if _captured is not None:
+            return _captured
+    return _C._sobol_engine_scramble_(input, ltm, dimension)
+
+def _sobol_engine_initialize_state_(input, dimension):
+    if _capturing():
+        _captured = _capture_call(_sobol_engine_initialize_state_, (input, dimension), {})
+        if _captured is not None:
+            return _captured
+    return _C._sobol_engine_initialize_state_(input, dimension)
+
+def _reshape_from_tensor(input, shape):
+    if _capturing():
+        _captured = _capture_call(_reshape_from_tensor, (input, shape), {})
+        if _captured is not None:
+            return _captured
+    return _C._reshape_from_tensor(input, shape)
+
+def _shape_as_tensor(input):
+    if _capturing():
+        _captured = _capture_call(_shape_as_tensor, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C._shape_as_tensor(input)
+
+def chalf(input, memory_format=None):
+    if _capturing():
+        _captured = _capture_call(chalf, (input, memory_format), {})
+        if _captured is not None:
+            return _captured
+    return input.chalf(memory_format=memory_format)
+
+def _conj(input):
+    if _capturing():
+        _captured = _capture_call(_conj, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C._conj(input)
+
+def _conj_physical(input):
+    if _capturing():
+        _captured = _capture_call(_conj_physical, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C._conj_physical(input)
+
+def _neg_view(input):
+    if _capturing():
+        _captured = _capture_call(_neg_view, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C._neg_view(input)
+
+def _add_relu(input, other, *, alpha=1, out=None):
+    if out is not None:
+        return _C._add_relu(self=input, other=other, alpha=alpha, out=out)
+    if _capturing():
+        _captured = _capture_call(_add_relu, (input, other), {})
+        if _captured is not None:
+            return _captured
+    return _C._add_relu(self=input, other=other, alpha=alpha)
+
+def _add_relu_(input, other, alpha=1):
+    if _capturing():
+        _captured = _capture_call(_add_relu_, (input, other, alpha), {})
+        if _captured is not None:
+            return _captured
+    if not isinstance(alpha, (tensorplay.Scalar, tensorplay.Tensor)):
+        alpha = tensorplay.Scalar(alpha)
+    return _C._add_relu_(input, other, alpha=alpha)
+
+def affine_grid_generator(theta, size, align_corners):
+    if _capturing():
+        _captured = _capture_call(affine_grid_generator, (theta, size, align_corners), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(size, int) and not isinstance(size, bool):
+        size = [size]
+    return _C.affine_grid_generator(theta, size, align_corners)
+
+def affine_grid_generator_backward(grad, size, align_corners):
+    if _capturing():
+        _captured = _capture_call(affine_grid_generator_backward, (grad, size, align_corners), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(size, int) and not isinstance(size, bool):
+        size = [size]
+    return _C.affine_grid_generator_backward(grad, size, align_corners)
+
+def _is_all_true(input):
+    if _capturing():
+        _captured = _capture_call(_is_all_true, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C._is_all_true(input)
+
+def _is_any_true(input):
+    if _capturing():
+        _captured = _capture_call(_is_any_true, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C._is_any_true(input)
+
+def _test_check_tensor(input):
+    if _capturing():
+        _captured = _capture_call(_test_check_tensor, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C._test_check_tensor(input)
+
+def _test_functorch_fallback(input, other):
+    if _capturing():
+        _captured = _capture_call(_test_functorch_fallback, (input, other), {})
+        if _captured is not None:
+            return _captured
+    return _C._test_functorch_fallback(input, other)
+
+def _dim_arange(like, dim):
+    if _capturing():
+        _captured = _capture_call(_dim_arange, (like, dim), {})
+        if _captured is not None:
+            return _captured
+    return _C._dim_arange(like, dim)
+
+def as_strided(input, size, stride, storage_offset=None):
+    if _capturing():
+        _captured = _capture_call(as_strided, (input, size, stride, storage_offset), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(size, int) and not isinstance(size, bool):
+        size = [size]
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    return _C.as_strided(input, size, stride, storage_offset)
+
+def as_strided_(input, size, stride, storage_offset=None):
+    if _capturing():
+        _captured = _capture_call(as_strided_, (input, size, stride, storage_offset), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(size, int) and not isinstance(size, bool):
+        size = [size]
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    return _C.as_strided_(input, size, stride, storage_offset)
+
+def baddbmm_(input, batch1, batch2, beta=1, alpha=1):
+    return input.baddbmm_(batch1=batch1, batch2=batch2, beta=beta, alpha=alpha)
+
+def quantized_batch_norm(input, weight, bias, mean, var, eps, output_scale, output_zero_point):
+    if _capturing():
+        _captured = _capture_call(quantized_batch_norm, (input, weight, bias, mean, var, eps, output_scale, output_zero_point), {})
+        if _captured is not None:
+            return _captured
+    return _C.quantized_batch_norm(input, weight, bias, mean, var, eps, output_scale, output_zero_point)
+
+def _batch_norm_impl_index(input, weight, bias, running_mean, running_var, training, momentum, eps, cudnn_enabled):
+    if _capturing():
+        _captured = _capture_call(_batch_norm_impl_index, (input, weight, bias, running_mean, running_var, training, momentum, eps, cudnn_enabled), {})
+        if _captured is not None:
+            return _captured
+    return _C._batch_norm_impl_index(input, weight, bias, running_mean, running_var, training, momentum, eps, cudnn_enabled)
+
+def _batch_norm_impl_index_backward(impl_index, input, grad_output, weight, running_mean, running_var, save_mean, save_var_transform, train, eps, output_mask, reservedSpace):
+    if _capturing():
+        _captured = _capture_call(_batch_norm_impl_index_backward, (impl_index, input, grad_output, weight, running_mean, running_var, save_mean, save_var_transform, train, eps, output_mask, reservedSpace), {})
+        if _captured is not None:
+            return _captured
+    return _C._batch_norm_impl_index_backward(impl_index, input, grad_output, weight, running_mean, running_var, save_mean, save_var_transform, train, eps, output_mask, reservedSpace)
+
+def copysign_(input, other):
+    return input.copysign_(other=other)
+
+def _lazy_clone(input):
+    if _capturing():
+        _captured = _capture_call(_lazy_clone, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C._lazy_clone(input)
+
+def _sparse_broadcast_to(input, size):
+    if _capturing():
+        _captured = _capture_call(_sparse_broadcast_to, (input, size), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(size, int) and not isinstance(size, bool):
+        size = [size]
+    return _C._sparse_broadcast_to(input, size)
+
+def cudnn_is_acceptable(input):
+    if _capturing():
+        _captured = _capture_call(cudnn_is_acceptable, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.cudnn_is_acceptable(input)
+
+def _convolution(input, weight, bias, stride, padding, dilation, transposed, output_padding, groups, benchmark, deterministic, cudnn_enabled, allow_tf32):
+    if _capturing():
+        _captured = _capture_call(_convolution, (input, weight, bias, stride, padding, dilation, transposed, output_padding, groups, benchmark, deterministic, cudnn_enabled, allow_tf32), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    if isinstance(dilation, int) and not isinstance(dilation, bool):
+        dilation = [dilation]
+    if isinstance(output_padding, int) and not isinstance(output_padding, bool):
+        output_padding = [output_padding]
+    return _C._convolution(input, weight, bias, stride, padding, dilation, transposed, output_padding, groups, benchmark, deterministic, cudnn_enabled, allow_tf32)
+
+def _convolution_mode(input, weight, bias, stride, padding, dilation, groups):
+    if _capturing():
+        _captured = _capture_call(_convolution_mode, (input, weight, bias, stride, padding, dilation, groups), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(dilation, int) and not isinstance(dilation, bool):
+        dilation = [dilation]
+    return _C._convolution_mode(input, weight, bias, stride, padding, dilation, groups)
+
+def _convolution_double_backward(ggI, ggW, ggb, gO, weight, input, stride, padding, dilation, transposed, output_padding, groups, output_mask):
+    if _capturing():
+        _captured = _capture_call(_convolution_double_backward, (ggI, ggW, ggb, gO, weight, input, stride, padding, dilation, transposed, output_padding, groups, output_mask), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    if isinstance(dilation, int) and not isinstance(dilation, bool):
+        dilation = [dilation]
+    if isinstance(output_padding, int) and not isinstance(output_padding, bool):
+        output_padding = [output_padding]
+    return _C._convolution_double_backward(ggI, ggW, ggb, gO, weight, input, stride, padding, dilation, transposed, output_padding, groups, output_mask)
+
+def conv_tbc_backward(input, input1, weight, bias, pad):
+    if _capturing():
+        _captured = _capture_call(conv_tbc_backward, (input, input1, weight, bias, pad), {})
+        if _captured is not None:
+            return _captured
+    return _C.conv_tbc_backward(input, input1, weight, bias, pad)
+
+def copy(input, src, non_blocking=False):
+    if _capturing():
+        _captured = _capture_call(copy, (input, src, non_blocking), {})
+        if _captured is not None:
+            return _captured
+    return _C.copy(input, src, non_blocking)
+
+def _copy_from(input, dst, non_blocking=False):
+    if _capturing():
+        _captured = _capture_call(_copy_from, (input, dst, non_blocking), {})
+        if _captured is not None:
+            return _captured
+    return _C._copy_from(input, dst, non_blocking)
+
+def _copy_from_and_resize(input, dst):
+    if _capturing():
+        _captured = _capture_call(_copy_from_and_resize, (input, dst), {})
+        if _captured is not None:
+            return _captured
+    return _C._copy_from_and_resize(input, dst)
+
+def cudnn_affine_grid_generator(theta, N, C, H, W):
+    if _capturing():
+        _captured = _capture_call(cudnn_affine_grid_generator, (theta, N, C, H, W), {})
+        if _captured is not None:
+            return _captured
+    return _C.cudnn_affine_grid_generator(theta, N, C, H, W)
+
+def cudnn_affine_grid_generator_backward(grad, N, C, H, W):
+    if _capturing():
+        _captured = _capture_call(cudnn_affine_grid_generator_backward, (grad, N, C, H, W), {})
+        if _captured is not None:
+            return _captured
+    return _C.cudnn_affine_grid_generator_backward(grad, N, C, H, W)
+
+def cudnn_batch_norm(input, weight, bias, running_mean, running_var, training, exponential_average_factor, epsilon, *, out=None):
+    if out is not None:
+        return _C.cudnn_batch_norm(input=input, weight=weight, bias=bias, running_mean=running_mean, running_var=running_var, training=training, exponential_average_factor=exponential_average_factor, epsilon=epsilon, out=out)
+    if _capturing():
+        _captured = _capture_call(cudnn_batch_norm, (input, weight, bias, running_mean, running_var, training, exponential_average_factor, epsilon), {})
+        if _captured is not None:
+            return _captured
+    return _C.cudnn_batch_norm(input=input, weight=weight, bias=bias, running_mean=running_mean, running_var=running_var, training=training, exponential_average_factor=exponential_average_factor, epsilon=epsilon)
+
+def cudnn_batch_norm_backward(input, grad_output, weight, running_mean, running_var, save_mean, save_var, epsilon, reserveSpace):
+    if _capturing():
+        _captured = _capture_call(cudnn_batch_norm_backward, (input, grad_output, weight, running_mean, running_var, save_mean, save_var, epsilon, reserveSpace), {})
+        if _captured is not None:
+            return _captured
+    return _C.cudnn_batch_norm_backward(input, grad_output, weight, running_mean, running_var, save_mean, save_var, epsilon, reserveSpace)
+
+def cudnn_convolution(input, weight, padding, stride, dilation, groups, benchmark, deterministic, allow_tf32, *, out=None):
+    if out is not None:
+        return _C.cudnn_convolution(self=input, weight=weight, padding=padding, stride=stride, dilation=dilation, groups=groups, benchmark=benchmark, deterministic=deterministic, allow_tf32=allow_tf32, out=out)
+    if _capturing():
+        _captured = _capture_call(cudnn_convolution, (input, weight, padding, stride, dilation, groups, benchmark, deterministic, allow_tf32), {})
+        if _captured is not None:
+            return _captured
+    return _C.cudnn_convolution(self=input, weight=weight, padding=padding, stride=stride, dilation=dilation, groups=groups, benchmark=benchmark, deterministic=deterministic, allow_tf32=allow_tf32)
+
+def cudnn_convolution_transpose(input, weight, padding, output_padding, stride, dilation, groups, benchmark, deterministic, allow_tf32):
+    if _capturing():
+        _captured = _capture_call(cudnn_convolution_transpose, (input, weight, padding, output_padding, stride, dilation, groups, benchmark, deterministic, allow_tf32), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    if isinstance(output_padding, int) and not isinstance(output_padding, bool):
+        output_padding = [output_padding]
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(dilation, int) and not isinstance(dilation, bool):
+        dilation = [dilation]
+    return _C.cudnn_convolution_transpose(input, weight, padding, output_padding, stride, dilation, groups, benchmark, deterministic, allow_tf32)
+
+def _mps_convolution_transpose(input, weight, padding, output_padding, stride, dilation, groups):
+    if _capturing():
+        _captured = _capture_call(_mps_convolution_transpose, (input, weight, padding, output_padding, stride, dilation, groups), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    if isinstance(output_padding, int) and not isinstance(output_padding, bool):
+        output_padding = [output_padding]
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(dilation, int) and not isinstance(dilation, bool):
+        dilation = [dilation]
+    return _C._mps_convolution_transpose(input, weight, padding, output_padding, stride, dilation, groups)
+
+def mps_convolution_transpose_backward(input, grad_output, weight, padding, output_padding, stride, dilation, groups, output_mask):
+    if _capturing():
+        _captured = _capture_call(mps_convolution_transpose_backward, (input, grad_output, weight, padding, output_padding, stride, dilation, groups, output_mask), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    if isinstance(output_padding, int) and not isinstance(output_padding, bool):
+        output_padding = [output_padding]
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(dilation, int) and not isinstance(dilation, bool):
+        dilation = [dilation]
+    return _C.mps_convolution_transpose_backward(input, grad_output, weight, padding, output_padding, stride, dilation, groups, output_mask)
+
+def cudnn_convolution_relu(input, weight, bias, stride, padding, dilation, groups):
+    if _capturing():
+        _captured = _capture_call(cudnn_convolution_relu, (input, weight, bias, stride, padding, dilation, groups), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    if isinstance(dilation, int) and not isinstance(dilation, bool):
+        dilation = [dilation]
+    return _C.cudnn_convolution_relu(input, weight, bias, stride, padding, dilation, groups)
+
+def cudnn_convolution_add_relu(input, weight, z, alpha, bias, stride, padding, dilation, groups):
+    if _capturing():
+        _captured = _capture_call(cudnn_convolution_add_relu, (input, weight, z, alpha, bias, stride, padding, dilation, groups), {})
+        if _captured is not None:
+            return _captured
+    if alpha is not None and not isinstance(alpha, (tensorplay.Scalar, tensorplay.Tensor)):
+        alpha = tensorplay.Scalar(alpha)
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    if isinstance(dilation, int) and not isinstance(dilation, bool):
+        dilation = [dilation]
+    return _C.cudnn_convolution_add_relu(input, weight, z, alpha, bias, stride, padding, dilation, groups)
+
+def cudnn_grid_sampler(input, grid):
+    if _capturing():
+        _captured = _capture_call(cudnn_grid_sampler, (input, grid), {})
+        if _captured is not None:
+            return _captured
+    return _C.cudnn_grid_sampler(input, grid)
+
+def cudnn_grid_sampler_backward(input, grid, grad_output):
+    if _capturing():
+        _captured = _capture_call(cudnn_grid_sampler_backward, (input, grid, grad_output), {})
+        if _captured is not None:
+            return _captured
+    return _C.cudnn_grid_sampler_backward(input, grid, grad_output)
+
+def _cummax_helper(input, values, indices, dim):
+    if _capturing():
+        _captured = _capture_call(_cummax_helper, (input, values, indices, dim), {})
+        if _captured is not None:
+            return _captured
+    return _C._cummax_helper(input, values, indices, dim)
+
+def _cummin_helper(input, values, indices, dim):
+    if _capturing():
+        _captured = _capture_call(_cummin_helper, (input, values, indices, dim), {})
+        if _captured is not None:
+            return _captured
+    return _C._cummin_helper(input, values, indices, dim)
+
+def cummaxmin_backward(grad, input, indices, dim):
+    if _capturing():
+        _captured = _capture_call(cummaxmin_backward, (grad, input, indices, dim), {})
+        if _captured is not None:
+            return _captured
+    return _C.cummaxmin_backward(grad, input, indices, dim)
+
+def cumprod_backward(grad, input, dim, output):
+    if _capturing():
+        _captured = _capture_call(cumprod_backward, (grad, input, dim, output), {})
+        if _captured is not None:
+            return _captured
+    return _C.cumprod_backward(grad, input, dim, output)
+
+def ctc_loss(log_probs, targets, input_lengths, target_lengths, blank=0, reduction=1, zero_infinity=False):
+    if _capturing():
+        _captured = _capture_call(ctc_loss, (log_probs, targets, input_lengths, target_lengths, blank, reduction, zero_infinity), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(input_lengths, int) and not isinstance(input_lengths, bool):
+        input_lengths = [input_lengths]
+    if isinstance(target_lengths, int) and not isinstance(target_lengths, bool):
+        target_lengths = [target_lengths]
+    return _C.ctc_loss(log_probs, targets, input_lengths, target_lengths, blank, reduction, zero_infinity)
+
+def fill_diagonal_(input, fill_value, wrap=False):
+    return input.fill_diagonal_(fill_value=fill_value, wrap=wrap)
+
+def divide_(input, other, rounding_mode=None):
+    if _capturing():
+        _captured = _capture_call(divide_, (input, other), {'rounding_mode': rounding_mode})
+        if _captured is not None:
+            return _captured
+    if not isinstance(input, tensorplay.Tensor):
+        input = tensorplay.as_tensor(input)
+    if rounding_mode is None:
+        return input.divide_(other=other)
+    return input.divide_(other=other, rounding_mode=rounding_mode)
+
+def true_divide_(input, other):
+    return input.true_divide_(other=other)
+
+def embedding_backward(grad, indices, num_weights, padding_idx, scale_grad_by_freq, sparse):
+    if _capturing():
+        _captured = _capture_call(embedding_backward, (grad, indices, num_weights, padding_idx, scale_grad_by_freq, sparse), {})
+        if _captured is not None:
+            return _captured
+    return _C.embedding_backward(grad, indices, num_weights, padding_idx, scale_grad_by_freq, sparse)
+
+def embedding_renorm_(input, indices, max_norm, norm_type):
+    if _capturing():
+        _captured = _capture_call(embedding_renorm_, (input, indices, max_norm, norm_type), {})
+        if _captured is not None:
+            return _captured
+    return _C.embedding_renorm_(input, indices, max_norm, norm_type)
+
+def embedding_sparse_backward(grad, indices, num_weights, padding_idx, scale_grad_by_freq):
+    if _capturing():
+        _captured = _capture_call(embedding_sparse_backward, (grad, indices, num_weights, padding_idx, scale_grad_by_freq), {})
+        if _captured is not None:
+            return _captured
+    return _C.embedding_sparse_backward(grad, indices, num_weights, padding_idx, scale_grad_by_freq)
+
+def _rowwise_prune(weight, mask, compressed_indices_dtype):
+    if _capturing():
+        _captured = _capture_call(_rowwise_prune, (weight, mask, compressed_indices_dtype), {})
+        if _captured is not None:
+            return _captured
+    return _C._rowwise_prune(weight, mask, compressed_indices_dtype)
+
+def embedding_bag(input, indices=None, offsets=None, scale_grad_by_freq=False, mode=0, sparse=False, per_sample_weights=None, include_last_offset=False, padding_idx=None):
+    if _capturing():
+        _captured = _capture_call(embedding_bag, (input, indices, offsets, scale_grad_by_freq, mode, sparse, per_sample_weights, include_last_offset, padding_idx), {})
+        if _captured is not None:
+            return _captured
+    if padding_idx is None:
+        return _C.embedding_bag(input, indices, offsets, scale_grad_by_freq, mode, sparse, per_sample_weights, include_last_offset)
+    return _C.embedding_bag(input, indices, offsets, scale_grad_by_freq, mode, sparse, per_sample_weights, include_last_offset, padding_idx)
+
+def _embedding_bag_backward(grad, indices, offsets, offset2bag, bag_size, maximum_indices, num_weights, scale_grad_by_freq, mode, sparse, per_sample_weights, padding_idx=-1):
+    if _capturing():
+        _captured = _capture_call(_embedding_bag_backward, (grad, indices, offsets, offset2bag, bag_size, maximum_indices, num_weights, scale_grad_by_freq, mode, sparse, per_sample_weights, padding_idx), {})
+        if _captured is not None:
+            return _captured
+    return _C._embedding_bag_backward(grad, indices, offsets, offset2bag, bag_size, maximum_indices, num_weights, scale_grad_by_freq, mode, sparse, per_sample_weights, padding_idx)
+
+def _embedding_bag_sparse_backward(grad, indices, offsets, offset2bag, bag_size, num_weights, scale_grad_by_freq, mode, per_sample_weights, padding_idx=-1):
+    if _capturing():
+        _captured = _capture_call(_embedding_bag_sparse_backward, (grad, indices, offsets, offset2bag, bag_size, num_weights, scale_grad_by_freq, mode, per_sample_weights, padding_idx), {})
+        if _captured is not None:
+            return _captured
+    return _C._embedding_bag_sparse_backward(grad, indices, offsets, offset2bag, bag_size, num_weights, scale_grad_by_freq, mode, per_sample_weights, padding_idx)
+
+def empty_permuted(size, physical_layout, dtype=None, layout=None, device=None, pin_memory=None):
+    if _capturing():
+        _captured = _capture_call(empty_permuted, (size, physical_layout, dtype, layout, device, pin_memory), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(size, int) and not isinstance(size, bool):
+        size = [size]
+    if isinstance(physical_layout, int) and not isinstance(physical_layout, bool):
+        physical_layout = [physical_layout]
+    if dtype is None:
+            dtype = DType.undefined
+    return _C.empty_permuted(size, physical_layout, dtype=dtype, layout=layout, device=_ensure_device(device), pin_memory=pin_memory)
+
+def new_empty(input, size, dtype=None, layout=None, device=None, pin_memory=None):
+    if _capturing():
+        _captured = _capture_call(new_empty, (input, size, dtype, layout, device, pin_memory), {})
+        if _captured is not None:
+            return _captured
+    return input.new_empty(size=size, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory)
+
+def new_empty_strided(input, size, stride, dtype=None, layout=None, device=None, pin_memory=None):
+    if _capturing():
+        _captured = _capture_call(new_empty_strided, (input, size, stride, dtype, layout, device, pin_memory), {})
+        if _captured is not None:
+            return _captured
+    return input.new_empty_strided(size=size, stride=stride, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory)
+
+def new_full(input, size, fill_value, dtype=None, layout=None, device=None, pin_memory=None):
+    if _capturing():
+        _captured = _capture_call(new_full, (input, size, fill_value, dtype, layout, device, pin_memory), {})
+        if _captured is not None:
+            return _captured
+    return input.new_full(size=size, fill_value=fill_value, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory)
+
+def new_zeros(input, size, dtype=None, layout=None, device=None, pin_memory=None):
+    if _capturing():
+        _captured = _capture_call(new_zeros, (input, size, dtype, layout, device, pin_memory), {})
+        if _captured is not None:
+            return _captured
+    return input.new_zeros(size=size, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory)
+
+def new_ones(input, size, dtype=None, layout=None, device=None, pin_memory=None):
+    if _capturing():
+        _captured = _capture_call(new_ones, (input, size, dtype, layout, device, pin_memory), {})
+        if _captured is not None:
+            return _captured
+    return input.new_ones(size=size, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory)
+
+def _empty_affine_quantized(size, dtype=None, layout=None, device=None, pin_memory=None, scale=1, zero_point=0, memory_format=tensorplay.contiguous_format):
+    if _capturing():
+        _captured = _capture_call(_empty_affine_quantized, (size, dtype, layout, device, pin_memory, scale, zero_point, memory_format), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(size, int) and not isinstance(size, bool):
+        size = [size]
+    if dtype is None:
+            dtype = DType.undefined
+    return _C._empty_affine_quantized(size, dtype=dtype, layout=layout, device=_ensure_device(device), pin_memory=pin_memory, scale=scale, zero_point=zero_point, memory_format=memory_format)
+
+def _empty_per_channel_affine_quantized(size, scales, zero_points, axis, dtype=None, layout=None, device=None, pin_memory=None, memory_format=tensorplay.contiguous_format):
+    if _capturing():
+        _captured = _capture_call(_empty_per_channel_affine_quantized, (size, scales, zero_points, axis, dtype, layout, device, pin_memory, memory_format), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(size, int) and not isinstance(size, bool):
+        size = [size]
+    if dtype is None:
+            dtype = DType.undefined
+    return _C._empty_per_channel_affine_quantized(size, scales=scales, zero_points=zero_points, axis=axis, dtype=dtype, layout=layout, device=_ensure_device(device), pin_memory=pin_memory, memory_format=memory_format)
+
+def _resize_output_(input, size, device):
+    if _capturing():
+        _captured = _capture_call(_resize_output_, (input, size, device), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(size, int) and not isinstance(size, bool):
+        size = [size]
+    return _C._resize_output_(input, size, _ensure_device(device))
+
+def empty_quantized(size, qtensor, dtype=None, layout=None, device=None, pin_memory=None, memory_format=None):
+    if _capturing():
+        _captured = _capture_call(empty_quantized, (size, qtensor, dtype, layout, device, pin_memory, memory_format), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(size, int) and not isinstance(size, bool):
+        size = [size]
+    if dtype is None:
+            dtype = DType.undefined
+    return _C.empty_quantized(size, qtensor, dtype=dtype, layout=layout, device=_ensure_device(device), pin_memory=pin_memory, memory_format=memory_format)
+
+def floor_divide_(input, other):
+    return input.floor_divide_(other=other)
+
+def from_file(filename, shared=None, size=0, dtype=None, layout=None, device=None, pin_memory=None):
+    if _capturing():
+        _captured = _capture_call(from_file, (filename, shared, size, dtype, layout, device, pin_memory), {})
+        if _captured is not None:
+            return _captured
+    if dtype is None:
+            dtype = DType.undefined
+    return _C.from_file(filename, shared, size, dtype=dtype, layout=layout, device=_ensure_device(device), pin_memory=pin_memory)
+
+def grid_sampler(input, grid, interpolation_mode, padding_mode, align_corners):
+    if _capturing():
+        _captured = _capture_call(grid_sampler, (input, grid, interpolation_mode, padding_mode, align_corners), {})
+        if _captured is not None:
+            return _captured
+    return _C.grid_sampler(input, grid, interpolation_mode, padding_mode, align_corners)
+
+def _grid_sampler_2d_cpu_fallback(input, grid, interpolation_mode, padding_mode, align_corners):
+    if _capturing():
+        _captured = _capture_call(_grid_sampler_2d_cpu_fallback, (input, grid, interpolation_mode, padding_mode, align_corners), {})
+        if _captured is not None:
+            return _captured
+    return _C._grid_sampler_2d_cpu_fallback(input, grid, interpolation_mode, padding_mode, align_corners)
+
+def _grid_sampler_2d_cpu_fallback_backward(grad_output, input, grid, interpolation_mode, padding_mode, align_corners):
+    if _capturing():
+        _captured = _capture_call(_grid_sampler_2d_cpu_fallback_backward, (grad_output, input, grid, interpolation_mode, padding_mode, align_corners), {})
+        if _captured is not None:
+            return _captured
+    return _C._grid_sampler_2d_cpu_fallback_backward(grad_output, input, grid, interpolation_mode, padding_mode, align_corners)
+
+def native_group_norm(input, weight, bias, N, C, HxW, group, eps):
+    if _capturing():
+        _captured = _capture_call(native_group_norm, (input, weight, bias, N, C, HxW, group, eps), {})
+        if _captured is not None:
+            return _captured
+    return _C.native_group_norm(input, weight, bias, N, C, HxW, group, eps)
+
+def native_group_norm_backward(grad_out, input, mean, rstd, weight, N, C, HxW, group, output_mask):
+    if _capturing():
+        _captured = _capture_call(native_group_norm_backward, (grad_out, input, mean, rstd, weight, N, C, HxW, group, output_mask), {})
+        if _captured is not None:
+            return _captured
+    return _C.native_group_norm_backward(grad_out, input, mean, rstd, weight, N, C, HxW, group, output_mask)
+
+def _fft_r2c(input, dim, normalization, onesided, *, out=None):
+    if out is not None:
+        return _C._fft_r2c(self=input, dim=dim, normalization=normalization, onesided=onesided, out=out)
+    if _capturing():
+        _captured = _capture_call(_fft_r2c, (input, dim, normalization, onesided), {})
+        if _captured is not None:
+            return _captured
+    return _C._fft_r2c(self=input, dim=dim, normalization=normalization, onesided=onesided)
+
+def _fft_c2r(input, dim, normalization, last_dim_size, *, out=None):
+    if out is not None:
+        return _C._fft_c2r(self=input, dim=dim, normalization=normalization, last_dim_size=last_dim_size, out=out)
+    if _capturing():
+        _captured = _capture_call(_fft_c2r, (input, dim, normalization, last_dim_size), {})
+        if _captured is not None:
+            return _captured
+    return _C._fft_c2r(self=input, dim=dim, normalization=normalization, last_dim_size=last_dim_size)
+
+def _fft_c2c(input, dim, normalization, forward, *, out=None):
+    if out is not None:
+        return _C._fft_c2c(self=input, dim=dim, normalization=normalization, forward=forward, out=out)
+    if _capturing():
+        _captured = _capture_call(_fft_c2c, (input, dim, normalization, forward), {})
+        if _captured is not None:
+            return _captured
+    return _C._fft_c2c(self=input, dim=dim, normalization=normalization, forward=forward)
+
+def _validate_compressed_sparse_indices(is_crow, compressed_idx, plain_idx, cdim, dim, nnz):
+    if _capturing():
+        _captured = _capture_call(_validate_compressed_sparse_indices, (is_crow, compressed_idx, plain_idx, cdim, dim, nnz), {})
+        if _captured is not None:
+            return _captured
+    return _C._validate_compressed_sparse_indices(is_crow, compressed_idx, plain_idx, cdim, dim, nnz)
+
+def index(input, indices):
+    if _capturing():
+        _captured = _capture_call(index, (input, indices), {})
+        if _captured is not None:
+            return _captured
+    return _C.index(input, indices)
+
+def _unsafe_index(input, indices):
+    if _capturing():
+        _captured = _capture_call(_unsafe_index, (input, indices), {})
+        if _captured is not None:
+            return _captured
+    return _C._unsafe_index(input, indices)
+
+def _unsafe_masked_index(input, mask, indices, fill):
+    if _capturing():
+        _captured = _capture_call(_unsafe_masked_index, (input, mask, indices, fill), {})
+        if _captured is not None:
+            return _captured
+    if not isinstance(fill, (tensorplay.Scalar, tensorplay.Tensor)):
+        fill = tensorplay.Scalar(fill)
+    return _C._unsafe_masked_index(input, mask, indices, fill)
+
+def _unsafe_masked_index_put_accumulate(input, mask, indices, values):
+    if _capturing():
+        _captured = _capture_call(_unsafe_masked_index_put_accumulate, (input, mask, indices, values), {})
+        if _captured is not None:
+            return _captured
+    return _C._unsafe_masked_index_put_accumulate(input, mask, indices, values)
+
+def _unsafe_index_put(input, indices, values, accumulate=False):
+    if _capturing():
+        _captured = _capture_call(_unsafe_index_put, (input, indices, values, accumulate), {})
+        if _captured is not None:
+            return _captured
+    return _C._unsafe_index_put(input, indices, values, accumulate)
+
+def _index_put_impl_(input, indices, values, accumulate=False, unsafe=False):
+    if _capturing():
+        _captured = _capture_call(_index_put_impl_, (input, indices, values, accumulate, unsafe), {})
+        if _captured is not None:
+            return _captured
+    return _C._index_put_impl_(input, indices, values, accumulate, unsafe)
+
+def is_distributed(input):
+    if _capturing():
+        _captured = _capture_call(is_distributed, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.is_distributed(input)
+
+def is_floating_point(input):
+    if _capturing():
+        _captured = _capture_call(is_floating_point, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.is_floating_point(input)
+
+def _is_zerotensor(input):
+    if _capturing():
+        _captured = _capture_call(_is_zerotensor, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C._is_zerotensor(input)
+
+def is_inference(input):
+    if _capturing():
+        _captured = _capture_call(is_inference, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.is_inference(input)
+
+def numel(input):
+    if _capturing():
+        _captured = _capture_call(numel, (input,), {})
+        if _captured is not None:
+            return _captured
+    return input.numel()
+
+def dim(input):
+    if _capturing():
+        _captured = _capture_call(dim, (input,), {})
+        if _captured is not None:
+            return _captured
+    return input.dim()
+
+def storage_offset(input):
+    if _capturing():
+        _captured = _capture_call(storage_offset, (input,), {})
+        if _captured is not None:
+            return _captured
+    return input.storage_offset()
+
+def is_contiguous(input):
+    if _capturing():
+        _captured = _capture_call(is_contiguous, (input,), {})
+        if _captured is not None:
+            return _captured
+    return input.is_contiguous()
+
+def native_layer_norm(input, normalized_shape, weight, bias, eps):
+    if _capturing():
+        _captured = _capture_call(native_layer_norm, (input, normalized_shape, weight, bias, eps), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(normalized_shape, int) and not isinstance(normalized_shape, bool):
+        normalized_shape = [normalized_shape]
+    return _C.native_layer_norm(input, normalized_shape, weight, bias, eps)
+
+def native_layer_norm_backward(grad_out, input, normalized_shape, mean, rstd, weight, bias, output_mask):
+    if _capturing():
+        _captured = _capture_call(native_layer_norm_backward, (grad_out, input, normalized_shape, mean, rstd, weight, bias, output_mask), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(normalized_shape, int) and not isinstance(normalized_shape, bool):
+        normalized_shape = [normalized_shape]
+    return _C.native_layer_norm_backward(grad_out, input, normalized_shape, mean, rstd, weight, bias, output_mask)
+
+def _fused_rms_norm(input, normalized_shape, weight, eps):
+    if _capturing():
+        _captured = _capture_call(_fused_rms_norm, (input, normalized_shape, weight, eps), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(normalized_shape, int) and not isinstance(normalized_shape, bool):
+        normalized_shape = [normalized_shape]
+    return _C._fused_rms_norm(input, normalized_shape, weight, eps)
+
+def _fused_rms_norm_backward(grad_out, input, normalized_shape, rstd, weight, output_mask):
+    if _capturing():
+        _captured = _capture_call(_fused_rms_norm_backward, (grad_out, input, normalized_shape, rstd, weight, output_mask), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(normalized_shape, int) and not isinstance(normalized_shape, bool):
+        normalized_shape = [normalized_shape]
+    return _C._fused_rms_norm_backward(grad_out, input, normalized_shape, rstd, weight, output_mask)
+
+def linear_backward(input, grad_output, weight, output_mask):
+    if _capturing():
+        _captured = _capture_call(linear_backward, (input, grad_output, weight, output_mask), {})
+        if _captured is not None:
+            return _captured
+    return _C.linear_backward(input, grad_output, weight, output_mask)
+
+def mkldnn_linear(input, weight, bias=None):
+    if _capturing():
+        _captured = _capture_call(mkldnn_linear, (input, weight, bias), {})
+        if _captured is not None:
+            return _captured
+    return _C.mkldnn_linear(input, weight, bias)
+
+def mkldnn_linear_backward_input(input_size, grad_output, weight):
+    if _capturing():
+        _captured = _capture_call(mkldnn_linear_backward_input, (input_size, grad_output, weight), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(input_size, int) and not isinstance(input_size, bool):
+        input_size = [input_size]
+    return _C.mkldnn_linear_backward_input(input_size, grad_output, weight)
+
+def mkldnn_linear_backward_weights(grad_output, input, weight, bias_defined):
+    if _capturing():
+        _captured = _capture_call(mkldnn_linear_backward_weights, (grad_output, input, weight, bias_defined), {})
+        if _captured is not None:
+            return _captured
+    return _C.mkldnn_linear_backward_weights(grad_output, input, weight, bias_defined)
+
+def mkldnn_linear_backward(input, grad_output, weight, output_mask):
+    if _capturing():
+        _captured = _capture_call(mkldnn_linear_backward, (input, grad_output, weight, output_mask), {})
+        if _captured is not None:
+            return _captured
+    return _C.mkldnn_linear_backward(input, grad_output, weight, output_mask)
+
+def _cslt_compress(input):
+    if _capturing():
+        _captured = _capture_call(_cslt_compress, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C._cslt_compress(input)
+
+def _cslt_sparse_mm(compressed_A, dense_B, bias=None, alpha=None, out_dtype=None, transpose_result=False, alg_id=0, split_k=1, split_k_mode=-1):
+    if _capturing():
+        _captured = _capture_call(_cslt_sparse_mm, (compressed_A, dense_B, bias, alpha, out_dtype, transpose_result, alg_id, split_k, split_k_mode), {})
+        if _captured is not None:
+            return _captured
+    return _C._cslt_sparse_mm(compressed_A, dense_B, bias, alpha, out_dtype, transpose_result, alg_id, split_k, split_k_mode)
+
+def _cslt_sparse_mm_search(compressed_A, dense_B, bias=None, alpha=None, out_dtype=None, transpose_result=False):
+    if _capturing():
+        _captured = _capture_call(_cslt_sparse_mm_search, (compressed_A, dense_B, bias, alpha, out_dtype, transpose_result), {})
+        if _captured is not None:
+            return _captured
+    return _C._cslt_sparse_mm_search(compressed_A, dense_B, bias, alpha, out_dtype, transpose_result)
+
+def _sparse_semi_structured_tile(input, algorithm='', use_cutlass=True):
+    if _capturing():
+        _captured = _capture_call(_sparse_semi_structured_tile, (input, algorithm, use_cutlass), {})
+        if _captured is not None:
+            return _captured
+    return _C._sparse_semi_structured_tile(input, algorithm, use_cutlass)
+
+def _sparse_semi_structured_apply(input, thread_masks):
+    if _capturing():
+        _captured = _capture_call(_sparse_semi_structured_apply, (input, thread_masks), {})
+        if _captured is not None:
+            return _captured
+    return _C._sparse_semi_structured_apply(input, thread_masks)
+
+def _sparse_semi_structured_apply_dense(input, thread_masks):
+    if _capturing():
+        _captured = _capture_call(_sparse_semi_structured_apply_dense, (input, thread_masks), {})
+        if _captured is not None:
+            return _captured
+    return _C._sparse_semi_structured_apply_dense(input, thread_masks)
+
+def _sparse_semi_structured_linear(input, weight, meta, bias=None, activation=None, out_dtype=None):
+    if _capturing():
+        _captured = _capture_call(_sparse_semi_structured_linear, (input, weight, meta, bias, activation, out_dtype), {})
+        if _captured is not None:
+            return _captured
+    return _C._sparse_semi_structured_linear(input, weight, meta, bias=bias, activation=activation, out_dtype=out_dtype)
+
+def _mixed_dtypes_linear(input, weight, scale, bias=None, activation=None):
+    if _capturing():
+        _captured = _capture_call(_mixed_dtypes_linear, (input, weight, scale, bias, activation), {})
+        if _captured is not None:
+            return _captured
+    return _C._mixed_dtypes_linear(input, weight, scale, bias=bias, activation=activation)
+
+def fbgemm_linear_int8_weight_fp32_activation(input, weight, packed, col_offsets, weight_scale, weight_zero_point, bias):
+    if _capturing():
+        _captured = _capture_call(fbgemm_linear_int8_weight_fp32_activation, (input, weight, packed, col_offsets, weight_scale, weight_zero_point, bias), {})
+        if _captured is not None:
+            return _captured
+    if not isinstance(weight_scale, (tensorplay.Scalar, tensorplay.Tensor)):
+        weight_scale = tensorplay.Scalar(weight_scale)
+    if not isinstance(weight_zero_point, (tensorplay.Scalar, tensorplay.Tensor)):
+        weight_zero_point = tensorplay.Scalar(weight_zero_point)
+    return _C.fbgemm_linear_int8_weight_fp32_activation(input, weight, packed, col_offsets, weight_scale, weight_zero_point, bias)
+
+def fbgemm_linear_int8_weight(input, weight, packed, col_offsets, weight_scale, weight_zero_point, bias):
+    if _capturing():
+        _captured = _capture_call(fbgemm_linear_int8_weight, (input, weight, packed, col_offsets, weight_scale, weight_zero_point, bias), {})
+        if _captured is not None:
+            return _captured
+    if not isinstance(weight_scale, (tensorplay.Scalar, tensorplay.Tensor)):
+        weight_scale = tensorplay.Scalar(weight_scale)
+    if not isinstance(weight_zero_point, (tensorplay.Scalar, tensorplay.Tensor)):
+        weight_zero_point = tensorplay.Scalar(weight_zero_point)
+    return _C.fbgemm_linear_int8_weight(input, weight, packed, col_offsets, weight_scale, weight_zero_point, bias)
+
+def fbgemm_linear_quantize_weight(input):
+    if _capturing():
+        _captured = _capture_call(fbgemm_linear_quantize_weight, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.fbgemm_linear_quantize_weight(input)
+
+def fbgemm_pack_gemm_matrix_fp16(input):
+    if _capturing():
+        _captured = _capture_call(fbgemm_pack_gemm_matrix_fp16, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.fbgemm_pack_gemm_matrix_fp16(input)
+
+def _wrapped_linear_prepack(weight, weight_scale, weight_zero_point, bias):
+    if _capturing():
+        _captured = _capture_call(_wrapped_linear_prepack, (weight, weight_scale, weight_zero_point, bias), {})
+        if _captured is not None:
+            return _captured
+    return _C._wrapped_linear_prepack(weight, weight_scale, weight_zero_point, bias)
+
+def _wrapped_quantized_linear_prepacked(input, input_scale, input_zero_point, packed_weight, output_scale, output_zero_point, out_channel):
+    if _capturing():
+        _captured = _capture_call(_wrapped_quantized_linear_prepacked, (input, input_scale, input_zero_point, packed_weight, output_scale, output_zero_point, out_channel), {})
+        if _captured is not None:
+            return _captured
+    return _C._wrapped_quantized_linear_prepacked(input, input_scale, input_zero_point, packed_weight, output_scale, output_zero_point, out_channel)
+
+def fbgemm_linear_fp16_weight_fp32_activation(input, packed_weight, bias, *, out=None):
+    if out is not None:
+        return _C.fbgemm_linear_fp16_weight_fp32_activation(input=input, packed_weight=packed_weight, bias=bias, out=out)
+    if _capturing():
+        _captured = _capture_call(fbgemm_linear_fp16_weight_fp32_activation, (input, packed_weight, bias), {})
+        if _captured is not None:
+            return _captured
+    return _C.fbgemm_linear_fp16_weight_fp32_activation(input=input, packed_weight=packed_weight, bias=bias)
+
+def fbgemm_linear_fp16_weight(input, packed_weight, bias, *, out=None):
+    if out is not None:
+        return _C.fbgemm_linear_fp16_weight(input=input, packed_weight=packed_weight, bias=bias, out=out)
+    if _capturing():
+        _captured = _capture_call(fbgemm_linear_fp16_weight, (input, packed_weight, bias), {})
+        if _captured is not None:
+            return _captured
+    return _C.fbgemm_linear_fp16_weight(input=input, packed_weight=packed_weight, bias=bias)
+
+def fbgemm_pack_quantized_matrix(input, K=None, N=None):
+    if _capturing():
+        _captured = _capture_call(fbgemm_pack_quantized_matrix, (input, K, N), {})
+        if _captured is not None:
+            return _captured
+    if K is None:
+        return _C.fbgemm_pack_quantized_matrix(input)
+    return _C.fbgemm_pack_quantized_matrix(input, K, N)
+
+def _log_softmax(input, dim, half_to_float, *, out=None):
+    if out is not None:
+        return _C._log_softmax(self=input, dim=dim, half_to_float=half_to_float, out=out)
+    if _capturing():
+        _captured = _capture_call(_log_softmax, (input, dim, half_to_float), {})
+        if _captured is not None:
+            return _captured
+    return _C._log_softmax(self=input, dim=dim, half_to_float=half_to_float)
+
+def _log_softmax_backward_data(grad_output, output, dim, input_dtype, *, out=None):
+    if out is not None:
+        return _C._log_softmax_backward_data(grad_output=grad_output, output=output, dim=dim, input_dtype=input_dtype, out=out)
+    if _capturing():
+        _captured = _capture_call(_log_softmax_backward_data, (grad_output, output, dim, input_dtype), {})
+        if _captured is not None:
+            return _captured
+    return _C._log_softmax_backward_data(grad_output=grad_output, output=output, dim=dim, input_dtype=input_dtype)
+
+def _logcumsumexp(input, dim, *, out=None):
+    if out is not None:
+        return _C._logcumsumexp(self=input, dim=dim, out=out)
+    if _capturing():
+        _captured = _capture_call(_logcumsumexp, (input, dim), {})
+        if _captured is not None:
+            return _captured
+    return _C._logcumsumexp(self=input, dim=dim)
+
+def matmul_backward(grad, input, other, mask):
+    if _capturing():
+        _captured = _capture_call(matmul_backward, (grad, input, other, mask), {})
+        if _captured is not None:
+            return _captured
+    return _C.matmul_backward(grad, input, other, mask)
+
+def matrix_exp(input):
+    if _capturing():
+        _captured = _capture_call(matrix_exp, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.matrix_exp(input)
+
+def matrix_exp_backward(input, grad):
+    if _capturing():
+        _captured = _capture_call(matrix_exp_backward, (input, grad), {})
+        if _captured is not None:
+            return _captured
+    return _C.matrix_exp_backward(input, grad)
+
+def _aminmax(input, dim=None, keepdim=False):
+    if _capturing():
+        _captured = _capture_call(_aminmax, (input, dim, keepdim), {})
+        if _captured is not None:
+            return _captured
+    if dim is None:
+        return _C._aminmax(input)
+    return _C._aminmax(input, dim, keepdim)
+
+def _compute_linear_combination(input, coefficients, *, out=None):
+    if out is not None:
+        return _C._compute_linear_combination(input=input, coefficients=coefficients, out=out)
+    if _capturing():
+        _captured = _capture_call(_compute_linear_combination, (input, coefficients), {})
+        if _captured is not None:
+            return _captured
+    return _C._compute_linear_combination(input=input, coefficients=coefficients)
+
+def value_selecting_reduction_backward(grad, dim, indices, sizes, keepdim):
+    if _capturing():
+        _captured = _capture_call(value_selecting_reduction_backward, (grad, dim, indices, sizes, keepdim), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(sizes, int) and not isinstance(sizes, bool):
+        sizes = [sizes]
+    return _C.value_selecting_reduction_backward(grad, dim, indices, sizes, keepdim)
+
+def mkldnn_max_pool2d(input, kernel_size, stride=[], padding=0, dilation=1, ceil_mode=False):
+    if _capturing():
+        _captured = _capture_call(mkldnn_max_pool2d, (input, kernel_size, stride, padding, dilation, ceil_mode), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(kernel_size, int) and not isinstance(kernel_size, bool):
+        kernel_size = [kernel_size]
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    if isinstance(dilation, int) and not isinstance(dilation, bool):
+        dilation = [dilation]
+    return _C.mkldnn_max_pool2d(input, kernel_size, stride, padding, dilation, ceil_mode)
+
+def mkldnn_max_pool2d_backward(grad_output, output, input, kernel_size, stride=[], padding=0, dilation=1, ceil_mode=False):
+    if _capturing():
+        _captured = _capture_call(mkldnn_max_pool2d_backward, (grad_output, output, input, kernel_size, stride, padding, dilation, ceil_mode), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(kernel_size, int) and not isinstance(kernel_size, bool):
+        kernel_size = [kernel_size]
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    if isinstance(dilation, int) and not isinstance(dilation, bool):
+        dilation = [dilation]
+    return _C.mkldnn_max_pool2d_backward(grad_output, output, input, kernel_size, stride, padding, dilation, ceil_mode)
+
+def mkldnn_max_pool3d(input, kernel_size, stride=[], padding=0, dilation=1, ceil_mode=False):
+    if _capturing():
+        _captured = _capture_call(mkldnn_max_pool3d, (input, kernel_size, stride, padding, dilation, ceil_mode), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(kernel_size, int) and not isinstance(kernel_size, bool):
+        kernel_size = [kernel_size]
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    if isinstance(dilation, int) and not isinstance(dilation, bool):
+        dilation = [dilation]
+    return _C.mkldnn_max_pool3d(input, kernel_size, stride, padding, dilation, ceil_mode)
+
+def mkldnn_max_pool3d_backward(grad_output, output, input, kernel_size, stride=[], padding=0, dilation=1, ceil_mode=False):
+    if _capturing():
+        _captured = _capture_call(mkldnn_max_pool3d_backward, (grad_output, output, input, kernel_size, stride, padding, dilation, ceil_mode), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(kernel_size, int) and not isinstance(kernel_size, bool):
+        kernel_size = [kernel_size]
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    if isinstance(dilation, int) and not isinstance(dilation, bool):
+        dilation = [dilation]
+    return _C.mkldnn_max_pool3d_backward(grad_output, output, input, kernel_size, stride, padding, dilation, ceil_mode)
+
+def quantized_max_pool1d(input, kernel_size, stride=[], padding=0, dilation=1, ceil_mode=False):
+    if _capturing():
+        _captured = _capture_call(quantized_max_pool1d, (input, kernel_size, stride, padding, dilation, ceil_mode), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(kernel_size, int) and not isinstance(kernel_size, bool):
+        kernel_size = [kernel_size]
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    if isinstance(dilation, int) and not isinstance(dilation, bool):
+        dilation = [dilation]
+    return _C.quantized_max_pool1d(input, kernel_size, stride, padding, dilation, ceil_mode)
+
+def quantized_max_pool2d(input, kernel_size, stride=[], padding=0, dilation=1, ceil_mode=False):
+    if _capturing():
+        _captured = _capture_call(quantized_max_pool2d, (input, kernel_size, stride, padding, dilation, ceil_mode), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(kernel_size, int) and not isinstance(kernel_size, bool):
+        kernel_size = [kernel_size]
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    if isinstance(dilation, int) and not isinstance(dilation, bool):
+        dilation = [dilation]
+    return _C.quantized_max_pool2d(input, kernel_size, stride, padding, dilation, ceil_mode)
+
+def quantized_max_pool3d(input, kernel_size, stride=[], padding=0, dilation=1, ceil_mode=False):
+    if _capturing():
+        _captured = _capture_call(quantized_max_pool3d, (input, kernel_size, stride, padding, dilation, ceil_mode), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(kernel_size, int) and not isinstance(kernel_size, bool):
+        kernel_size = [kernel_size]
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    if isinstance(dilation, int) and not isinstance(dilation, bool):
+        dilation = [dilation]
+    return _C.quantized_max_pool3d(input, kernel_size, stride, padding, dilation, ceil_mode)
+
+def _mps_convolution(input, weight, bias, padding, stride, dilation, groups):
+    if _capturing():
+        _captured = _capture_call(_mps_convolution, (input, weight, bias, padding, stride, dilation, groups), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(dilation, int) and not isinstance(dilation, bool):
+        dilation = [dilation]
+    return _C._mps_convolution(input, weight, bias, padding, stride, dilation, groups)
+
+def mps_convolution_backward(input, grad_output, weight, padding, stride, dilation, groups, output_mask):
+    if _capturing():
+        _captured = _capture_call(mps_convolution_backward, (input, grad_output, weight, padding, stride, dilation, groups, output_mask), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(dilation, int) and not isinstance(dilation, bool):
+        dilation = [dilation]
+    return _C.mps_convolution_backward(input, grad_output, weight, padding, stride, dilation, groups, output_mask)
+
+def mkldnn_convolution(input, weight, bias, padding, stride, dilation, groups):
+    if _capturing():
+        _captured = _capture_call(mkldnn_convolution, (input, weight, bias, padding, stride, dilation, groups), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(dilation, int) and not isinstance(dilation, bool):
+        dilation = [dilation]
+    return _C.mkldnn_convolution(input, weight, bias, padding, stride, dilation, groups)
+
+def mkldnn_rnn_layer(input, weight0, weight1, weight2, weight3, hx_, cx_, reverse, batch_sizes, mode, hidden_size, num_layers, has_biases, bidirectional, batch_first, train):
+    if _capturing():
+        _captured = _capture_call(mkldnn_rnn_layer, (input, weight0, weight1, weight2, weight3, hx_, cx_, reverse, batch_sizes, mode, hidden_size, num_layers, has_biases, bidirectional, batch_first, train), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(batch_sizes, int) and not isinstance(batch_sizes, bool):
+        batch_sizes = [batch_sizes]
+    return _C.mkldnn_rnn_layer(input, weight0, weight1, weight2, weight3, hx_, cx_, reverse, batch_sizes, mode, hidden_size, num_layers, has_biases, bidirectional, batch_first, train)
+
+def mkldnn_rnn_layer_backward(input, weight1, weight2, weight3, weight4, hx_, cx_tmp, output, hy_, cy_, grad_output, grad_hy, grad_cy, reverse, mode, hidden_size, num_layers, has_biases, train, bidirectional, batch_sizes, batch_first, workspace):
+    if _capturing():
+        _captured = _capture_call(mkldnn_rnn_layer_backward, (input, weight1, weight2, weight3, weight4, hx_, cx_tmp, output, hy_, cy_, grad_output, grad_hy, grad_cy, reverse, mode, hidden_size, num_layers, has_biases, train, bidirectional, batch_sizes, batch_first, workspace), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(batch_sizes, int) and not isinstance(batch_sizes, bool):
+        batch_sizes = [batch_sizes]
+    return _C.mkldnn_rnn_layer_backward(input, weight1, weight2, weight3, weight4, hx_, cx_tmp, output, hy_, cy_, grad_output, grad_hy, grad_cy, reverse, mode, hidden_size, num_layers, has_biases, train, bidirectional, batch_sizes, batch_first, workspace)
+
+def miopen_batch_norm(input, weight, bias, running_mean, running_var, training, exponential_average_factor, epsilon):
+    if _capturing():
+        _captured = _capture_call(miopen_batch_norm, (input, weight, bias, running_mean, running_var, training, exponential_average_factor, epsilon), {})
+        if _captured is not None:
+            return _captured
+    return _C.miopen_batch_norm(input, weight, bias, running_mean, running_var, training, exponential_average_factor, epsilon)
+
+def miopen_batch_norm_backward(input, grad_output, weight, running_mean, running_var, save_mean, save_var, epsilon):
+    if _capturing():
+        _captured = _capture_call(miopen_batch_norm_backward, (input, grad_output, weight, running_mean, running_var, save_mean, save_var, epsilon), {})
+        if _captured is not None:
+            return _captured
+    return _C.miopen_batch_norm_backward(input, grad_output, weight, running_mean, running_var, save_mean, save_var, epsilon)
+
+def miopen_convolution(input, weight, bias, padding, stride, dilation, groups, benchmark, deterministic):
+    if _capturing():
+        _captured = _capture_call(miopen_convolution, (input, weight, bias, padding, stride, dilation, groups, benchmark, deterministic), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(dilation, int) and not isinstance(dilation, bool):
+        dilation = [dilation]
+    return _C.miopen_convolution(input, weight, bias, padding, stride, dilation, groups, benchmark, deterministic)
+
+def miopen_convolution_transpose(input, weight, bias, padding, output_padding, stride, dilation, groups, benchmark, deterministic):
+    if _capturing():
+        _captured = _capture_call(miopen_convolution_transpose, (input, weight, bias, padding, output_padding, stride, dilation, groups, benchmark, deterministic), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    if isinstance(output_padding, int) and not isinstance(output_padding, bool):
+        output_padding = [output_padding]
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(dilation, int) and not isinstance(dilation, bool):
+        dilation = [dilation]
+    return _C.miopen_convolution_transpose(input, weight, bias, padding, output_padding, stride, dilation, groups, benchmark, deterministic)
+
+def miopen_depthwise_convolution(input, weight, bias, padding, stride, dilation, groups, benchmark, deterministic):
+    if _capturing():
+        _captured = _capture_call(miopen_depthwise_convolution, (input, weight, bias, padding, stride, dilation, groups, benchmark, deterministic), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(dilation, int) and not isinstance(dilation, bool):
+        dilation = [dilation]
+    return _C.miopen_depthwise_convolution(input, weight, bias, padding, stride, dilation, groups, benchmark, deterministic)
+
+def miopen_convolution_relu(input, weight, bias, stride, padding, dilation, groups):
+    if _capturing():
+        _captured = _capture_call(miopen_convolution_relu, (input, weight, bias, stride, padding, dilation, groups), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    if isinstance(dilation, int) and not isinstance(dilation, bool):
+        dilation = [dilation]
+    return _C.miopen_convolution_relu(input, weight, bias, stride, padding, dilation, groups)
+
+def miopen_convolution_add_relu(input, weight, z, alpha, bias, stride, padding, dilation, groups):
+    if _capturing():
+        _captured = _capture_call(miopen_convolution_add_relu, (input, weight, z, alpha, bias, stride, padding, dilation, groups), {})
+        if _captured is not None:
+            return _captured
+    if alpha is not None and not isinstance(alpha, (tensorplay.Scalar, tensorplay.Tensor)):
+        alpha = tensorplay.Scalar(alpha)
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    if isinstance(dilation, int) and not isinstance(dilation, bool):
+        dilation = [dilation]
+    return _C.miopen_convolution_add_relu(input, weight, z, alpha, bias, stride, padding, dilation, groups)
+
+def miopen_rnn(input, weight, weight_stride0, hx, cx, mode, hidden_size, num_layers, batch_first, dropout, train, bidirectional, batch_sizes, dropout_state):
+    if _capturing():
+        _captured = _capture_call(miopen_rnn, (input, weight, weight_stride0, hx, cx, mode, hidden_size, num_layers, batch_first, dropout, train, bidirectional, batch_sizes, dropout_state), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(batch_sizes, int) and not isinstance(batch_sizes, bool):
+        batch_sizes = [batch_sizes]
+    return _C.miopen_rnn(input, weight, weight_stride0, hx, cx, mode, hidden_size, num_layers, batch_first, dropout, train, bidirectional, batch_sizes, dropout_state)
+
+def miopen_rnn_backward(input, weight, weight_stride0, weight_buf, hx, cx, output, grad_output, grad_hy, grad_cy, mode, hidden_size, num_layers, batch_first, dropout, train, bidirectional, batch_sizes, dropout_state, reserve, output_mask):
+    if _capturing():
+        _captured = _capture_call(miopen_rnn_backward, (input, weight, weight_stride0, weight_buf, hx, cx, output, grad_output, grad_hy, grad_cy, mode, hidden_size, num_layers, batch_first, dropout, train, bidirectional, batch_sizes, dropout_state, reserve, output_mask), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(batch_sizes, int) and not isinstance(batch_sizes, bool):
+        batch_sizes = [batch_sizes]
+    return _C.miopen_rnn_backward(input, weight, weight_stride0, weight_buf, hx, cx, output, grad_output, grad_hy, grad_cy, mode, hidden_size, num_layers, batch_first, dropout, train, bidirectional, batch_sizes, dropout_state, reserve, output_mask)
+
+def _use_miopen_ctc_loss(log_probs, targets, input_lengths, target_lengths, blank):
+    if _capturing():
+        _captured = _capture_call(_use_miopen_ctc_loss, (log_probs, targets, input_lengths, target_lengths, blank), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(input_lengths, int) and not isinstance(input_lengths, bool):
+        input_lengths = [input_lengths]
+    if isinstance(target_lengths, int) and not isinstance(target_lengths, bool):
+        target_lengths = [target_lengths]
+    return _C._use_miopen_ctc_loss(log_probs, targets, input_lengths, target_lengths, blank)
+
+def miopen_ctc_loss(log_probs, targets, input_lengths, target_lengths, blank, deterministic, zero_infinity):
+    if _capturing():
+        _captured = _capture_call(miopen_ctc_loss, (log_probs, targets, input_lengths, target_lengths, blank, deterministic, zero_infinity), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(input_lengths, int) and not isinstance(input_lengths, bool):
+        input_lengths = [input_lengths]
+    if isinstance(target_lengths, int) and not isinstance(target_lengths, bool):
+        target_lengths = [target_lengths]
+    return _C.miopen_ctc_loss(log_probs, targets, input_lengths, target_lengths, blank, deterministic, zero_infinity)
+
+def _int_mm(input, mat2, *, out=None):
+    if out is not None:
+        return _C._int_mm(self=input, mat2=mat2, out=out)
+    if _capturing():
+        _captured = _capture_call(_int_mm, (input, mat2), {})
+        if _captured is not None:
+            return _captured
+    return _C._int_mm(self=input, mat2=mat2)
+
+def _convert_weight_to_int4pack(input, innerKTiles):
+    if _capturing():
+        _captured = _capture_call(_convert_weight_to_int4pack, (input, innerKTiles), {})
+        if _captured is not None:
+            return _captured
+    return _C._convert_weight_to_int4pack(input, innerKTiles)
+
+def _weight_int4pack_mm(input, mat2, qGroupSize, qScaleAndZeros):
+    if _capturing():
+        _captured = _capture_call(_weight_int4pack_mm, (input, mat2, qGroupSize, qScaleAndZeros), {})
+        if _captured is not None:
+            return _captured
+    return _C._weight_int4pack_mm(input, mat2, qGroupSize, qScaleAndZeros)
+
+def _weight_int4pack_mm_with_scales_and_zeros(input, mat2, qGroupSize, qScale, qZeros):
+    if _capturing():
+        _captured = _capture_call(_weight_int4pack_mm_with_scales_and_zeros, (input, mat2, qGroupSize, qScale, qZeros), {})
+        if _captured is not None:
+            return _captured
+    return _C._weight_int4pack_mm_with_scales_and_zeros(input, mat2, qGroupSize, qScale, qZeros)
+
+def _convert_weight_to_int4pack_for_cpu(input, innerKTiles):
+    if _capturing():
+        _captured = _capture_call(_convert_weight_to_int4pack_for_cpu, (input, innerKTiles), {})
+        if _captured is not None:
+            return _captured
+    return _C._convert_weight_to_int4pack_for_cpu(input, innerKTiles)
+
+def _weight_int4pack_mm_for_cpu(input, mat2, qGroupSize, qScaleAndZeros):
+    if _capturing():
+        _captured = _capture_call(_weight_int4pack_mm_for_cpu, (input, mat2, qGroupSize, qScaleAndZeros), {})
+        if _captured is not None:
+            return _captured
+    return _C._weight_int4pack_mm_for_cpu(input, mat2, qGroupSize, qScaleAndZeros)
+
+def _dyn_quant_pack_4bit_weight(weights, scales_zeros, bias, block_size, in_features, out_features):
+    if _capturing():
+        _captured = _capture_call(_dyn_quant_pack_4bit_weight, (weights, scales_zeros, bias, block_size, in_features, out_features), {})
+        if _captured is not None:
+            return _captured
+    return _C._dyn_quant_pack_4bit_weight(weights, scales_zeros, bias, block_size, in_features, out_features)
+
+def _dyn_quant_matmul_4bit(inp, packed_weights, block_size, in_features, out_features):
+    if _capturing():
+        _captured = _capture_call(_dyn_quant_matmul_4bit, (inp, packed_weights, block_size, in_features, out_features), {})
+        if _captured is not None:
+            return _captured
+    return _C._dyn_quant_matmul_4bit(inp, packed_weights, block_size, in_features, out_features)
+
+def _weight_int8pack_mm(input, mat2, scales):
+    if _capturing():
+        _captured = _capture_call(_weight_int8pack_mm, (input, mat2, scales), {})
+        if _captured is not None:
+            return _captured
+    return _C._weight_int8pack_mm(input, mat2, scales)
+
+def _sparse_mm(sparse, dense):
+    if _capturing():
+        _captured = _capture_call(_sparse_mm, (sparse, dense), {})
+        if _captured is not None:
+            return _captured
+    return _C._sparse_mm(sparse, dense)
+
+def _sparse_sparse_matmul(input, other):
+    if _capturing():
+        _captured = _capture_call(_sparse_sparse_matmul, (input, other), {})
+        if _captured is not None:
+            return _captured
+    return _C._sparse_sparse_matmul(input, other)
+
+def multiply_(input, other):
+    return input.multiply_(other=other)
+
+def mvlgamma_(input, p):
+    return input.mvlgamma_(p=p)
+
+def native_batch_norm(input, weight, bias, running_mean, running_var, training, momentum, eps, *, out=None):
+    if out is not None:
+        return _C.native_batch_norm(input=input, weight=weight, bias=bias, running_mean=running_mean, running_var=running_var, training=training, momentum=momentum, eps=eps, out=out)
+    if _capturing():
+        _captured = _capture_call(native_batch_norm, (input, weight, bias, running_mean, running_var, training, momentum, eps), {})
+        if _captured is not None:
+            return _captured
+    return _C.native_batch_norm(input=input, weight=weight, bias=bias, running_mean=running_mean, running_var=running_var, training=training, momentum=momentum, eps=eps)
+
+def _native_batch_norm_legit(input, weight, bias, running_mean, running_var, training, momentum, eps, *, out=None):
+    if out is not None:
+        return _C._native_batch_norm_legit(input=input, weight=weight, bias=bias, running_mean=running_mean, running_var=running_var, training=training, momentum=momentum, eps=eps, out=out)
+    if _capturing():
+        _captured = _capture_call(_native_batch_norm_legit, (input, weight, bias, running_mean, running_var, training, momentum, eps), {})
+        if _captured is not None:
+            return _captured
+    return _C._native_batch_norm_legit(input=input, weight=weight, bias=bias, running_mean=running_mean, running_var=running_var, training=training, momentum=momentum, eps=eps)
+
+def _native_batch_norm_legit_no_training(input, weight, bias, running_mean, running_var, momentum, eps):
+    if _capturing():
+        _captured = _capture_call(_native_batch_norm_legit_no_training, (input, weight, bias, running_mean, running_var, momentum, eps), {})
+        if _captured is not None:
+            return _captured
+    return _C._native_batch_norm_legit_no_training(input, weight, bias, running_mean, running_var, momentum, eps)
+
+def batch_norm_stats(input, eps):
+    if _capturing():
+        _captured = _capture_call(batch_norm_stats, (input, eps), {})
+        if _captured is not None:
+            return _captured
+    return _C.batch_norm_stats(input, eps)
+
+def batch_norm_elemt(input, weight, bias, mean, invstd, eps, *, out=None):
+    if out is not None:
+        return _C.batch_norm_elemt(input=input, weight=weight, bias=bias, mean=mean, invstd=invstd, eps=eps, out=out)
+    if _capturing():
+        _captured = _capture_call(batch_norm_elemt, (input, weight, bias, mean, invstd, eps), {})
+        if _captured is not None:
+            return _captured
+    return _C.batch_norm_elemt(input=input, weight=weight, bias=bias, mean=mean, invstd=invstd, eps=eps)
+
+def batch_norm_gather_stats(input, mean, invstd, running_mean, running_var, momentum, eps, count):
+    if _capturing():
+        _captured = _capture_call(batch_norm_gather_stats, (input, mean, invstd, running_mean, running_var, momentum, eps, count), {})
+        if _captured is not None:
+            return _captured
+    return _C.batch_norm_gather_stats(input, mean, invstd, running_mean, running_var, momentum, eps, count)
+
+def batch_norm_gather_stats_with_counts(input, mean, invstd, running_mean, running_var, momentum, eps, counts):
+    if _capturing():
+        _captured = _capture_call(batch_norm_gather_stats_with_counts, (input, mean, invstd, running_mean, running_var, momentum, eps, counts), {})
+        if _captured is not None:
+            return _captured
+    return _C.batch_norm_gather_stats_with_counts(input, mean, invstd, running_mean, running_var, momentum, eps, counts)
+
+def native_batch_norm_backward(grad_out, input, weight, running_mean, running_var, save_mean, save_invstd, train, eps, output_mask):
+    if _capturing():
+        _captured = _capture_call(native_batch_norm_backward, (grad_out, input, weight, running_mean, running_var, save_mean, save_invstd, train, eps, output_mask), {})
+        if _captured is not None:
+            return _captured
+    return _C.native_batch_norm_backward(grad_out, input, weight, running_mean, running_var, save_mean, save_invstd, train, eps, output_mask)
+
+def batch_norm_backward_reduce(grad_out, input, mean, invstd, weight, input_g, weight_g, bias_g):
+    if _capturing():
+        _captured = _capture_call(batch_norm_backward_reduce, (grad_out, input, mean, invstd, weight, input_g, weight_g, bias_g), {})
+        if _captured is not None:
+            return _captured
+    return _C.batch_norm_backward_reduce(grad_out, input, mean, invstd, weight, input_g, weight_g, bias_g)
+
+def batch_norm_backward_elemt(grad_out, input, mean, invstd, weight, sum_dy, sum_dy_xmu, count):
+    if _capturing():
+        _captured = _capture_call(batch_norm_backward_elemt, (grad_out, input, mean, invstd, weight, sum_dy, sum_dy_xmu, count), {})
+        if _captured is not None:
+            return _captured
+    return _C.batch_norm_backward_elemt(grad_out, input, mean, invstd, weight, sum_dy, sum_dy_xmu, count)
+
+def batch_norm_update_stats(input, running_mean, running_var, momentum):
+    if _capturing():
+        _captured = _capture_call(batch_norm_update_stats, (input, running_mean, running_var, momentum), {})
+        if _captured is not None:
+            return _captured
+    return _C.batch_norm_update_stats(input, running_mean, running_var, momentum)
+
+def is_vulkan_available():
+    if _capturing():
+        _captured = _capture_call(is_vulkan_available, (), {})
+        if _captured is not None:
+            return _captured
+    return _C.is_vulkan_available()
+
+def _nnpack_available():
+    if _capturing():
+        _captured = _capture_call(_nnpack_available, (), {})
+        if _captured is not None:
+            return _captured
+    return _C._nnpack_available()
+
+def _nnpack_spatial_convolution(input, weight, bias, padding, stride=1):
+    if _capturing():
+        _captured = _capture_call(_nnpack_spatial_convolution, (input, weight, bias, padding, stride), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    return _C._nnpack_spatial_convolution(input, weight, bias, padding, stride)
+
+def _euclidean_dist(x1, x2):
+    if _capturing():
+        _captured = _capture_call(_euclidean_dist, (x1, x2), {})
+        if _captured is not None:
+            return _captured
+    return _C._euclidean_dist(x1, x2)
+
+def _cdist_forward(x1, x2, p, compute_mode):
+    if _capturing():
+        _captured = _capture_call(_cdist_forward, (x1, x2, p, compute_mode), {})
+        if _captured is not None:
+            return _captured
+    return _C._cdist_forward(x1, x2, p, compute_mode)
+
+def _cdist_backward(grad_output, x1, x2, p, cdist):
+    if _capturing():
+        _captured = _capture_call(_cdist_backward, (grad_output, x1, x2, p, cdist), {})
+        if _captured is not None:
+            return _captured
+    return _C._cdist_backward(grad_output, x1, x2, p, cdist)
+
+def _pdist_forward(input, p=2):
+    if _capturing():
+        _captured = _capture_call(_pdist_forward, (input, p), {})
+        if _captured is not None:
+            return _captured
+    return _C._pdist_forward(input, p)
+
+def _pdist_backward(grad_output, input, p, pdist):
+    if _capturing():
+        _captured = _capture_call(_pdist_backward, (grad_output, input, p, pdist), {})
+        if _captured is not None:
+            return _captured
+    return _C._pdist_backward(grad_output, input, p, pdist)
+
+def numpy_T(input):
+    if _capturing():
+        _captured = _capture_call(numpy_T, (input,), {})
+        if _captured is not None:
+            return _captured
+    return input.numpy_T()
+
+def matrix_H(input):
+    if _capturing():
+        _captured = _capture_call(matrix_H, (input,), {})
+        if _captured is not None:
+            return _captured
+    return input.matrix_H()
+
+def mT(input):
+    if _capturing():
+        _captured = _capture_call(mT, (input,), {})
+        if _captured is not None:
+            return _captured
+    return input.mT()
+
+def mH(input):
+    if _capturing():
+        _captured = _capture_call(mH, (input,), {})
+        if _captured is not None:
+            return _captured
+    return input.mH()
+
+def is_pinned(input, device=None):
+    if _capturing():
+        _captured = _capture_call(is_pinned, (input, device), {})
+        if _captured is not None:
+            return _captured
+    return input.is_pinned(device=device)
+
+def pin_memory(input, device=None):
+    if _capturing():
+        _captured = _capture_call(pin_memory, (input, device), {})
+        if _captured is not None:
+            return _captured
+    return input.pin_memory(device=device)
+
+def _pin_memory(input, device=None):
+    if _capturing():
+        _captured = _capture_call(_pin_memory, (input, device), {})
+        if _captured is not None:
+            return _captured
+    return _C._pin_memory(input, _ensure_device(device))
+
+def pinverse(input, rcond=1e-15):
+    if _capturing():
+        _captured = _capture_call(pinverse, (input, rcond), {})
+        if _captured is not None:
+            return _captured
+    return _C.pinverse(input, rcond)
+
+def repeat_interleave(repeats, output_size=None):
+    if _capturing():
+        _captured = _capture_call(repeat_interleave, (repeats, output_size), {})
+        if _captured is not None:
+            return _captured
+    return _C.repeat_interleave(repeats, output_size=output_size)
+
+def _reshape_copy(input, size):
+    if _capturing():
+        _captured = _capture_call(_reshape_copy, (input, size), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(size, int) and not isinstance(size, bool):
+        size = [size]
+    return _C._reshape_copy(input, size)
+
+def _reshape_alias(input, size, stride):
+    if _capturing():
+        _captured = _capture_call(_reshape_alias, (input, size, stride), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(size, int) and not isinstance(size, bool):
+        size = [size]
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    return _C._reshape_alias(input, size, stride)
+
+def _mkldnn_reshape(input, shape):
+    if _capturing():
+        _captured = _capture_call(_mkldnn_reshape, (input, shape), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(shape, int) and not isinstance(shape, bool):
+        shape = [shape]
+    return _C._mkldnn_reshape(input, shape)
+
+def _prelu_kernel(input, weight):
+    if _capturing():
+        _captured = _capture_call(_prelu_kernel, (input, weight), {})
+        if _captured is not None:
+            return _captured
+    return _C._prelu_kernel(input, weight)
+
+def _prelu_kernel_backward(grad_output, input, weight):
+    if _capturing():
+        _captured = _capture_call(_prelu_kernel_backward, (grad_output, input, weight), {})
+        if _captured is not None:
+            return _captured
+    return _C._prelu_kernel_backward(grad_output, input, weight)
+
+def infinitely_differentiable_gelu_backward(grad, input):
+    if _capturing():
+        _captured = _capture_call(infinitely_differentiable_gelu_backward, (grad, input), {})
+        if _captured is not None:
+            return _captured
+    return _C.infinitely_differentiable_gelu_backward(grad, input)
+
+def select(input, dim, index):
+    if _capturing():
+        _captured = _capture_call(select, (input, dim, index), {})
+        if _captured is not None:
+            return _captured
+    return _C.select(input, dim, index)
+
+def _nested_select_backward(grad_output, input, dim, index):
+    if _capturing():
+        _captured = _capture_call(_nested_select_backward, (grad_output, input, dim, index), {})
+        if _captured is not None:
+            return _captured
+    return _C._nested_select_backward(grad_output, input, dim, index)
+
+def detach(input):
+    if _capturing():
+        _captured = _capture_call(detach, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.detach(input)
+
+def size(input, dim):
+    if _capturing():
+        _captured = _capture_call(size, (input, dim), {})
+        if _captured is not None:
+            return _captured
+    return _C.size(input, dim)
+
+def sym_size(input, dim):
+    if _capturing():
+        _captured = _capture_call(sym_size, (input, dim), {})
+        if _captured is not None:
+            return _captured
+    return _C.sym_size(input, dim)
+
+def sym_is_contiguous(input, memory_format=tensorplay.contiguous_format):
+    if _capturing():
+        _captured = _capture_call(sym_is_contiguous, (input, memory_format), {})
+        if _captured is not None:
+            return _captured
+    return _C.sym_is_contiguous(input, memory_format)
+
+def sym_numel(input):
+    if _capturing():
+        _captured = _capture_call(sym_numel, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.sym_numel(input)
+
+def sym_storage_offset(input):
+    if _capturing():
+        _captured = _capture_call(sym_storage_offset, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.sym_storage_offset(input)
+
+def slice_inverse(input, src, dim=0, start=None, end=None, step=1):
+    if _capturing():
+        _captured = _capture_call(slice_inverse, (input, src, dim, start, end, step), {})
+        if _captured is not None:
+            return _captured
+    return _C.slice_inverse(input, src, dim, start, end, step)
+
+def as_strided_scatter(input, src, size, stride, storage_offset=None):
+    if _capturing():
+        _captured = _capture_call(as_strided_scatter, (input, src, size, stride, storage_offset), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(size, int) and not isinstance(size, bool):
+        size = [size]
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    return _C.as_strided_scatter(input, src, size, stride, storage_offset)
+
+def smm(input, mat2):
+    if _capturing():
+        _captured = _capture_call(smm, (input, mat2), {})
+        if _captured is not None:
+            return _captured
+    return _C.smm(input, mat2)
+
+def _softmax(input, dim, half_to_float, *, out=None):
+    if out is not None:
+        return _C._softmax(self=input, dim=dim, half_to_float=half_to_float, out=out)
+    if _capturing():
+        _captured = _capture_call(_softmax, (input, dim, half_to_float), {})
+        if _captured is not None:
+            return _captured
+    return _C._softmax(self=input, dim=dim, half_to_float=half_to_float)
+
+def _softmax_backward_data(grad_output, output, dim, input_dtype, *, out=None):
+    if out is not None:
+        return _C._softmax_backward_data(grad_output=grad_output, output=output, dim=dim, input_dtype=input_dtype, out=out)
+    if _capturing():
+        _captured = _capture_call(_softmax_backward_data, (grad_output, output, dim, input_dtype), {})
+        if _captured is not None:
+            return _captured
+    return _C._softmax_backward_data(grad_output=grad_output, output=output, dim=dim, input_dtype=input_dtype)
+
+def squeeze_(input):
+    return input.squeeze_()
+
+def sspaddmm(input, mat1, mat2, *, beta=1, alpha=1, out=None):
+    if out is not None:
+        return _C.sspaddmm(self=input, mat1=mat1, mat2=mat2, beta=beta, alpha=alpha, out=out)
+    if _capturing():
+        _captured = _capture_call(sspaddmm, (input, mat1, mat2), {})
+        if _captured is not None:
+            return _captured
+    return _C.sspaddmm(self=input, mat1=mat1, mat2=mat2, beta=beta, alpha=alpha)
+
+def _chunk_cat(tensors, dim, num_chunks, *, out=None):
+    if out is not None:
+        return _C._chunk_cat(tensors=tensors, dim=dim, num_chunks=num_chunks, out=out)
+    if _capturing():
+        _captured = _capture_call(_chunk_cat, (tensors, dim, num_chunks), {})
+        if _captured is not None:
+            return _captured
+    return _C._chunk_cat(tensors=tensors, dim=dim, num_chunks=num_chunks)
+
+def _stack(tensors, dim=0, *, out=None):
+    if out is not None:
+        return _C._stack(tensors=tensors, dim=dim, out=out)
+    if _capturing():
+        _captured = _capture_call(_stack, (tensors, dim), {})
+        if _captured is not None:
+            return _captured
+    return _C._stack(tensors=tensors, dim=dim)
+
+def stride(input, dim):
+    if _capturing():
+        _captured = _capture_call(stride, (input, dim), {})
+        if _captured is not None:
+            return _captured
+    return _C.stride(input, dim)
+
+def sym_stride(input, dim):
+    if _capturing():
+        _captured = _capture_call(sym_stride, (input, dim), {})
+        if _captured is not None:
+            return _captured
+    return _C.sym_stride(input, dim)
+
+def _nested_sum_backward(grad, input, dim, keepdim=False):
+    if _capturing():
+        _captured = _capture_call(_nested_sum_backward, (grad, input, dim, keepdim), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(dim, int) and not isinstance(dim, bool):
+        dim = [dim]
+    return _C._nested_sum_backward(grad, input, dim, keepdim)
+
+def hash_tensor(input, dim=[], *, keepdim=False, mode=0, out=None):
+    if out is not None:
+        return _C.hash_tensor(self=input, dim=dim, keepdim=keepdim, mode=mode, out=out)
+    if _capturing():
+        _captured = _capture_call(hash_tensor, (input, dim), {})
+        if _captured is not None:
+            return _captured
+    return _C.hash_tensor(self=input, dim=dim, keepdim=keepdim, mode=mode)
+
+def sum_to_size(input, size):
+    if _capturing():
+        _captured = _capture_call(sum_to_size, (input, size), {})
+        if _captured is not None:
+            return _captured
+    return input.sum_to_size(size=size)
+
+def t_(input):
+    return input.t_()
+
+def tensordot(input, other, dims_self, dims_other, *, out=None):
+    if out is not None:
+        return _C.tensordot(self=input, other=other, dims_self=dims_self, dims_other=dims_other, out=out)
+    if _capturing():
+        _captured = _capture_call(tensordot, (input, other, dims_self, dims_other), {})
+        if _captured is not None:
+            return _captured
+    return _C.tensordot(self=input, other=other, dims_self=dims_self, dims_other=dims_other)
+
+def _mkldnn_transpose(input, dim0, dim1):
+    if _capturing():
+        _captured = _capture_call(_mkldnn_transpose, (input, dim0, dim1), {})
+        if _captured is not None:
+            return _captured
+    return _C._mkldnn_transpose(input, dim0, dim1)
+
+def transpose_(input, dim0, dim1):
+    return input.transpose_(dim0=dim0, dim1=dim1)
+
+def _mkldnn_transpose_(input, dim0, dim1):
+    if _capturing():
+        _captured = _capture_call(_mkldnn_transpose_, (input, dim0, dim1), {})
+        if _captured is not None:
+            return _captured
+    return _C._mkldnn_transpose_(input, dim0, dim1)
+
+def _transform_bias_rescale_qkv(qkv, qkv_bias, num_heads):
+    if _capturing():
+        _captured = _capture_call(_transform_bias_rescale_qkv, (qkv, qkv_bias, num_heads), {})
+        if _captured is not None:
+            return _captured
+    return _C._transform_bias_rescale_qkv(qkv, qkv_bias, num_heads)
+
+def _nested_tensor_from_mask(t, mask, mask_check=True):
+    if _capturing():
+        _captured = _capture_call(_nested_tensor_from_mask, (t, mask, mask_check), {})
+        if _captured is not None:
+            return _captured
+    return _C._nested_tensor_from_mask(t, mask, mask_check)
+
+def _nested_tensor_from_mask_left_aligned(t, mask):
+    if _capturing():
+        _captured = _capture_call(_nested_tensor_from_mask_left_aligned, (t, mask), {})
+        if _captured is not None:
+            return _captured
+    return _C._nested_tensor_from_mask_left_aligned(t, mask)
+
+def _nested_from_padded(padded, cpu_nested_shape_example, fuse_transform_0213=False):
+    if _capturing():
+        _captured = _capture_call(_nested_from_padded, (padded, cpu_nested_shape_example, fuse_transform_0213), {})
+        if _captured is not None:
+            return _captured
+    return _C._nested_from_padded(padded, cpu_nested_shape_example, fuse_transform_0213)
+
+def _nested_tensor_size(input):
+    if _capturing():
+        _captured = _capture_call(_nested_tensor_size, (input,), {})
+        if _captured is not None:
+            return _captured
+    return input._nested_tensor_size()
+
+def _nested_tensor_strides(input):
+    if _capturing():
+        _captured = _capture_call(_nested_tensor_strides, (input,), {})
+        if _captured is not None:
+            return _captured
+    return input._nested_tensor_strides()
+
+def _nested_tensor_storage_offsets(input):
+    if _capturing():
+        _captured = _capture_call(_nested_tensor_storage_offsets, (input,), {})
+        if _captured is not None:
+            return _captured
+    return input._nested_tensor_storage_offsets()
+
+def _nested_from_padded_and_nested_example(padded, nt_example):
+    if _capturing():
+        _captured = _capture_call(_nested_from_padded_and_nested_example, (padded, nt_example), {})
+        if _captured is not None:
+            return _captured
+    return _C._nested_from_padded_and_nested_example(padded, nt_example)
+
+def _nested_view_from_buffer(input, nested_size, nested_strides, offsets):
+    if _capturing():
+        _captured = _capture_call(_nested_view_from_buffer, (input, nested_size, nested_strides, offsets), {})
+        if _captured is not None:
+            return _captured
+    return _C._nested_view_from_buffer(input, nested_size, nested_strides, offsets)
+
+def _nested_view_from_buffer_copy(input, nested_size, nested_strides, offsets):
+    if _capturing():
+        _captured = _capture_call(_nested_view_from_buffer_copy, (input, nested_size, nested_strides, offsets), {})
+        if _captured is not None:
+            return _captured
+    return _C._nested_view_from_buffer_copy(input, nested_size, nested_strides, offsets)
+
+def _nested_view_from_jagged(input, offsets, dummy, lengths=None, ragged_idx=1, min_seqlen=None, max_seqlen=None):
+    if _capturing():
+        _captured = _capture_call(_nested_view_from_jagged, (input, offsets, dummy, lengths, ragged_idx, min_seqlen, max_seqlen), {})
+        if _captured is not None:
+            return _captured
+    return _C._nested_view_from_jagged(input, offsets, dummy, lengths, ragged_idx, min_seqlen, max_seqlen)
+
+def _nested_view_from_jagged_copy(input, offsets, dummy, lengths=None, ragged_idx=1, min_seqlen=None, max_seqlen=None):
+    if _capturing():
+        _captured = _capture_call(_nested_view_from_jagged_copy, (input, offsets, dummy, lengths, ragged_idx, min_seqlen, max_seqlen), {})
+        if _captured is not None:
+            return _captured
+    return _C._nested_view_from_jagged_copy(input, offsets, dummy, lengths, ragged_idx, min_seqlen, max_seqlen)
+
+def _nested_get_values(input):
+    if _capturing():
+        _captured = _capture_call(_nested_get_values, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C._nested_get_values(input)
+
+def _nested_get_values_copy(input):
+    if _capturing():
+        _captured = _capture_call(_nested_get_values_copy, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C._nested_get_values_copy(input)
+
+def _nested_get_offsets(input):
+    if _capturing():
+        _captured = _capture_call(_nested_get_offsets, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C._nested_get_offsets(input)
+
+def _nested_get_lengths(input):
+    if _capturing():
+        _captured = _capture_call(_nested_get_lengths, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C._nested_get_lengths(input)
+
+def _nested_get_ragged_idx(input):
+    if _capturing():
+        _captured = _capture_call(_nested_get_ragged_idx, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C._nested_get_ragged_idx(input)
+
+def _nested_get_min_seqlen(input):
+    if _capturing():
+        _captured = _capture_call(_nested_get_min_seqlen, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C._nested_get_min_seqlen(input)
+
+def _nested_get_max_seqlen(input):
+    if _capturing():
+        _captured = _capture_call(_nested_get_max_seqlen, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C._nested_get_max_seqlen(input)
+
+def _nested_get_jagged_dummy(any):
+    if _capturing():
+        _captured = _capture_call(_nested_get_jagged_dummy, (any,), {})
+        if _captured is not None:
+            return _captured
+    return _C._nested_get_jagged_dummy(any)
+
+def _nested_compute_contiguous_strides_offsets(nested_size):
+    if _capturing():
+        _captured = _capture_call(_nested_compute_contiguous_strides_offsets, (nested_size,), {})
+        if _captured is not None:
+            return _captured
+    return _C._nested_compute_contiguous_strides_offsets(nested_size)
+
+def _trilinear(i1, i2, i3, expand1, expand2, expand3, sumdim, unroll_dim=1):
+    if _capturing():
+        _captured = _capture_call(_trilinear, (i1, i2, i3, expand1, expand2, expand3, sumdim, unroll_dim), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(expand1, int) and not isinstance(expand1, bool):
+        expand1 = [expand1]
+    if isinstance(expand2, int) and not isinstance(expand2, bool):
+        expand2 = [expand2]
+    if isinstance(expand3, int) and not isinstance(expand3, bool):
+        expand3 = [expand3]
+    if isinstance(sumdim, int) and not isinstance(sumdim, bool):
+        sumdim = [sumdim]
+    return _C._trilinear(i1, i2, i3, expand1, expand2, expand3, sumdim, unroll_dim)
+
+def fix_(input):
+    if _capturing():
+        _captured = _capture_call(fix_, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.fix_(input)
+
+def type_as(input, other):
+    if _capturing():
+        _captured = _capture_call(type_as, (input, other), {})
+        if _captured is not None:
+            return _captured
+    return input.type_as(other=other)
+
+def _has_compatible_shallow_copy_type(input, from_):
+    if _capturing():
+        _captured = _capture_call(_has_compatible_shallow_copy_type, (input, from_), {})
+        if _captured is not None:
+            return _captured
+    return _C._has_compatible_shallow_copy_type(input, from_)
+
+def _unique(input, sorted=True, return_inverse=False):
+    if _capturing():
+        _captured = _capture_call(_unique, (input, sorted, return_inverse), {})
+        if _captured is not None:
+            return _captured
+    return _C._unique(input, sorted, return_inverse)
+
+def unique_dim(input, dim, sorted=True, return_inverse=False, return_counts=False):
+    if _capturing():
+        _captured = _capture_call(unique_dim, (input, dim, sorted, return_inverse, return_counts), {})
+        if _captured is not None:
+            return _captured
+    return _C.unique_dim(input, dim, sorted, return_inverse, return_counts)
+
+def unique_dim_consecutive(input, dim, return_inverse=False, return_counts=False):
+    if _capturing():
+        _captured = _capture_call(unique_dim_consecutive, (input, dim, return_inverse, return_counts), {})
+        if _captured is not None:
+            return _captured
+    return _C.unique_dim_consecutive(input, dim, return_inverse, return_counts)
+
+def _unique2(input, sorted=True, return_inverse=False, return_counts=False):
+    if _capturing():
+        _captured = _capture_call(_unique2, (input, sorted, return_inverse, return_counts), {})
+        if _captured is not None:
+            return _captured
+    return _C._unique2(input, sorted, return_inverse, return_counts)
+
+def _unsafe_view(input, size):
+    if _capturing():
+        _captured = _capture_call(_unsafe_view, (input, size), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(size, int) and not isinstance(size, bool):
+        size = [size]
+    return _C._unsafe_view(input, size)
+
+def unsqueeze_(input, dim):
+    return input.unsqueeze_(dim=dim)
+
+def view_as(input, other):
+    if _capturing():
+        _captured = _capture_call(view_as, (input, other), {})
+        if _captured is not None:
+            return _captured
+    return input.view_as(other=other)
+
+def norm_except_dim(v, pow=2, dim=0):
+    if _capturing():
+        _captured = _capture_call(norm_except_dim, (v, pow, dim), {})
+        if _captured is not None:
+            return _captured
+    return _C.norm_except_dim(v, pow, dim)
+
+def _weight_norm(v, g, dim=0):
+    if _capturing():
+        _captured = _capture_call(_weight_norm, (v, g, dim), {})
+        if _captured is not None:
+            return _captured
+    return _C._weight_norm(v, g, dim)
+
+def _weight_norm_interface(v, g, dim=0):
+    if _capturing():
+        _captured = _capture_call(_weight_norm_interface, (v, g, dim), {})
+        if _captured is not None:
+            return _captured
+    return _C._weight_norm_interface(v, g, dim)
+
+def _weight_norm_interface_backward(grad_w, saved_v, saved_g, saved_norms, dim):
+    if _capturing():
+        _captured = _capture_call(_weight_norm_interface_backward, (grad_w, saved_v, saved_g, saved_norms, dim), {})
+        if _captured is not None:
+            return _captured
+    return _C._weight_norm_interface_backward(grad_w, saved_v, saved_g, saved_norms, dim)
+
+def _weight_norm_differentiable_backward(grad_w, saved_v, saved_g, saved_norms, dim):
+    if _capturing():
+        _captured = _capture_call(_weight_norm_differentiable_backward, (grad_w, saved_v, saved_g, saved_norms, dim), {})
+        if _captured is not None:
+            return _captured
+    return _C._weight_norm_differentiable_backward(grad_w, saved_v, saved_g, saved_norms, dim)
+
+def _efficientzerotensor(size, dtype=None, layout=None, device=None, pin_memory=None):
+    if _capturing():
+        _captured = _capture_call(_efficientzerotensor, (size, dtype, layout, device, pin_memory), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(size, int) and not isinstance(size, bool):
+        size = [size]
+    if dtype is None:
+            dtype = DType.undefined
+    return _C._efficientzerotensor(size, dtype=dtype, layout=layout, device=_ensure_device(device), pin_memory=pin_memory)
+
+def _standard_gamma_grad(input, output):
+    if _capturing():
+        _captured = _capture_call(_standard_gamma_grad, (input, output), {})
+        if _captured is not None:
+            return _captured
+    return _C._standard_gamma_grad(input, output)
+
+def _standard_gamma(input, generator=None):
+    if _capturing():
+        _captured = _capture_call(_standard_gamma, (input, generator), {})
+        if _captured is not None:
+            return _captured
+    return _C._standard_gamma(input, generator)
+
+def _philox_key_split(key, num_splits):
+    if _capturing():
+        _captured = _capture_call(_philox_key_split, (key, num_splits), {})
+        if _captured is not None:
+            return _captured
+    return _C._philox_key_split(key, num_splits)
+
+def _philox_key_fold_in(key, data):
+    if _capturing():
+        _captured = _capture_call(_philox_key_fold_in, (key, data), {})
+        if _captured is not None:
+            return _captured
+    return _C._philox_key_fold_in(key, data)
+
+def _philox_normal_(input, key, mean=0, std=1):
+    if _capturing():
+        _captured = _capture_call(_philox_normal_, (input, key, mean, std), {})
+        if _captured is not None:
+            return _captured
+    return _C._philox_normal_(input, key, mean, std)
+
+def _philox_uniform_(input, key, low=0, high=1):
+    if _capturing():
+        _captured = _capture_call(_philox_uniform_, (input, key, low, high), {})
+        if _captured is not None:
+            return _captured
+    return _C._philox_uniform_(input, key, low, high)
+
+def _dirichlet_grad(x, alpha, total):
+    if _capturing():
+        _captured = _capture_call(_dirichlet_grad, (x, alpha, total), {})
+        if _captured is not None:
+            return _captured
+    return _C._dirichlet_grad(x, alpha, total)
+
+def _sample_dirichlet(input, generator=None):
+    if _capturing():
+        _captured = _capture_call(_sample_dirichlet, (input, generator), {})
+        if _captured is not None:
+            return _captured
+    return _C._sample_dirichlet(input, generator)
+
+def binomial(count, prob, generator=None):
+    if _capturing():
+        _captured = _capture_call(binomial, (count, prob, generator), {})
+        if _captured is not None:
+            return _captured
+    return _C.binomial(count, prob, generator)
+
+def native_norm(input, p=2):
+    if _capturing():
+        _captured = _capture_call(native_norm, (input, p), {})
+        if _captured is not None:
+            return _captured
+    if not isinstance(p, (tensorplay.Scalar, tensorplay.Tensor)):
+        p = tensorplay.Scalar(p)
+    return _C.native_norm(input, p)
+
+def _batch_norm_with_update(input, weight, bias, running_mean, running_var, momentum, eps, *, out=None):
+    if out is not None:
+        return _C._batch_norm_with_update(input=input, weight=weight, bias=bias, running_mean=running_mean, running_var=running_var, momentum=momentum, eps=eps, out=out)
+    if _capturing():
+        _captured = _capture_call(_batch_norm_with_update, (input, weight, bias, running_mean, running_var, momentum, eps), {})
+        if _captured is not None:
+            return _captured
+    return _C._batch_norm_with_update(input=input, weight=weight, bias=bias, running_mean=running_mean, running_var=running_var, momentum=momentum, eps=eps)
+
+def _batch_norm_no_update(input, weight, bias, running_mean, running_var, momentum, eps):
+    if _capturing():
+        _captured = _capture_call(_batch_norm_no_update, (input, weight, bias, running_mean, running_var, momentum, eps), {})
+        if _captured is not None:
+            return _captured
+    return _C._batch_norm_no_update(input, weight, bias, running_mean, running_var, momentum, eps)
+
+def _sparse_sum(input):
+    if _capturing():
+        _captured = _capture_call(_sparse_sum, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C._sparse_sum(input)
+
+def _sparse_sum_backward(grad, input, dim):
+    if _capturing():
+        _captured = _capture_call(_sparse_sum_backward, (grad, input, dim), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(dim, int) and not isinstance(dim, bool):
+        dim = [dim]
+    return _C._sparse_sum_backward(grad, input, dim)
+
+def _sparse_csr_sum(input, dim, keepdim=False, dtype=None):
+    if _capturing():
+        _captured = _capture_call(_sparse_csr_sum, (input, dim, keepdim, dtype), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(dim, int) and not isinstance(dim, bool):
+        dim = [dim]
+    return _C._sparse_csr_sum(input, dim, keepdim, dtype=dtype)
+
+def _sparse_csr_prod(input, dim, keepdim=False, dtype=None):
+    if _capturing():
+        _captured = _capture_call(_sparse_csr_prod, (input, dim, keepdim, dtype), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(dim, int) and not isinstance(dim, bool):
+        dim = [dim]
+    return _C._sparse_csr_prod(input, dim, keepdim, dtype=dtype)
+
+def _sparse_softmax(input, dim, dtype=None):
+    if _capturing():
+        _captured = _capture_call(_sparse_softmax, (input, dim, dtype), {})
+        if _captured is not None:
+            return _captured
+    return _C._sparse_softmax(input, dim, dtype)
+
+def _sparse_softmax_backward_data(grad_output, output, dim, input):
+    if _capturing():
+        _captured = _capture_call(_sparse_softmax_backward_data, (grad_output, output, dim, input), {})
+        if _captured is not None:
+            return _captured
+    return _C._sparse_softmax_backward_data(grad_output, output, dim, input)
+
+def _sparse_log_softmax(input, dim, dtype=None):
+    if _capturing():
+        _captured = _capture_call(_sparse_log_softmax, (input, dim, dtype), {})
+        if _captured is not None:
+            return _captured
+    return _C._sparse_log_softmax(input, dim, dtype)
+
+def _sparse_log_softmax_backward_data(grad_output, output, dim, input):
+    if _capturing():
+        _captured = _capture_call(_sparse_log_softmax_backward_data, (grad_output, output, dim, input), {})
+        if _captured is not None:
+            return _captured
+    return _C._sparse_log_softmax_backward_data(grad_output, output, dim, input)
+
+def _spdiags(diagonals, offsets, shape, layout=None):
+    if _capturing():
+        _captured = _capture_call(_spdiags, (diagonals, offsets, shape, layout), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(shape, int) and not isinstance(shape, bool):
+        shape = [shape]
+    return _C._spdiags(diagonals, offsets, shape, layout)
+
+def frobenius_norm(input, dim, keepdim=False, *, out=None):
+    if out is not None:
+        return _C.frobenius_norm(self=input, dim=dim, keepdim=keepdim, out=out)
+    if _capturing():
+        _captured = _capture_call(frobenius_norm, (input, dim, keepdim), {})
+        if _captured is not None:
+            return _captured
+    return _C.frobenius_norm(self=input, dim=dim, keepdim=keepdim)
+
+def nuclear_norm(input, keepdim=False, *, out=None):
+    if out is not None:
+        return _C.nuclear_norm(self=input, keepdim=keepdim, out=out)
+    if _capturing():
+        _captured = _capture_call(nuclear_norm, (input, keepdim), {})
+        if _captured is not None:
+            return _captured
+    return _C.nuclear_norm(self=input, keepdim=keepdim)
+
+def resize_as_sparse_(input, the_template):
+    if _capturing():
+        _captured = _capture_call(resize_as_sparse_, (input, the_template), {})
+        if _captured is not None:
+            return _captured
+    return _C.resize_as_sparse_(input, the_template)
+
+def subtract_(input, other, alpha=1):
+    return input.subtract_(other=other, alpha=alpha)
+
+def _sparse_addmm(input, mat1, mat2, beta=1, alpha=1):
+    if _capturing():
+        _captured = _capture_call(_sparse_addmm, (input, mat1, mat2, beta, alpha), {})
+        if _captured is not None:
+            return _captured
+    if not isinstance(beta, (tensorplay.Scalar, tensorplay.Tensor)):
+        beta = tensorplay.Scalar(beta)
+    if not isinstance(alpha, (tensorplay.Scalar, tensorplay.Tensor)):
+        alpha = tensorplay.Scalar(alpha)
+    return _C._sparse_addmm(input, mat1, mat2, beta=beta, alpha=alpha)
+
+def sparse_sampled_addmm(input, mat1, mat2, *, beta=1, alpha=1, out=None):
+    if out is not None:
+        return _C.sparse_sampled_addmm(self=input, mat1=mat1, mat2=mat2, beta=beta, alpha=alpha, out=out)
+    if _capturing():
+        _captured = _capture_call(sparse_sampled_addmm, (input, mat1, mat2), {})
+        if _captured is not None:
+            return _captured
+    return _C.sparse_sampled_addmm(self=input, mat1=mat1, mat2=mat2, beta=beta, alpha=alpha)
+
+def _sparse_mm_reduce_impl(input, other, reduce):
+    if _capturing():
+        _captured = _capture_call(_sparse_mm_reduce_impl, (input, other, reduce), {})
+        if _captured is not None:
+            return _captured
+    return _C._sparse_mm_reduce_impl(input, other, reduce)
+
+def _sparse_mm_reduce_impl_backward(input, grad_out, weight, reduce, arg_out, output_mask):
+    if _capturing():
+        _captured = _capture_call(_sparse_mm_reduce_impl_backward, (input, grad_out, weight, reduce, arg_out, output_mask), {})
+        if _captured is not None:
+            return _captured
+    return _C._sparse_mm_reduce_impl_backward(input, grad_out, weight, reduce, arg_out, output_mask)
+
+def _addmm_activation(input, mat1, mat2, *, beta=1, alpha=1, use_gelu=False, out=None):
+    if out is not None:
+        return _C._addmm_activation(self=input, mat1=mat1, mat2=mat2, beta=beta, alpha=alpha, use_gelu=use_gelu, out=out)
+    if _capturing():
+        _captured = _capture_call(_addmm_activation, (input, mat1, mat2), {})
+        if _captured is not None:
+            return _captured
+    return _C._addmm_activation(self=input, mat1=mat1, mat2=mat2, beta=beta, alpha=alpha, use_gelu=use_gelu)
+
+def _scaled_mm(input, mat2, scale_a, scale_b, bias=None, scale_result=None, out_dtype=None, use_fast_accum=False, *, out=None):
+    if out is not None:
+        return _C._scaled_mm(self=input, mat2=mat2, scale_a=scale_a, scale_b=scale_b, bias=bias, scale_result=scale_result, out_dtype=out_dtype, use_fast_accum=use_fast_accum, out=out)
+    if _capturing():
+        _captured = _capture_call(_scaled_mm, (input, mat2, scale_a, scale_b, bias, scale_result, out_dtype, use_fast_accum), {})
+        if _captured is not None:
+            return _captured
+    return _C._scaled_mm(self=input, mat2=mat2, scale_a=scale_a, scale_b=scale_b, bias=bias, scale_result=scale_result, out_dtype=out_dtype, use_fast_accum=use_fast_accum)
+
+def _scaled_mm_v2(input, mat2, scale_a, recipe_a, swizzle_a, scale_b, recipe_b, swizzle_b, bias, out_dtype, contraction_dim=[], use_fast_accum=False, *, out=None):
+    if out is not None:
+        return _C._scaled_mm_v2(self=input, mat2=mat2, scale_a=scale_a, recipe_a=recipe_a, swizzle_a=swizzle_a, scale_b=scale_b, recipe_b=recipe_b, swizzle_b=swizzle_b, bias=bias, out_dtype=out_dtype, contraction_dim=contraction_dim, use_fast_accum=use_fast_accum, out=out)
+    if _capturing():
+        _captured = _capture_call(_scaled_mm_v2, (input, mat2, scale_a, recipe_a, swizzle_a, scale_b, recipe_b, swizzle_b, bias, out_dtype, contraction_dim, use_fast_accum), {})
+        if _captured is not None:
+            return _captured
+    return _C._scaled_mm_v2(self=input, mat2=mat2, scale_a=scale_a, recipe_a=recipe_a, swizzle_a=swizzle_a, scale_b=scale_b, recipe_b=recipe_b, swizzle_b=swizzle_b, bias=bias, out_dtype=out_dtype, contraction_dim=contraction_dim, use_fast_accum=use_fast_accum)
+
+def _scaled_grouped_mm(input, mat2, scale_a, scale_b, offs=None, bias=None, scale_result=None, out_dtype=None, use_fast_accum=False):
+    if _capturing():
+        _captured = _capture_call(_scaled_grouped_mm, (input, mat2, scale_a, scale_b, offs, bias, scale_result, out_dtype, use_fast_accum), {})
+        if _captured is not None:
+            return _captured
+    return _C._scaled_grouped_mm(input, mat2, scale_a, scale_b, offs, bias, scale_result, out_dtype, use_fast_accum)
+
+def _scaled_grouped_mm_v2(input, mat2, scale_a, recipe_a, swizzle_a, scale_b, recipe_b, swizzle_b, offs=None, bias=None, out_dtype=None, contraction_dim=[], use_fast_accum=False, *, out=None):
+    if out is not None:
+        return _C._scaled_grouped_mm_v2(self=input, mat2=mat2, scale_a=scale_a, recipe_a=recipe_a, swizzle_a=swizzle_a, scale_b=scale_b, recipe_b=recipe_b, swizzle_b=swizzle_b, offs=offs, bias=bias, out_dtype=out_dtype, contraction_dim=contraction_dim, use_fast_accum=use_fast_accum, out=out)
+    if _capturing():
+        _captured = _capture_call(_scaled_grouped_mm_v2, (input, mat2, scale_a, recipe_a, swizzle_a, scale_b, recipe_b, swizzle_b, offs, bias, out_dtype, contraction_dim, use_fast_accum), {})
+        if _captured is not None:
+            return _captured
+    return _C._scaled_grouped_mm_v2(self=input, mat2=mat2, scale_a=scale_a, recipe_a=recipe_a, swizzle_a=swizzle_a, scale_b=scale_b, recipe_b=recipe_b, swizzle_b=swizzle_b, offs=offs, bias=bias, out_dtype=out_dtype, contraction_dim=contraction_dim, use_fast_accum=use_fast_accum)
+
+def _grouped_mm(input, mat2, offs=None, bias=None, out_dtype=None):
+    if _capturing():
+        _captured = _capture_call(_grouped_mm, (input, mat2, offs, bias, out_dtype), {})
+        if _captured is not None:
+            return _captured
+    return _C._grouped_mm(input, mat2, offs, bias, out_dtype)
+
+def _sparse_compressed_tensor_with_dims(nnz, dense_dim, size, blocksize, index_dtype, dtype=None, layout=None, device=None, pin_memory=False):
+    if _capturing():
+        _captured = _capture_call(_sparse_compressed_tensor_with_dims, (nnz, dense_dim, size, blocksize, index_dtype, dtype, layout, device, pin_memory), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(size, int) and not isinstance(size, bool):
+        size = [size]
+    if isinstance(blocksize, int) and not isinstance(blocksize, bool):
+        blocksize = [blocksize]
+    if dtype is None:
+            dtype = DType.undefined
+    return _C._sparse_compressed_tensor_with_dims(nnz, dense_dim, size, blocksize, index_dtype, dtype=dtype, layout=layout, device=_ensure_device(device), pin_memory=pin_memory)
+
+def sparse_compressed_tensor(compressed_indices, plain_indices, values, size, dtype=None, layout=None, device=None, pin_memory=False):
+    if _capturing():
+        _captured = _capture_call(sparse_compressed_tensor, (compressed_indices, plain_indices, values, size, dtype, layout, device, pin_memory), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(size, int) and not isinstance(size, bool):
+        size = [size]
+    return _C.sparse_compressed_tensor(compressed_indices, plain_indices, values, size, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory)
+
+def sparse_csr_tensor(crow_indices, col_indices, values, size, dtype=None, layout=None, device=None, pin_memory=False):
+    if _capturing():
+        _captured = _capture_call(sparse_csr_tensor, (crow_indices, col_indices, values, size, dtype, layout, device, pin_memory), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(size, int) and not isinstance(size, bool):
+        size = [size]
+    return _C.sparse_csr_tensor(crow_indices, col_indices, values, size, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory)
+
+def sparse_csc_tensor(ccol_indices, row_indices, values, size, dtype=None, layout=None, device=None, pin_memory=False):
+    if _capturing():
+        _captured = _capture_call(sparse_csc_tensor, (ccol_indices, row_indices, values, size, dtype, layout, device, pin_memory), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(size, int) and not isinstance(size, bool):
+        size = [size]
+    return _C.sparse_csc_tensor(ccol_indices, row_indices, values, size, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory)
+
+def sparse_bsr_tensor(crow_indices, col_indices, values, size, dtype=None, layout=None, device=None, pin_memory=False):
+    if _capturing():
+        _captured = _capture_call(sparse_bsr_tensor, (crow_indices, col_indices, values, size, dtype, layout, device, pin_memory), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(size, int) and not isinstance(size, bool):
+        size = [size]
+    return _C.sparse_bsr_tensor(crow_indices, col_indices, values, size, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory)
+
+def sparse_bsc_tensor(ccol_indices, row_indices, values, size, dtype=None, layout=None, device=None, pin_memory=False):
+    if _capturing():
+        _captured = _capture_call(sparse_bsc_tensor, (ccol_indices, row_indices, values, size, dtype, layout, device, pin_memory), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(size, int) and not isinstance(size, bool):
+        size = [size]
+    return _C.sparse_bsc_tensor(ccol_indices, row_indices, values, size, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory)
+
+def _sparse_compressed_tensor_unsafe(compressed_indices, plain_indices, values, size, dtype=None, layout=None, device=None, pin_memory=None):
+    if _capturing():
+        _captured = _capture_call(_sparse_compressed_tensor_unsafe, (compressed_indices, plain_indices, values, size, dtype, layout, device, pin_memory), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(size, int) and not isinstance(size, bool):
+        size = [size]
+    return _C._sparse_compressed_tensor_unsafe(compressed_indices, plain_indices, values, size, dtype=dtype, layout=layout, device=_ensure_device(device), pin_memory=pin_memory)
+
+def _sparse_csr_tensor_unsafe(crow_indices, col_indices, values, size, dtype=None, layout=None, device=None, pin_memory=None):
+    if _capturing():
+        _captured = _capture_call(_sparse_csr_tensor_unsafe, (crow_indices, col_indices, values, size, dtype, layout, device, pin_memory), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(size, int) and not isinstance(size, bool):
+        size = [size]
+    return _C._sparse_csr_tensor_unsafe(crow_indices, col_indices, values, size, dtype=dtype, layout=layout, device=_ensure_device(device), pin_memory=pin_memory)
+
+def _sparse_csc_tensor_unsafe(ccol_indices, row_indices, values, size, dtype=None, layout=None, device=None, pin_memory=None):
+    if _capturing():
+        _captured = _capture_call(_sparse_csc_tensor_unsafe, (ccol_indices, row_indices, values, size, dtype, layout, device, pin_memory), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(size, int) and not isinstance(size, bool):
+        size = [size]
+    return _C._sparse_csc_tensor_unsafe(ccol_indices, row_indices, values, size, dtype=dtype, layout=layout, device=_ensure_device(device), pin_memory=pin_memory)
+
+def _sparse_bsr_tensor_unsafe(crow_indices, col_indices, values, size, dtype=None, layout=None, device=None, pin_memory=None):
+    if _capturing():
+        _captured = _capture_call(_sparse_bsr_tensor_unsafe, (crow_indices, col_indices, values, size, dtype, layout, device, pin_memory), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(size, int) and not isinstance(size, bool):
+        size = [size]
+    return _C._sparse_bsr_tensor_unsafe(crow_indices, col_indices, values, size, dtype=dtype, layout=layout, device=_ensure_device(device), pin_memory=pin_memory)
+
+def _sparse_bsc_tensor_unsafe(ccol_indices, row_indices, values, size, dtype=None, layout=None, device=None, pin_memory=None):
+    if _capturing():
+        _captured = _capture_call(_sparse_bsc_tensor_unsafe, (ccol_indices, row_indices, values, size, dtype, layout, device, pin_memory), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(size, int) and not isinstance(size, bool):
+        size = [size]
+    return _C._sparse_bsc_tensor_unsafe(ccol_indices, row_indices, values, size, dtype=dtype, layout=layout, device=_ensure_device(device), pin_memory=pin_memory)
+
+def _sparse_coo_tensor_unsafe(indices, values, size, dtype=None, layout=None, device=None, pin_memory=None, is_coalesced=None):
+    if _capturing():
+        _captured = _capture_call(_sparse_coo_tensor_unsafe, (indices, values, size, dtype, layout, device, pin_memory, is_coalesced), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(size, int) and not isinstance(size, bool):
+        size = [size]
+    return _C._sparse_coo_tensor_unsafe(indices, values, size, dtype=dtype, layout=layout, device=_ensure_device(device), pin_memory=pin_memory, is_coalesced=is_coalesced)
+
+def _validate_sparse_coo_tensor_args(indices, values, size, is_coalesced=None, check_pinning=None):
+    if _capturing():
+        _captured = _capture_call(_validate_sparse_coo_tensor_args, (indices, values, size, is_coalesced, check_pinning), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(size, int) and not isinstance(size, bool):
+        size = [size]
+    return _C._validate_sparse_coo_tensor_args(indices, values, size, is_coalesced, check_pinning)
+
+def _validate_sparse_compressed_tensor_args(compressed_indices, plain_indices, values, size, layout, check_pinning=None):
+    if _capturing():
+        _captured = _capture_call(_validate_sparse_compressed_tensor_args, (compressed_indices, plain_indices, values, size, layout, check_pinning), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(size, int) and not isinstance(size, bool):
+        size = [size]
+    return _C._validate_sparse_compressed_tensor_args(compressed_indices, plain_indices, values, size, layout, check_pinning)
+
+def _validate_sparse_csr_tensor_args(crow_indices, col_indices, values, size, check_pinning=None):
+    if _capturing():
+        _captured = _capture_call(_validate_sparse_csr_tensor_args, (crow_indices, col_indices, values, size, check_pinning), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(size, int) and not isinstance(size, bool):
+        size = [size]
+    return _C._validate_sparse_csr_tensor_args(crow_indices, col_indices, values, size, check_pinning)
+
+def _validate_sparse_csc_tensor_args(ccol_indices, row_indices, values, size, check_pinning=None):
+    if _capturing():
+        _captured = _capture_call(_validate_sparse_csc_tensor_args, (ccol_indices, row_indices, values, size, check_pinning), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(size, int) and not isinstance(size, bool):
+        size = [size]
+    return _C._validate_sparse_csc_tensor_args(ccol_indices, row_indices, values, size, check_pinning)
+
+def _validate_sparse_bsr_tensor_args(crow_indices, col_indices, values, size, check_pinning=None):
+    if _capturing():
+        _captured = _capture_call(_validate_sparse_bsr_tensor_args, (crow_indices, col_indices, values, size, check_pinning), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(size, int) and not isinstance(size, bool):
+        size = [size]
+    return _C._validate_sparse_bsr_tensor_args(crow_indices, col_indices, values, size, check_pinning)
+
+def _validate_sparse_bsc_tensor_args(ccol_indices, row_indices, values, size, check_pinning=None):
+    if _capturing():
+        _captured = _capture_call(_validate_sparse_bsc_tensor_args, (ccol_indices, row_indices, values, size, check_pinning), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(size, int) and not isinstance(size, bool):
+        size = [size]
+    return _C._validate_sparse_bsc_tensor_args(ccol_indices, row_indices, values, size, check_pinning)
+
+def _sparse_coo_tensor_with_dims(sparse_dim, dense_dim, size, dtype=None, layout=None, device=None, pin_memory=False):
+    if _capturing():
+        _captured = _capture_call(_sparse_coo_tensor_with_dims, (sparse_dim, dense_dim, size, dtype, layout, device, pin_memory), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(size, int) and not isinstance(size, bool):
+        size = [size]
+    if dtype is None:
+            dtype = DType.undefined
+    return _C._sparse_coo_tensor_with_dims(sparse_dim, dense_dim, size, dtype=dtype, layout=layout, device=_ensure_device(device), pin_memory=pin_memory)
+
+def _sparse_coo_tensor_with_dims_and_tensors(sparse_dim, dense_dim, size, indices, values, dtype=None, layout=None, device=None, pin_memory=False, is_coalesced=None):
+    if _capturing():
+        _captured = _capture_call(_sparse_coo_tensor_with_dims_and_tensors, (sparse_dim, dense_dim, size, indices, values, dtype, layout, device, pin_memory, is_coalesced), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(size, int) and not isinstance(size, bool):
+        size = [size]
+    if dtype is None:
+            dtype = DType.undefined
+    return _C._sparse_coo_tensor_with_dims_and_tensors(sparse_dim, dense_dim, size, indices, values, dtype=dtype, layout=layout, device=_ensure_device(device), pin_memory=pin_memory, is_coalesced=is_coalesced)
+
+def sparse_resize_(input, size, sparse_dim, dense_dim):
+    return input.sparse_resize_(size=size, sparse_dim=sparse_dim, dense_dim=dense_dim)
+
+def sparse_resize_and_clear_(input, size, sparse_dim, dense_dim):
+    return input.sparse_resize_and_clear_(size=size, sparse_dim=sparse_dim, dense_dim=dense_dim)
+
+def sparse_mask(input, mask):
+    if _capturing():
+        _captured = _capture_call(sparse_mask, (input, mask), {})
+        if _captured is not None:
+            return _captured
+    return input.sparse_mask(mask=mask)
+
+def _sparse_mask_projection(input, mask, accumulate_matches=False):
+    if _capturing():
+        _captured = _capture_call(_sparse_mask_projection, (input, mask, accumulate_matches), {})
+        if _captured is not None:
+            return _captured
+    return input._sparse_mask_projection(mask=mask, accumulate_matches=accumulate_matches)
+
+def _to_cpu(*args):
+    if _capturing():
+        _captured = _capture_call(_to_cpu, (*args,), {})
+        if _captured is not None:
+            return _captured
+    return _C._to_cpu(*args)
+
+def _to_dense(input, dtype=None, masked_grad=None):
+    if _capturing():
+        _captured = _capture_call(_to_dense, (input, dtype, masked_grad), {})
+        if _captured is not None:
+            return _captured
+    return input._to_dense(dtype=dtype, masked_grad=masked_grad)
+
+def to_dense_backward(grad, input, masked_grad=None):
+    if _capturing():
+        _captured = _capture_call(to_dense_backward, (grad, input, masked_grad), {})
+        if _captured is not None:
+            return _captured
+    return _C.to_dense_backward(grad, input, masked_grad)
+
+def sparse_dim(input):
+    if _capturing():
+        _captured = _capture_call(sparse_dim, (input,), {})
+        if _captured is not None:
+            return _captured
+    return input.sparse_dim()
+
+def _dimI(input):
+    if _capturing():
+        _captured = _capture_call(_dimI, (input,), {})
+        if _captured is not None:
+            return _captured
+    return input._dimI()
+
+def dense_dim(input):
+    if _capturing():
+        _captured = _capture_call(dense_dim, (input,), {})
+        if _captured is not None:
+            return _captured
+    return input.dense_dim()
+
+def _dimV(input):
+    if _capturing():
+        _captured = _capture_call(_dimV, (input,), {})
+        if _captured is not None:
+            return _captured
+    return input._dimV()
+
+def coalesce(input):
+    if _capturing():
+        _captured = _capture_call(coalesce, (input,), {})
+        if _captured is not None:
+            return _captured
+    return input.coalesce()
+
+def _coalesce(input):
+    if _capturing():
+        _captured = _capture_call(_coalesce, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C._coalesce(input)
+
+def is_coalesced(input):
+    if _capturing():
+        _captured = _capture_call(is_coalesced, (input,), {})
+        if _captured is not None:
+            return _captured
+    return input.is_coalesced()
+
+def _indices(input):
+    if _capturing():
+        _captured = _capture_call(_indices, (input,), {})
+        if _captured is not None:
+            return _captured
+    return input._indices()
+
+def _values(input):
+    if _capturing():
+        _captured = _capture_call(_values, (input,), {})
+        if _captured is not None:
+            return _captured
+    return input._values()
+
+def _coalesced_(input, coalesced):
+    return input._coalesced_(coalesced=coalesced)
+
+def indices(input):
+    if _capturing():
+        _captured = _capture_call(indices, (input,), {})
+        if _captured is not None:
+            return _captured
+    return input.indices()
+
+def values(input):
+    if _capturing():
+        _captured = _capture_call(values, (input,), {})
+        if _captured is not None:
+            return _captured
+    return input.values()
+
+def crow_indices(input):
+    if _capturing():
+        _captured = _capture_call(crow_indices, (input,), {})
+        if _captured is not None:
+            return _captured
+    return input.crow_indices()
+
+def col_indices(input):
+    if _capturing():
+        _captured = _capture_call(col_indices, (input,), {})
+        if _captured is not None:
+            return _captured
+    return input.col_indices()
+
+def ccol_indices(input):
+    if _capturing():
+        _captured = _capture_call(ccol_indices, (input,), {})
+        if _captured is not None:
+            return _captured
+    return input.ccol_indices()
+
+def row_indices(input):
+    if _capturing():
+        _captured = _capture_call(row_indices, (input,), {})
+        if _captured is not None:
+            return _captured
+    return input.row_indices()
+
+def hspmm(mat1, mat2, *, out=None):
+    if out is not None:
+        return _C.hspmm(mat1=mat1, mat2=mat2, out=out)
+    if _capturing():
+        _captured = _capture_call(hspmm, (mat1, mat2), {})
+        if _captured is not None:
+            return _captured
+    return _C.hspmm(mat1=mat1, mat2=mat2)
+
+def copy_sparse_to_sparse_(input, src, non_blocking=False):
+    if _capturing():
+        _captured = _capture_call(copy_sparse_to_sparse_, (input, src, non_blocking), {})
+        if _captured is not None:
+            return _captured
+    return _C.copy_sparse_to_sparse_(input, src, non_blocking)
+
+def _to_sparse(input, sparse_dim):
+    if _capturing():
+        _captured = _capture_call(_to_sparse, (input, sparse_dim), {})
+        if _captured is not None:
+            return _captured
+    return input._to_sparse(sparse_dim=sparse_dim)
+
+def _to_sparse_csr(input, dense_dim=None):
+    if _capturing():
+        _captured = _capture_call(_to_sparse_csr, (input, dense_dim), {})
+        if _captured is not None:
+            return _captured
+    return input._to_sparse_csr(dense_dim=dense_dim)
+
+def to_sparse_csc(input, dense_dim=None):
+    if _capturing():
+        _captured = _capture_call(to_sparse_csc, (input, dense_dim), {})
+        if _captured is not None:
+            return _captured
+    return input.to_sparse_csc(dense_dim=dense_dim)
+
+def _to_sparse_csc(input, dense_dim=None):
+    if _capturing():
+        _captured = _capture_call(_to_sparse_csc, (input, dense_dim), {})
+        if _captured is not None:
+            return _captured
+    return input._to_sparse_csc(dense_dim=dense_dim)
+
+def to_sparse_bsr(input, blocksize, dense_dim=None):
+    if _capturing():
+        _captured = _capture_call(to_sparse_bsr, (input, blocksize, dense_dim), {})
+        if _captured is not None:
+            return _captured
+    return input.to_sparse_bsr(blocksize=blocksize, dense_dim=dense_dim)
+
+def _to_sparse_bsr(input, blocksize, dense_dim=None):
+    if _capturing():
+        _captured = _capture_call(_to_sparse_bsr, (input, blocksize, dense_dim), {})
+        if _captured is not None:
+            return _captured
+    return input._to_sparse_bsr(blocksize=blocksize, dense_dim=dense_dim)
+
+def to_sparse_bsc(input, blocksize, dense_dim=None):
+    if _capturing():
+        _captured = _capture_call(to_sparse_bsc, (input, blocksize, dense_dim), {})
+        if _captured is not None:
+            return _captured
+    return input.to_sparse_bsc(blocksize=blocksize, dense_dim=dense_dim)
+
+def _to_sparse_bsc(input, blocksize, dense_dim=None):
+    if _capturing():
+        _captured = _capture_call(_to_sparse_bsc, (input, blocksize, dense_dim), {})
+        if _captured is not None:
+            return _captured
+    return input._to_sparse_bsc(blocksize=blocksize, dense_dim=dense_dim)
+
+def to_mkldnn(input, dtype=None):
+    if _capturing():
+        _captured = _capture_call(to_mkldnn, (input, dtype), {})
+        if _captured is not None:
+            return _captured
+    return input.to_mkldnn(dtype=dtype)
+
+def mkldnn_reorder_conv2d_weight(input, padding=0, stride=1, dilation=1, groups=1, input_size=None):
+    if _capturing():
+        _captured = _capture_call(mkldnn_reorder_conv2d_weight, (input, padding, stride, dilation, groups, input_size), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(dilation, int) and not isinstance(dilation, bool):
+        dilation = [dilation]
+    if isinstance(input_size, int) and not isinstance(input_size, bool):
+        input_size = [input_size]
+    return _C.mkldnn_reorder_conv2d_weight(input, padding, stride, dilation, groups, input_size)
+
+def mkldnn_reorder_conv3d_weight(input, padding=0, stride=1, dilation=1, groups=1, input_size=None):
+    if _capturing():
+        _captured = _capture_call(mkldnn_reorder_conv3d_weight, (input, padding, stride, dilation, groups, input_size), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(dilation, int) and not isinstance(dilation, bool):
+        dilation = [dilation]
+    if isinstance(input_size, int) and not isinstance(input_size, bool):
+        input_size = [input_size]
+    return _C.mkldnn_reorder_conv3d_weight(input, padding, stride, dilation, groups, input_size)
+
+def to_mkldnn_backward(grad, input):
+    if _capturing():
+        _captured = _capture_call(to_mkldnn_backward, (grad, input), {})
+        if _captured is not None:
+            return _captured
+    return _C.to_mkldnn_backward(grad, input)
+
+def quantize_per_tensor_dynamic(input, dtype, reduce_range):
+    if _capturing():
+        _captured = _capture_call(quantize_per_tensor_dynamic, (input, dtype, reduce_range), {})
+        if _captured is not None:
+            return _captured
+    return _C.quantize_per_tensor_dynamic(input, dtype, reduce_range)
+
+def dequantize(*args):
+    if _capturing():
+        _captured = _capture_call(dequantize, (*args,), {})
+        if _captured is not None:
+            return _captured
+    return _C.dequantize(*args)
+
+def q_scale(input):
+    if _capturing():
+        _captured = _capture_call(q_scale, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.q_scale(input)
+
+def q_zero_point(input):
+    if _capturing():
+        _captured = _capture_call(q_zero_point, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.q_zero_point(input)
+
+def q_per_channel_scales(input):
+    if _capturing():
+        _captured = _capture_call(q_per_channel_scales, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.q_per_channel_scales(input)
+
+def q_per_channel_zero_points(input):
+    if _capturing():
+        _captured = _capture_call(q_per_channel_zero_points, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.q_per_channel_zero_points(input)
+
+def q_per_channel_axis(input):
+    if _capturing():
+        _captured = _capture_call(q_per_channel_axis, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.q_per_channel_axis(input)
+
+def int_repr(input):
+    if _capturing():
+        _captured = _capture_call(int_repr, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.int_repr(input)
+
+def _make_per_tensor_quantized_tensor(input, scale, zero_point):
+    if _capturing():
+        _captured = _capture_call(_make_per_tensor_quantized_tensor, (input, scale, zero_point), {})
+        if _captured is not None:
+            return _captured
+    return _C._make_per_tensor_quantized_tensor(input, scale, zero_point)
+
+def _make_per_channel_quantized_tensor(input, scale, zero_point, axis):
+    if _capturing():
+        _captured = _capture_call(_make_per_channel_quantized_tensor, (input, scale, zero_point, axis), {})
+        if _captured is not None:
+            return _captured
+    return _C._make_per_channel_quantized_tensor(input, scale, zero_point, axis)
+
+def fake_quantize_per_tensor_affine(input, scale, zero_point, quant_min, quant_max):
+    if _capturing():
+        _captured = _capture_call(fake_quantize_per_tensor_affine, (input, scale, zero_point, quant_min, quant_max), {})
+        if _captured is not None:
+            return _captured
+    return _C.fake_quantize_per_tensor_affine(input, scale, zero_point, quant_min, quant_max)
+
+def fake_quantize_per_tensor_affine_cachemask(input, scale, zero_point, quant_min, quant_max):
+    if _capturing():
+        _captured = _capture_call(fake_quantize_per_tensor_affine_cachemask, (input, scale, zero_point, quant_min, quant_max), {})
+        if _captured is not None:
+            return _captured
+    return _C.fake_quantize_per_tensor_affine_cachemask(input, scale, zero_point, quant_min, quant_max)
+
+def _fake_quantize_per_tensor_affine_cachemask_tensor_qparams(input, scale, zero_point, fake_quant_enabled, quant_min, quant_max):
+    if _capturing():
+        _captured = _capture_call(_fake_quantize_per_tensor_affine_cachemask_tensor_qparams, (input, scale, zero_point, fake_quant_enabled, quant_min, quant_max), {})
+        if _captured is not None:
+            return _captured
+    return _C._fake_quantize_per_tensor_affine_cachemask_tensor_qparams(input, scale, zero_point, fake_quant_enabled, quant_min, quant_max)
+
+def fake_quantize_per_tensor_affine_cachemask_backward(grad, mask):
+    if _capturing():
+        _captured = _capture_call(fake_quantize_per_tensor_affine_cachemask_backward, (grad, mask), {})
+        if _captured is not None:
+            return _captured
+    return _C.fake_quantize_per_tensor_affine_cachemask_backward(grad, mask)
+
+def _fake_quantize_learnable_per_tensor_affine(input, scale, zero_point, quant_min, quant_max, grad_factor=1.0):
+    if _capturing():
+        _captured = _capture_call(_fake_quantize_learnable_per_tensor_affine, (input, scale, zero_point, quant_min, quant_max, grad_factor), {})
+        if _captured is not None:
+            return _captured
+    return _C._fake_quantize_learnable_per_tensor_affine(input, scale, zero_point, quant_min, quant_max, grad_factor)
+
+def _fake_quantize_learnable_per_tensor_affine_backward(grad, input, scale, zero_point, quant_min, quant_max, grad_factor=1.0):
+    if _capturing():
+        _captured = _capture_call(_fake_quantize_learnable_per_tensor_affine_backward, (grad, input, scale, zero_point, quant_min, quant_max, grad_factor), {})
+        if _captured is not None:
+            return _captured
+    return _C._fake_quantize_learnable_per_tensor_affine_backward(grad, input, scale, zero_point, quant_min, quant_max, grad_factor)
+
+def fake_quantize_per_channel_affine(input, scale, zero_point, axis, quant_min, quant_max):
+    if _capturing():
+        _captured = _capture_call(fake_quantize_per_channel_affine, (input, scale, zero_point, axis, quant_min, quant_max), {})
+        if _captured is not None:
+            return _captured
+    return _C.fake_quantize_per_channel_affine(input, scale, zero_point, axis, quant_min, quant_max)
+
+def fake_quantize_per_channel_affine_cachemask(input, scale, zero_point, axis, quant_min, quant_max):
+    if _capturing():
+        _captured = _capture_call(fake_quantize_per_channel_affine_cachemask, (input, scale, zero_point, axis, quant_min, quant_max), {})
+        if _captured is not None:
+            return _captured
+    return _C.fake_quantize_per_channel_affine_cachemask(input, scale, zero_point, axis, quant_min, quant_max)
+
+def fake_quantize_per_channel_affine_cachemask_backward(grad, mask):
+    if _capturing():
+        _captured = _capture_call(fake_quantize_per_channel_affine_cachemask_backward, (grad, mask), {})
+        if _captured is not None:
+            return _captured
+    return _C.fake_quantize_per_channel_affine_cachemask_backward(grad, mask)
+
+def _fake_quantize_learnable_per_channel_affine(input, scale, zero_point, axis, quant_min, quant_max, grad_factor=1.0):
+    if _capturing():
+        _captured = _capture_call(_fake_quantize_learnable_per_channel_affine, (input, scale, zero_point, axis, quant_min, quant_max, grad_factor), {})
+        if _captured is not None:
+            return _captured
+    return _C._fake_quantize_learnable_per_channel_affine(input, scale, zero_point, axis, quant_min, quant_max, grad_factor)
+
+def _fake_quantize_learnable_per_channel_affine_backward(grad, input, scale, zero_point, axis, quant_min, quant_max, grad_factor=1.0):
+    if _capturing():
+        _captured = _capture_call(_fake_quantize_learnable_per_channel_affine_backward, (grad, input, scale, zero_point, axis, quant_min, quant_max, grad_factor), {})
+        if _captured is not None:
+            return _captured
+    return _C._fake_quantize_learnable_per_channel_affine_backward(grad, input, scale, zero_point, axis, quant_min, quant_max, grad_factor)
+
+def fused_moving_avg_obs_fake_quant(input, observer_on, fake_quant_on, running_min, running_max, scale, zero_point, averaging_const, quant_min, quant_max, ch_axis, per_row_fake_quant=False, symmetric_quant=False):
+    if _capturing():
+        _captured = _capture_call(fused_moving_avg_obs_fake_quant, (input, observer_on, fake_quant_on, running_min, running_max, scale, zero_point, averaging_const, quant_min, quant_max, ch_axis, per_row_fake_quant, symmetric_quant), {})
+        if _captured is not None:
+            return _captured
+    return _C.fused_moving_avg_obs_fake_quant(input, observer_on, fake_quant_on, running_min, running_max, scale, zero_point, averaging_const, quant_min, quant_max, ch_axis, per_row_fake_quant, symmetric_quant)
+
+def _fused_moving_avg_obs_fq_helper(input, observer_on, fake_quant_on, running_min, running_max, scale, zero_point, averaging_const, quant_min, quant_max, ch_axis, per_row_fake_quant=False, symmetric_quant=False):
+    if _capturing():
+        _captured = _capture_call(_fused_moving_avg_obs_fq_helper, (input, observer_on, fake_quant_on, running_min, running_max, scale, zero_point, averaging_const, quant_min, quant_max, ch_axis, per_row_fake_quant, symmetric_quant), {})
+        if _captured is not None:
+            return _captured
+    return _C._fused_moving_avg_obs_fq_helper(input, observer_on, fake_quant_on, running_min, running_max, scale, zero_point, averaging_const, quant_min, quant_max, ch_axis, per_row_fake_quant, symmetric_quant)
+
+def _choose_qparams_per_tensor(input, reduce_range=False):
+    if _capturing():
+        _captured = _capture_call(_choose_qparams_per_tensor, (input, reduce_range), {})
+        if _captured is not None:
+            return _captured
+    return _C._choose_qparams_per_tensor(input, reduce_range)
+
+def _saturate_weight_to_fp16(weight):
+    if _capturing():
+        _captured = _capture_call(_saturate_weight_to_fp16, (weight,), {})
+        if _captured is not None:
+            return _captured
+    return _C._saturate_weight_to_fp16(weight)
+
+def choose_qparams_optimized(input, numel, n_bins, ratio, bit_width):
+    if _capturing():
+        _captured = _capture_call(choose_qparams_optimized, (input, numel, n_bins, ratio, bit_width), {})
+        if _captured is not None:
+            return _captured
+    return _C.choose_qparams_optimized(input, numel, n_bins, ratio, bit_width)
+
+def _autocast_to_reduced_precision(input, cuda_enabled, cpu_enabled, cuda_dtype, cpu_dtype):
+    if _capturing():
+        _captured = _capture_call(_autocast_to_reduced_precision, (input, cuda_enabled, cpu_enabled, cuda_dtype, cpu_dtype), {})
+        if _captured is not None:
+            return _captured
+    return input._autocast_to_reduced_precision(cuda_enabled=cuda_enabled, cpu_enabled=cpu_enabled, cuda_dtype=cuda_dtype, cpu_dtype=cpu_dtype)
+
+def _autocast_to_full_precision(input, cuda_enabled, cpu_enabled):
+    if _capturing():
+        _captured = _capture_call(_autocast_to_full_precision, (input, cuda_enabled, cpu_enabled), {})
+        if _captured is not None:
+            return _captured
+    return input._autocast_to_full_precision(cuda_enabled=cuda_enabled, cpu_enabled=cpu_enabled)
+
+def _to_copy(input, dtype=None, layout=None, device=None, pin_memory=None, non_blocking=False, memory_format=None):
+    if _capturing():
+        _captured = _capture_call(_to_copy, (input, dtype, layout, device, pin_memory, non_blocking, memory_format), {})
+        if _captured is not None:
+            return _captured
+    return _C._to_copy(input, dtype=dtype, layout=layout, device=_ensure_device(device), pin_memory=pin_memory, non_blocking=non_blocking, memory_format=memory_format)
+
+def to(input, dtype=None, layout=None, device=None, pin_memory=None, non_blocking=False, copy=False, memory_format=None):
+    if _capturing():
+        _captured = _capture_call(to, (input, dtype, layout, device, pin_memory, non_blocking, copy, memory_format), {})
+        if _captured is not None:
+            return _captured
+    return input.to(dtype=dtype, layout=layout, device=device, pin_memory=pin_memory, non_blocking=non_blocking, copy=copy, memory_format=memory_format)
+
+def _local_scalar_dense(input):
+    if _capturing():
+        _captured = _capture_call(_local_scalar_dense, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C._local_scalar_dense(input)
+
+def _lstm_mps(input, hx, params, has_biases, num_layers, dropout, train, bidirectional, batch_first):
+    if _capturing():
+        _captured = _capture_call(_lstm_mps, (input, hx, params, has_biases, num_layers, dropout, train, bidirectional, batch_first), {})
+        if _captured is not None:
+            return _captured
+    return _C._lstm_mps(input, hx, params, has_biases, num_layers, dropout, train, bidirectional, batch_first)
+
+def lstm_mps_backward(grad_y, grad_hy, grad_cy, z_state, cell_state_fwd, input, layersOutputs, hx, params, has_biases, num_layers, dropout, train, bidirectional, batch_first):
+    if _capturing():
+        _captured = _capture_call(lstm_mps_backward, (grad_y, grad_hy, grad_cy, z_state, cell_state_fwd, input, layersOutputs, hx, params, has_biases, num_layers, dropout, train, bidirectional, batch_first), {})
+        if _captured is not None:
+            return _captured
+    return _C.lstm_mps_backward(grad_y, grad_hy, grad_cy, z_state, cell_state_fwd, input, layersOutputs, hx, params, has_biases, num_layers, dropout, train, bidirectional, batch_first)
+
+def _thnn_fused_lstm_cell(input_gates, hidden_gates, cx, input_bias=None, hidden_bias=None):
+    if _capturing():
+        _captured = _capture_call(_thnn_fused_lstm_cell, (input_gates, hidden_gates, cx, input_bias, hidden_bias), {})
+        if _captured is not None:
+            return _captured
+    return _C._thnn_fused_lstm_cell(input_gates, hidden_gates, cx, input_bias, hidden_bias)
+
+def _thnn_fused_lstm_cell_backward_impl(grad_hy, grad_cy, cx, cy, workspace, has_bias):
+    if _capturing():
+        _captured = _capture_call(_thnn_fused_lstm_cell_backward_impl, (grad_hy, grad_cy, cx, cy, workspace, has_bias), {})
+        if _captured is not None:
+            return _captured
+    return _C._thnn_fused_lstm_cell_backward_impl(grad_hy, grad_cy, cx, cy, workspace, has_bias)
+
+def _thnn_fused_lstm_cell_backward(grad_hy, grad_cy, cx, cy, workspace, has_bias):
+    if _capturing():
+        _captured = _capture_call(_thnn_fused_lstm_cell_backward, (grad_hy, grad_cy, cx, cy, workspace, has_bias), {})
+        if _captured is not None:
+            return _captured
+    return _C._thnn_fused_lstm_cell_backward(grad_hy, grad_cy, cx, cy, workspace, has_bias)
+
+def _thnn_differentiable_lstm_cell_backward(grad_hy, grad_cy, input_gates, hidden_gates, input_bias, hidden_bias, cx, cy):
+    if _capturing():
+        _captured = _capture_call(_thnn_differentiable_lstm_cell_backward, (grad_hy, grad_cy, input_gates, hidden_gates, input_bias, hidden_bias, cx, cy), {})
+        if _captured is not None:
+            return _captured
+    return _C._thnn_differentiable_lstm_cell_backward(grad_hy, grad_cy, input_gates, hidden_gates, input_bias, hidden_bias, cx, cy)
+
+def _thnn_fused_gru_cell(input_gates, hidden_gates, hx, input_bias=None, hidden_bias=None):
+    if _capturing():
+        _captured = _capture_call(_thnn_fused_gru_cell, (input_gates, hidden_gates, hx, input_bias, hidden_bias), {})
+        if _captured is not None:
+            return _captured
+    return _C._thnn_fused_gru_cell(input_gates, hidden_gates, hx, input_bias, hidden_bias)
+
+def _thnn_fused_gru_cell_backward(grad_hy, workspace, has_bias):
+    if _capturing():
+        _captured = _capture_call(_thnn_fused_gru_cell_backward, (grad_hy, workspace, has_bias), {})
+        if _captured is not None:
+            return _captured
+    return _C._thnn_fused_gru_cell_backward(grad_hy, workspace, has_bias)
+
+def _thnn_differentiable_gru_cell_backward(grad_hy, input_gates, hidden_gates, hx, input_bias, hidden_bias):
+    if _capturing():
+        _captured = _capture_call(_thnn_differentiable_gru_cell_backward, (grad_hy, input_gates, hidden_gates, hx, input_bias, hidden_bias), {})
+        if _captured is not None:
+            return _captured
+    return _C._thnn_differentiable_gru_cell_backward(grad_hy, input_gates, hidden_gates, hx, input_bias, hidden_bias)
+
+def quantized_lstm_cell(input, hx, w_ih, w_hh, b_ih, b_hh, packed_ih, packed_hh, col_offsets_ih, col_offsets_hh, scale_ih, scale_hh, zero_point_ih, zero_point_hh):
+    if _capturing():
+        _captured = _capture_call(quantized_lstm_cell, (input, hx, w_ih, w_hh, b_ih, b_hh, packed_ih, packed_hh, col_offsets_ih, col_offsets_hh, scale_ih, scale_hh, zero_point_ih, zero_point_hh), {})
+        if _captured is not None:
+            return _captured
+    if not isinstance(scale_ih, (tensorplay.Scalar, tensorplay.Tensor)):
+        scale_ih = tensorplay.Scalar(scale_ih)
+    if not isinstance(scale_hh, (tensorplay.Scalar, tensorplay.Tensor)):
+        scale_hh = tensorplay.Scalar(scale_hh)
+    if not isinstance(zero_point_ih, (tensorplay.Scalar, tensorplay.Tensor)):
+        zero_point_ih = tensorplay.Scalar(zero_point_ih)
+    if not isinstance(zero_point_hh, (tensorplay.Scalar, tensorplay.Tensor)):
+        zero_point_hh = tensorplay.Scalar(zero_point_hh)
+    return _C.quantized_lstm_cell(input, hx, w_ih, w_hh, b_ih, b_hh, packed_ih, packed_hh, col_offsets_ih, col_offsets_hh, scale_ih, scale_hh, zero_point_ih, zero_point_hh)
+
+def quantized_gru_cell(input, hx, w_ih, w_hh, b_ih, b_hh, packed_ih, packed_hh, col_offsets_ih, col_offsets_hh, scale_ih, scale_hh, zero_point_ih, zero_point_hh):
+    if _capturing():
+        _captured = _capture_call(quantized_gru_cell, (input, hx, w_ih, w_hh, b_ih, b_hh, packed_ih, packed_hh, col_offsets_ih, col_offsets_hh, scale_ih, scale_hh, zero_point_ih, zero_point_hh), {})
+        if _captured is not None:
+            return _captured
+    if not isinstance(scale_ih, (tensorplay.Scalar, tensorplay.Tensor)):
+        scale_ih = tensorplay.Scalar(scale_ih)
+    if not isinstance(scale_hh, (tensorplay.Scalar, tensorplay.Tensor)):
+        scale_hh = tensorplay.Scalar(scale_hh)
+    if not isinstance(zero_point_ih, (tensorplay.Scalar, tensorplay.Tensor)):
+        zero_point_ih = tensorplay.Scalar(zero_point_ih)
+    if not isinstance(zero_point_hh, (tensorplay.Scalar, tensorplay.Tensor)):
+        zero_point_hh = tensorplay.Scalar(zero_point_hh)
+    return _C.quantized_gru_cell(input, hx, w_ih, w_hh, b_ih, b_hh, packed_ih, packed_hh, col_offsets_ih, col_offsets_hh, scale_ih, scale_hh, zero_point_ih, zero_point_hh)
+
+def quantized_rnn_relu_cell(input, hx, w_ih, w_hh, b_ih, b_hh, packed_ih, packed_hh, col_offsets_ih, col_offsets_hh, scale_ih, scale_hh, zero_point_ih, zero_point_hh):
+    if _capturing():
+        _captured = _capture_call(quantized_rnn_relu_cell, (input, hx, w_ih, w_hh, b_ih, b_hh, packed_ih, packed_hh, col_offsets_ih, col_offsets_hh, scale_ih, scale_hh, zero_point_ih, zero_point_hh), {})
+        if _captured is not None:
+            return _captured
+    if not isinstance(scale_ih, (tensorplay.Scalar, tensorplay.Tensor)):
+        scale_ih = tensorplay.Scalar(scale_ih)
+    if not isinstance(scale_hh, (tensorplay.Scalar, tensorplay.Tensor)):
+        scale_hh = tensorplay.Scalar(scale_hh)
+    if not isinstance(zero_point_ih, (tensorplay.Scalar, tensorplay.Tensor)):
+        zero_point_ih = tensorplay.Scalar(zero_point_ih)
+    if not isinstance(zero_point_hh, (tensorplay.Scalar, tensorplay.Tensor)):
+        zero_point_hh = tensorplay.Scalar(zero_point_hh)
+    return _C.quantized_rnn_relu_cell(input, hx, w_ih, w_hh, b_ih, b_hh, packed_ih, packed_hh, col_offsets_ih, col_offsets_hh, scale_ih, scale_hh, zero_point_ih, zero_point_hh)
+
+def quantized_rnn_tanh_cell(input, hx, w_ih, w_hh, b_ih, b_hh, packed_ih, packed_hh, col_offsets_ih, col_offsets_hh, scale_ih, scale_hh, zero_point_ih, zero_point_hh):
+    if _capturing():
+        _captured = _capture_call(quantized_rnn_tanh_cell, (input, hx, w_ih, w_hh, b_ih, b_hh, packed_ih, packed_hh, col_offsets_ih, col_offsets_hh, scale_ih, scale_hh, zero_point_ih, zero_point_hh), {})
+        if _captured is not None:
+            return _captured
+    if not isinstance(scale_ih, (tensorplay.Scalar, tensorplay.Tensor)):
+        scale_ih = tensorplay.Scalar(scale_ih)
+    if not isinstance(scale_hh, (tensorplay.Scalar, tensorplay.Tensor)):
+        scale_hh = tensorplay.Scalar(scale_hh)
+    if not isinstance(zero_point_ih, (tensorplay.Scalar, tensorplay.Tensor)):
+        zero_point_ih = tensorplay.Scalar(zero_point_ih)
+    if not isinstance(zero_point_hh, (tensorplay.Scalar, tensorplay.Tensor)):
+        zero_point_hh = tensorplay.Scalar(zero_point_hh)
+    return _C.quantized_rnn_tanh_cell(input, hx, w_ih, w_hh, b_ih, b_hh, packed_ih, packed_hh, col_offsets_ih, col_offsets_hh, scale_ih, scale_hh, zero_point_ih, zero_point_hh)
+
+def _pack_padded_sequence(input, lengths, batch_first):
+    if _capturing():
+        _captured = _capture_call(_pack_padded_sequence, (input, lengths, batch_first), {})
+        if _captured is not None:
+            return _captured
+    return _C._pack_padded_sequence(input, lengths, batch_first)
+
+def _pack_padded_sequence_backward(grad, input_size, batch_sizes, batch_first):
+    if _capturing():
+        _captured = _capture_call(_pack_padded_sequence_backward, (grad, input_size, batch_sizes, batch_first), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(input_size, int) and not isinstance(input_size, bool):
+        input_size = [input_size]
+    return _C._pack_padded_sequence_backward(grad, input_size, batch_sizes, batch_first)
+
+def _pad_packed_sequence(data, batch_sizes, batch_first, padding_value, total_length):
+    if _capturing():
+        _captured = _capture_call(_pad_packed_sequence, (data, batch_sizes, batch_first, padding_value, total_length), {})
+        if _captured is not None:
+            return _captured
+    if not isinstance(padding_value, (tensorplay.Scalar, tensorplay.Tensor)):
+        padding_value = tensorplay.Scalar(padding_value)
+    return _C._pad_packed_sequence(data, batch_sizes, batch_first, padding_value, total_length)
+
+def set_(input, source, storage_offset, size, stride=[]):
+    return input.set_(source=source, storage_offset=storage_offset, size=size, stride=stride)
+
+def lift(input):
+    if _capturing():
+        _captured = _capture_call(lift, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.lift(input)
+
+def lift_fresh(input):
+    if _capturing():
+        _captured = _capture_call(lift_fresh, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.lift_fresh(input)
+
+def lift_fresh_copy(input):
+    if _capturing():
+        _captured = _capture_call(lift_fresh_copy, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.lift_fresh_copy(input)
+
+def is_set_to(input, tensor):
+    if _capturing():
+        _captured = _capture_call(is_set_to, (input, tensor), {})
+        if _captured is not None:
+            return _captured
+    return input.is_set_to(tensor=tensor)
+
+def masked_scatter_backward(grad_output, mask, sizes):
+    if _capturing():
+        _captured = _capture_call(masked_scatter_backward, (grad_output, mask, sizes), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(sizes, int) and not isinstance(sizes, bool):
+        sizes = [sizes]
+    return _C.masked_scatter_backward(grad_output, mask, sizes)
+
+def _masked_softmax(input, mask, dim=None, mask_type=None):
+    if _capturing():
+        _captured = _capture_call(_masked_softmax, (input, mask, dim, mask_type), {})
+        if _captured is not None:
+            return _captured
+    return _C._masked_softmax(input, mask, dim, mask_type)
+
+def _masked_softmax_backward(grad_output, output, mask, dim=None):
+    if _capturing():
+        _captured = _capture_call(_masked_softmax_backward, (grad_output, output, mask, dim), {})
+        if _captured is not None:
+            return _captured
+    return _C._masked_softmax_backward(grad_output, output, mask, dim)
+
+def put_(input, index, source, accumulate=False):
+    return input.put_(index=index, source=source, accumulate=accumulate)
+
+def scatter_reduce_(input, dim, index, src, reduce, include_self=True):
+    return input.scatter_reduce_(dim=dim, index=index, src=src, reduce=reduce, include_self=include_self)
+
+def eq_(input, other):
+    return input.eq_(other=other)
+
+def bitwise_and_(input, other):
+    return input.bitwise_and_(other=other)
+
+def __and__(input, other):
+    if _capturing():
+        _captured = _capture_call(__and__, (input, other), {})
+        if _captured is not None:
+            return _captured
+    if not isinstance(other, (tensorplay.Scalar, tensorplay.Tensor)):
+        other = tensorplay.Scalar(other)
+    return _C.__and__(input, other)
+
+def __iand__(input, other):
+    return input.__iand__(other=other)
+
+def bitwise_or_(input, other):
+    return input.bitwise_or_(other=other)
+
+def __or__(input, other):
+    if _capturing():
+        _captured = _capture_call(__or__, (input, other), {})
+        if _captured is not None:
+            return _captured
+    if not isinstance(other, (tensorplay.Scalar, tensorplay.Tensor)):
+        other = tensorplay.Scalar(other)
+    return _C.__or__(input, other)
+
+def __ior__(input, other):
+    return input.__ior__(other=other)
+
+def bitwise_xor_(input, other):
+    return input.bitwise_xor_(other=other)
+
+def __xor__(input, other):
+    if _capturing():
+        _captured = _capture_call(__xor__, (input, other), {})
+        if _captured is not None:
+            return _captured
+    if not isinstance(other, (tensorplay.Scalar, tensorplay.Tensor)):
+        other = tensorplay.Scalar(other)
+    return _C.__xor__(input, other)
+
+def __ixor__(input, other):
+    return input.__ixor__(other=other)
+
+def __lshift__(input, other):
+    if _capturing():
+        _captured = _capture_call(__lshift__, (input, other), {})
+        if _captured is not None:
+            return _captured
+    if not isinstance(other, (tensorplay.Scalar, tensorplay.Tensor)):
+        other = tensorplay.Scalar(other)
+    return _C.__lshift__(input, other)
+
+def __ilshift__(input, other):
+    return input.__ilshift__(other=other)
+
+def bitwise_left_shift_(input, other):
+    return input.bitwise_left_shift_(other=other)
+
+def __rshift__(input, other):
+    if _capturing():
+        _captured = _capture_call(__rshift__, (input, other), {})
+        if _captured is not None:
+            return _captured
+    if not isinstance(other, (tensorplay.Scalar, tensorplay.Tensor)):
+        other = tensorplay.Scalar(other)
+    return _C.__rshift__(input, other)
+
+def __irshift__(input, other):
+    return input.__irshift__(other=other)
+
+def bitwise_right_shift_(input, other):
+    return input.bitwise_right_shift_(other=other)
+
+def digamma_(input):
+    return input.digamma_()
+
+def trace_backward(grad, sizes):
+    if _capturing():
+        _captured = _capture_call(trace_backward, (grad, sizes), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(sizes, int) and not isinstance(sizes, bool):
+        sizes = [sizes]
+    return _C.trace_backward(grad, sizes)
+
+def ne_(input, other):
+    return input.ne_(other=other)
+
+def not_equal_(input, other):
+    return input.not_equal_(other=other)
+
+def ge_(input, other):
+    return input.ge_(other=other)
+
+def greater_equal_(input, other):
+    return input.greater_equal_(other=other)
+
+def le_(input, other):
+    return input.le_(other=other)
+
+def less_equal_(input, other):
+    return input.less_equal_(other=other)
+
+def gt_(input, other):
+    return input.gt_(other=other)
+
+def greater_(input, other):
+    return input.greater_(other=other)
+
+def lt_(input, other):
+    return input.lt_(other=other)
+
+def less_(input, other):
+    return input.less_(other=other)
+
+def index_select_backward(grad, self_sizes, dim, index):
+    if _capturing():
+        _captured = _capture_call(index_select_backward, (grad, self_sizes, dim, index), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(self_sizes, int) and not isinstance(self_sizes, bool):
+        self_sizes = [self_sizes]
+    return _C.index_select_backward(grad, self_sizes, dim, index)
+
+def masked_select_backward(grad, input, mask):
+    if _capturing():
+        _captured = _capture_call(masked_select_backward, (grad, input, mask), {})
+        if _captured is not None:
+            return _captured
+    return _C.masked_select_backward(grad, input, mask)
+
+def nonzero_numpy(input):
+    if _capturing():
+        _captured = _capture_call(nonzero_numpy, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.nonzero_numpy(input)
+
+def gather_backward(grad, input, dim, index, sparse_grad):
+    if _capturing():
+        _captured = _capture_call(gather_backward, (grad, input, dim, index, sparse_grad), {})
+        if _captured is not None:
+            return _captured
+    return _C.gather_backward(grad, input, dim, index, sparse_grad)
+
+def _gather_sparse_backward(input, dim, index, grad):
+    if _capturing():
+        _captured = _capture_call(_gather_sparse_backward, (input, dim, index, grad), {})
+        if _captured is not None:
+            return _captured
+    return _C._gather_sparse_backward(input, dim, index, grad)
+
+def cross_entropy_loss(input, target, weight=None, reduction=1, ignore_index=-100, label_smoothing=0.0):
+    if _capturing():
+        _captured = _capture_call(cross_entropy_loss, (input, target, weight, reduction, ignore_index, label_smoothing), {})
+        if _captured is not None:
+            return _captured
+    return _C.cross_entropy_loss(input, target, weight, reduction, ignore_index, label_smoothing)
+
+def _linalg_check_errors(info, api_name, is_matrix):
+    if _capturing():
+        _captured = _capture_call(_linalg_check_errors, (info, api_name, is_matrix), {})
+        if _captured is not None:
+            return _captured
+    return _C._linalg_check_errors(info, api_name, is_matrix=is_matrix)
+
+def swapaxes_(input, axis0, axis1):
+    return input.swapaxes_(axis0=axis0, axis1=axis1)
+
+def swapdims_(input, dim0, dim1):
+    return input.swapdims_(dim0=dim0, dim1=dim1)
+
+def _cholesky_solve_helper(input, A, upper):
+    if _capturing():
+        _captured = _capture_call(_cholesky_solve_helper, (input, A, upper), {})
+        if _captured is not None:
+            return _captured
+    return _C._cholesky_solve_helper(input, A, upper)
+
+def geqrf(input, a, tau):
+    if _capturing():
+        _captured = _capture_call(geqrf, (input, a, tau), {})
+        if _captured is not None:
+            return _captured
+    return _C.geqrf(input, a, tau)
+
+def orgqr(input, input2, *, out=None):
+    if out is not None:
+        return _C.orgqr(self=input, input2=input2, out=out)
+    if _capturing():
+        _captured = _capture_call(orgqr, (input, input2), {})
+        if _captured is not None:
+            return _captured
+    return _C.orgqr(self=input, input2=input2)
+
+def ormqr(input, input2, input3, left=True, transpose=False, *, out=None):
+    if out is not None:
+        return _C.ormqr(self=input, input2=input2, input3=input3, left=left, transpose=transpose, out=out)
+    if _capturing():
+        _captured = _capture_call(ormqr, (input, input2, input3, left, transpose), {})
+        if _captured is not None:
+            return _captured
+    return _C.ormqr(self=input, input2=input2, input3=input3, left=left, transpose=transpose)
+
+def _lu_with_info(input, pivot=True, check_errors=True):
+    if _capturing():
+        _captured = _capture_call(_lu_with_info, (input, pivot, check_errors), {})
+        if _captured is not None:
+            return _captured
+    return _C._lu_with_info(input, pivot, check_errors)
+
+def lu_solve(input, LU_data, LU_pivots, *, out=None):
+    if out is not None:
+        return _C.lu_solve(self=input, LU_data=LU_data, LU_pivots=LU_pivots, out=out)
+    if _capturing():
+        _captured = _capture_call(lu_solve, (input, LU_data, LU_pivots), {})
+        if _captured is not None:
+            return _captured
+    return _C.lu_solve(self=input, LU_data=LU_data, LU_pivots=LU_pivots)
+
+def lu_unpack(LU_data, LU_pivots, unpack_data=True, unpack_pivots=True, *, out=None):
+    if out is not None:
+        return _C.lu_unpack(LU_data=LU_data, LU_pivots=LU_pivots, unpack_data=unpack_data, unpack_pivots=unpack_pivots, out=out)
+    if _capturing():
+        _captured = _capture_call(lu_unpack, (LU_data, LU_pivots, unpack_data, unpack_pivots), {})
+        if _captured is not None:
+            return _captured
+    return _C.lu_unpack(LU_data=LU_data, LU_pivots=LU_pivots, unpack_data=unpack_data, unpack_pivots=unpack_pivots)
+
+def polygamma_(input, n):
+    return input.polygamma_(n=n)
+
+def arctan2(input, other, *, out=None):
+    if out is not None:
+        return _C.arctan2(self=input, other=other, out=out)
+    if _capturing():
+        _captured = _capture_call(arctan2, (input, other), {})
+        if _captured is not None:
+            return _captured
+    return _C.arctan2(self=input, other=other)
+
+def arctan2_(input, other):
+    return input.arctan2_(other=other)
+
+def _histogramdd_bin_edges(input, bins, range=None, weight=None, density=False):
+    if _capturing():
+        _captured = _capture_call(_histogramdd_bin_edges, (input, bins, range, weight, density), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(bins, int) and not isinstance(bins, bool):
+        bins = [bins]
+    return _C._histogramdd_bin_edges(input, bins, range=range, weight=weight, density=density)
+
+def _histogramdd_from_bin_cts(input, bins, range=None, weight=None, density=False):
+    if _capturing():
+        _captured = _capture_call(_histogramdd_from_bin_cts, (input, bins, range, weight, density), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(bins, int) and not isinstance(bins, bool):
+        bins = [bins]
+    return _C._histogramdd_from_bin_cts(input, bins, range=range, weight=weight, density=density)
+
+def _histogramdd_from_bin_tensors(input, bins, weight=None, density=False):
+    if _capturing():
+        _captured = _capture_call(_histogramdd_from_bin_tensors, (input, bins, weight, density), {})
+        if _captured is not None:
+            return _captured
+    return _C._histogramdd_from_bin_tensors(input, bins, weight=weight, density=density)
+
+def histogramdd(input, bins, range=None, weight=None, density=False):
+    if _capturing():
+        _captured = _capture_call(histogramdd, (input, bins, range, weight, density), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(bins, int) and not isinstance(bins, bool):
+        bins = [bins]
+    return _C.histogramdd(input, bins, range, weight, density)
+
+def fmod_(input, other):
+    return input.fmod_(other=other)
+
+def igamma_(input, other):
+    return input.igamma_(other=other)
+
+def igammac_(input, other):
+    return input.igammac_(other=other)
+
+def remainder_(input, other):
+    return input.remainder_(other=other)
+
+def pow_(input, exponent):
+    return input.pow_(exponent=exponent)
+
+def float_power_(input, exponent):
+    return input.float_power_(exponent=exponent)
+
+def normal_functional(input, mean=0, std=1, generator=None):
+    if _capturing():
+        _captured = _capture_call(normal_functional, (input, mean, std, generator), {})
+        if _captured is not None:
+            return _captured
+    return _C.normal_functional(input, mean, std, generator=generator)
+
+def alias(input):
+    if _capturing():
+        _captured = _capture_call(alias, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.alias(input)
+
+def _foreach_acos(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_acos, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_acos(input, *args, **kwargs)
+
+def _foreach_acos_(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_acos_, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_acos_(input, *args, **kwargs)
+
+def _foreach_asin(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_asin, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_asin(input, *args, **kwargs)
+
+def _foreach_asin_(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_asin_, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_asin_(input, *args, **kwargs)
+
+def _foreach_atan(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_atan, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_atan(input, *args, **kwargs)
+
+def _foreach_atan_(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_atan_, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_atan_(input, *args, **kwargs)
+
+def _foreach_ceil(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_ceil, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_ceil(input, *args, **kwargs)
+
+def _foreach_ceil_(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_ceil_, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_ceil_(input, *args, **kwargs)
+
+def _foreach_cos(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_cos, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_cos(input, *args, **kwargs)
+
+def _foreach_cos_(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_cos_, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_cos_(input, *args, **kwargs)
+
+def _foreach_cosh(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_cosh, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_cosh(input, *args, **kwargs)
+
+def _foreach_cosh_(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_cosh_, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_cosh_(input, *args, **kwargs)
+
+def _foreach_erf(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_erf, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_erf(input, *args, **kwargs)
+
+def _foreach_erf_(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_erf_, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_erf_(input, *args, **kwargs)
+
+def _foreach_erfc(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_erfc, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_erfc(input, *args, **kwargs)
+
+def _foreach_erfc_(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_erfc_, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_erfc_(input, *args, **kwargs)
+
+def _foreach_exp(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_exp, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_exp(input, *args, **kwargs)
+
+def _foreach_exp_(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_exp_, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_exp_(input, *args, **kwargs)
+
+def _foreach_expm1(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_expm1, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_expm1(input, *args, **kwargs)
+
+def _foreach_expm1_(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_expm1_, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_expm1_(input, *args, **kwargs)
+
+def _foreach_floor(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_floor, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_floor(input, *args, **kwargs)
+
+def _foreach_floor_(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_floor_, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_floor_(input, *args, **kwargs)
+
+def _foreach_frac(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_frac, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_frac(input, *args, **kwargs)
+
+def _foreach_frac_(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_frac_, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_frac_(input, *args, **kwargs)
+
+def _foreach_lgamma(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_lgamma, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_lgamma(input, *args, **kwargs)
+
+def _foreach_lgamma_(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_lgamma_, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_lgamma_(input, *args, **kwargs)
+
+def _foreach_log(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_log, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_log(input, *args, **kwargs)
+
+def _foreach_log_(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_log_, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_log_(input, *args, **kwargs)
+
+def _foreach_log10(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_log10, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_log10(input, *args, **kwargs)
+
+def _foreach_log10_(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_log10_, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_log10_(input, *args, **kwargs)
+
+def _foreach_log1p(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_log1p, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_log1p(input, *args, **kwargs)
+
+def _foreach_log1p_(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_log1p_, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_log1p_(input, *args, **kwargs)
+
+def _foreach_log2(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_log2, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_log2(input, *args, **kwargs)
+
+def _foreach_log2_(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_log2_, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_log2_(input, *args, **kwargs)
+
+def _foreach_max(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_max, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_max(input, *args, **kwargs)
+
+def _foreach_norm(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_norm, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_norm(input, *args, **kwargs)
+
+def _foreach_powsum(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_powsum, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_powsum(input, *args, **kwargs)
+
+def _foreach_round(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_round, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_round(input, *args, **kwargs)
+
+def _foreach_round_(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_round_, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_round_(input, *args, **kwargs)
+
+def _foreach_sigmoid(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_sigmoid, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_sigmoid(input, *args, **kwargs)
+
+def _foreach_sigmoid_(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_sigmoid_, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_sigmoid_(input, *args, **kwargs)
+
+def _foreach_sin(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_sin, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_sin(input, *args, **kwargs)
+
+def _foreach_sin_(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_sin_, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_sin_(input, *args, **kwargs)
+
+def _foreach_sinh(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_sinh, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_sinh(input, *args, **kwargs)
+
+def _foreach_sinh_(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_sinh_, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_sinh_(input, *args, **kwargs)
+
+def _foreach_tan(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_tan, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_tan(input, *args, **kwargs)
+
+def _foreach_tan_(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_tan_, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_tan_(input, *args, **kwargs)
+
+def _foreach_tanh(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_tanh, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_tanh(input, *args, **kwargs)
+
+def _foreach_tanh_(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_tanh_, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_tanh_(input, *args, **kwargs)
+
+def _foreach_trunc(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_trunc, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_trunc(input, *args, **kwargs)
+
+def _foreach_trunc_(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_trunc_, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_trunc_(input, *args, **kwargs)
+
+def _foreach_clone(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_clone, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_clone(input, *args, **kwargs)
+
+def _foreach_copy(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_copy, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_copy(input, *args, **kwargs)
+
+def _foreach_mm(input, *args, **kwargs):
+    if _capturing():
+        _captured = _capture_call(_foreach_mm, (input, *args), kwargs)
+        if _captured is not None:
+            return _captured
+    return _C._foreach_mm(input, *args, **kwargs)
+
+def _convert_indices_from_coo_to_csr(input, size, *, out_int32=False, out=None):
+    if out is not None:
+        return _C._convert_indices_from_coo_to_csr(self=input, size=size, out_int32=out_int32, out=out)
+    if _capturing():
+        _captured = _capture_call(_convert_indices_from_coo_to_csr, (input, size), {})
+        if _captured is not None:
+            return _captured
+    return _C._convert_indices_from_coo_to_csr(self=input, size=size, out_int32=out_int32)
+
+def _convert_indices_from_csr_to_coo(crow_indices, col_indices, *, out_int32=False, transpose=False, out=None):
+    if out is not None:
+        return _C._convert_indices_from_csr_to_coo(crow_indices=crow_indices, col_indices=col_indices, out_int32=out_int32, transpose=transpose, out=out)
+    if _capturing():
+        _captured = _capture_call(_convert_indices_from_csr_to_coo, (crow_indices, col_indices), {})
+        if _captured is not None:
+            return _captured
+    return _C._convert_indices_from_csr_to_coo(crow_indices=crow_indices, col_indices=col_indices, out_int32=out_int32, transpose=transpose)
+
+def nll_loss_nd(input, target, weight=None, reduction=1, ignore_index=-100):
+    if _capturing():
+        _captured = _capture_call(nll_loss_nd, (input, target, weight, reduction, ignore_index), {})
+        if _captured is not None:
+            return _captured
+    return _C.nll_loss_nd(input, target, weight, reduction, ignore_index)
+
+def nll_loss_forward(input, target, weight, reduction, ignore_index, output, total_weight):
+    if _capturing():
+        _captured = _capture_call(nll_loss_forward, (input, target, weight, reduction, ignore_index, output, total_weight), {})
+        if _captured is not None:
+            return _captured
+    return _C.nll_loss_forward(input, target, weight, reduction, ignore_index, output, total_weight)
+
+def nll_loss2d_forward(input, target, weight, reduction, ignore_index, output, total_weight):
+    if _capturing():
+        _captured = _capture_call(nll_loss2d_forward, (input, target, weight, reduction, ignore_index, output, total_weight), {})
+        if _captured is not None:
+            return _captured
+    return _C.nll_loss2d_forward(input, target, weight, reduction, ignore_index, output, total_weight)
+
+def soft_margin_loss_backward(grad_output, input, target, reduction, grad_input):
+    if _capturing():
+        _captured = _capture_call(soft_margin_loss_backward, (grad_output, input, target, reduction, grad_input), {})
+        if _captured is not None:
+            return _captured
+    return _C.soft_margin_loss_backward(grad_output, input, target, reduction, grad_input)
+
+def glu_jvp(glu, x, dx, dim):
+    if _capturing():
+        _captured = _capture_call(glu_jvp, (glu, x, dx, dim), {})
+        if _captured is not None:
+            return _captured
+    return _C.glu_jvp(glu, x, dx, dim)
+
+def glu_backward_jvp(grad_x, grad_glu, x, dgrad_glu, dx, dim):
+    if _capturing():
+        _captured = _capture_call(glu_backward_jvp, (grad_x, grad_glu, x, dgrad_glu, dx, dim), {})
+        if _captured is not None:
+            return _captured
+    return _C.glu_backward_jvp(grad_x, grad_glu, x, dgrad_glu, dx, dim)
+
+def log_sigmoid_forward(input, output, buffer):
+    if _capturing():
+        _captured = _capture_call(log_sigmoid_forward, (input, output, buffer), {})
+        if _captured is not None:
+            return _captured
+    return _C.log_sigmoid_forward(input, output, buffer)
+
+def rrelu_with_noise_(input, noise, lower=0.125, upper=0.3333333333333333, training=False, generator=None):
+    if _capturing():
+        _captured = _capture_call(rrelu_with_noise_, (input, noise, lower, upper, training, generator), {})
+        if _captured is not None:
+            return _captured
+    if not isinstance(lower, (tensorplay.Scalar, tensorplay.Tensor)):
+        lower = tensorplay.Scalar(lower)
+    if not isinstance(upper, (tensorplay.Scalar, tensorplay.Tensor)):
+        upper = tensorplay.Scalar(upper)
+    return _C.rrelu_with_noise_(input, noise, lower, upper, training, generator)
+
+def mkldnn_adaptive_avg_pool2d(input, output_size, *, out=None):
+    if out is not None:
+        return _C.mkldnn_adaptive_avg_pool2d(self=input, output_size=output_size, out=out)
+    if _capturing():
+        _captured = _capture_call(mkldnn_adaptive_avg_pool2d, (input, output_size), {})
+        if _captured is not None:
+            return _captured
+    return _C.mkldnn_adaptive_avg_pool2d(self=input, output_size=output_size)
+
+def mkldnn_adaptive_avg_pool2d_backward(grad_output, input):
+    if _capturing():
+        _captured = _capture_call(mkldnn_adaptive_avg_pool2d_backward, (grad_output, input), {})
+        if _captured is not None:
+            return _captured
+    return _C.mkldnn_adaptive_avg_pool2d_backward(grad_output, input)
+
+def _adaptive_avg_pool2d(input, output_size):
+    if _capturing():
+        _captured = _capture_call(_adaptive_avg_pool2d, (input, output_size), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(output_size, int) and not isinstance(output_size, bool):
+        output_size = [output_size]
+    return _C._adaptive_avg_pool2d(input, output_size)
+
+def _adaptive_avg_pool2d_backward(grad_output, input):
+    if _capturing():
+        _captured = _capture_call(_adaptive_avg_pool2d_backward, (grad_output, input), {})
+        if _captured is not None:
+            return _captured
+    return _C._adaptive_avg_pool2d_backward(grad_output, input)
+
+def _adaptive_avg_pool3d(input, output_size):
+    if _capturing():
+        _captured = _capture_call(_adaptive_avg_pool3d, (input, output_size), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(output_size, int) and not isinstance(output_size, bool):
+        output_size = [output_size]
+    return _C._adaptive_avg_pool3d(input, output_size)
+
+def _adaptive_avg_pool3d_backward(grad_output, input):
+    if _capturing():
+        _captured = _capture_call(_adaptive_avg_pool3d_backward, (grad_output, input), {})
+        if _captured is not None:
+            return _captured
+    return _C._adaptive_avg_pool3d_backward(grad_output, input)
+
+def reflection_pad1d(input, padding, *, out=None):
+    if out is not None:
+        return _C.reflection_pad1d(self=input, padding=padding, out=out)
+    if _capturing():
+        _captured = _capture_call(reflection_pad1d, (input, padding), {})
+        if _captured is not None:
+            return _captured
+    return _C.reflection_pad1d(self=input, padding=padding)
+
+def reflection_pad1d_backward(grad_output, input, padding, grad_input):
+    if _capturing():
+        _captured = _capture_call(reflection_pad1d_backward, (grad_output, input, padding, grad_input), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    return _C.reflection_pad1d_backward(grad_output, input, padding, grad_input)
+
+def reflection_pad2d(input, padding, *, out=None):
+    if out is not None:
+        return _C.reflection_pad2d(self=input, padding=padding, out=out)
+    if _capturing():
+        _captured = _capture_call(reflection_pad2d, (input, padding), {})
+        if _captured is not None:
+            return _captured
+    return _C.reflection_pad2d(self=input, padding=padding)
+
+def reflection_pad2d_backward(grad_output, input, padding, grad_input):
+    if _capturing():
+        _captured = _capture_call(reflection_pad2d_backward, (grad_output, input, padding, grad_input), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    return _C.reflection_pad2d_backward(grad_output, input, padding, grad_input)
+
+def reflection_pad3d(input, padding, *, out=None):
+    if out is not None:
+        return _C.reflection_pad3d(self=input, padding=padding, out=out)
+    if _capturing():
+        _captured = _capture_call(reflection_pad3d, (input, padding), {})
+        if _captured is not None:
+            return _captured
+    return _C.reflection_pad3d(self=input, padding=padding)
+
+def reflection_pad3d_backward(grad_output, input, padding, grad_input):
+    if _capturing():
+        _captured = _capture_call(reflection_pad3d_backward, (grad_output, input, padding, grad_input), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    return _C.reflection_pad3d_backward(grad_output, input, padding, grad_input)
+
+def replication_pad1d(input, padding, *, out=None):
+    if out is not None:
+        return _C.replication_pad1d(self=input, padding=padding, out=out)
+    if _capturing():
+        _captured = _capture_call(replication_pad1d, (input, padding), {})
+        if _captured is not None:
+            return _captured
+    return _C.replication_pad1d(self=input, padding=padding)
+
+def replication_pad1d_backward(grad_output, input, padding, grad_input):
+    if _capturing():
+        _captured = _capture_call(replication_pad1d_backward, (grad_output, input, padding, grad_input), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    return _C.replication_pad1d_backward(grad_output, input, padding, grad_input)
+
+def replication_pad2d(input, padding, *, out=None):
+    if out is not None:
+        return _C.replication_pad2d(self=input, padding=padding, out=out)
+    if _capturing():
+        _captured = _capture_call(replication_pad2d, (input, padding), {})
+        if _captured is not None:
+            return _captured
+    return _C.replication_pad2d(self=input, padding=padding)
+
+def replication_pad2d_backward(grad_output, input, padding, grad_input):
+    if _capturing():
+        _captured = _capture_call(replication_pad2d_backward, (grad_output, input, padding, grad_input), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    return _C.replication_pad2d_backward(grad_output, input, padding, grad_input)
+
+def replication_pad3d(input, padding, *, out=None):
+    if out is not None:
+        return _C.replication_pad3d(self=input, padding=padding, out=out)
+    if _capturing():
+        _captured = _capture_call(replication_pad3d, (input, padding), {})
+        if _captured is not None:
+            return _captured
+    return _C.replication_pad3d(self=input, padding=padding)
+
+def replication_pad3d_backward(grad_output, input, padding, grad_input):
+    if _capturing():
+        _captured = _capture_call(replication_pad3d_backward, (grad_output, input, padding, grad_input), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    return _C.replication_pad3d_backward(grad_output, input, padding, grad_input)
+
+def _pad_circular(input, pad):
+    if _capturing():
+        _captured = _capture_call(_pad_circular, (input, pad), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(pad, int) and not isinstance(pad, bool):
+        pad = [pad]
+    return _C._pad_circular(input, pad)
+
+def _pad_enum(input, pad, mode, value=None):
+    if _capturing():
+        _captured = _capture_call(_pad_enum, (input, pad, mode, value), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(pad, int) and not isinstance(pad, bool):
+        pad = [pad]
+    return _C._pad_enum(input, pad, mode, value)
+
+def pad(input, pad, mode='constant', value=None):
+    if _capturing():
+        _captured = _capture_call(pad, (input, pad, mode, value), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(pad, int) and not isinstance(pad, bool):
+        pad = [pad]
+    return _C.pad(input, pad, mode, value)
+
+def _upsample_bilinear2d_aa(input, output_size, align_corners, scale_factors, *, out=None):
+    if out is not None:
+        return _C._upsample_bilinear2d_aa(input=input, output_size=output_size, align_corners=align_corners, scale_factors=scale_factors, out=out)
+    if _capturing():
+        _captured = _capture_call(_upsample_bilinear2d_aa, (input, output_size, align_corners, scale_factors), {})
+        if _captured is not None:
+            return _captured
+    return _C._upsample_bilinear2d_aa(input=input, output_size=output_size, align_corners=align_corners, scale_factors=scale_factors)
+
+def _upsample_bicubic2d_aa(input, output_size, align_corners, scale_factors, *, out=None):
+    if out is not None:
+        return _C._upsample_bicubic2d_aa(input=input, output_size=output_size, align_corners=align_corners, scale_factors=scale_factors, out=out)
+    if _capturing():
+        _captured = _capture_call(_upsample_bicubic2d_aa, (input, output_size, align_corners, scale_factors), {})
+        if _captured is not None:
+            return _captured
+    return _C._upsample_bicubic2d_aa(input=input, output_size=output_size, align_corners=align_corners, scale_factors=scale_factors)
+
+def _upsample_lanczos2d_aa(input, output_size, align_corners, scale_factors, *, out=None):
+    if out is not None:
+        return _C._upsample_lanczos2d_aa(input=input, output_size=output_size, align_corners=align_corners, scale_factors=scale_factors, out=out)
+    if _capturing():
+        _captured = _capture_call(_upsample_lanczos2d_aa, (input, output_size, align_corners, scale_factors), {})
+        if _captured is not None:
+            return _captured
+    return _C._upsample_lanczos2d_aa(input=input, output_size=output_size, align_corners=align_corners, scale_factors=scale_factors)
+
+def _upsample_nearest_exact1d(input, output_size, scale_factors, *, out=None):
+    if out is not None:
+        return _C._upsample_nearest_exact1d(input=input, output_size=output_size, scale_factors=scale_factors, out=out)
+    if _capturing():
+        _captured = _capture_call(_upsample_nearest_exact1d, (input, output_size, scale_factors), {})
+        if _captured is not None:
+            return _captured
+    return _C._upsample_nearest_exact1d(input=input, output_size=output_size, scale_factors=scale_factors)
+
+def _upsample_nearest_exact2d(input, output_size, scale_factors, *, out=None):
+    if out is not None:
+        return _C._upsample_nearest_exact2d(input=input, output_size=output_size, scale_factors=scale_factors, out=out)
+    if _capturing():
+        _captured = _capture_call(_upsample_nearest_exact2d, (input, output_size, scale_factors), {})
+        if _captured is not None:
+            return _captured
+    return _C._upsample_nearest_exact2d(input=input, output_size=output_size, scale_factors=scale_factors)
+
+def _upsample_nearest_exact3d(input, output_size, scale_factors, *, out=None):
+    if out is not None:
+        return _C._upsample_nearest_exact3d(input=input, output_size=output_size, scale_factors=scale_factors, out=out)
+    if _capturing():
+        _captured = _capture_call(_upsample_nearest_exact3d, (input, output_size, scale_factors), {})
+        if _captured is not None:
+            return _captured
+    return _C._upsample_nearest_exact3d(input=input, output_size=output_size, scale_factors=scale_factors)
+
+def _upsample_bilinear2d_aa_backward(grad_output, output_size, input_size, align_corners, grad_input, scales_h=None, scales_w=None):
+    if _capturing():
+        _captured = _capture_call(_upsample_bilinear2d_aa_backward, (grad_output, output_size, input_size, align_corners, grad_input, scales_h, scales_w), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(output_size, int) and not isinstance(output_size, bool):
+        output_size = [output_size]
+    if isinstance(input_size, int) and not isinstance(input_size, bool):
+        input_size = [input_size]
+    return _C._upsample_bilinear2d_aa_backward(grad_output, output_size, input_size, align_corners, scales_h, scales_w, grad_input)
+
+def _upsample_bicubic2d_aa_backward(grad_output, output_size, input_size, align_corners, grad_input, scales_h=None, scales_w=None):
+    if _capturing():
+        _captured = _capture_call(_upsample_bicubic2d_aa_backward, (grad_output, output_size, input_size, align_corners, grad_input, scales_h, scales_w), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(output_size, int) and not isinstance(output_size, bool):
+        output_size = [output_size]
+    if isinstance(input_size, int) and not isinstance(input_size, bool):
+        input_size = [input_size]
+    return _C._upsample_bicubic2d_aa_backward(grad_output, output_size, input_size, align_corners, scales_h, scales_w, grad_input)
+
+def _upsample_lanczos2d_aa_backward(grad_output, output_size, input_size, align_corners, grad_input, scales_h=None, scales_w=None):
+    if _capturing():
+        _captured = _capture_call(_upsample_lanczos2d_aa_backward, (grad_output, output_size, input_size, align_corners, grad_input, scales_h, scales_w), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(output_size, int) and not isinstance(output_size, bool):
+        output_size = [output_size]
+    if isinstance(input_size, int) and not isinstance(input_size, bool):
+        input_size = [input_size]
+    return _C._upsample_lanczos2d_aa_backward(grad_output, output_size, input_size, align_corners, scales_h, scales_w, grad_input)
+
+def _upsample_nearest_exact1d_backward(grad_output, output_size, input_size, grad_input, scales=None):
+    if _capturing():
+        _captured = _capture_call(_upsample_nearest_exact1d_backward, (grad_output, output_size, input_size, grad_input, scales), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(output_size, int) and not isinstance(output_size, bool):
+        output_size = [output_size]
+    if isinstance(input_size, int) and not isinstance(input_size, bool):
+        input_size = [input_size]
+    return _C._upsample_nearest_exact1d_backward(grad_output, output_size, input_size, scales, grad_input)
+
+def _upsample_nearest_exact2d_backward(grad_output, output_size, input_size, grad_input, scales_h=None, scales_w=None):
+    if _capturing():
+        _captured = _capture_call(_upsample_nearest_exact2d_backward, (grad_output, output_size, input_size, grad_input, scales_h, scales_w), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(output_size, int) and not isinstance(output_size, bool):
+        output_size = [output_size]
+    if isinstance(input_size, int) and not isinstance(input_size, bool):
+        input_size = [input_size]
+    return _C._upsample_nearest_exact2d_backward(grad_output, output_size, input_size, scales_h, scales_w, grad_input)
+
+def _upsample_nearest_exact3d_backward(grad_output, output_size, input_size, grad_input, scales_d=None, scales_h=None, scales_w=None):
+    if _capturing():
+        _captured = _capture_call(_upsample_nearest_exact3d_backward, (grad_output, output_size, input_size, grad_input, scales_d, scales_h, scales_w), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(output_size, int) and not isinstance(output_size, bool):
+        output_size = [output_size]
+    if isinstance(input_size, int) and not isinstance(input_size, bool):
+        input_size = [input_size]
+    return _C._upsample_nearest_exact3d_backward(grad_output, output_size, input_size, scales_d, scales_h, scales_w, grad_input)
+
+def slow_conv_transpose2d(input, weight, kernel_size, bias=None, stride=1, padding=0, output_padding=0, dilation=1, *, out=None):
+    if out is not None:
+        return _C.slow_conv_transpose2d(self=input, weight=weight, kernel_size=kernel_size, bias=bias, stride=stride, padding=padding, output_padding=output_padding, dilation=dilation, out=out)
+    if _capturing():
+        _captured = _capture_call(slow_conv_transpose2d, (input, weight, kernel_size, bias, stride, padding, output_padding, dilation), {})
+        if _captured is not None:
+            return _captured
+    return _C.slow_conv_transpose2d(self=input, weight=weight, kernel_size=kernel_size, bias=bias, stride=stride, padding=padding, output_padding=output_padding, dilation=dilation)
+
+def slow_conv_transpose3d(input, weight, kernel_size, bias=None, stride=1, padding=0, output_padding=0, dilation=1, *, out=None):
+    if out is not None:
+        return _C.slow_conv_transpose3d(self=input, weight=weight, kernel_size=kernel_size, bias=bias, stride=stride, padding=padding, output_padding=output_padding, dilation=dilation, out=out)
+    if _capturing():
+        _captured = _capture_call(slow_conv_transpose3d, (input, weight, kernel_size, bias, stride, padding, output_padding, dilation), {})
+        if _captured is not None:
+            return _captured
+    return _C.slow_conv_transpose3d(self=input, weight=weight, kernel_size=kernel_size, bias=bias, stride=stride, padding=padding, output_padding=output_padding, dilation=dilation)
+
+def thnn_conv2d(input, weight, kernel_size, bias=None, stride=1, padding=0, *, out=None):
+    if out is not None:
+        return _C.thnn_conv2d(self=input, weight=weight, kernel_size=kernel_size, bias=bias, stride=stride, padding=padding, out=out)
+    if _capturing():
+        _captured = _capture_call(thnn_conv2d, (input, weight, kernel_size, bias, stride, padding), {})
+        if _captured is not None:
+            return _captured
+    return _C.thnn_conv2d(self=input, weight=weight, kernel_size=kernel_size, bias=bias, stride=stride, padding=padding)
+
+def _slow_conv2d_forward(input, weight, kernel_size, bias, stride, padding, output):
+    if _capturing():
+        _captured = _capture_call(_slow_conv2d_forward, (input, weight, kernel_size, bias, stride, padding, output), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(kernel_size, int) and not isinstance(kernel_size, bool):
+        kernel_size = [kernel_size]
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    return _C._slow_conv2d_forward(input, weight, kernel_size, bias, stride, padding, output)
+
+def _slow_conv2d_backward(grad_output, input, weight, kernel_size, stride, padding, grad_input, grad_weight, grad_bias):
+    if _capturing():
+        _captured = _capture_call(_slow_conv2d_backward, (grad_output, input, weight, kernel_size, stride, padding, grad_input, grad_weight, grad_bias), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(kernel_size, int) and not isinstance(kernel_size, bool):
+        kernel_size = [kernel_size]
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    return _C._slow_conv2d_backward(grad_output, input, weight, kernel_size, stride, padding, grad_input, grad_weight, grad_bias)
+
+def _conv_depthwise2d(input, weight, kernel_size, bias, stride, padding, dilation, *, out=None):
+    if out is not None:
+        return _C._conv_depthwise2d(self=input, weight=weight, kernel_size=kernel_size, bias=bias, stride=stride, padding=padding, dilation=dilation, out=out)
+    if _capturing():
+        _captured = _capture_call(_conv_depthwise2d, (input, weight, kernel_size, bias, stride, padding, dilation), {})
+        if _captured is not None:
+            return _captured
+    return _C._conv_depthwise2d(self=input, weight=weight, kernel_size=kernel_size, bias=bias, stride=stride, padding=padding, dilation=dilation)
+
+def conv_depthwise3d(input, weight, kernel_size, bias, stride, padding, dilation):
+    if _capturing():
+        _captured = _capture_call(conv_depthwise3d, (input, weight, kernel_size, bias, stride, padding, dilation), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(kernel_size, int) and not isinstance(kernel_size, bool):
+        kernel_size = [kernel_size]
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    if isinstance(dilation, int) and not isinstance(dilation, bool):
+        dilation = [dilation]
+    return _C.conv_depthwise3d(input, weight, kernel_size, bias, stride, padding, dilation)
+
+def slow_conv3d(input, weight, kernel_size, bias=None, stride=1, padding=0, *, out=None):
+    if out is not None:
+        return _C.slow_conv3d(self=input, weight=weight, kernel_size=kernel_size, bias=bias, stride=stride, padding=padding, out=out)
+    if _capturing():
+        _captured = _capture_call(slow_conv3d, (input, weight, kernel_size, bias, stride, padding), {})
+        if _captured is not None:
+            return _captured
+    return _C.slow_conv3d(self=input, weight=weight, kernel_size=kernel_size, bias=bias, stride=stride, padding=padding)
+
+def slow_conv3d_forward(input, weight, kernel_size, bias, stride, padding, output):
+    if _capturing():
+        _captured = _capture_call(slow_conv3d_forward, (input, weight, kernel_size, bias, stride, padding, output), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(kernel_size, int) and not isinstance(kernel_size, bool):
+        kernel_size = [kernel_size]
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    return _C.slow_conv3d_forward(input, weight, kernel_size, bias, stride, padding, output)
+
+def slow_conv_dilated2d(input, weight, kernel_size, bias=None, stride=1, padding=0, dilation=1):
+    if _capturing():
+        _captured = _capture_call(slow_conv_dilated2d, (input, weight, kernel_size, bias, stride, padding, dilation), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(kernel_size, int) and not isinstance(kernel_size, bool):
+        kernel_size = [kernel_size]
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    if isinstance(dilation, int) and not isinstance(dilation, bool):
+        dilation = [dilation]
+    return _C.slow_conv_dilated2d(input, weight, kernel_size, bias, stride, padding, dilation)
+
+def slow_conv_dilated3d(input, weight, kernel_size, bias=None, stride=1, padding=0, dilation=1):
+    if _capturing():
+        _captured = _capture_call(slow_conv_dilated3d, (input, weight, kernel_size, bias, stride, padding, dilation), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(kernel_size, int) and not isinstance(kernel_size, bool):
+        kernel_size = [kernel_size]
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    if isinstance(dilation, int) and not isinstance(dilation, bool):
+        dilation = [dilation]
+    return _C.slow_conv_dilated3d(input, weight, kernel_size, bias, stride, padding, dilation)
+
+def _add_batch_dim(input, batch_dim, level):
+    if _capturing():
+        _captured = _capture_call(_add_batch_dim, (input, batch_dim, level), {})
+        if _captured is not None:
+            return _captured
+    return _C._add_batch_dim(input, batch_dim, level)
+
+def _remove_batch_dim(input, level, batch_size, out_dim):
+    if _capturing():
+        _captured = _capture_call(_remove_batch_dim, (input, level, batch_size, out_dim), {})
+        if _captured is not None:
+            return _captured
+    return _C._remove_batch_dim(input, level, batch_size, out_dim)
+
+def special_entr(input, *, out=None):
+    if out is not None:
+        return _C.special_entr(self=input, out=out)
+    if _capturing():
+        _captured = _capture_call(special_entr, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_entr(self=input)
+
+def special_ndtri(input, *, out=None):
+    if out is not None:
+        return _C.special_ndtri(self=input, out=out)
+    if _capturing():
+        _captured = _capture_call(special_ndtri, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_ndtri(self=input)
+
+def special_log_ndtr(input, *, out=None):
+    if out is not None:
+        return _C.special_log_ndtr(self=input, out=out)
+    if _capturing():
+        _captured = _capture_call(special_log_ndtr, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_log_ndtr(self=input)
+
+def special_expm1(input, *, out=None):
+    if out is not None:
+        return _C.special_expm1(self=input, out=out)
+    if _capturing():
+        _captured = _capture_call(special_expm1, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_expm1(self=input)
+
+def special_exp2(input, *, out=None):
+    if out is not None:
+        return _C.special_exp2(self=input, out=out)
+    if _capturing():
+        _captured = _capture_call(special_exp2, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_exp2(self=input)
+
+def special_psi(input, *, out=None):
+    if out is not None:
+        return _C.special_psi(self=input, out=out)
+    if _capturing():
+        _captured = _capture_call(special_psi, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_psi(self=input)
+
+def special_digamma(input, *, out=None):
+    if out is not None:
+        return _C.special_digamma(self=input, out=out)
+    if _capturing():
+        _captured = _capture_call(special_digamma, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_digamma(self=input)
+
+def special_gammaln(input, *, out=None):
+    if out is not None:
+        return _C.special_gammaln(self=input, out=out)
+    if _capturing():
+        _captured = _capture_call(special_gammaln, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_gammaln(self=input)
+
+def special_erf(input, *, out=None):
+    if out is not None:
+        return _C.special_erf(self=input, out=out)
+    if _capturing():
+        _captured = _capture_call(special_erf, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_erf(self=input)
+
+def special_erfc(input, *, out=None):
+    if out is not None:
+        return _C.special_erfc(self=input, out=out)
+    if _capturing():
+        _captured = _capture_call(special_erfc, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_erfc(self=input)
+
+def special_erfcx(input, *, out=None):
+    if out is not None:
+        return _C.special_erfcx(self=input, out=out)
+    if _capturing():
+        _captured = _capture_call(special_erfcx, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_erfcx(self=input)
+
+def special_erfinv(input, *, out=None):
+    if out is not None:
+        return _C.special_erfinv(self=input, out=out)
+    if _capturing():
+        _captured = _capture_call(special_erfinv, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_erfinv(self=input)
+
+def special_ndtr(input, *, out=None):
+    if out is not None:
+        return _C.special_ndtr(self=input, out=out)
+    if _capturing():
+        _captured = _capture_call(special_ndtr, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_ndtr(self=input)
+
+def special_xlog1py(input, other, *, out=None):
+    if out is not None:
+        return _C.special_xlog1py(self=input, other=other, out=out)
+    if _capturing():
+        _captured = _capture_call(special_xlog1py, (input, other), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_xlog1py(self=input, other=other)
+
+def special_xlogy(input, other, *, out=None):
+    if out is not None:
+        return _C.special_xlogy(self=input, other=other, out=out)
+    if _capturing():
+        _captured = _capture_call(special_xlogy, (input, other), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_xlogy(self=input, other=other)
+
+def special_zeta(input, other, *, out=None):
+    if out is not None:
+        return _C.special_zeta(self=input, other=other, out=out)
+    if _capturing():
+        _captured = _capture_call(special_zeta, (input, other), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_zeta(self=input, other=other)
+
+def special_i0(input, *, out=None):
+    if out is not None:
+        return _C.special_i0(self=input, out=out)
+    if _capturing():
+        _captured = _capture_call(special_i0, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_i0(self=input)
+
+def special_i0e(input, *, out=None):
+    if out is not None:
+        return _C.special_i0e(self=input, out=out)
+    if _capturing():
+        _captured = _capture_call(special_i0e, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_i0e(self=input)
+
+def special_i1(input, *, out=None):
+    if out is not None:
+        return _C.special_i1(self=input, out=out)
+    if _capturing():
+        _captured = _capture_call(special_i1, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_i1(self=input)
+
+def special_i1e(input, *, out=None):
+    if out is not None:
+        return _C.special_i1e(self=input, out=out)
+    if _capturing():
+        _captured = _capture_call(special_i1e, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_i1e(self=input)
+
+def special_logit(input, eps=None, *, out=None):
+    if out is not None:
+        return _C.special_logit(self=input, eps=eps, out=out)
+    if _capturing():
+        _captured = _capture_call(special_logit, (input, eps), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_logit(self=input, eps=eps)
+
+def special_polygamma(n, input, *, out=None):
+    if out is not None:
+        return _C.special_polygamma(n=n, self=input, out=out)
+    if _capturing():
+        _captured = _capture_call(special_polygamma, (n, input), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_polygamma(n=n, self=input)
+
+def special_logsumexp(input, dim, keepdim=False, *, out=None):
+    if out is not None:
+        return _C.special_logsumexp(self=input, dim=dim, keepdim=keepdim, out=out)
+    if _capturing():
+        _captured = _capture_call(special_logsumexp, (input, dim, keepdim), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_logsumexp(self=input, dim=dim, keepdim=keepdim)
+
+def special_expit(input, *, out=None):
+    if out is not None:
+        return _C.special_expit(self=input, out=out)
+    if _capturing():
+        _captured = _capture_call(special_expit, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_expit(self=input)
+
+def special_sinc(input, *, out=None):
+    if out is not None:
+        return _C.special_sinc(self=input, out=out)
+    if _capturing():
+        _captured = _capture_call(special_sinc, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_sinc(self=input)
+
+def special_round(input, *, decimals=0, out=None):
+    if out is not None:
+        return _C.special_round(self=input, decimals=decimals, out=out)
+    if _capturing():
+        _captured = _capture_call(special_round, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_round(self=input, decimals=decimals)
+
+def special_log1p(input, *, out=None):
+    if out is not None:
+        return _C.special_log1p(self=input, out=out)
+    if _capturing():
+        _captured = _capture_call(special_log1p, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_log1p(self=input)
+
+def special_log_softmax(input, dim, dtype=None):
+    if _capturing():
+        _captured = _capture_call(special_log_softmax, (input, dim, dtype), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_log_softmax(input, dim, dtype=dtype)
+
+def special_gammainc(input, other, *, out=None):
+    if out is not None:
+        return _C.special_gammainc(self=input, other=other, out=out)
+    if _capturing():
+        _captured = _capture_call(special_gammainc, (input, other), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_gammainc(self=input, other=other)
+
+def special_gammaincc(input, other, *, out=None):
+    if out is not None:
+        return _C.special_gammaincc(self=input, other=other, out=out)
+    if _capturing():
+        _captured = _capture_call(special_gammaincc, (input, other), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_gammaincc(self=input, other=other)
+
+def special_multigammaln(input, p, *, out=None):
+    if out is not None:
+        return _C.special_multigammaln(self=input, p=p, out=out)
+    if _capturing():
+        _captured = _capture_call(special_multigammaln, (input, p), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_multigammaln(self=input, p=p)
+
+def special_softmax(input, dim, dtype=None):
+    if _capturing():
+        _captured = _capture_call(special_softmax, (input, dim, dtype), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_softmax(input, dim, dtype)
+
+def fft_hfft(input, n=None, dim=-1, norm=None, *, out=None):
+    if out is not None:
+        return _C.fft_hfft(self=input, n=n, dim=dim, norm=norm, out=out)
+    if _capturing():
+        _captured = _capture_call(fft_hfft, (input, n, dim, norm), {})
+        if _captured is not None:
+            return _captured
+    return _C.fft_hfft(self=input, n=n, dim=dim, norm=norm)
+
+def fft_ihfft(input, n=None, dim=-1, norm=None, *, out=None):
+    if out is not None:
+        return _C.fft_ihfft(self=input, n=n, dim=dim, norm=norm, out=out)
+    if _capturing():
+        _captured = _capture_call(fft_ihfft, (input, n, dim, norm), {})
+        if _captured is not None:
+            return _captured
+    return _C.fft_ihfft(self=input, n=n, dim=dim, norm=norm)
+
+def fft_hfft2(input, s=None, dim=[-2,-1], norm=None, *, out=None):
+    if out is not None:
+        return _C.fft_hfft2(self=input, s=s, dim=dim, norm=norm, out=out)
+    if _capturing():
+        _captured = _capture_call(fft_hfft2, (input, s, dim, norm), {})
+        if _captured is not None:
+            return _captured
+    return _C.fft_hfft2(self=input, s=s, dim=dim, norm=norm)
+
+def fft_ihfft2(input, s=None, dim=[-2,-1], norm=None, *, out=None):
+    if out is not None:
+        return _C.fft_ihfft2(self=input, s=s, dim=dim, norm=norm, out=out)
+    if _capturing():
+        _captured = _capture_call(fft_ihfft2, (input, s, dim, norm), {})
+        if _captured is not None:
+            return _captured
+    return _C.fft_ihfft2(self=input, s=s, dim=dim, norm=norm)
+
+def fft_fftn(input, s=None, dim=None, norm=None, *, out=None):
+    if out is not None:
+        return _C.fft_fftn(self=input, s=s, dim=dim, norm=norm, out=out)
+    if _capturing():
+        _captured = _capture_call(fft_fftn, (input, s, dim, norm), {})
+        if _captured is not None:
+            return _captured
+    return _C.fft_fftn(self=input, s=s, dim=dim, norm=norm)
+
+def fft_ifftn(input, s=None, dim=None, norm=None, *, out=None):
+    if out is not None:
+        return _C.fft_ifftn(self=input, s=s, dim=dim, norm=norm, out=out)
+    if _capturing():
+        _captured = _capture_call(fft_ifftn, (input, s, dim, norm), {})
+        if _captured is not None:
+            return _captured
+    return _C.fft_ifftn(self=input, s=s, dim=dim, norm=norm)
+
+def fft_rfftn(input, s=None, dim=None, norm=None, *, out=None):
+    if out is not None:
+        return _C.fft_rfftn(self=input, s=s, dim=dim, norm=norm, out=out)
+    if _capturing():
+        _captured = _capture_call(fft_rfftn, (input, s, dim, norm), {})
+        if _captured is not None:
+            return _captured
+    return _C.fft_rfftn(self=input, s=s, dim=dim, norm=norm)
+
+def fft_irfftn(input, s=None, dim=None, norm=None, *, out=None):
+    if out is not None:
+        return _C.fft_irfftn(self=input, s=s, dim=dim, norm=norm, out=out)
+    if _capturing():
+        _captured = _capture_call(fft_irfftn, (input, s, dim, norm), {})
+        if _captured is not None:
+            return _captured
+    return _C.fft_irfftn(self=input, s=s, dim=dim, norm=norm)
+
+def fft_hfftn(input, s=None, dim=None, norm=None, *, out=None):
+    if out is not None:
+        return _C.fft_hfftn(self=input, s=s, dim=dim, norm=norm, out=out)
+    if _capturing():
+        _captured = _capture_call(fft_hfftn, (input, s, dim, norm), {})
+        if _captured is not None:
+            return _captured
+    return _C.fft_hfftn(self=input, s=s, dim=dim, norm=norm)
+
+def fft_ihfftn(input, s=None, dim=None, norm=None, *, out=None):
+    if out is not None:
+        return _C.fft_ihfftn(self=input, s=s, dim=dim, norm=norm, out=out)
+    if _capturing():
+        _captured = _capture_call(fft_ihfftn, (input, s, dim, norm), {})
+        if _captured is not None:
+            return _captured
+    return _C.fft_ihfftn(self=input, s=s, dim=dim, norm=norm)
+
+def fft_fftfreq(n, d=1.0, *, dtype=None, layout=None, device=None, pin_memory=None, out=None):
+    if out is not None:
+        return _C.fft_fftfreq(n=n, d=d, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory, out=out)
+    if _capturing():
+        _captured = _capture_call(fft_fftfreq, (n, d), {})
+        if _captured is not None:
+            return _captured
+    return _C.fft_fftfreq(n=n, d=d, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory)
+
+def fft_rfftfreq(n, d=1.0, *, dtype=None, layout=None, device=None, pin_memory=None, out=None):
+    if out is not None:
+        return _C.fft_rfftfreq(n=n, d=d, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory, out=out)
+    if _capturing():
+        _captured = _capture_call(fft_rfftfreq, (n, d), {})
+        if _captured is not None:
+            return _captured
+    return _C.fft_rfftfreq(n=n, d=d, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory)
+
+def fft_fftshift(input, dim=None):
+    if _capturing():
+        _captured = _capture_call(fft_fftshift, (input, dim), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(dim, int) and not isinstance(dim, bool):
+        dim = [dim]
+    return _C.fft_fftshift(input, dim)
+
+def fft_ifftshift(input, dim=None):
+    if _capturing():
+        _captured = _capture_call(fft_ifftshift, (input, dim), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(dim, int) and not isinstance(dim, bool):
+        dim = [dim]
+    return _C.fft_ifftshift(input, dim)
+
+def _linalg_det(A):
+    if _capturing():
+        _captured = _capture_call(_linalg_det, (A,), {})
+        if _captured is not None:
+            return _captured
+    return _C._linalg_det(A)
+
+def det(input):
+    if _capturing():
+        _captured = _capture_call(det, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.det(input)
+
+def _linalg_slogdet(A):
+    if _capturing():
+        _captured = _capture_call(_linalg_slogdet, (A,), {})
+        if _captured is not None:
+            return _captured
+    return _C._linalg_slogdet(A)
+
+def slogdet(input, *, out=None):
+    if out is not None:
+        return _C.slogdet(self=input, out=out)
+    if _capturing():
+        _captured = _capture_call(slogdet, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.slogdet(self=input)
+
+def logdet(input):
+    if _capturing():
+        _captured = _capture_call(logdet, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.logdet(input)
+
+def _linalg_eigvals(input):
+    if _capturing():
+        _captured = _capture_call(_linalg_eigvals, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C._linalg_eigvals(input)
+
+def _linalg_eigh(A, UPLO='L', compute_v=True):
+    if _capturing():
+        _captured = _capture_call(_linalg_eigh, (A, UPLO, compute_v), {})
+        if _captured is not None:
+            return _captured
+    return _C._linalg_eigh(A, UPLO, compute_v)
+
+def inverse(input, *, out=None):
+    if out is not None:
+        return _C.inverse(self=input, out=out)
+    if _capturing():
+        _captured = _capture_call(inverse, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.inverse(self=input)
+
+def _linalg_svd(A, full_matrices=False, compute_uv=True, driver=None):
+    if _capturing():
+        _captured = _capture_call(_linalg_svd, (A, full_matrices, compute_uv, driver), {})
+        if _captured is not None:
+            return _captured
+    return _C._linalg_svd(A, full_matrices, compute_uv, driver=driver)
+
+def _linalg_solve_ex(A, B, left=True, check_errors=False):
+    if _capturing():
+        _captured = _capture_call(_linalg_solve_ex, (A, B, left, check_errors), {})
+        if _captured is not None:
+            return _captured
+    return _C._linalg_solve_ex(A, B, left=left, check_errors=check_errors)
+
+def _spsolve(A, B, left=True):
+    if _capturing():
+        _captured = _capture_call(_spsolve, (A, B, left), {})
+        if _captured is not None:
+            return _captured
+    return _C._spsolve(A, B, left=left)
+
+def nested_to_padded_tensor(input, padding, output_size=None):
+    if _capturing():
+        _captured = _capture_call(nested_to_padded_tensor, (input, padding, output_size), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(output_size, int) and not isinstance(output_size, bool):
+        output_size = [output_size]
+    return _C.nested_to_padded_tensor(input, padding, output_size)
+
+def _test_serialization_subcmul(input, other, alpha=1):
+    if _capturing():
+        _captured = _capture_call(_test_serialization_subcmul, (input, other, alpha), {})
+        if _captured is not None:
+            return _captured
+    if not isinstance(alpha, (tensorplay.Scalar, tensorplay.Tensor)):
+        alpha = tensorplay.Scalar(alpha)
+    return _C._test_serialization_subcmul(input, other, alpha)
+
+def _test_parallel_materialize(input, num_parallel, skip_first=False):
+    if _capturing():
+        _captured = _capture_call(_test_parallel_materialize, (input, num_parallel, skip_first), {})
+        if _captured is not None:
+            return _captured
+    return _C._test_parallel_materialize(input, num_parallel, skip_first)
+
+def _test_optional_intlist(values, addends):
+    if _capturing():
+        _captured = _capture_call(_test_optional_intlist, (values, addends), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(addends, int) and not isinstance(addends, bool):
+        addends = [addends]
+    return _C._test_optional_intlist(values, addends)
+
+def _test_optional_filled_intlist(values, addends):
+    if _capturing():
+        _captured = _capture_call(_test_optional_filled_intlist, (values, addends), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(addends, int) and not isinstance(addends, bool):
+        addends = [addends]
+    return _C._test_optional_filled_intlist(values, addends)
+
+def _test_optional_floatlist(values, addends):
+    if _capturing():
+        _captured = _capture_call(_test_optional_floatlist, (values, addends), {})
+        if _captured is not None:
+            return _captured
+    return _C._test_optional_floatlist(values, addends)
+
+def _test_string_default(dummy, a='"\'\\', b='"\'\\'):
+    if _capturing():
+        _captured = _capture_call(_test_string_default, (dummy, a, b), {})
+        if _captured is not None:
+            return _captured
+    return _C._test_string_default(dummy, a, b)
+
+def _test_ambiguous_defaults(dummy, a=1, b=1):
+    if _capturing():
+        _captured = _capture_call(_test_ambiguous_defaults, (dummy, a, b), {})
+        if _captured is not None:
+            return _captured
+    return _C._test_ambiguous_defaults(dummy, a, b)
+
+def _test_warn_in_autograd(input):
+    if _capturing():
+        _captured = _capture_call(_test_warn_in_autograd, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C._test_warn_in_autograd(input)
+
+def _test_autograd_multiple_dispatch(input):
+    if _capturing():
+        _captured = _capture_call(_test_autograd_multiple_dispatch, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C._test_autograd_multiple_dispatch(input)
+
+def _test_autograd_multiple_dispatch_view(input):
+    if _capturing():
+        _captured = _capture_call(_test_autograd_multiple_dispatch_view, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C._test_autograd_multiple_dispatch_view(input)
+
+def _test_autograd_multiple_dispatch_view_copy(input):
+    if _capturing():
+        _captured = _capture_call(_test_autograd_multiple_dispatch_view_copy, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C._test_autograd_multiple_dispatch_view_copy(input)
+
+def segment_reduce(data, reduce, lengths=None, indices=None, offsets=None, axis=0, unsafe=False, initial=None):
+    if _capturing():
+        _captured = _capture_call(segment_reduce, (data, reduce, lengths, indices, offsets, axis, unsafe, initial), {})
+        if _captured is not None:
+            return _captured
+    if initial is not None and not isinstance(initial, (tensorplay.Scalar, tensorplay.Tensor)):
+        initial = tensorplay.Scalar(initial)
+    return _C.segment_reduce(data, reduce, lengths=lengths, indices=indices, offsets=offsets, axis=axis, unsafe=unsafe, initial=initial)
+
+def _segment_reduce_backward(grad, output, data, reduce, lengths=None, offsets=None, axis=0, initial=None):
+    if _capturing():
+        _captured = _capture_call(_segment_reduce_backward, (grad, output, data, reduce, lengths, offsets, axis, initial), {})
+        if _captured is not None:
+            return _captured
+    if initial is not None and not isinstance(initial, (tensorplay.Scalar, tensorplay.Tensor)):
+        initial = tensorplay.Scalar(initial)
+    return _C._segment_reduce_backward(grad, output, data, reduce, lengths=lengths, offsets=offsets, axis=axis, initial=initial)
+
+def pad_sequence(sequences, batch_first=False, padding_value=0.0, padding_side='right'):
+    if _capturing():
+        _captured = _capture_call(pad_sequence, (sequences, batch_first, padding_value, padding_side), {})
+        if _captured is not None:
+            return _captured
+    return _C.pad_sequence(sequences, batch_first, padding_value, padding_side)
+
+def flatten_dense_tensors(*args):
+    if _capturing():
+        _captured = _capture_call(flatten_dense_tensors, (*args,), {})
+        if _captured is not None:
+            return _captured
+    return _C.flatten_dense_tensors(*args)
+
+def unflatten_dense_tensors(flat, tensors):
+    if _capturing():
+        _captured = _capture_call(unflatten_dense_tensors, (flat, tensors), {})
+        if _captured is not None:
+            return _captured
+    return _C.unflatten_dense_tensors(flat, tensors)
+
+def _nested_tensor_from_tensor_list(list, dtype=None, layout=None, device=None, pin_memory=None):
+    if _capturing():
+        _captured = _capture_call(_nested_tensor_from_tensor_list, (list, dtype, layout, device, pin_memory), {})
+        if _captured is not None:
+            return _captured
+    return _C._nested_tensor_from_tensor_list(list, dtype, layout, _ensure_device(device), pin_memory)
+
+def _fw_primal_copy(input, level):
+    if _capturing():
+        _captured = _capture_call(_fw_primal_copy, (input, level), {})
+        if _captured is not None:
+            return _captured
+    return _C._fw_primal_copy(input, level)
+
+def _make_dual_copy(primal, tangent, level):
+    if _capturing():
+        _captured = _capture_call(_make_dual_copy, (primal, tangent, level), {})
+        if _captured is not None:
+            return _captured
+    return _C._make_dual_copy(primal, tangent, level)
+
+def view_as_real_copy(input):
+    if _capturing():
+        _captured = _capture_call(view_as_real_copy, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.view_as_real_copy(input)
+
+def view_as_complex_copy(input):
+    if _capturing():
+        _captured = _capture_call(view_as_complex_copy, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.view_as_complex_copy(input)
+
+def _conj_copy(input):
+    if _capturing():
+        _captured = _capture_call(_conj_copy, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C._conj_copy(input)
+
+def _neg_view_copy(input):
+    if _capturing():
+        _captured = _capture_call(_neg_view_copy, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C._neg_view_copy(input)
+
+def as_strided_copy(input, size, stride, storage_offset=None):
+    if _capturing():
+        _captured = _capture_call(as_strided_copy, (input, size, stride, storage_offset), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(size, int) and not isinstance(size, bool):
+        size = [size]
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    return _C.as_strided_copy(input, size, stride, storage_offset)
+
+def _sparse_broadcast_to_copy(input, size):
+    if _capturing():
+        _captured = _capture_call(_sparse_broadcast_to_copy, (input, size), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(size, int) and not isinstance(size, bool):
+        size = [size]
+    return _C._sparse_broadcast_to_copy(input, size)
+
+def _reshape_alias_copy(input, size, stride):
+    if _capturing():
+        _captured = _capture_call(_reshape_alias_copy, (input, size, stride), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(size, int) and not isinstance(size, bool):
+        size = [size]
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    return _C._reshape_alias_copy(input, size, stride)
+
+def _indices_copy(input):
+    if _capturing():
+        _captured = _capture_call(_indices_copy, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C._indices_copy(input)
+
+def _values_copy(input):
+    if _capturing():
+        _captured = _capture_call(_values_copy, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C._values_copy(input)
+
+def indices_copy(input):
+    if _capturing():
+        _captured = _capture_call(indices_copy, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.indices_copy(input)
+
+def values_copy(input):
+    if _capturing():
+        _captured = _capture_call(values_copy, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.values_copy(input)
+
+def crow_indices_copy(input):
+    if _capturing():
+        _captured = _capture_call(crow_indices_copy, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.crow_indices_copy(input)
+
+def col_indices_copy(input):
+    if _capturing():
+        _captured = _capture_call(col_indices_copy, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.col_indices_copy(input)
+
+def ccol_indices_copy(input):
+    if _capturing():
+        _captured = _capture_call(ccol_indices_copy, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.ccol_indices_copy(input)
+
+def row_indices_copy(input):
+    if _capturing():
+        _captured = _capture_call(row_indices_copy, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.row_indices_copy(input)
+
+def to_padded_tensor(input, padding, output_size=None):
+    if _capturing():
+        _captured = _capture_call(to_padded_tensor, (input, padding, output_size), {})
+        if _captured is not None:
+            return _captured
+    return input.to_padded_tensor(padding=padding, output_size=output_size)
+
+def _jagged_to_padded_dense_forward(values, offsets, max_lengths, padding_value=0.0):
+    if _capturing():
+        _captured = _capture_call(_jagged_to_padded_dense_forward, (values, offsets, max_lengths, padding_value), {})
+        if _captured is not None:
+            return _captured
+    if isinstance(max_lengths, int) and not isinstance(max_lengths, bool):
+        max_lengths = [max_lengths]
+    return _C._jagged_to_padded_dense_forward(values, offsets, max_lengths, padding_value)
+
+def _padded_dense_to_jagged_forward(dense, offsets, total_L=None):
+    if _capturing():
+        _captured = _capture_call(_padded_dense_to_jagged_forward, (dense, offsets, total_L), {})
+        if _captured is not None:
+            return _captured
+    return _C._padded_dense_to_jagged_forward(dense, offsets, total_L)
+
+def _nested_from_padded_tensor(padded, offsets, dummy, ragged_idx=1, min_seqlen=None, max_seqlen=None, sum_S=None):
+    if _capturing():
+        _captured = _capture_call(_nested_from_padded_tensor, (padded, offsets, dummy, ragged_idx, min_seqlen, max_seqlen, sum_S), {})
+        if _captured is not None:
+            return _captured
+    return _C._nested_from_padded_tensor(padded, offsets, dummy, ragged_idx, min_seqlen, max_seqlen, sum_S)
+
+def _nested_tensor_softmax_with_shape(input, query):
+    if _capturing():
+        _captured = _capture_call(_nested_tensor_softmax_with_shape, (input, query), {})
+        if _captured is not None:
+            return _captured
+    return _C._nested_tensor_softmax_with_shape(input, query)
+
+def _safe_softmax(input, dim, dtype=None):
+    if _capturing():
+        _captured = _capture_call(_safe_softmax, (input, dim, dtype), {})
+        if _captured is not None:
+            return _captured
+    return _C._safe_softmax(input, dim, dtype)
+
+def _transformer_encoder_layer_fwd(src, embed_dim, num_heads, qkv_weight, qkv_bias, proj_weight, proj_bias, use_gelu, norm_first, eps, norm_weight_1, norm_bias_1, norm_weight_2, norm_bias_2, ffn_weight_1, ffn_bias_1, ffn_weight_2, ffn_bias_2, mask=None, mask_type=None):
+    if _capturing():
+        _captured = _capture_call(_transformer_encoder_layer_fwd, (src, embed_dim, num_heads, qkv_weight, qkv_bias, proj_weight, proj_bias, use_gelu, norm_first, eps, norm_weight_1, norm_bias_1, norm_weight_2, norm_bias_2, ffn_weight_1, ffn_bias_1, ffn_weight_2, ffn_bias_2, mask, mask_type), {})
+        if _captured is not None:
+            return _captured
+    return _C._transformer_encoder_layer_fwd(src, embed_dim, num_heads, qkv_weight, qkv_bias, proj_weight, proj_bias, use_gelu, norm_first, eps, norm_weight_1, norm_bias_1, norm_weight_2, norm_bias_2, ffn_weight_1, ffn_bias_1, ffn_weight_2, ffn_bias_2, mask, mask_type)
+
+def _native_multi_head_attention(query, key, value, embed_dim, num_head, qkv_weight, qkv_bias, proj_weight, proj_bias, mask=None, need_weights=True, average_attn_weights=True, mask_type=None):
+    if _capturing():
+        _captured = _capture_call(_native_multi_head_attention, (query, key, value, embed_dim, num_head, qkv_weight, qkv_bias, proj_weight, proj_bias, mask, need_weights, average_attn_weights, mask_type), {})
+        if _captured is not None:
+            return _captured
+    return _C._native_multi_head_attention(query, key, value, embed_dim, num_head, qkv_weight, qkv_bias, proj_weight, proj_bias, mask, need_weights, average_attn_weights, mask_type)
+
+def _fused_sdp_choice(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False):
+    if _capturing():
+        _captured = _capture_call(_fused_sdp_choice, (query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa), {})
+        if _captured is not None:
+            return _captured
+    return _C._fused_sdp_choice(query, key, value, attn_mask, dropout_p, is_causal, scale=scale, enable_gqa=enable_gqa)
+
+def _scaled_dot_product_attention_math(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, dropout_mask=None, scale=None, enable_gqa=False):
+    if _capturing():
+        _captured = _capture_call(_scaled_dot_product_attention_math, (query, key, value, attn_mask, dropout_p, is_causal, dropout_mask, scale, enable_gqa), {})
+        if _captured is not None:
+            return _captured
+    return _C._scaled_dot_product_attention_math(query, key, value, attn_mask, dropout_p, is_causal, dropout_mask, scale=scale, enable_gqa=enable_gqa)
+
+def _scaled_dot_product_attention_math_for_mps(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, dropout_mask=None, scale=None, enable_gqa=False):
+    if _capturing():
+        _captured = _capture_call(_scaled_dot_product_attention_math_for_mps, (query, key, value, attn_mask, dropout_p, is_causal, dropout_mask, scale, enable_gqa), {})
+        if _captured is not None:
+            return _captured
+    return _C._scaled_dot_product_attention_math_for_mps(query, key, value, attn_mask, dropout_p, is_causal, dropout_mask, scale=scale, enable_gqa=enable_gqa)
+
+def _scaled_dot_product_flash_attention(query, key, value, dropout_p=0.0, is_causal=False, return_debug_mask=False, scale=None):
+    if _capturing():
+        _captured = _capture_call(_scaled_dot_product_flash_attention, (query, key, value, dropout_p, is_causal, return_debug_mask, scale), {})
+        if _captured is not None:
+            return _captured
+    return _C._scaled_dot_product_flash_attention(query, key, value, dropout_p, is_causal, return_debug_mask, scale=scale)
+
+def _scaled_dot_product_flash_attention_for_cpu(query, key, value, dropout_p=0.0, is_causal=False, attn_mask=None, scale=None):
+    if _capturing():
+        _captured = _capture_call(_scaled_dot_product_flash_attention_for_cpu, (query, key, value, dropout_p, is_causal, attn_mask, scale), {})
+        if _captured is not None:
+            return _captured
+    return _C._scaled_dot_product_flash_attention_for_cpu(query, key, value, dropout_p, is_causal, attn_mask=attn_mask, scale=scale)
+
+def _scaled_dot_product_fused_attention_overrideable(query, key, value, attn_bias=None, dropout_p=0.0, is_causal=False, return_debug_mask=False, scale=None):
+    if _capturing():
+        _captured = _capture_call(_scaled_dot_product_fused_attention_overrideable, (query, key, value, attn_bias, dropout_p, is_causal, return_debug_mask, scale), {})
+        if _captured is not None:
+            return _captured
+    return _C._scaled_dot_product_fused_attention_overrideable(query, key, value, attn_bias, dropout_p, is_causal, return_debug_mask, scale=scale)
+
+def _scaled_dot_product_flash_attention_backward(grad_out, query, key, value, out, logsumexp, cum_seq_q, cum_seq_k, max_q, max_k, dropout_p, is_causal, philox_seed, philox_offset, scale=None):
+    if _capturing():
+        _captured = _capture_call(_scaled_dot_product_flash_attention_backward, (grad_out, query, key, value, out, logsumexp, cum_seq_q, cum_seq_k, max_q, max_k, dropout_p, is_causal, philox_seed, philox_offset, scale), {})
+        if _captured is not None:
+            return _captured
+    return _C._scaled_dot_product_flash_attention_backward(grad_out, query, key, value, out, logsumexp, cum_seq_q, cum_seq_k, max_q, max_k, dropout_p, is_causal, philox_seed, philox_offset, scale=scale)
+
+def _scaled_dot_product_flash_attention_for_cpu_backward(grad_out, query, key, value, out, logsumexp, dropout_p, is_causal, attn_mask=None, scale=None):
+    if _capturing():
+        _captured = _capture_call(_scaled_dot_product_flash_attention_for_cpu_backward, (grad_out, query, key, value, out, logsumexp, dropout_p, is_causal, attn_mask, scale), {})
+        if _captured is not None:
+            return _captured
+    return _C._scaled_dot_product_flash_attention_for_cpu_backward(grad_out, query, key, value, out, logsumexp, dropout_p, is_causal, attn_mask=attn_mask, scale=scale)
+
+def _scaled_dot_product_fused_attention_overrideable_backward(grad_out, query, key, value, attn_bias, grad_input_mask, out, logsumexp, cum_seq_q, cum_seq_k, max_q, max_k, dropout_p, is_causal, philox_seed, philox_offset, scale=None):
+    if _capturing():
+        _captured = _capture_call(_scaled_dot_product_fused_attention_overrideable_backward, (grad_out, query, key, value, attn_bias, grad_input_mask, out, logsumexp, cum_seq_q, cum_seq_k, max_q, max_k, dropout_p, is_causal, philox_seed, philox_offset, scale), {})
+        if _captured is not None:
+            return _captured
+    return _C._scaled_dot_product_fused_attention_overrideable_backward(grad_out, query, key, value, attn_bias, grad_input_mask, out, logsumexp, cum_seq_q, cum_seq_k, max_q, max_k, dropout_p, is_causal, philox_seed, philox_offset, scale=scale)
+
+def _scaled_dot_product_efficient_attention(query, key, value, attn_bias, compute_log_sumexp, dropout_p=0.0, is_causal=False, scale=None):
+    if _capturing():
+        _captured = _capture_call(_scaled_dot_product_efficient_attention, (query, key, value, attn_bias, compute_log_sumexp, dropout_p, is_causal, scale), {})
+        if _captured is not None:
+            return _captured
+    return _C._scaled_dot_product_efficient_attention(query, key, value, attn_bias, compute_log_sumexp, dropout_p, is_causal, scale=scale)
+
+def _scaled_dot_product_efficient_attention_backward(grad_out_, query, key, value, attn_bias, out, logsumexp, philox_seed, philox_offset, dropout_p, grad_input_mask, is_causal=False, scale=None):
+    if _capturing():
+        _captured = _capture_call(_scaled_dot_product_efficient_attention_backward, (grad_out_, query, key, value, attn_bias, out, logsumexp, philox_seed, philox_offset, dropout_p, grad_input_mask, is_causal, scale), {})
+        if _captured is not None:
+            return _captured
+    return _C._scaled_dot_product_efficient_attention_backward(grad_out_, query, key, value, attn_bias, out, logsumexp, philox_seed, philox_offset, dropout_p, grad_input_mask, is_causal, scale=scale)
+
+def _scaled_dot_product_cudnn_attention(query, key, value, attn_bias, compute_log_sumexp, dropout_p=0.0, is_causal=False, return_debug_mask=False, scale=None):
+    if _capturing():
+        _captured = _capture_call(_scaled_dot_product_cudnn_attention, (query, key, value, attn_bias, compute_log_sumexp, dropout_p, is_causal, return_debug_mask, scale), {})
+        if _captured is not None:
+            return _captured
+    return _C._scaled_dot_product_cudnn_attention(query, key, value, attn_bias, compute_log_sumexp, dropout_p, is_causal, return_debug_mask, scale=scale)
+
+def _scaled_dot_product_cudnn_attention_backward(grad_out, query, key, value, out, logsumexp, philox_seed, philox_offset, attn_bias, cum_seq_q, cum_seq_k, max_q, max_k, dropout_p, is_causal, scale=None):
+    if _capturing():
+        _captured = _capture_call(_scaled_dot_product_cudnn_attention_backward, (grad_out, query, key, value, out, logsumexp, philox_seed, philox_offset, attn_bias, cum_seq_q, cum_seq_k, max_q, max_k, dropout_p, is_causal, scale), {})
+        if _captured is not None:
+            return _captured
+    return _C._scaled_dot_product_cudnn_attention_backward(grad_out, query, key, value, out, logsumexp, philox_seed, philox_offset, attn_bias, cum_seq_q, cum_seq_k, max_q, max_k, dropout_p, is_causal, scale=scale)
+
+def _flash_attention_forward(query, key, value, cum_seq_q, cum_seq_k, max_q, max_k, dropout_p, is_causal, return_debug_mask, scale=None, window_size_left=None, window_size_right=None, seqused_k=None, alibi_slopes=None, block_table=None, num_splits=None):
+    if _capturing():
+        _captured = _capture_call(_flash_attention_forward, (query, key, value, cum_seq_q, cum_seq_k, max_q, max_k, dropout_p, is_causal, return_debug_mask, scale, window_size_left, window_size_right, seqused_k, alibi_slopes, block_table, num_splits), {})
+        if _captured is not None:
+            return _captured
+    return _C._flash_attention_forward(query, key, value, cum_seq_q, cum_seq_k, max_q, max_k, dropout_p, is_causal, return_debug_mask, scale=scale, window_size_left=window_size_left, window_size_right=window_size_right, seqused_k=seqused_k, alibi_slopes=alibi_slopes, block_table=block_table, num_splits=num_splits)
+
+def _flash_attention_forward_no_dropout_inplace(out, query, key, value, cum_seq_q, cum_seq_k, max_q, max_k, dropout_p, is_causal, return_debug_mask, scale=None, window_size_left=None, window_size_right=None, seqused_k=None, alibi_slopes=None, block_table=None, num_splits=None):
+    if _capturing():
+        _captured = _capture_call(_flash_attention_forward_no_dropout_inplace, (out, query, key, value, cum_seq_q, cum_seq_k, max_q, max_k, dropout_p, is_causal, return_debug_mask, scale, window_size_left, window_size_right, seqused_k, alibi_slopes, block_table, num_splits), {})
+        if _captured is not None:
+            return _captured
+    return _C._flash_attention_forward_no_dropout_inplace(out, query, key, value, cum_seq_q, cum_seq_k, max_q, max_k, dropout_p, is_causal, return_debug_mask, scale=scale, window_size_left=window_size_left, window_size_right=window_size_right, seqused_k=seqused_k, alibi_slopes=alibi_slopes, block_table=block_table, num_splits=num_splits)
+
+def _flash_attention_backward(grad_out, query, key, value, out, logsumexp, cum_seq_q, cum_seq_k, max_q, max_k, dropout_p, is_causal, rng_state, unused, scale=None, window_size_left=None, window_size_right=None):
+    if _capturing():
+        _captured = _capture_call(_flash_attention_backward, (grad_out, query, key, value, out, logsumexp, cum_seq_q, cum_seq_k, max_q, max_k, dropout_p, is_causal, rng_state, unused, scale, window_size_left, window_size_right), {})
+        if _captured is not None:
+            return _captured
+    return _C._flash_attention_backward(grad_out, query, key, value, out, logsumexp, cum_seq_q, cum_seq_k, max_q, max_k, dropout_p, is_causal, rng_state, unused, scale=scale, window_size_left=window_size_left, window_size_right=window_size_right)
+
+def _efficient_attention_forward(query, key, value, bias, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, dropout_p, custom_mask_type, compute_log_sumexp=False, scale=None, seqlen_k=None, window_size=None):
+    if _capturing():
+        _captured = _capture_call(_efficient_attention_forward, (query, key, value, bias, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, dropout_p, custom_mask_type, compute_log_sumexp, scale, seqlen_k, window_size), {})
+        if _captured is not None:
+            return _captured
+    return _C._efficient_attention_forward(query, key, value, bias, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, dropout_p, custom_mask_type, compute_log_sumexp, scale=scale, seqlen_k=seqlen_k, window_size=window_size)
+
+def _efficient_attention_backward(grad_out_, query, key, value, bias, out, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, logsumexp, dropout_p, philox_seed, philox_offset, custom_mask_type, bias_requires_grad, scale=None, num_splits_key=None, window_size=None, shared_storage_dqdkdv=False):
+    if _capturing():
+        _captured = _capture_call(_efficient_attention_backward, (grad_out_, query, key, value, bias, out, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, logsumexp, dropout_p, philox_seed, philox_offset, custom_mask_type, bias_requires_grad, scale, num_splits_key, window_size, shared_storage_dqdkdv), {})
+        if _captured is not None:
+            return _captured
+    return _C._efficient_attention_backward(grad_out_, query, key, value, bias, out, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, logsumexp, dropout_p, philox_seed, philox_offset, custom_mask_type, bias_requires_grad, scale=scale, num_splits_key=num_splits_key, window_size=window_size, shared_storage_dqdkdv=shared_storage_dqdkdv)
+
+def _cudnn_attention_forward(query, key, value, attn_bias, cum_seq_q, cum_seq_k, max_q, max_k, compute_log_sumexp, dropout_p=0.0, is_causal=False, return_debug_mask=False, scale=None, seqused_k=None, block_table=None):
+    if _capturing():
+        _captured = _capture_call(_cudnn_attention_forward, (query, key, value, attn_bias, cum_seq_q, cum_seq_k, max_q, max_k, compute_log_sumexp, dropout_p, is_causal, return_debug_mask, scale, seqused_k, block_table), {})
+        if _captured is not None:
+            return _captured
+    return _C._cudnn_attention_forward(query, key, value, attn_bias, cum_seq_q, cum_seq_k, max_q, max_k, compute_log_sumexp, dropout_p, is_causal, return_debug_mask, scale=scale, seqused_k=seqused_k, block_table=block_table)
+
+def _cudnn_attention_backward(grad_out, query, key, value, out, logsumexp, philox_seed, philox_offset, attn_bias, cum_seq_q, cum_seq_k, max_q, max_k, dropout_p, is_causal, scale=None):
+    if _capturing():
+        _captured = _capture_call(_cudnn_attention_backward, (grad_out, query, key, value, out, logsumexp, philox_seed, philox_offset, attn_bias, cum_seq_q, cum_seq_k, max_q, max_k, dropout_p, is_causal, scale), {})
+        if _captured is not None:
+            return _captured
+    return _C._cudnn_attention_backward(grad_out, query, key, value, out, logsumexp, philox_seed, philox_offset, attn_bias, cum_seq_q, cum_seq_k, max_q, max_k, dropout_p, is_causal, scale=scale)
+
+def _triton_scaled_dot_attention(q, k, v, dropout_p=0.0):
+    if _capturing():
+        _captured = _capture_call(_triton_scaled_dot_attention, (q, k, v, dropout_p), {})
+        if _captured is not None:
+            return _captured
+    return _C._triton_scaled_dot_attention(q, k, v, dropout_p)
+
+def _fill_mem_eff_dropout_mask_(input, dropout_p, seed, offset):
+    if _capturing():
+        _captured = _capture_call(_fill_mem_eff_dropout_mask_, (input, dropout_p, seed, offset), {})
+        if _captured is not None:
+            return _captured
+    return _C._fill_mem_eff_dropout_mask_(input, dropout_p, seed, offset)
+
+def _triton_multi_head_attention(query, key, value, embed_dim, num_head, qkv_weight, qkv_bias, proj_weight, proj_bias, mask=None):
+    if _capturing():
+        _captured = _capture_call(_triton_multi_head_attention, (query, key, value, embed_dim, num_head, qkv_weight, qkv_bias, proj_weight, proj_bias, mask), {})
+        if _captured is not None:
+            return _captured
+    return _C._triton_multi_head_attention(query, key, value, embed_dim, num_head, qkv_weight, qkv_bias, proj_weight, proj_bias, mask)
+
+def special_airy_ai(x, *, out=None):
+    if out is not None:
+        return _C.special_airy_ai(x=x, out=out)
+    if _capturing():
+        _captured = _capture_call(special_airy_ai, (x,), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_airy_ai(x=x)
+
+def special_bessel_j0(input, *, out=None):
+    if out is not None:
+        return _C.special_bessel_j0(self=input, out=out)
+    if _capturing():
+        _captured = _capture_call(special_bessel_j0, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_bessel_j0(self=input)
+
+def special_bessel_j1(input, *, out=None):
+    if out is not None:
+        return _C.special_bessel_j1(self=input, out=out)
+    if _capturing():
+        _captured = _capture_call(special_bessel_j1, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_bessel_j1(self=input)
+
+def special_bessel_y0(input, *, out=None):
+    if out is not None:
+        return _C.special_bessel_y0(self=input, out=out)
+    if _capturing():
+        _captured = _capture_call(special_bessel_y0, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_bessel_y0(self=input)
+
+def special_bessel_y1(input, *, out=None):
+    if out is not None:
+        return _C.special_bessel_y1(self=input, out=out)
+    if _capturing():
+        _captured = _capture_call(special_bessel_y1, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_bessel_y1(self=input)
+
+def special_chebyshev_polynomial_t(x, n, *, out=None):
+    if out is not None:
+        return _C.special_chebyshev_polynomial_t(x=x, n=n, out=out)
+    if _capturing():
+        _captured = _capture_call(special_chebyshev_polynomial_t, (x, n), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_chebyshev_polynomial_t(x=x, n=n)
+
+def special_chebyshev_polynomial_u(x, n, *, out=None):
+    if out is not None:
+        return _C.special_chebyshev_polynomial_u(x=x, n=n, out=out)
+    if _capturing():
+        _captured = _capture_call(special_chebyshev_polynomial_u, (x, n), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_chebyshev_polynomial_u(x=x, n=n)
+
+def special_chebyshev_polynomial_v(x, n, *, out=None):
+    if out is not None:
+        return _C.special_chebyshev_polynomial_v(x=x, n=n, out=out)
+    if _capturing():
+        _captured = _capture_call(special_chebyshev_polynomial_v, (x, n), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_chebyshev_polynomial_v(x=x, n=n)
+
+def special_chebyshev_polynomial_w(x, n, *, out=None):
+    if out is not None:
+        return _C.special_chebyshev_polynomial_w(x=x, n=n, out=out)
+    if _capturing():
+        _captured = _capture_call(special_chebyshev_polynomial_w, (x, n), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_chebyshev_polynomial_w(x=x, n=n)
+
+def special_hermite_polynomial_h(x, n, *, out=None):
+    if out is not None:
+        return _C.special_hermite_polynomial_h(x=x, n=n, out=out)
+    if _capturing():
+        _captured = _capture_call(special_hermite_polynomial_h, (x, n), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_hermite_polynomial_h(x=x, n=n)
+
+def special_hermite_polynomial_he(x, n, *, out=None):
+    if out is not None:
+        return _C.special_hermite_polynomial_he(x=x, n=n, out=out)
+    if _capturing():
+        _captured = _capture_call(special_hermite_polynomial_he, (x, n), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_hermite_polynomial_he(x=x, n=n)
+
+def special_laguerre_polynomial_l(x, n, *, out=None):
+    if out is not None:
+        return _C.special_laguerre_polynomial_l(x=x, n=n, out=out)
+    if _capturing():
+        _captured = _capture_call(special_laguerre_polynomial_l, (x, n), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_laguerre_polynomial_l(x=x, n=n)
+
+def special_legendre_polynomial_p(x, n, *, out=None):
+    if out is not None:
+        return _C.special_legendre_polynomial_p(x=x, n=n, out=out)
+    if _capturing():
+        _captured = _capture_call(special_legendre_polynomial_p, (x, n), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_legendre_polynomial_p(x=x, n=n)
+
+def special_modified_bessel_i0(input, *, out=None):
+    if out is not None:
+        return _C.special_modified_bessel_i0(self=input, out=out)
+    if _capturing():
+        _captured = _capture_call(special_modified_bessel_i0, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_modified_bessel_i0(self=input)
+
+def special_modified_bessel_i1(input, *, out=None):
+    if out is not None:
+        return _C.special_modified_bessel_i1(self=input, out=out)
+    if _capturing():
+        _captured = _capture_call(special_modified_bessel_i1, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_modified_bessel_i1(self=input)
+
+def special_modified_bessel_k0(input, *, out=None):
+    if out is not None:
+        return _C.special_modified_bessel_k0(self=input, out=out)
+    if _capturing():
+        _captured = _capture_call(special_modified_bessel_k0, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_modified_bessel_k0(self=input)
+
+def special_modified_bessel_k1(input, *, out=None):
+    if out is not None:
+        return _C.special_modified_bessel_k1(self=input, out=out)
+    if _capturing():
+        _captured = _capture_call(special_modified_bessel_k1, (input,), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_modified_bessel_k1(self=input)
+
+def special_scaled_modified_bessel_k0(x, *, out=None):
+    if out is not None:
+        return _C.special_scaled_modified_bessel_k0(x=x, out=out)
+    if _capturing():
+        _captured = _capture_call(special_scaled_modified_bessel_k0, (x,), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_scaled_modified_bessel_k0(x=x)
+
+def special_scaled_modified_bessel_k1(x, *, out=None):
+    if out is not None:
+        return _C.special_scaled_modified_bessel_k1(x=x, out=out)
+    if _capturing():
+        _captured = _capture_call(special_scaled_modified_bessel_k1, (x,), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_scaled_modified_bessel_k1(x=x)
+
+def special_shifted_chebyshev_polynomial_t(x, n, *, out=None):
+    if out is not None:
+        return _C.special_shifted_chebyshev_polynomial_t(x=x, n=n, out=out)
+    if _capturing():
+        _captured = _capture_call(special_shifted_chebyshev_polynomial_t, (x, n), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_shifted_chebyshev_polynomial_t(x=x, n=n)
+
+def special_shifted_chebyshev_polynomial_u(x, n, *, out=None):
+    if out is not None:
+        return _C.special_shifted_chebyshev_polynomial_u(x=x, n=n, out=out)
+    if _capturing():
+        _captured = _capture_call(special_shifted_chebyshev_polynomial_u, (x, n), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_shifted_chebyshev_polynomial_u(x=x, n=n)
+
+def special_shifted_chebyshev_polynomial_v(x, n, *, out=None):
+    if out is not None:
+        return _C.special_shifted_chebyshev_polynomial_v(x=x, n=n, out=out)
+    if _capturing():
+        _captured = _capture_call(special_shifted_chebyshev_polynomial_v, (x, n), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_shifted_chebyshev_polynomial_v(x=x, n=n)
+
+def special_shifted_chebyshev_polynomial_w(x, n, *, out=None):
+    if out is not None:
+        return _C.special_shifted_chebyshev_polynomial_w(x=x, n=n, out=out)
+    if _capturing():
+        _captured = _capture_call(special_shifted_chebyshev_polynomial_w, (x, n), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_shifted_chebyshev_polynomial_w(x=x, n=n)
+
+def special_spherical_bessel_j0(x, *, out=None):
+    if out is not None:
+        return _C.special_spherical_bessel_j0(x=x, out=out)
+    if _capturing():
+        _captured = _capture_call(special_spherical_bessel_j0, (x,), {})
+        if _captured is not None:
+            return _captured
+    return _C.special_spherical_bessel_j0(x=x)
+
+def _foobar(input, arg1=True, arg2=True, arg3=True):
+    if _capturing():
+        _captured = _capture_call(_foobar, (input, arg1, arg2, arg3), {})
+        if _captured is not None:
+            return _captured
+    return _C._foobar(input, arg1, arg2, arg3=arg3)
+
+def _propagate_xla_data(input, output):
+    if _capturing():
+        _captured = _capture_call(_propagate_xla_data, (input, output), {})
+        if _captured is not None:
+            return _captured
+    return _C._propagate_xla_data(input, output)
 
 try:
     _C.install_factory_fast_paths(_C, {

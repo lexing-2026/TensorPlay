@@ -1,20 +1,15 @@
 // CUPTI kernel-level GPU tracing for the native profiler (USE_CUDA builds;
-// this file is kineto's cupti_activity.cpp: the activity API is driven with
+// the activity API is driven with
 // CONCURRENT_KERNEL + MEMCPY + MEMSET + RUNTIME + EXTERNAL_CORRELATION and
 // buffer-request/completion callbacks, and CUDA dispatch brackets push/pop
 // the op's slot id as an external correlation id so kernel records join
 // back to the op that launched them (op -> runtime API -> kernel).
 //
-// libcupti is dlopen'd (12.x soname candidates first) so the core library
-// never hard-depends on it and sessions on machines without the toolkit
-// degrade gracefully.  Struct definitions come from the toolkit headers the
-// build already ships (CUDAToolkit_INCLUDE_DIRS), so record parsing stays
-// ABI-correct for the CUDA the extension was compiled against.
-//
-// Validation status: written against the CUDA 12.4 headers on the remote
-// sm_89 box (.remote_build.md); field usage follows CUpti_ActivityKernel9 /
-// CUpti_ActivityAPI / CUpti_ActivityMemcpy5 / CUpti_ActivityMemset4 /
-// CUpti_ActivityExternalCorrelation from those headers.
+// libcupti is dlopen'd (major-line soname candidates first) so the core
+// library never hard-depends on it and sessions on machines without the
+// toolkit degrade gracefully.  Struct definitions come from the toolkit
+// headers the build already ships (CUDAToolkit_INCLUDE_DIRS), so record
+// parsing stays ABI-correct for the CUDA the extension was compiled against.
 //
 // Hot path: outside a gpu_trace session the only per-op cost is the
 // g_gpu_trace load in GpuTimerPair::arm (one acquire-load, same class as
@@ -27,6 +22,36 @@
 #ifdef USE_CUDA
 
 #include <cupti.h>
+
+// ---- Activity-record revisions ---------------------------------------------
+// Toolkit headers ship a subset of record revisions: 12.8+ headers replace
+// Memcpy5 with Memcpy6, 12.0+ headers add Kernel9, and older headers lack
+// the newest revisions entirely.  The dlopen'd runtime in turn delivers
+// whichever revision its own toolkit writes.  Across the 11.x/12.x line
+// every revision shares the layout of the prefix fields read below
+// (start/end/correlationId/deviceId/streamId/name/bytes/value/copyKind):
+// revisions only append or replace trailing fields.  So the alias picks the
+// newest revision the build headers know, and parsing stays correct for any
+// runtime of the same major line.
+#if defined(CUPTI_API_VERSION) && CUPTI_API_VERSION >= 21
+using ActivityKernel = CUpti_ActivityKernel9;
+#elif defined(CUPTI_API_VERSION) && CUPTI_API_VERSION >= 18
+using ActivityKernel = CUpti_ActivityKernel8;
+#else
+using ActivityKernel = CUpti_ActivityKernel4;
+#endif
+#if defined(CUPTI_API_VERSION) && CUPTI_API_VERSION >= 26
+using ActivityMemcpy = CUpti_ActivityMemcpy6;
+#elif defined(CUPTI_API_VERSION) && CUPTI_API_VERSION >= 18
+using ActivityMemcpy = CUpti_ActivityMemcpy5;
+#else
+using ActivityMemcpy = CUpti_ActivityMemcpy4;
+#endif
+#if defined(CUPTI_API_VERSION) && CUPTI_API_VERSION >= 18
+using ActivityMemset = CUpti_ActivityMemset4;
+#else
+using ActivityMemset = CUpti_ActivityMemset3;
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -224,10 +249,8 @@ void parse_buffer_locked(uint8_t* buffer, size_t valid_size) {
     while (g_fns->GetNextRecord(buffer, valid_size, &record) == CUPTI_SUCCESS) {
         switch (record->kind) {
             case CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL: {
-                // CUDA 12.4 delivers CUpti_ActivityKernel9 for
-                // CONCURRENT_KERNEL; fields accessed by name.
-                const auto* k = reinterpret_cast<const CUpti_ActivityKernel9*>(
-                    record);
+                // Revision aliased above; only prefix fields are touched.
+                const auto* k = reinterpret_cast<const ActivityKernel*>(record);
                 const size_t len = k->name ? std::strlen(k->name) : 0;
                 g_acts->push_back(base_act(
                     intern_name_locked(k->name, len), 'k',
@@ -239,7 +262,7 @@ void parse_buffer_locked(uint8_t* buffer, size_t valid_size) {
             }
             case CUPTI_ACTIVITY_KIND_MEMCPY: {
                 const auto* m =
-                    reinterpret_cast<const CUpti_ActivityMemcpy5*>(record);
+                    reinterpret_cast<const ActivityMemcpy*>(record);
                 GpuActivity a = base_act(
                     memcpy_name(m->copyKind), 'm',
                     m->start + g_time_offset_ns, m->end + g_time_offset_ns,
@@ -253,7 +276,7 @@ void parse_buffer_locked(uint8_t* buffer, size_t valid_size) {
             }
             case CUPTI_ACTIVITY_KIND_MEMSET: {
                 const auto* s =
-                    reinterpret_cast<const CUpti_ActivityMemset4*>(record);
+                    reinterpret_cast<const ActivityMemset*>(record);
                 GpuActivity a = base_act(
                     "Memset (Device)", 's',
                     s->start + g_time_offset_ns, s->end + g_time_offset_ns,
@@ -340,7 +363,8 @@ TENSORPLAY_API bool cupti_available() {
     if (g_fns != nullptr) return true;
     if (g_last_error.empty()) {
         // Probe the library without enabling anything.
-        const char* candidates[] = {"libcupti.so.12", "libcupti.so.1",
+        const char* candidates[] = {"libcupti.so.13", "libcupti.so.12",
+                                    "libcupti.so.11", "libcupti.so.1",
                                     "libcupti.so"};
         for (const char* soname : candidates) {
             void* lib = dlopen(soname, RTLD_LAZY | RTLD_LOCAL | RTLD_NOLOAD);
@@ -349,7 +373,7 @@ TENSORPLAY_API bool cupti_available() {
                 return true;
             }
         }
-        g_last_error = "libcupti not found (tried libcupti.so.12/.1/.so)";
+        g_last_error = "libcupti not found (tried libcupti.so.13/.12/.11/.1/.so)";
     }
     return false;
 }
@@ -371,7 +395,8 @@ TENSORPLAY_API uint32_t cupti_version() {
     }
     void* lib = g_cupti_lib;
     if (lib == nullptr) {
-        const char* candidates[] = {"libcupti.so.12", "libcupti.so.1",
+        const char* candidates[] = {"libcupti.so.13", "libcupti.so.12",
+                                    "libcupti.so.11", "libcupti.so.1",
                                     "libcupti.so"};
         for (const char* soname : candidates) {
             lib = dlopen(soname, RTLD_LAZY | RTLD_LOCAL);
@@ -397,7 +422,8 @@ TENSORPLAY_API bool cupti_start() {
 
     if (g_fns == nullptr) {
         if (g_cupti_lib == nullptr) {
-            const char* candidates[] = {"libcupti.so.12", "libcupti.so.1",
+            const char* candidates[] = {"libcupti.so.13", "libcupti.so.12",
+                                        "libcupti.so.11", "libcupti.so.1",
                                         "libcupti.so"};
             for (const char* soname : candidates) {
                 g_cupti_lib = dlopen(soname, RTLD_LAZY | RTLD_LOCAL);
@@ -425,7 +451,7 @@ TENSORPLAY_API bool cupti_start() {
         TP_CUPTI_DLSYM(FlushAll, "cuptiActivityFlushAll")
         TP_CUPTI_DLSYM(GetNextRecord, "cuptiActivityGetNextRecord")
         // Optional diagnostics/name helpers: absent from some libcupti
-        // exports (e.g. GetNumLostRecords in 12.4); call sites null-check.
+        // exports; call sites null-check.
         fns->GetNumLostRecords = reinterpret_cast<Fn_GetNumLostRecords>(
             dlsym(g_cupti_lib, "cuptiActivityGetNumLostRecords"));
         fns->GetCallbackName = reinterpret_cast<Fn_GetCallbackName>(

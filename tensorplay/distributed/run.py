@@ -1,212 +1,218 @@
 #
-# Adaptation: tp implements a single-node elastic launcher backed by worker
-# subprocesses and the pure-Python env:// rendezvous (TCPStore hosted by
-# local rank 0). Multi-node rendezvous backends (c10d/etcd agents) are part
+# The agent-based elastic launcher. ``main`` is the console entry point
+# (tensorrun-style); it parses CLI arguments into a
+# ``tensorplay.distributed.launcher.LaunchConfig`` and delegates to the
+# elastic agent, which handles rendezvous, worker monitoring, restarts, and
+# scale-up/scale-down re-rendezvous. Single-node jobs run through the same
+# path as multi-node ones.
+#
 import argparse
 import os
-import socket
-import subprocess
+import runpy
 import sys
 import warnings
-from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Callable
 
+from tensorplay.distributed.launcher import LaunchConfig, elastic_launch
+from tensorplay.distributed.elastic.multiprocessing.redirects import Redirects, Std
 
 __all__ = ["LaunchConfig", "elastic_launch", "run", "main"]
 
 
-def _get_free_port() -> int:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        sock.bind(("", 0))
-        return int(sock.getsockname()[1])
-    finally:
-        sock.close()
-
-
-@dataclass
-class LaunchConfig:
-
-    min_nodes: int = 1
-    max_nodes: int = 1
-    nproc_per_node: int = 1
-    run_id: str = "none"
-    role: str = "default_role"
-    max_restarts: int = 0
-    monitor_interval: float = 0.1
-    start_method: str = "subprocess"
-    redirects: Any = field(default_factory=lambda: {})
-    tee: Any = field(default_factory=lambda: {})
-    log_dir: str | None = None
-    rdzv_backend: str = "static"
-    rdzv_endpoint: str = ""
-    rdzv_configs: dict[str, Any] = field(default_factory=dict)
-    rdzv_timeout: float = 900
-    metrics_cfg: dict[str, Any] = field(default_factory=dict)
-    local_addr: str | None = None
-
-    @staticmethod
-    def from_args(args_dict: dict[str, Any]) -> "LaunchConfig":
-        return LaunchConfig(
-            min_nodes=1,
-            max_nodes=1,
-            nproc_per_node=int(args_dict.get("nproc_per_node", 1)),
-            rdzv_backend=args_dict.get("rdzv_backend", "static"),
-            run_id=args_dict.get("run_id", "none"),
-            role=args_dict.get("role", "default_role"),
-            max_restarts=args_dict.get("max_restarts", 0),
-            monitor_interval=args_dict.get("monitor_interval", 0.1),
-            start_method="subprocess",
-            log_dir=args_dict.get("log_dir"),
-            redirects=args_dict.get("redirects", {}),
-            tee=args_dict.get("tee", {}),
-            metrics_cfg=args_dict.get("metrics_cfg", {}),
-            local_addr=getattr(args_dict, "local_addr", None),
-        )
-
-
-class elastic_launch:
-
-    def __init__(self, config: LaunchConfig, entrypoint: Callable | str | None):
-        self._config = config
-        self._entrypoint = entrypoint
-
-    def __call__(self, *args):
-        return _launch_local(self._config, self._entrypoint, args)
-
-
 def determine_local_world_size(nproc_per_node: str | int) -> int:
+    """Resolve ``auto``/``gpu``/``cpu``/int into the local worker count."""
     if isinstance(nproc_per_node, int):
         return nproc_per_node
-    if isinstance(nproc_per_node, str):
-        if nproc_per_node == "gpu":
-            import tensorplay as tp
+    text = str(nproc_per_node).strip().lower()
+    if text.isdigit():
+        return int(text)
+    if text == "cpu":
+        return os.cpu_count() or 1
+    if text == "gpu" or text == "auto":
+        try:
+            from tensorplay import cuda
 
-            if not tp.cuda.is_available():
-                raise ValueError(
-                    'tp.distributed.run uses nproc_per_node="gpu" but CUDA is '
-                    "not available."
-                )
-            return tp.cuda.device_count()
-        if nproc_per_node == "auto":
-            num_proc = len(os.sched_getaffinity(0))
-            return num_proc
-        return int(nproc_per_node)
-    raise ValueError(f"Unsupported nproc_per_node value: {nproc_per_node}")
+            return cuda.device_count()
+        except Exception:
+            return 1
+    raise ValueError(f"Cannot resolve nproc_per_node value: {nproc_per_node!r}")
+
+
+def _parse_redirects(value: str | None) -> Std | dict[int, Std] | None:
+    if value is None or value == "":
+        return None
+    return Redirects.from_str(value).stdouts
+
+
+def _parse_tee(value: str | None) -> Std | dict[int, Std] | None:
+    if value is None or value == "":
+        return None
+    return Redirects.from_str(value).stderrs
 
 
 def config_from_args(args) -> tuple[LaunchConfig, Callable | str, list[str]]:
-    config = LaunchConfig.from_args(vars(args)) if hasattr(args, "__dict__") \
-        else LaunchConfig(nproc_per_node=determine_local_world_size(args))
-    entrypoint = args.training_script
-    cmd_args = list(args.training_script_args)
+    """Translate parsed CLI arguments into a config plus entrypoint."""
+    if args.nnodes:
+        nnodes = str(args.nnodes)
+        if ":" in nnodes:
+            min_nodes, _, max_nodes = nnodes.partition(":")
+            min_nodes = int(min_nodes)
+            max_nodes = int(max_nodes) if max_nodes else min_nodes
+        else:
+            min_nodes = max_nodes = int(nnodes)
+    else:
+        min_nodes = max_nodes = 1
+    if max_nodes < min_nodes:
+        raise ValueError(f"max_nodes ({max_nodes}) must be >= min_nodes ({min_nodes})")
+
+    nproc = determine_local_world_size(args.nproc_per_node)
+    if nproc > 1 and "OMP_NUM_THREADS" not in os.environ:
+        os.environ["OMP_NUM_THREADS"] = "1"
+        warnings.warn(
+            f"Setting OMP_NUM_THREADS environment variable for each process to be "
+            f"1: setting OMP_NUM_THREADS=1 when using {nproc} processes, "
+            f"otherwise CPU contention may slow the job down.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    rdzv_endpoint = args.rdzv_endpoint
+    if args.rdzv_backend == "static":
+        endpoint = f"{args.master_addr}:{args.master_port}"
+        if rdzv_endpoint:
+            endpoint = rdzv_endpoint
+    else:
+        endpoint = rdzv_endpoint or "localhost:0"
+
+    config = LaunchConfig(
+        min_nodes=min_nodes,
+        max_nodes=max_nodes,
+        nproc_per_node=nproc,
+        run_id=args.rdzv_id,
+        role=args.role,
+        rdzv_endpoint=endpoint,
+        rdzv_backend=args.rdzv_backend,
+        rdzv_configs=_parse_rdzv_conf(args.rdzv_conf),
+        rdzv_timeout=args.rdzv_timeout,
+        max_restarts=args.max_restarts,
+        monitor_interval=args.monitor_interval,
+        start_method=args.start_method,
+        log_dir=args.log_dir,
+        redirects=_parse_redirects(args.redirects),
+        tee=_parse_tee(args.tee),
+        local_addr=args.local_addr,
+        master_addr=args.master_addr if args.master_addr != "127.0.0.1" else None,
+        master_port=args.master_port if args.master_port else None,
+    )
+
+    if args.run_path:
+        entrypoint: Callable | str = _run_script
+        cmd_args = [(args.training_script, *args.training_script_args)] * config.nproc_per_node
+    elif args.module:
+        entrypoint = sys.executable
+        cmd_args = ["-u", "-m", args.training_script, *args.training_script_args]
+    elif args.no_python:
+        entrypoint = args.training_script
+        cmd_args = list(args.training_script_args)
+    else:
+        entrypoint = sys.executable
+        cmd_args = ["-u", args.training_script, *args.training_script_args]
     return config, entrypoint, cmd_args
 
 
-def _launch_local(config: LaunchConfig, entrypoint, script_args):
-    """Spawn ``nproc_per_node`` workers joined by an env:// rendezvous."""
-    import datetime as dt
+def _parse_rdzv_conf(conf: str | None) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for token in filter(None, (conf or "").split(",")):
+        key, sep, value = token.partition("=")
+        if not sep:
+            raise ValueError(f"Malformed rdzv_conf entry '{token}'; expected key=value")
+        out[key.strip()] = value.strip()
+    return out
 
-    from tensorplay.distributed.rendezvous import TCPStore
 
-    nproc = determine_local_world_size(config.nproc_per_node)
-    master_addr = "127.0.0.1"
-    master_port = (
-        int(config.rdzv_configs.get("port", 0)) or _get_free_port()
-    )
-    store = TCPStore(master_addr, master_port, nproc, is_master=True,
-                     timeout=300.0)
-    port = store.port
-
-    procs: list[subprocess.Popen] = []
-    try:
-        for local_rank in range(nproc):
-            env = dict(os.environ)
-            env.update({
-                "RANK": str(local_rank),
-                "LOCAL_RANK": str(local_rank),
-                "WORLD_SIZE": str(nproc),
-                "LOCAL_WORLD_SIZE": str(nproc),
-                "MASTER_ADDR": master_addr,
-                "MASTER_PORT": str(port),
-                "TORCHELASTIC_RUN_ID": config.run_id,
-                # Rank 0 hosts the TCPStore server.
-                "TP_START_DAEMON": "1" if local_rank == 0 else "0",
-            })
-            if entrypoint == sys.executable or (
-                isinstance(entrypoint, str) and entrypoint.endswith(".py")
-            ):
-                cmd = [sys.executable, "-u", entrypoint, *map(str, script_args)]
-            else:
-                cmd = [entrypoint, *map(str, script_args)] if isinstance(
-                    entrypoint, str) else None
-            if cmd is None:
-                # Function entrypoint: execute via tp.multiprocessing-style
-                # pickling in child processes is not supported by the
-                # subprocess launcher; instruct users accordingly.
-                raise ValueError(
-                    "elastic_launch(function) requires a spawn-based agent "
-                    "(pending); use a script path as the entrypoint."
-                )
-            procs.append(subprocess.Popen(cmd, env=env))
-
-        failed = []
-        for local_rank, proc in enumerate(procs):
-            ret = proc.wait()
-            if ret != 0:
-                failed.append((local_rank, ret))
-        if failed:
-            local_rank, ret = failed[0]
-            raise RuntimeError(
-                f"Worker rank {local_rank} exited with error code {ret}."
-            )
-        return [None] * nproc
-    finally:
-        for proc in procs:
-            if proc.poll() is None:
-                proc.kill()
+def _run_script(script: str, *script_args: str) -> int:
+    """Function entrypoint body for ``--run-path``: exec the script in-place."""
+    sys.argv = [script, *script_args]
+    runpy.run_path(script, run_name="__main__")
+    return 0
 
 
 def run(args=None):
-    args = main_args(args)
+    """Parse CLI arguments (when ``args`` is None) and launch the job.
+
+    ``args`` may be a list of CLI strings or a pre-parsed namespace.
+    """
+    if args is None or isinstance(args, (list, tuple)):
+        args = main_args(args)
     with warnings.catch_warnings(record=True) as caught_warnings:
         config, cmd, cmd_args = config_from_args(args)
     for w in caught_warnings:
-        warnings.warn(w.message)
-    if not args.run_path:
-        assert os.path.isfile(cmd), f"{cmd} is not a valid file path"
+        warnings.warn(w.message, w.category, stacklevel=2)
+    if not args.run_path and not args.module:
+        assert os.path.isfile(args.training_script), (
+            f"{args.training_script} is not a valid file path"
+        )
     elastic_launch(config=config, entrypoint=cmd)(*cmd_args)
 
 
 def get_args_parser() -> argparse.ArgumentParser:
+    """Argument parser mirroring the documented launcher CLI."""
     parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument(
+        "--nnodes",
+        action="store",
+        default="1:1",
+        help="Number of nodes, either a plain count (e.g. 2) or a "
+        "min:max range (e.g. 1:4) for elastic jobs.",
+    )
     parser.add_argument(
         "--nproc-per-node",
         "--nproc_per_node",
         action="store",
         default="auto",
-        help="Number of workers per node; support auto/gpu/int.",
+        help="Number of workers per node; support auto/gpu/cpu/int.",
     )
     parser.add_argument(
-        "--master-addr", "--master_addr", action="store", default="127.0.0.1"
+        "--rdzv-backend", "--rdzv_backend", action="store", default="core",
+        help="Rendezvous backend: core (elastic) or static (fixed world size).",
     )
-    parser.add_argument("--master-port", "--master_port", action="store", default="0")
-    parser.add_argument("--run-path", "--run_path", action="store_true")
-    parser.add_argument("--rdzv-backend", "--rdzv_backend", action="store",
-                        default="static")
-    parser.add_argument("--rdzv-endpoint", "--rdzv_endpoint", action="store",
-                        default="")
+    parser.add_argument(
+        "--rdzv-endpoint", "--rdzv_endpoint", action="store", default="",
+        help="Rendezvous endpoint host:port; defaults to localhost with an "
+        "ephemeral port for single-node runs.",
+    )
     parser.add_argument("--rdzv-id", "--rdzv_id", action="store", default="none")
-    parser.add_argument("--max-restarts", "--max_restarts", action="store",
-                        default=0)
+    parser.add_argument(
+        "--rdzv-conf", "--rdzv_conf", action="store", default="",
+        help="Comma-separated backend options: key=value,key2=value2.",
+    )
+    parser.add_argument(
+        "--rdzv-timeout", "--rdzv_timeout", action="store", default=900, type=int,
+        help="Rendezvous join timeout in seconds.",
+    )
+    parser.add_argument("--max-restarts", "--max_restarts", action="store", default=0, type=int)
     parser.add_argument("--monitor-interval", "--monitor_interval",
-                        action="store", default=0.1)
+                        action="store", default=0.1, type=float)
     parser.add_argument("--role", action="store", default="default_role")
+    parser.add_argument("--log-dir", "--log_dir", action="store", default=None)
+    parser.add_argument("--redirects", action="store", default=None,
+                        help="Std redirection spec: 0/1/2/3 or per-rank map.")
+    parser.add_argument("--tee", action="store", default=None,
+                        help="Tee spec like redirects; duplicates worker output to the console.")
+    parser.add_argument("--local-addr", "--local_addr", action="store", default=None,
+                        help="Address of the local node advertised to peers.")
+    parser.add_argument("--start-method", "--start_method", action="store", default="spawn",
+                        help="Multiprocessing start method for function entrypoints.")
+    parser.add_argument("--run-path", "--run_path", action="store_true",
+                        help="Run the training script with runpy in workers.")
+    parser.add_argument("--master-addr", "--master_addr", action="store", default="127.0.0.1")
+    parser.add_argument("--master-port", "--master_port", action="store", default="0", type=int)
     parser.add_argument("-m", "--module", action="store_true",
-                        help="Change each process to interpret the launch "
-                        "script as a python module.")
+                        help="Interpret the launch script as a python module.")
     parser.add_argument("--no-python", "--no_python", action="store_true",
-                        help="Skip prepending the training script with python.")
+                        help="Skip prepending the interpreter to the script command.")
+    parser.add_argument("--node-rank", "--node_rank", action="store", default=0, type=int,
+                        help="Rank of this node among static nodes.")
     parser.add_argument("training_script", type=str)
     parser.add_argument("training_script_args", nargs="*")
     return parser
@@ -217,5 +223,10 @@ def main_args(args=None):
 
 
 def main(args=None):
+    """Console entry point."""
     args = main_args(args)
     run(args)
+
+
+if __name__ == "__main__":
+    main()

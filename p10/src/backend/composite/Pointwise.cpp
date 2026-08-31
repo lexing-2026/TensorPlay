@@ -1,8 +1,10 @@
-// Composite kernels: numerically-special elementwise ops -- xlogy, ldexp,
-// fmax/fmin, float_power, mvlgamma, conj_physical and the negative_ alias.
+// Composite kernels: numerically-special elementwise ops -- xlogy, xlog1py,
+// ldexp, fmax/fmin, float_power, mvlgamma, conj_physical and the negative_
+// alias.
 //
-//   xlogy:      x * log(y), with the x == 0 branch collapsing every y
-//               (including 0 / inf / nan) to 0.
+//   xlogy:      x * log(y), with the x == 0 branch collapsing every finite or
+//               infinite y to 0; a NaN y still yields NaN.
+//   xlog1py:    the same rule for x * log1p(y), singular at y == -1.
 //   ldexp:      x * 2^y; the exponent is evaluated in the input dtype so the
 //               power of two is exact.
 //   fmax/fmin:  maximum/minimum with NaN treated as missing -- whenever one
@@ -20,6 +22,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <tuple>
 #include <vector>
 
 namespace tensorplay {
@@ -29,9 +32,18 @@ namespace ops = tensorplay::tpx::ops;
 
 namespace {
 
+// The self == 0 shortcut collapses every y, but a NaN y still has to survive:
+// the product carries it, so only the non-NaN positions take the zero.
 Tensor xlogy_impl(const Tensor& self, const Tensor& other) {
-    return ops::where(ops::eq(self, Scalar(0)), Scalar(0),
-                      ops::mul(self, ops::log(other)));
+    const Tensor product = ops::mul(self, ops::log(other));
+    return ops::where(ops::isnan(other), product,
+                      ops::where(ops::eq(self, Scalar(0)), Scalar(0), product));
+}
+
+Tensor xlog1py_impl(const Tensor& self, const Tensor& other) {
+    const Tensor product = ops::mul(self, ops::log1p(other));
+    return ops::where(ops::isnan(other), product,
+                      ops::where(ops::eq(self, Scalar(0)), Scalar(0), product));
 }
 
 Tensor fmaxmin_impl(const Tensor& self, const Tensor& other, bool max) {
@@ -51,6 +63,15 @@ Tensor xlogy_native(const Tensor& self, const Tensor& other) {
 
 Tensor& xlogy__native(Tensor& self, const Tensor& other) {
     ops::copy_(self, xlogy_impl(self, other));
+    return self;
+}
+
+Tensor xlog1py_native(const Tensor& self, const Tensor& other) {
+    return xlog1py_impl(self, other);
+}
+
+Tensor& xlog1py__native(Tensor& self, const Tensor& other) {
+    ops::copy_(self, ops::xlog1py(self, other));
     return self;
 }
 
@@ -107,9 +128,47 @@ Tensor& negative__native(Tensor& self) {
     return ops::neg_(self);
 }
 
+// ---------------------------------------------------------------------------
+// Special functions: the CPU kernels hold the exact implementations; other
+// devices use the backend-independent fallback until device kernels land.
+// ---------------------------------------------------------------------------
+} // namespace composite
+
+namespace cpu {
+std::tuple<Tensor, Tensor> frexp_cpu(const Tensor& self);
+Tensor igamma_cpu(const Tensor& a, const Tensor& x);
+Tensor igammac_cpu(const Tensor& a, const Tensor& x);
+} // namespace cpu
+
+namespace composite {
+
+std::tuple<Tensor, Tensor> frexp_native(const Tensor& self) {
+    const Tensor s = self.device().is_cpu() ? self : self.to(Device(DeviceType::CPU));
+    auto r = cpu::frexp_cpu(s);
+    return {std::get<0>(r).to(self.device()), std::get<1>(r).to(self.device())};
+}
+
+Tensor igamma_native(const Tensor& a, const Tensor& x) {
+    if (a.device().is_cpu() && x.device().is_cpu()) {
+        return cpu::igamma_cpu(a, x);
+    }
+    return cpu::igamma_cpu(a.to(Device(DeviceType::CPU)),
+                           x.to(Device(DeviceType::CPU))).to(a.device());
+}
+
+Tensor igammac_native(const Tensor& a, const Tensor& x) {
+    if (a.device().is_cpu() && x.device().is_cpu()) {
+        return cpu::igammac_cpu(a, x);
+    }
+    return cpu::igammac_cpu(a.to(Device(DeviceType::CPU)),
+                            x.to(Device(DeviceType::CPU))).to(a.device());
+}
+
 TENSORPLAY_LIBRARY_IMPL(Composite, PointwiseComposite) {
     m.impl("xlogy", xlogy_native);
     m.impl("xlogy_", xlogy__native);
+    m.impl("xlog1py", xlog1py_native);
+    m.impl("xlog1py_", xlog1py__native);
     m.impl("ldexp", ldexp_native);
     m.impl("ldexp_", ldexp__native);
     m.impl("fmax", fmax_native);
@@ -119,6 +178,9 @@ TENSORPLAY_LIBRARY_IMPL(Composite, PointwiseComposite) {
     m.impl("conj_physical", conj_physical_native);
     m.impl("conj_physical_", conj_physical__native);
     m.impl("negative_", negative__native);
+    m.impl("frexp", frexp_native);
+    m.impl("igamma", igamma_native);
+    m.impl("igammac", igammac_native);
 }
 
 } // namespace composite

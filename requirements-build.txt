@@ -1,14 +1,8 @@
-# Build system requirements
-# Kept in sync with [build-system].requires and [dependency-groups] dev in
-# --no-build-isolation builds; isolated PEP 517 builds fetch these
-# automatically.
 scikit-build-core>=1.0
 cmake<4.0
 ninja
 pybind11
 PyYAML
-packaging>=24.2  # used by tools/generate_tensorplay_version.py
-# For building sdists and wheels
+packaging>=24.2
 build
-# For running the test suite
 pytest

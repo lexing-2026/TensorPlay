@@ -223,14 +223,14 @@ def inverse_spectrogram(
 
 def _get_spec_norms(normalized: Union[str, bool]):
     frame_length_norm, window_norm = False, False
-    if tensorplay.jit.isinstance(normalized, str):
+    if isinstance(normalized, str):
         if normalized not in ["frame_length", "window"]:
             raise ValueError("Invalid normalized parameter: {}".format(normalized))
         if normalized == "frame_length":
             frame_length_norm = True
         elif normalized == "window":
             window_norm = True
-    elif tensorplay.jit.isinstance(normalized, bool):
+    elif isinstance(normalized, bool):
         if normalized:
             window_norm = True
     else:
@@ -1466,7 +1466,6 @@ def resample(
     return resampled
 
 
-@tensorplay.jit.unused
 def edit_distance(seq1: Sequence, seq2: Sequence) -> int:
     """
     Calculate the word level edit (Levenshtein) distance between two sequences.
@@ -1707,17 +1706,6 @@ class RnntLoss(tensorplay.autograd.Function):
         result = grad * grad_out
         return (result, None, None, None, None, None, None, None)
 
-    @staticmethod
-    def ts_apply(logits, targets, logit_lengths, target_lengths, blank: int, clamp: float, fused_log_softmax: bool):
-        if tensorplay.jit.is_scripting():
-            output, saved = tensorplay.ops.tensorplay.audio.rnnt_loss_forward(
-                logits, targets, logit_lengths, target_lengths, blank, clamp, fused_log_softmax
-            )
-            return output
-        else:
-            return RnntLoss.apply(logits, targets, logit_lengths, target_lengths, blank, clamp, fused_log_softmax)
-
-
 def rnnt_loss(
     logits: Tensor,
     targets: Tensor,
@@ -1759,7 +1747,7 @@ def rnnt_loss(
     if blank < 0:  # reinterpret blank index if blank < 0.
         blank = logits.shape[-1] + blank
 
-    costs = RnntLoss.ts_apply(logits, targets, logit_lengths, target_lengths, blank, clamp, fused_log_softmax)
+    costs = RnntLoss.apply(logits, targets, logit_lengths, target_lengths, blank, clamp, fused_log_softmax)
 
     if reduction == "mean":
         return costs.mean()
@@ -1932,9 +1920,9 @@ def mvdr_weights_souden(
     numerator = tensorplay.linalg.solve(psd_n, psd_s)  # psd_n.inv() @ psd_s
     # ws: (..., C, C) / (...,) -> (..., C, C)
     ws = numerator / (_compute_mat_trace(numerator)[..., None, None] + eps)
-    if tensorplay.jit.isinstance(reference_channel, int):
+    if isinstance(reference_channel, int):
         beamform_weights = ws[..., :, reference_channel]
-    elif tensorplay.jit.isinstance(reference_channel, Tensor):
+    elif isinstance(reference_channel, Tensor):
         reference_channel = reference_channel.to(psd_n.dtype)
         # h: (..., F, C_1, C_2) x (..., C_2) -> (..., F, C_1)
         beamform_weights = tensorplay.einsum("...c,...c->...", [ws, reference_channel[..., None, None, :]])
@@ -2015,9 +2003,9 @@ def mvdr_weights_rtf(
     beamform_weights = numerator / (denominator.real.unsqueeze(-1) + eps)
     # normalize the numerator
     if reference_channel is not None:
-        if tensorplay.jit.isinstance(reference_channel, int):
+        if isinstance(reference_channel, int):
             scale = rtf[..., reference_channel].conj()
-        elif tensorplay.jit.isinstance(reference_channel, Tensor):
+        elif isinstance(reference_channel, Tensor):
             reference_channel = reference_channel.to(psd_n.dtype)
             scale = tensorplay.einsum("...c,...c->...", [rtf.conj(), reference_channel[..., None, :]])
         else:
@@ -2091,9 +2079,9 @@ def rtf_power(
         psd_n = _tik_reg(psd_n, reg=diag_eps)
     # phi is regarded as the first iteration
     phi = tensorplay.linalg.solve(psd_n, psd_s)  # psd_n.inv() @ psd_s
-    if tensorplay.jit.isinstance(reference_channel, int):
+    if isinstance(reference_channel, int):
         rtf = phi[..., reference_channel]
-    elif tensorplay.jit.isinstance(reference_channel, Tensor):
+    elif isinstance(reference_channel, Tensor):
         reference_channel = reference_channel.to(psd_n.dtype)
         rtf = tensorplay.einsum("...c,...c->...", [phi, reference_channel[..., None, None, :]])
     else:

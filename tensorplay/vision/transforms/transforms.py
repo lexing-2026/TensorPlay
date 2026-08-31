@@ -78,7 +78,7 @@ class Compose:
         >>>     transforms.CenterCrop(10),
         >>>     transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
         >>> )
-        >>> scripted_transforms = tensorplay.jit.script(transforms)
+        >>> compiled_transforms = tensorplay.compile(transforms)
 
         Make sure to use only scriptable transformations, i.e. that work with ``tensorplay.Tensor``, does not require
         `lambda` functions or ``PIL.Image``.
@@ -86,7 +86,7 @@ class Compose:
     """
 
     def __init__(self, transforms):
-        if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
+        if not tensorplay.compiler.is_compiling():
             _log_api_usage_once(self)
         self.transforms = transforms
 
@@ -519,7 +519,7 @@ class RandomApply(tensorplay.nn.Module):
         >>> transforms = transforms.RandomApply(tensorplay.nn.ModuleList([
         >>>     transforms.ColorJitter(),
         >>> ]), p=0.3)
-        >>> scripted_transforms = tensorplay.jit.script(transforms)
+        >>> compiled_transforms = tensorplay.compile(transforms)
 
         Make sure to use only scriptable transformations, i.e. that work with ``tensorplay.Tensor``, does not require
         `lambda` functions or ``PIL.Image``.
@@ -1200,7 +1200,7 @@ class ColorJitter(tensorplay.nn.Module):
         self.saturation = self._check_input(saturation, "saturation")
         self.hue = self._check_input(hue, "hue", center=0, bound=(-0.5, 0.5), clip_first_on_zero=False)
 
-    @tensorplay.jit.unused
+@tensorplay.compiler.unused
     def _check_input(self, value, name, center=1, bound=(0, float("inf")), clip_first_on_zero=True):
         if isinstance(value, numbers.Number):
             if value < 0:

@@ -18,6 +18,8 @@ set(P10_SOURCES
     src/SizesAndStrides.cpp
     src/Stacktrace.cpp
     src/TensorImpl.cpp
+    src/TransformDispatch.cpp
+    src/BatchingKernels.cpp
     src/OneDNNContext.cpp
     src/StaxPointwise.cpp
     src/autocast_mode.cpp
@@ -30,9 +32,12 @@ set(P10_SOURCES
     src/backend/cpu/ArithmeticKernels.cpp
     src/backend/cpu/ComparisonKernels.cpp
     src/backend/cpu/ConvKernels.cpp
+    src/backend/cpu/Convolution.cpp
     src/backend/cpu/CopyKernels.cpp
+    src/backend/cpu/EmbeddingBagKernels.cpp
     src/backend/cpu/Cross.cpp
     src/backend/cpu/SparseKernels.cpp
+    src/backend/cpu/SemiStructuredKernels.cpp
     src/backend/cpu/QuantKernels.cpp
     src/backend/cpu/ForwardKernels.cpp
     src/backend/cpu/FactoryKernels.cpp
@@ -72,6 +77,10 @@ set(P10_SOURCES
     src/backend/cpu/TierOpsKernels.cpp
     src/backend/cpu/Tier5OpsKernels.cpp
     src/backend/cpu/SpecialKernels.cpp
+    src/backend/cpu/SpecialAliasKernels.cpp
+    src/backend/cpu/MetaViewKernels.cpp
+    src/backend/cpu/FactoryToolsKernels.cpp
+    src/backend/cpu/ActivationMoreKernels.cpp
     src/backend/cpu/SpectralKernels.cpp
     src/backend/cpu/Spectral2DKernels.cpp
     src/backend/cpu/InplaceCompletionKernels.cpp
@@ -80,17 +89,22 @@ set(P10_SOURCES
     # (CompositeCommon.h holds the shared helpers).
     # Registered under the Composite dispatch key; see the files themselves.
     src/backend/composite/Activation.cpp
+    src/backend/composite/ActivationMore.cpp
+    src/backend/composite/DunderBinaryComposite.cpp
+    src/backend/composite/FactoryToolsComposite.cpp
     src/backend/composite/ChanelShuffle.cpp
     src/backend/composite/CompositeViewCopyKernels.cpp
     src/backend/composite/ConvolutionTBC.cpp
     src/backend/composite/Distance.cpp
     src/backend/composite/Dropout.cpp
+    src/backend/composite/FactoryToolsComposite.cpp
     src/backend/composite/Histogram.cpp
     src/backend/composite/Integration.cpp
     src/backend/composite/Itertools.cpp
     src/backend/composite/Linear.cpp
     src/backend/composite/LinearAlgebra.cpp
     src/backend/composite/Pointwise.cpp
+    src/backend/composite/Reduction.cpp
     src/backend/composite/RNN.cpp
     src/backend/composite/TensorAdvancedIndexing.cpp
     src/backend/composite/TensorCompare.cpp
@@ -128,10 +142,12 @@ if(USE_CUDA)
         src/backend/cuda/CopyKernels.cu
         src/backend/cuda/Cross.cu
         src/backend/cuda/SparseKernels.cu
+        src/backend/cuda/SemiStructuredKernels.cu
         src/backend/cuda/QuantKernels.cu
         src/backend/cuda/ForwardKernels.cu
         src/backend/cuda/FactoryKernels.cu
         src/backend/cuda/EmbeddingKernels.cu
+        src/backend/cuda/EmbeddingBagKernels.cu
         src/backend/cuda/PointwiseKernels.cu
         src/backend/cuda/UnaryOps.cu
         src/backend/cuda/Pooling.cu
@@ -154,6 +170,7 @@ if(USE_CUDA)
         src/backend/cuda/LossKernels.cu
         src/backend/cuda/LossCTC.cu
         src/backend/cuda/ConvKernels.cu
+        src/backend/cuda/Convolution.cu
         src/backend/cuda/PadKernels.cu
         src/backend/cuda/PoolingKernels.cu
         src/backend/cuda/GridSamplerKernels.cu
@@ -171,7 +188,8 @@ if(USE_CUDA)
         src/backend/cuda/OptimizerKernels.cu
         src/backend/cuda/AmpKernels.cu
         src/backend/cuda/SamplingKernels.cu
-        src/backend/cuda/TopKKernels.cu
+        src/backend/cuda/TensorTopK.cu
+        src/backend/cuda/SpecialAliasKernels.cu
         src/backend/cuda/AttentionKernels.cu
         src/backend/cuda/IndexingKernels.cu
         src/backend/cuda/TierOpsKernels.cu
@@ -204,6 +222,7 @@ set_source_files_properties(${GEN_CPP} PROPERTIES GENERATED TRUE)
 # HAVE_AVX2_CPU_DEFINITION is defined).
 set(TP_CPU_KERNEL_SRCS
     src/backend/cpu/ReductionKernelsImpl.cpp
+    src/backend/cpu/EmbeddingBagKernelsImpl.cpp
     src/backend/cpu/ActivationUnaryKernels.cpp
     src/backend/cpu/StaxPointwiseKernels.cpp
     src/backend/cpu/ComplexKernels.cpp
@@ -290,6 +309,29 @@ if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
     if(TP_CXX_AVX512_FOUND)
         list(APPEND P10_SOURCES ${TP_CPU_KERNEL_AVX512_OBJS})
     endif()
+else()
+    # Targets without the x86 ISA tiers still need one copy of each kernel, or
+    # the DispatchStub DEFAULT slots stay empty and the ops report a missing
+    # kernel at runtime.  Same defines as the DEFAULT tier above, minus the
+    # AVX capability flags.
+    foreach(KERNEL_SRC ${TP_CPU_KERNEL_SRCS})
+        get_filename_component(KERNEL_NAME ${KERNEL_SRC} NAME_WE)
+        add_library(p10_kernel_default_${KERNEL_NAME} OBJECT ${KERNEL_SRC})
+        set_target_properties(p10_kernel_default_${KERNEL_NAME} PROPERTIES
+            POSITION_INDEPENDENT_CODE ON)
+        target_compile_definitions(p10_kernel_default_${KERNEL_NAME} PRIVATE
+            CPU_CAPABILITY_DEFAULT CPU_CAPABILITY=DEFAULT)
+        if(KERNEL_NAME STREQUAL "ComplexKernels")
+            target_compile_definitions(p10_kernel_default_${KERNEL_NAME} PRIVATE
+                TP_COMPLEX_KERNELS_DEFINE_DISPATCH)
+        endif()
+        target_include_directories(p10_kernel_default_${KERNEL_NAME} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include ${GEN_BASE_DIR})
+        target_compile_definitions(p10_kernel_default_${KERNEL_NAME} PRIVATE
+            ${BLAS_COMPILE_DEFS})
+        add_dependencies(p10_kernel_default_${KERNEL_NAME} generate_code)
+        list(APPEND P10_SOURCES $<TARGET_OBJECTS:p10_kernel_default_${KERNEL_NAME}>)
+    endforeach()
 endif()
 
 add_library(p10 ${P10_SOURCES})
@@ -308,11 +350,19 @@ endif()
 if(USE_CUDA)
     # The native aligned flash path consumes only the standalone CUTE/CUTLASS
     # headers and flash kernels.  It intentionally does not include or link
-    # kernels remain buildable.
-    set(TP_NATIVE_FLASH_SRC
-        "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/pytorch/third_party/flash-attention/csrc/flash_attn/src")
-    set(TP_NATIVE_CUTLASS_INCLUDE
-        "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/pytorch/third_party/cutlass/include")
+    # them into the library; ordinary kernels remain buildable.
+    file(GLOB TP_VENDOR_ROOTS LIST_DIRECTORIES true
+        "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/*")
+    foreach(TP_VENDOR_ROOT ${TP_VENDOR_ROOTS})
+        if(EXISTS "${TP_VENDOR_ROOT}/third_party/flash-attention/csrc/flash_attn/src/flash.h" AND
+           EXISTS "${TP_VENDOR_ROOT}/third_party/cutlass/include/cute/tensor.hpp")
+            set(TP_NATIVE_FLASH_SRC
+                "${TP_VENDOR_ROOT}/third_party/flash-attention/csrc/flash_attn/src")
+            set(TP_NATIVE_CUTLASS_INCLUDE
+                "${TP_VENDOR_ROOT}/third_party/cutlass/include")
+            break()
+        endif()
+    endforeach()
     if(EXISTS "${TP_NATIVE_FLASH_SRC}/flash.h" AND
        EXISTS "${TP_NATIVE_CUTLASS_INCLUDE}/cute/tensor.hpp")
         target_include_directories(p10 PRIVATE
@@ -369,16 +419,17 @@ if(USE_CUDA)
     # positive USE_NCCL define, graceful downgrade when absent.
     option(USE_NCCL "Use NCCL for tensorplay.distributed" ON)
     if(USE_NCCL)
-        find_package(NCCL 2.4.8 QUIET)
-        if(NCCL_FOUND)
-            target_link_libraries(p10 PRIVATE ${NCCL_LIBRARIES})
-            target_include_directories(p10 SYSTEM PRIVATE ${NCCL_INCLUDE_DIRS})
+        option(USE_SYSTEM_NCCL "Use a system-wide NCCL" OFF)
+        include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/External/nccl.cmake)
+        if(TARGET tp::nccl)
+            target_link_libraries(p10 PRIVATE tp::nccl)
             target_compile_definitions(p10 PRIVATE USE_NCCL)
-            message(STATUS "Found NCCL: ${NCCL_LIBRARIES} (version ${NCCL_VERSION})")
+            message(STATUS "Found NCCL: ${NCCL_LIBRARIES}")
         else()
             message(WARNING
                 "Not using NCCL (tensorplay.distributed will be unavailable). "
-                "Set NCCL_ROOT to an NCCL install prefix to enable it.")
+                "Set NCCL_ROOT to an NCCL install prefix or check out "
+                "third_party/nccl to enable it.")
         endif()
     endif()
 
@@ -394,6 +445,11 @@ endif()
 
 if(COMPUTE_LIBS)
     target_link_libraries(p10 PUBLIC ${COMPUTE_LIBS})
+endif()
+
+# Vector math (runtime-dispatched entry points; see cpu/vec/SleefShims.h).
+if(TARGET sleef)
+    target_link_libraries(p10 PRIVATE sleef)
 endif()
 
 find_package(Threads REQUIRED)

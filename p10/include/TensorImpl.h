@@ -71,6 +71,13 @@ private:
     };
     std::shared_ptr<SparseState> sparse_state_;
 
+    // A transform wrapper keeps the physical value separate from its public
+    // logical metadata. The wrapper is immutable with respect to storage;
+    // batching rules create a new wrapper for each result.
+    std::shared_ptr<TensorImpl> transform_value_;
+    int64_t transform_batch_dim_ = -1;
+    int64_t transform_level_ = -1;
+
 public:
     static constexpr int kSparseCOOLayout = 0;
     static constexpr int kSparseCSRLayout = 1;
@@ -83,6 +90,9 @@ public:
     TensorImpl(const std::vector<int64_t>& sizes, const std::vector<int64_t>& strides, DType dtype, const Device& device = Device());
     TensorImpl(Storage storage, const std::vector<int64_t>& sizes, DType dtype, size_t storage_offset = 0);
     TensorImpl(Storage storage, const std::vector<int64_t>& sizes, const std::vector<int64_t>& strides, DType dtype, size_t storage_offset = 0);
+    TensorImpl(std::shared_ptr<TensorImpl> transform_value,
+               const std::vector<int64_t>& sizes,
+               const std::vector<int64_t>& strides);
     
     // Copy/Move
     TensorImpl(const TensorImpl& other);
@@ -117,9 +127,33 @@ public:
     DispatchKeySet key_set() const {
         DispatchKey backend = computeDispatchKey(device_);
         DispatchKeySet ks;
+        if (is_batched()) {
+            ks.add(toVmapKey(backend));
+            return ks;
+        }
         ks.add(backend);
         ks.add(toAutogradKey(backend));
         return ks;
+    }
+
+    bool is_batched() const { return transform_value_ != nullptr; }
+    int64_t batch_dim() const { return transform_batch_dim_; }
+    int64_t batch_level() const { return transform_level_; }
+    int64_t batch_size() const {
+        return is_batched() ? transform_value_->size(static_cast<size_t>(transform_batch_dim_)) : 0;
+    }
+    std::shared_ptr<TensorImpl> transform_value_impl() const { return transform_value_; }
+    void set_transform_value(std::shared_ptr<TensorImpl> value,
+                             int64_t batch_dim,
+                             int64_t level) {
+        transform_value_ = std::move(value);
+        transform_batch_dim_ = batch_dim;
+        transform_level_ = level;
+    }
+    void clear_transform_value() {
+        transform_value_.reset();
+        transform_batch_dim_ = -1;
+        transform_level_ = -1;
     }
     
     size_t itemsize() const { return elementSize(dtype_); }

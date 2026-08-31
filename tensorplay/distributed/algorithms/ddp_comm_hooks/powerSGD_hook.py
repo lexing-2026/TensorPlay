@@ -9,7 +9,7 @@ import tensorplay as tp
 from tensorplay.linalg import qr as _qr, vector_norm as _vector_norm
 
 import tensorplay.distributed as dist
-from tensorplay.distributed import distributed_c10d
+from tensorplay.distributed import distributed_core
 
 from . import default_hooks as default
 
@@ -248,7 +248,7 @@ class PowerSGDState:
 
     def __setstate__(self, state):
         r"""Restore state; process group is set to default."""
-        self.process_group = distributed_c10d._get_default_group()
+        self.process_group = distributed_core._get_default_group()
         logger.warning(
             "NOTE: Process group will be set to a default group (i.e. the world size).\
                 If a different group is desired, please set `self.process_group` after PowerSGD state is loaded."

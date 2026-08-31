@@ -346,7 +346,7 @@ Tensor bernoulli_mask(const Tensor& input, const std::vector<int64_t>& shape,
                       double keep_prob) {
     Tensor noise = Tensor::full(shape, keep_prob, DType::Float32,
                                 input.device());
-    noise.bernoulli_();
+    noise.bernoulli_(keep_prob, std::nullopt);
     return noise;
 }
 
@@ -913,7 +913,7 @@ Tensor quantile_compute(const Tensor& self, const Tensor& q,
         // first, then fill the whole row with NaN so a gather at any rank --
         // including the pinned last index below -- yields NaN under either
         // sort placement.  Rows without NaN are untouched (bit-exact path).
-        Tensor has_nan = reduced.isnan().any({-1}, true);
+        Tensor has_nan = reduced.isnan().any(int64_t(-1), true);
         if (has_nan.any().item<bool>()) {
             std::vector<int64_t> in_shape =
                 static_cast<std::vector<int64_t>>(reduced.shape());

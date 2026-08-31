@@ -446,7 +446,7 @@ Tensor bernoulli_mask_cuda(const Tensor& input,
                            double keep_prob) {
     Tensor noise = Tensor::full(shape, keep_prob, DType::Float32,
                                 input.device());
-    noise.bernoulli_();
+    noise.bernoulli_(keep_prob, std::nullopt);
     return noise;
 }
 

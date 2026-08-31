@@ -227,13 +227,10 @@ static void dlpack_managed_deleter(void* ctx) {
 }
 
 static Tensor from_dlpack(py::object o) {
-    PyObject* cap_ptr;
-    bool is_capsule = PyCapsule_CheckExact(o.ptr());
-    py::capsule cap_holder; // Holds reference if we created a new capsule
-    
-    if (is_capsule) {
-        cap_ptr = o.ptr();
-    } else {
+    PyObject* cap_ptr = o.ptr();
+    py::object cap_holder; // Holds a reference to a capsule we produced
+
+    if (!PyCapsule_CheckExact(cap_ptr)) {
         // Optimization: Use C-API to call __dlpack__ directly.
         // faster than py::hasattr + o.attr()()
         static PyObject* dlpack_str = PyUnicode_InternFromString("__dlpack__");
@@ -242,16 +239,27 @@ static Tensor from_dlpack(py::object o) {
              PyErr_Clear(); // Clear AttributeError
              TP_THROW(TypeError, "Object is not a DLPack capsule and does not have __dlpack__ method");
         }
-        cap_holder = py::reinterpret_steal<py::capsule>(res);
+        // The reference is taken before validating: a permissive __getattr__
+        // makes any object look like it implements the protocol, so whatever
+        // came back must be owned (and released) even when it is not a capsule.
+        cap_holder = py::reinterpret_steal<py::object>(res);
         cap_ptr = res;
     }
-    
-    // Check name
-    const char* name = PyCapsule_GetName(cap_ptr);
-    if (strcmp(name, "dltensor") != 0) {
-        TP_THROW(ValueError, "DLPack capsule is invalid or already consumed");
+
+    // Validate before dereferencing: PyCapsule_GetName on a non-capsule
+    // returns NULL with an exception set, and reading through that pointer
+    // is a hard crash rather than a Python-level error.
+    if (!PyCapsule_IsValid(cap_ptr, "dltensor")) {
+        if (PyCapsule_IsValid(cap_ptr, "used_dltensor")) {
+            TP_THROW(ValueError,
+                     "DLPack capsule has already been consumed; a DLTensor can "
+                     "only be turned into a tensor once");
+        }
+        TP_THROW(TypeError,
+                 "expected a DLPack capsule named \"dltensor\", got ",
+                 Py_TYPE(cap_ptr)->tp_name);
     }
-    
+
     DLManagedTensor* managed = (DLManagedTensor*)PyCapsule_GetPointer(cap_ptr, "dltensor");
     if (!managed) TP_THROW(ValueError, "Invalid DLPack capsule pointer");
     
@@ -1707,12 +1715,37 @@ void init_tensor(py::module_& m) {
         .def_property_readonly("_impl_id", [](const Tensor& self) {
              return (uintptr_t)self.unsafeGetTensorImpl().get();
         })
-        .def_property_readonly("shape", &Tensor::shape)
+        .def_property_readonly(
+            "shape",
+            [](const Tensor& self) {
+                return py::reinterpret_steal<py::object>(Size_New(self.shape()));
+            })
         .def_property_readonly("dtype", &Tensor::dtype)
         .def_property_readonly("device", &Tensor::device)
-        .def_property_readonly("ndim", &Tensor::dim)
-        .def("dim", &Tensor::dim)
-        .def("numel", &Tensor::numel)
+        .def_property_readonly(
+            "ndim", static_cast<int64_t (Tensor::*)() const>(&Tensor::dim))
+        // Transposed view; identity on 0-d inputs (matching the reference
+        // semantics of a trailing-dimension swap).
+        .def_property_readonly("T", [](const Tensor& self) {
+            if (self.dim() == 0) {
+                return self;
+            }
+            return tensorplay::tpx::ops::transpose(self, -2, -1);
+        })
+        // Conjugated transposed view; equals .T for non-complex dtypes.
+        .def_property_readonly("H", [](const Tensor& self) {
+            if (self.dim() == 0) {
+                return self;
+            }
+            Tensor base = isComplexType(self.dtype()) ? tensorplay::tpx::ops::conj(self) : self;
+            return tensorplay::tpx::ops::transpose(base, -2, -1);
+        })
+        .def("dim", static_cast<int64_t (Tensor::*)() const>(&Tensor::dim))
+        // Ops that return an optional gradient slot (convolution_backward and
+        // friends) hand back an undefined tensor for the slots the caller did
+        // not ask for; this is how Python tells that apart from an empty one.
+        .def("defined", &Tensor::defined)
+        .def("numel", static_cast<int64_t (Tensor::*)() const>(&Tensor::numel))
         .def("itemsize", &Tensor::itemsize)
         .def("is_contiguous", [](const Tensor& t) { return t.is_contiguous(); })
         .def("is_contiguous", [](const Tensor& t, int64_t format) {
@@ -1922,7 +1955,7 @@ void init_tensor(py::module_& m) {
                 self.unsafeGetTensorImpl()->copy_metadata_from(*other.unsafeGetTensorImpl());
             }
         )
-        .def("detach", &Tensor::detach)
+        .def("detach", static_cast<Tensor (Tensor::*)() const>(&Tensor::detach))
         .def("_is_view", [](const Tensor& self) {
             return self.defined() && self.unsafeGetTensorImpl()->is_view();
         })
@@ -1952,7 +1985,7 @@ void init_tensor(py::module_& m) {
         
         // Methods
         .def("size", [](const Tensor& self) {
-            return self.shape();
+            return py::reinterpret_steal<py::object>(Size_New(self.shape()));
         })
         .def("size", [](const Tensor& self, int64_t dim) {
             return self.size(dim);
@@ -2790,7 +2823,13 @@ void init_tensor(py::module_& m) {
         // Scalar/float conversion: Tensor::item() has the C++ side; without
         // this, float(t) on the raw extension type raises TypeError.
         .def("__float__", [](const Tensor& self) { return self.item().to<double>(); })
-        .def("__int__", [](const Tensor& self) { return static_cast<int64_t>(self.item().to<double>()); });
+        .def("__int__", [](const Tensor& self) { return static_cast<int64_t>(self.item().to<double>()); })
+        // len(t) == t.size(0); a 0-d tensor has no length.
+        .def("__len__", [](const Tensor& self) -> int64_t {
+            if (self.dim() == 0)
+                TP_THROW(TypeError, "len() of a 0-d tensor");
+            return self.size(0);
+        });
 
     // FASTCALL method layer goes in LAST: it fills names nothing above
     // bound, and must never shadow a hand-written pybind overload (e.g.

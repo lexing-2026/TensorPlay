@@ -4,6 +4,7 @@
 #include "TensorImpl.h"
 #include "Storage.h"
 #include "SparseKernels.h"
+#include "BatchingKernels.h"
 #include "Utils.h"
 #include "ErrorReporting.h"
 #include <iostream>
@@ -201,6 +202,11 @@ Device Tensor::device() const { return impl_ ? impl_->device() : Device(DeviceTy
 size_t Tensor::itemsize() const { return impl_ ? impl_->itemsize() : 0; }
 bool Tensor::is_contiguous() const { return impl_ ? impl_->is_contiguous() : false; }
 
+Tensor Tensor::transform_value() const {
+    if (!impl_ || !impl_->is_batched()) return *this;
+    return Tensor(impl_->transform_value_impl());
+}
+
 bool Tensor::requires_grad() const {
     return impl_ && impl_->autograd_meta() && impl_->autograd_meta()->requires_grad();
 }
@@ -271,7 +277,7 @@ Tensor Tensor::pin_memory() const {
 bool Tensor::is_sparse() const { return impl_ && impl_->is_sparse(); }
 
 bool Tensor::is_coalesced() const {
-    if (!is_sparse()) {
+    if (!is_sparse() || is_sparse_csr()) {
         TP_THROW(RuntimeError,
                  "is_coalesced expected sparse coordinate tensor layout");
     }
@@ -289,12 +295,18 @@ int64_t Tensor::dense_dim() const {
 }
 
 Tensor Tensor::_indices() const {
-    if (!is_sparse()) TP_THROW(RuntimeError, "_indices() is only defined for sparse COO tensors");
+    if (!is_sparse() || is_sparse_csr()) {
+        TP_THROW(RuntimeError,
+                 "_indices() is only defined for sparse COO tensors");
+    }
     return Tensor(impl_->sparse_indices_impl());
 }
 
 Tensor Tensor::_values() const {
-    if (!is_sparse()) TP_THROW(RuntimeError, "_values() is only defined for sparse COO tensors");
+    if (!is_sparse()) {
+        TP_THROW(RuntimeError,
+                 "_values() is only defined for sparse tensors");
+    }
     return Tensor(impl_->sparse_values_impl());
 }
 
@@ -317,7 +329,10 @@ Tensor Tensor::_col_indices() const {
 }
 
 Tensor Tensor::coalesce() const {
-    if (!is_sparse()) TP_THROW(RuntimeError, "coalesce() is only defined for sparse COO tensors");
+    if (!is_sparse() || is_sparse_csr()) {
+        TP_THROW(RuntimeError,
+                 "coalesce() is only defined for sparse COO tensors");
+    }
     if (is_coalesced()) return *this;
     if (device().is_cpu()) return cpu::coalesce_sparse_cpu(*this);
 #ifdef USE_CUDA
@@ -327,19 +342,26 @@ Tensor Tensor::coalesce() const {
 }
 
 Tensor Tensor::sparse_mask(const Tensor& mask) const {
-    if (is_sparse()) TP_THROW(RuntimeError, "sparse_mask(): self must be dense");
-    if (!mask.is_sparse()) TP_THROW(RuntimeError, "sparse_mask(): mask must be sparse COO");
+    if (is_sparse()) {
+        TP_THROW(RuntimeError, "sparse_mask(): self must be dense");
+    }
+    if (!mask.is_sparse() || mask.is_sparse_csr()) {
+        TP_THROW(RuntimeError, "sparse_mask(): mask must be sparse COO");
+    }
     if (shape() != mask.shape()) {
-        TP_THROW(RuntimeError, "sparse_mask(): operands have incompatible sizes");
+        TP_THROW(RuntimeError,
+                 "sparse_mask(): operands have incompatible sizes");
     }
     if (device() != mask.device()) {
-        TP_THROW(DeviceMismatchError, "sparse_mask(): operands must be on the same device");
+        TP_THROW(DeviceMismatchError,
+                 "sparse_mask(): operands must be on the same device");
     }
     if (device().is_cpu()) return cpu::sparse_mask_cpu(*this, mask);
 #ifdef USE_CUDA
     if (device().is_cuda()) return cuda::sparse_mask_cuda(*this, mask);
 #endif
-    TP_THROW(NotImplementedError, "sparse_mask() is not implemented for this device");
+    TP_THROW(NotImplementedError,
+             "sparse_mask() is not implemented for this device");
 }
 
 void* Tensor::data_ptr() const {
@@ -351,7 +373,7 @@ void* Tensor::data_ptr() const {
 
 Scalar Tensor::item() const {
     if (is_sparse()) {
-        TP_THROW(RuntimeError, "item() is not supported for sparse COO tensors");
+        TP_THROW(RuntimeError, "item() is not supported for sparse tensors");
     }
     if (numel() != 1) {
         TP_THROW(ValueError, "item() only supported for 1-element tensors");
@@ -360,7 +382,7 @@ Scalar Tensor::item() const {
     if (device().type() != DeviceType::CPU) {
         return to(Device(DeviceType::CPU)).item();
     }
-    
+
     switch (dtype()) {
         case DType::Float32: return Scalar(static_cast<double>(*data_ptr<float>()));
         case DType::Float64: return Scalar(*data_ptr<double>());
@@ -389,7 +411,8 @@ Scalar Tensor::item() const {
             return Scalar(std::complex<float>(static_cast<float>(value.real()),
                                               static_cast<float>(value.imag())));
         }
-        default: TP_THROW(NotImplementedError, "item() not implemented for this dtype");
+        default:
+            TP_THROW(NotImplementedError, "item() not implemented for this dtype");
     }
 }
 
@@ -595,14 +618,26 @@ Tensor operator-(const Tensor& t) {
     return t * Scalar(-1);
 }
 
-// View methods implementation
-
-Tensor Tensor::as_strided(const std::vector<int64_t>& size, const std::vector<int64_t>& stride, std::optional<int64_t> storage_offset) const {
+Tensor Tensor::as_strided(const std::vector<int64_t>& size,
+                          const std::vector<int64_t>& stride,
+                          std::optional<int64_t> storage_offset) const {
     if (!impl_) TP_THROW(RuntimeError, "Tensor not defined");
-    size_t offset = storage_offset.value_or(impl_->storage_offset());
-    Tensor out = Tensor(impl_->storage(), size, stride, impl_->dtype(), offset);
-    // A view aliases the base memory: share the version counter so that
-    // in-place writes through either alias are visible to mutation tracking
+    if (size.size() != stride.size()) {
+        TP_THROW(ValueError,
+                 "as_strided(): sizes and strides must have the same length");
+    }
+    for (int64_t value : size) {
+        if (value < 0) {
+            TP_THROW(ValueError, "as_strided(): sizes must be non-negative");
+        }
+    }
+    const int64_t offset = storage_offset.value_or(
+        static_cast<int64_t>(impl_->storage_offset()));
+    if (offset < 0) {
+        TP_THROW(ValueError, "as_strided(): storage_offset must be non-negative");
+    }
+    Tensor out = Tensor(impl_->storage(), size, stride, impl_->dtype(),
+                        static_cast<size_t>(offset));
     out.unsafeGetTensorImpl()->share_version_counter(*impl_);
     return out;
 }
@@ -611,20 +646,16 @@ Tensor Tensor::view(const std::vector<int64_t>& shape) const {
     if (!impl_) TP_THROW(RuntimeError, "Tensor not defined");
 
     std::vector<int64_t> inferred = SizesAndStrides::infer_size(shape, numel());
-
-    // view is valid whenever the layout admits it -- not only for contiguous
-    // tensors -- and the resulting strides follow the input's layout.
     auto stride = SizesAndStrides::compute_view_strides(
         static_cast<std::vector<int64_t>>(this->shape()), strides(), inferred);
     if (!stride.has_value()) {
-        TP_THROW(RuntimeError, "view size is "
-                 "not compatible with input tensor's size and stride (at least one dimension"
-                 " spans across two contiguous subspaces). Use .reshape(...) instead.");
+        TP_THROW(RuntimeError,
+                 "view size is not compatible with input tensor's size and stride");
     }
     return as_strided(inferred, *stride);
 }
 
-// element stream as `dtype` while aliasing the same storage.  Same-size
+// Reinterprets the element stream as `dtype` while aliasing the same storage.  Same-size
 // dtypes keep shape/strides; otherwise only the last dimension may change
 Tensor Tensor::view_dtype(DType dtype) const {
     if (!impl_) TP_THROW(RuntimeError, "Tensor not defined");
@@ -696,38 +727,38 @@ Tensor Tensor::view_dtype(DType dtype) const {
 
 Tensor Tensor::select(int64_t dim, int64_t index) const {
     if (!impl_) TP_THROW(RuntimeError, "Tensor not defined");
-    // TensorShape.cpp select_symint: 0-dim rejection, maybe_wrap_dim, then an
-    // index range check phrased against the original (unwrapped) index.
     const int64_t ndim = this->dim();
     if (ndim == 0) {
-        TP_THROW(IndexError, "select() cannot be applied to a 0-dim tensor.");
+        TP_THROW(IndexError, "select() cannot be applied to a 0-dim tensor");
     }
-    const int64_t orig_dim = dim;
+    const int64_t original_dim = dim;
     if (dim < 0) dim += ndim;
-    if (dim < 0 || dim >= ndim) TP_THROW(IndexError, format_dim_range(ndim, orig_dim));
+    if (dim < 0 || dim >= ndim) {
+        TP_THROW(IndexError, format_dim_range(ndim, original_dim));
+    }
 
     const int64_t size_dim = size(dim);
     if (size_dim <= -1 - index || size_dim <= index) {
-        TP_THROW(IndexError, "select(): index ", index,
-                 " out of range for tensor of size ",
-                 format_sizes(static_cast<std::vector<int64_t>>(shape())),
-                 " at dimension ", dim);
+        TP_THROW(IndexError, "select(): index out of range");
     }
     if (index < 0) index += size_dim;
 
     std::vector<int64_t> new_sizes = static_cast<std::vector<int64_t>>(shape());
     std::vector<int64_t> new_strides = strides();
-
-    size_t new_offset = impl_->storage_offset() + index * new_strides[dim];
-
+    const size_t new_offset = impl_->storage_offset() +
+        static_cast<size_t>(index * new_strides[static_cast<size_t>(dim)]);
     new_sizes.erase(new_sizes.begin() + dim);
     new_strides.erase(new_strides.begin() + dim);
-
-    return as_strided(new_sizes, new_strides, new_offset);
+    return as_strided(new_sizes, new_strides, static_cast<int64_t>(new_offset));
 }
 
 Tensor Tensor::slice(int64_t dim, int64_t start, int64_t end, int64_t step) const {
     if (!impl_) TP_THROW(RuntimeError, "Tensor not defined");
+    if (is_batched()) {
+        return transform::batch::slice(
+            *this, dim, std::optional<int64_t>(start),
+            std::optional<int64_t>(end), step);
+    }
     int64_t ndim = this->dim();
     if (dim < 0) dim += ndim;
     if (dim < 0 || dim >= ndim) TP_THROW(IndexError, format_dim_range(ndim, dim));

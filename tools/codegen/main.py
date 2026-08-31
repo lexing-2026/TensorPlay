@@ -38,7 +38,29 @@ class CodegenContext:
     autograd_ops: dict[str, str]  # dispatcher op name -> backward node
     out_dir: str
     pkg_out: str | None = None
+    backend_indices: dict = field(default_factory=dict)
+    reference_functions: tuple = ()
     written: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def grouped_native_functions(self):
+        """Return schema groups with the parser's native invariants."""
+        grouped = getattr(self.funcs, "grouped_native_functions", None)
+        return tuple(grouped()) if grouped is not None else ()
+
+    @property
+    def grouped_view_functions(self):
+        """Return alias groups with the parser's view invariants."""
+        grouped = getattr(self.funcs, "grouped_view_functions", None)
+        return tuple(grouped()) if grouped is not None else ()
+
+    def backend_index(self, dispatch_key):
+        """Return the backend index for a dispatch key or ``None``."""
+        key_name = getattr(dispatch_key, "name", dispatch_key)
+        for key, index in self.backend_indices.items():
+            if getattr(key, "name", str(key)) == key_name:
+                return index
+        return None
 
     def write(self, filename: str, content: str) -> None:
         path = os.path.join(self.out_dir, filename)
@@ -82,7 +104,9 @@ def _gen_redispatch(ctx: CodegenContext) -> None:
 def _gen_autograd_nodes(ctx: CodegenContext) -> None:
     from .gen_autograd import generate_autograd_nodes
     ctx.write("AutogradNodesGenerated.h",
-              generate_autograd_nodes(ctx.derivatives))
+              generate_autograd_nodes(
+                  ctx.derivatives,
+                  native_op_names={f.cpp_name for f in ctx.funcs}))
 
 
 @register_generator("TPXOps")
@@ -146,11 +170,18 @@ def _gen_pyi(ctx: CodegenContext) -> None:
     if ctx.pyi_template and getattr(ctx, "pyi_out", None):
         script_dir = os.path.dirname(os.path.abspath(__file__))
         dtype_header = os.path.join(script_dir, "../../p10/include/DType.h")
-        path = ctx.pyi_out
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as fh:
-            fh.write(generate_pyi(ctx.funcs, ctx.pyi_template, dtype_header))
-        print(f'Generated "{path}"')
+        dtype_binding = os.path.join(script_dir,
+                                     "../../src/bindings/python/DType.cpp")
+        out_dir = ctx.pyi_out
+        os.makedirs(out_dir, exist_ok=True)
+        outputs = generate_pyi(ctx.funcs, ctx.pyi_template, dtype_header,
+                               dtype_binding)
+        for name, content in outputs.items():
+            path = os.path.join(out_dir, name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as fh:
+                fh.write(content)
+            print(f'Generated "{path}"')
 
 
 DEFAULT_TARGETS = ["TensorMethods", "Redispatch", "AutogradNodes", "TPXOps",
@@ -172,8 +203,10 @@ def main(argv=None) -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--yaml", required=True)
     parser.add_argument("--out_dir", required=True)
-    parser.add_argument("--pyi_template")
-    parser.add_argument("--pyi_out")
+    parser.add_argument("--pyi_template",
+                        help="directory containing the .pyi.in templates")
+    parser.add_argument("--pyi_out",
+                        help="package directory receiving the .pyi outputs")
     parser.add_argument("--derivatives")
     parser.add_argument("--pkg_out")
     parser.add_argument("--targets", default=",".join(DEFAULT_TARGETS),
@@ -195,6 +228,8 @@ def main(argv=None) -> None:
     ctx = CodegenContext(
         funcs=funcs,
         native_by_opname=native_by_opname,
+        backend_indices=getattr(funcs, "backend_indices", {}),
+        reference_functions=getattr(funcs, "reference_functions", ()),
         derivatives=derivatives,
         autocast_ops=autocast_registered_ops(),
         autograd_ops=autograd_ops,

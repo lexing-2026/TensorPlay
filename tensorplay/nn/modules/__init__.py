@@ -173,7 +173,7 @@ from .transformer import (
     TransformerEncoder,
     TransformerEncoderLayer,
 )
-from .upsampling import Upsample, UpsamplingBilinear2d, UpsamplingNearest2d
+from .upsampling import Upsample
 
 
 __all__ = [
@@ -331,8 +331,6 @@ __all__ = [
     "Unflatten",
     "Unfold",
     "Upsample",
-    "UpsamplingBilinear2d",
-    "UpsamplingNearest2d",
     "ZeroPad1d",
     "ZeroPad2d",
     "ZeroPad3d",

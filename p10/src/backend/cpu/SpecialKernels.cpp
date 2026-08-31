@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <tuple>
 #include <vector>
 
 namespace tensorplay {
@@ -26,7 +27,13 @@ using tensorplay::special_math::bessel_j0_forward;
 using tensorplay::special_math::bessel_j1_forward;
 using tensorplay::special_math::bessel_y0_forward;
 using tensorplay::special_math::bessel_y1_forward;
+using tensorplay::special_math::calc_entr;
+using tensorplay::special_math::calc_erfcx;
 using tensorplay::special_math::calc_i0e;
+using tensorplay::special_math::calc_log_ndtr;
+using tensorplay::special_math::calc_ndtr;
+using tensorplay::special_math::calc_ndtri;
+using tensorplay::special_math::calc_xlog1py;
 using tensorplay::special_math::calc_i1e;
 using tensorplay::special_math::calc_igamma;
 using tensorplay::special_math::calc_igammac;
@@ -39,6 +46,7 @@ using tensorplay::special_math::hermite_polynomial_h_forward;
 using tensorplay::special_math::hermite_polynomial_he_forward;
 using tensorplay::special_math::laguerre_polynomial_l_forward;
 using tensorplay::special_math::legendre_polynomial_p_forward;
+using tensorplay::special_math::modified_bessel_i0_forward;
 using tensorplay::special_math::modified_bessel_i1_forward;
 using tensorplay::special_math::modified_bessel_k0_forward;
 using tensorplay::special_math::modified_bessel_k1_forward;
@@ -83,11 +91,14 @@ Tensor binary_float_kernel(const Tensor& a_in, const Tensor& b_in, F f, const ch
         static_cast<std::vector<int64_t>>(b_in.shape()));
     DType dt = promoteTypes(a_in.dtype(), b_in.dtype());
     if (!isFloatingType(dt)) dt = DType::Float32;
-    Tensor ac = a_in.to(dt).expand(out_shape).contiguous();
-    Tensor bc = b_in.to(dt).expand(out_shape).contiguous();
-    Tensor out = Tensor::empty(out_shape, dt, a_in.device());
+    // Reduced-width inputs are evaluated in Float32 and narrowed once at the
+    // end; the loops below only ever address float or double buffers.
+    DType compute_dt = (dt == DType::Float64) ? DType::Float64 : DType::Float32;
+    Tensor ac = a_in.to(compute_dt).expand(out_shape).contiguous();
+    Tensor bc = b_in.to(compute_dt).expand(out_shape).contiguous();
+    Tensor out = Tensor::empty(out_shape, compute_dt, a_in.device());
     int64_t n = out.numel();
-    if (dt == DType::Float64) {
+    if (compute_dt == DType::Float64) {
         const double* ap = ac.data_ptr<double>();
         const double* bp = bc.data_ptr<double>();
         double* dp = out.data_ptr<double>();
@@ -102,7 +113,7 @@ Tensor binary_float_kernel(const Tensor& a_in, const Tensor& b_in, F f, const ch
             for (int64_t i = begin; i < end; ++i) dp[i] = static_cast<float>(f(ap[i], bp[i]));
         });
     }
-    return out;
+    return (dt == compute_dt) ? out : out.to(dt);
 }
 
 // ---------------------------------------------------------------------------
@@ -128,6 +139,11 @@ Tensor spherical_bessel_j0_cpu(const Tensor& self) {
     return float_math_kernel(self,
                              [](double x) { return spherical_bessel_j0_forward(x); },
                              "spherical_bessel_j0");
+}
+Tensor modified_bessel_i0_cpu(const Tensor& self) {
+    return float_math_kernel(self,
+                             [](double x) { return modified_bessel_i0_forward(x); },
+                             "modified_bessel_i0");
 }
 Tensor modified_bessel_i1_cpu(const Tensor& self) {
     return float_math_kernel(self,
@@ -162,6 +178,31 @@ Tensor i1_cpu(const Tensor& self) {
 }
 Tensor i1e_cpu(const Tensor& self) {
     return float_math_kernel(self, [](double x) { return calc_i1e(x); }, "i1e");
+}
+
+// ---------------------------------------------------------------------------
+// Error-function tail and normal-distribution family
+// ---------------------------------------------------------------------------
+
+Tensor erfcx_cpu(const Tensor& self) {
+    return float_math_kernel(self, [](double x) { return calc_erfcx(x); }, "erfcx");
+}
+Tensor ndtr_cpu(const Tensor& self) {
+    return float_math_kernel(self, [](double x) { return calc_ndtr(x); }, "ndtr");
+}
+Tensor ndtri_cpu(const Tensor& self) {
+    return float_math_kernel(self, [](double x) { return calc_ndtri(x); }, "ndtri");
+}
+Tensor log_ndtr_cpu(const Tensor& self) {
+    return float_math_kernel(self, [](double x) { return calc_log_ndtr(x); }, "log_ndtr");
+}
+Tensor entr_cpu(const Tensor& self) {
+    return float_math_kernel(self, [](double x) { return calc_entr(x); }, "entr");
+}
+Tensor xlog1py_cpu(const Tensor& a, const Tensor& b) {
+    return binary_float_kernel(a, b,
+                               [](double x, double y) { return calc_xlog1py(x, y); },
+                               "xlog1py");
 }
 
 // ---------------------------------------------------------------------------
@@ -255,6 +296,71 @@ Tensor polygamma_cpu(int64_t n, const Tensor& x) {
 
 }  // namespace
 
+// External linkage: the backend-neutral composite layer uses
+// non-CPU inputs through these kernels (Pointwise.cpp declarations).
+namespace cpu {
+
+// Public names of the regularized incomplete gamma pair; the same
+// calc_igamma / calc_igammac implementations as gammainc / gammaincc.
+Tensor igamma_cpu(const Tensor& a, const Tensor& x) {
+    return binary_float_kernel(a, x, [](double p, double v) {
+        return calc_igamma(p, v);
+    }, "igamma");
+}
+Tensor igammac_cpu(const Tensor& a, const Tensor& x) {
+    return binary_float_kernel(a, x, [](double p, double v) {
+        return calc_igammac(p, v);
+    }, "igammac");
+}
+
+// mantissa in [0.5, 1) (or exactly 0), exponent as int32; computed via
+// std::frexp in Float64 -- the decomposition of a Float32/16 input is exact
+// on the double path and casts back losslessly.
+std::tuple<Tensor, Tensor> frexp_cpu(const Tensor& self) {
+    if (!isFloatingType(self.dtype())) {
+        TP_THROW(RuntimeError, "frexp(): only supports floating-point dtypes");
+    }
+    const std::vector<int64_t> shape(self.shape());
+    Tensor mantissa = Tensor::empty(shape, self.dtype(), self.device());
+    Tensor exponent = Tensor::empty(shape, DType::Int32, self.device());
+    const int64_t n = self.numel();
+    if (n == 0) return {mantissa, exponent};
+    Tensor s32 = (self.dtype() == DType::Float64 || self.dtype() == DType::Float32)
+        ? self.contiguous() : self.to(DType::Float32).contiguous();
+    Tensor mant32 = (self.dtype() == DType::Float32)
+        ? mantissa : Tensor::empty(shape, DType::Float32, self.device());
+
+    if (self.dtype() == DType::Float64) {
+        const double* sp = s32.data_ptr<double>();
+        double* mp = mantissa.data_ptr<double>();
+        int32_t* ep = exponent.data_ptr<int32_t>();
+        parallel_for(0, n, GRAIN_SIZE, [&](int64_t b, int64_t e) {
+            for (int64_t i = b; i < e; ++i) {
+                int ex = 0;
+                mp[i] = std::frexp(sp[i], &ex);
+                ep[i] = ex;
+            }
+        });
+    } else {
+        const float* sp = s32.data_ptr<float>();
+        float* mp = mant32.data_ptr<float>();
+        int32_t* ep = exponent.data_ptr<int32_t>();
+        parallel_for(0, n, GRAIN_SIZE, [&](int64_t b, int64_t e) {
+            for (int64_t i = b; i < e; ++i) {
+                int ex = 0;
+                mp[i] = std::frexp(static_cast<double>(sp[i]), &ex);
+                ep[i] = ex;
+            }
+        });
+        if (self.dtype() != DType::Float32) {
+            mantissa = mant32.to(self.dtype());
+        }
+    }
+    return {mantissa, exponent};
+}
+
+}  // namespace cpu
+
 TENSORPLAY_LIBRARY_IMPL(CPU, SpecialKernels) {
     // Unary specials
     m.impl("bessel_j0", bessel_j0_cpu);
@@ -263,6 +369,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, SpecialKernels) {
     m.impl("bessel_y1", bessel_y1_cpu);
     m.impl("airy_ai", airy_ai_cpu);
     m.impl("spherical_bessel_j0", spherical_bessel_j0_cpu);
+    m.impl("modified_bessel_i0", modified_bessel_i0_cpu);
     m.impl("modified_bessel_i1", modified_bessel_i1_cpu);
     m.impl("modified_bessel_k0", modified_bessel_k0_cpu);
     m.impl("modified_bessel_k1", modified_bessel_k1_cpu);
@@ -271,6 +378,13 @@ TENSORPLAY_LIBRARY_IMPL(CPU, SpecialKernels) {
     m.impl("i0e", i0e_cpu);
     m.impl("i1", i1_cpu);
     m.impl("i1e", i1e_cpu);
+    // Error-function tail / normal distribution
+    m.impl("erfcx", erfcx_cpu);
+    m.impl("ndtr", ndtr_cpu);
+    m.impl("ndtri", ndtri_cpu);
+    m.impl("log_ndtr", log_ndtr_cpu);
+    m.impl("entr", entr_cpu);
+    m.impl("xlog1py", xlog1py_cpu);
     // Polynomial family
     m.impl("chebyshev_polynomial_t", chebyshev_polynomial_t_cpu);
     m.impl("chebyshev_polynomial_u", chebyshev_polynomial_u_cpu);
@@ -289,6 +403,11 @@ TENSORPLAY_LIBRARY_IMPL(CPU, SpecialKernels) {
     m.impl("gammainc", gammainc_cpu);
     m.impl("gammaincc", gammaincc_cpu);
     m.impl("polygamma", polygamma_cpu);
+    // Public names of the regularized incomplete gamma pair; the
+    // kernels are the same calc_igamma / calc_igammac implementations.
+    m.impl("igamma", cpu::igamma_cpu);
+    m.impl("igammac", cpu::igammac_cpu);
+    m.impl("frexp", cpu::frexp_cpu);
 }
 
 }  // namespace tensorplay

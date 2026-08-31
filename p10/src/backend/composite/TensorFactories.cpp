@@ -187,6 +187,17 @@ Tensor range_native(Scalar start, Scalar end, Scalar step,
                        dtype.value_or(DType::Undefined), device);
 }
 
+// Uninitialized allocation with explicit strides: the base dense buffer is
+// handed the requested layout via as_strided, matching the factory contract
+// (values undefined until written).
+Tensor empty_strided_native(const std::vector<int64_t>& size,
+                            const std::vector<int64_t>& stride,
+                            std::optional<DType> dtype,
+                            std::optional<Device> device, bool pin_memory) {
+    Tensor base = ops::empty(size, dtype, device, pin_memory);
+    return base.as_strided(size, stride, 0);
+}
+
 TENSORPLAY_LIBRARY_IMPL(Composite, TensorFactoriesComposite) {
     m.impl("tril_indices", tril_indices_native);
     m.impl("triu_indices", triu_indices_native);
@@ -195,6 +206,7 @@ TENSORPLAY_LIBRARY_IMPL(Composite, TensorFactoriesComposite) {
     m.impl("kaiser_window.periodic", kaiser_window_periodic_native);
     m.impl("kaiser_window.beta", kaiser_window_beta_native);
     m.impl("range", range_native);
+    m.impl("empty_strided", empty_strided_native);
 }
 
 } // namespace composite

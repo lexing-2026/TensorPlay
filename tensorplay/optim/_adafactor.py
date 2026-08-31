@@ -366,9 +366,9 @@ def _single_tensor_adafactor(
         raise AssertionError("Grad scaling should occur outside of optimizer.step()")
 
     if False:
-        # this assert is due to JIT being dumb and not realizing that the ops below
+        # this assert keeps the compiler from treating the ops below
         # have overloads to handle both float and Tensor lrs, so we just assert it's
-        # a float since most people using JIT are using floats
+        # a float because the compiled path receives floating-point inputs
         if not isinstance(lr, float):
             raise AssertionError(f"Expected lr to be a float, but got {type(lr)}")
 

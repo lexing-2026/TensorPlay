@@ -40,7 +40,10 @@ Tensor conv_tbc_native(const Tensor& self, const Tensor& weight,
     const Tensor weight_oct = ops::permute(weight, {2, 1, 0});
     const Tensor out = ops::conv1d(input_nct, weight_oct,
                                    std::optional<Tensor>(bias),
-                                   {1}, {pad}, {1}, 1);
+                                   std::vector<int64_t>{1},
+                                   std::vector<int64_t>{pad},
+                                   std::vector<int64_t>{1},
+                                   1);
     return ops::permute(out, {2, 0, 1});
 }
 

@@ -7,6 +7,7 @@
 #include <optional>
 #include <iostream>
 #include <variant>
+#include <cstddef>
 #include "Tensor.h"
 #include "Macros.h"
 
@@ -15,6 +16,22 @@ namespace stax {
 
 struct OpNode;
 struct Graph;
+
+struct STAX_API CaptureState {
+    size_t compile_depth = 0;
+    size_t disabled_depth = 0;
+    size_t exporting_depth = 0;
+};
+
+STAX_API void enterCaptureState(
+    bool compiling,
+    bool exporting,
+    bool disabled);
+STAX_API void exitCaptureState(
+    bool compiling,
+    bool exporting,
+    bool disabled);
+STAX_API CaptureState currentCaptureState();
 
 // a "custom_op" node carries its qualified "ns::op" name as a string
 // attribute and hands its tensor inputs to the installed executor — the

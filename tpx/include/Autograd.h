@@ -1,6 +1,8 @@
 #pragma once
 #include <memory>
 #include <cstdint>
+#include <functional>
+#include <utility>
 #include <vector>
 #include "Macros.h"
 #include "Tensor.h"
@@ -41,10 +43,7 @@ inline void retain_grad(const Tensor& t) {
     if (auto* meta = get_or_create_autograd_meta(t)) meta->set_retains_grad(true);
 }
 
-inline std::shared_ptr<Node> grad_fn(const Tensor& t) {
-    if (auto* meta = get_autograd_meta(t)) return meta->grad_fn();
-    return nullptr;
-}
+TENSORPLAY_API std::shared_ptr<Node> grad_fn(const Tensor& t);
 
 inline void set_grad_fn(const Tensor& t, std::shared_ptr<Node> grad_fn, uint32_t output_nr = 0) {
     if (auto* meta = get_or_create_autograd_meta(t)) {
@@ -52,6 +51,16 @@ inline void set_grad_fn(const Tensor& t, std::shared_ptr<Node> grad_fn, uint32_t
         meta->set_output_nr(output_nr);
     }
 }
+
+TENSORPLAY_API void set_view_metadata(
+    const Tensor& view,
+    const Tensor& base,
+    CreationMeta creation_meta = CreationMeta::DEFAULT,
+    std::function<Tensor(const Tensor&)> view_fn = {},
+    bool force_view_fn = false);
+
+TENSORPLAY_API bool has_view_metadata(const Tensor& t);
+TENSORPLAY_API void rebase_history(const Tensor& self, std::shared_ptr<Node> grad_fn);
 
 inline uint32_t output_nr(const Tensor& t) {
     if (auto* meta = get_autograd_meta(t)) return meta->output_nr();

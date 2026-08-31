@@ -1,6 +1,7 @@
 """Shared private helpers for ``tensorplay.vision``.
 
-Ported from tensorplay.vision/_utils.py (StrEnumMeta, StrEnum, sequence_to_str).
+The string-enum helpers accept symbolic member names and produce stable
+human-readable sequences for validation messages and representation code.
 """
 
 import enum

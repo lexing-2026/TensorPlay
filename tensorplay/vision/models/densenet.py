@@ -55,18 +55,18 @@ class _DenseLayer(nn.Module):
                 return True
         return False
 
-    @tensorplay.jit.unused  # noqa: T484
+    @tensorplay.compiler.unused  # noqa: T484
     def call_checkpoint_bottleneck(self, input: list[Tensor]) -> Tensor:
         def closure(*inputs):
             return self.bn_function(inputs)
 
         return cp.checkpoint(closure, *input, use_reentrant=False)
 
-    @tensorplay.jit._overload_method  # noqa: F811
+    @tensorplay.compiler.overload_method  # noqa: F811
     def forward(self, input: list[Tensor]) -> Tensor:  # noqa: F811
         pass
 
-    @tensorplay.jit._overload_method  # noqa: F811
+    @tensorplay.compiler.overload_method  # noqa: F811
     def forward(self, input: Tensor) -> Tensor:  # noqa: F811
         pass
 
@@ -78,8 +78,8 @@ class _DenseLayer(nn.Module):
             prev_features = input
 
         if self.memory_efficient and self.any_requires_grad(prev_features):
-            if tensorplay.jit.is_scripting():
-                raise Exception("Memory Efficient not supported in JIT")
+            if tensorplay.compiler.is_compiling():
+                raise Exception("Memory Efficient not supported during compilation")
 
             bottleneck_output = self.call_checkpoint_bottleneck(prev_features)
         else:

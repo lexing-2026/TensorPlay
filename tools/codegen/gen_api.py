@@ -20,7 +20,31 @@ from .api_types import (
     stub_arg_type,
     stub_arg_type_for,
 )
-from .model import Argument, NativeFunction
+from .model import (
+    Argument,
+    NativeFunction,
+    redispatch_key as _redispatch_key,
+    redispatch_name as _redispatch_name,
+)
+
+
+_RANDOM_TRANSFORM_OPS = frozenset({
+    "rand",
+    "randn",
+    "randint",
+    "randperm",
+    "rand_like",
+    "randint_like",
+    "randn_like",
+    "bernoulli",
+    "normal",
+    "exponential_",
+    "normal_",
+    "random_",
+    "uniform_",
+    "bernoulli_",
+    "multinomial",
+})
 
 
 def _variant_instances(f: NativeFunction):
@@ -28,9 +52,106 @@ def _variant_instances(f: NativeFunction):
         yield v
 
 
+# Method variants declared by hand in p10/include/Tensor.h.  Ownership of
+# these members stays with the handwritten class body: generation keeps the
+# dispatcher-level redispatch helpers and the free registration surface, but
+# must not redeclare the members (a duplicate declaration inside the same
+# class is a hard C++ error, and two implementations of one method would
+# break the single-ownership rule).  Members listed here also cover the
+# defaulted-parameter case: a handwritten no-argument member plus a generated
+# one-argument member with a default value makes zero-argument call sites
+# ambiguous, so the generated form cannot coexist either.
+_HANDWRITTEN_TENSOR_METHODS = frozenset({
+    "dim", "numel", "is_contiguous", "retains_grad", "detach", "as_strided",
+    "select", "sparse_dim", "dense_dim", "is_coalesced", "coalesce",
+    "_values", "_indices", "sparse_mask", "to", "is_pinned", "pin_memory",
+    "item", "view",
+})
+
+
+def _owns_method_variant(f: NativeFunction, variant: str) -> bool:
+    return f.manual_cpp_binding or (
+        variant == "method" and f.cpp_name in _HANDWRITTEN_TENSOR_METHODS
+    )
+
+
+def _overload_key(f: NativeFunction, variant: str) -> tuple:
+    """Identity of a Tensor member for C++ overloading purposes.
+
+    Parameter *types* decide: argument names, default values, constness, and
+    staticness never distinguish overloads, so two members of the same class
+    with identical parameter type lists are a redeclaration conflict even
+    when their schema entries differ.
+    """
+    params = tuple(
+        cpp_arg_type(a.type)
+        for a in f.args
+        if a.name != "requires_grad"
+        and not (variant == "method" and a.name == "self")
+    )
+    return (f.cpp_name, params)
+
+
 def _is_const_method(f: NativeFunction) -> bool:
     self_a = f.self_arg()
     return bool(self_a) and not self_a.type.is_mutable_ref
+
+
+def _member_params(f: NativeFunction, variant: str) -> list:
+    """(C++ parameter type, has-default) pairs in schema order."""
+    out = []
+    for a in f.args:
+        if a.name == "requires_grad":
+            continue
+        if variant == "method" and a.name == "self":
+            continue
+        out.append((cpp_arg_type(a.type), bool(a.default)))
+    return out
+
+
+def _prefix_ambiguous(prev: list, new: list) -> bool:
+    """True when a shared-prefix call site is viable for both members.
+
+    Two members with the same name collide when their leading parameter
+    types agree up to the longest common prefix and every parameter past
+    that prefix is defaulted on both sides: a call supplying only the
+    prefix is then viable for each member and overload resolution cannot
+    pick one.
+    """
+    k = 0
+    while k < len(prev) and k < len(new) and prev[k][0] == new[k][0]:
+        k += 1
+    return (all(d for _, d in prev[k:])
+            and all(d for _, d in new[k:]))
+
+
+def plan_members(funcs: list[NativeFunction]) -> dict:
+    """Decide which variant renders each C++ member of class Tensor.
+
+    Schema overloads flatten onto one C++ member name, and code generation
+    only keeps overloads that form one resolvable overload set:
+    an operator and its overloads whose C++ parameter lists coincide
+    collapse into a single member.  When a later overload would instead
+    create a prefix ambiguity (all-defaulted tails behind a shared
+    prefix), it yields the C++ member to the earlier variant and keeps
+    only its dispatcher-level surface -- the redispatch helper and the
+    registration entry remain, so dispatch behavior is unchanged.
+    """
+    plan: dict = {}
+    emitted: dict = {}
+    for f in funcs:
+        for variant in _variant_instances(f):
+            owned = _owns_method_variant(f, variant)
+            params = _member_params(f, variant)
+            collides = False
+            for _pv in emitted.get(f.cpp_name, ()):
+                if _prefix_ambiguous(_pv, params):
+                    collides = True
+                    break
+            if not (collides or owned):
+                emitted.setdefault(f.cpp_name, []).append(params)
+            plan[(f.func_name, variant)] = not collides and not owned
+    return plan
 
 
 def _sig_args(f: NativeFunction, variant: str, *, with_defaults: bool) -> list[str]:
@@ -41,20 +162,11 @@ def _sig_args(f: NativeFunction, variant: str, *, with_defaults: bool) -> list[s
         if a.name == "requires_grad":
             continue
         s = f"{cpp_arg_type(a.type)} {a.name}"
-        if with_defaults and a.default:
+        if (with_defaults and not f.is_out and a.default
+                and a.name not in f.cpp_no_default_args):
             s += f" = {cpp_default(a.type, a.default)}"
         out.append(s)
-    # Merged out= overloads put a defaulted alpha before an output list;
-    # C++ requires every parameter after the first default to have one.
-    result = []
-    default_started = False
-    for s in out:
-        if "=" in s:
-            default_started = True
-        elif default_started and "std::vector<Tensor>" in s:
-            s = f"{s} = {{}}"
-        result.append(s)
-    return result
+    return out
 
 
 def method_signature(f: NativeFunction, variant: str, *, declaration: bool,
@@ -90,7 +202,7 @@ def _device_source(f: NativeFunction, variant: str) -> tuple[str, str]:
             val = (f"{device_arg.name}.has_value() ? *{device_arg.name} : {cpu}")
             return val, val
         return device_arg.name, device_arg.name
-    if variant == "method":
+    if variant == "method" and f.self_arg() is not None:
         return "device()", "device()"
     first_tensor = next((a for a in f.args if a.type.kind == "Tensor"
                          and not a.type.is_opt and not a.type.is_list), None)
@@ -98,10 +210,33 @@ def _device_source(f: NativeFunction, variant: str) -> tuple[str, str]:
         return f"{first_tensor.name}.device()", f"{first_tensor.name}.device()"
     first_list = next((a for a in f.args if a.type.is_tensor_like and a.type.is_list), None)
     if first_list is not None:
-        val = (f"({first_list.name}.empty() ? {cpu} : "
-               f"{first_list.name}[0].device())")
+        val = f"deviceForTensorArg({first_list.name})"
         return val, val
     return cpu, cpu
+
+
+def _dispatch_key_expr(f: NativeFunction, variant: str, *, redispatch: bool) -> str:
+    """Select the highest active transform across every tensor argument."""
+    if f.func_name == "copy_":
+        target = "self"
+        if variant == "method" and not redispatch:
+            target = "*this"
+        return f"dispatchKeyForTensorArgs({target})"
+    if f.func_name in _RANDOM_TRANSFORM_OPS:
+        _dispatch, device = _device_source(f, variant)
+        return f"transform::dispatch_key_for_random(computeDispatchKey({device}))"
+    names = []
+    for a in f.args:
+        if not a.type.is_tensor_like:
+            continue
+        if variant == "method" and a.name == "self" and not redispatch:
+            names.append("*this")
+        else:
+            names.append(a.name)
+    if names:
+        return f"dispatchKeyForTensorArgs({', '.join(names)})"
+    _dispatch, device = _device_source(f, variant)
+    return f"computeDispatchKey({device})"
 
 
 # ---------------------------------------------------------------------------
@@ -115,26 +250,23 @@ def generate_header(funcs: list[NativeFunction]) -> str:
         "#include <tuple>",
         "",
     ]
+    member_plan = plan_members(funcs)
     seen_decl = set()
     for f in funcs:
-        if f.skip_implementation:
-            # The core Tensor method is the implementation (gen_tpx routes
-            # through it and generate_cpp skips the definition); re-declaring
-            # it here would collide with p10/include/Tensor.h -- a class may
-            # not declare the same member twice.
-            continue
         for variant in _variant_instances(f):
+            if not member_plan.get((f.func_name, variant), True):
+                continue
             # (`int[]`) intentionally share the same std::vector ABI.  Their
             # schema defaults may differ (`padding=0` vs `padding=[]`), but
             # C++ cannot overload those declarations.  Deduplicate on the
-            # signature without defaults, matching generate_cpp's definition
-            key = method_signature(f, variant, declaration=False)
+            # parameter types, matching generate_cpp's definition dedup.
+            key = _overload_key(f, variant)
             if key in seen_decl:
                 continue
             seen_decl.add(key)
             # Function variants become static members of Tensor (factory
             # surface, e.g. Tensor::zeros), method variants are instance
-            # methods -- same as the reference layout.
+            # methods -- using the same generated layout.
             prefix = "static " if variant == "function" else ""
             lines.append(prefix + method_signature(f, variant, declaration=True) + ";")
             lines.append("")
@@ -159,6 +291,7 @@ _CPP_INCLUDES = """// Generated by tools/codegen/main.py -- DO NOT EDIT
 #include "Device.h"
 #include "TypePromotion.h"
 #include "autocast_mode.h"
+#include "TransformDispatch.h"
 #include "Profiler.h"
 #ifdef USE_CUDA
 #include "CUDARuntime.h"
@@ -168,7 +301,7 @@ _CPP_INCLUDES = """// Generated by tools/codegen/main.py -- DO NOT EDIT
 """
 
 
-def _emit_redispatch(lines, f, variant, dev_src):
+def _emit_redispatch(lines, f, variant, dev_src, helper_name):
     ret = cpp_return_type(f)
     tmpl = [ret]
     rd_args, rd_call = [], []
@@ -180,12 +313,13 @@ def _emit_redispatch(lines, f, variant, dev_src):
         rd_args.append(f"{st} {a.name}")
         rd_call.append(a.name)
 
-    rd_dev = dev_src.replace("device()", "self.device()") if variant == "method" else dev_src
+    rd_dev = dev_src
+    if variant == "method" and f.self_arg() is not None:
+        rd_dev = dev_src.replace("device()", "self.device()")
     mutable = [a.name for a in f.mutable_args]
 
-    redispatch_name = f"redispatch_{f.cpp_name}_{variant}"
     lines.append("namespace detail {")
-    lines.append(f"TENSORPLAY_API {ret} {redispatch_name}({', '.join(rd_args)}) {{")
+    lines.append(f"TENSORPLAY_API {ret} {helper_name}({', '.join(rd_args)}) {{")
     # Op-level profiler record: every dispatched execution passes through
     # exactly one redispatch funnel, so this is the single instrumentation
     # dispatch).  Inactive cost: one acquire-load of a static atomic.
@@ -209,12 +343,21 @@ def _emit_redispatch(lines, f, variant, dev_src):
             if t.is_list:
                 lines.append(
                     f"        for (const auto& __tp_t : {a.name}) {{")
-                lines.append(
-                    "            __tp_prof_shapes.push_back("
-                    "static_cast<std::vector<int64_t>>(__tp_t.shape()));")
-                lines.append(
-                    "            __tp_prof_dtypes.push_back(static_cast<int32_t>"
-                    "(__tp_t.dtype()));")
+                if t.list_elem_opt:
+                    lines.append("            if (!__tp_t.has_value()) continue;")
+                    lines.append(
+                        "            __tp_prof_shapes.push_back("
+                        "static_cast<std::vector<int64_t>>(__tp_t->shape()));")
+                    lines.append(
+                        "            __tp_prof_dtypes.push_back(static_cast<int32_t>"
+                        "(__tp_t->dtype()));")
+                else:
+                    lines.append(
+                        "            __tp_prof_shapes.push_back("
+                        "static_cast<std::vector<int64_t>>(__tp_t.shape()));")
+                    lines.append(
+                        "            __tp_prof_dtypes.push_back(static_cast<int32_t>"
+                        "(__tp_t.dtype()));")
                 lines.append("        }")
             elif t.is_opt:
                 lines.append(
@@ -255,12 +398,24 @@ def _emit_redispatch(lines, f, variant, dev_src):
     lines.append(
         f'    static const OperatorHandle op_handle = '
         f'Dispatcher::singleton().findHandle("{f.func_name}");')
-    lines.append(f"    DispatchKey dispatch_key = computeDispatchKey({rd_dev});")
+    # The redispatch helpers are free functions: a method variant's implicit
+    # receiver becomes the explicit `self` parameter here, so every receiver
+    # expression must be rewritten the same way as the device source above.
+    key_expr = f"toBackendKey({_dispatch_key_expr(f, variant, redispatch=True)})"
+    if variant == "method" and f.self_arg() is not None:
+        key_expr = key_expr.replace("device()", "self.device()")
+    lines.append(
+        f"    DispatchKey dispatch_key = {key_expr};"
+    )
     lines.append("#ifdef USE_CUDA")
     lines.append(f"    __tp_gpu.arm({rd_dev});")
     lines.append("#endif")
 
-    call = f"DispatchStub<{', '.join(tmpl)}>::call(op_handle, dispatch_key, {', '.join(rd_call)})"
+    dispatch_stub = f"DispatchStub<{', '.join(tmpl)}>"
+    if rd_call:
+        call = f"{dispatch_stub}::call(op_handle, dispatch_key, {', '.join(rd_call)})"
+    else:
+        call = f"{dispatch_stub}::call(op_handle, dispatch_key)"
     ret_void = ret == "void"
     if not mutable:
         if ret_void:
@@ -301,12 +456,14 @@ def _emit_redispatch(lines, f, variant, dev_src):
     lines.append("}")
     lines.append("} // namespace detail")
     lines.append("")
-    return redispatch_name
+    return helper_name
 
 
 def _emit_device_checks(lines, f, variant, target_dev):
     if f.device_check == "NoCheck" or f.cpp_name == "copy_":
         return
+    target_expr = f"({target_dev})"
+    target_text = f"{target_expr}.toString()"
     is_factory_like = f.base_name.endswith("_like")
     checked = {"Tensor", "Tensor?", "Tensor[]"}
     for a in f.args:
@@ -320,20 +477,31 @@ def _emit_device_checks(lines, f, variant, target_dev):
         elif t.is_mutable_tensor_list:
             kind = "Tensor[]"
         elif t.is_tensor_like:
-            kind = "Tensor?" if t.is_opt else ("Tensor[]" if t.is_list else "Tensor")
+            if t.is_list:
+                kind = "Tensor?[]" if t.list_elem_opt else "Tensor[]"
+            else:
+                kind = "Tensor?" if t.is_opt else "Tensor"
         else:
             continue
         if kind == "Tensor?":
             cond = (f"{a.name}.has_value() && {a.name}->defined() && "
-                    f"{a.name}->device() != {target_dev}")
-        elif kind == "Tensor[]":
+                    f"{a.name}->device() != {target_expr}")
+        elif kind in ("Tensor[]", "Tensor?[]"):
             cond = None
         else:
-            cond = f"{a.name}.defined() && {a.name}.device() != {target_dev}"
-        if kind == "Tensor[]":
+            cond = f"{a.name}.defined() && {a.name}.device() != {target_expr}"
+        if kind in ("Tensor[]", "Tensor?[]"):
             lines.append(f"    for (const auto& t : {a.name}) {{")
-            lines.append(f"        if (t.defined() && t.device() != {target_dev}) {{")
-            lines.append('            TP_THROW(DeviceMismatchError, "Expected all tensors to be on the same device, but found one (in ' + a.name + ') on " + t.device().toString() + " and another (' + target_dev.replace('"', '') + ') on " + ' + target_dev + '.toString());')
+            tensor_expr = "t->" if kind == "Tensor?[]" else "t."
+            present = "t.has_value() && " if kind == "Tensor?[]" else ""
+            lines.append(
+                f"        if ({present}{tensor_expr}defined() && "
+                f"{tensor_expr}device() != {target_expr}) {{")
+            shown_device = "t->device()" if kind == "Tensor?[]" else "t.device()"
+            lines.append(
+                '            TP_THROW(DeviceMismatchError, "Expected all tensors to be on the same device, but found one (in '
+                + a.name + ') on " + ' + shown_device + '.toString() + " and another (target) on " + '
+                + target_text + ');')
             lines.append("        }")
             lines.append("    }")
             continue
@@ -343,7 +511,7 @@ def _emit_device_checks(lines, f, variant, target_dev):
                    else f"{a.name}.device().toString()")
         lines.append(
             '            TP_THROW(DeviceMismatchError, "Expected all tensors to be on the same device, but found one (' + shown + ') on " + '
-            + lhs_dev + ' + " and another (' + target_dev.replace('"', '') + ') on " + ' + target_dev + '.toString());')
+            + lhs_dev + ' + " and another (target) on " + ' + target_text + ');')
         lines.append("    }")
 
 
@@ -352,20 +520,39 @@ def generate_cpp(funcs: list[NativeFunction], *,
     """autograd_ops maps dispatcher op name -> backward node name."""
     lines = [_CPP_INCLUDES.rstrip("\n"), "", "namespace tensorplay {", ""]
 
-    # Ops declared `variants: function, method` but without a `self` argument
-    # produce identical signatures for both variants; emit only the first.
-    seen_def = set()
+    # Pass 1: backend redispatch helpers, one per schema and variant.
+    seen_rd = set()
     for f in funcs:
-        if f.skip_implementation:
+        if f.manual_kernel_registration:
             continue
         for variant in _variant_instances(f):
-            def_key = method_signature(f, variant, declaration=False, qualified=True)
+            rd_name = _redispatch_name(f, variant)
+            rd_key = _redispatch_key(f, variant)
+            if rd_key in seen_rd:
+                continue
+            seen_rd.add(rd_key)
+            dev_src, _ = _device_source(f, variant)
+            _emit_redispatch(lines, f, variant, dev_src, rd_name)
+
+    # Pass 2: public Tensor members.  Deduplicate on parameter types (names,
+    # defaults, staticness, and constness never distinguish overloads); the
+    # member plan additionally routes ambiguous overload forms and handwritten
+    # method variants away from this surface.  Both variants are members of
+    # Tensor here: static factories for the function surface, instance
+    # methods otherwise.
+    member_plan = plan_members(funcs)
+    seen_def = set()
+    for f in funcs:
+        for variant in _variant_instances(f):
+            def_key = _overload_key(f, variant)
             if def_key in seen_def:
                 continue
             seen_def.add(def_key)
+            if not member_plan.get((f.func_name, variant), True):
+                continue
             dev_src, target_dev = _device_source(f, variant)
 
-            rd_name = _emit_redispatch(lines, f, variant, dev_src)
+            rd_name = _redispatch_name(f, variant)
 
             # ---- public entry ----
             # Both variants are members of Tensor here: static factories for
@@ -411,6 +598,36 @@ def generate_cpp(funcs: list[NativeFunction], *,
 
             tmpl = [ret] + [stub_arg_type_for(f.base_name, a)
                            for a in f.args if a.name != "requires_grad"]
+
+            # Transform keys must be consumed before autocast or autograd.
+            # A wrapped tensor carries the physical backend in its payload,
+            # while its public dispatch key identifies the active transform.
+            tensor_like_args = [a for a in f.args if a.type.is_tensor_like]
+            if tensor_like_args or f.func_name in _RANDOM_TRANSFORM_OPS:
+                lines.append("    {")
+                lines.append(
+                    f"        DispatchKey __tp_key = "
+                    f"{_dispatch_key_expr(f, variant, redispatch=False)};")
+                lines.append("        if (is_vmap_key(__tp_key)) {")
+                lines.append(
+                    '            static const OperatorHandle __tp_handle = '
+                    f'Dispatcher::singleton().findHandle("{f.func_name}");')
+                lines.append(
+                    "            if (!__tp_handle || !__tp_handle.getKernel(__tp_key)) {")
+                lines.append(
+                    f'                TP_THROW(NotImplementedError, "No native batch rule registered for {f.func_name}");')
+                lines.append("            }")
+                transform_call = (
+                    f"DispatchStub<{', '.join(tmpl)}>::call(__tp_handle, "
+                    f"__tp_key, {call_str})"
+                )
+                if ret_void:
+                    lines.append(f"            {transform_call};")
+                    lines.append("            return;")
+                else:
+                    lines.append(f"            return {transform_call};")
+                lines.append("        }")
+                lines.append("    }")
 
             # Autocast key outranks Autograd (casts precede VariableType).
             if f.func_name in autocast_ops:
@@ -475,15 +692,21 @@ def generate_redispatch_header(funcs: list[NativeFunction]) -> str:
         "namespace detail {",
         "",
     ]
+    seen_rd = set()
     for f in funcs:
-        if f.skip_implementation:
+        if f.manual_kernel_registration:
             continue
         for variant in _variant_instances(f):
+            rd_name = _redispatch_name(f, variant)
+            rd_key = _redispatch_key(f, variant)
+            if rd_key in seen_rd:
+                continue
+            seen_rd.add(rd_key)
             ret = cpp_return_type(f)
             rd_args = [f"{stub_arg_type(a.type)} {a.name}"
                        for a in f.args if a.name != "requires_grad"]
             lines.append(
-                f"TENSORPLAY_API {ret} redispatch_{f.cpp_name}_{variant}({', '.join(rd_args)});")
+                f"TENSORPLAY_API {ret} {rd_name}({', '.join(rd_args)});")
             lines.append("")
     lines.extend(["} // namespace detail", "} // namespace tensorplay"])
     return "\n".join(lines)

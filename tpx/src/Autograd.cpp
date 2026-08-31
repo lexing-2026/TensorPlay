@@ -31,10 +31,138 @@ AutogradMeta* get_or_create_autograd_meta(const Tensor& t) {
     return raw;
 }
 
+std::shared_ptr<Node> grad_fn(const Tensor& t) {
+    auto* meta = get_autograd_meta(t);
+    if (!meta) return nullptr;
+    if (!meta->has_view_info()) return meta->grad_fn();
+
+    std::lock_guard<std::mutex> lock(meta->view_mutex());
+    const auto& base = meta->view_base();
+    if (!base.defined()) return meta->grad_fn();
+
+    const uint32_t current_version = t.unsafeGetTensorImpl()->version();
+    if (meta->attr_version() == current_version) return meta->grad_fn();
+    if (!meta->grad_fn() && !base.requires_grad()) {
+        meta->set_attr_version(current_version);
+        return nullptr;
+    }
+    if (meta->creation_meta() != CreationMeta::DEFAULT) {
+        TP_THROW(RuntimeError,
+                 "a view was modified after its backward history became stale");
+    }
+
+    std::shared_ptr<Node> refreshed;
+    if (meta->has_view_fn()) {
+        const bool previous_grad_mode = GradMode::is_enabled();
+        GradMode::set_enabled(true);
+        try {
+            Tensor replay = meta->view_fn()(base);
+            refreshed = grad_fn(replay);
+        } catch (...) {
+            GradMode::set_enabled(previous_grad_mode);
+            throw;
+        }
+        GradMode::set_enabled(previous_grad_mode);
+    } else {
+        const int64_t base_offset = static_cast<int64_t>(
+            base.unsafeGetTensorImpl()->storage_offset());
+        const int64_t relative_offset = meta->view_storage_offset() - base_offset;
+        refreshed = std::make_shared<AsStridedBackward>(
+            base.shape(), meta->view_sizes(), meta->view_strides(),
+            std::optional<int64_t>(relative_offset), base.dtype(), base.device());
+        refreshed->set_view_fn(true);
+        refreshed->add_next_edge_list(collect_next_edges(base));
+    }
+    meta->set_grad_fn(std::move(refreshed));
+    meta->set_attr_version(current_version);
+    return meta->grad_fn();
+}
+
 void set_requires_grad(const Tensor& t, bool requires_grad) {
     if (auto* meta = get_or_create_autograd_meta(t)) {
         meta->set_requires_grad(requires_grad);
     }
+}
+
+void set_view_metadata(
+    const Tensor& view,
+    const Tensor& base,
+    CreationMeta creation_meta,
+    std::function<Tensor(const Tensor&)> view_fn,
+    bool force_view_fn) {
+    if (!view.defined() || !base.defined()) return;
+    auto view_impl = view.unsafeGetTensorImpl();
+    auto base_impl = base.unsafeGetTensorImpl();
+    if (!view_impl || !base_impl || view_impl == base_impl) return;
+    if (!view_impl->has_storage() || !base_impl->has_storage() ||
+        !view_impl->storage().is_same(base_impl->storage())) {
+        return;
+    }
+    Tensor root_base = base;
+    auto* base_meta = get_autograd_meta(base);
+    if (base_meta && base_meta->has_view_info() &&
+        base_meta->view_base().defined()) {
+        root_base = base_meta->view_base();
+    }
+    if (!root_base.defined()) return;
+
+    if (!force_view_fn && view.dtype() == base.dtype()) {
+        view_fn = {};
+    } else if (view_fn && base_meta && base_meta->has_view_info()) {
+        std::function<Tensor(const Tensor&)> parent_view_fn;
+        if (base_meta->has_view_fn()) {
+            parent_view_fn = base_meta->view_fn();
+        } else {
+            const auto parent_size =
+                static_cast<std::vector<int64_t>>(base.shape());
+            const auto parent_stride = base.strides();
+            const int64_t parent_offset = static_cast<int64_t>(
+                base_impl->storage_offset());
+            const int64_t root_offset = static_cast<int64_t>(
+                root_base.unsafeGetTensorImpl()->storage_offset());
+            const int64_t relative_offset = parent_offset - root_offset;
+            parent_view_fn = [parent_size, parent_stride, relative_offset](
+                                 const Tensor& root) {
+                return root.as_strided(
+                    parent_size, parent_stride, relative_offset);
+            };
+        }
+        auto current_view_fn = std::move(view_fn);
+        view_fn = [parent_view_fn = std::move(parent_view_fn),
+                   current_view_fn = std::move(current_view_fn)](
+                      const Tensor& root) {
+            return current_view_fn(parent_view_fn(root));
+        };
+    }
+    if (auto* meta = get_or_create_autograd_meta(view)) {
+        meta->set_view_info(view, root_base, creation_meta, std::move(view_fn));
+    }
+}
+
+bool has_view_metadata(const Tensor& t) {
+    auto* meta = get_autograd_meta(t);
+    return meta != nullptr && meta->has_view_info();
+}
+
+void rebase_history(const Tensor& self, std::shared_ptr<Node> grad_fn) {
+    TP_CHECK(grad_fn != nullptr, "rebase_history requires a backward node");
+    auto* meta = get_autograd_meta(self);
+    if (!meta || !meta->has_view_info()) {
+        set_grad_fn(self, std::move(grad_fn));
+        return;
+    }
+    if (meta->creation_meta() != CreationMeta::DEFAULT) {
+        TP_THROW(RuntimeError,
+                 "a view with restricted mutation history cannot be modified inplace");
+    }
+    const Tensor base = meta->view_base();
+    TP_CHECK(base.defined(), "view metadata has no base tensor");
+    std::function<Tensor(const Tensor&)> view_fn;
+    if (meta->has_view_fn()) view_fn = meta->view_fn();
+    auto copy_slices = std::make_shared<CopySlices>(
+        base, self, std::move(view_fn), std::move(grad_fn));
+    set_grad_fn(base, copy_slices);
+    (void)impl::grad_fn(self);
 }
 
 } // namespace impl
@@ -290,10 +418,18 @@ void backward(const Tensor& tensor, const Tensor& gradient, bool retain_graph, b
 Tensor as_strided(const Tensor& self, const std::vector<int64_t>& size,
                   const std::vector<int64_t>& stride,
                   std::optional<int64_t> storage_offset) {
-    bool requires_grad = self.requires_grad();
+    const bool requires_grad =
+        GradMode::is_enabled() && !InferenceMode::is_enabled() &&
+        self.requires_grad();
     std::shared_ptr<Node> grad_fn;
     if (requires_grad) {
-        grad_fn = std::make_shared<AsStridedBackward>(self.shape(), size, stride, storage_offset, self.dtype(), self.device());
+        const int64_t base_offset = static_cast<int64_t>(
+            self.unsafeGetTensorImpl()->storage_offset());
+        const int64_t view_offset = storage_offset.value_or(base_offset);
+        grad_fn = std::make_shared<AsStridedBackward>(
+            self.shape(), size, stride,
+            std::optional<int64_t>(view_offset - base_offset),
+            self.dtype(), self.device());
         grad_fn->set_view_fn(true);
         grad_fn->add_next_edge_list(collect_next_edges(self));
     }
@@ -304,6 +440,7 @@ Tensor as_strided(const Tensor& self, const std::vector<int64_t>& size,
         result.unsafeGetTensorImpl()->set_is_view(true);
     }
     if (requires_grad && result.defined()) {
+        impl::set_view_metadata(result, self);
         impl::set_grad_fn(result, grad_fn);
     }
     return result;

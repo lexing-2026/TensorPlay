@@ -6,15 +6,15 @@ import operator
 import pytest
 
 import tensorplay as tp
-from tensorplay.compiler.graph import Graph, GraphModule, Tracer
-from tensorplay.compiler.passes import (
+from tensorplay.graph import Graph, GraphModule, Tracer
+from tensorplay.graph.passes import (
     ConstFold,
     DeadCodeElimination,
     PassManager,
     PassResult,
     ShapeProp,
 )
-import tensorplay.compiler as tpc
+import tensorplay.graph.passes as tgp
 
 
 def _gm_from_graph(g, params=("x",)):
@@ -135,13 +135,15 @@ def test_shape_prop_records_values_and_shapes_for_dot():
     assert mul_node.name in dot and add_node.name in dot
 
 
-def test_compiler_namespace_exports_pass_infra():
+def test_graph_pass_namespace_exports_pass_infra():
     for name in ("PassManager", "PassBase", "PassResult", "ConstFold",
                  "DeadCodeElimination", "ShapeProp"):
-        assert hasattr(tpc, name)
+        assert hasattr(tgp, name)
 
 
-def test_facade_exposes_passes_like_fx_passes():
+def test_graph_namespace_keeps_passes_in_the_passes_package():
     import tensorplay.graph as tpg
-    assert tpg.PassManager is tpc.PassManager
-    assert tpg.ShapeProp is tpc.ShapeProp
+    assert not hasattr(tpg, "PassManager")
+    assert not hasattr(tpg, "ShapeProp")
+    assert tgp.PassManager is not None
+    assert tgp.ShapeProp is not None

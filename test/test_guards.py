@@ -3,13 +3,13 @@
 import pytest
 
 import tensorplay as tp
-from tensorplay.compiler.guards import GuardChain, format_recompile_reasons
+from tensorplay._stax.guards import GuardChain, format_recompile_reasons
 
 
 @pytest.fixture(autouse=True)
 def _reset_compiler():
     yield
-    tp.compiler.reset()
+    tp._stax.reset()
 
 
 @pytest.fixture()
@@ -20,15 +20,15 @@ def probe_calls():
         calls.append([(n.op, n.target) for n in graph_module.graph.nodes])
         return graph_module.forward
 
-    tp.compiler.register_backend(name="l6_probe")(backend)
+    tp._stax.register_backend(name="l6_probe")(backend)
     yield calls
-    tp.compiler.unregister_backend("l6_probe")
+    tp._stax.unregister_backend("l6_probe")
 
 
 
 def test_guard_chain_renders_tensor_conditions():
     x = tp.zeros(4, 3)
-    from tensorplay.compiler.api import _input_signature
+    from tensorplay._stax.api import _input_signature
 
     key = (_input_signature((x,), {}, dynamic=False), ())
     chain = GuardChain(key, param_names=(), dynamic=False)
@@ -105,5 +105,5 @@ def test_reset_clears_guard_chains(probe_calls):
     compiled = tp.compile(fn, backend="l6_probe")
     compiled(tp.tensor([1.0, 2.0]))
     assert compiled._tensorplay_guard_chains
-    tp.compiler.reset()
+    tp._stax.reset()
     assert not compiled._tensorplay_guard_chains

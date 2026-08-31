@@ -184,7 +184,7 @@ def generate_autocast_registration(funcs: list[NativeFunction]) -> str:
     for f in funcs:
         name = f.func_name
         base = f.base_name
-        if name in seen or f.skip_implementation:
+        if name in seen or f.manual_kernel_registration:
             continue
         # Out/mutable variants are excluded from autocast:
         if any(a.type.is_mutable_ref for a in f.args):

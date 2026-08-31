@@ -6,14 +6,20 @@ positional/keyword args against the schema, unpacks through the
 packs the result.  pybind11 overload dispatch is bypassed; the existing
 binding surface stays untouched.
 
-Types without a bridge mapping are skipped and counted; unsupported
-signatures therefore remain on the fallback binding surface.
+Every configured schema signature must have a native bridge mapping.  Code
+generation fails when a type is not implemented instead of emitting a second
+binding path with different call semantics.
 """
 
 from __future__ import annotations
 
-from .api_types import (_MEMORY_FORMAT_VALUES, binding_default,
-                        cpp_arg_type, cpp_return_type, py_default_for)
+import ast as _ast
+import hashlib as _hashlib
+import json as _json
+
+from .api_types import (_MEMORY_FORMAT_VALUES, _memory_format_name,
+                        binding_default, cpp_arg_type, cpp_return_type,
+                        py_default_for, tuple_element_cpp_types)
 from .main import CodegenContext, register_generator
 
 import re as _re
@@ -41,11 +47,17 @@ def _default_pyobject(a, expr: str) -> str:
     if _FLOAT_RE.match(expr):
         return f"PyFloat_FromDouble({expr})"
     if a.type.kind == "str":
-        if not (expr.startswith('"') and expr.endswith('"')):
+        try:
+            value = _ast.literal_eval(expr)
+        except (SyntaxError, ValueError) as error:
             raise SystemExit(
                 f"unsupported string default {expr!r} "
-                "(expected double-quoted spelling)")
-        return f"PyUnicode_FromString({expr})"
+                "(expected a quoted string literal)") from error
+        if not isinstance(value, str):
+            raise SystemExit(
+                f"unsupported string default {expr!r} "
+                "(expected a quoted string literal)")
+        return f"PyUnicode_FromString({_json.dumps(value, ensure_ascii=False)})"
     if a.type.is_list:
         return expr  # marker: caller emits a list-builder helper
     if a.type.kind == "DType" and expr.startswith("DType::"):
@@ -55,7 +67,7 @@ def _default_pyobject(a, expr: str) -> str:
     if a.type.kind == "MemoryFormat":
         # MemoryFormat rides the dispatcher as its integer value; accept both
         # bare and enum-qualified spellings from the yaml.
-        name = expr.split("::")[-1].strip()
+        name = _memory_format_name(expr)
         if name in _MEMORY_FORMAT_VALUES:
             return f"PyLong_FromLongLong({_MEMORY_FORMAT_VALUES[name]}LL)"
     raise SystemExit(
@@ -63,7 +75,7 @@ def _default_pyobject(a, expr: str) -> str:
         "has no CPython-literal mapping; drop the default from the yaml or "
         "extend gen_python_c._default_pyobject")
 
-# schema type -> (bridge call template, doc)
+# Schema C++ type -> native bridge call template.
 # Tensor args bind by reference into the Python wrapper's storage: the const
 # form skips one refcount pair per argument, the mutable form is what makes
 # in-place ops write through to the caller's tensor.
@@ -81,28 +93,33 @@ _BRIDGE = {
     "std::optional<double>": "tpx_py_opt_double({n})",
     "std::optional<bool>": "tpx_py_opt_bool({n})",
     "std::optional<Scalar>": "tpx_py_opt_scalar({n})",
+    "Generator": "tpx_py_generator({n})",
+    "std::optional<Generator>": "tpx_py_opt_generator({n})",
     "std::vector<int64_t>": "tpx_py_intlist({n})",
     "std::vector<double>": "tpx_py_doublelist({n})",
     # Schemas bind lists by const-ref at signature level; the unpackers
     # return by value, which binds fine -- keep both spellings claimed.
     "const std::vector<int64_t>&": "tpx_py_intlist({n})",
     "const std::vector<double>&": "tpx_py_doublelist({n})",
+    "std::vector<bool>": "tpx_py_boollist({n})",
+    "const std::vector<bool>&": "tpx_py_boollist({n})",
     "std::vector<Tensor>": "tpx_py_tensorlist({n})",
     "const std::vector<Tensor>&": "tpx_py_tensorlist({n})",
+    "const std::vector<std::optional<Tensor>>&": "tpx_py_opt_tensorlist({n})",
     "std::vector<Scalar>": "tpx_py_scalarlist({n})",
     "const std::vector<Scalar>&": "tpx_py_scalarlist({n})",
     "const std::optional<Tensor>&": "tpx_py_opt_tensor({n})",
     "std::optional<std::vector<int64_t>>": "tpx_py_opt_intlist({n})",
+    "std::optional<std::vector<double>>": "tpx_py_opt_doublelist({n})",
     "std::optional<std::string>": "tpx_py_opt_string({n})",
     "std::string": "tpx_py_string({n})",
     "DType": "tpx_py_dtype({n})",
     "std::optional<DType>": "tpx_py_opt_dtype({n})",
     "std::optional<Device>": "tpx_py_opt_device({n})",
+    "Device": "tpx_py_device({n})",
 }
 
-# C++ argument type -> tpx_py_type_kind byte (see CPythonBridge.h).  The map
-# uses the same key set as _BRIDGE; entries absent here disable the eager check
-# using them rather than changing which ops get FASTCALL bindings.
+# C++ argument type -> tpx_py_type_kind byte (see CPythonBridge.h).
 _KIND_CONST = {
     "const Tensor&": "TPK_TENSOR",
     "Tensor&": "TPK_TENSOR",
@@ -116,12 +133,17 @@ _KIND_CONST = {
     "std::vector<double>": "TPK_FLOATLIST",
     "const std::vector<int64_t>&": "TPK_INTLIST",
     "const std::vector<double>&": "TPK_FLOATLIST",
+    "std::vector<bool>": "TPK_BOOLLIST",
+    "const std::vector<bool>&": "TPK_BOOLLIST",
     "std::vector<Tensor>": "TPK_TENSORLIST",
     "const std::vector<Tensor>&": "TPK_TENSORLIST",
+    "const std::vector<std::optional<Tensor>>&": "TPK_TENSORLIST_OPTIONAL",
     "std::vector<Scalar>": "TPK_SCALARLIST",
     "const std::vector<Scalar>&": "TPK_SCALARLIST",
     "std::string": "TPK_STR",
     "DType": "TPK_DTYPE",
+    "Device": "TPK_DEVICE",
+    "Generator": "TPK_GENERATOR",
 }
 _OPT = {
     "std::optional<Tensor>": "TPK_TENSOR",
@@ -134,36 +156,152 @@ _OPT = {
     "std::optional<Device>": "TPK_DEVICE",
     "const std::optional<Tensor>&": "TPK_TENSOR",
     "std::optional<std::vector<int64_t>>": "TPK_INTLIST",
+    "std::optional<std::vector<double>>": "TPK_FLOATLIST",
+    "std::optional<Generator>": "TPK_GENERATOR",
 }
 _KIND_CONST.update({k: v + " | TPK_OPTIONAL" for k, v in _OPT.items()})
 
 _RET_SHAPES = {"void", "value", "tuple", "list", "mut_ref"}
 
 
-def _op_supported(f, variant: str) -> bool:
-    """True when this single overload is expressible on the FASTCALL layer."""
+def _schema_tag(f, variant: str, ordinal: int) -> str:
+    payload = f"{variant}\0{ordinal}\0{f.schema}".encode("utf-8")
+    return _hashlib.sha1(payload).hexdigest()[:10]
+
+
+def _pack_expr(cpp_type: str, value: str) -> str | None:
+    """Return the native Python-object packer for one result value."""
+    if cpp_type == "Tensor":
+        return f"tpx_py_wrap({value})"
+    if cpp_type == "Tensor&":
+        return f"tpx_py_wrap({value})"
+    if cpp_type == "std::optional<Tensor>":
+        return f"tpx_py_wrap_optional_tensor({value})"
+    if cpp_type == "Scalar":
+        return f"tpx_py_wrap_scalar({value})"
+    if cpp_type == "std::optional<Scalar>":
+        return f"tpx_py_wrap_optional_scalar({value})"
+    if cpp_type == "Generator":
+        return f"tpx_py_wrap_generator({value})"
+    if cpp_type == "DType":
+        return f"tpx_py_wrap_dtype({value})"
+    if cpp_type == "Device":
+        return f"tpx_py_wrap_device({value})"
+    if cpp_type == "bool":
+        return f"PyBool_FromLong({value})"
+    if cpp_type == "std::optional<bool>":
+        return f"tpx_py_wrap_optional_bool({value})"
+    if cpp_type == "int64_t":
+        return f"PyLong_FromLongLong({value})"
+    if cpp_type == "std::optional<int64_t>":
+        return f"tpx_py_wrap_optional_int64({value})"
+    if cpp_type == "double":
+        return f"PyFloat_FromDouble({value})"
+    if cpp_type == "std::optional<double>":
+        return f"tpx_py_wrap_optional_double({value})"
+    if cpp_type == "std::string":
+        return f"PyUnicode_FromString({value}.c_str())"
+    if cpp_type == "std::optional<std::string>":
+        return f"tpx_py_wrap_optional_string({value})"
+    if cpp_type == "std::vector<Tensor>":
+        return f"tpx_py_wrap_list({value})"
+    if cpp_type == "std::vector<std::optional<Tensor>>":
+        return f"tpx_py_wrap_optional_tensor_list({value})"
+    if cpp_type == "std::vector<int64_t>":
+        return f"tpx_py_wrap_intlist({value})"
+    if cpp_type == "std::vector<double>":
+        return f"tpx_py_wrap_doublelist({value})"
+    if cpp_type == "std::vector<bool>":
+        return f"tpx_py_wrap_boollist({value})"
+    if cpp_type == "std::vector<Scalar>":
+        return f"tpx_py_wrap_scalarlist({value})"
+    if cpp_type == "std::optional<DType>":
+        return f"tpx_py_wrap_optional_dtype({value})"
+    if cpp_type == "std::optional<Device>":
+        return f"tpx_py_wrap_optional_device({value})"
+    if cpp_type == "std::optional<Generator>":
+        return f"tpx_py_wrap_optional_generator({value})"
+    if cpp_type == "std::optional<std::vector<int64_t>>":
+        return f"tpx_py_wrap_optional_intlist({value})"
+    if cpp_type == "std::optional<std::vector<double>>":
+        return f"tpx_py_wrap_optional_doublelist({value})"
+    return None
+
+
+def _require_bridge(cpp_type: str) -> str:
+    try:
+        return _BRIDGE[cpp_type]
+    except KeyError as error:
+        raise SystemExit(
+            f"native CPython bridge has no converter for C++ type {cpp_type!r}") from error
+
+
+def _validate_op_support(f, variant: str) -> None:
     for a in f.args:
-        if _BRIDGE.get(cpp_arg_type(a.type)) is None:
-            return False
+        cpp_type = cpp_arg_type(a.type)
+        _require_bridge(cpp_type)
+        if cpp_type not in _KIND_CONST:
+            raise SystemExit(
+                f"native CPython bridge has no type check for C++ type {cpp_type!r} "
+                f"in {f.func_name} ({variant})")
     if f.cpp_return_kind not in _RET_SHAPES:
-        return False
-    if f.cpp_return_kind == "value":
-        return cpp_return_type(f) in ("Tensor", "bool", "Scalar", "int64_t")
-    if f.cpp_return_kind == "tuple":
-        return len(f.returns) in (2, 3, 4)
+        raise SystemExit(
+            f"native CPython bridge has no return shape for {f.cpp_return_kind!r} "
+            f"in {f.func_name} ({variant})")
+    if f.cpp_return_kind in {"value", "list"}:
+        cpp_type = cpp_return_type(f)
+        if _pack_expr(cpp_type, "result") is None:
+            raise SystemExit(
+                f"native CPython bridge has no packer for C++ type {cpp_type!r} "
+                f"in {f.func_name} ({variant})")
+    elif f.cpp_return_kind == "tuple":
+        for cpp_type in tuple_element_cpp_types(f):
+            if _pack_expr(cpp_type, "result") is None:
+                raise SystemExit(
+                    f"native CPython bridge has no tuple packer for C++ type "
+                    f"{cpp_type!r} in {f.func_name} ({variant})")
+
+
+def _tuple_invoke(f, op: str, call: str, site_hook: str) -> str | None:
+    elements = tuple_element_cpp_types(f)
+    packed = [
+        _pack_expr(t, f"std::get<{i}>(r)")
+        for i, t in enumerate(elements)
+    ]
+    if any(expr is None for expr in packed):
+        return None
+    statements = [
+        f"PyObject* tpx_tuple_result = PyTuple_New({len(elements)});",
+        "if (tpx_tuple_result == nullptr) return nullptr;",
+    ]
+    for i, expr in enumerate(packed):
+        assert expr is not None
+        item = f"tpx_tuple_item_{i}"
+        statements.extend([
+            f"PyObject* {item} = {expr};",
+            f"if ({item} == nullptr) {{ Py_DECREF(tpx_tuple_result); return nullptr; }}",
+            f"PyTuple_SET_ITEM(tpx_tuple_result, {i}, {item});",
+        ])
+    statements.append("return tpx_tuple_result;")
+    return (site_hook
+            + f"auto r = [&]() {{ tpx_py_GilRelease _gil; return {op}({call}); }}(); "
+            + " ".join(statements))
+
+
+def _op_supported(f, variant: str) -> bool:
+    """Validate one overload and report that it has a native entry point."""
+    _validate_op_support(f, variant)
     return True
 
 
 def plan_groups(funcs) -> "dict[tuple[str, str], list]":
-    """Group overloads by exposed (variant, name), keeping only groups where
-    *every* member is expressible -- a partial group would silently lose the
-    unsupported overload."""
+    """Group every overload by its exposed variant and public name."""
     groups: "dict[tuple[str, str], list]" = {}
     for f in funcs:
         for variant in f.variants:
+            _op_supported(f, variant)
             groups.setdefault((variant, f.cpp_name), []).append(f)
-    return {k: v for k, v in groups.items()
-            if all(_op_supported(f, variant) for f in v)}
+    return groups
 
 
 def capi_claims(funcs):
@@ -197,8 +335,9 @@ def _probe_info(f, variant: str):
 
 
 def _emit_op(out: list[str], f, variant: str, fn: str,
-             own_catch: bool = True) -> bool:
-    """Emit one overload entry point under `fn`; False if unsupported.
+             own_catch: bool = True, dispatch: bool = True,
+             helper_tag: str | None = None) -> None:
+    """Emit one native overload entry point under ``fn``.
 
     own_catch=False (multi-overload group members) leaves argument errors
     uncaught so the group dispatcher can fall through to the next candidate.
@@ -206,9 +345,7 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
     prelude: list[str] = []
     slots: list[tuple[str, str, str | None]] = []  # (argname, template, dflt)
     for i, a in enumerate(f.args):
-        tpl = _BRIDGE.get(cpp_arg_type(a.type))
-        if tpl is None:
-            return False                       # unsupported type -> skip op
+        tpl = _require_bridge(cpp_arg_type(a.type))
         dft = py_default_for(f, a, 'binding') or (
             binding_default(a.type, a.default) if a.default is not None else None)
         dflt = None
@@ -218,7 +355,8 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
             if dflt == expr and a.type.is_list:
                 inner = expr[expr.find("{") + 1:expr.rfind("}")]
                 items = [s.strip() for s in inner.split(",") if s.strip()]
-                helper = f"pydflt_{f.cpp_name}_{variant}_{i}"
+                tag = helper_tag or _schema_tag(f, variant, 0)
+                helper = f"pydflt_{f.cpp_name}_{variant}_{tag}_{i}"
                 prelude.append(f"static PyObject* {helper}() {{")
                 prelude.append(f"    PyObject* v = PyList_New({len(items)});")
                 for j, item in enumerate(items):
@@ -229,7 +367,9 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
         slots.append((a.name, tpl, dflt))
 
     if f.cpp_return_kind not in _RET_SHAPES:
-        return False
+        raise SystemExit(
+            f"native CPython bridge has no return shape for {f.cpp_return_kind!r} "
+            f"in {f.func_name} ({variant})")
 
     nargs = len(slots)
     is_method = variant == "method" and slots and slots[0][0] == "self"
@@ -248,7 +388,8 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
              'static const char* kwlist[] = {nullptr};'
 
     call = ", ".join("s_" + n for n, _, _ in slots)
-    op = f"tensorplay::tpx::ops::{f.cpp_name}"
+    op_signature = (f"{cpp_return_type(f)} (*)({', '.join(cpp_arg_type(a.type) for a in f.args)})")
+    op = f"static_cast<{op_signature}>(tensorplay::tpx::ops::{f.cpp_name})"
     kind = f.cpp_return_kind
     ret_cpp = cpp_return_type(f)
     # Python call-site capture for the profiler (with_stack): runs under the
@@ -274,17 +415,27 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
             invoke = (site_hook + f"auto r = [&]() {{ tpx_py_GilRelease _gil; return {op}({call}); }}(); "
                       "return tpx_py_wrap(r);")
         else:
-            return False                       # unhandled scalar shape
+            pack = _pack_expr(ret_cpp, "r")
+            if pack is None:
+                raise SystemExit(
+                    f"native CPython bridge has no packer for C++ type {ret_cpp!r} "
+                    f"in {f.func_name} ({variant})")
+            invoke = (site_hook + f"auto r = [&]() {{ tpx_py_GilRelease _gil; return {op}({call}); }}(); "
+                      f"return {pack};")
     elif kind == "tuple":
-        packer = {2: "tpx_py_wrap_tuple", 3: "tpx_py_wrap_tuple3",
-                  4: "tpx_py_wrap_tuple4"}.get(len(f.returns))
-        if packer is None:
-            return None
-        invoke = (site_hook + f"auto r = [&]() {{ tpx_py_GilRelease _gil; return {op}({call}); }}(); "
-                  f"return {packer}(r);")
+        invoke = _tuple_invoke(f, op, call, site_hook)
+        if invoke is None:
+            raise SystemExit(
+                f"native CPython bridge has no tuple packer for {f.func_name} "
+                f"({variant})")
     elif kind == "list":
+        pack = _pack_expr(ret_cpp, "r")
+        if pack is None:
+            raise SystemExit(
+                f"native CPython bridge has no packer for C++ type {ret_cpp!r} "
+                f"in {f.func_name} ({variant})")
         invoke = (site_hook + f"auto r = [&]() {{ tpx_py_GilRelease _gil; return {op}({call}); }}(); "
-                  "return tpx_py_wrap_list(r);")
+                  f"return {pack};")
     else:                                      # mut_ref
         # slots[0] is the raw self PyObject; the s_* locals hold unpacked
         # C++ tensors.
@@ -304,10 +455,29 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
     ]
     if own_catch:
         body.append("    try {")
-    body += [
-        f"        {kwlist}",
-        f"        PyObject* slots[{nargs}];",
-    ]
+    body += [f"        {kwlist}", f"        PyObject* slots[{nargs}];"]
+    if dispatch:
+        body += [
+            "        PyObject* tpx_dispatch_result = nullptr;",
+            f'        const int tpx_mode_status = '
+            f'tpx_py_try_function_mode_dispatch("{f.cpp_name}", '
+            f' {"self" if is_method else "nullptr"}, '
+            f' {"true" if is_method else "false"}, args, nargs, kwnames, '
+            "&tpx_dispatch_result);",
+            "        if (tpx_mode_status != 0) return tpx_dispatch_result;",
+            f'        const int tpx_function_status = '
+            f'tpx_py_try_tensor_function_dispatch("{f.cpp_name}", '
+            f' {"self" if is_method else "nullptr"}, '
+            f' {"true" if is_method else "false"}, args, nargs, kwnames, '
+            "&tpx_dispatch_result);",
+            "        if (tpx_function_status != 0) return tpx_dispatch_result;",
+            f'        const int tpx_dispatch_status = '
+            f'tpx_py_try_tensor_subclass_dispatch("{f.cpp_name}", '
+            f'{"self" if is_method else "nullptr"}, '
+            f'{"true" if is_method else "false"}, args, nargs, kwnames, '
+            "&tpx_dispatch_result);",
+            "        if (tpx_dispatch_status != 0) return tpx_dispatch_result;",
+        ]
 
     # Fold surplus positionals into a trailing IntList parameter
     # (t.view(2, 3) == t.view([2, 3])).  This keeps the public call form:
@@ -383,13 +553,17 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
             body.append("        }")
     out.extend(body)
 
-    # Eager type validation with one static kind
-    # table per overload, consumed by tpx_py_check_types right after slot
-    # merging.  Unknown argument types simply skip the check (casters stay
-    # authoritative); this never changes operator support.
+    # Eager type validation with one static kind table per overload.
     off = 1 if is_method else 0
     kind_consts = [_KIND_CONST.get(cpp_arg_type(a.type)) for a in f.args[off:]]
-    if nargs > off and all(kind_consts):
+    if any(kind is None for kind in kind_consts):
+        missing = next(
+            cpp_arg_type(a.type) for a in f.args[off:]
+            if _KIND_CONST.get(cpp_arg_type(a.type)) is None)
+        raise SystemExit(
+            f"native CPython bridge has no type check for C++ type {missing!r} "
+            f"in {f.func_name} ({variant})")
+    if nargs > off:
         out.append('        static const unsigned char tpx_kinds[] = {'
                    + ", ".join(kind_consts) + '};')
         out.append(
@@ -438,8 +612,7 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
         "}",
         "",
     ])
-    return True
-    return fn
+    return None
 
 
 @register_generator("PythonCAPI")
@@ -463,7 +636,6 @@ def _gen_python_capi(ctx: CodegenContext) -> None:
     # property getters.
     property_methods = {"real", "imag"}
     prop_table: list[str] = []
-    skipped = 0
     claimed = plan_groups(ctx.funcs)
     for (variant, cname), fs in sorted(claimed.items()):
         base = f"pyop_{cname}_{variant}"
@@ -472,14 +644,11 @@ def _gen_python_capi(ctx: CodegenContext) -> None:
         ovfns: list[str] = []
         for k, f in enumerate(fs):
             ovfn = f"{base}_ov{k}" if multi else base
-            if _emit_op(out, f, variant, ovfn, own_catch=not multi):
-                docs.append(f.schema.replace("\\", "\\\\").replace('"', '\\"'))
-                ovfns.append(ovfn)
-        if len(ovfns) != len(fs):
-            # Partial group would silently lose an overload; leave the whole
-            # name to the pybind11 surface.
-            skipped += len(fs)
-            continue
+            _emit_op(out, f, variant, ovfn, own_catch=not multi,
+                     dispatch=not multi,
+                     helper_tag=_schema_tag(f, variant, k))
+            docs.append(f.schema.replace("\\", "\\\\").replace('"', '\\"'))
+            ovfns.append(ovfn)
 
         # Multi-overload names dispatch by trying candidates in declaration
         # order; only argument-shape mismatches (std::invalid_argument from
@@ -491,6 +660,27 @@ def _gen_python_capi(ctx: CodegenContext) -> None:
             out.append(
                 f"static PyObject* {base}(PyObject* self, PyObject* const* args,"
                 " Py_ssize_t nargs, PyObject* kwnames) {")
+            dispatch_self = "self" if variant == "method" else "nullptr"
+            dispatch_method = "true" if variant == "method" else "false"
+            out += [
+                "    try {",
+                "        PyObject* tpx_dispatch_result = nullptr;",
+                f'        const int tpx_mode_status = '
+                f'tpx_py_try_function_mode_dispatch("{fs[0].cpp_name}", '
+                f" {dispatch_self}, {dispatch_method}, args, nargs, kwnames, "
+                "&tpx_dispatch_result);",
+                "        if (tpx_mode_status != 0) return tpx_dispatch_result;",
+                f'        const int tpx_function_status = '
+                f'tpx_py_try_tensor_function_dispatch("{fs[0].cpp_name}", '
+                f" {dispatch_self}, {dispatch_method}, args, nargs, kwnames, "
+                "&tpx_dispatch_result);",
+                "        if (tpx_function_status != 0) return tpx_dispatch_result;",
+                f'        const int tpx_dispatch_status = '
+                f'tpx_py_try_tensor_subclass_dispatch("{fs[0].cpp_name}", '
+                f"{dispatch_self}, {dispatch_method}, args, nargs, kwnames, "
+                "&tpx_dispatch_result);",
+                "        if (tpx_dispatch_status != 0) return tpx_dispatch_result;",
+            ]
             # Kind-probe fast path: for positional-only calls, pick the single
             # compatible overload by argument kind instead of throwing on each
             # mismatched candidate (mul_(1.0) etc.).  Enabled only when every
@@ -525,7 +715,6 @@ def _gen_python_capi(ctx: CodegenContext) -> None:
                 out.append("            }")
                 out.append("        }")
                 out.append("    }")
-            out.append("    try {")
             out.append("        std::exception_ptr arg_err;")
             for ovn in ovfns:
                 out.append(f"        try {{ return {ovn}(self, args, nargs, kwnames); }}")

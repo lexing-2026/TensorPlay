@@ -1085,6 +1085,17 @@ Tensor max_pool2d_with_indices_backward_cpu(
     }
     if (grad_output.dim() != 4 || input.dim() != 4)
         TP_THROW(RuntimeError, "max_pool2d_with_indices_backward: Expected 4D input and grad_output");
+    const Tensor& idx_shape_ref = *indices_opt;
+    if (idx_shape_ref.dim() != 4 || idx_shape_ref.size(0) != grad_output.size(0) ||
+        idx_shape_ref.size(1) != grad_output.size(1) ||
+        idx_shape_ref.size(2) != grad_output.size(2) ||
+        idx_shape_ref.size(3) != grad_output.size(3)) {
+        TP_THROW(RuntimeError, "max_pool2d_with_indices_backward: expected grad_output with shape [",
+                 grad_output.size(0), ", ", grad_output.size(1), ", ", grad_output.size(2), ", ",
+                 grad_output.size(3), "] to match indices shape [",
+                 idx_shape_ref.size(0), ", ", idx_shape_ref.size(1), ", ", idx_shape_ref.size(2),
+                 ", ", idx_shape_ref.size(3), "]");
+    }
     Tensor grad_input = Tensor::zeros_like(input);
     const Tensor go = grad_output.contiguous();
     const Tensor idx = indices.contiguous();

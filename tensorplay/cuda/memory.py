@@ -9,7 +9,6 @@ APIs require allocator instrumentation this build does not expose.
 
 import collections
 import contextlib
-import warnings
 from typing import Any
 
 import tensorplay
@@ -30,8 +29,6 @@ __all__ = [
     "memory_stats_as_nested_dict",
     "reset_accumulated_memory_stats",
     "reset_peak_memory_stats",
-    "reset_max_memory_allocated",
-    "reset_max_memory_cached",
     "host_memory_stats",
     "host_memory_stats_as_nested_dict",
     "reset_accumulated_host_memory_stats",
@@ -40,8 +37,6 @@ __all__ = [
     "max_memory_allocated",
     "memory_reserved",
     "max_memory_reserved",
-    "memory_cached",
-    "max_memory_cached",
     "memory_snapshot",
     "memory_summary",
     "list_gpu_processes",
@@ -188,7 +183,6 @@ def reset_peak_memory_stats(device: Any = None) -> None:
     """
     idx = _get_device_index(device, optional=True)
     _lcuda.reset_peak_memory_stats(idx)
-    _lcuda.reset_max_memory_allocated(idx)
 
 
 def host_memory_stats() -> dict[str, Any]:
@@ -213,38 +207,6 @@ def reset_accumulated_host_memory_stats() -> None:
 def reset_peak_host_memory_stats() -> None:
     r"""Reset the "peak" stats tracked by the host memory allocator."""
     pass
-
-
-def reset_max_memory_allocated(device: Any = None) -> None:
-    r"""Reset the starting point in tracking maximum GPU memory occupied by tensors for a given device.
-
-    .. warning::
-        This function now calls :func:`~tensorplay.cuda.reset_peak_memory_stats`, which resets
-        /all/ peak memory stats.
-    """
-    warnings.warn(
-        "tensorplay.cuda.reset_max_memory_allocated now calls tensorplay.cuda.reset_peak_memory_stats, "
-        "which resets /all/ peak memory stats.",
-        FutureWarning,
-        stacklevel=2,
-    )
-    return reset_peak_memory_stats(device=device)
-
-
-def reset_max_memory_cached(device: Any = None) -> None:
-    r"""Reset the starting point in tracking maximum GPU memory managed by the caching allocator for a given device.
-
-    .. warning::
-        This function now calls :func:`~tensorplay.cuda.reset_peak_memory_stats`, which resets
-        /all/ peak memory stats.
-    """
-    warnings.warn(
-        "tensorplay.cuda.reset_max_memory_cached now calls tensorplay.cuda.reset_peak_memory_stats, "
-        "which resets /all/ peak memory stats.",
-        FutureWarning,
-        stacklevel=2,
-    )
-    return reset_peak_memory_stats(device=device)
 
 
 def memory_allocated(device: Any = None) -> int:
@@ -297,26 +259,6 @@ def max_memory_reserved(device: Any = None) -> int:
             ``None`` (default).
     """
     return memory_stats(device=device).get("reserved_bytes.all.peak", 0)
-
-
-def memory_cached(device: Any = None) -> int:
-    r"""Deprecated; see :func:`~tensorplay.cuda.memory_reserved`."""
-    warnings.warn(
-        "tensorplay.cuda.memory_cached has been renamed to tensorplay.cuda.memory_reserved",
-        FutureWarning,
-        stacklevel=2,
-    )
-    return memory_reserved(device=device)
-
-
-def max_memory_cached(device: Any = None) -> int:
-    r"""Deprecated; see :func:`~tensorplay.cuda.max_memory_reserved`."""
-    warnings.warn(
-        "tensorplay.cuda.max_memory_cached has been renamed to tensorplay.cuda.max_memory_reserved",
-        FutureWarning,
-        stacklevel=2,
-    )
-    return max_memory_reserved(device=device)
 
 
 def memory_snapshot(mempool_id=None, include_traces=True):

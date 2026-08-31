@@ -4,7 +4,6 @@
 import functools
 import inspect
 import sys
-import warnings
 from typing import Any, Callable, cast, TypeVar
 
 
@@ -123,20 +122,7 @@ class _DecoratorContextManager:
     """Allow a context manager to be used as a decorator."""
 
     def __call__(self, orig_func: F) -> F:
-        if inspect.isclass(orig_func):
-            warnings.warn(
-                "Decorating classes is deprecated and will be disabled in "
-                "future versions. You should only decorate functions or methods. "
-                "To preserve the current behavior of class decoration, you can "
-                "directly decorate the `__init__` method and nothing else.",
-                FutureWarning,
-                stacklevel=2,
-            )
-            func = cast(F, lambda *args, **kwargs: orig_func(*args, **kwargs))
-        else:
-            func = orig_func
-
-        return cast(F, context_decorator(self.clone, func))
+        return cast(F, context_decorator(self.clone, orig_func))
 
     def __enter__(self) -> None:
         raise NotImplementedError

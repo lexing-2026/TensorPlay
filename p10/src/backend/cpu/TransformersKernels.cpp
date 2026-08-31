@@ -43,14 +43,10 @@ TENSORPLAY_API Tensor cat(const std::vector<Tensor>& tensors, int64_t dim);
 #elif defined(USE_BLAS)
 #include <cblas.h>
 #endif
+#include "cpu/vec/SleefShims.h"
 
-#if defined(__x86_64__) && defined(__GLIBC__)
-extern "C" {
-__m256 _ZGVdN8v_expf(__m256);
-__m512 _ZGVeN16v_expf(__m512);
-}
-#define TP_SDPA_LIBMVEC 1
-#define TP_SDPA_LIBMVEC512 1
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#define TP_SDPA_SLEEF 1
 #endif
 
 namespace tensorplay {
@@ -59,30 +55,21 @@ namespace cpu {
 namespace {
 
 // Vectorized expf: AVX-512 16 lanes -> AVX2 8 lanes -> scalar libm tail.
-// libmvec symbols carry C linkage; dispatch is per-call CPUID so one binary
-// serves Zen4 (AVX-512) and older guests alike.  The target attribute is
-// required because the TU compiles with base x86-64 flags (repo convention:
-// per-function targets, cf. VecUnary.h).
-#if defined(TP_SDPA_LIBMVEC512)
+// The target attribute is required because the TU compiles with base
+// x86-64 flags (repo convention: per-function targets, cf. VecUnary.h).
+#if defined(TP_SDPA_SLEEF)
 __attribute__((target("avx2,avx512f")))
-#elif defined(TP_SDPA_LIBMVEC)
-__attribute__((target("avx2")))
 #endif
 void vexp_f32(const float* x, float* y, int64_t n) {
   int64_t i = 0;
-#if defined(TP_SDPA_LIBMVEC)
-  const bool avx512 =
-#if defined(TP_SDPA_LIBMVEC512)
-      __builtin_cpu_supports("avx512f");
-#else
-      false;
-#endif
+#if defined(TP_SDPA_SLEEF)
+  const bool avx512 = __builtin_cpu_supports("avx512f");
   if (avx512) {
     for (; i + 16 <= n; i += 16)
-      _mm512_storeu_ps(y + i, _ZGVeN16v_expf(_mm512_loadu_ps(x + i)));
+      _mm512_storeu_ps(y + i, tensorplay::tpsleef::exp(_mm512_loadu_ps(x + i)));
   } else if (__builtin_cpu_supports("avx2")) {
     for (; i + 8 <= n; i += 8)
-      _mm256_storeu_ps(y + i, _ZGVdN8v_expf(_mm256_loadu_ps(x + i)));
+      _mm256_storeu_ps(y + i, tensorplay::tpsleef::exp(_mm256_loadu_ps(x + i)));
   }
 #endif
   for (; i < n; ++i) y[i] = std::exp(x[i]);

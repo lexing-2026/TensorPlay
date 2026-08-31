@@ -1,5 +1,4 @@
 #include "python_bindings.h"
-#include "tensorplay/ops/Config.h"
 #include "tensorplay/ops/TensorBindingsGenerated.h"
 #include "tensorplay/ops/TensorCPythonGenerated.h"
 #include "Dispatcher.h"
@@ -412,13 +411,26 @@ void init_ops(py::module_& m) {
     }, "op_name"_a, "device_type"_a = py::none());
 
     // Bind generated functions (includes *_like, transpose, permute, etc.)
-    bind_generated_op_functions(m);
+    // onto the dedicated op-functions submodule; every bound name is then
+    // aliased onto the root module so `from ._C import <op>` keeps resolving
+    // to the same objects.  Hand-written bindings on the root always win.
+    py::module_ variable_functions = m.def_submodule("_VariableFunctions");
+    bind_generated_op_functions(variable_functions);
+    py::object module_dir = py::module_::import("builtins").attr("dir");
+    for (py::handle h : module_dir(variable_functions)) {
+        const std::string name = py::str(h);
+        if (name.empty() || name[0] == '_') {
+            continue;
+        }
+        if (PyObject_HasAttrString(m.ptr(), name.c_str())) {
+            continue;
+        }
+        m.attr(name.c_str()) = variable_functions.attr(name.c_str());
+    }
 
     // NOTE: the METH_FASTCALL layer (register_generated_cpython_functions)
     // is installed at the end of PYBIND11_MODULE so it can never shadow a
     // hand-written pybind overload -- it only fills names nothing else bound.
 
-    // Config
-    m.def("_show_config", &tensorplay::show_config);
-    
+
 }

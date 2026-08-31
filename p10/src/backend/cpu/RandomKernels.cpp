@@ -3,6 +3,7 @@
 #include "Generator.h"
 #include "DistributionsHelper.h"
 #include "DistributionDispatch.h"
+#include "TensorIterator.h"
 #include "Exception.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 #include <algorithm>
@@ -10,6 +11,7 @@
 #include <cstdint>
 #include <limits>
 #include <vector>
+#include <utility>
 
 namespace tensorplay {
 namespace cpu {
@@ -195,11 +197,23 @@ void for_each_element_pair(const Tensor& a, const Tensor& b, Func&& fn) {
 
 } // namespace
 
-Tensor bernoulli_kernel(const Tensor& self) {
+template <typename prob_t>
+void validate_bernoulli_probabilities(const Tensor& probabilities) {
+    for_each_element_const<prob_t>(probabilities, [](const prob_t& value) {
+        const double p = static_cast<double>(value);
+        if (!(p >= 0.0 && p <= 1.0)) {
+            TP_THROW(ValueError,
+                     "bernoulli_ expects probability values in [0, 1]");
+        }
+    });
+}
+
+Tensor bernoulli_kernel(const Tensor& self, std::optional<Generator> generator) {
     Tensor out(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
-    auto& gen = default_generator();
+    Generator& gen = generator.has_value() ? *generator : default_generator();
 
     if (self.dtype() == DType::Float32) {
+        validate_bernoulli_probabilities<float>(self);
         // rand() (24-bit mantissa mask) and compares strictly against p.
         float* res = out.data_ptr<float>();
         for_each_element_const<float>(self, [&](const float& p) {
@@ -208,6 +222,7 @@ Tensor bernoulli_kernel(const Tensor& self) {
             *res++ = u < static_cast<double>(p) ? 1.0f : 0.0f;
         });
     } else if (self.dtype() == DType::Float64) {
+        validate_bernoulli_probabilities<double>(self);
         double* res = out.data_ptr<double>();
         uniform_real_distribution<double> uniform(0.0, 1.0);
         for_each_element_const<double>(self, [&](const double& p) {
@@ -216,12 +231,14 @@ Tensor bernoulli_kernel(const Tensor& self) {
     } else if (self.dtype() == DType::Float16 || self.dtype() == DType::BFloat16) {
         // Probabilities are read in float precision; output keeps self dtype.
         if (self.dtype() == DType::Float16) {
+            validate_bernoulli_probabilities<Half>(self);
             Half* res = out.data_ptr<Half>();
             uniform_real_distribution<double> uniform(0.0, 1.0);
             for_each_element_const<Half>(self, [&](const Half& p) {
                 *res++ = static_cast<Half>(uniform(&gen) < static_cast<double>(p) ? 1.0f : 0.0f);
             });
         } else {
+            validate_bernoulli_probabilities<BFloat16>(self);
             BFloat16* res = out.data_ptr<BFloat16>();
             uniform_real_distribution<double> uniform(0.0, 1.0);
             for_each_element_const<BFloat16>(self, [&](const BFloat16& p) {
@@ -231,6 +248,136 @@ Tensor bernoulli_kernel(const Tensor& self) {
     } else {
         TP_THROW(NotImplementedError, "bernoulli only supports floating dtype inputs");
     }
+    return out;
+}
+
+template <typename output_t, typename prob_t>
+void bernoulli_tensor_loop(TensorIterator& iter, Generator* generator) {
+    uniform_real_distribution<double> uniform(0.0, 1.0);
+    iter.for_each([&](char** data, const int64_t* strides, int64_t n) {
+        auto* output = reinterpret_cast<output_t*>(data[0]);
+        const auto* probabilities = reinterpret_cast<const prob_t*>(data[1]);
+        for (int64_t i = 0; i < n; ++i) {
+            const auto* probability = reinterpret_cast<const prob_t*>(
+                reinterpret_cast<const char*>(probabilities) + i * strides[1]);
+            auto* value = reinterpret_cast<output_t*>(
+                reinterpret_cast<char*>(output) + i * strides[0]);
+            *value = static_cast<output_t>(
+                uniform(generator) < static_cast<double>(*probability));
+        }
+    });
+}
+
+template <typename output_t>
+void bernoulli_tensor_loop_for_probability_dtype(
+        TensorIterator& iter, const Tensor& probabilities, Generator* generator) {
+    switch (probabilities.dtype()) {
+        case DType::Float32:
+            bernoulli_tensor_loop<output_t, float>(iter, generator);
+            return;
+        case DType::Float64:
+            bernoulli_tensor_loop<output_t, double>(iter, generator);
+            return;
+        case DType::Float16:
+            bernoulli_tensor_loop<output_t, Half>(iter, generator);
+            return;
+        case DType::BFloat16:
+            bernoulli_tensor_loop<output_t, BFloat16>(iter, generator);
+            return;
+        default:
+            TP_THROW(TypeError,
+                     "bernoulli_ probability tensor must have a floating dtype");
+    }
+}
+
+Tensor& bernoulli_tensor_inplace_kernel(
+        Tensor& self, const Tensor& probabilities,
+        std::optional<Generator> generator) {
+    if (self.device() != probabilities.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "bernoulli_: probability tensor must be on the same device");
+    }
+    if (self.numel() == 0) return self;
+    check_writable_inplace(self);
+    switch (probabilities.dtype()) {
+        case DType::Float32:
+            validate_bernoulli_probabilities<float>(probabilities);
+            break;
+        case DType::Float64:
+            validate_bernoulli_probabilities<double>(probabilities);
+            break;
+        case DType::Float16:
+            validate_bernoulli_probabilities<Half>(probabilities);
+            break;
+        case DType::BFloat16:
+            validate_bernoulli_probabilities<BFloat16>(probabilities);
+            break;
+        default:
+            TP_THROW(TypeError,
+                     "bernoulli_ probability tensor must have a floating dtype");
+    }
+
+    TensorIterator iter = TensorIteratorConfig()
+        .add_output(self)
+        .add_const_input(probabilities)
+        .check_all_same_dtype(false)
+        .build();
+    Generator& gen = generator.has_value() ? *generator : default_generator();
+#define TP_BERNOULLI_OUTPUT_CASE(ctype, name) \
+    case DType::name: \
+        bernoulli_tensor_loop_for_probability_dtype<ctype>(iter, probabilities, &gen); \
+        break;
+    switch (self.dtype()) {
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_BERNOULLI_OUTPUT_CASE)
+        default:
+            TP_THROW(NotImplementedError,
+                     "bernoulli_ output dtype is not supported");
+    }
+#undef TP_BERNOULLI_OUTPUT_CASE
+    return self;
+}
+
+Tensor& bernoulli_out_kernel(const Tensor& self,
+                             std::optional<Generator> generator,
+                             Tensor& out) {
+    if (self.device() != out.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "bernoulli: output must be on the same device as input");
+    }
+    tpx::ops::resize_(out, static_cast<std::vector<int64_t>>(self.shape()));
+    return bernoulli_tensor_inplace_kernel(out, self, std::move(generator));
+}
+
+Tensor& bernoulli_scalar_inplace_kernel(
+        Tensor& self, double p, std::optional<Generator> generator) {
+    if (!(p >= 0.0 && p <= 1.0)) {
+        TP_THROW(ValueError, "bernoulli_ expects p to be in [0, 1]");
+    }
+    if (self.numel() == 0) return self;
+    check_writable_inplace(self);
+    Generator& gen = generator.has_value() ? *generator : default_generator();
+    uniform_real_distribution<double> uniform(0.0, 1.0);
+#define TP_BERNOULLI_SCALAR_CASE(ctype, name) \
+    case DType::name: \
+        for_each_element<ctype>(self, [&](ctype& value) { \
+            value = static_cast<ctype>(uniform(&gen) < p); \
+        }); \
+        break;
+    switch (self.dtype()) {
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_BERNOULLI_SCALAR_CASE)
+        default:
+            TP_THROW(NotImplementedError,
+                     "bernoulli_ output dtype is not supported");
+    }
+#undef TP_BERNOULLI_SCALAR_CASE
+    return self;
+}
+
+Tensor bernoulli_p_kernel(const Tensor& self, double p,
+                          std::optional<Generator> generator) {
+    Tensor out(static_cast<std::vector<int64_t>>(self.shape()),
+               self.dtype(), self.device());
+    bernoulli_scalar_inplace_kernel(out, p, std::move(generator));
     return out;
 }
 
@@ -364,8 +511,9 @@ Tensor& log_normal_kernel(Tensor& self, double mean, double std) {
     return self;
 }
 
-Tensor& normal_inplace_kernel(Tensor& self, double mean, double std) {
-    auto& gen = default_generator();
+Tensor& normal_inplace_kernel(Tensor& self, double mean, double std,
+                              std::optional<Generator> generator) {
+    Generator& gen = generator.has_value() ? *generator : default_generator();
     TP_THROW_IF(std < 0.0, RuntimeError, "normal expects std >= 0.0, but found std ", std);
     if (self.numel() == 0) return self;
     check_writable_inplace(self);
@@ -492,9 +640,12 @@ Tensor& uniform_kernel(Tensor& self, double from, double to) {
 
 TENSORPLAY_LIBRARY_IMPL(CPU, RandomKernels) {
     m.impl("bernoulli", bernoulli_kernel);
+    m.impl("bernoulli.out", bernoulli_out_kernel);
+    m.impl("bernoulli.p", bernoulli_p_kernel);
     m.impl("normal", normal_kernel);
     m.impl("poisson", poisson_kernel);
-    m.impl("bernoulli_", bernoulli_inplace_kernel);
+    m.impl("bernoulli_.Tensor", bernoulli_tensor_inplace_kernel);
+    m.impl("bernoulli_.float", bernoulli_scalar_inplace_kernel);
     m.impl("cauchy_", cauchy_kernel);
     m.impl("exponential_", exponential_kernel);
     m.impl("geometric_", geometric_kernel);

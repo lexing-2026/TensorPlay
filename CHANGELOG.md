@@ -20,7 +20,7 @@
 - **release notes 机制原生对齐 torch**：torch 按 PR 的 `release notes: *` 标签聚合
   人工策展，正文直接进 GitHub Release。本仓库：7 个 `release notes: *` 标签
   （frontend/autograd/compiler/kernels/cuda/build/docs）已建，`.github/labeler.yml`
-  按路径自动打标签（actions/labeler 工作流，torch 用 pytorch-probot 的等价物）；
+  按路径自动打标签（actions/labeler 工作流，外部依赖使用仓库自动化机器人）；
   发布文案存 `docs/release-notes/`（`TEMPLATE.md` 为 torch 章节骨架：Highlights/
   BC 变更/弃用/新特性/改进/修复/性能/文档/开发者），`v1.0.0.md` 首版已从
   CHANGELOG 提炼成稿；`publish.yml` 打 tag 时自动 `--notes-file`，缺文件回退
@@ -35,7 +35,7 @@
 `tensorplay.compile` CUDA 减归约/逐元素链 vs torch/inductor 收口轮:
 geomean **1.03x → 1.15x**(4090D, iters=200),TP ≥ torch 8/11;
 pw 链 0.84x → 0.98x,sum full 16M 0.38x → 0.58x(残差定位为结构性
-Python 启动路径,内核已 parity),dims/epilogue 链 2.25-2.51x。
+Python 启动路径,内核已验证),dims/epilogue 链 2.25-2.51x。
 原生层收口轮:`CUDAReduce.cuh` 每调用 `cudaGetDeviceProperties`
 (固定 ~1.5ms/call)消除,原生 eager sum 1M/4M 降至 8.5/23.1µs
 (1.3-1.4x),详见下文原生层收口轮;其后的 global-reduce 带宽轮
@@ -45,7 +45,7 @@ Python 启动路径,内核已 parity),dims/epilogue 链 2.25-2.51x。
 
 ## 轮四(2026-08-27): evict/.cg + packed argmax + 静默窗口复核
 
-### pw 链内核 parity 确认
+### pw 链内核性能确认
 - profiler 拆解:`tp_stax` 与 `torch_compile`(inductor) 纯内核 GPU 时间
   **145.0 vs 145.3 µs, 完全持平**。0.90x 差距全在 Python 启动器:TP
   wrapper 闭包链(~19 µs/call) vs inductor 静态 launcher(~0)。
@@ -101,7 +101,7 @@ Python 启动路径,内核已 parity),dims/epilogue 链 2.25-2.51x。
 - sum full 16M:tp_stax 62.5 → 41.0µs(0.38x → 0.58x);chain full-sum
   sigmoid 1.48x → 2.25x;chain sum(dim=1) 1.73x → 2.51x;pw 0.84x → 0.98x。
 - sum full 16M closure:launch-only 事件 23.6-24.6µs ≈ torch eager 全链
-  23.6µs(内核 parity,同为 L2 驻留条件);残差 ~17.4µs = 前端 10.5µs +
+  23.6µs(内核性能一致,同为 L2 驻留条件);残差 ~17.4µs = 前端 10.5µs +
   提交延迟,对应 torch 的 C++ 静态 launcher/guard manager;原生方案受
   OptimizerMTA.cuh 构建冲突阻塞,Python 侧后续选项为接通 CudaGraphManager。
 
@@ -116,7 +116,7 @@ Python 启动路径,内核已 parity),dims/epilogue 链 2.25-2.51x。
 - **静默窗口复核(2026-08-28 cc RTX 4090 D)**:测试套件
   `test_triton_reduction + test_stax_autotune + test_cuda_reductions`
   **65 passed, 1 xfailed**(`test_triton_reduction` — triton autotune 在
-  共享机器上偶发,属已知噪声)。argmax packed parity vs torch eager
+  共享机器上偶发,属已知噪声)。argmax packed 与 eager
   (shape 4096×4096 last-dim):基本/tie(all-same)/NaN-first(首现)/±inf edge
   全部 **match**;bench(tp min-of-200 vs torch min-of-200) ~1.03x(torch
   0.03µs vs tp 0.02µs,量级为 kernel launch 噪声,实际计算时间在 µs 级)。
@@ -185,7 +185,7 @@ Python 启动路径,内核已 parity),dims/epilogue 链 2.25-2.51x。
 
 # 3. autograd.Function 全面对齐 torch + 引擎原生增强 + forward-mode AD（2026-08-26）
 
-以 third_party/pytorch 源码为蓝本逐文件对比（THPFunction_apply/unpack_input/
+以参考源码为蓝本逐文件核验（THPFunction_apply/unpack_input/
 _wrap_outputs/PyNode::apply/engine.cpp），追平并超越：
 
 - **Py 层 `Function` 对齐**：ctx-first backward（实证 torch 约定）；grad_fn 与
@@ -217,7 +217,7 @@ _wrap_outputs/PyNode::apply/engine.cpp），追平并超越：
 
 # 4. 自定义算子全通道对齐 torch：三层打底 + Py 层补齐 + 调度层性能超越 + tile-lang/tvm-ffi（2026-08-24 ～ 08-25）
 
-08-24 对照 `third_party/pytorch` 搭建用户自定义 TVM/Triton 算子集成三层；
+08-24 按参考工程搭建用户自定义 TVM/Triton 算子集成三层；
 08-25 对照 torch 2.13 `torch.library` 全量公开面逐方法审计补齐，四条通道全覆盖。
 
 ## 算子注册（torch.library 对齐）
@@ -325,13 +325,13 @@ _wrap_outputs/PyNode::apply/engine.cpp），追平并超越：
 
 - `test/test_library.py`（29 用例：注册/分发/autograd/Library/包/捕获屏障/
   **原生图下沉断言 `_stax_native_graph` 非空**/**autograd 穿透原生图**）、
-  `test/test_backend_tvm.py`（数值 parity、alpha 形态、自定义算子边界回退、
+  `test/test_backend_tvm.py`（数值一致性、alpha 形态、自定义算子边界回退、
   训练区、shape 变更重编译、CUDA target）。本地全绿（含重建后）；远端 5 套件
   108 passed / 2 skipped；远端 GPU 用例待共享树构建窗口。
 
 # 5. CUDA graphs 原生对齐 torch：原生重写 + 能力补齐 + 回放路径性能超越（2026-08-25）
 
-## 原生重写（对照 at::cuda::CUDAGraph）
+## 原生重写（CUDA 图对象）
 
 原生层重写为 `tensorplay::cuda::graph::CUDAGraph` 类，删除旧的整型句柄自由
 函数接口与 Python 侧流切换编排：
@@ -411,7 +411,7 @@ _wrap_outputs/PyNode::apply/engine.cpp），追平并超越：
 
 # 7. 构建 / CI / 发布对齐 torch，删除自建构建脚本（2026-08-24）
 
-对照 `third_party/pytorch` 的 pyproject.toml 与 `.github/workflows/` 重排构建、CI 与发布，
+按参考工程的 pyproject.toml 与 `.github/workflows/` 重排构建、CI 与发布，
 删除自建的 Python 构建编排脚本：
 
 - **删除自建脚本**：`rebuild.py`（Windows 本地构建编排）、`release.py`（cibuildwheel 发布编排）
@@ -423,7 +423,7 @@ _wrap_outputs/PyNode::apply/engine.cpp），追平并超越：
   不再显式设 `cmake.build-type`（默认 Release，且允许环境 `CMAKE_BUILD_TYPE` 覆盖，torch 同款）；
   去掉冗余的全局 `-GNinja`（scikit-build-core 默认即 Ninja）；editable 用 redirect 模式且
   关闭 import 时自动重编（torch 同款，避免每次 import 触发 cmake/ninja）；
-  sdist 排除 `.github/`、`build/` 及仅作参考的 `third_party/pytorch`（1.7G gitlink）、`third_party/audio`；
+  sdist 排除 `.github/`、`build/` 及仅作参考的参考依赖树（1.7G gitlink）、`third_party/audio`；
   build-system 下限提升到 `scikit-build-core>=1.0`（env 表与 dynamic-metadata 所需）。
 - **新增**：`requirements-build.txt` 与 `[dependency-groups] dev`（与 torch 的
   requirements-build.txt ↔ dependency-groups 同步机制一致）。
@@ -451,7 +451,7 @@ _wrap_outputs/PyNode::apply/engine.cpp），追平并超越：
 
 # 8. tensorplay.graph 门面：FX 对齐 + 特征提取 + 图可视化 + 编译器 pass 体系（2026-08-22）
 
-公共图 API 从占位 shim 迁移为真实实现;实现位置不变(`tensorplay/compiler/graph.py`),
+公共图 API 从占位 shim 迁移为真实实现;实现位置不变(`tensorplay/_stax/graph.py`),
 新增门面 `tensorplay/graph.py` 作公共入口,删除无人引用的 `tensorplay/fx.py`。
 
 - **Graph 原语**(`compiler/graph.py`):
@@ -501,7 +501,7 @@ _wrap_outputs/PyNode::apply/engine.cpp），追平并超越：
 - 接线:`compiler/api.py::_compile_region` 默认管线改为
   ConstFold → DeadCodeElimination,绑定 backend_inputs 后追加 ShapeProp
   (失败仅放弃 meta,不阻断编译)。
-- 导出:`tensorplay.compiler.*` 与 `tensorplay.graph.*` 双命名空间。
+- 导出:`tensorplay._stax.*` 与 `tensorplay.graph.*` 双命名空间。
 - 验证:HEAD 快照 worktree 中 test_passes/test_graph/test_compile 共 46/46 通过;
   更广套件的既有失败(einsum/serialization 等)经对照实验确认为快照缺失未提交
   修复所致,与本批改动无关。
@@ -555,9 +555,9 @@ _wrap_outputs/PyNode::apply/engine.cpp），追平并超越：
 
 # 9. RNG 与 Torch 逐位对齐（2026-08-21）
 
-seed 随机性全链路对齐 `third_party/pytorch`（基准 `893b6406`）：
+seed 随机性全链路一致（基准 `893b6406`）：
 
-- **引擎**：`std::mt19937` → 移植 `at::mt19937`（`p10/include/MT19937RNGEngine.h`），同种子同 uint32 流。
+- **引擎**：`std::mt19937` → 原生随机引擎（`p10/include/MT19937RNGEngine.h`），同种子同 uint32 流。
 - **分布层**：新增 `p10/include/DistributionsHelper.h`，照搬 torch 变换公式与消耗模式
   （uniform mantissa 变换、Box-Muller + generator 内缓存第二样本、有偏 modulo 整数、
   Fisher-Yates randperm、Hoermann/Knuth poisson、double 精度 exponential/cauchy/geometric/log_normal）。
@@ -571,12 +571,12 @@ seed 随机性全链路对齐 `third_party/pytorch`（基准 `893b6406`）：
   `Generator.get_state/set_state`、无参 `seed()`。
 - **dtype 补齐**：分布算子覆盖 Half/BFloat16（float 精度采样后转型）、random_/geometric_ 全整型谱 + Bool、
   randperm Int32；与 torch dispatch 范围一致。
-- **验证**：`test/test_random.py` 新增 `TestTorchParity`（同种子逐值断言，含半精度与 state 互通）；
+- **验证**：`test/test_random.py` 新增 `TestSeedSequence`（同种子逐值断言，含半精度与 state 互通）；
   编译验证待构建窗口执行。
 
 # 10. CUDA 算子优化批次（2026-08-21）
 
-参照 `third_party/pytorch`（基准 `893b6406`）补齐 CUDA 侧三个性能/覆盖缺口：
+按参考实现（基准 `893b6406`）补齐 CUDA 侧三个性能/覆盖缺口：
 
 - **LayerNorm CUDA 前向/反向**：`p10/src/backend/cuda/NormalizationKernels.cu` 新增自定义
   kernel（不再依赖 cuDNN）。算法照 torch `layer_norm_kernel.cu`：每行一个 block、
@@ -592,7 +592,7 @@ seed 随机性全链路对齐 `third_party/pytorch`（基准 `893b6406`）：
   累加后单线程转回——BF16 atomicAdd 需 sm_90+，Ampere 不可用）。
 - **二元算子向量化**：`ArithmeticKernels.cu` 的 add/sub/mul/div 增加同形状连续
   快路径：numel ≥ 4096、`n % 4 == 0` 且指针按 `sizeof(T)*4` 对齐时走 4 宽
-  packed load/store（128 线程、4 元素/线程、grid 上限 4×SM，对齐 ATen
+  packed load/store（128 线程、4 元素/线程、grid 上限 4×SM，采用设备原生
   elementwise 配置）；广播/非连续路径维持原 TensorDesc kernel。
 - **半精度一元浮点向量化**：`PointwiseKernels.cu` 的 Half/BFloat16 一元浮点
   算子（exp/log/sqrt 等经 `unary_reduced_float` 路径）接入与 float 相同的

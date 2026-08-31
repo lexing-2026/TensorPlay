@@ -15,9 +15,9 @@ def probe_calls(monospace=None):
         )
         return graph_module.forward
 
-    tp.compiler.register_backend(name="p2_probe")(backend)
+    tp._stax.register_backend(name="p2_probe")(backend)
     yield calls
-    tp.compiler.unregister_backend("p2_probe")
+    tp._stax.unregister_backend("p2_probe")
 
 
 def _branch_on_shape(x):
@@ -75,13 +75,13 @@ def test_metadata_touches_recorded_on_graph_module():
         captured["touches"] = getattr(graph_module, "meta", {}).get("metadata_touches")
         return graph_module.forward
 
-    tp.compiler.register_backend(name="p2_spy")(spy)
+    tp._stax.register_backend(name="p2_spy")(spy)
     try:
         # compile() resolves the backend at wrapper creation time.
         compiled = tp.compile(_branch_on_shape, backend="p2_spy", dynamic=True)
         compiled(tp.tensor([1.0]))
     finally:
-        tp.compiler.unregister_backend("p2_spy")
+        tp._stax.unregister_backend("p2_spy")
 
     touches = {name for name, _attr in captured["touches"]}
     assert "x" in touches

@@ -6,19 +6,19 @@ from types import SimpleNamespace
 import pytest
 
 import tensorplay as tp
-from tensorplay.compiler.runtime import stax_autotune as sa
-from tensorplay.compiler.runtime.stax_autotune import CANDIDATE_CONFIGS
-from tensorplay.compiler.runtime.stax_autotune import CANDIDATE_CONFIGS
-from tensorplay.compiler.codegen import triton as st
-from tensorplay.compiler.codegen.triton import TritonProgramCodegen
-from tensorplay.compiler.codecache import CodeCache
+from tensorplay._stax.runtime import stax_autotune as sa
+from tensorplay._stax.runtime.stax_autotune import CANDIDATE_CONFIGS
+from tensorplay._stax.runtime.stax_autotune import CANDIDATE_CONFIGS
+from tensorplay._stax.codegen import triton as st
+from tensorplay._stax.codegen.triton import TritonProgramCodegen
+from tensorplay._stax.codecache import CodeCache
 
 
 @pytest.fixture()
 def cache_root(tmp_path, monkeypatch):
     monkeypatch.setenv("TP_CACHE_DIR", str(tmp_path))
     # default_cache memoizes per process; reset for isolation.
-    import tensorplay.compiler.codecache as cc
+    import tensorplay._stax.codecache as cc
 
     monkeypatch.setattr(cc, "_default_caches", {})
     return tmp_path
@@ -253,7 +253,7 @@ def test_program_digest_shape_independent():
 @pytest.mark.skipif(not tp.cuda.is_available(), reason="CUDA required")
 @pytest.mark.skipif(not st.runtime_available(), reason="triton cannot target this device")
 def test_bench_launch_returns_positive_ms():
-    from tensorplay.compiler.codegen.triton import _compile_program
+    from tensorplay._stax.codegen.triton import _compile_program
 
     pytest.importorskip("triton")
     args = _cuda_inputs()
@@ -269,10 +269,10 @@ def test_autotune_launch_end_to_end(tmp_path, monkeypatch):
     """Full path: first call benchmarks & persists, second call reuses."""
 
     triton = pytest.importorskip("triton")
-    from tensorplay.compiler.codegen import triton as st
+    from tensorplay._stax.codegen import triton as st
 
     monkeypatch.setenv("TP_CACHE_DIR", str(tmp_path))
-    import tensorplay.compiler.codecache as cc
+    import tensorplay._stax.codecache as cc
 
     monkeypatch.setattr(cc, "_default_caches", {})
     st._launch_memo.clear()
@@ -308,11 +308,11 @@ def test_autotune_launch_end_to_end(tmp_path, monkeypatch):
 @pytest.mark.skipif(not st.runtime_available(), reason="triton cannot target this device")
 def test_triton_backward_still_works_through_autotune_path(tmp_path, monkeypatch):
     pytest.importorskip("triton")
-    from tensorplay.compiler.codegen.triton import compile_graph_module
-    from tensorplay.compiler.graph import Tracer
+    from tensorplay._stax.codegen.triton import compile_graph_module
+    from tensorplay.graph import Tracer
 
     monkeypatch.setenv("TP_CACHE_DIR", str(tmp_path))
-    import tensorplay.compiler.codecache as cc
+    import tensorplay._stax.codecache as cc
 
     monkeypatch.setattr(cc, "_default_caches", {})
 
@@ -345,7 +345,7 @@ def test_triton_backward_still_works_through_autotune_path(tmp_path, monkeypatch
 def test_dims_autotune_persists_and_reuses_decision(cache_root, monkeypatch):
     """Sweep candidates once; later compiles reuse the persisted winner."""
 
-    from tensorplay.compiler.codegen.triton import (
+    from tensorplay._stax.codegen.triton import (
         _DIM_REDUCTION_CANDIDATES,
         ReductionSpec,
         _autotune_dims_program,
@@ -400,7 +400,7 @@ def test_dims_autotune_persists_and_reuses_decision(cache_root, monkeypatch):
 
 
 def test_dims_autotune_disabled_uses_static_config(cache_root, monkeypatch):
-    from tensorplay.compiler.codegen.triton import (
+    from tensorplay._stax.codegen.triton import (
         _STATIC_DIM_TRIPLE,
         ReductionSpec,
         _autotune_dims_program,
@@ -419,7 +419,7 @@ def test_dims_autotune_disabled_uses_static_config(cache_root, monkeypatch):
 
 
 def test_dims_autotune_all_fail_falls_back_static(cache_root, monkeypatch):
-    from tensorplay.compiler.codegen.triton import (
+    from tensorplay._stax.codegen.triton import (
         _STATIC_DIM_TRIPLE,
         ReductionSpec,
         _autotune_dims_program,
@@ -440,10 +440,10 @@ def test_dims_autotune_all_fail_falls_back_static(cache_root, monkeypatch):
 
 
 def test_dims_autotune_invalid_cached_config_rebuilds(cache_root, monkeypatch):
-    from tensorplay.compiler.codecache import default_cache
-    from tensorplay.compiler.runtime import stax_autotune as sa
+    from tensorplay._stax.codecache import default_cache
+    from tensorplay._stax.runtime import stax_autotune as sa
     import json as json_mod
-    from tensorplay.compiler.codegen.triton import (
+    from tensorplay._stax.codegen.triton import (
         ReductionSpec,
         _autotune_dims_program,
         _dims_decision_key,
@@ -476,8 +476,8 @@ def test_dims_autotune_rblock_record_roundtrip(cache_root, monkeypatch):
     process re-benchmarked forever)."""
 
     import json as json_mod
-    from tensorplay.compiler.codecache import default_cache
-    from tensorplay.compiler.codegen.triton import (
+    from tensorplay._stax.codecache import default_cache
+    from tensorplay._stax.codegen.triton import (
         _DIM_REDUCTION_CANDIDATES,
         _dims_decision_key,
         ReductionSpec,

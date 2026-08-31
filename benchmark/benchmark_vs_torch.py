@@ -296,7 +296,7 @@ def run_case(name, make_args, tp_fn, torch_fn, warmup=10, iters=50,
     rows["tp_eager"] = _time_tp(tp_fn, tp_args, warmup, iters)
 
     if compile_tp:
-        from tensorplay.compiler import compile as tp_compile
+        from tensorplay._stax import compile as tp_compile
 
         optimized = tp_compile(tp_fn, backend="stax")
         # First call compiles; exclude via warmup inside timing helper.

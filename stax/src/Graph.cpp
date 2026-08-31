@@ -12,6 +12,8 @@ namespace stax {
 
 namespace {
 
+thread_local CaptureState capture_state;
+
 const std::vector<int64_t>* int_list_attr(
     const OpNode& node,
     const std::string& key) {
@@ -81,6 +83,43 @@ Tensor execute_fused_pointwise_cpu(
 }
 
 } // namespace
+
+void enterCaptureState(bool compiling, bool exporting, bool disabled) {
+    if (compiling) {
+        ++capture_state.compile_depth;
+    }
+    if (exporting) {
+        ++capture_state.exporting_depth;
+    }
+    if (disabled) {
+        ++capture_state.disabled_depth;
+    }
+}
+
+void exitCaptureState(bool compiling, bool exporting, bool disabled) {
+    if (compiling && capture_state.compile_depth == 0) {
+        throw std::runtime_error("Stax capture compile state underflow");
+    }
+    if (exporting && capture_state.exporting_depth == 0) {
+        throw std::runtime_error("Stax capture export state underflow");
+    }
+    if (disabled && capture_state.disabled_depth == 0) {
+        throw std::runtime_error("Stax capture disabled state underflow");
+    }
+    if (compiling) {
+        --capture_state.compile_depth;
+    }
+    if (exporting) {
+        --capture_state.exporting_depth;
+    }
+    if (disabled) {
+        --capture_state.disabled_depth;
+    }
+}
+
+CaptureState currentCaptureState() {
+    return capture_state;
+}
 
 OpNode::OpNode(Graph* g, std::string type, std::string n) 
     : owningGraph(g), op_type(type), name(n) {}

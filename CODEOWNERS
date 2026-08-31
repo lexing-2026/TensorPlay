@@ -13,7 +13,7 @@
 
 # Stax compiler and tensorplay.compile
 /stax/ @lexing-2026
-/tensorplay/compiler/ @lexing-2026
+/tensorplay/_stax/ @lexing-2026
 
 # p10 core library and CPU/CUDA kernels
 /p10/ @lexing-2026

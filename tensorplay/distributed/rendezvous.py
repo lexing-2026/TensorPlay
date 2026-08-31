@@ -160,7 +160,7 @@ def _agent_store_serves(hostname, port) -> bool:
     )
 
 
-def _create_c10d_store(
+def _create_core_store(
     hostname, port, rank, world_size, timeout,
 ) -> Store:
     """
@@ -214,7 +214,7 @@ def _tcp_rendezvous_handler(
     if result.hostname is None:
         raise AssertionError("hostname cannot be None")
 
-    store = _create_c10d_store(result.hostname, result.port, rank, world_size, timeout)
+    store = _create_core_store(result.hostname, result.port, rank, world_size, timeout)
 
     yield (store, rank, world_size)
 
@@ -231,12 +231,12 @@ def _env_rendezvous_handler(
     def _env_error(var):
         return _error(f"environment variable {var} expected, but not set")
 
-    def _get_env_or_raise(env_var: str) -> str:
-        env_val = os.environ.get(env_var, None)
-        if not env_val:
-            raise _env_error(env_var)
-        else:
-            return env_val
+    def _get_env_or_raise(env_var: str, fallbacks: tuple = ()) -> str:
+        for candidate in (env_var, *fallbacks):
+            env_val = os.environ.get(candidate, None)
+            if env_val:
+                return env_val
+        raise _env_error(env_var)
 
     result = urlparse(url)
     query_dict = _query_to_dict(result.query)
@@ -249,17 +249,22 @@ def _env_rendezvous_handler(
     if "rank" in query_dict:
         rank = int(query_dict["rank"])
     else:
-        rank = int(_get_env_or_raise("RANK"))
+        # Jobs launched by an MPI runtime export their own rank variables;
+        # accept them when RANK is absent.
+        rank = int(_get_env_or_raise(
+            "RANK", ("OMPI_COMM_WORLD_RANK", "PMI_RANK", "SLURM_PROCID")))
 
     if "world_size" in query_dict:
         world_size = int(query_dict["world_size"])
     else:
-        world_size = int(_get_env_or_raise("WORLD_SIZE"))
+        world_size = int(_get_env_or_raise(
+            "WORLD_SIZE",
+            ("OMPI_COMM_WORLD_SIZE", "PMI_SIZE", "SLURM_NPROCS")))
 
     master_addr = _get_env_or_raise("MASTER_ADDR")
     master_port = int(_get_env_or_raise("MASTER_PORT"))
 
-    store = _create_c10d_store(master_addr, master_port, rank, world_size, timeout)
+    store = _create_core_store(master_addr, master_port, rank, world_size, timeout)
 
     yield (store, rank, world_size)
 

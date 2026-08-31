@@ -83,7 +83,7 @@ std::tuple<Tensor, Tensor, Tensor> unique_consecutive_dim(
     const Tensor neq_rows = ops::any(
         ops::ne(ops::slice(flat, 0, 1, std::nullopt, 1),
                 ops::slice(flat, 0, std::nullopt, n - 1, 1)),
-        {1}, false);
+        int64_t(1), false);
     const Tensor mark = ops::cat(
         {ops::ones({1}, DType::Bool, dev), neq_rows}, 0);
     const Tensor kept_idx = ops::reshape(ops::nonzero(mark), {-1});

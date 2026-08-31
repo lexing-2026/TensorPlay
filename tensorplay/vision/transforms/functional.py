@@ -71,7 +71,7 @@ def get_dimensions(img: Tensor) -> list[int]:
     Returns:
         List[int]: The image dimensions.
     """
-    if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
+    if not tensorplay.compiler.is_compiling():
         _log_api_usage_once(get_dimensions)
     if isinstance(img, tensorplay.Tensor):
         return F_t.get_dimensions(img)
@@ -88,7 +88,7 @@ def get_image_size(img: Tensor) -> list[int]:
     Returns:
         List[int]: The image size.
     """
-    if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
+    if not tensorplay.compiler.is_compiling():
         _log_api_usage_once(get_image_size)
     if isinstance(img, tensorplay.Tensor):
         return F_t.get_image_size(img)
@@ -105,7 +105,7 @@ def get_image_num_channels(img: Tensor) -> int:
     Returns:
         int: The number of channels.
     """
-    if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
+    if not tensorplay.compiler.is_compiling():
         _log_api_usage_once(get_image_num_channels)
     if isinstance(img, tensorplay.Tensor):
         return F_t.get_image_num_channels(img)
@@ -113,12 +113,12 @@ def get_image_num_channels(img: Tensor) -> int:
     return F_pil.get_image_num_channels(img)
 
 
-@tensorplay.jit.unused
+@tensorplay.compiler.unused
 def _is_numpy(img: Any) -> bool:
     return isinstance(img, np.ndarray)
 
 
-@tensorplay.jit.unused
+@tensorplay.compiler.unused
 def _is_numpy_image(img: Any) -> bool:
     return img.ndim in {2, 3}
 
@@ -134,7 +134,7 @@ def to_tensor(pic: Union[PILImage, np.ndarray]) -> Tensor:
     Returns:
         Tensor: Converted image.
     """
-    if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
+    if not tensorplay.compiler.is_compiling():
         _log_api_usage_once(to_tensor)
     if not (F_pil._is_pil_image(pic) or _is_numpy(pic)):
         raise TypeError(f"pic should be PIL Image or ndarray. Got {type(pic)}")
@@ -191,7 +191,7 @@ def pil_to_tensor(pic: Any) -> Tensor:
     Returns:
         Tensor: Converted image.
     """
-    if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
+    if not tensorplay.compiler.is_compiling():
         _log_api_usage_once(pil_to_tensor)
     if not F_pil._is_pil_image(pic):
         raise TypeError(f"pic should be PIL Image. Got {type(pic)}")
@@ -232,7 +232,7 @@ def convert_image_dtype(image: tensorplay.Tensor, dtype: tensorplay.dtype = tens
             overflow errors since the floating point ``dtype`` cannot store consecutive integers over the whole range
             of the integer ``dtype``.
     """
-    if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
+    if not tensorplay.compiler.is_compiling():
         _log_api_usage_once(convert_image_dtype)
     if not isinstance(image, tensorplay.Tensor):
         raise TypeError("Input img should be Tensor Image")
@@ -254,7 +254,7 @@ def to_pil_image(pic, mode=None):
     Returns:
         PIL Image: Image converted to PIL Image.
     """
-    if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
+    if not tensorplay.compiler.is_compiling():
         _log_api_usage_once(to_pil_image)
 
     if isinstance(pic, tensorplay.Tensor):
@@ -339,7 +339,7 @@ def normalize(tensor: Tensor, mean: list[float], std: list[float], inplace: bool
     Returns:
         Tensor: Normalized Tensor image.
     """
-    if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
+    if not tensorplay.compiler.is_compiling():
         _log_api_usage_once(normalize)
     if not isinstance(tensor, tensorplay.Tensor):
         raise TypeError(f"img should be Tensor Image. Got {type(tensor)}")
@@ -436,7 +436,7 @@ def resize(
     Returns:
         PIL Image or Tensor: Resized image.
     """
-    if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
+    if not tensorplay.compiler.is_compiling():
         _log_api_usage_once(resize)
 
     if isinstance(interpolation, int):
@@ -513,7 +513,7 @@ def pad(img: Tensor, padding: list[int], fill: Union[int, float] = 0, padding_mo
     Returns:
         PIL Image or Tensor: Padded image.
     """
-    if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
+    if not tensorplay.compiler.is_compiling():
         _log_api_usage_once(pad)
     if not isinstance(img, tensorplay.Tensor):
         return F_pil.pad(img, padding=padding, fill=fill, padding_mode=padding_mode)
@@ -538,7 +538,7 @@ def crop(img: Tensor, top: int, left: int, height: int, width: int) -> Tensor:
         PIL Image or Tensor: Cropped image.
     """
 
-    if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
+    if not tensorplay.compiler.is_compiling():
         _log_api_usage_once(crop)
     if not isinstance(img, tensorplay.Tensor):
         return F_pil.crop(img, top, left, height, width)
@@ -560,7 +560,7 @@ def center_crop(img: Tensor, output_size: list[int]) -> Tensor:
     Returns:
         PIL Image or Tensor: Cropped image.
     """
-    if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
+    if not tensorplay.compiler.is_compiling():
         _log_api_usage_once(center_crop)
     if isinstance(output_size, numbers.Number):
         output_size = (int(output_size), int(output_size))
@@ -637,7 +637,7 @@ def resized_crop(
     Returns:
         PIL Image or Tensor: Cropped image.
     """
-    if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
+    if not tensorplay.compiler.is_compiling():
         _log_api_usage_once(resized_crop)
     img = crop(img, top, left, height, width)
     img = resize(img, size, interpolation, antialias=antialias)
@@ -656,7 +656,7 @@ def hflip(img: Tensor) -> Tensor:
     Returns:
         PIL Image or Tensor:  Horizontally flipped image.
     """
-    if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
+    if not tensorplay.compiler.is_compiling():
         _log_api_usage_once(hflip)
     if not isinstance(img, tensorplay.Tensor):
         return F_pil.hflip(img)
@@ -727,7 +727,7 @@ def perspective(
     Returns:
         PIL Image or Tensor: transformed Image.
     """
-    if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
+    if not tensorplay.compiler.is_compiling():
         _log_api_usage_once(perspective)
 
     coeffs = _get_perspective_coeffs(startpoints, endpoints)
@@ -758,7 +758,7 @@ def vflip(img: Tensor) -> Tensor:
     Returns:
         PIL Image or Tensor:  Vertically flipped image.
     """
-    if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
+    if not tensorplay.compiler.is_compiling():
         _log_api_usage_once(vflip)
     if not isinstance(img, tensorplay.Tensor):
         return F_pil.vflip(img)
@@ -785,7 +785,7 @@ def five_crop(img: Tensor, size: list[int]) -> tuple[Tensor, Tensor, Tensor, Ten
        tuple: tuple (tl, tr, bl, br, center)
        Corresponding top left, top right, bottom left, bottom right and center crop.
     """
-    if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
+    if not tensorplay.compiler.is_compiling():
         _log_api_usage_once(five_crop)
     if isinstance(size, numbers.Number):
         size = (int(size), int(size))
@@ -836,7 +836,7 @@ def ten_crop(
         Corresponding top left, top right, bottom left, bottom right and
         center crop and same for the flipped image.
     """
-    if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
+    if not tensorplay.compiler.is_compiling():
         _log_api_usage_once(ten_crop)
     if isinstance(size, numbers.Number):
         size = (int(size), int(size))
@@ -871,7 +871,7 @@ def adjust_brightness(img: Tensor, brightness_factor: float) -> Tensor:
     Returns:
         PIL Image or Tensor: Brightness adjusted image.
     """
-    if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
+    if not tensorplay.compiler.is_compiling():
         _log_api_usage_once(adjust_brightness)
     if not isinstance(img, tensorplay.Tensor):
         return F_pil.adjust_brightness(img, brightness_factor)
@@ -893,7 +893,7 @@ def adjust_contrast(img: Tensor, contrast_factor: float) -> Tensor:
     Returns:
         PIL Image or Tensor: Contrast adjusted image.
     """
-    if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
+    if not tensorplay.compiler.is_compiling():
         _log_api_usage_once(adjust_contrast)
     if not isinstance(img, tensorplay.Tensor):
         return F_pil.adjust_contrast(img, contrast_factor)
@@ -915,7 +915,7 @@ def adjust_saturation(img: Tensor, saturation_factor: float) -> Tensor:
     Returns:
         PIL Image or Tensor: Saturation adjusted image.
     """
-    if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
+    if not tensorplay.compiler.is_compiling():
         _log_api_usage_once(adjust_saturation)
     if not isinstance(img, tensorplay.Tensor):
         return F_pil.adjust_saturation(img, saturation_factor)
@@ -954,7 +954,7 @@ def adjust_hue(img: Tensor, hue_factor: float) -> Tensor:
     Returns:
         PIL Image or Tensor: Hue adjusted image.
     """
-    if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
+    if not tensorplay.compiler.is_compiling():
         _log_api_usage_once(adjust_hue)
     if not isinstance(img, tensorplay.Tensor):
         return F_pil.adjust_hue(img, hue_factor)
@@ -987,7 +987,7 @@ def adjust_gamma(img: Tensor, gamma: float, gain: float = 1) -> Tensor:
     Returns:
         PIL Image or Tensor: Gamma correction adjusted image.
     """
-    if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
+    if not tensorplay.compiler.is_compiling():
         _log_api_usage_once(adjust_gamma)
     if not isinstance(img, tensorplay.Tensor):
         return F_pil.adjust_gamma(img, gamma, gain)
@@ -1091,7 +1091,7 @@ def rotate(
     .. _filters: https://pillow.readthedocs.io/en/latest/handbook/concepts.html#filters
 
     """
-    if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
+    if not tensorplay.compiler.is_compiling():
         _log_api_usage_once(rotate)
 
     if isinstance(interpolation, int):
@@ -1160,7 +1160,7 @@ def affine(
     Returns:
         PIL Image or Tensor: Transformed image.
     """
-    if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
+    if not tensorplay.compiler.is_compiling():
         _log_api_usage_once(affine)
 
     if isinstance(interpolation, int):
@@ -1230,7 +1230,7 @@ def affine(
 # Looks like to_grayscale() is a stand-alone functional that is never called
 # from the transform classes. Perhaps it's still here for BC? I can't be
 # bothered to dig.
-@tensorplay.jit.unused
+@tensorplay.compiler.unused
 def to_grayscale(img, num_output_channels=1):
     """Convert PIL image of any mode (RGB, HSV, LAB, etc) to grayscale version of image.
     This transform does not support tensorplay Tensor.
@@ -1245,7 +1245,7 @@ def to_grayscale(img, num_output_channels=1):
         - if num_output_channels = 1 : returned image is single channel
         - if num_output_channels = 3 : returned image is 3 channel with r = g = b
     """
-    if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
+    if not tensorplay.compiler.is_compiling():
         _log_api_usage_once(to_grayscale)
     if isinstance(img, Image.Image):
         return F_pil.to_grayscale(img, num_output_channels)
@@ -1272,7 +1272,7 @@ def rgb_to_grayscale(img: Tensor, num_output_channels: int = 1) -> Tensor:
         - if num_output_channels = 1 : returned image is single channel
         - if num_output_channels = 3 : returned image is 3 channel with r = g = b
     """
-    if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
+    if not tensorplay.compiler.is_compiling():
         _log_api_usage_once(rgb_to_grayscale)
     if not isinstance(img, tensorplay.Tensor):
         return F_pil.to_grayscale(img, num_output_channels)
@@ -1296,7 +1296,7 @@ def erase(img: Tensor, i: int, j: int, h: int, w: int, v: Tensor, inplace: bool 
     Returns:
         Tensor Image: Erased image.
     """
-    if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
+    if not tensorplay.compiler.is_compiling():
         _log_api_usage_once(erase)
     if not isinstance(img, tensorplay.Tensor):
         raise TypeError(f"img should be Tensor Image. Got {type(img)}")
@@ -1330,7 +1330,7 @@ def gaussian_blur(img: Tensor, kernel_size: list[int], sigma: Optional[list[floa
     Returns:
         PIL Image or Tensor: Gaussian Blurred version of the image.
     """
-    if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
+    if not tensorplay.compiler.is_compiling():
         _log_api_usage_once(gaussian_blur)
     if not isinstance(kernel_size, (int, list, tuple)):
         raise TypeError(f"kernel_size should be int or a sequence of integers. Got {type(kernel_size)}")
@@ -1383,7 +1383,7 @@ def invert(img: Tensor) -> Tensor:
     Returns:
         PIL Image or Tensor: Color inverted image.
     """
-    if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
+    if not tensorplay.compiler.is_compiling():
         _log_api_usage_once(invert)
     if not isinstance(img, tensorplay.Tensor):
         return F_pil.invert(img)
@@ -1404,7 +1404,7 @@ def posterize(img: Tensor, bits: int) -> Tensor:
     Returns:
         PIL Image or Tensor: Posterized image.
     """
-    if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
+    if not tensorplay.compiler.is_compiling():
         _log_api_usage_once(posterize)
     if not (0 <= bits <= 8):
         raise ValueError(f"The number if bits should be between 0 and 8. Got {bits}")
@@ -1427,7 +1427,7 @@ def solarize(img: Tensor, threshold: float) -> Tensor:
     Returns:
         PIL Image or Tensor: Solarized image.
     """
-    if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
+    if not tensorplay.compiler.is_compiling():
         _log_api_usage_once(solarize)
     if not isinstance(img, tensorplay.Tensor):
         return F_pil.solarize(img, threshold)
@@ -1449,7 +1449,7 @@ def adjust_sharpness(img: Tensor, sharpness_factor: float) -> Tensor:
     Returns:
         PIL Image or Tensor: Sharpness adjusted image.
     """
-    if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
+    if not tensorplay.compiler.is_compiling():
         _log_api_usage_once(adjust_sharpness)
     if not isinstance(img, tensorplay.Tensor):
         return F_pil.adjust_sharpness(img, sharpness_factor)
@@ -1471,7 +1471,7 @@ def autocontrast(img: Tensor) -> Tensor:
     Returns:
         PIL Image or Tensor: An image that was autocontrasted.
     """
-    if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
+    if not tensorplay.compiler.is_compiling():
         _log_api_usage_once(autocontrast)
     if not isinstance(img, tensorplay.Tensor):
         return F_pil.autocontrast(img)
@@ -1494,7 +1494,7 @@ def equalize(img: Tensor) -> Tensor:
     Returns:
         PIL Image or Tensor: An image that was equalized.
     """
-    if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
+    if not tensorplay.compiler.is_compiling():
         _log_api_usage_once(equalize)
     if not isinstance(img, tensorplay.Tensor):
         return F_pil.equalize(img)
@@ -1533,7 +1533,7 @@ def elastic_transform(
             If a tuple of length 3, it is used to fill R, G, B channels respectively.
             This value is only used when the padding_mode is constant.
     """
-    if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
+    if not tensorplay.compiler.is_compiling():
         _log_api_usage_once(elastic_transform)
     # Backward compatibility with integer value
     if isinstance(interpolation, int):

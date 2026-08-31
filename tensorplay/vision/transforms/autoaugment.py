@@ -527,11 +527,11 @@ class AugMix(tensorplay.nn.Module):
             )
         return s
 
-    @tensorplay.jit.unused
+    @tensorplay.compiler.unused
     def _pil_to_tensor(self, img) -> Tensor:
         return F.pil_to_tensor(img)
 
-    @tensorplay.jit.unused
+    @tensorplay.compiler.unused
     def _tensor_to_pil(self, img: Tensor):
         return F.to_pil_image(img)
 

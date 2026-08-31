@@ -5,6 +5,11 @@
 #include "Utils.h"
 #include "TensorIteratorOps.h"
 #include "Exception.h"
+#include "Parallel.h"
+#include "cpu/VecUnary.h"
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
 #include <vector>
 #include <cmath>
 #include <algorithm>
@@ -13,6 +18,52 @@
 
 namespace tensorplay {
 namespace cpu {
+
+#if defined(__x86_64__) || defined(__i386__)
+namespace {
+
+__attribute__((target("avx512f")))
+inline void where_f32_avx512(const bool* condition, const float* self,
+                             const float* other, float* result,
+                             int64_t begin, int64_t end) {
+    int64_t i = begin;
+    const __m128i zero = _mm_setzero_si128();
+    for (; i + 16 <= end; i += 16) {
+        const __m128i c = _mm_loadu_si128(
+            reinterpret_cast<const __m128i*>(condition + i));
+        const int zero_bits = _mm_movemask_epi8(_mm_cmpeq_epi8(c, zero));
+        const __mmask16 mask = static_cast<__mmask16>(~zero_bits);
+        const __m512 a = _mm512_loadu_ps(self + i);
+        const __m512 b = _mm512_loadu_ps(other + i);
+        _mm512_storeu_ps(result + i, _mm512_mask_blend_ps(mask, b, a));
+    }
+    for (; i < end; ++i) {
+        result[i] = condition[i] ? self[i] : other[i];
+    }
+}
+
+__attribute__((target("avx512f")))
+inline void where_f64_avx512(const bool* condition, const double* self,
+                             const double* other, double* result,
+                             int64_t begin, int64_t end) {
+    int64_t i = begin;
+    const __m128i zero = _mm_setzero_si128();
+    for (; i + 8 <= end; i += 8) {
+        const __m128i c = _mm_loadl_epi64(
+            reinterpret_cast<const __m128i*>(condition + i));
+        const int zero_bits = _mm_movemask_epi8(_mm_cmpeq_epi8(c, zero));
+        const __mmask8 mask = static_cast<__mmask8>(~zero_bits);
+        const __m512d a = _mm512_loadu_pd(self + i);
+        const __m512d b = _mm512_loadu_pd(other + i);
+        _mm512_storeu_pd(result + i, _mm512_mask_blend_pd(mask, b, a));
+    }
+    for (; i < end; ++i) {
+        result[i] = condition[i] ? self[i] : other[i];
+    }
+}
+
+} // namespace
+#endif
 
 // (result_type(int_tensor, 2.5) == Float32), and the scalar must never be
 // truncated into the tensor's dtype before comparing.
@@ -118,6 +169,59 @@ Tensor where_kernel_impl(const Tensor& condition, const Tensor& self,
     Tensor result = Tensor::empty(out_shape, common_dtype, self.device());
     Tensor self_casted = self.dtype() == common_dtype ? self : self.to(common_dtype);
     Tensor other_casted = other.dtype() == common_dtype ? other : other.to(common_dtype);
+
+    // No-broadcast contiguous case: one flat select loop, parallelized and
+    // left to the auto-vectorizer (compare + blend lowers to cmov/blend ops).
+    const bool flat = out_shape == static_cast<std::vector<int64_t>>(condition.shape()) &&
+                      out_shape == static_cast<std::vector<int64_t>>(self_casted.shape()) &&
+                      out_shape == static_cast<std::vector<int64_t>>(other_casted.shape()) &&
+                      condition.is_contiguous() && self_casted.is_contiguous() &&
+                      other_casted.is_contiguous() && result.is_contiguous();
+    if (flat) {
+        const int64_t n = result.numel();
+        const bool* cond = condition.data_ptr<bool>();
+#if defined(__x86_64__) || defined(__i386__)
+        if (vecunary::avx512_available() && common_dtype == DType::Float32) {
+            const float* a = self_casted.data_ptr<float>();
+            const float* b = other_casted.data_ptr<float>();
+            float* o = result.data_ptr<float>();
+            tensorplay::parallel::parallel_for(0, n, 8192,
+                [&](int64_t begin, int64_t end) {
+                    where_f32_avx512(cond, a, b, o, begin, end);
+                });
+            return result;
+        }
+        if (vecunary::avx512_available() && common_dtype == DType::Float64) {
+            const double* a = self_casted.data_ptr<double>();
+            const double* b = other_casted.data_ptr<double>();
+            double* o = result.data_ptr<double>();
+            tensorplay::parallel::parallel_for(0, n, 8192,
+                [&](int64_t begin, int64_t end) {
+                    where_f64_avx512(cond, a, b, o, begin, end);
+                });
+            return result;
+        }
+#endif
+        bool done = false;
+        #define TP_WHERE_FLAT_CASE(ctype, name) \
+        case DType::name: { \
+            const ctype* a = self_casted.data_ptr<ctype>(); \
+            const ctype* b = other_casted.data_ptr<ctype>(); \
+            ctype* o = result.data_ptr<ctype>(); \
+            tensorplay::parallel::parallel_for(0, n, 8192, [&](int64_t lo, int64_t hi) { \
+                for (int64_t i = lo; i < hi; ++i) o[i] = cond[i] ? a[i] : b[i]; \
+            }); \
+            done = true; \
+            break; \
+        }
+        switch (common_dtype) {
+            TENSORPLAY_FORALL_SCALAR_TYPES(TP_WHERE_FLAT_CASE)
+            default: break;
+        }
+        #undef TP_WHERE_FLAT_CASE
+        if (done) return result;
+    }
+
     auto condition_strides = broadcast_strides(condition, out_shape);
     auto self_strides = broadcast_strides(self_casted, out_shape);
     auto other_strides = broadcast_strides(other_casted, out_shape);

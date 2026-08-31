@@ -12,6 +12,7 @@ namespace tensorplay {
 #define TENSORPLAY_FORALL_DEVICE_TYPES(_) \
     _(CPU)                                \
     _(CUDA)                               \
+    _(Vulkan)                             \
     _(Unknown)
 
 // Device types supported by TensorPlay
@@ -39,7 +40,8 @@ public:
        
     bool is_cpu() const { return type_ == DeviceType::CPU; }
     bool is_cuda() const { return type_ == DeviceType::CUDA; }
-    
+    bool is_vulkan() const { return type_ == DeviceType::Vulkan; }
+
     // Convert device to string representation using macro-based mapping
     std::string toString() const {
         switch (type_) {
@@ -48,8 +50,8 @@ public:
                     std::string result = #name; \
                     /* Convert to lowercase */ \
                     for (auto& c : result) c = std::tolower(c); \
-                    /* Handle device index for CUDA devices */ \
-                    if ((DeviceType::name == DeviceType::CUDA || DeviceType::name == DeviceType::CPU) && index_ >= 0) { \
+                    /* Handle device index for accelerator devices */ \
+                    if ((DeviceType::name == DeviceType::CUDA || DeviceType::name == DeviceType::Vulkan || DeviceType::name == DeviceType::CPU) && index_ >= 0) { \
                         result += ":" + std::to_string(index_); \
                     } \
                     return result; \
@@ -78,7 +80,6 @@ namespace cuda {
     P10_API size_t memory_reserved(int device = 0);
     P10_API size_t max_memory_allocated(int device = 0);
     P10_API size_t max_memory_reserved(int device = 0);
-    P10_API void reset_max_memory_allocated(int device = 0);
     P10_API void reset_peak_memory_stats(int device = 0);
     P10_API void empty_cache();
     // Fragmentation-aware accounting: allocated/reserved/peaks plus segment
