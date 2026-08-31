@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
 #include <deque>
 #include <functional>
 #include <mutex>
@@ -430,6 +431,127 @@ TENSORPLAY_API std::string site_string(uint32_t id) {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_site_table || id >= g_site_table->size()) return "";
     return g_site_table->at(id).first;
+}
+
+// ---- Op-level FLOP estimation ----------------------------------------------
+// Runs once per collected event at session stop (inside the binding's batch
+// conversion), never on the dispatch hot path.  A multiply-accumulate pair
+// counts as two operations.  Only operand shapes are available -- op
+// attributes are not captured -- so:
+//   * convolution assumes stride 1 / padding 0 / dilation 1;
+//   * ops whose arithmetic depends on non-captured attributes (einsum's
+//     equation) return 0;
+//   * ops that decompose into counted primitives (linear -> addmm) return 0
+//     so per-session totals never double count.
+// Event names may carry an overload suffix ("mm.Tensor"); matching keys on
+// the base spelling.
+
+namespace {
+
+int64_t flops_prod_from(const std::vector<int64_t>& dims, size_t begin) {
+    int64_t out = 1;
+    for (size_t i = begin; i < dims.size(); ++i) out *= dims[i];
+    return out;
+}
+
+// Broadcast-compatible batch size of two shapes' leading dimensions
+// (trailing dims aligned, missing dims broadcast to 1).
+int64_t flops_batch_dims(const std::vector<int64_t>& a,
+                         const std::vector<int64_t>& b) {
+    int64_t batch = 1;
+    size_t i = a.size() - 2;
+    size_t j = b.size() - 2;
+    while (i > 0 && j > 0) {
+        batch *= std::max(a[i - 1], b[j - 1]);
+        --i;
+        --j;
+    }
+    while (i > 0) batch *= a[--i];
+    while (j > 0) batch *= b[--j];
+    return batch;
+}
+
+// Product of the leading dimensions dims[0, end) -- the batch prefix.
+int64_t flops_batch_prefix(const std::vector<int64_t>& dims, size_t end) {
+    int64_t out = 1;
+    for (size_t i = 0; i < end; ++i) out *= dims[i];
+    return out;
+}
+
+int64_t flops_matmul(const ShapeVec& shapes) {
+    const auto& a = shapes[0];
+    const auto& b = shapes[1];
+    if (a.empty() || b.empty()) return 0;
+    if (a.size() == 1 && b.size() == 1) return 2 * a[0] * b[0];
+    if (a.size() == 1) {
+        // Vector @ (batched) matrix: the vector broadcasts over b's batch
+        // dims (everything before its [K, N] tail).
+        return 2 * flops_batch_prefix(b, b.size() - 2) * a[0] *
+               b[b.size() - 1];
+    }
+    if (b.size() == 1) {
+        // (Batched) matrix @ vector: batch dims are everything before a's
+        // [M, K] tail.
+        return 2 * flops_batch_prefix(a, a.size() - 2) * a[a.size() - 2] *
+               a[a.size() - 1];
+    }
+    return 2 * flops_batch_dims(a, b) * a[a.size() - 2] * a[a.size() - 1] *
+           b[b.size() - 1];
+}
+
+int64_t flops_conv(const ShapeVec& shapes) {
+    // Input [N, C, *D_in], weight [Cout, C/groups, *k]; output spatial size
+    // approximated by the input's (stride 1 / padding 0 / dilation 1).
+    const auto& inp = shapes[0];
+    const auto& weight = shapes[1];
+    if (inp.size() < 3 || weight.size() < 3) return 0;
+    return 2 * inp[0] * weight[0] * flops_prod_from(inp, 2) * weight[1] *
+           flops_prod_from(weight, 2);
+}
+
+} // namespace
+
+TENSORPLAY_API int64_t estimate_flops(const char* name,
+                                      const ShapeVec& shapes) {
+    if (name == nullptr || shapes.size() < 2) return 0;
+    const char* dot = std::strchr(name, '.');
+    const std::string base(name, dot ? static_cast<size_t>(dot - name)
+                                     : std::strlen(name));
+    const auto& s0 = shapes[0];
+    const auto& s1 = shapes[1];
+
+    if (base == "mm") {
+        if (s0.size() < 2 || s1.empty()) return 0;
+        return 2 * s0[s0.size() - 2] * s0[s0.size() - 1] * s1[s1.size() - 1];
+    }
+    if (base == "addmm") {
+        // addmm(input, mat1, mat2): the operands are arguments 1 and 2.
+        if (shapes.size() < 3) return 0;
+        const auto& a = shapes[1];
+        const auto& b = shapes[2];
+        if (a.size() < 2 || b.empty()) return 0;
+        return 2 * a[a.size() - 2] * a[a.size() - 1] * b[b.size() - 1];
+    }
+    if (base == "bmm") {
+        if (s0.size() < 3 || s1.size() < 3) return 0;
+        return 2 * s0[0] * s0[s0.size() - 2] * s0[s0.size() - 1] *
+               s1[s1.size() - 1];
+    }
+    if (base == "baddbmm") {
+        if (shapes.size() < 3) return 0;
+        const auto& a = shapes[1];
+        const auto& b = shapes[2];
+        if (a.size() < 3 || b.size() < 3) return 0;
+        return 2 * a[0] * a[a.size() - 2] * a[a.size() - 1] *
+               b[b.size() - 1];
+    }
+    if (base == "matmul") {
+        return flops_matmul(shapes);
+    }
+    if (base == "conv1d" || base == "conv2d" || base == "conv3d") {
+        return flops_conv(shapes);
+    }
+    return 0;
 }
 
 } // namespace prof

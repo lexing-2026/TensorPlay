@@ -245,7 +245,7 @@ class CompilerCaptureTest(unittest.TestCase):
             return tp.add(tp.mul(x, x), 1.0)
 
         x = tp.tensor([1.0, 2.0])
-        gm = tp.compiler.Tracer().trace(
+        gm = tp.graph.Tracer().trace(
             lambda a: square_plus(a),
             sample_inputs={"a": x},
         )
@@ -269,14 +269,14 @@ class CompilerCaptureTest(unittest.TestCase):
     def test_custom_op_lowers_into_native_graph_not_interpreter(self):
         # dispatcher bridge inside the compiled artifact, never via the
         # Python GraphModule interpreter.
-        from tensorplay.backends.stax import stax
+        from tensorplay._stax.stax import stax
 
         @library.custom_op("capns::native_shift", mutates_args=())
         def native_shift(x):
             return tp.add(x, 10.0)
 
         x = tp.tensor([1.0, 2.0])
-        gm = tp.compiler.Tracer().trace(
+        gm = tp.graph.Tracer().trace(
             lambda a: tp.mul(native_shift(a), 2.0),
             sample_inputs={"a": x},
         )
@@ -289,7 +289,7 @@ class CompilerCaptureTest(unittest.TestCase):
         self.assertEqual(compiled(x).tolist(), [22.0, 24.0])
 
     def test_autograd_flows_through_native_graph(self):
-        from tensorplay.backends.stax import stax
+        from tensorplay._stax.stax import stax
 
         @library.custom_op("capns::nat_sq", mutates_args=())
         def nat_sq(x):
@@ -305,7 +305,7 @@ class CompilerCaptureTest(unittest.TestCase):
         nat_sq.register_autograd(backward, setup_context=setup_context)
 
         x = tp.tensor([1.0, 3.0], requires_grad=True)
-        gm = tp.compiler.Tracer().trace(
+        gm = tp.graph.Tracer().trace(
             lambda a: tp.add(nat_sq(a), 1.0),
             sample_inputs={"a": x},
         )
@@ -365,9 +365,9 @@ class WrapTritonTest(unittest.TestCase):
             return wrapped[(1,)](a)
 
         try:
-            tp.compiler.Tracer().trace(broken, sample_inputs={"x": x})
+            tp.graph.Tracer().trace(broken, sample_inputs={"x": x})
         except Exception as exc:  # noqa: BLE001
-            from tensorplay.compiler.graph import GraphCaptureError
+            from tensorplay.graph import GraphCaptureError
 
             self.assertIsInstance(exc, GraphCaptureError)
         else:
@@ -764,8 +764,8 @@ class WrapTileLangTest(unittest.TestCase):
 
         x = tp.tensor([1.0])
         with self.assertRaises(Exception) as ctx:
-            tp.compiler.Tracer().trace(broken, sample_inputs={"a": x})
-        from tensorplay.compiler.graph import GraphCaptureError
+            tp.graph.Tracer().trace(broken, sample_inputs={"a": x})
+        from tensorplay.graph import GraphCaptureError
 
         self.assertIsInstance(ctx.exception, GraphCaptureError)
 
@@ -783,7 +783,7 @@ class TileLangOpCaptureTest(unittest.TestCase):
             return tp.add(x, 1.0)
 
         x = tp.tensor([1.0, 2.0])
-        gm = tp.compiler.Tracer().trace(lambda a: shift(a), sample_inputs={"a": x})
+        gm = tp.graph.Tracer().trace(lambda a: shift(a), sample_inputs={"a": x})
 
         self.assertEqual(launched, [])  # body skipped under trace
         op_nodes = [
@@ -853,7 +853,7 @@ class RealTritonJITFunctionTest(unittest.TestCase):
             return tp.add(x, 1.0)
 
         x = tp.tensor([1.0, 2.0])
-        gm = tp.compiler.Tracer().trace(lambda a: shift(a), sample_inputs={"a": x})
+        gm = tp.graph.Tracer().trace(lambda a: shift(a), sample_inputs={"a": x})
 
         # The body never executed under the tracer: no launch, no proxy leak.
         self.assertEqual(body_ran, [])

@@ -2,11 +2,6 @@ import tensorplay as tp
 from tensorplay.optim import sgd as F
 from tensorplay import Tensor
 
-from tensorplay.distributed.optim._deprecation_warning import (
-    _scripted_functional_optimizer_deprecation_warning,
-)
-
-
 __all__: list[str] = []
 
 
@@ -33,7 +28,6 @@ class _FunctionalSGD:
         fused: bool = False,
         _allow_empty_param_list: bool = False,
     ):
-        _scripted_functional_optimizer_deprecation_warning(stacklevel=2)
         self.defaults = {
             "lr": lr,
             "momentum": momentum,

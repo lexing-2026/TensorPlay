@@ -145,12 +145,20 @@ Tensor all_dim_kernel(const Tensor& self, std::vector<int64_t> dims, bool keepdi
     return all_dim_stub(DeviceType::CPU, self, std::move(dims), keepdim);
 }
 
+Tensor all_dim_int_kernel(const Tensor& self, int64_t dim, bool keepdim) {
+    return all_dim_kernel(self, std::vector<int64_t>{dim}, keepdim);
+}
+
 Tensor any_kernel(const Tensor& self) {
     return any_stub(DeviceType::CPU, self);
 }
 
 Tensor any_dim_kernel(const Tensor& self, std::vector<int64_t> dims, bool keepdim) {
     return any_dim_stub(DeviceType::CPU, self, std::move(dims), keepdim);
+}
+
+Tensor any_dim_int_kernel(const Tensor& self, int64_t dim, bool keepdim) {
+    return any_dim_kernel(self, std::vector<int64_t>{dim}, keepdim);
 }
 
 Tensor argmax_kernel(const Tensor& self, std::optional<int64_t> dim, bool keepdim) {
@@ -269,9 +277,9 @@ TENSORPLAY_LIBRARY_IMPL(CPU, ReductionKernels) {
     m.impl("prod", prod_kernel);
     m.impl("prod.dim_IntList", prod_dim_kernel);
     m.impl("all", all_kernel);
-    m.impl("all.dim", all_dim_kernel);
+    m.impl("all.dim", all_dim_int_kernel);
     m.impl("any", any_kernel);
-    m.impl("any.dim", any_dim_kernel);
+    m.impl("any.dim", any_dim_int_kernel);
     m.impl("argmax", argmax_kernel);
     m.impl("argmin", argmin_kernel);
     m.impl("var", var_kernel);

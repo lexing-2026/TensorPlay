@@ -33,7 +33,19 @@ Device::Device(const std::string& device_str) : type_(DeviceType::CPU), index_(-
             // our Device class defaults index to -1.
             // If we want to support default device, -1 is correct.
             // However, to avoid mismatch with explicit cuda:0, we default to 0 here.
-            index_ = 0; 
+            index_ = 0;
+        }
+    } else if (s.rfind("vk", 0) == 0 || s.rfind("vulkan", 0) == 0) {
+        type_ = DeviceType::Vulkan;
+        size_t colon = s.find(':');
+        if (colon != std::string::npos) {
+            try {
+                index_ = std::stoi(s.substr(colon + 1));
+            } catch (...) {
+                TP_THROW(ValueError, "Invalid device string: " + device_str);
+            }
+        } else {
+            index_ = 0;
         }
     } else {
         TP_THROW(ValueError, "Invalid device string: " + device_str);
@@ -48,6 +60,8 @@ Device::Device(const std::string& type_str, int64_t index) : index_(index) {
         type_ = DeviceType::CPU;
     } else if (s == "cuda") {
         type_ = DeviceType::CUDA;
+    } else if (s == "vulkan" || s == "vk") {
+        type_ = DeviceType::Vulkan;
     } else {
         TP_THROW(ValueError, "Invalid device type: " + type_str);
     }

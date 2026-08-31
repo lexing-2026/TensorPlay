@@ -1156,10 +1156,6 @@ size_t max_memory_reserved(int device) {
     return AllocatorState::instance().maxReserved(device);
 }
 
-void reset_max_memory_allocated(int device) {
-    AllocatorState::instance().resetPeaks(device);
-}
-
 void reset_peak_memory_stats(int device) {
     AllocatorState::instance().resetPeaks(device);
 }

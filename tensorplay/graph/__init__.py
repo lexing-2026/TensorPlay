@@ -1,15 +1,14 @@
-"""Graph facade and feature-extraction helpers.
+"""Graph namespace and feature-extraction helpers.
 
-The canonical implementation lives in :mod:`tensorplay.compiler.graph`; this
-facade re-exports it and adds the frontend features that operate on captured
-models:
+The modules in this package own graph capture, graph values, tracing, and
+execution.  This package also exposes the frontend features that operate on
+captured models:
 
 - :func:`get_graph_node_names` / :func:`create_feature_extractor`, the
 - :meth:`Graph.to_dot` / :meth:`Graph.draw` visualization helpers;
 - :class:`NodePathTracer`, which records the qualified module path behind
   every ``call_module`` node;
-- :func:`wrap`, an identity decorator kept for ``@tensorplay.fx.wrap``
-  style annotations.
+- :func:`wrap`, an identity decorator for marking wrapped callables.
 """
 
 from __future__ import annotations
@@ -18,64 +17,61 @@ import copy
 import warnings
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
-from .compiler.graph import (
-    Graph,
+from ._utils import (
     GraphCaptureError,
-    GraphModule,
-    Node,
-    Proxy,
-    Tracer,
-    dead_code_elimination,
+    capture_call,
+    capturing,
+    compiler_context,
+    gate_outcome,
+    _iter_proxies,
 )
-from .compiler.passes import (
-    ConstFold,
-    DeadCodeElimination,
-    PassBase,
-    PassManager,
-    PassResult,
-    ShapeProp,
+from .graph import Graph
+from .graph_module import GraphModule
+from .node import Node
+from .proxy import Proxy, gate
+from .symbolic_trace import symbolic_trace, wrap
+from .tracer import NodePathTracer, Tracer
+from .annotate import annotate
+from .immutable_collections import immutable_dict, immutable_list
+from .interpreter import Interpreter, Transformer
+from .subgraph_rewriter import (
+    Match,
+    ReplacedPatterns,
+    replace_pattern,
+    replace_pattern_with_filters,
 )
-
+from .tensor_type import Dyn, TensorType, is_consistent, is_more_precise
 __all__ = [
-    "ConstFold",
-    "DeadCodeElimination",
+    "Dyn",
     "Graph",
     "GraphCaptureError",
     "GraphModule",
+    "Interpreter",
+    "Match",
     "Node",
     "NodePathTracer",
-    "PassBase",
-    "PassManager",
-    "PassResult",
     "Proxy",
-    "ShapeProp",
+    "ReplacedPatterns",
+    "TensorType",
     "Tracer",
+    "Transformer",
+    "annotate",
+    "capture_call",
+    "capturing",
+    "compiler_context",
     "create_feature_extractor",
-    "dead_code_elimination",
     "get_graph_node_names",
+    "gate",
+    "gate_outcome",
+    "immutable_dict",
+    "immutable_list",
+    "is_consistent",
+    "is_more_precise",
+    "replace_pattern",
+    "replace_pattern_with_filters",
+    "symbolic_trace",
     "wrap",
 ]
-
-
-def wrap(fn_or_name=None):
-
-    if fn_or_name is None:
-        return lambda fn: fn
-    if callable(fn_or_name):
-        return fn_or_name
-    return lambda fn: fn
-
-
-class NodePathTracer(Tracer):
-    """:class:`Tracer` that records the qualified module path of every
-    ``call_module`` node in :attr:`Tracer.node_to_qualname`.
-
-    A module counts as a leaf once it has no child modules, matching
-    ``path_0``, ``path_1``, ... entries so each execution stays selectable.
-    """
-
-    def is_leaf_module(self, module: Any, qualified_name: str) -> bool:
-        return next(module.named_children(), None) is None
 
 
 ReturnNodes = Union[Iterable[str], Mapping[str, Optional[str]]]

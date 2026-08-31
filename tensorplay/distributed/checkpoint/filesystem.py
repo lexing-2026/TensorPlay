@@ -3,6 +3,7 @@
 # sharded-planner file matrix; the FileSystemReader/FileSystemWriter public
 # API is preserved.
 import dataclasses
+from dataclasses import dataclass
 import os
 import pickle as _pickle
 from abc import ABC, abstractmethod

@@ -3,7 +3,7 @@
 import pytest
 
 import tensorplay as tp
-from tensorplay.compiler import CudaGraphError, CudaGraphManager
+from tensorplay._stax import CudaGraphError, CudaGraphManager
 
 
 class FakeGraph:
@@ -57,7 +57,7 @@ def _manager(native=FakeNative):
 
 
 def test_missing_native_reports_surface(monkeypatch):
-    import tensorplay.compiler.cudagraphs as cg
+    import tensorplay._stax.cudagraphs as cg
     monkeypatch.setattr(cg, "_default_native", lambda: (_ for _ in ()).throw(
         NotImplementedError("CUDA graphs are not supported by this TensorPlay "
                             "build (tensorplay._C exposes no CUDAGraph class)")))

@@ -38,6 +38,8 @@ inline constexpr DispatchKey get_autocast_dispatch_key_from_device_type(
             return DispatchKey::AutocastCPU;
         case DeviceType::CUDA:
             return DispatchKey::AutocastCUDA;
+        case DeviceType::Vulkan:
+            return DispatchKey::AutocastVulkan;
         default:
             TP_THROW(NotImplementedError,
                 "unknown device type for autocast in get_autocast_dispatch_key_from_device_type");
@@ -50,6 +52,8 @@ inline constexpr DeviceType get_device_type_from_autocast_key(DispatchKey key) {
             return DeviceType::CPU;
         case DispatchKey::AutocastCUDA:
             return DeviceType::CUDA;
+        case DispatchKey::AutocastVulkan:
+            return DeviceType::Vulkan;
         default:
             TP_THROW(NotImplementedError,
                 "unknown autocast dispatch key in get_device_type_from_autocast_key");

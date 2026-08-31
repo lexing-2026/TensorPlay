@@ -70,7 +70,7 @@ Tensor feature_alpha_dropout_native(const Tensor& input, double p, bool train) {
     noise_shape[1] = input.size(1);
     Tensor noise = ops::full(noise_shape, Scalar(1.0 - p), input.dtype(),
                              input.device());
-    ops::bernoulli_(noise);
+    ops::bernoulli_(noise, 1.0 - p, std::nullopt);
     // out = input * (noise * a) + (noise - 1) * (alpha * a) + alpha * a * p
     const Tensor b = ops::add(ops::mul(ops::sub(noise, Scalar(1)),
                                        Scalar(alpha * a)),

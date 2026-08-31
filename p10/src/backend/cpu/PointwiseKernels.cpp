@@ -622,11 +622,15 @@ Tensor relu_kernel(const Tensor& self) {
     if (vecunary::vec_ready() && self.dtype() == DType::Float32 && self.is_contiguous()) {
          Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
          int64_t n = self.numel();
-         const float* src = self.data_ptr<float>();
-         float* dst = result.data_ptr<float>();
-         parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) {
-             vecunary::run_f32(vecunary::VOp::Relu, vecunary::VParams{}, src, dst, begin, end);
-         });
+        const float* src = self.data_ptr<float>();
+        float* dst = result.data_ptr<float>();
+        if (n <= kUnaryGrain) {
+            vecunary::run_f32(vecunary::VOp::Relu, vecunary::VParams{}, src, dst, 0, n);
+        } else {
+            parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) {
+                vecunary::run_f32(vecunary::VOp::Relu, vecunary::VParams{}, src, dst, begin, end);
+            });
+        }
          return result;
     }
 
@@ -647,11 +651,15 @@ Tensor& relu_inplace_kernel(Tensor& self) {
     // was a serial full-tensor loop.  Non-AVX2 hosts fall through to the
     // parallel generic branch below.
     if (vecunary::vec_ready() && self.dtype() == DType::Float32 && self.is_contiguous()) {
-         int64_t n = self.numel();
-         float* data = self.data_ptr<float>();
-         parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) {
-             vecunary::run_f32(vecunary::VOp::Relu, vecunary::VParams{}, data, data, begin, end);
-         });
+        int64_t n = self.numel();
+        float* data = self.data_ptr<float>();
+        if (n <= kUnaryGrain) {
+            vecunary::run_f32(vecunary::VOp::Relu, vecunary::VParams{}, data, data, 0, n);
+        } else {
+            parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) {
+                vecunary::run_f32(vecunary::VOp::Relu, vecunary::VParams{}, data, data, begin, end);
+            });
+        }
          return self;
     }
 
@@ -1378,6 +1386,17 @@ Tensor pow_scalar_kernel(const Tensor& self, Scalar exponent) {
         if (exp_val < 0) {
              return unary_float_op_kernel(self, [exp_val](auto x) { using T = decltype(x); return std::pow(x, static_cast<T>(static_cast<double>(exp_val))); });
         }
+        // Small non-negative integer exponents reduce to cheap elementwise
+        // forms instead of the per-element square-and-multiply loop.
+        if (exp_val == 0) {
+            Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
+            return result.fill_(Scalar(1));
+        }
+        if (exp_val == 1) return self.clone();
+        if (exp_val == 2) return square_kernel(self);
+        if (exp_val == 3) {
+            return unary_op_kernel(self, [](auto x) { using T = decltype(x); return x * x * x; });
+        }
         return unary_op_kernel(self, [exp_val](auto x) {
              using T = decltype(x);
              T base = x;
@@ -1476,11 +1495,80 @@ Tensor angle_kernel(const Tensor& self) {
 
 // --- Binary/Ternary Kernels ---
 
-// Helper for clamp
+#if defined(__x86_64__)
+namespace {
+__attribute__((target("avx512f")))
+void clamp_f32_avx512(const float* src, float* dst, int64_t n,
+                      float lo, float hi) {
+    const __m512 vlo = _mm512_set1_ps(lo);
+    const __m512 vhi = _mm512_set1_ps(hi);
+    int64_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m512 v = _mm512_loadu_ps(src + i);
+        v = _mm512_max_ps(vlo, v);
+        v = _mm512_min_ps(vhi, v);
+        _mm512_storeu_ps(dst + i, v);
+    }
+    for (; i < n; ++i) {
+        float v = src[i];
+        if (v < lo) v = lo;
+        if (v > hi) v = hi;
+        dst[i] = v;
+    }
+}
+
+__attribute__((target("avx512f")))
+void clamp_f64_avx512(const double* src, double* dst, int64_t n,
+                      double lo, double hi) {
+    const __m512d vlo = _mm512_set1_pd(lo);
+    const __m512d vhi = _mm512_set1_pd(hi);
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m512d v = _mm512_loadu_pd(src + i);
+        v = _mm512_max_pd(vlo, v);
+        v = _mm512_min_pd(vhi, v);
+        _mm512_storeu_pd(dst + i, v);
+    }
+    for (; i < n; ++i) {
+        double v = src[i];
+        if (v < lo) v = lo;
+        if (v > hi) v = hi;
+        dst[i] = v;
+    }
+}
+} // namespace
+#endif
+
 Tensor clamp_kernel(const Tensor& self, std::optional<Scalar> min, std::optional<Scalar> max) {
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
     int64_t n = self.numel();
     Tensor self_contig = self.contiguous();
+
+#if defined(__x86_64__)
+    if (vecunary::avx512_available() &&
+        (self.dtype() == DType::Float32 || self.dtype() == DType::Float64)) {
+        const double lo = min.has_value()
+            ? min->toDouble() : -std::numeric_limits<double>::infinity();
+        const double hi = max.has_value()
+            ? max->toDouble() : std::numeric_limits<double>::infinity();
+        if (self.dtype() == DType::Float32) {
+            const float* src = self_contig.data_ptr<float>();
+            float* dst = result.data_ptr<float>();
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                clamp_f32_avx512(src + begin, dst + begin, end - begin,
+                                 static_cast<float>(lo), static_cast<float>(hi));
+            });
+        } else {
+            const double* src = self_contig.data_ptr<double>();
+            double* dst = result.data_ptr<double>();
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                clamp_f64_avx512(src + begin, dst + begin, end - begin,
+                                 lo, hi);
+            });
+        }
+        return result;
+    }
+#endif
 
     #define OP_CASE(ctype, name) \
     case DType::name: { \
@@ -1596,6 +1684,161 @@ Tensor threshold_backward_kernel(const Tensor& grad_output, const Tensor& output
 
 // (max pass, exp+sum pass, write pass) instead of materializing 5 temporaries.
 // Fast path: contiguous input, reduction over last dim. Fallback: composition.
+
+// ---------------------------------------------------------------------------
+// Row-wise softmax helpers.  Per-row passes are hand-vectorized with
+// per-function target attributes and selected at runtime (AVX-512 -> AVX2 ->
+// scalar), keeping exp on the libmvec vector ABI instead of a scalar libm
+// call per element.
+// ---------------------------------------------------------------------------
+namespace softmax_row {
+
+#if defined(__x86_64__)
+
+#define TP_SOFTMAX_ROW_F32(fn_suffix, vec_t, width, exp_fn, mm_add, mm_sub, mm_mul, mm_max, mm_load, mm_store, mm_set1, mm_zero) \
+__attribute__((target("avx512f")))                                       \
+inline float row_max_##fn_suffix(const float* x, int64_t n) {            \
+    vec_t m = mm_set1(x[0]);                                             \
+    int64_t i = 1;                                                       \
+    for (; i + width <= n; i += width)                                   \
+        m = mm_max(mm_load(x + i), m);                                   \
+    alignas(64) float buf[width];                                        \
+    mm_store(buf, m);                                                    \
+    float best = buf[0];                                                 \
+    for (int64_t k = 1; k < width; ++k) best = std::max(best, buf[k]);   \
+    for (; i < n; ++i) best = std::max(best, x[i]);                      \
+    return best;                                                         \
+}                                                                        \
+__attribute__((target("avx512f")))                                       \
+inline float row_expsum_##fn_suffix(const float* x, float m, float* out, int64_t n) { \
+    vec_t vm = mm_set1(m);                                               \
+    vec_t a0 = mm_zero(), a1 = mm_zero(), a2 = mm_zero(), a3 = mm_zero();\
+    int64_t i = 0;                                                       \
+    for (; i + 4 * width <= n; i += 4 * width) {                         \
+        vec_t e0 = exp_fn(mm_sub(mm_load(x + i), vm));                   \
+        vec_t e1 = exp_fn(mm_sub(mm_load(x + i + width), vm));           \
+        vec_t e2 = exp_fn(mm_sub(mm_load(x + i + 2 * width), vm));       \
+        vec_t e3 = exp_fn(mm_sub(mm_load(x + i + 3 * width), vm));       \
+        mm_store(out + i, e0);                                           \
+        mm_store(out + i + width, e1);                                   \
+        mm_store(out + i + 2 * width, e2);                               \
+        mm_store(out + i + 3 * width, e3);                               \
+        a0 = mm_add(a0, e0);                                             \
+        a1 = mm_add(a1, e1);                                             \
+        a2 = mm_add(a2, e2);                                             \
+        a3 = mm_add(a3, e3);                                             \
+    }                                                                    \
+    vec_t acc = mm_add(mm_add(a0, a1), mm_add(a2, a3));                  \
+    alignas(64) float buf[width];                                        \
+    mm_store(buf, acc);                                                  \
+    float s = 0.f;                                                       \
+    for (int64_t k = 0; k < width; ++k) s += buf[k];                     \
+    for (; i < n; ++i) {                                                 \
+        float e = std::exp(x[i] - m);                                    \
+        out[i] = e;                                                      \
+        s += e;                                                          \
+    }                                                                    \
+    return s;                                                            \
+}                                                                        \
+__attribute__((target("avx512f")))                                       \
+inline void row_scale_##fn_suffix(float* out, float inv, int64_t n) {    \
+    vec_t vi = mm_set1(inv);                                             \
+    int64_t i = 0;                                                       \
+    for (; i + width <= n; i += width)                                   \
+        mm_store(out + i, mm_mul(mm_load(out + i), vi));                 \
+    for (; i < n; ++i) out[i] *= inv;                                    \
+}                                                                        \
+__attribute__((target("avx512f")))                                       \
+inline void row_logmode_##fn_suffix(const float* x, float* out, float m, float lse, int64_t n) { \
+    vec_t vm = mm_set1(m), vl = mm_set1(lse);                            \
+    int64_t i = 0;                                                       \
+    for (; i + width <= n; i += width)                                   \
+        mm_store(out + i, mm_sub(mm_sub(mm_load(x + i), vm), vl));       \
+    for (; i < n; ++i) out[i] = (x[i] - m) - lse;                        \
+}
+
+TP_SOFTMAX_ROW_F32(f32_512, __m512, 16, tensorplay::tpsleef::exp,
+                   _mm512_add_ps, _mm512_sub_ps, _mm512_mul_ps, _mm512_max_ps,
+                   _mm512_loadu_ps, _mm512_storeu_ps, _mm512_set1_ps, _mm512_setzero_ps)
+TP_SOFTMAX_ROW_F32(f32_256, __m256, 8, tensorplay::tpsleef::exp,
+                   _mm256_add_ps, _mm256_sub_ps, _mm256_mul_ps, _mm256_max_ps,
+                   _mm256_loadu_ps, _mm256_storeu_ps, _mm256_set1_ps, _mm256_setzero_ps)
+#undef TP_SOFTMAX_ROW_F32
+
+#define TP_SOFTMAX_ROW_F64(fn_suffix, vec_t, width, exp_fn, mm_add, mm_sub, mm_mul, mm_max, mm_load, mm_store, mm_set1, mm_zero) \
+__attribute__((target("avx512f")))                                       \
+inline double row_max_##fn_suffix(const double* x, int64_t n) {          \
+    vec_t m = mm_set1(x[0]);                                             \
+    int64_t i = 1;                                                       \
+    for (; i + width <= n; i += width)                                   \
+        m = mm_max(mm_load(x + i), m);                                   \
+    alignas(64) double buf[width];                                       \
+    mm_store(buf, m);                                                    \
+    double best = buf[0];                                                \
+    for (int64_t k = 1; k < width; ++k) best = std::max(best, buf[k]);   \
+    for (; i < n; ++i) best = std::max(best, x[i]);                      \
+    return best;                                                         \
+}                                                                        \
+__attribute__((target("avx512f")))                                       \
+inline double row_expsum_##fn_suffix(const double* x, double m, double* out, int64_t n) { \
+    vec_t vm = mm_set1(m);                                               \
+    vec_t a0 = mm_zero(), a1 = mm_zero(), a2 = mm_zero(), a3 = mm_zero();\
+    int64_t i = 0;                                                       \
+    for (; i + 4 * width <= n; i += 4 * width) {                         \
+        vec_t e0 = exp_fn(mm_sub(mm_load(x + i), vm));                   \
+        vec_t e1 = exp_fn(mm_sub(mm_load(x + i + width), vm));           \
+        vec_t e2 = exp_fn(mm_sub(mm_load(x + i + 2 * width), vm));       \
+        vec_t e3 = exp_fn(mm_sub(mm_load(x + i + 3 * width), vm));       \
+        mm_store(out + i, e0);                                           \
+        mm_store(out + i + width, e1);                                   \
+        mm_store(out + i + 2 * width, e2);                               \
+        mm_store(out + i + 3 * width, e3);                               \
+        a0 = mm_add(a0, e0);                                             \
+        a1 = mm_add(a1, e1);                                             \
+        a2 = mm_add(a2, e2);                                             \
+        a3 = mm_add(a3, e3);                                             \
+    }                                                                    \
+    vec_t acc = mm_add(mm_add(a0, a1), mm_add(a2, a3));                  \
+    alignas(64) double buf[width];                                       \
+    mm_store(buf, acc);                                                  \
+    double s = 0.0;                                                      \
+    for (int64_t k = 0; k < width; ++k) s += buf[k];                     \
+    for (; i < n; ++i) {                                                 \
+        double e = std::exp(x[i] - m);                                   \
+        out[i] = e;                                                      \
+        s += e;                                                          \
+    }                                                                    \
+    return s;                                                            \
+}                                                                        \
+__attribute__((target("avx512f")))                                       \
+inline void row_scale_##fn_suffix(double* out, double inv, int64_t n) {  \
+    vec_t vi = mm_set1(inv);                                             \
+    int64_t i = 0;                                                       \
+    for (; i + width <= n; i += width)                                   \
+        mm_store(out + i, mm_mul(mm_load(out + i), vi));                 \
+    for (; i < n; ++i) out[i] *= inv;                                    \
+}                                                                        \
+__attribute__((target("avx512f")))                                       \
+inline void row_logmode_##fn_suffix(const double* x, double* out, double m, double lse, int64_t n) { \
+    vec_t vm = mm_set1(m), vl = mm_set1(lse);                            \
+    int64_t i = 0;                                                       \
+    for (; i + width <= n; i += width)                                   \
+        mm_store(out + i, mm_sub(mm_sub(mm_load(x + i), vm), vl));       \
+    for (; i < n; ++i) out[i] = (x[i] - m) - lse;                        \
+}
+
+TP_SOFTMAX_ROW_F64(f64_512, __m512d, 8, tensorplay::tpsleef::exp,
+                   _mm512_add_pd, _mm512_sub_pd, _mm512_mul_pd, _mm512_max_pd,
+                   _mm512_loadu_pd, _mm512_storeu_pd, _mm512_set1_pd, _mm512_setzero_pd)
+TP_SOFTMAX_ROW_F64(f64_256, __m256d, 4, tensorplay::tpsleef::exp,
+                   _mm256_add_pd, _mm256_sub_pd, _mm256_mul_pd, _mm256_max_pd,
+                   _mm256_loadu_pd, _mm256_storeu_pd, _mm256_set1_pd, _mm256_setzero_pd)
+#undef TP_SOFTMAX_ROW_F64
+
+#endif  // __x86_64__
+
+}  // namespace softmax_row
+
 template <bool LogMode>
 static Tensor softmax_fused_kernel_impl(const Tensor& self, int64_t dim, DType out_dtype) {
     Tensor input = self.to(out_dtype);
@@ -1617,39 +1860,65 @@ static Tensor softmax_fused_kernel_impl(const Tensor& self, int64_t dim, DType o
     int64_t rows = input.numel() / input.size(-1);
     int64_t size = input.size(-1);
 
-    #define SOFTMAX_CASE(ctype, name) \
+    #define SOFTMAX_SCALAR_ROW(ctype) \
+        const ctype* row = in + r * size; \
+        ctype* orow = out + r * size; \
+        ctype m = row[0]; \
+        for (int64_t j = 1; j < size; ++j) m = std::max(m, row[j]); \
+        ctype sum = ctype(0); \
+        for (int64_t j = 0; j < size; ++j) { \
+            ctype e = std::exp(row[j] - m); \
+            orow[j] = e; \
+            sum += e; \
+        } \
+        if constexpr (LogMode) { \
+            ctype lse = std::log(sum); \
+            for (int64_t j = 0; j < size; ++j) orow[j] = (row[j] - m) - lse; \
+        } else { \
+            ctype inv = ctype(1) / sum; \
+            for (int64_t j = 0; j < size; ++j) orow[j] *= inv; \
+        }
+
+    #define SOFTMAX_ROW_VEC(ns, suffix, ctype, row_, orow_) \
+        { \
+            ctype m = softmax_row::row_max_##suffix(row_, size); \
+            ctype sum = softmax_row::row_expsum_##suffix(row_, m, orow_, size); \
+            if constexpr (LogMode) { \
+                softmax_row::row_logmode_##suffix(row_, orow_, m, std::log(sum), size); \
+            } else { \
+                softmax_row::row_scale_##suffix(orow_, ctype(1) / sum, size); \
+            } \
+        }
+
+    #define SOFTMAX_CASE(ctype, name, s512, s256, t512, t256) \
     case DType::name: { \
         const ctype* in = input.data_ptr<ctype>(); \
         ctype* out = result.data_ptr<ctype>(); \
+        const bool use512 = vecunary::avx512_available(); \
+        const bool use256 = vecunary::avx2_available(); \
         parallel_for(0, rows, 1, [&](int64_t begin, int64_t end) { \
             for (int64_t r = begin; r < end; ++r) { \
                 const ctype* row = in + r * size; \
                 ctype* orow = out + r * size; \
-                ctype m = row[0]; \
-                for (int64_t j = 1; j < size; ++j) m = std::max(m, row[j]); \
-                ctype sum = ctype(0); \
-                for (int64_t j = 0; j < size; ++j) { \
-                    ctype e = std::exp(row[j] - m); \
-                    orow[j] = e; \
-                    sum += e; \
-                } \
-                if constexpr (LogMode) { \
-                    ctype lse = std::log(sum); \
-                    for (int64_t j = 0; j < size; ++j) orow[j] = (row[j] - m) - lse; \
+                if (use512 && size >= t512) { \
+                    SOFTMAX_ROW_VEC(softmax_row, s512, ctype, row, orow) \
+                } else if (use256 && size >= t256) { \
+                    SOFTMAX_ROW_VEC(softmax_row, s256, ctype, row, orow) \
                 } else { \
-                    ctype inv = ctype(1) / sum; \
-                    for (int64_t j = 0; j < size; ++j) orow[j] *= inv; \
+                    SOFTMAX_SCALAR_ROW(ctype) \
                 } \
             } \
         }); \
         break; \
     }
     switch (out_dtype) {
-        SOFTMAX_CASE(float, Float32)
-        SOFTMAX_CASE(double, Float64)
+        SOFTMAX_CASE(float, Float32, f32_512, f32_256, 64, 32)
+        SOFTMAX_CASE(double, Float64, f64_512, f64_256, 32, 16)
         default: TP_THROW(TypeError, "softmax: unsupported dtype");
     }
     #undef SOFTMAX_CASE
+    #undef SOFTMAX_ROW_VEC
+    #undef SOFTMAX_SCALAR_ROW
     return result;
 }
 

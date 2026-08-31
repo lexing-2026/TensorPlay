@@ -14,7 +14,7 @@ def test_standalone_import_loads_cuda_runtime_without_torch():
         [
             sys.executable,
             "-c",
-            "import sys; import tensorplay; assert 'torch' not in sys.modules; print(tensorplay.compiler.get_default_backend())",
+            "import sys; import tensorplay; assert 'torch' not in sys.modules; print(tensorplay._stax.get_default_backend())",
         ],
         cwd=Path(__file__).resolve().parent.parent,
         check=True,
@@ -34,19 +34,19 @@ def test_compile_uses_single_public_entrypoint_and_stax_backend():
     compiled = tp.compile(fn)
     actual = compiled(x, y)
 
-    assert tp.compiler.get_default_backend() == "stax"
+    assert tp._stax.get_default_backend() == "stax"
     assert tp.hub.__name__ == "tensorplay.hub"
     assert tp.types.__name__ == "tensorplay.types"
     assert not hasattr(tp, "not_a_tensorplay_name")
     assert actual.tolist() == expected.tolist()
     assert compiled._tensorplay_backend == "stax"
-    assert tp.compiler.list_backends() == ["stax", "tvm"]
+    assert tp._stax.list_backends() == ["stax", "tvm"]
 
 
 def test_custom_backend_receives_graph_module_and_caches_specializations():
     calls = []
 
-    @tp.compiler.register_backend(name="test_capture_backend")
+    @tp._stax.register_backend(name="test_capture_backend")
     def test_capture_backend(graph_module, example_inputs, **kwargs):
         calls.append((graph_module, tuple(example_inputs), kwargs))
         return graph_module.forward
@@ -219,7 +219,7 @@ def test_scalar_and_numeric_gates_specialize_from_samples():
 
 
 def test_symbolic_tracer_still_rejects_data_dependent_control_flow():
-    from tensorplay.compiler.graph import GraphCaptureError, Tracer
+    from tensorplay.graph import GraphCaptureError, Tracer
 
     def fn(x):
         if bool((x > 0).all()):
@@ -318,7 +318,7 @@ def test_stax_triton_compiles_forward_and_backward_together():
         import triton  # noqa: F401
     except ImportError:
         pytest.skip("Triton is unavailable")
-    from tensorplay.compiler.codegen.triton import runtime_available
+    from tensorplay._stax.codegen.triton import runtime_available
 
     if not runtime_available():
         pytest.skip("Triton runtime cannot target this device")

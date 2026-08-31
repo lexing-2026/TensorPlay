@@ -775,7 +775,7 @@ class _Decoder(nn.Module):
         decoder_input = tensorplay.zeros(n_batch, self.n_mels * self.n_frames_per_step, dtype=dtype, device=device)
         return decoder_input
 
-    @tensorplay.jit.export
+    @tensorplay.compiler.export
     def infer(self, memory: Tensor, memory_lengths: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         """Decoder inference
 
@@ -1004,7 +1004,7 @@ class Tacotron2(nn.Module):
 
         return mel_specgram, mel_specgram_postnet, gate_outputs, alignments
 
-    @tensorplay.jit.export
+    @tensorplay.compiler.export
     def infer(self, tokens: Tensor, lengths: Optional[Tensor] = None) -> Tuple[Tensor, Tensor, Tensor]:
         r"""Using Tacotron2 for inference. The input is a batch of encoded
         sentences (``tokens``) and its corresponding lengths (``lengths``). The

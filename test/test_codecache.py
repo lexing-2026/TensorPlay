@@ -4,7 +4,7 @@ import os
 
 import pytest
 
-from tensorplay.compiler import CodeCache, default_cache
+from tensorplay._stax import CodeCache, default_cache
 
 
 def test_cache_key_canonicalization(tmp_path):

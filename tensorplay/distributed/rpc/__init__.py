@@ -1,15 +1,61 @@
-#
-# runtime, so the public names report the same "RPC not initialized"
-__all__: list[str] = []
+from . import api, backend_registry, functions
+from .api import (
+    AllGatherStates,
+    Future,
+    RRef,
+    get_worker_info,
+    init_rpc,
+    is_available,
+    method_factory,
+    remote,
+    rpc_async,
+    rpc_sync,
+    shutdown,
+)
+from .backend_registry import (
+    BackendType,
+    BackendValue,
+    backend_registered,
+    construct_rpc_backend_options,
+    init_backend,
+    register_backend,
+)
+from .constants import (
+    DEFAULT_INIT_METHOD,
+    DEFAULT_NUM_WORKER_THREADS,
+    DEFAULT_PROCESS_GROUP_TIMEOUT,
+    DEFAULT_RPC_TIMEOUT_SEC,
+    DEFAULT_SHUTDOWN_TIMEOUT,
+    UNSET_RPC_TIMEOUT,
+)
+from .options import TensorPipeRpcBackendOptions
 
-
-def _require_rpc():
-    raise RuntimeError(
-        "tensorplay.distributed.rpc requires a build with the RPC runtime "
-    )
-
-
-def __getattr__(name):
-    if name.startswith("_"):
-        raise AttributeError(name)
-    _require_rpc()
+__all__ = [
+    "api",
+    "backend_registry",
+    "functions",
+    "AllGatherStates",
+    "BackendType",
+    "BackendValue",
+    "Future",
+    "RRef",
+    "TensorPipeRpcBackendOptions",
+    "backend_registered",
+    "construct_rpc_backend_options",
+    "get_worker_info",
+    "init_backend",
+    "init_rpc",
+    "is_available",
+    "method_factory",
+    "register_backend",
+    "remote",
+    "rpc_async",
+    "rpc_sync",
+    "shutdown",
+    "DEFAULT_INIT_METHOD",
+    "DEFAULT_NUM_WORKER_THREADS",
+    "DEFAULT_PROCESS_GROUP_TIMEOUT",
+    "DEFAULT_RPC_TIMEOUT_SEC",
+    "DEFAULT_SHUTDOWN_TIMEOUT",
+    "UNSET_RPC_TIMEOUT",
+]

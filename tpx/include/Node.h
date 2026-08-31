@@ -5,6 +5,9 @@
 #include <functional>
 #include <typeinfo>
 #include <string>
+#if defined(__GNUG__) && !defined(TP_NO_CXA_DEMANGLE)
+#include <cxxabi.h>
+#endif
 #include "Macros.h"
 #include "Edge.h"
 #include "Tensor.h"
@@ -160,11 +163,10 @@ private:
 };
 
 #if defined(__GNUG__) && !defined(TP_NO_CXA_DEMANGLE)
-#include <cxxabi.h>
 
 inline std::string demangle_node_name(const char* mangled) {
     int status = 0;
-    char* demangled = abi::__cxa_demangle(mangled, nullptr, nullptr, &status);
+    char* demangled = ::abi::__cxa_demangle(mangled, nullptr, nullptr, &status);
     if (status != 0 || !demangled) return mangled;
     std::string full(demangled);
     free(demangled);

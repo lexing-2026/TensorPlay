@@ -1,8 +1,10 @@
 #include "Tensor.h"
+#include "Convolution.h"
 #include "TensorImpl.h"
 #include "Dispatcher.h"
 #include "Exception.h"
 #include "Parallel.h"
+#include "Context.h"
 #include "OneDNNContext.h"
 #include "Allocator.h"
 #include "GradMode.h"
@@ -88,7 +90,9 @@ namespace tensorplay {
 namespace cpu {
 using namespace tensorplay::parallel;
 
+#ifdef USE_ONEDNN
 using namespace dnnl;
+#endif
 
 // Forward declaration of mm_kernel from LinearAlgebraKernels.cpp
 Tensor mm_kernel(const Tensor& self, const Tensor& mat2);
@@ -150,6 +154,7 @@ static Tensor conv_transpose3d_naive(const Tensor& input, const Tensor& weight, 
 // kernels and is correct for all shapes (verified standalone and in-tree).
 // Every gemm_direct call site passes contiguous row-major matrices
 // (lda == M or K, ldb == K or N, ldc == N), so plain 'ab' descs map 1:1.
+#ifdef USE_ONEDNN
 namespace {
 struct MatmulGemmKey {
     bool transA, transB;
@@ -289,6 +294,7 @@ void onednn_matmul_gemm(bool transA, bool transB, int64_t M, int64_t N, int64_t 
         for (int64_t i = 0; i < out_count; ++i) C[i] = alpha * tmp[i] + beta * C[i];
     }
 }
+#endif // USE_ONEDNN
 } // namespace
 
 // Helper for GEMM (reuse from LinearAlgebraKernels logic implicitly or duplicate for now)
@@ -1991,6 +1997,195 @@ static bool conv2d_grad_weight_onednn(const Tensor& grad_output, const Tensor& i
 }
 #endif
 
+#ifdef USE_NNPACK
+#include <nnpack.h>
+
+namespace {
+
+// NNPACK works on scratch buffers whose size depends on the chosen algorithm;
+// a thread-local arena sized by the first size-query call avoids repeated
+// allocation. 64-byte alignment satisfies the vector load/store requirements.
+constexpr size_t kNnpackAlignment = 64;
+
+struct NnpackWorkspace {
+    void* buffer = nullptr;
+    size_t size = 0;
+    void allocate() {
+        deallocate();
+        void* p = nullptr;
+        if (posix_memalign(&p, kNnpackAlignment, size) != 0) {
+            TP_THROW(RuntimeError, "NNPACK: failed to allocate workspace of size " +
+                                     std::to_string(size));
+        }
+        buffer = p;
+    }
+    void deallocate() {
+        std::free(buffer);
+        buffer = nullptr;
+    }
+    ~NnpackWorkspace() { deallocate(); }
+};
+
+thread_local NnpackWorkspace nnpack_workspace;
+
+bool nnpack_available() {
+    static const nnp_status status = nnp_initialize();
+    return status == nnp_status_success;
+}
+
+pthreadpool_t nnpack_threadpool() {
+    static pthreadpool_t pool = pthreadpool_create(static_cast<uint32_t>(
+        std::max(1, tensorplay::parallel::get_num_threads())));
+    return pool;
+}
+
+// Backend claim check for the NNPACK inference path: master switch, runtime
+// availability, float32 CPU tensors, kernel size up to 16x16 with padding
+// smaller than the kernel, and a batch large enough for NNPACK to pay off.
+bool use_nnpack_conv2d(const Tensor& input, const Tensor& weight,
+                       int64_t pH_top, int64_t pW_left) {
+    if (!tensorplay::globalContext().userEnabledNNPACK()) return false;
+    if (!nnpack_available()) return false;
+    if (input.dtype() != DType::Float32) return false;
+    const int64_t kH = weight.size(2);
+    const int64_t kW = weight.size(3);
+    if (kH >= 17 || kW >= 17) return false;
+    if (pH_top >= kH || pW_left >= kW) return false;
+    if (input.size(0) < 16) return false;
+    return true;
+}
+
+// Inference 2-D convolution through NNPACK for float32 NCHW tensors. Returns
+// false when the request falls outside the supported shape envelope or NNPACK
+// rejects the call, so the caller falls back to the generic kernels.
+bool conv2d_nnpack(const Tensor& input, const Tensor& weight, const Tensor& bias,
+                   int64_t pH_top, int64_t pH_bottom, int64_t pW_left, int64_t pW_right,
+                   int64_t sH, int64_t sW, int64_t dH, int64_t dW,
+                   int64_t groups, bool fused_relu, Tensor& out) {
+    if (!nnpack_available()) return false;
+    // NNPACK computes plain ungrouped, undilated convolutions only.
+    if (groups != 1 || dH != 1 || dW != 1) return false;
+    const int64_t N = input.size(0);
+    // Batch threshold below which the oneDNN/native paths measure faster.
+    if (N < 16) return false;
+    const int64_t kH = weight.size(2);
+    const int64_t kW = weight.size(3);
+    if (kH < 1 || kH > 16 || kW < 1 || kW > 16) return false;
+    // Symmetric padding smaller than the kernel only.
+    if (pH_top != pH_bottom || pW_left != pW_right) return false;
+    if (pH_top < 0 || pH_top >= kH || pW_left < 0 || pW_left >= kW) return false;
+    // Skip blocked oneDNN layouts; plain row-major NCHW is required.
+    if (input.unsafeGetTensorImpl()->has_onednn_md() ||
+        weight.unsafeGetTensorImpl()->has_onednn_md()) return false;
+
+    const int64_t C_in = input.size(1);
+    const int64_t H_in = input.size(2);
+    const int64_t W_in = input.size(3);
+    const int64_t C_out = weight.size(0);
+    const int64_t H_out = out.size(2);
+    const int64_t W_out = out.size(3);
+
+    Tensor bias_flat;
+    if (bias.defined()) {
+        if (bias.numel() != C_out) return false;
+        bias_flat = bias.contiguous();
+    } else {
+        bias_flat = Tensor::zeros({C_out}, input.dtype(), input.device());
+    }
+
+    const nnp_size input_size = {static_cast<size_t>(W_in), static_cast<size_t>(H_in)};
+    const nnp_padding input_padding = {
+        static_cast<size_t>(pH_top), static_cast<size_t>(pW_right),
+        static_cast<size_t>(pH_bottom), static_cast<size_t>(pW_left)};
+    const nnp_size kernel_size = {static_cast<size_t>(kW), static_cast<size_t>(kH)};
+    const nnp_size output_subsample = {static_cast<size_t>(sW), static_cast<size_t>(sH)};
+
+    const float* input_ptr = input.data_ptr<float>();
+    const float* weight_ptr = weight.data_ptr<float>();
+    const float* bias_ptr = bias_flat.data_ptr<float>();
+    float* out_ptr = out.data_ptr<float>();
+
+    const nnp_activation activation = fused_relu ? nnp_activation_relu : nnp_activation_identity;
+    const size_t input_stride_n = static_cast<size_t>(C_in * H_in * W_in);
+    const size_t output_stride_n = static_cast<size_t>(C_out * H_out * W_out);
+
+    auto compute = [&](size_t batch_size) -> nnp_status {
+        // Strided inference runs per sample; unit stride handles the whole
+        // batch in one call once batch is 1 anyway.
+        if (batch_size == 1 || sH != 1 || sW != 1) {
+            for (size_t n = 0; n < batch_size; ++n) {
+                const nnp_status st = nnp_convolution_inference(
+                    nnp_convolution_algorithm_auto,
+                    nnp_convolution_transform_strategy_compute,
+                    static_cast<size_t>(C_in), static_cast<size_t>(C_out),
+                    input_size, input_padding, kernel_size, output_subsample,
+                    input_ptr + n * input_stride_n,
+                    weight_ptr, bias_ptr,
+                    out_ptr + n * output_stride_n,
+                    nnpack_workspace.buffer, &nnpack_workspace.size,
+                    activation, nullptr, nnpack_threadpool(), nullptr);
+                if (st != nnp_status_success) return st;
+            }
+            return nnp_status_success;
+        }
+        return nnp_convolution_output(
+            nnp_convolution_algorithm_auto,
+            batch_size,
+            static_cast<size_t>(C_in), static_cast<size_t>(C_out),
+            input_size, input_padding, kernel_size,
+            input_ptr, weight_ptr, bias_ptr, out_ptr,
+            nnpack_workspace.buffer, &nnpack_workspace.size,
+            activation, nullptr, nnpack_threadpool(), nullptr);
+    };
+
+    if (nnpack_workspace.buffer == nullptr) {
+        // First call with a null buffer only records the required size.
+        if (compute(static_cast<size_t>(N)) != nnp_status_success) return false;
+        nnpack_workspace.allocate();
+    }
+    nnp_status status = compute(static_cast<size_t>(N));
+    if (status == nnp_status_insufficient_buffer) {
+        nnpack_workspace.deallocate();
+        if (compute(static_cast<size_t>(N)) != nnp_status_success) return false;
+        nnpack_workspace.allocate();
+        status = compute(static_cast<size_t>(N));
+    }
+    return status == nnp_status_success;
+}
+
+} // namespace
+#endif // USE_NNPACK
+
+#ifdef USE_ONEDNN
+namespace {
+
+// Backend claim check for the oneDNN convolution path: master switch first,
+// then the shape heuristics. Strided, dilated, batched, large, or non-1x1
+// calls are claimed; tiny single-image 1x1 convolutions measure faster on the
+// native GEMM path and stay there. Blocked oneDNN-layout inputs are always
+// claimed because only this backend understands that layout.
+bool onednn_claims_conv2d(const Tensor& input, const Tensor& weight,
+                          int64_t sH, int64_t sW, int64_t dH, int64_t dW,
+                          int64_t groups) {
+    if (!tensorplay::globalContext().userEnabledMkldnn()) return false;
+    if (input.unsafeGetTensorImpl()->has_onednn_md()) return true;
+    if (input.dtype() != DType::Float32) return false;
+    const bool strided = (sH != 1) || (sW != 1);
+    const bool dilated = (dH != 1) || (dW != 1);
+    const int64_t N = input.size(0);
+    const int64_t kH = weight.size(2);
+    const int64_t kW = weight.size(3);
+    const bool shape_prefers_onednn =
+        strided || dilated || N >= 16 || kW != 1 || kH != 1 ||
+        tensorplay::parallel::get_num_threads() > 1;
+    const bool native_slower =
+        groups > 1 || (kW > 3 && kH > 3) || N > 1 || input.numel() > 20480;
+    return shape_prefers_onednn && native_slower;
+}
+
+} // namespace
+#endif // USE_ONEDNN
+
 static Tensor conv2d_cpu_impl(const Tensor& input_arg, const Tensor& weight_arg, const Tensor& bias, const std::vector<int64_t>& stride_arg, const std::vector<int64_t>& padding_arg, const std::vector<int64_t>& dilation_arg, int64_t groups, bool fused_relu) {
     Tensor input = input_arg.contiguous();
     Tensor weight = weight_arg.contiguous();
@@ -2047,56 +2242,67 @@ static Tensor conv2d_cpu_impl(const Tensor& input_arg, const Tensor& weight_arg,
     }
 
     Tensor out = Tensor::empty({N, C_out, H_out, W_out}, input.dtype(), input.device());
-    
-    // Manual 1x1 Optimization Removed: Let OneDNN handle it for better integration and performance.
 
+    bool handled = false;
+#ifdef USE_ONEDNN
+    // oneDNN claims the call first when enabled and its shape heuristics hold;
+    // otherwise the call falls through to NNPACK or the native kernels.
+    if (onednn_claims_conv2d(input, weight, sH, sW, dH, dW, groups)) {
+        // Optimization: Winograd Input Size Alignment (User Request: Break constraints)
+        // Force padding to multiple of 8 for 3x3s1 convolutions to enable Winograd on AVX2
+        // Only apply if input is NCHW (not blocked) to avoid messing up OneDNN formats
+        if (groups == 1 && kH == 3 && kW == 3 && sH == 1 && sW == 1 && dH == 1 && dW == 1 &&
+            input.dtype() == DType::Float32 && !input.unsafeGetTensorImpl()->has_onednn_md() &&
+            !fused_relu) {
 
-    // Optimization: Winograd Input Size Alignment (User Request: Break constraints)
-    // Force padding to multiple of 8 for 3x3s1 convolutions to enable Winograd on AVX2
-    // Only apply if input is NCHW (not blocked) to avoid messing up OneDNN formats
-    if (groups == 1 && kH == 3 && kW == 3 && sH == 1 && sW == 1 && dH == 1 && dW == 1 &&
-        input.dtype() == DType::Float32 && !input.unsafeGetTensorImpl()->has_onednn_md() &&
-        !fused_relu) {
-        
-        int64_t h_padded_total = H_in + pH_top + pH_bottom;
-        int64_t w_padded_total = W_in + pW_left + pW_right;
-        
-        int64_t pad_h_extra = (h_padded_total % 8 != 0) ? (8 - (h_padded_total % 8)) : 0;
-        int64_t pad_w_extra = (w_padded_total % 8 != 0) ? (8 - (w_padded_total % 8)) : 0;
-        
-        // Check overhead to avoid performance regression
-        // Winograd usually gives 2-2.5x speedup, but padding adds copy + larger compute.
-        // We conservatively allow up to 15% overhead.
-        // 64x64 (pad=1) -> 66x66. Aligned to 72x72. Overhead ~19%. Too high.
-        double overhead = (double)((h_padded_total + pad_h_extra) * (w_padded_total + pad_w_extra)) / 
-                          (double)(h_padded_total * w_padded_total);
+            int64_t h_padded_total = H_in + pH_top + pH_bottom;
+            int64_t w_padded_total = W_in + pW_left + pW_right;
 
-        if ((pad_h_extra > 0 || pad_w_extra > 0) && overhead < 1.15) {
-            // Apply padding: (left, right, top, bottom)
-            // We need to preserve existing padding logic, so we pass 0 to conv2d_onednn
-            // and apply ALL padding here.
-            std::vector<int64_t> pads = {pW_left, pW_right + pad_w_extra, pH_top, pH_bottom + pad_h_extra};
-            Tensor input_padded = constant_pad_nd_cpu(input, pads, 0.0f);
-            
-            // Output size will be larger
-            int64_t H_out_padded = h_padded_total + pad_h_extra - 2; // 3x3 kernel: L - K + 1 = L - 3 + 1 = L - 2
-            int64_t W_out_padded = w_padded_total + pad_w_extra - 2;
-            
-            Tensor out_padded = Tensor::empty({N, C_out, H_out_padded, W_out_padded}, input.dtype(), input.device());
-            
-            if (conv2d_onednn(input_padded, weight, bias, stride, 0, 0, 0, 0, dilation, groups, out_padded)) {
-                 // Crop to original size
-                 return out_padded.slice(2, 0, H_out).slice(3, 0, W_out).contiguous();
+            int64_t pad_h_extra = (h_padded_total % 8 != 0) ? (8 - (h_padded_total % 8)) : 0;
+            int64_t pad_w_extra = (w_padded_total % 8 != 0) ? (8 - (w_padded_total % 8)) : 0;
+
+            // Check overhead to avoid performance regression
+            // Winograd usually gives 2-2.5x speedup, but padding adds copy + larger compute.
+            // We conservatively allow up to 15% overhead.
+            // 64x64 (pad=1) -> 66x66. Aligned to 72x72. Overhead ~19%. Too high.
+            double overhead = (double)((h_padded_total + pad_h_extra) * (w_padded_total + pad_w_extra)) /
+                              (double)(h_padded_total * w_padded_total);
+
+            if ((pad_h_extra > 0 || pad_w_extra > 0) && overhead < 1.15) {
+                // Apply padding: (left, right, top, bottom)
+                // We need to preserve existing padding logic, so we pass 0 to conv2d_onednn
+                // and apply ALL padding here.
+                std::vector<int64_t> pads = {pW_left, pW_right + pad_w_extra, pH_top, pH_bottom + pad_h_extra};
+                Tensor input_padded = constant_pad_nd_cpu(input, pads, 0.0f);
+
+                // Output size will be larger
+                int64_t H_out_padded = h_padded_total + pad_h_extra - 2; // 3x3 kernel: L - K + 1 = L - 3 + 1 = L - 2
+                int64_t W_out_padded = w_padded_total + pad_w_extra - 2;
+
+                Tensor out_padded = Tensor::empty({N, C_out, H_out_padded, W_out_padded}, input.dtype(), input.device());
+
+                if (conv2d_onednn(input_padded, weight, bias, stride, 0, 0, 0, 0, dilation, groups, out_padded)) {
+                     // Crop to original size
+                     return out_padded.slice(2, 0, H_out).slice(3, 0, W_out).contiguous();
+                }
             }
         }
-    }
 
-    #ifdef USE_ONEDNN
-    // Try oneDNN implementation first
-    if (conv2d_onednn(input, weight, bias, stride, pH_top, pH_bottom, pW_left, pW_right, dilation, groups, out, fused_relu)) {
+        handled = conv2d_onednn(input, weight, bias, stride, pH_top, pH_bottom, pW_left, pW_right, dilation, groups, out, fused_relu);
+    }
+#endif
+    if (handled) {
         return out;
     }
-    #endif
+
+#ifdef USE_NNPACK
+    // NNPACK inference path when oneDNN did not claim the call.
+    if (use_nnpack_conv2d(input, weight, pH_top, pW_left) &&
+        conv2d_nnpack(input, weight, bias, pH_top, pH_bottom, pW_left, pW_right,
+                      sH, sW, dH, dW, groups, fused_relu, out)) {
+        return out;
+    }
+#endif
     
     if (input.dtype() == DType::Float32) {
         // Winograd Check (F(2,3) for 3x3s1)

@@ -928,7 +928,7 @@ class DifferentiableFIR(tensorplay.autograd.Function):
         b_coeff_flipped = b_coeffs.flip(1).contiguous()
         padded_waveform = F.pad(waveform, (n_order - 1, 0))
         output = F.conv1d(padded_waveform, b_coeff_flipped.unsqueeze(1), groups=n_channel)
-        if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
+        if not tensorplay.compiler.is_compiling():
             ctx.save_for_backward(waveform, b_coeffs, output)
         return output
 
@@ -956,11 +956,9 @@ class DifferentiableFIR(tensorplay.autograd.Function):
 
     @staticmethod
     def ts_apply(waveform, b_coeffs):
-        if tensorplay.jit.is_scripting() or tensorplay.jit.is_tracing():
+        if tensorplay.compiler.is_compiling():
             return DifferentiableFIR.forward(tensorplay.empty(0), waveform, b_coeffs)
-        else:
-            return DifferentiableFIR.apply(waveform, b_coeffs)
-
+        return DifferentiableFIR.apply(waveform, b_coeffs)
 
 class DifferentiableIIR(tensorplay.autograd.Function):
     @staticmethod
@@ -975,7 +973,7 @@ class DifferentiableIIR(tensorplay.autograd.Function):
         )
         _lfilter_core_loop(waveform, a_coeff_flipped, padded_output_waveform)
         output = padded_output_waveform[:, :, n_order - 1 :]
-        if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
+        if not tensorplay.compiler.is_compiling():
             ctx.save_for_backward(waveform, a_coeffs_normalized, output)
         return output
 
@@ -1000,15 +998,19 @@ class DifferentiableIIR(tensorplay.autograd.Function):
 
     @staticmethod
     def ts_apply(waveform, a_coeffs_normalized):
-        if tensorplay.jit.is_scripting() or tensorplay.jit.is_tracing():
-            return DifferentiableIIR.forward(tensorplay.empty(0), waveform, a_coeffs_normalized)
-        else:
-            return DifferentiableIIR.apply(waveform, a_coeffs_normalized)
-
+        if tensorplay.compiler.is_compiling():
+            return DifferentiableIIR.forward(
+                tensorplay.empty(0), waveform, a_coeffs_normalized
+            )
+        return DifferentiableIIR.apply(waveform, a_coeffs_normalized)
 
 def _lfilter(waveform, a_coeffs, b_coeffs):
-    filtered_waveform = DifferentiableFIR.ts_apply(waveform, b_coeffs / a_coeffs[:, 0:1])
-    return DifferentiableIIR.ts_apply(filtered_waveform, a_coeffs / a_coeffs[:, 0:1])
+    filtered_waveform = DifferentiableFIR.ts_apply(
+        waveform, b_coeffs / a_coeffs[:, 0:1]
+    )
+    return DifferentiableIIR.ts_apply(
+        filtered_waveform, a_coeffs / a_coeffs[:, 0:1]
+    )
 
 
 def lfilter(waveform: Tensor, a_coeffs: Tensor, b_coeffs: Tensor, clamp: bool = True, batching: bool = True) -> Tensor:

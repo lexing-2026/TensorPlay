@@ -15,7 +15,7 @@ pytestmark = pytest.mark.skipif(
     not tp.cuda.is_available(), reason="CUDA runtime is not available"
 )
 
-from tensorplay.compiler import CudaGraphManager  # noqa: E402
+from tensorplay._stax import CudaGraphManager  # noqa: E402
 from tensorplay.cuda.graphs import make_graphed_callables  # noqa: E402
 
 

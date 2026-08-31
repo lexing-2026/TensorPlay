@@ -9,7 +9,7 @@ import tensorplay
 import tensorplay._C as _C
 from tensorplay._C import _add_docstr, DType
 from tensorplay import Tensor
-from tensorplay.compiler.graph import capture_call as _capture_call
+from tensorplay.graph import capture_call as _capture_call
 
 def threshold(
     input: Tensor,
@@ -170,6 +170,9 @@ def softmax(input, dim=None, dtype=None):
     return input.softmax(dim, dtype)
 
 def log_softmax(input, dim=None, dtype=None):
+    captured = _capture_call(log_softmax, (input, dim, dtype), {})
+    if captured is not None:
+        return captured
     if dim is None:
         dim = -1
     if dtype is None:
@@ -177,6 +180,9 @@ def log_softmax(input, dim=None, dtype=None):
     return _C.log_softmax(input, dim, dtype)
 
 def prelu(input, weight):
+    captured = _capture_call(prelu, (input, weight), {})
+    if captured is not None:
+        return captured
     # PReLU(x) = max(0, x) + weight * min(0, x)
     #          = relu(x) - weight * relu(-x)
     
@@ -200,6 +206,9 @@ def flatten(input, start_dim=0, end_dim=-1):
     return input.flatten(start_dim, end_dim)
 
 def embedding(input, weight, padding_idx=None, max_norm=None, norm_type=2.0, scale_grad_by_freq=False, sparse=False):
+    captured = _capture_call(embedding, (input, weight, padding_idx, max_norm, norm_type, scale_grad_by_freq, sparse), {})
+    if captured is not None:
+        return captured
     if max_norm is not None:
         raise NotImplementedError('embedding: max_norm is not supported')
     if padding_idx is None:
@@ -214,6 +223,9 @@ def embedding(input, weight, padding_idx=None, max_norm=None, norm_type=2.0, sca
 # Add more functionals as needed
 
 def dropout(input, p=0.5, training=True, inplace=False):
+    captured = _capture_call(dropout, (input, p, training, inplace), {})
+    if captured is not None:
+        return captured
     if p < 0 or p > 1:
         raise ValueError("dropout probability has to be between 0 and 1, but got {}".format(p))
     if not training or p == 0:
@@ -343,6 +355,9 @@ def conv1d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
         >>> filters = tp.randn(20, 16, 5)
         >>> F.conv1d(inputs, filters)
     """
+    captured = _capture_call(conv1d, (input, weight, bias, stride, padding, dilation, groups), {})
+    if captured is not None:
+        return captured
     stride = _single(stride)
     padding = _single(padding)
     dilation = _single(dilation)
@@ -412,6 +427,9 @@ def conv3d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
         >>> inputs = tp.randn(1, 4, 5, 5, 5)
         >>> F.conv3d(inputs, filters, padding=1)
     """
+    captured = _capture_call(conv3d, (input, weight, bias, stride, padding, dilation, groups), {})
+    if captured is not None:
+        return captured
     stride = _triple(stride)
     padding = _triple(padding)
     dilation = _triple(dilation)
@@ -420,6 +438,9 @@ def conv3d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
     return _C.conv3d(input, weight, bias, stride, padding, dilation, groups)
 
 def conv_transpose2d(input, weight, bias=None, stride=1, padding=0, output_padding=0, groups=1, dilation=1):
+    captured = _capture_call(conv_transpose2d, (input, weight, bias, stride, padding, output_padding, groups, dilation), {})
+    if captured is not None:
+        return captured
     stride = _pair(stride)
     padding = _pair(padding)
     output_padding = _pair(output_padding)
@@ -508,6 +529,9 @@ def max_pool2d(input, kernel_size, stride=None, padding=0, dilation=1, ceil_mode
                          dilation, ceil_mode)
 
 def avg_pool2d(input, kernel_size, stride=None, padding=0, ceil_mode=False, count_include_pad=True, divisor_override=None):
+    captured = _capture_call(avg_pool2d, (input, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override), {})
+    if captured is not None:
+        return captured
     kernel_size = _pair(kernel_size)
     if stride is None:
         stride = kernel_size
@@ -525,6 +549,9 @@ def adaptive_avg_pool2d(input, output_size):
     return _C.adaptive_avg_pool2d(input, output_size)
 
 def adaptive_max_pool2d(input, output_size):
+    captured = _capture_call(adaptive_max_pool2d, (input, output_size), {})
+    if captured is not None:
+        return captured
     output_size = list(_pair(output_size))
     # Route through the (values, indices) op so autograd saves indices and the
     return _C.adaptive_max_pool2d_with_indices(input, output_size)[0]
@@ -542,19 +569,31 @@ def batch_norm(input, running_mean=None, running_var=None, weight=None, bias=Non
     return _C.batch_norm(input, weight, bias, running_mean, running_var, training, momentum, eps)
 
 def layer_norm(input, normalized_shape, weight=None, bias=None, eps=1e-5):
+    captured = _capture_call(layer_norm, (input, normalized_shape, weight, bias, eps), {})
+    if captured is not None:
+        return captured
     normalized_shape = _single(normalized_shape)
     return _C.layer_norm(input, normalized_shape, weight, bias, eps)
 
 def group_norm(input, num_groups, weight=None, bias=None, eps=1e-5):
+    captured = _capture_call(group_norm, (input, num_groups, weight, bias, eps), {})
+    if captured is not None:
+        return captured
     return _C.group_norm(input, num_groups, weight, bias, eps)
 
 def instance_norm(input, running_mean=None, running_var=None, weight=None, bias=None, use_input_stats=True, momentum=0.1, eps=1e-5):
+    captured = _capture_call(instance_norm, (input, running_mean, running_var, weight, bias, use_input_stats, momentum, eps), {})
+    if captured is not None:
+        return captured
     return _C.instance_norm(input, weight, bias, running_mean, running_var, use_input_stats, momentum, eps)
 
 def pad(input, pad, mode='constant', value=0):
     r"""Pads tensor.  ``pad`` values are described starting from the last
     Non-constant modes support the last 3 dimensions of a 3D/4D/5D input
     """
+    captured = _capture_call(globals()["pad"], (input, pad, mode, value), {})
+    if captured is not None:
+        return captured
     if mode == 'constant':
         return _C.constant_pad_nd(input, list(pad), value)
     ndim = input.dim()
@@ -581,6 +620,9 @@ def pad(input, pad, mode='constant', value=0):
 
 # Loss functions
 def mse_loss(input, target, reduction='mean'):
+    captured = _capture_call(mse_loss, (input, target, reduction), {})
+    if captured is not None:
+        return captured
     if not (target.size() == input.size()):
         print(f"Warning: Using a target size ({target.size()}) that is different to the input size ({input.size()}). "
               "This will likely lead to incorrect results due to broadcasting. "
@@ -609,6 +651,9 @@ def nll_loss(input, target, weight=None, size_average=None, ignore_index=-100,
 
     See :class:`~tensorplay.nn.NLLLoss` for details.
     """
+    captured = _capture_call(nll_loss, (input, target, weight, size_average, ignore_index, reduce, reduction), {})
+    if captured is not None:
+        return captured
     if size_average is not None or reduce is not None:
         if size_average is None: size_average = True
         if reduce is None: reduce = True
@@ -658,6 +703,9 @@ def cross_entropy(input, target, weight=None, size_average=None, ignore_index=-1
 
     See :class:`~tensorplay.nn.CrossEntropyLoss` for details.
     """
+    captured = _capture_call(cross_entropy, (input, target, weight, size_average, ignore_index, reduce, reduction, label_smoothing), {})
+    if captured is not None:
+        return captured
     if size_average is not None or reduce is not None:
         reduction = _legacy_get_string(size_average, reduce)
 
@@ -850,6 +898,9 @@ def interpolate(
 
     Routes to the native ``upsample_*`` ops exactly like
     """
+    captured = _capture_call(interpolate, (input, size, scale_factor, mode, align_corners, recompute_scale_factor, antialias), {})
+    if captured is not None:
+        return captured
     if antialias:
         raise NotImplementedError("interpolate: antialias=True is not supported")
     if size is None and scale_factor is None:
@@ -1161,6 +1212,9 @@ def avg_pool1d(
     Applies a 1D average pooling over an input signal composed of several
     input planes. Input shape ``(N, C, L)`` or unbatched ``(C, L)``.
     """
+    captured = _capture_call(avg_pool1d, (input, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override), {})
+    if captured is not None:
+        return captured
     unbatched = input.dim() == 2
     x = input.unsqueeze(0) if unbatched else input
     k = _single(kernel_size)[0]
@@ -1188,6 +1242,9 @@ def max_pool1d(
     Applies a 1D max pooling over an input signal composed of several input
     planes. Input shape ``(N, C, L)`` or unbatched ``(C, L)``.
     """
+    captured = _capture_call(max_pool1d, (input, kernel_size, stride, padding, dilation, ceil_mode, return_indices), {})
+    if captured is not None:
+        return captured
     if return_indices:
         return max_pool1d_with_indices(
             input, kernel_size, stride=stride, padding=padding,
@@ -1295,6 +1352,9 @@ def local_response_norm(
 
     See :class:`~tensorplay.nn.LocalResponseNorm` for details.
     """
+    captured = _capture_call(local_response_norm, (input, size, alpha, beta, k), {})
+    if captured is not None:
+        return captured
     dim = input.dim()
     if dim < 3:
         raise ValueError(
@@ -1313,21 +1373,18 @@ def local_response_norm(
         shape[1] = n
         return tensorplay.zeros(shape, dtype=ref.dtype, device=ref.device)
 
-    if pad_left or pad_right:
-        parts = []
-        if pad_left:
-            parts.append(_zero_channels(pad_left, div))
-        parts.append(div)
-        if pad_right:
-            parts.append(_zero_channels(pad_right, div))
-        padded = tensorplay.cat(parts, dim=1)
-    else:
-        padded = div
+    # The leading zero channel beyond ``pad_left`` makes the prefix sums
+    # 1-indexed, so the window covering output channel ``i`` -- padded
+    # channels ``[i, i + size)`` -- is exactly ``cs[i + size] - cs[i]``.
+    parts = [_zero_channels(pad_left + 1, div), div]
+    if pad_right:
+        parts.append(_zero_channels(pad_right, div))
+    padded = tensorplay.cat(parts, dim=1)
 
     cs = padded.cumsum(1)
     c = input.size(1)
-    hi = tensorplay.narrow(cs, 1, pad_left + size, c)
-    lo = tensorplay.narrow(cs, 1, pad_left, c)
+    hi = tensorplay.narrow(cs, 1, size, c)
+    lo = tensorplay.narrow(cs, 1, 0, c)
     window_sum = hi - lo
 
     div = window_sum.mul(alpha / size).add(k).pow(beta)
@@ -1663,6 +1720,9 @@ def one_hot(tensor: Tensor, num_classes: int = -1) -> Tensor:
 
     Returns long tensor shaped ``tensor.shape + (num_classes,)`` with a 1 at
     """
+    captured = _capture_call(one_hot, (tensor, num_classes), {})
+    if captured is not None:
+        return captured
     if num_classes < 0:
         if tensor.numel() == 0:
             raise RuntimeError("Cannot infer num classes from empty tensor")
@@ -1796,6 +1856,9 @@ def l1_loss(
     Function that takes the mean element-wise absolute value difference.
     See :class:`~tensorplay.nn.L1Loss` for details.
     """
+    captured = _capture_call(l1_loss, (input, target, size_average, reduce, reduction, weight), {})
+    if captured is not None:
+        return captured
     if size_average is not None or reduce is not None:
         reduction = _legacy_get_string(size_average, reduce)
     if target.size() != input.size():
@@ -2268,6 +2331,9 @@ def pixel_shuffle(input: Tensor, upscale_factor: int) -> Tensor:
 
     input[n, c*r^2 + i*r + j, h, w]``.
     """
+    captured = _capture_call(pixel_shuffle, (input, upscale_factor), {})
+    if captured is not None:
+        return captured
     r = int(upscale_factor)
     if input.dim() != 4:
         raise ValueError(f"pixel_shuffle expects 4D input, got {input.dim()}D")
@@ -2285,6 +2351,9 @@ def pixel_shuffle(input: Tensor, upscale_factor: int) -> Tensor:
 def pixel_unshuffle(input: Tensor, downscale_factor: int) -> Tensor:
     r"""Reverses the :func:`pixel_shuffle` transformation: ``(*, C, H x r,
     W x r) -> (*, C x r^2, H, W)``."""
+    captured = _capture_call(pixel_unshuffle, (input, downscale_factor), {})
+    if captured is not None:
+        return captured
     r = int(downscale_factor)
     if input.dim() != 4:
         raise ValueError(f"pixel_unshuffle expects 4D input, got {input.dim()}D")
@@ -2764,94 +2833,53 @@ def embedding_bag(
             "per_sample_weights is only supported for mode='sum' "
             f"(got mode='{mode}').")
 
-    numel = input.numel()
-    dev = input.device
+    if padding_idx is not None:
+        padding_idx = int(padding_idx)
+        if padding_idx >= weight.size(0) or padding_idx < -weight.size(0):
+            raise ValueError(
+                f"padding_idx must be within the number of embeddings ({weight.size(0)}), "
+                f"got {padding_idx}")
+        if padding_idx < 0:
+            padding_idx += weight.size(0)
+    else:
+        padding_idx = -1
+
     i64 = DType.int64
+    dev = input.device
+    numel = input.numel()
     flat = input.to(i64).reshape(-1)
 
+    include_last_offset = bool(include_last_offset)
     if input.dim() == 2:
         if offsets is not None:
             raise ValueError(
                 "if input is 2D, then offsets has to be None"
                 ", as input is treated is a mini-batch of"
                 " fixed length sequences.")
-        starts = tensorplay.arange(0, numel, input.size(1), dtype=i64, device=dev)
-        # Fixed-length bags: end of each bag is start + seq_len.
-        ends = starts + int(input.size(1))
+        seq_len = int(input.size(1))
+        # Fixed-length bags: one offset per row.  A zero-width row still owns a
+        # bag, which arange cannot express with a zero step.
+        if seq_len == 0:
+            offs = tensorplay.zeros([input.size(0)], dtype=i64, device=dev)
+        else:
+            offs = tensorplay.arange(0, numel, seq_len, dtype=i64, device=dev)
         include_last_offset = False
-        num_bags = int(starts.numel())
     elif input.dim() == 1:
         if offsets is None:
             raise ValueError("offsets has to be a 1D Tensor but got None")
         if offsets.dim() != 1:
             raise ValueError("offsets has to be a 1D Tensor")
         offs = offsets.to(i64)
-        if include_last_offset:
-            num_bags = offs.numel() - 1
-            starts = offs[:num_bags] if num_bags > 0 else offs[:0]
-            ends = offs[1:]
-        else:
-            num_bags = offs.numel()
-            starts = offs
-            ends = tensorplay.cat([
-                offs[1:].to(i64),
-                tensorplay.full([1], numel, dtype=i64, device=dev),
-            ]) if numel > 0 else offs[:0]
     else:
         raise ValueError(
             f"input has to be 1D or 2D Tensor, but got Tensor of dimension {input.dim()}")
 
-    e = tensorplay.arange(numel, dtype=i64, device=dev)
-    # bag id per element: cumulative count of bag starts seen so far, minus 1
-    seg_start = e.unsqueeze(1).eq(starts.unsqueeze(0)).to(i64).sum(1)
-    bid = tensorplay.cumsum(seg_start, 0) - 1
-    mask = tensorplay.logical_and(bid >= 0, bid < num_bags)
-    if padding_idx is not None:
-        mask = tensorplay.logical_and(mask, flat.ne(int(padding_idx)))
-    bid_safe = tensorplay.where(mask, bid, num_bags)   # sentinel bucket
-
-    rows = tensorplay.embedding(weight, flat)                # (numel, D)
     if per_sample_weights is not None:
-        rows = rows * per_sample_weights.reshape(-1).unsqueeze(-1).to(rows.dtype)
+        per_sample_weights = per_sample_weights.reshape(-1).to(weight.dtype)
 
-    dsize = weight.size(1)
-    canvas = tensorplay.zeros([num_bags + 1, dsize], dtype=weight.dtype, device=dev)
-    sums = tensorplay.index_add(canvas, 0, bid_safe, rows)[:num_bags]
-
-    if mode == "sum":
-        return sums
-    if mode == "mean":
-        cnt_canvas = tensorplay.zeros([num_bags + 1], dtype=DType.float32, device=dev)
-        cnt = tensorplay.index_add(
-            cnt_canvas, 0, bid_safe,
-            tensorplay.ones(numel, dtype=DType.float32, device=dev),
-        )[:num_bags]
-        denom = cnt.clamp(min=1.0).to(weight.dtype).unsqueeze(-1)
-        return sums / denom
-
-    # mode == 'max': segment-max over each bag's valid (non-padding) rows.
-    # The previous matmul-accumulator formulation mixed elements across bags
-    # and produced shape-incompatible where() calls.
-    neg_inf = float("-inf")
-    acc = tensorplay.full([num_bags, dsize], neg_inf, dtype=weight.dtype, device=dev)
-    if num_bags > 0 and numel > 0:
-        mask_list = mask.tolist()
-        starts_list = starts.tolist()
-        ends_list = ends.tolist() if ends.numel() == num_bags else None
-        if ends_list is None:
-            # include_last_offset=False 1-D fallback: ends derived from offsets
-            offs_l = offsets.to(i64).tolist()
-            ends_list = offs_l[1:] + [numel]
-        rows_list = None
-        for g in range(num_bags):
-            s_g, e_g = int(starts_list[g]), int(ends_list[g])
-            idxs = [i for i in range(s_g, min(e_g, numel)) if mask_list[i]]
-            if not idxs:
-                continue
-            sel = rows.index_select(0, tensorplay.tensor(idxs, dtype=DType.int64, device=dev))
-            acc[int(g)] = tensorplay.amax(sel, dim=[0])
-    empty = sums.sum(1).eq(0).unsqueeze(1)
-    return tensorplay.where(empty & acc.eq(neg_inf), tensorplay.zeros_like(acc), acc)
+    return _C._embedding_bag(
+        weight, flat, offs, scale_grad_by_freq, mode_enum, sparse,
+        per_sample_weights, include_last_offset, padding_idx)[0]
 
 
 def scaled_dot_product_attention(
@@ -2927,51 +2955,6 @@ def scaled_dot_product_attention(
         keep = (_C.rand(out.shape, device=out.device) >= dropout_p).to(out.dtype) / (1.0 - dropout_p)
         out = out * keep
     return out @ value
-
-
-def upsample(input, size=None, scale_factor=None, mode="nearest", align_corners=None):
-    r"""Upsamples the input to the given :attr:`size` or :attr:`scale_factor`.
-
-    .. warning::
-        This function is deprecated in favor of :func:`interpolate`.
-        Equivalent to ``interpolate(...)``.
-    """
-    warnings.warn(
-        "`nn.functional.upsample` is deprecated. "
-        "Use `nn.functional.interpolate` instead.",
-        stacklevel=2,
-    )
-    return interpolate(input, size, scale_factor, mode=mode, align_corners=align_corners)
-
-
-def upsample_nearest(input, size=None, scale_factor=None):
-    r"""Upsamples the input using nearest neighbours.
-
-    .. warning::
-        This function is deprecated in favor of
-        :func:`interpolate` with ``mode='nearest'``.
-    """
-    warnings.warn(
-        "`nn.functional.upsample_nearest` is deprecated. "
-        "Use `nn.functional.interpolate` instead.",
-        stacklevel=2,
-    )
-    return interpolate(input, size, scale_factor, mode="nearest")
-
-
-def upsample_bilinear(input, size=None, scale_factor=None):
-    r"""Upsamples the input using bilinear upsampling.
-
-    .. warning::
-        This function is deprecated in favor of
-        :func:`interpolate` with ``mode='bilinear', align_corners=True``.
-    """
-    warnings.warn(
-        "`nn.functional.upsample_bilinear` is deprecated. "
-        "Use `nn.functional.interpolate` instead.",
-        stacklevel=2,
-    )
-    return interpolate(input, size, scale_factor, mode="bilinear", align_corners=True)
 
 
 def linear_cross_entropy(
@@ -3273,6 +3256,9 @@ def max_pool3d(
     Applies a 3D max pooling over an input signal composed of several input
     planes. Input shape ``(N, C, D, H, W)`` or unbatched ``(C, D, H, W)``.
     """
+    captured = _capture_call(max_pool3d, (input, kernel_size, stride, padding, dilation, ceil_mode, return_indices), {})
+    if captured is not None:
+        return captured
     if return_indices:
         return max_pool3d_with_indices(
             input, kernel_size, stride=stride, padding=padding,
@@ -3325,6 +3311,9 @@ def avg_pool3d(
     Applies a 3D average pooling over an input signal composed of several
     input planes. Input shape ``(N, C, D, H, W)`` or unbatched ``(C, D, H, W)``.
     """
+    captured = _capture_call(avg_pool3d, (input, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override), {})
+    if captured is not None:
+        return captured
     unbatched = input.dim() == 4
     x = input.unsqueeze(0) if unbatched else input
     kd, kh, kw = _triple(kernel_size)

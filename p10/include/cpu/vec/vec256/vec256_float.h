@@ -1,46 +1,18 @@
 #pragma once
 
-// depend on Sleef fall back to a scalar map (auto-vectorized by the
-// compiler at -O3 -mavx2), everything else uses AVX2 intrinsics.
+// Transcendental methods dispatch to the vendored SLEEF vector math
+// (runtime-dispatched entry points, see cpu/vec/SleefShims.h); the
+// remaining primitives use AVX2 intrinsics directly.
 
 #include <immintrin.h>
 #include "cpu/vec/vec_base.h"
+#include "cpu/vec/SleefShims.h"
 #include "cpu/SpecialMath.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 
-#if defined(CPU_CAPABILITY_AVX2) && defined(__GLIBC__)
-// On glibc systems libmvec exposes the same vector ABI, which gives Stax's
-// fused CPU codegen a real vector math implementation instead of falling
-// back to eight scalar calls through map().
-extern "C" {
-__m256 _ZGVdN8v_sinf(__m256);
-__m256 _ZGVdN8v_cosf(__m256);
-__m256 _ZGVdN8v_expf(__m256);
-__m256 _ZGVdN8v_logf(__m256);
-__m256 _ZGVdN8v_tanhf(__m256);
-__m256 _ZGVdN8v__acosf(__m256);
-__m256 _ZGVdN8v__acoshf(__m256);
-__m256 _ZGVdN8v__asinf(__m256);
-__m256 _ZGVdN8v__asinhf(__m256);
-__m256 _ZGVdN8v__atanf(__m256);
-__m256 _ZGVdN8v__atanhf(__m256);
-__m256 _ZGVdN8v__cosf(__m256);
-__m256 _ZGVdN8v__coshf(__m256);
-__m256 _ZGVdN8v__erff(__m256);
-__m256 _ZGVdN8v__erfcf(__m256);
-__m256 _ZGVdN8v__exp2f(__m256);
-__m256 _ZGVdN8v__expm1f(__m256);
-__m256 _ZGVdN8v__log2f(__m256);
-__m256 _ZGVdN8v__log10f(__m256);
-__m256 _ZGVdN8v__log1pf(__m256);
-__m256 _ZGVdN8v__sinf(__m256);
-__m256 _ZGVdN8v__sinhf(__m256);
-__m256 _ZGVdN8v__tanf(__m256);
-}
-#endif
 
 #if defined(CPU_CAPABILITY_AVX2)
 
@@ -209,56 +181,25 @@ struct Vectorized<float> {
     return *this;
   }
   Vectorized<float> acos() const {
-    #if defined(__GLIBC__)
-    return _ZGVdN8v__acosf(values);
-#else
-    return map(std::acos);
-#endif
+    return tensorplay::tpsleef::acos(values);
   }
   Vectorized<float> acosh() const {
-    #if defined(__GLIBC__)
-    return _ZGVdN8v__acoshf(values);
-#else
-    return map(std::acosh);
-#endif
+    return tensorplay::tpsleef::acosh(values);
   }
   Vectorized<float> asin() const {
-    #if defined(__GLIBC__)
-    return _ZGVdN8v__asinf(values);
-#else
-    return map(std::asin);
-#endif
+    return tensorplay::tpsleef::asin(values);
   }
   Vectorized<float> asinh() const {
-    #if defined(__GLIBC__)
-    return _ZGVdN8v__asinhf(values);
-#else
-    return map(std::asinh);
-#endif
+    return tensorplay::tpsleef::asinh(values);
   }
   Vectorized<float> atan() const {
-    #if defined(__GLIBC__)
-    return _ZGVdN8v__atanf(values);
-#else
-    return map(std::atan);
-#endif
+    return tensorplay::tpsleef::atan(values);
   }
   Vectorized<float> atanh() const {
-    #if defined(__GLIBC__)
-    return _ZGVdN8v__atanhf(values);
-#else
-    return map(std::atanh);
-#endif
+    return tensorplay::tpsleef::atanh(values);
   }
   Vectorized<float> atan2(const Vectorized<float>& exp) const {
-    __at_align__ float tmp[size()];
-    __at_align__ float tmp_x[size()];
-    store(tmp);
-    exp.store(tmp_x);
-    for (const auto i : tensorplay::irange(size())) {
-      tmp[i] = std::atan2(tmp[i], tmp_x[i]);
-    }
-    return loadu(tmp);
+    return tensorplay::tpsleef::atan2(values, exp.values);
   }
   Vectorized<float> copysign(const Vectorized<float>& sign) const {
     // clear sign bit of a, and merge with sign bit of b
@@ -267,45 +208,25 @@ struct Vectorized<float> {
         _mm256_and_ps(_mm256_set1_ps(-0.0f), sign));
   }
   Vectorized<float> erf() const {
-    #if defined(__GLIBC__)
-    return _ZGVdN8v__erff(values);
-#else
-    return map(std::erf);
-#endif
+    return tensorplay::tpsleef::erf(values);
   }
   Vectorized<float> erfc() const {
-    #if defined(__GLIBC__)
-    return _ZGVdN8v__erfcf(values);
-#else
-    return map(std::erfc);
-#endif
+    return tensorplay::tpsleef::erfc(values);
   }
   Vectorized<float> exp() const {
-#if defined(__GLIBC__)
-    return _ZGVdN8v_expf(values);
-#else
-    return map(std::exp);
-#endif
+    return tensorplay::tpsleef::exp(values);
   }
   Vectorized<float> exp2() const {
-    #if defined(__GLIBC__)
-    return _ZGVdN8v__exp2f(values);
-#else
-    return map(std::exp2);
-#endif
+    return tensorplay::tpsleef::exp2(values);
   }
   Vectorized<float> expm1() const {
-    #if defined(__GLIBC__)
-    return _ZGVdN8v__expm1f(values);
-#else
-    return map(std::expm1);
-#endif
+    return tensorplay::tpsleef::expm1(values);
   }
   Vectorized<float> exp_u20() const {
-    return map(std::exp);
+    return tensorplay::tpsleef::exp(values);
   }
   Vectorized<float> fexp_u20() const {
-    return map(std::exp);
+    return tensorplay::tpsleef::exp(values);
   }
   Vectorized<float> fmod(const Vectorized<float>& q) const {
     __at_align__ float tmp[size()];
@@ -318,65 +239,31 @@ struct Vectorized<float> {
     return loadu(tmp);
   }
   Vectorized<float> log() const {
-#if defined(__GLIBC__)
-    return _ZGVdN8v_logf(values);
-#else
-    return map(std::log);
-#endif
+    return tensorplay::tpsleef::log(values);
   }
   Vectorized<float> log2() const {
-    #if defined(__GLIBC__)
-    return _ZGVdN8v__log2f(values);
-#else
-    return map(std::log2);
-#endif
+    return tensorplay::tpsleef::log2(values);
   }
   Vectorized<float> log10() const {
-    #if defined(__GLIBC__)
-    return _ZGVdN8v__log10f(values);
-#else
-    return map(std::log10);
-#endif
+    return tensorplay::tpsleef::log10(values);
   }
   Vectorized<float> log1p() const {
-    #if defined(__GLIBC__)
-    return _ZGVdN8v__log1pf(values);
-#else
-    return map(std::log1p);
-#endif
+    return tensorplay::tpsleef::log1p(values);
   }
   Vectorized<float> ceil() const {
     return _mm256_ceil_ps(values);
   }
   Vectorized<float> cos() const {
-#if defined(__GLIBC__)
-    return _ZGVdN8v_cosf(values);
-#else
-    #if defined(__GLIBC__)
-    return _ZGVdN8v__cosf(values);
-#else
-    return map(std::cos);
-#endif
-#endif
+    return tensorplay::tpsleef::cos(values);
   }
   Vectorized<float> cosh() const {
-    #if defined(__GLIBC__)
-    return _ZGVdN8v__coshf(values);
-#else
-    return map(std::cosh);
-#endif
+    return tensorplay::tpsleef::cosh(values);
   }
   Vectorized<float> floor() const {
     return _mm256_floor_ps(values);
   }
   Vectorized<float> hypot(const Vectorized<float>& b) const {
-    __at_align__ float tmp[kSize], tmp_y[kSize], tmp_result[kSize];
-    store(tmp);
-    b.store(tmp_y);
-    for (int64_t i = 0; i < kSize; i++) {
-      tmp_result[i] = std::hypot(tmp[i], tmp_y[i]);
-    }
-    return loadu(tmp_result);
+    return tensorplay::tpsleef::hypot(values, b.values);
   }
   Vectorized<float> neg() const {
     return _mm256_xor_ps(values, _mm256_set1_ps(-0.0f));
@@ -395,36 +282,16 @@ struct Vectorized<float> {
         values, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
   }
   Vectorized<float> sin() const {
-#if defined(__GLIBC__)
-    return _ZGVdN8v_sinf(values);
-#else
-    #if defined(__GLIBC__)
-    return _ZGVdN8v__sinf(values);
-#else
-    return map(std::sin);
-#endif
-#endif
+    return tensorplay::tpsleef::sin(values);
   }
   Vectorized<float> sinh() const {
-    #if defined(__GLIBC__)
-    return _ZGVdN8v__sinhf(values);
-#else
-    return map(std::sinh);
-#endif
+    return tensorplay::tpsleef::sinh(values);
   }
   Vectorized<float> tan() const {
-    #if defined(__GLIBC__)
-    return _ZGVdN8v__tanf(values);
-#else
-    return map(std::tan);
-#endif
+    return tensorplay::tpsleef::tan(values);
   }
   Vectorized<float> tanh() const {
-#if defined(__GLIBC__)
-    return _ZGVdN8v_tanhf(values);
-#else
-    return map(std::tanh);
-#endif
+    return tensorplay::tpsleef::tanh(values);
   }
   Vectorized<float> trunc() const {
     return _mm256_round_ps(values, (_MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC));
@@ -462,13 +329,7 @@ struct Vectorized<float> {
     return _mm256_div_ps(_mm256_set1_ps(1), _mm256_sqrt_ps(values));
   }
   Vectorized<float> pow(const Vectorized<float>& b) const {
-    __at_align__ float tmp[kSize], tmp_y[kSize], tmp_result[kSize];
-    store(tmp);
-    b.store(tmp_y);
-    for (int64_t i = 0; i < kSize; i++) {
-      tmp_result[i] = std::pow(tmp[i], tmp_y[i]);
-    }
-    return loadu(tmp_result);
+    return tensorplay::tpsleef::pow(values, b.values);
   }
   float reduce_add() const {
     auto v = values;

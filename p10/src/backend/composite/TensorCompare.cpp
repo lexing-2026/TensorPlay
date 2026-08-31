@@ -36,7 +36,7 @@ Tensor isin_tensor_tensor_native(const Tensor& elements,
     }
     const Tensor test_flat = ops::reshape(test_elements, {-1});
     Tensor result = ops::any(
-        ops::eq(ops::unsqueeze(elements, -1), test_flat), {-1}, false);
+        ops::eq(ops::unsqueeze(elements, -1), test_flat), int64_t(-1), false);
     if (invert) result = ops::logical_not(result);
     return result;
 }
@@ -55,7 +55,7 @@ Tensor isin_scalar_tensor_native(const Scalar& element,
                                  bool /*assume_unique*/, bool invert) {
     isin_dtype_check(test_elements.dtype());
     // bool result.
-    Tensor result = ops::any(ops::eq(test_elements, element));
+    Tensor result = ops::any(ops::eq(test_elements, element), std::nullopt, false);
     if (invert) result = ops::logical_not(result);
     return result;
 }

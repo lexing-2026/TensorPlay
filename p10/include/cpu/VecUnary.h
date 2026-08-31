@@ -8,10 +8,10 @@
 //   compiling without ISA flags while the hot loops get real AVX2 codegen.
 //   Dispatch happens once per chunk through avx2_available(); below-AVX2
 //   machines transparently keep the previous scalar behaviour.
-// * Transcendentals resolve to glibc's libmvec vector ABI (_ZGVdN8v_*f /
-//   _ZGVdN4v_*, merged into libm since glibc 2.35 and already linked into
-//   libp10).  Composite activations reuse those building blocks so results
-//   stay bit-compatible with the scalar formulas used by PointwiseKernels.cpp.
+// * Transcendentals dispatch to the vendored SLEEF vector math through
+//   cpu/vec/SleefShims.h (runtime-dispatched entry points, linked into
+//   libp10).  Composite activations reuse those building blocks, so the
+//   fast path and the scalar tail implement the same formulas.
 // * lgamma has no libmvec entry point; it uses a Lanczos expansion restricted
 //   to strictly positive inputs (blocks containing non-positive or NaN values
 //   fall back to the scalar std::lgamma, which handles the reflection domain).
@@ -26,12 +26,15 @@
 #include "Half.h"
 #include "BFloat16.h"
 
+#include "cpu/vec/SleefShims.h"
+
 #if defined(__x86_64__) || defined(__i386__)
 #define TP_VECUNARY_X86 1
 #endif
 
-#if defined(TP_VECUNARY_X86) && defined(__GLIBC__) && defined(__x86_64__)
-#define TP_VECUNARY_LIBMVEC 1
+#if defined(TP_VECUNARY_X86) && defined(__x86_64__) \
+    && (defined(__GNUC__) || defined(__clang__))
+#define TP_VECUNARY_SLEEF 1
 #endif
 
 namespace tensorplay {
@@ -102,97 +105,9 @@ inline bool f64_rounding_sensitive(VOp op) {
 }
 
 // ---------------------------------------------------------------------------
-// libmvec declarations (glibc >= 2.35 ships these inside libm/libmvec; p10
-// already links libmvec for the stax fused kernels).
+// SLEEF entry points are declared in cpu/vec/SleefShims.h; the runtime
+// CPU dispatch happens inside libsleef.
 // ---------------------------------------------------------------------------
-#ifdef TP_VECUNARY_LIBMVEC
-extern "C" {
-__m256 _ZGVdN8v_acosf(__m256);
-__m256 _ZGVdN8v_acoshf(__m256);
-__m256 _ZGVdN8v_asinf(__m256);
-__m256 _ZGVdN8v_asinhf(__m256);
-__m256 _ZGVdN8v_atanf(__m256);
-__m256 _ZGVdN8v_atanhf(__m256);
-__m256 _ZGVdN8v_cosf(__m256);
-__m256 _ZGVdN8v_coshf(__m256);
-__m256 _ZGVdN8v_erff(__m256);
-__m256 _ZGVdN8v_erfcf(__m256);
-__m256 _ZGVdN8v_expf(__m256);
-__m256 _ZGVdN8v_expm1f(__m256);
-__m256 _ZGVdN8v_logf(__m256);
-__m256 _ZGVdN8v_log10f(__m256);
-__m256 _ZGVdN8v_log1pf(__m256);
-__m256 _ZGVdN8v_log2f(__m256);
-__m256 _ZGVdN8v_sinf(__m256);
-__m256 _ZGVdN8v_sinhf(__m256);
-__m256 _ZGVdN8v_tanf(__m256);
-__m256 _ZGVdN8v_tanhf(__m256);
-
-__m256d _ZGVdN4v_acos(__m256d);
-__m256d _ZGVdN4v_acosh(__m256d);
-__m256d _ZGVdN4v_asin(__m256d);
-__m256d _ZGVdN4v_asinh(__m256d);
-__m256d _ZGVdN4v_atan(__m256d);
-__m256d _ZGVdN4v_atanh(__m256d);
-__m256d _ZGVdN4v_cos(__m256d);
-__m256d _ZGVdN4v_cosh(__m256d);
-__m256d _ZGVdN4v_erf(__m256d);
-__m256d _ZGVdN4v_erfc(__m256d);
-__m256d _ZGVdN4v_exp(__m256d);
-__m256d _ZGVdN4v_expm1(__m256d);
-__m256d _ZGVdN4v_log(__m256d);
-__m256d _ZGVdN4v_log10(__m256d);
-__m256d _ZGVdN4v_log1p(__m256d);
-__m256d _ZGVdN4v_log2(__m256d);
-__m256d _ZGVdN4v_sin(__m256d);
-__m256d _ZGVdN4v_sinh(__m256d);
-__m256d _ZGVdN4v_tan(__m256d);
-__m256d _ZGVdN4v_tanh(__m256d);
-
-// AVX-512 widths (Zen4 native); same glibc vector ABI.
-__m512 _ZGVeN16v_acosf(__m512);
-__m512 _ZGVeN16v_acoshf(__m512);
-__m512 _ZGVeN16v_asinf(__m512);
-__m512 _ZGVeN16v_asinhf(__m512);
-__m512 _ZGVeN16v_atanf(__m512);
-__m512 _ZGVeN16v_atanhf(__m512);
-__m512 _ZGVeN16v_cosf(__m512);
-__m512 _ZGVeN16v_coshf(__m512);
-__m512 _ZGVeN16v_erff(__m512);
-__m512 _ZGVeN16v_erfcf(__m512);
-__m512 _ZGVeN16v_expf(__m512);
-__m512 _ZGVeN16v_expm1f(__m512);
-__m512 _ZGVeN16v_logf(__m512);
-__m512 _ZGVeN16v_log10f(__m512);
-__m512 _ZGVeN16v_log1pf(__m512);
-__m512 _ZGVeN16v_log2f(__m512);
-__m512 _ZGVeN16v_sinf(__m512);
-__m512 _ZGVeN16v_sinhf(__m512);
-__m512 _ZGVeN16v_tanf(__m512);
-__m512 _ZGVeN16v_tanhf(__m512);
-
-__m512d _ZGVeN8v_acos(__m512d);
-__m512d _ZGVeN8v_acosh(__m512d);
-__m512d _ZGVeN8v_asin(__m512d);
-__m512d _ZGVeN8v_asinh(__m512d);
-__m512d _ZGVeN8v_atan(__m512d);
-__m512d _ZGVeN8v_atanh(__m512d);
-__m512d _ZGVeN8v_cos(__m512d);
-__m512d _ZGVeN8v_cosh(__m512d);
-__m512d _ZGVeN8v_erf(__m512d);
-__m512d _ZGVeN8v_erfc(__m512d);
-__m512d _ZGVeN8v_exp(__m512d);
-__m512d _ZGVeN8v_expm1(__m512d);
-__m512d _ZGVeN8v_log(__m512d);
-__m512d _ZGVeN8v_log10(__m512d);
-__m512d _ZGVeN8v_log1p(__m512d);
-__m512d _ZGVeN8v_log2(__m512d);
-__m512d _ZGVeN8v_sin(__m512d);
-__m512d _ZGVeN8v_sinh(__m512d);
-__m512d _ZGVeN8v_tan(__m512d);
-__m512d _ZGVeN8v_tanh(__m512d);
-}
-#endif // TP_VECUNARY_LIBMVEC
 
 // ---------------------------------------------------------------------------
 // Scalar reference implementations.  These reuse the formulas in
@@ -312,7 +227,7 @@ inline T scalar_apply(VOp op, VParams prm, T x) {
 // AVX2 helpers.  Everything below either carries a target attribute itself or
 // is always_inline so it folds into an attributed caller.
 // ---------------------------------------------------------------------------
-#ifdef TP_VECUNARY_LIBMVEC
+#ifdef TP_VECUNARY_SLEEF
 
 constexpr float kSignBitF = -0.0f;
 
@@ -342,10 +257,10 @@ inline __m256 v_lgamma_pos_f32(__m256 x) {
     __m256 t = _mm256_add_ps(z, _mm256_set1_ps(7.5f));
     __m256 res = _mm256_sub_ps(
         _mm256_fmadd_ps(_mm256_add_ps(z, _mm256_set1_ps(0.5f)),
-                        _ZGVdN8v_logf(t), _mm256_set1_ps(static_cast<float>(kHalfLogTwoPi))),
+                        tensorplay::tpsleef::log(t), _mm256_set1_ps(static_cast<float>(kHalfLogTwoPi))),
         t);
-    res = _mm256_add_ps(res, _ZGVdN8v_logf(series));
-    return _mm256_sub_ps(res, _mm256_and_ps(small, _ZGVdN8v_logf(x)));
+    res = _mm256_add_ps(res, tensorplay::tpsleef::log(series));
+    return _mm256_sub_ps(res, _mm256_and_ps(small, tensorplay::tpsleef::log(x)));
 }
 
 __attribute__((target("avx2,fma"), always_inline))
@@ -365,10 +280,10 @@ inline __m256d v_lgamma_pos_f64(__m256d x) {
     __m256d t = _mm256_add_pd(z, _mm256_set1_pd(7.5));
     __m256d res = _mm256_sub_pd(
         _mm256_fmadd_pd(_mm256_add_pd(z, _mm256_set1_pd(0.5)),
-                        _ZGVdN4v_log(t), _mm256_set1_pd(kHalfLogTwoPi)),
+                        tensorplay::tpsleef::log(t), _mm256_set1_pd(kHalfLogTwoPi)),
         t);
-    res = _mm256_add_pd(res, _ZGVdN4v_log(series));
-    return _mm256_sub_pd(res, _mm256_and_pd(small, _ZGVdN4v_log(x)));
+    res = _mm256_add_pd(res, tensorplay::tpsleef::log(series));
+    return _mm256_sub_pd(res, _mm256_and_pd(small, tensorplay::tpsleef::log(x)));
 }
 
 // Reciprocal via rcp + Newton-Raphson refinements: _mm256_rcp_ps seeds at
@@ -407,26 +322,26 @@ inline __m256 apply_f32(VOp op, VParams prm, __m256 x) {
         case VOp::Round: return _mm256_round_ps(x, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
         case VOp::Frac: return _mm256_sub_ps(x, _mm256_round_ps(x, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC));
         case VOp::Relu: return _mm256_max_ps(zero, x); // NaN propagates (second operand wins)
-        case VOp::Exp: return _ZGVdN8v_expf(x);
-        case VOp::Expm1: return _ZGVdN8v_expm1f(x);
-        case VOp::Log: return _ZGVdN8v_logf(x);
-        case VOp::Log2: return _ZGVdN8v_log2f(x);
-        case VOp::Log10: return _ZGVdN8v_log10f(x);
-        case VOp::Log1p: return _ZGVdN8v_log1pf(x);
-        case VOp::Sin: return _ZGVdN8v_sinf(x);
-        case VOp::Cos: return _ZGVdN8v_cosf(x);
-        case VOp::Tan: return _ZGVdN8v_tanf(x);
-        case VOp::Asin: return _ZGVdN8v_asinf(x);
-        case VOp::Acos: return _ZGVdN8v_acosf(x);
-        case VOp::Atan: return _ZGVdN8v_atanf(x);
-        case VOp::Sinh: return _ZGVdN8v_sinhf(x);
-        case VOp::Cosh: return _ZGVdN8v_coshf(x);
-        case VOp::Tanh: return _ZGVdN8v_tanhf(x);
-        case VOp::Asinh: return _ZGVdN8v_asinhf(x);
-        case VOp::Acosh: return _ZGVdN8v_acoshf(x);
-        case VOp::Atanh: return _ZGVdN8v_atanhf(x);
-        case VOp::Erf: return _ZGVdN8v_erff(x);
-        case VOp::Erfc: return _ZGVdN8v_erfcf(x);
+        case VOp::Exp: return tensorplay::tpsleef::exp(x);
+        case VOp::Expm1: return tensorplay::tpsleef::expm1(x);
+        case VOp::Log: return tensorplay::tpsleef::log(x);
+        case VOp::Log2: return tensorplay::tpsleef::log2(x);
+        case VOp::Log10: return tensorplay::tpsleef::log10(x);
+        case VOp::Log1p: return tensorplay::tpsleef::log1p(x);
+        case VOp::Sin: return tensorplay::tpsleef::sin(x);
+        case VOp::Cos: return tensorplay::tpsleef::cos(x);
+        case VOp::Tan: return tensorplay::tpsleef::tan(x);
+        case VOp::Asin: return tensorplay::tpsleef::asin(x);
+        case VOp::Acos: return tensorplay::tpsleef::acos(x);
+        case VOp::Atan: return tensorplay::tpsleef::atan(x);
+        case VOp::Sinh: return tensorplay::tpsleef::sinh(x);
+        case VOp::Cosh: return tensorplay::tpsleef::cosh(x);
+        case VOp::Tanh: return tensorplay::tpsleef::tanh(x);
+        case VOp::Asinh: return tensorplay::tpsleef::asinh(x);
+        case VOp::Acosh: return tensorplay::tpsleef::acosh(x);
+        case VOp::Atanh: return tensorplay::tpsleef::atanh(x);
+        case VOp::Erf: return tensorplay::tpsleef::erf(x);
+        case VOp::Erfc: return tensorplay::tpsleef::erfc(x);
         case VOp::Lgamma: {
             // Callers guarantee all lanes > 0 here.
             return v_lgamma_pos_f32(x);
@@ -435,7 +350,7 @@ inline __m256 apply_f32(VOp op, VParams prm, __m256 x) {
             // rcp+NR instead of divps.  Division corners reproduced: den==inf
             // (x <= -88.7, exp overflowed) must yield +0 like 1/inf, and a NaN
             // denominator must stay NaN -- hence the two mask repairs.
-            __m256 den = _mm256_add_ps(one, _ZGVdN8v_expf(_mm256_xor_ps(x, signbit)));
+            __m256 den = _mm256_add_ps(one, tensorplay::tpsleef::exp(_mm256_xor_ps(x, signbit)));
             __m256 r = v_rcp_nr_ps(den);
             __m256 not_inf = _mm256_cmp_ps(den, _mm256_set1_ps(INFINITY), _CMP_NEQ_OQ);
             __m256 zeroed = _mm256_and_ps(not_inf, r);
@@ -444,7 +359,7 @@ inline __m256 apply_f32(VOp op, VParams prm, __m256 x) {
         }
         case VOp::GeluNone: {
             const __m256 kAlpha = _mm256_set1_ps(static_cast<float>(0.70710678118654752440));
-            __m256 cdf = _mm256_add_ps(one, _ZGVdN8v_erff(_mm256_mul_ps(kAlpha, x)));
+            __m256 cdf = _mm256_add_ps(one, tensorplay::tpsleef::erf(_mm256_mul_ps(kAlpha, x)));
             return _mm256_mul_ps(_mm256_mul_ps(_mm256_set1_ps(0.5f), x), cdf);
         }
         case VOp::GeluTanh: {
@@ -452,27 +367,27 @@ inline __m256 apply_f32(VOp op, VParams prm, __m256 x) {
             const __m256 kKappa = _mm256_set1_ps(0.044715f);
             __m256 x_cube = _mm256_mul_ps(_mm256_mul_ps(x, x), x);
             __m256 inner = _mm256_mul_ps(kBeta, _mm256_add_ps(x, _mm256_mul_ps(kKappa, x_cube)));
-            __m256 cdf = _mm256_add_ps(one, _ZGVdN8v_tanhf(inner));
+            __m256 cdf = _mm256_add_ps(one, tensorplay::tpsleef::tanh(inner));
             return _mm256_mul_ps(_mm256_mul_ps(_mm256_set1_ps(0.5f), x), cdf);
         }
         case VOp::Silu: {
             // x * rcp_nr(den) matches x/den bit-for-bit in every corner here:
             // den==inf makes the NR chain NaN exactly like -inf/+inf division,
             // and finite dens get a float-exact reciprocal.
-            __m256 den = _mm256_add_ps(one, _ZGVdN8v_expf(_mm256_xor_ps(x, signbit)));
+            __m256 den = _mm256_add_ps(one, tensorplay::tpsleef::exp(_mm256_xor_ps(x, signbit)));
             return _mm256_mul_ps(x, v_rcp_nr_ps(den));
         }
         case VOp::Mish: {
             // Uses the scalar expression: log((1 + exp(x))) * tanh(...) — plain
             // log, not log1p, and overflow-to-inf semantics are preserved.
-            __m256 sp = _ZGVdN8v_logf(_mm256_add_ps(one, _ZGVdN8v_expf(x)));
-            return _mm256_mul_ps(x, _ZGVdN8v_tanhf(sp));
+            __m256 sp = tensorplay::tpsleef::log(_mm256_add_ps(one, tensorplay::tpsleef::exp(x)));
+            return _mm256_mul_ps(x, tensorplay::tpsleef::tanh(sp));
         }
         case VOp::Selu: {
             const __m256 lambda = _mm256_set1_ps(static_cast<float>(1.0507009873554804934193349852946));
             const __m256 alphalambda = _mm256_set1_ps(static_cast<float>(1.6732632423543772848170429916717 * 1.0507009873554804934193349852946));
             __m256 pos = _mm256_mul_ps(x, lambda);
-            __m256 neg = _mm256_mul_ps(alphalambda, _ZGVdN8v_expm1f(x));
+            __m256 neg = _mm256_mul_ps(alphalambda, tensorplay::tpsleef::expm1(x));
             return _mm256_blendv_ps(neg, pos, _mm256_cmp_ps(x, zero, _CMP_GT_OQ));
         }
         case VOp::Elu: {
@@ -480,7 +395,7 @@ inline __m256 apply_f32(VOp op, VParams prm, __m256 x) {
             const __m256 poscoef = _mm256_set1_ps(static_cast<float>(prm.p1)); // scale
             const __m256 negipt = _mm256_set1_ps(static_cast<float>(prm.p2));  // input_scale
             __m256 scaled = _mm256_mul_ps(x, negipt);
-            __m256 neg = _mm256_mul_ps(_ZGVdN8v_expm1f(scaled), negcoef);
+            __m256 neg = _mm256_mul_ps(tensorplay::tpsleef::expm1(scaled), negcoef);
             __m256 pos = _mm256_mul_ps(x, poscoef);
             return _mm256_blendv_ps(neg, pos, _mm256_cmp_ps(x, zero, _CMP_GE_OQ));
         }
@@ -491,7 +406,7 @@ inline __m256 apply_f32(VOp op, VParams prm, __m256 x) {
             const __m256 threshold = _mm256_set1_ps(static_cast<float>(prm.p1));
             const __m256d beta_d = _mm256_set1_pd(prm.p0);
             __m256 bx = _mm256_mul_ps(x, beta);
-            __m256 numf = _ZGVdN8v_log1pf(_ZGVdN8v_expf(bx));
+            __m256 numf = tensorplay::tpsleef::log1p(tensorplay::tpsleef::exp(bx));
             __m256d lo_d = _mm256_div_pd(_mm256_cvtps_pd(_mm256_castps256_ps128(numf)), beta_d);
             __m256d hi_d = _mm256_div_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(numf, 1)), beta_d);
             __m256 sp = _mm256_insertf128_ps(_mm256_castps128_ps256(_mm256_cvtpd_ps(lo_d)),
@@ -526,7 +441,7 @@ inline __m256 apply_f32(VOp op, VParams prm, __m256 x) {
             return _mm256_min_ps(_mm256_max_ps(x, zero), _mm256_set1_ps(6.0f));
         case VOp::Celu: {
             const __m256 a = _mm256_set1_ps(static_cast<float>(prm.p0));
-            __m256 neg = _mm256_mul_ps(a, _ZGVdN8v_expm1f(_mm256_div_ps(x, a)));
+            __m256 neg = _mm256_mul_ps(a, tensorplay::tpsleef::expm1(_mm256_div_ps(x, a)));
             __m256 pos = _mm256_max_ps(zero, x);
             __m256 minneg = _mm256_min_ps(neg, zero);
             return _mm256_add_ps(pos, minneg);
@@ -577,32 +492,32 @@ inline __m256d apply_f64(VOp op, VParams prm, __m256d x) {
         case VOp::Round: return _mm256_round_pd(x, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
         case VOp::Frac: return _mm256_sub_pd(x, _mm256_round_pd(x, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC));
         case VOp::Relu: return _mm256_max_pd(zero, x);
-        case VOp::Exp: return _ZGVdN4v_exp(x);
-        case VOp::Expm1: return _ZGVdN4v_expm1(x);
-        case VOp::Log: return _ZGVdN4v_log(x);
-        case VOp::Log2: return _ZGVdN4v_log2(x);
-        case VOp::Log10: return _ZGVdN4v_log10(x);
-        case VOp::Log1p: return _ZGVdN4v_log1p(x);
-        case VOp::Sin: return _ZGVdN4v_sin(x);
-        case VOp::Cos: return _ZGVdN4v_cos(x);
-        case VOp::Tan: return _ZGVdN4v_tan(x);
-        case VOp::Asin: return _ZGVdN4v_asin(x);
-        case VOp::Acos: return _ZGVdN4v_acos(x);
-        case VOp::Atan: return _ZGVdN4v_atan(x);
-        case VOp::Sinh: return _ZGVdN4v_sinh(x);
-        case VOp::Cosh: return _ZGVdN4v_cosh(x);
-        case VOp::Tanh: return _ZGVdN4v_tanh(x);
-        case VOp::Asinh: return _ZGVdN4v_asinh(x);
-        case VOp::Acosh: return _ZGVdN4v_acosh(x);
-        case VOp::Atanh: return _ZGVdN4v_atanh(x);
-        case VOp::Erf: return _ZGVdN4v_erf(x);
-        case VOp::Erfc: return _ZGVdN4v_erfc(x);
+        case VOp::Exp: return tensorplay::tpsleef::exp(x);
+        case VOp::Expm1: return tensorplay::tpsleef::expm1(x);
+        case VOp::Log: return tensorplay::tpsleef::log(x);
+        case VOp::Log2: return tensorplay::tpsleef::log2(x);
+        case VOp::Log10: return tensorplay::tpsleef::log10(x);
+        case VOp::Log1p: return tensorplay::tpsleef::log1p(x);
+        case VOp::Sin: return tensorplay::tpsleef::sin(x);
+        case VOp::Cos: return tensorplay::tpsleef::cos(x);
+        case VOp::Tan: return tensorplay::tpsleef::tan(x);
+        case VOp::Asin: return tensorplay::tpsleef::asin(x);
+        case VOp::Acos: return tensorplay::tpsleef::acos(x);
+        case VOp::Atan: return tensorplay::tpsleef::atan(x);
+        case VOp::Sinh: return tensorplay::tpsleef::sinh(x);
+        case VOp::Cosh: return tensorplay::tpsleef::cosh(x);
+        case VOp::Tanh: return tensorplay::tpsleef::tanh(x);
+        case VOp::Asinh: return tensorplay::tpsleef::asinh(x);
+        case VOp::Acosh: return tensorplay::tpsleef::acosh(x);
+        case VOp::Atanh: return tensorplay::tpsleef::atanh(x);
+        case VOp::Erf: return tensorplay::tpsleef::erf(x);
+        case VOp::Erfc: return tensorplay::tpsleef::erfc(x);
         case VOp::Lgamma: return v_lgamma_pos_f64(x);
         case VOp::Sigmoid:
-            return _mm256_div_pd(one, _mm256_add_pd(one, _ZGVdN4v_exp(_mm256_xor_pd(x, signbit))));
+            return _mm256_div_pd(one, _mm256_add_pd(one, tensorplay::tpsleef::exp(_mm256_xor_pd(x, signbit))));
         case VOp::GeluNone: {
             const __m256d kAlpha = _mm256_set1_pd(0.70710678118654752440);
-            __m256d cdf = _mm256_add_pd(one, _ZGVdN4v_erf(_mm256_mul_pd(kAlpha, x)));
+            __m256d cdf = _mm256_add_pd(one, tensorplay::tpsleef::erf(_mm256_mul_pd(kAlpha, x)));
             return _mm256_mul_pd(_mm256_mul_pd(_mm256_set1_pd(0.5), x), cdf);
         }
         case VOp::GeluTanh: {
@@ -610,22 +525,22 @@ inline __m256d apply_f64(VOp op, VParams prm, __m256d x) {
             const __m256d kKappa = _mm256_set1_pd(0.044715);
             __m256d x_cube = _mm256_mul_pd(_mm256_mul_pd(x, x), x);
             __m256d inner = _mm256_mul_pd(kBeta, _mm256_add_pd(x, _mm256_mul_pd(kKappa, x_cube)));
-            __m256d cdf = _mm256_add_pd(one, _ZGVdN4v_tanh(inner));
+            __m256d cdf = _mm256_add_pd(one, tensorplay::tpsleef::tanh(inner));
             return _mm256_mul_pd(_mm256_mul_pd(_mm256_set1_pd(0.5), x), cdf);
         }
         case VOp::Silu: {
-            __m256d den = _mm256_add_pd(one, _ZGVdN4v_exp(_mm256_xor_pd(x, signbit)));
+            __m256d den = _mm256_add_pd(one, tensorplay::tpsleef::exp(_mm256_xor_pd(x, signbit)));
             return _mm256_div_pd(x, den);
         }
         case VOp::Mish: {
-            __m256d sp = _ZGVdN4v_log(_mm256_add_pd(one, _ZGVdN4v_exp(x)));
-            return _mm256_mul_pd(x, _ZGVdN4v_tanh(sp));
+            __m256d sp = tensorplay::tpsleef::log(_mm256_add_pd(one, tensorplay::tpsleef::exp(x)));
+            return _mm256_mul_pd(x, tensorplay::tpsleef::tanh(sp));
         }
         case VOp::Selu: {
             const __m256d lambda = _mm256_set1_pd(1.0507009873554804934193349852946);
             const __m256d alphalambda = _mm256_set1_pd(1.6732632423543772848170429916717 * 1.0507009873554804934193349852946);
             __m256d pos = _mm256_mul_pd(x, lambda);
-            __m256d neg = _mm256_mul_pd(alphalambda, _ZGVdN4v_expm1(x));
+            __m256d neg = _mm256_mul_pd(alphalambda, tensorplay::tpsleef::expm1(x));
             return _mm256_blendv_pd(neg, pos, _mm256_cmp_pd(x, zero, _CMP_GT_OQ));
         }
         case VOp::Elu: {
@@ -636,7 +551,7 @@ inline __m256d apply_f64(VOp op, VParams prm, __m256d x) {
             // in double, times float(negcoef); positive branch a*poscoef.
             __m256d xf = _mm256_cvtps_pd(_mm256_cvtpd_ps(x));
             __m256d scaled = _mm256_mul_pd(xf, _mm256_cvtps_pd(_mm256_cvtpd_ps(negipt)));
-            __m256d neg = _mm256_mul_pd(_ZGVdN4v_expm1(scaled),
+            __m256d neg = _mm256_mul_pd(tensorplay::tpsleef::expm1(scaled),
                                         _mm256_cvtps_pd(_mm256_cvtpd_ps(negcoef)));
             __m256d pos = _mm256_mul_pd(xf, poscoef);
             return _mm256_blendv_pd(neg, pos, _mm256_cmp_pd(xf, _mm256_setzero_pd(), _CMP_GE_OQ));
@@ -652,7 +567,7 @@ inline __m256d apply_f64(VOp op, VParams prm, __m256d x) {
             __m128 btf4 = _mm256_cvtpd_ps(bt); // float(x*beta), all 4 lanes
             __m256 btf8 = _mm256_insertf128_ps(_mm256_setzero_ps(), btf4, 0);
             __m256d num = _mm256_cvtps_pd(
-                _mm256_castps256_ps128(_ZGVdN8v_log1pf(_ZGVdN8v_expf(btf8))));
+                _mm256_castps256_ps128(tensorplay::tpsleef::log1p(tensorplay::tpsleef::exp(btf8))));
             __m256d sp = _mm256_div_pd(num, beta);
             return _mm256_blendv_pd(sp, x, _mm256_cmp_pd(bt, threshold, _CMP_GT_OQ));
         }
@@ -688,7 +603,7 @@ inline __m256d apply_f64(VOp op, VParams prm, __m256d x) {
             // Scalar f64: af = double(float(x)); alpha stays full double.
             const __m256d a = _mm256_set1_pd(prm.p0);
             __m256d af = _mm256_cvtps_pd(_mm256_cvtpd_ps(x));
-            __m256d neg = _mm256_mul_pd(a, _ZGVdN4v_expm1(_mm256_div_pd(af, a)));
+            __m256d neg = _mm256_mul_pd(a, tensorplay::tpsleef::expm1(_mm256_div_pd(af, a)));
             __m256d pos = _mm256_max_pd(_mm256_setzero_pd(), af);
             __m256d minneg = _mm256_min_pd(neg, _mm256_setzero_pd());
             return _mm256_add_pd(pos, minneg);
@@ -756,10 +671,10 @@ inline __m512 v_lgamma_pos_f32_512(__m512 x) {
     __m512 t = _mm512_add_ps(z, _mm512_set1_ps(7.5f));
     __m512 res = _mm512_sub_ps(
         _mm512_fmadd_ps(_mm512_add_ps(z, _mm512_set1_ps(0.5f)),
-                        _ZGVeN16v_logf(t), _mm512_set1_ps(static_cast<float>(kHalfLogTwoPi))),
+                        tensorplay::tpsleef::log(t), _mm512_set1_ps(static_cast<float>(kHalfLogTwoPi))),
         t);
-    res = _mm512_add_ps(res, _ZGVeN16v_logf(series));
-    return _mm512_sub_ps(res, _mm512_maskz_mov_ps(small, _ZGVeN16v_logf(x)));
+    res = _mm512_add_ps(res, tensorplay::tpsleef::log(series));
+    return _mm512_sub_ps(res, _mm512_maskz_mov_ps(small, tensorplay::tpsleef::log(x)));
 }
 
 __attribute__((target("avx512f,avx512dq"), always_inline))
@@ -779,10 +694,10 @@ inline __m512d v_lgamma_pos_f64_512(__m512d x) {
     __m512d t = _mm512_add_pd(z, _mm512_set1_pd(7.5));
     __m512d res = _mm512_sub_pd(
         _mm512_fmadd_pd(_mm512_add_pd(z, _mm512_set1_pd(0.5)),
-                        _ZGVeN8v_log(t), _mm512_set1_pd(kHalfLogTwoPi)),
+                        tensorplay::tpsleef::log(t), _mm512_set1_pd(kHalfLogTwoPi)),
         t);
-    res = _mm512_add_pd(res, _ZGVeN8v_log(series));
-    return _mm512_sub_pd(res, _mm512_maskz_mov_pd(small, _ZGVeN8v_log(x)));
+    res = _mm512_add_pd(res, tensorplay::tpsleef::log(series));
+    return _mm512_sub_pd(res, _mm512_maskz_mov_pd(small, tensorplay::tpsleef::log(x)));
 }
 
 // Softplus: numerator stays float; the /beta happens in double with one
@@ -802,6 +717,24 @@ __attribute__((target("avx512f"), always_inline))
 inline __m512 v_rcp_nr_ps(__m512 d) {
     __m512 r = _mm512_rcp14_ps(d);
     return _mm512_mul_ps(r, _mm512_fnmadd_ps(d, r, _mm512_set1_ps(2.0f)));
+}
+
+__attribute__((target("avx512f,avx512dq"), always_inline))
+inline __m512 gelu_poly_f32_512(__m512 x) {
+    const __m512 one = _mm512_set1_ps(1.0f);
+    const __m512 half = _mm512_set1_ps(0.5f);
+    const __m512 alpha = _mm512_set1_ps(0.7071067811865476f);
+    const __m512 z = _mm512_mul_ps(alpha, x);
+    const __m512 q = _mm512_mul_ps(z, z);
+    __m512 p = _mm512_set1_ps(0.0000473397310f);
+    p = _mm512_fmadd_ps(p, q, _mm512_set1_ps(-0.000664962729f));
+    p = _mm512_fmadd_ps(p, q, _mm512_set1_ps(0.00495391422f));
+    p = _mm512_fmadd_ps(p, q, _mm512_set1_ps(-0.0266572969f));
+    p = _mm512_fmadd_ps(p, q, _mm512_set1_ps(0.112756411f));
+    p = _mm512_fmadd_ps(p, q, _mm512_set1_ps(-0.376113147f));
+    p = _mm512_fmadd_ps(p, q, _mm512_set1_ps(1.12837863f));
+    const __m512 cdf = _mm512_add_ps(one, _mm512_mul_ps(z, p));
+    return _mm512_mul_ps(_mm512_mul_ps(half, x), cdf);
 }
 
 __attribute__((target("avx512f,avx512dq"), always_inline))
@@ -831,40 +764,61 @@ inline __m512 apply16_f32(VOp op, VParams prm, __m512 x) {
         case VOp::Round: return _mm512_roundscale_ps(x, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
         case VOp::Frac: return _mm512_sub_ps(x, _mm512_roundscale_ps(x, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC));
         case VOp::Relu: return _mm512_max_ps(zero, x);
-        case VOp::Exp: return _ZGVeN16v_expf(x);
-        case VOp::Expm1: return _ZGVeN16v_expm1f(x);
-        case VOp::Log: return _ZGVeN16v_logf(x);
-        case VOp::Log2: return _ZGVeN16v_log2f(x);
-        case VOp::Log10: return _ZGVeN16v_log10f(x);
-        case VOp::Log1p: return _ZGVeN16v_log1pf(x);
-        case VOp::Sin: return _ZGVeN16v_sinf(x);
-        case VOp::Cos: return _ZGVeN16v_cosf(x);
-        case VOp::Tan: return _ZGVeN16v_tanf(x);
-        case VOp::Asin: return _ZGVeN16v_asinf(x);
-        case VOp::Acos: return _ZGVeN16v_acosf(x);
-        case VOp::Atan: return _ZGVeN16v_atanf(x);
-        case VOp::Sinh: return _ZGVeN16v_sinhf(x);
-        case VOp::Cosh: return _ZGVeN16v_coshf(x);
-        case VOp::Tanh: return _ZGVeN16v_tanhf(x);
-        case VOp::Asinh: return _ZGVeN16v_asinhf(x);
-        case VOp::Acosh: return _ZGVeN16v_acoshf(x);
-        case VOp::Atanh: return _ZGVeN16v_atanhf(x);
-        case VOp::Erf: return _ZGVeN16v_erff(x);
-        case VOp::Erfc: return _ZGVeN16v_erfcf(x);
+        case VOp::Exp: return tensorplay::tpsleef::exp(x);
+        case VOp::Expm1: return tensorplay::tpsleef::expm1(x);
+        case VOp::Log: return tensorplay::tpsleef::log(x);
+        case VOp::Log2: return tensorplay::tpsleef::log2(x);
+        case VOp::Log10: return tensorplay::tpsleef::log10(x);
+        case VOp::Log1p: return tensorplay::tpsleef::log1p(x);
+        case VOp::Sin: return tensorplay::tpsleef::sin(x);
+        case VOp::Cos: return tensorplay::tpsleef::cos(x);
+        case VOp::Tan: return tensorplay::tpsleef::tan(x);
+        case VOp::Asin: return tensorplay::tpsleef::asin(x);
+        case VOp::Acos: return tensorplay::tpsleef::acos(x);
+        case VOp::Atan: return tensorplay::tpsleef::atan(x);
+        case VOp::Sinh: return tensorplay::tpsleef::sinh(x);
+        case VOp::Cosh: return tensorplay::tpsleef::cosh(x);
+        case VOp::Tanh: return tensorplay::tpsleef::tanh(x);
+        case VOp::Asinh: return tensorplay::tpsleef::asinh(x);
+        case VOp::Acosh: return tensorplay::tpsleef::acosh(x);
+        case VOp::Atanh: return tensorplay::tpsleef::atanh(x);
+        case VOp::Erf: return tensorplay::tpsleef::erf(x);
+        case VOp::Erfc: return tensorplay::tpsleef::erfc(x);
         case VOp::Lgamma:
             return v_lgamma_pos_f32_512(x);
         case VOp::Sigmoid: {
             // rcp14+NR instead of divps; see the 256-bit Sigmoid note for the
             // inf/NaN corner repairs.
-            __m512 den = _mm512_add_ps(one, _ZGVeN16v_expf(_mm512_xor_ps(x, signbit)));
+            __m512 den = _mm512_add_ps(one, tensorplay::tpsleef::exp(_mm512_xor_ps(x, signbit)));
             __m512 r = v_rcp_nr_ps(den);
             __m512 zeroed = _mm512_maskz_mov_ps(
                 _mm512_cmp_ps_mask(den, _mm512_set1_ps(INFINITY), _CMP_NEQ_OQ), r);
             return _mm512_mask_mov_ps(zeroed, _mm512_cmp_ps_mask(den, den, _CMP_UNORD_Q), r);
         }
         case VOp::GeluNone: {
-            const __m512 kAlpha = _mm512_set1_ps(static_cast<float>(0.70710678118654752440));
-            __m512 cdf = _mm512_add_ps(one, _ZGVeN16v_erff(_mm512_mul_ps(kAlpha, x)));
+            const __m512 kAlpha = _mm512_set1_ps(0.7071067811865476f);
+            const __m512 z = _mm512_mul_ps(kAlpha, x);
+            const __m512 az = _mm512_andnot_ps(signbit, z);
+            const __m512 t = v_rcp_nr_ps(
+                _mm512_add_ps(one, _mm512_mul_ps(_mm512_set1_ps(0.3275911f), az)));
+            __m512 poly = _mm512_add_ps(_mm512_mul_ps(
+                _mm512_set1_ps(1.061405429f), t),
+                _mm512_set1_ps(-1.453152027f));
+            poly = _mm512_add_ps(_mm512_mul_ps(poly, t),
+                                 _mm512_set1_ps(1.421413741f));
+            poly = _mm512_add_ps(_mm512_mul_ps(poly, t),
+                                 _mm512_set1_ps(-0.284496736f));
+            poly = _mm512_add_ps(_mm512_mul_ps(poly, t),
+                                 _mm512_set1_ps(0.254829592f));
+            poly = _mm512_mul_ps(poly, t);
+            const __m512 erf_abs = _mm512_sub_ps(
+                one, _mm512_mul_ps(poly,
+                    tensorplay::tpsleef::exp(_mm512_sub_ps(_mm512_setzero_ps(),
+                                                  _mm512_mul_ps(az, az)))));
+            const __m512 erf = _mm512_mask_mov_ps(
+                erf_abs, _mm512_cmp_ps_mask(z, zero, _CMP_LT_OQ),
+                _mm512_sub_ps(zero, erf_abs));
+            __m512 cdf = _mm512_add_ps(one, erf);
             return _mm512_mul_ps(_mm512_mul_ps(_mm512_set1_ps(0.5f), x), cdf);
         }
         case VOp::GeluTanh: {
@@ -872,23 +826,23 @@ inline __m512 apply16_f32(VOp op, VParams prm, __m512 x) {
             const __m512 kKappa = _mm512_set1_ps(0.044715f);
             __m512 x_cube = _mm512_mul_ps(_mm512_mul_ps(x, x), x);
             __m512 inner = _mm512_mul_ps(kBeta, _mm512_add_ps(x, _mm512_mul_ps(kKappa, x_cube)));
-            __m512 cdf = _mm512_add_ps(one, _ZGVeN16v_tanhf(inner));
+            __m512 cdf = _mm512_add_ps(one, tensorplay::tpsleef::tanh(inner));
             return _mm512_mul_ps(_mm512_mul_ps(_mm512_set1_ps(0.5f), x), cdf);
         }
         case VOp::Silu: {
             // x * rcp14_nr(den): corner-equivalent to x/den (see 256-bit note).
-            __m512 den = _mm512_add_ps(one, _ZGVeN16v_expf(_mm512_xor_ps(x, signbit)));
+            __m512 den = _mm512_add_ps(one, tensorplay::tpsleef::exp(_mm512_xor_ps(x, signbit)));
             return _mm512_mul_ps(x, v_rcp_nr_ps(den));
         }
         case VOp::Mish: {
-            __m512 sp = _ZGVeN16v_logf(_mm512_add_ps(one, _ZGVeN16v_expf(x)));
-            return _mm512_mul_ps(x, _ZGVeN16v_tanhf(sp));
+            __m512 sp = tensorplay::tpsleef::log(_mm512_add_ps(one, tensorplay::tpsleef::exp(x)));
+            return _mm512_mul_ps(x, tensorplay::tpsleef::tanh(sp));
         }
         case VOp::Selu: {
             const __m512 lambda = _mm512_set1_ps(static_cast<float>(1.0507009873554804934193349852946));
             const __m512 alphalambda = _mm512_set1_ps(static_cast<float>(1.6732632423543772848170429916717 * 1.0507009873554804934193349852946));
             __m512 pos = _mm512_mul_ps(x, lambda);
-            __m512 neg = _mm512_mul_ps(alphalambda, _ZGVeN16v_expm1f(x));
+            __m512 neg = _mm512_mul_ps(alphalambda, tensorplay::tpsleef::expm1(x));
             return _mm512_mask_mov_ps(neg, _mm512_cmp_ps_mask(x, zero, _CMP_GT_OQ), pos);
         }
         case VOp::Elu: {
@@ -896,7 +850,7 @@ inline __m512 apply16_f32(VOp op, VParams prm, __m512 x) {
             const __m512 poscoef = _mm512_set1_ps(prm.p1);
             const __m512 negipt = _mm512_set1_ps(prm.p2);
             __m512 scaled = _mm512_mul_ps(x, negipt);
-            __m512 neg = _mm512_mul_ps(_ZGVeN16v_expm1f(scaled), negcoef);
+            __m512 neg = _mm512_mul_ps(tensorplay::tpsleef::expm1(scaled), negcoef);
             __m512 pos = _mm512_mul_ps(x, poscoef);
             return _mm512_mask_mov_ps(neg, _mm512_cmp_ps_mask(x, zero, _CMP_GE_OQ), pos);
         }
@@ -906,7 +860,7 @@ inline __m512 apply16_f32(VOp op, VParams prm, __m512 x) {
             const __m512 beta = _mm512_set1_ps(static_cast<float>(prm.p0));
             const __m512 threshold = _mm512_set1_ps(static_cast<float>(prm.p1));
             __m512 bx = _mm512_mul_ps(x, beta);
-            __m512 numf = _ZGVeN16v_log1pf(_ZGVeN16v_expf(bx));
+            __m512 numf = tensorplay::tpsleef::log1p(tensorplay::tpsleef::exp(bx));
             __m256 sp_lo = softplus_div_beta_8(_mm512_castps512_ps256(numf), prm.p0);
             __m256 sp_hi = softplus_div_beta_8(_mm512_extractf32x8_ps(numf, 1), prm.p0);
             __m512 sp = _mm512_insertf32x8(_mm512_castps256_ps512(sp_lo), sp_hi, 1);
@@ -940,7 +894,7 @@ inline __m512 apply16_f32(VOp op, VParams prm, __m512 x) {
             return _mm512_min_ps(_mm512_max_ps(x, zero), _mm512_set1_ps(6.0f));
         case VOp::Celu: {
             const __m512 a = _mm512_set1_ps(static_cast<float>(prm.p0));
-            __m512 neg = _mm512_mul_ps(a, _ZGVeN16v_expm1f(_mm512_div_ps(x, a)));
+            __m512 neg = _mm512_mul_ps(a, tensorplay::tpsleef::expm1(_mm512_div_ps(x, a)));
             __m512 pos = _mm512_max_ps(zero, x);
             __m512 minneg = _mm512_min_ps(neg, zero);
             return _mm512_add_ps(pos, minneg);
@@ -959,6 +913,20 @@ static void f32_chunk_avx512(VOp op, VParams prm, const float* src, float* dst, 
         __m512 x = _mm512_loadu_ps(src + i);
         if (op == VOp::Lgamma && _mm512_cmplt_ps_mask(x, _mm512_setzero_ps())) {
             for (int64_t j = i; j < i + 16; ++j) dst[j] = scalar_apply(op, prm, src[j]);
+        } else if (op == VOp::Square) {
+            _mm512_storeu_ps(dst + i, _mm512_mul_ps(x, x));
+        } else if (op == VOp::GeluNone) {
+            const __m512 z = _mm512_mul_ps(
+                _mm512_set1_ps(0.7071067811865476f), x);
+            const __m512 az = _mm512_andnot_ps(
+                _mm512_set1_ps(kSignBitF512), z);
+            const __mmask16 core = _mm512_cmp_ps_mask(
+                az, _mm512_set1_ps(1.5f), _CMP_LE_OQ);
+            if (core == static_cast<__mmask16>(0xffff)) {
+                _mm512_storeu_ps(dst + i, gelu_poly_f32_512(x));
+            } else {
+                _mm512_storeu_ps(dst + i, apply16_f32(op, prm, x));
+            }
         } else {
             _mm512_storeu_ps(dst + i, apply16_f32(op, prm, x));
         }
@@ -993,32 +961,32 @@ inline __m512d apply16_f64(VOp op, VParams prm, __m512d x) {
         case VOp::Round: return _mm512_roundscale_pd(x, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
         case VOp::Frac: return _mm512_sub_pd(x, _mm512_roundscale_pd(x, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC));
         case VOp::Relu: return _mm512_max_pd(zero, x);
-        case VOp::Exp: return _ZGVeN8v_exp(x);
-        case VOp::Expm1: return _ZGVeN8v_expm1(x);
-        case VOp::Log: return _ZGVeN8v_log(x);
-        case VOp::Log2: return _ZGVeN8v_log2(x);
-        case VOp::Log10: return _ZGVeN8v_log10(x);
-        case VOp::Log1p: return _ZGVeN8v_log1p(x);
-        case VOp::Sin: return _ZGVeN8v_sin(x);
-        case VOp::Cos: return _ZGVeN8v_cos(x);
-        case VOp::Tan: return _ZGVeN8v_tan(x);
-        case VOp::Asin: return _ZGVeN8v_asin(x);
-        case VOp::Acos: return _ZGVeN8v_acos(x);
-        case VOp::Atan: return _ZGVeN8v_atan(x);
-        case VOp::Sinh: return _ZGVeN8v_sinh(x);
-        case VOp::Cosh: return _ZGVeN8v_cosh(x);
-        case VOp::Tanh: return _ZGVeN8v_tanh(x);
-        case VOp::Asinh: return _ZGVeN8v_asinh(x);
-        case VOp::Acosh: return _ZGVeN8v_acosh(x);
-        case VOp::Atanh: return _ZGVeN8v_atanh(x);
-        case VOp::Erf: return _ZGVeN8v_erf(x);
-        case VOp::Erfc: return _ZGVeN8v_erfc(x);
+        case VOp::Exp: return tensorplay::tpsleef::exp(x);
+        case VOp::Expm1: return tensorplay::tpsleef::expm1(x);
+        case VOp::Log: return tensorplay::tpsleef::log(x);
+        case VOp::Log2: return tensorplay::tpsleef::log2(x);
+        case VOp::Log10: return tensorplay::tpsleef::log10(x);
+        case VOp::Log1p: return tensorplay::tpsleef::log1p(x);
+        case VOp::Sin: return tensorplay::tpsleef::sin(x);
+        case VOp::Cos: return tensorplay::tpsleef::cos(x);
+        case VOp::Tan: return tensorplay::tpsleef::tan(x);
+        case VOp::Asin: return tensorplay::tpsleef::asin(x);
+        case VOp::Acos: return tensorplay::tpsleef::acos(x);
+        case VOp::Atan: return tensorplay::tpsleef::atan(x);
+        case VOp::Sinh: return tensorplay::tpsleef::sinh(x);
+        case VOp::Cosh: return tensorplay::tpsleef::cosh(x);
+        case VOp::Tanh: return tensorplay::tpsleef::tanh(x);
+        case VOp::Asinh: return tensorplay::tpsleef::asinh(x);
+        case VOp::Acosh: return tensorplay::tpsleef::acosh(x);
+        case VOp::Atanh: return tensorplay::tpsleef::atanh(x);
+        case VOp::Erf: return tensorplay::tpsleef::erf(x);
+        case VOp::Erfc: return tensorplay::tpsleef::erfc(x);
         case VOp::Lgamma: return v_lgamma_pos_f64_512(x);
         case VOp::Sigmoid:
-            return _mm512_div_pd(one, _mm512_add_pd(one, _ZGVeN8v_exp(_mm512_xor_pd(x, signbit))));
+            return _mm512_div_pd(one, _mm512_add_pd(one, tensorplay::tpsleef::exp(_mm512_xor_pd(x, signbit))));
         case VOp::GeluNone: {
             const __m512d kAlpha = _mm512_set1_pd(0.70710678118654752440);
-            __m512d cdf = _mm512_add_pd(one, _ZGVeN8v_erf(_mm512_mul_pd(kAlpha, x)));
+            __m512d cdf = _mm512_add_pd(one, tensorplay::tpsleef::erf(_mm512_mul_pd(kAlpha, x)));
             return _mm512_mul_pd(_mm512_mul_pd(_mm512_set1_pd(0.5), x), cdf);
         }
         case VOp::GeluTanh: {
@@ -1026,22 +994,22 @@ inline __m512d apply16_f64(VOp op, VParams prm, __m512d x) {
             const __m512d kKappa = _mm512_set1_pd(0.044715);
             __m512d x_cube = _mm512_mul_pd(_mm512_mul_pd(x, x), x);
             __m512d inner = _mm512_mul_pd(kBeta, _mm512_add_pd(x, _mm512_mul_pd(kKappa, x_cube)));
-            __m512d cdf = _mm512_add_pd(one, _ZGVeN8v_tanh(inner));
+            __m512d cdf = _mm512_add_pd(one, tensorplay::tpsleef::tanh(inner));
             return _mm512_mul_pd(_mm512_mul_pd(_mm512_set1_pd(0.5), x), cdf);
         }
         case VOp::Silu: {
-            __m512d den = _mm512_add_pd(one, _ZGVeN8v_exp(_mm512_xor_pd(x, signbit)));
+            __m512d den = _mm512_add_pd(one, tensorplay::tpsleef::exp(_mm512_xor_pd(x, signbit)));
             return _mm512_div_pd(x, den);
         }
         case VOp::Mish: {
-            __m512d sp = _ZGVeN8v_log(_mm512_add_pd(one, _ZGVeN8v_exp(x)));
-            return _mm512_mul_pd(x, _ZGVeN8v_tanh(sp));
+            __m512d sp = tensorplay::tpsleef::log(_mm512_add_pd(one, tensorplay::tpsleef::exp(x)));
+            return _mm512_mul_pd(x, tensorplay::tpsleef::tanh(sp));
         }
         case VOp::Selu: {
             const __m512d lambda = _mm512_set1_pd(1.0507009873554804934193349852946);
             const __m512d alphalambda = _mm512_set1_pd(1.6732632423543772848170429916717 * 1.0507009873554804934193349852946);
             __m512d pos = _mm512_mul_pd(x, lambda);
-            __m512d neg = _mm512_mul_pd(alphalambda, _ZGVeN8v_expm1(x));
+            __m512d neg = _mm512_mul_pd(alphalambda, tensorplay::tpsleef::expm1(x));
             return _mm512_mask_mov_pd(neg, _mm512_cmp_pd_mask(x, zero, _CMP_GT_OQ), pos);
         }
         case VOp::Hardswish: {
@@ -1079,6 +1047,8 @@ static void f64_chunk_avx512(VOp op, VParams prm, const double* src, double* dst
         __m512d x = _mm512_loadu_pd(src + i);
         if (op == VOp::Lgamma && _mm512_cmplt_pd_mask(x, _mm512_setzero_pd())) {
             for (int64_t j = i; j < i + 8; ++j) dst[j] = scalar_apply(op, prm, src[j]);
+        } else if (op == VOp::Square) {
+            _mm512_storeu_pd(dst + i, _mm512_mul_pd(x, x));
         } else {
             _mm512_storeu_pd(dst + i, apply16_f64(op, prm, x));
         }
@@ -1119,13 +1089,13 @@ static void bf16_chunk_avx2(VOp op, VParams prm, const uint16_t* src, uint16_t* 
     }
 }
 
-#endif // TP_VECUNARY_LIBMVEC
+#endif // TP_VECUNARY_SLEEF
 
 // ---------------------------------------------------------------------------
 // Public entry points: process [b, e) of contiguous src -> dst.
 // ---------------------------------------------------------------------------
 inline void run_f32(VOp op, VParams prm, const float* src, float* dst, int64_t b, int64_t e) {
-#ifdef TP_VECUNARY_LIBMVEC
+#ifdef TP_VECUNARY_SLEEF
 #if defined(CPU_CAPABILITY_AVX512)
     // Tier-compiled copy: the ISA is guaranteed by the tier's -m flags, so
     // the runtime CPUID branch disappears entirely.
@@ -1145,7 +1115,7 @@ inline void run_f32(VOp op, VParams prm, const float* src, float* dst, int64_t b
 }
 
 inline void run_f64(VOp op, VParams prm, const double* src, double* dst, int64_t b, int64_t e) {
-#ifdef TP_VECUNARY_LIBMVEC
+#ifdef TP_VECUNARY_SLEEF
 #if defined(CPU_CAPABILITY_AVX512)
     // Tier-compiled copy (see run_f32).  The f64_rounding_sensitive ops keep
     // their AVX2-only contract: route them through the scalar loop here the
@@ -1172,7 +1142,7 @@ inline void run_f64(VOp op, VParams prm, const double* src, double* dst, int64_t
 }
 
 inline bool vec_ready() {
-#ifdef TP_VECUNARY_LIBMVEC
+#ifdef TP_VECUNARY_SLEEF
     return avx2_available();
 #else
     return false;
@@ -1183,7 +1153,7 @@ inline bool vec_ready() {
 // round-to-nearest-even — same semantics as tensorplay::Half(float).
 // Scalar fallback goes through the Half type itself.
 inline void run_f16(VOp op, VParams prm, const uint16_t* src, uint16_t* dst, int64_t b, int64_t e) {
-#ifdef TP_VECUNARY_LIBMVEC
+#ifdef TP_VECUNARY_SLEEF
     if (avx2_available() && f16c_available()) {
         half_chunk_avx2(op, prm, src, dst, b, e);
         return;
@@ -1199,7 +1169,7 @@ inline void run_f16(VOp op, VParams prm, const uint16_t* src, uint16_t* dst, int
 // bf16 path: widen by bit shift, compute, narrow with round-to-nearest-even
 // (matches tensorplay::BFloat16(float)). Scalar fallback via BFloat16 type.
 inline void run_bf16(VOp op, VParams prm, const uint16_t* src, uint16_t* dst, int64_t b, int64_t e) {
-#ifdef TP_VECUNARY_LIBMVEC
+#ifdef TP_VECUNARY_SLEEF
     if (avx2_available()) {
         bf16_chunk_avx2(op, prm, src, dst, b, e);
         return;

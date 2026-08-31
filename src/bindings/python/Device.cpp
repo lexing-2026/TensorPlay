@@ -311,12 +311,6 @@ void init_device(py::module_& m) {
        "segment and free-block counts, largest free block, pending bytes, "
        "graph pools)");
 
-    cuda.def("reset_max_memory_allocated", [](int device) {
-#ifdef USE_CUDA
-        tensorplay::cuda::reset_max_memory_allocated(device);
-#endif
-    }, "device"_a = -1);
-
     cuda.def("reset_peak_memory_stats", [](int device) {
 #ifdef USE_CUDA
         tensorplay::cuda::reset_peak_memory_stats(device);

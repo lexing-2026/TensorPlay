@@ -1,36 +1,43 @@
-import sys
-import tensorplay._C as _C
 from contextlib import contextmanager
 
-class MkldnnModule:
-    def __getattr__(self, name):
-        if name == 'is_available':
-            return self.is_available
-        if name == 'flags':
-            return self.flags
-        raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
+import sys
 
-    @staticmethod
-    def is_available():
-        return _C.has_mkldnn()
+import tensorplay
+from tensorplay.backends import ContextProp, PropModule, __allow_nonbracketed_mutation
 
-    @property
-    def enabled(self):
-        return _C.is_mkldnn_enabled()
+__all__ = ["is_available", "flags", "set_flags", "enabled"]
 
-    @enabled.setter
-    def enabled(self, val):
-        _C.set_mkldnn_enabled(val)
 
-    @contextmanager
-    def flags(self, enabled=None):
-        original = _C.is_mkldnn_enabled()
-        if enabled is not None:
-            _C.set_mkldnn_enabled(enabled)
-        try:
-            yield
-        finally:
-            _C.set_mkldnn_enabled(original)
+def is_available() -> bool:
+    """Return whether oneDNN kernels were included in this build."""
+    return bool(tensorplay._C.has_mkldnn())
 
-# Replace the module with an instance of the class
-sys.modules[__name__] = MkldnnModule()
+
+def set_flags(_enabled=None):
+    """Set the process-wide oneDNN enable flag."""
+    original = (tensorplay._C.is_mkldnn_enabled(),)
+    if _enabled is not None:
+        tensorplay._C.set_mkldnn_enabled(bool(_enabled))
+    return original
+
+
+@contextmanager
+def flags(enabled=False):
+    """Temporarily set the process-wide oneDNN enable flag."""
+    with __allow_nonbracketed_mutation():
+        original = set_flags(enabled)
+    try:
+        yield
+    finally:
+        with __allow_nonbracketed_mutation():
+            set_flags(*original)
+
+
+class MkldnnModule(PropModule):
+    enabled = ContextProp(
+        tensorplay._C.is_mkldnn_enabled,
+        tensorplay._C.set_mkldnn_enabled,
+    )
+
+
+sys.modules[__name__] = MkldnnModule(sys.modules[__name__], __name__)

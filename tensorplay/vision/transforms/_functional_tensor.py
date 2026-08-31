@@ -349,9 +349,6 @@ def _pad_symmetric(img: Tensor, padding: list[int]) -> Tensor:
 
 def _parse_pad_padding(padding: Union[int, list[int]]) -> list[int]:
     if isinstance(padding, int):
-        if tensorplay.jit.is_scripting():
-            # This maybe unreachable
-            raise ValueError("padding can't be an int while scripting, set it as a list [value, ]")
         pad_left = pad_right = pad_top = pad_bottom = padding
     elif len(padding) == 1:
         pad_left = pad_right = pad_top = pad_bottom = padding[0]
@@ -776,7 +773,7 @@ def posterize(img: Tensor, bits: int) -> Tensor:
         raise TypeError(f"Only tensorplay.uint8 image tensors are supported, but found {img.dtype}")
 
     _assert_channels(img, [1, 3])
-    mask = -int(2 ** (8 - bits))  # JIT-friendly for: ~(2 ** (8 - bits) - 1)
+    mask = -int(2 ** (8 - bits))  # compiler-friendly for: ~(2 ** (8 - bits) - 1)
     return img & mask
 
 

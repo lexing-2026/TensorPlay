@@ -4,6 +4,7 @@
 
 #include "cpu/ComplexKernels.h"
 #include "cpu/VecComplex.h"
+#include "cpu/vec/SleefShims.h"
 #include "Parallel.h"
 
 #include <vector>
@@ -28,70 +29,40 @@ constexpr int64_t kGrain = 4096;
 // definitions behind this guard is important: merely mentioning an AVX
 // intrinsic in a non-targeted TU makes GCC emit a target-option mismatch even
 // when the template is never instantiated.
-#ifdef TP_VECCPLX_LIBMVEC
-
-extern "C" {
-__m256 _ZGVdN8v_expf(__m256); __m256 _ZGVdN8v_expm1f(__m256);
-__m256 _ZGVdN8v_logf(__m256); __m256 _ZGVdN8v_log1pf(__m256);
-__m256 _ZGVdN8v_log2f(__m256); __m256 _ZGVdN8v_log10f(__m256);
-__m256 _ZGVdN8v_sinf(__m256); __m256 _ZGVdN8v_cosf(__m256);
-__m256 _ZGVdN8v_atanf(__m256); __m256 _ZGVdN8v_sinhf(__m256);
-__m256 _ZGVdN8v_coshf(__m256); __m256 _ZGVdN8vv_atan2f(__m256, __m256);
-__m256 _ZGVdN8vv_hypotf(__m256, __m256);
-__m512 _ZGVeN16v_expf(__m512); __m512 _ZGVeN16v_expm1f(__m512);
-__m512 _ZGVeN16v_logf(__m512); __m512 _ZGVeN16v_log1pf(__m512);
-__m512 _ZGVeN16v_sinf(__m512); __m512 _ZGVeN16v_cosf(__m512);
-__m512 _ZGVeN16v_atanf(__m512); __m512 _ZGVeN16v_sinhf(__m512);
-__m512 _ZGVeN16v_coshf(__m512);
-__m512 _ZGVeN16vv_atan2f(__m512, __m512);
-__m512 _ZGVeN16vv_hypotf(__m512, __m512);
-__m256d _ZGVdN4v_exp(__m256d); __m256d _ZGVdN4v_expm1(__m256d);
-__m256d _ZGVdN4v_log(__m256d); __m256d _ZGVdN4v_log1p(__m256d);
-__m256d _ZGVdN4v_sin(__m256d); __m256d _ZGVdN4v_cos(__m256d);
-__m256d _ZGVdN4v_atan(__m256d); __m256d _ZGVdN4v_sinh(__m256d);
-__m256d _ZGVdN4v_cosh(__m256d); __m256d _ZGVdN4vv_atan2(__m256d, __m256d);
-__m256d _ZGVdN4vv_hypot(__m256d, __m256d);
-__m512d _ZGVeN8v_exp(__m512d); __m512d _ZGVeN8v_expm1(__m512d);
-__m512d _ZGVeN8v_log(__m512d); __m512d _ZGVeN8v_log1p(__m512d);
-__m512d _ZGVeN8v_sin(__m512d); __m512d _ZGVeN8v_cos(__m512d);
-__m512d _ZGVeN8v_atan(__m512d); __m512d _ZGVeN8v_sinh(__m512d);
-__m512d _ZGVeN8v_cosh(__m512d);
-__m512d _ZGVeN8vv_atan2(__m512d, __m512d);
-__m512d _ZGVeN8vv_hypot(__m512d, __m512d);
-}
+#ifdef TP_VECCPLX_SLEEF
 
 template <typename V> struct Math;
 template <> struct Math<__m256> {
     using scalar = float;
     static constexpr int W = 4;  // complex elements per vector
-    static __m256 exp(__m256 v) { return _ZGVdN8v_expf(v); }
-    static __m256 expm1(__m256 v) { return _ZGVdN8v_expm1f(v); }
-    static __m256 log(__m256 v) { return _ZGVdN8v_logf(v); }
-    static __m256 log1p(__m256 v) { return _ZGVdN8v_log1pf(v); }
-    static __m256 sin(__m256 v) { return _ZGVdN8v_sinf(v); }
-    static __m256 cos(__m256 v) { return _ZGVdN8v_cosf(v); }
-    static __m256 atan(__m256 v) { return _ZGVdN8v_atanf(v); }
-    static __m256 atan2(__m256 y, __m256 x) { return _ZGVdN8vv_atan2f(y, x); }
-    static __m256 sinh(__m256 v) { return _ZGVdN8v_sinhf(v); }
-    static __m256 cosh(__m256 v) { return _ZGVdN8v_coshf(v); }
-    static __m256 hypot(__m256 y, __m256 x) { return _ZGVdN8vv_hypotf(y, x); }
+    static __m256 exp(__m256 v) { return tensorplay::tpsleef::exp(v); }
+    static __m256 expm1(__m256 v) { return tensorplay::tpsleef::expm1(v); }
+    static __m256 log(__m256 v) { return tensorplay::tpsleef::log(v); }
+    static __m256 log1p(__m256 v) { return tensorplay::tpsleef::log1p(v); }
+    static __m256 sin(__m256 v) { return tensorplay::tpsleef::sin(v); }
+    static __m256 cos(__m256 v) { return tensorplay::tpsleef::cos(v); }
+    static __m256 atan(__m256 v) { return tensorplay::tpsleef::atan(v); }
+    static __m256 atan2(__m256 y, __m256 x) { return tensorplay::tpsleef::atan2(y, x); }
+    static __m256 sinh(__m256 v) { return tensorplay::tpsleef::sinh(v); }
+    static __m256 cosh(__m256 v) { return tensorplay::tpsleef::cosh(v); }
+    static __m256 hypot(__m256 y, __m256 x) { return tensorplay::tpsleef::hypot(y, x); }
     static __m256 ln2() { return _mm256_set1_ps(0.69314718055994530942f); }
     static __m256 ln10() { return _mm256_set1_ps(2.30258509299404568402f); }
 };
 template <> struct Math<__m256d> {
     using scalar = double;
     static constexpr int W = 2;
-    static __m256d exp(__m256d v) { return _ZGVdN4v_exp(v); }
-    static __m256d expm1(__m256d v) { return _ZGVdN4v_expm1(v); }
-    static __m256d log(__m256d v) { return _ZGVdN4v_log(v); }
-    static __m256d log1p(__m256d v) { return _ZGVdN4v_log1p(v); }
-    static __m256d sin(__m256d v) { return _ZGVdN4v_sin(v); }
-    static __m256d cos(__m256d v) { return _ZGVdN4v_cos(v); }
-    static __m256d atan(__m256d v) { return _ZGVdN4v_atan(v); }
-    static __m256d atan2(__m256d y, __m256d x) { return _ZGVdN4vv_atan2(y, x); }
-    static __m256d sinh(__m256d v) { return _ZGVdN4v_sinh(v); }
-    static __m256d cosh(__m256d v) { return _ZGVdN4v_cosh(v); }
-    static __m256d hypot(__m256d y, __m256d x) { return _ZGVdN4vv_hypot(y, x); }
+    static __m256d exp(__m256d v) { return tensorplay::tpsleef::exp(v); }
+    static __m256d expm1(__m256d v) { return tensorplay::tpsleef::expm1(v); }
+    static __m256d log(__m256d v) { return tensorplay::tpsleef::log(v); }
+    static __m256d log1p(__m256d v) { return tensorplay::tpsleef::log1p(v); }
+    static __m256d sin(__m256d v) { return tensorplay::tpsleef::sin(v); }
+    static __m256d cos(__m256d v) { return tensorplay::tpsleef::cos(v); }
+    static __m256d atan(__m256d v) { return tensorplay::tpsleef::atan(v); }
+    static __m256d atan2(__m256d y, __m256d x) { return tensorplay::tpsleef::atan2(y, x); }
+    static __m256d sinh(__m256d v) { return tensorplay::tpsleef::sinh(v); }
+    static __m256d cosh(__m256d v) { return tensorplay::tpsleef::cosh(v); }
+    static __m256d hypot(__m256d y, __m256d x) { return tensorplay::tpsleef::hypot(y, x); }
     static __m256d ln2() { return _mm256_set1_pd(0.69314718055994530942); }
     static __m256d ln10() { return _mm256_set1_pd(2.30258509299404568402); }
 };
@@ -100,34 +71,34 @@ template <> struct Math<__m256d> {
 template <> struct Math<__m512> {
     using scalar = float;
     static constexpr int W = 8;
-    static __m512 exp(__m512 v) { return _ZGVeN16v_expf(v); }
-    static __m512 expm1(__m512 v) { return _ZGVeN16v_expm1f(v); }
-    static __m512 log(__m512 v) { return _ZGVeN16v_logf(v); }
-    static __m512 log1p(__m512 v) { return _ZGVeN16v_log1pf(v); }
-    static __m512 sin(__m512 v) { return _ZGVeN16v_sinf(v); }
-    static __m512 cos(__m512 v) { return _ZGVeN16v_cosf(v); }
-    static __m512 atan(__m512 v) { return _ZGVeN16v_atanf(v); }
-    static __m512 atan2(__m512 y, __m512 x) { return _ZGVeN16vv_atan2f(y, x); }
-    static __m512 sinh(__m512 v) { return _ZGVeN16v_sinhf(v); }
-    static __m512 cosh(__m512 v) { return _ZGVeN16v_coshf(v); }
-    static __m512 hypot(__m512 y, __m512 x) { return _ZGVeN16vv_hypotf(y, x); }
+    static __m512 exp(__m512 v) { return tensorplay::tpsleef::exp(v); }
+    static __m512 expm1(__m512 v) { return tensorplay::tpsleef::expm1(v); }
+    static __m512 log(__m512 v) { return tensorplay::tpsleef::log(v); }
+    static __m512 log1p(__m512 v) { return tensorplay::tpsleef::log1p(v); }
+    static __m512 sin(__m512 v) { return tensorplay::tpsleef::sin(v); }
+    static __m512 cos(__m512 v) { return tensorplay::tpsleef::cos(v); }
+    static __m512 atan(__m512 v) { return tensorplay::tpsleef::atan(v); }
+    static __m512 atan2(__m512 y, __m512 x) { return tensorplay::tpsleef::atan2(y, x); }
+    static __m512 sinh(__m512 v) { return tensorplay::tpsleef::sinh(v); }
+    static __m512 cosh(__m512 v) { return tensorplay::tpsleef::cosh(v); }
+    static __m512 hypot(__m512 y, __m512 x) { return tensorplay::tpsleef::hypot(y, x); }
     static __m512 ln2() { return _mm512_set1_ps(0.69314718055994530942f); }
     static __m512 ln10() { return _mm512_set1_ps(2.30258509299404568402f); }
 };
 template <> struct Math<__m512d> {
     using scalar = double;
     static constexpr int W = 4;
-    static __m512d exp(__m512d v) { return _ZGVeN8v_exp(v); }
-    static __m512d expm1(__m512d v) { return _ZGVeN8v_expm1(v); }
-    static __m512d log(__m512d v) { return _ZGVeN8v_log(v); }
-    static __m512d log1p(__m512d v) { return _ZGVeN8v_log1p(v); }
-    static __m512d sin(__m512d v) { return _ZGVeN8v_sin(v); }
-    static __m512d cos(__m512d v) { return _ZGVeN8v_cos(v); }
-    static __m512d atan(__m512d v) { return _ZGVeN8v_atan(v); }
-    static __m512d atan2(__m512d y, __m512d x) { return _ZGVeN8vv_atan2(y, x); }
-    static __m512d sinh(__m512d v) { return _ZGVeN8v_sinh(v); }
-    static __m512d cosh(__m512d v) { return _ZGVeN8v_cosh(v); }
-    static __m512d hypot(__m512d y, __m512d x) { return _ZGVeN8vv_hypot(y, x); }
+    static __m512d exp(__m512d v) { return tensorplay::tpsleef::exp(v); }
+    static __m512d expm1(__m512d v) { return tensorplay::tpsleef::expm1(v); }
+    static __m512d log(__m512d v) { return tensorplay::tpsleef::log(v); }
+    static __m512d log1p(__m512d v) { return tensorplay::tpsleef::log1p(v); }
+    static __m512d sin(__m512d v) { return tensorplay::tpsleef::sin(v); }
+    static __m512d cos(__m512d v) { return tensorplay::tpsleef::cos(v); }
+    static __m512d atan(__m512d v) { return tensorplay::tpsleef::atan(v); }
+    static __m512d atan2(__m512d y, __m512d x) { return tensorplay::tpsleef::atan2(y, x); }
+    static __m512d sinh(__m512d v) { return tensorplay::tpsleef::sinh(v); }
+    static __m512d cosh(__m512d v) { return tensorplay::tpsleef::cosh(v); }
+    static __m512d hypot(__m512d y, __m512d x) { return tensorplay::tpsleef::hypot(y, x); }
     static __m512d ln2() { return _mm512_set1_pd(0.69314718055994530942); }
     static __m512d ln10() { return _mm512_set1_pd(2.30258509299404568402); }
 };
@@ -915,7 +886,7 @@ void sum_core(
     *im_out = ri;
 }
 
-#endif // TP_VECCPLX_LIBMVEC
+#endif // TP_VECCPLX_SLEEF
 
 // ---------------------------------------------------------------------------
 // public entry points (parallel over chunks; return false -> caller falls
@@ -928,7 +899,7 @@ bool try_unary_impl(const void* xv, void* yv, int64_t n, int dt_i, int op_id) {
     const DType dt = static_cast<DType>(dt_i);
     const veccomplex::Op op = static_cast<veccomplex::Op>(op_id);
 
-#ifdef TP_VECCPLX_LIBMVEC
+#ifdef TP_VECCPLX_SLEEF
     if (!width_ok(dt) || n <= 0) return false;
 #ifdef TP_VECCPLX_AVX512
     if (avx512_available()) {
@@ -975,7 +946,7 @@ bool try_binary_impl(const void* av_, const void* bv, void* yv, int64_t n, int d
     const DType dt = static_cast<DType>(dt_i);
     const veccomplex::Op op = static_cast<veccomplex::Op>(op_id);
 
-#ifdef TP_VECCPLX_LIBMVEC
+#ifdef TP_VECCPLX_SLEEF
     if (!width_ok(dt) || n <= 0 || !binary_supported(op))
         return false;
 #ifdef TP_VECCPLX_AVX512
@@ -1025,7 +996,7 @@ bool try_binary_impl(const void* av_, const void* bv, void* yv, int64_t n, int d
 bool try_abs_impl(const void* xv, void* real_out, int64_t n, int dt_i) {
     const DType dt = static_cast<DType>(dt_i);
 
-#ifdef TP_VECCPLX_LIBMVEC
+#ifdef TP_VECCPLX_SLEEF
     if (n <= 0) return false;
 #ifdef TP_VECCPLX_AVX512
     if (avx512_available()) {
@@ -1077,7 +1048,7 @@ bool try_abs_impl(const void* xv, void* real_out, int64_t n, int dt_i) {
 bool try_angle_impl(const void* xv, void* real_out, int64_t n, int dt_i) {
     const DType dt = static_cast<DType>(dt_i);
 
-#ifdef TP_VECCPLX_LIBMVEC
+#ifdef TP_VECCPLX_SLEEF
     if (n <= 0) return false;
 #ifdef TP_VECCPLX_AVX512
     if (avx512_available()) {
@@ -1128,7 +1099,7 @@ bool try_angle_impl(const void* xv, void* real_out, int64_t n, int dt_i) {
 
 bool try_sum_impl(const void* xv, int64_t n, int dt_i, double* re_out, double* im_out) {
     const DType dt = static_cast<DType>(dt_i);
-#ifdef TP_VECCPLX_LIBMVEC
+#ifdef TP_VECCPLX_SLEEF
     if (n <= 0) return false;
     const int64_t nslots = (n + kGrain - 1) / kGrain;
 #ifdef TP_VECCPLX_AVX512

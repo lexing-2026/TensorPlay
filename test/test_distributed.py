@@ -65,7 +65,7 @@ class TestTCPStore(unittest.TestCase):
         self.assertEqual(client.get("x"), b"42")
         self.assertEqual(client.add("x", 8), 50)
         self.assertTrue(client.wait(["x"], timeout=1))
-        server._server.stop()
+        server.stop()
 
     def test_blocking_get_across_clients(self):
         import threading
@@ -85,7 +85,7 @@ class TestTCPStore(unittest.TestCase):
         result.append(client.get("late", timeout=5))
         thread.join()
         self.assertEqual(result[0], b"here")
-        server._server.stop()
+        server.stop()
 
 
 _NCCL_SCRIPT = """
@@ -642,7 +642,7 @@ class TestNCCLProcessGroup(unittest.TestCase):
 
 
 @unittest.skipUnless(HAS_TORCH, "reference package not available")
-class TestDistributedSamplerParity(unittest.TestCase):
+class TestDistributedSamplerReference(unittest.TestCase):
     def test_lengths_and_coverage(self):
         for n, num_replicas, drop_last in [(10, 3, False), (10, 3, True),
                                            (9, 3, False), (9, 3, True)]:

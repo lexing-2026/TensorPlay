@@ -36,15 +36,23 @@ void init_tensor(py::module_& m);
 void init_device(py::module_& m);
 void init_dtype(py::module_& m);
 void init_size(py::module_& m);
+
+// Materialize a tensorplay.Size (C tuple subclass) for Python.
+PyObject* Size_New(const tensorplay::Size& size);
+bool Size_Check(PyObject* obj);
 void init_generator(py::module_& m);
 void init_autograd(py::module_& m);
 void init_autocast(py::module_& m);
+void init_transforms(py::module_& m);
 void init_ops(py::module_& m);
 void init_scalar(py::module_& m);
 void init_stax(py::module_& m);
 void init_parallel(py::module_& m);
 void init_distributed(py::module_& m);
 void init_cuda_graph(py::module_& m);
+void init_futures(py::module_& m);
+void init_rpc(py::module_& m);
+void init_distributed_autograd(py::module_& m);
 
 namespace tensorplay {
 class Exception;

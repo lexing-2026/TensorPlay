@@ -7,6 +7,10 @@ project(TensorPlay LANGUAGES CXX)
 find_package(Python COMPONENTS Interpreter REQUIRED)
 include(cmake/EnvVarForwarding.cmake)
 
+# Find modules (cuDNN, MKL, OpenBLAS, MKLDNN, NCCL, ...) live in cmake/Modules
+# and must be resolvable by every find_package() below.
+list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake/Modules)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -21,6 +25,7 @@ if(NOT DEFINED USE_CUDA)
     endif()
 endif()
 option(USE_CUDA "Enable CUDA support" ${USE_CUDA})
+set(TP_CUDA_ENABLED ${USE_CUDA})
 
 if(USE_CUDA)
     message(STATUS "Checking for CUDA compiler...")
@@ -66,42 +71,49 @@ endif()
 if(USE_CUDA)
     find_package(CUDAToolkit REQUIRED)
     message(STATUS "Found CUDA Toolkit: ${CUDAToolkit_VERSION}")
-    add_compile_definitions(USE_CUDA)
+        string(APPEND CMAKE_CXX_FLAGS " -DUSE_CUDA")
 else()
     message(STATUS "CUDA support disabled by user or not found.")
 endif()
 
-# Check for cuDNN
+# Check for cuDNN.  Discovery (root hints, CUDA toolkit layout, pip wheel,
+# Windows v9 nesting, version parsing, frontend header) lives in
+# cmake/Modules/FindCUDNN.cmake; only the enable/bundling policy stays here.
+set(USE_CUDNN OFF)
 if(USE_CUDA)
-    find_path(CUDNN_INCLUDE_DIR cudnn.h
-        HINTS 
-            ${CUDAToolkit_INCLUDE_DIRS} 
-            $ENV{CUDNN_ROOT_DIR}/include 
-            $ENV{CUDNN_INCLUDE_DIR}
-            "C:/Program Files/NVIDIA/CUDNN/v9.17/include/13.1"
-            "C:/Program Files/NVIDIA/CUDNN/v9.17/include"
-            "C:/Program Files/NVIDIA/CUDNN/v9.x/include"
-        DOC "Path to cuDNN include directory"
-    )
+    option(USE_STATIC_CUDNN "Use cuDNN static libraries" OFF)
+    if(USE_STATIC_CUDNN)
+        set(CUDNN_STATIC ON CACHE BOOL "")
+    else()
+        set(CUDNN_STATIC OFF CACHE BOOL "")
+    endif()
 
-    # Look for cudnn library (windows: cudnn.lib, linux: libcudnn.so)
-    find_library(CUDNN_LIBRARY NAMES cudnn
-        HINTS 
-            ${CUDAToolkit_LIBRARY_DIR} 
-            $ENV{CUDNN_ROOT_DIR}/lib/x64 
-            $ENV{CUDNN_LIBRARY_DIR}
-            "C:/Program Files/NVIDIA/CUDNN/v9.17/lib/13.1/x64"
-            "C:/Program Files/NVIDIA/CUDNN/v9.17/lib/x64"
-            "C:/Program Files/NVIDIA/CUDNN/v9.x/lib/x64"
-        DOC "Path to cuDNN library"
-    )
+    find_package(CUDNN QUIET)
+    if(CUDNN_FOUND)
+        if(CUDNN_VERSION VERSION_LESS "8.1.0")
+            message(FATAL_ERROR "TensorPlay requires cuDNN 8.1 and above.")
+        endif()
+        set(USE_CUDNN ON)
+        message(STATUS "Found cuDNN ${CUDNN_VERSION}: ${CUDNN_INCLUDE_PATH}")
+        string(APPEND CMAKE_CXX_FLAGS " -DUSE_CUDNN")
+        if(CUDNN_FRONTEND_INCLUDE_DIR)
+            message(STATUS "Found cuDNN frontend: ${CUDNN_FRONTEND_INCLUDE_DIR}")
+        endif()
 
-    if(NOT CUDNN_INCLUDE_DIR OR NOT CUDNN_LIBRARY)
-        message(WARNING "cuDNN not found in standard locations.")
+        add_library(tp::cudnn INTERFACE IMPORTED)
+        target_include_directories(tp::cudnn INTERFACE ${CUDNN_INCLUDE_PATH})
+        if(CUDNN_STATIC AND NOT WIN32)
+            target_link_options(tp::cudnn INTERFACE
+                "-Wl,--exclude-libs,libcudnn_static.a")
+        else()
+            target_link_libraries(tp::cudnn INTERFACE ${CUDNN_LIBRARY_PATH})
+        endif()
+    else()
+        message(STATUS "cuDNN not found; CUDA backend will be built without cuDNN support.")
     endif()
 
     # Install CUDA Runtime Libraries (Windows)
-    if(WIN32 AND USE_CUDA)
+    if(WIN32)
         set(CUDA_BIN_DIR "")
         if(DEFINED CUDAToolkit_BIN_DIR)
             set(CUDA_BIN_DIR "${CUDAToolkit_BIN_DIR}")
@@ -158,58 +170,35 @@ if(USE_CUDA)
         endif()
     endif()
 
-    if(CUDNN_INCLUDE_DIR AND CUDNN_LIBRARY)
-        set(USE_CUDNN ON)
-        message(STATUS "Found cuDNN: ${CUDNN_INCLUDE_DIR}")
-        add_compile_definitions(USE_CUDNN)
+    # On Windows, copy cuDNN DLLs if they are not in PATH
+    if(WIN32 AND USE_CUDNN)
+        get_filename_component(CUDNN_LIB_DIR "${CUDNN_LIBRARY}" DIRECTORY)
+        # Handle v9.x structure: lib/13.1/x64 -> ../../../bin/13.1
+        # Or standard: lib/x64 -> ../../bin
 
-        # cuDNN v9 frontend (header-only graph API)
-        find_path(CUDNN_FRONTEND_INCLUDE_DIR cudnn_frontend.h
-            HINTS
-                $ENV{CUDNN_FRONTEND_DIR}/include
-                "${CUDNN_INCLUDE_DIR}/cudnn_frontend"
-            DOC "Path to cuDNN frontend include directory"
-        )
-        if(CUDNN_FRONTEND_INCLUDE_DIR)
-            message(STATUS "Found cuDNN frontend: ${CUDNN_FRONTEND_INCLUDE_DIR}")
-        endif()
-        
-        # On Windows, we might need to copy DLLs if they are not in PATH
-        if(WIN32)
-            get_filename_component(CUDNN_LIB_DIR "${CUDNN_LIBRARY}" DIRECTORY)
-            # Handle v9.x structure: lib/13.1/x64 -> ../../../bin/13.1
-            # Or standard: lib/x64 -> ../../bin
-            
-            # Try to find root by going up until we find 'bin'
-            get_filename_component(CUDNN_ROOT_V9 "${CUDNN_LIB_DIR}/../../.." ABSOLUTE)
-            get_filename_component(CUDNN_ROOT_STD "${CUDNN_LIB_DIR}/../.." ABSOLUTE)
-            
-            set(CUDNN_DLLS "")
-            
-            if(EXISTS "${CUDNN_ROOT_V9}/bin/13.1")
-                file(GLOB CUDNN_DLLS "${CUDNN_ROOT_V9}/bin/13.1/cudnn*.dll")
-            elseif(EXISTS "${CUDNN_ROOT_STD}/bin")
-                file(GLOB CUDNN_DLLS "${CUDNN_ROOT_STD}/bin/cudnn*.dll")
-            endif()
-            
-            if(NOT CUDNN_DLLS)
-                # Fallback: try to find adjacent to lib if flattened, or in typical paths
-                file(GLOB CUDNN_DLLS "${CUDNN_LIB_DIR}/*.dll")
-            endif()
+        # Try to find root by going up until we find 'bin'
+        get_filename_component(CUDNN_ROOT_V9 "${CUDNN_LIB_DIR}/../../.." ABSOLUTE)
+        get_filename_component(CUDNN_ROOT_STD "${CUDNN_LIB_DIR}/../.." ABSOLUTE)
 
-            foreach(DLL ${CUDNN_DLLS})
-                # Don't copy if already exists to avoid permission issues or redundancy
-                # But for development it's safer to copy to build dir
-                file(COPY ${DLL} DESTINATION ${CMAKE_BINARY_DIR}/bin) 
-                file(COPY ${DLL} DESTINATION ${CMAKE_SOURCE_DIR}/tensorplay/lib)
-                install(FILES ${DLL} DESTINATION tensorplay/lib)
-            endforeach()
+        set(CUDNN_DLLS "")
+
+        if(EXISTS "${CUDNN_ROOT_V9}/bin/13.1")
+            file(GLOB CUDNN_DLLS "${CUDNN_ROOT_V9}/bin/13.1/cudnn*.dll")
+        elseif(EXISTS "${CUDNN_ROOT_STD}/bin")
+            file(GLOB CUDNN_DLLS "${CUDNN_ROOT_STD}/bin/cudnn*.dll")
         endif()
-    else()
-        message(WARNING "cuDNN not found. CUDA backend will be built without cuDNN support.")
+
+        if(NOT CUDNN_DLLS)
+            # Fallback: try to find adjacent to lib if flattened, or in typical paths
+            file(GLOB CUDNN_DLLS "${CUDNN_LIB_DIR}/*.dll")
+        endif()
+
+        foreach(DLL ${CUDNN_DLLS})
+            file(COPY ${DLL} DESTINATION ${CMAKE_BINARY_DIR}/bin)
+            file(COPY ${DLL} DESTINATION ${CMAKE_SOURCE_DIR}/tensorplay/lib)
+            install(FILES ${DLL} DESTINATION tensorplay/lib)
+        endforeach()
     endif()
-else()
-    set(USE_CUDNN OFF)
 endif()
 
 if(WIN32)
@@ -247,9 +236,9 @@ if(WIN32)
 
     endif()
 else()
-    add_compile_options(-std=c++20 -O3 -Wall -Wextra -Wpedantic)
+    string(APPEND CMAKE_CXX_FLAGS " -std=c++20 -O3 -Wall -Wextra -Wpedantic")
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU")
-        add_compile_options(-fPIC)
+        string(APPEND CMAKE_CXX_FLAGS " -fPIC")
     endif()
 endif()
 
@@ -318,7 +307,7 @@ if(OpenMP_CXX_FOUND)
     message(STATUS "Found OpenMP")
     # Apply OpenMP flags only to CXX files directly
     # For CUDA, pass them to the host compiler via -Xcompiler
-    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:${OpenMP_CXX_FLAGS}>)
+    string(APPEND CMAKE_CXX_FLAGS " ${OpenMP_CXX_FLAGS}")
     
     if(MSVC)
         # MSVC flag is usually -openmp or /openmp
@@ -428,34 +417,15 @@ if(USE_BLAS)
                 endif()
             endif()
         else()
-            # Fallback: Try finding BLAS/MKL via standard FindBLAS
-            set(BLA_VENDOR "Intel10_64lp")
-            set(BLA_STATIC ON) # Force static linking
-            find_package(BLAS QUIET)
-            if(BLAS_FOUND)
-                message(STATUS "Found MKL via BLAS: ${BLAS_LIBRARIES}")
-                list(APPEND COMPUTE_LIBS ${BLAS_LIBRARIES})
+            # Module-mode fallback (cmake/Modules/FindMKL.cmake): manual
+            # oneAPI/classic layouts, then a generic FindBLAS pass.  The
+            # module reports the result through MKL::MKL.
+            find_package(MKL MODULE QUIET)
+            if(MKL_FOUND)
+                message(STATUS "Found MKL (module): ${MKL_LIBRARIES}")
+                list(APPEND COMPUTE_LIBS MKL::MKL)
+                set(BLAS_FOUND TRUE)
                 list(APPEND BLAS_COMPILE_DEFS "USE_MKL")
-                
-                # Try to find headers if using generic FindBLAS
-                find_path(MKL_INCLUDE_DIR mkl.h HINTS $ENV{MKL_ROOT}/include "${ONEAPI_ROOT}/mkl/latest/include")
-                if(MKL_INCLUDE_DIR)
-                    include_directories(SYSTEM ${MKL_INCLUDE_DIR})
-                else()
-                    # Assume standard path
-                    include_directories(SYSTEM "C:/Program Files (x86)/Intel/oneAPI/mkl/latest/include")
-                endif()
-            else()
-                 # Try manual search
-                 if(EXISTS "${ONEAPI_ROOT}/mkl/latest/lib/intel64/mkl_core.lib")
-                     message(STATUS "Found MKL (Manual): ${ONEAPI_ROOT}/mkl/latest")
-                     set(MKL_LIB_DIR "${ONEAPI_ROOT}/mkl/latest/lib/intel64")
-                     set(MKL_INC_DIR "${ONEAPI_ROOT}/mkl/latest/include")
-                     include_directories(SYSTEM ${MKL_INC_DIR})
-                     list(APPEND COMPUTE_LIBS "${MKL_LIB_DIR}/mkl_intel_lp64.lib" "${MKL_LIB_DIR}/mkl_sequential.lib" "${MKL_LIB_DIR}/mkl_core.lib")
-                     set(BLAS_FOUND TRUE)
-                     list(APPEND BLAS_COMPILE_DEFS "USE_MKL")
-                 endif()
             endif()
         endif()
 
@@ -474,15 +444,13 @@ if(USE_BLAS)
              set(BLAS_FOUND TRUE)
              list(APPEND BLAS_COMPILE_DEFS "USE_OPENBLAS" "USE_BLAS")
         else()
-             find_package(PkgConfig QUIET)
-             if(PKG_CONFIG_FOUND)
-                pkg_check_modules(OpenBLAS_PC openblas QUIET)
-                if(OpenBLAS_PC_FOUND)
-                    list(APPEND COMPUTE_LIBS ${OpenBLAS_PC_LIBRARIES})
-                    include_directories(SYSTEM ${OpenBLAS_PC_INCLUDE_DIRS})
-                    set(BLAS_FOUND TRUE)
-                    list(APPEND BLAS_COMPILE_DEFS "USE_OPENBLAS" "USE_BLAS")
-                endif()
+             # Module-mode fallback (cmake/Modules/FindOpenBLAS.cmake):
+             # pkg-config or manual prefix layouts.
+             find_package(OpenBLAS MODULE QUIET)
+             if(OpenBLAS_FOUND)
+                 list(APPEND COMPUTE_LIBS OpenBLAS::OpenBLAS)
+                 set(BLAS_FOUND TRUE)
+                 list(APPEND BLAS_COMPILE_DEFS "USE_OPENBLAS" "USE_BLAS")
              endif()
         endif()
     endif()
@@ -538,59 +506,68 @@ if(USE_BLAS)
     endif()
 endif()
 
-# --- oneDNN Integration ---
-option(USE_ONEDNN "Enable oneDNN for deep learning primitives" ON)
+# --- oneDNN Integration (cmake/Modules/FindMKLDNN.cmake) ---
+# Resolution order inside the module: a system installation first, then the
+# vendored source tree at third_party/oneDNN built as a static library with
+# the OMP CPU runtime (default), the graph API on Linux, and portable codegen
+# unless MKLDNN_USE_NATIVE_ARCH is set.
+option(USE_MKLDNN "Enable oneDNN for deep learning primitives" ON)
+option(USE_NATIVE_ARCH "Let dependencies tune for the build host (-march=native / HostOpts)" OFF)
+option(USE_NCCL "Use NCCL for tensorplay.distributed" ON)
+# Compatibility alias for the historical knob name.
+if(DEFINED USE_ONEDNN AND NOT DEFINED USE_MKLDNN)
+    set(USE_MKLDNN "${USE_ONEDNN}")
+endif()
 
-if(USE_ONEDNN)
-    message(STATUS "Configuring oneDNN (Static)...")
-    
-    include(FetchContent)
-    
-    set(DNNL_LIBRARY_TYPE STATIC CACHE STRING "" FORCE)
-    set(DNNL_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-    set(DNNL_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-    set(DNNL_ENABLE_CONCURRENT_EXEC ON CACHE BOOL "" FORCE)
-    # THREADPOOL runtime: oneDNN submits its GEMM partitions through the
-    # dnnl::threadpool_interop bridge onto TensorPlay's own intra-op pool
-    # instead of spawning an independent OpenMP team -- one shared worker
-    # team means no oversubscription/spin contention between pointwise
-    # kernels and primitive execution inside training loops.
-    set(DNNL_CPU_RUNTIME "THREADPOOL" CACHE STRING "" FORCE)
-    set(DNNL_ENABLE_WORKLOAD "TRAINING" CACHE STRING "" FORCE)
-    set(DNNL_ENABLE_PRIMITIVE "CONVOLUTION;DECONVOLUTION;MATMUL;REORDER;RNN" CACHE STRING "" FORCE)
-    set(DNNL_ENABLE_PRIMITIVE_CACHE ON CACHE BOOL "" FORCE)
-    set(ONEDNN_BUILD_GRAPH OFF CACHE BOOL "" FORCE) # Graph API incompatible with primitive selection (Use ONEDNN_ prefix)
-    set(DNNL_BUILD_GRAPH OFF CACHE BOOL "" FORCE) # Try legacy name too
-    set(DNNL_ARCH_OPT_FLAGS "" CACHE STRING "" FORCE) # Let user flags decide
-    # OneDNN v3+ might use these
-    set(DNNL_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
-    
-    FetchContent_Declare(
-        onednn
-        URL "${CMAKE_CURRENT_SOURCE_DIR}/third_party/v3.4.1.zip"
-    )
-    
-    FetchContent_MakeAvailable(onednn)
-    
-    if(TARGET dnnl)
-        message(STATUS "✅ Successfully configured oneDNN (Static)")
-        list(APPEND COMPUTE_LIBS dnnl)
+set(MKLDNN_USE_NATIVE_ARCH ${USE_NATIVE_ARCH})
+set(ONEDNN_FOUND FALSE)
+if(USE_MKLDNN)
+    find_package(MKLDNN QUIET)
+    if(MKLDNN_FOUND)
+        list(APPEND COMPUTE_LIBS ${MKLDNN_LIBRARIES})
+        foreach(_inc ${MKLDNN_INCLUDE_DIRS})
+            include_directories(SYSTEM ${_inc})
+        endforeach()
         set(ONEDNN_FOUND TRUE)
-        add_compile_definitions(USE_ONEDNN)
-        
-        # OneDNN headers
-        get_target_property(DNNL_INCLUDE_DIRS dnnl INTERFACE_INCLUDE_DIRECTORIES)
-        include_directories(${DNNL_INCLUDE_DIRS})
-
-        # Disable OneDNN installation to prevent polluting site-packages
-        # We only need the static library linked into p10
-        set_target_properties(dnnl PROPERTIES EXCLUDE_FROM_ALL ON)
+        message(STATUS "✅ Successfully configured oneDNN (MKLDNN_CPU_RUNTIME=${MKLDNN_CPU_RUNTIME})")
     else()
-        message(FATAL_ERROR "Failed to build oneDNN")
+        message(STATUS "oneDNN not found; building without MKL-DNN primitives.")
     endif()
 endif()
 
-add_compile_definitions(${BLAS_COMPILE_DEFS})
+# --- NNPACK Integration ---
+option(USE_NNPACK "Use NNPACK" ON)
+
+# ---[ NNPACK
+if(USE_NNPACK)
+    include(${CMAKE_CURRENT_LIST_DIR}/cmake/External/nnpack.cmake)
+    if(NNPACK_FOUND)
+        if(TARGET nnpack)
+            # ---[ NNPACK is built together with TensorPlay: explicitly specify dependency
+            list(APPEND COMPUTE_LIBS nnpack)
+        else()
+            include_directories(SYSTEM ${NNPACK_INCLUDE_DIRS})
+            list(APPEND COMPUTE_LIBS ${NNPACK_LIBRARIES})
+        endif()
+    else()
+        message(WARNING "Not compiling with NNPACK. Suppress this warning with -DUSE_NNPACK=OFF")
+        set(USE_NNPACK OFF)
+    endif()
+endif()
+
+if(NNPACK_FOUND AND NOT CMAKE_CXX_FLAGS MATCHES "USE_NNPACK")
+    string(APPEND CMAKE_CXX_FLAGS " -DUSE_NNPACK")
+endif()
+
+# --- SLEEF Integration ---
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/External/sleef.cmake)
+
+if(ONEDNN_FOUND)
+    string(APPEND CMAKE_CXX_FLAGS " -DUSE_MKLDNN -DUSE_ONEDNN")
+endif()
+foreach(_def ${BLAS_COMPILE_DEFS})
+    string(APPEND CMAKE_CXX_FLAGS " -D${_def}")
+endforeach()
 
 # Link the OpenMP runtime into every compute library and the Python extension.
 # Compile-only flags (-fopenmp) emit GOMP_* symbols without resolving them,
@@ -603,7 +580,10 @@ endif()
 if(MSVC)
   list(APPEND BLAS_COMPILE_OPTIONS "/O2" "/arch:AVX2")
 else()
-  list(APPEND BLAS_COMPILE_OPTIONS "-march=native" "-O3")
+  list(APPEND BLAS_COMPILE_OPTIONS "-O3")
+  if(USE_NATIVE_ARCH)
+      list(APPEND BLAS_COMPILE_OPTIONS "-march=native")
+  endif()
 endif()
 
 if(NOT BLAS_FOUND)
@@ -674,6 +654,9 @@ set(TP_CXX_VERSION "202002") # C++20
 
 if(MSVC)
     set(TP_COMPILER_INFO "MSVC ${MSVC_VERSION}")
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU")
+    string(REGEX REPLACE "^([0-9]+)\\.([0-9]+).*" "\\1.\\2" _compiler_ver_short "${CMAKE_CXX_COMPILER_VERSION}")
+    set(TP_COMPILER_INFO "GCC ${_compiler_ver_short}")
 else()
     set(TP_COMPILER_INFO "${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
 endif()
@@ -698,13 +681,13 @@ else()
 endif()
 
 if(ONEDNN_FOUND)
-    set(TP_ONEDNN_INFO "Intel(R) MKL-DNN v${dnnl_VERSION}")
+    set(TP_ONEDNN_INFO "Intel(R) MKL-DNN runtime-detected")
 else()
     set(TP_ONEDNN_INFO "N/A")
 endif()
 
 if(OpenMP_CXX_FOUND)
-    set(TP_OPENMP_INFO "OpenMP ${OpenMP_CXX_VERSION}")
+    set(TP_OPENMP_INFO "OpenMP runtime-detected")
 else()
     set(TP_OPENMP_INFO "OpenMP disabled")
 endif()
@@ -727,6 +710,22 @@ else()
     set(TP_CPU_CAPABILITY "Native")
 endif()
 
+# Normalize CMake TRUE/FALSE to ON/OFF for build settings
+function(tp_bool_to_onoff VAR)
+    if(${VAR})
+        set(_out "ON")
+    else()
+        set(_out "OFF")
+    endif()
+    set("${VAR}_OUT" "${_out}" PARENT_SCOPE)
+endfunction()
+
+# Call normalize functions before build settings are assembled
+tp_bool_to_onoff(OpenMP_CXX_FOUND)
+tp_bool_to_onoff(BLAS_FOUND)
+tp_bool_to_onoff(ONEDNN_FOUND)
+tp_bool_to_onoff(USE_NNPACK)
+
 # Build Settings String
 set(TP_BUILD_SETTINGS_LIST)
 
@@ -736,8 +735,37 @@ else()
     set(BLAS_INFO_VAL "${BLAS_PROVIDER}")
 endif()
 
+# Normalize the CUDA toggle to 0/1 for build settings
+if(USE_CUDA)
+    set(TP_USE_CUDA_VAL "1")
+else()
+    set(TP_USE_CUDA_VAL "0")
+endif()
+
+# Entries are emitted in alphabetical key order
 list(APPEND TP_BUILD_SETTINGS_LIST "BLAS_INFO=${BLAS_INFO_VAL}")
 list(APPEND TP_BUILD_SETTINGS_LIST "BUILD_TYPE=${TP_BUILD_TYPE}")
+
+# Get git commit SHA (full hash)
+execute_process(
+    COMMAND git rev-parse HEAD
+    OUTPUT_VARIABLE TP_COMMIT_SHA
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    RESULT_VARIABLE GIT_RESULT
+)
+if(NOT GIT_RESULT EQUAL 0)
+    set(TP_COMMIT_SHA "unknown")
+endif()
+list(APPEND TP_BUILD_SETTINGS_LIST "COMMIT_SHA=${TP_COMMIT_SHA}")
+
+# CUDA compile flags are recorded even for CPU-only builds; when CUDA is
+# disabled this carries the baseline flags a CUDA build would use.
+set(TP_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
+if(NOT TP_CUDA_FLAGS)
+    set(TP_CUDA_FLAGS "-Xcompiler -fPIC")
+endif()
+list(APPEND TP_BUILD_SETTINGS_LIST "CUDA_FLAGS=${TP_CUDA_FLAGS}")
 
 # Sanitize CXX_COMPILER (remove quotes, use forward slashes)
 string(REPLACE "\"" "" CXX_COMPILER_NO_QUOTES "${CMAKE_CXX_COMPILER}")
@@ -749,67 +777,43 @@ list(APPEND TP_BUILD_SETTINGS_LIST "LAPACK_INFO=${BLAS_INFO_VAL}")
 list(APPEND TP_BUILD_SETTINGS_LIST "PERF_WITH_AVX=1")
 list(APPEND TP_BUILD_SETTINGS_LIST "PERF_WITH_AVX2=1")
 list(APPEND TP_BUILD_SETTINGS_LIST "TENSORPLAY_VERSION=${TENSORPLAY_VERSION}")
-list(APPEND TP_BUILD_SETTINGS_LIST "USE_OPENMP=${OpenMP_CXX_FOUND}")
-list(APPEND TP_BUILD_SETTINGS_LIST "USE_MKL=${BLAS_FOUND}")
-list(APPEND TP_BUILD_SETTINGS_LIST "USE_MKLDNN=${ONEDNN_FOUND}")
-list(APPEND TP_BUILD_SETTINGS_LIST "USE_CUDA=${USE_CUDA}")
+list(APPEND TP_BUILD_SETTINGS_LIST "USE_CUDA=${TP_USE_CUDA_VAL}")
 list(APPEND TP_BUILD_SETTINGS_LIST "USE_CUDNN=${USE_CUDNN}")
+list(APPEND TP_BUILD_SETTINGS_LIST "USE_CUSPARSELT=OFF")
+list(APPEND TP_BUILD_SETTINGS_LIST "USE_GFLAGS=OFF")
+list(APPEND TP_BUILD_SETTINGS_LIST "USE_GLOG=OFF")
+list(APPEND TP_BUILD_SETTINGS_LIST "USE_GLOO=ON")
+list(APPEND TP_BUILD_SETTINGS_LIST "USE_MKL=${BLAS_FOUND_OUT}")
+list(APPEND TP_BUILD_SETTINGS_LIST "USE_MKLDNN=${ONEDNN_FOUND_OUT}")
+list(APPEND TP_BUILD_SETTINGS_LIST "USE_MPI=OFF")
+list(APPEND TP_BUILD_SETTINGS_LIST "USE_NCCL=${USE_NCCL}")
+list(APPEND TP_BUILD_SETTINGS_LIST "USE_NNPACK=${USE_NNPACK_OUT}")
+list(APPEND TP_BUILD_SETTINGS_LIST "USE_OPENMP=${OpenMP_CXX_FOUND_OUT}")
+list(APPEND TP_BUILD_SETTINGS_LIST "USE_ROCM=OFF")
+list(APPEND TP_BUILD_SETTINGS_LIST "USE_ROCM_KERNEL_ASSERT=OFF")
+list(APPEND TP_BUILD_SETTINGS_LIST "USE_XCCL=OFF")
+list(APPEND TP_BUILD_SETTINGS_LIST "USE_XPU=OFF")
 
 string(REPLACE ";" ", " TP_BUILD_SETTINGS_STR "${TP_BUILD_SETTINGS_LIST}")
+string(APPEND TP_BUILD_SETTINGS_STR ", ")
 # Escape backslashes for C++ string literal
 string(REPLACE "\\" "\\\\" TP_BUILD_SETTINGS_STR "${TP_BUILD_SETTINGS_STR}")
 # Escape quotes for C++ string literal
 string(REPLACE "\"" "\\\"" TP_BUILD_SETTINGS_STR "${TP_BUILD_SETTINGS_STR}")
+# Escape CXX_FLAGS for C++ string literal
+set(ESCAPED_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+string(REPLACE "\\" "\\\\" ESCAPED_CXX_FLAGS "${ESCAPED_CXX_FLAGS}")
+string(REPLACE "\"" "\\\"" ESCAPED_CXX_FLAGS "${ESCAPED_CXX_FLAGS}")
 
-set(CONFIG_CONTENT "
-#pragma once
-#include <string>
-#include <map>
-#include \"Parallel.h\"
-
-namespace tensorplay {
-    inline std::string show_config() {
-        std::string s = \"TensorPlay built with:\\n\";
-        s += \"   - C++ Version: ${TP_CXX_VERSION}\\n\";
-        s += \"   - ${TP_COMPILER_INFO}\\n\";
-        s += \"   - ${TP_MKL_INFO}\\n\";
-        s += \"   - ${TP_ONEDNN_INFO}\\n\";
-        s += \"   - ${TP_OPENMP_INFO}\\n\";
-        s += \"   - ${TP_CUDA_INFO}\\n\";
-        s += \"   - ${TP_CUDNN_INFO}\\n\";
-        s += \"   - ${TP_LAPACK_INFO}\\n\";
-        s += \"   - CPU capability usage: ${TP_CPU_CAPABILITY}\\n\";
-        s += \"   - Build settings: ${TP_BUILD_SETTINGS_STR}\\n\";
-        return s;
-    }
-
-    inline std::string _cxx_flags() {
-        return \"${ESCAPED_CXX_FLAGS}\";
-    }
-
-    inline std::string _parallel_info() {
-        return tensorplay::parallel::get_parallel_info();
-    }
-
-    inline std::map<std::string, std::string> get_build_info() {
-        std::map<std::string, std::string> info;
-        info[\"CXX_VERSION\"] = \"${TP_CXX_VERSION}\";
-        info[\"COMPILER_INFO\"] = \"${TP_COMPILER_INFO}\";
-        info[\"MKL_INFO\"] = \"${TP_MKL_INFO}\";
-        info[\"ONEDNN_INFO\"] = \"${TP_ONEDNN_INFO}\";
-        info[\"OPENMP_INFO\"] = \"${TP_OPENMP_INFO}\";
-        info[\"CUDA_INFO\"] = \"${TP_CUDA_INFO}\";
-        info[\"CUDNN_INFO\"] = \"${TP_CUDNN_INFO}\";
-        info[\"LAPACK_INFO\"] = \"${TP_LAPACK_INFO}\";
-        info[\"CPU_CAPABILITY\"] = \"${TP_CPU_CAPABILITY}\";
-        info[\"BUILD_SETTINGS\"] = \"${TP_BUILD_SETTINGS_STR}\";
-        return info;
-    }
-}
-")
-file(WRITE "${GEN_BASE_DIR}/tensorplay/ops/Config.h" "${CONFIG_CONTENT}")
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/ConfigInfo.h.in"
+               "${GEN_BASE_DIR}/tensorplay/ops/Config.h")
 
 # Code generation
+file(GLOB_RECURSE tp_codegen_reference CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/pytorch/torchgen/*.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/pytorch/tools/autograd/*.py")
+list(APPEND tp_codegen_reference
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/pytorch/aten/src/ATen/native/tags.yaml")
 add_custom_command(
             OUTPUT ${GEN_HEADER} ${GEN_CPP} ${GEN_BINDINGS_HEADER}
                    ${GEN_CPYTHON_HEADER}
@@ -834,6 +838,9 @@ add_custom_command(
                 ${CMAKE_CURRENT_SOURCE_DIR}/tools/codegen/gen_pyi.py
                 ${CMAKE_CURRENT_SOURCE_DIR}/tools/codegen/gen_tpx.py
                 ${CMAKE_CURRENT_SOURCE_DIR}/tools/codegen/gen_python_c.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/tools/codegen/gen_structured.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/tools/codegen/gen_inplace_or_view.py
+                ${tp_codegen_reference}
                 ${CMAKE_CURRENT_SOURCE_DIR}/src/bindings/python/CPythonBridge.h
                 ${CMAKE_CURRENT_SOURCE_DIR}/src/bindings/python/CPythonBridge.cpp
             COMMENT "Generating Tensor methods, bindings and pyi stubs from native_functions.yaml"
@@ -855,9 +862,7 @@ if(WIN32 AND BUILD_SHARED_LIBS)
 endif()
 
 # Add p10
-list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake/Modules)
 add_subdirectory(p10)
-
 # Add tpx
 add_subdirectory(tpx)
 
@@ -881,6 +886,75 @@ if(NOT WIN32)
     target_link_libraries(tp_python PUBLIC p10 pybind11::pybind11)
 endif()
 
+# ---------------------------------------------------------------------------
+# CPU process-group backends (gloo transport + MPI), kept as a separate
+# static library so the pybind11 module stays free of unity-build collisions.
+# ---------------------------------------------------------------------------
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+set(BUILD_TEST OFF CACHE BOOL "" FORCE)
+set(BUILD_BENCHMARK OFF CACHE BOOL "" FORCE)
+set(USE_REDIS OFF CACHE BOOL "" FORCE)
+set(USE_IBVERBS OFF CACHE BOOL "" FORCE)
+set(USE_NCCL OFF CACHE BOOL "" FORCE)
+set(USE_RCCL OFF CACHE BOOL "" FORCE)
+# libuv ships as a non-PIC static archive on this platform and cannot be
+# linked into the shared transport library; the TCP transport covers our use.
+set(USE_LIBUV OFF CACHE BOOL "" FORCE)
+set(USE_TCP_OPENSSL_LINK OFF CACHE BOOL "" FORCE)
+set(USE_TCP_OPENSSL_LOAD OFF CACHE BOOL "" FORCE)
+# Gloo builds CPU-only, but its USE_CUDA knob lives in the global namespace:
+# save the project's own switch and restore it after the subdirectory, or a
+# fresh configure silently turns the whole CUDA build off.
+set(TP_GLOO_USE_CUDA_SAVE "${USE_CUDA}")
+set(USE_CUDA OFF CACHE BOOL "" FORCE)
+add_subdirectory(third_party/gloo)
+set(USE_CUDA "${TP_GLOO_USE_CUDA_SAVE}" CACHE BOOL "" FORCE)
+
+set(TP_USE_CUDA ${TP_CUDA_ENABLED} CACHE BOOL "" FORCE)
+set(TP_BUILD_LIBUV OFF CACHE BOOL "" FORCE)
+set(TP_BUILD_PYTHON OFF CACHE BOOL "" FORCE)
+set(TP_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+set(TP_BUILD_MISC OFF CACHE BOOL "" FORCE)
+set(TP_BUILD_BENCHMARK OFF CACHE BOOL "" FORCE)
+set(TP_STATIC_OR_SHARED STATIC CACHE STRING "" FORCE)
+add_subdirectory(
+    third_party/pytorch/third_party/tensorpipe
+    third_party/tensorpipe-build
+    EXCLUDE_FROM_ALL)
+set_target_properties(tensorpipe PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(TARGET tensorpipe_cuda)
+    set_target_properties(tensorpipe_cuda PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif()
+
+add_library(tp_distributed STATIC
+    src/distributed/gloo/ProcessGroupGloo.cpp
+    src/distributed/mpi/ProcessGroupMPI.cpp
+    src/distributed/store/FileStore.cpp
+    src/distributed/store/HashStore.cpp
+    src/distributed/store/PrefixStore.cpp
+    src/distributed/store/Store.cpp
+    src/distributed/store/TCPStore.cpp
+)
+target_include_directories(tp_distributed
+    PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src/distributed"
+           "${CMAKE_CURRENT_SOURCE_DIR}/src/distributed/autograd"
+           "${CMAKE_CURRENT_SOURCE_DIR}/p10/include"
+           "${CMAKE_CURRENT_SOURCE_DIR}/third_party/gloo")
+target_link_libraries(tp_distributed PUBLIC p10 pybind11::pybind11 gloo)
+target_compile_definitions(tp_distributed PUBLIC USE_P10D_GLOO)
+
+option(TP_USE_MPI "Enable the MPI process group backend" ON)
+if(TP_USE_MPI)
+    find_package(MPI COMPONENTS CXX QUIET)
+    if(MPI_CXX_FOUND)
+        target_link_libraries(tp_distributed PUBLIC MPI::MPI_CXX)
+        target_compile_definitions(tp_distributed PUBLIC USE_P10D_MPI)
+        message(STATUS "MPI backend enabled (${MPI_CXX_LIBRARIES})")
+    else()
+        message(STATUS "MPI runtime not found; the MPI backend stays disabled")
+    endif()
+endif()
+
 # Python Bindings
 pybind11_add_module(_C
     src/bindings/python/init.cpp
@@ -891,22 +965,74 @@ pybind11_add_module(_C
     src/bindings/python/Generator.cpp
     src/bindings/python/Autograd.cpp
     src/bindings/python/autocast_mode.cpp
+    src/bindings/python/Transforms.cpp
     src/bindings/python/Ops.cpp
     src/bindings/python/Tensor.cpp
     src/bindings/python/Stax.cpp
     src/bindings/python/Parallel.cpp
     src/bindings/python/Distributed.cpp
+    src/bindings/python/DistributedAutograd.cpp
+    src/distributed/bindings.cpp
+    src/bindings/python/Futures.cpp
+    src/bindings/python/Rpc.cpp
+    src/distributed/rpc/agent_utils.cpp
+    src/distributed/rpc/future.cpp
+    src/distributed/rpc/message.cpp
+    src/distributed/rpc/python_call.cpp
+    src/distributed/rpc/python_functions.cpp
+    src/distributed/rpc/python_remote_call.cpp
+    src/distributed/rpc/python_resp.cpp
+    src/distributed/rpc/python_rpc_handler.cpp
+    src/distributed/rpc/py_rref.cpp
+    src/distributed/rpc/rpc_agent.cpp
+    src/distributed/rpc/request_callback.cpp
+    src/distributed/rpc/request_callback_impl.cpp
+    src/distributed/rpc/request_callback_no_python.cpp
+    src/distributed/rpc/rpc_runtime.cpp
+    src/distributed/rpc/rref_context.cpp
+    src/distributed/rpc/rref_impl.cpp
+    src/distributed/rpc/rref_proto.cpp
+    src/distributed/rpc/tensorpipe_agent.cpp
+    src/distributed/rpc/tensorpipe_backend.cpp
+    src/distributed/rpc/tensorpipe_utils.cpp
+    src/distributed/rpc/types.cpp
+    src/distributed/rpc/unpickled_python_call.cpp
+    src/distributed/rpc/unpickled_python_remote_call.cpp
+    src/distributed/rpc/utils.cpp
+    src/distributed/autograd/autograd.cpp
+    src/distributed/autograd/context/container.cpp
+    src/distributed/autograd/context/context.cpp
+    src/distributed/autograd/engine/dist_engine.cpp
+    src/distributed/autograd/functions/recvrpc_backward.cpp
+    src/distributed/autograd/functions/sendrpc_backward.cpp
+    src/distributed/autograd/rpc_messages/autograd_metadata.cpp
+    src/distributed/autograd/rpc_messages/cleanup_autograd_context_req.cpp
+    src/distributed/autograd/rpc_messages/cleanup_autograd_context_resp.cpp
+    src/distributed/autograd/rpc_messages/propagate_gradients_req.cpp
+    src/distributed/autograd/rpc_messages/propagate_gradients_resp.cpp
+    src/distributed/autograd/rpc_messages/rpc_with_autograd.cpp
+    src/distributed/autograd/rpc_messages/rref_backward_req.cpp
+    src/distributed/autograd/rpc_messages/rref_backward_resp.cpp
+    src/distributed/autograd/utils.cpp
+    src/distributed/rpc/metrics/registry.cpp
+    src/distributed/rpc/profiler/remote_profiler_manager.cpp
+    src/distributed/rpc/profiler/server_process_global_profiler.cpp
     src/bindings/python/CudaGraph.cpp
-    src/bindings/python/FileCheck.cpp
-)
+     src/bindings/python/FileCheck.cpp
+     src/Version.cpp
+ )
 set_target_properties(_C PROPERTIES UNITY_BUILD ON)
 if(NOT WIN32)
-    target_link_libraries(_C PRIVATE p10 tpx stax tp_python)
+    target_link_libraries(_C PRIVATE p10 tpx stax tp_python tp_distributed tensorpipe)
 else()
-    target_link_libraries(_C PRIVATE p10 tpx stax)
+    target_link_libraries(_C PRIVATE p10 tpx stax tp_distributed tensorpipe)
 endif()
 
-if(USE_CUDA)
+if(TP_CUDA_ENABLED AND TARGET tensorpipe_cuda)
+    target_link_libraries(_C PRIVATE tensorpipe_cuda)
+endif()
+
+if(TP_CUDA_ENABLED)
     target_link_libraries(_C PRIVATE CUDA::cudart)
 endif()
 
@@ -925,6 +1051,7 @@ target_include_directories(_C PRIVATE
     include
     ${CMAKE_CURRENT_SOURCE_DIR}/src/bindings/python
     ${CMAKE_CURRENT_SOURCE_DIR}/p10/src/backend/cuda
+    ${CMAKE_CURRENT_SOURCE_DIR}/p10/include
 )
 
 set(TP_PACKAGE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tensorplay")
@@ -989,6 +1116,55 @@ install(DIRECTORY "${CMAKE_SOURCE_DIR}/tensorplay/_C/"
     DESTINATION tensorplay/_C
     FILES_MATCHING PATTERN "*.pyi"
 )
+install(FILES "${CMAKE_SOURCE_DIR}/tensorplay/functional.pyi"
+    DESTINATION tensorplay
+)
+
+# Type stubs for the _C extension are generated into the package source tree
+# so IDEs and type checkers pick them up both in-tree and from the install
+# rule above.  Like the other codegen outputs, the stub is a dedicated custom
+# command: its outputs, template, schema, binding source, and documentation
+# module are all tracked as dependencies, and the stub target is a dependency
+# of the extension target so a stale stub cannot survive a build.
+file(GLOB_RECURSE tp_pyi_python CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/tools/codegen/*.py")
+add_custom_command(
+    OUTPUT
+    "${TP_PACKAGE_DIR}/_C/__init__.pyi"
+    "${TP_PACKAGE_DIR}/_C/_VariableFunctions.pyi"
+    "${TP_PACKAGE_DIR}/functional.pyi"
+    COMMAND
+    ${CMAKE_COMMAND} -E env PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
+        ${Python_EXECUTABLE} -m tools.codegen.main
+        --yaml config/native_functions.yaml
+        --out_dir ${GEN_INCLUDE_DIR}
+        --targets PyiStub
+        --pyi_template "${TP_PACKAGE_DIR}"
+        --pyi_out "${TP_PACKAGE_DIR}"
+    DEPENDS
+        "${TP_PACKAGE_DIR}/_C/__init__.pyi.in"
+        "${TP_PACKAGE_DIR}/_C/_VariableFunctions.pyi.in"
+        "${TP_PACKAGE_DIR}/functional.pyi.in"
+        "${TP_PACKAGE_DIR}/functional.py"
+        "${TP_PACKAGE_DIR}/_docs.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/config/native_functions.yaml"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/bindings/python/DType.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/codegen/gen_pyi.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/codegen/api_types.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/codegen/model.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/codegen/main.py"
+        ${tp_pyi_python}
+        ${tp_codegen_reference}
+    WORKING_DIRECTORY
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+    COMMENT "Generating type stubs from native_functions.yaml"
+)
+add_custom_target(tensorplay_stubs DEPENDS
+    "${TP_PACKAGE_DIR}/_C/__init__.pyi"
+    "${TP_PACKAGE_DIR}/_C/_VariableFunctions.pyi"
+    "${TP_PACKAGE_DIR}/functional.pyi"
+)
+add_dependencies(_C tensorplay_stubs)
 
 # Add custom target for building python extension
 add_custom_target(build_python

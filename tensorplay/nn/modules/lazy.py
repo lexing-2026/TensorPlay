@@ -236,7 +236,7 @@ class LazyModuleMixin:
 
     def has_uninitialized_params(self: _LazyProtocol):
         r"""Check if a module has parameters that are not initialized."""
-        # This is to avoid the JIT to track this parameter and force
+        # This avoids the compiler tracking this parameter and forcing
         # custom modules __setstate__ to add it
         params = self._parameters.values()
         buffers = self._buffers.values()

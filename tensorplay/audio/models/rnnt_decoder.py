@@ -236,7 +236,7 @@ class RNNTBeamSearch(tensorplay.nn.Module):
         b_hypos = self._init_b_hypos(device) if hypo is None else hypo
         for t in range(n_time_steps):
             a_hypos = b_hypos
-            b_hypos = tensorplay.jit.annotate(List[Hypothesis], [])
+            b_hypos = []
             key_to_b_hypo: Dict[str, Hypothesis] = {}
             symbols_current_t = 0
 
@@ -292,7 +292,7 @@ class RNNTBeamSearch(tensorplay.nn.Module):
         enc_out, _ = self.model.transcribe(input, length)
         return self._search(enc_out, None, beam_width)
 
-    @tensorplay.jit.export
+    @tensorplay.compiler.export
     def infer(
         self,
         input: tensorplay.Tensor,

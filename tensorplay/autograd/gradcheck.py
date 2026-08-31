@@ -17,14 +17,10 @@ import tensorplay
 from .function import Function
 
 
-# Note: `get_*_jacobian` functions are added here even though we didn't intend to make them public
-# since they have been exposed from before we added `__all__`  and we already maintain BC for them
 __all__ = [
     "gradcheck",
     "gradgradcheck",
     "GradcheckError",
-    "get_numerical_jacobian",
-    "get_analytical_jacobian",
     "get_numerical_jacobian_wrt_specific_input",
 ]
 
@@ -177,47 +173,6 @@ def _get_numerical_jacobian(fn, inputs, outputs=None, target=None, eps=1e-3):
             )
         ]
     return jacobians
-
-
-def get_numerical_jacobian(fn, inputs, target=None, eps=1e-3, grad_out=1.0):
-    """Compute the numerical Jacobian for a given fn and its inputs.
-
-    .. warning::
-        only for backward compatibility.
-
-    Args:
-        fn: the function to compute the Jacobian for (must take inputs as a tuple)
-        inputs: input to `fn`
-        target: the Tensors wrt whom Jacobians are calculated (default=`input`)
-        eps: the magnitude of the perturbation during finite differencing
-             (default=`1e-3`)
-        grad_out: defaults to 1.0.
-
-    Returns:
-        A list of Jacobians of `fn` (restricted to its first output) with respect to
-        each input or target, if provided.
-
-    Note that `target` may not even be part of `input` to `fn`, so please be
-    **very careful** in this to not clone `target`.
-    """
-    warnings.warn(
-        "meant to be exposed. We are deprecating it and it will be removed "
-        "in a future version.",
-        FutureWarning,
-        stacklevel=2,
-    )
-    if grad_out != 1.0:  # grad_out param is only kept for backward compatibility reasons
-        raise ValueError(
-            "Expected grad_out to be 1.0. get_numerical_jacobian no longer "
-            "supports values of grad_out != 1.0."
-        )
-
-    def fn_pack_inps(*inps):
-        return fn(inps)
-
-    jacobians = _get_numerical_jacobian(fn_pack_inps, inputs, None, target, eps)
-
-    return tuple(jacobian_for_each_output[0] for jacobian_for_each_output in jacobians)
 
 
 def _compute_numerical_gradient(fn, entry, v, norm_v, nbhd_checks_fn):
@@ -412,44 +367,6 @@ def _check_analytical_jacobian_attributes(inputs, output, nondet_tol, check_grad
             f"The tolerance for nondeterminism was {nondet_tol}." + FAILED_NONDET_MSG
         )
     return jacobians1
-
-
-def get_analytical_jacobian(inputs, output, nondet_tol=0.0, grad_out=1.0):
-    # Replicates the behavior of the old get_analytical_jacobian before the refactor
-    # This shares much of its code with _check_analytical_jacobian_attributes
-    warnings.warn(
-        "meant to be exposed. We are deprecating it and it will be removed "
-        "in a future version.",
-        FutureWarning,
-        stacklevel=2,
-    )
-    if grad_out != 1.0:  # grad_out param is only kept for backward compatibility reasons
-        raise ValueError(
-            "Expected grad_out to be 1.0. get_analytical_jacobian no longer "
-            "supports values of grad_out != 1.0."
-        )
-    if output.is_complex():
-        raise ValueError(
-            "Expected output to be non-complex. get_analytical_jacobian no "
-            "longer supports functions that return complex outputs."
-        )
-    diff_input_list = list(_iter_tensors(inputs, True))
-
-    def vjp_fn(grad_output):
-        return tensorplay.autograd.grad(
-            output, diff_input_list, grad_output, retain_graph=True, allow_unused=True
-        )
-
-    # Compute everything twice to check for nondeterminism (which we call reentrancy)
-    vjps1 = _compute_analytical_jacobian_rows(vjp_fn, output.clone())
-    vjps2 = _compute_analytical_jacobian_rows(vjp_fn, output.clone())
-
-    output_numel = output.numel()
-    jacobians1, types_ok, sizes_ok = _stack_and_check_tensors(vjps1, inputs, output_numel)
-    jacobians2, _, _ = _stack_and_check_tensors(vjps2, inputs, output_numel)
-    reentrant = _check_jacobians_equal(jacobians1, jacobians2, nondet_tol)
-
-    return jacobians1, reentrant, sizes_ok, types_ok
 
 
 def _get_analytical_jacobian(inputs, outputs, input_idx, output_idx):

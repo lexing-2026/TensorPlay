@@ -998,3 +998,64 @@ class TestStructuralPointwiseBatch:
                      torch.nonzero_static(sv, size=1).tolist())
         assert close(tp.nonzero_static(tsv, size=7, fill_value=-9).tolist(),
                      torch.nonzero_static(sv, size=7, fill_value=-9).tolist())
+
+
+class TestLeftoverNativeBatch:
+    def test_frexp(self):
+        for vals in ([1.0, 2.0, 4.0, 0.0, -3.5],
+                     [5e-320, 1e-300, float("inf"), float("nan")]):
+            t = torch.tensor(vals, dtype=torch.float64)
+            gm, ge = tp.frexp(tp.tensor(vals, dtype=tp.float64))
+            rm, re = torch.frexp(t)
+            for g, r in zip(gm.cpu().tolist(), rm.tolist()):
+                if math.isnan(r):
+                    assert math.isnan(g)
+                else:
+                    assert g == r
+            assert ge.cpu().tolist() == re.tolist()
+        gm, ge = tp.frexp(tp.tensor([1.5, -2.5], dtype=tp.float32))
+        assert str(gm.dtype) == "tensorplay.float32"
+        assert str(ge.dtype) == "tensorplay.int32"
+
+    def test_igamma_igammac_grid(self):
+        avals = [0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 60.0, 150.0]
+        xvals = [0.0, 1e-3, 0.3, 1.0, 2.5, 7.0, 24.0, 60.0, 149.0, 300.0]
+        for a in avals:
+            for x in xvals:
+                ra = torch.tensor([a], dtype=torch.float64)
+                rx = torch.tensor([x], dtype=torch.float64)
+                ta = tp.tensor([a], dtype=tp.float64)
+                tx = tp.tensor([x], dtype=tp.float64)
+                rp = torch.igamma(ra, rx).tolist()[0]
+                rq = torch.igammac(ra, rx).tolist()[0]
+                gp = tp.igamma(ta, tx).cpu().tolist()[0]
+                gq = tp.igammac(ta, tx).cpu().tolist()[0]
+                if math.isnan(rp):
+                    assert math.isnan(gp)
+                else:
+                    assert abs(gp - rp) < 1e-9, (a, x, gp, rp)
+                if math.isnan(rq):
+                    assert math.isnan(gq)
+                else:
+                    assert abs(gq - rq) < 1e-9, (a, x, gq, rq)
+
+    def test_empty_strided(self):
+        es = tp.empty_strided([4, 4], [1, 4], dtype=tp.float32)
+        assert es.shape == tp.Size([4, 4])
+        es2 = tp.empty_strided([2, 3], [3, 1], dtype=tp.float64)
+        es2.copy_(tp.ones([2, 3]))
+        assert close(es2.cpu().tolist(), [[1.0] * 3, [1.0] * 3])
+
+    def test_cdist_batched_and_generic_p(self):
+        x1 = torch.randn(2, 4, 6)
+        x2 = torch.randn(2, 5, 6)
+        t1 = tp.tensor(x1.tolist())
+        t2 = tp.tensor(x2.tolist())
+        for p in (0, 1, 2, 3.5, float("inf")):
+            assert close(tp.cdist(t1, t2, p).tolist(),
+                         torch.cdist(x1, x2, p).tolist(), tol=1e-4)
+        x1_2 = torch.randn(4, 6)
+        x2_2 = torch.randn(5, 6)
+        assert close(tp.cdist(tp.tensor(x1_2.tolist()),
+                              tp.tensor(x2_2.tolist()), 3.5).tolist(),
+                     torch.cdist(x1_2, x2_2, 3.5).tolist(), tol=1e-4)

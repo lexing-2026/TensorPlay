@@ -1,9 +1,11 @@
 #include "python_bindings.h"
 #include "tensorplay/ops/Config.h"
 #include "tensorplay/ops/TensorCPythonGenerated.h"
+#include "CPythonBridge.h"
 #include "Context.h"
 #include "OneDNNContext.h"
 #include "Profiler.h"
+#include "Graph.h"
 #include <cstdlib>
 #include <cstring>
 
@@ -68,17 +70,15 @@ namespace {
 // wrappers in front of them cost ~0.5us of frame/checks per call -- which is
 // rebinds those public names onto C trampolines:
 //
-//   * while a Tracer capture is live (tensorplay.compiler.graph._TRACE_DEPTH
-//     > 0) the call vectors straight to the original Python wrapper, so
+//   * while the native capture state reports an active compiler region the
+//     call vectors straight to the original Python wrapper, so
 //     capture_call/proxy-scan semantics are preserved bit-for-bit;
 //   * otherwise it normalizes just the spellings the generated parser rejects
 //     (device strings, lone-int or iterable-only sizes, bare-int fill_value)
 //     and vectors directly into the fastcall entry -- zero Python frames.
 //
 // Called from the tail of tensorplay/functional.py (which owns the wrappers),
-// so both refs are resolved eagerly and every failure degrades to keeping the
-// plain Python wrappers (older extensions without this symbol hit the
-// AttributeError guard there).
+// so both refs are resolved eagerly before the fast call entry is installed.
 // ---------------------------------------------------------------------------
 
 struct FactoryHook {
@@ -90,19 +90,9 @@ struct FactoryHook {
     bool varargs;           // empty family: fold *size positionals
 };
 
-PyObject* g_factory_graph_mod = nullptr;  // tensorplay.compiler.graph
-
-// Borrowed-borrowed-borrowed: returns false only when capture state cannot be
-// read, in which case callers must divert to the Python wrapper (correct by
-// construction -- the wrapper consults capturing() itself).
 bool factory_trace_depth(long* out) {
-    if (!g_factory_graph_mod) return false;
-    PyObject* v = PyDict_GetItemString(PyModule_GetDict(g_factory_graph_mod),
-                                       "_TRACE_DEPTH");
-    if (!v || !PyLong_Check(v)) return false;
-    long d = PyLong_AsLong(v);
-    if (d < 0) { PyErr_Clear(); return false; }
-    *out = d;
+    *out = static_cast<long>(
+        tensorplay::stax::currentCaptureState().compile_depth);
     return true;
 }
 
@@ -252,11 +242,6 @@ int install_factory_fast_paths_impl(py::module_& m, py::dict wrappers) {
     if (done) return 0;
     done = true;
 
-    // Capture-state source.  Missing => trampolines divert everything to the
-    // Python wrappers (still correct), so a soft failure is fine here.
-    g_factory_graph_mod = PyImport_ImportModule("tensorplay.compiler.graph");
-    if (!g_factory_graph_mod) PyErr_Clear();
-
     PyObject* tp_mod = PyImport_ImportModule("tensorplay");
     PyObject* tensor_type = nullptr, *scalar_type = nullptr, *device_fn = nullptr;
     if (tp_mod) {
@@ -364,10 +349,14 @@ PYBIND11_MODULE(_C, m) {
     init_tensor(m);
     init_autograd(m);
     init_autocast(m);
+    init_transforms(m);
     init_ops(m);
     init_stax(m);
     init_parallel(m);
     init_distributed(m);
+    init_futures(m);
+    init_rpc(m);
+    init_distributed_autograd(m);
     init_filecheck(m);
     init_cuda_graph(m);
 
@@ -385,6 +374,66 @@ PYBIND11_MODULE(_C, m) {
     m.def("_cxx_flags", &tensorplay::_cxx_flags);
     m.def("_parallel_info", &tensorplay::_parallel_info);
     m.def("_get_build_info", &tensorplay::get_build_info);
+
+    // Python dispatch state is thread-local and is consumed by both the
+    // generated fastcall entries and the public override helpers.
+    m.def("_get_tensor_function_state", []() {
+        return tensorplay::python_c::tpx_py_get_function_state();
+    });
+    m.def("_set_tensor_function_state", [](int state) {
+        if (!tensorplay::python_c::tpx_py_set_function_state(state)) {
+            throw py::error_already_set();
+        }
+    }, "state"_a);
+    m.def("_exchange_tensor_function_skip_next", [](bool value) {
+        return tensorplay::python_c::tpx_py_exchange_skip_next(value);
+    }, "value"_a);
+    m.def("_peek_tensor_function_skip_next", []() {
+        return tensorplay::python_c::tpx_py_peek_skip_next();
+    });
+    m.def("_exchange_tensor_subclass_skip_next", [](bool value) {
+        return tensorplay::python_c::tpx_py_exchange_subclass_skip_next(value);
+    }, "value"_a);
+    m.def("_peek_tensor_subclass_skip_next", []() {
+        return tensorplay::python_c::tpx_py_peek_subclass_skip_next();
+    });
+    m.def("_get_tensor_dispatch_layer", []() {
+        return tensorplay::python_c::tpx_py_get_dispatch_layer();
+    });
+    m.def("_push_tensor_function_mode", [](py::object mode) {
+        tensorplay::python_c::tpx_py_push_function_mode(mode.ptr());
+    }, "mode"_a);
+    m.def("_pop_tensor_function_mode", []() {
+        PyObject* mode = tensorplay::python_c::tpx_py_pop_function_mode();
+        if (mode == nullptr) throw py::error_already_set();
+        return py::reinterpret_steal<py::object>(mode);
+    });
+    m.def("_get_tensor_function_mode", [](Py_ssize_t index) {
+        PyObject* mode = tensorplay::python_c::tpx_py_get_function_mode(index);
+        if (mode == nullptr) throw py::error_already_set();
+        return py::reinterpret_steal<py::object>(mode);
+    }, "index"_a);
+    m.def("_len_tensor_function_mode", []() {
+        return tensorplay::python_c::tpx_py_function_mode_len();
+    });
+    m.def("_is_tensor_function_mode_enabled", []() {
+        return tensorplay::python_c::tpx_py_get_function_state() !=
+                   tensorplay::python_c::TPX_ALL_DISABLED &&
+               tensorplay::python_c::tpx_py_function_mode_len() != 0;
+    });
+
+    m.def("_get_nnpack_enabled", []() {
+        return tensorplay::globalContext().userEnabledNNPACK();
+    });
+    m.def("_set_nnpack_enabled", [](bool e) {
+        tensorplay::globalContext().setUserEnabledNNPACK(e);
+    });
+    m.def("_get_mkldnn_enabled", []() {
+        return tensorplay::globalContext().userEnabledMkldnn();
+    });
+    m.def("_set_mkldnn_enabled", [](bool e) {
+        tensorplay::globalContext().setUserEnabledMkldnn(e);
+    });
 
     m.def("get_default_dtype", []() {
         return tensorplay::globalContext().defaultDType();
@@ -575,11 +624,17 @@ PYBIND11_MODULE(_C, m) {
                 }
                 stack = std::move(fr);
             }
+            // FLOP estimate for the aggregation view: computed here (once
+            // per event, off the hot path) from the already-captured input
+            // shapes; 0 when shapes are absent or the op is not covered.
+            const int64_t flops =
+                e.shapes ? tensorplay::prof::estimate_flops(e.name, *e.shapes)
+                         : 0;
             out_ops.append(py::make_tuple(
                 std::string(e.name), char(e.kind), e.start_ns, e.end_ns,
                 e.tid, std::move(shapes), std::move(dtypes),
                 std::move(site), e.gpu_ms, e.out_bytes,
-                std::move(stack), e.kernel_count));
+                std::move(stack), e.kernel_count, flops));
         }
         py::list out_gpu;
         for (const auto& a : gpu_acts) {
@@ -669,6 +724,15 @@ PYBIND11_MODULE(_C, m) {
     if (getenv("TP_NO_FASTCALL") == nullptr) {
         if (tensorplay::python_c::register_generated_cpython_functions(m.ptr()) != 0) {
             throw py::error_already_set();
+        }
+        // The op-functions submodule carries the same fill-only layer so the
+        // METH_FASTCALL-bound ops are reachable from both module surfaces.
+        if (py::hasattr(m, "_VariableFunctions")) {
+            py::object variable_functions = m.attr("_VariableFunctions");
+            if (tensorplay::python_c::register_generated_cpython_functions(
+                    variable_functions.ptr()) != 0) {
+                throw py::error_already_set();
+            }
         }
     }
 

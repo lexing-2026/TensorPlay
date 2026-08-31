@@ -262,14 +262,6 @@ class _Context:
                 )
             self._non_differentiable.add(id(arg))
 
-    def mark_shared_storage(self, *args):
-        r"""Deprecated: has no effect in this engine."""
-        warnings.warn(
-            "ctx.mark_shared_storage is deprecated and has no effect",
-            stacklevel=2,
-        )
-
-
 def once_differentiable(fn):
     r"""Decorator to make a custom autograd Function's backward run once,
     with gradients detached and grad-mode disabled inside."""
@@ -389,12 +381,6 @@ class Function(metaclass=FunctionMeta):
             "You tried to vmap over a custom Function that does not have "
             "vmap support. Please override and implement the vmap "
             "staticmethod or set generate_vmap_rule=True."
-        )
-
-    def __call__(self, *args, **kwargs):
-        raise RuntimeError(
-            "legacy autograd function with non-static forward method is deprecated. "
-            "Please use new-style autograd function with static forward method. "
         )
 
     @classmethod

@@ -41,7 +41,7 @@ class Wav2Vec2Model(Module):
         self.encoder = encoder
         self.aux = aux
 
-    @tensorplay.jit.export
+    @tensorplay.compiler.export
     def extract_features(
         self,
         waveforms: Tensor,

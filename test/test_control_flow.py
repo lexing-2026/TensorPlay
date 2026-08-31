@@ -9,7 +9,7 @@ import tensorplay as tp
 def _clean_probe_backends():
     yield
     for name in ("p1_probe", "p1_meta_probe"):
-        tp.compiler.unregister_backend(name)
+        tp._stax.unregister_backend(name)
 
 
 class ShapeBranch(tp.nn.Module):
@@ -34,7 +34,7 @@ def test_shape_condition_specializes_statically():
 def test_static_branch_graph_contains_only_taken_path():
     calls = {}
 
-    @tp.compiler.register_backend(name="p1_probe")
+    @tp._stax.register_backend(name="p1_probe")
     def probe(graph_module, example_inputs, **kwargs):
         calls["ops"] = [
             n.target.__name__ if callable(n.target) else n.target
@@ -102,7 +102,7 @@ def test_data_dependent_control_flow_specializes_with_guards():
 def test_sample_inputs_recorded_on_graph_module():
     captured = {}
 
-    @tp.compiler.register_backend(name="p1_meta_probe")
+    @tp._stax.register_backend(name="p1_meta_probe")
     def meta_probe(graph_module, example_inputs, **kwargs):
         captured["meta"] = getattr(graph_module, "meta", {})
         return graph_module.forward
@@ -114,7 +114,7 @@ def test_sample_inputs_recorded_on_graph_module():
 
 
 def test_tracer_without_samples_keeps_symbolic_shape():
-    from tensorplay.compiler.graph import Tracer
+    from tensorplay.graph import Tracer
 
     gm = Tracer().trace(lambda t: tp.zeros(t.shape))
     targets = [
@@ -132,7 +132,7 @@ def test_compiler_gate_keeps_scalar_symbolic():
     """UPV-native path: gate() values flow as tensor proxies; one spec."""
 
     def fn(x):
-        n = tp.compiler.gate(x.sum())
+        n = tp.graph.gate(x.sum())
         return x * n
 
     compiled = tp.compile(fn, fullgraph=True)
@@ -158,5 +158,5 @@ def test_plain_int_consumption_stays_baked_and_keyed():
 
 def test_gate_outside_capture_raises():
     t = tp.tensor([1.0])
-    with pytest.raises(tp.compiler.GraphCaptureError):
-        tp.compiler.gate(t.sum())
+    with pytest.raises(tp.graph.GraphCaptureError):
+        tp.graph.gate(t.sum())

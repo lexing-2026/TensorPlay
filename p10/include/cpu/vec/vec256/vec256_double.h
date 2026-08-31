@@ -1,32 +1,13 @@
 #pragma once
 
-// depend on Sleef fall back to a scalar map, everything else uses AVX2.
+// AVX2 double vector layer.  Transcendental methods dispatch to the
+// vendored SLEEF vector math (see cpu/vec/SleefShims.h); the remaining
+// primitives use AVX2 intrinsics directly.
 
 #include <immintrin.h>
 #include "cpu/vec/vec_base.h"
+#include "cpu/vec/SleefShims.h"
 
-#if defined(CPU_CAPABILITY_AVX2) && defined(__GLIBC__)
-extern "C" {
-__m256d _ZGVdN4v_acos(__m256d);
-__m256d _ZGVdN4v_acosh(__m256d);
-__m256d _ZGVdN4v_asin(__m256d);
-__m256d _ZGVdN4v_asinh(__m256d);
-__m256d _ZGVdN4v_atan(__m256d);
-__m256d _ZGVdN4v_atanh(__m256d);
-__m256d _ZGVdN4v_cos(__m256d);
-__m256d _ZGVdN4v_cosh(__m256d);
-__m256d _ZGVdN4v_erf(__m256d);
-__m256d _ZGVdN4v_erfc(__m256d);
-__m256d _ZGVdN4v_exp2(__m256d);
-__m256d _ZGVdN4v_expm1(__m256d);
-__m256d _ZGVdN4v_log2(__m256d);
-__m256d _ZGVdN4v_log10(__m256d);
-__m256d _ZGVdN4v_log1p(__m256d);
-__m256d _ZGVdN4v_sin(__m256d);
-__m256d _ZGVdN4v_sinh(__m256d);
-__m256d _ZGVdN4v_tan(__m256d);
-}
-#endif
 
 #include "cpu/SpecialMath.h"
 
@@ -168,56 +149,25 @@ struct Vectorized<double> {
     return *this;
   }
   Vectorized<double> acos() const {
-    #if defined(__GLIBC__)
-    return _ZGVdN4v_acos(values);
-#else
-    return map(std::acos);
-#endif
+    return tensorplay::tpsleef::acos(values);
   }
   Vectorized<double> acosh() const {
-    #if defined(__GLIBC__)
-    return _ZGVdN4v_acosh(values);
-#else
-    return map(std::acosh);
-#endif
+    return tensorplay::tpsleef::acosh(values);
   }
   Vectorized<double> asin() const {
-    #if defined(__GLIBC__)
-    return _ZGVdN4v_asin(values);
-#else
-    return map(std::asin);
-#endif
+    return tensorplay::tpsleef::asin(values);
   }
   Vectorized<double> asinh() const {
-    #if defined(__GLIBC__)
-    return _ZGVdN4v_asinh(values);
-#else
-    return map(std::asinh);
-#endif
+    return tensorplay::tpsleef::asinh(values);
   }
   Vectorized<double> atan() const {
-    #if defined(__GLIBC__)
-    return _ZGVdN4v_atan(values);
-#else
-    return map(std::atan);
-#endif
+    return tensorplay::tpsleef::atan(values);
   }
   Vectorized<double> atanh() const {
-    #if defined(__GLIBC__)
-    return _ZGVdN4v_atanh(values);
-#else
-    return map(std::atanh);
-#endif
+    return tensorplay::tpsleef::atanh(values);
   }
   Vectorized<double> atan2(const Vectorized<double>& exp) const {
-    __at_align__ double tmp[size()];
-    __at_align__ double tmp_x[size()];
-    store(tmp);
-    exp.store(tmp_x);
-    for (const auto i : tensorplay::irange(size())) {
-      tmp[i] = std::atan2(tmp[i], tmp_x[i]);
-    }
-    return loadu(tmp);
+    return tensorplay::tpsleef::atan2(values, exp.values);
   }
   Vectorized<double> copysign(const Vectorized<double>& sign) const {
     // clear sign bit of a, and merge with sign bit of b
@@ -226,41 +176,25 @@ struct Vectorized<double> {
         _mm256_and_pd(_mm256_set1_pd(-0.0), sign));
   }
   Vectorized<double> erf() const {
-    #if defined(__GLIBC__)
-    return _ZGVdN4v_erf(values);
-#else
-    return map(std::erf);
-#endif
+    return tensorplay::tpsleef::erf(values);
   }
   Vectorized<double> erfc() const {
-    #if defined(__GLIBC__)
-    return _ZGVdN4v_erfc(values);
-#else
-    return map(std::erfc);
-#endif
+    return tensorplay::tpsleef::erfc(values);
   }
   Vectorized<double> exp() const {
-    return map(std::exp);
+    return tensorplay::tpsleef::exp(values);
   }
   Vectorized<double> exp2() const {
-    #if defined(__GLIBC__)
-    return _ZGVdN4v_exp2(values);
-#else
-    return map(std::exp2);
-#endif
+    return tensorplay::tpsleef::exp2(values);
   }
   Vectorized<double> expm1() const {
-    #if defined(__GLIBC__)
-    return _ZGVdN4v_expm1(values);
-#else
-    return map(std::expm1);
-#endif
+    return tensorplay::tpsleef::expm1(values);
   }
   Vectorized<double> exp_u20() const {
-    return map(std::exp);
+    return tensorplay::tpsleef::exp(values);
   }
   Vectorized<double> fexp_u20() const {
-    return map(std::exp);
+    return tensorplay::tpsleef::exp(values);
   }
   Vectorized<double> fmod(const Vectorized<double>& q) const {
     __at_align__ double tmp[size()];
@@ -273,57 +207,31 @@ struct Vectorized<double> {
     return loadu(tmp);
   }
   Vectorized<double> log() const {
-    return map(std::log);
+    return tensorplay::tpsleef::log(values);
   }
   Vectorized<double> log2() const {
-    #if defined(__GLIBC__)
-    return _ZGVdN4v_log2(values);
-#else
-    return map(std::log2);
-#endif
+    return tensorplay::tpsleef::log2(values);
   }
   Vectorized<double> log10() const {
-    #if defined(__GLIBC__)
-    return _ZGVdN4v_log10(values);
-#else
-    return map(std::log10);
-#endif
+    return tensorplay::tpsleef::log10(values);
   }
   Vectorized<double> log1p() const {
-    #if defined(__GLIBC__)
-    return _ZGVdN4v_log1p(values);
-#else
-    return map(std::log1p);
-#endif
+    return tensorplay::tpsleef::log1p(values);
   }
   Vectorized<double> ceil() const {
     return _mm256_ceil_pd(values);
   }
   Vectorized<double> cos() const {
-    #if defined(__GLIBC__)
-    return _ZGVdN4v_cos(values);
-#else
-    return map(std::cos);
-#endif
+    return tensorplay::tpsleef::cos(values);
   }
   Vectorized<double> cosh() const {
-    #if defined(__GLIBC__)
-    return _ZGVdN4v_cosh(values);
-#else
-    return map(std::cosh);
-#endif
+    return tensorplay::tpsleef::cosh(values);
   }
   Vectorized<double> floor() const {
     return _mm256_floor_pd(values);
   }
   Vectorized<double> hypot(const Vectorized<double>& b) const {
-    __at_align__ double tmp[kSize], tmp_y[kSize], tmp_result[kSize];
-    store(tmp);
-    b.store(tmp_y);
-    for (int64_t i = 0; i < kSize; i++) {
-      tmp_result[i] = std::hypot(tmp[i], tmp_y[i]);
-    }
-    return loadu(tmp_result);
+    return tensorplay::tpsleef::hypot(values, b.values);
   }
   Vectorized<double> neg() const {
     return _mm256_xor_pd(values, _mm256_set1_pd(-0.0));
@@ -342,28 +250,16 @@ struct Vectorized<double> {
         values, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
   }
   Vectorized<double> sin() const {
-    #if defined(__GLIBC__)
-    return _ZGVdN4v_sin(values);
-#else
-    return map(std::sin);
-#endif
+    return tensorplay::tpsleef::sin(values);
   }
   Vectorized<double> sinh() const {
-    #if defined(__GLIBC__)
-    return _ZGVdN4v_sinh(values);
-#else
-    return map(std::sinh);
-#endif
+    return tensorplay::tpsleef::sinh(values);
   }
   Vectorized<double> tan() const {
-    #if defined(__GLIBC__)
-    return _ZGVdN4v_tan(values);
-#else
-    return map(std::tan);
-#endif
+    return tensorplay::tpsleef::tan(values);
   }
   Vectorized<double> tanh() const {
-    return map(std::tanh);
+    return tensorplay::tpsleef::tanh(values);
   }
   Vectorized<double> trunc() const {
     return _mm256_round_pd(values, (_MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC));
@@ -401,13 +297,7 @@ struct Vectorized<double> {
     return _mm256_div_pd(_mm256_set1_pd(1), _mm256_sqrt_pd(values));
   }
   Vectorized<double> pow(const Vectorized<double>& b) const {
-    __at_align__ double tmp[kSize], tmp_y[kSize], tmp_result[kSize];
-    store(tmp);
-    b.store(tmp_y);
-    for (int64_t i = 0; i < kSize; i++) {
-      tmp_result[i] = std::pow(tmp[i], tmp_y[i]);
-    }
-    return loadu(tmp_result);
+    return tensorplay::tpsleef::pow(values, b.values);
   }
   double reduce_add() const {
     auto v = values;

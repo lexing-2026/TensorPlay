@@ -5,7 +5,7 @@
 TensorPlay documentation
 ===================================
 
-TensorPlay is a PyTorch-compatible tensor library for deep learning using GPUs and CPUs.
+TensorPlay is a tensor library for deep learning using GPUs and CPUs.
 
 Features described in this documentation are classified by release status:
 
@@ -40,7 +40,7 @@ multiprocessing
 library
 distributed
 quantization
-compiler
+_stax
 stax
 vision
 audio

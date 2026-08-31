@@ -8,7 +8,7 @@ import shutil
 
 import tensorplay as tp
 import tensorplay.graph as tpg
-from tensorplay.compiler.graph import Graph, GraphCaptureError, Tracer
+from tensorplay.graph import Graph, GraphCaptureError, Tracer
 
 
 class TinyBlock(tp.nn.Module):
@@ -342,12 +342,11 @@ def test_wrap_is_identity_and_supports_string_form():
     assert tpg.wrap()(fn) is fn
 
 
-def test_facade_reexports_compiler_graph_symbols():
+def test_graph_namespace_exports_graph_symbols():
     assert tpg.Graph is Graph
     assert tpg.Tracer is Tracer
-    assert tpg.dead_code_elimination is __import__(
-        "tensorplay.compiler.graph", fromlist=["dead_code_elimination"]
-    ).dead_code_elimination
+    assert not hasattr(tpg, "PassManager")
+    assert not hasattr(tpg, "ShapeProp")
 
 
 # ---------------------------------------------------------------------------

@@ -49,6 +49,13 @@ enum class EventKind : char {
 using ShapeVec = std::vector<std::vector<int64_t>>;
 using DtypeVec = std::vector<int32_t>;
 
+// Estimated FLOPs for one op invocation from its input shapes
+// (multiply-accumulate counted as two operations), or 0 when the arithmetic
+// is not inferable from operand shapes alone.  Convolution estimates assume
+// stride 1 / padding 0 / dilation 1 (op attributes are not captured).  Used
+// by the binding layer to stamp each collected event at session stop.
+TENSORPLAY_API int64_t estimate_flops(const char* name, const ShapeVec& shapes);
+
 struct Event {
     const char* name;       // borrowed for kOp (static literal), owned in
                             // an internal arena for kUser/kBackward

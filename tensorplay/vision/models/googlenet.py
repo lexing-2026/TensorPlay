@@ -162,7 +162,7 @@ class GoogLeNet(nn.Module):
         # N x 1000 (num_classes)
         return x, aux2, aux1
 
-    @tensorplay.jit.unused
+    @tensorplay.compiler.unused
     def eager_outputs(self, x: Tensor, aux2: Tensor, aux1: Optional[Tensor]) -> GoogLeNetOutputs:
         if self.training and self.aux_logits:
             return _GoogLeNetOutputs(x, aux2, aux1)
@@ -173,9 +173,9 @@ class GoogLeNet(nn.Module):
         x = self._transform_input(x)
         x, aux2, aux1 = self._forward(x)
         aux_defined = self.training and self.aux_logits
-        if tensorplay.jit.is_scripting():
+        if tensorplay.compiler.is_compiling():
             if not aux_defined:
-                warnings.warn("Scripted GoogleNet always returns GoogleNetOutputs Tuple")
+                warnings.warn("Compiled GoogleNet always returns GoogleNetOutputs Tuple")
             return GoogLeNetOutputs(x, aux2, aux1)
         else:
             return self.eager_outputs(x, aux2, aux1)

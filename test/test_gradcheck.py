@@ -1,13 +1,9 @@
 import unittest
-import warnings
-
 import tensorplay as tp
 from tensorplay.autograd.gradcheck import (
     GradcheckError,
     gradcheck,
     gradgradcheck,
-    get_analytical_jacobian,
-    get_numerical_jacobian,
 )
 
 
@@ -108,33 +104,6 @@ class TestGradgradcheck(unittest.TestCase):
     def test_exp_passes(self):
         x = tp.rand(3, dtype=tp.float64, requires_grad=True)
         self.assertTrue(gradgradcheck(lambda t: t.exp().sum(dim=0), x))
-
-
-class TestJacobianHelpers(unittest.TestCase):
-    def test_get_numerical_jacobian(self):
-        x = tp.tensor([1.0, 2.0], dtype=tp.float64, requires_grad=True)
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            jacs = get_numerical_jacobian(lambda inp: inp[0] * inp[0], x)
-        self.assertEqual(len(jacs), 1)
-        jac = jacs[0]
-        self.assertEqual(tuple(jac.shape), (2, 2))
-        for i in range(2):
-            self.assertAlmostEqual(jac[i][i].item(), 2.0 * (i + 1), places=4)
-            self.assertAlmostEqual(jac[i][1 - i].item(), 0.0, places=4)
-
-    def test_get_analytical_jacobian(self):
-        x = tp.tensor([1.0, 2.0], dtype=tp.float64, requires_grad=True)
-        out = x * x
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            jacobians, reentrant, sizes_ok, types_ok = get_analytical_jacobian((x,), out)
-        self.assertTrue(reentrant)
-        self.assertTrue(sizes_ok)
-        self.assertTrue(types_ok)
-        for i in range(2):
-            self.assertAlmostEqual(jacobians[0][i][i].item(), 2.0 * (i + 1), places=8)
 
 
 if __name__ == "__main__":

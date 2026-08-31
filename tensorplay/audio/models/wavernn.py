@@ -328,7 +328,7 @@ class WaveRNN(nn.Module):
         # bring back channel dimension
         return x.unsqueeze(1)
 
-    @tensorplay.jit.export
+    @tensorplay.compiler.export
     def infer(self, specgram: Tensor, lengths: Optional[Tensor] = None) -> Tuple[Tensor, Optional[Tensor]]:
         r"""Inference method of WaveRNN.
 

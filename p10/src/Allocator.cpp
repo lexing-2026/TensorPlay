@@ -13,6 +13,10 @@
 #include <cuda_runtime.h>
 #endif
 
+#ifdef USE_VULKAN
+#include "VulkanRuntime.h"
+#endif
+
 #ifdef _WIN32
 #include <malloc.h>
 #endif
@@ -136,6 +140,14 @@ void copyAllocationBytes(void* destination, const Device& destination_device,
         std::memcpy(destination, source, nbytes);
         return;
     }
+#ifdef USE_VULKAN
+    if (destination_device.is_vulkan() || source_device.is_vulkan()) {
+        vulkan::copyHostVisibleBytes(
+            const_cast<void*>(destination), destination_device,
+            const_cast<void*>(source), source_device, nbytes);
+        return;
+    }
+#endif
 #ifdef USE_CUDA
     const Device cuda_device = destination_device.is_cuda()
         ? destination_device
@@ -157,12 +169,18 @@ void copyAllocationBytes(void* destination, const Device& destination_device,
     if (destination_device.is_cpu() || source_device.is_cpu()) stream.synchronize();
     return;
 #else
-    TP_THROW(RuntimeError, "cannot copy CUDA storage in a CPU-only TensorPlay build");
+    if (destination_device.is_cuda() || source_device.is_cuda()) {
+        TP_THROW(RuntimeError, "cannot copy CUDA storage in a CPU-only TensorPlay build");
+    }
 #endif
+    TP_THROW(RuntimeError, "cannot copy storage between these devices");
 }
 
 #ifdef USE_CUDA
 Allocator* getCUDAAllocator();
+#endif
+#ifdef USE_VULKAN
+Allocator* getVulkanAllocator();
 #endif
 
 Allocator* getAllocator(DeviceType t) {
@@ -174,7 +192,12 @@ Allocator* getAllocator(DeviceType t) {
         return getCUDAAllocator();
     }
 #endif
-    
+#ifdef USE_VULKAN
+    if (t == DeviceType::Vulkan) {
+        return getVulkanAllocator();
+    }
+#endif
+
     TP_THROW(NotImplementedError, "Allocator not implemented for this device type");
 }
 

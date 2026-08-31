@@ -295,17 +295,24 @@ _GRAD_SYMBOLS = {"grad", "grad_output"}
 
 class Emitter:
     """Renders an Expr back to C++, lowering tensor arithmetic onto the
-    tpx::ops free functions (add/sub/mul/div/neg) exactly like the reference
-    translation tables."""
+    tpx::ops free functions (add/sub/mul/div/neg) for generated translation
+    tables."""
 
     def __init__(self, tensor_syms: set[str], member_names: set[str],
-                 tensor_member_names: set[str] = frozenset()):
+                 tensor_member_names: set[str] = frozenset(),
+                 native_op_names: set[str] = frozenset()):
         self.tensor_syms = set(tensor_syms) | _GRAD_SYMBOLS
         self.members = set(member_names)
         # Saved forward tensors become SavedVariable members and are unpacked
         # into `{name}_sv` locals at the top of apply(); formulas reference
         # those locals so every use goes through the version check.
         self.tensor_members = set(tensor_member_names)
+        self.native_op_names = set(native_op_names)
+
+    def op_name(self, name: str) -> str:
+        if "::" not in name and name in self.native_op_names:
+            return f"ops::{name}"
+        return name
 
     # -- static tensor-ness analysis ----------------------------------------
     def _is_tensor(self, e: Expr) -> bool:
@@ -364,13 +371,14 @@ class Emitter:
             leaf = e.callee.split("::")[-1].split("<")[0]
             if leaf == "Scalar":
                 return f"Scalar({args})" if args else "Scalar()"
-            return f"{e.callee}({args})"
+            return f"{self.op_name(e.callee)}({args})"
         if isinstance(e, Method):
             recv = self.emit(e.receiver)
             base = e.name[:-1] if e.name.endswith("_") and e.name[:-1] in TENSOR_METHODS else e.name
             args = ", ".join(self.emit(a) for a in e.args)
             if base in TENSOR_METHODS:
-                return f"{TENSOR_METHODS[base]}({recv}, {args})" if args else f"{TENSOR_METHODS[base]}({recv})"
+                name = self.op_name(TENSOR_METHODS[base])
+                return f"{name}({recv}, {args})" if args else f"{name}({recv})"
             return f"{recv}.{e.name}({args})" if args else f"{recv}.{e.name}()"
         if isinstance(e, BinOp):
             l_txt = self.emit(e.left)
@@ -395,8 +403,10 @@ class Emitter:
 
 
 def render_formula(expr: Expr, tensor_syms: set[str], member_names: set[str],
-                   tensor_member_names: set[str] = frozenset()) -> str:
-    return Emitter(tensor_syms, member_names, tensor_member_names).emit(expr)
+                   tensor_member_names: set[str] = frozenset(),
+                   native_op_names: set[str] = frozenset()) -> str:
+    return Emitter(tensor_syms, member_names, tensor_member_names,
+                   native_op_names).emit(expr)
 
 
 def _iter_call_nodes(expr: Expr):
@@ -609,7 +619,9 @@ using namespace ops;
 """
 
 
-def generate_autograd_nodes(derivatives: dict[str, OpDerivatives]) -> str:
+def generate_autograd_nodes(
+        derivatives: dict[str, OpDerivatives],
+        native_op_names: set[str] = frozenset()) -> str:
     lines = [_HEADER_PRELUDE.rstrip("\n"), ""]
 
     emitted: set[str] = set()
@@ -667,7 +679,8 @@ def generate_autograd_nodes(derivatives: dict[str, OpDerivatives]) -> str:
         # three-way backward kernel call).
         cse_temps: dict[str, str] = {}
         call_counts: dict[str, int] = {}
-        em = Emitter(tensor_syms, member_names, tensor_members)
+        em = Emitter(tensor_syms, member_names, tensor_members,
+                     native_op_names)
         for a in dv.grad_slots:
             expr = dv.formulas.get(a.name)
             if expr is None:
@@ -688,7 +701,8 @@ def generate_autograd_nodes(derivatives: dict[str, OpDerivatives]) -> str:
             if expr is None:
                 lines.append("        grads.push_back(Tensor());")
                 continue
-            txt = render_formula(expr, tensor_syms, member_names, tensor_members)
+            txt = render_formula(expr, tensor_syms, member_names,
+                                 tensor_members, native_op_names)
             # Splice shared temporaries into the rendered formula (longest
             # first so nested shared calls splice cleanly).
             for t in sorted(cse_temps, key=len, reverse=True):

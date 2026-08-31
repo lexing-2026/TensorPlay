@@ -45,7 +45,6 @@ node_modules/
 **/node_modules/
 
 # Third party sources
-third_party/oneDNN/
 third_party/cudnn/
 third_party/googletest/
 third_party/pybind11/

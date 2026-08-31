@@ -437,3 +437,16 @@ void invoke_parallel_impl(
 } // namespace internal
 } // namespace parallel
 } // namespace tensorplay
+
+void tp_parallel_for_c(
+    long long begin,
+    long long end,
+    long long grain,
+    tp_parallel_body_c body,
+    void* ctx) {
+  tensorplay::parallel::parallel_for(
+      static_cast<int64_t>(begin),
+      static_cast<int64_t>(end),
+      static_cast<int64_t>(grain),
+      [body, ctx](int64_t b, int64_t e) { body(ctx, b, e); });
+}
