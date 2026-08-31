@@ -55,6 +55,11 @@ public:
     SymInt operator*(const SymInt& other) const;
     SymInt operator/(const SymInt& other) const;
     SymInt operator%(const SymInt& other) const;
+    SymInt operator&(const SymInt& other) const;
+    SymInt operator|(const SymInt& other) const;
+    SymInt operator^(const SymInt& other) const;
+    SymInt operator<<(const SymInt& other) const;
+    SymInt operator>>(const SymInt& other) const;
     void operator+=(const SymInt& other);
     void operator-=(const SymInt& other);
     void operator*=(const SymInt& other);
@@ -89,6 +94,12 @@ public:
 
     SymInt min(const SymInt& other) const;
     SymInt max(const SymInt& other) const;
+    SymInt pow_by_natural(const SymInt& exponent) const;
+    SymInt ceil() const;
+    SymInt floor() const;
+    SymInt trunc() const;
+    SymInt round() const;
+    SymFloat sym_float() const;
     bool is_same(const SymInt& other) const;
     operator SymFloat() const;
 

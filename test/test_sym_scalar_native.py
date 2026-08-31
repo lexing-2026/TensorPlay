@@ -1,3 +1,4 @@
+import builtins
 import pytest
 
 import tensorplay as tp
@@ -47,3 +48,38 @@ def test_symbolic_metadata_returns_are_native_types():
     assert tp.sym_storage_offset(value).expect_int() == 0
     assert isinstance(tp.sym_is_contiguous(value), tp.SymBool)
     assert tp.sym_is_contiguous(value).expect_bool()
+
+
+def test_symbolic_scalar_native_operator_surface():
+    integer = tp.SymInt.symbolic("n")
+    floating = tp.SymFloat.symbolic("scale")
+    boolean = tp.SymBool.symbolic("flag")
+
+    assert isinstance(integer / 2, tp.SymFloat)
+    assert isinstance(integer // 2, tp.SymInt)
+    assert isinstance(integer & 3, tp.SymInt)
+    assert isinstance(integer | 3, tp.SymInt)
+    assert isinstance(integer ^ 3, tp.SymInt)
+    assert isinstance(integer << 2, tp.SymInt)
+    assert isinstance(integer >> 2, tp.SymInt)
+    assert isinstance(integer**2, tp.SymInt)
+    assert isinstance(round(integer), tp.SymInt)
+    assert isinstance(round(floating), tp.SymInt)
+    assert isinstance(round(floating, 2), tp.SymFloat)
+    assert isinstance(tp.sym_sqrt(integer), tp.SymFloat)
+    assert isinstance(tp.sym_log2(floating), tp.SymFloat)
+    assert isinstance(boolean ^ True, tp.SymBool)
+    assert isinstance(boolean + 2, tp.SymInt)
+    assert isinstance(boolean + tp.SymBool.symbolic("other"), tp.SymInt)
+    assert ("flag" in str(boolean + 2))
+    assert isinstance(tp.sym_ite(boolean, integer, tp.SymInt(2)), tp.SymInt)
+    assert isinstance(tp.sym_sum(integer, 2), tp.SymInt)
+    assert isinstance(tp.sym_sum([integer, 2]), tp.SymInt)
+
+    assert type(tp.sym_float(2)) is builtins.float
+    assert type(tp.sym_int(2.75)) is builtins.int
+    assert type(tp.sym_not(True)) is builtins.bool
+    assert type(tp.sym_min(1, 2)) is builtins.int
+    assert type(tp.sym_max(1, 2.0)) is builtins.float
+    assert tp.sym_ite(True, 1, 2) == 1
+    assert tp.sym_ite(True, "yes", "no") == "yes"
