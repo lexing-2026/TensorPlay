@@ -17,7 +17,9 @@ target_compile_definitions(stax PRIVATE STAX_EXPORTS)
 target_link_libraries(stax PUBLIC p10)
 
 # Output directories
-set(TP_PACKAGE_DIR "${CMAKE_SOURCE_DIR}/tensorplay")
+if(NOT DEFINED TP_PACKAGE_DIR)
+    set(TP_PACKAGE_DIR "${CMAKE_SOURCE_DIR}/tensorplay")
+endif()
 set(TP_LIB_DIR "${TP_PACKAGE_DIR}/lib")
 
 set_target_properties(stax PROPERTIES

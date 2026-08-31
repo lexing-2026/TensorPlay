@@ -40,7 +40,9 @@ target_compile_definitions(tpx PRIVATE TENSORPLAY_EXPORTS)
 target_link_libraries(tpx PUBLIC p10)
 
 # Installation logic for tpx
-set(TP_PACKAGE_DIR "${CMAKE_SOURCE_DIR}/tensorplay")
+if(NOT DEFINED TP_PACKAGE_DIR)
+    set(TP_PACKAGE_DIR "${CMAKE_SOURCE_DIR}/tensorplay")
+endif()
 set(TP_LIB_DIR "${TP_PACKAGE_DIR}/lib")
 
 set_target_properties(tpx PROPERTIES

@@ -19,7 +19,9 @@ struct CudaDeviceProperties {
 void init_device(py::module_& m) {
     py::enum_<DeviceType>(m, "DeviceType")
         .value("CPU", DeviceType::CPU)
-        .value("CUDA", DeviceType::CUDA);
+        .value("CUDA", DeviceType::CUDA)
+        .value("Vulkan", DeviceType::Vulkan)
+        .value("Unknown", DeviceType::Unknown);
 
     py::class_<Device>(m, "Device")
         .def(py::init<DeviceType, int64_t>(), "type"_a, "index"_a = -1)
@@ -36,6 +38,7 @@ void init_device(py::module_& m) {
         .def_property_readonly("index", &Device::index)
         .def("is_cpu", &Device::is_cpu)
         .def("is_cuda", &Device::is_cuda)
+        .def("is_vulkan", &Device::is_vulkan)
         .def("__repr__", &Device::toString)
         .def("__str__", &Device::toString)
         .def(py::self == py::self)

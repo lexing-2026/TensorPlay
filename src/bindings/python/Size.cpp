@@ -49,12 +49,13 @@ PyObject* size_from_tuple(PyObject* tup) {
     return PyObject_CallFunctionObjArgs(SizeTypeObj, tup, nullptr);
 }
 
-// Wrap any slot borrowed from the tuple implementation: tuple results come
-// back as Size so slicing/concatenation keeps the type.  The borrowed slots
-// are resolved through file-scope pointers set at static-init time.
+// Wrap any slot borrowed from the tuple implementation: a tuple result
+// comes back as Size so slicing/repetition keeps the type; scalar results
+// (a single subscripted dimension) pass through untouched.
 static PyObject* size_repeat(PyObject* self, Py_ssize_t count) {
     PyObject* result = tuple_repeat(self, count);
     if (result == nullptr) return nullptr;
+    if (!PyTuple_Check(result)) return result;
     PyObject* wrapped = size_from_tuple(result);
     Py_DECREF(result);
     return wrapped;
@@ -65,6 +66,7 @@ static PyObject* size_subscript(PyObject* self, PyObject* key) {
     // slices; only the slice result needs re-wrapping into a Size.
     PyObject* result = tuple_subscript(self, key);
     if (result == nullptr) return nullptr;
+    if (!PyTuple_Check(result)) return result;
     PyObject* wrapped = size_from_tuple(result);
     Py_DECREF(result);
     return wrapped;
@@ -224,6 +226,12 @@ PyObject* size_richcompare(PyObject* self, PyObject* other, int op) {
     return PyTuple_Type.tp_richcompare(self, other, op);
 }
 
+// A custom tp_richcompare blocks hash inheritance from the tuple base, so
+// the tuple hash is delegated explicitly.
+static Py_hash_t size_hash(PyObject* self) {
+    return PyTuple_Type.tp_hash(self);
+}
+
 PyObject* size_numel(PyObject* self, PyObject*) {
     Py_ssize_t n = PyTuple_GET_SIZE(self);
     long long numel = 1;
@@ -268,7 +276,7 @@ PyTypeObject SizeType = {
     &size_as_number,         /* tp_as_number */
     &size_as_sequence,       /* tp_as_sequence */
     &size_as_mapping,        /* tp_as_mapping */
-    nullptr,                 /* tp_hash (tuple's, inherited) */
+    size_hash,               /* tp_hash */
     nullptr,                 /* tp_call */
     nullptr,                 /* tp_str */
     nullptr,                 /* tp_getattro */

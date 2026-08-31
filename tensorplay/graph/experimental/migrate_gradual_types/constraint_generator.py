@@ -104,8 +104,8 @@ __all__ = [
     "reshape_inference_rule",
     "size_inference_rule",
     "tensor_inference_rule",
-    "torch_dim_inference_rule",
-    "torch_linear_inference_rule",
+    "dim_inference_rule",
+    "linear_inference_rule_for_tensor",
     "transpose_inference_rule",
     "type_inference_rule",
     "view_inference_rule",
@@ -691,7 +691,7 @@ def linear_inference_rule(n: Node, module_instance: Any, symbols: _SymbolDict, c
     return linear_constraints(n, module_instance.in_features, module_instance.out_features, symbols, counter)
 
 
-def torch_dim_inference_rule(n: Node, symbols: _SymbolDict, constraints: list[Constraint], counter: int) -> tuple[list[Constraint], int]:
+def dim_inference_rule(n: Node, symbols: _SymbolDict, constraints: list[Constraint], counter: int) -> tuple[list[Constraint], int]:
     source = _tensor(n.args[0], symbols)
     output, counter = gen_dvar(counter)
     symbols[n] = output
@@ -702,7 +702,7 @@ def torch_dim_inference_rule(n: Node, symbols: _SymbolDict, constraints: list[Co
     return [Disj(branches)], counter
 
 
-def torch_linear_inference_rule(n: Node, symbols: _SymbolDict, constraints: list[Constraint], counter: int) -> tuple[list[Constraint], int]:
+def linear_inference_rule_for_tensor(n: Node, symbols: _SymbolDict, constraints: list[Constraint], counter: int) -> tuple[list[Constraint], int]:
     weight = _tensor(n.args[1], symbols)
     dims, counter = gen_tensor_dims(2, counter)
     generated, counter = linear_constraints(n, dims[1], dims[0], symbols, counter)
@@ -779,7 +779,7 @@ _register_function_names(arange_inference_rule, "arange")
 _register_function_names(broadcasting_inference_rule, "add", "mul")
 _register_function_names(flatten_inference_rule, "flatten")
 _register_function_names(layer_norm_functional, "layer_norm")
-_register_function_names(torch_dim_inference_rule, "dim")
+_register_function_names(dim_inference_rule, "dim")
 
 for _target in (operator.add, operator.mul, operator.eq, operator.ne, operator.lt, operator.gt, operator.getitem):
     _INFERENCE_RULES.setdefault(_target, _lookup_rule(_target.__name__))

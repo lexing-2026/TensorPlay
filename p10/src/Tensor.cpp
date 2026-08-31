@@ -213,13 +213,7 @@ bool Tensor::requires_grad() const {
 
 void Tensor::set_requires_grad(bool requires_grad) {
     if (!impl_) return;
-    if (auto* meta = impl_->autograd_meta()) {
-        meta->set_requires_grad(requires_grad);
-    } else if (requires_grad) {
-        // No autograd metadata attached yet. The tpx layer owns the concrete
-        // AutogradMeta type; without it, requires_grad cannot be enabled.
-        // only meaningful once the autograd layer attaches metadata.
-    }
+    impl_->set_requires_grad(requires_grad);
 }
 
 Tensor Tensor::grad() const {

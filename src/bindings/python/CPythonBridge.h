@@ -16,6 +16,7 @@
 #include <DType.h>
 #include <Device.h>
 #include <Generator.h>
+#include <Storage.h>
 #include <SymBool.h>
 #include <SymFloat.h>
 #include <SymInt.h>
@@ -41,6 +42,10 @@ void tpx_py_parse_into(PyObject* const* args, Py_ssize_t nargs,
                        PyObject* kwnames, const char* const* kwlist,
                        Py_ssize_t nkws, const char* op_name,
                        PyObject** out);
+
+// Tests whether a FASTCALL keyword tuple contains a literal name.
+// The tuple is supplied by the interpreter and is borrowed by the caller.
+bool tpx_py_kwnames_has(PyObject* kwnames, const char* name);
 
 // Give Python Tensor subclasses the first chance to handle an operator.
 // Returns 1 when result is owned by the caller, 0 when native parsing should
@@ -103,6 +108,7 @@ enum tpx_py_type_kind : unsigned char {
     TPK_BOOLLIST,
     TPK_TENSORLIST_OPTIONAL,
     TPK_GENERATOR,
+    TPK_STORAGE,
 };
 constexpr unsigned char TPK_OPTIONAL = 0x80;
 
@@ -130,6 +136,12 @@ bool tpx_py_obj_matches_kind(PyObject* obj, unsigned char kind);
 Tensor tpx_py_tensor(PyObject* obj);
 const Tensor& tpx_py_tensor_cref(PyObject* obj);
 Tensor& tpx_py_tensor_mref(PyObject* obj);
+// Non-throwing guard helpers for compiled-kernel entry points: read the
+// version counter / autograd flag straight from the C++ value holder.
+// Return -1 (version) / -1 (flag) when the object is not a plain tensor
+// wrapper; PyErr is cleared so callers only test the integer.
+long long tpx_tensor_version(PyObject* obj);
+int tpx_tensor_requires_grad(PyObject* obj);
 Scalar tpx_py_scalar(PyObject* obj);
 std::optional<Tensor> tpx_py_opt_tensor(PyObject* obj);
 int64_t tpx_py_int64(PyObject* obj);
@@ -141,6 +153,7 @@ std::optional<bool> tpx_py_opt_bool(PyObject* obj);
 std::optional<Scalar> tpx_py_opt_scalar(PyObject* obj);
 Generator tpx_py_generator(PyObject* obj);
 std::optional<Generator> tpx_py_opt_generator(PyObject* obj);
+Storage tpx_py_storage(PyObject* obj);
 Device tpx_py_device(PyObject* obj);
 std::optional<Device> tpx_py_opt_device(PyObject* obj);
 std::vector<int64_t> tpx_py_intlist(PyObject* obj);
@@ -192,6 +205,7 @@ PyObject* tpx_py_wrap_optional_symboollist(
 PyObject* tpx_py_wrap_optional_symfloatlist(
     const std::optional<std::vector<SymFloat>>& values);
 PyObject* tpx_py_wrap_generator(const Generator& g);
+PyObject* tpx_py_wrap_storage(const Storage& storage);
 PyObject* tpx_py_wrap_dtype(const DType& dt);
 PyObject* tpx_py_wrap_device(const Device& d);
 PyObject* tpx_py_wrap_optional_generator(const std::optional<Generator>& g);

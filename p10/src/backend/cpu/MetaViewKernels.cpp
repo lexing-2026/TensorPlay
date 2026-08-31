@@ -428,6 +428,27 @@ Tensor col_indices_cpu(const Tensor& self) {
     return Tensor(std::move(col));
 }
 
+bool is_set_to_cpu(const Tensor& self, const Tensor& other) {
+    const auto self_impl = self.unsafeGetTensorImpl();
+    const auto other_impl = other.unsafeGetTensorImpl();
+    if (!self_impl || !other_impl || !self_impl->has_storage() ||
+        !other_impl->has_storage()) {
+        return false;
+    }
+    if (!self_impl->storage().is_same(other_impl->storage()) ||
+        self_impl->storage_offset() != other_impl->storage_offset() ||
+        self.dim() != other.dim()) {
+        return false;
+    }
+    for (int64_t dim = 0; dim < self.dim(); ++dim) {
+        if (self.size(dim) != other.size(dim) ||
+            self.stride(dim) != other.stride(dim)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 TENSORPLAY_LIBRARY_IMPL(CPU, MetaViewOps) {
     m.impl("as_strided", as_strided_cpu);
     m.impl("as_strided_", as_strided__cpu);
@@ -436,6 +457,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, MetaViewOps) {
     m.impl("view.dtype", view_dtype_cpu);
     m.impl("item", item_cpu);
     m.impl("storage_offset", storage_offset_cpu);
+    m.impl("is_set_to", is_set_to_cpu);
     m.impl("is_pinned", is_pinned_cpu);
     m.impl("pin_memory", pin_memory_cpu);
     m.impl("coalesce", coalesce_cpu);

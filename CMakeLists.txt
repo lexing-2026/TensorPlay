@@ -27,6 +27,41 @@ endif()
 option(USE_CUDA "Enable CUDA support" ${USE_CUDA})
 set(TP_CUDA_ENABLED ${USE_CUDA})
 
+# AMD GPU support via the HIP toolchain.  Mutually exclusive with CUDA: the
+# HIP backend registers the same device and dispatch slots, so one build can
+# serve only one of the two runtimes.
+option(USE_ROCM "Enable AMD GPU (HIP) support" OFF)
+if(USE_ROCM AND USE_CUDA)
+    message(FATAL_ERROR "USE_CUDA and USE_ROCM are mutually exclusive; pick one GPU backend per build.")
+endif()
+
+if(USE_ROCM)
+    include(cmake/LoadHIP.cmake)
+    if(NOT TP_FOUND_HIP)
+        message(STATUS "USE_ROCM requested but no usable HIP toolchain found; continuing without AMD GPU support.")
+        set(USE_ROCM OFF)
+    endif()
+endif()
+
+if(USE_ROCM)
+    # Stage the CUDA-backed sources into the build tree and translate them
+    # to HIP (API-name rewrite + file renames; see tools/amd_build).
+    set(TP_HIP_STAGING "${CMAKE_BINARY_DIR}/hipified")
+    execute_process(
+        COMMAND ${CMAKE_COMMAND} -E env PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
+                ${Python_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/amd_build/build_amd.py
+                --output-dir "${TP_HIP_STAGING}"
+                --subdir p10
+                --subdir src/bindings/python
+                --ignore tests
+                --ignore benchmark
+        RESULT_VARIABLE TP_HIPIFY_RESULT)
+    if(NOT TP_HIPIFY_RESULT EQUAL 0)
+        message(FATAL_ERROR "GPU source staging failed with ${TP_HIPIFY_RESULT}")
+    endif()
+    include(cmake/HipifyStage.cmake)
+endif()
+
 if(USE_CUDA)
     message(STATUS "Checking for CUDA compiler...")
     message(STATUS "CMAKE_CUDA_COMPILER is set to: '${CMAKE_CUDA_COMPILER}'")
@@ -258,7 +293,9 @@ endif()
 message(STATUS "Python Root: ${Python_ROOT_DIR}")
 
 # Code generation variables
-set(GEN_BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/build/generated")
+if(NOT DEFINED GEN_BASE_DIR)
+    set(GEN_BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/build/generated")
+endif()
 set(GEN_INCLUDE_DIR "${GEN_BASE_DIR}/tensorplay/ops")
 set(GEN_HEADER "${GEN_INCLUDE_DIR}/TensorGenerated.h")
 set(GEN_CPP "${GEN_INCLUDE_DIR}/TensorGenerated.cpp")
@@ -272,7 +309,9 @@ set(GEN_AUTOCAST_CPP "${GEN_INCLUDE_DIR}/AutocastGenerated.cpp")
 set(GEN_TPX_REDISPATCH_H "${GEN_INCLUDE_DIR}/TensorRedispatchGenerated.h")
 
 # Python Interface Stub Generation
-set(TP_PACKAGE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tensorplay")
+if(NOT DEFINED TP_PACKAGE_DIR)
+    set(TP_PACKAGE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tensorplay")
+endif()
 
 # Generate tensorplay/version.py from version.txt + git metadata
 set(TP_VERSION_PY "${TP_PACKAGE_DIR}/version.py")
@@ -343,6 +382,29 @@ else()
 endif()
 
 option(USE_BLAS "Enable BLAS linear algebra acceleration" ON)
+
+# Vulkan backend: enabled when a Vulkan loader can be located.  The loader
+# is linked from the system; headers are vendored under
+# third_party/vulkan-headers and the GLSL compiler is vendored under
+# tools/bin/glslangValidator, so no Vulkan SDK install is required.
+if(NOT DEFINED USE_VULKAN)
+    find_library(VULKAN_LOADER_CANDIDATE vulkan)
+    if(VULKAN_LOADER_CANDIDATE)
+        set(USE_VULKAN ON)
+    else()
+        set(USE_VULKAN OFF)
+    endif()
+endif()
+option(USE_VULKAN "Enable Vulkan support" ${USE_VULKAN})
+if(USE_VULKAN)
+    find_library(VULKAN_LIBRARY NAMES vulkan)
+    if(NOT VULKAN_LIBRARY)
+        message(FATAL_ERROR "USE_VULKAN is ON but the Vulkan loader library was not found.")
+    endif()
+    message(STATUS "Found Vulkan loader: ${VULKAN_LIBRARY}")
+    string(APPEND CMAKE_CXX_FLAGS " -DUSE_VULKAN")
+endif()
+
 set(COMPUTE_LIBS "")
 set(BLAS_COMPILE_DEFS "")
 set(BLAS_COMPILE_OPTIONS "")
@@ -956,7 +1018,7 @@ if(TP_USE_MPI)
 endif()
 
 # Python Bindings
-pybind11_add_module(_C
+set(TP_C_SOURCES
     src/bindings/python/init.cpp
     src/bindings/python/DType.cpp
     src/bindings/python/Scalar.cpp
@@ -964,6 +1026,7 @@ pybind11_add_module(_C
     src/bindings/python/Device.cpp
     src/bindings/python/Size.cpp
     src/bindings/python/Generator.cpp
+    src/bindings/python/Storage.cpp
     src/bindings/python/Autograd.cpp
     src/bindings/python/autocast_mode.cpp
     src/bindings/python/Transforms.cpp
@@ -1021,7 +1084,13 @@ pybind11_add_module(_C
     src/bindings/python/CudaGraph.cpp
      src/bindings/python/FileCheck.cpp
      src/Version.cpp
- )
+)
+if(USE_ROCM)
+    # Swap every binding TU over to its hipify-staged copy where one exists
+    # (raw CUDA runtime calls in the bindings need the HIP translation too).
+    tp_map_sources(TP_C_SOURCES ${TP_C_SOURCES})
+endif()
+pybind11_add_module(_C ${TP_C_SOURCES})
 set_target_properties(_C PROPERTIES UNITY_BUILD ON)
 if(NOT WIN32)
     target_link_libraries(_C PRIVATE p10 tpx stax tp_python tp_distributed tensorpipe)
@@ -1031,6 +1100,10 @@ endif()
 
 if(TP_CUDA_ENABLED AND TARGET tensorpipe_cuda)
     target_link_libraries(_C PRIVATE tensorpipe_cuda)
+endif()
+
+if(TP_CUDA_ENABLED)
+    target_compile_definitions(_C PRIVATE TENSORPLAY_TENSORPIPE_CUDA)
 endif()
 
 if(TP_CUDA_ENABLED)
@@ -1055,7 +1128,29 @@ target_include_directories(_C PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/p10/include
 )
 
-set(TP_PACKAGE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tensorplay")
+if(USE_ROCM)
+    # Staged headers must win over the repo originals, hence BEFORE.
+    target_include_directories(_C BEFORE PRIVATE
+        ${TP_HIP_STAGING}/p10/include
+        ${TP_HIP_STAGING}/src
+    )
+    target_include_directories(_C PRIVATE ${TP_HIP_INCLUDE_DIRS})
+    target_link_libraries(_C PRIVATE ${TP_HIP_LIBRARIES})
+    target_compile_options(_C PRIVATE ${TP_HIP_CXX_FLAGS})
+    # Only the translated binding TUs activate the GPU paths; the rest of
+    # the module (and every vendored third-party TU it absorbs in the unity
+    # build) keeps CPU semantics, matching a plain CPU configuration.
+    foreach(_src IN LISTS TP_C_SOURCES)
+        if(_src MATCHES "^${TP_HIP_STAGING}")
+            set_source_files_properties(${_src} PROPERTIES
+                COMPILE_OPTIONS "-DUSE_CUDA")
+        endif()
+    endforeach()
+endif()
+
+if(NOT DEFINED TP_PACKAGE_DIR)
+    set(TP_PACKAGE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tensorplay")
+endif()
 set(TP_LIB_DIR "${TP_PACKAGE_DIR}/lib")
 file(MAKE_DIRECTORY "${TP_LIB_DIR}")
 

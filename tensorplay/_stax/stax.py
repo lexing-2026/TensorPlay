@@ -295,40 +295,30 @@ def _normalize_pointwise_grad_output(grad_output: Any, reference: Any) -> Any:
 
 
 def _attach_fast_call(lowering: Any, exec_fn: Any = None) -> None:
-    """Install the C steady-state trampoline when the extension offers it.
+    """Install the C steady-state trampoline for a compiled lowering.
 
     ``exec_fn`` selects the steady-state execution entry; the default is the
     native ``Graph.execute`` bound method.  Lowerings with a direct kernel
-    entry pass it here so the trampoline skips the graph walk.  Soft failure
-    keeps the plain lowering object: older extensions without
-    ``_stax.install_call_trampoline`` simply skip the fast entry.
+    entry pass it here so the trampoline skips the graph walk.
     """
+    import tensorplay
 
-    try:
-        import tensorplay
-
-        installer = getattr(
-            tensorplay._C._stax, "install_call_trampoline", None
-        )
-        if installer is None:
-            return
-        tail = [
-            lowering.graph_module._get_attr(target)
-            for target in lowering.attribute_targets
-        ]
-        tail.extend(lowering.constant_values)
-        lowering._fast_call = installer(
-            lowering,
-            exec_fn if exec_fn is not None else lowering.graph.execute,
-            tail,
-            tensorplay.Tensor,
-            len(lowering.placeholders),
-            int(getattr(lowering, "_output_count", 1)),
-            getattr(lowering, "_gradient_plan", None) is not None,
-        )
-    except Exception:
-        # Never let a trampoline install failure break compilation.
-        pass
+    installer = tensorplay._C._stax.install_call_trampoline
+    tail = [
+        lowering.graph_module._get_attr(target)
+        for target in lowering.attribute_targets
+    ]
+    tail.extend(lowering.constant_values)
+    lowering._fast_call = installer(
+        lowering,
+        exec_fn if exec_fn is not None else lowering.graph.execute,
+        tail,
+        tensorplay.Tensor,
+        len(lowering.placeholders),
+        int(getattr(lowering, "_output_count", 1)),
+        getattr(lowering, "_gradient_plan", None) is not None,
+        int(getattr(lowering, "_native_direct", 0) or 0),
+    )
 
 
 class _NativeLowering:
@@ -367,10 +357,34 @@ class _NativeLowering:
 
         def fp(value: Any) -> Any:
             if isinstance(value, tensorplay.Tensor):
+                try:
+                    version = value._version
+                except RuntimeError:
+                    shape = getattr(value, "shape", ())
+                    if callable(shape):
+                        shape = shape()
+                    try:
+                        shape = tuple(int(item) for item in shape)
+                    except (TypeError, ValueError):
+                        shape = repr(shape)
+                    stride = getattr(value, "stride", ())
+                    if callable(stride):
+                        stride = stride()
+                    try:
+                        stride = tuple(int(item) for item in stride)
+                    except (TypeError, ValueError):
+                        stride = repr(stride)
+                    dtype = getattr(value, "dtype", None)
+                    if callable(dtype):
+                        dtype = dtype()
+                    device = getattr(value, "device", None)
+                    if callable(device):
+                        device = device()
+                    version = ("metadata", shape, stride, dtype, device)
                 return (
                     "t",
                     id(value),
-                    getattr(value, "_version", None),
+                    version,
                 )
             return ("o", id(value))
 
@@ -431,6 +445,7 @@ class _CpuFusedPointwiseLowering(_NativeLowering):
         gradient_plan: tuple[list[int], list[float], tuple[int, ...]] | None = None,
         strict_native: bool = False,
         native_runner: Any = None,
+        native_direct: int = 0,
     ) -> None:
         super().__init__(graph_module, graph, attribute_targets)
         self._expected_shape = expected_shape
@@ -444,6 +459,9 @@ class _CpuFusedPointwiseLowering(_NativeLowering):
         # compiler-scheduled code replacing the program interpreter when the
         # system compiler is available.  None keeps the graph-execute path.
         self._native_runner = native_runner
+        # Address of the kernel's pointer-level entry (0 = absent); the C
+        # steady-state trampoline reads it for the direct launch path.
+        self._native_direct = int(native_direct) if native_direct else 0
         # Route memo (id, _version, requires_grad) per input: eligibility and
         # autograd routing are pure functions of these, so steady-state calls
         # skip the per-input shape/dtype/device/contiguity probes entirely.
@@ -531,10 +549,34 @@ class _CpuFusedPointwiseLowering(_NativeLowering):
         import tensorplay
 
         if isinstance(value, tensorplay.Tensor):
+            try:
+                version = value._version
+            except RuntimeError:
+                shape = getattr(value, "shape", ())
+                if callable(shape):
+                    shape = shape()
+                try:
+                    shape = tuple(int(item) for item in shape)
+                except (TypeError, ValueError):
+                    shape = repr(shape)
+                stride = getattr(value, "stride", ())
+                if callable(stride):
+                    stride = stride()
+                try:
+                    stride = tuple(int(item) for item in stride)
+                except (TypeError, ValueError):
+                    stride = repr(stride)
+                dtype = getattr(value, "dtype", None)
+                if callable(dtype):
+                    dtype = dtype()
+                device = getattr(value, "device", None)
+                if callable(device):
+                    device = device()
+                version = ("metadata", shape, stride, dtype, device)
             return (
                 "t",
                 id(value),
-                getattr(value, "_version", None),
+                version,
                 bool(getattr(value, "requires_grad", False)),
             )
         return ("o", id(value))
@@ -871,10 +913,11 @@ def _lower_cpu_fused_pointwise(
         return None
 
     native_runner: Any = None
+    native_direct = 0
     try:
         from .codegen.cpp import build_cpu_native_kernel
 
-        native_runner = build_cpu_native_kernel(
+        built = build_cpu_native_kernel(
             instructions,
             constants,
             len(external_nodes),
@@ -882,8 +925,13 @@ def _lower_cpu_fused_pointwise(
             shape=first.shape,
             device=first.device,
         )
+        if isinstance(built, tuple):
+            native_runner, native_direct = built
+        else:
+            native_runner = built
     except Exception:
         native_runner = None
+        native_direct = 0
     if extended and native_runner is None:
         return None
 
@@ -937,6 +985,7 @@ def _lower_cpu_fused_pointwise(
         gradient_plan,
         strict_native,
         native_runner,
+        native_direct,
     )
 
 
@@ -2869,6 +2918,10 @@ def stax(
     if native_graph is not None:
         graph_module._stax_native_graph = native_graph.graph
         return native_graph
+    if strict_native:
+        raise RuntimeError(
+            "strict_native Stax lowering failed: captured graph has no native executable"
+        )
     raise RuntimeError(
         "Stax could not lower the captured graph to a native executable"
     )

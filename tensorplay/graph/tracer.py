@@ -14,7 +14,7 @@ from ._utils import (
 from .graph import Graph
 from .graph_module import GraphModule
 from .node import Node
-from .proxy import Proxy
+from .proxy import Proxy, _apply_preserved_node_meta
 
 
 def _is_module(value: Any) -> bool:
@@ -98,6 +98,26 @@ class Tracer:
 
         del module, qualified_name
         return False
+
+    def path_of_module(self, module: Any) -> str:
+        named_modules = getattr(self.root, "named_modules", None)
+        if callable(named_modules):
+            for name, candidate in named_modules():
+                if candidate is module:
+                    return name
+        raise NameError("module is not installed as a submodule")
+
+    def call_module(
+        self,
+        module: Any,
+        forward: Callable[..., Any],
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> Any:
+        qualified_name = self.path_of_module(module)
+        if not self.is_leaf_module(module, qualified_name):
+            return forward(*args, **kwargs)
+        return self.create_proxy("call_module", qualified_name, args, kwargs)
 
     def _record_call_module(self, node: Node, qualified_name: str) -> None:
         if qualified_name not in self._recorded_qualnames:
@@ -208,6 +228,7 @@ class Tracer:
         if _capture_disabled.get():
             raise GraphCaptureError("graph capture is disabled for this operation")
         proxy = Proxy(self.graph.create_node(kind, target, args, kwargs), self)
+        _apply_preserved_node_meta(proxy.node)
         if self.execute and kind != "placeholder":
             self._execute_node(proxy.node)
         return proxy

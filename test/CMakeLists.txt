@@ -10,3 +10,5 @@ target_link_libraries(test_process_group_gloo
     PRIVATE tp_distributed pybind11::embed GTest::gtest Threads::Threads
             tpx stax)
 add_test(NAME test_process_group_gloo COMMAND test_process_group_gloo)
+
+add_subdirectory(cpp/vulkan)
