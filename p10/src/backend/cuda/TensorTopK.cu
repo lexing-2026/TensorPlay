@@ -136,7 +136,7 @@ __global__ void radix_topk_kernel(
     T pattern[2];
   } smem_storage;
   IndexType* smem = smem_storage.scan;
-  const IndexType row = static_cast<IndexType>(topk_linear_block_id());
+  const IndexType row = topk_linear_block_id<IndexType>();
   if (row >= rows) return;
 
   const IndexType outer_index = row / inner;
@@ -170,27 +170,29 @@ __global__ void topk_multiblock_fill_kernel(
   for (uint64_t i = first; i < size; i += stride) output[i] = value;
 }
 
-template <typename T, typename Key>
+template <typename T, typename Key, typename IndexType>
 __launch_bounds__(topk_multiblock_threads)
 __global__ void topk_multiblock_digit_counts(
     const T* __restrict__ input, const uint32_t* __restrict__ ranks,
     const Key* __restrict__ desired_values, Key desired_mask,
     uint16_t* __restrict__ counts, uint32_t rows, uint32_t cols,
-    int64_t inner, uint32_t blocks_per_row, int items_per_thread,
+    IndexType inner, uint32_t blocks_per_row, int items_per_thread,
     int digit_pos) {
   using Traits = TopKRadixTraits<T>;
   __shared__ uint32_t digit_counts[topk_multiblock_radix_size];
-  const uint64_t block_index = topk_linear_block_id();
-  const uint64_t num_blocks = static_cast<uint64_t>(rows) * blocks_per_row;
+  const uint32_t block_index = topk_linear_block_id<uint32_t>();
+  const uint32_t num_blocks = rows * blocks_per_row;
   if (block_index >= num_blocks) return;
   const uint32_t row = static_cast<uint32_t>(block_index / blocks_per_row);
   const uint32_t block_in_row = static_cast<uint32_t>(block_index % blocks_per_row);
-  const int64_t outer_index = static_cast<int64_t>(row) / inner;
-  const int64_t inner_index = static_cast<int64_t>(row) % inner;
-  const int64_t input_base = outer_index * static_cast<int64_t>(cols) * inner +
+  const IndexType row_index = static_cast<IndexType>(row);
+  const IndexType outer_index = row_index / inner;
+  const IndexType inner_index = row_index % inner;
+  const IndexType input_base = outer_index * static_cast<IndexType>(cols) * inner +
       inner_index;
   const int items_per_block = items_per_thread * topk_multiblock_threads;
-  const int64_t block_base = static_cast<int64_t>(block_in_row) * items_per_block;
+  const IndexType block_base = static_cast<IndexType>(block_in_row) *
+      static_cast<IndexType>(items_per_block);
   const int items = block_in_row + 1 < blocks_per_row
       ? items_per_thread
       : static_cast<int>((static_cast<int64_t>(cols) - block_base +
@@ -200,9 +202,9 @@ __global__ void topk_multiblock_digit_counts(
   if (threadIdx.x < topk_multiblock_radix_size) digit_counts[threadIdx.x] = 0;
   __syncthreads();
   for (int item = 0; item < items; ++item) {
-    const int64_t column = block_base +
-        static_cast<int64_t>(item) * topk_multiblock_threads + threadIdx.x;
-    if (column < cols) {
+    const IndexType column = block_base +
+        static_cast<IndexType>(item) * topk_multiblock_threads + threadIdx.x;
+    if (column < static_cast<IndexType>(cols)) {
       const Key key = Traits::encode(
           topk_load(&input[input_base + column * inner]));
       if ((key & desired_mask) == (desired & desired_mask)) {
@@ -220,65 +222,47 @@ __global__ void topk_multiblock_digit_counts(
   (void)ranks;
 }
 
-template <typename Key>
-__global__ void topk_multiblock_digit_cumsum(
-    const uint16_t* __restrict__ counts, uint32_t* __restrict__ cumsum,
-    uint32_t rows, uint32_t blocks_per_row) {
-  using Scan = cub::BlockScan<uint32_t, topk_multiblock_radix_size>;
-  __shared__ typename Scan::TempStorage scan_storage;
-  const uint64_t row = topk_linear_block_id();
-  if (row >= rows) return;
-  const int digit = threadIdx.x;
-  uint32_t total = 0;
-  if (digit < topk_multiblock_radix_size) {
-    const uint64_t row_base = row * blocks_per_row * topk_multiblock_radix_size;
-    const uint32_t full_tiles = blocks_per_row / 4;
-    for (uint32_t tile = 0; tile < full_tiles; ++tile) {
-      const uint64_t base = row_base +
-          static_cast<uint64_t>(tile) * 4 * topk_multiblock_radix_size + digit;
-      total += __ldg(counts + base) +
-          __ldg(counts + base + topk_multiblock_radix_size) +
-          __ldg(counts + base + 2 * topk_multiblock_radix_size) +
-          __ldg(counts + base + 3 * topk_multiblock_radix_size);
-    }
-    for (uint32_t block = full_tiles * 4; block < blocks_per_row; ++block) {
-      total += __ldg(counts + row_base + static_cast<uint64_t>(block) *
-          topk_multiblock_radix_size + digit);
-    }
-  }
-  uint32_t inclusive = 0;
-  Scan(scan_storage).InclusiveSum(total, inclusive);
-  __syncthreads();
-  if (digit < topk_multiblock_radix_size) {
-    cumsum[row * topk_multiblock_radix_size + digit] = inclusive;
-  }
-}
-
 template <typename T, typename Key>
 __launch_bounds__(topk_multiblock_radix_size)
-__global__ void topk_multiblock_select_digits(
+__global__ void topk_multiblock_within_k_counts(
     const uint16_t* __restrict__ counts,
-    const uint32_t* __restrict__ digit_cumsum,
     const Key* __restrict__ desired_in, const uint32_t* __restrict__ ranks_in,
     Key* __restrict__ desired_out, uint32_t* __restrict__ ranks_out,
     uint32_t rows, uint32_t blocks_per_row, int digit_pos,
     bool largest, uint32_t* __restrict__ within_k_counts,
     T* __restrict__ kth_values) {
   using Traits = TopKRadixTraits<T>;
+  using Scan = cub::BlockScan<uint32_t, topk_multiblock_radix_size>;
+  __shared__ union {
+    uint32_t digit_count_cumsum[topk_multiblock_radix_size];
+    typename Scan::TempStorage scan_storage;
+  } temp_storage;
   __shared__ Key desired;
-  __shared__ uint32_t warp_counts[topk_multiblock_threads / 32];
-  const uint64_t block_index = topk_linear_block_id();
-  const uint64_t num_blocks = static_cast<uint64_t>(rows) * blocks_per_row;
+  const uint32_t block_index = topk_linear_block_id<uint32_t>();
+  const uint32_t num_blocks = rows * blocks_per_row;
   if (block_index >= num_blocks) return;
   const uint32_t row = static_cast<uint32_t>(block_index / blocks_per_row);
   const uint32_t block_in_row = static_cast<uint32_t>(block_index % blocks_per_row);
   uint32_t rank = __ldg(ranks_in + row);
+  uint32_t digit_count = 0;
   if (threadIdx.x < topk_multiblock_radix_size) {
-    const uint32_t position = row * topk_multiblock_radix_size + threadIdx.x;
-    const uint32_t right = __ldg(digit_cumsum + position);
+    for (uint32_t block = 0; block < blocks_per_row; ++block) {
+      digit_count += __ldg(counts +
+          (row * blocks_per_row + block) * topk_multiblock_radix_size +
+          threadIdx.x);
+    }
+  }
+  uint32_t inclusive = 0;
+  Scan(temp_storage.scan_storage).InclusiveSum(digit_count, inclusive);
+  __syncthreads();
+  if (threadIdx.x < topk_multiblock_radix_size) {
+    temp_storage.digit_count_cumsum[threadIdx.x] = inclusive;
+  }
+  __syncthreads();
+  if (threadIdx.x < topk_multiblock_radix_size) {
     const uint32_t left = threadIdx.x == 0
-        ? 0 : __ldg(digit_cumsum + position - 1);
-    if (left < rank && rank <= right) {
+        ? 0 : temp_storage.digit_count_cumsum[threadIdx.x - 1];
+    if (left < rank && rank <= inclusive) {
       const Key digit_mask = static_cast<Key>(
           topk_multiblock_radix_mask) << digit_pos;
       desired = (__ldg(desired_in + row) & ~digit_mask) |
@@ -314,6 +298,7 @@ __global__ void topk_multiblock_select_digits(
       count += __shfl_down_sync(0xffffffffu, count, offset);
     }
   }
+  __shared__ uint32_t warp_counts[topk_multiblock_threads / 32];
   if ((threadIdx.x & 31) == 0) warp_counts[warp] = count;
   __syncthreads();
   if (threadIdx.x == 0) {
@@ -330,7 +315,8 @@ __global__ void topk_multiblock_kth_counts(
     uint32_t blocks_per_row) {
   const uint64_t grid_blocks = static_cast<uint64_t>(gridDim.x) * gridDim.y *
       gridDim.z;
-  const uint64_t first = topk_linear_block_id() * blockDim.x + threadIdx.x;
+  const uint64_t first = static_cast<uint64_t>(topk_linear_block_id<uint32_t>()) *
+      blockDim.x + threadIdx.x;
   const uint64_t stride = grid_blocks * blockDim.x;
   for (uint64_t block_index = first; block_index < num_blocks;
        block_index += stride) {
@@ -350,50 +336,52 @@ struct topk_multiblock_block_to_row {
   }
 };
 
-template <typename T, typename Key>
+template <typename T, typename Key, typename IndexType>
 __launch_bounds__(topk_multiblock_threads)
 __global__ void topk_multiblock_gather(
     const T* __restrict__ input, T* __restrict__ values,
     int64_t* __restrict__ indices, const T* __restrict__ kth_values,
     const uint32_t* __restrict__ within_k_counts,
     const uint32_t* __restrict__ kth_counts, uint32_t rows, uint32_t cols,
-    int64_t inner, uint32_t blocks_per_row, int items_per_thread,
-    int64_t k, bool largest) {
+    IndexType inner, uint32_t blocks_per_row, int items_per_thread,
+    IndexType k, bool largest) {
   using Traits = TopKRadixTraits<T>;
   using Scan = cub::BlockScan<uint32_t, topk_multiblock_threads>;
   __shared__ typename Scan::TempStorage scan_storage;
-  const uint64_t block_index = topk_linear_block_id();
-  const uint64_t num_blocks = static_cast<uint64_t>(rows) * blocks_per_row;
+  const uint32_t block_index = topk_linear_block_id<uint32_t>();
+  const uint32_t num_blocks = rows * blocks_per_row;
   if (block_index >= num_blocks) return;
   const uint32_t row = static_cast<uint32_t>(block_index / blocks_per_row);
   const uint32_t block_in_row = static_cast<uint32_t>(block_index % blocks_per_row);
-  const int64_t outer_index = static_cast<int64_t>(row) / inner;
-  const int64_t inner_index = static_cast<int64_t>(row) % inner;
-  const int64_t input_base = outer_index * static_cast<int64_t>(cols) * inner +
+  const IndexType row_index = static_cast<IndexType>(row);
+  const IndexType outer_index = row_index / inner;
+  const IndexType inner_index = row_index % inner;
+  const IndexType input_base = outer_index * static_cast<IndexType>(cols) * inner +
       inner_index;
-  const int64_t output_base = outer_index * k * inner + inner_index;
+  const IndexType output_base = outer_index * static_cast<IndexType>(k) * inner +
+      inner_index;
   const int items_per_block = items_per_thread * topk_multiblock_threads;
-  const int64_t block_base = static_cast<int64_t>(block_in_row) * items_per_block;
+  const IndexType block_base = static_cast<IndexType>(block_in_row) *
+      static_cast<IndexType>(items_per_block);
   const int items = block_in_row + 1 < blocks_per_row
       ? items_per_thread
-      : static_cast<int>((static_cast<int64_t>(cols) - block_base +
+      : static_cast<int>((static_cast<uint64_t>(cols) - block_base +
                           topk_multiblock_threads - 1) /
                          topk_multiblock_threads);
   const Key kth_key = Traits::encode(topk_load(kth_values + row));
   uint32_t start_within = block_in_row == 0
       ? 0 : __ldg(within_k_counts + block_index - 1);
   const uint32_t total_within =
-      __ldg(within_k_counts + static_cast<uint64_t>(row) * blocks_per_row +
-            blocks_per_row - 1);
+      __ldg(within_k_counts + row * blocks_per_row + blocks_per_row - 1);
   uint32_t start_kth = total_within + (block_in_row == 0
       ? 0 : __ldg(kth_counts + block_index - 1));
   for (int item = 0; item < items; ++item) {
-    const int64_t column = block_base +
-        static_cast<int64_t>(item) * topk_multiblock_threads + threadIdx.x;
+    const IndexType column = block_base +
+        static_cast<IndexType>(item) * topk_multiblock_threads + threadIdx.x;
     T value = static_cast<T>(0);
     uint32_t within = 0;
     uint32_t kth = 0;
-    if (column < cols) {
+    if (column < static_cast<IndexType>(cols)) {
       value = topk_load(&input[input_base + column * inner]);
       const Key key = Traits::encode(value);
       within = largest ? key > kth_key : key < kth_key;
@@ -405,8 +393,8 @@ __global__ void topk_multiblock_gather(
     __syncthreads();
     if (within) {
       const uint32_t offset = start_within + within_index;
-      values[output_base + static_cast<int64_t>(offset) * inner] = value;
-      indices[output_base + static_cast<int64_t>(offset) * inner] = column;
+      values[output_base + static_cast<IndexType>(offset) * inner] = value;
+      indices[output_base + static_cast<IndexType>(offset) * inner] = column;
     }
     start_within += num_within;
     if (start_kth < static_cast<uint32_t>(k)) {
@@ -417,8 +405,8 @@ __global__ void topk_multiblock_gather(
       if (kth) {
         const uint32_t offset = start_kth + kth_index;
         if (offset < static_cast<uint32_t>(k)) {
-          values[output_base + static_cast<int64_t>(offset) * inner] = value;
-          indices[output_base + static_cast<int64_t>(offset) * inner] = column;
+          values[output_base + static_cast<IndexType>(offset) * inner] = value;
+          indices[output_base + static_cast<IndexType>(offset) * inner] = column;
         }
       }
       start_kth += num_kth;
@@ -462,11 +450,11 @@ template <typename T>
 void launch_sorted_topk(Tensor& values, Tensor& indices, int64_t rows,
                         int64_t k, int64_t inner, bool largest);
 
-template <typename T>
-void launch_multiblock_topk(const Tensor& input, Tensor& values,
-                            Tensor& indices, int64_t rows, int64_t cols,
-                            int64_t k, int64_t inner, bool largest,
-                            bool sorted) {
+template <typename T, typename IndexType>
+void launch_multiblock_topk_impl(const Tensor& input, Tensor& values,
+                                 Tensor& indices, int64_t rows, int64_t cols,
+                                 int64_t k, int64_t inner, bool largest,
+                                 bool sorted) {
   using Key = typename TopKRadixTraits<T>::key_type;
   using Traits = TopKRadixTraits<T>;
   TP_CHECK(rows <= std::numeric_limits<uint32_t>::max() &&
@@ -503,14 +491,14 @@ void launch_multiblock_topk(const Tensor& input, Tensor& values,
       DType::UInt16, input.device());
   Tensor kth_values = Tensor::empty(
       {static_cast<int64_t>(row_count)}, input.dtype(), input.device());
-  Tensor digit_cumsum = Tensor::empty(
-      {static_cast<int64_t>(row_count) * topk_multiblock_radix_size},
-      DType::UInt32, input.device());
-  Tensor within_k_counts = Tensor::zeros(
+  Tensor within_k_counts = Tensor::empty(
       {static_cast<int64_t>(block_count)}, DType::UInt32, input.device());
   Tensor kth_counts = Tensor::empty(
       {static_cast<int64_t>(block_count)}, DType::UInt32, input.device());
-  const dim3 row_grid = grid_for(row_count);
+  TP_CUDA_CHECK(cudaMemsetAsync(
+      within_k_counts.data_ptr<uint32_t>(), 0,
+      static_cast<size_t>(block_count) * sizeof(uint32_t),
+      getCurrentCUDAStream().stream()));
   const dim3 fill_grid = grid_for((static_cast<uint64_t>(row_count) + 511) / 512);
   topk_multiblock_fill_kernel<uint32_t>
       <<<fill_grid, 512, 0,
@@ -528,24 +516,19 @@ void launch_multiblock_topk(const Tensor& input, Tensor& values,
   const dim3 block_grid = grid_for(block_count);
   for (int digit_pos = Traits::bit_count - topk_multiblock_radix_bits;
        digit_pos >= 0; digit_pos -= topk_multiblock_radix_bits) {
-    topk_multiblock_digit_counts<T, Key>
+    topk_multiblock_digit_counts<T, Key, IndexType>
         <<<block_grid, topk_multiblock_threads, 0,
            getCurrentCUDAStream().stream()>>>(
             input.data_ptr<T>(), ranks_in, desired_in, desired_mask,
-            counts.data_ptr<uint16_t>(), row_count, column_count, inner,
+            counts.data_ptr<uint16_t>(), row_count, column_count,
+            static_cast<IndexType>(inner),
             blocks_per_row, items_per_thread, digit_pos);
     TP_CUDA_CHECK(cudaGetLastError());
-    topk_multiblock_digit_cumsum<Key>
-        <<<row_grid, topk_multiblock_radix_size, 0,
-           getCurrentCUDAStream().stream()>>>(
-            counts.data_ptr<uint16_t>(), digit_cumsum.data_ptr<uint32_t>(),
-            row_count, blocks_per_row);
-    TP_CUDA_CHECK(cudaGetLastError());
-    topk_multiblock_select_digits<T, Key>
+    topk_multiblock_within_k_counts<T, Key>
         <<<block_grid, topk_multiblock_radix_size, 0,
            getCurrentCUDAStream().stream()>>>(
-            counts.data_ptr<uint16_t>(), digit_cumsum.data_ptr<uint32_t>(),
-            desired_in, ranks_in, desired_out, ranks_out, row_count,
+            counts.data_ptr<uint16_t>(), desired_in, ranks_in, desired_out,
+            ranks_out, row_count,
             blocks_per_row, digit_pos, largest,
             within_k_counts.data_ptr<uint32_t>(), kth_values.data_ptr<T>());
     TP_CUDA_CHECK(cudaGetLastError());
@@ -562,7 +545,7 @@ void launch_multiblock_topk(const Tensor& input, Tensor& values,
   TP_CUDA_CHECK(cudaGetLastError());
   TP_CHECK(block_count <= static_cast<uint32_t>(std::numeric_limits<int>::max()),
            "topk: scan range exceeds device scan limit");
-  using Counter = cub::CountingInputIterator<uint32_t>;
+  using Counter = cub::CountingInputIterator<uint32_t, uint32_t>;
   using KeyIterator = cub::TransformInputIterator<
       uint32_t, topk_multiblock_block_to_row<Key>, Counter>;
   KeyIterator key_iterator(
@@ -585,16 +568,34 @@ void launch_multiblock_topk(const Tensor& input, Tensor& values,
       kth_counts.data_ptr<uint32_t>(), kth_counts.data_ptr<uint32_t>(),
       static_cast<int>(block_count), cub::Equality(),
       getCurrentCUDAStream().stream()));
-  topk_multiblock_gather<T, Key>
+  topk_multiblock_gather<T, Key, IndexType>
       <<<block_grid, topk_multiblock_threads, 0,
          getCurrentCUDAStream().stream()>>>(
           input.data_ptr<T>(), values.data_ptr<T>(), indices.data_ptr<int64_t>(),
           kth_values.data_ptr<T>(), within_k_counts.data_ptr<uint32_t>(),
-          kth_counts.data_ptr<uint32_t>(), row_count, column_count, inner,
-          blocks_per_row, items_per_thread, k, largest);
+          kth_counts.data_ptr<uint32_t>(), row_count, column_count,
+          static_cast<IndexType>(inner),
+          blocks_per_row, items_per_thread, static_cast<IndexType>(k), largest);
   TP_CUDA_CHECK(cudaGetLastError());
   if (sorted && k > 1) {
     launch_sorted_topk<T>(values, indices, rows, k, inner, largest);
+  }
+}
+
+template <typename T>
+void launch_multiblock_topk(const Tensor& input, Tensor& values,
+                            Tensor& indices, int64_t rows, int64_t cols,
+                            int64_t k, int64_t inner, bool largest,
+                            bool sorted) {
+  const int64_t max_index =
+      static_cast<int64_t>(std::numeric_limits<uint32_t>::max());
+  if (input.numel() <= max_index && values.numel() <= max_index &&
+      indices.numel() <= max_index) {
+    launch_multiblock_topk_impl<T, uint32_t>(
+        input, values, indices, rows, cols, k, inner, largest, sorted);
+  } else {
+    launch_multiblock_topk_impl<T, uint64_t>(
+        input, values, indices, rows, cols, k, inner, largest, sorted);
   }
 }
 
@@ -771,18 +772,27 @@ void launch_topk_cuda(const Tensor& input, Tensor& values, Tensor& indices,
     TP_THROW(RuntimeError, "topk: unknown impl " + std::to_string(impl));
   }
 
-  if (cols > 128 && cols <= 1024 && k <= 1024) {
+  if (sorted && cols > 128 && cols <= 1024 && rows <= 2048) {
     using Key = typename TopKRadixTraits<T>::key_type;
     const dim3 grid = topk_grid_for(static_cast<uint64_t>(rows));
-    radix_sort_all_topk_kernel<T, Key, 32, 32>
-        <<<grid, 32, 0, getCurrentCUDAStream().stream()>>>(
-            input.data_ptr<T>(), values.data_ptr<T>(),
-            indices.data_ptr<int64_t>(), rows, cols, k, inner, largest);
+    if (k <= 128) {
+      radix_sort_all_topk_indices_kernel<T, Key, 32, 32>
+          <<<grid, 32, 0, getCurrentCUDAStream().stream()>>>(
+              input.data_ptr<T>(), values.data_ptr<T>(),
+              indices.data_ptr<int64_t>(), rows, cols, k, inner, largest);
+    } else {
+      radix_sort_all_topk_kernel<T, Key, 32, 32>
+          <<<grid, 32, 0, getCurrentCUDAStream().stream()>>>(
+              input.data_ptr<T>(), values.data_ptr<T>(),
+              indices.data_ptr<int64_t>(), rows, cols, k, inner, largest);
+    }
     TP_CUDA_CHECK(cudaGetLastError());
     return;
   }
 
-  if (topk_should_use_multiblock(rows, cols)) {
+  const bool use_multiblock = topk_should_use_multiblock(rows, cols) &&
+      !(rows <= 512 && cols <= 4096);
+  if (use_multiblock) {
     launch_multiblock_topk<T>(input, values, indices, rows, cols, k, inner,
                               largest, sorted);
     return;

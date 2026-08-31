@@ -1,0 +1,168 @@
+unary_op:
+  parameter_names_with_default_values:
+    OPERATOR: exp(X)
+    INPLACE: false
+  generate_variant_forall:
+    INPLACE:
+      - VALUE: false
+        SUFFIX: ""
+      - VALUE: true
+        SUFFIX: inplace
+  shader_variants:
+    - NAME: exp
+      OPERATOR: exp(X)
+    - NAME: sqrt
+      OPERATOR: sqrt(X)
+    - NAME: log
+      OPERATOR: log(X)
+    - NAME: abs
+      OPERATOR: abs(X)
+    - NAME: neg
+      OPERATOR: -X
+    - NAME: tanh
+      OPERATOR: tanh(X)
+    - NAME: sigmoid
+      OPERATOR: 1.0f / (1.0f + exp(-X))
+    - NAME: floor
+      OPERATOR: floor(X)
+    - NAME: sin
+      OPERATOR: sin(X)
+    - NAME: cos
+      OPERATOR: cos(X)
+    - NAME: relu
+      OPERATOR: max(X, 0.0f)
+    - NAME: rsqrt
+      OPERATOR: inversesqrt(X)
+
+binary_op_scalar:
+  parameter_names_with_default_values:
+    OPERATOR: X + Y
+    INPLACE: false
+  generate_variant_forall:
+    INPLACE:
+      - VALUE: false
+        SUFFIX: ""
+      - VALUE: true
+        SUFFIX: inplace
+  shader_variants:
+    - NAME: add_scalar
+      OPERATOR: X + Y
+    - NAME: mul_scalar
+      OPERATOR: X * Y
+    - NAME: pow_tensor_scalar
+      OPERATOR: pow (X, Y)
+    - NAME: floor_mul_scalar
+      OPERATOR: floor(X * Y)
+
+binary_op_tensor:
+  parameter_names_with_default_values:
+    IS_DIV: false
+    OPERATOR: X + A * Y
+    INPLACE: false
+  generate_variant_forall:
+    INPLACE:
+      - VALUE: false
+        SUFFIX: ""
+      - VALUE: true
+        SUFFIX: inplace
+  shader_variants:
+    - NAME: add
+      OPERATOR: X + A * Y
+    - NAME: sub
+      OPERATOR: X - A * Y
+    - NAME: mul
+      OPERATOR: X * Y
+    - NAME: div
+      IS_DIV: true
+      OPERATOR: X / Y
+    - NAME: pow
+      OPERATOR: pow(X, Y)
+    - NAME: floor_divide
+      IS_DIV: true
+      OPERATOR: floor(X / Y)
+
+clamp:
+  parameter_names_with_default_values:
+    OPERATOR: clamp(X, min_val, max_val)
+    INPLACE: false
+  generate_variant_forall:
+    INPLACE:
+      - VALUE: false
+        SUFFIX: ""
+      - VALUE: true
+        SUFFIX: inplace
+  shader_variants:
+    - NAME: clamp
+      OPERATOR: clamp(X, min_val, max_val)
+
+buffer_unary_op:
+  parameter_names_with_default_values:
+    OPERATOR: X
+    INPLACE: false
+  generate_variant_forall:
+    INPLACE:
+      - VALUE: false
+        SUFFIX: ""
+      - VALUE: true
+        SUFFIX: inplace
+  shader_variants:
+    - NAME: buffer_exp
+      OPERATOR: exp(X)
+    - NAME: buffer_sqrt
+      OPERATOR: sqrt(X)
+    - NAME: buffer_log
+      OPERATOR: log(X)
+    - NAME: buffer_abs
+      OPERATOR: abs(X)
+    - NAME: buffer_neg
+      OPERATOR: -X
+    - NAME: buffer_tanh
+      OPERATOR: tanh(X)
+    - NAME: buffer_sigmoid
+      OPERATOR: 1.0f / (1.0f + exp(-X))
+    - NAME: buffer_floor
+      OPERATOR: floor(X)
+    - NAME: buffer_sin
+      OPERATOR: sin(X)
+    - NAME: buffer_cos
+      OPERATOR: cos(X)
+    - NAME: buffer_relu
+      OPERATOR: max(X, 0.0f)
+    - NAME: buffer_rsqrt
+      OPERATOR: inversesqrt(X)
+
+buffer_binary_op_tensor:
+  parameter_names_with_default_values:
+    OPERATOR: X + A * Y
+    INPLACE: false
+  generate_variant_forall:
+    INPLACE:
+      - VALUE: false
+        SUFFIX: ""
+      - VALUE: true
+        SUFFIX: inplace
+  shader_variants:
+    - NAME: buffer_add
+      OPERATOR: X + A * Y
+    - NAME: buffer_sub
+      OPERATOR: X - A * Y
+    - NAME: buffer_mul
+      OPERATOR: X * Y
+    - NAME: buffer_div
+      OPERATOR: X / Y
+
+buffer_binary_op_scalar:
+  parameter_names_with_default_values:
+    OPERATOR: X + A * Y
+    INPLACE: false
+  generate_variant_forall:
+    INPLACE:
+      - VALUE: false
+        SUFFIX: ""
+      - VALUE: true
+        SUFFIX: inplace
+  shader_variants:
+    - NAME: buffer_add_scalar
+      OPERATOR: X + A * Y
+    - NAME: buffer_mul_scalar
+      OPERATOR: X * Y

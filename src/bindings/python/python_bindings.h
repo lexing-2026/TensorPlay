@@ -47,6 +47,7 @@ void init_size(py::module_& m);
 PyObject* Size_New(const tensorplay::Size& size);
 bool Size_Check(PyObject* obj);
 void init_generator(py::module_& m);
+void init_storage(py::module_& m);
 void init_autograd(py::module_& m);
 void init_autocast(py::module_& m);
 void init_transforms(py::module_& m);

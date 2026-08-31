@@ -1,18 +1,11 @@
 #pragma once
 
+#include "GradMode.h"
 #include "Macros.h"
 
 namespace tensorplay {
 
-// Thread-local inference-mode switch. Lives at
-// the p10 layer so generated dispatch code can consult it without depending
-// on tpx; tpx re-exports it as tensorplay::tpx::InferenceMode.
-//
-// While enabled, ops skip autograd recording entirely (outputs of any op get
-// requires_grad=False even for inputs that require grad) and in-place
-// inference tensors without version counters, rejected later use in
-// autograd -- are not implemented yet; this covers the recording/versioning
-// behavior, which is what inference_mode() gates in practice.
+// Thread-local inference-mode switch used by tensor creation and dispatch.
 class P10_API InferenceMode {
 public:
     static bool is_enabled() { return enabled_; }
@@ -27,11 +20,17 @@ private:
 // RAII helper for C++ call sites.
 struct P10_API InferenceModeGuard {
     bool prev_;
+    bool prev_grad_;
     explicit InferenceModeGuard(bool enabled = true)
-        : prev_(InferenceMode::is_enabled()) {
+        : prev_(InferenceMode::is_enabled()),
+          prev_grad_(GradMode::is_enabled()) {
         InferenceMode::set_enabled(enabled);
+        GradMode::set_enabled(!enabled);
     }
-    ~InferenceModeGuard() { InferenceMode::set_enabled(prev_); }
+    ~InferenceModeGuard() {
+        InferenceMode::set_enabled(prev_);
+        GradMode::set_enabled(prev_grad_);
+    }
     InferenceModeGuard(const InferenceModeGuard&) = delete;
     InferenceModeGuard& operator=(const InferenceModeGuard&) = delete;
 };

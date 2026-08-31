@@ -99,6 +99,17 @@ bool is_conj_native(const Tensor& /*self*/) { return false; }
 
 bool is_neg_native(const Tensor& /*self*/) { return false; }
 
+bool is_distributed_native(const Tensor& /*self*/) { return false; }
+
+bool is_floating_point_native(const Tensor& self) {
+    return isFloatingType(self.dtype());
+}
+
+bool is_inference_native(const Tensor& self) {
+    const auto impl = self.unsafeGetTensorImpl();
+    return impl && impl->is_inference();
+}
+
 TENSORPLAY_LIBRARY_IMPL(Composite, TypePropertiesComposite) {
     m.impl("can_cast", can_cast_native);
     m.impl("promote_types", promote_types_native);
@@ -106,6 +117,9 @@ TENSORPLAY_LIBRARY_IMPL(Composite, TypePropertiesComposite) {
     m.impl("result_type.Scalar", result_type_scalar_native);
     m.impl("result_type.Scalar_Tensor", result_type_scalar_tensor_native);
     m.impl("result_type.Scalar_Scalar", result_type_scalar_scalar_native);
+    m.impl("is_distributed", is_distributed_native);
+    m.impl("is_floating_point", is_floating_point_native);
+    m.impl("is_inference", is_inference_native);
     m.impl("is_conj", is_conj_native);
     m.impl("is_neg", is_neg_native);
 }

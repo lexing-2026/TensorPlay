@@ -181,17 +181,22 @@ def _arg_fingerprint(value: Any) -> Any:
 
     ``(id, version)`` for tensors: in-place mutation bumps ``_version`` so a
     cached key component is never reused across mutated inputs; fresh tensors
-    have fresh ids.  Scalars compare by value.  This replaces per-call
-    shape/dtype/device reads and tuple rebuilding, which profiling showed at
-    ~40% of steady-state compiled-call time.
+    have fresh ids.  Inputs without a version counter use tensor metadata.
+    Scalars compare by value.  This replaces per-call shape/dtype/device reads
+    and tuple rebuilding, which profiling showed at ~40% of steady-state
+    compiled-call time.
     """
 
     module = type(value).__module__
-    if module.startswith("tensorplay") and hasattr(value, "_version"):
+    if module.startswith("tensorplay"):
+        try:
+            version = value._version
+        except RuntimeError:
+            version = ("metadata", _quick_value_signature(value, dynamic=False))
         return (
             "t",
             id(value),
-            getattr(value, "_version", None),
+            version,
             bool(getattr(value, "requires_grad", False)),
         )
     if value is None or isinstance(value, (bool, int, float, str, bytes)):
@@ -389,6 +394,16 @@ def compile(
             ),
         )
 
+    def _bind_dispatcher_fast(fast: Any, nargs: int) -> None:
+        """Hand a resolved steady-state entry to the outer C dispatcher.
+
+        The dispatcher re-enters it directly once its argument memo passes;
+        any slow call routes through here again, so the binding stays
+        current across recompiles and specialization switches.
+        """
+
+        dispatcher.tpx_set_fast(fast, nargs)
+
     @functools.wraps(model)
     def optimized(*args: Any, **kwargs: Any) -> Any:
         nonlocal last_quick_key, last_compiled_fn, last_arg_refs
@@ -522,8 +537,13 @@ def compile(
         if not kwargs:
             fast = getattr(compiled_fn, "_fast_call", None)
             if fast is not None:
-                return fast(*args)
+                _bind_dispatcher_fast(fast, len(args))
+                return compiled_fn(*args)
         return compiled_fn(*args, **kwargs)
+
+    from tensorplay._C import _stax as _stax_native
+
+    dispatcher: Any = _stax_native.make_call_dispatcher(optimized)
 
     optimized._tensorplay_backend = backend_spec  # type: ignore[attr-defined]
     optimized._tensorplay_cache = cache  # type: ignore[attr-defined]
@@ -535,6 +555,9 @@ def compile(
     optimized._tensorplay_isolate_recompiles = isolate_recompiles  # type: ignore[attr-defined]
     optimized._tensorplay_recompile_limit = specialization_limit  # type: ignore[attr-defined]
     _compiled_wrappers.add(optimized)
+    if dispatcher is not None:
+        dispatcher._tensorplay_dispatcher = optimized  # type: ignore[attr-defined]
+        return dispatcher
     return optimized
 
 

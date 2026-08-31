@@ -12,6 +12,7 @@
 #include "Device.h"
 #include "DispatchKey.h"
 #include "Dispatcher.h"
+#include "InferenceMode.h"
 #include "MemoryFormat.h"
 #include "VariableVersion.h"
 #include "Storage.h"
@@ -28,7 +29,8 @@ private:
     SizesAndStrides sizes_and_strides_;
     DType dtype_;
     Device device_;
-    tensorplay::VariableVersion version_counter_;
+    tensorplay::VariableVersion version_counter_{!InferenceMode::is_enabled()};
+    bool inference_tensor_ = InferenceMode::is_enabled();
 
     bool is_contiguous_;
     // Layout tag: Contiguous, ChannelsLast (NHWC) or ChannelsLast3d (NDHWC).
@@ -121,9 +123,7 @@ public:
     DType dtype() const { return dtype_; }
     Device device() const { return device_; }
 
-    // The dispatch key set describing this tensor: its backend key plus the
-    // matching autograd key. The autograd kernel decides whether to record
-    // based on GradMode and requires_grad.
+    // The dispatch key set describing this tensor and its backend.
     DispatchKeySet key_set() const {
         DispatchKey backend = computeDispatchKey(device_);
         DispatchKeySet ks;
@@ -132,9 +132,13 @@ public:
             return ks;
         }
         ks.add(backend);
-        ks.add(toAutogradKey(backend));
+        if (!inference_tensor_) {
+            ks.add(toAutogradKey(backend));
+        }
         return ks;
     }
+
+    bool is_inference() const { return inference_tensor_; }
 
     bool is_batched() const { return transform_value_ != nullptr; }
     int64_t batch_dim() const { return transform_batch_dim_; }
@@ -250,15 +254,36 @@ public:
     }
 
     // the counter with their base via share_version_counter().
-    uint32_t version() const { return version_counter_.current_version(); }
-    void bump_version() { version_counter_.bump(); }
+    uint32_t version() const {
+        if (!version_counter_.is_enabled()) {
+            throw std::runtime_error("Inference tensors do not track version counter.");
+        }
+        return version_counter_.current_version();
+    }
+    void bump_version() {
+        if (inference_tensor_ && !InferenceMode::is_enabled()) {
+            throw std::runtime_error(
+                "In-place update to an inference tensor outside inference mode is not allowed.");
+        }
+        version_counter_.bump();
+    }
     // Zero the counter (used when a fresh tensor is materialized by an
     // internal copy such as clone(), so the result starts unmutated).
     void reset_version() { version_counter_.reset(); }
-    void set_version_counter(const VariableVersion& vc) { version_counter_ = vc; }
+    void set_version_counter(const VariableVersion& vc) {
+        if (inference_tensor_ && vc.is_enabled()) {
+            throw std::runtime_error("Cannot set a version counter on an inference tensor.");
+        }
+        version_counter_ = vc;
+    }
     const VariableVersion& version_counter() const { return version_counter_; }
     // Make this tensor's version counter alias `other`'s (view semantics).
-    void share_version_counter(const TensorImpl& other) { version_counter_ = other.version_counter_; }
+    void share_version_counter(const TensorImpl& other) {
+        inference_tensor_ = other.inference_tensor_;
+        version_counter_ = other.inference_tensor_
+            ? VariableVersion(false)
+            : other.version_counter_;
+    }
     
     // Copy metadata (storage, sizes, strides, dtype, device) from another TensorImpl
     // preserving autograd_meta
@@ -297,6 +322,7 @@ public:
     AutogradMetaBase* autograd_meta() const { return autograd_meta_.get(); }
     bool has_autograd_meta() const { return autograd_meta_ != nullptr; }
     std::shared_ptr<AutogradMetaBase> autograd_meta_shared() const { return autograd_meta_; }
+    void set_requires_grad(bool requires_grad);
 
     // resize_ support: adopt new logical sizes with fresh contiguous strides.
     // Storage growth is the caller's job (kernels grow it first so the old

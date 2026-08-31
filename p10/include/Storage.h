@@ -47,6 +47,8 @@ public:
     bool is_same(const Storage& other) const { return impl_ == other.impl_; }
     
     // Resize (only if resizable)
+    bool resizable() const { return impl_ && impl_->resizable; }
+
     void set_nbytes(size_t new_nbytes) {
         if (!impl_) {
              impl_ = std::make_shared<StorageImpl>(new_nbytes, getCPUAllocator());
@@ -59,6 +61,16 @@ public:
     
     // Use count for debugging
     long use_count() const { return impl_.use_count(); }
+
+    // Borrows the underlying StorageImpl.  For backend internals only; the
+    // handle stays owned by this Storage.
+    const std::shared_ptr<StorageImpl>& unsafeGetStorageImpl() const {
+        return impl_;
+    }
+
+    std::shared_ptr<StorageImpl>& unsafeGetStorageImpl() {
+        return impl_;
+    }
 
 private:
     std::shared_ptr<StorageImpl> impl_;

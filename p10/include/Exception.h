@@ -48,6 +48,8 @@ P10_API void setWarningHandler(WarningHandler handler);
 P10_API void warn(SourceLocation source, const std::string& msg);
 
 namespace detail {
+    inline void msg_builder(std::ostream&) {}
+
     template <typename T>
     void msg_builder(std::ostream& os, const T& t) {
         os << t;

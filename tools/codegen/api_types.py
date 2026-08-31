@@ -36,6 +36,7 @@ _SCALAR = BaseCType(_P10("", "Scalar"))
 _DTYPE = BaseCType(_P10("", "DType"))
 _DEVICE = BaseCType(_P10("", "Device"))
 _GENERATOR = BaseCType(_P10("", "Generator"))
+_STORAGE = BaseCType(_P10("", "Storage"))
 
 
 def _symbolic_kind(t: Type, symbolic: bool = False) -> str:
@@ -65,6 +66,7 @@ _RAW_ATOMIC = {
     "DType": _P10("", "DType"),
     "Device": _P10("", "Device"),
     "Generator": _P10("", "Generator"),
+    "Storage": _P10("", "Storage"),
     "SymInt": _P10("", "SymInt"),
     "SymBool": _P10("", "SymBool"),
     "SymFloat": _P10("", "SymFloat"),
@@ -110,6 +112,7 @@ _CPP_ARG_TYPES = {
                                 # keep the schema optional and ABI-stable.
     "Layout": "int64_t",
     "Generator": "Generator",
+    "Storage": "Storage",
     "SymInt": "SymInt",
     "SymBool": "SymBool",
     "SymFloat": "SymFloat",
@@ -414,6 +417,7 @@ _PYI_TYPES = {
     "MemoryFormat": "int",
     "Layout": "int",
     "Generator": "Generator",
+    "Storage": "UntypedStorage",
     "void": "None",
 }
 

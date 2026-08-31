@@ -392,9 +392,10 @@ def _emit_redispatch(lines, f, variant, dev_src, helper_name):
     lines.append("#ifdef USE_CUDA")
     lines.append("    tensorplay::prof::GpuTimerPair __tp_gpu(__tp_prof_rec);")
     lines.append("#endif")
-    lines.append("#ifdef USE_CUDA")
-    lines.append(f"    cuda::OptionalCUDAGuard device_guard({rd_dev});")
-    lines.append("#endif")
+    if f.device_guard:
+        lines.append("#ifdef USE_CUDA")
+        lines.append(f"    cuda::OptionalCUDAGuard device_guard({rd_dev});")
+        lines.append("#endif")
     lines.append(
         f'    static const OperatorHandle op_handle = '
         f'Dispatcher::singleton().findHandle("{f.func_name}");')

@@ -23,7 +23,6 @@ __all__ = [
     "dispatch_trace",
     "extract_val",
     "fake_signature",
-    "make_fx",
     "get_innermost_proxy_mode",
     "get_proxy_mode",
     "handle_sym_dispatch",
@@ -36,11 +35,11 @@ __all__ = [
     "track_tensor",
     "track_tensor_tree",
     "disable_proxy_modes_tracing",
-    "get_torch_dispatch_modes",
+    "get_dispatch_modes",
     "get_proxy_node",
     "unwrap_proxy",
     "wrap_with_proxy",
-    "wrapper_and_args_for_make_fx",
+    "wrapper_and_args_for_make_graph",
     "get_isolated_graphmodule",
     "disable_autocast_cache",
 ]
@@ -283,50 +282,6 @@ def dispatch_trace(
         _CURRENT_MODE.reset(token)
 
 
-def make_fx(
-    f: Callable[..., Any],
-    decomposition_table: Mapping[Any, Callable[..., Any]] | None = None,
-    tracing_mode: str = "real",
-    _allow_non_fake_inputs: bool = False,
-    *,
-    pre_dispatch: bool = False,
-    record_module_stack: bool = False,
-    _allow_fake_constant: bool = False,
-    _error_on_data_dependent_ops: bool = True,
-    record_stack_traces: bool = False,
-    proxy_module_inputs: bool = False,
-    _disable_torch_fn_metadata_mode: bool = False,
-    dynamic_shapes: ShapesSpec | ParamsSpec | dict[str, Any] | None = None,
-) -> Callable[..., GraphModule]:
-    del (
-        _allow_non_fake_inputs,
-        pre_dispatch,
-        record_module_stack,
-        _allow_fake_constant,
-        _error_on_data_dependent_ops,
-        record_stack_traces,
-        proxy_module_inputs,
-        _disable_torch_fn_metadata_mode,
-    )
-    if tracing_mode not in {"real", "fake", "symbolic"}:
-        raise ValueError(f"unknown tracing mode {tracing_mode!r}")
-    if tracing_mode in {"fake", "symbolic"}:
-        raise NotImplementedError(
-            f"{tracing_mode} tensor materialization requires symbolic shape support"
-        )
-    resolved_shapes = _resolve_dynamic_shapes(f, dynamic_shapes)
-
-    @functools.wraps(f)
-    def wrapped(*args: Any, **kwargs: Any) -> GraphModule:
-        samples = _bind_sample_inputs(f, args, kwargs)
-        tracer = PythonKeyTracer(decomposition_table=decomposition_table, execute=False)
-        tracer.dynamic_shapes = resolved_shapes
-        tracer.tracing_mode = tracing_mode
-        return dispatch_trace(f, tracer, samples)
-
-    return wrapped
-
-
 def make_graph(
     f: Any,
     decomposition_table: Mapping[Any, Callable[..., Any]] | None = None,
@@ -339,7 +294,7 @@ def make_graph(
     _error_on_data_dependent_ops: bool = True,
     record_stack_traces: bool = False,
     proxy_module_inputs: bool = False,
-    _disable_torch_fn_metadata_mode: bool = False,
+    _disable_function_metadata_mode: bool = False,
     dynamic_shapes: ShapesSpec | ParamsSpec | dict[str, Any] | None = None,
 ) -> Callable[..., GraphModule]:
     """Return a callable that captures each invocation into a graph module."""
@@ -352,7 +307,7 @@ def make_graph(
         _error_on_data_dependent_ops,
         record_stack_traces,
         proxy_module_inputs,
-        _disable_torch_fn_metadata_mode,
+        _disable_function_metadata_mode,
     )
     if tracing_mode not in {"real", "fake", "symbolic"}:
         raise ValueError(f"unknown tracing mode {tracing_mode!r}")
@@ -427,26 +382,26 @@ def get_innermost_proxy_mode() -> ProxyMode | None:
     return get_proxy_mode()
 
 
-class TorchFunctionMetadataMode(ProxyMode):
+class FunctionMetadataMode(ProxyMode):
     """Record the callable used for metadata propagation during a trace."""
 
     def __call__(self, function: Callable[..., T], *args: Any, **kwargs: Any) -> Any:
-        self.tracer.torch_fn_metadata = function
+        self.tracer.function_metadata = function
         return function(*args, **kwargs)
 
 
-class PreDispatchTorchFunctionMode(TorchFunctionMetadataMode):
+class PreDispatchFunctionMode(FunctionMetadataMode):
     """Metadata mode used before a callable reaches the graph dispatcher."""
 
 
-class ProxyTorchDispatchMode(ProxyMode):
+class ProxyDispatchMode(ProxyMode):
     """Dispatch mode that materializes a graph operation for proxy inputs."""
 
     def __call__(self, target: Any, *args: Any, **kwargs: Any) -> Any:
         return self.tracer.create_proxy("call_function", target, args, kwargs)
 
 
-def get_torch_dispatch_modes() -> list[ProxyMode]:
+def get_dispatch_modes() -> list[ProxyMode]:
     mode = get_proxy_mode()
     return [] if mode is None else [mode]
 
@@ -489,7 +444,7 @@ def wrap_with_proxy(value: Any, proxy: Any) -> Any:
     return proxy
 
 
-def wrapper_and_args_for_make_fx(
+def wrapper_and_args_for_make_graph(
     function: Callable[..., T],
     args: tuple[object, ...],
     kwargs: dict[str, object],
@@ -511,9 +466,9 @@ def get_isolated_graphmodule(
     tracing_mode: str = "real",
     decomposition_table: Mapping[Any, Callable[..., Any]] | None = None,
 ) -> GraphModule:
-    wrapped, flat_args = wrapper_and_args_for_make_fx(function, args, kwargs)
+    wrapped, flat_args = wrapper_and_args_for_make_graph(function, args, kwargs)
     with disable_proxy_modes_tracing():
-        return make_fx(
+        return make_graph(
             wrapped,
             decomposition_table=decomposition_table,
             tracing_mode=tracing_mode,

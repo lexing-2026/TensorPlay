@@ -3,6 +3,7 @@
 // autograd-internal concern); the view structure is identical.
 
 #include "CompositeCommon.h"
+#include "SetStorage.h"
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "Exception.h"
@@ -62,6 +63,14 @@ Tensor& resize_as__native(Tensor& self, const Tensor& other,
     return self;
 }
 
+Tensor& set__source_Tensor_storage_offset_native(
+    Tensor& self, const Tensor& source, int64_t storage_offset,
+    const std::vector<int64_t>& size,
+    const std::vector<int64_t>& stride) {
+    return native::set_tensor_storage_offset_native(
+        self, source, storage_offset, size, stride);
+}
+
 TENSORPLAY_LIBRARY_IMPL(Composite, TensorShapeComposite) {
     m.impl("reshape_as", reshape_as_native);
     m.impl("unsafe_chunk", unsafe_chunk_native);
@@ -69,6 +78,8 @@ TENSORPLAY_LIBRARY_IMPL(Composite, TensorShapeComposite) {
     m.impl("fliplr", fliplr_native);
     m.impl("flipud", flipud_native);
     m.impl("resize_as_", resize_as__native);
+    m.impl("set_.source_Tensor_storage_offset",
+           set__source_Tensor_storage_offset_native);
 }
 
 } // namespace composite

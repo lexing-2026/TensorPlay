@@ -95,6 +95,12 @@ set(P10_SOURCES
     # Registered under the Composite dispatch key; see the files themselves.
     src/backend/composite/Activation.cpp
     src/backend/composite/ActivationMore.cpp
+    src/backend/composite/OutVariantComposites.cpp
+    src/backend/composite/InplaceAliasComposites.cpp
+    src/backend/composite/VariantOutComposites.cpp
+    src/backend/composite/VariantAliasComposites.cpp
+    src/backend/composite/VariantHandComposites.cpp
+    src/backend/composite/MiscBridgeComposites.cpp
     src/backend/composite/DunderBinaryComposite.cpp
     src/backend/composite/FactoryToolsComposite.cpp
     src/backend/composite/ChanelShuffle.cpp
@@ -120,6 +126,11 @@ set(P10_SOURCES
     src/backend/composite/UnaryOps.cpp
     src/backend/composite/Unique.cpp
 
+    # Unconditionally compiled Vulkan dispatch surface: exposes the
+    # availability probe and registry so callers link regardless of whether
+    # the backend itself is in the build.
+    src/vulkan/Context.cpp
+
     src/Einsum.cpp
     src/Profiler.cpp
     src/ProfilerGpu.cpp
@@ -133,8 +144,8 @@ set(P10_SOURCES
     ${GEN_CPP}
 )
 
-if(USE_CUDA)
-    list(APPEND P10_SOURCES
+if(USE_CUDA OR USE_ROCM)
+    set(TP_CUDA_BACKEND_SOURCES
         src/backend/cuda/CUDAAllocator.cpp
         src/backend/cuda/CUDAContext.cpp
         src/backend/cuda/CUDAGenerator.cpp
@@ -208,6 +219,94 @@ if(USE_CUDA)
         src/backend/cuda/SpectralKernels.cu
         src/backend/cuda/Spectral2DKernels.cu
         src/backend/cuda/InplaceCompletionKernels.cu
+    )
+    if(USE_ROCM)
+        # Compile the hipify-staged translations instead of the originals.
+        tp_map_sources(TP_CUDA_BACKEND_SOURCES ${TP_CUDA_BACKEND_SOURCES})
+        list(APPEND P10_SOURCES ${TP_CUDA_BACKEND_SOURCES})
+        # The staged tree also carries translated copies of every shared
+        # source; swap the ones whose original TU touches GPU APIs.
+        # ProfilerCupti is dropped; the stub keeps its symbols as no-ops
+        # (the GPU collector is not available in HIP builds).
+        set(TP_P10_SHARED_GPU_SOURCES
+            src/Allocator.cpp
+            src/ProfilerGpu.cpp
+            src/backend/cpu/CopyKernels.cpp
+        )
+        tp_map_sources(TP_P10_SHARED_GPU_SOURCES ${TP_P10_SHARED_GPU_SOURCES})
+        list(REMOVE_ITEM P10_SOURCES
+            src/Allocator.cpp
+            src/ProfilerGpu.cpp
+            src/backend/cpu/CopyKernels.cpp
+            src/ProfilerCupti.cpp)
+        list(APPEND P10_SOURCES ${TP_P10_SHARED_GPU_SOURCES}
+            src/ProfilerCuptiStub.cpp)
+    else()
+        list(APPEND P10_SOURCES ${TP_CUDA_BACKEND_SOURCES})
+    endif()
+endif()
+
+if(USE_VULKAN)
+    # Vulkan backend: api layer, ops and the generated SPIR-V registry.
+    # The shader registry is produced at build time from the GLSL sources by
+    # tools/gen_vulkan_spv.py (GLSL -> SPIR-V -> embedded C++ pipeline).
+    set(TP_VULKAN_GEN_DIR "${GEN_BASE_DIR}/vulkan")
+    set(TP_VULKAN_GEN_CPP "${TP_VULKAN_GEN_DIR}/spv.cpp")
+    set(TP_VULKAN_GEN_H "${TP_VULKAN_GEN_DIR}/spv.h")
+
+    find_program(TP_GLSLANG_VALIDATOR glslangValidator
+        PATHS "${CMAKE_CURRENT_SOURCE_DIR}/../tools/bin"
+        NO_DEFAULT_PATH)
+    if(NOT TP_GLSLANG_VALIDATOR)
+        find_program(TP_GLSLANG_VALIDATOR glslangValidator)
+    endif()
+    if(NOT TP_GLSLANG_VALIDATOR)
+        message(FATAL_ERROR "USE_VULKAN requires glslangValidator (expected under tools/bin).")
+    endif()
+
+    file(GLOB_RECURSE TP_VULKAN_GLSL CONFIG_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/vulkan/glsl/*.glsl")
+    list(APPEND TP_VULKAN_GLSL
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/vulkan/glsl/shader_params.yaml")
+
+    add_custom_command(
+        OUTPUT ${TP_VULKAN_GEN_CPP} ${TP_VULKAN_GEN_H}
+        COMMAND ${CMAKE_COMMAND} -E env PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/..
+                ${Python_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_vulkan_spv.py
+                --glsl-path ${CMAKE_CURRENT_SOURCE_DIR}/src/backend/vulkan/glsl
+                --output-path ${TP_VULKAN_GEN_DIR}
+                --glslang-path ${TP_GLSLANG_VALIDATOR}
+        DEPENDS ${TP_VULKAN_GLSL} ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_vulkan_spv.py
+        COMMENT "Generating Vulkan SPIR-V shader registry"
+    )
+    set_source_files_properties(${TP_VULKAN_GEN_CPP} PROPERTIES GENERATED TRUE)
+    add_custom_target(vulkan_spv_gen DEPENDS ${TP_VULKAN_GEN_CPP} ${TP_VULKAN_GEN_H})
+
+    list(APPEND P10_SOURCES
+        src/backend/vulkan/api/Adapter.cpp
+        src/backend/vulkan/api/Allocator.cpp
+        src/backend/vulkan/api/Command.cpp
+        src/backend/vulkan/api/Context.cpp
+        src/backend/vulkan/api/Descriptor.cpp
+        src/backend/vulkan/api/Pipeline.cpp
+        src/backend/vulkan/api/Resource.cpp
+        src/backend/vulkan/api/Runtime.cpp
+        src/backend/vulkan/api/Shader.cpp
+        src/backend/vulkan/api/ShaderRegistry.cpp
+        src/backend/vulkan/api/Tensor.cpp
+        src/backend/vulkan/VulkanRuntime.cpp
+        src/backend/vulkan/impl/Common.cpp
+        src/backend/vulkan/impl/Packing.cpp
+        src/backend/vulkan/ops/Allocator.cpp
+        src/backend/vulkan/ops/BinaryOp.cpp
+        src/backend/vulkan/ops/Clamp.cpp
+        src/backend/vulkan/ops/Clone.cpp
+        src/backend/vulkan/ops/Copy.cpp
+        src/backend/vulkan/ops/Factory.cpp
+        src/backend/vulkan/ops/UnaryOp.cpp
+        src/backend/vulkan/ops/Utils.cpp
+        src/backend/vulkan/ops/Zero.cpp
+        ${TP_VULKAN_GEN_CPP}
     )
 endif()
 
@@ -388,10 +487,26 @@ set_source_files_properties(${GEN_CPP} PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
 
 add_dependencies(p10 generate_code)
 
-target_include_directories(p10 PUBLIC  
+target_include_directories(p10 PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
     ${GEN_BASE_DIR}
+)
+
+if(USE_ROCM)
+    # Staged headers (translated CUDA-spelling names) must win over the
+    # originals for every TU in this target, hence BEFORE on the prefix.
+    target_include_directories(p10 BEFORE PUBLIC
+        $<BUILD_INTERFACE:${TP_HIP_STAGING}/p10/include>
+    )
+    target_include_directories(p10 BEFORE PRIVATE ${TP_HIP_STAGING}/src)
+    target_include_directories(p10 SYSTEM PRIVATE ${TP_HIP_INCLUDE_DIRS})
+endif()
+
+# Backend-internal cross-directory includes (e.g. backend/vulkan/... from
+# cpu kernels) resolve against src/.
+target_include_directories(p10 PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
 # hand-written tpx headers (Autograd.h, Node.h).  Expose tpx/include so those
@@ -411,10 +526,20 @@ if(WIN32)
     endif()
 endif()
 
+if(USE_VULKAN)
+    target_include_directories(p10 SYSTEM PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/vulkan-headers/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/vulkan-memory-allocator"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/vulkan/api"
+        "${TP_VULKAN_GEN_DIR}")
+    target_link_libraries(p10 PRIVATE ${VULKAN_LIBRARY})
+    target_compile_definitions(p10 PRIVATE USE_VULKAN)
+    add_dependencies(p10 vulkan_spv_gen)
+endif()
+
 if(USE_CUDA)
     target_link_libraries(p10 PRIVATE CUDA::cudart CUDA::cublas CUDA::cublasLt CUDA::cufft CUDA::cusolver)
     target_compile_definitions(p10 PRIVATE USE_CUDA)
-
     # CUDA 13 moved CUB/thrust under <toolkit>/include/cccl; SparseKernels
     # includes <cub/cub.cuh>, which resolves only with that dir on the path.
     if(EXISTS "${CUDAToolkit_INCLUDE_DIRS}/cccl/cub")
@@ -448,6 +573,16 @@ if(USE_CUDA)
     endif()
 endif()
 
+if(USE_ROCM)
+    target_link_libraries(p10 PRIVATE ${TP_HIP_LIBRARIES})
+    # The staged tree keeps the CUDA-spelling guard names, so the target
+    # carries both defines: existing #ifdef USE_CUDA blocks activate and
+    # route to the HIP-backed implementations.
+    target_compile_definitions(p10 PRIVATE USE_CUDA USE_ROCM)
+    target_compile_options(p10 PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX,HIP>:${TP_HIP_CXX_FLAGS}>)
+endif()
+
 if(COMPUTE_LIBS)
     target_link_libraries(p10 PUBLIC ${COMPUTE_LIBS})
 endif()
@@ -468,7 +603,9 @@ if(UNIX AND NOT APPLE)
 endif()
 
 # Installation logic for p10
-set(TP_PACKAGE_DIR "${CMAKE_SOURCE_DIR}/tensorplay")
+if(NOT DEFINED TP_PACKAGE_DIR)
+    set(TP_PACKAGE_DIR "${CMAKE_SOURCE_DIR}/tensorplay")
+endif()
 set(TP_LIB_DIR "${TP_PACKAGE_DIR}/lib")
 
 set_target_properties(p10 PROPERTIES

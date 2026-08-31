@@ -4,7 +4,7 @@
 
 #include <tensorpipe/tensorpipe.h>
 
-#ifdef USE_CUDA
+#ifdef TENSORPLAY_TENSORPIPE_CUDA
 #include <tensorpipe/tensorpipe_cuda.h>
 #endif
 
@@ -77,7 +77,7 @@ std::unique_ptr<ChannelRegistration> make_multiplexed_uv_channel() {
         std::move(context), kMultiplexedUvChannelPriority});
 }
 
-#ifdef USE_CUDA
+#ifdef TENSORPLAY_TENSORPIPE_CUDA
 std::unique_ptr<ChannelRegistration> make_cuda_basic_channel() {
     auto context = tensorpipe::channel::cuda_basic::create(
         tensorpipe::channel::basic::create());
@@ -128,7 +128,7 @@ struct BuiltinBackendRegistrations final {
 #endif
         TensorPipeChannelRegistry::instance().register_creator(
             "mpt_uv", make_multiplexed_uv_channel);
-#ifdef USE_CUDA
+#ifdef TENSORPLAY_TENSORPIPE_CUDA
         TensorPipeChannelRegistry::instance().register_creator(
             "cuda_basic", make_cuda_basic_channel);
         TensorPipeChannelRegistry::instance().register_creator(

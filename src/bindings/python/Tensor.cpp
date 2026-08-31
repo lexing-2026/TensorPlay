@@ -1840,6 +1840,9 @@ void init_tensor(py::module_& m) {
         .def("storage_offset", [](const Tensor& self) -> int64_t {
             return static_cast<int64_t>(self.unsafeGetTensorImpl()->storage_offset());
         })
+        .def("untyped_storage", [](const Tensor& self) {
+            return self.unsafeGetTensorImpl()->storage();
+        })
         .def("get_device", [](const Tensor& self) -> int64_t {
             const auto dev = self.device();
             return dev.is_cuda() || dev.type() != DeviceType::CPU ? dev.index() : -1;
@@ -1848,37 +1851,6 @@ void init_tensor(py::module_& m) {
             if (self.dtype() == other.dtype()) return self;
             return self.to(other.dtype());
         }, py::arg("other"))
-        .def("set_", [](Tensor& self, const Tensor& source,
-                        std::optional<int64_t> storage_offset,
-                        std::optional<std::vector<int64_t>> size,
-                        std::optional<std::vector<int64_t>> stride) -> Tensor& {
-            // storage.  Autograd metadata on the impl stays untouched.
-            auto impl = self.unsafeGetTensorImpl();
-            const auto& src_impl = *source.unsafeGetTensorImpl();
-            std::vector<int64_t> ns = size.has_value()
-                ? *size
-                : static_cast<std::vector<int64_t>>(source.shape());
-            std::vector<int64_t> nst = stride.has_value()
-                ? *stride
-                : (size.has_value()
-                       ? std::vector<int64_t>{}
-                       : static_cast<std::vector<int64_t>>(source.strides()));
-            if (nst.empty() && !ns.empty()) {
-                // sizes given without strides: fresh contiguous strides
-                nst.assign(ns.size(), 1);
-                for (int i = static_cast<int>(ns.size()) - 2; i >= 0; --i)
-                    nst[i] = nst[i + 1] * ns[i + 1];
-            }
-            impl->set_storage(src_impl.storage());
-            impl->set_sizes_and_strides(ns, nst);
-            impl->set_storage_offset(storage_offset.has_value()
-                ? static_cast<size_t>(*storage_offset)
-                : src_impl.storage_offset());
-            return self;
-        },
-             py::arg("source"), py::arg("storage_offset").none(true) = py::none(),
-             py::arg("size").none(true) = py::none(),
-             py::arg("stride").none(true) = py::none())
         .def_property_readonly("is_cuda", [](const Tensor& self) { return self.device().type() == DeviceType::CUDA; })
         .def("pin_memory", [](const Tensor& self) {
              Tensor result(self.pin_memory());

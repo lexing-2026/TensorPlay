@@ -9,6 +9,7 @@
 #include "Scalar.h"
 #include "Utils.h"
 #include "TypePromotion.h"
+#include "GradMode.h"
 #include "CUDABroadcast.cuh"
 #include "CUDAComplex.cuh"
 #include <thrust/complex.h>
@@ -402,6 +403,88 @@ void get_grid_block(int64_t n, dim3& grid, dim3& block) {
     grid.x = (n + 255) / 256;
 }
 
+bool has_output_alias(const Tensor& out, const Tensor& input) {
+    auto out_impl = out.unsafeGetTensorImpl();
+    auto input_impl = input.unsafeGetTensorImpl();
+    return out_impl != nullptr && input_impl != nullptr &&
+           out_impl->storage().defined() && input_impl->storage().defined() &&
+           out_impl->storage().is_same(input_impl->storage());
+}
+
+bool try_add_out_direct(const Tensor& self, const Tensor& other, Scalar alpha,
+                        const std::vector<int64_t>& out_shape,
+                        DType result_dtype, Tensor& out) {
+    if (static_cast<std::vector<int64_t>>(out.shape()) != out_shape ||
+        !out.is_contiguous() || has_output_alias(out, self) ||
+        has_output_alias(out, other)) {
+        return false;
+    }
+
+    const int64_t n = out.numel();
+    if (n == 0) return true;
+
+    dim3 grid, block;
+    get_grid_block(n, grid, block);
+    Tensor a = (self.dtype() == result_dtype) ? self : self.to(result_dtype);
+    Tensor b = (other.dtype() == result_dtype) ? other : other.to(result_dtype);
+
+    if (try_binary_vectorized(n, a, b, out, alpha, BinaryAddVecOp{})) {
+        CUDA_CHECK(cudaGetLastError());
+        return true;
+    }
+
+    TensorDesc a_desc = make_desc(a, out_shape.size());
+    TensorDesc b_desc = make_desc(b, out_shape.size());
+    TensorDesc out_desc = make_desc(out, out_shape.size());
+    auto stream = getCurrentCUDAStream().stream();
+    switch (result_dtype) {
+        case DType::Float32:
+            add_broadcast_kernel<float><<<grid, block, 0, stream>>>(
+                n, a.data_ptr<float>(), a_desc, b.data_ptr<float>(), b_desc,
+                out.data_ptr<float>(), out_desc, alpha.to<float>());
+            break;
+        case DType::Int32:
+            add_broadcast_kernel<int><<<grid, block, 0, stream>>>(
+                n, a.data_ptr<int>(), a_desc, b.data_ptr<int>(), b_desc,
+                out.data_ptr<int>(), out_desc, alpha.to<int>());
+            break;
+        case DType::Int64:
+            add_broadcast_kernel<int64_t><<<grid, block, 0, stream>>>(
+                n, a.data_ptr<int64_t>(), a_desc, b.data_ptr<int64_t>(), b_desc,
+                out.data_ptr<int64_t>(), out_desc, alpha.to<int64_t>());
+            break;
+        case DType::Float16:
+            add_broadcast_kernel<tensorplay::Half><<<grid, block, 0, stream>>>(
+                n, a.data_ptr<tensorplay::Half>(), a_desc,
+                b.data_ptr<tensorplay::Half>(), b_desc,
+                out.data_ptr<tensorplay::Half>(), out_desc, alpha.to<float>());
+            break;
+        case DType::BFloat16:
+            add_broadcast_kernel<tensorplay::BFloat16><<<grid, block, 0, stream>>>(
+                n, a.data_ptr<tensorplay::BFloat16>(), a_desc,
+                b.data_ptr<tensorplay::BFloat16>(), b_desc,
+                out.data_ptr<tensorplay::BFloat16>(), out_desc, alpha.to<float>());
+            break;
+        case DType::Float64:
+            add_broadcast_kernel<double><<<grid, block, 0, stream>>>(
+                n, a.data_ptr<double>(), a_desc, b.data_ptr<double>(), b_desc,
+                out.data_ptr<double>(), out_desc, alpha.to<double>());
+            break;
+        case DType::ComplexFloat:
+            run_cplx_binary<float>(a, b, out,
+                                   cuda::cplx::AddAlphaOp<float>{s2c<float>(alpha)});
+            break;
+        case DType::ComplexDouble:
+            run_cplx_binary<double>(a, b, out,
+                                    cuda::cplx::AddAlphaOp<double>{s2c<double>(alpha)});
+            break;
+        default:
+            TP_THROW(NotImplementedError, "CUDA add: unsupported dtype");
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 #ifdef USE_CUDNN
 // Helper for cuDNN binary op
 void cudnn_binary_op(const Tensor& a, const Tensor& b, Tensor& c, cudnnOpTensorOp_t op, double alpha1, double alpha2, double beta) {
@@ -454,6 +537,9 @@ void cudnn_binary_op(const Tensor& a, const Tensor& b, Tensor& c, cudnnOpTensorO
 Tensor add_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
     std::vector<int64_t> out_shape = broadcast_shapes(static_cast<std::vector<int64_t>>(self.shape()), static_cast<std::vector<int64_t>>(other.shape()));
     DType result_dtype = promoteTypes(self.dtype(), other.dtype());
+    if (alpha.isFloatingPoint() && !isFloatingType(result_dtype)) {
+        result_dtype = promoteTypes(result_dtype, DType::Float32);
+    }
     Tensor result = Tensor::empty(out_shape, result_dtype, self.device());
     int64_t n = result.numel();
     if (n == 0) return result;
@@ -503,6 +589,46 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
             TP_THROW(NotImplementedError, "CUDA add: unsupported dtype");
     }
     return result;
+}
+
+Tensor& add_out_kernel(const Tensor& self, const Tensor& other, Scalar alpha,
+                       Tensor& out) {
+    if (self.device() != other.device() || self.device() != out.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "add.out: all tensors must be on the same device");
+    }
+    if (GradMode::is_enabled() &&
+        (self.requires_grad() || other.requires_grad() || out.requires_grad())) {
+        TP_THROW(RuntimeError,
+                 "add.out: functions with out arguments do not support automatic differentiation");
+    }
+
+    DType result_dtype = promoteTypes(self.dtype(), other.dtype());
+    if (alpha.isFloatingPoint() && !isFloatingType(result_dtype)) {
+        result_dtype = promoteTypes(result_dtype, DType::Float32);
+    }
+    if (out.dtype() != result_dtype) {
+        TP_THROW(RuntimeError,
+                 "add.out: expected output dtype ",
+                 static_cast<int>(result_dtype), ", but got ",
+                 static_cast<int>(out.dtype()));
+    }
+
+    const std::vector<int64_t> out_shape = broadcast_shapes(
+        static_cast<std::vector<int64_t>>(self.shape()),
+        static_cast<std::vector<int64_t>>(other.shape()));
+    if (try_add_out_direct(self, other, alpha, out_shape, result_dtype, out)) {
+        return out;
+    }
+
+    Tensor result = add_kernel(self, other, alpha);
+    if (out.shape() == result.shape()) {
+        out.copy_(result);
+    } else {
+        out.unsafeGetTensorImpl()->copy_metadata_from(
+            *result.unsafeGetTensorImpl());
+    }
+    return out;
 }
 
 __global__ void add_relu_same_shape_kernel(
@@ -1442,6 +1568,7 @@ Tensor& addcdiv_inplace_cuda(Tensor& self, const Tensor& tensor1,
 
 TENSORPLAY_LIBRARY_IMPL(CUDA, ArithmeticKernels) {
     m.impl("add.Tensor", add_kernel);
+    m.impl("add.out", add_out_kernel);
     m.impl("add_relu", add_relu_cuda);
     m.impl("add_.Tensor", add_inplace_kernel);
     m.impl("add.Scalar", add_scalar_kernel);

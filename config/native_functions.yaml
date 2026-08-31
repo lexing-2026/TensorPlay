@@ -220,13 +220,13 @@
     CPU: conv_transpose3d_grad_bias_cpu
 
 - func: add.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor
-  variants: method
+  variants: function, method
   dispatch:
     CPU: add_cpu
     CUDA: add_cuda
 
 - func: add.Scalar(Tensor self, Scalar other, Scalar alpha=1) -> Tensor
-  variants: method
+  variants: function, method
   dispatch:
     CPU: add_scalar_cpu
     CUDA: add_scalar_cuda
@@ -7329,12 +7329,43 @@
   variants: function
 - func: _pad_packed_sequence(Tensor data, Tensor batch_sizes, bool batch_first, Scalar padding_value, int total_length) -> (Tensor, Tensor)
   variants: function
+- func: set_.source_Storage(Tensor(a!) self, Storage source) -> Tensor(a!)
+  variants: method
+  device_check: NoCheck
+  device_guard: False
+  dispatch:
+    CPU: set_storage_cpu
+    CUDA: set_storage_cuda
+  tags: inplace_view
+- func: set_.source_Storage_storage_offset(Tensor(a!) self, Storage source, SymInt storage_offset, SymInt[] size, SymInt[] stride=[]) -> Tensor(a!)
+  variants: method
+  device_check: NoCheck
+  device_guard: False
+  dispatch:
+    CPU: set_storage_cpu_
+    CUDA: set_storage_cuda_
+  tags: inplace_view
 - func: set_.source_Tensor_storage_offset(Tensor(a!) self, Tensor source, SymInt storage_offset, SymInt[] size, SymInt[] stride=[]) -> Tensor(a!)
   variants: method
+  device_check: NoCheck
+  device_guard: False
+  dispatch:
+    Composite: set__source_Tensor_storage_offset_native
+  tags: inplace_view
 - func: set_.source_Tensor(Tensor(a!) self, Tensor source) -> Tensor(a!)
   variants: method
+  device_check: NoCheck
+  device_guard: False
+  dispatch:
+    CPU: set_tensor_cpu
+    CUDA: set_tensor_cuda
+  tags: inplace_view
 - func: set_(Tensor(a!) self) -> Tensor(a!)
   variants: method
+  dispatch:
+    CPU: set_cpu_
+    CUDA: set_cuda_
+  tags: inplace_view
 - func: lift(Tensor self) -> Tensor
   variants: function
 - func: lift_fresh(Tensor(a) self) -> Tensor(a)
