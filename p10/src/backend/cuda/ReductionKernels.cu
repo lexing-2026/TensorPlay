@@ -967,6 +967,10 @@ Tensor all_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, bool 
     TP_DISPATCH_REDUCTION(all_same_dtype, self.dtype(), self, spec, keepdim);
 }
 
+Tensor all_dim_int_kernel(const Tensor& self, int64_t dim, bool keepdim) {
+    return all_dim_kernel(self, std::vector<int64_t>{dim}, keepdim);
+}
+
 Tensor all_kernel(const Tensor& self) {
     return all_dim_kernel(self, {}, false);
 }
@@ -974,6 +978,10 @@ Tensor all_kernel(const Tensor& self) {
 Tensor any_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, bool keepdim) {
     const ReductionSpec spec = make_reduction_spec(self, dim);
     TP_DISPATCH_REDUCTION(any_same_dtype, self.dtype(), self, spec, keepdim);
+}
+
+Tensor any_dim_int_kernel(const Tensor& self, int64_t dim, bool keepdim) {
+    return any_dim_kernel(self, std::vector<int64_t>{dim}, keepdim);
 }
 
 Tensor any_kernel(const Tensor& self) {
@@ -1111,10 +1119,10 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, ReductionKernels) {
     m.impl("norm.dim", norm_dim_kernel);
     
     m.impl("all", all_kernel);
-    m.impl("all.dim", all_dim_kernel);
+    m.impl("all.dim", all_dim_int_kernel);
     
     m.impl("any", any_kernel);
-    m.impl("any.dim", any_dim_kernel);
+    m.impl("any.dim", any_dim_int_kernel);
     
     m.impl("var", var_kernel);
     m.impl("var.dim", var_dim_kernel);

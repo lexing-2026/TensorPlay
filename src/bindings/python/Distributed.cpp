@@ -241,6 +241,13 @@ private:
 }  // namespace
 #endif  // USE_CUDA
 
+namespace tensorplay {
+namespace distributed {
+void init_gloo_bindings(py::module_& dist);
+void init_mpi_bindings(py::module_& dist);
+}  // namespace distributed
+}  // namespace tensorplay
+
 void init_distributed(py::module_& m) {
     py::module_ dist = m.def_submodule("_distributed", "Distributed (NCCL) backend");
 
@@ -556,4 +563,7 @@ void init_distributed(py::module_& m) {
         .def("set_require_sync", &DDPReducer::set_require_sync)
         .def("abort_iteration", &DDPReducer::abort_iteration);
 #endif
+
+    tensorplay::distributed::init_gloo_bindings(dist);
+    tensorplay::distributed::init_mpi_bindings(dist);
 }

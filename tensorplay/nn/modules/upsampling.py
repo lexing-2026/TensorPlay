@@ -2,12 +2,12 @@
 
 import tensorplay.nn.functional as F
 from tensorplay import Tensor
-from tensorplay.nn.common_types import _ratio_2_t, _ratio_any_t, _size_2_t, _size_any_t
+from tensorplay.nn.common_types import _ratio_any_t, _size_any_t
 
 from .module import Module
 
 
-__all__ = ["Upsample", "UpsamplingNearest2d", "UpsamplingBilinear2d"]
+__all__ = ["Upsample"]
 
 
 class Upsample(Module):
@@ -194,101 +194,3 @@ class Upsample(Module):
             info = "size=" + repr(self.size)
         info += ", mode=" + repr(self.mode)
         return info
-
-
-class UpsamplingNearest2d(Upsample):
-    r"""Applies a 2D nearest neighbor upsampling to an input signal composed of several input channels.
-
-    To specify the scale, it takes either the :attr:`size` or the :attr:`scale_factor`
-    as its constructor argument.
-
-    When :attr:`size` is given, it is the output size of the image `(h, w)`.
-
-    Args:
-        size (int or Tuple[int, int], optional): output spatial sizes
-        scale_factor (float or Tuple[float, float], optional): multiplier for
-            spatial size.
-
-    .. warning::
-        This class is deprecated in favor of :func:`~nn.functional.interpolate`.
-
-    Shape:
-        - Input: :math:`(N, C, H_{in}, W_{in})`
-        - Output: :math:`(N, C, H_{out}, W_{out})` where
-
-    .. math::
-          H_{out} = \left\lfloor H_{in} \times \text{scale\_factor} \right\rfloor
-
-    .. math::
-          W_{out} = \left\lfloor W_{in} \times \text{scale\_factor} \right\rfloor
-
-    Examples::
-
-        >>> input
-        tensor([[[[1., 2.],
-                  [3., 4.]]]])
-
-        >>> m = nn.UpsamplingNearest2d(scale_factor=2)
-        >>> m(input)
-        tensor([[[[1., 1., 2., 2.],
-                  [1., 1., 2., 2.],
-                  [3., 3., 4., 4.],
-                  [3., 3., 4., 4.]]]])
-    """
-
-    def __init__(
-        self,
-        size: _size_2_t | None = None,
-        scale_factor: _ratio_2_t | None = None,
-    ) -> None:
-        super().__init__(size, scale_factor, mode="nearest")
-
-
-class UpsamplingBilinear2d(Upsample):
-    r"""Applies a 2D bilinear upsampling to an input signal composed of several input channels.
-
-    To specify the scale, it takes either the :attr:`size` or the :attr:`scale_factor`
-    as its constructor argument.
-
-    When :attr:`size` is given, it is the output size of the image `(h, w)`.
-
-    Args:
-        size (int or Tuple[int, int], optional): output spatial sizes
-        scale_factor (float or Tuple[float, float], optional): multiplier for
-            spatial size.
-
-    .. warning::
-        This class is deprecated in favor of :func:`~nn.functional.interpolate`. It is
-        equivalent to ``nn.functional.interpolate(..., mode='bilinear', align_corners=True)``.
-
-    Shape:
-        - Input: :math:`(N, C, H_{in}, W_{in})`
-        - Output: :math:`(N, C, H_{out}, W_{out})` where
-
-    .. math::
-        H_{out} = \left\lfloor H_{in} \times \text{scale\_factor} \right\rfloor
-
-    .. math::
-        W_{out} = \left\lfloor W_{in} \times \text{scale\_factor} \right\rfloor
-
-    Examples::
-
-        >>> input
-        tensor([[[[1., 2.],
-                  [3., 4.]]]])
-
-        >>> # xdoctest: +IGNORE_WANT("do other tests modify the global state?")
-        >>> m = nn.UpsamplingBilinear2d(scale_factor=2)
-        >>> m(input)
-        tensor([[[[1.0000, 1.3333, 1.6667, 2.0000],
-                  [1.6667, 2.0000, 2.3333, 2.6667],
-                  [2.3333, 2.6667, 3.0000, 3.3333],
-                  [3.0000, 3.3333, 3.6667, 4.0000]]]])
-    """
-
-    def __init__(
-        self,
-        size: _size_2_t | None = None,
-        scale_factor: _ratio_2_t | None = None,
-    ) -> None:
-        super().__init__(size, scale_factor, mode="bilinear", align_corners=True)

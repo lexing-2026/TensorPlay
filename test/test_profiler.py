@@ -22,7 +22,7 @@ def torch_op_names(trace_path):
             if e.get("cat") == "cpu_op"}
 
 
-class TestCaptureParity:
+class TestCaptureReference:
     def test_forward_ops_match_torch(self):
         # Same tiny workload on both frameworks; compare forward op sets.
         with torch.profiler.profile() as tprof:
@@ -661,6 +661,198 @@ class TestGpuTraceCpuBuild:
     def test_cupti_available_flag(self):
         avail = tp._C and hasattr(tp._C, "_profiler_stop")
         assert avail  # binding surface intact
+
+
+class TestFlops:
+    """with_flops: C++-estimated FLOPs stamped per event at session stop."""
+
+    def _run(self, *fns):
+        with tp_prof.profile(with_flops=True) as prof:
+            for fn in fns:
+                fn()
+        return prof
+
+    def _flops(self, prof, name, shapes):
+        want = [list(s) for s in shapes]
+        return next(ev[12] for ev in prof.events
+                    if ev[0] == name
+                    and [list(s) for s in ev[5]][:len(want)] == want)
+
+    def test_matmul_family(self):
+        prof = self._run(
+            lambda: tp.randn([2, 3, 5, 7]).matmul(tp.randn([3, 7, 9])),
+            lambda: tp.randn([7]).matmul(tp.randn([7, 9])),
+            lambda: tp.randn([5, 7]).matmul(tp.randn([7])),
+            lambda: tp.randn([4, 7]).matmul(tp.randn([2, 4, 7, 9])),
+        )
+        # [2,3]x[3] batch broadcast -> 6 batches of 5x7x9
+        assert self._flops(prof, "matmul", ([2, 3, 5, 7], [3, 7, 9])) == 2*6*5*7*9
+        assert self._flops(prof, "matmul", ([7], [7, 9])) == 2*7*9
+        assert self._flops(prof, "matmul", ([5, 7], [7])) == 2*5*7
+        # [4,7] @ [2,4,7,9]: batch prefix [2,4] = 8
+        assert self._flops(prof, "matmul", ([4, 7], [2, 4, 7, 9])) == 2*8*4*7*9
+
+    def test_mm_addmm_bmm_baddbmm(self):
+        prof = self._run(
+            lambda: tp.randn([64, 32]).mm(tp.randn([32, 48])),
+            lambda: tp.addmm(tp.randn([8, 8]), tp.randn([8, 8]), tp.randn([8, 8])),
+            lambda: tp.bmm(tp.randn([2, 4, 6]), tp.randn([2, 6, 5])),
+            lambda: tp.baddbmm(tp.randn([2, 4, 5]), tp.randn([2, 4, 6]), tp.randn([2, 6, 5])),
+        )
+        assert self._flops(prof, "mm", ([64, 32], [32, 48])) == 2*64*32*48
+        # addmm(input, mat1, mat2) counts the matmul operands only
+        assert self._flops(prof, "addmm", ([8, 8], [8, 8], [8, 8])) == 2*8*8*8
+        assert self._flops(prof, "bmm", ([2, 4, 6], [2, 6, 5])) == 2*2*4*6*5
+        assert self._flops(prof, "baddbmm",
+                           ([2, 4, 5], [2, 4, 6], [2, 6, 5])) == 2*2*4*6*5
+
+    def test_conv2d_assumes_unit_stride(self):
+        import tensorplay.nn as nn
+
+        prof = self._run(
+            lambda: nn.functional.conv2d(
+                tp.randn([4, 8, 16, 16]), tp.randn([16, 8, 3, 3]))
+        )
+        got = self._flops(prof, "conv2d", ([4, 8, 16, 16], [16, 8, 3, 3]))
+        assert got == 2*4*16*16*16*8*9  # N * Cout * H*W * (Cin/g) * kh*kw * 2
+
+    def test_uncovered_ops_report_zero(self):
+        prof = self._run(
+            lambda: tp.randn([8, 8]).relu(),
+            lambda: tp.randn([8, 8]).sum(),
+        )
+        assert all(ev[12] == 0 for ev in prof.events)
+
+    def test_no_shapes_reports_zero(self):
+        with tp_prof.profile() as prof:  # record_shapes off
+            tp.randn([4, 4]).mm(tp.randn([4, 4]))
+        ev = next(ev for ev in prof.events if ev[0] == "mm")
+        assert ev[12] == 0
+
+    def test_key_averages_column_and_total(self):
+        prof = self._run(
+            lambda: tp.randn([64, 32]).mm(tp.randn([32, 48])),
+        )
+        table = prof.key_averages()
+        row = next(r for r in table.rows if r.name == "mm")
+        assert row.flops == 2*64*32*48
+        assert table.total_flops == 2*64*32*48
+        text = table.table()
+        assert "Total Flops" in text
+        assert f"{2*64*32*48:,}" in text
+
+    def test_no_column_without_flag(self):
+        with tp_prof.profile(record_shapes=True) as prof:
+            tp.randn([4, 4]).mm(tp.randn([4, 4]))
+        assert "Total Flops" not in prof.key_averages().table()
+
+    def test_event_attribute_and_sort(self):
+        prof = self._run(
+            lambda: tp.randn([4, 4]).mm(tp.randn([4, 4])),
+            lambda: tp.randn([2, 4, 6]).bmm(tp.randn([2, 6, 5])),
+        )
+        ev = next(e for e in prof.events.function_events if e.name == "mm")
+        assert ev.flops == 2*4*4*4
+        # bmm (2*2*4*6*5 = 480) outranks mm (2*4*4*4 = 128) by flops
+        rows = prof.key_averages(sort_by="flops").rows
+        assert rows[0].name == "bmm" and rows[0].flops == 2*2*4*6*5
+
+    def test_total_average_carries_flops(self):
+        prof = self._run(
+            lambda: tp.randn([4, 4]).mm(tp.randn([4, 4])),
+            lambda: tp.randn([4, 4]).mm(tp.randn([4, 4])),
+        )
+        assert prof.total_average().flops == 2 * 2*4*4*4
+
+
+class TestWithModules:
+    """with_modules: nn.Module forwards bracket profiler spans."""
+
+    def test_spans_present_nested_and_restored(self):
+        import tensorplay.nn as nn
+
+        class Sub(nn.Module):
+            def forward(self, x):
+                return x.mm(x.t())
+
+        class Top(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.sub = Sub()
+
+            def forward(self, x):
+                return self.sub(x) + x.sum()
+
+        orig_call = nn.Module.__call__
+        model = Top()
+        with tp_prof.profile(with_modules=True) as prof:
+            model(tp.randn([16, 16]))
+        mods = [(ev[0], ev[2], ev[3]) for ev in prof.events
+                if isinstance(ev[0], str) and ev[0].startswith("nn.Module:")]
+        names = [n for n, _, _ in mods]
+        assert "nn.Module: Top" in names and "nn.Module: Sub" in names
+        top = next(e for e in mods if e[0] == "nn.Module: Top")
+        sub = next(e for e in mods if e[0] == "nn.Module: Sub")
+        assert top[1] <= sub[1] and sub[2] <= top[2]  # nesting
+        # op event inside the leaf module's span
+        mm = next(ev for ev in prof.events if ev[0] == "mm")
+        assert sub[1] <= mm[2] and mm[3] <= sub[2]
+        assert nn.Module.__call__ is orig_call  # restored
+
+    def test_no_module_events_without_flag(self):
+        import tensorplay.nn as nn
+
+        class M(nn.Module):
+            def forward(self, x):
+                return x.relu()
+
+        model = M()
+        with tp_prof.profile() as prof:
+            model(tp.randn([4, 4]))
+        assert not [ev for ev in prof.events
+                    if str(ev[0]).startswith("nn.Module")]
+
+    def test_exception_keeps_call_consistent(self):
+        import tensorplay.nn as nn
+
+        class Boom(nn.Module):
+            def forward(self, x):
+                raise ValueError("boom")
+
+        orig_call = nn.Module.__call__
+        with tp_prof.profile(with_modules=True):
+            with pytest.raises(ValueError):
+                Boom()(tp.randn([4, 4]))
+        assert nn.Module.__call__ is orig_call
+        # next session still captures balanced events
+        with tp_prof.profile() as prof:
+            tp.ones([2]).add(tp.ones([2]))
+        assert any("add" in str(ev[0]) for ev in prof.events)
+
+    def test_nested_sessions_share_one_patch(self):
+        import tensorplay.nn as nn
+
+        orig_call = nn.Module.__call__
+        with tp_prof.profile(with_modules=True):
+            with tp_prof.profile(with_modules=True):
+                pass
+            assert nn.Module.__call__ is not orig_call
+        assert nn.Module.__call__ is orig_call
+
+    def test_key_averages_aggregates_module_rows(self):
+        import tensorplay.nn as nn
+
+        class Sub(nn.Module):
+            def forward(self, x):
+                return x.mm(x.t())
+
+        model = Sub()
+        with tp_prof.profile(with_modules=True) as prof:
+            for _ in range(3):
+                model(tp.randn([8, 8]))
+        row = next(r for r in prof.key_averages().rows
+                   if r.name == "nn.Module: Sub")
+        assert row.count == 3
 
 
 class TestKeyAveragesGpuColumns:

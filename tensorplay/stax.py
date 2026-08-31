@@ -8,7 +8,7 @@ and optimizer development.
 
 from __future__ import annotations
 
-from .backends.stax import stax
+from ._stax.stax import stax
 
 try:
     from . import _C
@@ -25,4 +25,3 @@ def is_available() -> bool:
 
 
 __all__ = ["is_available", "stax"]
-

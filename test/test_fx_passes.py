@@ -6,13 +6,13 @@ import operator
 import pytest
 
 import tensorplay as tp
-from tensorplay.compiler.fx_passes import (
+from tensorplay.graph.passes import (
     POINTWISE_FUSED_OP_NAMES,
     NormalizeOperators,
     PointwiseFusionHint,
 )
-from tensorplay.compiler.graph import GraphModule, Tracer
-from tensorplay.compiler.passes import PassManager
+from tensorplay.graph import GraphModule, Tracer
+from tensorplay.graph.passes import PassManager
 
 
 def _trace(fn, *args, **kwargs):
@@ -141,7 +141,7 @@ def test_hint_boundaries_split_regions():
 
 
 def test_hint_op_set_matches_stax():
-    from tensorplay.backends.stax import _CPU_FUSED_OPS
+    from tensorplay._stax.stax import _CPU_FUSED_OPS
 
     assert _CPU_FUSED_OPS is POINTWISE_FUSED_OP_NAMES
 
@@ -150,7 +150,7 @@ def test_hint_op_set_matches_stax():
 
 
 def test_default_pipeline_stamps_hints_via_compile():
-    from tensorplay.compiler import compile, registry
+    from tensorplay._stax import compile, registry
 
     calls = {}
 
@@ -176,7 +176,7 @@ def test_default_pipeline_stamps_hints_via_compile():
 
 
 def test_sum_epilogue_detection_and_source():
-    from tensorplay.compiler.codegen.triton import (
+    from tensorplay._stax.codegen.triton import (
         TritonProgramCodegen,
         _split_sum_epilogue,
     )
@@ -218,6 +218,6 @@ def test_no_epilogue_for_non_sum_tail():
     x = tp.tensor([1.0])
     w = tp.tensor([1.0])
     gm = _trace(fn, x, w)
-    from tensorplay.compiler.codegen.triton import _split_sum_epilogue
+    from tensorplay._stax.codegen.triton import _split_sum_epilogue
 
     assert _split_sum_epilogue(gm) is None

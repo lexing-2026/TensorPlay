@@ -6,14 +6,12 @@
 # every per-tensor enqueue is issued inside a single ``groupStart/groupEnd``
 # coalescing manager. Ops enqueue on the current stream and return real
 
-import warnings
-
 import tensorplay as tp
 import tensorplay.distributed as dist
 from tensorplay.autograd.function import Function
-from tensorplay.distributed.distributed_c10d import (
-    _get_default_group as _c10d_default_group,
-    _resolve_group as _c10d_resolve_group,
+from tensorplay.distributed.distributed_core import (
+    _get_default_group as _core_default_group,
+    _resolve_group as _core_resolve_group,
 )
 
 
@@ -28,8 +26,6 @@ __all__ = [
     "all_reduce_coalesced",
     "all_gather_single_coalesced",
     "reduce_scatter_single_coalesced",
-    "all_gather_into_tensor_coalesced",
-    "reduce_scatter_tensor_coalesced",
 ]
 
 
@@ -53,13 +49,13 @@ def wait_tensor(tensor, timeout=None):
 
 def _resolve_group(group):
     if group is None:
-        return _c10d_default_group()
+        return _core_default_group()
     if isinstance(group, dist.ProcessGroup):
         return group
     if isinstance(group, str):
-        return _c10d_resolve_group(group)
+        return _core_resolve_group(group)
     if isinstance(group, int):  # global rank prefix of a sub-group
-        return _c10d_default_group()
+        return _core_default_group()
     raise ValueError(f"Unsupported group type: {type(group)}")
 
 
@@ -236,11 +232,11 @@ reduce_scatter_tensor_autograd = reduce_scatter_tensor
 
 def _resolve_coalesced_group(group):
     if group is None:
-        return _c10d_default_group()
+        return _core_default_group()
     if isinstance(group, dist.ProcessGroup):
         return group
     if isinstance(group, str):
-        return _c10d_resolve_group(group)
+        return _core_resolve_group(group)
     raise ValueError(
         f"Unsupported group type: {type(group)}; expected ProcessGroup or None")
 
@@ -447,27 +443,3 @@ def reduce_scatter_single_coalesced(inputs, reduce_op, scatter_dim, group=None,
         shard_shape[0] = shard_shape[0] // group_size
         out_list.append(out.view(shard_shape))
     return out_list
-
-
-def all_gather_into_tensor_coalesced(self_tensor_list, group=None, tag=""):
-    warnings.warn(
-        "`tensorplay.distributed._functional_collectives."
-        "all_gather_into_tensor_coalesced` is deprecated. Please use "
-        "`all_gather_single_coalesced` instead.",
-        FutureWarning,
-        stacklevel=2,
-    )
-    return all_gather_single_coalesced(self_tensor_list, group, tag)
-
-
-def reduce_scatter_tensor_coalesced(inputs, reduce_op, scatter_dim, group=None,
-                                    tag=""):
-    warnings.warn(
-        "`tensorplay.distributed._functional_collectives."
-        "reduce_scatter_tensor_coalesced` is deprecated. Please use "
-        "`reduce_scatter_single_coalesced` instead.",
-        FutureWarning,
-        stacklevel=2,
-    )
-    return reduce_scatter_single_coalesced(inputs, reduce_op, scatter_dim,
-                                           group, tag)

@@ -80,6 +80,13 @@ public:
     bool cudnnBenchmark() const { return cudnn_benchmark_; }
     void setCudnnBenchmark(bool b) { cudnn_benchmark_ = b; }
 
+    // Master switches for the oneDNN and NNPACK convolution backends; both
+    // default to enabled and are consulted before a backend claims a call.
+    bool userEnabledMkldnn() const { return enabled_mkldnn_; }
+    void setUserEnabledMkldnn(bool e) { enabled_mkldnn_ = e; }
+    bool userEnabledNNPACK() const { return enabled_nnpack_; }
+    void setUserEnabledNNPACK(bool e) { enabled_nnpack_ = e; }
+
 private:
     Context(const Context&) = delete;
     Context& operator=(const Context&) = delete;
@@ -94,6 +101,8 @@ private:
     Float32MatmulPrecision float32_matmul_precision_ = Float32MatmulPrecision::HIGHEST;
     bool allow_tf32_cudnn_ = true;
     bool cudnn_benchmark_ = false;
+    bool enabled_mkldnn_ = true;
+    bool enabled_nnpack_ = true;
 };
 
 P10_API Context& globalContext();

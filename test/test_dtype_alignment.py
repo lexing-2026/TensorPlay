@@ -137,3 +137,29 @@ def test_dlpack_codes_match_torch_for_supported_real_and_complex_types():
         assert torch.from_dlpack(tensor).dtype == torch_dtype
         torch_tensor = torch.tensor(values, dtype=torch_dtype)
         assert tp.from_dlpack(torch_tensor).dtype == dtype
+
+
+def test_from_dlpack_rejects_a_non_capsule_instead_of_crashing():
+    """An object with a permissive ``__getattr__`` answers every attribute
+    probe, so ``__dlpack__`` must be validated before it is dereferenced."""
+
+    import pytest
+
+    class AnswersEverything:
+        def __getattr__(self, name):
+            return lambda *args, **kwargs: 42
+
+    with pytest.raises(TypeError, match="dltensor"):
+        tp.from_dlpack(AnswersEverything())
+    with pytest.raises(TypeError, match="dltensor"):
+        tp.tensor(AnswersEverything())
+
+
+def test_from_dlpack_reports_a_consumed_capsule():
+    import pytest
+
+    array = np.arange(6, dtype=np.float32).reshape(2, 3)
+    capsule = array.__dlpack__()
+    assert np.allclose(tp.from_dlpack(capsule).numpy(), array)
+    with pytest.raises(ValueError, match="already been consumed"):
+        tp.from_dlpack(capsule)

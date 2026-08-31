@@ -1,29 +1,40 @@
-# Distributed process-group surface implemented in ``distributed_c10d`` plus
-# the pure-Python store layer.
-from tensorplay.distributed import distributed_c10d as _c10d
-from tensorplay.distributed._store import FileStore, Store, StoreTimeoutError, TCPStore
+# Distributed process-group surface implemented in ``distributed_core`` plus
+# the store layer (C++ backends with Python shims in ``_store``).
+from tensorplay.distributed import distributed_core as _core
+from tensorplay.distributed._store import (
+    FileStore,
+    HashStore,
+    PrefixStore,
+    Store,
+    StoreTimeoutError,
+    TCPStore,
+)
 from tensorplay.distributed.constants import (
     default_pg_nccl_timeout,
     default_pg_timeout,
 )
-from tensorplay.distributed.distributed_c10d import *  # noqa: F401,F403
+from tensorplay.distributed.distributed_core import *  # noqa: F401,F403
 
 # (DDP, DDP comm hooks, checkpoint) rely on them, so re-export the internal
 # accessors too.
-_get_default_group = _c10d._get_default_group
-_resolve_group = _c10d._resolve_group
-_rank_not_in_group = _c10d._rank_not_in_group
-_broadcast_coalesced = _c10d._broadcast_coalesced
-_compute_bucket_assignment_by_size = _c10d._compute_bucket_assignment_by_size
-_verify_params_across_processes = _c10d._verify_params_across_processes
+_get_default_group = _core._get_default_group
+_resolve_group = _core._resolve_group
+_rank_not_in_group = _core._rank_not_in_group
+_broadcast_coalesced = _core._broadcast_coalesced
+_compute_bucket_assignment_by_size = _core._compute_bucket_assignment_by_size
+_verify_params_across_processes = _core._verify_params_across_processes
 
 from tensorplay.distributed.rendezvous import (
     register_rendezvous_handler,
     rendezvous,
 )
+from tensorplay.distributed.remote_device import _remote_device
+from tensorplay.distributed import tensor as tensor
 
-__all__ = list(_c10d.__all__) + [
+__all__ = list(_core.__all__) + [
     "FileStore",
+    "HashStore",
+    "PrefixStore",
     "Store",
     "StoreTimeoutError",
     "TCPStore",
@@ -31,4 +42,5 @@ __all__ = list(_c10d.__all__) + [
     "default_pg_nccl_timeout",
     "register_rendezvous_handler",
     "rendezvous",
+    "tensor",
 ]

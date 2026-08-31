@@ -66,7 +66,7 @@ def main():
             dst.copy_(src)
         g.replay()
 
-    from tensorplay.compiler import CudaGraphManager
+    from tensorplay._stax import CudaGraphManager
 
     mgr = CudaGraphManager(max_entries=4)
 

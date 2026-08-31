@@ -133,10 +133,25 @@ Tensor ones_kernel(const std::vector<int64_t>& size, DType dtype, Device device,
     return t;
 }
 
+namespace {
+
+DType infer_full_dtype(const Scalar& fill_value) {
+    if (fill_value.isBoolean()) return DType::Bool;
+    if (fill_value.isIntegral(false)) return DType::Int64;
+    if (fill_value.isComplex()) {
+        return globalContext().defaultDType() == DType::Float64
+                   ? DType::ComplexDouble
+                   : DType::ComplexFloat;
+    }
+    return globalContext().defaultDType();
+}
+
+} // namespace
+
 Tensor full_kernel(const std::vector<int64_t>& size, Scalar fill_value, DType dtype, Device device, bool pin_memory) {
     DType inferred_dtype = dtype;
     if (inferred_dtype == DType::Undefined) {
-        inferred_dtype = fill_value.dtype();
+        inferred_dtype = infer_full_dtype(fill_value);
     }
     Tensor t = allocate_cpu_tensor(size, inferred_dtype, pin_memory);
     fill_kernel(t, fill_value);
@@ -339,20 +354,23 @@ Tensor logspace_kernel(Scalar start, Scalar end, int64_t steps, double base, DTy
 
 // --- Random Factory Kernels ---
 
-Tensor randn_kernel(const std::vector<int64_t>& size, DType dtype, Device device) {
-    Tensor t(size, dtype, device);
+Tensor randn_kernel(const std::vector<int64_t>& size, DType dtype, Device device,
+                    Generator* generator = nullptr, bool pin_memory = false) {
+    Tensor t = device.type() == DeviceType::CPU
+        ? allocate_cpu_tensor(size, dtype, pin_memory)
+        : Tensor(size, dtype, device);
     int64_t n = t.numel();
-    auto& gen = default_generator();
+    Generator* gen = generator != nullptr ? generator : &default_generator();
 
     switch (dtype) {
         case DType::Float32: {
             float* data = t.data_ptr<float>();
             if (n >= 16 && t.is_contiguous()) {
-                normal_fill<float>(data, n, 0.0f, 1.0f, &gen);
+                normal_fill<float>(data, n, 0.0f, 1.0f, gen);
             } else {
                 normal_distribution<double> dist(0.0, 1.0);
                 for (int64_t i = 0; i < n; ++i) {
-                    data[i] = static_cast<float>(dist(&gen));
+                    data[i] = static_cast<float>(dist(gen));
                 }
             }
             break;
@@ -360,11 +378,11 @@ Tensor randn_kernel(const std::vector<int64_t>& size, DType dtype, Device device
         case DType::Float64: {
             double* data = t.data_ptr<double>();
             if (n >= 16 && t.is_contiguous()) {
-                normal_fill<double>(data, n, 0.0, 1.0, &gen);
+                normal_fill<double>(data, n, 0.0, 1.0, gen);
             } else {
                 normal_distribution<double> dist(0.0, 1.0);
                 for (int64_t i = 0; i < n; ++i) {
-                    data[i] = dist(&gen);
+                    data[i] = dist(gen);
                 }
             }
             break;
@@ -376,21 +394,21 @@ Tensor randn_kernel(const std::vector<int64_t>& size, DType dtype, Device device
             // Box-Muller in float, then cast down to the storage dtype.
             if (n >= 16 && t.is_contiguous()) {
                 if (dtype == DType::Float16) {
-                    normal_fill_cast<Half>(t.data_ptr<Half>(), n, 0.0, 1.0, &gen);
+                    normal_fill_cast<Half>(t.data_ptr<Half>(), n, 0.0, 1.0, gen);
                 } else {
-                    normal_fill_cast<BFloat16>(t.data_ptr<BFloat16>(), n, 0.0, 1.0, &gen);
+                    normal_fill_cast<BFloat16>(t.data_ptr<BFloat16>(), n, 0.0, 1.0, gen);
                 }
             } else {
                 normal_distribution<double> dist(0.0, 1.0);
                 if (dtype == DType::Float16) {
                     Half* data = t.data_ptr<Half>();
                     for (int64_t i = 0; i < n; ++i) {
-                        data[i] = static_cast<Half>(dist(&gen));
+                        data[i] = static_cast<Half>(dist(gen));
                     }
                 } else {
                     BFloat16* data = t.data_ptr<BFloat16>();
                     for (int64_t i = 0; i < n; ++i) {
-                        data[i] = static_cast<BFloat16>(dist(&gen));
+                        data[i] = static_cast<BFloat16>(dist(gen));
                     }
                 }
             }
@@ -406,15 +424,15 @@ Tensor randn_kernel(const std::vector<int64_t>& size, DType dtype, Device device
                 normal_distribution<double> dist(0.0, 1.0);
                 for (int64_t i = 0; i < n; ++i) {
                     data[i] = std::complex<float>(
-                        static_cast<float>(dist(&gen) * comp_std),
-                        static_cast<float>(dist(&gen) * comp_std));
+                        static_cast<float>(dist(gen) * comp_std),
+                        static_cast<float>(dist(gen) * comp_std));
                 }
             } else {
                 std::complex<double>* data = t.data_ptr<std::complex<double>>();
                 normal_distribution<double> dist(0.0, 1.0);
                 for (int64_t i = 0; i < n; ++i) {
-                    data[i] = std::complex<double>(dist(&gen) * comp_std,
-                                                   dist(&gen) * comp_std);
+                    data[i] = std::complex<double>(dist(gen) * comp_std,
+                                                   dist(gen) * comp_std);
                 }
             }
             break;
@@ -554,6 +572,22 @@ Tensor randn_stub(const std::vector<int64_t>& size, std::optional<DType> dtype,
                         resolve_factory_device(device));
 }
 
+Tensor randn_generator_stub(const std::vector<int64_t>& size,
+                            std::optional<Generator> generator,
+                            std::optional<DType> dtype,
+                            std::optional<int64_t> layout,
+                            std::optional<Device> device,
+                            std::optional<bool> pin_memory) {
+    if (layout.has_value() && *layout != 2) {
+        TP_THROW(NotImplementedError,
+                 "randn is only implemented for strided (dense) layout tensors");
+    }
+    Generator* generator_ptr = generator.has_value() ? &*generator : nullptr;
+    return randn_kernel(size, resolve_factory_dtype(dtype),
+                        resolve_factory_device(device), generator_ptr,
+                        pin_memory.value_or(false));
+}
+
 Tensor randint_stub(int64_t low, int64_t high, const std::vector<int64_t>& size,
                     DType dtype, std::optional<Device> device) {
     return randint_kernel(low, high, size, dtype, resolve_factory_device(device));
@@ -628,6 +662,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, FactoryKernels) {
     m.impl("fill_.Scalar", fill_kernel);
     m.impl("zero_", zero_kernel);
     m.impl("randn", randn_stub);
+    m.impl("randn.generator", randn_generator_stub);
     m.impl("randint", randint_stub);
     m.impl("randperm", randperm_stub);
     m.impl("rand_like", rand_like_kernel);

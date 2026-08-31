@@ -1,0 +1,36 @@
+# ${generated_comment}
+# mypy: disable-error-code="type-arg"
+# mypy: allow-untyped-defs
+# ruff: noqa: F401,PYI054
+
+from collections.abc import Sequence
+from typing import overload
+
+import tensorplay
+from tensorplay import (
+    Generator,
+    MemoryFormat,
+    channels_last,
+    channels_last_3d,
+    contiguous_format,
+    preserve_format,
+)
+from tensorplay.types import (
+    Number,
+    _bool,
+    _complex,
+    _device,
+    _dtype,
+    _float,
+    _int,
+    _size,
+)
+from tensorplay._C import (
+    Device,
+    DType,
+    TensorBase,
+)
+
+${all_directive}
+
+${generated_functions}

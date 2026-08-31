@@ -42,7 +42,7 @@ from collections.abc import Callable, Sequence
 from typing import Any, Iterable
 
 import tensorplay
-from .compiler.graph import (
+from .graph import (
     GraphCaptureError,
     capture_call as _capture_call,
     capturing as _capturing,
@@ -271,7 +271,7 @@ class CustomOpDef:
         return self._schema
 
     # Readable node names once this object becomes a graph target
-    # (compiler.graph._target_name resolves ``target.__name__`` first).
+    # (the graph target formatter resolves ``target.__name__`` first).
     @property
     def __name__(self) -> str:  # type: ignore[override]
         return self._name
@@ -573,7 +573,7 @@ class CustomOpDef:
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         # A Proxy can only exist while a Tracer.trace() is live on this
-        # thread (compiler.graph._TRACE_DEPTH), so the proxy walk is skipped
+        # thread (the graph tracing depth), so the proxy walk is skipped
         # entirely outside capture — identical to the generated functional
         # wrappers' hot path in tensorplay/functional.py.
         if _capturing():
@@ -1445,7 +1445,7 @@ def _opcheck_test_aot_dispatch_dynamic(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
 ) -> None:
-    from tensorplay.compiler import Tracer
+    from tensorplay.graph import Tracer
 
     tensor_positions = [
         i for i, v in enumerate(args) if isinstance(v, tensorplay.Tensor)

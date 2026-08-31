@@ -197,11 +197,21 @@
 - name: contiguous(Tensor self, *, MemoryFormat memory_format=Contiguous) -> Tensor
   self: grad
 
-- name: select(Tensor self, int dim, int index) -> Tensor
+- name: select.int(Tensor self, int dim, SymInt index) -> Tensor
   self: tensorplay::tpx::ops::select_backward(grad, self, dim, index)
 
 - name: slice(Tensor self, int dim=0, int? start=None, int? end=None, int step=1) -> Tensor
   self: tensorplay::tpx::ops::slice_backward(grad, self, dim, start, end, step)
+
+# The two scatter-back ops above are linear in grad_output, and their own
+# derivative is the gather they undo.  Without these entries the chain stops
+# at the backward node: a second derivative taken through select/slice/narrow
+# would come back as zeros rather than as an error.
+- name: select_backward(Tensor grad_output, Tensor self, int dim, int index) -> Tensor
+  grad_output: tensorplay::tpx::ops::select(grad, dim, index)
+
+- name: slice_backward(Tensor grad_output, Tensor self, int dim=0, int? start=None, int? end=None, int step=1) -> Tensor
+  grad_output: tensorplay::tpx::ops::slice(grad, dim, start, end, step)
 
 # Narrow is a slice(dim, start, start+length);
 # our kernel materializes the slice view, backward reuses the slice formula.
@@ -239,6 +249,25 @@
   self: maybe_multiply(grad, beta)
   mat1: maybe_multiply(grad.mm(mat2.t()), alpha)
   mat2: maybe_multiply(mat1.t().mm(grad), alpha)
+
+- name: _to_sparse_semi_structured(Tensor dense) -> (Tensor packed, Tensor meta)
+  dense: _sparse_semi_structured_to_dense(grad, meta)
+
+- name: _sparse_semi_structured_to_dense(Tensor packed, Tensor meta) -> Tensor
+  packed: _sparse_semi_structured_gather_grad(grad, packed, meta)
+
+- name: _sparse_semi_structured_mm(Tensor mat1, Tensor mat1_meta, Tensor mat2, *, ScalarType? out_dtype=None) -> Tensor
+  mat1: _sparse_semi_structured_gather_grad(grad.to(mat2.dtype()).mm(mat2.t()), mat1, mat1_meta)
+  mat2: _sparse_semi_structured_mm_right(grad.t().to(mat1.dtype()), mat1, mat1_meta).t()
+
+- name: _sparse_semi_structured_mm_right(Tensor mat2, Tensor mat1, Tensor mat1_meta, *, ScalarType? out_dtype=None) -> Tensor
+  mat2: _sparse_semi_structured_mm(mat1, mat1_meta, grad.t().to(mat1.dtype())).t()
+  mat1: _sparse_semi_structured_gather_grad(mat2.t().mm(grad.to(mat2.dtype())), mat1, mat1_meta)
+
+- name: _sparse_semi_structured_addmm(Tensor input, Tensor mat1, Tensor mat1_meta, Tensor mat2, *, Scalar alpha=1, Scalar beta=1, ScalarType? out_dtype=None) -> Tensor
+  input: maybe_multiply(grad.sum({1}).to(input.dtype()), beta)
+  mat1: _sparse_semi_structured_gather_grad(maybe_multiply(grad.to(mat2.dtype()).mm(mat2.t()), alpha), mat1, mat1_meta)
+  mat2: maybe_multiply(_sparse_semi_structured_mm_right(grad.t().to(mat1.dtype()), mat1, mat1_meta).t(), alpha)
 
 - name: bmm(Tensor self, Tensor mat2) -> Tensor
   self: grad.matmul(mat2.transpose(-2, -1))
@@ -454,6 +483,24 @@
 
 - name: constant_pad_nd(Tensor self, int[] pad, Scalar value=0) -> Tensor
   self: constant_pad_nd_backward(grad, pad)
+
+# Rank-generic convolution: one backward call per requested slot, with the
+# output mask narrowing the work to exactly that slot.
+- name: convolution(Tensor input, Tensor weight, Tensor? bias, int[] stride, int[] padding, int[] dilation, bool transposed, int[] output_padding, int groups) -> Tensor
+  input: std::get<0>(convolution_backward(grad, input, weight, std::nullopt, stride, padding, dilation, transposed, output_padding, groups, {true, false, false}))
+  weight: std::get<1>(convolution_backward(grad, input, weight, std::nullopt, stride, padding, dilation, transposed, output_padding, groups, {false, true, false}))
+  bias: std::get<2>(convolution_backward(grad, input, weight, std::nullopt, stride, padding, dilation, transposed, output_padding, groups, {false, false, true}))
+
+- name: convolution_overrideable(Tensor input, Tensor weight, Tensor? bias, int[] stride, int[] padding, int[] dilation, bool transposed, int[] output_padding, int groups) -> Tensor
+  input: std::get<0>(convolution_backward_overrideable(grad, input, weight, stride, padding, dilation, transposed, output_padding, groups, {true, false, false}))
+  weight: std::get<1>(convolution_backward_overrideable(grad, input, weight, stride, padding, dilation, transposed, output_padding, groups, {false, true, false}))
+  bias: std::get<2>(convolution_backward_overrideable(grad, input, weight, stride, padding, dilation, transposed, output_padding, groups, {false, false, true}))
+
+# Only the reduced rows carry a gradient; offset2bag / bag_size / max_indices
+# are integer bookkeeping the two backward kernels read back.
+- name: _embedding_bag(Tensor weight, Tensor indices, Tensor offsets, bool scale_grad_by_freq=False, int mode=0, bool sparse=False, Tensor? per_sample_weights=None, bool include_last_offset=False, int padding_idx=-1) -> (Tensor output, Tensor offset2bag, Tensor bag_size, Tensor max_indices)
+  weight: _embedding_bag_dense_backward(grad, indices, offset2bag, bag_size, max_indices, weight.size(0), scale_grad_by_freq, mode, per_sample_weights, padding_idx)
+  per_sample_weights: embedding_bag_psw_backward(grad, weight, indices, offsets, offset2bag, per_sample_weights, mode, padding_idx)
 
 - name: conv2d(Tensor input, Tensor weight, Tensor? bias=None, int[] stride=[], int[] padding=[], int[] dilation=[], int groups=1) -> Tensor
   input: conv2d_grad_input(grad, input, weight, stride, padding, dilation, groups)
@@ -678,6 +725,56 @@
   self: div_tensor_self_backward(grad, other, self.dtype())
   other: div_tensor_other_backward(grad, self, other)
 
+- name: divide.Scalar(Tensor self, Scalar other) -> Tensor
+  self: grad / scalar_conj_if_complex(other)
+
+- name: true_divide.Scalar(Tensor self, Scalar other) -> Tensor
+  self: grad / scalar_conj_if_complex(other)
+
+# A rounded quotient is locally constant, so the mode-taking overloads only
+# carry a gradient when no mode was given.
+- name: div.Tensor_mode(Tensor self, Tensor other, *, str? rounding_mode) -> Tensor
+  self: div_tensor_self_backward(grad, other, self.dtype(), rounding_mode)
+  other: div_tensor_other_backward(grad, self, other, rounding_mode)
+
+- name: div.Scalar_mode(Tensor self, Scalar other, *, str? rounding_mode) -> Tensor
+  self: div_tensor_self_backward(grad, other, self.dtype(), rounding_mode)
+
+- name: divide.Tensor_mode(Tensor self, Tensor other, *, str? rounding_mode) -> Tensor
+  self: div_tensor_self_backward(grad, other, self.dtype(), rounding_mode)
+  other: div_tensor_other_backward(grad, self, other, rounding_mode)
+
+- name: divide.Scalar_mode(Tensor self, Scalar other, *, str? rounding_mode) -> Tensor
+  self: div_tensor_self_backward(grad, other, self.dtype(), rounding_mode)
+
+- name: subtract.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor
+  self: grad
+  other: maybe_multiply(grad.neg(), alpha)
+
+- name: subtract.Scalar(Tensor self, Scalar other, Scalar alpha=1) -> Tensor
+  self: grad
+
+# The divisor moves the result by one whole multiple per unit step, and the
+# multiple is the floored (remainder) or truncated (fmod) quotient.
+- name: remainder.Tensor(Tensor self, Tensor other) -> Tensor
+  self: grad
+  other: -(grad * floor(self / other))
+
+- name: remainder.Scalar(Tensor self, Scalar other) -> Tensor
+  self: grad
+
+- name: fmod.Scalar(Tensor self, Scalar other) -> Tensor
+  self: grad
+
+# copysign transplants a sign and nothing else, so the gradient comes back
+# with whichever sign the result took.
+- name: copysign.Tensor(Tensor self, Tensor other) -> Tensor
+  self: copysign_tensor_self_backward(grad, self, result)
+  other: zeros_like(other)
+
+- name: copysign.Scalar(Tensor self, Scalar other) -> Tensor
+  self: copysign_tensor_self_backward(grad, self, result)
+
 - name: multiply.Tensor(Tensor self, Tensor other) -> Tensor
   self: mul_tensor_backward(grad, other, self.dtype())
   other: mul_tensor_backward(grad, self, other.dtype())
@@ -703,9 +800,13 @@
 - name: exp2(Tensor self) -> Tensor
   self: grad * (result.conj() * 0.6931471805599453)
 
-- name: xlogy.Tensor(Tensor self, Tensor other) -> Tensor
-  self: grad * log(other)
+- name: xlogy(Tensor self, Tensor other) -> Tensor
+  self: where(logical_and(eq(self, 0), le(other, 0)), zeros_like(grad), xlogy(grad, other))
   other: self * grad / other
+
+- name: xlog1py(Tensor self, Tensor other) -> Tensor
+  self: where(logical_and(eq(self, 0), le(other, -1)), zeros_like(grad), xlog1py(grad, other))
+  other: self * grad / (other + 1)
 
 # BinaryOps.cpp logaddexp
 - name: logaddexp(Tensor self, Tensor other) -> Tensor
@@ -747,11 +848,15 @@
 - name: clamp_max.Scalar(Tensor self, Scalar max) -> Tensor
   self: grad * (self <= max)
 
+# Both operands are differentiable here, and a tie belongs to neither alone:
+# the gradient splits evenly where self and the bound coincide.
 - name: clamp_min.Tensor(Tensor self, Tensor min) -> Tensor
-  self: grad * (self >= min)
+  self: where(self < min, zeros_like(grad), where(eq(self, min), grad / 2, grad))
+  min: where(self > min, zeros_like(grad), where(eq(self, min), grad / 2, grad))
 
 - name: clamp_max.Tensor(Tensor self, Tensor max) -> Tensor
-  self: grad * (self <= max)
+  self: where(self > max, zeros_like(grad), where(eq(self, max), grad / 2, grad))
+  max: where(self < max, zeros_like(grad), where(eq(self, max), grad / 2, grad))
 
 # TensorTransformations.cpp:36 flip is an involution.
 - name: flip(Tensor self, int[] dims) -> Tensor
@@ -1040,7 +1145,7 @@
 
 - name: masked_scatter(Tensor self, Tensor mask, Tensor source) -> Tensor
   self: masked_fill(grad, mask, Scalar(0))
-  source: masked_scatter_backward(grad, mask, source)
+  source: masked_scatter_backward(grad, mask, source.shape())
 
 # --- scatter-family view ops (derivatives.yaml:1240-1270) ------------------
 
@@ -1103,6 +1208,29 @@
 
 - name: i0(Tensor self) -> Tensor
   self: grad * i1(self)
+
+- name: modified_bessel_i0(Tensor self) -> Tensor
+  self: grad * modified_bessel_i1(self)
+
+# d/dx exp(x^2)erfc(x) = 2x*erfcx(x) - 2/sqrt(pi)
+- name: erfcx(Tensor self) -> Tensor
+  self: (2.0 * self * result - 1.1283791670955126) * grad
+
+# The normal density 1/sqrt(2*pi) * exp(-x^2/2) is the derivative of ndtr;
+# log_ndtr differentiates to that density divided by ndtr, and `result` is
+# already its logarithm.
+- name: ndtr(Tensor self) -> Tensor
+  self: grad * 0.3989422804014327 * exp(-0.5 * self * self)
+
+- name: log_ndtr(Tensor self) -> Tensor
+  self: grad * 0.3989422804014327 * exp(-0.5 * self * self - result)
+
+# Inverse-function rule: 1 / phi(ndtri(y)) = sqrt(2*pi) * exp(ndtri(y)^2/2).
+- name: ndtri(Tensor self) -> Tensor
+  self: grad * 2.5066282746310002 * exp(0.5 * result * result)
+
+- name: entr(Tensor self) -> Tensor
+  self: grad * (-(1 + log(self)))
 
 - name: sgn(Tensor self) -> Tensor
   self: zeros_like(self)
@@ -1177,7 +1305,7 @@
   self: std_backward(result, grad, self, dim, correction, keepdim)
 
 - name: trace(Tensor self) -> Tensor
-  self: trace_backward(grad, self)
+  self: trace_backward(grad, self.shape())
 
 - name: vdot(Tensor self, Tensor other) -> Tensor
   self: grad * other

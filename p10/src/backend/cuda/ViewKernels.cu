@@ -153,6 +153,25 @@ Tensor reshape_kernel_cuda(const Tensor& self, const std::vector<int64_t>& shape
     return self.clone(static_cast<int64_t>(MemoryFormat::Contiguous)).view(inferred);
 }
 
+Tensor view_kernel_cuda(const Tensor& self, const std::vector<int64_t>& shape) {
+    if (!self.defined()) {
+        TP_THROW(RuntimeError, "Tensor not defined");
+    }
+    std::shared_ptr<TensorImpl> impl = self.unsafeGetTensorImpl();
+    const std::vector<int64_t> inferred =
+        SizesAndStrides::infer_size(shape, impl->numel());
+    auto stride = SizesAndStrides::compute_view_strides(
+        impl->sizes().vec(), impl->strides().vec(), inferred);
+    if (!stride.has_value()) {
+        TP_THROW(RuntimeError,
+                 "view size is not compatible with input tensor's size and stride");
+    }
+    Tensor out(impl->storage(), inferred, *stride, impl->dtype(),
+               impl->storage_offset());
+    out.unsafeGetTensorImpl()->share_version_counter(*impl);
+    return out;
+}
+
 Tensor transpose_kernel_cuda(const Tensor& self, int64_t dim0, int64_t dim1) {
     // TensorShape.cpp transpose: maybe_wrap_dim both dims (wrap_scalar=true
     // makes transpose(0, 0) a no-op on 0-d tensors), then swap sizes/strides.
@@ -611,7 +630,7 @@ Tensor movedim_kernel_cuda(const Tensor& self, const std::vector<int64_t>& sourc
 // The detail implementations live in libp10 and route copies by device, so
 // the CUDA registrations share the CPU bodies.  Sparse layouts are rejected
 // before the dense-stride math, matching the CPU guards.  (select/item use
-// skip_implementation -- their core Tensor methods are the implementation.)
+// Their core Tensor methods provide the implementation.)
 Tensor clone_kernel_cuda(const Tensor& self, std::optional<int64_t> memory_format) {
     std::optional<MemoryFormat> format;
     if (memory_format.has_value()) {
@@ -663,6 +682,7 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, ViewKernels) {
     m.impl("view_as_real", view_as_real_cuda);
     m.impl("view_as_complex", view_as_complex_cuda);
     m.impl("is_complex", is_complex_cuda);
+    m.impl("view", view_kernel_cuda);
     m.impl("reshape", reshape_kernel_cuda);
     m.impl("transpose", transpose_kernel_cuda);
     m.impl("t", t_kernel_cuda);

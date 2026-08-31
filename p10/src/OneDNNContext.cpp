@@ -7,8 +7,11 @@
 #if DNNL_CPU_RUNTIME == DNNL_RUNTIME_THREADPOOL
 #include "oneapi/dnnl/dnnl_threadpool.hpp"
 #endif
+#endif
 
 namespace tensorplay {
+
+#ifdef USE_ONEDNN
 
 std::atomic<bool> OneDNNContext::enabled_(true);
 

@@ -110,6 +110,46 @@ void binary_f64_avx512(int code, const double* a, const double* b, double* y,
 }
 
 __attribute__((target("avx512f")))
+void add_f32_avx512(const float* a, const float* b, float* y, int64_t n) {
+    int64_t i = 0;
+    for (; i + 64 <= n; i += 64) {
+        _mm512_storeu_ps(y + i, _mm512_add_ps(_mm512_loadu_ps(a + i),
+                                              _mm512_loadu_ps(b + i)));
+        _mm512_storeu_ps(y + i + 16, _mm512_add_ps(_mm512_loadu_ps(a + i + 16),
+                                                    _mm512_loadu_ps(b + i + 16)));
+        _mm512_storeu_ps(y + i + 32, _mm512_add_ps(_mm512_loadu_ps(a + i + 32),
+                                                    _mm512_loadu_ps(b + i + 32)));
+        _mm512_storeu_ps(y + i + 48, _mm512_add_ps(_mm512_loadu_ps(a + i + 48),
+                                                    _mm512_loadu_ps(b + i + 48)));
+    }
+    for (; i + 16 <= n; i += 16) {
+        _mm512_storeu_ps(y + i, _mm512_add_ps(_mm512_loadu_ps(a + i),
+                                              _mm512_loadu_ps(b + i)));
+    }
+    for (; i < n; ++i) y[i] = a[i] + b[i];
+}
+
+__attribute__((target("avx512f")))
+void add_f64_avx512(const double* a, const double* b, double* y, int64_t n) {
+    int64_t i = 0;
+    for (; i + 32 <= n; i += 32) {
+        _mm512_storeu_pd(y + i, _mm512_add_pd(_mm512_loadu_pd(a + i),
+                                              _mm512_loadu_pd(b + i)));
+        _mm512_storeu_pd(y + i + 8, _mm512_add_pd(_mm512_loadu_pd(a + i + 8),
+                                                  _mm512_loadu_pd(b + i + 8)));
+        _mm512_storeu_pd(y + i + 16, _mm512_add_pd(_mm512_loadu_pd(a + i + 16),
+                                                   _mm512_loadu_pd(b + i + 16)));
+        _mm512_storeu_pd(y + i + 24, _mm512_add_pd(_mm512_loadu_pd(a + i + 24),
+                                                   _mm512_loadu_pd(b + i + 24)));
+    }
+    for (; i + 8 <= n; i += 8) {
+        _mm512_storeu_pd(y + i, _mm512_add_pd(_mm512_loadu_pd(a + i),
+                                              _mm512_loadu_pd(b + i)));
+    }
+    for (; i < n; ++i) y[i] = a[i] + b[i];
+}
+
+__attribute__((target("avx512f")))
 void scalar_f32_avx512(int code, const float* a, float* y, int64_t n,
                        float scalar) {
     const __m512 vscalar = _mm512_set1_ps(scalar);
@@ -455,6 +495,30 @@ inline T tp_alpha_scaled(const tensorplay::Scalar& alpha, const T& y) {
 }
 
 Tensor add_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
+#if defined(__x86_64__)
+    bool plain_layout = true;
+#ifdef USE_ONEDNN
+    plain_layout =
+        !self.unsafeGetTensorImpl()->has_onednn_md() &&
+        !other.unsafeGetTensorImpl()->has_onednn_md();
+#endif
+    if (plain_layout && cpu_has_avx512() &&
+        self.dtype() == DType::Float32 && other.dtype() == DType::Float32 &&
+        self.shape() == other.shape() && self.is_contiguous() &&
+        other.is_contiguous() && alpha.to<float>() == 1.0f) {
+        Tensor result = Tensor::empty(
+            static_cast<std::vector<int64_t>>(self.shape()), DType::Float32,
+            self.device());
+        const int64_t n = self.numel();
+        const float* a = self.data_ptr<float>();
+        const float* b = other.data_ptr<float>();
+        float* y = result.data_ptr<float>();
+        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+            add_f32_avx512(a + begin, b + begin, y + begin, end - begin);
+        });
+        return result;
+    }
+#endif
     #ifdef USE_ONEDNN
     if (OneDNNContext::is_enabled()) {
         auto self_impl = self.unsafeGetTensorImpl();
@@ -655,10 +719,17 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
 #if defined(__x86_64__)
         // AVX-512 runtime dispatch: full-width add for any alpha.
         if (cpu_has_avx512()) {
-            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-                binary_f32_avx512(BIN_ADD, s_ptr + begin, o_ptr + begin,
-                                  r_ptr + begin, end - begin, alpha_val);
-            });
+            if (alpha_val == 1.0f) {
+                parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                    add_f32_avx512(s_ptr + begin, o_ptr + begin, r_ptr + begin,
+                                   end - begin);
+                });
+            } else {
+                parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                    binary_f32_avx512(BIN_ADD, s_ptr + begin, o_ptr + begin,
+                                      r_ptr + begin, end - begin, alpha_val);
+                });
+            }
             optimized = true;
         }
 #endif
@@ -844,10 +915,17 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
         double* r_ptr = result_contig.data_ptr<double>();
         const double* s_ptr = self_contig.data_ptr<double>();
         const double* o_ptr = other_contig.data_ptr<double>();
-        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-            binary_f64_avx512(BIN_ADD, s_ptr + begin, o_ptr + begin,
-                              r_ptr + begin, end - begin, alpha_val);
-        });
+        if (alpha_val == 1.0) {
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                add_f64_avx512(s_ptr + begin, o_ptr + begin, r_ptr + begin,
+                               end - begin);
+            });
+        } else {
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                binary_f64_avx512(BIN_ADD, s_ptr + begin, o_ptr + begin,
+                                  r_ptr + begin, end - begin, alpha_val);
+            });
+        }
         optimized = true;
     }
 #endif

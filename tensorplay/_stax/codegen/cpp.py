@@ -1,0 +1,778 @@
+"""Runtime C++ code generation for fused CPU pointwise programs.
+
+The captured program — a flat, topologically ordered instruction list —
+is rendered as straight-line C++ that runs explicit ``Vectorized`` SIMD
+operations (SLEEF-backed transcendentals included) inside the in-tree
+OpenMP worksharing bridge, compiled once by the system compiler, cached
+by content hash, and loaded as a Python callable.
+
+Code structure per kernel:
+
+* a four-vector unrolled main loop (independent chains give the scheduler
+  instructions to interleave) used when the program is short enough to keep
+  register pressure sane;
+* a single-vector loop covering the mid body;
+* a scalar tail handling the final partial vector through the partial-width
+  ``loadu``/``store`` overloads.
+
+Every data pointer is ``__restrict__``-qualified and the hot loops carry
+``#pragma GCC ivdep`` so the compiler can reorder loads and stores freely.
+Constants are materialized once per body, outside all loops.
+
+The supported operation surface covers the pointwise fused set plus the
+comparison/``where``/order-relation extension: comparisons yield 0.0f/1.0f
+lanes (the same boolean value domain the program interpreter uses), and
+``where`` selects through ``blendv`` driven by the raw comparison mask.
+
+Compilation uses the same multi-tier capability scheme as the in-tree
+kernels: a dry-compile probe selects the SIMD tier, and the tier's
+compiler definitions and architecture flags are applied verbatim.  All
+vector math therefore matches the interpreter path bit-for-bit.
+
+The module degrades gracefully: without a system compiler, without the
+development headers, on unsupported programs, or on any build/load failure
+it returns ``None`` and callers keep the generic kernel path.
+``TP_STAX_CPU_NATIVE=0`` disables the path outright.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import hashlib
+import os
+from typing import Any, Callable, Optional
+
+from ..codecache import default_cache, file_lock
+from ..cpp_builder import (
+    CppBuilder,
+    CppOptions,
+    get_compiler_version_info,
+    get_cpp_compiler,
+    package_paths,
+)
+from ..cpu_vec_isa import VecISA, pick_vec_isa
+
+# The four-way unrolled loop is emitted only when replicating the program
+# four times keeps live temporaries within reason; longer programs use the
+# single-vector loop (the compiler still schedules within one vector).
+_UNROLL_MAX_STEPS = 16
+
+_MAX_INPUTS = 16
+
+# Instruction surface, keyed by the program's op names.  ``{a}``/``{b}``
+# are the operand placeholders; every expression is a single C++ rvalue.
+_BINARY_EXPR: dict[str, str] = {
+    "add": "({a} + {b})",
+    "sub": "({a} - {b})",
+    "mul": "({a} * {b})",
+    "div": "({a} / {b})",
+    "pow": "{a}.pow({b})",
+}
+_COMPARE_EXPR: dict[str, str] = {
+    "lt": "{a}.lt({b})",
+    "le": "{a}.le({b})",
+    "gt": "{a}.gt({b})",
+    "ge": "{a}.ge({b})",
+    "eq": "{a}.eq({b})",
+    "ne": "{a}.ne({b})",
+}
+_ORDER_EXPR: dict[str, str] = {
+    "minimum": "tensorplay::vec::minimum({a}, {b})",
+    "maximum": "tensorplay::vec::maximum({a}, {b})",
+    "clamp_min": "tensorplay::vec::maximum({a}, {b})",
+    "clamp_max": "tensorplay::vec::minimum({a}, {b})",
+}
+_UNARY_EXPR: dict[str, str] = {
+    "neg": "(-{a})",
+    "pos": "{a}",
+    "abs": "{a}.abs()",
+    "sin": "{a}.sin()",
+    "cos": "{a}.cos()",
+    "exp": "{a}.exp()",
+    "log": "{a}.log()",
+    "sigmoid": "(V(1.0f) / (V(1.0f) + (-{a}).exp()))",
+    "sqrt": "{a}.sqrt()",
+    "square": "({a} * {a})",
+    "tanh": "{a}.tanh()",
+    "relu": "tensorplay::vec::maximum({a}, V(0.0f))",
+    "relu_grad": "{a}.gt(V(0.0f))",
+    "abs_grad": "({a}.gt(V(0.0f)) - {a}.lt(V(0.0f)))",
+    "rsqrt": "{a}.rsqrt()",
+    "exp2": "{a}.exp2()",
+    "erf": "{a}.erf()",
+}
+_BINARY_OPS = frozenset(_BINARY_EXPR) | frozenset(_COMPARE_EXPR) | frozenset(_ORDER_EXPR)
+_UNARY_OPS = frozenset(_UNARY_EXPR)
+
+# float32 identity is the only cast the float-domain kernel can express;
+# other targets keep the graph on the interpreter/Triton paths.
+_F32_CAST_ID = 3
+
+
+class _ProgramError(Exception):
+    """Raised when an instruction list cannot be rendered."""
+
+
+def _const_text(value: float) -> str:
+    text = f"{value:.17g}"
+    if not any(ch in text for ch in ".eE"):
+        text += ".0"
+    return f"V({text}f)"
+
+
+def _check_ref(
+    ref: int, constants: list[float], input_count: int, temp_count: int
+) -> None:
+    if ref >= 0:
+        if ref >= input_count + temp_count:
+            raise _ProgramError("reference beyond program surface")
+        return
+    index = -ref - 1
+    if index < 0 or index >= len(constants):
+        raise _ProgramError("constant reference out of range")
+
+
+def _analyze_instructions(
+    instructions: list[tuple[str, int, int, int]],
+    constants: list[float],
+    input_count: int,
+    output_ref: int | None = None,
+) -> set[int]:
+    """Validate the instruction list and return the referenced input set.
+
+    Ref layout matches the program encoding: ``0..input_count-1`` are
+    inputs, ``input_count + i`` is the result of instruction ``i``, and
+    negative refs index ``constants``.  ``where``/``where_rest`` must
+    appear as an adjacent pair sharing the condition ref.
+    """
+
+    if not instructions or input_count <= 0 or input_count > _MAX_INPUTS:
+        raise _ProgramError("degenerate program")
+    temp_count = len(instructions)
+    used: set[int] = set()
+    skip_where_rest = False
+    for i, (op, lhs, rhs, result) in enumerate(instructions):
+        if skip_where_rest:
+            if op != "where_rest" or result != input_count + i:
+                raise _ProgramError("where/where_rest pairing broken")
+            _check_ref(rhs, constants, input_count, temp_count)
+            if 0 <= rhs < input_count:
+                used.add(rhs)
+            skip_where_rest = False
+            continue
+        if result != input_count + i:
+            raise _ProgramError("instruction result refs must be sequential")
+        if op == "where":
+            if i + 1 >= temp_count:
+                raise _ProgramError("where without where_rest")
+            nxt = instructions[i + 1]
+            if nxt[0] != "where_rest" or nxt[1] != lhs:
+                raise _ProgramError("where/where_rest pairing broken")
+            _check_ref(lhs, constants, input_count, temp_count)
+            _check_ref(rhs, constants, input_count, temp_count)
+            used.update(ref for ref in (lhs, rhs) if 0 <= ref < input_count)
+            skip_where_rest = True
+            continue
+        if op == "where_rest":
+            raise _ProgramError("where_rest without where")
+        if op in _BINARY_OPS:
+            _check_ref(lhs, constants, input_count, temp_count)
+            _check_ref(rhs, constants, input_count, temp_count)
+            used.update(ref for ref in (lhs, rhs) if 0 <= ref < input_count)
+        elif op in _UNARY_OPS:
+            _check_ref(lhs, constants, input_count, temp_count)
+            if rhs != -1:
+                raise _ProgramError("unary op with rhs operand")
+            if 0 <= lhs < input_count:
+                used.add(lhs)
+        elif op == "cast":
+            _check_ref(lhs, constants, input_count, temp_count)
+            if rhs != _F32_CAST_ID:
+                raise _ProgramError("unsupported cast target")
+            if 0 <= lhs < input_count:
+                used.add(lhs)
+        else:
+            raise _ProgramError(f"unsupported op: {op}")
+    if output_ref is not None and 0 <= output_ref < input_count:
+        used.add(output_ref)
+    return used
+
+
+def _operand_expr(
+    ref: int,
+    constants: list[float],
+    input_count: int,
+    names: Callable[[int], str],
+) -> str:
+    if ref >= 0:
+        return names(ref)
+    index = -ref - 1
+    return _const_text(constants[index])
+
+
+def _expr_for(
+    op: str,
+    lhs: int,
+    rhs: int,
+    constants: list[float],
+    input_count: int,
+    names: Callable[[int], str],
+) -> str:
+    if op in _BINARY_OPS:
+        template = (
+            _BINARY_EXPR.get(op)
+            or _COMPARE_EXPR.get(op)
+            or _ORDER_EXPR.get(op)
+        )
+        return template.format(
+            a=_operand_expr(lhs, constants, input_count, names),
+            b=_operand_expr(rhs, constants, input_count, names),
+        )
+    if op in _UNARY_OPS:
+        return _UNARY_EXPR[op].format(
+            a=_operand_expr(lhs, constants, input_count, names)
+        )
+    if op == "cast":
+        return _operand_expr(lhs, constants, input_count, names)
+    raise _ProgramError(f"unsupported op: {op}")  # pragma: no cover
+
+
+def _emit_body(
+    instructions: list[tuple[str, int, int, int]],
+    constants: list[float],
+    input_count: int,
+    output_ref: int,
+    used_inputs: set[int],
+    indent: str,
+    *,
+    unrolled: bool,
+    partial: bool,
+) -> str:
+    """Emit one loop body for a given variable-naming scheme.
+
+    ``unrolled`` suffixes every variable with the unroll lane index and
+    loads/stores four vectors; ``partial`` switches loads/stores to the
+    partial-width ``count`` overloads (scalar tail).
+    """
+
+    def name(ref: int, lane: int = 0) -> str:
+        if ref < input_count:
+            base = f"x{ref}"
+        else:
+            base = f"t{ref - input_count}"
+        return f"{base}{lane}" if unrolled else base
+
+    count_expr = "count" if partial else "W"
+    lines: list[str] = []
+    used_temps = {
+        ref
+        for op, lhs, rhs, _ in instructions
+        for ref in ((lhs,) if (op in _UNARY_OPS or op == "cast") else (lhs, rhs))
+        if ref >= input_count
+    }
+
+    def emit_loads(lane: int, offset_expr: str) -> None:
+        for ref in sorted(used_inputs):
+            var = name(ref, lane)
+            lines.append(
+                f"{indent}V {var} = V::loadu(in{ref} + {offset_expr}, {count_expr});"
+            )
+
+    def emit_steps(lane: int) -> None:
+        pending_where: tuple[int, str] | None = None
+        for op, lhs, rhs, result in instructions:
+            if op == "where":
+                pending_where = (
+                    result,
+                    _operand_expr(
+                        rhs, constants, input_count, lambda r: name(r, lane)
+                    ),
+                )
+                continue
+            if op == "where_rest":
+                assert pending_where is not None
+                where_result, a_expr = pending_where
+                cond_expr = _operand_expr(
+                    lhs, constants, input_count, lambda r: name(r, lane)
+                )
+                b_expr = _operand_expr(
+                    rhs, constants, input_count, lambda r: name(r, lane)
+                )
+                lines.append(f"{indent}V {name(where_result, lane)} = {a_expr};")
+                lines.append(
+                    f"{indent}V {name(result, lane)} = V::blendv("
+                    f"{b_expr}, {a_expr}, ({cond_expr} > V(0.0f)));"
+                )
+                pending_where = None
+                continue
+            expr = _expr_for(
+                op, lhs, rhs, constants, input_count, lambda r: name(r, lane)
+            )
+            lines.append(f"{indent}V {name(result, lane)} = {expr};")
+        if pending_where is not None:  # pragma: no cover - guarded by analysis
+            raise _ProgramError("where without where_rest")
+
+    def emit_store(lane: int, offset_expr: str) -> None:
+        var = name(output_ref, lane)
+        lines.append(f"{indent}{var}.store(out + {offset_expr}, {count_expr});")
+
+    if unrolled:
+        for lane in range(4):
+            offset = "i" if lane == 0 else f"i + {lane} * W"
+            emit_loads(lane, offset)
+        for lane in range(4):
+            emit_steps(lane)
+        for lane in range(4):
+            offset = "i" if lane == 0 else f"i + {lane} * W"
+            emit_store(lane, offset)
+    else:
+        emit_loads(0, "i")
+        emit_steps(0)
+        emit_store(0, "i")
+    return "\n".join(lines)
+
+
+def render_kernel_source(
+    instructions: list[tuple[str, int, int, int]],
+    constants: list[float],
+    input_count: int,
+    output_ref: int,
+    entry: str,
+    *,
+    out_shape: tuple[int, ...] | None = None,
+    out_device: tuple[int, int] | None = None,
+) -> str:
+    """Render the full translation unit for one fused CPU kernel.
+
+    ``out_shape``/``out_device`` (DeviceType ordinal, device index) pin the
+    specialization; when both are given the unit also emits a METH_FASTCALL
+    runner that receives the input tensor list, extracts the data pointers
+    in C, allocates the output in C, calls the kernel, and wraps the result
+    — the steady-state call never re-enters Python.
+    """
+
+    used_inputs = _analyze_instructions(
+        instructions, constants, input_count, output_ref
+    )
+    if output_ref < 0 or output_ref >= input_count + len(instructions):
+        raise _ProgramError("output reference out of range")
+
+    const_decls = (
+        "\n".join(
+            f"    const V c{index} = {_const_text(value)};"
+            for index, value in enumerate(constants)
+        )
+        or "    (void)0;"
+    )
+
+    unrolled_body = ""
+    if len(instructions) <= _UNROLL_MAX_STEPS:
+        unrolled_body = _emit_body(
+            instructions,
+            constants,
+            input_count,
+            output_ref,
+            used_inputs,
+            "        ",
+            unrolled=True,
+            partial=False,
+        )
+    single_body = _emit_body(
+        instructions,
+        constants,
+        input_count,
+        output_ref,
+        used_inputs,
+        "        ",
+        unrolled=False,
+        partial=False,
+    )
+    tail_body = _emit_body(
+        instructions,
+        constants,
+        input_count,
+        output_ref,
+        used_inputs,
+        "        ",
+        unrolled=False,
+        partial=True,
+    )
+
+    input_params = ", ".join(
+        f"const float* __restrict__ in{i}" for i in range(input_count)
+    )
+    ctx_fields = "".join(f"    const float* in{i};\n" for i in range(input_count))
+    ctx_init = ", ".join(f"in{i}" for i in range(input_count)) + ", out"
+    ctx_loads = "".join(
+        f"    const float* __restrict__ in{i} = c->in{i};\n"
+        for i in range(input_count)
+    )
+
+    unrolled_loop = ""
+    if unrolled_body:
+        unrolled_loop = (
+            "    #pragma GCC ivdep\n"
+            "    for (; i + 4 * W <= e; i += 4 * W) {\n"
+            f"{unrolled_body}\n"
+            "    }\n"
+        )
+
+    # Worksharing policy, mirroring the parallel-depth decision of the
+    # in-tree CPU kernels: a region runs on the shared pool only when each
+    # thread would still receive at least one minimum chunk (otherwise the
+    # body runs inline, serially), and the chunk size is an even static
+    # split of the trip count.  ``min_chunk`` matches the in-tree kernel
+    # grain floor.
+    min_chunk = 512
+    threads = _pool_threads()
+    serial_cutoff = threads * min_chunk
+
+    entry_call_tail = ""
+    runner_section = ""
+    extra_includes = ""
+    if out_shape is not None and out_device is not None:
+        shape_init = ", ".join(f"{int(d)}LL" for d in out_shape)
+        dev_name, dev_index = out_device
+        ptr_args = "".join(f", in[{i}]" for i in range(input_count))
+        numel = 1
+        for d in out_shape:
+            numel *= int(d)
+        runner_section = (
+            "\n"
+            "static PyObject* tp_runner(PyObject*, PyObject* const* args, "
+            "Py_ssize_t nargs) {\n"
+            "    try {\n"
+            "        if (nargs != 1)\n"
+            "            throw std::runtime_error(\"runner expects the input list\");\n"
+            "        PyObject* inputs = args[0];\n"
+            f"        if (!PyList_CheckExact(inputs) ||\n"
+            f"            PyList_GET_SIZE(inputs) != {input_count})\n"
+            "            throw std::runtime_error(\"runner input list mismatch\");\n"
+            f"        const float* in[{input_count}];\n"
+            f"        for (long i = 0; i < {input_count}; ++i) {{\n"
+            "            in[i] = static_cast<const float*>(\n"
+            "                tensorplay::python_c::tpx_py_tensor_cref(\n"
+            "                    PyList_GET_ITEM(inputs, i)).data_ptr());\n"
+            "        }\n"
+            "        tensorplay::Tensor out = tensorplay::Tensor::empty(\n"
+            f"            std::vector<int64_t>{{{shape_init}}},\n"
+            "            tensorplay::ScalarType::Float32,\n"
+            f"            tensorplay::Device(tensorplay::DeviceType::{dev_name}, "
+            f"{int(dev_index)}LL), false);\n"
+            f"        {entry}({numel}LL{ptr_args}, out.data_ptr<float>());\n"
+            "        return tensorplay::python_c::tpx_py_wrap(out);\n"
+            "    } catch (const std::exception& e) {\n"
+            "        PyErr_SetString(PyExc_RuntimeError, e.what());\n"
+            "        return nullptr;\n"
+            "    } catch (...) {\n"
+            "        PyErr_SetString(PyExc_RuntimeError, \"unhandled kernel runner error\");\n"
+            "        return nullptr;\n"
+            "    }\n"
+            "}\n"
+            "\n"
+            "static PyMethodDef tp_runner_def = {\n"
+            "    \"runner\", (PyCFunction)(void (*)(void))tp_runner,\n"
+            "    METH_FASTCALL, nullptr};\n"
+            "\n"
+            'extern "C" PyObject* tp_make_runner(void) {\n'
+            "    return PyCFunction_New(&tp_runner_def, nullptr);\n"
+            "}\n"
+        )
+        extra_includes = (
+            "#include <Python.h>\n"
+            "#include <vector>\n"
+            "#include \"Tensor.h\"\n"
+            "\n"
+            "namespace tensorplay { namespace python_c {\n"
+            "const Tensor& tpx_py_tensor_cref(PyObject* obj);\n"
+            "PyObject* tpx_py_wrap(const Tensor& t);\n"
+            "}}  // namespace tensorplay::python_c\n"
+            "\n"
+        )
+
+    return (
+        '#include "cpu/vec/vec.h"\n'
+        "using V = tensorplay::vec::Vectorized<float>;\n"
+        "\n"
+        f"{extra_includes}"
+        "typedef void (*tp_parallel_body_c)(void* ctx, long long b, long long e);\n"
+        'extern "C" void tp_parallel_for_c('
+        "long long begin, long long end, long long grain, "
+        "tp_parallel_body_c body, void* ctx);\n"
+        "\n"
+        "typedef struct TP_Ctx {\n"
+        f"{ctx_fields}"
+        "    float* out;\n"
+        "} TP_Ctx;\n"
+        "\n"
+        "static void tp_body(void* ctxp, long long b, long long e) {\n"
+        "    const TP_Ctx* c = (const TP_Ctx*)ctxp;\n"
+        f"{ctx_loads}"
+        "    float* __restrict__ out = c->out;\n"
+        "    const long W = V::size();\n"
+        f"{const_decls}\n"
+        "    long i = b;\n"
+        f"{unrolled_loop}"
+        "    #pragma GCC ivdep\n"
+        "    for (; i + W <= e; i += W) {\n"
+        f"{single_body}\n"
+        "    }\n"
+        "    if (i < e) {\n"
+        "        const long count = e - i;\n"
+        f"{tail_body}\n"
+        "    }\n"
+        "}\n"
+        "\n"
+        f'extern "C" void {entry}(long n, {input_params}, float* __restrict__ out) {{\n'
+        f"    TP_Ctx ctx{{{ctx_init}}};\n"
+        f"    if (n < {serial_cutoff}LL) {{\n"
+        "        tp_body(&ctx, 0, n);\n"
+        "    } else {\n"
+        f"        tp_parallel_for_c(0, n, {min_chunk}LL, tp_body, &ctx);\n"
+        "    }\n"
+        "}\n"
+    )
+
+
+def _pool_threads() -> int:
+    """Intra-op pool size at codegen time (baked into the entry check)."""
+
+    try:
+        import tensorplay
+
+        threads = int(tensorplay.get_num_threads())
+    except Exception:
+        threads = 0
+    if threads < 1:
+        threads = (os.cpu_count() or 2) // 2
+    return max(1, threads)
+
+
+# ---------------------------------------------------------------------------
+# Compile + load
+# ---------------------------------------------------------------------------
+
+_LIBS_STATE: dict[str, dict[str, Any]] = {"libs": {}}
+
+
+def _kill_switch() -> bool:
+    return os.environ.get("TP_STAX_CPU_NATIVE", "") == "0"
+
+
+def _digest_entry_key(instructions, constants, input_count, output_ref, tier, version_info) -> str:
+    return hashlib.sha256(
+        repr(
+            (
+                tuple(instructions),
+                tuple(constants),
+                input_count,
+                output_ref,
+                tier,
+                version_info,
+            )
+        ).encode()
+    ).hexdigest()[:16]
+
+
+def build_cpu_native_kernel(
+    instructions: list[tuple[str, int, int, int]],
+    constants: list[float],
+    input_count: int,
+    output_ref: int | None = None,
+    *,
+    shape: Any = None,
+    device: Any = None,
+) -> Optional[Callable[[list[Any]], Any]]:
+    """Compile the program once and return ``run(inputs) -> Tensor``.
+
+    Returns ``None`` when the path is disabled, the development headers are
+    missing, the program cannot be rendered, or the build/load fails.
+
+    ``shape``/``device`` pin the specialization: the lowering route already
+    verified every input against them, so with both present the unit emits
+    a METH_FASTCALL runner that keeps the steady-state call entirely in C
+    (pointer extraction, output allocation, result wrapping), mirroring the
+    binding pattern of the in-tree kernel loader.
+    """
+
+    if _kill_switch():
+        return None
+    if output_ref is None:
+        output_ref = input_count + len(instructions) - 1
+    try:
+        _analyze_instructions(instructions, constants, input_count, output_ref)
+    except _ProgramError:
+        return None
+    paths = package_paths()
+    if paths is None:
+        return None
+    compiler = get_cpp_compiler()
+    if not compiler:
+        return None
+    include_dir, generated_include_dir, lib_dir = paths
+
+    isa: VecISA = pick_vec_isa(paths)
+    if not isa:
+        return None
+
+    version_info = get_compiler_version_info(compiler)
+
+    pinned_shape: tuple[int, ...] | None = None
+    out_device_code: tuple[int, int] | None = None
+    if shape is not None:
+        try:
+            pinned_shape = tuple(int(item) for item in shape)
+        except (TypeError, ValueError):
+            pinned_shape = None
+    if pinned_shape is not None and device is not None:
+        device_ordinals = {"cpu": 0, "cuda": 1}
+        try:
+            out_device_code = (
+                device_ordinals[str(device.type)],
+                int(device.index) if device.index is not None else -1,
+            )
+        except (KeyError, TypeError, ValueError, AttributeError):
+            out_device_code = None
+    if out_device_code is None:
+        pinned_shape = None
+
+    entry = f"tp_native_{digest_entry_key(instructions, constants, input_count, output_ref, isa.name, version_info)}"
+    source = render_kernel_source(
+        instructions,
+        constants,
+        input_count,
+        output_ref,
+        entry,
+        out_shape=pinned_shape,
+        out_device=out_device_code,
+    )
+    pinned = pinned_shape is not None and out_device_code is not None
+
+    cache = default_cache("stax-cpu-native")
+    key_options = {
+        "tier": isa.name,
+        "flags": " ".join(isa.build_arch_flags()),
+        "ver": version_info[:32],
+        "entry": entry,
+        "bind": "runner-v1" if pinned else "py",
+    }
+    key = cache.cache_key(source, entry, key_options)
+    source_path = cache.path_for(key, "cpp")
+    output_path = cache.path_for(key, "so")
+
+    if not os.path.exists(output_path):
+        try:
+            import sysconfig
+
+            python_include = sysconfig.get_paths()["include"]
+            os.makedirs(os.path.dirname(source_path), exist_ok=True)
+            with file_lock(output_path + ".lock"):
+                if not os.path.exists(output_path):
+                    with open(source_path, "w") as fh:
+                        fh.write(source)
+                    options = CppOptions(
+                        compiler=compiler,
+                        definitions=isa.definitions(),
+                        include_dirs=[
+                            include_dir,
+                            generated_include_dir,
+                            python_include,
+                        ],
+                        cflags=[
+                            "-std=c++20",
+                            "-O3",
+                            "-fno-math-errno",
+                            "-fPIC",
+                            "-shared",
+                            *isa.build_arch_flags(),
+                        ],
+                        library_dirs=[lib_dir],
+                        libraries=["p10", "tp_python"] if pinned else ["p10"],
+                        ldflags=[f"-Wl,-rpath,{lib_dir}"],
+                    )
+                    builder = CppBuilder(
+                        name=os.path.basename(output_path),
+                        sources=[source_path],
+                        options=options,
+                        output_dir=os.path.dirname(source_path),
+                    )
+                    # Transient toolchain failures (fork/OOM pressure under
+                    # heavy load) get one retry before the region demotes to
+                    # the interpreter path.
+                    builder.build()
+        except Exception:
+            if not os.path.exists(output_path):
+                return None
+
+    libs = _LIBS_STATE.setdefault("libs", {})
+    lib = libs.get(output_path)
+    if lib is None:
+        try:
+            lib = ctypes.CDLL(output_path)
+        except Exception:
+            return None
+        libs[output_path] = lib
+    fn = getattr(lib, entry, None)
+    if fn is None:
+        return None
+    fn.restype = None
+    fn.argtypes = (
+        [ctypes.c_long] + [ctypes.c_void_p] * input_count + [ctypes.c_void_p]
+    )
+
+    import tensorplay
+
+    if pinned:
+        # The generated unit carries a METH_FASTCALL runner: it receives the
+        # input tensor list, extracts the data pointers in C, allocates the
+        # output in C, and wraps the result — the steady-state call never
+        # re-enters Python.
+        make_runner = getattr(lib, "tp_make_runner", None)
+        if make_runner is not None:
+            make_runner.restype = ctypes.py_object
+            make_runner.argtypes = []
+            try:
+                return make_runner()
+            except Exception:
+                return None
+
+    if pinned_shape is None:
+        # Unpinned builds keep the runtime shape read; the route check
+        # still guarantees all inputs match, so reading input 0 once per
+        # call is faithful.
+        def run(inputs: list[Any]) -> Any:
+            out = tensorplay.empty(
+                tuple(int(item) for item in inputs[0].shape),
+                dtype=tensorplay.float32,
+                device=inputs[0].device,
+            )
+            fn(
+                inputs[0].numel(),
+                *[t.data_ptr() for t in inputs],
+                out.data_ptr(),
+            )
+            return out
+
+        return run
+
+    empty = tensorplay.empty
+    f32 = tensorplay.float32
+    numel = 1
+    for item in pinned_shape:
+        numel *= item
+    pinned_device = device
+
+    def run(inputs: list[Any]) -> Any:
+        out = empty(
+            pinned_shape,
+            dtype=f32,
+            device=pinned_device,
+        )
+        fn(
+            numel,
+            *[t.data_ptr() for t in inputs],
+            out.data_ptr(),
+        )
+        return out
+
+    return run

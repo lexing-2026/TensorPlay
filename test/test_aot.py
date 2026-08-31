@@ -5,8 +5,8 @@ import operator
 import pytest
 
 import tensorplay as tp
-from tensorplay.compiler import AOTError, build_aot
-from tensorplay.compiler.graph import Tracer
+from tensorplay._stax import AOTError, build_aot
+from tensorplay.graph import Tracer
 
 
 def _make(fn, sample):

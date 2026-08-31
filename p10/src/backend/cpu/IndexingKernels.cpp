@@ -161,16 +161,32 @@ Tensor triu_cpu(const Tensor& self, int64_t diagonal) {
 // ---------------------------------------------------------------------------
 // cumsum / cumprod / logcumsumexp
 //
-// :99 cumprod_cpu_kernel / :118 logcumsumexp_cpu_kernel. All three share
-// cpu_cum_base_kernel's structure: outer_size x inner_stride independent
-// slices scanned sequentially along `dim` with acc_type accumulation.
+// Each operation scans independent outer*inner slices sequentially along
+// `dim`, using an operation-specific accumulator type.
 // ---------------------------------------------------------------------------
 
 template <typename ctype, typename acc_t, typename Op>
 inline void cum_base(ctype* d, const ctype* s, int64_t d_size, int64_t outer,
                      int64_t inner, ctype init_val, Op op) {
-    // ReduceOpsKernel.cpp cpu_cum_base_kernel loop nest
-    parallel_for(0, outer * inner, GRAIN_SIZE, [&](int64_t b, int64_t e) {
+    // Independent outer*inner slices, each scanned sequentially along `dim`.
+    // The grain is expressed in slices scaled by per-slice work so short
+    // slices still fill the thread pool.
+    const int64_t slice_grain = std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(d_size, 1));
+    if (inner == 1) {
+        parallel_for(0, outer, slice_grain, [&](int64_t b, int64_t e) {
+            for (int64_t o = b; o < e; ++o) {
+                const ctype* sp = s + o * d_size;
+                ctype* dp = d + o * d_size;
+                acc_t acc = static_cast<acc_t>(init_val);
+                for (int64_t j = 0; j < d_size; ++j) {
+                    acc = op(acc, static_cast<acc_t>(sp[j]));
+                    dp[j] = static_cast<ctype>(acc);
+                }
+            }
+        });
+        return;
+    }
+    parallel_for(0, outer * inner, slice_grain, [&](int64_t b, int64_t e) {
         for (int64_t si = b; si < e; ++si) {
             int64_t o = si / inner, in2 = si % inner;
             acc_t acc = static_cast<acc_t>(init_val);
@@ -185,7 +201,6 @@ inline void cum_base(ctype* d, const ctype* s, int64_t d_size, int64_t outer,
 }
 
 Tensor cumsum_cpu(const Tensor& self, int64_t dim, std::optional<DType> dtype) {
-    // ReduceOpsKernel.cpp:80
     int64_t nd = self.dim();
     if (nd == 0) TP_THROW(RuntimeError, "cumsum: dimension not supported for scalar tensors");
     dim = wrap_dim(dim, nd);
@@ -225,7 +240,6 @@ Tensor cumsum_cpu(const Tensor& self, int64_t dim, std::optional<DType> dtype) {
 }
 
 Tensor cumprod_cpu(const Tensor& self, int64_t dim, std::optional<DType> dtype) {
-    // ReduceOpsKernel.cpp:99
     int64_t nd = self.dim();
     if (nd == 0) TP_THROW(RuntimeError, "cumprod: dimension not supported for scalar tensors");
     dim = wrap_dim(dim, nd);
@@ -831,8 +845,34 @@ Tensor nonzero_cpu(const Tensor& self) {
 // ---------------------------------------------------------------------------
 // sort / argsort
 //
-// stable sort along dim that also carries the original positions.
+// Sort along dim while carrying original positions.  NaN ordering follows
+// the framework-wide convention: NaN sorts after every non-NaN value in
+// ascending order (and before them in descending order); ties keep their
+// original relative order.  The (value, index) lexicographic comparator is a
+// strict weak ordering even with NaN lanes, so plain std::sort is both
+// well-defined and deterministic.
 // ---------------------------------------------------------------------------
+
+namespace {
+
+template <typename ctype>
+struct SortPairLess {
+    bool descending;
+    explicit SortPairLess(bool desc) : descending(desc) {}
+    // returns true when pair a must come before pair b
+    bool operator()(const std::pair<ctype, int64_t>& a, const std::pair<ctype, int64_t>& b) const {
+        constexpr bool is_float = std::is_floating_point_v<ctype>;
+        if constexpr (is_float) {
+            const bool na = std::isnan(a.first), nb = std::isnan(b.first);
+            if (na != nb) return descending ? na : nb;  // NaN sinks in ascending
+            if (na) return a.second < b.second;         // stable among NaNs
+        }
+        if (a.first != b.first) return descending ? (b.first < a.first) : (a.first < b.first);
+        return a.second < b.second;  // stable among equal values
+    }
+};
+
+}  // namespace
 
 std::tuple<Tensor, Tensor> sort_cpu(const Tensor& self, int64_t dim, bool descending) {
     int64_t nd = self.dim();
@@ -850,14 +890,15 @@ std::tuple<Tensor, Tensor> sort_cpu(const Tensor& self, int64_t dim, bool descen
         const ctype* s = self_c.data_ptr<ctype>(); \
         ctype* vp = values.data_ptr<ctype>(); \
         int64_t* ip = indices.data_ptr<int64_t>(); \
-        parallel_for(0, outer * inner, GRAIN_SIZE, [&](int64_t b, int64_t e) { \
+        const SortPairLess<ctype> less(descending); \
+        const int64_t slice_grain = std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(d_size, 1)); \
+        parallel_for(0, outer * inner, slice_grain, [&](int64_t b, int64_t e) { \
             std::vector<std::pair<ctype, int64_t>> buf(static_cast<size_t>(d_size)); \
             for (int64_t si = b; si < e; ++si) { \
                 int64_t o = si / inner, in2 = si % inner; \
                 const ctype* base = s + o * d_size * inner + in2; \
                 for (int64_t j = 0; j < d_size; ++j) buf[j] = {base[j * inner], j}; \
-                if (descending) std::stable_sort(buf.begin(), buf.end(), [](const std::pair<ctype,int64_t>& a, const std::pair<ctype,int64_t>& bb){ return a.first > bb.first; }); \
-                else std::stable_sort(buf.begin(), buf.end(), [](const std::pair<ctype,int64_t>& a, const std::pair<ctype,int64_t>& bb){ return a.first < bb.first; }); \
+                std::sort(buf.begin(), buf.end(), less); \
                 ctype* vbase = vp + o * d_size * inner + in2; \
                 int64_t* ibase = ip + o * d_size * inner + in2; \
                 for (int64_t j = 0; j < d_size; ++j) { vbase[j * inner] = buf[j].first; ibase[j * inner] = buf[j].second; } \
@@ -874,7 +915,8 @@ std::tuple<Tensor, Tensor> sort_cpu(const Tensor& self, int64_t dim, bool descen
 }
 
 Tensor argsort_cpu(const Tensor& self, int64_t dim, bool descending) {
-    // Sorting.cpp sort_indices: indices-only variant of sort.
+    // Indices-only variant of sort; values are materialized as well and the
+    // values tensor is dropped.
     return std::get<1>(sort_cpu(self, dim, descending));
 }
 

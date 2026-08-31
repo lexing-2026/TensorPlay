@@ -6,6 +6,8 @@ never re-derive C++ signatures from raw strings.
 
 from __future__ import annotations
 
+import ast
+import json
 import re
 
 from .model import Argument, NativeFunction, Type, make_type
@@ -64,6 +66,8 @@ _RAW_ATOMIC = {
 
 def p10_ctype(t: Type):
     atom = BaseCType(_RAW_ATOMIC[t.kind])
+    if t.list_elem_opt:
+        atom = StdOptionalCType(atom)
     if t.is_list and t.is_opt:
         # ``int[]?`` composes optional over the vector type.
         return StdOptionalCType(StdVectorCType(atom))
@@ -117,6 +121,22 @@ def cpp_arg_type(t: Type) -> str:
     return ct.cpp_type()
 
 
+def _cpp_value_type(t: Type) -> str:
+    if t.is_tensor_like:
+        if t.is_list:
+            elem = "std::optional<Tensor>" if t.list_elem_opt else "Tensor"
+            value = f"std::vector<{elem}>"
+        else:
+            value = "Tensor"
+    elif t.is_list:
+        atom = _CPP_ARG_TYPES.get(t.kind, t.kind)
+        elem = f"std::optional<{atom}>" if t.list_elem_opt else atom
+        value = f"std::vector<{elem}>"
+    else:
+        value = _CPP_ARG_TYPES.get(t.kind, t.kind)
+    return f"std::optional<{value}>" if t.is_opt else value
+
+
 def cpp_return_type(f: NativeFunction) -> str:
     kind = f.cpp_return_kind
     if kind == "void":
@@ -124,33 +144,18 @@ def cpp_return_type(f: NativeFunction) -> str:
     if kind == "mut_ref":
         return "Tensor&"
     if kind == "list":
-        return "std::vector<Tensor>"
+        return _cpp_value_type(f.returns[0].type)
     if kind == "tuple":
-        parts = []
-        for r in f.returns:
-            rt = r.type
-            if rt.is_tensor_like and not rt.is_list:
-                parts.append("Tensor")
-            elif rt.is_list:
-                parts.append(f"std::vector<{rt.kind}>")
-            else:
-                parts.append(_CPP_ARG_TYPES.get(rt.kind, rt.kind))
+        parts = [_cpp_value_type(r.type) for r in f.returns]
         return f"std::tuple<{', '.join(parts)}>"
-    r = f.returns[0]
-    if r.type.is_tensor_like:
-        return "Tensor"
-    return _CPP_ARG_TYPES.get(r.type.kind, r.type.kind)
+    return _cpp_value_type(f.returns[0].type)
 
 
 def tuple_element_cpp_types(f: NativeFunction) -> list[str]:
     assert f.cpp_return_kind == "tuple"
     out = []
     for r in f.returns:
-        rt = r.type
-        if rt.is_tensor_like:
-            out.append("std::vector<Tensor>" if rt.is_list else "Tensor")
-        else:
-            out.append(_CPP_ARG_TYPES.get(rt.kind, rt.kind))
+        out.append(_cpp_value_type(r.type))
     return out
 
 
@@ -169,12 +174,15 @@ def stub_arg_type(t: Type) -> str:
         if t.is_mutable_ref:
             return "Tensor&"
         if t.is_opt:
-            return "std::optional<Tensor>"
+            return f"std::optional<{_cpp_value_type(make_type(t.kind, t.is_list, False, None, t.symint, t.list_elem_opt))}>"
         if t.is_list:
-            return ("std::vector<Tensor>" if t.mutability
-                    else "const std::vector<Tensor>&")
+            elem = "std::optional<Tensor>" if t.list_elem_opt else "Tensor"
+            vector = f"std::vector<{elem}>"
+            return vector if t.mutability else f"const {vector}&"
         return "const Tensor&"
     atom = BaseCType(_RAW_ATOMIC[t.kind])
+    if t.list_elem_opt:
+        atom = StdOptionalCType(atom)
     if t.is_list:
         vec = StdVectorCType(atom)
         return f"const {vec.cpp_type()}&" if not t.is_opt \
@@ -191,13 +199,16 @@ def stub_arg_type(t: Type) -> str:
 def node_member_type(t: Type) -> str:
     """Saved-variable member type: always owned by value."""
     if t.is_tensor_like:
+        if t.is_list:
+            elem = "std::optional<Tensor>" if t.list_elem_opt else "Tensor"
+            value = f"std::vector<{elem}>"
+            return f"std::optional<{value}>" if t.is_opt else value
         if t.is_opt:
             return "std::optional<Tensor>"
-        if t.is_list:
-            return "std::vector<Tensor>"
         return "Tensor"
     if t.is_list:
-        vec = f"std::vector<{t.kind}>"
+        elem = f"std::optional<{t.kind}>" if t.list_elem_opt else t.kind
+        vec = f"std::vector<{elem}>"
         return f"std::optional<{vec}>" if t.is_opt else vec
     base = _CPP_ARG_TYPES.get(t.kind, t.kind)
     return f"std::optional<{base}>" if t.is_opt else base
@@ -213,6 +224,8 @@ def node_member_type(t: Type) -> str:
 _MEMORY_FORMAT_VALUES = {"Contiguous": 0, "Preserve": 1,
                          "ChannelsLast": 2, "ChannelsLast3d": 3}
 
+_REDUCTION_VALUES = {"None": 0, "Mean": 1, "Sum": 2}
+
 # analog): tensorplay exposes these as IntEnum members, which ARE their
 # integer ABI values.
 _MEMORY_FORMAT_PY = {
@@ -226,14 +239,37 @@ _MEMORY_FORMAT_PY = {
 def _memory_format_name(default: str) -> str | None:
     """Accept both bare and enum-qualified yaml spellings."""
     name = default.split("::")[-1].strip()
+    aliases = {
+        "contiguous_format": "Contiguous",
+        "preserve_format": "Preserve",
+        "channels_last": "ChannelsLast",
+        "channels_last_3d": "ChannelsLast3d",
+    }
+    name = aliases.get(name, name)
     return name if name in _MEMORY_FORMAT_VALUES else None
+
+
+def _string_value(default: str) -> str:
+    value = ast.literal_eval(default)
+    if not isinstance(value, str):
+        raise ValueError(f"string schema default is not a string: {default}")
+    return value
+
+
+def _cpp_string_default(default: str) -> str:
+    return json.dumps(_string_value(default), ensure_ascii=False)
 
 
 def cpp_default(t: Type, default: str) -> str:
     d = default
+    if t.kind == "int64_t" and not t.is_list and not t.is_opt and d in _REDUCTION_VALUES:
+        return str(_REDUCTION_VALUES[d])
     if d == "Float32":
         return "DType::Float32"
     if d == "Int64":
+        return "DType::Int64"
+    if d == "long":
+        # Schema shorthand for the 64-bit integer dtype.
         return "DType::Int64"
     if d == "Undefined":
         return "DType::Undefined"
@@ -245,6 +281,8 @@ def cpp_default(t: Type, default: str) -> str:
         return "true"
     if d == "false":
         return "false"
+    if t.kind == "str":
+        return _cpp_string_default(d)
     if t.kind == "MemoryFormat":
         # MemoryFormat rides the dispatcher as its integer value, and the
         # rendered C++ parameter type is int64_t.
@@ -276,6 +314,7 @@ _PYI_DEFAULT_MAP = {
     "DType::Int64": "DType.int64",
     "Undefined": "DType.undefined",
     "DType::Undefined": "DType.undefined",
+    "long": "DType.int64",
     "CPU": "...",
     "Device(DeviceType::CPU)": "...",
     "None": "None",
@@ -286,11 +325,15 @@ _PYI_DEFAULT_MAP = {
 
 
 def pyi_default(t: Type, default: str) -> str:
+    if t.kind == "int64_t" and not t.is_list and not t.is_opt and default in _REDUCTION_VALUES:
+        return str(_REDUCTION_VALUES[default])
     if t.kind == "MemoryFormat":
         # Bare `Contiguous` would be an undefined name in generated Python;
         name = _memory_format_name(default)
         if name is not None:
             return _MEMORY_FORMAT_PY[name]
+    if t.kind == "str" and default != "None":
+        return repr(_string_value(default))
     d = _PYI_DEFAULT_MAP.get(default, default)
     if t.is_tensor_like and d == "{}":
         return "None"
@@ -302,6 +345,8 @@ def pyi_default(t: Type, default: str) -> str:
 def binding_default(t: Type, default: str) -> str:
     """Default expression inside a pybind11 def()."""
     d = default
+    if t.kind == "int64_t" and not t.is_list and not t.is_opt and d in _REDUCTION_VALUES:
+        return str(_REDUCTION_VALUES[d])
     if d == "CPU":
         return "Device(DeviceType::CPU)"
     if d == "Undefined":
@@ -312,6 +357,11 @@ def binding_default(t: Type, default: str) -> str:
         return "DType::Float32"
     if d == "Int64":
         return "DType::Int64"
+    if d == "long":
+        # Schema shorthand for the 64-bit integer dtype.
+        return "DType::Int64"
+    if t.kind == "str":
+        return _cpp_string_default(d)
     if d.startswith("{") or d.startswith("["):
         inner = d[1:-1].strip()
         if t.is_tensor_like:
@@ -345,11 +395,11 @@ def pyi_type(t: Type) -> str:
     else:
         base = _PYI_TYPES.get(t.kind, t.kind)
     if t.is_list:
-        base = {
-            "TensorBase": "Sequence[TensorBase]",
-            "int": "Sequence[int]",
-            "Scalar": "Sequence[Scalar]",
-        }.get(base, f"Sequence[{base}]")
+        if base == "TensorBase" and not t.list_elem_opt:
+            base = "Sequence[TensorBase]"
+        else:
+            elem = f"{base} | None" if t.list_elem_opt else base
+            base = f"Sequence[{elem}]"
     if t.is_opt:
         base += " | None"
     return base

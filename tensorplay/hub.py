@@ -335,7 +335,7 @@ class torch_hub_alias:
         import tensorplay.nn
 
         hub_shim = ModuleType("tensorplay.hub.shim")
-        hub_shim.        hub_shim.download_url_to_file = download_url_to_file
+        hub_shim.download_url_to_file = download_url_to_file
         hub_shim.get_dir = get_dir
         hub_shim.set_dir = set_dir
         hub_shim._get_torch_home = lambda: str(get_dir())
@@ -344,8 +344,7 @@ class torch_hub_alias:
         from tensorplay.utils import checkpoint as _cp  # noqa: F401
         utils_shim.checkpoint = _cp
 
-        jit_mod = _import_optional("tensorplay.jit")
-        fx_mod = _import_optional("tensorplay.fx")
+        graph_mod = _import_optional("tensorplay.graph")
 
         return {
             "torch": tensorplay,
@@ -356,8 +355,7 @@ class torch_hub_alias:
             "torch.hub": hub_shim,
             "torch.utils": utils_shim,
             "torch.utils.checkpoint": _cp,
-            "torch.jit": jit_mod,
-            "torch.fx": fx_mod,
+            "torch.fx": graph_mod,
             "torchvision": _import_optional("tensorplay.vision"),
             "torchvision.models": _import_optional("tensorplay.vision.models"),
             "torchvision.transforms": _import_optional("tensorplay.vision.transforms"),

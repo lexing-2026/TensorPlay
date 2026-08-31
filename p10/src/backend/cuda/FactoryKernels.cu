@@ -114,13 +114,25 @@ Tensor full_like_kernel(const Tensor& self, Scalar fill_value, DType dtype, std:
     return fill_kernel(t, fill_value);
 }
 
+namespace {
+
+DType infer_full_dtype(const Scalar& fill_value) {
+    if (fill_value.isBoolean()) return DType::Bool;
+    if (fill_value.isIntegral(false)) return DType::Int64;
+    if (fill_value.isComplex()) {
+        return globalContext().defaultDType() == DType::Float64
+                   ? DType::ComplexDouble
+                   : DType::ComplexFloat;
+    }
+    return globalContext().defaultDType();
+}
+
+} // namespace
+
 Tensor full_kernel(const std::vector<int64_t>& size, Scalar fill_value, DType dtype, Device device, bool pin_memory) {
     if (pin_memory) TP_THROW(RuntimeError, "pin_memory is only valid for CPU tensors");
     if (dtype == DType::Undefined) {
-        if (fill_value.isFloatingPoint()) dtype = globalContext().defaultDType();
-        else if (fill_value.isIntegral()) dtype = DType::Int64;
-        else if (fill_value.isBoolean()) dtype = DType::Bool;
-        else dtype = globalContext().defaultDType();
+        dtype = infer_full_dtype(fill_value);
     }
     Tensor t(size, dtype, device);
     fill_kernel(t, fill_value);

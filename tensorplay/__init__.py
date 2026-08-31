@@ -347,9 +347,6 @@ __all__.extend([
 # Please keep this list sorted
 # assert __all__ == sorted(__all__)
 
-# The tensorplay._C submodule is already loaded above; import multiprocessing
-from . import multiprocessing
-
 import functools
 
 from ._C import (
@@ -409,9 +406,11 @@ for __attr_name in dir(_C):
                              return wrapper
                          
                          wrapper = make_wrapper(__obj)
-                         # Overwrite in globals if it exists (imported from _C)
+                         # Overwrite a name already installed by the native binding.
                          if __attr_name in globals():
                              globals()[__attr_name] = wrapper
+            if __attr_name not in globals():
+                globals()[__attr_name] = __obj
 
     elif __attr_name == "TensorBase":
         if hasattr(sys.modules[__name__], __attr_name):
@@ -465,8 +464,9 @@ from ._einsum import einsum
 from .utils.comparison import allclose
 
 from ._ops import ops as ops
+from . import _stax
+from ._stax import compile
 from . import compiler
-from .compiler import compile
 from . import library
 from . import profiler
 
@@ -474,6 +474,10 @@ from . import profiler
 # Submodules
 # -------------------------------------------------------------------------
 from . import cuda
+# Imported after the op names, nn, and cuda are bound: the multiprocessing
+# reducers pull in tensorplay.primitives (via nn) which references eager op
+# names, so this must not run during partial initialization.
+from . import multiprocessing
 from . import stax
 from . import backends
 # Import nn before optim because optim.swa_utils pulls in tensorplay.nn,
@@ -972,8 +976,6 @@ from ._composite_funcs import quantile as quantile
 from ._composite_funcs import nanquantile as nanquantile
 from ._composite_funcs import histogram as histogram
 from ._finfo import finfo, iinfo
-from . import jit
-
 # Python's ``import *`` intentionally omits underscore-prefixed names, but
 # only generated ``_foreach_*`` wrappers; their implementation is still the
 # native dispatcher/backend and this block does not introduce a Python
@@ -1078,12 +1080,14 @@ if TYPE_CHECKING:
     # imported in user code.
     from tensorplay import (
         export as export,
+        func as func,
     )
 
 else:
     _lazy_modules = {
         "audio",
         "export",
+        "func",
         "fft",
         "linalg",
         "quantization",

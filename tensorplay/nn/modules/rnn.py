@@ -35,15 +35,6 @@ def _apply_permutation(tensor: Tensor, permutation: Tensor, dim: int = 1) -> Ten
     return tensor.index_select(dim, permutation)
 
 
-def apply_permutation(tensor: Tensor, permutation: Tensor, dim: int = 1) -> Tensor:
-    warnings.warn(
-        "`apply_permutation` is deprecated, please use `tensor.index_select(dim, permutation)` instead",
-        category=FutureWarning,
-        stacklevel=2,
-    )
-    return _apply_permutation(tensor, permutation, dim)
-
-
 # ---------------------------------------------------------------------------
 #
 #   cell(input, hidden, params, pre_compute_input=False) -> hidden

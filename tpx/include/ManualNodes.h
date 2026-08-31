@@ -3,6 +3,8 @@
 #include "Autograd.h"
 #include "SavedVariable.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
+#include <optional>
+#include <string>
 #include <tuple>
 #include <utility>
 #include <algorithm>
@@ -94,19 +96,28 @@ inline Tensor sum_to(Tensor tensor, const std::vector<int64_t>& shape) {
     }
 
     if (!reduce_dims.empty())
-        tensor = tensor.sum(reduce_dims, /*keepdim=*/true);
+        tensor = ops::sum(tensor, reduce_dims, /*keepdim=*/true);
 
-    return leading_dims > 0 ? tensor.view(shape) : tensor;
+    return leading_dims > 0 ? ops::view(tensor, shape) : tensor;
 }
 
-// expandability check + sum_to.
-inline Tensor sum_to_size(const Tensor& self, const std::vector<int64_t>& size) {
-    TP_CHECK(
-        is_expandable_to(size, static_cast<std::vector<int64_t>>(self.shape())),
-        "size ", Size(size).toString(), " is not expandable to size ",
-        self.shape().toString(), ".");
-
-    return sum_to(self, size);
+// Bagged-embedding per-sample-weight gradient.
+//
+// Only the sum reduction accepts per_sample_weights, so in the other modes the
+// slot has no consumer: leaving it undefined skips a full [len(indices), D]
+// reduction the engine would immediately discard.
+inline Tensor embedding_bag_psw_backward(
+        const Tensor& grad, const Tensor& weight, const Tensor& indices,
+        const Tensor& offsets, const Tensor& offset2bag,
+        const std::optional<Tensor>& per_sample_weights, int64_t mode,
+        int64_t padding_idx) {
+    constexpr int64_t kBagSum = 0;
+    if (mode != kBagSum || !per_sample_weights.has_value() ||
+        !per_sample_weights->defined()) {
+        return Tensor();
+    }
+    return ops::_embedding_bag_per_sample_weights_backward(
+        grad, weight, indices, offsets, offset2bag, mode, padding_idx);
 }
 
 // Scalar multiplier helper for autograd formulas.
@@ -307,6 +318,78 @@ struct AsStridedBackward : public Node {
     }
 };
 
+struct CopySlices : public Node {
+    Tensor base_;
+    std::vector<int64_t> view_size_;
+    std::vector<int64_t> view_stride_;
+    int64_t view_storage_offset_ = 0;
+    std::function<Tensor(const Tensor&)> view_fn_;
+    std::shared_ptr<Node> fn_;
+
+    CopySlices(
+        Tensor base,
+        const Tensor& view,
+        std::function<Tensor(const Tensor&)> view_fn,
+        std::shared_ptr<Node> fn)
+        : base_(std::move(base)),
+          view_size_(static_cast<std::vector<int64_t>>(view.shape())),
+          view_stride_(view.strides()),
+          view_storage_offset_(static_cast<int64_t>(
+              view.unsafeGetTensorImpl()->storage_offset())),
+          view_fn_(std::move(view_fn)),
+          fn_(std::move(fn)) {
+        TP_CHECK(fn_ != nullptr, "CopySlices requires an inner backward node");
+        add_next_edge_list(collect_next_edges(base_));
+        const auto& inner_edges = fn_->next_edges();
+        for (size_t i = 1; i < inner_edges.size(); ++i) {
+            add_next_edge(inner_edges[i]);
+        }
+    }
+
+    variable_list apply(variable_list&& inputs) override {
+        if (inputs.empty() || !inputs[0].defined()) {
+            return variable_list(next_edges_.size());
+        }
+        TP_CHECK(fn_ != nullptr, "backward graph has already been released");
+
+        const Tensor& grad = inputs[0];
+        const auto base_size = static_cast<std::vector<int64_t>>(base_.shape());
+        const auto base_stride = base_.strides();
+        Tensor result = ops::empty_strided(
+            base_size, base_stride, base_.dtype(), base_.device(), false);
+        result.copy_(grad);
+
+        Tensor grad_slice;
+        if (view_fn_) {
+            grad_slice = view_fn_(result);
+        } else {
+            const int64_t base_offset = static_cast<int64_t>(
+                base_.unsafeGetTensorImpl()->storage_offset());
+            const int64_t relative_offset = view_storage_offset_ - base_offset;
+            grad_slice = result.as_strided(
+                view_size_, view_stride_, relative_offset);
+        }
+        Tensor grad_slice_clone = grad_slice.clone();
+        variable_list inner = fn_->apply({std::move(grad_slice_clone)});
+
+        variable_list outputs(next_edges_.size());
+        if (!inner.empty() && inner[0].defined()) {
+            grad_slice.copy_(inner[0]);
+            outputs[0] = std::move(result);
+        }
+        for (size_t i = 1; i < outputs.size() && i < inner.size(); ++i) {
+            outputs[i] = std::move(inner[i]);
+        }
+        return outputs;
+    }
+
+    void release_variables() override {
+        Node::release_variables();
+        fn_.reset();
+        base_ = Tensor();
+    }
+};
+
 // NOTE(history): a hand-written ScaledDotProductAttentionBackward used to live
 // here but was never instantiated -- the generated autograd node (from
 // derivatives.yaml) is authoritative and avoids the double bookkeeping.
@@ -438,7 +521,7 @@ struct CatBackward : public Node {
         for (const auto& saved : tensors_) {
             const Tensor tensor = saved.unpack();
             const int64_t size = tensor.size(dim);
-            grads.push_back(grad.slice(dim, offset, offset + size));
+            grads.push_back(ops::slice(grad, dim, offset, offset + size, 1));
             offset += size;
         }
         return grads;
@@ -578,7 +661,7 @@ struct StackBackward : public Node {
         variable_list grads;
         grads.reserve(tensors_.size());
         for (size_t i = 0; i < tensors_.size(); ++i) {
-            grads.push_back(grad.select(dim, static_cast<int64_t>(i)));
+            grads.push_back(ops::select(grad, dim, static_cast<int64_t>(i)));
         }
         return grads;
     }
@@ -646,6 +729,33 @@ inline Tensor div_tensor_other_backward(const Tensor& grad,
                                         const Tensor& other) {
     return handle_r_to_c(
         other.dtype(), -(grad * ops::conj(self / other / other)));
+}
+
+// Rounded division is locally constant, so its gradient vanishes; only the
+// unrounded form carries the quotient rule through.
+template <typename T>
+inline Tensor div_tensor_self_backward(const Tensor& grad, const T& other,
+                                       DType self_st,
+                                       const std::optional<std::string>& rounding_mode) {
+    if (rounding_mode.has_value()) return ops::zeros_like(grad);
+    return div_tensor_self_backward(grad, other, self_st);
+}
+
+inline Tensor div_tensor_other_backward(const Tensor& grad,
+                                        const Tensor& self,
+                                        const Tensor& other,
+                                        const std::optional<std::string>& rounding_mode) {
+    if (rounding_mode.has_value()) return ops::zeros_like(grad);
+    return div_tensor_other_backward(grad, self, other);
+}
+
+// copysign only ever transplants a sign, so the incoming gradient is passed
+// through with the sign it acquired.  A zero input has no sign to carry.
+inline Tensor copysign_tensor_self_backward(const Tensor& grad,
+                                            const Tensor& self,
+                                            const Tensor& result) {
+    return ops::where(ops::eq(self, Scalar(0)), ops::zeros_like(grad),
+                      grad * (result / self));
 }
 
 // Scalar-exponent power backward: zero exponent short
@@ -1104,21 +1214,6 @@ inline Tensor take_backward(const Tensor& grad, const Tensor& self,
         ops::zeros_like(flat), 0, ops::reshape(indices, {-1}),
         ops::reshape(grad, {-1}));
     return ops::reshape(grad_flat, sizes);
-}
-
-inline Tensor masked_select_backward(const Tensor& grad, const Tensor& input,
-                                     const Tensor& mask) {
-    const auto a = static_cast<std::vector<int64_t>>(input.shape());
-    const auto b = static_cast<std::vector<int64_t>>(mask.shape());
-    const size_t nd = std::max(a.size(), b.size());
-    std::vector<int64_t> bshape(nd, 1);
-    for (size_t i = 0; i < nd; ++i) {
-        const int64_t x = i < nd - a.size() ? 1 : a[i - (nd - a.size())];
-        const int64_t y = i < nd - b.size() ? 1 : b[i - (nd - b.size())];
-        bshape[i] = std::max(x, y);
-    }
-    return ops::masked_scatter(
-        ops::zeros(bshape, input.dtype(), input.device()), mask, grad);
 }
 
 // slice of grad, zero-padded to the source numel and reshaped back.

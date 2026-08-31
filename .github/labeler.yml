@@ -8,7 +8,7 @@
           - 'src/bindings/**'
           - 'demo*.py'
           - '!tensorplay/autograd/**'
-          - '!tensorplay/compiler/**'
+          - '!tensorplay/_stax/**'
           - '!tensorplay/cuda/**'
 
 "release notes: autograd":
@@ -22,8 +22,8 @@
   - changed-files:
       - any-glob-to-any-file:
           - 'stax/**'
-          - 'tensorplay/compiler/**'
-          - 'tensorplay/graph.py'
+          - 'tensorplay/_stax/**'
+          - 'tensorplay/graph/**'
 
 "release notes: kernels":
   - changed-files:

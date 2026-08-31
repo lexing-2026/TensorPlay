@@ -22,7 +22,6 @@ __all__ = [
     "register_module_forward_pre_hook",
     "register_module_forward_hook",
     "register_module_full_backward_pre_hook",
-    "register_module_backward_hook",
     "register_module_full_backward_hook",
     "register_module_buffer_registration_hook",
     "register_module_module_registration_hook",
@@ -290,35 +289,6 @@ def register_module_forward_hook(
     return handle
 
 
-def register_module_backward_hook(
-    hook: Callable[["Module", _grad_t, _grad_t], Union[None, _grad_t]],
-) -> RemovableHandle:
-    r"""Register a backward hook common to all the modules.
-
-    This function is deprecated in favor of
-    :func:`tensorplay.nn.modules.module.register_module_full_backward_hook`
-    and the behavior of this function will change in future versions.
-
-    Returns:
-        :class:`tensorplay.utils.hooks.RemovableHandle`:
-            a handle that can be used to remove the added hook by calling
-            ``handle.remove()``
-
-    """
-    global _global_is_full_backward_hook
-    if _global_is_full_backward_hook is True:
-        raise RuntimeError(
-            "Cannot use both regular backward hooks and full backward hooks as a "
-            "global Module hook. Please use only one of them."
-        )
-
-    _global_is_full_backward_hook = False
-
-    handle = RemovableHandle(_global_backward_hooks)
-    _global_backward_hooks[handle.id] = hook
-    return handle
-
-
 def register_module_full_backward_pre_hook(
     hook: Callable[["Module", _grad_t], Union[None, _grad_t]],
 ) -> RemovableHandle:
@@ -369,12 +339,6 @@ def register_module_full_backward_hook(
 
     """
     global _global_is_full_backward_hook
-    if _global_is_full_backward_hook is False:
-        raise RuntimeError(
-            "Cannot use both regular backward hooks and full backward hooks as a "
-            "global Module hook. Please use only one of them."
-        )
-
     _global_is_full_backward_hook = True
 
     handle = RemovableHandle(_global_backward_hooks)
@@ -486,14 +450,14 @@ class Module:
     _is_full_backward_hook: Optional[bool]
     _forward_hooks: dict[int, Callable]
     # Marks whether the corresponding _forward_hooks accept kwargs or not.
-    # As JIT does not support set[int], this dict is used as a set, where all
+    # As the compiler does not support set[int], this dict is used as a set, where all
     # hooks represented in this dict accept kwargs.
     _forward_hooks_with_kwargs: dict[int, bool]
     # forward hooks that should always be called even if an exception is raised
     _forward_hooks_always_called: dict[int, bool]
     _forward_pre_hooks: dict[int, Callable]
     # Marks whether the corresponding _forward_hooks accept kwargs or not.
-    # As JIT does not support set[int], this dict is used as a set, where all
+    # As the compiler does not support set[int], this dict is used as a set, where all
     # hooks represented in this dict accept kwargs.
     _forward_pre_hooks_with_kwargs: dict[int, bool]
     _state_dict_hooks: dict[int, Callable]
@@ -1329,32 +1293,6 @@ class Module:
             self._backward_pre_hooks.move_to_end(handle.id, last=False)  # type: ignore[attr-defined]
         return handle
 
-    def register_backward_hook(
-        self, hook: Callable[["Module", _grad_t, _grad_t], Union[None, _grad_t]]
-    ) -> RemovableHandle:
-        r"""Register a backward hook on the module.
-
-        This function is deprecated in favor of :meth:`~tensorplay.nn.Module.register_full_backward_hook` and
-        the behavior of this function will change in future versions.
-
-        Returns:
-            :class:`tensorplay.utils.hooks.RemovableHandle`:
-                a handle that can be used to remove the added hook by calling
-                ``handle.remove()``
-
-        """
-        if self._is_full_backward_hook is True:
-            raise RuntimeError(
-                "Cannot use both regular backward hooks and full backward hooks on a "
-                "single Module. Please use only one of them."
-            )
-
-        self._is_full_backward_hook = False
-
-        handle = RemovableHandle(self._backward_hooks)
-        self._backward_hooks[handle.id] = hook
-        return handle
-
     def register_full_backward_hook(
         self,
         hook: Callable[["Module", _grad_t, _grad_t], Union[None, _grad_t]],
@@ -1423,23 +1361,13 @@ class Module:
 
     def _get_backward_hooks(self):
         r"""Return the backward hooks for use in the call function.
-
-        It returns two lists, one with the full backward hooks and one with the non-full
-        backward hooks.
         """
         full_backward_hooks: list[Callable] = []
         if _global_is_full_backward_hook is True:
             full_backward_hooks += _global_backward_hooks.values()
         if self._is_full_backward_hook is True:
             full_backward_hooks += self._backward_hooks.values()
-
-        non_full_backward_hooks: list[Callable] = []
-        if _global_is_full_backward_hook is False:
-            non_full_backward_hooks += _global_backward_hooks.values()
-        if self._is_full_backward_hook is False:
-            non_full_backward_hooks += self._backward_hooks.values()
-
-        return full_backward_hooks, non_full_backward_hooks
+        return full_backward_hooks, []
 
     def _get_backward_pre_hooks(self):
         backward_pre_hooks: list[Callable] = []
@@ -1447,77 +1375,6 @@ class Module:
         backward_pre_hooks += self._backward_pre_hooks.values()
 
         return backward_pre_hooks
-
-    def _maybe_warn_non_full_backward_hook(self, inputs, result, grad_fn) -> None:
-        if not isinstance(result, tensorplay.Tensor):
-            if not (
-                isinstance(result, tuple)
-                and all(isinstance(r, tensorplay.Tensor) for r in result)
-            ):
-                warnings.warn(
-                    "Using non-full backward hooks on a Module that does not return a "
-                    "single Tensor or a tuple of Tensors is deprecated and will be removed "
-                    "in future versions. This hook will be missing some of the grad_output. "
-                    "Please use register_full_backward_hook to get the documented behavior.",
-                    FutureWarning,
-                    stacklevel=2,
-                )
-                return
-        else:
-            result = (result,)
-
-        if not isinstance(inputs, tensorplay.Tensor):
-            if not (
-                isinstance(inputs, tuple)
-                and all(isinstance(i, tensorplay.Tensor) for i in inputs)
-            ):
-                warnings.warn(
-                    "Using non-full backward hooks on a Module that does not take as input a "
-                    "single Tensor or a tuple of Tensors is deprecated and will be removed "
-                    "in future versions. This hook will be missing some of the grad_input. "
-                    "Please use register_full_backward_hook to get the documented behavior.",
-                    FutureWarning,
-                    stacklevel=2,
-                )
-                return
-        else:
-            inputs = (inputs,)
-
-        # At this point we are sure that inputs and result are tuple of Tensors
-        out_grad_fn = {r.grad_fn for r in result if r.grad_fn is not None}
-        if len(out_grad_fn) == 0 or (
-            len(out_grad_fn) == 1 and grad_fn not in out_grad_fn
-        ):
-            warnings.warn(
-                "Using a non-full backward hook when outputs are nested in python data structure "
-                "is deprecated and will be removed in future versions. This hook will be missing "
-                "some grad_output.",
-                FutureWarning,
-                stacklevel=2,
-            )
-        elif len(out_grad_fn) > 1:
-            warnings.warn(
-                "Using a non-full backward hook when outputs are generated by different autograd Nodes "
-                "is deprecated and will be removed in future versions. This hook will be missing "
-                "some grad_output. Please use register_full_backward_hook to get the documented behavior.",
-                FutureWarning,
-                stacklevel=2,
-            )
-        else:
-            # At this point the grad_output part of the hook will most likely be correct
-            inputs_grad_fn = {i.grad_fn for i in inputs if i.grad_fn is not None}
-
-            next_functions = {n[0] for n in grad_fn.next_functions}
-
-            if inputs_grad_fn != next_functions:
-                warnings.warn(
-                    "Using a non-full backward hook when the forward contains multiple autograd Nodes "
-                    "is deprecated and will be removed in future versions. This hook will be missing "
-                    "some grad_input. Please use register_full_backward_hook to get the documented "
-                    "behavior.",
-                    FutureWarning,
-                    stacklevel=2,
-                )
 
     def register_forward_pre_hook(
         self,
@@ -1677,13 +1534,13 @@ class Module:
         def inner():
             nonlocal result, args, kwargs
 
-            full_backward_hooks, non_full_backward_hooks = [], []
+            full_backward_hooks = []
             backward_pre_hooks = []
             if self._backward_pre_hooks or _global_backward_pre_hooks:
                 backward_pre_hooks = self._get_backward_pre_hooks()
 
             if self._backward_hooks or _global_backward_hooks:
-                full_backward_hooks, non_full_backward_hooks = self._get_backward_hooks()
+                full_backward_hooks, _ = self._get_backward_hooks()
 
             if _global_forward_pre_hooks or self._forward_pre_hooks:
                 for hook_id, hook in (
@@ -1736,20 +1593,6 @@ class Module:
                                   " module output should be a Tensor or a tuple of Tensors"
                                   f" but received {type(result)}")
                 result = bw_hook.setup_output_hook(result)
-
-            # Handle the non-full backward hooks
-            if non_full_backward_hooks:
-                var = result
-                while not isinstance(var, tensorplay.Tensor):
-                    if isinstance(var, dict):
-                        var = next(v for v in var.values() if isinstance(v, tensorplay.Tensor))
-                    else:
-                        var = var[0]
-                grad_fn = var.grad_fn
-                if grad_fn is not None:
-                    for hook in non_full_backward_hooks:
-                        grad_fn.register_hook(_WrappedHook(hook, self))
-                    self._maybe_warn_non_full_backward_hook(args, result, grad_fn)
 
             return result
 

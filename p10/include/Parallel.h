@@ -111,3 +111,19 @@ void invoke_parallel(int64_t begin, int64_t end, int64_t grain_size, const F& f)
 
 } // namespace parallel
 } // namespace tensorplay
+
+// C-ABI worksharing bridge: lets runtime-generated kernels share the same
+// intra-op pool as every in-tree kernel instead of carrying a second thread
+// runtime.  The body callback receives ``[begin, end)`` per chunk.
+extern "C" {
+
+typedef void (*tp_parallel_body_c)(void* ctx, long long begin, long long end);
+
+P10_API void tp_parallel_for_c(
+    long long begin,
+    long long end,
+    long long grain,
+    tp_parallel_body_c body,
+    void* ctx);
+
+} // extern "C"

@@ -1,0 +1,298 @@
+# ${generated_comment}
+# mypy: disable-error-code="type-arg"
+# mypy: allow-untyped-defs
+# ruff: noqa: F401,PYI054
+
+from typing import Any, overload
+
+import tensorplay
+from tensorplay import (
+    Generator,
+    MemoryFormat,
+    contiguous_format,
+)
+from tensorplay.types import (
+    Number,
+    _bool,
+    _complex,
+    _device,
+    _dtype,
+    _float,
+    _int,
+    _size,
+)
+from tensorplay._C import (
+    Device,
+    DType,
+    TensorBase,
+)
+
+__all__ = []
+
+def abs_(input: TensorBase) -> TensorBase: ...
+
+__all__ += ["abs_"]
+
+def add(input: TensorBase, other: TensorBase | Number | _complex, alpha: Number | _complex = 1) -> TensorBase: ...
+
+__all__ += ["add"]
+
+def add_(input: TensorBase, other: TensorBase | Number | _complex, alpha: Number | _complex = 1) -> TensorBase: ...
+
+__all__ += ["add_"]
+
+def absolute_(input: TensorBase) -> TensorBase: ...
+
+__all__ += ["absolute_"]
+
+def addcmul_(input: TensorBase, tensor1: TensorBase, tensor2: TensorBase, value: Number | _complex = 1) -> TensorBase: ...
+
+__all__ += ["addcmul_"]
+
+def addcdiv_(input: TensorBase, tensor1: TensorBase, tensor2: TensorBase, value: Number | _complex = 1) -> TensorBase: ...
+
+__all__ += ["addcdiv_"]
+
+@overload
+def arange(end: Number, *, dtype: _dtype = ..., device: Device | None = None, requires_grad: _bool = False) -> TensorBase: ...
+@overload
+def arange(start: Number, end: Number, *, dtype: _dtype = ..., device: Device | None = None, requires_grad: _bool = False) -> TensorBase: ...
+@overload
+def arange(start: Number, end: Number, step: Number, *, dtype: _dtype = ..., device: Device | None = None, requires_grad: _bool = False) -> TensorBase: ...
+
+__all__ += ["arange"]
+
+def bernoulli_(input: TensorBase) -> TensorBase: ...
+
+__all__ += ["bernoulli_"]
+
+def cauchy_(input: TensorBase, median: _float = 0.0, sigma: _float = 1.0) -> TensorBase: ...
+
+__all__ += ["cauchy_"]
+
+def clone(input: TensorBase, memory_format: MemoryFormat | None = None) -> TensorBase: ...
+
+__all__ += ["clone"]
+
+def contiguous(input: TensorBase, memory_format: MemoryFormat = contiguous_format) -> TensorBase: ...
+
+__all__ += ["contiguous"]
+
+def copy_(input: TensorBase, src: TensorBase, non_blocking: _bool = False) -> TensorBase: ...
+
+__all__ += ["copy_"]
+
+def div(input: TensorBase, other: TensorBase | Number | _complex) -> TensorBase: ...
+
+__all__ += ["div"]
+
+def div_(input: TensorBase, other: TensorBase | Number | _complex) -> TensorBase: ...
+
+__all__ += ["div_"]
+
+@overload
+def empty(*size: _int, dtype: _dtype = ..., device: Device | None = None, pin_memory: _bool = False, requires_grad: _bool = False) -> TensorBase: ...
+@overload
+def empty(size: _size, *, dtype: _dtype = ..., device: Device | None = None, pin_memory: _bool = False, requires_grad: _bool = False) -> TensorBase: ...
+
+__all__ += ["empty"]
+
+def empty_like(input: TensorBase, dtype: _dtype = ..., device: Device | None = None, requires_grad: _bool = False) -> TensorBase: ...
+
+__all__ += ["empty_like"]
+
+def expand(input: TensorBase, size: _size, implicit: _bool = False) -> TensorBase: ...
+
+__all__ += ["expand"]
+
+def expand_as(input: TensorBase, other: TensorBase) -> TensorBase: ...
+
+__all__ += ["expand_as"]
+
+def exponential_(input: TensorBase, lambd: _float = 1.0) -> TensorBase: ...
+
+__all__ += ["exponential_"]
+
+def fill_(input: TensorBase, value: Number | _complex) -> TensorBase: ...
+
+__all__ += ["fill_"]
+
+def full(size: _size, fill_value: Number | _complex, dtype: _dtype = ..., device: Device | None = None, pin_memory: _bool = False, requires_grad: _bool = False) -> TensorBase: ...
+
+__all__ += ["full"]
+
+def full_like(input: TensorBase, fill_value: Number | _complex, dtype: _dtype = ..., device: Device | None = None, requires_grad: _bool = False) -> TensorBase: ...
+
+__all__ += ["full_like"]
+
+def geometric_(input: TensorBase, p: _float) -> TensorBase: ...
+
+__all__ += ["geometric_"]
+
+def item(input: TensorBase) -> Number | _complex: ...
+
+__all__ += ["item"]
+
+def kaiser_window(window_length: _int, periodic: _bool = True, beta: _float = 12.0, *, dtype: _dtype | None = None, device: Device | None = None, pin_memory: _bool = False) -> TensorBase: ...
+
+__all__ += ["kaiser_window"]
+
+def linear(input: TensorBase, weight: TensorBase, bias: TensorBase | None = None) -> TensorBase: ...
+
+__all__ += ["linear"]
+
+def lerp_(input: TensorBase, end: TensorBase, weight: TensorBase | Number | _complex) -> TensorBase: ...
+
+__all__ += ["lerp_"]
+
+def log_normal_(input: TensorBase, mean: _float = 1.0, std: _float = 2.0) -> TensorBase: ...
+
+__all__ += ["log_normal_"]
+
+def logspace(start: Number, end: Number, steps: _int, base: _float = 10.0, dtype: _dtype = ..., device: Device | None = None, requires_grad: _bool = False) -> TensorBase: ...
+
+__all__ += ["logspace"]
+
+def linspace(start: Number, end: Number, steps: _int, dtype: _dtype = ..., device: Device | None = None, requires_grad: _bool = False) -> TensorBase: ...
+
+__all__ += ["linspace"]
+
+def matmul(input: TensorBase, other: TensorBase | Number | _complex, *, out: TensorBase | None = None) -> TensorBase: ...
+
+__all__ += ["matmul"]
+
+def mm(input: TensorBase, mat2: TensorBase) -> TensorBase: ...
+
+__all__ += ["mm"]
+
+def mul(input: TensorBase, other: TensorBase | Number | _complex) -> TensorBase: ...
+
+__all__ += ["mul"]
+
+def mul_(input: TensorBase, other: TensorBase | Number | _complex) -> TensorBase: ...
+
+__all__ += ["mul_"]
+
+def neg_(input: TensorBase) -> TensorBase: ...
+
+__all__ += ["neg_"]
+
+def normal_(input: TensorBase, mean: _float = 0.0, std: _float = 1.0) -> TensorBase: ...
+
+__all__ += ["normal_"]
+
+@overload
+def rand(*size: _int, dtype: _dtype | None = None, device: Device | None = None, requires_grad: _bool = False) -> TensorBase: ...
+@overload
+def rand(size: _size, *, dtype: _dtype | None = None, device: Device | None = None, requires_grad: _bool = False) -> TensorBase: ...
+
+__all__ += ["rand"]
+
+def rand_like(input: TensorBase, dtype: _dtype = ..., device: Device | None = None, requires_grad: _bool = False) -> TensorBase: ...
+
+__all__ += ["rand_like"]
+
+def randint(low: _int, high: _int, size: _size, dtype: _dtype = ..., device: Device | None = None, requires_grad: _bool = False) -> TensorBase: ...
+
+__all__ += ["randint"]
+
+def randint_like(input: TensorBase, low: _int, high: _int, dtype: _dtype = ..., device: Device | None = None, requires_grad: _bool = False) -> TensorBase: ...
+
+__all__ += ["randint_like"]
+
+@overload
+def randn(*size: _int, dtype: _dtype | None = None, device: Device | None = None, requires_grad: _bool = False) -> TensorBase: ...
+@overload
+def randn(size: _size, *, dtype: _dtype | None = None, device: Device | None = None, requires_grad: _bool = False) -> TensorBase: ...
+
+__all__ += ["randn"]
+
+def randn_like(input: TensorBase, dtype: _dtype = ..., device: Device | None = None, requires_grad: _bool = False) -> TensorBase: ...
+
+__all__ += ["randn_like"]
+
+def random_(input: TensorBase, low: _int = 0, high: _int = 0) -> TensorBase: ...
+
+__all__ += ["random_"]
+
+def repeat(input: TensorBase, repeats: _size) -> TensorBase: ...
+
+__all__ += ["repeat"]
+
+def resize_(input: TensorBase, size: _size) -> TensorBase: ...
+
+__all__ += ["resize_"]
+
+def rsqrt_(input: TensorBase) -> TensorBase: ...
+
+__all__ += ["rsqrt_"]
+
+def select(input: TensorBase, dim: _int, index: _int) -> TensorBase: ...
+
+__all__ += ["select"]
+
+def slice(input: TensorBase, dim: _int = 0, start: _int | None = None, end: _int | None = None, step: _int = 1) -> TensorBase: ...
+
+__all__ += ["slice"]
+
+def sqrt_(input: TensorBase) -> TensorBase: ...
+
+__all__ += ["sqrt_"]
+
+def squeeze_copy(input: TensorBase, dim: _size | None = None) -> TensorBase: ...
+
+__all__ += ["squeeze_copy"]
+
+def sub(input: TensorBase, other: TensorBase | Number | _complex, alpha: Number | _complex = 1) -> TensorBase: ...
+
+__all__ += ["sub"]
+
+def sub_(input: TensorBase, other: TensorBase | Number | _complex, alpha: Number | _complex = 1) -> TensorBase: ...
+
+__all__ += ["sub_"]
+
+def trapz(y: TensorBase, x: TensorBase | None = None, dx: _float | None = None, dim: _int = -1) -> TensorBase: ...
+
+__all__ += ["trapz"]
+
+def unique_consecutive(input: TensorBase, return_inverse: _bool = False, return_counts: _bool = False, dim: _int | None = None) -> Any: ...
+
+__all__ += ["unique_consecutive"]
+
+def uniform_(input: TensorBase, from_: _float = 0.0, to: _float = 1.0) -> TensorBase: ...
+
+__all__ += ["uniform_"]
+
+def view(input: TensorBase, shape: _size) -> TensorBase: ...
+
+__all__ += ["view"]
+
+def where(condition: TensorBase, input: TensorBase | Number | _complex, other: TensorBase | Number | _complex) -> TensorBase: ...
+
+__all__ += ["where"]
+
+def zero_(input: TensorBase) -> TensorBase: ...
+
+__all__ += ["zero_"]
+
+def ones(*size: _int, dtype: _dtype = ..., device: Device | None = None, pin_memory: _bool = False, requires_grad: _bool = False) -> TensorBase: ...
+
+__all__ += ["ones"]
+
+def ones_like(input: TensorBase, dtype: _dtype = ..., device: Device | None = None, requires_grad: _bool = False) -> TensorBase: ...
+
+__all__ += ["ones_like"]
+
+def zeros(*size: _int, dtype: _dtype = ..., device: Device | None = None, pin_memory: _bool = False, requires_grad: _bool = False) -> TensorBase: ...
+
+__all__ += ["zeros"]
+
+def zeros_like(input: TensorBase, dtype: _dtype = ..., device: Device | None = None, requires_grad: _bool = False) -> TensorBase: ...
+
+__all__ += ["zeros_like"]
+
+${imported_hints}
+
+${dispatched_hints}
+
+${extra_functional___all__}

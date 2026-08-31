@@ -109,7 +109,7 @@ Tensor review_reduce_result(const Tensor& result, int64_t ndim, const std::vecto
       stride.insert(stride.begin() + dim, 0);
     }
   }
-  return result.as_strided(shape, stride);
+  return Tensor::as_strided(result, shape, stride, std::nullopt);
 }
 
 // ops-based accumulator for the complex dtypes (no Vectorized<complex>
@@ -140,12 +140,116 @@ struct NormTwoOps {
 // L2 norm fast path. The previous TensorPlay implementation composed
 // native path reduces squares directly; this is particularly important for
 // Muon's bfloat16 normalization step.
+
+// --- AVX-512 runtime-dispatched sum-of-squares (full-tensor contiguous) ----
+#if defined(__x86_64__)
+namespace {
+
+inline bool normsq_avx512_available() {
+    static const bool ok = __builtin_cpu_supports("avx512f") != 0 &&
+                           __builtin_cpu_supports("avx512vl") != 0 &&
+                           __builtin_cpu_supports("avx512dq") != 0;
+    return ok;
+}
+
+__attribute__((target("avx512f")))
+float normsq_f32_chunk_avx512(const float* x, int64_t b, int64_t e) {
+    __m512 a0 = _mm512_setzero_ps(), a1 = _mm512_setzero_ps();
+    __m512 a2 = _mm512_setzero_ps(), a3 = _mm512_setzero_ps();
+    int64_t i = b;
+    for (; i + 64 <= e; i += 64) {
+        __m512 v;
+        v = _mm512_loadu_ps(x + i);          a0 = _mm512_fmadd_ps(v, v, a0);
+        v = _mm512_loadu_ps(x + i + 16);     a1 = _mm512_fmadd_ps(v, v, a1);
+        v = _mm512_loadu_ps(x + i + 32);     a2 = _mm512_fmadd_ps(v, v, a2);
+        v = _mm512_loadu_ps(x + i + 48);     a3 = _mm512_fmadd_ps(v, v, a3);
+    }
+    __m512 acc = _mm512_add_ps(_mm512_add_ps(a0, a1), _mm512_add_ps(a2, a3));
+    for (; i + 16 <= e; i += 16) {
+        __m512 v = _mm512_loadu_ps(x + i);
+        acc = _mm512_fmadd_ps(v, v, acc);
+    }
+    alignas(64) float buf[16];
+    _mm512_storeu_ps(buf, acc);
+    float s = ((buf[0] + buf[1]) + (buf[2] + buf[3])) +
+              ((buf[4] + buf[5]) + (buf[6] + buf[7])) +
+              ((buf[8] + buf[9]) + (buf[10] + buf[11])) +
+              ((buf[12] + buf[13]) + (buf[14] + buf[15]));
+    for (; i < e; ++i) { float v = x[i]; s += v * v; }
+    return s;
+}
+
+__attribute__((target("avx512f")))
+double normsq_f64_chunk_avx512(const double* x, int64_t b, int64_t e) {
+    __m512d a0 = _mm512_setzero_pd(), a1 = _mm512_setzero_pd();
+    int64_t i = b;
+    for (; i + 16 <= e; i += 16) {
+        __m512d v;
+        v = _mm512_loadu_pd(x + i);          a0 = _mm512_fmadd_pd(v, v, a0);
+        v = _mm512_loadu_pd(x + i + 8);      a1 = _mm512_fmadd_pd(v, v, a1);
+    }
+    __m512d acc = _mm512_add_pd(a0, a1);
+    alignas(64) double buf[8];
+    _mm512_storeu_pd(buf, acc);
+    double s = (buf[0] + buf[1]) + (buf[2] + buf[3]) +
+               (buf[4] + buf[5]) + (buf[6] + buf[7]);
+    for (; i < e; ++i) { double v = x[i]; s += v * v; }
+    return s;
+}
+
+// Returns false when the caller should use the iterator path.  Emits the raw
+// sum of squares; the caller applies the square root in the element dtype.
+static bool try_normsq_real_avx512(const void* xv, int64_t n, DType dt,
+                                   double* out) {
+    if (!normsq_avx512_available() || n < 4096) return false;
+    constexpr int64_t kGrain = 32768;
+    if (dt == DType::Float32) {
+        const float* x = static_cast<const float*>(xv);
+        const int64_t nslots = (n + kGrain - 1) / kGrain;
+        std::vector<float> part(nslots, 0.f);
+        tensorplay::parallel::parallel_for(0, n, kGrain, [&](int64_t b, int64_t e) {
+            part[b / kGrain] = normsq_f32_chunk_avx512(x, b, e);
+        });
+        float s = 0.f;
+        for (int64_t k = 0; k < nslots; ++k) s += part[k];
+        *out = static_cast<double>(s);
+        return true;
+    }
+    if (dt == DType::Float64) {
+        const double* x = static_cast<const double*>(xv);
+        const int64_t nslots = (n + kGrain - 1) / kGrain;
+        std::vector<double> part(nslots, 0.0);
+        tensorplay::parallel::parallel_for(0, n, kGrain, [&](int64_t b, int64_t e) {
+            part[b / kGrain] = normsq_f64_chunk_avx512(x, b, e);
+        });
+        double s = 0.0;
+        for (int64_t k = 0; k < nslots; ++k) s += part[k];
+        *out = s;
+        return true;
+    }
+    return false;
+}
+
+}  // namespace
+#endif  // __x86_64__
+
 Tensor norm_kernel_impl(const Tensor& self, double p) {
     TP_CHECK(p == 2.0, "norm: only p=2 supported by the native CPU path");
     if (self.numel() == 0) {
         return Tensor::zeros({}, self.dtype(), self.device());
     }
 
+#if defined(__x86_64__)
+    if (self.is_contiguous()) {
+        double r = 0.0;
+        if (try_normsq_real_avx512(self.data_ptr(), self.numel(), self.dtype(), &r)) {
+            Tensor out = Tensor::empty({}, self.dtype(), self.device());
+            if (self.dtype() == DType::Float32) out.fill_(Scalar(std::sqrt(static_cast<float>(r))));
+            else out.fill_(Scalar(std::sqrt(r)));
+            return out;
+        }
+    }
+#endif
     if (self.dtype() == DType::Float32) {
         Tensor out = Tensor::zeros({}, DType::Float32, self.device());
         TensorIterator iter = TensorIterator::reduce_op(out, self);
@@ -292,6 +396,135 @@ static bool try_sum_real_avx512(const void* xv, int64_t n, DType dt,
         double s = 0.0;
         for (int64_t k = 0; k < nslots; ++k) s += part[k];
         *out = s;
+        return true;
+    }
+    return false;
+}
+
+__attribute__((target("avx512f")))
+float max_f32_chunk_avx512(const float* x, int64_t b, int64_t e,
+                           bool* has_nan) {
+    __m512 a0 = _mm512_set1_ps(-std::numeric_limits<float>::infinity());
+    __m512 a1 = a0;
+    __m512 a2 = a0;
+    __m512 a3 = a0;
+    __mmask16 nan_mask = 0;
+    int64_t i = b;
+    for (; i + 64 <= e; i += 64) {
+        const __m512 v0 = _mm512_loadu_ps(x + i);
+        const __m512 v1 = _mm512_loadu_ps(x + i + 16);
+        const __m512 v2 = _mm512_loadu_ps(x + i + 32);
+        const __m512 v3 = _mm512_loadu_ps(x + i + 48);
+        nan_mask |= _mm512_cmp_ps_mask(v0, v0, _CMP_UNORD_Q);
+        nan_mask |= _mm512_cmp_ps_mask(v1, v1, _CMP_UNORD_Q);
+        nan_mask |= _mm512_cmp_ps_mask(v2, v2, _CMP_UNORD_Q);
+        nan_mask |= _mm512_cmp_ps_mask(v3, v3, _CMP_UNORD_Q);
+        a0 = _mm512_mask_blend_ps(_mm512_cmp_ps_mask(v0, a0, _CMP_GT_OQ), a0, v0);
+        a1 = _mm512_mask_blend_ps(_mm512_cmp_ps_mask(v1, a1, _CMP_GT_OQ), a1, v1);
+        a2 = _mm512_mask_blend_ps(_mm512_cmp_ps_mask(v2, a2, _CMP_GT_OQ), a2, v2);
+        a3 = _mm512_mask_blend_ps(_mm512_cmp_ps_mask(v3, a3, _CMP_GT_OQ), a3, v3);
+    }
+    for (; i + 16 <= e; i += 16) {
+        const __m512 v = _mm512_loadu_ps(x + i);
+        nan_mask |= _mm512_cmp_ps_mask(v, v, _CMP_UNORD_Q);
+        a0 = _mm512_mask_blend_ps(_mm512_cmp_ps_mask(v, a0, _CMP_GT_OQ), a0, v);
+    }
+    alignas(64) float lanes[16];
+    _mm512_storeu_ps(lanes, _mm512_max_ps(_mm512_max_ps(a0, a1),
+                                          _mm512_max_ps(a2, a3)));
+    float best = lanes[0];
+    for (int j = 1; j < 16; ++j) {
+        if (lanes[j] > best) best = lanes[j];
+    }
+    for (; i < e; ++i) {
+        if (std::isnan(x[i])) {
+            nan_mask = 1;
+        } else if (x[i] > best) {
+            best = x[i];
+        }
+    }
+    *has_nan = nan_mask != 0;
+    return best;
+}
+
+__attribute__((target("avx512f")))
+double max_f64_chunk_avx512(const double* x, int64_t b, int64_t e,
+                            bool* has_nan) {
+    __m512d a0 = _mm512_set1_pd(-std::numeric_limits<double>::infinity());
+    __m512d a1 = a0;
+    __mmask8 nan_mask = 0;
+    int64_t i = b;
+    for (; i + 16 <= e; i += 16) {
+        const __m512d v0 = _mm512_loadu_pd(x + i);
+        const __m512d v1 = _mm512_loadu_pd(x + i + 8);
+        nan_mask |= _mm512_cmp_pd_mask(v0, v0, _CMP_UNORD_Q);
+        nan_mask |= _mm512_cmp_pd_mask(v1, v1, _CMP_UNORD_Q);
+        a0 = _mm512_mask_blend_pd(_mm512_cmp_pd_mask(v0, a0, _CMP_GT_OQ), a0, v0);
+        a1 = _mm512_mask_blend_pd(_mm512_cmp_pd_mask(v1, a1, _CMP_GT_OQ), a1, v1);
+    }
+    for (; i + 8 <= e; i += 8) {
+        const __m512d v = _mm512_loadu_pd(x + i);
+        nan_mask |= _mm512_cmp_pd_mask(v, v, _CMP_UNORD_Q);
+        a0 = _mm512_mask_blend_pd(_mm512_cmp_pd_mask(v, a0, _CMP_GT_OQ), a0, v);
+    }
+    alignas(64) double lanes[8];
+    _mm512_storeu_pd(lanes, _mm512_max_pd(a0, a1));
+    double best = lanes[0];
+    for (int j = 1; j < 8; ++j) {
+        if (lanes[j] > best) best = lanes[j];
+    }
+    for (; i < e; ++i) {
+        if (std::isnan(x[i])) {
+            nan_mask = 1;
+        } else if (x[i] > best) {
+            best = x[i];
+        }
+    }
+    *has_nan = nan_mask != 0;
+    return best;
+}
+
+static bool try_max_real_avx512(const void* xv, int64_t n, DType dt,
+                                double* out, bool* has_nan) {
+    if (!reduce_avx512_available() || n < 4096) return false;
+    constexpr int64_t kGrain = 32768;
+    const int64_t nslots = (n + kGrain - 1) / kGrain;
+    if (dt == DType::Float32) {
+        const float* x = static_cast<const float*>(xv);
+        std::vector<float> part(nslots, -std::numeric_limits<float>::infinity());
+        std::vector<uint8_t> nan(nslots, 0);
+        tensorplay::parallel::parallel_for(0, n, kGrain, [&](int64_t b, int64_t e) {
+            bool local_nan = false;
+            part[b / kGrain] = max_f32_chunk_avx512(x, b, e, &local_nan);
+            nan[b / kGrain] = static_cast<uint8_t>(local_nan);
+        });
+        float best = part[0];
+        bool any_nan = nan[0] != 0;
+        for (int64_t k = 1; k < nslots; ++k) {
+            any_nan = any_nan || nan[k] != 0;
+            if (part[k] > best) best = part[k];
+        }
+        *out = static_cast<double>(best);
+        *has_nan = any_nan;
+        return true;
+    }
+    if (dt == DType::Float64) {
+        const double* x = static_cast<const double*>(xv);
+        std::vector<double> part(nslots, -std::numeric_limits<double>::infinity());
+        std::vector<uint8_t> nan(nslots, 0);
+        tensorplay::parallel::parallel_for(0, n, kGrain, [&](int64_t b, int64_t e) {
+            bool local_nan = false;
+            part[b / kGrain] = max_f64_chunk_avx512(x, b, e, &local_nan);
+            nan[b / kGrain] = static_cast<uint8_t>(local_nan);
+        });
+        double best = part[0];
+        bool any_nan = nan[0] != 0;
+        for (int64_t k = 1; k < nslots; ++k) {
+            any_nan = any_nan || nan[k] != 0;
+            if (part[k] > best) best = part[k];
+        }
+        *out = best;
+        *has_nan = any_nan;
         return true;
     }
     return false;
@@ -724,6 +957,27 @@ Tensor max_kernel_impl(const Tensor& self) {
     Tensor input = self.contiguous();
     Tensor out = Tensor::empty({}, self.dtype(), self.device());
 
+#if defined(__x86_64__)
+    if (input.is_contiguous() &&
+        (input.dtype() == DType::Float32 || input.dtype() == DType::Float64)) {
+        double value = 0.0;
+        bool has_nan = false;
+        if (try_max_real_avx512(input.data_ptr(), input.numel(), input.dtype(),
+                                &value, &has_nan)) {
+            if (has_nan) {
+                out.fill_(input.dtype() == DType::Float32
+                    ? Scalar(std::numeric_limits<float>::quiet_NaN())
+                    : Scalar(std::numeric_limits<double>::quiet_NaN()));
+            } else if (input.dtype() == DType::Float32) {
+                out.fill_(Scalar(static_cast<float>(value)));
+            } else {
+                out.fill_(Scalar(value));
+            }
+            return out;
+        }
+    }
+#endif
+
     #define TP_MAX_VALUES_CASE(ctype, name) \
     case DType::name: \
         binary_kernel_reduce_vec(iter, \
@@ -770,7 +1024,8 @@ std::tuple<Tensor, Tensor> max_dim_kernel_impl(const Tensor& self, int64_t dim0,
         const ctype* sp = sc.data_ptr<ctype>();                                         \
         ctype* vp = vals.data_ptr<ctype>();                                             \
         int64_t* ip = idxs.data_ptr<int64_t>();                                         \
-        parallel_for(0, outer * inner, GRAIN_SIZE, [&](int64_t b, int64_t e) {          \
+        const int64_t line_grain = std::max<int64_t>(1, GRAIN_SIZE / d_size);           \
+        parallel_for(0, outer * inner, line_grain, [&](int64_t b, int64_t e) {          \
             for (int64_t flat = b; flat < e; ++flat) {                                  \
                 const int64_t o = flat / inner, in2 = flat % inner;                     \
                 const ctype* line = sp + o * d_size * inner + in2;                      \
@@ -882,7 +1137,8 @@ std::tuple<Tensor, Tensor> min_dim_kernel_impl(const Tensor& self, int64_t dim0,
         const ctype* sp = sc.data_ptr<ctype>();                                         \
         ctype* vp = vals.data_ptr<ctype>();                                             \
         int64_t* ip = idxs.data_ptr<int64_t>();                                         \
-        parallel_for(0, outer * inner, GRAIN_SIZE, [&](int64_t b, int64_t e) {          \
+        const int64_t line_grain = std::max<int64_t>(1, GRAIN_SIZE / d_size);           \
+        parallel_for(0, outer * inner, line_grain, [&](int64_t b, int64_t e) {          \
             for (int64_t flat = b; flat < e; ++flat) {                                  \
                 const int64_t o = flat / inner, in2 = flat % inner;                     \
                 const ctype* line = sp + o * d_size * inner + in2;                      \
@@ -1208,25 +1464,49 @@ Tensor argmax_kernel_impl(const Tensor& self, std::optional<int64_t> dim, bool k
             TP_THROW(IndexError,
                      "argmax(): Expected reduction dim to be specified for input.numel() == 0.");
         }
-        // Flatten
+        // Flatten: chunked scan (chunk-local max + first-NaN marker), then a
+        // serial combine that keeps the earliest index on ties/NaN.
         Tensor self_contig = self.contiguous();
         int64_t max_idx = 0;
-        
+
         #define OP_CASE(ctype, name) \
         case DType::name: { \
             const ctype* data = self_contig.data_ptr<ctype>(); \
             int64_t n = self_contig.numel(); \
-            ctype max_val = get_lowest<ctype>(); \
-            bool has_nan = false; \
-            for(int64_t i=0; i<n; ++i) { \
-                if constexpr (std::is_floating_point_v<ctype>) { \
-                    if (!has_nan && std::isnan(data[i])) { has_nan = true; max_idx = i; continue; } \
+            constexpr bool is_float = std::is_floating_point_v<ctype>; \
+            constexpr int64_t kChunks = 32; \
+            const int64_t chunk = std::max<int64_t>(1, (n + kChunks - 1) / kChunks); \
+            ctype best_val = get_lowest<ctype>(); \
+            int64_t best_pos = 0; \
+            int64_t nan_pos = -1; \
+            std::vector<ctype> chunk_val(kChunks, get_lowest<ctype>()); \
+            std::vector<int64_t> chunk_pos(kChunks, 0); \
+            std::vector<int64_t> chunk_nan(kChunks, -1); \
+            tensorplay::parallel::parallel_for(0, kChunks, 1, [&](int64_t cb, int64_t ce) { \
+                for (int64_t c = cb; c < ce; ++c) { \
+                    const int64_t lo = c * chunk; \
+                    if (lo >= n) break; \
+                    const int64_t hi = std::min(n, lo + chunk); \
+                    ctype lmax = get_lowest<ctype>(); \
+                    int64_t lpos = lo; \
+                    int64_t lnan = -1; \
+                    for (int64_t i = lo; i < hi; ++i) { \
+                        if constexpr (is_float) { \
+                            if (lnan < 0 && std::isnan(data[i])) { lnan = i; break; } \
+                        } \
+                        if (lnan < 0 && data[i] > lmax) { lmax = data[i]; lpos = i; } \
+                    } \
+                    chunk_val[c] = lmax; chunk_pos[c] = lpos; chunk_nan[c] = lnan; \
                 } \
-                if (!has_nan && data[i] > max_val) { max_val = data[i]; max_idx = i; } \
+            }); \
+            for (int64_t c = 0; c < kChunks; ++c) { \
+                if (chunk_nan[c] >= 0) { nan_pos = chunk_nan[c]; break; } \
+                if (chunk_val[c] > best_val) { best_val = chunk_val[c]; best_pos = chunk_pos[c]; } \
             } \
+            max_idx = (nan_pos >= 0) ? nan_pos : best_pos; \
             break; \
         }
-        
+
         switch (self.dtype()) {
             TENSORPLAY_FORALL_SCALAR_TYPES(OP_CASE)
             default: TP_THROW(NotImplementedError, "argmax not implemented for this dtype");
@@ -1244,33 +1524,41 @@ Tensor argmax_kernel_impl(const Tensor& self, std::optional<int64_t> dim, bool k
         TP_THROW(IndexError, "argmax(): Expected reduction dim ", d, " to have non-zero size.");
     }
     
-    // Transpose d to end, reshape to (-1, size), find max idx per row
-    Tensor t = self.transpose(d, -1);
-    t = t.contiguous(); // Force copy/compact
-    
-    int64_t size = t.size(-1);
-    int64_t n_rows = t.numel() / size;
-    
+    // Direct strided-line scan over the contiguous input: line for (o, in2)
+    // starts at o*d_size*inner + in2, elements at stride `inner`.  Rows are
+    // independent, so the scan parallelizes at line granularity.
+    Tensor sc = self.contiguous();
+    std::vector<int64_t> in_shape = static_cast<std::vector<int64_t>>(sc.shape());
+    const int64_t d_size = in_shape[d];
+    int64_t outer = 1, inner = 1;
+    for (int64_t i = 0; i < d; ++i) outer *= in_shape[i];
+    for (int64_t i = d + 1; i < sc.dim(); ++i) inner *= in_shape[i];
+
     std::vector<int64_t> out_shape = compute_reduction_shape(self, {d}, keepdim);
     Tensor out = Tensor::empty(out_shape, DType::Int64, self.device());
     int64_t* out_data = out.data_ptr<int64_t>();
     
     #define OP_CASE(ctype, name) \
     case DType::name: { \
-        const ctype* data = t.data_ptr<ctype>(); \
-        for(int64_t i=0; i<n_rows; ++i) { \
-            ctype max_val = get_lowest<ctype>(); \
-            int64_t max_idx = 0; \
-            bool has_nan = false; \
-            for(int64_t j=0; j<size; ++j) { \
-                ctype val = data[i*size + j]; \
-                if constexpr (std::is_floating_point_v<ctype>) { \
-                    if (!has_nan && std::isnan(val)) { has_nan = true; max_idx = j; break; } \
+        const ctype* data = sc.data_ptr<ctype>(); \
+        const int64_t line_grain = std::max<int64_t>(1, GRAIN_SIZE / d_size); \
+        parallel_for(0, outer * inner, line_grain, [&](int64_t b, int64_t e) { \
+            for (int64_t flat = b; flat < e; ++flat) { \
+                const int64_t o = flat / inner, in2 = flat % inner; \
+                const ctype* line = data + o * d_size * inner + in2; \
+                ctype max_val = line[0]; \
+                int64_t max_idx = 0; \
+                bool has_nan = false; \
+                for (int64_t j = 0; j < d_size; ++j) { \
+                    ctype val = line[j * inner]; \
+                    if constexpr (std::is_floating_point_v<ctype>) { \
+                        if (!has_nan && std::isnan(val)) { has_nan = true; max_idx = j; break; } \
+                    } \
+                    if (!has_nan && val > max_val) { max_val = val; max_idx = j; } \
                 } \
-                if (!has_nan && val > max_val) { max_val = val; max_idx = j; } \
+                out_data[flat] = max_idx; \
             } \
-            out_data[i] = max_idx; \
-        } \
+        }); \
         break; \
     }
     

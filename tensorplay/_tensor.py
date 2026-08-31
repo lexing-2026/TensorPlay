@@ -402,36 +402,20 @@ def _as_tensor(x):
     return as_tensor(x)
 
 
-def _floor_divide(self, other):
-    return _cf("floor_divide")(self, other)
-
-
+# floor_divide/remainder/fmod/true_divide are native methods; only the
+# reflected forms need a wrapper, since the left operand arrives as a plain
+# Python number.
 def __rfloordiv__(self, other):
-    return _cf("floor_divide")(_as_tensor(other), self)
-
-
-def _remainder(self, other):
-    return _cf("remainder")(self, other)
+    return _as_tensor(other).floor_divide(self)
 
 
 def __rmod__(self, other):
-    return _cf("remainder")(_as_tensor(other), self)
+    import tensorplay
+    return tensorplay.remainder(other, self)
 
 
-def _fmod(self, other):
-    return _cf("fmod")(self, other)
-
-
-def true_divide(self, other):
-    return self.div(other)
-
-
-Tensor.floor_divide = _floor_divide
 Tensor.__rfloordiv__ = __rfloordiv__
-Tensor.remainder = _remainder
 Tensor.__rmod__ = __rmod__
-Tensor.fmod = _fmod
-Tensor.true_divide = true_divide
 
 
 def repeat_interleave(self, repeats, dim=None, *, output_size=None):
@@ -547,14 +531,14 @@ Tensor.topk = topk
 # bit width modulo through the unsigned domain in the kernel).
 # ---------------------------------------------------------------------------
 def __ifloordiv__(self, other):
-    res = _floor_divide(self, other)
+    res = self.floor_divide(other)
     with _C_no_grad():
         self.copy_(res)
     return self
 
 
 def __imod__(self, other):
-    res = _remainder(self, other)
+    res = self.remainder(other)
     with _C_no_grad():
         self.copy_(res)
     return self
@@ -608,8 +592,8 @@ def __abs__(self):
     return self.abs()
 
 
-Tensor.__floordiv__ = lambda self, other: _floor_divide(self, other)
-Tensor.__mod__ = _remainder
+Tensor.__floordiv__ = lambda self, other: self.floor_divide(other)
+Tensor.__mod__ = lambda self, other: self.remainder(other)
 Tensor.__ifloordiv__ = __ifloordiv__
 Tensor.__imod__ = __imod__
 Tensor.__and__ = _bitwise_fn("and")

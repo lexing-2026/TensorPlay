@@ -10,6 +10,29 @@ from tensorplay.distributed.checkpoint.mega_storage import (
 )
 from tensorplay.distributed.checkpoint.state_dict_loader import load
 from tensorplay.distributed.checkpoint.state_dict_saver import async_save, save
+from tensorplay.distributed.checkpoint.api import CheckpointException
+from tensorplay.distributed.checkpoint.default_planner import DefaultLoadPlanner, DefaultSavePlanner
+from tensorplay.distributed.checkpoint.metadata import (
+    BytesStorageMetadata,
+    ChunkStorageMetadata,
+    Metadata,
+    MetadataIndex,
+    StorageMeta,
+    TensorProperties,
+    TensorStorageMetadata,
+)
+from tensorplay.distributed.checkpoint.planner import (
+    BytesIOWriteData,
+    LoadItemType,
+    LoadPlan,
+    LoadPlanner,
+    ReadItem,
+    SavePlan,
+    SavePlanner,
+    TensorWriteData,
+    WriteItem,
+    WriteItemType,
+)
 
 __all__ = [
     "save",
@@ -21,4 +44,24 @@ __all__ = [
     "MegaStorageWriter",
     "StorageReader",
     "StorageWriter",
+    "CheckpointException",
+    "DefaultLoadPlanner",
+    "DefaultSavePlanner",
+    "BytesStorageMetadata",
+    "ChunkStorageMetadata",
+    "Metadata",
+    "MetadataIndex",
+    "StorageMeta",
+    "TensorProperties",
+    "TensorStorageMetadata",
+    "BytesIOWriteData",
+    "LoadItemType",
+    "LoadPlan",
+    "LoadPlanner",
+    "ReadItem",
+    "SavePlan",
+    "SavePlanner",
+    "TensorWriteData",
+    "WriteItem",
+    "WriteItemType",
 ]

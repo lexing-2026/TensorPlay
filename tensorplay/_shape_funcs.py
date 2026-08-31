@@ -11,7 +11,7 @@ views are not yet recorded by the autograd codegen.
 import tensorplay
 import tensorplay._C as _C
 from tensorplay._C import DType
-from tensorplay.compiler.graph import capture_call as _capture_call
+from tensorplay.graph import capture_call as _capture_call
 from tensorplay.autograd.function import Function
 
 __all__ = [

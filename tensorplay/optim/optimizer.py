@@ -124,17 +124,14 @@ def _stack_if_compiling(value):
 
 
 def _disable_dynamo(func):
-    """Keep a stateful optimizer helper outside the active Stax capture."""
+    """Keep a stateful optimizer helper outside the active capture."""
 
     @functools.wraps(func)
     def disabled(*args, **kwargs):
-        disable_capture = getattr(tp.compiler, "_disable_capture", None)
-        if disable_capture is None:
-            return func(*args, **kwargs)
-        with disable_capture():
+        with tp.compiler.disable_capture():
             return func(*args, **kwargs)
 
-    disabled._tensorplay_disable_stax = True
+    disabled._tensorplay_compiler_disabled = True
     return disabled
 
 
@@ -287,13 +284,10 @@ def _use_grad_for_differentiable(func):
                         return closure()
             else:
                 grad_closure = None
-            disable_capture = getattr(tp.compiler, "_disable_capture", None)
-            if disable_capture is None:
-                return func(self, grad_closure)
             # The ahead-of-time backward pass does not functionalize the
-            # in-place optimizer-state mutation into the model graph.  Stax
-            # uses the same boundary.
-            with disable_capture():
+            # in-place optimizer-state mutation into the model graph, so the
+            # step runs outside the capture boundary.
+            with tp.compiler.disable_capture():
                 return func(self, grad_closure)
 
     return _use_grad

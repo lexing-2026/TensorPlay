@@ -8,12 +8,14 @@
 #include <Python.h>
 
 #include <string>
+#include <optional>
 #include <vector>
 
 #include <Tensor.h>
 #include <Scalar.h>
 #include <DType.h>
 #include <Device.h>
+#include <Generator.h>
 
 namespace tensorplay {
 namespace python_c {
@@ -37,6 +39,47 @@ void tpx_py_parse_into(PyObject* const* args, Py_ssize_t nargs,
                        Py_ssize_t nkws, const char* op_name,
                        PyObject** out);
 
+// Give Python Tensor subclasses the first chance to handle an operator.
+// Returns 1 when result is owned by the caller, 0 when native parsing should
+// continue, and -1 when Python has already set an exception.
+int tpx_py_try_tensor_subclass_dispatch(
+    const char* op_name, PyObject* receiver, bool is_method,
+    PyObject* const* args, Py_ssize_t nargs, PyObject* kwnames,
+    PyObject** result);
+
+int tpx_py_try_tensor_function_dispatch(
+    const char* op_name, PyObject* receiver, bool is_method,
+    PyObject* const* args, Py_ssize_t nargs, PyObject* kwnames,
+    PyObject** result);
+
+enum tpx_py_function_state : unsigned char {
+    TPX_FUNCTION_ENABLED = 0,
+    TPX_SUBCLASSES_DISABLED = 1,
+    TPX_ALL_DISABLED = 2,
+};
+
+int tpx_py_get_function_state();
+bool tpx_py_set_function_state(int state);
+bool tpx_py_exchange_skip_next(bool value);
+bool tpx_py_peek_skip_next();
+bool tpx_py_exchange_subclass_skip_next(bool value);
+bool tpx_py_peek_subclass_skip_next();
+int tpx_py_get_dispatch_layer();
+
+void tpx_py_push_function_mode(PyObject* mode);
+PyObject* tpx_py_pop_function_mode();
+PyObject* tpx_py_get_function_mode(Py_ssize_t index);
+Py_ssize_t tpx_py_function_mode_len();
+
+// Runs the top function mode for a generated operation.  The mode is
+// temporarily removed while its hook runs so nested operations continue at
+// the next level.  Return values have the same ownership convention as the
+// subclass dispatch helper above.
+int tpx_py_try_function_mode_dispatch(
+    const char* op_name, PyObject* receiver, bool is_method,
+    PyObject* const* args, Py_ssize_t nargs, PyObject* kwnames,
+    PyObject** result);
+
 // ---- eager argument type validation ----------------------------------------
 // Generated bindings pass a parallel table of slot kinds so type mismatches
 // include the operation name, argument name, and positional index.  Kinds are
@@ -54,6 +97,9 @@ enum tpx_py_type_kind : unsigned char {
     TPK_FLOATLIST,
     TPK_TENSORLIST,
     TPK_SCALARLIST,
+    TPK_BOOLLIST,
+    TPK_TENSORLIST_OPTIONAL,
+    TPK_GENERATOR,
 };
 constexpr unsigned char TPK_OPTIONAL = 0x80;
 
@@ -90,14 +136,21 @@ std::optional<int64_t> tpx_py_opt_int64(PyObject* obj);
 std::optional<double> tpx_py_opt_double(PyObject* obj);
 std::optional<bool> tpx_py_opt_bool(PyObject* obj);
 std::optional<Scalar> tpx_py_opt_scalar(PyObject* obj);
+Generator tpx_py_generator(PyObject* obj);
+std::optional<Generator> tpx_py_opt_generator(PyObject* obj);
+Device tpx_py_device(PyObject* obj);
 std::optional<Device> tpx_py_opt_device(PyObject* obj);
 std::vector<int64_t> tpx_py_intlist(PyObject* obj);
 std::vector<double> tpx_py_doublelist(PyObject* obj);
+// Fixed-width bool lists (`bool[3] output_mask` and friends).
+std::vector<bool> tpx_py_boollist(PyObject* obj);
 // Tensor lists accept tuple/list containers; other sequences fall through to
 // overload dispatch.
 std::vector<Tensor> tpx_py_tensorlist(PyObject* obj);
+std::vector<std::optional<Tensor>> tpx_py_opt_tensorlist(PyObject* obj);
 std::vector<Scalar> tpx_py_scalarlist(PyObject* obj);
 std::optional<std::vector<int64_t>> tpx_py_opt_intlist(PyObject* obj);
+std::optional<std::vector<double>> tpx_py_opt_doublelist(PyObject* obj);
 std::string tpx_py_string(PyObject* obj);
 std::optional<std::string> tpx_py_opt_string(PyObject* obj);
 DType tpx_py_dtype(PyObject* obj);
@@ -117,14 +170,34 @@ struct tpx_py_GilRelease {
 
 // ---- packing ---------------------------------------------------------------
 PyObject* tpx_py_wrap(const Tensor& t);
+PyObject* tpx_py_wrap_optional_tensor(const std::optional<Tensor>& t);
 PyObject* tpx_py_wrap_scalar(const Scalar& s);
+PyObject* tpx_py_wrap_optional_scalar(const std::optional<Scalar>& s);
+PyObject* tpx_py_wrap_generator(const Generator& g);
 PyObject* tpx_py_wrap_dtype(const DType& dt);
 PyObject* tpx_py_wrap_device(const Device& d);
+PyObject* tpx_py_wrap_optional_generator(const std::optional<Generator>& g);
+PyObject* tpx_py_wrap_optional_int64(const std::optional<int64_t>& v);
+PyObject* tpx_py_wrap_optional_double(const std::optional<double>& v);
+PyObject* tpx_py_wrap_optional_bool(const std::optional<bool>& v);
+PyObject* tpx_py_wrap_optional_string(const std::optional<std::string>& v);
+PyObject* tpx_py_wrap_optional_dtype(const std::optional<DType>& dt);
+PyObject* tpx_py_wrap_optional_device(const std::optional<Device>& d);
 PyObject* tpx_py_wrap_tuple(const std::tuple<Tensor, Tensor>& t);
 PyObject* tpx_py_wrap_tuple3(const std::tuple<Tensor, Tensor, Tensor>& t);
 PyObject* tpx_py_wrap_tuple4(
     const std::tuple<Tensor, Tensor, Tensor, Tensor>& t);
 PyObject* tpx_py_wrap_list(const std::vector<Tensor>& v);
+PyObject* tpx_py_wrap_optional_tensor_list(
+    const std::vector<std::optional<Tensor>>& v);
+PyObject* tpx_py_wrap_intlist(const std::vector<int64_t>& v);
+PyObject* tpx_py_wrap_doublelist(const std::vector<double>& v);
+PyObject* tpx_py_wrap_optional_intlist(
+    const std::optional<std::vector<int64_t>>& v);
+PyObject* tpx_py_wrap_optional_doublelist(
+    const std::optional<std::vector<double>>& v);
+PyObject* tpx_py_wrap_boollist(const std::vector<bool>& v);
+PyObject* tpx_py_wrap_scalarlist(const std::vector<Scalar>& v);
 
 // keep `self` alive while the returned alias references its storage
 void tpx_py_keep_alive(PyObject* self);

@@ -1,9 +1,4 @@
-# RPC-backed functional wrappers. All entry points require the RPC runtime.
-__all__: list[str] = []
+from ..functional import *
+from .remote_module import RemoteModule
 
-
-def __getattr__(name):
-    raise RuntimeError(
-        f"tensorplay.distributed.nn.api.{name} requires "
-        "tensorplay.distributed.rpc, which is not available in this build."
-    )
+__all__ = ["RemoteModule"]

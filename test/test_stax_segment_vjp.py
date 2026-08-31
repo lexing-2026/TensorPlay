@@ -10,8 +10,8 @@ autograd on a real GPU is gated on ``runtime_available()``.
 import pytest
 
 import tensorplay as tp
-from tensorplay.compiler.codegen import triton as st
-from tensorplay.compiler.graph import Tracer
+from tensorplay._stax.codegen import triton as st
+from tensorplay.graph import Tracer
 
 
 def _fake_runtime(monkeypatch, launches):
@@ -174,7 +174,7 @@ def test_untrainable_reduction_still_falls_back(monkeypatch):
 
 @pytest.mark.skipif(not st.runtime_available(), reason="Triton/CUDA unavailable")
 def test_multi_segment_training_matches_eager_gpu():
-    from tensorplay.compiler.graph import Tracer as _Tracer
+    from tensorplay.graph import Tracer as _Tracer
 
     device = tp.device("cuda", 0)
 

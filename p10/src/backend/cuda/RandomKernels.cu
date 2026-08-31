@@ -2,15 +2,20 @@
 #include "CUDARuntime.h"
 #include "Dispatcher.h"
 #include "CUDAGenerator.h"
+#include "Generator.h"
 #include "Exception.h"
 #include "Utils.h"
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <limits>
+#include <optional>
 #include <string>
 #include <tuple>
+#include <type_traits>
+#include <utility>
 
 namespace tensorplay {
 namespace cuda {
@@ -103,13 +108,20 @@ __global__ void distribution_elementwise_grid_stride_kernel(
 template <typename scalar_t, typename dist_return_t, int unroll_factor,
           typename dist_t, typename transform_t>
 void distribution_nullary_kernel(scalar_t* out_data, int64_t numel,
-                                 dist_t dist_func, transform_t transform_func) {
+                                 dist_t dist_func, transform_t transform_func,
+                                 std::optional<Generator> generator = std::nullopt) {
     if (numel == 0) return;
     auto policy = calc_execution_policy(numel, unroll_factor);
     const uint64_t counter_offset = std::get<0>(policy);
     const dim3 grid = std::get<1>(policy);
     const dim3 block = std::get<2>(policy);
-    auto philox_args = philox_cuda_state(counter_offset);
+    PhiloxCudaState philox_args;
+    if (generator.has_value()) {
+        philox_args.seed = generator->random64();
+        philox_args.offset = 0;
+    } else {
+        philox_args = philox_cuda_state(counter_offset);
+    }
     cudaStream_t stream = getCurrentCUDAStream().stream();
     distribution_elementwise_grid_stride_kernel<scalar_t, dist_return_t, unroll_factor>
         <<<grid, block, 0, stream>>>(numel, philox_args, out_data,
@@ -198,7 +210,8 @@ Tensor rand_kernel_cuda(const std::vector<int64_t>& size, DType dtype, Device de
     return t;
 }
 
-Tensor randn_kernel_cuda(const std::vector<int64_t>& size, DType dtype, Device device) {
+Tensor randn_kernel_cuda(const std::vector<int64_t>& size, DType dtype, Device device,
+                         std::optional<Generator> generator = std::nullopt) {
     Tensor t = Tensor::empty(size, dtype, device);
     int64_t n = t.numel();
 
@@ -207,26 +220,28 @@ Tensor randn_kernel_cuda(const std::vector<int64_t>& size, DType dtype, Device d
         distribution_nullary_kernel<float, float4, 4>(
             data, n,
             [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal4(state); },
-            [] __device__ (float rand) { return rand; });
+            [] __device__ (float rand) { return rand; }, std::move(generator));
     } else if (dtype == DType::Float64) {
         double* data = t.data_ptr<double>();
         distribution_nullary_kernel<double, double2, 2>(
             data, n,
             [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal2_double(state); },
-            [] __device__ (double rand) { return rand; });
+            [] __device__ (double rand) { return rand; }, std::move(generator));
     } else if (dtype == DType::Float16 || dtype == DType::BFloat16) {
         if (dtype == DType::Float16) {
             Half* data = t.data_ptr<Half>();
             distribution_nullary_kernel<Half, float4, 4>(
                 data, n,
                 [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal4(state); },
-                [] __device__ (float rand) { return static_cast<Half>(rand); });
+                [] __device__ (float rand) { return static_cast<Half>(rand); },
+                std::move(generator));
         } else {
             BFloat16* data = t.data_ptr<BFloat16>();
             distribution_nullary_kernel<BFloat16, float4, 4>(
                 data, n,
                 [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal4(state); },
-                [] __device__ (float rand) { return static_cast<BFloat16>(rand); });
+                [] __device__ (float rand) { return static_cast<BFloat16>(rand); },
+                std::move(generator));
         }
     } else if (dtype == DType::ComplexFloat || dtype == DType::ComplexDouble) {
         // standard-normal factory is N(0, 1/sqrt(2)) per component.
@@ -238,13 +253,15 @@ Tensor randn_kernel_cuda(const std::vector<int64_t>& size, DType dtype, Device d
             distribution_nullary_kernel<float, float4, 4>(
                 raw, comps,
                 [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal4(state); },
-                [] __device__ (float v) { return v * kInvSqrt2f; });
+                [] __device__ (float v) { return v * kInvSqrt2f; },
+                std::move(generator));
         } else {
             double* raw = static_cast<double*>(t.data_ptr());
             distribution_nullary_kernel<double, double2, 2>(
                 raw, comps,
                 [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal2_double(state); },
-                [] __device__ (double v) { return v * kInvSqrt2; });
+                [] __device__ (double v) { return v * kInvSqrt2; },
+                std::move(generator));
         }
     } else {
          TP_THROW(NotImplementedError, "randn() only supports floating dtypes on CUDA for now");
@@ -315,10 +332,13 @@ Tensor& uniform_kernel_cuda(Tensor& self, double from, double to) {
     return self;
 }
 
-Tensor& normal_kernel_cuda(Tensor& self, double mean, double std) {
+Tensor& normal_kernel_cuda(Tensor& self, double mean, double std,
+                           std::optional<Generator> generator) {
     if (self.numel() == 0) return self;
     if (!self.is_contiguous()) {
-        return fill_via_contiguous(self, [&](Tensor& t) { return normal_kernel_cuda(t, mean, std); });
+        return fill_via_contiguous(self, [&](Tensor& t) {
+            return normal_kernel_cuda(t, mean, std, std::move(generator));
+        });
     }
     int64_t n = self.numel();
     if (std < 0.0) {
@@ -331,13 +351,15 @@ Tensor& normal_kernel_cuda(Tensor& self, double mean, double std) {
         distribution_nullary_kernel<float, float4, 4>(
             data, n,
             [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal4(state); },
-            [mu, sigma] __device__ (float rand) { return mu + sigma * rand; });
+            [mu, sigma] __device__ (float rand) { return mu + sigma * rand; },
+            std::move(generator));
     } else if (self.dtype() == DType::Float64) {
         double* data = self.data_ptr<double>();
         distribution_nullary_kernel<double, double2, 2>(
             data, n,
             [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_normal2_double(state); },
-            [mean, std] __device__ (double rand) { return mean + std * rand; });
+            [mean, std] __device__ (double rand) { return mean + std * rand; },
+            std::move(generator));
     } else {
         TP_THROW(NotImplementedError, "normal_() only supports Float32/Float64 on CUDA for now");
     }
@@ -709,42 +731,207 @@ Tensor poisson_kernel_cuda(const Tensor& self) {
     return t;
 }
 
-// one thread per element keeps the threshold read race-free.
-template <typename scalar_t>
-__global__ void bernoulli_fill_impl(int64_t numel, PhiloxCudaState philox_args,
-                                    const scalar_t* in_data, scalar_t* out_data) {
+template <typename output_t, typename probability_t>
+__global__ void bernoulli_tensor_fill_impl(
+        int64_t numel, PhiloxCudaState philox_args,
+        const probability_t* probability, output_t* output) {
     uint64_t seed;
     uint64_t offset;
     philox_unpack(philox_args, &seed, &offset);
-    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (idx >= numel) return;
+    const int64_t thread_index =
+        static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t thread_count =
+        static_cast<int64_t>(blockDim.x) * gridDim.x;
+    int64_t linear_index = thread_index;
     curandStatePhilox4_32_10_t state;
-    curand_init(seed, idx, offset, &state);
-    const float u = curand_uniform(&state);
-    out_data[idx] = static_cast<scalar_t>(
-        u < static_cast<float>(in_data[idx]) ? scalar_t(1) : scalar_t(0));
+    curand_init(seed, thread_index, offset, &state);
+    for (; linear_index < numel; linear_index += thread_count * 4) {
+        const float4 random = curand_uniform4(&state);
+        const int64_t i0 = linear_index;
+        const int64_t i1 = linear_index + thread_count;
+        const int64_t i2 = linear_index + thread_count * 2;
+        const int64_t i3 = linear_index + thread_count * 3;
+        if (i0 < numel) {
+            const double p = static_cast<double>(probability[i0]);
+            assert(0.0 <= p && p <= 1.0);
+            output[i0] = static_cast<output_t>(random.x <= p);
+        }
+        if (i1 < numel) {
+            const double p = static_cast<double>(probability[i1]);
+            assert(0.0 <= p && p <= 1.0);
+            output[i1] = static_cast<output_t>(random.y <= p);
+        }
+        if (i2 < numel) {
+            const double p = static_cast<double>(probability[i2]);
+            assert(0.0 <= p && p <= 1.0);
+            output[i2] = static_cast<output_t>(random.z <= p);
+        }
+        if (i3 < numel) {
+            const double p = static_cast<double>(probability[i3]);
+            assert(0.0 <= p && p <= 1.0);
+            output[i3] = static_cast<output_t>(random.w <= p);
+        }
+    }
 }
 
-Tensor& bernoulli_inplace_kernel_cuda(Tensor& self) {
+template <typename output_t>
+__global__ void bernoulli_scalar_fill_impl(
+        int64_t numel, PhiloxCudaState philox_args, double p,
+        output_t* output) {
+    uint64_t seed;
+    uint64_t offset;
+    philox_unpack(philox_args, &seed, &offset);
+    const int64_t thread_index =
+        static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t thread_count =
+        static_cast<int64_t>(blockDim.x) * gridDim.x;
+    int64_t linear_index = thread_index;
+    curandStatePhilox4_32_10_t state;
+    curand_init(seed, thread_index, offset, &state);
+    for (; linear_index < numel; linear_index += thread_count * 4) {
+        const float4 random = curand_uniform4(&state);
+        const int64_t i0 = linear_index;
+        const int64_t i1 = linear_index + thread_count;
+        const int64_t i2 = linear_index + thread_count * 2;
+        const int64_t i3 = linear_index + thread_count * 3;
+        if (i0 < numel) output[i0] = static_cast<output_t>(random.x <= p);
+        if (i1 < numel) output[i1] = static_cast<output_t>(random.y <= p);
+        if (i2 < numel) output[i2] = static_cast<output_t>(random.z <= p);
+        if (i3 < numel) output[i3] = static_cast<output_t>(random.w <= p);
+    }
+}
+
+PhiloxCudaState bernoulli_philox_state(
+        std::optional<Generator> generator, uint64_t increment) {
+    if (generator.has_value()) {
+        PhiloxCudaState state;
+        state.seed = generator->random64();
+        state.offset = 0;
+        return state;
+    }
+    return philox_cuda_state(increment);
+}
+
+template <typename output_t, typename probability_t>
+void launch_bernoulli_tensor(const Tensor& probability, Tensor& output,
+                             std::optional<Generator> generator) {
+    const auto policy = calc_execution_policy(output.numel(), 4);
+    const uint64_t counter_offset = std::get<0>(policy);
+    const dim3 grid = std::get<1>(policy);
+    const dim3 block = std::get<2>(policy);
+    const PhiloxCudaState philox_args =
+        bernoulli_philox_state(std::move(generator), counter_offset);
+    bernoulli_tensor_fill_impl<output_t, probability_t>
+        <<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
+            output.numel(), philox_args, probability.data_ptr<probability_t>(),
+            output.data_ptr<output_t>());
+}
+
+template <typename probability_t>
+void launch_bernoulli_tensor_for_output(
+        const Tensor& probability, Tensor& output,
+        std::optional<Generator> generator) {
+#define TP_BERNOULLI_TENSOR_OUTPUT_CASE(ctype, name) \
+    case DType::name: \
+        launch_bernoulli_tensor<ctype, probability_t>( \
+            probability, output, std::move(generator)); \
+        break;
+    switch (output.dtype()) {
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_BERNOULLI_TENSOR_OUTPUT_CASE)
+        default:
+            TP_THROW(NotImplementedError,
+                     "bernoulli_ output dtype is not supported");
+    }
+#undef TP_BERNOULLI_TENSOR_OUTPUT_CASE
+}
+
+Tensor prepare_bernoulli_probabilities(const Tensor& output,
+                                       const Tensor& probabilities) {
+    if (!isFloatingType(probabilities.dtype())) {
+        TP_THROW(TypeError,
+                 "bernoulli_ probability tensor must have a floating dtype");
+    }
+    const DType probability_dtype =
+        output.dtype() == DType::Float64 ? DType::Float64 : DType::Float32;
+    Tensor probability = probabilities.dtype() == probability_dtype
+        ? probabilities
+        : probabilities.to(probability_dtype);
+    if (probability.shape() != output.shape()) {
+        probability = probability.expand(
+            static_cast<std::vector<int64_t>>(output.shape()));
+    }
+    return probability.is_contiguous() ? probability : probability.contiguous();
+}
+
+Tensor& bernoulli_tensor_inplace_kernel_cuda(
+        Tensor& self, const Tensor& probabilities,
+        std::optional<Generator> generator) {
+    if (self.device() != probabilities.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "bernoulli_: probability tensor must be on the same device");
+    }
     if (self.numel() == 0) return self;
     if (!self.is_contiguous()) {
-        return fill_via_contiguous(self, [&](Tensor& t) { return bernoulli_inplace_kernel_cuda(t); });
+        return fill_via_contiguous(self, [&](Tensor& t) {
+            return bernoulli_tensor_inplace_kernel_cuda(
+                t, probabilities, std::move(generator));
+        });
     }
-    int64_t n = self.numel();
-    const int threads = 256;
-    const int blocks = static_cast<int>((n + threads - 1) / threads);
-    auto philox_args = philox_cuda_state(kMaxGeneratorOffsetsPerCall *
-        ((static_cast<uint64_t>(n) + threads * blocks - 1) / (threads * blocks) + 1));
 
-    if (self.dtype() == DType::Float32) {
-        bernoulli_fill_impl<float><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
-            n, philox_args, self.data_ptr<float>(), self.data_ptr<float>());
-    } else if (self.dtype() == DType::Float64) {
-        bernoulli_fill_impl<double><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
-            n, philox_args, self.data_ptr<double>(), self.data_ptr<double>());
+    Tensor probability = prepare_bernoulli_probabilities(self, probabilities);
+    if (self.dtype() == DType::Float64) {
+        launch_bernoulli_tensor_for_output<double>(
+            probability, self, std::move(generator));
     } else {
-        TP_THROW(NotImplementedError, "bernoulli_() only supports Float32/Float64 on CUDA for now");
+        launch_bernoulli_tensor_for_output<float>(
+            probability, self, std::move(generator));
     }
+    cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) {
+        TP_THROW(RuntimeError, std::string("CUDA bernoulli_ Error: ") +
+                    cudaGetErrorString(error));
+    }
+    return self;
+}
+
+template <typename output_t>
+void launch_bernoulli_scalar(Tensor& output, double p,
+                             std::optional<Generator> generator) {
+    const auto policy = calc_execution_policy(output.numel(), 4);
+    const uint64_t counter_offset = std::get<0>(policy);
+    const dim3 grid = std::get<1>(policy);
+    const dim3 block = std::get<2>(policy);
+    const PhiloxCudaState philox_args =
+        bernoulli_philox_state(std::move(generator), counter_offset);
+    bernoulli_scalar_fill_impl<output_t>
+        <<<grid, block, 0, getCurrentCUDAStream().stream()>>>(
+            output.numel(), philox_args, p, output.data_ptr<output_t>());
+}
+
+Tensor& bernoulli_scalar_inplace_kernel_cuda(
+        Tensor& self, double p, std::optional<Generator> generator) {
+    if (!(p >= 0.0 && p <= 1.0)) {
+        TP_THROW(ValueError, "bernoulli_ expects p to be in [0, 1]");
+    }
+    if (self.numel() == 0) return self;
+    if (!self.is_contiguous()) {
+        return fill_via_contiguous(self, [&](Tensor& t) {
+            return bernoulli_scalar_inplace_kernel_cuda(
+                t, p, std::move(generator));
+        });
+    }
+#define TP_BERNOULLI_SCALAR_OUTPUT_CASE(ctype, name) \
+    case DType::name: \
+        launch_bernoulli_scalar<ctype>(self, p, std::move(generator)); \
+        break;
+    switch (self.dtype()) {
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_BERNOULLI_SCALAR_OUTPUT_CASE)
+        default:
+            TP_THROW(NotImplementedError,
+                     "bernoulli_ output dtype is not supported");
+    }
+#undef TP_BERNOULLI_SCALAR_OUTPUT_CASE
+
     cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess) {
         TP_THROW(RuntimeError, std::string("CUDA bernoulli_ Error: ") +
@@ -795,6 +982,25 @@ Tensor randn_stub_cuda(const std::vector<int64_t>& size, std::optional<DType> dt
                              device.value_or(Device(DeviceType::CUDA)));
 }
 
+Tensor randn_generator_stub_cuda(const std::vector<int64_t>& size,
+                                 std::optional<Generator> generator,
+                                 std::optional<DType> dtype,
+                                 std::optional<int64_t> layout,
+                                 std::optional<Device> device,
+                                 std::optional<bool> pin_memory) {
+    if (layout.has_value() && *layout != 2) {
+        TP_THROW(NotImplementedError,
+                 "randn is only implemented for strided (dense) layout tensors");
+    }
+    if (pin_memory.value_or(false)) {
+        TP_THROW(RuntimeError,
+                 "pin_memory is not valid for CUDA random tensor outputs");
+    }
+    return randn_kernel_cuda(size, dtype.value_or(DType::Float32),
+                             device.value_or(Device(DeviceType::CUDA)),
+                             std::move(generator));
+}
+
 Tensor randint_stub_cuda(int64_t low, int64_t high, const std::vector<int64_t>& size,
                          DType dtype, std::optional<Device> device) {
     return randint_kernel_cuda(low, high, size, dtype,
@@ -805,33 +1011,35 @@ Tensor randperm_stub_cuda(int64_t n, DType dtype, std::optional<Device> device) 
     return randperm_kernel_cuda(n, dtype, device.value_or(Device(DeviceType::CUDA)));
 }
 
-// fresh tensor of the same shape/dtype, filled by the same philox kernel that
-// backs bernoulli_, with p read from `self` (separate in/out pointers).
-Tensor bernoulli_out_kernel_cuda(const Tensor& self) {
-    Tensor out(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
-    int64_t n = self.numel();
-    if (n == 0) return out;
-    const int threads = 256;
-    const int blocks = static_cast<int>((n + threads - 1) / threads);
-    auto philox_args = philox_cuda_state(kMaxGeneratorOffsetsPerCall *
-        ((static_cast<uint64_t>(n) + threads * blocks - 1) / (threads * blocks) + 1));
-
-    if (self.dtype() == DType::Float32) {
-        bernoulli_fill_impl<float><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
-            n, philox_args, self.data_ptr<float>(), out.data_ptr<float>());
-    } else if (self.dtype() == DType::Float64) {
-        bernoulli_fill_impl<double><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
-            n, philox_args, self.data_ptr<double>(), out.data_ptr<double>());
-    } else {
-        TP_THROW(NotImplementedError, "bernoulli() only supports Float32/Float64 on CUDA for now");
-    }
-    cudaError_t error = cudaGetLastError();
-    if (error != cudaSuccess) {
-        TP_THROW(RuntimeError, std::string("CUDA bernoulli Error: ") +
-                    cudaGetErrorString(error));
-    }
+Tensor bernoulli_kernel_cuda(const Tensor& self,
+                             std::optional<Generator> generator) {
+    Tensor out(static_cast<std::vector<int64_t>>(self.shape()),
+               self.dtype(), self.device());
+    bernoulli_tensor_inplace_kernel_cuda(out, self, std::move(generator));
     return out;
 }
+
+Tensor& bernoulli_out_kernel_cuda(const Tensor& self,
+                                  std::optional<Generator> generator,
+                                  Tensor& out) {
+    if (self.device() != out.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "bernoulli: output must be on the same device as input");
+    }
+    out.resize_(static_cast<std::vector<int64_t>>(self.shape()));
+    return bernoulli_tensor_inplace_kernel_cuda(out, self,
+                                                std::move(generator));
+}
+
+Tensor bernoulli_p_kernel_cuda(const Tensor& self, double p,
+                               std::optional<Generator> generator) {
+    Tensor out(static_cast<std::vector<int64_t>>(self.shape()),
+               self.dtype(), self.device());
+    bernoulli_scalar_inplace_kernel_cuda(out, p, std::move(generator));
+    return out;
+}
+
+} // anonymous namespace
 
 // (tensor-tensor): ret = empty(infer_size(mean.sizes(), std.sizes()));
 // ret.normal_(0, 1); ret.mul_(std).add_(mean);
@@ -846,11 +1054,15 @@ Tensor normal_broadcast_kernel_cuda(const Tensor& mean, const Tensor& std) {
     return out;
 }
 
-} // anonymous namespace
+/*
+ * The registration table is kept at the end of the translation unit so every
+ * overload has a complete schema-level function type before registration.
+ */
 
 TENSORPLAY_LIBRARY_IMPL(CUDA, RandomKernels) {
     m.impl("rand", rand_stub_cuda);
     m.impl("randn", randn_stub_cuda);
+    m.impl("randn.generator", randn_generator_stub_cuda);
     m.impl("rand_like", rand_like_kernel_cuda);
     m.impl("randn_like", randn_like_kernel_cuda);
     m.impl("uniform_", uniform_kernel_cuda);
@@ -860,8 +1072,11 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, RandomKernels) {
     m.impl("log_normal_", log_normal_kernel_cuda);
     m.impl("cauchy_", cauchy_kernel_cuda);
     m.impl("random_", random_kernel_cuda);
-    m.impl("bernoulli_", bernoulli_inplace_kernel_cuda);
-    m.impl("bernoulli", bernoulli_out_kernel_cuda);
+    m.impl("bernoulli", bernoulli_kernel_cuda);
+    m.impl("bernoulli.out", bernoulli_out_kernel_cuda);
+    m.impl("bernoulli.p", bernoulli_p_kernel_cuda);
+    m.impl("bernoulli_.Tensor", bernoulli_tensor_inplace_kernel_cuda);
+    m.impl("bernoulli_.float", bernoulli_scalar_inplace_kernel_cuda);
     m.impl("normal", normal_broadcast_kernel_cuda);
     m.impl("poisson", poisson_kernel_cuda);
     m.impl("randint", randint_stub_cuda);

@@ -1,10 +1,10 @@
 """L5-M5c static fusion segmentation semantics."""
 
 import tensorplay as tp
-from tensorplay.compiler.codegen.triton import _reduction_spec_from_node
-from tensorplay.compiler.fx_passes import POINTWISE_FUSED_OP_NAMES
-from tensorplay.compiler.graph import Tracer
-from tensorplay.compiler.scheduler import annotate, describe, segment_graph
+from tensorplay._stax.codegen.triton import _reduction_spec_from_node
+from tensorplay.graph.passes import POINTWISE_FUSED_OP_NAMES
+from tensorplay.graph import Tracer
+from tensorplay._stax.scheduler import annotate, describe, segment_graph
 
 
 def _trace(fn, *args):
@@ -96,11 +96,38 @@ def test_back_to_back_reductions_split():
     assert segs[1].producer is not None and segs[1].producer.op == "call_method"
 
 
-def test_extern_op_falls_back_whole_graph():
+def test_extern_op_is_a_segment_barrier():
+    """Unsupported operators become eager one-node segments, not a bail."""
+
     x = tp.tensor([[1.0, 2.0], [3.0, 4.0]])
     _, segs = _segments(
         lambda t: ((t * 2.0).reshape(4)).sum(), x
     )  # reshape is not pointwise-fusible
+    assert segs is not None
+    assert describe(segs) == "pw -> extern -> pw+red"
+    assert segs[1].kind == "extern"
+    assert segs[1].nodes[0].op == "call_method"
+    assert segs[1].export_node is segs[1].nodes[0]
+
+
+def test_mixed_graph_interleaves_fused_and_eager():
+    x = tp.tensor([[1.0, 2.0], [3.0, 4.0]])
+    _, segs = _segments(lambda t: t.softmax(dim=1).exp() + 1.0, x)
+    assert segs is not None
+    assert describe(segs) == "extern -> pw"
+
+
+def test_interior_value_across_barrier_falls_back():
+    """A value interior to one kernel cannot feed a later segment (v1)."""
+
+    x = tp.tensor([[1.0, 2.0], [3.0, 4.0]])
+
+    def fn(t):
+        g = (t * 2.0).relu()  # interior: consumed by h and by the output
+        h = g * 3.0
+        return t.softmax(dim=1) * h * g
+
+    _, segs = _segments(fn, x)
     assert segs is None
 
 
@@ -136,12 +163,12 @@ def _plan_harness(fn, *args):
     """Run the real scheduler + extractor the way codegen does."""
     from types import SimpleNamespace
 
-    from tensorplay.backends.stax import _build_pointwise_program
-    from tensorplay.compiler.codegen.triton import (
+    from tensorplay._stax.stax import _build_pointwise_program
+    from tensorplay._stax.codegen.triton import (
         _ExternSource,
         _extract_segment_view,
     )
-    from tensorplay.compiler.codegen.triton import (
+    from tensorplay._stax.codegen.triton import (
         _reduction_spec_from_node as classify,
     )
 
@@ -193,8 +220,8 @@ def test_pw_red_pw_fuses_to_single_segment_with_epilogue_program():
     assert prog0 is not None and len(prog0[1]) > 0
 
     # epilogue program follows compile_graph_module's construction
-    from tensorplay.compiler.codegen.triton import _extract_segment_view
-    from tensorplay.backends.stax import _build_pointwise_program
+    from tensorplay._stax.codegen.triton import _extract_segment_view
+    from tensorplay._stax.stax import _build_pointwise_program
     from types import SimpleNamespace as NS
 
     view, epi_mapping, epi_externals = _extract_segment_view(

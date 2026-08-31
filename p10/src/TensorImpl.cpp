@@ -75,6 +75,17 @@ TensorImpl::TensorImpl(Storage storage, const std::vector<int64_t>& sizes, const
     is_contiguous_ = sizes_and_strides_.is_contiguous();
 }
 
+TensorImpl::TensorImpl(std::shared_ptr<TensorImpl> transform_value,
+                       const std::vector<int64_t>& sizes,
+                       const std::vector<int64_t>& strides)
+    : storage_offset_(0), sizes_and_strides_(sizes, strides),
+      dtype_(transform_value ? transform_value->dtype() : DType::Undefined),
+      device_(transform_value ? transform_value->device() : Device(DeviceType::CPU)),
+      is_contiguous_(sizes_and_strides_.is_contiguous()),
+      transform_value_(std::move(transform_value)) {
+    shared_state_ = std::make_shared<SharedState>();
+}
+
 // Copy does not carry autograd metadata: copies start fresh, matching
 TensorImpl::TensorImpl(const TensorImpl& other)
     : storage_offset_(other.storage_offset_),
@@ -85,7 +96,10 @@ TensorImpl::TensorImpl(const TensorImpl& other)
       is_contiguous_(other.is_contiguous_),
       memory_format_(other.memory_format_),
       shared_state_(other.shared_state_),
-      sparse_state_(other.sparse_state_) {}
+      sparse_state_(other.sparse_state_),
+      transform_value_(other.transform_value_),
+      transform_batch_dim_(other.transform_batch_dim_),
+      transform_level_(other.transform_level_) {}
 TensorImpl::TensorImpl(TensorImpl&& other) noexcept = default;
 TensorImpl& TensorImpl::operator=(const TensorImpl& other) = default;
 TensorImpl& TensorImpl::operator=(TensorImpl&& other) noexcept = default;
@@ -165,6 +179,9 @@ void TensorImpl::copy_metadata_from(const TensorImpl& other) {
     is_contiguous_ = other.is_contiguous_;
     memory_format_ = other.memory_format_;
     sparse_state_ = other.sparse_state_;
+    transform_value_ = other.transform_value_;
+    transform_batch_dim_ = other.transform_batch_dim_;
+    transform_level_ = other.transform_level_;
     // onednn_md_ = other.onednn_md_; // Replaced by shared_state_
 }
 

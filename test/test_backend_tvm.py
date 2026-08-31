@@ -3,7 +3,7 @@
 import unittest
 
 import tensorplay as tp
-from tensorplay.backends.tvm import has_tvm
+from tensorplay._stax.tvm import has_tvm
 
 
 def _require_tvm_or_skip():
@@ -33,11 +33,11 @@ class TvmAvailabilityTest(unittest.TestCase):
         self.assertIn("install", message.lower())
 
     def test_backend_registered(self):
-        self.assertIn("tvm", tp.compiler.list_backends())
+        self.assertIn("tvm", tp._stax.list_backends())
 
 
 @unittest.skipUnless(has_tvm(), "apache-tvm is not installed")
-class TvmNumericParityTest(unittest.TestCase):
+class TvmNumericEquivalenceTest(unittest.TestCase):
     def test_pointwise_chain_matches_eager(self):
         def model(a, b):
             return tp.sigmoid(tp.tanh(a + b) * (a * b)) - a

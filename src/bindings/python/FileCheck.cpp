@@ -2,6 +2,8 @@
 
 #include "FileCheck.h"
 
+namespace py = pybind11;
+
 using tensorplay::FileCheck;
 
 void init_filecheck(py::module_& m) {

@@ -11,7 +11,7 @@ from typing import Any, List, Optional
 
 import tensorplay as tp
 import tensorplay.distributed as dist
-from tensorplay.distributed import distributed_c10d as _c10d
+from tensorplay.distributed import distributed_core as _core
 from tensorplay.distributed.algorithms.join import Join, JoinHook, Joinable
 from tensorplay.nn.modules.module import Module
 
@@ -295,8 +295,8 @@ class DistributedDataParallel(Module, Joinable):
         # dist.all_reduce wrapper (no per-call group resolution, lock, event
         # record, or Work allocation); ordering is handled by the comm-stream
         # joins instead of work.wait().
-        self._comm_handle = _c10d._ensure_comm(
-            self.process_group, _c10d.default_pg_timeout.total_seconds())
+        self._comm_handle = _core._ensure_comm(
+            self.process_group, _core.default_pg_timeout.total_seconds())
 
         # Builds reducer state and registers grad hooks.
         self._ddp_init_helper(parameters, expect_sparse_gradient)
@@ -661,7 +661,7 @@ class DistributedDataParallel(Module, Joinable):
         cur = tp.cuda.current_stream(buffer.device)
         self._comm_stream.wait_stream(cur)
         with tp.cuda.stream(self._comm_stream):
-            _c10d._C.all_reduce(buffer, int(op), self._comm_handle)
+            _core._C.all_reduce(buffer, int(op), self._comm_handle)
             if not self.gradient_as_bucket_view:
                 self._copy_bucket_back(bstate, buffer)
         if bstate["index"] == len(self._buckets) - 1:
@@ -788,8 +788,8 @@ class DistributedDataParallel(Module, Joinable):
         self.__dict__.update(state)
         self.__dict__.setdefault("require_forward_param_sync", True)
         self.__dict__.setdefault("require_backward_grad_sync", True)
-        self._comm_handle = _c10d._ensure_comm(
-            self.process_group, _c10d.default_pg_timeout.total_seconds())
+        self._comm_handle = _core._ensure_comm(
+            self.process_group, _core.default_pg_timeout.total_seconds())
         parameters, expect_sparse_gradient = self._build_params_for_reducer()
         self._ddp_init_helper(parameters, expect_sparse_gradient)
 

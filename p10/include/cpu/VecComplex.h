@@ -22,6 +22,7 @@
 //   atanh(z) = (log(1+z) - log(1-z)) / 2
 
 #include <immintrin.h>
+#include "cpu/vec/SleefShims.h"
 #include "cpu/ComplexKernels.h"
 
 #include <cmath>
@@ -41,10 +42,11 @@
 // falls back to the scalar implementations registered via REGISTER_DISPATCH.
 // Compiling the always_inline AVX helpers without matching target flags is
 // a hard error ("target specific option mismatch").
-#if defined(TP_VECCPLX_X86) && defined(__GLIBC__) && defined(__x86_64__) \
+#if defined(TP_VECCPLX_X86) && defined(__x86_64__) \
+    && (defined(__GNUC__) || defined(__clang__)) \
     && (defined(__AVX2__) || defined(CPU_CAPABILITY_AVX2) \
         || defined(CPU_CAPABILITY_AVX512))
-#define TP_VECCPLX_LIBMVEC 1
+#define TP_VECCPLX_SLEEF 1
 #endif
 
 namespace tensorplay {
@@ -70,7 +72,7 @@ inline bool width_ok(DType dt) {
     return dt == DType::ComplexFloat || dt == DType::ComplexDouble;
 }
 
-#ifdef TP_VECCPLX_LIBMVEC
+#ifdef TP_VECCPLX_SLEEF
 
 inline bool avx2_available() {
     static const bool ok = __builtin_cpu_supports("avx2") != 0;
@@ -88,60 +90,6 @@ inline bool avx512_available() {
 #endif
 }
 
-extern "C" {
-__m256 _ZGVdN8v_expf(__m256);
-__m256 _ZGVdN8v_expm1f(__m256);
-__m256 _ZGVdN8v_logf(__m256);
-__m256 _ZGVdN8v_log1pf(__m256);
-__m256 _ZGVdN8v_log2f(__m256);
-__m256 _ZGVdN8v_log10f(__m256);
-__m256 _ZGVdN8v_sinf(__m256);
-__m256 _ZGVdN8v_cosf(__m256);
-__m256 _ZGVdN8v_atanf(__m256);
-__m256 _ZGVdN8v_sinhf(__m256);
-__m256 _ZGVdN8v_coshf(__m256);
-__m256 _ZGVdN8vv_atan2f(__m256, __m256);
-__m256 _ZGVdN8vv_hypotf(__m256, __m256);
-
-__m256d _ZGVdN4v_exp(__m256d);
-__m512 _ZGVeN16v_expf(__m512);
-__m512 _ZGVeN16v_expm1f(__m512);
-__m512 _ZGVeN16v_logf(__m512);
-__m512 _ZGVeN16v_log1pf(__m512);
-__m512 _ZGVeN16v_log2f(__m512);
-__m512 _ZGVeN16v_log10f(__m512);
-__m512 _ZGVeN16v_sinf(__m512);
-__m512 _ZGVeN16v_cosf(__m512);
-__m512 _ZGVeN16v_atanf(__m512);
-__m512 _ZGVeN16v_sinhf(__m512);
-__m512 _ZGVeN16v_coshf(__m512);
-__m512 _ZGVeN16vv_atan2f(__m512, __m512);
-__m512 _ZGVeN16vv_hypotf(__m512, __m512);
-
-__m512d _ZGVeN8v_exp(__m512d);
-__m512d _ZGVeN8v_expm1(__m512d);
-__m512d _ZGVeN8v_log(__m512d);
-__m512d _ZGVeN8v_log1p(__m512d);
-__m512d _ZGVeN8v_sin(__m512d);
-__m512d _ZGVeN8v_cos(__m512d);
-__m512d _ZGVeN8v_atan(__m512d);
-__m512d _ZGVeN8v_sinh(__m512d);
-__m512d _ZGVeN8v_cosh(__m512d);
-__m512d _ZGVeN8vv_atan2(__m512d, __m512d);
-__m512d _ZGVeN8vv_hypot(__m512d, __m512d);
-__m256d _ZGVdN4v_expm1(__m256d);
-__m256d _ZGVdN4v_log(__m256d);
-__m256d _ZGVdN4v_log1p(__m256d);
-__m256d _ZGVdN4v_log2(__m256d);
-__m256d _ZGVdN4v_log10(__m256d);
-__m256d _ZGVdN4v_sin(__m256d);
-__m256d _ZGVdN4v_cos(__m256d);
-__m256d _ZGVdN4v_atan(__m256d);
-__m256d _ZGVdN4v_sinh(__m256d);
-__m256d _ZGVdN4v_cosh(__m256d);
-__m256d _ZGVdN4vv_atan2(__m256d, __m256d);
-__m256d _ZGVdN4vv_hypot(__m256d, __m256d);
-}
 
 // [vec+scalar complex kernels moved to ComplexKernels.cpp for three-tier compilation]
 inline bool try_unary(const void* xv, void* yv, int64_t n, DType dt, Op op) {
@@ -167,7 +115,7 @@ inline bool try_sum(const void* xv, int64_t n, DType dt,
     return tensorplay::cpu::cplx_sum_stub(tensorplay::DeviceType::CPU, xv, n, static_cast<int>(dt), re_out, im_out);
 }
 
-#else  // !TP_VECCPLX_LIBMVEC
+#else  // !TP_VECCPLX_SLEEF
 
 inline bool avx2_available() { return false; }
 inline bool avx512_available() { return false; }
@@ -202,7 +150,7 @@ inline bool try_sum(const void* xv, int64_t n, DType dt,
                                           im_out);
 }
 
-#endif  // TP_VECCPLX_LIBMVEC
+#endif  // TP_VECCPLX_SLEEF
 
 }  // namespace veccomplex
 }  // namespace cpu

@@ -1,7 +1,7 @@
 # TensorPlay Release Handbook
 
 How versions, channels and releases work in this repository. The design
-mirrors pytorch's: `version.txt` is the single version source, release notes
+uses one version source: `version.txt` is the single version source, release notes
 are compiled from the `release notes: *` PR label family, and wheels ship
 through three channels.
 
@@ -14,9 +14,9 @@ through three channels.
 | nightly | `X.Y.0.dev<UTC date>[+cuXXX\|+cpu]` | rolling `nightly` GitHub Release + `whl/nightly/<variant>/` indexes |
 
 - Version source of truth: `version.txt` (main currently carries an alpha
-  suffix, e.g. `1.0.0a0`, like pytorch's main). Dev builds append
+  suffix, e.g. `1.0.0a0`, like the main release). Dev builds append
   `+git<sha>` via `tools/generate_tensorplay_version.py`.
-- Variant local labels follow pytorch's `binary_populate_env.sh` rule: CUDA
+- Variant local labels follow the `binary_populate_env.sh` rule: CUDA
   wheels get `+cuXXX`, Linux/Windows CPU wheels get `+cpu`, macOS wheels get
   no suffix.
 - `cz bump` is never used; commitizen only drafts changelogs.
@@ -69,7 +69,7 @@ pip install --pre tensorplay --index-url https://download.tensorplay.cn/whl/nigh
 6. **Open the next cycle**: bump `version.txt` to the next `X.(Y+1).0a0`,
    close the `vX.Y.0` milestone, ensure the next milestone exists.
 
-## Release notes mechanics (pytorch-style)
+## Release notes mechanics
 
 - The labeler workflow applies `release notes: *` labels from paths
   (`.github/labeler.yml`); adjust labels manually when a PR spans subsystems.

@@ -20,11 +20,12 @@ from .grad_mode import (
     is_grad_enabled,
 )
 
-from .function import Function
+from .function import Function, NestedIOFunction
+from .variable import Variable
 from .graph import saved_tensor_hooks as saved_tensors_hooks
 from . import forward_ad
 from .._C._autograd import (
-    backward,
+    backward as _backward,
     grad as _grad,
     is_anomaly_enabled,
     is_anomaly_check_nan_enabled,
@@ -34,6 +35,8 @@ from .._C._autograd import (
 
 __all__ = [
     "Function",
+    "Variable",
+    "NestedIOFunction",
     "backward",
     "grad",
     "grad_mode",
@@ -60,6 +63,69 @@ __all__ = [
 
 _OptionalTensor = Optional[tensorplay.Tensor]
 _ShapeorNestedShape = Union[_size, Sequence[_size], tensorplay.Tensor]
+
+
+def _as_tuple(value, length=None):
+    if value is None:
+        return (None,) * length if length is not None else None
+    if isinstance(value, tensorplay.Tensor):
+        return (value,)
+    return tuple(value)
+
+
+def _make_grads(outputs, grads):
+    if len(outputs) != len(grads):
+        raise RuntimeError(
+            "The number of grad_outputs must match the number of outputs"
+        )
+    result = []
+    for index, (output, grad_output) in enumerate(zip(outputs, grads)):
+        if not isinstance(output, tensorplay.Tensor):
+            raise TypeError("outputs must contain tensorplay.Tensor values")
+        if grad_output is None:
+            if output.requires_grad:
+                if output.numel() != 1:
+                    raise RuntimeError(
+                        "grad can be implicitly created only for scalar outputs"
+                    )
+                if not output.dtype.is_floating_point:
+                    raise RuntimeError(
+                        "grad can be implicitly created only for real scalar outputs"
+                    )
+            result.append(tensorplay.ones_like(output))
+            continue
+        if not isinstance(grad_output, tensorplay.Tensor):
+            raise TypeError(
+                "gradients can be either Tensors or None, but got "
+                + type(grad_output).__name__
+            )
+        if tuple(grad_output.shape) != tuple(output.shape):
+            raise RuntimeError(
+                f"Mismatch in shape: grad_output[{index}] has a shape of "
+                f"{grad_output.shape} and output[{index}] has a shape of "
+                f"{output.shape}."
+            )
+        if output.dtype.is_complex != grad_output.dtype.is_complex:
+            raise RuntimeError(
+                "For complex Tensors, both grad_output and output are "
+                "required to have the same dtype category."
+            )
+        result.append(grad_output)
+    return tuple(result)
+
+
+def backward(
+    tensors: _TensorOrTensorsOrGradEdge,
+    grad_tensors: Optional[_TensorOrTensors] = None,
+    retain_graph: Optional[bool] = None,
+    create_graph: bool = False,
+) -> None:
+    outputs = _as_tuple(tensors)
+    grad_tuple = _as_tuple(grad_tensors, len(outputs))
+    grad_tuple = _make_grads(outputs, grad_tuple)
+    if retain_graph is None:
+        retain_graph = create_graph
+    _backward(outputs, grad_tuple, retain_graph, create_graph)
 
 
 def grad(
@@ -103,25 +169,17 @@ def grad(
             always zero) is an error. Defaults to the value of ``materialize_grads``.
 
     """
-    if not isinstance(outputs, (list, tuple)):
-        outputs = [outputs]
-    if not isinstance(inputs, (list, tuple)):
-        inputs = [inputs]
+    outputs = _as_tuple(outputs)
+    inputs = _as_tuple(inputs)
 
     if retain_graph is None:
         retain_graph = create_graph
     if allow_unused is None:
         allow_unused = False
 
-    # ones; the C++ binding cannot carry None elements, so materialize them.
-    if grad_outputs is not None:
-        if not isinstance(grad_outputs, (list, tuple)):
-            grad_outputs = [grad_outputs]
-        grad_outputs = tuple(
-            tensorplay.ones_like(out) if g is None else g
-            for g, out in zip(grad_outputs, outputs)
-        )
-
+    grad_outputs = _make_grads(
+        outputs, _as_tuple(grad_outputs, len(outputs))
+    )
     return _grad(outputs, inputs, grad_outputs, retain_graph, create_graph, allow_unused)
 
 
@@ -134,5 +192,6 @@ from .gradcheck import (  # noqa: E402
     GradcheckError,
 )
 
-from .. import profiler as profiler  # noqa: E402
-from ..profiler import emit_nvtx as emit_nvtx  # noqa: E402
+from . import profiler as profiler  # noqa: E402
+from .profiler import emit_nvtx as emit_nvtx  # noqa: E402
+from . import profiler_legacy as profiler_legacy  # noqa: E402

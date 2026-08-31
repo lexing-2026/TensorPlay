@@ -2,11 +2,6 @@ import tensorplay as tp
 from tensorplay.optim import adam as F
 from tensorplay import Tensor
 
-from tensorplay.distributed.optim._deprecation_warning import (
-    _scripted_functional_optimizer_deprecation_warning,
-)
-
-
 __all__: list[str] = []
 
 
@@ -33,7 +28,6 @@ class _FunctionalAdam:
         fused: bool = False,
         _allow_empty_param_list: bool = False,
     ):
-        _scripted_functional_optimizer_deprecation_warning(stacklevel=2)
         if not 0.0 <= lr:
             raise ValueError(f"Invalid learning rate: {lr}")
         if not 0.0 <= eps:

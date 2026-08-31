@@ -79,7 +79,7 @@ def make_grid(
     Returns:
         grid (Tensor): the tensor containing grid of images.
     """
-    if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
+    if not tensorplay.compiler.is_compiling():
         _log_api_usage_once(make_grid)
     if not tensorplay.is_tensor(tensor):
         if isinstance(tensor, list):
@@ -168,11 +168,10 @@ def save_image(
         **kwargs: Other arguments are documented in ``make_grid``.
     """
 
-    if not tensorplay.jit.is_scripting() and not tensorplay.jit.is_tracing():
+    if not tensorplay.compiler.is_compiling():
         _log_api_usage_once(save_image)
     grid = make_grid(tensor, **kwargs)
     # Add 0.5 after unnormalizing to [0, 255] to round to the nearest integer
     ndarr = grid.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to("cpu", tensorplay.uint8).numpy()
     im = Image.fromarray(ndarr)
     im.save(fp, format=format)
-

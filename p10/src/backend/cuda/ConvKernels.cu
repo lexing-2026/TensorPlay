@@ -1,4 +1,5 @@
 #include "Tensor.h"
+#include "Convolution.h"
 #include "Dispatcher.h"
 #include "Context.h"
 #include "Exception.h"
@@ -1331,7 +1332,16 @@ Tensor conv1d_grad_weight_cuda(const Tensor& grad_output, const Tensor& input, c
 Tensor conv1d_grad_bias_cuda(const Tensor& grad_output, const Tensor& input, const Tensor& weight,
                              const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
                              const std::vector<int64_t>& dilation, int64_t groups) {
-    return conv2d_grad_bias_cuda(grad_output, input, weight, stride, padding, dilation, groups);
+    // The 2-D kernel describes its operands with 4-D cuDNN tensor descriptors,
+    // so the 1-D operands have to gain the singleton spatial axis first -- the
+    // same lift conv1d_grad_input/weight above perform.
+    Tensor go2 = grad_output.unsqueeze(2);
+    Tensor in2 = input.unsqueeze(2);
+    Tensor w2 = weight.unsqueeze(2);
+    std::vector<int64_t> s2 = {1, stride.empty() ? 1 : stride[0]};
+    std::vector<int64_t> p2 = {0, padding.empty() ? 0 : padding[0]};
+    std::vector<int64_t> d2 = {1, dilation.empty() ? 1 : dilation[0]};
+    return conv2d_grad_bias_cuda(go2, in2, w2, s2, p2, d2, groups);
 }
 
 // --- conv3d: legacy-descriptor cuDNN path with 5-D descriptors ---------------

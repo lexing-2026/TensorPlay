@@ -5,9 +5,9 @@ import operator
 import pytest
 
 import tensorplay as tp
-from tensorplay.compiler import DecomposePass
-from tensorplay.compiler.graph import Tracer
-from tensorplay.compiler import build_aot
+from tensorplay.graph import Tracer
+from tensorplay.graph.passes import DecomposePass
+from tensorplay._stax import build_aot
 
 
 def _trace(fn, sample):
@@ -60,7 +60,7 @@ def test_pass_idempotent_when_no_composites():
 
 import math
 
-from tensorplay.backends.stax import stax
+from tensorplay._stax.stax import stax
 
 
 # sec/csc/cot/tanhshrink/squared_difference/swish 的表层包装尚未生成
@@ -99,13 +99,12 @@ def test_decomposed_op_compiles_to_native_graph(name):
     x = tp.tensor([0.7])
     gm = Tracer().trace(fn, sample_inputs={"x": x})
     # 复现真实编译管线：分解 → 消死代码 → 融合标注，再交给后端
-    from tensorplay.compiler.decompositions import DecomposePass
-    from tensorplay.compiler.passes import (
+    from tensorplay.graph.passes import (
         ConstFold,
         DeadCodeElimination,
         PassManager,
     )
-    from tensorplay.compiler.fx_passes import (
+    from tensorplay.graph.passes import (
         NormalizeOperators,
         PointwiseFusionHint,
     )
@@ -179,7 +178,7 @@ def test_compile_pipeline_applies_decomposition():
     """默认管线接入：tp.compile 的图里不应再出现已注册复合算子。"""
     seen = {}
 
-    from tensorplay.compiler import register_backend
+    from tensorplay._stax import register_backend
 
     @register_backend(name="_decomp_probe")
     def probe(gm, example_inputs, **kw):
@@ -197,4 +196,4 @@ def test_compile_pipeline_applies_decomposition():
         assert "softplus" not in seen["names"]
         assert "tanh" in seen["names"]
     finally:
-        tp.compiler.unregister_backend("_decomp_probe")
+        tp._stax.unregister_backend("_decomp_probe")
