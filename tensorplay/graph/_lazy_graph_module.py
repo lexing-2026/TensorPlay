@@ -53,6 +53,7 @@ def _make_graph_module(
 def _unwrap_lazy_graph_module(gm: GraphModule) -> GraphModule:
     if not isinstance(gm, _LazyGraphModule):
         return gm
+    gm.real_recompile()
     result = GraphModule(gm.root, gm.graph, gm.signature)
     result.meta.update(gm.meta)
     return result
@@ -62,21 +63,32 @@ def _unwrap_lazy_graph_module(gm: GraphModule) -> GraphModule:
 class _LazyGraphModule(GraphModule):
     """Delay explicit executor generation until code or execution is needed."""
 
+    @classmethod
+    def from_graphmodule(cls, gm: GraphModule) -> GraphModule:
+        if isinstance(gm, cls):
+            return gm
+        return cls(gm, gm.graph, gm.signature)
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self._lazy_needs_recompile = False
         super().__init__(*args, **kwargs)
         self._lazy_needs_recompile = True
 
     def recompile(self):
         self._lazy_needs_recompile = True
         self._compiled_forward = None
-        return self.code
+        self._compiled_impl = None
+        return self._lazy_forward
 
-    def real_recompile(self):
+    def real_recompile(self) -> Any:
         if self._lazy_needs_recompile or self._compiled_forward is None:
             result = GraphModule.recompile(self)
             self._lazy_needs_recompile = False
             return result
-        return self.forward
+        return self._compiled_forward
+
+    def _needs_recompile(self) -> bool:
+        return self._lazy_needs_recompile or self._compiled_forward is None
 
     @classmethod
     def force_recompile(cls, gm: GraphModule) -> None:
@@ -85,9 +97,20 @@ class _LazyGraphModule(GraphModule):
 
     def _lazy_forward(self, *args: Any, **kwargs: Any) -> Any:
         self.real_recompile()
-        return GraphModule.forward(self, *args, **kwargs)
+        if self._needs_recompile():
+            raise AssertionError("recompilation did not produce an executor")
+        return self(*args, **kwargs)
 
     forward = _lazy_forward
+
+    @property
+    def code(self) -> str:
+        self.real_recompile()
+        return super().code
+
+    def __str__(self) -> str:
+        self.real_recompile()
+        return super().__str__()
 
 
 __all__ = [
