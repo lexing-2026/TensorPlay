@@ -752,6 +752,9 @@ def get_generator_seed_for_device_type(device_type: str) -> int:
     return tp.initial_seed()
 
 
+from . import _p10d
+
+
 class _ExceptionRaisingThread(threading.Thread):
     def __init__(self, group: Any, target: Callable[..., Any], name: str | None = None, args: tuple[Any, ...] = (), kwargs: dict[str, Any] | None = None, daemon: bool | None = None) -> None:
         del group
