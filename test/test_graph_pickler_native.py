@@ -7,6 +7,12 @@ from tensorplay.graph._graph_pickler import (
     Options,
     patch_pytree_map_over_slice,
 )
+from tensorplay.graph._lazy_graph_module import (
+    _LazyGraphModule,
+    _get_graph_module_cls,
+    _unwrap_lazy_graph_module,
+    _use_lazy_graph_module,
+)
 
 
 def _make_graph() -> GraphModule:
@@ -73,3 +79,23 @@ def test_graph_pickler_slice_registration_is_scoped() -> None:
     with patch_pytree_map_over_slice():
         assert slice in _pytree.SUPPORTED_NODES
     assert slice not in _pytree.SUPPORTED_NODES
+
+
+def test_lazy_graph_module_defers_and_recompiles_on_demand() -> None:
+    module = _LazyGraphModule(None, _make_graph().graph)
+    assert module._compiled_forward is None
+    assert module._lazy_needs_recompile
+    assert module(tp.tensor([1.0, 2.0, 3.0])).tolist() == [2.0, 3.0]
+    assert not module._lazy_needs_recompile
+    assert module._compiled_forward is not None
+
+    plain = _unwrap_lazy_graph_module(module)
+    assert type(plain) is GraphModule
+    assert plain(tp.tensor([2.0, 3.0, 4.0])).tolist() == [3.0, 4.0]
+
+
+def test_lazy_graph_module_selection_is_scoped() -> None:
+    assert _get_graph_module_cls() is GraphModule
+    with _use_lazy_graph_module(True):
+        assert _get_graph_module_cls() is _LazyGraphModule
+    assert _get_graph_module_cls() is GraphModule
