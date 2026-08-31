@@ -3,6 +3,7 @@ import operator
 import tensorplay as tp
 from tensorplay.graph import Graph, GraphModule
 from tensorplay.graph.interpreter import Transformer
+from tensorplay.graph.proxy import GraphAppendingTracer, Proxy
 from tensorplay.graph._graph_pickler import (
     GraphPickler,
     Options,
@@ -120,3 +121,14 @@ def test_transformer_preserves_placeholder_defaults_and_node_metadata() -> None:
     assert output_value.type is int
     assert output_value.meta["source"] == "add"
     assert transformed() == 4
+
+
+def test_graph_appending_tracer_builds_native_proxy_nodes() -> None:
+    graph = Graph()
+    value = graph.placeholder("value")
+    proxy = Proxy(value, GraphAppendingTracer(graph))
+    result = (proxy + 1).node
+    graph.output(result)
+
+    assert result.op == "call_function"
+    assert result.args == (value, 1)
