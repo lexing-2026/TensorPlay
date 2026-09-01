@@ -24,6 +24,7 @@ namespace py = pybind11;
 using namespace tensorplay;
 using tensorplay::distributed::GlooOptions;
 using tensorplay::distributed::ProcessGroupGloo;
+using tensorplay::distributed::ReduceOp;
 using T = tensorplay::Tensor;
 
 namespace {
@@ -107,7 +108,7 @@ void runCollective(Step&& step) {
   forkAndRun(2, storePath, [step](int rank, int size, const std::string& p) {
     WorkerEnv env(p, rank, size);
     step(env.pg(), rank, size);
-    return true;
+    return !::testing::Test::HasFailure();
   });
 }
 
@@ -136,7 +137,7 @@ TEST(ProcessGroupGlooTest, TestBroadcast) {
 TEST(ProcessGroupGlooTest, TestAllreduceSum) {
   runCollective([](ProcessGroupGloo& pg, int rank, int) {
     std::vector<T> tensors = {fullLike(rank + 1.0)};
-    pg.allreduce(tensors, 0, kTimeout)->wait();
+    pg.allreduce(tensors, ReduceOp::SUM, kTimeout)->wait();
     EXPECT_EQ(tensors[0].select(0, 0).item<double>(), 3.0);
   });
 }
@@ -144,7 +145,7 @@ TEST(ProcessGroupGlooTest, TestAllreduceSum) {
 TEST(ProcessGroupGlooTest, TestAllreduceAvg) {
   runCollective([](ProcessGroupGloo& pg, int rank, int) {
     std::vector<T> tensors = {fullLike(2.0 * (rank + 1.0))};
-    pg.allreduce(tensors, 4, kTimeout)->wait();
+    pg.allreduce(tensors, ReduceOp::AVG, kTimeout)->wait();
     EXPECT_EQ(tensors[0].select(0, 0).item<double>(), 3.0);
   });
 }
@@ -152,7 +153,7 @@ TEST(ProcessGroupGlooTest, TestAllreduceAvg) {
 TEST(ProcessGroupGlooTest, TestAllreduceProduct) {
   runCollective([](ProcessGroupGloo& pg, int rank, int) {
     std::vector<T> tensors = {fullLike(rank + 1.0)};
-    pg.allreduce(tensors, 1, kTimeout)->wait();
+    pg.allreduce(tensors, ReduceOp::PRODUCT, kTimeout)->wait();
     EXPECT_EQ(tensors[0].select(0, 0).item<double>(), 2.0);
   });
 }
@@ -161,8 +162,8 @@ TEST(ProcessGroupGlooTest, TestAllreduceMinMax) {
   runCollective([](ProcessGroupGloo& pg, int rank, int) {
     std::vector<T> lo = {fullLike(rank + 1.0)};
     std::vector<T> hi = {fullLike(rank + 1.0)};
-    pg.allreduce(lo, 3, kTimeout)->wait();
-    pg.allreduce(hi, 2, kTimeout)->wait();
+    pg.allreduce(lo, ReduceOp::MIN, kTimeout)->wait();
+    pg.allreduce(hi, ReduceOp::MAX, kTimeout)->wait();
     EXPECT_EQ(lo[0].select(0, 0).item<double>(), 1.0);
     EXPECT_EQ(hi[0].select(0, 0).item<double>(), 2.0);
   });
@@ -171,8 +172,20 @@ TEST(ProcessGroupGlooTest, TestAllreduceMinMax) {
 TEST(ProcessGroupGlooTest, TestAllreduceScalar) {
   runCollective([](ProcessGroupGloo& pg, int rank, int) {
     std::vector<T> tensors = {fullLike(rank + 1.0, {})};
-    pg.allreduce(tensors, 0, kTimeout)->wait();
+    pg.allreduce(tensors, ReduceOp::SUM, kTimeout)->wait();
     EXPECT_EQ(tensors[0].item<double>(), 3.0);
+  });
+}
+
+TEST(ProcessGroupGlooTest, TestAllreduceMultipleTensors) {
+  runCollective([](ProcessGroupGloo& pg, int rank, int) {
+    std::vector<T> tensors = {
+        fullLike(rank + 1.0),
+        fullLike(2.0 * (rank + 1.0)),
+    };
+    pg.allreduce(tensors, 0, kTimeout)->wait();
+    EXPECT_EQ(tensors[0].select(0, 0).item<double>(), 9.0);
+    EXPECT_EQ(tensors[1].select(0, 0).item<double>(), 9.0);
   });
 }
 
@@ -182,8 +195,6 @@ TEST(ProcessGroupGlooTest, TestReduce) {
     pg.reduce(tensors, 1, 0, 0, kTimeout)->wait();
     if (rank == 1) {
       EXPECT_EQ(tensors[0].select(0, 0).item<double>(), 2.0);
-    } else {
-      EXPECT_EQ(tensors[0].select(0, 0).item<double>(), 1.0);
     }
   });
 }
@@ -192,8 +203,13 @@ TEST(ProcessGroupGlooTest, TestAllgather) {
   runCollective([](ProcessGroupGloo& pg, int rank, int size) {
     std::vector<T> inputs = {fullLike(rank)};
     // One output group per input; each group holds one tensor per rank.
-    std::vector<std::vector<T>> outputs{
-        1, {size, T::full({3}, -1.0, tensorplay::ScalarType::Float32)}};
+    std::vector<T> output_group;
+    output_group.reserve(size);
+    for (int i = 0; i < size; ++i) {
+      output_group.push_back(
+          T::full({3}, -1.0, tensorplay::ScalarType::Float32));
+    }
+    std::vector<std::vector<T>> outputs{std::move(output_group)};
     pg.allgather(outputs, inputs, kTimeout)->wait();
     for (int i = 0; i < size; ++i) {
       EXPECT_EQ(outputs[0][i].select(0, 0).item<double>(), (double)i);
@@ -215,19 +231,75 @@ TEST(ProcessGroupGlooTest, TestAllGatherIntoTensor) {
   });
 }
 
+TEST(ProcessGroupGlooTest, TestAllGatherSingle) {
+  runCollective([](ProcessGroupGloo& pg, int rank, int size) {
+    T input = fullLike(rank + 1.0);
+    T output = T::full(
+        {size * 3}, -1.0, tensorplay::ScalarType::Float32);
+    pg.all_gather_single(output, input, kTimeout)->wait();
+    for (int i = 0; i < size; ++i) {
+      for (int64_t j = 0; j < 3; ++j) {
+        EXPECT_EQ(output.select(0, i * 3 + j).item<double>(),
+                  (double)(i + 1));
+      }
+    }
+  });
+}
+
+TEST(ProcessGroupGlooTest, TestAllGatherSingleCoalesced) {
+  runCollective([](ProcessGroupGloo& pg, int rank, int size) {
+    std::vector<T> inputs = {
+        fullLike(rank + 1.0),
+        fullLike(2.0 * (rank + 1.0), {2}),
+    };
+    std::vector<T> outputs = {
+        T::full({size * 3}, -1.0, tensorplay::ScalarType::Float32),
+        T::full({size * 2}, -1.0, tensorplay::ScalarType::Float32),
+    };
+    pg.all_gather_single_coalesced(outputs, inputs, kTimeout)->wait();
+    for (int i = 0; i < size; ++i) {
+      EXPECT_EQ(outputs[0].select(0, i * 3).item<double>(),
+                (double)(i + 1));
+      EXPECT_EQ(outputs[1].select(0, i * 2).item<double>(),
+                2.0 * (double)(i + 1));
+    }
+  });
+}
+
 TEST(ProcessGroupGlooTest, TestGather) {
   runCollective([](ProcessGroupGloo& pg, int rank, int size) {
     std::vector<T> inputs = {fullLike(rank)};
     std::vector<std::vector<T>> outputs;
     if (rank == 0) {
-      outputs.assign(
-          1, std::vector<T>(size, T::full({3}, -1.0,
-                             tensorplay::ScalarType::Float32)));
+      std::vector<T> output_group;
+      output_group.reserve(size);
+      for (int i = 0; i < size; ++i) {
+        output_group.push_back(
+            T::full({3}, -1.0, tensorplay::ScalarType::Float32));
+      }
+      outputs.push_back(std::move(output_group));
     }
     pg.gather(outputs, inputs, 0, kTimeout)->wait();
     if (rank == 0) {
       for (int i = 0; i < size; ++i) {
         EXPECT_EQ(outputs[0][i].select(0, 0).item<double>(), (double)i);
+      }
+    }
+  });
+}
+
+TEST(ProcessGroupGlooTest, TestGatherSingle) {
+  runCollective([](ProcessGroupGloo& pg, int rank, int size) {
+    T input = fullLike(rank);
+    T output = T::full(
+        rank == 0 ? std::vector<int64_t>{size * 3}
+                  : std::vector<int64_t>{0},
+        -1.0,
+        tensorplay::ScalarType::Float32);
+    pg.gather_single(output, input, 0, kTimeout)->wait();
+    if (rank == 0) {
+      for (int i = 0; i < size; ++i) {
+        EXPECT_EQ(output.select(0, i * 3).item<double>(), (double)i);
       }
     }
   });
@@ -285,7 +357,7 @@ TEST(ProcessGroupGlooTest, TestReduceScatter) {
     std::vector<T> outputs = {
         T::full({2}, -1.0, tensorplay::ScalarType::Float32)};
     std::vector<std::vector<T>> inputs{
-        1, {size, T::full({2}, 1.0, tensorplay::ScalarType::Float32)}};
+        std::vector<T>(size, T::full({2}, 1.0, tensorplay::ScalarType::Float32))};
     pg.reduce_scatter(outputs, inputs, 0, kTimeout)->wait();
     EXPECT_EQ(outputs[0].select(0, 0).item<double>(), (double)size);
   });
@@ -297,6 +369,31 @@ TEST(ProcessGroupGlooTest, TestReduceScatterTensor) {
     T output = T::full({2}, -1.0, tensorplay::ScalarType::Float32);
     pg.reduce_scatter_tensor(output, input, 0, kTimeout)->wait();
     EXPECT_EQ(output.select(0, 0).item<double>(), (double)size);
+  });
+}
+
+TEST(ProcessGroupGlooTest, TestReduceScatterSingle) {
+  runCollective([](ProcessGroupGloo& pg, int, int size) {
+    T input = T::full({size * 2}, 1.0, tensorplay::ScalarType::Float32);
+    T output = T::full({2}, -1.0, tensorplay::ScalarType::Float32);
+    pg.reduce_scatter_single(output, input, 0, kTimeout)->wait();
+    EXPECT_EQ(output.select(0, 0).item<double>(), (double)size);
+  });
+}
+
+TEST(ProcessGroupGlooTest, TestReduceScatterSingleCoalesced) {
+  runCollective([](ProcessGroupGloo& pg, int, int size) {
+    std::vector<T> inputs = {
+        T::full({size * 2}, 1.0, tensorplay::ScalarType::Float32),
+        T::full({size * 3}, 2.0, tensorplay::ScalarType::Float32),
+    };
+    std::vector<T> outputs = {
+        T::full({2}, -1.0, tensorplay::ScalarType::Float32),
+        T::full({3}, -1.0, tensorplay::ScalarType::Float32),
+    };
+    pg.reduce_scatter_single_coalesced(outputs, inputs, 0, kTimeout)->wait();
+    EXPECT_EQ(outputs[0].select(0, 0).item<double>(), (double)size);
+    EXPECT_EQ(outputs[1].select(0, 0).item<double>(), 2.0 * (double)size);
   });
 }
 

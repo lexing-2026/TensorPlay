@@ -7,25 +7,39 @@ gloo (and MPI) for CPU groups. Backends live in the C++ layer under
 
 from __future__ import annotations
 
+import contextlib
 import datetime as _dt
 import io
 import os
 import pickle
 import threading
 import warnings
-from typing import List, Optional, Sequence
+from dataclasses import dataclass, field
+from typing import Any, Callable, List, Optional, Sequence
 
 import tensorplay as tp
 from tensorplay._C import _distributed as _C
 
 __all__ = [
     "Backend",
+    "BackendConfig",
     "GroupMember",
     "ProcessGroup",
     "ReduceOp",
+    "AllreduceCoalescedOptions",
+    "AllreduceOptions",
+    "AllToAllOptions",
+    "BarrierOptions",
+    "BroadcastOptions",
+    "GatherOptions",
+    "AllgatherOptions",
+    "ReduceOptions",
+    "ReduceScatterOptions",
+    "ScatterOptions",
     "Work",
     "group",
     "all_gather",
+    "all_gather_single",
     "all_gather_coalesced",
     "all_gather_into_tensor",
     "all_gather_object",
@@ -33,16 +47,18 @@ __all__ = [
     "all_reduce_coalesced",
     "all_to_all",
     "all_to_all_single",
-    "_allgather_base",
-    "_reduce_scatter_base",
     "barrier",
     "batch_isend_irecv",
     "broadcast",
     "broadcast_object_list",
     "destroy_process_group",
     "gather",
+    "gather_single",
+    "gather_into_tensor",
     "gather_object",
     "get_backend",
+    "get_backend_config",
+    "get_default_backend_for_device",
     "get_global_rank",
     "get_group_rank",
     "get_process_group_ranks",
@@ -52,6 +68,7 @@ __all__ = [
     "init_process_group",
     "irecv",
     "is_available",
+    "is_backend_available",
     "is_gloo_available",
     "is_initialized",
     "is_mpi_available",
@@ -66,34 +83,285 @@ __all__ = [
     "reduce",
     "reduce_scatter",
     "reduce_scatter_coalesced",
+    "reduce_scatter_single",
     "reduce_scatter_tensor",
     "scatter",
     "scatter_object_list",
     "send",
     "send_object_list",
     "isend",
+    "set_timeout",
+    "split_group",
+    "shrink_group",
+    "record_comm",
+    "supports_complex",
+    "SHRINK_DEFAULT",
+    "SHRINK_ABORT",
 ]
 
 default_pg_timeout = _dt.timedelta(minutes=30)
 
 
-class Backend:
+class Backend(str):
+    """Named communication backends and their device capabilities."""
+
     UNDEFINED = "undefined"
     NCCL = "nccl"
     GLOO = "gloo"
     MPI = "mpi"
 
     BACKENDS = [GLOO, MPI, NCCL]
-    # ships the NCCL path so the remaining entries are absent.
-    BACKEND_TO_MAP = {NCCL: None}
+    backend_list = [UNDEFINED, GLOO, NCCL, MPI]
+    default_device_backend_map = {
+        "cpu": GLOO,
+        "cuda": NCCL,
+    }
+    backend_capability = {
+        GLOO: ["cpu"],
+        NCCL: ["cuda"],
+        MPI: ["cpu"],
+    }
+    backend_type_map: dict[str, str] = {
+        UNDEFINED: UNDEFINED,
+        GLOO: GLOO,
+        NCCL: NCCL,
+        MPI: MPI,
+    }
+    _plugins: dict[str, tuple[Callable[..., Any], bool]] = {}
+    BACKEND_TO_MAP: dict[str, Any] = {NCCL: None}
+
+    def __new__(cls, name: str) -> str:
+        if not isinstance(name, str):
+            raise ValueError("Backend constructor parameter must be string-ish")
+        value = getattr(cls, name.upper(), None)
+        return str.__new__(cls, value if value is not None else name.lower())
+
+    @classmethod
+    def _ensure_backend_registered(cls, name: str) -> None:
+        normalized = str(name).lower()
+        if normalized in cls.backend_list:
+            return
+        plugin = cls._plugins.get(normalized.upper())
+        if plugin is not None:
+            return
+        try:
+            from importlib.metadata import entry_points
+
+            candidates = entry_points(group="tensorplay.distributed.backends")
+        except Exception:
+            candidates = ()
+        for entrypoint in candidates:
+            if entrypoint.name.lower() != normalized:
+                continue
+            registrar = entrypoint.load()
+            if not callable(registrar):
+                raise TypeError("backend entry point must load a callable registrar")
+            registrar()
+            if normalized not in cls.backend_list:
+                raise RuntimeError(
+                    f"backend entry point {normalized} did not register a backend"
+                )
+            return
+
+    @classmethod
+    def register_backend(
+        cls,
+        name: str,
+        func: Callable[..., Any],
+        extended_api: bool = False,
+        devices: str | list[str] | None = None,
+        *,
+        _backend_type: str | None = None,
+    ) -> None:
+        normalized = str(name).lower()
+        if not normalized or ":" in normalized or "," in normalized:
+            raise ValueError("backend name must be a single non-empty identifier")
+        if not callable(func):
+            raise TypeError("backend creator must be callable")
+        if isinstance(devices, str):
+            devices = [devices]
+        if devices is None:
+            devices = ["cpu"]
+        devices = [str(device).lower() for device in devices]
+        if not devices:
+            raise ValueError("backend devices must not be empty")
+        upper = normalized.upper()
+        if not hasattr(cls, upper):
+            setattr(cls, upper, normalized)
+        if normalized not in cls.backend_list:
+            cls.backend_list.append(normalized)
+        cls.backend_capability[normalized] = devices
+        cls.backend_type_map[normalized] = _backend_type or "custom"
+        cls._plugins[upper] = (func, bool(extended_api))
+        cls.BACKEND_TO_MAP[normalized] = func
+        for device in devices:
+            cls.default_device_backend_map.setdefault(device, normalized)
 
 
 class ReduceOp:
     SUM = 0
-    PRODUCT = PROD = 1
-    MAX = 2
+    AVG = 1
+    PRODUCT = PROD = 2
     MIN = 3
-    AVG = 4
+    MAX = 4
+    BAND = 5
+    BOR = 6
+    BXOR = 7
+    PREMUL_SUM = 8
+    UNUSED = 9
+
+
+@dataclass
+class BroadcastOptions:
+    rootRank: int = 0
+    rootTensor: int = 0
+    timeout: _dt.timedelta = field(
+        default_factory=lambda: _dt.timedelta(milliseconds=-1)
+    )
+    asyncOp: bool = True
+
+
+@dataclass
+class AllreduceOptions:
+    reduceOp: int = ReduceOp.SUM
+    timeout: _dt.timedelta = field(
+        default_factory=lambda: _dt.timedelta(milliseconds=-1)
+    )
+    asyncOp: bool = True
+    sparseIndices: Any = None
+
+
+@dataclass
+class AllreduceCoalescedOptions(AllreduceOptions):
+    pass
+
+
+@dataclass
+class ReduceOptions:
+    reduceOp: int = 0
+    rootRank: int = 0
+    rootTensor: int = 0
+    timeout: _dt.timedelta = field(
+        default_factory=lambda: _dt.timedelta(milliseconds=-1)
+    )
+    asyncOp: bool = True
+
+
+@dataclass
+class AllgatherOptions:
+    timeout: _dt.timedelta = field(
+        default_factory=lambda: _dt.timedelta(milliseconds=-1)
+    )
+    asyncOp: bool = True
+
+
+@dataclass
+class GatherOptions:
+    rootRank: int = 0
+    timeout: _dt.timedelta = field(
+        default_factory=lambda: _dt.timedelta(milliseconds=-1)
+    )
+    asyncOp: bool = True
+
+
+@dataclass
+class ScatterOptions:
+    rootRank: int = 0
+    timeout: _dt.timedelta = field(
+        default_factory=lambda: _dt.timedelta(milliseconds=-1)
+    )
+    asyncOp: bool = True
+
+
+@dataclass
+class ReduceScatterOptions:
+    reduceOp: int = 0
+    timeout: _dt.timedelta = field(
+        default_factory=lambda: _dt.timedelta(milliseconds=-1)
+    )
+    asyncOp: bool = True
+
+
+@dataclass
+class AllToAllOptions:
+    timeout: _dt.timedelta = field(
+        default_factory=lambda: _dt.timedelta(milliseconds=-1)
+    )
+    asyncOp: bool = True
+
+
+@dataclass
+class BarrierOptions:
+    device_ids: list[int] = field(default_factory=list)
+    timeout: _dt.timedelta = field(
+        default_factory=lambda: _dt.timedelta(milliseconds=-1)
+    )
+    device: Any = None
+    asyncOp: bool = True
+
+
+for _option_name in (
+    "BroadcastOptions",
+    "AllreduceOptions",
+    "AllreduceCoalescedOptions",
+    "ReduceOptions",
+    "AllgatherOptions",
+    "GatherOptions",
+    "ScatterOptions",
+    "ReduceScatterOptions",
+    "AllToAllOptions",
+    "BarrierOptions",
+):
+    _native_option = getattr(_C, _option_name, None)
+    if _native_option is not None:
+        globals()[_option_name] = _native_option
+del _option_name, _native_option
+
+
+class BackendConfig:
+    """Map device types to the backend selected for each device."""
+
+    def __init__(self, backend: str | Backend):
+        self.device_backend_map: dict[str, str] = {}
+        normalized = str(backend).lower()
+        if normalized == Backend.UNDEFINED:
+            device = "cuda" if tp.cuda.is_available() else "cpu"
+            self.device_backend_map[device] = Backend.default_device_backend_map[
+                device
+            ]
+            return
+        if ":" not in normalized:
+            Backend._ensure_backend_registered(normalized)
+            if normalized not in Backend.backend_list:
+                raise ValueError(f"Unknown backend: '{backend}'")
+            devices = Backend.backend_capability.get(normalized, ["cpu"])
+            self.device_backend_map = {
+                device: normalized for device in devices
+            }
+            return
+
+        for pair in normalized.split(","):
+            pieces = pair.split(":")
+            if len(pieces) != 2 or not pieces[0] or not pieces[1]:
+                raise ValueError(
+                    "backend must use '<device>:<backend>' pairs separated by commas"
+                )
+            device, backend_name = pieces
+            if device in self.device_backend_map:
+                raise ValueError(f"Duplicate device type '{device}'")
+            Backend._ensure_backend_registered(backend_name)
+            if backend_name not in Backend.backend_list:
+                raise ValueError(f"Unknown backend: '{backend_name}'")
+            self.device_backend_map[device] = backend_name
+
+    def __repr__(self) -> str:
+        return ",".join(
+            f"{device}:{backend}"
+            for device, backend in self.device_backend_map.items()
+        )
+
+    def get_device_backend_map(self) -> dict[str, str]:
+        return dict(self.device_backend_map)
 
 
 class GroupMember:
@@ -116,15 +384,21 @@ class Work:
         self._event = event
         self._done = done
         self._tensors = list(tensors) if tensors is not None else []
+        self._done_called = False
+        self._profiling_name = _current_comm_name()
 
     def is_completed(self) -> bool:
         return bool(self._event.query())
 
     def wait(self, timeout: Optional[_dt.timedelta] = None) -> bool:
         self._event.synchronize()
-        if self._done is not None:
-            self._done()
+        self._run_done()
         return True
+
+    def _run_done(self):
+        if self._done is not None and not self._done_called:
+            self._done_called = True
+            self._done()
 
     def get_future(self):
         from tensorplay import futures as _futures
@@ -151,6 +425,7 @@ class ProcessGroup:
         self.ranks = list(ranks)
         self.group_name = group_name
         self.backend = backend
+        self._backend_config = str(backend)
         # NCCL communicator (cuda backends) / C++ process group (gloo, mpi).
         self.comm: Optional[int] = None
         self.gloo_pg = None
@@ -188,6 +463,17 @@ class ProcessGroup:
     def group_rank(self, global_rank: int) -> int:
         return self.ranks.index(global_rank)
 
+    def set_timeout(self, timeout: _dt.timedelta) -> None:
+        if not isinstance(timeout, _dt.timedelta):
+            raise TypeError(
+                "Expected timeout argument to be of type datetime.timedelta"
+            )
+        if timeout.total_seconds() < 0:
+            raise ValueError("timeout must be non-negative")
+        self._timeout_s = timeout.total_seconds()
+        if self.gloo_pg is not None:
+            self.gloo_pg.set_timeout(int(self._timeout_s * 1000))
+
 
 Backend.BACKEND_TO_MAP[Backend.NCCL] = ProcessGroup
 if hasattr(_C, "ProcessGroupGloo"):
@@ -210,6 +496,60 @@ _uninitialized_msg = (
 _invalid_group_msg = "Invalid process group specified"
 
 
+def _device_type(device) -> str:
+    device_type = getattr(device, "type", None)
+    if device_type is not None:
+        return str(device_type).lower()
+    value = str(device).lower()
+    return value.split(":", 1)[0]
+
+
+def supports_complex(reduce_op) -> bool:
+    """Return whether a reduction operation accepts complex tensors."""
+    if isinstance(reduce_op, str):
+        name = reduce_op.lower()
+        return name not in {"product", "min", "max", "band", "bor", "bxor"}
+    try:
+        value = int(reduce_op)
+    except (TypeError, ValueError):
+        operation = getattr(reduce_op, "op", None)
+        if callable(operation):
+            return supports_complex(operation())
+        return True
+    return value not in {
+        ReduceOp.PRODUCT,
+        ReduceOp.MIN,
+        ReduceOp.MAX,
+        ReduceOp.BAND,
+        ReduceOp.BOR,
+        ReduceOp.BXOR,
+    }
+
+
+_comm_state = threading.local()
+
+
+def _current_comm_name() -> str | None:
+    stack = getattr(_comm_state, "names", None)
+    return stack[-1] if stack else None
+
+
+@contextlib.contextmanager
+def record_comm(name: str):
+    """Temporarily assign a profiling name to issued communication work."""
+    if not isinstance(name, str):
+        raise TypeError("communication profiling name must be a string")
+    stack = getattr(_comm_state, "names", None)
+    if stack is None:
+        stack = []
+        _comm_state.names = stack
+    stack.append(name)
+    try:
+        yield
+    finally:
+        stack.pop()
+
+
 def is_available() -> bool:
     return _C.is_available()
 
@@ -224,6 +564,28 @@ def is_gloo_available() -> bool:
 
 def is_mpi_available() -> bool:
     return hasattr(_C, "ProcessGroupMPI")
+
+
+def is_backend_available(backend: str) -> bool:
+    """Return whether every backend named by a configuration is available."""
+    normalized = str(backend).lower()
+    try:
+        config = BackendConfig(normalized)
+    except (TypeError, ValueError, RuntimeError):
+        return False
+    for backend_name in config.get_device_backend_map().values():
+        if backend_name == Backend.GLOO:
+            available = is_gloo_available()
+        elif backend_name == Backend.MPI:
+            available = is_mpi_available()
+        elif backend_name == Backend.NCCL:
+            available = is_nccl_available()
+        else:
+            plugin = Backend._plugins.get(str(backend_name).upper())
+            available = plugin is not None
+        if not available:
+            return False
+    return bool(config.get_device_backend_map())
 
 
 def is_initialized() -> bool:
@@ -262,6 +624,29 @@ def get_world_size(group=None) -> int:
 
 def get_backend(group=None) -> str:
     return _resolve_group(group).backend
+
+
+def get_backend_config(group=None) -> str:
+    pg = _resolve_group(group)
+    return str(getattr(pg, "_backend_config", pg.backend))
+
+
+def get_default_backend_for_device(device) -> str:
+    device_name = _device_type(device)
+    try:
+        return Backend.default_device_backend_map[device_name]
+    except KeyError as exc:
+        raise ValueError(
+            f"Default backend not registered for device: {device}"
+        ) from exc
+
+
+def set_timeout(timeout: _dt.timedelta, group=None) -> None:
+    """Set the timeout used by future operations on a process group."""
+    if group is None:
+        group = _get_default_group()
+    pg = _resolve_group(group)
+    pg.set_timeout(timeout)
 
 
 def _global_rank() -> int:
@@ -310,9 +695,9 @@ def _ensure_mpi_comm(pg: ProcessGroup) -> object:
     with pg._lock:
         if pg.mpi_pg is not None:
             return pg.mpi_pg
-        # The C++ side derives the communicator from the rank list (empty
-        # ranks resolve to the world communicator).
-        pg.mpi_pg = _C.ProcessGroupMPI.create(pg.ranks)
+        world_size = int(os.environ.get("WORLD_SIZE", len(pg.ranks)))
+        ranks = [] if pg.ranks == list(range(world_size)) else pg.ranks
+        pg.mpi_pg = _C.ProcessGroupMPI.create(ranks)
         return pg.mpi_pg
 
 
@@ -340,10 +725,16 @@ class _BackendWork(Work):
         return bool(self._work.is_completed())
 
     def wait(self, timeout: Optional[_dt.timedelta] = None) -> bool:
-        self._work.wait(-1)
-        if self._done is not None:
-            self._done()
-        return True
+        if timeout is None:
+            timeout_ms = -1
+        elif isinstance(timeout, _dt.timedelta):
+            timeout_ms = int(timeout.total_seconds() * 1000)
+        else:
+            timeout_ms = int(timeout)
+        completed = self._work.wait(timeout_ms)
+        if completed:
+            self._run_done()
+        return bool(completed)
 
 
 class _ChainedWork(_BackendWork):
@@ -358,9 +749,9 @@ class _ChainedWork(_BackendWork):
 
     def wait(self, timeout: Optional[_dt.timedelta] = None) -> bool:
         for w in self._works:
-            w.wait(-1)
-        if self._done is not None:
-            self._done()
+            if not w.wait(-1):
+                return False
+        self._run_done()
         return True
 
 
@@ -368,7 +759,6 @@ def _cpu_finish(work, tensors=None, restore=None, extra=None,
                 async_op: bool = False):
     if async_op:
         def done():
-            work.wait(-1)
             if restore is not None:
                 restore()
             if extra is not None:
@@ -492,7 +882,19 @@ def init_process_group(
     if _world_group is not None:
         raise RuntimeError("trying to initialize the default process group twice!")
     if backend is None:
-        backend = "nccl"
+        backend = Backend.UNDEFINED
+    requested_backend = str(backend).lower()
+    backend_config = BackendConfig(requested_backend)
+    if len(backend_config.device_backend_map) == 1:
+        backend = next(iter(backend_config.device_backend_map.values()))
+    else:
+        active_device = "cuda" if tp.cuda.is_available() else "cpu"
+        try:
+            backend = backend_config.device_backend_map[active_device]
+        except KeyError as exc:
+            raise ValueError(
+                f"No backend configured for active device '{active_device}'"
+            ) from exc
     backend = str(backend).lower()
     if backend == Backend.NCCL:
         if not is_available():
@@ -541,6 +943,7 @@ def init_process_group(
     _group_count += 1
     _world_group = ProcessGroup(list(range(world_size)), group_name or "0",
                                 backend=backend)
+    _world_group._backend_config = repr(backend_config)
     _world_group._timeout_s = timeout_s
     GroupMember.WORLD = _world_group
     _ensure_comm(_world_group, timeout_s)
@@ -576,36 +979,194 @@ def destroy_process_group(group=None) -> None:
         _groups.clear()
         _store_ref[0] = None
         _backend = ""
+    else:
+        _groups.pop(pg.group_name, None)
+
+
+SHRINK_DEFAULT = 0x00
+SHRINK_ABORT = 0x01
+
+
+def split_group(parent_pg=None, split_ranks=None, timeout=None,
+                pg_options=None, group_desc=None, backend=None):
+    """Create a subgroup for the current rank from parent-relative ranks."""
+    if split_ranks is None or not split_ranks:
+        raise ValueError("split_ranks cannot be None or empty")
+    parent = _resolve_group(parent_pg)
+    parent_rank = parent.rank()
+    parent_size = parent.size()
+    groups = []
+    selected = None
+    used = set()
+    for ranks in split_ranks:
+        if not isinstance(ranks, (list, tuple)) or not ranks:
+            raise ValueError("each split group must be a non-empty sequence")
+        values = [int(rank) for rank in ranks]
+        if len(values) != len(set(values)):
+            raise ValueError("the split group cannot have duplicate ranks")
+        if any(rank < 0 or rank >= parent_size for rank in values):
+            raise ValueError("split ranks must be valid parent group ranks")
+        overlap = used.intersection(values)
+        if overlap:
+            raise ValueError("split groups cannot overlap")
+        used.update(values)
+        global_ranks = [parent.ranks[rank] for rank in values]
+        groups.append(global_ranks)
+        if parent_rank in values:
+            selected = global_ranks
+
+    if timeout is None:
+        timeout = _dt.timedelta(seconds=parent._timeout_s)
+    if not isinstance(timeout, _dt.timedelta):
+        raise TypeError("timeout must be a datetime.timedelta")
+    if timeout.total_seconds() < 0:
+        raise ValueError("timeout must be non-negative")
+
+    inherited_backend = backend if backend is not None else parent.backend
+    created = []
+    for global_ranks in groups:
+        child = new_group(
+            ranks=global_ranks,
+            timeout=timeout,
+            backend=inherited_backend,
+            pg_options=pg_options,
+            group_desc=group_desc,
+            sort_ranks=False,
+        )
+        if child is not GroupMember.NON_GROUP_MEMBER:
+            created.append(child)
+    if selected is None:
+        return GroupMember.NON_GROUP_MEMBER
+    for child in created:
+        if child.ranks == selected:
+            return child
+    raise RuntimeError("failed to create the selected split process group")
+
+
+def shrink_group(ranks_to_exclude, group=None, shrink_flags=SHRINK_DEFAULT,
+                 pg_options=None):
+    """Create a process group after excluding parent-relative ranks."""
+    global _world_group, _backend
+    if not isinstance(ranks_to_exclude, list):
+        raise TypeError("ranks_to_exclude must be a list")
+    if not ranks_to_exclude:
+        raise ValueError("ranks_to_exclude cannot be empty")
+    if shrink_flags not in (SHRINK_DEFAULT, SHRINK_ABORT):
+        raise ValueError("invalid shrink_flags")
+    parent = _resolve_group(group)
+    if parent.size() <= 1:
+        raise ValueError("cannot shrink a process group with one rank")
+    excluded = []
+    for rank in ranks_to_exclude:
+        if not isinstance(rank, int):
+            raise TypeError("ranks_to_exclude must contain integers")
+        if rank < 0 or rank >= parent.size():
+            raise ValueError("rank to exclude is out of range")
+        if rank in excluded:
+            raise ValueError("ranks_to_exclude cannot contain duplicates")
+        excluded.append(rank)
+    if len(excluded) >= parent.size():
+        raise ValueError("cannot exclude every rank in a process group")
+    current_rank = parent.rank()
+    remaining = [
+        global_rank for local_rank, global_rank in enumerate(parent.ranks)
+        if local_rank not in excluded
+    ]
+    if current_rank in excluded:
+        raise RuntimeError(
+            "the current rank is excluded and must not call shrink_group"
+        )
+    if shrink_flags == SHRINK_ABORT and parent.comm is not None:
+        _C.comm_abort(parent.comm)
+
+    timeout = _dt.timedelta(seconds=parent._timeout_s)
+    child = new_group(
+        ranks=remaining,
+        timeout=timeout,
+        backend=parent.backend,
+        pg_options=pg_options,
+        sort_ranks=False,
+    )
+    if child is GroupMember.NON_GROUP_MEMBER:
+        raise RuntimeError("current rank is not in the shrunken process group")
+    child._backend_config = parent._backend_config
+
+    if parent is _world_group:
+        old_groups = [candidate for candidate in _groups.values()
+                      if candidate is not child]
+        for candidate in old_groups:
+            if candidate.comm is not None:
+                _C.comm_destroy(candidate.comm)
+            candidate.gloo_pg = None
+            candidate.mpi_pg = None
+        _groups.clear()
+        _world_group = child
+        GroupMember.WORLD = child
+        _backend = child.backend
+    else:
+        destroy_process_group(parent)
+    return child
 
 
 def new_group(ranks: Optional[List[int]] = None,
               timeout: _dt.timedelta = default_pg_timeout,
-              backend: Optional[str] = None, pg_options=None):
+              backend: Optional[str] = None, pg_options=None,
+              group_desc: Optional[str] = None,
+              sort_ranks: bool = True):
     global _group_count
     _check_default_pg()
-    if backend is None:
-        backend = _backend
+    requested_backend = (
+        getattr(_world_group, "_backend_config", _backend)
+        if backend is None
+        else str(backend).lower()
+    )
+    backend_config = BackendConfig(requested_backend)
+    if len(backend_config.device_backend_map) == 1:
+        backend = next(iter(backend_config.device_backend_map.values()))
     else:
-        backend = str(backend).lower()
-        if backend not in (Backend.NCCL, Backend.GLOO, Backend.MPI):
+        active_device = "cuda" if tp.cuda.is_available() else "cpu"
+        try:
+            backend = backend_config.device_backend_map[active_device]
+        except KeyError as exc:
             raise ValueError(
-                f"Invalid backend: '{backend}'. TensorPlay currently supports: "
-                f"'{Backend.NCCL}', '{Backend.GLOO}', '{Backend.MPI}'"
-            )
-        if backend == Backend.NCCL and not is_available():
-            raise RuntimeError("NCCL library could not be loaded")
-        if backend == Backend.GLOO and not is_gloo_available():
-            raise RuntimeError("The gloo backend was not compiled into this build")
-        if backend == Backend.MPI and not is_mpi_available():
-            raise RuntimeError("The MPI backend was not compiled into this build")
+                f"No backend configured for active device '{active_device}'"
+            ) from exc
+    backend = str(backend).lower()
+    if backend not in (Backend.NCCL, Backend.GLOO, Backend.MPI):
+        raise ValueError(
+            f"Invalid backend: '{backend}'. TensorPlay currently supports: "
+            f"'{Backend.NCCL}', '{Backend.GLOO}', '{Backend.MPI}'"
+        )
+    if backend == Backend.NCCL and not is_available():
+        raise RuntimeError("NCCL library could not be loaded")
+    if backend == Backend.GLOO and not is_gloo_available():
+        raise RuntimeError("The gloo backend was not compiled into this build")
+    if backend == Backend.MPI and not is_mpi_available():
+        raise RuntimeError("The MPI backend was not compiled into this build")
     if ranks is None:
         ranks = list(range(get_world_size()))
-    ranks = sorted(set(ranks))
+    ranks = list(ranks)
+    if not ranks:
+        raise ValueError("ranks must not be empty")
+    if len(ranks) != len(set(ranks)):
+        raise ValueError("ranks must be unique")
+    world_size = get_world_size()
+    if any(rank < 0 or rank >= world_size for rank in ranks):
+        raise ValueError(
+            f"ranks must be in the range [0, {world_size})"
+        )
+    if sort_ranks:
+        ranks.sort()
     if _global_rank() not in ranks:
+        if backend == Backend.MPI:
+            _C.ProcessGroupMPI.create(ranks)
         return GroupMember.NON_GROUP_MEMBER
     _group_count += 1
     pg = ProcessGroup(ranks, group_name=str(_group_count), backend=backend)
+    pg._backend_config = repr(backend_config)
     pg._timeout_s = timeout.total_seconds()
+    if group_desc is not None:
+        pg.group_desc = str(group_desc)
     _groups[pg.group_name] = pg
     _ensure_comm(pg, pg._timeout_s)
     return pg
@@ -634,10 +1195,13 @@ def _contiguous_view(t: tp.Tensor):
     return buf, (lambda: t.copy_(buf))
 
 
+def _collective_view(t: tp.Tensor):
+    return tp.view_as_real(t) if t.is_complex() else t
+
+
 def _finish(event, restore=None, extra=None, async_op: bool = False):
     if async_op:
         def done():
-            event.synchronize()
             if restore is not None:
                 restore()
             if extra is not None:
@@ -656,7 +1220,6 @@ def _finish_with_tensors(event, tensors, restore=None, extra=None,
     """Like :func:`_finish` but attaches output tensors for ``get_future``."""
     if async_op:
         def done():
-            event.synchronize()
             if restore is not None:
                 restore()
             if extra is not None:
@@ -672,14 +1235,15 @@ def _finish_with_tensors(event, tensors, restore=None, extra=None,
 
 def broadcast(tensor: tp.Tensor, src: int, group=None, async_op: bool = False):
     pg = _resolve_group(group)
+    tensor_base = _collective_view(tensor)
     if pg.backend != Backend.NCCL:
-        buf, restore = _contiguous_view(tensor)
+        buf, restore = _contiguous_view(tensor_base)
         work = _cpu_pg(pg).broadcast(
             [buf], pg.group_rank(src), 0, _cpu_timeout_ms(pg))
         return _cpu_finish(work, tensors=[tensor], restore=restore,
                            async_op=async_op)
     comm = _ensure_comm(pg, default_pg_timeout.total_seconds())
-    buf, restore = _contiguous_view(tensor)
+    buf, restore = _contiguous_view(tensor_base)
     # NCCL roots are communicator-relative (= group rank).
     root = pg.group_rank(src)
     _C.broadcast(buf, root, comm)
@@ -690,13 +1254,20 @@ def broadcast(tensor: tp.Tensor, src: int, group=None, async_op: bool = False):
 def all_reduce(tensor: tp.Tensor, op: int = ReduceOp.SUM, group=None,
                async_op: bool = False):
     pg = _resolve_group(group)
+    if tensor.is_complex() and not supports_complex(op):
+        raise RuntimeError("reduction operation does not support complex tensors")
+    if tensor.is_sparse and pg.backend != Backend.NCCL:
+        work = _cpu_pg(pg).allreduce(
+            [tensor], int(op), _cpu_timeout_ms(pg))
+        return _cpu_finish(work, tensors=[tensor], async_op=async_op)
+    tensor_base = _collective_view(tensor)
     if pg.backend != Backend.NCCL:
-        buf, restore = _contiguous_view(tensor)
+        buf, restore = _contiguous_view(tensor_base)
         work = _cpu_pg(pg).allreduce([buf], int(op), _cpu_timeout_ms(pg))
         return _cpu_finish(work, tensors=[tensor], restore=restore,
                            async_op=async_op)
     comm = _ensure_comm(pg, default_pg_timeout.total_seconds())
-    buf, restore = _contiguous_view(tensor)
+    buf, restore = _contiguous_view(tensor_base)
     _C.all_reduce(buf, int(op), comm)
     return _finish_with_tensors(_record_event(_device_index_of(tensor)),
                                 [tensor], restore=restore, async_op=async_op)
@@ -708,7 +1279,7 @@ def reduce(tensor: tp.Tensor, dst: int, op: int = ReduceOp.SUM, group=None,
     if pg.backend != Backend.NCCL:
         buf, restore = _contiguous_view(tensor)
         work = _cpu_pg(pg).reduce(
-            [buf], pg.group_rank(dst), 0, int(op), _cpu_timeout_ms(pg))
+            [buf], pg.group_rank(dst), int(op), 0, _cpu_timeout_ms(pg))
         return _cpu_finish(work, tensors=[tensor], restore=restore,
                            async_op=async_op)
     comm = _ensure_comm(pg, default_pg_timeout.total_seconds())
@@ -727,21 +1298,39 @@ def all_gather(tensor_list: List[tp.Tensor], tensor: tp.Tensor, group=None,
             f"the group world size ({pg.size()})"
         )
     if pg.backend != Backend.NCCL:
-        send_t, restore = _contiguous_view(tensor)
+        output_buffers = []
+        output_restores = []
+        for output in tensor_list:
+            output_t, output_restore = _contiguous_view(
+                _collective_view(output))
+            output_buffers.append(output_t)
+            output_restores.append(output_restore)
+        send_t, input_restore = _contiguous_view(_collective_view(tensor))
         work = _cpu_pg(pg).allgather(
-            [list(tensor_list)], [send_t], _cpu_timeout_ms(pg))
-        return _cpu_finish(work, tensors=tensor_list, restore=restore,
+            [output_buffers], [send_t], _cpu_timeout_ms(pg))
+
+        def _restore():
+            for restore in output_restores:
+                if restore is not None:
+                    restore()
+            if input_restore is not None:
+                input_restore()
+
+        return _cpu_finish(work, tensors=tensor_list, restore=_restore,
                            async_op=async_op)
     comm = _ensure_comm(pg, default_pg_timeout.total_seconds())
-    n = tensor.numel()
-    out = tp.zeros(pg.size() * n, dtype=tensor.dtype,
+    input_base = _collective_view(tensor)
+    output_bases = [_collective_view(output) for output in tensor_list]
+    n = input_base.numel()
+    out = tp.zeros(pg.size() * n, dtype=input_base.dtype,
                    device=tensor.device)
-    send_t, restore = _contiguous_view(tensor)
+    send_t, restore = _contiguous_view(input_base)
     _C.all_gather(out, send_t, comm)
 
     def _split():
-        for i, t in enumerate(tensor_list):
-            t.copy_(out[i * n : (i + 1) * n].view(t.shape))
+        for i, output_base in enumerate(output_bases):
+            output_base.copy_(
+                out[i * n : (i + 1) * n].view(output_base.shape))
 
     return _finish_with_tensors(_record_event(_device_index_of(tensor)),
                                 tensor_list, restore=restore,
@@ -782,6 +1371,79 @@ def gather(tensor: tp.Tensor, gather_list: Optional[List[tp.Tensor]] = None,
                                 extra=_split, async_op=async_op)
 
 
+def gather_single(tensor: tp.Tensor, gather_tensor: Optional[tp.Tensor] = None,
+                  dst: int = 0, group=None, async_op: bool = False):
+    """Gather one tensor from every rank into one tensor on ``dst``."""
+    pg = _resolve_group(group)
+    my_group_rank = pg.group_rank(_global_rank())
+    if dst < 0 or dst >= pg.size():
+        raise ValueError("dst rank is out of range for the process group")
+    if tensor.is_complex():
+        input_base = tp.view_as_real(tensor)
+    else:
+        input_base = tensor
+
+    if my_group_rank == dst:
+        if gather_tensor is None:
+            raise ValueError(
+                "gather_tensor must be specified on the destination rank")
+        if gather_tensor.dtype != tensor.dtype:
+            raise ValueError(
+                "gather_tensor and tensor must have the same dtype")
+        output_base = (tp.view_as_real(gather_tensor)
+                       if gather_tensor.is_complex() else gather_tensor)
+        expected = pg.size() * input_base.numel()
+        if output_base.numel() != expected:
+            raise RuntimeError(
+                f"gather_tensor has {gather_tensor.numel()} elements but "
+                f"expected {pg.size() * tensor.numel()}"
+            )
+    else:
+        output_base = tp.empty(
+            (0,), dtype=input_base.dtype, device=input_base.device)
+
+    if pg.backend != Backend.NCCL:
+        out_t, out_restore = _contiguous_view(output_base)
+        in_t, in_restore = _contiguous_view(input_base)
+        work = _cpu_pg(pg).gather_single(
+            out_t, in_t, dst, _cpu_timeout_ms(pg))
+
+        def _restore():
+            if out_restore is not None:
+                out_restore()
+            if in_restore is not None:
+                in_restore()
+
+        tensors = [gather_tensor] if my_group_rank == dst else []
+        return _cpu_finish(work, tensors=tensors, restore=_restore,
+                           async_op=async_op)
+
+    comm = _ensure_comm(pg, default_pg_timeout.total_seconds())
+    out_t, out_restore = _contiguous_view(output_base)
+    in_t, in_restore = _contiguous_view(input_base)
+    _C.gather(out_t if my_group_rank == dst else None, in_t, dst, comm)
+
+    def _restore():
+        if out_restore is not None:
+            out_restore()
+        if in_restore is not None:
+            in_restore()
+
+    tensors = [gather_tensor] if my_group_rank == dst else []
+    return _finish_with_tensors(
+        _record_event(_device_index_of(tensor)),
+        tensors,
+        restore=_restore if (out_restore or in_restore) else None,
+        async_op=async_op)
+
+
+def gather_into_tensor(tensor: tp.Tensor,
+                       gather_tensor: Optional[tp.Tensor] = None,
+                       dst: int = 0, group=None, async_op: bool = False):
+    """Gather one tensor from every rank into one tensor on ``dst``."""
+    return gather_single(tensor, gather_tensor, dst, group, async_op)
+
+
 def scatter(tensor: tp.Tensor, scatter_list: Optional[List[tp.Tensor]] = None,
             src: int = 0, group=None, async_op: bool = False):
     pg = _resolve_group(group)
@@ -790,11 +1452,26 @@ def scatter(tensor: tp.Tensor, scatter_list: Optional[List[tp.Tensor]] = None,
         if my_group_rank == src and scatter_list is None:
             raise RuntimeError("scatter_list must be specified on the source rank")
         inputs = []
+        input_restores = []
         if my_group_rank == src:
-            inputs = [list(scatter_list)]
-        recv_t, restore = _contiguous_view(tensor)
+            input_buffers = []
+            for input_tensor in scatter_list:
+                input_t, input_restore = _contiguous_view(
+                    _collective_view(input_tensor))
+                input_buffers.append(input_t)
+                input_restores.append(input_restore)
+            inputs = [input_buffers]
+        recv_t, output_restore = _contiguous_view(_collective_view(tensor))
         work = _cpu_pg(pg).scatter([recv_t], inputs, src, _cpu_timeout_ms(pg))
-        return _cpu_finish(work, tensors=[tensor], restore=restore,
+
+        def _restore():
+            for restore in input_restores:
+                if restore is not None:
+                    restore()
+            if output_restore is not None:
+                output_restore()
+
+        return _cpu_finish(work, tensors=[tensor], restore=_restore,
                            async_op=async_op)
     comm = _ensure_comm(pg, default_pg_timeout.total_seconds())
     send_obj = None
@@ -803,10 +1480,10 @@ def scatter(tensor: tp.Tensor, scatter_list: Optional[List[tp.Tensor]] = None,
             raise RuntimeError("scatter_list must be specified on the source rank")
         chunks = []
         for t in scatter_list:
-            c, r = _contiguous_view(t)
+            c, r = _contiguous_view(_collective_view(t))
             chunks.append(c.reshape(1, -1))
         send_obj = tp.cat(chunks, 0)
-    recv_t, restore = _contiguous_view(tensor)
+    recv_t, restore = _contiguous_view(_collective_view(tensor))
     _C.scatter(recv_t, send_obj, src, comm)
 
     return _finish_with_tensors(_record_event(_device_index_of(tensor)),
@@ -849,7 +1526,7 @@ def isend(tensor: tp.Tensor, dst: int, group=None, tag: int = 0):
         _warn_not_in_group("isend")
         return None
     pg = _resolve_group(group)
-    buf, _ = _contiguous_view(tensor)
+    buf, _ = _contiguous_view(_collective_view(tensor))
     if pg.backend != Backend.NCCL:
         return _BackendWork(_cpu_pg(pg).send(
             [buf], pg.group_rank(dst), tag))
@@ -871,7 +1548,7 @@ def irecv(tensor: tp.Tensor, src: Optional[int] = None, group=None,
         return None
     pg = _resolve_group(group)
     if src is None and pg.backend != Backend.NCCL:
-        buf, restore = _contiguous_view(tensor)
+        buf, restore = _contiguous_view(_collective_view(tensor))
         work = _cpu_pg(pg).recv_anysource([buf], tag)
         return _BackendWork(work, done=restore)
     if src is None:
@@ -879,7 +1556,7 @@ def irecv(tensor: tp.Tensor, src: Optional[int] = None, group=None,
             "TensorPlay does not support recv from any source yet; "
             "specify src"
         )
-    buf, restore = _contiguous_view(tensor)
+    buf, restore = _contiguous_view(_collective_view(tensor))
     if pg.backend != Backend.NCCL:
         return _BackendWork(_cpu_pg(pg).recv(
             [buf], pg.group_rank(src), tag), done=restore)
@@ -988,17 +1665,42 @@ def _validate_output_list_for_rank(my_rank: int, dst: int, gather_list) -> None:
 
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
-def all_gather_into_tensor(output_tensor: tp.Tensor, input_tensor: tp.Tensor,
-                           group=None, async_op: bool = False):
-    """Gather tensors from all ranks into one flat output tensor.
-
-    ``output_tensor`` must have ``world_size * input_tensor.numel()`` elements,
-    """
+def all_gather_single(output_tensor: tp.Tensor, input_tensor: tp.Tensor,
+                      group=None, async_op: bool = False):
+    """Gather one tensor from every rank into one output tensor."""
     pg = _resolve_group(group)
+    expected = pg.size() * input_tensor.numel()
+    if output_tensor.numel() != expected:
+        raise RuntimeError(
+            f"output_tensor has {output_tensor.numel()} elements but expected "
+            f"{expected} (world_size {pg.size()} x input numel {input_tensor.numel()})"
+        )
+    input_shape = tuple(input_tensor.shape)
+    concatenated_shape = (
+        (pg.size(),) if not input_shape else
+        (pg.size() * input_shape[0],) + input_shape[1:]
+    )
+    stacked_shape = (pg.size(),) + input_shape
+    if tuple(output_tensor.shape) not in {
+        concatenated_shape,
+        stacked_shape,
+    }:
+        raise RuntimeError(
+            "output_tensor shape must be either the concatenation shape "
+            f"{concatenated_shape} or the stack shape {stacked_shape}; got "
+            f"{tuple(output_tensor.shape)}"
+        )
+    if output_tensor.dtype != input_tensor.dtype:
+        raise ValueError("output_tensor and input_tensor must have the same dtype")
+
+    output_base = (tp.view_as_real(output_tensor)
+                   if output_tensor.is_complex() else output_tensor)
+    input_base = (tp.view_as_real(input_tensor)
+                  if input_tensor.is_complex() else input_tensor)
     if pg.backend != Backend.NCCL:
-        out_t, out_restore = _contiguous_view(output_tensor)
-        in_t, in_restore = _contiguous_view(input_tensor)
-        work = _cpu_pg(pg).all_gather_into_tensor(
+        out_t, out_restore = _contiguous_view(output_base)
+        in_t, in_restore = _contiguous_view(input_base)
+        work = _cpu_pg(pg).all_gather_single(
             out_t, in_t, _cpu_timeout_ms(pg))
 
         def _restore():
@@ -1010,15 +1712,9 @@ def all_gather_into_tensor(output_tensor: tp.Tensor, input_tensor: tp.Tensor,
         return _cpu_finish(work, tensors=[output_tensor], restore=_restore,
                            async_op=async_op)
     comm = _ensure_comm(pg, default_pg_timeout.total_seconds())
-    expected = pg.size() * input_tensor.numel()
-    if output_tensor.numel() != expected:
-        raise RuntimeError(
-            f"output_tensor has {output_tensor.numel()} elements but expected "
-            f"{expected} (world_size {pg.size()} x input numel {input_tensor.numel()})"
-        )
-    out, out_restore = _contiguous_view(output_tensor)
-    send_t, send_restore = _contiguous_view(input_tensor)
-    _C.all_gather(out, send_t, comm)
+    out_t, out_restore = _contiguous_view(output_base)
+    send_t, send_restore = _contiguous_view(input_base)
+    _C.all_gather(out_t, send_t, comm)
 
     def _restore():
         if out_restore is not None:
@@ -1026,21 +1722,23 @@ def all_gather_into_tensor(output_tensor: tp.Tensor, input_tensor: tp.Tensor,
         if send_restore is not None:
             send_restore()
 
-    return _finish(_record_event(_device_index_of(input_tensor)),
-                   restore=_restore if (out_restore or send_restore) else None,
-                   async_op=async_op)
+    return _finish_with_tensors(
+        _record_event(_device_index_of(input_tensor)),
+        [output_tensor],
+        restore=_restore if (out_restore or send_restore) else None,
+        async_op=async_op)
 
 
-_allgather_base = all_gather_into_tensor
+def all_gather_into_tensor(output_tensor: tp.Tensor, input_tensor: tp.Tensor,
+                           group=None, async_op: bool = False):
+    """Gather one tensor from every rank into one output tensor."""
+    return all_gather_single(output_tensor, input_tensor, group, async_op)
 
 
-def reduce_scatter_tensor(output: tp.Tensor, input: tp.Tensor,
+def reduce_scatter_single(output: tp.Tensor, input: tp.Tensor,
                           op: int = ReduceOp.SUM, group=None,
                           async_op: bool = False):
-    """
-
-    ``input`` must have ``world_size * output.numel()`` elements.
-    """
+    """Reduce one tensor and scatter one result to every rank."""
     pg = _resolve_group(group)
     expected = pg.size() * output.numel()
     if input.numel() != expected:
@@ -1048,10 +1746,16 @@ def reduce_scatter_tensor(output: tp.Tensor, input: tp.Tensor,
             f"input has {input.numel()} elements but expected {expected} "
             f"(world_size {pg.size()} x output numel {output.numel()})"
         )
+    if output.dtype != input.dtype:
+        raise ValueError("output and input must have the same dtype")
+    output_base = (tp.view_as_real(output)
+                   if output.is_complex() else output)
+    input_base = (tp.view_as_real(input)
+                  if input.is_complex() else input)
     if pg.backend != Backend.NCCL:
-        out_t, out_restore = _contiguous_view(output)
-        in_t, in_restore = _contiguous_view(input)
-        work = _cpu_pg(pg).reduce_scatter_tensor(
+        out_t, out_restore = _contiguous_view(output_base)
+        in_t, in_restore = _contiguous_view(input_base)
+        work = _cpu_pg(pg).reduce_scatter_single(
             out_t, in_t, int(op), _cpu_timeout_ms(pg))
 
         def _restore():
@@ -1063,8 +1767,8 @@ def reduce_scatter_tensor(output: tp.Tensor, input: tp.Tensor,
         return _cpu_finish(work, tensors=[output], restore=_restore,
                            async_op=async_op)
     comm = _ensure_comm(pg, default_pg_timeout.total_seconds())
-    recv_t, recv_restore = _contiguous_view(output)
-    send_t, send_restore = _contiguous_view(input)
+    recv_t, recv_restore = _contiguous_view(output_base)
+    send_t, send_restore = _contiguous_view(input_base)
     _C.reduce_scatter(recv_t, send_t, int(op), comm)
 
     def _restore():
@@ -1073,12 +1777,18 @@ def reduce_scatter_tensor(output: tp.Tensor, input: tp.Tensor,
         if send_restore is not None:
             send_restore()
 
-    return _finish(_record_event(_device_index_of(output)),
-                   restore=_restore if (recv_restore or send_restore) else None,
-                   async_op=async_op)
+    return _finish_with_tensors(
+        _record_event(_device_index_of(output)),
+        [output],
+        restore=_restore if (recv_restore or send_restore) else None,
+        async_op=async_op)
 
 
-_reduce_scatter_base = reduce_scatter_tensor
+def reduce_scatter_tensor(output: tp.Tensor, input: tp.Tensor,
+                          op: int = ReduceOp.SUM, group=None,
+                          async_op: bool = False):
+    """Reduce one tensor and scatter one result to every rank."""
+    return reduce_scatter_single(output, input, op, group, async_op)
 
 
 # ---------------------------------------------------------------------------
@@ -1090,29 +1800,32 @@ def all_reduce_coalesced(tensors: List[tp.Tensor], op: int = ReduceOp.SUM,
     """All-reduce a list of tensors in one coalesced (grouped) launch."""
     pg = _resolve_group(group)
     if pg.backend != Backend.NCCL:
-        # CPU backends run one collective per tensor; the list form is a
-        # convenience wrapper, not a fused exchange.
-        works = []
+        buffers = []
         restores = []
         for t in tensors:
-            buf, restore = _contiguous_view(t)
+            base = tp.view_as_real(t) if t.is_complex() else t
+            buf, restore = _contiguous_view(base)
+            buffers.append(buf)
             restores.append(restore)
-            works.append(_cpu_pg(pg).allreduce(
-                [buf], int(op), _cpu_timeout_ms(pg)))
+        work = _cpu_pg(pg).allreduce_coalesced(
+            buffers, int(op), _cpu_timeout_ms(pg))
 
         def _restore():
             for r in restores:
                 if r is not None:
                     r()
 
-        return _cpu_finish(_ChainedWork(works), tensors=list(tensors),
+        return _cpu_finish(work, tensors=list(tensors),
                            restore=_restore, async_op=async_op)
     comm = _ensure_comm(pg, default_pg_timeout.total_seconds())
     restores = []
     _C.group_start()
     try:
         for t in tensors:
-            buf, restore = _contiguous_view(t)
+            if t.is_complex() and not supports_complex(op):
+                raise RuntimeError(
+                    "reduction operation does not support complex tensors")
+            buf, restore = _contiguous_view(_collective_view(t))
             restores.append(restore)
             _C.all_reduce(buf, int(op), comm)
     except BaseException:
@@ -1142,19 +1855,39 @@ def all_gather_coalesced(output_tensor_lists: List[List[tp.Tensor]],
             "output_tensor_lists and input_tensor_list must have the same length"
         )
     if pg.backend != Backend.NCCL:
-        works = []
+        input_buffers = []
+        input_restores = []
+        output_lists = [[] for _ in range(pg.size())]
+        output_restores = []
         for out_list, tensor in zip(output_tensor_lists, input_tensor_list):
             if len(out_list) != pg.size():
                 raise RuntimeError(
                     f"output list length ({len(out_list)}) does not match the "
                     f"group world size ({pg.size()})"
                 )
-            send_t, _ = _contiguous_view(tensor)
-            works.append(_cpu_pg(pg).allgather(
-                [list(out_list)], [send_t], _cpu_timeout_ms(pg)))
-        return _cpu_finish(_ChainedWork(works),
-                           tensors=[t for ol in output_tensor_lists for t in ol],
-                           async_op=async_op)
+            input_base = tp.view_as_real(tensor) if tensor.is_complex() else tensor
+            send_t, input_restore = _contiguous_view(input_base)
+            input_buffers.append(send_t)
+            input_restores.append(input_restore)
+            for rank, output in enumerate(out_list):
+                output_base = (tp.view_as_real(output)
+                               if output.is_complex() else output)
+                output_t, output_restore = _contiguous_view(output_base)
+                output_lists[rank].append(output_t)
+                output_restores.append(output_restore)
+        work = _cpu_pg(pg).allgather_coalesced(
+            output_lists, input_buffers, _cpu_timeout_ms(pg))
+
+        def _restore():
+            for restore in output_restores + input_restores:
+                if restore is not None:
+                    restore()
+
+        return _cpu_finish(
+            work,
+            tensors=[t for output_list in output_tensor_lists for t in output_list],
+            restore=_restore,
+            async_op=async_op)
     comm = _ensure_comm(pg, default_pg_timeout.total_seconds())
     flats = []
     restores = []
@@ -1166,22 +1899,25 @@ def all_gather_coalesced(output_tensor_lists: List[List[tp.Tensor]],
                     f"output list length ({len(out_list)}) does not match the "
                     f"group world size ({pg.size()})"
                 )
-            n = tensor.numel()
-            out = tp.zeros(pg.size() * n, dtype=tensor.dtype,
+            input_base = _collective_view(tensor)
+            output_bases = [_collective_view(output) for output in out_list]
+            n = input_base.numel()
+            out = tp.zeros(pg.size() * n, dtype=input_base.dtype,
                            device=tensor.device)
-            send_t, restore = _contiguous_view(tensor)
+            send_t, restore = _contiguous_view(input_base)
             restores.append(restore)
             _C.all_gather(out, send_t, comm)
-            flats.append((out, out_list, n))
+            flats.append((out, output_bases, n))
     except BaseException:
         _C.group_end()
         raise
     _C.group_end()
 
     def _split():
-        for out, out_list, n in flats:
-            for i, t in enumerate(out_list):
-                t.copy_(out[i * n:(i + 1) * n].view(t.shape))
+        for out, output_bases, n in flats:
+            for i, output_base in enumerate(output_bases):
+                output_base.copy_(
+                    out[i * n:(i + 1) * n].view(output_base.shape))
         for r in restores:
             if r is not None:
                 r()
@@ -1206,17 +1942,35 @@ def reduce_scatter_coalesced(output_tensor_list: List[tp.Tensor],
         )
     if pg.backend != Backend.NCCL:
         works = []
+        restores = []
         for output, inputs in zip(output_tensor_list, input_tensor_lists):
             if len(inputs) != pg.size():
                 raise RuntimeError(
                     "input list length must equal the group world size"
                 )
-            out_t, _ = _contiguous_view(output)
+            if output.is_complex() and not supports_complex(op):
+                raise RuntimeError(
+                    "reduction operation does not support complex tensors")
+            out_t, output_restore = _contiguous_view(
+                _collective_view(output))
+            input_buffers = []
+            for input_tensor in inputs:
+                input_t, input_restore = _contiguous_view(
+                    _collective_view(input_tensor))
+                input_buffers.append(input_t)
+                restores.append(input_restore)
+            restores.append(output_restore)
             works.append(_cpu_pg(pg).reduce_scatter(
-                [out_t], [list(inputs)], int(op), _cpu_timeout_ms(pg)))
+                [out_t], [input_buffers], int(op), _cpu_timeout_ms(pg)))
+
+        def _restore():
+            for restore in restores:
+                if restore is not None:
+                    restore()
+
         return _cpu_finish(_ChainedWork(works),
                            tensors=list(output_tensor_list),
-                           async_op=async_op)
+                           restore=_restore, async_op=async_op)
     comm = _ensure_comm(pg, default_pg_timeout.total_seconds())
     restores = []
     _C.group_start()
@@ -1227,9 +1981,15 @@ def reduce_scatter_coalesced(output_tensor_list: List[tp.Tensor],
                     f"input list length ({len(in_list)}) does not match the "
                     f"group world size ({pg.size()})"
                 )
-            flat_in = tp.cat([t.reshape(-1) for t in in_list])
+            if (output.is_complex() or any(t.is_complex() for t in in_list)) \
+                    and not supports_complex(op):
+                raise RuntimeError(
+                    "reduction operation does not support complex tensors")
+            flat_in = tp.cat([
+                _collective_view(t).reshape(-1) for t in in_list
+            ])
             send_t, s_restore = _contiguous_view(flat_in)
-            recv_t, r_restore = _contiguous_view(output)
+            recv_t, r_restore = _contiguous_view(_collective_view(output))
             restores.extend([s_restore, r_restore])
             _C.reduce_scatter(recv_t, send_t, int(op), comm)
     except BaseException:
@@ -1616,18 +2376,18 @@ def all_to_all_single(output: tp.Tensor, input: tp.Tensor,
     pg = _resolve_group(group)
     if input.dtype != output.dtype:
         raise ValueError("output tensor must have the same type as input tensor")
-    if (output_split_sizes is None) != (input_split_sizes is None):
-        raise ValueError(
-            "output_split_sizes and input_split_sizes must both be specified "
-            "or both be None"
-        )
+    output_split_sizes = (
+        [] if output_split_sizes is None else list(output_split_sizes)
+    )
+    input_split_sizes = (
+        [] if input_split_sizes is None else list(input_split_sizes)
+    )
     if pg.backend != Backend.NCCL:
-        out_counts = list(output_split_sizes or [])
-        in_counts = list(input_split_sizes or [])
-        out_t, out_restore = _contiguous_view(output)
-        in_t, in_restore = _contiguous_view(input)
+        out_t, out_restore = _contiguous_view(_collective_view(output))
+        in_t, in_restore = _contiguous_view(_collective_view(input))
         work = _cpu_pg(pg).all_to_all_single(
-            out_t, in_t, out_counts, in_counts, _cpu_timeout_ms(pg))
+            out_t, in_t, output_split_sizes, input_split_sizes,
+            _cpu_timeout_ms(pg))
 
         def _restore():
             if out_restore is not None:
@@ -1638,28 +2398,55 @@ def all_to_all_single(output: tp.Tensor, input: tp.Tensor,
         return _cpu_finish(work, tensors=[output], restore=_restore,
                            async_op=async_op)
     comm = _ensure_comm(pg, default_pg_timeout.total_seconds())
-    if output_split_sizes is None:
-        if output.numel() != input.numel():
-            raise ValueError(
-                "output tensor must have the same number of elements as "
-                "input tensor for equal splits"
-            )
-        _C.all_to_all_single_equal_split(output, input, comm)
-    else:
+    output_base = _collective_view(output)
+    input_base = _collective_view(input)
+    if output_base.dim() == 0 or input_base.dim() == 0:
+        raise ValueError("all_to_all_single requires tensors with a dimension 0")
+    if output_split_sizes or input_split_sizes:
         if len(input_split_sizes) != pg.size() or \
                 len(output_split_sizes) != pg.size():
             raise RuntimeError(
                 "split sizes length must equal the group world size"
             )
-        if sum(input_split_sizes) != input.numel():
-            raise ValueError("input_split_sizes sum must equal input numel")
-        if sum(output_split_sizes) != output.numel():
-            raise ValueError("output_split_sizes sum must equal output numel")
+        if any(size < 0 for size in input_split_sizes + output_split_sizes):
+            raise ValueError("split sizes must be non-negative")
+        if sum(input_split_sizes) != input_base.shape[0]:
+            raise ValueError("input_split_sizes sum must equal input dim 0")
+        if sum(output_split_sizes) != output_base.shape[0]:
+            raise ValueError("output_split_sizes sum must equal output dim 0")
+        input_row_size = input_base.numel() // input_base.shape[0]
+        output_row_size = output_base.numel() // output_base.shape[0]
+        in_counts = [size * input_row_size for size in input_split_sizes]
+        out_counts = [size * output_row_size for size in output_split_sizes]
+    else:
+        if input_base.shape[0] % pg.size() != 0 or \
+                output_base.shape[0] % pg.size() != 0:
+            raise ValueError(
+                "tensor dim 0 must be evenly divisible by the group world size"
+            )
+        if output_base.numel() != input_base.numel():
+            raise ValueError(
+                "output tensor must have the same number of elements as "
+                "input tensor for equal splits"
+            )
+        in_counts = []
+        out_counts = []
+    out_t, out_restore = _contiguous_view(output_base)
+    in_t, in_restore = _contiguous_view(input_base)
+    if not (output_split_sizes or input_split_sizes):
+        _C.all_to_all_single_equal_split(out_t, in_t, comm)
+    else:
         _C.all_to_all_single_unequal_split(
-            output, input, list(output_split_sizes), list(input_split_sizes),
+            out_t, in_t, out_counts, in_counts,
             comm)
 
-    return _finish(_record_event(_device_index_of(input)), None,
+    def _restore():
+        if out_restore is not None:
+            out_restore()
+        if in_restore is not None:
+            in_restore()
+
+    return _finish(_record_event(_device_index_of(input)), _restore,
                    async_op=async_op)
 
 
@@ -1679,23 +2466,38 @@ def all_to_all(output_tensor_list: List[tp.Tensor],
             f"world_size ({pg.size()})"
         )
     if pg.backend != Backend.NCCL:
-        # The backend copies in place into the output tensors; reshaped
-        # views share storage with the caller's tensors.
-        outs = [t.reshape(-1) for t in output_tensor_list]
-        ins = [t.reshape(-1) for t in input_tensor_list]
+        outs = []
+        ins = []
+        restores = []
+        for tensor in output_tensor_list:
+            tensor_view, restore = _contiguous_view(_collective_view(tensor))
+            outs.append(tensor_view.reshape(-1))
+            restores.append(restore)
+        for tensor in input_tensor_list:
+            tensor_view, restore = _contiguous_view(_collective_view(tensor))
+            ins.append(tensor_view.reshape(-1))
+            restores.append(restore)
         work = _cpu_pg(pg).alltoall(outs, ins, _cpu_timeout_ms(pg))
+
+        def _restore():
+            for restore in restores:
+                if restore is not None:
+                    restore()
+
         return _cpu_finish(work, tensors=list(output_tensor_list),
-                           async_op=async_op)
+                           restore=_restore, async_op=async_op)
     dtype = input_tensor_list[0].dtype
     for t in list(input_tensor_list) + list(output_tensor_list):
         if t.dtype != dtype:
             raise ValueError(
                 "all_to_all tensors must have identical dtypes across lists"
             )
-    input_splits = [t.numel() for t in input_tensor_list]
-    output_splits = [t.numel() for t in output_tensor_list]
-    flat_in = tp.cat([t.reshape(-1) for t in input_tensor_list])
-    flat_out = tp.empty(sum(output_splits), dtype=dtype,
+    input_bases = [_collective_view(t) for t in input_tensor_list]
+    output_bases = [_collective_view(t) for t in output_tensor_list]
+    input_splits = [t.numel() for t in input_bases]
+    output_splits = [t.numel() for t in output_bases]
+    flat_in = tp.cat([t.reshape(-1) for t in input_bases])
+    flat_out = tp.empty(sum(output_splits), dtype=flat_in.dtype,
                         device=input_tensor_list[0].device)
     work = all_to_all_single(flat_out, flat_in, output_splits, input_splits,
                              group=pg, async_op=True)
@@ -1704,8 +2506,8 @@ def all_to_all(output_tensor_list: List[tp.Tensor],
         if hasattr(work, "wait"):
             work.wait()
         offset = 0
-        for t, n in zip(output_tensor_list, output_splits):
-            t.copy_(flat_out[offset : offset + n].reshape(t.shape))
+        for t, base, n in zip(output_tensor_list, output_bases, output_splits):
+            base.copy_(flat_out[offset : offset + n].reshape(base.shape))
             offset += n
 
     if async_op:

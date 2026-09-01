@@ -1,18 +1,23 @@
 #pragma once
 
 #include <condition_variable>
+#include <cstring>
 #include <deque>
 #include <exception>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <stdexcept>
 #include <thread>
+#include <tuple>
+#include <utility>
 #include <vector>
 
 #include <Tensor.h>
 
 #include "../gloo/ProcessGroupGloo.h"
+#include "../Types.h"
 
 #ifdef USE_P10D_MPI
 #include <mpi.h>
@@ -56,9 +61,11 @@ class ProcessGroupMPI {
     AsyncWork(
         MPI_Request request,
         std::vector<Tensor> outputTensors,
-        std::string opName)
+        std::string opName,
+        std::vector<Tensor> inputTensors = {})
         : GlooWork(std::move(opName)),
           outputTensors_(std::move(outputTensors)),
+          inputTensors_(std::move(inputTensors)),
           request_(request) {
       std::memset(&status_, 0, sizeof(status_));
     }
@@ -78,6 +85,7 @@ class ProcessGroupMPI {
 
    private:
     const std::vector<Tensor> outputTensors_;
+    const std::vector<Tensor> inputTensors_;
     MPI_Request request_;
     MPI_Status status_{};
   };
@@ -96,57 +104,190 @@ class ProcessGroupMPI {
       std::vector<Tensor>& tensors,
       int rootRank,
       std::chrono::milliseconds timeout);
+  std::shared_ptr<GlooWork> broadcast(
+      std::vector<Tensor>& tensors,
+      const BroadcastOptions& options) {
+    if (options.rootTensor != 0) {
+      throw std::invalid_argument(
+          "MPI broadcast supports only root tensor index 0");
+    }
+    return broadcast(tensors, options.rootRank, options.timeout);
+  }
   std::shared_ptr<GlooWork> allreduce(
       std::vector<Tensor>& tensors,
-      int reduceOp,
+      ReduceOp reduceOp,
+      std::chrono::milliseconds timeout);
+  std::shared_ptr<GlooWork> allreduce(
+      std::vector<Tensor>& tensors,
+      const AllreduceOptions& options) {
+    return allreduce(tensors, options.reduceOp, options.timeout);
+  }
+  std::shared_ptr<GlooWork> allreduce_sparse(
+      std::vector<Tensor>& tensors,
+      const AllreduceOptions& options) {
+    (void)tensors;
+    (void)options;
+    TP_THROW(RuntimeError, "ProcessGroupMPI does not support allreduce_sparse");
+  }
+  std::shared_ptr<GlooWork> allreduce_coalesced(
+      std::vector<Tensor>& tensors,
+      ReduceOp reduceOp,
       std::chrono::milliseconds timeout);
   std::shared_ptr<GlooWork> allreduce_coalesced(
       std::vector<Tensor>& tensors,
-      int reduceOp,
-      std::chrono::milliseconds timeout);
+      const AllreduceCoalescedOptions& options) {
+    return allreduce_coalesced(tensors, options.reduceOp, options.timeout);
+  }
   std::shared_ptr<GlooWork> reduce(
       std::vector<Tensor>& tensors,
       int rootRank,
-      int reduceOp,
+      ReduceOp reduceOp,
       std::chrono::milliseconds timeout);
+  std::shared_ptr<GlooWork> reduce(
+      std::vector<Tensor>& tensors,
+      const ReduceOptions& options) {
+    if (options.rootTensor != 0) {
+      throw std::invalid_argument(
+          "MPI reduce supports only root tensor index 0");
+    }
+    return reduce(tensors, options.rootRank, options.reduceOp, options.timeout);
+  }
   std::shared_ptr<GlooWork> allgather(
       std::vector<std::vector<Tensor>>& outputTensors,
       std::vector<Tensor>& inputTensors,
       std::chrono::milliseconds timeout);
+  std::shared_ptr<GlooWork> allgather(
+      std::vector<std::vector<Tensor>>& outputTensors,
+      std::vector<Tensor>& inputTensors,
+      const AllgatherOptions& options) {
+    return allgather(outputTensors, inputTensors, options.timeout);
+  }
+  std::shared_ptr<GlooWork> all_gather_single(
+      Tensor& output,
+      Tensor& input,
+      std::chrono::milliseconds timeout);
+  std::shared_ptr<GlooWork> all_gather_single(
+      Tensor& output,
+      Tensor& input,
+      const AllgatherOptions& options) {
+    return all_gather_single(output, input, options.timeout);
+  }
+  std::shared_ptr<GlooWork> allgather_coalesced(
+      std::vector<std::vector<Tensor>>& outputTensors,
+      std::vector<Tensor>& inputTensors,
+      std::chrono::milliseconds timeout);
+  std::shared_ptr<GlooWork> allgather_coalesced(
+      std::vector<std::vector<Tensor>>& outputTensors,
+      std::vector<Tensor>& inputTensors,
+      const AllgatherOptions& options) {
+    return allgather_coalesced(outputTensors, inputTensors, options.timeout);
+  }
   std::shared_ptr<GlooWork> all_gather_into_tensor(
       Tensor& output,
       Tensor& input,
       std::chrono::milliseconds timeout);
+  std::shared_ptr<GlooWork> all_gather_into_tensor(
+      Tensor& output,
+      Tensor& input,
+      const AllgatherOptions& options) {
+    return all_gather_into_tensor(output, input, options.timeout);
+  }
+  std::shared_ptr<GlooWork> gather_single(
+      Tensor& output,
+      Tensor& input,
+      int rootRank,
+      std::chrono::milliseconds timeout);
+  std::shared_ptr<GlooWork> gather_single(
+      Tensor& output,
+      Tensor& input,
+      const GatherOptions& options) {
+    return gather_single(output, input, options.rootRank, options.timeout);
+  }
   std::shared_ptr<GlooWork> gather(
       std::vector<std::vector<Tensor>>& outputTensors,
       std::vector<Tensor>& inputTensors,
       int rootRank,
       std::chrono::milliseconds timeout);
+  std::shared_ptr<GlooWork> gather(
+      std::vector<std::vector<Tensor>>& outputTensors,
+      std::vector<Tensor>& inputTensors,
+      const GatherOptions& options) {
+    return gather(outputTensors, inputTensors, options.rootRank, options.timeout);
+  }
   std::shared_ptr<GlooWork> scatter(
       std::vector<Tensor>& outputTensors,
       std::vector<std::vector<Tensor>>& inputTensors,
       int rootRank,
       std::chrono::milliseconds timeout);
+  std::shared_ptr<GlooWork> scatter(
+      std::vector<Tensor>& outputTensors,
+      std::vector<std::vector<Tensor>>& inputTensors,
+      const ScatterOptions& options) {
+    return scatter(outputTensors, inputTensors, options.rootRank, options.timeout);
+  }
   std::shared_ptr<GlooWork> reduce_scatter(
       std::vector<Tensor>& outputTensors,
       std::vector<std::vector<Tensor>>& inputTensors,
-      int reduceOp,
+      ReduceOp reduceOp,
+      std::chrono::milliseconds timeout);
+  std::shared_ptr<GlooWork> reduce_scatter(
+      std::vector<Tensor>& outputTensors,
+      std::vector<std::vector<Tensor>>& inputTensors,
+      const ReduceScatterOptions& options) {
+    return reduce_scatter(
+        outputTensors, inputTensors, options.reduceOp, options.timeout);
+  }
+  std::shared_ptr<GlooWork> reduce_scatter_tensor(
+      Tensor& output,
+      Tensor& input,
+      ReduceOp reduceOp,
       std::chrono::milliseconds timeout);
   std::shared_ptr<GlooWork> reduce_scatter_tensor(
       Tensor& output,
       Tensor& input,
-      int reduceOp,
+      const ReduceScatterOptions& options) {
+    return reduce_scatter_tensor(output, input, options.reduceOp, options.timeout);
+  }
+  std::shared_ptr<GlooWork> reduce_scatter_single(
+      Tensor& output,
+      Tensor& input,
+      ReduceOp reduceOp,
       std::chrono::milliseconds timeout);
+  std::shared_ptr<GlooWork> reduce_scatter_single(
+      Tensor& output,
+      Tensor& input,
+      const ReduceScatterOptions& options) {
+    return reduce_scatter_single(output, input, options.reduceOp, options.timeout);
+  }
   std::shared_ptr<GlooWork> all_to_all_single(
       Tensor& outputTensor,
       Tensor& inputTensor,
       std::vector<int64_t> outputSplitSizes,
       std::vector<int64_t> inputSplitSizes,
       std::chrono::milliseconds timeout);
+  std::shared_ptr<GlooWork> all_to_all_single(
+      Tensor& outputTensor,
+      Tensor& inputTensor,
+      std::vector<int64_t> outputSplitSizes,
+      std::vector<int64_t> inputSplitSizes,
+      const AllToAllOptions& options) {
+    return all_to_all_single(
+        outputTensor,
+        inputTensor,
+        std::move(outputSplitSizes),
+        std::move(inputSplitSizes),
+        options.timeout);
+  }
   std::shared_ptr<GlooWork> alltoall(
       std::vector<Tensor>& outputTensors,
       std::vector<Tensor>& inputTensors,
       std::chrono::milliseconds timeout);
+  std::shared_ptr<GlooWork> alltoall(
+      std::vector<Tensor>& outputTensors,
+      std::vector<Tensor>& inputTensors,
+      const AllToAllOptions& options) {
+    return alltoall(outputTensors, inputTensors, options.timeout);
+  }
   std::shared_ptr<GlooWork> send(
       std::vector<Tensor>& tensors,
       int dstRank,
@@ -159,6 +300,9 @@ class ProcessGroupMPI {
       std::vector<Tensor>& tensors,
       int tag);
   std::shared_ptr<GlooWork> barrier(std::chrono::milliseconds timeout);
+  std::shared_ptr<GlooWork> barrier(const BarrierOptions& options) {
+    return barrier(options.timeout);
+  }
 
   int getRank() const {
     return rank_;
