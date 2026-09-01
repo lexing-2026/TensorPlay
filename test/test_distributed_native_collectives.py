@@ -78,6 +78,7 @@ def _exercise_collectives(
     backend,
     port=None,
     include_coalesced=True,
+    include_subgroup=False,
 ):
     tp, dist = _initialize(backend, rank, world_size, port)
     try:
@@ -116,6 +117,26 @@ def _exercise_collectives(
         assert self_result is None
         assert gathered.tolist() == _expected_rows(world_size, 0)
 
+        if backend == "gloo":
+            strided_input = tp.tensor(
+                [[float(rank), float(rank + 1)]], dtype=tp.float32
+            )
+            strided_output = tp.zeros(
+                (2, world_size), dtype=tp.float32
+            ).transpose(0, 1)
+            dist.all_gather_single(strided_output, strided_input)
+            assert strided_output.tolist() == [
+                [float(source_rank), float(source_rank + 1)]
+                for source_rank in range(world_size)
+            ]
+            _assert_raises(
+                RuntimeError,
+                lambda: dist.all_gather_single(
+                    tp.zeros((world_size * 2, 1), dtype=tp.float32),
+                    strided_input,
+                ),
+            )
+
         gathered_flat = tp.zeros((world_size * 2,), dtype=tp.float32)
         async_input = tp.arange(2, dtype=tp.float32) + float(100 + rank * 10)
         work = dist.all_gather_single(
@@ -124,6 +145,27 @@ def _exercise_collectives(
         assert work.wait() is True
         assert work.is_completed()
         assert gathered_flat.tolist() == _expected_flat(world_size, 100)
+
+        if backend == "gloo":
+            if rank == 0:
+                sparse_input = tp.sparse_coo_tensor(
+                    tp.tensor([[0, 1], [0, 1]], dtype=tp.int64),
+                    tp.tensor([1.0, 2.0], dtype=tp.float32),
+                    [2, 2],
+                )
+            else:
+                sparse_input = tp.sparse_coo_tensor(
+                    tp.tensor([[0, 1], [1, 0]], dtype=tp.int64),
+                    tp.tensor([3.0, 4.0], dtype=tp.float32),
+                    [2, 2],
+                )
+            dist.all_reduce(sparse_input)
+            expected_sparse = (
+                [[1.0, 0.0], [0.0, 2.0]]
+                if world_size == 1
+                else [[1.0, 3.0], [4.0, 2.0]]
+            )
+            assert sparse_input.to_dense().tolist() == expected_sparse
 
         root = world_size - 1
         gather_input = tp.arange(2, dtype=tp.float32) + float(rank * 10)
@@ -137,20 +179,16 @@ def _exercise_collectives(
         else:
             assert gather_output is None
 
-        reduce_input = (
-            tp.arange(world_size * 2, dtype=tp.float32)
-            .reshape((world_size, 2))
-            + float(rank * 100)
+        reduce_input = tp.arange(world_size * 2, dtype=tp.float32) + float(
+            rank * 100
         )
         reduce_output = tp.zeros((2,), dtype=tp.float32)
         self_result = dist.reduce_scatter_single(reduce_output, reduce_input)
         assert self_result is None
         assert reduce_output.tolist() == _expected_reduce_scatter(rank, world_size)
 
-        future_input = (
-            tp.arange(world_size * 2, dtype=tp.float32)
-            .reshape((world_size, 2))
-            + float(1000 + rank * 100)
+        future_input = tp.arange(world_size * 2, dtype=tp.float32) + float(
+            1000 + rank * 100
         )
         future_output = tp.zeros((2,), dtype=tp.float32)
         future_work = dist.reduce_scatter_single(
@@ -189,6 +227,19 @@ def _exercise_collectives(
                     float(11 + source_rank),
                     float(12 + source_rank),
                 ]
+
+        if include_subgroup:
+            subgroup = dist.new_group(ranks=[0])
+            if rank == 0:
+                assert subgroup != dist.GroupMember.NON_GROUP_MEMBER
+                assert subgroup.size() == 1
+                assert subgroup.rank() == 0
+                subgroup_value = tp.tensor([1.0], dtype=tp.float32)
+                dist.all_reduce(subgroup_value, group=subgroup)
+                assert subgroup_value.tolist() == [1.0]
+                dist.destroy_process_group(subgroup)
+            else:
+                assert subgroup == dist.GroupMember.NON_GROUP_MEMBER
     finally:
         dist.destroy_process_group()
 
@@ -237,7 +288,7 @@ class TestMPINativeCollectives(unittest.TestCase):
                     "world_size = int(os.environ.get(\"OMPI_COMM_WORLD_SIZE\", "
                     "os.environ.get(\"PMI_SIZE\", \"2\")))\n"
                     "_exercise_collectives(rank, world_size, \"mpi\", "
-                    "include_coalesced=False)\n"
+                    "include_coalesced=False, include_subgroup=True)\n"
                     "print(f\"mpi rank {rank} native collectives OK\", flush=True)\n"
                 )
             environment = dict(os.environ)
