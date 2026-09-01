@@ -3,12 +3,16 @@
 #include <pybind11/pybind11.h>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <deque>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <gloo/context.h>
@@ -18,6 +22,7 @@
 
 #include <Tensor.h>
 
+#include "../Types.h"
 #include "store/Store.h"
 
 namespace tensorplay {
@@ -25,15 +30,6 @@ namespace distributed {
 
 using Tensor = tensorplay::Tensor;
 using Store = distributed::Store;
-
-// Reduction op codes mirror the Python-layer ReduceOp values.
-enum class ReduceOpCode : int {
-  SUM = 0,
-  PRODUCT = 1,
-  MAX = 2,
-  MIN = 3,
-  AVG = 4,
-};
 
 // Base of every asynchronous work item. Completion state is guarded by
 // waitMutex_; wait() blocks until the worker thread marks completion or an
@@ -52,10 +48,7 @@ class GlooWork {
   virtual int source_rank() const {
     return -1;
   }
-  virtual std::vector<Tensor> result() const {
-    return outputTensors_.empty() ? std::vector<Tensor>{}
-                                  : outputTensors_.front();
-  }
+  virtual std::vector<Tensor> result() const;
 
   const std::string& op_name() const {
     return opName_;
@@ -121,7 +114,8 @@ class GlooAsyncWork : public GlooWork {
 };
 
 // Point-to-point completions are driven entirely by the device I/O thread;
-// the work object only synchronizes on the underlying unbound buffer.
+// the work object synchronizes on the underlying unbound buffer and owns the
+// tensor storage until the transfer finishes.
 class GlooRecvWork : public GlooWork {
  public:
   GlooRecvWork(
@@ -146,6 +140,22 @@ class GlooRecvWork : public GlooWork {
   Tensor tensor_;
   std::unique_ptr<::gloo::transport::UnboundBuffer> buffer_;
   int srcRank_{-1};
+};
+
+class GlooSendWork : public GlooWork {
+ public:
+  GlooSendWork(
+      Tensor tensor,
+      std::unique_ptr<::gloo::transport::UnboundBuffer> buffer,
+      uint64_t seq,
+      std::string opName = "send");
+
+  bool wait(int64_t timeout_ms = -1) override;
+  void abort() override;
+
+ private:
+  Tensor tensor_;
+  std::unique_ptr<::gloo::transport::UnboundBuffer> buffer_;
 };
 
 struct GlooOptions {
@@ -208,58 +218,208 @@ class ProcessGroupGloo {
       int rootRank,
       int rootTensor,
       std::chrono::milliseconds timeout);
+  std::shared_ptr<GlooWork> broadcast(
+      std::vector<Tensor>& tensors,
+      const BroadcastOptions& options) {
+    return broadcast(
+        tensors, options.rootRank, options.rootTensor, options.timeout);
+  }
   std::shared_ptr<GlooWork> allreduce(
       std::vector<Tensor>& tensors,
-      int reduceOp,
+      ReduceOp reduceOp,
+      std::chrono::milliseconds timeout);
+  std::shared_ptr<GlooWork> allreduce(
+      std::vector<Tensor>& tensors,
+      const AllreduceOptions& options) {
+    return allreduce(tensors, options.reduceOp, options.timeout);
+  }
+  std::shared_ptr<GlooWork> allreduce_sparse(
+      std::vector<Tensor>& tensors,
+      const AllreduceOptions& options) {
+    return allreduce(tensors, options);
+  }
+  std::shared_ptr<GlooWork> allreduce_coalesced(
+      std::vector<Tensor>& tensors,
+      ReduceOp reduceOp,
       std::chrono::milliseconds timeout);
   std::shared_ptr<GlooWork> allreduce_coalesced(
       std::vector<Tensor>& tensors,
-      int reduceOp,
-      std::chrono::milliseconds timeout);
+      const AllreduceCoalescedOptions& options) {
+    return allreduce_coalesced(tensors, options.reduceOp, options.timeout);
+  }
   std::shared_ptr<GlooWork> reduce(
       std::vector<Tensor>& tensors,
       int rootRank,
       int rootTensor,
-      int reduceOp,
+      ReduceOp reduceOp,
       std::chrono::milliseconds timeout);
+  std::shared_ptr<GlooWork> reduce(
+      std::vector<Tensor>& tensors,
+      const ReduceOptions& options) {
+    return reduce(
+        tensors,
+        options.rootRank,
+        options.rootTensor,
+        options.reduceOp,
+        options.timeout);
+  }
   std::shared_ptr<GlooWork> allgather(
       std::vector<std::vector<Tensor>>& outputs,
       std::vector<Tensor>& inputs,
       std::chrono::milliseconds timeout);
+  std::shared_ptr<GlooWork> allgather(
+      std::vector<std::vector<Tensor>>& outputs,
+      std::vector<Tensor>& inputs,
+      const AllgatherOptions& options) {
+    return allgather(outputs, inputs, options.timeout);
+  }
+  std::shared_ptr<GlooWork> all_gather_single(
+      Tensor& output,
+      Tensor& input,
+      std::chrono::milliseconds timeout);
+  std::shared_ptr<GlooWork> all_gather_single(
+      Tensor& output,
+      Tensor& input,
+      const AllgatherOptions& options) {
+    return all_gather_single(output, input, options.timeout);
+  }
+  std::shared_ptr<GlooWork> allgather_coalesced(
+      std::vector<std::vector<Tensor>>& outputLists,
+      std::vector<Tensor>& inputList,
+      std::chrono::milliseconds timeout);
+  std::shared_ptr<GlooWork> allgather_coalesced(
+      std::vector<std::vector<Tensor>>& outputLists,
+      std::vector<Tensor>& inputList,
+      const AllgatherOptions& options) {
+    return allgather_coalesced(outputLists, inputList, options.timeout);
+  }
+  std::shared_ptr<GlooWork> all_gather_single_coalesced(
+      std::vector<Tensor>& outputs,
+      std::vector<Tensor>& inputs,
+      std::chrono::milliseconds timeout);
+  std::shared_ptr<GlooWork> all_gather_single_coalesced(
+      std::vector<Tensor>& outputs,
+      std::vector<Tensor>& inputs,
+      const AllgatherOptions& options) {
+    return all_gather_single_coalesced(outputs, inputs, options.timeout);
+  }
   std::shared_ptr<GlooWork> all_gather_into_tensor(
       Tensor& output,
       Tensor& input,
       std::chrono::milliseconds timeout);
+  std::shared_ptr<GlooWork> all_gather_into_tensor(
+      Tensor& output,
+      Tensor& input,
+      const AllgatherOptions& options) {
+    return all_gather_into_tensor(output, input, options.timeout);
+  }
+  std::shared_ptr<GlooWork> gather_single(
+      Tensor& output,
+      Tensor& input,
+      int rootRank,
+      std::chrono::milliseconds timeout);
+  std::shared_ptr<GlooWork> gather_single(
+      Tensor& output,
+      Tensor& input,
+      const GatherOptions& options) {
+    return gather_single(output, input, options.rootRank, options.timeout);
+  }
   std::shared_ptr<GlooWork> gather(
       std::vector<std::vector<Tensor>>& outputs,
       std::vector<Tensor>& inputs,
       int rootRank,
       std::chrono::milliseconds timeout);
+  std::shared_ptr<GlooWork> gather(
+      std::vector<std::vector<Tensor>>& outputs,
+      std::vector<Tensor>& inputs,
+      const GatherOptions& options) {
+    return gather(outputs, inputs, options.rootRank, options.timeout);
+  }
   std::shared_ptr<GlooWork> scatter(
       std::vector<Tensor>& outputs,
       std::vector<std::vector<Tensor>>& inputs,
       int rootRank,
       std::chrono::milliseconds timeout);
+  std::shared_ptr<GlooWork> scatter(
+      std::vector<Tensor>& outputs,
+      std::vector<std::vector<Tensor>>& inputs,
+      const ScatterOptions& options) {
+    return scatter(outputs, inputs, options.rootRank, options.timeout);
+  }
   std::shared_ptr<GlooWork> reduce_scatter(
       std::vector<Tensor>& outputs,
       std::vector<std::vector<Tensor>>& inputs,
-      int reduceOp,
+      ReduceOp reduceOp,
+      std::chrono::milliseconds timeout);
+  std::shared_ptr<GlooWork> reduce_scatter(
+      std::vector<Tensor>& outputs,
+      std::vector<std::vector<Tensor>>& inputs,
+      const ReduceScatterOptions& options) {
+    return reduce_scatter(outputs, inputs, options.reduceOp, options.timeout);
+  }
+  std::shared_ptr<GlooWork> reduce_scatter_tensor(
+      Tensor& output,
+      Tensor& input,
+      ReduceOp reduceOp,
       std::chrono::milliseconds timeout);
   std::shared_ptr<GlooWork> reduce_scatter_tensor(
       Tensor& output,
       Tensor& input,
-      int reduceOp,
+      const ReduceScatterOptions& options) {
+    return reduce_scatter_tensor(output, input, options.reduceOp, options.timeout);
+  }
+  std::shared_ptr<GlooWork> reduce_scatter_single(
+      Tensor& output,
+      Tensor& input,
+      ReduceOp reduceOp,
       std::chrono::milliseconds timeout);
+  std::shared_ptr<GlooWork> reduce_scatter_single(
+      Tensor& output,
+      Tensor& input,
+      const ReduceScatterOptions& options) {
+    return reduce_scatter_single(output, input, options.reduceOp, options.timeout);
+  }
+  std::shared_ptr<GlooWork> reduce_scatter_single_coalesced(
+      std::vector<Tensor>& outputs,
+      std::vector<Tensor>& inputs,
+      ReduceOp reduceOp,
+      std::chrono::milliseconds timeout);
+  std::shared_ptr<GlooWork> reduce_scatter_single_coalesced(
+      std::vector<Tensor>& outputs,
+      std::vector<Tensor>& inputs,
+      const ReduceScatterOptions& options) {
+    return reduce_scatter_single_coalesced(
+        outputs, inputs, options.reduceOp, options.timeout);
+  }
   std::shared_ptr<GlooWork> all_to_all_single(
       Tensor& outputTensor,
       Tensor& inputTensor,
       std::vector<int64_t> outputCounts,
       std::vector<int64_t> inputCounts,
       std::chrono::milliseconds timeout);
+  std::shared_ptr<GlooWork> all_to_all_single(
+      Tensor& outputTensor,
+      Tensor& inputTensor,
+      std::vector<int64_t> outputCounts,
+      std::vector<int64_t> inputCounts,
+      const AllToAllOptions& options) {
+    return all_to_all_single(
+        outputTensor,
+        inputTensor,
+        std::move(outputCounts),
+        std::move(inputCounts),
+        options.timeout);
+  }
   std::shared_ptr<GlooWork> alltoall(
       std::vector<Tensor>& outputTensors,
       std::vector<Tensor>& inputTensors,
       std::chrono::milliseconds timeout);
+  std::shared_ptr<GlooWork> alltoall(
+      std::vector<Tensor>& outputTensors,
+      std::vector<Tensor>& inputTensors,
+      const AllToAllOptions& options) {
+    return alltoall(outputTensors, inputTensors, options.timeout);
+  }
   std::shared_ptr<GlooWork> send(
       std::vector<Tensor>& tensors,
       int dstRank,
@@ -272,6 +432,9 @@ class ProcessGroupGloo {
       std::vector<Tensor>& tensors,
       int tag);
   std::shared_ptr<GlooWork> barrier(std::chrono::milliseconds timeout);
+  std::shared_ptr<GlooWork> barrier(const BarrierOptions& options) {
+    return barrier(options.timeout);
+  }
   void monitoredBarrier(std::chrono::milliseconds timeout, bool waitAllRanks);
 
   uint64_t getSequenceNumberForGroup() const {
@@ -290,7 +453,7 @@ class ProcessGroupGloo {
   void enqueue(std::shared_ptr<GlooAsyncWork> work);
   // Runs synchronously on the calling thread (used by monitoredBarrier).
   void runInline(GlooAsyncWork* work);
-  // Splits dim 0 of ``tensor`` into ``size`` equal contiguous chunks.
+  // Splits dim 0 of ``tensor`` into ``size`` equal chunks.
   std::vector<Tensor> splitEven(const Tensor& tensor);
 
   std::shared_ptr<Store> store_;

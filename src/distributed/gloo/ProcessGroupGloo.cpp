@@ -20,9 +20,12 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
+#include <limits>
 #include <map>
 #include <numeric>
 #include <stdexcept>
+#include <type_traits>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -37,12 +40,6 @@
 #endif
 
 
-#include <algorithm>
-#include <cstring>
-#include <map>
-#include <numeric>
-#include <stdexcept>
-
 namespace tensorplay {
 namespace distributed {
 
@@ -51,6 +48,47 @@ namespace py = pybind11;
 namespace {
 
 constexpr const char* kLoopbackAddress = "127.0.0.1";
+
+[[noreturn]] void runtimeFailure(const std::string& msg);
+
+std::chrono::milliseconds remainingBarrierTime(
+    std::chrono::steady_clock::time_point start,
+    std::chrono::milliseconds timeout,
+    bool waitAllRanks) {
+  if (waitAllRanks) {
+    return timeout;
+  }
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - start);
+  const auto remaining = timeout - elapsed;
+  return remaining.count() <= 0 ? std::chrono::milliseconds(-1) : remaining;
+}
+
+void checkBarrierTime(
+    std::chrono::milliseconds timeout,
+    std::chrono::milliseconds remaining,
+    const std::vector<int>& processedRanks,
+    int currentRank) {
+  if (remaining.count() >= 0) {
+    return;
+  }
+  std::string message =
+      "Rank " + std::to_string(currentRank) +
+      " timed out in monitoredBarrier after " +
+      std::to_string(timeout.count()) + " ms.";
+  if (processedRanks.empty()) {
+    message += "\nNo ranks successfully processed in monitoredBarrier.";
+  } else {
+    message += "\nSuccessfully processed ranks: ";
+    for (size_t i = 0; i < processedRanks.size(); ++i) {
+      if (i != 0) {
+        message += ", ";
+      }
+      message += std::to_string(processedRanks[i]);
+    }
+  }
+  runtimeFailure(message);
+}
 
 // Adapts the project store onto the rendezvous interface the gloo transport
 // expects. Extended batch APIs are not wired; gloo falls back to the plain
@@ -118,12 +156,54 @@ void assertRootTensor(int rootTensor, int64_t count, const char* op) {
 void assertTypeAndSizesMatch(
     const std::vector<Tensor>& tensors,
     const char* op) {
+  if (tensors.empty()) {
+    invalidArgument(std::string(op) + ": requires a non-empty tensor list");
+  }
   for (const auto& tensor : tensors) {
-    if (tensor.dtype() != tensors[0].dtype() ||
-        tensor.shape() != tensors[0].shape()) {
+    if (!tensor.defined() ||
+        tensor.dtype() != tensors[0].dtype() ||
+        tensor.shape() != tensors[0].shape() ||
+        tensor.device() != tensors[0].device() ||
+        tensor.is_sparse() != tensors[0].is_sparse() ||
+        tensor.is_sparse_csr() != tensors[0].is_sparse_csr()) {
       invalidArgument(
-          std::string(op) + ": all tensors must have the same type and sizes");
+          std::string(op) +
+          ": all tensors must have the same type, device, layout and sizes");
     }
+  }
+}
+
+void assertTensorTypeAndSizesMatch(
+    const Tensor& expected,
+    const Tensor& actual,
+    const char* op) {
+  if (!expected.defined() || !actual.defined() ||
+      expected.dtype() != actual.dtype() ||
+      expected.shape() != actual.shape() ||
+      expected.device() != actual.device() ||
+      expected.is_sparse() != actual.is_sparse() ||
+      expected.is_sparse_csr() != actual.is_sparse_csr()) {
+    invalidArgument(
+        std::string(op) +
+        ": tensors must have the same type, device, layout and sizes");
+  }
+}
+
+void assertDense(const Tensor& tensor, const char* op) {
+  if (!tensor.defined()) {
+    invalidArgument(std::string(op) + ": tensor is undefined");
+  }
+  if (tensor.is_sparse()) {
+    invalidArgument(std::string(op) + ": only dense tensors are supported");
+  }
+}
+
+void assertDense(const std::vector<Tensor>& tensors, const char* op) {
+  if (tensors.empty()) {
+    invalidArgument(std::string(op) + ": requires a non-empty tensor list");
+  }
+  for (const auto& tensor : tensors) {
+    assertDense(tensor, op);
   }
 }
 
@@ -164,6 +244,11 @@ void checkSplitSizes(
     const std::vector<int64_t>& splitSizes,
     const Tensor& tensor,
     int groupSize) {
+  for (const auto splitSize : splitSizes) {
+    if (splitSize < 0) {
+      runtimeFailure("Split sizes must be non-negative");
+    }
+  }
   if (splitSizes.empty()) {
     if (tensor.dim() == 0 || tensor.size(0) % groupSize != 0) {
       runtimeFailure(
@@ -187,37 +272,23 @@ void computeLengthsAndOffsets(
     const Tensor& tensor,
     std::vector<int64_t>* lengths,
     std::vector<int64_t>* offsets) {
-  if (splitSizes.empty()) {
-    const auto split = tensor.numel() / tensor.size(0);
-    const auto length = tensor.numel() / split;
-    lengths->resize(split);
-    std::fill(lengths->begin(), lengths->end(), length);
-  } else {
-    lengths->resize(splitSizes.size());
-    for (size_t i = 0; i < splitSizes.size(); ++i) {
-      int64_t length = splitSizes[i];
-      for (int64_t d = 1; d < tensor.dim(); ++d) {
-        length *= tensor.size(d);
-      }
-      (*lengths)[i] = length;
-    }
+  const size_t groupSize = lengths->size();
+  const int64_t dim0Size = tensor.size(0);
+  const int64_t rowSize = dim0Size == 0 ? 1 : tensor.numel() / dim0Size;
+  const bool equalSplits = splitSizes.empty();
+  const int64_t equalSplitSize =
+      equalSplits ? dim0Size / static_cast<int64_t>(groupSize) : 0;
+  if (!equalSplits && splitSizes.size() != groupSize) {
+    runtimeFailure("Number of tensor split sizes not equal to group size");
   }
-  offsets->resize(lengths->size());
-  int64_t offset = 0;
-  for (size_t i = 0; i < lengths->size(); ++i) {
-    (*offsets)[i] = offset;
-    offset += (*lengths)[i];
+  if (!equalSplits) {
+    lengths->resize(groupSize);
   }
-}
-
-void computeLengthsAndOffsets(
-    const std::vector<Tensor>& tensors,
-    std::vector<int64_t>* lengths,
-    std::vector<int64_t>* offsets) {
-  lengths->resize(tensors.size());
+  offsets->resize(groupSize);
   int64_t offset = 0;
-  for (size_t i = 0; i < tensors.size(); ++i) {
-    (*lengths)[i] = tensors[i].numel();
+  for (size_t i = 0; i < groupSize; ++i) {
+    (*lengths)[i] = rowSize *
+        (equalSplits ? equalSplitSize : splitSizes[i]);
     (*offsets)[i] = offset;
     offset += (*lengths)[i];
   }
@@ -227,20 +298,62 @@ void computeLengthsAndOffsets(
 // transport library's implementations; 16-bit float types are reduced through
 // float promotion to avoid relying on their conversion operators.
 template <typename T, std::enable_if_t<std::is_arithmetic_v<T>, int> = 0>
-void reduceInto(int op, void* c, const void* a, const void* b, size_t n) {
-  switch (op) {
-    case 0: // SUM
-    case 4: // AVG
+void reduceInto(ReduceOp op, void* c, const void* a, const void* b, size_t n) {
+  switch (op.op()) {
+    case ReduceOp::SUM:
+    case ReduceOp::AVG:
       ::gloo::sum<T>(c, a, b, n);
       break;
-    case 1: // PRODUCT
+    case ReduceOp::PRODUCT:
       ::gloo::product<T>(c, a, b, n);
       break;
-    case 2: // MAX
+    case ReduceOp::MIN:
+      ::gloo::min<T>(c, a, b, n);
+      break;
+    case ReduceOp::MAX:
       ::gloo::max<T>(c, a, b, n);
       break;
-    case 3: // MIN
-      ::gloo::min<T>(c, a, b, n);
+    case ReduceOp::BAND:
+      if constexpr (std::is_integral_v<T>) {
+        auto* tc = static_cast<T*>(c);
+        const auto* ta = static_cast<const T*>(a);
+        const auto* tb = static_cast<const T*>(b);
+        for (size_t i = 0; i < n; ++i) {
+          tc[i] = ta[i] & tb[i];
+        }
+      } else {
+        runtimeFailure(
+            "Cannot use the bitwise AND reduction with a non-integral dtype");
+      }
+      break;
+    case ReduceOp::BOR:
+      if constexpr (std::is_integral_v<T>) {
+        auto* tc = static_cast<T*>(c);
+        const auto* ta = static_cast<const T*>(a);
+        const auto* tb = static_cast<const T*>(b);
+        for (size_t i = 0; i < n; ++i) {
+          tc[i] = ta[i] | tb[i];
+        }
+      } else {
+        runtimeFailure(
+            "Cannot use the bitwise OR reduction with a non-integral dtype");
+      }
+      break;
+    case ReduceOp::BXOR:
+      if constexpr (std::is_integral_v<T>) {
+        auto* tc = static_cast<T*>(c);
+        const auto* ta = static_cast<const T*>(a);
+        const auto* tb = static_cast<const T*>(b);
+        for (size_t i = 0; i < n; ++i) {
+          tc[i] = ta[i] ^ tb[i];
+        }
+      } else {
+        runtimeFailure(
+            "Cannot use the bitwise XOR reduction with a non-integral dtype");
+      }
+      break;
+    case ReduceOp::PREMUL_SUM:
+      runtimeFailure("Cannot use the pre-multiply sum reduction with Gloo");
       break;
     default:
       runtimeFailure("Unhandled reduce op for the gloo backend");
@@ -248,7 +361,7 @@ void reduceInto(int op, void* c, const void* a, const void* b, size_t n) {
 }
 
 template <typename T>
-void halfOp(int op, void* c, const void* a, const void* b, size_t n) {
+void halfOp(ReduceOp op, void* c, const void* a, const void* b, size_t n) {
   auto* tc = static_cast<T*>(c);
   auto* ta = static_cast<const T*>(a);
   auto* tb = static_cast<const T*>(b);
@@ -256,19 +369,29 @@ void halfOp(int op, void* c, const void* a, const void* b, size_t n) {
     float x = static_cast<float>(ta[i]);
     float y = static_cast<float>(tb[i]);
     float r = x;
-    switch (op) {
-      case 0:
-      case 4:
+    switch (op.op()) {
+      case ReduceOp::SUM:
+      case ReduceOp::AVG:
         r = x + y;
         break;
-      case 1:
+      case ReduceOp::PRODUCT:
         r = x * y;
         break;
-      case 2:
+      case ReduceOp::MIN:
+        r = x < y ? x : y;
+        break;
+      case ReduceOp::MAX:
         r = x > y ? x : y;
         break;
-      case 3:
-        r = x < y ? x : y;
+      case ReduceOp::BAND:
+      case ReduceOp::BOR:
+      case ReduceOp::BXOR:
+        runtimeFailure(
+            "Cannot use a bitwise reduction with a non-integral dtype");
+        break;
+      case ReduceOp::PREMUL_SUM:
+        runtimeFailure(
+            "Cannot use the pre-multiply sum reduction with Gloo");
         break;
       default:
         runtimeFailure("Unhandled reduce op for the gloo backend");
@@ -278,7 +401,7 @@ void halfOp(int op, void* c, const void* a, const void* b, size_t n) {
 }
 
 template <typename T>
-gloo::AllreduceOptions::Func makeReduceFunction(int op) {
+gloo::AllreduceOptions::Func makeReduceFunction(ReduceOp op) {
   if constexpr (std::is_arithmetic_v<T>) {
     return [op](void* c, const void* a, const void* b, size_t n) {
       reduceInto<T>(op, c, a, b, n);
@@ -291,7 +414,7 @@ gloo::AllreduceOptions::Func makeReduceFunction(int op) {
 }
 
 template <typename T, typename O>
-void setReduceFn(O& opts, int op) {
+void setReduceFn(O& opts, ReduceOp op) {
   opts.setReduceFunction(makeReduceFunction<T>(op));
 }
 
@@ -382,6 +505,11 @@ void setOutput(O& opts, Tensor& tensor, std::vector<int64_t>& counts) {
   opts.setOutput(static_cast<T*>(tensor.data_ptr()), counts);
 }
 
+template <typename T, typename O>
+void setOutput(O& opts, Tensor& tensor, const std::vector<size_t>& counts) {
+  opts.setOutput(static_cast<T*>(tensor.data_ptr()), counts);
+}
+
 template <typename T>
 void setOutputs(
     gloo::AllreduceOptions& opts,
@@ -399,10 +527,15 @@ void assertNonEmptyDeviceCpu(const std::vector<Tensor>& tensors, const char* op)
   if (tensors.empty()) {
     invalidArgument(std::string(op) + ": requires a non-empty tensor list");
   }
-  if (tensors[0].device().is_cuda()) {
-    invalidArgument(
-        std::string(op) +
-        ": CUDA tensors are not supported by the gloo backend in this build");
+  for (const auto& tensor : tensors) {
+    if (!tensor.defined()) {
+      invalidArgument(std::string(op) + ": tensor is undefined");
+    }
+    if (!tensor.device().is_cpu()) {
+      invalidArgument(
+          std::string(op) +
+          ": only CPU tensors are supported by the gloo backend");
+    }
   }
 }
 
@@ -435,6 +568,25 @@ bool GlooWork::is_completed() {
   return completed_;
 }
 
+std::vector<Tensor> GlooWork::result() const {
+  std::lock_guard<std::mutex> lock(waitMutex_);
+  if (!completed_) {
+    TP_THROW(
+        RuntimeError,
+        "work must be completed before its result can be read");
+  }
+  if (exception_ != nullptr) {
+    std::rethrow_exception(exception_);
+  }
+  if (outputTensors_.size() > 1) {
+    TP_THROW(
+        RuntimeError,
+        "work result does not support multiple tensor lists");
+  }
+  return outputTensors_.empty() ? std::vector<Tensor>{}
+                                : outputTensors_.front();
+}
+
 void GlooWork::finish() {
   {
     std::lock_guard<std::mutex> lock(waitMutex_);
@@ -460,23 +612,29 @@ int GlooRecvWork::source_rank() const {
 bool GlooRecvWork::wait(int64_t timeout_ms) {
   std::exception_ptr exception{nullptr};
   bool completed = false;
+  int receivedRank = -1;
   try {
     if (timeout_ms < 0) {
-      completed = buffer_->waitRecv(&srcRank_);
+      completed = buffer_->waitRecv(&receivedRank);
     } else {
       completed =
-          buffer_->waitRecv(&srcRank_, std::chrono::milliseconds(timeout_ms));
+          buffer_->waitRecv(
+              &receivedRank, std::chrono::milliseconds(timeout_ms));
     }
   } catch (...) {
     exception = std::current_exception();
   }
   if (exception != nullptr) {
-    std::lock_guard<std::mutex> lock(waitMutex_);
-    completed_ = true;
-    exception_ = exception;
-    std::rethrow_exception(exception_);
+    finishWithError(exception);
+    std::rethrow_exception(exception);
   }
-  GlooWork::finish();
+  if (completed) {
+    {
+      std::lock_guard<std::mutex> lock(waitMutex_);
+      srcRank_ = receivedRank;
+    }
+    GlooWork::finish();
+  }
   return completed;
 }
 
@@ -558,8 +716,7 @@ ProcessGroupGloo::createDeviceForHostname(
 std::shared_ptr<::gloo::transport::Device>
 ProcessGroupGloo::createDefaultDevice(bool lazyInit) {
   socketInitialize();
-  // An explicit interface selection wins, mirroring the ecosystem-wide
-  // GLOO_SOCKET_IFNAME escape hatch.
+  // An explicit interface selection takes precedence over hostname discovery.
   const char* ifname = std::getenv("GLOO_SOCKET_IFNAME");
   if (ifname != nullptr && std::strlen(ifname) > 1) {
     return createDeviceForInterface(ifname, lazyInit);
@@ -587,8 +744,27 @@ ProcessGroupGloo::ProcessGroupGloo(
       options_(std::move(options)),
       rank_(rank),
       size_(size) {
+  if (!store_) {
+    runtimeFailure("ProcessGroupGloo: store must not be null");
+  }
+  if (size_ <= 0 || rank_ < 0 || rank_ >= size_) {
+    runtimeFailure("ProcessGroupGloo: rank and size are invalid");
+  }
   if (options_.devices.empty()) {
     runtimeFailure("ProcessGroupGloo: no device(s) specified");
+  }
+  for (const auto& device : options_.devices) {
+    if (!device) {
+      runtimeFailure("ProcessGroupGloo: device must not be null");
+    }
+  }
+  if (options_.threads <= 0) {
+    runtimeFailure("ProcessGroupGloo: thread count must be positive");
+  }
+  if (!options_.global_ranks_in_group.empty() &&
+      options_.global_ranks_in_group.size() != static_cast<size_t>(size_)) {
+    runtimeFailure(
+        "ProcessGroupGloo: global rank list must match the group size");
   }
   connectContexts(rank_, size_, store_);
   initialized_ = true;
@@ -714,7 +890,7 @@ class AsyncBroadcastWork : public GlooAsyncWork {
   void broadcastOne(Tensor tensor) {
     if (tensor.dtype() == ::tensorplay::ScalarType::ComplexFloat ||
         tensor.dtype() == ::tensorplay::ScalarType::ComplexDouble) {
-      tensor = tensor.view_as_real().contiguous();
+      tensor = tensor.view_as_real();
     }
     const auto scalarType = tensor.dtype();
     gloo::BroadcastOptions opts(context_);
@@ -741,7 +917,7 @@ class AsyncAllreduceWork : public GlooAsyncWork {
   AsyncAllreduceWork(
       std::shared_ptr<gloo::Context> context,
       std::vector<Tensor>& inputs,
-      int reduceOp,
+      ReduceOp reduceOp,
       uint32_t tag,
       uint64_t seq,
       std::chrono::milliseconds timeout)
@@ -756,14 +932,19 @@ class AsyncAllreduceWork : public GlooAsyncWork {
         tag(tag) {}
 
   std::vector<Tensor> inputs;
-  const int reduceOp;
+  const ReduceOp reduceOp;
   const uint32_t tag;
 
   void allreduceOne(std::vector<Tensor>& tensors) {
     Tensor tensor = tensors[0];
     if (tensor.dtype() == ::tensorplay::ScalarType::ComplexFloat ||
         tensor.dtype() == ::tensorplay::ScalarType::ComplexDouble) {
-      tensor = tensor.view_as_real().contiguous();
+      if (!isComplexViewAsRealAllowed(reduceOp)) {
+        runtimeFailure(
+            "all_reduce does not support this reduction operation on "
+            "complex tensors");
+      }
+      tensor = tensor.view_as_real();
     }
     gloo::AllreduceOptions opts(context_);
     const auto scalarType = tensor.dtype();
@@ -771,15 +952,313 @@ class AsyncAllreduceWork : public GlooAsyncWork {
     opts.setTag(tag);
     opts.setTimeout(getTimeout());
     TP_GLOO_GENERATE_ALL_TYPES(
-        scalarType, setOutputs, opts, tensors, tensor.numel());
+        scalarType,
+        setOutputs,
+        opts,
+        tensors,
+        tensor.numel());
     gloo::allreduce(opts);
-    if (reduceOp == 4) { // AVG = SUM / size
+    if (reduceOp == ReduceOp::AVG) {
       tensors[0] /= (double)context_->size;
     }
   }
 
   void run() override {
     allreduceOne(inputs);
+  }
+};
+
+class AsyncSparseAllreduceWork : public GlooAsyncWork {
+ public:
+  AsyncSparseAllreduceWork(
+      std::shared_ptr<gloo::Context> context,
+      std::vector<Tensor>& inputs,
+      uint32_t tag,
+      uint64_t seq,
+      std::chrono::milliseconds timeout)
+      : GlooAsyncWork(
+            std::move(context),
+            {inputs},
+            "sparse_all_reduce",
+            seq,
+            timeout),
+        inputs(inputs),
+        tag(tag) {}
+
+  std::vector<Tensor> inputs;
+  const uint32_t tag;
+
+  struct Metadata {
+    int64_t sparseDim{0};
+    int64_t denseDim{0};
+    int64_t nnz{0};
+    std::vector<int64_t> sizes;
+  };
+
+  static size_t checkedCount(int64_t left, int64_t right) {
+    if (left < 0 || right < 0) {
+      runtimeFailure("Sparse tensor metadata contains a negative size");
+    }
+    const auto lhs = static_cast<size_t>(left);
+    const auto rhs = static_cast<size_t>(right);
+    if (rhs != 0 && lhs > std::numeric_limits<size_t>::max() / rhs) {
+      runtimeFailure("Sparse tensor metadata size overflows the transport count");
+    }
+    return lhs * rhs;
+  }
+
+  static int64_t checkedProduct(int64_t left, int64_t right) {
+    if (left < 0 || right < 0) {
+      runtimeFailure("Sparse tensor shape contains a negative size");
+    }
+    if (right != 0 && left > std::numeric_limits<int64_t>::max() / right) {
+      runtimeFailure("Sparse tensor shape overflows the index range");
+    }
+    return left * right;
+  }
+
+  std::vector<int64_t> metadataPayload(const Tensor& tensor) const {
+    if (!tensor.is_sparse() || tensor.is_sparse_csr()) {
+      runtimeFailure(
+          "sparse allreduce requires sparse coordinate tensors");
+    }
+    const int64_t sparseDim = tensor.sparse_dim();
+    const int64_t denseDim = tensor.dense_dim();
+    const int64_t nnz = tensor._values().size(0);
+    std::vector<int64_t> payload;
+    payload.reserve(static_cast<size_t>(3 + sparseDim + denseDim));
+    payload.push_back(sparseDim);
+    payload.push_back(denseDim);
+    payload.push_back(nnz);
+    for (int64_t dim = 0; dim < tensor.dim(); ++dim) {
+      payload.push_back(tensor.size(dim));
+    }
+    return payload;
+  }
+
+  std::vector<Metadata> allgatherMetadata(const Tensor& tensor) {
+    const auto payload = metadataPayload(tensor);
+    Tensor localSize = Tensor::empty({1}, ::tensorplay::DType::Int64,
+                                     tensor.device());
+    localSize.data_ptr<int64_t>()[0] = static_cast<int64_t>(payload.size());
+    Tensor sizes = Tensor::empty(
+        {static_cast<int64_t>(context_->size)},
+        ::tensorplay::DType::Int64,
+        tensor.device());
+
+    gloo::AllgatherOptions sizeOptions(context_);
+    sizeOptions.setInput(localSize.data_ptr<int64_t>(), 1);
+    sizeOptions.setOutput(
+        sizes.data_ptr<int64_t>(), static_cast<size_t>(context_->size));
+    sizeOptions.setTag(tag);
+    sizeOptions.setTimeout(getTimeout());
+    gloo::allgather(sizeOptions);
+
+    std::vector<size_t> counts;
+    counts.reserve(static_cast<size_t>(context_->size));
+    size_t total = 0;
+    for (int rank = 0; rank < context_->size; ++rank) {
+      const int64_t count = sizes.data_ptr<int64_t>()[rank];
+      if (count < 3) {
+        runtimeFailure("Sparse tensor metadata payload is truncated");
+      }
+      const auto countSize = static_cast<size_t>(count);
+      if (total > std::numeric_limits<size_t>::max() - countSize) {
+        runtimeFailure("Sparse tensor metadata exceeds the transport size");
+      }
+      counts.push_back(countSize);
+      total += countSize;
+    }
+
+    Tensor localPayload = Tensor::empty(
+        {static_cast<int64_t>(payload.size())},
+        ::tensorplay::DType::Int64,
+        tensor.device());
+    std::copy(payload.begin(), payload.end(), localPayload.data_ptr<int64_t>());
+    Tensor gathered = Tensor::empty(
+        {static_cast<int64_t>(total)},
+        ::tensorplay::DType::Int64,
+        tensor.device());
+
+    gloo::AllgathervOptions payloadOptions(context_);
+    payloadOptions.setInput(
+        localPayload.data_ptr<int64_t>(), localPayload.numel());
+    payloadOptions.setOutput(gathered.data_ptr<int64_t>(), counts);
+    payloadOptions.setTag(tag);
+    payloadOptions.setTimeout(getTimeout());
+    gloo::allgatherv(payloadOptions);
+
+    std::vector<Metadata> metadata;
+    metadata.reserve(static_cast<size_t>(context_->size));
+    size_t offset = 0;
+    const auto* data = gathered.data_ptr<int64_t>();
+    for (const auto count : counts) {
+      const auto* entry = data + offset;
+      Metadata item;
+      item.sparseDim = entry[0];
+      item.denseDim = entry[1];
+      item.nnz = entry[2];
+      if (item.sparseDim < 0 || item.denseDim < 0 || item.nnz < 0) {
+        runtimeFailure("Sparse tensor metadata contains a negative dimension");
+      }
+      const auto dimensionCount = checkedCount(
+          item.sparseDim + item.denseDim, 1);
+      if (count != static_cast<size_t>(3) + dimensionCount) {
+        runtimeFailure("Sparse tensor metadata has an invalid dimension count");
+      }
+      item.sizes.assign(entry + 3, entry + 3 + dimensionCount);
+      for (const auto size : item.sizes) {
+        if (size < 0) {
+          runtimeFailure("Sparse tensor metadata contains a negative size");
+        }
+      }
+      metadata.push_back(std::move(item));
+      offset += count;
+    }
+    return metadata;
+  }
+
+  std::vector<Tensor> allgatherIndices(
+      const Tensor& tensor,
+      const std::vector<Metadata>& metadata) {
+    const int64_t sparseDim = tensor.sparse_dim();
+    std::vector<size_t> counts;
+    counts.reserve(metadata.size());
+    size_t total = 0;
+    for (const auto& item : metadata) {
+      const auto count = checkedCount(item.nnz, sparseDim);
+      if (total > std::numeric_limits<size_t>::max() - count) {
+        runtimeFailure("Sparse indices exceed the transport size");
+      }
+      counts.push_back(count);
+      total += count;
+    }
+
+    Tensor input = tensor._indices().contiguous();
+    Tensor output = Tensor::empty(
+        {static_cast<int64_t>(total)},
+        ::tensorplay::DType::Int64,
+        tensor.device());
+    gloo::AllgathervOptions options(context_);
+    options.setInput(input.data_ptr<int64_t>(), input.numel());
+    options.setOutput(output.data_ptr<int64_t>(), counts);
+    options.setTag(tag);
+    options.setTimeout(getTimeout());
+    gloo::allgatherv(options);
+
+    std::vector<Tensor> indices;
+    indices.reserve(metadata.size());
+    int64_t offset = 0;
+    for (const auto& item : metadata) {
+      const auto count = checkedCount(item.nnz, sparseDim);
+      indices.push_back(output.narrow(
+          0, offset, static_cast<int64_t>(count))
+          .reshape({sparseDim, item.nnz}));
+      offset += static_cast<int64_t>(count);
+    }
+    return indices;
+  }
+
+  std::vector<Tensor> allgatherValues(
+      const Tensor& tensor,
+      const std::vector<Metadata>& metadata) {
+    const int64_t sparseDim = tensor.sparse_dim();
+    int64_t denseNumel = 1;
+    for (int64_t dim = sparseDim; dim < tensor.dim(); ++dim) {
+      denseNumel = checkedProduct(denseNumel, tensor.size(dim));
+    }
+
+    std::vector<size_t> counts;
+    counts.reserve(metadata.size());
+    size_t total = 0;
+    for (const auto& item : metadata) {
+      const auto count = checkedCount(item.nnz, denseNumel);
+      if (total > std::numeric_limits<size_t>::max() - count) {
+        runtimeFailure("Sparse values exceed the transport size");
+      }
+      counts.push_back(count);
+      total += count;
+    }
+
+    Tensor input = tensor._values().contiguous();
+    Tensor output = Tensor::empty(
+        {static_cast<int64_t>(total)},
+        tensor.dtype(),
+        tensor.device());
+    gloo::AllgathervOptions options(context_);
+    const auto scalarType = input.dtype();
+    TP_GLOO_GENERATE_ALL_TYPES(scalarType, setInput, options, input);
+    TP_GLOO_GENERATE_ALL_TYPES(
+        scalarType, setOutput, options, output, counts);
+    options.setTag(tag);
+    options.setTimeout(getTimeout());
+    gloo::allgatherv(options);
+
+    std::vector<Tensor> values;
+    values.reserve(metadata.size());
+    int64_t offset = 0;
+    std::vector<int64_t> valueShape;
+    for (int64_t dim = sparseDim; dim < tensor.dim(); ++dim) {
+      valueShape.push_back(tensor.size(dim));
+    }
+    for (const auto& item : metadata) {
+      std::vector<int64_t> shape{item.nnz};
+      shape.insert(shape.end(), valueShape.begin(), valueShape.end());
+      const auto count = checkedCount(item.nnz, denseNumel);
+      values.push_back(output.narrow(
+          0, offset, static_cast<int64_t>(count)).reshape(shape));
+      offset += static_cast<int64_t>(count);
+    }
+    return values;
+  }
+
+static void replaceSparseTensor(Tensor& destination, const Tensor& source) {
+    auto indices = source._indices().clone();
+    auto values = source._values().clone();
+    destination.unsafeGetTensorImpl()->set_sparse_state(
+        indices.unsafeGetTensorImpl(),
+        values.unsafeGetTensorImpl(),
+        static_cast<std::vector<int64_t>>(source.shape()),
+        source.is_coalesced());
+  }
+
+  Tensor allreduceSparse(std::vector<Tensor>& tensors) {
+    Tensor input = tensors[0];
+    for (size_t i = 1; i < tensors.size(); ++i) {
+      input = Tensor::sparse_add(input, tensors[i]);
+    }
+    input = input.coalesce();
+
+    auto metadata = allgatherMetadata(input);
+    const auto& expected = metadata[static_cast<size_t>(context_->rank)];
+    for (const auto& item : metadata) {
+      if (item.sparseDim != expected.sparseDim ||
+          item.denseDim != expected.denseDim ||
+          item.sizes != expected.sizes) {
+        runtimeFailure("Sparse tensor dimensions do not match across ranks");
+      }
+    }
+
+    auto indices = allgatherIndices(input, metadata);
+    auto values = allgatherValues(input, metadata);
+    Tensor output = Tensor::make_sparse_coo_tensor(
+        indices[0], values[0], expected.sizes, true);
+    for (int rank = 1; rank < context_->size; ++rank) {
+      Tensor peer = Tensor::make_sparse_coo_tensor(
+          indices[static_cast<size_t>(rank)],
+          values[static_cast<size_t>(rank)],
+          expected.sizes,
+          true);
+      output = Tensor::sparse_add(output, peer);
+    }
+    return output.coalesce();
+  }
+
+  void run() override {
+    Tensor output = allreduceSparse(inputs);
+    for (auto& tensor : inputs) {
+      replaceSparseTensor(tensor, output);
+    }
   }
 };
 
@@ -810,7 +1289,7 @@ class AsyncReduceWork : public GlooAsyncWork {
       std::vector<Tensor>& inputs,
       int rootRank,
       int rootTensor,
-      int reduceOp,
+      ReduceOp reduceOp,
       uint32_t tag,
       uint64_t seq,
       std::chrono::milliseconds timeout)
@@ -824,14 +1303,19 @@ class AsyncReduceWork : public GlooAsyncWork {
   std::vector<Tensor> inputs;
   const int rootRank;
   const int rootTensor;
-  const int reduceOp;
+  const ReduceOp reduceOp;
   const uint32_t tag;
 
   void reduceOne(std::vector<Tensor>& tensors) {
     Tensor tensor = tensors[0];
     if (tensor.dtype() == ::tensorplay::ScalarType::ComplexFloat ||
         tensor.dtype() == ::tensorplay::ScalarType::ComplexDouble) {
-      tensor = tensor.view_as_real().contiguous();
+      if (!isComplexViewAsRealAllowed(reduceOp)) {
+        runtimeFailure(
+            "reduce does not support this reduction operation on complex "
+            "tensors");
+      }
+      tensor = tensor.view_as_real();
     }
     gloo::ReduceOptions opts(context_);
     const auto scalarType = tensor.dtype();
@@ -841,7 +1325,7 @@ class AsyncReduceWork : public GlooAsyncWork {
     TP_GLOO_GENERATE_ALL_TYPES(scalarType, setReduceFn, opts, reduceOp);
     TP_GLOO_GENERATE_ALL_TYPES(scalarType, setOutput, opts, tensor);
     gloo::reduce(opts);
-    if (reduceOp == 4) {
+    if (reduceOp == ReduceOp::AVG) {
       tensors[0] /= (double)context_->size;
     }
   }
@@ -954,6 +1438,46 @@ class AsyncAllgatherCoalescedWork : public GlooAsyncWork {
         current_element += output_tensor.numel();
       }
     }
+  }
+};
+
+class AsyncGatherSingleWork : public GlooAsyncWork {
+ public:
+  AsyncGatherSingleWork(
+      std::shared_ptr<gloo::Context> context,
+      Tensor& output,
+      Tensor& input,
+      int root,
+      uint32_t tag,
+      uint64_t seq,
+      std::chrono::milliseconds timeout)
+      : GlooAsyncWork(
+            std::move(context),
+            {{output}},
+            "gather",
+            seq,
+            timeout),
+        output(output),
+        input(input),
+        root(root),
+        tag(tag) {}
+
+  Tensor output;
+  Tensor input;
+  const int root;
+  const uint32_t tag;
+
+  void run() override {
+    const auto scalarType = input.dtype();
+    gloo::GatherOptions opts(context_);
+    opts.setRoot(root);
+    opts.setTag(tag);
+    opts.setTimeout(getTimeout());
+    TP_GLOO_GENERATE_ALL_TYPES(scalarType, setInput, opts, input);
+    if (context_->rank == root) {
+      TP_GLOO_GENERATE_ALL_TYPES(scalarType, setOutput, opts, output);
+    }
+    gloo::gather(opts);
   }
 };
 
@@ -1201,38 +1725,48 @@ class AsyncBarrierWork : public GlooAsyncWork {
   }
 };
 
-// Runs on a worker thread so the send buffer outlives a dropped handle: the
-// wait happens where the buffer lives, never on the caller's thread. The
-// tensor is held for the same reason -- its storage backs the raw pointer
-// the transport reads from.
-class AsyncSendWork : public GlooAsyncWork {
- public:
-  AsyncSendWork(
-      std::shared_ptr<gloo::Context> context,
-      Tensor tensor,
-      std::unique_ptr<::gloo::transport::UnboundBuffer> buffer,
-      int dstRank,
-      uint32_t tag,
-      uint64_t seq,
-      std::chrono::milliseconds timeout)
-      : GlooAsyncWork(std::move(context), {}, "send", seq, timeout),
-        tensor_(std::move(tensor)),
-        buffer_(std::move(buffer)),
-        dstRank(dstRank),
-        tag(tag) {}
+}  // namespace
 
-  Tensor tensor_;
-  std::unique_ptr<::gloo::transport::UnboundBuffer> buffer_;
-  const int dstRank;
-  const uint32_t tag;
+GlooSendWork::GlooSendWork(
+    Tensor tensor,
+    std::unique_ptr<::gloo::transport::UnboundBuffer> buffer,
+    uint64_t seq,
+    std::string opName)
+    : GlooWork(std::move(opName)),
+      tensor_(std::move(tensor)),
+      buffer_(std::move(buffer)) {
+  seq_ = seq;
+}
 
-  void run() override {
-    buffer_->send(dstRank, tag);
-    buffer_->waitSend(getTimeout());
+bool GlooSendWork::wait(int64_t timeout_ms) {
+  {
+    std::lock_guard<std::mutex> lock(waitMutex_);
+    if (completed_) {
+      if (exception_ != nullptr) {
+        std::rethrow_exception(exception_);
+      }
+      return true;
+    }
   }
-};
 
-} // namespace
+  try {
+    const bool completed = timeout_ms < 0
+        ? buffer_->waitSend()
+        : buffer_->waitSend(std::chrono::milliseconds(timeout_ms));
+    if (completed) {
+      finish();
+    }
+    return completed;
+  } catch (...) {
+    auto exception = std::current_exception();
+    finishWithError(exception);
+    std::rethrow_exception(exception);
+  }
+}
+
+void GlooSendWork::abort() {
+  buffer_->abortWaitSend();
+}
 
 // ---------------------------------------------------------------------------
 // Collective entry points
@@ -1246,6 +1780,7 @@ std::shared_ptr<GlooWork> ProcessGroupGloo::broadcast(
   assertRootRank(rootRank, size_, "ProcessGroupGloo::broadcast");
   assertRootTensor(rootTensor, (int64_t)inputs.size(), "ProcessGroupGloo::broadcast");
   assertNonEmptyDeviceCpu(inputs, "ProcessGroupGloo::broadcast");
+  assertDense(inputs, "ProcessGroupGloo::broadcast");
   assertTypeAndSizesMatch(inputs, "ProcessGroupGloo::broadcast");
 
   auto tag = nextTag();
@@ -1259,31 +1794,54 @@ std::shared_ptr<GlooWork> ProcessGroupGloo::broadcast(
 
 std::shared_ptr<GlooWork> ProcessGroupGloo::allreduce(
     std::vector<Tensor>& inputs,
-    int reduceOp,
+    ReduceOp reduceOp,
     std::chrono::milliseconds timeout) {
   assertNonEmptyDeviceCpu(inputs, "ProcessGroupGloo::allreduce");
   assertTypeAndSizesMatch(inputs, "ProcessGroupGloo::allreduce");
+  if (inputs[0].is_sparse()) {
+    if (inputs[0].is_sparse_csr()) {
+      invalidArgument(
+          "ProcessGroupGloo::allreduce: sparse CSR tensors are not supported");
+    }
+    if (reduceOp != ReduceOp::SUM) {
+      invalidArgument(
+          "ProcessGroupGloo::allreduce: sparse tensors support SUM only");
+    }
+    for (const auto& tensor : inputs) {
+      if (tensor.is_sparse_csr()) {
+        invalidArgument(
+            "ProcessGroupGloo::allreduce: sparse CSR tensors are not supported");
+      }
+    }
+  }
 
   auto tag = nextTag();
   auto context = getContext(tag);
   ++seq_;
-  std::shared_ptr<GlooAsyncWork> work =
-      std::make_shared<AsyncAllreduceWork>(
-          std::move(context), inputs, reduceOp, tag, seq_, timeout);
+  std::shared_ptr<GlooAsyncWork> work;
+  if (inputs[0].is_sparse()) {
+    work = std::make_shared<AsyncSparseAllreduceWork>(
+        std::move(context), inputs, tag, seq_, timeout);
+  } else {
+    work = std::make_shared<AsyncAllreduceWork>(
+        std::move(context), inputs, reduceOp, tag, seq_, timeout);
+  }
   enqueue(work);
   return work;
 }
 
 std::shared_ptr<GlooWork> ProcessGroupGloo::allreduce_coalesced(
     std::vector<Tensor>& tensors,
-    int reduceOp,
+    ReduceOp reduceOp,
     std::chrono::milliseconds timeout) {
   assertNonEmptyDeviceCpu(tensors, "ProcessGroupGloo::allreduce_coalesced");
+  assertDense(tensors, "ProcessGroupGloo::allreduce_coalesced");
   for (const auto& t : tensors) {
-    if (t.dtype() != tensors[0].dtype() || t.device() != tensors[0].device()) {
+    if (t.is_sparse() || t.dtype() != tensors[0].dtype() ||
+        t.device() != tensors[0].device()) {
       invalidArgument(
           "ProcessGroupGloo::allreduce_coalesced: tensors must share type "
-          "and device");
+          "and device and must be dense");
     }
   }
   auto tag = nextTag();
@@ -1300,12 +1858,13 @@ std::shared_ptr<GlooWork> ProcessGroupGloo::reduce(
     std::vector<Tensor>& inputs,
     int rootRank,
     int rootTensor,
-    int reduceOp,
+    ReduceOp reduceOp,
     std::chrono::milliseconds timeout) {
   assertRootRank(rootRank, size_, "ProcessGroupGloo::reduce");
   assertRootTensor(rootTensor, (int64_t)inputs.size(), "ProcessGroupGloo::reduce");
   assertSingleElement(inputs, "ProcessGroupGloo::reduce");
   assertNonEmptyDeviceCpu(inputs, "ProcessGroupGloo::reduce");
+  assertDense(inputs, "ProcessGroupGloo::reduce");
 
   auto tag = nextTag();
   auto context = getContext(tag);
@@ -1335,14 +1894,27 @@ std::shared_ptr<GlooWork> ProcessGroupGloo::allgather(
         "ProcessGroupGloo::allgather: input/output lists must have the same "
         "length");
   }
-  for (const auto i : outputs) {
-    if ((int64_t)i.size() != (int64_t)inputs.size() * size_) {
+  for (const auto& outputList : outputs) {
+    if ((int64_t)outputList.size() != (int64_t)inputs.size() * size_) {
       invalidArgument(
           "ProcessGroupGloo::allgather: invalid output tensor list length");
     }
   }
   assertNonEmptyDeviceCpu(inputs, "ProcessGroupGloo::allgather");
+  assertDense(inputs, "ProcessGroupGloo::allgather");
   assertTypeAndSizesMatch(inputs, "ProcessGroupGloo::allgather");
+  if (outputs.empty()) {
+    invalidArgument(
+        "ProcessGroupGloo::allgather: output lists must not be empty");
+  }
+  for (const auto& outputList : outputs) {
+    assertNonEmptyDeviceCpu(outputList, "ProcessGroupGloo::allgather");
+    assertDense(outputList, "ProcessGroupGloo::allgather");
+    for (const auto& output : outputList) {
+      assertTensorTypeAndSizesMatch(
+          inputs[0], output, "ProcessGroupGloo::allgather");
+    }
+  }
 
   auto tag = nextTag();
   auto context = getContext(tag);
@@ -1353,14 +1925,190 @@ std::shared_ptr<GlooWork> ProcessGroupGloo::allgather(
   return work;
 }
 
+std::shared_ptr<GlooWork> ProcessGroupGloo::all_gather_single(
+    Tensor& output,
+    Tensor& input,
+    std::chrono::milliseconds timeout) {
+  assertNonEmptyDeviceCpu({output}, "ProcessGroupGloo::all_gather_single");
+  assertNonEmptyDeviceCpu({input}, "ProcessGroupGloo::all_gather_single");
+  assertDense(output, "ProcessGroupGloo::all_gather_single");
+  assertDense(input, "ProcessGroupGloo::all_gather_single");
+  if (output.dtype() != input.dtype() || output.device() != input.device()) {
+    invalidArgument(
+        "ProcessGroupGloo::all_gather_single: input and output tensors "
+        "must have the same type and device");
+  }
+
+  const auto inputView = isComplexType(input.dtype()) ? input.view_as_real() : input;
+  const auto outputView = isComplexType(output.dtype()) ? output.view_as_real() : output;
+  const auto inputShape = static_cast<std::vector<int64_t>>(inputView.shape());
+  const auto outputShape =
+      static_cast<std::vector<int64_t>>(outputView.shape());
+  auto concatenatedShape = inputShape;
+  if (concatenatedShape.empty()) {
+    concatenatedShape.push_back(static_cast<int64_t>(size_));
+  } else {
+    if (concatenatedShape[0] >
+        std::numeric_limits<int64_t>::max() / size_) {
+      invalidArgument(
+          "ProcessGroupGloo::all_gather_single: output shape overflows");
+    }
+    concatenatedShape[0] *= static_cast<int64_t>(size_);
+  }
+  auto stackedShape = inputShape;
+  stackedShape.insert(stackedShape.begin(), static_cast<int64_t>(size_));
+
+  std::vector<Tensor> outputChunks;
+  if (outputShape == concatenatedShape) {
+    if (inputShape.empty()) {
+      outputChunks.reserve(static_cast<size_t>(size_));
+      for (int rank = 0; rank < size_; ++rank) {
+        outputChunks.push_back(outputView.select(0, rank));
+      }
+    } else {
+      outputChunks = outputView.chunk(size_, 0);
+    }
+  } else if (outputShape == stackedShape) {
+    outputChunks.reserve(static_cast<size_t>(size_));
+    for (int rank = 0; rank < size_; ++rank) {
+      outputChunks.push_back(outputView.select(0, rank));
+    }
+  } else {
+    invalidArgument(
+        "ProcessGroupGloo::all_gather_single: output tensor shape must be "
+        "either concatenated or stacked along dim 0");
+  }
+  if (outputChunks.size() != static_cast<size_t>(size_)) {
+    invalidArgument(
+        "ProcessGroupGloo::all_gather_single: output tensor must provide "
+        "one chunk per group rank");
+  }
+  std::vector<std::vector<Tensor>> outputs = {outputChunks};
+  std::vector<Tensor> inputs = {inputView};
+  return allgather(outputs, inputs, timeout);
+}
+
+std::shared_ptr<GlooWork> ProcessGroupGloo::allgather_coalesced(
+    std::vector<std::vector<Tensor>>& outputLists,
+    std::vector<Tensor>& inputList,
+    std::chrono::milliseconds timeout) {
+  if (inputList.empty()) {
+    invalidArgument(
+        "ProcessGroupGloo::allgather_coalesced: requires non-empty input "
+        "tensor list");
+  }
+  if (outputLists.size() != static_cast<size_t>(size_)) {
+    invalidArgument(
+        "ProcessGroupGloo::allgather_coalesced: output lists should be equal "
+        "to world size");
+  }
+  for (const auto& outputList : outputLists) {
+    if (outputList.size() != inputList.size()) {
+      invalidArgument(
+          "ProcessGroupGloo::allgather_coalesced: invalid output tensor list "
+          "length");
+    }
+  }
+  assertNonEmptyDeviceCpu(inputList, "ProcessGroupGloo::allgather_coalesced");
+  assertDense(inputList, "ProcessGroupGloo::allgather_coalesced");
+  for (size_t i = 1; i < inputList.size(); ++i) {
+    if (inputList[i].dtype() != inputList[0].dtype() ||
+        inputList[i].device() != inputList[0].device()) {
+      invalidArgument(
+          "ProcessGroupGloo::allgather_coalesced: input tensors must share "
+          "dtype and device");
+    }
+  }
+  for (const auto& outputList : outputLists) {
+    assertNonEmptyDeviceCpu(outputList, "ProcessGroupGloo::allgather_coalesced");
+    assertDense(outputList, "ProcessGroupGloo::allgather_coalesced");
+    for (size_t i = 0; i < outputList.size(); ++i) {
+      if (outputList[i].shape() != inputList[i].shape()) {
+        invalidArgument(
+            "ProcessGroupGloo::allgather_coalesced: output tensor sizes do "
+            "not match input tensor sizes");
+      }
+      if (outputList[i].dtype() != inputList[i].dtype() ||
+          outputList[i].device() != inputList[i].device()) {
+        invalidArgument(
+            "ProcessGroupGloo::allgather_coalesced: output tensor types do "
+            "not match input tensor types");
+      }
+    }
+  }
+
+  auto tag = nextTag();
+  auto context = getContext(tag);
+  ++seq_;
+  std::shared_ptr<GlooAsyncWork> work =
+      std::make_shared<AsyncAllgatherCoalescedWork>(
+          std::move(context), outputLists, inputList, tag, seq_, timeout);
+  enqueue(work);
+  return work;
+}
+
+std::shared_ptr<GlooWork> ProcessGroupGloo::all_gather_single_coalesced(
+    std::vector<Tensor>& outputs,
+    std::vector<Tensor>& inputs,
+    std::chrono::milliseconds timeout) {
+  if (outputs.size() != inputs.size()) {
+    invalidArgument(
+        "ProcessGroupGloo::all_gather_single_coalesced: input/output tensor "
+        "lists must have the same length");
+  }
+  std::vector<std::vector<Tensor>> outputLists(size_);
+  for (auto& output : outputs) {
+    auto chunks = splitEven(output);
+    for (size_t i = 0; i < outputLists.size(); ++i) {
+      outputLists[i].push_back(chunks[i]);
+    }
+  }
+  return allgather_coalesced(outputLists, inputs, timeout);
+}
+
 std::shared_ptr<GlooWork> ProcessGroupGloo::all_gather_into_tensor(
     Tensor& output,
     Tensor& input,
     std::chrono::milliseconds timeout) {
-  auto tensor_list = splitEven(output);
-  std::vector<std::vector<Tensor>> outputs = {tensor_list};
-  std::vector<Tensor> inputs = {input};
-  return allgather(outputs, inputs, timeout);
+  return all_gather_single(output, input, timeout);
+}
+
+std::shared_ptr<GlooWork> ProcessGroupGloo::gather_single(
+    Tensor& output,
+    Tensor& input,
+    int rootRank,
+    std::chrono::milliseconds timeout) {
+  assertRootRank(rootRank, size_, "ProcessGroupGloo::gather_single");
+  assertNonEmptyDeviceCpu({input}, "ProcessGroupGloo::gather_single");
+  if (!input.is_contiguous()) {
+    invalidArgument(
+        "ProcessGroupGloo::gather_single: input must be contiguous");
+  }
+  if (getRank() == rootRank) {
+    if (!output.defined() || !output.is_contiguous()) {
+      invalidArgument(
+          "ProcessGroupGloo::gather_single: output must be a contiguous "
+          "tensor on the destination rank");
+    }
+    if (output.numel() != input.numel() * static_cast<int64_t>(size_)) {
+      invalidArgument(
+          "ProcessGroupGloo::gather_single: output size must equal input "
+          "size times world size");
+    }
+    if (output.dtype() != input.dtype() || output.device() != input.device()) {
+      invalidArgument(
+          "ProcessGroupGloo::gather_single: input/output tensor types do not "
+          "match");
+    }
+  }
+
+  auto tag = nextTag();
+  auto context = getContext(tag);
+  ++seq_;
+  std::shared_ptr<GlooAsyncWork> work = std::make_shared<AsyncGatherSingleWork>(
+      std::move(context), output, input, rootRank, tag, seq_, timeout);
+  enqueue(work);
+  return work;
 }
 
 std::shared_ptr<GlooWork> ProcessGroupGloo::gather(
@@ -1371,11 +2119,18 @@ std::shared_ptr<GlooWork> ProcessGroupGloo::gather(
   assertRootRank(rootRank, size_, "ProcessGroupGloo::gather");
   assertSingleElement(inputs, "ProcessGroupGloo::gather");
   assertNonEmptyDeviceCpu(inputs, "ProcessGroupGloo::gather");
+  assertDense(inputs, "ProcessGroupGloo::gather");
   if (getRank() == rootRank) {
     if ((int64_t)outputs.size() != 1 ||
         (int64_t)outputs[0].size() != size_) {
       invalidArgument(
           "ProcessGroupGloo::gather: root expects one tensor per rank");
+    }
+    assertNonEmptyDeviceCpu(outputs[0], "ProcessGroupGloo::gather");
+    assertDense(outputs[0], "ProcessGroupGloo::gather");
+    for (const auto& output : outputs[0]) {
+      assertTensorTypeAndSizesMatch(
+          inputs[0], output, "ProcessGroupGloo::gather");
     }
   } else if (!outputs.empty()) {
     invalidArgument(
@@ -1401,12 +2156,17 @@ std::shared_ptr<GlooWork> ProcessGroupGloo::scatter(
     invalidArgument("ProcessGroupGloo::scatter: requires a single output");
   }
   assertNonEmptyDeviceCpu(outputs, "ProcessGroupGloo::scatter");
+  assertDense(outputs, "ProcessGroupGloo::scatter");
   if (getRank() == rootRank) {
     if (inputs.size() != 1 || (int64_t)inputs[0].size() != size_) {
       invalidArgument(
           "ProcessGroupGloo::scatter: root expects one input tensor per rank");
     }
     assertTypeAndSizesMatch(inputs[0], "ProcessGroupGloo::scatter");
+    for (const auto& input : inputs[0]) {
+      assertTensorTypeAndSizesMatch(
+          outputs[0], input, "ProcessGroupGloo::scatter");
+    }
   } else if (!inputs.empty()) {
     invalidArgument(
         "ProcessGroupGloo::scatter: non-root input list must be empty");
@@ -1424,7 +2184,7 @@ std::shared_ptr<GlooWork> ProcessGroupGloo::scatter(
 std::shared_ptr<GlooWork> ProcessGroupGloo::reduce_scatter(
     std::vector<Tensor>& outputs,
     std::vector<std::vector<Tensor>>& inputs,
-    int reduceOp,
+    ReduceOp reduceOp,
     std::chrono::milliseconds timeout) {
   const auto rank = getRank();
   const auto worldSize = getSize();
@@ -1436,6 +2196,13 @@ std::shared_ptr<GlooWork> ProcessGroupGloo::reduce_scatter(
         "ProcessGroupGloo::reduce_scatter: input list length must equal "
         "world size");
   }
+  assertNonEmptyDeviceCpu(outputs, "ProcessGroupGloo::reduce_scatter");
+  assertDense(outputs, "ProcessGroupGloo::reduce_scatter");
+  assertNonEmptyDeviceCpu(inputs[0], "ProcessGroupGloo::reduce_scatter");
+  assertDense(inputs[0], "ProcessGroupGloo::reduce_scatter");
+  assertTypeAndSizesMatch(inputs[0], "ProcessGroupGloo::reduce_scatter");
+  assertTensorTypeAndSizesMatch(
+      outputs[0], inputs[0][0], "ProcessGroupGloo::reduce_scatter");
 
   std::vector<Tensor> buffers;
   for (size_t i = 0; i < (size_t)worldSize; ++i) {
@@ -1470,7 +2237,9 @@ std::shared_ptr<GlooWork> ProcessGroupGloo::reduce_scatter(
 
     bool wait(int64_t timeout_ms) override {
       for (auto& work : works_) {
-        work->wait(timeout_ms);
+        if (!work->wait(timeout_ms)) {
+          return false;
+        }
       }
       // The output slot aliases this rank's own buffer, which the enqueued
       // allreduce already reduced in place.
@@ -1491,14 +2260,35 @@ std::shared_ptr<GlooWork> ProcessGroupGloo::reduce_scatter(
 std::shared_ptr<GlooWork> ProcessGroupGloo::reduce_scatter_tensor(
     Tensor& output,
     Tensor& input,
-    int reduceOp,
+    ReduceOp reduceOp,
     std::chrono::milliseconds timeout) {
   const auto worldSize = getSize();
+  assertNonEmptyDeviceCpu({output}, "ProcessGroupGloo::reduce_scatter_tensor");
+  assertNonEmptyDeviceCpu({input}, "ProcessGroupGloo::reduce_scatter_tensor");
+  assertDense(output, "ProcessGroupGloo::reduce_scatter_tensor");
+  assertDense(input, "ProcessGroupGloo::reduce_scatter_tensor");
+  if (output.dtype() != input.dtype() || output.device() != input.device()) {
+    invalidArgument(
+        "ProcessGroupGloo::reduce_scatter_tensor: input/output tensors must "
+        "have the same type and device");
+  }
   if (output.dim() == 0 || input.dim() == 0 ||
       output.size(0) * worldSize != input.size(0)) {
     invalidArgument(
         "ProcessGroupGloo::reduce_scatter_tensor: dim 0 of input must equal "
         "output dim 0 times world size");
+  }
+  if (output.shape().size() != input.shape().size()) {
+    invalidArgument(
+        "ProcessGroupGloo::reduce_scatter_tensor: input/output dimensions "
+        "do not match");
+  }
+  for (size_t dim = 1; dim < output.shape().size(); ++dim) {
+    if (output.shape()[dim] != input.shape()[dim]) {
+      invalidArgument(
+          "ProcessGroupGloo::reduce_scatter_tensor: input/output sizes do "
+          "not match");
+    }
   }
   Tensor inputClone = input.clone();
   std::vector<Tensor> inp = {inputClone};
@@ -1521,7 +2311,9 @@ std::shared_ptr<GlooWork> ProcessGroupGloo::reduce_scatter_tensor(
     }
 
     bool wait(int64_t timeout_ms) override {
-      work_->wait(timeout_ms);
+      if (!work_->wait(timeout_ms)) {
+        return false;
+      }
       int64_t chunk = buffer_.numel() / worldSize_;
       output_.copy_(
           buffer_.narrow(0, (int64_t)rank_ * chunk, chunk).reshape(
@@ -1541,18 +2333,155 @@ std::shared_ptr<GlooWork> ProcessGroupGloo::reduce_scatter_tensor(
       output, inputClone, std::move(work), getRank(), worldSize);
 }
 
+std::shared_ptr<GlooWork> ProcessGroupGloo::reduce_scatter_single(
+    Tensor& output,
+    Tensor& input,
+    ReduceOp reduceOp,
+    std::chrono::milliseconds timeout) {
+  std::vector<Tensor> outputs = {output};
+  std::vector<Tensor> inputs = {input};
+  return reduce_scatter_single_coalesced(
+      outputs, inputs, reduceOp, timeout);
+}
+
+std::shared_ptr<GlooWork> ProcessGroupGloo::reduce_scatter_single_coalesced(
+    std::vector<Tensor>& outputs,
+    std::vector<Tensor>& inputs,
+    ReduceOp reduceOp,
+    std::chrono::milliseconds timeout) {
+  if (outputs.size() != inputs.size()) {
+    invalidArgument(
+        "ProcessGroupGloo::reduce_scatter_single_coalesced: input/output "
+        "tensor lists must have the same length");
+  }
+  if (!inputs.empty()) {
+    assertNonEmptyDeviceCpu(
+        inputs, "ProcessGroupGloo::reduce_scatter_single_coalesced");
+  }
+  if (!outputs.empty()) {
+    assertNonEmptyDeviceCpu(
+        outputs, "ProcessGroupGloo::reduce_scatter_single_coalesced");
+  }
+
+  const auto rank = getRank();
+  const auto worldSize = getSize();
+  std::vector<Tensor> buffers;
+  buffers.reserve(inputs.size());
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    const auto inputShape = inputs[i].shape();
+    const auto outputShape = outputs[i].shape();
+    if (inputShape.empty() || outputShape.empty()) {
+      invalidArgument(
+          "ProcessGroupGloo::reduce_scatter_single_coalesced: tensors must "
+          "have at least one dimension");
+    }
+    if (outputs[i].dtype() != inputs[i].dtype() ||
+        outputs[i].device() != inputs[i].device()) {
+      invalidArgument(
+          "ProcessGroupGloo::reduce_scatter_single_coalesced: input/output "
+          "tensor types do not match");
+    }
+    if (outputShape[0] * worldSize != inputShape[0]) {
+      invalidArgument(
+          "ProcessGroupGloo::reduce_scatter_single_coalesced: input dim 0 "
+          "must equal output dim 0 times world size");
+    }
+    if (outputShape.size() != inputShape.size()) {
+      invalidArgument(
+          "ProcessGroupGloo::reduce_scatter_single_coalesced: input/output "
+          "dimensions do not match");
+    }
+    for (size_t d = 1; d < outputShape.size(); ++d) {
+      if (outputShape[d] != inputShape[d]) {
+        invalidArgument(
+            "ProcessGroupGloo::reduce_scatter_single_coalesced: input/output "
+            "tensor sizes do not match");
+      }
+    }
+    buffers.push_back(inputs[i].clone());
+  }
+
+  std::vector<std::shared_ptr<GlooWork>> works;
+  works.reserve(buffers.size());
+  for (auto& buffer : buffers) {
+    std::vector<Tensor> input = {buffer};
+    works.push_back(allreduce(input, reduceOp, timeout));
+  }
+
+  class ReduceScatterSingleFinish : public GlooWork {
+   public:
+    ReduceScatterSingleFinish(
+        std::vector<Tensor> outputs,
+        std::vector<Tensor> buffers,
+        std::vector<std::shared_ptr<GlooWork>> works,
+        int rank,
+        int worldSize)
+        : GlooWork("reduce_scatter"),
+          outputs_(std::move(outputs)),
+          buffers_(std::move(buffers)),
+          works_(std::move(works)),
+          rank_(rank),
+          worldSize_(worldSize) {
+      outputTensors_ = {outputs_};
+    }
+
+    bool wait(int64_t timeout_ms) override {
+      for (size_t i = 0; i < works_.size(); ++i) {
+        if (!works_[i]->wait(timeout_ms)) {
+          return false;
+        }
+        const auto chunk = buffers_[i].size(0) / worldSize_;
+        outputs_[i].copy_(
+            buffers_[i]
+                .narrow(0, static_cast<int64_t>(rank_) * chunk, chunk)
+                .reshape(outputs_[i].shape()));
+      }
+      GlooWork::finish();
+      return true;
+    }
+
+   private:
+    std::vector<Tensor> outputs_;
+    std::vector<Tensor> buffers_;
+    std::vector<std::shared_ptr<GlooWork>> works_;
+    int rank_;
+    int worldSize_;
+  };
+
+  return std::make_shared<ReduceScatterSingleFinish>(
+      outputs, std::move(buffers), std::move(works), rank, worldSize);
+}
+
 std::shared_ptr<GlooWork> ProcessGroupGloo::all_to_all_single(
     Tensor& outputTensor,
     Tensor& inputTensor,
     std::vector<int64_t> outputCounts,
     std::vector<int64_t> inputCounts,
     std::chrono::milliseconds timeout) {
+  assertNonEmptyDeviceCpu({outputTensor}, "ProcessGroupGloo::all_to_all_single");
+  assertNonEmptyDeviceCpu({inputTensor}, "ProcessGroupGloo::all_to_all_single");
+  assertDense(outputTensor, "ProcessGroupGloo::all_to_all_single");
+  assertDense(inputTensor, "ProcessGroupGloo::all_to_all_single");
   if (outputTensor.device() != inputTensor.device()) {
     invalidArgument(
         "ProcessGroupGloo::all_to_all_single: output and input must be on "
         "the same device");
   }
-  assertNonEmptyDeviceCpu({outputTensor}, "ProcessGroupGloo::all_to_all_single");
+  if (outputTensor.dtype() != inputTensor.dtype()) {
+    invalidArgument(
+        "ProcessGroupGloo::all_to_all_single: output and input must have "
+        "the same dtype");
+  }
+  if (!inputTensor.is_contiguous() || !outputTensor.is_contiguous()) {
+    invalidArgument(
+        "ProcessGroupGloo::all_to_all_single: input and output tensors "
+        "must be contiguous");
+  }
+  if (outputCounts.empty() != inputCounts.empty()) {
+    invalidArgument(
+        "ProcessGroupGloo::all_to_all_single: input and output split sizes "
+        "must be specified together");
+  }
   checkSplitSizes(inputCounts, inputTensor, getSize());
   checkSplitSizes(outputCounts, outputTensor, getSize());
 
@@ -1583,8 +2512,15 @@ std::shared_ptr<GlooWork> ProcessGroupGloo::alltoall(
         "size");
   }
   assertNonEmptyDeviceCpu(inputTensors, "ProcessGroupGloo::alltoall");
+  assertNonEmptyDeviceCpu(outputTensors, "ProcessGroupGloo::alltoall");
+  assertDense(inputTensors, "ProcessGroupGloo::alltoall");
+  assertDense(outputTensors, "ProcessGroupGloo::alltoall");
   assertTypeAndSizesMatch(inputTensors, "ProcessGroupGloo::alltoall");
   assertTypeAndSizesMatch(outputTensors, "ProcessGroupGloo::alltoall");
+  for (size_t i = 0; i < inputTensors.size(); ++i) {
+    assertTensorTypeAndSizesMatch(
+        inputTensors[i], outputTensors[i], "ProcessGroupGloo::alltoall");
+  }
 
   auto tag = nextTag();
   auto context = getContext(tag);
@@ -1603,6 +2539,15 @@ Tensor& checkSingleTensor(std::vector<Tensor>& tensors, const char* op) {
     invalidArgument(std::string(op) + " takes a single tensor");
   }
   auto& tensor = tensors[0];
+  if (!tensor.defined()) {
+    invalidArgument(std::string(op) + ": tensor is undefined");
+  }
+  if (tensor.is_sparse()) {
+    invalidArgument(std::string(op) + ": only dense tensors are supported");
+  }
+  if (!tensor.device().is_cpu()) {
+    invalidArgument(std::string(op) + ": only CPU tensors are supported");
+  }
   if (!tensor.is_contiguous()) {
     invalidArgument(std::string(op) + ": input tensor has to be contiguous");
   }
@@ -1622,6 +2567,7 @@ std::shared_ptr<GlooWork> ProcessGroupGloo::send(
     std::vector<Tensor>& tensors,
     int dstRank,
     int tag) {
+  assertRootRank(dstRank, size_, "ProcessGroupGloo::send");
   auto& tensor = checkSingleTensor(tensors, "ProcessGroupGloo::send");
   auto utag = checkTag(tag, "ProcessGroupGloo::send");
   void* ptr = tensor.data_ptr();
@@ -1629,23 +2575,17 @@ std::shared_ptr<GlooWork> ProcessGroupGloo::send(
 
   auto context = getContext(utag);
   auto buf = context->createUnboundBuffer(ptr, size);
+  buf->send(dstRank, utag);
   ++seq_;
-  auto work = std::make_shared<AsyncSendWork>(
-      std::move(context),
-      tensor,
-      std::move(buf),
-      dstRank,
-      utag,
-      seq_,
-      options_.timeout);
-  enqueue(work);
-  return work;
+  return std::make_shared<GlooSendWork>(
+      tensor, std::move(buf), seq_, "send");
 }
 
 std::shared_ptr<GlooWork> ProcessGroupGloo::recv(
     std::vector<Tensor>& tensors,
     int srcRank,
     int tag) {
+  assertRootRank(srcRank, size_, "ProcessGroupGloo::recv");
   auto& tensor = checkSingleTensor(tensors, "ProcessGroupGloo::recv");
   auto utag = checkTag(tag, "ProcessGroupGloo::recv");
   void* ptr = tensor.data_ptr();
@@ -1699,6 +2639,8 @@ std::shared_ptr<GlooWork> ProcessGroupGloo::barrier(
 void ProcessGroupGloo::monitoredBarrier(
     std::chrono::milliseconds timeout,
     bool waitAllRanks) {
+  const auto barrierTimeout =
+      timeout == kUnsetTimeout ? options_.timeout : timeout;
   auto t1 = nextTag();
   auto t2 = nextTag();
   std::vector<Tensor> commTensor = {
@@ -1718,6 +2660,7 @@ void ProcessGroupGloo::monitoredBarrier(
     }
     return;
   }
+  auto startTime = std::chrono::steady_clock::now();
   auto worldSize = getSize();
   std::map<int, std::shared_ptr<GlooWork>> recvWorkMap;
   std::map<int, std::shared_ptr<GlooWork>> sendWorkMap;
@@ -1730,13 +2673,24 @@ void ProcessGroupGloo::monitoredBarrier(
     for (auto& entry : works) {
       bool rankResponded = false;
       try {
-        entry.second->wait(timeout.count());
+        const auto remaining = remainingBarrierTime(
+            startTime, barrierTimeout, waitAllRanks);
+        if (!waitAllRanks) {
+          checkBarrierTime(
+              barrierTimeout, remaining, processedRanks, rank);
+        }
+        if (!entry.second->wait(remaining.count())) {
+          runtimeFailure(
+              "Rank " + std::to_string(entry.first) +
+              " failed to pass monitoredBarrier in " +
+              std::to_string(barrierTimeout.count()) + " ms");
+        }
         rankResponded = true;
       } catch (const std::exception& e) {
         const std::string error =
             "[Rank 0]: Rank " + std::to_string(entry.first) +
             " failed to pass monitoredBarrier in " +
-            std::to_string(timeout.count()) + " ms: " + e.what();
+            std::to_string(barrierTimeout.count()) + " ms: " + e.what();
         if (waitAllRanks) {
           std::cerr << error << std::endl;
         } else {
@@ -1759,7 +2713,7 @@ void ProcessGroupGloo::monitoredBarrier(
       }
       runtimeFailure(
           "[Rank 0]: Ranks " + failed + " failed to pass monitoredBarrier in " +
-          std::to_string(timeout.count()) + " ms");
+          std::to_string(barrierTimeout.count()) + " ms");
     }
   };
 
@@ -1781,8 +2735,7 @@ std::vector<Tensor> ProcessGroupGloo::splitEven(const Tensor& tensor) {
   std::vector<Tensor> out;
   out.reserve(worldSize);
   for (size_t i = 0; i < worldSize; ++i) {
-    out.push_back(
-        tensor.narrow(0, (int64_t)i * chunk, chunk).contiguous());
+    out.push_back(tensor.narrow(0, (int64_t)i * chunk, chunk));
   }
   return out;
 }

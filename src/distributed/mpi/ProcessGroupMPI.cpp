@@ -8,7 +8,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <map>
+#include <numeric>
 #include <stdexcept>
 
 namespace tensorplay {
@@ -35,17 +37,41 @@ namespace {
   TP_THROW(RuntimeError, msg);
 }
 
-// Op mapping (codes mirror the Python-layer ReduceOp values).
-MPI_Op mpiOpOf(int op) {
-  switch (op) {
-    case 0: // SUM
+void checkRootRank(int rootRank, int size, const char* op) {
+  if (rootRank < 0 || rootRank >= size) {
+    invalidArgument(
+        std::string(op) + ": root rank " + std::to_string(rootRank) +
+        " is out of range for group of size " + std::to_string(size));
+  }
+}
+
+void checkPeerRank(int peerRank, int size, const char* op) {
+  if (peerRank < 0 || peerRank >= size) {
+    invalidArgument(
+        std::string(op) + ": peer rank " + std::to_string(peerRank) +
+        " is out of range for group of size " + std::to_string(size));
+  }
+}
+
+int mpiCount(int64_t value, const char* op) {
+  if (value < 0 || value > std::numeric_limits<int>::max()) {
+    runtimeFailure(
+        std::string(op) + ": tensor element count exceeds the MPI limit");
+  }
+  return static_cast<int>(value);
+}
+
+// Op mapping for the distributed reduction operations.
+MPI_Op mpiOpOf(ReduceOp op) {
+  switch (op.op()) {
+    case ReduceOp::SUM:
       return MPI_SUM;
-    case 1: // PRODUCT
+    case ReduceOp::PRODUCT:
       return MPI_PROD;
-    case 2: // MAX
-      return MPI_MAX;
-    case 3: // MIN
+    case ReduceOp::MIN:
       return MPI_MIN;
+    case ReduceOp::MAX:
+      return MPI_MAX;
     default:
       runtimeFailure("Unhandled reduce op for the MPI backend");
   }
@@ -72,6 +98,13 @@ MPI_Datatype mpiDatatypeOf(::tensorplay::ScalarType type) {
     case ::tensorplay::ScalarType::Float16:
       return MPIX_C_FLOAT16;
 #endif
+#if defined(MPIX_C_BF16)
+    case ::tensorplay::ScalarType::BFloat16:
+      return MPIX_C_BF16;
+#elif defined(MPIX_BFLOAT16)
+    case ::tensorplay::ScalarType::BFloat16:
+      return MPIX_BFLOAT16;
+#endif
     default:
       runtimeFailure(
           "Tensor dtype is not supported by the MPI backend");
@@ -79,8 +112,14 @@ MPI_Datatype mpiDatatypeOf(::tensorplay::ScalarType type) {
 }
 
 void checkSingleTensorHelper(const Tensor& tensor) {
+  if (!tensor.defined()) {
+    runtimeFailure("input tensor is undefined");
+  }
   if (!tensor.is_contiguous()) {
     runtimeFailure("input tensor has to be contiguous");
+  }
+  if (tensor.is_sparse()) {
+    runtimeFailure("input tensor has to be dense");
   }
   if (tensor.device().is_cuda()) {
     runtimeFailure(
@@ -98,6 +137,7 @@ void checkSingleTensor(const std::vector<Tensor>& tensors) {
 void checkSameSizeAndType(
     const Tensor& t_in,
     const std::vector<Tensor>& tensors) {
+  checkSingleTensorHelper(t_in);
   for (const auto& tensor : tensors) {
     if ((tensor.numel() != t_in.numel()) ||
         (tensor.dtype() != t_in.dtype())) {
@@ -107,16 +147,99 @@ void checkSameSizeAndType(
   }
 }
 
-Tensor newLikeFlat(const std::vector<Tensor>& tensors) {
-  int64_t numel = 0;
+void checkSameDtype(
+    const Tensor& t_in,
+    const std::vector<Tensor>& tensors) {
   for (const auto& tensor : tensors) {
-    numel += tensor.numel();
+    if (tensor.dtype() != t_in.dtype()) {
+      runtimeFailure("Tensors are not equal in data type");
+    }
   }
-  return Tensor::empty({numel}, tensors[0].dtype(), tensors[0].device());
 }
 
-std::chrono::milliseconds timeoutOr(std::chrono::milliseconds t) {
-  return t == std::chrono::milliseconds(-1) ? std::chrono::milliseconds(0) : t;
+void checkSplitSizes(
+    const std::vector<int64_t>& splitSizes,
+    const Tensor& tensor,
+    int groupSize) {
+  if (tensor.dim() == 0) {
+    runtimeFailure("all_to_all_single requires tensors with a dimension 0");
+  }
+  for (const auto splitSize : splitSizes) {
+    if (splitSize < 0) {
+      runtimeFailure("Split sizes must be non-negative");
+    }
+  }
+  if (splitSizes.empty()) {
+    if (tensor.size(0) % groupSize != 0) {
+      runtimeFailure(
+          "Tensor's dim 0 does not divide equally across group size");
+    }
+    return;
+  }
+  if (splitSizes.size() != static_cast<size_t>(groupSize)) {
+    runtimeFailure("Number of tensor split sizes not equal to group size");
+  }
+  const int64_t sum =
+      std::accumulate(splitSizes.begin(), splitSizes.end(), int64_t{0});
+  if (sum != tensor.size(0)) {
+    runtimeFailure("Split sizes doesn't match total dim 0 size");
+  }
+}
+
+void computeLengthsAndOffsets(
+    const std::vector<int64_t>& splitSizes,
+    const Tensor& tensor,
+    int groupSize,
+    std::vector<int>* lengths,
+    std::vector<int>* offsets) {
+  const int64_t dim0Size = tensor.size(0);
+  const int64_t rowSize = dim0Size == 0 ? 1 : tensor.numel() / dim0Size;
+  const bool equalSplits = splitSizes.empty();
+  const int64_t equalSplitSize =
+      equalSplits ? dim0Size / static_cast<int64_t>(groupSize) : 0;
+  lengths->resize(static_cast<size_t>(groupSize));
+  offsets->resize(static_cast<size_t>(groupSize));
+  int64_t offset = 0;
+  for (int i = 0; i < groupSize; ++i) {
+    const int64_t splitSize =
+        equalSplits ? equalSplitSize : splitSizes[static_cast<size_t>(i)];
+    if (splitSize > 0 && rowSize > std::numeric_limits<int64_t>::max() / splitSize) {
+      runtimeFailure("all_to_all_single split size overflow");
+    }
+    const int64_t length = rowSize * splitSize;
+    (*lengths)[static_cast<size_t>(i)] = mpiCount(length, "MPI alltoallv");
+    (*offsets)[static_cast<size_t>(i)] = mpiCount(offset, "MPI alltoallv");
+    if (length > std::numeric_limits<int64_t>::max() - offset) {
+      runtimeFailure("all_to_all_single offset overflow");
+    }
+    offset += length;
+  }
+}
+
+void computeLengthsAndOffsets(
+    const std::vector<Tensor>& tensors,
+    std::vector<int>* lengths,
+    std::vector<int>* offsets) {
+  lengths->resize(tensors.size());
+  offsets->resize(tensors.size());
+  int64_t offset = 0;
+  for (size_t i = 0; i < tensors.size(); ++i) {
+    (*lengths)[i] = mpiCount(tensors[i].numel(), "MPI alltoallv");
+    (*offsets)[i] = mpiCount(offset, "MPI alltoallv");
+    if (tensors[i].numel() > std::numeric_limits<int64_t>::max() - offset) {
+      runtimeFailure("alltoall tensor offset overflow");
+    }
+    offset += tensors[i].numel();
+  }
+}
+
+Tensor newLikeFlat(const std::vector<Tensor>& tensors) {
+  if (tensors.empty()) {
+    runtimeFailure("Received an empty tensor list");
+  }
+  std::vector<int64_t> sizes = tensors[0].shape();
+  sizes.insert(sizes.begin(), static_cast<int64_t>(tensors.size()));
+  return Tensor::empty(sizes, tensors[0].dtype(), tensors[0].device());
 }
 
 } // namespace
@@ -142,6 +265,9 @@ bool ProcessGroupMPI::AsyncWork::is_completed() {
   }
   if (status_.MPI_ERROR != MPI_SUCCESS) {
     populateException();
+    finishWithError(exception_);
+  } else {
+    finish();
   }
   return true;
 }
@@ -152,6 +278,9 @@ int ProcessGroupMPI::AsyncWork::source_rank() const {
 
 bool ProcessGroupMPI::AsyncWork::wait(int64_t /* timeout_ms */) {
   if (request_ == MPI_REQUEST_NULL) {
+    if (exception_ != nullptr) {
+      std::rethrow_exception(exception_);
+    }
     return true;
   }
   std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
@@ -159,8 +288,10 @@ bool ProcessGroupMPI::AsyncWork::wait(int64_t /* timeout_ms */) {
   auto ok = (status_.MPI_ERROR == MPI_SUCCESS);
   if (!ok) {
     populateException();
+    finishWithError(exception_);
     std::rethrow_exception(exception_);
   }
+  finish();
   return true;
 }
 
@@ -230,12 +361,15 @@ std::shared_ptr<ProcessGroupMPI> ProcessGroupMPI::createProcessGroupMPI(
       bool groupComm_updated = false;
       MPI_Barrier(MPI_COMM_WORLD);
       for (int i = 0; i < kMaxNumRetries; ++i) {
-        if (MPI_Comm_create(MPI_COMM_WORLD, ranksGroup, &groupComm)) {
+        if (MPI_Comm_create(MPI_COMM_WORLD, ranksGroup, &groupComm) ==
+            MPI_SUCCESS) {
           groupComm_updated = true;
           break;
         }
       }
-      MPI_CHECK(groupComm_updated);
+      if (!groupComm_updated) {
+        runtimeFailure("Failed to create the MPI process group");
+      }
       MPI_CHECK(MPI_Group_free(&worldGroup));
       MPI_CHECK(MPI_Group_free(&ranksGroup));
     }
@@ -260,6 +394,9 @@ ProcessGroupMPI::ProcessGroupMPI(int rank, int size, MPI_Comm pgComm)
     : pgComm_(pgComm), rank_(rank), size_(size) {
   if (pgComm_ == MPI_COMM_NULL) {
     TP_THROW(RuntimeError, "pgComm_ must not be MPI_COMM_NULL");
+  }
+  if (size_ <= 0 || rank_ < 0 || rank_ >= size_) {
+    TP_THROW(RuntimeError, "Invalid process-group rank or size");
   }
   workerThread_ = std::thread(&ProcessGroupMPI::runLoop, this);
 }
@@ -320,6 +457,7 @@ std::shared_ptr<GlooWork> ProcessGroupMPI::broadcast(
     std::vector<Tensor>& tensors,
     int rootRank,
     std::chrono::milliseconds timeout) {
+  checkRootRank(rootRank, size_, "Broadcast");
   checkSingleTensor(tensors);
   (void)timeout;
   std::function<void(WorkEntry&)> runFunc =
@@ -328,7 +466,7 @@ std::shared_ptr<GlooWork> ProcessGroupMPI::broadcast(
         std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
         MPI_CHECK(MPI_Bcast(
             data.data_ptr(),
-            (int)data.numel(),
+            mpiCount(data.numel(), "MPI broadcast"),
             mpiDatatypeOf(data.dtype()),
             rootRank,
             pgComm_));
@@ -340,7 +478,7 @@ std::shared_ptr<GlooWork> ProcessGroupMPI::broadcast(
 
 std::shared_ptr<GlooWork> ProcessGroupMPI::allreduce(
     std::vector<Tensor>& tensors,
-    int reduceOp,
+    ReduceOp reduceOp,
     std::chrono::milliseconds timeout) {
   checkSingleTensor(tensors);
   (void)timeout;
@@ -351,7 +489,7 @@ std::shared_ptr<GlooWork> ProcessGroupMPI::allreduce(
         MPI_CHECK(MPI_Allreduce(
             MPI_IN_PLACE,
             data.data_ptr(),
-            (int)data.numel(),
+            mpiCount(data.numel(), "MPI allreduce"),
             mpiDatatypeOf(data.dtype()),
             mpiOpOf(reduceOp),
             pgComm_));
@@ -363,7 +501,7 @@ std::shared_ptr<GlooWork> ProcessGroupMPI::allreduce(
 
 std::shared_ptr<GlooWork> ProcessGroupMPI::allreduce_coalesced(
     std::vector<Tensor>& tensors,
-    int reduceOp,
+    ReduceOp reduceOp,
     std::chrono::milliseconds timeout) {
   (void)tensors;
   (void)reduceOp;
@@ -374,8 +512,9 @@ std::shared_ptr<GlooWork> ProcessGroupMPI::allreduce_coalesced(
 std::shared_ptr<GlooWork> ProcessGroupMPI::reduce(
     std::vector<Tensor>& tensors,
     int rootRank,
-    int reduceOp,
+    ReduceOp reduceOp,
     std::chrono::milliseconds timeout) {
+  checkRootRank(rootRank, size_, "Reduce");
   checkSingleTensor(tensors);
   (void)timeout;
   std::function<void(WorkEntry&)> runFunc =
@@ -388,7 +527,7 @@ std::shared_ptr<GlooWork> ProcessGroupMPI::reduce(
         MPI_CHECK(MPI_Reduce(
             sendbuf,
             recvbuf,
-            (int)data.numel(),
+            mpiCount(data.numel(), "MPI reduce"),
             mpiDatatypeOf(data.dtype()),
             mpiOpOf(reduceOp),
             rootRank,
@@ -418,12 +557,12 @@ std::shared_ptr<GlooWork> ProcessGroupMPI::allgather(
     std::vector<Tensor> outputDataVec = entry.dst;
     auto flatOutputTensor = newLikeFlat(outputDataVec);
     std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
-    MPI_CHECK(MPI_Allgather(
-        data.data_ptr(),
-        (int)data.numel(),
-        mpiDatatypeOf(data.dtype()),
-        flatOutputTensor.data_ptr(),
-        (int)data.numel(),
+        MPI_CHECK(MPI_Allgather(
+            data.data_ptr(),
+            mpiCount(data.numel(), "MPI allgather"),
+            mpiDatatypeOf(data.dtype()),
+            flatOutputTensor.data_ptr(),
+            mpiCount(data.numel(), "MPI allgather"),
         mpiDatatypeOf(data.dtype()),
         pgComm_));
     for (size_t i = 0; i < outputDataVec.size(); ++i) {
@@ -437,17 +576,20 @@ std::shared_ptr<GlooWork> ProcessGroupMPI::allgather(
   return enqueue(std::move(entry), "mpi:all_gather");
 }
 
-std::shared_ptr<GlooWork> ProcessGroupMPI::all_gather_into_tensor(
+std::shared_ptr<GlooWork> ProcessGroupMPI::all_gather_single(
     Tensor& output,
     Tensor& input,
     std::chrono::milliseconds timeout) {
+  checkSingleTensorHelper(input);
+  checkSingleTensorHelper(output);
   if (output.numel() != input.numel() * (int64_t)size_) {
     runtimeFailure(
         "All gather: output tensor size must equal input tensor size times "
         "the world size");
   }
-  checkSingleTensorHelper(input);
-  checkSingleTensorHelper(output);
+  if (output.dtype() != input.dtype()) {
+    runtimeFailure("Tensors are not equal in data type");
+  }
   (void)timeout;
   std::function<void(WorkEntry&)> runFunc = [this](WorkEntry& entry) {
     auto dstdata = entry.dst[0];
@@ -455,10 +597,10 @@ std::shared_ptr<GlooWork> ProcessGroupMPI::all_gather_into_tensor(
     std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
     MPI_CHECK(MPI_Allgather(
         srcdata.data_ptr(),
-        (int)srcdata.numel(),
+        mpiCount(srcdata.numel(), "MPI allgather"),
         mpiDatatypeOf(srcdata.dtype()),
         dstdata.data_ptr(),
-        (int)srcdata.numel(),
+        mpiCount(srcdata.numel(), "MPI allgather"),
         mpiDatatypeOf(dstdata.dtype()),
         pgComm_));
   };
@@ -466,7 +608,96 @@ std::shared_ptr<GlooWork> ProcessGroupMPI::all_gather_into_tensor(
   auto outputTensors = std::vector<Tensor>({output});
   auto entry = std::make_unique<WorkEntry>(
       &inputTensors, &outputTensors, std::move(runFunc));
-  return enqueue(std::move(entry), "mpi:_allgather_base");
+  return enqueue(std::move(entry), "mpi:all_gather_single");
+}
+
+std::shared_ptr<GlooWork> ProcessGroupMPI::allgather_coalesced(
+    std::vector<std::vector<Tensor>>& outputTensors,
+    std::vector<Tensor>& inputTensors,
+    std::chrono::milliseconds timeout) {
+  (void)outputTensors;
+  (void)inputTensors;
+  (void)timeout;
+  TP_THROW(RuntimeError, "ProcessGroupMPI does not support allgather_coalesced");
+}
+
+std::shared_ptr<GlooWork> ProcessGroupMPI::all_gather_into_tensor(
+    Tensor& output,
+    Tensor& input,
+    std::chrono::milliseconds timeout) {
+  checkSingleTensorHelper(input);
+  checkSingleTensorHelper(output);
+  if (output.numel() != input.numel() * (int64_t)size_) {
+    runtimeFailure(
+        "All gather: output tensor size must equal input tensor size times "
+        "the world size");
+  }
+  if (output.dtype() != input.dtype()) {
+    runtimeFailure("Tensors are not equal in data type");
+  }
+  (void)timeout;
+  std::function<void(WorkEntry&)> runFunc = [this](WorkEntry& entry) {
+    auto dstdata = entry.dst[0];
+    auto srcdata = entry.src[0];
+    std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
+    MPI_CHECK(MPI_Allgather(
+        srcdata.data_ptr(),
+        mpiCount(srcdata.numel(), "MPI allgather"),
+        mpiDatatypeOf(srcdata.dtype()),
+        dstdata.data_ptr(),
+        mpiCount(srcdata.numel(), "MPI allgather"),
+        mpiDatatypeOf(dstdata.dtype()),
+        pgComm_));
+  };
+  auto inputTensors = std::vector<Tensor>({input});
+  auto outputTensors = std::vector<Tensor>({output});
+  auto entry = std::make_unique<WorkEntry>(
+      &inputTensors, &outputTensors, std::move(runFunc));
+  return enqueue(std::move(entry), "mpi:all_gather_into_tensor");
+}
+
+std::shared_ptr<GlooWork> ProcessGroupMPI::gather_single(
+    Tensor& output,
+    Tensor& input,
+    int rootRank,
+    std::chrono::milliseconds timeout) {
+  checkRootRank(rootRank, size_, "Gather");
+  checkSingleTensorHelper(input);
+  if (getRank() == rootRank) {
+    checkSingleTensorHelper(output);
+    if (output.numel() != input.numel() * static_cast<int64_t>(size_)) {
+      runtimeFailure(
+          "Gather: output tensor size must equal input tensor size times "
+          "the world size");
+    }
+    if (output.dtype() != input.dtype()) {
+      runtimeFailure("Tensors are not equal in data type");
+    }
+  }
+  (void)timeout;
+  std::function<void(WorkEntry&)> runFunc =
+      [rootRank, this](WorkEntry& entry) {
+        auto srcdata = entry.src[0];
+        void* recvbuf = nullptr;
+        if (rank_ == rootRank) {
+          recvbuf = entry.dst[0].data_ptr();
+        }
+        std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
+        MPI_CHECK(MPI_Gather(
+            srcdata.data_ptr(),
+            mpiCount(srcdata.numel(), "MPI gather"),
+            mpiDatatypeOf(srcdata.dtype()),
+            recvbuf,
+            mpiCount(srcdata.numel(), "MPI gather"),
+            mpiDatatypeOf(srcdata.dtype()),
+            rootRank,
+            pgComm_));
+      };
+  auto inputTensors = std::vector<Tensor>({input});
+  auto outputTensors = std::vector<Tensor>({output});
+  auto entry = std::make_unique<WorkEntry>(
+      &inputTensors, &outputTensors, std::move(runFunc));
+  return enqueue(std::move(entry), "mpi:gather");
 }
 
 std::shared_ptr<GlooWork> ProcessGroupMPI::gather(
@@ -474,6 +705,7 @@ std::shared_ptr<GlooWork> ProcessGroupMPI::gather(
     std::vector<Tensor>& inputTensors,
     int rootRank,
     std::chrono::milliseconds timeout) {
+  checkRootRank(rootRank, size_, "Gather");
   checkSingleTensor(inputTensors);
   (void)timeout;
 
@@ -506,10 +738,10 @@ std::shared_ptr<GlooWork> ProcessGroupMPI::gather(
         std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
         MPI_CHECK(MPI_Gather(
             data.data_ptr(),
-            (int)data.numel(),
+            mpiCount(data.numel(), "MPI gather"),
             mpiDatatypeOf(data.dtype()),
             recvbuf,
-            (int)data.numel(),
+            mpiCount(data.numel(), "MPI gather"),
             mpiDatatypeOf(data.dtype()),
             rootRank,
             pgComm_));
@@ -539,6 +771,7 @@ std::shared_ptr<GlooWork> ProcessGroupMPI::scatter(
     std::vector<std::vector<Tensor>>& inputTensors,
     int rootRank,
     std::chrono::milliseconds timeout) {
+  checkRootRank(rootRank, size_, "Scatter");
   checkSingleTensor(outputTensors);
   (void)timeout;
 
@@ -575,10 +808,10 @@ std::shared_ptr<GlooWork> ProcessGroupMPI::scatter(
         std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
         MPI_CHECK(MPI_Scatter(
             sendbuf,
-            (int)data.numel(),
+            mpiCount(data.numel(), "MPI scatter"),
             mpiDatatypeOf(data.dtype()),
             data.data_ptr(),
-            (int)data.numel(),
+            mpiCount(data.numel(), "MPI scatter"),
             mpiDatatypeOf(data.dtype()),
             rootRank,
             pgComm_));
@@ -597,7 +830,7 @@ std::shared_ptr<GlooWork> ProcessGroupMPI::scatter(
 std::shared_ptr<GlooWork> ProcessGroupMPI::reduce_scatter(
     std::vector<Tensor>& outputTensors,
     std::vector<std::vector<Tensor>>& inputTensors,
-    int reduceOp,
+    ReduceOp reduceOp,
     std::chrono::milliseconds timeout) {
   checkSingleTensor(outputTensors);
   (void)timeout;
@@ -618,7 +851,9 @@ std::shared_ptr<GlooWork> ProcessGroupMPI::reduce_scatter(
           flatInputTensor.narrow(0, (int64_t)i, 1).reshape(
               entry.src[i].shape()).copy_(entry.src[i]);
         }
-        int recvcount = (int)(flatInputTensor.numel() / (int64_t)size_);
+        int recvcount = mpiCount(
+            flatInputTensor.numel() / (int64_t)size_,
+            "MPI reduce scatter");
 
         std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
         MPI_CHECK(MPI_Reduce_scatter_block(
@@ -638,15 +873,18 @@ std::shared_ptr<GlooWork> ProcessGroupMPI::reduce_scatter(
 std::shared_ptr<GlooWork> ProcessGroupMPI::reduce_scatter_tensor(
     Tensor& output,
     Tensor& input,
-    int reduceOp,
+    ReduceOp reduceOp,
     std::chrono::milliseconds timeout) {
+  checkSingleTensorHelper(output);
+  checkSingleTensorHelper(input);
   if (output.numel() * (int64_t)size_ != input.numel()) {
     runtimeFailure(
         "Reduce scatter: input tensor size must equal output tensor size "
         "times the world size");
   }
-  checkSingleTensorHelper(output);
-  checkSingleTensorHelper(input);
+  if (output.dtype() != input.dtype()) {
+    runtimeFailure("Tensors are not equal in data type");
+  }
   (void)timeout;
   std::function<void(WorkEntry&)> runFunc =
       [reduceOp, this](WorkEntry& entry) {
@@ -656,7 +894,7 @@ std::shared_ptr<GlooWork> ProcessGroupMPI::reduce_scatter_tensor(
         MPI_CHECK(MPI_Reduce_scatter_block(
             srcdata.data_ptr(),
             dstdata.data_ptr(),
-            (int)dstdata.numel(),
+            mpiCount(dstdata.numel(), "MPI reduce scatter"),
             mpiDatatypeOf(srcdata.dtype()),
             mpiOpOf(reduceOp),
             pgComm_));
@@ -666,7 +904,43 @@ std::shared_ptr<GlooWork> ProcessGroupMPI::reduce_scatter_tensor(
   auto outputTensors = std::vector<Tensor>({output});
   auto entry = std::make_unique<WorkEntry>(
       &inputTensors, &outputTensors, std::move(runFunc));
-  return enqueue(std::move(entry), "mpi:_reduce_scatter_base");
+  return enqueue(std::move(entry), "mpi:reduce_scatter_tensor");
+}
+
+std::shared_ptr<GlooWork> ProcessGroupMPI::reduce_scatter_single(
+    Tensor& output,
+    Tensor& input,
+    ReduceOp reduceOp,
+    std::chrono::milliseconds timeout) {
+  if (output.numel() * (int64_t)size_ != input.numel()) {
+    runtimeFailure(
+        "Reduce scatter: input tensor size must equal output tensor size "
+        "times the world size");
+  }
+  checkSingleTensorHelper(output);
+  checkSingleTensorHelper(input);
+  if (output.dtype() != input.dtype()) {
+    runtimeFailure("Tensors are not equal in data type");
+  }
+  (void)timeout;
+  std::function<void(WorkEntry&)> runFunc =
+      [reduceOp, this](WorkEntry& entry) {
+        auto dstdata = entry.dst[0];
+        auto srcdata = entry.src[0];
+        std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
+        MPI_CHECK(MPI_Reduce_scatter_block(
+            srcdata.data_ptr(),
+            dstdata.data_ptr(),
+            mpiCount(dstdata.numel(), "MPI reduce scatter"),
+            mpiDatatypeOf(srcdata.dtype()),
+            mpiOpOf(reduceOp),
+            pgComm_));
+      };
+  auto inputTensors = std::vector<Tensor>({input});
+  auto outputTensors = std::vector<Tensor>({output});
+  auto entry = std::make_unique<WorkEntry>(
+      &inputTensors, &outputTensors, std::move(runFunc));
+  return enqueue(std::move(entry), "mpi:reduce_scatter_single");
 }
 
 std::shared_ptr<GlooWork> ProcessGroupMPI::all_to_all_single(
@@ -677,16 +951,18 @@ std::shared_ptr<GlooWork> ProcessGroupMPI::all_to_all_single(
     std::chrono::milliseconds timeout) {
   checkSingleTensorHelper(inputTensor);
   checkSingleTensorHelper(outputTensor);
+  if (inputTensor.dtype() != outputTensor.dtype()) {
+    runtimeFailure("Tensors are not equal in data type");
+  }
+  if (inputTensor.dim() == 0 || outputTensor.dim() == 0) {
+    runtimeFailure("all_to_all_single requires tensors with a dimension 0");
+  }
   (void)timeout;
 
   if (outputSplitSizes.empty() && inputSplitSizes.empty()) {
-    if (!(outputTensor.numel() == inputTensor.numel() &&
-          outputTensor.dtype() == inputTensor.dtype())) {
+    checkSplitSizes(outputSplitSizes, outputTensor, size_);
+    if (outputTensor.numel() != inputTensor.numel()) {
       runtimeFailure("Tensors are not equal in size or data type");
-    }
-    if (outputTensor.size(0) % size_ != 0) {
-      runtimeFailure(
-          "Tensor's dim 0 does not divide equally across group size");
     }
 
     std::function<void(WorkEntry&)> runFunc = [this](WorkEntry& entry) {
@@ -695,10 +971,10 @@ std::shared_ptr<GlooWork> ProcessGroupMPI::all_to_all_single(
       std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
       MPI_CHECK(MPI_Alltoall(
           srcdata.data_ptr(),
-          (int)(srcdata.numel() / (int64_t)size_),
+          mpiCount(srcdata.numel() / (int64_t)size_, "MPI alltoall"),
           mpiDatatypeOf(srcdata.dtype()),
           dstdata.data_ptr(),
-          (int)(dstdata.numel() / (int64_t)size_),
+          mpiCount(dstdata.numel() / (int64_t)size_, "MPI alltoall"),
           mpiDatatypeOf(dstdata.dtype()),
           pgComm_));
     };
@@ -709,21 +985,8 @@ std::shared_ptr<GlooWork> ProcessGroupMPI::all_to_all_single(
     return enqueue(std::move(entry), "mpi:all_to_all");
   }
 
-  // Variable-size path (alltoallv).
-  if (inputSplitSizes.size() != (size_t)size_ ||
-      outputSplitSizes.size() != (size_t)size_) {
-    runtimeFailure("Number of split sizes must equal group size");
-  }
-  int64_t inSum = 0;
-  for (auto v : inputSplitSizes) inSum += v;
-  if (inSum != inputTensor.size(0)) {
-    runtimeFailure("Split sizes doesn't match total dim 0 size");
-  }
-  int64_t outSum = 0;
-  for (auto v : outputSplitSizes) outSum += v;
-  if (outSum != outputTensor.size(0)) {
-    runtimeFailure("Split sizes doesn't match total dim 0 size");
-  }
+  checkSplitSizes(inputSplitSizes, inputTensor, size_);
+  checkSplitSizes(outputSplitSizes, outputTensor, size_);
 
   std::function<void(WorkEntry&)> runFunc =
       [this, inputSplitSizes, outputSplitSizes](WorkEntry& entry) {
@@ -733,18 +996,18 @@ std::shared_ptr<GlooWork> ProcessGroupMPI::all_to_all_single(
         std::vector<int> recv_lengths(size_);
         std::vector<int> send_offsets(size_);
         std::vector<int> recv_offsets(size_);
-        int64_t send_offset = 0;
-        for (int i = 0; i < size_; ++i) {
-          send_lengths[i] = (int)inputSplitSizes[i];
-          send_offsets[i] = (int)send_offset;
-          send_offset += inputSplitSizes[i];
-        }
-        int64_t recv_offset = 0;
-        for (int i = 0; i < size_; ++i) {
-          recv_lengths[i] = (int)outputSplitSizes[i];
-          recv_offsets[i] = (int)recv_offset;
-          recv_offset += outputSplitSizes[i];
-        }
+        computeLengthsAndOffsets(
+            inputSplitSizes,
+            srcdata,
+            size_,
+            &send_lengths,
+            &send_offsets);
+        computeLengthsAndOffsets(
+            outputSplitSizes,
+            dstdata,
+            size_,
+            &recv_lengths,
+            &recv_offsets);
         std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
         MPI_CHECK(MPI_Alltoallv(
             srcdata.data_ptr(),
@@ -775,6 +1038,14 @@ std::shared_ptr<GlooWork> ProcessGroupMPI::alltoall(
   if ((int64_t)outputTensors.size() != size_) {
     runtimeFailure("Number of output tensors are not equal to group size");
   }
+  for (const auto& tensor : inputTensors) {
+    checkSingleTensorHelper(tensor);
+  }
+  for (const auto& tensor : outputTensors) {
+    checkSingleTensorHelper(tensor);
+  }
+  checkSameDtype(inputTensors[0], inputTensors);
+  checkSameDtype(inputTensors[0], outputTensors);
   std::function<void(WorkEntry&)> runFunc = [this](WorkEntry& entry) {
     std::vector<int> send_lengths(size_);
     std::vector<int> recv_lengths(size_);
@@ -782,14 +1053,12 @@ std::shared_ptr<GlooWork> ProcessGroupMPI::alltoall(
     std::vector<int> recv_offsets(size_);
     auto srcdata = entry.src;
     auto dstdata = entry.dst;
+    computeLengthsAndOffsets(srcdata, &send_lengths, &send_offsets);
+    computeLengthsAndOffsets(dstdata, &recv_lengths, &recv_offsets);
     int64_t src_len = 0;
     int64_t dst_len = 0;
     for (int i = 0; i < size_; ++i) {
-      send_lengths[i] = (int)srcdata[i].numel();
-      send_offsets[i] = (int)src_len;
       src_len += srcdata[i].numel();
-      recv_lengths[i] = (int)dstdata[i].numel();
-      recv_offsets[i] = (int)dst_len;
       dst_len += dstdata[i].numel();
     }
     Tensor srcFlatData = Tensor::empty(
@@ -831,6 +1100,10 @@ std::shared_ptr<GlooWork> ProcessGroupMPI::send(
     std::vector<Tensor>& tensors,
     int dstRank,
     int tag) {
+  checkPeerRank(dstRank, size_, "Send");
+  if (tag < 0) {
+    invalidArgument("Send: tag must be non-negative");
+  }
   checkSingleTensor(tensors);
   auto& tensor = tensors[0];
   MPI_Request request = MPI_REQUEST_NULL;
@@ -838,7 +1111,7 @@ std::shared_ptr<GlooWork> ProcessGroupMPI::send(
     std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
     MPI_CHECK(MPI_Isend(
         tensor.data_ptr(),
-        (int)tensor.numel(),
+        mpiCount(tensor.numel(), "MPI send"),
         mpiDatatypeOf(tensor.dtype()),
         dstRank,
         tag,
@@ -846,13 +1119,17 @@ std::shared_ptr<GlooWork> ProcessGroupMPI::send(
         &request));
   }
   return std::make_shared<AsyncWork>(
-      request, std::vector<Tensor>(), "mpi:send");
+      request, std::vector<Tensor>(), "mpi:send", tensors);
 }
 
 std::shared_ptr<GlooWork> ProcessGroupMPI::recv(
     std::vector<Tensor>& tensors,
     int srcRank,
     int tag) {
+  checkPeerRank(srcRank, size_, "Receive");
+  if (tag < 0) {
+    invalidArgument("Receive: tag must be non-negative");
+  }
   checkSingleTensor(tensors);
   auto& tensor = tensors[0];
   MPI_Request request = MPI_REQUEST_NULL;
@@ -860,19 +1137,22 @@ std::shared_ptr<GlooWork> ProcessGroupMPI::recv(
     std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
     MPI_CHECK(MPI_Irecv(
         tensor.data_ptr(),
-        (int)tensor.numel(),
+        mpiCount(tensor.numel(), "MPI receive"),
         mpiDatatypeOf(tensor.dtype()),
         srcRank,
         tag,
         pgComm_,
         &request));
   }
-  return std::make_shared<AsyncWork>(request, tensors, "mpi:recv");
+  return std::make_shared<AsyncWork>(request, tensors, "mpi:recv", tensors);
 }
 
 std::shared_ptr<GlooWork> ProcessGroupMPI::recvAnysource(
     std::vector<Tensor>& tensors,
     int tag) {
+  if (tag < 0) {
+    invalidArgument("Receive: tag must be non-negative");
+  }
   checkSingleTensor(tensors);
   auto& tensor = tensors[0];
   MPI_Request request = MPI_REQUEST_NULL;
@@ -880,14 +1160,15 @@ std::shared_ptr<GlooWork> ProcessGroupMPI::recvAnysource(
     std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
     MPI_CHECK(MPI_Irecv(
         tensor.data_ptr(),
-        (int)tensor.numel(),
+        mpiCount(tensor.numel(), "MPI receive"),
         mpiDatatypeOf(tensor.dtype()),
         MPI_ANY_SOURCE,
         tag,
         pgComm_,
         &request));
   }
-  return std::make_shared<AsyncWork>(request, tensors, "mpi:recvAnySource");
+  return std::make_shared<AsyncWork>(
+      request, tensors, "mpi:recvAnySource", tensors);
 }
 
 std::shared_ptr<GlooWork> ProcessGroupMPI::barrier(
