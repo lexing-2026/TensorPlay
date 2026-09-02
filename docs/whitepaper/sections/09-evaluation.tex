@@ -1,0 +1,352 @@
+% 09-evaluation.tex
+\section{Evaluation: Readability, Correctness, and Overhead}
+\label{sec:eval}
+
+This chapter evaluates TensorPlay on three axes that a readable framework must earn: how small the core is to read, how precisely it guards correctness when the training loop mutates tensors, and how little it costs when every guard and profiler probe is disabled. All numbers cite \texttt{path:line} and are reproducible with \texttt{grep -rn} on the tree at \path{version.txt:1}.
+
+%======================================================================
+\subsection{Readability (Lines of Core)}
+\label{subsec:eval-readability}
+
+Table~\ref{tab:evalsize} quantifies the ``bone vs.\ flesh'' claim of \S\ref{sec:arch}: the architectural skeleton---object model, dispatcher layering, \texttt{TensorIterator}, autograd \path{Node/Edge/InputBuffer/ReadyQueue/GraphTask} engine---is retained line-for-line, while production axes (op coverage, dispatch depth, dtype$\times$op completeness, sparse/quantized) are trimmed.
+
+\begin{table}[H]
+\centering
+\caption{Core size. TensorPlay intentionally trims production axes. Counts are \texttt{wc -l} on the cited tag; ``core'' is \path{p10+tpx+stax+src/bindings} only, excluding \path{third\_party/}, \path{build/generated/}, and tests.}
+\label{tab:evalsize}
+\small
+\begin{tabular}{lrr}
+\toprule
+Metric & TensorPlay & Broader implementation \\
+\midrule
+C++ core (\path{p10+tpx+stax+bindings}) & $\approx$ 75\,k & hundreds of k (core runtime $>$ 300\,k) \\
+Python surface (\path{tensorplay/}) & $\approx$ 133\,k / 354 files & Larger package surface \\
+Operators (unique \texttt{m.impl}) & 642--673 & 2000+ \\
+\texttt{DispatchKey} cardinality & 13 (\path{DispatchKey.h:48}) & 60+ \\
+Autograd nodes (generated) & 148 (\path{AutogradNodesGenerated.h}) & thousands \\
+Build artifacts & 4 libs: \texttt{libp10}, \texttt{libtpx}, \texttt{libstax}, \texttt{\_C} & dozens \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Concretely: \path{p10/include/TensorImpl.h:43} holds \path{shared\_ptr<AutogradMetaBase>} to decouple \texttt{p10} from \texttt{tpx}; \path{tpx/include/Node.h:26} defines \texttt{Node} as \path{enable\_shared\_from\_this} with \path{vector<Edge> next\_edges\_:150}; \path{p10/include/Dispatcher.h:49} defines \texttt{DispatchTable} as \path{array<atomic<KernelFunction>,kDispatchKeyCount>}; \path{p10/src/TensorIterator.cpp:1077} implements the seven-step \texttt{TensorIterator}. A newcomer can read the dispatcher in one file (\path{Dispatcher.h:214}), the key set in one file (\path{DispatchKey.h:189}), and the engine queue in one file (\path{Engine.h:137}). These concentrated definitions keep the core easy to inspect.
+
+\begin{table}[H]
+\centering
+\caption{Where the 75\,k lines live. Generated files are excluded; see \path{CMakeLists.txt:308} for staging.}
+\label{tab:corebreakdown}
+\small
+\begin{tabular}{llr}
+\toprule
+Component & Representative files & Approx.\ lines \\
+\midrule
+\texttt{p10} object model & \texttt{Tensor.h}, \path{TensorImpl.h:43}, \texttt{StorageImpl.h}, \path{VariableVersion.h:13} & $\sim$18\,k \\
+\texttt{p10} dispatcher & \path{Dispatcher.h:49}, \path{DispatchKey.h:15}, \path{Dispatcher.cpp:14} & $\sim$1.5\,k \\
+\texttt{p10} kernels & \path{src/backend/cpu/*.cpp} (32 \texttt{.cu} counterparts) & $\sim$35\,k \\
+\texttt{tpx} autograd engine & \path{Node.h:26}, \path{Edge.h:14}, \path{Engine.h:23}, \path{Engine.cpp:621} & $\sim$6\,k \\
+\texttt{stax} + compiler & \path{stax/}, \path{tools/codegen/} & $\sim$8\,k \\
+Bindings & \path{src/bindings/python/}, \path{gen\_python\_c.py:944} & $\sim$7\,k \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The size gap is not a virtue in itself; it is the budget that buys readability. Every indirection that remains is load-bearing and has a single definition site.
+
+%======================================================================
+\subsection{Operator Census and Dispatch Depth}
+\label{subsec:eval-opcount}
+
+The funnel audit of \path{docs/gap\_analysis.md} \S8 uses three counts: dispatcher registrations (\texttt{m.impl}), YAML schemas (\path{config/native\_functions.yaml:1} with 479 distinct names / 2\,809 records), and Python-visible surface (\path{tensorplay/\_C/\_\_init\_\_.pyi} with 275 functions + 184 methods). The three-way comparison is the only way to distinguish ``kernel exists but unreachable'' from ``Python reachable but no kernel''.
+
+\begin{table}[H]
+\centering
+\caption{Operator census (\path{docs/gap\_analysis.md} \S8, late 2026-08-24).}
+\label{tab:opcount}
+\small
+\begin{tabular}{lll}
+\toprule
+Layer & TensorPlay & Vendor baseline \\
+\midrule
+Registered kernels (\texttt{m.impl} dedup) & 673 (CPU 671, CUDA 587) & 2000+ distinct ops \\
+YAML schemas & 479 names / 618 active & 2000+ (with overloads) \\
+Backward formulas (\path{derivatives.yaml:1}) & 187 formulas $\rightarrow$ 148 nodes & thousands \\
+Python \texttt{\_C} surface & $\sim$550 (\texttt{gen\_python\_c.py}) & $\sim$1500 \\
+Coverage focus & pointwise, reduction, matmul, conv/pool (24 conv ops), linalg 26, \texttt{foreach} $\sim$100 & full domain \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The delta is deliberate. TensorPlay covers the dense tensor loop that a convolution classifier or a transformer pre-training step exercises, plus the composite fallbacks that make the remainder runnable: \path{p10/src/backend/composite/TensorProperties.cpp:32} (\path{TensorPropertiesComposite}), \path{Histogram.cpp:63}, \path{Unique.cpp:119}, \path{Itertools.cpp:49}, \path{Integration.cpp:24}. Each composite is a single \path{TENSORPLAY\_LIBRARY\_IMPL(Composite,\dots)} registration at \path{Dispatcher.h:203} that serves every backend until a native kernel overrides it via \path{OperatorHandle::getKernel:67} fallback to \texttt{Composite} (\path{Dispatcher.h:75}).
+
+Missing families are documented, not hidden. \path{docs/gap\_analysis.md} \S10.1 lists dropout (now wired via \texttt{native\_dropout}), \texttt{resize\_}/\texttt{resize\_as\_}, \texttt{cross\_entropy}/\texttt{ctc\_loss}, \path{max\_pool1d/3d}, \texttt{rms\_norm}, \texttt{scatter\_reduce}/\texttt{index\_reduce}, quantized and long-tail sparse ops. Each shipped as ``kernel exists, YAML missing'' (class~A) or ``three layers missing'' (class~D) so a contributor can close one overload with one YAML edit and one rebuild.
+
+%======================================================================
+\subsection{DispatchKey: 13 vs.\ 60+}
+\label{subsec:eval-dispatchkey}
+
+\begin{table}[H]
+\centering
+\caption{\texttt{DispatchKey} enumeration at \path{p10/include/DispatchKey.h:15}--\texttt{48}. Sentinel \texttt{EndOfKeys=13} is spelled out so the table size is a compile-time constant.}
+\label{tab:dispatchkey}
+\small
+\begin{tabular}{lll}
+\toprule
+Key & Value & Role \\
+\midrule
+\texttt{CPU} & 0 & Dense backend (\path{kBackendKeyCount=3:51}) \\
+\texttt{CUDA} & 1 & Dense backend \\
+\texttt{Vulkan} & 2 & Dense backend, reserved \\
+\texttt{AutogradCPU} & 3 & \texttt{toAutogradKey(CPU)} = CPU + 3 (\path{DispatchKey.h:60}) \\
+\texttt{AutogradCUDA} & 4 & Autograd over CUDA \\
+\texttt{AutogradVulkan} & 5 & Autograd over Vulkan \\
+\texttt{AutocastCPU} & 6 & \texttt{toAutocastKey(CPU)} = CPU + 6 (\path{DispatchKey.h:56}) \\
+\texttt{AutocastCUDA} & 7 & Autocast over CUDA \\
+\texttt{AutocastVulkan} & 8 & Autocast over Vulkan \\
+\texttt{VmapCPU} & 9 & \texttt{toVmapKey(CPU)} = CPU + 9 (\path{DispatchKey.h:64}), outranks autograd \\
+\texttt{VmapCUDA} & 10 & Vmap over CUDA \\
+\texttt{VmapVulkan} & 11 & Vmap over Vulkan \\
+\texttt{Composite} & 12 & Backend-neutral fallback (\path{Dispatcher.h:75}) \\
+\texttt{EndOfKeys} & 13 & Sentinel (\path{DispatchKey.h:48}), \path{kDispatchKeyCount=13:40} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\texttt{DispatchTable} at \path{p10/include/Dispatcher.h:49} is therefore \path{array<atomic<KernelFunction>,13>} with each slot relaxed-initialized to \texttt{nullptr} and published with \path{memory\_order\_release} (\path{Dispatcher.cpp:14}). \texttt{DispatchKeySet} at \path{DispatchKey.h:125} is a \texttt{uint32\_t} bitset over the 13 keys; \path{highest\_priority\_key:151} scans the mask for the numerically largest bit, so priority is \path{Vmap $>$ Autocast $>$ Autograd $>$ backend}. Helpers \path{remove\_autograd:160}, \path{remove\_autocast:169}, \path{remove\_vmap:177} clear one axis at a time, used by redispatch below each layer.
+
+TensorPlay keeps a compact set of dispatch keys and leaves specialized axes outside the core table. There is no \texttt{Meta} key or open registration API: \path{Dispatcher::registerKernel:14} is a closed \path{unordered\_map<string,DispatchTable>} guarded by one mutex, and \path{TENSORPLAY\_LIBRARY\_IMPL:203} expands to a process-lifetime static constructor. The cost is that shape-only inference, sparse dispatch, and quantized dispatch have no dedicated fast path; they either share the \texttt{Composite} fallback or are explicitly unsupported, which \path{docs/gap\_analysis.md} \S10 records.
+
+\begin{lstlisting}[caption={\path{Dispatcher.h:67} --- \texttt{Composite} fallthrough in the hot path.}, label=lst:composite]
+KernelFunction getKernel(DispatchKey key) const noexcept {
+  auto k = table_->kernels[dispatchKeyIndex(key)].load(acquire);
+  if (!k && is_backend_key(key)) {                          // Dispatcher.h:75
+    constexpr auto kCompositeIdx = dispatchKeyIndex(Composite);
+    k = table_->kernels[kCompositeIdx].load(acquire);       // one extra load
+  }
+  return k;
+}
+\end{lstlisting}
+
+%======================================================================
+\subsection{Autograd Nodes: 148 Generated, Explicit DAG, No Tape}
+\label{subsec:eval-autograd-nodes}
+
+\path{tools/codegen/gen\_autograd.py:785} parses \path{config/derivatives.yaml:1} (345 raw records collapsing to 187 formulas after grouping) through an expression AST and emits \path{build/generated/tensorplay/ops/AutogradNodesGenerated.h} with 148 node structs. Each node stores saved forward tensors as \texttt{tpx::SavedVariable} (\path{tpx/include/SavedVariable.h:15}) where the formula needs them and synthesizes \texttt{apply} from the same AST that decided the save set, so the save list, constructor, and \texttt{apply} cannot drift. Handwritten nodes that formulas cannot express (\path{cat/stack/roll}) live in \path{tpx/include/ManualNodes.h:1200} and follow the same \texttt{SavedVariable} contract.
+
+There is no Tape. \path{grep -rn Tape tpx/} returns zero. The graph is the transitive closure of \path{Node::next\_edges\_:150} where each \texttt{Edge} (\path{tpx/include/Edge.h:14}) carries only hints (\path{shape\_hint:21}, \texttt{grad\_dtype:27}, \path{device\_type\_hint:33}) so backward can \texttt{ops::zeros} a missing gradient without touching the forward tensor. \texttt{GraphTask} (\path{tpx/include/GraphTask.h:22}) holds \path{unordered\_map<Node*,int> dependencies\_:44} built once by \path{Engine::compute\_dependencies:192}, \path{unordered\_map<Node*,InputBuffer> not\_ready\_:43} keyed by raw \texttt{Node*}, and \path{vector<Tensor> captured\_vars\_:50} for \texttt{grad()} outputs. \texttt{ReadyQueue} (\path{tpx/include/Engine.h:23}) is a max-heap ordered by \path{Node::sequence\_nr\_:151} assigned from \path{thread\_local counter:35} at \path{Node.h:50}; \path{ReadyQueue::NodeTask::operator<:37} pops the largest sequence number first, approximating reverse creation order, while real topological order is enforced by the dependency counter at \path{Engine.cpp:535}. The per-node interpreter at \path{tpx/src/Engine.cpp:333} executes ten steps---\path{GradModeGuard:339}, \texttt{ExecInfo} capture (\path{Engine.h:30}), missing-grad materialization (\path{Engine.cpp:392}), pre-hooks, \path{CurrentEvalNodeGuard:432}, \texttt{apply}, post-hooks, \path{sum\_to\_shape:298}, dtype cast (\path{Engine.cpp:495}), NaN probe (\path{Engine.cpp:141})---then propagates to parents under \path{GraphTask::mutex\_:53} at \path{Engine.cpp:532}.
+
+The memory/performance trade-off is explicit: every \texttt{Edge} holds \texttt{shared\_ptr<Node>} and every \texttt{InputBuffer} holds \texttt{vector<Tensor>}, so one \texttt{shared\_ptr} per node plus one allocation per distinct input slot. The vendor runtime uses \texttt{intrusive\_ptr} to shave the control block. TensorPlay keeps the standard-library pointer so students can follow ownership with ordinary tooling; the appendix of \path{docs/gap\_analysis.md} \S10.2 notes the cost and leaves it as a teaching decision.
+
+%======================================================================
+\subsection{Correctness Guards}
+\label{subsec:eval-guards}
+
+Four guards turn silent wrong gradients or silent cross-device copies into loud failures or into shape-correct grads. Table~\ref{tab:guards} summarizes them; the remainder of the subsection cites the exact check.
+
+\begin{table}[H]
+\centering
+\caption{Correctness guards: what they catch, where they live, and how they are verified.}
+\label{tab:guards}
+\small
+\begin{tabular}{llll}
+\toprule
+Guard & Header & Check & Failure mode \\
+\midrule
+Version & \path{SavedVariable.h:15} & \path{unpack:18} compares \texttt{current} vs.\ \texttt{saved\_version\_} & \texttt{RuntimeError} with both versions \\
+Shape & \path{Engine.cpp:298} & \path{sum\_to\_shape:318} reduces broadcast dims & No crash; grad reshaped to \texttt{Edge.shape\_hint} \\
+Dtype & \path{Engine.cpp:495} & \texttt{grad\_dtype} hint cast via \path{tpx::to:501} & Grad cast to forward dtype \\
+Device & \path{Exception.h:43} & \texttt{DeviceMismatchError} in \path{Tensor.cpp:96} & Distinct Python exception \\
+Anomaly & \path{AnomalyMode.h:14} & \path{store\_stack:39} + \texttt{parent\_:46} + \path{t.ne(t).any():141} & Forward stack + backward chain \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Version guard: \texttt{SavedVariable} (\path{tpx/include/SavedVariable.h:15}, \path{tpx/src/SavedVariable.cpp:8})}
+
+Forward tensors needed by backward are not stored bare. \path{SavedVariable::save:8} copies \path{tensor.unsafeGetTensorImpl()->version():15} into \path{saved\_version\_:40}; \texttt{unpack:18} reloads \path{data\_.unsafeGetTensorImpl()->version():20} and throws
+
+\begin{lstlisting}[caption={\path{SavedVariable.cpp:22} --- version mismatch is loud.}, label=lst:savedvar]
+TP_THROW(RuntimeError,
+  "one of the variables needed for gradient computation has been modified "
+  "by an inplace operation: [saved version: " + to_string(saved_version_) +
+  "; current version: " + to_string(current) + "]");
+\end{lstlisting}
+
+The message spells both versions, matching the vendor diagnostic. \texttt{VariableVersion} at \path{p10/include/VariableVersion.h:13} is an \path{atomic<uint32\_t> version\_:13} bumped by \texttt{bump():44} on every in-place op after codegen at \path{tools/codegen/gen\_api.py:456} (\texttt{bump\_version()} guarded by \path{!InferenceMode::is\_enabled()}), and shared eagerly between a base and its views via \path{share\_version\_counter:289} so that mutating a view bumps the base's counter as well. Generated nodes at \path{gen\_autograd.py:785} store each \texttt{Tensor} member as \texttt{SavedVariable} and emit \texttt{\{m\}\_.unpack()} at the top of \texttt{apply}; handwritten nodes in \path{ManualNodes.h:1200} do the same. \path{Node::release\_variables:105} clears \path{SavedVariable::reset\_data:31} when \path{GraphTask::keep\_graph\_==false}.
+
+\subsubsection{Shape and dtype guard: \texttt{sum\_to\_shape} (\path{tpx/src/Engine.cpp:298}) and \texttt{Edge} hints (\path{Edge.h:21})}
+
+Broadcast during forward inflates a scalar grad to the output shape. Before the next edge consumes it the engine reduces it at \path{Engine.cpp:463}:
+
+\begin{lstlisting}[caption={\path{Engine.cpp:298} --- broadcast recovery.}, label=lst:sumtoshape]
+static Tensor sum_to_shape(const Tensor& grad, const vector<int64_t>& target){
+  if(target.empty()) return ops::sum(grad);                 // scalar ()
+  int64_t leading = (int64_t)grad.dim() - (int64_t)target.size();
+  if(leading < 0){ /* reshape up when numel matches, else passthrough */ }
+  vector<int64_t> reduce; for(int64_t i=0;i<leading;++i) reduce.push_back(i);
+  for(int64_t i=leading;i<(int64_t)grad.dim();++i)
+    if(target[i-leading]==1 && grad.size(i)!=1) reduce.push_back(i);
+  Tensor cur = reduce.empty()? grad : ops::sum(grad,reduce,true);
+  if(leading>0) cur = ops::reshape(cur,target); return cur;
+}
+\end{lstlisting}
+
+The recorded shape comes from \path{Edge::shape\_hint:21} with \texttt{has\_shape\_hint:21} distinguishing \texttt{()} from ``no hint'', and the dtype comes from \path{Edge::grad\_dtype:27}. At \path{Engine.cpp:495} a floating-point grad whose dtype disagrees with the hint is cast back via \path{tpx::to:501} (the autocast case at \path{Edge.h:27}: an \texttt{fp32} grad re-entering a low-precision backward). Both ops run under the per-node \path{GradModeGuard:339} so second-order grads still build a graph when \texttt{create\_graph} is true.
+
+\subsubsection{Device guard: \texttt{DeviceMismatchError} (\path{p10/include/Exception.h:43})}
+
+\texttt{DispatchKeySet} omits \texttt{Autograd} for inference tensors: \texttt{TensorImpl} at \path{p10/include/TensorImpl.h:34} initializes \path{VariableVersion(!InferenceMode::is\_enabled())}, so inference tensors get a disabled counter and never acquire an autograd key. Mismatched devices are not silently copied; they throw a distinct Python type:
+
+\begin{lstlisting}[caption={\path{Exception.h:43} --- distinct exception for device mismatch.}, label=lst:devicemismatch]
+class P10_API DeviceMismatchError : public RuntimeError { using RuntimeError::RuntimeError; };
+\end{lstlisting}
+
+The throw site at \path{p10/src/Tensor.cpp:96} fires on device disagreement in element-wise and matmul entry points, and at \path{TensorIterator.cpp:409} for reduction iterators. Because \texttt{DeviceMismatchError} derives from \texttt{RuntimeError} it is an \texttt{Exception} with \texttt{SourceLocation} and an optional C++ stack, but Python can catch it separately from other runtime errors. The vendor bridges the same signal via \path{c10::DeviceMismatchError}; TensorPlay keeps a parallel hierarchy so \path{except DeviceMismatchError} works without importing the vendor tree.
+
+\subsubsection{Anomaly guard: \texttt{AnomalyMode} (\path{tpx/include/AnomalyMode.h:14}, \path{tpx/src/AnomalyMode.cpp:20})}
+
+\path{AnomalyMode::set\_enabled(true)} at \path{src/bindings/python/Autograd.cpp:475} sets two globals (\path{AnomalyMode.cpp:9}) visible to every thread: \path{\_enabled:24} and \texttt{\_check\_nan:24}. On node creation \path{Node::init\_anomaly\_metadata:132} calls \texttt{store\_stack:39} (C++ frames via \texttt{get\_stacktrace} by default; the Python binding installs \path{traceback.format\_stack} under the GIL at \path{Autograd.cpp:487}) and, if \path{tls\_current\_evaluating\_node:20} is set, \texttt{assign\_parent:42}. During backward \path{evaluate\_function:432} pushes the evaluating node onto \path{tls\_current\_evaluating\_node} via \path{CurrentEvalNodeGuard:57}, so any node created inside that \texttt{apply} records its parent. On exception the engine prints the forward stack chain at \path{AnomalyMode.cpp:46} before rethrowing. The NaN probe at \path{Engine.cpp:139} is
+
+\begin{lstlisting}[caption={\path{Engine.cpp:139} --- NaN probe.}, label=lst:nanprobe]
+bool tensor_has_nan(const Tensor& t){
+  if(!t.defined() || !isFloatingOrComplexType(t.dtype())) return false;
+  return t.ne(t).any().item<bool>(); // ieee NaN != NaN via dispatch
+}
+\end{lstlisting}
+
+gated on \path{AnomalyMode::should\_check\_nan:17} and run under \path{GradModeGuard(false)} so the probe itself never records history. \path{AnomalyMode::print\_stack:46} walks \path{AnomalyMetadata::parent\_:46} (\texttt{weak\_ptr<Node>}) printing ``Previous calculation was induced by...'' per parent until expiration, so a \texttt{create\_graph} failure shows the forward site that induced the backward node that failed.
+
+%======================================================================
+\subsection{Overhead When Disabled}
+\label{subsec:eval-overhead}
+
+Readable frameworks are judged by what they cost when the developer is not looking. Three hot paths sit on every op: the profiler gate, the autograd-mode gate, and the dispatch-key computation. All three are designed to be predicted not-taken or to be a pair of branches.
+
+\begin{table}[H]
+\centering
+\caption{Disabled overhead budget. Measured on a quiet host, mid-range x86, single thread; profiler numbers from \path{tools/bench\_profiler\_overhead.py}.}
+\label{tab:overhead}
+\small
+\begin{tabular}{llll}
+\toprule
+Gate & Instruction & Cost (disabled) & Site \\
+\midrule
+Profiler & \path{g\_active.load(acquire)} + not-taken branch & $\approx$ 2 cycles & \path{Profiler.h:129}, \path{Profiler.cpp:300} \\
+\texttt{GradMode} & \texttt{thread\_local bool} load + not-taken branch & $\approx$ 1 cycle & \path{GradMode.h:17}, \path{GradMode.cpp:5} \\
+\texttt{InferenceMode} & \texttt{thread\_local bool} load + not-taken branch & $\approx$ 1 cycle & \path{InferenceMode.h:17}, \path{InferenceMode.cpp:5} \\
+Dispatcher & 2 branches (autocast + composite) & $\approx$ 2 branches & \path{Dispatcher.h:144}, \path{Dispatcher.h:75} \\
+Autograd key & \texttt{GradMode}$\land$\texttt{InferenceMode}$\land$\texttt{requires\_grad} & 3 loads, short-circuit & \path{gen\_tpx.py:234} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Profiler: 2 cycles (\path{p10/include/Profiler.h:129}, \path{p10/src/Profiler.cpp:300})}
+
+\path{OpRecord::begin:300} is one \path{memory\_order\_acquire} load of \path{g\_active:129} inlined to a \texttt{mov} + \texttt{cmp} + predicted not-taken branch on x86. Shape and site capture each add one further \texttt{acquire} load, but they sit strictly inside the \texttt{g\_active} true-branch at \path{gen\_api.py:335} and \path{Profiler.cpp:297}, so they add zero cycles when disabled. The binding at \path{src/bindings/python/init.cpp:521} stores \path{g\_gpu\_timing:241} / \path{g\_capture\_shapes:131} / \path{g\_capture\_sites:133} with \texttt{release} before the first op, so a CPU-only session never arms \texttt{GpuTimerPair} (\path{ProfilerGpu.cpp:143} early-return). Measured baseline overhead is $\sim$0.6\,ns at 3.5\,GHz for one load; see \S\ref{sec:profiler} Table~\ref{tab:profoverhead} for the enabled costs (30\,ns CPU, 80--120\,ns with shapes, two \texttt{cudaEventRecord} at $\sim$5\,\textmu s).
+
+\subsubsection{\texttt{GradMode} / \texttt{InferenceMode}: \texttt{thread\_local} (\path{p10/include/GradMode.h:17}, \path{p10/src/GradMode.cpp:5})}
+
+\path{GradMode::enabled\_:17} and \path{InferenceMode::enabled\_:17} are \texttt{thread\_local bool} with definitions at \path{GradMode.cpp:5} (\texttt{=true}) and \path{InferenceMode.cpp:5} (\texttt{=false}). Every generated \texttt{tpx::ops::} wrapper at \path{tools/codegen/gen\_tpx.py:234} computes \texttt{requires\_grad} as \path{GradMode::is\_enabled() \&\& !InferenceMode::is\_enabled() \&\& any\_input\_requires\_grad}, three inlined loads with short-circuit. Worker threads in \path{tpx/src/Engine.cpp:333} honor the task's \texttt{create\_graph} via \path{GradModeGuard:339} that overwrites TLS for the duration of \texttt{evaluate\_function}, so disabled cost is exactly the TLS load the engine would have paid anyway. Inference tensors additionally skip version-counter allocation at \path{TensorImpl.h:34}.
+
+\subsubsection{Dispatcher: 2 branches (\path{p10/include/Dispatcher.h:144}, \path{p10/include/Dispatcher.h:75})}
+
+\path{DispatchStub::call:139} consults the chosen key at \path{Dispatcher.h:144}:
+
+\begin{lstlisting}[caption={\path{Dispatcher.h:144} --- autocast exclusion is one predicted branch.}, label=lst:dispbranch]
+if (is_autocast_key(key) && !autocast::is_enabled(key)) [[unlikely]]
+  TP_THROW(NotImplementedError, ...);   // Dispatcher.h:144
+auto kernel_void = handle.getKernel(key); // Dispatcher.h:148 -> 67
+if (!kernel_void) TP_THROW(NotImplementedError, ...);
+\end{lstlisting}
+
+\path{OperatorHandle::getKernel:67} does the second branch: one \texttt{acquire} load of the indexed slot plus, only when \path{is\_backend\_key(key)} and the slot is \texttt{nullptr}, one extra \texttt{acquire} load of the \texttt{Composite} slot. For any op with a native kernel the composite load is not taken. Codegen at \path{gen\_api.py:400} hoists \path{static const OperatorHandle} so \texttt{findHandle} is resolved once per process.
+
+On top of hot-path gates, two build-time choices amortize cold cost. \path{CMakeLists.txt:1106} builds \texttt{\_C} with \texttt{UNITY\_BUILD ON} so the 9\,300-line \path{TensorCPythonGenerated.h} plus binding units are compiled as a single translation unit. \texttt{p10} deliberately opts out of unity (kernel TUs must remain separate for \path{TENSORPLAY\_LIBRARY\_IMPL} static registration). The Python extension \texttt{tp\_python} at \path{CMakeLists.txt:390} is a thin shim that re-exports the real symbols, keeping import time dominated by \texttt{dlopen} rather than Python overhead.
+
+The explicit DAG's teaching trade-off is one \texttt{shared\_ptr} per node versus \texttt{intrusive\_ptr}. The vendor tree uses intrusive reference counting to avoid a separate control block per node; TensorPlay keeps the standard control block so ownership is observable in \texttt{gdb} and \texttt{valgrind} without custom pretty-printers. Sustained throughput therefore sees a constant-factor overhead in backward node allocation that is independent of tensor size and invisible on large matmuls where kernel time dominates.
+
+%======================================================================
+\subsection{What Is Trimmed}
+\label{subsec:eval-trimmed}
+
+Table~\ref{tab:trimmed} enumerates the axes that TensorPlay cuts and what takes their place. Each cut is a one-line predicate in code or a single \texttt{Composite} registration, never a silent semantic change.
+
+\begin{table}[H]
+\centering
+\caption{Trimmed axes. Every entry is a deliberate omission with a fallback or a documented gap.}
+\label{tab:trimmed}
+\small
+\begin{tabular}{lll}
+\toprule
+Axis & What ships & What is trimmed \\
+\midrule
+Dispatch keys & 13 keys, \texttt{Composite} fallback & No third-party key registration, no runtime key creation \\
+\texttt{Meta} dispatch & None & No shape-only kernel; shape inference lives in \texttt{stax} \\
+Sparse / quantized & COO minimal (\path{SparseState:15}), no quantized op & No sparse dispatch key, no quantized matmul \\
+Inplace alias analysis & \texttt{check\_inplace} on \texttt{is\_view\_fn\_} & No multi-version alias tracker \\
+Compiler & Vertical pointwise fusion only (\texttt{stax}) & No loop codegen, no buffer planning, no autotune \\
+Distributed autograd & Collectives via \path{distributed\_c10d.py} & No distributed autograd, no RPC autograd \\
+Forward AD & \texttt{ForwardKernels} 15 fused kernels & No per-level \texttt{ForwardADLevel} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{itemize}[leftmargin=1.2em]
+\item \textbf{No third-party keys.} \path{Dispatcher::registerKernel:14} is closed; there is no \texttt{registerDispatchKey} and no per-operator stack of boxed kernels. Extension authors add ops by editing \path{native\_functions.yaml:1} and rebuilding, not by injecting a key at import time. The benefit is that \texttt{findHandle} is one atomic load, not a vector walk.
+\item \textbf{No meta dispatch.} The vendor \texttt{Meta} key runs kernels that only compute output shapes and dtypes. TensorPlay never dispatches meta kernels; shape propagation for \texttt{stax} is ordinary Python in \path{tensorplay/\_stax/} with \texttt{ShapeProp} and \path{DCE/ConstFold}. The dispatcher therefore has no \texttt{Meta} slot and no ``meta-tensor'' concept.
+\item \textbf{No sparse/quantized axes.} \path{p10/include/SparseState.h:15} stores layout as \texttt{0=COO, 1=CSR} plus \path{crow/col} for CSR, and \path{TensorImpl::SparseState} is a minimal payload, not a dispatch axis. Quantized affine int8 lives in \path{tensorplay/quantization} as a Python FakeQuantize STE, not as a dtype$\times$key dispatch. There is no \texttt{SparseCPU} or \texttt{QuantizedCPU} key.
+\item \textbf{Teaching compiler.} Fusion is exactly one pattern---\texttt{mul}$\rightarrow$\texttt{add}---plus pointwise expression programs with CPU vectorization (\path{stax/}). \texttt{Graph::execute} interprets sequentially with lifetime回收; there is no codegen to loops or to CUDA, no buffer reuse planning, and no performance model. The appendix of \path{docs/gap\_analysis.md} \S10.4 notes this as ``concept demonstration, not Inductor.''
+\item \textbf{Composite fallbacks.} The trimmed axes are not cliffs: 24+ composite registrations at \path{p10/src/backend/composite/} (view/copy, histogram, unique, itertools, integration, tensor properties) serve as the neutral kernel when a backend slot is empty. Adding a native kernel is one YAML edit; the verification in \S\ref{subsec:eval-verify} shows how to confirm the fallback was replaced.
+\end{itemize}
+
+%======================================================================
+\subsection{Gap Analysis and Roadmap}
+\label{subsec:eval-gap}
+
+\path{docs/gap\_analysis.md} is the living ledger of the cuts above. It is organized as a three-funnel audit (dispatcher $\cap$ YAML $\cap$ Python surface) with dated sections that a reviewer can diff:
+
+\begin{itemize}[leftmargin=1.2em]
+\item \S8 (2026-08-22): three-layer census classifying 254 ``kernel exists, YAML missing'' ops (upsample family, RNN fused, loss native, im2col/col2im, conv\_transpose1d) and 39 ``YAML $\rightarrow$ no m.impl'' overload mismatches.
+\item \S10 (2026-08-23): full C++ core vs.\ runtime comparison, closing \texttt{\_InferenceMode} binding, \texttt{SavedVariable} migration, \texttt{resize\_}/\texttt{native\_dropout}, and \texttt{MemoryFormat} enum.
+\item \S``CUDA complement'' (2026-08-24): CPU vs.\ CUDA delta of 65 ops, fixing fused RNN, wiring chunk/split/unbind/arange/linspace/RNG/norm/constant\_pad\_nd.
+\item \S``All-stack audit'' (2026-08-24): ABI alignment (\texttt{ScalarType?}/\texttt{Device?} vs.\ bare \path{DType/Device}), \texttt{METH\_FASTCALL} guard, \texttt{scatter} index decode, \texttt{nansum(dim=[])}, \texttt{sum.dim}/\texttt{mean} derivatives, bitwise family.
+\end{itemize}
+
+The roadmap comments in that file prioritize by teaching value: (i) finish YAML wiring for class~A ops (single-line changes), (ii) derivatives for \path{select\_scatter/slice\_scatter/diagonal\_scatter}, (iii) \path{quantile/nanquantile/histogram/cdist}, (iv) \texttt{grid\_sampler} 2D/3D backward, (v) clean \texttt{\_foreach\_out} dead registrations. Each step is gated on ``ninja -C build \_C'' freshness and on a single-rank NCCL smoke at \path{test/test\_distributed.py}, as the document notes.
+
+%======================================================================
+\subsection{Verification: From Claim to \texttt{grep}}
+\label{subsec:eval-verify}
+
+Every table entry above is one command away. The project enforces this by citing \texttt{path:line} rather than prose.
+
+\begin{lstlisting}[caption={Reproducing the evaluation numbers.}, label=lst:evalverify, style=pystyle]
+# core size and key count
+grep -n "enum class DispatchKey" p10/include/DispatchKey.h -A 18  # :15, EndOfKeys=13:48
+grep -n "kDispatchKeyCount\|kBackendKeyCount\|kVmapKeyOffset" p10/include/DispatchKey.h p10/include/Dispatcher.h
+wc -l p10/include/Dispatcher.h p10/include/DispatchKey.h p10/include/Profiler.h tpx/include/Node.h
+
+# operator census
+grep -rn "TENSORPLAY_LIBRARY_IMPL" p10/src --include="*.cpp" | wc -l   # m.impl ~673
+grep -c "^- func:" config/native_functions.yaml             # 2809 raw, 479 distinct
+grep -c "^- name:" config/derivatives.yaml                  # 345 raw, 187 formulas
+grep -c "struct.*Backward" build/generated/tensorplay/ops/AutogradNodesGenerated.h  # 148
+
+# correctness guards
+grep -n "class SavedVariable" tpx/include/SavedVariable.h          # :15
+grep -n "saved version" tpx/src/SavedVariable.cpp                  # :22
+grep -n "sum_to_shape" tpx/src/Engine.cpp                           # :298, :488
+grep -n "class DeviceMismatchError" p10/include/Exception.h        # :43
+grep -n "class AnomalyMode\|should_check_nan\|t.ne" tpx/include/AnomalyMode.h tpx/src/Engine.cpp
+
+# overhead when disabled
+grep -n "g_active.load\|g_capture_shapes.load" p10/src/Profiler.cpp p10/include/Profiler.h tools/codegen/gen_api.py
+grep -n "thread_local bool GradMode::enabled_" p10/src/GradMode.cpp   # :5
+grep -n "is_autocast_key.*is_enabled\|Composite" p10/include/Dispatcher.h  # :144, :75
+
+# trimmed axes and gap ledger
+grep -n "TENSORPLAY_LIBRARY_IMPL(Composite" p10/src/backend/composite/*.cpp
+cat docs/gap_analysis.md | head -n 80
+ls -lh tensorplay/lib/libp10.so tensorplay/lib/libtpx.so tensorplay/_C/*.so  # mtime freshness
+\end{lstlisting}
+
+The LaTeX sources in \path{docs/whitepaper/} compile on stock TeX Live \texttt{pdflatex} or \texttt{xelatex} via \path{latexmk -pdf main.tex} with no external assets; all figures are TikZ. The white paper therefore satisfies the same reproducibility contract as the code: every structural claim is a \texttt{path:line}, every number is a \texttt{wc -l} or a \texttt{grep -c}, and every omission is an entry in \path{docs/gap\_analysis.md} rather than an undeclared assumption.

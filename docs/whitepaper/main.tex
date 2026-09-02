@@ -1,0 +1,227 @@
+% TensorPlay White Paper --- Industry Highest Standard, Publishable LaTeX
+% Engine: pdflatex or xelatex (TeX Live on Windows E:\texlive)
+% Compile: latexmk -pdf main.tex  OR  pdflatex main.tex; bibtex main; pdflatex main.tex; pdflatex main.tex
+\documentclass[11pt,a4paper,oneside]{article}
+
+% ---------- Geometry & Typography ----------
+\usepackage[margin=2.45cm, top=2.8cm, bottom=2.8cm]{geometry}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{textcomp}
+\usepackage[htt]{hyphenat}
+\usepackage[hyphens]{url}
+\usepackage{xurl}
+\usepackage{seqsplit}
+% Make \path/\url safe in moving arguments (captions, section titles)
+\makeatletter
+\DeclareUrlCommand\path{\urlstyle{tt}}
+\let\orig@path\path
+\def\path{\protect\orig@path}
+\DeclareUrlCommand\url{}
+\let\orig@url\url
+\def\url{\protect\orig@url}
+\makeatother
+\usepackage{microtype}
+\usepackage{lmodern}
+% Allow \texttt to break at / . - _ and set sloppy for overfull
+\sloppy
+\setlength{\emergencystretch}{6em}
+\setlength{\tolerance}{3000}
+\hyphenpenalty=500
+\exhyphenpenalty=500
+\hbadness=10000
+\vbadness=10000
+\setlength{\tabcolsep}{2.5pt}
+\renewcommand{\arraystretch}{0.92}
+\usepackage{amsmath,amssymb,amsfonts,mathtools}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{etoolbox}
+\usepackage{adjustbox}
+\AtBeginEnvironment{tabular}{\footnotesize}
+\AtBeginEnvironment{longtable}{\footnotesize}
+\AtBeginEnvironment{tabularx}{\footnotesize}
+% Auto-scale wide tables to text width (fixes Overfull hbox for encyclopedic tables)
+\let\oldtabular\tabular
+\let\endoldtabular\endtabular
+\renewenvironment{tabular}[1]{\begin{adjustbox}{max width=\textwidth, center}\begin{oldtabular}{#1}}{\end{oldtabular}\end{adjustbox}}
+\let\oldtabularx\tabularx
+\let\endoldtabularx\endtabularx
+\renewenvironment{tabularx}[2]{\begin{adjustbox}{max width=\textwidth, center}\begin{oldtabularx}{#1}{#2}}{\end{oldtabularx}\end{adjustbox}}
+\usepackage{enumitem}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, positioning, shapes, shadows, calc, fit, backgrounds, chains}
+\usepackage{listings}
+\usepackage{longtable}
+\usepackage{float}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage{abstract}
+\usepackage{authblk}
+
+% ---------- Colors ----------
+\definecolor{tpblue}{RGB}{21,101,192}
+\definecolor{tporange}{RGB}{239,108,0}
+\definecolor{tpgreen}{RGB}{46,125,50}
+\definecolor{tppurple}{RGB}{106,27,154}
+\definecolor{codebg}{RGB}{245,245,245}
+\definecolor{codeframe}{RGB}{220,220,220}
+\definecolor{commentgreen}{RGB}{0,128,0}
+
+% ---------- Hyperref ----------
+\hypersetup{
+  colorlinks=true,
+  linkcolor=tpblue,
+  citecolor=tpgreen,
+  urlcolor=tporange,
+  pdfauthor={TensorPlay Contributors},
+  pdftitle={TensorPlay White Paper},
+  pdfsubject={Deep Learning Framework Architecture},
+  pdfkeywords={TensorPlay, Deep Learning, Autograd, Dispatch, Vmap, Profiler}
+}
+
+% ---------- Listings ----------
+\lstdefinestyle{cppstyle}{
+  language=C++,
+  backgroundcolor=\color{codebg},
+  frame=single,
+  rulecolor=\color{codeframe},
+  basicstyle=\ttfamily\fontsize{7.5}{9}\selectfont,
+  keywordstyle=\color{tpblue}\bfseries,
+  commentstyle=\color{commentgreen}\itshape,
+  stringstyle=\color{tporange},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=6pt,
+  breaklines=true,
+  breakatwhitespace=false,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  tabsize=2,
+  captionpos=b,
+  upquote=true,
+  morekeywords={P10_API,TENSORPLAY_API,constexpr,thread_local,shared_ptr,weak_ptr,atomic}
+}
+\lstdefinestyle{pystyle}{
+  language=Python,
+  backgroundcolor=\color{codebg},
+  frame=single,
+  rulecolor=\color{codeframe},
+  basicstyle=\ttfamily\fontsize{7.5}{9}\selectfont,
+  keywordstyle=\color{tpblue}\bfseries,
+  commentstyle=\color{commentgreen}\itshape,
+  stringstyle=\color{tporange},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=6pt,
+  breaklines=true,
+  showstringspaces=false,
+  tabsize=2
+}
+\lstset{style=cppstyle}
+
+% ---------- Fancy header ----------
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\textsc{TensorPlay White Paper}}
+\fancyhead[R]{\small\textit{2026-09-02 --- v1.0.0rc0}}
+\fancyfoot[C]{\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+% ---------- Title ----------
+\title{\vspace{-1.5em}\textbf{\Huge TensorPlay}\\[0.6em]
+\large \textsc{A Readable Deep Learning Framework with Explicit Four-Pillar Architecture}\\[1.2em]
+\large \textbf{White Paper --- Industry Standard, Publishable Edition}\\[0.5em]
+\normalsize \texttt{Version 1.0.0rc0 \quad\textbullet\quad 2026-09-02}\\[0.3em]
+\normalsize Based on \texttt{p10 / tpx / stax / \_C} at \texttt{version.txt:1}
+}
+\author{TensorPlay Contributors}
+\affil{\small \url{https://github.com/lexing-2026/TensorPlay} \quad\textbullet\quad \texttt{tensorplay.cn}}
+\date{\small Compiles on Windows \texttt{E:\textbackslash texlive} with \texttt{pdflatex} or \texttt{xelatex} --- see \texttt{README} in this directory}
+
+% ---------- Caption ----------
+\captionsetup{font=small, labelfont=bf, justification=raggedright, singlelinecheck=false, format=plain}
+
+% Auto-scale wide figures to text width
+\let\oldtikzpicture\tikzpicture
+\let\endoldtikzpicture\endtikzpicture
+\renewenvironment{tikzpicture}{\begin{adjustbox}{max width=\textwidth, center}\begin{oldtikzpicture}}{\end{oldtikzpicture}\end{adjustbox}}
+
+% ---------- TikZ styles ----------
+\tikzset{
+  pillar/.style={draw, rounded corners=3pt, thick, minimum width=2.9cm, minimum height=2.1cm, align=center, font=\small\bfseries, drop shadow},
+  libbox/.style={draw, rounded corners=2pt, thick, align=center, font=\footnotesize},
+  arrow/.style={-{Stealth[length=2.5mm]}, thick}
+}
+
+\begin{document}
+\maketitle
+
+% ---------- Abstract ----------
+\begin{abstract}
+\noindent TensorPlay is a \emph{readability-first} deep-learning framework that reconstructs, in approximately 75\,k lines of C++, the skeleton of mainstream frameworks while deliberately trimming production extensions. The core is split into four physically isolated dynamic libraries --- \textbf{p10} (tensor, storage, kernels, dispatch), \textbf{tpx} (autograd), \textbf{stax} (static IR), and a single Python extension \textbf{\_C} --- with a thin Python veneer \texttt{tensorplay}. Dependencies flow only downward (\texttt{p10 $\rightarrow$ tpx $\rightarrow$ stax $\rightarrow$ \_C}), enforced at link time.
+
+This white paper departs from high-level overviews and documents \emph{concrete} mechanisms:
+the 13-slot \texttt{DispatchTable} and \texttt{Composite} fallback
+(\path{p10/include/Dispatcher.h:49}),
+the \texttt{TENSORPLAY\_LIBRARY\_IMPL} macro
+(\path{Dispatcher.h:203}),
+the \texttt{TensorIterator} seven-step pipeline
+(\path{p10/src/TensorIterator.cpp:1077}),
+the explicit DAG without a Tape
+(\path{tpx/include/Node.h:26}, \path{Edge.h:14}),
+the \texttt{ReadyQueue} priority by \texttt{sequence\_nr}
+(\path{tpx/include/Engine.h:37}),
+the \texttt{SavedVariable} version guard
+(\path{tpx/include/SavedVariable.h:15}),
+the \texttt{Vmap} key at offset~9
+(\path{p10/include/DispatchKey.h:41}),
+and the profiler's \texttt{OpRecord}~/~\texttt{GpuTimerPair}~/~\texttt{Cupti}~/~\texttt{Nvtx} stack
+(\path{p10/include/Profiler.h}).
+
+All claims are reproducible via \texttt{grep -rn} and \texttt{read} on the cited \texttt{path:line}. The LaTeX sources in \texttt{docs/whitepaper/} compile locally on Windows \texttt{E:\textbackslash texlive} with \texttt{latexmk -pdf main.tex}.
+
+\medskip
+\noindent\textbf{Keywords:} deep learning framework, dispatch, autograd, vmap, redispatch, profiler, code generation, TensorIterator
+\end{abstract}
+
+\vspace{1em}
+\noindent\textbf{Reproducibility note.} Every structural claim cites \texttt{path:line} in the source tree at \texttt{version.txt:1} (1.0.0rc0). Build artifacts are verified by \texttt{ls -lh tensorplay/lib/libp10.so}.
+
+\tableofcontents
+\listoffigures
+\listoftables
+\clearpage
+
+% ---------- Sections ----------
+\input{sections/01-introduction}
+\input{sections/02-architecture}
+\input{sections/03-redispatch}
+\input{sections/04-profiler}
+\input{sections/05-autograd}
+\input{sections/06-vmap}
+\input{sections/07-memory}
+\input{sections/07b-tensoriterator}
+\input{sections/08-codegen}
+\input{sections/09-evaluation}
+
+% ---------- Bibliography ----------
+\bibliographystyle{ieeetr}
+\begin{thebibliography}{9}
+\bibitem{tp2026} TensorPlay Contributors, \emph{TensorPlay Source Tree}, \texttt{version.txt:1}, 2026. \texttt{https://github.com/lexing-2026/TensorPlay}.
+\bibitem{adis} A.~Griewank and A.~Walther, \emph{Evaluating Derivatives: Principles and Techniques of AD}, SIAM, 2nd ed., 2008.
+\bibitem{cupti2024} NVIDIA, \emph{CUPTI Documentation}, CUDA 12.x, 2024.
+\bibitem{pybind11} W.~Jakob et~al., \emph{pybind11 Documentation}, 2024.
+\end{thebibliography}
+
+% ---------- Appendix ----------
+\appendix
+\input{sections/10-appendix}
+
+\end{document}

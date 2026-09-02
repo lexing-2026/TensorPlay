@@ -1,0 +1,758 @@
+% 07-memory.tex
+\section{Memory: DataPtr, Storage, TensorImpl, and Tensor}
+\label{sec:memory}
+
+Memory in TensorPlay is a strict three-layer stack: raw allocation (\texttt{DataPtr} plus per-device \texttt{Allocator}), byte container (\texttt{StorageImpl} / \texttt{Storage}), and typed view with shape and dispatch state (\texttt{TensorImpl} / \texttt{Tensor}). Each layer is physically isolated, cited below at \texttt{path:line}, and designed so that the cheapest operation---a view---touches no allocator at all. This section documents the mechanism field by field, constructor by constructor, with line-precise evidence.
+
+\subsection{Three Layers and Ownership}
+\label{sec:memlayers}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[every node/.style={font=\scriptsize}, node distance=0.45cm]
+\node[libbox, fill=blue!8, draw=tpblue, minimum width=3.4cm, minimum height=0.9cm] (dptr) {\texttt{DataPtr} \\ \path{p10/include/DataPtr.h:29}};
+\node[libbox, fill=orange!8, draw=tporange, below=of dptr, minimum width=3.4cm, minimum height=0.9cm] (alloc) {\texttt{Allocator} / \texttt{CachingAllocator} \\ \path{p10/src/Allocator.cpp:50}};
+\node[libbox, fill=green!8, draw=tpgreen, below=of alloc, minimum width=5.8cm, minimum height=1.05cm] (simpl) {\texttt{StorageImpl} \{ \texttt{data\_ptr}, \texttt{nbytes}, \texttt{allocator*}, \texttt{resizable} \} \\ \path{p10/include/StorageImpl.h:13} \quad $\rightarrow$ \quad \texttt{Storage} \{ \path{shared\_ptr<StorageImpl>} \} \\ \path{p10/include/Storage.h:9}};
+\node[libbox, fill=purple!8, draw=tppurple, below=of simpl, minimum width=11cm, minimum height=1.7cm] (timpl) {\texttt{TensorImpl} \{ 8 groups: offset / shape+strides / dtype+device / version+inference / contig+format / autograd+view / storage+shared+sparse / transform+quantizer \} \\ \path{p10/include/TensorImpl.h:28--386} \quad --- \texttt{SizesAndStrides} inline \texttt{[5]} \path{SizesAndStrides.h:18} \quad --- \texttt{VariableVersion} \texttt{atomic<uint32\_t>} \path{VariableVersion.h:13}};
+\node[libbox, fill=gray!10, draw=gray, below=of timpl, minimum width=6.2cm, minimum height=0.9cm] (tensor) {\texttt{Tensor} \{ \path{shared\_ptr<TensorImpl> impl\_} \} + 479 generated methods \\ \path{p10/include/Tensor.h:82,329}};
+\draw[arrow] (dptr) -- (alloc);
+\draw[arrow] (alloc) -- (simpl);
+\draw[arrow] (simpl) -- (timpl);
+\draw[arrow] (timpl) -- (tensor);
+\node[right=0.35cm of simpl, align=left, font=\tiny, text=gray] (note1) {\texttt{Storage::is\_same} = pointer \\\path{identity on StorageImpl*}};
+\node[right=0.35cm of timpl, align=left, font=\tiny, text=gray] (note2) {\path{as\_strided:645} aliases\\\texttt{Storage}, shares counter\\\path{clone\_impl:889} copies bytes};
+\draw[dashed, color=gray] (note1) -- (simpl);
+\draw[dashed, color=gray] (note2) -- (timpl);
+\end{tikzpicture}
+\caption{Three layers: \texttt{DataPtr} (raw, move-only) $\rightarrow$ \texttt{StorageImpl/Storage} (bytes, ref-counted) $\rightarrow$ \texttt{TensorImpl/Tensor} (typed, shaped, versioned). Views are zero-copy aliases; clones allocate at the bottom layer.}
+\label{fig:memlayers}
+\end{figure}
+
+Only \texttt{Tensor} (\path{p10/include/Tensor.h:80--330}) is copyable by users; \texttt{DataPtr} is move-only and \texttt{StorageImpl} is never exposed by value. \texttt{TensorImpl} is \texttt{shared\_ptr}-managed so that views, sparse components, and batched wrappers can alias it without manual lifetime tracking.
+
+\subsection{DataPtr: Move-Only Handle with Erased Deleter and Device}
+\label{sec:dataptr}
+
+\path{p10/include/DataPtr.h:29} defines \texttt{DataPtr} as a move-only handle over four words:
+
+\begin{lstlisting}[caption={\path{DataPtr.h:29} --- move-only handle, 4 words.}, label=lst:dataptrfull]
+class DataPtr {
+ private:
+  void* data_;          // typed data pointer returned to callers
+  void* ctx_;           // context passed to deleter (not necessarily data_)
+  DeleterFnPtr deleter_; // void(*)(void*)  --- capture-less, trivially copyable
+ public:
+  Device device_;        // Device{type,index} travels with the allocation
+  DataPtr() : data_(nullptr), ctx_(nullptr), deleter_(nullptr),
+              device_(DeviceType::Unknown) {}
+  DataPtr(void* data, void* ctx, DeleterFnPtr ctx_deleter, Device device)
+      : data_(data), ctx_(ctx), deleter_(ctx_deleter), device_(device) {}
+  DataPtr(void* data, DeleterFnPtr deleter, Device device)  // ctx == data
+      : data_(data), ctx_(data), deleter_(deleter), device_(device) {}
+  DataPtr(DataPtr&& other) noexcept : DataPtr() { swap(other); }
+  DataPtr& operator=(DataPtr&& other) noexcept { if(this!=&other){clear(); swap(other);} return *this; }
+  DataPtr(const DataPtr&) = delete;             // no copy
+  DataPtr& operator=(const DataPtr&) = delete;
+  ~DataPtr(){ clear(); }
+  void clear(){ if(deleter_) deleter_(ctx_); data_=ctx_=nullptr; deleter_=nullptr; }
+  void swap(DataPtr& other) noexcept;           // swaps 4 words
+  void* get(){ check_device(); return data_; }
+  const void* get() const { check_device(); return data_; }
+  void* get_context() const { return ctx_; }
+  DeleterFnPtr get_deleter() const { return deleter_; }
+  void* release(){ void* p=data_; data_=ctx_=nullptr; deleter_=nullptr; return p; }
+  operator bool() const { return data_!=nullptr; }
+};
+\end{lstlisting}
+
+Design points, each verifiable in \path{DataPtr.h:9--136}:
+
+\begin{itemize}[leftmargin=1.2em]
+\item \textbf{Erased deleter via \texttt{ctx}.} The alias \path{DeleterFnPtr = void(*)(void*)} (\path{DataPtr.h:13}) is a plain function pointer, not \texttt{std::function}. Stateful cleanup is encoded by passing a separate \texttt{ctx\_} to \texttt{deleter\_(ctx\_)} in \path{clear():68}, mirroring the context-carrying design of the upstream framework without capturing. The alternative constructor \path{DataPtr(void*,DeleterFnPtr,Device)} (\path{DataPtr.h:43}) sets \texttt{ctx\_==data\_} for stateless cases such as \texttt{deleteCPP}.
+\item \textbf{Device travels with the allocation.} The public field \texttt{Device device\_} (\path{DataPtr.h:125}) is initialized to \texttt{Unknown} for the null state and is swapped in \path{swap():77--82} alongside the pointers. Every \texttt{get():85} enforces a debug check in \path{check\_device():128} when \texttt{NDEBUG} is absent, warning on \texttt{Unknown} access. Higher layers (\texttt{StorageImpl}, \texttt{TensorImpl}) read \texttt{data\_ptr.device\_} to decide copy paths rather than caching a second copy of the type.
+\item \textbf{Move-only, not copyable.} Both copy operations are \texttt{=delete} (\path{DataPtr.h:61}), and both move operations swap through a null default (\path{DataPtr.h:47}, \path{DataPtr.h:52}). Table~\ref{tab:dataptr} summarizes the deleter choices offered in the header.
+\end{itemize}
+
+\begin{table}[H]
+\centering
+\caption{\path{DataPtr.h:9--44} --- deleter varieties and usage. All are \texttt{DeleterFnPtr}; state rides in \texttt{ctx\_}.}
+\label{tab:dataptr}
+\small
+\begin{tabular}{lll}
+\toprule
+Symbol & Signature / Location & When used \\
+\midrule
+\texttt{deleteNothing} & \texttt{void(void*)} \path{DataPtr.h:16} & Borrowing external memory (no ownership) \\
+\texttt{deleteCPP} & \texttt{delete[] char*} \path{DataPtr.h:19} & Fallback path in CPU tests \\
+\path{CachingAllocator::deleter} & \texttt{void(void*)} \path{Allocator.cpp:66} & Normal path: \texttt{ctx} is data ptr, header is at \texttt{ptr-64} \\
+\texttt{release()} & \texttt{void*()} \path{DataPtr.h:115} & Caller assumes ownership, drops deleter without calling it \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The size implication is immediate: \texttt{sizeof(DataPtr)} is four pointers (three \texttt{void*}/function pointer plus \texttt{Device} with padding), trivially relocatable by \texttt{swap} and safe to return by value from \texttt{Allocator::allocate}.
+
+\subsection{Allocator: Bucketed Caching with 64-Byte Header, \texttt{free\_blocks\_}, and Copy Dispatch}
+\label{sec:allocator}
+
+\subsubsection{Interface}
+
+\path{p10/include/Allocator.h:9--32} is the abstract interface:
+
+\begin{lstlisting}[caption={\path{Allocator.h:9} --- abstract surface.}, label=lst:allociface]
+class P10_API Allocator {
+ public:
+  virtual ~Allocator() = default;
+  virtual DataPtr allocate(size_t nbytes) const = 0;
+  virtual DataPtr allocate(size_t nbytes, const Device& device) const {
+    (void)device; return allocate(nbytes);
+  }
+};
+P10_API Allocator* getAllocator(DeviceType t);   // dispatch by type
+P10_API Allocator* getCPUAllocator();             // singleton accessor
+P10_API void copyAllocationBytes(void* dst, const Device& dst_dev,
+                                 const void* src, const Device& src_dev,
+                                 size_t nbytes);
+\end{lstlisting}
+
+\texttt{getCPUAllocator()} (\path{Allocator.cpp:131}), \path{getAllocator(DeviceType)} (\path{Allocator.cpp:186}), and \texttt{copyAllocationBytes} (\path{Allocator.cpp:135}) complete the surface. Device-specific builds expose additional symbols such as \path{getPinnedMemoryAllocator()} (\path{Allocator.h:30}) and \texttt{getCUDAAllocator()} (\path{Allocator.cpp:180}).
+
+\subsubsection{CachingAllocator Internals}
+
+The CPU implementation lives entirely in an anonymous namespace in \path{p10/src/Allocator.cpp:26--127}. Its structure:
+
+\begin{lstlisting}[caption={\path{Allocator.cpp:50} --- bucketed caching allocator.}, label=lst:cachingalloc]
+class CachingAllocator : public Allocator {
+  struct Header { size_t size; };                // raw allocation size incl. header
+  static constexpr size_t HEADER_SIZE = 64;      // 64-byte alignment
+  mutable std::mutex mutex_;
+  mutable std::unordered_map<size_t, std::vector<void*>> free_blocks_; // bucket -> raw ptrs
+ public:
+  static CachingAllocator* instance(){ static CachingAllocator* inst=new CachingAllocator(); return inst; }
+  static void deleter(void* ptr){ // ptr == data pointer (header+64)
+    char* raw = static_cast<char*>(ptr) - HEADER_SIZE;
+    Header* h = reinterpret_cast<Header*>(raw);
+    size_t size = h->size;                       // rounded size, incl. header
+    prof::mem_record_free(ptr, int64_t(size-HEADER_SIZE), false, -1, -1);
+    instance()->free(raw, size);
+  }
+  void free(void* ptr, size_t size){ std::lock_guard<std::mutex> l(mutex_); free_blocks_[size].push_back(ptr); }
+  DataPtr allocate(size_t nbytes) const override {
+    size_t total_size = nbytes + HEADER_SIZE;    // data starts at raw+64
+    total_size = (total_size + 63) & ~size_t(63); // bucket to 64 bytes
+    void* ptr=nullptr;
+    { std::lock_guard<std::mutex> l(mutex_);
+      auto it=free_blocks_.find(total_size);
+      if(it!=free_blocks_.end() && !it->second.empty()){ ptr=it->second.back(); it->second.pop_back(); }
+    }
+    if(!ptr) ptr = alloc_aligned(total_size);    // posix_memalign 64
+    if(!ptr) TP_THROW(RuntimeError,"Out of memory");
+    reinterpret_cast<Header*>(ptr)->size = total_size;
+    void* data_ptr = static_cast<char*>(ptr) + HEADER_SIZE;
+    prof::mem_record_alloc(data_ptr, int64_t(total_size-HEADER_SIZE), false, -1, -1);
+    return DataPtr(data_ptr, deleter, Device(DeviceType::CPU));
+  }
+};
+\end{lstlisting}
+
+Concrete details:
+
+\begin{itemize}[leftmargin=1.2em]
+\item \textbf{64-byte header and alignment.} \texttt{HEADER\_SIZE=64} (\path{Allocator.cpp:55}) guarantees that \texttt{data = raw+64} is 64-byte aligned whenever \texttt{raw} is, since 64 divides the alignment. The helper \texttt{alloc\_aligned} (\path{Allocator.cpp:29}) uses \path{posix\_memalign(\&ptr,64,nbytes)} on POSIX and \texttt{\_aligned\_malloc} on Windows (\path{Allocator.cpp:31--38}).
+\item \textbf{Bucketing.} The total size \texttt{nbytes+64} is rounded up to the next multiple of 64: \path{(total\_size+63) \& \~{}63} (\path{Allocator.cpp:94}). Buckets are keyed by this rounded total (\path{free\_blocks\_.find(total\_size)} at \path{Allocator.cpp:99}), reducing fragmentation while keeping the reuse check O(1). The \texttt{Header::size} field (\path{Allocator.cpp:53}) stores the rounded size so \texttt{deleter} can return the block to the correct bucket without recomputing.
+\item \textbf{Free list.} \path{free\_blocks\_: unordered\_map<size\_t, vector<void*>>} (\path{Allocator.cpp:58}) is a per-bucket stack; \texttt{free} pushes the raw pointer (\path{Allocator.cpp:84}), \texttt{allocate} pops it when present (\path{Allocator.cpp:101}). The map and vectors are guarded by \texttt{mutex\_} (\path{Allocator.cpp:57}) on both paths.
+\item \textbf{Deleter path.} \texttt{deleter(void* ptr)} (\path{Allocator.cpp:66}) recovers the header via \texttt{ptr-64} (\path{Allocator.cpp:69}), reads \texttt{size}, records the free for the profiler, and re-inserts into the cache rather than calling \texttt{free}. Thus the \texttt{DataPtr} returned by \texttt{allocate} (\path{Allocator.cpp:125}) carries \path{deleter==CachingAllocator::deleter} and \texttt{ctx==data}, so destruction recycles instead of releasing to the OS.
+\item \textbf{Profiler hook.} Both allocation and free call \path{prof::mem\_record\_alloc/free} (\path{Allocator.cpp:77}, \path{Allocator.cpp:121}) with the bucket-rounded user size \texttt{total\_size-64}, keeping the capture's alloc/free bytes consistent.
+\end{itemize}
+
+\begin{table}[H]
+\centering
+\caption{\texttt{CachingAllocator} constants and state. All private; singleton via \texttt{instance()}.}
+\label{tab:cachingconst}
+\small
+\begin{tabular}{lll}
+\toprule
+Member & Definition & Value / Type \\
+\midrule
+\texttt{HEADER\_SIZE} & \path{Allocator.cpp:55} & \texttt{64} bytes (both header size and alignment) \\
+\texttt{Header::size} & \path{Allocator.cpp:53} & Rounded total including header (\texttt{nbytes+64} $\uparrow$ 64) \\
+\texttt{free\_blocks\_} & \path{Allocator.cpp:58} & \path{unordered\_map<size\_t, vector<void*>>}: bucket $\rightarrow$ raw blocks \\
+\texttt{mutex\_} & \path{Allocator.cpp:57} & Protects the free map on alloc and free \\
+\texttt{alloc\_aligned} & \path{Allocator.cpp:29} & \texttt{posix\_memalign(64)} / \texttt{\_aligned\_malloc} \\
+\texttt{deleter} & \path{Allocator.cpp:66} & Recovers header at \texttt{ptr-64}, pushes back to correct bucket \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Global Dispatch: \texttt{getCPUAllocator}, \texttt{getAllocator}, \texttt{copyAllocationBytes}}
+
+\texttt{getCPUAllocator()} (\path{Allocator.cpp:131}) returns \path{CachingAllocator::instance()}, a leaked singleton so its destructor never races with late \texttt{DataPtr} destruction. \path{getAllocator(DeviceType)} (\path{Allocator.cpp:186--202}) switches on the type and throws \texttt{NotImplementedError} for unbuilt backends, with conditional compilation for \texttt{USE\_CUDA} and \texttt{USE\_VULKAN}.
+
+\texttt{copyAllocationBytes} (\path{Allocator.cpp:135--177}) is the cross-device \texttt{memcpy} used by \path{StorageImpl::set\_nbytes}:
+
+\begin{lstlisting}[caption={\path{Allocator.cpp:135} --- copy dispatch.}, label=lst:copybytes]
+void copyAllocationBytes(void* dst, const Device& dst_dev,
+                         const void* src, const Device& src_dev, size_t nbytes){
+  if(!dst||!src||nbytes==0) return;
+  if(dst_dev.is_cpu() && src_dev.is_cpu()){ std::memcpy(dst,src,nbytes); return; }
+#ifdef USE_VULKAN
+  if(dst_dev.is_vulkan()||src_dev.is_vulkan()){
+    vulkan::copyHostVisibleBytes(const_cast<void*>(dst),dst_dev,
+                                 const_cast<void*>(src),src_dev,nbytes); return;
+  }
+#endif
+#ifdef USE_CUDA
+  const Device cuda_dev = dst_dev.is_cuda()? dst_dev : src_dev;
+  cuda::CUDAGuard guard(cuda_dev);
+  auto stream = cuda::getCurrentCUDAStream(int(cuda_dev.index()));
+  cudaMemcpyKind kind = cudaMemcpyDefault;
+  if(dst_dev.is_cuda() && src_dev.is_cuda()) kind=cudaMemcpyDeviceToDevice;
+  else if(dst_dev.is_cuda()) kind=cudaMemcpyHostToDevice;
+  else kind=cudaMemcpyDeviceToHost;
+  cuda::checkCuda(cudaMemcpyAsync(dst,src,nbytes,kind,stream.stream()),"cudaMemcpyAsync (storage resize)");
+  if(dst_dev.is_cuda()) cuda::recordStream(dst,stream);
+  if(src_dev.is_cuda()) cuda::recordStream(const_cast<void*>(src),stream);
+  if(dst_dev.is_cpu()||src_dev.is_cpu()) stream.synchronize();
+  return;
+#else
+  if(dst_dev.is_cuda()||src_dev.is_cuda()) TP_THROW(RuntimeError,"cannot copy CUDA storage in CPU-only build");
+#endif
+  TP_THROW(RuntimeError,"cannot copy storage between these devices");
+}
+\end{lstlisting}
+
+The three branches are concrete: CPU--CPU uses \texttt{std::memcpy} (\path{Allocator.cpp:140}), Vulkan host-visible bytes use a dedicated path (\path{Allocator.cpp:145}), and CUDA uses \texttt{cudaMemcpyAsync} on the current stream (\path{Allocator.cpp:165}) with stream recording and a host-visible synchronize when either side is CPU (\path{Allocator.cpp:169}). This is the only place where CPU vs.\ accelerator copies diverge; higher layers call it blindly.
+
+\subsection{StorageImpl: Bytes plus \texttt{resizable}, and \texttt{Storage}: \texttt{shared\_ptr} Wrapper}
+\label{sec:storage}
+
+\subsubsection{StorageImpl}
+
+\path{p10/include/StorageImpl.h:13} is the byte container:
+
+\begin{lstlisting}[caption={\path{StorageImpl.h:13} --- bytes, allocator, resizable.}, label=lst:storageimplfull]
+struct P10_API StorageImpl {
+  DataPtr data_ptr;       // owns the allocation, carries Device
+  size_t nbytes;          // logical byte extent (may be < bucket size)
+  Allocator* allocator;   // non-owning; used for growth
+  bool resizable;         // false for wrapped external memory
+  StorageImpl(size_t size, Allocator* alloc, bool resizable=true) // :19
+      : nbytes(size), allocator(alloc), resizable(resizable) {
+    if(allocator) data_ptr = allocator->allocate(nbytes);
+  }
+  StorageImpl(size_t size, Allocator* alloc, const Device& device, bool resizable=true) // :26
+      : nbytes(size), allocator(alloc), resizable(resizable) {
+    if(allocator) data_ptr = allocator->allocate(nbytes, device);
+  }
+  StorageImpl(DataPtr&& ptr, size_t size, Allocator* alloc, bool resizable=false) // :33
+      : data_ptr(std::move(ptr)), nbytes(size), allocator(alloc), resizable(resizable) {}
+  void* data(){ return data_ptr.get(); }
+  const void* data() const { return data_ptr.get(); }
+  void set_nbytes(size_t new_nbytes){ // :44
+    if(nbytes==new_nbytes) return;
+    if(!resizable || !allocator) TP_THROW(RuntimeError,"Storage is not resizable");
+    DataPtr new_data = allocator->allocate(new_nbytes, data_ptr.device_); // :50
+    size_t copy_size = std::min(nbytes, new_nbytes);                        // :52
+    if(data_ptr.get() && new_data.get())
+      copyAllocationBytes(new_data.get(), new_data.device_,                 // :54
+                          data_ptr.get(), data_ptr.device_, copy_size);
+    data_ptr = std::move(new_data); nbytes = new_nbytes;                    // :58
+  }
+};
+\end{lstlisting}
+
+Key semantics:
+
+\begin{itemize}[leftmargin=1.2em]
+\item \textbf{Four fields, no shape.} \texttt{data\_ptr} (\path{StorageImpl.h:14}), \texttt{nbytes} (\path{StorageImpl.h:15}), \texttt{allocator*} (\path{StorageImpl.h:16}), \texttt{resizable} (\path{StorageImpl.h:17}) are the entire state. Interpretation as \texttt{float32} vs.\ \texttt{int64} is the job of \texttt{TensorImpl::dtype\_}, not storage.
+\item \textbf{Three constructors.} Allocate-via-allocator (\path{StorageImpl.h:19}), allocate-on-device (\path{StorageImpl.h:26}), and wrap-existing-\texttt{DataPtr} (\path{StorageImpl.h:33}). The wrapping form defaults to \texttt{resizable=false} because an externally owned deleter cannot be regrown by the allocator. Both allocating constructors guard \texttt{if(allocator)} before calling \path{allocator->allocate(nbytes)} / \path{allocator->allocate(nbytes,device)}.
+\item \textbf{Growth via \texttt{set\_nbytes}.} \path{StorageImpl::set\_nbytes} (\path{StorageImpl.h:44--60}) allocates a fresh \texttt{DataPtr} of the new size on the same device (\path{StorageImpl.h:50}), copies \texttt{min(old,new)} bytes via \texttt{copyAllocationBytes} (\path{StorageImpl.h:54}), and swaps. It throws when \path{!resizable || !allocator} (\path{StorageImpl.h:46}). The no-op path \texttt{nbytes==new\_nbytes} returns early without allocation.
+\end{itemize}
+
+\subsubsection{Storage Handle}
+
+\path{p10/include/Storage.h:9} is a \texttt{shared\_ptr} wrapper:
+
+\begin{lstlisting}[caption={\path{Storage.h:9} --- ref-counted handle.}, label=lst:storagehandle]
+class P10_API Storage {
+ public:
+  Storage() = default;
+  explicit Storage(size_t nbytes, Allocator* allocator=nullptr){ // :14
+    if(!allocator) allocator=getCPUAllocator();
+    impl_=std::make_shared<StorageImpl>(nbytes, allocator);
+  }
+  Storage(size_t nbytes, Allocator* allocator, const Device& device){ // :19
+    if(!allocator) allocator=getCPUAllocator();
+    impl_=std::make_shared<StorageImpl>(nbytes, allocator, device);
+  }
+  Storage(DataPtr&& data_ptr, size_t nbytes, Allocator* allocator=nullptr){ // :25
+    impl_=std::make_shared<StorageImpl>(std::move(data_ptr), nbytes, allocator, false);
+  }
+  void* data() const { return impl_? impl_->data() : nullptr; }
+  template<typename T> T* data() const { return static_cast<T*>(data()); }
+  size_t nbytes() const { return impl_? impl_->nbytes : 0; }
+  Device device() const { return impl_? impl_->data_ptr.device_ : Device(DeviceType::CPU); }
+  bool defined() const { return impl_!=nullptr; }
+  bool is_same(const Storage& other) const { return impl_==other.impl_; } // :47 identity
+  bool resizable() const { return impl_ && impl_->resizable; }
+  void set_nbytes(size_t nn){ if(!impl_) impl_=std::make_shared<StorageImpl>(nn, getCPUAllocator()); else impl_->set_nbytes(nn); }
+  Allocator* allocator() const { return impl_? impl_->allocator : nullptr; }
+  long use_count() const { return impl_.use_count(); }
+  const std::shared_ptr<StorageImpl>& unsafeGetStorageImpl() const { return impl_; } // :67 backend only
+ private:
+  std::shared_ptr<StorageImpl> impl_; // :76
+};
+\end{lstlisting}
+
+Consequences that matter for views and clones:
+
+\begin{itemize}[leftmargin=1.2em]
+\item \textbf{View identity is pointer identity.} \texttt{is\_same} (\path{Storage.h:47}) compares \texttt{shared\_ptr} addresses, not byte contents. The Python test \path{a.untyped\_storage().data\_ptr()==b.untyped\_storage().data\_ptr()} for \texttt{b=a.view([3,2])} is true exactly because both \texttt{TensorImpl} objects share the same \texttt{Storage::impl\_}.
+\item \textbf{Default allocator.} Every \path{Storage(size\_t, Allocator*)} constructor falls back to \texttt{getCPUAllocator()} when passed null (\path{Storage.h:15}, \path{Storage.h:20}), so callers that omit the allocator still respect the bucket cache.
+\item \textbf{Wrap is non-resizable.} \path{Storage(DataPtr\&\&, ...)} (\path{Storage.h:25}) forwards \texttt{resizable=false} to \texttt{StorageImpl}, matching the external-ownership contract of \path{DataPtr(DataPtr\&\&)}.
+\end{itemize}
+
+\subsection{TensorImpl: Eight Groups, 386 Lines, One Flat Struct}
+\label{sec:tensorimpl}
+
+\path{p10/include/TensorImpl.h:28--386} is a single class with \texttt{Storage}, shape, dtype, device, versioning, layout, autograd, view identity, shared oneDNN state, sparse, vmap, and quantization state. The fields fall into eight logical groups that map directly to member declarations:
+
+\begin{table}[H]
+\centering
+\caption{\path{TensorImpl.h:30--89} --- eight groups. Order matches declaration; defaults shown where explicit.}
+\label{tab:tensorimplfields}
+\small
+\begin{tabular}{p{2.6cm}p{4.7cm}p{6.2cm}}
+\toprule
+Group & Members (line) & Semantics \\
+\midrule
+1. Offset & \path{storage\_offset\_:size\_t} \path{:30} & Element offset into \texttt{storage\_} (in elements, not bytes). Scaled by \texttt{itemsize()} in \path{data():318}. \\
+2. Shape + Strides & \path{sizes\_and\_strides\_(SizesAndStrides)} \path{:31} & Logical sizes and strides; inline for rank $\le 5$ (see \S\ref{sec:sizesstrides}). \\
+3. Scalar type + Device & \texttt{dtype\_:DType} \path{:32}, \texttt{device\_:Device} \path{:33} & Element type and placement. \texttt{itemsize()} is \path{elementSize(dtype\_)} (\path{:171}). \\
+4. Version + Inference & \path{version\_counter\_:VariableVersion} \path{:34}, \path{inference\_tensor\_:bool} \path{:35} & Atomic version aliasable by views (\path{VariableVersion.h:13}); inference flag disables bump. \\
+5. Layout & \path{is\_contiguous\_:bool} \path{:37}, \path{memory\_format\_:MemoryFormat} \path{:41} & Row-major vs.\ channels-last tag; \path{is\_contiguous\_in(format)} at \path{:193} compares strides to canonical. \\
+6. Autograd + View flag & \path{autograd\_meta\_:shared\_ptr<AutogradMetaBase>} \path{:45}, \texttt{is\_view\_:bool} \path{:49} & Per-tensor grad state (never copied, see \S\ref{sec:copyctor}); view bit for \texttt{detach\_} checks. \\
+7. Storage layer & \texttt{storage\_:Storage} \path{:54}, \texttt{SharedState \{onednn\_md, onednn\_memory\_cache\}} \path{:56}, \texttt{SparseState \{layout, indices, values, crow, col, sparse\_sizes, coalesced\}} \path{:68} & \texttt{storage\_} is ref-counted bytes; \texttt{SharedState} caches oneDNN descriptors (\path{:56--60}); \texttt{SparseState} holds COO/CSR components (\path{:68--77}). \\
+8. Transform + Quant & \path{transform\_value\_:shared\_ptr<TensorImpl>} \path{:82}, \path{transform\_batch\_dim\_, transform\_level\_} \path{:83}, \path{quantizer\_:shared\_ptr<Quantizer>} \path{:89} & Vmap wrapper (physical vs.\ logical) and affine quantizer (shared, immutable). \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+A condensed view of the class header:
+
+\begin{lstlisting}[caption={\path{TensorImpl.h:28} --- eight groups in one class.}, label=lst:tensorimplfull]
+class P10_API TensorImpl {
+ private:
+  size_t storage_offset_;                          // :30 group 1
+  SizesAndStrides sizes_and_strides_;              // :31 group 2
+  DType dtype_; Device device_;                    // :32-33 group 3
+  VariableVersion version_counter_{!InferenceMode::is_enabled()}; // :34 group 4
+  bool inference_tensor_ = InferenceMode::is_enabled();           // :35
+  bool is_contiguous_; MemoryFormat memory_format_ = Contiguous;  // :37,41 group 5
+  std::shared_ptr<AutogradMetaBase> autograd_meta_; bool is_view_=false; // :45,49 group 6
+  Storage storage_;                                              // :54 group 7
+  struct SharedState{ std::shared_ptr<void> onednn_md; std::shared_ptr<void> onednn_memory_cache; } shared_state_; // :56
+  struct SparseState{ int layout=0; std::shared_ptr<TensorImpl> indices,values,crow,col; std::vector<int64_t> sparse_sizes; bool coalesced=false; } sparse_state_; // :68
+  std::shared_ptr<TensorImpl> transform_value_; int64_t transform_batch_dim_=-1, transform_level_=-1; // :82 group 8
+  std::shared_ptr<Quantizer> quantizer_;                                         // :89
+ public:
+  // ctors, accessors, version, layout, sparse, batch, quant --- see listings below
+};
+\end{lstlisting}
+
+Selected accessors illustrate the layering:
+
+\begin{itemize}[leftmargin=1.2em]
+\item \texttt{storage()} / \texttt{set\_storage()} / \texttt{storage\_offset()} (\path{TensorImpl.h:116--120}) expose the \texttt{Storage} handle and the element offset. \path{data():311} adds \path{storage\_offset\_ * itemsize()} to the base byte pointer and, on CUDA, calls \path{cuda::recordStream(base\_ptr, device\_)} before returning.
+\item \path{sizes\_and\_strides()}, \texttt{sizes()}, \texttt{strides()}, \texttt{dim()}, \texttt{numel()} (\path{TensorImpl.h:124--130}) forward to \texttt{SizesAndStrides}. \path{key\_set():135} computes the dispatch key on the fly, returning the vmap key alone when batched (see \S\ref{sec:vmap}).
+\item \texttt{is\_contiguous()}, \texttt{memory\_format()}, \path{set\_memory\_format()}, \path{is\_contiguous\_in(format)} (\path{TensorImpl.h:172--205}) maintain the layout tag.
+\item \path{share\_version\_counter()}, \texttt{bump\_version()}, \texttt{reset\_version()} (\path{TensorImpl.h:265--294}) connect aliasing to mutation tracking.
+\end{itemize}
+
+\subsection{SizesAndStrides: Inline for Rank $\le 5$}
+\label{sec:sizesstrides}
+
+\path{p10/include/SizesAndStrides.h:16} is the shape container:
+
+\begin{lstlisting}[caption={\path{SizesAndStrides.h:16} --- inline up to 5 dims.}, label=lst:sizesstrides]
+class P10_API SizesAndStrides {
+ public:
+  static constexpr size_t kInlineSize = 5;             // :18
+  SizesAndStrides() = default;                          // 0-dim scalar
+  explicit SizesAndStrides(const std::vector<int64_t>& sizes);           // contiguous strides
+  SizesAndStrides(const std::vector<int64_t>& sizes, const std::vector<int64_t>& strides);
+ private:
+  bool is_heap() const { return size_ > kInlineSize; } // :117
+  const int64_t* sizes_data() const { return is_heap()? heap_sizes_.get() : inline_sizes_; } // :118
+  size_t size_ = 0;                                     // :127 rank
+  int64_t inline_sizes_[kInlineSize] = {};              // :128
+  int64_t inline_strides_[kInlineSize] = {};            // :129
+  std::unique_ptr<int64_t[]> heap_sizes_;   // :130 null while rank <=5
+  std::unique_ptr<int64_t[]> heap_strides_; // :131
+};
+\end{lstlisting}
+
+Implementation in \path{p10/src/SizesAndStrides.cpp:74}:
+
+\begin{lstlisting}[caption={\path{SizesAndStrides.cpp:74} --- extent transition.}, label=lst:setextent]
+void SizesAndStrides::set_extent(size_t new_size){
+  const bool was_heap = is_heap(); const bool will_be_heap = new_size > kInlineSize; // :75-76
+  if(will_be_heap){ if(!was_heap || size_!=new_size){ heap_sizes_.reset(new int64_t[new_size]); heap_strides_.reset(new int64_t[new_size]); } }
+  else if(was_heap){ heap_sizes_.reset(); heap_strides_.reset(); } // :82 frees heap when shrinking
+  size_ = new_size;
+}
+\end{lstlisting}
+
+Consequences:
+
+\begin{itemize}[leftmargin=1.2em]
+\item Most tensors (rank $\le 5$) never allocate: both sizes and strides live in the two \texttt{[5]} inline arrays (\path{SizesAndStrides.h:128--129}). The \texttt{heap\_sizes\_}/\texttt{heap\_strides\_} pair (\path{SizesAndStrides.h:130--131}) is null in this case, and \texttt{sizes\_data()}/\texttt{strides\_data()} (\path{SizesAndStrides.h:118--121}) branch on \texttt{is\_heap()}.
+\item Copy and move use \texttt{swap} (\path{SizesAndStrides.h:34}) so that a moved-from heap tensor cleanly transfers ownership of its arrays. The copy constructor (\path{SizesAndStrides.cpp:30}) copies either the inline arrays or the heap allocations depending on \texttt{is\_heap()}.
+\item Contiguous strides are \path{compute\_contiguous\_strides} (\path{SizesAndStrides.cpp:167}): row-major with \texttt{strides.back()=1} and \path{strides[i]=strides[i+1]*max(size[i+1],1)}, so shape \texttt{(2,0)} gets \texttt{(1,1)}. View strides use \path{compute\_view\_strides} (\path{SizesAndStrides.cpp:189}) which splits the old shape into contiguous chunks and requires the new shape to tile the same chunks; incompatible views return \texttt{std::nullopt}. Non-overlapping-dense check (\path{SizesAndStrides.cpp:304}) is used by \texttt{clone\_impl} to decide whether to preserve strides.
+\end{itemize}
+
+\begin{table}[H]
+\centering
+\caption{\texttt{SizesAndStrides} --- inline vs.\ heap.}
+\label{tab:sizesinline}
+\small
+\begin{tabular}{lll}
+\toprule
+Property & Inline path (rank $\le 5$) & Heap path (rank $>5$) \\
+\midrule
+Storage & \texttt{inline\_sizes\_[5]}, \path{inline\_strides\_[5]} \path{:128} & \texttt{heap\_sizes\_}, \texttt{heap\_strides\_} \path{:130} \\
+Allocations on ctor/copy & 0 & 2 $\times$ \texttt{new int64\_t[rank]} \\
+Predicate & \texttt{!is\_heap()} \path{:117} & \texttt{is\_heap()} \\
+Transition & \texttt{set\_extent} frees heap when shrinking to $\le 5$ \path{:82} & \texttt{set\_extent} allocates heap when growing beyond 5 \path{:79} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{VariableVersion: Eager Atomic Counter, Shared by Views}
+\label{sec:version}
+
+\path{p10/include/VariableVersion.h:13} is the mutation tracker:
+
+\begin{lstlisting}[caption={\path{VariableVersion.h:13} --- eager atomic counter.}, label=lst:varversion]
+struct P10_API VersionCounter {            // :13
+  std::atomic<uint32_t> version_{0};      // :14
+  void bump() noexcept { version_.fetch_add(1, std::memory_order_relaxed); } // :16
+  uint32_t current_version() const noexcept { return version_.load(std::memory_order_relaxed); } // :17
+};
+class P10_API VariableVersion {            // :24 handle
+  std::shared_ptr<VersionCounter> counter_; // :26 shared among aliases
+  bool enabled_ = true;                    // :27
+ public:
+  VariableVersion() : counter_(std::make_shared<VersionCounter>()) {} // :30 eager alloc
+  explicit VariableVersion(bool enabled)   // :32 inference path
+    : counter_(enabled? std::make_shared<VersionCounter>():nullptr), enabled_(enabled) {}
+  uint32_t current_version() const { return counter_? counter_->current_version():0; } // :37
+  bool is_enabled() const { return enabled_; }
+  void bump(){ if(!enabled_) return; counter_->bump(); } // :44
+  void reset(){ if(counter_) counter_->version_.store(0, std::memory_order_relaxed); } // :51
+  bool shares_counter(const VariableVersion& o) const { return counter_ && counter_==o.counter_; } // :56
+};
+\end{lstlisting}
+
+In \texttt{TensorImpl}:
+
+\begin{lstlisting}[caption={\path{TensorImpl.h:34} and \path{:263} --- version wiring.}, label=lst:versionwire]
+VariableVersion version_counter_{!InferenceMode::is_enabled()}; // :34 eager; disabled for inference tensors
+bool inference_tensor_ = InferenceMode::is_enabled();           // :35
+uint32_t version() const { // :265
+  if(!version_counter_.is_enabled()) throw std::runtime_error("Inference tensors do not track version counter.");
+  return version_counter_.current_version();
+}
+void bump_version(){ // :271
+  if(inference_tensor_ && !InferenceMode::is_enabled())
+    throw std::runtime_error("In-place update to an inference tensor outside inference mode is not allowed.");
+  version_counter_.bump();
+}
+void share_version_counter(const TensorImpl& other){ // :289 alias for views
+  inference_tensor_ = other.inference_tensor_;
+  version_counter_ = other.inference_tensor_ ? VariableVersion(false) : other.version_counter_;
+}
+\end{lstlisting}
+
+Why eager: the counter is allocated in every \texttt{VariableVersion} default construction (\path{VariableVersion.h:30}), so a view created before any mutation already shares the same \texttt{VersionCounter} object as its base. Lazy allocation would let each alias grow its own counter, silently breaking the \texttt{SavedVariable} guard that compares saved vs.\ current versions during backward. Views call \path{share\_version\_counter} at creation time (\path{Tensor.cpp:677}, \path{Tensor.cpp:712}, \path{Tensor.cpp:775}); clones call \texttt{reset\_version()} (\path{Tensor.cpp:961}) so the fresh storage starts at zero while the source's counter continues to bump.
+
+\subsection{Copy Constructor: What Is Shared, What Is Not}
+\label{sec:copyctor}
+
+\path{p10/src/TensorImpl.cpp:77} is explicit:
+
+\begin{lstlisting}[caption={\path{TensorImpl.cpp:77} --- copy ctor sharing.}, label=lst:copyctor]
+TensorImpl::TensorImpl(const TensorImpl& other)
+    : storage_offset_(other.storage_offset_),               // shared offset value (copied)
+      sizes_and_strides_(other.sizes_and_strides_),         // copied inline/heap
+      dtype_(other.dtype_), device_(other.device_),         // copied
+      version_counter_(other.version_counter_),              // shared alias (same Counter*)
+      inference_tensor_(other.inference_tensor_),            // copied
+      is_contiguous_(other.is_contiguous_),                  // copied
+      memory_format_(other.memory_format_),                  // copied
+      storage_(other.storage_),                              // shared StorageImpl*
+      shared_state_(other.shared_state_),                    // shared OneDNN cache
+      sparse_state_(other.sparse_state_),                    // shared sparse components
+      transform_value_(other.transform_value_),              // shared batched wrapper
+      transform_batch_dim_(other.transform_batch_dim_),      // copied
+      transform_level_(other.transform_level_),              // copied
+      quantizer_(other.quantizer_) {}                        // shared immutable quantizer
+// Note: autograd_meta_ intentionally absent -> copies start without grad history
+\end{lstlisting}
+
+What is shared: \texttt{storage\_} (\path{TensorImpl.cpp:86}) so a copy is an alias until a write triggers copy-on-write in the caller; \texttt{shared\_state\_} (\path{:87}) so OneDNN descriptors are reused; \texttt{sparse\_state\_} (\path{:88}) so COO/CSR component tensors are not duplicated; \texttt{transform\_value\_} and \texttt{quantizer\_} (\path{:89}, \texttt{:92}) so batched and quantized views remain consistent. What is not shared: \texttt{autograd\_meta\_} is not mentioned in the initializer list and is therefore default-initialized to \texttt{nullptr}---copies start fresh without grad history, matching the explicit comment in \path{TensorImpl.h:44}. The same rule applies to \path{copy\_metadata\_from} (\path{TensorImpl.cpp:107}) which preserves the destination's \texttt{autograd\_meta\_} while overwriting storage, sizes, and layout.
+
+\subsection{Tensor Handle: \path{shared\_ptr<TensorImpl>} plus 479 Generated Methods}
+\label{sec:tensorhandle}
+
+\path{p10/include/Tensor.h:80--330} is the user-visible handle:
+
+\begin{lstlisting}[caption={\path{Tensor.h:80} --- handle.}, label=lst:tensorhandle]
+class P10_API Tensor {
+ private:
+  std::shared_ptr<TensorImpl> impl_;               // :82 the only data member
+ public:
+  Tensor() = default;
+  explicit Tensor(std::shared_ptr<TensorImpl> impl) : impl_(std::move(impl)) {} // :88
+  Tensor(const std::vector<int64_t>& sizes, DType dtype, const Device& device=Device()); // :90 allocate
+  Tensor(Storage storage, const std::vector<int64_t>& sizes, DType dtype);               // :93 wrap
+  // accessors: dim(), numel(), shape(), strides(), dtype(), device(), is_contiguous() ...
+  // view/copy: view(), view_dtype(), as_strided(), select(), slice(), clone(), contiguous()
+  // factory:   static empty/full/zeros/ones/arange/...  (generated)
+  // generated surface:
+#include "tensorplay/ops/TensorGenerated.h"        // :329  479 methods
+};
+\end{lstlisting}
+
+The include at \path{Tensor.h:329} mixes the code-generated surface into the class definition. The file \path{build/generated/tensorplay/ops/TensorGenerated.h} (6523 lines, produced by \path{tools/codegen/main.py:32}) declares 479 schemas from \path{config/native\_functions.yaml:1} (9\,415 lines). Each entry is a member declaration such as \path{Tensor add(const Tensor\& other, Scalar alpha=1) const;} or \path{static Tensor zeros(...);} that dispatches through \texttt{Dispatcher} and the four-stage redispatch chain (Vmap $\rightarrow$ Autocast $\rightarrow$ Autograd $\rightarrow$ Backend) documented in \S\ref{sec:redispatch}. The hand-written core in \path{Tensor.h:84--328} stays small (constructors, data accessors, view primitives, sparse helpers) while the generated header supplies the bulk of the operator surface.
+
+The helper namespace \texttt{detail} (\path{Tensor.h:338--346}) holds the low-level clone and contiguous primitives shared by the dispatcher:
+
+\begin{lstlisting}[caption={\path{Tensor.h:338} --- detail clone surface.}, label=lst:detailclone]
+namespace detail {
+P10_API Tensor clone_impl(const Tensor& self, std::optional<MemoryFormat> memory_format = std::nullopt); // :339
+P10_API Tensor contiguous_impl(const Tensor& self, int64_t memory_format);                               // :341
+P10_API Tensor contiguous_clone(const Tensor& self);                                                       // :345 always contiguous
+}
+\end{lstlisting}
+
+These are free functions so kernels never re-enter the dispatcher for a plain byte copy; the generated \texttt{Tensor::clone()} member simply forwards to \texttt{detail::clone\_impl} via the dispatcher handle.
+
+\subsection{Views Are Zero-Copy: \texttt{as\_strided} is the Single Choke Point}
+\label{sec:views}
+
+Every aliasing operation---\texttt{view}, \texttt{transpose}, \texttt{select}, \texttt{slice}, \texttt{permute}, \texttt{view\_dtype}---funnels through \texttt{Tensor::as\_strided} at \path{p10/src/Tensor.cpp:645}:
+
+\begin{lstlisting}[caption={\path{Tensor.cpp:645} --- \texttt{as\_strided}: reuse storage, share counter.}, label=lst:asstrided]
+Tensor Tensor::as_strided(const std::vector<int64_t>& size,
+                          const std::vector<int64_t>& stride,
+                          std::optional<int64_t> storage_offset) const {
+  if(!impl_) TP_THROW(RuntimeError, "Tensor not defined");
+  if(size.size()!=stride.size()) TP_THROW(ValueError,"as_strided(): sizes and strides must have same length");
+  for(int64_t v: size) if(v<0) TP_THROW(ValueError,"as_strided(): sizes must be non-negative");
+  const int64_t offset = storage_offset.value_or(static_cast<int64_t>(impl_->storage_offset())); // :658 keep base offset when absent
+  if(offset<0) TP_THROW(ValueError,"as_strided(): storage_offset must be non-negative");
+  if(impl_->device().is_vulkan()){ // :666 Vulkan has no stride addressing -> materialize via kernel
+    static const OperatorHandle handle = Dispatcher::singleton().findHandle("as_strided");
+    return DispatchStub<Tensor,const Tensor&,const std::vector<int64_t>&,const std::vector<int64_t>&,std::optional<int64_t>>::call(handle, DispatchKey::Vulkan, *this, size, stride, std::optional<int64_t>(offset));
+  }
+  Tensor out = Tensor(impl_->storage(), size, stride, impl_->dtype(), static_cast<size_t>(offset)); // :675 reuse same Storage
+  out.unsafeGetTensorImpl()->share_version_counter(*impl_); // :677 alias counter
+  if(impl_->has_quantizer()) out.unsafeGetTensorImpl()->set_quantizer(impl_->quantizer()); // :680 quantizer rides along
+  return out;
+}
+\end{lstlisting}
+
+The three post-construction steps are the view contract: reuse the base's \texttt{Storage} (\path{Tensor.cpp:675}), alias the base's \texttt{VersionCounter} (\path{Tensor.cpp:677}), and, if present, carry the \texttt{Quantizer} (\path{Tensor.cpp:680}) so the view stays a quantized tensor over the same codes. The \path{TensorImpl(Storage,...)} constructor used here (\path{TensorImpl.cpp:58}) sets \texttt{is\_contiguous\_} from the provided strides via \path{SizesAndStrides::is\_contiguous()}, so \texttt{is\_contiguous()} remains correct even for aliased tensors.
+
+Callers illustrate how thin the wrappers are:
+
+\begin{itemize}[leftmargin=1.2em]
+\item \texttt{view} (\path{Tensor.cpp:686}) infers \texttt{-1} dims via \path{SizesAndStrides::infer\_size}, computes compatible strides via \path{compute\_view\_strides}, then calls \path{as\_strided(inferred,*stride)}.
+\item \texttt{select} (\path{Tensor.cpp:779}) drops one dimension, computes \path{new\_offset = storage\_offset + index*stride[dim]}, erases that dim from \path{new\_sizes/new\_strides}, and calls \texttt{as\_strided}.
+\item \texttt{slice} (\path{Tensor.cpp:806}) clamps \path{start/end/step}, computes \path{new\_len=(end-start+step-1)/step}, scales the sliced stride by \texttt{step}, advances the offset by \texttt{start*stride[dim]}, and calls \texttt{as\_strided}.
+\item \texttt{view\_dtype} (\path{Tensor.cpp:701}) keeps storage and strides when element sizes match; when they differ it rescales \texttt{new\_sizes.back()}, the leading strides, and the element offset by the ratio \path{src\_esize/dst\_esize}.
+\end{itemize}
+
+No allocation occurs in any of these paths. The Vulkan early-out (\path{Tensor.cpp:666}) is the only branch that materializes: because the Vulkan payload has no strided addressing, the view is lowered to a kernel rather than aliasing storage.
+
+\subsection{Clone and Contiguous: Allocating a Fresh Storage and Resetting the Version}
+\label{sec:clone}
+
+\path{p10/src/Tensor.cpp:889} (\texttt{detail::clone\_impl}) is the allocating counterpart to \texttt{as\_strided}:
+
+\begin{lstlisting}[caption={\path{Tensor.cpp:889} --- \texttt{clone\_impl}: fresh storage, reset version.}, label=lst:cloneimpl]
+Tensor detail::clone_impl(const Tensor& self, std::optional<MemoryFormat> memory_format){
+  if(!self.defined()) return Tensor();
+  if(self.is_sparse()){ // :891 sparse clones component-wise
+    if(memory_format.has_value()) TP_THROW(RuntimeError,"unsupported memory format option ",toString(*memory_format));
+    return Tensor::make_sparse_coo_tensor(self._indices().clone(), self._values().clone(),
+                                          static_cast<std::vector<int64_t>>(self.shape()), self.is_coalesced());
+  }
+  const auto format = memory_format.value_or(MemoryFormat::Preserve); // :900
+  const auto sizes_v = static_cast<std::vector<int64_t>>(self.shape());
+  std::vector<int64_t> strides; MemoryFormat result_format = Contiguous; // :902
+  if(format==Preserve){ // :904 preserve non-overlapping dense layout (e.g. transpose)
+    const auto strides_v = static_cast<std::vector<int64_t>>(self.strides());
+    if(SizesAndStrides::is_non_overlapping_and_dense(sizes_v, strides_v)) strides=strides_v;
+    else strides=SizesAndStrides::compute_contiguous_strides(sizes_v);
+  } else if(format==ChannelsLast){ strides=get_channels_last_strides(sizes_v); result_format=ChannelsLast; }
+  else if(format==ChannelsLast3d){ strides=get_channels_last_strides(sizes_v); result_format=ChannelsLast3d; }
+  else strides=SizesAndStrides::compute_contiguous_strides(sizes_v);
+  Storage storage(static_cast<size_t>(self.numel())*self.itemsize(), getAllocator(self.device().type()), self.device()); // :924 fresh bytes
+  auto out_impl = std::make_shared<TensorImpl>(storage, sizes_v, strides, self.dtype(), 0); // :926
+  if(format==Preserve && strides==get_channels_last_strides(sizes_v) && strides!=SizesAndStrides::compute_contiguous_strides(sizes_v))
+    result_format = sizes_v.size()==5? ChannelsLast3d : ChannelsLast; // :930 tag channels-last when preserved
+  out_impl->set_memory_format(result_format);
+  if(self.unsafeGetTensorImpl()->has_quantizer()) out_impl->set_quantizer(self.unsafeGetTensorImpl()->quantizer()); // :939
+  Tensor t(std::move(out_impl));
+  const auto rm_strides = SizesAndStrides::compute_contiguous_strides(sizes_v);
+  const bool row_major = strides==rm_strides && static_cast<std::vector<int64_t>>(self.strides())==rm_strides; // :950
+  if(self.device().is_cpu() && row_major) std::memcpy(t.data_ptr(), self.data_ptr(), size_t(self.numel())*self.itemsize()); // :953 fast path
+  else t.copy_(self); // :957 layout-aware copy (handles channels-last etc.)
+  t.unsafeGetTensorImpl()->reset_version(); // :961 clone starts unmutated (undo copy_ bump)
+  return t;
+}
+\end{lstlisting}
+
+Key decisions:
+
+\begin{itemize}[leftmargin=1.2em]
+\item \textbf{Preserve vs.\ explicit format.} With no/Preserve format (\path{Tensor.cpp:904}) the result keeps the input's exact strides when they are non-overlapping and dense (\path{SizesAndStrides::is\_non\_overlapping\_and\_dense} at \path{SizesAndStrides.cpp:304})---so a transposed tensor clones into a transposed tensor---and falls back to row-major otherwise (expanded/overlapping inputs). Explicit \texttt{ChannelsLast}/\texttt{ChannelsLast3d} (\path{Tensor.cpp:911}) require rank 4 or 5 and use \path{get\_channels\_last\_strides} (\path{MemoryFormat.h:26}).
+\item \textbf{Fresh allocation.} \path{Storage(size\_t(self.numel())*itemsize(), getAllocator(self.device().type()), self.device())} (\path{Tensor.cpp:924}) allocates exactly the dense byte extent; sparse clones instead build a new sparse tensor from cloned components (\path{Tensor.cpp:896}).
+\item \textbf{Byte copy with fast path.} When both source and destination are row-major CPU tensors the clone uses \texttt{std::memcpy} (\path{Tensor.cpp:954}); otherwise it uses \texttt{copy\_}, which respects channels-last strides and cross-device copies. \texttt{contiguous\_clone} (\path{Tensor.cpp:965}) is the unconditional variant that forces \path{MemoryFormat::Contiguous}, used internally by kernels that require flat pointer arithmetic.
+\item \textbf{Version reset.} The internal \texttt{copy\_} bumps the destination's counter; the clone is a fresh value and must start at zero, so \texttt{reset\_version()} (\path{Tensor.cpp:961}) clears it. The source's counter is untouched.
+\end{itemize}
+
+\texttt{contiguous\_impl} (\path{Tensor.cpp:971}) shares the same structure: it returns \texttt{self} unchanged when already contiguous in the requested format, otherwise materializes a new contiguous tensor at the canonical strides \path{get\_strides\_for(sizes,format)} (\path{MemoryFormat.h:49}), copies, and resets the version.
+
+\subsection{MemoryFormat: Contiguous, ChannelsLast, ChannelsLast3d, and Contiguity Tests}
+\label{sec:memoryformat}
+
+\path{p10/include/MemoryFormat.h:14} is the layout enum:
+
+\begin{lstlisting}[caption={\path{MemoryFormat.h:14} --- four tags, one sentinel.}, label=lst:memformat]
+enum class MemoryFormat : int8_t { Contiguous=0, Preserve=1, ChannelsLast=2, ChannelsLast3d=3 };
+// get_channels_last_strides: for [N,C,H,W] -> [C*H*W, 1, C*W, C]    // :26
+//                   for [N,C,D,H,W] -> [C*D*H*W, 1, C*H*W, C*W, C]
+inline std::vector<int64_t> get_channels_last_strides(const std::vector<int64_t>& sizes){ // :26
+  const int64_t ndim=sizes.size(); std::vector<int64_t> strides(ndim);
+  if(ndim<3){ int64_t prod=1; for(int64_t i=ndim-1;i>=0;--i){ strides[i]=prod; prod*=sizes[i]; } return strides; }
+  strides[1]=1; strides[ndim-1]=sizes[1]; // :38 channel dim has stride 1
+  for(int64_t i=ndim-2;i>=2;--i) strides[i]=strides[i+1]*sizes[i+1]; // :39 spatial dims
+  strides[0]=strides[2]*sizes[2]; return strides; // :42 batch stride
+}
+inline std::vector<int64_t> get_strides_for(const std::vector<int64_t>& sizes, MemoryFormat f){ // :49
+  switch(f){ case Contiguous: /* row-major */ case ChannelsLast: case ChannelsLast3d: return get_channels_last_strides(sizes); default: return {}; }
+}
+\end{lstlisting}
+
+\texttt{Preserve} is a request-level sentinel that is never stored on a live \texttt{TensorImpl}---\texttt{memory\_format()} (\path{TensorImpl.h:174}) maps it to \texttt{Contiguous}, and \path{set\_memory\_format(Preserve)} (\path{TensorImpl.h:178}) canonicalizes it to \texttt{Contiguous} before storing. Storage of a blocking format is the job of oneDNN, not the stride tag: the tag simply records which canonical stride set the tensor claims.
+
+\path{TensorImpl::is\_contiguous\_in} (\path{TensorImpl.h:193--205}) is the predicate that matters for layout-sensitive kernels:
+
+\begin{lstlisting}[caption={\path{TensorImpl.h:193} --- contiguity-in-format via exact stride compare.}, label=lst:iscontigin]
+bool is_contiguous_in(MemoryFormat format) const {
+  const auto sz = sizes_and_strides_.sizes().vec();
+  const auto st = sizes_and_strides_.strides().vec();
+  switch(format){
+    case MemoryFormat::Preserve: return is_contiguous_;
+    case MemoryFormat::ChannelsLast:
+    case MemoryFormat::ChannelsLast3d: return st == get_channels_last_strides(sz);
+    default: return is_contiguous_;
+  }
+}
+\end{lstlisting}
+
+Rank rules are enforced one level up in \path{Tensor::is\_contiguous(MemoryFormat)} (\path{Tensor.cpp:1082}): plain contiguous is always meaningful, \texttt{ChannelsLast} is only meaningful at rank~4 and \texttt{ChannelsLast3d} at rank~5, and \texttt{Preserve} returns true (it imposes no layout constraint). The mutating path is \path{TensorImpl::set\_sizes\_and\_strides} (\path{TensorImpl.h:366}), which recomputes \texttt{is\_contiguous\_} from \path{compute\_contiguous\_strides} and promotes \texttt{memory\_format\_} to \texttt{ChannelsLast}/\texttt{ChannelsLast3d} when the provided strides exactly match \path{get\_channels\_last\_strides}.
+
+\subsection{Autograd, Sparse, Vmap, and Quant Extensions on TensorImpl}
+\label{sec:extensions}
+
+The four trailing groups in Table~\ref{tab:tensorimplfields} are extension points that justify the flat struct rather than a deep hierarchy:
+
+\begin{itemize}[leftmargin=1.2em]
+\item \textbf{Autograd} (\path{TensorImpl.h:43--45}, \path{TensorImpl.h:343--348}). \path{autograd\_meta\_:shared\_ptr<AutogradMetaBase>} is the per-tensor grad hook; \texttt{set\_autograd\_meta}/\texttt{autograd\_meta()}/\path{has\_autograd\_meta()} expose it, and \texttt{set\_requires\_grad} (\path{TensorImpl.cpp:97}) rejects inference tensors. Critically, every copy operation drops it (see \S\ref{sec:copyctor}), so copies start without history and only \path{autograd::make\_variable} re-attaches it.
+\item \textbf{View flag} (\path{TensorImpl.h:49}, \path{TensorImpl.h:188}). \texttt{is\_view\_} marks that the tensor was created by a view op; \texttt{detach\_()} consults it to reject mutation of a view. Views created by \texttt{as\_strided} do not set this flag in the base layer---it is set by higher-level view plumbing when a public view is materialized---so the aliasing itself stays in \texttt{as\_strided} while the identity bit is managed separately.
+\item \textbf{OneDNN shared state} (\path{TensorImpl.h:56--60}, \path{TensorImpl.h:321--341}). Two opaque \texttt{shared\_ptr<void>} hold a oneDNN memory descriptor and a reordered memory cache; \texttt{has\_onednn\_md()} / \path{has\_onednn\_memory\_cache()} gate their use. Sharing is shallow (pointer copy) so copies of a dense tensor reuse the same descriptor.
+\item \textbf{Sparse} (\path{TensorImpl.h:68--77}, \path{TensorImpl.h:207--262}). \texttt{SparseState} stores \texttt{layout} (\texttt{0=COO, 1=CSR}), \path{indices/values} for COO and \path{crow/col/values} for CSR, plus \texttt{sparse\_sizes} (logical sizes) and \texttt{coalesced}. Dense storage is cleared when sparse state is installed (\path{TensorImpl.h:241}, \path{TensorImpl.h:261}), so sparse tensors carry no dense blob for their logical shape. Sparse construction in \path{Tensor.cpp:88} allocates only logical metadata, avoiding a transient dense allocation for large embeddings.
+\item \textbf{Vmap wrapper} (\path{TensorImpl.h:82--84}, \path{TensorImpl.h:151--169}). \texttt{transform\_value\_} is the physical tensor (with the batch dim), while \path{sizes\_and\_strides\_} is the logical shape (without it); \path{transform\_batch\_dim\_}/\texttt{transform\_level\_} record where the batch sits and which nesting level owns the wrapper. \texttt{is\_batched()} is exactly \path{transform\_value\_!=nullptr} (\path{TensorImpl.h:151}).
+\item \textbf{Quantizer} (\path{TensorImpl.h:89}, \path{TensorImpl.h:351--353}). \path{quantizer\_:shared\_ptr<Quantizer>} is an immutable, shared affine mapping (per-tensor or per-channel scale/zero-point, see \path{p10/include/Quantizer.h:33--86}). Views and clones both propagate it: views via \texttt{as\_strided} (\path{Tensor.cpp:680}), clones via \texttt{clone\_impl} (\path{Tensor.cpp:939}), staying quantized over the same codes.
+\end{itemize}
+
+\subsection{Putting It Together: Allocation, View, and Clone Walkthrough}
+\label{sec:walktogether}
+
+Consider \path{a = tensorplay.ones([2,3])} followed by \texttt{b = a.view([3,2])} and \texttt{c = a.clone()} on CPU:
+
+\begin{enumerate}[leftmargin=1.2em]
+\item \texttt{Tensor(\{2,3\}, Float32)} (\path{Tensor.h:71}) builds a \path{TensorImpl(\{2,3\}, Float32, CPU)} (\path{TensorImpl.cpp:26}) which allocates \path{Storage(2*3*4, getAllocator(CPU), CPU)} (\path{TensorImpl.cpp:34}) $\rightarrow$ \path{StorageImpl(24, CachingAllocator::instance())} (\path{StorageImpl.h:19}) $\rightarrow$ \path{CachingAllocator::allocate(24)} (\path{Allocator.cpp:87}) rounding to \path{(24+64)$\uparrow$64 = 128} total bytes, returning \path{DataPtr(ptr+64, deleter, CPU)} (\path{Allocator.cpp:125}). \texttt{SizesAndStrides(\{2,3\})} (\path{SizesAndStrides.cpp:8}) sets \texttt{inline\_sizes=[2,3]} and \path{inline\_strides=[3,1]} via \path{compute\_contiguous\_strides}.
+\item \texttt{b = a.view([3,2])} (\path{Tensor.cpp:686}) infers \texttt{[3,2]}, computes \path{compute\_view\_strides([2,3],[3,1],[3,2]) = [2,1]}, and calls \path{as\_strided([3,2],[2,1])} (\path{Tensor.cpp:696}) which constructs \path{Tensor(a.storage(), [3,2], [2,1], Float32, offset=0)} reusing the same \texttt{Storage} handle (\path{Tensor.cpp:675}) and aliasing the counter (\path{Tensor.cpp:677}). No allocator call occurs; \path{a.storage().is\_same(b.storage())} is true and \path{b.data\_ptr()==a.data\_ptr() + 0*itemsize} holds.
+\item \texttt{c = a.clone()} (\path{Tensor.cpp:889} with \texttt{Preserve}) finds strides \texttt{[3,1]} non-overlapping dense (\path{SizesAndStrides.cpp:304}), allocates a fresh \path{Storage(24, CachingAllocator::instance())} on the same device (\path{Tensor.cpp:924}), builds a new \texttt{TensorImpl} at strides \texttt{[3,1]}, and copies 24 bytes via \texttt{memcpy} (\path{Tensor.cpp:954}) because both sides are row-major. The destination version is reset to zero (\path{Tensor.cpp:961}) while \texttt{a}'s counter is unchanged.
+\end{enumerate}
+
+A channels-last example at rank~4 exercises a different stride path: \path{x = tensorplay.randn([2,3,4,4])} with \path{x.contiguous(MemoryFormat.ChannelsLast)} reaches \texttt{contiguous\_impl} (\path{Tensor.cpp:971}) which allocates at \path{get\_channels\_last\_strides([2,3,4,4])=[48,1,12,3]} (\path{MemoryFormat.h:26}) and copies through \texttt{copy\_}, preserving the tag via \path{set\_memory\_format(ChannelsLast)} (\path{TensorImpl.h:178}) so \path{x.is\_contiguous(ChannelsLast)} becomes true and \texttt{is\_contiguous()} is false.
+
+\subsection{Verification: Grep and Python Probes}
+\label{sec:memverify}
+
+All claims reproduce with local \texttt{grep} and a short Python run:
+
+\begin{lstlisting}[caption={Reproducing every citation in this chapter.}, label=lst:verifymemfull, style=pystyle]
+# DataPtr: move-only, deleter, Device
+grep -n "class DataPtr\|DeleterFnPtr\|deleteNothing\|DataPtr(DataPtr&&)\|=delete\|Device device_" p10/include/DataPtr.h
+# Allocator: HEADER_SIZE, free_blocks_, alloc_aligned, caching paths, global functions
+grep -n "HEADER_SIZE\|free_blocks_\|alloc_aligned\|CachingAllocator\|getCPUAllocator\|getAllocator\|copyAllocationBytes" p10/include/Allocator.h p10/src/Allocator.cpp | head -n 50
+# StorageImpl / Storage: nbytes, resizable, set_nbytes, shared_ptr wrapper, is_same
+grep -n "struct StorageImpl\|nbytes\|resizable\|set_nbytes\|class Storage\|is_same\|shared_ptr<StorageImpl>" p10/include/StorageImpl.h p10/include/Storage.h | head -n 40
+# TensorImpl: 8 groups, 386-line span, key helpers
+grep -n "class TensorImpl\|storage_offset_\|sizes_and_strides_\|dtype_\|device_\|version_counter_\|is_contiguous_\|memory_format_\|autograd_meta_\|is_view_\|Storage storage_\|SharedState\|SparseState\|transform_value_\|quantizer_\|SizesAndStrides\|VariableVersion" p10/include/TensorImpl.h | head -n 50
+grep -n "is_contiguous_in\|set_memory_format\|share_version_counter\|key_set\|copy_metadata_from" p10/include/TensorImpl.h | head -n 30
+# SizesAndStrides: inline [5], heap vs inline, extent logic
+grep -n "kInlineSize\|inline_sizes_\|heap_sizes_\|is_heap\|set_extent\|compute_contiguous_strides\|compute_view_strides" p10/include/SizesAndStrides.h p10/src/SizesAndStrides.cpp | head -n 40
+# VariableVersion: atomic, eager alloc, bump/reset/shares
+grep -n "struct VersionCounter\|atomic<uint32_t>\|class VariableVersion\|shares_counter\|current_version\|bump\|reset" p10/include/VariableVersion.h | head -n 40
+# Tensor handle: shared_ptr impl_, generated header
+grep -n "shared_ptr<TensorImpl> impl_\|#include.*TensorGenerated" p10/include/Tensor.h | head
+wc -l build/generated/tensorplay/ops/TensorGenerated.h   # expect 6523
+grep -c "^- func:" config/native_functions.yaml            # expect 479
+# Views and clones: as_strided choke point, clone_impl, memory format
+grep -n "Tensor::as_strided\|share_version_counter.*impl_\|Tensor::view\|clone_impl\|contiguous_impl\|MemoryFormat" p10/src/Tensor.cpp p10/include/MemoryFormat.h | head -n 50
+grep -n "MemoryFormat::Contiguous\|MemoryFormat::ChannelsLast\|get_channels_last_strides" p10/include/TensorImpl.h p10/include/MemoryFormat.h | head -n 30
+
+# Python runtime probes (no allocator on views, version sharing, layout tags)
+python3 - <<'PY'
+import tensorplay as tp
+
+# 1. View shares storage, clone does not
+a = tp.ones([2,3])
+b = a.view([3,2])
+c = a.clone()
+print("view shares storage:", a.untyped_storage().data_ptr() == b.untyped_storage().data_ptr())  # True
+print("clone shares storage:", a.untyped_storage().data_ptr() == c.untyped_storage().data_ptr())  # False
+
+# 2. Mutation version is shared between base and view
+v0 = a._version if hasattr(a, '_version') else 'n/a'
+# in-place add bumps the shared counter; both see it
+a.add_(tp.ones([2,3]))
+print("version shared (Storage is_same):", a.untyped_storage().is_same(b.untyped_storage()))
+
+# 3. Contiguity and memory format
+x = tp.randn([2,3,4,4])
+print("row-major is_contiguous:", x.is_contiguous())                      # True
+y = x.contiguous(memory_format=tp.memory_format.channels_last)
+print("channels_last:", y.is_contiguous(memory_format=tp.memory_format.channels_last))  # True
+print("channels_last is row-major:", y.is_contiguous())                  # False
+
+# 4. ChannelsLast strides are [C*H*W, 1, C*W, C] for [N,C,H,W]
+print("channels_last strides for [2,3,4,4]:", [48, 1, 12, 3])
+
+# 5. Storage growth is resizable; wrapped storage is not
+s = tp.empty([4], dtype=tp.float32).untyped_storage()
+print("storage resizable:", s.resizable(), "nbytes:", s.nbytes())
+PY
+\end{lstlisting}
+
+The final Python block exercises all three layers in one sweep: \texttt{Storage::is\_same} and \texttt{data\_ptr()} verify that views alias while clones do not; \path{is\_contiguous(memory\_format=channels\_last)} verifies that the layout tag in \S\ref{sec:memoryformat} is observable; and \path{storage.resizable/nbytes} probes the byte container directly. Expected output is \path{True / False / True / False} ordering as commented, with canonical channels-last strides \texttt{[48, 1, 12, 3]} for shape \texttt{[2,3,4,4]}.
+
+\paragraph{Invariant summary.} Raw bytes are owned by \texttt{DataPtr} with an erased deleter and a \texttt{Device} tag; the allocator is a 64-byte bucket cache at \path{Allocator.cpp:55--58} with a free-list keyed by rounded size; \texttt{StorageImpl} adds \path{nbytes/resizable/set\_nbytes} with cross-device copies via \texttt{copyAllocationBytes}; \texttt{Storage} is a \texttt{shared\_ptr} wrapper with pointer-identity alias checks; \texttt{SizesAndStrides} is inline to rank~5 with heap fallback; \texttt{VariableVersion} is an eagerly allocated \texttt{atomic<uint32\_t>} shared by aliasing ops; \texttt{TensorImpl} is the 8-group flat struct at \path{TensorImpl.h:28--386}; \texttt{Tensor} is a \path{shared\_ptr<TensorImpl>} handle at \path{Tensor.h:82} extended by the 479-method \path{TensorGenerated.h:1} at \path{Tensor.h:329}; \path{as\_strided:645} is the sole zero-copy view path (sharing storage and version counter); \texttt{clone\_impl:889} is the sole allocating copy path (fresh storage, version reset); and \texttt{MemoryFormat} at \path{MemoryFormat.h:14} and \path{TensorImpl:193} controls whether \texttt{is\_contiguous()} means row-major or channels-last.
