@@ -139,6 +139,18 @@ class TestSparseBinaryOps(unittest.TestCase):
         self.assertTrue(tp.allclose(
             dense_from_coo(out), tp.tensor([[1.0, 0.0], [0.0, 2.0]])))
 
+    def test_add_different_nnz(self):
+        a = sparse.sparse_coo_tensor(
+            tp.tensor([[0], [0]], dtype=tp.int64), tp.tensor([1.0]), [2, 2])
+        b = sparse.sparse_coo_tensor(
+            tp.tensor([[0, 1], [1, 0]], dtype=tp.int64),
+            tp.tensor([2.0, 3.0]),
+            [2, 2],
+        )
+        out = sparse.add(a, b)
+        self.assertTrue(tp.allclose(
+            dense_from_coo(out), tp.tensor([[1.0, 2.0], [3.0, 0.0]])))
+
     def test_mul_intersection(self):
         a = sparse.sparse_coo_tensor(
             tp.tensor([[0, 1, 1], [0, 1, 2]], dtype=tp.int64),

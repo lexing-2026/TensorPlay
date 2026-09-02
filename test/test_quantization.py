@@ -160,7 +160,10 @@ class TestStubsAndQuantizedLinear(unittest.TestCase):
                               zero_point=stub.fake_quant.zero_point)
         x = data[0]  # in-distribution: bounded by the calibrated range
         q = stub(x)
-        self.assertEqual(q.dtype, tp.int8)
+        self.assertEqual(q.dtype, tp.qint8)
+        self.assertTrue(q.is_quantized())
+        self.assertAlmostEqual(q.q_scale(), stub.fake_quant.scale, places=7)
+        self.assertEqual(q.q_zero_point(), stub.fake_quant.zero_point)
         back = dequant(q)
         self.assertTrue(float((back - x).abs().max().item()) < 0.2)
 

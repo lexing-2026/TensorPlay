@@ -84,12 +84,14 @@ def test_canonicalize_rebuilds_namespace_for_future_nodes():
 
     renamed = canonicalize_graph(graph, _key, _is_safe_to_reorder)
     assert renamed["custom"] == "add"
-    assert renamed["custom_1"] == "add_1"
+    # Duplicate explicit names collide zero-based (custom, custom_0), and the
+    # renames inherit that ordering after their target base name.
+    assert renamed["custom_0"] == "add_0"
     assert first.name == "add"
-    assert second.name == "add_1"
+    assert second.name == "add_0"
 
     future = graph.call_function(operator.add, (x, x))
-    assert future.name == "add_2"
+    assert future.name == "add_1"
 
 
 def test_default_canonical_key_preserves_placeholder_order():
