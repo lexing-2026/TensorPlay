@@ -12,6 +12,7 @@ The functional path delegates to
 
 from typing import Optional
 
+import tensorplay
 from tensorplay import Tensor
 from tensorplay.nn import functional as F
 from tensorplay.nn import init

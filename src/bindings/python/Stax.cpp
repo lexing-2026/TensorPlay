@@ -17,17 +17,22 @@ using namespace tensorplay::stax;
 // for the exact steady state -- same tensor objects, unchanged versions.
 //
 // Fast path:  arity ok, all args are the installed tensor exact-type, every
-//   (id, _version) matches the stored fingerprint, and no input requires grad
-//   when this lowering owns an autograd plan.  Then the cached input vector
-//   (args + attribute targets + constants) is refreshed in place and handed
-//   straight to the native Graph.execute callable -- zero Python frames.
-//   When the installed kernel exposes a direct entry (``direct``), the
-//   steady state skips the graph callable entirely: pointers are read from
-//   the C++ value holders, the kernel allocates its pinned output in C, and
-//   the result comes back pre-wrapped.
+//   (id, version) matches the stored fingerprint, and no input requires grad
+//   when this lowering owns an autograd plan.  Inference tensors carry no
+//   version counter, so their fingerprint entry is the identity alone -- one
+//   probe instead of a version read that would throw and clear.  Then the
+//   cached input vector (args + attribute targets + constants) is refreshed
+//   in place and handed straight to the native Graph.execute callable --
+//   zero Python frames.  When the installed kernel exposes a direct entry
+//   (``direct``), the steady state skips the graph callable entirely:
+//   pointers are read from the C++ value holders, the kernel allocates its
+//   pinned output in C, and the result comes back pre-wrapped.
 // Divert:     anything else vectorcalls the Python lowering, which re-resolves
-//   binding/route through its own memos; the stored fingerprint is refreshed
-//   first so the next identical call re-enters the fast path.
+//   binding/route through its own memos.  The fingerprint is deliberately
+//   left stale: a caller whose state changed at all already diverted once,
+//   and an unchanged re-call over a stale entry cannot be fast by definition,
+//   so the Python side rebinds through tpx_fingerprint_store after it has
+//   fully resolved the slow call.
 //
 // In-place mutation bumps _version (ConvKernels guard contract), so a stale
 // fast hit is impossible by construction; requires_grad rides the fingerprint
@@ -42,6 +47,11 @@ using namespace tensorplay::python_c;
 
 namespace {
 
+// Sentinel version slot for inference tensors: they carry no version counter
+// and are immutable, so the identity alone keys the entry.  The value is
+// unreachable for a real counter (unsigned, always non-negative).
+constexpr long long kFpNoVersion = -1;
+
 struct CallTrampolineState {
     PyObject* lowering;      // borrowed: owned by the compiled wrapper
     PyObject* fallback;      // borrowed: outer optimized wrapper, if present
@@ -55,10 +65,14 @@ struct CallTrampolineState {
     // output PyObject* for a C array of data pointers.  Null keeps the
     // exec_fn path.
     PyObject* (*direct)(const void* const* ins);
-    // Fingerprint: per-arg (id, version, requires_grad-int).
-    std::vector<PyObject*> fp_ids;    // strong refs pin the identity
-    std::vector<long long> fp_versions;
-    std::vector<int> fp_rg;
+    // Fingerprint: per-arg (id, version-or-sentinel, requires_grad views).
+    // Single writer: the dispatcher-level store below, called once per fully
+    // resolved Python call.  An empty id vector means "not stored", so a
+    // fresh trampoline never fast-hits before its first resolution.
+    std::vector<PyObject*> fp_ids;      // strong refs pin the identity
+    std::vector<long long> fp_versions;  // kFpNoVersion marks an inference tensor
+    std::vector<int> fp_rg;      // fast-path view: 0 unless a gradient plan exists
+    std::vector<int> fp_rg_live;  // memo view: live requires_grad flag
 };
 
 bool capture_busy_probe();
@@ -83,6 +97,101 @@ void destroy_trampoline_state(CallTrampolineState* st) {
     delete st;
 }
 
+// Read the fingerprint-relevant state of one argument.  Returns false when
+// the argument cannot be fingerprinted.  ``version`` is the counter value,
+// or kFpNoVersion for an inference tensor.  ``rg_live`` is the live
+// requires_grad flag when ``want_rg`` is set (the gradient-plan fast path
+// skips one guard probe per arg otherwise) and 0 when not read.
+bool fp_probe(CallTrampolineState* st, PyObject* v, bool want_rg,
+              long long& version, int& rg_fast, int& rg_live) {
+    if (Py_TYPE(v) != reinterpret_cast<PyTypeObject*>(st->tensor_type)) {
+        return false;
+    }
+    long long vv;
+    int probe = tpx_tensor_guard_probe(v, &vv);
+    if (probe < 0) return false;
+    if (probe == 1) vv = kFpNoVersion;
+    rg_live = 0;
+    if (want_rg) {
+        rg_live = tpx_tensor_requires_grad(v);
+        if (rg_live < 0) return false;
+    }
+    rg_fast = st->gradient_plan ? rg_live : 0;
+    version = vv;
+    return true;
+}
+
+// True when ``args`` exactly matches the stored fingerprint: same arity,
+// every slot the same tensor object with the same (possibly absent) version
+// and an unchanged live requires_grad flag.  Read-only: this is the C
+// certificate the Python memo layer consumes instead of rebuilding an
+// (id, version) tuple per diverted call.
+bool trampoline_fingerprint_matches(const CallTrampolineState* st,
+                                    PyObject* const* args, Py_ssize_t nargs) {
+    if (nargs != static_cast<Py_ssize_t>(st->fp_ids.size())) return false;
+    for (Py_ssize_t i = 0; i < nargs; ++i) {
+        PyObject* v = args[i];
+        if (Py_TYPE(v) != reinterpret_cast<PyTypeObject*>(st->tensor_type)) {
+            return false;
+        }
+        long long vv;
+        int probe = tpx_tensor_guard_probe(v, &vv);
+        if (probe < 0) return false;
+        if (probe == 1) vv = kFpNoVersion;
+        if (st->fp_ids[i] != v || st->fp_versions[i] != vv) return false;
+        int rgi = tpx_tensor_requires_grad(v);
+        if (rgi < 0 || rgi != st->fp_rg_live[i]) return false;
+    }
+    return true;
+}
+
+void trampoline_fingerprint_reset(CallTrampolineState* st) {
+    for (PyObject* id : st->fp_ids) Py_XDECREF(id);
+    st->fp_ids.clear();
+    st->fp_versions.clear();
+    st->fp_rg.clear();
+    st->fp_rg_live.clear();
+}
+
+void trampoline_fingerprint_store(CallTrampolineState* st,
+                                  PyObject* const* args, Py_ssize_t nargs) {
+    std::vector<PyObject*> ids;
+    std::vector<long long> versions;
+    std::vector<int> rg_fast;
+    std::vector<int> rg_live;
+    ids.reserve(static_cast<size_t>(nargs));
+    versions.reserve(static_cast<size_t>(nargs));
+    rg_fast.reserve(static_cast<size_t>(nargs));
+    rg_live.reserve(static_cast<size_t>(nargs));
+    bool ok = nargs >= 0;
+    for (Py_ssize_t i = 0; ok && i < nargs; ++i) {
+        long long vv;
+        int rgf, rgl;
+        if (!fp_probe(st, args[i], true, vv, rgf, rgl)) {
+            ok = false;
+            break;
+        }
+        ids.push_back(args[i]);
+        versions.push_back(vv);
+        rg_fast.push_back(rgf);
+        rg_live.push_back(rgl);
+    }
+    if (!ok) {
+        // A call the fingerprint cannot describe (scalars, kwargs-only
+        // positionals, exotic objects) must not leave a stale certificate
+        // behind: the Python memo would then pair old slots with new
+        // quick parts.  Clear instead.
+        trampoline_fingerprint_reset(st);
+        return;
+    }
+    for (PyObject* id : st->fp_ids) Py_XDECREF(id);
+    st->fp_ids = std::move(ids);
+    st->fp_versions = std::move(versions);
+    st->fp_rg = std::move(rg_fast);
+    st->fp_rg_live = std::move(rg_live);
+    for (PyObject* id : st->fp_ids) Py_INCREF(id);
+}
+
 PyObject* call_trampoline(PyObject* self, PyObject* const* args,
                           Py_ssize_t nargs, PyObject* kwnames) {
     auto* st = static_cast<CallTrampolineState*>(PyCapsule_GetPointer(self, nullptr));
@@ -97,37 +206,22 @@ PyObject* call_trampoline(PyObject* self, PyObject* const* args,
     if (can_fast) {
         for (Py_ssize_t i = 0; i < nargs; ++i) {
             PyObject* v = args[i];
-            if (Py_TYPE(v) != reinterpret_cast<PyTypeObject*>(st->tensor_type)) {
+            long long vv;
+            int rg_fast, rg_live;
+            if (!fp_probe(st, v, st->gradient_plan, vv, rg_fast, rg_live) ||
+                static_cast<size_t>(i) >= st->fp_ids.size() ||
+                st->fp_ids[i] != v || st->fp_versions[i] != vv ||
+                st->fp_rg[i] != rg_fast) {
+                // Leave the stored fingerprint untouched: the diverted Python
+                // resolution is the single writer and re-stores it after the
+                // slow path has fully re-resolved, so slots always describe
+                // the call the quick memo was built from.
                 can_fast = false;
                 break;
             }
-            long long vv = tpx_tensor_version(v);
-            if (vv < 0) { can_fast = false; break; }
-            int rgi = 0;
-            if (st->gradient_plan) {
+            if (st->gradient_plan && rg_live) {
                 // Autograd route decided by the Python lowering: any input
-                // demanding grad diverts.  Only read when a plan exists so
-                // inference-only kernels skip one guard probe per arg.
-                rgi = tpx_tensor_requires_grad(v);
-                if (rgi < 0) { can_fast = false; break; }
-                if (rgi) { can_fast = false; break; }
-            }
-            if (static_cast<size_t>(i) >= st->fp_ids.size() ||
-                st->fp_ids[i] != v || st->fp_versions[i] != vv ||
-                st->fp_rg[i] != rgi) {
-                // Refresh so the next identical call re-enters fast path,
-                // then divert once for full Python-side re-resolution.
-                if (static_cast<Py_ssize_t>(st->fp_ids.size()) != nargs) {
-                    for (PyObject* old : st->fp_ids) Py_XDECREF(old);
-                    st->fp_ids.assign(nargs, nullptr);
-                    st->fp_versions.assign(nargs, -1);
-                    st->fp_rg.assign(nargs, 0);
-                }
-                Py_INCREF(v);
-                Py_XDECREF(st->fp_ids[i]);
-                st->fp_ids[i] = v;
-                st->fp_versions[i] = vv;
-                st->fp_rg[i] = rgi;
+                // demanding grad diverts.
                 can_fast = false;
                 break;
             }
@@ -272,6 +366,57 @@ PyObject* call_dispatcher_set_fast(PyObject* self, PyObject* const* args,
     Py_RETURN_NONE;
 }
 
+// Read-only certificate for the Python memo layer: true when the currently
+// bound trampoline's stored fingerprint describes exactly these arguments.
+// The Python wrapper consumes this instead of rebuilding an (id, version)
+// tuple per diverted call -- one C probe replaces a Python loop, and the
+// single-writer store below keeps the certificate paired with the memo it
+// validates.
+PyObject* call_dispatcher_fingerprint_matches(PyObject* self,
+                                              PyObject* const* args,
+                                              Py_ssize_t nargs) {
+    auto* d = reinterpret_cast<CallDispatcher*>(self);
+    bool matched = false;
+    if (d->fast != nullptr) {
+        if (auto* st = trampoline_state_from_callable(d->fast)) {
+            matched = trampoline_fingerprint_matches(st, args, nargs);
+        }
+    }
+    if (matched) Py_RETURN_TRUE;
+    Py_RETURN_FALSE;
+}
+
+// Single writer of the steady-state fingerprint: called once per fully
+// resolved Python call with that call's positional arguments.  Arguments
+// the fingerprint cannot describe clear the stored state instead, so a
+// stored fingerprint is always paired with the memo built alongside it.
+PyObject* call_dispatcher_fingerprint_store(PyObject* self,
+                                            PyObject* const* args,
+                                            Py_ssize_t nargs) {
+    auto* d = reinterpret_cast<CallDispatcher*>(self);
+    if (d->fast != nullptr) {
+        if (auto* st = trampoline_state_from_callable(d->fast)) {
+            trampoline_fingerprint_store(st, args, nargs);
+        }
+    }
+    Py_RETURN_NONE;
+}
+
+// Invalidate the stored fingerprint (specialization switch to a lowering
+// without a trampoline, keyword-bearing calls): no certificate may outlive
+// the memo it was stored with.
+PyObject* call_dispatcher_fingerprint_clear(PyObject* self,
+                                            PyObject* const* /*args*/,
+                                            Py_ssize_t /*nargs*/) {
+    auto* d = reinterpret_cast<CallDispatcher*>(self);
+    if (d->fast != nullptr) {
+        if (auto* st = trampoline_state_from_callable(d->fast)) {
+            trampoline_fingerprint_reset(st);
+        }
+    }
+    Py_RETURN_NONE;
+}
+
 int call_dispatcher_traverse(PyObject* self, visitproc visit, void* arg) {
     auto* d = reinterpret_cast<CallDispatcher*>(self);
     Py_VISIT(d->python_entry);
@@ -310,6 +455,15 @@ bool capture_busy_probe() {
 
 PyMethodDef dispatcher_methods[] = {
     {"tpx_set_fast", (PyCFunction)(void(*)(void))call_dispatcher_set_fast,
+     METH_FASTCALL, nullptr},
+    {"tpx_fingerprint_matches",
+     (PyCFunction)(void(*)(void))call_dispatcher_fingerprint_matches,
+     METH_FASTCALL, nullptr},
+    {"tpx_fingerprint_store",
+     (PyCFunction)(void(*)(void))call_dispatcher_fingerprint_store,
+     METH_FASTCALL, nullptr},
+    {"tpx_fingerprint_clear",
+     (PyCFunction)(void(*)(void))call_dispatcher_fingerprint_clear,
      METH_FASTCALL, nullptr},
     {nullptr, nullptr, 0, nullptr},
 };

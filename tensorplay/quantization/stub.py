@@ -1,9 +1,10 @@
-"""Quant/DeQuant stubs for float<->Int8 conversion points in a model.
+"""Quant/DeQuant stubs for float<->quantized conversion points in a model.
 
 QuantStub calibrates on observed activations (training/QAT) and, once
-frozen, converts incoming floats to REAL Int8 tensors via the native
-quantize_per_tensor kernel.  DeQuantStub converts Int8 back to Float32 using
-the paired stub's parameters (or explicit ones).
+frozen, converts incoming floats to native QInt8 tensors via the
+quantize_per_tensor kernel.  DeQuantStub converts a quantized tensor back to
+Float32 through its own quantizer (or explicit parameters for raw code
+tensors).
 """
 
 import tensorplay
@@ -25,7 +26,7 @@ class QuantStub(nn.Module):
 
     def record(self, x):
         """Calibration entry point: feeds the batch to the inner FakeQuantize
-        observer without fake-quantizing (mirrors manual calibration loops)."""
+        observer without fake-quantizing (as manual calibration loops do)."""
         self.fake_quant.record(x)
         return x
 
@@ -35,7 +36,8 @@ class QuantStub(nn.Module):
         self.fake_quant.record(x)
         scale, zero_point = self.fake_quant.calculate_qparams()
         if not self.training and self.fake_quant.frozen:
-            # Inference path: produce a real Int8 tensor.
+            # Inference path: produce a native quantized tensor carrying
+            # its affine parameters.
             return _quantize_per_tensor(self=x, scale=scale,
                                         zero_point=zero_point)
         return self.fake_quant(x)
@@ -51,10 +53,13 @@ class DeQuantStub(nn.Module):
         self.zero_point = zero_point
 
     def forward(self, x):
+        if x.is_quantized():
+            # Native path: the tensor carries its own affine parameters.
+            return x.dequantize()
         if x.dtype != tensorplay.int8:
             raise TypeError(
-                "DeQuantStub expects an Int8 tensor; convert float inputs "
-                "through a QuantStub first")
+                "DeQuantStub expects a quantized (or raw Int8 code) tensor; "
+                "convert float inputs through a QuantStub first")
         scale = 1.0 if self.scale is None else float(self.scale)
         zero_point = 0 if self.zero_point is None else int(self.zero_point)
         return _dequantize_per_tensor(self=x, scale=scale,

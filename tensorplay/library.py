@@ -82,6 +82,51 @@ _DEFINED_LIBRARY_NAMESPACES: set[str] = set()
 # tensorplay/__init__, so every attribute below already exists).
 _is_grad_enabled = tensorplay.is_grad_enabled
 
+# Profiler session gate for automatic op-span emission.  Resolved lazily:
+# the bridge function exists whenever the compiled extension ships it, and
+# calling it is one atomic load.  Module-level None until the first lookup
+# keeps attribute access off the hot path.
+_profiler_is_active_fn = None
+_profiler_probe_done = False
+
+# Span source tag: distinguishes custom-op spans from hand-written
+# record_function annotations in exported traces.
+_SPAN_SRC_CUSTOM_OP = "custom_op"
+
+
+def _profiler_active() -> bool:
+    """True while a profiling session records on this process.
+
+    One atomic load via the compiled bridge; the binding object is cached
+    after the first call.  Falls back to False when the bridge is absent
+    (older extension), keeping the wrapper callable.
+    """
+    global _profiler_is_active_fn, _profiler_probe_done
+    if not _profiler_probe_done:
+        _profiler_is_active_fn = getattr(
+            tensorplay._C, "_profiler_is_active", None
+        )
+        _profiler_probe_done = True
+    return _profiler_is_active_fn is not None and _profiler_is_active_fn()
+
+
+# Live profiling sessions (nesting counted; the profiler start/stop hooks
+# call _note_profiling_start/_note_profiling_stop).  The eager paths read
+# this module global: one dict-free global load per custom-op call, so an
+# inactive session costs nothing and an active one emits an op span.
+_profiling_sessions = 0
+
+
+def _note_profiling_start() -> None:
+    global _profiling_sessions
+    _profiling_sessions += 1
+
+
+def _note_profiling_stop() -> None:
+    global _profiling_sessions
+    if _profiling_sessions > 0:
+        _profiling_sessions -= 1
+
 _COMPOSITE_KEYS = frozenset(
     {"CompositeExplicitAutograd", "CompositeImplicitAutograd"}
 )
@@ -218,6 +263,11 @@ class CustomOpDef:
         # ``None`` key holds the device-agnostic kernel (device_types=None).
         self._kernels: dict[str | None, Callable[..., Any]] = {}
         self._disabled_kernels: set[str] = set()
+        # Memoized _kernel_for resolutions, keyed by device key.  Every
+        # mutation of _kernels/_disabled_kernels clears this (registration
+        # and enable/disable are rare; the memo turns the per-call
+        # resolution into a single dict hit).
+        self._kernel_cache: dict[str | None, Callable[..., Any]] = {}
         self._fake_fn: Callable[..., Any] | None = None
         self._backward: Callable[..., Any] | None = None
         self._setup_context: Callable[..., Any] | None = None
@@ -238,6 +288,7 @@ class CustomOpDef:
         else:
             for key in self._device_keys:
                 self._kernels[key] = fn
+        self._kernel_cache.clear()
         self._mirror_native(self._device_keys, fn)
 
     # -- introspection -----------------------------------------------------
@@ -316,6 +367,7 @@ class CustomOpDef:
                 else:
                     for key in keys:
                         self._kernels[key] = f
+                self._kernel_cache.clear()
             self._mirror_native(keys, f)
             return f
 
@@ -455,6 +507,7 @@ class CustomOpDef:
                 )
             else:
                 self._disabled_kernels.add(key)
+                self._kernel_cache.clear()
         else:  # enable the kernel
             if not originally_disabled:
                 warnings.warn(
@@ -464,6 +517,7 @@ class CustomOpDef:
                 )
             else:
                 self._disabled_kernels.remove(key)
+                self._kernel_cache.clear()
         try:
             yield
         finally:
@@ -472,6 +526,7 @@ class CustomOpDef:
                 self._disabled_kernels.add(key)
             else:
                 self._disabled_kernels.discard(key)
+            self._kernel_cache.clear()
 
     def _build_autograd_class(self) -> type:
         op_def = self
@@ -511,14 +566,25 @@ class CustomOpDef:
         # the GIL and registration only ever swaps callables wholesale.
         if key is _UNSET:
             key = _first_device_key(args)
+        # Hot path: one dict hit for a previously resolved (key, state)
+        # combination.  _disabled_kernels membership dominates the miss
+        # path only when a kernel was toggled; both mutation sites clear
+        # the memo.
+        cache = self._kernel_cache
+        fn = cache.get(key)
+        if fn is not None:
+            return fn
         kernels = self._kernels
         if key is not None:
             fn = kernels.get(key)
             if fn is not None and key not in self._disabled_kernels:
+                cache[key] = fn
                 return fn
             # Disabled/shadowed concrete kernels fall back to the composite
         fn = kernels.get(None)
         if fn is not None:
+            if key is not None and key not in self._disabled_kernels:
+                cache[key] = fn
             return fn
         with _LOCK:  # cold error path only
             registered = sorted(str(item) for item in kernels)
@@ -556,19 +622,71 @@ class CustomOpDef:
 
         Shared by :meth:`__call__` and the native re-entry below so compiled
         graphs keep device dispatch AND ``register_autograd`` behavior.
-        Hot path: one device-key scan, one dict lookup, one call.
+        Hot path: one device-key scan, one dict lookup, one call.  The
+        autocast rule table stays empty for the common un-registered case,
+        so its branch is fully skipped there.
         """
 
-        key = _first_device_key(args)
-        rule = self._autocast_rules.get(key) if key is not None else None
-        if rule is not None and _autocast_enabled(key):
-            args = tuple(_cast_if_floating(v, rule) for v in args)
-            if kwargs:
-                kwargs = {
-                    k: _cast_if_floating(v, rule) for k, v in kwargs.items()
-                }
-        if self._autograd_cls is not None and _is_grad_enabled():
-            return self._autograd_cls.apply(*args, **kwargs)
+        if self._autograd_cls is not None:
+            key = _first_device_key(args)
+            if self._autocast_rules:
+                rule = self._autocast_rules.get(key) if key is not None else None
+                if rule is not None and _autocast_enabled(key):
+                    args = tuple(_cast_if_floating(v, rule) for v in args)
+                    if kwargs:
+                        kwargs = {
+                            k: _cast_if_floating(v, rule) for k, v in kwargs.items()
+                        }
+            if _is_grad_enabled():
+                if _profiling_sessions:
+                    return self._profiled(
+                        self._autograd_cls.apply, args, kwargs)
+                return self._autograd_cls.apply(*args, **kwargs)
+            return self._run_profiled(args, kwargs, key)
+        if self._autocast_rules:
+            key = _first_device_key(args)
+            rule = self._autocast_rules.get(key) if key is not None else None
+            if rule is not None and _autocast_enabled(key):
+                args = tuple(_cast_if_floating(v, rule) for v in args)
+                if kwargs:
+                    kwargs = {
+                        k: _cast_if_floating(v, rule) for k, v in kwargs.items()
+                    }
+            return self._run_profiled(args, kwargs, key)
+        return self._run_profiled(args, kwargs, None)
+
+    # -- profiler span emission --------------------------------------------
+
+    def _profiled(self, call, args, kwargs):
+        """Run ``call`` inside one user-annotation span (autograd path)."""
+        begin = tensorplay._C._profiler_user_begin
+        end = tensorplay._C._profiler_user_end
+        begin(self._name)
+        try:
+            return call(*args, **kwargs)
+        finally:
+            end()
+
+    def _run_profiled(
+        self, args: tuple[Any, ...], kwargs: dict[str, Any], key: Any
+    ) -> Any:
+        """Kernel invocation, emitting one op span when a session is live.
+
+        The session flag is a module-global load; outside profiling this is
+        the plain ``_kernel_for`` call with no extra work.  Inner calls the
+        kernel itself fires (e.g. a composite body) nest under this span
+        like ordinary operator records do.
+        """
+        if _profiling_sessions:
+            begin = tensorplay._C._profiler_user_begin
+            end = tensorplay._C._profiler_user_end
+            begin(self._name)
+            try:
+                return self._kernel_for(args, key)(*args, **kwargs)
+            finally:
+                end()
+        if key is None:
+            return self._kernel_for(args)(*args, **kwargs)
         return self._kernel_for(args, key)(*args, **kwargs)
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:

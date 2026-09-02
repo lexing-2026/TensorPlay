@@ -22,13 +22,13 @@ from tensorplay import primitives
 from tensorplay.primitives.common import TensorLike
 
 # Operations in this set bypass interpretation and execute directly.
-torch_function_passthrough = frozenset({})
+function_passthrough = frozenset({})
 
 _R = TypeVar("_R")
 
 
 @functools.cache
-def torch_to_refs_map() -> dict[Any, Any]:
+def tensorplay_to_refs_map() -> dict[Any, Any]:
     """Build the callable-to-primitive mapping used by the active mode.
 
     Public functions exported by the primitive namespace are matched by
@@ -62,7 +62,7 @@ def all_prims() -> set[Any]:
     return {getattr(primitives, s) for s in primitives.__all__ if hasattr(primitives, s)}
 
 
-class TorchRefsMode:
+class TensorPlayRefsMode:
     """Context manager that reinterprets public API calls as primitives.
 
     ``strict`` raises when an operation has no registered primitive.  The
@@ -83,18 +83,18 @@ class TorchRefsMode:
         self.prims_mode_cls = prims_mode_cls
 
     def __enter__(self):
-        self._prev = getattr(_torch_refs_mode_state, "value", None)
-        _torch_refs_mode_state.value = self
+        self._prev = getattr(_tensorplay_refs_mode_state, "value", None)
+        _tensorplay_refs_mode_state.value = self
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self._prev is None:
-            del _torch_refs_mode_state.value
+            del _tensorplay_refs_mode_state.value
         else:
-            _torch_refs_mode_state.value = self._prev
+            _tensorplay_refs_mode_state.value = self._prev
         return False
 
-    def __torch_function__(
+    def __tensorplay_function__(
         self,
         orig_func: Callable[..., Any],
         types: Sequence[type],
@@ -103,10 +103,10 @@ class TorchRefsMode:
     ) -> Any:
         if kwargs is None:
             kwargs = {}
-        if orig_func in torch_function_passthrough or orig_func in all_prims():
+        if orig_func in function_passthrough or orig_func in all_prims():
             with self.prims_mode_cls():
                 return orig_func(*args, **kwargs)
-        mapping = torch_to_refs_map()
+        mapping = tensorplay_to_refs_map()
         func = mapping.get(orig_func, None)
         if func is not None:
             if self.should_fallback_fn(self, orig_func, func, args, kwargs):
@@ -119,10 +119,15 @@ class TorchRefsMode:
 
 
 class _ModeState:
-    value: TorchRefsMode | None = None
+    value: TensorPlayRefsMode | None = None
 
 
-_torch_refs_mode_state = _ModeState()
+_tensorplay_refs_mode_state = _ModeState()
 
 
-__all__ = ["TorchRefsMode", "all_prims", "torch_to_refs_map", "torch_function_passthrough"]
+__all__ = [
+    "TensorPlayRefsMode",
+    "all_prims",
+    "tensorplay_to_refs_map",
+    "function_passthrough",
+]

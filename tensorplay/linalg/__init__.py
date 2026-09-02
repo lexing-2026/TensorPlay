@@ -50,6 +50,7 @@ from ._matrix_functions import (
     multi_dot,
     vander,
     vecdot,
+    vdot,
 )
 from ._norms import cond, matrix_norm, matrix_rank, norm, vector_norm
 from ._solve import (
@@ -76,5 +77,5 @@ __all__ = [
     "matrix_norm", "matmul", "diagonal", "multi_dot", "svd", "svdvals",
     "cond", "pinv", "matrix_exp", "matrix_sqrth", "solve",
     "solve_triangular", "lu_factor", "lu_factor_ex", "lu_solve", "lu",
-    "tensorinv", "tensorsolve", "qr", "polar", "vander", "vecdot",
+    "tensorinv", "tensorsolve", "qr", "polar", "vander", "vecdot", "vdot",
 ]

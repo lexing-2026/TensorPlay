@@ -7,6 +7,7 @@ from . import _utils
 from ._utils import (
     GraphCaptureError,
     _capture_disabled,
+    _active_tracer,
     _iter_nodes,
     compiler_context,
     gate_outcome,
@@ -243,12 +244,13 @@ class Tracer:
     ) -> "GraphModule":
         self.root = root
         self.sample_inputs = dict(sample_inputs or {})
-        
+        tracer_token = _active_tracer.set(self)
         _utils._TRACE_DEPTH += 1
         try:
             return self._trace_impl(root)
         finally:
             _utils._TRACE_DEPTH -= 1
+            _active_tracer.reset(tracer_token)
 
     def _trace_impl(self, root: Any) -> "GraphModule":
         if _is_module(root):

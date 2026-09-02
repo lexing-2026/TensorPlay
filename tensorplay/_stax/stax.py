@@ -321,6 +321,37 @@ def _attach_fast_call(lowering: Any, exec_fn: Any = None) -> None:
     )
 
 
+def _metadata_fingerprint(value: Any) -> Any:
+    """Metadata snapshot for tensors outside the version-counter contract.
+
+    Only reached when ``_version`` is unavailable and the tensor is not an
+    inference tensor; every component is normalized so the snapshot stays
+    comparable across calls.
+    """
+
+    shape = getattr(value, "shape", ())
+    if callable(shape):
+        shape = shape()
+    try:
+        shape = tuple(int(item) for item in shape)
+    except (TypeError, ValueError):
+        shape = repr(shape)
+    stride = getattr(value, "stride", ())
+    if callable(stride):
+        stride = stride()
+    try:
+        stride = tuple(int(item) for item in stride)
+    except (TypeError, ValueError):
+        stride = repr(stride)
+    dtype = getattr(value, "dtype", None)
+    if callable(dtype):
+        dtype = dtype()
+    device = getattr(value, "device", None)
+    if callable(device):
+        device = device()
+    return ("metadata", shape, stride, dtype, device)
+
+
 class _NativeLowering:
     def __init__(
         self,
@@ -360,27 +391,12 @@ class _NativeLowering:
                 try:
                     version = value._version
                 except RuntimeError:
-                    shape = getattr(value, "shape", ())
-                    if callable(shape):
-                        shape = shape()
-                    try:
-                        shape = tuple(int(item) for item in shape)
-                    except (TypeError, ValueError):
-                        shape = repr(shape)
-                    stride = getattr(value, "stride", ())
-                    if callable(stride):
-                        stride = stride()
-                    try:
-                        stride = tuple(int(item) for item in stride)
-                    except (TypeError, ValueError):
-                        stride = repr(stride)
-                    dtype = getattr(value, "dtype", None)
-                    if callable(dtype):
-                        dtype = dtype()
-                    device = getattr(value, "device", None)
-                    if callable(device):
-                        device = device()
-                    version = ("metadata", shape, stride, dtype, device)
+                    # Inference tensors carry no version counter and are
+                    # immutable, so the identity alone keys the entry: no
+                    # metadata snapshot, no divert on the next call.
+                    if getattr(value, "is_inference", lambda: False)():
+                        return ("t", id(value), None)
+                    version = _metadata_fingerprint(value)
                 return (
                     "t",
                     id(value),
@@ -446,11 +462,17 @@ class _CpuFusedPointwiseLowering(_NativeLowering):
         strict_native: bool = False,
         native_runner: Any = None,
         native_direct: int = 0,
+        expected_layouts: tuple[tuple[tuple[int, ...], tuple[int, ...]], ...]
+        | None = None,
     ) -> None:
         super().__init__(graph_module, graph, attribute_targets)
         self._expected_shape = expected_shape
         self._expected_dtype = expected_dtype
         self._expected_device = expected_device
+        # Per-input (shape, strides) pinned at lowering time; set only for
+        # broadcast/strided specializations whose generated addressing is
+        # valid for exactly these layouts.
+        self._expected_layouts = expected_layouts
         self._gradient_plan = gradient_plan
         self._strict_native = strict_native
         self._tensorplay_codegen = "stax-fused-cpu"
@@ -499,6 +521,8 @@ class _CpuFusedPointwiseLowering(_NativeLowering):
         expected_shape: tuple[int, ...],
         expected_dtype: Any,
         expected_device: Any,
+        expected_layouts: tuple[tuple[tuple[int, ...], tuple[int, ...]], ...]
+        | None = None,
     ) -> bool:
         try:
             import tensorplay
@@ -506,6 +530,21 @@ class _CpuFusedPointwiseLowering(_NativeLowering):
             tensor_type = tensorplay.Tensor
         except (AttributeError, ImportError):
             return False
+        if expected_layouts is not None:
+            if len(inputs) != len(expected_layouts):
+                return False
+            # Broadcast/strided specializations pin each input's exact
+            # (shape, strides): the generated addressing was proven for
+            # that layout, so any deviation must re-lower.
+            return bool(inputs) and all(
+                isinstance(value, tensor_type)
+                and value.device.is_cpu()
+                and value.dtype == expected_dtype
+                and value.device == expected_device
+                and tuple(int(item) for item in value.shape) == layout[0]
+                and tuple(int(item) for item in value.stride()) == layout[1]
+                for value, layout in zip(inputs, expected_layouts)
+            )
         return bool(inputs) and all(
             isinstance(value, tensor_type)
             and value.device.is_cpu()
@@ -552,27 +591,11 @@ class _CpuFusedPointwiseLowering(_NativeLowering):
             try:
                 version = value._version
             except RuntimeError:
-                shape = getattr(value, "shape", ())
-                if callable(shape):
-                    shape = shape()
-                try:
-                    shape = tuple(int(item) for item in shape)
-                except (TypeError, ValueError):
-                    shape = repr(shape)
-                stride = getattr(value, "stride", ())
-                if callable(stride):
-                    stride = stride()
-                try:
-                    stride = tuple(int(item) for item in stride)
-                except (TypeError, ValueError):
-                    stride = repr(stride)
-                dtype = getattr(value, "dtype", None)
-                if callable(dtype):
-                    dtype = dtype()
-                device = getattr(value, "device", None)
-                if callable(device):
-                    device = device()
-                version = ("metadata", shape, stride, dtype, device)
+                # Inference tensors are immutable: the identity alone keys
+                # the entry, no metadata snapshot needed.
+                if getattr(value, "is_inference", lambda: False)():
+                    return ("t", id(value), None)
+                version = _metadata_fingerprint(value)
             return (
                 "t",
                 id(value),
@@ -587,6 +610,7 @@ class _CpuFusedPointwiseLowering(_NativeLowering):
             self._expected_shape,
             self._expected_dtype,
             self._expected_device,
+            getattr(self, "_expected_layouts", None),
         ):
             return "fallback"
         if self._gradient_plan is not None and any(
@@ -728,10 +752,17 @@ def _build_pointwise_program(
         kwargs = node.kwargs or {}
         result_type = "num"
 
-        if op_name in {"add", "sub"} and len(node.args) == 3 and "alpha" not in (
-            kwargs
+        if op_name in {"add", "sub"} and (
+            len(node.args) == 3
+            or ("alpha" in (node.kwargs or {}) and len(node.args) == 2)
         ):
-            lhs, rhs, alpha = node.args
+            if len(node.args) == 3 and "alpha" not in kwargs:
+                lhs, rhs, alpha = node.args
+            else:
+                if len(node.args) != 2:
+                    return None
+                lhs, rhs = node.args
+                alpha = kwargs.get("alpha", 1)
             if not _is_scalar(alpha):
                 return None
             lhs_ref = value_ref(lhs)
@@ -838,6 +869,24 @@ def _build_pointwise_program(
     return external_nodes, program, constants, instructions, refs[output_values[0]]
 
 
+def _broadcast_shape(shapes: tuple[tuple[int, ...], ...]) -> tuple[int, ...] | None:
+    """Broadcast several shapes to one result shape (``None`` on mismatch)."""
+
+    rank = max((len(s) for s in shapes), default=0)
+    result: list[int] = []
+    for dim in range(rank):
+        extent = 1
+        for shape in shapes:
+            idx = dim - (rank - len(shape))
+            d = shape[idx] if idx >= 0 else 1
+            if d != 1:
+                if extent != 1 and extent != d:
+                    return None
+                extent = d
+        result.append(extent)
+    return tuple(result)
+
+
 def _lower_cpu_fused_pointwise(
     graph_module: GraphModule,
     example_inputs: list[Any],
@@ -882,11 +931,39 @@ def _lower_cpu_fused_pointwise(
     ):
         return None
     if any(
-        value.device != first.device
-        or value.dtype != first.dtype
-        or value.shape != first.shape
-        or not value.is_contiguous()
+        value.device != first.device or value.dtype != first.dtype
         for value in example_inputs[1:]
+    ):
+        return None
+    # Broadcast/strided acceptance: inputs may differ in shape or layout as
+    # long as the emitter can prove every address it generates contiguous
+    # within a vector.  Everything else keeps the generic fallback.
+    input_shapes = tuple(
+        tuple(int(item) for item in value.shape) for value in example_inputs
+    )
+    input_strides = tuple(
+        tuple(int(item) for item in value.stride()) for value in example_inputs
+    )
+    output_shape = input_shapes[0]
+    if _broadcast_shape(input_shapes) != output_shape:
+        return None
+    try:
+        from .codegen.cpp import analyze_input_modes
+
+        input_modes = analyze_input_modes(
+            input_shapes, input_strides, output_shape, lane_count=16
+        )
+    except (TypeError, ValueError):
+        return None
+    if input_modes is None:
+        return None
+    # Legacy surface (every input flat) keeps the program-interpreter
+    # fallback; anything else requires the compiled kernel, whose generated
+    # addressing is only valid for these exact layouts, and a grad-free
+    # graph (the fused backward program assumes flat inputs).
+    layouts_only = any(mode != "flat" for mode, _ in input_modes)
+    if layouts_only and any(
+        value.requires_grad for value in example_inputs
     ):
         return None
 
@@ -924,6 +1001,8 @@ def _lower_cpu_fused_pointwise(
             output_ref,
             shape=first.shape,
             device=first.device,
+            input_shapes=input_shapes,
+            input_strides=input_strides,
         )
         if isinstance(built, tuple):
             native_runner, native_direct = built
@@ -933,6 +1012,10 @@ def _lower_cpu_fused_pointwise(
         native_runner = None
         native_direct = 0
     if extended and native_runner is None:
+        return None
+    # Broadcast/strided layouts have no interpreter-compatible program: the
+    # compiled kernel is the only route that can address them.
+    if layouts_only and native_runner is None:
         return None
 
     try:
@@ -956,7 +1039,7 @@ def _lower_cpu_fused_pointwise(
         return None
 
     gradient_plan: tuple[list[int], list[float], tuple[int, ...]] | None = None
-    if not extended and any(
+    if not extended and not layouts_only and any(
         value.requires_grad for value in example_inputs
     ):
         if any(op_name not in _CPU_FUSED_AUTOGRAD_OPS for op_name, *_ in instructions):
@@ -986,6 +1069,9 @@ def _lower_cpu_fused_pointwise(
         strict_native,
         native_runner,
         native_direct,
+        expected_layouts=(
+            tuple(zip(input_shapes, input_strides)) if layouts_only else None
+        ),
     )
 
 
@@ -1813,12 +1899,20 @@ def _lower_native(
             continue
 
         # ``alpha`` argument, so their graph node has
-        # ``(input, other, alpha)`` even when alpha is the default 1.  Lower
-        # that contract to the native pointwise IR instead of falling back to
-        # a Python method call.  Non-unit alpha becomes a scalar multiply and
-        # can be consumed by Stax's mul-add fusion pass.
-        if op_name in {"add", "sub"} and len(node.args) == 3:
-            input_node, other_node, alpha = node.args
+        # ``(input, other, alpha)`` even when alpha is the default 1, and
+        # keyword-only spellings record alpha in the node kwargs.  Lower
+        # that contract to the native pointwise IR instead of falling back
+        # to a Python method call.  Non-unit alpha becomes a scalar multiply
+        # and can be consumed by Stax's mul-add fusion pass.
+        if op_name in {"add", "sub"} and (
+            len(node.args) == 3
+            or (len(node.args) == 2 and "alpha" in (node.kwargs or {}))
+        ):
+            if len(node.args) == 3 and not node.kwargs:
+                input_node, other_node, alpha = node.args
+            else:
+                input_node, other_node = node.args
+                alpha = node.kwargs.get("alpha", 1)
             if not isinstance(input_node, Node) or not _is_scalar(alpha):
                 return None
             if input_node not in values:
@@ -2922,6 +3016,8 @@ def stax(
         raise RuntimeError(
             "strict_native Stax lowering failed: captured graph has no native executable"
         )
-    raise RuntimeError(
-        "Stax could not lower the captured graph to a native executable"
-    )
+    # No native executable exists for this graph (scalar placeholders,
+    # factory-only regions, unsupported surface).  Fall back to the
+    # generated Python executor so the region still runs with captured
+    # semantics instead of failing to compile.
+    return graph_module.recompile()

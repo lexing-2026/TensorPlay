@@ -1,8 +1,8 @@
-"""Real Int8 modules for inference after quantization.
+"""Real quantized modules for inference after quantization.
 
-Int8 closed loop: activations are pre-quantized Int8 [M,K] tensors, weights
-are stored as per-channel Int8 with their scales/zero_points, and the fused
-native kernel produces a Float32 [M,N] output.
+Closed loop: activations are native QInt8 tensors carrying their affine
+parameters, weights are stored as per-channel QInt8, and the fused native
+kernel produces a Float32 [M,N] output.
 """
 
 import tensorplay
@@ -10,6 +10,7 @@ from tensorplay import nn
 from tensorplay._C import (
     quantize_per_channel as _quantize_per_channel,
     quantized_linear as _quantized_linear,
+    _make_per_tensor_quantized_tensor as _make_per_tensor_quantized_tensor,
 )
 
 from .observer import ObserverBase
@@ -18,7 +19,7 @@ __all__ = ["QuantizedLinear"]
 
 
 class QuantizedLinear(nn.Module):
-    """Applies a linear transformation on an Int8 input with Int8 weights.
+    """Applies a linear transformation on a quantized input with QInt8 weights.
 
     out[m, n] = input_scale * weight_scales[n] *
                 sum_k (x_q[m,k] - input_zero_point) *
@@ -29,8 +30,8 @@ class QuantizedLinear(nn.Module):
                  input_zero_point, qweight, weight_scales, weight_zero_points,
                  bias=None):
         super().__init__()
-        if qweight.dtype != tensorplay.int8:
-            raise TypeError("QuantizedLinear expects Int8 weights")
+        if qweight.dtype not in (tensorplay.qint8, tensorplay.int8):
+            raise TypeError("QuantizedLinear expects QInt8 (or raw Int8) weights")
         self.in_features = int(in_features)
         self.out_features = int(out_features)
         self.input_scale = float(input_scale)
@@ -47,10 +48,19 @@ class QuantizedLinear(nn.Module):
             self.bias = None
 
     def forward(self, x):
-        if x.dtype != tensorplay.int8:
+        if x.is_quantized():
+            if x.dtype != tensorplay.qint8:
+                raise TypeError(
+                    "QuantizedLinear expects QInt8 activations, got "
+                    f"{x.dtype}")
+        elif x.dtype == tensorplay.int8:
+            # Raw code tensor: wrap it with this module's activation qparams.
+            x = _make_per_tensor_quantized_tensor(
+                x, self.input_scale, self.input_zero_point)
+        else:
             raise TypeError(
-                "QuantizedLinear expects an Int8 activation tensor; run it "
-                "through QuantStub (or quantize_per_tensor) first")
+                "QuantizedLinear expects a quantized activation tensor; run "
+                "it through QuantStub (or quantize_per_tensor) first")
         return _quantized_linear(
             x, self.qweight, input_scale=self.input_scale,
             input_zero_point=self.input_zero_point,

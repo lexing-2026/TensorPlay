@@ -110,7 +110,7 @@ class SparseSemiStructuredTensor(Tensor):
             self.requires_grad = True
 
     @classmethod
-    def __torch_dispatch__(cls, func, types, args, kwargs=None):
+    def __tensorplay_dispatch__(cls, func, types, args, kwargs=None):
         op_name = getattr(func, "__name__", func)
         if not isinstance(op_name, str):
             op_name = getattr(func, "name", str(func))

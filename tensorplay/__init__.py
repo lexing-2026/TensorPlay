@@ -246,6 +246,9 @@ complex128 = DType.complex128
 bcomplex32 = DType.bcomplex32
 bool = DType.bool
 undefined = DType.undefined
+qint8 = DType.qint8
+quint8 = DType.quint8
+qint32 = DType.qint32
 
 half = DType.float16
 float = DType.float32
@@ -268,6 +271,18 @@ class MemoryFormat(IntEnum):
     channels_last = 2
     channels_last_3d = 3
 
+
+class QScheme(IntEnum):
+    """Quantization scheme attached to a quantized tensor's quantizer."""
+
+    PER_TENSOR_AFFINE = 0
+    PER_CHANNEL_AFFINE = 1
+    per_tensor_affine = 0
+    per_channel_affine = 1
+
+
+per_tensor_affine = QScheme.PER_TENSOR_AFFINE
+per_channel_affine = QScheme.PER_CHANNEL_AFFINE
 
 
 class Layout(IntEnum):
@@ -301,6 +316,7 @@ __all__ = [
     "MemoryFormat", "contiguous_format", "preserve_format", "channels_last", "channels_last_3d",
     "uint8", "int8", "int16", "uint16", "uint32", "uint64", "int32", "int64",
     "float16", "bfloat16", "float32", "float64", "complex32", "complex64", "complex128", "bcomplex32", "bool",
+    "qint8", "quint8", "qint32", "QScheme", "per_tensor_affine", "per_channel_affine",
     "half", "float", "double", "short", "int", "long", "cfloat", "cdouble", "chalf",
     "save", "load", "inspect_checkpoint", "as_tensor",
     "no_grad", "enable_grad", "set_grad_enabled", "is_grad_enabled",
@@ -974,6 +990,15 @@ __all__.extend(
 from tensorplay import functional as functional
 from tensorplay.functional import *
 
+# Keep package-level dtype aliases and composite signatures after importing
+# the generated function surface.
+chalf = DType.complex32
+from tensorplay._shape_funcs import (
+    block_diag as block_diag,
+    broadcast_tensors as broadcast_tensors,
+    tensordot as tensordot,
+)
+
 # Re-pin the einsum shim: functional.py's thin wrapper predates the sublist
 # quantile/nanquantile/histogram need the same treatment: the generated
 # functional.py wrappers forward a raw Python-number `q` (the _C binding
@@ -1013,19 +1038,17 @@ _min_return_type = _collections.namedtuple("min_return_type", ["values", "indice
 def max(input, other=None, *, dim=None, keepdim=False):
     if other is not None:
         return _C.maximum(input, other)
-    result = functional.max(input, dim=dim, keepdim=keepdim)
-    if dim is not None and isinstance(result, tuple):
-        return _max_return_type(*result)
-    return result
+    if dim is not None:
+        return _max_return_type(*_C.max(input, dim, keepdim))
+    return functional.max(input)
 
 
 def min(input, other=None, *, dim=None, keepdim=False):
     if other is not None:
         return _C.minimum(input, other)
-    result = functional.min(input, dim=dim, keepdim=keepdim)
-    if dim is not None and isinstance(result, tuple):
-        return _min_return_type(*result)
-    return result
+    if dim is not None:
+        return _min_return_type(*_C.min(input, dim, keepdim))
+    return functional.min(input)
 
 
 def gradient(input, *, spacing=None, dim=None, edge_order=1):

@@ -1,9 +1,70 @@
+"""Utilities for filling tensors with values drawn from common
+initialization distributions."""
+
 import math
 import warnings
+
 import tensorplay as tp
 
+__all__ = [
+    "calculate_gain",
+    "uniform_",
+    "normal_",
+    "trunc_normal_",
+    "constant_",
+    "ones_",
+    "zeros_",
+    "eye_",
+    "dirac_",
+    "xavier_uniform_",
+    "xavier_normal_",
+    "kaiming_uniform_",
+    "kaiming_normal_",
+    "orthogonal_",
+    "sparse_",
+]
+
+_FLOATING_DTYPES = (
+    tp.float16,
+    tp.bfloat16,
+    tp.float32,
+    tp.float64,
+)
+
+
+def _cast_scalar_like(value, dtype):
+    """Round a python number to the precision of ``dtype`` (floating
+    dtypes only); returns the original value otherwise."""
+    if dtype in _FLOATING_DTYPES:
+        return tp.tensor(value, dtype=dtype).item()
+    return value
+
+
+def _uniform_fill_(tensor, a, b, generator=None):
+    """Fill ``tensor`` in-place from U(a, b) without tracking gradients.
+
+    ``generator`` routes the draw through the given generator stream;
+    without one the default global stream is used.
+    """
+    with tp.no_grad():
+        return tensor.uniform_(a, b, generator=generator)
+
+
+def _normal_fill_(tensor, mean, std, generator=None):
+    with tp.no_grad():
+        return tensor.normal_(mean, std, generator=generator)
+
+
 def calculate_gain(nonlinearity, param=None):
-    linear_fns = ['linear', 'conv1d', 'conv2d', 'conv3d', 'conv_transpose1d', 'conv_transpose2d', 'conv_transpose3d']
+    """Return the recommended gain value for the given nonlinearity.
+
+    Supported names: linear/conv{1,2,3}d/conv_transpose{1,2,3}d and
+    sigmoid map to 1, tanh to 5/3, relu to sqrt(2), selu to 3/4, and
+    leaky_relu to sqrt(2 / (1 + negative_slope**2)) where the slope is
+    taken from ``param`` (default 0.01).
+    """
+    linear_fns = ['linear', 'conv1d', 'conv2d', 'conv3d', 'conv_transpose1d',
+                  'conv_transpose2d', 'conv_transpose3d']
     if nonlinearity in linear_fns or nonlinearity == 'sigmoid':
         return 1
     elif nonlinearity == 'tanh':
@@ -20,60 +81,87 @@ def calculate_gain(nonlinearity, param=None):
             raise ValueError("negative_slope {} not a valid number".format(param))
         return math.sqrt(2.0 / (1 + negative_slope ** 2))
     elif nonlinearity == 'selu':
-        return 3.0 / 4  # Value from SNN paper
+        return 3.0 / 4
     else:
         raise ValueError("Unsupported nonlinearity {}".format(nonlinearity))
 
-def uniform_(tensor, a=0.0, b=1.0):
-    with tp.no_grad():
-        return tensor.uniform_(a, b)
 
-def normal_(tensor, mean=0.0, std=1.0):
-    with tp.no_grad():
-        return tensor.normal_(mean, std)
+def uniform_(tensor, a=0.0, b=1.0, generator=None):
+    """Fill ``tensor`` in-place with samples from U(a, b)."""
+    return _uniform_fill_(tensor, a, b, generator)
+
+
+def normal_(tensor, mean=0.0, std=1.0, generator=None):
+    """Fill ``tensor`` in-place with samples from N(mean, std^2)."""
+    return _normal_fill_(tensor, mean, std, generator)
+
 
 def constant_(tensor, val):
+    """Fill ``tensor`` in-place with the scalar ``val``."""
     with tp.no_grad():
         return tensor.fill_(val)
 
+
 def ones_(tensor):
+    """Fill ``tensor`` in-place with the scalar value 1."""
     with tp.no_grad():
         return tensor.fill_(1)
 
+
 def zeros_(tensor):
+    """Fill ``tensor`` in-place with the scalar value 0."""
     with tp.no_grad():
         return tensor.fill_(0)
 
+
 def eye_(tensor):
+    """Fill the 2-D ``tensor`` in-place with the identity matrix.
+
+    As many inputs as possible are preserved through a Linear layer.
+    """
     if tensor.ndimension() != 2:
         raise ValueError("Only tensors with 2 dimensions are supported")
-        
+
     with tp.no_grad():
-        # Implementation via copy since eye_ might not be native
-        # tp.eye creates a new tensor, we copy it to tensor
-        rows, cols = tensor.shape
-        tensor.copy_(tp.eye(rows, cols, dtype=tensor.dtype, device=tensor.device))
-        return tensor
+        tensor.zero_()
+        n = min(tensor.shape[0], tensor.shape[1])
+        idx = tp.arange(n, device=tensor.device)
+        tensor[idx, idx] = 1
+    return tensor
+
 
 def dirac_(tensor, groups=1):
+    """Fill the {3, 4, 5}-D ``tensor`` in-place with Dirac delta kernels.
+
+    Preserves identity of inputs in convolutional layers; with
+    ``groups > 1`` each group of output channels preserves identity
+    independently.
+    """
     dimensions = tensor.ndimension()
     if dimensions not in [3, 4, 5]:
         raise ValueError("Only tensors with 3, 4, or 5 dimensions are supported")
-    
+
     sizes = tensor.shape
-    min_dim = min(sizes[0], sizes[1])
+    if sizes[0] % groups != 0:
+        raise ValueError("dim 0 must be divisible by groups")
+
+    out_chans_per_grp = sizes[0] // groups
+    min_dim = min(out_chans_per_grp, sizes[1])
+
     with tp.no_grad():
         tensor.zero_()
         for g in range(groups):
-            for i in range(min_dim // groups):
-                d = i + g * (min_dim // groups)
+            for d in range(min_dim):
                 if dimensions == 3:  # Temporal convolution
-                    tensor[d, d, sizes[2] // 2] = 1
+                    tensor[g * out_chans_per_grp + d, d, sizes[2] // 2] = 1
                 elif dimensions == 4:  # Spatial convolution
-                    tensor[d, d, sizes[2] // 2, sizes[3] // 2] = 1
+                    tensor[g * out_chans_per_grp + d, d,
+                           sizes[2] // 2, sizes[3] // 2] = 1
                 else:  # Volumetric convolution
-                    tensor[d, d, sizes[2] // 2, sizes[3] // 2, sizes[4] // 2] = 1
+                    tensor[g * out_chans_per_grp + d, d,
+                           sizes[2] // 2, sizes[3] // 2, sizes[4] // 2] = 1
     return tensor
+
 
 def _calculate_fan_in_and_fan_out(tensor):
     dimensions = tensor.ndimension()
@@ -82,50 +170,13 @@ def _calculate_fan_in_and_fan_out(tensor):
 
     num_input_fmaps = tensor.size(1)
     num_output_fmaps = tensor.size(0)
-    receptive_field_size = 1
-    if tensor.dim() > 2:
-        # math.prod is available in Python 3.8+
-        # receptive_field_size = math.prod(tensor.shape[2:])
-        receptive_field_size = 1
-        for s in list(tensor.shape)[2:]:
-            receptive_field_size *= s
-            
+    receptive_field_size = math.prod(tensor.shape[2:]) if tensor.dim() > 2 else 1
+
     fan_in = num_input_fmaps * receptive_field_size
     fan_out = num_output_fmaps * receptive_field_size
 
     return fan_in, fan_out
 
-def xavier_uniform_(tensor, gain=1.0):
-    fan_in, fan_out = _calculate_fan_in_and_fan_out(tensor)
-    std = gain * math.sqrt(2.0 / (float(fan_in + fan_out)))
-    a = math.sqrt(3.0) * std  # Calculate uniform bounds from standard deviation
-    return uniform_(tensor, -a, a)
-
-def xavier_normal_(tensor, gain=1.0):
-    fan_in, fan_out = _calculate_fan_in_and_fan_out(tensor)
-    std = gain * math.sqrt(2.0 / (float(fan_in + fan_out)))
-    return normal_(tensor, 0., std)
-
-def kaiming_uniform_(tensor, a=0, mode='fan_in', nonlinearity='leaky_relu'):
-    if 0 in tensor.shape:
-        warnings.warn("Initializing zero-element tensor")
-        return tensor
-    fan = _calculate_correct_fan(tensor, mode)
-    gain = calculate_gain(nonlinearity, a)
-    std = gain / math.sqrt(fan)
-    bound = math.sqrt(3.0) * std  # Calculate uniform bounds from standard deviation
-    with tp.no_grad():
-        return tensor.uniform_(-bound, bound)
-
-def kaiming_normal_(tensor, a=0, mode='fan_in', nonlinearity='leaky_relu'):
-    if 0 in tensor.shape:
-        warnings.warn("Initializing zero-element tensor")
-        return tensor
-    fan = _calculate_correct_fan(tensor, mode)
-    gain = calculate_gain(nonlinearity, a)
-    std = gain / math.sqrt(fan)
-    with tp.no_grad():
-        return tensor.normal_(0, std)
 
 def _calculate_correct_fan(tensor, mode):
     mode = mode.lower()
@@ -137,16 +188,56 @@ def _calculate_correct_fan(tensor, mode):
     return fan_in if mode == 'fan_in' else fan_out
 
 
-def trunc_normal_(tensor, mean=0.0, std=1.0, a=-2.0, b=2.0):
+def xavier_uniform_(tensor, gain=1.0, generator=None):
+    """Fill ``tensor`` in-place with U(-a, a) where
+    a = gain * sqrt(6 / (fan_in + fan_out))."""
+    fan_in, fan_out = _calculate_fan_in_and_fan_out(tensor)
+    std = gain * math.sqrt(2.0 / (float(fan_in + fan_out)))
+    a = math.sqrt(3.0) * std  # Calculate uniform bounds from standard deviation
+    return _uniform_fill_(tensor, -a, a, generator)
+
+
+def xavier_normal_(tensor, gain=1.0, generator=None):
+    """Fill ``tensor`` in-place with N(0, std^2) where
+    std = gain * sqrt(2 / (fan_in + fan_out))."""
+    fan_in, fan_out = _calculate_fan_in_and_fan_out(tensor)
+    std = gain * math.sqrt(2.0 / (float(fan_in + fan_out)))
+    return _normal_fill_(tensor, 0., std, generator)
+
+
+def kaiming_uniform_(tensor, a=0, mode='fan_in', nonlinearity='leaky_relu',
+                     generator=None):
+    """Fill ``tensor`` in-place with U(-bound, bound) where
+    bound = gain * sqrt(3 / fan)."""
+    if 0 in tensor.shape:
+        warnings.warn("Initializing zero-element tensor")
+        return tensor
+    fan = _calculate_correct_fan(tensor, mode)
+    gain = calculate_gain(nonlinearity, a)
+    std = gain / math.sqrt(fan)
+    bound = math.sqrt(3.0) * std  # Calculate uniform bounds from standard deviation
+    return _uniform_fill_(tensor, -bound, bound, generator)
+
+
+def kaiming_normal_(tensor, a=0, mode='fan_in', nonlinearity='leaky_relu',
+                    generator=None):
+    """Fill ``tensor`` in-place with N(0, std^2) where std = gain / sqrt(fan)."""
+    if 0 in tensor.shape:
+        warnings.warn("Initializing zero-element tensor")
+        return tensor
+    fan = _calculate_correct_fan(tensor, mode)
+    gain = calculate_gain(nonlinearity, a)
+    std = gain / math.sqrt(fan)
+    return _normal_fill_(tensor, 0, std, generator)
+
+
+def trunc_normal_(tensor, mean=0.0, std=1.0, a=-2.0, b=2.0, generator=None):
     r"""Fills the input Tensor with values drawn from a truncated normal
     distribution.
 
     Method is based on the rejection-sampling scheme in
     https://people.sc.fsu.edu/~jburkardt/presentations/truncated_normal.pdf —
     """
-    import math
-    import warnings
-
     def norm_cdf(x):
         return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
 
@@ -157,18 +248,22 @@ def trunc_normal_(tensor, mean=0.0, std=1.0, a=-2.0, b=2.0):
             stacklevel=2,
         )
 
+    # Compare against bounds rounded to the tensor's own precision so the
+    # rejection mask is consistent with representable values.
+    lo = _cast_scalar_like(a, tensor.dtype)
+    hi = _cast_scalar_like(b, tensor.dtype)
+
     with tp.no_grad():
         p = norm_cdf((b - mean) / std) - norm_cdf((a - mean) / std)
 
         if p > 0.3:
-            lo = float(a)
-            hi = float(b)
-            result = tensor.normal_(mean, std)
+            result = tensor.normal_(mean, std, generator=generator)
             while True:
                 mask = (result < lo) | (result > hi)
                 if not bool(mask.any().item()):
                     break
-                rejected = tensor.empty_like(result).normal_(mean, std)
+                rejected = tp.empty_like(result).normal_(mean, std,
+                                                         generator=generator)
                 result = tp.where(mask, rejected, result)
             if tensor is not result:
                 tensor.copy_(result)
@@ -176,70 +271,57 @@ def trunc_normal_(tensor, mean=0.0, std=1.0, a=-2.0, b=2.0):
             mode = max(a, min(mean, b))
             log_peak = -0.5 * ((mode - mean) / std) ** 2
 
-            candidates = tensor.empty_like(tensor)
-            accept_buf = tensor.empty_like(tensor)
+            candidates = tp.empty_like(tensor)
+            accept_buf = tp.empty_like(tensor)
 
             # First iteration: sample directly into tensor.
-            tensor.uniform_(a, b)
+            _uniform_fill_(tensor, a, b, generator)
             candidates.copy_(tensor)
             candidates.sub_(mean).div_(std).pow_(2).mul_(-0.5).sub_(log_peak)
-            pending = accept_buf.uniform_().log_() > candidates
+            pending = _uniform_fill_(accept_buf, 0.0, 1.0, generator).log_() > candidates
             if not bool(pending.any().item()):
                 pass
             else:
                 result = tensor
                 while True:
-                    candidates.uniform_(a, b)
+                    _uniform_fill_(candidates, a, b, generator)
                     result = tp.where(pending, candidates, result)
                     candidates.sub_(mean).div_(std).pow_(2).mul_(-0.5).sub_(log_peak)
-                    new_pending = accept_buf.uniform_().log_() > candidates
-                    pending = tp.where(pending, new_pending, pending)
+                    redraw = _uniform_fill_(accept_buf, 0.0, 1.0, generator).log_() > candidates
+                    pending = tp.where(pending, redraw, pending)
                     if not bool(pending.any().item()):
                         break
                 tensor.copy_(result)
 
         return tensor
 
-def _qr_reduced(a):
-    # native QR yet, so this pure-tensor Householder reduction provides the
-    # same reduced-QR contract (Q: m x n with orthonormal columns, R: n x n).
-    m, n = a.shape
-    q = tp.eye(m, m, dtype=a.dtype, device=a.device)
-    r = a.clone()
-    for k in range(min(n, m - 1)):
-        x = r[k:, k]
-        norm_x = float(x.norm())
-        if norm_x == 0.0:
-            continue
-        v = x.clone()
-        v[0] = v[0] + (norm_x if float(x[0]) >= 0 else -norm_x)
-        v_norm = float(v.norm())
-        if v_norm == 0.0:
-            continue
-        v = v / v_norm
-        col = v.reshape(-1, 1)
-        row = v.reshape(1, -1)
-        r[k:, k:] = r[k:, k:] - 2.0 * tp.matmul(col, tp.matmul(row, r[k:, k:]))
-        q[:, k:] = q[:, k:] - 2.0 * tp.matmul(tp.matmul(q[:, k:], col), row)
-    return q[:, :n], r[:n, :]
 
 def orthogonal_(tensor, gain=1, generator=None):
+    """Fill ``tensor`` in-place with a (semi) orthogonal matrix.
+
+    The tensor must have at least 2 dimensions; trailing dimensions are
+    flattened.  Rows (or columns, when narrower) are orthonormalized
+    with a QR factorization of a standard-normal sample, and Q is
+    rescaled by the diagonal signs of R so its distribution is uniform
+    over the orthogonal group.
+    """
     if tensor.ndimension() < 2:
         raise ValueError("Only tensors with 2 or more dimensions are supported")
+    if tensor.numel() == 0:
+        return tensor
 
     rows = tensor.size(0)
     cols = tensor.numel() // rows
-    flattened = tp.empty((rows, cols), dtype=tensor.dtype, device=tensor.device).normal_(0, 1)
+    flattened = tp.empty((rows, cols), dtype=tensor.dtype,
+                         device=tensor.device).normal_(0, 1, generator=generator)
 
     swapped = rows < cols
-    if swapped:
-        flattened = flattened.t().clone()
+    work = flattened.t() if swapped else flattened
 
-    q, r = _qr_reduced(flattened)
+    q, r = tp.linalg.qr(work)
 
-    # Make Q uniform according to https://arxiv.org/pdf/math-ph/0609050.pdf
     dim = min(r.shape[0], r.shape[1])
-    ph = tp.tensor([float(r[i, i]) for i in range(dim)]).sign().to(r.dtype, r.device)
+    ph = tp.diagonal(r).sign()
     q = q * ph
 
     if swapped:
@@ -250,7 +332,13 @@ def orthogonal_(tensor, gain=1, generator=None):
         tensor.mul_(gain)
     return tensor
 
+
 def sparse_(tensor, sparsity, std=0.01, generator=None):
+    """Fill the 2-D ``tensor`` in-place as a sparse matrix.
+
+    Each column gets ``sparsity * rows`` zeroed entries (a random row
+    subset per column); the remaining entries come from N(0, std^2).
+    """
     if tensor.ndimension() != 2:
         raise ValueError("Only tensors with 2 dimensions are supported")
 
@@ -258,9 +346,12 @@ def sparse_(tensor, sparsity, std=0.01, generator=None):
     num_zeros = math.ceil(sparsity * rows)
 
     with tp.no_grad():
-        tensor.normal_(0, std)
+        tensor.normal_(0, std, generator=generator)
         for col_idx in range(cols):
-            row_indices = tp.randperm(rows)
+            if generator is None:
+                row_indices = tp.randperm(rows)
+            else:
+                row_indices = tp._C.randperm(rows, generator=generator)
             zero_indices = row_indices[:num_zeros]
             tensor[zero_indices, col_idx] = 0
     return tensor

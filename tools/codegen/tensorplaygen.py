@@ -31,7 +31,7 @@ from tools.codegen.api_types import (binding_default, cpp_arg_type,  # noqa: E40
                                      sanitize_name)
 from tools.codegen.gen_python_c import (_BRIDGE,  # noqa: E402
                                         _default_pyobject)
-from tools.codegen.model import parse_native_yaml  # noqa: E402
+from tools.codegen.model import parse_schema  # noqa: E402
 
 
 def _stub_template(f):
@@ -334,6 +334,24 @@ def generate_binding(funcs, module_name: str) -> str:
     return "\n".join(L)
 
 
+def _parse_custom_yaml(data):
+    if not isinstance(data, list):
+        raise TypeError("custom-op schema file must contain a list")
+
+    funcs = []
+    for item in data:
+        if not isinstance(item, dict) or not isinstance(item.get("func"), str):
+            raise TypeError("each custom-op entry must provide a string func field")
+        function = parse_schema(item["func"])
+        dispatch = item.get("dispatch") or {}
+        if not isinstance(dispatch, dict):
+            raise TypeError(f"dispatch for {function.func_name} must be a mapping")
+        function.dispatch = {str(device): str(kernel)
+                             for device, kernel in dispatch.items()}
+        funcs.append(function)
+    return funcs
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="TensorPlay custom-op generator")
     ap.add_argument("--yaml", required=True)
@@ -341,8 +359,6 @@ def main(argv=None):
     ap.add_argument("--module_name", default="custom_ops")
     args = ap.parse_args(argv)
 
-    # Custom-op yamls are plain lists; reuse the native loader minus the
-    # duplicate-schema gate semantics is fine either way.
     import yaml
     with open(args.yaml) as fh:
         data = yaml.safe_load(fh) or []
@@ -351,7 +367,7 @@ def main(argv=None):
     tmp_yaml = tmp / f"_ops_{args.module_name}.yaml"
     tmp_yaml.write_text(yaml.safe_dump(data, sort_keys=False))
 
-    funcs = [f for f in parse_native_yaml(str(tmp_yaml))]
+    funcs = _parse_custom_yaml(data)
     hdr = generate_header(funcs, args.module_name)
     cpp = generate_binding(funcs, args.module_name)
     h_path = os.path.join(args.out_dir, "OpsGenerated.h")

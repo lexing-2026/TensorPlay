@@ -86,7 +86,6 @@ struct FactoryHook {
     PyObject* wrapper;  // original Python functional wrapper (strong ref)
     PyObject* tensor_type;  // tensorplay.Tensor (strong, may be null)
     PyObject* scalar_type;  // tensorplay.Scalar (strong, may be null)
-    PyObject* device_fn;    // tensorplay.device (strong, may be null)
     bool varargs;           // empty family: fold *size positionals
 };
 
@@ -128,28 +127,6 @@ PyObject* factory_trampoline(PyObject* self, PyObject* const* args,
         lift_first = true;               // full(3, v) -> full([3], v)
     }
 
-    // Keyword scan: only "device" needs conversion (string -> Device).
-    PyObject* owned_dev = nullptr;
-    Py_ssize_t dev_kw = -1;
-    for (Py_ssize_t j = 0; j < nkw; ++j) {
-        if (PyUnicode_CompareWithASCIIString(PyTuple_GET_ITEM(kwnames, j),
-                                             "device") == 0) {
-            PyObject* dv = args[nargs + j];
-            if (PyUnicode_Check(dv)) {
-                if (!h->device_fn) {
-                    // No converter available: let the wrapper produce the
-                    // canonical error instead of a raw parse failure.
-                    return PyObject_Vectorcall(h->wrapper, args,
-                                               (size_t)nargs, kwnames);
-                }
-                owned_dev = PyObject_CallOneArg(h->device_fn, dv);
-                if (!owned_dev) return nullptr;
-                dev_kw = j;
-            }
-            break;
-        }
-    }
-
     // full(): numbers/Tensors/Scalars go straight through; anything exotic
     // (numpy scalars, Decimal, ...) takes the wrapper's Scalar() promotion.
     if (!h->varargs && !lift_first && nargs >= 2 && h->tensor_type &&
@@ -160,12 +137,11 @@ PyObject* factory_trampoline(PyObject* self, PyObject* const* args,
             Py_TYPE(fv) != (PyTypeObject*)h->scalar_type) {
             PyObject* r = PyObject_Vectorcall(h->wrapper, args,
                                               (size_t)nargs, kwnames);
-            Py_XDECREF(owned_dev);
             return r;
         }
     }
 
-    if (!fold_all && !lift_first && !listify_single && dev_kw < 0)
+    if (!fold_all && !lift_first && !listify_single)
         return PyObject_Vectorcall(h->raw, args, (size_t)nargs, kwnames);
 
     // Slow-shaped eager call: build a rewritten argument buffer.
@@ -174,7 +150,7 @@ PyObject* factory_trampoline(PyObject* self, PyObject* const* args,
     PyObject** heap = nullptr;
     if (nargs + nkw + 1 > 24) {
         heap = (PyObject**)PyMem_Malloc(sizeof(PyObject*) * (size_t)(nargs + nkw + 1));
-        if (!heap) { Py_XDECREF(owned_dev); return PyErr_NoMemory(); }
+        if (!heap) return PyErr_NoMemory();
         buf = heap;
     }
     Py_ssize_t out = 0;
@@ -201,20 +177,18 @@ PyObject* factory_trampoline(PyObject* self, PyObject* const* args,
         for (Py_ssize_t i = 0; i < nargs; ++i) buf[out++] = args[i];
     }
     for (Py_ssize_t j = 0; j < nkw; ++j)
-        buf[out++] = (j == dev_kw) ? owned_dev : args[nargs + j];
+        buf[out++] = args[nargs + j];
 
     {
         // nargsf counts POSITIONALS only; kw values trail after them and are
         // counted via kwnames.
         PyObject* r = PyObject_Vectorcall(h->raw, buf, (size_t)(out - nkw), kwnames);
-        Py_XDECREF(owned_dev);
         Py_XDECREF(owned_size);
         PyMem_Free(heap);
         return r;
     }
 
 fail:
-    Py_XDECREF(owned_dev);
     Py_XDECREF(owned_size);
     PyMem_Free(heap);
     return nullptr;
@@ -243,14 +217,12 @@ int install_factory_fast_paths_impl(py::module_& m, py::dict wrappers) {
     done = true;
 
     PyObject* tp_mod = PyImport_ImportModule("tensorplay");
-    PyObject* tensor_type = nullptr, *scalar_type = nullptr, *device_fn = nullptr;
+    PyObject* tensor_type = nullptr, *scalar_type = nullptr;
     if (tp_mod) {
         tensor_type = PyObject_GetAttrString(tp_mod, "Tensor");
         if (!tensor_type) PyErr_Clear();
         scalar_type = PyObject_GetAttrString(tp_mod, "Scalar");
         if (!scalar_type) PyErr_Clear();
-        device_fn = PyObject_GetAttrString(tp_mod, "device");
-        if (!device_fn) PyErr_Clear();
         Py_DECREF(tp_mod);
     } else {
         PyErr_Clear();
@@ -267,7 +239,6 @@ int install_factory_fast_paths_impl(py::module_& m, py::dict wrappers) {
         h->wrapper = Py_NewRef(w);
         h->tensor_type = tensor_type ? Py_NewRef(tensor_type) : nullptr;
         h->scalar_type = scalar_type ? Py_NewRef(scalar_type) : nullptr;
-        h->device_fn = device_fn ? Py_NewRef(device_fn) : nullptr;
         h->varargs = (strcmp(factory_names[i], "full") != 0);
 
         PyObject* cap = PyCapsule_New((void*)h, nullptr,
@@ -278,7 +249,6 @@ int install_factory_fast_paths_impl(py::module_& m, py::dict wrappers) {
                 Py_XDECREF(hh->wrapper);
                 Py_XDECREF(hh->tensor_type);
                 Py_XDECREF(hh->scalar_type);
-                Py_XDECREF(hh->device_fn);
                 delete hh;
             }
         });
@@ -301,7 +271,6 @@ int install_factory_fast_paths_impl(py::module_& m, py::dict wrappers) {
     }
     Py_XDECREF(tensor_type);
     Py_XDECREF(scalar_type);
-    Py_XDECREF(device_fn);
     return 0;
 }
 
@@ -353,6 +322,7 @@ PYBIND11_MODULE(_C, m) {
     init_autocast(m);
     init_transforms(m);
     init_ops(m);
+    init_dispatch(m);
     init_stax(m);
     init_parallel(m);
     init_distributed(m);
@@ -653,6 +623,11 @@ PYBIND11_MODULE(_C, m) {
         }
         return py::make_tuple(std::move(out_ops), std::move(out_gpu),
                               std::move(out_mem));
+    });
+    m.def("_profiler_is_active", []() {
+        // One relaxed-enough atomic load; gates Python-side span emission
+        // (custom-op wrappers) at zero cost when no session runs.
+        return tensorplay::prof::g_active.load(std::memory_order_acquire);
     });
     m.def("_profiler_user_begin", [](const std::string& name) {
         // Capture the caller's frame while we still hold the GIL; the span

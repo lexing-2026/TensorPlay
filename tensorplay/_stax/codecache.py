@@ -27,10 +27,26 @@ def file_lock(path: str, *, shared: bool = False) -> Iterator[None]:
     External toolchain invocations write their output in place, so two
     processes racing on the same cache key could interleave writes into one
     corrupt artifact.  The lock file itself carries no data.
+
+    Some cache subfolders may be unwritable for this user (entries written
+    by another uid earlier).  The lock then moves to a mirror path under the
+    temp directory: mutual exclusion is preserved per path, and the build
+    proceeds against the cache folder.
     """
 
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+    def acquire(target: str) -> int:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        return os.open(target, os.O_CREAT | os.O_RDWR, 0o644)
+
+    try:
+        fd = acquire(path)
+    except OSError:
+        mirror = os.path.join(
+            tempfile.gettempdir(),
+            "tp-locks",
+            hashlib.sha256(path.encode()).hexdigest()[:32] + ".lock",
+        )
+        fd = acquire(mirror)
     try:
         import fcntl
 
@@ -52,6 +68,32 @@ class CodeCache:
         env_root = os.environ.get("TP_CACHE_DIR")
         base = root or env_root or os.path.join(os.getcwd(), ".tp_cache")
         self.root = os.path.join(base, "kernels", backend)
+        # Cache entries may have been written by another uid (a root-run
+        # process earlier): key-prefix subfolders then reject every write
+        # for this user and silently disable compilation.  Move to a
+        # user-writable cache root once per instance instead.
+        if not self._writable(base) or self._poisoned_prefixes():
+            fallback = os.path.join(tempfile.gettempdir(), f"tp-cache-{os.getuid()}")
+            self.root = os.path.join(fallback, "kernels", backend)
+
+    @staticmethod
+    def _writable(base: str) -> bool:
+        probe = os.path.join(base, ".writable-probe")
+        try:
+            os.makedirs(probe, exist_ok=True)
+            return os.access(probe, os.W_OK)
+        except OSError:
+            return False
+
+    def _poisoned_prefixes(self) -> bool:
+        try:
+            with os.scandir(self.root) as entries:
+                return any(
+                    entry.is_dir() and not os.access(entry.path, os.W_OK)
+                    for entry in entries
+                )
+        except OSError:
+            return False
 
     # -- keying -------------------------------------------------------------
 

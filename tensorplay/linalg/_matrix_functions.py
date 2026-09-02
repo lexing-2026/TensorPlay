@@ -29,8 +29,32 @@ def cross(input, other, *, dim=-1):
 
 
 def vecdot(x, y, *, dim=-1):
-    """vecdot(x, y, *, dim=-1) -> Tensor"""
+    """vecdot(x, y, *, dim=-1) -> Tensor
+
+    Dot product along `dim` with the first argument conjugated for complex
+    inputs.
+    """
+    from tensorplay import functional as _F
+    if x.dtype.is_complex:
+        x = _F.conj_physical(x)
     return (x * y).sum(dim=dim)
+
+
+def vdot(self, other):
+    """vdot(self, other) -> Tensor
+
+    Conjugating dot product over 1-D operands: sum(conj(self) * other).
+    """
+    from tensorplay import functional as _F
+    if self.dim() != 1 or other.dim() != 1:
+        raise RuntimeError(
+            f"vdot: Expected both inputs to be 1-dimensional, but got "
+            f"{self.dim()}D and {other.dim()}D tensors")
+    if self.shape[0] != other.shape[0]:
+        raise RuntimeError(
+            f"vdot: sizes don't match, got {self.shape[0]} and {other.shape[0]}")
+    a = _F.conj_physical(self) if self.dtype.is_complex else self
+    return (a * other).sum()
 
 
 def matmul(input, other):
