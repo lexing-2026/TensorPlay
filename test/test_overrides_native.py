@@ -27,7 +27,7 @@ def test_function_hook_precedes_native_argument_conversion():
 
     class FunctionLike:
         @classmethod
-        def __torch_function__(cls, func, types, args, kwargs):
+        def __tensorplay_function__(cls, func, types, args, kwargs):
             calls.append((func, types, args, kwargs))
             return "function"
 
@@ -40,8 +40,8 @@ def test_function_hook_precedes_native_argument_conversion():
 def test_mode_stack_and_exception_restore():
     events = []
 
-    class Mode(overrides.TorchFunctionMode):
-        def __torch_function__(self, func, types, args, kwargs=None):
+    class Mode(overrides.TensorPlayFunctionMode):
+        def __tensorplay_function__(self, func, types, args, kwargs=None):
             events.append((func, types, args, kwargs))
             return "mode"
 
@@ -51,8 +51,8 @@ def test_mode_stack_and_exception_restore():
     assert tp._C._len_tensor_function_mode() == 0
     assert events and events[0][1] == ()
 
-    class FailingMode(overrides.TorchFunctionMode):
-        def __torch_function__(self, func, types, args, kwargs=None):
+    class FailingMode(overrides.TensorPlayFunctionMode):
+        def __tensorplay_function__(self, func, types, args, kwargs=None):
             raise ValueError("hook failure")
 
     with pytest.raises(ValueError, match="hook failure"):
@@ -66,13 +66,13 @@ def test_subclass_precedence_and_redispatch():
 
     class Base(tp.Tensor):
         @classmethod
-        def __torch_dispatch__(cls, func, types, args, kwargs):
+        def __tensorplay_dispatch__(cls, func, types, args, kwargs):
             calls.append(("base", func, types))
             return "base"
 
     class Derived(Base):
         @classmethod
-        def __torch_dispatch__(cls, func, types, args, kwargs):
+        def __tensorplay_dispatch__(cls, func, types, args, kwargs):
             calls.append(("derived", func, types))
             return NotImplemented
 
@@ -84,7 +84,7 @@ def test_subclass_precedence_and_redispatch():
 
     class Redispatch(tp.Tensor):
         @classmethod
-        def __torch_dispatch__(cls, func, types, args, kwargs):
+        def __tensorplay_dispatch__(cls, func, types, args, kwargs):
             return overrides.redispatch_function(func, types, args, kwargs)
 
     result = tp._C.add(Redispatch(tp.tensor([1.0])), 2.0)
@@ -94,11 +94,11 @@ def test_subclass_precedence_and_redispatch():
 def test_disable_and_restore_native_state():
     class Subclass(tp.Tensor):
         @classmethod
-        def __torch_dispatch__(cls, func, types, args, kwargs):
+        def __tensorplay_dispatch__(cls, func, types, args, kwargs):
             return "blocked"
 
     value = Subclass(tp.tensor([1.0]))
-    with overrides._disable_torch_function():
+    with overrides._disable_tensorplay_function():
         assert type(tp._C.add(value, 2.0)) is tp.Tensor
         assert tp._C._get_tensor_function_state() == 2
     assert tp._C._get_tensor_function_state() == 0

@@ -61,7 +61,7 @@ def test_blas_family_numerics(device):
         "bmm": (lambda: tp.bmm(tA, tB), lambda: torch.bmm(hA, hB)),
         "addmm": (lambda: tp.addmm(_mk(v3, device), ta, tb, 2.0, 3.0),
                   lambda: torch.addmm(_torch_mk(v3, device), ha, hb, beta=2.0, alpha=3.0)),
-        "baddbmm": (lambda: tp.baddbmm(_mk(np.zeros((2, 3, 4), np.float32), device), tA, tB, 0.5, 2.0),
+        "baddbmm": (lambda: tp.baddbmm(_mk(np.zeros((2, 3, 4), np.float32), device), tA, tB, beta=0.5, alpha=2.0),
                     lambda: torch.baddbmm(_torch_mk(np.zeros((2, 3, 4), np.float32), device), hA, hB, beta=0.5, alpha=2.0)),
     }
     for name, (tp_fn, torch_fn) in cases.items():

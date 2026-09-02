@@ -124,7 +124,7 @@ class TestVulkanOps(unittest.TestCase):
         )
 
     def test_unary_exp(self):
-        a = tensorplay.zeros((2, 3), device="vulkan")
+        a = tensorplay.ones((2, 3), device="vulkan")
         back = a.exp().cpu()
         np.testing.assert_allclose(
             back.numpy(), np.full((2, 3), np.e, dtype=np.float32), rtol=1e-5
