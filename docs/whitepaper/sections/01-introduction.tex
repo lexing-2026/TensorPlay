@@ -1,0 +1,322 @@
+% 01-introduction.tex
+\section{Introduction}
+\label{sec:intro}
+
+TensorPlay is a readability-first implementation of a dense tensor core, in approximately 75\,k lines of C++ plus 354 Python modules under
+\path{tensorplay/}. The build produces four shared libraries \texttt{p10}, \texttt{tpx}, \texttt{stax}, \texttt{tp\_python} and one extension \texttt{\_C}
+(\path{tensorplay/\_C/\_\_init\_\_.so}) whose \texttt{OUTPUT\_DIRECTORY} is pinned by \path{CMakeLists.txt:1175--1192} to \path{TP\_PACKAGE\_DIR=tensorplay} at
+\path{CMakeLists.txt:325}. Every structural claim below cites \texttt{path:line} against \path{version.txt:1} (1.0.0a0) at \texttt{HEAD 2026-09-02}. No claim relies on external
+benchmarks or on prose that cannot be checked with \texttt{grep -n} and \texttt{readelf -d}.
+
+\subsection{Problem: Readability vs.\ Performance}
+\label{sec:intro:problem}
+
+Mainstream frameworks co-locate tensor storage, operator dispatch, automatic differentiation, compilation, and distribution in one translation unit. The result is maximal visibility for
+the optimizer: a single \texttt{LTO} step can inline storage access into the kernel loop. The cost is cognitive and incremental-build overhead. Understanding how a tensor is stored
+requires traversing an inheritance chain (\texttt{Tensor} $\rightarrow$ \texttt{Variable} $\rightarrow$ storage) and the associated intrusive reference counting; modifying a CPU kernel
+for \texttt{add} triggers a rebuild of the entire operator aggregation target; implicit header inclusion creates de~facto circular dependencies between core and operator layers
+that static analysis cannot recover without building the graph first.
+
+TensorPlay inverts the trade-off explicitly. It optimizes for \emph{readability}: a newcomer can understand tensor storage by reading only \texttt{p10}
+(\path{p10/include/TensorImpl.h:23--63}, \path{p10/include/Storage.h:17--58}, \path{p10/include/Allocator.h:14--41}) without loading any differentiation concept; an optimizer for
+\texttt{add} rebuilds only \texttt{p10} (\path{p10/CMakeLists.txt:144} accumulates \texttt{P10\_SOURCES}, \path{cmake --build build --target p10 -j4} relinks
+\path{tensorplay/lib/libp10.so} alone at \path{CMakeLists.txt:1202} with \texttt{RPATH \$ORIGIN}); a compiler experiment lives inside \texttt{stax}
+(\path{stax/include/Graph.h:47--123}, \path{stax/include/Fusion.h:15--73}) without relinking storage.
+The price is an explicit cross-library boundary per call. Concretely, one \path{atomic<void*>} acquire load at \path{p10/include/Dispatcher.h:71}, one virtual dispatch at \path{p10/include/AutogradMetaBase.h:13}, and no whole-program inlining across the four pillars.
+In short, calls must serialize across the boundary, but the gains in readability and incremental build are larger than the cost.
+The project accepts this cost because the target workloads are teaching, correctness auditing, and hardware experimentation---not peak FLOPS on a frozen kernel set.
+
+Concretely, the boundary is enforced at link time, not by convention. \path{p10/include/AutogradMetaBase.h:13} declares a pure interface (\texttt{requires\_grad()}, \texttt{grad()}, \texttt{set\_grad()}); \path{p10/include/TensorImpl.h:43} holds \path{shared\_ptr<AutogradMetaBase> autograd\_meta\_} that is deliberately omitted from the copy constructor at \path{p10/src/TensorImpl.cpp:77--92} so \texttt{Tensor b=a} shares storage, sizes, strides, device, dtype and version counter but not history.
+\path{tpx/include/AutogradMeta.h:26} supplies the concrete plug (\texttt{grad\_fn\_}, \texttt{grad\_accumulator\_} as \texttt{weak\_ptr<Node>} to avoid cycles, view replay state). \path{tpx/src/Autograd.cpp:17,26} is the single \path{static\_cast<AutogradMeta*>} handshake.
+Because no header under \path{p10/include/} includes \texttt{tpx}, \texttt{grep -rn "tpx" p10/include/ --include="*.h"} returns 0 and adding \path{\#include "tpx/AutogradMeta.h"} inside \texttt{p10} fails with \texttt{undefined reference to tensorplay::tpx::AutogradMeta} at the \path{libp10.so} link step.
+
+Build granularity follows the same axiom. At \path{CMakeLists.txt:938--944} the order is \path{add\_subdirectory(p10)} :938, \path{add\_subdirectory(tpx)} :941,
+\path{add\_subdirectory(stax)} :944; \path{tpx/CMakeLists.txt:26,40} and \path{stax/CMakeLists.txt:8,17} link downward only. Touching
+\path{p10/src/backend/cpu/ActivationKernels.cpp} dirties exactly \path{libp10.so} and the final \texttt{\_C} link; touching \path{tpx/src/Engine.cpp:621} rebuilds
+\path{libtpx.so} plus \path{libstax.so} and \texttt{\_C} but not \path{libp10.so}. Artifact freshness is \path{ls -lt tensorplay/lib/libp10.so tensorplay/lib/libtpx.so
+tensorplay/lib/libstax.so tensorplay/\_C/\_\_init\_\_.so} and loader correctness is \path{readelf -d tensorplay/lib/libp10.so | grep -i rpath} (\texttt{\$ORIGIN} at
+\path{CMakeLists.txt:1202}) and \path{readelf -d tensorplay/\_C/\_\_init\_\_.so | grep -i rpath} (\path{\$ORIGIN/../lib} at \path{CMakeLists.txt:1210} with \texttt{ldd ... |
+grep "not found"} empty). On Windows the same invariant is preserved by ordered \texttt{LoadLibraryExW} with \texttt{0x00001100} at \path{tensorplay/\_\_init\_\_.py:122} and
+\path{tensorplay/\_\_init\_\_.py:34--205} preload.
+
+\subsection{Contributions}
+\label{sec:intro:contributions}
+
+This paper makes four concrete contributions beyond high-level architecture sketches. Each is a set of files, lines, and checked commands, not a qualitative claim.
+Table~\ref{tab:intro:contrib} is the index; \S\ref{sec:intro:c1}--\S\ref{sec:intro:c4} expand each row.
+
+\begin{table}[H]
+\centering
+\caption{Four concrete contributions. Every entry cites the line that implements the mechanism, not a design note.}
+\label{tab:intro:contrib}
+\small
+\begin{tabular}{p{0.6cm}p{2.6cm}p{4.0cm}p{4.6cm}}
+\toprule
+\# & Mechanism & Primary \texttt{path:line} & Paper section \\
+\midrule
+C1 & Four-pillar acyclic graph & \path{CMakeLists.txt:938--944}, \path{p10/CMakeLists.txt:28}, \path{AutogradMetaBase.h:13}, \path{TensorImpl.h:43}, \path{TensorImpl.cpp:77} &
+\S\ref{sec:arch} \\
+C2 & 13-slot redispatch + registration & \path{DispatchKey.h:15}, \path{Dispatcher.h:49}, \path{Dispatcher.h:67}, \path{Dispatcher.h:203},
+\path{CPythonBridge.cpp:801,989,1398} & \S\ref{sec:redispatch} \\
+C3 & Explicit DAG without Tape & \path{tpx/include/Node.h:26,50}, \path{Edge.h:14}, \path{Engine.h:23,37,112}, \path{SavedVariable.h:15,33}, \path{AutogradMeta.h:26} &
+\S\ref{sec:autograd} \\
+C4 & Vmap at offset~9 + profiler stack & \path{DispatchKey.h:41,54}, \path{TransformDispatch.h:14}, \path{BatchingKernels.h:18}, \path{Profiler.h:129,145,227,259,283} &
+\S\ref{sec:vmap}, \S\ref{sec:profiler} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{C1: Four-Pillar Decomposition with Link-Time Acyclicity}
+\label{sec:intro:c1}
+
+The framework is partitioned into \texttt{p10} (tensor, storage, 300+ kernels, allocators), \texttt{tpx} (explicit DAG, engine, saved variables), \texttt{stax} (minimal \texttt{Graph}
+IR at \path{stax/include/Graph.h:47,69,89} with single \texttt{fused\_mul\_add} pass at \path{stax/include/Fusion.h:53}), and the Python extension \texttt{\_C} plus its single-copy
+bridge \texttt{tp\_python} (\path{src/bindings/python/CPythonBridge.cpp}). Table~\ref{tab:intro:pillars} repeats the directory $\rightarrow$ artifact contract verified by \texttt{ls
+-lh} and \texttt{readelf}.
+
+\begin{table}[H]
+\centering
+\caption{Directory $\rightarrow$ CMake target $\rightarrow$ artifact. \texttt{TP\_PACKAGE\_DIR} at \path{CMakeLists.txt:326}.}
+\label{tab:intro:pillars}
+\small
+\begin{tabular}{p{2.0cm}p{1.4cm}p{3.6cm}p{4.8cm}}
+\toprule
+Directory & Target & Artifact & Link deps \\
+\midrule
+\path{p10/} & \texttt{p10} & \path{tensorplay/lib/libp10.so} & \texttt{Threads}, \texttt{COMPUTE\_LIBS} \\
+\path{tpx/} & \texttt{tpx} & \path{tensorplay/lib/libtpx.so} & \path{p10/} (\path{tpx/CMakeLists.txt:26,40}) \\
+\path{stax/} & \texttt{stax} & \path{tensorplay/lib/libstax.so} & \path{p10/}, \path{tpx/} (\path{stax/CMakeLists.txt:8,17}) \\
+\path{src/bindings/python/} & \path{tp_python} & \path{tensorplay/lib/libtp_python.so} & \path{p10/}, \path{pybind11} (\path{CMakeLists.txt:954}) \\
+\path{src/bindings/python/} & \path{_C} & \path{tensorplay/_C/__init__.so} & \path{p10/}, \path{tpx/}, \path{stax/}, \path{tp_python} (\path{CMakeLists.txt:1108}) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Axiom: $\forall (a,b)\in D$, \texttt{level}(a)$>$\texttt{level}(b) with \texttt{level}(p10)=0, \texttt{level}(tpx)=1, \texttt{level}(stax)=2, \texttt{level}(\_C)=3 and
+\texttt{level}(tp\_python)=3. The enforcements are (i) directory isolation, (ii) \path{target\_link\_libraries} edges that point only downward, and (iii) header visibility: no
+\path{p10/include/*.h} includes \texttt{tpx}. The audited move at \path{p10/CMakeLists.txt:28} (\path{\# src/AutogradMetaInterface.cpp (Moved to TPX)}) records that concrete
+metadata once lived in \texttt{p10} and was vacated to preserve the axiom. The Windows static branch at \path{CMakeLists.txt:934--936} embeds the pillars into \texttt{\_C.pyd} to
+avoid \path{\_\_declspec(dllexport)} on every p10 symbol while keeping visibility identical.
+
+\subsubsection{C2: Redispatch and Static Registration}
+\label{sec:intro:c2}
+
+\path{p10/include/DispatchKey.h:15--49} encodes 13 keys: \texttt{CPU}=0, \texttt{CUDA}=1, \texttt{Vulkan}=2, \texttt{AutogradCPU}=3--5, \texttt{AutocastCPU}=6--8,
+\texttt{VmapCPU}=9--11, \texttt{Composite}=12, \texttt{EndOfKeys}=13. Offsets \texttt{kAutogradKeyOffset}=3, \texttt{kAutocastKeyOffset}=6, \texttt{kVmapKeyOffset}=9 at
+\path{DispatchKey.h:51--54} make priority arithmetic. \texttt{DispatchKeySet} at \path{DispatchKey.h:125--187} is a \texttt{uint32\_t} bitset whose \path{highest\_priority\_key()}
+at \path{DispatchKey.h:151} scans the most-significant set bit so numerically larger keys win; \path{TensorImpl::key\_set()} at \path{p10/include/TensorImpl.h:135} computes the
+set from device and \texttt{inference\_tensor\_} without storing it.
+
+\path{p10/include/Dispatcher.h:49--61} stores \path{array<atomic<KernelFunction>,13>} per operator; \path{OperatorHandle::getKernel} at \path{Dispatcher.h:67--81} does one
+\texttt{acquire} load and, only for \texttt{is\_backend\_key} (0--2), a second load at \texttt{Composite} index~12. \texttt{DispatchStub::call} at \path{Dispatcher.h:139} is the
+single choke point that enforces the autocast contract \path{is\_autocast\_key(k) \&\& !is\_enabled(k) $\rightarrow$ throw} with \texttt{[[unlikely]]} and emits a 32-frame
+\texttt{backtrace} when \path{TP\_TRACE\_KERNEL\_MISS} is set. Registration is bulk: \path{TENSORPLAY\_LIBRARY\_IMPL(KEY, NAME)} at \path{Dispatcher.h:203} uses two-level
+\texttt{TP\_CONCAT} at \path{p10/include/Macros.h:23} to produce hygienic unique statics; \texttt{Library::impl} at \path{Dispatcher.h:194} chains calls. The deprecated per-op
+\path{TENSORPLAY\_REGISTER\_KERNEL} at \path{Dispatcher.h:177} is retained as a legacy registration path.
+
+Python binding is dual-path and fill-only. \path{src/bindings/python/CPythonBridge.h:28--240} and \texttt{CPythonBridge.cpp} implement parse (\path{CPythonBridge.cpp:801}
+\path{tpx\_py\_parse\_into} via \texttt{memcpy} + linear keyword scan), check (\path{CPythonBridge.h:94} 16 kinds + \texttt{TPK\_OPTIONAL}=0x80), subclass/function hooks
+(\path{CPythonBridge.cpp:80} \texttt{PythonDispatchTLS}), unpack (\path{CPythonBridge.cpp:989} fast \texttt{instance} holder), and wrap (\path{CPythonBridge.cpp:1398}
+\texttt{g\_wrap\_cache} with capsule destructor). \path{tools/codegen/gen\_python\_c.py:882,907} emits \path{generated\_functions[]} and
+\path{register\_generated\_cpython\_functions} that never shadows a \texttt{pybind11} name (checked by \path{PyObject\_HasAttrString}). \path{src/bindings/python/init.cpp:697}
+installs the generated table last behind \texttt{TP\_NO\_FASTCALL}; \path{CMakeLists.txt:954} keeps a single \texttt{tp\_python} so caster registry and wrap cache are not duplicated
+per extension.
+
+\subsubsection{C3: Autograd}
+\label{sec:intro:c3}
+
+There is no tape. Each forward op that requires grad allocates a \texttt{Node} subclass (148 types generated from \path{config/derivatives.yaml:1} via \path{tools/codegen/gen\_autograd.py:785} into \path{build/generated/tensorplay/ops/AutogradNodesGenerated.h}, or a handwritten node in \path{tpx/include/ManualNodes.h:1200}).
+\path{next\_edges: vector<Edge>} at \path{tpx/include/Node.h:150} points to parents; \texttt{Edge} at \path{tpx/include/Edge.h:14} carries a \texttt{weak\_ptr<Node>} plus \texttt{output\_nr}.
+\texttt{output\_nr}. The graph is the transitive closure of those edges. \texttt{Node::sequence\_nr} at \path{tpx/include/Node.h:50,109} is a global monotonic counter from
+\path{get\_and\_increment\_sequence\_nr()} at \path{Node.h:34}, used by the engine to prioritize recomputation order deterministically.
+
+\path{tpx/include/GraphTask.h} holds the task launched by \texttt{backward()}: \texttt{dependencies\_} in-degree counts, \texttt{captured\_vars}, and the initiating \texttt{GraphRoot}
+synthesized at \path{tpx/src/Engine.cpp:621,648} only when \texttt{roots.size()!=1}. \path{tpx/include/InputBuffer.h:16} is the per-node accumulator whose \texttt{accumulate} adds
+incoming grads in topological order. \path{tpx/include/Engine.h:23} defines \texttt{ReadyQueue} as a thread-safe max-heap by \texttt{sequence\_nr} (\path{Engine.h:38} \texttt{return
+fn->sequence\_nr() < other.fn->sequence\_nr()}); \path{Engine.h:112--122} dispatches with device-partitioned queues (\texttt{ready\_queues\_} at \path{Engine.h:129},
+\texttt{queue\_for\_device} at \path{Engine.h:122}, \texttt{execute\_task} at \path{Engine.h:120}) and a \texttt{local\_queue} for reentrancy so that \texttt{Node} implementations
+that call \texttt{backward} recursively do not deadlock the global worker.
+
+Versioning is fail-fast, not silent. \path{p10/include/VariableVersion.h} backs \path{TensorImpl::version\_counter\_} at \path{TensorImpl.h:34} with \texttt{bump()} at
+\path{TensorImpl.h:276} on every inplace mutation. \path{tpx/include/SavedVariable.h:15,33} saves \texttt{saved\_version\_}; the unpack checks \texttt{expected==current} and throws
+rather than producing a numerically wrong gradient, which is the single most valuable readability guard in the engine. \path{tpx/include/AutogradMeta.h:26} additionally stores
+\texttt{grad\_accumulator\_} as \texttt{weak\_ptr<Node>} so leaf accumulators do not form uncollectable cycles.
+
+\subsubsection{C4: Vmap and the Profiler Stack}
+\label{sec:intro:c4}
+
+Vmap occupies offset~9 precisely so it outranks autograd and backend. \path{DispatchKey::VmapCPU}=9 at \path{DispatchKey.h:41} with \texttt{kVmapKeyOffset}=9 at
+\path{DispatchKey.h:54}; \texttt{toVmapKey} at \path{DispatchKey.h:64} and \texttt{is\_vmap\_key} at \path{DispatchKey.h:81} are \texttt{constexpr} range tests that lower to one
+compare. \texttt{TransformDispatch} at \path{p10/include/TransformDispatch.h:14} and the kernel table at \path{p10/include/BatchingKernels.h:18} implement per-slice fallback versus
+batched kernels; the dispatcher unwraps transform state before the autograd layer observes the tensor, so \texttt{Vmap} and autograd compose without a second dispatch table.
+
+The profiler spans CPU and GPU with one hot-path guard. \path{p10/include/Profiler.h:129} exports \texttt{g\_active}, \texttt{g\_capture\_shapes}, \texttt{g\_capture\_sites} as
+\texttt{atomic<bool>}; when inactive the cost per op is one acquire load. \texttt{OpRecord} at \path{Profiler.h:145} stamps a slot with \path{begin/end\_ns}, \texttt{tid},
+\texttt{kind}, optional \path{shapes/dtypes} and \path{site\_id/stack\_id}; \texttt{GpuTimerPair} at \path{Profiler.h:227} arms a pooled \texttt{cudaEvent} pair per dispatched
+CUDA op and resolves elapsed \texttt{gpu\_ms} at session stop. \path{cupti\_available/start/stop} at \path{Profiler.h:259,267,270} dlopen \texttt{libcupti} and correlate kernels to
+ops via external correlation ids pushed in \texttt{GpuTimerPair}; \path{nvtx\_range\_push/pop} at \path{Profiler.h:283} and \path{itt\_task\_begin\_name} at
+\path{Profiler.h:297} bridge to Nsight and VTune. All collectors degrade gracefully when the native library is absent, and the binding layer at \path{tensorplay/profiler.py}
+multiplexes sampling without adding a build dependency.
+
+\subsection{Scope and Non-goals}
+\label{sec:intro:scope}
+
+We document what is implemented at \path{version.txt:1} and deliberately leave other axes as \texttt{Composite} fallbacks or as not implemented. Table~\ref{tab:intro:scope} enumerates
+the trimmed axes; every absent row is intentional for the 75\,k-line readability target.
+
+\begin{table}[H]
+\centering
+\caption{Scope: present versus trimmed. Trimmed means no dispatch key and no dedicated storage; the generic path remains valid via \texttt{Composite}.}
+\label{tab:intro:scope}
+\small
+\begin{tabular}{p{2.8cm}p{4.6cm}p{4.6cm}}
+\toprule
+Axis & Present in \path{version.txt:1} & Trimmed (non-goal) and fallback \\
+\midrule
+Dispatch keys & 13 keys at \path{DispatchKey.h:15} (\path{CPU/CUDA/Vulkan} + \path{Autograd/Autocast/Vmap} + \texttt{Composite}) & No sparse, quantized, meta, mkldnn, xla, lazy
+dispatch keys; quantized kernels exist only as \path{p10/include/QuantKernels.h:14} composites \\
+Tensor storage & Dense \texttt{Storage} at \path{p10/include/Storage.h:17}, \texttt{DataPtr} at \path{p10/include/DataPtr.h:18}, \texttt{Allocator} at
+\path{p10/include/Allocator.h:14} & No sparse COO/CSR storage, no quantized per-tensor/per-channel storage, no meta-device allocation; sparse helpers at \path{SparseKernels.h:12}
+are teaching stubs \\
+Autograd & Explicit DAG (\path{Node.h:26}, \path{Edge.h:14}, \texttt{GraphTask.h}, \path{InputBuffer.h:16}, \path{Engine.h:23}) with \texttt{SavedVariable} version guard & No
+tape reuse, no boxed alias analysis, no inference-mode fast path beyond \texttt{InferenceMode} at \path{p10/include/InferenceMode.h:18} \\
+Compiler & Minimal \texttt{Graph} IR at \path{stax/include/Graph.h:47--123} with \path{Fusion.h:53} vertical \texttt{fused\_mul\_add} & No loop fusion, layout planner, vectorization
+policy, auto-tuning, or persistence beyond in-memory \texttt{Graph::execute} at \path{stax/src/Graph.cpp:179} \\
+Distribution & Single-process collectives via \texttt{tensorpipe} link at \path{CMakeLists.txt:1109} & No sharded \texttt{DTensor}, no pipeline parallelism, no heterogeneous device
+mesh \\
+Quantization & \texttt{Quantizer} at \path{p10/include/Quantizer.h:12} placeholder & No quantized dispatch axis, no kernel selection by \texttt{QScheme}; 8-bit kernels are composite
+demos \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Sparse is the most illustrative trim. \path{p10/include/SparseKernels.h:12} declares the API surface, but \path{DispatchKey.h:15} never defines \texttt{SparseCPU} and
+\path{TensorImpl::key\_set()} never emits it, so dispatch never queries a sparse slot. A contributor adding sparse would add a key, extend \texttt{kDispatchKeyCount} from 13, and add
+the offset helpers, which is exactly the change the acyclic build is designed to make painful enough to discuss. Meta tensors are absent for the same reason: \texttt{DeviceType::Meta}
+exists as an enum value but never participates in \texttt{computeDispatchKey} at \path{Dispatcher.h:31} and never acquires a \texttt{RegisterKernel} entry, so \texttt{has\_kernel(...,
+Meta)} remains false by construction. Boxed alias analysis and shape-check elision are absent because the codegen pipeline at \path{tools/codegen/model.py:754} and
+\path{gen\_autograd.py:785} deliberately generates straight-line backward formulas without alias metadata; the stax interpreter re-enters \texttt{tpx::ops} at
+\path{stax/src/Graph.cpp:192} so correctness of aliasing stays with the eager dispatcher rather than with a compiler pass.
+
+The trimmed axes are not undocumented; they are documented as trimmed so that a reader does not search for a sparse dispatch key that does not exist or file an issue about meta tensors
+being broken. Future work that promotes a trimmed axis to a real key must update \path{DispatchKey.h:15}, \path{Dispatcher.h:49}, and the schema validator that admits
+\texttt{Vulkan} at \path{tools/codegen/model.py:754} even on CPU builds; the paper version after such a promotion will cite the new \texttt{path:line} and bump \path{version.txt:1}.
+
+\subsection{How to Read This Paper}
+\label{sec:intro:howto}
+
+Figure~\ref{fig:pillars} is the map of the whole white paper; every later figure is a zoom of one arrow in it. Readers should traverse the paper according to their contribution target,
+not linearly, using Table~\ref{tab:intro:guide} and the figure references at the start of each chapter.
+
+\begin{table}[H]
+\centering
+\caption{Reader's guide. Each row starts from Fig.~\ref{fig:pillars} and descends to one figure and one verification command.}
+\label{tab:intro:guide}
+\small
+\begin{tabular}{p{2.6cm}p{3.6cm}p{3.4cm}p{2.8cm}}
+\toprule
+Goal & Start & Figures & Check \\
+\midrule
+Understand pillars & \S\ref{sec:arch}, Fig.~\ref{fig:pillars} & Fig.~\ref{fig:pillars} (4 boxes, 3 solid arrows, 1 dashed foundation) & \path{grep -n add\_subdirectory CMakeLists.txt}
+\\
+Add a kernel & \S\ref{sec:redispatch}, \S\ref{sec:memory} & Fig.~\ref{fig:dispatchermap}, Fig.~\ref{fig:e2e} & \path{grep -n TENSORPLAY\_LIBRARY\_IMPL p10/src/*.cpp} \\
+Fix autograd & \S\ref{sec:autograd} & Fig.~\ref{fig:usb}, DAG at \path{Node.h:26} & \path{grep -n SavedVariable tpx/include/*.h} \\
+Experiment with fusion & \S\ref{sec:arch:stax}, \path{stax/include/Fusion.h:53} & Stax pipeline at \path{stax/src/Graph.cpp:179} & \path{grep -n fused\_mul\_add stax/src/*.cpp} \\
+Add a batching rule & \S\ref{sec:vmap} & Vmap offset diagram at \path{DispatchKey.h:54} & \path{grep -n toVmapKey p10/include/*.h} \\
+Profile a model & \S\ref{sec:profiler} & Profiler stack at \path{Profiler.h:129} & \path{python -m tensorplay.profiler} \\
+Reproduce numbers & \S\ref{sec:intro:repro}, Appendix & LoF/LoT at front matter & \path{grep -rn path:line docs/whitepaper/} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+System overview: read \S\ref{sec:arch} and Fig.~\ref{fig:pillars} first; the TikZ source for that figure is generated locally by \path{python docs/blogs/assets/gen\_01\_arch.py} and
+the YAML$\rightarrow$10-artifacts contract underneath it is at \path{CMakeLists.txt:308--344} via \path{tools/codegen/main.py}. Kernel contributors then jump to
+\S\ref{sec:redispatch} (DispatchKey arithmetic, \path{array<atomic<void*>,13>}, Composite fallback, \texttt{TP\_CONCAT}) and \S\ref{sec:memory} (TensorIterator seven-step pipeline at
+\path{p10/src/TensorIterator.cpp:1077}). Autograd contributors focus on \S\ref{sec:autograd}: the USB slot at \path{AutogradMetaBase.h:13} $\rightarrow$ \path{TensorImpl.h:43}
+$\rightarrow$ \path{AutogradMeta.h:26} with cast at \path{Autograd.cpp:17,26}, the heap \texttt{ReadyQueue} by \texttt{sequence\_nr} at \path{Engine.h:37}, and the
+\texttt{SavedVariable} guard. Compiler contributors read \S\ref{sec:arch:stax} and the stax IR at \path{Graph.h:47} plus the interpreter at \path{Graph.cpp:179}; every other Python
+module ultimately re-enters \texttt{\_C} so \path{tensorplay/\_\_init\_\_.py:408--443} symbol renaming and \path{tensorplay/\_\_init\_\_.py:1118--1134} lazy \texttt{\_\_getattr\_\_}
+are the only Python-side complexity with cross-cutting impact.
+
+Every figure has a \path{python docs/blogs/assets/gen\_*.py} script that reproduces it locally; the source of truth remains the cited \texttt{path:line} because the script is a
+rendering of the code, not a second specification. All line numbers refer to \texttt{HEAD 2026-09-02} at \path{version.txt:1}; when a line shifts, the new tag updates the citation and
+the release notes record the diff, so \path{grep -n "class DispatchTable" p10/include/Dispatcher.h} is always the resolver for \path{Dispatcher.h:49}.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[node distance=0.6cm]
+\node[pillar, fill=blue!8, draw=tpblue] (p10) {p10\\{\footnotesize Tensor / Storage}\\{\footnotesize Dispatcher / Kernels}};
+\node[pillar, fill=orange!8, draw=tporange, right=0.7cm of p10] (tpx) {tpx\\{\footnotesize Autograd DAG}\\{\footnotesize Engine / Node}};
+\node[pillar, fill=purple!8, draw=tppurple, right=0.7cm of tpx] (stax) {stax\\{\footnotesize Graph IR}\\{\footnotesize Pass / Interpreter}};
+\node[pillar, fill=green!8, draw=tpgreen, right=0.7cm of stax] (c) {\_C + tp\_python\\{\footnotesize pybind11 + FASTCALL}};
+\node[libbox, fill=blue!4, draw=tpblue, below=0.7cm of p10, minimum width=13.2cm, minimum height=0.7cm] (base) {CMake + codegen \quad \path{native\_functions.yaml $\rightarrow$ 10 artifacts} \quad (schema parser)};
+\node[libbox, fill=yellow!12, draw=orange!60!black, above=0.7cm of p10, minimum width=13.2cm, minimum height=0.7cm] (py) {Python veneer \quad \path{tensorplay/\_\_init\_\_.py $\cdot$ nn / optim / autograd / compiler / graph}};
+\draw[arrow, color=gray] (p10) -- (tpx);
+\draw[arrow, color=gray] (tpx) -- (stax);
+\draw[arrow, color=gray] (stax) -- (c);
+\foreach \x in {p10,tpx,stax,c} \draw[arrow, dashed, color=orange!70!black] (\x) -- (py);
+\foreach \x in {p10,tpx,stax,c} \draw[arrow, dashed, color=tpblue!70] (base) -- (\x);
+\end{tikzpicture}
+\caption{Four pillars and dependency direction (acyclic). Downward edges only; any upward \texttt{\#include} fails at link time.\\
+Foundation: YAML $\rightarrow$ codegen (\path{CMakeLists.txt:308}).\\
+Roof: Python veneer (\path{tensorplay/\_\_init\_\_.py:1--1197}).\\
+Solid arrows: \path{target_link_libraries}; dashed: generation or re-export.}
+\label{fig:pillars}
+\end{figure}
+
+\subsection{Reproducibility and Versioning}
+\label{sec:intro:repro}
+
+The source tag is \path{version.txt:1}, which reads \texttt{1.0.0a0} at \texttt{HEAD 2026-09-02}. Every structural claim
+cites \texttt{path:line} resolvable by \texttt{grep -rn} without building; every number is a \texttt{wc -l} or \texttt{grep -c}. Table~\ref{tab:intro:repro} lists the one-command
+resolvers for the claims in this chapter.
+
+\begin{table}[H]
+\centering
+\caption{Reproducibility resolvers for this chapter. All commands run from the repository root at \path{version.txt:1}.}
+\label{tab:intro:repro}
+\small
+\begin{tabular}{p{4.0cm}p{5.5cm}p{3.0cm}}
+\toprule
+Claim & Resolver & Expected \\
+\midrule
+Pillar order & \path{grep -n "add\_subdirectory" CMakeLists.txt} & \path{p10:938}, \texttt{tpx:941}, \path{stax:944} \\
+Audited move & \path{grep -n "Moved to TPX" p10/CMakeLists.txt} & \path{:28} \\
+Header isolation & \path{grep -rn "tpx" p10/include/ --include="*.h" | wc -l} & \texttt{0} \\
+USB slot & \path{grep -n "class P10\_API AutogradMetaBase" p10/include/AutogradMetaBase.h} & \path{:13} \\
+Never-copied & \path{grep -n "TensorImpl(const TensorImpl" p10/src/TensorImpl.cpp -A 15 | grep autograd} & absent \\
+Handshake & \path{grep -n "static\_cast<AutogradMeta" tpx/src/Autograd.cpp} & \path{:17, :26} \\
+Dispatch keys & \path{grep -n "enum class DispatchKey" \path{p10/include/DispatchKey.h -A18}} & 13 keys + sentinel \\
+Vmap offset & \path{grep -n "kVmapKeyOffset" p10/include/DispatchKey.h} & \path{:54 =9} \\
+Artifact layout & \path{ls -lh tensorplay/lib/libp10.so tensorplay/\_C/\_\_init\_\_.so} & mtime \textgreater{} source \\
+RPATH & \path{readelf -d tensorplay/lib/libp10.so | grep -i rpath} & \texttt{\$ORIGIN} \\
+Windows preload & \path{grep -n "LoadLibraryExW.*0x00001100" tensorplay/\_\_init\_\_.py} & \path{:122} \\
+Python renaming & \path{grep -n "\_\_module\_\_.*\_\_name\_\_" tensorplay/\_\_init\_\_.py} & \path{:418} \\
+Lazy packages & \path{grep -n "\_lazy\_modules" tensorplay/\_\_init\_\_.py} & \path{:1118} \\
+Profiler guard & \path{grep -n "g\_active" p10/include/Profiler.h} & \path{:129 atomic<bool>} \\
+YAML contracts & \path{grep -c "- func:" config/native\_functions.yaml; grep -c "- name:" config/derivatives.yaml} & \texttt{2809; 345} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Line numbers are stable for the cited tag because \path{version.txt:1} is the single source of version truth read by \path{tools/generate\_tensorplay\_version.py} and stamped into
+\path{tensorplay/version.py} at \path{CMakeLists.txt:330} and into the white-paper header at \path{main.tex:104}. The paper's \texttt{fancyhdr} at \path{main.tex:94} shows
+\path{2026-09-02 --- v1.0.0rc0}; when a refactor moves a line, the next tag bumps the file, the citation is updated, and the diff is visible in \path{git log --oneline -10}. The
+LaTeX sources in \path{docs/whitepaper/} compile locally on Windows \path{E:\textbackslash texlive} with \path{latexmk -pdf main.tex} or \texttt{pdflatex main.tex} (two passes for
+\texttt{main.toc}/\texttt{main.lof}/\texttt{main.lot}) with no external data; all figures are TikZ at \path{main.tex:113--117} and all code listings use \texttt{style=cppstyle} at
+\path{main.tex:53}.
+
+The code generation dependency list records the parser modules and schema tags consumed by \path{tools/codegen/}, together with the generated outputs staged under
+\path{build/generated/tensorplay/ops/} via \texttt{GEN\_HEADER}, \texttt{GEN\_CPP}, etc.\ at \path{CMakeLists.txt:322}. The dependency is on the file contract and
+does not add a runtime library dependency.
+
+\subsection{Conventions}
+\label{sec:intro:conventions}
+
+\texttt{path:line} means the file relative to the repository root at the cited tag; \path{p10/include/Dispatcher.h:49} is line~49 of that file. \texttt{path:line--line} is an
+inclusive range. \texttt{grep -n} examples are literal commands that reproduce the citation; \texttt{wc -l} and \texttt{grep -c} are the sources of every count. Code listings are
+verbatim excerpts with at most whitespace folding; the caption gives the exact range. Tables enumerate normative values (key numbers, artifact names, trimmed axes) rather than
+illustrative samples. \texttt{Composite} at \path{DispatchKey.h:36} is a backend-neutral fallback; it never appears in a \texttt{DispatchKeySet} and is consulted only by
+\path{OperatorHandle::getKernel} for \texttt{is\_backend\_key}. \texttt{TP\_CONCAT} at \path{p10/include/Macros.h:23} is a two-level macro so its argument expands before pasting;
+the paper always cites the two-level definition, not a single-level variant. All shell snippets assume \texttt{bash} and a Release build with \texttt{USE\_CUDA=ON}, \texttt{USE\_MKL=ON}
+unless noted as CPU-only.

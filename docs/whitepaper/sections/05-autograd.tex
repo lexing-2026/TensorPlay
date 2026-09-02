@@ -1,0 +1,855 @@
+% 05-autograd.tex
+\section{Autograd: Explicit DAG, ReadyQueue, and Version Guards}
+\label{sec:autograd}
+
+This chapter documents the autograd engine as code, not as a concept. Every claim cites a concrete \texttt{path:line} and can be reproduced with \texttt{grep -rn} on the version at \path{version.txt:1}. There is no Tape: \path{grep -r Tape tpx/} returns zero. The graph is an explicit DAG of \texttt{shared\_ptr<Node>} linked through \texttt{Edge}, dependency-counted, and scheduled across ReadyQueues keyed by \texttt{sequence\_nr}. The chapter walks \path{Node.h:26}, \path{Edge.h:14}, \path{GraphTask.h:22}, \path{InputBuffer.h:16}, \path{Engine.h:23}, \path{Engine.cpp:621}, \path{SavedVariable.h:15}, \path{VariableVersion.h:13}, \path{AnomalyMode.h:14}, \path{GradMode.h:8}, and \path{src/bindings/python/Autograd.cpp:24}.
+
+%==============================================================================
+\subsection{No Tape, Explicit DAG}
+\label{subsec:notape}
+
+The engine builds the graph eagerly during forward. Each op's autograd wrapper allocates a \texttt{Node} subclass (148 types generated from \path{config/derivatives.yaml:1} via \path{tools/codegen/gen\_autograd.py:785} into \path{build/generated/tensorplay/ops/AutogradNodesGenerated.h}) or uses a handwritten node in \path{tpx/include/ManualNodes.h:1200} (e.g.\ \texttt{CatBackward}, \texttt{MeanBackward}, \texttt{AccumulateGrad}). The node's \path{next\_edges:\ vector<Edge>} (\path{tpx/include/Node.h:150}) points to its parents. The whole graph is the transitive closure of those edges. Printing or drawing the graph is a walk of \texttt{shared\_ptr<Node>}; device-partitioned scheduling is a map from node to queue without scanning a global tape. \path{tpx/src/Engine.cpp:621} creates a synthetic \texttt{GraphRoot} only when \texttt{roots.size()!=1}, otherwise the single root is the graph root directly (\path{Engine.cpp:648}).
+
+%==============================================================================
+\subsection{Node: Fields and Invariants}
+\label{subsec:node}
+
+\path{tpx/include/Node.h:26--180} is the base. Listing~\ref{lst:nodefields} distills the layout; Table~\ref{tab:nodefields} explains each field's role on the hot path.
+
+\begin{lstlisting}[caption={\path{Node.h:26} --- output metadata and base.}, label=lst:nodefields]
+struct OutputSlotMeta {                   // 26
+  std::vector<int64_t> shape;             // 27
+  DType dtype{DType::Undefined};          // 28
+  int64_t device_index = -1;              // 29
+  bool valid = false;                     // 30
+};
+inline uint64_t get_and_increment_sequence_nr() { // 34
+  static thread_local uint64_t counter = 0;       // 35
+  return counter++;                               // 36
+}
+class TENSORPLAY_API Node : public std::enable_shared_from_this<Node> { // 44
+  virtual variable_list apply(variable_list&&) = 0;  // 75
+  void add_next_edge(Edge e){ update_topological_nr(e); next_edges_.push_back(std::move(e)); } //86
+  void update_topological_nr(const Edge& e){         //141
+    if(!e.is_valid()) return;
+    auto topo=e.function->topological_nr();
+    if(topological_nr_ <= topo) topological_nr_=topo+1; // 145
+  }
+protected:
+  std::vector<Edge> next_edges_;               //150
+  uint64_t sequence_nr_ = 0;                   //151 ctor assigns get_and_increment_sequence_nr()
+  bool materialize_grads_ = true;              //152
+  bool is_view_fn_ = false;                    //153
+  bool multi_output_view_ = false;             //154
+  std::string forward_op_name_;                //155
+  std::vector<OutputSlotMeta> output_metas_;   //156
+  uint64_t topological_nr_ = 0;                //157
+private:
+  std::vector<PreHookFn> pre_hooks_;           //160
+  std::vector<PostHookFn> post_hooks_;         //161
+  std::unique_ptr<AnomalyMetadata> anomaly_metadata_=nullptr; //162
+};
+\end{lstlisting}
+
+\begin{table}[H]
+\centering
+\caption{\texttt{Node.h} fields. Every field is on the backward critical path except hooks/anomaly which are cold.}
+\label{tab:nodefields}
+\small
+\begin{tabular}{lll}
+\toprule
+Field & Line & Purpose \\
+\midrule
+\texttt{next\_edges\_} & 150 & Parents. \texttt{num\_inputs()} defaults to \texttt{size()} (\path{Node.h:101}). \\
+\texttt{sequence\_nr\_} & 151+50 & Thread-local monotonic id from \path{get\_and\_increment\_sequence\_nr():34}. Orders \texttt{ReadyQueue}. \\
+\texttt{topological\_nr\_} & 157+141 & \texttt{max(next.topo)+1} on each \texttt{add\_next\_edge}. Enables \texttt{min\_topo} pruning. \\
+\path{materialize\_grads\_} & 152 & If false, undefined grads pass through; if true (default), engine zero-fills via hints. \\
+\texttt{output\_metas\_} & 156 & Per-output slot metadata for \texttt{PyNode} (see \S\ref{subsec:pynode}). Empty for generated nodes. \\
+\texttt{is\_view\_fn\_} & 153 & View wrappers; \texttt{check\_inplace} in \texttt{VariableTypeUtils.h} rejects leaf-view mutation. \\
+\path{multi\_output\_view\_} & 154 & \path{unbind/split/chunk} views; never in-place mutable, reported via \texttt{forward\_op\_name\_}. \\
+\path{pre\_hooks\_/post\_hooks\_} & 160 & \path{function<void(variable\_list\&\&)>} lists; read during backward while graph is immutable. \\
+\texttt{anomaly\_metadata\_} & 162 & Lazy \texttt{AnomalyMetadata}; captures stack at node creation iff \path{AnomalyMode::is\_enabled():14}. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Key invariants:
+
+\begin{itemize}[leftmargin=1.2em]
+\item \texttt{sequence\_nr\_} is assigned in the constructor (\path{Node.h:50}) from a \path{thread\_local counter:35}. It is monotonic per thread, never global, so the max-heap approximates reverse creation order without a global atomic. \path{ReadyQueue::NodeTask::operator<:37} compares it.
+\item \texttt{topological\_nr\_} is the longest-path distance from leaves. \path{compute\_min\_topological\_nr:127} scans \path{outputs[].function->topological\_nr()}, and both \path{compute\_dependencies:201} and \path{GraphTask::init\_to\_execute:281} prune \texttt{topo < min\_topo}. Early ops outside the needed subgraph never enter \texttt{dependencies\_}.
+\item \texttt{output\_metas\_} exists because for custom functions the backward inputs correspond to forward \emph{outputs}, not to \texttt{next\_edges} inputs. \path{PyNode::attach\_outputs:159} in \path{src/bindings/python/Autograd.cpp:159} fills one \texttt{OutputSlotMeta} per output tensor (shape/dtype/device\_index/valid). Generated nodes leave it empty and rely on \texttt{Edge} hints.
+\item Hooks are append-only at graph-build time. The engine iterates them during \path{evaluate\_function:426,446} while no other thread mutates the node, so no lock is needed around hooks themselves (the graph is logically immutable once \texttt{execute} starts).
+\item \texttt{anomaly\_metadata\_} is allocated lazily in \path{Node::anomaly\_metadata():122} and initialized via \path{init\_anomaly\_metadata():132} which calls \texttt{store\_stack()} and, if \path{tls\_current\_evaluating\_node} is set, \texttt{assign\_parent}. This chains the creation stack of a backward-created node to its parent.
+\end{itemize}
+
+Generated nodes from \path{tools/codegen/gen\_autograd.py:785} store \texttt{SavedVariable} members per saved tensor; handwritten nodes in \path{tpx/include/ManualNodes.h:1200} do the same. Each node's destructor need not be virtual for scheduling; \texttt{shared\_from\_this} is required for \path{CurrentEvalNodeGuard} to capture the parent in anomaly mode.
+
+%==============================================================================
+\subsection{Edge: Hints for Materialization}
+\label{subsec:edge}
+
+\path{tpx/include/Edge.h:14--54} carries no tensor, only hints so backward can \texttt{ops::zeros} a missing gradient without touching the forward tensor (Listing~\ref{lst:edge}).
+
+\begin{lstlisting}[caption={\path{Edge.h:14} --- hints.}, label=lst:edge]
+struct TENSORPLAY_API Edge{                    //14
+  std::shared_ptr<Node> function; uint32_t input_nr; //15
+  std::vector<int64_t> shape_hint; bool has_shape_hint=false; //21
+  std::optional<DType> grad_dtype;                           //27
+  std::optional<DeviceType> device_type_hint;               //33
+  std::optional<int64_t> device_index_hint;                //34
+  bool has_input_metadata() const {                         //36
+    return has_shape_hint && grad_dtype && device_type_hint && device_index_hint; //37
+  }
+  Edge(std::shared_ptr<Node> f,uint32_t nr) :function(move(f)),input_nr(nr){} //42
+  Edge(std::shared_ptr<Node> f,uint32_t nr,vector<int64_t> s):function(move(f)),input_nr(nr),shape_hint(move(s)),has_shape_hint(true){} //44
+  Edge():function(nullptr),input_nr(0){}                     //49
+  bool is_valid() const { return function!=nullptr; }        //51
+};
+\end{lstlisting}
+
+\begin{table}[H]
+\centering
+\caption{Edge hints and their consumers in \path{Engine::evaluate\_function}.}
+\label{tab:edgehints}
+\small
+\begin{tabular}{lll}
+\toprule
+Hint & Line & Where consumed \\
+\midrule
+\path{shape\_hint / has\_shape\_hint} & 21 & Materialize \path{ops::zeros(shape,\dots)} (\path{Engine.cpp:399}) and \path{sum\_to\_shape(\dots,hint):488}. Distinguishes \texttt{()} from no-hint via the bool. \\
+\texttt{grad\_dtype} & 27 & Dtype cast of mismatched grads (\path{Engine.cpp:497}); skipped if \path{InferenceMode::is\_enabled()}. \\
+\texttt{device\_type\_hint} & 33 & Materialize device for \texttt{ops::zeros} (\path{Engine.cpp:421}); type stored separately because CPU DLpack may report \path{cpu:0}. \\
+\texttt{device\_index\_hint} & 34 & Same allocation site; combined into \path{Device(dev\_type, dev\_type==CPU?-1:dev\_idx):421}. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Semantics: every time the Python binding or generated wrapper wires a tensor's \texttt{grad\_fn}, it records the forward input's \path{shape/dtype/device} triple on the outgoing \texttt{Edge} from the consumer's \texttt{Node}. During backward, if \texttt{vars[i]} is undefined and \path{func->materialize\_grads()==true}, the engine prefers \texttt{output\_metas\_[i]} (custom functions) and falls back to the \texttt{Edge} triple to allocate \texttt{ops::zeros} without crossing into Python.
+
+%==============================================================================
+\subsection{GraphTask: Per-Backward Shared State}
+\label{subsec:graphtask}
+
+One \texttt{GraphTask} is created per \path{Engine::execute:636} call. Multiple worker threads may evaluate different nodes of the same task concurrently, so all shared bookkeeping is guarded by \texttt{mutex\_} once execution starts (Listing~\ref{lst:graphtask}, Table~\ref{tab:graphtask}).
+
+\begin{lstlisting}[caption={\path{GraphTask.h:22} --- per-backward context.}, label=lst:graphtask]
+struct GraphTask{ //22
+  struct ExecInfo{ //23
+    struct Capture{ int input_idx_, output_idx_; Capture(int i,int o):input_idx_(i),output_idx_(o){} }; //24
+    bool should_execute() const { return needed_ || captures_; } //30
+    bool needed_=false; std::unique_ptr<vector<Capture>> captures_; //31
+  };
+  bool keep_graph_, grad_mode_; uint64_t trace_id_=0; //35+40
+  unordered_map<Node*,InputBuffer> not_ready_;     //43
+  unordered_map<Node*,int> dependencies_;           //44
+  unordered_set<Node*> nodes_in_graph_;           //45
+  unordered_map<Node*,ExecInfo> exec_info_;        //48 non-empty only for grad()
+  vector<Tensor> captured_vars_;                    //50
+  mutex mutex_; condition_variable cv_;            //53
+  uint64_t outstanding_tasks_=0; bool completed_=false; exception_ptr exception_; //55
+  explicit GraphTask(bool keep,bool grad):keep_graph_(keep),grad_mode_(grad){} //61
+  void init_to_execute(Node& root, edge_list outputs, bool acc, uint64_t min_topo); //64
+  void task_enqueued(){ lock_guard<mutex> l(mutex_); ++outstanding_tasks_; } //67
+  bool task_completed(){ lock_guard<mutex> l(mutex_); if(--outstanding_tasks_==0){ completed_=true; cv_.notify_all(); return true; } return false; } //76
+  void record_exception(exception_ptr e){ lock_guard<mutex> l(mutex_); if(!exception_) exception_=move(e);} //88
+  bool is_completed(){ lock_guard<mutex> l(mutex_); return completed_; } //93
+  void wait_for_completion(){ unique_lock<mutex> l(mutex_); cv_.wait(l,[this]{return completed_;}); } //99
+};
+\end{lstlisting}
+
+\begin{table}[H]
+\centering
+\caption{\texttt{GraphTask.h} fields; all maps are keyed by raw \texttt{Node*} (stable while \texttt{shared\_ptr} lives elsewhere).}
+\label{tab:graphtask}
+\small
+\begin{tabular}{lll}
+\toprule
+Field & Line & Role \\
+\midrule
+\texttt{keep\_graph\_} & 35 & If false, \path{evaluate\_function:594} calls \path{func->release\_variables()} (clears \texttt{next\_edges\_}). \\
+\texttt{grad\_mode\_} & 36 & \texttt{create\_graph} decision; copied into \texttt{GradModeGuard} on every worker (\path{Engine.cpp:339}). \\
+\texttt{trace\_id\_} & 40 & Monotonic \path{EngineTrace::next\_graph\_id():68} for \texttt{TP\_ENGINE\_TRACE} filtering of concurrent graphs. \\
+\texttt{not\_ready\_} & 43 & Buffers for nodes whose \texttt{dependencies>0}. Keyed by \texttt{Node*}, value \texttt{InputBuffer} of size \texttt{num\_inputs()}. \\
+\texttt{dependencies\_} & 44 & In-degree. Computed once in \path{compute\_dependencies:192}, decremented under \texttt{mutex\_} in \path{evaluate\_function:535}. \\
+\texttt{nodes\_in\_graph\_} & 45 & Deduplication set for BFS \path{was\_inserted:215}. \\
+\texttt{exec\_info\_} & 48 & Filtering for \texttt{grad()}: empty means \texttt{backward()} executes everything. \\
+\texttt{captured\_vars\_} & 50 & Outputs of \texttt{grad()}: filled by the engine from \texttt{InputBuffer} before \texttt{apply}. \\
+\path{mutex\_/cv\_/outstanding\_} & 53 & Shared-state guard, completion wakeup, and task counter. \path{outstanding\_tasks\_} counts enqueued-but-not-done. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Filtering with \texttt{init\_to\_execute}}
+\label{subsubsec:inittoexec}
+
+For \texttt{backward()}, \texttt{exec\_info\_} stays empty and every visited node executes. For \path{grad(outputs,inputs)}, \path{Engine::execute:658} calls \path{GraphTask::init\_to\_execute:224}. That method must mark \emph{only} the subgraph needed to produce the requested inputs.
+
+The code at \path{Engine.cpp:224--293} does two passes:
+
+\begin{enumerate}[leftmargin=1.2em]
+\item Seed \path{exec\_info\_[output\_edge.function].captures\_} with \path{(input\_nr, output\_idx)} or \texttt{needed\_=true} when \path{accumulate\_grad==true} (\path{Engine.cpp:227}). \path{captured\_vars\_.resize(output\_idx):239} pre-sizes the result vector.
+\item Walk from \texttt{graph\_root} using an explicit stack of \texttt{Frame\{Node* fn; size\_t next\_next\_fn\_\}} (\path{Engine.cpp:241}). \path{Frame::get\_next\_fn():246} iterates \texttt{fn->next\_edges()} one edge at a time. A \texttt{seen} set plus the \texttt{nodeShouldExecute} lambda (\texttt{257}) propagates \texttt{needed\_} backward: if a child already \texttt{should\_execute}, its parent is marked \texttt{needed\_=true} (\texttt{274}). When unwinding (\texttt{287}), a just-finalized node's \texttt{needed\_} is pushed to its DFS parent (\texttt{289}). The \texttt{min\_topo\_nr} computed at \path{Engine.cpp:127} (minimum topo among \texttt{outputs}) prunes the walk: any child with \path{topological\_nr < min\_topo} is skipped (\texttt{281}) because it cannot reach the requested outputs.
+\end{enumerate}
+
+The result is that \path{Engine::evaluate\_function:341} can early-return after copying captures but before \texttt{apply} when \texttt{!fn\_info.needed\_}: that node's outputs are still needed as captured inputs but the node itself need not compute new grads.
+
+%==============================================================================
+\subsection{InputBuffer: Accumulation and Device Routing}
+\label{subsec:inputbuffer}
+
+\path{tpx/include/InputBuffer.h:16--82} is both an accumulator and a routing hint (Listing~\ref{lst:inputbuffer}).
+
+\begin{lstlisting}[caption={\path{InputBuffer.h:16} --- accumulation.}, label=lst:inputbuffer]
+inline bool can_accumulate_inplace(const Tensor& v){ //16
+  if(!v.is_contiguous()) return false;                           //17
+  if(v.unsafeGetTensorImpl().use_count()!=2) return false;        //20
+  if(!v.impl()->has_storage()) return false;                      //21
+  if(v.impl()->storage().use_count()!=1) return false;            //22
+  return true;                                                    //23
+}
+inline void accumulate(vector<Tensor>& buf,size_t pos,Tensor&& var,bool grad_mode){ //29
+  auto& old=buf[pos];                                             //30
+  if(grad_mode) buf[pos]=tpx::ops::add(old,var);                 //34 second-order
+  else if(can_accumulate_inplace(old)) buf[pos]=old.add_(var); //36 in-place
+  else buf[pos]=old+var;                                          //38 out-of-place
+}
+struct InputBuffer{ //43
+  vector<Tensor> buffer;                                          //78
+  void add(size_t pos,Tensor&& v,bool gm=false){                 //52
+    if(pos>=buffer.size()||!v.defined()) return;                  //53
+    if(!buffer[pos].defined()) buffer[pos]=move(v);               //55
+    else accumulate(buffer,pos,move(v),gm);                       //57
+  }
+  int device_index() const{ //65
+    for(auto& t:buffer) if(t.defined() && t.device().is_cuda()) return (int)t.device().index(); //67
+    return -1; //71 CPU / unspecified
+  }
+  static variable_list variables(InputBuffer&& g){ return move(g.buffer); } //74
+};
+\end{lstlisting}
+
+\begin{table}[H]
+\centering
+\caption{\path{can\_accumulate\_inplace} triple condition (\path{InputBuffer.h:16}).}
+\label{tab:inplace}
+\small
+\begin{tabular}{ll}
+\toprule
+Check & Why \\
+\midrule
+\texttt{is\_contiguous()} & \texttt{add\_} on non-contiguous would trigger a copy anyway; out-of-place \texttt{+} is cheaper. \\
+\path{unsafeGetTensorImpl().use\_count()==2} & The temporary \texttt{shared\_ptr} copy from \texttt{impl()} counts as one; \texttt{==2} means the caller holds the last logical reference. \\
+\path{storage().use\_count()==1} & Ensures no other tensor aliases the same storage (views); mutating would corrupt an alias. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\path{InputBuffer::add:52} is the sole accumulation entry point used by the engine (\path{Engine.cpp:555,565}). The first grad at position \texttt{pos} moves in; the second and later grads go through \path{accumulate:29}. Under \texttt{grad\_mode==true} (i.e.\ \texttt{create\_graph}, propagated as \texttt{task.grad\_mode\_} at \path{Engine.cpp:555}) accumulation itself builds the second-order graph via \texttt{tpx::ops::add} (which re-enters dispatch and records a new \texttt{Node}). Otherwise the engine tries in-place \texttt{add\_} when \path{can\_accumulate\_inplace} holds, else falls back to \texttt{old+var} which allocates.
+
+\path{device\_index():65} scans for the first CUDA tensor. \path{Engine::enqueue\_task:616} uses it to pick the target \texttt{ReadyQueue}: \path{dev>=0 ? queue\_for\_device(dev) : \&cpu\_queue}. Placement is therefore determined by the first defined input's device, not by the node's own device; this matches the observation that the gradient tensor lives on the same device as its forward input.
+
+%==============================================================================
+\subsection{ReadyQueue: Priority by \texttt{sequence\_nr}}
+\label{subsec:readyqueue}
+
+\path{tpx/include/Engine.h:23--83} implements the scheduler queue (Listing~\ref{lst:readyqueue}).
+
+\begin{lstlisting}[caption={\path{Engine.h:23} --- priority queue.}, label=lst:readyqueue]
+struct ReadyQueue{ //23
+  struct NodeTask{ //25
+    shared_ptr<Node> fn_; InputBuffer input_buffer_; GraphTask* graph_; //26
+    NodeTask(shared_ptr<Node> f,InputBuffer b,GraphTask* g):fn_(move(f)),input_buffer_(move(b)),graph_(g){} //33
+    bool operator<(const NodeTask& o) const { return fn_->sequence_nr() < o.fn_->sequence_nr(); } //37 max-heap
+  };
+  void push(NodeTask t){ lock_guard<mutex> l(mutex_); heap_.push(move(t)); cv_.notify_one(); } //42
+  template<StopFn> optional<NodeTask> pop_until(const StopFn& stop){ //53
+    unique_lock<mutex> lock(mutex_);
+    for(;;){
+      if(!heap_.empty()){ auto t=move(const_cast<NodeTask&>(heap_.top())); heap_.pop(); return t; } //58
+      if(stop()) return nullopt; //62
+      cv_.wait_for(lock, chrono::milliseconds(5)); //65 poll
+    }
+  }
+  void notify(){ lock_guard<mutex> l(mutex_); cv_.notify_all(); } //74
+  mutex mutex_; condition_variable cv_; priority_queue<NodeTask> heap_; //80
+};
+\end{lstlisting}
+
+The queue is a max-heap by \texttt{sequence\_nr\_}. Since nodes are allocated in forward order, larger \texttt{sequence\_nr} is roughly closer to the outputs, so popping the maximum approximates reverse topological order without computing a topological sort per backward. It is a heuristic, not exact: true topological order is enforced by \texttt{dependencies\_} counting, which prevents execution before parents complete.
+
+\path{pop\_until:53} is used in two modes. Device workers call \path{queue.pop\_until([]{return false;})} (\path{Engine.cpp:169}) and block forever with a 5\,ms poll. The initiating thread calls \path{cpu\_queue.pop\_until([\&graph]{return graph.is\_completed();}):693} so it can exit as soon as its \texttt{GraphTask} finishes, even if the CPU queue is otherwise empty. The 5\,ms \path{wait\_for:65} avoids lost wakeups (the notifier takes the mutex before \texttt{notify}: \path{Engine.h:74} comments this explicitly) and bounds idle latency without busy-spinning. \path{notify:74} takes the lock before \texttt{notify\_all} so a notification cannot be lost between \texttt{pop\_until}'s empty check and its wait.
+
+\path{push:42} increments no counters itself; the caller must have already called \path{GraphTask::task\_enqueued():67} before pushing, which does the \path{outstanding\_tasks\_++} under \texttt{task.mutex\_}. This ordering matters: workers decrement on completion and the initiator blocks on \path{outstanding\_tasks\_==0}.
+
+%==============================================================================
+\subsection{Engine: Queues, Workers, and Cross-Device Routing}
+\label{subsec:enginequeues}
+
+\path{tpx/include/Engine.h:85--135} owns the queues and worker threads.
+
+\begin{lstlisting}[caption={\path{Engine.h:85} --- engine.}, label=lst:engineh]
+class TENSORPLAY_API Engine{ //85
+  static Engine& get_default_engine(); //88 leaked singleton
+  variable_list execute(edge_list roots,variable_list inputs,bool keep,bool create,bool acc,edge_list out); //95
+  void compute_dependencies(Node* root,GraphTask& t,uint64_t min_topo); //105
+  void evaluate_function(GraphTask& t,Node* func,InputBuffer& in,ReadyQueue& cpu,ReadyQueue* local); //111
+  void enqueue_task(GraphTask& t,ReadyQueue::NodeTask&& nt,ReadyQueue& cpu,ReadyQueue* local); //116
+  void execute_task(ReadyQueue::NodeTask&& t,ReadyQueue& cpu,ReadyQueue* local); //120
+  ReadyQueue* queue_for_device(int idx); //122
+  void worker_main(ReadyQueue& q); //124
+  mutex queues_mutex_; //126
+  unordered_map<int,ReadyQueue*> ready_queues_; //129 -1 CPU, >=0 CUDA
+  unordered_map<int,thread> device_threads_; //130 leaked by design
+  static thread_local int nested_depth_; //133
+};
+\end{lstlisting}
+
+\begin{lstlisting}[caption={\path{Engine.cpp:151} --- lazy queue and worker creation.}, label=lst:queuefordevice]
+ReadyQueue* Engine::queue_for_device(int idx){ //151
+  lock_guard<mutex> lock(queues_mutex_); //152
+  auto it=ready_queues_.find(idx); if(it!=end) return it->second; //153
+  auto* q=new ReadyQueue(); ready_queues_[idx]=q;          //156 leaked
+  if(idx>=0) device_threads_.emplace(idx, thread([this,q]{ worker_main(*q); })); //158
+  return q; //163
+}
+void Engine::worker_main(ReadyQueue& q){ //166
+  for(;;){ auto task=q.pop_until([]{return false;}); if(!task) continue; execute_task(move(*task), q, nullptr); } //168
+}
+void Engine::enqueue_task(GraphTask& task, ReadyQueue::NodeTask&& nt, ReadyQueue& cpu, ReadyQueue* local){ //609
+  task.task_enqueued(); //611
+  if(local){ local->push(move(nt)); return; } //612 nested: stay on local
+  int dev=nt.input_buffer_.device_index(); //616
+  ReadyQueue* target=(dev>=0)? queue_for_device(dev) : &cpu; //617
+  target->push(move(nt)); //618
+}
+\end{lstlisting}
+
+Design notes:
+
+\begin{itemize}[leftmargin=1.2em]
+\item \path{get\_default\_engine:145} leaks the singleton on purpose (\texttt{new Engine()} never freed) because queued tasks and workers may outlive static destructors. The Queues themselves are also leaked (\path{Engine.h:129}).
+\item \texttt{ready\_queues\_} maps \texttt{-1} to the CPU queue and non-negative ints to CUDA device indices. Each CUDA device gets exactly one persistent worker spawned on first use (\path{Engine.cpp:158}). CPU has no worker; the initiator thread drains it.
+\item \path{worker\_main:166} never exits. It blocks in \texttt{pop\_until} and calls \path{execute\_task:175}, which catches any exception, records it in \path{GraphTask::exception\_} via \path{record\_exception:185}, and marks completion with \path{task\_completed():186}.
+\item \path{nested\_depth\_:133} is \texttt{thread\_local}. When \path{execute:662} detects \texttt{nested=true}, it routes every task to a stack-local \path{local\_queue:667} and drains it itself (\texttt{684}). This keeps reentrant backward (a backward inside a backward's \texttt{apply}) deadlock-free: workers busy with the outer graph cannot block the inner one, and the inner graph's tasks never leak to device queues where workers would wait for an outer initiator that is itself blocked.
+\item Build discipline matters: both the root \path{build/} and the repo root are CMake binary directories pointing \texttt{TP\_PACKAGE\_DIR} at \path{tensorplay/} (see \path{CMakeLists.txt} \texttt{TP\_PACKAGE\_DIR}). Concurrent linkers corrupt \path{\_C.so}; see \path{docs/whitepaper/README.md} compile notes.
+\end{itemize}
+
+%==============================================================================
+\subsection{Building the Dependency Count}
+\label{subsec:dependencies}
+
+\begin{lstlisting}[caption={\path{Engine.cpp:192} --- BFS in-degree.}, label=lst:computedep]
+void Engine::compute_dependencies(Node* root,GraphTask& task,uint64_t min_topo){ //192
+  vector<Node*> queue{root}; auto& deps=task.dependencies_; auto& nodes=task.nodes_in_graph_; //194
+  while(!queue.empty()){
+    auto fn=queue.back(); queue.pop_back(); //198
+    if(fn->topological_nr() < min_topo) continue; //201 prune
+    for(auto& e: fn->next_edges()){ //204
+      if(auto* next=e.function.get()){
+        deps[next] += 1; //206
+        if(was_inserted(nodes,next)) queue.push_back(next); //215
+      }
+    }
+  }
+}
+\end{lstlisting}
+
+This is a DFS (vector as stack) over the DAG starting from \texttt{graph\_root}. Each edge contributes one to the child's in-degree stored in \path{dependencies\_[child]++:206}. The \texttt{nodes\_in\_graph\_} set ensures each node is expanded once, but the counter still accumulates one per incoming edge (the map is bumped even when the node was already seen). The \texttt{min\_topo} guard (\texttt{201}) skips entire subtrees that were created before the first output of interest; this is critical for \texttt{grad()} where only a suffix of the forward matters. Trace level~2 emits \path{EngineTrace::emit("dep \%s -> \%s count=\%d"):211} per edge when \texttt{TP\_ENGINE\_TRACE=2}.
+
+\path{compute\_min\_topological\_nr:127} is the minimum \texttt{topological\_nr\_} among \texttt{outputs[].function}. If \texttt{outputs} is empty (pure \texttt{backward()}), it returns 0 and nothing is pruned.
+
+%==============================================================================
+\subsection{Orchestrating a Backward: \texttt{Engine::execute}}
+\label{subsec:execute}
+
+Listing~\ref{lst:execute} is the full orchestration at \path{Engine.cpp:621--710}.
+
+\begin{lstlisting}[caption={\path{Engine.cpp:621} --- orchestration.}, label=lst:execute]
+variable_list Engine::execute(const edge_list& roots,const variable_list& inputs, //621
+  bool keep, bool create, bool acc, const edge_list& outputs){
+  GraphTask task(keep,create); task.trace_id_=EngineTrace::next_graph_id(); //636
+  bool skip=roots.size()==1; shared_ptr<Node> graph_root; //647
+  if(skip) graph_root=roots[0].function; else graph_root=make_shared<GraphRoot>(roots,inputs); //648
+  auto min_topo=compute_min_topological_nr(outputs); //655
+  compute_dependencies(graph_root.get(), task, min_topo); //656
+  if(!outputs.empty()) task.init_to_execute(*graph_root, outputs, acc, min_topo); //658
+  const bool nested=nested_depth_>0; ReadyQueue local; ReadyQueue& cpu=*queue_for_device(-1); //662
+  if(skip){ //669
+    InputBuffer buf(roots[0].function->num_inputs()); //670
+    buf.add(roots[0].input_nr, Tensor(inputs[0]), create); //671
+    enqueue_task(task, NodeTask(roots[0].function, move(buf), &task), cpu, nested?&local:nullptr); //672
+  } else enqueue_task(task, NodeTask(graph_root, InputBuffer(), &task), cpu, nested?&local:nullptr); //675
+  DepthGuard depth(nested_depth_); //681
+  if(nested){ while(!task.is_completed()){ auto t=local.pop_until([]{return false;}); if(!t) break; execute_task(move(*t), cpu, &local); } //683
+  } else { while(!task.is_completed()){ auto t=cpu.pop_until([&task]{return task.is_completed();}); if(!t) break; execute_task(move(*t), cpu, nullptr); } task.wait_for_completion(); } //689
+  if(task.exception_) rethrow_exception(task.exception_); //705
+  return move(task.captured_vars_); //709
+}
+\end{lstlisting}
+
+Steps:
+
+\begin{enumerate}[leftmargin=1.2em]
+\item Validate \path{roots.size()==inputs.size()} (\texttt{629}) and that \texttt{grad()} has non-empty outputs (\texttt{633}).
+\item Create \path{GraphTask(keep\_graph,create\_graph):636} and assign \texttt{trace\_id\_} from an atomic counter (\path{Engine.cpp:68}).
+\item Build an ephemeral \texttt{GraphRoot} if fan-in (multi-output backward) is needed; it holds the root edges and forwards the seeded gradients to the correct parents.
+\item Compute dependencies (\S\ref{subsec:dependencies}) and, for \texttt{grad()}, the \path{needed\_/captures} filter via \texttt{init\_to\_execute}.
+\item Enqueue the root(s). In the single-root fast path, the seed gradient is inserted at \texttt{input\_nr} with explicit \path{grad\_mode==create\_graph} so the first \texttt{InputBuffer::add} already knows whether to build second-order history.
+\item Branch on \texttt{nested\_depth\_}. Nested backs use the local queue; the top-level initiator drains the CPU queue itself while CUDA workers drain their device queues. The initiator also calls \path{wait\_for\_completion:697} after the CPU queue drains, because some work may still be on device workers.
+\end{enumerate}
+
+\path{DepthGuard:121} is RAII: \texttt{++depth} on entry, \texttt{--depth} on exit, even via exception, so reentrancy tracking is exception-safe.
+
+%==============================================================================
+\subsection{The Core Loop: \texttt{evaluate\_function} in Ten Steps}
+\label{subsec:evaluate}
+
+\path{Engine::evaluate\_function:333} is the per-node interpreter. Listing~\ref{lst:evaluatehead} shows the prologue and epilogue; the ten steps are indexed below and detailed in subsubsections.
+
+\begin{lstlisting}[caption={\path{Engine.cpp:333} --- prologue.}, label=lst:evaluatehead]
+void Engine::evaluate_function(GraphTask& task, Node* func, InputBuffer& inputs, //333
+  ReadyQueue& cpu, ReadyQueue* local){
+  auto& exec_info=task.exec_info_; //335
+  GradModeGuard grad_guard(task.grad_mode_); //339 Honour create_graph on workers
+  if(!exec_info.empty()){ //341 grad() filtering
+    auto& info=exec_info.at(func);
+    if(auto* caps=info.captures_.get()){ lock_guard<mutex> L(task.mutex_); for(auto& c:*caps) task.captured_vars_[c.output_idx_]=inputs.buffer[c.input_idx_]; } //345
+    if(!info.needed_){ if(task.task_completed()) queue_for_device(-1)->notify(); return; } //352
+  }
+  variable_list outputs; //361
+  { //362 profiling + trace scope
+    optional<prof::OpRecord> rec; if(prof::g_active.load(acquire)) rec.emplace(intern_name("backward::"+func->name())); //367
+    // ... materialize, hooks, guard, apply, post hooks (see sub-steps)
+  }
+  // ... shape/dtype/nan + propagation (see below)
+}
+\end{lstlisting}
+
+\subsubsection{Step~1: \texttt{GradModeGuard}}
+\label{subsubsec:gradguard}
+
+\begin{lstlisting}[caption={\path{Engine.cpp:21} --- honour \texttt{create\_graph} on workers.}, label=lst:gradguard]
+struct GradModeGuard{ explicit GradModeGuard(bool e):prev_(GradMode::is_enabled()){ GradMode::set_enabled(e); } ~GradModeGuard(){ GradMode::set_enabled(prev_); } bool prev_; }; //21
+\end{lstlisting}
+
+\texttt{GradMode} lives in \texttt{p10} (\path{p10/include/GradMode.h:8}, \S\ref{subsec:guards}) as \path{thread\_local bool enabled\_=true} (\path{p10/src/GradMode.cpp:5}). Worker threads inherit whatever TLS the OS gave them, which is unrelated to the task's \texttt{create\_graph}. The guard overwrites the worker's TLS with \texttt{task.grad\_mode\_} for the duration of this node's evaluation, so nested accumulation and profiling see the correct value.
+
+\subsubsection{Step~2: \texttt{ExecInfo} Capture and Early Exit}
+\label{subsubsec:execinfo}
+
+Already shown in Listing~\ref{lst:evaluatehead}:345. For \texttt{grad()} the engine copies captured slots directly from the input buffer into \path{task.captured\_vars\_} under \texttt{task.mutex\_}, without copying the whole buffer for nodes without captures. If \texttt{!needed\_} the node is done: decrement outstanding and wake the initiator if this was the last task.
+
+\subsubsection{Step~3: Materializing Missing Gradients}
+\label{subsubsec:materialize}
+
+\begin{lstlisting}[caption={\path{Engine.cpp:384} --- missing grads.}, label=lst:materialize]
+variable_list vars=InputBuffer::variables(move(inputs)); //384
+if(func->materialize_grads()){ //392
+  auto& metas=func->output_metas(); auto& edges=func->next_edges(); //393
+  size_t n=min(vars.size(), metas.empty()?edges.size():metas.size()); //395
+  for(size_t i=0;i<n;++i) if(!vars[i].defined()){ //398
+    vector<int64_t> shape; DType dt=DType::Undefined; DeviceType dt_type=DeviceType::CPU; int64_t didx=-1; bool have=false; //399
+    if(!metas.empty() && i<metas.size() && metas[i].valid){ shape=metas[i].shape; dt=metas[i].dtype; didx=metas[i].device_index; have=true; } //404
+    else if(i<edges.size() && edges[i].has_shape_hint && edges[i].grad_dtype && edges[i].device_type_hint && edges[i].device_index_hint){ shape=edges[i].shape_hint; dt=*edges[i].grad_dtype; dt_type=*edges[i].device_type_hint; didx=*edges[i].device_index_hint; have=true; } //410
+    if(!have) continue; //419
+    Device dev(dt_type, dt_type==DeviceType::CPU?-1:didx); //421
+    vars[i]=ops::zeros(shape,dt,dev); //423
+  }
+}
+\end{lstlisting}
+
+Policy: \texttt{PyNode}-like custom functions record per-output metadata in \texttt{output\_metas\_} via \texttt{attach\_outputs}; generated derivative nodes leave it empty and fall back to the per-input \texttt{Edge} triple. Preference is given to \texttt{output\_metas\_} because custom functions' backward inputs correspond to forward outputs (their \texttt{num\_inputs()} equals \path{output\_metas\_.size()}, see \path{src/bindings/python/Autograd.cpp:30}). \path{ops::zeros:423} allocates on the recorded device with the recorded dtype, so missing grads never require a Python crossing.
+
+\subsubsection{Step~4: Pre-Hooks}
+\label{subsubsec:prehooks}
+
+\begin{lstlisting}[caption={\path{Engine.cpp:426} --- pre-hooks.}, label=lst:prehooks]
+for(auto& hook: func->pre_hooks()) vars=hook(move(vars)); //426
+\end{lstlisting}
+
+Hooks are \path{std::function<variable\_list(variable\_list\&\&)>} installed at graph-build time (\path{Node.h:116}). Python bindings wrap them with \path{py::gil\_scoped\_acquire} at \path{src/bindings/python/Autograd.cpp:100} so hook execution is GIL-safe even from CUDA workers.
+
+\subsubsection{Step~5: Apply under \path{CurrentEvalNodeGuard}}
+\label{subsubsec:apply}
+
+\begin{lstlisting}[caption={\path{Engine.cpp:432} --- apply.}, label=lst:apply]
+CurrentEvalNodeGuard guard(AnomalyMode::is_enabled()? func->shared_from_this():nullptr); //432
+if(AnomalyMode::is_enabled()){ //434
+  try{ outputs=func->apply(move(vars)); }catch(...){ if(auto* m=func->anomaly_metadata()) m->print_stack(func->name()); throw; } //435
+} else outputs=func->apply(move(vars)); //444
+\end{lstlisting}
+
+\path{CurrentEvalNodeGuard:57} (\path{tpx/include/AnomalyMode.h:57}) pushes \texttt{func} onto \path{tls\_current\_evaluating\_node} (\path{tpx/src/AnomalyMode.cpp:20}), so any \texttt{Node} allocated inside this \texttt{apply} (possible under \texttt{create\_graph}) records the current node as its anomaly parent via \path{Node::init\_anomaly\_metadata():134}. On exception with anomaly enabled, the engine prints the forward stack chain before rethrowing.
+
+\path{EngineTrace:372} also emits \path{"apply \%s inputs=[...]"} with \path{EngineTrace::tensor\_desc:82} rendering shape/dtype and, at level~3, up to eight element values.
+
+\subsubsection{Step~6: Post-Hooks}
+\label{subsubsec:posthooks}
+
+\begin{lstlisting}[caption={\path{Engine.cpp:446} --- post-hooks.}, label=lst:posthooks]
+for(auto& hook: func->post_hooks()) outputs=hook(outputs, move(outputs)); //447 -- signature (inputs,outputs)->outputs
+\end{lstlisting}
+
+Post-hooks receive both the inputs and the outputs of this node and may rewrite the outputs (e.g.\ grad clipping). The C++ binding exposes a \path{(inputs,outputs)->outputs} signature plus GIL acquisition.
+
+\subsubsection{Step~7: Shape Validation and \texttt{sum\_to\_shape}}
+\label{subsubsec:sumto}
+
+Broadcasting during forward inflates a scalar grad to a large shape. Before the next edge consumes the grad, the engine must reduce it to the forward-input shape recorded on that edge. Listing~\ref{lst:sumtoshape} is the routine at \path{Engine.cpp:298--331}.
+
+\begin{lstlisting}[caption={\path{Engine.cpp:298} --- broadcast recovery.}, label=lst:sumtoshape]
+static Tensor sum_to_shape(const Tensor& grad,const vector<int64_t>& target){ //298
+  if(target.empty()) return ops::sum(grad); //301 scalar ()
+  int64_t leading=(int64_t)grad.dim()-(int64_t)target.size(); //304
+  if(leading<0){ int64_t n=1; for(auto d:target) n*=d; if(grad.numel()==n) return ops::reshape(grad,target); return grad; } //306
+  vector<int64_t> reduce; for(int64_t i=0;i<leading;++i) reduce.push_back(i); //318
+  for(int64_t i=leading;i<(int64_t)grad.dim();++i) if(target[i-leading]==1 && grad.size(i)!=1) reduce.push_back(i); //319
+  Tensor cur=reduce.empty()?grad:ops::sum(grad,reduce,true); //325 keepdim
+  if(leading>0) cur=ops::reshape(cur,target); //327
+  return cur; //330
+}
+\end{lstlisting}
+
+Called at \path{Engine.cpp:463--489}: for each \path{i < min(outputs.size(),edges.size())}, if \path{edges[i].has\_shape\_hint} and the grad's sizes mismatch the hint, \texttt{sum\_to\_shape} is invoked. The logic keeps dimensions where \texttt{target==1} but \texttt{grad>1} and sums with \texttt{keepdim=true}, then reshapes away leading broadcast dimensions. Under \texttt{create\_graph}, the \path{ops::sum/reshape} calls join the second-order graph because \texttt{GradModeGuard} is still active.
+
+\subsubsection{Step~8: Dtype Cast}
+\label{subsubsec:dtypecast}
+
+\begin{lstlisting}[caption={\path{Engine.cpp:495} --- dtype alignment.}, label=lst:dtypecast]
+auto& gdt=edges[i].grad_dtype;
+if(gdt && isFloatingType(*gdt) && isFloatingType(outputs[i].dtype()) && outputs[i].dtype()!=*gdt && !InferenceMode::is_enabled())
+  outputs[i]=tpx::to(outputs[i], *gdt); //501 autocast rebalance: fp32->bf16 etc.
+\end{lstlisting}
+
+Edge dtype hints exist so that an \texttt{fp32} grad produced by an unwrapped promote op re-enters a backward node whose saved tensors are low-precision (the autocast case documented at \path{Edge.h:27}). Non-floating hints (bool masks, indices) are never grads and are left alone. The \texttt{InferenceMode} guard matches the dispatcher's \texttt{inference\_tensor\_} semantics.
+
+\subsubsection{Step~9: NaN Probe}
+\label{subsubsec:nanprobe}
+
+\begin{lstlisting}[caption={\path{Engine.cpp:139} --- NaN probe.}, label=lst:nanprobe]
+bool tensor_has_nan(const Tensor& t){ //139
+  if(!t.defined()|| !isFloatingOrComplexType(t.dtype())) return false; //140
+  return t.ne(t).any().item<bool>(); //141 ieee NaN != NaN via dispatch
+}
+\end{lstlisting}
+
+At \path{Engine.cpp:506}: if \path{AnomalyMode::is\_enabled()\&\&should\_check\_nan()}, each output is probed under a local \path{GradModeGuard(false)} so the probe itself does not record history. On failure the engine throws \path{RuntimeError "Function 'X' returned nan values in its ith output.":509}.
+
+\subsubsection{Step~10: Propagation, Accumulation, and Enqueue}
+\label{subsubsec:propagate}
+
+Listing~\ref{lst:propagate} at \path{Engine.cpp:518--592} distributes outputs to parents.
+
+\begin{lstlisting}[caption={\path{Engine.cpp:518} --- propagation.}, label=lst:propagate]
+auto num=outputs.size(); auto& edges=func->next_edges(); //515
+for(size_t i=0;i<num;++i){ //519
+  if(i>=edges.size()) break; auto& out=outputs[i]; auto& nxt=edges[i]; if(!nxt.is_valid()) continue; //520
+  bool ready=false, enqueue=false; ReadyQueue::NodeTask pending(nullptr,InputBuffer(),&task); //529
+  { lock_guard<mutex> L(task.mutex_); //532
+    auto it=task.dependencies_.find(nxt.function.get());
+    if(it==end) TP_THROW(RuntimeError,"dependency not found"); else if(--it->second==0){ task.dependencies_.erase(it); ready=true; } //535
+    auto& not_ready=task.not_ready_;
+    auto jt=not_ready.find(nxt.function.get());
+    if(jt==end){
+      if(!exec_info.empty()){ auto k=exec_info.find(nxt.function.get()); if(k==end||!k->second.should_execute()) continue; } //546
+      InputBuffer buf(nxt.function->num_inputs()); buf.add(nxt.input_nr, move(out), task.grad_mode_); //554
+      if(ready){ pending=NodeTask(nxt.function, move(buf), &task); enqueue=true; } else not_ready.emplace(nxt.function.get(), move(buf)); //556
+    } else {
+      auto& buf=jt->second; buf.add(nxt.input_nr, move(out), task.grad_mode_); //564
+      if(ready){ pending=NodeTask(nxt.function, move(buf), &task); enqueue=true; not_ready.erase(jt); } //566
+    }
+  }
+  if(enqueue) enqueue_task(task, move(pending), cpu, local); //583
+}
+if(!task.keep_graph_) func->release_variables(); //594 clears next_edges_
+if(task.task_completed()) queue_for_device(-1)->notify(); //598 wakes initiator
+\end{lstlisting}
+
+Under \texttt{task.mutex\_} the engine decrements \path{dependencies\_[next]}, stashing the first contribution in \texttt{not\_ready\_[next]} and calling \path{InputBuffer::add:554,565} for subsequent ones. When the counter hits zero the buffer is moved into a \texttt{NodeTask} and handed to \texttt{enqueue\_task}, which picks the queue by \texttt{device\_index} (or the local queue for nested graphs). \path{release\_variables:594} clears \texttt{next\_edges\_} so the DAG is freed eagerly when \path{retain\_graph==false} but stays intact when \texttt{create\_graph} or \texttt{retain\_graph} requested it.
+
+%==============================================================================
+\subsection{SavedVariable and VariableVersion: Mutation Guard}
+\label{subsec:savedvar}
+
+Backward needs forward tensors. Storing a bare \texttt{Tensor} would silently yield wrong grads if the tensor is mutated in-place between forward and backward. TensorPlay uses a version counter on storage plus a guarded handle (Listings~\ref{lst:savedvar}--\ref{lst:varver}).
+
+\begin{lstlisting}[caption={\path{tpx/include/SavedVariable.h:15} --- guarded handle.}, label=lst:savedvar]
+class SavedVariable{ //15
+  Tensor data_; uint32_t saved_version_=0; //39
+  void save(const Tensor& t){ //8 in SavedVariable.cpp
+    if(!t.defined()){ data_=Tensor(); saved_version_=0; return; } //9
+    data_=t; saved_version_=t.unsafeGetTensorImpl()->version(); //14
+  }
+  Tensor unpack() const{ //18
+    if(!data_.defined()) return Tensor(); //19
+    uint32_t cur=data_.unsafeGetTensorImpl()->version(); //20
+    if(cur!=saved_version_) TP_THROW(RuntimeError, //21
+      "one of the variables needed for gradient computation has been modified by an inplace operation: [saved version: "+to_string(saved_version_)+"; current version: "+to_string(cur)+"]"); //22
+    return data_; //28
+  }
+  void reset_data(){ data_=Tensor(); saved_version_=0; } //31 called by Node::release_variables
+  bool defined() const { return data_.defined(); } //36
+};
+\end{lstlisting}
+
+\begin{lstlisting}[caption={\path{p10/include/VariableVersion.h:13} --- atomic counter.}, label=lst:varver]
+struct VersionCounter{ atomic<uint32_t> version_{0}; void bump() noexcept { version_.fetch_add(1, relaxed); } uint32_t current_version() const noexcept { return version_.load(relaxed); } }; //13
+class VariableVersion{ //24
+  shared_ptr<VersionCounter> counter_; bool enabled_=true; //26
+  VariableVersion():counter_(make_shared<VersionCounter>()){} //30 eagerly allocated
+  explicit VariableVersion(bool e):counter_(e?make_shared<VersionCounter>():nullptr),enabled_(e){} //32
+  uint32_t current_version() const { return counter_?counter_->current_version():0; } //36
+  void bump(){ if(!enabled_) return; counter_->bump(); } //44
+  bool shares_counter(const VariableVersion& o) const { return counter_ && counter_==o.counter_; } //56 alias test
+};
+\end{lstlisting}
+
+\begin{table}[H]
+\centering
+\caption{Version lifecycle. Every path:line is a contract, not a suggestion.}
+\label{tab:verlife}
+\small
+\begin{tabular}{lll}
+\toprule
+Site & Path:Line & Action \\
+\midrule
+\path{TensorImpl::version\_counter\_} & \path{p10/include/TensorImpl.h:34} & Initialized as \path{VariableVersion(!InferenceMode::is\_enabled())}; inference tensors get a disabled counter. \\
+\path{TensorImpl::bump\_version()} & \path{p10/include/TensorImpl.h:271} & \path{version\_counter\_.bump()} (+ inference-mode guard). \\
+Generated mutating ops & \path{tools/codegen/gen\_api.py:456} & \path{if(!InferenceMode::is\_enabled()) \_\_tp\_tensor.impl()->bump\_version()} for every \texttt{a!} arg. \\
+View creation & \path{tools/codegen/gen\_tpx.py:457} & \path{result.impl()->share\_version\_counter(input.impl())} so view+base share one \texttt{VersionCounter}. \\
+\texttt{SavedVariable::save} & \path{tpx/src/SavedVariable.cpp:15} & Snapshots \path{tensor.unsafeGetTensorImpl()->version()}. \\
+\path{SavedVariable::unpack} & \path{tpx/src/SavedVariable.cpp:20} & Compares current version; throws with both versions in the message if mismatched. \\
+\path{tpx/src/Autograd.cpp:43} & \path{Autograd.cpp:43} & \texttt{is\_view\_of\_leaf} checks \texttt{attr\_version} before walking through view nodes. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Why eagerly allocated: \path{VariableVersion:30} always allocates a \texttt{VersionCounter}. If allocation were lazy, a base that had not yet mutated and a view created before any mutation would each grow their own counter on first bump, and later mutations on one alias would be invisible to the other. Eager allocation plus \path{share\_version\_counter:289} (\path{TensorImpl.h:289}) guarantees all aliases observe the same bump. The counter is atomic (\path{VariableVersion.h:14}) so bumps from one alias are visible to readers holding another.
+
+%==============================================================================
+\subsection{Anomaly and Mode Guards}
+\label{subsec:guards}
+
+\path{tpx/include/AnomalyMode.h:14--73} and its companion \path{tpx/src/AnomalyMode.cpp:20} separate a global switch from a thread-local current node (Listing~\ref{lst:anomaly}).
+
+\begin{lstlisting}[caption={\path{AnomalyMode.h:14} and \path{AnomalyMode.cpp:20}.}, label=lst:anomaly]
+class AnomalyMode{ //14
+  static bool is_enabled(){ return _enabled; } //16
+  static bool should_check_nan(){ return _check_nan; } //17
+  static void set_enabled(bool e,bool c=true){ _enabled=e; _check_nan=c; } //18
+  static bool _enabled, _check_nan; //24 global, not TLS
+};
+struct AnomalyMetadata{ //32
+  void store_stack(); void print_stack(const string& node); //39
+  void assign_parent(const shared_ptr<Node>& p){ parent_=p; } //42 weak_ptr<Node> parent_;
+  string traceback_; weak_ptr<Node> parent_; //45
+};
+namespace{ thread_local weak_ptr<Node> tls_current_evaluating_node; } //20 in .cpp
+shared_ptr<Node> get_current_evaluating_node(){ return tls_current_evaluating_node.lock(); } //28
+void set_current_evaluating_node(const shared_ptr<Node>& n){ tls_current_evaluating_node=n; } //32
+struct CurrentEvalNodeGuard{ //57
+  explicit CurrentEvalNodeGuard(const shared_ptr<Node>& n):last_(get_current_evaluating_node()){ set_current_evaluating_node(n); } //59
+  ~CurrentEvalNodeGuard(){ set_current_evaluating_node(last_); } //62
+  shared_ptr<Node> last_; //69
+};
+\end{lstlisting}
+
+State machine:
+
+\begin{itemize}[leftmargin=1.2em]
+\item User calls \path{tensorplay.autograd.set\_detect\_anomaly(True)} which reaches \path{src/bindings/python/Autograd.cpp:475} \path{AnomalyMode::set\_enabled(enabled,check\_nan)}. This sets two globals (\path{AnomalyMode.cpp:9}) visible to every thread; no TLS, no refcount, so the first thread that enables it pays for all.
+\item On node creation, \path{Node::init\_anomaly\_metadata():132} snapshots the current stack via \texttt{store\_stack:38}. By default that calls \path{tensorplay::get\_stacktrace()} (C++ frames). The Python binding at \path{Autograd.cpp:487} installs a capturer that calls \path{traceback.format\_stack()} under the GIL, so the stored traceback is the Python call site of the forward op, not a C++ backtrace.
+\item During backward, \path{evaluate\_function:432} pushes the evaluating node onto \path{tls\_current\_evaluating\_node}. Any node created inside that \texttt{apply} (second-order graph) records the pushed node as its \path{AnomalyMetadata::parent\_}. On failure the engine walks the chain at \path{AnomalyMode.cpp:46} \texttt{print\_stack} printing \path{"Previous calculation was induced by..."} per parent until the weak pointer expires.
+\item The NaN check (\path{tensor\_has\_nan:139} via \texttt{t.ne(t).any()}) is gated on \path{AnomalyMode::should\_check\_nan():17} and runs under a local \path{GradModeGuard(false)} so the probe never mutates \texttt{GradMode}.
+\end{itemize}
+
+\subsubsection{GradMode and InferenceMode: Thread-Local Switches}
+\label{subsubsec:gradmode}
+
+\begin{lstlisting}[caption={\path{p10/include/GradMode.h:8} and \path{InferenceMode.h:9}.}, label=lst:gradmode]
+class GradMode{ static bool is_enabled(){ return enabled_; } static void set_enabled(bool e){ enabled_=e; } static thread_local bool enabled_; }; //8 in GradMode.h
+// GradMode.cpp:5  thread_local bool GradMode::enabled_ = true; // enabled by default
+class InferenceMode{ static bool is_enabled(){ return enabled_; } static void set_enabled(bool e){ enabled_=e; } static thread_local bool enabled_; }; //9
+// InferenceMode.cpp:5  thread_local bool InferenceMode::enabled_ = false;
+\end{lstlisting}
+
+Both live in \texttt{p10} deliberately (\path{tpx/include/Autograd.h:138} re-exports them as \path{tensorplay::tpx::GradMode / InferenceMode}) so dispatch can consult them without depending on \texttt{tpx}. They are true \texttt{thread\_local}: \texttt{no\_grad()} in one thread does not leak into engine workers or other user threads. Inference tensors are born with \path{version\_counter\_\{false\}} and \path{inference\_tensor\_=true} (\path{TensorImpl.h:34}); \path{TensorImpl::key\_set():135} omits the Autograd bit for them, and \path{Engine.cpp:500} skips dtype casts when \path{InferenceMode::is\_enabled()}. RAII helpers \path{GradModeGuard:21} and \path{InferenceModeGuard:21} (\path{p10/include/InferenceMode.h:21}) restore previous values, including on exceptions.
+
+%==============================================================================
+\subsection{Python Binding: \texttt{PyNode} and the Single-Crossing Hot Path}
+\label{subsec:pynode}
+
+Custom autograd functions are the escape hatch for user code. The binding is at \path{src/bindings/python/Autograd.cpp:24} (Listing~\ref{lst:pynode}).
+
+\begin{lstlisting}[caption={\path{Autograd.cpp:24} --- \texttt{PyNode}.}, label=lst:pynode]
+class PyNode : public tpx::Node{ //24
+  PyNode(py::object ctx): py_ctx_(move(ctx)){} //26
+  size_t num_inputs() const override { return output_metas().empty()? Node::num_inputs() : output_metas().size(); } //30 Py outputs are backward inputs
+  variable_list apply(variable_list&& inputs) override{ //35
+    py::gil_scoped_acquire gil; //37 workers need the GIL
+    py::tuple py_in(inputs.size()); for(size_t i=0;i<inputs.size();++i) py_in[i]=inputs[i].defined()? py::cast(inputs[i]): py::none(); //42
+    py::object res=py_ctx_.attr("backward")(*py_in); //58
+    variable_list out; if(res.is_none()) return out; else if(py::isinstance<Tensor>(res)) out.push_back(py::cast<Tensor>(res)); else for(auto item: py::cast<py::sequence>(res)) out.push_back(item.is_none()? Tensor(): py::cast<Tensor>(item)); //60
+    return out; //79
+  }
+  py::object py_ctx_; //82
+};
+\end{lstlisting}
+
+\begin{lstlisting}[caption={\path{Autograd.cpp:159} --- \texttt{attach\_outputs} records hints for zero-fill.}, label=lst:attach]
+.def("attach_outputs", [](PyNode& self, py::handle outputs){ //159
+  auto node=static_pointer_cast<Node>(self.shared_from_this()); //166
+  auto& metas=self.output_metas(); metas.clear(); auto record=[&](py::handle item){ //169
+    OutputSlotMeta m; if(py::isinstance<Tensor>(item)){ auto& t=py::cast<const Tensor&>(item); m.shape=vector<int64_t>(t.shape()); m.dtype=t.dtype(); m.device_index=t.device().index(); m.valid=true; } metas.push_back(move(m)); //173
+  };
+  if(py::isinstance<Tensor>(outputs)){ record(outputs); Tensor& t=py::cast<Tensor&>(outputs); impl::set_requires_grad(t,true); impl::set_grad_fn(t,node,0); return; } //183
+  for(auto item: outputs.cast<py::sequence>()){ record(item); if(py::isinstance<Tensor>(item)){ Tensor& t=py::cast<Tensor&>(item); impl::set_requires_grad(t,true); impl::set_grad_fn(t,node,idx); } ++idx; } //190
+}, "outputs"_a);
+\end{lstlisting}
+
+The binding is more than a trampoline. Three hot-path optimizations cut per-op Python overhead:
+
+\begin{enumerate}[leftmargin=1.2em]
+\item \path{autograd.collect\_next\_edges:202} and \path{setup\_custom\_function\_graph:214} batch edge wiring: one crossing builds the \texttt{vector<Edge>} for all tensor args by iterating \path{py::isinstance<Tensor>} at \path{Autograd.cpp:222} and calling \path{collect\_next\_edges:229} per tensor, then \path{add\_next\_edge\_list} once. The non-batched Python loop in \path{tensorplay/autograd/function.py:255} would pay N pybind crossings otherwise.
+\item \path{custom\_function\_apply:286} is the single-entry fast path. It creates the \texttt{PyNode}, unpacks \texttt{needs\_input\_grad}, wires \texttt{next\_edges} (\texttt{327}), disables GradMode (\texttt{346}), calls \texttt{forward} plus \texttt{setup\_context}, marks outputs with \texttt{set\_grad\_fn} plus \texttt{OutputSlotMeta} (\texttt{368}), and returns \path{(output, ctx, needs, executable, node)} all in one GIL hold. Python only builds the backward closure afterwards. This replaces five round-trips with one.
+\item \path{backward:408} and \texttt{grad:419} release the GIL (\path{py::gil\_scoped\_release:415}) before entering \path{tpx::backward/grad}, because workers need it to re-enter Python for \texttt{PyNode::apply}. Holding it would deadlock.
+\end{enumerate}
+
+\path{PyNode::num\_inputs:30} overrides the default \path{next\_edges\_.size()} when \texttt{output\_metas\_} is non-empty, because for custom functions the backward arity is the forward's outputarity, not its input arity. Hook registration on \texttt{Node} (\path{Autograd.cpp:95}) wraps the user hook with a GIL acquire so hooks are safe even when invoked from CUDA workers.
+
+%==============================================================================
+\subsection{Explicit DAG in Two Dimensions}
+\label{subsec:dagfig}
+
+Figure~\ref{fig:autograddag} shows the graph the engine actually walks. Each node's \texttt{next\_edges\_} are the incoming grad channels; the heap key is the \texttt{sequence\_nr\_}. Device placement is an \texttt{Edge} hint, not a separate schedule.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[every node/.style={font=\scriptsize}, node distance=0.55cm, >=Stealth]
+\tikzset{libbox/.style={draw, rounded corners=2pt, thick, align=center, font=\scriptsize, minimum height=0.75cm}}
+\node[libbox, fill=blue!9, draw=tpblue, minimum width=3.2cm] (g1) {\texttt{GraphRoot} \tiny $(topo=5)$};
+\node[libbox, fill=blue!9, draw=tpblue, minimum width=3.2cm, below=of g1] (n1) {\texttt{SumBackward} \tiny $seq=42$};
+\node[libbox, fill=blue!9, draw=tpblue, minimum width=3.2cm, below=of n1] (n2) {\texttt{MulBackward} \tiny $seq=38$};
+\node[libbox, fill=green!10, draw=tpgreen, below left=0.65cm and -0.3cm of n2, minimum width=2.9cm] (n3) {\texttt{AccumulateGrad(x)} \tiny $seq=1$};
+\node[libbox, fill=purple!10, draw=tppurple, below right=0.65cm and -0.3cm of n2, minimum width=2.9cm] (n4) {\texttt{CatBackward} \tiny $seq=29$\\ \tiny \texttt{SavedVariable\{self,dim\}}};
+\node[libbox, fill=gray!10, draw=gray, below=1.15cm of n3, minimum width=6.8cm] (q) {ReadyQueue CPU (max-heap by \texttt{sequence\_nr}) \quad ReadyQueue CUDA:0 (worker thread)};
+\path[arrow] (g1) edge node[right, font=\tiny, color=gray] {\path{Edge\{hint (2,3)/fp32/cuda:0\}}} (n1);
+\path[arrow] (n1) edge (n2);
+\path[arrow] (n2) edge node[left, font=\tiny, color=gray] {\texttt{input\_nr 0}} (n3);
+\path[arrow] (n2) edge node[right, font=\tiny, color=gray] {\texttt{input\_nr 1}} (n4);
+\node[font=\tiny, color=gray, below=0.18cm of g1, xshift=2.35cm] {\path{dependencies: Mul 1, Sum 1}};
+\node[font=\tiny, color=gray, below=0.02cm of q] {\texttt{tls nested\_depth\_} routes reentrant backs to \texttt{local\_queue}};
+\draw[arrow, dashed, color=gray] (g1.east) -- ++(0.75,0) |- (q.east);
+\draw[arrow, dashed, color=gray] (n1.east) -- ++(0.55,0) |- (q.east);
+\draw[arrow, dashed, color=gray] (n2.east) -- ++(0.35,0) |- (q.east);
+\end{tikzpicture}
+\caption{Explicit DAG, no Tape. Nodes carry \path{sequence\_nr / topological\_nr / materialize\_grads / OutputSlotMeta}; edges carry \path{shape\_hint / grad\_dtype / device\_hint}. Engine's \texttt{ReadyQueue} pops the largest \texttt{sequence\_nr} first; \texttt{dependencies\_} gates readiness. Reentrant backward bypasses device queues into a stack-local \texttt{local\_queue} guarded by \texttt{nested\_depth\_}.}
+\label{fig:autograddag}
+\end{figure}
+
+%==============================================================================
+\subsection{Design Tradeoffs}
+\label{subsec:compare}
+
+Table~\ref{tab:compare} summarizes the load-bearing design choices and the deliberate simplifications that preserve correctness guards.
+
+\begin{table}[H]
+\centering
+\caption{Autograd design choices and tradeoffs.}
+\label{tab:compare}
+\small
+\begin{tabular}{lll}
+\toprule
+Axis & TensorPlay (\path{tpx/}, \path{p10/}) & Alternative design \\
+\midrule
+Graph structure & Explicit DAG: \path{Node::next\_edges\_:150} of \texttt{Edge:14}; no Tape & Linear recording with a separate replay structure \\
+Identity & \path{uint64\_t sequence\_nr\_:151} thread-local monotonic; \path{topological\_nr\_:157} longest-path & Global incremented \texttt{sequence\_nr} plus \texttt{topo} via \path{Node::update\_topological\_nr} pattern \\
+DispatchKeys & 13 keys at \path{DispatchKey.h:15} (3 backends $\times$ \{ Backend,Autograd,Autocast,Vmap\} + Composite) & Larger key spaces with more specialized axes \\
+Dispatcher & \path{array<atomic<void*>,13>} + Composite fallback at \path{Dispatcher.h:73}; 214 lines & Boxing, alias handling, and observation layers \\
+Table cost & \path{TensorImpl::key\_set():135} computed on fly; batched returns early; inference skips Autograd & Stored bitset per \texttt{TensorImpl} plus extra keys for inference batched states \\
+Scheduler & \path{ReadyQueue:23} max-heap by \texttt{sequence\_nr:37}, per-device workers, \texttt{local\_queue} for reentrancy & Thread pool plus \texttt{ReadyQueue} with topological priority \\
+Dependencies & \path{compute\_dependencies:192} BFS in-degree + \texttt{min\_topo} prune at \texttt{201}; \path{dependencies\_[Node*]++:206} & BFS plus \texttt{ThreadLocalState} propagation; per-task \texttt{captured\_vars} equivalent in \texttt{GraphTask} \\
+Filtering & \path{exec\_info\_:48} (\path{needed\_/captures\_}) via \path{init\_to\_execute:224} stack DFS with \texttt{Frame:241} & Explicit stack traversal with a \texttt{seen} set \\
+Accumulation & \path{InputBuffer:16} triple-condition in-place (\texttt{contiguous}+ \texttt{use\_count==2}+ \texttt{storage==1}) else \path{ops::add:34} for second-order & \texttt{InputBuffer} with \texttt{AccumulateGrad} leaf; copy-on-write plus \texttt{defined()} short-circuit \\
+Shape recovery & \path{sum\_to\_shape:298} reduce-where-\texttt{target==1} then reshape; called at \texttt{488} & \texttt{sum\_to\_shape} plus \texttt{view\_ops} broadcast handling; many kernels call it directly \\
+Version guard & \path{VersionCounter:13} atomic eager alloc + \texttt{SavedVariable:15} check at \texttt{20} with both versions in message & \path{c10::VariableVersion / SavedVariable} with identical eager-share semantics plus \texttt{impl::bump\_version} \\
+Modes & \path{GradMode:8} \texttt{thread\_local true}, \path{InferenceMode:9} \texttt{thread\_local false}, lived in \texttt{p10} & \texttt{c10::GradMode} / \texttt{InferenceMode} in \texttt{c10} with same thread-local semantics \\
+Anomaly & Global \path{\_enabled/\_check\_nan:24} + \path{tls\_current\_evaluating\_node:20}; chain via \path{weak\_ptr parent\_:46} & \texttt{AnomalyMode} global plus \path{thread\_local current\_node}; Python traceback hook injected identically \\
+Python nodes & \path{PyNode:24} with \texttt{num\_inputs} over \path{output\_metas\_:30}, single-crossing \path{custom\_function\_apply:286} & \texttt{PyNode} / \texttt{CppNode} with identical \texttt{output\_metas} split (custom vs generated) \\
+Compile & Explicit, leak singleton \path{get\_default\_engine:145}; \texttt{TP\_PACKAGE\_DIR} at \path{CMakeLists.txt:TP\_PACKAGE\_DIR} & Lazy singleton with \texttt{atexit}; separate Python extension layout \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Takeaways:
+
+\begin{itemize}[leftmargin=1.2em]
+\item The data structure is implemented in $\sim$1\,k lines (\path{tpx/include/*.h} + \path{tpx/src/Engine.cpp:713}). The compactness comes from trimming sparse/quantized/inference key combinations, alias-key remapping, and operator boxing.
+\item Correctness guards are kept one-for-one: the version counter is eager and shared across views (lazy allocation would silently miss alias mutations), \texttt{sum\_to\_shape} and dtype casts run under \texttt{GradModeGuard} so second-order graphs are correct, and anomaly mode chains parents through the same \path{tls\_current\_evaluating\_node} mechanism.
+\item Scheduling uses a priority queue gated by in-degree. TensorPlay's max-heap key is the thread-local \texttt{sequence\_nr} and device routing uses per-device queues via \texttt{device\_index()} at \path{InputBuffer.h:65}; per-device workers are created on first use.
+\end{itemize}
+
+%==============================================================================
+\subsection{Invariants, Traces, and Local Verification}
+\label{subsec:verify}
+
+Checked invariants the code enforces; violations are either warned or hard-fail:
+
+\begin{itemize}[leftmargin=1.2em]
+\item \path{Node::add\_next\_edge:86} updates \path{topological\_nr\_:141} before pushing. Forgetting this would let \texttt{min\_topo} prune incorrectly and drop live dependencies.
+\item \path{InputBuffer::can\_accumulate\_inplace:16} requires \texttt{use\_count==2} (temporary impl alias counts as one) and \texttt{storage==1}. Accumulating in-place on a shared storage would alias-corrupt a sibling.
+\item \path{ReadyQueue::pop\_until:62} checks \texttt{stop()} \emph{after} the heap-empty test but \emph{before} waiting. Reversing the order would sleep one extra poll interval after the graph completes.
+\item \path{GraphTask::task\_enqueued:67} must precede the queue push. Workers incrementally decrement and test \texttt{outstanding==0}; pushing without counting would hang the initiator.
+\item \path{SavedVariable::unpack:20} throws with both \texttt{saved\_version\_} and current version. The message at \path{SavedVariable.cpp:22} is the same string users see in both codebases, enabling transferred runbooks.
+\end{itemize}
+
+Tracing at \path{Engine.cpp:29--117} is free when off (level~0: one static \texttt{bool} check). Enabled via \path{TP\_ENGINE\_TRACE=1/2/3} (\path{Engine.cpp:30}):
+
+\begin{lstlisting}[caption={Engine tracing (zero cost when off).}, label=lst:trace]
+TP_ENGINE_TRACE=2 python -c "import tensorplay; x=tensorplay.randn([2,3], requires_grad=True); y=(x*2).sum(); y.backward()"
+# [tp-engine g1] execute create_graph=0 keep_graph=0 accumulate_grad=1 roots=1
+# [tp-engine g1] dep  SumBackward#42@suffix -> MulBackward#38@suffix (count=1)
+# [tp-engine g1] apply MulBackward#38 inputs=[ones(2,3) fp32]  |  emit MulBackward#38 outputs=[ones(2,3)]
+# [tp-engine g1] buf  MulBackward#38 -> AccumulateGrad#1@... (waiting on more inputs)
+\end{lstlisting}
+
+Verification snippets (all pass on the cited commit; no Python import required for structural checks):
+
+\begin{lstlisting}[caption={Local reproduction of every cited path:line.}, label=lst:verify, style=pystyle]
+grep -n "get_and_increment_sequence_nr\|sequence_nr_\|topological_nr_\|materialize_grads_\|output_metas_\|pre_hooks_\|anomaly_metadata_" tpx/include/Node.h | head -n 25
+grep -n "shape_hint\|grad_dtype\|device_type_hint\|device_index_hint\|has_input_metadata" tpx/include/Edge.h
+grep -n "not_ready_\|dependencies_\|exec_info_\|captured_vars_\|mutex_\|outstanding_tasks_" tpx/include/GraphTask.h
+grep -n "can_accumulate_inplace\|void accumulate\|void add\|device_index" tpx/include/InputBuffer.h
+grep -n "priority_queue<NodeTask>\|operator<.*sequence_nr\|pop_until\|wait_for.*5ms\|queue_for_device\|worker_main\|nested_depth_" tpx/include/Engine.h tpx/src/Engine.cpp | head -n 30
+grep -n "compute_dependencies\|compute_min_topological_nr\|init_to_execute\|evaluate_function\|sum_to_shape\|tensor_has_nan\|GradModeGuard\|CurrentEvalNodeGuard\|release_variables" tpx/src/Engine.cpp | head -n 40
+grep -n "class SavedVariable\|save(\|unpack()\|saved_version_\|reset_data" tpx/include/SavedVariable.h tpx/src/SavedVariable.cpp
+grep -n "VersionCounter\|VariableVersion\|shares_counter\|share_version_counter\|bump_version" p10/include/VariableVersion.h p10/include/TensorImpl.h | head -n 30
+grep -n "AnomalyMode\|AnomalyMetadata\|tls_current_evaluating_node\|CurrentEvalNodeGuard\|store_stack\|print_stack" tpx/include/AnomalyMode.h tpx/src/AnomalyMode.cpp | head -n 30
+grep -n "GradMode::is_enabled\|InferenceMode::is_enabled\|thread_local.*enabled_" p10/include/GradMode.h p10/include/InferenceMode.h p10/src/GradMode.cpp p10/src/InferenceMode.cpp | head
+grep -n "class PyNode\|num_inputs.*output_metas\|apply.*variable_list\|attach_outputs\|custom_function_apply\|run_custom_function_forward" src/bindings/python/Autograd.cpp | head -n 40
+# quick functional smoke (engine + version guard + anomaly)
+python3 - <<'PY'
+import tensorplay as tp
+x = tp.randn([4], requires_grad=True)
+y = tp.randn([4], requires_grad=True)
+z = (x * y).sum(); z.backward()
+assert x.grad is not None and y.grad is not None
+# in-place guard fires
+try:
+    a = tp.randn([3], requires_grad=True); a_saved = a
+    b = (a * 2).sum(); a.add_(1); b.backward()
+    raise SystemExit("expected version error")
+except RuntimeError as e:
+    assert "modified by an inplace operation" in str(e)
+# anomaly includes forward traceback
+tp.autograd.set_detect_anomaly(True)
+try:
+    p = tp.randn([2], requires_grad=True); q = (p * p).sum(); q.backward()
+except Exception: pass
+finally: tp.autograd.set_detect_anomaly(False)
+print("autograd invariants hold")
+PY
+\end{lstlisting}
+
+The engine's \texttt{ReadyQueue} heuristic plus exact \texttt{dependencies\_} gating jointly guarantee that no node runs before its consumers have all delivered, yet nodes far from the root (large \texttt{sequence\_nr}) run as early as possible, bounding \texttt{not\_ready\_} occupancy. The version guard guarantees no silent wrong grad after an in-place mutation. Global anomaly mode plus \path{tls\_current\_evaluating\_node} guarantees that a failure in a backward-created subgraph is attributable to the forward Python call site that induced it. Together these three mechanisms (explicit DAG, versioned storage, global anomaly chain) are the contracts the rest of the framework relies on.

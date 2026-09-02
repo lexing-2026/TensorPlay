@@ -1,0 +1,49 @@
+% 10-appendix.tex
+\section*{Appendix A: Reproducibility Checklist}
+
+\begin{enumerate}[leftmargin=1.2em]
+\item \path{ls -lh tensorplay/lib/libp10.so tensorplay/lib/libtpx.so tensorplay/lib/libstax.so tensorplay/\_C/\_\_init\_\_.so}
+\item \path{grep -rn "tpx{\textbackslash}|AutogradMeta.h" p10/include/ | wc -l} --- expect 0.
+\item \path{grep -n "enum class DispatchKey" p10/include/DispatchKey.h -A 18}
+\item \path{python docs/blogs/assets/gen\_01\_arch.py --out /tmp/01\_arch.png}
+\end{enumerate}
+
+\section*{Appendix B: Local Build (Windows \path{E:\textbackslash texlive})}
+
+\begin{lstlisting}[caption={Windows build.}, label=lst:buildwin, style=pystyle]
+# In E:\TensorPlay\docs\whitepaper\
+latexmk -pdf main.tex
+# or
+pdflatex main.tex
+bibtex main
+pdflatex main.tex
+pdflatex main.tex
+# outputs main.pdf
+\end{lstlisting}
+
+Required TeX Live collections: \path{collection-latexrecommended}, \path{collection-fontsrecommended}, \path{collection-latexextra} (for \texttt{booktabs}, \texttt{listings}, \texttt{tikz}). No external data; all figures are TikZ.
+
+\section*{Appendix C: File Map for Reviewers}
+
+\small
+\begin{longtable}{ll}
+\toprule
+Claim & Source \\
+\midrule
+13 keys & \path{p10/include/DispatchKey.h:15} \\
+214-line dispatcher & \path{p10/include/Dispatcher.h:49} \\
+AutogradMetaBase & \path{p10/include/AutogradMetaBase.h:13} \\
+Node / Edge & \path{tpx/include/Node.h:26}, \path{Edge.h:14} \\
+GraphTask & \path{tpx/include/GraphTask.h:22} \\
+InputBuffer & \path{tpx/include/InputBuffer.h:16} \\
+Engine & \path{tpx/include/Engine.h:23}, \path{tpx/src/Engine.cpp:621} \\
+SavedVariable & \path{tpx/include/SavedVariable.h:15} \\
+VariableVersion & \path{p10/include/VariableVersion.h:13} \\
+AnomalyMode & \path{tpx/include/AnomalyMode.h:14} \\
+GradMode / InferenceMode & \path{p10/include/GradMode.h:8}, \path{InferenceMode.h:9} \\
+Profiler & \path{p10/include/Profiler.h}, \path{p10/src/Profiler*.cpp} \\
+Vmap keys & \path{p10/include/DispatchKey.h:41}, \texttt{TransformDispatch} \\
+Codegen & \path{tools/codegen/main.py:32}, \path{gen\_api.py:304} \\
+Bindings & \path{src/bindings/python/init.cpp:279}, \path{CPythonBridge.h:28} \\
+\bottomrule
+\end{longtable}
