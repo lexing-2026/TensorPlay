@@ -46,6 +46,7 @@ F g_sgesdd, g_dgesdd;
 F g_ssyevd, g_dsyevd;
 F g_sgeev, g_dgeev;
 F g_strtrs, g_dtrtrs;
+F g_strsm, g_dtrsm;
 F g_sgels, g_dgels;
 F g_ssytrf, g_dsytrf, g_ssytrs, g_dsytrs;
 
@@ -65,7 +66,7 @@ static void* sym(LibHandle h, const char* n) { return dlsym(h, n); }
 
 void* resolve_one(void* handle, const char* base) {
     char buf[128];
-    const char* patterns[] = {"scipy_%s_64_", "%s_64_", "%s_"};
+    const char* patterns[] = {"scipy_%s_64_", "%s_64_", "%s_", "scipy_%s64_"};
     for (const char* pattern : patterns) {
         std::snprintf(buf, sizeof(buf), pattern, base);
         if (void* p = sym(handle, buf)) return p;
@@ -90,6 +91,7 @@ bool resolve_all(void* handle) {
         {g_ssyevd, "ssyevd"}, {g_dsyevd, "dsyevd"},
         {g_sgeev,  "sgeev"},  {g_dgeev,  "dgeev"},
         {g_strtrs, "strtrs"}, {g_dtrtrs, "dtrtrs"},
+        {g_strsm, "cblas_strsm"}, {g_dtrsm, "cblas_dtrsm"},
         {g_sgels,  "sgels"},  {g_dgels,  "dgels"},
         {g_ssytrf, "ssytrf"}, {g_dsytrf, "dsytrf"},
         {g_ssytrs, "ssytrs"}, {g_dsytrs, "dsytrs"},
@@ -349,6 +351,27 @@ int64_t lapack_dtrtrs(char side, char uplo, char transa, char diag, int64_t n,
     int64_t info = 0;
     TP_LAPACK_CALL(dtrtrs, const char*, const char*, const char*, const char*, const int64_t*, const int64_t*, const double*, const int64_t*, double*, const int64_t*, int64_t*)(&side, &uplo, &transa, &diag, &n, &nrhs, a, &lda, b, &ldb, &info);
     return info;
+}
+
+// CBLAS trsm bindings (order/side/uplo/trans/diag pass through the CBLAS
+// enum values; see cpu/Lapack.h for why these back the triangular solves).
+void lapack_strsm(int64_t order, int64_t side, int64_t uplo, int64_t trans,
+                  int64_t diag, int64_t m, int64_t n, float alpha,
+                  const float* a, int64_t lda, float* b, int64_t ldb) {
+    TP_LAPACK_CALL(strsm, const int64_t*, const int64_t*, const int64_t*,
+                   const int64_t*, const int64_t*, const int64_t*, const int64_t*,
+                   const float*, const float*, const int64_t*, float*,
+                   const int64_t*)(&order, &side, &uplo, &trans, &diag, &m, &n,
+                                   &alpha, a, &lda, b, &ldb);
+}
+void lapack_dtrsm(int64_t order, int64_t side, int64_t uplo, int64_t trans,
+                  int64_t diag, int64_t m, int64_t n, double alpha,
+                  const double* a, int64_t lda, double* b, int64_t ldb) {
+    TP_LAPACK_CALL(dtrsm, const int64_t*, const int64_t*, const int64_t*,
+                   const int64_t*, const int64_t*, const int64_t*, const int64_t*,
+                   const double*, const double*, const int64_t*, double*,
+                   const int64_t*)(&order, &side, &uplo, &trans, &diag, &m, &n,
+                                   &alpha, a, &lda, b, &ldb);
 }
 int64_t lapack_sgels(char trans, int64_t m, int64_t n, int64_t nrhs, float* a,
                      int64_t lda, float* b, int64_t ldb, float* work,

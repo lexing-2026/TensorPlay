@@ -333,9 +333,14 @@ Tensor& rrelu_with_noise_bridge_inplace(Tensor& self, Tensor& noise,
 // factory .out variants
 // ---------------------------------------------------------------------------
 
-Tensor& arange_bridge_out(Scalar end, Tensor& out) {
-    out = ops::arange(end, out.dtype(),
-                      std::optional<Device>(out.device()));
+// The out= contract takes the destination's dtype/device/grad mode; the
+// TensorOptions arguments are accepted for schema compatibility and ignored.
+Tensor& arange_bridge_out(Scalar end, DType dtype, Device device,
+                          bool requires_grad, Tensor& out) {
+    (void)dtype;
+    (void)device;
+    (void)requires_grad;
+    out = ops::arange(end, out.dtype(), std::optional<Device>(out.device()));
     return out;
 }
 
@@ -409,7 +414,7 @@ TENSORPLAY_LIBRARY_IMPL(Composite, DeadEndBridgeKernels) {
     m.impl("rrelu_with_noise.out", rrelu_with_noise_bridge_out);
     m.impl("rrelu_with_noise_", rrelu_with_noise_bridge_inplace);
 
-    m.impl("arange.out", arange_bridge_out);
+    m.impl("arange.end_out", arange_bridge_out);
     m.impl("linspace.out", linspace_bridge_out);
     m.impl("logspace.out", logspace_bridge_out);
     m.impl("eye.out", eye_bridge_out);

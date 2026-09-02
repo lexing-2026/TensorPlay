@@ -78,6 +78,17 @@ int64_t lapack_dtrtrs(char side, char uplo, char transa, char diag, int64_t n,
                       int64_t nrhs, const double* a, int64_t lda, double* b,
                       int64_t ldb);
 
+// CBLAS triangular multiply-solve: X = op(A)^-1 * alpha * B (side) in the
+// given order (0 = row-major, 1 = column-major).  The strtrs Fortran entry
+// rejects every UPLO value in the bundled scipy-openblas64 wheel, so the
+// triangular solves route through the working CBLAS trsm instead.
+void lapack_strsm(int64_t order, int64_t side, int64_t uplo, int64_t trans,
+                  int64_t diag, int64_t m, int64_t n, float alpha,
+                  const float* a, int64_t lda, float* b, int64_t ldb);
+void lapack_dtrsm(int64_t order, int64_t side, int64_t uplo, int64_t trans,
+                  int64_t diag, int64_t m, int64_t n, double alpha,
+                  const double* a, int64_t lda, double* b, int64_t ldb);
+
 int64_t lapack_sgels(char trans, int64_t m, int64_t n, int64_t nrhs, float* a,
                      int64_t lda, float* b, int64_t ldb, float* work,
                      int64_t lwork);
