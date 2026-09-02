@@ -38,15 +38,21 @@ def _param_name(a) -> str:
     return 'input' if name == 'self' else name
 
 
-def _capture_line(lines, fn_name, params):
+def _capture_line(lines, fn_name, params, kwparams=()):
     # Eager hot path: the proxy scan (and its kwargs dict) only runs while a
     # Tracer.capture is live -- measured ~1.5us/call of pure-Python tax on
     # factory ops when unguarded.
+    #
+    # Keyword-only signature parameters must ride the capture as keywords:
+    # the public spelling accepts them only as keywords, so recording them
+    # positionally would produce a node the interpreter cannot replay, and
+    # omitting them would silently drop user values (add's alpha).
     lines.append('    if _capturing():')
     tup = ', '.join(params)
     if len(params) == 1:
         tup += ','
-    lines.append(f'        _captured = _capture_call({fn_name}, ({tup}), {{}})')
+    kw = '{' + ', '.join(f"'{k}': {k}" for k in kwparams) + '}'
+    lines.append(f'        _captured = _capture_call({fn_name}, ({tup}), {kw})')
     lines.append('        if _captured is not None:')
     lines.append('            return _captured')
 
@@ -166,8 +172,11 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
         #    (tensor_split's int vs int[] vs Tensor), so the wrapper forwards
         #    positionally and lets the FASTCALL group dispatcher pick.
         group = [g for g in funcs if g.cpp_name == name]
-        out_variant = next((g for g in group if g.overload_name == 'out'), None)
-        multi_overload = sum(1 for g in group if g.overload_name != 'out') > 1
+        out_variant = next(
+            (g for g in group if g.overload_name == 'out' or g.out_args), None)
+        multi_overload = sum(
+            1 for g in group
+            if g.overload_name != 'out' and not g.out_args) > 1
 
         # linalg ops are exposed through the tensorplay.linalg package only
         if name.startswith('linalg_'):
@@ -485,6 +494,25 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
                 ]
                 continue
 
+            # A base+dim reduction pair forms one public union signature
+            # (dim=None routes to the base overload).  This must win over the
+            # out-variant merge below: the pair's dim positional lacks a
+            # schema default, so the merge check would reject it and fall
+            # back to the base-only wrapper, hiding sum(t, [1]) shapes.
+            sibs_pre = [g for g in group if g is not f
+                        and g.overload_name != 'out' and not g.out_args]
+            if multi_overload:
+                for sib in sibs_pre:
+                    union = _reduction_union_lines(name, f, sib)
+                    if union is not None:
+                        seen.add(name)
+                        lines += union
+                        break
+                else:
+                    union = None
+                if union is not None:
+                    continue
+
             if out_variant is not None:
                 # autograd capture (matching the matmul special-case this
                 # generalizes).  Schema defaults carry over to the public
@@ -510,6 +538,19 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
                     kwonly.append(p)
                 kw = ", ".join(f"{a.python_name}={_param_name(a)}"
                                for a in f.args)
+                merged = []
+                # multi-overload groups forward positionally (schema order):
+                # siblings may spell the same slot differently (isin's
+                # test_element vs test_elements), so a keyword built from
+                # this overload's name would reject the matching candidate.
+                # Keyword-only schema args stay keyword (the FASTCALL binding
+                # rejects them positionally).
+                if multi_overload:
+                    fwd = [_param_name(a) for a in f.args if not a.kwonly]
+                    fwd += [f'{a.python_name}={_param_name(a)}'
+                            for a in f.args if a.kwonly]
+                else:
+                    fwd = None
                 # Sibling overloads that only append defaulted positional
                 # parameters to the base's positional list fold into one
                 # public signature.  The extension-level group dispatcher
@@ -518,7 +559,7 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
                     base_pos = [a for a in f.args if not a.kwonly]
                     merged = []
                     for sib in group:
-                        if sib is f or sib.overload_name == 'out':
+                        if sib is f or sib.overload_name == 'out' or sib.out_args:
                             continue
                         sib_pos = [a for a in sib.args if not a.kwonly]
                         if len(sib_pos) <= len(base_pos):
@@ -541,17 +582,31 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
                         kw += ", " + ", ".join(
                             f"{n}={p}" for n, p in merged)
                 lines.append(f'def {name}({", ".join(pos + kwonly + ["out=None"])}):')
-                lines.append('    if out is not None:')
-                lines.append(f'        return _C.{name}({kw}, out=out)')
-                _capture_line(lines, name, pos_names)
-                lines.append(f'    return _C.{name}({kw})')
+                if fwd is not None:
+                    lines.append(
+                        f'    if out is not None:')
+                    lines.append(
+                        f'        return _C.{name}({", ".join(fwd + ["out=out"])})')
+                else:
+                    lines.append('    if out is not None:')
+                    lines.append(f'        return _C.{name}({kw}, out=out)')
+                _capture_line(
+                    lines,
+                    name,
+                    pos_names,
+                    tuple(_param_name(a) for a in f.args if a.kwonly),
+                )
+                if fwd is not None:
+                    lines.append(f'    return _C.{name}({", ".join(fwd)})')
+                else:
+                    lines.append(f'    return _C.{name}({kw})')
                 lines.append('')
                 continue
 
             # (broadcast_tensors(*tensors), block_diag(*tensors)); the
             # FASTCALL layer folds surplus positionals into the list.
             seq_varargs = any(
-                g.overload_name != 'out' and len(g.args) == 1
+                g.overload_name != 'out' and not g.out_args and len(g.args) == 1
                 and g.args[0].type.is_tensor_like and g.args[0].type.is_list
                 for g in group)
             if (len(f.args) >= 2 and f.args[0].type.kind == 'str'
@@ -583,12 +638,18 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
                 lines.append('')
                 continue
 
-            sibs = [g for g in group if g is not f and g.overload_name != 'out']
-            if multi_overload and len(sibs) == 1:
-                union = _reduction_union_lines(name, f, sibs[0])
+            sibs = [g for g in group if g is not f and g.overload_name != 'out'
+                       and not g.out_args]
+            if multi_overload:
+                for sib in sibs:
+                    union = _reduction_union_lines(name, f, sib)
+                    if union is not None:
+                        seen.add(name)
+                        lines += union
+                        break
+                    union = None
                 if union is not None:
-                    seen.add(name)
-                    lines += union
+                    continue
                     continue
 
             sig_items, call_args = [], []

@@ -10,7 +10,6 @@ from __future__ import annotations
 import functools
 import inspect
 import threading
-import weakref
 from typing import Any, Callable
 from weakref import WeakSet
 
@@ -181,10 +180,11 @@ def _arg_fingerprint(value: Any) -> Any:
 
     ``(id, version)`` for tensors: in-place mutation bumps ``_version`` so a
     cached key component is never reused across mutated inputs; fresh tensors
-    have fresh ids.  Inputs without a version counter use tensor metadata.
-    Scalars compare by value.  This replaces per-call shape/dtype/device reads
-    and tuple rebuilding, which profiling showed at ~40% of steady-state
-    compiled-call time.
+    have fresh ids.  Inference tensors carry no version counter and are
+    immutable, so their identity alone keys the entry.  Other inputs without
+    a version counter use tensor metadata.  Scalars compare by value.  This
+    replaces per-call shape/dtype/device reads and tuple rebuilding, which
+    profiling showed at ~40% of steady-state compiled-call time.
     """
 
     module = type(value).__module__
@@ -192,6 +192,8 @@ def _arg_fingerprint(value: Any) -> Any:
         try:
             version = value._version
         except RuntimeError:
+            if getattr(value, "is_inference", lambda: False)():
+                return ("t", id(value), None)
             version = ("metadata", _quick_value_signature(value, dynamic=False))
         return (
             "t",
@@ -361,7 +363,6 @@ def compile(
     lock = threading.RLock()
     last_quick_key: Any = object()
     last_compiled_fn: Callable[..., Any] | None = None
-    last_arg_refs: tuple[weakref.ReferenceType[Any], ...] | None = None
     guard_param_names: tuple[str, ...] = ()
     gate_evaluator: Callable[..., tuple] | None = None
     target_cache = model.forward if _is_module_like(model) else model
@@ -406,36 +407,46 @@ def compile(
 
     @functools.wraps(model)
     def optimized(*args: Any, **kwargs: Any) -> Any:
-        nonlocal last_quick_key, last_compiled_fn, last_arg_refs
+        nonlocal last_quick_key, last_compiled_fn
         nonlocal guard_param_names, gate_evaluator
         nonlocal last_call_fp, last_quick_parts
         nonlocal compile_attempts
         if _capture_disabled.get():
             return model(*args, **kwargs)
-        # Identity reuse is unsound once control-flow gates exist: in-place
-        # mutation preserves weakref identity but can flip the traced branch,
-        # so gate outcomes are always re-evaluated.
-        same_last_args = (
-            gate_evaluator is None
-            and not kwargs
-            and last_arg_refs is not None
-            and len(last_arg_refs) == len(args)
-            and all(reference() is value for reference, value in zip(last_arg_refs, args))
-        )
         # Steady-state memo: identical objects with unchanged versions (or
         # unchanged scalars) cannot produce different signatures or gate
         # outcomes -- skip metadata reads and evaluator replay entirely.
-        call_fp = _call_fingerprint(args, kwargs)
-        if last_quick_parts is not None and call_fp == last_call_fp:
+        # Tensor-positional calls ask the C dispatcher for a read-only
+        # certificate against the trampoline fingerprint (one probe loop in
+        # C replaces the Python (id, version) walk); every other call shape
+        # falls back to the Python fingerprint below.
+        if dispatcher is not None:
+            matched = not kwargs and dispatcher.tpx_fingerprint_matches(*args)
+            if not matched:
+                # Refresh the certificate for this call up front so it stays
+                # paired with the quick memo built below even when resolution
+                # raises.  Calls the fingerprint cannot describe (scalars,
+                # kwargs) clear it instead of leaving a stale certificate.
+                if not kwargs:
+                    dispatcher.tpx_fingerprint_store(*args)
+                else:
+                    dispatcher.tpx_fingerprint_clear()
+        else:
+            matched = False
+        if last_quick_parts is not None and matched:
             input_signature, shape_component, data_component = last_quick_parts
         else:
-            input_signature = _quick_input_signature(
-                args, kwargs, dynamic=specialization_dynamic
-            )
-            shape_component = _guard_component(
-                args, kwargs, _quick_value_signature
-            )
-            data_component = gate_evaluator(args, kwargs) if gate_evaluator else ()
+            call_fp = _call_fingerprint(args, kwargs)
+            if last_quick_parts is not None and call_fp == last_call_fp:
+                input_signature, shape_component, data_component = last_quick_parts
+            else:
+                input_signature = _quick_input_signature(
+                    args, kwargs, dynamic=specialization_dynamic
+                )
+                shape_component = _guard_component(
+                    args, kwargs, _quick_value_signature
+                )
+                data_component = gate_evaluator(args, kwargs) if gate_evaluator else ()
             last_quick_parts = (
                 input_signature,
                 shape_component,
@@ -527,13 +538,6 @@ def compile(
                     )
             last_quick_key = quick_key
             last_compiled_fn = compiled_fn
-            if not kwargs:
-                try:
-                    last_arg_refs = tuple(weakref.ref(value) for value in args)
-                except TypeError:
-                    last_arg_refs = None
-            else:
-                last_arg_refs = None
         if not kwargs:
             fast = getattr(compiled_fn, "_fast_call", None)
             if fast is not None:

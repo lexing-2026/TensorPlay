@@ -147,7 +147,10 @@ class VecISA:
                             ],
                             definitions=self.definitions(),
                             library_dirs=[lib_dir],
-                            libraries=["p10"],
+                            # ``tpx`` follows p10: the runtime library pulls
+                            # tpx-namespace symbols, and the probe must dlopen
+                            # against the same surface real kernels see.
+                            libraries=["p10", "tpx"],
                             ldflags=[f"-Wl,-rpath,{lib_dir}"],
                         )
                         builder = CppBuilder(

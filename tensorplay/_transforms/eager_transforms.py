@@ -201,6 +201,30 @@ def _as_tuple_for_replace(diff_args, argnums: argnums_t) -> tuple[Any, ...]:
 # ------------------------------------------------------------ graph seeding --
 
 
+def _unwrap_transform_layers(value: Any) -> tuple[Any, list[tuple[int, int]]]:
+    """Return the physical value and the transform wrappers around it."""
+
+    layers: list[tuple[int, int]] = []
+    while isinstance(value, tensorplay.Tensor) and tensorplay._C._transform_is_batched(value):
+        level = tensorplay._C._transform_batch_level(value)
+        unwrapped, batch_dim = tensorplay._C._transform_unwrap(value, level)
+        if batch_dim is None:
+            break
+        layers.append((int(batch_dim), int(level)))
+        value = unwrapped
+    return value, layers
+
+
+def _rewrap_transform_layers(
+    value: tensorplay.Tensor, layers: list[tuple[int, int]]
+) -> tensorplay.Tensor:
+    """Restore transform wrappers after a physical autograd operation."""
+
+    for batch_dim, level in reversed(layers):
+        value = tensorplay._C._transform_make_batched(value, batch_dim, level)
+    return value
+
+
 def _create_differentiable(inps, api: str = "transform"):
     """Re-seeds every tensor leaf so it can be differentiated against.
 
@@ -211,9 +235,12 @@ def _create_differentiable(inps, api: str = "transform"):
 
     def create_differentiable(x):
         if isinstance(x, tensorplay.Tensor):
-            if x.requires_grad:
-                return x
-            return x.detach().requires_grad_(True)
+            physical, layers = _unwrap_transform_layers(x)
+            if physical.requires_grad:
+                differentiable = physical
+            else:
+                differentiable = physical.detach().requires_grad_(True)
+            return _rewrap_transform_layers(differentiable, layers)
         raise ValueError(
             f"{api}: Expected all inputs to be Tensors, got {type(x)} instead"
         )
@@ -234,7 +261,10 @@ def _undo_create_differentiable(inps, keep_graph: bool):
         return inps
 
     def unwrap(x):
-        return x.detach() if isinstance(x, tensorplay.Tensor) else x
+        if not isinstance(x, tensorplay.Tensor):
+            return x
+        physical, layers = _unwrap_transform_layers(x)
+        return _rewrap_transform_layers(physical.detach(), layers)
 
     return tree_map(unwrap, inps)
 
@@ -248,31 +278,168 @@ def _autograd_grad(
 ):
     """``autograd.grad`` with unused inputs and non-differentiable outputs
     reported as explicit zeros instead of ``None``."""
+    physical_outputs_and_layers = tuple(_unwrap_transform_layers(out) for out in outputs)
+    physical_outputs = tuple(item[0] for item in physical_outputs_and_layers)
+    physical_inputs_and_layers = tuple(_unwrap_transform_layers(inp) for inp in inputs)
+    physical_inputs = tuple(item[0] for item in physical_inputs_and_layers)
+
     if grad_outputs is None:
-        diff_outputs = tuple(out for out in outputs if out.requires_grad)
+        diff_outputs = tuple(out for out in physical_outputs if out.requires_grad)
+        physical_grad_outputs = tuple(
+            tensorplay.ones_like(output)
+            if original.numel() == 1 and output.numel() != 1
+            else None
+            for original, output in zip(outputs, physical_outputs)
+            if output.requires_grad
+        )
+        cotangent_layers = tuple(() for _ in diff_outputs)
+        diff_output_layers = tuple(
+            output_layers
+            for output, (_, output_layers) in zip(
+                physical_outputs, physical_outputs_and_layers
+            )
+            if output.requires_grad
+        )
     else:
+        physical_cotangents_and_layers = tuple(
+            (None, [])
+            if cotangent is None
+            else _unwrap_transform_layers(cotangent)
+            for cotangent in grad_outputs
+        )
         pairs = tuple(
-            (out, cotangent)
-            for out, cotangent in zip(outputs, grad_outputs)
+            (out, cotangent, output_layers, cotangent_layers_for_output)
+            for out, (_, output_layers), (cotangent, cotangent_layers_for_output) in zip(
+                physical_outputs,
+                physical_outputs_and_layers,
+                physical_cotangents_and_layers,
+            )
             if out.requires_grad
         )
         if len(pairs) == 0:
-            diff_outputs, grad_outputs = (), ()
+            diff_outputs = ()
+            physical_grad_outputs = ()
+            cotangent_layers = ()
+            diff_output_layers = ()
         else:
-            diff_outputs, grad_outputs = zip(*pairs)
+            diff_outputs = tuple(pair[0] for pair in pairs)
+            physical_grad_outputs = tuple(pair[1] for pair in pairs)
+            cotangent_layers = tuple(pair[3] for pair in pairs)
+            diff_output_layers = tuple(pair[2] for pair in pairs)
+
     if len(diff_outputs) == 0:
-        return tuple(tensorplay.zeros_like(inp) for inp in inputs)
-    grad_inputs = tensorplay.autograd.grad(
-        diff_outputs,
-        inputs,
-        grad_outputs,
-        retain_graph=retain_graph,
-        create_graph=create_graph,
-        allow_unused=True,
+        return tuple(
+            _rewrap_transform_layers(tensorplay.zeros_like(inp), layers)
+            for inp, layers in physical_inputs_and_layers
+        )
+
+    output_levels = tuple(
+        {level for _, level in output_layers} for output_layers in diff_output_layers
     )
+
+    def _next_extra_level(layers):
+        for output_level_set, cotangent_layer_set in zip(output_levels, layers):
+            for _, level in cotangent_layer_set:
+                if level not in output_level_set:
+                    return level
+        return None
+
+    def _native_grad(cotangents):
+        return tensorplay.autograd.grad(
+            diff_outputs,
+            physical_inputs,
+            cotangents,
+            retain_graph=retain_graph,
+            create_graph=create_graph,
+            allow_unused=True,
+        )
+
+    def _batched_grad(cotangents, layers):
+        level = _next_extra_level(layers)
+        if level is None:
+            return _native_grad(cotangents)
+
+        batch_dim = next(
+            dim
+            for cotangent_layers_for_output in layers
+            for dim, layer_level in cotangent_layers_for_output
+            if layer_level == level
+        )
+        batch_size = next(
+            cotangent.size(batch_dim)
+            for cotangent, cotangent_layers_for_output in zip(cotangents, layers)
+            if cotangent is not None
+            and any(layer_level == level for _, layer_level in cotangent_layers_for_output)
+        )
+        gradients = [[] for _ in physical_inputs]
+        for index in range(batch_size):
+            sliced_cotangents = []
+            sliced_layers = []
+            for cotangent, cotangent_layers_for_output in zip(cotangents, layers):
+                matching_dim = next(
+                    (
+                        dim
+                        for dim, layer_level in cotangent_layers_for_output
+                        if layer_level == level
+                    ),
+                    None,
+                )
+                if matching_dim is None:
+                    sliced_cotangents.append(cotangent)
+                    sliced_layers.append(cotangent_layers_for_output)
+                    continue
+                sliced_cotangents.append(
+                    None
+                    if cotangent is None
+                    else cotangent.select(matching_dim, index)
+                )
+                sliced_layers.append(
+                    tuple(
+                        (
+                            dim - 1
+                            if dim > matching_dim
+                            else dim,
+                            layer_level,
+                        )
+                        for dim, layer_level in cotangent_layers_for_output
+                        if layer_level != level
+                    )
+                )
+            per_sample = _batched_grad(tuple(sliced_cotangents), tuple(sliced_layers))
+            for slot, gradient in zip(gradients, per_sample):
+                slot.append(gradient)
+
+        return tuple(
+            tensorplay.stack(
+                [
+                    tensorplay.zeros_like(inp) if gradient is None else gradient
+                    for gradient in per_input
+                ],
+                dim=0,
+            )
+            for per_input, (inp, _) in zip(gradients, physical_inputs_and_layers)
+        )
+
+    grad_inputs = _batched_grad(physical_grad_outputs, cotangent_layers)
+    extra_layers = []
+    for output_level_set, cotangent_layer_set in zip(output_levels, cotangent_layers):
+        extra_layers = [
+            (0, level)
+            for _, level in cotangent_layer_set
+            if level not in output_level_set
+        ]
+        if extra_layers:
+            break
+    extra_layer_count = len(extra_layers)
     return tuple(
-        tensorplay.zeros_like(inp) if grad_input is None else grad_input
-        for grad_input, inp in zip(grad_inputs, inputs)
+        _rewrap_transform_layers(
+            tensorplay.zeros_like(inp) if grad_input is None else grad_input,
+            extra_layers
+            + [(dim + extra_layer_count, level) for dim, level in layers],
+        )
+        for grad_input, (inp, layers) in zip(
+            grad_inputs, physical_inputs_and_layers
+        )
     )
 
 

@@ -140,14 +140,12 @@ bool is_tensor_object(PyObject* value) {
 
 bool has_subclass_dispatch(PyObject* value) {
     PyObject* type = reinterpret_cast<PyObject*>(Py_TYPE(value));
-    return has_attribute(type, "__tensorplay_dispatch__") ||
-           has_attribute(type, "__torch_dispatch__");
+    return has_attribute(type, "__tensorplay_dispatch__");
 }
 
 bool has_function_dispatch(PyObject* value) {
     PyObject* type = reinterpret_cast<PyObject*>(Py_TYPE(value));
-    return has_attribute(type, "__tensorplay_function__") ||
-           has_attribute(type, "__torch_function__");
+    return has_attribute(type, "__tensorplay_function__");
 }
 
 bool is_builtin_dispatch_free(PyObject* value) {
@@ -289,7 +287,13 @@ PyObject* make_public_api(const char* op_name, bool is_method) {
 
     api = PyObject_GetAttrString(module, op_name);
     Py_DECREF(module);
-    if (api == nullptr) return nullptr;
+    if (api == nullptr) {
+        // The op has no public Python name (private dispatcher ops, method
+        // entry points, ...).  Hook dispatch simply does not apply; swallow
+        // the lookup error so it cannot leak into later calls.
+        PyErr_Clear();
+        return nullptr;
+    }
     if (!PyCallable_Check(api)) {
         PyErr_Format(PyExc_TypeError,
                      "tensorplay.%s is not callable", op_name);
@@ -300,15 +304,11 @@ PyObject* make_public_api(const char* op_name, bool is_method) {
 }
 
 PyObject* get_hook(PyObject* value, bool function_hook) {
-    const char* names[] = {
-        function_hook ? "__tensorplay_function__" : "__tensorplay_dispatch__",
-        function_hook ? "__torch_function__" : "__torch_dispatch__",
-    };
-    for (const char* name : names) {
-        PyObject* hook = PyObject_GetAttrString(value, name);
-        if (hook != nullptr) return hook;
-        PyErr_Clear();
-    }
+    const char* name = function_hook ? "__tensorplay_function__"
+                                     : "__tensorplay_dispatch__";
+    PyObject* hook = PyObject_GetAttrString(value, name);
+    if (hook != nullptr) return hook;
+    PyErr_Clear();
     return nullptr;
 }
 
@@ -411,11 +411,14 @@ int tpx_py_try_tensor_function_dispatch(
     PyObject* func = make_public_api(op_name, is_method);
     PyObject* types = PyTuple_New(static_cast<Py_ssize_t>(candidate_types.size()));
     if (func == nullptr || types == nullptr) {
+        // No public Python name: the hook layer does not apply for this op.
+        // Resume ordinary native dispatch instead of failing the call.
+        PyErr_Clear();
         Py_XDECREF(types);
         Py_XDECREF(func);
         Py_DECREF(call_kwargs);
         Py_DECREF(call_args);
-        return -1;
+        return 0;
     }
     for (size_t i = 0; i < candidate_types.size(); ++i) {
         PyObject* type = reinterpret_cast<PyObject*>(candidate_types[i]);
@@ -531,11 +534,14 @@ int tpx_py_try_tensor_subclass_dispatch(
     PyObject* func = make_public_api(op_name, is_method);
     PyObject* types = PyTuple_New(static_cast<Py_ssize_t>(candidate_types.size()));
     if (func == nullptr || types == nullptr) {
+        // No public Python name: the hook layer does not apply for this op.
+        // Resume ordinary native dispatch instead of failing the call.
+        PyErr_Clear();
         Py_XDECREF(types);
         Py_XDECREF(func);
         Py_DECREF(call_kwargs);
         Py_DECREF(call_args);
-        return -1;
+        return 0;
     }
     for (size_t i = 0; i < candidate_types.size(); ++i) {
         PyObject* type = reinterpret_cast<PyObject*>(candidate_types[i]);
@@ -714,11 +720,13 @@ int tpx_py_try_function_mode_dispatch(
     PyObject* types = PyTuple_New(static_cast<Py_ssize_t>(candidate_types.size()));
     PyObject* func = make_public_api(op_name, is_method);
     if (types == nullptr || func == nullptr) {
+        // No public Python name: the hook layer does not apply for this op.
+        PyErr_Clear();
         Py_XDECREF(types);
         Py_XDECREF(func);
         Py_DECREF(call_kwargs);
         Py_DECREF(call_args);
-        return -1;
+        return 0;
     }
     for (size_t i = 0; i < candidate_types.size(); ++i) {
         PyObject* type = reinterpret_cast<PyObject*>(candidate_types[i]);
@@ -1048,6 +1056,14 @@ Storage tpx_py_storage(PyObject* obj) {
     }
 }
 Device tpx_py_device(PyObject* obj) {
+    if (PyUnicode_Check(obj)) {
+        const char* text = PyUnicode_AsUTF8(obj);
+        if (text == nullptr) {
+            PyErr_Clear();
+            throw std::invalid_argument("expected a Device or device string");
+        }
+        return Device(std::string(text));
+    }
     try {
         return py::cast<Device>(py::reinterpret_borrow<py::object>(obj));
     } catch (const py::cast_error&) {
@@ -1404,8 +1420,21 @@ PyObject* tpx_py_wrap(const Tensor& t) {
     }
     return wrapped;
 }
+// Scalar results cross into Python as native numbers (bool/int/float/
+// complex, with a UInt64 widening for values outside the int64 range);
+// callers never see a boxed Scalar wrapper.
 PyObject* tpx_py_wrap_scalar(const Scalar& s) {
-    return py::cast(s).release().ptr();
+    if (s.isBoolean()) return PyBool_FromLong(s.to<bool>());
+    if (s.isComplex()) {
+        const auto c = s.to<std::complex<double>>();
+        return PyComplex_FromDoubles(c.real(), c.imag());
+    }
+    if (s.dtype() == DType::UInt64) {
+        return PyLong_FromUnsignedLongLong(
+            static_cast<unsigned long long>(s.to<uint64_t>()));
+    }
+    if (s.isFloatingPoint()) return PyFloat_FromDouble(s.to<double>());
+    return PyLong_FromLongLong(s.to<int64_t>());
 }
 PyObject* tpx_py_wrap_optional_scalar(const std::optional<Scalar>& s) {
     if (!s.has_value()) {
@@ -1626,6 +1655,20 @@ int tpx_tensor_requires_grad(PyObject* obj) {
         const Tensor& t = tpx_py_tensor_cref(obj);
         if (!t.unsafeGetTensorImpl()) return -1;
         return t.requires_grad() ? 1 : 0;
+    } catch (...) {
+        PyErr_Clear();
+        return -1;
+    }
+}
+
+int tpx_tensor_guard_probe(PyObject* obj, long long* version_out) {
+    try {
+        const Tensor& t = tpx_py_tensor_cref(obj);
+        auto impl = t.unsafeGetTensorImpl();
+        if (!impl) return -1;
+        if (impl->is_inference()) return 1;
+        *version_out = static_cast<long long>(impl->version());
+        return 0;
     } catch (...) {
         PyErr_Clear();
         return -1;

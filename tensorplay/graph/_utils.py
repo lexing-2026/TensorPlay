@@ -78,6 +78,18 @@ _capture_disabled: ContextVar[bool] = ContextVar(
     "tensorplay_graph_capture_disabled", default=False
 )
 
+# The active tracer is exposed through a context variable so small graph
+# markers can participate in capture even when they have no tensor argument.
+# Keeping this state thread-local is important for nested captures and for
+# concurrent compiler workers.
+_active_tracer: ContextVar[Any] = ContextVar(
+    "tensorplay_graph_active_tracer", default=None
+)
+
+
+def get_active_tracer() -> Any:
+    return _active_tracer.get()
+
 
 def _native_capture_state(
     entering: bool,

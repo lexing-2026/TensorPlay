@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from typing import Any, List, Optional
 
 import tensorplay as tp
+import tensorplay._C as _C
 import tensorplay.distributed as dist
 from tensorplay.distributed import distributed_core as _core
 from tensorplay.distributed.algorithms.join import Join, JoinHook, Joinable
@@ -384,7 +385,12 @@ class DistributedDataParallel(Module, Joinable):
         # path (_match_all_reduce_for_bwd_pass), which shares the same
         # buffers.
         self._c_reducer = None
-        if not self.find_unused_parameters and not self._comm_hooks:
+        if (
+            self.device_type == "cuda"
+            and hasattr(_C, "DDPReducer")
+            and not self.find_unused_parameters
+            and not self._comm_hooks
+        ):
             self._c_reducer = _C.DDPReducer(
                 [b["params"] for b in self._buckets],
                 [b["buffer"] for b in self._buckets],
@@ -636,11 +642,29 @@ class DistributedDataParallel(Module, Joinable):
             self._flush_deferred_copies(bstate)
             new_buffer = None
             for hook, state in self._comm_hooks:
-                new_buffer = hook(state, bucket).value()
+                hook_result = hook(state, bucket)
+                if hasattr(hook_result, "wait"):
+                    new_buffer = hook_result.wait()
+                elif hasattr(hook_result, "value"):
+                    new_buffer = hook_result.value()
+                else:
+                    new_buffer = hook_result
+                if isinstance(new_buffer, (list, tuple)) \
+                        and len(new_buffer) == 1:
+                    new_buffer = new_buffer[0]
             self._copy_bucket_back(bstate, new_buffer)
             return
         self._flush_deferred_copies(bstate)
         buffer = bstate["buffer"]
+        if self.device_type != "cuda" or self._comm_handle is None:
+            if buffer.dtype == tp.float32:
+                op = dist.ReduceOp.AVG
+            else:
+                buffer.div_(world_size)
+                op = dist.ReduceOp.SUM
+            dist.all_reduce(buffer, op=op, group=self.process_group)
+            self._copy_bucket_back(bstate, buffer)
+            return
         # fp32: let NCCL average natively (ncclAvg) — no separate div_ pass
         # avoid accumulating large unscaled values at reduced precision.
         if buffer.dtype == tp.float32:
@@ -826,6 +850,12 @@ class DistributedDataParallel(Module, Joinable):
         if self.will_sync_module_buffers() and tp.is_grad_enabled():
             self._sync_buffers()
 
+        if getattr(self, "_join_config", None) is not None \
+                and self._join_config.enable:
+            self._check_global_requires_backward_grad_sync(
+                is_joined_rank=False
+            )
+
         if self.device_ids:
             target = f"{self.device_type}:{self.device_ids[0]}"
             inputs = _recursive_to(inputs, target)
@@ -895,8 +925,7 @@ class DistributedDataParallel(Module, Joinable):
                                   authoritative_rank)
 
     def _passing_sync_batchnorm_handle(self, module):
-        # tp ships no SyncBatchNorm yet; nothing to hand off.
-        pass
+        return module
 
     def _find_common_rank(self, input_rank, rank_cond):
         # -1 indicates that this rank is not under consideration to be the
@@ -1022,7 +1051,11 @@ class DistributedDataParallel(Module, Joinable):
         )
 
     def scatter(self, inputs, kwargs, device_ids):
-        raise NotImplementedError
+        from tensorplay.nn.parallel.scatter_gather import scatter_kwargs
+
+        return scatter_kwargs(inputs, kwargs, device_ids, dim=self.dim)
 
     def gather(self, outputs, output_device):
-        raise NotImplementedError
+        from tensorplay.nn.parallel.scatter_gather import gather
+
+        return gather(outputs, output_device, dim=self.dim)

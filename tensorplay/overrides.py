@@ -25,22 +25,21 @@ __all__ = [
     "get_ignored_functions",
     "get_overridable_functions",
     "get_testing_overrides",
-    "handle_torch_function",
-    "has_torch_function",
+    "handle_tensorplay_function",
+    "has_tensorplay_function",
     "resolve_name",
     "is_tensor_like",
     "is_tensor_method_or_property",
-    "wrap_torch_function",
+    "wrap_tensorplay_function",
     "enable_reentrant_dispatch",
     "redispatch_function",
 ]
 
 
 _R = TypeVar("_R")
-# The first spelling is the package-native protocol.  The second is retained
-# because existing Tensor subclasses use it at the native operator boundary.
-_FUNCTION_HOOKS = ("__tensorplay_function__", "__torch_function__")
-_DISPATCH_HOOKS = ("__tensorplay_dispatch__", "__torch_dispatch__")
+# Function dispatch uses the package-native protocol at every boundary.
+_FUNCTION_HOOKS = ("__tensorplay_function__",)
+_DISPATCH_HOOKS = ("__tensorplay_dispatch__",)
 _ALL_HOOKS = _FUNCTION_HOOKS + _DISPATCH_HOOKS
 
 _NON_DISPATCHABLE_NAMES = frozenset(
@@ -259,7 +258,7 @@ def _get_overloaded_args(
     return overloaded_args
 
 
-def has_torch_function(relevant_args: Iterable[Any]) -> bool:
+def has_tensorplay_function(relevant_args: Iterable[Any]) -> bool:
     """Return whether any argument supplies a Python dispatch hook."""
     overloaded = _get_overloaded_args(relevant_args)
     return _is_dispatch_enabled() and (
@@ -267,16 +266,16 @@ def has_torch_function(relevant_args: Iterable[Any]) -> bool:
     )
 
 
-def has_torch_function_unary(arg: Any) -> bool:
-    """Fast single-argument form of :func:`has_torch_function`."""
+def has_tensorplay_function_unary(arg: Any) -> bool:
+    """Fast single-argument form of :func:`has_tensorplay_function`."""
     if _consume_function_skip() or not _is_dispatch_enabled():
         return False
     hooks = _effective_hooks(_ALL_HOOKS)
     return _function_mode_len() > 0 or _hook_for_value(arg, hooks) is not None
 
 
-def has_torch_function_variadic(*args: Any) -> bool:
-    """Variadic form of :func:`has_torch_function` without tuple allocation."""
+def has_tensorplay_function_variadic(*args: Any) -> bool:
+    """Variadic form without allocating an argument tuple."""
     if _consume_function_skip() or not _is_dispatch_enabled():
         return False
     hooks = _effective_hooks(_ALL_HOOKS)
@@ -295,7 +294,7 @@ def _call_function_hook(
     return hook(public_api, types_, args, kwargs)
 
 
-def handle_torch_function(
+def handle_tensorplay_function(
     public_api: Callable[..., _R],
     relevant_args: Iterable[Any],
     *args: Any,
@@ -358,7 +357,7 @@ def handle_torch_function(
     raise TypeError(f"no implementation found for {name!r} on types [{detail}]")
 
 
-def wrap_torch_function(
+def wrap_tensorplay_function(
     dispatcher: Callable[..., Iterable[Any]],
 ) -> Callable[[Callable[..., _R]], Callable[..., _R]]:
     """Decorate a composite function with hook discovery and dispatch."""
@@ -367,8 +366,10 @@ def wrap_torch_function(
         @wraps(func)
         def wrapped(*args: Any, **kwargs: Any) -> _R:
             relevant_args = dispatcher(*args, **kwargs)
-            if has_torch_function(relevant_args):
-                return handle_torch_function(wrapped, relevant_args, *args, **kwargs)
+            if has_tensorplay_function(relevant_args):
+                return handle_tensorplay_function(
+                    wrapped, relevant_args, *args, **kwargs
+                )
             return func(*args, **kwargs)
 
         return cast(Callable[..., _R], wrapped)
@@ -470,12 +471,12 @@ def get_ignored_functions() -> set[Callable[..., Any]]:
     """Return public callables that do not receive function-hook dispatch."""
     tp = _tensorplay()
     ignored: set[Callable[..., Any]] = {
-        has_torch_function,
-        has_torch_function_unary,
-        has_torch_function_variadic,
-        handle_torch_function,
+        has_tensorplay_function,
+        has_tensorplay_function_unary,
+        has_tensorplay_function_variadic,
+        handle_tensorplay_function,
         is_tensor_like,
-        wrap_torch_function,
+        wrap_tensorplay_function,
     }
     for name in (
         "Tensor",
@@ -606,10 +607,10 @@ def is_tensor_method_or_property(func: Callable[..., Any]) -> bool:
     return getattr(func, "__name__", None) == "__get__"
 
 
-class TorchFunctionMode:
+class TensorPlayFunctionMode:
     """Context manager that handles function hooks for a dynamic scope."""
 
-    def __enter__(self) -> "TorchFunctionMode":
+    def __enter__(self) -> "TensorPlayFunctionMode":
         _push_mode(self)
         return self
 
@@ -622,7 +623,7 @@ class TorchFunctionMode:
             _push_mode(popped)
             raise RuntimeError("function mode stack is not properly nested")
 
-    def __torch_function__(
+    def __tensorplay_function__(
         self,
         func: Callable[..., Any],
         types_: tuple[type, ...],
@@ -632,42 +633,41 @@ class TorchFunctionMode:
         del types_
         return func(*args, **(kwargs or {}))
 
-    def __tensorplay_function__(
-        self,
-        func: Callable[..., Any],
-        types_: tuple[type, ...],
-        args: tuple[Any, ...] = (),
-        kwargs: dict[str, Any] | None = None,
-    ) -> Any:
-        return self.__torch_function__(func, types_, args, kwargs)
-
     @classmethod
-    def push(cls, *args: Any, **kwargs: Any) -> "TorchFunctionMode":
+    def push(cls, *args: Any, **kwargs: Any) -> "TensorPlayFunctionMode":
         instance = cls(*args, **kwargs)
         _push_mode(instance)
         return instance
 
 
-def _get_current_function_mode() -> TorchFunctionMode | None:
+def _get_current_function_mode() -> TensorPlayFunctionMode | None:
     length = _function_mode_len()
     if length == 0:
         return None
-    return cast(TorchFunctionMode, _native_call("_get_tensor_function_mode", length - 1))
+    return cast(
+        TensorPlayFunctionMode,
+        _native_call("_get_tensor_function_mode", length - 1),
+    )
 
 
-def _get_current_function_mode_stack() -> list[TorchFunctionMode]:
+def _get_current_function_mode_stack() -> list[TensorPlayFunctionMode]:
     return [
-        cast(TorchFunctionMode, _native_call("_get_tensor_function_mode", index))
+        cast(
+            TensorPlayFunctionMode,
+            _native_call("_get_tensor_function_mode", index),
+        )
         for index in range(_function_mode_len())
     ]
 
 
-def _push_mode(mode: TorchFunctionMode) -> None:
+def _push_mode(mode: TensorPlayFunctionMode) -> None:
     _native_call("_push_tensor_function_mode", mode)
 
 
-def _pop_mode() -> TorchFunctionMode:
-    return cast(TorchFunctionMode, _native_call("_pop_tensor_function_mode"))
+def _pop_mode() -> TensorPlayFunctionMode:
+    return cast(
+        TensorPlayFunctionMode, _native_call("_pop_tensor_function_mode")
+    )
 
 
 @contextlib.contextmanager
@@ -679,10 +679,10 @@ def _pop_mode_temporarily() -> Any:
         _push_mode(mode)
 
 
-class BaseTorchFunctionMode(TorchFunctionMode):
+class BaseTensorPlayFunctionMode(TensorPlayFunctionMode):
     """Mode that forwards to the selected callable."""
 
-    def __torch_function__(
+    def __tensorplay_function__(
         self,
         func: Callable[..., Any],
         types_: tuple[type, ...],
@@ -694,7 +694,7 @@ class BaseTorchFunctionMode(TorchFunctionMode):
 
 
 @contextlib.contextmanager
-def _enable_torch_function() -> Any:
+def _enable_tensorplay_function() -> Any:
     previous = _native_state()
     try:
         _set_native_state(_FUNCTION_ENABLED)
@@ -704,7 +704,7 @@ def _enable_torch_function() -> Any:
 
 
 @contextlib.contextmanager
-def _disable_torch_function() -> Any:
+def _disable_tensorplay_function() -> Any:
     """Temporarily suppress Python hook discovery on the current thread."""
     previous = _native_state()
     try:

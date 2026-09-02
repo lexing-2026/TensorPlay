@@ -21,7 +21,7 @@ def mm(sparse, dense):
     if (
         isinstance(sparse, tensorplay.Tensor)
         and type(sparse) is not tensorplay.Tensor
-        and callable(getattr(sparse, "__torch_dispatch__", None))
+        and callable(getattr(sparse, "__tensorplay_dispatch__", None))
     ):
         return tensorplay.mm(sparse, dense)
     return tensorplay.sparse_mm(sparse, dense)
@@ -40,7 +40,7 @@ def addmm(mat, mat1, mat2, *, beta=1.0, alpha=1.0):
     if any(
         isinstance(value, tensorplay.Tensor)
         and type(value) is not tensorplay.Tensor
-        and callable(getattr(value, "__torch_dispatch__", None))
+        and callable(getattr(value, "__tensorplay_dispatch__", None))
         for value in (mat1, mat2)
     ):
         return tensorplay.addmm(mat, mat1, mat2, beta=beta, alpha=alpha)

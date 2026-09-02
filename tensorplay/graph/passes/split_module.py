@@ -190,15 +190,9 @@ def split_module(
         for input_node in input_nodes:
             if input_node.op == "get_attr":
                 attr = _get_attr_from_qualname(root_m, input_node.target)
-                if hasattr(attr, "forward") or hasattr(attr, "__call__"):
-                    target = _safe_attr_name(input_node.target)
-                    copied = partition.graph.get_attr(target)
-                    partition.targets[target] = attr
-                else:
-                    copied = partition.graph.placeholder(
-                        input_node.name if keep_original_input_name else f"arg_{counter}"
-                    )
-                    counter += 1
+                target = _safe_attr_name(input_node.target)
+                copied = partition.graph.get_attr(target)
+                partition.targets[target] = attr
             else:
                 name = input_node.name if keep_original_input_name else f"arg_{counter}"
                 copied = partition.graph.placeholder(name)

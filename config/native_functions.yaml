@@ -906,7 +906,7 @@
 # optimizer paths.  Keep all overloads in the dispatcher; the generated
 # Python functional surface is only a thin binding to these kernels.
 - func: where.self(Tensor condition, Tensor self, Tensor other) -> Tensor
-  variants: function
+  variants: function, method
   dispatch:
     CPU: where_cpu
     CUDA: where_cuda
@@ -918,7 +918,7 @@
     CUDA: where_scalar_self_cuda
 
 - func: where.ScalarOther(Tensor condition, Tensor self, Scalar other) -> Tensor
-  variants: function
+  variants: function, method
   dispatch:
     CPU: where_scalar_other_cpu
     CUDA: where_scalar_other_cuda
@@ -930,12 +930,12 @@
     CUDA: where_scalar_scalar_cuda
 
 - func: maximum(Tensor self, Tensor other) -> Tensor
-  variants: function
+  variants: function, method
   dispatch:
     CPU: maximum_cpu
 
 - func: minimum(Tensor self, Tensor other) -> Tensor
-  variants: function
+  variants: function, method
   dispatch:
     CPU: minimum_cpu
 
@@ -962,7 +962,7 @@
     CPU: mm_kernel
 
 - func: addmm(Tensor self, Tensor mat1, Tensor mat2, *, Scalar beta=1, Scalar alpha=1) -> Tensor
-  variants: function
+  variants: function, method
   dispatch:
     CPU: addmm_kernel
 
@@ -996,7 +996,7 @@
     CPU: bmm_kernel
 
 - func: baddbmm(Tensor self, Tensor batch1, Tensor batch2, *, Scalar beta=1, Scalar alpha=1) -> Tensor
-  variants: function
+  variants: function, method
   dispatch:
     CPU: baddbmm_kernel
 
@@ -1358,12 +1358,12 @@
 # weight accumulation goes through the dispatched index_add, so the same body
 # registers for CPU and CUDA.
 - func: histogram.bins_tensor(Tensor self, Tensor bins, *, Tensor? weight=None, bool density=False) -> (Tensor hist, Tensor bin_edges)
-  variants: function
+  variants: method, function
   dispatch:
     CPU: histogram_bins_tensor_kernel
 
 - func: histogram.bin_ct(Tensor self, int bins=100, *, float[]? range=None, Tensor? weight=None, bool density=False) -> (Tensor hist, Tensor bin_edges)
-  variants: function
+  variants: method, function
   dispatch:
     CPU: histogram_bin_ct_kernel
 
@@ -1486,6 +1486,7 @@
 - func: atan2(Tensor self, Tensor other) -> Tensor
   variants: function, method
   dispatch:
+    CPU: atan2_cpu
     CUDA: atan2_kernel_cuda
 
 - func: poisson(Tensor self) -> Tensor
@@ -1959,7 +1960,7 @@
   dispatch:
     CPU: random_kernel
 
-- func: uniform_(Tensor(a!) self, float from=0.0, float to=1.0) -> Tensor(a!)
+- func: uniform_(Tensor(a!) self, float from=0.0, float to=1.0, *, Generator? generator=None) -> Tensor(a!)
   variants: method
   dispatch:
     CPU: uniform_kernel
@@ -2181,11 +2182,13 @@
   variants: function
   dispatch:
     CPU: nll_loss_kernel
+    CUDA: nll_loss_cuda
 
 - func: nll_loss_backward(Tensor grad_output, Tensor self, Tensor target, Tensor? weight=None, int reduction=1, int ignore_index=-100, Tensor? total_weight=None) -> Tensor
   variants: function
   dispatch:
     CPU: nll_loss_backward_kernel
+    CUDA: nll_loss_backward_cuda
 
 # (N, H, W) target; every spatial position is an independent batch row.
 - func: nll_loss2d(Tensor self, Tensor target, Tensor? weight=None, int reduction=1, int ignore_index=-100) -> (Tensor output, Tensor total_weight)
@@ -2219,11 +2222,13 @@
   variants: function
   dispatch:
     CPU: mse_loss_kernel
+    CUDA: mse_loss_cuda
 
 - func: mse_loss_backward(Tensor grad_output, Tensor self, Tensor target, int reduction=1) -> Tensor
   variants: function
   dispatch:
     CPU: mse_loss_backward_kernel
+    CUDA: mse_loss_backward_cuda
 
 - func: max_pool2d_backward(Tensor grad_output, Tensor input, int[] kernel_size, int[] stride=[], int[] padding=[], int[] dilation=[], bool ceil_mode=false) -> Tensor
   python_defaults: {dilation: '[1, 1]', padding: '[0, 0]', stride: '[]'}
@@ -2321,7 +2326,7 @@
     CPU: instance_norm_backward_cpu
 
 - func: multinomial(Tensor self, int num_samples, bool replacement=false, int impl=0) -> Tensor
-  variants: function
+  variants: function, method
   dispatch:
     CPU: multinomial_kernel_cpu
 
@@ -2567,7 +2572,7 @@
     CPU: cumsum_cpu
 
 - func: flip(Tensor self, int[] dims=[]) -> Tensor
-  variants: function
+  variants: function, method
   dispatch:
     CPU: flip_cpu
 
@@ -2613,7 +2618,7 @@
     CPU: frac_kernel
 
 - func: i0(Tensor self) -> Tensor
-  variants: function
+  variants: function, method
   dispatch:
     CPU: i0_cpu
     CUDA: i0_cuda
@@ -2630,19 +2635,19 @@
     CUDA: real_cuda
 
 - func: diff(Tensor self, int n=1, int dim=-1, Tensor? prepend=None, Tensor? append=None) -> Tensor
-  variants: function
+  variants: function, method
   dispatch:
     CPU: diff_cpu
 
 - func: logical_and(Tensor self, Tensor other) -> Tensor
-  variants: function
+  variants: function, method
   dispatch:
     CPU: logical_and_cpu
 
 # Native cross-product entry points.
 # live in p10/src/backend/cpu/Cross.cpp and p10/src/backend/cuda/Cross.cu.
 - func: cross(Tensor self, Tensor other, int? dim=None) -> Tensor
-  variants: function
+  variants: function, method
   dispatch:
     CPU: cross_cpu
     CUDA: cross_cuda
@@ -2816,7 +2821,7 @@
     CUDA: linalg_diagonal_kernel_cuda
 
 - func: roll(Tensor self, int[] shifts, int[] dims=[]) -> Tensor
-  variants: function
+  variants: function, method
   dispatch:
     CPU: roll_cpu
 
@@ -3237,7 +3242,7 @@
     CUDA: amin_cuda2
 
 - func: aminmax(Tensor self, int[] dim=[], bool keepdim=False) -> (Tensor min, Tensor max)
-  variants: function
+  variants: function, method
   dispatch:
     CPU: aminmax_cpu
     CUDA: aminmax_cuda
@@ -4505,6 +4510,122 @@
     CPU: quantized_linear_cpu
     CUDA: quantized_linear_cuda
 
+# Elementwise quantized arithmetic over Int8 tensors with explicit affine
+# qparams: each operand is dequantized as (q - zero_point) * scale, the float
+# operation is applied, and the result is requantized into [-128, 127] with
+# q = clamp(nearbyint(y / out_scale) + out_zero_point).  Division by zero
+# follows IEEE float rules in the dequantized domain.
+- func: quantized_add(Tensor a, Tensor b, float a_scale, int a_zero_point, float b_scale, int b_zero_point, float out_scale, int out_zero_point) -> Tensor
+  variants: function
+  dispatch:
+    CPU: quantized_add_cpu
+    CUDA: quantized_add_cuda
+    Vulkan: quantized_add
+
+- func: quantized_sub(Tensor a, Tensor b, float a_scale, int a_zero_point, float b_scale, int b_zero_point, float out_scale, int out_zero_point) -> Tensor
+  variants: function
+  dispatch:
+    CPU: quantized_sub_cpu
+    CUDA: quantized_sub_cuda
+    Vulkan: quantized_sub
+
+- func: quantized_mul(Tensor a, Tensor b, float a_scale, int a_zero_point, float b_scale, int b_zero_point, float out_scale, int out_zero_point) -> Tensor
+  variants: function
+  dispatch:
+    CPU: quantized_mul_cpu
+    CUDA: quantized_mul_cuda
+    Vulkan: quantized_mul
+
+- func: quantized_div(Tensor a, Tensor b, float a_scale, int a_zero_point, float b_scale, int b_zero_point, float out_scale, int out_zero_point) -> Tensor
+  variants: function
+  dispatch:
+    CPU: quantized_div_cpu
+    CUDA: quantized_div_cuda
+    Vulkan: quantized_div
+
+# Clamp on the dequantized domain with requantization into the output
+# qparams; either bound may be omitted.
+- func: quantized_clamp(Tensor self, float self_scale, int self_zero_point, float out_scale, int out_zero_point, Scalar? min=None, Scalar? max=None) -> Tensor
+  variants: function
+  dispatch:
+    CPU: quantized_clamp_cpu
+    CUDA: quantized_clamp_cuda
+    Vulkan: quantized_clamp
+
+# Max pooling over Int8 storage: the window maximum is exact in the quantized
+# domain, so the output inherits the input qparams without requantization.
+- func: quantized_max_pool2d(Tensor self, int[2] kernel_size, int[2] stride=[], int[2] padding=0, int[2] dilation=1, bool ceil_mode=False) -> Tensor
+  variants: function
+  dispatch:
+    CPU: quantized_max_pool2d_cpu
+    CUDA: quantized_max_pool2d_cuda
+    Vulkan: quantized_max_pool2d
+
+# Quantized 2D convolution with explicit affine qparams: input and weight
+# bytes are dequantized as (q - zero_point) * scale, the convolution runs in
+# the float domain, and the result is requantized into [-128, 127] under the
+# output qparams.  Bias arrives in the float domain and is added after the
+# accumulation.  groups == 1 only.
+# Quantized 2D convolution with explicit affine qparams.  The weight is
+# quantized per output channel (scales/zero_points over [O]); the compute
+# shader dequantizes input and weight on read, accumulates in the float
+# domain, adds the float bias, and requantizes into the output qparams.
+# Weight and bias are pre-packed on the host into the shader's access layout
+# through quantized_conv2d_prepack; run via quantized_conv2d_run.
+- func: quantized_conv2d_prepack(Tensor weight, Tensor weight_scales, Tensor weight_zero_points, Tensor? bias=None, bool transposed=False) -> (Tensor weight_packed, Tensor bias_packed)
+  variants: function
+  dispatch:
+    CPU: quantized_conv2d_prepack_cpu
+
+- func: quantized_conv2d_unpack(Tensor weight_packed, Tensor bias_packed, SymInt[] weight_sizes, bool transposed=False, bool depthwise=False) -> (Tensor weight, Tensor bias)
+  variants: function
+  dispatch:
+    CPU: quantized_conv2d_unpack_cpu
+
+- func: quantized_conv2d_run(Tensor input, Tensor weight_packed, Tensor bias_packed, SymInt[] weight_sizes, float input_scale, int input_zero_point, float out_scale, int out_zero_point, int[] stride=1, int[] padding=0, int[] dilation=1, int[] output_padding=0, int groups=1, bool transposed=False, Scalar? output_min=None, Scalar? output_max=None) -> Tensor
+  variants: function
+  dispatch:
+    Vulkan: quantized_conv2d_run
+
+- func: quantized_conv2d(Tensor input, Tensor weight, Tensor? bias, float input_scale, int input_zero_point, float weight_scale, int weight_zero_point, float out_scale, int out_zero_point, int[] stride=1, int[] padding=0, int[] dilation=1, int groups=1) -> Tensor
+  variants: function
+  dispatch:
+    CPU: quantized_conv2d_cpu
+    CUDA: quantized_conv2d_cuda
+    Vulkan: quantized_conv2d
+
+# Unsigned-byte and int32 affine quantization variants.  quint8 stores the
+# clamped code in a UInt8 tensor (zero_point within [0, 255]); qint32 keeps
+# the full accumulator precision in an Int32 tensor.  The rounding and
+# clamping rules match the Int8 quantize/dequantize pair.
+- func: quantize_per_tensor_quint8(Tensor self, float scale, int zero_point, int quant_min=0, int quant_max=255) -> Tensor
+  variants: function
+  dispatch:
+    CPU: quantize_per_tensor_quint8_cpu
+    CUDA: quantize_per_tensor_quint8_cuda
+    Vulkan: quantize_per_tensor_quint8
+
+- func: dequantize_per_tensor_quint8(Tensor self, float scale, int zero_point) -> Tensor
+  variants: function
+  dispatch:
+    CPU: dequantize_per_tensor_quint8_cpu
+    CUDA: dequantize_per_tensor_quint8_cuda
+    Vulkan: dequantize_per_tensor_quint8
+
+- func: quantize_per_tensor_qint32(Tensor self, float scale, int zero_point) -> Tensor
+  variants: function
+  dispatch:
+    CPU: quantize_per_tensor_qint32_cpu
+    CUDA: quantize_per_tensor_qint32_cuda
+    Vulkan: quantize_per_tensor_qint32
+
+- func: dequantize_per_tensor_qint32(Tensor self, float scale, int zero_point) -> Tensor
+  variants: function
+  dispatch:
+    CPU: dequantize_per_tensor_qint32_cpu
+    CUDA: dequantize_per_tensor_qint32_cuda
+    Vulkan: dequantize_per_tensor_qint32
+
 # ---------------------------------------------------------------------------
 # Native forward-mode AD (JVP) kernels: each op evaluates the primal and its
 # tangent propagation in one pass, {primal_out, tangent_out}.  Used by
@@ -5083,6 +5204,9 @@
 
 - func: atan2_(Tensor(a!) self, Tensor other) -> Tensor(a!)
   variants: function, method
+  dispatch:
+    CPU: atan2_inplace_kernel
+    CUDA: atan2_inplace_kernel
 
 - func: atan_(Tensor(a!) self) -> Tensor(a!)
   variants: function, method
@@ -5416,7 +5540,7 @@
   variants: function
 
 - func: narrow_copy(Tensor self, int dim, SymInt start, SymInt length) -> Tensor
-  variants: function
+  variants: function, method
 
 - func: diagonal_copy(Tensor self, int offset=0, int dim1=0, int dim2=1) -> Tensor
   variants: function
@@ -5445,10 +5569,10 @@
 
 # TensorShape.cpp; used by autograd internals).
 - func: unsafe_chunk(Tensor self, int chunks, int dim=0) -> Tensor[]
-  variants: function
+  variants: function, method
 
 - func: unsafe_split.Tensor(Tensor self, SymInt split_size, int dim=0) -> Tensor[]
-  variants: function
+  variants: function, method
 
 - func: cosine_similarity(Tensor x1, Tensor x2, int dim=1, float eps=1e-8) -> Tensor
   variants: function
@@ -5534,7 +5658,7 @@
   variants: function
 
 - func: unsafe_split_with_sizes(Tensor self, int[] split_sizes, int dim=0) -> Tensor[]
-  variants: function
+  variants: function, method
 
 - func: detach_copy(Tensor self) -> Tensor
   variants: function, method
@@ -5585,9 +5709,15 @@
 
 - func: fmax(Tensor self, Tensor other) -> Tensor
   variants: function, method
+  dispatch:
+    CPU: fmax_cpu
+    CUDA: fmax_cuda
 
 - func: fmin(Tensor self, Tensor other) -> Tensor
   variants: function, method
+  dispatch:
+    CPU: fmin_cpu
+    CUDA: fmin_cuda
 
 - func: float_power(Tensor self, Tensor exponent) -> Tensor
   variants: function, method
@@ -5614,7 +5744,7 @@
 
 # TensorAdvancedIndexing.cpp: fixed-size nonzero indices, padded/truncated.
 - func: nonzero_static(Tensor self, *, int? size=None, int fill_value=-1) -> Tensor
-  variants: function
+  variants: function, method
 
 # ---------------------------------------------------------------------------
 # Leftover group with dedicated public entry points:
@@ -5629,11 +5759,11 @@
 - func: frexp(Tensor self) -> (Tensor mantissa, Tensor exponent)
   variants: function
 
-- func: igamma(Tensor a, Tensor x) -> Tensor
-  variants: function
+- func: igamma(Tensor self, Tensor other) -> Tensor
+  variants: method, function
 
-- func: igammac(Tensor a, Tensor x) -> Tensor
-  variants: function
+- func: igammac(Tensor self, Tensor other) -> Tensor
+  variants: method, function
 
 - func: empty_strided(int[] size, int[] stride, *, ScalarType? dtype=None, Device? device=None, bool pin_memory=False) -> Tensor
   variants: function
@@ -5798,9 +5928,11 @@
   variants: function
 - func: arange.start_step(Scalar start, Scalar end, Scalar step=1, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
   variants: function
-- func: arange.out(Scalar end, *, Tensor(a!) out) -> Tensor(a!)
+- func: arange.end_out(Scalar end, *, ScalarType dtype=Undefined, Device? device=None, bool requires_grad=false, Tensor(a!) out) -> Tensor(a!)
   variants: function
-- func: arange.start_out(Scalar start, Scalar end, Scalar step=1, *, Tensor(a!) out) -> Tensor(a!)
+  dispatch:
+    Composite: arange_bridge_out
+- func: arange.start_step_out(Scalar start, Scalar end, Scalar step=1, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: _dim_arange(Tensor like, int dim) -> Tensor
   variants: function
@@ -5933,6 +6065,8 @@
   variants: function
 - func: _convolution(Tensor input, Tensor weight, Tensor? bias, SymInt[] stride, SymInt[] padding, SymInt[] dilation, bool transposed, SymInt[] output_padding, SymInt groups, bool benchmark, bool deterministic, bool cudnn_enabled, bool allow_tf32) -> Tensor
   variants: function
+  dispatch:
+    Composite: _convolution_bridge
 - func: _convolution.deprecated(Tensor input, Tensor weight, Tensor? bias, SymInt[] stride, SymInt[] padding, SymInt[] dilation, bool transposed, int[] output_padding, SymInt groups, bool benchmark, bool deterministic, bool cudnn_enabled) -> Tensor
   variants: function
 - func: _convolution_mode(Tensor input, Tensor weight, Tensor? bias, SymInt[] stride, str padding, SymInt[] dilation, SymInt groups) -> Tensor
@@ -6151,6 +6285,8 @@
   variants: function
 - func: grid_sampler(Tensor input, Tensor grid, int interpolation_mode, int padding_mode, bool align_corners) -> Tensor
   variants: function
+  dispatch:
+    Composite: grid_sampler_bridge
 - func: _grid_sampler_2d_cpu_fallback(Tensor input, Tensor grid, int interpolation_mode, int padding_mode, bool align_corners) -> Tensor
   variants: function
 - func: _grid_sampler_2d_cpu_fallback_backward(Tensor grad_output, Tensor input, Tensor grid, int interpolation_mode, int padding_mode, bool align_corners) -> (Tensor, Tensor)
@@ -6363,6 +6499,8 @@
   variants: function
 - func: _log_softmax(Tensor self, int dim, bool half_to_float) -> Tensor
   variants: function
+  dispatch:
+    Composite: _log_softmax_bridge
 - func: _log_softmax.out(Tensor self, int dim, bool half_to_float, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: _log_softmax_backward_data(Tensor grad_output, Tensor output, int dim, ScalarType input_dtype) -> Tensor
@@ -6410,8 +6548,6 @@
 - func: mkldnn_max_pool3d_backward(Tensor grad_output, Tensor output, Tensor input, int[3] kernel_size, int[3] stride=[], int[3] padding=0, int[3] dilation=1, bool ceil_mode=False) -> Tensor
   variants: function
 - func: quantized_max_pool1d(Tensor self, int[1] kernel_size, int[1] stride=[], int[1] padding=0, int[1] dilation=1, bool ceil_mode=False) -> Tensor
-  variants: function
-- func: quantized_max_pool2d(Tensor self, int[2] kernel_size, int[2] stride=[], int[2] padding=0, int[2] dilation=1, bool ceil_mode=False) -> Tensor
   variants: function
 - func: quantized_max_pool3d(Tensor self, int[3] kernel_size, int[3] stride=[], int[3] padding=0, int[3] dilation=1, bool ceil_mode=False) -> Tensor
   variants: function
@@ -6591,6 +6727,8 @@
   variants: function
 - func: pinverse(Tensor self, float rcond=1e-15) -> Tensor
   variants: function, method
+  dispatch:
+    Composite: pinverse_bridge
 - func: rad2deg.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: deg2rad.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
@@ -6659,9 +6797,6 @@
   variants: function, method
 - func: repeat_interleave.self_int(Tensor self, SymInt repeats, int? dim=None, *, SymInt? output_size=None) -> Tensor
   variants: function, method
-  dispatch:
-    CPU: repeat_interleave_cpu
-    CUDA: repeat_interleave_cuda
 - func: _reshape_copy(Tensor self, SymInt[] size) -> Tensor
   variants: function
 - func: _reshape_alias(Tensor(a) self, SymInt[] size, SymInt[] stride) -> Tensor(a)
@@ -6740,6 +6875,8 @@
   variants: function
 - func: _softmax(Tensor self, int dim, bool half_to_float) -> Tensor
   variants: function
+  dispatch:
+    Composite: _softmax_bridge
 - func: _softmax.out(Tensor self, int dim, bool half_to_float, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: _softmax_backward_data(Tensor grad_output, Tensor output, int dim, ScalarType input_dtype) -> Tensor
@@ -7044,6 +7181,8 @@
   variants: function
 - func: _addmm_activation(Tensor self, Tensor mat1, Tensor mat2, *, Scalar beta=1, Scalar alpha=1, bool use_gelu=False) -> Tensor
   variants: function, method
+  dispatch:
+    Composite: _addmm_activation_bridge
 - func: _scaled_mm(Tensor self, Tensor mat2, Tensor scale_a, Tensor scale_b, Tensor? bias=None, Tensor? scale_result=None, ScalarType? out_dtype=None, bool use_fast_accum=False) -> Tensor
   variants: function
 - func: _scaled_mm.out(Tensor self, Tensor mat2, Tensor scale_a, Tensor scale_b, Tensor? bias=None, Tensor? scale_result=None, ScalarType? out_dtype=None, bool use_fast_accum=False, *, Tensor(a!) out) -> Tensor(a!)
@@ -7220,6 +7359,10 @@
 - func: q_per_channel_zero_points(Tensor self) -> Tensor
   variants: function, method
 - func: q_per_channel_axis(Tensor self) -> int
+  variants: function, method
+- func: is_quantized(Tensor self) -> bool
+  variants: function, method
+- func: qscheme(Tensor self) -> int
   variants: function, method
 - func: int_repr(Tensor self) -> Tensor
   variants: function, method
@@ -7696,6 +7839,8 @@
   variants: method, function
 - func: orgqr(Tensor self, Tensor input2) -> Tensor
   variants: method, function
+  dispatch:
+    Composite: orgqr_bridge
 - func: orgqr.out(Tensor self, Tensor input2, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: ormqr.out(Tensor self, Tensor input2, Tensor input3, bool left=True, bool transpose=False, *, Tensor(a!) out) -> Tensor(a!)
@@ -7708,6 +7853,8 @@
   variants: function
 - func: lu_solve(Tensor self, Tensor LU_data, Tensor LU_pivots) -> Tensor
   variants: method, function
+  dispatch:
+    Composite: lu_solve_bridge
 - func: lu_unpack(Tensor LU_data, Tensor LU_pivots, bool unpack_data=True, bool unpack_pivots=True) -> (Tensor P, Tensor L, Tensor U)
   variants: function
 - func: lu_unpack.out(Tensor LU_data, Tensor LU_pivots, bool unpack_data=True, bool unpack_pivots=True, *, Tensor(a!) P, Tensor(b!) L, Tensor(c!) U) -> (Tensor(a!) P, Tensor(b!) L, Tensor(c!) U)
@@ -7734,10 +7881,16 @@
   variants: function
 - func: arctan2(Tensor self, Tensor other) -> Tensor
   variants: method, function
+  dispatch:
+    CPU: atan2_cpu
+    CUDA: atan2_kernel_cuda
 - func: arctan2.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: arctan2_(Tensor(a!) self, Tensor other) -> Tensor(a!)
   variants: method
+  dispatch:
+    CPU: atan2_inplace_kernel
+    CUDA: atan2_inplace_kernel
 - func: lerp.Scalar_out(Tensor self, Tensor end, Scalar weight, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: lerp.Tensor_out(Tensor self, Tensor end, Tensor weight, *, Tensor(a!) out) -> Tensor(a!)
@@ -8193,50 +8346,91 @@
   variants: function
 - func: reflection_pad1d(Tensor self, SymInt[2] padding) -> Tensor
   variants: function
+  dispatch:
+    CPU: reflection_pad_nd_cpu
+    CUDA: reflection_pad_nd_cuda
+    Vulkan: reflection_pad_nd_vulkan
 - func: reflection_pad1d_backward.grad_input(Tensor grad_output, Tensor self, SymInt[2] padding, *, Tensor(a!) grad_input) -> Tensor(a!)
   variants: function
 - func: reflection_pad1d_backward(Tensor grad_output, Tensor self, SymInt[2] padding) -> Tensor
   variants: function
+  dispatch:
+    CPU: reflection_pad_nd_backward_cpu
+    CUDA: reflection_pad_nd_backward_cuda
 - func: reflection_pad2d.out(Tensor self, SymInt[4] padding, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: reflection_pad2d(Tensor self, SymInt[4] padding) -> Tensor
   variants: function
+  dispatch:
+    CPU: reflection_pad_nd_cpu
+    CUDA: reflection_pad_nd_cuda
+    Vulkan: reflection_pad_nd_vulkan
 - func: reflection_pad2d_backward.grad_input(Tensor grad_output, Tensor self, SymInt[4] padding, *, Tensor(a!) grad_input) -> Tensor(a!)
   variants: function
 - func: reflection_pad2d_backward(Tensor grad_output, Tensor self, SymInt[4] padding) -> Tensor
   variants: function
+  dispatch:
+    CPU: reflection_pad_nd_backward_cpu
+    CUDA: reflection_pad_nd_backward_cuda
 - func: reflection_pad3d.out(Tensor self, SymInt[6] padding, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: reflection_pad3d(Tensor self, SymInt[6] padding) -> Tensor
   variants: function
+  dispatch:
+    CPU: reflection_pad_nd_cpu
+    CUDA: reflection_pad_nd_cuda
 - func: reflection_pad3d_backward.grad_input(Tensor grad_output, Tensor self, SymInt[6] padding, *, Tensor(a!) grad_input) -> Tensor(a!)
   variants: function
 - func: reflection_pad3d_backward(Tensor grad_output, Tensor self, SymInt[6] padding) -> Tensor
   variants: function
+  dispatch:
+    CPU: reflection_pad_nd_backward_cpu
+    CUDA: reflection_pad_nd_backward_cuda
 - func: replication_pad1d.out(Tensor self, SymInt[2] padding, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: replication_pad1d(Tensor self, SymInt[2] padding) -> Tensor
   variants: function
+  dispatch:
+    CPU: replication_pad_nd_cpu
+    CUDA: replication_pad_nd_cuda
+    Vulkan: replication_pad_nd_vulkan
 - func: replication_pad1d_backward.grad_input(Tensor grad_output, Tensor self, SymInt[2] padding, *, Tensor(a!) grad_input) -> Tensor(a!)
   variants: function
 - func: replication_pad1d_backward(Tensor grad_output, Tensor self, SymInt[2] padding) -> Tensor
   variants: function
+  dispatch:
+    CPU: replication_pad_nd_backward_cpu
+    CUDA: replication_pad_nd_backward_cuda
 - func: replication_pad2d.out(Tensor self, SymInt[4] padding, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: replication_pad2d(Tensor self, SymInt[4] padding) -> Tensor
   variants: function
+  dispatch:
+    CPU: replication_pad_nd_cpu
+    CUDA: replication_pad_nd_cuda
+    Vulkan: replication_pad_nd_vulkan
 - func: replication_pad2d_backward.grad_input(Tensor grad_output, Tensor self, SymInt[4] padding, *, Tensor(a!) grad_input) -> Tensor(a!)
   variants: function
 - func: replication_pad2d_backward(Tensor grad_output, Tensor self, SymInt[4] padding) -> Tensor
   variants: function
+  dispatch:
+    CPU: replication_pad_nd_backward_cpu
+    CUDA: replication_pad_nd_backward_cuda
 - func: replication_pad3d.out(Tensor self, SymInt[6] padding, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: replication_pad3d(Tensor self, SymInt[6] padding) -> Tensor
   variants: function
+  dispatch:
+    CPU: replication_pad_nd_cpu
+    CUDA: replication_pad_nd_cuda
+    Vulkan: replication_pad_nd_vulkan
 - func: replication_pad3d_backward.grad_input(Tensor grad_output, Tensor self, SymInt[6] padding, *, Tensor(a!) grad_input) -> Tensor(a!)
   variants: function
 - func: replication_pad3d_backward(Tensor grad_output, Tensor self, SymInt[6] padding) -> Tensor
   variants: function
+  dispatch:
+    CPU: replication_pad_nd_backward_cpu
+    CUDA: replication_pad_nd_backward_cuda
 - func: _pad_circular(Tensor self, SymInt[] pad) -> Tensor
   variants: function
 - func: _pad_enum(Tensor self, SymInt[] pad, int mode, float? value=None) -> Tensor
@@ -8249,12 +8443,18 @@
   variants: function
 - func: _upsample_bilinear2d_aa.vec(Tensor input, SymInt[]? output_size, bool align_corners, float[]? scale_factors) -> Tensor
   variants: function
+  dispatch:
+    CPU: _upsample_bilinear2d_aa_vec_cpu
+    CUDA: _upsample_bilinear2d_aa_vec_cuda
 - func: upsample_trilinear3d.vec(Tensor input, SymInt[]? output_size, bool align_corners, float[]? scale_factors) -> Tensor
   variants: function
 - func: upsample_bicubic2d.vec(Tensor input, SymInt[]? output_size, bool align_corners, float[]? scale_factors) -> Tensor
   variants: function
 - func: _upsample_bicubic2d_aa.vec(Tensor input, SymInt[]? output_size, bool align_corners, float[]? scale_factors) -> Tensor
   variants: function
+  dispatch:
+    CPU: _upsample_bicubic2d_aa_vec_cpu
+    CUDA: _upsample_bicubic2d_aa_vec_cuda
 - func: _upsample_lanczos2d_aa.vec(Tensor input, SymInt[]? output_size, bool align_corners, float[]? scale_factors) -> Tensor
   variants: function
 - func: upsample_nearest1d.vec(Tensor input, SymInt[]? output_size, float[]? scale_factors) -> Tensor
@@ -8279,24 +8479,48 @@
   variants: function
 - func: _upsample_bilinear2d_aa.out(Tensor self, SymInt[2] output_size, bool align_corners, float? scales_h=None, float? scales_w=None, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
+  dispatch:
+    CPU: upsample_bilinear2d_aa_out_cpu
+    CUDA: upsample_bilinear2d_aa_out_cuda
 - func: _upsample_bilinear2d_aa(Tensor self, SymInt[2] output_size, bool align_corners, float? scales_h=None, float? scales_w=None) -> Tensor
   variants: function
+  dispatch:
+    CPU: upsample_bilinear2d_aa_cpu
+    CUDA: upsample_bilinear2d_aa_cuda
 - func: _upsample_bilinear2d_aa_backward.grad_input(Tensor grad_output, SymInt[2] output_size, SymInt[4] input_size, bool align_corners, float? scales_h=None, float? scales_w=None, *, Tensor(a!) grad_input) -> Tensor(a!)
   variants: function
+  dispatch:
+    CPU: upsample_bilinear2d_aa_backward_grad_input_cpu
+    CUDA: upsample_bilinear2d_aa_backward_grad_input_cuda
 - func: _upsample_bilinear2d_aa_backward(Tensor grad_output, SymInt[2] output_size, SymInt[4] input_size, bool align_corners, float? scales_h=None, float? scales_w=None) -> Tensor
   variants: function
+  dispatch:
+    CPU: upsample_bilinear2d_aa_backward_cpu
+    CUDA: upsample_bilinear2d_aa_backward_cuda
 - func: upsample_bicubic2d.out(Tensor self, SymInt[2] output_size, bool align_corners, float? scales_h=None, float? scales_w=None, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: upsample_bicubic2d_backward.grad_input(Tensor grad_output, SymInt[2] output_size, SymInt[4] input_size, bool align_corners, float? scales_h=None, float? scales_w=None, *, Tensor(a!) grad_input) -> Tensor(a!)
   variants: function
 - func: _upsample_bicubic2d_aa.out(Tensor self, SymInt[2] output_size, bool align_corners, float? scales_h=None, float? scales_w=None, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
+  dispatch:
+    CPU: upsample_bicubic2d_aa_out_cpu
+    CUDA: upsample_bicubic2d_aa_out_cuda
 - func: _upsample_bicubic2d_aa(Tensor self, SymInt[2] output_size, bool align_corners, float? scales_h=None, float? scales_w=None) -> Tensor
   variants: function
+  dispatch:
+    CPU: upsample_bicubic2d_aa_cpu
+    CUDA: upsample_bicubic2d_aa_cuda
 - func: _upsample_bicubic2d_aa_backward.grad_input(Tensor grad_output, SymInt[2] output_size, SymInt[4] input_size, bool align_corners, float? scales_h=None, float? scales_w=None, *, Tensor(a!) grad_input) -> Tensor(a!)
   variants: function
+  dispatch:
+    CPU: upsample_bicubic2d_aa_backward_grad_input_cpu
+    CUDA: upsample_bicubic2d_aa_backward_grad_input_cuda
 - func: _upsample_bicubic2d_aa_backward(Tensor grad_output, SymInt[2] output_size, SymInt[4] input_size, bool align_corners, float? scales_h=None, float? scales_w=None) -> Tensor
   variants: function
+  dispatch:
+    CPU: upsample_bicubic2d_aa_backward_cpu
+    CUDA: upsample_bicubic2d_aa_backward_cuda
 - func: _upsample_lanczos2d_aa.out(Tensor self, SymInt[2] output_size, bool align_corners, float? scales_h=None, float? scales_w=None, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: _upsample_lanczos2d_aa(Tensor self, SymInt[2] output_size, bool align_corners, float? scales_h=None, float? scales_w=None) -> Tensor
@@ -8313,38 +8537,74 @@
   variants: function
 - func: _upsample_nearest_exact1d.out(Tensor self, SymInt[1] output_size, float? scales=None, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
+  dispatch:
+    CPU: upsample_nearest_exact1d_out_cpu
+    CUDA: upsample_nearest_exact1d_out_cuda
 - func: _upsample_nearest_exact1d(Tensor self, SymInt[1] output_size, float? scales=None) -> Tensor
   variants: function
+  dispatch:
+    CPU: upsample_nearest_exact1d_cpu
+    CUDA: upsample_nearest_exact1d_cuda
 - func: upsample_nearest1d_backward.grad_input(Tensor grad_output, SymInt[1] output_size, SymInt[3] input_size, float? scales=None, *, Tensor(a!) grad_input) -> Tensor(a!)
   variants: function
 - func: _upsample_nearest_exact1d_backward.grad_input(Tensor grad_output, SymInt[1] output_size, SymInt[3] input_size, float? scales=None, *, Tensor(a!) grad_input) -> Tensor(a!)
   variants: function
+  dispatch:
+    CPU: upsample_nearest_exact1d_backward_grad_input_cpu
+    CUDA: upsample_nearest_exact1d_backward_grad_input_cuda
 - func: _upsample_nearest_exact1d_backward(Tensor grad_output, SymInt[1] output_size, SymInt[3] input_size, float? scales=None) -> Tensor
   variants: function
+  dispatch:
+    CPU: upsample_nearest_exact1d_backward_cpu
+    CUDA: upsample_nearest_exact1d_backward_cuda
 - func: upsample_nearest2d.out(Tensor self, SymInt[2] output_size, float? scales_h=None, float? scales_w=None, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: _upsample_nearest_exact2d.out(Tensor self, SymInt[2] output_size, float? scales_h=None, float? scales_w=None, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
+  dispatch:
+    CPU: upsample_nearest_exact2d_out_cpu
+    CUDA: upsample_nearest_exact2d_out_cuda
 - func: _upsample_nearest_exact2d(Tensor self, SymInt[2] output_size, float? scales_h=None, float? scales_w=None) -> Tensor
   variants: function
+  dispatch:
+    CPU: upsample_nearest_exact2d_cpu
+    CUDA: upsample_nearest_exact2d_cuda
 - func: upsample_nearest2d_backward.grad_input(Tensor grad_output, SymInt[2] output_size, SymInt[4] input_size, float? scales_h=None, float? scales_w=None, *, Tensor(a!) grad_input) -> Tensor(a!)
   variants: function
 - func: _upsample_nearest_exact2d_backward.grad_input(Tensor grad_output, SymInt[2] output_size, SymInt[4] input_size, float? scales_h=None, float? scales_w=None, *, Tensor(a!) grad_input) -> Tensor(a!)
   variants: function
+  dispatch:
+    CPU: upsample_nearest_exact2d_backward_grad_input_cpu
+    CUDA: upsample_nearest_exact2d_backward_grad_input_cuda
 - func: _upsample_nearest_exact2d_backward(Tensor grad_output, SymInt[2] output_size, SymInt[4] input_size, float? scales_h=None, float? scales_w=None) -> Tensor
   variants: function
+  dispatch:
+    CPU: upsample_nearest_exact2d_backward_cpu
+    CUDA: upsample_nearest_exact2d_backward_cuda
 - func: upsample_nearest3d.out(Tensor self, SymInt[3] output_size, float? scales_d=None, float? scales_h=None, float? scales_w=None, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: _upsample_nearest_exact3d.out(Tensor self, SymInt[3] output_size, float? scales_d=None, float? scales_h=None, float? scales_w=None, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
+  dispatch:
+    CPU: upsample_nearest_exact3d_out_cpu
+    CUDA: upsample_nearest_exact3d_out_cuda
 - func: _upsample_nearest_exact3d(Tensor self, SymInt[3] output_size, float? scales_d=None, float? scales_h=None, float? scales_w=None) -> Tensor
   variants: function
+  dispatch:
+    CPU: upsample_nearest_exact3d_cpu
+    CUDA: upsample_nearest_exact3d_cuda
 - func: upsample_nearest3d_backward.grad_input(Tensor grad_output, SymInt[3] output_size, SymInt[5] input_size, float? scales_d=None, float? scales_h=None, float? scales_w=None, *, Tensor(a!) grad_input) -> Tensor(a!)
   variants: function
 - func: _upsample_nearest_exact3d_backward.grad_input(Tensor grad_output, SymInt[3] output_size, SymInt[5] input_size, float? scales_d=None, float? scales_h=None, float? scales_w=None, *, Tensor(a!) grad_input) -> Tensor(a!)
   variants: function
+  dispatch:
+    CPU: upsample_nearest_exact3d_backward_grad_input_cpu
+    CUDA: upsample_nearest_exact3d_backward_grad_input_cuda
 - func: _upsample_nearest_exact3d_backward(Tensor grad_output, SymInt[3] output_size, SymInt[5] input_size, float? scales_d=None, float? scales_h=None, float? scales_w=None) -> Tensor
   variants: function
+  dispatch:
+    CPU: upsample_nearest_exact3d_backward_cpu
+    CUDA: upsample_nearest_exact3d_backward_cuda
 - func: sigmoid_backward.grad_input(Tensor grad_output, Tensor output, *, Tensor(a!) grad_input) -> Tensor(a!)
   variants: function
 - func: logit_backward.grad_input(Tensor grad_output, Tensor self, float? eps=None, *, Tensor(a!) grad_input) -> Tensor(a!)
@@ -8730,6 +8990,10 @@
   variants: function
 - func: linalg_vecdot(Tensor x, Tensor y, *, int dim=-1) -> Tensor
   variants: function
+  dispatch:
+    Composite: linalg_vecdot_bridge
+- func: linalg_vdot(Tensor self, Tensor other) -> Tensor
+  variants: function
 - func: linalg_vecdot.out(Tensor x, Tensor y, *, int dim=-1, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: linalg_matrix_exp(Tensor self) -> Tensor
@@ -8770,6 +9034,8 @@
   variants: function
 - func: inverse(Tensor self) -> Tensor
   variants: function, method
+  dispatch:
+    Composite: inverse_bridge
 - func: inverse.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: inner.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)

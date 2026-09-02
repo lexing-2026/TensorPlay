@@ -20,6 +20,9 @@ const char* dtype_name(DType dtype) {
         case DType::ComplexFloat: return "complex64";
         case DType::ComplexDouble: return "complex128";
         case DType::BComplex32: return "bcomplex32";
+        case DType::QInt8: return "qint8";
+        case DType::QUInt8: return "quint8";
+        case DType::QInt32: return "qint32";
         case DType::Bool: return "bool";
         default: return "undefined";
     }
@@ -50,6 +53,9 @@ void init_dtype(py::module_& m) {
         .value("complex64", DType::ComplexFloat)
         .value("complex128", DType::ComplexDouble)
         .value("bcomplex32", DType::BComplex32)
+        .value("qint8", DType::QInt8)
+        .value("quint8", DType::QUInt8)
+        .value("qint32", DType::QInt32)
         .value("bool", DType::Bool)
         .value("undefined", DType::Undefined)
         .def("__str__", [](DType d) { return dtype_repr(d); })
@@ -59,6 +65,9 @@ void init_dtype(py::module_& m) {
         })
         .def_property_readonly("is_complex", [](DType d) {
             return tensorplay::isComplexType(d);
+        })
+        .def_property_readonly("is_quantized", [](DType d) {
+            return tensorplay::isQuantizedType(d);
         })
         .def_property_readonly("is_signed", [](DType d) {
             return tensorplay::isSignedType(d);
@@ -83,6 +92,9 @@ void init_dtype(py::module_& m) {
     m.attr("complex64") = DType::ComplexFloat;
     m.attr("complex128") = DType::ComplexDouble;
     m.attr("bcomplex32") = DType::BComplex32;
+    m.attr("qint8") = DType::QInt8;
+    m.attr("quint8") = DType::QUInt8;
+    m.attr("qint32") = DType::QInt32;
     m.attr("bool") = DType::Bool;
     m.attr("undefined") = DType::Undefined;
 

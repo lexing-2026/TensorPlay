@@ -262,7 +262,9 @@ class TracerBase:
 
     def to_bool(self, obj: "Proxy") -> bool:
         del obj
-        raise TraceError("symbolic graph values cannot be used as Python conditions")
+        raise TraceError(
+            "symbolic graph values cannot be used in Python control flow"
+        )
 
     def iter(self, obj: "Proxy") -> Iterator[Any]:
         del obj
@@ -508,7 +510,7 @@ class Proxy:
         if callable(tracer_to_bool):
             return tracer_to_bool(self)
         raise TraceError(
-            "symbolic graph values cannot be used as Python conditions"
+            "symbolic graph values cannot be used in Python control flow"
         )
 
     def __index__(self) -> int:

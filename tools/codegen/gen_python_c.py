@@ -165,6 +165,23 @@ _KIND_CONST.update({k: v + " | TPK_OPTIONAL" for k, v in _OPT.items()})
 
 _RET_SHAPES = {"void", "value", "tuple", "list", "mut_ref"}
 
+_VMAP_MEMBER_OPS = frozenset({
+    "neg", "negative", "abs", "exp", "log", "sin", "cos", "sinh",
+    "cosh", "tanh", "sqrt", "rsqrt", "sigmoid", "relu", "floor", "ceil",
+    "round", "trunc", "erf", "erfc", "log1p", "expm1", "mul.Tensor",
+    "div.Tensor", "logical_or", "logical_xor", "add.Scalar", "sub.Scalar",
+    "mul.Scalar", "div.Scalar",
+    "add.Tensor", "sub.Tensor", "pow.Tensor_Scalar", "pow.Tensor_Tensor",
+    "sum", "sum.dim_IntList", "view", "permute", "transpose", "movedim",
+    "reshape", "expand", "squeeze", "squeeze.dim", "squeeze.dims", "unsqueeze",
+    "contiguous", "slice", "narrow", "index_select",
+    "mm", "matmul", "bmm",
+})
+
+_VMAP_STATIC_OPS = frozenset({
+    "maximum", "minimum", "logical_and", "cat", "stack", "linear",
+})
+
 
 def _schema_tag(f, variant: str, ordinal: int) -> str:
     payload = f"{variant}\0{ordinal}\0{f.schema}".encode("utf-8")
@@ -288,7 +305,7 @@ def _validate_op_support(f, variant: str) -> None:
                     f"{cpp_type!r} in {f.func_name} ({variant})")
 
 
-def _tuple_invoke(f, op: str, call: str, site_hook: str) -> str | None:
+def _tuple_invoke(f, invoke_expr: str, site_hook: str) -> str | None:
     elements = tuple_element_cpp_types(f)
     packed = [
         _pack_expr(t, f"std::get<{i}>(r)")
@@ -310,7 +327,7 @@ def _tuple_invoke(f, op: str, call: str, site_hook: str) -> str | None:
         ])
     statements.append("return tpx_tuple_result;")
     return (site_hook
-            + f"auto r = [&]() {{ tpx_py_GilRelease _gil; return {op}({call}); }}(); "
+            + f"auto r = [&]() {{ tpx_py_GilRelease _gil; return {invoke_expr}; }}(); "
             + " ".join(statements))
 
 
@@ -349,8 +366,10 @@ def _probe_info(f, variant: str):
     by the generated dispatcher to pick a candidate overload without raising.
     """
     is_method = variant == "method"
-    off = 1 if is_method else 0
-    pos = [a for a in f.args[off:] if not a.kwonly]
+    # The probe works on user arguments; the receiver's `self` slot sits
+    # wherever the schema places it, so exclude it by name.
+    pos = [a for a in f.args if not (is_method and a.name == "self")
+           and not a.kwonly]
     if pos and pos[-1].type.is_list:
         return None                       # splat folding: nargs not comparable
     kinds = [_KIND_CONST.get(cpp_arg_type(a.type)) for a in pos]
@@ -362,9 +381,9 @@ def _probe_info(f, variant: str):
 
 def _unique_keyword_probes(funcs, variant: str):
     """Return keyword names that identify one overload in a group."""
-    offset = 1 if variant == "method" else 0
     names = [
-        {a.name for a in f.args[offset:]}
+        {a.name for a in f.args
+         if not (variant == "method" and a.name == "self")}
         for f in funcs
     ]
     probes = []
@@ -414,15 +433,28 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
             f"in {f.func_name} ({variant})")
 
     nargs = len(slots)
-    is_method = variant == "method" and slots and slots[0][0] == "self"
+    # The method surface binds the receiver to the schema argument named
+    # "self", wherever it sits in the signature (leading `self` is the common
+    # case; where.self carries it mid-signature).
+    self_idx = next(
+        (i for i, (n, _, _) in enumerate(slots) if n == "self"), None)
+    is_method = variant == "method" and self_idx is not None
+    # Schema names that collide with Python keywords ("from") map to their
+    # trailing-underscore spelling everywhere a Python caller can spell them;
+    # C++ locals keyed on slots stay on the raw schema name.
+    def _py_kw(name: str) -> str:
+        return "from_" if name == "from" else name
+
     if is_method:
         # METH_FASTCALL method descriptors pass the receiver as the first C
         # parameter; args[] holds only the user arguments.  The schema's
-        # leading `self` therefore never appears in kwlist.
-        kw_names = [n for n, _, _ in slots][1:]
-        user_pos = sum(1 for a in f.args[1:] if not a.kwonly)
+        # `self` slot therefore never appears in kwlist.
+        kw_names = [_py_kw(n) for i, (n, _, _) in enumerate(slots)
+                    if i != self_idx]
+        user_pos = sum(1 for i, a in enumerate(f.args)
+                       if i != self_idx and not a.kwonly)
     else:
-        kw_names = [n for n, _, _ in slots]
+        kw_names = [_py_kw(n) for n, _, _ in slots]
         user_pos = sum(1 for a in f.args if not a.kwonly)
     kwlist = ('static const char* kwlist[] = {'
               + ", ".join(f'"{n}"' for n in kw_names)
@@ -430,8 +462,20 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
              'static const char* kwlist[] = {nullptr};'
 
     call = ", ".join("s_" + n for n, _, _ in slots)
-    op_signature = (f"{cpp_return_type(f)} (*)({', '.join(cpp_arg_type(a.type) for a in f.args)})")
-    op = f"static_cast<{op_signature}>(tensorplay::tpx::ops::{f.cpp_name})"
+    use_member_entry = (
+        f.func_name in _VMAP_MEMBER_OPS
+        and f.args
+        and f.args[0].name == "self"
+    )
+    if use_member_entry:
+        method_call = ", ".join("s_" + n for n, _, _ in slots[1:])
+        invoke_expr = f"s_self.{f.cpp_name}({method_call})"
+    elif f.func_name in _VMAP_STATIC_OPS:
+        invoke_expr = f"Tensor::{f.cpp_name}({call})"
+    else:
+        op_signature = (f"{cpp_return_type(f)} (*)({', '.join(cpp_arg_type(a.type) for a in f.args)})")
+        op = f"static_cast<{op_signature}>(tensorplay::tpx::ops::{f.cpp_name})"
+        invoke_expr = f"{op}({call})"
     kind = f.cpp_return_kind
     ret_cpp = cpp_return_type(f)
     # Python call-site capture for the profiler (with_stack): runs under the
@@ -442,19 +486,19 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
     # run multithreaded.  The lambda restores the GIL before the result is
     # wrapped (all Python C-API stays under the GIL).
     if kind == "void":
-        invoke = site_hook + f"[&]() {{ tpx_py_GilRelease _gil; {op}({call}); }}(); Py_RETURN_NONE;"
+        invoke = site_hook + f"[&]() {{ tpx_py_GilRelease _gil; {invoke_expr}; }}(); Py_RETURN_NONE;"
     elif kind == "value":
         if ret_cpp == "bool":
-            invoke = (site_hook + f"auto r = [&]() {{ tpx_py_GilRelease _gil; return {op}({call}); }}(); "
+            invoke = (site_hook + f"auto r = [&]() {{ tpx_py_GilRelease _gil; return {invoke_expr}; }}(); "
                       "return PyBool_FromLong(r);")
         elif ret_cpp == "Scalar":
-            invoke = (site_hook + f"auto r = [&]() {{ tpx_py_GilRelease _gil; return {op}({call}); }}(); "
+            invoke = (site_hook + f"auto r = [&]() {{ tpx_py_GilRelease _gil; return {invoke_expr}; }}(); "
                       "return tpx_py_wrap_scalar(r);")
         elif ret_cpp == "int64_t":
-            invoke = (site_hook + f"auto r = [&]() {{ tpx_py_GilRelease _gil; return {op}({call}); }}(); "
+            invoke = (site_hook + f"auto r = [&]() {{ tpx_py_GilRelease _gil; return {invoke_expr}; }}(); "
                       "return PyLong_FromLongLong(r);")
         elif ret_cpp == "Tensor":
-            invoke = (site_hook + f"auto r = [&]() {{ tpx_py_GilRelease _gil; return {op}({call}); }}(); "
+            invoke = (site_hook + f"auto r = [&]() {{ tpx_py_GilRelease _gil; return {invoke_expr}; }}(); "
                       "return tpx_py_wrap(r);")
         else:
             pack = _pack_expr(ret_cpp, "r")
@@ -462,10 +506,10 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
                 raise SystemExit(
                     f"native CPython bridge has no packer for C++ type {ret_cpp!r} "
                     f"in {f.func_name} ({variant})")
-            invoke = (site_hook + f"auto r = [&]() {{ tpx_py_GilRelease _gil; return {op}({call}); }}(); "
+            invoke = (site_hook + f"auto r = [&]() {{ tpx_py_GilRelease _gil; return {invoke_expr}; }}(); "
                       f"return {pack};")
     elif kind == "tuple":
-        invoke = _tuple_invoke(f, op, call, site_hook)
+        invoke = _tuple_invoke(f, invoke_expr, site_hook)
         if invoke is None:
             raise SystemExit(
                 f"native CPython bridge has no tuple packer for {f.func_name} "
@@ -476,14 +520,14 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
             raise SystemExit(
                 f"native CPython bridge has no packer for C++ type {ret_cpp!r} "
                 f"in {f.func_name} ({variant})")
-        invoke = (site_hook + f"auto r = [&]() {{ tpx_py_GilRelease _gil; return {op}({call}); }}(); "
+        invoke = (site_hook + f"auto r = [&]() {{ tpx_py_GilRelease _gil; return {invoke_expr}; }}(); "
                   f"return {pack};")
     else:                                      # mut_ref
         # slots[0] is the raw self PyObject; the s_* locals hold unpacked
         # C++ tensors.
         keep = "tpx_py_keep_alive(slots[0]);" if nargs else ""
         invoke = (site_hook + f"auto& r = [&]() -> auto& {{ tpx_py_GilRelease _gil; "
-                  f"return {op}({call}); }}(); {keep} return tpx_py_wrap(r);")
+                  f"return {invoke_expr}; }}(); {keep} return tpx_py_wrap(r);")
 
     recv = "PyObject* self" if is_method else "PyObject*"
     out.extend(prelude)
@@ -525,7 +569,8 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
     # (t.view(2, 3) == t.view([2, 3])).  This keeps the public call form:
     # when the last positional parameter is list-typed, pack args[P-1..]
     # into a tuple before parsing instead of rejecting extra positionals.
-    _pos = [a for a in f.args[(1 if is_method else 0):] if not a.kwonly]
+    _pos = [a for i, a in enumerate(f.args)
+            if i != self_idx and not a.kwonly]
     splat = bool(_pos) and _pos[-1].type.is_list
 
     if splat:
@@ -573,10 +618,16 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
         arg_arr, arg_n = "args", "nargs"
 
     if is_method:
-        body.append("        slots[0] = self;")
+        # parse_into owns the fill of a contiguous user-slot array; the
+        # receiver's named `self` slot is patched in afterwards.
+        user_idx = [i for i in range(nargs) if i != self_idx]
+        body.append(f"        PyObject* uslots[{nargs - 1}];")
         body.append(
             f'        tpx_py_parse_into({arg_arr}, {arg_n}, kwnames, kwlist, '
-            f'{nargs - 1}, "{f.func_name}", slots + 1);')
+            f'{nargs - 1}, "{f.func_name}", uslots);')
+        for u, i in enumerate(user_idx):
+            body.append(f"        slots[{i}] = uslots[{u}];")
+        body.append(f"        slots[{self_idx}] = self;")
         if not splat and user_pos < nargs - 1:
             # std::invalid_argument (not a Python error) so multi-overload
             # dispatch can fall through to the next candidate signature.
@@ -595,31 +646,41 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
             body.append("        }")
     out.extend(body)
 
-    # Eager type validation with one static kind table per overload.
-    off = 1 if is_method else 0
-    kind_consts = [_KIND_CONST.get(cpp_arg_type(a.type)) for a in f.args[off:]]
+    # Eager type validation with one static kind table per overload.  For the
+    # method surface the table covers the user-argument array (uslots, self
+    # excluded); for function overloads the schema's own `self` argument is a
+    # real slot, so it must stay in the table to match the checked slot count.
+    kind_consts = [_KIND_CONST.get(cpp_arg_type(a.type))
+                   for i, a in enumerate(f.args)
+                   if not (is_method and i == self_idx)]
     if any(kind is None for kind in kind_consts):
         missing = next(
-            cpp_arg_type(a.type) for a in f.args[off:]
-            if _KIND_CONST.get(cpp_arg_type(a.type)) is None)
+            cpp_arg_type(a.type) for i, a in enumerate(f.args)
+            if not (is_method and i == self_idx)
+            and _KIND_CONST.get(cpp_arg_type(a.type)) is None)
         raise SystemExit(
             f"native CPython bridge has no type check for C++ type {missing!r} "
             f"in {f.func_name} ({variant})")
-    if nargs > off:
+    if nargs > 1:
         out.append('        static const unsigned char tpx_kinds[] = {'
                    + ", ".join(kind_consts) + '};')
+        # The kind table follows the checked array: uslots holds only user
+        # arguments (method surface), slots holds every schema argument
+        # including self (function surface).
+        check_arr = "uslots" if is_method else "slots"
+        check_n = nargs - 1 if is_method else nargs
         out.append(
-            f'        tpx_py_check_types(slots + {off}, {nargs - off}, '
+            f'        tpx_py_check_types({check_arr}, {check_n}, '
             f'"{f.func_name}", kwlist, tpx_kinds, {user_pos});')
 
-    first_default = 1 if is_method else 0
+    first_default = 0
     splat_slot = -1
     if splat:
         splat_name = _pos[-1].name
         splat_slot = next(i for i, (n, _, _) in enumerate(slots) if n == splat_name)
     for i, (name, tpl, dflt) in enumerate(slots):
         src = "slots[%d]" % i
-        if i < first_default:
+        if i == self_idx:
             out.append(f"        PyObject* r_{i} = {src};")
             out.append(f"        (void)r_{i};")
         elif dflt is not None:

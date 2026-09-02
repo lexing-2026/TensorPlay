@@ -3,7 +3,7 @@
 import math
 import os
 import warnings
-from typing import Optional
+from typing import Any, Optional
 
 import tensorplay
 import tensorplay._C as _C
@@ -96,6 +96,12 @@ def linear(input: Tensor, weight: Tensor, bias: Optional[Tensor] = None) -> Tens
     if captured is not None:
         return captured
 
+    distributed = _distributed_tensor_types()
+    if distributed is not None and any(
+        isinstance(value, distributed[0]) for value in (input, weight, bias)
+    ):
+        return _distributed_linear(input, weight, bias, distributed[0])
+
     # _matmul_impl checks this again later, but the native flatten path does
     # not work on scalar inputs, so try to catch this here already
     input_dim = input.dim()
@@ -110,6 +116,52 @@ def linear(input: Tensor, weight: Tensor, bias: Optional[Tensor] = None) -> Tens
     # raw as_strided weight.t(), bias folded into the epilogue / seed);
     # other backends fall through to the recordable matmul/add composite.
     return tensorplay.linear(input, weight, bias)
+
+
+def _distributed_tensor_types() -> tuple[type, type] | None:
+    try:
+        from tensorplay.distributed.tensor import DTensor
+    except (ImportError, AttributeError):
+        return None
+    return DTensor, Tensor
+
+
+def _distributed_linear(input: Any, weight: Any, bias: Any, dtensor_type: type) -> Any:
+    from tensorplay.distributed.tensor import DTensor, Partial, Shard
+
+    input_dtensor = input if isinstance(input, dtensor_type) else None
+    weight_dtensor = weight if isinstance(weight, dtensor_type) else None
+    bias_value = bias.to_local() if isinstance(bias, dtensor_type) else bias
+    input_value = input.to_local() if input_dtensor is not None else input
+    weight_value = weight.to_local() if weight_dtensor is not None else weight
+    result = tensorplay.linear(input_value, weight_value, bias_value)
+
+    template = input_dtensor or weight_dtensor
+    if template is None:
+        return result
+    placements = list(template.placements)
+    if weight_dtensor is not None:
+        for index, placement in enumerate(weight_dtensor.placements):
+            if isinstance(placement, Shard) and placement.dim == 0:
+                placements[index] = Shard(-1)
+            elif isinstance(placement, Shard) and placement.dim == 1:
+                placements[index] = Partial("sum")
+    elif input_dtensor is not None:
+        for index, placement in enumerate(input_dtensor.placements):
+            if isinstance(placement, Shard) and placement.dim == input_dtensor.ndim - 1:
+                placements[index] = Partial("sum")
+    shape = tuple(input_value.shape[:-1]) + (int(weight.shape[0]),)
+    stride = [1] * len(shape)
+    for index in range(len(shape) - 2, -1, -1):
+        stride[index] = stride[index + 1] * int(shape[index + 1])
+    return DTensor.from_local(
+        result,
+        template.device_mesh,
+        placements,
+        shape=shape,
+        stride=tuple(stride),
+        run_check=False,
+    )
 
 
 def bilinear(input1, input2, weight, bias=None):
@@ -209,6 +261,47 @@ def embedding(input, weight, padding_idx=None, max_norm=None, norm_type=2.0, sca
     captured = _capture_call(embedding, (input, weight, padding_idx, max_norm, norm_type, scale_grad_by_freq, sparse), {})
     if captured is not None:
         return captured
+    try:
+        from tensorplay.distributed.tensor import DTensor, Shard
+    except (ImportError, AttributeError):
+        DTensor = ()
+        Shard = ()
+    if DTensor and (isinstance(input, DTensor) or isinstance(weight, DTensor)):
+        input_dtensor = input if isinstance(input, DTensor) else None
+        weight_dtensor = weight if isinstance(weight, DTensor) else None
+        input_value = input.to_local() if input_dtensor is not None else input
+        weight_value = weight.to_local() if weight_dtensor is not None else weight
+        if max_norm is not None:
+            raise NotImplementedError("embedding: max_norm is not supported")
+        if padding_idx is None:
+            normalized_padding_idx = -1
+        else:
+            if padding_idx < -weight.size(0) or padding_idx >= weight.size(0):
+                raise AssertionError("Padding_idx must be within num_embeddings")
+            normalized_padding_idx = padding_idx + weight.size(0) if padding_idx < 0 else padding_idx
+        result = _C.embedding(
+            weight_value,
+            input_value,
+            normalized_padding_idx,
+            scale_grad_by_freq,
+            sparse,
+        )
+        template = weight_dtensor or input_dtensor
+        placements = list(template.placements)
+        if input_dtensor is not None and weight_dtensor is None:
+            placements = list(input_dtensor.placements)
+        shape = tuple(input.shape) + (int(weight.shape[1]),)
+        stride = [1] * len(shape)
+        for index in range(len(shape) - 2, -1, -1):
+            stride[index] = stride[index + 1] * int(shape[index + 1])
+        return DTensor.from_local(
+            result,
+            template.device_mesh,
+            placements,
+            shape=shape,
+            stride=tuple(stride),
+            run_check=False,
+        )
     if max_norm is not None:
         raise NotImplementedError('embedding: max_norm is not supported')
     if padding_idx is None:
@@ -861,6 +954,103 @@ def celu(input: Tensor, alpha: float = 1.0, inplace: bool = False) -> Tensor:
     return input.copy_(out) if inplace else out
 
 
+threshold_ = _add_docstr(
+    _C.threshold_,
+    r"""
+threshold_(input, threshold, value) -> Tensor
+
+In-place version of :func:`~threshold`.
+""",
+)
+
+relu_ = _add_docstr(
+    _C.relu_,
+    r"""
+relu_(input) -> Tensor
+
+In-place version of :func:`~relu`.
+""",
+)
+
+hardtanh_ = _add_docstr(
+    _C.hardtanh_,
+    r"""
+hardtanh_(input, min_val=-1., max_val=1.) -> Tensor
+
+In-place version of :func:`~hardtanh`.
+""",
+)
+
+elu_ = _add_docstr(
+    _C.elu_,
+    r"""
+elu_(input, alpha=1.) -> Tensor
+
+In-place version of :func:`~elu`.
+""",
+)
+
+selu_ = _add_docstr(
+    _C.selu_,
+    r"""
+selu_(input) -> Tensor
+
+In-place version of :func:`~selu`.
+""",
+)
+
+celu_ = _add_docstr(
+    _C.celu_,
+    r"""
+celu_(input, alpha=1.) -> Tensor
+
+In-place version of :func:`~celu`.
+""",
+)
+
+leaky_relu_ = _add_docstr(
+    _C.leaky_relu_,
+    r"""
+leaky_relu_(input, negative_slope=0.01) -> Tensor
+
+In-place version of :func:`~leaky_relu`.
+""",
+)
+
+
+def lstm_cell(input, hx, cx, w_ih, w_hh, b_ih=None, b_hh=None):
+    r"""lstm_cell(input, hx, cx, w_ih, w_hh, b_ih=None, b_hh=None) -> (Tensor, Tensor)
+
+    One time step of a long short-term memory cell. Returns the next
+    hidden state and next cell state.
+    """
+    return _C.lstm_cell(input, hx, cx, w_ih, w_hh, b_ih, b_hh)
+
+
+def rnn_relu_cell(input, hx, w_ih, w_hh, b_ih=None, b_hh=None):
+    r"""rnn_relu_cell(input, hx, w_ih, w_hh, b_ih=None, b_hh=None) -> Tensor
+
+    One time step of an Elman RNN cell with ReLU nonlinearity.
+    """
+    return _C.rnn_relu_cell(input, hx, w_ih, w_hh, b_ih, b_hh)
+
+
+def rnn_tanh_cell(input, hx, w_ih, w_hh, b_ih=None, b_hh=None):
+    r"""rnn_tanh_cell(input, hx, w_ih, w_hh, b_ih=None, b_hh=None) -> Tensor
+
+    One time step of an Elman RNN cell with tanh nonlinearity.
+    """
+    return _C.rnn_tanh_cell(input, hx, w_ih, w_hh, b_ih, b_hh)
+
+
+def gru_cell(input, hx, w_ih, w_hh, b_ih=None, b_hh=None):
+    r"""gru_cell(input, hx, w_ih, w_hh, b_ih=None, b_hh=None) -> Tensor
+
+    One time step of a gated recurrent unit cell.
+    """
+    return _C.gru_cell(input, hx, w_ih, w_hh, b_ih, b_hh)
+
+
 def glu(input: Tensor, dim: int = -1) -> Tensor:
     r"""glu(input, dim=-1) -> Tensor
 
@@ -901,8 +1091,6 @@ def interpolate(
     captured = _capture_call(interpolate, (input, size, scale_factor, mode, align_corners, recompute_scale_factor, antialias), {})
     if captured is not None:
         return captured
-    if antialias:
-        raise NotImplementedError("interpolate: antialias=True is not supported")
     if size is None and scale_factor is None:
         raise ValueError("need to define size or scale_factor")
     if size is not None and scale_factor is not None:
@@ -947,18 +1135,28 @@ def interpolate(
     if mode == 'linear':
         if ndim != 3:
             raise ValueError("linear interpolation expects 3D input")
+        if antialias:
+            raise NotImplementedError("interpolate: antialias is not supported with mode='linear'")
         return tensorplay.upsample_linear1d(input, list(size), align_corners)
     elif mode == 'bilinear':
         if ndim != 4:
             raise ValueError("bilinear interpolation expects 4D input")
+        if antialias:
+            size_ = [size] * 2 if isinstance(size, int) else list(size)
+            return _C._upsample_bilinear2d_aa(input, size_, align_corners, None)
         return tensorplay.upsample_bilinear2d(input, list(size), align_corners)
     elif mode == 'bicubic':
         if ndim != 4:
             raise ValueError("bicubic interpolation expects 4D input")
+        if antialias:
+            size_ = [size] * 2 if isinstance(size, int) else list(size)
+            return _C._upsample_bicubic2d_aa(input, size_, align_corners, None)
         return tensorplay.upsample_bicubic2d(input, list(size), align_corners)
     elif mode == 'trilinear':
         if ndim != 5:
             raise ValueError("trilinear interpolation expects 5D input")
+        if antialias:
+            raise NotImplementedError("interpolate: antialias is not supported with mode='trilinear'")
         return tensorplay.upsample_trilinear3d(input, list(size), align_corners)
     raise NotImplementedError(f"interpolate: mode '{mode}' is not supported")
 
@@ -990,79 +1188,274 @@ def multi_head_attention_forward(
     average_attn_weights: bool = True,
     is_causal: bool = False,
 ):
-    r"""
+    r"""multi_head_attention_forward(query, key, value, embed_dim_to_check,
+    num_heads, in_proj_weight, in_proj_bias=None, bias_k=None, bias_v=None,
+    add_zero_attn=False, dropout_p=0.0, out_proj_weight=None,
+    out_proj_bias=None, training=True, key_padding_mask=None,
+    need_weights=True, attn_mask=None, use_separate_proj_weight=False,
+    q_proj_weight=None, k_proj_weight=None, v_proj_weight=None,
+    static_k=None, static_v=None, average_attn_weights=True,
+    is_causal=False) -> (Tensor, Optional[Tensor])
 
-    Follows the structure of
-    _scaled_dot_product_attention paths composed from dispatched primitives.
+    Computes multi-head attention on (L, N, E) inputs (2D unbatched inputs are
+    promoted internally and the batch dim is squeezed on return). Returns the
+    projected output of shape (L, N, E) and, when ``need_weights`` is true,
+    the attention weights of shape (N, L, S) — or (num_heads, L, S) with
+    ``average_attn_weights=False``.
     """
+    # Unbatched inputs carry a temporary batch dim; outputs squeeze it back.
+    if query.dim() == 3:
+        is_batched = True
+        if key_padding_mask is not None and key_padding_mask.dim() > 2:
+            raise AssertionError(
+                "key_padding_mask must be 1D or 2D for batched input")
+        if attn_mask is not None and attn_mask.dim() not in (2, 3):
+            raise AssertionError(
+                f"attn_mask must be 2D or 3D for batched input, got {attn_mask.dim()}D")
+    elif query.dim() == 2:
+        is_batched = False
+        if key_padding_mask is not None and key_padding_mask.dim() != 1:
+            raise AssertionError(
+                "key_padding_mask must be 1D for unbatched input")
+        if attn_mask is not None and attn_mask.dim() != 2:
+            raise AssertionError(
+                f"attn_mask must be 2D for unbatched input, got {attn_mask.dim()}D")
+        query = query.unsqueeze(1)
+        key = key.unsqueeze(1)
+        value = value.unsqueeze(1)
+        if key_padding_mask is not None:
+            key_padding_mask = key_padding_mask.unsqueeze(0)
+    else:
+        raise AssertionError(
+            f"query has to be 2d or 3d, but got {query.dim()}d")
+
     tgt_len, bsz, embed_dim = query.shape
     src_len = key.shape[0]
     head_dim = embed_dim // num_heads
-    scaling = float(head_dim) ** -0.5
+    if head_dim * num_heads != embed_dim:
+        raise AssertionError(
+            f"embed_dim {embed_dim} not divisible by num_heads {num_heads}")
 
     if use_separate_proj_weight:
-        q = tensorplay.linear(query, q_proj_weight)
-        k = tensorplay.linear(key, k_proj_weight)
-        v = tensorplay.linear(value, v_proj_weight)
+        if key.shape[:2] != value.shape[:2]:
+            raise AssertionError(
+                f"key's sequence and batch dims {tuple(key.shape[:2])} do not "
+                f"match value's {tuple(value.shape[:2])}")
+    elif key.shape != value.shape:
+        raise AssertionError(
+            f"key shape {tuple(key.shape)} does not match value shape {tuple(value.shape)}")
+
+    # Bool masks become additive float masks so they can merge by addition.
+    key_padding_mask = _canonical_mask(
+        mask=key_padding_mask,
+        mask_name="key_padding_mask",
+        other_type=_none_or_dtype(attn_mask),
+        other_name="attn_mask",
+        target_type=query.dtype,
+    )
+
+    if is_causal and attn_mask is None:
+        raise RuntimeError(
+            "Need attn_mask if specifying the is_causal hint. "
+            "You may use the Transformer module method "
+            "`generate_square_subsequent_mask` to create this mask.")
+
+    if is_causal and key_padding_mask is None and not need_weights:
+        # No mask fusion needed: pass the is_causal hint straight to SDPA.
+        attn_mask = None
     else:
-        qkv = tensorplay.linear(
-            tensorplay.cat([query, key, value], dim=0),
-            in_proj_weight,
-            in_proj_bias,
+        attn_mask = _canonical_mask(
+            mask=attn_mask,
+            mask_name="attn_mask",
+            other_type=None,
+            other_name="",
+            target_type=query.dtype,
+            check_other=False,
         )
-        q, k, v = qkv[:tgt_len], qkv[tgt_len:tgt_len + src_len], qkv[tgt_len + src_len:]
+        if key_padding_mask is not None:
+            # The merged mask is no longer causal.
+            is_causal = False
 
-    q = q * scaling
-    q = q.contiguous().view(tgt_len, bsz * num_heads, head_dim).transpose(0, 1)
-    k = k.contiguous().view(-1, bsz * num_heads, head_dim).transpose(0, 1)
-    v = v.contiguous().view(-1, bsz * num_heads, head_dim).transpose(0, 1)
+    # compute in-projection
+    if not use_separate_proj_weight:
+        if in_proj_weight is None:
+            raise AssertionError(
+                "use_separate_proj_weight is False but in_proj_weight is None")
+        q, k, v = _in_projection_packed(query, key, value, in_proj_weight, in_proj_bias)
+    else:
+        if q_proj_weight is None:
+            raise AssertionError(
+                "use_separate_proj_weight is True but q_proj_weight is None")
+        if k_proj_weight is None:
+            raise AssertionError(
+                "use_separate_proj_weight is True but k_proj_weight is None")
+        if v_proj_weight is None:
+            raise AssertionError(
+                "use_separate_proj_weight is True but v_proj_weight is None")
+        if in_proj_bias is None:
+            b_q = b_k = b_v = None
+        else:
+            b_q, b_k, b_v = tensorplay.chunk(in_proj_bias, 3)
+        q, k, v = _in_projection(
+            query, key, value, q_proj_weight, k_proj_weight, v_proj_weight,
+            b_q, b_k, b_v,
+        )
 
-    src_len_b = src_len
-    if add_zero_attn:
-        zero = tensorplay.zeros(k.shape[0], 1, k.shape[2], dtype=k.dtype, device=k.device)
-        k = tensorplay.cat([k, zero], dim=1)
-        v = tensorplay.cat([v, zero], dim=1)
-        src_len_b += 1
-
-    q4 = q.reshape(bsz, num_heads, tgt_len, head_dim)
-    k4 = k.reshape(bsz, num_heads, src_len_b, head_dim)
-    v4 = v.reshape(bsz, num_heads, src_len_b, head_dim)
-    attn_output_weights = q4 @ k4.transpose(-2, -1)
-
+    # prep attention mask: promote a 2D mask to 3D (broadcast over batch).
     if attn_mask is not None:
         if attn_mask.dim() == 2:
+            correct_2d_size = (tgt_len, src_len)
+            if tuple(attn_mask.shape) != correct_2d_size:
+                raise RuntimeError(
+                    f"The shape of the 2D attn_mask is {tuple(attn_mask.shape)}, "
+                    f"but should be {correct_2d_size}.")
             attn_mask = attn_mask.unsqueeze(0)
-        if attn_mask.dtype == tensorplay.bool:
-            zeros = tensorplay.zeros_like(attn_mask, dtype=q.dtype)
-            ones = tensorplay.ones_like(zeros)
-            attn_mask = tensorplay.where(attn_mask, zeros - ones, zeros)
-        attn_output_weights = attn_output_weights + attn_mask.to(q.dtype).reshape(1, 1, *attn_mask.shape[-2:])
+        elif attn_mask.dim() == 3:
+            correct_3d_size = (bsz * num_heads, tgt_len, src_len)
+            if tuple(attn_mask.shape) != correct_3d_size:
+                raise RuntimeError(
+                    f"The shape of the 3D attn_mask is {tuple(attn_mask.shape)}, "
+                    f"but should be {correct_3d_size}.")
+        else:
+            raise RuntimeError(
+                f"attn_mask's dimension {attn_mask.dim()} is not supported")
 
+    # extra bias heads join the key/value sequences (dim 0, pre-reshape).
+    if bias_k is not None and bias_v is not None:
+        if static_k is not None:
+            raise AssertionError("bias cannot be added to static key.")
+        if static_v is not None:
+            raise AssertionError("bias cannot be added to static value.")
+        k = tensorplay.cat([k, bias_k.repeat(1, bsz, 1)])
+        v = tensorplay.cat([v, bias_v.repeat(1, bsz, 1)])
+        if attn_mask is not None:
+            attn_mask = pad(attn_mask, (0, 1))
+        if key_padding_mask is not None:
+            key_padding_mask = pad(key_padding_mask, (0, 1))
+    else:
+        if bias_k is not None:
+            raise AssertionError("bias_k is set but bias_v is None")
+        if bias_v is not None:
+            raise AssertionError("bias_v is set but bias_k is None")
+
+    # reshape to heads-first (num_heads folded into the batch dim)
+    q = q.reshape(tgt_len, bsz * num_heads, head_dim).transpose(0, 1)
+    if static_k is None:
+        k = k.reshape(k.shape[0], bsz * num_heads, head_dim).transpose(0, 1)
+    else:
+        if static_k.shape[0] != bsz * num_heads:
+            raise AssertionError(
+                f"expecting static_k.size(0) of {bsz * num_heads}, "
+                f"but got {static_k.shape[0]}")
+        if static_k.shape[2] != head_dim:
+            raise AssertionError(
+                f"expecting static_k.size(2) of {head_dim}, but got {static_k.shape[2]}")
+        k = static_k
+    if static_v is None:
+        v = v.reshape(v.shape[0], bsz * num_heads, head_dim).transpose(0, 1)
+    else:
+        if static_v.shape[0] != bsz * num_heads:
+            raise AssertionError(
+                f"expecting static_v.size(0) of {bsz * num_heads}, "
+                f"but got {static_v.shape[0]}")
+        if static_v.shape[2] != head_dim:
+            raise AssertionError(
+                f"expecting static_v.size(2) of {head_dim}, but got {static_v.shape[2]}")
+        v = static_v
+
+    # extra zero key/value joined along the (heads-first) sequence dim.
+    if add_zero_attn:
+        zero_attn_shape = (bsz * num_heads, 1, head_dim)
+        k = tensorplay.cat(
+            [k, tensorplay.zeros(zero_attn_shape, dtype=k.dtype, device=k.device)],
+            dim=1,
+        )
+        v = tensorplay.cat(
+            [v, tensorplay.zeros(zero_attn_shape, dtype=v.dtype, device=v.device)],
+            dim=1,
+        )
+        if attn_mask is not None:
+            attn_mask = pad(attn_mask, (0, 1))
+        if key_padding_mask is not None:
+            key_padding_mask = pad(key_padding_mask, (0, 1))
+
+    src_len = k.shape[1]
+
+    # merge key padding into the attention mask (broadcast over query heads)
     if key_padding_mask is not None:
-        if key_padding_mask.dtype == tensorplay.bool:
-            zeros = tensorplay.zeros_like(key_padding_mask, dtype=q.dtype)
-            ones = tensorplay.ones_like(zeros)
-            key_padding_mask = tensorplay.where(key_padding_mask, zeros - ones, zeros)
-        kp = key_padding_mask.transpose(0, 1).reshape(1, bsz, 1, src_len).to(q.dtype)
-        attn_output_weights = attn_output_weights + kp
+        if key_padding_mask.shape[0] != bsz:
+            raise AssertionError(
+                f"Expected key_padded_mask.shape[0] to be {bsz}, "
+                f"but got {key_padding_mask.shape[0]}")
+        if key_padding_mask.shape[1] != src_len:
+            raise AssertionError(
+                f"Expected key_padded_mask.shape[1] to be {src_len}, "
+                f"but got {key_padding_mask.shape[1]}")
+        key_padding_mask = (
+            key_padding_mask.reshape(bsz, 1, 1, src_len)
+            .expand(-1, num_heads, -1, -1)
+            .reshape(bsz * num_heads, 1, src_len)
+        )
+        if attn_mask is None:
+            attn_mask = key_padding_mask
+        else:
+            attn_mask = attn_mask + key_padding_mask
 
-    attn_output_weights = tensorplay.softmax(attn_output_weights, dim=-1)
-
-    if dropout_p > 0.0 and training:
-        keep = (tensorplay.rand(attn_output_weights.shape) >= dropout_p).to(attn_output_weights.dtype)
-        attn_output_weights = attn_output_weights * keep / (1.0 - dropout_p)
-
-    attn_output = (attn_output_weights @ v4).reshape(bsz * num_heads, tgt_len, head_dim)
-    attn_output = attn_output.transpose(0, 1).contiguous().view(tgt_len * bsz, embed_dim)
-    attn_output = tensorplay.linear(attn_output, out_proj_weight, out_proj_bias)
-    attn_output = attn_output.view(tgt_len, bsz, attn_output.size(1))
+    if not training:
+        dropout_p = 0.0
 
     if need_weights:
-        aw = attn_output_weights.view(bsz, num_heads, tgt_len, src_len_b)
+        E = q.shape[2]
+        q_scaled = q * math.sqrt(1.0 / float(E))
+
+        if is_causal and attn_mask is None:
+            raise AssertionError("FIXME: is_causal not implemented for need_weights")
+
+        if attn_mask is not None:
+            attn_output_weights = tensorplay.baddbmm(
+                attn_mask.to(q_scaled.dtype), q_scaled, k.transpose(-2, -1)
+            )
+        else:
+            attn_output_weights = tensorplay.bmm(q_scaled, k.transpose(-2, -1))
+        attn_output_weights = softmax(attn_output_weights, dim=-1)
+        if dropout_p > 0.0:
+            attn_output_weights = dropout(attn_output_weights, p=dropout_p)
+
+        attn_output = tensorplay.bmm(attn_output_weights, v)
+        attn_output = attn_output.transpose(0, 1).reshape(tgt_len * bsz, embed_dim)
+        attn_output = linear(attn_output, out_proj_weight, out_proj_bias)
+        attn_output = attn_output.reshape(tgt_len, bsz, attn_output.shape[1])
+
+        attn_output_weights = attn_output_weights.reshape(bsz, num_heads, tgt_len, src_len)
         if average_attn_weights:
-            aw = aw.mean(dim=1)
-        return attn_output, aw
-    return attn_output, None
+            attn_output_weights = attn_output_weights.mean(dim=1)
+
+        if not is_batched:
+            attn_output = attn_output.squeeze(1)
+            attn_output_weights = attn_output_weights.squeeze(0)
+        return attn_output, attn_output_weights
+    else:
+        # (1, L, S) masks broadcast per batch; (N*num_heads, L, S) fold to 4D.
+        if attn_mask is not None:
+            if attn_mask.shape[0] == 1 and attn_mask.dim() == 3:
+                attn_mask = attn_mask.unsqueeze(0)
+            else:
+                attn_mask = attn_mask.reshape(bsz, num_heads, -1, src_len)
+
+        q = q.reshape(bsz, num_heads, tgt_len, head_dim)
+        k = k.reshape(bsz, num_heads, src_len, head_dim)
+        v = v.reshape(bsz, num_heads, src_len, head_dim)
+
+        attn_output = scaled_dot_product_attention(
+            q, k, v, attn_mask, dropout_p, is_causal
+        )
+        attn_output = attn_output.permute(2, 0, 1, 3).reshape(bsz * tgt_len, embed_dim)
+
+        attn_output = linear(attn_output, out_proj_weight, out_proj_bias)
+        attn_output = attn_output.reshape(tgt_len, bsz, attn_output.shape[1])
+        if not is_batched:
+            attn_output = attn_output.squeeze(1)
+        return attn_output, None
 
 
 # -----------------------------------------------------------------------------
@@ -2902,35 +3295,66 @@ def scaled_dot_product_attention(
         \text{Attention}(Q, K, V) = \text{softmax}(\frac{Q K^T}{\sqrt{E}}) V
 
     Args:
-        backend (str, optional): ``'flash'`` | ``'mem_efficient'`` |
+        backend (str, optional): ``'flash'`` | ``'mem_efficient'``,
             ``'math'``, or ``None`` to pick automatically. ``'flash'``
-            selects the fused flash-attention kernel (impl=1), ``'math'``
-            forces the composed reference path; ``'mem_efficient'``,
-            this build.
+            selects the fused flash-attention kernel, ``'math'`` forces the
+            composed reference path. When ``None``, the routing candidate
+            order is governed by :func:`tensorplay.nn.attention.sdpa_kernel`.
     """
+    from tensorplay.nn import attention as _sdpa_attention
+
     if attn_mask is not None and is_causal:
         raise AssertionError("Explicit attn_mask should not be set when is_causal=True")
     if backend not in (None, "math", "flash", "mem_efficient"):
         raise ValueError(
             f"scaled_dot_product_attention: unknown backend '{backend}'; "
             "expected 'flash', 'mem_efficient', 'math' or None")
-    if backend == "mem_efficient":
-        raise NotImplementedError(
-            "scaled_dot_product_attention: the mem_efficient backend requires "
-            "native memory-efficient attention kernels, which are not yet "
-            "available in this build.")
 
-    if backend == "flash":
-        if dropout_p != 0.0:
+    allowed = _sdpa_attention._cur_sdpa_kernel_backends(with_priority=True)
+    full_set = {
+        _sdpa_attention.SDPBackend.MATH,
+        _sdpa_attention.SDPBackend.FLASH_ATTENTION,
+        _sdpa_attention.SDPBackend.EFFICIENT_ATTENTION,
+    }
+    params = _sdpa_attention.SDPParams(
+        query=query, key=key, value=value, attn_mask=attn_mask,
+        dropout=dropout_p, is_causal=is_causal, need_attn_weights=False,
+    )
+
+    if backend is not None:
+        _name_to_backend = {
+            "math": _sdpa_attention.SDPBackend.MATH,
+            "flash": _sdpa_attention.SDPBackend.FLASH_ATTENTION,
+            "mem_efficient": _sdpa_attention.SDPBackend.EFFICIENT_ATTENTION,
+        }
+        requested = _name_to_backend[backend]
+        if allowed != full_set and requested not in allowed:
+            raise RuntimeError(
+                f"scaled_dot_product_attention: backend '{backend}' is "
+                f"disabled by the active sdpa_kernel context")
+        if backend == "flash":
+            return tensorplay.scaled_dot_product_attention(
+                query, key, value, is_causal=is_causal, impl=1)
+        if backend == "mem_efficient":
             raise NotImplementedError(
-                "scaled_dot_product_attention: the flash backend does not support dropout")
-        return tensorplay.scaled_dot_product_attention(query, key, value, is_causal=is_causal, impl=1)
-
-    # Auto-routing: only the plain case hits the fused native kernel; every
-    # other combination (and an explicit 'math' request) uses the reference
-    # composition below.
-    if backend is None and scale is None and attn_mask is None and dropout_p == 0.0:
-        return tensorplay.scaled_dot_product_attention(query, key, value, is_causal=is_causal)
+                "scaled_dot_product_attention: the mem_efficient backend requires "
+                "native memory-efficient attention kernels, which are not yet "
+                "available in this build.")
+    else:
+        _plain_case = scale is None and attn_mask is None and dropout_p == 0.0
+        for candidate in allowed:
+            if candidate == _sdpa_attention.SDPBackend.FLASH_ATTENTION:
+                if _plain_case and _sdpa_attention.can_use_flash_attention(params):
+                    return tensorplay.scaled_dot_product_attention(
+                        query, key, value, is_causal=is_causal)
+                _sdpa_attention._raise_kernel_warnings(params)
+            elif candidate == _sdpa_attention.SDPBackend.MATH:
+                break
+        else:
+            raise RuntimeError(
+                "No available kernel for scaled_dot_product_attention; "
+                "the active sdpa_kernel context allows none of the "
+                "installed backends for these inputs")
 
     L, S = query.size(-2), key.size(-2)
     scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale

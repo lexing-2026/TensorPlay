@@ -112,7 +112,9 @@ def _gen_autograd_nodes(ctx: CodegenContext) -> None:
 @register_generator("TPXOps")
 def _gen_tpx_ops(ctx: CodegenContext) -> None:
     from .gen_tpx import generate_tpx_ops_cpp, generate_tpx_ops_h
-    ctx.write("TPXOpsGenerated.h", generate_tpx_ops_h(ctx.funcs))
+    ctx.write("TPXOpsGenerated.h",
+              generate_tpx_ops_h(ctx.funcs, autocast_ops=ctx.autocast_ops,
+                                 derivatives=ctx.derivatives))
     ctx.write("TPXOpsGenerated.cpp",
               generate_tpx_ops_cpp(ctx.funcs, autocast_ops=ctx.autocast_ops,
                                    derivatives=ctx.derivatives))
