@@ -86,9 +86,27 @@ enum class ScalarType : int8_t {
     BComplex32,
     Float8_e4m3fn,
     Float8_e5m2,
+    // Affine-quantized storage types.  Each holds an integer code
+    // (int8_t / uint8_t / int32_t) and carries its affine parameters in the
+    // tensor's quantizer metadata; see Quantizer.h.
+    QInt8,
+    QUInt8,
+    QInt32,
     Undefined,
     NumOptions
 };
+
+inline bool isQuantizedType(ScalarType t) {
+    return t == ScalarType::QInt8 || t == ScalarType::QUInt8 ||
+           t == ScalarType::QInt32;
+}
+
+// Storage code type backing a quantized dtype: the bytes are interpreted
+// exactly as the underlying integer type, the dtype tag only changes how
+// affine parameters are resolved and how the tensor presents itself.
+inline bool isQuantizedSigned(ScalarType t) {
+    return t == ScalarType::QInt8;
+}
 
 inline bool isIntegralType(ScalarType t, bool includeBool = false) {
     bool isIntegral = (t == ScalarType::UInt8 || t == ScalarType::Int8 ||
@@ -125,6 +143,8 @@ inline bool isSignedType(ScalarType t) {
         case ScalarType::Int16:
         case ScalarType::Int32:
         case ScalarType::Int64:
+        case ScalarType::QInt8:
+        case ScalarType::QInt32:
         case ScalarType::Float16:
         case ScalarType::BFloat16:
         case ScalarType::Float32:
@@ -136,6 +156,16 @@ inline bool isSignedType(ScalarType t) {
             return true;
         default:
             return false;
+    }
+}
+
+// Underlying integer storage type holding a quantized value's code.
+inline ScalarType toUnderlyingStorageType(ScalarType t) {
+    switch (t) {
+        case ScalarType::QInt8: return ScalarType::Int8;
+        case ScalarType::QUInt8: return ScalarType::UInt8;
+        case ScalarType::QInt32: return ScalarType::Int32;
+        default: return t;
     }
 }
 
@@ -239,6 +269,9 @@ inline const char* toString(ScalarType t) {
         TP_TOSTRING_CASE(ComplexFloat, "ComplexFloat")
         TP_TOSTRING_CASE(ComplexDouble, "ComplexDouble")
         TP_TOSTRING_CASE(BComplex32, "BComplex32")
+        TP_TOSTRING_CASE(QInt8, "QInt8")
+        TP_TOSTRING_CASE(QUInt8, "QUInt8")
+        TP_TOSTRING_CASE(QInt32, "QInt32")
         case ScalarType::Undefined:
             return "Undefined";
         default:
@@ -248,6 +281,17 @@ inline const char* toString(ScalarType t) {
 }
 
 inline size_t elementSize(ScalarType t) {
+    // Quantized dtypes have no C++ storage type of their own in the
+    // forall list; their element sizes mirror the underlying integer code.
+    switch (t) {
+        case ScalarType::QInt8:
+        case ScalarType::QUInt8:
+            return 1;
+        case ScalarType::QInt32:
+            return 4;
+        default:
+            break;
+    }
 #define CASE_ELEMENTSIZE(ctype, name) \
     case ScalarType::name:            \
         return sizeof(ctype);

@@ -37,9 +37,7 @@ using namespace api::utils;
  *    the tensor would be {NC_aligned/4, H, W, 4}
  */
 Tensor nchw_to_nc4hw(const Tensor& src) {
-  TP_CHECK(
-      src.dtype() == DType::Float32,
-      "Vulkan NC4HW staging supports Float32 tensors only");
+  const size_t itemsize = src.itemsize();
 
   const int64_t N = get_dim<Dim4D::Batch>(src.shape());
   const int64_t C = get_dim<Dim4D::Channel>(src.shape());
@@ -51,18 +49,21 @@ Tensor nchw_to_nc4hw(const Tensor& src) {
 
   Tensor out(
       {NC4, H, W, 4}, src.dtype(), Device(DeviceType::CPU));
-  float* out_ptr = out.data_ptr<float>();
-  std::memset(out_ptr, 0, out.numel() * sizeof(float));
+  uint8_t* out_ptr = static_cast<uint8_t*>(out.impl()->storage().data());
+  std::memset(out_ptr, 0, out.numel() * itemsize);
 
-  const float* in_ptr = src.data_ptr<float>();
+  const uint8_t* in_ptr =
+      static_cast<const uint8_t*>(src.impl()->storage().data());
   for (int64_t n = 0; n < N; ++n) {
     for (int64_t c = 0; c < C; ++c) {
       const int64_t z = n * (C_aligned / 4) + c / 4;
       const int64_t c_idx = c % 4;
       for (int64_t h = 0; h < H; ++h) {
         for (int64_t w = 0; w < W; ++w) {
-          out_ptr[((z * H + h) * W + w) * 4 + c_idx] =
-              in_ptr[((n * C + c) * H + h) * W + w];
+          std::memcpy(
+              out_ptr + (((z * H + h) * W + w) * 4 + c_idx) * itemsize,
+              in_ptr + (((n * C + c) * H + h) * W + w) * itemsize,
+              itemsize);
         }
       }
     }
@@ -105,9 +106,7 @@ Tensor create_staging_tensor(const api::vTensor& v_in) {
  * restore the properties of the original tensor.
  */
 Tensor nc4hw_to_nchw(const Tensor& t_in, IntArrayRef sizes) {
-  TP_CHECK(
-      t_in.dtype() == DType::Float32,
-      "Vulkan NC4HW staging supports Float32 tensors only");
+  const size_t itemsize = t_in.itemsize();
 
   const int64_t N = get_dim<Dim4D::Batch>(sizes);
   const int64_t C = get_dim<Dim4D::Channel>(sizes);
@@ -117,8 +116,9 @@ Tensor nc4hw_to_nchw(const Tensor& t_in, IntArrayRef sizes) {
   const int64_t C_aligned = api::utils::align_up(C, 4u);
 
   Tensor out({N, C, H, W}, t_in.dtype(), Device(DeviceType::CPU));
-  float* out_ptr = out.data_ptr<float>();
-  const float* in_ptr = t_in.data_ptr<float>();
+  uint8_t* out_ptr = static_cast<uint8_t*>(out.impl()->storage().data());
+  const uint8_t* in_ptr =
+      static_cast<const uint8_t*>(t_in.impl()->storage().data());
 
   for (int64_t n = 0; n < N; ++n) {
     for (int64_t c = 0; c < C; ++c) {
@@ -126,8 +126,10 @@ Tensor nc4hw_to_nchw(const Tensor& t_in, IntArrayRef sizes) {
       const int64_t c_idx = c % 4;
       for (int64_t h = 0; h < H; ++h) {
         for (int64_t w = 0; w < W; ++w) {
-          out_ptr[((n * C + c) * H + h) * W + w] =
-              in_ptr[((z * H + h) * W + w) * 4 + c_idx];
+          std::memcpy(
+              out_ptr + (((n * C + c) * H + h) * W + w) * itemsize,
+              in_ptr + (((z * H + h) * W + w) * 4 + c_idx) * itemsize,
+              itemsize);
         }
       }
     }
@@ -261,6 +263,47 @@ bool pack_vtensor_to_staging(
         pipeline_barrier,
         fence_handle);
   }
+}
+
+void copy_staging_to_vtensor(
+    api::StorageBuffer& staging,
+    api::vTensor& v_dst) {
+  api::Context* const context = api::context();
+
+  if (v_dst.storage_type() == api::StorageType::BUFFER) {
+    api::PipelineBarrier pipeline_barrier{};
+    context->submit_copy<api::VulkanBuffer, api::VulkanBuffer>(
+        pipeline_barrier,
+        staging.buffer(),
+        v_dst.buffer(
+            pipeline_barrier,
+            api::PipelineStage::TRANSFER,
+            api::MemoryAccessType::WRITE),
+        {static_cast<uint32_t>(staging.buffer().mem_size()), 0u, 0u},
+        {0u, 0u, 0u},
+        {0u, 0u, 0u},
+        VK_NULL_HANDLE);
+  } else {
+    api::PipelineBarrier pipeline_barrier{};
+    copy_buffer_to_vtensor(staging.buffer(), v_dst, pipeline_barrier);
+  }
+}
+
+void upload_host_bytes(
+    api::vTensor& v_dst,
+    const void* bytes,
+    const size_t nbytes) {
+  api::Context* const context = api::context();
+
+  api::StorageBuffer staging(context, v_dst.texture_dtype(), v_dst.gpu_numel());
+  {
+    api::MemoryMap mapping(staging.buffer(), api::MemoryAccessType::WRITE);
+    mapping.invalidate();
+
+    memcpy(mapping.data<void>(), bytes, nbytes);
+  }
+
+  copy_staging_to_vtensor(staging, v_dst);
 }
 
 } // namespace utils

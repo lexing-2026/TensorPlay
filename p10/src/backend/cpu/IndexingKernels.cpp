@@ -1,7 +1,4 @@
-// Tier-1 hot indexing/masking/scan operators.
-//
-//     index_select/index_add/index_put/nonzero/take)
-//     logcumsumexp)
+// High-throughput indexing, masking, scan, and sorting operators.
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "Scalar.h"
@@ -44,19 +41,14 @@ inline void outer_inner(const std::vector<int64_t>& shape, int64_t dim,
 // ---------------------------------------------------------------------------
 // masked_fill / masked_fill_
 //
-// masked_fill_impl_cpu requires a strictly boolean mask (line 2463) and fills
-// through a TensorIterator over {output=self, input=mask}. The out-of-place
-// variant (line 2525) is expand_outplace(mask, self) followed by
-// result.clone() and an in-place fill on the clone.
+// Masks are broadcast to the input shape. The out-of-place operation copies
+// the input before applying the selected value to matching elements.
 // ---------------------------------------------------------------------------
 
 Tensor masked_fill_cpu(const Tensor& self, const Tensor& mask, Scalar value) {
-    // TensorAdvancedIndexing.cpp:2463-2467
     if (mask.dtype() != DType::Bool) {
         TP_THROW(TypeError, "masked_fill only supports boolean masks");
     }
-    // expand_outplace(mask, self); result = self.clone(); result.masked_fill_(...)
-    // (TensorAdvancedIndexing.cpp:2525-2533)
     std::vector<int64_t> out_shape = broadcast_shapes(
         static_cast<std::vector<int64_t>>(self.shape()),
         static_cast<std::vector<int64_t>>(mask.shape()));
@@ -84,14 +76,12 @@ Tensor masked_fill_cpu(const Tensor& self, const Tensor& mask, Scalar value) {
 }
 
 Tensor& masked_fill__cpu(Tensor& self, const Tensor& mask, Scalar value) {
-    // TensorAdvancedIndexing.cpp:2490 masked_fill__cpu
     Tensor r = masked_fill_cpu(self, mask, value);
     self.copy_(r);
     return self;
 }
 
 Tensor& masked_fill_tensor__cpu(Tensor& self, const Tensor& mask, const Tensor& value) {
-    // TensorAdvancedIndexing.cpp:2498-2509: value must be 0-dim, filled via .item()
     if (value.dim() != 0) {
         TP_THROW(RuntimeError,
                  "masked_fill_ only supports a 0-dimensional value tensor, but got tensor with ",
@@ -204,8 +194,8 @@ Tensor cumsum_cpu(const Tensor& self, int64_t dim, std::optional<DType> dtype) {
     int64_t nd = self.dim();
     if (nd == 0) TP_THROW(RuntimeError, "cumsum: dimension not supported for scalar tensors");
     dim = wrap_dim(dim, nd);
-    DType out_dtype = dtype.value_or(self.dtype() == DType::Bool ? DType::Int64
-                                                                 : self.dtype());
+    DType out_dtype = dtype.value_or(isIntegralType(self.dtype(), true) ? DType::Int64
+                                                                         : self.dtype());
     Tensor src = (self.dtype() == out_dtype) ? self.contiguous() : self.to(out_dtype).contiguous();
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(src.shape()), out_dtype, src.device());
     int64_t d_size = src.size(dim);
@@ -243,7 +233,8 @@ Tensor cumprod_cpu(const Tensor& self, int64_t dim, std::optional<DType> dtype) 
     int64_t nd = self.dim();
     if (nd == 0) TP_THROW(RuntimeError, "cumprod: dimension not supported for scalar tensors");
     dim = wrap_dim(dim, nd);
-    DType out_dtype = dtype.value_or(self.dtype());
+    DType out_dtype = dtype.value_or(isIntegralType(self.dtype(), true) ? DType::Int64
+                                                                         : self.dtype());
     Tensor src = (self.dtype() == out_dtype) ? self.contiguous() : self.to(out_dtype).contiguous();
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(src.shape()), out_dtype, src.device());
     int64_t d_size = src.size(dim);
@@ -276,8 +267,8 @@ Tensor cumprod_cpu(const Tensor& self, int64_t dim, std::optional<DType> dtype) 
 }
 
 Tensor logcumsumexp_cpu(const Tensor& self, int64_t dim, std::optional<DType> dtype) {
-    // ReduceOpsKernel.cpp:118 logcumsumexp_cpu_kernel:
-    //   m = max(x, acc); result = m + log1p(exp(-|x - acc|))
+    // Stable recurrence: m = max(x, acc), then
+    // result = m + log1p(exp(-|x - acc|)).
     int64_t nd = self.dim();
     if (nd == 0) TP_THROW(RuntimeError, "logcumsumexp: dimension not supported for scalar tensors");
     dim = wrap_dim(dim, nd);
@@ -321,8 +312,8 @@ Tensor logcumsumexp_cpu(const Tensor& self, int64_t dim, std::optional<DType> dt
 // ---------------------------------------------------------------------------
 // gather
 //
-// Backward reference: gather_backward (line 2118) = new_zeros +
-// scatter_add_(dim, index, grad).
+// The backward result is initialized to zero and accumulates each gradient
+// into the indexed locations.
 // ---------------------------------------------------------------------------
 
 Tensor gather_cpu(const Tensor& self, int64_t dim, const Tensor& index) {
@@ -380,10 +371,9 @@ Tensor gather_cpu(const Tensor& self, int64_t dim, const Tensor& index) {
 // ---------------------------------------------------------------------------
 // scatter / scatter_add
 //
-//   cuda/ScatterGatherKernel.cu:98 _scatter_gather_elementwise_kernel;
-//   accumulation uses atomicAdd on CUDA (nondeterminism noted at :588).
-//   CPU equivalent loops limited_vector slices in
-//   cpu/ScatterGatherKernel.cpp (scatter_gather_basekernel).
+// The CPU implementation updates one indexed slice at a time. The optional
+// accumulation mode is intentionally serialized because duplicate indices
+// must have deterministic update order.
 // ---------------------------------------------------------------------------
 
 enum class ScatterMode { Assign, Add };
@@ -424,7 +414,7 @@ Tensor scatter_base_cpu(const Tensor& self, int64_t dim, const Tensor& index,
     int64_t idx_dim_size = idx_c.size(dim);
     int64_t total_idx = idx_c.numel();
     int64_t self_dim_size = self.size(dim);
-    // TensorIterator): one destination element per index element,
+    // One destination element is produced for every index element:
     // out[oo][idx_value][t] <- src[oo][j][t].
 #define TP_SCATTER_CASE(ctype, name) \
     case DType::name: { \
@@ -471,9 +461,9 @@ Tensor scatter_value_cpu(const Tensor& self, int64_t dim, const Tensor& index, S
     return scatter_base_cpu(self, dim, index, full, ScatterMode::Assign);
 }
 
-// Tensor.scatter_add_): same scatter, written directly into self instead of a
-// clone.  Kept as a sibling of the out-of-place base rather than folded into
-// it so the existing dispatch path stays untouched.
+// The in-place variant writes directly into self instead of using a clone.
+// It remains a sibling of the out-of-place path so their dispatch behavior is
+// independent.
 static Tensor& scatter_base_inplace_cpu(Tensor& self, int64_t dim, const Tensor& index,
                                         const Tensor& src, ScatterMode mode) {
     int64_t nd = self.dim();
@@ -584,14 +574,30 @@ Tensor index_select_cpu(const Tensor& self, int64_t dim, const Tensor& index) {
     case DType::name: { \
         const ctype* s = self_c.data_ptr<ctype>(); \
         ctype* d = result.data_ptr<ctype>(); \
-        parallel_for(0, outer * n_idx, GRAIN_SIZE, [&](int64_t b, int64_t e) { \
-            for (int64_t t = b; t < e; ++t) { \
-                int64_t o = t / n_idx, k = t % n_idx; \
-                int64_t iv = ip[k]; if (iv < 0) iv += row; \
-                if (iv < 0 || iv >= row) TP_THROW(IndexError, "index_select: index out of range"); \
-                std::memcpy(d + static_cast<int64_t>(t) * inner, s + (o * row + iv) * inner, inner * sizeof(ctype)); \
-            } \
-        }); \
+        if (inner == 1) { \
+            const int64_t batch_grain = std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(n_idx, 1)); \
+            parallel_for(0, outer, batch_grain, [&](int64_t ob, int64_t oe) { \
+                for (int64_t o = ob; o < oe; ++o) { \
+                    const ctype* src_row = s + o * row; \
+                    ctype* dst_row = d + o * n_idx; \
+                    for (int64_t k = 0; k < n_idx; ++k) { \
+                        int64_t iv = ip[k]; if (iv < 0) iv += row; \
+                        if (iv < 0 || iv >= row) TP_THROW(IndexError, "index_select: index out of range"); \
+                        dst_row[k] = src_row[iv]; \
+                    } \
+                } \
+            }); \
+        } else { \
+            const int64_t slice_grain = std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(inner, 1)); \
+            parallel_for(0, outer * n_idx, slice_grain, [&](int64_t b, int64_t e) { \
+                for (int64_t t = b; t < e; ++t) { \
+                    int64_t o = t / n_idx, k = t % n_idx; \
+                    int64_t iv = ip[k]; if (iv < 0) iv += row; \
+                    if (iv < 0 || iv >= row) TP_THROW(IndexError, "index_select: index out of range"); \
+                    std::memcpy(d + static_cast<int64_t>(t) * inner, s + (o * row + iv) * inner, inner * sizeof(ctype)); \
+                } \
+            }); \
+        } \
         break; \
     }
     switch (self.dtype()) {
@@ -605,8 +611,7 @@ Tensor index_select_cpu(const Tensor& self, int64_t dim, const Tensor& index) {
 // ---------------------------------------------------------------------------
 // index_add
 //
-// index_add_cpu_out -> index_add_cpu_ (line 1250 dispatches index types and
-// adds each source slice into self along dim).
+// Adds each source slice into self along the selected dimension.
 // ---------------------------------------------------------------------------
 
 Tensor index_add_cpu(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& source) {
@@ -654,8 +659,7 @@ Tensor index_add_cpu(const Tensor& self, int64_t dim, const Tensor& index, const
 // ---------------------------------------------------------------------------
 // index_copy / index_fill
 //
-// :277 index_copy_cpu (both run through TensorIterator with an index
-// lookup per slice).
+// Each selected slice is written into the output.
 // ---------------------------------------------------------------------------
 
 Tensor index_copy_cpu(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& source) {
@@ -846,7 +850,7 @@ Tensor nonzero_cpu(const Tensor& self) {
 // sort / argsort
 //
 // Sort along dim while carrying original positions.  NaN ordering follows
-// the framework-wide convention: NaN sorts after every non-NaN value in
+// the project convention: NaN sorts after every non-NaN value in
 // ascending order (and before them in descending order); ties keep their
 // original relative order.  The (value, index) lexicographic comparator is a
 // strict weak ordering even with NaN lanes, so plain std::sort is both
@@ -987,23 +991,16 @@ Tensor searchsorted_cpu(const Tensor& sorted_sequence, const Tensor& self, bool 
 }
 
 Tensor bucketize_cpu(const Tensor& self, const Tensor& boundaries, bool out_int32, bool right) {
-    // Bucketization.cpp bucketize_cpu delegates to searchsorted with
-    // (boundaries, values) swapped.
+    // Boundaries form the lookup table and self supplies the query values.
     return searchsorted_cpu(boundaries, self, out_int32, right);
 }
 
 // ---------------------------------------------------------------------------
 // bincount
 //
-// :24 _bincount_cpu_template. Rules mirrored here:
-//   - minlength must be >= 0 (:25)
-//   - empty 1-D input returns zeros({minlength}, Long) (:29)
-//   - inputs are 1-D non-negative integral; nbins = max(max+1, minlength)
-//     (:34-49)
-//   - weights must be 1-D with same length as input (:41-44)
-//   - weighted output dtype = weights dtype when Float32, otherwise the
-//     weights are cast to Double and Double is returned (:89-93); unweighted
-//     output is always Long (:73).
+// Inputs are one-dimensional non-negative integers. The number of bins is the
+// larger of minlength and one more than the largest input value. Weighted
+// accumulation keeps float32 weights in float32 and widens other weights.
 // ---------------------------------------------------------------------------
 
 Tensor bincount_cpu(const Tensor& self, const std::optional<Tensor>& weights_opt, int64_t minlength) {
@@ -1043,7 +1040,6 @@ Tensor bincount_cpu(const Tensor& self, const std::optional<Tensor>& weights_opt
     int64_t nbins = std::max(max_v + 1, minlength);
     if (has_weights) {
         if (weights.dtype() == DType::Float32) {
-            // SummaryOps.cpp:90-91 template<float>
             Tensor w = weights.contiguous();
             Tensor rf = Tensor::zeros({nbins}, DType::Float32, self.device());
             const float* wp = w.data_ptr<float>();
@@ -1051,7 +1047,6 @@ Tensor bincount_cpu(const Tensor& self, const std::optional<Tensor>& weights_opt
             for (int64_t i = 0; i < self_size; ++i) rp[ip[i]] += wp[i];
             return rf;
         }
-        // SummaryOps.cpp:92-93: weights.to(kDouble) and Double output
         Tensor w = weights.to(DType::Float64).contiguous();
         Tensor rf = Tensor::zeros({nbins}, DType::Float64, self.device());
         const double* wp = w.data_ptr<double>();
@@ -1329,11 +1324,9 @@ TENSORPLAY_LIBRARY_IMPL(CPU, IndexingKernels) {
 
 
 // ---------------------------------------------------------------------------
-// scatter_impl + scatter_reduce_exclude_self_helper (:2133) and Indexing.cu
-// index_reduce_func_cuda_impl (:1320). reduce ∈ {sum, prod, mean, amin,
-// amax}. With include_self=False only the indexed slices are reset to the
-// never touched by index keep their original self values. The backward
-// scatter_reduce_backward / index_reduce_backward.
+// Reduction modes are sum, product, mean, minimum, and maximum. With
+// include_self=false only indexed slices are reset to the reduction identity;
+// untouched positions keep their original values.
 //
 // Accumulation is deliberately serial: duplicate indices are the point of
 // this op, so a data-parallel RMW over flats would race on collisions (the
@@ -1465,8 +1458,8 @@ Tensor sr_reduce_forward(const Tensor& self, int64_t dim, const Tensor& index,
 
     Tensor result = detail::contiguous_clone(self);
     if (!include_self && total_idx > 0 && result.numel() > 0) {
-        // scatter_reduce_exclude_self_helper: reset indexed slices to the
-        // op identity (idempotent writes, so flat order does not matter).
+        // Reset indexed slices to the operation identity. These writes are
+        // idempotent, so their flat traversal order does not matter.
         const int64_t self_inner = [&] {
             int64_t v = 1;
             for (int64_t i = dim + 1; i < nd; ++i) v *= self.size(i);
@@ -1717,7 +1710,7 @@ Tensor scatter_reduce_backward_self_cpu(const Tensor& grad, const Tensor& self,
                                         bool include_self) {
     const SrReduce op = parse_sr_reduce(reduce);
     if (op == SrReduce::Sum) {
-        // FunctionsManual: grad_self = grad
+        // The input gradient starts as a copy of the incoming gradient.
         if (!include_self) return grad.scatter(dim, index, Scalar(0));
         return grad;
     }
@@ -1776,9 +1769,8 @@ Tensor scatter_reduce_backward_src_cpu(const Tensor& grad, const Tensor& self,
         Tensor n_dist = self_is_result.scatter_add(dim, index, src_is_result);
         Tensor distributed = grad.div(n_dist);
         Tensor out = src_is_result.mul(distributed.gather(dim, index));
-        // FunctionsManual applies the !include_self zeroing to grad_self
-        // only; grad_src always receives gradient (src is accumulated even
-        // when self is excluded).
+        // Excluding self only changes the input gradient; source gradients
+        // still receive the accumulated contribution.
         return out;
     }
     Tensor masked_self = self.masked_fill(self.eq(0), 1.0);
@@ -1807,8 +1799,8 @@ Tensor index_reduce_backward_self_cpu(const Tensor& grad, const Tensor& self,
                                       const Tensor& source,
                                       const std::string& reduce,
                                       bool include_self) {
-    // FunctionsManual index_reduce_backward: like the scatter variant but
-    // all reads use vector-index ops (index_select/index_add/index_fill).
+    // This backward path uses indexed reads and writes for each reduced
+    // slice.
     const SrReduce op = parse_sr_reduce(reduce);
     if (op == SrReduce::Sum) {
         if (!include_self) return grad.index_fill(dim, index, Scalar(0));
@@ -1838,7 +1830,7 @@ Tensor index_reduce_backward_self_cpu(const Tensor& grad, const Tensor& self,
         if (!include_self) out = out.index_fill(dim, index, Scalar(0.0));
         return out;
     }
-    // prod
+    // product
     Tensor masked_self = self.masked_fill(self.eq(0), 1.0);
     Tensor masked_result = index_reduce_cpu(masked_self, dim, index, source,
                                             reduce, include_self);

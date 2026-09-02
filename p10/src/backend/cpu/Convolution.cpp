@@ -75,6 +75,13 @@ std::tuple<Tensor, Tensor, Tensor> convolution_backward_cpu(
     const convolution::GradRequest want = convolution::decode_mask(output_mask);
     if (want.bias) convolution::check_bias_sizes(bias_sizes, grad_output.size(1));
 
+    // The autograd engine may hand down a broadcast view of the output
+    // gradient (e.g. the expand() a sum-backward produces).  The rank-
+    // specialized backward kernels index grad_output with contiguous
+    // NCHW strides, so normalize the layout once here.
+    const Tensor grad_out = grad_output.is_contiguous()
+                                ? grad_output : grad_output.contiguous();
+
     // Slots the caller did not ask for stay undefined; that is the signal the
     // autograd engine reads for "no gradient flows to this input".
     Tensor grad_input;
@@ -90,22 +97,22 @@ std::tuple<Tensor, Tensor, Tensor> convolution_backward_cpu(
 
     if (!transposed) {
         switch (k) {
-            case 1: TP_CONV_BACKWARD_CASE(conv1d, grad_output, input, weight, stride,
+            case 1: TP_CONV_BACKWARD_CASE(conv1d, grad_out, input, weight, stride,
                                           padding, dilation, groups); break;
-            case 2: TP_CONV_BACKWARD_CASE(conv2d, grad_output, input, weight, stride,
+            case 2: TP_CONV_BACKWARD_CASE(conv2d, grad_out, input, weight, stride,
                                           padding, dilation, groups); break;
-            default: TP_CONV_BACKWARD_CASE(conv3d, grad_output, input, weight, stride,
+            default: TP_CONV_BACKWARD_CASE(conv3d, grad_out, input, weight, stride,
                                            padding, dilation, groups); break;
         }
     } else {
         switch (k) {
-            case 1: TP_CONV_BACKWARD_CASE(conv_transpose1d, grad_output, input, weight,
+            case 1: TP_CONV_BACKWARD_CASE(conv_transpose1d, grad_out, input, weight,
                                           stride, padding, output_padding, groups,
                                           dilation); break;
-            case 2: TP_CONV_BACKWARD_CASE(conv_transpose2d, grad_output, input, weight,
+            case 2: TP_CONV_BACKWARD_CASE(conv_transpose2d, grad_out, input, weight,
                                           stride, padding, output_padding, groups,
                                           dilation); break;
-            default: TP_CONV_BACKWARD_CASE(conv_transpose3d, grad_output, input, weight,
+            default: TP_CONV_BACKWARD_CASE(conv_transpose3d, grad_out, input, weight,
                                            stride, padding, output_padding, groups,
                                            dilation); break;
         }

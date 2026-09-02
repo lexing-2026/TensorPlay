@@ -6,6 +6,7 @@
 //
 // The CPU and CUDA copies of this file are textually identical apart from
 // namespace and library key; no device-specific kernel code lives here.
+#include <algorithm>
 #include <optional>
 #include <string>
 
@@ -486,6 +487,89 @@ Tensor& i0_inplace_kernel(Tensor& self) {
     return self;
 }
 
+Tensor& pow_scalar_inplace_kernel(Tensor& self, Scalar exponent) {
+    NoGradGuard __tp_nograd;
+    self.copy_(self.pow(exponent));
+    return self;
+}
+
+Tensor& pow_tensor_inplace_kernel(Tensor& self, const Tensor& exponent) {
+    NoGradGuard __tp_nograd;
+    self.copy_(self.pow(exponent));
+    return self;
+}
+
+Tensor& float_power_scalar_inplace_kernel(Tensor& self, Scalar exponent) {
+    NoGradGuard __tp_nograd;
+    self.copy_(self.float_power(exponent));
+    return self;
+}
+
+Tensor& float_power_tensor_inplace_kernel(Tensor& self, const Tensor& exponent) {
+    NoGradGuard __tp_nograd;
+    self.copy_(self.float_power(exponent));
+    return self;
+}
+
+// Writes the main diagonal (positions k * sum-of-strides from the storage
+// start) and, when wrap is set on a tall 2-D matrix, the continuation
+// positions past the column edge.  Raw strided writes: the diagonal of a
+// row-major matrix is never contiguous, so a linear fill would corrupt the
+// layout.
+Tensor& fill_diagonal__kernel(Tensor& self, Scalar fill_value, bool wrap) {
+    NoGradGuard __tp_nograd;
+    const int64_t n_dims = self.dim();
+    if (n_dims < 2) {
+        TP_THROW(ValueError, "fill_diagonal_ expects a tensor with at least 2 dimensions");
+    }
+    const int64_t height = self.size(0);
+    const int64_t width = self.size(1);
+    if (n_dims > 2) {
+        for (int64_t i = 1; i < n_dims; ++i) {
+            if (self.size(i) != height) {
+                TP_THROW(ValueError, "all dimensions of input must be of equal length");
+            }
+        }
+    }
+    const auto strides = self.strides();
+    int64_t diag_stride = 0;
+    for (int64_t i = 0; i < n_dims; ++i) {
+        diag_stride += strides[i];
+    }
+    const int64_t base = static_cast<int64_t>(
+        self.unsafeGetTensorImpl()->storage_offset());
+    const int64_t diag_size = std::min(height, width);
+
+    auto fill_run = [&](int64_t start, int64_t count) {
+        #define TP_FILL_DIAG_CASE(ctype, name) \
+        case DType::name: { \
+            ctype* data = self.data_ptr<ctype>(); \
+            const ctype val = fill_value.to<ctype>(); \
+            int64_t off = start; \
+            for (int64_t k = 0; k < count; ++k, off += diag_stride) { \
+                data[off] = val; \
+            } \
+            break; \
+        }
+        switch (self.dtype()) {
+            TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_FILL_DIAG_CASE)
+            default:
+                TP_THROW(NotImplementedError,
+                         "fill_diagonal_ not implemented for this dtype");
+        }
+        #undef TP_FILL_DIAG_CASE
+    };
+
+    fill_run(base, diag_size);
+    if (wrap && n_dims == 2 && height > width + 1) {
+        const int64_t step = width + 1;
+        const int64_t wrap_count =
+            (self.numel() + step - 1) / step - diag_size;
+        fill_run(base + self.stride(0) * step, wrap_count);
+    }
+    return self;
+}
+
 } // namespace
 
 TENSORPLAY_LIBRARY_IMPL(CPU, InplaceCompletionKernels) {
@@ -566,6 +650,11 @@ TENSORPLAY_LIBRARY_IMPL(CPU, InplaceCompletionKernels) {
     m.impl("trunc_", trunc_inplace_kernel);
     m.impl("threshold_", threshold_inplace_kernel);
     m.impl("i0_", i0_inplace_kernel);
+    m.impl("pow_.Scalar", pow_scalar_inplace_kernel);
+    m.impl("pow_.Tensor", pow_tensor_inplace_kernel);
+    m.impl("float_power_.Scalar", float_power_scalar_inplace_kernel);
+    m.impl("float_power_.Tensor", float_power_tensor_inplace_kernel);
+    m.impl("fill_diagonal_", fill_diagonal__kernel);
 }
 
 } // namespace cpu

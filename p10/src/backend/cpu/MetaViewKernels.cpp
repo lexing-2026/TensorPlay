@@ -54,6 +54,12 @@ Tensor as_strided_cpu(const Tensor& self,
     Tensor out(impl->storage(), size, stride, impl->dtype(),
                static_cast<size_t>(offset));
     out.unsafeGetTensorImpl()->share_version_counter(*impl);
+    // as_strided underlies every view op (transpose/squeeze/unsqueeze/
+    // permute/reshape...): a quantized source's quantizer rides along since
+    // the view aliases the same codes and mapping.
+    if (impl->has_quantizer()) {
+        out.unsafeGetTensorImpl()->set_quantizer(impl->quantizer());
+    }
     return out;
 }
 

@@ -341,16 +341,6 @@ __global__ void binary_same_shape_vectorized_kernel(
     }
 }
 
-inline int arith_device_sms() {
-    static int sms = []() {
-        int dev = 0, count = 0;
-        cudaGetDevice(&dev);
-        cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, dev);
-        return count > 0 ? count : 1;
-    }();
-    return sms;
-}
-
 template <typename T, typename Op>
 inline bool launch_binary_vec(
     int64_t n, const Tensor& a, const Tensor& b, Tensor& y,
@@ -363,11 +353,12 @@ inline bool launch_binary_vec(
     if ((reinterpret_cast<uintptr_t>(pa) | reinterpret_cast<uintptr_t>(pb) |
          reinterpret_cast<uintptr_t>(py)) & align_mask) return false;
 
-    dim3 block(128);
+    // One block per block-work-size chunk (no occupancy cap): the kernel is
+    // memory-bound and fully provisioned blocks schedule in a single wave.
+    dim3 block(256);
     const int64_t vec_n = n / kVec;
     const int64_t want = (vec_n + block.x - 1) / block.x;
-    const int64_t cap = static_cast<int64_t>(arith_device_sms()) * 4;
-    dim3 grid(static_cast<unsigned>(want < 1 ? 1 : (want > cap ? cap : want)));
+    dim3 grid(static_cast<unsigned>(want < 1 ? 1 : want));
     binary_same_shape_vectorized_kernel<T, kVec, Op><<<grid, block, 0, stream>>>(
         n, pa, pb, py, alpha, op);
     return true;
@@ -393,6 +384,183 @@ inline bool try_binary_vectorized(
         case DType::Int32: return launch_binary_vec<int>(n, a, b, y, alpha.to<int>(), op, stream);
         case DType::Int64: return launch_binary_vec<int64_t>(n, a, b, y, alpha.to<int64_t>(), op, stream);
         default: return false;
+    }
+}
+
+// --- Row-segment broadcast fast path ---
+//
+// Tensor broadcasting only ever stretches size-1 dimensions, so inside any
+// (outer, inner) row of the contiguous output each operand address is its
+// row base plus a fixed per-column stride.  The rank-sized coordinate
+// decomposition therefore runs once per row instead of once per element, and
+// the inner walk stays unit-stride across the warp.  Rows are distributed
+// over blockIdx.y (with a grid-stride walk when rows exceed the y-limit).
+
+template <typename T, typename Op>
+__global__ void binary_row_broadcast_kernel(
+    int64_t inner, int64_t rows,
+    const T* __restrict__ a, TensorDesc a_desc,
+    const T* __restrict__ b, TensorDesc b_desc,
+    T* __restrict__ y, TensorDesc y_desc, typename BinaryOpMath<T>::type alpha,
+    Op op) {
+    using M = typename BinaryOpMath<T>::type;
+    const int64_t col0 = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (col0 >= inner) return;
+    const int64_t a_col_stride = a_desc.strides[a_desc.ndim - 1];
+    const int64_t b_col_stride = b_desc.strides[b_desc.ndim - 1];
+    for (int64_t row = blockIdx.y; row < rows; row += gridDim.y) {
+        const int64_t row_lin = row * inner;
+        const int64_t a_base = get_offset(row_lin, a_desc, y_desc);
+        const int64_t b_base = get_offset(row_lin, b_desc, y_desc);
+        for (int64_t col = col0; col < inner;
+             col += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+            y[row_lin + col] = static_cast<T>(op(
+                static_cast<M>(a[a_base + col * a_col_stride]),
+                static_cast<M>(b[b_base + col * b_col_stride]),
+                static_cast<M>(alpha)));
+        }
+    }
+}
+
+// Vectorized variant: each thread owns one vec4 group of columns of one row,
+// so stores issue as single wide transactions and the row-base offsets are
+// computed once per row.  The operand with a unit column stride is loaded as
+// one vec4 (its row base stays aligned whenever every outer stride is a
+// multiple of the vector width); a size-1 innermost dim is a row-constant
+// splat loaded once.  The other operand is read per column with scalar
+// loads, which coalesce across the warp regardless of its column stride.
+template <typename T, int VecSize, typename Op>
+__global__ void binary_row_broadcast_vec_kernel(
+    int64_t inner, int64_t rows,
+    const T* __restrict__ a, TensorDesc a_desc,
+    const T* __restrict__ b, TensorDesc b_desc,
+    T* __restrict__ y, TensorDesc y_desc, typename BinaryOpMath<T>::type alpha,
+    Op op) {
+    using M = typename BinaryOpMath<T>::type;
+    const int64_t vec_inner = inner / VecSize;
+    const int64_t col0 = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (col0 >= vec_inner) return;
+    const int64_t a_col_stride = a_desc.strides[a_desc.ndim - 1];
+    const int64_t b_col_stride = b_desc.strides[b_desc.ndim - 1];
+    const bool b_unit = b_col_stride == 1;
+    const bool b_splat = b_col_stride == 0;
+    for (int64_t row = blockIdx.y; row < rows; row += gridDim.y) {
+        const int64_t row_lin = row * inner;
+        const int64_t a_base = get_offset(row_lin, a_desc, y_desc);
+        const int64_t b_base = get_offset(row_lin, b_desc, y_desc);
+        M bv[VecSize];
+        if (b_splat) {
+            const M b0 = static_cast<M>(b[b_base]);
+#pragma unroll
+            for (int v = 0; v < VecSize; ++v) bv[v] = b0;
+        } else if (b_unit) {
+            const TPVecPack<T, VecSize> pb =
+                *reinterpret_cast<const TPVecPack<T, VecSize>*>(b + b_base + col0 * VecSize);
+#pragma unroll
+            for (int v = 0; v < VecSize; ++v) bv[v] = static_cast<M>(pb.v[v]);
+        }
+        TPVecPack<T, VecSize> po;
+#pragma unroll
+        for (int v = 0; v < VecSize; ++v) {
+            const int64_t col = col0 * VecSize + v;
+            const M bval = (b_unit || b_splat) ? bv[v]
+                                               : static_cast<M>(b[b_base + col * b_col_stride]);
+            po.v[v] = static_cast<T>(op(
+                static_cast<M>(a[a_base + col * a_col_stride]),
+                bval, static_cast<M>(alpha)));
+        }
+        *reinterpret_cast<TPVecPack<T, VecSize>*>(y + row_lin + col0 * VecSize) = po;
+    }
+}
+
+// Returns true when the row-segment kernel handled the op.  Eligibility:
+// contiguous output and operands whose dimensions are all full-length or 1
+// (the broadcasting contract), with the output rank <= 1 or an inner row the
+// threads can sweep.  Falls back to the generic per-element kernel otherwise.
+template <typename T, typename Op>
+inline bool try_binary_row_broadcast(
+    int64_t n, const Tensor& a, const Tensor& b, Tensor& y,
+    typename BinaryOpMath<T>::type alpha, Op op, cudaStream_t stream) {
+    if (n == 0) return true;
+    if (!y.is_contiguous()) return false;
+    const int64_t inner = y.dim() > 0 ? y.size(y.dim() - 1) : 1;
+    if (inner <= 0 || n % inner != 0) return false;
+    const int64_t rows = n / inner;
+    if (y.dim() > CUDA_BROADCAST_MAX_DIMS || a.dim() > static_cast<int>(y.dim()) ||
+        b.dim() > static_cast<int>(y.dim())) {
+        return false;
+    }
+    const TensorDesc y_desc = make_desc(y, static_cast<size_t>(y.dim()));
+    const TensorDesc a_desc = make_desc(a, static_cast<size_t>(y.dim()));
+    const TensorDesc b_desc = make_desc(b, static_cast<size_t>(y.dim()));
+
+    // A thread block handles a contiguous vec4 group of columns of one row,
+    // so each lane touches a quarter of the addresses a scalar lane would.
+    // threads_x covers the row's vector groups; gridDim.y walks rows with a
+    // grid-stride loop when they exceed the y-limit.
+    constexpr int kVec = 4;
+    const int64_t b_col_stride = b_desc.strides[b_desc.ndim - 1];
+    bool b_vec_ok = true;
+    if (b_col_stride == 1) {
+        // The vec4 b load spans columns [col0*4, col0*4+4) of one row, so the
+        // row base must stay 4-element aligned for every row coordinate:
+        // each contributing outer stride has to be a multiple of 4.
+        for (int d = 0; d < b_desc.ndim - 1; ++d) {
+            if (b_desc.sizes[d] != 1 && b_desc.strides[d] % kVec != 0) {
+                b_vec_ok = false;
+                break;
+            }
+        }
+    }
+    if (inner % kVec == 0 && b_vec_ok &&
+        (reinterpret_cast<uintptr_t>(b.data_ptr<T>()) & (sizeof(T) * kVec - 1)) == 0 &&
+        (reinterpret_cast<uintptr_t>(y.data_ptr<T>()) & (sizeof(T) * kVec - 1)) == 0) {
+        const int64_t vec_inner = inner / kVec;
+        constexpr int threads_x = 128;
+        const int64_t blocks_x = (vec_inner + threads_x - 1) / threads_x;
+        // Enough blocks to fill the device several times over; rows beyond the
+        // y-limit are picked up by the grid-stride walk.
+        int64_t blocks_y = (rows + 1) / 2;
+        if (blocks_y < 1) blocks_y = 1;
+        if (blocks_y > 65535) blocks_y = 65535;
+        dim3 grid(static_cast<unsigned>(blocks_x < 1 ? 1 : blocks_x),
+                  static_cast<unsigned>(blocks_y));
+        binary_row_broadcast_vec_kernel<T, kVec, Op><<<grid, threads_x, 0, stream>>>(
+            inner, rows, a.data_ptr<T>(), a_desc, b.data_ptr<T>(), b_desc,
+            y.data_ptr<T>(), y_desc, alpha, op);
+        return true;
+    }
+
+    dim3 block(256);
+    dim3 grid(static_cast<unsigned>((inner + block.x - 1) / block.x),
+              static_cast<unsigned>(rows < 65535 ? rows : 65535));
+    binary_row_broadcast_kernel<T, Op><<<grid, block, 0, stream>>>(
+        inner, rows, a.data_ptr<T>(), a_desc, b.data_ptr<T>(), b_desc,
+        y.data_ptr<T>(), y_desc, alpha, op);
+    return true;
+}
+
+// Dtype fan-out for the row-segment broadcast kernel (binary add/sub/mul/div
+// share one functor contract: (x, y, alpha)).
+template <typename Op>
+inline bool try_row_broadcast(int64_t n, const Tensor& a, const Tensor& b,
+                              Tensor& y, const Scalar& alpha, Op op) {
+    const auto stream = getCurrentCUDAStream().stream();
+    switch (y.dtype()) {
+        case DType::Float32:
+            return try_binary_row_broadcast<float>(n, a, b, y, alpha.to<float>(), op, stream);
+        case DType::Float64:
+            return try_binary_row_broadcast<double>(n, a, b, y, alpha.to<double>(), op, stream);
+        case DType::Float16:
+            return try_binary_row_broadcast<tensorplay::Half>(n, a, b, y, alpha.to<float>(), op, stream);
+        case DType::BFloat16:
+            return try_binary_row_broadcast<tensorplay::BFloat16>(n, a, b, y, alpha.to<float>(), op, stream);
+        case DType::Int32:
+            return try_binary_row_broadcast<int>(n, a, b, y, alpha.to<int>(), op, stream);
+        case DType::Int64:
+            return try_binary_row_broadcast<int64_t>(n, a, b, y, alpha.to<int64_t>(), op, stream);
+        default:
+            return false;
     }
 }
 
@@ -429,6 +597,10 @@ bool try_add_out_direct(const Tensor& self, const Tensor& other, Scalar alpha,
     Tensor b = (other.dtype() == result_dtype) ? other : other.to(result_dtype);
 
     if (try_binary_vectorized(n, a, b, out, alpha, BinaryAddVecOp{})) {
+        CUDA_CHECK(cudaGetLastError());
+        return true;
+    }
+    if (try_row_broadcast(n, a, b, out, alpha, BinaryAddVecOp{})) {
         CUDA_CHECK(cudaGetLastError());
         return true;
     }
@@ -550,6 +722,10 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
     Tensor b = (other.dtype() == result_dtype) ? other : other.to(result_dtype);
 
     if (try_binary_vectorized(n, a, b, result, alpha, BinaryAddVecOp{})) {
+        CUDA_CHECK(cudaGetLastError());
+        return result;
+    }
+    if (try_row_broadcast(n, a, b, result, alpha, BinaryAddVecOp{})) {
         CUDA_CHECK(cudaGetLastError());
         return result;
     }
@@ -726,6 +902,10 @@ Tensor& add_inplace_kernel(Tensor& self, const Tensor& other, Scalar alpha) {
     if (try_binary_vectorized(n, self, b, self, alpha, BinaryAddVecOp{})) {
         return self;
     }
+    if (try_row_broadcast(n, self, b, self, alpha, BinaryAddVecOp{})) {
+        CUDA_CHECK(cudaGetLastError());
+        return self;
+    }
 
     dim3 grid, block; get_grid_block(n, grid, block);
 
@@ -783,6 +963,10 @@ Tensor sub_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
         CUDA_CHECK(cudaGetLastError());
         return result;
     }
+    if (try_row_broadcast(n, a, b, result, alpha, BinarySubVecOp{})) {
+        CUDA_CHECK(cudaGetLastError());
+        return result;
+    }
 
     TensorDesc a_desc = make_desc(a, out_shape.size());
     TensorDesc b_desc = make_desc(b, out_shape.size());
@@ -828,6 +1012,10 @@ Tensor& sub_inplace_kernel(Tensor& self, const Tensor& other, Scalar alpha) {
     Tensor b = (other.dtype() == self.dtype()) ? other : other.to(self.dtype());
 
     if (try_binary_vectorized(n, self, b, self, alpha, BinarySubVecOp{})) {
+        return self;
+    }
+    if (try_row_broadcast(n, self, b, self, alpha, BinarySubVecOp{})) {
+        CUDA_CHECK(cudaGetLastError());
         return self;
     }
 
@@ -887,6 +1075,10 @@ Tensor mul_kernel(const Tensor& self, const Tensor& other) {
         CUDA_CHECK(cudaGetLastError());
         return result;
     }
+    if (try_row_broadcast(n, a, b, result, Scalar(1), BinaryMulVecOp{})) {
+        CUDA_CHECK(cudaGetLastError());
+        return result;
+    }
 
     TensorDesc a_desc = make_desc(a, out_shape.size());
     TensorDesc b_desc = make_desc(b, out_shape.size());
@@ -930,6 +1122,10 @@ Tensor& mul_inplace_kernel(Tensor& self, const Tensor& other) {
     Tensor b = (other.dtype() == self.dtype()) ? other : other.to(self.dtype());
 
     if (try_binary_vectorized(n, self, b, self, Scalar(1), BinaryMulVecOp{})) {
+        return self;
+    }
+    if (try_row_broadcast(n, self, b, self, Scalar(1), BinaryMulVecOp{})) {
+        CUDA_CHECK(cudaGetLastError());
         return self;
     }
 
@@ -1028,6 +1224,10 @@ Tensor div_kernel(const Tensor& self, const Tensor& other) {
         CUDA_CHECK(cudaGetLastError());
         return result;
     }
+    if (try_row_broadcast(n, a, b, result, Scalar(1), BinaryDivVecOp{})) {
+        CUDA_CHECK(cudaGetLastError());
+        return result;
+    }
 
     TensorDesc a_desc = make_desc(a, out_shape.size());
     TensorDesc b_desc = make_desc(b, out_shape.size());
@@ -1069,6 +1269,10 @@ Tensor& div_inplace_kernel(Tensor& self, const Tensor& other) {
     Tensor b = (other.dtype() == self.dtype()) ? other : other.to(self.dtype());
 
     if (try_binary_vectorized(n, self, b, self, Scalar(1), BinaryDivVecOp{})) {
+        return self;
+    }
+    if (try_row_broadcast(n, self, b, self, Scalar(1), BinaryDivVecOp{})) {
+        CUDA_CHECK(cudaGetLastError());
         return self;
     }
 

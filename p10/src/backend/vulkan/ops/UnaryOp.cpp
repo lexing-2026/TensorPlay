@@ -21,6 +21,9 @@ Tensor unary_op(
     const Tensor& self_arg,
     const api::ShaderInfo& shader_descriptor,
     const char* buffer_shader_name) {
+  TP_CHECK(
+      self_arg.dtype() == DType::Float32,
+      "Vulkan unary ops support Float32 tensors only");
   api::Context* const context = api::context();
 
   api::vTensor v_self = convert(self_arg);
@@ -90,6 +93,9 @@ Tensor& unary_op_(
     Tensor& self_arg,
     const api::ShaderInfo& shader_descriptor,
     const char* buffer_shader_name) {
+  TP_CHECK(
+      self_arg.dtype() == DType::Float32,
+      "Vulkan unary ops support Float32 tensors only");
   api::Context* const context = api::context();
 
   api::vTensor v_self = convert(self_arg);

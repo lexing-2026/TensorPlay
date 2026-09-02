@@ -133,6 +133,27 @@ ComputePipeline::ComputePipeline(
   VK_CHECK_COND(descriptor.pipeline_layout, "Invalid pipeline layout!");
   VK_CHECK_COND(descriptor.shader_module, "Invalid shader module!");
 
+  // The generated shaders declare their local work group size through
+  // specialization constants with ids 0, 1, and 2; the values must be
+  // supplied at pipeline creation time.  The work group extent is three
+  // contiguous 32-bit words, so a component's offset is its index times
+  // the word size.
+  constexpr VkSpecializationMapEntry specialization_map_entries[3u]{
+      // X
+      {0u, 0u * sizeof(uint32_t), sizeof(uint32_t)},
+      // Y
+      {1u, 1u * sizeof(uint32_t), sizeof(uint32_t)},
+      // Z
+      {2u, 2u * sizeof(uint32_t), sizeof(uint32_t)},
+  };
+
+  const VkSpecializationInfo specialization_info{
+      3u, // mapEntryCount
+      specialization_map_entries, // pMapEntries
+      sizeof(descriptor.local_work_group), // dataSize
+      &descriptor.local_work_group, // pData
+  };
+
   const VkPipelineShaderStageCreateInfo stage_create_info{
       VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, // sType
       nullptr, // pNext
@@ -140,7 +161,7 @@ ComputePipeline::ComputePipeline(
       VK_SHADER_STAGE_COMPUTE_BIT, // stage
       descriptor.shader_module, // module
       "main", // pName
-      nullptr, // pSpecializationInfo
+      &specialization_info, // pSpecializationInfo
   };
 
   const VkComputePipelineCreateInfo pipeline_create_info{
@@ -150,7 +171,7 @@ ComputePipeline::ComputePipeline(
       stage_create_info, // stage
       descriptor.pipeline_layout, // layout
       VK_NULL_HANDLE, // basePipelineHandle
-      -1, // basePipelineIndex
+      0u, // basePipelineIndex
   };
 
   VK_CHECK(vkCreateComputePipelines(

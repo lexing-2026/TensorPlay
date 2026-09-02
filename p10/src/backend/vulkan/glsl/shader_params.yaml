@@ -80,6 +80,8 @@ binary_op_tensor:
     - NAME: floor_divide
       IS_DIV: true
       OPERATOR: floor(X / Y)
+    - NAME: sq_diff
+      OPERATOR: (X - Y) * (X - Y)
 
 clamp:
   parameter_names_with_default_values:
@@ -166,3 +168,418 @@ buffer_binary_op_scalar:
       OPERATOR: X + A * Y
     - NAME: buffer_mul_scalar
       OPERATOR: X * Y
+
+mm:
+  parameter_names_with_default_values: {}
+  shader_variants:
+    - NAME: mm
+
+softmax_channel:
+  parameter_names_with_default_values:
+    LOG_SOFTMAX: false
+  shader_variants:
+    - NAME: softmax_channel
+      LOG_SOFTMAX: false
+    - NAME: log_softmax_channel
+      LOG_SOFTMAX: true
+
+softmax_batch_height_width:
+  parameter_names_with_default_values:
+    LOG_SOFTMAX: false
+  shader_variants:
+    - NAME: softmax
+      LOG_SOFTMAX: false
+    - NAME: log_softmax
+      LOG_SOFTMAX: true
+
+sum_axis:
+  parameter_names_with_default_values: {}
+  shader_variants:
+    - NAME: sum_axis
+
+var_axis:
+  parameter_names_with_default_values: {}
+  shader_variants:
+    - NAME: var_axis
+
+layer_norm:
+  parameter_names_with_default_values:
+    WEIGHT_MODE: 0
+    BIAS_MODE: 0
+  generate_variant_forall:
+    WEIGHT_MODE:
+      - VALUE: 0
+        SUFFIX: ""
+      - VALUE: 1
+        SUFFIX: w
+      - VALUE: 2
+        SUFFIX: w2
+      - VALUE: 3
+        SUFFIX: w1
+    BIAS_MODE:
+      - VALUE: 0
+        SUFFIX: ""
+      - VALUE: 1
+        SUFFIX: b
+      - VALUE: 2
+        SUFFIX: b2
+      - VALUE: 3
+        SUFFIX: b1
+  shader_variants:
+    - NAME: layer_norm
+
+batchnorm:
+  parameter_names_with_default_values:
+    HAS_WEIGHT: true
+    HAS_BIAS: true
+  shader_variants:
+    - NAME: batchnorm
+      HAS_WEIGHT: true
+      HAS_BIAS: true
+    - NAME: batchnorm_w
+      HAS_WEIGHT: true
+      HAS_BIAS: false
+    - NAME: batchnorm_b
+      HAS_WEIGHT: false
+      HAS_BIAS: true
+    - NAME: batchnorm_nowb
+      HAS_WEIGHT: false
+      HAS_BIAS: false
+
+pool2d:
+  parameter_names_with_default_values:
+    MAX_POOLING: false
+  shader_variants:
+    - NAME: avg_pool2d
+      MAX_POOLING: false
+    - NAME: max_pool2d
+      MAX_POOLING: true
+
+adaptive_avg_pool2d:
+  parameter_names_with_default_values: {}
+  shader_variants:
+    - NAME: adaptive_avg_pool2d
+
+upsample_nearest2d:
+  parameter_names_with_default_values: {}
+  shader_variants:
+    - NAME: upsample_nearest2d
+
+conv2d:
+  parameter_names_with_default_values:
+    HAS_BIAS: true
+  shader_variants:
+    - NAME: conv2d
+      HAS_BIAS: true
+    - NAME: conv2d_nobias
+      HAS_BIAS: false
+
+conv2d_dw:
+  parameter_names_with_default_values:
+    HAS_BIAS: true
+  shader_variants:
+    - NAME: conv2d_dw
+      HAS_BIAS: true
+    - NAME: conv2d_dw_nobias
+      HAS_BIAS: false
+
+conv2d_pw:
+  parameter_names_with_default_values:
+    HAS_BIAS: true
+  shader_variants:
+    - NAME: conv2d_pw
+      HAS_BIAS: true
+    - NAME: conv2d_pw_nobias
+      HAS_BIAS: false
+
+conv1d:
+  parameter_names_with_default_values:
+    HAS_BIAS: true
+  shader_variants:
+    - NAME: conv1d
+      HAS_BIAS: true
+    - NAME: conv1d_nobias
+      HAS_BIAS: false
+
+conv_transpose2d:
+  parameter_names_with_default_values:
+    HAS_BIAS: true
+  shader_variants:
+    - NAME: conv_transpose2d
+      HAS_BIAS: true
+    - NAME: conv_transpose2d_nobias
+      HAS_BIAS: false
+
+flip:
+  parameter_names_with_default_values: {}
+  shader_variants:
+    - NAME: flip
+
+cat_channel:
+  parameter_names_with_default_values: {}
+  shader_variants:
+    - NAME: cat_channel
+
+cat:
+  parameter_names_with_default_values: {}
+  shader_variants:
+    - NAME: cat
+
+pad2d:
+  parameter_names_with_default_values:
+    REPLICATE: false
+  shader_variants:
+    - NAME: reflection_pad2d
+      REPLICATE: false
+    - NAME: replication_pad2d
+      REPLICATE: true
+
+permute:
+  parameter_names_with_default_values: {}
+  shader_variants:
+    - NAME: permute
+
+slice:
+  parameter_names_with_default_values: {}
+  shader_variants:
+    - NAME: slice
+
+view_gather:
+  parameter_names_with_default_values: {}
+  shader_variants:
+    - NAME: view_gather
+
+view_gather_int8:
+  parameter_names_with_default_values: {}
+  shader_variants:
+    - NAME: view_gather_int8
+
+lerp:
+  parameter_names_with_default_values:
+    TENSOR_WEIGHT: false
+    INPLACE: false
+    BLOCK_BINDING: 5
+  shader_variants:
+    - NAME: lerp
+      TENSOR_WEIGHT: false
+      INPLACE: false
+      BLOCK_BINDING: 3
+    - NAME: lerp_tensor
+      TENSOR_WEIGHT: true
+      INPLACE: false
+      BLOCK_BINDING: 4
+    - NAME: lerpinplace
+      TENSOR_WEIGHT: false
+      INPLACE: true
+      BLOCK_BINDING: 2
+    - NAME: lerp_tensorinplace
+      TENSOR_WEIGHT: true
+      INPLACE: true
+      BLOCK_BINDING: 3
+
+activation:
+  parameter_names_with_default_values:
+    OPERATOR: X
+    INPLACE: false
+  generate_variant_forall:
+    INPLACE:
+      - VALUE: false
+        SUFFIX: ""
+      - VALUE: true
+        SUFFIX: inplace
+  shader_variants:
+    - NAME: silu
+      OPERATOR: "X / (1.0f + exp(-X))"
+    - NAME: mish
+      OPERATOR: "X * tanh(log1p_approx(exp(X)))"
+    - NAME: relu6
+      OPERATOR: "clamp(X, 0.0f, 6.0f)"
+    - NAME: hardsigmoid
+      OPERATOR: "clamp(X + 3.0f, 0.0f, 6.0f) / 6.0f"
+    - NAME: hardswish
+      OPERATOR: "X * clamp(X + 3.0f, 0.0f, 6.0f) / 6.0f"
+
+activation_param:
+  parameter_names_with_default_values:
+    OPERATOR: X
+    INPLACE: false
+  generate_variant_forall:
+    INPLACE:
+      - VALUE: false
+        SUFFIX: ""
+      - VALUE: true
+        SUFFIX: inplace
+  shader_variants:
+    - NAME: leaky_relu
+      OPERATOR: "mix((X * P0), X, step(0.0f, X))"
+    - NAME: threshold
+      OPERATOR: "mix(X, P1, lessThanEqual(X, P0))"
+    - NAME: hardshrink
+      OPERATOR: "mix(X, vec4(0.0f), lessThanEqual(abs(X), P0))"
+
+gelu:
+  parameter_names_with_default_values:
+    GELU_TANH: false
+  shader_variants:
+    - NAME: gelu
+      GELU_TANH: false
+    - NAME: gelu_tanh
+      GELU_TANH: true
+
+buffer_activation:
+  parameter_names_with_default_values:
+    OPERATOR: X
+    INPLACE: false
+  generate_variant_forall:
+    INPLACE:
+      - VALUE: false
+        SUFFIX: ""
+      - VALUE: true
+        SUFFIX: inplace
+  shader_variants:
+    - NAME: buffer_silu
+      OPERATOR: "X / (1.0f + exp(-X))"
+    - NAME: buffer_mish
+      OPERATOR: "X * tanh(log1p_approx(exp(X)))"
+    - NAME: buffer_relu6
+      OPERATOR: "clamp(X, 0.0f, 6.0f)"
+    - NAME: buffer_hardsigmoid
+      OPERATOR: "clamp(X + 3.0f, 0.0f, 6.0f) / 6.0f"
+    - NAME: buffer_hardswish
+      OPERATOR: "X * clamp(X + 3.0f, 0.0f, 6.0f) / 6.0f"
+
+buffer_activation_param:
+  parameter_names_with_default_values:
+    OPERATOR: X
+    INPLACE: false
+  generate_variant_forall:
+    INPLACE:
+      - VALUE: false
+        SUFFIX: ""
+      - VALUE: true
+        SUFFIX: inplace
+  shader_variants:
+    - NAME: buffer_leaky_relu
+      OPERATOR: "mix((X * P0), X, step(0.0f, X))"
+    - NAME: buffer_threshold
+      OPERATOR: "(X <= P0) ? P1 : X"
+    - NAME: buffer_hardshrink
+      OPERATOR: "((X >= -P0) && (X <= P0)) ? 0.0f : X"
+
+buffer_gelu:
+  parameter_names_with_default_values:
+    GELU_TANH: false
+  shader_variants:
+    - NAME: buffer_gelu
+      GELU_TANH: false
+    - NAME: buffer_gelu_tanh
+      GELU_TANH: true
+
+quantize_per_tensor:
+  parameter_names_with_default_values: {}
+  shader_variants:
+    - NAME: quantize_per_tensor
+dequantize_per_tensor:
+  parameter_names_with_default_values: {}
+  shader_variants:
+    - NAME: dequantize_per_tensor
+
+quantized_binary_op:
+  parameter_names_with_default_values:
+    OPERATOR: X + Y
+  shader_variants:
+    - NAME: quantized_add
+      OPERATOR: X + Y
+    - NAME: quantized_sub
+      OPERATOR: X - Y
+    - NAME: quantized_mul
+      OPERATOR: X * Y
+    - NAME: quantized_div
+      OPERATOR: X / Y
+
+quantized_clamp:
+  parameter_names_with_default_values: {}
+  shader_variants:
+    - NAME: quantized_clamp
+
+quantized_max_pool2d:
+  parameter_names_with_default_values: {}
+  shader_variants:
+    - NAME: quantized_max_pool2d
+
+quantized_linear:
+  parameter_names_with_default_values: {}
+  shader_variants:
+    - NAME: quantized_linear
+
+quantized_conv2d:
+  parameter_names_with_default_values:
+    HAS_BIAS: true
+  shader_variants:
+    - NAME: quantized_conv2d
+      HAS_BIAS: true
+    - NAME: quantized_conv2d_nobias
+      HAS_BIAS: false
+
+quantize_per_tensor_quint8:
+  parameter_names_with_default_values: {}
+  shader_variants:
+    - NAME: quantize_per_tensor_quint8
+
+quantized_conv2d_sw:
+  parameter_names_with_default_values: {}
+  shader_variants:
+    - NAME: quantized_conv2d_sw
+
+quantized_conv2d_dw:
+  parameter_names_with_default_values: {}
+  shader_variants:
+    - NAME: quantized_conv2d_dw
+
+quantized_conv2d_pw_2x2:
+  parameter_names_with_default_values: {}
+  shader_variants:
+    - NAME: quantized_conv2d_pw_2x2
+
+quantized_conv_transpose2d:
+  parameter_names_with_default_values: {}
+  shader_variants:
+    - NAME: quantized_conv_transpose2d
+
+dequantize_per_tensor_quint8:
+  parameter_names_with_default_values: {}
+  shader_variants:
+    - NAME: dequantize_per_tensor_quint8
+
+quantize_per_tensor_qint32:
+  parameter_names_with_default_values: {}
+  shader_variants:
+    - NAME: quantize_per_tensor_qint32
+
+dequantize_per_tensor_qint32:
+  parameter_names_with_default_values: {}
+  shader_variants:
+    - NAME: dequantize_per_tensor_qint32
+
+random_fill:
+  parameter_names_with_default_values:
+    DIST: 0
+  shader_variants:
+    - NAME: uniform_fill
+      DIST: 0
+    - NAME: normal_fill
+      DIST: 1
+    - NAME: bernoulli_fill
+      DIST: 2
+
+hardshrink_mask:
+  parameter_names_with_default_values: {}
+  shader_variants:
+    - NAME: hardshrink_mask
+
+one_minus:
+  parameter_names_with_default_values:
+    OPERATOR: 1.0f - X
+  shader_variants:
+    - NAME: one_minus
+      OPERATOR: "1.0f - X"

@@ -4,7 +4,7 @@
 // Declared here (p10) so the replay-based RNN backward node
 // (tpx/include/RNNBackward.h) can route the lstm kind through oneDNN's fused
 // lstm_backward primitive instead of the decomposed per-step sweep.  Defined in
-// backend/cpu/Tier5OpsKernels.cpp next to onednn_lstm_forward.
+// backend/cpu/RNNKernels.cpp next to onednn_lstm_forward.
 //
 // lstm_backward primitive per layer+direction consuming the forward workspace.
 // Because TensorPlay's autograd node only saves (input, hx, params) -- the

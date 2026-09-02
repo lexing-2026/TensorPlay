@@ -33,6 +33,14 @@ int64_t lapack_dgetrs(char trans, int64_t n, int64_t nrhs, const double* a,
 int64_t lapack_spotrf(char uplo, int64_t n, float* a, int64_t lda);
 int64_t lapack_dpotrf(char uplo, int64_t n, double* a, int64_t lda);
 
+int64_t lapack_spotrs(char uplo, int64_t n, int64_t nrhs, const float* a,
+                      int64_t lda, float* b, int64_t ldb);
+int64_t lapack_dpotrs(char uplo, int64_t n, int64_t nrhs, const double* a,
+                      int64_t lda, double* b, int64_t ldb);
+
+int64_t lapack_spotri(char uplo, int64_t n, float* a, int64_t lda);
+int64_t lapack_dpotri(char uplo, int64_t n, double* a, int64_t lda);
+
 int64_t lapack_sgeqrf(int64_t m, int64_t n, float* a, int64_t lda, float* tau,
                       float* work, int64_t lwork);
 int64_t lapack_dgeqrf(int64_t m, int64_t n, double* a, int64_t lda, double* tau,

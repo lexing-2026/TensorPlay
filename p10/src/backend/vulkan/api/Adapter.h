@@ -25,6 +25,7 @@ struct PhysicalDevice final {
   // Properties obtained from Vulkan
   VkPhysicalDeviceProperties properties;
   VkPhysicalDeviceMemoryProperties memory_properties;
+  VkPhysicalDeviceFeatures features;
   std::vector<VkQueueFamilyProperties> queue_families;
 
   // Metadata
@@ -32,6 +33,10 @@ struct PhysicalDevice final {
   bool has_unified_memory;
   bool has_timestamps;
   float timestamp_period;
+  // True when the device advertises the portability subset extension
+  // (metal-tier drivers); such devices require the extension to be enabled
+  // and their subset features consulted before relying on core behavior.
+  bool has_portability_subset;
 
   explicit PhysicalDevice(VkPhysicalDevice);
 };
@@ -136,6 +141,16 @@ class Adapter final {
 
   inline bool has_unified_memory() const {
     return physical_device_.has_unified_memory;
+  }
+
+  // GPU timestamp support and the conversion from timestamp ticks to
+  // nanoseconds, for profiling paths.
+  inline bool has_timestamps() const {
+    return physical_device_.has_timestamps;
+  }
+
+  inline float timestamp_period() const {
+    return physical_device_.timestamp_period;
   }
 
   inline uint32_t num_compute_queues() const {

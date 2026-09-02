@@ -17,6 +17,9 @@ Tensor clamp(
     const Tensor& self_arg,
     const std::optional<Scalar>& min_arg,
     const std::optional<Scalar>& max_arg) {
+  TP_CHECK(
+      self_arg.dtype() == DType::Float32,
+      "Vulkan clamp supports Float32 tensors only");
   api::Context* const context = api::context();
 
   api::vTensor v_self = convert(self_arg);
@@ -67,6 +70,9 @@ Tensor& clamp_(
     Tensor& self_arg,
     const std::optional<Scalar>& min_arg,
     const std::optional<Scalar>& max_arg) {
+  TP_CHECK(
+      self_arg.dtype() == DType::Float32,
+      "Vulkan clamp_ supports Float32 tensors only");
   api::Context* const context = api::context();
 
   api::vTensor v_self = convert(self_arg);

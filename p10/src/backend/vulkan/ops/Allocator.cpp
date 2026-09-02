@@ -38,8 +38,9 @@ class VulkanCachingAllocator : public Allocator {
 
     vulkan::api::vTensorStorage* storage = allocate_storage(nbytes, index);
 
+    // The shared_ptr takes ownership; no reset() afterwards (that would
+    // release and re-adopt the same pointer).
     auto* holder = new StoragePtr(storage);
-    holder->reset(storage);
 
     // The DataPtr value carries the owning VulkanBuffer object; the object
     // stays alive because the DataPtr context holds the vTensorStorage

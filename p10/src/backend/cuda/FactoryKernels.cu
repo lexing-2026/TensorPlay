@@ -5,6 +5,7 @@
 #include "Scalar.h"
 #include "Context.h"
 #include <cuda_runtime.h>
+#include <algorithm>
 #include <cmath>
 #include <complex>
 #include <vector>
@@ -67,6 +68,101 @@ Tensor zeros_kernel(const std::vector<int64_t>& size, DType dtype, Device device
     Tensor t(size, dtype, device);
     fill_kernel(t, 0);
     return t;
+}
+
+template <typename T>
+__global__ void fill_diagonal_strided_cuda_impl(
+        int64_t count, T* data, int64_t base, int64_t diag_stride, T value) {
+    // Diagonal positions sit count * diag_stride apart in the storage, so
+    // each thread writes through the stride pattern instead of a flat range.
+    int64_t k = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (k < count) {
+        data[base + k * diag_stride] = value;
+    }
+}
+
+Tensor& fill_diagonal__kernel(Tensor& self, Scalar fill_value, bool wrap) {
+    const int64_t n_dims = self.dim();
+    if (n_dims < 2) {
+        TP_THROW(ValueError, "fill_diagonal_ expects a tensor with at least 2 dimensions");
+    }
+    const int64_t height = self.size(0);
+    const int64_t width = self.size(1);
+    if (n_dims > 2) {
+        for (int64_t i = 1; i < n_dims; ++i) {
+            if (self.size(i) != height) {
+                TP_THROW(ValueError, "all dimensions of input must be of equal length");
+            }
+        }
+    }
+    if (self.numel() == 0) return self;
+
+    const auto strides = self.strides();
+    int64_t diag_stride = 0;
+    for (int64_t i = 0; i < n_dims; ++i) {
+        diag_stride += strides[i];
+    }
+    const int64_t base = static_cast<int64_t>(
+        self.unsafeGetTensorImpl()->storage_offset());
+    const int64_t diag_size = std::min(height, width);
+    int64_t wrap_count = 0;
+    int64_t wrap_base = 0;
+    if (wrap && n_dims == 2 && height > width + 1) {
+        const int64_t step = width + 1;
+        wrap_count = (self.numel() + step - 1) / step - diag_size;
+        wrap_base = base + self.stride(0) * step;
+    }
+
+    const int threads = 256;
+    const int64_t max_count = diag_size > wrap_count ? diag_size : wrap_count;
+    const int blocks = static_cast<int>((max_count + threads - 1) / threads);
+
+    #define TP_FILL_DIAG_CUDA_CASE(ctype, name) \
+    case DType::name: { \
+        ctype* data = self.data_ptr<ctype>(); \
+        ctype val = fill_value.to<ctype>(); \
+        fill_diagonal_strided_cuda_impl<ctype><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>( \
+            diag_size, data, base, diag_stride, val); \
+        if (wrap_count > 0) { \
+            fill_diagonal_strided_cuda_impl<ctype><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>( \
+                wrap_count, data, wrap_base, diag_stride, val); \
+        } \
+        break; \
+    }
+
+    switch (self.dtype()) {
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_FILL_DIAG_CUDA_CASE)
+        case DType::ComplexFloat: {
+            std::complex<float>* data = self.data_ptr<std::complex<float>>();
+            std::complex<float> val = fill_value.to<std::complex<float>>();
+            fill_diagonal_strided_cuda_impl<std::complex<float>><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                diag_size, data, base, diag_stride, val);
+            if (wrap_count > 0) {
+                fill_diagonal_strided_cuda_impl<std::complex<float>><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                    wrap_count, data, wrap_base, diag_stride, val);
+            }
+            break;
+        }
+        case DType::ComplexDouble: {
+            std::complex<double>* data = self.data_ptr<std::complex<double>>();
+            std::complex<double> val = fill_value.to<std::complex<double>>();
+            fill_diagonal_strided_cuda_impl<std::complex<double>><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                diag_size, data, base, diag_stride, val);
+            if (wrap_count > 0) {
+                fill_diagonal_strided_cuda_impl<std::complex<double>><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+                    wrap_count, data, wrap_base, diag_stride, val);
+            }
+            break;
+        }
+        default: TP_THROW(NotImplementedError, "fill_diagonal_ not implemented for this dtype on CUDA");
+    }
+    #undef TP_FILL_DIAG_CUDA_CASE
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        TP_THROW(RuntimeError, std::string("CUDA fill_diagonal_ Error: ") + cudaGetErrorString(err));
+    }
+    return self;
 }
 
 Tensor ones_kernel(const std::vector<int64_t>& size, DType dtype, Device device, bool pin_memory) {
@@ -433,6 +529,7 @@ Tensor logspace_stub(Scalar start, Scalar end, int64_t steps, double base,
 
 TENSORPLAY_LIBRARY_IMPL(CUDA, FactoryKernels) {
     m.impl("fill_.Scalar", fill_kernel);
+    m.impl("fill_diagonal_", fill_diagonal__kernel);
     m.impl("zero_", zero_inplace_kernel);
     m.impl("zeros", zeros_stub);
     m.impl("ones", ones_stub);

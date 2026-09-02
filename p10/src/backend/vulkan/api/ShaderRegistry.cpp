@@ -3,14 +3,9 @@
 #include "ShaderRegistry.h"
 #include "Exception.h"
 
-#include <mutex>
-
 namespace tensorplay {
 namespace vulkan {
 namespace api {
-
-// Defined in the generated spv.cpp (shaders compiled at build time).
-void register_vulkan_shaders();
 
 namespace {
 
@@ -41,7 +36,6 @@ const ShaderInfo& ShaderRegistry::get_shader_info(
 }
 
 ShaderRegistry& shader_registry() {
-  static ShaderRegisterInit init(&register_vulkan_shaders);
   return get_registry();
 }
 

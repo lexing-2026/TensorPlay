@@ -189,8 +189,8 @@ __device__ inline void topk_count_radix_using_mask(
   if (threadIdx.x < 4) smem[threadIdx.x] = 0;
   __syncthreads();
 
-  unsigned active = __ballot_sync(0xffffffffu,
-                                  static_cast<IndexType>(threadIdx.x) < slice_size);
+  unsigned long long active = __ballot_sync(0xffffffffffffffffull,
+                                            static_cast<IndexType>(threadIdx.x) < slice_size);
   for (IndexType i = static_cast<IndexType>(threadIdx.x); i < slice_size;) {
     const Key value = TopKRadixTraits<T>::encode(
         topk_load(&data[i * within_slice_stride]));
@@ -198,7 +198,7 @@ __device__ inline void topk_count_radix_using_mask(
     const Key digit = (value >> digit_pos) & static_cast<Key>(3);
 #pragma unroll
     for (uint32_t j = 0; j < 4; ++j) {
-      counts[j] += static_cast<IndexType>(__popc(__ballot_sync(
+      counts[j] += static_cast<IndexType>(__popcll(__ballot_sync(
           active, has_value && digit == static_cast<Key>(j))));
     }
     i += static_cast<IndexType>(blockDim.x);

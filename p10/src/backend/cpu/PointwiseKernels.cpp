@@ -1839,6 +1839,92 @@ TP_SOFTMAX_ROW_F64(f64_256, __m256d, 4, tensorplay::tpsleef::exp,
 
 }  // namespace softmax_row
 
+#if defined(__x86_64__)
+// Vectorized strided-softmax unit: softmax along the strided dim, lanes across
+// the contiguous inner dimension.  One unit = one (outer, lane-block) pair;
+// the running max/sum vectors live in registers while sweeping k, so loads and
+// stores along the inner dim are coalesced.
+template <bool LogMode>
+struct SoftmaxStridedCtx {
+    const float* in_f32;
+    float* out_f32;
+    const double* in_f64;
+    double* out_f64;
+    int64_t size, stride, nblk;
+};
+
+template <bool LogMode>
+__attribute__((target("avx512f")))
+static void softmax_strided_f32_512_unit(const SoftmaxStridedCtx<LogMode>& c, int64_t u) {
+    const int64_t a = u / c.nblk;
+    const int64_t iv0 = (u % c.nblk) * 16;
+    const float* base = c.in_f32 + a * c.size * c.stride + iv0;
+    float* obase = c.out_f32 + a * c.size * c.stride + iv0;
+    const __m512 vinf = _mm512_set1_ps(-std::numeric_limits<float>::infinity());
+    __m512 vm = vinf;
+    for (int64_t k = 0; k < c.size; ++k)
+        vm = _mm512_max_ps(vm, _mm512_loadu_ps(base + k * c.stride));
+    __m512 vs = _mm512_setzero_ps();
+    for (int64_t k = 0; k < c.size; ++k) {
+        __m512 e = tensorplay::tpsleef::exp(
+            _mm512_sub_ps(_mm512_loadu_ps(base + k * c.stride), vm));
+        vs = _mm512_add_ps(vs, e);
+        _mm512_storeu_ps(obase + k * c.stride, e);
+    }
+    if constexpr (LogMode) {
+        alignas(64) float sb[16];
+        _mm512_storeu_ps(sb, vs);
+        for (int64_t l = 0; l < 16; ++l) sb[l] = std::log(sb[l]);
+        const __m512 vlse = _mm512_loadu_ps(sb);
+        for (int64_t k = 0; k < c.size; ++k) {
+            __m512 v = _mm512_sub_ps(_mm512_loadu_ps(base + k * c.stride), vm);
+            _mm512_storeu_ps(obase + k * c.stride, _mm512_sub_ps(v, vlse));
+        }
+    } else {
+        const __m512 vinv = _mm512_div_ps(_mm512_set1_ps(1.0f), vs);
+        for (int64_t k = 0; k < c.size; ++k) {
+            _mm512_storeu_ps(obase + k * c.stride,
+                             _mm512_mul_ps(_mm512_loadu_ps(obase + k * c.stride), vinv));
+        }
+    }
+}
+
+template <bool LogMode>
+__attribute__((target("avx512f")))
+static void softmax_strided_f64_512_unit(const SoftmaxStridedCtx<LogMode>& c, int64_t u) {
+    const int64_t a = u / c.nblk;
+    const int64_t iv0 = (u % c.nblk) * 8;
+    const double* base = c.in_f64 + a * c.size * c.stride + iv0;
+    double* obase = c.out_f64 + a * c.size * c.stride + iv0;
+    __m512d vm = _mm512_set1_pd(-std::numeric_limits<double>::infinity());
+    for (int64_t k = 0; k < c.size; ++k)
+        vm = _mm512_max_pd(vm, _mm512_loadu_pd(base + k * c.stride));
+    __m512d vs = _mm512_setzero_pd();
+    for (int64_t k = 0; k < c.size; ++k) {
+        __m512d e = tensorplay::tpsleef::exp(
+            _mm512_sub_pd(_mm512_loadu_pd(base + k * c.stride), vm));
+        vs = _mm512_add_pd(vs, e);
+        _mm512_storeu_pd(obase + k * c.stride, e);
+    }
+    if constexpr (LogMode) {
+        alignas(64) double sb[8];
+        _mm512_storeu_pd(sb, vs);
+        for (int64_t l = 0; l < 8; ++l) sb[l] = std::log(sb[l]);
+        const __m512d vlse = _mm512_loadu_pd(sb);
+        for (int64_t k = 0; k < c.size; ++k) {
+            __m512d v = _mm512_sub_pd(_mm512_loadu_pd(base + k * c.stride), vm);
+            _mm512_storeu_pd(obase + k * c.stride, _mm512_sub_pd(v, vlse));
+        }
+    } else {
+        const __m512d vinv = _mm512_div_pd(_mm512_set1_pd(1.0), vs);
+        for (int64_t k = 0; k < c.size; ++k) {
+            _mm512_storeu_pd(obase + k * c.stride,
+                             _mm512_mul_pd(_mm512_loadu_pd(obase + k * c.stride), vinv));
+        }
+    }
+}
+#endif  // __x86_64__
+
 template <bool LogMode>
 static Tensor softmax_fused_kernel_impl(const Tensor& self, int64_t dim, DType out_dtype) {
     Tensor input = self.to(out_dtype);
@@ -1848,8 +1934,95 @@ static Tensor softmax_fused_kernel_impl(const Tensor& self, int64_t dim, DType o
     }
 
     bool innermost = input.is_contiguous() && (d == input.dim() - 1);
+    if (!innermost && input.is_contiguous()) {
+        // Strided softmax over contiguous rows of length `size` with stride
+        // `stride` (the softmax dim is not last).  One streaming pass per row,
+        // no transpose materialization.
+        const int64_t size = input.size(d);
+        const int64_t stride = input.stride(d);
+        Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(input.shape()), out_dtype, input.device());
+
+        // Iterate rows as (a, b) with a in [0, before), b in [0, after);
+        // row data lives at a*(size*stride) + b + k*stride.
+        int64_t before = 1, after = 1;
+        for (int64_t i = 0; i < d; ++i) before *= input.size(i);
+        for (int64_t i = d + 1; i < input.dim(); ++i) after *= input.size(i);
+
+        #define TP_SOFTMAX_STRIDED_ROW(ctype)                              \
+            const ctype* src = in + a * size * stride + b;                 \
+            ctype* dst = out + a * size * stride + b;                      \
+            ctype m = src[0];                                              \
+            for (int64_t k = 1; k < size; ++k) m = std::max(m, src[k * stride]); \
+            ctype sum = ctype(0);                                          \
+            for (int64_t k = 0; k < size; ++k) {                           \
+                ctype e = std::exp(src[k * stride] - m);                   \
+                dst[k * stride] = e;                                       \
+                sum += e;                                                  \
+            }                                                              \
+            if constexpr (LogMode) {                                       \
+                ctype lse = std::log(sum);                                 \
+                for (int64_t k = 0; k < size; ++k)                         \
+                    dst[k * stride] = (src[k * stride] - m) - lse;         \
+            } else {                                                       \
+                ctype inv = ctype(1) / sum;                                \
+                for (int64_t k = 0; k < size; ++k) dst[k * stride] *= inv; \
+            }
+
+#if defined(__x86_64__)
+        SoftmaxStridedCtx<LogMode> sctx{
+            out_dtype == DType::Float32 ? input.data_ptr<float>() : nullptr,
+            out_dtype == DType::Float32 ? result.data_ptr<float>() : nullptr,
+            out_dtype == DType::Float64 ? input.data_ptr<double>() : nullptr,
+            out_dtype == DType::Float64 ? result.data_ptr<double>() : nullptr,
+            size, stride, 0};
+        auto run_f32_512 = [&](int64_t ub, int64_t ue) {
+            for (int64_t u = ub; u < ue; ++u) softmax_strided_f32_512_unit<LogMode>(sctx, u);
+        };
+        auto run_f64_512 = [&](int64_t ub, int64_t ue) {
+            for (int64_t u = ub; u < ue; ++u) softmax_strided_f64_512_unit<LogMode>(sctx, u);
+        };
+#endif
+
+        if (out_dtype == DType::Float32) {
+#if defined(__x86_64__)
+            if (vecunary::avx512_available() && after >= 16 && after % 16 == 0) {
+                sctx.nblk = after / 16;
+                parallel_for(0, before * sctx.nblk, 1, run_f32_512);
+                return result;
+            }
+#endif
+            const float* in = sctx.in_f32;
+            float* out = sctx.out_f32;
+            parallel_for(0, before * after, 1, [&](int64_t rb, int64_t re) {
+                for (int64_t r = rb; r < re; ++r) {
+                    const int64_t a = r / after;
+                    const int64_t b = r % after;
+                    TP_SOFTMAX_STRIDED_ROW(float)
+                }
+            });
+        } else {
+#if defined(__x86_64__)
+            if (vecunary::avx512_available() && after >= 8 && after % 8 == 0) {
+                sctx.nblk = after / 8;
+                parallel_for(0, before * sctx.nblk, 1, run_f64_512);
+                return result;
+            }
+#endif
+            const double* in = sctx.in_f64;
+            double* out = sctx.out_f64;
+            parallel_for(0, before * after, 1, [&](int64_t rb, int64_t re) {
+                for (int64_t r = rb; r < re; ++r) {
+                    const int64_t a = r / after;
+                    const int64_t b = r % after;
+                    TP_SOFTMAX_STRIDED_ROW(double)
+                }
+            });
+        }
+        #undef TP_SOFTMAX_STRIDED_ROW
+        return result;
+    }
     if (!innermost) {
-        // generic fallback via transpose-to-end + fused row loop
+        // Non-contiguous input: fall back to the transpose path.
         Tensor t = input.transpose(d, -1);
         if (!t.is_contiguous()) t = t.contiguous();
         Tensor result = softmax_fused_kernel_impl<LogMode>(t, t.dim() - 1, out_dtype);

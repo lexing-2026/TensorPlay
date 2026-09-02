@@ -45,7 +45,7 @@ template <typename T>
 __device__ inline T warpReduceSum(T val) {
 #pragma unroll
   for (int offset = 16; offset > 0; offset >>= 1)
-    val += __shfl_down_sync(0xffffffff, val, offset);
+    val += __shfl_down_sync(0xffffffffffffffffull, val, offset);
   return val;
 }
 
@@ -53,7 +53,7 @@ template <typename T>
 __device__ inline T warpReduceMax(T val) {
 #pragma unroll
   for (int offset = 16; offset > 0; offset >>= 1)
-    val = max(val, __shfl_down_sync(0xffffffff, val, offset));
+    val = max(val, __shfl_down_sync(0xffffffffffffffffull, val, offset));
   return val;
 }
 
