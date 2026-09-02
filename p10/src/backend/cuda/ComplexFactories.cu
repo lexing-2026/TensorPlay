@@ -75,8 +75,6 @@ __global__ void polar_kernel(int64_t n, const RT* ab, const RT* ang, CT* dst) {
 // Public entry points
 // ---------------------------------------------------------------------------
 
-}  // namespace
-
     DType rt = self.dtype() == DType::ComplexDouble ? DType::Float64 : DType::Float32;
     Tensor sc = self.contiguous();
     Tensor out = Tensor::empty(shape_of(sc), rt, self.device());

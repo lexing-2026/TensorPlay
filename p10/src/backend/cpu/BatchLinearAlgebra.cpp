@@ -117,7 +117,7 @@ bool cholesky_lapack(const Tensor& self, Tensor& out, int64_t n, int64_t batch,
         using T = std::remove_pointer_t<decltype(tag)>;
         for (int64_t j = 0; j < n; ++j) {
             for (int64_t i = 0; i < n; ++i) {
-                const bool strictly_opposite = upper ? (i < j) : (i > j);
+                const bool strictly_opposite = upper ? (i > j) : (i < j);
                 if (strictly_opposite) a[i + j * n] = T(0);
             }
         }
@@ -168,9 +168,9 @@ Tensor cholesky_inverse_lapack(const Tensor& self, int64_t n, int64_t batch, boo
         for (int64_t j = 0; j < n; ++j) {
             for (int64_t i = j + 1; i < n; ++i) {
                 if (upper) {
-                    a[j + i * n] = a[i + j * n];
-                } else {
                     a[i + j * n] = a[j + i * n];
+                } else {
+                    a[j + i * n] = a[i + j * n];
                 }
             }
         }
@@ -243,12 +243,15 @@ Tensor cholesky_solve_lapack(const Tensor& self, const Tensor& factor,
 Tensor triangular_solve_lapack(const Tensor& self, const Tensor& A,
                                int64_t n, int64_t rhs, int64_t batchB, int64_t batchA,
                                bool upper, bool transpose, bool unitriangular) {
-    const char side = 'L';
-    const char uplo = upper ? 'U' : 'L';
-    const char transa = transpose ? 'T' : 'N';
-    const char diag = unitriangular ? 'U' : 'N';
-    Tensor a = clone_batched_col_major(A);
-    Tensor b_work = clone_batched_col_major(self);
+    // CBLAS trsm consumes row-major operands natively, so no layout
+    // conversion is needed: X = op(A)^-1 B per batch block.
+    const int64_t order = 0;  // CblasRowMajor
+    const int64_t side = 0;   // CblasLeft
+    const int64_t uplo = upper ? 1 : 0;         // CblasUpper : CblasLower
+    const int64_t trans = transpose ? 1 : 0;    // CblasTrans : CblasNoTrans
+    const int64_t diag = unitriangular ? 1 : 0; // CblasUnit : CblasNonUnit
+    Tensor a = detail::contiguous_clone(A);
+    Tensor out = detail::contiguous_clone(self);
     const int64_t n2 = n * n;
     const int64_t nb = n * rhs;
     if (self.dtype() == DType::Float32 || self.dtype() == DType::Float64) {
@@ -256,29 +259,30 @@ Tensor triangular_solve_lapack(const Tensor& self, const Tensor& A,
             for (int64_t bi = begin; bi < end; ++bi) {
                 const int64_t ai = batchA == 1 ? 0 : bi;
                 if (self.dtype() == DType::Float32) {
-                    lapack_strtrs(side, uplo, transa, diag, n, rhs,
-                                  a.data_ptr<float>() + ai * n2, n,
-                                  b_work.data_ptr<float>() + bi * nb, n);
+                    lapack_strsm(order, side, uplo, trans, diag, n, rhs, 1.0f,
+                                 a.data_ptr<float>() + ai * n2, n,
+                                 out.data_ptr<float>() + bi * nb, rhs);
                 } else {
-                    lapack_dtrtrs(side, uplo, transa, diag, n, rhs,
-                                  a.data_ptr<double>() + ai * n2, n,
-                                  b_work.data_ptr<double>() + bi * nb, n);
+                    lapack_dtrsm(order, side, uplo, trans, diag, n, rhs, 1.0,
+                                 a.data_ptr<double>() + ai * n2, n,
+                                 out.data_ptr<double>() + bi * nb, rhs);
                 }
             }
         });
-        return b_work.contiguous();
+        return out;
     }
-    Tensor a64 = a.to(DType::Float64).contiguous();
-    Tensor work = clone_batched_col_major(self.to(DType::Float64));
+    // Half/BFloat16: solve in float32 and cast back.
+    Tensor a32 = a.to(DType::Float32);
+    Tensor work = detail::contiguous_clone(self.to(DType::Float32));
     parallel_for(0, batchB, 1, [&](int64_t begin, int64_t end) {
         for (int64_t bi = begin; bi < end; ++bi) {
             const int64_t ai = batchA == 1 ? 0 : bi;
-            lapack_dtrtrs(side, uplo, transa, diag, n, rhs,
-                          a64.data_ptr<double>() + ai * n2, n,
-                          work.data_ptr<double>() + bi * nb, n);
+            lapack_strsm(order, side, uplo, trans, diag, n, rhs, 1.0f,
+                         a32.data_ptr<float>() + ai * n2, n,
+                         work.data_ptr<float>() + bi * nb, rhs);
         }
     });
-    return work.contiguous().to(self.dtype());
+    return work.to(self.dtype());
 }
 
 // ---------------------------------------------------------------------------
