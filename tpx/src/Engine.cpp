@@ -340,11 +340,13 @@ void Engine::evaluate_function(GraphTask& task, Node* func, InputBuffer& inputs,
 
     if (!exec_info_.empty()) {
         GraphTask::ExecInfo& fn_info = exec_info_.at(func);
-        variable_list new_inputs = inputs.buffer;
+        // Captured gradients (grad() mode) are read straight out of the
+        // input buffer; no whole-buffer copy for nodes without captures.
         if (auto* capture_vec = fn_info.captures_.get()) {
             std::lock_guard<std::mutex> lock(task.mutex_);
             for (const auto& capture : *capture_vec) {
-                task.captured_vars_[capture.output_idx_] = new_inputs[capture.input_idx_];
+                task.captured_vars_[capture.output_idx_] =
+                    inputs.buffer[capture.input_idx_];
             }
         }
         if (!fn_info.needed_) {
@@ -362,14 +364,11 @@ void Engine::evaluate_function(GraphTask& task, Node* func, InputBuffer& inputs,
         // cost: one atomic load;
         // the virtual demangle runs only when a session is live, and names
         // are interned so long training loops don't grow any arena.
-        const bool __tp_prof_on =
-            tensorplay::prof::g_active.load(std::memory_order_acquire);
-        const char* __tp_node_nm = "";
-        if (__tp_prof_on) {
-            __tp_node_nm = tensorplay::prof::intern_name(
-                "backward::" + func->name());
+        std::optional<tensorplay::prof::OpRecord> __tp_node_rec;
+        if (tensorplay::prof::g_active.load(std::memory_order_acquire)) {
+            __tp_node_rec.emplace(tensorplay::prof::intern_name(
+                "backward::" + func->name()));
         }
-        tensorplay::prof::OpRecord __tp_node_rec(__tp_node_nm);
         if (EngineTrace::level() >= 2) {
             char label[128], buf[256];
             EngineTrace::node_label(label, sizeof(label), func);
@@ -473,10 +472,15 @@ void Engine::evaluate_function(GraphTask& task, Node* func, InputBuffer& inputs,
             if (out_edges[i].has_shape_hint) {
                 bool shape_ok = true;
                 if (static_cast<size_t>(outputs[i].dim()) == hint.size()) {
-                    const auto out_sizes =
-                        static_cast<std::vector<int64_t>>(outputs[i].shape());
-                    shape_ok =
-                        std::equal(hint.begin(), hint.end(), out_sizes.begin());
+                    // Compare dimension-by-dimension: materializing the
+                    // output shape into a vector here would cost one heap
+                    // allocation per gradient output per node.
+                    for (size_t d = 0; d < hint.size(); ++d) {
+                        if (outputs[i].size(d) != hint[d]) {
+                            shape_ok = false;
+                            break;
+                        }
+                    }
                 } else {
                     shape_ok = false;
                 }
