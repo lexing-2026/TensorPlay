@@ -12,6 +12,7 @@ from tensorplay.distributed.checkpoint.state_dict_loader import load
 from tensorplay.distributed.checkpoint.state_dict_saver import async_save, save
 from tensorplay.distributed.checkpoint.api import CheckpointException
 from tensorplay.distributed.checkpoint.default_planner import DefaultLoadPlanner, DefaultSavePlanner
+from tensorplay.distributed.checkpoint.optimizer import load_sharded_optimizer_state_dict
 from tensorplay.distributed.checkpoint.metadata import (
     BytesStorageMetadata,
     ChunkStorageMetadata,
@@ -47,6 +48,7 @@ __all__ = [
     "CheckpointException",
     "DefaultLoadPlanner",
     "DefaultSavePlanner",
+    "load_sharded_optimizer_state_dict",
     "BytesStorageMetadata",
     "ChunkStorageMetadata",
     "Metadata",

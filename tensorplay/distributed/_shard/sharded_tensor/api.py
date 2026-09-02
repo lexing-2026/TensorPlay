@@ -1,6 +1,7 @@
 """Explicit sharded tensor values backed by local tensor shards."""
 
 import copy
+import math
 from typing import Any, Callable, Iterable
 
 import tensorplay as tp
@@ -96,13 +97,48 @@ class ShardedTensorBase:
         return self._local_shards[0].tensor
 
     def gather(self, dst: int = 0, out: Any = None) -> Any:
-        del dst
-        result = tp.empty(self.shape, dtype=self.dtype, device=self.device)
-        for shard in self._local_shards:
-            _copy_shard(result, shard)
+        if not isinstance(dst, int) or dst < 0:
+            raise ValueError("dst must be a non-negative integer")
+        result = self._gather_full_tensor()
         if out is not None:
+            if tuple(out.shape) != self.shape:
+                raise ValueError("out does not match the global tensor shape")
             out.copy_(result)
             return out
+        return result
+
+    def _gather_full_tensor(self) -> Any:
+        local = self._local_tensor()
+        if local is None:
+            raise RuntimeError("the current rank does not own a local shard")
+        if not dist.is_initialized() or dist.get_world_size(self._process_group) == 1:
+            result = tp.empty(self.shape, dtype=local.dtype, device=local.device)
+            for shard in self._local_shards:
+                _copy_shard(result, shard)
+            return result
+
+        group = self._process_group
+        world_size = dist.get_world_size(group)
+        local_flat = local.reshape(-1).contiguous()
+        max_numel = max(
+            1,
+            max(
+                int(math.prod(metadata.shard_sizes))
+                for metadata in self._metadata.shards_metadata
+            ),
+        )
+        packed = tp.zeros(max_numel, dtype=local.dtype, device=local.device)
+        if local_flat.numel():
+            packed.narrow(0, 0, local_flat.numel()).copy_(local_flat)
+        gathered = [tp.empty((max_numel,), dtype=local.dtype, device=local.device) for _ in range(world_size)]
+        dist.all_gather(gathered, packed, group=group)
+        result = tp.zeros(self.shape, dtype=local.dtype, device=local.device)
+        for metadata in self._metadata.shards_metadata:
+            global_rank = _placement_rank(metadata.placement)
+            group_rank = _group_rank(group, global_rank)
+            count = int(math.prod(metadata.shard_sizes))
+            values = gathered[group_rank].narrow(0, 0, count).reshape(tuple(metadata.shard_sizes))
+            _copy_shard(result, Shard(values, metadata))
         return result
 
     def _local_tensor(self) -> Any:
@@ -123,7 +159,26 @@ class ShardedTensorBase:
         return self
 
     def reshard(self, sharding_spec: Any) -> "ShardedTensorBase":
-        return sharding_spec.shard(self.gather(), process_group=self._process_group)
+        from .reshard import reshard_local_shard
+
+        if not isinstance(sharding_spec, type(self._sharding_spec)):
+            raise TypeError("reshard requires a compatible sharding specification")
+        local = self._local_tensor()
+        if local is None:
+            raise RuntimeError("the current rank does not own a local shard")
+        local_shards, metadata = reshard_local_shard(
+            local,
+            self.shape,
+            self._sharding_spec,
+            sharding_spec,
+            self._process_group,
+        )
+        return type(self)._init_from_local_shards_and_global_metadata(
+            local_shards,
+            type(self._metadata)(metadata, self.shape, self._metadata.tensor_properties),
+            sharding_spec,
+            self._process_group,
+        )
 
     def __getattr__(self, name: str) -> Any:
         local = self.__dict__.get("_local_shards")
@@ -138,15 +193,87 @@ class ShardedTensorBase:
 class ShardedTensor(ShardedTensorBase):
     @classmethod
     def _init_from_global_tensor(cls, sharding_spec: Any, tensor: Any, process_group: Any = None) -> "ShardedTensor":
-        metadata = sharding_spec.build_metadata(tuple(tensor.shape), TensorProperties.create_from_tensor(tensor))
-        rank = _current_rank(process_group)
-        local = []
-        for item in metadata.shards_metadata:
-            if _placement_rank(item.placement) != rank:
-                continue
-            value = _slice_by_metadata(tensor, item).detach().clone()
-            local.append(Shard(value, item))
-        return cls._init_from_local_shards_and_global_metadata(local, metadata, sharding_spec, process_group)
+        return cls._scatter_from_global_tensor(
+            sharding_spec, tensor, process_group=process_group, src_rank=0
+        )
+
+    @classmethod
+    def _scatter_from_global_tensor(
+        cls,
+        sharding_spec: Any,
+        tensor: Any,
+        *,
+        process_group: Any = None,
+        src_rank: int = 0,
+    ) -> "ShardedTensor":
+        properties = TensorProperties.create_from_tensor(tensor)
+        metadata = sharding_spec.build_metadata(tuple(tensor.shape), properties)
+        placements = metadata.shards_metadata
+        if not placements:
+            raise ValueError("sharding specification produced no shards")
+        if not dist.is_initialized():
+            if src_rank != 0:
+                raise ValueError("src_rank must be zero without a process group")
+            local = [
+                Shard(_slice_by_metadata(tensor, item).detach().clone(), item)
+                for item in placements
+                if _placement_rank(item.placement) == 0
+            ]
+            return cls._init_from_local_shards_and_global_metadata(
+                local, metadata, sharding_spec, process_group
+            )
+
+        group = process_group
+        world_size = dist.get_world_size(group)
+        if len(placements) != world_size:
+            raise ValueError(
+                "the number of shard placements must equal the process group size"
+            )
+        current_group_rank = dist.get_rank(group)
+        current_global_rank = dist.get_rank()
+        if src_rank < 0 or src_rank >= world_size:
+            raise ValueError("src_rank is outside the process group")
+        local_metadata = next(
+            (
+                item
+                for item in placements
+                if _placement_rank(item.placement) == current_global_rank
+            ),
+            None,
+        )
+        if local_metadata is None:
+            raise ValueError("every process-group rank must own one shard")
+
+        counts = [int(math.prod(item.shard_sizes)) for item in placements]
+        max_count = max(1, max(counts))
+        scatter_list = None
+        if current_group_rank == src_rank:
+            scatter_list = [None] * world_size
+            for item, count in zip(placements, counts):
+                global_rank = _placement_rank(item.placement)
+                target_rank = _group_rank(group, global_rank)
+                values = _slice_by_metadata(tensor, item).detach().clone().reshape(-1)
+                packed = tp.zeros(max_count, dtype=tensor.dtype, device=tensor.device)
+                if count:
+                    packed.narrow(0, 0, count).copy_(values)
+                scatter_list[target_rank] = packed
+            if any(value is None for value in scatter_list):
+                raise ValueError("shard placements must map to every process-group rank")
+
+        received = tp.empty((max_count,), dtype=tensor.dtype, device=tensor.device)
+        dist.scatter(
+            received,
+            scatter_list=scatter_list,
+            group_src=src_rank,
+            group=group,
+        )
+        count = int(math.prod(local_metadata.shard_sizes))
+        value = received.narrow(0, 0, count).reshape(tuple(local_metadata.shard_sizes)).detach()
+        value.requires_grad_(bool(tensor.requires_grad))
+        local = [Shard(value, local_metadata)]
+        return cls._init_from_local_shards_and_global_metadata(
+            local, metadata, sharding_spec, process_group
+        )
 
 
 def _normalize_size(size: tuple[Any, ...]) -> tuple[int, ...]:
@@ -158,7 +285,10 @@ def _normalize_size(size: tuple[Any, ...]) -> tuple[int, ...]:
 def _placement_rank(placement: Any) -> int:
     if placement is None:
         return 0
-    return placement.rank() if hasattr(placement, "rank") else int(str(placement).split(":")[1].split("/")[0])
+    rank = placement.rank() if hasattr(placement, "rank") else int(str(placement).split(":")[1].split("/")[0])
+    if rank is None:
+        raise ValueError(f"placement {placement!r} does not identify a process rank")
+    return int(rank)
 
 
 def _current_rank(process_group: Any = None) -> int:
@@ -166,6 +296,12 @@ def _current_rank(process_group: Any = None) -> int:
         return dist.get_rank(process_group)
     except Exception:
         return 0
+
+
+def _group_rank(process_group: Any, global_rank: int) -> int:
+    if process_group is None:
+        return int(global_rank)
+    return int(dist.get_group_rank(process_group, int(global_rank)))
 
 
 def _slice_by_metadata(tensor: Any, metadata: ShardMetadata) -> Any:

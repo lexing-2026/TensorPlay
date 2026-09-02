@@ -157,6 +157,6 @@ class FSDPMemTracker(MemTracker):
         super().__exit__(*args)
         self._deregister_module_and_optimizer_hooks()
 
-    def __torch_dispatch__(self, func: Any, types: Any, args: tuple[Any, ...] = (), kwargs: dict[str, Any] | None = None) -> Any:
-        result = super().__torch_dispatch__(func, types, args, kwargs)
+    def __tensorplay_dispatch__(self, func: Any, types: Any, args: tuple[Any, ...] = (), kwargs: dict[str, Any] | None = None) -> Any:
+        result = super().__tensorplay_dispatch__(func, types, args, kwargs)
         return result

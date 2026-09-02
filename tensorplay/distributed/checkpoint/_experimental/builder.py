@@ -27,8 +27,18 @@ def default_subprocess_init_fn(*_: Any) -> None:
     return None
 
 
-def default_writer_init_fn(rank_info: RankInfo) -> CheckpointWriter:
-    return CheckpointWriter(CheckpointWriterConfig(), rank_info)
+def default_writer_init_fn(
+    rank_info: RankInfo,
+    config: CheckpointWriterConfig | None = None,
+    barrier_config: Any = None,
+    commit_hook: WriterHook | None = None,
+) -> CheckpointWriter:
+    barrier = (
+        create_barrier_from_config(barrier_config)
+        if barrier_config is not None
+        else None
+    )
+    return CheckpointWriter(config or CheckpointWriterConfig(), rank_info, barrier, commit_hook)
 
 
 def make_sync_checkpointer(config: CheckpointerConfig = CheckpointerConfig(), rank_info: RankInfo | None = None, commit_hook: WriterHook | None = None) -> SyncCheckpointer:
@@ -40,5 +50,9 @@ def make_sync_checkpointer(config: CheckpointerConfig = CheckpointerConfig(), ra
 
 def make_async_checkpointer(config: CheckpointerConfig = CheckpointerConfig(), rank_info: RankInfo | None = None, subprocess_init_fn: Callable[..., None] = default_subprocess_init_fn, subprocess_init_args: tuple[Any, ...] = (), checkpoint_writer_init_fn: Callable[..., CheckpointWriter] = default_writer_init_fn, checkpoint_writer_init_args: dict[str, Any] | None = None) -> AsyncCheckpointer:
     info = rank_info or _get_default_rank_info()
-    process = CheckpointProcess(info, config.process_config, subprocess_init_fn, subprocess_init_args, checkpoint_writer_init_fn, checkpoint_writer_init_args or {})
+    writer_args = dict(checkpoint_writer_init_args or {})
+    if checkpoint_writer_init_fn is default_writer_init_fn:
+        writer_args.setdefault("config", config.writer_config)
+        writer_args.setdefault("barrier_config", config.barrier_config)
+    process = CheckpointProcess(info, config.process_config, subprocess_init_fn, subprocess_init_args, checkpoint_writer_init_fn, writer_args)
     return AsyncCheckpointer(DefaultStager(config.staging_config), process, CheckpointReader(info))

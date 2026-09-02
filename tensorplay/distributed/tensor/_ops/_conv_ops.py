@@ -7,12 +7,13 @@ from typing import Any
 from .._api import DTensor
 from .._dtensor_spec import DTensorSpec
 from ..placement_types import Partial, Shard
+from .utils import _is_tensor_like
 
 __all__ = ["convolution_backward_rules", "convolution_rules", "convolution_single_dim_strategy"]
 
 
 def convolution_rules(op_schema: Any) -> DTensorSpec | None:
-    value = next((item for item in getattr(op_schema, "args", ()) if isinstance(item, DTensor)), None)
+    value = next((item for item in getattr(op_schema, "args", ()) if _is_tensor_like(item)), None)
     return None if value is None else DTensorSpec(value.device_mesh, value.placements, None)
 
 

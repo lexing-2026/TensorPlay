@@ -6,6 +6,7 @@ import functools
 import operator
 import threading
 from collections.abc import Callable, Generator, Mapping, Sequence
+from queue import Empty, Queue
 from typing import Any, ParamSpec, TypeVar
 
 import tensorplay as tp
@@ -449,7 +450,7 @@ class LocalTensor:
         return LocalTensor({_from_local_tensor_attr(name): value for name, value in inner_tensors.items()})
 
     @classmethod
-    def __torch_dispatch__(cls, func: Any, types: tuple[Any, ...], args: tuple[Any, ...] = (), kwargs: dict[str, Any] | None = None) -> Any:
+    def __tensorplay_dispatch__(cls, func: Any, types: tuple[Any, ...], args: tuple[Any, ...] = (), kwargs: dict[str, Any] | None = None) -> Any:
         del types
         mode = next((value for value in _iter_local_values((args, kwargs or {})) if isinstance(value, LocalTensor)), None)
         if mode is None:
@@ -569,7 +570,7 @@ class LocalTensorMode:
         self.disable_()
         get_local_tensor_mode_list().pop()
 
-    def __torch_dispatch__(self, func: Any, types: tuple[Any, ...], args: tuple[Any, ...] = (), kwargs: dict[str, Any] | None = None) -> Any:
+    def __tensorplay_dispatch__(self, func: Any, types: tuple[Any, ...], args: tuple[Any, ...] = (), kwargs: dict[str, Any] | None = None) -> Any:
         del types
         local = next(
             (value for value in _iter_local_values((args, kwargs or {})) if isinstance(value, LocalTensor)),
@@ -775,50 +776,153 @@ class _ExceptionRaisingThread(threading.Thread):
 
 class LocalRunnerMode:
     _current = threading.local()
+    _active: "LocalRunnerMode | None" = None
 
     def __init__(self, ranks: int | frozenset[int], concurrency: int | None = None, fn: Callable[..., Any] | None = None) -> None:
         self.ranks = frozenset(range(ranks)) if isinstance(ranks, int) else frozenset(ranks)
+        if not self.ranks:
+            raise ValueError("at least one rank is required")
+        if concurrency is None:
+            concurrency = len(self.ranks)
+        if concurrency < 1:
+            raise ValueError("concurrency must be positive")
         self.concurrency = concurrency
         self.fn = fn
         self._old = None
+        self._run_lock = threading.Lock()
+        self._run_cond = threading.Condition(self._run_lock)
+        self._run_id = None
+        self._stop_event = threading.Event()
+        self._last_recv_source = threading.local()
+        self._recv_objects: dict[int, dict[tuple[int, int], Queue[Any]]] = {
+            dst: {
+                (src, tag): Queue()
+                for src in self.ranks
+                for tag in [0]
+            }
+            for dst in self.ranks
+        }
+        self._pending_ranks: Queue[int] = Queue()
+        self._runners: list[_ExceptionRaisingThread] = []
+        if self.fn is not None:
+            for rank in sorted(self.ranks):
+                self._pending_ranks.put(rank)
+            self._runners = [
+                _ExceptionRaisingThread(
+                    self,
+                    target=self._run,
+                    name="LocalRunnerMode",
+                    args=(index,),
+                )
+                for index in range(min(self.concurrency, len(self.ranks)))
+            ]
 
     def __enter__(self) -> "LocalRunnerMode":
+        if LocalRunnerMode._active is not None:
+            raise RuntimeError("a LocalRunnerMode is already active")
         self._old = getattr(self._current, "value", None)
+        LocalRunnerMode._active = self
         self._current.value = self
+        self._stop_event.clear()
+        for runner in self._runners:
+            runner.start()
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        del exc_type, exc_val, exc_tb
+        del exc_val, exc_tb
+        if exc_type is not None:
+            self._stop_event.set()
+            with self._run_cond:
+                self._run_cond.notify_all()
+        error: BaseException | None = None
+        for runner in self._runners:
+            try:
+                runner.join()
+            except BaseException as runner_error:
+                if error is None:
+                    error = runner_error
+        LocalRunnerMode._active = None
         self._current.value = self._old
+        if error is not None:
+            raise error
 
-    def _run(self, rank: int) -> Any:
-        if self.fn is None:
-            return None
-        return self.fn(rank)
+    def _run(self, worker_id: int) -> None:
+        del worker_id
+        self._current.value = self
+        while True:
+            try:
+                rank = self._pending_ranks.get_nowait()
+            except Empty:
+                return
+            try:
+                self._current.rank = rank
+                self._acquire_run_lock()
+                try:
+                    if self.fn is not None:
+                        self.fn(rank)
+                except BaseException:
+                    self._stop_event.set()
+                    self._run_cond.notify_all()
+                    raise
+                finally:
+                    self._release_run_lock()
+            finally:
+                self._pending_ranks.task_done()
 
     def _acquire_run_lock(self) -> None:
-        return None
+        self._run_lock.acquire()
+        self._run_id = threading.get_ident()
 
     def _release_run_lock(self) -> None:
-        return None
+        if self._run_id != threading.get_ident():
+            raise RuntimeError("the current thread does not hold the run lock")
+        self._run_id = None
+        self._run_lock.release()
 
     def _assert_holds_run_lock(self) -> None:
+        if self._run_id != threading.get_ident():
+            raise AssertionError("calling thread does not hold the run lock")
+
+    def _get_recv_object(self, src: int, dst: int, tag: int = 0) -> Any:
+        if dst not in self._recv_objects:
+            raise ValueError(f"destination rank {dst} is not in the runner")
+        peers = sorted(self.ranks) if src == -1 else [src]
+        for peer in peers:
+            if peer not in self.ranks:
+                raise ValueError(f"source rank {peer} is not in the runner")
+            queue = self._recv_objects[dst].setdefault((peer, tag), Queue())
+            if not queue.empty():
+                self._last_recv_source.rank = peer
+                return queue.get_nowait()
         return None
 
-    def _get_recv_object(self, src: int, dst: int) -> Any:
-        del src, dst
-        return None
+    def _signal_send(self, src: int, dst: int, obj: Any, tag: int = 0) -> None:
+        self._assert_holds_run_lock()
+        if obj is None:
+            raise ValueError("cannot send a null object")
+        if dst not in self._recv_objects or src not in self.ranks:
+            raise ValueError(f"invalid point-to-point ranks {src}->{dst}")
+        queue = self._recv_objects[dst].setdefault((src, tag), Queue())
+        queue.put(obj)
+        self._run_cond.notify_all()
 
-    def _signal_send(self, src: int, dst: int, obj: Any) -> None:
-        del src, dst, obj
-
-    def _wait_recv(self, src: int, dst: int, post: bool = False) -> Any:
-        del src, dst, post
-        return None
+    def _wait_recv(self, src: int, dst: int, post: Any = False, tag: int = 0) -> Any:
+        self._assert_holds_run_lock()
+        if self._stop_event.is_set():
+            raise RuntimeError("a local runner failed while processing point-to-point work")
+        while True:
+            value = self._get_recv_object(src, dst, tag)
+            if value is not None:
+                if callable(post):
+                    post(value)
+                return value
+            if self._stop_event.is_set():
+                raise RuntimeError("a local runner failed while processing point-to-point work")
+            self._run_cond.wait()
 
     @classmethod
     def current(cls) -> "LocalRunnerMode | None":
-        return getattr(cls._current, "value", None)
+        return getattr(cls._current, "value", None) or cls._active
 
 
 class _LocalPhiloxState:

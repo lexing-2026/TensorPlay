@@ -1,6 +1,7 @@
 #include "rref_context.h"
 
 #include <chrono>
+#include <limits>
 #include <stdexcept>
 
 namespace tensorplay::distributed::rpc {
@@ -51,6 +52,14 @@ void RRefContext::set_value(const RRefId& id, py::object value) {
         state->ready = true;
     }
     state->condition.notify_all();
+    std::lock_guard<std::mutex> map_lock(mutex_);
+    auto iterator = owners_.find(id);
+    if (iterator != owners_.end() && iterator->second == state) {
+        std::lock_guard<std::mutex> state_lock(state->mutex);
+        if (state->ready && state->references == 0) {
+            owners_.erase(iterator);
+        }
+    }
 }
 
 void RRefContext::set_exception(const RRefId& id, py::object error) {
@@ -72,6 +81,14 @@ void RRefContext::set_exception(const RRefId& id, py::object error) {
         state->ready = true;
     }
     state->condition.notify_all();
+    std::lock_guard<std::mutex> map_lock(mutex_);
+    auto iterator = owners_.find(id);
+    if (iterator != owners_.end() && iterator->second == state) {
+        std::lock_guard<std::mutex> state_lock(state->mutex);
+        if (state->ready && state->references == 0) {
+            owners_.erase(iterator);
+        }
+    }
 }
 
 py::object RRefContext::wait(const RRefId& id, double timeout_seconds) const {
@@ -112,6 +129,9 @@ void RRefContext::retain(const RRefId& id) {
         throw std::runtime_error("RRef owner entry does not exist");
     }
     std::lock_guard<std::mutex> lock(state->mutex);
+    if (state->references == std::numeric_limits<size_t>::max()) {
+        throw std::overflow_error("RRef owner reference count overflow");
+    }
     ++state->references;
 }
 

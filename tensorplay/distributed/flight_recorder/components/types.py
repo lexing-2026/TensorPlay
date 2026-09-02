@@ -114,9 +114,9 @@ class Database(NamedTuple):
 types = [TypeInfo.from_type(item) for item in (Database, NCCLCall, Collective, Traceback, Membership, Group)]
 COLLECTIVES = {
     "broadcast", "_broadcast_oop", "reduce", "_reduce_oop", "all_gather", "all_gather_single",
-    "all_gather_v", "all_reduce", "_all_gather_base",
+    "all_gather_v", "all_reduce",
     "reduce_scatter", "reduce_scatter_single", "reduce_scatter_v",
-    "_reduce_scatter_base", "gather", "scatter", "all_to_all", "all_to_all_single",
+    "gather", "scatter", "all_to_all", "all_to_all_single",
     "all_to_all_v_single", "all_reduce_barrier", "barrier", "split", "new_window",
     "allreduce_coalesced", "allgather_coalesced", "ALLGATHER_coalesced", "REDUCE_SCATTER_coalesced",
 }

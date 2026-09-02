@@ -167,8 +167,10 @@ class DynamicRendezvousHandler(RendezvousHandler):
         node_rank: int,
         run_id: str,
         store: Store | None = None,
+        backend_name: str = "core",
     ) -> None:
         self._backend = backend
+        self._backend_name = backend_name
         self._settings = settings
         self._node_rank = node_rank
         self._run_id = run_id
@@ -208,14 +210,22 @@ class DynamicRendezvousHandler(RendezvousHandler):
         params.config.setdefault("min_nodes", settings.min_nodes)
         params.config.setdefault("max_nodes", settings.max_nodes)
         backend, store = create_backend(params, store_type=store_type)
-        return cls(backend, settings, local_addr, params.node_rank, run_id, store=store)
+        return cls(
+            backend,
+            settings,
+            local_addr,
+            params.node_rank,
+            run_id,
+            store=store,
+            backend_name=backend.name,
+        )
 
     @property
     def settings(self) -> RendezvousSettings:
         return self._settings
 
     def get_backend(self) -> str:
-        return "core"
+        return self._backend_name
 
     def use_agent_store(self) -> bool:
         # The rendezvous store doubles as the worker bootstrap store and is

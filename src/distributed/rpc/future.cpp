@@ -5,6 +5,31 @@
 
 namespace tensorplay::distributed::rpc {
 
+namespace {
+
+py::object make_callback_exception(const char* message) {
+    PyObject* value = PyObject_CallFunction(PyExc_RuntimeError, "s", message);
+    if (value == nullptr) {
+        PyErr_Clear();
+        return py::none();
+    }
+    return py::reinterpret_steal<py::object>(value);
+}
+
+void fail_child(
+    const std::shared_ptr<RpcFuture>& child,
+    const char* message) {
+    try {
+        py::object exception = make_callback_exception(message);
+        if (!exception.is_none()) {
+            child->set_exception(std::move(exception));
+        }
+    } catch (...) {
+    }
+}
+
+} // namespace
+
 struct RpcFuture::State {
     mutable std::mutex mutex;
     std::condition_variable condition;
@@ -122,6 +147,7 @@ void RpcFuture::set_exception(py::object error) {
 
 void RpcFuture::invoke_callbacks(
     std::vector<std::function<void(py::object)>> callbacks) {
+    py::gil_scoped_acquire gil;
     py::object self = py::cast(shared_from_this());
     for (auto& callback : callbacks) {
         try {
@@ -152,6 +178,10 @@ std::shared_ptr<RpcFuture> RpcFuture::then(py::function callback) {
                         child->set_exception(std::move(exception));
                         error.restore();
                         PyErr_Clear();
+                    } catch (const std::exception& error) {
+                        fail_child(child, error.what());
+                    } catch (...) {
+                        fail_child(child, "RPC future callback failed");
                     }
                 });
         }
@@ -164,6 +194,10 @@ std::shared_ptr<RpcFuture> RpcFuture::then(py::function callback) {
             child->set_exception(std::move(exception));
             error.restore();
             PyErr_Clear();
+        } catch (const std::exception& error) {
+            fail_child(child, error.what());
+        } catch (...) {
+            fail_child(child, "RPC future callback failed");
         }
     }
     return child;

@@ -17,6 +17,7 @@ from .internal import (
     _build_rpc_profiling_key,
     _handle_exception,
     _internal_rpc_pickler,
+    PythonUDF,
 )
 
 T = TypeVar("T")
@@ -384,6 +385,16 @@ def _resolve_timeout(timeout: float | None) -> float | None:
     return float(timeout)
 
 
+def _validate_rpc_call(
+    func: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> None:
+    if not callable(func):
+        raise TypeError("function should be callable")
+    _default_pickler.serialize(PythonUDF(func, args, kwargs))
+
+
 def _resolve_future(value: Any) -> Any:
     if isinstance(value, _Future):
         return value.wait()
@@ -442,6 +453,7 @@ def _submit(
     timeout: float = rpc_constants.UNSET_RPC_TIMEOUT,
 ) -> _Future[Any]:
     if _native_runtime is not None:
+        _validate_rpc_call(func, args, kwargs)
         native_future = _native_runtime.submit(
             target.name,
             func,
@@ -675,11 +687,14 @@ def remote(to: Any, func: Any, args: tuple[Any, ...] | None = None, kwargs: dict
     target = _to_worker_info(to)
     if _native_runtime is None:
         raise RuntimeError("native RPC runtime is not running")
+    call_args = tuple(args or ())
+    call_kwargs = dict(kwargs or {})
+    _validate_rpc_call(func, call_args, call_kwargs)
     native_rref = _native_runtime.remote(
         target.name,
         func,
-        tuple(args or ()),
-        dict(kwargs or {}),
+        call_args,
+        call_kwargs,
         float(timeout),
     )
     return RRef(_native=native_rref)
@@ -696,9 +711,11 @@ def _invoke_rpc(to: Any, func: Any, rpc_type: RPCExecMode, args: tuple[Any, ...]
 @_require_initialized
 def rpc_sync(to: Any, func: Any, args: tuple[Any, ...] | None = None, kwargs: dict[str, Any] | None = None, timeout: float = rpc_constants.UNSET_RPC_TIMEOUT) -> Any:
     target = _to_worker_info(to)
+    call_args = tuple(args or ())
+    call_kwargs = dict(kwargs or {})
     if getattr(_thread_local, "in_rpc", False) and _current_worker is not None and target.name == _current_worker.name:
-        return _execute(func, tuple(args or ()), dict(kwargs or {}), target)
-    return _submit(target, func, tuple(args or ()), dict(kwargs or {}), timeout).wait(_resolve_timeout(timeout))
+        return _execute(func, call_args, call_kwargs, target)
+    return _submit(target, func, call_args, call_kwargs, timeout).wait(_resolve_timeout(timeout))
 
 
 @_require_initialized

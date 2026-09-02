@@ -3,6 +3,8 @@ from .api import (
     AllGatherStates,
     Future,
     RRef,
+    _get_current_rpc_agent,
+    _is_current_rpc_agent_set,
     get_worker_info,
     init_rpc,
     is_available,

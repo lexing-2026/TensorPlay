@@ -186,6 +186,8 @@ replicate.state = staticmethod(_get_state)
 
 def _is_fully_sharded(module: Module) -> bool:
     r"""Check if module is marked with fully_shard."""
+    if getattr(module, "_fsdp_state", None) is not None:
+        return True
     registry = _get_registry(module)
     if registry is None:
         return False

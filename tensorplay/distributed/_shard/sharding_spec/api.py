@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 
 from ..metadata import ShardMetadata
+from ...remote_device import _remote_device
 from ._internals import check_tensor, validate_non_overlapping_shards_metadata
 
 __all__ = ["PlacementSpec", "DevicePlacementSpec", "ShardingSpec", "EnumerableShardingSpec", "custom_sharding_spec_op"]
@@ -60,6 +61,16 @@ class EnumerableShardingSpec(ShardingSpec):
     def __post_init__(self) -> None:
         if not self.shards:
             raise ValueError("shards must not be empty")
+        self.shards = [
+            shard
+            if isinstance(shard.placement, _remote_device)
+            else ShardMetadata(
+                list(shard.shard_offsets),
+                list(shard.shard_sizes),
+                _remote_device(shard.placement),
+            )
+            for shard in self.shards
+        ]
         validate_non_overlapping_shards_metadata(self.shards)
 
     def build_metadata(self, tensor_sizes: Iterable[int], tensor_properties: Any) -> Any:
@@ -69,9 +80,14 @@ class EnumerableShardingSpec(ShardingSpec):
         return ShardedTensorMetadata(list(self.shards), shape, tensor_properties)
 
     def shard(self, tensor: Any, src_rank: int = 0, process_group: Any = None) -> Any:
-        del src_rank, process_group
         from ..sharded_tensor.api import ShardedTensor
-        return ShardedTensor._init_from_global_tensor(self, tensor)
+
+        return ShardedTensor._scatter_from_global_tensor(
+            self,
+            tensor,
+            process_group=process_group,
+            src_rank=src_rank,
+        )
 
 
 def _infer_sharding_spec_from_shards_metadata(shards_metadata: list[ShardMetadata]) -> ShardingSpec:

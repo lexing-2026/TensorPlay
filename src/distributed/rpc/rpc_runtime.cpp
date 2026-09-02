@@ -279,11 +279,24 @@ std::tuple<bool, py::object> RpcRuntime::deserialize_result(
         std::string(message.payload().begin(), message.payload().end()),
         std::vector<py::object>(
             message.tensors().begin(), message.tensors().end())));
-    py::tuple result = value.cast<py::tuple>();
-    if (result.size() != 2) {
+    if (!PyTuple_Check(value.ptr()) && !PyList_Check(value.ptr())) {
+        throw std::runtime_error("RPC response must be a sequence");
+    }
+    const Py_ssize_t result_size = PySequence_Size(value.ptr());
+    if (result_size < 0) {
+        throw py::error_already_set();
+    }
+    if (result_size != 2) {
         throw std::runtime_error("RPC response must contain status and value");
     }
-    return {result[0].cast<bool>(), result[1]};
+    py::object success = py::reinterpret_steal<py::object>(
+        PySequence_GetItem(value.ptr(), 0));
+    py::object result = py::reinterpret_steal<py::object>(
+        PySequence_GetItem(value.ptr(), 1));
+    if (!success || !result) {
+        throw py::error_already_set();
+    }
+    return {success.cast<bool>(), std::move(result)};
 }
 
 py::object RpcRuntime::make_exception(const std::string& message) {
@@ -312,7 +325,7 @@ void RpcRuntime::init(
     if (num_worker_threads <= 0) {
         throw std::invalid_argument("number of RPC worker threads must be positive");
     }
-    if (timeout_seconds < 0.0) {
+    if (!std::isfinite(timeout_seconds) || timeout_seconds < 0.0) {
         throw std::invalid_argument("RPC timeout must be non-negative");
     }
     std::vector<WorkerInfo> configured_workers{{name, rank}};
@@ -351,7 +364,7 @@ void RpcRuntime::init(
             throw std::runtime_error("RPC runtime is already initialized");
         }
         workers_ = std::move(configured_workers);
-        worker_info_ = workers_[static_cast<size_t>(rank)];
+        worker_info_ = workers_.front();
         current_rank_ = rank;
         world_size_ = world_size;
         num_worker_threads_ = num_worker_threads;
@@ -360,6 +373,7 @@ void RpcRuntime::init(
         set_rpc_timeout(timeout_to_duration(timeout_seconds));
         stopping_ = false;
         started_ = false;
+        lifetime_token_->store(true, std::memory_order_release);
         initialized_ = true;
     }
     tensorplay::distributed::autograd::DistAutogradContainer::init(
@@ -599,7 +613,13 @@ std::shared_ptr<RpcRRef> RpcRuntime::remote(
         throw;
     }
     return std::make_shared<RpcRRef>(
-        this, worker, id, fork, std::move(creation), std::move(local_state));
+        this,
+        worker,
+        id,
+        fork,
+        std::move(creation),
+        std::move(local_state),
+        lifetime_token_);
 }
 
 std::shared_ptr<RpcRRef> RpcRuntime::restore_rref(
@@ -627,7 +647,8 @@ std::shared_ptr<RpcRRef> RpcRuntime::restore_rref(
         rref_id,
         ForkId(current_rank_, next_local_id_.fetch_add(1)),
         std::move(creation),
-        std::move(local_state));
+        std::move(local_state),
+        lifetime_token_);
     if (worker.id != current_rank_) {
         fork_rref(*result);
     }
@@ -696,9 +717,9 @@ void RpcRuntime::execute_callable(Task& task) {
         started,
         finished,
         failed);
-    task.callable = py::none();
-    task.args = py::tuple();
-    task.kwargs = py::dict();
+    task.callable = py::object();
+    task.args = py::object();
+    task.kwargs = py::object();
 }
 
 void RpcRuntime::execute_message(Task& task) {
@@ -859,9 +880,9 @@ void RpcRuntime::execute_task(Task task) {
     }
     {
         py::gil_scoped_acquire gil;
-        task.callable = py::none();
-        task.args = py::tuple();
-        task.kwargs = py::dict();
+        task.callable = py::object();
+        task.args = py::object();
+        task.kwargs = py::object();
     }
     if (task.message) {
         task.message.reset();
@@ -1539,18 +1560,67 @@ RpcRuntime::RpcFrame RpcRuntime::handle_delete(const RpcFrame& frame) {
 RpcRuntime::RpcFrame RpcRuntime::handle_gather(const RpcFrame& frame) {
     py::gil_scoped_acquire gil;
     try {
-        const py::tuple request = deserialize_python_object(
-            serialized_message(frame)).cast<py::tuple>();
-        if (request.size() != 6) {
+        py::object decoded = deserialize_python_object(serialized_message(frame));
+        if (!PyTuple_Check(decoded.ptr()) && !PyList_Check(decoded.ptr())) {
+            throw std::runtime_error("collective request must be a sequence");
+        }
+        const Py_ssize_t request_size = PySequence_Size(decoded.ptr());
+        if (request_size < 0) {
+            throw py::error_already_set();
+        }
+        if (request_size != 6) {
             throw std::runtime_error(
                 "collective request must contain six values");
         }
-        const std::string collective_id = request[0].cast<std::string>();
-        const worker_id_t source_id = request[1].cast<worker_id_t>();
-        const worker_id_t leader_id = request[2].cast<worker_id_t>();
-        const int phase = request[4].cast<int>();
-        const py::object value = request[5];
-        const auto expected = request[3].cast<std::vector<worker_id_t>>();
+        auto request_item = [&decoded](Py_ssize_t index) {
+            return py::reinterpret_steal<py::object>(
+                PySequence_GetItem(decoded.ptr(), index));
+        };
+        py::object collective_id_object = request_item(0);
+        py::object source_id_object = request_item(1);
+        py::object leader_id_object = request_item(2);
+        py::object worker_list = request_item(3);
+        py::object phase_object = request_item(4);
+        py::object value = request_item(5);
+        if (!collective_id_object || !source_id_object ||
+            !leader_id_object || !worker_list || !phase_object || !value) {
+            throw py::error_already_set();
+        }
+        const std::string collective_id = collective_id_object.cast<std::string>();
+        const int64_t source_value = source_id_object.cast<int64_t>();
+        const int64_t leader_value = leader_id_object.cast<int64_t>();
+        if (source_value < std::numeric_limits<worker_id_t>::min() ||
+            source_value > std::numeric_limits<worker_id_t>::max() ||
+            leader_value < std::numeric_limits<worker_id_t>::min() ||
+            leader_value > std::numeric_limits<worker_id_t>::max()) {
+            throw std::runtime_error("collective worker id is out of range");
+        }
+        const worker_id_t source_id = static_cast<worker_id_t>(source_value);
+        const worker_id_t leader_id = static_cast<worker_id_t>(leader_value);
+        const int phase = phase_object.cast<int>();
+        if (!PyList_Check(worker_list.ptr()) &&
+            !PyTuple_Check(worker_list.ptr())) {
+            throw std::runtime_error("collective worker list is invalid");
+        }
+        std::vector<worker_id_t> expected;
+        const auto expected_size = PySequence_Size(worker_list.ptr());
+        if (expected_size < 0) {
+            throw py::error_already_set();
+        }
+        expected.reserve(static_cast<size_t>(expected_size));
+        for (Py_ssize_t index = 0; index < expected_size; ++index) {
+            py::object item = py::reinterpret_steal<py::object>(
+                PySequence_GetItem(worker_list.ptr(), index));
+            if (!item) {
+                throw py::error_already_set();
+            }
+            const int64_t worker_id = item.cast<int64_t>();
+            if (worker_id < std::numeric_limits<worker_id_t>::min() ||
+                worker_id > std::numeric_limits<worker_id_t>::max()) {
+                throw std::runtime_error("collective worker id is out of range");
+            }
+            expected.push_back(static_cast<worker_id_t>(worker_id));
+        }
         if (collective_id.empty() || expected.empty()) {
             throw std::runtime_error("collective request is invalid");
         }
@@ -1609,7 +1679,10 @@ RpcRuntime::RpcFrame RpcRuntime::handle_gather(const RpcFrame& frame) {
                 throw std::runtime_error(
                     "collective broadcast was received more than once");
             }
-            state->gathered = value.cast<py::dict>();
+            if (!PyDict_Check(value.ptr())) {
+                throw std::runtime_error("collective broadcast value is invalid");
+            }
+            state->gathered = py::reinterpret_borrow<py::dict>(value);
             state->ready = true;
             state->condition.notify_all();
         }
@@ -1624,7 +1697,9 @@ RpcRuntime::RpcFrame RpcRuntime::handle_gather(const RpcFrame& frame) {
         return response_frame(
             frame.request_id,
             MessageType::PYTHON_GATHER_RET,
-            serialize_result(false, py::str(message)));
+            serialize_result(
+                false,
+                py::str(("collective request failed: " + message).c_str())));
     } catch (const std::exception& error) {
         return response_frame(
             frame.request_id,
@@ -1773,22 +1848,39 @@ MessagePtr RpcRuntime::send_collective(
     int phase,
     py::object value,
     double timeout_seconds) const {
-    SerializedPyObj object = serialize_python_object(
-        py::make_tuple(
-            collective_id,
-            current_rank_,
-            leader_id,
-            group_ids,
-            phase,
-            std::move(value)));
+    SerializedPyObj object;
+    try {
+        py::list python_group_ids;
+        for (const auto worker_id : group_ids) {
+            python_group_ids.append(static_cast<int64_t>(worker_id));
+        }
+        object = serialize_python_object(
+            py::make_tuple(
+                collective_id,
+                current_rank_,
+                leader_id,
+                python_group_ids,
+                phase,
+                std::move(value)));
+    } catch (py::error_already_set& error) {
+        const std::string message = error.what();
+        error.restore();
+        PyErr_Clear();
+        throw std::runtime_error("collective serialization failed: " + message);
+    }
     auto message = make_python_message(
         std::move(object), MessageType::PYTHON_GATHER_CALL);
     py::gil_scoped_release release;
-    return send_message(
-        to,
-        std::move(message),
-        timeout_seconds,
-        RpcRetryOptions{0, 1000, 1.5});
+    try {
+        auto response = send_message(
+            to,
+            std::move(message),
+            timeout_seconds,
+            RpcRetryOptions{0, 1000, 1.5});
+        return response;
+    } catch (...) {
+        throw;
+    }
 }
 
 py::dict RpcRuntime::all_gather(
@@ -1841,14 +1933,20 @@ py::dict RpcRuntime::all_gather(
     }
     const std::string collective_id =
         group_key + "#" + std::to_string(sequence);
-    auto state = std::make_shared<CollectiveState>();
-    state->expected = group_ids;
+    std::shared_ptr<CollectiveState> state;
     {
         std::lock_guard<std::mutex> lock(collective_mutex_);
-        const auto [iterator, inserted] =
+        const auto iterator = collective_states_.find(collective_id);
+        if (iterator == collective_states_.end()) {
+            state = std::make_shared<CollectiveState>();
+            state->expected = group_ids;
             collective_states_.emplace(collective_id, state);
-        if (!inserted) {
-            throw std::runtime_error("collective sequence is already active");
+        } else {
+            state = iterator->second;
+            if (!state || state->expected != group_ids) {
+                throw std::runtime_error(
+                    "collective group changed during an active operation");
+            }
         }
     }
     const auto remove_state = [this, &collective_id, &state]() {
@@ -2005,6 +2103,7 @@ RpcFuturePtr RpcRuntime::send_with_retries(
             "RPC destination name and id do not match");
     }
     if (options.max_retries < 0 || options.retry_duration_ms < 0 ||
+        !std::isfinite(options.retry_backoff) ||
         options.retry_backoff < 1.0) {
         throw std::invalid_argument("invalid RPC retry options");
     }
@@ -2130,6 +2229,7 @@ DeviceMap RpcRuntime::reverse_device_map_for(const std::string& worker) const {
 }
 
 void RpcRuntime::shutdown() {
+    std::unique_lock<std::mutex> shutdown_lock(shutdown_mutex_);
     std::shared_ptr<tensorpipe::Listener> listener;
     std::shared_ptr<tensorpipe::Context> context;
     {
@@ -2137,6 +2237,7 @@ void RpcRuntime::shutdown() {
         if (!initialized_) {
             return;
         }
+        lifetime_token_->store(false, std::memory_order_release);
         stopping_ = true;
         started_ = false;
         listener = tensorpipe_listener_;
@@ -2149,6 +2250,7 @@ void RpcRuntime::shutdown() {
     if (context) {
         context->close();
     }
+    bool called_from_worker = false;
     std::vector<std::shared_ptr<ClientPipe>> client_pipes;
     {
         std::lock_guard<std::mutex> lock(client_mutex_);
@@ -2164,17 +2266,28 @@ void RpcRuntime::shutdown() {
     }
     for (auto& worker : worker_threads_) {
         if (worker.joinable()) {
-            worker.join();
+            if (worker.get_id() == std::this_thread::get_id()) {
+                called_from_worker = true;
+                worker.detach();
+            } else {
+                worker.join();
+            }
         }
     }
     std::vector<std::thread> pipes;
+    bool called_from_pipe = false;
     {
         std::lock_guard<std::mutex> lock(client_mutex_);
         pipes.swap(pipe_threads_);
     }
     for (auto& pipe : pipes) {
         if (pipe.joinable()) {
-            pipe.join();
+            if (pipe.get_id() == std::this_thread::get_id()) {
+                called_from_pipe = true;
+                pipe.detach();
+            } else {
+                pipe.join();
+            }
         }
     }
     if (context) {
@@ -2195,7 +2308,7 @@ void RpcRuntime::shutdown() {
         tensorpipe_listener_.reset();
         tensorpipe_context_.reset();
         initialized_ = false;
-        stopping_ = false;
+        stopping_ = called_from_worker || called_from_pipe;
         rendezvous_prefix_.clear();
         bootstrap_transport_.clear();
         transports_.reset();
@@ -2213,6 +2326,9 @@ void RpcRuntime::shutdown() {
     }
     rrefs_.clear();
     profiler::shutdown_server_profiler();
+    if (RpcAgent::current_rpc_agent() == this) {
+        RpcAgent::set_current_rpc_agent(nullptr);
+    }
 }
 
 void RpcRuntime::join(bool should_shutdown, double timeout_seconds) {

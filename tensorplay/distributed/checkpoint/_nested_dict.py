@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 from typing import Any
 
 __all__ = ["flatten_state_dict", "unflatten_state_dict"]
@@ -15,7 +15,13 @@ def flatten_state_dict(state_dict: Mapping[str, Any]) -> tuple[dict[str, Any], d
             for key, child in value.items():
                 visit(child, path + (key,))
             return
+        if isinstance(value, (list, tuple)):
+            for index, child in enumerate(value):
+                visit(child, path + (index,))
+            return
         key = ".".join(str(part) for part in path)
+        if key in flat:
+            raise ValueError(f"duplicated flattened key {key}")
         flat[key] = value
         mapping[key] = path
 
@@ -23,13 +29,46 @@ def flatten_state_dict(state_dict: Mapping[str, Any]) -> tuple[dict[str, Any], d
     return flat, mapping
 
 
-def unflatten_state_dict(state_dict: Mapping[str, Any], mappings: Mapping[str, tuple[Any, ...]] | None = None) -> dict[str, Any]:
+def _set_element(root: MutableMapping[Any, Any], path: tuple[Any, ...], value: Any) -> None:
+    if not path:
+        raise ValueError("object path cannot be empty")
+    current: Any = root
+    for index, key in enumerate(path[:-1]):
+        next_key = path[index + 1]
+        default: Any = [] if isinstance(next_key, int) else {}
+        if isinstance(current, MutableMapping):
+            if key not in current:
+                current[key] = default
+            current = current[key]
+        else:
+            if not isinstance(key, int):
+                raise TypeError("list path components must be integers")
+            while len(current) <= key:
+                current.append(None)
+            if current[key] is None:
+                current[key] = default
+            current = current[key]
+    last = path[-1]
+    if isinstance(current, MutableMapping):
+        current[last] = value
+    else:
+        if not isinstance(last, int):
+            raise TypeError("list path components must be integers")
+        while len(current) <= last:
+            current.append(None)
+        current[last] = value
+
+
+def unflatten_state_dict(
+    state_dict: Mapping[str, Any],
+    mappings: Mapping[str, tuple[Any, ...]] | None = None,
+) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for flat_key, value in state_dict.items():
-        path = mappings.get(flat_key) if mappings is not None else tuple(flat_key.split("."))
-        current: dict[str, Any] = result
-        for part in path[:-1]:
-            current = current.setdefault(str(part), {})
-        if path:
-            current[str(path[-1])] = value
+        path = (
+            tuple(mappings[flat_key])
+            if mappings is not None and flat_key in mappings
+            else tuple(flat_key.split("."))
+        )
+        _set_element(result, path, value)
     return result

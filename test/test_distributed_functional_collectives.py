@@ -43,6 +43,12 @@ def _body(rank, world_size, port):
         (reduced.sum()).backward()
         assert value.grad.tolist() == [2.0, 2.0]
 
+        complex_value = tp.tensor(
+            [complex(rank + 1, rank + 2)], dtype=tp.complex64
+        )
+        complex_reduced = funcol.all_reduce(complex_value)
+        assert complex_reduced.tolist() == [3 + 5j]
+
         gathered_input = tp.full((2,), float(rank), dtype=tp.float32)
         gathered = funcol.all_gather_single(gathered_input)
         assert gathered.tolist() == [0.0, 0.0, 1.0, 1.0]

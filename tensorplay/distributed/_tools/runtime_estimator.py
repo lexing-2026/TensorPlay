@@ -78,7 +78,7 @@ class RuntimeEstimator:
             if name.count(".") + 1 <= depth:
                 print(f"{name} fw: {values.get('fw', 0.0):.3f}ms bw: {values.get('bw', 0.0):.3f}ms")
 
-    def __torch_dispatch__(self, func: Callable[..., Any], types: Any, args: tuple[Any, ...] = (), kwargs: dict[str, Any] | None = None) -> Any:
+    def __tensorplay_dispatch__(self, func: Callable[..., Any], types: Any, args: tuple[Any, ...] = (), kwargs: dict[str, Any] | None = None) -> Any:
         del types
         result, elapsed = self._estimate(func, args, kwargs)
         phase = "bw" if self._mod_tracker.is_bw else "fw"

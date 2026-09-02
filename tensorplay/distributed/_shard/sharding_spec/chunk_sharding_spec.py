@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 from ..metadata import ShardMetadata
+from ...remote_device import _remote_device
 from ._internals import get_chunked_dim_size, get_split_size
 from .api import ShardingSpec
 
@@ -20,6 +21,12 @@ class ChunkShardingSpec(ShardingSpec):
             raise TypeError("chunk sharding dimension must be an integer")
         if not self.placements:
             raise ValueError("placements must not be empty")
+        self.placements = [
+            placement
+            if isinstance(placement, _remote_device)
+            else _remote_device(placement)
+            for placement in self.placements
+        ]
 
     def build_metadata(self, tensor_sizes: Iterable[int], tensor_properties: Any) -> Any:
         shape = tuple(int(value) for value in tensor_sizes)
@@ -38,6 +45,11 @@ class ChunkShardingSpec(ShardingSpec):
         return ShardedTensorMetadata(shards, shape, tensor_properties)
 
     def shard(self, tensor: Any, src_rank: int = 0, process_group: Any = None) -> Any:
-        del src_rank, process_group
         from ..sharded_tensor.api import ShardedTensor
-        return ShardedTensor._init_from_global_tensor(self, tensor)
+
+        return ShardedTensor._scatter_from_global_tensor(
+            self,
+            tensor,
+            process_group=process_group,
+            src_rank=src_rank,
+        )

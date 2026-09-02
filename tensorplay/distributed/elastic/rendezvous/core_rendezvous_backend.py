@@ -184,7 +184,7 @@ def _create_tcp_store(params: RendezvousParameters) -> TCPStore:
                 timeout=float(read_timeout),
                 wait_for_workers=False,
             )
-        except OSError:
+        except (OSError, RuntimeError):
             pass
     try:
         return TCPStore(

@@ -13,6 +13,14 @@ bool Store::wait(
   if (check(keys)) {
     return true;
   }
+  if (timeout.count() < 0) {
+    for (;;) {
+      if (check(keys)) {
+        return true;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  }
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   for (;;) {
     if (check(keys)) {

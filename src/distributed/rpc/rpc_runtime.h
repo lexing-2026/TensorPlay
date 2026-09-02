@@ -141,8 +141,8 @@ private:
         bool valid = false;
         TaskKind kind = TaskKind::CALL;
         py::object callable;
-        py::tuple args;
-        py::dict kwargs;
+        py::object args;
+        py::object kwargs;
         MessagePtr message;
         RpcFuturePtr future;
         std::string target;
@@ -167,6 +167,7 @@ private:
     };
 
     mutable std::mutex mutex_;
+    mutable std::mutex shutdown_mutex_;
     std::condition_variable condition_;
     std::condition_variable idle_condition_;
     std::deque<Task> queue_;
@@ -207,6 +208,8 @@ private:
     mutable RRefContext rrefs_;
     mutable metrics::RpcMetricsHandler metrics_;
     mutable std::mutex profiler_mutex_;
+    std::shared_ptr<std::atomic<bool>> lifetime_token_ =
+        std::make_shared<std::atomic<bool>>(true);
 
     WorkerInfo resolve_worker(const std::string& name) const;
     void task_started();
