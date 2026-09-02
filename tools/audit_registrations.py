@@ -4,7 +4,11 @@
 Report ops that would raise MissingDeviceKernel on CPU and/or CUDA."""
 import os
 import re
+import sys
 from collections import defaultdict
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from audit_macro_expander import preprocess
 
 ROOTS = ["p10/src", "tpx/src"]
 
@@ -22,6 +26,7 @@ for root in ROOTS:
                 text = open(path, encoding="utf-8", errors="ignore").read()
             except OSError:
                 continue
+            text = preprocess(text)
             for m in reg_re.finditer(text):
                 key = m.group(1)
                 i = text.find("{", m.end())

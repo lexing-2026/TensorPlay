@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
 """Audit: which ops declare CPU/CUDA dispatch in native_functions.yaml but have
-no kernel symbol defined anywhere under p10/ (or tpx/)."""
+no kernel symbol defined anywhere under p10/ (or tpx/).
+
+Registration macros are expanded first (see audit_macro_expander) so kernels
+defined only through NAME(#OP)-style macros are recognized."""
+import os
+from collections import defaultdict
 import re
 import subprocess
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from audit_macro_expander import preprocess
 
 YAML = "config/native_functions.yaml"
 
@@ -50,12 +58,36 @@ files = subprocess.run(
     capture_output=True, text=True).stdout.split()
 tok_re = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
 identifiers = set()
+impl_re = re.compile(r'm\.impl\(\s*"([^"]+)"')
+reg_re = re.compile(r"TENSORPLAY_LIBRARY_IMPL\(\s*([A-Za-z0-9_]+)\s*,")
+registered = defaultdict(set)  # dispatch key -> {opname}
 for f in files:
     try:
         content = open(f, encoding="utf-8", errors="ignore").read()
     except OSError:
         continue
-    identifiers.update(tok_re.findall(content))
+    pre = preprocess(content)
+    identifiers.update(tok_re.findall(pre))
+    # A yaml dispatch symbol is satisfied when the op itself is registered on
+    # that backend, even if the live kernel has a different (macro-generated)
+    # name than the one documented in the yaml dispatch field.
+    for m in reg_re.finditer(pre):
+        key = m.group(1)
+        i = pre.find("{", m.end())
+        if i < 0:
+            continue
+        depth = 0
+        j = i
+        while j < len(pre):
+            if pre[j] == "{":
+                depth += 1
+            elif pre[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        for im in impl_re.finditer(pre[i:j]):
+            registered[key].add(im.group(1))
 
 missing = {sym for sym in symbols if sym not in identifiers}
 
@@ -66,10 +98,24 @@ for func, backend, sym in entries:
     if backend in ("CPU", "CUDA"):
         by_op[func][backend] = sym
 
+
+def op_base(func):
+    """yaml `func:` line -> base op name (e.g. `sub.Tensor(Tensor self...)`)."""
+    m = re.match(r"([A-Za-z0-9_]+(?:\.[A-Za-z0-9_.]+)*)\(", func)
+    return m.group(1) if m else func
+
+
+def op_registered(func, backend):
+    name = op_base(func)
+    keys = {backend, "Composite"} if backend == "CPU" else {backend, "Composite"}
+    return any(name in registered[k] for k in keys)
+
+
 print("=== ops with dispatch entries whose kernel symbol never appears in p10/tpx ===")
 for func in sorted(by_op):
     backends = by_op[func]
-    miss = [b for b, sym in backends.items() if sym in missing]
+    miss = [b for b, sym in backends.items()
+            if sym in missing and not op_registered(func, b)]
     if miss:
         print(f"{func}\n    missing: {miss}  syms: {[backends[b] for b in miss]}")
 print(f"\ntotal ops with CPU/CUDA dispatch: {len(by_op)}, symbols checked: {len(symbols)}, "
