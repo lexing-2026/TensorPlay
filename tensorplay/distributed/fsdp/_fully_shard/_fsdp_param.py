@@ -164,6 +164,7 @@ class FSDPParam:
         self._gradient_hook_nodes: list[Any] = []
         self._full_gradient_hook_handle: Any = None
         self._full_gradient_hook_node: Any = None
+        self._unsharded_grad: Any = None
         self._unsharded_param: Any = None
         self._unsharded_inner_tensors: list[Any] = []
         self._release_all_gather_outputs_after_post_all_gather = False
@@ -832,7 +833,7 @@ class FSDPParam:
 
     def to_accumulated_grad_if_needed(self) -> Any:
         unsharded = self._unsharded_param
-        gradient = getattr(unsharded, "grad", None)
+        gradient = self._unsharded_gradient()
         if (
             self.reduce_dtype is None
             or unsharded is None
@@ -840,18 +841,22 @@ class FSDPParam:
             or getattr(gradient, "dtype", None) == self.reduce_dtype
         ):
             return None
-        unsharded.grad = None
+        if unsharded is not None:
+            unsharded.grad = None
+        self._unsharded_grad = None
         self.unsharded_accumulated_grad = gradient.to(dtype=self.reduce_dtype)
         return None
 
     def accumulate_unsharded_grad_if_needed(self) -> Any:
         unsharded = self._unsharded_param
-        gradient = getattr(unsharded, "grad", None)
+        gradient = self._unsharded_gradient()
         if self.unsharded_accumulated_grad is not None and gradient is not None:
             self.unsharded_accumulated_grad = (
                 self.unsharded_accumulated_grad + gradient
             )
-            unsharded.grad = None
+            if unsharded is not None:
+                unsharded.grad = None
+            self._unsharded_grad = None
         return None
 
     def alloc_all_gather_outputs(self) -> None:
@@ -893,16 +898,26 @@ class FSDPParam:
         return self._full_tensor
 
     def unsharded_grad_data(self) -> Any:
-        return getattr(self._full_tensor, "grad", None)
+        gradient = self._unsharded_gradient()
+        if gradient is None:
+            raise RuntimeError("unsharded parameter gradient is unavailable")
+        return self._get_grad_inner_tensor(gradient)
 
     def unsharded_accumulated_grad_data(self) -> Any:
-        return self._sharded_grad
+        if self.unsharded_accumulated_grad is None:
+            raise RuntimeError("accumulated unsharded gradient is unavailable")
+        return self._get_grad_inner_tensor(self.unsharded_accumulated_grad)
 
     def unsharded_zero_grad_data(self) -> Any:
         return tp.zeros_like(self.unsharded_param())
 
     def _get_grad_inner_tensor(self, grad: Any) -> Any:
         return grad.to_local() if isinstance(grad, DTensor) else grad
+
+    def _unsharded_gradient(self) -> Any:
+        if self._unsharded_grad is not None:
+            return self._unsharded_grad
+        return getattr(self._unsharded_param, "grad", None)
 
     def _sharded_local_tensor(self) -> Any:
         if self._state == ShardedState.SHARDED_POST_FORWARD:
@@ -973,6 +988,8 @@ class FSDPParam:
 
     def _set_sharded_grad(self, grad: Any) -> None:
         self._sharded_grad = grad
+        target = self._sharded_local_tensor()
+        target.grad = grad
 
     def __repr__(self) -> str:
         return f"FSDPParam(fqn={self.module_info.fqn!r}, state={self._state!r})"
