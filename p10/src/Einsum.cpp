@@ -8,27 +8,7 @@
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "Exception.h"
-
-namespace tensorplay {
-namespace tpx {
-namespace ops {
-// Dispatcher-level entry points (defined in TPXOpsGenerated.cpp).  Declared
-// locally because tpx headers are not visible below the p10 layer.  Unlike
-// the codegen Tensor members -- which silently skip autograd when no
-// autograd-key kernel is registered -- these always build the backward node,
-// keeping einsum CompositeImplicitAutograd-exact.
-TENSORPLAY_API Tensor bmm(const Tensor& self, const Tensor& mat2);
-TENSORPLAY_API Tensor view(const Tensor& self, const std::vector<int64_t>& shape);
-TENSORPLAY_API Tensor mm(const Tensor& self, const Tensor& mat2);
-TENSORPLAY_API Tensor mv(const Tensor& self, const Tensor& vec);
-TENSORPLAY_API Tensor dot(const Tensor& self, const Tensor& tensor);
-TENSORPLAY_API Tensor outer(const Tensor& self, const Tensor& vec2);
-TENSORPLAY_API Tensor transpose(const Tensor& self, int64_t dim0, int64_t dim1);
-TENSORPLAY_API Tensor permute(const Tensor& self, const std::vector<int64_t>& dims);
-TENSORPLAY_API Tensor reshape(const Tensor& self, const std::vector<int64_t>& shape);
-} // namespace ops
-} // namespace tpx
-} // namespace tensorplay
+#include "tensorplay/ops/TPXOpsGenerated.h"
 
 #include <algorithm>
 #include <array>

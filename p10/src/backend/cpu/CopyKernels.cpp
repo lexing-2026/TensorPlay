@@ -183,6 +183,24 @@ void dispatch_dtype(DType dtype, F&& callback) {
         return; \
     }
 
+    // Quantized dtypes share their underlying integer code type: copies and
+    // casts move the raw codes, quantizer metadata rides on the impl.
+    switch (dtype) {
+        case DType::QInt8: {
+            callback(TypeTag<int8_t>{});
+            return;
+        }
+        case DType::QUInt8: {
+            callback(TypeTag<uint8_t>{});
+            return;
+        }
+        case DType::QInt32: {
+            callback(TypeTag<int32_t>{});
+            return;
+        }
+        default:
+            break;
+    }
     switch (dtype) {
         TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX_AND_FP8(DISPATCH_CASE)
         default:

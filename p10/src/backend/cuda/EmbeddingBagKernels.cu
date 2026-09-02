@@ -107,7 +107,7 @@ __global__ void bag_size_kernel(const IndexT* __restrict__ indices,
     if (static_cast<int64_t>(indices[i]) != padding_idx) ++count;
   }
   for (int offset = kWarp / 2; offset > 0; offset >>= 1) {
-    count += __shfl_down_sync(0xffffffffu, count, offset);
+    count += __shfl_down_sync(0xffffffffffffffffull, count, offset);
   }
   if (threadIdx.x == 0) bag_size[bag] = count;
 }
@@ -286,7 +286,7 @@ __global__ void bag_psw_backward_kernel(const T* __restrict__ grad,
     dot += static_cast<AccT>(grad[bag * D + d]) * static_cast<AccT>(weight[r * D + d]);
   }
   for (int offset = kWarp / 2; offset > 0; offset >>= 1) {
-    dot += __shfl_down_sync(0xffffffffu, dot, offset);
+    dot += __shfl_down_sync(0xffffffffffffffffull, dot, offset);
   }
   if (threadIdx.x == 0) output[i] = static_cast<T>(dot);
 }

@@ -128,18 +128,17 @@ VulkanBuffer MemoryAllocator::create_storage_buffer(
     const VkDeviceSize size,
     const bool gpu_only,
     const bool allocate_memory) {
-  const VmaAllocationCreateInfo allocation_create_info{
-      VMA_ALLOCATION_CREATE_STRATEGY_MIN_MEMORY_BIT, // flags
-      VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, // usage
-      gpu_only
-          ? 0u
-          : VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
-              VMA_ALLOCATION_CREATE_MAPPED_BIT, // requiredFlags
-      0u, // preferredFlags
-      0u, // memoryTypeBits
-      VK_NULL_HANDLE, // pool
-      nullptr, // pUserData
-  };
+  VmaAllocationCreateInfo allocation_create_info{};
+  allocation_create_info.flags = DEFAULT_ALLOCATION_STRATEGY;
+  allocation_create_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+
+  if (!gpu_only) {
+    // The buffer will be accessed by both the CPU and the GPU, so request
+    // host-visible memory through the host access flags.
+    allocation_create_info.flags |=
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
+    allocation_create_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+  }
 
   return VulkanBuffer{
       allocator_,
@@ -152,17 +151,12 @@ VulkanBuffer MemoryAllocator::create_storage_buffer(
 }
 
 VulkanBuffer MemoryAllocator::create_staging_buffer(const VkDeviceSize size) {
-  const VmaAllocationCreateInfo allocation_create_info{
-      VMA_ALLOCATION_CREATE_STRATEGY_MIN_MEMORY_BIT |
-          VMA_ALLOCATION_CREATE_MAPPED_BIT, // flags
-      VMA_MEMORY_USAGE_AUTO, // usage
+  VmaAllocationCreateInfo allocation_create_info{};
+  allocation_create_info.flags =
+      DEFAULT_ALLOCATION_STRATEGY |
       VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
-          VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT, // requiredFlags
-      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, // preferredFlags
-      0u, // memoryTypeBits
-      VK_NULL_HANDLE, // pool
-      nullptr, // pUserData
-  };
+      VMA_ALLOCATION_CREATE_MAPPED_BIT;
+  allocation_create_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
 
   return VulkanBuffer{
       allocator_,
@@ -174,16 +168,11 @@ VulkanBuffer MemoryAllocator::create_staging_buffer(const VkDeviceSize size) {
 }
 
 VulkanBuffer MemoryAllocator::create_uniform_buffer(const VkDeviceSize size) {
-  const VmaAllocationCreateInfo allocation_create_info{
-      VMA_ALLOCATION_CREATE_STRATEGY_MIN_MEMORY_BIT |
-          VMA_ALLOCATION_CREATE_MAPPED_BIT, // flags
-      VMA_MEMORY_USAGE_AUTO, // usage
-      VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT, // requiredFlags
-      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, // preferredFlags
-      0u, // memoryTypeBits
-      VK_NULL_HANDLE, // pool
-      nullptr, // pUserData
-  };
+  VmaAllocationCreateInfo allocation_create_info{};
+  allocation_create_info.flags =
+      DEFAULT_ALLOCATION_STRATEGY |
+      VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
+  allocation_create_info.usage = VMA_MEMORY_USAGE_AUTO;
 
   return VulkanBuffer{
       allocator_,

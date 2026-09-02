@@ -18,10 +18,10 @@ static constexpr int kUniqueIdBytes = 128;
 
 enum class ReduceOp : int {
     Sum = 0,
-    Prod = 1,
-    Max = 2,
+    Avg = 1,
+    Prod = 2,
     Min = 3,
-    Avg = 4,
+    Max = 4,
 };
 
 // Returns true when NCCL support was compiled in.

@@ -5,8 +5,15 @@
 #include "Allocator.h"
 #include "CudaGemm.h"
 #include "GradMode.h"
+#include "../composite/AttentionComposite.h"
 #include <cuda_runtime.h>
+// Tensor-core primitive API (wmma) is CUDA-toolchain-only; the HIP
+// toolchain ships no equivalent, so the WMMA kernel variants and the
+// CUTLASS-based native flash path are compiled out there.  The dispatch
+// branches that select them report the limitation explicitly.
+#if !defined(USE_ROCM)
 #include <mma.h>
+#endif
 #include <optional>
 #include <vector>
 #include <algorithm>
@@ -17,7 +24,8 @@
 
 // Native aligned flash reference.  This is the standalone CUDA/CUTE kernel
 // source used for the schedule comparison; FLASHATTENTION_DISABLE_DROPOUT
-#if __has_include("../../../../third_party/pytorch/third_party/flash-attention/csrc/flash_attn/src/flash.h") && \
+#if !defined(USE_ROCM) && \
+    __has_include("../../../../third_party/pytorch/third_party/flash-attention/csrc/flash_attn/src/flash.h") && \
     __has_include("../../../../third_party/pytorch/third_party/cutlass/include/cute/tensor.hpp")
 #define TP_HAS_NATIVE_CUTE_FLASH 1
 #define FLASHATTENTION_DISABLE_DROPOUT
@@ -68,7 +76,7 @@ template <typename T>
 __device__ inline T warpReduceMax(T val) {
 #pragma unroll
   for (int offset = 16; offset > 0; offset >>= 1)
-    val = max(val, __shfl_down_sync(0xffffffff, val, offset));
+    val = max(val, __shfl_down_sync(0xffffffffffffffffull, val, offset));
   return val;
 }
 
@@ -76,7 +84,7 @@ template <typename T>
 __device__ inline T warpReduceSum(T val) {
 #pragma unroll
   for (int offset = 16; offset > 0; offset >>= 1)
-    val += __shfl_down_sync(0xffffffff, val, offset);
+    val += __shfl_down_sync(0xffffffffffffffffull, val, offset);
   return val;
 }
 
@@ -328,7 +336,7 @@ __global__ void sdpa_warp_flash_kernel(
   constexpr int q_rows_per_block = 4;
   constexpr int k_tile = 64;
   constexpr int warp_threads = 32;
-  constexpr unsigned full_mask = 0xffffffffu;
+  constexpr unsigned long long full_mask = 0xffffffffffffffffull;
 
   const int lane = threadIdx.x & (warp_threads - 1);
   const int warp = threadIdx.x / warp_threads;
@@ -465,7 +473,7 @@ __global__ void sdpa_softmax_kernel(
   if (row >= rows * tokens) return;
   const int64_t token = row % tokens;
   DT* values = scores + row * tokens;
-  constexpr unsigned full_mask = 0xffffffffu;
+  constexpr unsigned long long full_mask = 0xffffffffffffffffull;
 
   // One warp is enough for a row and avoids the three block-wide barriers in
   // the old 256-thread reducer.  Each lane still walks a coalesced strip of
@@ -503,6 +511,7 @@ __device__ inline __half tp_half_to_cuda(tensorplay::Half value) {
   return *reinterpret_cast<const __half*>(&value);
 }
 
+#if !defined(USE_ROCM)
 __device__ inline tensorplay::Half tp_half_from_cuda(__half value) {
   tensorplay::Half result;
   result.x = __half_as_ushort(value);
@@ -521,7 +530,7 @@ __global__ void sdpa_wmma_flash_half_kernel(
   constexpr int k_tile = 64;
   constexpr int tile_d = 128;
   constexpr int threads = 512;
-  constexpr unsigned full_mask = 0xffffffffu;
+  constexpr unsigned long long full_mask = 0xffffffffffffffffull;
 
   const int thread = threadIdx.x;
   const int warp = thread >> 5;
@@ -699,7 +708,7 @@ __global__ void sdpa_wmma_flash_half_4warp_kernel(
   constexpr int tile_d = 128;
   constexpr int warps = 4;
   constexpr int threads = warps * 32;
-  constexpr unsigned full_mask = 0xffffffffu;
+  constexpr unsigned long long full_mask = 0xffffffffffffffffull;
   constexpr float log2e = 1.4426950408889634f;
 
   extern __shared__ unsigned char smem_raw[];
@@ -956,7 +965,7 @@ __global__ __launch_bounds__(256, 2) void sdpa_wmma_flash_half_aligned_kernel(
   constexpr int tile_d = 128;
   constexpr int warps = 8;
   constexpr int threads = warps * 32;
-  constexpr unsigned full_mask = 0xffffffffu;
+  constexpr unsigned long long full_mask = 0xffffffffffffffffull;
   constexpr float log2e = 1.4426950408889634f;
 
   extern __shared__ unsigned char smem_raw[];
@@ -1192,6 +1201,7 @@ __global__ __launch_bounds__(256, 2) void sdpa_wmma_flash_half_aligned_kernel(
 #undef TP_WMMA_STORE_NORM
   }
 }
+#endif  // !USE_ROCM (WMMA kernel variants)
 
 #if defined(TP_HAS_NATIVE_CUTE_FLASH)
 // This is the exact native 64x64/4-warp schedule used by the aligned CUDA
@@ -1664,6 +1674,12 @@ Tensor sdpa_kernel_cuda(const Tensor& query, const Tensor& key, const Tensor& va
     TP_CUDA_CHECK(cudaGetLastError());
     return out;
   } else if (impl == 8) {
+#if defined(USE_ROCM)
+    TP_THROW(NotImplementedError,
+             "sdpa impl=8 (4-warp FP16 WMMA flash) requires the tensor-core "
+             "primitive API of the CUDA toolchain; use impl=0, 1, 2 or 3 on "
+             "this backend");
+#else
     Tensor out = Tensor::empty({B, H, T, D}, dtype, q.device());
     if (dtype != DType::Float16 || D != 128) {
       TP_THROW(NotImplementedError,
@@ -1700,7 +1716,14 @@ Tensor sdpa_kernel_cuda(const Tensor& query, const Tensor& key, const Tensor& va
         B, H, T, D, scale, is_causal);
     TP_CUDA_CHECK(cudaGetLastError());
     return out;
+#endif  // !USE_ROCM
   } else if (impl == 5 || impl == 6 || impl == 7) {
+#if defined(USE_ROCM)
+    TP_THROW(NotImplementedError,
+             "sdpa impl=5/6/7 (aligned WMMA flash) requires the tensor-core "
+             "primitive API of the CUDA toolchain; use impl=0, 1 or 2 on "
+             "this backend");
+#else
     if (dtype != DType::Float16 || D != 128) {
       TP_THROW(NotImplementedError,
                "sdpa impl=5 (aligned FP16 WMMA flash) requires dtype=float16 and D=128");
@@ -1748,8 +1771,14 @@ Tensor sdpa_kernel_cuda(const Tensor& query, const Tensor& key, const Tensor& va
         impl == 6 ? 1 : (impl == 7 ? 2 : 0));
     TP_CUDA_CHECK(cudaGetLastError());
     return out;
-#endif
+#endif  // TP_HAS_NATIVE_CUTE_FLASH
+#endif  // !USE_ROCM
   } else if (impl == 4) {
+#if defined(USE_ROCM)
+    TP_THROW(NotImplementedError,
+             "sdpa impl=4 (WMMA flash) requires the tensor-core primitive "
+             "API of the CUDA toolchain; use impl=0, 1 or 2 on this backend");
+#else
     Tensor out = Tensor::empty({B, H, T, D}, dtype, q.device());
     if (dtype != DType::Float16 || D != 128) {
       TP_THROW(NotImplementedError,
@@ -1765,6 +1794,7 @@ Tensor sdpa_kernel_cuda(const Tensor& query, const Tensor& key, const Tensor& va
         B, H, T, D, scale, is_causal);
     TP_CUDA_CHECK(cudaGetLastError());
     return out;
+#endif  // !USE_ROCM
   } else if (impl == 2) {
     if (dtype == DType::Float32) {
       return sdpa_gemm_native<float>(q, k, v, B, H, T, D, is_causal);
@@ -1792,22 +1822,8 @@ Tensor sdpa_kernel_cuda(const Tensor& query, const Tensor& key, const Tensor& va
 }  // namespace cuda
 }  // namespace tensorplay
 
-namespace tensorplay {
-namespace tpx {
-namespace ops {
-TENSORPLAY_API Tensor mm(const Tensor& self, const Tensor& mat2);
-TENSORPLAY_API Tensor narrow(const Tensor& self, int64_t dim, int64_t start,
-                             int64_t length);
-TENSORPLAY_API Tensor reshape(const Tensor& self,
-                              const std::vector<int64_t>& shape);
-TENSORPLAY_API Tensor cat(const std::vector<Tensor>& tensors, int64_t dim);
-TENSORPLAY_API Tensor zeros(const std::vector<int64_t>& size,
-                            std::optional<DType> dtype,
-                            std::optional<Device> device, bool pin_memory,
-                            bool requires_grad);
-} // namespace ops
-} // namespace tpx
-} // namespace tensorplay
+// Dispatcher-level entry points (tensorplay::tpx::ops) are visible through
+// AttentionComposite.h -> TPXOpsGenerated.h; no local re-declarations.
 
 namespace tensorplay {
 namespace cuda {
@@ -2330,9 +2346,45 @@ Tensor grouped_mm_cuda(const Tensor& self, const Tensor& mat2,
   return out;
 }
 
+std::tuple<Tensor, Tensor> sdpa_math_cuda(
+    const Tensor& query, const Tensor& key, const Tensor& value,
+    const std::optional<Tensor>& attn_mask, double dropout_p, bool is_causal,
+    const std::optional<Tensor>& dropout_mask,
+    std::optional<double> scale, bool enable_gqa) {
+  return tensorplay::composite::sdpa_math_composite(
+      query, key, value, attn_mask, dropout_p, is_causal, dropout_mask, scale,
+      enable_gqa);
+}
+
+std::tuple<Tensor, Tensor> native_multi_head_attention_cuda(
+    const Tensor& query, const Tensor& key, const Tensor& value,
+    int64_t embed_dim, int64_t num_head, const Tensor& qkv_weight,
+    const Tensor& qkv_bias, const Tensor& proj_weight, const Tensor& proj_bias,
+    const std::optional<Tensor>& mask, bool need_weights,
+    bool average_attn_weights, std::optional<int64_t> mask_type) {
+  return tensorplay::composite::native_mha_composite(
+      query, key, value, embed_dim, num_head, qkv_weight, qkv_bias,
+      proj_weight, proj_bias, mask, need_weights, average_attn_weights,
+      mask_type);
+}
+
+int64_t fused_sdp_choice_cuda(const Tensor& query, const Tensor& key,
+                              const Tensor& value,
+                              const std::optional<Tensor>& attn_mask,
+                              double dropout_p, bool is_causal,
+                              std::optional<double> scale, bool enable_gqa) {
+  (void)key; (void)value; (void)is_causal; (void)scale;
+  return tensorplay::composite::fused_sdp_choice_common(query, attn_mask,
+                                                        dropout_p, enable_gqa);
+}
+
+
 TENSORPLAY_LIBRARY_IMPL(CUDA, AttentionKernels) {
   m.impl("scaled_dot_product_attention", sdpa_kernel_cuda);
   m.impl("scaled_dot_product_attention_backward", sdpa_backward_kernel_cuda);
+  m.impl("_scaled_dot_product_attention_math", sdpa_math_cuda);
+  m.impl("_native_multi_head_attention", native_multi_head_attention_cuda);
+  m.impl("_fused_sdp_choice", fused_sdp_choice_cuda);
   m.impl("grouped_mm", grouped_mm_cuda);
   m.impl("rotary_embedding", rotary_embedding_cuda);
   m.impl("fused_rope", fused_rope_cuda);

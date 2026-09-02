@@ -283,10 +283,13 @@ Tensor randn_like_kernel_cuda(const Tensor& self, DType dtype, std::optional<Dev
     return randn_kernel_cuda(static_cast<std::vector<int64_t>>(self.shape()), dtype, target_device);
 }
 
-Tensor& uniform_kernel_cuda(Tensor& self, double from, double to) {
+Tensor& uniform_kernel_cuda(Tensor& self, double from, double to,
+                            std::optional<Generator> generator) {
     if (self.numel() == 0) return self;
     if (!self.is_contiguous()) {
-        return fill_via_contiguous(self, [&](Tensor& t) { return uniform_kernel_cuda(t, from, to); });
+        return fill_via_contiguous(self, [&](Tensor& t) {
+            return uniform_kernel_cuda(t, from, to, generator);
+        });
     }
     int64_t n = self.numel();
     // Bounds of the [from, to) range against the destination dtype.
@@ -319,13 +322,15 @@ Tensor& uniform_kernel_cuda(Tensor& self, double from, double to) {
         distribution_nullary_kernel<float, float4, 4>(
             data, n,
             [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform4(state); },
-            [lo, hi] __device__ (float rand) { return lo + (hi - lo) * rand; });
+            [lo, hi] __device__ (float rand) { return lo + (hi - lo) * rand; },
+            std::move(generator));
     } else if (self.dtype() == DType::Float64) {
         double* data = self.data_ptr<double>();
         distribution_nullary_kernel<double, double2, 2>(
             data, n,
             [] __device__ (curandStatePhilox4_32_10_t* state) { return curand_uniform2_double(state); },
-            [from, to] __device__ (double rand) { return from + (to - from) * rand; });
+            [from, to] __device__ (double rand) { return from + (to - from) * rand; },
+            std::move(generator));
     } else {
         TP_THROW(NotImplementedError, "uniform_() only supports Float32/Float64 on CUDA for now");
     }
@@ -655,7 +660,7 @@ Tensor& random_kernel_cuda(Tensor& self, int64_t low, int64_t high) {
     }
 
     if (full_range && (self.dtype() == DType::Float32 || self.dtype() == DType::Float64)) {
-        return uniform_kernel_cuda(self, 0.0, 1.0);
+        return uniform_kernel_cuda(self, 0.0, 1.0, std::nullopt);
     }
     if (full_range) {
         // Full-range ints: uniform_int_full_range casts raw draws; approximate

@@ -38,13 +38,65 @@ Tensor prepare_source(const Tensor& src, DType dst_dtype) {
 void transfer_cpu_to_vulkan(const Tensor& src, api::vTensor& v_dst) {
   api::Context* const context = api::context();
 
-  // Convert to dtype corresponding to the image format of the texture to
-  // ensure that byte alignment is consistent when copying.
-  Tensor src_nc4hw =
-      utils::nchw_to_nc4hw(prepare_source(src, v_dst.texture_dtype()));
+  // Float32 textures are packed through the compute pipeline: the staging
+  // buffer holds contiguous NCHW values and the pack shader scatters them
+  // into the texel layout.
+  if (v_dst.storage_type() == api::StorageType::TEXTURE_3D &&
+      v_dst.dtype() == DType::Float32) {
+    Tensor src_contig = prepare_source(src, DType::Float32);
 
-  api::StorageBuffer staging(context, v_dst.texture_dtype(), v_dst.gpu_numel());
-  // Copy data into the staging buffer
+    api::StorageBuffer staging(context, DType::Float32, v_dst.gpu_numel());
+    {
+      api::MemoryMap mapping(staging.buffer(), api::MemoryAccessType::WRITE);
+      mapping.invalidate();
+
+      memcpy(
+          mapping.data<void>(),
+          src_contig.impl()->storage().data(),
+          src_contig.numel() * src_contig.itemsize());
+    }
+
+    utils::pack_staging_to_vtensor(staging.buffer(), v_dst);
+    return;
+  }
+
+  // Buffer payloads hold a plain linear layout.
+  if (v_dst.storage_type() == api::StorageType::BUFFER) {
+    Tensor src_lin = prepare_source(src, v_dst.texture_dtype());
+
+    api::StorageBuffer staging(context, v_dst.texture_dtype(), v_dst.gpu_numel());
+    {
+      api::MemoryMap mapping(staging.buffer(), api::MemoryAccessType::WRITE);
+      mapping.invalidate();
+
+      memcpy(
+          mapping.data<void>(),
+          src_lin.impl()->storage().data(),
+          staging.nbytes());
+    }
+
+    api::PipelineBarrier pipeline_barrier{};
+    context->submit_copy<api::VulkanBuffer, api::VulkanBuffer>(
+        pipeline_barrier,
+        staging.buffer(),
+        v_dst.buffer(
+            pipeline_barrier,
+            api::PipelineStage::TRANSFER,
+            api::MemoryAccessType::WRITE),
+        {static_cast<uint32_t>(staging.buffer().mem_size()), 0u, 0u},
+        {0u, 0u, 0u},
+        {0u, 0u, 0u},
+        VK_NULL_HANDLE);
+    return;
+  }
+
+  // Every other texture format moves through a byte-level transfer: the
+  // staging buffer holds the texel-linear payload and the copy command is
+  // format-agnostic, so no format-specific shader is needed.
+  Tensor src_tex = prepare_source(src, v_dst.dtype());
+  Tensor src_nc4hw = utils::nchw_to_nc4hw(src_tex);
+
+  api::StorageBuffer staging(context, v_dst.dtype(), v_dst.gpu_numel());
   {
     api::MemoryMap mapping(staging.buffer(), api::MemoryAccessType::WRITE);
     mapping.invalidate();
@@ -55,7 +107,8 @@ void transfer_cpu_to_vulkan(const Tensor& src, api::vTensor& v_dst) {
         staging.nbytes());
   }
 
-  utils::pack_staging_to_vtensor(staging.buffer(), v_dst);
+  api::PipelineBarrier pipeline_barrier{};
+  utils::copy_buffer_to_vtensor(staging.buffer(), v_dst, pipeline_barrier);
 }
 
 //
@@ -180,6 +233,16 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
     }
     // CPU -> Vulkan
     transfer_cpu_to_vulkan(src, v_self);
+    return self;
+  }
+
+  // Vulkan -> CPU
+  if (src.device().is_vulkan()) {
+    TP_CHECK(
+        self.device().is_cpu(),
+        "Vulkan copy_: only CPU destinations are supported");
+    api::vTensor v_src = convert(src);
+    transfer_vulkan_to_cpu(v_src, self);
     return self;
   }
 

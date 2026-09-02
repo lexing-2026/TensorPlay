@@ -4,6 +4,7 @@
 #include "Scalar.h"
 #include "Exception.h"
 #include "Parallel.h"
+#include "tensorplay/ops/TPXOpsGenerated.h"
 #include "Utils.h"
 #include "OneDNNContext.h"
 #include "GradMode.h"
@@ -19,18 +20,8 @@
 
 // Dispatcher-level primitives for the linear composite (defined in
 // TPXOpsGenerated.cpp; declared locally -- same pattern as Einsum.cpp).
-// Declared at global scope before `namespace tensorplay` below so the names
-// land in the real tensorplay::tpx::ops (inner-scope redeclaration would
-// shadow and break linkage).
-namespace tensorplay {
-namespace tpx {
-namespace ops {
-TENSORPLAY_API Tensor matmul(const Tensor& self, const Tensor& other);
-TENSORPLAY_API Tensor transpose(const Tensor& self, int64_t dim0, int64_t dim1);
-TENSORPLAY_API Tensor add(const Tensor& self, const Tensor& other, Scalar alpha);
-} // namespace ops
-} // namespace tpx
-} // namespace tensorplay
+// Dispatcher-level entry points come from the generated TPXOpsGenerated.h
+// (included at the top).
 
 #if defined(USE_MKL)
 // MKL dispatches AMD/Zen hosts to its generic kernel clones -- measured
@@ -1468,6 +1459,23 @@ Tensor matmul_backward_other_kernel(
     return grad;
 }
 
+namespace {
+
+// True when every batch item is a row-major or transposed-view matrix, so a
+// per-slice GEMM can consume the stack through strides without a copy.
+bool batch_items_contiguous_or_transposed(const Tensor& t) {
+    if (t.dim() != 3) return false;
+    const auto sizes = static_cast<std::vector<int64_t>>(t.shape());
+    const auto strides = t.strides();
+    // The stride of a size-1 dimension is irrelevant.
+    return (strides[2] == 1 && (sizes[1] == 1 || strides[1] >= sizes[2])) ||
+           (strides[1] == 1 && (sizes[2] == 1 || strides[2] >= sizes[1]));
+}
+
+template <typename T>
+void bgemm_batch(const Tensor& batch1, const Tensor& batch2, Tensor& result,
+                 double alpha, double beta);
+
 Tensor bmm_kernel(const Tensor& self, const Tensor& batch2) {
     if (self.dim() != 3) TP_THROW(RuntimeError, "batch1 must be a 3D tensor");
     if (batch2.dim() != 3) TP_THROW(RuntimeError, "batch2 must be a 3D tensor");
@@ -1482,8 +1490,85 @@ Tensor bmm_kernel(const Tensor& self, const Tensor& batch2) {
                  " but found ", pretty_dtype_name(batch2.dtype()));
     }
     check_cpu_matmul_dtype(self.dtype());
+    // Small/thin slices keep the parallel batched-2d path; fat contiguous
+    // stacks go through the fused batched GEMM (one BLAS call per slice
+    // without view-select round trips).
+    if ((self.dtype() == DType::Float32 || self.dtype() == DType::Float64) &&
+        batch_items_contiguous_or_transposed(self) &&
+        batch_items_contiguous_or_transposed(batch2)) {
+        const int64_t B = self.size(0), M = self.size(1), N = batch2.size(2);
+        const int64_t macs = B * self.size(1) * self.size(2) * N;
+        if (macs >= 4096 || (M == 1 || N == 1 || self.size(2) == 1)) {
+            Tensor result = Tensor::empty({B, M, N}, self.dtype(), self.device());
+            if (self.dtype() == DType::Float32) {
+                bgemm_batch<float>(self, batch2, result, 1.0, 0.0);
+            } else {
+                bgemm_batch<double>(self, batch2, result, 1.0, 0.0);
+            }
+            return result;
+        }
+    }
     return matmul_batched_2d(self, batch2, {self.size(0)}, {batch2.size(0)});
 }
+
+// One batched GEMM over per-slice raw pointers (batch dimension folded out):
+// result[b] = alpha * op(A[b]) @ op(B[b]) + beta * result[b].  Operands must
+// satisfy batch_items_contiguous_or_transposed and result must be
+// contiguous; f32/f64 only (low precision keeps the opmath batched path).
+template <typename T>
+void bgemm_batch(const Tensor& batch1, const Tensor& batch2, Tensor& result,
+                 double alpha, double beta) {
+    const int64_t B = result.size(0);
+    const int64_t M = result.size(1), N = result.size(2);
+    const int64_t K = batch1.size(2);
+    const auto s1 = batch1.strides();
+    const auto s2 = batch2.strides();
+    const auto sr = result.strides();
+    // Row-major CBLAS arguments; the per-slice matrix strides carry any
+    // transposed views directly.  For a transposed view (row stride 1) the
+    // stored matrix is the K x M transpose, so the op flag flips and the
+    // leading dimension is the column stride.
+    const bool trans_a = s1[1] == 1;
+    const int64_t lda = trans_a ? s1[2] : s1[1];
+    const bool trans_b = s2[1] == 1;
+    const int64_t ldb = trans_b ? s2[2] : s2[1];
+    const int64_t ldc = sr[1];
+    const T* A = batch1.data_ptr<T>();
+    const T* Bp = batch2.data_ptr<T>();
+    T* C = result.data_ptr<T>();
+    const T alpha_t = static_cast<T>(alpha);
+    const T beta_t = static_cast<T>(beta);
+    for (int64_t bi = 0; bi < B; ++bi) {
+        const int64_t a_off = bi * s1[0];
+        const int64_t b_off = bi * s2[0];
+        // beta == 0 must stay zero for every slice (bmm); only a nonzero
+        // beta turns into an accumulate chain (baddbmm).
+        const T beta_i = (bi == 0 || beta_t == T(0)) ? beta_t : T(1);
+#ifdef USE_MKL
+        CBLAS_TRANSPOSE TA = trans_a ? CblasTrans : CblasNoTrans;
+        CBLAS_TRANSPOSE TB = trans_b ? CblasTrans : CblasNoTrans;
+        if constexpr (std::is_same_v<T, float>) {
+            cblas_sgemm(CblasRowMajor, TA, TB, (int)M, (int)N, (int)K,
+                        alpha_t, A + a_off, (int)lda, Bp + b_off, (int)ldb,
+                        beta_i,
+                        C + bi * sr[0], (int)ldc);
+        } else {
+            cblas_dgemm(CblasRowMajor, TA, TB, (int)M, (int)N, (int)K,
+                        alpha_t, A + a_off, (int)lda, Bp + b_off, (int)ldb,
+                        beta_i,
+                        C + bi * sr[0], (int)ldc);
+        }
+#else
+        (void)alpha_t; (void)beta_t;
+        gemm_strided<T>(M, N, K,
+                        A + a_off, trans_a ? 1 : lda, trans_a ? lda : 1,
+                        Bp + b_off, trans_b ? 1 : ldb, trans_b ? ldb : 1,
+                        C + bi * sr[0], sr[1], sr[2]);
+#endif
+    }
+}
+
+}  // namespace
 
 Tensor baddbmm_kernel(const Tensor& input, const Tensor& batch1, const Tensor& batch2,
                       Scalar beta, Scalar alpha) {
@@ -1510,6 +1595,36 @@ Tensor baddbmm_kernel(const Tensor& input, const Tensor& batch1, const Tensor& b
     const double alpha_v = alpha.toDouble();
 
     const std::vector<int64_t> target{B, M, N};
+
+#if defined(USE_MKL) || defined(USE_BLAS)
+    // Fused batched GEMM: seed materializes the broadcast of `input` once,
+    // then a single GEMM chain per slice applies beta/alpha natively -- no
+    // standalone (B, M, N) product and no pointwise add pass.
+    const bool fused_ok =
+        (batch1.dtype() == DType::Float32 || batch1.dtype() == DType::Float64) &&
+        batch_items_contiguous_or_transposed(batch1) &&
+        batch_items_contiguous_or_transposed(batch2);
+    if (fused_ok) {
+        // beta == 0 makes the seed write-only (BLAS never reads C), so the
+        // broadcast copy of `input` is skipped entirely.
+        Tensor result = beta_v != 0.0
+            ? detail::contiguous_clone(expand_gemm_input(input, target))
+            : Tensor::empty(target, batch1.dtype(), batch1.device());
+        if (B == 0 || M == 0 || N == 0) return result;
+        if (batch1.size(2) == 0) {
+            // Empty contraction: the product contributes nothing.
+            if (beta_v != 1.0) result.mul_(beta);
+            return result;
+        }
+        if (batch1.dtype() == DType::Float32) {
+            bgemm_batch<float>(batch1, batch2, result, alpha_v, beta_v);
+        } else {
+            bgemm_batch<double>(batch1, batch2, result, alpha_v, beta_v);
+        }
+        return result;
+    }
+#endif
+
     Tensor result;
     if (beta_v == 0.0) {
         result = Tensor::empty(target, batch1.dtype(), batch1.device());

@@ -8,6 +8,7 @@
 #include <cudnn.h>
 #include <thrust/complex.h>
 #include <type_traits>
+#include <limits>
 
 #define CUDA_CHECK(condition) \
   do { \
@@ -396,6 +397,10 @@ Tensor log_softmax_kernel_cudnn(const Tensor& self, int64_t dim, DType dtype) {
 
 // --- Backward Kernels ---
 
+#endif  // USE_CUDNN
+
+// --- Native kernels (no DNN dependency) ---
+
 template <typename T>
 __global__ void relu_kernel_n(int64_t n, const T* input, T* output) {
     int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -461,13 +466,11 @@ Tensor threshold_backward_kernel(const Tensor& grad_output, const Tensor& output
     
     cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess) {
-       TP_THROW(RuntimeError, std::string("CUDA Error: ") + cudaGetErrorString(error));
-    }
-    
+        TP_THROW(RuntimeError, std::string("CUDA Error: ") + cudaGetErrorString(error));
+     }
+
     return grad_input;
 }
-
-#endif
 
 // Fused gated activations stay in the activation translation unit, matching
 // kernels.  The packed variant consumes [gate | up] on the last dimension.
@@ -613,8 +616,325 @@ Tensor silu_and_mul_cuda(const Tensor& input) {
     }
 }
 
+// --- Native softmax ---
+//
+// Row softmax over an arbitrary dimension without a DNN-library dependency.
+// The softmax dimension is the middle of the (outer, softmax_size, inner)
+// view: one thread block walks one row whose consecutive elements sit
+// `inner_size` elements apart.  Two passes (max, then sum of exponentials)
+// keep the numerics of the library path; reduced-precision inputs compute
+// in fp32, matching the upcast the DNN descriptor path applies.
+
+template <typename scalar_t, typename compute_t>
+__global__ void softmax_dim_kernel(
+    scalar_t* out, const scalar_t* in, int64_t rows, int64_t softmax_size,
+    int64_t inner_size, bool log_mode) {
+  const int64_t row = static_cast<int64_t>(blockIdx.x);
+  if (row >= rows) return;
+  const int64_t outer = row / inner_size;
+  const int64_t inner = row % inner_size;
+  const scalar_t* row_in =
+      in + outer * softmax_size * inner_size + inner;
+  scalar_t* row_out = out + outer * softmax_size * inner_size + inner;
+
+  __shared__ compute_t tile[1024];
+  const int tid = static_cast<int>(threadIdx.x);
+
+  compute_t thread_max = -std::numeric_limits<compute_t>::infinity();
+  for (int64_t j = tid; j < softmax_size; j += blockDim.x) {
+    const compute_t v = static_cast<compute_t>(row_in[j * inner_size]);
+    thread_max = (v > thread_max) ? v : thread_max;
+  }
+  tile[tid] = thread_max;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s) tile[tid] = (tile[tid + s] > tile[tid]) ? tile[tid + s] : tile[tid];
+    __syncthreads();
+  }
+  const compute_t row_max = tile[0];
+
+  compute_t thread_sum = compute_t(0);
+  for (int64_t j = tid; j < softmax_size; j += blockDim.x) {
+    thread_sum += std::exp(static_cast<compute_t>(row_in[j * inner_size]) - row_max);
+  }
+  tile[tid] = thread_sum;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s) tile[tid] += tile[tid + s];
+    __syncthreads();
+  }
+  const compute_t denom = std::log(tile[0]);
+
+  for (int64_t j = tid; j < softmax_size; j += blockDim.x) {
+    const compute_t v =
+        static_cast<compute_t>(row_in[j * inner_size]) - row_max - denom;
+    row_out[j * inner_size] =
+        static_cast<scalar_t>(log_mode ? v : std::exp(v));
+  }
+}
+
+// --- Wave (warp) softmax for rows along the fast dimension ---
+//
+// One wave owns one row (or two rows for short rows): every lane keeps a
+// strided register slice, and the max / sum reductions run as butterfly
+// shuffles with no shared-memory round trip.  The logical wave width is
+// clamped to the next power of two of the row length, so a hardware wave can
+// hold two independent logical waves when rows are short.  Templates are
+// instantiated for both 32- and 64-lane hardware waves and selected from the
+// device attribute at launch time.
+
+namespace {
+
+inline int softmax_log2_ceil(int value) {
+  int log2_value = 0;
+  while ((1 << log2_value) < value) ++log2_value;
+  return log2_value;
+}
+
+inline int softmax_wave_size() {
+  static int wave = []() {
+    int dev = 0, lanes = 32;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&lanes, cudaDevAttrWarpSize, dev);
+    return lanes > 0 ? lanes : 32;
+  }();
+  return wave;
+}
+
+template <typename acc_t, int WAVE_SIZE, int WAVE_BATCH, bool kIsMax>
+__device__ __forceinline__ void wave_butterfly_reduce(acc_t* values) {
+  const unsigned long long mask =
+      WAVE_SIZE == 64 ? 0xffffffffffffffffull : 0xffffffffull;
+#pragma unroll
+  for (int offset = WAVE_SIZE / 2; offset > 0; offset /= 2) {
+#pragma unroll
+    for (int i = 0; i < WAVE_BATCH; ++i) {
+      const acc_t other =
+          __shfl_xor_sync(mask, values[i], offset, WAVE_SIZE);
+      values[i] = kIsMax ? (other > values[i] ? other : values[i])
+                         : (values[i] + other);
+    }
+  }
+}
+
+template <typename scalar_t, typename acc_t, int LOG2_ELEMENTS, bool LOG_MODE,
+          int HW_WAVE>
+__global__ void softmax_wave_forward(scalar_t* dst, const scalar_t* src,
+                                     int batch_count, int stride,
+                                     int element_count) {
+  constexpr int kNextPow2 = 1 << LOG2_ELEMENTS;
+  constexpr int kWAVE = (kNextPow2 < HW_WAVE) ? kNextPow2 : HW_WAVE;
+  constexpr int kIterations = kNextPow2 / kWAVE;
+  constexpr int kBatchesPerWave = (kNextPow2 <= 128) ? 2 : 1;
+
+  const int first_batch = (blockDim.y * blockIdx.x + threadIdx.y) * kBatchesPerWave;
+  int local_batches = batch_count - first_batch;
+  if (local_batches > kBatchesPerWave) local_batches = kBatchesPerWave;
+
+  const int local_idx = static_cast<int>(threadIdx.x);
+  src += first_batch * stride + local_idx;
+  dst += first_batch * stride + local_idx;
+
+  acc_t elems[kBatchesPerWave][kIterations];
+  for (int i = 0; i < kBatchesPerWave; ++i) {
+    const int count = (i >= local_batches) ? 0 : element_count;
+#pragma unroll
+    for (int it = 0; it < kIterations; ++it) {
+      const int element_index = local_idx + it * kWAVE;
+      elems[i][it] =
+          element_index < count
+              ? static_cast<acc_t>(src[i * element_count + it * kWAVE])
+              : -std::numeric_limits<acc_t>::infinity();
+    }
+  }
+
+  acc_t max_value[kBatchesPerWave];
+#pragma unroll
+  for (int i = 0; i < kBatchesPerWave; ++i) {
+    max_value[i] = elems[i][0];
+#pragma unroll
+    for (int it = 1; it < kIterations; ++it) {
+      max_value[i] =
+          max_value[i] > elems[i][it] ? max_value[i] : elems[i][it];
+    }
+  }
+  wave_butterfly_reduce<acc_t, kWAVE, kBatchesPerWave, true>(max_value);
+
+  acc_t sum[kBatchesPerWave];
+#pragma unroll
+  for (int i = 0; i < kBatchesPerWave; ++i) {
+    sum[i] = acc_t(0);
+#pragma unroll
+    for (int it = 0; it < kIterations; ++it) {
+      if (LOG_MODE) {
+        sum[i] += std::exp(elems[i][it] - max_value[i]);
+      } else {
+        elems[i][it] = std::exp(elems[i][it] - max_value[i]);
+        sum[i] += elems[i][it];
+      }
+    }
+  }
+  wave_butterfly_reduce<acc_t, kWAVE, kBatchesPerWave, false>(sum);
+
+#pragma unroll
+  for (int i = 0; i < kBatchesPerWave; ++i) {
+    if (i >= local_batches) break;
+#pragma unroll
+    for (int it = 0; it < kIterations; ++it) {
+      const int element_index = local_idx + it * kWAVE;
+      if (element_index < element_count) {
+        if (LOG_MODE) {
+          // Elements stay raw: subtract the max and the log normalizer.
+          const acc_t v =
+              elems[i][it] - max_value[i] - std::log(sum[i]);
+          dst[i * element_count + it * kWAVE] = static_cast<scalar_t>(v);
+        } else {
+          // Elements hold exp(x - max) from the accumulation pass.
+          dst[i * element_count + it * kWAVE] =
+              static_cast<scalar_t>(elems[i][it] / sum[i]);
+        }
+      }
+    }
+  }
+}
+
+template <typename scalar_t, typename acc_t, bool LOG_MODE>
+void launch_wave_softmax(scalar_t* dst, const scalar_t* src, int64_t batch_count,
+                         int64_t element_count, cudaStream_t stream) {
+  const int log2_elements = softmax_log2_ceil(static_cast<int>(element_count));
+  const int next_pow2 = 1 << log2_elements;
+  const int hw_wave = softmax_wave_size();
+  const int wave_size = next_pow2 < hw_wave ? next_pow2 : hw_wave;
+  const int batches_per_wave = (next_pow2 <= 128) ? 2 : 1;
+  constexpr int kThreadsPerBlock = 128;
+  const int warps_per_block = kThreadsPerBlock / wave_size;
+  const int batches_per_block = warps_per_block * batches_per_wave;
+  const int64_t blocks =
+      (batch_count + batches_per_block - 1) / batches_per_block;
+  dim3 threads(static_cast<unsigned>(wave_size),
+               static_cast<unsigned>(warps_per_block), 1);
+
+#define TP_LAUNCH_WAVE_SOFTMAX(L2E)                                          \
+  do {                                                                       \
+    if (hw_wave == 64) {                                                     \
+      softmax_wave_forward<scalar_t, acc_t, L2E, LOG_MODE, 64>               \
+          <<<static_cast<unsigned>(blocks), threads, 0, stream>>>(           \
+              dst, src, static_cast<int>(batch_count),                       \
+              static_cast<int>(element_count),                               \
+              static_cast<int>(element_count));                              \
+    } else {                                                                 \
+      softmax_wave_forward<scalar_t, acc_t, L2E, LOG_MODE, 32>               \
+          <<<static_cast<unsigned>(blocks), threads, 0, stream>>>(           \
+              dst, src, static_cast<int>(batch_count),                       \
+              static_cast<int>(element_count),                               \
+              static_cast<int>(element_count));                              \
+    }                                                                        \
+  } while (0)
+
+  switch (log2_elements) {
+    case 0: TP_LAUNCH_WAVE_SOFTMAX(0); break;
+    case 1: TP_LAUNCH_WAVE_SOFTMAX(1); break;
+    case 2: TP_LAUNCH_WAVE_SOFTMAX(2); break;
+    case 3: TP_LAUNCH_WAVE_SOFTMAX(3); break;
+    case 4: TP_LAUNCH_WAVE_SOFTMAX(4); break;
+    case 5: TP_LAUNCH_WAVE_SOFTMAX(5); break;
+    case 6: TP_LAUNCH_WAVE_SOFTMAX(6); break;
+    case 7: TP_LAUNCH_WAVE_SOFTMAX(7); break;
+    case 8: TP_LAUNCH_WAVE_SOFTMAX(8); break;
+    case 9: TP_LAUNCH_WAVE_SOFTMAX(9); break;
+    case 10: TP_LAUNCH_WAVE_SOFTMAX(10); break;
+    default: TP_LAUNCH_WAVE_SOFTMAX(11); break;
+  }
+#undef TP_LAUNCH_WAVE_SOFTMAX
+  CUDA_CHECK(cudaGetLastError());
+}
+
+// The wave kernel covers rows laid out along the fastest dimension with a
+// bounded row length; anything else (strided rows, very long rows, huge
+// batches) stays on the block kernel below.
+template <typename scalar_t, typename acc_t, bool LOG_MODE>
+bool try_wave_softmax(const Tensor& self, Tensor& result, int64_t softmax_size,
+                      int64_t rows) {
+  constexpr int64_t kMaxRowBytes = 8192;
+  if (softmax_size <= 0 || softmax_size > 2048) return false;
+  if (softmax_size * static_cast<int64_t>(sizeof(scalar_t)) > kMaxRowBytes)
+    return false;
+  if (rows * softmax_size > static_cast<int64_t>(INT32_MAX)) return false;
+  if (!self.is_contiguous() || !result.is_contiguous()) return false;
+  launch_wave_softmax<scalar_t, acc_t, LOG_MODE>(
+      result.data_ptr<scalar_t>(), self.data_ptr<scalar_t>(), rows,
+      softmax_size, getCurrentCUDAStream().stream());
+  return true;
+}
+
+}  // namespace
+
+template <typename scalar_t, typename compute_t>
+void softmax_dim_dispatch(const Tensor& self, Tensor& result, int64_t dim,
+                          bool log_mode) {
+  // One thread block per (outer, inner) row; the kernel splits blockIdx
+  // back into the outer/inner pair.
+  int64_t rows = 1;
+  for (int64_t i = 0; i < dim; ++i) rows *= self.size(i);
+  int64_t inner_size = 1;
+  for (int64_t i = dim + 1; i < self.dim(); ++i) inner_size *= self.size(i);
+  const int64_t softmax_size = self.size(dim);
+  if (inner_size == 1) {
+    // Fast dimension: wave-resident kernel, one hardware wave per row.
+    const bool wave = log_mode
+        ? try_wave_softmax<scalar_t, compute_t, true>(self, result,
+                                                      softmax_size, rows)
+        : try_wave_softmax<scalar_t, compute_t, false>(self, result,
+                                                       softmax_size, rows);
+    if (wave) return;
+  }
+  constexpr int kThreads = 256;
+  softmax_dim_kernel<scalar_t, compute_t>
+      <<<static_cast<unsigned>(rows * inner_size), kThreads, 0,
+         getCurrentCUDAStream().stream()>>>(
+          result.data_ptr<scalar_t>(), self.data_ptr<scalar_t>(),
+          rows * inner_size, softmax_size, inner_size, log_mode);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+
+Tensor softmax_native_impl(const Tensor& self, int64_t dim, bool log_mode) {
+  int64_t dim_idx = dim < 0 ? dim + self.dim() : dim;
+  Tensor result = Tensor::empty(
+      static_cast<std::vector<int64_t>>(self.shape()), self.dtype(),
+      self.device());
+  switch (self.dtype()) {
+    case DType::Float32:
+      softmax_dim_dispatch<float, float>(self, result, dim_idx, log_mode);
+      break;
+    case DType::Float64:
+      softmax_dim_dispatch<double, double>(self, result, dim_idx, log_mode);
+      break;
+    case DType::Float16:
+      softmax_dim_dispatch<Half, float>(self, result, dim_idx, log_mode);
+      break;
+    case DType::BFloat16:
+      softmax_dim_dispatch<BFloat16, float>(self, result, dim_idx, log_mode);
+      break;
+    default:
+      TP_THROW(NotImplementedError,
+               "softmax: unsupported dtype on this GPU backend");
+  }
+  return result;
+}
+
+Tensor softmax_kernel_native(const Tensor& self, int64_t dim, DType dtype) {
+  (void)dtype;
+  return softmax_native_impl(self, dim, false);
+}
+
+Tensor log_softmax_kernel_native(const Tensor& self, int64_t dim, DType dtype) {
+  (void)dtype;
+  return softmax_native_impl(self, dim, true);
+}
+
 TENSORPLAY_LIBRARY_IMPL(CUDA, ActivationKernels) {
-#ifdef USE_CUDNN
+#if defined(USE_CUDNN) && !defined(USE_ROCM)
     m.impl("relu", relu_kernel_cudnn);
     m.impl("relu_", relu_inplace_kernel_cudnn);
     m.impl("sigmoid", sigmoid_kernel_cudnn);
@@ -623,8 +943,21 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, ActivationKernels) {
     // m.impl("elu", elu_kernel_cudnn); // Not registered in native_functions yet
     m.impl("softmax", softmax_kernel_cudnn);
     m.impl("log_softmax", log_softmax_kernel_cudnn);
-    m.impl("threshold_backward", threshold_backward_kernel);
+#elif defined(USE_CUDNN) && defined(USE_ROCM)
+    // The pointwise backend already registers relu/sigmoid/tanh/silu for
+    // every dtype; its coverage is a superset of what the DNN library offers
+    // here (fp64/bf16 activation and bf16 softmax return not-implemented),
+    // and the elementwise kernels are faster for this memory-bound surface.
+    m.impl("relu_", relu_inplace_kernel_cudnn);
+    m.impl("softmax", softmax_kernel_native);
+    m.impl("log_softmax", log_softmax_kernel_native);
+#else
+    // Native kernels cover the activation/softmax surface without a DNN
+    // library dependency.
+    m.impl("softmax", softmax_kernel_native);
+    m.impl("log_softmax", log_softmax_kernel_native);
 #endif
+    m.impl("threshold_backward", threshold_backward_kernel);
     m.impl("silu_mul", silu_mul_cuda);
     m.impl("fused_swiglu", fused_swiglu_cuda);
     m.impl("silu_and_mul", silu_and_mul_cuda);

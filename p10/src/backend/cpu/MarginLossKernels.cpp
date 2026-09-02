@@ -19,6 +19,7 @@
 #include "Scalar.h"
 #include "Exception.h"
 #include "LinearAlgebraNames.h"
+#include "tensorplay/ops/TPXOpsGenerated.h"
 
 #include <vector>
 #include <string>
@@ -26,16 +27,9 @@
 #include <tuple>
 #include <optional>
 
-// Dispatcher-level entry point for the composite (defined in
-// TPXOpsGenerated.cpp; declared locally -- same pattern as
-// PoolingKernels.cpp).
-namespace tensorplay {
-namespace tpx {
-namespace ops {
-TENSORPLAY_API std::tuple<Tensor, Tensor> multilabel_margin_loss_forward(const Tensor& self, const Tensor& target, int64_t reduction);
-} // namespace ops
-} // namespace tpx
-} // namespace tensorplay
+// Dispatcher-level entry point comes from the generated TPXOpsGenerated.h
+// (included at the top).
+
 
 namespace tensorplay {
 namespace cpu {

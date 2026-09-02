@@ -2,6 +2,7 @@
 #include "Dispatcher.h"
 #include "Exception.h"
 #include "Parallel.h"
+#include "tensorplay/ops/TPXOpsGenerated.h"
 #include <vector>
 #include <cmath>
 #include <algorithm>
@@ -15,15 +16,9 @@
 // LinearAlgebraKernels.cpp).  Declared at global scope before
 // `namespace tensorplay` below so the names land in the real
 // tensorplay::tpx::ops.
-namespace tensorplay {
-namespace tpx {
-namespace ops {
-TENSORPLAY_API std::tuple<Tensor, Tensor> max_pool2d_with_indices(const Tensor& input, const std::vector<int64_t>& kernel_size, const std::vector<int64_t>& stride, const std::vector<int64_t>& padding, const std::vector<int64_t>& dilation, bool ceil_mode);
-TENSORPLAY_API std::tuple<Tensor, Tensor> max_pool3d_with_indices(const Tensor& input, const std::vector<int64_t>& kernel_size, const std::vector<int64_t>& stride, const std::vector<int64_t>& padding, const std::vector<int64_t>& dilation, bool ceil_mode);
-TENSORPLAY_API std::tuple<Tensor, Tensor> adaptive_max_pool2d_with_indices(const Tensor& input, const std::vector<int64_t>& output_size);
-} // namespace ops
-} // namespace tpx
-} // namespace tensorplay
+// Dispatcher-level entry points come from the generated TPXOpsGenerated.h
+// (included at the top), so inline-merged wrappers stay bindable here.
+
 
 using namespace tensorplay::parallel;
 

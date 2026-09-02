@@ -34,4 +34,27 @@ OperatorHandle Dispatcher::findHandle(const std::string& op_name) {
     return OperatorHandle(table.get());
 }
 
+std::vector<std::string> Dispatcher::operator_names() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<std::string> names;
+    names.reserve(operators_.size());
+    for (const auto& entry : operators_) {
+        names.push_back(entry.first);
+    }
+    return names;
+}
+
+KernelFunction Dispatcher::direct_kernel(const std::string& op_name, DispatchKey key) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = operators_.find(op_name);
+    if (it == operators_.end() || dispatchKeyIndex(key) >= kDispatchKeyCount) {
+        return nullptr;
+    }
+    return it->second->kernels[dispatchKeyIndex(key)].load(std::memory_order_acquire);
+}
+
+bool Dispatcher::has_kernel(const std::string& op_name, DispatchKey key) const {
+    return direct_kernel(op_name, key) != nullptr;
+}
+
 } // namespace tensorplay

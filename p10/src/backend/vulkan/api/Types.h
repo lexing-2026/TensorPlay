@@ -7,32 +7,35 @@
 
 #include "DType.h"
 
+#ifndef VK_FORMAT_FLOAT4
+#define VK_FORMAT_FLOAT4 VK_FORMAT_R32G32B32A32_SFLOAT
+#endif
+
 namespace tensorplay {
 namespace vulkan {
 namespace api {
 
 //
 // Maps a core DType onto the VkFormat used when that dtype is viewed through
-// an image view.  Buffer storage does not consume these formats, but keeping
-// the mapping here centralizes the dtype policy for the backend.
+// an image view.  The covered set is the backend's dtype vocabulary: element
+// widths of 1, 2, and 4 bytes with matching signed/unsigned formats.  Buffer
+// storage does not consume these formats, but keeping the mapping here
+// centralizes the dtype policy for the backend.
 //
-// The backend's alias vocabulary (Byte/Char/Half) maps onto the core scalar
-// enumeration: Byte=UInt8, Char=Int8, Half=Float16.
 inline VkFormat to_vkformat(const DType dtype) {
-  switch (dtype) {
+  // Quantized dtypes share the VkFormat of their underlying integer code.
+  switch (toUnderlyingStorageType(dtype)) {
     case DType::UInt8:
       return VK_FORMAT_R8G8B8A8_UINT;
     case DType::Int8:
     case DType::Bool:
       return VK_FORMAT_R8G8B8A8_SINT;
     case DType::Int32:
-    case DType::Int64:
       return VK_FORMAT_R32G32B32A32_SINT;
     case DType::Float16:
       return VK_FORMAT_R16G16B16A16_SFLOAT;
     case DType::Float32:
-    case DType::Float64:
-      return VK_FORMAT_R32G32B32A32_SFLOAT;
+      return VK_FORMAT_FLOAT4;
     default:
       VK_CHECK_COND(false, "DType not supported by the Vulkan backend!");
   }
@@ -88,8 +91,6 @@ enum class GPUMemoryLayout : int8_t {
 // FLOAT_* values are fixed at build time by gen_vulkan_spv.py via
 // FLOAT_IMAGE_FORMAT (rgba32f unless USE_VULKAN_FP16_INFERENCE).
 //
-#define VK_FORMAT_FLOAT4 VK_FORMAT_R32G32B32A32_SFLOAT
-
 } // namespace api
 } // namespace vulkan
 } // namespace tensorplay

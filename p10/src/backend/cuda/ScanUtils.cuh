@@ -16,15 +16,18 @@ struct TopKAddOp {
 template <typename T, bool KillWARDependency, class BinaryFunction>
 __device__ void topk_inclusive_binary_prefix_scan(
     T* smem, bool in, T* out, BinaryFunction binop) {
-  unsigned vote = __ballot_sync(0xffffffffu, in);
-  unsigned lane_mask_le;
-  asm("mov.u32 %0, %%lanemask_le;" : "=r"(lane_mask_le));
-  T index = static_cast<T>(__popc(lane_mask_le & vote));
-  T carry = static_cast<T>(__popc(vote));
+  unsigned long long vote = __ballot_sync(0xffffffffffffffffull, in);
+  // Lanes at or below the caller, derived arithmetically so the scan needs
+  // no platform-specific lane-mask intrinsic or inline assembly.  Kernels
+  // address warps with the 32-lane model on both GPU toolchains.
+  const unsigned lane = threadIdx.x & 31u;
+  const unsigned long long lane_mask_le =
+      (lane == 31u) ? 0xffffffffull : ((1ull << (lane + 1)) - 1ull);
+  T index = static_cast<T>(__popcll(lane_mask_le & vote));
+  T carry = static_cast<T>(__popcll(vote));
 
   const int warp = threadIdx.x / 32;
-  int lane_id;
-  asm("mov.s32 %0, %%laneid;" : "=r"(lane_id));
+  const int lane_id = static_cast<int>(threadIdx.x & 31u);
   if (lane_id == 0) {
     smem[warp] = carry;
   }

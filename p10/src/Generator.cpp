@@ -49,12 +49,15 @@ inline uint64_t make64BitsFrom32Bits(uint32_t hi, uint32_t lo) {
 
 } // namespace
 
-Generator::Generator(uint64_t seed_val) : engine_(seed_val) {}
+Generator::Generator(uint64_t seed_val)
+    : state_(std::make_shared<GeneratorState>()) {
+    state_->engine = mt19937_engine(seed_val);
+}
 
 uint64_t Generator::manual_seed(uint64_t seed) {
-    next_float_normal_sample_.reset();
-    next_double_normal_sample_.reset();
-    engine_ = mt19937_engine(seed);
+    state_->next_float_normal_sample.reset();
+    state_->next_double_normal_sample.reset();
+    state_->engine = mt19937_engine(seed);
     return seed;
 }
 
@@ -65,37 +68,37 @@ uint64_t Generator::seed() {
 }
 
 uint64_t Generator::initial_seed() const {
-    return engine_.seed();
+    return state_->engine.seed();
 }
 
 uint64_t Generator::current_seed() const {
-    return engine_.seed();
+    return state_->engine.seed();
 }
 
 uint32_t Generator::random() {
-    return engine_();
+    return state_->engine();
 }
 
 uint64_t Generator::random64() {
-    uint32_t random1 = engine_();
-    uint32_t random2 = engine_();
+    uint32_t random1 = state_->engine();
+    uint32_t random2 = state_->engine();
     return make64BitsFrom32Bits(random1, random2);
 }
 
 std::optional<float> Generator::next_float_normal_sample() const {
-    return next_float_normal_sample_;
+    return state_->next_float_normal_sample;
 }
 
 std::optional<double> Generator::next_double_normal_sample() const {
-    return next_double_normal_sample_;
+    return state_->next_double_normal_sample;
 }
 
 void Generator::set_next_float_normal_sample(std::optional<float> randn) {
-    next_float_normal_sample_ = randn;
+    state_->next_float_normal_sample = randn;
 }
 
 void Generator::set_next_double_normal_sample(std::optional<double> randn) {
-    next_double_normal_sample_ = randn;
+    state_->next_double_normal_sample = randn;
 }
 
 Tensor Generator::get_state() const {
@@ -106,7 +109,7 @@ Tensor Generator::get_state() const {
     auto rng_state = state_tensor.data_ptr<uint8_t>();
 
     CPUGeneratorState accum_state{};
-    auto rng_data = engine_.data();
+    auto rng_data = state_->engine.data();
     accum_state.legacy_pod.the_initial_seed = rng_data.seed_;
     accum_state.legacy_pod.left = rng_data.left_;
     accum_state.legacy_pod.seeded = rng_data.seeded_;
@@ -118,13 +121,13 @@ Tensor Generator::get_state() const {
     accum_state.legacy_pod.normal_y = 0.0;
     accum_state.next_float_normal_sample = 0.0f;
     accum_state.is_next_float_normal_sample_valid = false;
-    if (next_double_normal_sample_) {
+    if (state_->next_double_normal_sample) {
         accum_state.legacy_pod.normal_is_valid = true;
-        accum_state.legacy_pod.normal_y = *(next_double_normal_sample_);
+        accum_state.legacy_pod.normal_y = *(state_->next_double_normal_sample);
     }
-    if (next_float_normal_sample_) {
+    if (state_->next_float_normal_sample) {
         accum_state.is_next_float_normal_sample_valid = true;
-        accum_state.next_float_normal_sample = *(next_float_normal_sample_);
+        accum_state.next_float_normal_sample = *(state_->next_float_normal_sample);
     }
 
     std::memcpy(rng_state, &accum_state, size);
@@ -157,11 +160,11 @@ void Generator::set_state(const Tensor& new_state) {
     if (!engine.is_valid()) {
         TP_THROW(RuntimeError, "Invalid mt19937 state");
     }
-    engine_ = engine;
-    next_float_normal_sample_ = rng_state->is_next_float_normal_sample_valid
+    state_->engine = engine;
+    state_->next_float_normal_sample = rng_state->is_next_float_normal_sample_valid
         ? std::optional<float>(rng_state->next_float_normal_sample)
         : std::optional<float>();
-    next_double_normal_sample_ = legacy_pod.normal_is_valid
+    state_->next_double_normal_sample = legacy_pod.normal_is_valid
         ? std::optional<double>(legacy_pod.normal_y)
         : std::optional<double>();
 }

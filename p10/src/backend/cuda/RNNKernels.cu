@@ -1,15 +1,15 @@
-// Fused RNN cell kernels — port of
-// (_thnn_fused_lstm_cell_cuda / _thnn_fused_gru_cell_cuda and their
-// backward impls).  TensorInfo addressing is replaced by flat contiguous
-// pointers: gates are row-major (N, G) with G = 4*H (LSTM) / 3*H (GRU),
-// states are (N, H), biases are (G,) or absent.
+// Fused RNN cell kernels: forward/backward LSTM and GRU cell updates in a
+// single elementwise pass.  Gates are row-major (N, G) with G = 4*H (LSTM) /
+// 3*H (GRU), states are (N, H), biases are (G,) or absent.
 
 #include "RNNCudaKernels.h"
 
 #include "CUDAContext.h"
 #include "CUDARuntime.h"
 #include "Exception.h"
+#include "GradMode.h"
 #include <cuda_runtime.h>
+#include <vector>
 
 namespace tensorplay {
 namespace cuda {
@@ -342,7 +342,7 @@ std::tuple<Tensor, Tensor, Tensor> fused_lstm_cell_backward_impl(
     const bool has_hy = grad_hy.numel() > 0;
     const bool has_cy = grad_cy.numel() > 0;
     if (!has_hy && !has_cy) {
-        TP_THROW(RuntimeError, "_thnn_fused_lstm_cell_backward: both gradients undefined");
+        TP_THROW(RuntimeError, "lstm cell backward: both gradients undefined");
     }
     Tensor c = cont(cx);
     Tensor y = cont(cy);
@@ -400,10 +400,176 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> fused_gru_cell_backward(
     TP_RNN_DISPATCH(launch)
 
     Tensor zero;
-    // at the composite level (RNN.cpp _thnn_fused_gru_cell_backward).
+    // consumed at the composite level (fused gru cell backward).
     return {grad_ig, grad_hg, grad_hx, zero, zero};
 }
 
 } // namespace rnn
-} // namespace cuda
-} // namespace tensorplay
+
+// ---------------------------------------------------------------------------
+// Sequence runner: layers of (LSTMCell / GRUCell / SimpleCell) driving the
+// fused-cell primitives above, one sequence-wide input-side GEMM per
+// layer+direction and a per-timestep hidden-side GEMM + cell update.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+inline Tensor rnn_row_gates(const Tensor& x2d, const Tensor& w,
+                            const Tensor& b, int64_t t, int64_t N) {
+    // Gates for timestep t: mm(x[t], w^T) + b  ((N,G)).
+    Tensor g = x2d.narrow(0, t * N, N).mm(w.t());
+    if (b.numel() > 0) g = g + b;
+    return g;
+}
+
+// The rnn autograd wrapper attaches the RNN backward nodes to the outputs and
+// those replay the forward themselves (RNNBackward.h); the graph the per-op
+// wrappers would build inside rnn_cuda_impl is never consumed.  Suppress it.
+struct RnnForwardNoGrad {
+    RnnForwardNoGrad() : prev_(GradMode::is_enabled()) { GradMode::set_enabled(false); }
+    ~RnnForwardNoGrad() { GradMode::set_enabled(prev_); }
+    bool prev_;
+};
+
+static std::tuple<Tensor, Tensor, Tensor> rnn_cuda_impl(
+    int kind,  // 0=lstm, 1=gru, 2=tanh, 3=relu
+    const Tensor& input, const std::vector<Tensor>& hx,
+    const std::vector<Tensor>& params, bool has_biases, int64_t num_layers,
+    bool bidirectional, bool batch_first) {
+    RnnForwardNoGrad no_grad_guard;
+    using tensorplay::cuda::rnn::fused_gru_cell;
+    using tensorplay::cuda::rnn::fused_lstm_cell;
+
+    Tensor x = batch_first ? input.transpose(0, 1).contiguous() : input.contiguous();
+    const int64_t T = x.size(0), N = x.size(1);
+    if (hx.empty()) TP_THROW(RuntimeError, "rnn: hx required");
+    // two hidden states"); an undersized hx would read past the vector.
+    if (kind == 0 && hx.size() != 2) TP_THROW(RuntimeError, "lstm expects two hidden states");
+    const int64_t L = num_layers;
+    const int64_t dirs = bidirectional ? 2 : 1;
+    const int64_t H = hx[0].size(-1);
+    const DType dt = x.dtype();
+
+    Tensor hn_out = Tensor::zeros({L * dirs, N, H}, hx[0].dtype(), x.device());
+    Tensor cn_out = kind == 0
+        ? Tensor::zeros({L * dirs, N, H}, hx[0].dtype(), x.device())
+        : Tensor();
+
+    size_t ppi = 0;  // params cursor: per layer/direction w_ih, w_hh[, b_ih, b_hh]
+    auto param_at = [&](void) -> const Tensor& {
+        return params.at(ppi++);
+    };
+
+    for (int64_t layer = 0; layer < L; ++layer) {
+        // Per-direction outputs written through Tensor::select views (narrow
+        // must not be used as an assignment target), concatenated along the
+        // feature dim afterwards.
+        std::vector<Tensor> dir_outs;
+        for (int64_t dir = 0; dir < dirs; ++dir) {
+            const int64_t state_idx = layer * dirs + dir;
+            Tensor h = hx[0].select(0, state_idx).contiguous();
+            Tensor c = kind == 0 ? hx[1].select(0, state_idx).contiguous() : h;
+
+            const Tensor& w_ih = param_at();
+            const Tensor& w_hh = param_at();
+            Tensor b_ih, b_hh;
+            if (has_biases) {
+                b_ih = param_at();
+                b_hh = param_at();
+                if (!(b_ih.numel() > 0)) b_ih = Tensor();
+                if (!(b_hh.numel() > 0)) b_hh = Tensor();
+            }
+
+            // Input-side gates for the whole sequence in one GEMM:
+            // (T*N, feat) @ (feat, G)^T -> (T*N, G).
+            Tensor x2d = x.reshape({T * N, x.size(2)});
+            Tensor in_gates = x2d.mm(w_ih.t());
+            if (b_ih.numel() > 0) in_gates = in_gates + b_ih;
+            const int64_t G = in_gates.size(1);
+
+            Tensor dir_out = Tensor::zeros({T, N, H}, dt, x.device());
+            for (int64_t t = 0; t < T; ++t) {
+                const int64_t tt = dir == 0 ? t : (T - 1 - t);
+                Tensor ig_row = in_gates.narrow(0, tt * N, N);
+                Tensor hg_row = h.mm(w_hh.t());
+                if (b_hh.numel() > 0) hg_row = hg_row + b_hh;
+
+                if (kind == 0) {
+                    auto r = fused_lstm_cell(ig_row, hg_row, c, Tensor(), Tensor());
+                    h = std::get<0>(r);
+                    c = std::get<1>(r);
+                } else if (kind == 1) {
+                    auto r = fused_gru_cell(ig_row, hg_row, h, Tensor(), Tensor());
+                    h = std::get<0>(r);
+                } else {
+                    Tensor gates = ig_row + hg_row;
+                    h = (kind == 2) ? gates.tanh() : gates.relu();
+                }
+
+                dir_out.select(0, tt).copy_(h);
+                hn_out.select(0, state_idx).copy_(h);
+                if (kind == 0) cn_out.select(0, state_idx).copy_(c);
+            }
+            dir_outs.push_back(dir_out);
+        }
+        Tensor layer_out;
+        if (dirs == 1) {
+            layer_out = dir_outs[0];
+        } else {
+            layer_out = Tensor::cat({dir_outs[0], dir_outs[1]}, 2);
+        }
+        x = layer_out;
+    }
+    Tensor y = batch_first ? x.transpose(0, 1).contiguous() : x;
+    return {y, hn_out, cn_out};
+}
+
+}  // namespace
+
+std::tuple<Tensor, Tensor, Tensor> lstm_cuda(const Tensor& input,
+                                             const std::vector<Tensor>& hx,
+                                             const std::vector<Tensor>& params,
+                                             bool has_biases, int64_t num_layers,
+                                             float dropout_p, bool training,
+                                             bool bidirectional, bool batch_first) {
+    (void)dropout_p; (void)training;
+    return rnn_cuda_impl(0, input, hx, params, has_biases, num_layers,
+                         bidirectional, batch_first);
+}
+std::tuple<Tensor, Tensor> gru_cuda(const Tensor& input, const std::vector<Tensor>& hx,
+                                    const std::vector<Tensor>& params, bool has_biases,
+                                    int64_t num_layers, float dropout_p, bool training,
+                                    bool bidirectional, bool batch_first) {
+    (void)dropout_p; (void)training;
+    auto r = rnn_cuda_impl(1, input, hx, params, has_biases, num_layers,
+                           bidirectional, batch_first);
+    return {std::get<0>(r), std::get<1>(r)};
+}
+std::tuple<Tensor, Tensor> rnn_relu_cuda(const Tensor& input, const std::vector<Tensor>& hx,
+                                         const std::vector<Tensor>& params, bool has_biases,
+                                         int64_t num_layers, float dropout_p, bool training,
+                                         bool bidirectional, bool batch_first) {
+    (void)dropout_p; (void)training;
+    auto r = rnn_cuda_impl(3, input, hx, params, has_biases, num_layers,
+                           bidirectional, batch_first);
+    return {std::get<0>(r), std::get<1>(r)};
+}
+std::tuple<Tensor, Tensor> rnn_tanh_cuda(const Tensor& input, const std::vector<Tensor>& hx,
+                                         const std::vector<Tensor>& params, bool has_biases,
+                                         int64_t num_layers, float dropout_p, bool training,
+                                         bool bidirectional, bool batch_first) {
+    (void)dropout_p; (void)training;
+    auto r = rnn_cuda_impl(2, input, hx, params, has_biases, num_layers,
+                           bidirectional, batch_first);
+    return {std::get<0>(r), std::get<1>(r)};
+}
+
+TENSORPLAY_LIBRARY_IMPL(CUDA, RnnSequence) {
+    m.impl("lstm", lstm_cuda);
+    m.impl("gru", gru_cuda);
+    m.impl("rnn_relu", rnn_relu_cuda);
+    m.impl("rnn_tanh", rnn_tanh_cuda);
+}
+
+}  // namespace cuda
+}  // namespace tensorplay

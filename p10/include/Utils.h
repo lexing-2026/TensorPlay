@@ -22,7 +22,10 @@ inline std::vector<int64_t> broadcast_shapes(const std::vector<int64_t>& shape1,
         if (dim1 == 1) result_shape[i] = dim2;
         else if (dim2 == 1) result_shape[i] = dim1;
         else if (dim1 == dim2) result_shape[i] = dim1;
-        else TP_THROW(RuntimeError, "The size of tensor a must match the size of tensor b at non-singleton dimension");
+        else TP_THROW(RuntimeError,
+               "The size of tensor a (", dim1,
+               ") must match the size of tensor b (", dim2,
+               ") at non-singleton dimension ", i);
     }
     return result_shape;
 }

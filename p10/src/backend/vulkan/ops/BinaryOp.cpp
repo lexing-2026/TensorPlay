@@ -30,6 +30,9 @@ Tensor binary_op_tensor(
     const Tensor& self_arg,
     const Tensor& other_arg,
     const Scalar& alpha) {
+  TP_CHECK(
+      self_arg.dtype() == DType::Float32,
+      "Vulkan binary ops support Float32 tensors only");
   api::Context* const context = api::context();
 
   api::vTensor v_self = convert(self_arg);
@@ -107,6 +110,9 @@ Tensor& binary_op_tensor_inplace(
     Tensor& self_arg,
     const Tensor& other_arg,
     const Scalar& alpha) {
+  TP_CHECK(
+      self_arg.dtype() == DType::Float32,
+      "Vulkan binary ops support Float32 tensors only");
   api::Context* const context = api::context();
 
   api::vTensor v_self = convert(self_arg);
@@ -177,6 +183,9 @@ Tensor binary_op_scalar(
     const Tensor& self_arg,
     const Scalar& other,
     const Scalar& alpha) {
+  TP_CHECK(
+      self_arg.dtype() == DType::Float32,
+      "Vulkan binary ops support Float32 tensors only");
   api::Context* const context = api::context();
 
   api::vTensor v_self = convert(self_arg);
@@ -246,6 +255,9 @@ Tensor& binary_op_scalar_inplace(
     Tensor& self_arg,
     const Scalar& other,
     const Scalar& alpha) {
+  TP_CHECK(
+      self_arg.dtype() == DType::Float32,
+      "Vulkan binary ops support Float32 tensors only");
   api::Context* const context = api::context();
 
   api::vTensor v_self = convert(self_arg);

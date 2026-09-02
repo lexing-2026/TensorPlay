@@ -486,6 +486,30 @@ Tensor& i0_inplace_kernel(Tensor& self) {
     return self;
 }
 
+Tensor& pow_scalar_inplace_kernel(Tensor& self, Scalar exponent) {
+    NoGradGuard __tp_nograd;
+    self.copy_(self.pow(exponent));
+    return self;
+}
+
+Tensor& pow_tensor_inplace_kernel(Tensor& self, const Tensor& exponent) {
+    NoGradGuard __tp_nograd;
+    self.copy_(self.pow(exponent));
+    return self;
+}
+
+Tensor& float_power_scalar_inplace_kernel(Tensor& self, Scalar exponent) {
+    NoGradGuard __tp_nograd;
+    self.copy_(self.float_power(exponent));
+    return self;
+}
+
+Tensor& float_power_tensor_inplace_kernel(Tensor& self, const Tensor& exponent) {
+    NoGradGuard __tp_nograd;
+    self.copy_(self.float_power(exponent));
+    return self;
+}
+
 } // namespace
 
 TENSORPLAY_LIBRARY_IMPL(CUDA, InplaceCompletionKernels) {
@@ -566,6 +590,10 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, InplaceCompletionKernels) {
     m.impl("trunc_", trunc_inplace_kernel);
     m.impl("threshold_", threshold_inplace_kernel);
     m.impl("i0_", i0_inplace_kernel);
+    m.impl("pow_.Scalar", pow_scalar_inplace_kernel);
+    m.impl("pow_.Tensor", pow_tensor_inplace_kernel);
+    m.impl("float_power_.Scalar", float_power_scalar_inplace_kernel);
+    m.impl("float_power_.Tensor", float_power_tensor_inplace_kernel);
 }
 
 } // namespace cuda

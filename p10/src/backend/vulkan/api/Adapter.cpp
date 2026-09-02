@@ -1,6 +1,8 @@
 #ifdef USE_VULKAN
 
 #include "Adapter.h"
+#include <cstdio>
+#include <vector>
 #include "Exception.h"
 
 #include <bitset>
@@ -13,21 +15,50 @@ namespace tensorplay {
 namespace vulkan {
 namespace api {
 
+// The portability subset extension name is provided here because older
+// header bundles predate the extension.
+#ifndef VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME
+#define VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME "VK_KHR_portability_subset"
+#endif
+
 PhysicalDevice::PhysicalDevice(VkPhysicalDevice physical_device_handle)
     : handle(physical_device_handle),
       properties{},
       memory_properties{},
+      features{},
       queue_families{},
       num_compute_queues(0),
       has_unified_memory(false),
       has_timestamps(false),
-      timestamp_period(0.0f) {
+      timestamp_period(0.0f),
+      has_portability_subset(false) {
   // Extract physical device properties
   vkGetPhysicalDeviceProperties(handle, &properties);
   vkGetPhysicalDeviceMemoryProperties(handle, &memory_properties);
+  vkGetPhysicalDeviceFeatures(handle, &features);
 
   has_timestamps = properties.limits.timestampComputeAndGraphics;
   timestamp_period = properties.limits.timestampPeriod;
+
+  // Detect the portability subset extension.  Devices that report it (for
+  // example metal-over-vulkan drivers) deviate from core semantics in
+  // documented ways and require the extension to be enabled at device
+  // creation time.
+  {
+    uint32_t extension_count = 0;
+    VK_CHECK(vkEnumerateDeviceExtensionProperties(
+        handle, nullptr, &extension_count, nullptr));
+    std::vector<VkExtensionProperties> extensions(extension_count);
+    VK_CHECK(vkEnumerateDeviceExtensionProperties(
+        handle, nullptr, &extension_count, extensions.data()));
+    for (const auto& extension : extensions) {
+      if (strcmp(extension.extensionName,
+                 VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME) == 0) {
+        has_portability_subset = true;
+        break;
+      }
+    }
+  }
 
   // Check if there are any memory types have both the HOST_VISIBLE and the
   // DEVICE_LOCAL property flags
@@ -94,6 +125,10 @@ VkDevice create_logical_device(
   std::vector<VkDeviceQueueCreateInfo> queue_create_infos;
   queue_create_infos.reserve(num_queues_to_create);
 
+  // Priority arrays live as long as the create infos below.
+  std::vector<std::vector<float>> queue_priorities_storage;
+  queue_priorities_storage.reserve(num_queues_to_create);
+
   std::vector<std::pair<uint32_t, uint32_t>> queues_to_get;
   queues_to_get.reserve(num_queues_to_create);
 
@@ -107,14 +142,14 @@ VkDevice create_logical_device(
       const uint32_t queues_to_init =
           std::min(remaining_queues, queue_properties.queueCount);
 
-      const std::vector<float> queue_priorities(queues_to_init, 1.0f);
+      queue_priorities_storage.emplace_back(queues_to_init, 1.0f);
       queue_create_infos.push_back({
           VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, // sType
           nullptr, // pNext
           0u, // flags
           family_i, // queueFamilyIndex
           queues_to_init, // queueCount
-          queue_priorities.data(), // pQueuePriorities
+          queue_priorities_storage.back().data(), // pQueuePriorities
       });
 
       for (size_t queue_i = 0; queue_i < queues_to_init; ++queue_i) {
@@ -133,7 +168,14 @@ VkDevice create_logical_device(
 
   // Create the VkDevice
 
+  // The portability subset extension is enabled when the device reports it;
+  // every other extension is optional and the backend makes no use of
+  // optional device extensions yet.
   std::vector<const char*> requested_device_extensions{};
+  if (physical_device.has_portability_subset) {
+    requested_device_extensions.push_back(
+        VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
+  }
 
   std::vector<const char*> enabled_device_extensions;
   find_requested_device_extensions(
@@ -152,7 +194,10 @@ VkDevice create_logical_device(
       static_cast<uint32_t>(
           enabled_device_extensions.size()), // enabledExtensionCount
       enabled_device_extensions.data(), // ppEnabledExtensionNames
-      nullptr, // pEnabledFeatures
+      // Enable the full feature set the device reports as supported.  All
+      // requests are guaranteed satisfiable, and future compute paths can
+      // rely on feature-gated abilities without re-plumbing this call.
+      &physical_device.features, // pEnabledFeatures
   };
 
   VkDevice handle = nullptr;

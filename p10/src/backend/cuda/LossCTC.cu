@@ -7,6 +7,7 @@
 #include "Dispatcher.h"
 #include "Exception.h"
 #include "CUDARuntime.h"
+#include "../composite/AttentionComposite.h"
 
 #include <cuda_runtime.h>
 
@@ -563,9 +564,36 @@ Tensor _ctc_loss_backward_cuda(const Tensor& grad, const Tensor& log_probs,
         grad, prepared, neg_log_likelihood, log_alpha, blank, zero_infinity);
 }
 
+
+// Public-op composites shared with the CPU registration; the inner `_ctc_loss`
+// dispatches to the CUDA kernel above.
+Tensor ctc_loss_intlist_cuda(const Tensor& log_probs, const Tensor& targets,
+                             const std::vector<int64_t>& input_lengths,
+                             const std::vector<int64_t>& target_lengths,
+                             int64_t blank, int64_t reduction,
+                             bool zero_infinity) {
+  Tensor il = Tensor::tensor(input_lengths, DType::Int64, log_probs.device());
+  Tensor tl = Tensor::tensor(target_lengths, DType::Int64, log_probs.device());
+  return tensorplay::composite::ctc_loss_compose(log_probs, targets, il, tl,
+                                                 blank, reduction,
+                                                 zero_infinity);
+}
+
+Tensor ctc_loss_tensor_cuda(const Tensor& log_probs, const Tensor& targets,
+                            const Tensor& input_lengths,
+                            const Tensor& target_lengths, int64_t blank,
+                            int64_t reduction, bool zero_infinity) {
+  return tensorplay::composite::ctc_loss_compose(log_probs, targets,
+                                                 input_lengths, target_lengths,
+                                                 blank, reduction,
+                                                 zero_infinity);
+}
+
 TENSORPLAY_LIBRARY_IMPL(CUDA, NativeCTCLoss) {
     m.impl("_ctc_loss", _ctc_loss_cuda);
     m.impl("_ctc_loss_backward", _ctc_loss_backward_cuda);
+    m.impl("ctc_loss.IntList", ctc_loss_intlist_cuda);
+    m.impl("ctc_loss.Tensor", ctc_loss_tensor_cuda);
 }
 
 }  // namespace cuda

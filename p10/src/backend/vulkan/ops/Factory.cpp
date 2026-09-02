@@ -13,35 +13,21 @@ namespace ops {
 namespace {
 
 /*
- * Uploads host bytes into the texture (or buffer) payload through the
- * staging pipeline: staging buffer -> pack shader / copy command.
- */
-void upload_host_bytes(api::vTensor& v_dst, const void* bytes, size_t nbytes) {
-  api::Context* const context = api::context();
-
-  api::StorageBuffer staging(
-      context, v_dst.texture_dtype(), v_dst.gpu_numel());
-  {
-    api::MemoryMap mapping(staging.buffer(), api::MemoryAccessType::WRITE);
-    memcpy(mapping.data<void>(), bytes, nbytes);
-  }
-  utils::pack_staging_to_vtensor(staging.buffer(), v_dst);
-}
-
-/*
- * Fills every element with the requested value.  The zero shader writes
- * vec4(0) for every texel, an in-place scalar add then applies the value.
+ * Fills every element with the requested value.  Float32 payloads run the
+ * zero-plus-add shader pair; every other dtype is materialized on the CPU in
+ * the payload's element type and streamed through the staging pipeline, which
+ * is valid for every supported VkFormat.
  */
 Tensor& fill_impl(Tensor& self, Scalar value) {
   TP_CHECK(
-      self.dtype() == DType::Float32,
-      "Vulkan fill_ supports Float32 tensors only");
+      self.dim() <= 4, "Vulkan fill_ supports up to 4d tensors");
 
   api::Context* const context = api::context();
 
   api::vTensor v_self = convert(self);
 
-  if (v_self.storage_type() == api::StorageType::BUFFER) {
+  if (v_self.storage_type() == api::StorageType::BUFFER &&
+      self.dtype() == DType::Float32) {
     const uint32_t n =
         safe_downcast_to_u32(static_cast<int64_t>(v_self.numel()));
     api::vTensor v = v_self;
@@ -75,32 +61,45 @@ Tensor& fill_impl(Tensor& self, Scalar value) {
     return self;
   }
 
-  const struct Block final {
-    uvec3 extents;
-    uint32_t fill0;
-    float other;
-  } block{
-      v_self.extents(),
-      0u,
-      value.to<float>(),
-  };
-
-  // Zero every texel.
-  {
-    const struct Block0 final {
-      uvec3 extents;
-      uint32_t fill0;
-    } block0{
-        v_self.extents(),
-        0u,
+  if (v_self.storage_type() == api::StorageType::TEXTURE_3D &&
+      self.dtype() == DType::Float32) {
+    const struct Block final {
+      ivec4 extents;
+      float other;
+    } block{
+        make_whcn_ivec4(v_self.gpu_sizes()),
+        value.to<float>(),
     };
 
-    api::UniformParamsBuffer params(context, block0);
+    // Newly allocated payloads hold arbitrary bits: clear every texel to a
+    // known zero before the in-place add reads it back.
+    {
+      api::PipelineBarrier pipeline_barrier{};
+
+      context->submit_compute_job(
+          // shader descriptor
+          VK_KERNEL(zero),
+          // pipeline barrier
+          pipeline_barrier,
+          // global work group size
+          v_self.extents(),
+          // local work group size
+          adaptive_work_group_size(v_self.extents()),
+          // fence handle
+          VK_NULL_HANDLE,
+          // shader arguments
+          v_self.image(
+              pipeline_barrier,
+              api::PipelineStage::COMPUTE,
+              api::MemoryAccessType::WRITE));
+    }
+
+    api::UniformParamsBuffer params(context, block);
     api::PipelineBarrier pipeline_barrier{};
 
     context->submit_compute_job(
         // shader descriptor
-        VK_KERNEL(zero),
+        VK_KERNEL(add_scalarinplace),
         // pipeline barrier
         pipeline_barrier,
         // global work group size
@@ -113,33 +112,38 @@ Tensor& fill_impl(Tensor& self, Scalar value) {
         v_self.image(
             pipeline_barrier,
             api::PipelineStage::COMPUTE,
-            api::MemoryAccessType::WRITE),
+            api::MemoryAccessType::READ | api::MemoryAccessType::WRITE),
         // params buffer
         params.buffer());
+
+    return self;
   }
 
-  api::UniformParamsBuffer params(context, block);
-  api::PipelineBarrier pipeline_barrier{};
+  // Non-float payloads: materialize the value on the CPU in the texture's
+  // element type, repack to the texel-linear layout, and transfer.
+  const DType texture_dtype =
+      (v_self.storage_type() == api::StorageType::TEXTURE_3D)
+      ? v_self.texture_dtype()
+      : self.dtype();
+  Tensor host(
+      static_cast<std::vector<int64_t>>(self.shape()),
+      texture_dtype,
+      Device(DeviceType::CPU));
+  host.fill_(value);
 
-  context->submit_compute_job(
-      // shader descriptor
-      VK_KERNEL(add_scalarinplace),
-      // pipeline barrier
-      pipeline_barrier,
-      // global work group size
-      v_self.extents(),
-      // local work group size
-      adaptive_work_group_size(v_self.extents()),
-      // fence handle
-      VK_NULL_HANDLE,
-      // shader arguments
-      v_self.image(
-          pipeline_barrier,
-          api::PipelineStage::COMPUTE,
-          api::MemoryAccessType::READ | api::MemoryAccessType::WRITE),
-      // params buffer
-      params.buffer());
+  if (v_self.storage_type() == api::StorageType::BUFFER) {
+    utils::upload_host_bytes(
+        v_self,
+        host.impl()->storage().data(),
+        host.numel() * host.itemsize());
+    return self;
+  }
 
+  Tensor host_nc4hw = utils::nchw_to_nc4hw(host.contiguous());
+  utils::upload_host_bytes(
+      v_self,
+      host_nc4hw.impl()->storage().data(),
+      host_nc4hw.numel() * host_nc4hw.itemsize());
   return self;
 }
 
@@ -150,13 +154,14 @@ Tensor empty_kernel(
     DType dtype,
     Device device,
     bool pin_memory) {
-  if (pin_memory) {
-    TP_THROW(RuntimeError, "pin_memory is only valid for CPU tensors");
-  }
+  TP_CHECK(
+      !pin_memory, "pin_memory is only valid for CPU tensors");
+  const DType resolved =
+      (dtype == DType::Undefined) ? DType::Float32 : dtype;
   api::vTensor v{
       api::context(),
       size,
-      dtype,
+      convert_dtype(resolved),
   };
   return convert(v);
 }
@@ -167,36 +172,14 @@ Tensor zeros_kernel(
     Device device,
     bool pin_memory) {
   Tensor t = empty_kernel(size, dtype, device, pin_memory);
-  if (dtype == DType::Float32) {
-    api::vTensor v = convert(t);
-    api::Context* const context = api::context();
+  if (t.numel() == 0) {
+    return t;
+  }
+  api::Context* const context = api::context();
+  api::vTensor v = convert(t);
 
-    if (v.storage_type() == api::StorageType::BUFFER) {
-      const uint32_t n =
-          safe_downcast_to_u32(static_cast<int64_t>(v.numel()));
-      const struct BlockZ final {
-        uint32_t buf_length;
-      } blockz{n};
-      api::UniformParamsBuffer params(context, blockz);
-      api::PipelineBarrier pipeline_barrier{};
-      context->submit_compute_job(
-          VK_KERNEL(buffer_zero), pipeline_barrier, {n, 1u, 1u}, {64u, 1u, 1u},
-          VK_NULL_HANDLE,
-          v.buffer(pipeline_barrier, api::PipelineStage::COMPUTE,
-                   api::MemoryAccessType::WRITE),
-          params.buffer());
-      return t;
-    }
-
-    const struct Block final {
-      uvec3 extents;
-      uint32_t fill0;
-    } block{
-        v.extents(),
-        0u,
-    };
-
-    api::UniformParamsBuffer params(context, block);
+  if (v.storage_type() == api::StorageType::TEXTURE_3D &&
+      t.dtype() == DType::Float32) {
     api::PipelineBarrier pipeline_barrier{};
 
     context->submit_compute_job(
@@ -214,17 +197,34 @@ Tensor zeros_kernel(
         v.image(
             pipeline_barrier,
             api::PipelineStage::COMPUTE,
-            api::MemoryAccessType::WRITE),
-        // params buffer
+            api::MemoryAccessType::WRITE));
+    return t;
+  }
+
+  if (v.storage_type() == api::StorageType::BUFFER &&
+      tensorplay::elementSize(t.dtype()) == 4u) {
+    // The zero shader writes single-precision words; the all-zero bit
+    // pattern is also a zero element for 4-byte integer payloads.
+    const uint32_t n =
+        safe_downcast_to_u32(static_cast<int64_t>(v.numel()));
+    const struct BlockZ final {
+      uint32_t buf_length;
+    } blockz{n};
+    api::UniformParamsBuffer params(context, blockz);
+    api::PipelineBarrier pipeline_barrier{};
+    context->submit_compute_job(
+        VK_KERNEL(buffer_zero), pipeline_barrier, {n, 1u, 1u}, {64u, 1u, 1u},
+        VK_NULL_HANDLE,
+        v.buffer(pipeline_barrier, api::PipelineStage::COMPUTE,
+                 api::MemoryAccessType::WRITE),
         params.buffer());
     return t;
   }
-  // Non-float payloads are staged from the CPU: all-zero bytes are valid
-  // for every dtype.
-  const size_t nbytes = t.numel() * tensorplay::elementSize(dtype);
-  std::vector<uint8_t> host(nbytes, 0);
-  api::vTensor v = convert(t);
-  upload_host_bytes(v, host.data(), nbytes);
+
+  // All-zero bytes are valid zeros for every dtype; stream the payload
+  // through the staging pipeline without format-specific shaders.
+  std::vector<uint8_t> host(v.gpu_nbytes(), 0);
+  utils::upload_host_bytes(v, host.data(), host.size());
   return t;
 }
 
@@ -234,12 +234,8 @@ Tensor ones_kernel(
     Device device,
     bool pin_memory) {
   Tensor t = empty_kernel(size, dtype, device, pin_memory);
-  if (dtype == DType::Float32) {
-    return fill_impl(t, Scalar(1.0)), t;
-  }
-  TP_THROW(
-      NotImplementedError,
-      "Vulkan ones supports Float32 tensors only");
+  fill_impl(t, Scalar(1.0));
+  return t;
 }
 
 Tensor full_kernel(
@@ -249,12 +245,8 @@ Tensor full_kernel(
     Device device,
     bool pin_memory) {
   Tensor t = empty_kernel(size, dtype, device, pin_memory);
-  if (dtype == DType::Float32) {
-    return fill_impl(t, fill_value), t;
-  }
-  TP_THROW(
-      NotImplementedError,
-      "Vulkan full supports Float32 tensors only");
+  fill_impl(t, fill_value);
+  return t;
 }
 
 Tensor empty_like_kernel(
@@ -305,15 +297,66 @@ Tensor& fill_kernel(Tensor& self, Scalar value) {
   return fill_impl(self, value);
 }
 
+namespace {
+
+DType resolve_dtype(std::optional<DType> dtype) {
+  if (!dtype.has_value() || *dtype == DType::Undefined) {
+    return DType::Float32;
+  }
+  return *dtype;
+}
+
+Device resolve_device(std::optional<Device> device) {
+  return device.value_or(Device(DeviceType::Vulkan));
+}
+
+// Schema-level adapters: the dispatcher invokes kernels with the optional
+// argument types of the schema, while the kernels above keep concrete
+// parameters for internal reuse.
+Tensor empty_stub(
+    const std::vector<int64_t>& size,
+    std::optional<DType> dtype,
+    std::optional<Device> device,
+    bool pin_memory) {
+  return empty_kernel(size, resolve_dtype(dtype), resolve_device(device), pin_memory);
+}
+
+Tensor zeros_stub(
+    const std::vector<int64_t>& size,
+    std::optional<DType> dtype,
+    std::optional<Device> device,
+    bool pin_memory) {
+  return zeros_kernel(size, resolve_dtype(dtype), resolve_device(device), pin_memory);
+}
+
+Tensor ones_stub(
+    const std::vector<int64_t>& size,
+    std::optional<DType> dtype,
+    std::optional<Device> device,
+    bool pin_memory) {
+  return ones_kernel(size, resolve_dtype(dtype), resolve_device(device), pin_memory);
+}
+
+Tensor full_stub(
+    const std::vector<int64_t>& size,
+    Scalar fill_value,
+    DType dtype,
+    std::optional<Device> device,
+    bool pin_memory) {
+  return full_kernel(size, fill_value, dtype, resolve_device(device), pin_memory);
+}
+
+} // namespace
+
 } // namespace ops
 } // namespace vulkan
 } // namespace tensorplay
 
 TENSORPLAY_LIBRARY_IMPL(Vulkan, FactoryKernels) {
-  m.impl("empty", &tensorplay::vulkan::ops::empty_kernel);
-  m.impl("zeros", &tensorplay::vulkan::ops::zeros_kernel);
-  m.impl("ones", &tensorplay::vulkan::ops::ones_kernel);
-  m.impl("full", &tensorplay::vulkan::ops::full_kernel);
+  m.impl("empty", &tensorplay::vulkan::ops::empty_stub);
+  m.impl("zeros", &tensorplay::vulkan::ops::zeros_stub);
+  m.impl("ones", &tensorplay::vulkan::ops::ones_stub);
+  m.impl("full", &tensorplay::vulkan::ops::full_stub);
   m.impl("empty_like", &tensorplay::vulkan::ops::empty_like_kernel);
   m.impl("zeros_like", &tensorplay::vulkan::ops::zeros_like_kernel);
   m.impl("ones_like", &tensorplay::vulkan::ops::ones_like_kernel);

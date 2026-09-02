@@ -337,6 +337,33 @@ Tensor minimum_cpu(const Tensor& self, const Tensor& other) {
     return maximum_minimum_kernel_impl(self, other, MinimumOp());
 }
 
+// fmax/fmin: a NaN operand yields the other input verbatim (IEEE fmax/fmin
+// semantics); two NaNs stay NaN.  Integral types have no NaN and reduce to
+// the plain max/min comparison.
+template <bool Maximum>
+struct FmaxFminOp {
+    template <typename T>
+    T operator()(T a, T b) const {
+        if constexpr (std::is_floating_point_v<T>) {
+            if (std::isnan(a)) return b;
+            if (std::isnan(b)) return a;
+        }
+        if constexpr (Maximum) {
+            return a < b ? b : a;
+        } else {
+            return a < b ? a : b;
+        }
+    }
+};
+
+Tensor fmax_cpu(const Tensor& self, const Tensor& other) {
+    return maximum_minimum_kernel_impl(self, other, FmaxFminOp<true>());
+}
+
+Tensor fmin_cpu(const Tensor& self, const Tensor& other) {
+    return maximum_minimum_kernel_impl(self, other, FmaxFminOp<false>());
+}
+
 TENSORPLAY_LIBRARY_IMPL(CPU, ComparisonKernels) {
     m.impl("eq.Tensor", eq_tensor_kernel);
     m.impl("eq.Scalar", eq_scalar_kernel);
@@ -356,6 +383,8 @@ TENSORPLAY_LIBRARY_IMPL(CPU, ComparisonKernels) {
     m.impl("where.Scalar", where_scalar_scalar_cpu);
     m.impl("maximum", maximum_cpu);
     m.impl("minimum", minimum_cpu);
+    m.impl("fmax", fmax_cpu);
+    m.impl("fmin", fmin_cpu);
 }
 
 } // namespace cpu

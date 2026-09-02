@@ -39,6 +39,8 @@ using F = void*;  // raw Fortran-ABI entry point
 
 F g_sgetrf, g_dgetrf, g_sgetrs, g_dgetrs;
 F g_spotrf, g_dpotrf;
+F g_spotrs, g_dpotrs;
+F g_spotri, g_dpotri;
 F g_sgeqrf, g_dgeqrf, g_sorgqr, g_dorgqr;
 F g_sgesdd, g_dgesdd;
 F g_ssyevd, g_dsyevd;
@@ -77,6 +79,8 @@ bool resolve_all(void* handle) {
         {g_sgetrf, "sgetrf"}, {g_dgetrf, "dgetrf"},
         {g_sgetrs, "sgetrs"}, {g_dgetrs, "dgetrs"},
         {g_spotrf, "spotrf"}, {g_dpotrf, "dpotrf"},
+        {g_spotrs, "spotrs"}, {g_dpotrs, "dpotrs"},
+        {g_spotri, "spotri"}, {g_dpotri, "dpotri"},
         // LAPACK's generic-name routines (geqrf/gesdd/syevd/...) carry the
         // s/d precision prefix in their symbols; the scipy-openblas wheel
         // exports them as scipy_<s|d><name>_64_.
@@ -242,6 +246,28 @@ int64_t lapack_spotrf(char uplo, int64_t n, float* a, int64_t lda) {
 int64_t lapack_dpotrf(char uplo, int64_t n, double* a, int64_t lda) {
     int64_t info = 0;
     TP_LAPACK_CALL(dpotrf, const char*, const int64_t*, double*, const int64_t*, int64_t*)(&uplo, &n, a, &lda, &info);
+    return info;
+}
+int64_t lapack_spotrs(char uplo, int64_t n, int64_t nrhs, const float* a,
+                      int64_t lda, float* b, int64_t ldb) {
+    int64_t info = 0;
+    TP_LAPACK_CALL(spotrs, const char*, const int64_t*, const int64_t*, const float*, const int64_t*, float*, const int64_t*, int64_t*)(&uplo, &n, &nrhs, a, &lda, b, &ldb, &info);
+    return info;
+}
+int64_t lapack_dpotrs(char uplo, int64_t n, int64_t nrhs, const double* a,
+                      int64_t lda, double* b, int64_t ldb) {
+    int64_t info = 0;
+    TP_LAPACK_CALL(dpotrs, const char*, const int64_t*, const int64_t*, const double*, const int64_t*, double*, const int64_t*, int64_t*)(&uplo, &n, &nrhs, a, &lda, b, &ldb, &info);
+    return info;
+}
+int64_t lapack_spotri(char uplo, int64_t n, float* a, int64_t lda) {
+    int64_t info = 0;
+    TP_LAPACK_CALL(spotri, const char*, const int64_t*, float*, const int64_t*, int64_t*)(&uplo, &n, a, &lda, &info);
+    return info;
+}
+int64_t lapack_dpotri(char uplo, int64_t n, double* a, int64_t lda) {
+    int64_t info = 0;
+    TP_LAPACK_CALL(dpotri, const char*, const int64_t*, double*, const int64_t*, int64_t*)(&uplo, &n, a, &lda, &info);
     return info;
 }
 int64_t lapack_sgeqrf(int64_t m, int64_t n, float* a, int64_t lda, float* tau,

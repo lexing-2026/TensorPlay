@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <random>
 #include <cstring>
+#include <utility>
 #include "Macros.h"
 #include "DType.h"
 #include "Device.h"
@@ -22,6 +23,7 @@
 namespace tensorplay {
 
 class Tensor;
+class Quantizer;
 
 class P10_API TensorImpl {
 private:
@@ -49,8 +51,9 @@ private:
     // Opaque pointer to OneDNN memory descriptor (std::shared_ptr<dnnl::memory::desc>)
     // std::shared_ptr<void> onednn_md_;
     
+    Storage storage_;
+
     struct SharedState {
-        Storage storage;
         std::shared_ptr<void> onednn_md;
         std::shared_ptr<void> onednn_memory_cache; // Cache for OneDNN memory object (reordered)
     };
@@ -80,6 +83,11 @@ private:
     int64_t transform_batch_dim_ = -1;
     int64_t transform_level_ = -1;
 
+    // Quantized tensors carry their affine parameters (scheme, scale,
+    // zero point, per-channel tables) in an immutable, shared quantizer.
+    // Plain integer tensors over the same storage keep this null.
+    std::shared_ptr<Quantizer> quantizer_;
+
 public:
     static constexpr int kSparseCOOLayout = 0;
     static constexpr int kSparseCSRLayout = 1;
@@ -105,12 +113,12 @@ public:
     ~TensorImpl() = default;
 
     // Storage
-    const Storage& storage() const { return shared_state_->storage; }
+    const Storage& storage() const { return storage_; }
     size_t storage_offset() const { return storage_offset_; }
-    void set_storage(Storage storage) { shared_state_->storage = storage; }
-    void clear_storage() { shared_state_->storage = Storage(); }
+    void set_storage(Storage storage) { storage_ = std::move(storage); }
+    void clear_storage() { storage_ = Storage(); }
     void set_storage_offset(size_t offset) { storage_offset_ = offset; }
-    bool has_storage() const { return shared_state_ && shared_state_->storage.defined(); }
+    bool has_storage() const { return storage_.defined(); }
     
     // Metadata
     const SizesAndStrides& sizes_and_strides() const { return sizes_and_strides_; }
@@ -293,7 +301,7 @@ public:
     template<typename T>
     T* data() const {
         if (!has_storage()) return nullptr;
-        void* base_ptr = shared_state_->storage.data();
+        void* base_ptr = storage_.data();
 #ifdef USE_CUDA
         if (device_.is_cuda()) cuda::recordStream(base_ptr, device_);
 #endif
@@ -302,7 +310,7 @@ public:
     
     void* data() const {
         if (!has_storage()) return nullptr;
-        void* base_ptr = shared_state_->storage.data();
+        void* base_ptr = storage_.data();
 #ifdef USE_CUDA
         if (device_.is_cuda()) cuda::recordStream(base_ptr, device_);
 #endif
@@ -310,19 +318,39 @@ public:
         return static_cast<char*>(base_ptr) + storage_offset_ * elem_size;
     }
 
-    void set_onednn_md(std::shared_ptr<void> md) { shared_state_->onednn_md = md; }
-    std::shared_ptr<void> get_onednn_md() const { return shared_state_->onednn_md; }
-    bool has_onednn_md() const { return shared_state_->onednn_md != nullptr; }
+    void set_onednn_md(std::shared_ptr<void> md) {
+        if (!shared_state_) shared_state_ = std::make_shared<SharedState>();
+        shared_state_->onednn_md = std::move(md);
+    }
+    std::shared_ptr<void> get_onednn_md() const {
+        return shared_state_ ? shared_state_->onednn_md : nullptr;
+    }
+    bool has_onednn_md() const {
+        return shared_state_ && shared_state_->onednn_md != nullptr;
+    }
 
-    void set_onednn_memory_cache(std::shared_ptr<void> mem) { shared_state_->onednn_memory_cache = mem; }
-    std::shared_ptr<void> get_onednn_memory_cache() const { return shared_state_->onednn_memory_cache; }
-    bool has_onednn_memory_cache() const { return shared_state_->onednn_memory_cache != nullptr; }
+    void set_onednn_memory_cache(std::shared_ptr<void> mem) {
+        if (!shared_state_) shared_state_ = std::make_shared<SharedState>();
+        shared_state_->onednn_memory_cache = std::move(mem);
+    }
+    std::shared_ptr<void> get_onednn_memory_cache() const {
+        return shared_state_ ? shared_state_->onednn_memory_cache : nullptr;
+    }
+    bool has_onednn_memory_cache() const {
+        return shared_state_ && shared_state_->onednn_memory_cache != nullptr;
+    }
 
     void set_autograd_meta(std::shared_ptr<AutogradMetaBase> meta) { autograd_meta_ = std::move(meta); }
     AutogradMetaBase* autograd_meta() const { return autograd_meta_.get(); }
     bool has_autograd_meta() const { return autograd_meta_ != nullptr; }
     std::shared_ptr<AutogradMetaBase> autograd_meta_shared() const { return autograd_meta_; }
     void set_requires_grad(bool requires_grad);
+
+    // Quantizer metadata: present exactly on quantized tensors.  The
+    // quantizer is shared between views/copies and is immutable.
+    void set_quantizer(std::shared_ptr<Quantizer> q) { quantizer_ = std::move(q); }
+    std::shared_ptr<Quantizer> quantizer() const { return quantizer_; }
+    bool has_quantizer() const { return quantizer_ != nullptr; }
 
     // resize_ support: adopt new logical sizes with fresh contiguous strides.
     // Storage growth is the caller's job (kernels grow it first so the old
@@ -350,6 +378,7 @@ public:
     
     // Share storage state from another TensorImpl
     void share_storage_from(const TensorImpl& other) {
+        storage_ = other.storage_;
         shared_state_ = other.shared_state_;
     }
 };

@@ -310,9 +310,9 @@ std::tuple<Tensor, Tensor, Tensor> batch_norm_backward_cuda(
 // ============================================================================
 // Layer Normalization (custom kernels, no cuDNN dependency)
 //
-// layer_norm_kernel.cu: per-row Welford moments combined through warp
-// shuffles and shared memory, fp32 accumulation for Half/BFloat16 inputs,
-// fused stats+apply forward pass with vectorized loads when N % 4 == 0.
+// Per-row Welford moments combined through warp shuffles and shared memory,
+// fp32 accumulation for Half/BFloat16 inputs, fused stats+apply forward pass
+// with vectorized loads when N % 4 == 0.
 // ============================================================================
 
 namespace layer_norm {
@@ -368,9 +368,9 @@ __device__ inline LNWelford<ACC> ln_warp_reduce(LNWelford<ACC> val) {
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
         LNWelford<ACC> other;
-        other.mean = __shfl_down_sync(0xffffffff, val.mean, offset);
-        other.m2 = __shfl_down_sync(0xffffffff, val.m2, offset);
-        other.count = __shfl_down_sync(0xffffffff, val.count, offset);
+        other.mean = __shfl_down_sync(0xffffffffffffffffull, val.mean, offset);
+        other.m2 = __shfl_down_sync(0xffffffffffffffffull, val.m2, offset);
+        other.count = __shfl_down_sync(0xffffffffffffffffull, val.count, offset);
         val = ln_welford_combine(val, other);
     }
     return val;
@@ -402,8 +402,8 @@ __device__ inline void ln_block_reduce2(ACC& v0, ACC& v1, ACC* smem0, ACC* smem1
     const int wid = static_cast<int>(threadIdx.x) >> 5;
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
-        v0 += __shfl_down_sync(0xffffffff, v0, offset);
-        v1 += __shfl_down_sync(0xffffffff, v1, offset);
+        v0 += __shfl_down_sync(0xffffffffffffffffull, v0, offset);
+        v1 += __shfl_down_sync(0xffffffffffffffffull, v1, offset);
     }
     if (lane == 0) { smem0[wid] = v0; smem1[wid] = v1; }
     __syncthreads();
@@ -412,8 +412,8 @@ __device__ inline void ln_block_reduce2(ACC& v0, ACC& v1, ACC* smem0, ACC* smem1
     if (wid == 0) {
 #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
-            v0 += __shfl_down_sync(0xffffffff, v0, offset);
-            v1 += __shfl_down_sync(0xffffffff, v1, offset);
+            v0 += __shfl_down_sync(0xffffffffffffffffull, v0, offset);
+            v1 += __shfl_down_sync(0xffffffffffffffffull, v1, offset);
         }
     }
     if (threadIdx.x == 0) { smem0[0] = v0; smem1[0] = v1; }
@@ -1130,7 +1130,7 @@ __global__ void rms_norm_row_kernel(const T* __restrict__ x,
     }
     // warp reduce
     for (int off = 16; off > 0; off >>= 1)
-        local += __shfl_down_sync(0xffffffffu, local, off);
+        local += __shfl_down_sync(0xffffffffffffffffull, local, off);
     __shared__ ACC warp_sums[32];
     const int lane = threadIdx.x & 31;
     const int wid = threadIdx.x >> 5;
@@ -1142,7 +1142,7 @@ __global__ void rms_norm_row_kernel(const T* __restrict__ x,
     if (wid == 0) {
         total = (lane < nwarps) ? warp_sums[lane] : ACC(0);
         for (int off = 16; off > 0; off >>= 1)
-            total += __shfl_down_sync(0xffffffffu, total, off);
+            total += __shfl_down_sync(0xffffffffffffffffull, total, off);
     }
     __shared__ ACC s_inv;
     if (threadIdx.x == 0)

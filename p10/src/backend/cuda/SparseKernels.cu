@@ -1,7 +1,7 @@
 #include "SparseKernels.h"
 #include "CUDARuntime.h"
 
-#include <cub/cub.cuh>
+#include "GPUPrimitives.cuh"
 #include <thrust/iterator/counting_iterator.h>
 #include <cuda_runtime.h>
 #include <climits>

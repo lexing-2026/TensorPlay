@@ -8,14 +8,17 @@
 #include "TypePromotion.h"
 #include "CompositeCommon.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
+#include "cpu/Lapack.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <functional>
 #include <limits>
 #include <optional>
 #include <string>
 #include <tuple>
+#include <type_traits>
 #include <vector>
 
 namespace tensorplay {
@@ -80,14 +83,16 @@ Tensor& norm_dtype_out_native(const Tensor& self, const std::optional<Scalar>& p
 
 // ---- reductions ------------------------------------------------------------
 Tensor prod_dim_int_native(const Tensor& self, int64_t dim, bool keepdim,
-                           const std::optional<DType>& dtype) {
-    Tensor r = ops::prod(self, dim, keepdim);
+                           std::optional<DType> dtype) {
+    // Forward to the registered int-list reduction; calling the int-dim
+    // overload here would dispatch back to this very kernel.
+    Tensor r = ops::prod(self, std::vector<int64_t>{dim}, keepdim);
     if (dtype.has_value() && r.dtype() != *dtype) r = r.to(*dtype);
     return r;
 }
 
 Tensor& prod_int_out_native(const Tensor& self, int64_t dim, bool keepdim,
-                            const std::optional<DType>& dtype, Tensor& out) {
+                            std::optional<DType> dtype, Tensor& out) {
     out = prod_dim_int_native(self, dim, keepdim, dtype);
     return out;
 }
@@ -161,7 +166,7 @@ std::tuple<Tensor, Tensor> median_dim_native(const Tensor& self, int64_t dim, bo
     return ops::kthvalue(self, (n + 1) / 2, dim, keepdim);
 }
 
-std::tuple<Tensor&, Tensor&> median_dim_values_native(const Tensor& self, int64_t dim,
+std::tuple<Tensor, Tensor> median_dim_values_native(const Tensor& self, int64_t dim,
                                                      bool keepdim, Tensor& values,
                                                      Tensor& indices) {
     auto r = median_dim_native(self, dim, keepdim);
@@ -172,14 +177,14 @@ std::tuple<Tensor&, Tensor&> median_dim_values_native(const Tensor& self, int64_
 
 // ---- sort / topk ------------------------------------------------------------
 std::tuple<Tensor, Tensor> sort_stable_native(const Tensor& self,
-                                              const std::optional<bool>& stable, int64_t dim,
+                                              std::optional<bool> stable, int64_t dim,
                                               bool descending) {
     (void)stable;
     return ops::sort(self, dim, descending);
 }
 
-std::tuple<Tensor&, Tensor&> sort_values_stable_native(const Tensor& self,
-                                                      const std::optional<bool>& stable,
+std::tuple<Tensor, Tensor> sort_values_stable_native(const Tensor& self,
+                                                      std::optional<bool> stable,
                                                       int64_t dim, bool descending,
                                                       Tensor& values, Tensor& indices) {
     auto r = sort_stable_native(self, stable, dim, descending);
@@ -199,7 +204,7 @@ Tensor& argsort_stable_out_native(const Tensor& self, bool stable, int64_t dim,
     return out;
 }
 
-std::tuple<Tensor&, Tensor&> topk_values_native(const Tensor& self, int64_t k, int64_t dim,
+std::tuple<Tensor, Tensor> topk_values_native(const Tensor& self, int64_t k, int64_t dim,
                                                bool largest, bool sorted, Tensor& values,
                                                Tensor& indices) {
     auto r = ops::topk(self, k, dim, largest, sorted);
@@ -238,8 +243,8 @@ Tensor max_other_native(const Tensor& self, const Tensor& other) {
     return ops::maximum(self, other);
 }
 
-std::tuple<Tensor&, Tensor&> aminmax_out_native(const Tensor& self,
-                                               const std::optional<int64_t>& dim,
+std::tuple<Tensor, Tensor> aminmax_out_native(const Tensor& self,
+                                               std::optional<int64_t> dim,
                                                bool keepdim, Tensor& min, Tensor& max) {
     std::vector<int64_t> dims;
     if (dim.has_value()) dims.push_back(*dim);
@@ -260,9 +265,9 @@ Tensor& round__decimals_native(Tensor& self, int64_t decimals) {
     return self;
 }
 
-Tensor& nan_to_num_out_native(const Tensor& self, const std::optional<double>& nan,
-                              const std::optional<double>& posinf,
-                              const std::optional<double>& neginf, Tensor& out) {
+Tensor& nan_to_num_out_native(const Tensor& self, std::optional<double> nan,
+                              std::optional<double> posinf,
+                              std::optional<double> neginf, Tensor& out) {
     out = ops::nan_to_num(self,
                           Scalar(nan.value_or(0.0)),
                           Scalar(posinf.value_or(std::numeric_limits<double>::infinity())),
@@ -271,7 +276,7 @@ Tensor& nan_to_num_out_native(const Tensor& self, const std::optional<double>& n
 }
 
 Tensor& nanmean_out_native(const Tensor& self, const std::optional<std::vector<int64_t>>& dim,
-                           bool keepdim, const std::optional<DType>& dtype, Tensor& out) {
+                           bool keepdim, std::optional<DType> dtype, Tensor& out) {
     if (dim.has_value() && dim->size() == 1) {
         out = ops::nanmean(self, (*dim)[0], keepdim, dtype);
     } else if (!dim.has_value()) {
@@ -299,60 +304,274 @@ Tensor cumulative_trapezoid_x_native(const Tensor& y, const Tensor& x, int64_t d
     return ops::cumulative_trapezoid(y, x, Scalar(1), dim);
 }
 
+// Every gradient overload funnels into the tensor-spacing base kernel, so the
+// scalar spacings of the variants below are materialized as 0-d tensors before
+// delegating. Calling a scalar-spacing overload from here would dispatch back
+// into the very kernels registered just below.
+static std::vector<Tensor> gradient_scalar_spacings(const std::vector<Scalar>& spacing,
+                                                    const Tensor& ref) {
+    std::vector<Tensor> sp;
+    sp.reserve(spacing.size());
+    for (const Scalar& s : spacing) {
+        sp.push_back(ops::scalar_tensor(s, DType::Undefined, ref.device()));
+    }
+    return sp;
+}
+
 std::vector<Tensor> gradient_scalarint_native(const Tensor& self,
                                               const std::optional<Scalar>& spacing,
-                                              const std::optional<int64_t>& dim,
+                                              std::optional<int64_t> dim,
                                               int64_t edge_order) {
-    if (dim.has_value()) {
-        return ops::gradient(self, spacing.value_or(Scalar(1)),
-                             std::vector<int64_t>{*dim}, edge_order);
-    }
-    return ops::gradient(self, spacing.value_or(Scalar(1)),
-                         std::vector<int64_t>{self.dim() - 1}, edge_order);
+    const std::vector<int64_t> dims{dim.has_value() ? *dim : self.dim() - 1};
+    return ops::gradient(self,
+                         gradient_scalar_spacings({spacing.value_or(Scalar(1))}, self),
+                         dims, edge_order);
 }
 
 std::vector<Tensor> gradient_scalararray_native(const Tensor& self, const Scalar& spacing,
                                                 const std::vector<int64_t>& dim,
                                                 int64_t edge_order) {
-    return ops::gradient(self, spacing, dim, edge_order);
+    return ops::gradient(self,
+                         gradient_scalar_spacings(std::vector<Scalar>(dim.size(), spacing), self),
+                         dim, edge_order);
 }
 
 std::vector<Tensor> gradient_array_native(const Tensor& self, const std::vector<int64_t>& dim,
                                           int64_t edge_order) {
-    return ops::gradient(self, std::vector<Tensor>{}, dim, edge_order);
+    return ops::gradient(self,
+                         gradient_scalar_spacings(std::vector<Scalar>(dim.size(), Scalar(1)), self),
+                         dim, edge_order);
 }
 
 std::vector<Tensor> gradient_scalarrayint_native(const Tensor& self,
                                                  const std::vector<Scalar>& spacing,
-                                                 const std::optional<int64_t>& dim,
+                                                 std::optional<int64_t> dim,
                                                  int64_t edge_order) {
-    if (dim.has_value()) {
-        return ops::gradient(self, spacing, std::vector<int64_t>{*dim}, edge_order);
-    }
-    return ops::gradient(self, spacing, std::vector<int64_t>{self.dim() - 1}, edge_order);
+    const std::vector<int64_t> dims{dim.has_value() ? *dim : self.dim() - 1};
+    return ops::gradient(self, gradient_scalar_spacings(spacing, self), dims, edge_order);
 }
 
 std::vector<Tensor> gradient_scalarrayarray_native(const Tensor& self,
                                                    const std::vector<Scalar>& spacing,
                                                    const std::vector<int64_t>& dim,
                                                    int64_t edge_order) {
-    return ops::gradient(self, spacing, dim, edge_order);
+    return ops::gradient(self, gradient_scalar_spacings(spacing, self), dim, edge_order);
 }
 
 std::vector<Tensor> gradient_tensorarrayint_native(const Tensor& self,
                                                    const std::vector<Tensor>& spacing,
-                                                   const std::optional<int64_t>& dim,
+                                                   std::optional<int64_t> dim,
                                                    int64_t edge_order) {
-    if (dim.has_value()) {
-        return ops::gradient(self, spacing, std::vector<int64_t>{*dim}, edge_order);
-    }
-    return ops::gradient(self, spacing, std::vector<int64_t>{self.dim() - 1}, edge_order);
+    const std::vector<int64_t> dims{dim.has_value() ? *dim : self.dim() - 1};
+    return ops::gradient(self, spacing, dims, edge_order);
 }
 
-Tensor quantile_scalar_native(const Tensor& self, double q, const std::optional<int64_t>& dim,
+Tensor quantile_scalar_native(const Tensor& self, double q, std::optional<int64_t> dim,
                               bool keepdim, const std::string& interpolation) {
     Tensor qv = ops::unsqueeze(ops::scalar_tensor(Scalar(q), DType::Undefined), 0);
     return ops::quantile(self, qv, dim, keepdim, interpolation);
+}
+
+// ---- ormqr -----------------------------------------------------------------
+// Applies the orthogonal matrix Q carried by Householder reflectors (self,
+// input2=tau) to the rows or columns of input3: C := op(Q)·C when left, else
+// C·op(Q), with op = transpose ? Q^T : Q.  Q has order q = the matched
+// dimension of input3, while only k reflectors are given; the product is
+// materialized explicitly by expanding the reflector block into a (q x q)
+// column-major buffer whose remaining columns are zero and reducing with
+// orgqr, then applied through the registered batched matmul.
+template <typename T>
+static void row_to_col_major(const T* src, int64_t rows, int64_t cols, T* dst) {
+    for (int64_t r = 0; r < rows; ++r)
+        for (int64_t c = 0; c < cols; ++c)
+            dst[c * rows + r] = src[r * cols + c];
+}
+
+template <typename T>
+static void col_to_row_major(const T* src, int64_t rows, int64_t cols, T* dst) {
+    for (int64_t r = 0; r < rows; ++r)
+        for (int64_t c = 0; c < cols; ++c)
+            dst[r * cols + c] = src[c * rows + r];
+}
+
+Tensor ormqr_composite(const Tensor& self, const Tensor& input2, const Tensor& input3,
+                       bool left, bool transpose) {
+    using namespace cpu;
+    require_lapack("ormqr");
+    if (self.dtype() != input2.dtype() || self.dtype() != input3.dtype()) {
+        TP_THROW(RuntimeError, "ormqr(): self, tau and other must share the same dtype");
+    }
+    const int64_t m = self.size(-2);
+    const int64_t k = self.size(-1);
+    if (input2.size(-1) != k) {
+        TP_THROW(RuntimeError, "ormqr(): tau must have shape (..., k) matching the ",
+                 k, " reflectors of self, but got ", input2.size(-1));
+    }
+    const int64_t q = left ? input3.size(-2) : input3.size(-1);
+    if (q != m) {
+        TP_THROW(RuntimeError, "ormqr(): reflector matrix and other disagree on the "
+                 "matched dimension: got ", m, " vs ", q);
+    }
+    if (k == 0 || q == 0) {
+        return input3.clone();
+    }
+    if (self.dtype() != DType::Float32 && self.dtype() != DType::Float64) {
+        TP_THROW(RuntimeError, "ormqr(): only float32 and float64 reflectors are "
+                 "supported on the CPU backend");
+    }
+    const Tensor self_c = self.contiguous();
+    const Tensor tau_c = input2.contiguous();
+    const Tensor other_c = input3.contiguous();
+    const int64_t self_plane = m * k;
+    const int64_t tau_plane = k;
+    const int64_t crows = input3.size(-2);
+    const int64_t ccols = input3.size(-1);
+    const int64_t other_plane = crows * ccols;
+    const int64_t batch = self.numel() / self_plane;
+    const DType dt = self.dtype();
+
+    Tensor q_full = Tensor::empty(std::vector<int64_t>{batch, q, q}, dt, self.device());
+    auto run_one_dtype = [&](auto tag) {
+        using T = std::remove_pointer_t<decltype(tag)>;
+        const T* sbase = self_c.data_ptr<T>();
+        const T* tbase = tau_c.data_ptr<T>();
+        T* qbase = q_full.data_ptr<T>();
+        for (int64_t i = 0; i < batch; ++i) {
+            const T* refl = sbase + i * self_plane;
+            const T* tau = tbase + i * tau_plane;
+            T* qrow = qbase + i * q * q;
+            {
+                // Expand the k reflector columns into a (q x q) column-major
+                // buffer (extra columns zero) and reduce with orgqr, then
+                // convert the resulting Q back to row-major.
+                std::vector<T> a(static_cast<size_t>(q * q), T(0));
+                row_to_col_major<T>(refl, q, k, a.data());
+                int64_t lwork = -1;
+                std::vector<T> work(1);
+                if constexpr (std::is_same_v<T, float>) {
+                    lapack_sorgqr(q, q, k, a.data(), q, tau, work.data(), lwork);
+                    lwork = std::max<int64_t>(1, static_cast<int64_t>(work[0]));
+                    work.resize(static_cast<size_t>(lwork));
+                    lapack_sorgqr(q, q, k, a.data(), q, tau, work.data(), lwork);
+                } else {
+                    lapack_dorgqr(q, q, k, a.data(), q, tau, work.data(), lwork);
+                    lwork = std::max<int64_t>(1, static_cast<int64_t>(work[0]));
+                    work.resize(static_cast<size_t>(lwork));
+                    lapack_dorgqr(q, q, k, a.data(), q, tau, work.data(), lwork);
+                }
+                col_to_row_major<T>(a.data(), q, q, qrow);
+            }
+        }
+    };
+    if (dt == DType::Float32) run_one_dtype(static_cast<float*>(nullptr));
+    else run_one_dtype(static_cast<double*>(nullptr));
+
+    const std::vector<int64_t> qshape{batch, q, q};
+    Tensor q_t = q_full.view(qshape);
+    Tensor qt = ops::transpose(q_t, -2, -1);
+    if (left) {
+        return transpose ? ops::matmul(qt, other_c) : ops::matmul(q_t, other_c);
+    }
+    return transpose ? ops::matmul(other_c, qt) : ops::matmul(other_c, q_t);
+}
+
+// ---- geqrf -----------------------------------------------------------------
+// Raw Householder factorization A = Q·R.  The reflector factors stay in the
+// lower triangle of the output and the elementary reflector scales in tau,
+// exactly the form consumed by orgqr/ormqr.  Batched, real dtypes only.
+std::tuple<Tensor, Tensor> geqrf_composite(const Tensor& self) {
+    using namespace cpu;
+    require_lapack("geqrf");
+    if (self.dtype() != DType::Float32 && self.dtype() != DType::Float64) {
+        TP_THROW(RuntimeError, "geqrf(): only float32 and float64 matrices are "
+                 "supported on the CPU backend");
+    }
+    const int64_t m = self.size(-2);
+    const int64_t n = self.size(-1);
+    const int64_t k = std::min(m, n);
+    const Tensor self_c = self.contiguous();
+    const int64_t plane = m * n;
+    const int64_t batch = plane == 0 ? 0 : self.numel() / plane;
+    // LAPACK works on column-major buffers: allocate with swapped dims and
+    // transpose so the physical layout matches, then copy logically.
+    std::vector<int64_t> phys(self_c.dim());
+    for (int64_t i = 0; i < self_c.dim(); ++i) phys[i] = self_c.size(i);
+    std::swap(phys[self_c.dim() - 2], phys[self_c.dim() - 1]);
+    Tensor a = Tensor::empty(phys, self.dtype(), self.device()).transpose(-2, -1);
+    a.copy_(self_c);
+    std::vector<int64_t> tau_shape(self_c.dim() - 1);
+    for (int64_t i = 0; i < self_c.dim() - 2; ++i) tau_shape[i] = self_c.size(i);
+    if (self_c.dim() >= 2) tau_shape.back() = k;
+    Tensor tau = Tensor::empty(tau_shape, self.dtype(), self.device());
+    auto run_one_dtype = [&](auto tag) {
+        using T = std::remove_pointer_t<decltype(tag)>;
+        T* abase = a.data_ptr<T>();
+        T* tbase = tau.data_ptr<T>();
+        int64_t lwork = -1;
+        std::vector<T> work(1);
+        if constexpr (std::is_same_v<T, float>) {
+            lapack_sgeqrf(m, n, abase, std::max<int64_t>(1, m), tbase, work.data(), lwork);
+            lwork = std::max<int64_t>(1, static_cast<int64_t>(work[0]));
+            work.resize(static_cast<size_t>(lwork));
+            for (int64_t i = 0; i < batch; ++i) {
+                lapack_sgeqrf(m, n, abase + i * plane, std::max<int64_t>(1, m),
+                              tbase + i * k, work.data(), lwork);
+            }
+        } else {
+            lapack_dgeqrf(m, n, abase, std::max<int64_t>(1, m), tbase, work.data(), lwork);
+            lwork = std::max<int64_t>(1, static_cast<int64_t>(work[0]));
+            work.resize(static_cast<size_t>(lwork));
+            for (int64_t i = 0; i < batch; ++i) {
+                lapack_dgeqrf(m, n, abase + i * plane, std::max<int64_t>(1, m),
+                              tbase + i * k, work.data(), lwork);
+            }
+        }
+    };
+    if (self.dtype() == DType::Float32) run_one_dtype(static_cast<float*>(nullptr));
+    else run_one_dtype(static_cast<double*>(nullptr));
+    return std::tuple<Tensor, Tensor>(std::move(a), std::move(tau));
+}
+
+// ---- legacy linalg names ----------------------------------------------------
+// inverse/pinverse/lu_solve/orgqr predate the linalg_* spellings and resolve to
+// those kernels; routing here keeps the two names on one implementation.
+Tensor inverse_composite(const Tensor& self) {
+    return std::get<0>(ops::linalg_inv_ex(self, false));
+}
+
+Tensor pinverse_composite(const Tensor& self, double rcond) {
+    // Moore-Penrose pseudo-inverse from the reduced SVD: singular values below
+    // rcond * largest are treated as zero, then Vᴴᴴ · (s⁻¹ ⊙ Uᴴ) with the
+    // diagonal folded into a broadcast scale so batches never need diag().
+    const auto [U, S, Vh] = ops::linalg_svd(self, false, std::nullopt);
+    const double cutoff = S.numel() == 0
+        ? 0.0 : rcond * ops::max(S).item().toDouble();
+    const Tensor S_inv = ops::where(ops::gt(S, Scalar(cutoff)),
+                                    ops::reciprocal(S), Scalar(0.0));
+    return ops::matmul(ops::transpose(Vh, -2, -1),
+                       ops::matmul(S_inv.unsqueeze(-1), ops::transpose(U, -2, -1)));
+}
+
+Tensor lu_solve_composite(const Tensor& self, const Tensor& LU_data,
+                          const Tensor& LU_pivots) {
+    return ops::linalg_lu_solve(LU_data, LU_pivots, self, true, false);
+}
+
+Tensor orgqr_composite(const Tensor& self, const Tensor& input2) {
+    return ops::linalg_householder_product(self, input2);
+}
+
+Tensor linalg_vecdot_composite(const Tensor& x, const Tensor& y, int64_t dim) {
+    // vecdot(x, y, dim) = sum(conj(x) * y, dim); the sum drops the reduced axis.
+    return ops::sum(ops::mul(ops::conj_physical(x), y), std::vector<int64_t>{dim}, false);
+}
+
+Tensor linalg_vdot_composite(const Tensor& self, const Tensor& other) {
+    // vdot conjugates the first argument and contracts the flattened
+    // operands, matching vecdot over the flattened views.
+    const Tensor a = ops::reshape(self, {self.numel()});
+    const Tensor b = ops::reshape(other, {other.numel()});
+    return ops::sum(ops::mul(ops::conj_physical(a), b), std::vector<int64_t>{0}, false);
 }
 
 // ---- matmul dtype overloads --------------------------------------------------
@@ -634,11 +853,11 @@ Tensor _to_sparse_sparse_dim_native(const Tensor& self, int64_t sparse_dim) {
 }
 
 Tensor sparse_coo_tensor_indices_native(const Tensor& indices, const Tensor& values,
-                                        const std::optional<DType>& dtype,
-                                        const std::optional<int64_t>& layout,
-                                        const std::optional<Device>& device,
-                                        const std::optional<bool>& pin_memory,
-                                        const std::optional<bool>& is_coalesced) {
+                                        std::optional<DType> dtype,
+                                        std::optional<int64_t> layout,
+                                        std::optional<Device> device,
+                                        std::optional<bool> pin_memory,
+                                        std::optional<bool> is_coalesced) {
     (void)layout; (void)pin_memory;
     Tensor v = values;
     if (dtype.has_value() && v.dtype() != *dtype) v = v.to(*dtype);
@@ -649,11 +868,11 @@ Tensor sparse_coo_tensor_indices_native(const Tensor& indices, const Tensor& val
 
 Tensor sparse_coo_tensor_indices_size_native(const Tensor& indices, const Tensor& values,
                                              const std::vector<int64_t>& size,
-                                             const std::optional<DType>& dtype,
-                                             const std::optional<int64_t>& layout,
-                                             const std::optional<Device>& device,
-                                             const std::optional<bool>& pin_memory,
-                                             const std::optional<bool>& is_coalesced) {
+                                             std::optional<DType> dtype,
+                                             std::optional<int64_t> layout,
+                                             std::optional<Device> device,
+                                             std::optional<bool> pin_memory,
+                                             std::optional<bool> is_coalesced) {
     (void)layout; (void)pin_memory;
     Tensor v = values;
     if (dtype.has_value() && v.dtype() != *dtype) v = v.to(*dtype);
@@ -662,16 +881,16 @@ Tensor sparse_coo_tensor_indices_size_native(const Tensor& indices, const Tensor
 }
 
 Tensor sparse_coo_tensor_size_native(const std::vector<int64_t>& size,
-                                     const std::optional<DType>& dtype,
-                                     const std::optional<int64_t>& layout,
-                                     const std::optional<Device>& device,
-                                     const std::optional<bool>& pin_memory) {
+                                     std::optional<DType> dtype,
+                                     std::optional<int64_t> layout,
+                                     std::optional<Device> device,
+                                     std::optional<bool> pin_memory) {
     (void)layout;
     return ops::empty(size, dtype, device, pin_memory.value_or(false));
 }
 
 Tensor& multinomial_out_native(const Tensor& self, int64_t num_samples, bool replacement,
-                               const std::optional<Generator>& generator, Tensor& out) {
+                               std::optional<Generator> generator, Tensor& out) {
     (void)generator;
     out = ops::multinomial(self, num_samples, replacement);
     return out;
@@ -694,62 +913,62 @@ void split_with_sizes_copy_out_native(const Tensor& self,
 
 // ---- generator-qualified factory overloads ---------------------------------
 Tensor rand_generator_native(const std::vector<int64_t>& size,
-                             const std::optional<Generator>& generator,
-                             const std::optional<DType>& dtype,
-                             const std::optional<int64_t>& layout,
-                             const std::optional<Device>& device,
-                             const std::optional<bool>& pin_memory) {
+                             std::optional<Generator> generator,
+                             std::optional<DType> dtype,
+                             std::optional<int64_t> layout,
+                             std::optional<Device> device,
+                             std::optional<bool> pin_memory) {
     (void)generator; (void)layout; (void)pin_memory;
     return ops::rand(size, dtype, device);
 }
 
 Tensor rand_like_generator_native(const Tensor& self,
-                                  const std::optional<Generator>& generator,
-                                  const std::optional<DType>& dtype,
-                                  const std::optional<int64_t>& layout,
-                                  const std::optional<Device>& device,
-                                  const std::optional<bool>& pin_memory,
-                                  const std::optional<int64_t>& memory_format) {
+                                  std::optional<Generator> generator,
+                                  std::optional<DType> dtype,
+                                  std::optional<int64_t> layout,
+                                  std::optional<Device> device,
+                                  std::optional<bool> pin_memory,
+                                  std::optional<int64_t> memory_format) {
     (void)generator; (void)layout; (void)pin_memory; (void)memory_format;
     return ops::rand_like(self, dtype.value_or(DType::Undefined), device);
 }
 
 Tensor randint_low_native(int64_t low, int64_t high, const std::vector<int64_t>& size,
-                          const std::optional<DType>& dtype,
-                          const std::optional<int64_t>& layout,
-                          const std::optional<Device>& device,
-                          const std::optional<bool>& pin_memory) {
+                          std::optional<DType> dtype,
+                          std::optional<int64_t> layout,
+                          std::optional<Device> device,
+                          std::optional<bool> pin_memory) {
     (void)layout; (void)pin_memory;
     return ops::randint(low, high, size, dtype.value_or(DType::Int64), device);
 }
 
 Tensor randint_generator_native(int64_t high, const std::vector<int64_t>& size,
-                                const std::optional<Generator>& generator,
-                                const std::optional<DType>& dtype,
-                                const std::optional<int64_t>& layout,
-                                const std::optional<Device>& device,
-                                const std::optional<bool>& pin_memory) {
+                                std::optional<Generator> generator,
+                                std::optional<DType> dtype,
+                                std::optional<int64_t> layout,
+                                std::optional<Device> device,
+                                std::optional<bool> pin_memory) {
     (void)generator; (void)layout; (void)pin_memory;
     return ops::randint(0, high, size, dtype.value_or(DType::Int64), device);
 }
 
 Tensor randint_low_generator_native(int64_t low, int64_t high,
                                     const std::vector<int64_t>& size,
-                                    const std::optional<Generator>& generator,
-                                    const std::optional<DType>& dtype,
-                                    const std::optional<int64_t>& layout,
-                                    const std::optional<Device>& device,
-                                    const std::optional<bool>& pin_memory) {
+                                    std::optional<Generator> generator,
+                                    std::optional<DType> dtype,
+                                    std::optional<int64_t> layout,
+                                    std::optional<Device> device,
+                                    std::optional<bool> pin_memory) {
     (void)generator; (void)layout; (void)pin_memory;
     return ops::randint(low, high, size, dtype.value_or(DType::Int64), device);
 }
 
 Tensor randint_like_low_dtype_native(const Tensor& self, int64_t low, int64_t high,
-                                     const std::optional<DType>& dtype,
-                                     const std::optional<int64_t>& layout,
-                                     const std::optional<Device>& device,
-                                     const std::optional<bool>& pin_memory,
-                                     const std::optional<int64_t>& memory_format) {
+                                     std::optional<DType> dtype,
+                                     std::optional<int64_t> layout,
+                                     std::optional<Device> device,
+                                     std::optional<bool> pin_memory,
+                                     std::optional<int64_t> memory_format) {
     (void)layout; (void)pin_memory; (void)memory_format;
     Tensor t = ops::randint(low, high, self.shape(),
                             dtype.value_or(DType::Undefined), self.device());
@@ -757,80 +976,117 @@ Tensor randint_like_low_dtype_native(const Tensor& self, int64_t low, int64_t hi
 }
 
 Tensor randint_like_tensor_native(const Tensor& self, const Tensor& high,
-                                  const std::optional<DType>& dtype,
-                                  const std::optional<int64_t>& layout,
-                                  const std::optional<Device>& device,
-                                  const std::optional<bool>& pin_memory,
-                                  const std::optional<int64_t>& memory_format) {
+                                  std::optional<DType> dtype,
+                                  std::optional<int64_t> layout,
+                                  std::optional<Device> device,
+                                  std::optional<bool> pin_memory,
+                                  std::optional<int64_t> memory_format) {
     (void)layout; (void)pin_memory; (void)memory_format;
     return ops::randint_like(self, 0, high.item().to<int64_t>(),
                              dtype.value_or(DType::Undefined), device);
 }
 
 Tensor randint_like_generator_native(const Tensor& self, int64_t high,
-                                     const std::optional<Generator>& generator,
-                                     const std::optional<DType>& dtype,
-                                     const std::optional<int64_t>& layout,
-                                     const std::optional<Device>& device,
-                                     const std::optional<bool>& pin_memory,
-                                     const std::optional<int64_t>& memory_format) {
+                                     std::optional<Generator> generator,
+                                     std::optional<DType> dtype,
+                                     std::optional<int64_t> layout,
+                                     std::optional<Device> device,
+                                     std::optional<bool> pin_memory,
+                                     std::optional<int64_t> memory_format) {
     (void)generator; (void)layout; (void)pin_memory; (void)memory_format;
     return ops::randint_like(self, 0, high, dtype.value_or(DType::Undefined), device);
 }
 
 Tensor randint_like_tensor_generator_native(const Tensor& self, const Tensor& high,
-                                            const std::optional<Generator>& generator,
-                                            const std::optional<DType>& dtype,
-                                            const std::optional<int64_t>& layout,
-                                            const std::optional<Device>& device,
-                                            const std::optional<bool>& pin_memory,
-                                            const std::optional<int64_t>& memory_format) {
+                                            std::optional<Generator> generator,
+                                            std::optional<DType> dtype,
+                                            std::optional<int64_t> layout,
+                                            std::optional<Device> device,
+                                            std::optional<bool> pin_memory,
+                                            std::optional<int64_t> memory_format) {
     (void)generator; (void)layout; (void)pin_memory; (void)memory_format;
     return ops::randint_like(self, 0, high.item().to<int64_t>(),
                              dtype.value_or(DType::Undefined), device);
 }
 
 Tensor randint_like_low_generator_dtype_native(const Tensor& self, int64_t low, int64_t high,
-                                               const std::optional<Generator>& generator,
-                                               const std::optional<DType>& dtype,
-                                               const std::optional<int64_t>& layout,
-                                               const std::optional<Device>& device,
-                                               const std::optional<bool>& pin_memory,
-                                               const std::optional<int64_t>& memory_format) {
+                                               std::optional<Generator> generator,
+                                               std::optional<DType> dtype,
+                                               std::optional<int64_t> layout,
+                                               std::optional<Device> device,
+                                               std::optional<bool> pin_memory,
+                                               std::optional<int64_t> memory_format) {
     (void)generator; (void)layout; (void)pin_memory; (void)memory_format;
     return ops::randint_like(self, low, high, dtype.value_or(DType::Undefined), device);
 }
 
 Tensor randn_like_generator_native(const Tensor& self,
-                                   const std::optional<Generator>& generator,
-                                   const std::optional<DType>& dtype,
-                                   const std::optional<int64_t>& layout,
-                                   const std::optional<Device>& device,
-                                   const std::optional<bool>& pin_memory,
-                                   const std::optional<int64_t>& memory_format) {
+                                   std::optional<Generator> generator,
+                                   std::optional<DType> dtype,
+                                   std::optional<int64_t> layout,
+                                   std::optional<Device> device,
+                                   std::optional<bool> pin_memory,
+                                   std::optional<int64_t> memory_format) {
     (void)generator; (void)layout; (void)pin_memory; (void)memory_format;
     return ops::randn_like(self, dtype.value_or(DType::Undefined), device);
 }
 
-Tensor randperm_generator_native(int64_t n, const std::optional<Generator>& generator,
-                                 const std::optional<DType>& dtype,
-                                 const std::optional<int64_t>& layout,
-                                 const std::optional<Device>& device,
-                                 const std::optional<bool>& pin_memory) {
-    (void)generator; (void)layout; (void)pin_memory;
-    return ops::randperm(n, dtype.value_or(DType::Int64), device);
+Tensor randperm_generator_native(int64_t n, std::optional<Generator> generator,
+                                 std::optional<DType> dtype,
+                                 std::optional<int64_t> layout,
+                                 std::optional<Device> device,
+                                 std::optional<bool> pin_memory) {
+    (void)layout; (void)pin_memory;
+    DType dt = dtype.value_or(DType::Int64);
+    if (dt != DType::Int64 && dt != DType::Int32) {
+        TP_THROW(NotImplementedError, "randperm() only supports Int64/Int32");
+    }
+    Device dev = device.has_value() ? *device : Device(DeviceType::CPU);
+    if (!generator.has_value()) {
+        return ops::randperm(n, dt, dev);
+    }
+    // The permutation values depend only on the generator stream, so the
+    // Fisher-Yates pass runs on CPU against the explicit generator and the
+    // result is then placed on the requested device; the draw order matches
+    // the default-generator randperm kernel element for element.
+    Tensor t({n}, dt, Device(DeviceType::CPU));
+    if (n > 0) {
+        if (dt == DType::Int64) {
+            int64_t* data = t.data_ptr<int64_t>();
+            for (int64_t i = 0; i < n; ++i) data[i] = i;
+            for (int64_t i = 0; i < n - 1; ++i) {
+                int64_t z = static_cast<int64_t>(
+                    generator->random() % static_cast<uint32_t>(n - i));
+                int64_t sav = data[i];
+                data[i] = data[z + i];
+                data[z + i] = sav;
+            }
+        } else {
+            int32_t* data = t.data_ptr<int32_t>();
+            for (int64_t i = 0; i < n; ++i) data[i] = static_cast<int32_t>(i);
+            for (int64_t i = 0; i < n - 1; ++i) {
+                int64_t z = static_cast<int64_t>(
+                    generator->random() % static_cast<uint32_t>(n - i));
+                int32_t sav = data[i];
+                data[i] = data[z + i];
+                data[z + i] = sav;
+            }
+        }
+    }
+    if (dev.type() == DeviceType::CPU) return t;
+    return t.to(dev);
 }
 
-Tensor random_to_native(Tensor& self, int64_t to, const std::optional<Generator>& generator) {
+Tensor& random_to_native(Tensor& self, int64_t to, std::optional<Generator> generator) {
     (void)generator;
     return ops::random_(self, 0, to);
 }
 
 Tensor range_step_native(const Scalar& start, const Scalar& end, const Scalar& step,
-                         const std::optional<DType>& dtype,
-                         const std::optional<int64_t>& layout,
-                         const std::optional<Device>& device,
-                         const std::optional<bool>& pin_memory) {
+                         std::optional<DType> dtype,
+                         std::optional<int64_t> layout,
+                         std::optional<Device> device,
+                         std::optional<bool> pin_memory) {
     (void)layout; (void)pin_memory;
     return ops::range(start, end, step, dtype, device);
 }
@@ -978,7 +1234,7 @@ Tensor upsample_nearest3d_vec_native(const Tensor& input,
 
 // ---- misc forwards ------------------------------------------------------------
 Tensor& logit_backward_gi_native(const Tensor& grad_output, const Tensor& self,
-                                 const std::optional<double>& eps, Tensor& grad_input) {
+                                 std::optional<double> eps, Tensor& grad_input) {
     grad_input = ops::logit_backward(grad_output, self,
                                      eps.has_value() ? std::optional<Scalar>(Scalar(*eps))
                                                      : std::nullopt);
@@ -987,9 +1243,20 @@ Tensor& logit_backward_gi_native(const Tensor& grad_output, const Tensor& self,
 
 Tensor quantize_per_tensor_tq_native(const Tensor& self, const Tensor& scale,
                                      const Tensor& zero_point, DType dtype) {
-    (void)dtype;
-    return ops::quantize_per_tensor(self, scale.item().toDouble(),
-                                    zero_point.item().to<int64_t>());
+    const double sc = scale.item().toDouble();
+    const int64_t zp = zero_point.item().to<int64_t>();
+    switch (dtype) {
+        case DType::QUInt8:
+            return ops::quantize_per_tensor_quint8(self, sc, zp);
+        case DType::QInt32:
+            return ops::quantize_per_tensor_qint32(self, sc, zp);
+        case DType::QInt8:
+            return ops::quantize_per_tensor(self, sc, zp);
+        default:
+            TP_THROW(TypeError,
+                     std::string("quantize_per_tensor(): unsupported quantized dtype ") +
+                         toString(dtype));
+    }
 }
 
 std::vector<Tensor> quantize_per_tensor_tensors_native(const std::vector<Tensor>& tensors,
@@ -1005,14 +1272,23 @@ std::vector<Tensor> quantize_per_tensor_tensors_native(const std::vector<Tensor>
     return out;
 }
 
+std::vector<Tensor> dequantize_tensors_native(const std::vector<Tensor>& tensors) {
+    std::vector<Tensor> out;
+    out.reserve(tensors.size());
+    for (const Tensor& t : tensors) {
+        out.push_back(t.dequantize());
+    }
+    return out;
+}
+
 Tensor stft_center_native(const Tensor& self, int64_t n_fft,
-                           const std::optional<int64_t>& hop_length,
-                           const std::optional<int64_t>& win_length,
+                           std::optional<int64_t> hop_length,
+                           std::optional<int64_t> win_length,
                            const std::optional<Tensor>& window, bool center,
                            const std::string& pad_mode, bool normalized,
-                           const std::optional<bool>& onesided,
-                           const std::optional<bool>& return_complex,
-                           const std::optional<bool>& align_to_window) {
+                           std::optional<bool> onesided,
+                           std::optional<bool> return_complex,
+                           std::optional<bool> align_to_window) {
     (void)align_to_window;
     return ops::stft(self, n_fft, hop_length, win_length, window, center, pad_mode, normalized,
                      onesided.value_or(true), return_complex.value_or(true));
@@ -1066,6 +1342,14 @@ TENSORPLAY_LIBRARY_IMPL(Composite, VariantHandOps) {
     m.impl("gradient.scalarrayarray", gradient_scalarrayarray_native);
     m.impl("gradient.tensorarrayint", gradient_tensorarrayint_native);
     m.impl("quantile.scalar", quantile_scalar_native);
+    m.impl("ormqr", ormqr_composite);
+    m.impl("geqrf", geqrf_composite);
+    m.impl("inverse", inverse_composite);
+    m.impl("pinverse", pinverse_composite);
+    m.impl("lu_solve", lu_solve_composite);
+    m.impl("orgqr", orgqr_composite);
+    m.impl("linalg_vecdot", linalg_vecdot_composite);
+    m.impl("linalg_vdot", linalg_vdot_composite);
 
     m.impl("mm.dtype", mm_dtype_native);
     m.impl("mm.dtype_out", mm_dtype_out_native);
@@ -1147,6 +1431,7 @@ TENSORPLAY_LIBRARY_IMPL(Composite, VariantHandOps) {
     m.impl("logit_backward.grad_input", logit_backward_gi_native);
     m.impl("quantize_per_tensor.tensor_qparams", quantize_per_tensor_tq_native);
     m.impl("quantize_per_tensor.tensors", quantize_per_tensor_tensors_native);
+    m.impl("dequantize.tensors", dequantize_tensors_native);
     // dropped duplicate: stft.center // m.impl("stft.center", stft_center_native);
 }
 

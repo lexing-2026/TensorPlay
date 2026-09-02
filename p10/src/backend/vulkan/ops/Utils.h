@@ -37,6 +37,12 @@ void copy_vtensor_to_buffer(
 void pack_staging_to_vtensor(api::VulkanBuffer&, api::vTensor&);
 bool pack_vtensor_to_staging(api::vTensor&, api::VulkanBuffer&, VkFence);
 
+// Raw byte transfer into the payload: staging -> texture (vkCopyBufferToImage)
+// or staging -> buffer (vkCopyBuffer).  Valid for every supported VkFormat.
+void copy_staging_to_vtensor(api::StorageBuffer&, api::vTensor&);
+
+void upload_host_bytes(api::vTensor&, const void*, size_t);
+
 } // namespace utils
 } // namespace ops
 } // namespace vulkan

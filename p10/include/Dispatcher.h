@@ -10,6 +10,7 @@
 #include <type_traits>
 #include <utility>
 #include <unordered_map>
+#include <vector>
 #include "DispatchKey.h"
 #include "Device.h"
 #include "Exception.h"
@@ -68,10 +69,9 @@ public:
             return nullptr;
         }
         auto kernel = table_->kernels[dispatchKeyIndex(key)].load(std::memory_order_acquire);
-        // Composite fallthrough (c10: getRuntimeDispatchKeySet(
-        // CompositeExplicitAutograd) == backend_dispatch_keyset): a backend
-        // with no kernel of its own is served by the backend-neutral composite
-        // registration; an explicit backend kernel overrides it.
+        // Composite fallthrough: a backend with no kernel of its own is served
+        // by the backend-neutral composite registration; an explicit backend
+        // kernel overrides it.
         if (!kernel && is_backend_key(key)) {
             constexpr auto kCompositeIdx = dispatchKeyIndex(DispatchKey::Composite);
             static_assert(kCompositeIdx < kDispatchKeyCount, "composite key out of range");
@@ -111,13 +111,27 @@ public:
         return findHandle(std::string(op_name));
     }
 
+    // Introspection for debugging tools: all registered operator names.
+    std::vector<std::string> operator_names() const;
+
+    // KernelFunction for a key WITHOUT the composite fallback (null when the
+    // key has no direct registration).  Purely for dump/introspection use.
+    KernelFunction direct_kernel(const std::string& op_name, DispatchKey key) const;
+
+    // Nonzero when a kernel is registered under `key` for `op_name`; a null
+    // kernel pointer is a valid registration (catch-all), so presence is
+    // tracked by the slot being non-null-for-registration.  Because slots
+    // store the function pointer itself, a registered catch-all cannot be
+    // distinguished from an empty slot; registrars must therefore always
+    // store a real function pointer.  Returns false for unknown ops.
+    bool has_kernel(const std::string& op_name, DispatchKey key) const;
+
 private:
     Dispatcher() = default;
 
     std::unordered_map<std::string, std::unique_ptr<DispatchTable>> operators_;
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
 };
-
 // Helper for type-safe dispatch
 template<typename Return, typename... Args>
 class DispatchStub {

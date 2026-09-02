@@ -213,6 +213,26 @@ void apply_ldl_solve(const Tensor& ld, const Tensor& pivots,
     scalar_t* result_data = result.data_ptr<scalar_t>();
     cusolverDnHandle_t handle = CUDAContext::getCusolverDnHandle();
 
+#if defined(USE_ROCM)
+    // The batched-solve entry the solve path relies on is not part of the
+    // AMD solver library (only the factorization routine exists there), so
+    // report the limitation instead of failing to link.
+    (void)handle;
+    (void)matrix_data;
+    (void)pivot_data;
+    (void)result_data;
+    (void)matrices;
+    (void)n;
+    (void)nrhs;
+    (void)lda;
+    (void)ldb;
+    (void)matrix_stride;
+    (void)result_stride;
+    (void)pivot_stride;
+    TP_THROW(NotImplementedError,
+             "ldl_solve on this GPU backend: the solver library provides no "
+             "symmetric solve routine; use the CPU path instead");
+#else
     size_t device_workspace_bytes = 0;
     size_t host_workspace_bytes = 0;
     CUSOLVER_CHECK(cusolverDnXsytrs_bufferSize(
@@ -244,6 +264,7 @@ void apply_ldl_solve(const Tensor& ld, const Tensor& pivots,
             host_workspace.data(), host_workspace_bytes,
             info.data_ptr<int32_t>()));
     }
+#endif
 }
 
 template <typename scalar_t>
