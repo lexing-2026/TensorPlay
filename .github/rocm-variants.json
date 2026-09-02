@@ -1,0 +1,8 @@
+[
+  {
+    "variant": "rocm72",
+    "toolkit": "7.2.4",
+    "arch": "gfx1100",
+    "image": "rocm/dev-ubuntu-22.04:7.2.4-complete"
+  }
+]
