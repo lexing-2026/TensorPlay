@@ -3,7 +3,7 @@
 from contextlib import contextmanager
 from typing import Any, Iterable
 
-from tensorplay.autograd import Function
+from tensorplay.autograd import Function, Variable
 
 from .._common_utils import TrainingState
 from ...device_mesh import DeviceMesh
@@ -45,6 +45,7 @@ class FSDPState:
         self._is_root: bool | None = None
         self._mp_policy = None
         self._forward_hooks_registered = False
+        self._post_backward_final_callback_queued = False
 
     def _get_state_for_module(self, module: Any) -> "FSDPState":
         return getattr(module, "_fsdp_state", self)
@@ -188,13 +189,19 @@ class FSDPState:
 
     def _pre_backward(self, grad: Any) -> Any:
         self._training_state = TrainingState.PRE_BACKWARD
+        self._register_root_post_backward_final_callback()
         if self._param_group is not None:
             self._param_group.pre_backward(None)
         return grad
 
     def _root_post_backward_final_callback(self) -> None:
+        group = self._fsdp_param_group()
+        if group._training_state != TrainingState.POST_BACKWARD:
+            group.post_backward()
+        group._training_state = TrainingState.IDLE
         self._training_state = TrainingState.IDLE
-        self._fsdp_param_group().finalize_backward()
+        group.finalize_backward()
+        self._post_backward_final_callback_queued = False
 
     def _register_pre_backward_hook(self, output: Any) -> Any:
         if isinstance(output, tuple):
@@ -212,14 +219,19 @@ class FSDPState:
         return output
 
     def _post_backward_output(self, grad: Any) -> Any:
-        self._root_post_backward_final_callback()
         return grad
 
     def _register_root_post_backward_final_callback(self) -> None:
-        self._fsdp_param_group().finalize_backward()
+        if self._post_backward_final_callback_queued:
+            return
+        self._post_backward_final_callback_queued = True
+        Variable._execution_engine.queue_callback(
+            self._root_post_backward_final_callback
+        )
 
     def _reset_iter_state(self) -> None:
         self._training_state = TrainingState.IDLE
+        self._post_backward_final_callback_queued = False
         if self._param_group is not None:
             self._param_group._reset_iter_state()
 
