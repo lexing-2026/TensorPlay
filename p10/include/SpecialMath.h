@@ -1225,28 +1225,28 @@ TP_HOST_DEVICE_NOINLINE scalar_t calc_igamma(scalar_t a, scalar_t x) {
 }
 
 template <>
-[[maybe_unused]] inline tensorplay::BFloat16 calc_igamma<tensorplay::BFloat16>(
+[[maybe_unused]] inline TP_HOST_DEVICE_NOINLINE tensorplay::BFloat16 calc_igamma<tensorplay::BFloat16>(
     tensorplay::BFloat16 a,
     tensorplay::BFloat16 x) {
   return calc_igamma<float>(float(a), float(x));
 }
 
 template <>
-[[maybe_unused]] inline tensorplay::Half calc_igamma<tensorplay::Half>(
+[[maybe_unused]] inline TP_HOST_DEVICE_NOINLINE tensorplay::Half calc_igamma<tensorplay::Half>(
     tensorplay::Half a,
     tensorplay::Half x) {
   return calc_igamma<float>(float(a), float(x));
 }
 
 template <>
-[[maybe_unused]] inline tensorplay::BFloat16 calc_igammac<tensorplay::BFloat16>(
+[[maybe_unused]] inline TP_HOST_DEVICE_NOINLINE tensorplay::BFloat16 calc_igammac<tensorplay::BFloat16>(
     tensorplay::BFloat16 a,
     tensorplay::BFloat16 x) {
   return calc_igammac<float>(float(a), float(x));
 }
 
 template <>
-[[maybe_unused]] inline tensorplay::Half calc_igammac<tensorplay::Half>(
+[[maybe_unused]] inline TP_HOST_DEVICE_NOINLINE tensorplay::Half calc_igammac<tensorplay::Half>(
     tensorplay::Half a,
     tensorplay::Half x) {
   return calc_igammac<float>(float(a), float(x));
@@ -1308,7 +1308,7 @@ TP_HOST_DEVICE T exp2_impl(T x) {
  * required is x -> 2(2ab/x - b - a)/(b-a).  If b is infinity, this becomes x -> 4a/x - 1.
  */
 template <typename T>
-inline typename std::enable_if_t<std::is_floating_point_v<T>, T>
+TP_HOST_DEVICE inline typename std::enable_if_t<std::is_floating_point_v<T>, T>
 chbevl(const T x, const T array[], size_t len) {
   T b0, b1, b2 = static_cast<T>(0.0);
 

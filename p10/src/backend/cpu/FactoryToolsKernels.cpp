@@ -21,6 +21,7 @@
 #include "Utils.h"
 #include "DType.h"
 #include "MemoryFormat.h"
+#include "Quantizer.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 
 #include <algorithm>
@@ -719,10 +720,9 @@ Tensor empty_memory_format_kernel(const std::vector<int64_t>& size,
 // ---------------------------------------------------------------------------
 // quantized-storage factories
 // ---------------------------------------------------------------------------
-// TensorPlay models quantized values functionally over plain integer storage
-// (see the quantize_* kernels), so these factories accept the quantization
-// parameters, validate them, and hand back uninitialized storage of the
-// requested dtype; the parameters are not attached as tensor metadata.
+// Quantized factories return tensors of a quantized dtype carrying an
+// attached quantizer: the affine parameters live on the tensor and are read
+// back through q_scale()/q_per_channel_scales()/dequantize().
 
 Tensor empty_affine_quantized_kernel(const std::vector<int64_t>& size,
                                      std::optional<DType> dtype,
@@ -731,13 +731,20 @@ Tensor empty_affine_quantized_kernel(const std::vector<int64_t>& size,
                                      std::optional<bool> pin_memory,
                                      double scale, int64_t zero_point,
                                      std::optional<int64_t> memory_format) {
-    (void)zero_point;
     require_strided_layout("_empty_affine_quantized", layout);
     const DType dt = require_explicit_dtype(dtype);
+    if (!isQuantizedType(dt)) {
+        TP_THROW(TypeError,
+                 "_empty_affine_quantized(): dtype must be a quantized "
+                 "dtype, got ", toString(dt));
+    }
     if (!(scale > 0.0)) {
         TP_THROW(ValueError, "affine quantized empty tensor requires a positive scale, got ", scale);
     }
-    return empty_raw(size, dt, device, pin_memory.value_or(false), memory_format);
+    Tensor out = empty_raw(size, dt, device, pin_memory.value_or(false), memory_format);
+    out.impl()->set_quantizer(
+        std::make_shared<PerTensorAffineQuantizer>(scale, zero_point));
+    return out;
 }
 
 Tensor empty_per_channel_affine_quantized_kernel(
@@ -747,6 +754,11 @@ Tensor empty_per_channel_affine_quantized_kernel(
     std::optional<int64_t> memory_format) {
     require_strided_layout("_empty_per_channel_affine_quantized", layout);
     const DType dt = require_explicit_dtype(dtype);
+    if (!isQuantizedType(dt)) {
+        TP_THROW(TypeError,
+                 "_empty_per_channel_affine_quantized(): dtype must be a "
+                 "quantized dtype, got ", toString(dt));
+    }
     if (scales.dim() != 1) {
         TP_THROW(ValueError, "per-channel quantized empty tensor requires 1-D scales, got ",
                  scales.dim(), " dimension(s)");
@@ -762,7 +774,12 @@ Tensor empty_per_channel_affine_quantized_kernel(
         (axis < 0 || axis >= static_cast<int64_t>(size.size()))) {
         TP_THROW(ValueError, "axis must be between 0 and number of dimensions, got ", axis);
     }
-    return empty_raw(size, dt, device, pin_memory.value_or(false), memory_format);
+    Tensor out = empty_raw(size, dt, device, pin_memory.value_or(false), memory_format);
+    out.impl()->set_quantizer(
+        std::make_shared<PerChannelAffineQuantizer>(
+            scales.to(DType::Float64).contiguous(),
+            zero_points.to(DType::Int64).contiguous(), axis));
+    return out;
 }
 
 Tensor empty_quantized_kernel(const std::vector<int64_t>& size, const Tensor& qtensor,
@@ -773,7 +790,13 @@ Tensor empty_quantized_kernel(const std::vector<int64_t>& size, const Tensor& qt
                               std::optional<int64_t> memory_format) {
     require_strided_layout("empty_quantized", layout);
     const DType dt = resolve_dtype_or_default(dtype, qtensor.dtype());
-    return empty_raw(size, dt, device, pin_memory.value_or(false), memory_format);
+    Tensor out = empty_raw(size, dt, device, pin_memory.value_or(false), memory_format);
+    // Inherit the quantizer so the result stays usable in quantized ops
+    // with the source tensor's affine parameters.
+    if (qtensor.impl() && qtensor.impl()->has_quantizer()) {
+        out.impl()->set_quantizer(qtensor.impl()->quantizer());
+    }
+    return out;
 }
 
 // ---------------------------------------------------------------------------

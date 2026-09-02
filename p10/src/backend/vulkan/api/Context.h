@@ -6,6 +6,7 @@
 #include "Command.h"
 #include "Descriptor.h"
 #include "Pipeline.h"
+#include "QueryPool.h"
 #include "Resource.h"
 #include "Runtime.h"
 #include "Shader.h"
@@ -24,6 +25,7 @@ struct ContextConfig final {
   uint32_t cmdSubmitFrequency;
   CommandPoolConfig cmdPoolConfig;
   DescriptorPoolConfig descriptorPoolConfig;
+  QueryPoolConfig queryPoolConfig;
 };
 
 //
@@ -58,6 +60,7 @@ class Context final {
   CommandPool command_pool_;
   DescriptorPool descriptor_pool_;
   FencePool fences_;
+  QueryPool querypool_;
   // Command buffers submission
   std::mutex cmd_mutex_;
   CommandBuffer cmd_;
@@ -110,6 +113,18 @@ class Context final {
   inline FencePool& fences() {
     return fences_;
   }
+
+  // GPU timestamp queries: results are host-readable once the submission
+  // they were recorded in completes.
+  inline QueryPool& querypool() {
+    return querypool_;
+  }
+
+  // Records a GPU timestamp into the pending command buffer and returns the
+  // (query pool, index) slot to read back.  Slots stay owned by the caller
+  // until querypool().reset() is invoked explicitly; reads require a
+  // completed submission (flush()).
+  std::pair<VkQueryPool, uint32_t> write_timestamp();
 
   // Memory Management
   void register_buffer_cleanup(VulkanBuffer& buffer) {

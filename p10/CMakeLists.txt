@@ -1,7 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-
 project(p10 LANGUAGES CXX)
-
 set(P10_SOURCES
     src/Allocator.cpp
     src/Context.cpp
@@ -43,6 +41,8 @@ set(P10_SOURCES
     src/backend/cpu/SparseKernels.cpp
     src/backend/cpu/SemiStructuredKernels.cpp
     src/backend/cpu/QuantKernels.cpp
+    src/backend/cpu/QuantConvPacking.cpp
+    src/quantized/QTensorImpl.cpp
     src/backend/cpu/ForwardKernels.cpp
     src/backend/cpu/FactoryKernels.cpp
     src/backend/cpu/LinearAlgebraKernels.cpp
@@ -66,6 +66,7 @@ set(P10_SOURCES
     src/backend/cpu/Itertools.cpp
     src/backend/cpu/PadKernels.cpp
     src/backend/cpu/NormalizationKernels.cpp
+    src/backend/cpu/BatchNormKernels.cpp
     src/backend/cpu/RandomKernels.cpp
     src/backend/cpu/ReductionKernels.cpp
     src/backend/cpu/LossKernels.cpp
@@ -79,7 +80,13 @@ set(P10_SOURCES
     src/backend/cpu/TransformersKernels.cpp
     src/backend/cpu/IndexingKernels.cpp
     src/backend/cpu/TierOpsKernels.cpp
-    src/backend/cpu/Tier5OpsKernels.cpp
+    src/backend/cpu/BitwiseKernels.cpp
+    src/backend/cpu/Blas.cpp
+    src/backend/cpu/BatchLinearAlgebra.cpp
+    src/backend/cpu/RNNKernels.cpp
+    src/backend/cpu/DistanceKernels.cpp
+    src/backend/cpu/ComplexFactories.cpp
+    src/backend/cpu/ExtraLossKernels.cpp
     src/backend/cpu/SpecialKernels.cpp
     src/backend/cpu/SpecialAliasKernels.cpp
     src/backend/cpu/MetaViewKernels.cpp
@@ -89,7 +96,6 @@ set(P10_SOURCES
     src/backend/cpu/Spectral2DKernels.cpp
     src/backend/cpu/InplaceCompletionKernels.cpp
     src/backend/cpu/SymScalarKernels.cpp
-
     # Backend-neutral composite kernels, one file per operator category
     # (CompositeCommon.h holds the shared helpers).
     # Registered under the Composite dispatch key; see the files themselves.
@@ -101,9 +107,11 @@ set(P10_SOURCES
     src/backend/composite/VariantAliasComposites.cpp
     src/backend/composite/VariantHandComposites.cpp
     src/backend/composite/MiscBridgeComposites.cpp
+    src/backend/composite/DeadEndBridgeComposites.cpp
     src/backend/composite/DunderBinaryComposite.cpp
     src/backend/composite/FactoryToolsComposite.cpp
     src/backend/composite/ChanelShuffle.cpp
+    src/backend/composite/BaseMetaComposites.cpp
     src/backend/composite/CompositeViewCopyKernels.cpp
     src/backend/composite/ConvolutionTBC.cpp
     src/backend/composite/Distance.cpp
@@ -125,12 +133,10 @@ set(P10_SOURCES
     src/backend/composite/TypeProperties.cpp
     src/backend/composite/UnaryOps.cpp
     src/backend/composite/Unique.cpp
-
     # Unconditionally compiled Vulkan dispatch surface: exposes the
     # availability probe and registry so callers link regardless of whether
     # the backend itself is in the build.
     src/vulkan/Context.cpp
-
     src/Einsum.cpp
     src/Profiler.cpp
     src/ProfilerGpu.cpp
@@ -143,7 +149,6 @@ set(P10_SOURCES
     # Generated
     ${GEN_CPP}
 )
-
 if(USE_CUDA OR USE_ROCM)
     set(TP_CUDA_BACKEND_SOURCES
         src/backend/cuda/CUDAAllocator.cpp
@@ -184,6 +189,7 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/ActivationKernels.cu
         src/backend/cuda/NormalizationKernels.cu
         src/backend/cuda/LossKernels.cu
+        src/backend/cuda/LossFillKernels.cu
         src/backend/cuda/LossCTC.cu
         src/backend/cuda/ConvKernels.cu
         src/backend/cuda/Convolution.cu
@@ -209,10 +215,13 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/AttentionKernels.cu
         src/backend/cuda/IndexingKernels.cu
         src/backend/cuda/TierOpsKernels.cu
+        src/backend/cuda/BitwiseKernels.cu
         src/backend/cuda/TierOpsReduceKernels.cu
         src/backend/cuda/RNNKernels.cu
-        src/backend/cuda/Tier5OpsKernels.cu
-        src/backend/cuda/Tier5LossesKernels.cu
+        src/backend/cuda/Blas.cu
+        src/backend/cuda/BatchLinearAlgebra.cu
+        src/backend/cuda/ComplexFactories.cu
+        src/backend/cuda/LossKernels.cu
         src/backend/cuda/SpecialUnaryKernels.cu
         src/backend/cuda/SpecialBinaryKernels.cu
         src/backend/cuda/IncompleteGammaKernels.cu
@@ -245,7 +254,6 @@ if(USE_CUDA OR USE_ROCM)
         list(APPEND P10_SOURCES ${TP_CUDA_BACKEND_SOURCES})
     endif()
 endif()
-
 if(USE_VULKAN)
     # Vulkan backend: api layer, ops and the generated SPIR-V registry.
     # The shader registry is produced at build time from the GLSL sources by
@@ -253,7 +261,6 @@ if(USE_VULKAN)
     set(TP_VULKAN_GEN_DIR "${GEN_BASE_DIR}/vulkan")
     set(TP_VULKAN_GEN_CPP "${TP_VULKAN_GEN_DIR}/spv.cpp")
     set(TP_VULKAN_GEN_H "${TP_VULKAN_GEN_DIR}/spv.h")
-
     find_program(TP_GLSLANG_VALIDATOR glslangValidator
         PATHS "${CMAKE_CURRENT_SOURCE_DIR}/../tools/bin"
         NO_DEFAULT_PATH)
@@ -263,12 +270,10 @@ if(USE_VULKAN)
     if(NOT TP_GLSLANG_VALIDATOR)
         message(FATAL_ERROR "USE_VULKAN requires glslangValidator (expected under tools/bin).")
     endif()
-
     file(GLOB_RECURSE TP_VULKAN_GLSL CONFIG_DEPENDS
         "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/vulkan/glsl/*.glsl")
     list(APPEND TP_VULKAN_GLSL
         "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/vulkan/glsl/shader_params.yaml")
-
     add_custom_command(
         OUTPUT ${TP_VULKAN_GEN_CPP} ${TP_VULKAN_GEN_H}
         COMMAND ${CMAKE_COMMAND} -E env PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/..
@@ -281,14 +286,15 @@ if(USE_VULKAN)
     )
     set_source_files_properties(${TP_VULKAN_GEN_CPP} PROPERTIES GENERATED TRUE)
     add_custom_target(vulkan_spv_gen DEPENDS ${TP_VULKAN_GEN_CPP} ${TP_VULKAN_GEN_H})
-
     list(APPEND P10_SOURCES
         src/backend/vulkan/api/Adapter.cpp
         src/backend/vulkan/api/Allocator.cpp
         src/backend/vulkan/api/Command.cpp
         src/backend/vulkan/api/Context.cpp
         src/backend/vulkan/api/Descriptor.cpp
+        src/backend/vulkan/api/Exception.cpp
         src/backend/vulkan/api/Pipeline.cpp
+        src/backend/vulkan/api/QueryPool.cpp
         src/backend/vulkan/api/Resource.cpp
         src/backend/vulkan/api/Runtime.cpp
         src/backend/vulkan/api/Shader.cpp
@@ -297,21 +303,31 @@ if(USE_VULKAN)
         src/backend/vulkan/VulkanRuntime.cpp
         src/backend/vulkan/impl/Common.cpp
         src/backend/vulkan/impl/Packing.cpp
+        src/backend/vulkan/ops/Activation.cpp
         src/backend/vulkan/ops/Allocator.cpp
         src/backend/vulkan/ops/BinaryOp.cpp
         src/backend/vulkan/ops/Clamp.cpp
         src/backend/vulkan/ops/Clone.cpp
+        src/backend/vulkan/ops/Conv.cpp
         src/backend/vulkan/ops/Copy.cpp
         src/backend/vulkan/ops/Factory.cpp
+        src/backend/vulkan/ops/Matmul.cpp
+        src/backend/vulkan/ops/Misc.cpp
+        src/backend/vulkan/ops/Normalization.cpp
+        src/backend/vulkan/ops/Pooling.cpp
+        src/backend/vulkan/ops/Quant.cpp
+        src/backend/vulkan/ops/Random.cpp
+        src/backend/vulkan/ops/Reduction.cpp
+        src/backend/vulkan/ops/Shape.cpp
+        src/backend/vulkan/ops/Softmax.cpp
         src/backend/vulkan/ops/UnaryOp.cpp
         src/backend/vulkan/ops/Utils.cpp
+        src/backend/vulkan/ops/View.cpp
         src/backend/vulkan/ops/Zero.cpp
         ${TP_VULKAN_GEN_CPP}
     )
 endif()
-
 set_source_files_properties(${GEN_CPP} PROPERTIES GENERATED TRUE)
-
 # ------------------------------------------------------------------
 # CPU kernel multi-version compilation (DEFAULT + AVX2)
 # ------------------------------------------------------------------
@@ -331,7 +347,6 @@ set(TP_CPU_KERNEL_SRCS
     src/backend/cpu/StaxPointwiseKernels.cpp
     src/backend/cpu/ComplexKernels.cpp
 )
-
 if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
     # (CXX_AVX512_FOUND): only build the tier when the compiler accepts the
     # ISA flags defined by the capability tables.
@@ -364,7 +379,6 @@ if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
                 TP_COMPLEX_KERNELS_DEFINE_DISPATCH)
         endif()
         add_dependencies(p10_kernel_default_${KERNEL_NAME} generate_code)
-
         add_library(p10_kernel_avx2_${KERNEL_NAME} OBJECT ${KERNEL_SRC})
         set_target_properties(p10_kernel_avx2_${KERNEL_NAME} PROPERTIES
             POSITION_INDEPENDENT_CODE ON)
@@ -384,10 +398,8 @@ if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
         target_compile_definitions(p10_kernel_avx2_${KERNEL_NAME} PRIVATE
             ${BLAS_COMPILE_DEFS})
         add_dependencies(p10_kernel_avx2_${KERNEL_NAME} generate_code)
-
         list(APPEND TP_CPU_KERNEL_DEFAULT_OBJS $<TARGET_OBJECTS:p10_kernel_default_${KERNEL_NAME}>)
         list(APPEND TP_CPU_KERNEL_AVX2_OBJS $<TARGET_OBJECTS:p10_kernel_avx2_${KERNEL_NAME}>)
-
         if(TP_CXX_AVX512_FOUND)
             add_library(p10_kernel_avx512_${KERNEL_NAME} OBJECT ${KERNEL_SRC})
             set_target_properties(p10_kernel_avx512_${KERNEL_NAME} PROPERTIES
@@ -437,11 +449,9 @@ else()
         list(APPEND P10_SOURCES $<TARGET_OBJECTS:p10_kernel_default_${KERNEL_NAME}>)
     endforeach()
 endif()
-
 add_library(p10 ${P10_SOURCES})
 # Enable UNITY_BUILD for faster compilation
 set_target_properties(p10 PROPERTIES UNITY_BUILD OFF)
-
 if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
     # Tell DispatchStub (and every TU) that AVX2 kernel copies exist, so the
     # AVX2 dispatch slots are registered and selected at runtime.
@@ -450,7 +460,6 @@ if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
         target_compile_definitions(p10 PUBLIC HAVE_AVX512_CPU_DEFINITION)
     endif()
 endif()
-
 if(USE_CUDA)
     # The native aligned flash path consumes only the standalone CUTE/CUTLASS
     # headers and flash kernels.  It intentionally does not include or link
@@ -481,18 +490,14 @@ if(USE_CUDA)
     # escape hatch for exactly this newer-compiler/older-headers pairing.
     target_compile_definitions(p10 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:CCCL_DISABLE_CTK_COMPATIBILITY_CHECK>)
 endif()
-
 # Exclude generated files from UNITY_BUILD as they might cause conflicts or be too large
 set_source_files_properties(${GEN_CPP} PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
-
 add_dependencies(p10 generate_code)
-
 target_include_directories(p10 PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
     ${GEN_BASE_DIR}
 )
-
 if(USE_ROCM)
     # Staged headers (translated CUDA-spelling names) must win over the
     # originals for every TU in this target, hence BEFORE on the prefix.
@@ -502,22 +507,18 @@ if(USE_ROCM)
     target_include_directories(p10 BEFORE PRIVATE ${TP_HIP_STAGING}/src)
     target_include_directories(p10 SYSTEM PRIVATE ${TP_HIP_INCLUDE_DIRS})
 endif()
-
 # Backend-internal cross-directory includes (e.g. backend/vulkan/... from
 # cpu kernels) resolve against src/.
 target_include_directories(p10 PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
-
 # hand-written tpx headers (Autograd.h, Node.h).  Expose tpx/include so those
 # generated/native translation units resolve.
 target_include_directories(p10 PRIVATE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../tpx/include>
 )
-
 target_compile_definitions(p10 PRIVATE P10_EXPORTS)
 target_compile_definitions(p10 PRIVATE ${BLAS_COMPILE_DEFS})
-
 if(WIN32)
     target_link_libraries(p10 PRIVATE Dbghelp)
     if(MSVC)
@@ -525,10 +526,9 @@ if(WIN32)
         target_link_options(p10 PRIVATE "/OPT:NOREF")
     endif()
 endif()
-
 if(USE_VULKAN)
     target_include_directories(p10 SYSTEM PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/vulkan-headers/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/vulkan-headers"
         "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/vulkan-memory-allocator"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/vulkan/api"
         "${TP_VULKAN_GEN_DIR}")
@@ -536,7 +536,6 @@ if(USE_VULKAN)
     target_compile_definitions(p10 PRIVATE USE_VULKAN)
     add_dependencies(p10 vulkan_spv_gen)
 endif()
-
 if(USE_CUDA)
     target_link_libraries(p10 PRIVATE CUDA::cudart CUDA::cublas CUDA::cublasLt CUDA::cufft CUDA::cusolver)
     target_compile_definitions(p10 PRIVATE USE_CUDA)
@@ -545,7 +544,6 @@ if(USE_CUDA)
     if(EXISTS "${CUDAToolkit_INCLUDE_DIRS}/cccl/cub")
         target_include_directories(p10 PRIVATE "${CUDAToolkit_INCLUDE_DIRS}/cccl")
     endif()
-
     # positive USE_NCCL define, graceful downgrade when absent.
     option(USE_NCCL "Use NCCL for tensorplay.distributed" ON)
     if(USE_NCCL)
@@ -562,7 +560,6 @@ if(USE_CUDA)
                 "third_party/nccl to enable it.")
         endif()
     endif()
-
     if(USE_CUDNN)
          target_link_libraries(p10 PRIVATE ${CUDNN_LIBRARY})
          target_include_directories(p10 PRIVATE ${CUDNN_INCLUDE_DIR})
@@ -572,42 +569,42 @@ if(USE_CUDA)
          target_compile_definitions(p10 PRIVATE USE_CUDNN)
     endif()
 endif()
-
 if(USE_ROCM)
     target_link_libraries(p10 PRIVATE ${TP_HIP_LIBRARIES})
     # The staged tree keeps the CUDA-spelling guard names, so the target
     # carries both defines: existing #ifdef USE_CUDA blocks activate and
     # route to the HIP-backed implementations.
     target_compile_definitions(p10 PRIVATE USE_CUDA USE_ROCM)
+    if(USE_CUDNN)
+        # The staged compatibility header re-creates the descriptor-style
+        # DNN surface on top of MIOpen; this define activates the guarded
+        # code paths (the library itself is already on the link line via
+        # TP_HIP_LIBRARIES).
+        target_compile_definitions(p10 PRIVATE USE_CUDNN)
+    endif()
     target_compile_options(p10 PRIVATE
         $<$<COMPILE_LANGUAGE:CXX,HIP>:${TP_HIP_CXX_FLAGS}>)
 endif()
-
 if(COMPUTE_LIBS)
     target_link_libraries(p10 PUBLIC ${COMPUTE_LIBS})
 endif()
-
 # Vector math (runtime-dispatched entry points; see cpu/vec/SleefShims.h).
 if(TARGET sleef)
     target_link_libraries(p10 PRIVATE sleef)
 endif()
-
 find_package(Threads REQUIRED)
 target_link_libraries(p10 PUBLIC Threads::Threads)
 # ProfilerCupti dlopen's libcupti at runtime; libdl is part of libc on
 # glibc >= 2.34 but must be linked explicitly elsewhere.
 target_link_libraries(p10 PRIVATE ${CMAKE_DL_LIBS})
-
 if(UNIX AND NOT APPLE)
     target_link_libraries(p10 PUBLIC m)
 endif()
-
 # Installation logic for p10
 if(NOT DEFINED TP_PACKAGE_DIR)
     set(TP_PACKAGE_DIR "${CMAKE_SOURCE_DIR}/tensorplay")
 endif()
 set(TP_LIB_DIR "${TP_PACKAGE_DIR}/lib")
-
 set_target_properties(p10 PROPERTIES
     OUTPUT_NAME "p10"
     RUNTIME_OUTPUT_DIRECTORY "${TP_LIB_DIR}"
@@ -620,7 +617,6 @@ set_target_properties(p10 PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY_DEBUG "${TP_LIB_DIR}"
     ARCHIVE_OUTPUT_DIRECTORY_DEBUG "${TP_LIB_DIR}"
 )
-
 install(TARGETS p10
     RUNTIME DESTINATION tensorplay/lib
     LIBRARY DESTINATION tensorplay/lib

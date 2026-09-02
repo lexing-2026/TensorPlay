@@ -17,7 +17,8 @@ namespace composite {
 namespace ops = tensorplay::tpx::ops;
 
 Tensor& out_wrap__addmm_activation_out(const Tensor& self, const Tensor& mat1, const Tensor& mat2, Scalar beta, Scalar alpha, bool use_gelu, Tensor& out) {
-    out = ops::_addmm_activation(self, mat1, mat2, beta, alpha, use_gelu);
+    Tensor mm = ops::addmm(self, mat1, mat2, beta, alpha);
+    out = use_gelu ? ops::gelu(mm) : ops::relu(mm);
     return out;
 }
 
@@ -91,14 +92,14 @@ Tensor& out_wrap_cross_out(const Tensor& self, const Tensor& other, std::optiona
     return out;
 }
 
-std::tuple<Tensor&, Tensor&> out_wrap_cummax_out(const Tensor& self, int64_t dim, Tensor& values, Tensor& indices) {
+std::tuple<Tensor, Tensor> out_wrap_cummax_out(const Tensor& self, int64_t dim, Tensor& values, Tensor& indices) {
     auto __tp_result = ops::cummax(self, dim);
     values = std::get<0>(__tp_result);
     indices = std::get<1>(__tp_result);
     return { values, indices };
 }
 
-std::tuple<Tensor&, Tensor&> out_wrap_cummin_out(const Tensor& self, int64_t dim, Tensor& values, Tensor& indices) {
+std::tuple<Tensor, Tensor> out_wrap_cummin_out(const Tensor& self, int64_t dim, Tensor& values, Tensor& indices) {
     auto __tp_result = ops::cummin(self, dim);
     values = std::get<0>(__tp_result);
     indices = std::get<1>(__tp_result);
@@ -150,7 +151,7 @@ Tensor& out_wrap_fft_rfft2_out(const Tensor& self, std::optional<std::vector<int
     return out;
 }
 
-std::tuple<Tensor&, Tensor&> out_wrap_fractional_max_pool2d_output(const Tensor& self, const std::vector<int64_t>& kernel_size, const std::vector<int64_t>& output_size, const Tensor& random_samples, Tensor& output, Tensor& indices) {
+std::tuple<Tensor, Tensor> out_wrap_fractional_max_pool2d_output(const Tensor& self, const std::vector<int64_t>& kernel_size, const std::vector<int64_t>& output_size, const Tensor& random_samples, Tensor& output, Tensor& indices) {
     auto __tp_result = ops::fractional_max_pool2d(self, kernel_size, output_size, random_samples);
     output = std::get<0>(__tp_result);
     indices = std::get<1>(__tp_result);
@@ -162,7 +163,7 @@ Tensor& out_wrap_fractional_max_pool2d_backward_grad_input(const Tensor& grad_ou
     return grad_input;
 }
 
-std::tuple<Tensor&, Tensor&> out_wrap_fractional_max_pool3d_output(const Tensor& self, const std::vector<int64_t>& kernel_size, const std::vector<int64_t>& output_size, const Tensor& random_samples, Tensor& output, Tensor& indices) {
+std::tuple<Tensor, Tensor> out_wrap_fractional_max_pool3d_output(const Tensor& self, const std::vector<int64_t>& kernel_size, const std::vector<int64_t>& output_size, const Tensor& random_samples, Tensor& output, Tensor& indices) {
     auto __tp_result = ops::fractional_max_pool3d(self, kernel_size, output_size, random_samples);
     output = std::get<0>(__tp_result);
     indices = std::get<1>(__tp_result);
@@ -220,25 +221,25 @@ Tensor& out_wrap_index_select_out(const Tensor& self, int64_t dim, const Tensor&
 }
 
 Tensor& out_wrap_inverse_out(const Tensor& self, Tensor& out) {
-    out = ops::inverse(self);
+    out = std::get<0>(ops::linalg_inv_ex(self, false));
     return out;
 }
 
-std::tuple<Tensor&, Tensor&> out_wrap_kthvalue_values(const Tensor& self, int64_t k, int64_t dim, bool keepdim, Tensor& values, Tensor& indices) {
+std::tuple<Tensor, Tensor> out_wrap_kthvalue_values(const Tensor& self, int64_t k, int64_t dim, bool keepdim, Tensor& values, Tensor& indices) {
     auto __tp_result = ops::kthvalue(self, k, dim, keepdim);
     values = std::get<0>(__tp_result);
     indices = std::get<1>(__tp_result);
     return { values, indices };
 }
 
-std::tuple<Tensor&, Tensor&> out_wrap_linalg_cholesky_ex_L(const Tensor& self, bool upper, bool check_errors, Tensor& L, Tensor& info) {
+std::tuple<Tensor, Tensor> out_wrap_linalg_cholesky_ex_L(const Tensor& self, bool upper, bool check_errors, Tensor& L, Tensor& info) {
     auto __tp_result = ops::linalg_cholesky_ex(self, upper, check_errors);
     L = std::get<0>(__tp_result);
     info = std::get<1>(__tp_result);
     return { L, info };
 }
 
-std::tuple<Tensor&, Tensor&> out_wrap_linalg_eigh_eigvals(const Tensor& self, std::string UPLO, Tensor& eigvals, Tensor& eigvecs) {
+std::tuple<Tensor, Tensor> out_wrap_linalg_eigh_eigvals(const Tensor& self, std::string UPLO, Tensor& eigvals, Tensor& eigvecs) {
     auto __tp_result = ops::linalg_eigh(self, UPLO);
     eigvals = std::get<0>(__tp_result);
     eigvecs = std::get<1>(__tp_result);
@@ -250,14 +251,14 @@ Tensor& out_wrap_linalg_householder_product_out(const Tensor& input, const Tenso
     return out;
 }
 
-std::tuple<Tensor&, Tensor&> out_wrap_linalg_inv_ex_inverse(const Tensor& A, bool check_errors, Tensor& inverse, Tensor& info) {
+std::tuple<Tensor, Tensor> out_wrap_linalg_inv_ex_inverse(const Tensor& A, bool check_errors, Tensor& inverse, Tensor& info) {
     auto __tp_result = ops::linalg_inv_ex(A, check_errors);
     inverse = std::get<0>(__tp_result);
     info = std::get<1>(__tp_result);
     return { inverse, info };
 }
 
-std::tuple<Tensor&, Tensor&, Tensor&> out_wrap_linalg_ldl_factor_ex_out(const Tensor& self, bool hermitian, bool check_errors, Tensor& LD, Tensor& pivots, Tensor& info) {
+std::tuple<Tensor, Tensor, Tensor> out_wrap_linalg_ldl_factor_ex_out(const Tensor& self, bool hermitian, bool check_errors, Tensor& LD, Tensor& pivots, Tensor& info) {
     auto __tp_result = ops::linalg_ldl_factor_ex(self, hermitian, check_errors);
     LD = std::get<0>(__tp_result);
     pivots = std::get<1>(__tp_result);
@@ -270,7 +271,7 @@ Tensor& out_wrap_linalg_ldl_solve_out(const Tensor& LD, const Tensor& pivots, co
     return out;
 }
 
-std::tuple<Tensor&, Tensor&, Tensor&> out_wrap_linalg_lu_factor_ex_out(const Tensor& A, bool pivot, bool check_errors, Tensor& LU, Tensor& pivots, Tensor& info) {
+std::tuple<Tensor, Tensor, Tensor> out_wrap_linalg_lu_factor_ex_out(const Tensor& A, bool pivot, bool check_errors, Tensor& LU, Tensor& pivots, Tensor& info) {
     auto __tp_result = ops::linalg_lu_factor_ex(A, pivot, check_errors);
     LU = std::get<0>(__tp_result);
     pivots = std::get<1>(__tp_result);
@@ -278,14 +279,14 @@ std::tuple<Tensor&, Tensor&, Tensor&> out_wrap_linalg_lu_factor_ex_out(const Ten
     return { LU, pivots, info };
 }
 
-std::tuple<Tensor&, Tensor&> out_wrap_linalg_solve_ex_out(const Tensor& A, const Tensor& B, bool left, bool check_errors, Tensor& result, Tensor& info) {
+std::tuple<Tensor, Tensor> out_wrap_linalg_solve_ex_out(const Tensor& A, const Tensor& B, bool left, bool check_errors, Tensor& result, Tensor& info) {
     auto __tp_result = ops::linalg_solve_ex(A, B, left, check_errors);
     result = std::get<0>(__tp_result);
     info = std::get<1>(__tp_result);
     return { result, info };
 }
 
-std::tuple<Tensor&, Tensor&, Tensor&> out_wrap_linalg_svd_U(const Tensor& A, bool full_matrices, std::optional<std::string> driver, Tensor& U, Tensor& S, Tensor& Vh) {
+std::tuple<Tensor, Tensor, Tensor> out_wrap_linalg_svd_U(const Tensor& A, bool full_matrices, std::optional<std::string> driver, Tensor& U, Tensor& S, Tensor& Vh) {
     auto __tp_result = ops::linalg_svd(A, full_matrices, driver);
     U = std::get<0>(__tp_result);
     S = std::get<1>(__tp_result);
@@ -294,7 +295,8 @@ std::tuple<Tensor&, Tensor&, Tensor&> out_wrap_linalg_svd_U(const Tensor& A, boo
 }
 
 Tensor& out_wrap_linalg_vecdot_out(const Tensor& x, const Tensor& y, int64_t dim, Tensor& out) {
-    out = ops::linalg_vecdot(x, y, dim);
+    // vecdot(x, y, dim) = sum(conj(x) * y, dim); the sum drops the reduced axis.
+    out = ops::sum(ops::mul(ops::conj_physical(x), y), std::vector<int64_t>{dim}, false);
     return out;
 }
 
@@ -304,18 +306,20 @@ Tensor& out_wrap_log_softmax_int_out(const Tensor& self, int64_t dim, std::optio
 }
 
 Tensor& out_wrap_lu_solve_out(const Tensor& self, const Tensor& LU_data, const Tensor& LU_pivots, Tensor& out) {
-    out = ops::lu_solve(self, LU_data, LU_pivots);
+    // lu_solve(B, LU, pivots) solves A X = B from the lu_factor output; the
+    // linalg variant takes (LU, pivots, B) with the same left-solve semantics.
+    out = ops::linalg_lu_solve(LU_data, LU_pivots, self, true, false);
     return out;
 }
 
-std::tuple<Tensor&, Tensor&> out_wrap_max_dim_max(const Tensor& self, int64_t dim, bool keepdim, Tensor& max, Tensor& max_values) {
+std::tuple<Tensor, Tensor> out_wrap_max_dim_max(const Tensor& self, int64_t dim, bool keepdim, Tensor& max, Tensor& max_values) {
     auto __tp_result = ops::max(self, dim, keepdim);
     max = std::get<0>(__tp_result);
     max_values = std::get<1>(__tp_result);
     return { max, max_values };
 }
 
-std::tuple<Tensor&, Tensor&> out_wrap_max_pool2d_with_indices_out(const Tensor& self, const std::vector<int64_t>& kernel_size, const std::vector<int64_t>& stride, const std::vector<int64_t>& padding, const std::vector<int64_t>& dilation, bool ceil_mode, Tensor& out, Tensor& indices) {
+std::tuple<Tensor, Tensor> out_wrap_max_pool2d_with_indices_out(const Tensor& self, const std::vector<int64_t>& kernel_size, const std::vector<int64_t>& stride, const std::vector<int64_t>& padding, const std::vector<int64_t>& dilation, bool ceil_mode, Tensor& out, Tensor& indices) {
     auto __tp_result = ops::max_pool2d_with_indices(self, kernel_size, stride, padding, dilation, ceil_mode);
     out = std::get<0>(__tp_result);
     indices = std::get<1>(__tp_result);
@@ -327,7 +331,7 @@ Tensor& out_wrap_max_pool2d_with_indices_backward_grad_input(const Tensor& grad_
     return grad_input;
 }
 
-std::tuple<Tensor&, Tensor&> out_wrap_max_pool3d_with_indices_out(const Tensor& self, const std::vector<int64_t>& kernel_size, const std::vector<int64_t>& stride, const std::vector<int64_t>& padding, const std::vector<int64_t>& dilation, bool ceil_mode, Tensor& out, Tensor& indices) {
+std::tuple<Tensor, Tensor> out_wrap_max_pool3d_with_indices_out(const Tensor& self, const std::vector<int64_t>& kernel_size, const std::vector<int64_t>& stride, const std::vector<int64_t>& padding, const std::vector<int64_t>& dilation, bool ceil_mode, Tensor& out, Tensor& indices) {
     auto __tp_result = ops::max_pool3d_with_indices(self, kernel_size, stride, padding, dilation, ceil_mode);
     out = std::get<0>(__tp_result);
     indices = std::get<1>(__tp_result);
@@ -359,7 +363,7 @@ Tensor& out_wrap_mean_out(const Tensor& self, std::optional<std::vector<int64_t>
     return out;
 }
 
-std::tuple<Tensor&, Tensor&> out_wrap_min_dim_min(const Tensor& self, int64_t dim, bool keepdim, Tensor& min, Tensor& min_indices) {
+std::tuple<Tensor, Tensor> out_wrap_min_dim_min(const Tensor& self, int64_t dim, bool keepdim, Tensor& min, Tensor& min_indices) {
     auto __tp_result = ops::min(self, dim, keepdim);
     min = std::get<0>(__tp_result);
     min_indices = std::get<1>(__tp_result);
@@ -371,7 +375,7 @@ Tensor& out_wrap_mm_out(const Tensor& self, const Tensor& mat2, Tensor& out) {
     return out;
 }
 
-std::tuple<Tensor&, Tensor&> out_wrap_mode_values(const Tensor& self, int64_t dim, bool keepdim, Tensor& values, Tensor& indices) {
+std::tuple<Tensor, Tensor> out_wrap_mode_values(const Tensor& self, int64_t dim, bool keepdim, Tensor& values, Tensor& indices) {
     auto __tp_result = ops::mode(self, dim, keepdim);
     values = std::get<0>(__tp_result);
     indices = std::get<1>(__tp_result);
@@ -403,7 +407,7 @@ Tensor& out_wrap_multilabel_margin_loss_backward_grad_input(const Tensor& grad_o
     return grad_input;
 }
 
-std::tuple<Tensor&, Tensor&> out_wrap_multilabel_margin_loss_forward_output(const Tensor& self, const Tensor& target, int64_t reduction, Tensor& output, Tensor& is_target) {
+std::tuple<Tensor, Tensor> out_wrap_multilabel_margin_loss_forward_output(const Tensor& self, const Tensor& target, int64_t reduction, Tensor& output, Tensor& is_target) {
     auto __tp_result = ops::multilabel_margin_loss_forward(self, target, reduction);
     output = std::get<0>(__tp_result);
     is_target = std::get<1>(__tp_result);
@@ -426,7 +430,8 @@ Tensor& out_wrap_nll_loss_backward_grad_input(const Tensor& grad_output, const T
 }
 
 Tensor& out_wrap_orgqr_out(const Tensor& self, const Tensor& input2, Tensor& out) {
-    out = ops::orgqr(self, input2);
+    // orgqr is the same Householder-product operation exposed by the linalg name.
+    out = ops::linalg_householder_product(self, input2);
     return out;
 }
 
@@ -458,6 +463,47 @@ Tensor& out_wrap_reflection_pad1d_out(const Tensor& self, const std::vector<int6
 Tensor& out_wrap_reflection_pad2d_out(const Tensor& self, const std::vector<int64_t>& padding, Tensor& out) {
     out = ops::reflection_pad2d(self, padding);
     return out;
+}
+
+Tensor& out_wrap_reflection_pad3d_out(const Tensor& self, const std::vector<int64_t>& padding, Tensor& out) {
+    out = ops::reflection_pad3d(self, padding);
+    return out;
+}
+
+Tensor& out_wrap_reflection_pad1d_backward_grad_input(const Tensor& grad_output, const Tensor& self,
+                                                      const std::vector<int64_t>& padding, Tensor& grad_input) {
+    grad_input = ops::reflection_pad1d_backward(grad_output, self, padding);
+    return grad_input;
+}
+
+Tensor& out_wrap_reflection_pad2d_backward_grad_input(const Tensor& grad_output, const Tensor& self,
+                                                      const std::vector<int64_t>& padding, Tensor& grad_input) {
+    grad_input = ops::reflection_pad2d_backward(grad_output, self, padding);
+    return grad_input;
+}
+
+Tensor& out_wrap_reflection_pad3d_backward_grad_input(const Tensor& grad_output, const Tensor& self,
+                                                      const std::vector<int64_t>& padding, Tensor& grad_input) {
+    grad_input = ops::reflection_pad3d_backward(grad_output, self, padding);
+    return grad_input;
+}
+
+Tensor& out_wrap_replication_pad1d_backward_grad_input(const Tensor& grad_output, const Tensor& self,
+                                                       const std::vector<int64_t>& padding, Tensor& grad_input) {
+    grad_input = ops::replication_pad1d_backward(grad_output, self, padding);
+    return grad_input;
+}
+
+Tensor& out_wrap_replication_pad2d_backward_grad_input(const Tensor& grad_output, const Tensor& self,
+                                                       const std::vector<int64_t>& padding, Tensor& grad_input) {
+    grad_input = ops::replication_pad2d_backward(grad_output, self, padding);
+    return grad_input;
+}
+
+Tensor& out_wrap_replication_pad3d_backward_grad_input(const Tensor& grad_output, const Tensor& self,
+                                                       const std::vector<int64_t>& padding, Tensor& grad_input) {
+    grad_input = ops::replication_pad3d_backward(grad_output, self, padding);
+    return grad_input;
 }
 
 Tensor& out_wrap_renorm_out(const Tensor& self, Scalar p, int64_t dim, Scalar maxnorm, Tensor& out) {
@@ -510,7 +556,7 @@ Tensor& out_wrap_softmax_int_out(const Tensor& self, int64_t dim, std::optional<
     return out;
 }
 
-std::tuple<Tensor&, Tensor&> out_wrap_sort_values(const Tensor& self, int64_t dim, bool descending, Tensor& values, Tensor& indices) {
+std::tuple<Tensor, Tensor> out_wrap_sort_values(const Tensor& self, int64_t dim, bool descending, Tensor& values, Tensor& indices) {
     auto __tp_result = ops::sort(self, dim, descending);
     values = std::get<0>(__tp_result);
     indices = std::get<1>(__tp_result);
@@ -522,7 +568,7 @@ Tensor& out_wrap_sum_IntList_out(const Tensor& self, std::optional<std::vector<i
     return out;
 }
 
-std::tuple<Tensor&, Tensor&, Tensor&> out_wrap_svd_U(const Tensor& self, bool some, bool compute_uv, Tensor& U, Tensor& S, Tensor& V) {
+std::tuple<Tensor, Tensor, Tensor> out_wrap_svd_U(const Tensor& self, bool some, bool compute_uv, Tensor& U, Tensor& S, Tensor& V) {
     auto __tp_result = ops::svd(self, some, compute_uv);
     U = std::get<0>(__tp_result);
     S = std::get<1>(__tp_result);
@@ -545,14 +591,14 @@ Tensor& out_wrap_tanh_backward_grad_input(const Tensor& grad_output, const Tenso
     return grad_input;
 }
 
-std::tuple<Tensor&, Tensor&> out_wrap_topk_values(const Tensor& self, int64_t k, int64_t dim, bool largest, bool sorted, Tensor& values, Tensor& indices) {
+std::tuple<Tensor, Tensor> out_wrap_topk_values(const Tensor& self, int64_t k, int64_t dim, bool largest, bool sorted, Tensor& values, Tensor& indices) {
     auto __tp_result = ops::topk(self, k, dim, largest, sorted, 0);
     values = std::get<0>(__tp_result);
     indices = std::get<1>(__tp_result);
     return { values, indices };
 }
 
-std::tuple<Tensor&, Tensor&> out_wrap_triangular_solve_X(const Tensor& self, const Tensor& A, bool upper, bool transpose, bool unitriangular, Tensor& X, Tensor& M) {
+std::tuple<Tensor, Tensor> out_wrap_triangular_solve_X(const Tensor& self, const Tensor& A, bool upper, bool transpose, bool unitriangular, Tensor& X, Tensor& M) {
     auto __tp_result = ops::triangular_solve(self, A, upper, transpose, unitriangular);
     X = std::get<0>(__tp_result);
     M = std::get<1>(__tp_result);
@@ -730,10 +776,17 @@ TENSORPLAY_LIBRARY_IMPL(Composite, VariantWiringoutvariants) {
     m.impl("range.out_", composite::out_wrap_range_out_);
     m.impl("reflection_pad1d.out", composite::out_wrap_reflection_pad1d_out);
     m.impl("reflection_pad2d.out", composite::out_wrap_reflection_pad2d_out);
+    m.impl("reflection_pad3d.out", composite::out_wrap_reflection_pad3d_out);
+    m.impl("reflection_pad1d_backward.grad_input", composite::out_wrap_reflection_pad1d_backward_grad_input);
+    m.impl("reflection_pad2d_backward.grad_input", composite::out_wrap_reflection_pad2d_backward_grad_input);
+    m.impl("reflection_pad3d_backward.grad_input", composite::out_wrap_reflection_pad3d_backward_grad_input);
     m.impl("renorm.out", composite::out_wrap_renorm_out);
     m.impl("replication_pad1d.out", composite::out_wrap_replication_pad1d_out);
     m.impl("replication_pad2d.out", composite::out_wrap_replication_pad2d_out);
     m.impl("replication_pad3d.out", composite::out_wrap_replication_pad3d_out);
+    m.impl("replication_pad1d_backward.grad_input", composite::out_wrap_replication_pad1d_backward_grad_input);
+    m.impl("replication_pad2d_backward.grad_input", composite::out_wrap_replication_pad2d_backward_grad_input);
+    m.impl("replication_pad3d_backward.grad_input", composite::out_wrap_replication_pad3d_backward_grad_input);
     m.impl("scatter_add.out", composite::out_wrap_scatter_add_out);
     m.impl("scatter_reduce.two_out", composite::out_wrap_scatter_reduce_two_out);
     m.impl("sigmoid_backward.grad_input", composite::out_wrap_sigmoid_backward_grad_input);

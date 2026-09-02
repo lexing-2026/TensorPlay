@@ -1,6 +1,6 @@
 #pragma once
-// Fused CPU RNN cells -- CPU implementation of the CUDA fused-cell kernels
-// _thnn_fused_lstm_cell / _thnn_fused_gru_cell and their backward
+// Fused CPU RNN cells -- the CUDA fused-cell kernels' CPU twin:
+// forward/backward LSTM and GRU cell updates in one elementwise pass
 //
 // updates; TensorPlay's decomposed loop instead dispatched ~15-20 ops (each a
 // dispatch + allocation + potential parallel region) per timestep.  These

@@ -60,7 +60,7 @@ inline bool cpu_has_avx512() {
 
 enum : int { BIN_ADD = 0, BIN_MUL = 1, BIN_DIV = 2 };
 
-__attribute__((target("avx512f")))
+__attribute__((target("avx512f,fma")))
 void binary_f32_avx512(int code, const float* a, const float* b, float* y,
                        int64_t n, float alpha) {
     const __m512 va = _mm512_set1_ps(alpha);
@@ -70,7 +70,11 @@ void binary_f32_avx512(int code, const float* a, const float* b, float* y,
         __m512 w = _mm512_loadu_ps(b + i);
         __m512 r;
         switch (code) {
-            case BIN_ADD: r = _mm512_add_ps(x, _mm512_mul_ps(va, w)); break;
+            case BIN_ADD:
+                r = alpha == 1.0f   ? _mm512_add_ps(x, w)
+                  : alpha == -1.0f  ? _mm512_sub_ps(x, w)
+                                    : _mm512_fmadd_ps(va, w, x);
+                break;
             case BIN_MUL: r = _mm512_mul_ps(x, w); break;
             default:      r = _mm512_div_ps(x, w); break;
         }
@@ -128,6 +132,29 @@ void add_f32_avx512(const float* a, const float* b, float* y, int64_t n) {
                                               _mm512_loadu_ps(b + i)));
     }
     for (; i < n; ++i) y[i] = a[i] + b[i];
+}
+
+__attribute__((target("avx512f")))
+void sub_f32_avx512(const float* a, const float* b, float* y, int64_t n) {
+    // Dedicated row for alpha == -1 (x - y): keeps the subtraction on the
+    // same unrolled schedule as addition instead of a fused mul-add chain,
+    // so subtracting large contiguous tensors stays pure bandwidth.
+    int64_t i = 0;
+    for (; i + 64 <= n; i += 64) {
+        _mm512_storeu_ps(y + i, _mm512_sub_ps(_mm512_loadu_ps(a + i),
+                                              _mm512_loadu_ps(b + i)));
+        _mm512_storeu_ps(y + i + 16, _mm512_sub_ps(_mm512_loadu_ps(a + i + 16),
+                                                    _mm512_loadu_ps(b + i + 16)));
+        _mm512_storeu_ps(y + i + 32, _mm512_sub_ps(_mm512_loadu_ps(a + i + 32),
+                                                    _mm512_loadu_ps(b + i + 32)));
+        _mm512_storeu_ps(y + i + 48, _mm512_sub_ps(_mm512_loadu_ps(a + i + 48),
+                                                    _mm512_loadu_ps(b + i + 48)));
+    }
+    for (; i + 16 <= n; i += 16) {
+        _mm512_storeu_ps(y + i, _mm512_sub_ps(_mm512_loadu_ps(a + i),
+                                              _mm512_loadu_ps(b + i)));
+    }
+    for (; i < n; ++i) y[i] = a[i] - b[i];
 }
 
 __attribute__((target("avx512f")))
@@ -535,6 +562,11 @@ bool try_add_float32_out(const Tensor& self, const Tensor& other,
                 add_f32_avx512(self_ptr + begin, other_ptr + begin,
                                out_ptr + begin, end - begin);
             });
+        } else if (alpha_val == -1.0f) {
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                sub_f32_avx512(self_ptr + begin, other_ptr + begin,
+                               out_ptr + begin, end - begin);
+            });
         } else {
             parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
                 binary_f32_avx512(BIN_ADD, self_ptr + begin,
@@ -621,10 +653,12 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
         !self.unsafeGetTensorImpl()->has_onednn_md() &&
         !other.unsafeGetTensorImpl()->has_onednn_md();
 #endif
+    const float fast_alpha = alpha.to<float>();
     if (plain_layout && cpu_has_avx512() &&
         self.dtype() == DType::Float32 && other.dtype() == DType::Float32 &&
         self.shape() == other.shape() && self.is_contiguous() &&
-        other.is_contiguous() && alpha.to<float>() == 1.0f) {
+        other.is_contiguous() &&
+        (fast_alpha == 1.0f || fast_alpha == -1.0f)) {
         Tensor result = Tensor::empty(
             static_cast<std::vector<int64_t>>(self.shape()), DType::Float32,
             self.device());
@@ -633,7 +667,11 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
         const float* b = other.data_ptr<float>();
         float* y = result.data_ptr<float>();
         parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-            add_f32_avx512(a + begin, b + begin, y + begin, end - begin);
+            if (fast_alpha == 1.0f) {
+                add_f32_avx512(a + begin, b + begin, y + begin, end - begin);
+            } else {
+                sub_f32_avx512(a + begin, b + begin, y + begin, end - begin);
+            }
         });
         return result;
     }
@@ -2357,6 +2395,34 @@ Tensor add_scalar_kernel(const Tensor& self, Scalar other, Scalar alpha) {
 
 Tensor sub_scalar_kernel(const Tensor& self, Scalar other, Scalar alpha) {
     DType result_dtype = scalar_result_dtype(self.dtype(), other, &alpha);
+
+#if defined(__x86_64__)
+    // x - alpha*other folds into one scalar term, so the contiguous float
+    // surface takes the same vectorized loop as add.Scalar with the negated
+    // product instead of the recursive elementwise functor.
+    if (self.dtype() == DType::Float32 && result_dtype == DType::Float32 &&
+        !other.isComplex() && !alpha.isComplex() && self.is_contiguous() &&
+        cpu_has_avx512()) {
+        Tensor result = Tensor::empty(
+            static_cast<std::vector<int64_t>>(self.shape()), DType::Float32,
+            self.device());
+        const float scalar = alpha.to<float>() * other.to<float>();
+        scalar_f32_contiguous(BIN_ADD, self.data_ptr<float>(),
+                              result.data_ptr<float>(), self.numel(), -scalar);
+        return result;
+    }
+    if (self.dtype() == DType::Float64 && result_dtype == DType::Float64 &&
+        !other.isComplex() && !alpha.isComplex() && self.is_contiguous() &&
+        cpu_has_avx512()) {
+        Tensor result = Tensor::empty(
+            static_cast<std::vector<int64_t>>(self.shape()), DType::Float64,
+            self.device());
+        const double scalar = alpha.to<double>() * other.to<double>();
+        scalar_f64_contiguous(BIN_ADD, self.data_ptr<double>(),
+                              result.data_ptr<double>(), self.numel(), -scalar);
+        return result;
+    }
+#endif
 
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), result_dtype, self.device());
     Tensor self_casted = (self.dtype() == result_dtype) ? self : self.to(result_dtype);

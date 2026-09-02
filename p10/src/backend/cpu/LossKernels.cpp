@@ -8,8 +8,12 @@
 #include <cmath>
 #include <vector>
 
+#include "../composite/AttentionComposite.h"
+
 namespace tensorplay {
 namespace cpu {
+
+namespace ops = tensorplay::tpx::ops;
 
 template <typename scalar_t>
 std::tuple<Tensor, Tensor> nll_loss_impl(const Tensor& input, const Tensor& target,
@@ -697,13 +701,16 @@ Tensor ctc_loss_backward_impl(const Tensor& grad_out, const Tensor& log_probs,
                 g_last[prime] = la_last[2 * tl - 1] + beta[2 * tl - 1];
             }
 
-            // eq (10)/(11) recursion plus eq (16) collection
+            // eq (10)/(11) recursion plus eq (16) collection.
+            // beta is a rolling single-row buffer: ascending s keeps
+            // beta[s+1]/beta[s+2] holding the previous-row (t+1) values
+            // until after they are consumed at step s.
             for (int64_t t = il - 2; t >= 0; --t) {
                 const scalar_t* lpt = lpb + (t * N) * C;
                 const scalar_t* lan = lab + ((t + 1) * M);
                 const scalar_t* lat = lab + (t * M);
                 scalar_t* gt = gb + (t * N) * C;
-                for (int64_t s = 2 * tl; s >= 0; --s) {
+                for (int64_t s = 0; s <= 2 * tl; ++s) {
                     const int64_t current_target_prime =
                         ctc_target_prime(tb, 1, s, blank);
                     scalar_t lb1 = beta[s];
@@ -803,6 +810,34 @@ std::tuple<Tensor, Tensor> _ctc_loss_cpu(const Tensor& log_probs,
     TP_THROW(NotImplementedError, "_ctc_loss only supports Float32/Float64");
 }
 
+
+Tensor ctc_loss_intlist_cpu(const Tensor& log_probs, const Tensor& targets,
+                            const std::vector<int64_t>& input_lengths,
+                            const std::vector<int64_t>& target_lengths,
+                            int64_t blank, int64_t reduction,
+                            bool zero_infinity) {
+    Tensor il = Tensor::tensor(input_lengths, DType::Int64, log_probs.device());
+    Tensor tl = Tensor::tensor(target_lengths, DType::Int64, log_probs.device());
+    return composite::ctc_loss_compose(log_probs, targets, il, tl, blank, reduction,
+                            zero_infinity);
+}
+
+Tensor ctc_loss_tensor_cpu(const Tensor& log_probs, const Tensor& targets,
+                           const Tensor& input_lengths,
+                           const Tensor& target_lengths, int64_t blank,
+                           int64_t reduction, bool zero_infinity) {
+    if (input_lengths.dtype() != DType::Int64 &&
+        input_lengths.dtype() != DType::Int32) {
+        TP_THROW(TypeError, "ctc_loss: input_lengths must be integral");
+    }
+    if (target_lengths.dtype() != DType::Int64 &&
+        target_lengths.dtype() != DType::Int32) {
+        TP_THROW(TypeError, "ctc_loss: target_lengths must be integral");
+    }
+    return composite::ctc_loss_compose(log_probs, targets, input_lengths, target_lengths,
+                            blank, reduction, zero_infinity);
+}
+
 TENSORPLAY_LIBRARY_IMPL(CPU, LossKernels) {
     m.impl("nll_loss", nll_loss_kernel);
     m.impl("nll_loss_backward", nll_loss_backward_kernel);
@@ -810,6 +845,8 @@ TENSORPLAY_LIBRARY_IMPL(CPU, LossKernels) {
     m.impl("nll_loss2d_backward", nll_loss2d_backward_kernel);
     m.impl("_ctc_loss", _ctc_loss_cpu);
     m.impl("_ctc_loss_backward", _ctc_loss_backward_cpu);
+    m.impl("ctc_loss.IntList", ctc_loss_intlist_cpu);
+    m.impl("ctc_loss.Tensor", ctc_loss_tensor_cpu);
 
     m.impl("mse_loss", mse_loss_kernel);
     m.impl("mse_loss_backward", mse_loss_backward_kernel);

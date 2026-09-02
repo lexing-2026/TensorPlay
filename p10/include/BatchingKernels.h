@@ -41,6 +41,8 @@ Tensor stack(const std::vector<Tensor>& inputs, int64_t dim);
 Tensor mm(const Tensor& left, const Tensor& right);
 Tensor matmul(const Tensor& left, const Tensor& right);
 Tensor bmm(const Tensor& left, const Tensor& right);
+Tensor linear(const Tensor& input, const Tensor& weight,
+              std::optional<Tensor> bias);
 Tensor rand(const std::vector<int64_t>& shape, std::optional<DType> dtype,
             std::optional<Device> device);
 Tensor randn(const std::vector<int64_t>& shape, std::optional<DType> dtype,

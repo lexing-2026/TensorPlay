@@ -155,20 +155,20 @@ __device__ __forceinline__ bool reduce_isnan(T value) {
 
 template <typename T>
 __device__ __forceinline__ T reduce_warp_shuffle_down(
-        T value, unsigned mask, int offset) {
+        T value, unsigned long long mask, int offset) {
     return __shfl_down_sync(mask, value, offset);
 }
 
 // thrust::complex has no intrinsic __shfl_down_sync overload; shuffle the
 __device__ __forceinline__ thrust::complex<float> reduce_warp_shuffle_down(
-        thrust::complex<float> value, unsigned mask, int offset) {
+        thrust::complex<float> value, unsigned long long mask, int offset) {
     float re = __shfl_down_sync(mask, value.real(), offset);
     float im = __shfl_down_sync(mask, value.imag(), offset);
     return thrust::complex<float>(re, im);
 }
 
 __device__ __forceinline__ thrust::complex<double> reduce_warp_shuffle_down(
-        thrust::complex<double> value, unsigned mask, int offset) {
+        thrust::complex<double> value, unsigned long long mask, int offset) {
     double re = __shfl_down_sync(mask, value.real(), offset);
     double im = __shfl_down_sync(mask, value.imag(), offset);
     return thrust::complex<double>(re, im);
@@ -205,7 +205,7 @@ struct ArgPair {
 
 template <typename T>
 __device__ __forceinline__ ArgPair<T> reduce_warp_shuffle_down(
-        ArgPair<T> value, unsigned mask, int offset) {
+        ArgPair<T> value, unsigned long long mask, int offset) {
     return {
         reduce_warp_shuffle_down(value.value, mask, offset),
         reduce_warp_shuffle_down(value.index, mask, offset)};
@@ -221,7 +221,7 @@ struct WelfordData {
 
 template <typename T>
 __device__ __forceinline__ WelfordData<T> reduce_warp_shuffle_down(
-        WelfordData<T> value, unsigned mask, int offset) {
+        WelfordData<T> value, unsigned long long mask, int offset) {
     return {
         reduce_warp_shuffle_down(value.mean, mask, offset),
         reduce_warp_shuffle_down(value.m2, mask, offset),

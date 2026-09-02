@@ -48,10 +48,11 @@ Tensor view_as_complex_cuda(const Tensor& self) {
     if (!self.defined()) {
         TP_THROW(RuntimeError, "view_as_complex: input must be defined");
     }
-    if (self.dtype() != DType::Float16 && self.dtype() != DType::Float32 &&
-        self.dtype() != DType::Float64) {
+    if (self.dtype() != DType::Float16 && self.dtype() != DType::BFloat16 &&
+        self.dtype() != DType::Float32 && self.dtype() != DType::Float64) {
         TP_THROW(RuntimeError,
-                "view_as_complex is only supported for half, float and double "
+                "view_as_complex is only supported for half, bfloat16, float "
+                "and double "
                 "tensors, but got " + std::string(toString(self.dtype())));
     }
     if (self.dim() == 0 || self.size(self.dim() - 1) != 2) {

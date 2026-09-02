@@ -6,7 +6,7 @@
 // that a follow-up atomic reduction collapses to the scalar mean/sum
 // (self-contained reduction -- does not go through the dispatched sum op).
 // Arithmetic runs in double on device (same convention as
-// Tier5LossesKernels.cu) and results are cast back to the input dtype.
+// ExtraLossKernels.cpp) and results are cast back to the input dtype.
 // CUDA_KERNEL_ASSERT.
 #include "Tensor.h"
 #include "Dispatcher.h"

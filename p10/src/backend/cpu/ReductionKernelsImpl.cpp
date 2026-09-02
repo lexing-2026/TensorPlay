@@ -15,6 +15,7 @@
 #include <vector>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <tuple>
 #if defined(__x86_64__)
@@ -326,6 +327,12 @@ inline bool reduce_avx512_available() {
     return ok;
 }
 
+inline bool byte_reduce_avx512_available() {
+    static const bool ok = __builtin_cpu_supports("avx512f") != 0 &&
+                           __builtin_cpu_supports("avx512bw") != 0;
+    return ok;
+}
+
 __attribute__((target("avx512f")))
 float sum_f32_chunk_avx512(const float* x, int64_t b, int64_t e) {
     __m512 a0 = _mm512_setzero_ps(), a1 = _mm512_setzero_ps();
@@ -365,6 +372,1375 @@ double sum_f64_chunk_avx512(const double* x, int64_t b, int64_t e) {
                (buf[4] + buf[5]) + (buf[6] + buf[7]);
     for (; i < e; ++i) s += x[i];
     return s;
+}
+
+__attribute__((target("avx512f")))
+float product_f32_chunk_avx512(const float* x, int64_t b, int64_t e) {
+    __m512 a0 = _mm512_set1_ps(1.0f), a1 = a0;
+    __m512 a2 = a0, a3 = a0;
+    int64_t i = b;
+    for (; i + 64 <= e; i += 64) {
+        a0 = _mm512_mul_ps(a0, _mm512_loadu_ps(x + i));
+        a1 = _mm512_mul_ps(a1, _mm512_loadu_ps(x + i + 16));
+        a2 = _mm512_mul_ps(a2, _mm512_loadu_ps(x + i + 32));
+        a3 = _mm512_mul_ps(a3, _mm512_loadu_ps(x + i + 48));
+    }
+    __m512 acc = _mm512_mul_ps(_mm512_mul_ps(a0, a1),
+                               _mm512_mul_ps(a2, a3));
+    for (; i + 16 <= e; i += 16)
+        acc = _mm512_mul_ps(acc, _mm512_loadu_ps(x + i));
+    alignas(64) float lanes[16];
+    _mm512_storeu_ps(lanes, acc);
+    float product = lanes[0];
+    for (int j = 1; j < 16; ++j) product *= lanes[j];
+    for (; i < e; ++i) product *= x[i];
+    return product;
+}
+
+__attribute__((target("avx512f")))
+double product_f64_chunk_avx512(const double* x, int64_t b, int64_t e) {
+    __m512d a0 = _mm512_set1_pd(1.0), a1 = a0;
+    int64_t i = b;
+    for (; i + 16 <= e; i += 16) {
+        a0 = _mm512_mul_pd(a0, _mm512_loadu_pd(x + i));
+        a1 = _mm512_mul_pd(a1, _mm512_loadu_pd(x + i + 8));
+    }
+    __m512d acc = _mm512_mul_pd(a0, a1);
+    for (; i + 8 <= e; i += 8)
+        acc = _mm512_mul_pd(acc, _mm512_loadu_pd(x + i));
+    alignas(64) double lanes[8];
+    _mm512_storeu_pd(lanes, acc);
+    double product = lanes[0];
+    for (int j = 1; j < 8; ++j) product *= lanes[j];
+    for (; i < e; ++i) product *= x[i];
+    return product;
+}
+
+static bool try_product_real_avx512(const void* xv, int64_t n, DType dt,
+                                    double* out) {
+    if (!reduce_avx512_available() || n < 4096) return false;
+    constexpr int64_t kGrain = 32768;
+    if (dt == DType::Float32) {
+        const float* x = static_cast<const float*>(xv);
+        const int64_t nslots = (n + kGrain - 1) / kGrain;
+        std::vector<float> partials(nslots, 1.0f);
+        tensorplay::parallel::parallel_for(0, n, kGrain, [&](int64_t b, int64_t e) {
+            partials[b / kGrain] = product_f32_chunk_avx512(x, b, e);
+        });
+        float product = 1.0f;
+        for (int64_t k = 0; k < nslots; ++k) product *= partials[k];
+        *out = static_cast<double>(product);
+        return true;
+    }
+    if (dt == DType::Float64) {
+        const double* x = static_cast<const double*>(xv);
+        const int64_t nslots = (n + kGrain - 1) / kGrain;
+        std::vector<double> partials(nslots, 1.0);
+        tensorplay::parallel::parallel_for(0, n, kGrain, [&](int64_t b, int64_t e) {
+            partials[b / kGrain] = product_f64_chunk_avx512(x, b, e);
+        });
+        double product = 1.0;
+        for (int64_t k = 0; k < nslots; ++k) product *= partials[k];
+        *out = product;
+        return true;
+    }
+    return false;
+}
+
+static bool try_product_lastdim_real_avx512(
+    const void* xv, void* outv, int64_t outer, int64_t d_size, DType dt) {
+    if (!reduce_avx512_available() || d_size < 64 || outer <= 0) return false;
+    const int64_t row_grain = std::max<int64_t>(
+        1, GRAIN_SIZE / std::max<int64_t>(d_size, 1));
+    if (dt == DType::Float32) {
+        const float* input = static_cast<const float*>(xv);
+        float* output = static_cast<float*>(outv);
+        tensorplay::parallel::parallel_for(0, outer, row_grain,
+            [&](int64_t begin, int64_t end) {
+                for (int64_t row = begin; row < end; ++row) {
+                    output[row] = product_f32_chunk_avx512(
+                        input + row * d_size, 0, d_size);
+                }
+            });
+        return true;
+    }
+    if (dt == DType::Float64) {
+        const double* input = static_cast<const double*>(xv);
+        double* output = static_cast<double*>(outv);
+        tensorplay::parallel::parallel_for(0, outer, row_grain,
+            [&](int64_t begin, int64_t end) {
+                for (int64_t row = begin; row < end; ++row) {
+                    output[row] = product_f64_chunk_avx512(
+                        input + row * d_size, 0, d_size);
+                }
+            });
+        return true;
+    }
+    return false;
+}
+
+template <bool WantAll>
+__attribute__((target("avx512f,avx512bw")))
+static bool byte_reduce_avx512_range(const uint8_t* data, int64_t begin,
+                                     int64_t end) {
+    int64_t i = begin;
+    const __m512i zero = _mm512_setzero_si512();
+    constexpr uint64_t kAllBytes = 0xffffffffffffffffULL;
+    for (; i + 64 <= end; i += 64) {
+        const __m512i values = _mm512_loadu_si512(data + i);
+        const uint64_t zero_mask = static_cast<uint64_t>(
+            _mm512_cmpeq_epi8_mask(values, zero));
+        if constexpr (WantAll) {
+            if (zero_mask != 0) return false;
+        } else if (zero_mask != kAllBytes) {
+            return true;
+        }
+    }
+    for (; i < end; ++i) {
+        if constexpr (WantAll) {
+            if (data[i] == 0) return false;
+        } else if (data[i] != 0) {
+            return true;
+        }
+    }
+    return WantAll;
+}
+
+template <bool WantAll>
+static bool byte_reduce_avx512(const uint8_t* data, int64_t n) {
+    if (n < GRAIN_SIZE || get_num_threads() == 1 || in_parallel_region()) {
+        return byte_reduce_avx512_range<WantAll>(data, 0, n);
+    }
+
+    const int num_threads = get_num_threads();
+    std::vector<unsigned char> partials(
+        static_cast<size_t>(num_threads), WantAll ? 1 : 0);
+    parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        partials[get_thread_num()] = static_cast<unsigned char>(
+            byte_reduce_avx512_range<WantAll>(data, begin, end));
+    });
+    for (unsigned char partial : partials) {
+        if constexpr (WantAll) {
+            if (partial == 0) return false;
+        } else if (partial != 0) {
+            return true;
+        }
+    }
+    return WantAll;
+}
+
+template <bool WantAll>
+__attribute__((target("avx512f")))
+static bool logical_reduce_f32_range(
+    const float* data, int64_t begin, int64_t end) {
+    int64_t i = begin;
+    constexpr uint16_t kAllLanes = 0xffff;
+    const __m512 zero = _mm512_setzero_ps();
+    for (; i + 16 <= end; i += 16) {
+        const uint16_t nonzero = static_cast<uint16_t>(
+            _mm512_cmp_ps_mask(_mm512_loadu_ps(data + i), zero, _CMP_NEQ_UQ));
+        if constexpr (WantAll) {
+            if (nonzero != kAllLanes) return false;
+        } else if (nonzero != 0) {
+            return true;
+        }
+    }
+    for (; i < end; ++i) {
+        if constexpr (WantAll) {
+            if (data[i] == 0.0f) return false;
+        } else if (data[i] != 0.0f) {
+            return true;
+        }
+    }
+    return WantAll;
+}
+
+template <bool WantAll>
+__attribute__((target("avx512f")))
+static bool logical_reduce_f64_range(
+    const double* data, int64_t begin, int64_t end) {
+    int64_t i = begin;
+    constexpr uint8_t kAllLanes = 0xff;
+    const __m512d zero = _mm512_setzero_pd();
+    for (; i + 8 <= end; i += 8) {
+        const uint8_t nonzero = static_cast<uint8_t>(
+            _mm512_cmp_pd_mask(_mm512_loadu_pd(data + i), zero, _CMP_NEQ_UQ));
+        if constexpr (WantAll) {
+            if (nonzero != kAllLanes) return false;
+        } else if (nonzero != 0) {
+            return true;
+        }
+    }
+    for (; i < end; ++i) {
+        if constexpr (WantAll) {
+            if (data[i] == 0.0) return false;
+        } else if (data[i] != 0.0) {
+            return true;
+        }
+    }
+    return WantAll;
+}
+
+template <bool WantAll>
+static bool logical_reduce_full_avx512(const void* data, int64_t n, DType dt) {
+    if (!reduce_avx512_available()) return false;
+    if (dt == DType::Float32) {
+        const float* values = static_cast<const float*>(data);
+        if (n < GRAIN_SIZE || get_num_threads() == 1 || in_parallel_region()) {
+            return logical_reduce_f32_range<WantAll>(values, 0, n);
+        }
+        const int num_threads = get_num_threads();
+        std::vector<unsigned char> partials(
+            static_cast<size_t>(num_threads), WantAll ? 1 : 0);
+        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+            partials[get_thread_num()] = static_cast<unsigned char>(
+                logical_reduce_f32_range<WantAll>(values, begin, end));
+        });
+        for (unsigned char partial : partials) {
+            if constexpr (WantAll) {
+                if (partial == 0) return false;
+            } else if (partial != 0) {
+                return true;
+            }
+        }
+        return WantAll;
+    }
+    if (dt == DType::Float64) {
+        const double* values = static_cast<const double*>(data);
+        if (n < GRAIN_SIZE || get_num_threads() == 1 || in_parallel_region()) {
+            return logical_reduce_f64_range<WantAll>(values, 0, n);
+        }
+        const int num_threads = get_num_threads();
+        std::vector<unsigned char> partials(
+            static_cast<size_t>(num_threads), WantAll ? 1 : 0);
+        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+            partials[get_thread_num()] = static_cast<unsigned char>(
+                logical_reduce_f64_range<WantAll>(values, begin, end));
+        });
+        for (unsigned char partial : partials) {
+            if constexpr (WantAll) {
+                if (partial == 0) return false;
+            } else if (partial != 0) {
+                return true;
+            }
+        }
+        return WantAll;
+    }
+    return false;
+}
+
+template <bool WantAll>
+__attribute__((target("avx512f")))
+static void logical_reduce_f32_dim_row(
+    const float* input, uint8_t* output, int64_t d_size, int64_t inner,
+    int64_t col_begin, int64_t col_end) {
+    if (inner == 1 && col_begin == 0 && col_end != 0) {
+        output[0] = static_cast<uint8_t>(
+            logical_reduce_f32_range<WantAll>(input, 0, d_size));
+        return;
+    }
+    constexpr uint16_t kAllLanes = 0xffff;
+    const __m512 zero = _mm512_setzero_ps();
+    int64_t col = col_begin;
+    for (; col + 64 <= col_end; col += 64) {
+        uint16_t result0 = WantAll ? kAllLanes : 0;
+        uint16_t result1 = WantAll ? kAllLanes : 0;
+        uint16_t result2 = WantAll ? kAllLanes : 0;
+        uint16_t result3 = WantAll ? kAllLanes : 0;
+        for (int64_t row = 0; row < d_size; ++row) {
+            const float* row_input = input + row * inner + col;
+            const uint16_t nonzero0 = static_cast<uint16_t>(
+                _mm512_cmp_ps_mask(_mm512_loadu_ps(row_input), zero, _CMP_NEQ_UQ));
+            const uint16_t nonzero1 = static_cast<uint16_t>(
+                _mm512_cmp_ps_mask(_mm512_loadu_ps(row_input + 16), zero, _CMP_NEQ_UQ));
+            const uint16_t nonzero2 = static_cast<uint16_t>(
+                _mm512_cmp_ps_mask(_mm512_loadu_ps(row_input + 32), zero, _CMP_NEQ_UQ));
+            const uint16_t nonzero3 = static_cast<uint16_t>(
+                _mm512_cmp_ps_mask(_mm512_loadu_ps(row_input + 48), zero, _CMP_NEQ_UQ));
+            if constexpr (WantAll) {
+                result0 &= nonzero0;
+                result1 &= nonzero1;
+                result2 &= nonzero2;
+                result3 &= nonzero3;
+                if ((result0 | result1 | result2 | result3) == 0) break;
+            } else {
+                result0 |= nonzero0;
+                result1 |= nonzero1;
+                result2 |= nonzero2;
+                result3 |= nonzero3;
+                if ((result0 & result1 & result2 & result3) == kAllLanes) break;
+            }
+        }
+        alignas(64) uint8_t reduced[64];
+        for (int lane = 0; lane < 16; ++lane) {
+            reduced[lane] = static_cast<uint8_t>((result0 >> lane) & 1);
+            reduced[16 + lane] = static_cast<uint8_t>((result1 >> lane) & 1);
+            reduced[32 + lane] = static_cast<uint8_t>((result2 >> lane) & 1);
+            reduced[48 + lane] = static_cast<uint8_t>((result3 >> lane) & 1);
+        }
+        std::memcpy(output + col, reduced, sizeof(reduced));
+    }
+    for (; col + 16 <= col_end; col += 16) {
+        uint16_t result = WantAll ? kAllLanes : 0;
+        for (int64_t row = 0; row < d_size; ++row) {
+            const uint16_t nonzero = static_cast<uint16_t>(
+                _mm512_cmp_ps_mask(
+                    _mm512_loadu_ps(input + row * inner + col),
+                    zero, _CMP_NEQ_UQ));
+            if constexpr (WantAll) {
+                result &= nonzero;
+                if (result == 0) break;
+            } else {
+                result |= nonzero;
+                if (result == kAllLanes) break;
+            }
+        }
+        uint8_t reduced[16];
+        for (int lane = 0; lane < 16; ++lane) {
+            reduced[lane] = static_cast<uint8_t>((result >> lane) & 1);
+        }
+        std::memcpy(output + col, reduced, sizeof(reduced));
+    }
+    for (; col < col_end; ++col) {
+        bool value = WantAll;
+        for (int64_t row = 0; row < d_size; ++row) {
+            const bool nonzero = input[row * inner + col] != 0.0f;
+            if constexpr (WantAll) {
+                value = value && nonzero;
+                if (!value) break;
+            } else {
+                value = value || nonzero;
+                if (value) break;
+            }
+        }
+        output[col] = static_cast<uint8_t>(value);
+    }
+}
+
+template <bool WantAll>
+__attribute__((target("avx512f")))
+static void logical_reduce_f64_dim_row(
+    const double* input, uint8_t* output, int64_t d_size, int64_t inner,
+    int64_t col_begin, int64_t col_end) {
+    if (inner == 1 && col_begin == 0 && col_end != 0) {
+        output[0] = static_cast<uint8_t>(
+            logical_reduce_f64_range<WantAll>(input, 0, d_size));
+        return;
+    }
+    constexpr uint8_t kAllLanes = 0xff;
+    const __m512d zero = _mm512_setzero_pd();
+    int64_t col = col_begin;
+    for (; col + 32 <= col_end; col += 32) {
+        uint8_t result0 = WantAll ? kAllLanes : 0;
+        uint8_t result1 = WantAll ? kAllLanes : 0;
+        uint8_t result2 = WantAll ? kAllLanes : 0;
+        uint8_t result3 = WantAll ? kAllLanes : 0;
+        for (int64_t row = 0; row < d_size; ++row) {
+            const double* row_input = input + row * inner + col;
+            const uint8_t nonzero0 = static_cast<uint8_t>(
+                _mm512_cmp_pd_mask(_mm512_loadu_pd(row_input), zero, _CMP_NEQ_UQ));
+            const uint8_t nonzero1 = static_cast<uint8_t>(
+                _mm512_cmp_pd_mask(_mm512_loadu_pd(row_input + 8), zero, _CMP_NEQ_UQ));
+            const uint8_t nonzero2 = static_cast<uint8_t>(
+                _mm512_cmp_pd_mask(_mm512_loadu_pd(row_input + 16), zero, _CMP_NEQ_UQ));
+            const uint8_t nonzero3 = static_cast<uint8_t>(
+                _mm512_cmp_pd_mask(_mm512_loadu_pd(row_input + 24), zero, _CMP_NEQ_UQ));
+            if constexpr (WantAll) {
+                result0 &= nonzero0;
+                result1 &= nonzero1;
+                result2 &= nonzero2;
+                result3 &= nonzero3;
+                if ((result0 | result1 | result2 | result3) == 0) break;
+            } else {
+                result0 |= nonzero0;
+                result1 |= nonzero1;
+                result2 |= nonzero2;
+                result3 |= nonzero3;
+                if ((result0 & result1 & result2 & result3) == kAllLanes) break;
+            }
+        }
+        alignas(64) uint8_t reduced[32];
+        for (int lane = 0; lane < 8; ++lane) {
+            reduced[lane] = static_cast<uint8_t>((result0 >> lane) & 1);
+            reduced[8 + lane] = static_cast<uint8_t>((result1 >> lane) & 1);
+            reduced[16 + lane] = static_cast<uint8_t>((result2 >> lane) & 1);
+            reduced[24 + lane] = static_cast<uint8_t>((result3 >> lane) & 1);
+        }
+        std::memcpy(output + col, reduced, sizeof(reduced));
+    }
+    for (; col + 8 <= col_end; col += 8) {
+        uint8_t result = WantAll ? kAllLanes : 0;
+        for (int64_t row = 0; row < d_size; ++row) {
+            const uint8_t nonzero = static_cast<uint8_t>(
+                _mm512_cmp_pd_mask(
+                    _mm512_loadu_pd(input + row * inner + col),
+                    zero, _CMP_NEQ_UQ));
+            if constexpr (WantAll) {
+                result &= nonzero;
+                if (result == 0) break;
+            } else {
+                result |= nonzero;
+                if (result == kAllLanes) break;
+            }
+        }
+        uint8_t reduced[8];
+        for (int lane = 0; lane < 8; ++lane) {
+            reduced[lane] = static_cast<uint8_t>((result >> lane) & 1);
+        }
+        std::memcpy(output + col, reduced, sizeof(reduced));
+    }
+    for (; col < col_end; ++col) {
+        bool value = WantAll;
+        for (int64_t row = 0; row < d_size; ++row) {
+            const bool nonzero = input[row * inner + col] != 0.0;
+            if constexpr (WantAll) {
+                value = value && nonzero;
+                if (!value) break;
+            } else {
+                value = value || nonzero;
+                if (value) break;
+            }
+        }
+        output[col] = static_cast<uint8_t>(value);
+    }
+}
+
+template <bool WantAll>
+static bool try_logical_reduce_dim_avx512(
+    const void* input, bool* output, int64_t outer, int64_t d_size,
+    int64_t inner, DType dt) {
+    if (!reduce_avx512_available() || outer <= 0 || d_size <= 0) return false;
+    if (dt != DType::Float32 && dt != DType::Float64) return false;
+    if (inner <= 0) return true;
+    const int64_t work = outer * inner * d_size;
+    const int64_t vector_width = dt == DType::Float32 ? 16 : 8;
+    const int64_t columns_per_task = std::max<int64_t>(
+        vector_width * 4,
+        ((GRAIN_SIZE / d_size + vector_width * 4 - 1) / (vector_width * 4)) *
+            (vector_width * 4));
+    const int64_t chunks_per_row =
+        (inner + columns_per_task - 1) / columns_per_task;
+    const int64_t task_count = outer * chunks_per_row;
+    auto reduce_tasks = [&](int64_t begin, int64_t end) {
+        uint8_t* output_bytes = reinterpret_cast<uint8_t*>(output);
+        for (int64_t task = begin; task < end; ++task) {
+            const int64_t row = task / chunks_per_row;
+            const int64_t chunk = task - row * chunks_per_row;
+            const int64_t col_begin = chunk * columns_per_task;
+            const int64_t col_end = std::min(inner, col_begin + columns_per_task);
+            if (dt == DType::Float32) {
+                const float* values = static_cast<const float*>(input);
+                logical_reduce_f32_dim_row<WantAll>(
+                    values + row * d_size * inner, output_bytes + row * inner,
+                    d_size, inner, col_begin, col_end);
+            } else {
+                const double* values = static_cast<const double*>(input);
+                logical_reduce_f64_dim_row<WantAll>(
+                    values + row * d_size * inner, output_bytes + row * inner,
+                    d_size, inner, col_begin, col_end);
+            }
+        }
+    };
+    if (work < GRAIN_SIZE || get_num_threads() == 1 || in_parallel_region()) {
+        reduce_tasks(0, task_count);
+    } else {
+        parallel_for(0, task_count, 1, reduce_tasks);
+    }
+    return true;
+}
+
+template <bool WantAll>
+__attribute__((target("avx512f,avx512bw")))
+static void byte_reduce_dim_avx512_row(
+    const uint8_t* input, uint8_t* output, int64_t d_size, int64_t inner,
+    int64_t col_begin, int64_t col_end) {
+    if (inner == 1 && col_begin == 0 && col_end != 0) {
+        output[0] = static_cast<uint8_t>(
+            byte_reduce_avx512_range<WantAll>(input, 0, d_size));
+        return;
+    }
+
+    constexpr uint64_t kAllBytes = 0xffffffffffffffffULL;
+    const __m512i zero = _mm512_setzero_si512();
+    const __m512i one = _mm512_set1_epi8(1);
+    int64_t col = col_begin;
+    for (; col + 256 <= col_end; col += 256) {
+        uint64_t result0 = WantAll ? kAllBytes : 0;
+        uint64_t result1 = WantAll ? kAllBytes : 0;
+        uint64_t result2 = WantAll ? kAllBytes : 0;
+        uint64_t result3 = WantAll ? kAllBytes : 0;
+        for (int64_t row = 0; row < d_size; ++row) {
+            const uint8_t* row_input = input + row * inner + col;
+            const uint64_t zero_mask0 = static_cast<uint64_t>(
+                _mm512_cmpeq_epi8_mask(
+                    _mm512_loadu_si512(row_input), zero));
+            const uint64_t zero_mask1 = static_cast<uint64_t>(
+                _mm512_cmpeq_epi8_mask(
+                    _mm512_loadu_si512(row_input + 64), zero));
+            const uint64_t zero_mask2 = static_cast<uint64_t>(
+                _mm512_cmpeq_epi8_mask(
+                    _mm512_loadu_si512(row_input + 128), zero));
+            const uint64_t zero_mask3 = static_cast<uint64_t>(
+                _mm512_cmpeq_epi8_mask(
+                    _mm512_loadu_si512(row_input + 192), zero));
+            if constexpr (WantAll) {
+                result0 &= ~zero_mask0;
+                result1 &= ~zero_mask1;
+                result2 &= ~zero_mask2;
+                result3 &= ~zero_mask3;
+                if ((result0 | result1 | result2 | result3) == 0) break;
+            } else {
+                result0 |= ~zero_mask0;
+                result1 |= ~zero_mask1;
+                result2 |= ~zero_mask2;
+                result3 |= ~zero_mask3;
+                if ((result0 & result1 & result2 & result3) == kAllBytes) break;
+            }
+        }
+        _mm512_storeu_si512(
+            output + col,
+            _mm512_maskz_mov_epi8(static_cast<__mmask64>(result0), one));
+        _mm512_storeu_si512(
+            output + col + 64,
+            _mm512_maskz_mov_epi8(static_cast<__mmask64>(result1), one));
+        _mm512_storeu_si512(
+            output + col + 128,
+            _mm512_maskz_mov_epi8(static_cast<__mmask64>(result2), one));
+        _mm512_storeu_si512(
+            output + col + 192,
+            _mm512_maskz_mov_epi8(static_cast<__mmask64>(result3), one));
+    }
+    for (; col + 64 <= col_end; col += 64) {
+        uint64_t result = WantAll ? kAllBytes : 0;
+        for (int64_t row = 0; row < d_size; ++row) {
+            const __m512i values = _mm512_loadu_si512(
+                input + row * inner + col);
+            const uint64_t zero_mask = static_cast<uint64_t>(
+                _mm512_cmpeq_epi8_mask(values, zero));
+            if constexpr (WantAll) {
+                result &= ~zero_mask;
+                if (result == 0) break;
+            } else {
+                result |= ~zero_mask;
+                if (result == kAllBytes) break;
+            }
+        }
+        const __m512i reduced = _mm512_maskz_mov_epi8(
+            static_cast<__mmask64>(result), one);
+        _mm512_storeu_si512(output + col, reduced);
+    }
+    for (; col < col_end; ++col) {
+        bool value = WantAll;
+        for (int64_t row = 0; row < d_size; ++row) {
+            const bool nonzero = input[row * inner + col] != 0;
+            if constexpr (WantAll) {
+                value = value && nonzero;
+                if (!value) break;
+            } else {
+                value = value || nonzero;
+                if (value) break;
+            }
+        }
+        output[col] = static_cast<uint8_t>(value);
+    }
+}
+
+template <bool WantAll>
+static bool try_byte_reduce_dim_avx512(
+    const uint8_t* input, bool* output, int64_t outer, int64_t d_size,
+    int64_t inner) {
+    if (!byte_reduce_avx512_available() || outer <= 0 || d_size <= 0) {
+        return false;
+    }
+    if (inner <= 0) return true;
+    const int64_t output_count = outer * inner;
+    const int64_t work = output_count * d_size;
+    constexpr int64_t vector_width = 64;
+    const int64_t columns_per_task = std::max<int64_t>(
+        vector_width * 4,
+        ((GRAIN_SIZE / d_size + vector_width * 4 - 1) / (vector_width * 4)) *
+            (vector_width * 4));
+    const int64_t chunks_per_row =
+        (inner + columns_per_task - 1) / columns_per_task;
+    const int64_t task_count = outer * chunks_per_row;
+    auto reduce_tasks = [&](int64_t begin, int64_t end) {
+        for (int64_t task = begin; task < end; ++task) {
+            const int64_t row_index = task / chunks_per_row;
+            const int64_t chunk = task - row_index * chunks_per_row;
+            const int64_t col_begin = chunk * columns_per_task;
+            const int64_t col_end = std::min(inner, col_begin + columns_per_task);
+            byte_reduce_dim_avx512_row<WantAll>(
+                input + row_index * d_size * inner,
+                reinterpret_cast<uint8_t*>(output) + row_index * inner,
+                d_size, inner, col_begin, col_end);
+        }
+    };
+    if (work < GRAIN_SIZE || get_num_threads() == 1 || in_parallel_region()) {
+        reduce_tasks(0, task_count);
+    } else {
+        parallel_for(0, task_count, 1, reduce_tasks);
+    }
+    return true;
+}
+
+template <bool IsMax>
+__attribute__((target("avx512f")))
+static std::pair<float, int64_t> extremum_f32_row_avx512(
+    const float* input, int64_t n) {
+    constexpr int64_t width = 16;
+    const __m512 lane_values = _mm512_loadu_ps(input);
+    const __mmask16 initial_nan =
+        _mm512_cmp_ps_mask(lane_values, lane_values, _CMP_UNORD_Q);
+    if (initial_nan != 0) {
+        return {std::numeric_limits<float>::quiet_NaN(),
+                static_cast<int64_t>(__builtin_ctz(static_cast<unsigned>(initial_nan)))};
+    }
+    const __m512i lane_indices = _mm512_setr_epi32(
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    __m512 best_values = lane_values;
+    __m512i best_indices = lane_indices;
+    int64_t i = width;
+    for (; i + width <= n; i += width) {
+        const __m512 values = _mm512_loadu_ps(input + i);
+        const __mmask16 nan_mask = _mm512_cmp_ps_mask(values, values, _CMP_UNORD_Q);
+        if (nan_mask != 0) {
+            return {std::numeric_limits<float>::quiet_NaN(),
+                    i + static_cast<int64_t>(__builtin_ctz(static_cast<unsigned>(nan_mask)))};
+        }
+        const __m512i indices = _mm512_add_epi32(
+            lane_indices, _mm512_set1_epi32(static_cast<int>(i)));
+        const __mmask16 better = IsMax
+            ? _mm512_cmp_ps_mask(values, best_values, _CMP_GT_OQ)
+            : _mm512_cmp_ps_mask(values, best_values, _CMP_LT_OQ);
+        best_values = _mm512_mask_blend_ps(better, best_values, values);
+        best_indices = _mm512_mask_blend_epi32(better, best_indices, indices);
+    }
+
+    alignas(64) float values[width];
+    alignas(64) int32_t indices[width];
+    _mm512_storeu_ps(values, best_values);
+    _mm512_storeu_si512(indices, best_indices);
+    float best = values[0];
+    int64_t best_index = indices[0];
+    for (int lane = 1; lane < width; ++lane) {
+        const bool better = IsMax ? values[lane] > best : values[lane] < best;
+        if (better || (values[lane] == best && indices[lane] < best_index)) {
+            best = values[lane];
+            best_index = indices[lane];
+        }
+    }
+    for (; i < n; ++i) {
+        const float value = input[i];
+        if (std::isnan(value)) {
+            return {std::numeric_limits<float>::quiet_NaN(), i};
+        }
+        const bool better = IsMax ? value > best : value < best;
+        if (better || (value == best && i < best_index)) {
+            best = value;
+            best_index = i;
+        }
+    }
+    return {best, best_index};
+}
+
+template <bool IsMax>
+__attribute__((target("avx512f")))
+static std::pair<double, int64_t> extremum_f64_row_avx512(
+    const double* input, int64_t n) {
+    constexpr int64_t width = 8;
+    const __m512d lane_values = _mm512_loadu_pd(input);
+    const __mmask8 initial_nan =
+        _mm512_cmp_pd_mask(lane_values, lane_values, _CMP_UNORD_Q);
+    if (initial_nan != 0) {
+        return {std::numeric_limits<double>::quiet_NaN(),
+                static_cast<int64_t>(__builtin_ctz(static_cast<unsigned>(initial_nan)))};
+    }
+    const __m512i lane_indices = _mm512_setr_epi64(0, 1, 2, 3, 4, 5, 6, 7);
+    __m512d best_values = lane_values;
+    __m512i best_indices = lane_indices;
+    int64_t i = width;
+    for (; i + width <= n; i += width) {
+        const __m512d values = _mm512_loadu_pd(input + i);
+        const __mmask8 nan_mask = _mm512_cmp_pd_mask(values, values, _CMP_UNORD_Q);
+        if (nan_mask != 0) {
+            return {std::numeric_limits<double>::quiet_NaN(),
+                    i + static_cast<int64_t>(__builtin_ctz(static_cast<unsigned>(nan_mask)))};
+        }
+        const __m512i indices = _mm512_add_epi64(
+            lane_indices, _mm512_set1_epi64(i));
+        const __mmask8 better = IsMax
+            ? _mm512_cmp_pd_mask(values, best_values, _CMP_GT_OQ)
+            : _mm512_cmp_pd_mask(values, best_values, _CMP_LT_OQ);
+        best_values = _mm512_mask_blend_pd(better, best_values, values);
+        best_indices = _mm512_mask_blend_epi64(better, best_indices, indices);
+    }
+
+    alignas(64) double values[width];
+    alignas(64) int64_t indices[width];
+    _mm512_storeu_pd(values, best_values);
+    _mm512_storeu_si512(indices, best_indices);
+    double best = values[0];
+    int64_t best_index = indices[0];
+    for (int lane = 1; lane < width; ++lane) {
+        const bool better = IsMax ? values[lane] > best : values[lane] < best;
+        if (better || (values[lane] == best && indices[lane] < best_index)) {
+            best = values[lane];
+            best_index = indices[lane];
+        }
+    }
+    for (; i < n; ++i) {
+        const double value = input[i];
+        if (std::isnan(value)) {
+            return {std::numeric_limits<double>::quiet_NaN(), i};
+        }
+        const bool better = IsMax ? value > best : value < best;
+        if (better || (value == best && i < best_index)) {
+            best = value;
+            best_index = i;
+        }
+    }
+    return {best, best_index};
+}
+
+template <bool IsMax>
+__attribute__((target("avx512f")))
+static std::pair<int32_t, int64_t> extremum_i32_row_avx512(
+    const int32_t* input, int64_t n) {
+    constexpr int64_t width = 16;
+    const __m512i lane_indices = _mm512_setr_epi32(
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    __m512i best_values = _mm512_loadu_si512(input);
+    __m512i best_indices = lane_indices;
+    int64_t i = width;
+    for (; i + width <= n; i += width) {
+        const __m512i values = _mm512_loadu_si512(input + i);
+        const __mmask16 better = IsMax
+            ? _mm512_cmp_epi32_mask(values, best_values, _MM_CMPINT_GT)
+            : _mm512_cmp_epi32_mask(values, best_values, _MM_CMPINT_LT);
+        best_values = _mm512_mask_blend_epi32(better, best_values, values);
+        best_indices = _mm512_mask_blend_epi32(
+            better, best_indices,
+            _mm512_add_epi32(lane_indices, _mm512_set1_epi32(static_cast<int>(i))));
+    }
+    alignas(64) int32_t values[width];
+    alignas(64) int32_t indices[width];
+    _mm512_storeu_si512(values, best_values);
+    _mm512_storeu_si512(indices, best_indices);
+    int32_t best = values[0];
+    int64_t best_index = indices[0];
+    for (int lane = 1; lane < width; ++lane) {
+        const bool better = IsMax ? values[lane] > best : values[lane] < best;
+        if (better || (values[lane] == best && indices[lane] < best_index)) {
+            best = values[lane];
+            best_index = indices[lane];
+        }
+    }
+    for (; i < n; ++i) {
+        const int32_t value = input[i];
+        const bool better = IsMax ? value > best : value < best;
+        if (better || (value == best && i < best_index)) {
+            best = value;
+            best_index = i;
+        }
+    }
+    return {best, best_index};
+}
+
+template <bool IsMax>
+__attribute__((target("avx512f")))
+static std::pair<int64_t, int64_t> extremum_i64_row_avx512(
+    const int64_t* input, int64_t n) {
+    constexpr int64_t width = 8;
+    const __m512i lane_indices = _mm512_setr_epi64(0, 1, 2, 3, 4, 5, 6, 7);
+    __m512i best_values = _mm512_loadu_si512(input);
+    __m512i best_indices = lane_indices;
+    int64_t i = width;
+    for (; i + width <= n; i += width) {
+        const __m512i values = _mm512_loadu_si512(input + i);
+        const __mmask8 better = IsMax
+            ? _mm512_cmp_epi64_mask(values, best_values, _MM_CMPINT_GT)
+            : _mm512_cmp_epi64_mask(values, best_values, _MM_CMPINT_LT);
+        best_values = _mm512_mask_blend_epi64(better, best_values, values);
+        best_indices = _mm512_mask_blend_epi64(
+            better, best_indices, _mm512_add_epi64(lane_indices, _mm512_set1_epi64(i)));
+    }
+    alignas(64) int64_t values[width];
+    alignas(64) int64_t indices[width];
+    _mm512_storeu_si512(values, best_values);
+    _mm512_storeu_si512(indices, best_indices);
+    int64_t best = values[0];
+    int64_t best_index = indices[0];
+    for (int lane = 1; lane < width; ++lane) {
+        const bool better = IsMax ? values[lane] > best : values[lane] < best;
+        if (better || (values[lane] == best && indices[lane] < best_index)) {
+            best = values[lane];
+            best_index = indices[lane];
+        }
+    }
+    for (; i < n; ++i) {
+        const int64_t value = input[i];
+        const bool better = IsMax ? value > best : value < best;
+        if (better || (value == best && i < best_index)) {
+            best = value;
+            best_index = i;
+        }
+    }
+    return {best, best_index};
+}
+
+template <bool IsMax>
+static bool try_extremum_lastdim_real_avx512(
+    const void* xv, void* vv, int64_t* indices, int64_t outer,
+    int64_t d_size, DType dt) {
+    if (!reduce_avx512_available() || d_size < 64 || outer <= 0) return false;
+    const int64_t row_grain = std::max<int64_t>(
+        1, GRAIN_SIZE / std::max<int64_t>(d_size, 1));
+    if (dt == DType::Float32) {
+        const float* input = static_cast<const float*>(xv);
+        float* values = static_cast<float*>(vv);
+        tensorplay::parallel::parallel_for(0, outer, row_grain,
+            [&](int64_t begin, int64_t end) {
+                for (int64_t row = begin; row < end; ++row) {
+                    auto result = extremum_f32_row_avx512<IsMax>(
+                        input + row * d_size, d_size);
+                    values[row] = result.first;
+                    indices[row] = result.second;
+                }
+            });
+        return true;
+    }
+    if (dt == DType::Float64) {
+        const double* input = static_cast<const double*>(xv);
+        double* values = static_cast<double*>(vv);
+        tensorplay::parallel::parallel_for(0, outer, row_grain,
+            [&](int64_t begin, int64_t end) {
+                for (int64_t row = begin; row < end; ++row) {
+                    auto result = extremum_f64_row_avx512<IsMax>(
+                        input + row * d_size, d_size);
+                    values[row] = result.first;
+                    indices[row] = result.second;
+                }
+            });
+        return true;
+    }
+    return false;
+}
+
+template <bool IsMax>
+static bool try_extremum_lastdim_integral_avx512(
+    const Tensor& input, Tensor& values, int64_t* indices, int64_t outer,
+    int64_t d_size) {
+    if (!reduce_avx512_available() || d_size < 64 || outer <= 0 ||
+        !input.is_contiguous() ||
+        (input.dtype() != DType::Int32 && input.dtype() != DType::Int64)) {
+        return false;
+    }
+    const int64_t row_grain = std::max<int64_t>(
+        1, GRAIN_SIZE / std::max<int64_t>(d_size, 1));
+    if (input.dtype() == DType::Int32) {
+        const int32_t* input_data = input.data_ptr<int32_t>();
+        int32_t* output_data = values.data_ptr<int32_t>();
+        parallel_for(0, outer, row_grain, [&](int64_t begin, int64_t end) {
+            for (int64_t row = begin; row < end; ++row) {
+                const auto result = extremum_i32_row_avx512<IsMax>(
+                    input_data + row * d_size, d_size);
+                output_data[row] = result.first;
+                indices[row] = result.second;
+            }
+        });
+    } else {
+        const int64_t* input_data = input.data_ptr<int64_t>();
+        int64_t* output_data = values.data_ptr<int64_t>();
+        parallel_for(0, outer, row_grain, [&](int64_t begin, int64_t end) {
+            for (int64_t row = begin; row < end; ++row) {
+                const auto result = extremum_i64_row_avx512<IsMax>(
+                    input_data + row * d_size, d_size);
+                output_data[row] = result.first;
+                indices[row] = result.second;
+            }
+        });
+    }
+    return true;
+}
+
+__attribute__((target("avx512f")))
+static void sum_f32_leading_range_avx512(
+    const float* input, float* output, int64_t rows, int64_t cols,
+    int64_t begin, int64_t end) {
+    int64_t col = begin;
+    for (; col + 64 <= end; col += 64) {
+        __m512 sum0 = _mm512_setzero_ps();
+        __m512 sum1 = _mm512_setzero_ps();
+        __m512 sum2 = _mm512_setzero_ps();
+        __m512 sum3 = _mm512_setzero_ps();
+        for (int64_t row = 0; row < rows; ++row) {
+            const float* row_input = input + row * cols + col;
+            sum0 = _mm512_add_ps(sum0, _mm512_loadu_ps(row_input));
+            sum1 = _mm512_add_ps(sum1, _mm512_loadu_ps(row_input + 16));
+            sum2 = _mm512_add_ps(sum2, _mm512_loadu_ps(row_input + 32));
+            sum3 = _mm512_add_ps(sum3, _mm512_loadu_ps(row_input + 48));
+        }
+        _mm512_storeu_ps(output + col, sum0);
+        _mm512_storeu_ps(output + col + 16, sum1);
+        _mm512_storeu_ps(output + col + 32, sum2);
+        _mm512_storeu_ps(output + col + 48, sum3);
+    }
+    for (; col + 16 <= end; col += 16) {
+        __m512 sum = _mm512_setzero_ps();
+        for (int64_t row = 0; row < rows; ++row) {
+            sum = _mm512_add_ps(
+                sum, _mm512_loadu_ps(input + row * cols + col));
+        }
+        _mm512_storeu_ps(output + col, sum);
+    }
+    for (; col < end; ++col) {
+        float sum = 0.0f;
+        for (int64_t row = 0; row < rows; ++row) {
+            sum += input[row * cols + col];
+        }
+        output[col] = sum;
+    }
+}
+
+__attribute__((target("avx512f")))
+static void sum_f64_leading_range_avx512(
+    const double* input, double* output, int64_t rows, int64_t cols,
+    int64_t begin, int64_t end) {
+    int64_t col = begin;
+    for (; col + 32 <= end; col += 32) {
+        __m512d sum0 = _mm512_setzero_pd();
+        __m512d sum1 = _mm512_setzero_pd();
+        __m512d sum2 = _mm512_setzero_pd();
+        __m512d sum3 = _mm512_setzero_pd();
+        for (int64_t row = 0; row < rows; ++row) {
+            const double* row_input = input + row * cols + col;
+            sum0 = _mm512_add_pd(sum0, _mm512_loadu_pd(row_input));
+            sum1 = _mm512_add_pd(sum1, _mm512_loadu_pd(row_input + 8));
+            sum2 = _mm512_add_pd(sum2, _mm512_loadu_pd(row_input + 16));
+            sum3 = _mm512_add_pd(sum3, _mm512_loadu_pd(row_input + 24));
+        }
+        _mm512_storeu_pd(output + col, sum0);
+        _mm512_storeu_pd(output + col + 8, sum1);
+        _mm512_storeu_pd(output + col + 16, sum2);
+        _mm512_storeu_pd(output + col + 24, sum3);
+    }
+    for (; col + 8 <= end; col += 8) {
+        __m512d sum = _mm512_setzero_pd();
+        for (int64_t row = 0; row < rows; ++row) {
+            sum = _mm512_add_pd(
+                sum, _mm512_loadu_pd(input + row * cols + col));
+        }
+        _mm512_storeu_pd(output + col, sum);
+    }
+    for (; col < end; ++col) {
+        double sum = 0.0;
+        for (int64_t row = 0; row < rows; ++row) {
+            sum += input[row * cols + col];
+        }
+        output[col] = sum;
+    }
+}
+
+static bool try_sum_dim_real_avx512(
+    const Tensor& input, Tensor& output, int64_t dim) {
+    if (!reduce_avx512_available() || !input.is_contiguous() ||
+        input.numel() == 0 || input.dim() == 0) {
+        return false;
+    }
+    if (input.dtype() != DType::Float32 && input.dtype() != DType::Float64) {
+        return false;
+    }
+
+    const int64_t ndim = input.dim();
+    if (dim == ndim - 1) {
+        const int64_t d_size = input.size(dim);
+        const int64_t vector_width = input.dtype() == DType::Float32 ? 16 : 8;
+        if (d_size < vector_width) return false;
+        const int64_t rows = input.numel() / d_size;
+        const int64_t row_grain = std::max<int64_t>(
+            1, GRAIN_SIZE / std::max<int64_t>(d_size, 1));
+        if (input.dtype() == DType::Float32) {
+            const float* values = input.data_ptr<float>();
+            float* results = output.data_ptr<float>();
+            parallel_for(0, rows, row_grain, [&](int64_t begin, int64_t end) {
+                for (int64_t row = begin; row < end; ++row) {
+                    results[row] = sum_f32_chunk_avx512(
+                        values + row * d_size, 0, d_size);
+                }
+            });
+        } else {
+            const double* values = input.data_ptr<double>();
+            double* results = output.data_ptr<double>();
+            parallel_for(0, rows, row_grain, [&](int64_t begin, int64_t end) {
+                for (int64_t row = begin; row < end; ++row) {
+                    results[row] = sum_f64_chunk_avx512(
+                        values + row * d_size, 0, d_size);
+                }
+            });
+        }
+        return true;
+    }
+
+    if (dim < 0 || dim >= ndim) return false;
+    int64_t outer = 1;
+    for (int64_t i = 0; i < dim; ++i) outer *= input.size(i);
+    const int64_t rows = input.size(dim);
+    const int64_t cols = input.numel() / (outer * rows);
+    const int64_t vector_width = input.dtype() == DType::Float32 ? 16 : 8;
+    const int64_t vector_columns = vector_width * 4;
+    if (cols < vector_width) return false;
+    const int64_t approximate_grain = std::max<int64_t>(
+        1, GRAIN_SIZE / std::max<int64_t>(rows, 1));
+    const int64_t column_grain = std::max<int64_t>(
+        vector_columns,
+        ((approximate_grain + vector_columns - 1) / vector_columns) *
+            vector_columns);
+    if (input.dtype() == DType::Float32) {
+        const float* values = input.data_ptr<float>();
+        float* results = output.data_ptr<float>();
+        const int64_t chunks_per_row =
+            (cols + column_grain - 1) / column_grain;
+        const int64_t task_count = outer * chunks_per_row;
+        auto reduce_tasks = [&](int64_t begin, int64_t end) {
+            for (int64_t task = begin; task < end; ++task) {
+                const int64_t row = task / chunks_per_row;
+                const int64_t chunk = task - row * chunks_per_row;
+                const int64_t col_begin = chunk * column_grain;
+                const int64_t col_end = std::min(cols, col_begin + column_grain);
+                sum_f32_leading_range_avx512(
+                    values + row * rows * cols, results + row * cols,
+                    rows, cols, col_begin, col_end);
+            }
+        };
+        if (input.numel() < GRAIN_SIZE || get_num_threads() == 1 ||
+            in_parallel_region()) {
+            reduce_tasks(0, task_count);
+        } else {
+            parallel_for(0, task_count, 1, reduce_tasks);
+        }
+    } else {
+        const double* values = input.data_ptr<double>();
+        double* results = output.data_ptr<double>();
+        const int64_t chunks_per_row =
+            (cols + column_grain - 1) / column_grain;
+        const int64_t task_count = outer * chunks_per_row;
+        auto reduce_tasks = [&](int64_t begin, int64_t end) {
+            for (int64_t task = begin; task < end; ++task) {
+                const int64_t row = task / chunks_per_row;
+                const int64_t chunk = task - row * chunks_per_row;
+                const int64_t col_begin = chunk * column_grain;
+                const int64_t col_end = std::min(cols, col_begin + column_grain);
+                sum_f64_leading_range_avx512(
+                    values + row * rows * cols, results + row * cols,
+                    rows, cols, col_begin, col_end);
+            }
+        };
+        if (input.numel() < GRAIN_SIZE || get_num_threads() == 1 ||
+            in_parallel_region()) {
+            reduce_tasks(0, task_count);
+        } else {
+            parallel_for(0, task_count, 1, reduce_tasks);
+        }
+    }
+    return true;
+}
+
+__attribute__((target("avx512f")))
+static void product_f32_leading_range_avx512(
+    const float* input, float* output, int64_t rows, int64_t cols,
+    int64_t begin, int64_t end) {
+    int64_t col = begin;
+    for (; col + 64 <= end; col += 64) {
+        __m512 product0 = _mm512_set1_ps(1.0f);
+        __m512 product1 = _mm512_set1_ps(1.0f);
+        __m512 product2 = _mm512_set1_ps(1.0f);
+        __m512 product3 = _mm512_set1_ps(1.0f);
+        for (int64_t row = 0; row < rows; ++row) {
+            const float* row_input = input + row * cols + col;
+            product0 = _mm512_mul_ps(product0, _mm512_loadu_ps(row_input));
+            product1 = _mm512_mul_ps(product1, _mm512_loadu_ps(row_input + 16));
+            product2 = _mm512_mul_ps(product2, _mm512_loadu_ps(row_input + 32));
+            product3 = _mm512_mul_ps(product3, _mm512_loadu_ps(row_input + 48));
+        }
+        _mm512_storeu_ps(output + col, product0);
+        _mm512_storeu_ps(output + col + 16, product1);
+        _mm512_storeu_ps(output + col + 32, product2);
+        _mm512_storeu_ps(output + col + 48, product3);
+    }
+    for (; col + 16 <= end; col += 16) {
+        __m512 product = _mm512_set1_ps(1.0f);
+        for (int64_t row = 0; row < rows; ++row) {
+            product = _mm512_mul_ps(
+                product, _mm512_loadu_ps(input + row * cols + col));
+        }
+        _mm512_storeu_ps(output + col, product);
+    }
+    for (; col < end; ++col) {
+        float product = 1.0f;
+        for (int64_t row = 0; row < rows; ++row) {
+            product *= input[row * cols + col];
+        }
+        output[col] = product;
+    }
+}
+
+__attribute__((target("avx512f")))
+static void product_f64_leading_range_avx512(
+    const double* input, double* output, int64_t rows, int64_t cols,
+    int64_t begin, int64_t end) {
+    int64_t col = begin;
+    for (; col + 32 <= end; col += 32) {
+        __m512d product0 = _mm512_set1_pd(1.0);
+        __m512d product1 = _mm512_set1_pd(1.0);
+        __m512d product2 = _mm512_set1_pd(1.0);
+        __m512d product3 = _mm512_set1_pd(1.0);
+        for (int64_t row = 0; row < rows; ++row) {
+            const double* row_input = input + row * cols + col;
+            product0 = _mm512_mul_pd(product0, _mm512_loadu_pd(row_input));
+            product1 = _mm512_mul_pd(product1, _mm512_loadu_pd(row_input + 8));
+            product2 = _mm512_mul_pd(product2, _mm512_loadu_pd(row_input + 16));
+            product3 = _mm512_mul_pd(product3, _mm512_loadu_pd(row_input + 24));
+        }
+        _mm512_storeu_pd(output + col, product0);
+        _mm512_storeu_pd(output + col + 8, product1);
+        _mm512_storeu_pd(output + col + 16, product2);
+        _mm512_storeu_pd(output + col + 24, product3);
+    }
+    for (; col + 8 <= end; col += 8) {
+        __m512d product = _mm512_set1_pd(1.0);
+        for (int64_t row = 0; row < rows; ++row) {
+            product = _mm512_mul_pd(
+                product, _mm512_loadu_pd(input + row * cols + col));
+        }
+        _mm512_storeu_pd(output + col, product);
+    }
+    for (; col < end; ++col) {
+        double product = 1.0;
+        for (int64_t row = 0; row < rows; ++row) {
+            product *= input[row * cols + col];
+        }
+        output[col] = product;
+    }
+}
+
+static bool try_product_dim_real_avx512(
+    const Tensor& input, Tensor& output, int64_t outer, int64_t d_size,
+    int64_t inner) {
+    if (!reduce_avx512_available() || !input.is_contiguous() ||
+        input.numel() == 0 || input.dim() == 0 || outer <= 0 ||
+        d_size <= 0 || inner < 1 ||
+        (input.dtype() != DType::Float32 && input.dtype() != DType::Float64)) {
+        return false;
+    }
+    const int64_t vector_width = input.dtype() == DType::Float32 ? 16 : 8;
+    const int64_t vector_columns = vector_width * 4;
+    if (inner < vector_width) return false;
+    const int64_t approximate_grain = std::max<int64_t>(
+        1, GRAIN_SIZE / std::max<int64_t>(d_size, 1));
+    const int64_t column_grain = std::max<int64_t>(
+        vector_columns,
+        ((approximate_grain + vector_columns - 1) / vector_columns) *
+            vector_columns);
+    const int64_t chunks_per_row =
+        (inner + column_grain - 1) / column_grain;
+    const int64_t task_count = outer * chunks_per_row;
+    if (input.dtype() == DType::Float32) {
+        const float* values = input.data_ptr<float>();
+        float* results = output.data_ptr<float>();
+        auto reduce_tasks = [&](int64_t begin, int64_t end) {
+            for (int64_t task = begin; task < end; ++task) {
+                const int64_t row = task / chunks_per_row;
+                const int64_t chunk = task - row * chunks_per_row;
+                const int64_t col_begin = chunk * column_grain;
+                const int64_t col_end = std::min(inner, col_begin + column_grain);
+                product_f32_leading_range_avx512(
+                    values + row * d_size * inner, results + row * inner,
+                    d_size, inner, col_begin, col_end);
+            }
+        };
+        if (input.numel() < GRAIN_SIZE || get_num_threads() == 1 ||
+            in_parallel_region()) {
+            reduce_tasks(0, task_count);
+        } else {
+            parallel_for(0, task_count, 1, reduce_tasks);
+        }
+    } else {
+        const double* values = input.data_ptr<double>();
+        double* results = output.data_ptr<double>();
+        auto reduce_tasks = [&](int64_t begin, int64_t end) {
+            for (int64_t task = begin; task < end; ++task) {
+                const int64_t row = task / chunks_per_row;
+                const int64_t chunk = task - row * chunks_per_row;
+                const int64_t col_begin = chunk * column_grain;
+                const int64_t col_end = std::min(inner, col_begin + column_grain);
+                product_f64_leading_range_avx512(
+                    values + row * d_size * inner, results + row * inner,
+                    d_size, inner, col_begin, col_end);
+            }
+        };
+        if (input.numel() < GRAIN_SIZE || get_num_threads() == 1 ||
+            in_parallel_region()) {
+            reduce_tasks(0, task_count);
+        } else {
+            parallel_for(0, task_count, 1, reduce_tasks);
+        }
+    }
+    return true;
+}
+
+template <bool IsMax>
+__attribute__((target("avx512f")))
+static void extremum_i32_dim_row_avx512(
+    const int32_t* input, int32_t* output, int64_t* indices,
+    int64_t d_size, int64_t inner, int64_t col_begin, int64_t col_end) {
+    const __m512i zero_indices = _mm512_setzero_si512();
+    int64_t col = col_begin;
+    for (; col + 16 <= col_end; col += 16) {
+        __m512i best = _mm512_loadu_si512(input + col);
+        __m512i best_indices = zero_indices;
+        for (int64_t row = 1; row < d_size; ++row) {
+            const __m512i values = _mm512_loadu_si512(
+                input + row * inner + col);
+            const __mmask16 better = IsMax
+                ? _mm512_cmp_epi32_mask(values, best, _MM_CMPINT_GT)
+                : _mm512_cmp_epi32_mask(values, best, _MM_CMPINT_LT);
+            best = _mm512_mask_blend_epi32(better, best, values);
+            best_indices = _mm512_mask_blend_epi32(
+                better, best_indices, _mm512_set1_epi32(static_cast<int>(row)));
+        }
+        _mm512_storeu_si512(output + col, best);
+        alignas(64) int32_t index_buffer[16];
+        _mm512_storeu_si512(index_buffer, best_indices);
+        for (int lane = 0; lane < 16; ++lane) {
+            indices[col + lane] = index_buffer[lane];
+        }
+    }
+    for (; col < col_end; ++col) {
+        int32_t best = input[col];
+        int64_t best_index = 0;
+        for (int64_t row = 1; row < d_size; ++row) {
+            const int32_t value = input[row * inner + col];
+            const bool better = IsMax ? value > best : value < best;
+            if (better) {
+                best = value;
+                best_index = row;
+            }
+        }
+        output[col] = best;
+        indices[col] = best_index;
+    }
+}
+
+template <bool IsMax>
+__attribute__((target("avx512f")))
+static void extremum_i64_dim_row_avx512(
+    const int64_t* input, int64_t* output, int64_t* indices,
+    int64_t d_size, int64_t inner, int64_t col_begin, int64_t col_end) {
+    const __m512i zero_indices = _mm512_setzero_si512();
+    int64_t col = col_begin;
+    for (; col + 8 <= col_end; col += 8) {
+        __m512i best = _mm512_loadu_si512(input + col);
+        __m512i best_indices = zero_indices;
+        for (int64_t row = 1; row < d_size; ++row) {
+            const __m512i values = _mm512_loadu_si512(
+                input + row * inner + col);
+            const __mmask8 better = IsMax
+                ? _mm512_cmp_epi64_mask(values, best, _MM_CMPINT_GT)
+                : _mm512_cmp_epi64_mask(values, best, _MM_CMPINT_LT);
+            best = _mm512_mask_blend_epi64(better, best, values);
+            best_indices = _mm512_mask_blend_epi64(
+                better, best_indices, _mm512_set1_epi64(row));
+        }
+        _mm512_storeu_si512(output + col, best);
+        alignas(64) int64_t index_buffer[8];
+        _mm512_storeu_si512(index_buffer, best_indices);
+        for (int lane = 0; lane < 8; ++lane) {
+            indices[col + lane] = index_buffer[lane];
+        }
+    }
+    for (; col < col_end; ++col) {
+        int64_t best = input[col];
+        int64_t best_index = 0;
+        for (int64_t row = 1; row < d_size; ++row) {
+            const int64_t value = input[row * inner + col];
+            const bool better = IsMax ? value > best : value < best;
+            if (better) {
+                best = value;
+                best_index = row;
+            }
+        }
+        output[col] = best;
+        indices[col] = best_index;
+    }
+}
+
+template <bool IsMax>
+static bool try_extremum_integral_dim_avx512(
+    const Tensor& input, Tensor& output, int64_t* indices, int64_t outer,
+    int64_t d_size, int64_t inner) {
+    if (!reduce_avx512_available() || !input.is_contiguous() ||
+        input.numel() == 0 || input.dim() == 0 || outer <= 0 ||
+        d_size <= 0 || inner < 1 ||
+        (input.dtype() != DType::Int32 && input.dtype() != DType::Int64)) {
+        return false;
+    }
+    const int64_t vector_width = input.dtype() == DType::Int32 ? 16 : 8;
+    if (inner < vector_width) return false;
+    const int64_t column_block = vector_width * 4;
+    const int64_t approximate_grain = std::max<int64_t>(
+        1, GRAIN_SIZE / std::max<int64_t>(d_size, 1));
+    const int64_t column_grain = std::max<int64_t>(
+        column_block,
+        ((approximate_grain + column_block - 1) / column_block) * column_block);
+    const int64_t chunks_per_row =
+        (inner + column_grain - 1) / column_grain;
+    const int64_t task_count = outer * chunks_per_row;
+    if (input.dtype() == DType::Int32) {
+        const int32_t* values = input.data_ptr<int32_t>();
+        int32_t* results = output.data_ptr<int32_t>();
+        auto reduce_tasks = [&](int64_t begin, int64_t end) {
+            for (int64_t task = begin; task < end; ++task) {
+                const int64_t row = task / chunks_per_row;
+                const int64_t chunk = task - row * chunks_per_row;
+                const int64_t col_begin = chunk * column_grain;
+                const int64_t col_end = std::min(inner, col_begin + column_grain);
+                extremum_i32_dim_row_avx512<IsMax>(
+                    values + row * d_size * inner,
+                    results + row * inner,
+                    indices + row * inner,
+                    d_size, inner, col_begin, col_end);
+            }
+        };
+        if (input.numel() < GRAIN_SIZE || get_num_threads() == 1 ||
+            in_parallel_region()) {
+            reduce_tasks(0, task_count);
+        } else {
+            parallel_for(0, task_count, 1, reduce_tasks);
+        }
+    } else {
+        const int64_t* values = input.data_ptr<int64_t>();
+        int64_t* results = output.data_ptr<int64_t>();
+        auto reduce_tasks = [&](int64_t begin, int64_t end) {
+            for (int64_t task = begin; task < end; ++task) {
+                const int64_t row = task / chunks_per_row;
+                const int64_t chunk = task - row * chunks_per_row;
+                const int64_t col_begin = chunk * column_grain;
+                const int64_t col_end = std::min(inner, col_begin + column_grain);
+                extremum_i64_dim_row_avx512<IsMax>(
+                    values + row * d_size * inner,
+                    results + row * inner,
+                    indices + row * inner,
+                    d_size, inner, col_begin, col_end);
+            }
+        };
+        if (input.numel() < GRAIN_SIZE || get_num_threads() == 1 ||
+            in_parallel_region()) {
+            reduce_tasks(0, task_count);
+        } else {
+            parallel_for(0, task_count, 1, reduce_tasks);
+        }
+    }
+    return true;
 }
 
 }  // namespace
@@ -561,6 +1937,33 @@ static void sum_kernel_iter(TensorIteratorBase& iter) {
     #undef OP_CASE
 }
 
+template <typename ctype>
+static void product_kernel_vec(TensorIteratorBase& iter) {
+    binary_kernel_reduce_vec(iter,
+        [](ctype a, ctype b) -> ctype { return a * b; },
+        [](Vectorized<ctype> a, Vectorized<ctype> b) { return a * b; },
+        1);
+}
+
+static bool try_product_kernel_vec(TensorIteratorBase& iter) {
+    switch (iter.dtype()) {
+        case DType::Int32:
+            product_kernel_vec<int32_t>(iter);
+            return true;
+        case DType::Int64:
+            product_kernel_vec<int64_t>(iter);
+            return true;
+        case DType::Float32:
+            product_kernel_vec<float>(iter);
+            return true;
+        case DType::Float64:
+            product_kernel_vec<double>(iter);
+            return true;
+        default:
+            return false;
+    }
+}
+
 static bool should_use_acc_buffer(const TensorIteratorBase& iter) {
     if (iter.noutputs() != 1 ||
         !isReducedFloatingType(iter.common_dtype()) ||
@@ -682,7 +2085,7 @@ Tensor sum_dim_kernel_impl(const Tensor& self, const std::vector<int64_t>& dims,
              out_dtype = DType::Int64;
          }
     }
-    
+
     if (dims.empty()) {
         return sum_kernel_impl(self, dtype);
     }
@@ -710,6 +2113,12 @@ Tensor sum_dim_kernel_impl(const Tensor& self, const std::vector<int64_t>& dims,
         }
         if (dims.size() == 1) {
             const int64_t dim = dims[0] < 0 ? dims[0] + ndim : dims[0];
+#if defined(__x86_64__)
+            if (input.dtype() == out_dtype &&
+                try_sum_dim_real_avx512(input, out, dim)) {
+                return out;
+            }
+#endif
             bool handled = false;
             if (out_dtype == DType::Float16) {
                 handled = sum_detail::contiguous_sum_dim<float, Half>(input, out, dim);
@@ -912,6 +2321,248 @@ T get_highest() {
     }
 }
 
+template <bool WantAll>
+bool byte_reduce_parallel(const uint8_t* data, int64_t n) {
+#if defined(__x86_64__)
+    if (byte_reduce_avx512_available() && n >= 64) {
+        return byte_reduce_avx512<WantAll>(data, n);
+    }
+#endif
+
+    auto serial_reduce = [&]() {
+        int64_t i = 0;
+        constexpr uint64_t kOnes = 0x0101010101010101ULL;
+        constexpr uint64_t kHighBits = 0x8080808080808080ULL;
+        for (; i + 8 <= n; i += 8) {
+            uint64_t word;
+            std::memcpy(&word, data + i, sizeof(word));
+            if constexpr (WantAll) {
+                if (((word - kOnes) & ~word & kHighBits) != 0) return false;
+            } else if (word != 0) {
+                return true;
+            }
+        }
+        for (; i < n; ++i) {
+            if constexpr (WantAll) {
+                if (data[i] == 0) return false;
+            } else if (data[i] != 0) {
+                return true;
+            }
+        }
+        return WantAll;
+    };
+
+    if (n < GRAIN_SIZE || get_num_threads() == 1 || in_parallel_region()) {
+        return serial_reduce();
+    }
+
+    const int num_threads = get_num_threads();
+    std::vector<unsigned char> partials(
+        static_cast<size_t>(num_threads), WantAll ? 1 : 0);
+    constexpr uint64_t kOnes = 0x0101010101010101ULL;
+    constexpr uint64_t kHighBits = 0x8080808080808080ULL;
+    parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        int64_t i = begin;
+        for (; i + 8 <= end; i += 8) {
+            uint64_t word;
+            std::memcpy(&word, data + i, sizeof(word));
+            if constexpr (WantAll) {
+                if (((word - kOnes) & ~word & kHighBits) != 0) {
+                    partials[get_thread_num()] = 0;
+                    return;
+                }
+            } else if (word != 0) {
+                partials[get_thread_num()] = 1;
+                return;
+            }
+        }
+        for (; i < end; ++i) {
+            if constexpr (WantAll) {
+                if (data[i] == 0) {
+                    partials[get_thread_num()] = 0;
+                    return;
+                }
+            } else if (data[i] != 0) {
+                partials[get_thread_num()] = 1;
+                return;
+            }
+        }
+    });
+
+    for (unsigned char partial : partials) {
+        if constexpr (WantAll) {
+            if (partial == 0) return false;
+        } else if (partial != 0) {
+            return true;
+        }
+    }
+    return WantAll;
+}
+
+template <typename scalar_t>
+scalar_t product_reduce_parallel(const scalar_t* data, int64_t n) {
+    const scalar_t identity = scalar_t(1);
+    auto serial_reduce = [&]() {
+        scalar_t value = identity;
+        for (int64_t i = 0; i < n; ++i) {
+            Accumulator<scalar_t>::mul(value, data[i]);
+        }
+        return value;
+    };
+
+    if constexpr (std::is_same_v<scalar_t, bool>) {
+        return serial_reduce();
+    } else {
+        if (n < GRAIN_SIZE || get_num_threads() == 1 || in_parallel_region()) {
+            return serial_reduce();
+        }
+
+        const int num_threads = get_num_threads();
+        std::vector<scalar_t> partials(static_cast<size_t>(num_threads), identity);
+        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+            scalar_t local0 = identity;
+            scalar_t local1 = identity;
+            scalar_t local2 = identity;
+            scalar_t local3 = identity;
+            int64_t i = begin;
+            if constexpr (std::is_arithmetic_v<scalar_t>) {
+                for (; i + 3 < end; i += 4) {
+                    Accumulator<scalar_t>::mul(local0, data[i]);
+                    Accumulator<scalar_t>::mul(local1, data[i + 1]);
+                    Accumulator<scalar_t>::mul(local2, data[i + 2]);
+                    Accumulator<scalar_t>::mul(local3, data[i + 3]);
+                }
+            }
+            for (; i < end; ++i) {
+                Accumulator<scalar_t>::mul(local0, data[i]);
+            }
+            Accumulator<scalar_t>::mul(local0, local1);
+            Accumulator<scalar_t>::mul(local0, local2);
+            Accumulator<scalar_t>::mul(local0, local3);
+            Accumulator<scalar_t>::mul(partials[get_thread_num()], local0);
+        });
+
+        scalar_t value = identity;
+        for (const scalar_t partial : partials) {
+            Accumulator<scalar_t>::mul(value, partial);
+        }
+        return value;
+    }
+}
+
+template <typename scalar_t>
+bool all_reduce_parallel(const scalar_t* data, int64_t n) {
+    auto serial_reduce = [&]() {
+        for (int64_t i = 0; i < n; ++i) {
+            if (!static_cast<bool>(data[i])) return false;
+        }
+        return true;
+    };
+
+    if (n < GRAIN_SIZE || get_num_threads() == 1 || in_parallel_region()) {
+        return serial_reduce();
+    }
+
+    const int num_threads = get_num_threads();
+    std::vector<unsigned char> partials(static_cast<size_t>(num_threads), 1);
+    parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        for (int64_t i = begin; i < end; ++i) {
+            if (!static_cast<bool>(data[i])) {
+                partials[get_thread_num()] = 0;
+                break;
+            }
+        }
+    });
+    for (unsigned char partial : partials) {
+        if (partial == 0) return false;
+    }
+    return true;
+}
+
+template <typename scalar_t>
+bool any_reduce_parallel(const scalar_t* data, int64_t n) {
+    auto serial_reduce = [&]() {
+        for (int64_t i = 0; i < n; ++i) {
+            if (static_cast<bool>(data[i])) return true;
+        }
+        return false;
+    };
+
+    if (n < GRAIN_SIZE || get_num_threads() == 1 || in_parallel_region()) {
+        return serial_reduce();
+    }
+
+    const int num_threads = get_num_threads();
+    std::vector<unsigned char> partials(static_cast<size_t>(num_threads), 0);
+    parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        for (int64_t i = begin; i < end; ++i) {
+            if (static_cast<bool>(data[i])) {
+                partials[get_thread_num()] = 1;
+                break;
+            }
+        }
+    });
+    for (unsigned char partial : partials) {
+        if (partial != 0) return true;
+    }
+    return false;
+}
+
+template <typename scalar_t>
+int64_t argmin_reduce_parallel(const scalar_t* data, int64_t n) {
+    auto serial_reduce = [&]() {
+        scalar_t value = get_highest<scalar_t>();
+        int64_t index = 0;
+        for (int64_t i = 0; i < n; ++i) {
+            if (data[i] < value) {
+                value = data[i];
+                index = i;
+            }
+        }
+        return index;
+    };
+
+    if constexpr (std::is_same_v<scalar_t, bool>) {
+        return serial_reduce();
+    } else {
+        if (n < GRAIN_SIZE || get_num_threads() == 1 || in_parallel_region()) {
+            return serial_reduce();
+        }
+
+        const int64_t chunk_count = std::min<int64_t>(32, n);
+        const int64_t chunk_size = (n + chunk_count - 1) / chunk_count;
+        std::vector<scalar_t> chunk_values(
+            static_cast<size_t>(chunk_count), get_highest<scalar_t>());
+        std::vector<int64_t> chunk_indices(static_cast<size_t>(chunk_count), 0);
+        parallel_for(0, chunk_count, 1, [&](int64_t begin, int64_t end) {
+            for (int64_t chunk = begin; chunk < end; ++chunk) {
+                const int64_t lo = chunk * chunk_size;
+                const int64_t hi = std::min(n, lo + chunk_size);
+                scalar_t value = get_highest<scalar_t>();
+                int64_t index = lo;
+                for (int64_t i = lo; i < hi; ++i) {
+                    if (data[i] < value) {
+                        value = data[i];
+                        index = i;
+                    }
+                }
+                chunk_values[static_cast<size_t>(chunk)] = value;
+                chunk_indices[static_cast<size_t>(chunk)] = index;
+            }
+        });
+
+        scalar_t value = get_highest<scalar_t>();
+        int64_t index = 0;
+        for (int64_t chunk = 0; chunk < chunk_count; ++chunk) {
+            if (chunk_values[static_cast<size_t>(chunk)] < value) {
+                value = chunk_values[static_cast<size_t>(chunk)];
+                index = chunk_indices[static_cast<size_t>(chunk)];
+            }
+        }
+        return index;
+    }
+}
+
 // returns NaN when any element is NaN), plain compare otherwise.
 template <typename T>
 inline T nan_max(T a, T b) {
@@ -1015,6 +2666,22 @@ std::tuple<Tensor, Tensor> max_dim_kernel_impl(const Tensor& self, int64_t dim0,
     std::vector<int64_t> out_shape = compute_reduction_shape(sc, {dim}, keepdim);
     Tensor vals = Tensor::empty(out_shape, sc.dtype(), sc.device());
     Tensor idxs = Tensor::empty(out_shape, DType::Int64, sc.device());
+
+#if defined(__x86_64__)
+    if (inner == 1 && try_extremum_lastdim_real_avx512<true>(
+            sc.data_ptr(), vals.data_ptr(), idxs.data_ptr<int64_t>(), outer, d_size,
+            sc.dtype())) {
+        return {vals, idxs};
+    }
+    if (inner == 1 && try_extremum_lastdim_integral_avx512<true>(
+            sc, vals, idxs.data_ptr<int64_t>(), outer, d_size)) {
+        return {vals, idxs};
+    }
+    if (try_extremum_integral_dim_avx512<true>(
+            sc, vals, idxs.data_ptr<int64_t>(), outer, d_size, inner)) {
+        return {vals, idxs};
+    }
+#endif
 
     // With the reduced dim removed (or sized 1 under keepdim), the output is
     // a contiguous [outer, inner] grid and line i lives at o*d_size*inner +
@@ -1132,6 +2799,22 @@ std::tuple<Tensor, Tensor> min_dim_kernel_impl(const Tensor& self, int64_t dim0,
     Tensor vals = Tensor::empty(out_shape, sc.dtype(), sc.device());
     Tensor idxs = Tensor::empty(out_shape, DType::Int64, sc.device());
 
+#if defined(__x86_64__)
+    if (inner == 1 && try_extremum_lastdim_real_avx512<false>(
+            sc.data_ptr(), vals.data_ptr(), idxs.data_ptr<int64_t>(), outer, d_size,
+            sc.dtype())) {
+        return {vals, idxs};
+    }
+    if (inner == 1 && try_extremum_lastdim_integral_avx512<false>(
+            sc, vals, idxs.data_ptr<int64_t>(), outer, d_size)) {
+        return {vals, idxs};
+    }
+    if (try_extremum_integral_dim_avx512<false>(
+            sc, vals, idxs.data_ptr<int64_t>(), outer, d_size, inner)) {
+        return {vals, idxs};
+    }
+#endif
+
 #define TP_MIN_DIM_CASE(ctype, name_)                                                   \
     case DType::name_: {                                                                \
         const ctype* sp = sc.data_ptr<ctype>();                                         \
@@ -1188,21 +2871,40 @@ Tensor prod_kernel_impl(const Tensor& self, DType dtype) {
          }
     }
     
-    Tensor out = Tensor::zeros({}, out_dtype, self.device());
+    Tensor out = Tensor::empty({}, out_dtype, self.device());
     
     Tensor self_contig = self.contiguous();
     if (self_contig.dtype() != out_dtype) {
         self_contig = self_contig.to(out_dtype);
+    }
+
+#if defined(__x86_64__)
+    if (self_contig.is_contiguous() && self_contig.numel() > 0) {
+        double product = 1.0;
+        if (try_product_real_avx512(self_contig.data_ptr(), self_contig.numel(),
+                                    self_contig.dtype(), &product)) {
+            if (self_contig.dtype() == DType::Float32) {
+                out.fill_(Scalar(static_cast<float>(product)));
+            } else {
+                out.fill_(Scalar(product));
+            }
+            return out;
+        }
+    }
+#endif
+
+    if (self_contig.numel() > 0) {
+        TensorIterator iter = TensorIterator::reduce_op(out, self_contig);
+        if (try_product_kernel_vec(iter)) return out;
     }
     
     #define OP_CASE(ctype, name) \
     case DType::name: { \
         /* direct-init works for both scalars (T(1)) and complex types
            (complex<T>(T(1))); plain `= 1` breaks reduced complexes */ \
-        ctype prod_val = ctype(1); \
         ctype* data = self_contig.data_ptr<ctype>(); \
         int64_t n = self_contig.numel(); \
-        for(int64_t i=0; i<n; ++i) Accumulator<ctype>::mul(prod_val, data[i]); \
+        ctype prod_val = product_reduce_parallel(data, n); \
         out.fill_(to_scalar(prod_val)); \
         break; \
     }
@@ -1230,13 +2932,76 @@ Tensor prod_dim_kernel_impl(const Tensor& self, const std::vector<int64_t>& dims
     }
     
     std::vector<int64_t> out_shape = compute_reduction_shape(self, dims, keepdim);
-    Tensor out = Tensor::ones(out_shape, out_dtype, self.device());
+    Tensor out = Tensor::empty(out_shape, out_dtype, self.device());
     
     Tensor self_in = self;
     if (self.dtype() != out_dtype) {
         self_in = self.to(out_dtype);
     }
+
+    if (dims.size() == 1) {
+        int64_t dim = dims[0];
+        if (dim < 0) dim += self_in.dim();
+        Tensor input = self_in.contiguous();
+        std::vector<int64_t> shape = static_cast<std::vector<int64_t>>(input.shape());
+        const int64_t d_size = shape[dim];
+        if (d_size == 0) {
+            out.fill_(Scalar(1));
+            return out;
+        }
+        int64_t outer = 1, inner = 1;
+        for (int64_t i = 0; i < dim; ++i) outer *= shape[i];
+        for (int64_t i = dim + 1; i < input.dim(); ++i) inner *= shape[i];
+
+#if defined(__x86_64__)
+        if (inner == 1 && try_product_lastdim_real_avx512(
+                input.data_ptr(), out.data_ptr(), outer, d_size, input.dtype())) {
+            return out;
+        }
+        if (input.dtype() == out_dtype &&
+            try_product_dim_real_avx512(input, out, outer, d_size, inner)) {
+            return out;
+        }
+#endif
+
+        if (d_size >= 16) {
+            std::vector<bool> mask(input.dim(), false);
+            mask[dim] = true;
+            Tensor viewed = review_reduce_result(out, input.dim(), mask, keepdim);
+            TensorIterator iter = TensorIterator::reduce_op(viewed, input);
+            if (try_product_kernel_vec(iter)) return out;
+        }
+
+#define TP_PROD_DIM_FAST_CASE(ctype, name) \
+        case DType::name: { \
+            const ctype* input_data = input.data_ptr<ctype>(); \
+            ctype* output_data = out.data_ptr<ctype>(); \
+            const int64_t line_grain = std::max<int64_t>(1, GRAIN_SIZE / d_size); \
+            parallel_for(0, outer * inner, line_grain, [&](int64_t begin, int64_t end) { \
+                for (int64_t flat = begin; flat < end; ++flat) { \
+                    const int64_t outer_index = flat / inner; \
+                    const int64_t inner_index = flat % inner; \
+                    const ctype* line = input_data + \
+                        outer_index * d_size * inner + inner_index; \
+                    ctype value = ctype(1); \
+                    for (int64_t i = 0; i < d_size; ++i) { \
+                        Accumulator<ctype>::mul(value, line[i * inner]); \
+                    } \
+                    output_data[flat] = value; \
+                } \
+            }); \
+            break; \
+        }
+        switch (out_dtype) {
+            TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_PROD_DIM_FAST_CASE)
+            default: TP_THROW(NotImplementedError, "prod_dim not implemented for this dtype");
+        }
+#undef TP_PROD_DIM_FAST_CASE
+        return out;
+    }
     
+    out.fill_(Scalar(1));
+
     std::vector<int64_t> inp_strides = static_cast<std::vector<int64_t>>(self_in.strides());
     std::vector<int64_t> out_strides = static_cast<std::vector<int64_t>>(out.strides());
     std::vector<int64_t> inp_shape = static_cast<std::vector<int64_t>>(self_in.shape());
@@ -1295,14 +3060,28 @@ Tensor prod_dim_kernel_impl(const Tensor& self, const std::vector<int64_t>& dims
 Tensor all_kernel_impl(const Tensor& self) {
     Tensor out = Tensor::zeros({}, DType::Bool, self.device());
     Tensor self_contig = self.contiguous();
+
+#if defined(__x86_64__)
+    if (self_contig.dtype() == DType::Float32 ||
+        self_contig.dtype() == DType::Float64) {
+        const bool value = logical_reduce_full_avx512<true>(
+            self_contig.data_ptr(), self_contig.numel(), self_contig.dtype());
+        if (reduce_avx512_available()) {
+            out.fill_(Scalar(value));
+            return out;
+        }
+    }
+#endif
     
     #define OP_CASE(ctype, name) \
     case DType::name: { \
-        bool val = true; \
         const ctype* data = self_contig.data_ptr<ctype>(); \
         int64_t n = self_contig.numel(); \
-        for(int64_t i=0; i<n; ++i) { \
-            if (!static_cast<bool>(data[i])) { val = false; break; } \
+        bool val; \
+        if constexpr (sizeof(ctype) == 1) { \
+            val = byte_reduce_parallel<true>(reinterpret_cast<const uint8_t*>(data), n); \
+        } else { \
+            val = all_reduce_parallel(data, n); \
         } \
         out.fill_(Scalar(val)); \
         break; \
@@ -1319,14 +3098,28 @@ Tensor all_kernel_impl(const Tensor& self) {
 Tensor any_kernel_impl(const Tensor& self) {
     Tensor out = Tensor::zeros({}, DType::Bool, self.device());
     Tensor self_contig = self.contiguous();
+
+#if defined(__x86_64__)
+    if (self_contig.dtype() == DType::Float32 ||
+        self_contig.dtype() == DType::Float64) {
+        const bool value = logical_reduce_full_avx512<false>(
+            self_contig.data_ptr(), self_contig.numel(), self_contig.dtype());
+        if (reduce_avx512_available()) {
+            out.fill_(Scalar(value));
+            return out;
+        }
+    }
+#endif
     
     #define OP_CASE(ctype, name) \
     case DType::name: { \
-        bool val = false; \
         const ctype* data = self_contig.data_ptr<ctype>(); \
         int64_t n = self_contig.numel(); \
-        for(int64_t i=0; i<n; ++i) { \
-            if (static_cast<bool>(data[i])) { val = true; break; } \
+        bool val; \
+        if constexpr (sizeof(ctype) == 1) { \
+            val = byte_reduce_parallel<false>(reinterpret_cast<const uint8_t*>(data), n); \
+        } else { \
+            val = any_reduce_parallel(data, n); \
         } \
         out.fill_(Scalar(val)); \
         break; \
@@ -1345,6 +3138,67 @@ Tensor all_dim_kernel_impl(const Tensor& self, const std::vector<int64_t>& dims,
     
     std::vector<int64_t> out_shape = compute_reduction_shape(self, dims, keepdim);
     Tensor out = Tensor::ones(out_shape, DType::Bool, self.device()); // Init with True
+
+    if (dims.size() == 1) {
+        int64_t dim = dims[0];
+        if (dim < 0) dim += self.dim();
+        Tensor input = self.contiguous();
+        std::vector<int64_t> shape = static_cast<std::vector<int64_t>>(input.shape());
+        const int64_t d_size = shape[dim];
+        if (d_size == 0) return out;
+        int64_t outer = 1, inner = 1;
+        for (int64_t i = 0; i < dim; ++i) outer *= shape[i];
+        for (int64_t i = dim + 1; i < input.dim(); ++i) inner *= shape[i];
+
+#if defined(__x86_64__)
+        if ((self.dtype() == DType::Float32 || self.dtype() == DType::Float64) &&
+            try_logical_reduce_dim_avx512<true>(
+                input.data_ptr(), out.data_ptr<bool>(), outer, d_size, inner,
+                self.dtype())) {
+            return out;
+        }
+#endif
+
+#if defined(__x86_64__)
+        if ((self.dtype() == DType::UInt8 || self.dtype() == DType::Int8 ||
+             self.dtype() == DType::Bool) &&
+            try_byte_reduce_dim_avx512<true>(
+                input.data_ptr<uint8_t>(), out.data_ptr<bool>(), outer, d_size,
+                inner)) {
+            return out;
+        }
+#endif
+
+#define TP_ALL_DIM_FAST_CASE(ctype, name) \
+        case DType::name: { \
+            const ctype* input_data = input.data_ptr<ctype>(); \
+            bool* output_data = out.data_ptr<bool>(); \
+            const int64_t line_grain = std::max<int64_t>(1, GRAIN_SIZE / d_size); \
+            parallel_for(0, outer * inner, line_grain, [&](int64_t begin, int64_t end) { \
+                for (int64_t flat = begin; flat < end; ++flat) { \
+                    const int64_t outer_index = flat / inner; \
+                    const int64_t inner_index = flat % inner; \
+                    const ctype* line = input_data + \
+                        outer_index * d_size * inner + inner_index; \
+                    bool value = true; \
+                    for (int64_t i = 0; i < d_size; ++i) { \
+                        if (!static_cast<bool>(line[i * inner])) { \
+                            value = false; \
+                            break; \
+                        } \
+                    } \
+                    output_data[flat] = value; \
+                } \
+            }); \
+            break; \
+        }
+        switch (self.dtype()) {
+            TENSORPLAY_FORALL_SCALAR_TYPES(TP_ALL_DIM_FAST_CASE)
+            default: TP_THROW(NotImplementedError, "all_dim not implemented for this dtype");
+        }
+#undef TP_ALL_DIM_FAST_CASE
+        return out;
+    }
     
     std::vector<int64_t> inp_strides = static_cast<std::vector<int64_t>>(self.strides());
     std::vector<int64_t> out_strides = static_cast<std::vector<int64_t>>(out.strides());
@@ -1402,6 +3256,67 @@ Tensor any_dim_kernel_impl(const Tensor& self, const std::vector<int64_t>& dims,
     
     std::vector<int64_t> out_shape = compute_reduction_shape(self, dims, keepdim);
     Tensor out = Tensor::zeros(out_shape, DType::Bool, self.device()); // Init with False
+
+    if (dims.size() == 1) {
+        int64_t dim = dims[0];
+        if (dim < 0) dim += self.dim();
+        Tensor input = self.contiguous();
+        std::vector<int64_t> shape = static_cast<std::vector<int64_t>>(input.shape());
+        const int64_t d_size = shape[dim];
+        if (d_size == 0) return out;
+        int64_t outer = 1, inner = 1;
+        for (int64_t i = 0; i < dim; ++i) outer *= shape[i];
+        for (int64_t i = dim + 1; i < input.dim(); ++i) inner *= shape[i];
+
+#if defined(__x86_64__)
+        if ((self.dtype() == DType::Float32 || self.dtype() == DType::Float64) &&
+            try_logical_reduce_dim_avx512<false>(
+                input.data_ptr(), out.data_ptr<bool>(), outer, d_size, inner,
+                self.dtype())) {
+            return out;
+        }
+#endif
+
+#if defined(__x86_64__)
+        if ((self.dtype() == DType::UInt8 || self.dtype() == DType::Int8 ||
+             self.dtype() == DType::Bool) &&
+            try_byte_reduce_dim_avx512<false>(
+                input.data_ptr<uint8_t>(), out.data_ptr<bool>(), outer, d_size,
+                inner)) {
+            return out;
+        }
+#endif
+
+#define TP_ANY_DIM_FAST_CASE(ctype, name) \
+        case DType::name: { \
+            const ctype* input_data = input.data_ptr<ctype>(); \
+            bool* output_data = out.data_ptr<bool>(); \
+            const int64_t line_grain = std::max<int64_t>(1, GRAIN_SIZE / d_size); \
+            parallel_for(0, outer * inner, line_grain, [&](int64_t begin, int64_t end) { \
+                for (int64_t flat = begin; flat < end; ++flat) { \
+                    const int64_t outer_index = flat / inner; \
+                    const int64_t inner_index = flat % inner; \
+                    const ctype* line = input_data + \
+                        outer_index * d_size * inner + inner_index; \
+                    bool value = false; \
+                    for (int64_t i = 0; i < d_size; ++i) { \
+                        if (static_cast<bool>(line[i * inner])) { \
+                            value = true; \
+                            break; \
+                        } \
+                    } \
+                    output_data[flat] = value; \
+                } \
+            }); \
+            break; \
+        }
+        switch (self.dtype()) {
+            TENSORPLAY_FORALL_SCALAR_TYPES(TP_ANY_DIM_FAST_CASE)
+            default: TP_THROW(NotImplementedError, "any_dim not implemented for this dtype");
+        }
+#undef TP_ANY_DIM_FAST_CASE
+        return out;
+    }
     
     std::vector<int64_t> inp_strides = static_cast<std::vector<int64_t>>(self.strides());
     std::vector<int64_t> out_strides = static_cast<std::vector<int64_t>>(out.strides());
@@ -1585,10 +3500,7 @@ Tensor argmin_kernel_impl(const Tensor& self, std::optional<int64_t> dim, bool k
         case DType::name: { \
             const ctype* data = self_contig.data_ptr<ctype>(); \
             int64_t n = self_contig.numel(); \
-            ctype min_val = get_highest<ctype>(); \
-            for(int64_t i=0; i<n; ++i) { \
-                if (data[i] < min_val) { min_val = data[i]; min_idx = i; } \
-            } \
+            min_idx = argmin_reduce_parallel(data, n); \
             break; \
         }
         
@@ -1605,41 +3517,54 @@ Tensor argmin_kernel_impl(const Tensor& self, std::optional<int64_t> dim, bool k
     
     int64_t d = dim.value();
     if (d < 0) d += self.dim();
+    TP_CHECK(d >= 0 && d < self.dim(),
+             "Dimension out of range (expected to be in range of [-", self.dim(), ", ",
+             self.dim() - 1, "], but got ", dim.value(), ")");
     if (self.size(d) == 0) {
         TP_THROW(IndexError, "argmin(): Expected reduction dim ", d, " to have non-zero size.");
     }
-    
-    // Transpose d to end, reshape to (-1, size), find min idx per row
-    Tensor t = self.transpose(d, -1);
-    t = t.contiguous(); 
-    
-    int64_t size = t.size(-1);
-    int64_t n_rows = t.numel() / size;
+
+    Tensor sc = self.contiguous();
+    std::vector<int64_t> in_shape = static_cast<std::vector<int64_t>>(sc.shape());
+    const int64_t d_size = in_shape[d];
+    int64_t outer = 1, inner = 1;
+    for (int64_t i = 0; i < d; ++i) outer *= in_shape[i];
+    for (int64_t i = d + 1; i < sc.dim(); ++i) inner *= in_shape[i];
     
     std::vector<int64_t> out_shape = compute_reduction_shape(self, {d}, keepdim);
     Tensor out = Tensor::empty(out_shape, DType::Int64, self.device());
     int64_t* out_data = out.data_ptr<int64_t>();
     
-    #define OP_CASE(ctype, name) \
+#define TP_ARGMIN_DIM_CASE(ctype, name) \
     case DType::name: { \
-        const ctype* data = t.data_ptr<ctype>(); \
-        for(int64_t i=0; i<n_rows; ++i) { \
-            ctype min_val = get_highest<ctype>(); \
-            int64_t min_idx = 0; \
-            for(int64_t j=0; j<size; ++j) { \
-                ctype val = data[i*size + j]; \
-                if (val < min_val) { min_val = val; min_idx = j; } \
+        const ctype* data = sc.data_ptr<ctype>(); \
+        const int64_t line_grain = std::max<int64_t>(1, GRAIN_SIZE / d_size); \
+        parallel_for(0, outer * inner, line_grain, [&](int64_t begin, int64_t end) { \
+            for (int64_t flat = begin; flat < end; ++flat) { \
+                const int64_t outer_index = flat / inner; \
+                const int64_t inner_index = flat % inner; \
+                const ctype* line = data + \
+                    outer_index * d_size * inner + inner_index; \
+                ctype value = get_highest<ctype>(); \
+                int64_t index = 0; \
+                for (int64_t i = 0; i < d_size; ++i) { \
+                    const ctype candidate = line[i * inner]; \
+                    if (candidate < value) { \
+                        value = candidate; \
+                        index = i; \
+                    } \
+                } \
+                out_data[flat] = index; \
             } \
-            out_data[i] = min_idx; \
-        } \
+        }); \
         break; \
     }
     
     switch (self.dtype()) {
-        TENSORPLAY_FORALL_SCALAR_TYPES(OP_CASE)
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_ARGMIN_DIM_CASE)
         default: TP_THROW(NotImplementedError, "argmin not implemented for this dtype");
     }
-    #undef OP_CASE
+#undef TP_ARGMIN_DIM_CASE
     
     return out;
 }

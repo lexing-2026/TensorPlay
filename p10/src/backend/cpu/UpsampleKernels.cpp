@@ -1,14 +1,5 @@
 // Upsampling kernels.
 //
-// counterpart frame kernel; citations at each site:
-//     compute_scales_value / area_pixel_compute_scale /
-//     area_pixel_compute_source_index / nearest_neighbor_compute_source_index
-//     nearest_neighbor_bw_compute_source_index
-//     upsample_nearest2d_out_frame / upsample_nearest2d_backward_out_frame
-//     upsample_bilinear2d_out_frame / upsample_bilinear2d_backward_out_frame
-//     upsample_bicubic2d_out_frame / upsample_bicubic2d_backward_out_frame
-//     upsample_trilinear3d_out_frame / upsample_trilinear3d_backward_out_frame
-//
 // Tensors must be contiguous NCW / NCHW / NCDHW.  The linear/bicubic backwards
 // distribute output gradients to input pixels serially on CPU; this matches
 // the atomicAdd semantics of the CUDA kernels.
@@ -17,6 +8,7 @@
 #include "Dispatcher.h"
 #include "Utils.h"
 #include "Parallel.h"
+#include "tensorplay/ops/TPXOpsGenerated.h"
 #include <cmath>
 #include <algorithm>
 
@@ -27,7 +19,8 @@ using namespace tensorplay::parallel;
 namespace {
 
 // ---------------------------------------------------------------------------
-// UpSample.h index/weight helpers (float scale path; double tensors compute
+// Shared index/weight helpers (float scale path; double tensors compute in
+// double).
 // ---------------------------------------------------------------------------
 
 inline float compute_scales_value_f(const std::optional<double>& scale,
@@ -68,14 +61,14 @@ inline float area_pixel_compute_source_index_f(float scale, int64_t dst_index,
     return (!cubic && src_idx < 0.f) ? 0.f : src_idx;
 }
 
-// OpenCV INTER_NEAREST semantics, kept for BC (UpSample.h).
+// OpenCV INTER_NEAREST semantics, kept for BC.
 inline int64_t nearest_neighbor_compute_source_index(float scale, int64_t dst_index,
                                                      int64_t input_size) {
     return std::min(static_cast<int64_t>(std::floor(static_cast<float>(dst_index) * scale)),
                     input_size - 1);
 }
 
-// UpSample.cuh nearest_neighbor_bw_compute_source_index.
+// Backward nearest index: ceil semantics.
 inline int nearest_neighbor_bw_compute_source_index(float scale, int dst_index,
                                                     int output_size) {
     int src_index = std::min(static_cast<int>(std::ceil(static_cast<float>(dst_index) * scale)),
@@ -83,7 +76,16 @@ inline int nearest_neighbor_bw_compute_source_index(float scale, int dst_index,
     return src_index;
 }
 
-// UpSample.h cubic machinery (A = -0.75).
+// nearest-exact source index: source = floor(scale * (dst + 0.5)) clamped to
+// [0, input_size-1].  The +0.5 centers the window on the source pixel, so
+// upscales shift by half a pixel compared to the OpenCV nearest mode.
+inline int64_t nearest_exact_compute_source_index(float scale, int64_t dst_index,
+                                                  int64_t input_size) {
+    return std::min(static_cast<int64_t>(std::floor(scale * (static_cast<float>(dst_index) + 0.5f))),
+                    input_size - 1);
+}
+
+// Cubic convolution machinery (A = -0.75).
 template <typename scalar_t>
 inline scalar_t cubic_convolution1(scalar_t x, scalar_t A) {
     return ((A + 2) * x - (A + 3)) * x * x + 1;
@@ -865,7 +867,605 @@ Tensor upsample_bicubic2d_backward_cpu(const Tensor& grad_output, std::vector<in
     return grad_input;
 }
 
-#undef UP_DISPATCH
+// ---------------------------------------------------------------------------
+// nearest-exact upsampling (Pillow / Scikit-Image convention).
+//
+// Forward gathers: every output pixel copies input[floor(scale*(i+0.5))].
+// Backward is the exact adjoint: an input pixel j owns the contiguous output
+// range where floor(scale*(i+0.5)) == j, found by lower_bound on the shared
+// forward index table (race-free per-plane gather).
+// ---------------------------------------------------------------------------
+
+Tensor _upsample_nearest_exact1d_cpu(const Tensor& self, std::vector<int64_t> output_size,
+                                     std::optional<double> scales) {
+    Tensor in = self.is_contiguous() ? self : self.contiguous();
+    Tensor result = Tensor::empty(out_shape(in, output_size), in.dtype(), in.device());
+    const int64_t N = in.size(0), C = in.size(1);
+    const int64_t W1 = in.size(2), W2 = output_size[0];
+    if (in.numel() == 0 || W2 == 0) return result;
+
+    UP_DISPATCH(in, {
+        const scalar_t* idata = in.data_ptr<scalar_t>();
+        scalar_t* odata = result.data_ptr<scalar_t>();
+        const float width_scale = compute_scales_value_f(scales, W1, W2);
+        parallel_for(0, N * C * W2, 1, [&](int64_t begin, int64_t end) {
+            for (int64_t it = begin; it < end; ++it) {
+                const int64_t w2 = it % W2;
+                const int64_t nc = it / W2;
+                const int64_t w1 = nearest_exact_compute_source_index(width_scale, w2, W1);
+                odata[it] = idata[nc * W1 + w1];
+            }
+        });
+    });
+    return result;
+}
+
+Tensor _upsample_nearest_exact2d_cpu(const Tensor& self, std::vector<int64_t> output_size,
+                                     std::optional<double> scales_h, std::optional<double> scales_w) {
+    Tensor in = self.is_contiguous() ? self : self.contiguous();
+    Tensor result = Tensor::empty(out_shape(in, output_size), in.dtype(), in.device());
+    const int64_t N = in.size(0), C = in.size(1);
+    const int64_t H1 = in.size(2), W1 = in.size(3);
+    const int64_t H2 = output_size[0], W2 = output_size[1];
+    if (in.numel() == 0 || H2 == 0 || W2 == 0) return result;
+
+    UP_DISPATCH(in, {
+        const scalar_t* idata = in.data_ptr<scalar_t>();
+        scalar_t* odata = result.data_ptr<scalar_t>();
+        const float height_scale = compute_scales_value_f(scales_h, H1, H2);
+        const float width_scale = compute_scales_value_f(scales_w, W1, W2);
+        parallel_for(0, N * C * H2, 1, [&](int64_t begin, int64_t end) {
+            for (int64_t idx = begin; idx < end; ++idx) {
+                const int64_t h2 = idx % H2;
+                const int64_t nc = idx / H2;
+                const int64_t h1 = nearest_exact_compute_source_index(height_scale, h2, H1);
+                const scalar_t* src_row = idata + (nc * H1 + h1) * W1;
+                scalar_t* dst_row = odata + idx * W2;
+                for (int64_t w2 = 0; w2 < W2; ++w2) {
+                    const int64_t w1 = nearest_exact_compute_source_index(width_scale, w2, W1);
+                    dst_row[w2] = src_row[w1];
+                }
+            }
+        });
+    });
+    return result;
+}
+
+Tensor _upsample_nearest_exact3d_cpu(const Tensor& self, std::vector<int64_t> output_size,
+                                     std::optional<double> scales_d, std::optional<double> scales_h,
+                                     std::optional<double> scales_w) {
+    Tensor in = self.is_contiguous() ? self : self.contiguous();
+    Tensor result = Tensor::empty(out_shape(in, output_size), in.dtype(), in.device());
+    const int64_t N = in.size(0), C = in.size(1);
+    const int64_t D1 = in.size(2), H1 = in.size(3), W1 = in.size(4);
+    const int64_t D2 = output_size[0], H2 = output_size[1], W2 = output_size[2];
+    if (in.numel() == 0 || D2 == 0 || H2 == 0 || W2 == 0) return result;
+
+    UP_DISPATCH(in, {
+        const scalar_t* idata = in.data_ptr<scalar_t>();
+        scalar_t* odata = result.data_ptr<scalar_t>();
+        const float depth_scale = compute_scales_value_f(scales_d, D1, D2);
+        const float height_scale = compute_scales_value_f(scales_h, H1, H2);
+        const float width_scale = compute_scales_value_f(scales_w, W1, W2);
+        parallel_for(0, N * C * D2 * H2, 1, [&](int64_t begin, int64_t end) {
+            for (int64_t idx = begin; idx < end; ++idx) {
+                const int64_t h2 = idx % H2;
+                const int64_t d2 = (idx / H2) % D2;
+                const int64_t nc = idx / (H2 * D2);
+                const int64_t d1 = nearest_exact_compute_source_index(depth_scale, d2, D1);
+                const int64_t h1 = nearest_exact_compute_source_index(height_scale, h2, H1);
+                const scalar_t* src_plane = idata + (nc * D1 + d1) * H1 * W1 + h1 * W1;
+                scalar_t* dst_plane = odata + idx * W2;
+                for (int64_t w2 = 0; w2 < W2; ++w2) {
+                    const int64_t w1 = nearest_exact_compute_source_index(width_scale, w2, W1);
+                    dst_plane[w2] = src_plane[w1];
+                }
+            }
+        });
+    });
+    return result;
+}
+
+
+// nearest-exact backward: exact adjoint of the forward index map.  Per input
+// index j, the owning output range is the preimage of j under
+// floor(scale*(i+0.5)); since the map is nondecreasing, the range is found by
+// lower_bound on the shared forward index table (race-free per-plane gather).
+Tensor _upsample_nearest_exact1d_backward_cpu(const Tensor& grad_output, std::vector<int64_t> output_size,
+                                              std::vector<int64_t> input_size, std::optional<double> scales) {
+    Tensor go = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
+    Tensor grad_input = Tensor::zeros(out_shape(go, input_size), go.dtype(), go.device());
+    const int64_t dim_b = go.size(0), dim_c = go.size(1);
+    const int64_t src_dim_w = output_size[0];  // W2
+    const int64_t dst_dim_w = input_size[0];   // W1
+    if (go.numel() == 0 || src_dim_w == 0 || dst_dim_w == 0) return grad_input;
+
+    UP_DISPATCH(go, {
+        const scalar_t* grad_o = go.data_ptr<scalar_t>();
+        scalar_t* grad_i = grad_input.data_ptr<scalar_t>();
+        const float width_scale = compute_scales_value_backwards_f(scales, src_dim_w, dst_dim_w);
+        std::vector<int64_t> src_tab(static_cast<size_t>(src_dim_w));
+        for (int64_t w2 = 0; w2 < src_dim_w; ++w2)
+            src_tab[static_cast<size_t>(w2)] = nearest_exact_compute_source_index(width_scale, w2, dst_dim_w);
+        std::vector<int64_t> lo_tab(static_cast<size_t>(dst_dim_w) + 1);
+        for (int64_t w1 = 0; w1 <= dst_dim_w; ++w1)
+            lo_tab[static_cast<size_t>(w1)] = static_cast<int64_t>(std::lower_bound(src_tab.begin(), src_tab.end(), w1) - src_tab.begin());
+        parallel_for(0, dim_b * dim_c, 1, [&](int64_t begin, int64_t end) {
+            for (int64_t bc = begin; bc < end; ++bc) {
+                const scalar_t* go_base = grad_o + bc * src_dim_w;
+                scalar_t* gi_base = grad_i + bc * dst_dim_w;
+                for (int64_t w1 = 0; w1 < dst_dim_w; ++w1) {
+                    accscalar_t acc = 0;
+                    for (int64_t i = lo_tab[static_cast<size_t>(w1)]; i < lo_tab[static_cast<size_t>(w1) + 1]; ++i)
+                        acc += go_base[i];
+                    gi_base[w1] = static_cast<scalar_t>(acc);
+                }
+            }
+        });
+    });
+    return grad_input;
+}
+
+
+Tensor _upsample_nearest_exact2d_backward_cpu(const Tensor& grad_output, std::vector<int64_t> output_size,
+                                              std::vector<int64_t> input_size, std::optional<double> scales_h,
+                                              std::optional<double> scales_w) {
+    Tensor go = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
+    Tensor grad_input = Tensor::zeros(out_shape(go, input_size), go.dtype(), go.device());
+    const int64_t dim_b = go.size(0), dim_c = go.size(1);
+    const int64_t src_dim_h = output_size[0], src_dim_w = output_size[1];
+    const int64_t dst_dim_h = input_size[0], dst_dim_w = input_size[1];
+    if (go.numel() == 0 || src_dim_h * src_dim_w == 0 || dst_dim_h * dst_dim_w == 0) return grad_input;
+
+    UP_DISPATCH(go, {
+        const scalar_t* grad_o = go.data_ptr<scalar_t>();
+        scalar_t* grad_i = grad_input.data_ptr<scalar_t>();
+        const float height_scale = compute_scales_value_backwards_f(scales_h, src_dim_h, dst_dim_h);
+        const float width_scale = compute_scales_value_backwards_f(scales_w, src_dim_w, dst_dim_w);
+        auto preimage = [](float scale, int64_t src_dim, int64_t dst_dim) {
+            std::vector<int64_t> src_tab(static_cast<size_t>(src_dim));
+            for (int64_t i = 0; i < src_dim; ++i)
+                src_tab[static_cast<size_t>(i)] = nearest_exact_compute_source_index(scale, i, dst_dim);
+            std::vector<int64_t> lo(dst_dim + 1);
+            for (int64_t j = 0; j <= dst_dim; ++j)
+                lo[static_cast<size_t>(j)] = static_cast<int64_t>(std::lower_bound(src_tab.begin(), src_tab.end(), j) - src_tab.begin());
+            return lo;
+        };
+        const std::vector<int64_t> xlo_tab = preimage(width_scale, src_dim_w, dst_dim_w);
+        const std::vector<int64_t> ylo_tab = preimage(height_scale, src_dim_h, dst_dim_h);
+        parallel_for(0, dim_b * dim_c, 1, [&](int64_t begin, int64_t end) {
+            for (int64_t bc = begin; bc < end; ++bc) {
+                const scalar_t* go_base = grad_o + bc * src_dim_h * src_dim_w;
+                scalar_t* gi_base = grad_i + bc * dst_dim_h * dst_dim_w;
+                for (int64_t y = 0; y < dst_dim_h; ++y) {
+                    for (int64_t x = 0; x < dst_dim_w; ++x) {
+                        accscalar_t acc = 0;
+                        for (int64_t yy = ylo_tab[static_cast<size_t>(y)]; yy < ylo_tab[static_cast<size_t>(y) + 1]; ++yy) {
+                            const scalar_t* go_row = go_base + yy * src_dim_w;
+                            for (int64_t xx = xlo_tab[static_cast<size_t>(x)]; xx < xlo_tab[static_cast<size_t>(x) + 1]; ++xx)
+                                acc += go_row[xx];
+                        }
+                        gi_base[y * dst_dim_w + x] = static_cast<scalar_t>(acc);
+                    }
+                }
+            }
+        });
+    });
+    return grad_input;
+}
+
+Tensor _upsample_nearest_exact3d_backward_cpu(const Tensor& grad_output, std::vector<int64_t> output_size,
+                                              std::vector<int64_t> input_size, std::optional<double> scales_d,
+                                              std::optional<double> scales_h, std::optional<double> scales_w) {
+    Tensor go = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
+    Tensor grad_input = Tensor::zeros(out_shape(go, input_size), go.dtype(), go.device());
+    const int64_t dim_b = go.size(0), dim_c = go.size(1);
+    const int64_t src_d = output_size[0], src_h = output_size[1], src_w = output_size[2];
+    const int64_t dst_d = input_size[0], dst_h = input_size[1], dst_w = input_size[2];
+    if (go.numel() == 0 || src_d * src_h * src_w == 0 || dst_d * dst_h * dst_w == 0) return grad_input;
+
+    UP_DISPATCH(go, {
+        const scalar_t* grad_o = go.data_ptr<scalar_t>();
+        scalar_t* grad_i = grad_input.data_ptr<scalar_t>();
+        auto preimage = [](float scale, int64_t src_dim, int64_t dst_dim) {
+            std::vector<int64_t> src_tab(static_cast<size_t>(src_dim));
+            for (int64_t i = 0; i < src_dim; ++i)
+                src_tab[static_cast<size_t>(i)] = nearest_exact_compute_source_index(scale, i, dst_dim);
+            std::vector<int64_t> lo(dst_dim + 1);
+            for (int64_t j = 0; j <= dst_dim; ++j)
+                lo[static_cast<size_t>(j)] = static_cast<int64_t>(std::lower_bound(src_tab.begin(), src_tab.end(), j) - src_tab.begin());
+            return lo;
+        };
+        const std::vector<int64_t> dlo = preimage(compute_scales_value_backwards_f(scales_d, src_d, dst_d), src_d, dst_d);
+        const std::vector<int64_t> hlo = preimage(compute_scales_value_backwards_f(scales_h, src_h, dst_h), src_h, dst_h);
+        const std::vector<int64_t> wlo = preimage(compute_scales_value_backwards_f(scales_w, src_w, dst_w), src_w, dst_w);
+        parallel_for(0, dim_b * dim_c, 1, [&](int64_t begin, int64_t end) {
+            for (int64_t bc = begin; bc < end; ++bc) {
+                const scalar_t* go_base = grad_o + bc * src_d * src_h * src_w;
+                scalar_t* gi_base = grad_i + bc * dst_d * dst_h * dst_w;
+                for (int64_t z = 0; z < dst_d; ++z) {
+                    for (int64_t y = 0; y < dst_h; ++y) {
+                        for (int64_t x = 0; x < dst_w; ++x) {
+                            accscalar_t acc = 0;
+                            for (int64_t zz = dlo[static_cast<size_t>(z)]; zz < dlo[static_cast<size_t>(z) + 1]; ++zz)
+                                for (int64_t yy = hlo[static_cast<size_t>(y)]; yy < hlo[static_cast<size_t>(y) + 1]; ++yy) {
+                                    const scalar_t* go_row = go_base + (zz * src_h + yy) * src_w;
+                                    for (int64_t xx = wlo[static_cast<size_t>(x)]; xx < wlo[static_cast<size_t>(x) + 1]; ++xx)
+                                        acc += go_row[xx];
+                                }
+                            gi_base[(z * dst_h + y) * dst_w + x] = static_cast<scalar_t>(acc);
+                        }
+                    }
+                }
+            }
+        });
+    });
+    return grad_input;
+}
+
+// ---------------------------------------------------------------------------
+// Antialiased 2-D upsampling.
+//
+// When the output grid is coarser than the input grid, a fixed 2/4-tap
+// reconstruction aliases high frequencies.  With antialiasing the filter
+// support on the source grid is stretched by the downscale factor and each
+// output pixel becomes a normalized filter sum over the whole source window
+// it covers.  Per output index an axis contributes (window start, window
+// size, normalized weights); the 2-D value is the outer product of the two
+// axes' weight vectors, applied as two separable 1-D passes through an
+// (input rows x output cols) scratch plane.  Separability reduces the
+// per-pixel gather cost from O(xsize*ysize) to O(xsize+ysize).
+//
+// Axis table for output index i (edge-aligned source coordinates):
+//   scale   = source/target size ratio (align_corners uses the endpoint
+//             ratio; an explicit scale is used as its reciprocal);
+//   center  = scale * (i + 0.5);
+//   support = taps/2 * max(scale, 1);
+//   window  = [round(center - support), round(center + support)) clipped to
+//             the source extent and to 2*ceil(support)+1 taps;
+//   w_j     = filter((j + begin - center + 0.5) / max(scale, 1)), normalized
+//             to sum 1 over the window, so borders need no special casing.
+// filter is the unit triangle (bilinear) or the cubic convolution kernel
+// with A = -0.75 (bicubic).  Weights are computed in double regardless of
+// dtype; the accumulation type follows the tensor (float/double).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct AaAxis {
+    int64_t max_taps = 0;         // taps reserved per output index
+    std::vector<int64_t> begin;   // first source index
+    std::vector<int64_t> taps;    // taps actually used
+    std::vector<double> weights;  // [i * max_taps + j], normalized
+};
+
+inline double aa_triangle(double x) {
+    x = std::abs(x);
+    return x < 1.0 ? 1.0 - x : 0.0;
+}
+
+// Keys cubic convolution (a = -0.5); the antialias path uses the Keys kernel
+// for PIL compatibility, unlike the non-antialias bicubic path (a = -0.75).
+inline double aa_cubic_convolution(double x) {
+    constexpr double A = -0.5;
+    x = std::abs(x);
+    if (x < 1.0) return cubic_convolution1<double>(x, A);
+    if (x < 2.0) return cubic_convolution2<double>(x, A);
+    return 0.0;
+}
+
+inline double aa_axis_scale(int64_t in_size, int64_t out_size, bool align_corners,
+                            const std::optional<double>& scale) {
+    if (align_corners) {
+        return out_size > 1
+            ? static_cast<double>(in_size - 1) / static_cast<double>(out_size - 1)
+            : 0.0;
+    }
+    return (scale.has_value() && scale.value() > 0.)
+        ? 1.0 / scale.value()
+        : static_cast<double>(in_size) / static_cast<double>(out_size);
+}
+
+using aa_filter_fn = double (*)(double);
+
+AaAxis aa_axis_weights(int64_t in_size, int64_t out_size, double scale,
+                       int taps_half, aa_filter_fn filter) {
+    AaAxis ax;
+    const double support = (scale >= 1.0) ? static_cast<double>(taps_half) * scale
+                                          : static_cast<double>(taps_half);
+    ax.max_taps = static_cast<int64_t>(std::ceil(support)) * 2 + 1;
+    ax.begin.resize(static_cast<size_t>(out_size));
+    ax.taps.resize(static_cast<size_t>(out_size));
+    ax.weights.assign(static_cast<size_t>(out_size) * static_cast<size_t>(ax.max_taps), 0.0);
+    const double invscale = (scale >= 1.0) ? 1.0 / scale : 1.0;
+    for (int64_t i = 0; i < out_size; ++i) {
+        const double center = scale * (static_cast<double>(i) + 0.5);
+        int64_t lo = std::max<int64_t>(static_cast<int64_t>(center - support + 0.5), 0);
+        int64_t n = std::min<int64_t>(static_cast<int64_t>(center + support + 0.5), in_size) - lo;
+        n = std::clamp<int64_t>(n, 0, ax.max_taps);
+        double total = 0.0;
+        for (int64_t j = 0; j < n; ++j) {
+            const double w = filter((static_cast<double>(j + lo) - center + 0.5) * invscale);
+            ax.weights[static_cast<size_t>(i) * ax.max_taps + j] = w;
+            total += w;
+        }
+        if (total != 0.0) {
+            for (int64_t j = 0; j < n; ++j)
+                ax.weights[static_cast<size_t>(i) * ax.max_taps + j] /= total;
+        }
+        ax.begin[static_cast<size_t>(i)] = lo;
+        ax.taps[static_cast<size_t>(i)] = n;
+    }
+    return ax;
+}
+
+} // anonymous namespace
+
+// Forward: horizontal pass into a scratch plane (H1 rows x W2 cols per
+// (n, c)), then vertical reduction.  Both passes are row-parallel and the
+// inner loops run over contiguous memory.
+template <typename scalar_t, typename accscalar_t>
+void aa_2d_forward_impl(const scalar_t* in, scalar_t* out, scalar_t* scratch,
+                        int64_t N, int64_t C, int64_t H1, int64_t W1,
+                        int64_t H2, int64_t W2,
+                        const AaAxis& ah, const AaAxis& aw) {
+    parallel_for(0, N * C * H1, 1, [&](int64_t b, int64_t e) {
+        for (int64_t idx = b; idx < e; ++idx) {
+            const int64_t h1 = idx % H1;
+            const int64_t nc = idx / H1;
+            const scalar_t* src = in + (nc * H1 + h1) * W1;
+            scalar_t* dst = scratch + idx * W2;
+            for (int64_t w2 = 0; w2 < W2; ++w2) {
+                const int64_t lo = aw.begin[w2];
+                const int64_t n = aw.taps[w2];
+                const double* w = aw.weights.data() + static_cast<size_t>(w2) * aw.max_taps;
+                accscalar_t acc = 0;
+                for (int64_t j = 0; j < n; ++j)
+                    acc += static_cast<accscalar_t>(w[j]) * src[lo + j];
+                dst[w2] = static_cast<scalar_t>(acc);
+            }
+        }
+    });
+    parallel_for(0, N * C * H2, 1, [&](int64_t b, int64_t e) {
+        for (int64_t idx = b; idx < e; ++idx) {
+            const int64_t h2 = idx % H2;
+            const int64_t nc = idx / H2;
+            const int64_t lo = ah.begin[h2];
+            const int64_t n = ah.taps[h2];
+            const double* w = ah.weights.data() + static_cast<size_t>(h2) * ah.max_taps;
+            scalar_t* dst = out + idx * W2;
+            for (int64_t w2 = 0; w2 < W2; ++w2) {
+                accscalar_t acc = 0;
+                for (int64_t k = 0; k < n; ++k)
+                    acc += static_cast<accscalar_t>(w[k]) *
+                           scratch[(nc * H1 + lo + k) * W2 + w2];
+                dst[w2] = static_cast<scalar_t>(acc);
+            }
+        }
+    });
+}
+
+// Backward: adjoint of the forward.  Each output pixel scatters its gradient
+// over the source window with the same separable weights.  Parallelism is
+// over (n, c) planes only; within a plane every target element is owned by
+// one thread, so plain accumulation needs no atomics.
+template <typename scalar_t>
+void aa_2d_backward_impl(const scalar_t* go, scalar_t* gi,
+                         int64_t N, int64_t C, int64_t H1, int64_t W1,
+                         int64_t H2, int64_t W2,
+                         const AaAxis& ah, const AaAxis& aw) {
+    parallel_for(0, N * C, 1, [&](int64_t b, int64_t e) {
+        for (int64_t nc = b; nc < e; ++nc) {
+            const scalar_t* gop = go + nc * H2 * W2;
+            scalar_t* gip = gi + nc * H1 * W1;
+            for (int64_t h2 = 0; h2 < H2; ++h2) {
+                const int64_t ylo = ah.begin[h2];
+                const int64_t yn = ah.taps[h2];
+                for (int64_t w2 = 0; w2 < W2; ++w2) {
+                    const scalar_t g = gop[h2 * W2 + w2];
+                    if (g == static_cast<scalar_t>(0)) continue;
+                    const int64_t xlo = aw.begin[w2];
+                    const int64_t xn = aw.taps[w2];
+                    const double* wx = aw.weights.data() + static_cast<size_t>(w2) * aw.max_taps;
+                    for (int64_t k = 0; k < yn; ++k) {
+                        const scalar_t gy = static_cast<scalar_t>(ah.weights[static_cast<size_t>(h2) * ah.max_taps + k]) * g;
+                        scalar_t* row = gip + (ylo + k) * W1;
+                        for (int64_t j = 0; j < xn; ++j)
+                            row[xlo + j] += static_cast<scalar_t>(wx[j]) * gy;
+                    }
+                }
+            }
+        }
+    });
+}
+
+Tensor aa_2d_forward(const Tensor& in, const std::vector<int64_t>& output_size,
+                     bool align_corners, const std::optional<double>& scales_h,
+                     const std::optional<double>& scales_w,
+                     int taps_half, aa_filter_fn filter) {
+    Tensor result = Tensor::empty(out_shape(in, output_size), in.dtype(), in.device());
+    const int64_t N = in.size(0), C = in.size(1);
+    const int64_t H1 = in.size(2), W1 = in.size(3);
+    const int64_t H2 = output_size[0], W2 = output_size[1];
+    if (in.numel() == 0 || H2 == 0 || W2 == 0) return result;
+
+    const AaAxis ah = aa_axis_weights(H1, H2, aa_axis_scale(H1, H2, align_corners, scales_h), taps_half, filter);
+    const AaAxis aw = aa_axis_weights(W1, W2, aa_axis_scale(W1, W2, align_corners, scales_w), taps_half, filter);
+    Tensor scratch = Tensor::empty({N * C * H1 * W2}, in.dtype(), in.device());
+
+    UP_DISPATCH(in, {
+        aa_2d_forward_impl<scalar_t, accscalar_t>(
+            in.data_ptr<scalar_t>(), result.data_ptr<scalar_t>(), scratch.data_ptr<scalar_t>(),
+            N, C, H1, W1, H2, W2, ah, aw);
+    });
+    return result;
+}
+
+Tensor aa_2d_backward(const Tensor& grad_output, const std::vector<int64_t>& output_size,
+                      const std::vector<int64_t>& input_size, bool align_corners,
+                      const std::optional<double>& scales_h, const std::optional<double>& scales_w,
+                      int taps_half, aa_filter_fn filter) {
+    Tensor go = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
+    Tensor grad_input = Tensor::zeros(out_shape(go, input_size), go.dtype(), go.device());
+    const int64_t N = go.size(0), C = go.size(1);
+    const int64_t H1 = input_size[0], W1 = input_size[1];
+    const int64_t H2 = output_size[0], W2 = output_size[1];
+    if (go.numel() == 0 || H1 == 0 || W1 == 0 || H2 == 0 || W2 == 0) return grad_input;
+
+    const AaAxis ah = aa_axis_weights(H1, H2, aa_axis_scale(H1, H2, align_corners, scales_h), taps_half, filter);
+    const AaAxis aw = aa_axis_weights(W1, W2, aa_axis_scale(W1, W2, align_corners, scales_w), taps_half, filter);
+
+    UP_DISPATCH(go, {
+        aa_2d_backward_impl<scalar_t>(
+            go.data_ptr<scalar_t>(), grad_input.data_ptr<scalar_t>(),
+            N, C, H1, W1, H2, W2, ah, aw);
+    });
+    return grad_input;
+}
+
+Tensor upsample_bilinear2d_aa_cpu(const Tensor& self, std::vector<int64_t> output_size,
+                                  bool align_corners, std::optional<double> scales_h,
+                                  std::optional<double> scales_w) {
+    Tensor in = self.is_contiguous() ? self : self.contiguous();
+    return aa_2d_forward(in, output_size, align_corners, scales_h, scales_w, /*taps_half=*/1, aa_triangle);
+}
+
+Tensor upsample_bicubic2d_aa_cpu(const Tensor& self, std::vector<int64_t> output_size,
+                                 bool align_corners, std::optional<double> scales_h,
+                                 std::optional<double> scales_w) {
+    Tensor in = self.is_contiguous() ? self : self.contiguous();
+    return aa_2d_forward(in, output_size, align_corners, scales_h, scales_w, /*taps_half=*/2, aa_cubic_convolution);
+}
+
+Tensor upsample_bilinear2d_aa_backward_cpu(const Tensor& grad_output, std::vector<int64_t> output_size,
+                                           std::vector<int64_t> input_size, bool align_corners,
+                                           std::optional<double> scales_h, std::optional<double> scales_w) {
+    return aa_2d_backward(grad_output, output_size, input_size, align_corners, scales_h, scales_w,
+                          /*taps_half=*/1, aa_triangle);
+}
+
+Tensor upsample_bicubic2d_aa_backward_cpu(const Tensor& grad_output, std::vector<int64_t> output_size,
+                                          std::vector<int64_t> input_size, bool align_corners,
+                                          std::optional<double> scales_h, std::optional<double> scales_w) {
+    return aa_2d_backward(grad_output, output_size, input_size, align_corners, scales_h, scales_w,
+                          /*taps_half=*/2, aa_cubic_convolution);
+}
+
+Tensor& upsample_bilinear2d_aa_out_cpu(const Tensor& self, std::vector<int64_t> output_size,
+                                       bool align_corners, std::optional<double> scales_h,
+                                       std::optional<double> scales_w, Tensor& out) {
+    out = upsample_bilinear2d_aa_cpu(self, std::move(output_size), align_corners, scales_h, scales_w);
+    return out;
+}
+
+Tensor& upsample_bicubic2d_aa_out_cpu(const Tensor& self, std::vector<int64_t> output_size,
+                                      bool align_corners, std::optional<double> scales_h,
+                                      std::optional<double> scales_w, Tensor& out) {
+    out = upsample_bicubic2d_aa_cpu(self, std::move(output_size), align_corners, scales_h, scales_w);
+    return out;
+}
+
+Tensor& upsample_bilinear2d_aa_backward_grad_input_cpu(const Tensor& grad_output, std::vector<int64_t> output_size,
+                                                       std::vector<int64_t> input_size, bool align_corners,
+                                                       std::optional<double> scales_h,
+                                                       std::optional<double> scales_w, Tensor& grad_input) {
+    grad_input = upsample_bilinear2d_aa_backward_cpu(grad_output, std::move(output_size),
+                                                     std::move(input_size), align_corners, scales_h, scales_w);
+    return grad_input;
+}
+
+Tensor& upsample_bicubic2d_aa_backward_grad_input_cpu(const Tensor& grad_output, std::vector<int64_t> output_size,
+                                                      std::vector<int64_t> input_size, bool align_corners,
+                                                      std::optional<double> scales_h,
+                                                      std::optional<double> scales_w, Tensor& grad_input) {
+    grad_input = upsample_bicubic2d_aa_backward_cpu(grad_output, std::move(output_size),
+                                                    std::move(input_size), align_corners, scales_h, scales_w);
+    return grad_input;
+}
+
+namespace {
+
+// Resolve the .vec call shape into a concrete output size; the base op is
+// re-entered through the dispatcher so its contract lives in one place.
+std::vector<int64_t> aa_vec_output_size(const Tensor& input,
+                                        const std::optional<std::vector<int64_t>>& output_size,
+                                        const std::optional<std::vector<double>>& scale_factors) {
+    if (output_size.has_value()) {
+        if (output_size.value().size() != 2)
+            TP_THROW(RuntimeError, "_upsample_aa: vec output_size must have 2 entries");
+        return output_size.value();
+    }
+    if (!scale_factors.has_value())
+        TP_THROW(RuntimeError, "_upsample_aa: vec form needs output_size or scale_factors");
+    const auto& sf = scale_factors.value();
+    if (sf.size() != 2)
+        TP_THROW(RuntimeError, "_upsample_aa: vec scale_factors must have 2 entries");
+    return {static_cast<int64_t>(std::floor(static_cast<double>(input.size(2)) * sf[0])),
+            static_cast<int64_t>(std::floor(static_cast<double>(input.size(3)) * sf[1]))};
+}
+
+} // anonymous namespace
+
+Tensor _upsample_bilinear2d_aa_vec_cpu(const Tensor& input,
+                                       std::optional<std::vector<int64_t>> output_size,
+                                       bool align_corners,
+                                       std::optional<std::vector<double>> scale_factors) {
+    return tpx::ops::_upsample_bilinear2d_aa(
+        input, aa_vec_output_size(input, output_size, scale_factors), align_corners);
+}
+
+Tensor _upsample_bicubic2d_aa_vec_cpu(const Tensor& input,
+                                      std::optional<std::vector<int64_t>> output_size,
+                                      bool align_corners,
+                                      std::optional<std::vector<double>> scale_factors) {
+    return tpx::ops::_upsample_bicubic2d_aa(
+        input, aa_vec_output_size(input, output_size, scale_factors), align_corners);
+}
+
+Tensor& upsample_nearest_exact1d_out_cpu(const Tensor& self, std::vector<int64_t> output_size,
+                                         std::optional<double> scales, Tensor& out) {
+    out = _upsample_nearest_exact1d_cpu(self, std::move(output_size), scales);
+    return out;
+}
+
+Tensor& upsample_nearest_exact2d_out_cpu(const Tensor& self, std::vector<int64_t> output_size,
+                                         std::optional<double> scales_h, std::optional<double> scales_w,
+                                         Tensor& out) {
+    out = _upsample_nearest_exact2d_cpu(self, std::move(output_size), scales_h, scales_w);
+    return out;
+}
+
+Tensor& upsample_nearest_exact3d_out_cpu(const Tensor& self, std::vector<int64_t> output_size,
+                                         std::optional<double> scales_d, std::optional<double> scales_h,
+                                         std::optional<double> scales_w, Tensor& out) {
+    out = _upsample_nearest_exact3d_cpu(self, std::move(output_size), scales_d, scales_h, scales_w);
+    return out;
+}
+
+Tensor& upsample_nearest_exact1d_backward_grad_input_cpu(const Tensor& grad_output, std::vector<int64_t> output_size,
+                                                         std::vector<int64_t> input_size, std::optional<double> scales,
+                                                         Tensor& grad_input) {
+    grad_input = _upsample_nearest_exact1d_backward_cpu(grad_output, std::move(output_size),
+                                                        std::move(input_size), scales);
+    return grad_input;
+}
+
+Tensor& upsample_nearest_exact2d_backward_grad_input_cpu(const Tensor& grad_output, std::vector<int64_t> output_size,
+                                                         std::vector<int64_t> input_size, std::optional<double> scales_h,
+                                                         std::optional<double> scales_w, Tensor& grad_input) {
+    grad_input = _upsample_nearest_exact2d_backward_cpu(grad_output, std::move(output_size),
+                                                        std::move(input_size), scales_h, scales_w);
+    return grad_input;
+}
+
+Tensor& upsample_nearest_exact3d_backward_grad_input_cpu(const Tensor& grad_output, std::vector<int64_t> output_size,
+                                                         std::vector<int64_t> input_size, std::optional<double> scales_d,
+                                                         std::optional<double> scales_h, std::optional<double> scales_w,
+                                                         Tensor& grad_input) {
+    grad_input = _upsample_nearest_exact3d_backward_cpu(grad_output, std::move(output_size),
+                                                        std::move(input_size), scales_d, scales_h, scales_w);
+    return grad_input;
+}
 
 TENSORPLAY_LIBRARY_IMPL(CPU, UpsampleKernels) {
     m.impl("upsample_nearest1d", upsample_nearest1d_cpu);
@@ -882,6 +1482,28 @@ TENSORPLAY_LIBRARY_IMPL(CPU, UpsampleKernels) {
     m.impl("upsample_bilinear2d_backward", upsample_bilinear2d_backward_cpu);
     m.impl("upsample_bicubic2d_backward", upsample_bicubic2d_backward_cpu);
     m.impl("upsample_trilinear3d_backward", upsample_trilinear3d_backward_cpu);
+    m.impl("_upsample_bilinear2d_aa", upsample_bilinear2d_aa_cpu);
+    m.impl("_upsample_bilinear2d_aa.out", upsample_bilinear2d_aa_out_cpu);
+    m.impl("_upsample_bilinear2d_aa.vec", _upsample_bilinear2d_aa_vec_cpu);
+    m.impl("_upsample_bilinear2d_aa_backward", upsample_bilinear2d_aa_backward_cpu);
+    m.impl("_upsample_bilinear2d_aa_backward.grad_input", upsample_bilinear2d_aa_backward_grad_input_cpu);
+    m.impl("_upsample_bicubic2d_aa", upsample_bicubic2d_aa_cpu);
+    m.impl("_upsample_bicubic2d_aa.out", upsample_bicubic2d_aa_out_cpu);
+    m.impl("_upsample_bicubic2d_aa.vec", _upsample_bicubic2d_aa_vec_cpu);
+    m.impl("_upsample_bicubic2d_aa_backward", upsample_bicubic2d_aa_backward_cpu);
+    m.impl("_upsample_bicubic2d_aa_backward.grad_input", upsample_bicubic2d_aa_backward_grad_input_cpu);
+    m.impl("_upsample_nearest_exact1d", _upsample_nearest_exact1d_cpu);
+    m.impl("_upsample_nearest_exact1d.out", upsample_nearest_exact1d_out_cpu);
+    m.impl("_upsample_nearest_exact1d_backward", _upsample_nearest_exact1d_backward_cpu);
+    m.impl("_upsample_nearest_exact1d_backward.grad_input", upsample_nearest_exact1d_backward_grad_input_cpu);
+    m.impl("_upsample_nearest_exact2d", _upsample_nearest_exact2d_cpu);
+    m.impl("_upsample_nearest_exact2d.out", upsample_nearest_exact2d_out_cpu);
+    m.impl("_upsample_nearest_exact2d_backward", _upsample_nearest_exact2d_backward_cpu);
+    m.impl("_upsample_nearest_exact2d_backward.grad_input", upsample_nearest_exact2d_backward_grad_input_cpu);
+    m.impl("_upsample_nearest_exact3d", _upsample_nearest_exact3d_cpu);
+    m.impl("_upsample_nearest_exact3d.out", upsample_nearest_exact3d_out_cpu);
+    m.impl("_upsample_nearest_exact3d_backward", _upsample_nearest_exact3d_backward_cpu);
+    m.impl("_upsample_nearest_exact3d_backward.grad_input", upsample_nearest_exact3d_backward_grad_input_cpu);
 }
 
 } // namespace cpu

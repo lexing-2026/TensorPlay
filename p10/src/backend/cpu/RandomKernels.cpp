@@ -574,12 +574,13 @@ Tensor& random_kernel(Tensor& self, int64_t low, int64_t high) {
     return self;
 }
 
-Tensor& uniform_kernel(Tensor& self, double from, double to) {
+Tensor& uniform_kernel(Tensor& self, double from, double to,
+                       std::optional<Generator> generator) {
     // Complex tensors fill both components: recurse over the interleaved
     // real view, which keeps the [from, to) contract per component.
     if (isComplexType(self.dtype())) {
         Tensor real_view = tpx::ops::view_as_real(self);
-        return uniform_kernel(real_view, from, to);
+        return uniform_kernel(real_view, from, to, std::move(generator));
     }
     if (!isFloatingType(self.dtype())) {
         TP_THROW(NotImplementedError, "\"check_uniform_bounds\" not implemented for '",
@@ -608,7 +609,7 @@ Tensor& uniform_kernel(Tensor& self, double from, double to) {
 
     if (self.numel() == 0) return self;
     check_writable_inplace(self);
-    auto& gen = default_generator();
+    auto& gen = generator.has_value() ? *generator : default_generator();
 
     dispatch_floating(self.dtype(), [&](auto tag) {
         using scalar_t = decltype(tag);

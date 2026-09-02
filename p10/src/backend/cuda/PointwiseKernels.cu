@@ -8,12 +8,20 @@
 #include "TypePromotion.h"
 #include "CUDABroadcast.cuh"
 #include "CUDAComplex.cuh"
+#include "GradMode.h"
 #include <thrust/complex.h>
 #include <cuda_runtime.h>
 #include <cmath>
 
 namespace tensorplay {
 namespace cuda {
+
+// RAII over thread-local GradMode for mutation-free sections.
+struct NoGradGuard {
+    bool prev;
+    NoGradGuard() : prev(GradMode::is_enabled()) { GradMode::set_enabled(false); }
+    ~NoGradGuard() { GradMode::set_enabled(prev); }
+};
 
 // --- Utils ---
 #define CUDA_CHECK(condition) \
@@ -95,24 +103,15 @@ __global__ void unary_reduced_float_kernel_cuda_impl(int64_t n, const T* input, 
 
 // --- Dispatchers ---
 
-// elementwise_kernel: 128 threads/block, 4 elems/thread when vectorized,
-// grid capped at a few blocks per SM.
-inline int device_sms() {
-    static int sms = []() {
-        int dev = 0, count = 0;
-        cudaGetDevice(&dev);
-        cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, dev);
-        return count > 0 ? count : 1;
-    }();
-    return sms;
-}
-
+// elementwise_kernel: one thread block per block-work-size chunk of the
+// tensor (4 elems/thread vectorized, 8 scalar), grid-stride walks make the
+// underfilled tail blocks cheap and there is no occupancy cap: memory-bound
+// elementwise work saturates with one wave of fully provisioned blocks.
 inline void get_elementwise_config(int64_t n, bool vectorized, dim3& grid, dim3& block) {
-    block.x = 128;
+    block.x = 256;
     int64_t per_thread = vectorized ? 4 : 8;
     int64_t want = (n + block.x * per_thread - 1) / (block.x * per_thread);
-    int64_t cap = static_cast<int64_t>(device_sms()) * 4;
-    grid.x = static_cast<unsigned>(want < 1 ? 1 : (want > cap ? cap : want));
+    grid.x = static_cast<unsigned>(want < 1 ? 1 : want);
 }
 
 inline bool ptr_aligned16(const void* p) { return (reinterpret_cast<uintptr_t>(p) & 15) == 0; }
@@ -1363,6 +1362,245 @@ Tensor minimum_cuda(const Tensor& self, const Tensor& other) {
     return maximum_minimum_cuda_impl<false>(self, other);
 }
 
+// fmax/fmin: a NaN operand yields the other input verbatim; two NaNs stay NaN.
+// Integral types have no NaN and reduce to the plain comparison; Half/BFloat16
+// are evaluated through the float overloads below.  double keeps its own
+// overload so the comparison never narrows to float.
+template <bool Maximum, typename T>
+__device__ inline T fmaxfmin_elem(T a, T b) {
+    if constexpr (Maximum) {
+        return a < b ? b : a;
+    } else {
+        return a < b ? a : b;
+    }
+}
+
+template <bool Maximum>
+__device__ inline float fmaxfmin_elem(float a, float b) {
+    if (a != a) return b;
+    if (b != b) return a;
+    if constexpr (Maximum) return a < b ? b : a;
+    else return a < b ? a : b;
+}
+
+template <bool Maximum>
+__device__ inline double fmaxfmin_elem(double a, double b) {
+    if (a != a) return b;
+    if (b != b) return a;
+    if constexpr (Maximum) return a < b ? b : a;
+    else return a < b ? a : b;
+}
+
+template <bool Maximum>
+__device__ inline Half fmaxfmin_elem(Half a, Half b) {
+    return Half(fmaxfmin_elem<Maximum>(static_cast<float>(a), static_cast<float>(b)));
+}
+
+template <bool Maximum>
+__device__ inline BFloat16 fmaxfmin_elem(BFloat16 a, BFloat16 b) {
+    return BFloat16(fmaxfmin_elem<Maximum>(static_cast<float>(a), static_cast<float>(b)));
+}
+
+template <bool Maximum, typename T>
+__global__ void fmaxfmin_broadcast_kernel_cuda_impl(
+    int64_t n, const T* self, TensorDesc self_desc,
+    const T* other, TensorDesc other_desc,
+    T* output, TensorDesc output_desc) {
+    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        const T a = self[get_offset(i, self_desc, output_desc)];
+        const T b = other[get_offset(i, other_desc, output_desc)];
+        output[i] = fmaxfmin_elem<Maximum>(a, b);
+    }
+}
+
+template <bool Maximum>
+Tensor fmaxfmin_cuda_impl(const Tensor& self, const Tensor& other) {
+    std::vector<int64_t> out_shape = broadcast_shapes(
+        static_cast<std::vector<int64_t>>(self.shape()),
+        static_cast<std::vector<int64_t>>(other.shape()));
+    DType common_dtype = promoteTypes(self.dtype(), other.dtype());
+    if (isComplexType(common_dtype)) {
+        TP_THROW(RuntimeError, "fmax/fmin is not implemented for complex tensors");
+    }
+    Tensor result = Tensor::empty(out_shape, common_dtype, self.device());
+    const int64_t n = result.numel();
+    if (n == 0) return result;
+    dim3 block(256);
+    dim3 grid((n + 255) / 256);
+    Tensor a = self.dtype() == common_dtype ? self.contiguous() : self.to(common_dtype).contiguous();
+    Tensor b = other.dtype() == common_dtype ? other.contiguous() : other.to(common_dtype).contiguous();
+    TensorDesc a_desc = make_desc(a, out_shape.size());
+    TensorDesc b_desc = make_desc(b, out_shape.size());
+    TensorDesc result_desc = make_desc(result, out_shape.size());
+
+    #define FMAXMIN_CASE(ctype, name) \
+        case DType::name: \
+            fmaxfmin_broadcast_kernel_cuda_impl<Maximum, ctype><<<grid, block, 0, getCurrentCUDAStream().stream()>>>( \
+                n, a.data_ptr<ctype>(), a_desc, b.data_ptr<ctype>(), b_desc, \
+                result.data_ptr<ctype>(), result_desc); \
+            break;
+    switch (common_dtype) {
+        TENSORPLAY_FORALL_SCALAR_TYPES(FMAXMIN_CASE)
+        default: TP_THROW(NotImplementedError, "CUDA fmax/fmin: unsupported dtype");
+    }
+    #undef FMAXMIN_CASE
+    CUDA_CHECK(cudaGetLastError());
+    return result;
+}
+
+Tensor fmax_cuda(const Tensor& self, const Tensor& other) {
+    return fmaxfmin_cuda_impl<true>(self, other);
+}
+
+Tensor fmin_cuda(const Tensor& self, const Tensor& other) {
+    return fmaxfmin_cuda_impl<false>(self, other);
+}
+
+// ldexp: x * 2^y with the power of two applied in the element dtype so the
+// result is exact whenever y fits the exponent range.
+template <typename T>
+__global__ void ldexp_broadcast_kernel_cuda_impl(
+    int64_t n, const T* self, TensorDesc self_desc,
+    const T* other, TensorDesc other_desc,
+    T* output, TensorDesc output_desc) {
+    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        const T x = self[get_offset(i, self_desc, output_desc)];
+        const T e = other[get_offset(i, other_desc, output_desc)];
+        if constexpr (std::is_integral_v<T>) {
+            output[i] = e >= static_cast<T>(8 * static_cast<int>(sizeof(T)))
+                ? T(0) : static_cast<T>(x * (T(1) << e));
+        } else {
+            output[i] = static_cast<T>(static_cast<double>(x) * ::exp2(static_cast<double>(e)));
+        }
+    }
+}
+
+Tensor ldexp_cuda(const Tensor& self, const Tensor& other) {
+    std::vector<int64_t> out_shape = broadcast_shapes(
+        static_cast<std::vector<int64_t>>(self.shape()),
+        static_cast<std::vector<int64_t>>(other.shape()));
+    DType common_dtype = promoteTypes(self.dtype(), other.dtype());
+    Tensor result = Tensor::empty(out_shape, common_dtype, self.device());
+    const int64_t n = result.numel();
+    if (n == 0) return result;
+    dim3 block(256);
+    dim3 grid((n + 255) / 256);
+    Tensor a = self.dtype() == common_dtype ? self.contiguous() : self.to(common_dtype).contiguous();
+    Tensor b = other.dtype() == common_dtype ? other.contiguous() : other.to(common_dtype).contiguous();
+    TensorDesc a_desc = make_desc(a, out_shape.size());
+    TensorDesc b_desc = make_desc(b, out_shape.size());
+    TensorDesc result_desc = make_desc(result, out_shape.size());
+
+    #define LDEXP_CASE(ctype, name) \
+        case DType::name: \
+            ldexp_broadcast_kernel_cuda_impl<ctype><<<grid, block, 0, getCurrentCUDAStream().stream()>>>( \
+                n, a.data_ptr<ctype>(), a_desc, b.data_ptr<ctype>(), b_desc, \
+                result.data_ptr<ctype>(), result_desc); \
+            break;
+    switch (common_dtype) {
+        TENSORPLAY_FORALL_SCALAR_TYPES(LDEXP_CASE)
+        default: TP_THROW(NotImplementedError, "CUDA ldexp: unsupported dtype");
+    }
+    #undef LDEXP_CASE
+    CUDA_CHECK(cudaGetLastError());
+    return result;
+}
+
+// clamp.Tensor: same bound logic as clamp_kernel_cuda but each bound is a
+// broadcastable tensor, evaluated per element.
+template <typename T>
+__global__ void clamp_tensor_broadcast_kernel_cuda_impl(
+    int64_t n, const T* self, TensorDesc self_desc,
+    const T* lo, TensorDesc lo_desc,
+    const T* hi, TensorDesc hi_desc,
+    T* output, TensorDesc output_desc,
+    bool has_min, bool has_max) {
+    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        T val = self[get_offset(i, self_desc, output_desc)];
+        if (has_min) {
+            const T m = lo[get_offset(i, lo_desc, output_desc)];
+            if (val < m) val = m;
+        }
+        if (has_max) {
+            const T m = hi[get_offset(i, hi_desc, output_desc)];
+            if (val > m) val = m;
+        }
+        output[i] = val;
+    }
+}
+
+Tensor clamp_tensor_cuda(const Tensor& self, const std::optional<Tensor>& min,
+                         const std::optional<Tensor>& max) {
+    if (!min.has_value() && !max.has_value()) {
+        return self;
+    }
+    DType common_dtype = self.dtype();
+    if (min.has_value()) common_dtype = promoteTypes(common_dtype, min->dtype());
+    if (max.has_value()) common_dtype = promoteTypes(common_dtype, max->dtype());
+    if (isComplexType(common_dtype)) {
+        TP_THROW(RuntimeError, "clamp is not implemented for complex tensors");
+    }
+    std::vector<int64_t> out_shape = static_cast<std::vector<int64_t>>(self.shape());
+    if (min.has_value()) {
+        out_shape = broadcast_shapes(out_shape,
+            static_cast<std::vector<int64_t>>(min->shape()));
+    }
+    if (max.has_value()) {
+        out_shape = broadcast_shapes(out_shape,
+            static_cast<std::vector<int64_t>>(max->shape()));
+    }
+    Tensor result = Tensor::empty(out_shape, common_dtype, self.device());
+    const int64_t n = result.numel();
+    if (n == 0) return result;
+    dim3 block(256);
+    dim3 grid((n + 255) / 256);
+    Tensor a = self.dtype() == common_dtype ? self.contiguous() : self.to(common_dtype).contiguous();
+    Tensor lo, hi;
+    TensorDesc a_desc = make_desc(a, out_shape.size());
+    TensorDesc lo_desc = a_desc, hi_desc = a_desc;
+    if (min.has_value()) {
+        lo = min->dtype() == common_dtype ? min->contiguous() : min->to(common_dtype).contiguous();
+        lo_desc = make_desc(lo, out_shape.size());
+    }
+    if (max.has_value()) {
+        hi = max->dtype() == common_dtype ? max->contiguous() : max->to(common_dtype).contiguous();
+        hi_desc = make_desc(hi, out_shape.size());
+    }
+    TensorDesc result_desc = make_desc(result, out_shape.size());
+
+    #define CLAMP_T_CASE(ctype, name) \
+        case DType::name: \
+            clamp_tensor_broadcast_kernel_cuda_impl<ctype><<<grid, block, 0, getCurrentCUDAStream().stream()>>>( \
+                n, a.data_ptr<ctype>(), a_desc, \
+                min.has_value() ? lo.data_ptr<ctype>() : a.data_ptr<ctype>(), lo_desc, \
+                max.has_value() ? hi.data_ptr<ctype>() : a.data_ptr<ctype>(), hi_desc, \
+                result.data_ptr<ctype>(), result_desc, min.has_value(), max.has_value()); \
+            break;
+    switch (common_dtype) {
+        TENSORPLAY_FORALL_SCALAR_TYPES(CLAMP_T_CASE)
+        default: TP_THROW(NotImplementedError, "CUDA clamp.Tensor: unsupported dtype");
+    }
+    #undef CLAMP_T_CASE
+    CUDA_CHECK(cudaGetLastError());
+    return result;
+}
+
+Tensor& clamp_tensor__cuda(Tensor& self, const std::optional<Tensor>& min,
+                           const std::optional<Tensor>& max) {
+    NoGradGuard __tp_nograd;
+    self.copy_(clamp_tensor_cuda(self, min, max));
+    return self;
+}
+
+Tensor& clamp_tensor_out_cuda(const Tensor& self, const std::optional<Tensor>& min,
+                              const std::optional<Tensor>& max, Tensor& out) {
+    out.copy_(clamp_tensor_cuda(self, min, max));
+    return out;
+}
+
 
 // Clamp
 template <typename T>
@@ -1884,6 +2122,17 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, PointwiseKernels) {
     m.impl("where.Scalar", where_scalar_scalar_cuda);
     m.impl("maximum", maximum_cuda);
     m.impl("minimum", minimum_cuda);
+
+    m.impl("fmax", fmax_cuda);
+    m.impl("fmin", fmin_cuda);
+    m.impl("ldexp", ldexp_cuda);
+    m.impl("ldexp.Tensor", ldexp_cuda);
+    m.impl("clamp.Tensor", clamp_tensor_cuda);
+    m.impl("clamp_.Tensor", clamp_tensor__cuda);
+    m.impl("clamp.Tensor_out", clamp_tensor_out_cuda);
+    m.impl("clip.Tensor", clamp_tensor_cuda);
+    m.impl("clip_.Tensor", clamp_tensor__cuda);
+    m.impl("clip.Tensor_out", clamp_tensor_out_cuda);
     
     m.impl("pow.Tensor_Tensor", pow_kernel_cuda);
     m.impl("pow.Tensor_Scalar", pow_scalar_kernel_cuda);

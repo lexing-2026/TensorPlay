@@ -2,6 +2,7 @@
 
 #ifdef USE_VULKAN
 
+#include "vk_api.h"
 #include "../../../../include/Exception.h"
 
 #include <string>
@@ -18,6 +19,17 @@
         tensorplay::vulkan::api::to_string(_check_result));                     \
   } while (0)
 
+#define VK_CHECK_MSG(f, ...)                                                    \
+  do {                                                                          \
+    const VkResult _check_result = (f);                                         \
+    TP_CHECK(                                                                   \
+        _check_result == VK_SUCCESS,                                            \
+        tensorplay::vulkan::api::make_error_message(                            \
+            #f,                                                                 \
+            tensorplay::vulkan::api::to_string(_check_result),                  \
+            __VA_ARGS__));                                                      \
+  } while (0)
+
 #define VK_CHECK_COND(exp, ...)                                                 \
   do {                                                                          \
     if (!(exp)) {                                                               \
@@ -31,50 +43,14 @@ namespace tensorplay {
 namespace vulkan {
 namespace api {
 
-inline const char* to_string(const VkResult result) {
-  switch (result) {
-    case VK_SUCCESS:
-      return "VK_SUCCESS";
-    case VK_NOT_READY:
-      return "VK_NOT_READY";
-    case VK_TIMEOUT:
-      return "VK_TIMEOUT";
-    case VK_EVENT_SET:
-      return "VK_EVENT_SET";
-    case VK_EVENT_RESET:
-      return "VK_EVENT_RESET";
-    case VK_INCOMPLETE:
-      return "VK_INCOMPLETE";
-    case VK_ERROR_OUT_OF_HOST_MEMORY:
-      return "VK_ERROR_OUT_OF_HOST_MEMORY";
-    case VK_ERROR_OUT_OF_DEVICE_MEMORY:
-      return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
-    case VK_ERROR_INITIALIZATION_FAILED:
-      return "VK_ERROR_INITIALIZATION_FAILED";
-    case VK_ERROR_DEVICE_LOST:
-      return "VK_ERROR_DEVICE_LOST";
-    case VK_ERROR_MEMORY_MAP_FAILED:
-      return "VK_ERROR_MEMORY_MAP_FAILED";
-    case VK_ERROR_LAYER_NOT_PRESENT:
-      return "VK_ERROR_LAYER_NOT_PRESENT";
-    case VK_ERROR_EXTENSION_NOT_PRESENT:
-      return "VK_ERROR_EXTENSION_NOT_PRESENT";
-    case VK_ERROR_FEATURE_NOT_PRESENT:
-      return "VK_ERROR_FEATURE_NOT_PRESENT";
-    case VK_ERROR_INCOMPATIBLE_DRIVER:
-      return "VK_ERROR_INCOMPATIBLE_DRIVER";
-    case VK_ERROR_TOO_MANY_OBJECTS:
-      return "VK_ERROR_TOO_MANY_OBJECTS";
-    case VK_ERROR_FORMAT_NOT_SUPPORTED:
-      return "VK_ERROR_FORMAT_NOT_SUPPORTED";
-    case VK_ERROR_FRAGMENTED_POOL:
-      return "VK_ERROR_FRAGMENTED_POOL";
-    case VK_ERROR_OUT_OF_POOL_MEMORY:
-      return "VK_ERROR_OUT_OF_POOL_MEMORY";
-    default:
-      return "VK_UNKNOWN";
-  }
-}
+const char* to_string(const VkResult result);
+
+// Assembles the failure text used by VK_CHECK_MSG: the rejected call plus
+// the returned result code, followed by any caller-supplied context.
+std::string make_error_message(
+    const std::string& function,
+    const std::string& result,
+    const std::string& message);
 
 } // namespace api
 } // namespace vulkan

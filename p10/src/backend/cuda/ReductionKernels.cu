@@ -721,7 +721,7 @@ __global__ void norm2_partial_kernel(
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     for (int offset = 16; offset > 0; offset >>= 1) {
-        value += __shfl_down_sync(0xffffffffu, value, offset);
+        value += __shfl_down_sync(0xffffffffffffffffull, value, offset);
     }
     __shared__ AccT warp_values[32];
     if (lane == 0) warp_values[warp] = value;
@@ -731,7 +731,7 @@ __global__ void norm2_partial_kernel(
         const int warp_count = (blockDim.x + 31) / 32;
         value = lane < warp_count ? warp_values[lane] : AccT(0);
         for (int offset = 16; offset > 0; offset >>= 1) {
-            value += __shfl_down_sync(0xffffffffu, value, offset);
+            value += __shfl_down_sync(0xffffffffffffffffull, value, offset);
         }
         if (lane == 0) partials[blockIdx.x] = value;
     }
@@ -748,7 +748,7 @@ __global__ void norm2_finalize_kernel(
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     for (int offset = 16; offset > 0; offset >>= 1) {
-        value += __shfl_down_sync(0xffffffffu, value, offset);
+        value += __shfl_down_sync(0xffffffffffffffffull, value, offset);
     }
     if (lane == 0) warp_values[warp] = value;
     __syncthreads();
@@ -756,7 +756,7 @@ __global__ void norm2_finalize_kernel(
         const int warp_count = (blockDim.x + 31) / 32;
         value = lane < warp_count ? warp_values[lane] : AccT(0);
         for (int offset = 16; offset > 0; offset >>= 1) {
-            value += __shfl_down_sync(0xffffffffu, value, offset);
+            value += __shfl_down_sync(0xffffffffffffffffull, value, offset);
         }
         if (lane == 0) {
             if constexpr (std::is_same_v<AccT, float>) {
@@ -788,7 +788,7 @@ __global__ void norm2_single_block_kernel(
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     for (int offset = 16; offset > 0; offset >>= 1) {
-        value += __shfl_down_sync(0xffffffffu, value, offset);
+        value += __shfl_down_sync(0xffffffffffffffffull, value, offset);
     }
     __shared__ AccT warp_values[32];
     if (lane == 0) warp_values[warp] = value;
@@ -798,7 +798,7 @@ __global__ void norm2_single_block_kernel(
         const int warp_count = (blockDim.x + 31) / 32;
         value = lane < warp_count ? warp_values[lane] : AccT(0);
         for (int offset = 16; offset > 0; offset >>= 1) {
-            value += __shfl_down_sync(0xffffffffu, value, offset);
+            value += __shfl_down_sync(0xffffffffffffffffull, value, offset);
         }
         if (lane == 0) {
             if constexpr (std::is_same_v<AccT, float>) {
@@ -832,7 +832,7 @@ __global__ void norm2_atomic_kernel(
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     for (int offset = 16; offset > 0; offset >>= 1) {
-        value += __shfl_down_sync(0xffffffffu, value, offset);
+        value += __shfl_down_sync(0xffffffffffffffffull, value, offset);
     }
     __shared__ AccT warp_values[32];
     if (lane == 0) warp_values[warp] = value;
@@ -842,7 +842,7 @@ __global__ void norm2_atomic_kernel(
         const int warp_count = (blockDim.x + 31) / 32;
         value = lane < warp_count ? warp_values[lane] : AccT(0);
         for (int offset = 16; offset > 0; offset >>= 1) {
-            value += __shfl_down_sync(0xffffffffu, value, offset);
+            value += __shfl_down_sync(0xffffffffffffffffull, value, offset);
         }
         if (lane == 0) atomicAdd(accumulator, value);
     }

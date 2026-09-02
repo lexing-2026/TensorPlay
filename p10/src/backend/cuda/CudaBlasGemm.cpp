@@ -369,7 +369,19 @@ void gemm_impl(const Tensor& self, const Tensor& other, Tensor& result,
     // products where the cuBLAS reduction policy is the reference numerical
     // path.  Keep the Lt bias epilogue for vector-bias addmm below.
     const bool has_bias = (bias != nullptr);
-    if (!has_bias && (dtype == DType::Float16 || dtype == DType::BFloat16)) {
+    // The AMD math-library port ships no real fp32/fp64 kernel set for the
+    // Lt heuristic on RDNA iGPUs (measured 3-6x slower than the classic
+    // API), so plain-precision GEMMs route through the classic API there
+    // as well; bias fusion stays on Lt because the classic API has no
+    // epilogue.
+#if defined(USE_ROCM)
+    const bool prefer_classic_precision =
+        (dtype == DType::Float32 || dtype == DType::Float64);
+#else
+    const bool prefer_classic_precision = false;
+#endif
+    if (!has_bias && (dtype == DType::Float16 || dtype == DType::BFloat16 ||
+                      prefer_classic_precision)) {
         const cudaDataType_t cuda_type = to_cublas_type(dtype);
         const cublasComputeType_t compute_type = to_compute_type(dtype);
         void* alpha_ptr = to_scalar_ptr(alpha, dtype, 0);
@@ -396,7 +408,10 @@ void gemm_impl(const Tensor& self, const Tensor& other, Tensor& result,
             static_cast<int>(self_transposed_contiguous ? M : K),
             beta_ptr,
             result.data_ptr(), cuda_type, static_cast<int>(N),
-            compute_type, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            compute_type,
+            (dtype == DType::Float16 || dtype == DType::BFloat16)
+                ? CUBLAS_GEMM_DEFAULT_TENSOR_OP
+                : CUBLAS_GEMM_DEFAULT);
         CUBLAS_CHECK(status);
         return;
     }

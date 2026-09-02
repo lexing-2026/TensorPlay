@@ -218,7 +218,7 @@ __device__ __forceinline__ AccT distance_block_reduce(AccT value, AccT identity)
     const int warp = threadIdx.x >> 5;
 
     for (int offset = 16; offset > 0; offset >>= 1) {
-        value = Family::combine(value, __shfl_down_sync(0xffffffffu, value, offset));
+        value = Family::combine(value, __shfl_down_sync(0xffffffffffffffffull, value, offset));
     }
     if (lane == 0) warp_values[warp] = value;
     __syncthreads();
@@ -227,7 +227,7 @@ __device__ __forceinline__ AccT distance_block_reduce(AccT value, AccT identity)
         value = lane < kDistanceWarps ? warp_values[lane] : identity;
         for (int offset = kDistanceWarps / 2; offset > 0; offset >>= 1) {
             value = Family::combine(
-                value, __shfl_down_sync(0xffffffffu, value, offset));
+                value, __shfl_down_sync(0xffffffffffffffffull, value, offset));
         }
     }
     return value;

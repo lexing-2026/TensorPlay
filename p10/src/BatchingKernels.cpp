@@ -193,6 +193,53 @@ Tensor random_factory(const char* op, const std::vector<int64_t>& shape,
     return expand_same_random(std::move(sample), layer);
 }
 
+Tensor random_int_factory(const char* op, int64_t low, int64_t high,
+                          const std::vector<int64_t>& shape, DType dtype,
+                          std::optional<Device> device) {
+    const Layer layer = current_vmap_layer();
+    check_randomness(layer);
+    const Device target = resolve_random_device(device);
+    if (layer.randomness == Randomness::Different) {
+        Tensor result = call_device<Tensor, int64_t, int64_t,
+                                    const std::vector<int64_t>&, DType,
+                                    std::optional<Device>>(
+            op, target, low, high,
+            prepend_batch_size(shape, layer.batch_size), dtype, device);
+        return make_batched(result, 0, layer.level);
+    }
+    Tensor sample = call_device<Tensor, int64_t, int64_t,
+                                const std::vector<int64_t>&, DType,
+                                std::optional<Device>>(
+        op, target, low, high, shape, dtype, device);
+    return expand_same_random(std::move(sample), layer);
+}
+
+Tensor randperm_factory(int64_t n, DType dtype,
+                        std::optional<Device> device) {
+    const Layer layer = current_vmap_layer();
+    check_randomness(layer);
+    const Device target = resolve_random_device(device);
+    const auto sample = [&]() {
+        return call_device<Tensor, int64_t, DType, std::optional<Device>>(
+            "randperm", target, n, dtype, device);
+    };
+    if (layer.randomness != Randomness::Different) {
+        return expand_same_random(sample(), layer);
+    }
+    if (layer.batch_size == 0) {
+        Tensor empty(std::vector<int64_t>{0, n}, dtype, target);
+        return make_batched(empty, 0, layer.level);
+    }
+    std::vector<Tensor> values;
+    values.reserve(static_cast<size_t>(layer.batch_size));
+    for (int64_t i = 0; i < layer.batch_size; ++i) {
+        values.push_back(sample());
+    }
+    Tensor result = call_device<Tensor, const std::vector<Tensor>&, int64_t>(
+        "stack", target, values, 0);
+    return make_batched(result, 0, layer.level);
+}
+
 Tensor random_like_factory(const char* op, const Tensor& input,
                            DType dtype, std::optional<Device> device) {
     const Layer active = current_vmap_layer();
@@ -303,6 +350,15 @@ Tensor binary_alpha(const char* op, const Tensor& left, const Tensor& right,
 Tensor scalar(const char* op, const Tensor& input, Scalar value) {
     return unary_impl(input, [&](const Tensor& base) {
         return call_next<Tensor, const Tensor&, Scalar>(op, base, base, value);
+    });
+}
+
+// Scalar-first overload: the constant is the leading argument of the op, so
+// the re-dispatch order flips while the batch dimension still comes from the
+// mapped operand.
+Tensor scalar_left(const char* op, const Tensor& input, Scalar value) {
+    return unary_impl(input, [&](const Tensor& base) {
+        return call_next<Tensor, Scalar, const Tensor&>(op, base, value, base);
     });
 }
 
@@ -775,6 +831,99 @@ Tensor bmm(const Tensor& left, const Tensor& right) {
     return make_batched(result, 0, level);
 }
 
+Tensor linear(const Tensor& input, const Tensor& weight,
+              std::optional<Tensor> bias) {
+    Operand input_operand = unwrap_operand(input);
+    Operand weight_operand = unwrap_operand(weight);
+    std::optional<Operand> bias_operand;
+    if (bias.has_value() && bias->defined()) {
+        bias_operand = unwrap_operand(*bias);
+    }
+
+    const Operand* mapped = input_operand.bdim.has_value()
+        ? &input_operand
+        : (weight_operand.bdim.has_value()
+            ? &weight_operand
+            : (bias_operand.has_value() && bias_operand->bdim.has_value()
+                ? &*bias_operand : nullptr));
+    if (mapped == nullptr) {
+        TP_THROW(RuntimeError, "linear batch rule received no mapped operand");
+    }
+    const Layer& active = layer_for(mapped->level);
+    const auto weight_shape = logical_shape(weight_operand);
+    if (weight_shape.size() != 2) {
+        TP_THROW(RuntimeError, "linear batch rule expects a 2D weight");
+    }
+
+    const auto align = [&](const Operand& operand) {
+        if (operand.bdim.has_value()) {
+            return move_to_front(operand.value, *operand.bdim);
+        }
+        return expand_unbatched(operand.value, active.batch_size,
+                                logical_shape(operand));
+    };
+    Tensor input_value = align(input_operand);
+    Tensor weight_value = align(weight_operand);
+    Tensor transposed_weight = call_next<Tensor, const Tensor&, int64_t, int64_t>(
+        "transpose", weight_value, weight_value,
+        weight_value.dim() - 2, weight_value.dim() - 1);
+    Tensor result = call_next<Tensor, const Tensor&, const Tensor&>(
+        "matmul", input_value, input_value, transposed_weight);
+    if (bias_operand.has_value()) {
+        Tensor bias_value = align(*bias_operand);
+        while (bias_value.dim() < result.dim()) {
+            bias_value = call_next<Tensor, const Tensor&, int64_t>(
+                "unsqueeze", bias_value, bias_value, 1);
+        }
+        result = call_next<Tensor, const Tensor&, const Tensor&, Scalar>(
+            "add.Tensor", result, result, bias_value, Scalar(1));
+    }
+    return make_batched(result, 0, mapped->level);
+}
+
+Tensor rand(const std::vector<int64_t>& shape, std::optional<DType> dtype,
+            std::optional<Device> device) {
+    return random_factory("rand", shape, dtype, device);
+}
+
+Tensor randn(const std::vector<int64_t>& shape, std::optional<DType> dtype,
+             std::optional<Device> device) {
+    return random_factory("randn", shape, dtype, device);
+}
+
+Tensor randint(int64_t low, int64_t high,
+               const std::vector<int64_t>& shape, DType dtype,
+               std::optional<Device> device) {
+    return random_int_factory("randint", low, high, shape, dtype, device);
+}
+
+Tensor randperm(int64_t n, DType dtype, std::optional<Device> device) {
+    return randperm_factory(n, dtype, device);
+}
+
+Tensor rand_like(const Tensor& input, DType dtype,
+                 std::optional<Device> device) {
+    return random_like_factory("rand_like", input, dtype, device);
+}
+
+Tensor randint_like(const Tensor& input, int64_t low, int64_t high,
+                    DType dtype, std::optional<Device> device) {
+    return random_like_impl(
+        input, dtype, device,
+        [&](const Tensor& value, DType output_dtype,
+            std::optional<Device> output_device) {
+            return call_next<Tensor, const Tensor&, int64_t, int64_t, DType,
+                             std::optional<Device>>(
+                "randint_like", value, value, low, high, output_dtype,
+                output_device);
+        });
+}
+
+Tensor randn_like(const Tensor& input, DType dtype,
+                  std::optional<Device> device) {
+    return random_like_factory("randn_like", input, dtype, device);
+}
+
 } // namespace batch
 } // namespace transform
 } // namespace tensorplay
@@ -811,6 +960,7 @@ TP_BATCH_UNARY(batch_erf, "erf")
 TP_BATCH_UNARY(batch_erfc, "erfc")
 TP_BATCH_UNARY(batch_log1p, "log1p")
 TP_BATCH_UNARY(batch_expm1, "expm1")
+TP_BATCH_UNARY(batch_bitwise_not, "bitwise_not")
 
 TP_BATCH_BINARY(batch_mul, "mul.Tensor")
 TP_BATCH_BINARY(batch_div, "div.Tensor")
@@ -819,6 +969,11 @@ TP_BATCH_BINARY(batch_minimum, "minimum")
 TP_BATCH_BINARY(batch_logical_and, "logical_and")
 TP_BATCH_BINARY(batch_logical_or, "logical_or")
 TP_BATCH_BINARY(batch_logical_xor, "logical_xor")
+TP_BATCH_BINARY(batch_bitwise_and, "bitwise_and.Tensor")
+TP_BATCH_BINARY(batch_bitwise_or, "bitwise_or.Tensor")
+TP_BATCH_BINARY(batch_bitwise_xor, "bitwise_xor.Tensor")
+TP_BATCH_BINARY(batch_bitwise_lshift, "bitwise_left_shift.Tensor")
+TP_BATCH_BINARY(batch_bitwise_rshift, "bitwise_right_shift.Tensor")
 
 Tensor batch_add(const Tensor& left, const Tensor& right, Scalar alpha) {
     return binary_alpha("add.Tensor", left, right, alpha);
@@ -837,6 +992,36 @@ Tensor batch_mul_scalar(const Tensor& input, Scalar value) {
 }
 Tensor batch_div_scalar(const Tensor& input, Scalar value) {
     return scalar("div.Scalar", input, value);
+}
+Tensor batch_bitwise_and_scalar(const Tensor& input, Scalar value) {
+    return scalar("bitwise_and.Scalar", input, value);
+}
+Tensor batch_bitwise_or_scalar(const Tensor& input, Scalar value) {
+    return scalar("bitwise_or.Scalar", input, value);
+}
+Tensor batch_bitwise_xor_scalar(const Tensor& input, Scalar value) {
+    return scalar("bitwise_xor.Scalar", input, value);
+}
+Tensor batch_bitwise_lshift_scalar(const Tensor& input, Scalar value) {
+    return scalar("bitwise_left_shift.Tensor_Scalar", input, value);
+}
+Tensor batch_bitwise_rshift_scalar(const Tensor& input, Scalar value) {
+    return scalar("bitwise_right_shift.Tensor_Scalar", input, value);
+}
+Tensor batch_bitwise_and_stensor(Scalar value, const Tensor& input) {
+    return scalar_left("bitwise_and.Scalar_Tensor", input, value);
+}
+Tensor batch_bitwise_or_stensor(Scalar value, const Tensor& input) {
+    return scalar_left("bitwise_or.Scalar_Tensor", input, value);
+}
+Tensor batch_bitwise_xor_stensor(Scalar value, const Tensor& input) {
+    return scalar_left("bitwise_xor.Scalar_Tensor", input, value);
+}
+Tensor batch_bitwise_lshift_stensor(Scalar value, const Tensor& input) {
+    return scalar_left("bitwise_left_shift.Scalar_Tensor", input, value);
+}
+Tensor batch_bitwise_rshift_stensor(Scalar value, const Tensor& input) {
+    return scalar_left("bitwise_right_shift.Scalar_Tensor", input, value);
 }
 Tensor batch_pow_scalar(const Tensor& input, Scalar exponent) {
     return scalar("pow.Tensor_Scalar", input, exponent);
@@ -910,6 +1095,42 @@ Tensor batch_matmul(const Tensor& left, const Tensor& right) {
 Tensor batch_bmm(const Tensor& left, const Tensor& right) {
     return bmm(left, right);
 }
+Tensor batch_linear(const Tensor& input, const Tensor& weight,
+                    std::optional<Tensor> bias) {
+    return linear(input, weight, std::move(bias));
+}
+
+Tensor batch_rand(const std::vector<int64_t>& shape,
+                  std::optional<DType> dtype,
+                  std::optional<Device> device) {
+    return rand(shape, dtype, device);
+}
+Tensor batch_randn(const std::vector<int64_t>& shape,
+                   std::optional<DType> dtype,
+                   std::optional<Device> device) {
+    return randn(shape, dtype, device);
+}
+Tensor batch_randint(int64_t low, int64_t high,
+                     const std::vector<int64_t>& shape, DType dtype,
+                     std::optional<Device> device) {
+    return randint(low, high, shape, dtype, device);
+}
+Tensor batch_randperm(int64_t n, DType dtype,
+                      std::optional<Device> device) {
+    return randperm(n, dtype, device);
+}
+Tensor batch_rand_like(const Tensor& input, DType dtype,
+                       std::optional<Device> device) {
+    return rand_like(input, dtype, device);
+}
+Tensor batch_randint_like(const Tensor& input, int64_t low, int64_t high,
+                          DType dtype, std::optional<Device> device) {
+    return randint_like(input, low, high, dtype, device);
+}
+Tensor batch_randn_like(const Tensor& input, DType dtype,
+                        std::optional<Device> device) {
+    return randn_like(input, dtype, device);
+}
 
 void register_batch_rules(tensorplay::Library& library) {
     library.impl("neg", &batch_neg);
@@ -941,6 +1162,22 @@ void register_batch_rules(tensorplay::Library& library) {
     library.impl("logical_and", &batch_logical_and);
     library.impl("logical_or", &batch_logical_or);
     library.impl("logical_xor", &batch_logical_xor);
+    library.impl("bitwise_not", &batch_bitwise_not);
+    library.impl("bitwise_and.Tensor", &batch_bitwise_and);
+    library.impl("bitwise_or.Tensor", &batch_bitwise_or);
+    library.impl("bitwise_xor.Tensor", &batch_bitwise_xor);
+    library.impl("bitwise_left_shift.Tensor", &batch_bitwise_lshift);
+    library.impl("bitwise_right_shift.Tensor", &batch_bitwise_rshift);
+    library.impl("bitwise_and.Scalar", &batch_bitwise_and_scalar);
+    library.impl("bitwise_or.Scalar", &batch_bitwise_or_scalar);
+    library.impl("bitwise_xor.Scalar", &batch_bitwise_xor_scalar);
+    library.impl("bitwise_left_shift.Tensor_Scalar", &batch_bitwise_lshift_scalar);
+    library.impl("bitwise_right_shift.Tensor_Scalar", &batch_bitwise_rshift_scalar);
+    library.impl("bitwise_and.Scalar_Tensor", &batch_bitwise_and_stensor);
+    library.impl("bitwise_or.Scalar_Tensor", &batch_bitwise_or_stensor);
+    library.impl("bitwise_xor.Scalar_Tensor", &batch_bitwise_xor_stensor);
+    library.impl("bitwise_left_shift.Scalar_Tensor", &batch_bitwise_lshift_stensor);
+    library.impl("bitwise_right_shift.Scalar_Tensor", &batch_bitwise_rshift_stensor);
     library.impl("add.Scalar", &batch_add_scalar);
     library.impl("sub.Scalar", &batch_sub_scalar);
     library.impl("mul.Scalar", &batch_mul_scalar);
@@ -971,6 +1208,14 @@ void register_batch_rules(tensorplay::Library& library) {
     library.impl("mm", &batch_mm);
     library.impl("matmul", &batch_matmul);
     library.impl("bmm", &batch_bmm);
+    library.impl("linear", &batch_linear);
+    library.impl("rand", &batch_rand);
+    library.impl("randn", &batch_randn);
+    library.impl("randint", &batch_randint);
+    library.impl("randperm", &batch_randperm);
+    library.impl("rand_like", &batch_rand_like);
+    library.impl("randint_like", &batch_randint_like);
+    library.impl("randn_like", &batch_randn_like);
 }
 
 } // namespace

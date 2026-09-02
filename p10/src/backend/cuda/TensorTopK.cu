@@ -7,15 +7,7 @@
 #include "ScanUtils.cuh"
 #include "SortingRadixSelect.cuh"
 #include "SortUtils.cuh"
-#include <cub/block/block_scan.cuh>
-#include <cub/block/block_radix_sort.cuh>
-#include <cub/device/device_scan.cuh>
-#include <cub/device/device_segmented_radix_sort.cuh>
-#include <cub/iterator/counting_input_iterator.cuh>
-#include <cub/iterator/transform_input_iterator.cuh>
-#include <cub/warp/warp_load.cuh>
-#include <cub/warp/warp_merge_sort.cuh>
-#include <cub/warp/warp_store.cuh>
+#include "GPUPrimitives.cuh"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -295,7 +287,7 @@ __global__ void topk_multiblock_within_k_counts(
                     threadIdx.x);
     }
     for (int offset = 16; offset > 0; offset >>= 1) {
-      count += __shfl_down_sync(0xffffffffu, count, offset);
+      count += __shfl_down_sync(0xffffffffffffffffull, count, offset);
     }
   }
   __shared__ uint32_t warp_counts[topk_multiblock_threads / 32];

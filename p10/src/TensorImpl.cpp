@@ -18,7 +18,6 @@ const char* toString(MemoryFormat format) {
 TensorImpl::TensorImpl()
     : storage_offset_(0), dtype_(DType::Float32), device_(DeviceType::CPU),
       is_contiguous_(true) {
-    shared_state_ = std::make_shared<SharedState>();
 }
 
 TensorImpl::TensorImpl(const std::vector<int64_t>& sizes, DType dtype, const Device& device)
@@ -28,46 +27,38 @@ TensorImpl::TensorImpl(const std::vector<int64_t>& sizes, DType dtype,
                        const Device& device, bool allocate_storage)
     : storage_offset_(0), sizes_and_strides_(sizes), dtype_(dtype), device_(device),
       is_contiguous_(true) {
-    
-    shared_state_ = std::make_shared<SharedState>();
     int64_t num_elements = sizes_and_strides_.numel();
     if (allocate_storage) {
         size_t total_bytes = static_cast<size_t>(num_elements) * elementSize(dtype);
         Allocator* allocator = getAllocator(device.type());
-        shared_state_->storage = Storage(total_bytes, allocator, device);
-        device_ = shared_state_->storage.device();
+        storage_ = Storage(total_bytes, allocator, device);
+        device_ = storage_.device();
     }
 }
 
 TensorImpl::TensorImpl(const std::vector<int64_t>& sizes, const std::vector<int64_t>& strides, DType dtype, const Device& device)
     : storage_offset_(0), sizes_and_strides_(sizes, strides), dtype_(dtype), device_(device),
       is_contiguous_(false) {
-    
-    shared_state_ = std::make_shared<SharedState>();
     is_contiguous_ = sizes_and_strides_.is_contiguous();
     
     int64_t num_elements = sizes_and_strides_.numel();
     size_t total_bytes = static_cast<size_t>(num_elements) * elementSize(dtype);
     Allocator* allocator = getAllocator(device.type());
-    shared_state_->storage = Storage(total_bytes, allocator, device);
-    device_ = shared_state_->storage.device();
+    storage_ = Storage(total_bytes, allocator, device);
+    device_ = storage_.device();
 }
 
 TensorImpl::TensorImpl(Storage storage, const std::vector<int64_t>& sizes, DType dtype, size_t storage_offset)
     : storage_offset_(storage_offset), sizes_and_strides_(sizes), dtype_(dtype),
       device_(storage.device()), is_contiguous_(true) {
-    
-    shared_state_ = std::make_shared<SharedState>();
-    shared_state_->storage = storage;
+    storage_ = std::move(storage);
     is_contiguous_ = sizes_and_strides_.is_contiguous();
 }
 
 TensorImpl::TensorImpl(Storage storage, const std::vector<int64_t>& sizes, const std::vector<int64_t>& strides, DType dtype, size_t storage_offset)
     : storage_offset_(storage_offset), sizes_and_strides_(sizes, strides), dtype_(dtype),
       device_(storage.device()), is_contiguous_(false) {
-      
-    shared_state_ = std::make_shared<SharedState>();
-    shared_state_->storage = storage;
+    storage_ = std::move(storage);
     is_contiguous_ = sizes_and_strides_.is_contiguous();
 }
 
@@ -92,11 +83,13 @@ TensorImpl::TensorImpl(const TensorImpl& other)
       inference_tensor_(other.inference_tensor_),
       is_contiguous_(other.is_contiguous_),
       memory_format_(other.memory_format_),
+      storage_(other.storage_),
       shared_state_(other.shared_state_),
       sparse_state_(other.sparse_state_),
       transform_value_(other.transform_value_),
       transform_batch_dim_(other.transform_batch_dim_),
-      transform_level_(other.transform_level_) {}
+      transform_level_(other.transform_level_),
+      quantizer_(other.quantizer_) {}
 TensorImpl::TensorImpl(TensorImpl&& other) noexcept = default;
 TensorImpl& TensorImpl::operator=(const TensorImpl& other) = default;
 TensorImpl& TensorImpl::operator=(TensorImpl&& other) noexcept = default;
@@ -112,6 +105,7 @@ void TensorImpl::set_requires_grad(bool requires_grad) {
 }
 
 void TensorImpl::copy_metadata_from(const TensorImpl& other) {
+    storage_ = other.storage_;
     shared_state_ = other.shared_state_;
     storage_offset_ = other.storage_offset_;
     sizes_and_strides_ = other.sizes_and_strides_;
@@ -123,6 +117,7 @@ void TensorImpl::copy_metadata_from(const TensorImpl& other) {
     transform_value_ = other.transform_value_;
     transform_batch_dim_ = other.transform_batch_dim_;
     transform_level_ = other.transform_level_;
+    quantizer_ = other.quantizer_;
 }
 
 } // namespace tensorplay

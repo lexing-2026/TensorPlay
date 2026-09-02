@@ -1,42 +1,46 @@
-// Tier-1 hot indexing/masking/scan operators - CUDA kernels.
-//
-//     atomicAdd nondeterminism noted at :588)
-//     masked_scatter :409/:425)
+// High-throughput indexing, masking, and scan kernels.
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "Scalar.h"
 #include "Exception.h"
 #include "Context.h"
 #include "CUDARuntime.h"
+#include "Allocator.h"
 #include "Utils.h"
 
 #include <cuda_runtime.h>
+#include "GPUPrimitives.cuh"
 
-// fp16/bf16 (and narrow-width integer) atomics: vendored from
-// BFloat16 overloads align back to the containing 32-bit word and swap the
-// target half via atomicCAS(uint32_t*). Must stay at global scope: the
-// tensorplay::Half/BFloat16 qualified names inside would otherwise resolve
-// relative to an enclosing namespace.
+// Narrow floating-point atomics operate on the containing 32-bit word and
+// replace the selected half with an atomic compare-and-swap. The overloads
+// stay at global scope so qualified scalar types resolve without ambiguity.
 #include "Atomic.cuh"
 
 #include <vector>
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
+#include <functional>
 #include <limits>
+#include <mutex>
 #include <tuple>
 #include <type_traits>
+#include <unordered_map>
 
 namespace {
 inline std::vector<int64_t> broadcast_shapes(const std::vector<int64_t>& a,
                                              const std::vector<int64_t>& b) {
-    // Same semantics as cpu broadcast_shapes: right-aligned, size-1 stretch.
+    // Broadcast dimensions from the trailing axis; size-one axes stretch.
     const size_t rank = std::max(a.size(), b.size());
     std::vector<int64_t> out(rank, 1);
     for (size_t i = 0; i < rank; ++i) {
         const int64_t x = i < a.size() ? a[a.size() - 1 - i] : 1;
         const int64_t y = i < b.size() ? b[b.size() - 1 - i] : 1;
         if (x != y && x != 1 && y != 1) {
-            TP_THROW(RuntimeError, "The size of tensor a must match the size of tensor b at non-singleton dimension");
+            TP_THROW(RuntimeError,
+                     "The size of tensor a (", x,
+                     ") must match the size of tensor b (", y,
+                     ") at non-singleton dimension ", rank - 1 - i);
         }
         out[rank - 1 - i] = std::max(x, y);
     }
@@ -76,7 +80,7 @@ inline void outer_inner(const std::vector<int64_t>& shape, int64_t dim,
 }
 
 // ---------------------------------------------------------------------------
-// TensorIterator; see TensorAdvancedIndexing.cpp:2459).
+// Elementwise broadcast and mask application.
 // ---------------------------------------------------------------------------
 template <typename T>
 __global__ void masked_fill_kernel(int64_t n, const T* self, const bool* mask,
@@ -122,7 +126,452 @@ __global__ void scan_kernel(int64_t n_slices, int64_t d_size, int64_t inner,
     }
 }
 
-// logcumsumexp scan, ReduceOpsKernel.cpp:118 formula:
+template <typename T, typename Op, typename IndexT>
+__global__ void scan_outer_kernel(IndexT n_outer, IndexT d_size, IndexT inner,
+                                  const T* __restrict__ in,
+                                  T* __restrict__ out, T init_val, Op op) {
+    const IndexT outer_stride = static_cast<IndexT>(gridDim.x);
+    const IndexT inner_stride = static_cast<IndexT>(gridDim.y) *
+        static_cast<IndexT>(blockDim.x);
+    for (IndexT outer_index = static_cast<IndexT>(blockIdx.x);
+         outer_index < n_outer; outer_index += outer_stride) {
+        for (IndexT inner_index = static_cast<IndexT>(blockIdx.y) *
+                 static_cast<IndexT>(blockDim.x) + static_cast<IndexT>(threadIdx.x);
+             inner_index < inner; inner_index += inner_stride) {
+            const T* sp = in + (outer_index * d_size * inner + inner_index);
+            T* dp = out + (outer_index * d_size * inner + inner_index);
+            T acc = init_val;
+            #pragma unroll 4
+            for (IndexT j = 0; j < d_size; ++j) {
+                acc = op(acc, *sp);
+                *dp = acc;
+                sp += inner;
+                dp += inner;
+            }
+        }
+    }
+}
+
+template <typename T>
+using scan_accum_t = std::conditional_t<
+    (std::is_same_v<T, bool> || sizeof(T) < sizeof(int32_t)), int32_t, T>;
+
+template <typename T, typename AccT, typename Op>
+__device__ __forceinline__ AccT scan_combine(const Op& op, AccT lhs, AccT rhs) {
+    return static_cast<AccT>(op(static_cast<T>(lhs), static_cast<T>(rhs)));
+}
+
+template <typename T, typename Op, int kThreadsX, int kThreadsY>
+__global__ void scan_short_rows_kernel(int64_t n_rows, int64_t d_size,
+                                        const T* in, T* out, T init_val, Op op) {
+    static_assert(kThreadsX * kThreadsY == 512);
+    using AccT = scan_accum_t<T>;
+    alignas(sizeof(double)) extern __shared__ unsigned char raw[];
+    AccT* shared = reinterpret_cast<AccT*>(raw);
+    AccT* row_buf = shared + static_cast<int>(threadIdx.y) * (2 * kThreadsX);
+    const int tid = threadIdx.x;
+    const AccT identity = static_cast<AccT>(init_val);
+
+    for (int64_t block_row = static_cast<int64_t>(blockIdx.x) * kThreadsY;
+         block_row < n_rows;
+         block_row += static_cast<int64_t>(gridDim.x) * kThreadsY) {
+        const int64_t row = block_row + threadIdx.y;
+        const bool row_exists = row < n_rows;
+        const T* row_in = row_exists ? in + row * d_size : nullptr;
+        T* row_out = row_exists ? out + row * d_size : nullptr;
+        AccT carry = identity;
+
+        for (int64_t tile = 0; tile < d_size;
+             tile += static_cast<int64_t>(2 * kThreadsX)) {
+            const int64_t pos1 = tile + tid;
+            const int64_t pos2 = tile + kThreadsX + tid;
+            row_buf[tid] = row_exists && pos1 < d_size
+                ? static_cast<AccT>(row_in[pos1]) : identity;
+            row_buf[kThreadsX + tid] = row_exists && pos2 < d_size
+                ? static_cast<AccT>(row_in[pos2]) : identity;
+            __syncthreads();
+
+            if (tid == 0) {
+                row_buf[0] = scan_combine<T>(op, carry, row_buf[0]);
+            }
+            __syncthreads();
+
+            for (int stride = 1; stride <= kThreadsX; stride <<= 1) {
+                const int base = (tid / stride) * (2 * stride) + stride;
+                const int target = base + (tid % stride);
+                const int source = base - 1;
+                row_buf[target] = scan_combine<T>(op, row_buf[source], row_buf[target]);
+                __syncthreads();
+            }
+
+            if (row_exists) {
+                if (pos1 < d_size) row_out[pos1] = static_cast<T>(row_buf[tid]);
+                if (pos2 < d_size) {
+                    row_out[pos2] = static_cast<T>(row_buf[kThreadsX + tid]);
+                }
+            }
+            carry = row_buf[2 * kThreadsX - 1];
+            __syncthreads();
+        }
+    }
+}
+
+inline int scan_log_threads_x(int64_t n_rows, int64_t row_size) {
+    int log_x = 0;
+    int log_y = 0;
+    while ((int64_t{1} << log_x) < row_size) ++log_x;
+    while ((int64_t{1} << log_y) < n_rows) ++log_y;
+    log_x = std::clamp((9 + log_x - log_y) / 2, 4, 9);
+    return log_x;
+}
+
+template <typename T, typename Op>
+void launch_short_rows_scan(int64_t n_rows, int64_t row_size,
+                            const T* in, T* out, T init_val, Op op,
+                            cudaStream_t stream) {
+    const int log_x = scan_log_threads_x(n_rows, row_size);
+    const int threads_x = 1 << log_x;
+    const int threads_y = 512 / threads_x;
+    const int64_t blocks = std::min<int64_t>((n_rows + threads_y - 1) / threads_y, 65535);
+    const size_t shared_bytes = static_cast<size_t>(2) * threads_x * threads_y * sizeof(scan_accum_t<T>);
+
+    switch (log_x) {
+        case 4:
+            scan_short_rows_kernel<T, Op, 16, 32><<<static_cast<unsigned>(blocks), dim3(16, 32), shared_bytes, stream>>>(
+                n_rows, row_size, in, out, init_val, op);
+            break;
+        case 5:
+            scan_short_rows_kernel<T, Op, 32, 16><<<static_cast<unsigned>(blocks), dim3(32, 16), shared_bytes, stream>>>(
+                n_rows, row_size, in, out, init_val, op);
+            break;
+        case 6:
+            scan_short_rows_kernel<T, Op, 64, 8><<<static_cast<unsigned>(blocks), dim3(64, 8), shared_bytes, stream>>>(
+                n_rows, row_size, in, out, init_val, op);
+            break;
+        case 7:
+            scan_short_rows_kernel<T, Op, 128, 4><<<static_cast<unsigned>(blocks), dim3(128, 4), shared_bytes, stream>>>(
+                n_rows, row_size, in, out, init_val, op);
+            break;
+        case 8:
+            scan_short_rows_kernel<T, Op, 256, 2><<<static_cast<unsigned>(blocks), dim3(256, 2), shared_bytes, stream>>>(
+                n_rows, row_size, in, out, init_val, op);
+            break;
+        default:
+            scan_short_rows_kernel<T, Op, 512, 1><<<static_cast<unsigned>(blocks), dim3(512, 1), shared_bytes, stream>>>(
+                n_rows, row_size, in, out, init_val, op);
+            break;
+    }
+}
+
+template <typename T, bool Product>
+struct scan_arithmetic_op {
+    __host__ __device__ T operator()(T lhs, T rhs) const {
+        if constexpr (Product) {
+            return static_cast<T>(lhs * rhs);
+        } else {
+            return static_cast<T>(lhs + rhs);
+        }
+    }
+};
+
+struct ScanWorkspaceKey {
+    int device;
+    std::uintptr_t stream;
+    bool product;
+
+    bool operator==(const ScanWorkspaceKey& other) const {
+        return device == other.device && stream == other.stream && product == other.product;
+    }
+};
+
+struct ScanWorkspaceKeyHash {
+    size_t operator()(const ScanWorkspaceKey& key) const {
+        size_t hash = std::hash<int>{}(key.device);
+        hash ^= std::hash<std::uintptr_t>{}(key.stream) + 0x9e3779b9 +
+            (hash << 6) + (hash >> 2);
+        hash ^= std::hash<bool>{}(key.product) + 0x9e3779b9 +
+            (hash << 6) + (hash >> 2);
+        return hash;
+    }
+};
+
+struct ScanWorkspaceEntry {
+    DataPtr storage;
+    size_t capacity = 0;
+    size_t required = 0;
+    int64_t count = -1;
+};
+
+template <typename T>
+struct ScanWorkspaceCache {
+    std::mutex mutex;
+    std::unordered_map<ScanWorkspaceKey, ScanWorkspaceEntry, ScanWorkspaceKeyHash> entries;
+};
+
+template <typename T>
+ScanWorkspaceCache<T>& scan_workspace_cache() {
+    static auto* cache = new ScanWorkspaceCache<T>();
+    return *cache;
+}
+
+template <typename T, typename Launch>
+bool scan_with_cached_workspace(const Tensor& input, Tensor& output,
+                                bool product, Launch launch) {
+    constexpr bool supported =
+        std::is_same_v<T, int32_t> || std::is_same_v<T, int64_t> ||
+        std::is_same_v<T, float> || std::is_same_v<T, double>;
+    if constexpr (!supported) {
+        return false;
+    } else {
+        const int64_t count = input.numel();
+        if (count > std::numeric_limits<int>::max()) return false;
+        const auto stream = getCurrentCUDAStream().stream();
+        ScanWorkspaceKey key{
+            currentDevice(), reinterpret_cast<std::uintptr_t>(stream), product};
+        auto& cache = scan_workspace_cache<T>();
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        auto& entry = cache.entries[key];
+        if (entry.count != count) {
+            CUDA_CHECK(launch(nullptr, 0));
+            entry.required = launch.required_bytes;
+            entry.count = count;
+        }
+        if (entry.capacity < entry.required) {
+            entry.storage = getAllocator(DeviceType::CUDA)->allocate(
+                std::max<size_t>(entry.required, 1), input.device());
+            entry.capacity = std::max<size_t>(entry.required, 1);
+        }
+        CUDA_CHECK(launch(entry.storage.get(), entry.required));
+        return true;
+    }
+}
+
+template <typename T, typename Op>
+bool scan_flat_with_cub(const Tensor& input, Tensor& output, Op op) {
+    struct Launch {
+        const Tensor& input;
+        Tensor& output;
+        Op op;
+        cudaStream_t stream;
+        size_t required_bytes = 0;
+
+        cudaError_t operator()(void* storage, size_t bytes) {
+            cudaError_t error = cub::DeviceScan::InclusiveScan(
+                storage, bytes, input.data_ptr<T>(), output.data_ptr<T>(), op,
+                static_cast<int>(input.numel()), stream);
+            required_bytes = bytes;
+            return error;
+        }
+    } launch{input, output, op, getCurrentCUDAStream().stream()};
+    return scan_with_cached_workspace<T>(input, output, true, launch);
+}
+
+template <typename T>
+bool scan_flat_sum_with_cub(const Tensor& input, Tensor& output) {
+    struct Launch {
+        const Tensor& input;
+        Tensor& output;
+        cudaStream_t stream;
+        size_t required_bytes = 0;
+
+        cudaError_t operator()(void* storage, size_t bytes) {
+            cudaError_t error = cub::DeviceScan::InclusiveSum(
+                storage, bytes, input.data_ptr<T>(), output.data_ptr<T>(),
+                static_cast<int>(input.numel()), stream);
+            required_bytes = bytes;
+            return error;
+        }
+    } launch{input, output, getCurrentCUDAStream().stream()};
+    return scan_with_cached_workspace<T>(input, output, false, launch);
+}
+
+template <typename T>
+bool scan_flat_product_with_cub(const Tensor& input, Tensor& output) {
+    struct Launch {
+        const Tensor& input;
+        Tensor& output;
+        cudaStream_t stream;
+        size_t required_bytes = 0;
+
+        cudaError_t operator()(void* storage, size_t bytes) {
+            cudaError_t error = cub::DeviceScan::InclusiveScan(
+                storage, bytes, input.data_ptr<T>(), output.data_ptr<T>(),
+                std::multiplies<T>{}, static_cast<int>(input.numel()), stream);
+            required_bytes = bytes;
+            return error;
+        }
+    } launch{input, output, getCurrentCUDAStream().stream()};
+    return scan_with_cached_workspace<T>(input, output, true, launch);
+}
+
+// A block owns one contiguous row and scans fixed-size tiles in order.  The
+// tile carry keeps the synchronization cost bounded while allowing rows much
+// longer than one block.
+template <typename T, typename Op>
+__global__ void scan_row_kernel(int64_t n_rows, int64_t d_size,
+                                const T* in, T* out, T init_val, Op op) {
+    using AccT = scan_accum_t<T>;
+    constexpr int kItemsPerThread = 4;
+    constexpr unsigned long long mask = 0xffffffffffffffffull;
+    const unsigned lane = threadIdx.x & 31u;
+    const AccT identity = static_cast<AccT>(init_val);
+    const int64_t row_stride = static_cast<int64_t>(gridDim.x);
+
+    for (int64_t row = static_cast<int64_t>(blockIdx.x); row < n_rows;
+         row += row_stride) {
+        AccT carry = identity;
+        for (int64_t tile = 0; tile < d_size;
+             tile += static_cast<int64_t>(blockDim.x) * kItemsPerThread) {
+            AccT local_prefix[kItemsPerThread];
+            AccT local_total = identity;
+            #pragma unroll
+            for (int j = 0; j < kItemsPerThread; ++j) {
+                const int64_t pos = tile +
+                    static_cast<int64_t>(threadIdx.x) * kItemsPerThread + j;
+                if (pos < d_size) {
+                    const AccT value = static_cast<AccT>(in[row * d_size + pos]);
+                    local_total = scan_combine<T>(op, local_total, value);
+                    local_prefix[j] = local_total;
+                } else {
+                    local_prefix[j] = identity;
+                }
+            }
+
+            AccT thread_prefix = local_total;
+            for (unsigned offset = 1; offset < 32; offset <<= 1) {
+                const AccT other = __shfl_up_sync(mask, thread_prefix, offset);
+                if (lane >= offset) {
+                    thread_prefix = scan_combine<T>(op, other, thread_prefix);
+                }
+            }
+            const AccT prior_thread_prefix = __shfl_up_sync(mask, thread_prefix, 1);
+            AccT before = lane == 0u ? identity : prior_thread_prefix;
+            before = scan_combine<T>(op, carry, before);
+
+            #pragma unroll
+            for (int j = 0; j < kItemsPerThread; ++j) {
+                const int64_t pos = tile +
+                    static_cast<int64_t>(threadIdx.x) * kItemsPerThread + j;
+                if (pos < d_size) {
+                    out[row * d_size + pos] = static_cast<T>(
+                        scan_combine<T>(op, before, local_prefix[j]));
+                }
+            }
+
+            const AccT tile_total = __shfl_sync(mask, thread_prefix, 31);
+            carry = scan_combine<T>(op, carry, tile_total);
+        }
+    }
+}
+
+template <typename T, typename Op, int kBlockThreads>
+__global__ void scan_single_row_block_kernel(int64_t n_rows, int64_t d_size,
+                                              const T* in, T* out,
+                                              T init_val, Op op) {
+    using AccT = scan_accum_t<T>;
+    constexpr int kItemsPerThread = 2;
+    alignas(sizeof(double)) extern __shared__ unsigned char raw[];
+    AccT* buf = reinterpret_cast<AccT*>(raw);
+    const int tid = threadIdx.x;
+    const AccT identity = static_cast<AccT>(init_val);
+    for (int64_t row = static_cast<int64_t>(blockIdx.x); row < n_rows;
+         row += static_cast<int64_t>(gridDim.x)) {
+        const T* row_in = in + row * d_size;
+        T* row_out = out + row * d_size;
+        AccT carry = identity;
+
+        for (int64_t tile = 0; tile < d_size;
+             tile += static_cast<int64_t>(kBlockThreads) * kItemsPerThread) {
+            const int64_t pos1 = tile + tid;
+            const int64_t pos2 = tile + kBlockThreads + tid;
+            buf[tid] = pos1 < d_size ? static_cast<AccT>(row_in[pos1]) : identity;
+            buf[kBlockThreads + tid] =
+                pos2 < d_size ? static_cast<AccT>(row_in[pos2]) : identity;
+            __syncthreads();
+
+            if (tid == 0) {
+                buf[0] = scan_combine<T>(op, carry, buf[0]);
+            }
+            __syncthreads();
+
+            for (int stride = 1; stride <= kBlockThreads; stride <<= 1) {
+                const int base = (tid / stride) * (2 * stride) + stride;
+                const int target = base + (tid % stride);
+                const int source = base - 1;
+                buf[target] = scan_combine<T>(op, buf[source], buf[target]);
+                __syncthreads();
+            }
+
+            if (pos1 < d_size) row_out[pos1] = static_cast<T>(buf[tid]);
+            if (pos2 < d_size) {
+                row_out[pos2] = static_cast<T>(buf[kBlockThreads + tid]);
+            }
+            carry = buf[2 * kBlockThreads - 1];
+            __syncthreads();
+        }
+    }
+}
+
+template <typename T, typename Op, int kBlockThreads, int kItemsPerThread>
+__global__ void scan_register_block_kernel(int64_t n_rows, int64_t d_size,
+                                            const T* in, T* out,
+                                            T init_val, Op op) {
+    using AccT = scan_accum_t<T>;
+    alignas(sizeof(double)) extern __shared__ unsigned char raw[];
+    AccT* totals = reinterpret_cast<AccT*>(raw);
+    const int tid = threadIdx.x;
+    const AccT identity = static_cast<AccT>(init_val);
+
+    for (int64_t row = static_cast<int64_t>(blockIdx.x); row < n_rows;
+         row += static_cast<int64_t>(gridDim.x)) {
+        const T* row_in = in + row * d_size;
+        T* row_out = out + row * d_size;
+        AccT carry = identity;
+
+        for (int64_t tile = 0; tile < d_size;
+             tile += static_cast<int64_t>(kBlockThreads) * kItemsPerThread) {
+            AccT local_prefix[kItemsPerThread];
+            AccT local_total = identity;
+            #pragma unroll
+            for (int j = 0; j < kItemsPerThread; ++j) {
+                const int64_t pos = tile + static_cast<int64_t>(tid) * kItemsPerThread + j;
+                if (pos < d_size) {
+                    local_total = scan_combine<T>(
+                        op, local_total, static_cast<AccT>(row_in[pos]));
+                    local_prefix[j] = local_total;
+                } else {
+                    local_prefix[j] = identity;
+                }
+            }
+            totals[tid] = local_total;
+            __syncthreads();
+
+            for (int stride = 1; stride < kBlockThreads; stride <<= 1) {
+                if ((tid % (2 * stride)) >= stride) {
+                    const int group = (tid / (2 * stride)) * (2 * stride);
+                    totals[tid] = scan_combine<T>(
+                        op, totals[group + stride - 1], totals[tid]);
+                }
+                __syncthreads();
+            }
+
+            AccT before = tid == 0 ? carry :
+                scan_combine<T>(op, carry, totals[tid - 1]);
+            #pragma unroll
+            for (int j = 0; j < kItemsPerThread; ++j) {
+                const int64_t pos = tile + static_cast<int64_t>(tid) * kItemsPerThread + j;
+                if (pos < d_size) {
+                    row_out[pos] = static_cast<T>(
+                        scan_combine<T>(op, before, local_prefix[j]));
+                }
+            }
+            carry = scan_combine<T>(op, carry, totals[kBlockThreads - 1]);
+            __syncthreads();
+        }
+    }
+}
+
+// Stable running log-sum-exp:
 // m = max(x, acc); acc = m + log1p(exp(-|x - acc|)).
 template <typename T>
 __global__ void logcumsumexp_scan_kernel(int64_t n_slices, int64_t d_size, int64_t inner,
@@ -145,14 +594,13 @@ __global__ void logcumsumexp_scan_kernel(int64_t n_slices, int64_t d_size, int64
     }
 }
 
-// gather: elementwise indexed read (ScatterGatherKernel.cu:98 elementwise
-// two-index functor structure).
+// Gather with separate result and source trailing extents.
 template <typename T>
 __global__ void gather_kernel(int64_t n, int64_t idx_dim_size, int64_t idx_inner,
                               int64_t self_dim_size, int64_t self_inner,
                               const T* s, const int64_t* ip, T* d) {
-    // Decomposition runs over the result (=index) shape; the source read
-    // for i != dim, so idx_inner and self_inner may differ).
+    // The result follows the index shape; source and index trailing extents
+    // can differ on axes other than the selected one.
     int64_t flat = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
     for (; flat < n; flat += stride) {
@@ -179,22 +627,19 @@ __device__ __forceinline__ void atomic_add_rel(BFloat16* addr, BFloat16 v) {
 }
 
 __device__ __forceinline__ int64_t atomic_add_rel_return(int64_t* addr) {
-    // ::atomicAdd — the vendored tensorplay::cuda overloads shadow the global
-    // CUDA atomicAdd set inside this namespace.
+    // Local overloads handle scalar widths without native atomicAdd support.
     return static_cast<int64_t>(::atomicAdd(reinterpret_cast<unsigned long long*>(addr),
                                             static_cast<unsigned long long>(1)));
 }
 
-// scatter/scatter_add: elementwise indexed write. Assign mode matches
-// ScatterGatherKernel.cu gpu_scatter_assign; Add mode uses atomicAdd exactly
-// like gpu_scatter_add_kernel (nondeterminism noted at ScatterGatherKernel.cu:588).
+// Scatter and scatter-add use elementwise indexed writes. Add mode uses
+// atomic accumulation and is intentionally unordered for colliding indices.
 template <typename T, bool Add>
 __global__ void scatter_kernel(int64_t total_idx, int64_t idx_dim_size, int64_t idx_inner,
                                int64_t self_dim_size, int64_t self_inner,
                                T* d, const int64_t* ip, const T* vp) {
-    // One thread per index element: elementwise mapping out[oo][idx][t] <->
-    // TensorIterator). Colliding indices serialize through atomics in Add
-    // mode.
+    // One thread handles one indexed element. Colliding additions serialize
+    // through atomics.
     int64_t flat = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
     for (; flat < total_idx; flat += stride) {
@@ -219,7 +664,7 @@ template <typename T>
 __global__ void index_add_kernel(int64_t total, int64_t inner, int64_t row,
                                  T* d, const int64_t* ip, const T* sp) {
     // One thread per (source position, inner column): adds sv into the
-    // selected destination slice (Indexing.cu index_add small-index path).
+    // selected destination slice.
     int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
     for (; t < total; t += stride) {
@@ -234,7 +679,7 @@ __global__ void index_add_kernel(int64_t total, int64_t inner, int64_t row,
     }
 }
 
-// index_select: row gather, Indexing.cu:1599 index_select_out_cuda_impl.
+// Index-select row gather.
 template <typename T>
 __global__ void index_select_kernel(int64_t total_out_elems, int64_t n_idx, int64_t inner,
                                     int64_t row, const T* s, const int64_t* ip, T* d) {
@@ -247,6 +692,25 @@ __global__ void index_select_kernel(int64_t total_out_elems, int64_t n_idx, int6
         int64_t iv = ip[k];
         if (iv < 0) iv += row;
         d[i] = s[(t / n_idx * row + iv) * inner + c];
+    }
+}
+
+template <typename T>
+__global__ void index_select_slice_kernel(int64_t n_slices, int64_t n_idx,
+                                          int64_t inner, int64_t row,
+                                          const T* s, const int64_t* ip, T* d) {
+    const int64_t slice_stride = static_cast<int64_t>(gridDim.x);
+    for (int64_t slice = static_cast<int64_t>(blockIdx.x); slice < n_slices;
+         slice += slice_stride) {
+        const int64_t outer_index = slice / n_idx;
+        const int64_t index_position = slice % n_idx;
+        int64_t source_index = ip[index_position];
+        if (source_index < 0) source_index += row;
+        const T* source = s + (outer_index * row + source_index) * inner;
+        T* destination = d + slice * inner;
+        for (int64_t c = threadIdx.x; c < inner; c += blockDim.x) {
+            destination[c] = source[c];
+        }
     }
 }
 
@@ -291,8 +755,8 @@ __global__ void index_put_kernel(int64_t n, T* d, const int64_t* ip, const T* vp
     }
 }
 
-// nonzero pass 1/2: count matches into counter[0], then each match claims a
-// slot via atomicAdd and writes coordinates (Nonzero.cu two-phase design).
+// Nonzero uses a count pass followed by a coordinate-writing pass. Matches
+// claim output slots atomically during the second pass.
 template <typename T>
 __global__ void nonzero_count_kernel(int64_t n, const T* x, int64_t* counter) {
     int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -318,8 +782,8 @@ __global__ void nonzero_fill_kernel(int64_t n, int64_t ndim, const T* x,
     }
 }
 
-// searchsorted binary search, Bucketization.cu searchsorted kernel: right=false
-// -> lower bound, right=true -> upper bound.
+// Searchsorted uses a binary search: right=false selects the lower bound and
+// right=true selects the upper bound.
 template <typename S, typename V>
 __global__ void searchsorted_kernel(int64_t n, int64_t seq_len, bool right,
                                     const S* sp, const V* vp, int64_t* rp) {
@@ -371,10 +835,9 @@ __global__ void bincount_weighted_kernel(int64_t n, const int64_t* x, const W* w
     for (; i < n; i += stride) atomic_add_rel(&bins[x[i]], wp[i]);
 }
 
-// Per-slice in-place heapsort carrying original positions. Deviation note:
-// sortKeyValueInplace); a global-memory heapsort keeps arbitrary slice sizes
-// without shared-memory limits while preserving the stable-order contract of
-// the reference implementation.
+// Per-slice in-place heapsort carrying original positions. Global-memory
+// storage supports arbitrary slice sizes without shared-memory limits while
+// preserving the stable-order contract.
 template <typename T>
 __global__ void sort_kernel(int64_t n_slices, int64_t d_size, int64_t inner,
                             bool descending, const T* in, T* vals, int64_t* idxs) {
@@ -422,8 +885,7 @@ __global__ void sort_kernel(int64_t n_slices, int64_t d_size, int64_t inner,
 // ---------------------------------------------------------------------------
 
 Tensor masked_fill_cuda(const Tensor& self, const Tensor& mask, Scalar value) {
-    // TensorAdvancedIndexing.cpp:2463 Bool-only check; :2525 out-of-place =
-    // expand_outplace + clone + fill.
+    // Broadcast the mask and source once, then apply the replacement in one pass.
     if (mask.dtype() != DType::Bool) {
         TP_THROW(TypeError, "masked_fill only supports boolean masks");
     }
@@ -459,7 +921,6 @@ Tensor& masked_fill__cuda(Tensor& self, const Tensor& mask, Scalar value) {
 }
 
 Tensor& masked_fill_tensor__cuda(Tensor& self, const Tensor& mask, const Tensor& value) {
-    // TensorAdvancedIndexing.cpp:2498-2509
     if (value.dim() != 0) {
         TP_THROW(RuntimeError,
                  "masked_fill_ only supports a 0-dimensional value tensor, but got tensor with ",
@@ -478,7 +939,7 @@ Tensor masked_fill_tensor_cuda(const Tensor& self, const Tensor& mask, const Ten
 }
 
 // ---------------------------------------------------------------------------
-// tril / triu (TriangularOps.cpp:176/:180)
+// tril / triu.
 // ---------------------------------------------------------------------------
 
 Tensor tril_cuda(const Tensor& self, int64_t diagonal);
@@ -516,8 +977,7 @@ Tensor tril_cuda(const Tensor& self, int64_t diagonal) { return triangular_mask_
 Tensor triu_cuda(const Tensor& self, int64_t diagonal) { return triangular_mask_entry<false>(self, diagonal); }
 
 // ---------------------------------------------------------------------------
-// cumsum / cumprod / logcumsumexp (ReduceOpsKernel.cpp:80/:99/:118 formulas,
-// CUDA scan structure per ScanUtils.cuh:154)
+// cumsum / cumprod / logcumsumexp.
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -531,9 +991,75 @@ Tensor scan_entry(const Tensor& self, int64_t dim, T init_val, Op op) {
     outer_inner(static_cast<std::vector<int64_t>>(self_c.shape()), dim, outer, inner);
     int64_t slices = outer * inner;
     auto stream = getCurrentCUDAStream().stream();
-    scan_kernel<T, Op><<<(slices + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-        slices, d_size, inner,
-        self_c.data_ptr<T>(), result.data_ptr<T>(), init_val, op);
+    if (inner == 1 && d_size >= 16 && d_size < 512) {
+        launch_short_rows_scan<T>(outer, d_size, self_c.data_ptr<T>(), result.data_ptr<T>(), init_val, op, stream);
+        CUDA_CHECK(cudaGetLastError());
+        return result;
+    }
+    if (inner == 1 && outer == 1 && d_size >= 512 && d_size <= 8192) {
+        if constexpr (std::is_same_v<T, double>) {
+            if constexpr (std::is_same_v<Op, scan_arithmetic_op<T, false>>) {
+                if (scan_flat_sum_with_cub<T>(self_c, result)) return result;
+            } else if constexpr (std::is_same_v<Op, scan_arithmetic_op<T, true>>) {
+                if (scan_flat_product_with_cub<T>(self_c, result)) return result;
+            } else if (scan_flat_with_cub<T>(self_c, result, op)) {
+                return result;
+            }
+        }
+        constexpr int kScanBlockThreads = 512;
+        scan_register_block_kernel<T, Op, kScanBlockThreads, 4><<<
+            1, kScanBlockThreads,
+            kScanBlockThreads * sizeof(scan_accum_t<T>), stream>>>(
+            1, d_size, self_c.data_ptr<T>(), result.data_ptr<T>(), init_val, op);
+        CUDA_CHECK(cudaGetLastError());
+        return result;
+    }
+    if (inner == 1 && outer > 1 && outer <= 64 && d_size >= 8192) {
+        constexpr int kScanBlockThreads = 512;
+        const int64_t blocks = std::min<int64_t>(outer, 4096);
+        scan_register_block_kernel<T, Op, kScanBlockThreads, 4><<<
+            static_cast<unsigned>(blocks), kScanBlockThreads,
+            kScanBlockThreads * sizeof(scan_accum_t<T>), stream>>>(
+            outer, d_size, self_c.data_ptr<T>(), result.data_ptr<T>(), init_val, op);
+        CUDA_CHECK(cudaGetLastError());
+        return result;
+    }
+    if (inner == 1 && outer == 1 && d_size >= 512) {
+        if constexpr (std::is_same_v<Op, scan_arithmetic_op<T, false>>) {
+            if (scan_flat_sum_with_cub<T>(self_c, result)) return result;
+        } else if constexpr (std::is_same_v<Op, scan_arithmetic_op<T, true>>) {
+            if (scan_flat_product_with_cub<T>(self_c, result)) return result;
+        } else if (scan_flat_with_cub<T>(self_c, result, op)) {
+            return result;
+        }
+    }
+    if (inner == 1 && d_size >= 512) {
+        const int64_t blocks = std::min<int64_t>(outer, 4096);
+        constexpr int kWarpThreads = 32;
+        scan_row_kernel<T, Op><<<static_cast<unsigned>(blocks), kWarpThreads, 0, stream>>>(
+            outer, d_size, self_c.data_ptr<T>(), result.data_ptr<T>(), init_val, op);
+    } else if (inner > 1) {
+        const int threads = static_cast<int>(std::min<int64_t>(inner, 512));
+        const int64_t blocks_x = std::min<int64_t>(outer, 65535);
+        const int64_t blocks_y = std::min<int64_t>(
+            (inner + threads - 1) / threads, 65535);
+        const dim3 grid(static_cast<unsigned>(blocks_x), static_cast<unsigned>(blocks_y));
+        if (static_cast<uint64_t>(self_c.numel()) <=
+            static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+            scan_outer_kernel<T, Op, uint32_t><<<grid, threads, 0, stream>>>(
+                static_cast<uint32_t>(outer), static_cast<uint32_t>(d_size),
+                static_cast<uint32_t>(inner), self_c.data_ptr<T>(),
+                result.data_ptr<T>(), init_val, op);
+        } else {
+            scan_outer_kernel<T, Op, int64_t><<<grid, threads, 0, stream>>>(
+                outer, d_size, inner, self_c.data_ptr<T>(),
+                result.data_ptr<T>(), init_val, op);
+        }
+    } else {
+        scan_kernel<T, Op><<<(slices + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+            slices, d_size, inner,
+            self_c.data_ptr<T>(), result.data_ptr<T>(), init_val, op);
+    }
     CUDA_CHECK(cudaGetLastError());
     return result;
 }
@@ -543,12 +1069,13 @@ Tensor cumsum_cuda(const Tensor& self, int64_t dim, std::optional<DType> dtype) 
     int64_t nd = self.dim();
     if (nd == 0) TP_THROW(RuntimeError, "cumsum: dimension not supported for scalar tensors");
     dim = wrap_dim(dim, nd);
-    DType out_dtype = dtype.value_or(self.dtype());
+    DType out_dtype = dtype.value_or(isIntegralType(self.dtype(), true) ? DType::Int64
+                                                                         : self.dtype());
     Tensor src = (self.dtype() == out_dtype) ? self : self.to(out_dtype);
 #define TP_CS_CASE(ctype, name) \
     case DType::name: \
         return scan_entry<ctype>(src, dim, static_cast<ctype>(0), \
-                                 [] __device__ (ctype a, ctype x) { return static_cast<ctype>(a + x); });
+                                 scan_arithmetic_op<ctype, false>{});
     switch (out_dtype) {
         TP_CS_CASE(uint8_t, UInt8)
         TP_CS_CASE(int8_t, Int8)
@@ -568,12 +1095,13 @@ Tensor cumprod_cuda(const Tensor& self, int64_t dim, std::optional<DType> dtype)
     int64_t nd = self.dim();
     if (nd == 0) TP_THROW(RuntimeError, "cumprod: dimension not supported for scalar tensors");
     dim = wrap_dim(dim, nd);
-    DType out_dtype = dtype.value_or(self.dtype());
+    DType out_dtype = dtype.value_or(isIntegralType(self.dtype(), true) ? DType::Int64
+                                                                         : self.dtype());
     Tensor src = (self.dtype() == out_dtype) ? self : self.to(out_dtype);
 #define TP_CP_CASE(ctype, name) \
     case DType::name: \
         return scan_entry<ctype>(src, dim, static_cast<ctype>(1), \
-                                 [] __device__ (ctype a, ctype x) { return static_cast<ctype>(a * x); });
+                                 scan_arithmetic_op<ctype, true>{});
     switch (out_dtype) {
         TP_CP_CASE(uint8_t, UInt8)
         TP_CP_CASE(int8_t, Int8)
@@ -616,7 +1144,7 @@ Tensor logcumsumexp_cuda(const Tensor& self, int64_t dim, std::optional<DType> d
 }
 
 // ---------------------------------------------------------------------------
-// gather (TensorAdvancedIndexing.cpp:2097)
+// gather.
 // ---------------------------------------------------------------------------
 
 Tensor gather_cuda(const Tensor& self, int64_t dim, const Tensor& index) {
@@ -659,8 +1187,7 @@ Tensor gather_cuda(const Tensor& self, int64_t dim, const Tensor& index) {
 }
 
 // ---------------------------------------------------------------------------
-// scatter / scatter_add (ScatterGatherKernel.cu:98; Add uses atomicAdd,
-// nondeterministic per :588)
+// scatter / scatter_add.
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -851,7 +1378,7 @@ Tensor& scatter_add_inplace_cuda(Tensor& self, int64_t dim, const Tensor& index,
 }
 
 // ---------------------------------------------------------------------------
-// index_select (Indexing.cu:1599 index_select_out_cuda_impl)
+// index_select.
 // ---------------------------------------------------------------------------
 
 Tensor index_select_cuda(const Tensor& self, int64_t dim, const Tensor& index) {
@@ -870,12 +1397,22 @@ Tensor index_select_cuda(const Tensor& self, int64_t dim, const Tensor& index) {
     if (total == 0) return result;
     Tensor self_c = self.contiguous();
     auto stream = getCurrentCUDAStream().stream();
+    const int slice_threads = inner >= 1024 ? 512 : kThreads;
 #define TP_IS_CASE(ctype, name) \
-    case DType::name: \
-        index_select_kernel<ctype><<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
-            total, n_idx, inner, row, self_c.data_ptr<ctype>(), \
-            idx.data_ptr<int64_t>(), result.data_ptr<ctype>()); \
-        break;
+    case DType::name: { \
+        if (inner >= 64) { \
+            const int64_t slices = outer * n_idx; \
+            const int64_t blocks = std::min<int64_t>(slices, 4096); \
+            index_select_slice_kernel<ctype><<<static_cast<unsigned>(blocks), slice_threads, 0, stream>>>( \
+                slices, n_idx, inner, row, self_c.data_ptr<ctype>(), \
+                idx.data_ptr<int64_t>(), result.data_ptr<ctype>()); \
+        } else { \
+            index_select_kernel<ctype><<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
+                total, n_idx, inner, row, self_c.data_ptr<ctype>(), \
+                idx.data_ptr<int64_t>(), result.data_ptr<ctype>()); \
+        } \
+        break; \
+    }
     switch (self.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_IS_CASE)
         default: TP_THROW(TypeError, "index_select: unsupported dtype");
@@ -886,7 +1423,7 @@ Tensor index_select_cuda(const Tensor& self, int64_t dim, const Tensor& index) {
 }
 
 // ---------------------------------------------------------------------------
-// index_add (atomic accumulation, Indexing.cu index_add path)
+// index_add with atomic accumulation.
 // ---------------------------------------------------------------------------
 
 Tensor index_add_cuda(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& source) {
@@ -937,7 +1474,7 @@ Tensor index_add_cuda(const Tensor& self, int64_t dim, const Tensor& index, cons
 }
 
 // ---------------------------------------------------------------------------
-// index_copy / index_fill (IndexKernel.cpp:218/:277 semantics)
+// index_copy / index_fill.
 // ---------------------------------------------------------------------------
 
 Tensor index_copy_cuda(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& source) {
@@ -1009,8 +1546,7 @@ Tensor index_fill_scalar_cuda(const Tensor& self, int64_t dim, const Tensor& ind
 }
 
 Tensor& index_fill_scalar__cuda(Tensor& self, int64_t dim, const Tensor& index, Scalar value) {
-    // In-place variant of index_fill (IndexKernel.cu semantics): fill a
-    // clone then copy back through the existing in-place copy path.
+    // Fill a clone, then copy it back through the existing in-place path.
     self.copy_(index_fill_scalar_cuda(self, dim, index, value));
     return self;
 }
@@ -1025,7 +1561,7 @@ Tensor& index_fill_tensor__cuda(Tensor& self, int64_t dim, const Tensor& index, 
 }
 
 // ---------------------------------------------------------------------------
-// index_put / index_put_ (_index_put_impl_ TensorAdvancedIndexing.cpp:962)
+// index_put / index_put_.
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -1104,7 +1640,7 @@ Tensor& index_put__cuda(Tensor& self, const std::vector<Tensor>& indices,
 }
 
 // ---------------------------------------------------------------------------
-// nonzero (Nonzero.cu two-phase: count then claim slots via atomics)
+// nonzero (count pass followed by an atomic slot-claiming pass).
 // ---------------------------------------------------------------------------
 
 Tensor nonzero_cuda(const Tensor& self) {
@@ -1158,7 +1694,7 @@ Tensor nonzero_cuda(const Tensor& self) {
 }
 
 // ---------------------------------------------------------------------------
-// searchsorted / bucketize (Bucketization.cu)
+// searchsorted / bucketize.
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -1214,12 +1750,12 @@ Tensor searchsorted_cuda(const Tensor& sorted_sequence, const Tensor& self, bool
 }
 
 Tensor bucketize_cuda(const Tensor& self, const Tensor& boundaries, bool out_int32, bool right) {
-    // Bucketization.cpp bucketize_cpu swaps (boundaries, values).
+    // Boundaries are the sorted sequence and self supplies the query values.
     return searchsorted_impl_cuda(boundaries, self, out_int32, right);
 }
 
 // ---------------------------------------------------------------------------
-// bincount (BincountKernel.cu: max-reduce to size on host, then atomicAdd)
+// bincount (host-sized histogram followed by atomic accumulation).
 // ---------------------------------------------------------------------------
 
 Tensor bincount_cuda(const Tensor& self, const std::optional<Tensor>& weights_opt, int64_t minlength) {
@@ -1281,7 +1817,7 @@ Tensor bincount_cuda(const Tensor& self, const std::optional<Tensor>& weights_op
 }
 
 // ---------------------------------------------------------------------------
-// take (reshape -> index_select -> reshape, TensorAdvancedIndexing.cpp:1076)
+// take (reshape -> index_select -> reshape).
 // ---------------------------------------------------------------------------
 
 Tensor take_cuda(const Tensor& self, const Tensor& index) {
@@ -1291,7 +1827,7 @@ Tensor take_cuda(const Tensor& self, const Tensor& index) {
 }
 
 // ---------------------------------------------------------------------------
-// masked_scatter (sequential consumption order per IndexKernel.cu:409)
+// masked_scatter (source values are consumed in mask order).
 // ---------------------------------------------------------------------------
 
 Tensor masked_scatter_cuda(const Tensor& self, const Tensor& mask, const Tensor& source) {
@@ -1327,7 +1863,7 @@ Tensor masked_scatter_cuda(const Tensor& self, const Tensor& mask, const Tensor&
 }
 
 // ---------------------------------------------------------------------------
-// sort / argsort (Sorting.cpp:1018 per-slice sort carrying positions)
+// sort / argsort (per-slice sort carrying original positions).
 // ---------------------------------------------------------------------------
 
 std::tuple<Tensor, Tensor> sort_cuda(const Tensor& self, int64_t dim, bool descending) {
@@ -1359,7 +1895,7 @@ std::tuple<Tensor, Tensor> sort_cuda(const Tensor& self, int64_t dim, bool desce
 }
 
 Tensor argsort_cuda(const Tensor& self, int64_t dim, bool descending) {
-    // Sorting.cpp sort_indices: indices-only variant of sort.
+    // Indices-only variant of the per-slice sort.
     return std::get<1>(sort_cuda(self, dim, descending));
 }
 
@@ -1502,7 +2038,7 @@ std::tuple<Tensor, Tensor, Tensor> unique_cuda(const Tensor& self, bool sorted,
 }
 
 // ---------------------------------------------------------------------------
-// cumsum_backward (derivatives.yaml:530 -> reverse scan R[i]=sum_{j>=i} g[j])
+// cumsum_backward: reverse scan R[i] = sum_{j>=i} g[j].
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -1632,12 +2168,10 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, IndexingKernels) {
 } // namespace cuda
 
 // ---------------------------------------------------------------------------
-// reduce functors (gpuAtomicAdd/Mul/Min/Max from the vendored Atomic.cuh,
-// safe_min/safe_max NaN semantics) and Indexing.cu index_reduce_func_cuda_impl
-// (:1320): with include_self=False only the indexed slices are reset to the
-// per-op identity before accumulating (index_fill_ pre-pass); slices never
-// touched by index keep their original self values. Mean divides by
-// full-rank counts with zero-counts masked to 1 (Indexing.cu:1517-1526).
+// Reduction functors and indexed reduction helpers. With include_self=False,
+// indexed slices are reset to the operation identity before accumulation;
+// untouched slices retain their original values. Mean divides by full-rank
+// counts, replacing zero counts with one before division.
 // Floating-point dtypes only: the atomic primitives cover Float32/Float64.
 // scatter_reduce_backward / index_reduce_backward.
 // ---------------------------------------------------------------------------
@@ -1912,8 +2446,7 @@ Tensor sr_forward_cuda_impl(const Tensor& self, int64_t dim,
     CUDA_CHECK(cudaGetLastError());
 
     if (op == SrReduceCuda::Mean) {
-        // Indexing.cu:1518-1526: counts.masked_fill_(counts == 0, 1);
-        // result.div_(counts)
+        // Avoid division by zero for slices with no selected entries.
         count = count.masked_fill(count.eq(0), 1);
         result = result.div(count.to(result.dtype()));
     }
@@ -2056,8 +2589,7 @@ Tensor ir_forward_cuda_impl(const Tensor& self, int64_t dim,
     CUDA_CHECK(cudaGetLastError());
 
     if (reduce == "mean") {
-        // Indexing.cu:1518-1526: counts.masked_fill_(counts == 0, 1);
-        // result.div_(counts)
+        // Avoid division by zero for slices with no selected entries.
         count = count.masked_fill(count.eq(0), 1);
         result = result.div(count.to(result.dtype()));
     }
@@ -2072,7 +2604,6 @@ Tensor scatter_reduce_backward_self_cuda(const Tensor& grad,
                                          bool include_self) {
     const SrReduceCuda op = parse_sr_reduce_cuda(reduce);
     if (op == SrReduceCuda::Sum) {
-        // FunctionsManual: grad_self = grad
         if (!include_self) return grad.scatter(dim, index, Scalar(0));
         return grad;
     }
@@ -2135,8 +2666,7 @@ Tensor scatter_reduce_backward_src_cuda(const Tensor& grad,
         Tensor n_dist = self_is_result.scatter_add(dim, index, src_is_result);
         Tensor distributed = grad.div(n_dist);
         Tensor out = src_is_result.mul(distributed.gather(dim, index));
-        // FunctionsManual applies the !include_self zeroing to grad_self
-        // only; grad_src always receives gradient.
+        // The source gradient is defined for every selected source entry.
         return out;
     }
     Tensor masked_self = self.masked_fill(self.eq(0), 1.0);
@@ -2166,8 +2696,7 @@ Tensor index_reduce_backward_self_cuda(const Tensor& grad,
                                        const std::string& reduce,
                                        bool include_self) {
     const SrReduceCuda op = parse_sr_reduce_cuda(reduce);
-    // FunctionsManual index_reduce_backward applies the !include_self zeroing
-    // via index_fill (the index here is always a vector).
+    // Exclude the original values from the gradient when requested.
     if (op == SrReduceCuda::Sum) {
         if (!include_self) return grad.index_fill(dim, index, Scalar(0));
         return grad;

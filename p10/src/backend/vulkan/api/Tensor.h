@@ -224,6 +224,13 @@ class vTensor final {
   std::shared_ptr<vTensorStorage> view_;
 
  public:
+  // Storage-sharing accessor: converting a vTensor into a user-facing Tensor
+  // must reuse this handle so shader writes land in the same payload the
+  // Tensor exposes.
+  inline const std::shared_ptr<vTensorStorage>& view() const {
+    return view_;
+  }
+
   /*
    * Texture Access
    */

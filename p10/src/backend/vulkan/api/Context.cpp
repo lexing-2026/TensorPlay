@@ -25,6 +25,7 @@ Context::Context(size_t adapter_i, const ContextConfig& config)
       command_pool_(device_, queue_.family_index, config_.cmdPoolConfig),
       descriptor_pool_(device_, config_.descriptorPoolConfig),
       fences_(device_),
+      querypool_(device_, config_.queryPoolConfig),
       // Command buffer submission
       cmd_mutex_{},
       cmd_(VK_NULL_HANDLE, 0u),
@@ -98,12 +99,26 @@ void Context::submit_cmd_to_gpu(VkFence fence_handle, const bool final_use) {
   }
 }
 
+std::pair<VkQueryPool, uint32_t> Context::write_timestamp() {
+  std::lock_guard<std::mutex> cmd_lock(cmd_mutex_);
+  set_cmd();
+
+  auto slot = querypool_.get_new_query();
+  cmd_.write_timestamp(slot.first, slot.second);
+  return slot;
+}
+
 void Context::flush() {
+  // Submit any pending recorded work before waiting on the queue.  Fence
+  // managed paths call flush while holding the dispatch lock, so this must
+  // not re-lock; synchronize-style callers tolerate the same relaxed
+  // ordering because the queue wait follows the submit attempt.
+  submit_cmd_to_gpu();
+
   VK_CHECK(vkQueueWaitIdle(queue()));
 
   command_pool_.flush();
   descriptor_pool_.flush();
-
   // If there is an existing command buffer, invalidate it
   if (cmd_) {
     cmd_.invalidate();
@@ -142,10 +157,16 @@ Context* context() {
           32u, // descriptorPileSizes
       };
 
+      const QueryPoolConfig query_pool_config{
+          32u, // queryPoolInitialSize
+          16u, // queryPoolBatchSize
+      };
+
       const ContextConfig config{
           submit_frequency, // cmdSubmitFrequency
           cmd_config, // cmdPoolConfig
           descriptor_pool_config, // descriptorPoolConfig
+          query_pool_config, // queryPoolConfig
       };
 
       return new Context(runtime()->default_adapter_i(), config);

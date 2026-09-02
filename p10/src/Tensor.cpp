@@ -1,8 +1,11 @@
  #include <iomanip>
 #include <type_traits>
 #include "Tensor.h"
+#include "tensorplay/ops/TPXOpsGenerated.h"
+namespace ops = tensorplay::tpx::ops;
 #include "TensorImpl.h"
 #include "Storage.h"
+#include "Quantizer.h"
 #include "SparseKernels.h"
 #include "BatchingKernels.h"
 #include "Utils.h"
@@ -33,6 +36,9 @@ std::ostream& operator<<(std::ostream& os, DType dt) {
         case DType::ComplexDouble: os << "complex128"; break;
         case DType::BComplex32: os << "bcomplex32"; break;
         case DType::Bool: os << "bool"; break;
+        case DType::QInt8: os << "qint8"; break;
+        case DType::QUInt8: os << "quint8"; break;
+        case DType::QInt32: os << "qint32"; break;
         default: os << "dtype(" << static_cast<int>(dt) << ")"; break;
     }
     return os;
@@ -585,6 +591,15 @@ std::string Tensor::toString() const {
         case DType::Bool:
             print_data_recursive(ss, tensor_to_print.data_ptr<bool>(), current_sizes, current_strides, 0, 7, options, summarizing);
             break;
+        case DType::QInt8:
+            print_data_recursive(ss, tensor_to_print.data_ptr<int8_t>(), current_sizes, current_strides, 0, 7, options, summarizing);
+            break;
+        case DType::QUInt8:
+            print_data_recursive(ss, tensor_to_print.data_ptr<uint8_t>(), current_sizes, current_strides, 0, 7, options, summarizing);
+            break;
+        case DType::QInt32:
+            print_data_recursive(ss, tensor_to_print.data_ptr<int32_t>(), current_sizes, current_strides, 0, 7, options, summarizing);
+            break;
         default:
             ss << "Tensor(shape=" << shape() << ", dtype=" << dtype() << ", device=" << device() << ")";
             return ss.str();
@@ -592,6 +607,21 @@ std::string Tensor::toString() const {
     
     if (dtype() != DType::Float32) {
         ss << ", dtype=" << dtype();
+    }
+
+    // Quantized tensors surface their scheme and affine parameters in the
+    // representation, so the mapping is visible alongside the codes.
+    if (impl_->has_quantizer()) {
+        const auto q = impl_->quantizer();
+        ss << ", quantization_scheme=tensorplay." << tensorplay::toString(q->qscheme());
+        if (q->qscheme() == QScheme::PerTensorAffine) {
+            ss << ", scale=" << q->scale()
+               << ", zero_point=" << q->zero_point();
+        } else {
+            ss << ", scale=" << q->scales().toString()
+               << ", zero_point=" << q->zero_points().toString()
+               << ", axis=" << q->axis();
+        }
     }
 
     if (device().type() != DeviceType::CPU) {
@@ -630,9 +660,26 @@ Tensor Tensor::as_strided(const std::vector<int64_t>& size,
     if (offset < 0) {
         TP_THROW(ValueError, "as_strided(): storage_offset must be non-negative");
     }
+    // The Vulkan payload has no stride addressing: a strided view over it
+    // would read back in storage order, so the view materializes on the GPU
+    // through the backend's as_strided kernel instead of aliasing storage.
+    if (impl_->device().is_vulkan()) {
+        static const OperatorHandle handle =
+            Dispatcher::singleton().findHandle("as_strided");
+        return DispatchStub<Tensor, const Tensor&, const std::vector<int64_t>&,
+                            const std::vector<int64_t>&,
+                            std::optional<int64_t>>::
+            call(handle, DispatchKey::Vulkan, *this, size, stride,
+                 std::optional<int64_t>(offset));
+    }
     Tensor out = Tensor(impl_->storage(), size, stride, impl_->dtype(),
                         static_cast<size_t>(offset));
     out.unsafeGetTensorImpl()->share_version_counter(*impl_);
+    // Every view op funnels through here: a quantized source's quantizer
+    // rides along since the view aliases the same codes and mapping.
+    if (impl_->has_quantizer()) {
+        out.unsafeGetTensorImpl()->set_quantizer(impl_->quantizer());
+    }
     return out;
 }
 
@@ -663,7 +710,17 @@ Tensor Tensor::view_dtype(DType dtype) const {
                             static_cast<std::vector<int64_t>>(strides()),
                             dtype, impl_->storage_offset());
         out.unsafeGetTensorImpl()->share_version_counter(*impl_);
+        if (impl_->has_quantizer()) {
+            out.unsafeGetTensorImpl()->set_quantizer(impl_->quantizer());
+        }
         return out;
+    }
+    // A reinterpretation crosses VkFormat boundaries on the Vulkan payload:
+    // the texture was allocated for the source element type, so aliasing it
+    // as another dtype cannot be addressed.  Same-dtype views stay safe.
+    if (impl_->device().is_vulkan()) {
+        TP_THROW(NotImplementedError,
+                 "view(dtype) reinterpretation is not supported on Vulkan tensors");
     }
 
     const std::vector<int64_t> self_sizes = static_cast<std::vector<int64_t>>(shape());
@@ -877,6 +934,11 @@ Tensor clone_impl(const Tensor& self, std::optional<MemoryFormat> memory_format)
         }
     }
     out_impl->set_memory_format(result_format);
+    // A clone is a full-value copy: a quantized source's quantizer rides
+    // along so the result stays a quantized tensor with the same mapping.
+    if (self.unsafeGetTensorImpl()->has_quantizer()) {
+        out_impl->set_quantizer(self.unsafeGetTensorImpl()->quantizer());
+    }
     Tensor t(std::move(out_impl));
     // every same-dtype contiguous clone through the dispatcher.  Optimizer
     // momentum initialization creates one clone per parameter, so this
@@ -925,6 +987,9 @@ Tensor contiguous_impl(const Tensor& self, int64_t memory_format_raw) {
                     getAllocator(self.device().type()), self.device());
     auto out_impl = std::make_shared<TensorImpl>(storage, sizes_v, strides, self.dtype(), 0);
     out_impl->set_memory_format(format);
+    if (self.unsafeGetTensorImpl()->has_quantizer()) {
+        out_impl->set_quantizer(self.unsafeGetTensorImpl()->quantizer());
+    }
     Tensor out(std::move(out_impl));
     out.copy_(self);
     out.unsafeGetTensorImpl()->reset_version();
@@ -951,7 +1016,8 @@ Tensor Tensor::to(DType dtype, bool non_blocking, bool copy) const {
     if (this->dtype() == dtype) {
         return copy ? clone() : *this;
     }
-    Tensor t(impl_->sizes(), dtype, device());
+    Tensor t = ops::empty(
+        impl_->sizes(), dtype, device(), /*pin_memory=*/false);
     t.copy_(*this, non_blocking);
     return t;
 }
@@ -975,8 +1041,12 @@ Tensor Tensor::to(Device device, bool non_blocking, bool copy) const {
     if (this->device() == device) {
         return copy ? clone() : *this;
     }
-    Tensor t(impl_->sizes(), dtype(), device);
+    Tensor t = ops::empty(
+        impl_->sizes(), dtype(), device, /*pin_memory=*/false);
     t.copy_(*this, non_blocking);
+    if (impl_->has_quantizer()) {
+        t.unsafeGetTensorImpl()->set_quantizer(impl_->quantizer());
+    }
     return t;
 }
 
@@ -1001,7 +1071,8 @@ Tensor Tensor::to(Device device, DType dtype, bool non_blocking, bool copy) cons
     if (this->device() == device && this->dtype() == dtype) {
         return copy ? clone() : *this;
     }
-    Tensor t(impl_->sizes(), dtype, device);
+    Tensor t = ops::empty(
+        impl_->sizes(), dtype, device, /*pin_memory=*/false);
     t.copy_(*this, non_blocking);
     return t;
 }

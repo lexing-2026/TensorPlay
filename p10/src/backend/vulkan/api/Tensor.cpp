@@ -238,6 +238,17 @@ static VulkanImage allocate_image(
 
   const bool allow_transfer = true;
 
+  // Texture reads go through combined image samplers, so every image carries
+  // a cached sampler matching its sampling properties.
+  const api::ImageSampler::Properties sampler_props{
+      VK_FILTER_NEAREST, // filter
+      VK_SAMPLER_MIPMAP_MODE_NEAREST, // mipmap_mode
+      VK_SAMPLER_ADDRESS_MODE_REPEAT, // address_mode:
+      VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK, // border_color
+  };
+  VkSampler sampler =
+      adapter_ptr->sampler_cache().retrieve(sampler_props);
+
   VulkanImage image = adapter_ptr->vma().create_image(
       {
           extents[0u], // width
@@ -247,14 +258,8 @@ static VulkanImage allocate_image(
       image_format,
       VK_IMAGE_TYPE_3D,
       VK_IMAGE_VIEW_TYPE_3D,
-      {
-          VK_FILTER_NEAREST, // filter
-          VK_SAMPLER_MIPMAP_MODE_NEAREST, // mipmap_mode
-          VK_SAMPLER_ADDRESS_MODE_REPEAT, // address_mode:
-          VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK, // border_color
-      },
-      // Sampler will not be used
-      VK_NULL_HANDLE,
+      sampler_props,
+      sampler,
       allow_transfer,
       allocate_memory);
 
@@ -324,10 +329,10 @@ void vTensorStorage::transition(
   const bool write = access & api::MemoryAccessType::WRITE;
 
   if (api::StorageType::TEXTURE_3D == storage_type_) {
-    // Images track their layout through the barrier system: every write
-    // re-asserts VK_IMAGE_LAYOUT_GENERAL, matching the layout the image was
-    // created with.  Barriers between dependent dispatches are recorded the
-    // same way as buffers.
+    // Images track their layout through the barrier system: every access
+    // transitions to (and re-asserts) VK_IMAGE_LAYOUT_GENERAL, matching the
+    // layout the descriptor bindings advertise.  Barriers between dependent
+    // dispatches are recorded the same way as buffers.
     const bool is_write_only = write && !read;
 
     if (write) {
@@ -343,6 +348,7 @@ void vTensorStorage::transition(
             image_);
       }
 
+      image_.set_layout(VK_IMAGE_LAYOUT_GENERAL);
       last_access_ = LastAccess{stage, access};
     } else if (read) {
       if (last_access_.access & api::MemoryAccessType::WRITE) {
@@ -357,6 +363,8 @@ void vTensorStorage::transition(
             VK_IMAGE_LAYOUT_GENERAL,
             image_);
       }
+
+      image_.set_layout(VK_IMAGE_LAYOUT_GENERAL);
 
       if (last_access_.stage == api::PipelineStage::NO_STAGE) {
         last_access_ = LastAccess{stage, access};

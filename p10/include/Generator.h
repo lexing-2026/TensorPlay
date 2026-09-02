@@ -11,6 +11,17 @@ class Tensor;
 
 constexpr uint64_t default_rng_seed_val = 67280421310721ULL;
 
+// Reference-semantics handle: copies share one underlying state stream, so a
+// generator passed by value into a kernel still advances the caller's
+// sequence.  The default generator is just the first created instance.
+struct P10_API GeneratorState {
+    mt19937_engine engine;
+    // Box-Muller produces samples in pairs; the unconsumed half is cached
+    // here and participates in get_state/set_state.
+    std::optional<float> next_float_normal_sample;
+    std::optional<double> next_double_normal_sample;
+};
+
 class P10_API Generator {
 public:
     explicit Generator(uint64_t seed_val = default_rng_seed_val);
@@ -28,21 +39,20 @@ public:
     uint32_t random();
     uint64_t random64();
 
-    // Box-Muller produces samples in pairs; the unconsumed half is cached here
-    // and participates in get_state/set_state.
     std::optional<float> next_float_normal_sample() const;
     std::optional<double> next_double_normal_sample() const;
     void set_next_float_normal_sample(std::optional<float> randn);
     void set_next_double_normal_sample(std::optional<double> randn);
 
-    // Serializes the full engine state to a CPU UInt8 tensor using the same
+    // Serializes the full engine state to a CPU UInt8 tensor.
     Tensor get_state() const;
     void set_state(const Tensor& new_state);
 
+    GeneratorState& state() { return *state_; }
+    const GeneratorState& state() const { return *state_; }
+
 private:
-    mt19937_engine engine_;
-    std::optional<float> next_float_normal_sample_;
-    std::optional<double> next_double_normal_sample_;
+    std::shared_ptr<GeneratorState> state_;
 };
 
 namespace detail {

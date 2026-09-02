@@ -2,14 +2,10 @@
 
 #include "DType.h"
 #include <cuda_runtime.h>
-#include <cub/warp/warp_load.cuh>
-#include <cub/warp/warp_merge_sort.cuh>
-#include <cub/warp/warp_store.cuh>
-#include <cub/block/block_load.cuh>
-#include <cub/block/block_radix_sort.cuh>
-#include <cub/block/block_store.cuh>
+#include "GPUPrimitives.cuh"
 #include <cstdint>
 #include <cmath>
+#include <iterator>
 #include <limits>
 #include <type_traits>
 
@@ -55,33 +51,107 @@ struct TopKSortValue {
   int64_t index;
 };
 
+// Element-level strided iterator over one row of a batched tensor, with
+// the full random-access protocol so the collective load/store primitives
+// can read its traits and step it.  `pointer` always addresses the current
+// element; stepping multiplies the advance by the row stride.
 template <typename T>
 struct TopKStridedReadAccessor {
+  using value_type = T;
+  using difference_type = int64_t;
+  using pointer_t = const T*;
+  using reference_t = const T&;
+  using iterator_category = std::random_access_iterator_tag;
+
   const T* pointer;
   int64_t stride;
 
+  __device__ __forceinline__ const T& operator*() const { return *pointer; }
   __device__ __forceinline__ const T& operator[](int64_t index) const {
     return pointer[index * stride];
   }
-
+  __device__ __forceinline__ TopKStridedReadAccessor& operator++() {
+    pointer += stride;
+    return *this;
+  }
+  __device__ __forceinline__ TopKStridedReadAccessor operator++(int) {
+    TopKStridedReadAccessor tmp = *this;
+    pointer += stride;
+    return tmp;
+  }
+  __device__ __forceinline__ TopKStridedReadAccessor& operator+=(int64_t offset) {
+    pointer += offset * stride;
+    return *this;
+  }
   __device__ __forceinline__ TopKStridedReadAccessor operator+(
       int64_t offset) const {
     return {pointer + offset * stride, stride};
+  }
+  __device__ __forceinline__ TopKStridedReadAccessor operator-(
+      int64_t offset) const {
+    return {pointer - offset * stride, stride};
+  }
+  __device__ __forceinline__ int64_t operator-(
+      const TopKStridedReadAccessor& other) const {
+    return (pointer - other.pointer) / stride;
+  }
+  __device__ __forceinline__ bool operator==(
+      const TopKStridedReadAccessor& other) const {
+    return pointer == other.pointer;
+  }
+  __device__ __forceinline__ bool operator!=(
+      const TopKStridedReadAccessor& other) const {
+    return pointer != other.pointer;
   }
 };
 
 template <typename T>
 struct TopKStridedWriteAccessor {
+  using value_type = T;
+  using difference_type = int64_t;
+  using pointer_t = T*;
+  using reference_t = T&;
+  using iterator_category = std::random_access_iterator_tag;
+
   T* pointer;
   int64_t stride;
 
+  __device__ __forceinline__ T& operator*() const { return *pointer; }
   __device__ __forceinline__ T& operator[](int64_t index) const {
     return pointer[index * stride];
   }
-
+  __device__ __forceinline__ TopKStridedWriteAccessor& operator++() {
+    pointer += stride;
+    return *this;
+  }
+  __device__ __forceinline__ TopKStridedWriteAccessor operator++(int) {
+    TopKStridedWriteAccessor tmp = *this;
+    pointer += stride;
+    return tmp;
+  }
+  __device__ __forceinline__ TopKStridedWriteAccessor& operator+=(int64_t offset) {
+    pointer += offset * stride;
+    return *this;
+  }
   __device__ __forceinline__ TopKStridedWriteAccessor operator+(
       int64_t offset) const {
     return {pointer + offset * stride, stride};
+  }
+  __device__ __forceinline__ TopKStridedWriteAccessor operator-(
+      int64_t offset) const {
+    return {pointer - offset * stride, stride};
+  }
+  __device__ __forceinline__ int64_t operator-(
+      const TopKStridedWriteAccessor& other) const {
+    return (pointer - other.pointer) / stride;
+  }
+  __device__ __forceinline__ bool operator==(
+      const TopKStridedWriteAccessor& other) const {
+    return pointer == other.pointer;
+  }
+  __device__ __forceinline__ bool operator!=(
+      const TopKStridedWriteAccessor& other) const {
+    return pointer != other.pointer;
   }
 };
 
