@@ -9,7 +9,7 @@ argument handling in the graph object and adds no per-element Python loop.
 from collections.abc import Callable
 from typing import Any, TypeVar
 
-from tensorplay.primitives.context import TorchRefsMode
+from tensorplay.primitives.context import TensorPlayRefsMode
 
 T = TypeVar("T")
 
@@ -48,7 +48,7 @@ def make_traced(fn: Callable[..., T]) -> Callable[..., T]:
 
     def _traced(*args: Any, **kwargs: Any) -> T:
         executor = str(kwargs.pop("executor", "native"))
-        with TorchRefsMode():
+        with TensorPlayRefsMode():
             return fn(*args, **kwargs)
 
     return _traced

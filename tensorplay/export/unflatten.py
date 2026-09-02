@@ -7,6 +7,7 @@ import copy
 from typing import Any
 
 from ..graph._pytree import TreeSpec, tree_flatten, tree_unflatten
+from ..nn import Module as _Module
 from .exported_program import ExportedProgram
 
 __all__ = [
@@ -102,12 +103,26 @@ class _TreeAdapter(FlatArgsAdapter):
         return list(tree_flatten(tree_unflatten(flat, target_spec))[0])
 
 
-class _FrameModule:
+class _FrameModule(_Module):
     """A reconstructed module whose body is one frame of the flat graph."""
 
     def __init__(self, graph_module: Any, ty: str | None = None) -> None:
+        super().__init__()
         self.graph_module = graph_module
         self._ty = ty
+
+    @property
+    def root(self) -> Any:
+        return self.graph_module.root
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            graph_module = self.__dict__.get("graph_module")
+            if graph_module is not None:
+                return getattr(graph_module.root, name)
+            raise
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
         return self.graph_module(*args, **kwargs)
@@ -324,8 +339,21 @@ def _frame_module_for(
                 parent = child
         setattr(parent, leaf, value)
 
+    # Graph construction needs every direct call target to exist on the
+    # frame root.  The hierarchy is attached after all frame graphs compile,
+    # so temporary module objects reserve those names during construction.
+    for child_fqn in calls_by_fqn:
+        if not child_fqn:
+            continue
+        parent_name, _, leaf = child_fqn.rpartition(".")
+        if parent_name != fqn:
+            continue
+        if getattr(frame_root, leaf, None) is None:
+            setattr(frame_root, leaf, tp.nn.Module())
+
     signature = user_signature if not fqn else None
-    return GraphModule(frame_root, sub, signature)
+    graph_module = GraphModule(frame_root, sub, signature)
+    return graph_module if not fqn else _FrameModule(graph_module)
 
 
 def _flat_output_names(graph: Any) -> list[str]:
@@ -435,14 +463,18 @@ def _rebuild_hierarchy(program: ExportedProgram) -> Any:
 
     for fqn in sorted(built, key=lambda f: (f.count("."), f)):
         parent_name, _, leaf = fqn.rpartition(".")
+        child = built[fqn]
         if parent_name:
             owner = built.get(parent_name)
             if owner is None:
                 continue
             parent = owner.root
+            setattr(parent, leaf, child)
+            setattr(owner.graph_module, leaf, child)
         else:
             parent = root_graph_module.root
-        setattr(parent, leaf, built[fqn])
+            setattr(parent, leaf, child)
+            setattr(root_graph_module, leaf, child)
     return root_graph_module
 
 

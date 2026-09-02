@@ -144,6 +144,7 @@ class _UserFacingModule(GraphModule):
         self._mutation_count = int(self.meta.get("num_mutations", 0) or 0)
         self._out_spec = self.meta.get("out_spec")
         self._compiled_forward = getattr(graph_module, "_compiled_forward", None)
+        self.__dict__.pop("forward", None)
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
         return _strip_mutation_outputs(self, super().forward(*args, **kwargs))

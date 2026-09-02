@@ -417,6 +417,17 @@ class GraphModule:
             return self._compiled_forward(*args, **kwargs)
         return self._interpret(*args, **kwargs)
 
+    def _invalidate_compiled_executor(self) -> None:
+        """Drop the generated executor (graph surgery invalidated it).
+
+        ``recompile`` binds the compiled program as the instance
+        ``forward``; both bindings must go so calls fall back to the live
+        interpreter until the module explicitly recompiles.
+        """
+
+        object.__setattr__(self, "_compiled_forward", None)
+        self.__dict__.pop("forward", None)
+
     def recompile(self) -> Callable[..., Any]:
         """Generate an explicit Python executor for custom backend use.
 
@@ -1050,6 +1061,19 @@ class GraphModule:
             return
         object.__delattr__(self, name)
 
+    def _has_local_attribute(self, name: str) -> bool:
+        # Registration collision checks must not traverse the root fallback
+        # in __getattr__: while _copy_graph_references populates this module
+        # from the root, the root exposes every same-named attribute, so a
+        # plain hasattr() would report "already exists" for the first
+        # parameter copy.  Only real local slots count as collisions.
+        return (
+            name in self.__dict__
+            or name in self._parameters
+            or name in self._buffers
+            or name in self._modules
+        )
+
     def add_module(self, name: str, module: Any) -> None:
         if not isinstance(name, str):
             raise TypeError(f"module name should be a string, got {type(name)!r}")
@@ -1057,7 +1081,7 @@ class GraphModule:
             raise KeyError(f"invalid module name {name!r}")
         if module is not None and not _is_module(module):
             raise TypeError(f"{type(module)!r} is not a module")
-        if hasattr(self, name) and name not in self._modules:
+        if self._has_local_attribute(name) and name not in self._modules:
             raise KeyError(f"attribute {name!r} already exists")
         for hook in _module_hook_tables()[5:6]:
             for registration_hook in hook.values():
@@ -1075,7 +1099,7 @@ class GraphModule:
             raise KeyError(f"invalid parameter name {name!r}")
         if parameter is not None and not _is_parameter(parameter):
             raise TypeError(f"{type(parameter)!r} is not a parameter")
-        if hasattr(self, name) and name not in self._parameters:
+        if self._has_local_attribute(name) and name not in self._parameters:
             raise KeyError(f"attribute {name!r} already exists")
         for hook in _module_hook_tables()[6:7]:
             for registration_hook in hook.values():
@@ -1094,7 +1118,7 @@ class GraphModule:
             raise KeyError(f"invalid buffer name {name!r}")
         if value is not None and not _is_tensor(value):
             raise TypeError(f"{type(value)!r} is not a tensor or None")
-        if hasattr(self, name) and name not in self._buffers:
+        if self._has_local_attribute(name) and name not in self._buffers:
             raise KeyError(f"attribute {name!r} already exists")
         for hook in _module_hook_tables()[4:5]:
             for registration_hook in hook.values():

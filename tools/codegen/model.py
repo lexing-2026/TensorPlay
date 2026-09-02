@@ -915,6 +915,26 @@ def _parse_reference_native_yaml(path: str) -> _ReferenceParseResult:
     prepared = [_prepare_reference_entry(item) for item in data]
     valid_tags = generator.parse_tags_yaml(str(_tags_path()))
 
+    # TP declares a Vulkan backend in its schema file; the vendored reference
+    # parser validates dispatch keys against its own closed set, so admit the
+    # key for the duration of the parse.
+    from torchgen import model as _tg_model
+    reference_dispatch_keys = _tg_model.dispatch_keys
+    if not any(getattr(k, "name", str(k)) == "Vulkan"
+               for k in reference_dispatch_keys):
+        class _VulkanKey:
+            name = "Vulkan"
+
+            def __str__(self):
+                return "Vulkan"
+
+            def __eq__(self, other):
+                return self is other or getattr(other, "name", None) == "Vulkan"
+
+            def __hash__(self):
+                return hash("Vulkan")
+        reference_dispatch_keys.append(_VulkanKey())
+
     from torchgen import native_function_generation
 
     original_pre_group = native_function_generation.pre_group_native_functions

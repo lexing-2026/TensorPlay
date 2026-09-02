@@ -235,6 +235,17 @@ class _Namespace:
         except TypeError:
             return self._id_to_name.get(id(obj))
 
+    def release_name(self, name: str) -> None:
+        """Return an erased node's name to the pool for reuse."""
+
+        self._used_names.discard(name)
+        for obj, held in list(self._obj_to_name.items()):
+            if held == name:
+                del self._obj_to_name[obj]
+        for key, held in list(self._id_to_name.items()):
+            if held == name:
+                del self._id_to_name[key]
+
     def _remember(self, obj: object, name: str) -> None:
         try:
             self._obj_to_name[obj] = name
@@ -256,15 +267,20 @@ class _Namespace:
             match = _name_pattern.match(candidate)
         assert match is not None
         base, suffix = match.groups()
-        number = int(suffix) if suffix is not None else self._base_count.get(base, 0)
-        if candidate in _illegal_names and _illegal_names[candidate] is not obj:
-            number += 1
+        # Collisions number from zero (add, add_0, add_1, ...), whether the
+        # candidate arrives with or without a numeric suffix.  Only keywords
+        # are guarded: assigning to them is a syntax error in generated code.
+        # Builtin spellings (sum, abs, ...) are safe as node names because
+        # generated code invokes targets through resolved identifiers, never
+        # by node name.
+        if candidate in keyword.kwlist:
+            number = 0 if suffix is None else int(suffix) + 1
             candidate = f"{base}_{number}"
+        number = int(suffix) if suffix is not None else None
         while candidate in self._used_names:
-            number += 1
+            number = 0 if number is None else number + 1
             candidate = f"{base}_{number}"
         self._used_names.add(candidate)
-        self._base_count[base] = number
         if obj is not None:
             self._remember(obj, candidate)
         return candidate
@@ -1030,12 +1046,30 @@ class Graph:
         old = tuple(self.nodes)
         list.remove(self.nodes, node)
         self._sync_nodes(self.nodes, old)
+        # Free the name so a replacement node (an output re-registration,
+        # a rewrite inserting over an erased site) can reclaim it.
+        self._graph_namespace.release_name(node.name)
         node.graph = None
         node._erased = True
         node._args = ()
         node._kwargs = {}
         node._input_nodes.clear()
         node.users.clear()
+        self._notify_owner_mutated()
+
+    def _notify_owner_mutated(self) -> None:
+        """Drop the owning module's generated executor after graph surgery.
+
+        The generated code is a snapshot of the graph at recompile time; a
+        rewrite (substitution, erasure) that kept executing it would run the
+        pre-rewrite program.  Calls fall back to the live interpreter until
+        the module explicitly recompiles.
+        """
+
+        owner = self.owning_module
+        invalidate = getattr(owner, "_invalidate_compiled_executor", None)
+        if callable(invalidate):
+            invalidate()
 
     @property
     def owning_module(self) -> Any:
@@ -1064,6 +1098,10 @@ class Graph:
         value = target if isinstance(target, str) else _callable_name(target)
         if value.startswith("__") and value.endswith("__"):
             value = value[2:-2]
+        # Module and attribute targets are named after the referenced object,
+        # not its qualified path: "backbone.conv1" derives "conv1" and
+        # "backbone.conv1.weight" derives "weight".
+        value = value.rsplit(".", 1)[-1]
         return _snake_case(value)
 
     def _create_unique_name(self, candidate: str) -> str:
@@ -1099,7 +1137,7 @@ class Graph:
         if not isinstance(args, tuple) or not isinstance(kwargs, dict):
             raise AssertionError("node arguments lost their container types")
         candidate = name if name is not None else self._target_to_str(target)
-        node_name = self._create_unique_name(candidate)
+        node_name = self._graph_namespace.create_name(candidate, None)
         node = Node(
             self,
             node_name,

@@ -54,7 +54,7 @@ class _BroadcastTo(Function):
         if dims:
             grad_output = grad_output.sum(dims, keepdim=True)
         grad_output = grad_output.reshape(list(shape))
-        return grad_output, None
+        return (grad_output,) + (None,) * (len(ctx.needs_input_grad) - 1)
 
 
 def broadcast_shapes(*shapes):
@@ -451,9 +451,7 @@ def block_diag(*tensors):
         if ndim == 0:
             blocks.append(t.reshape([1, 1]))
         elif ndim == 1:
-            n = t.numel()
-            eye = _C.eye(n=n, dtype=t.dtype, device=t.device)
-            blocks.append(eye * t)
+            blocks.append(t.reshape([1, t.numel()]))
         elif ndim == 2:
             blocks.append(t)
         else:

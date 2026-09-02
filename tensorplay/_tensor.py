@@ -281,23 +281,10 @@ Tensor.expand = _expand
 
 
 # ---------------------------------------------------------------------------
-# binding boxes into a tp Scalar wrapper, so route through _C.item_python
-# which unboxes in C++ (bool/int/float/complex by dtype) — one frame, no
-# per-call imports.
-def item(self):
-    return _C.item_python(self)
-
-
-Tensor.item = item
-
-
-# ---------------------------------------------------------------------------
 # __bool__ lives in the C extension (nb_bool slot on TensorBase): empty ->
 # RuntimeError "no values is ambiguous", one element -> value != 0, more ->
 
 
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
 def _norm_new_size(size):
     if len(size) == 1 and hasattr(size[0], "__iter__") and \
             not isinstance(size[0], _C.TensorBase):
@@ -504,9 +491,23 @@ def unique(self, sorted=True, return_inverse=False, return_counts=False):
 Tensor.unique = unique
 
 
+def unique_consecutive(self, return_inverse=False, return_counts=False,
+                       dim=None):
+    values, inverse, counts = _C.unique_consecutive(
+        self, return_inverse, return_counts, dim)
+    outs = [values]
+    if return_inverse:
+        outs.append(inverse)
+    if return_counts:
+        outs.append(counts)
+    return outs[0] if len(outs) == 1 else tuple(outs)
+
+
+Tensor.unique_consecutive = unique_consecutive
+
+
 def topk(self, k, dim=None, largest=True, sorted=True):
-    import operator
-    d = self.dim() - 1 if dim is None else int(dim)
+    d = self.dim() - 1 if dim is None else builtins_int(dim)
     if d < 0:
         d += self.dim()
     desc = largest

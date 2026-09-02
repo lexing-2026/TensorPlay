@@ -216,10 +216,16 @@ class profile:
             self.profile_memory,
         )
         self._recording = True
+        # Custom operators emit their op spans only while a session is live;
+        # the counter handles nested/scheduled sessions.
+        from .. import library as _library
+        _library._note_profiling_start()
 
     def _stop_session(self):
         if not self._recording:
             return
+        from .. import library as _library
+        _library._note_profiling_stop()
         stop_start = time.perf_counter_ns()
         try:
             raw_ops, raw_gpu, raw_mem = _C._profiler_stop()

@@ -51,7 +51,13 @@ from ..cpp_builder import (
     package_paths,
 )
 from ..cpu_vec_isa import VecISA, pick_vec_isa
-from .index_expr import Const as _IxC, Symbol as _IxS, affine_coeff as _ix_affine, render as _ix_render
+from .index_expr import (
+    Const as _IxC,
+    Symbol as _IxS,
+    affine_coeff as _ix_affine,
+    modular_indexing as _ix_mod,
+    render as _ix_render,
+)
 
 # The four-way unrolled loop is emitted only when replicating the program
 # four times keeps live temporaries within reason; longer programs use the
@@ -139,6 +145,96 @@ def _lane_offset(lane: int) -> str:
     if coeff != 1:
         raise _ProgramError(f"non-unit-stride lane addressing (stride {coeff})")
     return _ix_render(expr)
+
+
+# Per-input addressing modes, one per program input.
+#
+# flat    -- address is the flat output index; contiguous ``loadu`` per lane.
+# splat   -- the input has one element (any broadcast scalar); a single
+#            ``V(in[0])`` splat is hoisted out of every loop.
+# colmod  -- the input's only non-unit dim is the output's last dim of width
+#            ``S`` (a row broadcast, e.g. a bias vector): address ``i % S``.
+#            Every vector stays inside one row because ``W`` (the lane count)
+#            divides ``S`` and the induction variable is peeled to a ``W``
+#            boundary first, so each ``loadu`` is still contiguous.
+InputMode = tuple[str, int]
+
+
+def analyze_input_modes(
+    input_shapes: tuple[tuple[int, ...], ...],
+    input_strides: tuple[tuple[int, ...], ...],
+    out_shape: tuple[int, ...],
+    lane_count: int,
+) -> tuple[InputMode, ...] | None:
+    """Classify how each input is addressed from the flat output index.
+
+    Returns one mode per input, or ``None`` when any input uses an addressing
+    pattern the emitter cannot prove contiguous within a vector (strided
+    walks, column broadcasts, nested rearrangements): those keep the generic
+    fallback instead of risking wrong addresses.
+    """
+
+    if len(input_shapes) != len(input_strides) or not input_shapes:
+        return None
+    rank = len(out_shape)
+    modes: list[InputMode] = []
+    for shape, strides in zip(input_shapes, input_strides):
+        if len(shape) != len(strides) or len(shape) > rank:
+            return None
+        # Left-align broadcast dims: leading dims the input lacks are size-1.
+        pad = rank - len(shape)
+        aligned_shape = (1,) * pad + tuple(int(d) for d in shape)
+        aligned_strides = (0,) * pad + tuple(int(s) for s in strides)
+        # Dims that contribute nothing to the address: size-1 (broadcast) or
+        # stride-0 (``expand`` of any extent -- every element along the dim
+        # aliases the same address).
+        live = [
+            (d, aligned_strides[d])
+            for d in range(rank)
+            if aligned_shape[d] != 1 and aligned_strides[d] != 0
+        ]
+        if not live:
+            modes.append(("splat", 0))
+            continue
+        if len(live) == 1:
+            dim, stride = live[0]
+            if (
+                dim == rank - 1
+                and stride == 1
+                and aligned_shape[dim] == out_shape[dim]
+                and rank >= 2
+                and out_shape[dim] > 0
+                and out_shape[dim] % lane_count == 0
+            ):
+                modes.append(("colmod", int(out_shape[dim])))
+                continue
+            if (
+                rank == 1
+                and dim == 0
+                and aligned_shape[0] == out_shape[0]
+            ):
+                # Rank-1 output: a matching trailing dim is the flat index
+                # itself; the vector path needs unit stride.
+                if stride == 1:
+                    modes.append(("flat", 0))
+                    continue
+                return None
+            return None
+        if len(live) == rank:
+            # Full-rank input: only the unit-stride flat layout is provably
+            # row-contiguous; any stride permutation is rejected.
+            expected = 1
+            flat_contiguous = True
+            for d in range(rank - 1, -1, -1):
+                if aligned_strides[d] != expected:
+                    flat_contiguous = False
+                    break
+                expected *= aligned_shape[d]
+            if flat_contiguous:
+                modes.append(("flat", 0))
+                continue
+        return None
+    return tuple(modes)
 
 
 def _check_ref(
@@ -268,16 +364,26 @@ def _emit_body(
     *,
     unrolled: bool,
     partial: bool,
+    input_modes: tuple[InputMode, ...] | None = None,
 ) -> str:
     """Emit one loop body for a given variable-naming scheme.
 
     ``unrolled`` suffixes every variable with the unroll lane index and
     loads/stores four vectors; ``partial`` switches loads/stores to the
-    partial-width ``count`` overloads (scalar tail).
+    partial-width ``count`` overloads (scalar tail).  ``input_modes`` maps
+    each input to its addressing mode: ``flat`` keeps the flat index, and
+    ``colmod`` addresses through ``i % S`` (the peel in the rendered kernel
+    guarantees the lane never straddles a row).  ``splat`` inputs are hoisted
+    before all loops and referenced without a lane suffix.
     """
+
+    if input_modes is None:
+        input_modes = (("flat", 0),) * input_count
 
     def name(ref: int, lane: int = 0) -> str:
         if ref < input_count:
+            if input_modes[ref][0] == "splat":
+                return f"h{ref}"
             base = f"x{ref}"
         else:
             base = f"t{ref - input_count}"
@@ -292,11 +398,20 @@ def _emit_body(
         if ref >= input_count
     }
 
-    def emit_loads(lane: int, offset_expr: str) -> None:
+    def lane_offset(mode: str, width: int, lane: int) -> str:
+        if mode == "colmod":
+            expr = _I_i if lane == 0 else _I_i + _IxC(lane) * _I_W
+            return _ix_render(_ix_mod(expr, 1, width))
+        return "i" if lane == 0 else _lane_offset(lane)
+
+    def emit_loads(lane: int) -> None:
         for ref in sorted(used_inputs):
+            if input_modes[ref][0] == "splat":
+                continue
             var = name(ref, lane)
+            mode, width = input_modes[ref]
             lines.append(
-                f"{indent}V {var} = V::loadu(in{ref} + {offset_expr}, {count_expr});"
+                f"{indent}V {var} = V::loadu(in{ref} + {lane_offset(mode, width, lane)}, {count_expr});"
             )
 
     def emit_steps(lane: int) -> None:
@@ -333,21 +448,21 @@ def _emit_body(
         if pending_where is not None:  # pragma: no cover - guarded by analysis
             raise _ProgramError("where without where_rest")
 
-    def emit_store(lane: int, offset_expr: str) -> None:
+    def emit_store(lane: int) -> None:
         var = name(output_ref, lane)
-        lines.append(f"{indent}{var}.store(out + {offset_expr}, {count_expr});")
+        lines.append(f"{indent}{var}.store(out + {lane_offset('flat', 0, lane)}, {count_expr});")
 
     if unrolled:
         for lane in range(4):
-            emit_loads(lane, _lane_offset(lane))
+            emit_loads(lane)
         for lane in range(4):
             emit_steps(lane)
         for lane in range(4):
-            emit_store(lane, _lane_offset(lane))
+            emit_store(lane)
     else:
-        emit_loads(0, "i")
+        emit_loads(0)
         emit_steps(0)
-        emit_store(0, "i")
+        emit_store(0)
     return "\n".join(lines)
 
 
@@ -360,6 +475,9 @@ def render_kernel_source(
     *,
     out_shape: tuple[int, ...] | None = None,
     out_device: tuple[int, int] | None = None,
+    input_shapes: tuple[tuple[int, ...], ...] | None = None,
+    input_strides: tuple[tuple[int, ...], ...] | None = None,
+    lane_count: int | None = None,
 ) -> str:
     """Render the full translation unit for one fused CPU kernel.
 
@@ -368,6 +486,12 @@ def render_kernel_source(
     runner that receives the input tensor list, extracts the data pointers
     in C, allocates the output in C, calls the kernel, and wraps the result
     — the steady-state call never re-enters Python.
+
+    ``input_shapes``/``input_strides`` (when given) select per-input
+    addressing modes: broadcast scalars become hoisted splats and row
+    broadcasts become ``i % S`` addresses under an alignment peel.  Passing
+    them without ``out_shape`` has no effect -- the modes are only valid for
+    a pinned specialization.
     """
 
     used_inputs = _analyze_instructions(
@@ -384,6 +508,28 @@ def render_kernel_source(
         or "    (void)0;"
     )
 
+    # ``lane_count`` comes from the picked SIMD tier (the same one that will
+    # compile the unit).  Without it the analysis falls back to the widest
+    # tier width, which is conservative in the safe direction: a ``colmod``
+    # width divisible by 16 is divisible by every smaller lane count.
+    tier_width = lane_count if lane_count is not None else 16
+    input_modes: tuple[InputMode, ...] | None = None
+    if out_shape is not None and input_shapes is not None and input_strides is not None:
+        try:
+            input_modes = analyze_input_modes(
+                input_shapes, input_strides, out_shape, tier_width
+            )
+        except (TypeError, ValueError):
+            input_modes = None
+    if input_modes is None:
+        input_modes = (("flat", 0),) * input_count
+    splat_refs = [
+        ref for ref in sorted(used_inputs) if input_modes[ref][0] == "splat"
+    ]
+    splat_decls = "\n".join(
+        f"    const V h{ref} = V(in{ref}[0]);" for ref in splat_refs
+    )
+
     unrolled_body = ""
     if len(instructions) <= _UNROLL_MAX_STEPS:
         unrolled_body = _emit_body(
@@ -395,6 +541,7 @@ def render_kernel_source(
             "        ",
             unrolled=True,
             partial=False,
+            input_modes=input_modes,
         )
     single_body = _emit_body(
         instructions,
@@ -405,6 +552,7 @@ def render_kernel_source(
         "        ",
         unrolled=False,
         partial=False,
+        input_modes=input_modes,
     )
     tail_body = _emit_body(
         instructions,
@@ -415,6 +563,7 @@ def render_kernel_source(
         "        ",
         unrolled=False,
         partial=True,
+        input_modes=input_modes,
     )
 
     input_params = ", ".join(
@@ -426,6 +575,26 @@ def render_kernel_source(
         f"    const float* __restrict__ in{i} = c->in{i};\n"
         for i in range(input_count)
     )
+
+    # Alignment peel for ``colmod`` inputs: every vector must start at a
+    # flat index congruent to 0 mod the vector width so, together with the
+    # row width being a multiple of the widest tier width, the whole vector
+    # stays inside one row.  Advance from the chunk start to the next
+    # boundary with scalar steps; interior iterations are then fully
+    # vectorized row-interior loads.
+    peel_needed = any(mode == "colmod" for mode, _ in input_modes)
+    peel_loop = ""
+    if peel_needed:
+        peel_loop = (
+            "    for (; i % W != 0 && i < e; ++i) {\n"
+            "        const long count = 1;\n"
+            f"{tail_body}\n"
+            "    }\n"
+        )
+
+    splat_hoists = ""
+    if splat_refs:
+        splat_hoists = f"{splat_decls}\n"
 
     unrolled_loop = ""
     if unrolled_body:
@@ -566,7 +735,9 @@ def render_kernel_source(
         "    float* __restrict__ out = c->out;\n"
         "    const long W = V::size();\n"
         f"{const_decls}\n"
+        f"{splat_hoists}"
         "    long i = b;\n"
+        f"{peel_loop}"
         f"{unrolled_loop}"
         "    #pragma GCC ivdep\n"
         "    for (; i + W <= e; i += W) {\n"
@@ -616,7 +787,20 @@ def _kill_switch() -> bool:
     return os.environ.get("TP_STAX_CPU_NATIVE", "") == "0"
 
 
-def _digest_entry_key(instructions, constants, input_count, output_ref, tier, version_info) -> str:
+def _digest_entry_key(
+    instructions,
+    constants,
+    input_count,
+    output_ref,
+    tier,
+    version_info,
+    pinned_shape=None,
+    layout_key=None,
+) -> str:
+    # The pinned shape and per-input layouts are baked into the generated
+    # unit (output allocation, addressing modes), so they belong in the
+    # entry symbol: two specializations sharing one program must never
+    # collide on a cached artifact.
     return hashlib.sha256(
         repr(
             (
@@ -626,6 +810,8 @@ def _digest_entry_key(instructions, constants, input_count, output_ref, tier, ve
                 output_ref,
                 tier,
                 version_info,
+                pinned_shape,
+                layout_key,
             )
         ).encode()
     ).hexdigest()[:16]
@@ -639,6 +825,8 @@ def build_cpu_native_kernel(
     *,
     shape: Any = None,
     device: Any = None,
+    input_shapes: tuple[tuple[int, ...], ...] | None = None,
+    input_strides: tuple[tuple[int, ...], ...] | None = None,
 ) -> Optional[Callable[[list[Any]], Any]]:
     """Compile the program once and return ``run(inputs) -> Tensor``.
 
@@ -650,6 +838,12 @@ def build_cpu_native_kernel(
     a METH_FASTCALL runner that keeps the steady-state call entirely in C
     (pointer extraction, output allocation, result wrapping), matching the
     binding pattern of the in-tree kernel loader.
+
+    ``input_shapes``/``input_strides`` describe each input's layout at
+    compile time (the pinned route guarantees they hold for every call);
+    together with ``shape`` they enable broadcast-splat hoisting and
+    row-broadcast ``i % S`` addressing.  The caller remains responsible for
+    the route check -- the generated unit trusts these layouts.
     """
 
     if _kill_switch():
@@ -693,7 +887,18 @@ def build_cpu_native_kernel(
     if out_device_code is None:
         pinned_shape = None
 
-    entry = f"tp_native_{_digest_entry_key(instructions, constants, input_count, output_ref, isa.name, version_info)}"
+    layout_key: Any = None
+    if (
+        pinned_shape is not None
+        and input_shapes is not None
+        and input_strides is not None
+    ):
+        layout_key = (
+            tuple(tuple(int(d) for d in s) for s in input_shapes),
+            tuple(tuple(int(s) for s in st) for st in input_strides),
+        )
+
+    entry = f"tp_native_{_digest_entry_key(instructions, constants, input_count, output_ref, isa.name, version_info, pinned_shape, layout_key)}"
     source = render_kernel_source(
         instructions,
         constants,
@@ -702,6 +907,9 @@ def build_cpu_native_kernel(
         entry,
         out_shape=pinned_shape,
         out_device=out_device_code,
+        input_shapes=input_shapes if layout_key is not None else None,
+        input_strides=input_strides if layout_key is not None else None,
+        lane_count=isa.nelements(),
     )
     pinned = pinned_shape is not None and out_device_code is not None
 
@@ -711,7 +919,7 @@ def build_cpu_native_kernel(
         "flags": " ".join(isa.build_arch_flags()),
         "ver": version_info[:32],
         "entry": entry,
-        "bind": "plan-v1" if pinned else "py",
+        "bind": "plan-v2" if pinned else "py",
     }
     key = cache.cache_key(source, entry, key_options)
     source_path = cache.path_for(key, "cpp")
@@ -752,7 +960,14 @@ def build_cpu_native_kernel(
                             *isa.build_arch_flags(),
                         ],
                         library_dirs=[lib_dir],
-                        libraries=["p10", "tp_python"] if pinned else ["p10"],
+                        # ``tpx`` must stay on the link line: libp10 carries
+                        # undefined references into the tpx ops namespace,
+                        # and a kernel module that omits it fails to dlopen
+                        # under RTLD_LOCAL (then silently loses the compiled
+                        # route to the interpreter fallback).
+                        libraries=["p10", "tpx", "tp_python"]
+                        if pinned
+                        else ["p10", "tpx"],
                         ldflags=[f"-Wl,-rpath,{lib_dir}"],
                     )
                     builder = CppBuilder(

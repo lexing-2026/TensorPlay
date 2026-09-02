@@ -142,6 +142,13 @@ Tensor& tpx_py_tensor_mref(PyObject* obj);
 // wrapper; PyErr is cleared so callers only test the integer.
 long long tpx_tensor_version(PyObject* obj);
 int tpx_tensor_requires_grad(PyObject* obj);
+// Combined steady-state guard probe: classifies the tensor and reads its
+// version in one call without letting the missing-counter case throw.
+// Returns 0 for a versioned tensor (*version_out set), 1 for an inference
+// tensor (no version counter, immutable -- fingerprint by identity alone),
+// -1 when the object is not a plain tensor wrapper.  PyErr is cleared so
+// callers only test the integer.
+int tpx_tensor_guard_probe(PyObject* obj, long long* version_out);
 Scalar tpx_py_scalar(PyObject* obj);
 std::optional<Tensor> tpx_py_opt_tensor(PyObject* obj);
 int64_t tpx_py_int64(PyObject* obj);

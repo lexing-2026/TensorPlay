@@ -402,7 +402,12 @@ def _emit_redispatch(lines, f, variant, dev_src, helper_name):
     # The redispatch helpers are free functions: a method variant's implicit
     # receiver becomes the explicit `self` parameter here, so every receiver
     # expression must be rewritten the same way as the device source above.
-    key_expr = f"toBackendKey({_dispatch_key_expr(f, variant, redispatch=True)})"
+    dispatch_key_expr = _dispatch_key_expr(f, variant, redispatch=True)
+    key_expr = (
+        dispatch_key_expr
+        if f.func_name in _RANDOM_TRANSFORM_OPS
+        else f"toBackendKey({dispatch_key_expr})"
+    )
     if variant == "method" and f.self_arg() is not None:
         key_expr = key_expr.replace("device()", "self.device()")
     lines.append(

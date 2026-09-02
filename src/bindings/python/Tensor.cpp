@@ -1483,6 +1483,392 @@ Tensor audio_to_tensor(py::object obj) {
     return Tensor(impl);
 }
 
+// ---------------------------------------------------------------------------
+// apply_ / map_ / map2_: per-element Python callbacks over strided memory.
+// These live at the binding layer (not the dispatcher) because the callable is
+// a Python object; they are CPU-only debug helpers, not performance paths.
+// ---------------------------------------------------------------------------
+namespace {
+
+struct StridedElem {
+    void* data;
+    const int64_t* strides;  // in elements
+    int64_t itemsize;        // bytes
+
+    void step(int64_t dim) {
+        data = static_cast<char*>(data) + strides[dim] * itemsize;
+    }
+};
+
+// Lazily resolved numpy markers; null when numpy is unavailable.
+PyTypeObject* numpy_ndarray_type() {
+    static PyTypeObject* type = []() -> PyTypeObject* {
+        PyObject* np = PyImport_ImportModule("numpy");
+        if (np == nullptr) { PyErr_Clear(); return nullptr; }
+        auto* t = reinterpret_cast<PyTypeObject*>(
+            PyObject_GetAttrString(np, "ndarray"));
+        Py_DECREF(np);
+        if (t == nullptr) PyErr_Clear();
+        return t;  // kept alive intentionally
+    }();
+    return type;
+}
+
+PyObject* numpy_generic_type() {
+    static PyObject* type = []() -> PyObject* {
+        PyObject* np = PyImport_ImportModule("numpy");
+        if (np == nullptr) { PyErr_Clear(); return nullptr; }
+        PyObject* t = PyObject_GetAttrString(np, "generic");
+        Py_DECREF(np);
+        if (t == nullptr) PyErr_Clear();
+        return t;  // kept alive intentionally
+    }();
+    return type;
+}
+
+bool numpy_object_kind(py::object obj, bool* is_scalar_out) {
+    if (is_scalar_out != nullptr) *is_scalar_out = false;
+    PyTypeObject* nd = numpy_ndarray_type();
+    if (nd != nullptr && Py_TYPE(obj.ptr()) == nd) return true;
+    PyObject* generic = numpy_generic_type();
+    if (generic == nullptr) return false;
+    const int res = PyObject_IsInstance(obj.ptr(), generic);
+    if (res < 0) { PyErr_Clear(); return false; }
+    if (is_scalar_out != nullptr) *is_scalar_out = res != 0;
+    return res != 0;
+}
+
+// Mirror of create_tensor's numpy dtype mapping, for alias compatibility
+// checks before a zero-copy wrap is attempted.
+std::optional<DType> numpy_inferred_dtype(py::object obj) {
+    py::array arr = py::array::ensure(obj);
+    if (!arr) return std::nullopt;
+    py::dtype ndt = arr.dtype();
+    const char kind = ndt.kind();
+    const size_t bits = ndt.itemsize() * 8;
+    if (kind == 'f' && bits == 16) return DType::Float16;
+    if (kind == 'f' && bits == 32) return DType::Float32;
+    if (kind == 'f' && bits == 64) return DType::Float64;
+    if (kind == 'c' && bits == 64) return DType::ComplexFloat;
+    if (kind == 'c' && bits == 128) return DType::ComplexDouble;
+    if (kind == 'i' && bits == 8) return DType::Int8;
+    if (kind == 'i' && bits == 16) return DType::Int16;
+    if (kind == 'i' && bits == 32) return DType::Int32;
+    if (kind == 'i' && bits == 64) return DType::Int64;
+    if (kind == 'u' && bits == 8) return DType::UInt8;
+    if (kind == 'u' && bits == 16) return DType::UInt16;
+    if (kind == 'u' && bits == 32) return DType::UInt32;
+    if (kind == 'u' && bits == 64) return DType::UInt64;
+    if (kind == 'b') return DType::Bool;
+    return std::nullopt;
+}
+
+py::object load_elem_scalar(const void* ptr, DType dtype) {
+    switch (dtype) {
+        case DType::Float32: return py::float_(*static_cast<const float*>(ptr));
+        case DType::Float64: return py::float_(*static_cast<const double*>(ptr));
+        case DType::Float16: return py::float_(static_cast<float>(*static_cast<const tensorplay::Half*>(ptr)));
+        case DType::BFloat16: return py::float_(static_cast<float>(*static_cast<const tensorplay::BFloat16*>(ptr)));
+        case DType::Int8: return py::int_(static_cast<int64_t>(*static_cast<const int8_t*>(ptr)));
+        case DType::Int16: return py::int_(static_cast<int64_t>(*static_cast<const int16_t*>(ptr)));
+        case DType::Int32: return py::int_(static_cast<int64_t>(*static_cast<const int32_t*>(ptr)));
+        case DType::Int64: return py::int_(*static_cast<const int64_t*>(ptr));
+        case DType::UInt8: return py::int_(static_cast<uint64_t>(*static_cast<const uint8_t*>(ptr)));
+        case DType::UInt16: return py::int_(static_cast<uint64_t>(*static_cast<const uint16_t*>(ptr)));
+        case DType::UInt32: return py::int_(static_cast<uint64_t>(*static_cast<const uint32_t*>(ptr)));
+        case DType::UInt64: return py::int_(*static_cast<const uint64_t*>(ptr));
+        case DType::Bool: return py::bool_(*static_cast<const bool*>(ptr));
+        case DType::ComplexHalf: {
+            const auto& v = *static_cast<const std::complex<tensorplay::Half>*>(ptr);
+            return py::cast(std::complex<float>(static_cast<float>(v.real()), static_cast<float>(v.imag())));
+        }
+        case DType::BComplex32: {
+            const auto& v = *static_cast<const std::complex<tensorplay::BFloat16>*>(ptr);
+            return py::cast(std::complex<float>(static_cast<float>(v.real()), static_cast<float>(v.imag())));
+        }
+        case DType::ComplexFloat: return py::cast(*static_cast<const std::complex<float>*>(ptr));
+        case DType::ComplexDouble: return py::cast(*static_cast<const std::complex<double>*>(ptr));
+        default: TP_THROW(NotImplementedError, "apply_: unsupported dtype");
+    }
+}
+
+void store_elem_scalar(void* ptr, DType dtype, PyObject* value) {
+    // Integral slots accept floats with truncation for backward
+    // compatibility (except the 64-bit unsigned slot, which requires an
+    // exact integer); float slots require a real number.
+    switch (dtype) {
+        case DType::Bool: {
+            bool flag;
+            if (PyBool_Check(value)) {
+                flag = value == Py_True;
+            } else if (PyLong_Check(value)) {
+                flag = PyLong_AsLongLong(value) != 0;
+                if (PyErr_Occurred()) throw py::error_already_set();
+            } else if (PyFloat_Check(value)) {
+                flag = PyFloat_AsDouble(value) != 0.0;
+                if (PyErr_Occurred()) throw py::error_already_set();
+            } else {
+                TP_THROW(TypeError, "must be a number, not ",
+                         Py_TYPE(value)->tp_name);
+            }
+            *static_cast<bool*>(ptr) = flag;
+            return;
+        }
+        case DType::UInt64: {
+            PyObject* num = PyNumber_Index(value);
+            if (num == nullptr) throw py::error_already_set();
+            const unsigned long long v = PyLong_AsUnsignedLongLong(num);
+            Py_DECREF(num);
+            if (v == static_cast<unsigned long long>(-1) && PyErr_Occurred())
+                throw py::error_already_set();
+            *static_cast<uint64_t*>(ptr) = static_cast<uint64_t>(v);
+            return;
+        }
+        case DType::Int8: case DType::Int16: case DType::Int32:
+        case DType::Int64: case DType::UInt8: case DType::UInt16:
+        case DType::UInt32: {
+            long long v;
+            if (PyFloat_Check(value)) {
+                v = static_cast<long long>(PyFloat_AsDouble(value));
+                if (PyErr_Occurred()) throw py::error_already_set();
+            } else {
+                v = PyLong_AsLongLong(value);
+                if (v == -1 && PyErr_Occurred()) throw py::error_already_set();
+            }
+            switch (dtype) {
+                case DType::Int8: *static_cast<int8_t*>(ptr) = static_cast<int8_t>(v); return;
+                case DType::Int16: *static_cast<int16_t*>(ptr) = static_cast<int16_t>(v); return;
+                case DType::Int32: *static_cast<int32_t*>(ptr) = static_cast<int32_t>(v); return;
+                case DType::Int64: *static_cast<int64_t*>(ptr) = static_cast<int64_t>(v); return;
+                case DType::UInt8: *static_cast<uint8_t*>(ptr) = static_cast<uint8_t>(v); return;
+                case DType::UInt16: *static_cast<uint16_t*>(ptr) = static_cast<uint16_t>(v); return;
+                default: *static_cast<uint32_t*>(ptr) = static_cast<uint32_t>(v); return;
+            }
+        }
+        case DType::ComplexFloat:
+        case DType::ComplexDouble:
+        case DType::ComplexHalf:
+        case DType::BComplex32: {
+            double real, imag;
+            if (PyComplex_Check(value)) {
+                real = PyComplex_RealAsDouble(value);
+                imag = PyComplex_ImagAsDouble(value);
+                if ((real == -1.0 || imag == -1.0) && PyErr_Occurred())
+                    throw py::error_already_set();
+            } else {
+                real = PyFloat_AsDouble(value);
+                if (real == -1.0 && PyErr_Occurred())
+                    throw py::error_already_set();
+                imag = 0.0;
+            }
+            switch (dtype) {
+                case DType::ComplexFloat:
+                    *static_cast<std::complex<float>*>(ptr) = {static_cast<float>(real), static_cast<float>(imag)};
+                    return;
+                case DType::ComplexDouble:
+                    *static_cast<std::complex<double>*>(ptr) = {real, imag};
+                    return;
+                case DType::ComplexHalf:
+                    *static_cast<std::complex<tensorplay::Half>*>(ptr) =
+                        {static_cast<tensorplay::Half>(static_cast<float>(real)),
+                         static_cast<tensorplay::Half>(static_cast<float>(imag))};
+                    return;
+                default:
+                    *static_cast<std::complex<tensorplay::BFloat16>*>(ptr) =
+                        {static_cast<tensorplay::BFloat16>(static_cast<float>(real)),
+                         static_cast<tensorplay::BFloat16>(static_cast<float>(imag))};
+                    return;
+            }
+        }
+        default: {
+            // Float slots (Half/BFloat16/Float32/Float64): require a real
+            // number; ints convert through their float value.
+            const double v = PyFloat_AsDouble(value);
+            if (v == -1.0 && PyErr_Occurred()) throw py::error_already_set();
+            switch (dtype) {
+                case DType::Float32: *static_cast<float*>(ptr) = static_cast<float>(v); return;
+                case DType::Float64: *static_cast<double*>(ptr) = v; return;
+                case DType::Float16: *static_cast<tensorplay::Half*>(ptr) = static_cast<tensorplay::Half>(static_cast<float>(v)); return;
+                case DType::BFloat16: *static_cast<tensorplay::BFloat16*>(ptr) = static_cast<tensorplay::BFloat16>(static_cast<float>(v)); return;
+                default: TP_THROW(NotImplementedError, "apply_: unsupported dtype");
+            }
+        }
+    }
+}
+
+void recursive_apply_elems(const std::vector<int64_t>& sizes, DType dtype,
+                           int64_t dim, PyObject* fn,
+                           std::vector<StridedElem>& elems) {
+    if (dim == static_cast<int64_t>(sizes.size())) {
+        PyObject* args = PyTuple_New(static_cast<Py_ssize_t>(elems.size()));
+        if (args == nullptr) throw py::error_already_set();
+        for (size_t i = 0; i < elems.size(); ++i) {
+            py::object boxed = load_elem_scalar(elems[i].data, dtype);
+            PyTuple_SET_ITEM(args, static_cast<Py_ssize_t>(i),
+                             boxed.release().ptr());
+        }
+        PyObject* ret = PyObject_CallObject(fn, args);
+        Py_DECREF(args);
+        if (ret == nullptr) throw py::error_already_set();
+        store_elem_scalar(elems[0].data, dtype, ret);
+        Py_DECREF(ret);
+        return;
+    }
+    if (sizes[dim] == 0) return;
+    // The per-cursor state is advanced while walking this dimension and
+    // restored afterwards, so each outer level resumes from its own position
+    // (the by-value pass-through of the reference layout).
+    std::vector<void*> saved(elems.size());
+    for (size_t i = 0; i < elems.size(); ++i) saved[i] = elems[i].data;
+    for (int64_t i = 0; i < sizes[dim]; ++i) {
+        recursive_apply_elems(sizes, dtype, dim + 1, fn, elems);
+        for (auto& e : elems) e.step(dim);
+    }
+    for (size_t i = 0; i < elems.size(); ++i) elems[i].data = saved[i];
+}
+
+void check_apply_inplace(const Tensor& t, const char* op) {
+    if (t.requires_grad()) {
+        TP_THROW(RuntimeError, "Can't call ", op,
+                 "() on Variable that requires grad. Use var.detach().", op,
+                 "() instead.");
+    }
+}
+
+void check_apply_cpu(const Tensor& t, const char* op) {
+    if (!t.device().is_cpu()) {
+        TP_THROW(RuntimeError, op, " is only implemented on CPU tensors");
+    }
+}
+
+// Broadcast `other` against `self`'s shape, returning a view when possible.
+Tensor expand_inplace_like(const Tensor& self, const Tensor& other) {
+    if (other.shape() == self.shape()) return other;
+    return other.expand(static_cast<std::vector<int64_t>>(self.shape()));
+}
+
+// Operand mismatches are spelled with the layout-tagged type name
+// ("tensorplay.FloatTensor"); the message phrasing below keeps that surface.
+std::string tensor_kind_name(const Tensor& t) {
+    std::string name = "tensorplay.";
+    if (t.device().is_cuda()) name += "cuda.";
+    switch (t.dtype()) {
+#define TP_KIND_CASE(name_, suffix) \
+        case DType::name_: return name + #suffix;
+        TP_KIND_CASE(Float32, FloatTensor)
+        TP_KIND_CASE(Float64, DoubleTensor)
+        TP_KIND_CASE(Float16, HalfTensor)
+        TP_KIND_CASE(BFloat16, BFloat16Tensor)
+        TP_KIND_CASE(Int8, CharTensor)
+        TP_KIND_CASE(Int16, ShortTensor)
+        TP_KIND_CASE(Int32, IntTensor)
+        TP_KIND_CASE(Int64, LongTensor)
+        TP_KIND_CASE(UInt8, ByteTensor)
+        TP_KIND_CASE(UInt16, UInt16Tensor)
+        TP_KIND_CASE(UInt32, UInt32Tensor)
+        TP_KIND_CASE(UInt64, UInt64Tensor)
+        TP_KIND_CASE(Bool, BoolTensor)
+        TP_KIND_CASE(ComplexHalf, ComplexHalfTensor)
+        TP_KIND_CASE(ComplexFloat, ComplexFloatTensor)
+        TP_KIND_CASE(ComplexDouble, ComplexDoubleTensor)
+        TP_KIND_CASE(BComplex32, BComplex32Tensor)
+#undef TP_KIND_CASE
+        default: return name + "Tensor";
+    }
+}
+
+void check_apply_same_type(const Tensor& self, const Tensor& other,
+                           const char* op, const char* argname) {
+    if (other.dtype() != self.dtype() || !(other.device() == self.device())) {
+        TP_THROW(TypeError, op, ": expected ", tensor_kind_name(self), " for ",
+                 argname, " (got ", tensor_kind_name(other), ")");
+    }
+}
+
+void check_tensor_subclass_type(py::object cls, const char* fn) {
+    const int res = PyObject_IsSubclass(cls.ptr(), py::type::of<Tensor>().ptr());
+    if (res < 0) throw py::error_already_set();
+    if (!res) {
+        TP_THROW(TypeError, fn,
+                 ": cls must be a subclass of tensorplay._C.TensorBase");
+    }
+}
+
+py::object wrap_tensor_as_type(const Tensor& t, py::object cls) {
+    py::object inst = cls();
+    *inst.cast<Tensor*>() = t;
+    return inst;
+}
+
+// Buffer-protocol view: zero-copy, owner kept alive through the DataPtr.
+Tensor tensor_from_buffer(py::object buffer, DType dtype, int64_t count,
+                          int64_t offset) {
+    static bool warned_non_writable = false;
+    const size_t elsize = tensorplay::elementSize(dtype);
+    Py_buffer view;
+    if (PyObject_GetBuffer(buffer.ptr(), &view, PyBUF_WRITABLE) < 0) {
+        if (PyObject_GetBuffer(buffer.ptr(), &view, PyBUF_SIMPLE) < 0) {
+            TP_THROW(ValueError, "could not retrieve buffer from object");
+        }
+        if (!warned_non_writable) {
+            PyErr_WarnEx(PyExc_UserWarning,
+                         "The given buffer is not writable, and TensorPlay does "
+                         "not support non-writable tensors. This means you can write to the "
+                         "underlying (supposedly non-writable) buffer using the tensor. "
+                         "You may want to copy the buffer to protect its data or make it writable "
+                         "before converting it to a tensor. This type of warning will be "
+                         "suppressed for the rest of this program.", 1);
+            warned_non_writable = true;
+        }
+        PyErr_Clear();
+    }
+
+    PyObject* view_obj = view.obj;
+    Py_INCREF(view_obj);
+
+    const int64_t len = static_cast<int64_t>(view.len);
+    void* buf = view.buf;
+    PyBuffer_Release(&view);
+    (void)buf;
+
+    if (!(len > 0 && count != 0)) {
+        Py_DECREF(view_obj);
+        TP_THROW(ValueError, "both buffer length and count must not be 0");
+    }
+    if (!(offset >= 0 && offset < len)) {
+        Py_DECREF(view_obj);
+        TP_THROW(ValueError, "offset must be non-negative and no greater than buffer length minus 1");
+    }
+    if (!(count > 0 || (len - offset) % static_cast<int64_t>(elsize) == 0)) {
+        Py_DECREF(view_obj);
+        TP_THROW(ValueError, "buffer length after offset must be a multiple of element size");
+    }
+
+    size_t actual_count;
+    if (count < 0) {
+        actual_count = static_cast<size_t>((len - offset) / static_cast<int64_t>(elsize));
+    } else {
+        actual_count = static_cast<size_t>(count);
+    }
+    if (static_cast<size_t>(offset) + actual_count * elsize > static_cast<size_t>(len)) {
+        Py_DECREF(view_obj);
+        TP_THROW(ValueError, "requested buffer length must not be greater than actual buffer length");
+    }
+
+    auto* offset_buf = static_cast<char*>(buf) + offset;
+
+    // Zero-copy: the DataPtr keeps the buffer's owner alive via DECREF.
+    tensorplay::DataPtr ptr(offset_buf, view_obj, &pyobject_deleter, Device(DeviceType::CPU));
+    tensorplay::Storage storage(std::move(ptr), actual_count * elsize);
+
+    std::vector<int64_t> shape{static_cast<int64_t>(actual_count)};
+    std::vector<int64_t> strides{1};
+    auto impl = std::make_shared<tensorplay::TensorImpl>(storage, shape, strides, dtype);
+    return Tensor(impl);
+}
+
+} // namespace
+
 py::object as_tensor(py::object data, std::optional<DType> dtype, std::optional<Device> device) {
     if (py::isinstance<Tensor>(data)) {
         Tensor t = py::cast<Tensor>(data);
@@ -1507,26 +1893,6 @@ py::object as_tensor(py::object data, std::optional<DType> dtype, std::optional<
 }
 
 void init_tensor(py::module_& m) {
-    // item -> native Python number: the generated fastcall binding boxes the
-    // result into a tp.Scalar object which the _tensor.py wrapper then
-    // unboxes per dtype (with a per-call `import builtins`).  Returning raw
-    // both extra layers.
-    m.def("item_python", [](const Tensor& t) -> py::object {
-        const Scalar v = t.item();
-        if (v.isBoolean()) return py::bool_(v.to<bool>());
-        if (v.isComplex()) {
-            const auto c = v.to<std::complex<double>>();
-            return py::reinterpret_steal<py::object>(
-                PyComplex_FromDoubles(c.real(), c.imag()));
-        }
-        if (v.dtype() == DType::UInt64) {
-            return py::reinterpret_steal<py::object>(PyLong_FromUnsignedLongLong(
-                static_cast<unsigned long long>(v.to<uint64_t>())));
-        }
-        if (v.isFloatingPoint()) return py::float_(v.to<double>());
-        return py::int_(v.to<int64_t>());
-    });
-
     // tensor_from_numpy(): zero-copy from_blob view; non-writable arrays warn
     // once instead of failing; byte-stride divisibility, negative strides and
     static bool warned_numpy_not_writeable = false;
@@ -1602,71 +1968,10 @@ void init_tensor(py::module_& m) {
 
     // tensor_frombuffer(): buffer-protocol view, zero-copy, writable preferred
     // with the same non-writable warn-once fallback and value checks.
-    static bool warned_non_writable = false;
-    m.def("frombuffer", [warned_non_writable](py::object buffer, DType dtype,
-                                              int64_t count, int64_t offset,
-                                              bool requires_grad) mutable -> Tensor {
-        const size_t elsize = tensorplay::elementSize(dtype);
-        Py_buffer view;
-        if (PyObject_GetBuffer(buffer.ptr(), &view, PyBUF_WRITABLE) < 0) {
-            if (PyObject_GetBuffer(buffer.ptr(), &view, PyBUF_SIMPLE) < 0) {
-                TP_THROW(ValueError, "could not retrieve buffer from object");
-            }
-            if (!warned_non_writable) {
-                PyErr_WarnEx(PyExc_UserWarning,
-                             "The given buffer is not writable, and TensorPlay does "
-                             "not support non-writable tensors. This means you can write to the "
-                             "underlying (supposedly non-writable) buffer using the tensor. "
-                             "You may want to copy the buffer to protect its data or make it writable "
-                             "before converting it to a tensor. This type of warning will be "
-                             "suppressed for the rest of this program.", 1);
-                warned_non_writable = true;
-            }
-            PyErr_Clear();
-        }
-
-        PyObject* view_obj = view.obj;
-        Py_INCREF(view_obj);
-
-        const int64_t len = static_cast<int64_t>(view.len);
-        void* buf = view.buf;
-        PyBuffer_Release(&view);
-        (void)buf;
-
-        if (!(len > 0 && count != 0)) {
-            Py_DECREF(view_obj);
-            TP_THROW(ValueError, "both buffer length and count must not be 0");
-        }
-        if (!(offset >= 0 && offset < len)) {
-            Py_DECREF(view_obj);
-            TP_THROW(ValueError, "offset must be non-negative and no greater than buffer length minus 1");
-        }
-        if (!(count > 0 || (len - offset) % static_cast<int64_t>(elsize) == 0)) {
-            Py_DECREF(view_obj);
-            TP_THROW(ValueError, "buffer length after offset must be a multiple of element size");
-        }
-
-        size_t actual_count;
-        if (count < 0) {
-            actual_count = static_cast<size_t>((len - offset) / static_cast<int64_t>(elsize));
-        } else {
-            actual_count = static_cast<size_t>(count);
-        }
-        if (static_cast<size_t>(offset) + actual_count * elsize > static_cast<size_t>(len)) {
-            Py_DECREF(view_obj);
-            TP_THROW(ValueError, "requested buffer length must not be greater than actual buffer length");
-        }
-
-        auto* offset_buf = static_cast<char*>(buf) + offset;
-
-        // Zero-copy: the DataPtr keeps the buffer's owner alive via DECREF.
-        tensorplay::DataPtr ptr(offset_buf, view_obj, &pyobject_deleter, Device(DeviceType::CPU));
-        tensorplay::Storage storage(std::move(ptr), actual_count * elsize);
-
-        std::vector<int64_t> shape{static_cast<int64_t>(actual_count)};
-        std::vector<int64_t> strides{1};
-        auto impl = std::make_shared<tensorplay::TensorImpl>(storage, shape, strides, dtype);
-        Tensor t(impl);
+    m.def("frombuffer", [](py::object buffer, DType dtype,
+                           int64_t count, int64_t offset,
+                           bool requires_grad) -> Tensor {
+        Tensor t = tensor_from_buffer(buffer, dtype, count, offset);
         tensorplay::tpx::impl::set_requires_grad(t, requires_grad);
         return t;
     }, "buffer"_a, "dtype"_a = DType::Float32, "count"_a = -1, "offset"_a = 0,
@@ -1675,6 +1980,144 @@ void init_tensor(py::module_& m) {
     // Expose from_dlpack as a module function
     m.def("from_dlpack", &from_dlpack, "obj"_a);
     m.def("to_dlpack", &to_dlpack, "obj"_a, "stream"_a = py::none());
+
+    // asarray(): alias when possible; copy on explicit copy=True or a
+    // device/dtype mismatch with copy unset; sequences always copy.
+    m.def("asarray",
+          [](py::object obj, std::optional<DType> dtype,
+             std::optional<Device> device, std::optional<bool> copy,
+             std::optional<bool> requires_grad) -> Tensor {
+              Tensor tensor;
+              if (py::isinstance<Tensor>(obj)) {
+                  tensor = py::cast<Tensor>(obj);
+              } else {
+                  if (!requires_grad.has_value() && !py::isinstance<py::none>(obj)) {
+                      // Source objects that can alias (NumPy arrays) may carry
+                      // their own requires_grad; sequences default to False.
+                      // Handled below after the tensor materializes.
+                  }
+              }
+              bool return_requires_grad = requires_grad.value_or(false);
+              const bool force_copy = copy.value_or(false);
+              const bool force_alias = copy.has_value() && !*copy;
+              bool deferred_requires_grad = false;
+
+              if (!tensor.defined()) {
+                  bool is_np_scalar = false;
+                  const bool is_np = numpy_object_kind(obj, &is_np_scalar);
+                  const bool has_dlpack =
+                      PyObject_HasAttrString(obj.ptr(), "__dlpack__") != 0;
+                  const bool is_buffer_like =
+                      is_np || has_dlpack || PyObject_CheckBuffer(obj.ptr()) != 0;
+
+                  if (is_np && is_np_scalar) {
+                      if (force_alias) {
+                          TP_THROW(ValueError,
+                                   "can't alias NumPy scalars. Either remove copy=False "
+                                   "or transform it in a ndarray.");
+                      }
+                      // 0-d array view of the scalar; the converter keeps the
+                      // temporary alive through the storage's DataPtr.
+                      py::object arr = py::module_::import("numpy").attr("asarray")(obj);
+                      tensor = create_tensor(arr, dtype, device);
+                  } else if (is_np || has_dlpack) {
+                      if (force_alias && device.has_value() &&
+                          device->type() != DeviceType::CPU) {
+                          TP_THROW(ValueError, "can't alias tensor from device 'cpu' to '",
+                                   device->toString(), "'.");
+                      }
+                      if (force_alias && is_np && dtype.has_value()) {
+                          const std::optional<DType> inferred =
+                              numpy_inferred_dtype(obj);
+                          if (inferred && *inferred != *dtype) {
+                              TP_THROW(ValueError,
+                                       "can't alias tensor with dtype '",
+                                       tensorplay::toString(*inferred),
+                                       "' into dtype '",
+                                       tensorplay::toString(*dtype), "'.");
+                          }
+                      }
+                      // Inferred dtype/device; conversions and copy semantics
+                      // are applied by the shared alias/copy block below, so
+                      // copy=True still produces detached fresh storage.
+                      tensor = create_tensor(obj, std::nullopt, device);
+                  } else if (PyObject_CheckBuffer(obj.ptr()) != 0) {
+                      // Raw buffer views are read in the requested dtype (the
+                      // default dtype when none is given); no conversion is
+                      // applied to aliased data.
+                      const DType buf_dtype =
+                          dtype.value_or(tensorplay::globalContext().defaultDType());
+                      if (force_alias && device.has_value() &&
+                          device->type() != DeviceType::CPU) {
+                          TP_THROW(ValueError, "can't alias tensor from device 'cpu' to '",
+                                   device->toString(), "'.");
+                      }
+                      tensor = tensor_from_buffer(
+                          obj, buf_dtype, /*count=*/-1, /*offset=*/0);
+                      if (force_copy) tensor = tensor.clone();
+                      return tensor;
+                  } else {
+                      // Sequence or arbitrary python object: always copies.
+                      if (force_alias) {
+                          TP_THROW(ValueError,
+                                   "can't alias arbitrary sequence into a tensor.");
+                      }
+                      tensor = create_tensor(obj, dtype, device);
+                  }
+                  // numpy/dlpack aliases of objects that cannot carry autograd
+                  // state default to requires_grad=False.
+                  deferred_requires_grad = !requires_grad.has_value();
+              } else {
+                  if (!requires_grad.has_value()) {
+                      return_requires_grad = tensor.requires_grad();
+                  }
+              }
+
+              const bool wrong_device =
+                  device.has_value() && *device != tensor.device();
+              const bool wrong_dtype =
+                  dtype.has_value() && *dtype != tensor.dtype();
+              const bool needs_copying =
+                  !copy.has_value() && (wrong_device || wrong_dtype);
+              if (force_copy || needs_copying) {
+                  if (wrong_device || wrong_dtype) {
+                      tensor = tensor.to(
+                          device.value_or(tensor.device()),
+                          dtype.value_or(tensor.dtype()),
+                          /*non_blocking=*/false, /*copy=*/force_copy);
+                  } else {
+                      tensor = tensor.clone();
+                  }
+              } else {
+                  if (wrong_device) {
+                      TP_THROW(ValueError, "can't alias tensor from device '",
+                               tensor.device().toString(), "' to '",
+                               device->toString(), "'.");
+                  }
+                  if (wrong_dtype) {
+                      TP_THROW(ValueError, "can't alias tensor with dtype '",
+                               tensorplay::toString(tensor.dtype()),
+                               "' into dtype '", tensorplay::toString(*dtype),
+                               "'.");
+                  }
+              }
+
+              if (tensor.defined()) {
+                  if (deferred_requires_grad && !requires_grad.has_value()) {
+                      // leave at the converter default (False), matching an
+                      // unspecified request over data without autograd state
+                  } else if (!tensorplay::tpx::impl::is_leaf(tensor) &&
+                             !return_requires_grad) {
+                      tensor = tensor.detach();
+                  } else {
+                      tensorplay::tpx::impl::set_requires_grad(
+                          tensor, return_requires_grad);
+                  }
+              }
+              return tensor;
+          },
+          "obj"_a, "dtype"_a = py::none(), "device"_a = py::none(),
+          "copy"_a = py::none(), "requires_grad"_a = py::none());
 
     // from_numpy: zero-copy view over the numpy array's memory when dtypes
     m.def("from_numpy", [](py::array array) -> Tensor {
@@ -2571,33 +3014,33 @@ void init_tensor(py::module_& m) {
         })
         
         // Operators
-        .def("__neg__", [](const Tensor& t) { return tensorplay::tpx::ops::neg(t); })
-        .def("__add__", [](const Tensor& a, const Tensor& b) { return tensorplay::tpx::ops::add(a, b); })
-        .def("__sub__", [](const Tensor& a, const Tensor& b) { return tensorplay::tpx::ops::sub(a, b); })
-        .def("__mul__", [](const Tensor& a, const Tensor& b) { return tensorplay::tpx::ops::mul(a, b); })
-        .def("__truediv__", [](const Tensor& a, const Tensor& b) { return tensorplay::tpx::ops::div(a, b); })
+        .def("__neg__", [](const Tensor& t) { return t.neg(); })
+        .def("__add__", [](const Tensor& a, const Tensor& b) { return a.add(b); })
+        .def("__sub__", [](const Tensor& a, const Tensor& b) { return a.sub(b); })
+        .def("__mul__", [](const Tensor& a, const Tensor& b) { return a.mul(b); })
+        .def("__truediv__", [](const Tensor& a, const Tensor& b) { return a.div(b); })
         // as int64 scalars); the double overloads below handle real scalars.
-        .def("__add__", [](const Tensor& t, int64_t s) { return tensorplay::tpx::ops::add(t, Scalar(s)); })
-        .def("__sub__", [](const Tensor& t, int64_t s) { return tensorplay::tpx::ops::sub(t, Scalar(s)); })
-        .def("__mul__", [](const Tensor& t, int64_t s) { return tensorplay::tpx::ops::mul(t, Scalar(s)); })
-        .def("__add__", [](const Tensor& t, double s) { return tensorplay::tpx::ops::add(t, Scalar(s)); })
-        .def("__sub__", [](const Tensor& t, double s) { return tensorplay::tpx::ops::sub(t, Scalar(s)); })
-        .def("__mul__", [](const Tensor& t, double s) { return tensorplay::tpx::ops::mul(t, Scalar(s)); })
-        .def("__truediv__", [](const Tensor& t, double s) { return tensorplay::tpx::ops::div(t, Scalar(s)); })
+        .def("__add__", [](const Tensor& t, int64_t s) { return t.add(Scalar(s)); })
+        .def("__sub__", [](const Tensor& t, int64_t s) { return t.sub(Scalar(s)); })
+        .def("__mul__", [](const Tensor& t, int64_t s) { return t.mul(Scalar(s)); })
+        .def("__add__", [](const Tensor& t, double s) { return t.add(Scalar(s)); })
+        .def("__sub__", [](const Tensor& t, double s) { return t.sub(Scalar(s)); })
+        .def("__mul__", [](const Tensor& t, double s) { return t.mul(Scalar(s)); })
+        .def("__truediv__", [](const Tensor& t, double s) { return t.div(Scalar(s)); })
         // the weak-scalar promotion rules in the kernels.
-        .def("__add__", [](const Tensor& t, std::complex<double> s) { return tensorplay::tpx::ops::add(t, Scalar(s)); })
-        .def("__sub__", [](const Tensor& t, std::complex<double> s) { return tensorplay::tpx::ops::sub(t, Scalar(s)); })
-        .def("__mul__", [](const Tensor& t, std::complex<double> s) { return tensorplay::tpx::ops::mul(t, Scalar(s)); })
-        .def("__truediv__", [](const Tensor& t, std::complex<double> s) { return tensorplay::tpx::ops::div(t, Scalar(s)); })
-        .def("__radd__", [](const Tensor& t, int64_t s) { return tensorplay::tpx::ops::add(t, Scalar(s)); })
-        .def("__rmul__", [](const Tensor& t, int64_t s) { return tensorplay::tpx::ops::mul(t, Scalar(s)); })
-        .def("__radd__", [](const Tensor& t, double s) { return tensorplay::tpx::ops::add(t, Scalar(s)); })
+        .def("__add__", [](const Tensor& t, std::complex<double> s) { return t.add(Scalar(s)); })
+        .def("__sub__", [](const Tensor& t, std::complex<double> s) { return t.sub(Scalar(s)); })
+        .def("__mul__", [](const Tensor& t, std::complex<double> s) { return t.mul(Scalar(s)); })
+        .def("__truediv__", [](const Tensor& t, std::complex<double> s) { return t.div(Scalar(s)); })
+        .def("__radd__", [](const Tensor& t, int64_t s) { return t.add(Scalar(s)); })
+        .def("__rmul__", [](const Tensor& t, int64_t s) { return t.mul(Scalar(s)); })
+        .def("__radd__", [](const Tensor& t, double s) { return t.add(Scalar(s)); })
         .def("__rsub__", [](const Tensor& t, double s) {
             Tensor s_t = Tensor::full({}, Scalar(s), t.dtype(), t.device());
-            return tensorplay::tpx::ops::sub(s_t, t);
+            return s_t.sub(t);
         })
-        .def("__rmul__", [](const Tensor& t, double s) { return tensorplay::tpx::ops::mul(t, Scalar(s)); })
-        .def("__radd__", [](const Tensor& t, std::complex<double> s) { return tensorplay::tpx::ops::add(t, Scalar(s)); })
+        .def("__rmul__", [](const Tensor& t, double s) { return t.mul(Scalar(s)); })
+        .def("__radd__", [](const Tensor& t, std::complex<double> s) { return t.add(Scalar(s)); })
         // Weak-scalar rule for the reflected operand's storage width:
         // complex tensor keeps its dtype; float32 -> complex64,
         // float64 -> complex128; integral -> complex64.
@@ -2607,16 +3050,16 @@ void init_tensor(py::module_& m) {
                 : (isFloatingType(t.dtype()) ? promoteTypes(toComplexType(t.dtype()), DType::ComplexFloat)
                                              : DType::ComplexFloat);
             Tensor s_t = Tensor::full({}, Scalar(s), sdt, t.device());
-            return tensorplay::tpx::ops::sub(s_t, t);
+            return s_t.sub(t);
         })
-        .def("__rmul__", [](const Tensor& t, std::complex<double> s) { return tensorplay::tpx::ops::mul(t, Scalar(s)); })
+        .def("__rmul__", [](const Tensor& t, std::complex<double> s) { return t.mul(Scalar(s)); })
         // NOTE: the double overload must precede the std::complex<double> one.
         // pybind tries overloads in registration order and a python float is
         // convertible to complex<double>; otherwise every `1.0 / real_tensor`
         // silently promoted to complex (broke linalg.pinv et al).
         .def("__rtruediv__", [](const Tensor& t, double s) {
             Tensor s_t = Tensor::full({}, Scalar(s), t.dtype(), t.device());
-            return tensorplay::tpx::ops::div(s_t, t);
+            return s_t.div(t);
         })
         .def("__rtruediv__", [](const Tensor& t, std::complex<double> s) {
             DType sdt = isComplexType(t.dtype())
@@ -2624,7 +3067,7 @@ void init_tensor(py::module_& m) {
                 : (isFloatingType(t.dtype()) ? promoteTypes(toComplexType(t.dtype()), DType::ComplexFloat)
                                              : DType::ComplexFloat);
             Tensor s_t = Tensor::full({}, Scalar(s), sdt, t.device());
-            return tensorplay::tpx::ops::div(s_t, t);
+            return s_t.div(t);
         })
         .def("__iadd__", [](Tensor& self, const Tensor& other) {
             tensorplay::tpx::ops::add_(self, other);
@@ -2660,7 +3103,7 @@ void init_tensor(py::module_& m) {
         })
         
         // Explicit arithmetic
-                                                                                                                                                .def("__matmul__", [](const Tensor& self, const Tensor& other) { return tensorplay::tpx::ops::matmul(self, other); }, "other"_a)
+                                                                                                                                                .def("__matmul__", [](const Tensor& self, const Tensor& other) { return self.matmul(other); }, "other"_a)
 
         // Comparison operators
         .def("__hash__", [](const Tensor& self) { return (intptr_t)&self; })
@@ -2678,11 +3121,11 @@ void init_tensor(py::module_& m) {
         .def("__ge__", [](const Tensor& self, Scalar other) { return self.ge(other); })
 
         // Pointwise ops
-                                                                                                                .def("__pow__", [](const Tensor& self, Scalar exponent) { return tensorplay::tpx::ops::pow(self, exponent); }, "exponent"_a)
-        .def("__pow__", [](const Tensor& self, const Tensor& exponent) { return tensorplay::tpx::ops::pow(self, exponent); }, "exponent"_a)
+                                                                                                                .def("__pow__", [](const Tensor& self, Scalar exponent) { return self.pow(exponent); }, "exponent"_a)
+        .def("__pow__", [](const Tensor& self, const Tensor& exponent) { return self.pow(exponent); }, "exponent"_a)
         .def("__rpow__", [](const Tensor& self, Scalar base) {
             Tensor base_t = Tensor::full({}, base, self.dtype(), self.device());
-            return tensorplay::tpx::ops::pow(base_t, self);
+            return base_t.pow(self);
         })        // DLPack
         .def("__dlpack__", [](py::object self_obj, std::optional<int64_t> stream) {
             return to_dlpack(self_obj, stream);
@@ -2801,7 +3244,218 @@ void init_tensor(py::module_& m) {
             if (self.dim() == 0)
                 TP_THROW(TypeError, "len() of a 0-d tensor");
             return self.size(0);
-        });
+        })
+        // ------------------------------------------------------------------
+        // Binding-layer ops and accessors.  These must be bound before the
+        // FASTCALL layer registers (which only fills unbound names).
+        // ------------------------------------------------------------------
+
+        // In-place per-element callbacks.  CPU-only (meta tensors are a
+        // silent no-op); rejects tensors that carry autograd state because
+        // no gradient rule exists for a Python callable.
+        .def("apply_", [](py::object self_obj, py::object fn) -> py::object {
+            Tensor& self = self_obj.cast<Tensor&>();
+            check_apply_cpu(self, "apply_");
+            check_apply_inplace(self, "apply_");
+            const std::vector<int64_t> sizes =
+                static_cast<std::vector<int64_t>>(self.shape());
+            const std::vector<int64_t> strides = self.strides();
+            std::vector<StridedElem> elems{
+                {self.data_ptr(), strides.data(), self.itemsize()}};
+            recursive_apply_elems(sizes, self.dtype(), 0, fn.ptr(), elems);
+            return self_obj;
+        }, "callable"_a)
+        .def("map_", [](py::object self_obj, const Tensor& other,
+                        py::object fn) -> py::object {
+            Tensor& self = self_obj.cast<Tensor&>();
+            check_apply_same_type(self, other, "map_", "'other'");
+            check_apply_cpu(self, "map_");
+            check_apply_inplace(self, "map_");
+            Tensor other_exp = expand_inplace_like(self, other);
+            const std::vector<int64_t> sizes =
+                static_cast<std::vector<int64_t>>(self.shape());
+            const std::vector<int64_t> strides = self.strides();
+            const std::vector<int64_t> other_strides = other_exp.strides();
+            std::vector<StridedElem> elems{
+                {self.data_ptr(), strides.data(), self.itemsize()},
+                {other_exp.data_ptr(), other_strides.data(),
+                 other_exp.itemsize()}};
+            recursive_apply_elems(sizes, self.dtype(), 0, fn.ptr(), elems);
+            return self_obj;
+        }, "tensor"_a, "callable"_a)
+        .def("map2_", [](py::object self_obj, const Tensor& x, const Tensor& y,
+                         py::object fn) -> py::object {
+            Tensor& self = self_obj.cast<Tensor&>();
+            check_apply_same_type(self, x, "map2_", "argument 'x'");
+            check_apply_same_type(self, y, "map2_", "argument 'y'");
+            check_apply_cpu(self, "map2_");
+            check_apply_inplace(self, "map2_");
+            Tensor x_exp = expand_inplace_like(self, x);
+            Tensor y_exp = expand_inplace_like(self, y);
+            const std::vector<int64_t> sizes =
+                static_cast<std::vector<int64_t>>(self.shape());
+            const std::vector<int64_t> strides = self.strides();
+            const std::vector<int64_t> x_strides = x_exp.strides();
+            const std::vector<int64_t> y_strides = y_exp.strides();
+            std::vector<StridedElem> elems{
+                {self.data_ptr(), strides.data(), self.itemsize()},
+                {x_exp.data_ptr(), x_strides.data(), x_exp.itemsize()},
+                {y_exp.data_ptr(), y_strides.data(), y_exp.itemsize()}};
+            recursive_apply_elems(sizes, self.dtype(), 0, fn.ptr(), elems);
+            return self_obj;
+        }, "tensor1"_a, "tensor2"_a, "callable"_a)
+
+        // new(...): factory sharing this tensor's dtype and device.  A single
+        // integer (or several) is a size; storage, tensor and sequence-like
+        // arguments are data; the keyword device overrides the target device.
+        // (py::kwargs instead of a named trailing parameter: pybind11 3.1
+        // misloads that combination -- reads freed stack memory -- whenever
+        // the keyword is absent.)
+        .def("new", [](const Tensor& self, py::args args, py::kwargs kwargs) -> Tensor {
+            std::optional<Device> device;
+            if (kwargs && kwargs.size() > 0) {
+                for (auto item : kwargs) {
+                    if (!item.first.equal(py::str("device"))) {
+                        TP_THROW(TypeError,
+                                 "new() got an unexpected keyword argument '",
+                                 item.first.cast<std::string>(), "'");
+                    }
+                }
+                py::object dv = kwargs["device"];
+                if (!dv.is_none()) {
+                    if (py::isinstance<py::str>(dv)) {
+                        device = tensorplay::Device(dv.cast<std::string>());
+                    } else {
+                        device = dv.cast<Device>();
+                    }
+                }
+            }
+            const Device target =
+                device.value_or(self.device());
+            if (args.size() == 0) {
+                return Tensor::empty({0}, self.dtype(), target);
+            }
+            if (args.size() == 1) {
+                py::object arg = args[0];
+                if (py::isinstance<py::int_>(arg) &&
+                    !py::isinstance<py::bool_>(arg)) {
+                    const int64_t n = arg.cast<int64_t>();
+                    return Tensor::empty({n}, self.dtype(), target);
+                }
+                if (py::isinstance<tensorplay::Storage>(arg)) {
+                    const auto& storage = arg.cast<const tensorplay::Storage&>();
+                    const int64_t nbytes = static_cast<int64_t>(storage.nbytes());
+                    const int64_t numel =
+                        nbytes / static_cast<int64_t>(self.itemsize());
+                    return Tensor(storage,
+                                  std::vector<int64_t>{numel},
+                                  self.dtype());
+                }
+                if (py::isinstance<Tensor>(arg)) {
+                    // Same data, same dtype/device contract as the size and
+                    // data forms: shares the source tensor's payload.
+                    return py::cast<Tensor>(arg);
+                }
+                if (py::isinstance<py::float_>(arg) ||
+                    PyComplex_Check(arg.ptr()) ||
+                    py::isinstance<py::bool_>(arg)) {
+                    TP_THROW(TypeError,
+                             "new(): data must be a sequence (got float)");
+                }
+                return create_tensor(arg, self.dtype(), target);
+            }
+            // Multiple positional arguments spell a size.
+            std::vector<int64_t> shape;
+            shape.reserve(args.size());
+            for (size_t i = 0; i < args.size(); ++i) {
+                py::object arg = args[i];
+                if (!py::isinstance<py::int_>(arg) ||
+                    py::isinstance<py::bool_>(arg)) {
+                    TP_THROW(TypeError,
+                             "new() received an invalid combination of arguments");
+                }
+                shape.push_back(arg.cast<int64_t>());
+            }
+            return Tensor::empty(shape, self.dtype(), target);
+        })
+
+        // Memory-format dim order: dimensions sorted by descending stride,
+        // which enumerates contiguous, channels-last and channels-last-3d
+        // layouts and permuted views uniformly.
+        .def("dim_order", [](const Tensor& self) -> py::tuple {
+            const int64_t ndim = self.dim();
+            if (ndim == 0) return py::tuple(0);
+            const std::vector<int64_t> strides = self.strides();
+            std::vector<int64_t> order(ndim);
+            for (int64_t i = 0; i < ndim; ++i) order[i] = i;
+            std::stable_sort(order.begin(), order.end(),
+                             [&](int64_t a, int64_t b) {
+                                 return strides[a] > strides[b];
+                             });
+            return py::cast(order);
+        })
+
+        .def("as_subclass", [](py::object self_obj, py::object cls) -> py::object {
+            check_tensor_subclass_type(cls, "as_subclass");
+            return wrap_tensor_as_type(self_obj.cast<const Tensor&>(), cls);
+        }, "cls"_a)
+
+        // Named-tensor names are not tracked by this build; the accessor
+        // reports the unnamed state, mirroring an unnamed tensor upstream.
+        .def_property_readonly("name", [](const Tensor&) -> py::object {
+            return py::none();
+        })
+
+        // Gradient dtype override: unset falls back to the tensor's dtype;
+        // an explicit None disables the dtype check performed when a gradient
+        // is assigned.
+        .def_property("grad_dtype",
+            [](py::object self_obj) -> py::object {
+                if (py::hasattr(self_obj, "_grad_dtype")) {
+                    return self_obj.attr("_grad_dtype");
+                }
+                return py::cast(self_obj.cast<const Tensor&>().dtype());
+            },
+            [](py::object self_obj, py::object value) {
+                if (!value.is_none()) {
+                    bool ok = false;
+                    try {
+                        value.cast<DType>();
+                        ok = true;
+                    } catch (const py::cast_error&) {
+                    }
+                    if (!ok) {
+                        TP_THROW(TypeError,
+                                 "grad_dtype must be a tensorplay.dtype or None, but got ",
+                                 Py_TYPE(value.ptr())->tp_name);
+                    }
+                }
+                const Tensor& self = self_obj.cast<const Tensor&>();
+                py::object grad = self_obj.attr("grad");
+                if (!value.is_none() && !grad.is_none()) {
+                    py::object grad_dtype = grad.attr("dtype");
+                    if (!grad_dtype.equal(value)) {
+                        TP_THROW(RuntimeError,
+                                 "Cannot set grad_dtype to '",
+                                 tensorplay::toString(value.cast<DType>()),
+                                 "' because there is already a gradient with dtype '",
+                                 tensorplay::toString(grad_dtype.cast<DType>()), "'.");
+                    }
+                }
+                self_obj.attr("_grad_dtype") = value;
+            });
+
+    // Wrap an existing tensor payload into an instance of a TensorBase
+    // subclass with fresh autograd state (detached), optionally requesting
+    // gradients on the result.
+    m.def("_make_subclass",
+          [](py::object cls, const Tensor& data, bool require_grad) -> py::object {
+              check_tensor_subclass_type(cls, "_make_subclass");
+              Tensor fresh = data.detach();
+              tensorplay::tpx::impl::set_requires_grad(fresh, require_grad);
+              return wrap_tensor_as_type(fresh, cls);
+          },
+          "cls"_a, "data"_a, "require_grad"_a = false);
 
     // FASTCALL method layer goes in LAST: it fills names nothing above
     // bound, and must never shadow a hand-written pybind overload (e.g.

@@ -10,6 +10,7 @@ from .._utils import _iter_nodes, _map_arg
 from ..graph import Graph
 from ..graph_module import GraphModule
 from ..node import Node
+from ...nn.modules.module import Module
 from .tools_common import CALLABLE_NODE_OPS, is_node_output_tensor
 
 if TYPE_CHECKING:
@@ -24,28 +25,22 @@ __all__ = [
 ]
 
 
-class HolderModule:
+class HolderModule(Module):
     """Attribute container used as the root of a stitched graph."""
 
     def __init__(self, values: dict[str, Any] | None = None) -> None:
+        super().__init__()
         for name, value in (values or {}).items():
             setattr(self, name, value)
 
     def add_module(self, name: str, module: Any) -> None:
-        if not name or "." in name:
-            raise ValueError("module names must be non-empty and contain no dots")
-        setattr(self, name, module)
+        super().add_module(name, module)
 
     def named_children(self):
-        for name, value in vars(self).items():
-            if name.startswith("_"):
-                continue
-            if callable(value) or hasattr(value, "forward"):
-                yield name, value
+        yield from super().named_children()
 
     def children(self):
-        for _, value in self.named_children():
-            yield value
+        yield from super().children()
 
     def named_modules(
         self,
@@ -53,22 +48,11 @@ class HolderModule:
         prefix: str = "",
         remove_duplicate: bool = True,
     ):
-        if memo is None:
-            memo = set()
-        if remove_duplicate and id(self) in memo:
-            return
-        if remove_duplicate:
-            memo.add(id(self))
-        yield prefix, self
-        for name, child in self.named_children():
-            child_prefix = f"{prefix}.{name}" if prefix else name
-            if hasattr(child, "named_modules"):
-                yield from child.named_modules(memo, child_prefix, remove_duplicate)
-            else:
-                if not remove_duplicate or id(child) not in memo:
-                    if remove_duplicate:
-                        memo.add(id(child))
-                    yield child_prefix, child
+        yield from super().named_modules(
+            memo=memo,
+            prefix=prefix,
+            remove_duplicate=remove_duplicate,
+        )
 
 
 def getattr_recursive(obj: object, name: str) -> Any:

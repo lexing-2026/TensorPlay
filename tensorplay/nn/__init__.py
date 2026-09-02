@@ -6,6 +6,7 @@ from tensorplay.nn.parameter import (
 )
 from tensorplay.nn.modules import *
 from tensorplay.nn import (
+    attention as attention,
     functional as functional,
     init as init,
     modules as modules,
