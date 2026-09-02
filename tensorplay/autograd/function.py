@@ -73,10 +73,14 @@ def _make_backward(ctx, cls):
     backward_fn = ctx.backward_fn
     n_in = len(ctx.needs_input_grad)
     # CustomFunctionNode semantics); unused outputs arrive absent/None.
-    n_out = max(len(getattr(ctx, "_outputs", ())), n_in)
+    n_out = len(getattr(ctx, "_outputs", ()))
+    if n_out == 0:
+        n_out = 1
 
     def backward(*grads):
         # Complete missing trailing slots with None before anything else.
+        if len(grads) > n_out:
+            grads = grads[:n_out]
         if len(grads) < n_out:
             grads = grads + (None,) * (n_out - len(grads))
         for ph in prehooks:

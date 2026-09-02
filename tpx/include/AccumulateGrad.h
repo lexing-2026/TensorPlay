@@ -31,16 +31,30 @@ struct AccumulateGrad : public Node {
         }
 
         const auto& param_sizes = value_.impl()->sizes();
-        Size g_shape = grad.shape();
+        // Shape mismatch check without materializing either shape into a
+        // heap vector (this node runs once per leaf per backward).
+        const size_t p_dim = param_sizes.size();
+        bool same_shape = grad.dim() == static_cast<int64_t>(p_dim);
+        if (same_shape) {
+            for (size_t i = 0; i < p_dim; ++i) {
+                if (grad.size(i) != param_sizes[i]) {
+                    same_shape = false;
+                    break;
+                }
+            }
+        }
 
-        if (g_shape != Size(param_sizes)) {
-            std::vector<int64_t> g_sizes(g_shape.begin(), g_shape.end());
-            int64_t p_dim = param_sizes.size();
-            int64_t g_dim = g_sizes.size();
+        if (!same_shape) {
+            const int64_t g_dim = grad.dim();
+            std::vector<int64_t> g_sizes(g_dim);
+            for (int64_t i = 0; i < g_dim; ++i) {
+                g_sizes[static_cast<size_t>(i)] = grad.size(i);
+            }
+            int64_t p_dim_signed = static_cast<int64_t>(p_dim);
 
-            if (g_dim >= p_dim) {
+            if (g_dim >= p_dim_signed) {
                 std::vector<int64_t> reduce_dims;
-                int64_t dim_diff = g_dim - p_dim;
+                int64_t dim_diff = g_dim - p_dim_signed;
 
                 // 1. Reduce extra leading dimensions
                 for (int64_t i = 0; i < dim_diff; ++i) {
@@ -48,7 +62,7 @@ struct AccumulateGrad : public Node {
                 }
 
                 // 2. Reduce broadcasted dimensions
-                for (int64_t i = 0; i < p_dim; ++i) {
+                for (int64_t i = 0; i < p_dim_signed; ++i) {
                     if (param_sizes[i] == 1 && g_sizes[i + dim_diff] > 1) {
                         reduce_dims.push_back(i + dim_diff);
                     }
