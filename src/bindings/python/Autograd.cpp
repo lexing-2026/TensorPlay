@@ -2,6 +2,7 @@
 #include "Node.h"
 #include "AccumulateGrad.h"
 #include "Autograd.h"
+#include "Engine.h"
 #include "AnomalyMode.h"
 #include <typeinfo>
 #include <string>
@@ -415,6 +416,22 @@ void init_autograd(py::module_& m) {
         py::gil_scoped_release release;
         tensorplay::tpx::backward(tensors, grads, keep_graph, create_graph);
     }, "tensors"_a, "grad_tensors"_a = py::none(), "retain_graph"_a = py::none(), "create_graph"_a = false);
+
+    autograd.def("queue_callback", [](py::function callback) {
+        PyObject* raw_callback = callback.ptr();
+        Py_INCREF(raw_callback);
+        std::shared_ptr<PyObject> callback_ref(
+            raw_callback,
+            [](PyObject* object) {
+                py::gil_scoped_acquire gil;
+                Py_DECREF(object);
+            });
+        tensorplay::tpx::Engine::get_default_engine().queue_callback(
+            [callback_ref = std::move(callback_ref)]() {
+                py::gil_scoped_acquire gil;
+                py::reinterpret_borrow<py::object>(callback_ref.get())();
+            });
+    }, "callback"_a);
 
     autograd.def("grad", [](const std::vector<Tensor>& outputs, const std::vector<Tensor>& inputs, std::optional<std::vector<Tensor>> grad_outputs, std::optional<bool> retain_graph, bool create_graph, bool allow_unused) {
         bool keep_graph = retain_graph.value_or(create_graph);

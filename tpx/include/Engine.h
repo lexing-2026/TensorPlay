@@ -4,6 +4,7 @@
 #include <queue>
 #include <mutex>
 #include <condition_variable>
+#include <functional>
 #include <thread>
 #include <optional>
 #include <unordered_map>
@@ -98,6 +99,8 @@ public:
                           bool create_graph,
                           bool accumulate_grad,
                           const edge_list& outputs);
+
+    void queue_callback(std::function<void()> callback);
 
 private:
     Engine() = default;
