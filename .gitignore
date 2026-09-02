@@ -45,6 +45,7 @@ node_modules/
 **/node_modules/
 
 # Third party sources
+third_party/
 third_party/cudnn/
 third_party/googletest/
 third_party/pybind11/
@@ -60,3 +61,19 @@ third_party/torchview/
 CMakeFiles/
 _deps/
 CMakeCache.txt
+
+# Local backend staging and tool artifacts
+.tp_cache/
+build-hip/
+tensorplay-hip/
+tools/bin/
+*.tmp_head
+libvulkan-dev_*.deb
+
+# Generated white paper outputs
+docs/whitepaper/*.aux
+docs/whitepaper/*.lof
+docs/whitepaper/*.lot
+docs/whitepaper/*.out
+docs/whitepaper/*.pdf
+docs/whitepaper/*.toc
