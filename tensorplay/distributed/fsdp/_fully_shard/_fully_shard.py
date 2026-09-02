@@ -172,7 +172,10 @@ class FSDPModule:
 
     def set_requires_all_reduce(self, requires_all_reduce: bool, recurse: bool = True) -> None:
         for module in _selected_modules(self, recurse):
-            _get_module_fsdp_state(module)._requires_all_reduce = bool(requires_all_reduce)
+            state = _get_module_fsdp_state(module)
+            state._requires_all_reduce = bool(requires_all_reduce)
+            if state._param_group is not None:
+                state._param_group._requires_all_reduce = bool(requires_all_reduce)
 
     def set_reshard_after_forward(self, reshard_after_forward: bool, recurse: bool = True) -> None:
         if not isinstance(reshard_after_forward, bool):
@@ -208,29 +211,46 @@ class FSDPModule:
         self._get_fsdp_state()._modules_to_backward_prefetch = list(modules)
 
     def set_custom_all_gather(self, comm: Any) -> None:
-        self._get_fsdp_state()._custom_all_gather = comm
+        state = self._get_fsdp_state()
+        state._custom_all_gather = comm
+        state._fsdp_param_group()._all_gather_comm = comm
 
     def set_custom_reduce_scatter(self, comm: Any) -> None:
-        self._get_fsdp_state()._custom_reduce_scatter = comm
+        state = self._get_fsdp_state()
+        state._custom_reduce_scatter = comm
+        state._fsdp_param_group()._reduce_scatter_comm = comm
 
     def set_all_reduce_hook(self, hook: Any, stream: Any = None) -> None:
-        self._get_fsdp_state()._all_reduce_hook = (hook, stream)
+        state = self._get_fsdp_state()
+        state._all_reduce_hook = (hook, stream)
+        group = state._fsdp_param_group()
+        group._all_reduce_hook = hook
+        group._all_reduce_hook_stream = stream
 
     def set_post_optim_event(self, event: Any) -> None:
         self._get_fsdp_state()._post_optim_event = event
 
     def set_reduce_scatter_divide_factor(self, factor: float) -> None:
-        self._get_fsdp_state()._reduce_scatter_divide_factor = factor
+        self.set_gradient_divide_factor(factor)
 
     def set_gradient_divide_factor(self, factor: float) -> None:
-        self._get_fsdp_state()._gradient_divide_factor = factor
+        state = self._get_fsdp_state()
+        state._gradient_divide_factor = factor
+        state._fsdp_param_group().gradient_divide_factor = factor
 
     def set_force_sum_reduction_for_comms(self, enable: bool) -> None:
-        self._get_fsdp_state()._force_sum_reduction_for_comms = bool(enable)
+        state = self._get_fsdp_state()
+        state._force_sum_reduction_for_comms = bool(enable)
+        state._fsdp_param_group().force_sum_reduction_for_comms = bool(enable)
 
     def set_reduce_scatter_unused_params(self, reduce_scatter_unused_params: bool, recurse: bool = True) -> None:
         for module in _selected_modules(self, recurse):
-            _get_module_fsdp_state(module)._reduce_scatter_unused_params = bool(reduce_scatter_unused_params)
+            state = _get_module_fsdp_state(module)
+            state._reduce_scatter_unused_params = bool(reduce_scatter_unused_params)
+            if state._param_group is not None:
+                state._param_group.reduce_scatter_unused_params = bool(
+                    reduce_scatter_unused_params
+                )
 
     def set_reduce_scatter_max_input_buffers(self, max_input_buffers: int) -> None:
         value = int(max_input_buffers)
@@ -245,7 +265,9 @@ class FSDPModule:
             _get_module_fsdp_state(module)._param_group._set_separate_reduce_scatter_group(enable)
 
     def set_unshard_in_backward(self, unshard_in_backward: bool) -> None:
-        self._get_fsdp_state()._unshard_in_backward = bool(unshard_in_backward)
+        state = self._get_fsdp_state()
+        state._unshard_in_backward = bool(unshard_in_backward)
+        state._fsdp_param_group().unshard_in_backward = bool(unshard_in_backward)
 
     def set_allocate_memory_from_process_group_for_comm(self, enable: bool) -> None:
         self._get_fsdp_state()._param_group.set_allocate_memory_from_process_group(enable)
@@ -254,7 +276,9 @@ class FSDPModule:
         self._get_fsdp_state()._param_group.set_symm_mem(backend)
 
     def _set_unshard_async_op(self, async_op: bool) -> None:
-        self._get_fsdp_state()._unshard_async_op = bool(async_op)
+        state = self._get_fsdp_state()
+        state._unshard_async_op = bool(async_op)
+        state._fsdp_param_group().unshard_async_op = bool(async_op)
 
     def _get_fsdp_state(self) -> FSDPState:
         state = _get_module_fsdp_state(self)

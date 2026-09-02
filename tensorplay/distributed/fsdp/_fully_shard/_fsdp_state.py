@@ -94,6 +94,7 @@ class FSDPState:
                         device=device,
                         shard_placement_fn=shard_placement_fn,
                         mp_policy=mp_policy,
+                        offload_policy=getattr(self, "offload_policy", None),
                     )
                 )
         self._param_group = FSDPParamGroup(

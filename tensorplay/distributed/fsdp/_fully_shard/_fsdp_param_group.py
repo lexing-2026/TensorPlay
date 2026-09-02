@@ -98,6 +98,7 @@ class FSDPParamGroup:
         self._is_unsharded = False
         self._sharded_state = ShardedState.SHARDED
         self._backward_finalized = False
+        self._post_backward_done = False
         self._all_gather_result: list[AllGatherResult] | None = None
         self._all_gather_comm = DefaultAllGather()
         self._reduce_scatter_comm = DefaultReduceScatter()
@@ -116,6 +117,8 @@ class FSDPParamGroup:
         self._partial_reduce_output = None
         self._post_reduce_event = None
         self._all_reduce_state = None
+        self._all_reduce_hook = None
+        self._all_reduce_hook_stream = None
         self._state_dict_hooks_registered = False
         self._post_forward_recorded = False
         self._post_backward_wrapped = False
@@ -127,6 +130,18 @@ class FSDPParamGroup:
     def _init_mp_dtypes(self) -> None:
         for param in self.params:
             param.init_dtype_attrs(self.mp_policy)
+        trainable = [param for param in self.params if param.param_requires_grad]
+        candidates = trainable or [
+            param
+            for param in self.params
+            if getattr(param.orig_dtype, "is_floating_point", False)
+        ]
+        orig_dtypes = {param.orig_dtype for param in candidates}
+        reduce_dtypes = {param.reduce_dtype for param in candidates}
+        self._orig_dtype = next(iter(orig_dtypes)) if len(orig_dtypes) == 1 else None
+        self._reduce_dtype = (
+            next(iter(reduce_dtypes)) if len(reduce_dtypes) == 1 else None
+        )
 
     def lazy_init(self) -> None:
         if not self.comm_ctx.initialized:
@@ -150,15 +165,6 @@ class FSDPParamGroup:
     def _unshard_impl(self) -> None:
         self.unshard(async_op=False)
         self.wait_for_unshard()
-
-    def _all_gather_process_group(self) -> Any:
-        mesh_info = self.mesh_info
-        if self.is_sharded_post_forward() and self.post_forward_mesh_info is not None:
-            mesh_info = self.post_forward_mesh_info
-        mesh_dim = mesh_info.shard_mesh_dim
-        if mesh_dim is None or mesh_info.shard_world_size <= 1:
-            return None
-        return getattr(mesh_info, "shard_process_group", None) or mesh_info.mesh.get_group(mesh_dim)
 
     def _all_gather_world_size(self) -> int:
         mesh_dim = self._active_mesh_info().shard_mesh_dim
@@ -258,21 +264,29 @@ class FSDPParamGroup:
         self._is_unsharded = False
         self._sharded_state = ShardedState.SHARDED
         self._backward_finalized = False
+        self._post_backward_done = False
+        self._post_reduce_event = None
+        self._all_reduce_state = None
+        self._partial_reduce_output = None
+        self.comm_ctx.reduce_scatter_states.clear()
 
     def pre_forward(self, module: Any, args: Any, kwargs: Any) -> tuple[Any, Any]:
         del module
         self._backward_finalized = False
+        self._post_backward_done = False
+        entering_forward_pass = self._training_state != TrainingState.FORWARD
         self._training_state = TrainingState.FORWARD
         self.unshard(self.unshard_async_op)
         self.wait_for_unshard()
-        self._install_post_backward_wrappers()
         policy = self.mp_policy
         if getattr(policy, "cast_forward_inputs", False):
             dtype = getattr(policy, "param_dtype", None)
             if dtype is not None:
                 args = _cast_tree(args, dtype)
                 kwargs = _cast_tree(kwargs, dtype)
-        return self._register_post_backward_hook(args, kwargs)
+        if entering_forward_pass:
+            args, kwargs = self._register_post_backward_hook(args, kwargs)
+        return args, kwargs
 
     def post_forward(self, module: Any, input: Any, output: Any) -> Any:
         del module, input
@@ -297,15 +311,119 @@ class FSDPParamGroup:
 
     def post_backward(self, *unused: Any) -> None:
         del unused
+        if self._post_backward_done:
+            return
         self._training_state = TrainingState.POST_BACKWARD
+        for param in self.params:
+            param.accumulate_unsharded_grad_if_needed()
+        fsdp_params_with_grad: list[FSDPParam] = []
+        unsharded_grads: list[Any] = []
+        for param in self.params:
+            accumulated = param.unsharded_accumulated_grad
+            if accumulated is not None:
+                fsdp_params_with_grad.append(param)
+                unsharded_grads.append(param.unsharded_accumulated_grad_data())
+                continue
+            gradient = param._unsharded_gradient()
+            if gradient is not None:
+                fsdp_params_with_grad.append(param)
+                unsharded_grads.append(param.unsharded_grad_data())
+                continue
+            if (
+                self.reduce_scatter_unused_params
+                and param.param_requires_grad
+                and param._unsharded_param is not None
+            ):
+                fsdp_params_with_grad.append(param)
+                unsharded_grads.append(param.unsharded_zero_grad_data())
+        if not self.reduce_grads or not self._requires_gradient_sync:
+            for param in fsdp_params_with_grad:
+                if param.unsharded_accumulated_grad is not None:
+                    continue
+                gradient = param._unsharded_gradient()
+                if gradient is None:
+                    continue
+                if param.reduce_dtype is not None and gradient.dtype != param.reduce_dtype:
+                    gradient = gradient.to(dtype=param.reduce_dtype)
+                param.unsharded_accumulated_grad = gradient
+                if param._unsharded_param is not None:
+                    param._unsharded_param.grad = None
+                param._unsharded_grad = None
+            if self._reshard_after_backward_enabled:
+                self.reshard()
+            self._post_backward_done = True
+            return
+        if not fsdp_params_with_grad:
+            if self._reshard_after_backward_enabled:
+                self.reshard()
+            self._post_backward_done = True
+            return
+        limit = int(self.reduce_scatter_max_input_buffers)
+        while len(self.comm_ctx.reduce_scatter_states) >= limit:
+            state = self.comm_ctx.reduce_scatter_states.pop(0)
+            if state.event is not None:
+                self._wait_all_gather_streams_on_event(state.event)
+        for param in fsdp_params_with_grad:
+            if param.unsharded_accumulated_grad is not None:
+                param.unsharded_accumulated_grad = None
+            else:
+                if param._unsharded_param is not None:
+                    param._unsharded_param.grad = None
+                param._unsharded_grad = None
         if self._reshard_after_backward_enabled:
             self.reshard()
+        reduce_result = foreach_reduce(
+            fsdp_params_with_grad,
+            unsharded_grads,
+            self._reduce_scatter_process_group(),
+            self.comm_ctx.reduce_scatter_stream,
+            self._reduce_scatter_comm,
+            self._orig_dtype,
+            self._reduce_dtype,
+            self.device,
+            self.gradient_divide_factor,
+            self._all_reduce_process_group(),
+            self.comm_ctx.all_reduce_stream,
+            self.all_reduce_grads and self._requires_all_reduce,
+            self._partial_reduce_output,
+            self._all_reduce_hook,
+            self.force_sum_reduction_for_comms,
+        )
+        (
+            reduce_scatter_input,
+            reduce_scatter_event,
+            _post_reduce_stream,
+            post_reduce_event,
+            all_reduce_input,
+            all_reduce_event,
+            partial_reduce_output,
+        ) = reduce_result
+        self.comm_ctx.reduce_scatter_states.append(
+            ReduceScatterState([reduce_scatter_input], reduce_scatter_event)
+        )
+        self._post_reduce_event = post_reduce_event
+        self._partial_reduce_output = partial_reduce_output
+        if all_reduce_input is not None:
+            self._all_reduce_state = AllReduceState(
+                [all_reduce_input], all_reduce_event
+            )
+        self._post_backward_done = True
 
     def finalize_backward(self) -> None:
         if self._backward_finalized:
             return
         self._backward_finalized = True
-        self.post_backward()
+        if not self._post_backward_done:
+            self.post_backward()
+        if self._post_reduce_event is not None:
+            self._wait_all_gather_streams_on_event(self._post_reduce_event)
+            self._post_reduce_event = None
+        for state in self.comm_ctx.reduce_scatter_states:
+            if state.event is not None:
+                self._wait_all_gather_streams_on_event(state.event)
+        self.comm_ctx.reduce_scatter_states.clear()
+        self._all_reduce_state = None
+        self._partial_reduce_output = None
 
     def _wait_for_post_backward(self) -> None:
         self.wait_for_unshard()
@@ -352,8 +470,18 @@ class FSDPParamGroup:
         return self._sharded_state == ShardedState.UNSHARDED
 
     def use_training_state(self, training_state: Any) -> Any:
+        old_training_state = self._training_state
         self._training_state = training_state
-        return self
+
+        class _TrainingStateGuard:
+            def __enter__(guard_self: Any) -> Any:
+                return guard_self
+
+            def __exit__(guard_self: Any, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+                del guard_self, exc_type, exc_value, traceback
+                self._training_state = old_training_state
+
+        return _TrainingStateGuard()
 
     def _register_post_backward_hook(self, args: Any, kwargs: Any) -> tuple[Any, Any]:
         values = [
