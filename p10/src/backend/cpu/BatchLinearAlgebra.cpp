@@ -245,11 +245,12 @@ Tensor triangular_solve_lapack(const Tensor& self, const Tensor& A,
                                bool upper, bool transpose, bool unitriangular) {
     // CBLAS trsm consumes row-major operands natively, so no layout
     // conversion is needed: X = op(A)^-1 B per batch block.
-    const int64_t order = 0;  // CblasRowMajor
-    const int64_t side = 0;   // CblasLeft
-    const int64_t uplo = upper ? 1 : 0;         // CblasUpper : CblasLower
-    const int64_t trans = transpose ? 1 : 0;    // CblasTrans : CblasNoTrans
-    const int64_t diag = unitriangular ? 1 : 0; // CblasUnit : CblasNonUnit
+    // CBLAS enum values (netlib ABI).
+    const int64_t order = 101;  // CblasRowMajor
+    const int64_t side = 141;   // CblasLeft
+    const int64_t uplo = upper ? 121 : 122;       // CblasUpper : CblasLower
+    const int64_t trans = transpose ? 112 : 111;  // CblasTrans : CblasNoTrans
+    const int64_t diag = unitriangular ? 132 : 131; // CblasUnit : CblasNonUnit
     Tensor a = detail::contiguous_clone(A);
     Tensor out = detail::contiguous_clone(self);
     const int64_t n2 = n * n;
