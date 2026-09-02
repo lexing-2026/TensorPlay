@@ -5,7 +5,7 @@
 
 # Distributed communication package - tensorplay.distributed
 
-# Distributed communication package - torch.distributed
+# Distributed communication package - process groups
 
 ```{eval-rst}
 .. autosummary::
@@ -25,16 +25,16 @@
     :toctree: generated
     :nosignatures:
 
-    tensorplay.distributed.distributed_c10d.is_available
-    tensorplay.distributed.distributed_c10d.init_process_group
+    tensorplay.distributed.distributed_core.is_available
+    tensorplay.distributed.distributed_core.init_process_group
     tensorplay.distributed.device_mesh.init_device_mesh
-    tensorplay.distributed.distributed_c10d.is_initialized
-    tensorplay.distributed.distributed_c10d.is_mpi_available
-    tensorplay.distributed.distributed_c10d.is_nccl_available
-    tensorplay.distributed.distributed_c10d.is_gloo_available
-    tensorplay.distributed.distributed_c10d.batch_isend_irecv
-    tensorplay.distributed.distributed_c10d.destroy_process_group
-    tensorplay.distributed.distributed_c10d.irecv
+    tensorplay.distributed.distributed_core.is_initialized
+    tensorplay.distributed.distributed_core.is_mpi_available
+    tensorplay.distributed.distributed_core.is_nccl_available
+    tensorplay.distributed.distributed_core.is_gloo_available
+    tensorplay.distributed.distributed_core.batch_isend_irecv
+    tensorplay.distributed.distributed_core.destroy_process_group
+    tensorplay.distributed.distributed_core.irecv
 ```
 
 ## Post-Initialization
@@ -44,10 +44,10 @@
     :toctree: generated
     :nosignatures:
 
-    tensorplay.distributed.distributed_c10d.Backend
-    tensorplay.distributed.distributed_c10d.get_backend
-    tensorplay.distributed.distributed_c10d.get_rank
-    tensorplay.distributed.distributed_c10d.get_world_size
+    tensorplay.distributed.distributed_core.Backend
+    tensorplay.distributed.distributed_core.get_backend
+    tensorplay.distributed.distributed_core.get_rank
+    tensorplay.distributed.distributed_core.get_world_size
 ```
 
 ## Groups
@@ -57,10 +57,10 @@
     :toctree: generated
     :nosignatures:
 
-    tensorplay.distributed.distributed_c10d.new_group
-    tensorplay.distributed.distributed_c10d.get_group_rank
-    tensorplay.distributed.distributed_c10d.get_global_rank
-    tensorplay.distributed.distributed_c10d.get_process_group_ranks
+    tensorplay.distributed.distributed_core.new_group
+    tensorplay.distributed.distributed_core.get_group_rank
+    tensorplay.distributed.distributed_core.get_global_rank
+    tensorplay.distributed.distributed_core.get_process_group_ranks
 ```
 
 ## DeviceMesh
@@ -80,12 +80,12 @@
     :toctree: generated
     :nosignatures:
 
-    tensorplay.distributed.distributed_c10d.send
-    tensorplay.distributed.distributed_c10d.recv
-    tensorplay.distributed.distributed_c10d.isend
-    tensorplay.distributed.distributed_c10d.send_object_list
-    tensorplay.distributed.distributed_c10d.recv_object_list
-    tensorplay.distributed.distributed_c10d.P2POp
+    tensorplay.distributed.distributed_core.send
+    tensorplay.distributed.distributed_core.recv
+    tensorplay.distributed.distributed_core.isend
+    tensorplay.distributed.distributed_core.send_object_list
+    tensorplay.distributed.distributed_core.recv_object_list
+    tensorplay.distributed.distributed_core.P2POp
 ```
 
 ## Collective functions
@@ -95,22 +95,22 @@
     :toctree: generated
     :nosignatures:
 
-    tensorplay.distributed.distributed_c10d.broadcast
-    tensorplay.distributed.distributed_c10d.broadcast_object_list
-    tensorplay.distributed.distributed_c10d.all_reduce
-    tensorplay.distributed.distributed_c10d.reduce
-    tensorplay.distributed.distributed_c10d.all_gather
-    tensorplay.distributed.distributed_c10d.all_gather_object
-    tensorplay.distributed.distributed_c10d.gather
-    tensorplay.distributed.distributed_c10d.gather_object
-    tensorplay.distributed.distributed_c10d.scatter
-    tensorplay.distributed.distributed_c10d.scatter_object_list
-    tensorplay.distributed.distributed_c10d.reduce_scatter
-    tensorplay.distributed.distributed_c10d.all_to_all_single
-    tensorplay.distributed.distributed_c10d.all_to_all
-    tensorplay.distributed.distributed_c10d.barrier
-    tensorplay.distributed.distributed_c10d.Work
-    tensorplay.distributed.distributed_c10d.ReduceOp
+    tensorplay.distributed.distributed_core.broadcast
+    tensorplay.distributed.distributed_core.broadcast_object_list
+    tensorplay.distributed.distributed_core.all_reduce
+    tensorplay.distributed.distributed_core.reduce
+    tensorplay.distributed.distributed_core.all_gather
+    tensorplay.distributed.distributed_core.all_gather_object
+    tensorplay.distributed.distributed_core.gather
+    tensorplay.distributed.distributed_core.gather_object
+    tensorplay.distributed.distributed_core.scatter
+    tensorplay.distributed.distributed_core.scatter_object_list
+    tensorplay.distributed.distributed_core.reduce_scatter
+    tensorplay.distributed.distributed_core.all_to_all_single
+    tensorplay.distributed.distributed_core.all_to_all
+    tensorplay.distributed.distributed_core.barrier
+    tensorplay.distributed.distributed_core.Work
+    tensorplay.distributed.distributed_core.ReduceOp
 ```
 
 ## Distributed Key-Value Store
@@ -146,4 +146,3 @@
 
     tensorplay.distributed.collective_utils.all_gather_object_enforce_type
 ```
-

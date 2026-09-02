@@ -11,6 +11,7 @@
 #include <cstdlib>
 
 #include <chrono>
+#include <complex>
 #include <memory>
 #include <string>
 #include <vector>
@@ -116,6 +117,13 @@ T fullLike(double value, std::initializer_list<int64_t> shape = {3}) {
   return T::full(shape, value, tensorplay::ScalarType::Float32);
 }
 
+T complexFullLike(
+    std::complex<float> value,
+    std::initializer_list<int64_t> shape = {3}) {
+  return T::full(
+      shape, value, tensorplay::ScalarType::ComplexFloat);
+}
+
 } // namespace
 
 TEST(ProcessGroupGlooTest, TestRankAndSize) {
@@ -174,6 +182,65 @@ TEST(ProcessGroupGlooTest, TestAllreduceScalar) {
     std::vector<T> tensors = {fullLike(rank + 1.0, {})};
     pg.allreduce(tensors, ReduceOp::SUM, kTimeout)->wait();
     EXPECT_EQ(tensors[0].item<double>(), 3.0);
+  });
+}
+
+TEST(ProcessGroupGlooTest, TestComplexCollectives) {
+  runCollective([](ProcessGroupGloo& pg, int rank, int size) {
+    std::vector<T> reduced = {
+        complexFullLike({rank + 1.0f, rank + 2.0f})};
+    pg.allreduce(reduced, ReduceOp::SUM, kTimeout)->wait();
+    const auto reducedValue = reduced[0].data_ptr<std::complex<float>>()[0];
+    EXPECT_FLOAT_EQ(reducedValue.real(), 3.0f);
+    EXPECT_FLOAT_EQ(reducedValue.imag(), 5.0f);
+
+    T gatheredInput = T::full(
+        {}, std::complex<float>(rank + 10.0f, rank + 20.0f),
+        tensorplay::ScalarType::ComplexFloat);
+    T gatheredOutput = T::full(
+        {size}, std::complex<float>(-1.0f, -1.0f),
+        tensorplay::ScalarType::ComplexFloat);
+    pg.all_gather_single(gatheredOutput, gatheredInput, kTimeout)->wait();
+    auto* gatheredData = gatheredOutput.data_ptr<std::complex<float>>();
+    for (int i = 0; i < size; ++i) {
+      EXPECT_FLOAT_EQ(gatheredData[i].real(), i + 10.0f);
+      EXPECT_FLOAT_EQ(gatheredData[i].imag(), i + 20.0f);
+    }
+
+    std::vector<T> coalescedInputs = {complexFullLike(
+        {rank + 30.0f, rank + 40.0f}, {})};
+    std::vector<T> coalescedOutputs = {T::full(
+        {size}, std::complex<float>(-1.0f, -1.0f),
+        tensorplay::ScalarType::ComplexFloat)};
+    pg.all_gather_single_coalesced(
+          coalescedOutputs, coalescedInputs, kTimeout)
+        ->wait();
+    auto* coalescedData =
+        coalescedOutputs[0].data_ptr<std::complex<float>>();
+    for (int i = 0; i < size; ++i) {
+      EXPECT_FLOAT_EQ(coalescedData[i].real(), i + 30.0f);
+      EXPECT_FLOAT_EQ(coalescedData[i].imag(), i + 40.0f);
+    }
+  });
+}
+
+TEST(ProcessGroupGlooTest, TestComplexSparseAllreduce) {
+  runCollective([](ProcessGroupGloo& pg, int rank, int) {
+    const auto indices = T::tensor<int64_t>(
+        {static_cast<int64_t>(rank)}, tensorplay::ScalarType::Int64)
+                             .reshape({1, 1});
+    const auto values = T::tensor<std::complex<float>>(
+        {std::complex<float>(rank + 1.0f, rank + 2.0f)},
+        tensorplay::ScalarType::ComplexFloat);
+    std::vector<T> tensors = {
+        T::make_sparse_coo_tensor(indices, values, {2}, true)};
+    pg.allreduce(tensors, ReduceOp::SUM, kTimeout)->wait();
+    const auto dense = tensors[0].to_dense();
+    const auto* denseData = dense.data_ptr<std::complex<float>>();
+    EXPECT_FLOAT_EQ(denseData[0].real(), 1.0f);
+    EXPECT_FLOAT_EQ(denseData[0].imag(), 2.0f);
+    EXPECT_FLOAT_EQ(denseData[1].real(), 2.0f);
+    EXPECT_FLOAT_EQ(denseData[1].imag(), 3.0f);
   });
 }
 
@@ -262,6 +329,23 @@ TEST(ProcessGroupGlooTest, TestAllGatherSingleCoalesced) {
                 (double)(i + 1));
       EXPECT_EQ(outputs[1].select(0, i * 2).item<double>(),
                 2.0 * (double)(i + 1));
+    }
+  });
+}
+
+TEST(ProcessGroupGlooTest, TestAllGatherSingleCoalescedScalar) {
+  runCollective([](ProcessGroupGloo& pg, int rank, int size) {
+    std::vector<T> inputs = {
+        T::full({}, static_cast<double>(rank + 1),
+                tensorplay::ScalarType::Float32),
+    };
+    std::vector<T> outputs = {
+        T::full({size}, -1.0, tensorplay::ScalarType::Float32),
+    };
+    pg.all_gather_single_coalesced(outputs, inputs, kTimeout)->wait();
+    for (int i = 0; i < size; ++i) {
+      EXPECT_EQ(outputs[0].select(0, i).item<double>(),
+                static_cast<double>(i + 1));
     }
   });
 }
@@ -394,6 +478,18 @@ TEST(ProcessGroupGlooTest, TestReduceScatterSingleCoalesced) {
     pg.reduce_scatter_single_coalesced(outputs, inputs, 0, kTimeout)->wait();
     EXPECT_EQ(outputs[0].select(0, 0).item<double>(), (double)size);
     EXPECT_EQ(outputs[1].select(0, 0).item<double>(), 2.0 * (double)size);
+  });
+}
+
+TEST(ProcessGroupGlooTest, TestReduceScatterSingleCoalescedScalarOutput) {
+  runCollective([](ProcessGroupGloo& pg, int rank, int size) {
+    T input = T::full(
+        {size}, static_cast<double>(rank + 1),
+        tensorplay::ScalarType::Float32);
+    T output = T::full({}, -1.0, tensorplay::ScalarType::Float32);
+    pg.reduce_scatter_single(output, input, 0, kTimeout)->wait();
+    EXPECT_EQ(output.item<double>(),
+              static_cast<double>(size * (size + 1) / 2));
   });
 }
 

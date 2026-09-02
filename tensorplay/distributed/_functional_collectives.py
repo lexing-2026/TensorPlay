@@ -8,7 +8,7 @@ import threading
 import tensorplay as tp
 import tensorplay.distributed as dist
 from tensorplay.autograd.function import Function
-from tensorplay.overrides import _disable_torch_function
+from tensorplay.overrides import _disable_tensorplay_function
 from tensorplay.distributed import distributed_core as _core
 from tensorplay.distributed.distributed_core import (
     _get_default_group as _core_default_group,
@@ -157,7 +157,7 @@ class AsyncCollectiveTensor(tp.Tensor):
 
     def view(self, *shape):
         work = getattr(self, "_tp_collective_work", None)
-        with _disable_torch_function():
+        with _disable_tensorplay_function():
             result = tp.Tensor.view(self, *shape)
         if work is None or getattr(self, "_tp_collective_completed", True):
             return result
@@ -172,7 +172,7 @@ class AsyncCollectiveTensor(tp.Tensor):
     def __repr__(self):
         return repr(self.trigger_wait())
 
-    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+    def __tensorplay_dispatch__(self, func, types, args=(), kwargs=None):
         del types
         kwargs = kwargs or {}
         values = list(_walk_async(args)) + list(_walk_async(kwargs))
@@ -185,7 +185,7 @@ class AsyncCollectiveTensor(tp.Tensor):
                 getattr(value, "_tp_collective_completed", True)
                 for value in values
             )
-            with _disable_torch_function():
+            with _disable_tensorplay_function():
                 result = func(*args, **kwargs)
             if completed:
                 return result
@@ -198,7 +198,7 @@ class AsyncCollectiveTensor(tp.Tensor):
             if id(value) not in seen:
                 seen.add(id(value))
                 value.trigger_wait()
-        with _disable_torch_function():
+        with _disable_tensorplay_function():
             return func(*args, **kwargs)
 
     def __tensor_flatten__(self):
@@ -238,12 +238,13 @@ def _group_from_ranks(ranks, tag=""):
     if not dist.is_initialized():
         raise RuntimeError("Default process group has not been initialized")
     default = _core_default_group()
-    if tuple(default.ranks) == rankset:
+    canonical = tuple(sorted(rankset))
+    if tuple(sorted(default.ranks)) == canonical:
         return default
     for candidate in _core._groups.values():
-        if tuple(candidate.ranks) == rankset:
+        if tuple(sorted(candidate.ranks)) == canonical:
             return candidate
-    result = dist.new_group(ranks=list(rankset))
+    result = dist.new_group(ranks=list(canonical))
     if result is dist.GroupMember.NON_GROUP_MEMBER:
         raise ValueError("current rank is not in the requested process group")
     return result
@@ -427,7 +428,7 @@ class BroadcastWithAutograd(_CollectiveFunctionBase):
         grad_input = grad_output.clone()
         src_global = dist.get_global_rank(pg, ctx.src)
         dist.reduce(grad_input, dst=src_global, op=dist.ReduceOp.SUM, group=pg)
-        if dist.get_rank(group=pg) != src_global:
+        if dist.get_rank(group=pg) != ctx.src:
             grad_input.zero_()
         return None, None, grad_input
 
@@ -652,12 +653,8 @@ class AllGatherSingleCoalescedWithAutograd(_CollectiveFunctionBase):
                      device=t.device)
             for t in tensors
         ]
-        output_lists = [
-            _gather_views(output, tensor, group_size)
-            for output, tensor in zip(outputs, tensors)
-        ]
-        work = dist.all_gather_coalesced(
-            output_lists,
+        work = dist.all_gather_single_coalesced(
+            outputs,
             [tensor.contiguous() for tensor in tensors],
             group=pg,
             async_op=True,
@@ -712,7 +709,6 @@ class ReduceScatterSingleCoalescedWithAutograd(_CollectiveFunctionBase):
         ctx.reduce_op = str(reduce_op).lower()
         pg = _resolve_coalesced_group(group_name)
         outputs = []
-        input_lists = []
         for tensor in tensors:
             if tensor.numel() % group_size:
                 raise ValueError(
@@ -721,12 +717,12 @@ class ReduceScatterSingleCoalescedWithAutograd(_CollectiveFunctionBase):
             chunk = tensor.numel() // group_size
             outputs.append(tp.empty(chunk, dtype=tensor.dtype,
                                     device=tensor.device))
-            input_lists.append([
-                tensor.narrow(0, rank * chunk, chunk)
-                for rank in range(group_size)
-            ])
-        work = dist.reduce_scatter_coalesced(
-            outputs, input_lists, op=int(op_int), group=pg, async_op=True
+        work = dist.reduce_scatter_single_coalesced(
+            outputs,
+            [tensor.contiguous() for tensor in tensors],
+            op=int(op_int),
+            group=pg,
+            async_op=True,
         )
         ctx._in_metas = [(tuple(o.shape), o.dtype, o.device) for o in outputs]
         return tuple(_work_tensors(outputs, work))

@@ -88,6 +88,54 @@ class TestTCPStore(unittest.TestCase):
         server.stop()
 
 
+class TestMicrobatchUtilities(unittest.TestCase):
+    def test_nested_default_chunking_and_merge(self):
+        from tensorplay.distributed.pipelining.microbatch import (
+            merge_chunks,
+            split_args_kwargs_into_chunks,
+        )
+
+        features = tp.arange(12, dtype=tp.float32).reshape(3, 4)
+        args = ({"features": features, "metadata": ["fixed", 7]},)
+        arg_chunks, kwarg_chunks = split_args_kwargs_into_chunks(
+            args, {"scale": 2.0}, 2
+        )
+
+        self.assertEqual(len(arg_chunks), 2)
+        self.assertEqual(len(kwarg_chunks), 2)
+        self.assertEqual(arg_chunks[0][0]["features"].shape, (2, 4))
+        self.assertEqual(arg_chunks[1][0]["features"].shape, (1, 4))
+        self.assertEqual(arg_chunks[0][0]["metadata"], ["fixed", 7])
+        self.assertEqual(arg_chunks[1][0]["metadata"], ["fixed", 7])
+        self.assertEqual(kwarg_chunks[0]["scale"], 2.0)
+        self.assertEqual(kwarg_chunks[1]["scale"], 2.0)
+
+        merged = merge_chunks([chunk[0] for chunk in arg_chunks], None)
+        self.assertEqual(merged["features"].tolist(), features.tolist())
+        self.assertEqual(merged["metadata"], ["fixed", 7])
+
+    def test_shallow_replicate_spec(self):
+        from tensorplay.distributed.pipelining.microbatch import (
+            TensorChunkSpec,
+            split_args_kwargs_into_chunks,
+        )
+
+        value = {"features": tp.arange(6, dtype=tp.float32).reshape(3, 2)}
+        args, _ = split_args_kwargs_into_chunks(
+            (value,), {}, 2, args_chunk_spec=(None,)
+        )
+        self.assertIs(args[0][0]["features"], value["features"])
+        self.assertIs(args[0][0]["features"], args[1][0]["features"])
+
+        args, _ = split_args_kwargs_into_chunks(
+            (value,), {}, 2, args_chunk_spec=(
+                {"features": TensorChunkSpec(0)},
+            )
+        )
+        self.assertEqual(args[0][0]["features"].shape, (2, 2))
+        self.assertEqual(args[1][0]["features"].shape, (1, 2))
+
+
 _NCCL_SCRIPT = """
 import sys
 import tensorplay as tp
@@ -126,16 +174,16 @@ dist.all_gather(outs, t)
 for r in range(world):
     assert L(outs[r]) == [float(r)] * 2, f"all_gather[{r}] {L(outs[r])}"
 
-# all_gather_into_tensor / _allgather_base
+# all_gather_single
 t = tp.full((2,), float(rank + 1), dtype=tp.float32, device=dev)
 flat_out = tp.zeros(2 * world, dtype=tp.float32, device=dev)
 dist.all_gather_into_tensor(flat_out, t)
 assert L(flat_out) == [float(r + 1) for r in range(world) for _ in range(2)], \\
     f"all_gather_into_tensor {L(flat_out)}"
 flat_out.zero_()
-dist._allgather_base(flat_out, t)
+dist.all_gather_single(flat_out, t)
 assert L(flat_out) == [float(r + 1) for r in range(world) for _ in range(2)], \\
-    f"_allgather_base {L(flat_out)}"
+    f"all_gather_single {L(flat_out)}"
 
 # gather
 gather_list = None
@@ -162,14 +210,14 @@ output = tp.zeros(2, dtype=tp.float32, device=dev)
 dist.reduce_scatter(output, ins, op=dist.ReduceOp.SUM)
 assert L(output) == [float(world)] * 2, f"reduce_scatter {L(output)}"
 
-# reduce_scatter_tensor / _reduce_scatter_base
+# reduce_scatter_single
 flat_in = tp.ones(world * 2, dtype=tp.float32, device=dev)
 rs_out = tp.zeros(2, dtype=tp.float32, device=dev)
 dist.reduce_scatter_tensor(rs_out, flat_in)
 assert L(rs_out) == [float(world)] * 2, f"reduce_scatter_tensor {L(rs_out)}"
 rs_out.zero_()
-dist._reduce_scatter_base(rs_out, flat_in)
-assert L(rs_out) == [float(world)] * 2, f"_reduce_scatter_base {L(rs_out)}"
+dist.reduce_scatter_single(rs_out, flat_in)
+assert L(rs_out) == [float(world)] * 2, f"reduce_scatter_single {L(rs_out)}"
 
 # _functional_collectives: coalesced family (single groupStart/groupEnd
 from tensorplay.distributed import _functional_collectives as fc

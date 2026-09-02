@@ -56,6 +56,7 @@ class LaunchConfig:
     tee: Any = None
     metrics_cfg: dict[str, str] = field(default_factory=dict)
     local_addr: str | None = None
+    node_rank: int = 0
     master_addr: str | None = None
     master_port: int | None = None
 
@@ -66,6 +67,18 @@ class LaunchConfig:
             )
         if self.nproc_per_node <= 0:
             raise ValueError(f"nproc_per_node ({self.nproc_per_node}) must be positive")
+        if self.min_nodes <= 0:
+            raise ValueError(f"min_nodes ({self.min_nodes}) must be positive")
+        if self.max_restarts < 0:
+            raise ValueError(f"max_restarts ({self.max_restarts}) must be non-negative")
+        if self.monitor_interval < 0:
+            raise ValueError("monitor_interval must be non-negative")
+        if self.node_rank < 0:
+            raise ValueError(f"node_rank ({self.node_rank}) must be non-negative")
+        if self.node_rank >= self.max_nodes:
+            raise ValueError(
+                f"node_rank ({self.node_rank}) must be smaller than max_nodes ({self.max_nodes})"
+            )
         if not self.run_id:
             self.run_id = "none"
 
@@ -114,11 +127,14 @@ def _make_rdzv_handler(config: LaunchConfig):
         rdzv_configs.setdefault("join_timeout", rdvz_timeout)
     rdzv_configs.setdefault("min_nodes", config.min_nodes)
     rdzv_configs.setdefault("max_nodes", config.max_nodes)
+    if config.rdzv_backend == "static":
+        rdzv_configs.setdefault("rank", config.node_rank)
     params = RendezvousParameters(
         backend=config.rdzv_backend,
         endpoint=endpoint,
         run_id=config.run_id,
         local_addr=config.local_addr,
+        node_rank=config.node_rank,
         local_world_size=config.nproc_per_node,
         config=rdzv_configs,
     )

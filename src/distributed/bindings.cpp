@@ -106,6 +106,10 @@ void bindWork(py::module_& dist) {
              return work.wait(timeout_ms);
            },
            py::arg("timeout_ms") = -1)
+      .def("abort", [](GlooWork& work) {
+        py::gil_scoped_release release;
+        work.abort();
+      })
       .def("is_completed", &GlooWork::is_completed)
       .def("source_rank", &GlooWork::source_rank)
       .def("op_name", [](const GlooWork& work) { return work.op_name(); })
@@ -1066,6 +1070,16 @@ void bindMPI(py::module_& dist) {
           py::arg("input_tensor_list"),
           py::arg("timeout_ms") = -1)
       .def(
+          "all_gather_single_coalesced",
+          [](ProcessGroupMPI& pg,
+             std::vector<Tensor>& outputs,
+             std::vector<Tensor>& inputs,
+             int64_t timeout_ms) {
+            return pg.all_gather_single_coalesced(
+                outputs, inputs, toTimeout(timeout_ms));
+          },
+          py::arg("outputs"), py::arg("inputs"), py::arg("timeout_ms") = -1)
+      .def(
           "gather",
           [](ProcessGroupMPI& pg,
              std::vector<std::vector<Tensor>>& outputs,
@@ -1143,6 +1157,20 @@ void bindMPI(py::module_& dist) {
           },
           py::arg("output"),
           py::arg("input"),
+          py::arg("op") = ReduceOp(ReduceOp::SUM),
+          py::arg("timeout_ms") = -1)
+      .def(
+          "reduce_scatter_single_coalesced",
+          [](ProcessGroupMPI& pg,
+             std::vector<Tensor>& outputs,
+             std::vector<Tensor>& inputs,
+             ReduceOp op,
+             int64_t timeout_ms) {
+            return pg.reduce_scatter_single_coalesced(
+                outputs, inputs, op, toTimeout(timeout_ms));
+          },
+          py::arg("outputs"),
+          py::arg("inputs"),
           py::arg("op") = ReduceOp(ReduceOp::SUM),
           py::arg("timeout_ms") = -1)
       .def(
@@ -1277,6 +1305,17 @@ void bindMPI(py::module_& dist) {
           py::arg("input_tensor_list"),
           py::arg("options") = AllgatherOptions{})
       .def(
+          "all_gather_single_coalesced",
+          [](ProcessGroupMPI& pg,
+             std::vector<Tensor>& outputs,
+             std::vector<Tensor>& inputs,
+             const AllgatherOptions& options) {
+            return pg.all_gather_single_coalesced(outputs, inputs, options);
+          },
+          py::arg("outputs"),
+          py::arg("inputs"),
+          py::arg("options") = AllgatherOptions{})
+      .def(
           "all_gather_into_tensor",
           [](ProcessGroupMPI& pg,
              Tensor& output,
@@ -1353,6 +1392,18 @@ void bindMPI(py::module_& dist) {
           },
           py::arg("output"),
           py::arg("input"),
+          py::arg("options") = ReduceScatterOptions{})
+      .def(
+          "reduce_scatter_single_coalesced",
+          [](ProcessGroupMPI& pg,
+             std::vector<Tensor>& outputs,
+             std::vector<Tensor>& inputs,
+             const ReduceScatterOptions& options) {
+            return pg.reduce_scatter_single_coalesced(
+                outputs, inputs, options);
+          },
+          py::arg("outputs"),
+          py::arg("inputs"),
           py::arg("options") = ReduceScatterOptions{})
       .def(
           "all_to_all_single",

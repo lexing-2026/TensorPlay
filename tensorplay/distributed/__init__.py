@@ -13,6 +13,7 @@ from tensorplay.distributed.constants import (
     default_pg_nccl_timeout,
     default_pg_timeout,
 )
+from tensorplay.distributed import config
 from tensorplay.distributed.distributed_core import *  # noqa: F401,F403
 
 # (DDP, DDP comm hooks, checkpoint) rely on them, so re-export the internal
@@ -40,6 +41,7 @@ __all__ = list(_core.__all__) + [
     "TCPStore",
     "default_pg_timeout",
     "default_pg_nccl_timeout",
+    "config",
     "register_rendezvous_handler",
     "rendezvous",
     "tensor",

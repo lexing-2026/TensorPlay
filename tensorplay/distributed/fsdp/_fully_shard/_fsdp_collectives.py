@@ -60,12 +60,12 @@ class SymmMemAllocMixin(ProcessGroupAllocMixin):
 
 class DefaultAllGather(DefaultAllocMixin, AllGather):
     def __call__(self, output_tensor: Any, input_tensor: Any, group: Any, async_op: bool = False) -> Any:
-        world_size = dist.get_world_size(group)
-        outputs = [output_tensor.new_empty(output_tensor.shape) for _ in range(world_size)]
-        work = dist.all_gather(outputs, input_tensor, group=group, async_op=async_op)
-        for index, value in enumerate(outputs):
-            output_tensor[index].copy_(value)
-        return work
+        return dist.all_gather_single(
+            output_tensor,
+            input_tensor,
+            group=group,
+            async_op=async_op,
+        )
 
 
 class ProcessGroupAllocAllGather(DefaultAllGather, ProcessGroupAllocMixin):
@@ -80,9 +80,13 @@ class SymmMemAllGather(ProcessGroupAllocAllGather, SymmMemAllocMixin):
 
 class DefaultReduceScatter(DefaultAllocMixin, ReduceScatter):
     def __call__(self, output_tensor: Any, input_tensor: Any, group: Any, op: Any, async_op: bool = False) -> Any:
-        world_size = dist.get_world_size(group)
-        chunks = list(input_tensor.chunk(world_size, dim=0))
-        return dist.reduce_scatter(output_tensor, chunks, op=op, group=group, async_op=async_op)
+        return dist.reduce_scatter_single(
+            output_tensor,
+            input_tensor,
+            op=op,
+            group=group,
+            async_op=async_op,
+        )
 
 
 class ProcessGroupAllocReduceScatter(DefaultReduceScatter, ProcessGroupAllocMixin):
@@ -96,36 +100,81 @@ class SymmMemReduceScatter(ProcessGroupAllocReduceScatter, SymmMemAllocMixin):
 
 
 def all_gather_copy_in_meta(all_gather_inputs: Sequence[Any], all_gather_output: Any, inp_split_sizes: Sequence[int], all_gather_input_numel: int, rank: int) -> Any:
-    del all_gather_inputs, inp_split_sizes, all_gather_input_numel, rank
-    return all_gather_output
+    del all_gather_inputs, inp_split_sizes
+    if int(all_gather_input_numel) < 0 or int(rank) < 0:
+        raise ValueError("all-gather input size and rank must be non-negative")
+    start = int(all_gather_input_numel) * int(rank)
+    end = start + int(all_gather_input_numel)
+    if end > int(all_gather_output.numel()):
+        raise ValueError("all-gather input slice exceeds the output buffer")
+    return all_gather_output[start:end], all_gather_output
 
 
 def all_gather_copy_in_cuda(all_gather_inputs: Sequence[Any], all_gather_output: Any, inp_split_sizes: Sequence[int], all_gather_input_numel: int, rank: int) -> Any:
-    del inp_split_sizes, all_gather_input_numel, rank
+    if int(all_gather_input_numel) < 0 or int(rank) < 0:
+        raise ValueError("all-gather input size and rank must be non-negative")
+    sizes = [int(size) for size in inp_split_sizes]
+    if len(sizes) != len(all_gather_inputs):
+        raise ValueError("input split sizes must match the input tensor list")
+    if any(size < 0 for size in sizes) or sum(sizes) != int(all_gather_input_numel):
+        raise ValueError("input split sizes do not match the input buffer size")
+    start = int(all_gather_input_numel) * int(rank)
+    end = start + int(all_gather_input_numel)
+    if end > int(all_gather_output.numel()):
+        raise ValueError("all-gather input slice exceeds the output buffer")
+    all_gather_input = all_gather_output[start:end]
     offset = 0
-    for value in all_gather_inputs:
-        end = offset + int(value.numel())
-        all_gather_output[offset:end].copy_(value.reshape(-1))
-        offset = end
-    return all_gather_output
+    for value, size in zip(all_gather_inputs, sizes):
+        if int(value.numel()) != size:
+            raise ValueError("input split size does not match the tensor size")
+        next_offset = offset + size
+        all_gather_input[offset:next_offset].copy_(value.reshape(-1))
+        offset = next_offset
+    return all_gather_input, all_gather_output
 
 
 def split_with_sizes_copy(all_gather_output: Any, all_gather_input_split_sizes: Sequence[int], dim: int, out: Sequence[Any]) -> Sequence[Any]:
-    for target, value in zip(out, all_gather_output.split(tuple(all_gather_input_split_sizes), dim=dim)):
+    sizes = tuple(int(size) for size in all_gather_input_split_sizes)
+    if len(out) != len(sizes):
+        raise ValueError("output count must match the split-size count")
+    if any(size < 0 for size in sizes):
+        raise ValueError("split sizes must be non-negative")
+    values = all_gather_output.split(sizes, dim=dim)
+    for target, value in zip(out, values):
+        if int(target.numel()) != int(value.numel()):
+            raise ValueError("split output has an incompatible number of elements")
         target.copy_(value)
     return out
 
 
 def chunk_cat(tensors: Sequence[Any], dim: int, num_chunks: int, out: Any = None) -> Any:
-    result = tp.cat(tuple(tensors), dim=dim)
-    if out is not None:
-        out.copy_(result)
-        return out
-    return result.chunk(num_chunks, dim=dim)
+    num_chunks = int(num_chunks)
+    if num_chunks <= 0:
+        raise ValueError("num_chunks must be positive")
+    if not tensors:
+        raise ValueError("tensors must not be empty")
+    chunks_by_rank = [value.chunk(num_chunks, dim=dim) for value in tensors]
+    chunks = [
+        tp.cat(tuple(chunks_by_rank[index][rank].reshape(-1) for index in range(len(tensors))), dim=0)
+        for rank in range(num_chunks)
+    ]
+    if out is None:
+        return tuple(chunks)
+    if int(out.numel()) != sum(int(value.numel()) for value in chunks):
+        raise ValueError("output has an incompatible number of elements")
+    if int(out.dim()) == 2 and int(out.shape[0]) == num_chunks:
+        row_width = int(out.shape[1])
+        if any(int(value.numel()) != row_width for value in chunks):
+            raise ValueError("chunked outputs must have equal flattened sizes")
+        for rank, value in enumerate(chunks):
+            out[rank].copy_(value.reshape(out[rank].shape))
+    else:
+        out.reshape(-1).copy_(tp.cat(tuple(chunks), dim=0))
+    return out
 
 
 def _get_param_all_gather_inputs(fsdp_params: Sequence[Any]) -> list[Any]:
-    return [param.all_gather_inputs() for param in fsdp_params]
+    return [param.all_gather_inputs for param in fsdp_params]
 
 
 def foreach_all_gather(fsdp_params: Sequence[Any], group: Any, async_op: bool, all_gather_copy_in_stream: Any, all_gather_stream: Any, device: Any, all_gather_comm: AllGather | None = None) -> list[AllGatherResult]:
@@ -133,7 +182,12 @@ def foreach_all_gather(fsdp_params: Sequence[Any], group: Any, async_op: bool, a
     comm = all_gather_comm or DefaultAllGather()
     results = []
     for param in fsdp_params:
-        local = param._sharded_local_tensor()
+        inputs = tuple(param.all_gather_inputs)
+        if not inputs:
+            raise ValueError("each sharded parameter needs an all-gather input")
+        local = inputs[0] if len(inputs) == 1 else tp.cat(
+            tuple(value.reshape(-1) for value in inputs), dim=0
+        )
         width = int(local.numel()) * dist.get_world_size(group)
         output = local.new_empty(width)
         work = comm(output, local.reshape(-1), group, async_op)
@@ -144,40 +198,128 @@ def foreach_all_gather(fsdp_params: Sequence[Any], group: Any, async_op: bool, a
 def foreach_all_gather_copy_out(all_gather_result: Sequence[AllGatherResult], fsdp_params: Sequence[Any], group: Any) -> None:
     del group
     for result, param in zip(all_gather_result, fsdp_params):
-        param._use_unsharded_tensor(result.wait())
+        gathered = result.wait()
+        gathered = param._attach_local_gradient_to_all_gather(gathered)
+        param._use_unsharded_tensor(gathered)
 
 
 def foreach_reduce(fsdp_params: Sequence[Any], unsharded_grads: Sequence[Any], reduce_scatter_group: Any, reduce_scatter_stream: Any, reduce_scatter_comm: ReduceScatter | None, orig_dtype: Any, reduce_dtype: Any, device: Any, gradient_divide_factor: float, all_reduce_group: Any, all_reduce_stream: Any, all_reduce_grads: bool, partial_reduce_output: Any, all_reduce_hook: Any, force_sum_reduction_for_comms: bool) -> None:
-    del reduce_scatter_stream, orig_dtype, device, all_reduce_stream, partial_reduce_output, all_reduce_hook, force_sum_reduction_for_comms
+    del reduce_scatter_stream, device, all_reduce_stream, partial_reduce_output, force_sum_reduction_for_comms
+    if len(fsdp_params) != len(unsharded_grads):
+        raise ValueError("parameter and gradient lists must have the same length")
+    if reduce_dtype is None:
+        reduce_dtype = orig_dtype
+    world_size = dist.get_world_size(reduce_scatter_group) if reduce_scatter_group is not None else 1
+    comm = reduce_scatter_comm or DefaultReduceScatter()
     for param, grad in zip(fsdp_params, unsharded_grads):
         value = grad.to(dtype=reduce_dtype) if reduce_dtype is not None else grad
         if all_reduce_grads:
-            dist.all_reduce(value, group=all_reduce_group)
-        elif reduce_scatter_comm is not None:
-            local = value.new_empty(tuple(max(1, s // dist.get_world_size(reduce_scatter_group)) for s in value.shape))
-            reduce_scatter_comm(local, value, reduce_scatter_group, dist.ReduceOp.SUM, False)
+            dist.all_reduce(value, group=all_reduce_group, async_op=False)
+        elif reduce_scatter_group is not None and world_size > 1:
+            target = param._sharded_local_tensor()
+            shard_dim = int(getattr(getattr(param, "_placement", None), "dim", 0))
+            if shard_dim < 0:
+                shard_dim += int(value.dim())
+            if shard_dim < 0 or shard_dim >= int(value.dim()):
+                raise ValueError("shard dimension is outside the gradient")
+            expected = int(target.numel()) * world_size
+            if int(value.numel()) != expected:
+                if int(value.shape[shard_dim]) > int(target.shape[shard_dim]) * world_size:
+                    raise ValueError("gradient is larger than the sharded parameter")
+                padded_shape = list(value.shape)
+                padded_shape[shard_dim] = int(target.shape[shard_dim]) * world_size
+                padded = value.new_zeros(tuple(padded_shape))
+                slices = [slice(None)] * int(value.dim())
+                slices[shard_dim] = slice(0, int(value.shape[shard_dim]))
+                padded[tuple(slices)].copy_(value)
+                value = padded
+            if shard_dim != 0:
+                if int(value.shape[shard_dim]) % world_size:
+                    raise ValueError("gradient shard dimension must divide evenly")
+                value = tp.cat(tuple(value.chunk(world_size, dim=shard_dim)), dim=0)
+            local = target.new_empty(tuple(target.shape), dtype=value.dtype)
+            comm(local, value.reshape(-1), reduce_scatter_group, dist.ReduceOp.SUM, False)
             value = local
         if gradient_divide_factor not in (None, 1):
             value = value / gradient_divide_factor
+        if all_reduce_hook is not None:
+            all_reduce_hook(value)
         param._set_sharded_grad(value)
 
 
 def foreach_reduce_scatter_copy_in(unsharded_grads: Sequence[Any], reduce_scatter_input: Any, world_size: int) -> Any:
-    offset = 0
+    world_size = int(world_size)
+    if world_size <= 0:
+        raise ValueError("world_size must be positive")
+    rows = [[] for _ in range(world_size)]
     for grad in unsharded_grads:
-        end = offset + int(grad.numel())
-        reduce_scatter_input[offset:end].copy_(grad.reshape(-1))
+        if int(grad.dim()) == 0:
+            raise ValueError("reduce-scatter gradients must be non-scalar")
+        if int(grad.shape[0]) % world_size:
+            raise ValueError("gradient leading dimension must divide evenly")
+        chunks = grad.chunk(world_size, dim=0)
+        for rank, chunk in enumerate(chunks):
+            rows[rank].append(chunk.reshape(-1))
+    if rows and any(not row for row in rows):
+        raise ValueError("reduce-scatter input cannot be empty")
+    packed = [tp.cat(tuple(row), dim=0) if row else reduce_scatter_input.new_empty(0) for row in rows]
+    expected = int(reduce_scatter_input.numel())
+    if sum(int(value.numel()) for value in packed) != expected:
+        raise ValueError("reduce-scatter input size does not match the gradients")
+    offset = 0
+    for value in packed:
+        end = offset + int(value.numel())
+        reduce_scatter_input[offset:end].copy_(value)
         offset = end
     return reduce_scatter_input
 
 
-def _get_all_gather_input_metadatas(param_all_gather_inputs: Sequence[Any]) -> list[tuple[Any, ...]]:
-    return [tuple(value.shape) for value in param_all_gather_inputs]
+def _get_all_gather_input_metadatas(param_all_gather_inputs: Sequence[Sequence[Any]]) -> tuple[list[list[Any]], list[list[int]], Any]:
+    if not param_all_gather_inputs or not param_all_gather_inputs[0]:
+        raise ValueError("all-gather input metadata requires at least one tensor")
+    dtypes: list[list[Any]] = []
+    numels: list[list[int]] = []
+    dtype = param_all_gather_inputs[0][0].dtype
+    for inputs in param_all_gather_inputs:
+        current_dtypes: list[Any] = []
+        current_numels: list[int] = []
+        for value in inputs:
+            current_dtypes.append(value.dtype)
+            current_numels.append(int(value.numel()))
+            if value.dtype != dtype:
+                dtype = getattr(tp, "uint8", "uint8")
+        dtypes.append(current_dtypes)
+        numels.append(current_numels)
+    return dtypes, numels, dtype
 
 
-def _get_gradient_divide_factors(reduce_scatter_group: Any, all_reduce_group: Any, reduce_dtype: Any, device_type: str, factor: float | None, force_sum_reduction_for_comms: bool) -> tuple[float, float]:
-    del reduce_dtype, device_type, force_sum_reduction_for_comms
-    return float(factor or 1), float(factor or 1)
+def _get_gradient_divide_factors(reduce_scatter_group: Any, all_reduce_group: Any, reduce_dtype: Any, device_type: str, factor: float | None, force_sum_reduction_for_comms: bool) -> tuple[float | None, float | None, Any, Any]:
+    if device_type == "mtia":
+        force_sum_reduction_for_comms = True
+    reduce_world = dist.get_world_size(reduce_scatter_group) if reduce_scatter_group is not None else 1
+    all_reduce_world = dist.get_world_size(all_reduce_group) if all_reduce_group is not None else 1
+    total = reduce_world * all_reduce_world
+    dtype_name = str(reduce_dtype).lower()
+    overflow_risk = not any(name in dtype_name for name in ("float32", "bfloat16"))
+    if not overflow_risk and not force_sum_reduction_for_comms:
+        if factor is None:
+            if total == 1:
+                return None, None, dist.ReduceOp.SUM, dist.ReduceOp.SUM
+            return None, None, dist.ReduceOp.AVG, dist.ReduceOp.AVG
+        factor = float(factor)
+        reduce_op = dist.ReduceOp.AVG if reduce_world > 1 and factor == reduce_world else dist.ReduceOp.PREMUL_SUM
+        if reduce_op == dist.ReduceOp.PREMUL_SUM:
+            reduce_op = dist.ReduceOp.SUM
+        return None, None, reduce_op, dist.ReduceOp.SUM
+    divisor = float(total if factor is None else factor)
+    if divisor <= 0:
+        raise ValueError("gradient divide factor must be positive")
+    if overflow_risk:
+        pre = 1.0
+        while divisor % pre == 0 and divisor / pre > pre:
+            pre *= 2.0
+        return pre, divisor / pre, dist.ReduceOp.SUM, dist.ReduceOp.SUM
+    return None, divisor, dist.ReduceOp.SUM, dist.ReduceOp.SUM
 
 
 def _div_if_needed(tensor: Any, div_factor: float | None) -> Any:

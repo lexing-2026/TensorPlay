@@ -19,11 +19,15 @@ def _auto_wrap(root_module: Any, auto_wrap_policy: Any, ignored_modules: set[Any
             continue
         kwargs = targets[module]
         replacement = wrapper_cls(module, **kwargs)
-        for parent_name, parent in _parents(root_module):
-            for child_name, child in parent.named_children():
+        replaced = False
+        for parent in list(root_module.modules()):
+            for child_name, child in list(parent.named_children()):
                 if child is module:
                     setattr(parent, child_name, replacement)
+                    replaced = True
                     break
+            if replaced:
+                break
     return root_module
 
 

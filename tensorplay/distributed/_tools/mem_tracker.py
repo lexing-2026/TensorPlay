@@ -414,7 +414,7 @@ class MemTracker:
             self._mod_tracker.clear_user_hooks()
             self._mod_tracker.__exit__(*args)
 
-    def __torch_dispatch__(self, func: Any, types: Any, args: tuple[Any, ...] = (), kwargs: dict[str, Any] | None = None) -> Any:
+    def __tensorplay_dispatch__(self, func: Any, types: Any, args: tuple[Any, ...] = (), kwargs: dict[str, Any] | None = None) -> Any:
         del types
         result = func(*args, **(kwargs or {}))
         for value in _walk_tensors(result):

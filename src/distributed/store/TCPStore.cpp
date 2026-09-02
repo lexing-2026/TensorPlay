@@ -5,15 +5,19 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <optional>
 #include <set>
 #include <thread>
+#include <vector>
 
 #include "Exception.h"
 
@@ -44,6 +48,33 @@ enum class Status : uint8_t {
   ERROR = 2,
 };
 
+bool setSocketTimeout(
+    int fd,
+    const std::chrono::milliseconds& timeout) {
+  if (timeout.count() < 0) {
+    return true;
+  }
+  struct timeval value{};
+  using Seconds = decltype(value.tv_sec);
+  const int64_t seconds = timeout.count() / 1000;
+  value.tv_sec = static_cast<Seconds>(std::min<int64_t>(
+      seconds, static_cast<int64_t>(std::numeric_limits<Seconds>::max())));
+  value.tv_usec = static_cast<decltype(value.tv_usec)>(
+      (timeout.count() % 1000) * 1000);
+  return ::setsockopt(
+             fd,
+             SOL_SOCKET,
+             SO_RCVTIMEO,
+             &value,
+             sizeof(value)) == 0 &&
+      ::setsockopt(
+             fd,
+             SOL_SOCKET,
+             SO_SNDTIMEO,
+             &value,
+             sizeof(value)) == 0;
+}
+
 bool sendAll(int fd, const void* buf, size_t len) {
   const auto* bytes = static_cast<const uint8_t*>(buf);
   size_t sent = 0;
@@ -58,6 +89,9 @@ bool sendAll(int fd, const void* buf, size_t len) {
 }
 
 bool sendFrame(int fd, const void* buf, size_t len) {
+  TP_CHECK(
+      len <= std::numeric_limits<uint32_t>::max(),
+      "TCPStore: frame is too large");
   const uint32_t size = static_cast<uint32_t>(len);
   return sendAll(fd, &size, sizeof(size)) && sendAll(fd, buf, len);
 }
@@ -80,6 +114,9 @@ bool recvFrame(int fd, std::vector<uint8_t>* out) {
   if (!recvAll(fd, &size, sizeof(size))) {
     return false;
   }
+  if (size > std::vector<uint8_t>().max_size()) {
+    return false;
+  }
   out->assign(size, 0);
   return size == 0 || recvAll(fd, out->data(), size);
 }
@@ -87,6 +124,9 @@ bool recvFrame(int fd, std::vector<uint8_t>* out) {
 bool recvKey(int fd, std::string* key) {
   uint32_t keyLen = 0;
   if (!recvAll(fd, &keyLen, sizeof(keyLen))) {
+    return false;
+  }
+  if (keyLen > std::string().max_size()) {
     return false;
   }
   std::string bytes(keyLen, '\0');
@@ -111,10 +151,21 @@ int64_t bytesI64(const std::vector<uint8_t>& bytes) {
   return v;
 }
 
+int64_t checkedAdd(int64_t left, int64_t right) {
+  if ((right > 0 && left > std::numeric_limits<int64_t>::max() - right) ||
+      (right < 0 && left < std::numeric_limits<int64_t>::min() - right)) {
+    TP_THROW(RuntimeError, "TCPStore: counter overflow");
+  }
+  return left + right;
+}
+
 std::vector<uint8_t> packKeys(const std::vector<std::string>& keys) {
   std::vector<uint8_t> blob;
   for (const auto& key : keys) {
-    uint32_t len = static_cast<uint32_t>(key.size());
+    TP_CHECK(
+        key.size() <= std::numeric_limits<uint32_t>::max(),
+        "TCPStore: key is too large");
+    const uint32_t len = static_cast<uint32_t>(key.size());
     const auto* lenBytes = reinterpret_cast<const uint8_t*>(&len);
     blob.insert(blob.end(), lenBytes, lenBytes + sizeof(len));
     blob.insert(blob.end(), key.begin(), key.end());
@@ -122,20 +173,23 @@ std::vector<uint8_t> packKeys(const std::vector<std::string>& keys) {
   return blob;
 }
 
-std::vector<std::string> unpackKeys(const std::vector<uint8_t>& blob) {
-  std::vector<std::string> keys;
+bool unpackKeys(
+    const std::vector<uint8_t>& blob,
+    std::vector<std::string>* keys) {
+  keys->clear();
   size_t offset = 0;
-  while (offset + sizeof(uint32_t) <= blob.size()) {
+  while (offset <= blob.size() &&
+         blob.size() - offset >= sizeof(uint32_t)) {
     uint32_t len = 0;
     std::memcpy(&len, blob.data() + offset, sizeof(len));
     offset += sizeof(len);
-    if (offset + len > blob.size()) {
-      break;
+    if (len > blob.size() - offset) {
+      return false;
     }
-    keys.emplace_back(blob.begin() + offset, blob.begin() + offset + len);
+    keys->emplace_back(blob.begin() + offset, blob.begin() + offset + len);
     offset += len;
   }
-  return keys;
+  return offset == blob.size();
 }
 
 std::vector<uint8_t> strBytes(const std::string& s) {
@@ -180,6 +234,12 @@ class TCPStore::Server {
     if (acceptThread_.joinable()) {
       acceptThread_.join();
     }
+    for (auto& thread : connectionThreads_) {
+      if (thread.joinable()) {
+        thread.join();
+      }
+    }
+    connectionThreads_.clear();
   }
 
  private:
@@ -198,6 +258,7 @@ class TCPStore::Server {
   std::map<std::string, std::vector<uint8_t>> data_;
   std::mutex mutex_;
   std::set<int> conns_;
+  std::vector<std::thread> connectionThreads_;
   int listenFd_{-1};
   uint16_t port_{0};
   std::thread acceptThread_;
@@ -255,14 +316,14 @@ bool TCPStore::Server::readRequest(int fd, Request* request) {
       return recvFrame(fd, &request->expected) &&
           recvFrame(fd, &request->value);
     case Op::ADD:
-      return recvFrame(fd, &request->value);
+      return recvFrame(fd, &request->value) &&
+          request->value.size() == sizeof(int64_t);
     case Op::CHECK: {
       std::vector<uint8_t> blob;
       if (!recvFrame(fd, &blob)) {
         return false;
       }
-      request->keys = unpackKeys(blob);
-      return true;
+      return unpackKeys(blob, &request->keys);
     }
     case Op::GET:
     case Op::HAS:
@@ -327,7 +388,14 @@ void TCPStore::Server::handleConnection(int fd) {
             current = 0;
           }
         }
-        const int64_t updated = current + bytesI64(request.value);
+        int64_t updated = 0;
+        try {
+          updated = checkedAdd(current, bytesI64(request.value));
+        } catch (const std::exception&) {
+          const uint8_t error = static_cast<uint8_t>(Status::ERROR);
+          sendAll(fd, &error, 1);
+          break;
+        }
         const std::string text = std::to_string(updated);
         data_[request.key] = std::vector<uint8_t>(text.begin(), text.end());
         sendAll(fd, &ok, 1);
@@ -413,8 +481,16 @@ void TCPStore::Server::acceptLoop() {
       return;
     }
     // One thread per connection keeps the server logic sequential per
-    // client, matching the rendezvous-scale request rate.
-    std::thread(&Server::handleConnection, this, fd).detach();
+    // client, matching the rendezvous-scale request rate. Keeping the
+    // handles lets shutdown wait until no handler still references Server.
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (stop_) {
+        ::close(fd);
+        continue;
+      }
+      connectionThreads_.emplace_back(&Server::handleConnection, this, fd);
+    }
   }
 }
 
@@ -451,13 +527,15 @@ class TCPStoreClientHelper {
       const std::string& host,
       uint16_t port,
       const std::chrono::milliseconds& timeout) {
+    const bool hasDeadline = timeout.count() >= 0;
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     for (;;) {
       int fd = attemptConnect(host, port);
       if (fd >= 0) {
         return fd;
       }
-      if (std::chrono::steady_clock::now() >= deadline) {
+      const auto now = std::chrono::steady_clock::now();
+      if (hasDeadline && now >= deadline) {
         TP_CHECK(
             false,
             "TCPStore: could not connect to ",
@@ -465,7 +543,21 @@ class TCPStoreClientHelper {
             ":",
             port);
       }
-      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      auto delay = std::chrono::milliseconds(50);
+      if (hasDeadline) {
+        const auto remaining = std::chrono::duration_cast<
+            std::chrono::milliseconds>(deadline - now);
+        if (remaining <= std::chrono::milliseconds(0)) {
+          TP_CHECK(
+              false,
+              "TCPStore: could not connect to ",
+              host,
+              ":",
+              port);
+        }
+        delay = std::min(delay, remaining);
+      }
+      std::this_thread::sleep_for(delay);
     }
   }
 
@@ -512,8 +604,18 @@ bool exchange(
     const std::vector<uint8_t>& expected,
     const std::vector<std::string>& extraKeys,
     ConsumeReply&& consumeReply) {
+  const auto start = std::chrono::steady_clock::now();
   int fd = TCPStoreClientHelper::connect(host, port, timeout);
   if (fd < 0) {
+    return false;
+  }
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - start);
+  const auto remaining = timeout.count() < 0
+      ? std::chrono::milliseconds(-1)
+      : (elapsed >= timeout ? std::chrono::milliseconds(0) : timeout - elapsed);
+  if (!setSocketTimeout(fd, remaining)) {
+    ::close(fd);
     return false;
   }
   const uint8_t opByte = static_cast<uint8_t>(op);
@@ -535,7 +637,7 @@ bool exchange(
     ok = recvAll(fd, &status, 1);
   }
   if (ok) {
-    consumeReply(fd, static_cast<Status>(status));
+    ok = consumeReply(fd, static_cast<Status>(status));
   }
   ::close(fd);
   return ok;
@@ -548,7 +650,7 @@ void TCPStore::set(
     const std::vector<uint8_t>& value) {
   bool ok = exchange(
       host_, port_, timeout_, Op::SET, key, value, {}, {},
-      [](int, Status) {});
+      [](int, Status status) { return status == Status::OK; });
   TP_CHECK(ok, "TCPStore set: request failed");
 }
 
@@ -558,9 +660,9 @@ std::vector<uint8_t> TCPStore::get(const std::string& key) {
       host_, port_, timeout_, Op::GET, key, {}, {}, {},
       [&](int fd, Status status) {
         if (status == Status::NOT_FOUND) {
-          return;
+          return true;
         }
-        recvFrame(fd, &value);
+        return status == Status::OK && recvFrame(fd, &value);
       });
   TP_CHECK(ok, "TCPStore get: request failed");
   return value;
@@ -572,14 +674,19 @@ int64_t TCPStore::add(const std::string& key, int64_t value) {
       host_, port_, timeout_, Op::ADD, key, i64Bytes(value), {}, {},
       [&](int fd, Status status) {
         if (status != Status::OK) {
-          return;
+          return false;
         }
         std::vector<uint8_t> bytes;
-        recvFrame(fd, &bytes);
+        if (!recvFrame(fd, &bytes)) {
+          return false;
+        }
         try {
-          updated = std::stoll(std::string(bytes.begin(), bytes.end()));
+          const std::string text(bytes.begin(), bytes.end());
+          size_t parsed = 0;
+          updated = std::stoll(text, &parsed);
+          return parsed == text.size();
         } catch (const std::exception&) {
-          updated = 0;
+          return false;
         }
       });
   TP_CHECK(ok, "TCPStore add: request failed");
@@ -590,7 +697,10 @@ bool TCPStore::deleteKey(const std::string& key) {
   bool removed = false;
   bool ok = exchange(
       host_, port_, timeout_, Op::DEL, key, {}, {}, {},
-      [&](int fd, Status status) { removed = status == Status::OK; });
+      [&](int, Status status) {
+        removed = status == Status::OK;
+        return status == Status::OK || status == Status::NOT_FOUND;
+      });
   TP_CHECK(ok, "TCPStore delete: request failed");
   return removed;
 }
@@ -604,9 +714,9 @@ std::vector<uint8_t> TCPStore::compareSet(
       host_, port_, timeout_, Op::CAS, key, desiredValue, expectedValue, {},
       [&](int fd, Status status) {
         if (status != Status::OK) {
-          return;
+          return false;
         }
-        recvFrame(fd, &current);
+        return recvFrame(fd, &current);
       });
   TP_CHECK(ok, "TCPStore compareSet: request failed");
   return current;
@@ -618,11 +728,15 @@ bool TCPStore::check(const std::vector<std::string>& keys) {
       host_, port_, timeout_, Op::CHECK, "", {}, {}, keys,
       [&](int fd, Status status) {
         if (status != Status::OK) {
-          return;
+          return false;
         }
         uint8_t flag = 0;
-        recvAll(fd, &flag, 1);
+        if (!recvAll(fd, &flag, 1)) {
+          return false;
+        }
         allPresent = flag == static_cast<uint8_t>(Status::OK);
+        return flag == static_cast<uint8_t>(Status::OK) ||
+            flag == static_cast<uint8_t>(Status::NOT_FOUND);
       });
   TP_CHECK(ok, "TCPStore check: request failed");
   return allPresent;
@@ -634,11 +748,14 @@ int64_t TCPStore::getNumKeys() {
       host_, port_, timeout_, Op::NUMKEYS, "", {}, {}, {},
       [&](int fd, Status status) {
         if (status != Status::OK) {
-          return;
+          return false;
         }
         std::vector<uint8_t> bytes;
-        recvFrame(fd, &bytes);
+        if (!recvFrame(fd, &bytes) || bytes.size() != sizeof(int64_t)) {
+          return false;
+        }
         count = bytesI64(bytes);
+        return true;
       });
   TP_CHECK(ok, "TCPStore numKeys: request failed");
   return count;

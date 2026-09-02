@@ -13,7 +13,7 @@ __all__ = [
     "reduce",
     "reduce_scatter",
     "all_gather",
-    "_all_gather_base",
+    "all_gather_single",
     "all_to_all",
     "all_to_all_single",
     "all_reduce",
@@ -53,8 +53,8 @@ def all_gather(tensor: tp.Tensor, group=None):
     return _AllGather.apply(group, tensor)
 
 
-def _all_gather_base(output_tensor, input_tensor, group=None):
-    return _AllGatherBase.apply(output_tensor, input_tensor, group)
+def all_gather_single(output_tensor, input_tensor, group=None):
+    return _AllGatherSingle.apply(output_tensor, input_tensor, group)
 
 
 def all_to_all(output_tensor_list, input_tensor_list, group=None):
@@ -84,7 +84,7 @@ class _Broadcast(Function):
         ctx.group = group
         ctx.global_rank = dist.get_rank(group)
         result = tensor.clone()
-        dist.broadcast(result, src, group=group)
+        dist.broadcast(result, group=group, group_src=src)
         return result
 
     @staticmethod
@@ -106,8 +106,8 @@ class _Gather(Function):
         dist.gather(
             tensor.contiguous(),
             outputs if dist.get_rank(group=group) == dst else None,
-            dst,
             group=group,
+            group_dst=dst,
         )
         return tuple(outputs)
 
@@ -130,8 +130,8 @@ class _Scatter(Function):
         dist.scatter(
             output,
             list(tensors) if dist.get_rank(group=group) == src else None,
-            src,
             group=group,
+            group_src=src,
         )
         return output
 
@@ -147,7 +147,7 @@ class _Reduce(Function):
         ctx.op = op
         ctx.group = group
         result = tensor.clone()
-        dist.reduce(result, src, op=op, group=group)
+        dist.reduce(result, op=op, group=group, group_dst=src)
         return result
 
     @staticmethod
@@ -177,6 +177,9 @@ class _AllGather(Function):
     @staticmethod
     def forward(ctx, group, tensor):
         ctx.group = group
+        ctx.input_shape = tuple(tensor.shape)
+        ctx.input_dtype = tensor.dtype
+        ctx.input_device = tensor.device
         outputs = [
             tp.empty_like(tensor) for _ in range(dist.get_world_size(group=group))
         ]
@@ -186,29 +189,58 @@ class _AllGather(Function):
     @staticmethod
     def backward(ctx, *grad_outputs):
         rank = dist.get_rank(group=ctx.group)
-        if len(grad_outputs) == 1:
-            return None, grad_outputs[0]
-        result = grad_outputs[rank].clone()
-        for index, value in enumerate(grad_outputs):
-            if index != rank:
-                result.add_(value)
-        return None, result
+        world_size = dist.get_world_size(group=ctx.group)
+        if len(grad_outputs) != world_size:
+            raise RuntimeError(
+                "all_gather backward received an invalid number of output gradients"
+            )
+        reduced: Any = None
+        for index, grad_output in enumerate(grad_outputs):
+            if grad_output is None:
+                current = tp.zeros(
+                    ctx.input_shape,
+                    dtype=ctx.input_dtype,
+                    device=ctx.input_device,
+                )
+            else:
+                current = grad_output.clone()
+            dist.all_reduce(current, op=ReduceOp.SUM, group=ctx.group)
+            if index == rank:
+                reduced = current
+        return None, reduced
 
 
-class _AllGatherBase(Function):
+class _AllGatherSingle(Function):
     @staticmethod
     def forward(ctx, output_tensor, input_tensor, group):
         ctx.group = group
-        operation = getattr(dist, "_allgather_base", None)
-        if operation is None:
-            raise RuntimeError("base all-gather is not available")
-        operation(output_tensor, input_tensor.contiguous(), group=group)
+        dist.all_gather_single(
+            output_tensor, input_tensor.contiguous(), group=group
+        )
         return output_tensor
 
     @staticmethod
     def backward(ctx, grad_output):
-        del ctx
-        raise RuntimeError("base all-gather backward is not available")
+        world_size = dist.get_world_size(group=ctx.group)
+        output_shape = list(grad_output.shape)
+        if not output_shape or output_shape[0] % world_size != 0:
+            raise RuntimeError(
+                "all_gather_single backward requires the leading dimension "
+                "to be divisible by the group size"
+            )
+        output_shape[0] //= world_size
+        grad_input = tp.empty(
+            output_shape,
+            dtype=grad_output.dtype,
+            device=grad_output.device,
+        )
+        dist.reduce_scatter_single(
+            grad_input,
+            grad_output.contiguous(),
+            op=ReduceOp.SUM,
+            group=ctx.group,
+        )
+        return None, grad_input, None
 
 
 class _AlltoAll(Function):

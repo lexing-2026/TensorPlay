@@ -1,5 +1,6 @@
 #include "types.h"
 
+#include <cmath>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -57,7 +58,7 @@ std::ostream& operator<<(std::ostream& stream, const WorkerInfo& value) {
 }
 
 void RpcBackendOptions::validate() const {
-    if (rpc_timeout_seconds < 0) {
+    if (!std::isfinite(rpc_timeout_seconds) || rpc_timeout_seconds < 0) {
         throw std::invalid_argument("rpc timeout must be non-negative");
     }
     if (num_worker_threads <= 0) {

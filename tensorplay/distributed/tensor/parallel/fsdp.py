@@ -8,7 +8,7 @@ from .._api import DTensor
 from .._dtensor_spec import DTensorSpec
 from .._shards_wrapper import ShardMetadata, ShardsWrapper
 from .._utils import compute_local_shape_and_global_offset
-from ..placement_types import Shard
+from ..placement_types import Replicate, Shard
 from ._data_parallel_utils import _flatten_tensor, _unflatten_tensor
 
 __all__ = ["DTensorExtensions"]
@@ -32,7 +32,10 @@ class DTensorExtensions:
 
     def chunk_dtensor(self, tensor: DTensor, rank: int, device_mesh: Any) -> Any:
         del rank
-        return tensor.redistribute(device_mesh=device_mesh, placements=[Shard(0)]).to_local()
+        mesh_ndim = getattr(device_mesh, "ndim")
+        mesh_ndim = int(mesh_ndim() if callable(mesh_ndim) else mesh_ndim)
+        placements = (Shard(0),) + tuple(Replicate() for _ in range(mesh_ndim - 1))
+        return tensor.redistribute(device_mesh=device_mesh, placements=placements).to_local()
 
     def pre_load_state_dict_transform(self, tensor: Any) -> tuple[Any, list[ShardMetadata]]:
         if not isinstance(tensor, DTensor):

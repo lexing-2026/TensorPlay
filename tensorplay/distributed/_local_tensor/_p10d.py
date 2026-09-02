@@ -82,21 +82,64 @@ def _prepare_collective_groups(process_group: Any) -> tuple[list[int], list[int]
     relative_ranks = [rank - offset for rank in ranks]
     shape, strides = _indices_to_layout(relative_ranks)
     layout = _FlatLayout(shape, strides)
-    global_group = dist._get_default_group()
-    offsets = layout.complement(global_group.size()).all_ranks_from_zero()
+    try:
+        world_size = int(dist.get_world_size())
+    except RuntimeError:
+        world_size = max(ranks) + 1
+    offsets = layout.complement(world_size).all_ranks_from_zero()
     return relative_ranks, offsets, offset
 
 
 class _P10dWork:
+    def __init__(self, done: Callable[[], Any] | None = None, tensors: Sequence[Any] = (), source_rank: int = -1) -> None:
+        self._done = done
+        self._tensors = list(tensors)
+        self._source = int(source_rank)
+        self._completed = done is None
+        self._error: BaseException | None = None
+
     def wait(self, timeout: Any = None) -> bool:
         del timeout
+        if not self._completed and self._done is not None:
+            try:
+                self._done()
+            except BaseException as error:
+                self._error = error
+                self._completed = True
+                raise
+            self._completed = True
+        if self._error is not None:
+            raise self._error
         return True
 
     def is_completed(self) -> bool:
-        return True
+        return self._completed
 
     def get_future(self) -> Any:
-        return None
+        from tensorplay import futures
+
+        future = futures.Future()
+
+        def complete() -> None:
+            try:
+                self.wait()
+                future.set_result(list(self._tensors))
+            except Exception as error:
+                future.set_exception(error)
+
+        future._completer = complete
+        return future
+
+    def _result_tensors(self) -> list[Any]:
+        return list(self._tensors)
+
+    def _source_rank(self) -> int:
+        return self._source
+
+    def abort(self) -> None:
+        if not self._completed:
+            self._completed = True
+            self._done = None
 
 
 def _local_functional_all_gather_into_tensor(
@@ -126,10 +169,10 @@ def _local_reduce(
     reduce_op = getattr(reduce_op, "op", lambda: reduce_op)()
     names = {
         getattr(dist.ReduceOp, "SUM", 0): "sum",
-        getattr(dist.ReduceOp, "PRODUCT", 1): "product",
-        getattr(dist.ReduceOp, "MAX", 2): "max",
+        getattr(dist.ReduceOp, "AVG", 1): "avg",
+        getattr(dist.ReduceOp, "PRODUCT", 2): "product",
         getattr(dist.ReduceOp, "MIN", 3): "min",
-        getattr(dist.ReduceOp, "AVG", 4): "avg",
+        getattr(dist.ReduceOp, "MAX", 4): "max",
     }
     name = names.get(reduce_op, reduce_op)
     if isinstance(name, str):
@@ -387,11 +430,47 @@ def _local_allgather_into_tensor_coalesced_(
     return _P10dWork()
 
 
-def _local_gather_(*args: Any, **kwargs: Any) -> None:
-    del args, kwargs
-    raise NotImplementedError(
-        "gather is unavailable for a single-program local simulation; use all_gather"
-    )
+def _local_gather_(
+    output_tensors: list[list[Any]], input_tensors: list[Any], process_group: Any,
+    root_rank: int, async_op: bool = True, timeout: int = -1,
+) -> tuple[list[list[Any]], _P10dWork]:
+    del async_op, timeout
+    from . import LocalTensor
+
+    if len(input_tensors) != 1 or len(output_tensors) > 1:
+        raise ValueError("gather accepts one input tensor and at most one output list")
+    input_tensor = input_tensors[0]
+    if not isinstance(input_tensor, LocalTensor):
+        raise TypeError("input must be a LocalTensor")
+    ranks, group_offsets, offset = _prepare_collective_groups(process_group)
+    relative_root = int(root_rank) - offset
+    if relative_root < 0 or relative_root >= len(ranks):
+        raise ValueError("root rank is not in the process group")
+    if output_tensors:
+        outputs = output_tensors[0]
+        if len(outputs) != len(ranks):
+            raise ValueError("gather output list must match the process-group size")
+    else:
+        outputs = []
+    for group_offset in group_offsets:
+        group_ranks = [group_offset + rank for rank in ranks]
+        if not all(rank in input_tensor._local_tensors for rank in group_ranks):
+            continue
+        root = group_offset + relative_root
+        if not outputs:
+            continue
+        for index, output in enumerate(outputs):
+            source = input_tensor._local_tensors[group_ranks[index]]
+            if isinstance(output, LocalTensor):
+                if root in output._local_tensors:
+                    output._local_tensors[root].copy_(source)
+                elif len(output._local_tensors) == 1:
+                    next(iter(output._local_tensors.values())).copy_(source)
+                else:
+                    raise ValueError("each gather output must contain the destination rank")
+            else:
+                output.copy_(source)
+    return output_tensors, _P10dWork(tensors=outputs)
 
 
 def _local_scatter_(
@@ -524,7 +603,7 @@ def _local_monitored_barrier_(
 
 
 def _local_send(tensors: list[Any], process_group: Any, dst: int, tag: int) -> _P10dWork:
-    del process_group, tag
+    del process_group
     from . import LocalRunnerMode, LocalTensor
 
     if len(tensors) != 1 or not isinstance(tensors[0], LocalTensor):
@@ -534,12 +613,12 @@ def _local_send(tensors: list[Any], process_group: Any, dst: int, tag: int) -> _
     runner = LocalRunnerMode.current()
     if runner is None:
         raise RuntimeError("a LocalRunnerMode is required for point-to-point operations")
-    runner._signal_send(source, dst, tensor._local_tensors[source])
+    runner._signal_send(source, dst, tensor._local_tensors[source], tag)
     return _P10dWork()
 
 
 def _local_recv_(tensors: list[Any], process_group: Any, src: int, tag: int) -> _P10dWork:
-    del process_group, tag
+    del process_group
     from . import LocalRunnerMode, LocalTensor
 
     if len(tensors) != 1 or not isinstance(tensors[0], LocalTensor):
@@ -549,10 +628,10 @@ def _local_recv_(tensors: list[Any], process_group: Any, src: int, tag: int) -> 
     runner = LocalRunnerMode.current()
     if runner is None:
         raise RuntimeError("a LocalRunnerMode is required for point-to-point operations")
-    value = runner._wait_recv(src, destination)
+    value = runner._wait_recv(src, destination, tag=tag)
     if value is not None:
         tensor._local_tensors[destination].copy_(value)
-    return _P10dWork()
+    return _P10dWork(source_rank=getattr(runner._last_recv_source, "rank", src))
 
 
 def _local_recv_any_source_(tensors: list[Any], process_group: Any, tag: int) -> _P10dWork:

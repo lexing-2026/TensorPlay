@@ -18,16 +18,22 @@ RpcRRef::RpcRRef(
     RRefId rref_id,
     ForkId fork_id,
     RpcFuturePtr creation,
-    std::shared_ptr<RRefState> local_state)
+    std::shared_ptr<RRefState> local_state,
+    std::weak_ptr<std::atomic<bool>> runtime_lifetime)
     : runtime_(runtime),
       owner_(std::move(owner)),
       rref_id_(rref_id),
       fork_id_(fork_id),
       creation_(std::move(creation)),
-      local_state_(std::move(local_state)) {}
+      local_state_(std::move(local_state)),
+      runtime_lifetime_(std::move(runtime_lifetime)) {}
 
 RpcRRef::~RpcRRef() {
     try {
+        const auto lifetime = runtime_lifetime_.lock();
+        if (!lifetime || !lifetime->load(std::memory_order_acquire)) {
+            return;
+        }
         if (runtime_ != nullptr && runtime_->initialized() && !is_owner()) {
             runtime_->delete_rref(*this);
         } else if (runtime_ != nullptr && runtime_->initialized() && local_state_) {
@@ -124,7 +130,13 @@ std::shared_ptr<RpcRRef> RpcRRef::fork() const {
     const ForkId fork_id(runtime_->current_worker().id,
                          runtime_->next_local_id_.fetch_add(1));
     return std::make_shared<RpcRRef>(
-        runtime_, owner_, rref_id_, fork_id, creation_, local_state_);
+        runtime_,
+        owner_,
+        rref_id_,
+        fork_id,
+        creation_,
+        local_state_,
+        runtime_lifetime_);
 }
 
 std::string RpcRRef::repr() const {

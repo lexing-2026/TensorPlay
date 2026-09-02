@@ -147,7 +147,7 @@ class SACEstimator:
         curve = OrderedDict({0.0: 0.0, 1.0: total_runtime})
         return SACTradeOffStats(curve, total_runtime, total_memory, 1, [total_runtime], [0.0], [0.0, 1.0])
 
-    def __torch_dispatch__(self, func: Any, types: Any, args: tuple[Any, ...] = (), kwargs: dict[str, Any] | None = None) -> Any:
+    def __tensorplay_dispatch__(self, func: Any, types: Any, args: tuple[Any, ...] = (), kwargs: dict[str, Any] | None = None) -> Any:
         del types
         start = 0.0
         result = func(*args, **(kwargs or {}))

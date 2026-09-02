@@ -3,9 +3,12 @@
 from contextlib import contextmanager
 from typing import Any, Iterable
 
+from tensorplay.autograd import Function
+
 from .._common_utils import TrainingState
-from ...device_mesh import DeviceMesh, init_device_mesh
+from ...device_mesh import DeviceMesh
 from ._fsdp_common import DataParallelMeshInfo
+from ._fsdp_init import _init_default_mesh
 from ._fsdp_param import FSDPParam, ParamModuleInfo
 from ._fsdp_param_group import FSDPParamGroup
 
@@ -38,6 +41,8 @@ class FSDPState:
         self._requires_all_reduce = True
         self._reshard_after_forward = True
         self._reshard_after_backward = True
+        self._auto_reshard_after_forward: bool | None = True
+        self._is_root: bool | None = None
         self._mp_policy = None
         self._forward_hooks_registered = False
 
@@ -49,24 +54,64 @@ class FSDPState:
             raise RuntimeError("FSDP state has not been initialized")
         return self._param_group
 
-    def init(self, modules: Iterable[Any], device: Any, mp_policy: Any, auto_reshard_after_forward: bool | int | None) -> None:
+    def init(
+        self,
+        modules: Iterable[Any],
+        device: Any,
+        mp_policy: Any,
+        auto_reshard_after_forward: bool,
+        shard_placement_fn: Any = None,
+        post_forward_mesh_info: DataParallelMeshInfo | None = None,
+    ) -> None:
         modules = list(modules)
         if self.module is None:
             self.module = modules[0]
         mesh = getattr(self, "mesh", None)
         if mesh is None:
-            mesh = init_device_mesh("cpu", (1,))
+            mesh = _init_default_mesh("cpu")
         self.mesh = mesh
-        mesh_info = DataParallelMeshInfo(mesh, 0)
+        mesh_info = getattr(self, "mesh_info", None)
+        if mesh_info is None:
+            mesh_info = DataParallelMeshInfo(mesh, 0)
+        module_prefixes = {
+            id(candidate): prefix
+            for prefix, candidate in self.module.named_modules()
+        }
         params: list[FSDPParam] = []
+        ignored_params = getattr(self, "ignored_params", set())
         for module in modules:
             for name, param in module.named_parameters(recurse=False):
-                params.append(FSDPParam(param, ParamModuleInfo(module, name, name), mesh_info, device=device, mp_policy=mp_policy))
-        self._param_group = FSDPParamGroup(params, modules, mesh_info, None, device, None, mp_policy, getattr(self, "offload_policy", None))
+                if param in ignored_params:
+                    continue
+                prefix = module_prefixes.get(id(module), "")
+                fqn = f"{prefix}.{name}" if prefix else name
+                params.append(
+                    FSDPParam(
+                        param,
+                        ParamModuleInfo(module, fqn, name),
+                        mesh_info,
+                        post_forward_mesh_info=post_forward_mesh_info,
+                        device=device,
+                        shard_placement_fn=shard_placement_fn,
+                        mp_policy=mp_policy,
+                    )
+                )
+        self._param_group = FSDPParamGroup(
+            params,
+            modules,
+            mesh_info,
+            post_forward_mesh_info,
+            device,
+            shard_placement_fn,
+            mp_policy,
+            getattr(self, "offload_policy", None),
+        )
         self._handle = self._param_group
         self._mp_policy = mp_policy
-        self._reshard_after_forward = bool(auto_reshard_after_forward) if auto_reshard_after_forward is not None else True
+        self._auto_reshard_after_forward = bool(auto_reshard_after_forward)
+        self._reshard_after_forward = post_forward_mesh_info is not None
         self._param_group._reshard_after_forward_enabled = self._reshard_after_forward
+        self._param_group._reshard_after_backward_enabled = self._reshard_after_backward
         self._register_hooks(modules)
 
     def _register_hooks(self, modules: Iterable[Any]) -> None:
@@ -89,6 +134,14 @@ class FSDPState:
         return self._pre_forward(module, args, kwargs)
 
     def _lazy_init(self) -> None:
+        if self._is_root is not None:
+            return
+        self._is_root = True
+        if self._auto_reshard_after_forward:
+            group = self._fsdp_param_group()
+            group.post_forward_mesh_info = None
+            group._reshard_after_forward_enabled = False
+            self._reshard_after_forward = False
         self._fsdp_param_group().lazy_init()
 
     def _validate_no_duplicate_params(self) -> None:
@@ -114,6 +167,7 @@ class FSDPState:
     def _post_forward(self, module: Any, input: Any, output: Any) -> Any:
         del module
         result = self._fsdp_param_group().post_forward(self.module, input, output)
+        result = self._register_pre_backward_hook(result)
         self._training_state = TrainingState.IDLE
         return result
 
@@ -127,14 +181,15 @@ class FSDPState:
         return _cast_tree(output, dtype)
 
     def _force_complete_incomplete_states(self, output: Any) -> Any:
-        del output
-        return None
+        if self._param_group is not None:
+            self._param_group.wait_for_unshard()
+        return output
 
     def _pre_backward(self, grad: Any) -> Any:
-        del grad
         self._training_state = TrainingState.PRE_BACKWARD
-        self._fsdp_param_group().pre_backward(None)
-        return None
+        if self._param_group is not None:
+            self._param_group.pre_backward(None)
+        return grad
 
     def _root_post_backward_final_callback(self) -> None:
         self._training_state = TrainingState.IDLE
@@ -143,13 +198,24 @@ class FSDPState:
     def _register_pre_backward_hook(self, output: Any) -> Any:
         if isinstance(output, tuple):
             return tuple(self._register_pre_backward_hook(value) for value in output)
+        if isinstance(output, list):
+            return [self._register_pre_backward_hook(value) for value in output]
+        if isinstance(output, dict):
+            return {
+                key: self._register_pre_backward_hook(value)
+                for key, value in output.items()
+            }
         hook = getattr(output, "register_hook", None)
         if hook is not None and getattr(output, "requires_grad", False):
             hook(self._pre_backward)
         return output
 
+    def _post_backward_output(self, grad: Any) -> Any:
+        self._root_post_backward_final_callback()
+        return grad
+
     def _register_root_post_backward_final_callback(self) -> None:
-        return None
+        self._fsdp_param_group().finalize_backward()
 
     def _reset_iter_state(self) -> None:
         self._training_state = TrainingState.IDLE
@@ -182,10 +248,9 @@ def _register_group_forward_hooks(modules: Iterable[Any], pre_hook: Any, post_ho
         module.register_forward_hook(post_hook, with_kwargs=True)
 
 
-class RegisterPreBackwardFunction:
+class RegisterPreBackwardFunction(Function):
     @staticmethod
     def forward(state: FSDPState, output: Any) -> Any:
-        state._pre_backward(None)
         return output
 
     @staticmethod
@@ -194,8 +259,9 @@ class RegisterPreBackwardFunction:
 
     @staticmethod
     def backward(ctx: Any, *grad_outputs: Any) -> tuple[None, ...]:
-        ctx.state._root_post_backward_final_callback()
-        return (None,) * (len(grad_outputs) + 1)
+        if len(grad_outputs) != 1:
+            raise RuntimeError("pre-backward marker expects one gradient")
+        return (None, ctx.state._pre_backward(grad_outputs[0]))
 
     @staticmethod
     def jvp(ctx: Any, *grad_inputs: Any) -> tuple[Any, ...]:

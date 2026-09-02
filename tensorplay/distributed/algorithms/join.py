@@ -181,7 +181,8 @@ class Join:
         self._rank = dist.get_rank(self._process_group)
         self._device = device
 
-    def __enter__(self): ...
+    def __enter__(self):
+        return self
 
     def __exit__(
         self,

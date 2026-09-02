@@ -4,7 +4,7 @@
 subprocesses (command entrypoints) or through ``multiprocessing`` (function
 entrypoints), and returns a :class:`PContext` that monitors, signals, and
 reaps them. Std streams can be redirected into per-rank files (optionally
-mirrored to the console) and per-rank environments carry the elastic
+copied to the console) and per-rank environments carry the elastic
 contract (rank ids, rendezvous endpoint, error-file path).
 """
 import abc

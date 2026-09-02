@@ -42,9 +42,7 @@ class GlooWork {
 
   virtual bool wait(int64_t timeout_ms = -1);
   virtual bool is_completed();
-  virtual void abort() {
-    // Abort support is optional per work type.
-  }
+  virtual void abort();
   virtual int source_rank() const {
     return -1;
   }
@@ -132,9 +130,7 @@ class GlooRecvWork : public GlooWork {
 
   int source_rank() const override;
   bool wait(int64_t timeout_ms = -1) override;
-  void abort() override {
-    buffer_->abortWaitRecv();
-  }
+  void abort() override;
 
  protected:
   Tensor tensor_;

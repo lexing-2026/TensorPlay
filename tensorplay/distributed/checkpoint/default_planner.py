@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import pickle
+from dataclasses import replace
 from typing import Any
 
 import tensorplay as tp
@@ -25,9 +26,13 @@ def _narrow(value: tp.Tensor, offsets: tuple[int, ...], lengths: tuple[int, ...]
 
 class DefaultSavePlanner(SavePlanner):
     def __init__(self, flatten_state_dict: bool = True, flatten_sharded_tensors: bool = True, dedup_replicated_tensors: bool | None = None, dedup_save_to_lowest_rank: bool = False, enable_plan_caching: bool = False) -> None:
-        del dedup_replicated_tensors
         self.flatten_state_dict = flatten_state_dict
         self.flatten_sharded_tensors = flatten_sharded_tensors
+        self.dedup_replicated_tensors = (
+            bool(dedup_replicated_tensors)
+            if dedup_replicated_tensors is not None
+            else False
+        )
         self.dedup_save_to_lowest_rank = dedup_save_to_lowest_rank
         self._enable_plan_caching = enable_plan_caching
         self.mappings: dict[str, tuple[Any, ...]] = {}
@@ -47,8 +52,43 @@ class DefaultSavePlanner(SavePlanner):
         return self.plan
 
     def create_global_plan(self, all_plans: list[SavePlan]) -> tuple[list[SavePlan], Metadata]:
-        self.global_plan, self.metadata = create_default_global_save_plan(all_plans)
+        plans = all_plans
+        if self.dedup_replicated_tensors or self.dedup_save_to_lowest_rank:
+            plans = self._deduplicate_replicated_items(all_plans)
+        self.global_plan, self.metadata = create_default_global_save_plan(plans)
+        if self.flatten_state_dict and self.mappings:
+            self.metadata = replace(self.metadata, planner_data=dict(self.mappings))
         return self.global_plan, self.metadata
+
+    def _deduplicate_replicated_items(self, plans: list[SavePlan]) -> list[SavePlan]:
+        """Remove repeated writes for the same logical tensor chunk."""
+        seen: set[tuple[Any, ...]] = set()
+        result: list[SavePlan] = []
+        for plan in plans:
+            items = []
+            for item in plan.items:
+                if item.tensor_data is None:
+                    items.append(item)
+                    continue
+                chunk = item.tensor_data.chunk
+                key = (
+                    item.index.fqn,
+                    tuple(chunk.offsets),
+                    tuple(chunk.sizes),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                items.append(item)
+            result.append(
+                type(plan)(
+                    items,
+                    plan.storage_data,
+                    plan.planner_data,
+                    plan.usable,
+                )
+            )
+        return result
 
     def finish_plan(self, new_plan: SavePlan) -> SavePlan:
         self.plan = new_plan
@@ -63,6 +103,8 @@ class DefaultSavePlanner(SavePlanner):
             pickle.dump(value, stream, pickle.HIGHEST_PROTOCOL)
             stream.seek(0)
             return stream
+        if hasattr(value, "to_local") and callable(value.to_local):
+            return value.to_local()
         return value
 
     def resolve_data(self, write_item: Any) -> Any:
@@ -113,6 +155,10 @@ class DefaultLoadPlanner(LoadPlanner):
 
     def lookup_tensor(self, index: MetadataIndex) -> tp.Tensor:
         value = self.state_dict[index.fqn]
+        if hasattr(value, "__get_tensor_shard__"):
+            value = value.__get_tensor_shard__(index)
+        elif hasattr(value, "to_local") and callable(value.to_local):
+            value = value.to_local()
         if not isinstance(value, tp.Tensor):
             raise TypeError(f"{index.fqn} is not a tensor")
         return value
@@ -125,8 +171,7 @@ class DefaultLoadPlanner(LoadPlanner):
         return tensor
 
     def commit_tensor(self, read_item: Any, tensor: tp.Tensor) -> None:
-        destination = self.lookup_tensor(read_item.dest_index)
-        destination.copy_(tensor)
+        del read_item, tensor
 
 
 class _EmptyStateDictLoadPlanner(DefaultLoadPlanner):

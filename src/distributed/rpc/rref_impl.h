@@ -5,6 +5,7 @@
 
 #include <pybind11/pybind11.h>
 
+#include <atomic>
 #include <memory>
 #include <string>
 
@@ -20,7 +21,8 @@ public:
         RRefId rref_id,
         ForkId fork_id,
         RpcFuturePtr creation,
-        std::shared_ptr<RRefState> local_state);
+        std::shared_ptr<RRefState> local_state,
+        std::weak_ptr<std::atomic<bool>> runtime_lifetime);
     ~RpcRRef();
 
     RpcRRef(const RpcRRef&) = delete;
@@ -44,6 +46,7 @@ private:
     ForkId fork_id_;
     RpcFuturePtr creation_;
     std::shared_ptr<RRefState> local_state_;
+    std::weak_ptr<std::atomic<bool>> runtime_lifetime_;
 };
 
 }  // namespace tensorplay::distributed::rpc
