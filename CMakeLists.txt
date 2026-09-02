@@ -115,6 +115,19 @@ endif()
 # Windows v9 nesting, version parsing, frontend header) lives in
 # cmake/Modules/FindCUDNN.cmake; only the enable/bundling policy stays here.
 set(USE_CUDNN OFF)
+if(USE_ROCM)
+    # The AMD backend drives the descriptor-style DNN calls through the
+    # compatibility header staged by tools/amd_build, which re-creates the
+    # cuDNN-style surface on top of MIOpen.  libMIOpen is already on the link
+    # line via LoadHIP; enabling the guard here activates the DNN-backed code
+    # paths in the staged sources.
+    if(EXISTS "${TP_ROCM_PATH}/lib/libMIOpen.so")
+        set(USE_CUDNN ON)
+        message(STATUS "AMD backend: DNN support enabled via MIOpen (${TP_ROCM_PATH}/lib/libMIOpen.so)")
+    else()
+        message(STATUS "MIOpen not found; AMD backend will be built without DNN support.")
+    endif()
+endif()
 if(USE_CUDA)
     option(USE_STATIC_CUDNN "Use cuDNN static libraries" OFF)
     if(USE_STATIC_CUDNN)
@@ -765,7 +778,6 @@ else()
     set(TP_CUDA_INFO "CUDA disabled")
     set(TP_CUDNN_INFO "cuDNN disabled")
 endif()
-
 if(MSVC)
     set(TP_CPU_CAPABILITY "AVX2")
 else()
@@ -1031,6 +1043,7 @@ set(TP_C_SOURCES
     src/bindings/python/autocast_mode.cpp
     src/bindings/python/Transforms.cpp
     src/bindings/python/Ops.cpp
+    src/bindings/python/Dispatch.cpp
     src/bindings/python/Tensor.cpp
     src/bindings/python/Stax.cpp
     src/bindings/python/Parallel.cpp
@@ -1142,8 +1155,13 @@ if(USE_ROCM)
     # build) keeps CPU semantics, matching a plain CPU configuration.
     foreach(_src IN LISTS TP_C_SOURCES)
         if(_src MATCHES "^${TP_HIP_STAGING}")
-            set_source_files_properties(${_src} PROPERTIES
-                COMPILE_OPTIONS "-DUSE_CUDA")
+            if(USE_CUDNN)
+                set_source_files_properties(${_src} PROPERTIES
+                    COMPILE_OPTIONS "-DUSE_CUDA;-DUSE_CUDNN")
+            else()
+                set_source_files_properties(${_src} PROPERTIES
+                    COMPILE_OPTIONS "-DUSE_CUDA")
+            endif()
         endif()
     endforeach()
 endif()

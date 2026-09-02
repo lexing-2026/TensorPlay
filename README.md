@@ -143,7 +143,7 @@ pip install tensorplay \
 
 ### Nightly (preview) builds
 
-Preview wheels are published manually to the rolling `nightly` channel, following pytorch's nightly versioning rule (`X.Y.0.dev<date>+cuXXX` / `+cpu`). Only the latest published version is kept.
+Preview wheels are published manually to the rolling `nightly` channel, following the nightly version format (`X.Y.0.dev<date>+cuXXX` / `+cpu`). Only the latest published version is kept.
 
 ```bash
 # CUDA nightly (choose cu124, cu126, or cu130)
@@ -167,6 +167,7 @@ Building from source gives you a hackable, debuggable install — the recommende
 - CMake >= 3.18 (< 4.0)
 - A C++20-capable compiler (MSVC 2022 on Windows, GCC/Clang on Linux)
 - CUDA Toolkit (optional, for GPU support); set `CMAKE_CUDA_ARCHITECTURES` to target specific GPU architectures
+- ROCm 7.2.x (optional, for AMD GPU support); the HIP backend is currently built from source
 - [Ninja](https://ninja-build.org/) (installed automatically with the build dependencies)
 
 #### Get the TensorPlay Source
@@ -209,6 +210,9 @@ Environment variables drive the build — no `-D` flags needed:
 # CPU-only build
 USE_CUDA=OFF pip install .
 
+# AMD GPU build with ROCm 7.2 / HIP
+USE_CUDA=OFF USE_ROCM=ON pip install .
+
 # Target specific GPU architectures
 CMAKE_CUDA_ARCHITECTURES="70;75;86" pip install .
 ```
@@ -216,6 +220,7 @@ CMAKE_CUDA_ARCHITECTURES="70;75;86" pip install .
 | Variable | Default | Description |
 | ---- | ---- | ---- |
 | `USE_CUDA` | auto-detect | Enable/disable the CUDA build |
+| `USE_ROCM` | `OFF` | Enable the AMD GPU / HIP build (mutually exclusive with `USE_CUDA`) |
 | `BUILD_TESTS` | `OFF` | Build the C++ test suite |
 | `USE_BLAS` / `USE_ONEDNN` | `ON` | BLAS acceleration / oneDNN primitives |
 | `MAX_JOBS` | machine default | Cap compile parallelism |
@@ -302,6 +307,8 @@ The package version lives in [`version.txt`](version.txt) (single source of trut
 
 The publish workflow uses the `pypi` GitHub environment for PyPI trusted publishing. Python versions and CPU/CUDA platform runners are configured in [`.github/wheel-platforms.json`](.github/wheel-platforms.json); the current CUDA variants are `cu124`, `cu126`, and `cu130` in [`.github/cuda-variants.json`](.github/cuda-variants.json). Adding a future entry such as `{ "variant": "cu132", "toolkit": "13.2.1" }` builds and publishes another CUDA index in the same Pages deployment. CUDA release wheel versions carry a local `+cuXXX` suffix so different CUDA variants can coexist in one GitHub Release. CUDA index deployment requires the `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` repository secrets; the optional `CLOUDFLARE_PAGES_PROJECT_NAME` repository variable defaults to `tensorplay-pypi`.
 
+ROCm is intentionally optional and is not part of the default release matrix. The manual [`.github/workflows/rocm.yml`](.github/workflows/rocm.yml) workflow builds the Linux ROCm 7.2 wheel with the official ROCm 7.2.4 image, uploads it to the selected GitHub Release, and publishes the `whl/rocm72/` index.
+
 We welcome contributions of all kinds — bug fixes, documentation, new features. See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and coding standards.
 
 <a href="https://github.com/lexing-2026/TensorPlay/graphs/contributors">
@@ -312,12 +319,12 @@ We welcome contributions of all kinds — bug fixes, documentation, new features
 
 TensorPlay is licensed under the [Apache 2.0 License](LICENSE).
 
-<a href="https://star-history.com/#lexing-2026/TensorPlay&Date">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=lexing-2026/TensorPlay&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=lexing-2026/TensorPlay&type=Date" />
-    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=lexing-2026/TensorPlay&type=Date" width="100%" />
-  </picture>
+<a href="https://www.star-history.com/?repos=lexing-2026%2FTensorPlay&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=lexing-2026/TensorPlay&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=lexing-2026/TensorPlay&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=lexing-2026/TensorPlay&type=date&legend=top-left" />
+ </picture>
 </a>
 
 <div align="center">

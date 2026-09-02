@@ -179,7 +179,7 @@ def _landing_index(variants: list[str]) -> str:
     )
     return (
         "<!doctype html>\n<html><body>\n"
-        "<h1>TensorPlay CUDA wheels</h1>\n"
+        "<h1>TensorPlay GPU wheels</h1>\n"
         f"{links}\n"
         "</body></html>\n"
     )
@@ -200,7 +200,7 @@ def _nightly_landing_index(variants: list[str]) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dist-dir", type=Path, required=True, help="Directory containing the current CUDA wheels")
+    parser.add_argument("--dist-dir", type=Path, required=True, help="Directory containing the current CPU/GPU wheels")
     parser.add_argument("--output-dir", type=Path, required=True, help="Pages output directory")
     parser.add_argument("--release-tag", required=True, help="Current Git tag, for example v1.0.0")
     parser.add_argument(
@@ -214,7 +214,7 @@ def main() -> None:
         action="append",
         dest="variants",
         default=None,
-        help="Index variant, repeat for multiple variants, for example cu124; "
+        help="Index variant, repeat for multiple variants, for example cu124 or rocm72; "
         "the cpu pseudo-variant is only valid with --nightly",
     )
     parser.add_argument(
@@ -226,7 +226,7 @@ def main() -> None:
     args = parser.parse_args()
 
     variants = args.variants or ["cu124"]
-    invalid = [variant for variant in variants if not re.fullmatch(r"cu[0-9]+|cpu", variant)]
+    invalid = [variant for variant in variants if not re.fullmatch(r"(?:cu|rocm)[0-9]+|cpu", variant)]
     if invalid:
         raise SystemExit(f"Invalid variant(s): {invalid!r}")
     if not args.nightly and "cpu" in variants:
@@ -255,11 +255,11 @@ def main() -> None:
             nightly=args.nightly,
         )
         if not packages:
-            if args.nightly:
-                # Manual preview publishes may ship only a subset of variants.
-                print(f"No wheels found for variant {variant}, skipping")
-                continue
-            raise SystemExit(f"No CUDA wheel assets found for {variant}")
+            # Optional GPU variants, such as ROCm, are not part of every
+            # release. Keep the index publishable when an optional asset is
+            # absent; a later opt-in workflow can add the variant.
+            print(f"No wheels found for variant {variant}, skipping")
+            continue
 
         if args.nightly:
             index_root = args.output_dir / "whl" / "nightly" / variant
@@ -280,7 +280,9 @@ def main() -> None:
             _nightly_landing_index(published_variants), encoding="utf-8"
         )
     else:
-        (args.output_dir / "index.html").write_text(_landing_index(variants), encoding="utf-8")
+        if not published_variants:
+            raise SystemExit("No wheel assets found for any configured variant")
+        (args.output_dir / "index.html").write_text(_landing_index(published_variants), encoding="utf-8")
         (args.output_dir / "_headers").write_text(
             "/whl/*\n"
             "  Cache-Control: public, max-age=300, must-revalidate\n",

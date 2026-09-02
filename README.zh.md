@@ -142,7 +142,7 @@ pip install tensorplay --index-url https://download.tensorplay.cn/whl/cu124/ --e
 
 ### Nightly（预览版）
 
-预览版轮子通过手动发布到滚动的 `nightly` 通道，版本号规则对齐 pytorch nightly（`X.Y.0.dev<日期>+cuXXX` / `+cpu`），仅保留最新一次发布的版本。
+预览版轮子通过手动发布到滚动的 `nightly` 通道，采用 nightly 版本号格式（`X.Y.0.dev<日期>+cuXXX` / `+cpu`），仅保留最新一次发布的版本。
 
 ```bash
 # CUDA nightly（可选 cu124、cu126 或 cu130）
@@ -166,6 +166,7 @@ pip install --pre tensorplay \
 - CMake >= 3.18（< 4.0）
 - 支持 C++20 的编译器（Windows 使用 MSVC 2022，Linux 使用 GCC/Clang）
 - CUDA Toolkit（可选，用于 GPU 支持）；可通过 `CMAKE_CUDA_ARCHITECTURES` 指定目标 GPU 架构
+- ROCm 7.2.x（可选，用于 AMD GPU 支持）；HIP 后端当前通过源码构建
 - [Ninja](https://ninja-build.org/)（随构建依赖自动安装）
 
 #### 获取源码
@@ -208,6 +209,9 @@ python -m build --wheel
 # 仅构建 CPU 版本
 USE_CUDA=OFF pip install .
 
+# 使用 ROCm 7.2 / HIP 构建 AMD GPU 版本
+USE_CUDA=OFF USE_ROCM=ON pip install .
+
 # 指定目标 GPU 架构
 CMAKE_CUDA_ARCHITECTURES="70;75;86" pip install .
 ```
@@ -215,6 +219,7 @@ CMAKE_CUDA_ARCHITECTURES="70;75;86" pip install .
 | 变量 | 默认值 | 说明 |
 | ---- | ---- | ---- |
 | `USE_CUDA` | 自动探测 | 启用/禁用 CUDA 构建 |
+| `USE_ROCM` | `OFF` | 启用 AMD GPU / HIP 构建（与 `USE_CUDA` 互斥） |
 | `BUILD_TESTS` | `OFF` | 构建 C++ 测试套件 |
 | `USE_BLAS` / `USE_ONEDNN` | `ON` | BLAS 加速 / oneDNN 算子库 |
 | `MAX_JOBS` | 机器默认 | 限制编译并行度 |
@@ -301,6 +306,8 @@ CI 会在每个 PR 和 main 推送上构建完整 wheel 矩阵（Python 3.9–3.
 
 发布工作流使用 GitHub 的 `pypi` 环境进行 PyPI 可信发布。Python 版本以及 CPU/CUDA 平台 runner 配置在 [`.github/wheel-platforms.json`](.github/wheel-platforms.json) 中；当前 CUDA 版本为 `cu124`、`cu126`、`cu130`，配置在 [`.github/cuda-variants.json`](.github/cuda-variants.json) 中。未来增加 `{ "variant": "cu132", "toolkit": "13.2.1" }` 后，CI 会构建并在同一次 Pages 部署中发布新的 CUDA 索引。CUDA Release wheel 会带 `+cuXXX` 本地版本后缀，确保不同 CUDA 版本可以共存于同一个 GitHub Release。CUDA 索引部署需要仓库 Secrets `CLOUDFLARE_API_TOKEN` 和 `CLOUDFLARE_ACCOUNT_ID`；可选的仓库变量 `CLOUDFLARE_PAGES_PROJECT_NAME` 默认为 `tensorplay-pypi`。
 
+ROCm 默认是可选能力，不进入默认 release 矩阵。手动运行 [`.github/workflows/rocm.yml`](.github/workflows/rocm.yml) 后，会使用官方 ROCm 7.2.4 镜像构建 Linux ROCm 7.2 wheel，上传到指定 GitHub Release，并发布 `whl/rocm72/` index。
+
 我们欢迎各种形式的贡献——bug 修复、文档改进、新功能建议。开发流程与编码规范见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 <a href="https://github.com/lexing-2026/TensorPlay/graphs/contributors">
@@ -311,12 +318,12 @@ CI 会在每个 PR 和 main 推送上构建完整 wheel 矩阵（Python 3.9–3.
 
 TensorPlay 采用 [Apache 2.0 许可证](LICENSE)。
 
-<a href="https://star-history.com/#lexing-2026/TensorPlay&Date">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=lexing-2026/TensorPlay&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=lexing-2026/TensorPlay&type=Date" />
-    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=lexing-2026/TensorPlay&type=Date" width="100%" />
-  </picture>
+<a href="https://www.star-history.com/?repos=lexing-2026%2FTensorPlay&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=lexing-2026/TensorPlay&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=lexing-2026/TensorPlay&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=lexing-2026/TensorPlay&type=date&legend=top-left" />
+ </picture>
 </a>
 
 <div align="center">
