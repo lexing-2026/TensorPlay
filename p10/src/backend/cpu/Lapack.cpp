@@ -358,20 +358,22 @@ int64_t lapack_dtrtrs(char side, char uplo, char transa, char diag, int64_t n,
 void lapack_strsm(int64_t order, int64_t side, int64_t uplo, int64_t trans,
                   int64_t diag, int64_t m, int64_t n, float alpha,
                   const float* a, int64_t lda, float* b, int64_t ldb) {
-    TP_LAPACK_CALL(strsm, const int64_t*, const int64_t*, const int64_t*,
-                   const int64_t*, const int64_t*, const int64_t*, const int64_t*,
-                   const float*, const float*, const int64_t*, float*,
-                   const int64_t*)(&order, &side, &uplo, &trans, &diag, &m, &n,
-                                   &alpha, a, &lda, b, &ldb);
+    // CBLAS takes every scalar by value (netlib ABI), unlike the Fortran
+    // LAPACK entries above which take pointers.
+    TP_LAPACK_CALL(strsm, const int64_t, const int64_t, const int64_t,
+                   const int64_t, const int64_t, const int64_t, const int64_t,
+                   const float, const float*, const int64_t, float*,
+                   const int64_t)(order, side, uplo, trans, diag, m, n,
+                                  alpha, a, lda, b, ldb);
 }
 void lapack_dtrsm(int64_t order, int64_t side, int64_t uplo, int64_t trans,
                   int64_t diag, int64_t m, int64_t n, double alpha,
                   const double* a, int64_t lda, double* b, int64_t ldb) {
-    TP_LAPACK_CALL(dtrsm, const int64_t*, const int64_t*, const int64_t*,
-                   const int64_t*, const int64_t*, const int64_t*, const int64_t*,
-                   const double*, const double*, const int64_t*, double*,
-                   const int64_t*)(&order, &side, &uplo, &trans, &diag, &m, &n,
-                                   &alpha, a, &lda, b, &ldb);
+    TP_LAPACK_CALL(dtrsm, const int64_t, const int64_t, const int64_t,
+                   const int64_t, const int64_t, const int64_t, const int64_t,
+                   const double, const double*, const int64_t, double*,
+                   const int64_t)(order, side, uplo, trans, diag, m, n,
+                                  alpha, a, lda, b, ldb);
 }
 int64_t lapack_sgels(char trans, int64_t m, int64_t n, int64_t nrhs, float* a,
                      int64_t lda, float* b, int64_t ldb, float* work,
