@@ -17,6 +17,18 @@ namespace tpx {
 thread_local int Engine::nested_depth_ = 0;
 
 namespace {
+thread_local GraphTask* current_graph_task = nullptr;
+
+struct GraphTaskGuard {
+    explicit GraphTaskGuard(GraphTask* task)
+        : previous_(current_graph_task) {
+        current_graph_task = task;
+    }
+    ~GraphTaskGuard() { current_graph_task = previous_; }
+
+    GraphTask* previous_;
+};
+
 // Sets the thread-local GradMode to `enabled` for the duration of a scope.
 struct GradModeGuard {
     explicit GradModeGuard(bool enabled) : prev_(GradMode::is_enabled()) {
@@ -177,6 +189,7 @@ void Engine::execute_task(ReadyQueue::NodeTask&& task, ReadyQueue& cpu_queue,
     GraphTask& graph = *task.graph_;
     if (engine_trace_enabled()) fprintf(stderr, "[tp-engine] exec node %s\n", task.fn_->name().c_str());
     try {
+        GraphTaskGuard graph_guard(&graph);
         evaluate_function(graph, task.fn_.get(), task.input_buffer_, cpu_queue, local_queue);
     } catch (...) {
         // A failing node must not hang the whole backward: record the error
@@ -187,6 +200,13 @@ void Engine::execute_task(ReadyQueue::NodeTask&& task, ReadyQueue& cpu_queue,
             queue_for_device(-1)->notify();
         }
     }
+}
+
+void Engine::queue_callback(std::function<void()> callback) {
+    TP_CHECK(static_cast<bool>(callback), "queue_callback requires a callable");
+    TP_CHECK(current_graph_task != nullptr,
+             "Final callbacks can only be installed during backward pass.");
+    current_graph_task->add_final_callback(std::move(callback));
 }
 
 void Engine::compute_dependencies(Node* root, GraphTask& task, uint64_t min_topo_nr) {
@@ -698,6 +718,14 @@ variable_list Engine::execute(const edge_list& root_edges, const variable_list& 
     }
 
     TP_ENGINE_TRACE("execute done");
+    {
+        GraphTaskGuard graph_guard(&graph_task);
+        try {
+            graph_task.run_final_callbacks();
+        } catch (...) {
+            graph_task.record_exception(std::current_exception());
+        }
+    }
     if (EngineTrace::level() >= 1) {
         EngineTrace::emit(graph_task.trace_id_, "done captured=%zu",
                           graph_task.captured_vars_.size());

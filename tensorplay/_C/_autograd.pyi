@@ -35,6 +35,7 @@ def backward(tensors: Sequence[TensorBase],
              grad_tensors: Sequence[TensorBase] | None = None,
              retain_graph: bool | None = None,
              create_graph: bool = False) -> None: ...
+def queue_callback(callback: Callable[[], Any]) -> None: ...
 def grad(outputs: Sequence[TensorBase],
          inputs: Sequence[TensorBase],
          grad_outputs: Sequence[TensorBase] | None = None,

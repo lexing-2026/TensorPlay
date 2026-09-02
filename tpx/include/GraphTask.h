@@ -4,6 +4,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <exception>
+#include <functional>
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
@@ -49,6 +50,11 @@ struct GraphTask {
     // Captured gradients returned to the caller of grad().
     std::vector<Tensor> captured_vars_;
 
+    // Callbacks queued while this graph is executing. The callback may queue
+    // another callback, so execution consumes the vector by index.
+    std::vector<std::function<void()>> final_callbacks_;
+    std::mutex final_callbacks_mutex_;
+
     // --- Completion tracking ---
     std::mutex mutex_;
     std::condition_variable cv_;
@@ -88,6 +94,24 @@ struct GraphTask {
     void record_exception(std::exception_ptr exc) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!exception_) exception_ = std::move(exc);
+    }
+
+    void add_final_callback(std::function<void()> callback) {
+        std::lock_guard<std::mutex> lock(final_callbacks_mutex_);
+        final_callbacks_.emplace_back(std::move(callback));
+    }
+
+    void run_final_callbacks() {
+        size_t index = 0;
+        for (;;) {
+            std::function<void()> callback;
+            {
+                std::lock_guard<std::mutex> lock(final_callbacks_mutex_);
+                if (index >= final_callbacks_.size()) return;
+                callback = final_callbacks_[index++];
+            }
+            callback();
+        }
     }
 
     bool is_completed() {
