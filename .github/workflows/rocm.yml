@@ -1,0 +1,159 @@
+name: rocm-wheel
+
+# ROCm is intentionally opt-in. This workflow is dispatched manually after a
+# release exists; it does not expand the default CPU/CUDA release matrix.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        required: true
+        type: string
+        description: Existing GitHub Release tag to receive the ROCm wheel, e.g. v1.0.0
+
+permissions: read-all
+
+jobs:
+  build-rocm:
+    name: tensorplay-linux-rocm72-py3
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+    container:
+      image: rocm/dev-ubuntu-22.04:7.2.4-complete
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          show-progress: false
+
+      - name: Load ROCm build configuration
+        id: rocm-config
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          from pathlib import Path
+
+          config = json.loads(Path(".github/rocm-variants.json").read_text())[0]
+          for key in ("variant", "toolkit", "arch"):
+              print(f"{key}={config[key]}")
+          PY
+
+      - name: Set ROCm wheel version
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          VARIANT: ${{ steps.rocm-config.outputs.variant }}
+        run: |
+          set -euo pipefail
+          build_version="${RELEASE_TAG#v}"
+          build_version="${build_version/-rc/rc}"
+          echo "TENSORPLAY_BUILD_VERSION=${build_version}+${VARIANT}" >> "$GITHUB_ENV"
+          echo "TENSORPLAY_BUILD_NUMBER=1" >> "$GITHUB_ENV"
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --break-system-packages \
+            --disable-pip-version-check --upgrade \
+            pip build packaging numpy PyYAML typing-extensions
+
+      - name: Build ROCm wheel
+        shell: bash
+        env:
+          USE_CUDA: "OFF"
+          USE_ROCM: "ON"
+          TP_ROCM_ARCH: ${{ steps.rocm-config.outputs.arch }}
+        run: |
+          set -euo pipefail
+          python3 -m build --wheel
+
+      - name: Verify ROCm wheel metadata
+        shell: bash
+        env:
+          VARIANT: ${{ steps.rocm-config.outputs.variant }}
+        run: |
+          set -euo pipefail
+          python3 - "$VARIANT" <<'PY'
+          import sys
+          from pathlib import Path
+
+          from packaging.utils import parse_wheel_filename
+
+          wheels = sorted(Path("dist").glob("*.whl"))
+          if len(wheels) != 1:
+              raise SystemExit(f"Expected exactly one ROCm wheel, found: {wheels}")
+          _name, version, _build, _tags = parse_wheel_filename(wheels[0].name)
+          local = str(version).partition("+")[2]
+          if local != sys.argv[1]:
+              raise SystemExit(f"Expected +{sys.argv[1]} wheel, got +{local}")
+          print(f"Verified {wheels[0].name}")
+          PY
+
+      - name: Install and smoke-test wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --break-system-packages --force-reinstall dist/*.whl
+          cd /tmp
+          python3 - <<'PY'
+          import tensorplay as tp
+
+          print("ROCm wheel import ok:", getattr(tp, "__version__", "unknown"))
+          PY
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tensorplay-rocm72-wheel
+          path: dist/*.whl
+          if-no-files-found: error
+
+  publish-rocm:
+    name: upload-rocm-wheel
+    needs: build-rocm
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: tensorplay-rocm72-wheel
+          path: dist
+
+      - name: Verify target release exists
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
+
+      - name: Upload ROCm wheel to GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          gh release upload "$RELEASE_TAG" dist/*.whl \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
+  publish-rocm-index:
+    name: publish-gpu-index
+    needs: publish-rocm
+    uses: ./.github/workflows/_cuda-upload.yml
+    permissions:
+      contents: write
+    with:
+      build_environment: optional-rocm
+      pages_branch: pypi-pages
+      release_tag: ${{ inputs.release_tag }}
+      cuda_variants_json: >-
+        [{"variant":"cu124","toolkit":"12.4.1"},
+         {"variant":"cu126","toolkit":"12.6.3"},
+         {"variant":"cu130","toolkit":"13.0.2"},
+         {"variant":"rocm72","toolkit":"7.2.4"}]
