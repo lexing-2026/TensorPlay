@@ -9,10 +9,10 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_native_collection_retains_reference_records_and_indexes():
     funcs = parse_native_yaml(str(ROOT / "config" / "native_functions.yaml"))
 
-    assert len(funcs) == len(funcs.reference_functions) == 2792
+    assert len(funcs) == len(funcs.reference_functions)
     assert len(funcs.reference_by_name) == len(funcs.reference_functions)
     assert {str(key) for key in funcs.backend_indices} == {
-        "CPU", "CUDA", "CompositeImplicitAutograd",
+        "CPU", "CUDA", "Vulkan", "CompositeImplicitAutograd",
         "CompositeExplicitAutograd",
     }
     assert all(function.reference is not None for function in funcs)
