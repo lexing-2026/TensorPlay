@@ -30,7 +30,7 @@ class MemoryProfileDispatchMode:
     def __exit__(self, *args: Any) -> None:
         del args
 
-    def __torch_dispatch__(self, func: Any, types: Any, args: tuple[Any, ...] = (), kwargs: dict[str, Any] | None = None) -> Any:
+    def __tensorplay_dispatch__(self, func: Any, types: Any, args: tuple[Any, ...] = (), kwargs: dict[str, Any] | None = None) -> Any:
         del types
         result = func(*args, **(kwargs or {}))
         self.memory_tracker._record_memory_stats(getattr(func, "__name__", repr(func)))

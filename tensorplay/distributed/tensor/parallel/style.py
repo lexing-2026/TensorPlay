@@ -74,13 +74,13 @@ class ColwiseParallel(ParallelStyle):
         del name
         if not hasattr(module, "weight"):
             return
-        module._parameters["weight"] = distribute_tensor(module.weight, mesh, [Shard(0)], src_data_rank=self.src_data_rank)
+        module._parameters["weight"] = distribute_tensor(module.weight, mesh, _single_layout(Shard(0), mesh), src_data_rank=self.src_data_rank)
         if getattr(module, "bias", None) is not None:
-            module._parameters["bias"] = distribute_tensor(module.bias, mesh, [Shard(0)], src_data_rank=self.src_data_rank)
+            module._parameters["bias"] = distribute_tensor(module.bias, mesh, _single_layout(Shard(0), mesh), src_data_rank=self.src_data_rank)
 
     def _partition_embedding(self, name: str, module: Any, mesh: Any) -> None:
         del name
-        module._parameters["weight"] = distribute_tensor(module.weight, mesh, [Shard(1)], src_data_rank=self.src_data_rank)
+        module._parameters["weight"] = distribute_tensor(module.weight, mesh, _single_layout(Shard(1), mesh), src_data_rank=self.src_data_rank)
 
     @staticmethod
     def _prepare_input(layouts: Any, desired: Any, module: Any, inputs: tuple[Any, ...], mesh: Any) -> tuple[Any, ...]:
@@ -91,8 +91,8 @@ class ColwiseParallel(ParallelStyle):
         value = _redistribute(value, _single_layout(desired, mesh))
         return (value,) + inputs[1:]
 
-    def _prepare_output(self, module: Any, inputs: tuple[Any, ...], output: Any, mesh: Any) -> Any:
-        del module, inputs
+    def _prepare_output(self, module: Any, output: Any, mesh: Any) -> Any:
+        del module
         if not isinstance(output, DTensor):
             return output
         desired = _single_layout(self.output_layouts, mesh)
@@ -127,14 +127,35 @@ class RowwiseParallel(ParallelStyle):
         self.use_local_output = use_local_output
         self.desired_input_layouts = self.input_layouts
 
-    def _partition(self, name: str, module: Any, mesh: Any) -> None:
+    def _partition_linear(self, name: str, module: Any, mesh: Any) -> None:
         del name
-        module._parameters["weight"] = distribute_tensor(module.weight, mesh, [Shard(1)], src_data_rank=self.src_data_rank)
+        module._parameters["weight"] = distribute_tensor(module.weight, mesh, _single_layout(Shard(1), mesh), src_data_rank=self.src_data_rank)
         if getattr(module, "bias", None) is not None:
-            module._parameters["bias"] = distribute_tensor(module.bias, mesh, [Replicate()], src_data_rank=self.src_data_rank)
+            module._parameters["bias"] = distribute_tensor(module.bias, mesh, _single_layout(Replicate(), mesh), src_data_rank=self.src_data_rank)
+
+    def _partition_embedding(self, name: str, module: Any, mesh: Any) -> None:
+        del name
+        module._parameters["weight"] = distribute_tensor(module.weight, mesh, _single_layout(Shard(0), mesh), src_data_rank=self.src_data_rank)
 
     def _apply(self, module: Any, device_mesh: Any) -> Any:
-        return distribute_module(module, device_mesh, self._partition, self._prepare_input, self._prepare_output)
+        nn = __import__("tensorplay.nn", fromlist=["Linear", "Embedding"])
+        if isinstance(module, nn.Linear):
+            partition = self._partition_linear
+            self.desired_input_layouts = (Shard(-1),)
+        elif isinstance(module, nn.Embedding):
+            partition = self._partition_embedding
+            self.desired_input_layouts = (Replicate(),)
+        else:
+            raise NotImplementedError(
+                "RowwiseParallel supports Linear and Embedding modules"
+            )
+        return distribute_module(
+            module,
+            device_mesh,
+            partition,
+            self._prepare_input,
+            self._prepare_output,
+        )
 
     def _prepare_input(self, module: Any, inputs: tuple[Any, ...], mesh: Any) -> tuple[Any, ...]:
         del module
@@ -142,8 +163,8 @@ class RowwiseParallel(ParallelStyle):
         value = _redistribute(value, _single_layout(self.desired_input_layouts, mesh))
         return (value,) + inputs[1:] if inputs else inputs
 
-    def _prepare_output(self, module: Any, inputs: tuple[Any, ...], output: Any, mesh: Any) -> Any:
-        del module, inputs
+    def _prepare_output(self, module: Any, output: Any, mesh: Any) -> Any:
+        del module
         output = _redistribute(output, _single_layout(self.output_layouts, mesh))
         return output.to_local() if self.use_local_output and isinstance(output, DTensor) else output
 
@@ -160,7 +181,7 @@ class SequenceParallel(ParallelStyle):
         del name
         for param_name, param in list(module._parameters.items()):
             if param is not None:
-                module._parameters[param_name] = distribute_tensor(param, mesh, [Replicate()])
+                module._parameters[param_name] = distribute_tensor(param, mesh, _single_layout(Replicate(), mesh))
 
     def _input(self, module: Any, inputs: tuple[Any, ...], mesh: Any) -> tuple[Any, ...]:
         del module
@@ -169,8 +190,8 @@ class SequenceParallel(ParallelStyle):
         value = _as_dtensor(inputs[0], mesh, _single_layout(self.sequence_sharding, mesh))
         return (value,) + inputs[1:]
 
-    def _output(self, module: Any, inputs: tuple[Any, ...], output: Any, mesh: Any) -> Any:
-        del module, inputs, mesh
+    def _output(self, module: Any, output: Any, mesh: Any) -> Any:
+        del module, mesh
         return output.to_local() if self.use_local_output and isinstance(output, DTensor) else output
 
     def _apply(self, module: Any, device_mesh: Any) -> Any:

@@ -41,14 +41,19 @@ class AsyncCheckpointer(Checkpointer):
     def __init__(self, checkpoint_stager: CheckpointStager, checkpoint_process: CheckpointProcess, reader: CheckpointReader) -> None:
         self._stager, self._process, self._reader = checkpoint_stager, checkpoint_process, reader
         self._executor = ThreadPoolExecutor(max_workers=1)
+        self._closed = False
 
     def save(self, path: str, state_dict: STATE_DICT, **kwargs: Any) -> tuple[Future[Any], Future[Any]]:
+        if self._closed:
+            raise RuntimeError("checkpointer is closed")
         staged = self._stager.stage(state_dict)
         if isinstance(staged, Future):
             stage_future = staged
         else:
             stage_future = Future(); stage_future.set_result(staged)
-        write_future = self._executor.submit(lambda: self._process.write(path, stage_future.result(), **kwargs).result())
+        write_future = self._executor.submit(
+            lambda: self._process.write(path, stage_future, **kwargs).result()
+        )
         return stage_future, write_future
 
     def load(self, path: str, state_dict: STATE_DICT | None = None, *, default_map_location: Any = None, strict: bool = False, **kwargs: Any) -> STATE_DICT:
@@ -58,4 +63,9 @@ class AsyncCheckpointer(Checkpointer):
         return loaded
 
     def close(self) -> None:
-        self._stager.close(); self._process.close(); self._executor.shutdown(wait=True)
+        if self._closed:
+            return
+        self._closed = True
+        self._executor.shutdown(wait=True, cancel_futures=False)
+        self._process.close()
+        self._stager.close()

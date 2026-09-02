@@ -146,7 +146,7 @@ def _exercise_collectives(
         assert work.is_completed()
         assert gathered_flat.tolist() == _expected_flat(world_size, 100)
 
-        if backend == "gloo":
+        if backend in ("gloo", "mpi"):
             if rank == 0:
                 sparse_input = tp.sparse_coo_tensor(
                     tp.tensor([[0, 1], [0, 1]], dtype=tp.int64),
@@ -166,6 +166,67 @@ def _exercise_collectives(
                 else [[1.0, 3.0], [4.0, 2.0]]
             )
             assert sparse_input.to_dense().tolist() == expected_sparse
+
+            complex_sparse_input = tp.sparse_coo_tensor(
+                tp.tensor([[rank], [rank]], dtype=tp.int64),
+                tp.tensor([complex(rank + 1, rank + 2)], dtype=tp.complex64),
+                [2, 2],
+            )
+            dist.all_reduce(complex_sparse_input)
+            expected_complex_sparse = [[0j, 0j], [0j, 0j]]
+            for source_rank in range(world_size):
+                expected_complex_sparse[source_rank][source_rank] = complex(
+                    source_rank + 1, source_rank + 2
+                )
+            assert complex_sparse_input.to_dense().tolist() == expected_complex_sparse
+
+        complex_input = tp.tensor(
+            [complex(rank + 1, rank + 2), complex(rank + 3, rank + 4)],
+            dtype=tp.complex64,
+        )
+        dist.all_reduce(complex_input)
+        rank_sum = world_size * (world_size - 1) // 2
+        expected_complex = [
+            complex(rank_sum + world_size, rank_sum + 2 * world_size),
+            complex(rank_sum + 3 * world_size, rank_sum + 4 * world_size),
+        ]
+        assert complex_input.tolist() == expected_complex
+
+        complex_gather_input = tp.tensor(
+            [complex(rank + 10, rank + 20)], dtype=tp.complex64
+        )
+        complex_gather_output = tp.zeros(
+            (world_size, 1), dtype=tp.complex64
+        )
+        dist.all_gather_single(complex_gather_output, complex_gather_input)
+        assert complex_gather_output.tolist() == [
+            [complex(source_rank + 10, source_rank + 20)]
+            for source_rank in range(world_size)
+        ]
+
+        complex_scalar_input = tp.tensor(
+            complex(rank + 50, rank + 60), dtype=tp.complex64
+        )
+        complex_scalar_output = tp.zeros((world_size,), dtype=tp.complex64)
+        dist.all_gather_single(complex_scalar_output, complex_scalar_input)
+        assert complex_scalar_output.tolist() == [
+            complex(source_rank + 50, source_rank + 60)
+            for source_rank in range(world_size)
+        ]
+
+        complex_reduce_input = tp.tensor(
+            [complex(rank + 30, rank + 40)] * world_size,
+            dtype=tp.complex64,
+        )
+        complex_reduce_output = tp.zeros((1,), dtype=tp.complex64)
+        dist.reduce_scatter_single(
+            complex_reduce_output, complex_reduce_input
+        )
+        expected_complex_reduce = complex(
+            sum(source + 30 for source in range(world_size)),
+            sum(source + 40 for source in range(world_size)),
+        )
+        assert complex_reduce_output.tolist() == [expected_complex_reduce]
 
         root = world_size - 1
         gather_input = tp.arange(2, dtype=tp.float32) + float(rank * 10)

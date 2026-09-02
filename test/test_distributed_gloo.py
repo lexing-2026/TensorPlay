@@ -1,5 +1,5 @@
 """CPU-backend process-group tests: gloo over two spawned ranks, and MPI
-under mpirun when a launcher is available.
+under a launcher when one is available.
 
 Gloo test bodies live at module level so ``spawn`` can pickle them."""
 
@@ -99,7 +99,7 @@ def body_all_gather(rank, size, port):
 def body_gather_scatter(rank, size, port):
     tp, dist = _init(rank, port)
     try:
-        gather_list = [tp.zeros((2,)) for _ in range(size)]
+        gather_list = [tp.zeros((2,)) for _ in range(size)] if rank == 0 else None
         dist.gather(tp.full((2,), float(rank), dtype=tp.float32), gather_list, dst=0)
         if rank == 0:
             for i in range(size):
@@ -218,6 +218,22 @@ def body_async_all_reduce(rank, size, port):
         dist.destroy_process_group()
 
 
+def body_nn_functional_all_gather_backward(rank, size, port):
+    tp, dist = _init(rank, port)
+    try:
+        from tensorplay.distributed.nn import functional as dist_nn
+
+        value = tp.full((2,), float(rank + 1), dtype=tp.float32, requires_grad=True)
+        gathered = dist_nn.all_gather(value)
+        loss = gathered[0].sum() * float(1 + 2 * rank)
+        loss = loss + gathered[1].sum() * float(2 + 2 * rank)
+        loss.backward()
+        expected = [4.0, 6.0][rank]
+        assert value.grad.tolist() == [expected] * 2, value.grad.tolist()
+    finally:
+        dist.destroy_process_group()
+
+
 class TestGlooProcessGroup(unittest.TestCase):
     world_size = 2
 
@@ -273,6 +289,9 @@ class TestGlooProcessGroup(unittest.TestCase):
 
     def test_async_all_reduce(self):
         self._run(body_async_all_reduce)
+
+    def test_nn_functional_all_gather_backward(self):
+        self._run(body_nn_functional_all_gather_backward)
 
 
 @unittest.skipUnless(shutil.which("mpirun"), "mpirun not available")

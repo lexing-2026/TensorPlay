@@ -36,8 +36,8 @@ using Tensor = tensorplay::Tensor;
 // least MPI_THREAD_SERIALIZED support; only one such group may exist when
 // the runtime does not offer MPI_THREAD_MULTIPLE.
 //
-// Only single-tensor collectives are supported: the input tensor vector of
-// every operation must have exactly one element.
+// Collective entry points validate tensor count, shape, dtype, and device
+// requirements before queueing work on the MPI worker.
 #ifdef USE_P10D_MPI
 class ProcessGroupMPI {
  public:
@@ -81,7 +81,7 @@ class ProcessGroupMPI {
     }
 
    protected:
-    void populateException();
+    std::exception_ptr populateException() const;
 
    private:
     const std::vector<Tensor> outputTensors_;
@@ -91,7 +91,7 @@ class ProcessGroupMPI {
   };
 
   // Constructor spawns the worker thread loop.
-  ProcessGroupMPI(int rank, int size, MPI_Comm pgComm);
+  ProcessGroupMPI(int rank, int size, MPI_Comm pgComm, bool ownsCommunicator);
   ~ProcessGroupMPI();
 
   // Abort the MPI program; must be called when an exception is detected.
@@ -124,11 +124,7 @@ class ProcessGroupMPI {
   }
   std::shared_ptr<GlooWork> allreduce_sparse(
       std::vector<Tensor>& tensors,
-      const AllreduceOptions& options) {
-    (void)tensors;
-    (void)options;
-    TP_THROW(RuntimeError, "ProcessGroupMPI does not support allreduce_sparse");
-  }
+      const AllreduceOptions& options);
   std::shared_ptr<GlooWork> allreduce_coalesced(
       std::vector<Tensor>& tensors,
       ReduceOp reduceOp,
@@ -181,6 +177,16 @@ class ProcessGroupMPI {
       std::vector<Tensor>& inputTensors,
       const AllgatherOptions& options) {
     return allgather_coalesced(outputTensors, inputTensors, options.timeout);
+  }
+  std::shared_ptr<GlooWork> all_gather_single_coalesced(
+      std::vector<Tensor>& outputs,
+      std::vector<Tensor>& inputs,
+      std::chrono::milliseconds timeout);
+  std::shared_ptr<GlooWork> all_gather_single_coalesced(
+      std::vector<Tensor>& outputs,
+      std::vector<Tensor>& inputs,
+      const AllgatherOptions& options) {
+    return all_gather_single_coalesced(outputs, inputs, options.timeout);
   }
   std::shared_ptr<GlooWork> all_gather_into_tensor(
       Tensor& output,
@@ -258,6 +264,18 @@ class ProcessGroupMPI {
       Tensor& input,
       const ReduceScatterOptions& options) {
     return reduce_scatter_single(output, input, options.reduceOp, options.timeout);
+  }
+  std::shared_ptr<GlooWork> reduce_scatter_single_coalesced(
+      std::vector<Tensor>& outputs,
+      std::vector<Tensor>& inputs,
+      ReduceOp reduceOp,
+      std::chrono::milliseconds timeout);
+  std::shared_ptr<GlooWork> reduce_scatter_single_coalesced(
+      std::vector<Tensor>& outputs,
+      std::vector<Tensor>& inputs,
+      const ReduceScatterOptions& options) {
+    return reduce_scatter_single_coalesced(
+        outputs, inputs, options.reduceOp, options.timeout);
   }
   std::shared_ptr<GlooWork> all_to_all_single(
       Tensor& outputTensor,
@@ -355,13 +373,14 @@ class ProcessGroupMPI {
   static int mpiThreadSupport_;
 
   MPI_Comm pgComm_;
+  bool ownsCommunicator_{false};
+  bool destroyed_{false};
 
   int rank_{-1};
   int size_{-1};
 };
 #else
-// Placeholder keeping the Python-side surface importable on builds without
-// an MPI runtime; construction reports the missing support.
+// Keep the type available so bindings can report missing runtime support.
 class ProcessGroupMPI {
  public:
   static std::shared_ptr<ProcessGroupMPI> createProcessGroupMPI(

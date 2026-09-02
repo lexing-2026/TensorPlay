@@ -93,15 +93,55 @@ def _prepare_collective_groups(process_group: Any) -> tuple[list[int], list[int]
 
 
 class _LocalWork:
+    def __init__(self, done: Callable[[], Any] | None = None, tensors: Sequence[Any] = (), source_rank: int = -1) -> None:
+        self._done = done
+        self._tensors = list(tensors)
+        self._source = int(source_rank)
+        self._completed = done is None
+        self._error: BaseException | None = None
+
     def wait(self, timeout: Any = None) -> bool:
         del timeout
+        if not self._completed and self._done is not None:
+            try:
+                self._done()
+            except BaseException as error:
+                self._error = error
+                self._completed = True
+                raise
+            self._completed = True
+        if self._error is not None:
+            raise self._error
         return True
 
     def is_completed(self) -> bool:
-        return True
+        return self._completed
 
     def get_future(self) -> Any:
-        return None
+        from tensorplay import futures
+
+        future = futures.Future()
+
+        def complete() -> None:
+            try:
+                self.wait()
+                future.set_result(list(self._tensors))
+            except Exception as error:
+                future.set_exception(error)
+
+        future._completer = complete
+        return future
+
+    def _result_tensors(self) -> list[Any]:
+        return list(self._tensors)
+
+    def _source_rank(self) -> int:
+        return self._source
+
+    def abort(self) -> None:
+        if not self._completed:
+            self._completed = True
+            self._done = None
 
 
 def _groups(process_group: Any, local: LocalTensor) -> list[list[int]]:
@@ -123,20 +163,20 @@ def _local_reduce(reduce_op: Any, tensors: list[Any]) -> Any:
         name = name.lower()
     if name in (0, "sum"):
         return functools.reduce(operator.add, tensors)
-    if name in (1, "product", "prod"):
+    if name in (1, "avg", "average"):
+        return functools.reduce(operator.add, tensors) / len(tensors)
+    if name in (2, "product", "prod"):
         return functools.reduce(operator.mul, tensors)
-    if name in (2, "max"):
-        result = tensors[0]
-        for value in tensors[1:]:
-            result = result.maximum(value) if hasattr(result, "maximum") else result
-        return result
     if name in (3, "min"):
         result = tensors[0]
         for value in tensors[1:]:
             result = result.minimum(value) if hasattr(result, "minimum") else result
         return result
-    if name in (4, "avg", "average"):
-        return functools.reduce(operator.add, tensors) / len(tensors)
+    if name in (4, "max"):
+        result = tensors[0]
+        for value in tensors[1:]:
+            result = result.maximum(value) if hasattr(result, "maximum") else result
+        return result
     raise NotImplementedError(f"reduce operation {reduce_op!r} is not supported")
 
 
@@ -255,9 +295,32 @@ def _local_allgather_into_tensor_coalesced_(output_tensors: list[LocalTensor], i
     return _LocalWork()
 
 
-def _local_gather_(output_tensors: Any, input_tensors: Any, process_group_so: Any, root_rank: int, async_op: bool = True, timeout: int = -1):
-    del output_tensors, input_tensors, process_group_so, root_rank, async_op, timeout
-    raise NotImplementedError("gather is not defined for a single-program local simulation")
+def _local_gather_(output_tensors: list[list[LocalTensor]], input_tensors: list[LocalTensor], process_group_so: Any, root_rank: int, async_op: bool = True, timeout: int = -1):
+    del async_op, timeout
+    if len(input_tensors) != 1 or len(output_tensors) > 1:
+        raise ValueError("gather accepts one input tensor and at most one output list")
+    input_tensor = input_tensors[0]
+    relative, offsets, base = _prepare_collective_groups(process_group_so)
+    relative_root = int(root_rank) - base
+    if relative_root < 0 or relative_root >= len(relative):
+        raise ValueError("root rank is not in the process group")
+    outputs = output_tensors[0] if output_tensors else []
+    if outputs and len(outputs) != len(relative):
+        raise ValueError("gather output list must match the process-group size")
+    for offset in offsets:
+        group = [offset + rank for rank in relative]
+        if not all(rank in input_tensor._local_tensors for rank in group):
+            continue
+        root = offset + relative_root
+        for index, output in enumerate(outputs):
+            source = input_tensor._local_tensors[group[index]]
+            if root in output._local_tensors:
+                output._local_tensors[root].copy_(source)
+            elif len(output._local_tensors) == 1:
+                next(iter(output._local_tensors.values())).copy_(source)
+            else:
+                raise ValueError("each gather output must contain the destination rank")
+    return output_tensors, _LocalWork(tensors=outputs)
 
 
 def _local_scatter_(output_tensors: list[LocalTensor], input_tensors: list[list[LocalTensor]], process_group_so: Any, root_rank: int, async_op: bool = True, timeout: int = -1):
@@ -298,27 +361,27 @@ def _local_monitored_barrier_(tensor: LocalTensor, process_group_so: Any, device
 
 
 def _local_send(tensors: list[LocalTensor], process_group_so: Any, dst: int, tag: int):
-    del process_group_so, tag
+    del process_group_so
     runner = LocalRunnerMode.current()
     if runner is None:
         raise RuntimeError("a LocalRunnerMode is required for point-to-point operations")
     tensor = tensors[0]
     source = getattr(tensor, "__src_rank__", min(tensor._ranks))
-    runner._signal_send(source, dst, tensor._local_tensors[source])
+    runner._signal_send(source, dst, tensor._local_tensors[source], tag)
     return _LocalWork()
 
 
 def _local_recv_(tensors: list[LocalTensor], process_group_so: Any, src: int, tag: int):
-    del process_group_so, tag
+    del process_group_so
     runner = LocalRunnerMode.current()
     if runner is None:
         raise RuntimeError("a LocalRunnerMode is required for point-to-point operations")
     tensor = tensors[0]
     destination = getattr(tensor, "__src_rank__", min(tensor._ranks))
-    value = runner._wait_recv(src, destination)
+    value = runner._wait_recv(src, destination, tag=tag)
     if value is not None:
         tensor._local_tensors[destination].copy_(value)
-    return _LocalWork()
+    return _LocalWork(source_rank=getattr(runner._last_recv_source, "rank", src))
 
 
 def _local_recv_any_source_(tensors: list[LocalTensor], process_group_so: Any, tag: int):

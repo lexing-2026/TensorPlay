@@ -58,8 +58,8 @@ def _group_size(group: Any) -> int:
             return 1
     if isinstance(group, str):
         try:
-            return max(1, int(dist._resolve_group(group).size()))
-        except Exception:
+            return max(1, int(dist.get_world_size(group)))
+        except RuntimeError:
             return 1
     size = getattr(group, "size", None)
     return max(1, int(size() if callable(size) else size or 1))
@@ -70,8 +70,8 @@ def _group_rank(group: Any) -> int:
     if callable(rank):
         return int(rank())
     try:
-        return int(dist.get_rank())
-    except Exception:
+        return int(dist.get_rank(group))
+    except RuntimeError:
         return 0
 
 
@@ -112,12 +112,22 @@ class _SymmetricMemory:
 
     def barrier(self, channel: int = 0) -> None:
         del channel
+        if self.world_size > 1:
+            dist.barrier(group=self.group_name)
 
     def get_buffer(self, peer: int, shape: Sequence[int], dtype: Any, storage_offset: int = 0) -> tp.Tensor:
-        del peer
+        if peer < 0 or peer >= self.world_size:
+            raise ValueError("invalid peer")
+        shape = tuple(int(value) for value in shape)
+        if any(value < 0 for value in shape):
+            raise ValueError("buffer shape must be non-negative")
+        if dtype is not None and dtype != self.tensor.dtype:
+            raise ValueError("buffer dtype must match the rendezvous tensor")
         size = math.prod(shape)
+        if storage_offset < 0 or storage_offset + size > self.tensor.numel():
+            raise ValueError("buffer range exceeds the rendezvous tensor")
         view = self.tensor.view(-1)[storage_offset:storage_offset + size]
-        return view.view(tuple(shape)) if tuple(shape) else view.reshape(())
+        return view.view(shape) if shape else view.reshape(())
 
     def get_remote_tensor(self, peer: int, shape: Sequence[int], dtype: Any) -> tp.Tensor:
         return self.get_buffer(peer, shape, dtype)
@@ -447,6 +457,12 @@ def rendezvous(tensor: tp.Tensor, group: Any) -> _SymmetricMemory:
     if not is_symm_mem_tensor(tensor):
         raise ValueError("tensor was not allocated by symmetric memory")
     name = _group_name(group)
+    if _group_size(group) > 1:
+        metadata = (tuple(tensor.shape), str(tensor.dtype), str(tensor.device))
+        gathered = [None] * _group_size(group)
+        dist.all_gather_object(gathered, metadata, group=group)
+        if any(value != metadata for value in gathered):
+            raise ValueError("all ranks must rendezvous with matching tensor metadata")
     with _lock:
         return _tensor_handles.setdefault((id(tensor), name), _SymmetricMemory(tensor, name))
 
@@ -510,23 +526,49 @@ def wait_signal(hdl: _SymmetricMemory, peer: int) -> None:
         return
 
 
-def reduce_scatter_offset(input: tp.Tensor, out: list[tp.Tensor], group: str, *, dim: int, offsets: list[int] | None = None, dst_ranks: list[int] | None = None, red_op: str = "sum") -> None:
-    if dim not in (0, 1) or red_op != "sum":
-        raise ValueError("dim must be 0 or 1 and red_op must be sum")
+def reduce_scatter_offset(input: tp.Tensor, out: list[tp.Tensor], group: Any, *, dim: int, offsets: list[int] | None = None, dst_ranks: list[int] | None = None, red_op: str = "sum") -> None:
+    if dim not in (0, 1):
+        raise ValueError("dim must be 0 or 1")
+    if str(red_op).lower() not in {"sum", "avg", "average"}:
+        raise ValueError("red_op must be sum or avg")
+    count = _group_size(group)
+    extent = int(input.shape[dim])
     if offsets is None:
-        count = _group_size(group)
-        offsets = [round((index + 1) * input.shape[dim] / count) for index in range(count)]
+        offsets = [round((index + 1) * extent / count) for index in range(count)]
+    else:
+        offsets = [int(value) for value in offsets]
+    if len(offsets) != count or not offsets or offsets[-1] != extent:
+        raise ValueError("offsets must end at the input extent and match group size")
+    if any(stop <= start or stop > extent for start, stop in zip([0, *offsets[:-1]], offsets)):
+        raise ValueError("offsets must be strictly increasing within the input extent")
     if dst_ranks is None:
-        dst_ranks = list(range(len(offsets)))
-    rank = _group_rank(None)
-    owned = [index for index, destination in enumerate(dst_ranks) if destination == rank]
-    if len(owned) != len(out):
+        dst_ranks = list(range(count))
+    else:
+        dst_ranks = [int(value) for value in dst_ranks]
+    if len(dst_ranks) != count or any(rank < 0 or rank >= count for rank in dst_ranks):
+        raise ValueError("dst_ranks must contain one valid group rank per block")
+    if len(out) != dst_ranks.count(_group_rank(group)):
         raise ValueError("out does not contain one tensor per owned block")
+
+    partials = [tp.empty_like(input) for _ in range(count)]
+    if count > 1:
+        dist.all_gather(partials, input, group=group)
+    else:
+        partials[0].copy_(input)
+    reduced = partials[0]
+    for partial in partials[1:]:
+        reduced = reduced + partial
+    if str(red_op).lower() in {"avg", "average"} and count > 1:
+        reduced = reduced / count
+
+    rank = _group_rank(group)
+    output_index = 0
     start = 0
-    for output, index in zip(out, owned):
-        stop = offsets[index]
-        block = input.narrow(dim, start, stop - start)
-        _copy_into(output, block)
+    for index, stop in enumerate(offsets):
+        if dst_ranks[index] == rank:
+            block = reduced.narrow(dim, start, stop - start)
+            _copy_into(out[output_index], block)
+            output_index += 1
         start = stop
 
 
@@ -534,13 +576,23 @@ def is_symm_mem_tensor(tensor: tp.Tensor) -> bool:
     return id(tensor) in _symmetric_tensors
 
 
-def all_to_all_nd(input: tp.Tensor, out: tp.Tensor, scatter_dim: int, gather_dim: int, *, group: str) -> None:
+def all_to_all_nd(input: tp.Tensor, out: tp.Tensor, scatter_dim: int, gather_dim: int, *, group: Any) -> None:
     if (scatter_dim, gather_dim) not in {(0, 1), (1, 0)}:
         raise ValueError("only (0, 1) and (1, 0) dimension exchanges are supported")
-    if _group_size(group) == 1:
+    count = _group_size(group)
+    if count == 1:
         _copy_into(out, input)
         return
-    result = input.movedim(scatter_dim, 0).contiguous().movedim(0, gather_dim)
+    if input.dim() < 2:
+        raise ValueError("all_to_all_nd requires at least two dimensions")
+    if int(input.shape[scatter_dim]) % count != 0:
+        raise ValueError("scatter dimension must be divisible by group size")
+    chunks = list(input.chunk(count, dim=scatter_dim))
+    received = [tp.empty_like(chunks[0]) for _ in range(count)]
+    dist.all_to_all(received, chunks, group=group)
+    result = tp.cat(received, dim=gather_dim)
+    if tuple(out.shape) != tuple(result.shape):
+        raise ValueError(f"out shape must be {tuple(result.shape)}")
     _copy_into(out, result)
 
 

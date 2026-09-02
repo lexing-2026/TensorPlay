@@ -101,6 +101,7 @@ def config_from_args(args) -> tuple[LaunchConfig, Callable | str, list[str]]:
         redirects=_parse_redirects(args.redirects),
         tee=_parse_tee(args.tee),
         local_addr=args.local_addr,
+        node_rank=args.node_rank,
         master_addr=args.master_addr if args.master_addr != "127.0.0.1" else None,
         master_port=args.master_port if args.master_port else None,
     )

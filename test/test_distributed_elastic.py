@@ -69,10 +69,10 @@ class TestStoreCompareAndSwap(unittest.TestCase):
 
 
 class TestRendezvous(unittest.TestCase):
-    def _params(self, endpoint="", **config):
+    def _params(self, endpoint="", backend="core", **config):
         from tensorplay.distributed.elastic.rendezvous import RendezvousParameters
         return RendezvousParameters(
-            backend="core", endpoint=endpoint, run_id=f"test_{time.time()}",
+            backend=backend, endpoint=endpoint, run_id=f"test_{time.time()}",
             local_world_size=1, config=config,
         )
 
@@ -110,6 +110,58 @@ class TestRendezvous(unittest.TestCase):
         from tensorplay.distributed.elastic.rendezvous import create_handler
         handler = create_handler(self._params(endpoint="", backend_hint="static"))
         self.assertIsNotNone(handler)
+
+    def test_p10d_registry_and_export(self):
+        from tensorplay.distributed.elastic.rendezvous import (
+            P10dRendezvousBackend,
+            create_handler,
+        )
+
+        fd, path = tempfile.mkstemp(prefix="tp_p10d_rdzv_")
+        os.close(fd)
+        os.unlink(path)
+        handler = None
+        try:
+            params = self._params(
+                endpoint=path,
+                backend="p10d",
+                store_type="file",
+            )
+            handler = create_handler(params)
+            self.assertEqual(handler.get_backend(), "p10d")
+            self.assertIsInstance(handler._backend, P10dRendezvousBackend)
+        finally:
+            if handler is not None:
+                handler.shutdown()
+            if os.path.exists(path):
+                os.unlink(path)
+
+    def test_p10d_state_fencing(self):
+        from tensorplay.distributed.elastic.rendezvous.p10d_rendezvous_backend import (
+            create_backend,
+        )
+
+        fd, path = tempfile.mkstemp(prefix="tp_p10d_state_")
+        os.close(fd)
+        os.unlink(path)
+        try:
+            backend, store = create_backend(
+                self._params(
+                    endpoint=path,
+                    backend="p10d",
+                    store_type="file",
+                )
+            )
+            self.assertIsNone(backend.get_state())
+            first = backend.set_state(b"first", 0)
+            self.assertEqual(first, (b"first", 1))
+            self.assertEqual(backend.set_state(b"stale", 0), first)
+            self.assertEqual(backend.set_state(b"second", 1), (b"second", 2))
+            self.assertEqual(backend.get_state(), (b"second", 2))
+            del store
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
 
 
 class TestStoreUtils(unittest.TestCase):

@@ -1,9 +1,24 @@
 #include "store/HashStore.h"
 
 #include <cstring>
+#include <limits>
+
+#include "Exception.h"
 
 namespace tensorplay {
 namespace distributed {
+
+namespace {
+
+int64_t checkedAdd(int64_t left, int64_t right) {
+  if ((right > 0 && left > std::numeric_limits<int64_t>::max() - right) ||
+      (right < 0 && left < std::numeric_limits<int64_t>::min() - right)) {
+    TP_THROW(RuntimeError, "HashStore: counter overflow");
+  }
+  return left + right;
+}
+
+} // namespace
 
 void HashStore::set(
     const std::string& key,
@@ -44,7 +59,7 @@ int64_t HashStore::add(const std::string& key, int64_t value) {
       current = 0;
     }
   }
-  const int64_t updated = current + value;
+  const int64_t updated = checkedAdd(current, value);
   const std::string text = std::to_string(updated);
   data_[key] = std::vector<uint8_t>(text.begin(), text.end());
   return updated;

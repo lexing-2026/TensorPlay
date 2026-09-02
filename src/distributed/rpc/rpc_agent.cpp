@@ -35,7 +35,11 @@ void RpcAgent::set_rpc_timeout(std::chrono::milliseconds timeout) noexcept {
 }
 
 std::unordered_map<std::string, std::string> RpcAgent::get_debug_info() const {
-    return {};
+    return {
+        {"worker_name", worker_info_.name},
+        {"worker_id", std::to_string(worker_info_.id)},
+        {"rpc_timeout_ms", std::to_string(rpc_timeout().count())},
+    };
 }
 
 }  // namespace tensorplay::distributed::rpc

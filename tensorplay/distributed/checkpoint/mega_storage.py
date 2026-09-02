@@ -23,7 +23,8 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import tensorplay as tp
 
-from .filesystem import FileSystemReader, FileSystemWriter
+from .filesystem import FileSystemReader, FileSystemWriter, _atomic_dump
+from .metadata import Metadata, StorageMeta
 
 __all__ = ["MegaStorageWriter", "MegaStorageReader"]
 
@@ -157,6 +158,13 @@ class MegaStorageWriter(FileSystemWriter):
         if is_coordinator and not self.resolver.remote:
             Path(self.path).mkdir(parents=True, exist_ok=True)
 
+    def reset(self, checkpoint_id=None) -> None:
+        if checkpoint_id is not None:
+            self.path = str(checkpoint_id)
+            self.resolver = _PathResolver(checkpoint_id)
+        self.weight_map = {}
+        self.total_size = 0
+
     def write_data(self, state_dict) -> None:
         flat = _flatten(state_dict)
         mapping = self.fqn_to_index_mapping
@@ -173,18 +181,34 @@ class MegaStorageWriter(FileSystemWriter):
                 self.weight_map[fqn] = fname
             self.total_size += size
 
-    def finish(self, metadata) -> None:
+    def finish(self, metadata) -> Any:
         index_doc = {
             "metadata": {"total_size": self.total_size},
             "weight_map": self.weight_map,
         }
         self.resolver.put_bytes(_META_FN, json.dumps(index_doc, indent=2).encode())
-        # discover the checkpoint.
         if not self.resolver.remote:
-            import pickle
+            if isinstance(metadata, Metadata):
+                storage_data = dict(metadata.storage_data or {})
+                storage_data["format"] = "mega"
+                if metadata.storage_meta is None:
+                    storage_meta = StorageMeta(checkpoint_id=self.path)
+                elif metadata.storage_meta.checkpoint_id is None:
+                    from dataclasses import replace
 
-            with open(os.path.join(self.path, ".metadata"), "wb") as f:
-                pickle.dump({"version": "tp-1", **(metadata or {})}, f)
+                    storage_meta = replace(
+                        metadata.storage_meta, checkpoint_id=self.path
+                    )
+                else:
+                    storage_meta = metadata.storage_meta
+                metadata = replace(
+                    metadata,
+                    storage_data=storage_data,
+                    storage_meta=storage_meta,
+                    version=metadata.version or "tp-1",
+                )
+            _atomic_dump(Path(self.path) / ".metadata", metadata)
+        return metadata
 
 
 class MegaStorageReader(FileSystemReader):
@@ -202,6 +226,7 @@ class MegaStorageReader(FileSystemReader):
             self.path = str(checkpoint_id)
             self.resolver = _PathResolver(checkpoint_id)
         self._index = None
+        self._metadata = None
 
     def read_metadata(self) -> Dict[str, Any]:
         if self._index is not None:

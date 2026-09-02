@@ -1,10 +1,12 @@
 """Metadata and rank mapping utilities for pipeline execution."""
 
 from dataclasses import dataclass, field
+from enum import Enum
+import warnings
 from typing import Any, Callable, Iterable, Protocol
 
 import tensorplay as tp
-from tensorplay.utils._pytree import tree_flatten, tree_unflatten
+from tensorplay.utils._pytree import tree_flatten, tree_map, tree_unflatten
 
 from ..tensor import DTensor
 
@@ -82,6 +84,18 @@ class _DTensorMeta(_TensorMeta):
     def mesh_cache_key(self) -> tuple[tuple[str, ...], Any]:
         return self.mesh_dim_names, self.mesh_layout
 
+    def get_diff(self, other: "_TensorMeta") -> list[str]:
+        differences = _TensorMeta.get_diff(self, other)
+        if not isinstance(other, _DTensorMeta):
+            differences.append("metadata kind mismatch")
+            return differences
+        for field in ("global_shape", "global_stride", "placements", "mesh_dim_names", "mesh_layout"):
+            if getattr(self, field) != getattr(other, field):
+                differences.append(
+                    f"{field} mismatch: {getattr(self, field)!r} vs {getattr(other, field)!r}"
+                )
+        return differences
+
     def to_dtensor(self, device: Any, mesh: Any) -> DTensor:
         local = _make_tensor_from_meta(self, device)
         return DTensor.from_local(local, mesh, self.placements, shape=self.global_shape, stride=self.global_stride)
@@ -107,9 +121,62 @@ class _StageMeta:
     forward: _StageForwardMeta = field(default_factory=_StageForwardMeta)
     backward: _StageBackwardMeta = field(default_factory=_StageBackwardMeta)
 
+    @property
+    def inputs(self) -> tuple[TensorMeta, ...] | None:
+        value = self.forward.input_metas
+        return value or None
+
+    @inputs.setter
+    def inputs(self, value: Iterable[TensorMeta] | None) -> None:
+        self.forward.input_metas = tuple(value or ())
+
+    @property
+    def outputs(self) -> tuple[TensorMeta, ...] | None:
+        value = self.forward.output_metas
+        return value or None
+
+    @outputs.setter
+    def outputs(self, value: Iterable[TensorMeta] | None) -> None:
+        self.forward.output_metas = tuple(value or ())
+
+    @property
+    def input_grads(self) -> tuple[TensorMeta | None, ...] | None:
+        value = self.backward.input_grad_metas
+        return value or None
+
+    @input_grads.setter
+    def input_grads(self, value: Iterable[TensorMeta | None] | None) -> None:
+        self.backward.input_grad_metas = tuple(value or ())
+
+    @property
+    def output_grads(self) -> tuple[TensorMeta | None, ...] | None:
+        value = self.backward.output_grad_metas
+        return value or None
+
+    @output_grads.setter
+    def output_grads(self, value: Iterable[TensorMeta | None] | None) -> None:
+        self.backward.output_grad_metas = tuple(value or ())
+
+    def has_any(self) -> bool:
+        return any((self.inputs, self.outputs, self.input_grads, self.output_grads))
+
+    def has_dtensors(self) -> bool:
+        return any(
+            isinstance(meta, _DTensorMeta)
+            for values in (self.inputs, self.outputs)
+            if values is not None
+            for meta in values
+        )
+
+    def is_complete_for_forward(self) -> bool:
+        return self.inputs is not None and self.outputs is not None
+
 
 def _make_tensor_from_meta(meta: TensorMeta, device: Any = None) -> Any:
     kwargs = {"device": device} if device is not None else {}
+    empty_strided = getattr(tp, "empty_strided", None)
+    if callable(empty_strided):
+        return empty_strided(meta.shape, meta.stride, dtype=meta.dtype, **kwargs)
     return tp.empty(meta.shape, dtype=meta.dtype, **kwargs)
 
 
@@ -118,23 +185,48 @@ def _derive_grad_metas(output_metas: Iterable[TensorMeta]) -> tuple[TensorMeta |
 
 
 class _MeshCache:
-    def __init__(self, get_mesh: GetMeshCallback | None = None) -> None:
-        self._get_mesh = get_mesh
+    def __init__(self, get_mesh: GetMeshCallback | None = None, get_mesh_cb: GetMeshCallback | None = None) -> None:
+        self._get_mesh = get_mesh if get_mesh is not None else get_mesh_cb
         self._cache: dict[Any, Any] = {}
 
     def get(self, key: Any) -> Any:
-        if key not in self._cache and self._get_mesh is not None:
-            names, layout = key
-            self._cache[key] = self._get_mesh(names, layout)
-        return self._cache.get(key)
+        if key in self._cache:
+            return self._cache[key]
+        if self._get_mesh is None:
+            return None
+        names, layout = key
+        mesh = self._get_mesh(names, layout)
+        if mesh is None:
+            raise PipeliningMetadataError("mesh lookup returned no mesh")
+        self._cache[key] = mesh
+        return mesh
+
+    def get_mesh(self, key: Any) -> Any:
+        mesh = self.get(key)
+        if mesh is None:
+            raise PipeliningMetadataError(f"mesh {key!r} is not available")
+        return mesh
 
     def put(self, key: Any, mesh: Any) -> None:
         self._cache[key] = mesh
 
 
-class InferenceMode:
+class InferenceMode(str, Enum):
+    STATIC = "static"
+    DYNAMIC = "dynamic"
+
+    @classmethod
+    def needs_dynamic(cls, metadata: _StageMeta, has_backward: bool) -> bool:
+        if not metadata.is_complete_for_forward():
+            return True
+        if not metadata.has_dtensors() or not has_backward:
+            return False
+        return metadata.input_grads is None or metadata.output_grads is None
+
+
+class InferenceContext:
     def __init__(self, enabled: bool = True) -> None:
-        self.enabled = enabled
+        self.enabled = bool(enabled)
         self._context = None
 
     def __enter__(self):
@@ -145,26 +237,108 @@ class InferenceMode:
         return self._context.__exit__(exc_type, exc, tb)
 
 
-def flatten_args(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[list[Any], Any, Any]:
+def flatten_args(args: Any, kwargs: dict[str, Any] | None = None, *, detach: bool = False) -> Any:
+    if kwargs is None:
+        flat, spec = tree_flatten(args)
+        if detach:
+            detached = [
+                value.detach().requires_grad_(value.requires_grad)
+                if isinstance(value, tp.Tensor)
+                else value
+                for value in flat
+            ]
+            return tree_unflatten(detached, spec), detached
+        return flat
     flat_args, args_spec = tree_flatten(args)
     flat_kwargs, kwargs_spec = tree_flatten(kwargs)
-    return flat_args + flat_kwargs, args_spec, kwargs_spec
+    flat = flat_args + flat_kwargs
+    if detach:
+        flat = [
+            value.detach().requires_grad_(value.requires_grad)
+            if isinstance(value, tp.Tensor)
+            else value
+            for value in flat
+        ]
+    return flat, args_spec, kwargs_spec
 
 
-def flatten_args_detach(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[list[Any], Any, Any]:
-    flat, args_spec, kwargs_spec = flatten_args(args, kwargs)
-    return [value.detach() if isinstance(value, tp.Tensor) else value for value in flat], args_spec, kwargs_spec
+def flatten_args_detach(args: Any, kwargs: dict[str, Any] | None = None) -> Any:
+    return flatten_args(args, kwargs, detach=True)
 
 
-def generate_stage_to_rank_mapping(num_stages: int, pp_group_size: int, group_rank: int = 0) -> dict[int, int]:
-    if num_stages <= 0 or pp_group_size <= 0:
+def generate_stage_to_rank_mapping(
+    pp_size: int | None = None,
+    num_stages: int | None = None,
+    style: str | int = "loop",
+    *,
+    pp_group_size: int | None = None,
+    group_rank: int = 0,
+) -> dict[int, int]:
+    legacy_call = isinstance(style, int) and not isinstance(style, bool)
+    if pp_group_size is not None:
+        if pp_size is None:
+            pp_size = pp_group_size
+        elif pp_size != pp_group_size:
+            raise ValueError("pipeline group sizes disagree")
+    if legacy_call:
+        if pp_size is None or num_stages is None:
+            raise TypeError("stage and group counts are required")
+        group_rank = int(style)
+        pp_size, num_stages = num_stages, pp_size
+        style = "loop"
+    if pp_size is None or num_stages is None:
+        raise TypeError("pp_size and num_stages are required")
+    if isinstance(pp_size, bool) or isinstance(num_stages, bool):
+        raise TypeError("stage and group counts must be integers")
+    pp_size, num_stages = int(pp_size), int(num_stages)
+    if pp_size <= 0 or num_stages <= 0:
         raise ValueError("stage and group counts must be positive")
-    return {index: (group_rank + index) % pp_group_size for index in range(num_stages)}
+    if not isinstance(style, str):
+        raise TypeError("pipeline style must be a string")
+    if style == "loop":
+        mapping = {index: index % pp_size for index in range(num_stages)}
+    elif style == "v":
+        if num_stages % pp_size:
+            raise ValueError(
+                "num_stages must be divisible by pp_size for v-style mapping"
+            )
+        mapping = {}
+        rank = 0
+        for index in range(num_stages):
+            mapping[index] = rank
+            if (index + 1) % pp_size == 0:
+                continue
+            rank += 1 if (index // pp_size) % 2 == 0 else -1
+    else:
+        raise ValueError(f"unsupported pipeline style {style!r}")
+    if group_rank:
+        mapping = {stage: (rank + group_rank) % pp_size for stage, rank in mapping.items()}
+    return mapping
 
 
-def generate_rank_to_stage_mapping(num_stages: int, pp_group_size: int, group_rank: int = 0) -> dict[int, list[int]]:
-    mapping = generate_stage_to_rank_mapping(num_stages, pp_group_size, group_rank)
-    result: dict[int, list[int]] = {rank: [] for rank in range(pp_group_size)}
+def generate_rank_to_stage_mapping(
+    pp_size: int | None = None,
+    num_stages: int | None = None,
+    style: str | int = "loop",
+    *,
+    pp_group_size: int | None = None,
+    group_rank: int = 0,
+) -> dict[int, list[int]]:
+    legacy_call = isinstance(style, int) and not isinstance(style, bool)
+    mapping = generate_stage_to_rank_mapping(
+        pp_size,
+        num_stages,
+        style,
+        pp_group_size=pp_group_size,
+        group_rank=group_rank,
+    )
+    if legacy_call:
+        resolved_pp_size = num_stages
+    else:
+        resolved_pp_size = pp_group_size if pp_group_size is not None else pp_size
+    if resolved_pp_size is None:
+        raise TypeError("pp_size and num_stages are required")
+    result: dict[int, list[int]] = {rank: [] for rank in range(int(resolved_pp_size))}
     for stage, rank in mapping.items():
         result[rank].append(stage)
     return result
@@ -186,8 +360,25 @@ def extract_tensor_meta(value: Any) -> TensorMeta | None:
     return None
 
 
-def extract_tensor_metas(value: Any) -> Any:
-    return tree_unflatten([meta for item in tree_flatten(value)[0] for meta in [extract_tensor_meta(item)]], tree_flatten(value)[1])
+def extract_tensor_metas(value: Any, *, allow_none: bool = False) -> Any:
+    if value is None:
+        return None
+
+    def extract(value: Any) -> TensorMeta | None:
+        if value is None:
+            if allow_none:
+                return None
+            raise PipeliningMetadataError(
+                "None values are not allowed in tensor metadata"
+            )
+        meta = extract_tensor_meta(value)
+        if meta is None:
+            raise PipeliningMetadataError(
+                f"expected a tensor, got {type(value).__name__}"
+            )
+        return meta
+
+    return tree_map(extract, value)
 
 
 def to_local_if_dtensor(value: Any) -> Any:
@@ -202,33 +393,152 @@ def to_local_if_dtensor(value: Any) -> Any:
     return value
 
 
-def validate_and_normalize_to_tuple(value: Any, expected_len: int | None = None) -> tuple[Any, ...]:
-    result = value if isinstance(value, tuple) else (value,)
+def validate_and_normalize_to_tuple(
+    value: Any,
+    expected_len: int | None = None,
+    allow_none: bool = False,
+) -> tuple[Any, ...] | None:
+    if value is None:
+        return None
+    if isinstance(value, tp.Tensor):
+        result = (value,)
+    elif isinstance(value, (tuple, list)):
+        result = tuple(value)
+    else:
+        raise PipeliningMetadataError(
+            f"pipeline values must be tensors or a sequence of tensors, got {type(value).__name__}"
+        )
+    for index, item in enumerate(result):
+        if item is None and allow_none:
+            continue
+        if not isinstance(item, tp.Tensor):
+            raise PipeliningMetadataError(
+                f"pipeline value at index {index} is not a tensor"
+            )
     if expected_len is not None and len(result) != expected_len:
-        raise ValueError(f"expected {expected_len} values, got {len(result)}")
+        raise PipeliningMetadataError(
+            f"expected {expected_len} values, got {len(result)}"
+        )
     return result
 
 
-def validate_metadata(expected: TensorMeta | None, actual: Any, label: str = "tensor") -> None:
-    observed = extract_tensor_meta(actual)
+def validate_metadata(
+    expected_or_desc: TensorMeta | None | str,
+    actual_or_expected: Any,
+    label_or_actual: Any = "tensor",
+    *,
+    raise_on_mismatch: bool | None = None,
+    warn_on_mismatch: bool = False,
+) -> list[str]:
+    new_style = isinstance(expected_or_desc, str)
+    if new_style:
+        label = expected_or_desc
+        expected = actual_or_expected
+        actual = label_or_actual
+        if raise_on_mismatch is None:
+            raise_on_mismatch = False
+    else:
+        expected = expected_or_desc
+        actual = actual_or_expected
+        label = str(label_or_actual)
+        if raise_on_mismatch is None:
+            raise_on_mismatch = True
+
+    observed = actual if isinstance(actual, (_TensorMeta, _DTensorMeta)) else extract_tensor_meta(actual)
     if expected is None and observed is None:
-        return
+        return []
     if expected is None or observed is None:
-        raise PipeliningMetadataError(f"{label} metadata type mismatch")
-    differences = expected.get_diff(observed)
-    if differences:
+        differences = ["metadata type mismatch"]
+    elif type(expected) is not type(observed):
+        differences = [
+            f"metadata kind mismatch: {type(expected).__name__} vs {type(observed).__name__}"
+        ]
+    else:
+        differences = expected.get_diff(observed)
+    if differences and raise_on_mismatch:
         raise PipeliningMetadataError(f"{label}: {'; '.join(differences)}")
+    if differences and warn_on_mismatch:
+        warnings.warn(
+            f"{label}: {'; '.join(differences)}",
+            UserWarning,
+            stacklevel=2,
+        )
+    return differences
 
 
-def validate_tensors_metadata(label: str, expected: Iterable[TensorMeta | None], actual: Iterable[Any]) -> None:
+def validate_tensors_metadata(
+    label: str,
+    expected: Iterable[TensorMeta | None],
+    actual: Iterable[Any],
+    *,
+    raise_on_mismatch: bool = True,
+    warn_on_mismatch: bool = False,
+) -> list[str]:
     expected, actual = tuple(expected), tuple(actual)
     if len(expected) != len(actual):
-        raise PipeliningMetadataError(f"{label}: value count mismatch")
+        differences = [
+            f"value count mismatch: expected {len(expected)}, got {len(actual)}"
+        ]
+        if raise_on_mismatch:
+            raise PipeliningMetadataError(f"{label}: {differences[0]}")
+        if warn_on_mismatch:
+            warnings.warn(f"{label}: {differences[0]}", UserWarning, stacklevel=2)
+        return differences
+    differences: list[str] = []
     for index, (want, got) in enumerate(zip(expected, actual)):
-        validate_metadata(want, got, f"{label}[{index}]")
+        if want is None and got is None:
+            continue
+        if want is None or got is None:
+            differences.append(
+                f"{label}[{index}]: metadata type mismatch"
+            )
+            continue
+        differences.extend(
+            f"{label}[{index}]: {difference}"
+            for difference in validate_metadata(
+                f"{label}[{index}]",
+                want,
+                got,
+                raise_on_mismatch=False,
+            )
+        )
+    if differences and raise_on_mismatch:
+        raise PipeliningMetadataError("; ".join(differences))
+    if differences and warn_on_mismatch:
+        warnings.warn("; ".join(differences), UserWarning, stacklevel=2)
+    return differences
 
 
-def validate_static_arg_grad_correspondence(static_args: Any, requires_grad: Any) -> None:
-    static, flags = tree_flatten(static_args)[0], tree_flatten(requires_grad)[0]
-    if len(static) != len(flags):
-        raise PipeliningMetadataError("static argument metadata does not match gradients")
+def validate_static_arg_grad_correspondence(*args: Any) -> None:
+    if len(args) == 2:
+        static, flags = tree_flatten(args[0])[0], tree_flatten(args[1])[0]
+        if len(static) != len(flags):
+            raise PipeliningMetadataError(
+                "static argument metadata does not match gradients"
+            )
+        return
+    if len(args) != 4:
+        raise TypeError(
+            "expected (static_args, requires_grad) or "
+            "(stage_index, args, grads, is_input)"
+        )
+    stage_index, forward_args, grads, is_input = args
+    forward_args = validate_and_normalize_to_tuple(forward_args)
+    grads = validate_and_normalize_to_tuple(grads, allow_none=True)
+    if forward_args is None or grads is None:
+        raise PipeliningMetadataError("argument and gradient sequences are required")
+    kind = "input" if is_input else "output"
+    if len(forward_args) != len(grads):
+        raise PipeliningMetadataError(
+            f"stage {stage_index} {kind} argument and gradient counts differ"
+        )
+    for index, (value, gradient) in enumerate(zip(forward_args, grads)):
+        if not value.requires_grad and gradient is not None:
+            raise PipeliningMetadataError(
+                f"stage {stage_index} {kind} argument {index} has no gradient but a gradient value was supplied"
+            )
+        if value.requires_grad and gradient is not None:
+            if isinstance(value, DTensor) != isinstance(gradient, DTensor):
+                raise PipeliningMetadataError(
+                    f"stage {stage_index} {kind} argument {index} and gradient use different tensor kinds"
+                )

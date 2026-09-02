@@ -46,13 +46,43 @@ py::object PythonRpcHandler::run_function(py::handle udf) {
 SerializedPyObj PythonRpcHandler::serialize(py::handle value) {
     initialize();
     py::gil_scoped_acquire gil;
-    const py::tuple result = serialize_(value).cast<py::tuple>();
-    if (result.size() != 2) {
+    py::object encoded = serialize_(value);
+    if (!PyTuple_Check(encoded.ptr()) && !PyList_Check(encoded.ptr())) {
         throw std::runtime_error("RPC serializer returned an invalid result");
     }
-    return SerializedPyObj(
-        result[0].cast<std::string>(),
-        result[1].cast<std::vector<py::object>>());
+    const Py_ssize_t result_size = PySequence_Size(encoded.ptr());
+    if (result_size < 0) {
+        throw py::error_already_set();
+    }
+    if (result_size != 2) {
+        throw std::runtime_error("RPC serializer returned an invalid result");
+    }
+    py::object payload = py::reinterpret_steal<py::object>(
+        PySequence_GetItem(encoded.ptr(), 0));
+    py::object tensor_values = py::reinterpret_steal<py::object>(
+        PySequence_GetItem(encoded.ptr(), 1));
+    if (!payload || !tensor_values) {
+        throw py::error_already_set();
+    }
+    if (!PyList_Check(tensor_values.ptr()) &&
+        !PyTuple_Check(tensor_values.ptr())) {
+        throw std::runtime_error("RPC serializer returned invalid tensors");
+    }
+    const Py_ssize_t tensor_count = PySequence_Size(tensor_values.ptr());
+    if (tensor_count < 0) {
+        throw py::error_already_set();
+    }
+    std::vector<py::object> tensors;
+    tensors.reserve(static_cast<size_t>(tensor_count));
+    for (Py_ssize_t index = 0; index < tensor_count; ++index) {
+        py::object tensor = py::reinterpret_steal<py::object>(
+            PySequence_GetItem(tensor_values.ptr(), index));
+        if (!tensor) {
+            throw py::error_already_set();
+        }
+        tensors.emplace_back(std::move(tensor));
+    }
+    return SerializedPyObj(payload.cast<std::string>(), std::move(tensors));
 }
 
 py::object PythonRpcHandler::deserialize(const SerializedPyObj& value) {

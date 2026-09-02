@@ -7,13 +7,13 @@ from typing import Any, Sequence
 from .._api import DTensor
 from .._dtensor_spec import DTensorSpec
 from ..placement_types import Replicate, Shard
-from .utils import normalize_dim
+from .utils import _is_tensor_like, normalize_dim
 
 __all__ = ["cat_single_dim_strategy", "create_like_single_dim_strategy", "propagate_single_input_single_dim_strategy", "stack_strategy"]
 
 
-def _values(schema: Any) -> list[DTensor]:
-    return [value for value in getattr(schema, "args", schema) if isinstance(value, DTensor)]
+def _values(schema: Any) -> list[DTensor | DTensorSpec]:
+    return [value for value in getattr(schema, "args", schema) if _is_tensor_like(value)]
 
 
 def propagate_single_input_single_dim_strategy(op_schema: Any, *args: Any, **kwargs: Any) -> Any:

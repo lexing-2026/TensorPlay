@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
+#include <limits>
 #include <stdexcept>
 
 namespace tensorplay::distributed::rpc {
@@ -86,8 +88,16 @@ std::vector<WorkerInfo> collect_worker_infos(
 }
 
 std::chrono::milliseconds timeout_to_duration(double seconds) {
+    if (!std::isfinite(seconds)) {
+        throw std::invalid_argument(
+            "timeout must be finite");
+    }
     if (seconds < 0.0) {
         return std::chrono::milliseconds(-1);
+    }
+    if (seconds >
+        static_cast<double>(std::numeric_limits<int64_t>::max()) / 1000.0) {
+        throw std::overflow_error("timeout exceeds the duration range");
     }
     const auto milliseconds = static_cast<int64_t>(seconds * 1000.0);
     return std::chrono::milliseconds(std::max<int64_t>(0, milliseconds));

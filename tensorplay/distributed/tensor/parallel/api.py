@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from fnmatch import fnmatch
+import warnings
 from typing import Any
 
 from .._api import _current_mesh
@@ -35,7 +36,11 @@ def parallelize_module(
         tokens = path.split(".")
         matched = [(name, child) for name, child in module.named_children() if fnmatch(name, tokens[0])]
         if not matched:
-            raise ValueError(f"parallelize plan path {path!r} does not match a child module")
+            warnings.warn(
+                f"parallelize plan path {path!r} does not match a child module; skipping",
+                stacklevel=2,
+            )
+            continue
         tail = ".".join(tokens[1:])
         for _, child in matched:
             parallelize_module(child, mesh, {tail: style} if tail else style, src_data_rank=src_data_rank)

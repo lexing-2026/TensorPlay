@@ -51,16 +51,15 @@ class _FunctionalSGD:
         """Similar to self.step, but operates on a single parameter and
         its gradient.
         """
-        params_with_grad = []
-        grads = []
-        momentum_buffer_list: list[Tensor | None] = []
-        if grad is not None:
-            params_with_grad.append(param)
-            grads.append(grad)
-            if self.defaults["momentum"] != 0:
-                if param not in self.state:
-                    self.state[param] = {"momentum_buffer": None}
-                momentum_buffer_list.append(self.state[param]["momentum_buffer"])
+        if grad is None:
+            return
+        params_with_grad = [param]
+        grads = [grad]
+        momentum_buffer_list: list[Tensor | None] = [None]
+        if self.defaults["momentum"] != 0:
+            if param not in self.state:
+                self.state[param] = {}
+            momentum_buffer_list[0] = self.state[param].get("momentum_buffer")
 
         with tp.no_grad():
             F.sgd(
@@ -73,7 +72,7 @@ class _FunctionalSGD:
                 dampening=self.defaults["dampening"],
                 nesterov=self.nesterov,
                 maximize=self.maximize,
-                has_sparse_grad=False,
+                has_sparse_grad=bool(grad.is_sparse),
                 foreach=self.foreach,
                 fused=self.fused,
                 grad_scale=None,
@@ -115,10 +114,7 @@ class _FunctionalSGD:
                     self.state[param] = {}
 
                 state = self.state[param]
-                if "momentum_buffer" not in state:
-                    momentum_buffer_list.append(None)
-                else:
-                    momentum_buffer_list.append(state["momentum_buffer"])
+                momentum_buffer_list.append(state.get("momentum_buffer"))
 
         with tp.no_grad():
             F.sgd(
@@ -138,11 +134,8 @@ class _FunctionalSGD:
                 found_inf=None,
             )
 
-        # update momentum_buffers in state
-        for i, p in enumerate(params_with_grad):
-            state = self.state[p]
-            state["momentum_buffer"] = momentum_buffer_list[i]
-
-
-def _test_sgd():
-    pass
+        if momentum != 0:
+            for i, p in enumerate(params_with_grad):
+                momentum_buffer = momentum_buffer_list[i]
+                if momentum_buffer is not None:
+                    self.state[p]["momentum_buffer"] = momentum_buffer

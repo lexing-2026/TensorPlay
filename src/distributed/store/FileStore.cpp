@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <limits>
 
 #include "Exception.h"
 
@@ -27,9 +28,26 @@ void writeAll(int fd, const void* buf, size_t len) {
   size_t written = 0;
   while (written < len) {
     ssize_t n = ::write(fd, bytes + written, len - written);
-    TP_CHECK(n >= 0, "FileStore: write failed");
+    TP_CHECK(n > 0, "FileStore: write failed");
     written += static_cast<size_t>(n);
   }
+}
+
+uint32_t wireLength(size_t length, const char* field) {
+  TP_CHECK(
+      length <= std::numeric_limits<uint32_t>::max(),
+      "FileStore: ",
+      field,
+      " is too large");
+  return static_cast<uint32_t>(length);
+}
+
+int64_t checkedAdd(int64_t left, int64_t right) {
+  if ((right > 0 && left > std::numeric_limits<int64_t>::max() - right) ||
+      (right < 0 && left < std::numeric_limits<int64_t>::min() - right)) {
+    TP_THROW(RuntimeError, "FileStore: counter overflow");
+  }
+  return left + right;
 }
 
 // Reads the whole file into memory under the shared lock, then decodes the
@@ -45,7 +63,7 @@ FileStore::Snapshot decodeLog(const std::string& path) {
                    std::istreambuf_iterator<char>());
   size_t offset = 0;
   auto readU32 = [&](uint32_t* out) {
-    if (offset + sizeof(uint32_t) > blob.size()) {
+    if (offset > blob.size() || blob.size() - offset < sizeof(uint32_t)) {
       return false;
     }
     std::memcpy(out, blob.data() + offset, sizeof(uint32_t));
@@ -55,17 +73,16 @@ FileStore::Snapshot decodeLog(const std::string& path) {
   while (offset < blob.size()) {
     uint32_t keyLen = 0;
     uint32_t valLen = 0;
-    if (!readU32(&keyLen) || offset + keyLen > blob.size()) {
+    if (!readU32(&keyLen) || keyLen > blob.size() - offset) {
       break;
     }
     std::string key(blob.data() + offset, keyLen);
     offset += keyLen;
-    if (!readU32(&valLen) || offset + valLen > blob.size()) {
+    if (!readU32(&valLen) || valLen > blob.size() - offset) {
       break;
     }
     std::vector<uint8_t> value(
-        blob.begin() + static_cast<long>(offset),
-        blob.begin() + static_cast<long>(offset + valLen));
+        blob.begin() + offset, blob.begin() + offset + valLen);
     offset += valLen;
     if (offset < blob.size() && blob[offset] == '\n') {
       offset += 1;
@@ -83,8 +100,9 @@ FileStore::Snapshot decodeLog(const std::string& path) {
 
 FileStore::FileStore(std::string path, std::chrono::milliseconds timeout)
     : Store(timeout), path_(std::move(path)) {
-  const auto parent = path_.substr(0, path_.find_last_of('/'));
-  if (!parent.empty()) {
+  const auto separator = path_.find_last_of('/');
+  if (separator != std::string::npos && separator > 0) {
+    const auto parent = path_.substr(0, separator);
     ::mkdir(parent.c_str(), 0755);
   }
   // Create eagerly so all ranks agree on the path before rendezvous.
@@ -103,8 +121,8 @@ void FileStore::set(
   int fd = ::open(path_.c_str(), O_WRONLY | O_APPEND | O_CLOEXEC);
   TP_CHECK(fd >= 0, "FileStore: cannot open for append");
   ::flock(fd, LOCK_EX);
-  const uint32_t keyLen = static_cast<uint32_t>(key.size());
-  const uint32_t valLen = static_cast<uint32_t>(value.size());
+  const uint32_t keyLen = wireLength(key.size(), "key");
+  const uint32_t valLen = wireLength(value.size(), "value");
   writeAll(fd, &keyLen, sizeof(keyLen));
   writeAll(fd, key.data(), key.size());
   writeAll(fd, &valLen, sizeof(valLen));
@@ -126,8 +144,8 @@ std::vector<uint8_t> FileStore::compareSet(
   std::vector<uint8_t> current =
       it == snapshot.latest.end() ? std::vector<uint8_t>{} : it->second;
   if (current == expectedValue) {
-    const uint32_t keyLen = static_cast<uint32_t>(key.size());
-    const uint32_t valLen = static_cast<uint32_t>(desiredValue.size());
+    const uint32_t keyLen = wireLength(key.size(), "key");
+    const uint32_t valLen = wireLength(desiredValue.size(), "value");
     ::lseek(fd, 0, SEEK_END);
     writeAll(fd, &keyLen, sizeof(keyLen));
     writeAll(fd, key.data(), key.size());
@@ -166,11 +184,11 @@ int64_t FileStore::add(const std::string& key, int64_t value) {
       current = 0;
     }
   }
-  const int64_t updated = current + value;
+  const int64_t updated = checkedAdd(current, value);
   const std::string text = std::to_string(updated);
   const std::vector<uint8_t> bytes(text.begin(), text.end());
-  const uint32_t keyLen = static_cast<uint32_t>(key.size());
-  const uint32_t valLen = static_cast<uint32_t>(bytes.size());
+  const uint32_t keyLen = wireLength(key.size(), "key");
+  const uint32_t valLen = wireLength(bytes.size(), "value");
   ::lseek(fd, 0, SEEK_END);
   writeAll(fd, &keyLen, sizeof(keyLen));
   writeAll(fd, key.data(), key.size());
@@ -189,8 +207,8 @@ bool FileStore::deleteKey(const std::string& key) {
   Snapshot snapshot = decodeLog(path_);
   const bool existed = snapshot.latest.count(key) > 0;
   if (existed) {
-    const uint32_t keyLen = static_cast<uint32_t>(key.size());
-    const uint32_t valLen = static_cast<uint32_t>(kTombstone.size());
+    const uint32_t keyLen = wireLength(key.size(), "key");
+    const uint32_t valLen = wireLength(kTombstone.size(), "value");
     ::lseek(fd, 0, SEEK_END);
     writeAll(fd, &keyLen, sizeof(keyLen));
     writeAll(fd, key.data(), key.size());
