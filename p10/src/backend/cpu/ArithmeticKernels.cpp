@@ -2,6 +2,7 @@
 #include "SparseKernels.h"
 #include "Dispatcher.h"
 #include "Scalar.h"
+#include "OpMathType.h"
 #include "TypePromotion.h"
 #include "TensorIterator.h"
 #include "TensorIteratorOps.h"
@@ -414,6 +415,27 @@ inline void bf16_scalar_contiguous(int code, const BFloat16* a, BFloat16* y,
 #endif  // __x86_64__
 
 // --- Helper for Binary Ops ---
+
+// Scalar-division element step. Arithmetic happens in the compute domain
+// (opmath) so Half/BFloat16 inputs divide in float, and complex values over
+// non-floating element types divide in a float complex domain; the standard
+// complex templates require a real floating-point value_type and would
+// otherwise reject the Half/BFloat16 instantiations outright.
+template <typename ctype>
+ctype div_scalar_element(ctype a, const Scalar& other) {
+    if constexpr (is_complex_type_v<ctype>) {
+        using math_t = opmath_type<ctype>;
+        const math_t am(static_cast<float>(a.real()), static_cast<float>(a.imag()));
+        const math_t bm = other.to<math_t>();
+        const math_t rm = am / bm;
+        return ctype(static_cast<typename ctype::value_type>(rm.real()),
+                     static_cast<typename ctype::value_type>(rm.imag()));
+    } else {
+        using math_t = opmath_type<ctype>;
+        return static_cast<ctype>(static_cast<math_t>(a) /
+                                  static_cast<math_t>(other.to<ctype>()));
+    }
+}
 
 template<typename Op, typename MklOp>
 Tensor binary_op_kernel_impl(const Tensor& self, const Tensor& other, Op op, MklOp mkl_op, bool use_mkl_op = false, bool force_float = false) {
@@ -1566,10 +1588,19 @@ Tensor div_kernel(const Tensor& self, const Tensor& other) {
     }
 #endif
 
-    auto op = [](auto a, auto b) { 
+    auto op = [](auto a, auto b) {
         using T = std::decay_t<decltype(a)>;
         if constexpr (std::is_same_v<T, bool>) return static_cast<float>(a) / static_cast<float>(b);
-        else return a / b;
+        else if constexpr (is_complex_type_v<T>) {
+            // Half/BFloat16 element types do not model a floating-point
+            // type; route the complex cases through float math.
+            using F = std::complex<float>;
+            const F af(static_cast<float>(a.real()), static_cast<float>(a.imag()));
+            const F bf(static_cast<float>(b.real()), static_cast<float>(b.imag()));
+            const F rf = af / bf;
+            return T(static_cast<typename T::value_type>(rf.real()),
+                     static_cast<typename T::value_type>(rf.imag()));
+        } else return a / b;
     };
     auto mkl_op = [](int n, float* a, float* b, float* y) {
         #ifdef USE_MKL
@@ -2563,10 +2594,14 @@ Tensor div_scalar_kernel(const Tensor& self, Scalar other) {
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), result_dtype, self.device());
     Tensor self_casted = (self.dtype() == result_dtype) ? self : self.to(result_dtype);
 
+    // Half/BFloat16 element types do not model a floating-point type, so the
+    // division runs in a float complex domain. The template makes the branch
+    // dependent; a lambda inside the switch would still semantically check
+    // the dead branch for every element type the macro expands.
     #define OP_CASE(ctype, name) \
     case DType::name: { \
         auto op = [other](ctype a) -> ctype { \
-            return static_cast<ctype>(a / other.to<ctype>()); \
+            return div_scalar_element(a, other); \
         }; \
         apply_unary_op_recursive<ctype>(result.data_ptr<ctype>(), result.strides(), \
                                        self_casted, self_casted.strides(), \
@@ -2716,7 +2751,7 @@ Tensor& div_scalar_inplace_kernel(Tensor& self, Scalar other) {
     #define OP_CASE(ctype, name) \
     case DType::name: { \
         auto op = [other](ctype a) -> ctype { \
-            return static_cast<ctype>(a / other.to<ctype>()); \
+            return div_scalar_element(a, other); \
         }; \
         apply_unary_op_recursive<ctype>(self.data_ptr<ctype>(), self.strides(), \
                                        self, self.strides(), \
