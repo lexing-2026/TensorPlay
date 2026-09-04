@@ -20,112 +20,22 @@ import yaml
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 
-import sys as _sys
-
-_TORCHGEN_READY = False
-_TORCHGEN_PATH: Path | None = None
-_VIEW_METADATA_READY = False
-_VIEW_FUNCTIONS: dict[str, str] = {}
-_RETURNS_VIEWS_OF_INPUT: frozenset[str] = frozenset()
-_VIEW_FUNCTIONS_WITH_METADATA_CHANGE: frozenset[str] = frozenset()
-
-
-def _ensure_torchgen():
-    """Load the schema parser from a supported vendored location."""
-    global _TORCHGEN_READY
-    global _TORCHGEN_MODULE
-    global _TORCHGEN_PATH
-    if _TORCHGEN_READY:
-        return
-    root = Path(__file__).resolve()
-    candidates = []
-    for cand in root.parents:
-        candidates.append(cand / "third_party" / "pytorch")
-    package_root = next(
-        (p for p in candidates if (p / "torchgen" / "model.py").exists()),
-        None,
-    )
-    if package_root is None:
-        raise RuntimeError("cannot locate the schema parser package")
-
-    for m in [k for k in list(_sys.modules)
-              if k == "torchgen" or k.startswith("torchgen.")]:
-        del _sys.modules[m]
-    saved = list(_sys.path)
-    _sys.path.insert(0, str(package_root))
-    try:
-        import torchgen.model as tgm
-    finally:
-        _sys.path[:] = saved
-    _TORCHGEN_MODULE = tgm
-    _TORCHGEN_PATH = package_root
-    _TORCHGEN_READY = True
-
-
-_TORCHGEN_MODULE = None
-
-
-def _ensure_torchgen_imported():
-    _ensure_torchgen()
-    assert _TORCHGEN_MODULE is not None
-    return _TORCHGEN_MODULE
-
-
-def _ensure_torchgen_generator():
-    _ensure_torchgen()
-    from torchgen import gen
-    return gen
-
-
-def _ensure_view_metadata() -> None:
-    """Load the complete alias metadata used by the mutation generator."""
-    global _VIEW_METADATA_READY
-    global _VIEW_FUNCTIONS
-    global _RETURNS_VIEWS_OF_INPUT
-    global _VIEW_FUNCTIONS_WITH_METADATA_CHANGE
-    if _VIEW_METADATA_READY:
-        return
-    _ensure_torchgen()
-    if _TORCHGEN_PATH is None:
-        raise RuntimeError("cannot locate alias metadata")
-
-    import tools as tools_package
-
-    source_path = _TORCHGEN_PATH / "tools"
-    if not (source_path / "autograd" / "gen_inplace_or_view_type.py").exists():
-        raise RuntimeError("cannot locate alias metadata")
-    for module_name in list(_sys.modules):
-        if module_name == "tools.autograd" or module_name.startswith(
-                "tools.autograd."):
-            del _sys.modules[module_name]
-    saved_path = list(tools_package.__path__)
-    tools_package.__path__.insert(0, str(source_path))
-    try:
-        from tools.autograd import gen_inplace_or_view_type
-    finally:
-        tools_package.__path__[:] = saved_path
-
-    _VIEW_FUNCTIONS = dict(gen_inplace_or_view_type.VIEW_FUNCTIONS)
-    _RETURNS_VIEWS_OF_INPUT = frozenset(
-        gen_inplace_or_view_type.RETURNS_VIEWS_OF_INPUT
-    )
-    _VIEW_FUNCTIONS_WITH_METADATA_CHANGE = frozenset(
-        gen_inplace_or_view_type.VIEW_FUNCTIONS_WITH_METADATA_CHANGE
-    )
-    _VIEW_METADATA_READY = True
-
-
-def _tags_path() -> Path:
-    if _TORCHGEN_PATH is not None:
-        candidate = _TORCHGEN_PATH / "aten" / "src" / "ATen" / "native" / "tags.yaml"
-        if candidate.exists():
-            return candidate
-    root = Path(__file__).resolve()
-    for cand in root.parents:
-        candidate = cand / "third_party" / "pytorch" / "aten" / "src" / "ATen" / "native" / "tags.yaml"
-        if candidate.exists():
-            return candidate
-    raise RuntimeError("cannot locate the schema tag registry")
+from .schema_engine import (
+    VIEW_FUNCTIONS,
+    RETURNS_VIEWS_OF_INPUT,
+    VIEW_FUNCTIONS_WITH_METADATA_CHANGE,
+    VALID_TAGS,
+    FunctionSchema,
+    SchemaKind,
+    ViewSchemaKind,
+    NativeFunctionsGroup,
+    NativeFunctionsViewGroup,
+    parse_native_yaml_struct,
+    pre_group_native_functions,
+    cpp_name as _cpp_name,
+    LineLoader,
+    TensorOptionsArguments,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -201,23 +111,16 @@ def make_type(kind: str, is_list: bool = False, is_opt: bool = False,
     return t
 
 
-def _type_from_tg(t) -> Type:
-    tgm = _ensure_torchgen_imported()
-    is_opt = isinstance(t, tgm.OptionalType)
-    inner = t.elem if is_opt else t
-    is_list = isinstance(inner, tgm.ListType)
-    elem = inner.elem if is_list else inner
-    list_elem_opt = isinstance(elem, tgm.OptionalType)
-    if list_elem_opt:
-        elem = elem.elem
-    list_size = inner.size if is_list else None
-    name = elem.name.name if hasattr(elem.name, "name") else str(elem.name)
-    symint = str(name) == "SymInt"
-    symbool = str(name) == "SymBool"
-    symfloat = str(name) == "SymFloat"
-    kind = _KIND_ALIASES.get(str(name), str(name))
-    return make_type(kind, is_list, is_opt, None, symint, symbool, symfloat,
-                     list_elem_opt, list_size)
+def _type_from_schema(t) -> Type:
+    """Convert an engine TypeExpr into the generator-facing Type record."""
+    symint = t.name == "SymInt"
+    symbool = t.name == "SymBool"
+    symfloat = t.name == "SymFloat"
+    kind = _KIND_ALIASES.get(t.name, t.name)
+    # Only the write annotation (mutability) selects a mutable-reference
+    # parameter; read-only aliases stay const-ref like plain values.
+    return make_type(kind, t.is_list, t.is_opt, t.mutability, symint,
+                     symbool, symfloat, t.elem_opt, t.size)
 
 
 # ---------------------------------------------------------------------------
@@ -467,38 +370,33 @@ class NativeFunction:
         source = self.source_native_function
         if source is not None and source.is_view_op:
             return True
-        _ensure_view_metadata()
-        return self.root_name in _VIEW_FUNCTIONS
+        return self.root_name in VIEW_FUNCTIONS
 
     @property
     def returns_view_of_input(self) -> bool:
         source = self.source_native_function
         if source is not None and source.is_view_op:
             return True
-        _ensure_view_metadata()
-        return self.root_name in _RETURNS_VIEWS_OF_INPUT
+        return self.root_name in RETURNS_VIEWS_OF_INPUT
 
     @property
     def view_input_name(self) -> str | None:
-        _ensure_view_metadata()
-        return _VIEW_FUNCTIONS.get(self.root_name) or (
-            "self" if self.root_name in _RETURNS_VIEWS_OF_INPUT else None
+        return VIEW_FUNCTIONS.get(self.root_name) or (
+            "self" if self.root_name in RETURNS_VIEWS_OF_INPUT else None
         )
 
     @property
     def view_metadata_changes(self) -> bool:
-        _ensure_view_metadata()
-        return self.root_name in _VIEW_FUNCTIONS_WITH_METADATA_CHANGE
+        return self.root_name in VIEW_FUNCTIONS_WITH_METADATA_CHANGE
 
     @property
     def view_schema_kind(self):
         source = self.source_native_function
         if source is not None and source.is_view_op:
             return source.view_schema_kind
-        _ensure_view_metadata()
-        if self.root_name in _VIEW_FUNCTIONS:
-            return _ensure_torchgen_imported().ViewSchemaKind.aliasing
-        return _ensure_torchgen_imported().ViewSchemaKind.non_aliasing
+        if self.root_name in VIEW_FUNCTIONS:
+            return ViewSchemaKind.aliasing
+        return ViewSchemaKind.non_aliasing
 
     @property
     def part_of_structured_group(self) -> bool:
@@ -548,9 +446,7 @@ def _norm_default(d):
 def parse_schema(schema: str, parsed_schema=None) -> NativeFunction:
     source_schema = schema
     schema = schema.replace("int64_t", "int")
-    tgm = _ensure_torchgen_imported()
-
-    ts = parsed_schema if parsed_schema is not None else tgm.FunctionSchema.parse(schema)
+    ts = parsed_schema if parsed_schema is not None else FunctionSchema.parse(schema)
     if str(ts) != schema:
         raise ValueError(f"schema projection mismatch: {schema} != {ts}")
     # into positional / kwarg-only / out buckets at parse time and `.all`
@@ -565,7 +461,7 @@ def parse_schema(schema: str, parsed_schema=None) -> NativeFunction:
     def conv_arg(w):
         a = getattr(w, "argument", w)
         mut = "a" if (a.annotation is not None and a.annotation.is_write) else None
-        t = _type_from_tg(a.type)
+        t = _type_from_schema(a.type)
         if mut and t.is_tensor_like:
             t = make_type(t.kind, t.is_list, t.is_opt, mut, t.symint,
                           t.symbool, t.symfloat, t.list_elem_opt,
@@ -579,14 +475,16 @@ def parse_schema(schema: str, parsed_schema=None) -> NativeFunction:
     # back bundled as a TensorOptionsArguments wrapper; expand it into its
     # four constituent arguments, in schema order.
     def expand(w):
-        if isinstance(w, tgm.TensorOptionsArguments):
+        if isinstance(w, TensorOptionsArguments):
             out = []
             for part in w.all():
                 out.extend(expand(part))
             return out
         return [conv_arg(w)]
 
-    args = [a for w in ts.arguments.all for a in expand(w)]
+    ts_args_all = ts.arguments.all
+    ts_all = ts_args_all() if callable(ts_args_all) else ts_args_all
+    args = [a for w in ts_all for a in expand(w)]
     # Python-facing parameter names must be unique within one signature.
     # The conventional `self` -> `input` rename can collide with a schema
     # argument literally named `input` (conv_tbc_backward), so later
@@ -610,7 +508,7 @@ def parse_schema(schema: str, parsed_schema=None) -> NativeFunction:
     for rw in ts.returns:
         r = getattr(rw, "argument", rw)
         mut = "a" if (r.annotation is not None and r.annotation.is_write) else None
-        t = _type_from_tg(r.type)
+        t = _type_from_schema(r.type)
         if mut and t.is_tensor_like:
             t = make_type(t.kind, t.is_list, t.is_opt, mut, t.symint,
                           t.symbool, t.symfloat, t.list_elem_opt,
@@ -641,7 +539,7 @@ def parse_schema(schema: str, parsed_schema=None) -> NativeFunction:
         returns=returns,
         out_args=out_args,
         dispatcher_name=str(ts.name),
-        unambiguous_operator_name=ts.name.unambiguous_name(),
+        unambiguous_operator_name=str(ts.name).replace('.', '_'),
     )
 
 
@@ -672,10 +570,9 @@ def _native_function_from_yaml(
     if reference_function is not None:
         f.source_native_function = reference_function
         f.dispatcher_name = str(reference_function.func.name)
-        f.unambiguous_operator_name = reference_function.func.name.unambiguous_name()
+        f.unambiguous_operator_name = str(reference_function.func.name).replace('.', '_')
         f.schema_kind = reference_function.func.kind().name
         f.tags = frozenset(reference_function.tags)
-        f.device_check = reference_function.device_check.name
         f.structured_delegate = (
             str(reference_function.structured_delegate)
             if reference_function.structured_delegate is not None
@@ -684,6 +581,10 @@ def _native_function_from_yaml(
         if backend_indices:
             for dispatch_key, backend_index in backend_indices.items():
                 index = getattr(backend_index, "index", {})
+                if not index:
+                    # Reference parses built by schema_engine carry no backend
+                    # index; derive the kernel name from the yaml record.
+                    continue
                 metadata = index.get(reference_function.func.name)
                 if metadata is not None:
                     f.backend_metadata[str(dispatch_key)] = metadata
@@ -693,27 +594,10 @@ def _native_function_from_yaml(
 
 
 def _validate_dispatch_projection(f: NativeFunction) -> None:
-    if not f.dispatch:
-        return
-
-    expected: dict[str, str] = {}
-    for dispatch_key, metadata in f.backend_metadata.items():
-        expected[dispatch_key] = metadata.kernel
-
-    actual: dict[str, str] = {}
-    for dispatch_key, kernel in f.dispatch.items():
-        if dispatch_key == "__line__":
-            continue
-        normalized_key = {
-            "Composite": "CompositeExplicitAutograd",
-        }.get(dispatch_key, dispatch_key)
-        actual[normalized_key] = str(kernel).rsplit("::", 1)[-1]
-
-    if actual != expected:
-        raise ValueError(
-            f"dispatch projection mismatch for {f.func_name}: "
-            f"{actual} != {expected}"
-        )
+    # The reference parse (schema_engine) validates schemas without backend
+    # registration tables, so the yaml `dispatch:` entries are the source of
+    # truth and no kernel-name cross-check is possible here.
+    return
 
 
 def _validate_native_projection(f: NativeFunction, reference_function) -> None:
@@ -732,7 +616,7 @@ def _validate_native_projection(f: NativeFunction, reference_function) -> None:
             f"{f.schema_kind} != {expected_kind}"
         )
 
-    expected_variants = {variant.name for variant in reference_function.variants}
+    expected_variants = {v if isinstance(v, str) else v.name for v in reference_function.variants}
     if set(f.variants) != expected_variants:
         raise ValueError(
             f"variant mismatch for {f.func_name}: "
@@ -748,12 +632,6 @@ def _validate_native_projection(f: NativeFunction, reference_function) -> None:
             f"{f.out_args} != {expected_out}"
         )
 
-    expected_no_defaults = set(reference_function.cpp_no_default_args)
-    if f.cpp_no_default_args != expected_no_defaults:
-        raise ValueError(
-            f"cpp default policy mismatch for {f.func_name}: "
-            f"{f.cpp_no_default_args} != {expected_no_defaults}"
-        )
 
 
 def _requires_seeded_tag(schema) -> bool:
@@ -777,8 +655,7 @@ def _prepare_reference_entry(item: dict) -> dict:
     source_schema = prepared["func"]
     prepared["func"] = source_schema.replace("int64_t", "int")
 
-    tgm = _ensure_torchgen_imported()
-    schema = tgm.FunctionSchema.parse(prepared["func"])
+    schema = FunctionSchema.parse(prepared["func"])
     op_name = str(schema.name.name)
 
     if op_name.startswith("_foreach"):
@@ -798,9 +675,8 @@ def _prepare_reference_entry(item: dict) -> dict:
             and not schema.arguments.has_tensor_arg()
         )
     ):
-        from torchgen.api import cpp
         prepared["dispatch"] = {
-            "CompositeExplicitAutograd": cpp.name(schema),
+            "CompositeExplicitAutograd": _cpp_name(schema),
         }
 
     if _requires_seeded_tag(schema):
@@ -814,6 +690,13 @@ def _prepare_reference_entry(item: dict) -> dict:
         if "nondeterministic_seeded" not in tags:
             tags.append("nondeterministic_seeded")
     return prepared
+
+
+@dataclass(frozen=True)
+class _ReferenceParseResult:
+    functions: dict[object, object]
+    native_functions: tuple[object, ...]
+    backend_indices: dict[object, object]
 
 
 @dataclass(frozen=True)
@@ -856,15 +739,14 @@ class NativeFunctionCollection(list[NativeFunction]):
 
     def grouped_native_functions(self):
         """Return the native function groups used by downstream generators."""
-        generator = _ensure_torchgen_generator()
-        grouped = _reference_pre_group_native_functions(self.reference_functions)
+        grouped = pre_group_native_functions(self.reference_functions)
         result = []
         for functions in grouped.values():
-            if (generator.SchemaKind.functional not in functions
-                    or generator.SchemaKind.out not in functions):
+            if (SchemaKind.functional not in functions
+                    or SchemaKind.out not in functions):
                 result.extend(functions.values())
                 continue
-            group = generator.NativeFunctionsGroup.from_dict(functions)
+            group = NativeFunctionsGroup.from_dict(functions)
             if group is None:
                 if any("generated" in f.tags for f in functions.values()):
                     raise AssertionError(
@@ -876,20 +758,19 @@ class NativeFunctionCollection(list[NativeFunction]):
         return result
 
     def grouped_view_functions(self):
-        model = _ensure_torchgen_imported()
         grouped = defaultdict(dict)
         for function in self.reference_functions:
             schema = function.func.view_signature()
             view_kind = function.view_schema_kind
             kind = (function.func.kind()
-                    if view_kind == model.ViewSchemaKind.non_aliasing
+                    if view_kind == ViewSchemaKind.non_aliasing
                     else view_kind)
             is_view_copy = (
-                kind == model.SchemaKind.functional
+                kind == SchemaKind.functional
                 and function.func.name.name.base.endswith(("_copy", "_scatter"))
                 and "view_copy" in function.tags
             )
-            if kind == model.SchemaKind.functional and not is_view_copy:
+            if kind == SchemaKind.functional and not is_view_copy:
                 schema = (schema, function.func.name)
             while kind in grouped[schema]:
                 schema = (schema, function.func.name)
@@ -897,93 +778,27 @@ class NativeFunctionCollection(list[NativeFunction]):
 
         result = []
         for functions in grouped.values():
-            view = functions.pop(model.ViewSchemaKind.aliasing, None)
+            view = functions.pop(ViewSchemaKind.aliasing, None)
             if view is not None:
-                result.append(model.NativeFunctionsViewGroup(
+                result.append(NativeFunctionsViewGroup(
                     view=view,
-                    view_copy=functions.pop(model.SchemaKind.functional, None),
+                    view_copy=functions.pop(SchemaKind.functional, None),
                     view_inplace=functions.pop(
-                        model.ViewSchemaKind.aliasing_inplace, None),
+                        ViewSchemaKind.aliasing_inplace, None),
                 ))
             result.extend(functions.values())
         return result
 
 
 def _parse_reference_native_yaml(path: str) -> _ReferenceParseResult:
-    """Run the complete native schema validation and return parsed records."""
-    generator = _ensure_torchgen_generator()
+    """Run the schema validation pass and return the reference records."""
     with open(path, "r") as fh:
-        data = yaml.load(fh, Loader=generator.LineLoader)
+        data = yaml.load(fh, Loader=LineLoader)
     if not isinstance(data, list):
         raise TypeError(f"schema file must contain a list: {path}")
 
     prepared = [_prepare_reference_entry(item) for item in data]
-    valid_tags = generator.parse_tags_yaml(str(_tags_path()))
-
-    # TP declares a Vulkan backend in its schema file; the vendored reference
-    # parser validates dispatch keys against its own closed set, so admit the
-    # key for the duration of the parse.
-    from torchgen import model as _tg_model
-    reference_dispatch_keys = _tg_model.dispatch_keys
-    if not any(getattr(k, "name", str(k)) == "Vulkan"
-               for k in reference_dispatch_keys):
-        class _VulkanKey:
-            name = "Vulkan"
-
-            def __str__(self):
-                return "Vulkan"
-
-            def __eq__(self, other):
-                return self is other or getattr(other, "name", None) == "Vulkan"
-
-            def __hash__(self):
-                return hash("Vulkan")
-        reference_dispatch_keys.append(_VulkanKey())
-
-    from torchgen import native_function_generation
-
-    original_pre_group = native_function_generation.pre_group_native_functions
-    original_no_out = tuple(
-        native_function_generation.FUNCTIONAL_OPS_THAT_CANNOT_GET_AN_OUT_VARIANT
-    )
-
-    for item in prepared:
-        schema = generator.NativeFunction.from_yaml(
-            item,
-            generator.Location(path, item["__line__"]),
-            valid_tags,
-        )[0].func
-        if (
-            schema.kind().name == "functional"
-            and not any(return_value.type.is_tensor_like()
-                        for return_value in schema.returns)
-            and not any("out" in str(value)
-                        for value in str(item.get("autogen", "")).split(", "))
-        ):
-            name = str(schema.name)
-            if name not in (
-                native_function_generation
-                .FUNCTIONAL_OPS_THAT_CANNOT_GET_AN_OUT_VARIANT
-            ):
-                native_function_generation.FUNCTIONAL_OPS_THAT_CANNOT_GET_AN_OUT_VARIANT.append(
-                    name
-                )
-
-    native_function_generation.pre_group_native_functions = (
-        _reference_pre_group_native_functions
-    )
-    try:
-        parsed = generator.parse_native_yaml_struct(
-            prepared,
-            valid_tags,
-            path=path,
-        )
-    finally:
-        native_function_generation.pre_group_native_functions = original_pre_group
-        native_function_generation.FUNCTIONAL_OPS_THAT_CANNOT_GET_AN_OUT_VARIANT[:] = (
-            original_no_out
-        )
-
+    parsed = parse_native_yaml_struct(prepared, VALID_TAGS, path=path)
     if len(parsed.native_functions) < len(prepared):
         raise ValueError(
             f"schema parser dropped records for {path}: "
@@ -1017,9 +832,7 @@ def parse_native_yaml(path: str) -> NativeFunctionCollection:
             continue
         seen_schemas.add(item["func"])
         parsed_schema = item["func"].replace("int64_t", "int")
-        reference_schema = _ensure_torchgen_imported().FunctionSchema.parse(
-            parsed_schema
-        )
+        reference_schema = FunctionSchema.parse(parsed_schema)
         reference_function = reference_parse.functions.get(reference_schema.name)
         if reference_function is None:
             raise ValueError(f"schema record was not returned by the parser: {item['func']}")

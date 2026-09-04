@@ -1004,7 +1004,7 @@ set(TP_BUILD_MISC OFF CACHE BOOL "" FORCE)
 set(TP_BUILD_BENCHMARK OFF CACHE BOOL "" FORCE)
 set(TP_STATIC_OR_SHARED STATIC CACHE STRING "" FORCE)
 add_subdirectory(
-    third_party/pytorch/third_party/tensorpipe
+    third_party/tensorpipe
     third_party/tensorpipe-build
     EXCLUDE_FROM_ALL)
 set_target_properties(tensorpipe PROPERTIES POSITION_INDEPENDENT_CODE ON)
