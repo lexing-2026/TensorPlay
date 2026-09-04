@@ -401,11 +401,54 @@ Tensor fractional_max_pool3d_backward_cuda(
     }
 }
 
+Tensor& interop_fractional_max_pool2d_output_cuda(const Tensor& self, const std::vector<int64_t>& kernel_size,
+              const std::vector<int64_t>& output_size, const Tensor& random_samples,
+              Tensor& output, Tensor& indices) {
+        std::tie(output, indices) = fractional_max_pool2d_cuda(
+            self, kernel_size, output_size, random_samples);
+        return output;
+    
+}
+
+Tensor& interop_fractional_max_pool2d_backward_grad_input_cuda(const Tensor& grad_output, const Tensor& self,
+              const std::vector<int64_t>& kernel_size,
+              const std::vector<int64_t>& output_size, const Tensor& indices,
+              Tensor& grad_input) {
+        grad_input = fractional_max_pool2d_backward_cuda(
+            grad_output, self, kernel_size, output_size, indices);
+        return grad_input;
+    
+}
+
+Tensor& interop_fractional_max_pool3d_output_cuda(const Tensor& self, const std::vector<int64_t>& kernel_size,
+              const std::vector<int64_t>& output_size, const Tensor& random_samples,
+              Tensor& output, Tensor& indices) {
+        std::tie(output, indices) = fractional_max_pool3d_cuda(
+            self, kernel_size, output_size, random_samples);
+        return output;
+    
+}
+
+Tensor& interop_fractional_max_pool3d_backward_grad_input_cuda(const Tensor& grad_output, const Tensor& self,
+              const std::vector<int64_t>& kernel_size,
+              const std::vector<int64_t>& output_size, const Tensor& indices,
+              Tensor& grad_input) {
+        grad_input = fractional_max_pool3d_backward_cuda(
+            grad_output, self, kernel_size, output_size, indices);
+        return grad_input;
+    
+}
+
 TENSORPLAY_LIBRARY_IMPL(CUDA, FractionalMaxPoolKernels) {
     m.impl("fractional_max_pool2d", fractional_max_pool2d_cuda);
     m.impl("fractional_max_pool2d_backward", fractional_max_pool2d_backward_cuda);
     m.impl("fractional_max_pool3d", fractional_max_pool3d_cuda);
     m.impl("fractional_max_pool3d_backward", fractional_max_pool3d_backward_cuda);
+
+    m.impl("fractional_max_pool2d.output", interop_fractional_max_pool2d_output_cuda);
+    m.impl("fractional_max_pool2d_backward.grad_input", interop_fractional_max_pool2d_backward_grad_input_cuda);
+    m.impl("fractional_max_pool3d.output", interop_fractional_max_pool3d_output_cuda);
+    m.impl("fractional_max_pool3d_backward.grad_input", interop_fractional_max_pool3d_backward_grad_input_cuda);
 }
 
 }  // namespace cuda

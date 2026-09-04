@@ -1158,6 +1158,30 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, OptimizerKernels) {
     m.impl("_foreach_add_.ScalarList", foreach_add_scalar_list_mta_inplace_cuda);
     m.impl("_foreach_add_.Tensor", foreach_add_tensor_inplace_cuda);
 
+    m.impl("_foreach_sub.Scalar", foreach_sub_scalar_mta_ret_cuda);
+    m.impl("_foreach_sub.List", foreach_sub_list_mta_ret_cuda);
+    m.impl("_foreach_sub.ScalarList", foreach_sub_scalar_list_mta_ret_cuda);
+    m.impl("_foreach_sub.Tensor", foreach_sub_tensor_cuda);
+    m.impl("_foreach_mul.Scalar", foreach_mul_scalar_mta_ret_cuda);
+    m.impl("_foreach_mul.List", foreach_mul_list_mta_ret_cuda);
+    m.impl("_foreach_mul.ScalarList", foreach_mul_scalar_list_mta_ret_cuda);
+    m.impl("_foreach_mul.Tensor", foreach_mul_tensor_cuda);
+    m.impl("_foreach_div.Scalar", foreach_div_scalar_mta_ret_cuda);
+    m.impl("_foreach_div.List", foreach_div_list_mta_ret_cuda);
+    m.impl("_foreach_div.ScalarList", foreach_div_scalar_list_mta_ret_cuda);
+    m.impl("_foreach_div.Tensor", foreach_div_tensor_cuda);
+
+    m.impl("_foreach_sub_.ScalarList", foreach_sub_scalar_list_mta_inplace_cuda);
+    m.impl("_foreach_sub_.Tensor", foreach_sub_tensor_inplace_cuda);
+    m.impl("_foreach_mul_.Scalar", foreach_mul_scalar_mta_inplace_cuda);
+    m.impl("_foreach_mul_.List", foreach_mul_list_mta_inplace_cuda);
+    m.impl("_foreach_mul_.ScalarList", foreach_mul_scalar_list_mta_inplace_cuda);
+    m.impl("_foreach_mul_.Tensor", foreach_mul_tensor_inplace_cuda);
+    m.impl("_foreach_div_.Scalar", foreach_div_scalar_mta_inplace_cuda);
+    m.impl("_foreach_div_.List", foreach_div_list_mta_inplace_cuda);
+    m.impl("_foreach_div_.ScalarList", foreach_div_scalar_list_mta_inplace_cuda);
+    m.impl("_foreach_div_.Tensor", foreach_div_tensor_inplace_cuda);
+
 #define REGISTER_FOREACH_BINARY(NAME) \
     m.impl("_foreach_" #NAME ".Scalar", foreach_##NAME##_scalar_mta_ret_cuda); \
     m.impl("_foreach_" #NAME ".List", foreach_##NAME##_list_mta_ret_cuda); \

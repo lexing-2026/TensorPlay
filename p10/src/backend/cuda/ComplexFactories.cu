@@ -75,6 +75,10 @@ __global__ void polar_kernel(int64_t n, const RT* ab, const RT* ang, CT* dst) {
 // Public entry points
 // ---------------------------------------------------------------------------
 
+Tensor real_cuda(const Tensor& self) {
+    // Real input is its own real part (zero-copy view, as the op contract
+    // states); complex input materializes the real component in fp32/fp64.
+    if (!is_cplx(self.dtype())) return self;
     DType rt = self.dtype() == DType::ComplexDouble ? DType::Float64 : DType::Float32;
     Tensor sc = self.contiguous();
     Tensor out = Tensor::empty(shape_of(sc), rt, self.device());

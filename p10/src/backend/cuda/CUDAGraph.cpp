@@ -395,7 +395,7 @@ void CUDAGraph::debug_dump(const std::string& path) {
         TP_THROW(RuntimeError,
                  "no captured CUDA graph to dump; capture first");
     }
-#if CUDART_VERSION >= 11030
+#if defined(USE_ROCM) || CUDART_VERSION >= 11030
     // The template carries full node attributes; without enable_debug_mode
     // the dump is topology-only (flags gate attribute verbosity).
     cudaGraph_t template_graph = graph_;
@@ -458,7 +458,7 @@ void CUDAGraph::set_conditional_handle_for_current_node(const Tensor& scalar_pre
     if (cond_handles_.empty()) {
         TP_THROW(RuntimeError, "no active CUDA graph conditional node");
     }
-#if CUDART_VERSION >= 12040
+#if !defined(USE_ROCM) && CUDART_VERSION >= 12040
     validatePredicate(scalar_pred);
     launchSetConditionalHandle(cond_handles_.back(), scalar_pred.data_ptr(),
                                getCurrentCUDAStream(device_).stream());
@@ -497,14 +497,14 @@ void CUDAGraph::end_capture_to_conditional_node() {
 
 void CUDAGraph::begin_capture_to_conditional_node(const Tensor& scalar_pred,
                                                   int conditional_type) {
-#if CUDART_VERSION >= 12040
+#if !defined(USE_ROCM) && CUDART_VERSION >= 12040
     requireLiveCaptureOnThisThread(*this);
     validatePredicate(scalar_pred);
 
     cudaStream_t parent = capture_stream_.stream();
     cudaStreamCaptureStatus status{};
     cudaGraph_t parent_graph{};
-#if CUDART_VERSION >= 13000
+#if !defined(USE_ROCM) && CUDART_VERSION >= 13000
     cudaError_t error = cudaStreamGetCaptureInfo(
         parent, &status, nullptr, &parent_graph);
 #else
@@ -531,7 +531,7 @@ void CUDAGraph::begin_capture_to_conditional_node(const Tensor& scalar_pred,
     const cudaGraphNode_t* dependencies = nullptr;
     const cudaGraphEdgeData* dependency_edges = nullptr;
     size_t num_dependencies = 0;
-#if CUDART_VERSION >= 13000
+#if !defined(USE_ROCM) && CUDART_VERSION >= 13000
     checkCuda(cudaStreamGetCaptureInfo(parent, &status, nullptr,
                                        &parent_graph, &dependencies,
                                        &dependency_edges, &num_dependencies),
@@ -552,7 +552,7 @@ void CUDAGraph::begin_capture_to_conditional_node(const Tensor& scalar_pred,
     params.conditional.size = 1;
 
     cudaGraphNode_t cond_node{};
-#if CUDART_VERSION >= 13000
+#if !defined(USE_ROCM) && CUDART_VERSION >= 13000
     checkCuda(cudaGraphAddNode(&cond_node, parent_graph, dependencies,
                                dependency_edges, num_dependencies, &params),
               "cudaGraphAddNode");
@@ -563,7 +563,7 @@ void CUDAGraph::begin_capture_to_conditional_node(const Tensor& scalar_pred,
 #endif
     cudaGraph_t child_graph = params.conditional.phGraph_out[0];
 
-#if CUDART_VERSION >= 13000
+#if !defined(USE_ROCM) && CUDART_VERSION >= 13000
     checkCuda(cudaStreamUpdateCaptureDependencies(
                   parent, &cond_node, nullptr, 1,
                   cudaStreamSetCaptureDependencies),

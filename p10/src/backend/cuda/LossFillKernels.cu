@@ -751,6 +751,68 @@ Tensor nll_loss2d_backward_cuda(const Tensor& grad_output, const Tensor& input,
 // registration
 // ===========================================================================
 
+Tensor& interop_smooth_l1_loss_backward_grad_input_cuda(const Tensor& grad_output, const Tensor& input, const Tensor& target,
+              int64_t reduction, double beta, Tensor& grad_input) {
+        grad_input = smooth_l1_loss_backward_cuda(grad_output, input, target,
+                                                  reduction, beta);
+        return grad_input;
+    
+}
+
+Tensor& interop_binary_cross_entropy_out_cuda(const Tensor& input, const Tensor& target,
+              const std::optional<Tensor>& weight, int64_t reduction, Tensor& out) {
+        out = binary_cross_entropy_cuda(input, target, weight, reduction);
+        return out;
+    
+}
+
+Tensor& interop_binary_cross_entropy_backward_grad_input_cuda(const Tensor& grad_output, const Tensor& input, const Tensor& target,
+              const std::optional<Tensor>& weight, int64_t reduction,
+              Tensor& grad_input) {
+        grad_input = binary_cross_entropy_backward_cuda(grad_output, input, target,
+                                                        weight, reduction);
+        return grad_input;
+    
+}
+
+Tensor& interop_nll_loss_backward_grad_input_cuda(const Tensor& grad_output, const Tensor& input, const Tensor& target,
+              const std::optional<Tensor>& weight, int64_t reduction,
+              int64_t ignore_index, const Tensor& total_weight,
+              Tensor& grad_input) {
+        grad_input = nll_loss_backward_cuda(grad_output, input, target, weight,
+                                            reduction, ignore_index, total_weight);
+        return grad_input;
+    
+}
+
+Tensor& interop_nll_loss2d_backward_grad_input_cuda(const Tensor& grad_output, const Tensor& input, const Tensor& target,
+              const std::optional<Tensor>& weight, int64_t reduction,
+              int64_t ignore_index, const Tensor& total_weight,
+              Tensor& grad_input) {
+        grad_input = nll_loss2d_backward_cuda(grad_output, input, target, weight,
+                                              reduction, ignore_index, total_weight);
+        return grad_input;
+    
+}
+
+Tensor& interop_nll_loss_forward_output_cuda(const Tensor& input, const Tensor& target,
+              const std::optional<Tensor>& weight, int64_t reduction,
+              int64_t ignore_index, Tensor& output, Tensor& total_weight) {
+        std::tie(output, total_weight) = nll_loss_cuda(input, target, weight,
+                                                       reduction, ignore_index);
+        return output;
+    
+}
+
+Tensor& interop_nll_loss2d_forward_output_cuda(const Tensor& input, const Tensor& target,
+              const std::optional<Tensor>& weight, int64_t reduction,
+              int64_t ignore_index, Tensor& output, Tensor& total_weight) {
+        std::tie(output, total_weight) = nll_loss2d_cuda(input, target, weight,
+                                                         reduction, ignore_index);
+        return output;
+    
+}
+
 TENSORPLAY_LIBRARY_IMPL(CUDA, LossFillKernels) {
     m.impl("mse_loss", mse_loss_cuda);
     m.impl("mse_loss_backward", mse_loss_backward_cuda);
@@ -764,6 +826,16 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, LossFillKernels) {
     m.impl("nll_loss_backward", nll_loss_backward_cuda);
     m.impl("nll_loss2d", nll_loss2d_cuda);
     m.impl("nll_loss2d_backward", nll_loss2d_backward_cuda);
+
+    // out-variants: run the value kernel, then transfer into the caller's
+    // buffer (grad_input for backward spellings).
+    m.impl("smooth_l1_loss_backward.grad_input", interop_smooth_l1_loss_backward_grad_input_cuda);
+    m.impl("binary_cross_entropy.out", interop_binary_cross_entropy_out_cuda);
+    m.impl("binary_cross_entropy_backward.grad_input", interop_binary_cross_entropy_backward_grad_input_cuda);
+    m.impl("nll_loss_backward.grad_input", interop_nll_loss_backward_grad_input_cuda);
+    m.impl("nll_loss2d_backward.grad_input", interop_nll_loss2d_backward_grad_input_cuda);
+    m.impl("nll_loss_forward.output", interop_nll_loss_forward_output_cuda);
+    m.impl("nll_loss2d_forward.output", interop_nll_loss2d_forward_output_cuda);
 }
 
 }  // namespace cuda

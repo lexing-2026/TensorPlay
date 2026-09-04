@@ -4,6 +4,7 @@
 #include "Exception.h"
 #include "Allocator.h"
 #include "CUDAContext.h"
+#include "tensorplay/ops/TPXOpsGenerated.h"
 #include <cuda_runtime.h>
 #include <curand.h>
 #include <vector>
@@ -27,6 +28,8 @@
 
 namespace tensorplay {
 namespace cuda {
+
+namespace ops = tensorplay::tpx::ops;
 
 namespace {
 
@@ -497,9 +500,6 @@ __global__ void fused_sample_kernel(
 // ---------------------------------------------------------------------------
 
 Tensor multinomial_kernel_cuda(const Tensor& self, int64_t num_samples, bool replacement, int64_t impl) {
-  if (!replacement) {
-    TP_THROW(NotImplementedError, "multinomial: replacement=False is not implemented for CUDA");
-  }
   if (num_samples < 0) {
     TP_THROW(RuntimeError, "multinomial: num_samples must be >= 0");
   }
@@ -516,6 +516,26 @@ Tensor multinomial_kernel_cuda(const Tensor& self, int64_t num_samples, bool rep
   }
   if (prob.dtype() != DType::Float32) {
     prob = prob.to(DType::Float32);
+  }
+
+  // Sampling without replacement follows the Gumbel-top-k construction:
+  // draw e_k ~ Exp(1) independently per category and score p_k / e_k; the
+  // num_samples largest scores form a draw of num_samples distinct
+  // categories, so one topk over the scores yields the whole sample.
+  if (!replacement) {
+    if (num_samples > cols) {
+      TP_THROW(RuntimeError,
+               "multinomial: cannot sample num_samples > prob_dist.size(-1) samples without replacement");
+    }
+    Tensor scores = Tensor::empty(
+        static_cast<std::vector<int64_t>>(prob.shape()), DType::Float32,
+        prob.device());
+    ops::exponential_(scores, 1.0);
+    scores = ops::div(prob, scores);
+    Tensor vals, idxs;
+    std::tie(vals, idxs) = ops::topk(scores, num_samples, /*dim=*/-1,
+                                     /*largest=*/true, /*sorted=*/true, 0);
+    return idxs;
   }
 
   std::vector<int64_t> out_shape = is_1d ? std::vector<int64_t>{num_samples}
