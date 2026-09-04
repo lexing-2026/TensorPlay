@@ -2072,8 +2072,9 @@ static Tensor softmax_fused_kernel_impl(const Tensor& self, int64_t dim, DType o
 #else
     // No AVX vector rows on this architecture: the CASE macro's use512 /
     // use256 probes return false, so only the scalar row body is ever taken.
+    // Bare block, not do/while: the call sites carry no trailing semicolon.
     #define SOFTMAX_ROW_VEC(ns, suffix, ctype, row_, orow_) \
-        do { (void)row_; (void)orow_; } while (0)
+        { (void)row_; (void)orow_; }
 #endif
 
     #define SOFTMAX_CASE(ctype, name, s512, s256, t512, t256) \
