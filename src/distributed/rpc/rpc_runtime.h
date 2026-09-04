@@ -78,7 +78,7 @@ public:
     DeviceMap get_device_map(const WorkerInfo& destination) const;
 
     py::object fetch_rref(const RpcRRef& rref, double timeout_seconds) const;
-    void fork_rref(const RpcRRef& rref) const;
+    void fork_rref(const RpcRRef& rref, const ForkId& fork_id) const;
     void delete_rref(const RpcRRef& rref) const;
 
     py::dict all_gather(
@@ -149,6 +149,7 @@ private:
         double timeout_seconds = -1.0;
         RpcRetryOptions retry_options;
         RRefId rref_id;
+        ForkId fork_id;
         int64_t autograd_context_id = -1;
         int64_t autograd_message_id = -1;
         std::shared_ptr<tensorpipe::Pipe> pipe;

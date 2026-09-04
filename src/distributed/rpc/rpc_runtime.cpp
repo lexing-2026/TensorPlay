@@ -16,12 +16,14 @@
 #include "store/PrefixStore.h"
 #include "store/Store.h"
 #include "store/TCPStore.h"
+#include "rref_proto.h"
 #include "tensorpipe_backend.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <tuple>
@@ -115,6 +117,24 @@ std::chrono::milliseconds store_timeout(
         return tensorplay::distributed::Store::kDefaultTimeout;
     }
     return rpc_timeout;
+}
+
+std::pair<RRefId, ForkId> decode_fork_payload(const Message& message) {
+    constexpr size_t id_size = sizeof(worker_id_t) + sizeof(local_id_t);
+    if (message.payload().size() != id_size * 2) {
+        throw std::runtime_error("RRef control message has invalid payload");
+    }
+    auto decode_id = [&message](size_t offset) {
+        worker_id_t worker = 0;
+        local_id_t local = 0;
+        std::memcpy(&worker, message.payload().data() + offset, sizeof(worker));
+        std::memcpy(
+            &local,
+            message.payload().data() + offset + sizeof(worker),
+            sizeof(local));
+        return GloballyUniqueId(worker, local);
+    };
+    return {decode_id(0), decode_id(id_size)};
 }
 
 std::shared_ptr<tensorplay::distributed::Store> create_rendezvous_store(
@@ -588,7 +608,7 @@ std::shared_ptr<RpcRRef> RpcRuntime::remote(
     auto creation = std::make_shared<RpcFuture>();
     std::shared_ptr<RRefState> local_state;
     if (worker.id == current_rank_) {
-        local_state = rrefs_.create(id);
+        local_state = rrefs_.create(id, fork);
     }
     Task task;
     task.valid = true;
@@ -600,6 +620,7 @@ std::shared_ptr<RpcRRef> RpcRuntime::remote(
     task.target = worker.name;
     task.timeout_seconds = timeout_seconds;
     task.rref_id = id;
+    task.fork_id = fork;
     task.autograd_context_id = current_autograd_context_id();
     try {
         enqueue(std::move(task));
@@ -608,7 +629,7 @@ std::shared_ptr<RpcRRef> RpcRuntime::remote(
         }
     } catch (...) {
         if (local_state) {
-            rrefs_.release(id);
+            rrefs_.release(id, fork);
         }
         throw;
     }
@@ -639,18 +660,18 @@ std::shared_ptr<RpcRRef> RpcRuntime::restore_rref(
         if (!local_state) {
             throw std::runtime_error("local RRef owner entry does not exist");
         }
-        rrefs_.retain(rref_id);
+        rrefs_.retain(rref_id, fork_id);
     }
     auto result = std::make_shared<RpcRRef>(
         this,
         worker,
         rref_id,
-        ForkId(current_rank_, next_local_id_.fetch_add(1)),
+        fork_id,
         std::move(creation),
         std::move(local_state),
         lifetime_token_);
     if (worker.id != current_rank_) {
-        fork_rref(*result);
+        fork_rref(*result, fork_id);
     }
     return result;
 }
@@ -750,9 +771,7 @@ void RpcRuntime::execute_message(Task& task) {
                 response->payload().size()));
         };
         if (worker.id == current_rank_) {
-            if (task.message->type() == MessageType::BACKWARD_AUTOGRAD_REQ ||
-                task.message->type() == MessageType::CLEANUP_AUTOGRAD_CONTEXT_REQ ||
-                task.message->type() == MessageType::RREF_BACKWARD_REQ) {
+            if (task.message->is_request()) {
                 py::gil_scoped_acquire gil;
                 const auto frame = RpcFrame{
                     static_cast<uint64_t>(task.message->id()), task.message};
@@ -903,7 +922,12 @@ MessagePtr RpcRuntime::send_task(Task& task, const WorkerInfo& to) {
     py::gil_scoped_acquire gil;
     py::object call;
     if (task.kind == TaskKind::REMOTE_CALL) {
-        call = py::make_tuple(task.rref_id.to_python(), task.callable, task.args, task.kwargs);
+        call = py::make_tuple(
+            task.rref_id.to_python(),
+            task.fork_id.to_python(),
+            task.callable,
+            task.args,
+            task.kwargs);
     } else {
         call = py::make_tuple(task.callable, task.args, task.kwargs);
     }
@@ -1262,14 +1286,16 @@ RpcRuntime::RpcFrame RpcRuntime::handle_call(
         py::tuple args;
         py::dict kwargs;
         RRefId rref_id;
+        ForkId fork_id;
         if (remote_call) {
-            if (call.size() != 4) {
-                throw std::runtime_error("remote call payload must contain four values");
+            if (call.size() != 5) {
+                throw std::runtime_error("remote call payload must contain five values");
             }
             rref_id = GloballyUniqueId::from_python(call[0]);
-            callable = call[1];
-            args = call[2].cast<py::tuple>();
-            kwargs = call[3].cast<py::dict>();
+            fork_id = GloballyUniqueId::from_python(call[1]);
+            callable = call[2];
+            args = call[3].cast<py::tuple>();
+            kwargs = call[4].cast<py::dict>();
         } else {
             if (call.size() != 3) {
                 throw std::runtime_error("call payload must contain three values");
@@ -1280,7 +1306,7 @@ RpcRuntime::RpcFrame RpcRuntime::handle_call(
         }
         auto future = std::make_shared<RpcFuture>();
         if (remote_call) {
-            rrefs_.create(rref_id);
+            rrefs_.create(rref_id, fork_id);
         }
         Task task;
         task.valid = true;
@@ -1524,9 +1550,8 @@ RpcRuntime::RpcFrame RpcRuntime::handle_fetch(const RpcFrame& frame) {
 RpcRuntime::RpcFrame RpcRuntime::handle_fork(const RpcFrame& frame) {
     py::gil_scoped_acquire gil;
     try {
-        const auto id = GloballyUniqueId::from_python(
-            deserialize_python_object(serialized_message(frame)));
-        rrefs_.retain(id);
+        const auto [id, fork_id] = decode_fork_payload(*frame.message);
+        rrefs_.retain(id, fork_id);
         return response_frame(
             frame.request_id,
             MessageType::RREF_ACK,
@@ -1542,9 +1567,8 @@ RpcRuntime::RpcFrame RpcRuntime::handle_fork(const RpcFrame& frame) {
 RpcRuntime::RpcFrame RpcRuntime::handle_delete(const RpcFrame& frame) {
     py::gil_scoped_acquire gil;
     try {
-        const auto id = GloballyUniqueId::from_python(
-            deserialize_python_object(serialized_message(frame)));
-        rrefs_.release(id);
+        const auto [id, fork_id] = decode_fork_payload(*frame.message);
+        rrefs_.release(id, fork_id);
         return response_frame(
             frame.request_id,
             MessageType::RREF_ACK,
@@ -1771,22 +1795,25 @@ py::object RpcRuntime::fetch_rref(
     return value;
 }
 
-void RpcRuntime::fork_rref(const RpcRRef& rref) const {
+void RpcRuntime::fork_rref(const RpcRRef& rref, const ForkId& fork_id) const {
     if (rref.owner().id == current_rank_) {
-        rrefs_.retain(rref.rref_id());
+        rrefs_.retain(rref.rref_id(), fork_id);
         return;
     }
-    py::gil_scoped_acquire gil;
-    SerializedPyObj object = serialize_python_object(rref.rref_id().to_python());
-    auto message = make_python_message(std::move(object),
-                                       MessageType::RREF_FORK_REQUEST);
+    auto message = std::move(
+        RRefForkRequest(rref.rref_id(), fork_id)).to_message();
+    MessagePtr response;
     {
         py::gil_scoped_release release;
-        send_message(
+        response = send_message(
             rref.owner(),
             std::move(message),
             -1.0,
             RpcRetryOptions{});
+    }
+    auto [success, value] = deserialize_result(*response);
+    if (!success) {
+        throw std::runtime_error(value.cast<std::string>());
     }
 }
 
@@ -1795,13 +1822,11 @@ void RpcRuntime::delete_rref(const RpcRRef& rref) const {
         return;
     }
     if (rref.owner().id == current_rank_) {
-        rrefs_.release(rref.rref_id());
+        rrefs_.release(rref.rref_id(), rref.fork_id());
         return;
     }
-    py::gil_scoped_acquire gil;
-    SerializedPyObj object = serialize_python_object(rref.rref_id().to_python());
-    auto message = make_python_message(std::move(object),
-                                       MessageType::RREF_USER_DELETE);
+    auto message = std::move(
+        RRefUserDelete(rref.rref_id(), rref.fork_id())).to_message();
     try {
         py::gil_scoped_release release;
         send_message(
