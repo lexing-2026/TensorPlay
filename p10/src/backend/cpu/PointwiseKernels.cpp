@@ -1990,9 +1990,12 @@ static Tensor softmax_fused_kernel_impl(const Tensor& self, int64_t dim, DType o
                 parallel_for(0, before * sctx.nblk, 1, run_f32_512);
                 return result;
             }
-#endif
             const float* in = sctx.in_f32;
             float* out = sctx.out_f32;
+#else
+            const float* in = input.data_ptr<float>();
+            float* out = result.data_ptr<float>();
+#endif
             parallel_for(0, before * after, 1, [&](int64_t rb, int64_t re) {
                 for (int64_t r = rb; r < re; ++r) {
                     const int64_t a = r / after;
@@ -2007,9 +2010,12 @@ static Tensor softmax_fused_kernel_impl(const Tensor& self, int64_t dim, DType o
                 parallel_for(0, before * sctx.nblk, 1, run_f64_512);
                 return result;
             }
-#endif
             const double* in = sctx.in_f64;
             double* out = sctx.out_f64;
+#else
+            const double* in = input.data_ptr<double>();
+            double* out = result.data_ptr<double>();
+#endif
             parallel_for(0, before * after, 1, [&](int64_t rb, int64_t re) {
                 for (int64_t r = rb; r < re; ++r) {
                     const int64_t a = r / after;
@@ -2052,6 +2058,7 @@ static Tensor softmax_fused_kernel_impl(const Tensor& self, int64_t dim, DType o
             for (int64_t j = 0; j < size; ++j) orow[j] *= inv; \
         }
 
+#if defined(__x86_64__)
     #define SOFTMAX_ROW_VEC(ns, suffix, ctype, row_, orow_) \
         { \
             ctype m = softmax_row::row_max_##suffix(row_, size); \
@@ -2062,6 +2069,12 @@ static Tensor softmax_fused_kernel_impl(const Tensor& self, int64_t dim, DType o
                 softmax_row::row_scale_##suffix(orow_, ctype(1) / sum, size); \
             } \
         }
+#else
+    // No AVX vector rows on this architecture: the CASE macro's use512 /
+    // use256 probes return false, so only the scalar row body is ever taken.
+    #define SOFTMAX_ROW_VEC(ns, suffix, ctype, row_, orow_) \
+        do { (void)row_; (void)orow_; } while (0)
+#endif
 
     #define SOFTMAX_CASE(ctype, name, s512, s256, t512, t256) \
     case DType::name: { \
