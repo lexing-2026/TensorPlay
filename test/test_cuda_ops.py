@@ -176,7 +176,7 @@ class TestCUDAOps(unittest.TestCase):
         # Tanh
         res = tp.tanh(a)
         expected = np.tanh([-2.0, -1.0, 0.0, 1.0, 2.0])
-        self.assertTrue(tp.allclose(res.cpu(), tp.tensor(expected), atol=1e-5), "Tanh failed")
+        self.assertTrue(tp.allclose(res.cpu(), tp.tensor(expected.tolist()), atol=1e-5), "Tanh failed")
         
         # SiLU (x * sigmoid(x))
         res = tp.silu(a)
