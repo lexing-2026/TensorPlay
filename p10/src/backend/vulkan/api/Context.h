@@ -70,6 +70,19 @@ class Context final {
   std::vector<VulkanBuffer> buffers_to_clear_;
   std::mutex image_clearlist_mutex_;
   std::vector<VulkanImage> images_to_clear_;
+  // Host-visible buffer pools.  Staging and uniform-parameter buffers are
+  // recycled across ops instead of being re-allocated per record.  A dead
+  // buffer first lands in the pending list (its last recorded use may still
+  // be in flight); flush() drains the pending lists into the pools once the
+  // queue is idle, so an acquired buffer is never reused while the GPU may
+  // still read it.  Pools are capped; entries beyond the budget are
+  // destroyed at flush time.
+  std::mutex staging_pool_mutex_;
+  std::vector<VulkanBuffer> staging_pool_;
+  std::vector<VulkanBuffer> staging_pending_;
+  std::mutex params_pool_mutex_;
+  std::vector<VulkanBuffer> params_pool_;
+  std::vector<VulkanBuffer> params_pending_;
 
  public:
   // Adapter access
@@ -135,6 +148,47 @@ class Context final {
   void register_image_cleanup(VulkanImage& image) {
     std::lock_guard<std::mutex> imagelist_lock(image_clearlist_mutex_);
     images_to_clear_.emplace_back(std::move(image));
+  }
+
+  // Host-visible buffer recycling.  `release_*` parks a dead buffer in the
+  // pending list; flush() promotes pending buffers to the pools after the
+  // queue is idle.  `acquire_*` returns a pooled buffer whose allocation is
+  // exactly the requested size — call sites pass the pooled buffer onward
+  // with byte-exact size invariants (copy ranges, staging sizes), so a
+  // larger allocation would silently break them — or an empty handle when no
+  // entry matches (the caller then allocates fresh).
+  void release_staging_buffer(VulkanBuffer& buffer) {
+    std::lock_guard<std::mutex> lock(staging_pool_mutex_);
+    staging_pending_.emplace_back(std::move(buffer));
+  }
+
+  void release_params_buffer(VulkanBuffer& buffer) {
+    std::lock_guard<std::mutex> lock(params_pool_mutex_);
+    params_pending_.emplace_back(std::move(buffer));
+  }
+
+  VulkanBuffer acquire_staging_buffer(const VkDeviceSize size) {
+    std::lock_guard<std::mutex> lock(staging_pool_mutex_);
+    for (auto it = staging_pool_.begin(); it != staging_pool_.end(); ++it) {
+      if (it->mem_size() == size) {
+        VulkanBuffer buffer(std::move(*it));
+        staging_pool_.erase(it);
+        return buffer;
+      }
+    }
+    return VulkanBuffer{};
+  }
+
+  VulkanBuffer acquire_params_buffer(const VkDeviceSize size) {
+    std::lock_guard<std::mutex> lock(params_pool_mutex_);
+    for (auto it = params_pool_.begin(); it != params_pool_.end(); ++it) {
+      if (it->mem_size() >= size) {
+        VulkanBuffer buffer(std::move(*it));
+        params_pool_.erase(it);
+        return buffer;
+      }
+    }
+    return VulkanBuffer{};
   }
 
   // GPU RPC
@@ -420,8 +474,12 @@ class StorageBuffer final {
         dtype_(dtype),
         numel_(numel),
         nbytes_(numel_ * tensorplay::elementSize(dtype_)),
-        vulkan_buffer_(context_p_->adapter_ptr()->vma().create_staging_buffer(
-            nbytes_)) {}
+        vulkan_buffer_(context_p_->acquire_staging_buffer(nbytes_)) {
+    if (!vulkan_buffer_) {
+      vulkan_buffer_ = context_p_->adapter_ptr()->vma().create_staging_buffer(
+          nbytes_);
+    }
+  }
 
   StorageBuffer(const StorageBuffer&) = delete;
   StorageBuffer& operator=(const StorageBuffer&) = delete;
@@ -430,7 +488,11 @@ class StorageBuffer final {
   StorageBuffer& operator=(StorageBuffer&&) = default;
 
   ~StorageBuffer() {
-    context_p_->register_buffer_cleanup(vulkan_buffer_);
+    if (vulkan_buffer_) {
+      // Return the buffer for reuse at flush time (device idle) instead of
+      // tearing the allocation down; steady-state requests hit the pool.
+      context_p_->release_staging_buffer(vulkan_buffer_);
+    }
   }
 
   inline DType dtype() {
@@ -463,7 +525,17 @@ class UniformParamsBuffer final {
   UniformParamsBuffer(Context* context_p, const Block& block)
       : context_p_(context_p),
         nbytes_(sizeof(block)),
-        vulkan_buffer_(context_p_->adapter_ptr()->vma().create_params_buffer(block)) {}
+        vulkan_buffer_(context_p_->acquire_params_buffer(sizeof(block))) {
+    if (!vulkan_buffer_) {
+      vulkan_buffer_ = context_p_->adapter_ptr()->vma().create_params_buffer(
+          block);
+    } else {
+      // Pooled buffer: overwrite the mapped payload with the new block.
+      MemoryMap mapping(vulkan_buffer_, MemoryAccessType::WRITE);
+      Block* data_ptr = mapping.template data<Block>();
+      *data_ptr = block;
+    }
+  }
 
   UniformParamsBuffer(const UniformParamsBuffer&);
   UniformParamsBuffer& operator=(const UniformParamsBuffer&);
@@ -473,7 +545,9 @@ class UniformParamsBuffer final {
 
   ~UniformParamsBuffer() {
     if (vulkan_buffer_) {
-      context_p_->register_buffer_cleanup(vulkan_buffer_);
+      // Return the buffer for reuse at flush time instead of tearing the
+      // allocation down; steady-state requests hit the pool.
+      context_p_->release_params_buffer(vulkan_buffer_);
     }
   }
 

@@ -1330,6 +1330,48 @@ Tensor quantized_conv2d_run_kernel(
       out_max);
 }
 
+// Quantized-tensor metadata probes and the pass-through dequantize entry.
+// The scale/zero-point pair lives on the host-side quantizer, so both
+// probes answer without touching the payload; dequantize rides the
+// per-dtype kernels that the quantizer's scheme selects.
+double q_scale_kernel(const Tensor& self) {
+  return quantized::q_scale(self);
+}
+
+int64_t q_zero_point_kernel(const Tensor& self) {
+  return quantized::q_zero_point(self);
+}
+
+int64_t qscheme_kernel(const Tensor& self) {
+  return static_cast<int64_t>(quantized::quantizer_of(self)->qscheme());
+}
+
+Tensor int_repr_kernel(const Tensor& self) {
+  quantized::require_quantized(self, "int_repr");
+  return quantized::strip_quantizer(self).clone();
+}
+
+Tensor dequantize_self_kernel(const Tensor& self) {
+  if (!quantized::is_quantized(self)) {
+    return self;
+  }
+  const auto q = quantized::quantizer_of(self);
+  switch (self.dtype()) {
+    case DType::QInt8:
+      return dequantize_per_tensor_kernel(self, q->scale(), q->zero_point());
+    case DType::QUInt8:
+      return dequantize_per_tensor_quint8_kernel(
+          self, q->scale(), q->zero_point());
+    case DType::QInt32:
+      return dequantize_per_tensor_qint32_kernel(
+          self, q->scale(), q->zero_point());
+    default:
+      TP_THROW(
+          NotImplementedError,
+          "Vulkan dequantize: unsupported quantized dtype");
+  }
+}
+
 } // namespace ops
 } // namespace vulkan
 } // namespace tensorplay
@@ -1360,6 +1402,11 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, QuantKernels) {
          &tensorplay::vulkan::ops::quantize_per_tensor_qint32_kernel);
   m.impl("dequantize_per_tensor_qint32",
          &tensorplay::vulkan::ops::dequantize_per_tensor_qint32_kernel);
+  m.impl("q_scale", &tensorplay::vulkan::ops::q_scale_kernel);
+  m.impl("q_zero_point", &tensorplay::vulkan::ops::q_zero_point_kernel);
+  m.impl("qscheme", &tensorplay::vulkan::ops::qscheme_kernel);
+  m.impl("int_repr", &tensorplay::vulkan::ops::int_repr_kernel);
+  m.impl("dequantize.self", &tensorplay::vulkan::ops::dequantize_self_kernel);
 }
 
 #endif /* USE_VULKAN */

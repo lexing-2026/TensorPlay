@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <vector>
 
+#include "Exception.h"
+
 namespace tensorplay {
 namespace vulkan {
 namespace api {
@@ -112,6 +114,21 @@ inline vec<T, N> make_vec_prepadded1(const std::vector<int64_t>& sizes) {
   for (size_t i = 0; i < std::min(N - 1, sizes.size()); ++i) {
     result[i + 1] = static_cast<T>(sizes[sizes.size() - 1 - i]);
   }
+  return result;
+}
+
+// {N, C, H, W} with leading ones for missing dims: the {W, H, C, N} layout
+// helpers above cover Whcn-style blocks, while front-padded Nchw blocks are
+// what the relayout shaders index with.
+inline ivec4 make_ivec4_prepadded1(const std::vector<int64_t>& sizes) {
+  VK_CHECK_COND(sizes.size() <= 4u);
+
+  ivec4 result{1, 1, 1, 1};
+  const size_t base = 4u - sizes.size();
+  for (size_t i = 0; i < sizes.size(); ++i) {
+    result[i + base] = static_cast<int32_t>(sizes[i]);
+  }
+
   return result;
 }
 

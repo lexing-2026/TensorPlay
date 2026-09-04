@@ -153,7 +153,12 @@ std::unique_ptr<Runtime> init_global_vulkan_runtime() {
       false;
 #endif /* VULKAN_DEBUG */
   const bool initDefaultDevice = true;
-  const uint32_t numRequestedQueues = 1; // TODO: raise this value
+  // Acquire several compute queues per adapter.  The current execution model
+  // records into one shared command buffer, so the extra queues mainly serve
+  // concurrent Contexts (one per thread / device index); requesting more than
+  // four buys nothing because queue submission is striped across that many
+  // mutexes.
+  const uint32_t numRequestedQueues = 4u;
 
   const RuntimeConfiguration default_config{
       enableValidationMessages,

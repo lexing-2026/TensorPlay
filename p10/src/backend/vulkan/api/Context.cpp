@@ -11,6 +11,12 @@
 #define VULKAN_DESCRIPTOR_POOL_SIZE 1024u
 #endif
 
+// Combined byte budget of the staging / parameter buffer recycle pools.
+// Steady-state inference re-requests the same few sizes every batch, so a
+// small budget captures virtually all reuse; larger transfers simply
+// allocate fresh and are destroyed at flush.
+constexpr size_t kHostVisiblePoolByteBudget = 8u * 1024u * 1024u;
+
 namespace tensorplay {
 namespace vulkan {
 namespace api {
@@ -128,55 +134,143 @@ void Context::flush() {
   std::lock_guard<std::mutex> imagelist_lock(image_clearlist_mutex_);
   buffers_to_clear_.clear();
   images_to_clear_.clear();
+
+  // Promote dead host-visible buffers into the reuse pools (the queue is
+  // idle here, so any recorded use has completed), then enforce the byte
+  // budget by destroying the oldest entries.
+  {
+    std::lock_guard<std::mutex> lock(staging_pool_mutex_);
+    staging_pool_.insert(
+        staging_pool_.end(),
+        std::make_move_iterator(staging_pending_.begin()),
+        std::make_move_iterator(staging_pending_.end()));
+    staging_pending_.clear();
+    size_t pooled_bytes = 0u;
+    for (const VulkanBuffer& buffer : staging_pool_) {
+      pooled_bytes += static_cast<size_t>(buffer.mem_size());
+    }
+    while (!staging_pool_.empty() &&
+           pooled_bytes > kHostVisiblePoolByteBudget) {
+      pooled_bytes -= static_cast<size_t>(staging_pool_.back().mem_size());
+      staging_pool_.pop_back();
+    }
+  }
+  {
+    std::lock_guard<std::mutex> lock(params_pool_mutex_);
+    params_pool_.insert(
+        params_pool_.end(),
+        std::make_move_iterator(params_pending_.begin()),
+        std::make_move_iterator(params_pending_.end()));
+    params_pending_.clear();
+    size_t pooled_bytes = 0u;
+    for (const VulkanBuffer& buffer : params_pool_) {
+      pooled_bytes += static_cast<size_t>(buffer.mem_size());
+    }
+    while (!params_pool_.empty() &&
+           pooled_bytes > kHostVisiblePoolByteBudget) {
+      pooled_bytes -= static_cast<size_t>(params_pool_.back().mem_size());
+      params_pool_.pop_back();
+    }
+  }
 }
 
 bool available() {
   return context();
 }
 
-Context* context() {
-  static const std::unique_ptr<Context> context([]() -> Context* {
-    try {
-      if (!try_runtime()) {
-        return nullptr;
-      }
+namespace {
 
-      const uint32_t submit_frequency = 16u;
-
-      const CommandPoolConfig cmd_config{
-          32u, // cmdPoolInitialSize
-          8u, // cmdPoolBatchSize
-      };
-
-      const DescriptorPoolConfig descriptor_pool_config{
-          VULKAN_DESCRIPTOR_POOL_SIZE, // descriptorPoolMaxSets
-          VULKAN_DESCRIPTOR_POOL_SIZE, // descriptorUniformBufferCount
-          VULKAN_DESCRIPTOR_POOL_SIZE, // descriptorStorageBufferCount
-          VULKAN_DESCRIPTOR_POOL_SIZE, // descriptorCombinedSamplerCount
-          VULKAN_DESCRIPTOR_POOL_SIZE, // descriptorStorageImageCount
-          32u, // descriptorPileSizes
-      };
-
-      const QueryPoolConfig query_pool_config{
-          32u, // queryPoolInitialSize
-          16u, // queryPoolBatchSize
-      };
-
-      const ContextConfig config{
-          submit_frequency, // cmdSubmitFrequency
-          cmd_config, // cmdPoolConfig
-          descriptor_pool_config, // descriptorPoolConfig
-          query_pool_config, // queryPoolConfig
-      };
-
-      return new Context(runtime()->default_adapter_i(), config);
-    } catch (...) {
+// Shared construction recipe for every per-thread context.  Returns null
+// when the runtime is unavailable (no device / failed initialization).
+Context* make_default_context() {
+  try {
+    if (!try_runtime()) {
+      return nullptr;
     }
 
-    return nullptr;
-  }());
+    const uint32_t submit_frequency = 16u;
 
-  return context.get();
+    const CommandPoolConfig cmd_config{
+        32u, // cmdPoolInitialSize
+        8u, // cmdPoolBatchSize
+    };
+
+    const DescriptorPoolConfig descriptor_pool_config{
+        VULKAN_DESCRIPTOR_POOL_SIZE, // descriptorPoolMaxSets
+        VULKAN_DESCRIPTOR_POOL_SIZE, // descriptorUniformBufferCount
+        VULKAN_DESCRIPTOR_POOL_SIZE, // descriptorStorageBufferCount
+        VULKAN_DESCRIPTOR_POOL_SIZE, // descriptorCombinedSamplerCount
+        VULKAN_DESCRIPTOR_POOL_SIZE, // descriptorStorageImageCount
+        32u, // descriptorPileSizes
+    };
+
+    const QueryPoolConfig query_pool_config{
+        32u, // queryPoolInitialSize
+        16u, // queryPoolBatchSize
+    };
+
+    const ContextConfig config{
+        submit_frequency, // cmdSubmitFrequency
+        cmd_config, // cmdPoolConfig
+        descriptor_pool_config, // descriptorPoolConfig
+        query_pool_config, // queryPoolConfig
+    };
+
+    return new Context(runtime()->default_adapter_i(), config);
+  } catch (...) {
+  }
+
+  return nullptr;
+}
+
+class ContextRegistry final {
+ public:
+  ContextRegistry() {
+    // Construct the Runtime before this registry so static destruction keeps
+    // the adapter/device alive while registered contexts are released.
+    (void)try_runtime();
+  }
+
+  Context* create() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    contexts_.emplace_back(make_default_context());
+    return contexts_.back().get();
+  }
+
+  ~ContextRegistry() {
+    // Worker threads must have joined before process teardown.  Each Context
+    // flushes its queue and returns it before the Runtime is destroyed.
+    contexts_.clear();
+  }
+
+ private:
+  std::mutex mutex_;
+  std::vector<std::unique_ptr<Context>> contexts_;
+};
+
+ContextRegistry& context_registry() {
+  static ContextRegistry registry;
+  return registry;
+}
+
+} // namespace
+
+Context* context() {
+  // One context per thread: each context owns a command stream bound to a
+  // queue handed out from the adapter's least-used pool, so concurrent
+  // recording threads submit to distinct queues and their command buffers
+  // execute in parallel on devices with multiple compute queues.  All
+  // cross-context state (pipeline / shader caches, the shader registry, the
+  // VMA allocator) lives on the shared Adapter and is mutex-protected or
+  // read-only after initialization.  Tensor payloads are context-independent
+  // resources; handing a tensor between threads is safe once the producer's
+  // stream has been synchronized externally (standard multi-queue usage).
+  //
+  // The registry owns contexts so their destruction is ordered before the
+  // Runtime static.  A thread-local pointer selects one command stream per
+  // thread without giving thread-exit destructors access to a dead adapter.
+  static thread_local Context* const context = context_registry().create();
+  return context;
 }
 
 //
@@ -217,7 +311,7 @@ UniformParamsBuffer& UniformParamsBuffer::operator=(
     // Move vulkan_buffer_ to another VulkanBuffer for cleanup
     if (vulkan_buffer_) {
       VulkanBuffer temp_buffer(std::move(vulkan_buffer_));
-      context_p_->register_buffer_cleanup(temp_buffer);
+      context_p_->release_params_buffer(temp_buffer);
     }
     // vulkan_buffer_ should now be empty
 

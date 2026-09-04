@@ -110,8 +110,14 @@ DescriptorSet& DescriptorSet::bind_image(
 }
 
 void DescriptorSet::add_binding(const ResourceBinding& resource) {
-  for (const ResourceBinding& bound : bindings_) {
+  // Rebinding an occupied slot must overwrite: descriptor sets are recycled
+  // across submissions, so a reused set arrives with the previous call's
+  // bindings still recorded.  Keeping the first write would silently bind
+  // stale resources (e.g. last call's uniform block) whenever a shader runs
+  // twice before the pool is flushed.
+  for (ResourceBinding& bound : bindings_) {
     if (resource.binding_idx == bound.binding_idx) {
+      bound = resource;
       return;
     }
   }

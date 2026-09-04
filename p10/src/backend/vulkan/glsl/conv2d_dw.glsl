@@ -4,6 +4,7 @@
 #define FORMAT ${FORMAT}
 
 #define HAS_BIAS ${HAS_BIAS}
+#define TILE ${OUTPUT_TILE}
 // clang-format on
 
 layout(std430) buffer;
@@ -28,60 +29,81 @@ uBlock;
 layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
 
 /*
- * Depthwise 2D convolution (groups == channels, one plane per channel):
- * every output channel filters its own input channel with a 2D kernel.
- * One invocation computes one texel, i.e. four channels of one output
- * position; the input fetch is shared across those channels while the
- * kernel weights are fetched per channel.
+ * Depthwise 2D convolution (groups == channels): every output channel filters
+ * its own input channel with a 2D kernel.
+ *
+ * The packed weight texture stores four consecutive channels per texel:
+ * texel (kx, ky, z) lanes hold w[c = 4 * (z % c_depth) + lane][ky][kx], so
+ * one fetch covers a whole channel group of the kernel.  One invocation
+ * computes a TILE x TILE block of output positions; the weight fetch is
+ * shared across the block, and input fetches at positions beyond the output
+ * edges return zeros whose stores are discarded.
  */
 void main() {
   const ivec3 pos = ivec3(gl_GlobalInvocationID);
 
-  if (pos.x >= uBlock.out_sizes.x ||
-      pos.y >= uBlock.out_sizes.y ||
+  if (pos.x * TILE >= uBlock.out_sizes.x ||
+      pos.y * TILE >= uBlock.out_sizes.y ||
       pos.z >= uBlock.out_sizes.w * uBlock.c_depth) {
     return;
   }
 
-  const int ow = pos.x;
-  const int oh = pos.y;
   const int n = pos.z / uBlock.c_depth;
   const int c4 = pos.z % uBlock.c_depth;
 
-  vec4 acc = vec4(0.0f);
+  vec4 acc[TILE][TILE];
+  for (int i = 0; i < TILE; ++i) {
+    for (int j = 0; j < TILE; ++j) {
+      acc[i][j] = vec4(0.0f);
+    }
+  }
 
   for (int ky = 0; ky < uBlock.weight_sizes.z; ++ky) {
-    const int ih =
-        oh * uBlock.stride.y - uBlock.padding.y + ky * uBlock.dilation.y;
-    if (ih < 0 || ih >= uBlock.in_sizes.y) {
-      continue;
+    int ih[TILE];
+    bool ih_ok[TILE];
+    for (int i = 0; i < TILE; ++i) {
+      ih[i] = (pos.y * TILE + i) * uBlock.stride.y - uBlock.padding.y +
+          ky * uBlock.dilation.y;
+      ih_ok[i] = ih[i] >= 0 && ih[i] < uBlock.in_sizes.y;
     }
     for (int kx = 0; kx < uBlock.weight_sizes.w; ++kx) {
-      const int iw =
-          ow * uBlock.stride.x - uBlock.padding.x + kx * uBlock.dilation.x;
-      if (iw < 0 || iw >= uBlock.in_sizes.x) {
-        continue;
+      // Four consecutive channels of one kernel tap.
+      const vec4 w = texelFetch(uWeight, ivec3(kx, ky, pos.z), 0);
+      int iw[TILE];
+      bool iw_ok[TILE];
+      for (int j = 0; j < TILE; ++j) {
+        iw[j] = (pos.x * TILE + j) * uBlock.stride.x - uBlock.padding.x +
+            kx * uBlock.dilation.x;
+        iw_ok[j] = iw[j] >= 0 && iw[j] < uBlock.in_sizes.x;
       }
-      const vec4 v = texelFetch(
-          uInput, ivec3(iw, ih, n * uBlock.c_depth + c4), 0);
-      // Weight texture: {C, 1, KH, KW} logical sizes map to
-      // (W=KW, H=KH, C=1, N=C); texel z carries the channel.
-      const ivec4 c_idx = min(
-          ivec4(c4 * 4) + ivec4(0, 1, 2, 3),
-          ivec4(uBlock.in_sizes.z - 1));
-      const vec4 w = vec4(
-          texelFetch(uWeight, ivec3(kx, ky, c_idx.x), 0).x,
-          texelFetch(uWeight, ivec3(kx, ky, c_idx.y), 0).x,
-          texelFetch(uWeight, ivec3(kx, ky, c_idx.z), 0).x,
-          texelFetch(uWeight, ivec3(kx, ky, c_idx.w), 0).x);
-      acc += v * w;
+      for (int i = 0; i < TILE; ++i) {
+        for (int j = 0; j < TILE; ++j) {
+          if (ih_ok[i] && iw_ok[j]) {
+            const vec4 v = texelFetch(
+                uInput, ivec3(iw[j], ih[i], n * uBlock.c_depth + c4), 0);
+            acc[i][j] += v * w;
+          }
+        }
+      }
     }
   }
 
   // clang-format off
   $if HAS_BIAS:
-    acc += param_vec(uBias, c4, uBlock.in_sizes.z);
+    const vec4 b = param_vec(uBias, c4, uBlock.in_sizes.z);
+    for (int i = 0; i < TILE; ++i) {
+      for (int j = 0; j < TILE; ++j) {
+        acc[i][j] += b;
+      }
+    }
   // clang-format on
 
-  imageStore(uOutput, pos, acc);
+  for (int i = 0; i < TILE; ++i) {
+    for (int j = 0; j < TILE; ++j) {
+      imageStore(
+          uOutput,
+          ivec3(pos.x * TILE + j, pos.y * TILE + i, pos.z),
+          acc[i][j]);
+    }
+  }
 }

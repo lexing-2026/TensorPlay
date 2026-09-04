@@ -34,6 +34,12 @@ layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
  * input positions whose scatter lands on it: kernel taps are visited and
  * the implied input coordinate must divide the stride evenly and stay in
  * bounds.  One invocation computes the four output channels of one texel.
+ *
+ * Packed weight layout: texel (ci * KW + kx, o4 * KH + ky, 0) carries
+ * w[ci][4 * o4 + comp][ky][kx] in its four components.  Input channels and
+ * kernel columns are contiguous on x, while output-channel groups and kernel
+ * rows are contiguous on y.  The four output channels of one group therefore
+ * cost one fetch for each input-channel lane and tap.
  */
 void main() {
   const ivec3 pos = ivec3(gl_GlobalInvocationID);
@@ -48,7 +54,6 @@ void main() {
   const int oh = pos.y;
   const int n = pos.z / uBlock.out_c_depth;
   const int o4 = pos.z % uBlock.out_c_depth;
-  const int o = o4 * 4;
 
   vec4 acc = vec4(0.0f);
 
@@ -71,32 +76,24 @@ void main() {
       if (iw < 0 || iw >= uBlock.in_sizes.x) {
         continue;
       }
-      for (int ci = 0; ci < uBlock.in_sizes.z; ++ci) {
-        const float v = texelFetch(
-            uInput,
-            ivec3(iw, ih, n * uBlock.in_c_depth + ci / 4),
-            0)[ci % 4];
-        // Weight texture: {C, O, KH, KW} logical sizes map to
-        // (W=KW, H=KH, C=O, N=C); z carries output channel and input
-        // channel group, the lane the output channel within its group.
-        const vec4 w = vec4(
-            texelFetch(
-                uWeight,
-                ivec3(kx, ky, ci * uBlock.weight_c_depth + (o + 0) / 4),
-                0)[(o + 0) % 4],
-            texelFetch(
-                uWeight,
-                ivec3(kx, ky, ci * uBlock.weight_c_depth + (o + 1) / 4),
-                0)[(o + 1) % 4],
-            texelFetch(
-                uWeight,
-                ivec3(kx, ky, ci * uBlock.weight_c_depth + (o + 2) / 4),
-                0)[(o + 2) % 4],
-            texelFetch(
-                uWeight,
-                ivec3(kx, ky, ci * uBlock.weight_c_depth + (o + 3) / 4),
-                0)[(o + 3) % 4]);
-        acc += v * w;
+      for (int ci4 = 0; ci4 < uBlock.in_c_depth; ++ci4) {
+        // Input texel lanes carry the four input channels of one group.
+        const vec4 vin = texelFetch(
+            uInput, ivec3(iw, ih, n * uBlock.in_c_depth + ci4), 0);
+        for (int lane = 0; lane < 4; ++lane) {
+          const int ci = ci4 * 4 + lane;
+          if (ci >= uBlock.in_sizes.z) {
+            continue;
+          }
+          const vec4 w = texelFetch(
+              uWeight,
+              ivec3(
+                  ci * uBlock.weight_sizes.w + kx,
+                  o4 * uBlock.weight_sizes.z + ky,
+                  0),
+              0);
+          acc = fma(vec4(vin[lane]), w, acc);
+        }
       }
     }
   }
