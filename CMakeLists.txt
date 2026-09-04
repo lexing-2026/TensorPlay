@@ -890,12 +890,9 @@ string(REPLACE "\"" "\\\"" ESCAPED_CXX_FLAGS "${ESCAPED_CXX_FLAGS}")
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/ConfigInfo.h.in"
                "${GEN_BASE_DIR}/tensorplay/ops/Config.h")
 
-# Code generation
+# Code generation: the schema engine is self-contained under tools/codegen.
 file(GLOB_RECURSE tp_codegen_reference CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/pytorch/torchgen/*.py"
-    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/pytorch/tools/autograd/*.py")
-list(APPEND tp_codegen_reference
-    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/pytorch/aten/src/ATen/native/tags.yaml")
+    "${CMAKE_CURRENT_SOURCE_DIR}/tools/codegen/*.py")
 add_custom_command(
             OUTPUT ${GEN_HEADER} ${GEN_CPP} ${GEN_BINDINGS_HEADER}
                    ${GEN_CPYTHON_HEADER}
