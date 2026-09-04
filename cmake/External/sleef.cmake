@@ -30,9 +30,13 @@ if(USE_SYSTEM_SLEEF)
 endif()
 
 if(NOT EXISTS "${CMAKE_CURRENT_LIST_DIR}/../../third_party/sleef/CMakeLists.txt")
-    message(FATAL_ERROR
+    # No vendored checkout (for example a CI build without third_party):
+    # degrade to libm scalar paths instead of failing the configure.
+    message(STATUS
         "Vendored SLEEF checkout not found at third_party/sleef; "
-        "clone it or pass -DUSE_SYSTEM_SLEEF=ON with libsleef on the library path.")
+        "building without vector math acceleration.")
+    set(USE_SLEEF OFF CACHE BOOL "" FORCE)
+    return()
 endif()
 if(NOT EXISTS "${CMAKE_CURRENT_LIST_DIR}/../../third_party/sleef/submodules/tlfloat/CMakeLists.txt")
     message(FATAL_ERROR
@@ -40,10 +44,14 @@ if(NOT EXISTS "${CMAKE_CURRENT_LIST_DIR}/../../third_party/sleef/submodules/tlfl
         "the scalar fallback objects (git submodule update --init submodules/tlfloat).")
 endif()
 
-# Everything set inside this function stays function-local: the private
-# install prefix and the shared-lib switch must not escape to the project.
+# Everything set inside this function stays function-local except the
+# install-prefix cache entry SLEEF's own configure checks; the private
+# prefix keeps the vendored tree's install rules out of the project's.
 function(_tp_add_vendored_sleef)
-    set(CMAKE_INSTALL_PREFIX "${CMAKE_BINARY_DIR}/third_party/sleef-prefix")
+    set(CMAKE_INSTALL_PREFIX "${CMAKE_BINARY_DIR}/third_party/sleef-prefix"
+        CACHE PATH "" FORCE)
+    unset(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+    unset(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT CACHE)
     set(BUILD_SHARED_LIBS OFF)
     set(SLEEF_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
     set(SLEEF_BUILD_LIBM ON CACHE BOOL "" FORCE)
