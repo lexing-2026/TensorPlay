@@ -933,7 +933,202 @@ Tensor log_softmax_kernel_native(const Tensor& self, int64_t dim, DType dtype) {
   return softmax_native_impl(self, dim, true);
 }
 
+namespace {
+
+// One block per (outer, inner) row, matching the forward layout.  The row
+// reduction streams twice: once for the shared factor, once for the write.
+//   softmax:  grad_in = out * (grad - <grad, out>_dim)
+//   log:      grad_in = grad - exp(out) * <grad>_dim
+template <typename scalar_t, typename compute_t, bool LOG_MODE>
+__global__ void softmax_backward_data_kernel(
+    scalar_t* grad_in, const scalar_t* grad, const scalar_t* out,
+    int64_t rows, int64_t softmax_size, int64_t inner_size) {
+  const int64_t row = static_cast<int64_t>(blockIdx.x);
+  if (row >= rows) return;
+  const int64_t outer = row / inner_size;
+  const int64_t inner = row % inner_size;
+  const int64_t base = outer * softmax_size * inner_size + inner;
+  const scalar_t* row_grad = grad + base;
+  const scalar_t* row_out = out + base;
+  scalar_t* row_in = grad_in + base;
+
+  __shared__ compute_t tile[1024];
+  const int tid = static_cast<int>(threadIdx.x);
+
+  compute_t thread_sum = compute_t(0);
+  for (int64_t j = tid; j < softmax_size; j += blockDim.x) {
+    thread_sum += static_cast<compute_t>(row_grad[j * inner_size]) *
+                  (LOG_MODE ? compute_t(1)
+                            : static_cast<compute_t>(row_out[j * inner_size]));
+  }
+  tile[tid] = thread_sum;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s) tile[tid] += tile[tid + s];
+    __syncthreads();
+  }
+  const compute_t factor = tile[0];
+
+  for (int64_t j = tid; j < softmax_size; j += blockDim.x) {
+    const compute_t g = static_cast<compute_t>(row_grad[j * inner_size]);
+    const compute_t o = static_cast<compute_t>(row_out[j * inner_size]);
+    compute_t v;
+    if constexpr (LOG_MODE) {
+      v = g - std::exp(o) * factor;
+    } else {
+      v = o * (g - factor);
+    }
+    row_in[j * inner_size] = static_cast<scalar_t>(v);
+  }
+}
+
+// grad_output drives the result dtype; reduced-width inputs accumulate and
+// compute in float.  grad_output may carry float32 for a half input (the
+// half_to_float forward path), in which case the result casts back to the
+// input dtype.
+Tensor softmax_backward_native_impl(const Tensor& grad_output,
+                                    const Tensor& output, int64_t dim,
+                                    DType input_dtype, bool log_mode) {
+  Tensor g = grad_output.dim() == 0 ? grad_output.view({1}) : grad_output;
+  Tensor o = output.dim() == 0 ? output.view({1}) : output;
+  const int64_t nd = g.dim();
+  const int64_t d = dim < 0 ? dim + nd : dim;
+  if (d < 0 || d >= nd) {
+    TP_THROW(IndexError,
+             "dim must be non-negative and less than input dimensions");
+  }
+  DType result_dtype = g.dtype();
+  if (result_dtype != input_dtype && result_dtype == DType::Float32 &&
+      input_dtype == DType::Float16) {
+    result_dtype = DType::Float16;
+  }
+  if (!isFloatingType(result_dtype)) {
+    TP_THROW(TypeError, "unsupported dtype for softmax backward");
+  }
+
+  Tensor result =
+      Tensor::empty(static_cast<std::vector<int64_t>>(g.shape()), result_dtype,
+                    g.device());
+  if (g.numel() == 0) return result;
+
+  Tensor gc = g.contiguous();
+  Tensor oc = o.contiguous().to(gc.dtype());
+  Tensor result_work = result_dtype == gc.dtype()
+                           ? result
+                           : Tensor::empty(
+                                 static_cast<std::vector<int64_t>>(g.shape()),
+                                 gc.dtype(), g.device());
+
+  int64_t outer = 1;
+  for (int64_t i = 0; i < d; ++i) outer *= gc.size(i);
+  int64_t inner = 1;
+  for (int64_t i = d + 1; i < gc.dim(); ++i) inner *= gc.size(i);
+  const int64_t dim_size = gc.size(d);
+  const int64_t rows = outer * inner;
+  const int threads = dim_size < 256 ? 32 : 256;
+
+  #define TP_SOFTMAX_BWD_LAUNCH(ctype, acc)                                \
+  if (log_mode) {                                                          \
+    constexpr bool LOG_MODE = true;                                        \
+    softmax_backward_data_kernel<ctype, acc, LOG_MODE>                     \
+        <<<static_cast<unsigned>(rows), threads, 0,                        \
+           getCurrentCUDAStream().stream()>>>(                             \
+            result_work.data_ptr<ctype>(), gc.data_ptr<ctype>(),           \
+            oc.data_ptr<ctype>(), rows, dim_size, inner);                  \
+  } else {                                                                 \
+    constexpr bool LOG_MODE = false;                                       \
+    softmax_backward_data_kernel<ctype, acc, LOG_MODE>                     \
+        <<<static_cast<unsigned>(rows), threads, 0,                        \
+           getCurrentCUDAStream().stream()>>>(                             \
+            result_work.data_ptr<ctype>(), gc.data_ptr<ctype>(),           \
+            oc.data_ptr<ctype>(), rows, dim_size, inner);                  \
+  }
+
+  switch (gc.dtype()) {
+    case DType::Float32:
+      TP_SOFTMAX_BWD_LAUNCH(float, float)
+      break;
+    case DType::Float64:
+      TP_SOFTMAX_BWD_LAUNCH(double, double)
+      break;
+    case DType::Float16:
+      TP_SOFTMAX_BWD_LAUNCH(Half, float)
+      break;
+    case DType::BFloat16:
+      TP_SOFTMAX_BWD_LAUNCH(BFloat16, float)
+      break;
+    default:
+      TP_THROW(TypeError, "unsupported dtype for softmax backward");
+  }
+  #undef TP_SOFTMAX_BWD_LAUNCH
+  CUDA_CHECK(cudaGetLastError());
+
+  if (result_work.data_ptr() != result.data_ptr()) {
+    result.copy_(result_work);
+  }
+  return result;
+}
+
+}  // namespace
+
+Tensor _softmax_backward_data_cuda(const Tensor& grad_output,
+                                   const Tensor& output, int64_t dim,
+                                   DType input_dtype) {
+  return softmax_backward_native_impl(grad_output, output, dim, input_dtype,
+                                      /*log_mode=*/false);
+}
+
+Tensor& _softmax_backward_data_out_cuda(const Tensor& grad_output,
+                                        const Tensor& output, int64_t dim,
+                                        DType input_dtype, Tensor& grad_input) {
+  grad_input = softmax_backward_native_impl(grad_output, output, dim,
+                                            input_dtype, /*log_mode=*/false);
+  return grad_input;
+}
+
+Tensor _log_softmax_backward_data_cuda(const Tensor& grad_output,
+                                       const Tensor& output, int64_t dim,
+                                       DType input_dtype) {
+  return softmax_backward_native_impl(grad_output, output, dim, input_dtype,
+                                      /*log_mode=*/true);
+}
+
+Tensor& _log_softmax_backward_data_out_cuda(const Tensor& grad_output,
+                                            const Tensor& output, int64_t dim,
+                                            DType input_dtype,
+                                            Tensor& grad_input) {
+  grad_input = softmax_backward_native_impl(grad_output, output, dim,
+                                            input_dtype, /*log_mode=*/true);
+  return grad_input;
+}
+
+Tensor& _softmax_out_cuda(const Tensor& self, int64_t dim, bool half_to_float,
+                          Tensor& out) {
+  if (half_to_float) {
+    TP_THROW(RuntimeError,
+             "softmax with half to float conversion is not supported on this backend");
+  }
+  out = softmax_native_impl(self, dim, false);
+  return out;
+}
+
+Tensor& _log_softmax_out_cuda(const Tensor& self, int64_t dim,
+                              bool half_to_float, Tensor& out) {
+  if (half_to_float) {
+    TP_THROW(RuntimeError,
+             "log_softmax with half to float conversion is not supported on this backend");
+  }
+  out = softmax_native_impl(self, dim, true);
+  return out;
+}
+
 TENSORPLAY_LIBRARY_IMPL(CUDA, ActivationKernels) {
+    m.impl("_softmax.out", _softmax_out_cuda);
+    m.impl("_log_softmax.out", _log_softmax_out_cuda);
+    m.impl("_softmax_backward_data", _softmax_backward_data_cuda);
+    m.impl("_softmax_backward_data.out", _softmax_backward_data_out_cuda);
+    m.impl("_log_softmax_backward_data", _log_softmax_backward_data_cuda);
+    m.impl("_log_softmax_backward_data.out", _log_softmax_backward_data_out_cuda);
 #if defined(USE_CUDNN) && !defined(USE_ROCM)
     m.impl("relu", relu_kernel_cudnn);
     m.impl("relu_", relu_inplace_kernel_cudnn);

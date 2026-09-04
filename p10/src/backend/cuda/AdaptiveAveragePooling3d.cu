@@ -257,9 +257,31 @@ Tensor adaptive_avg_pool3d_backward_native_cuda(const Tensor& grad_output,
 
 } // namespace
 
+namespace {
+
+Tensor& adaptive_avg_pool3d_out_cuda(const Tensor& self,
+                                     const std::vector<int64_t>& output_size,
+                                     Tensor& out) {
+    out = adaptive_avg_pool3d_native_cuda(self, output_size);
+    return out;
+}
+
+Tensor& adaptive_avg_pool3d_backward_grad_input_cuda(const Tensor& grad_output,
+                                                     const Tensor& input,
+                                                     Tensor& grad_input) {
+    grad_input =
+        adaptive_avg_pool3d_backward_native_cuda(grad_output, input);
+    return grad_input;
+}
+
+} // namespace
+
 TENSORPLAY_LIBRARY_IMPL(CUDA, NativeAdaptiveAveragePool3d) {
     m.impl("adaptive_avg_pool3d", adaptive_avg_pool3d_native_cuda);
     m.impl("adaptive_avg_pool3d_backward", adaptive_avg_pool3d_backward_native_cuda);
+    m.impl("adaptive_avg_pool3d.out", adaptive_avg_pool3d_out_cuda);
+    m.impl("adaptive_avg_pool3d_backward.grad_input",
+           adaptive_avg_pool3d_backward_grad_input_cuda);
 }
 
 } // namespace cuda

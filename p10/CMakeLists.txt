@@ -154,7 +154,6 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/CUDAAllocator.cpp
         src/backend/cuda/CUDAContext.cpp
         src/backend/cuda/CUDAGenerator.cpp
-        src/backend/cuda/NCCLContext.cpp
         src/backend/cuda/CUDARuntime.cpp
         src/backend/cuda/CUDAGraph.cpp
         src/backend/cuda/CUDAGraphKernels.cu
@@ -214,6 +213,7 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/SpecialAliasKernels.cu
         src/backend/cuda/AttentionKernels.cu
         src/backend/cuda/IndexingKernels.cu
+        src/backend/cuda/InteropAliasKernels.cu
         src/backend/cuda/TierOpsKernels.cu
         src/backend/cuda/BitwiseKernels.cu
         src/backend/cuda/TierOpsReduceKernels.cu
@@ -233,6 +233,8 @@ if(USE_CUDA OR USE_ROCM)
         # Compile the hipify-staged translations instead of the originals.
         tp_map_sources(TP_CUDA_BACKEND_SOURCES ${TP_CUDA_BACKEND_SOURCES})
         list(APPEND P10_SOURCES ${TP_CUDA_BACKEND_SOURCES})
+        list(APPEND P10_SOURCES
+            "${TP_HIP_STAGING}/p10/src/backend/hip/NCCLContext.cpp")
         # The staged tree also carries translated copies of every shared
         # source; swap the ones whose original TU touches GPU APIs.
         # ProfilerCupti is dropped; the stub keeps its symbols as no-ops
@@ -251,6 +253,7 @@ if(USE_CUDA OR USE_ROCM)
         list(APPEND P10_SOURCES ${TP_P10_SHARED_GPU_SOURCES}
             src/ProfilerCuptiStub.cpp)
     else()
+        list(APPEND TP_CUDA_BACKEND_SOURCES src/backend/cuda/NCCLContext.cpp)
         list(APPEND P10_SOURCES ${TP_CUDA_BACKEND_SOURCES})
     endif()
 endif()
@@ -544,7 +547,7 @@ if(USE_CUDA)
     if(EXISTS "${CUDAToolkit_INCLUDE_DIRS}/cccl/cub")
         target_include_directories(p10 PRIVATE "${CUDAToolkit_INCLUDE_DIRS}/cccl")
     endif()
-    # positive USE_NCCL define, graceful downgrade when absent.
+    # Enable NCCL for CUDA builds when it is selected.
     option(USE_NCCL "Use NCCL for tensorplay.distributed" ON)
     if(USE_NCCL)
         option(USE_SYSTEM_NCCL "Use a system-wide NCCL" OFF)
@@ -570,11 +573,13 @@ if(USE_CUDA)
     endif()
 endif()
 if(USE_ROCM)
+    target_include_directories(p10 SYSTEM PRIVATE ${RCCL_INCLUDE_DIRS})
+    target_link_libraries(p10 PRIVATE tp::rccl)
     target_link_libraries(p10 PRIVATE ${TP_HIP_LIBRARIES})
     # The staged tree keeps the CUDA-spelling guard names, so the target
     # carries both defines: existing #ifdef USE_CUDA blocks activate and
     # route to the HIP-backed implementations.
-    target_compile_definitions(p10 PRIVATE USE_CUDA USE_ROCM)
+    target_compile_definitions(p10 PRIVATE USE_CUDA USE_ROCM USE_RCCL)
     if(USE_CUDNN)
         # The staged compatibility header re-creates the descriptor-style
         # DNN surface on top of MIOpen; this define activates the guarded

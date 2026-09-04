@@ -6,8 +6,10 @@
 #include "Allocator.h"
 #include "Utils.h"
 #include "TypePromotion.h"
+#include "tensorplay/ops/TPXOpsGenerated.h"
 #include "CUDABroadcast.cuh"
 #include "CUDAComplex.cuh"
+#include "ElementwiseStrided.cuh"
 #include "GradMode.h"
 #include <thrust/complex.h>
 #include <cuda_runtime.h>
@@ -15,6 +17,10 @@
 
 namespace tensorplay {
 namespace cuda {
+
+namespace ops = tensorplay::tpx::ops;
+
+Tensor glu_backward_cuda(const Tensor& grad_output, const Tensor& self, int64_t dim);
 
 // RAII over thread-local GradMode for mutation-free sections.
 struct NoGradGuard {
@@ -172,35 +178,6 @@ void launch_unary_reduced_float(int64_t n, const T* in, T* out, Func func) {
     }
 }
 
-// Generic Unary Dispatcher
-template<typename Func>
-Tensor unary_op_kernel(const Tensor& self, Func func) {
-    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
-    int64_t n = self.numel();
-    if (n == 0) return result;
-    
-    dim3 block(256);
-    dim3 grid((n + 255) / 256);
-    
-    // For now, assume contiguous. TODO: Handle non-contiguous via collapse or strides
-    Tensor self_contig = self.contiguous();
-    
-    #define OP_CASE(ctype, name) \
-    case DType::name: { \
-        unary_kernel_cuda_impl<ctype><<<grid, block, 0, getCurrentCUDAStream().stream()>>>(n, self_contig.data_ptr<ctype>(), result.data_ptr<ctype>(), func); \
-        break; \
-    }
-
-    switch (self.dtype()) {
-        TENSORPLAY_FORALL_SCALAR_TYPES(OP_CASE)
-        default: TP_THROW(TypeError, "CUDA unary op: Unsupported dtype");
-    }
-    #undef OP_CASE
-    
-    CUDA_CHECK(cudaGetLastError());
-    return result;
-}
-
 struct AbsFunctor { template<typename T> __device__ T operator()(T x) const { return x >= T(0) ? x : -x; } };
 struct NegFunctor { template<typename T> __device__ T operator()(T x) const { return -x; } };
 struct SquareFunctor { template<typename T> __device__ T operator()(T x) const { return x * x; } };
@@ -212,7 +189,9 @@ struct SignFunctor {
     } 
 };
 
-// Revised unary_op_kernel to use Functor with templated operator
+// Unary dispatcher: vectorized contiguous fast path, iterator-driven strided
+// kernel for views/permutations, contiguous-copy fallback for pathological
+// coalesced ranks.
 template<typename Functor>
 Tensor unary_op_kernel_v2(const Tensor& self, Functor functor) {
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
@@ -220,11 +199,17 @@ Tensor unary_op_kernel_v2(const Tensor& self, Functor functor) {
     if (n == 0) return result;
     dim3 block(256);
     dim3 grid((n + 255) / 256);
-    Tensor self_contig = self.contiguous();
     
     #define OP_CASE(ctype, name) \
     case DType::name: { \
-        launch_unary<ctype>(n, self_contig.data_ptr<ctype>(), result.data_ptr<ctype>(), functor); \
+        if (self.is_contiguous()) { \
+            launch_unary<ctype>(n, self.data_ptr<ctype>(), result.data_ptr<ctype>(), functor); \
+        } else if (!launch_unary_strided<ctype>(self, result, functor)) { \
+            Tensor self_contig = self.contiguous(); \
+            unary_kernel_cuda_impl<ctype><<<grid, block, 0, getCurrentCUDAStream().stream()>>>( \
+                n, self_contig.data_ptr<ctype>(), result.data_ptr<ctype>(), functor); \
+            CUDA_CHECK(cudaGetLastError()); \
+        } \
         break; \
     }
     switch (self.dtype()) {
@@ -859,6 +844,16 @@ Tensor log_sigmoid_kernel_cuda(const Tensor& self) {
 Tensor log_sigmoid_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self) {
     return activation_backward_kernel_cuda(grad_output, self, LogSigmoidBackwardFunctor());
 }
+// out-variant: the saved buffer only feeds the CPU loop's stable form; the
+// CUDA elementwise formula recomputes the same expression from x directly.
+Tensor& log_sigmoid_backward_out_cuda(const Tensor& grad_output,
+                                      const Tensor& self, const Tensor& buffer,
+                                      Tensor& grad_input) {
+    (void)buffer;
+    grad_input = activation_backward_kernel_cuda(grad_output, self,
+                                                 LogSigmoidBackwardFunctor());
+    return grad_input;
+}
 
 // the caller-provided noise; eval is leaky_relu with slope (lower+upper)/2.
 template<typename Functor>
@@ -903,6 +898,63 @@ Tensor binary_float_op_kernel_v2(const Tensor& self, const Tensor& other, Functo
 Tensor rrelu_with_noise_kernel_cuda(const Tensor& self, const Tensor& noise, Scalar lower, Scalar upper, bool training) {
     return binary_float_op_kernel_v2(self, noise,
         RreluWithNoiseFunctor(lower.toDouble(), upper.toDouble(), training));
+}
+// inplace out-variant: recompute and write back through the same functor.
+Tensor& rrelu_with_noise__cuda(Tensor& self, Tensor& noise, Scalar lower,
+                               Scalar upper, bool training) {
+    Tensor result = binary_float_op_kernel_v2(self, noise,
+        RreluWithNoiseFunctor(lower.toDouble(), upper.toDouble(), training));
+    self.copy_(result);
+    return self;
+}
+// out-variant of the forward: the noise buffer is filled on the fly and
+// returned alongside the result.
+Tensor rrelu_with_noise_out_cuda(const Tensor& self, Tensor& noise, Scalar lower,
+                                 Scalar upper, bool training) {
+    noise = binary_float_op_kernel_v2(self, noise,
+        RreluWithNoiseFunctor(lower.toDouble(), upper.toDouble(), training));
+    return noise;
+}
+// log_sigmoid forward with its saved buffer: log_sigmoid(x) = -softplus(-x);
+// the buffer caches exp(-|x|), the stable remainder of the softplus
+// evaluation the backward reuses elementwise.  Composed from the elementwise
+// kernels in this translation unit and the dispatched add/sub wrappers.
+std::tuple<Tensor, Tensor> log_sigmoid_forward_components_cuda(const Tensor& self) {
+    const Scalar one(1.0);
+    Tensor b = exp_kernel_cuda(neg_kernel_cuda(abs_kernel_cuda(self)));  // exp(-|x|)
+    Tensor one_plus_b = b + one;
+    Tensor log_b = log_kernel_cuda(b);
+    Tensor log_one_plus_b = log_kernel_cuda(one_plus_b);
+    Tensor pos_branch = log_b - log_one_plus_b;        // log(b) - log(1+b)
+    Tensor neg_branch = self + log_b;                  // x + log(b), x < 0
+    Tensor output = ops::where(self.lt(Scalar(0.0)), neg_branch, pos_branch);
+    return {output, b};
+}
+// out-variants: run the value kernel, then transfer into the caller's buffer.
+Tensor& gelu_out_cuda(const Tensor& self, const std::string& approximate,
+                      Tensor& out) {
+    out = gelu_kernel_cuda_v2(self, approximate);
+    return out;
+}
+Tensor& gelu_backward_grad_input_cuda(const Tensor& grad_output,
+                                      const Tensor& self,
+                                      const std::string& approximate,
+                                      Tensor& grad_input) {
+    grad_input = gelu_backward_kernel_cuda(grad_output, self, approximate);
+    return grad_input;
+}
+Tensor& glu_backward_grad_input_cuda(const Tensor& grad_output, const Tensor& self,
+                                     int64_t dim, Tensor& grad_input) {
+    grad_input = glu_backward_cuda(grad_output, self, dim);
+    return grad_input;
+}
+std::tuple<Tensor, Tensor> log_sigmoid_forward_out_cuda(const Tensor& self,
+                                                        Tensor& output,
+                                                        Tensor& buffer) {
+    auto [o, b] = log_sigmoid_forward_components_cuda(self);
+    output = std::move(o);
+    buffer = std::move(b);
+    return std::make_tuple(output, buffer);
 }
 Tensor rrelu_with_noise_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self, const Tensor& noise, Scalar lower, Scalar upper, bool training, bool self_is_result) {
     // (masked by self here, see functor note); eval -> leaky_relu_backward
@@ -2096,8 +2148,17 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, PointwiseKernels) {
     m.impl("softplus_backward", softplus_backward_kernel_cuda);
     m.impl("log_sigmoid", log_sigmoid_kernel_cuda);
     m.impl("log_sigmoid_backward", log_sigmoid_backward_kernel_cuda);
+    m.impl("log_sigmoid_backward.grad_input", log_sigmoid_backward_out_cuda);
+    m.impl("log_sigmoid_forward", log_sigmoid_forward_components_cuda);
+    m.impl("log_sigmoid_forward.output", log_sigmoid_forward_out_cuda);
     m.impl("rrelu_with_noise", rrelu_with_noise_kernel_cuda);
+    m.impl("rrelu_with_noise.out", rrelu_with_noise_out_cuda);
+    m.impl("rrelu_with_noise_", rrelu_with_noise__cuda);
     m.impl("rrelu_with_noise_backward", rrelu_with_noise_backward_kernel_cuda);
+
+    m.impl("gelu.out", gelu_out_cuda);
+    m.impl("gelu_backward.grad_input", gelu_backward_grad_input_cuda);
+    m.impl("glu_backward.grad_input", glu_backward_grad_input_cuda);
     
     m.impl("clamp", clamp_kernel_cuda);
     m.impl("clamp_backward", clamp_backward_kernel_cuda);
@@ -2137,6 +2198,7 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, PointwiseKernels) {
     m.impl("pow.Tensor_Tensor", pow_kernel_cuda);
     m.impl("pow.Tensor_Scalar", pow_scalar_kernel_cuda);
     m.impl("atan2", atan2_kernel_cuda);
+    m.impl("arctan2", atan2_kernel_cuda);
     
     m.impl("lerp", lerp_scalar_kernel_cuda);
     m.impl("lerp.Tensor", lerp_tensor_kernel_cuda);

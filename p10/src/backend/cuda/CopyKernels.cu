@@ -331,8 +331,115 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
     return self;
 }
 
+// Extract the single element of a 1-element device tensor.  The value is
+// staged through a synchronous device-to-host copy so the result reflects all
+// work queued on the current stream.
+Scalar item_cuda(const Tensor& self) {
+    if (!self.defined()) {
+        TP_THROW(RuntimeError, "Tensor not defined");
+    }
+    std::shared_ptr<TensorImpl> impl = self.unsafeGetTensorImpl();
+    if (impl->is_sparse()) {
+        TP_THROW(RuntimeError, "item() is not supported for sparse tensors");
+    }
+    if (impl->numel() != 1) {
+        TP_THROW(ValueError, "item() only supported for 1-element tensors");
+    }
+    if (!impl->device().is_cuda()) {
+        TP_THROW(RuntimeError, "item(): expected a CUDA tensor but got ",
+                 impl->device().toString());
+    }
+
+    const void* src = self.data_ptr();
+    // A 1-element tensor addresses its only element directly; strides are
+    // irrelevant and data_ptr() already includes the storage offset.
+    switch (impl->dtype()) {
+        case DType::Float32: {
+            float v; checkCuda(cudaMemcpy(&v, src, sizeof(v), cudaMemcpyDeviceToHost), "item D2H");
+            return Scalar(static_cast<double>(v));
+        }
+        case DType::Float64: {
+            double v; checkCuda(cudaMemcpy(&v, src, sizeof(v), cudaMemcpyDeviceToHost), "item D2H");
+            return Scalar(v);
+        }
+        case DType::Float16: {
+            Half v; checkCuda(cudaMemcpy(&v, src, sizeof(v), cudaMemcpyDeviceToHost), "item D2H");
+            return Scalar(static_cast<float>(v));
+        }
+        case DType::BFloat16: {
+            BFloat16 v; checkCuda(cudaMemcpy(&v, src, sizeof(v), cudaMemcpyDeviceToHost), "item D2H");
+            return Scalar(static_cast<float>(v));
+        }
+        case DType::Float8_e4m3fn: {
+            Float8_e4m3fn v; checkCuda(cudaMemcpy(&v, src, sizeof(v), cudaMemcpyDeviceToHost), "item D2H");
+            return Scalar(static_cast<float>(v));
+        }
+        case DType::Float8_e5m2: {
+            Float8_e5m2 v; checkCuda(cudaMemcpy(&v, src, sizeof(v), cudaMemcpyDeviceToHost), "item D2H");
+            return Scalar(static_cast<float>(v));
+        }
+        case DType::Int8: {
+            int8_t v; checkCuda(cudaMemcpy(&v, src, sizeof(v), cudaMemcpyDeviceToHost), "item D2H");
+            return Scalar(static_cast<int64_t>(v));
+        }
+        case DType::Int16: {
+            int16_t v; checkCuda(cudaMemcpy(&v, src, sizeof(v), cudaMemcpyDeviceToHost), "item D2H");
+            return Scalar(static_cast<int64_t>(v));
+        }
+        case DType::Int32: {
+            int32_t v; checkCuda(cudaMemcpy(&v, src, sizeof(v), cudaMemcpyDeviceToHost), "item D2H");
+            return Scalar(static_cast<int64_t>(v));
+        }
+        case DType::Int64: {
+            int64_t v; checkCuda(cudaMemcpy(&v, src, sizeof(v), cudaMemcpyDeviceToHost), "item D2H");
+            return Scalar(v);
+        }
+        case DType::UInt8: {
+            uint8_t v; checkCuda(cudaMemcpy(&v, src, sizeof(v), cudaMemcpyDeviceToHost), "item D2H");
+            return Scalar(static_cast<uint64_t>(v));
+        }
+        case DType::UInt16: {
+            uint16_t v; checkCuda(cudaMemcpy(&v, src, sizeof(v), cudaMemcpyDeviceToHost), "item D2H");
+            return Scalar(static_cast<uint64_t>(v));
+        }
+        case DType::UInt32: {
+            uint32_t v; checkCuda(cudaMemcpy(&v, src, sizeof(v), cudaMemcpyDeviceToHost), "item D2H");
+            return Scalar(static_cast<uint64_t>(v));
+        }
+        case DType::UInt64: {
+            uint64_t v; checkCuda(cudaMemcpy(&v, src, sizeof(v), cudaMemcpyDeviceToHost), "item D2H");
+            return Scalar(v);
+        }
+        case DType::Bool: {
+            bool v; checkCuda(cudaMemcpy(&v, src, sizeof(v), cudaMemcpyDeviceToHost), "item D2H");
+            return Scalar(v);
+        }
+        case DType::ComplexHalf: {
+            std::complex<Half> v; checkCuda(cudaMemcpy(&v, src, sizeof(v), cudaMemcpyDeviceToHost), "item D2H");
+            return Scalar(std::complex<float>(static_cast<float>(v.real()),
+                                              static_cast<float>(v.imag())));
+        }
+        case DType::ComplexFloat: {
+            std::complex<float> v; checkCuda(cudaMemcpy(&v, src, sizeof(v), cudaMemcpyDeviceToHost), "item D2H");
+            return Scalar(v);
+        }
+        case DType::ComplexDouble: {
+            std::complex<double> v; checkCuda(cudaMemcpy(&v, src, sizeof(v), cudaMemcpyDeviceToHost), "item D2H");
+            return Scalar(v);
+        }
+        case DType::BComplex32: {
+            std::complex<BFloat16> v; checkCuda(cudaMemcpy(&v, src, sizeof(v), cudaMemcpyDeviceToHost), "item D2H");
+            return Scalar(std::complex<float>(static_cast<float>(v.real()),
+                                              static_cast<float>(v.imag())));
+        }
+        default:
+            TP_THROW(NotImplementedError, "item() not implemented for this dtype");
+    }
+}
+
 TENSORPLAY_LIBRARY_IMPL(CUDA, CopyKernels) {
     m.impl("copy_", copy_kernel);
+    m.impl("item", item_cuda);
     m.impl("sparse_coo_tensor", sparse_coo_tensor_cuda);
     m.impl("sparse_mask", sparse_mask_cuda);
     m.impl("to_dense", to_dense_sparse_cuda);

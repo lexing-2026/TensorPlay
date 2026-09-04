@@ -177,14 +177,6 @@ Tensor empty_kernel(const std::vector<int64_t>& size, DType dtype, Device device
     return Tensor(size, dtype, device);
 }
 
-Tensor rand_like_kernel(const Tensor& self, DType dtype, std::optional<Device> device) {
-    if (dtype == DType::Undefined) dtype = self.dtype();
-    // For now we don't have rand_kernel exposed here, but we can implement it or leave it
-    // Wait, RandomKernels.cu should implement rand/randn.
-    // Let's just implement zeros_like/ones_like/empty_like which rely on kernels in this file.
-    TP_THROW(NotImplementedError, "rand_like not fully implemented in FactoryKernels.cu");
-}
-
 Tensor zeros_like_kernel(const Tensor& self, DType dtype, std::optional<Device> device) {
     if (dtype == DType::Undefined) dtype = self.dtype();
     Device dev = device.has_value() ? *device : self.device();
@@ -496,6 +488,22 @@ Tensor empty_stub(const std::vector<int64_t>& size, std::optional<DType> dtype,
                         device.value_or(Device(DeviceType::CUDA)), pin_memory);
 }
 
+Tensor empty_memory_format_stub(const std::vector<int64_t>& size,
+                                std::optional<DType> dtype,
+                                std::optional<int64_t> layout,
+                                std::optional<Device> device,
+                                std::optional<bool> pin_memory,
+                                std::optional<int64_t> memory_format) {
+    (void)memory_format;
+    if (layout.has_value() && *layout != 2) {
+        TP_THROW(NotImplementedError,
+                 "empty is only implemented for strided (dense) layout tensors");
+    }
+    return empty_kernel(size, resolve_factory_dtype(dtype),
+                        device.value_or(Device(DeviceType::CUDA)),
+                        pin_memory.value_or(false));
+}
+
 Tensor full_stub(const std::vector<int64_t>& size, Scalar fill_value,
                  DType dtype, std::optional<Device> device, bool pin_memory) {
     return full_kernel(size, fill_value, dtype,
@@ -534,6 +542,7 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, FactoryKernels) {
     m.impl("zeros", zeros_stub);
     m.impl("ones", ones_stub);
     m.impl("empty", empty_stub);
+    m.impl("empty.memory_format", empty_memory_format_stub);
     m.impl("zeros_like", zeros_like_kernel);
     m.impl("ones_like", ones_like_kernel);
     m.impl("empty_like", empty_like_kernel);

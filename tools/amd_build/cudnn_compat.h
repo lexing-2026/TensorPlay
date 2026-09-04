@@ -464,6 +464,25 @@ inline miopenStatus_t cudnnConvolutionForward(
         static_cast<miopenConvFwdAlgorithm_t>(algo), beta, yDesc, y, workSpace,
         workSpaceSize);
     if (s == miopenStatusSuccess) return s;
+    // The library registers the kernel invoker for a problem only during the
+    // measured search, so the classic execute stays unavailable until one find
+    // pass has run.  Do the (non-exhaustive) search with this call's own
+    // buffers and retry the classic execute before falling back to the
+    // immediate route.
+    {
+        miopenConvAlgoPerf_t perf;
+        int found = 0;
+        if (miopenFindConvolutionForwardAlgorithm(
+                handle, xDesc, x, wDesc, w, convDesc, yDesc, y, 1, &found,
+                &perf, workSpace, workSpaceSize, false) == miopenStatusSuccess &&
+            found > 0) {
+            s = miopenConvolutionForward(
+                handle, alpha, xDesc, x, wDesc, w, convDesc,
+                static_cast<miopenConvFwdAlgorithm_t>(algo), beta, yDesc, y,
+                workSpace, workSpaceSize);
+            if (s == miopenStatusSuccess) return s;
+        }
+    }
     miopenConvSolution_t solution;
     size_t count = 0;
     s = miopenConvolutionForwardGetSolution(handle, wDesc, xDesc, convDesc,
@@ -487,6 +506,21 @@ inline miopenStatus_t cudnnConvolutionBackwardData(
         static_cast<miopenConvBwdDataAlgorithm_t>(algo), beta, dxDesc, dx,
         workSpace, workSpaceSize);
     if (s == miopenStatusSuccess) return s;
+    {
+        miopenConvAlgoPerf_t perf;
+        int found = 0;
+        if (miopenFindConvolutionBackwardDataAlgorithm(
+                handle, dyDesc, dy, wDesc, w, convDesc, dxDesc, dx, 1, &found,
+                &perf, workSpace, workSpaceSize,
+                false) == miopenStatusSuccess &&
+            found > 0) {
+            s = miopenConvolutionBackwardData(
+                handle, alpha, dyDesc, dy, wDesc, w, convDesc,
+                static_cast<miopenConvBwdDataAlgorithm_t>(algo), beta, dxDesc,
+                dx, workSpace, workSpaceSize);
+            if (s == miopenStatusSuccess) return s;
+        }
+    }
     miopenConvSolution_t solution;
     size_t count = 0;
     s = miopenConvolutionBackwardDataGetSolution(handle, dyDesc, wDesc,
@@ -512,6 +546,21 @@ inline miopenStatus_t cudnnConvolutionBackwardFilter(
         static_cast<miopenConvBwdWeightsAlgorithm_t>(algo), beta, dwDesc, dw,
         workSpace, workSpaceSize);
     if (s == miopenStatusSuccess) return s;
+    {
+        miopenConvAlgoPerf_t perf;
+        int found = 0;
+        if (miopenFindConvolutionBackwardWeightsAlgorithm(
+                handle, dyDesc, dy, xDesc, x, convDesc, dwDesc, dw, 1, &found,
+                &perf, workSpace, workSpaceSize,
+                false) == miopenStatusSuccess &&
+            found > 0) {
+            s = miopenConvolutionBackwardWeights(
+                handle, alpha, dyDesc, dy, xDesc, x, convDesc,
+                static_cast<miopenConvBwdWeightsAlgorithm_t>(algo), beta,
+                dwDesc, dw, workSpace, workSpaceSize);
+            if (s == miopenStatusSuccess) return s;
+        }
+    }
     miopenConvSolution_t solution;
     size_t count = 0;
     s = miopenConvolutionBackwardWeightsGetSolution(handle, dyDesc, xDesc,
@@ -599,7 +648,35 @@ inline miopenStatus_t cudnnConvolutionBiasActivationForward(
     s = miopenConvolutionForward(handle, alpha1, xDesc, x, wDesc, w, convDesc,
                                  algo, zero, yDesc, y, workSpace,
                                  workSpaceSize);
-    if (s != miopenStatusSuccess) return s;
+    if (s == miopenStatusSuccess) {
+        // fall through to the bias+activation tail below
+    } else {
+        // Same invoker-registration requirement as the plain forward: run the
+        // measured search once, then retry both entry points.
+        miopenConvAlgoPerf_t perf;
+        int found = 0;
+        miopenFindConvolutionForwardAlgorithm(
+            handle, xDesc, x, wDesc, w, convDesc, yDesc, y, 1, &found, &perf,
+            workSpace, workSpaceSize, false);
+        s = miopenConvolutionForward(handle, alpha1, xDesc, x, wDesc, w,
+                                     convDesc, algo, zero, yDesc, y,
+                                     workSpace, workSpaceSize);
+        if (s != miopenStatusSuccess) {
+            miopenConvSolution_t solution;
+            size_t count = 0;
+            if (miopenConvolutionForwardGetSolution(handle, wDesc, xDesc,
+                                                    convDesc, yDesc, 1, &count,
+                                                    &solution) !=
+                        miopenStatusSuccess ||
+                count == 0) {
+                return s;
+            }
+            s = miopenConvolutionForwardImmediate(
+                handle, wDesc, w, xDesc, x, convDesc, yDesc, y, workSpace,
+                workSpaceSize, solution.solution_id);
+            if (s != miopenStatusSuccess) return s;
+        }
+    }
     miopenDataType_t dt = tp_miopen_compat::descriptor_dtype(yDesc);
     const void* one = tp_miopen_compat::scalar_one(dt);
     s = miopenOpTensor(handle, miopenTensorOpAdd, zero, yDesc, y, one, biasDesc,

@@ -307,6 +307,23 @@ static Tensor constant_pad_nd_backward_cuda(const Tensor& grad_output,
     return constant_pad_nd_cuda(grad_output, negated_pad, Scalar(0));
 }
 
+// .grad_input out-variants: run the rank-generic backward and hand the
+// result over through the caller's buffer.
+#define DEFINE_PAD_BACKWARD_OUT_CUDA(NAME, MODE_KERNEL)                       \
+Tensor& NAME##_grad_input_cuda(const Tensor& grad_output, const Tensor& self, \
+                               const std::vector<int64_t>& pad,               \
+                               Tensor& grad_input) {                          \
+    grad_input = MODE_KERNEL(grad_output, self, pad);                         \
+    return grad_input;                                                        \
+}
+DEFINE_PAD_BACKWARD_OUT_CUDA(reflection_pad1d_backward, reflection_pad_nd_backward_cuda)
+DEFINE_PAD_BACKWARD_OUT_CUDA(reflection_pad2d_backward, reflection_pad_nd_backward_cuda)
+DEFINE_PAD_BACKWARD_OUT_CUDA(reflection_pad3d_backward, reflection_pad_nd_backward_cuda)
+DEFINE_PAD_BACKWARD_OUT_CUDA(replication_pad1d_backward, replication_pad_nd_backward_cuda)
+DEFINE_PAD_BACKWARD_OUT_CUDA(replication_pad2d_backward, replication_pad_nd_backward_cuda)
+DEFINE_PAD_BACKWARD_OUT_CUDA(replication_pad3d_backward, replication_pad_nd_backward_cuda)
+#undef DEFINE_PAD_BACKWARD_OUT_CUDA
+
 TENSORPLAY_LIBRARY_IMPL(CUDA, PadKernels) {
     m.impl("reflection_pad_nd", reflection_pad_nd_cuda);
     m.impl("reflection_pad_nd_backward", reflection_pad_nd_backward_cuda);
@@ -316,6 +333,27 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, PadKernels) {
     m.impl("circular_pad_nd_backward", circular_pad_nd_backward_cuda);
     m.impl("constant_pad_nd", constant_pad_nd_cuda);
     m.impl("constant_pad_nd_backward", constant_pad_nd_backward_cuda);
+    // The rank-specific spellings are the same kernel: the pad list length
+    // selects the padded trailing dimensions, so 1d/2d/3d collapse onto _nd.
+    m.impl("reflection_pad1d", reflection_pad_nd_cuda);
+    m.impl("reflection_pad2d", reflection_pad_nd_cuda);
+    m.impl("reflection_pad3d", reflection_pad_nd_cuda);
+    m.impl("reflection_pad1d_backward", reflection_pad_nd_backward_cuda);
+    m.impl("reflection_pad2d_backward", reflection_pad_nd_backward_cuda);
+    m.impl("reflection_pad3d_backward", reflection_pad_nd_backward_cuda);
+    m.impl("replication_pad1d", replication_pad_nd_cuda);
+    m.impl("replication_pad2d", replication_pad_nd_cuda);
+    m.impl("replication_pad3d", replication_pad_nd_cuda);
+    m.impl("replication_pad1d_backward", replication_pad_nd_backward_cuda);
+    m.impl("replication_pad2d_backward", replication_pad_nd_backward_cuda);
+    m.impl("replication_pad3d_backward", replication_pad_nd_backward_cuda);
+
+    m.impl("reflection_pad1d_backward.grad_input", reflection_pad1d_backward_grad_input_cuda);
+    m.impl("reflection_pad2d_backward.grad_input", reflection_pad2d_backward_grad_input_cuda);
+    m.impl("reflection_pad3d_backward.grad_input", reflection_pad3d_backward_grad_input_cuda);
+    m.impl("replication_pad1d_backward.grad_input", replication_pad1d_backward_grad_input_cuda);
+    m.impl("replication_pad2d_backward.grad_input", replication_pad2d_backward_grad_input_cuda);
+    m.impl("replication_pad3d_backward.grad_input", replication_pad3d_backward_grad_input_cuda);
 }
 
 }  // namespace cuda

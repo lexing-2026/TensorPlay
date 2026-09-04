@@ -437,9 +437,40 @@ Tensor avg_pool3d_backward_native_cuda(
 
 } // namespace
 
+namespace {
+
+Tensor& avg_pool3d_out_cuda(const Tensor& self,
+                            const std::vector<int64_t>& kernel_size,
+                            const std::vector<int64_t>& stride,
+                            const std::vector<int64_t>& padding,
+                            bool ceil_mode, bool count_include_pad,
+                            std::optional<int64_t> divisor_override,
+                            Tensor& out) {
+    out = avg_pool3d_native_cuda(self, kernel_size, stride, padding, ceil_mode,
+                                 count_include_pad, divisor_override);
+    return out;
+}
+
+Tensor& avg_pool3d_backward_grad_input_cuda(
+    const Tensor& grad_output, const Tensor& input,
+    const std::vector<int64_t>& kernel_size,
+    const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
+    bool ceil_mode, bool count_include_pad,
+    std::optional<int64_t> divisor_override, Tensor& grad_input) {
+    grad_input = avg_pool3d_backward_native_cuda(
+        grad_output, input, kernel_size, stride, padding, ceil_mode,
+        count_include_pad, divisor_override);
+    return grad_input;
+}
+
+} // namespace
+
 TENSORPLAY_LIBRARY_IMPL(CUDA, NativeAveragePool3d) {
     m.impl("avg_pool3d", avg_pool3d_native_cuda);
     m.impl("avg_pool3d_backward", avg_pool3d_backward_native_cuda);
+    m.impl("avg_pool3d.out", avg_pool3d_out_cuda);
+    m.impl("avg_pool3d_backward.grad_input",
+           avg_pool3d_backward_grad_input_cuda);
 }
 
 } // namespace cuda

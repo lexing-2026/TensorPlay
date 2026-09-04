@@ -531,11 +531,48 @@ Tensor multilabel_margin_loss_backward_cuda(const Tensor& grad_output, const Ten
     return grad_input.to(dt);
 }
 
+Tensor& interop_multi_margin_loss_out_cuda(const Tensor& input, const Tensor& target, Scalar p, Scalar margin,
+              const std::optional<Tensor>& weight, int64_t reduction, Tensor& out) {
+        out = multi_margin_loss_cuda(input, target, p, margin, weight, reduction);
+        return out;
+    
+}
+
+Tensor& interop_multi_margin_loss_backward_grad_input_cuda(const Tensor& grad_output, const Tensor& input, const Tensor& target,
+              Scalar p, Scalar margin, const std::optional<Tensor>& weight,
+              int64_t reduction, Tensor& grad_input) {
+        grad_input = multi_margin_loss_cuda_backward(grad_output, input, target, p,
+                                                     margin, weight, reduction);
+        return grad_input;
+    
+}
+
+Tensor& interop_multilabel_margin_loss_backward_grad_input_cuda(const Tensor& grad_output, const Tensor& input, const Tensor& target,
+              int64_t reduction, const Tensor& is_target, Tensor& grad_input) {
+        grad_input = multilabel_margin_loss_backward_cuda(grad_output, input, target,
+                                                          reduction, is_target);
+        return grad_input;
+    
+}
+
+Tensor& interop_multilabel_margin_loss_forward_output_cuda(const Tensor& input, const Tensor& target, int64_t reduction,
+              Tensor& output, Tensor& is_target) {
+        std::tie(output, is_target) = multilabel_margin_loss_forward_cuda(
+            input, target, reduction);
+        return output;
+    
+}
+
 TENSORPLAY_LIBRARY_IMPL(CUDA, MarginLossKernels) {
     m.impl("multi_margin_loss", multi_margin_loss_cuda);
     m.impl("multi_margin_loss_backward", multi_margin_loss_cuda_backward);
     m.impl("multilabel_margin_loss_forward", multilabel_margin_loss_forward_cuda);
     m.impl("multilabel_margin_loss_backward", multilabel_margin_loss_backward_cuda);
+
+    m.impl("multi_margin_loss.out", interop_multi_margin_loss_out_cuda);
+    m.impl("multi_margin_loss_backward.grad_input", interop_multi_margin_loss_backward_grad_input_cuda);
+    m.impl("multilabel_margin_loss_backward.grad_input", interop_multilabel_margin_loss_backward_grad_input_cuda);
+    m.impl("multilabel_margin_loss_forward.output", interop_multilabel_margin_loss_forward_output_cuda);
 }
 
 } // namespace cuda

@@ -7,15 +7,16 @@
 #include "GradMode.h"
 #include "../composite/AttentionComposite.h"
 #include <cuda_runtime.h>
-// Tensor-core primitive API (wmma) is CUDA-toolchain-only; the HIP
-// toolchain ships no equivalent, so the WMMA kernel variants and the
-// CUTLASS-based native flash path are compiled out there.  The dispatch
-// branches that select them report the limitation explicitly.
-#if !defined(USE_ROCM)
+// Tensor-core primitive API: <mma.h> on the CUDA toolchain; on HIP the
+// RDNA3 WMMA instruction backs a compatible subset (WmmaRocmCompat.cuh).
+#if defined(USE_ROCM)
+#include "WmmaRocmCompat.cuh"
+#else
 #include <mma.h>
 #endif
 #include <optional>
 #include <vector>
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -511,7 +512,6 @@ __device__ inline __half tp_half_to_cuda(tensorplay::Half value) {
   return *reinterpret_cast<const __half*>(&value);
 }
 
-#if !defined(USE_ROCM)
 __device__ inline tensorplay::Half tp_half_from_cuda(__half value) {
   tensorplay::Half result;
   result.x = __half_as_ushort(value);
@@ -560,9 +560,12 @@ __global__ void sdpa_wmma_flash_half_kernel(
   }
   __syncthreads();
 
-  // Causal attention never needs a key tile that starts after the end of the
-  // query tile.  The last tile may still contain masked columns.
-  const int64_t last_k = min(T, q0 + q_tile);
+  // Causal attention never needs key tiles past the end of the query tile
+  // (rows q0..q0+15 only attend to keys 0..q0+15); the non-causal walk must
+  // cover the whole key axis.  The final tile may still contain masked
+  // columns either way.
+  const int64_t last_k =
+      is_causal ? min(T, q0 + q_tile) : T;
   for (int64_t k0 = 0; k0 < last_k; k0 += k_tile) {
     for (int idx = thread; idx < k_tile * tile_d; idx += threads) {
       const int kr = idx / tile_d;
@@ -740,8 +743,9 @@ __global__ void sdpa_wmma_flash_half_4warp_kernel(
   __syncthreads();
 
   // The largest query in this block is q0 + 63.  Causal attention therefore
-  // never needs a key tile beginning after that row.
-  const int64_t last_k = min(T, q0 + q_tile);
+  // never needs a key tile beginning after that row; the non-causal walk
+  // covers the whole key axis.
+  const int64_t last_k = is_causal ? min(T, q0 + q_tile) : T;
 
   using AccFragment =
       wmma::fragment<wmma::accumulator, 16, 16, 16, float>;
@@ -850,7 +854,11 @@ __global__ void sdpa_wmma_flash_half_4warp_kernel(
           auto& c = accum[qr_tile][d_tile];
 #pragma unroll
           for (int i = 0; i < c.num_elements; ++i) {
+#if defined(USE_ROCM)
+            const int row = (i & 7) + 8 * (lane >= 16);
+#else
             const int row = (lane >> 2) + ((i & 2) ? 8 : 0);
+#endif
             c.x[i] *= smem.row_alpha[qr_tile * 16 + row];
           }
         }
@@ -916,9 +924,16 @@ __global__ void sdpa_wmma_flash_half_4warp_kernel(
         auto& c = accum[qr_tile][d_tile];
 #pragma unroll
         for (int i = 0; i < c.num_elements; ++i) {
+#if defined(USE_ROCM)
+          // RDNA3 WMMA accumulator order: element i of lane l covers local
+          // row (i & 7) + 8 * (l >= 16) and local column l & 15.
+          const int local_row = (i & 7) + 8 * (lane >= 16);
+          const int local_col = lane & 15;
+#else
           const int local_row = (lane >> 2) + ((i & 2) ? 8 : 0);
           const int local_col = ((lane & 3) * 2) + (i & 1) +
                                 ((i >= 4) ? 8 : 0);
+#endif
           const int qr = qr0 + local_row;
           const int d = d0 + d_tile * 16 + local_col;
           const float denom = smem.row_sum[qr];
@@ -951,6 +966,32 @@ struct TpWmmaFlashAlignedShared {
   float row_sum[64];
   float row_alpha[64];
 };
+
+// Epilogue helper for the aligned kernel: normalizes one 16x16 accumulator
+// fragment in registers and writes the FP16 result straight to the output.
+// The fragment element -> (local row, local column) mapping differs between
+// the two toolchains; both mappings are noted inline.
+template <typename FragT>
+__device__ inline void tp_wmma_store_norm(
+    FragT& c, int qr0, int d0, int lane, const float* row_sum,
+    __half* out_half, int64_t bh_base, int q0, int64_t D) {
+  for (int i = 0; i < c.num_elements; ++i) {
+#if defined(USE_ROCM)
+    // RDNA3 WMMA accumulator order: element i of lane l covers local row
+    // (i & 7) + 8 * (l >= 16) and local column l & 15.
+    const int local_row = (i & 7) + 8 * (lane >= 16);
+    const int local_col = lane & 15;
+#else
+    const int local_row = (lane >> 2) + ((i & 2) ? 8 : 0);
+    const int local_col = ((lane & 3) * 2) + (i & 1) + ((i >= 4) ? 8 : 0);
+#endif
+    const int qr = qr0 + local_row;
+    const int d = d0 + local_col;
+    const float denom = row_sum[qr];
+    out_half[bh_base + (q0 + qr) * D + d] =
+        __float2half(denom > 0.f ? c.x[i] / denom : 0.f);
+  }
+}
 
 __global__ __launch_bounds__(256, 2) void sdpa_wmma_flash_half_aligned_kernel(
     const tensorplay::Half* __restrict__ q,
@@ -1009,7 +1050,8 @@ __global__ __launch_bounds__(256, 2) void sdpa_wmma_flash_half_aligned_kernel(
   AccFragment accum3;
   bool first_tile = true;
 
-  for (int64_t k0 = 0; k0 < T && k0 < q0 + q_tile; k0 += k_tile) {
+  const int64_t last_k = is_causal ? min(T, q0 + q_tile) : T;
+  for (int64_t k0 = 0; k0 < last_k; k0 += k_tile) {
     for (int idx = thread; idx < k_tile * tile_d; idx += threads) {
       const int kr = idx / tile_d;
       const int d = idx % tile_d;
@@ -1120,15 +1162,18 @@ __global__ __launch_bounds__(256, 2) void sdpa_wmma_flash_half_aligned_kernel(
     }
 
     // Bring the previous numerator into the new max coordinate before the
-    // Tensor Core PV update.  For the native SM89 16x16 row-major accumulator
-    // layout, each lane's fragment elements map to local rows
-    // (lane >> 2) + ((i & 2) ? 8 : 0).  Keeping this rescale in registers is
-    // shared-memory round trip per key tile.
+    // Tensor Core PV update.  Each lane's accumulator fragment elements map
+    // to local rows per the layout note at the epilogue below.  Keeping the
+    // rescale in registers saves a shared-memory round trip per key tile.
     if (!first_tile) {
       if (warp < warps) {
 #pragma unroll
         for (int i = 0; i < accum0.num_elements; ++i) {
+#if defined(USE_ROCM)
+          const int row = (i & 7) + 8 * (lane >= 16);
+#else
           const int row = (lane >> 2) + ((i & 2) ? 8 : 0);
+#endif
           accum0.x[i] *= smem.row_alpha[row];
           accum1.x[i] *= smem.row_alpha[16 + row];
           accum2.x[i] *= smem.row_alpha[32 + row];
@@ -1175,33 +1220,23 @@ __global__ __launch_bounds__(256, 2) void sdpa_wmma_flash_half_aligned_kernel(
     first_tile = false;
   }
 
-  // The accumulator fragment's SM89 mapping is stable for this fixed
-  // 16x16x16 WMMA shape.  Normalize in registers and write one FP16 value
-  // per lane; this removes the 32KB float output staging tile and leaves the
-  // block below the shared-memory occupancy cliff.
+    // The accumulator fragment's element order is stable for this fixed
+    // 16x16x16 WMMA shape (per-toolchain mapping noted inline).  Normalize
+    // in registers and write one FP16 value per lane; this removes the 32KB
+    // float output staging tile and leaves the block below the shared-memory
+    // occupancy cliff.
   if (warp < warps) {
     const int d0 = warp * 16;
-#define TP_WMMA_STORE_NORM(C, QR0) \
-    do { \
-      for (int i = 0; i < (C).num_elements; ++i) { \
-        const int local_row = (lane >> 2) + ((i & 2) ? 8 : 0); \
-        const int local_col = ((lane & 3) * 2) + (i & 1) + \
-                              ((i >= 4) ? 8 : 0); \
-        const int qr = (QR0) + local_row; \
-        const int d = d0 + local_col; \
-        const float denom = smem.row_sum[qr]; \
-        out_half[bh_base + (q0 + qr) * D + d] = __float2half( \
-            denom > 0.f ? (C).x[i] / denom : 0.f); \
-      } \
-    } while (0)
-    TP_WMMA_STORE_NORM(accum0, 0);
-    TP_WMMA_STORE_NORM(accum1, 16);
-    TP_WMMA_STORE_NORM(accum2, 32);
-    TP_WMMA_STORE_NORM(accum3, 48);
-#undef TP_WMMA_STORE_NORM
+    tp_wmma_store_norm(accum0, 0, d0, lane, smem.row_sum, out_half,
+                       bh_base, q0, D);
+    tp_wmma_store_norm(accum1, 16, d0, lane, smem.row_sum, out_half,
+                       bh_base, q0, D);
+    tp_wmma_store_norm(accum2, 32, d0, lane, smem.row_sum, out_half,
+                       bh_base, q0, D);
+    tp_wmma_store_norm(accum3, 48, d0, lane, smem.row_sum, out_half,
+                       bh_base, q0, D);
   }
 }
-#endif  // !USE_ROCM (WMMA kernel variants)
 
 #if defined(TP_HAS_NATIVE_CUTE_FLASH)
 // This is the exact native 64x64/4-warp schedule used by the aligned CUDA
@@ -1602,6 +1637,14 @@ Tensor sdpa_kernel_cuda(const Tensor& query, const Tensor& key, const Tensor& va
 
   constexpr int kThreads = 256;
 
+  // Default (impl=0) routing: the warp-per-row flash kernel covers every
+  // supported dtype at head_dim <= 128 and avoids the naive kernel's
+  // float32 upcast entirely; the naive row-per-block kernel stays as the
+  // fallback for wider heads.
+  if (impl == 0 && D <= 128) {
+    impl = 3;
+  }
+
   if (impl == 0) {
     Tensor out;
     if (dtype != DType::Float32) {
@@ -1674,12 +1717,6 @@ Tensor sdpa_kernel_cuda(const Tensor& query, const Tensor& key, const Tensor& va
     TP_CUDA_CHECK(cudaGetLastError());
     return out;
   } else if (impl == 8) {
-#if defined(USE_ROCM)
-    TP_THROW(NotImplementedError,
-             "sdpa impl=8 (4-warp FP16 WMMA flash) requires the tensor-core "
-             "primitive API of the CUDA toolchain; use impl=0, 1, 2 or 3 on "
-             "this backend");
-#else
     Tensor out = Tensor::empty({B, H, T, D}, dtype, q.device());
     if (dtype != DType::Float16 || D != 128) {
       TP_THROW(NotImplementedError,
@@ -1700,7 +1737,11 @@ Tensor sdpa_kernel_cuda(const Tensor& query, const Tensor& key, const Tensor& va
     static bool shared_memory_configured = false;
     if (!shared_memory_configured) {
       TP_CUDA_CHECK(cudaFuncSetAttribute(
+#if defined(USE_ROCM)
+          reinterpret_cast<const void*>(&sdpa_wmma_flash_half_4warp_kernel),
+#else
           sdpa_wmma_flash_half_4warp_kernel,
+#endif
           cudaFuncAttributeMaxDynamicSharedMemorySize,
           static_cast<int>(sizeof(TpWmmaFlashShared))));
       shared_memory_configured = true;
@@ -1716,14 +1757,7 @@ Tensor sdpa_kernel_cuda(const Tensor& query, const Tensor& key, const Tensor& va
         B, H, T, D, scale, is_causal);
     TP_CUDA_CHECK(cudaGetLastError());
     return out;
-#endif  // !USE_ROCM
   } else if (impl == 5 || impl == 6 || impl == 7) {
-#if defined(USE_ROCM)
-    TP_THROW(NotImplementedError,
-             "sdpa impl=5/6/7 (aligned WMMA flash) requires the tensor-core "
-             "primitive API of the CUDA toolchain; use impl=0, 1 or 2 on "
-             "this backend");
-#else
     if (dtype != DType::Float16 || D != 128) {
       TP_THROW(NotImplementedError,
                "sdpa impl=5 (aligned FP16 WMMA flash) requires dtype=float16 and D=128");
@@ -1737,6 +1771,7 @@ Tensor sdpa_kernel_cuda(const Tensor& query, const Tensor& key, const Tensor& va
     }
     return sdpa_native_cute_flash<false>(q, k, v, B, H, T, D);
 #else
+    Tensor out = Tensor::empty({B, H, T, D}, dtype, q.device());
     // The native 64x64 schedule deliberately requires the original aligned
     // Llama shape.  Keep the older tail-safe kernel for arbitrary lengths.
     if ((T & 63) != 0) {
@@ -1754,7 +1789,11 @@ Tensor sdpa_kernel_cuda(const Tensor& query, const Tensor& key, const Tensor& va
     static bool shared_memory_configured = false;
     if (!shared_memory_configured) {
       TP_CUDA_CHECK(cudaFuncSetAttribute(
+#if defined(USE_ROCM)
+          reinterpret_cast<const void*>(&sdpa_wmma_flash_half_aligned_kernel),
+#else
           sdpa_wmma_flash_half_aligned_kernel,
+#endif
           cudaFuncAttributeMaxDynamicSharedMemorySize,
           static_cast<int>(sizeof(TpWmmaFlashAlignedShared))));
       shared_memory_configured = true;
@@ -1772,13 +1811,7 @@ Tensor sdpa_kernel_cuda(const Tensor& query, const Tensor& key, const Tensor& va
     TP_CUDA_CHECK(cudaGetLastError());
     return out;
 #endif  // TP_HAS_NATIVE_CUTE_FLASH
-#endif  // !USE_ROCM
   } else if (impl == 4) {
-#if defined(USE_ROCM)
-    TP_THROW(NotImplementedError,
-             "sdpa impl=4 (WMMA flash) requires the tensor-core primitive "
-             "API of the CUDA toolchain; use impl=0, 1 or 2 on this backend");
-#else
     Tensor out = Tensor::empty({B, H, T, D}, dtype, q.device());
     if (dtype != DType::Float16 || D != 128) {
       TP_THROW(NotImplementedError,
@@ -1794,7 +1827,6 @@ Tensor sdpa_kernel_cuda(const Tensor& query, const Tensor& key, const Tensor& va
         B, H, T, D, scale, is_causal);
     TP_CUDA_CHECK(cudaGetLastError());
     return out;
-#endif  // !USE_ROCM
   } else if (impl == 2) {
     if (dtype == DType::Float32) {
       return sdpa_gemm_native<float>(q, k, v, B, H, T, D, is_causal);
