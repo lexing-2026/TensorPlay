@@ -1200,7 +1200,7 @@ class ColorJitter(tensorplay.nn.Module):
         self.saturation = self._check_input(saturation, "saturation")
         self.hue = self._check_input(hue, "hue", center=0, bound=(-0.5, 0.5), clip_first_on_zero=False)
 
-@tensorplay.compiler.unused
+    @tensorplay.compiler.unused
     def _check_input(self, value, name, center=1, bound=(0, float("inf")), clip_first_on_zero=True):
         if isinstance(value, numbers.Number):
             if value < 0:

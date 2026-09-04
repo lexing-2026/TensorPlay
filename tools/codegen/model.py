@@ -556,6 +556,11 @@ def parse_schema(schema: str, parsed_schema=None) -> NativeFunction:
     # into positional / kwarg-only / out buckets at parse time and `.all`
     # flattens them.  Recover the distinction via the kwarg-only bucket.
     kwarg_names = {a.name for a in ts.arguments.flat_kwarg_only}
+    # Write-annotated schema slots are bucketed as out arguments and are
+    # keyword-only in the signature, even though the kwarg-only bucket
+    # excludes them; keep the kwonly flag faithful to the source schema.
+    out_names = {getattr(getattr(w, "argument", w), "name")
+                 for w in ts.arguments.out}
 
     def conv_arg(w):
         a = getattr(w, "argument", w)
@@ -565,7 +570,7 @@ def parse_schema(schema: str, parsed_schema=None) -> NativeFunction:
             t = make_type(t.kind, t.is_list, t.is_opt, mut, t.symint,
                           t.symbool, t.symfloat, t.list_elem_opt,
                           t.list_size)
-        kwonly = a.name in kwarg_names
+        kwonly = a.name in kwarg_names or a.name in out_names
         return Argument(name=a.name, type=t,
                         default=_norm_default(a.default), kwonly=kwonly,
                         source_argument=a)

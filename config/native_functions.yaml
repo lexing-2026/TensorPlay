@@ -3555,7 +3555,7 @@
     CPU: index_fill_tensor__cpu
     CUDA: index_fill_tensor__cuda
 
-- func: searchsorted.Tensor(Tensor sorted_sequence, Tensor self, *, bool out_int32=False, bool right=False) -> Tensor
+- func: searchsorted.Tensor(Tensor sorted_sequence, Tensor self, *, bool out_int32=False, bool right=False, str? side=None, Tensor? sorter=None) -> Tensor
   variants: function
   dispatch:
     CPU: searchsorted_cpu
@@ -4972,10 +4972,9 @@
     CUDA: tpsa_fill_tensor
 
 - func: equal(Tensor self, Tensor other) -> bool
-  variants: function, method
+  variants: function
   dispatch:
     CPU: tpsa_equal
-    CUDA: tpsa_equal
 
 - func: allclose(Tensor self, Tensor other, float rtol=1e-05, float atol=1e-08, bool equal_nan=False) -> bool
   variants: function, method
@@ -7023,12 +7022,24 @@
   variants: function
 - func: _unique(Tensor self, bool sorted=True, bool return_inverse=False) -> (Tensor, Tensor)
   variants: function
+  dispatch:
+    CPU: _unique_cpu
+    CUDA: _unique_cuda
 - func: unique_dim(Tensor self, int dim, bool sorted=True, bool return_inverse=False, bool return_counts=False) -> (Tensor, Tensor, Tensor)
   variants: function
+  dispatch:
+    CPU: unique_dim_cpu
+    CUDA: unique_dim_cuda
 - func: unique_dim_consecutive(Tensor self, int dim, bool return_inverse=False, bool return_counts=False) -> (Tensor, Tensor, Tensor)
   variants: function
+  dispatch:
+    CPU: unique_dim_consecutive_cpu
+    CUDA: unique_dim_consecutive_cuda
 - func: _unique2(Tensor self, bool sorted=True, bool return_inverse=False, bool return_counts=False) -> (Tensor, Tensor, Tensor)
   variants: function
+  dispatch:
+    CPU: _unique2_cpu
+    CUDA: _unique2_cuda
 - func: _unsafe_view(Tensor self, SymInt[] size) -> Tensor
   variants: function
 - func: unsqueeze_(Tensor(a!) self, int dim) -> Tensor(a!)
@@ -7067,6 +7078,8 @@
   variants: function
 - func: _standard_gamma(Tensor self, Generator? generator=None) -> Tensor
   variants: function
+  dispatch:
+    CPU: standard_gamma_kernel
 - func: _philox_key_split(Tensor key, int num_splits) -> Tensor
   variants: function
 - func: _philox_key_fold_in(Tensor key, int data) -> Tensor
@@ -7081,8 +7094,12 @@
   variants: function
 - func: _sample_dirichlet(Tensor self, Generator? generator=None) -> Tensor
   variants: function
+  dispatch:
+    CPU: sample_dirichlet_kernel
 - func: binomial(Tensor count, Tensor prob, Generator? generator=None) -> Tensor
   variants: function
+  dispatch:
+    CPU: binomial_kernel
 - func: native_norm(Tensor self, Scalar p=2) -> Tensor
   variants: function
 - func: native_norm.ScalarOpt_dim_dtype(Tensor self, Scalar? p, int[1] dim, bool keepdim, ScalarType? dtype) -> Tensor
@@ -8052,72 +8069,106 @@
   variants: method, function
 - func: _foreach_acos(Tensor[] self) -> Tensor[]
   variants: function
+  dispatch: {CPU: foreach_acos_cpu, CUDA: foreach_acos_cuda}
 - func: _foreach_acos_(Tensor(a!)[] self) -> ()
   variants: function
+  dispatch: {CPU: foreach_acos_inplace_cpu, CUDA: foreach_acos_inplace_cuda}
 - func: _foreach_asin(Tensor[] self) -> Tensor[]
   variants: function
+  dispatch: {CPU: foreach_asin_cpu, CUDA: foreach_asin_cuda}
 - func: _foreach_asin_(Tensor(a!)[] self) -> ()
   variants: function
+  dispatch: {CPU: foreach_asin_inplace_cpu, CUDA: foreach_asin_inplace_cuda}
 - func: _foreach_atan(Tensor[] self) -> Tensor[]
   variants: function
+  dispatch: {CPU: foreach_atan_cpu, CUDA: foreach_atan_cuda}
 - func: _foreach_atan_(Tensor(a!)[] self) -> ()
   variants: function
+  dispatch: {CPU: foreach_atan_inplace_cpu, CUDA: foreach_atan_inplace_cuda}
 - func: _foreach_ceil(Tensor[] self) -> Tensor[]
   variants: function
+  dispatch: {CPU: foreach_ceil_cpu, CUDA: foreach_ceil_cuda}
 - func: _foreach_ceil_(Tensor(a!)[] self) -> ()
   variants: function
+  dispatch: {CPU: foreach_ceil_inplace_cpu, CUDA: foreach_ceil_inplace_cuda}
 - func: _foreach_cos(Tensor[] self) -> Tensor[]
   variants: function
+  dispatch: {CPU: foreach_cos_cpu, CUDA: foreach_cos_cuda}
 - func: _foreach_cos_(Tensor(a!)[] self) -> ()
   variants: function
+  dispatch: {CPU: foreach_cos_inplace_cpu, CUDA: foreach_cos_inplace_cuda}
 - func: _foreach_cosh(Tensor[] self) -> Tensor[]
   variants: function
+  dispatch: {CPU: foreach_cosh_cpu, CUDA: foreach_cosh_cuda}
 - func: _foreach_cosh_(Tensor(a!)[] self) -> ()
   variants: function
+  dispatch: {CPU: foreach_cosh_inplace_cpu, CUDA: foreach_cosh_inplace_cuda}
 - func: _foreach_erf(Tensor[] self) -> Tensor[]
   variants: function
+  dispatch: {CPU: foreach_erf_cpu, CUDA: foreach_erf_cuda}
 - func: _foreach_erf_(Tensor(a!)[] self) -> ()
   variants: function
+  dispatch: {CPU: foreach_erf_inplace_cpu, CUDA: foreach_erf_inplace_cuda}
 - func: _foreach_erfc(Tensor[] self) -> Tensor[]
   variants: function
+  dispatch: {CPU: foreach_erfc_cpu, CUDA: foreach_erfc_cuda}
 - func: _foreach_erfc_(Tensor(a!)[] self) -> ()
   variants: function
+  dispatch: {CPU: foreach_erfc_inplace_cpu, CUDA: foreach_erfc_inplace_cuda}
 - func: _foreach_exp(Tensor[] self) -> Tensor[]
   variants: function
+  dispatch: {CPU: foreach_exp_cpu, CUDA: foreach_exp_cuda}
 - func: _foreach_exp_(Tensor(a!)[] self) -> ()
   variants: function
+  dispatch: {CPU: foreach_exp_inplace_cpu, CUDA: foreach_exp_inplace_cuda}
 - func: _foreach_expm1(Tensor[] self) -> Tensor[]
   variants: function
+  dispatch: {CPU: foreach_expm1_cpu, CUDA: foreach_expm1_cuda}
 - func: _foreach_expm1_(Tensor(a!)[] self) -> ()
   variants: function
+  dispatch: {CPU: foreach_expm1_inplace_cpu, CUDA: foreach_expm1_inplace_cuda}
 - func: _foreach_floor(Tensor[] self) -> Tensor[]
   variants: function
+  dispatch: {CPU: foreach_floor_cpu, CUDA: foreach_floor_cuda}
 - func: _foreach_floor_(Tensor(a!)[] self) -> ()
   variants: function
+  dispatch: {CPU: foreach_floor_inplace_cpu, CUDA: foreach_floor_inplace_cuda}
 - func: _foreach_frac(Tensor[] self) -> Tensor[]
   variants: function
+  dispatch: {CPU: foreach_frac_cpu, CUDA: foreach_frac_cuda}
 - func: _foreach_frac_(Tensor(a!)[] self) -> ()
   variants: function
+  dispatch: {CPU: foreach_frac_inplace_cpu, CUDA: foreach_frac_inplace_cuda}
 - func: _foreach_lgamma(Tensor[] self) -> Tensor[]
   variants: function
+  dispatch: {CPU: foreach_lgamma_cpu, CUDA: foreach_lgamma_cuda}
 - func: _foreach_lgamma_(Tensor(a!)[] self) -> ()
   variants: function
+  dispatch: {CPU: foreach_lgamma_inplace_cpu, CUDA: foreach_lgamma_inplace_cuda}
 - func: _foreach_log(Tensor[] self) -> Tensor[]
   variants: function
+  dispatch: {CPU: foreach_log_cpu, CUDA: foreach_log_cuda}
 - func: _foreach_log_(Tensor(a!)[] self) -> ()
   variants: function
+  dispatch: {CPU: foreach_log_inplace_cpu, CUDA: foreach_log_inplace_cuda}
 - func: _foreach_log10(Tensor[] self) -> Tensor[]
   variants: function
+  dispatch: {CPU: foreach_log10_cpu, CUDA: foreach_log10_cuda}
 - func: _foreach_log10_(Tensor(a!)[] self) -> ()
   variants: function
+  dispatch: {CPU: foreach_log10_inplace_cpu, CUDA: foreach_log10_inplace_cuda}
 - func: _foreach_log1p(Tensor[] self) -> Tensor[]
   variants: function
+  dispatch: {CPU: foreach_log1p_cpu, CUDA: foreach_log1p_cuda}
 - func: _foreach_log1p_(Tensor(a!)[] self) -> ()
   variants: function
+  dispatch: {CPU: foreach_log1p_inplace_cpu, CUDA: foreach_log1p_inplace_cuda}
 - func: _foreach_log2(Tensor[] self) -> Tensor[]
   variants: function
+  dispatch: {CPU: foreach_log2_cpu, CUDA: foreach_log2_cuda}
 - func: _foreach_log2_(Tensor(a!)[] self) -> ()
   variants: function
+  dispatch: {CPU: foreach_log2_inplace_cpu, CUDA: foreach_log2_inplace_cuda}
 - func: _foreach_max(Tensor[] self) -> Tensor[]
   variants: function
   dispatch:
@@ -8135,32 +8186,46 @@
     CUDA: foreach_powsum_cuda
 - func: _foreach_round(Tensor[] self) -> Tensor[]
   variants: function
+  dispatch: {CPU: foreach_round_cpu, CUDA: foreach_round_cuda}
 - func: _foreach_round_(Tensor(a!)[] self) -> ()
   variants: function
+  dispatch: {CPU: foreach_round_inplace_cpu, CUDA: foreach_round_inplace_cuda}
 - func: _foreach_sigmoid(Tensor[] self) -> Tensor[]
   variants: function
+  dispatch: {CPU: foreach_sigmoid_cpu, CUDA: foreach_sigmoid_cuda}
 - func: _foreach_sigmoid_(Tensor(a!)[] self) -> ()
   variants: function
+  dispatch: {CPU: foreach_sigmoid_inplace_cpu, CUDA: foreach_sigmoid_inplace_cuda}
 - func: _foreach_sin(Tensor[] self) -> Tensor[]
   variants: function
+  dispatch: {CPU: foreach_sin_cpu, CUDA: foreach_sin_cuda}
 - func: _foreach_sin_(Tensor(a!)[] self) -> ()
   variants: function
+  dispatch: {CPU: foreach_sin_inplace_cpu, CUDA: foreach_sin_inplace_cuda}
 - func: _foreach_sinh(Tensor[] self) -> Tensor[]
   variants: function
+  dispatch: {CPU: foreach_sinh_cpu, CUDA: foreach_sinh_cuda}
 - func: _foreach_sinh_(Tensor(a!)[] self) -> ()
   variants: function
+  dispatch: {CPU: foreach_sinh_inplace_cpu, CUDA: foreach_sinh_inplace_cuda}
 - func: _foreach_tan(Tensor[] self) -> Tensor[]
   variants: function
+  dispatch: {CPU: foreach_tan_cpu, CUDA: foreach_tan_cuda}
 - func: _foreach_tan_(Tensor(a!)[] self) -> ()
   variants: function
+  dispatch: {CPU: foreach_tan_inplace_cpu, CUDA: foreach_tan_inplace_cuda}
 - func: _foreach_tanh(Tensor[] self) -> Tensor[]
   variants: function
+  dispatch: {CPU: foreach_tanh_cpu, CUDA: foreach_tanh_cuda}
 - func: _foreach_tanh_(Tensor(a!)[] self) -> ()
   variants: function
+  dispatch: {CPU: foreach_tanh_inplace_cpu, CUDA: foreach_tanh_inplace_cuda}
 - func: _foreach_trunc(Tensor[] self) -> Tensor[]
   variants: function
+  dispatch: {CPU: foreach_trunc_cpu, CUDA: foreach_trunc_cuda}
 - func: _foreach_trunc_(Tensor(a!)[] self) -> ()
   variants: function
+  dispatch: {CPU: foreach_trunc_inplace_cpu, CUDA: foreach_trunc_inplace_cuda}
 - func: _foreach_clone(Tensor[] self, *, MemoryFormat? memory_format=None) -> Tensor[]
   variants: function
   dispatch:
@@ -8178,14 +8243,29 @@
     CUDA: foreach_mm_cuda
 - func: bucketize.Tensor_out(Tensor self, Tensor boundaries, *, bool out_int32=False, bool right=False, Tensor(a!) out) -> Tensor(a!)
   variants: function
+  dispatch:
+    CPU: bucketize_out_cpu
+    CUDA: bucketize_out_cuda
 - func: bucketize.Scalar(Scalar self, Tensor boundaries, *, bool out_int32=False, bool right=False) -> Tensor
   variants: function
+  dispatch:
+    CPU: bucketize_scalar_cpu
+    CUDA: bucketize_scalar_cuda
 - func: searchsorted.Tensor_out(Tensor sorted_sequence, Tensor self, *, bool out_int32=False, bool right=False, str? side=None, Tensor? sorter=None, Tensor(a!) out) -> Tensor(a!)
   variants: function
+  dispatch:
+    CPU: searchsorted_out_cpu
+    CUDA: searchsorted_out_cuda
 - func: searchsorted.Scalar(Tensor sorted_sequence, Scalar self, *, bool out_int32=False, bool right=False, str? side=None, Tensor? sorter=None) -> Tensor
   variants: function
+  dispatch:
+    CPU: searchsorted_scalar_cpu
+    CUDA: searchsorted_scalar_cuda
 - func: searchsorted.Scalar_out(Tensor sorted_sequence, Scalar self, *, bool out_int32=False, bool right=False, str? side=None, Tensor? sorter=None, Tensor(a!) out) -> Tensor(a!)
   variants: function
+  dispatch:
+    CPU: searchsorted_scalar_out_cpu
+    CUDA: searchsorted_scalar_out_cuda
 - func: _convert_indices_from_coo_to_csr(Tensor self, int size, *, bool out_int32=False) -> Tensor
   variants: function
 - func: _convert_indices_from_coo_to_csr.out(Tensor self, int size, *, bool out_int32=False, Tensor(a!) out) -> Tensor(a!)
