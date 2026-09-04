@@ -269,38 +269,6 @@ Tensor mean_kernel(const Tensor& self, DType dtype) {
 }
 
 //
-// Whole-tensor variance: the same two-pass composition the dim-listed
-// entry uses (keepdim mean, broadcast subtract, square, sum), with the
-// reduced span covering every axis.
-//
-Tensor var_kernel(const Tensor& self, int64_t correction) {
-  TP_CHECK(
-      self.dtype() == DType::Float32,
-      "Vulkan var supports Float32 tensors only");
-  TP_CHECK(self.dim() >= 1 && self.dim() <= 4, "Vulkan var: 1d to 4d only");
-  TP_CHECK(self.numel() > 0, "Vulkan var does not support empty tensors");
-
-  std::vector<int64_t> dims;
-  dims.reserve(static_cast<size_t>(self.dim()));
-  for (int64_t d = 0; d < self.dim(); ++d) {
-    dims.push_back(d);
-  }
-
-  const int64_t count = self.numel();
-  Tensor mean = reduce_impl(self, dims, /*keepdim=*/true, true, false, 0);
-  Tensor centered_sq = square(broadcast_sub(self, mean));
-  Tensor summed = reduce_impl(centered_sq, dims, false, false, false, 0);
-  const double denom =
-      static_cast<double>(std::max<int64_t>(count - correction, 1));
-  return summed.mul(Scalar(1.0 / denom));
-}
-
-Tensor std_kernel(const Tensor& self, int64_t correction) {
-  Tensor v = var_kernel(self, correction);
-  return v.sqrt();
-}
-
-//
 // p-norms: abs then pow(1/p) fold around the whole-tensor sum, matching
 // the norm formula the dim-listed CPU entry evaluates.  Infinite p needs
 // a max reduction the backend does not carry, so it is rejected.
@@ -432,6 +400,38 @@ Tensor square(const Tensor& a) {
       params.buffer());
 
   return convert(v_out);
+}
+
+//
+// Whole-tensor variance: the same two-pass composition the dim-listed
+// entry uses (keepdim mean, broadcast subtract, square, sum), with the
+// reduced span covering every axis.
+//
+Tensor var_kernel(const Tensor& self, int64_t correction) {
+  TP_CHECK(
+      self.dtype() == DType::Float32,
+      "Vulkan var supports Float32 tensors only");
+  TP_CHECK(self.dim() >= 1 && self.dim() <= 4, "Vulkan var: 1d to 4d only");
+  TP_CHECK(self.numel() > 0, "Vulkan var does not support empty tensors");
+
+  std::vector<int64_t> dims;
+  dims.reserve(static_cast<size_t>(self.dim()));
+  for (int64_t d = 0; d < self.dim(); ++d) {
+    dims.push_back(d);
+  }
+
+  const int64_t count = self.numel();
+  Tensor mean = reduce_impl(self, dims, /*keepdim=*/true, true, false, 0);
+  Tensor centered_sq = square(broadcast_sub(self, mean));
+  Tensor summed = reduce_impl(centered_sq, dims, false, false, false, 0);
+  const double denom =
+      static_cast<double>(std::max<int64_t>(count - correction, 1));
+  return summed.mul(Scalar(1.0 / denom));
+}
+
+Tensor std_kernel(const Tensor& self, int64_t correction) {
+  Tensor v = var_kernel(self, correction);
+  return v.sqrt();
 }
 
 } // namespace
