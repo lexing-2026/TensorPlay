@@ -72,6 +72,17 @@ jobs:
           submodules: false
           show-progress: false
 
+      # Linux wheel builds link the accelerated BLAS stack and the oneDNN
+      # fetch needs no extra packages; OpenBLAS comes from the runner image
+      # repositories. macOS uses Accelerate, Windows falls back to naive.
+      - name: Install Linux build dependencies
+        if: ${{ runner.os == 'Linux' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libopenblas-dev 1>/dev/null
+
       # The wheel links vendored SLEEF/NNPACK trees that CI checkouts do
       # not carry; fetch the pinned revisions before configuring.
       - name: Restore vendored build dependencies
