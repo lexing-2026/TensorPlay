@@ -1110,6 +1110,20 @@ def interpolate(
     if mode in ('nearest', 'nearest-exact'):
         if align_corners is not None:
             raise ValueError("align_corners option can only be set with interpolating modes")
+        # 'nearest-exact' resolves to the pixel-center kernels; the legacy
+        # 'nearest' keeps the deprecated asymmetric-index behavior.
+        if mode == 'nearest-exact':
+            import tensorplay.functional as _functional
+            if ndim == 3:
+                size_ = [size] * 1 if isinstance(size, int) else list(size)
+                return _functional._upsample_nearest_exact1d(input, size_, None)
+            elif ndim == 4:
+                size_ = [size] * 2 if isinstance(size, int) else list(size)
+                return _functional._upsample_nearest_exact2d(input, size_, None)
+            elif ndim == 5:
+                size_ = [size] * 3 if isinstance(size, int) else list(size)
+                return _functional._upsample_nearest_exact3d(input, size_, None)
+            raise ValueError(f"Expected 3D, 4D or 5D input, got {ndim}D")
         if ndim == 3:
             size_ = [size] * 1 if isinstance(size, int) else list(size)
             return tensorplay.upsample_nearest1d(input, size_)
@@ -3334,7 +3348,7 @@ def scaled_dot_product_attention(
                 f"disabled by the active sdpa_kernel context")
         if backend == "flash":
             return tensorplay.scaled_dot_product_attention(
-                query, key, value, is_causal=is_causal, impl=1)
+                query, key, value, is_causal=is_causal)
         if backend == "mem_efficient":
             raise NotImplementedError(
                 "scaled_dot_product_attention: the mem_efficient backend requires "
@@ -3345,6 +3359,8 @@ def scaled_dot_product_attention(
         for candidate in allowed:
             if candidate == _sdpa_attention.SDPBackend.FLASH_ATTENTION:
                 if _plain_case and _sdpa_attention.can_use_flash_attention(params):
+                    # impl=None lets the fused-kernel selection pick the
+                    # fastest eligible kernel for the shape.
                     return tensorplay.scaled_dot_product_attention(
                         query, key, value, is_causal=is_causal)
                 _sdpa_attention._raise_kernel_warnings(params)

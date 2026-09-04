@@ -4,16 +4,24 @@ from typing import Any
 
 from .decomp_utils import CustomDecompTable
 from .custom_obj import register_dataclass
-from .pt2_archive import load_pt2, package_pt2
+from .pt2_archive import (
+    PT2ArchiveContents,
+    WeightType,
+    load_pt2,
+    package_pt2,
+)
 from .dynamic_shapes import (
     AdditionalInputs,
     Constraint,
+    ConstraintsExceededError,
+    DerivedDim,
     Dim,
     ShapesCollection,
     dims,
     refine_dynamic_shapes_from_suggested_fixes,
 )
 from .exported_program import (
+    EqualityConstraint,
     ExportedProgram,
     ModuleCallEntry,
     ModuleCallSignature,
@@ -46,9 +54,12 @@ __all__ = [
     "ArgumentSpec",
     "ConstantArgument",
     "Constraint",
+    "ConstraintsExceededError",
     "CustomDecompTable",
     "CustomObjArgument",
+    "DerivedDim",
     "Dim",
+    "EqualityConstraint",
     "ExportBackwardSignature",
     "ExportGraphSignature",
     "ExportedProgram",
@@ -60,6 +71,7 @@ __all__ = [
     "ModuleCallSignature",
     "OutputKind",
     "OutputSpec",
+    "PT2ArchiveContents",
     "ShapesCollection",
     "SymBoolArgument",
     "SymFloatArgument",
@@ -67,6 +79,7 @@ __all__ = [
     "TensorArgument",
     "TokenArgument",
     "UnflattenedModule",
+    "WeightType",
     "default_decompositions",
     "dims",
     "draft_export",

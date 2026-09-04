@@ -1,5 +1,6 @@
 """Base optimizer."""
 
+import copy
 import functools
 import inspect
 import warnings

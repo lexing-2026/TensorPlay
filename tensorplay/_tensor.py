@@ -477,15 +477,11 @@ def nonzero(self):
 Tensor.nonzero = nonzero
 
 
-def unique(self, sorted=True, return_inverse=False, return_counts=False):
-    # public contract of returning 1/2/3 tensors depending on the flags.
-    values, inverse, counts = _C.unique(self, sorted, True, True)
-    outs = [values]
-    if return_inverse:
-        outs.append(inverse)
-    if return_counts:
-        outs.append(counts)
-    return outs[0] if len(outs) == 1 else tuple(outs)
+def unique(self, sorted=True, return_inverse=False, return_counts=False,
+           dim=None):
+    from . import functional
+    return functional.unique(self, sorted, return_inverse, return_counts,
+                             dim)
 
 
 Tensor.unique = unique
@@ -504,6 +500,28 @@ def unique_consecutive(self, return_inverse=False, return_counts=False,
 
 
 Tensor.unique_consecutive = unique_consecutive
+
+
+def searchsorted(self, sorted_sequence, *, out_int32=False, right=False,
+                 side=None, sorter=None, out=None):
+    """Insertion positions of `self` values in `sorted_sequence`."""
+    from . import functional
+    return functional.searchsorted(sorted_sequence, self, out_int32=out_int32,
+                                   right=right, side=side, sorter=sorter,
+                                   out=out)
+
+
+Tensor.searchsorted = searchsorted
+
+
+def bucketize(self, boundaries, *, out_int32=False, right=False, out=None):
+    """Bucket indices of `self` against a sorted 1-D `boundaries` tensor."""
+    from . import functional
+    return functional.bucketize(self, boundaries, out_int32=out_int32,
+                                right=right, out=out)
+
+
+Tensor.bucketize = bucketize
 
 
 def topk(self, k, dim=None, largest=True, sorted=True):

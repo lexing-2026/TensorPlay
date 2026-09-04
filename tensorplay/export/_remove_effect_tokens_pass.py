@@ -43,7 +43,7 @@ def _replace_with_effects_node(node: Any, module: Any) -> None:
         if index == 0:
             user.replace_all_uses_with(node.args[0])
         else:
-            user.replace_all_uses_with(replacement if index == 1 else replacement)
+            user.replace_all_uses_with(replacement)
         if not user.users:
             user.graph.erase_node(user)
     if not node.users:

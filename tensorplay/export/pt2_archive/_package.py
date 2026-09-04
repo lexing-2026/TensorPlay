@@ -27,6 +27,7 @@ from .constants import (
     WEIGHTS_CONFIG_FILENAME_FORMAT,
     WEIGHTS_DIR,
 )
+from ._package_weights import WeightType
 
 __all__ = [
     "AOTICompiledModel",
@@ -34,9 +35,11 @@ __all__ = [
     "PT2ArchiveReader",
     "PT2ArchiveWriter",
     "is_pt2_package",
+    "load_multimodal_pt2",
     "load_pt2",
     "load_weights_to_pt2_contents",
     "package_pt2",
+    "save_multimodal_pt2",
 ]
 
 DEFAULT_PICKLE_PROTOCOL = 4
@@ -168,7 +171,7 @@ def _programs_mapping(programs: Any) -> dict[str, Any]:
 
 
 def _tensor_meta(tensor: Any) -> dict[str, Any]:
-    from ..._serialization_torch import _dtype_name_of, _contiguous_stride
+    from ...serialization.archive import _dtype_name_of, _contiguous_stride
 
     shape = [int(dim) for dim in tuple(tensor.shape)]
     stride_fn = getattr(tensor, "stride", None)
@@ -187,7 +190,7 @@ def _tensor_meta(tensor: Any) -> dict[str, Any]:
 
 
 def _tensor_from_meta(data: bytes, meta: dict[str, Any]) -> Any:
-    from ..._serialization_torch import (
+    from ...serialization.archive import (
         _ITEMSIZE,
         _tensor_from_flat_bytes,
         _reshape_or_view,
@@ -208,7 +211,7 @@ def _tensor_from_meta(data: bytes, meta: dict[str, Any]) -> Any:
 
 
 def _dtype_from_name(name: str) -> Any:
-    from ..._serialization_torch import _tp_dtype, _NUMPY_DTYPES
+    from ...serialization.archive import _tp_dtype, _NUMPY_DTYPES
 
     return _tp_dtype(name)
 
@@ -217,16 +220,17 @@ def _package_weights(
     writer: "PT2ArchiveWriter",
     directory: str,
     values: dict[str, Any],
-    is_param_flags: dict[str, bool] | None = None,
+    roles: dict[str, WeightType] | None = None,
     pickle_protocol: int = DEFAULT_PICKLE_PROTOCOL,
 ) -> dict[str, Any]:
     """Write tensors as raw payloads plus a JSON index; returns the index."""
 
-    from ..._serialization_torch import _tensor_bytes
+    from ...serialization.archive import _tensor_bytes
 
-    is_param_flags = is_param_flags or {}
+    roles = roles or {}
     config: dict[str, Any] = {}
     for index, (name, tensor) in enumerate(values.items()):
+        role = roles.get(name, WeightType.OPTIONAL_STATE)
         if not hasattr(tensor, "shape"):
             path_name = f"{CUSTOM_OBJ_FILENAME_PREFIX}{index}"
             writer.write_bytes(
@@ -241,7 +245,8 @@ def _package_weights(
         meta = _tensor_meta(payload)
         meta["path_name"] = path_name
         meta["use_pickle"] = False
-        meta["is_param"] = bool(is_param_flags.get(name, False))
+        meta["is_param"] = role is WeightType.PARAMETER
+        meta["role"] = int(role)
         config[name] = meta
     return config
 
@@ -257,7 +262,11 @@ def _load_weights(reader: "PT2ArchiveReader", directory: str, config: dict[str, 
             values[name] = pickle.loads(data)
             continue
         tensor = _tensor_from_meta(data, meta)
-        if meta.get("is_param"):
+        is_param = meta.get("is_param", False) or (
+            meta.get("role") is not None
+            and WeightType(meta.get("role")) is WeightType.PARAMETER
+        )
+        if is_param:
             tensor = tp.nn.Parameter(tensor, requires_grad=meta.get("requires_grad", False))
         elif meta.get("requires_grad"):
             tensor.requires_grad_(True)
@@ -265,13 +274,17 @@ def _load_weights(reader: "PT2ArchiveReader", directory: str, config: dict[str, 
     return values
 
 
-def _export_state_values(program: Any) -> tuple[dict[str, Any], dict[str, Any], dict[str, bool]]:
-    """Split program state into parameters, buffers, and constant values."""
+def _export_state_values(program: Any) -> tuple[dict[str, Any], dict[str, Any], dict[str, WeightType]]:
+    """Split program state into parameters, buffers, and constant values.
+
+    Each state entry is tagged with its archive role so readers can rebuild
+    the right module attribute kind without inspecting the tensor.
+    """
 
     signature = program.graph_signature
     root = program.graph_module.root
     state: dict[str, Any] = {}
-    flags: dict[str, bool] = {}
+    roles: dict[str, WeightType] = {}
 
     def fetch(target: str) -> Any:
         value = root
@@ -281,15 +294,15 @@ def _export_state_values(program: Any) -> tuple[dict[str, Any], dict[str, Any], 
 
     for target in signature.parameters:
         state[target] = fetch(target)
-        flags[target] = True
+        roles[target] = WeightType.PARAMETER
     for target in signature.buffers:
         state[target] = fetch(target)
-        flags[target] = False
+        roles[target] = WeightType.BUFFER
     constants: dict[str, Any] = dict(getattr(program.graph_module, "meta", {}).get("constants", {}))
     for target in signature.lifted_tensor_constants:
         if target not in constants:
             constants[target] = fetch(target)
-    return state, constants, flags
+    return state, constants, roles
 
 
 def package_pt2(
@@ -316,12 +329,12 @@ def package_pt2(
             )
     with PT2ArchiveWriter(f) as writer:
         for name, program in programs.items():
-            state, constants, flags = _export_state_values(program)
+            state, constants, roles = _export_state_values(program)
             weights_config = _package_weights(
                 writer,
                 WEIGHTS_DIR,
                 state,
-                is_param_flags=flags,
+                roles=roles,
                 pickle_protocol=pickle_protocol,
             )
             writer.write_string(
@@ -415,6 +428,42 @@ def load_pt2(
             elif name.startswith(EXTRA_DIR):
                 extra[name[len(EXTRA_DIR):]] = reader.read_string(name)
     return PT2ArchiveContents(programs, aoti_runners, extra)
+
+
+def save_multimodal_pt2(
+    f: Any,
+    programs: dict[str, Any],
+    *,
+    extra_files: dict[str, Any] | None = None,
+    pickle_protocol: int = DEFAULT_PICKLE_PROTOCOL,
+) -> Any:
+    """Package several named exported programs into one archive.
+
+    A convenience wrapper over :func:`package_pt2` that requires the mapping
+    form, so every program gets an explicit archive name.
+    """
+
+    if not isinstance(programs, dict) or not programs:
+        raise TypeError("programs must be a non-empty dict of name -> ExportedProgram")
+    return package_pt2(
+        f,
+        exported_programs=programs,
+        extra_files=extra_files,
+        pickle_protocol=pickle_protocol,
+    )
+
+
+def load_multimodal_pt2(f: Any) -> dict[str, Any]:
+    """Load every exported program stored by :func:`save_multimodal_pt2`.
+
+    Returns the name-keyed program mapping; extra files are dropped.  Use
+    :func:`load_pt2` when AOTI runners or extra files matter.
+    """
+
+    contents = load_pt2(f)
+    if not contents.exported_programs:
+        raise ValueError("the archive does not contain an exported program")
+    return contents.exported_programs
 
 
 def load_weights_to_pt2_contents(pt2_contents: PT2ArchiveContents, weights_map: dict[str, Any]) -> None:

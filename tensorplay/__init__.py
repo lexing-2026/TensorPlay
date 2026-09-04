@@ -221,6 +221,7 @@ from ._C import (tensor, DType, Size, Scalar, SymInt, SymBool, SymFloat,
 from .autograd import (no_grad, enable_grad, set_grad_enabled, is_grad_enabled,
                        inference_mode)
 from .serialization import save, load, inspect_checkpoint
+from .serialization import archive as _serialization_torch
 from .random import fork_rng
 
 # -------------------------------------------------------------------------
@@ -989,6 +990,13 @@ __all__.extend(
 # needs to be after the above c++ bindings so we can overwrite from Python side
 from tensorplay import functional as functional
 from tensorplay.functional import *
+
+# Underscore sampling ops are skipped by the star-import above; expose them
+# explicitly so tensorplay._standard_gamma / _sample_dirichlet resolve.
+from tensorplay.functional import (
+    _standard_gamma as _standard_gamma,
+    _sample_dirichlet as _sample_dirichlet,
+)
 
 # Keep package-level dtype aliases and composite signatures after importing
 # the generated function surface.
