@@ -1,9 +1,6 @@
-// wrappers in BatchLinearAlgebra.cpp / LinearAlgebra.cpp).
-//
 // runtime-resolved ILP64 LAPACK (see cpu/Lapack.h).  All matrices follow the
 // Fortran (batched column-major) layout that LAPACK expects, produced with
-// cloneBatchedColumnMajor.  Complex inputs are rejected until the complex
-// paths are implemented.
+// cloneBatchedColumnMajor.
 
 #include "Tensor.h"
 #include "Dispatcher.h"
@@ -12,19 +9,25 @@
 #include "Utils.h"
 #include "LinearAlgebraNames.h"
 #include "cpu/Lapack.h"
+#include "tensorplay/ops/TPXOpsGenerated.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <complex>
 #include <cstring>
 #include <limits>
 #include <numeric>
+#include <tuple>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 namespace tensorplay {
 namespace cpu {
 using namespace tensorplay::parallel;
+
+namespace ops = tensorplay::tpx::ops;
 
 namespace {
 
@@ -41,6 +44,291 @@ decltype(auto) run_real(DType dt, Kernel&& k) {
             TP_THROW(NotImplementedError,
                      "unsupported dtype ", pretty_dtype_name(dt),
                      " for linalg on CPU (only float32/float64 are implemented)");
+    }
+}
+
+template <typename T>
+struct LinalgScalarTraits {
+    using value_type = T;
+    static constexpr bool is_complex = false;
+};
+
+template <typename T>
+struct LinalgScalarTraits<std::complex<T>> {
+    using value_type = T;
+    static constexpr bool is_complex = true;
+};
+
+template <class Kernel>
+decltype(auto) run_linalg(DType dt, Kernel&& k) {
+    switch (dt) {
+        case DType::Float32:
+            return k(static_cast<float*>(nullptr));
+        case DType::Float64:
+            return k(static_cast<double*>(nullptr));
+        case DType::ComplexFloat:
+            return k(static_cast<std::complex<float>*>(nullptr));
+        case DType::ComplexDouble:
+            return k(static_cast<std::complex<double>*>(nullptr));
+        default:
+            TP_THROW(NotImplementedError,
+                     "unsupported dtype ", pretty_dtype_name(dt),
+                     " for linalg on CPU");
+    }
+}
+
+// Complex-only dispatch: kernels that wrap Lapack's xGEEV-style complex
+// routines carry no real-typed instantiation, so every switch arm must map
+// onto a std::complex element type for the template to type-check.
+template <class Kernel>
+decltype(auto) run_linalg_complex(DType dt, Kernel&& k) {
+    switch (dt) {
+        case DType::ComplexFloat:
+            return k(static_cast<std::complex<float>*>(nullptr));
+        case DType::ComplexDouble:
+            return k(static_cast<std::complex<double>*>(nullptr));
+        default:
+            TP_THROW(NotImplementedError,
+                     "unsupported dtype ", pretty_dtype_name(dt),
+                     " for complex linalg on CPU");
+    }
+}
+
+template <typename T>
+int64_t lapack_getrf(int64_t m, int64_t n, T* a, int64_t lda, int64_t* ipiv) {
+    if constexpr (std::is_same_v<T, float>) {
+        return lapack_sgetrf(m, n, a, lda, ipiv);
+    } else if constexpr (std::is_same_v<T, double>) {
+        return lapack_dgetrf(m, n, a, lda, ipiv);
+    } else if constexpr (std::is_same_v<T, std::complex<float>>) {
+        return lapack_cgetrf(m, n, a, lda, ipiv);
+    } else {
+        return lapack_zgetrf(m, n, a, lda, ipiv);
+    }
+}
+
+template <typename T>
+int64_t lapack_getrs(char trans, int64_t n, int64_t nrhs, const T* a,
+                     int64_t lda, const int64_t* ipiv, T* b, int64_t ldb) {
+    if constexpr (std::is_same_v<T, float>) {
+        return lapack_sgetrs(trans, n, nrhs, a, lda, ipiv, b, ldb);
+    } else if constexpr (std::is_same_v<T, double>) {
+        return lapack_dgetrs(trans, n, nrhs, a, lda, ipiv, b, ldb);
+    } else if constexpr (std::is_same_v<T, std::complex<float>>) {
+        return lapack_cgetrs(trans, n, nrhs, a, lda, ipiv, b, ldb);
+    } else {
+        return lapack_zgetrs(trans, n, nrhs, a, lda, ipiv, b, ldb);
+    }
+}
+
+template <typename T>
+int64_t lapack_potrf(char uplo, int64_t n, T* a, int64_t lda) {
+    if constexpr (std::is_same_v<T, float>) {
+        return lapack_spotrf(uplo, n, a, lda);
+    } else if constexpr (std::is_same_v<T, double>) {
+        return lapack_dpotrf(uplo, n, a, lda);
+    } else if constexpr (std::is_same_v<T, std::complex<float>>) {
+        return lapack_cpotrf(uplo, n, a, lda);
+    } else {
+        return lapack_zpotrf(uplo, n, a, lda);
+    }
+}
+
+template <typename T>
+int64_t lapack_trtrs(char side, char uplo, char transa, char diag, int64_t n,
+                     int64_t nrhs, const T* a, int64_t lda, T* b, int64_t ldb) {
+    const int64_t order = 102;
+    const int64_t side_code = side == 'L' ? 141 : 142;
+    const int64_t uplo_code = uplo == 'U' ? 121 : 122;
+    const int64_t trans_code = transa == 'N' ? 111 : (transa == 'T' ? 112 : 113);
+    const int64_t diag_code = diag == 'U' ? 132 : 131;
+    if constexpr (std::is_same_v<T, float>) {
+        lapack_strsm(order, side_code, uplo_code, trans_code, diag_code, n, nrhs,
+                     1.0f, a, lda, b, ldb);
+        return 0;
+    } else if constexpr (std::is_same_v<T, double>) {
+        lapack_dtrsm(order, side_code, uplo_code, trans_code, diag_code, n, nrhs,
+                     1.0, a, lda, b, ldb);
+        return 0;
+    } else if constexpr (std::is_same_v<T, std::complex<float>>) {
+        const std::complex<float> alpha(1.0f, 0.0f);
+        lapack_ctrsm(order, side_code, uplo_code, trans_code, diag_code, n, nrhs,
+                     &alpha, a, lda, b, ldb);
+        return 0;
+    } else {
+        const std::complex<double> alpha(1.0, 0.0);
+        lapack_ztrsm(order, side_code, uplo_code, trans_code, diag_code, n, nrhs,
+                     &alpha, a, lda, b, ldb);
+        return 0;
+    }
+}
+
+template <typename T>
+int64_t lapack_geqrf(int64_t m, int64_t n, T* a, int64_t lda, T* tau,
+                     T* work, int64_t lwork) {
+    if constexpr (std::is_same_v<T, float>) {
+        return lapack_sgeqrf(m, n, a, lda, tau, work, lwork);
+    } else if constexpr (std::is_same_v<T, double>) {
+        return lapack_dgeqrf(m, n, a, lda, tau, work, lwork);
+    } else if constexpr (std::is_same_v<T, std::complex<float>>) {
+        return lapack_cgeqrf(m, n, a, lda, tau, work, lwork);
+    } else {
+        return lapack_zgeqrf(m, n, a, lda, tau, work, lwork);
+    }
+}
+
+template <typename T>
+int64_t lapack_orgqr(int64_t m, int64_t n, int64_t k, T* a, int64_t lda,
+                     const T* tau, T* work, int64_t lwork) {
+    if constexpr (std::is_same_v<T, float>) {
+        return lapack_sorgqr(m, n, k, a, lda, tau, work, lwork);
+    } else if constexpr (std::is_same_v<T, double>) {
+        return lapack_dorgqr(m, n, k, a, lda, tau, work, lwork);
+    } else if constexpr (std::is_same_v<T, std::complex<float>>) {
+        return lapack_cungqr(m, n, k, a, lda, tau, work, lwork);
+    } else {
+        return lapack_zungqr(m, n, k, a, lda, tau, work, lwork);
+    }
+}
+
+template <typename T>
+int64_t lapack_gels(char trans, int64_t m, int64_t n, int64_t nrhs, T* a,
+                    int64_t lda, T* b, int64_t ldb, T* work, int64_t lwork) {
+    if constexpr (std::is_same_v<T, float>) {
+        return lapack_sgels(trans, m, n, nrhs, a, lda, b, ldb, work, lwork);
+    } else if constexpr (std::is_same_v<T, double>) {
+        return lapack_dgels(trans, m, n, nrhs, a, lda, b, ldb, work, lwork);
+    } else if constexpr (std::is_same_v<T, std::complex<float>>) {
+        return lapack_cgels(trans, m, n, nrhs, a, lda, b, ldb, work, lwork);
+    } else {
+        return lapack_zgels(trans, m, n, nrhs, a, lda, b, ldb, work, lwork);
+    }
+}
+
+enum class LstsqDriver { Gels, Gelsy, Gelsd, Gelss };
+
+template <typename T>
+int64_t lapack_gelsy(int64_t m, int64_t n, int64_t nrhs, T* a, int64_t lda,
+                     T* b, int64_t ldb, int64_t* jpvt,
+                     typename LinalgScalarTraits<T>::value_type rcond,
+                     int64_t* rank, T* work, int64_t lwork,
+                     typename LinalgScalarTraits<T>::value_type* rwork) {
+    using R = typename LinalgScalarTraits<T>::value_type;
+    if constexpr (std::is_same_v<T, float>) {
+        return lapack_sgelsy(m, n, nrhs, a, lda, b, ldb, jpvt, rcond, rank,
+                             work, lwork);
+    } else if constexpr (std::is_same_v<T, double>) {
+        return lapack_dgelsy(m, n, nrhs, a, lda, b, ldb, jpvt, rcond, rank,
+                             work, lwork);
+    } else if constexpr (std::is_same_v<T, std::complex<float>>) {
+        return lapack_cgelsy(m, n, nrhs, a, lda, b, ldb, jpvt, rcond, rank,
+                             work, lwork, rwork);
+    } else {
+        return lapack_zgelsy(m, n, nrhs, a, lda, b, ldb, jpvt, rcond, rank,
+                             work, lwork, rwork);
+    }
+}
+
+template <typename T>
+int64_t lapack_gelsd(int64_t m, int64_t n, int64_t nrhs, T* a, int64_t lda,
+                     T* b, int64_t ldb,
+                     typename LinalgScalarTraits<T>::value_type* s,
+                     typename LinalgScalarTraits<T>::value_type rcond,
+                     int64_t* rank, T* work, int64_t lwork,
+                     typename LinalgScalarTraits<T>::value_type* rwork,
+                     int64_t* iwork) {
+    using R = typename LinalgScalarTraits<T>::value_type;
+    if constexpr (std::is_same_v<T, float>) {
+        return lapack_sgelsd(m, n, nrhs, a, lda, b, ldb, s, rcond, rank, work,
+                             lwork, iwork);
+    } else if constexpr (std::is_same_v<T, double>) {
+        return lapack_dgelsd(m, n, nrhs, a, lda, b, ldb, s, rcond, rank, work,
+                             lwork, iwork);
+    } else if constexpr (std::is_same_v<T, std::complex<float>>) {
+        return lapack_cgelsd(m, n, nrhs, a, lda, b, ldb, s, rcond, rank, work,
+                             lwork, rwork, iwork);
+    } else {
+        return lapack_zgelsd(m, n, nrhs, a, lda, b, ldb, s, rcond, rank, work,
+                             lwork, rwork, iwork);
+    }
+}
+
+template <typename T>
+int64_t lapack_gelss(int64_t m, int64_t n, int64_t nrhs, T* a, int64_t lda,
+                     T* b, int64_t ldb,
+                     typename LinalgScalarTraits<T>::value_type* s,
+                     typename LinalgScalarTraits<T>::value_type rcond,
+                     int64_t* rank, T* work, int64_t lwork,
+                     typename LinalgScalarTraits<T>::value_type* rwork) {
+    using R = typename LinalgScalarTraits<T>::value_type;
+    if constexpr (std::is_same_v<T, float>) {
+        return lapack_sgelss(m, n, nrhs, a, lda, b, ldb, s, rcond, rank, work,
+                             lwork);
+    } else if constexpr (std::is_same_v<T, double>) {
+        return lapack_dgelss(m, n, nrhs, a, lda, b, ldb, s, rcond, rank, work,
+                             lwork);
+    } else if constexpr (std::is_same_v<T, std::complex<float>>) {
+        return lapack_cgelss(m, n, nrhs, a, lda, b, ldb, s, rcond, rank, work,
+                             lwork, rwork);
+    } else {
+        return lapack_zgelss(m, n, nrhs, a, lda, b, ldb, s, rcond, rank, work,
+                             lwork, rwork);
+    }
+}
+
+template <typename T>
+int64_t lapack_lstsq_call(
+        LstsqDriver driver, int64_t m, int64_t n, int64_t nrhs, T* a,
+        int64_t lda, T* b, int64_t ldb, T* work, int64_t lwork,
+        int64_t* jpvt, typename LinalgScalarTraits<T>::value_type rcond,
+        int64_t* rank, typename LinalgScalarTraits<T>::value_type* rwork,
+        typename LinalgScalarTraits<T>::value_type* s, int64_t* iwork) {
+    switch (driver) {
+        case LstsqDriver::Gels:
+            return lapack_gels('N', m, n, nrhs, a, lda, b, ldb, work, lwork);
+        case LstsqDriver::Gelsy:
+            return lapack_gelsy(m, n, nrhs, a, lda, b, ldb, jpvt, rcond, rank,
+                                work, lwork, rwork);
+        case LstsqDriver::Gelsd:
+            return lapack_gelsd(m, n, nrhs, a, lda, b, ldb, s, rcond, rank,
+                                work, lwork, rwork, iwork);
+        case LstsqDriver::Gelss:
+            return lapack_gelss(m, n, nrhs, a, lda, b, ldb, s, rcond, rank,
+                                work, lwork, rwork);
+    }
+    return -1;
+}
+
+template <typename T>
+int64_t lapack_ldl_factor(char uplo, bool hermitian, int64_t n, T* a,
+                          int64_t lda, int64_t* ipiv, T* work, int64_t lwork) {
+    if constexpr (std::is_same_v<T, float>) {
+        return lapack_ssytrf(uplo, n, a, lda, ipiv, work, lwork);
+    } else if constexpr (std::is_same_v<T, double>) {
+        return lapack_dsytrf(uplo, n, a, lda, ipiv, work, lwork);
+    } else if constexpr (std::is_same_v<T, std::complex<float>>) {
+        return hermitian ? lapack_chetrf(uplo, n, a, lda, ipiv, work, lwork)
+                         : lapack_csytrf(uplo, n, a, lda, ipiv, work, lwork);
+    } else {
+        return hermitian ? lapack_zhetrf(uplo, n, a, lda, ipiv, work, lwork)
+                         : lapack_zsytrf(uplo, n, a, lda, ipiv, work, lwork);
+    }
+}
+
+template <typename T>
+int64_t lapack_ldl_solve(char uplo, bool hermitian, int64_t n, int64_t nrhs,
+                         const T* a, int64_t lda, const int64_t* ipiv, T* b,
+                         int64_t ldb) {
+    if constexpr (std::is_same_v<T, float>) {
+        return lapack_ssytrs(uplo, n, nrhs, a, lda, ipiv, b, ldb);
+    } else if constexpr (std::is_same_v<T, double>) {
+        return lapack_dsytrs(uplo, n, nrhs, a, lda, ipiv, b, ldb);
+    } else if constexpr (std::is_same_v<T, std::complex<float>>) {
+        return hermitian ? lapack_chetrs(uplo, n, nrhs, a, lda, ipiv, b, ldb)
+                         : lapack_csytrs(uplo, n, nrhs, a, lda, ipiv, b, ldb);
+    } else {
+        return hermitian ? lapack_zhetrs(uplo, n, nrhs, a, lda, ipiv, b, ldb)
+                         : lapack_zsytrs(uplo, n, nrhs, a, lda, ipiv, b, ldb);
     }
 }
 
@@ -63,6 +351,13 @@ inline void square_check_inputs(const Tensor& A, const char* fn, const char* arg
 inline void check_inputs_solver(const Tensor& A, const Tensor& B, bool left, const char* fn) {
     square_check_inputs(A, fn, "A");
     check_is_matrix(B, fn, "B");
+    if (A.device() != B.device()) {
+        TP_THROW(DeviceMismatchError, fn, ": A and B must be on the same device");
+    }
+    if (A.dtype() != B.dtype()) {
+        TP_THROW(RuntimeError, fn, ": A and B must have the same dtype, but got ",
+                 pretty_dtype_name(A.dtype()), " and ", pretty_dtype_name(B.dtype()));
+    }
     if (!(left ? A.size(-2) == B.size(-2) : A.size(-1) == B.size(-1))) {
         TP_THROW(RuntimeError, fn, ": Incompatible shapes of A and B for the equation ",
                  left ? "AX = B" : "XA = B",
@@ -209,6 +504,15 @@ int64_t linear_batch_size(const std::vector<int64_t>& batch) {
                                                 std::multiplies<int64_t>()));
 }
 
+int64_t svd_real_workspace(char jobz, int64_t m, int64_t n) {
+    const int64_t mn = std::min(m, n);
+    const int64_t mx = std::max(m, n);
+    if (jobz == 'N') return 5 * mn;
+    if (mx > 10 * mn) return 5 * mn * mn + 5 * mn;
+    return std::max(5 * mn * mn + 5 * mn,
+                    2 * mx * mn + 2 * mn * mn + mn);
+}
+
 // Pack GEEV's real outputs into complex tensors: eigenvalues wr + i*wi and,
 // when requested, the conjugate-pair eigenvector expansion.
 void pack_complex_outputs(bool is_float_input, const Tensor& wr, const Tensor& wi,
@@ -244,11 +548,10 @@ void apply_lu_factor(const Tensor& input, const Tensor& pivots, const Tensor& in
     const int64_t m = input.size(-2);
     const int64_t n = input.size(-1);
     const int64_t leading_dimension = std::max<int64_t>(1, m);
-    constexpr bool is_float = std::is_same_v<scalar_t, float>;
-
     const int64_t matrix_rank = std::min(m, n);
+    const double rank3 = static_cast<double>(matrix_rank) * matrix_rank * matrix_rank;
     const int64_t chunk_size_per_thread = static_cast<int64_t>(
-        std::min(1.0, 3200.0 / (static_cast<double>(matrix_rank * matrix_rank * matrix_rank))));
+        std::min(1.0, rank3 == 0.0 ? 3200.0 : 3200.0 / rank3));
     const int64_t grain_size = chunk_size_per_thread * static_cast<int64_t>(1);
     parallel_for(0, batch_size > 0 ? batch_size : 1, grain_size,
                  [&](int64_t begin, int64_t end) {
@@ -257,11 +560,7 @@ void apply_lu_factor(const Tensor& input, const Tensor& pivots, const Tensor& in
                          int32_t* piv = &pivots_data[i * pivots_stride];
                          std::vector<int64_t> ipiv(pivots_stride);
                          int64_t info;
-                         if constexpr (is_float) {
-                             info = lapack_sgetrf(m, n, a, leading_dimension, ipiv.data());
-                         } else {
-                             info = lapack_dgetrf(m, n, a, leading_dimension, ipiv.data());
-                         }
+                         info = lapack_getrf(m, n, a, leading_dimension, ipiv.data());
                          for (int64_t j = 0; j < pivots_stride; ++j) piv[j] = static_cast<int32_t>(ipiv[j]);
                          infos_data[i] = static_cast<int32_t>(info);
                      }
@@ -277,7 +576,7 @@ std::tuple<Tensor, Tensor, Tensor> lu_factor_ex_impl(
     Tensor LU = clone_batched_column_major(A);
     Tensor pivots = empty_pivots(A, batch, k);
     Tensor info = empty_info_like(A, batch);
-    run_real(A.dtype(), [&](auto tag) {
+    run_linalg(A.dtype(), [&](auto tag) {
         using T = std::remove_pointer_t<decltype(tag)>;
         apply_lu_factor<T>(LU, pivots, info);
     });
@@ -287,7 +586,7 @@ std::tuple<Tensor, Tensor, Tensor> lu_factor_ex_impl(
 
 // ------------------------------------------------------- det / slogdet ------
 
-// As P is a permutation matrix: det(P) = (-1)^{#swaps}.  Port of lu_det_P.
+// The determinant of a permutation is determined by the number of its swaps.
 int64_t lu_perm_sign(const int32_t* pivots, int64_t k) {
             int64_t sign_changes = 0;
     for (int64_t i = 0; i < k; ++i) {
@@ -301,17 +600,21 @@ Tensor linalg_det_kernel(const Tensor& A) {
     square_check_inputs(A, "linalg.det");
     // det(A^T) = det(A): reuse the contiguous layout as the column-major copy.
     const Tensor src = A.is_contiguous() ? A.transpose(-2, -1) : A;
-    auto [LU, pivots, info] = lu_factor_ex_impl(src, true, false, "linalg.lu_factor");
-    (void)info;
-    const int64_t batch_size = batch_count_of(LU);
-    const int64_t n = LU.size(-1);
+    // Named locals: the lambda below references these, and structured
+    // bindings are not capturable on every supported compiler.
+    Tensor LU_tensor;
+    Tensor pivots_tensor;
+    std::tie(LU_tensor, pivots_tensor, std::ignore) =
+        lu_factor_ex_impl(src, true, false, "linalg.lu_factor");
+    const int64_t batch_size = batch_count_of(LU_tensor);
+    const int64_t n = LU_tensor.size(-1);
     Tensor result = Tensor::empty(batch_shape_of(A), A.dtype(), A.device());
-    run_real(A.dtype(), [&](auto tag) {
+    run_linalg(A.dtype(), [&](auto tag) {
         using T = std::remove_pointer_t<decltype(tag)>;
-        auto* lu = LU.data_ptr<T>();
+        auto* lu = LU_tensor.data_ptr<T>();
         auto* out = result.data_ptr<T>();
-        const auto* piv = pivots.data_ptr<int32_t>();
-        const int64_t ms = matrix_stride_of(LU);
+        const auto* piv = pivots_tensor.data_ptr<int32_t>();
+        const int64_t ms = matrix_stride_of(LU_tensor);
         for (int64_t b = 0; b < batch_size; ++b) {
             T det = T(1);
             for (int64_t i = 0; i < n; ++i) det *= lu[b * ms + i * n + i];
@@ -325,37 +628,46 @@ std::tuple<Tensor, Tensor> linalg_slogdet_kernel(const Tensor& A) {
     require_lapack("linalg.slogdet");
     square_check_inputs(A, "linalg.slogdet");
     Tensor work = A.is_contiguous() ? A.transpose(-2, -1) : A;  // det(A^T) = det(A)
-    auto [LU, pivots, info] = lu_factor_ex_impl(work, true, false, "linalg.lu_factor");
-    (void)info;
-    const int64_t batch_size = batch_count_of(LU);
-    const int64_t n = LU.size(-1);
+    Tensor LU_tensor;
+    Tensor pivots_tensor;
+    std::tie(LU_tensor, pivots_tensor, std::ignore) =
+        lu_factor_ex_impl(work, true, false, "linalg.lu_factor");
+    const int64_t batch_size = batch_count_of(LU_tensor);
+    const int64_t n = LU_tensor.size(-1);
     const auto batch = batch_shape_of(A);
     Tensor sign = Tensor::empty(batch, A.dtype(), A.device());
-    Tensor logabsdet = Tensor::empty(batch, A.dtype(), A.device());
-    run_real(A.dtype(), [&](auto tag) {
+    const DType value_dtype = isComplexType(A.dtype()) ? toRealValueType(A.dtype()) : A.dtype();
+    Tensor logabsdet = Tensor::empty(batch, value_dtype, A.device());
+    run_linalg(A.dtype(), [&](auto tag) {
         using T = std::remove_pointer_t<decltype(tag)>;
-        auto* lu = LU.data_ptr<T>();
+        using R = typename LinalgScalarTraits<T>::value_type;
+        auto* lu = LU_tensor.data_ptr<T>();
         auto* s_out = sign.data_ptr<T>();
-        auto* l_out = logabsdet.data_ptr<T>();
-        const auto* piv = pivots.data_ptr<int32_t>();
-        const int64_t ms = matrix_stride_of(LU);
-        const T neg_inf = -std::numeric_limits<T>::infinity();
+        auto* l_out = logabsdet.data_ptr<R>();
+        const auto* piv = pivots_tensor.data_ptr<int32_t>();
+        const int64_t ms = matrix_stride_of(LU_tensor);
+        const R neg_inf = -std::numeric_limits<R>::infinity();
         for (int64_t b = 0; b < batch_size; ++b) {
-            T logdet = T(0);
-            T sgn_prod = T(1);
+            R logdet = R(0);
+            T det = T(1);
             bool singular = false;
             for (int64_t i = 0; i < n; ++i) {
                 const T d = lu[b * ms + i * n + i];
-                if (d == T(0)) { singular = true; break; }
+                if (std::abs(d) == R(0)) { singular = true; break; }
                 logdet += std::log(std::abs(d));
-                sgn_prod *= (d < T(0)) ? T(-1) : T(1);
+                det *= d;
             }
             const int64_t perm_sign = lu_perm_sign(&piv[b * n], n);
             if (singular) {
                 s_out[b] = T(0);
                 l_out[b] = neg_inf;
             } else {
-                s_out[b] = sgn_prod * static_cast<T>(perm_sign);
+                det *= T(perm_sign);
+                if constexpr (LinalgScalarTraits<T>::is_complex) {
+                    s_out[b] = det / static_cast<R>(std::abs(det));
+                } else {
+                    s_out[b] = det < T(0) ? T(-1) : T(1);
+                }
                 l_out[b] = logdet;
             }
         }
@@ -380,11 +692,7 @@ void getrs_inplace(char trans, const Tensor& LU, const int32_t* pivots,
     std::vector<int64_t> ipiv(pivots_stride);
     for (int64_t j = 0; j < pivots_stride; ++j) ipiv[j] = pivots[j];
     int64_t info;
-    if constexpr (std::is_same_v<scalar_t, float>) {
-        info = lapack_sgetrs(trans, n, nrhs, lu, lda, ipiv.data(), b, ldb);
-    } else {
-        info = lapack_dgetrs(trans, n, nrhs, lu, lda, ipiv.data(), b, ldb);
-    }
+    info = lapack_getrs(trans, n, nrhs, lu, lda, ipiv.data(), b, ldb);
     (void)info;  // only reports bad arguments
 }
 
@@ -392,9 +700,20 @@ std::tuple<Tensor, Tensor> linalg_solve_ex_kernel(
         const Tensor& A, const Tensor& B, bool left, bool check_errors) {
     const char* api = "linalg.solve";
     require_lapack(api);
-    check_inputs_solver(A, B, left, api);
+    bool vector_case = B.dim() == 1;
+    if (!vector_case && A.dim() - 1 == B.dim()) {
+        vector_case = true;
+        for (int64_t i = 0; i < A.dim() - 1; ++i) {
+            if (A.size(i) != B.size(i)) {
+                vector_case = false;
+                break;
+            }
+        }
+    }
+    Tensor B_2d = vector_case ? B.unsqueeze(-1) : B;
+    check_inputs_solver(A, B_2d, left, api);
     if (left) {
-        const auto batch = broadcast_batch(A, B);
+        const auto batch = broadcast_batch(A, B_2d);
         Tensor LU_work;
         {
             const Tensor A_exp = expand_to_batch(A, batch);
@@ -403,15 +722,15 @@ std::tuple<Tensor, Tensor> linalg_solve_ex_kernel(
         const int64_t n = A.size(-2);
         Tensor pivots = empty_pivots(A, batch, n);
         Tensor info = empty_info_like(A, batch);
-        run_real(A.dtype(), [&](auto tag) {
+        run_linalg(A.dtype(), [&](auto tag) {
             using T = std::remove_pointer_t<decltype(tag)>;
             apply_lu_factor<T>(LU_work, pivots, info);
         });
-        Tensor B_work = clone_batched_column_major(expand_to_batch(B, batch));
+        Tensor B_work = clone_batched_column_major(expand_to_batch(B_2d, batch));
         const int64_t bs = std::max<int64_t>(1, static_cast<int64_t>(std::accumulate(
                                                   batch.begin(), batch.end(), int64_t{1},
                                                   std::multiplies<int64_t>())));
-        run_real(A.dtype(), [&](auto tag) {
+        run_linalg(A.dtype(), [&](auto tag) {
             using T = std::remove_pointer_t<decltype(tag)>;
             const int64_t lu_ms = matrix_stride_of(LU_work);
             const int64_t b_ms = matrix_stride_of(B_work);
@@ -425,12 +744,15 @@ std::tuple<Tensor, Tensor> linalg_solve_ex_kernel(
             }
         });
         Tensor result = B_work.contiguous();
+        if (vector_case) result = result.squeeze(-1);
         if (check_errors) linalg_check_errors(info, api, A.dim() == 2 && B.dim() == 2);
         return {result, info};
     }
-    // X A = B  <=>  A^T X^T = B^T (real dtypes only).
-    auto [xt, info] = linalg_solve_ex_kernel(A.transpose(-2, -1), B.transpose(-2, -1), true, false);
+    // X A = B is solved as A^T X^T = B^T.
+    auto [xt, info] = linalg_solve_ex_kernel(
+        A.transpose(-2, -1), B_2d.transpose(-2, -1), true, false);
     Tensor result = xt.transpose(-2, -1).contiguous();
+    if (vector_case) result = result.squeeze(-1);
     if (check_errors) linalg_check_errors(info, api, A.dim() == 2 && B.dim() == 2);
     return {result, info};
 }
@@ -447,7 +769,7 @@ std::tuple<Tensor, Tensor> linalg_inv_ex_kernel(const Tensor& A, bool check_erro
     // linalg.inv reject its own RHS.
     Tensor identity = Tensor::empty(static_cast<std::vector<int64_t>>(A.shape()),
                                     A.dtype(), A.device());
-    run_real(A.dtype(), [&](auto tag) {
+    run_linalg(A.dtype(), [&](auto tag) {
         using T = std::remove_pointer_t<decltype(tag)>;
         auto* p = identity.data_ptr<T>();
         const int64_t n = A.size(-1);
@@ -479,16 +801,11 @@ void apply_cholesky(const Tensor& input, const Tensor& info, bool upper) {
     const int64_t batch_size = batch_count_of(input);
     const int64_t n = input.size(-2);
     const int64_t lda = std::max<int64_t>(1, n);
-    constexpr bool is_float = std::is_same_v<scalar_t, float>;
     for (int64_t i = 0; i < batch_size; ++i) {
         scalar_t* a = &input_data[i * input_matrix_stride];
         const char uplo = upper ? 'U' : 'L';
         int64_t err;
-        if constexpr (is_float) {
-            err = lapack_spotrf(uplo, n, a, lda);
-        } else {
-            err = lapack_dpotrf(uplo, n, a, lda);
-        }
+        err = lapack_potrf(uplo, n, a, lda);
         // (LAPACK leaves the input's untouched entries there).
         if (err == 0) {
             for (int64_t r = 0; r < n; ++r) {
@@ -510,7 +827,7 @@ std::tuple<Tensor, Tensor> linalg_cholesky_ex_kernel(const Tensor& A, bool upper
     Tensor L = clone_batched_column_major(A);
     const auto batch = batch_shape_of(A);
     Tensor info = empty_info_like(A, batch);
-    run_real(A.dtype(), [&](auto tag) {
+    run_linalg(A.dtype(), [&](auto tag) {
         using T = std::remove_pointer_t<decltype(tag)>;
         apply_cholesky<T>(L, info, upper);
     });
@@ -532,6 +849,17 @@ Tensor linalg_solve_triangular_kernel(const Tensor& A, const Tensor& B,
     require_lapack(api);
     check_is_matrix(A, api, "A");
     check_is_matrix(B, api, "B");
+    if (A.device() != B.device()) {
+        TP_THROW(DeviceMismatchError, api, ": A and B must be on the same device");
+    }
+    if (A.dtype() != B.dtype()) {
+        TP_THROW(RuntimeError, api, ": A and B must have the same dtype, but got ",
+                 pretty_dtype_name(A.dtype()), " and ", pretty_dtype_name(B.dtype()));
+    }
+    if (!(left ? A.size(-1) == B.size(-2) : A.size(-1) == B.size(-1))) {
+        TP_THROW(RuntimeError, api, ": Incompatible shapes of A and B for the equation ",
+                 left ? "AX = B" : "XA = B");
+    }
     const auto batch = broadcast_batch(A, B);
     Tensor B_work = clone_batched_column_major(expand_to_batch(B, batch));
     Tensor A_work = clone_batched_column_major(expand_to_batch(A, batch));
@@ -541,7 +869,7 @@ Tensor linalg_solve_triangular_kernel(const Tensor& A, const Tensor& B,
     const int64_t bs = std::max<int64_t>(1, static_cast<int64_t>(std::accumulate(
                                             batch.begin(), batch.end(), int64_t{1},
                                             std::multiplies<int64_t>())));
-    run_real(A.dtype(), [&](auto tag) {
+    run_linalg(A.dtype(), [&](auto tag) {
         using T = std::remove_pointer_t<decltype(tag)>;
         auto* a = A_work.data_ptr<T>();
         auto* b = B_work.data_ptr<T>();
@@ -554,13 +882,8 @@ Tensor linalg_solve_triangular_kernel(const Tensor& A, const Tensor& B,
         const int64_t ldb = std::max<int64_t>(1, B.size(-2));
         for (int64_t i = 0; i < bs; ++i) {
             int64_t info;
-            if constexpr (std::is_same_v<T, float>) {
-                info = lapack_strtrs(side, uplo, 'N', diag, m, n, &a[i * a_ms], lda,
-                                     &b[i * b_ms], ldb);
-            } else {
-                info = lapack_dtrtrs(side, uplo, 'N', diag, m, n, &a[i * a_ms], lda,
-                                     &b[i * b_ms], ldb);
-            }
+            info = lapack_trtrs(side, uplo, 'N', diag, m, n, &a[i * a_ms], lda,
+                                &b[i * b_ms], ldb);
             (void)info;
         }
     });
@@ -574,7 +897,33 @@ Tensor linalg_lu_solve_kernel(const Tensor& LU, const Tensor& pivots,
     const char* api = "linalg.lu_solve";
     require_lapack(api);
     square_check_inputs(LU, api, "LU");
-    check_is_matrix(B, api, "B");
+    if (B.dim() < 1) {
+        TP_THROW(RuntimeError, api, ": B must have at least 1 dimension");
+    }
+    if (LU.device() != B.device()) {
+        TP_THROW(DeviceMismatchError, api, ": LU and B must be on the same device");
+    }
+    if (LU.dtype() != B.dtype()) {
+        TP_THROW(RuntimeError, api, ": LU and B must have the same dtype, but got ",
+                 pretty_dtype_name(LU.dtype()), " and ", pretty_dtype_name(B.dtype()));
+    }
+    bool vector_case = B.dim() == 1;
+    if (!vector_case && LU.dim() - 1 == B.dim()) {
+        vector_case = true;
+        for (int64_t i = 0; i < LU.dim() - 1; ++i) {
+            if (LU.size(i) != B.size(i)) {
+                vector_case = false;
+                break;
+            }
+        }
+    }
+    Tensor B_2d = vector_case ? B.unsqueeze(-1) : B;
+    if (pivots.dtype() != DType::Int32 || pivots.device() != LU.device()) {
+        TP_THROW(RuntimeError, api, ": pivots must be Int32 on the same device as LU");
+    }
+    if (pivots.dim() < 1 || pivots.size(-1) != LU.size(-1)) {
+        TP_THROW(RuntimeError, api, ": pivots must contain one entry per matrix column");
+    }
     {
         const int64_t np = pivots.numel();
         const auto* pv = pivots.data_ptr<int32_t>();
@@ -589,13 +938,13 @@ Tensor linalg_lu_solve_kernel(const Tensor& LU, const Tensor& pivots,
             }
         }
     }
-    if (!(left ? LU.size(-2) == B.size(-2) : LU.size(-1) == B.size(-1))) {
+    if (!(left ? LU.size(-2) == B_2d.size(-2) : LU.size(-1) == B_2d.size(-1))) {
         TP_THROW(RuntimeError, api, ": Incompatible shapes of LU and B for the equation ",
                  left ? "AX = B" : "XA = B",
                  " (", LU.size(-2), "x", LU.size(-1), " and ",
-                 B.size(-2), "x", B.size(-1), ")");
+                 B_2d.size(-2), "x", B_2d.size(-1), ")");
     }
-    const auto batch = broadcast_batch(LU, B);
+    const auto batch = broadcast_batch(LU, B_2d);
     Tensor LU_work = clone_batched_column_major(expand_to_batch(LU, batch));
     std::vector<int64_t> piv_shape = batch;
     piv_shape.push_back(pivots.size(-1));
@@ -611,12 +960,15 @@ Tensor linalg_lu_solve_kernel(const Tensor& LU, const Tensor& pivots,
     Tensor work_cm;
     if (rhs_transposed) {
         // Logical (... , n, r) column-major copy of B^T.
-        work_cm = clone_batched_column_major(expand_to_batch(B, batch).transpose(-2, -1));
+        work_cm = clone_batched_column_major(
+            expand_to_batch(B_2d, batch).conj().transpose(-2, -1));
     } else {
-        work_cm = clone_batched_column_major(expand_to_batch(B, batch));
+        work_cm = clone_batched_column_major(expand_to_batch(B_2d, batch));
     }
-    const char trans = (left != adjoint) ? 'N' : 'T';
-    run_real(LU.dtype(), [&](auto tag) {
+    const char trans = left
+        ? (adjoint ? (isComplexType(LU.dtype()) ? 'C' : 'T') : 'N')
+        : (adjoint ? 'N' : (isComplexType(LU.dtype()) ? 'C' : 'T'));
+    run_linalg(LU.dtype(), [&](auto tag) {
         using T = std::remove_pointer_t<decltype(tag)>;
         const auto* piv = piv_exp.data_ptr<int32_t>();
         const int64_t piv_stride = pivots.size(-1);
@@ -628,9 +980,13 @@ Tensor linalg_lu_solve_kernel(const Tensor& LU, const Tensor& pivots,
         }
     });
     if (rhs_transposed) {
-        return work_cm.contiguous().transpose(-2, -1).contiguous();
+        Tensor result = work_cm.contiguous().conj().transpose(-2, -1).contiguous();
+        if (vector_case) result = result.squeeze(-1);
+        return result;
     }
-    return work_cm.contiguous();
+    Tensor result = work_cm.contiguous();
+    if (vector_case) result = result.squeeze(-1);
+    return result;
 }
 
 // ------------------------------------------------------------------ syevd --
@@ -638,11 +994,12 @@ Tensor linalg_lu_solve_kernel(const Tensor& LU, const Tensor& pivots,
 template <typename scalar_t>
 void apply_syevd(const Tensor& vectors, const Tensor& values, const Tensor& infos,
                  bool upper, bool compute_eigenvectors) {
+    using value_t = typename LinalgScalarTraits<scalar_t>::value_type;
     constexpr bool is_float = std::is_same_v<scalar_t, float>;
     const char uplo = upper ? 'U' : 'L';
     const char jobz = compute_eigenvectors ? 'V' : 'N';
     auto* vectors_data = vectors.data_ptr<scalar_t>();
-    auto* values_data = values.data_ptr<scalar_t>();
+    auto* values_data = values.data_ptr<value_t>();
     auto* infos_data = infos.data_ptr<int32_t>();
     const int64_t vectors_stride = matrix_stride_of(vectors);
     const int64_t values_stride = values.size(-1);
@@ -651,31 +1008,51 @@ void apply_syevd(const Tensor& vectors, const Tensor& values, const Tensor& info
     const int64_t lda = std::max<int64_t>(1, n);
 
     int64_t lwork = -1;
+    int64_t lrwork = -1;
     int64_t liwork = -1;
     std::vector<scalar_t> work(1);
+    std::vector<value_t> rwork(1);
     std::vector<int64_t> iwork(1);
     if constexpr (is_float) {
         lapack_ssyevd(jobz, uplo, n, vectors_data, lda, values_data,
                       work.data(), lwork, iwork.data(), liwork);
-    } else {
+    } else if constexpr (std::is_same_v<scalar_t, double>) {
         lapack_dsyevd(jobz, uplo, n, vectors_data, lda, values_data,
                       work.data(), lwork, iwork.data(), liwork);
+    } else if constexpr (std::is_same_v<scalar_t, std::complex<float>>) {
+        lapack_cheevd(jobz, uplo, n, vectors_data, lda, values_data, work.data(),
+                      lwork, rwork.data(), lrwork, iwork.data(), liwork);
+    } else {
+        lapack_zheevd(jobz, uplo, n, vectors_data, lda, values_data, work.data(),
+                      lwork, rwork.data(), lrwork, iwork.data(), liwork);
     }
-    lwork = std::max<int64_t>(1, static_cast<int64_t>(work[0]));
+    if constexpr (LinalgScalarTraits<scalar_t>::is_complex) {
+        lwork = std::max<int64_t>(1, static_cast<int64_t>(work[0].real()));
+        lrwork = std::max<int64_t>(1, static_cast<int64_t>(rwork[0]));
+    } else {
+        lwork = std::max<int64_t>(1, static_cast<int64_t>(work[0]));
+    }
     liwork = std::max<int64_t>(1, iwork[0]);
     work.resize(lwork);
+    if constexpr (LinalgScalarTraits<scalar_t>::is_complex) rwork.resize(lrwork);
     iwork.resize(liwork);
 
     for (int64_t i = 0; i < batch_size; ++i) {
         scalar_t* v = &vectors_data[i * vectors_stride];
-        scalar_t* w = &values_data[i * values_stride];
+        value_t* w = &values_data[i * values_stride];
         int64_t err;
         if constexpr (is_float) {
             err = lapack_ssyevd(jobz, uplo, n, v, lda, w, work.data(), lwork,
                                 iwork.data(), liwork);
-        } else {
+        } else if constexpr (std::is_same_v<scalar_t, double>) {
             err = lapack_dsyevd(jobz, uplo, n, v, lda, w, work.data(), lwork,
                                 iwork.data(), liwork);
+        } else if constexpr (std::is_same_v<scalar_t, std::complex<float>>) {
+            err = lapack_cheevd(jobz, uplo, n, v, lda, w, work.data(), lwork,
+                                rwork.data(), lrwork, iwork.data(), liwork);
+        } else {
+            err = lapack_zheevd(jobz, uplo, n, v, lda, w, work.data(), lwork,
+                                rwork.data(), lrwork, iwork.data(), liwork);
         }
         infos_data[i] = static_cast<int32_t>(err);
         if (err != 0) break;
@@ -687,13 +1064,16 @@ std::tuple<Tensor, Tensor> eigh_impl(const Tensor& A, bool upper, bool compute_e
     square_check_inputs(A, "linalg.eigh");
     Tensor vectors = clone_batched_column_major(A);
     const auto batch = batch_shape_of(A);
-    Tensor values = Tensor::empty(batch.empty() ? std::vector<int64_t>{A.size(-1)} : cat_batch(batch, std::vector<int64_t>{A.size(-1)}),
-                                  A.dtype(), A.device());
+    Tensor values = Tensor::empty(
+        batch.empty() ? std::vector<int64_t>{A.size(-1)}
+                      : cat_batch(batch, std::vector<int64_t>{A.size(-1)}),
+        toRealValueType(A.dtype()), A.device());
     Tensor info = empty_info_like(A, batch);
-    run_real(A.dtype(), [&](auto tag) {
+    run_linalg(A.dtype(), [&](auto tag) {
         using T = std::remove_pointer_t<decltype(tag)>;
         apply_syevd<T>(vectors, values, info, upper, compute_eigenvectors);
     });
+    linalg_check_errors(info, "linalg.eigh", A.dim() == 2);
     return {values.contiguous(), vectors.contiguous()};
 }
 
@@ -760,9 +1140,52 @@ void apply_geev(const Tensor& input, const Tensor& wr, const Tensor& wi,
     }
 }
 
-// Port of linalg_eig_make_complex_eigenvectors_cpu_impl
-// (BatchLinearAlgebraKernel.cpp:146): GEEV packs complex conjugate pairs into
-// consecutive columns of VR.
+template <typename scalar_t>
+void apply_geev_complex(const Tensor& input, const Tensor& values,
+                        const Tensor& vectors, const Tensor& infos,
+                        bool compute_eigenvectors) {
+    using value_t = typename LinalgScalarTraits<scalar_t>::value_type;
+    auto* a_data = input.data_ptr<scalar_t>();
+    auto* w_data = values.data_ptr<scalar_t>();
+    auto* v_data = compute_eigenvectors ? vectors.data_ptr<scalar_t>() : nullptr;
+    auto* infos_data = infos.data_ptr<int32_t>();
+    const char jobvl = 'N';
+    const char jobvr = compute_eigenvectors ? 'V' : 'N';
+    const int64_t n = input.size(-1);
+    const int64_t lda = std::max<int64_t>(1, n);
+    const int64_t ldvr = compute_eigenvectors ? lda : 1;
+    const int64_t matrix_stride = matrix_stride_of(input);
+    std::vector<scalar_t> work(1);
+    std::vector<value_t> rwork(static_cast<size_t>(std::max<int64_t>(1, 2 * n)));
+    int64_t lwork = -1;
+    if constexpr (std::is_same_v<scalar_t, std::complex<float>>) {
+        lapack_cgeev(jobvl, jobvr, n, a_data, lda, w_data, nullptr, 1, v_data,
+                     ldvr, work.data(), lwork, rwork.data());
+    } else {
+        lapack_zgeev(jobvl, jobvr, n, a_data, lda, w_data, nullptr, 1, v_data,
+                     ldvr, work.data(), lwork, rwork.data());
+    }
+    lwork = std::max<int64_t>(1, static_cast<int64_t>(work[0].real()));
+    work.resize(static_cast<size_t>(lwork));
+
+    const int64_t batch_size = batch_count_of(input);
+    for (int64_t i = 0; i < batch_size; ++i) {
+        scalar_t* a = &a_data[i * matrix_stride];
+        scalar_t* w = &w_data[i * n];
+        scalar_t* v = compute_eigenvectors ? &v_data[i * matrix_stride] : nullptr;
+        int64_t err;
+        if constexpr (std::is_same_v<scalar_t, std::complex<float>>) {
+            err = lapack_cgeev(jobvl, jobvr, n, a, lda, w, nullptr, 1, v, ldvr,
+                               work.data(), lwork, rwork.data());
+        } else {
+            err = lapack_zgeev(jobvl, jobvr, n, a, lda, w, nullptr, 1, v, ldvr,
+                               work.data(), lwork, rwork.data());
+        }
+        infos_data[i] = static_cast<int32_t>(err);
+    }
+}
+
+// Real-input GEEV stores conjugate pairs in adjacent real columns.
 template <typename scalar_t, typename cplx_t>
 void make_complex_eigenvectors(const Tensor& result, const Tensor& complex_values,
                                const Tensor& real_vectors) {
@@ -798,6 +1221,20 @@ std::tuple<Tensor, Tensor> eig_impl(const Tensor& A, bool compute_eigenvectors) 
     Tensor input = clone_batched_column_major(A);
     const auto batch = batch_shape_of(A);
     const int64_t n = A.size(-1);
+    if (isComplexType(A.dtype())) {
+        Tensor values = Tensor::empty(repeat_batch(batch, n), A.dtype(), A.device());
+        Tensor eigvecs;
+        if (compute_eigenvectors) {
+            eigvecs = empty_column_major(cat_batch(batch, {n, n}), A.dtype(), A.device());
+        }
+        Tensor info = empty_info_like(A, batch);
+        run_linalg_complex(A.dtype(), [&](auto tag) {
+            using T = std::remove_pointer_t<decltype(tag)>;
+            apply_geev_complex<T>(input, values, eigvecs, info, compute_eigenvectors);
+        });
+        linalg_check_errors(info, "linalg.eig", A.dim() == 2);
+        return {values.contiguous(), compute_eigenvectors ? eigvecs.contiguous() : eigvecs};
+    }
     Tensor wr = Tensor::empty(repeat_batch(batch, n), A.dtype(), A.device());
     Tensor wi = Tensor::empty(repeat_batch(batch, n), A.dtype(), A.device());
     Tensor rvectors;
@@ -845,10 +1282,12 @@ Tensor linalg_eigvals_kernel(const Tensor& A) {
 template <typename scalar_t>
 void apply_svd(const Tensor& A, bool full_matrices, bool compute_uv,
                const Tensor& U, const Tensor& S, const Tensor& Vh, const Tensor& info) {
+    using value_t = typename LinalgScalarTraits<scalar_t>::value_type;
     constexpr bool is_float = std::is_same_v<scalar_t, float>;
+    constexpr bool is_double = std::is_same_v<scalar_t, double>;
     auto* a_data = A.data_ptr<scalar_t>();
     auto* u_data = compute_uv ? U.data_ptr<scalar_t>() : nullptr;
-    auto* s_data = S.data_ptr<scalar_t>();
+    auto* s_data = S.data_ptr<value_t>();
     auto* vh_data = compute_uv ? Vh.data_ptr<scalar_t>() : nullptr;
     auto* info_data = info.data_ptr<int32_t>();
     const int64_t a_stride = matrix_stride_of(A);
@@ -863,18 +1302,34 @@ void apply_svd(const Tensor& A, bool full_matrices, bool compute_uv,
     const int64_t lda = A.stride(-1);
     const int64_t ldu = compute_uv ? U.stride(-1) : 1;
     const int64_t ldvh = compute_uv ? Vh.stride(-1) : 1;
-    std::vector<int64_t> iwork(static_cast<size_t>(8 * k));
+    std::vector<int64_t> iwork(static_cast<size_t>(std::max<int64_t>(1, 8 * k)));
 
     int64_t lwork = -1;
     std::vector<scalar_t> work(1);
+    std::vector<value_t> rwork;
+    if constexpr (LinalgScalarTraits<scalar_t>::is_complex) {
+        rwork.resize(static_cast<size_t>(std::max<int64_t>(1,
+                                                           svd_real_workspace(jobz, m, n))));
+    }
+    value_t* rwork_data = rwork.empty() ? nullptr : rwork.data();
     if constexpr (is_float) {
         lapack_sgesdd(jobz, m, n, a_data, lda, s_data, u_data, ldu, vh_data, ldvh,
                       work.data(), lwork, iwork.data());
-    } else {
+    } else if constexpr (is_double) {
         lapack_dgesdd(jobz, m, n, a_data, lda, s_data, u_data, ldu, vh_data, ldvh,
                       work.data(), lwork, iwork.data());
+    } else if constexpr (std::is_same_v<scalar_t, std::complex<float>>) {
+        lapack_cgesdd(jobz, m, n, a_data, lda, s_data, u_data, ldu, vh_data, ldvh,
+                      work.data(), lwork, rwork_data, iwork.data());
+    } else {
+        lapack_zgesdd(jobz, m, n, a_data, lda, s_data, u_data, ldu, vh_data, ldvh,
+                      work.data(), lwork, rwork_data, iwork.data());
     }
-    lwork = std::max<int64_t>(1, static_cast<int64_t>(work[0]));
+    if constexpr (LinalgScalarTraits<scalar_t>::is_complex) {
+        lwork = std::max<int64_t>(1, static_cast<int64_t>(work[0].real()));
+    } else {
+        lwork = std::max<int64_t>(1, static_cast<int64_t>(work[0]));
+    }
     work.resize(lwork);
 
     for (int64_t i = 0; i < batch_size; ++i) {
@@ -885,12 +1340,24 @@ void apply_svd(const Tensor& A, bool full_matrices, bool compute_uv,
                                 compute_uv ? &u_data[i * u_stride] : nullptr, ldu,
                                 compute_uv ? &vh_data[i * vh_stride] : nullptr, ldvh,
                                 work.data(), lwork, iwork.data());
-        } else {
+        } else if constexpr (is_double) {
             err = lapack_dgesdd(jobz, m, n, &a_data[i * a_stride], lda,
                                 &s_data[i * s_stride],
                                 compute_uv ? &u_data[i * u_stride] : nullptr, ldu,
                                 compute_uv ? &vh_data[i * vh_stride] : nullptr, ldvh,
                                 work.data(), lwork, iwork.data());
+        } else if constexpr (std::is_same_v<scalar_t, std::complex<float>>) {
+            err = lapack_cgesdd(jobz, m, n, &a_data[i * a_stride], lda,
+                                &s_data[i * s_stride],
+                                compute_uv ? &u_data[i * u_stride] : nullptr, ldu,
+                                compute_uv ? &vh_data[i * vh_stride] : nullptr, ldvh,
+                                work.data(), lwork, rwork_data, iwork.data());
+        } else {
+            err = lapack_zgesdd(jobz, m, n, &a_data[i * a_stride], lda,
+                                &s_data[i * s_stride],
+                                compute_uv ? &u_data[i * u_stride] : nullptr, ldu,
+                                compute_uv ? &vh_data[i * vh_stride] : nullptr, ldvh,
+                                work.data(), lwork, rwork_data, iwork.data());
         }
         info_data[i] = static_cast<int32_t>(err);
     }
@@ -900,7 +1367,6 @@ std::tuple<Tensor, Tensor, Tensor> svd_impl(const Tensor& A, bool full_matrices,
                                             bool compute_uv) {
     require_lapack("linalg.svd");
     check_is_matrix(A, "linalg.svd");
-    Tensor a_copy = clone_batched_column_major(A);
     const int64_t m = A.size(-2);
     const int64_t n = A.size(-1);
     const int64_t k = std::min(m, n);
@@ -915,12 +1381,27 @@ std::tuple<Tensor, Tensor, Tensor> svd_impl(const Tensor& A, bool full_matrices,
         U = Tensor::empty({0}, A.dtype(), A.device());
         Vh = Tensor::empty({0}, A.dtype(), A.device());
     }
-    S = Tensor::empty(cat_batch(batch, std::vector<int64_t>{k}), A.dtype(), A.device());
+    S = Tensor::empty(cat_batch(batch, std::vector<int64_t>{k}),
+                      toRealValueType(A.dtype()), A.device());
     Tensor info = empty_info_like(A, batch);
-    run_real(A.dtype(), [&](auto tag) {
-        using T = std::remove_pointer_t<decltype(tag)>;
-        apply_svd<T>(a_copy, full_matrices, compute_uv, U, S, Vh, info);
-    });
+    if (A.numel() == 0) {
+        if (compute_uv && full_matrices) {
+            if (U.numel() != 0) {
+                U.zero_();
+                U.diagonal(0, -2, -1).fill_(Scalar(1));
+            }
+            if (Vh.numel() != 0) {
+                Vh.zero_();
+                Vh.diagonal(0, -2, -1).fill_(Scalar(1));
+            }
+        }
+    } else {
+        Tensor a_copy = clone_batched_column_major(A);
+        run_linalg(A.dtype(), [&](auto tag) {
+            using T = std::remove_pointer_t<decltype(tag)>;
+            apply_svd<T>(a_copy, full_matrices, compute_uv, U, S, Vh, info);
+        });
+    }
     linalg_check_errors(info, "linalg.svd", A.dim() == 2);
     if (!compute_uv) {
         U = Tensor::empty(cat_batch(batch, std::vector<int64_t>{m, 0}), A.dtype(), A.device());
@@ -929,24 +1410,45 @@ std::tuple<Tensor, Tensor, Tensor> svd_impl(const Tensor& A, bool full_matrices,
     return {U.contiguous(), S.contiguous(), Vh.contiguous()};
 }
 
+void check_cpu_svd_driver(const std::optional<std::string>& driver) {
+    if (driver.has_value()) {
+        TP_THROW(RuntimeError,
+                 "linalg.svd: keyword argument `driver=` is only supported on CUDA inputs");
+    }
+}
+
 std::tuple<Tensor, Tensor, Tensor> linalg_svd_kernel(const Tensor& A, bool full_matrices,
                                                      std::optional<std::string> driver) {
-    if (driver.has_value() && driver.value() != "gesvd" && driver.value() != "gesvdj") {
-        TP_THROW(RuntimeError, "linalg.svd(): driver ", driver.value(),
-                 " is not supported on CPU. Consider linalg.svd(A, full_matrices) instead.");
-    }
+    check_cpu_svd_driver(driver);
     return svd_impl(A, full_matrices, true);
 }
 
-Tensor linalg_svdvals_kernel(const Tensor& A, std::optional<std::string> /*driver*/) {
+Tensor linalg_svdvals_kernel(const Tensor& A, std::optional<std::string> driver) {
+    check_cpu_svd_driver(driver);
     return std::get<1>(svd_impl(A, false, false));
+}
+
+std::tuple<Tensor, Tensor> linalg_polar_kernel(const Tensor& A) {
+    check_is_matrix(A, "linalg.polar");
+    if (A.size(-2) < A.size(-1)) {
+        TP_THROW(RuntimeError,
+                 "linalg.polar: input must have at least as many rows as columns, but got ",
+                 A.size(-2), " by ", A.size(-1), " matrices");
+    }
+
+    auto [Up, S, Vh] = ops::linalg_svd(A, false, std::nullopt);
+    Tensor scaled_vh = ops::mul(ops::unsqueeze(S, -1), Vh);
+    Tensor H = ops::matmul(ops::mH(Vh), scaled_vh);
+    H = ops::mul(ops::add(H, ops::mH(H)), Scalar(0.5));
+    Tensor U = ops::matmul(Up, Vh);
+    return {U.contiguous(), H.contiguous()};
 }
 
 // ------------------------------------------------------------- geqrf/orgqr --
 
 template <typename scalar_t>
 void apply_geqrf(const Tensor& input, const Tensor& tau) {
-    constexpr bool is_float = std::is_same_v<scalar_t, float>;
+    if (input.numel() == 0) return;
     auto* input_data = input.data_ptr<scalar_t>();
     auto* tau_data = tau.data_ptr<scalar_t>();
     const int64_t input_matrix_stride = matrix_stride_of(input);
@@ -958,28 +1460,23 @@ void apply_geqrf(const Tensor& input, const Tensor& tau) {
 
     int64_t lwork = -1;
     std::vector<scalar_t> work(1);
-    if constexpr (is_float) {
-        lapack_sgeqrf(m, n, input_data, lda, tau_data, work.data(), lwork);
+    lapack_geqrf(m, n, input_data, lda, tau_data, work.data(), lwork);
+    if constexpr (LinalgScalarTraits<scalar_t>::is_complex) {
+        lwork = std::max<int64_t>(n, static_cast<int64_t>(work[0].real()));
     } else {
-        lapack_dgeqrf(m, n, input_data, lda, tau_data, work.data(), lwork);
+        lwork = std::max<int64_t>(n, static_cast<int64_t>(work[0]));
     }
-    lwork = std::max<int64_t>(n, static_cast<int64_t>(work[0]));
     work.resize(lwork);
 
     for (int64_t i = 0; i < batch_size; ++i) {
         scalar_t* a = &input_data[i * input_matrix_stride];
         scalar_t* t = &tau_data[i * tau_stride];
-        if constexpr (is_float) {
-            lapack_sgeqrf(m, n, a, lda, t, work.data(), lwork);
-        } else {
-            lapack_dgeqrf(m, n, a, lda, t, work.data(), lwork);
-        }
+        lapack_geqrf(m, n, a, lda, t, work.data(), lwork);
     }
 }
 
 template <typename scalar_t>
 void apply_orgqr(Tensor& self, const Tensor& tau) {
-    constexpr bool is_float = std::is_same_v<scalar_t, float>;
     if (self.numel() == 0) return;
     auto* self_data = self.data_ptr<scalar_t>();
     const auto* tau_data = tau.data_ptr<scalar_t>();
@@ -993,66 +1490,66 @@ void apply_orgqr(Tensor& self, const Tensor& tau) {
 
     int64_t lwork = -1;
     std::vector<scalar_t> work(1);
-    if constexpr (is_float) {
-        lapack_sorgqr(m, n, k, self_data, lda, tau_data, work.data(), lwork);
+    lapack_orgqr(m, n, k, self_data, lda, tau_data, work.data(), lwork);
+    if constexpr (LinalgScalarTraits<scalar_t>::is_complex) {
+        lwork = std::max<int64_t>(1, static_cast<int64_t>(work[0].real()));
     } else {
-        lapack_dorgqr(m, n, k, self_data, lda, tau_data, work.data(), lwork);
+        lwork = std::max<int64_t>(1, static_cast<int64_t>(work[0]));
     }
-    lwork = std::max<int64_t>(1, static_cast<int64_t>(work[0]));
     work.resize(lwork);
 
     for (int64_t i = 0; i < batch_size; ++i) {
         scalar_t* s = &self_data[i * self_matrix_stride];
         const scalar_t* t = &tau_data[i * tau_stride];
-        if constexpr (is_float) {
-            lapack_sorgqr(m, n, k, s, lda, t, work.data(), lwork);
-        } else {
-            lapack_dorgqr(m, n, k, s, lda, t, work.data(), lwork);
-        }
+        lapack_orgqr(m, n, k, s, lda, t, work.data(), lwork);
     }
 }
 
 std::tuple<Tensor, Tensor> linalg_qr_kernel(const Tensor& A, std::string mode) {
     require_lapack("linalg.qr");
     check_is_matrix(A, "linalg.qr");
-    if (mode != "reduced" && mode != "complete" && mode != "r" && mode != "R") {
+    if (mode != "reduced" && mode != "complete" && mode != "r") {
         TP_THROW(RuntimeError, "linalg.qr: mode '", mode,
-                 "' not recognized. Mode must be one of 'reduced', 'complete', 'r' or 'R'");
+                 "' not recognized. Mode must be one of 'reduced', 'complete' or 'r'");
     }
-    const bool reduced = (mode == "reduced" || mode == "r" || mode == "R");
+    const bool compute_q = mode != "r";
+    const bool reduced = mode == "reduced" || !compute_q;
     Tensor QR = clone_batched_column_major(A);
     const int64_t m = A.size(-2);
     const int64_t n = A.size(-1);
     const int64_t k = std::min(m, n);
     const auto batch = batch_shape_of(A);
     Tensor tau = Tensor::empty(cat_batch(batch, std::vector<int64_t>{k}), A.dtype(), A.device());
-    run_real(A.dtype(), [&](auto tag) {
+    run_linalg(A.dtype(), [&](auto tag) {
         using T = std::remove_pointer_t<decltype(tag)>;
         apply_geqrf<T>(QR, tau);
     });
 
-    const int64_t qcols = reduced ? k : m;
-    // Pack the first qcols columns of the reflector buffer into an
-    // (m x qcols) column-major buffer for orgqr.
-    Tensor Q_in = empty_column_major(cat_batch(batch, std::vector<int64_t>{m, qcols}),
-                                     A.dtype(), A.device());
-    run_real(A.dtype(), [&](auto tag) {
-        using T = std::remove_pointer_t<decltype(tag)>;
-        const auto* src = QR.data_ptr<T>();
-        auto* dst = Q_in.data_ptr<T>();
-        const int64_t bs = linear_batch_size(batch);
-        for (int64_t b = 0; b < bs; ++b)
-            for (int64_t col = 0; col < qcols; ++col)
-                std::memcpy(dst + (b * m * qcols) + col * m,
-                            src + (b * m * n) + col * m, sizeof(T) * m);
-        apply_orgqr<T>(Q_in, tau);
-    });
+    Tensor Q_in = Tensor::empty({0}, A.dtype(), A.device());
+    if (compute_q) {
+        const int64_t qcols = reduced ? k : m;
+        // Pack the first qcols columns of the reflector buffer into an
+        // (m x qcols) column-major buffer for orgqr.
+        Q_in = empty_column_major(cat_batch(batch, std::vector<int64_t>{m, qcols}),
+                                  A.dtype(), A.device());
+        run_linalg(A.dtype(), [&](auto tag) {
+            using T = std::remove_pointer_t<decltype(tag)>;
+            const auto* src = QR.data_ptr<T>();
+            auto* dst = Q_in.data_ptr<T>();
+            const int64_t bs = linear_batch_size(batch);
+            for (int64_t b = 0; b < bs; ++b)
+                for (int64_t col = 0; col < qcols; ++col)
+                    std::memcpy(dst + (b * m * qcols) + col * m,
+                                src + (b * m * n) + col * m, sizeof(T) * m);
+            apply_orgqr<T>(Q_in, tau);
+        });
+    }
 
     // R: upper triangle of the geqrf buffer.
-    const int64_t rrows = reduced ? k : m;
+    const int64_t rrows = reduced || !compute_q ? k : m;
     Tensor R = empty_column_major(cat_batch(batch, std::vector<int64_t>{rrows, n}),
                                   A.dtype(), A.device());
-    run_real(A.dtype(), [&](auto tag) {
+    run_linalg(A.dtype(), [&](auto tag) {
         using T = std::remove_pointer_t<decltype(tag)>;
         const auto* src = QR.data_ptr<T>();
         auto* dst = R.data_ptr<T>();
@@ -1063,7 +1560,8 @@ std::tuple<Tensor, Tensor> linalg_qr_kernel(const Tensor& A, std::string mode) {
                     dst[b * rrows * n + col * rrows + row] =
                         src[b * m * n + col * m + row];
     });
-    return {Q_in.contiguous(), R.contiguous()};
+    return {compute_q ? Q_in.contiguous() : Tensor::empty({0}, A.dtype(), A.device()),
+            R.contiguous()};
 }
 
 Tensor linalg_householder_product_kernel(const Tensor& input, const Tensor& tau) {
@@ -1071,133 +1569,272 @@ Tensor linalg_householder_product_kernel(const Tensor& input, const Tensor& tau)
     check_is_matrix(input, "linalg.householder_product");
     if (input.size(-2) < input.size(-1)) {
         TP_THROW(RuntimeError, "linalg.householder_product: If input has size (..., m, n), "
-                               "n must be less than or equal to m, but got n = ",
+                 "n must be less than or equal to m, but got n = ",
                  input.size(-1), " and m = ", input.size(-2));
     }
-    if (tau.dim() < 1 || tau.size(-1) != std::min(input.size(-2), input.size(-1))) {
+    if (tau.dim() < 1 || input.size(-1) < tau.size(-1)) {
+        TP_THROW(RuntimeError, "linalg.householder_product: input.shape[-1] must be greater than or equal to tau.shape[-1]");
+    }
+    if (input.dim() - tau.dim() != 1) {
+        TP_THROW(RuntimeError, "linalg.householder_product: Expected tau to have one dimension less than input, but got tau.ndim equal to ",
+                 tau.dim(), " and input.ndim is equal to ", input.dim());
+    }
+    for (int64_t i = 0; i < input.dim() - 2; ++i) {
+        if (input.size(i) != tau.size(i)) {
+            TP_THROW(RuntimeError, "linalg.householder_product: Expected batch dimensions of tau to be equal to input.shape[:-2]");
+        }
+    }
+    if (tau.size(-1) != std::min(input.size(-2), input.size(-1))) {
         TP_THROW(RuntimeError, "linalg.householder_product: If tau has size (..., k), then "
                                "when input has size (..., m, n) we require k == min(m, n)");
     }
     if (tau.dtype() != input.dtype()) {
         TP_THROW(RuntimeError, "linalg.householder_product: input and tau must have the same dtype");
     }
+    if (tau.device() != input.device()) {
+        TP_THROW(DeviceMismatchError, "linalg.householder_product: input and tau must be on the same device");
+    }
+    Tensor tau_work = tau.is_contiguous() ? tau : tau.contiguous();
     Tensor result = clone_batched_column_major(input);
-    run_real(input.dtype(), [&](auto tag) {
+    run_linalg(input.dtype(), [&](auto tag) {
         using T = std::remove_pointer_t<decltype(tag)>;
-        apply_orgqr<T>(result, tau);
+        apply_orgqr<T>(result, tau_work);
     });
     return result.contiguous();
 }
 
-// ------------------------------------------------------------------- gels --
+template <typename T>
+void apply_lstsq(const Tensor& A, Tensor& B, Tensor& rank,
+                 Tensor& singular_values, double rcond, LstsqDriver driver) {
+    using R = typename LinalgScalarTraits<T>::value_type;
+    const int64_t m = A.size(-2);
+    const int64_t n = A.size(-1);
+    const int64_t nrhs = B.size(-1);
+    const int64_t lda = std::max<int64_t>(1, m);
+    const int64_t ldb = std::max<int64_t>({int64_t{1}, m, n});
+    const int64_t bs = linear_batch_size(batch_shape_of(A));
+    if (bs == 0) return;
+
+    auto* a_data = A.data_ptr<T>();
+    auto* b_data = B.data_ptr<T>();
+    auto* rank_data = driver == LstsqDriver::Gels
+        ? static_cast<int64_t*>(nullptr) : rank.data_ptr<int64_t>();
+    auto* s_data = (driver == LstsqDriver::Gelsd || driver == LstsqDriver::Gelss)
+        ? singular_values.data_ptr<R>() : static_cast<R*>(nullptr);
+
+    std::vector<int64_t> jpvt;
+    if (driver == LstsqDriver::Gelsy) {
+        jpvt.resize(static_cast<size_t>(std::max<int64_t>(1, n)));
+    }
+    std::vector<R> rwork;
+    std::vector<int64_t> iwork;
+    T work_opt{};
+    R rwork_opt{};
+    int64_t iwork_opt = 0;
+    int64_t rank_opt = 0;
+    int64_t info = lapack_lstsq_call(
+        driver, m, n, nrhs, a_data, lda, b_data, ldb, &work_opt, -1,
+        jpvt.empty() ? nullptr : jpvt.data(), static_cast<R>(rcond), &rank_opt,
+        &rwork_opt, s_data, &iwork_opt);
+    if (info != 0) {
+        TP_THROW(RuntimeError, "linalg.lstsq: workspace query failed with error code ", info);
+    }
+    int64_t lwork = 1;
+    if constexpr (LinalgScalarTraits<T>::is_complex) {
+        lwork = std::max<int64_t>(1, static_cast<int64_t>(work_opt.real()));
+    } else {
+        lwork = std::max<int64_t>(1, static_cast<int64_t>(work_opt));
+    }
+    std::vector<T> work(static_cast<size_t>(lwork));
+
+    if constexpr (LinalgScalarTraits<T>::is_complex) {
+        if (driver != LstsqDriver::Gels) {
+            int64_t rwork_size = 1;
+            if (driver == LstsqDriver::Gelsy) {
+                rwork_size = std::max<int64_t>(1, 2 * n);
+            } else if (driver == LstsqDriver::Gelss) {
+                rwork_size = std::max<int64_t>(1, 5 * std::min(m, n));
+            } else {
+                rwork_size = std::max<int64_t>(1, rwork_opt);
+            }
+            rwork.resize(static_cast<size_t>(rwork_size));
+        }
+    }
+    if (driver == LstsqDriver::Gelsd) {
+        iwork.resize(static_cast<size_t>(std::max<int64_t>(1, iwork_opt)));
+    }
+
+    for (int64_t i = 0; i < bs; ++i) {
+        if (!jpvt.empty()) std::fill(jpvt.begin(), jpvt.end(), int64_t{0});
+        int64_t rank_value = 0;
+        int64_t info_value = lapack_lstsq_call(
+            driver, m, n, nrhs, a_data + i * m * n, lda,
+            b_data + i * ldb * nrhs, ldb, work.data(), lwork,
+            jpvt.empty() ? nullptr : jpvt.data(), static_cast<R>(rcond),
+            &rank_value, rwork.empty() ? nullptr : rwork.data(),
+            s_data ? s_data + i * std::min(m, n) : nullptr,
+            iwork.empty() ? nullptr : iwork.data());
+        if (info_value != 0) {
+            TP_THROW(RuntimeError, "linalg.lstsq: (Batch element ", i,
+                     ") The least squares solution could not be computed (error code: ",
+                     info_value, ").");
+        }
+        if (rank_data) rank_data[i] = rank_value;
+    }
+}
 
 std::tuple<Tensor, Tensor, Tensor, Tensor> linalg_lstsq_kernel(
         const Tensor& A, const Tensor& B, std::optional<double> rcond,
         std::optional<std::string> driver_opt) {
     const char* api = "linalg.lstsq";
     require_lapack(api);
-    const std::string driver = driver_opt.value_or("gels");
-    if (driver != "gels") {
-        TP_THROW(NotImplementedError, api, ": driver '", driver,
-                 "' is not supported on CPU; only 'gels' is implemented");
-    }
     check_is_matrix(A, api);
-    check_is_matrix(B, api);
+    if (B.dim() < 1) {
+        TP_THROW(RuntimeError, api, ": B must have at least 1 dimension");
+    }
+    const int64_t dim_diff = A.dim() - B.dim();
+    if (dim_diff < 0 || dim_diff > 1) {
+        TP_THROW(RuntimeError, api,
+                 ": A and B must have compatible numbers of dimensions");
+    }
+    if (A.device() != B.device()) {
+        TP_THROW(DeviceMismatchError, api, ": A and B must be on the same device");
+    }
+    if (A.dtype() != B.dtype()) {
+        TP_THROW(RuntimeError, api, ": A and B must have the same dtype, but got ",
+                 pretty_dtype_name(A.dtype()), " and ", pretty_dtype_name(B.dtype()));
+    }
+
+    bool vector_case = B.dim() == 1;
+    if (!vector_case && A.dim() - 1 == B.dim()) {
+        vector_case = true;
+        for (int64_t i = 0; i < A.dim() - 1; ++i) {
+            if (A.size(i) != B.size(i)) {
+                vector_case = false;
+                break;
+            }
+        }
+    }
+    Tensor B_2d = vector_case ? B.unsqueeze(-1) : B;
+    if (A.size(-2) != B_2d.size(-2)) {
+        TP_THROW(RuntimeError, api, ": A and B have incompatible row dimensions: ",
+                 A.size(-2), " and ", B_2d.size(-2));
+    }
+
+    std::string driver = driver_opt.value_or("gelsy");
+    std::transform(driver.begin(), driver.end(), driver.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    LstsqDriver driver_type;
+    if (driver == "gels") driver_type = LstsqDriver::Gels;
+    else if (driver == "gelsy") driver_type = LstsqDriver::Gelsy;
+    else if (driver == "gelsd") driver_type = LstsqDriver::Gelsd;
+    else if (driver == "gelss") driver_type = LstsqDriver::Gelss;
+    else {
+        TP_THROW(RuntimeError, api,
+                 ": driver must be one of gels, gelsy, gelsd, or gelss");
+    }
+
+    const double epsilon = (A.dtype() == DType::Float32 ||
+                            A.dtype() == DType::ComplexFloat)
+        ? static_cast<double>(std::numeric_limits<float>::epsilon())
+        : std::numeric_limits<double>::epsilon();
+    const double rcond_value = rcond.value_or(
+        epsilon * static_cast<double>(std::max(A.size(-2), A.size(-1))));
+    const auto batch = broadcast_batch(A, B_2d);
     const int64_t m = A.size(-2);
     const int64_t n = A.size(-1);
-    if (m < n) {
-        TP_THROW(RuntimeError, api,
-                 ": The input tensor A should have at least as many rows as columns, "
-                 "but they are ", m, " by ", n);
-    }
-    (void)rcond;
-
-    const auto batch = broadcast_batch(A, B);
-    const int64_t nrhs = B.size(-1);
-    const int64_t ldb = std::max<int64_t>(m, n);
+    const int64_t nrhs = B_2d.size(-1);
+    const int64_t ldb = std::max<int64_t>({int64_t{1}, m, n});
     const int64_t bs = linear_batch_size(batch);
 
-    Tensor A_work = clone_batched_column_major(expand_to_batch(A, batch));  // destroyed
-    Tensor B_work = empty_column_major(cat_batch(batch, std::vector<int64_t>{ldb, nrhs}),
-                                        B.dtype(), B.device());
-    run_real(A.dtype(), [&](auto tag) {
+    Tensor A_work = clone_batched_column_major(expand_to_batch(A, batch));
+    Tensor B_work = empty_column_major(
+        cat_batch(batch, std::vector<int64_t>{ldb, nrhs}), B.dtype(), B.device());
+    const Tensor B_source = expand_to_batch(B_2d, batch).contiguous();
+    run_linalg(A.dtype(), [&](auto tag) {
         using T = std::remove_pointer_t<decltype(tag)>;
-        auto* a = A_work.data_ptr<T>();
-        auto* b = B_work.data_ptr<T>();
-        constexpr bool is_float = std::is_same_v<T, float>;
-
-        // Zero-fill the padded buffer, then copy B into its top m rows.
-        // b_rowmajor is a contiguous ROW-major (... m, nrhs) tensor: element
-        // (row, col) lives at row * nrhs + col (the old col * m stride read
-        // garbage for nrhs != 1).
-        const Tensor b_rowmajor = expand_to_batch(B, batch).contiguous();
-        const auto* bsrc = b_rowmajor.data_ptr<T>();
-        const int64_t b_ms_src = matrix_stride_of(b_rowmajor);
-        const int64_t b_cols = B.size(-1);
-        std::memset(b, 0, sizeof(T) * static_cast<size_t>(B_work.numel()));
-        for (int64_t i = 0; i < bs; ++i)
-            for (int64_t row = 0; row < m; ++row)
-                for (int64_t col = 0; col < nrhs; ++col)
-                    b[i * ldb * nrhs + col * ldb + row] =
-                        bsrc[i * b_ms_src + row * b_cols + col];
-
-        // Workspace query once, then one gels call per batch element.
-        int64_t lwork = -1;
-        std::vector<T> work(1);
-        if constexpr (is_float) {
-            lapack_sgels('N', m, n, nrhs, a, m, b, ldb, work.data(), lwork);
-        } else {
-            lapack_dgels('N', m, n, nrhs, a, m, b, ldb, work.data(), lwork);
-        }
-        lwork = std::max<int64_t>(1, static_cast<int64_t>(work[0]));
-        work.resize(lwork);
+        auto* dst = B_work.data_ptr<T>();
+        const auto* src = B_source.data_ptr<T>();
+        std::fill(dst, dst + B_work.numel(), T(0));
         for (int64_t i = 0; i < bs; ++i) {
-            int64_t err;
-            if constexpr (is_float) {
-                err = lapack_sgels('N', m, n, nrhs, &a[i * m * n], m,
-                                   &b[i * ldb * nrhs], ldb, work.data(), lwork);
-            } else {
-                err = lapack_dgels('N', m, n, nrhs, &a[i * m * n], m,
-                                   &b[i * ldb * nrhs], ldb, work.data(), lwork);
-            }
-            if (err != 0) {
-                TP_THROW(RuntimeError, api, ": (Batch element ", i,
-                         ") The least squares solution could not be computed.");
+            for (int64_t row = 0; row < m; ++row) {
+                for (int64_t col = 0; col < nrhs; ++col) {
+                    dst[i * ldb * nrhs + col * ldb + row] =
+                        src[i * m * nrhs + row * nrhs + col];
+                }
             }
         }
     });
 
-    Tensor solution = B_work.contiguous().slice(-2, 0, n).contiguous();
-    Tensor residuals;
-    if (m > n) {
-        residuals = Tensor::empty(cat_batch(batch, std::vector<int64_t>{nrhs}), B.dtype(), B.device());
-        const Tensor b_rowmajor = B_work.contiguous();
-        run_real(B.dtype(), [&](auto tag) {
-            using T = std::remove_pointer_t<decltype(tag)>;
-            const auto* b = b_rowmajor.data_ptr<T>();
-            auto* res = residuals.data_ptr<T>();
-            for (int64_t i = 0; i < bs; ++i)
-                for (int64_t col = 0; col < nrhs; ++col) {
-                    T acc = T(0);
-                    for (int64_t row = n; row < ldb; ++row)
-                        acc += b[i * ldb * nrhs + col * ldb + row] *
-                               b[i * ldb * nrhs + col * ldb + row];
-                    res[i * nrhs + col] = acc;
-                }
-        });
+    Tensor rank = driver_type == LstsqDriver::Gels
+        ? Tensor::empty({0}, DType::Int64, B.device())
+        : Tensor::empty(batch, DType::Int64, B.device());
+    Tensor singular_values;
+    if (driver_type == LstsqDriver::Gelsd || driver_type == LstsqDriver::Gelss) {
+        singular_values = Tensor::empty(
+            cat_batch(batch, std::vector<int64_t>{std::min(m, n)}),
+            toRealValueType(A.dtype()), A.device());
     } else {
-        residuals = Tensor::empty(cat_batch(batch, std::vector<int64_t>{0}), B.dtype(), B.device());
+        singular_values = Tensor::empty(
+            {0}, toRealValueType(A.dtype()), A.device());
     }
-    Tensor rank = Tensor::full(batch, Scalar(static_cast<int64_t>(n)),
-                               DType::Int64, B.device());
-    return {solution, residuals, rank, solution};
+    run_linalg(A.dtype(), [&](auto tag) {
+        using T = std::remove_pointer_t<decltype(tag)>;
+        apply_lstsq<T>(A_work, B_work, rank, singular_values, rcond_value,
+                       driver_type);
+    });
+
+    const Tensor solved = B_work.contiguous();
+    Tensor solution = solved.slice(-2, 0, n).contiguous();
+    if (vector_case) solution = solution.squeeze(-1);
+
+    bool compute_residuals = m > n && driver_type != LstsqDriver::Gelsy;
+    if (compute_residuals &&
+        (driver_type == LstsqDriver::Gelsd || driver_type == LstsqDriver::Gelss)) {
+        const auto* rank_ptr = rank.data_ptr<int64_t>();
+        for (int64_t i = 0; i < rank.numel(); ++i) {
+            if (rank_ptr[i] != n) {
+                compute_residuals = false;
+                break;
+            }
+        }
+    }
+    Tensor residuals;
+    if (!compute_residuals) {
+        residuals = Tensor::empty({0}, toRealValueType(B.dtype()), B.device());
+    } else {
+        residuals = Tensor::empty(
+            cat_batch(batch, std::vector<int64_t>{nrhs}),
+            toRealValueType(B.dtype()), B.device());
+        run_linalg(B.dtype(), [&](auto tag) {
+            using T = std::remove_pointer_t<decltype(tag)>;
+            using R = typename LinalgScalarTraits<T>::value_type;
+            const auto* src = solved.data_ptr<T>();
+            auto* dst = residuals.data_ptr<R>();
+            for (int64_t i = 0; i < bs; ++i) {
+                for (int64_t col = 0; col < nrhs; ++col) {
+                    R value = R(0);
+                    for (int64_t row = n; row < m; ++row) {
+                        const T x = src[i * ldb * nrhs + col * ldb + row];
+                        if constexpr (LinalgScalarTraits<T>::is_complex) {
+                            value += static_cast<R>(std::norm(x));
+                        } else {
+                            value += x * x;
+                        }
+                    }
+                    dst[i * nrhs + col] = value;
+                }
+            }
+        });
+    }
+    return {solution, residuals, rank, singular_values};
 }
 
 // --------------------------------------------------------------- sytrf LDL --
 
 template <typename scalar_t>
-void apply_ldl_factor(const Tensor& LD, const Tensor& pivots, const Tensor& info, char uplo) {
-    constexpr bool is_float = std::is_same_v<scalar_t, float>;
+void apply_ldl_factor(const Tensor& LD, const Tensor& pivots, const Tensor& info,
+                      char uplo, bool hermitian) {
     auto* a_data = LD.data_ptr<scalar_t>();
     auto* pivots_data = pivots.data_ptr<int32_t>();
     auto* info_data = info.data_ptr<int32_t>();
@@ -1210,29 +1847,25 @@ void apply_ldl_factor(const Tensor& LD, const Tensor& pivots, const Tensor& info
     int64_t lwork = -1;
     std::vector<scalar_t> work(1);
     std::vector<int64_t> ipiv(static_cast<size_t>(n));
-    if constexpr (is_float) {
-        lapack_ssytrf(uplo, n, a_data, lda, ipiv.data(), work.data(), lwork);
+    lapack_ldl_factor(uplo, hermitian, n, a_data, lda, ipiv.data(), work.data(), lwork);
+    if constexpr (LinalgScalarTraits<scalar_t>::is_complex) {
+        lwork = std::max<int64_t>(1, static_cast<int64_t>(work[0].real()));
     } else {
-        lapack_dsytrf(uplo, n, a_data, lda, ipiv.data(), work.data(), lwork);
+        lwork = std::max<int64_t>(1, static_cast<int64_t>(work[0]));
     }
-    lwork = std::max<int64_t>(1, static_cast<int64_t>(work[0]));
     work.resize(lwork);
 
     for (int64_t i = 0; i < batch_size; ++i) {
         scalar_t* a = &a_data[i * a_stride];
         int64_t err;
-        if constexpr (is_float) {
-            err = lapack_ssytrf(uplo, n, a, lda, ipiv.data(), work.data(), lwork);
-        } else {
-            err = lapack_dsytrf(uplo, n, a, lda, ipiv.data(), work.data(), lwork);
-        }
+        err = lapack_ldl_factor(uplo, hermitian, n, a, lda, ipiv.data(), work.data(), lwork);
         for (int64_t j = 0; j < n; ++j)
             pivots_data[i * pivots_stride + j] = static_cast<int32_t>(ipiv[j]);
         info_data[i] = static_cast<int32_t>(err);
     }
 }
 
-std::tuple<Tensor, Tensor, Tensor> ldl_factor_impl(const Tensor& A, bool /*hermitian*/,
+std::tuple<Tensor, Tensor, Tensor> ldl_factor_impl(const Tensor& A, bool hermitian,
                                                    bool check_errors) {
     const char* api = check_errors ? "linalg.ldl_factor_ex" : "linalg.ldl_factor";
     require_lapack(api);
@@ -1242,16 +1875,16 @@ std::tuple<Tensor, Tensor, Tensor> ldl_factor_impl(const Tensor& A, bool /*hermi
     const int64_t n = A.size(-1);
     Tensor pivots = empty_pivots(A, batch, n);
     Tensor info = empty_info_like(A, batch);
-    run_real(A.dtype(), [&](auto tag) {
+    run_linalg(A.dtype(), [&](auto tag) {
         using T = std::remove_pointer_t<decltype(tag)>;
-        apply_ldl_factor<T>(LD, pivots, info, 'L');
+        apply_ldl_factor<T>(LD, pivots, info, 'L', hermitian);
     });
     if (check_errors) linalg_check_errors(info, api, A.dim() == 2);
     return {LD.contiguous(), pivots, info};
 }
 
 Tensor ldl_solve_impl(const Tensor& LD, const Tensor& pivots, const Tensor& B,
-                      bool /*hermitian*/) {
+                      bool hermitian) {
     const char* api = "linalg.ldl_solve";
     require_lapack(api);
     square_check_inputs(LD, api, "LD");
@@ -1260,7 +1893,7 @@ Tensor ldl_solve_impl(const Tensor& LD, const Tensor& pivots, const Tensor& B,
         Tensor pv64 = pivots.to(DType::Int64);
         const auto* pv = pv64.data_ptr<int64_t>();
         for (int64_t i = 0; i < pivots.numel(); ++i) {
-            if (pv[i] < 1 || pv[i] > LD.size(-2)) {
+            if (std::abs(pv[i]) < 1 || std::abs(pv[i]) > LD.size(-2)) {
                 TP_THROW(RuntimeError, "Pivots given to ldl_solve must all satisfy |pivot| >= 1. "
                                        "Did you properly pass the result of ldl_factor?");
             }
@@ -1273,23 +1906,17 @@ Tensor ldl_solve_impl(const Tensor& LD, const Tensor& pivots, const Tensor& B,
     const int64_t n = LD.size(-2);
     const int64_t nrhs = B.size(-1);
     const int64_t bs = linear_batch_size(batch);
-    run_real(LD.dtype(), [&](auto tag) {
+    run_linalg(LD.dtype(), [&](auto tag) {
         using T = std::remove_pointer_t<decltype(tag)>;
         const auto* a = LD_work.data_ptr<T>();
         auto* b = B_work.data_ptr<T>();
         const auto* piv = piv32.data_ptr<int32_t>();
-        constexpr bool is_float = std::is_same_v<T, float>;
         for (int64_t i = 0; i < bs; ++i) {
             std::vector<int64_t> ipiv(static_cast<size_t>(n));
             for (int64_t j = 0; j < n; ++j) ipiv[j] = piv[i * n + j];
             int64_t err;
-            if constexpr (is_float) {
-                err = lapack_ssytrs('L', n, nrhs, &a[i * n * n], n, ipiv.data(),
-                                    &b[i * n * nrhs], n);
-            } else {
-                err = lapack_dsytrs('L', n, nrhs, &a[i * n * n], n, ipiv.data(),
-                                    &b[i * n * nrhs], n);
-            }
+            err = lapack_ldl_solve('L', hermitian, n, nrhs, &a[i * n * n], n,
+                                    ipiv.data(), &b[i * n * nrhs], n);
             (void)err;
         }
     });
@@ -1304,9 +1931,10 @@ std::tuple<Tensor, Tensor, Tensor> linalg_lu_kernel(const Tensor& A, bool pivot)
         TP_THROW(RuntimeError, "linalg.lu: LU without pivoting is not implemented");
     }
     square_check_inputs(A, "linalg.lu");
-    auto [LU, pivots, info] = lu_factor_ex_impl(A, pivot, false,
-                                                "linalg.lu_factor_ex");
-    (void)info;
+    Tensor LU_tensor;
+    Tensor pivots_tensor;
+    std::tie(LU_tensor, pivots_tensor, std::ignore) =
+        lu_factor_ex_impl(A, pivot, false, "linalg.lu_factor_ex");
     const int64_t m = A.size(-2);
     const int64_t n = A.size(-1);
     const int64_t kk = std::min(m, n);
@@ -1315,10 +1943,10 @@ std::tuple<Tensor, Tensor, Tensor> linalg_lu_kernel(const Tensor& A, bool pivot)
     Tensor P = Tensor::zeros(cat_batch(batch, std::vector<int64_t>{m, m}), A.dtype(), A.device());
     Tensor L = Tensor::zeros(cat_batch(batch, std::vector<int64_t>{m, kk}), A.dtype(), A.device());
     Tensor U = Tensor::zeros(cat_batch(batch, std::vector<int64_t>{kk, n}), A.dtype(), A.device());
-    run_real(A.dtype(), [&](auto tag) {
+    run_linalg(A.dtype(), [&](auto tag) {
         using T = std::remove_pointer_t<decltype(tag)>;
-        const auto* lu_all = LU.data_ptr<T>();  // column-major (*, m, n), lda = m
-        const auto* piv = pivots.data_ptr<int32_t>();
+        const auto* lu_all = LU_tensor.data_ptr<T>();  // column-major (*, m, n), lda = m
+        const auto* piv = pivots_tensor.data_ptr<int32_t>();
         auto* p_out = P.data_ptr<T>();
         auto* l_out = L.data_ptr<T>();
         auto* u_out = U.data_ptr<T>();
@@ -1401,7 +2029,7 @@ Tensor linalg_diagonal_kernel(const Tensor& A, int64_t offset, int64_t dim1, int
     }
 
     const int64_t total = out.numel();
-    run_real(A.dtype(), [&](auto tag) {
+    run_linalg(A.dtype(), [&](auto tag) {
         using T = std::remove_pointer_t<decltype(tag)>;
         const auto* src = A.data_ptr<T>();
         auto* dst = out.data_ptr<T>();
@@ -1478,6 +2106,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, LinalgKernels) {
     m.impl("linalg_svd", linalg_svd_kernel);
     m.impl("linalg_svdvals", linalg_svdvals_kernel);
     m.impl("linalg_lstsq", linalg_lstsq_kernel);
+    m.impl("linalg_polar", linalg_polar_kernel);
     m.impl("linalg_qr", linalg_qr_kernel);
     m.impl("linalg_householder_product", linalg_householder_product_kernel);
     m.impl("linalg_ldl_factor", linalg_ldl_factor_kernel);
