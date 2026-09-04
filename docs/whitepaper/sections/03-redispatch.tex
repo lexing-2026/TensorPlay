@@ -4,7 +4,7 @@
 
 Redispatch resolves a tensor's runtime properties into a key, selects the
 highest-priority kernel from a per-operator atomic table, and enforces the
-autocast contract at a single choke point. The Python surface exposes the same
+autocast contract a single choke point. The Python surface exposes the same
 operator through two cooperating layers: a hand-written \texttt{pybind11}
 binding and a generated \texttt{METH\_FASTCALL} function, both funneling
 through \texttt{CPythonBridge} helpers and a shared \texttt{tp\_python}
@@ -12,16 +12,14 @@ library. The design trims heterogeneous key spaces to 13 slots, encodes layering
 as fixed offsets so that priority is arithmetic, uses acquire/release atomics
 instead of locks on the hot path, isolates type erasure to one template, and
 reuses one Python type registration so that returned tensors preserve identity.
-All claims below cite \texttt{path:line} and are checkable with
-\texttt{grep -n} against \path{version.txt:1}.
 
 \subsection{DispatchKey: 13 Keys and Fixed Offsets}
 \label{sec:dispatchkey}
 
-\path{p10/include/DispatchKey.h:15--54} defines 13 live keys plus sentinel;
+ defines 13 live keys plus sentinel;
 numeric order is priority:
 
-\begin{lstlisting}[caption={\path{DispatchKey.h:15} --- 13 keys.}, label=lst:dispatchkey]
+\begin{lstlisting}[caption={13 keys.}, label=lst:dispatchkey]
 enum class DispatchKey : uint8_t {
   CPU=0, CUDA=1, Vulkan=2,
   AutogradCPU=3, AutogradCUDA=4, AutogradVulkan=5,
@@ -34,12 +32,12 @@ constexpr size_t kBackendKeyCount=3, kAutogradKeyOffset=3,
 \end{lstlisting}
 
 \texttt{Composite}=12 is stored out of logical priority so that
-\texttt{dispatchKeyIndex} (\path{Dispatcher.h:43}) is a plain
-\path{static\_cast<size\_t>} and \texttt{Composite} never enters the
-\path{highest\_priority\_key} scan. Helpers at
-\path{DispatchKey.h:56--101} are \texttt{constexpr}:
+\texttt{dispatchKeyIndex} is a plain
+\texttt{static\_cast<size\_t>} and \texttt{Composite} never enters the
+\texttt{highest\_priority\_key} scan. Helpers
+ are \texttt{constexpr}:
 
-\begin{lstlisting}[caption={\path{DispatchKey.h:56} --- arithmetic helpers.}, label=lst:dispatchhelpers]
+\begin{lstlisting}[caption={arithmetic helpers.}, label=lst:dispatchhelpers]
 inline constexpr DispatchKey toAutogradKey(DispatchKey b){return DispatchKey(uint8_t(b)+kAutogradKeyOffset);}
 inline constexpr DispatchKey toAutocastKey(DispatchKey b){return DispatchKey(uint8_t(b)+kAutocastKeyOffset);}
 inline constexpr DispatchKey toVmapKey(DispatchKey b){return DispatchKey(uint8_t(b)+kVmapKeyOffset);}
@@ -54,19 +52,19 @@ inline constexpr DispatchKey toBackendKey(DispatchKey k){
 
 \texttt{is\_backend\_key} enumerates the three dense keys; \texttt{Composite}
 is false, which gates the fallback in \S\ref{sec:handle}.
-\texttt{computeDispatchKey} (\path{Dispatcher.h:31}) maps \texttt{Device}
-to \path{CPU/CUDA/Vulkan} via \texttt{is\_cuda()}/\texttt{is\_vulkan()}.
+\texttt{computeDispatchKey} maps \texttt{Device}
+to \texttt{Vulkan} via \texttt{is\_cuda}/\texttt{is\_vulkan}.
 
 \begin{table}[H]
 \centering
-\caption{Key arithmetic (\path{DispatchKey.h:51}). Range tests lower to 1--2 compares.}
+\caption{Key arithmetic. Range tests lower to 1--2 compares.}
 \label{tab:keyoffsets}
 \small
 \begin{tabular}{ccll}
 \toprule
 Offset & Val & Keys & Predicate \\
 \midrule
-$kBackendKeyCount$ & 3 & 0--2 \path{CPU/CUDA/Vulkan} & \texttt{is\_backend\_key} \\
+$kBackendKeyCount$ & 3 & 0--2 \texttt{Vulkan} & \texttt{is\_backend\_key} \\
 $kAutogradKeyOffset$ & 3 & 3--5 \texttt{Autograd*} & \texttt{is\_autograd\_key} \\
 $kAutocastKeyOffset$ & 6 & 6--8 \texttt{Autocast*} & \texttt{is\_autocast\_key} \\
 $kVmapKeyOffset$ & 9 & 9--11 \texttt{Vmap*} & \texttt{is\_vmap\_key} \\
@@ -79,9 +77,9 @@ $kVmapKeyOffset$ & 9 & 9--11 \texttt{Vmap*} & \texttt{is\_vmap\_key} \\
 \subsection{DispatchKeySet: Bitmask and Priority}
 \label{sec:keyset}
 
-\path{p10/include/DispatchKey.h:125--187} is a 32-bit bitset; 13 bits live:
+ is a 32-bit bitset; 13 bits live:
 
-\begin{lstlisting}[caption={\path{DispatchKey.h:125} --- bitmask.}, label=lst:keysetdef]
+\begin{lstlisting}[caption={bitmask.}, label=lst:keysetdef]
 class DispatchKeySet{
 public:
   using raw_t=uint32_t;
@@ -97,9 +95,9 @@ private: raw_t mask_=0;
 };
 \end{lstlisting}
 
-Priority is the most-significant set bit, i.e.\ largest numeric key wins:
+Priority is the most-significant set bit, i.e.\ largest numeric \ac{op} key wins:
 
-\begin{lstlisting}[caption={\path{DispatchKey.h:151} --- scan high $\rightarrow$ low.}, label=lst:highestkey]
+\begin{lstlisting}[caption={scan high $\rightarrow$ low.}, label=lst:highestkey]
 constexpr DispatchKey highest_priority_key() const {
   if(!mask_) return DispatchKey::EndOfKeys;
   uint8_t idx=0; raw_t m=mask_; while(m>>=1) ++idx; return DispatchKey(idx);}
@@ -107,26 +105,26 @@ constexpr DispatchKey highest_priority_key() const {
 
 \begin{table}[H]
 \centering
-\caption{Effective priority from \path{highest\_priority\_key}. Composite never in set.}
+\caption{Effective priority from \texttt{highest\_priority\_key}. Composite never in set.}
 \label{tab:keypriority}
 \small
 \begin{tabular}{cll}
 \toprule
 Indices & Keys & Removal to redispatch below layer \\
 \midrule
-9--11 & \path{VmapCPU/CUDA/Vulkan} via \texttt{toVmapKey} & \texttt{remove\_vmap()} \\
-6--8 & \path{AutocastCPU/CUDA/Vulkan} via \texttt{toAutocastKey} & \texttt{remove\_autocast()} \\
-3--5 & \path{AutogradCPU/CUDA/Vulkan} via \texttt{toAutogradKey} & \texttt{remove\_autograd()} \\
-0--2 & \path{CPU/CUDA/Vulkan} via \texttt{computeDispatchKey} & final compute \\
+9--11 & \texttt{Vulkan} via \texttt{toVmapKey} & \texttt{remove\_vmap} \\
+6--8 & \texttt{Vulkan} via \texttt{toAutocastKey} & \texttt{remove\_autocast} \\
+3--5 & \texttt{Vulkan} via \texttt{toAutogradKey} & \texttt{remove\_autograd} \\
+0--2 & \texttt{Vulkan} via \texttt{computeDispatchKey} & final compute \\
 12 & \texttt{Composite} & fallback only in \texttt{getKernel} for \texttt{is\_backend\_key} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\path{p10/include/TensorImpl.h:135--147} computes the set on every call; no
+ computes the set on every call; no
 field is stored:
 
-\begin{lstlisting}[caption={\path{TensorImpl.h:135} --- computed, not stored.}, label=lst:implkeyset]
+\begin{lstlisting}[caption={computed, not stored.}, label=lst:implkeyset]
 DispatchKeySet key_set() const {
   DispatchKey backend=computeDispatchKey(device_);
   DispatchKeySet ks;
@@ -137,23 +135,27 @@ DispatchKeySet key_set() const {
 }
 \end{lstlisting}
 
-\texttt{is\_batched()} checks \path{transform\_value\_!=nullptr}
-(\path{TensorImpl.h:151}); inference tensors (\texttt{inference\_tensor\_}
-from \path{InferenceMode::is\_enabled()} at construction,
-\path{TensorImpl.h:35}) omit the autograd bit. Cost is one device query plus
+\texttt{is\_batched} checks \texttt{transform\_value\_!=nullptr}
+; inference tensors (\texttt{inference\_tensor\_}
+from \texttt{InferenceMode::is\_enabled} at construction,
+) omit the autograd bit. Cost is one device query plus
 two bit ops, cheaper than an atomic load of a stored bitset. Generated redispatch
-helpers at \path{tools/codegen/gen\_api.py:323} call \texttt{key\_set()} once,
-cache the result, and iterate by handling the top key via \path{OperatorHandle::getKernel}
-then stripping the layer with \path{remove\_autocast/remove\_autograd} until
-\path{highest\_priority\_key()==EndOfKeys} or a kernel is found; the loop is
+helpers at call \texttt{key\_set} once,
+cache the result, and iterate by handling the top key via \texttt{OperatorHandle::getKernel}
+then stripping the layer with \texttt{remove\_autograd} until
+\texttt{highest\_priority\_key==EndOfKeys} or a kernel is found; the loop is
 at most three iterations because only three layers can be present simultaneously.
+
+\begin{tppitfall}[Pitfall: The Composite Slot Is Never in the DispatchKeySet]
+The most common misreading of the 13-slot table is assuming \texttt{Composite} (slot~12) participates in priority selection---it does not. \texttt{TensorImpl::key\_set} at only ever adds a backend key plus, optionally, one \texttt{Autocast} or \texttt{Autograd} or \texttt{Vmap} transform key. \texttt{Composite} is consulted exclusively inside \texttt{OperatorHandle::getKernel} when \texttt{is\_backend\_key(key)} is true and the backend slot is \texttt{nullptr}. Consequences when extending the dispatcher: (i) adding a key below 12 does not shift composite arithmetic, but adding a key above 12 does and requires bumping \texttt{EndOfKeys} and \texttt{kDispatchKeyCount}; (ii) \texttt{remove\_*} masks in hard-code the 13-bit layout, so a new \emph{layer} needs a new offset constant like \texttt{kVmapKeyOffset}=9; (iii) a dump tool that iterates a key set will never see \texttt{Composite}---``served by composite'' is only visible via the fallback branch itself.
+\end{tppitfall}
 
 \subsection{DispatchTable and Dispatcher}
 \label{sec:dispatcher}
 
-\path{p10/include/Dispatcher.h:39--61} stores one fixed table per operator:
+ stores one fixed table per operator:
 
-\begin{lstlisting}[caption={\path{Dispatcher.h:39} --- 13 atomics per operator.}, label=lst:dispatchtable]
+\begin{lstlisting}[caption={13 atomics per operator.}, label=lst:dispatchtable]
 using KernelFunction = void*;
 constexpr size_t kDispatchKeyCount = size_t(DispatchKey::EndOfKeys); // 13
 inline constexpr size_t dispatchKeyIndex(DispatchKey k) noexcept {return size_t(k);}
@@ -169,7 +171,7 @@ Indexing is a cast. Store in ctor is relaxed; registration publishes with
 \texttt{release}, lookup consumes with \texttt{acquire} (no lock on hot path).
 The header is 214 lines.
 
-\begin{lstlisting}[caption={\path{Dispatcher.h:97} --- registry map.}, label=lst:registermap]
+\begin{lstlisting}[caption={registry map.}, label=lst:registermap]
 class P10_API Dispatcher{
 public:
   static Dispatcher& singleton();
@@ -185,10 +187,10 @@ private:
 };
 \end{lstlisting}
 
-\path{p10/src/Dispatcher.cpp:7--10} is a Meyer's singleton leaked to avoid
+ is a Meyer's singleton leaked to avoid
 exit-order destruction:
 
-\begin{lstlisting}[caption={\path{Dispatcher.cpp:7} --- singleton.}, label=lst:singleton]
+\begin{lstlisting}[caption={singleton.}, label=lst:singleton]
 Dispatcher& Dispatcher::singleton(){ static Dispatcher* instance=new Dispatcher(); return *instance; }
 void Dispatcher::registerKernel(const std::string& op, DispatchKey k, KernelFunction f){
   if(dispatchKeyIndex(k)>=kDispatchKeyCount) throw std::invalid_argument("invalid key: "+op);
@@ -197,17 +199,17 @@ void Dispatcher::registerKernel(const std::string& op, DispatchKey k, KernelFunc
   t->kernels[dispatchKeyIndex(k)].store(f,memory_order_release);}
 \end{lstlisting}
 
-\texttt{findHandle} (\path{Dispatcher.cpp:28}) also locks and creates the
+\texttt{findHandle} also locks and creates the
 table if absent, returning a non-owning \texttt{OperatorHandle} whose raw
-\path{const DispatchTable*} stays stable for the process lifetime.
+\texttt{const DispatchTable*} stays stable for the process lifetime.
 \texttt{direct\_kernel}/\texttt{has\_kernel} load under lock without fallback.
 
 \begin{figure}[H]
 \centering
 \begin{tikzpicture}[node distance=0.6cm, every node/.style={font=\footnotesize}]
-\node[libbox, fill=blue!8, draw=tpblue, minimum width=3.3cm, minimum height=1.1cm] (disp) {\path{Dispatcher::singleton()}\\ \path{unordered\_map<string,Table>}\\ \texttt{mutex\_}};
-\node[libbox, fill=orange!8, draw=tporange, minimum width=3.3cm, minimum height=1.0cm, below=0.55cm of disp] (table) {\texttt{DispatchTable "add"}\\ \path{array<atomic<void*>,13>}};
-\node[libbox, fill=green!8, draw=tpgreen, minimum width=3.2cm, minimum height=0.85cm, below=0.5cm of table] (kernels) {\path{[0]=add\_cpu [3]=autograd [12]=Composite}};
+\node[libbox, fill=blue!8, draw=tpblue, minimum width=3.3cm, minimum height=1.1cm] (disp) {\texttt{Dispatcher::singleton}\\ \texttt{unordered\_map<string,Table>}\\ \texttt{mutex\_}};
+\node[libbox, fill=orange!8, draw=tporange, minimum width=3.3cm, minimum height=1.0cm, below=0.55cm of disp] (table) {\texttt{DispatchTable "add"}\\ \texttt{array<atomic<void*>,13>}};
+\node[libbox, fill=green!8, draw=tpgreen, minimum width=3.2cm, minimum height=0.85cm, below=0.5cm of table] (kernels) {\texttt{[0]=add\_cpu [3]=autograd [12]=Composite}};
 \node[libbox, fill=gray!8, draw=gray, minimum width=2.7cm, minimum height=0.85cm, right=0.9cm of table] (handle) {\texttt{OperatorHandle}\\ \texttt{getKernel(k)}};
 \draw[arrow, color=tpblue] (disp) -- (table);
 \draw[arrow, color=tporange] (table) -- (kernels);
@@ -229,7 +231,7 @@ table.
 
 \begin{table}[H]
 \centering
-\caption{Cold vs.\ hot path (\path{Dispatcher.h:67}, \path{Dispatcher.cpp:12}).}
+\caption{Cold vs.\ hot path.}
 \label{tab:dispatchfields}
 \small
 \begin{tabular}{lll}
@@ -246,9 +248,9 @@ Path & Sync & Operation \\
 \subsection{OperatorHandle::getKernel: Composite Fallback}
 \label{sec:handle}
 
-\path{p10/include/Dispatcher.h:67--81} is the hot load:
+ is the hot load:
 
-\begin{lstlisting}[caption={\path{Dispatcher.h:67} --- backend fallback.}, label=lst:getkernel]
+\begin{lstlisting}[caption={backend fallback.}, label=lst:getkernel]
 KernelFunction getKernel(DispatchKey k) const noexcept {
   if(!table_ || dispatchKeyIndex(k)>=kDispatchKeyCount) return nullptr;
   auto v=table_->kernels[dispatchKeyIndex(k)].load(memory_order_acquire);
@@ -270,10 +272,10 @@ the \texttt{release} store in \texttt{registerKernel}.
 \subsection{DispatchStub: Typed Choke Point and Backtrace}
 \label{sec:stub}
 
-\path{p10/include/Dispatcher.h:136--174} is the sole type-safe boundary;
+ is the sole type-safe boundary;
 generated code never casts at call sites:
 
-\begin{lstlisting}[caption={\path{Dispatcher.h:136} --- autocast guard + miss trace.}, label=lst:stub]
+\begin{lstlisting}[caption={autocast guard + miss trace.}, label=lst:stub]
 template<typename R, typename... Args>
 struct DispatchStub{
   static R call(const OperatorHandle& h, DispatchKey k, Args... args){
@@ -292,32 +294,32 @@ struct DispatchStub{
 };
 \end{lstlisting}
 
-\path{autocast::is\_enabled} is forward-declared at \path{Dispatcher.h:27}
+\texttt{autocast::is\_enabled} is forward-declared
 to avoid pulling \texttt{Tensor.h} into every user; the guard is the only
 place that enforces the disabled-autocast $\rightarrow$ miss contract, even if
-upper dispatch already skips it. \path{execinfo.h:7} supplies 32-frame dumps
-to fd~2 when \path{TP\_TRACE\_KERNEL\_MISS} is set. The branch is marked
+upper dispatch already skips it. supplies 32-frame dumps
+to fd~2 when \texttt{TP\_TRACE\_KERNEL\_MISS} is set. The branch is marked
 \texttt{[[unlikely]]} so the predicted path is the non-throwingfall-through,
 adding one compare on autocast keys and none on others after branch prediction.
 The string overload is convenience; hot calls cache the handle in a \texttt{static
-const} local as emitted at \path{gen\_api.py:323} (\texttt{static const
-OperatorHandle op = Dispatcher::singleton().findHandle("add")}) so that
+const} local as emitted at (\texttt{static const
+OperatorHandle op = Dispatcher::singleton.findHandle("add")}) so that
 \texttt{findHandle}'s mutex is taken once per process, not per call.
 
 \subsection{Registration Macros: TP\_CONCAT and Library Chaining}
 \label{sec:registration}
 
-\path{p10/include/Macros.h:23} needs two levels so that a macro argument
+ needs two levels so that a macro argument
 expands before pasting:
 
-\begin{lstlisting}[caption={\path{Macros.h:23} --- two-level concat.}, label=lst:concat]
+\begin{lstlisting}[caption={two-level concat.}, label=lst:concat]
 #define TP_CONCAT_IMPL(x,y) x##y
 #define TP_CONCAT(x,y) TP_CONCAT_IMPL(x,y)
 \end{lstlisting}
 
 \subsubsection{Deprecated per-op macro}
 
-\begin{lstlisting}[caption={\path{Dispatcher.h:176} --- one static per (op,key).}, label=lst:regkernel]
+\begin{lstlisting}[caption={one static per (op,key).}, label=lst:regkernel]
 #define TENSORPLAY_REGISTER_KERNEL(OP,KEY,FUNC) \
   static struct Register##OP##KEY{ Register##OP##KEY(){ \
     ::tensorplay::Dispatcher::singleton().registerKernel(#OP,::tensorplay::DispatchKey::KEY,(::tensorplay::KernelFunction)FUNC);} \
@@ -330,7 +332,7 @@ and scattering breakpoints.
 
 \subsubsection{Bulk macro}
 
-\begin{lstlisting}[caption={\path{Dispatcher.h:203} --- one static per (key,NAME) block.}, label=lst:libraryimpl]
+\begin{lstlisting}[caption={one static per (key,NAME) block.}, label=lst:libraryimpl]
 #define TENSORPLAY_LIBRARY_IMPL(KEY, NAME) \
   static void TP_CONCAT(tensorplay_library_init_,NAME)(::tensorplay::Library&); \
   static struct TP_CONCAT(TensorPlayLibraryInit_,NAME){ \
@@ -340,7 +342,7 @@ and scattering breakpoints.
   static void TP_CONCAT(tensorplay_library_init_,NAME)(::tensorplay::Library& m)
 \end{lstlisting}
 
-\begin{lstlisting}[caption={\path{Dispatcher.h:188} --- chaining helper.}, label=lst:libraryclass]
+\begin{lstlisting}[caption={chaining helper.}, label=lst:libraryclass]
 class Library{public: explicit Library(DispatchKey k): key_(k){}
   template<typename F> Library& impl(const std::string& n,F f){
     Dispatcher::singleton().registerKernel(n,key_,(KernelFunction)f); return *this;}
@@ -363,7 +365,7 @@ from static initializers.
 
 \begin{table}[H]
 \centering
-\caption{Per-op vs.\ bulk (\path{Dispatcher.h:176} vs.\ \texttt{203}).}
+\caption{Per-op vs.\ bulk ( vs.\ \texttt{203}).}
 \label{tab:macros}
 \small
 \begin{tabular}{lll}
@@ -371,7 +373,7 @@ from static initializers.
  & \texttt{REGISTER\_KERNEL} & \texttt{LIBRARY\_IMPL} \\
 \midrule
 Statics & $O(\#\text{ops})$ & $O(\#\text{keys}\times\#\text{files})$ \\
-Naming & \path{Register\#\#OP\#\#KEY} & \texttt{TP\_CONCAT} 2-level \\
+Naming & \texttt{Register\#\#OP\#\#KEY} & \texttt{TP\_CONCAT} 2-level \\
 Breakpoint & many ctors & one \texttt{registerKernel} \\
 Status & deprecated & preferred \\
 \bottomrule
@@ -381,51 +383,51 @@ Status & deprecated & preferred \\
 \subsection{Python/C++ Dual Binding}
 \label{sec:dualbinding}
 
-\path{CMakeLists.txt:1106} builds \texttt{\_C} with \texttt{UNITY\_BUILD ON}
-(30+ TUs); \texttt{p10} opts out. On non-Windows, \path{CMakeLists.txt:954}
+ builds \texttt{\_C} with \texttt{UNITY\_BUILD ON}
+(30+ TUs); \texttt{p10} opts out. On non-Windows,
 adds a single shared bridge:
 
-\begin{lstlisting}[caption={\path{CMakeLists.txt:954} --- one shared copy.}, label=lst:tppythontarget]
+\begin{lstlisting}[caption={one shared copy.}, label=lst:tppythontarget]
 if(NOT WIN32)
   add_library(tp_python SHARED src/bindings/python/CPythonBridge.cpp)
   target_link_libraries(tp_python PUBLIC p10 pybind11::pybind11)
 endif()
 \end{lstlisting}
 
-The comment at \path{CMakeLists.txt:946--953} explains: per-extension copies of
+The comment at explains: per-extension copies of
 the caster substrate and wrap cache segfault on first returned tensor because
-each copy carries its own \path{pybind11::detail::type\_caster} registry and
+each copy carries its own \texttt{pybind11::detail::type\_caster} registry and
 its own \texttt{g\_wrap\_cache} map; the first \texttt{tpx\_py\_wrap} from a
 second extension would insert into a different map than the one
-\path{tpx\_py\_tensor\_cref} registered from. A single \texttt{tp\_python}
+\texttt{tpx\_py\_tensor\_cref} registered from. A single \texttt{tp\_python}
 forces one registry and one cache; user op modules built via
 \texttt{add\_tensorplay\_op} link the same library and are loaded after
 \texttt{\_C} has registered \texttt{TensorBase}, so their unwraps hit the
 direct \texttt{instance} holder path. \texttt{\_C} links \texttt{p10 tpx stax
-tp\_python} (\path{CMakeLists.txt:1109}); Windows embeds the bridge
-statically because no \path{__declspec(dllexport)} annotations exist and the
+tp\_python}; Windows embeds the bridge
+statically because no \texttt{\_\_declspec(dllexport)} annotations exist and the
 DLL boundary would otherwise hide the registry.
 
-\paragraph{pybind11 path.} \path{src/bindings/python/Tensor.cpp:2146}
-registers \path{py::class\_<Tensor>(m,"TensorBase",py::dynamic\_attr())};
-\path{tensorplay/\_tensor.py:12} aliases \path{Tensor=\_C.TensorBase}.
+\paragraph{pybind11 path.}
+registers \texttt{py::class\_<Tensor>(m,"TensorBase",py::dynamic\_attr)};
+ aliases \texttt{Tensor=\_C.TensorBase}.
 \texttt{Ops.cpp} hand-writes \texttt{.def} for custom semantics (factory dtype
-resolution, splats). \path{PYBIND11\_MODULE(\_C,m)} at
-\path{init.cpp:279} calls \texttt{init\_dtype} $\rightarrow$ \texttt{init\_ops}
-in order (\path{init.cpp:313}).
+resolution, splats). \texttt{PYBIND11\_MODULE(\_C,m)}
+ calls \texttt{init\_dtype} $\rightarrow$ \texttt{init\_ops}
+in order.
 
-\paragraph{METH\_FASTCALL path.} \path{tools/codegen/gen\_python\_c.py}
-emits \path{TensorCPythonGenerated.h} with
+\paragraph{METH\_FASTCALL path.} \texttt{gen\_python\_c.py}
+emits \texttt{TensorCPythonGenerated.h} with
 
-\begin{lstlisting}[caption={\path{gen\_python\_c.py:882} --- generated tables.}, label=lst:gentables]
+\begin{lstlisting}[caption={generated tables.}, label=lst:gentables]
 inline PyMethodDef generated_functions[]={
   {"add",(PyCFunction)(void*)pyop_add_function,METH_FASTCALL|METH_KEYWORDS,"add(Tensor self,...)"},
   {nullptr,nullptr,0,nullptr}};
 \end{lstlisting}
 
-Installation is fill-only (\path{gen\_python\_c.py:907}):
+Installation is fill-only:
 
-\begin{lstlisting}[caption={\path{gen\_python\_c.py:907} --- never shadows hand-written.}, label=lst:fillonly]
+\begin{lstlisting}[caption={never shadows hand-written.}, label=lst:fillonly]
 inline int register_generated_cpython_functions(PyObject* m){
   for(auto* d=generated_functions; d->ml_name; ++d){
     if(PyObject_HasAttrString(m,d->ml_name)) continue;
@@ -434,14 +436,14 @@ inline int register_generated_cpython_functions(PyObject* m){
   return 0;}
 \end{lstlisting}
 
-\path{src/bindings/python/init.cpp:697} installs it last, behind
-\path{getenv("TP\_NO\_FASTCALL")==nullptr}, for both \texttt{m} and
+ installs it last, behind
+\texttt{getenv("TP\_NO\_FASTCALL")==nullptr}, for both \texttt{m} and
 \texttt{\_VariableFunctions}. When set, the layer is disabled.
 
-\paragraph{Factory trampolines.} \path{init.cpp:84--210} installs six
-\texttt{METH\_FASTCALL} trampolines (\path{empty,zeros,ones,rand,randn,full}):
+\paragraph{Factory trampolines.} installs six
+\texttt{METH\_FASTCALL} trampolines:
 
-\begin{lstlisting}[caption={\path{init.cpp:84} --- capture-aware trampoline.}, label=lst:factoryhook]
+\begin{lstlisting}[caption={capture-aware trampoline.}, label=lst:factoryhook]
 struct FactoryHook{PyObject *raw,*wrapper,*tensor_type,*scalar_type; bool varargs;};
 PyObject* factory_trampoline(PyObject* self,PyObject* const* a,Py_ssize_t n,PyObject* kwnames){
   auto* h=(FactoryHook*)PyCapsule_GetPointer(self,nullptr);
@@ -458,7 +460,7 @@ and vector-calls the raw fast entry with zero Python frames.
 
 \begin{table}[H]
 \centering
-\caption{Cooperating layers (\path{Tensor.cpp:2146}, \path{gen\_python\_c.py:907}, \path{init.cpp:697}).}
+\caption{Cooperating layers.}
 \label{tab:dualpath}
 \small
 \begin{tabular}{p{3cm}p{5cm}p{5cm}}
@@ -467,7 +469,7 @@ and vector-calls the raw fast entry with zero Python frames.
 \midrule
 Type & \texttt{TensorBase}, \texttt{dynamic\_attr} & reuses same type as descriptors \\
 Custom overloads & hand \texttt{.def} & skipped by \texttt{HasAttr} \\
-Bulk ops & --- & \path{generated\_functions[]} via \texttt{gen\_python\_c.py} \\
+Bulk ops & --- & \texttt{generated\_functions[]} via \texttt{gen\_python\_c.py} \\
 Factories & \texttt{functional.py} wrappers & \texttt{FactoryHook} + \texttt{compile\_depth} check \\
 \bottomrule
 \end{tabular}
@@ -480,8 +482,8 @@ Fill-only install means \texttt{nm -D} shows one symbol per operator regardless 
 \begin{tikzpicture}[node distance=0.6cm, every node/.style={font=\scriptsize}]
 \node[libbox, fill=blue!8, draw=tpblue, minimum width=3.0cm, minimum height=1.0cm] (py) {Python \texttt{tp.add(a,b)}};
 \node[libbox, fill=orange!8, draw=tporange, minimum width=3.0cm, minimum height=1.0cm, below=0.5cm of py] (has) {\texttt{HasAttr?}};
-\node[libbox, fill=green!8, draw=tpgreen, minimum width=3.0cm, minimum height=0.95cm, below left=0.5cm and -0.3cm of has] (pb) {\texttt{pybind11 .def}};
-\node[libbox, fill=purple!8, draw=tppurple, minimum width=3.0cm, minimum height=0.95cm, below right=0.5cm and -0.3cm of has] (fc) {\path{generated\_functions}};
+\node[libbox, fill=green!8, draw=tpgreen, minimum width=3.0cm, minimum height=0.95cm, below left=0.5cm and -0.3cm of has] (pb) {\texttt{pybind11.def}};
+\node[libbox, fill=purple!8, draw=tppurple, minimum width=3.0cm, minimum height=0.95cm, below right=0.5cm and -0.3cm of has] (fc) {\texttt{generated\_functions}};
 \node[libbox, fill=gray!8, draw=gray, minimum width=6.2cm, minimum height=0.9cm, below=1.3cm of has] (bridge) {\texttt{CPythonBridge} parse $\rightarrow$ check $\rightarrow$ dispatch $\rightarrow$ \texttt{tpx::ops::add}};
 \draw[arrow, color=tpblue] (py) -- (has);
 \draw[arrow, color=gray] (has) -- node[left,font=\tiny]{yes} (pb);
@@ -496,12 +498,12 @@ Fill-only install means \texttt{nm -D} shows one symbol per operator regardless 
 \subsection{CPythonBridge: Parse, Check, Dispatch, Wrap}
 \label{sec:bridge}
 
-\path{src/bindings/python/CPythonBridge.h:28--240} is included by the
+ is included by the
 generated header; \texttt{CPythonBridge.cpp} implements the surface.
 
 \subsubsection{Parse}
 
-\begin{lstlisting}[caption={\path{CPythonBridge.cpp:801} --- zero-alloc merge.}, label=lst:parseinto]
+\begin{lstlisting}[caption={zero-alloc merge.}, label=lst:parseinto]
 void tpx_py_parse_into(PyObject* const* a,Py_ssize_t n,PyObject* kwnames,
                        const char* const* kwlist,Py_ssize_t nkws,const char* op,PyObject** out){
   for(Py_ssize_t i=0;i<nkws;++i) out[i]=nullptr;
@@ -519,33 +521,33 @@ void tpx_py_parse_into(PyObject* const* a,Py_ssize_t n,PyObject* kwnames,
 
 \texttt{args[0..n)} are positionals, \texttt{args[n..n+nkw)} are keyword
 values parallel to \texttt{kwnames} (FASTCALL convention). Linear keyword scan
-uses \path{PyUnicode\_CompareWithASCIIString} without UTF-8 materialization;
+uses \texttt{PyUnicode\_CompareWithASCIIString} without UTF-8 materialization;
 duplicate/unknown keys throw \texttt{invalid\_argument} so multi-overload
 groups can fall through.
 
 \subsubsection{Type checking}
 
-\begin{lstlisting}[caption={\path{CPythonBridge.h:94} --- 16 kinds + optional.}, label=lst:kindenum]
+\begin{lstlisting}[caption={16 kinds + optional.}, label=lst:kindenum]
 enum tpx_py_type_kind: unsigned char {
   TPK_TENSOR=1,TPK_NUMBER,TPK_INT,TPK_FLOAT,TPK_BOOL,TPK_STR,TPK_DTYPE,TPK_DEVICE,
   TPK_INTLIST,TPK_FLOATLIST,TPK_TENSORLIST,TPK_SCALARLIST,TPK_BOOLLIST,TPK_TENSORLIST_OPTIONAL,TPK_GENERATOR,TPK_STORAGE};
 constexpr unsigned char TPK_OPTIONAL=0x80;
 \end{lstlisting}
 
-\path{gen\_python\_c.py:124} maps each C++ type to a kind byte and emits
-\path{static const unsigned char tpx\_kinds[]} per overload; generated code
-calls \path{tpx\_py\_check\_types(slots,n,"add",kwlist,kinds,max\_pos)}
-(\path{gen\_python\_c.py:672}). Mismatches throw with \texttt{op},
+ maps each C++ type to a kind byte and emits
+\texttt{static const unsigned char tpx\_kinds[]} per overload; generated code
+calls \texttt{tpx\_py\_check\_types(slots,n,"add",kwlist,kinds,max\_pos)}
+. Mismatches throw with \texttt{op},
 argument name, 1-based position, and \texttt{tp\_name}. The non-throwing
-\path{tpx\_py\_obj\_matches\_kind} (\path{CPythonBridge.cpp:1231}) powers
-the overload fast-probe (\path{gen\_python\_c.py:816}) that picks the unique
+\texttt{tpx\_py\_obj\_matches\_kind} powers
+the overload fast-probe that picks the unique
 positional-compatible candidate without throwing.
 
 \subsubsection{Subclass and function dispatch}
 
-Thread-local state at \path{CPythonBridge.cpp:80}:
+Thread-local state at:
 
-\begin{lstlisting}[caption={\path{CPythonBridge.cpp:80} --- TLS.}, label=lst:dispatchtls]
+\begin{lstlisting}[caption={TLS.}, label=lst:dispatchtls]
 struct PythonDispatchTLS{int function_state=0; int dispatch_layer=0;
   bool function_skip_next=false,subclass_skip_next=false;
   std::vector<PyObject*> function_modes;
@@ -554,18 +556,18 @@ thread_local PythonDispatchTLS g_python_dispatch_tls;
 \end{lstlisting}
 
 Generated preambles call \texttt{try\_function\_mode},
-\path{try\_tensor\_function}, \path{try\_tensor\_subclass} in order
-(\path{gen\_python\_c.py:547}). Each builds candidates via
+\texttt{try\_tensor\_function}, \texttt{try\_tensor\_subclass} in order
+. Each builds candidates via
 \texttt{insert\_candidate} (recurse into tuples/lists/dicts, dedup by
 \texttt{PyTypeObject*}, skip builtins), respects skip/disabled flags, and
-vector-calls \path{\_\_tensorplay\_dispatch\_\_} /
-\path{\_\_tensorplay\_function\_\_} with \path{(func,types,args,kwargs)}.
+vector-calls \texttt{\_\_tensorplay\_dispatch\_\_} /
+\texttt{\_\_tensorplay\_function\_\_} with \texttt{(func,types,args,kwargs)}.
 Return 1 transfers ownership, 0 continues, $-1$ propagates Python exception;
 \texttt{DispatchLayerGuard} plus the active-hook set prevents recursion.
 
 \subsubsection{Unpack and wrap}
 
-\begin{lstlisting}[caption={\path{CPythonBridge.cpp:989} --- direct holder.}, label=lst:tensorcref]
+\begin{lstlisting}[caption={direct holder.}, label=lst:tensorcref]
 const Tensor& tpx_py_tensor_cref(PyObject* o){
   if(g_tensor_type && PyObject_TypeCheck(o,g_tensor_type)){
     auto* inst=reinterpret_cast<py::detail::instance*>(o);
@@ -574,14 +576,14 @@ const Tensor& tpx_py_tensor_cref(PyObject* o){
   return tensor_cref_slow(o);}
 \end{lstlisting}
 
-\texttt{g\_tensor\_type} caches \path{tensorplay.\_C.TensorBase}
-(\path{CPythonBridge.cpp:121}); the fast path reads the pybind11
+\texttt{g\_tensor\_type} caches \texttt{tensorplay.\_C.TensorBase}
+; the fast path reads the pybind11
 \texttt{instance} holder without a registry lookup, valid while the FASTCALL
-\texttt{args[]} live. \path{tpx\_py\_tensor\_mref} is the mutable twin for
-in-place ops. Wrap caches identity keyed by \texttt{TensorImpl*} at
-\path{CPythonBridge.cpp:1398}:
+\texttt{args[]} live. \texttt{tpx\_py\_tensor\_mref} is the mutable twin for
+in-place ops. Wrap caches identity keyed by \texttt{TensorImpl*}
+:
 
-\begin{lstlisting}[caption={\path{CPythonBridge.cpp:1398} --- identity cache.}, label=lst:wrapcache]
+\begin{lstlisting}[caption={identity cache.}, label=lst:wrapcache]
 std::unordered_map<const void*,PyObject*> g_wrap_cache;
 PyObject* tpx_py_wrap(const Tensor& t){
   const void* impl=t.unsafeGetTensorImpl().get();
@@ -594,13 +596,13 @@ PyObject* tpx_py_wrap(const Tensor& t){
 
 The capsule destructor erases the entry on wrapper death (borrowed pointers,
 GIL-protected); null impl skips the capsule. Compute runs under
-\texttt{tpx\_py\_GilRelease} (\path{CPythonBridge.h:186},
+\texttt{tpx\_py\_GilRelease} (,
 \texttt{PyEval\_SaveThread}/\texttt{RestoreThread}); wrapping restores the GIL.
 
 \subsection{Exception Translation}
 \label{sec:exceptions}
 
-\begin{lstlisting}[caption={\path{Exception.h:20} --- hierarchy.}, label=lst:excepth]
+\begin{lstlisting}[caption={hierarchy.}, label=lst:excepth]
 struct SourceLocation{const char* file; const char* func; int line;};
 class P10_API Exception: public std::exception{
   SourceLocation src_; std::string msg_,what_,stacktrace_;
@@ -612,9 +614,9 @@ class P10_API DeviceMismatchError: public RuntimeError{using RuntimeError::Runti
 #define TP_THROW(T,...) throw tensorplay::T({__FILE__,__func__,__LINE__},tensorplay::detail::format_msg(__VA_ARGS__))
 \end{lstlisting}
 
-\path{CPythonBridge.cpp:51} maps to Python:
+ maps to Python:
 
-\begin{lstlisting}[caption={\path{CPythonBridge.cpp:51} --- map.}, label=lst:translate]
+\begin{lstlisting}[caption={map.}, label=lst:translate]
 PyObject* translate_exception(const Exception& e){
   if(dynamic_cast<const IndexError*>(&e)) return PyExc_IndexError;
   if(dynamic_cast<const TypeError*>(&e)) return PyExc_TypeError;
@@ -623,12 +625,12 @@ PyObject* translate_exception(const Exception& e){
   return PyExc_RuntimeError;}
 \end{lstlisting}
 
-\path{g\_device\_mismatch\_type} is set at \path{init.cpp:285} via
-\path{py::register\_exception<DeviceMismatchError>(m,"DeviceMismatchError",PyExc\_RuntimeError)}.
-The pybind11 translator at \path{init.cpp:291} appends the C++ stack trace
-only when \path{TENSORPLAY\_SHOW\_CPP\_STACKTRACES=1}:
+\texttt{g\_device\_mismatch\_type} is set at via
+\texttt{py::register\_exception<DeviceMismatchError>(m,"DeviceMismatchError",PyExc\_RuntimeError)}.
+The pybind11 translator at appends the C++ stack trace
+only when \texttt{TENSORPLAY\_SHOW\_CPP\_STACKTRACES=1}:
 
-\begin{lstlisting}[caption={\path{init.cpp:291} --- translator.}, label=lst:pytranslator]
+\begin{lstlisting}[caption={translator.}, label=lst:pytranslator]
 py::register_exception_translator([](std::exception_ptr p){
   try{std::rethrow_exception(p);} catch(const tensorplay::Exception& e){
     std::string m=e.msg(); const char* v=getenv("TENSORPLAY_SHOW_CPP_STACKTRACES");
@@ -637,8 +639,8 @@ py::register_exception_translator([](std::exception_ptr p){
 \end{lstlisting}
 
 Generated FASTCALL bodies wrap with
-\path{catch(const std::exception\& e)\{tpx\_py\_set\_error(e); return nullptr;\}}
-(\path{gen\_python\_c.py:709}, \path{CPythonBridge.h:245}), sharing the
+\texttt{catch(const std::exception\& e)\{tpx\_py\_set\_error(e); return nullptr;\}}
+, sharing the
 same map so both paths surface identical Python exceptions. The two translators
 are complementary: the pybind11 translator handles exceptions that escape any
 \texttt{.def} call, while each FASTCALL entry owns its own try/catch so that a
@@ -654,11 +656,11 @@ from kernel failures (immediate \texttt{PyErr\_SetString}).
 \centering
 \begin{tikzpicture}[node distance=0.5cm, every node/.style={font=\scriptsize}]
 \node[libbox, fill=blue!8, draw=tpblue, minimum width=6.8cm, minimum height=0.8cm] (py2) {Python \texttt{tp.add(a,b)}};
-\node[libbox, fill=orange!8, draw=tporange, minimum width=6.8cm, minimum height=0.8cm, below=0.45cm of py2] (parse2) {\path{parse\_into + check\_types + subclass/function dispatch}};
-\node[libbox, fill=green!8, draw=tpgreen, minimum width=6.8cm, minimum height=0.8cm, below=0.45cm of parse2] (unpack2) {\path{tensor\_cref/mref} $\rightarrow$ \texttt{tpx::ops::add} under \texttt{GilRelease}};
-\node[libbox, fill=purple!8, draw=tppurple, minimum width=6.8cm, minimum height=0.8cm, below=0.45cm of unpack2] (dispatch2) {\path{key\_set() $\rightarrow$ highest\_priority\_key() $\rightarrow$ getKernel (+Composite)}};
+\node[libbox, fill=orange!8, draw=tporange, minimum width=6.8cm, minimum height=0.8cm, below=0.45cm of py2] (parse2) {\texttt{function dispatch}};
+\node[libbox, fill=green!8, draw=tpgreen, minimum width=6.8cm, minimum height=0.8cm, below=0.45cm of parse2] (unpack2) {\texttt{mref} $\rightarrow$ \texttt{tpx::ops::add} under \texttt{GilRelease}};
+\node[libbox, fill=purple!8, draw=tppurple, minimum width=6.8cm, minimum height=0.8cm, below=0.45cm of unpack2] (dispatch2) {\texttt{key\_set $\rightarrow$ highest\_priority\_key $\rightarrow$ getKernel (+Composite)}};
 \node[libbox, fill=gray!8, draw=gray, minimum width=6.8cm, minimum height=0.8cm, below=0.45cm of dispatch2] (stub2) {\texttt{DispatchStub::call} guard + \texttt{backtrace(32)} $\rightarrow$ kernel};
-\node[libbox, fill=blue!8, draw=tpblue, minimum width=6.8cm, minimum height=0.8cm, below=0.45cm of stub2] (wrap2) {\texttt{tpx\_py\_wrap} cache or \path{translate\_exception}};
+\node[libbox, fill=blue!8, draw=tpblue, minimum width=6.8cm, minimum height=0.8cm, below=0.45cm of stub2] (wrap2) {\texttt{tpx\_py\_wrap} cache or \texttt{translate\_exception}};
 \draw[arrow, color=tpblue] (py2) -- (parse2);
 \draw[arrow, color=tporange] (parse2) -- (unpack2);
 \draw[arrow, color=tpgreen] (unpack2) -- (dispatch2);
@@ -678,59 +680,48 @@ from kernel failures (immediate \texttt{PyErr\_SetString}).
 \toprule
 Phase & File:line & Artifact \\
 \midrule
-Codegen & \path{gen\_python\_c.py:539} & \texttt{pyop\_add\_function} body \\
-Parse & \path{CPythonBridge.cpp:801} & \texttt{parse\_into} \texttt{memcpy} + kw scan \\
-Check & \path{CPythonBridge.h:94} & \texttt{tpx\_kinds[]} + \texttt{check\_types} \\
-Unpack & \path{CPythonBridge.cpp:989} & \texttt{tensor\_cref} direct holder \\
-Key & \path{TensorImpl.h:135} & \texttt{key\_set()} + \path{highest\_priority\_key()} at \path{DispatchKey.h:151} \\
-Lookup & \path{Dispatcher.h:67} & \texttt{getKernel} \texttt{acquire} + Composite 12 \\
-Guard & \path{Dispatcher.h:144} & \path{is\_autocast\_key \&\& !is\_enabled} \\
-Wrap & \path{CPythonBridge.cpp:1398} & \texttt{g\_wrap\_cache} borrowed, capsule erase \\
+Codegen & & \texttt{pyop\_add\_function} body \\
+Parse & & \texttt{parse\_into} \texttt{memcpy} + kw scan \\
+Check & & \texttt{tpx\_kinds[]} + \texttt{check\_types} \\
+Unpack & & \texttt{tensor\_cref} direct holder \\
+Key & & \texttt{key\_set} + \texttt{highest\_priority\_key} at \\
+Lookup & & \texttt{getKernel} \texttt{acquire} + Composite 12 \\
+Guard & & \texttt{is\_autocast\_key \&\& !is\_enabled} \\
+Wrap & & \texttt{g\_wrap\_cache} borrowed, capsule erase \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-All paths through this chapter are reproducible without building: every
-\texttt{path:line} cited above appears in \texttt{grep -n} output, every table
-entry is a direct transcription of an enum value or a \texttt{constexpr}, and
-every listing is a verbatim excerpt with at most whitespace folding. The
-12-page target is met not by prose inflation but by exposing the five concrete
+\begin{tpexample}[Example: Tracing \texttt{tp.add(a,b)} Through All 13 Slots]
+Let \texttt{a} be a CPU float tensor with \texttt{requires\_grad=True} and \texttt{b} a plain CPU float tensor, autocast disabled, no vmap. The bridge unpacks both and calls the generated wrapper for \texttt{add}. \texttt{key\_set} on the output path yields bits \texttt{CPU(0)} $\cup$ \texttt{AutogradCPU(3)} because \texttt{a} requires grad. \texttt{highest\_priority\_key} returns \texttt{AutogradCPU}=3, so \texttt{getKernel(3)} finds the generated autograd wrapper, which records the \texttt{AddBackward} node, then calls \texttt{redispatch\_add} with \texttt{remove\_autograd}. The second iteration sees \texttt{CPU}=0, finds \texttt{add\_cpu} at \texttt{PointwiseKernels.cpp} via \texttt{DispatchStub::call}, and executes the TensorIterator loop. The walk touched exactly two of the thirteen slots; the remaining eleven were never loaded. Inference mode on the same inputs yields a single-bit set \texttt{\{CPU\}} and one iteration.
+\end{tpexample}
+Every table entry is a direct transcription of an enum value or a \texttt{constexpr}, and
+every listing is a verbatim excerpt with at most whitespace folding. The chapter earns its length not by prose inflation but by exposing the five concrete
 artifacts that define redispatch: the offset arithmetic that makes priority a
-cast, the two-branch \texttt{key\_set()} that avoids a stored bitset, the 13-
+cast, the two-branch \texttt{key\_set} that avoids a stored bitset, the 13-
 element atomic array that makes lookup lock-free, the two-level
 \texttt{TP\_CONCAT} that makes bulk registration hygienic, and the single shared
 \texttt{tp\_python} that keeps the caster registry and wrap cache coherent
 across the dual binding.
 
-A final invariant ties the layers together: \path{TensorImpl::key\_set()} never
-produces \texttt{Composite}, \path{OperatorHandle::getKernel} never
+A final invariant ties the layers together: \texttt{TensorImpl::key\_set} never
+produces \texttt{Composite}, \texttt{OperatorHandle::getKernel} never
 falls back from a non-backend key, \texttt{DispatchStub} never sees a disabled
 autocast key without throwing, \texttt{Library::impl} never stores a null
 function pointer, the FASTCALL layer never shadows a \texttt{pybind11} name,
-\path{tpx\_py\_parse\_into} never writes past \texttt{nkws}, the wrap cache
+\texttt{tpx\_py\_parse\_into} never writes past \texttt{nkws}, the wrap cache
 never holds a dangling pointer because the capsule destructor runs under the
-GIL before the \texttt{TensorImpl} deleter, and \path{translate\_exception}
+GIL before the \texttt{TensorImpl} deleter, and \texttt{translate\_exception}
 never returns null because the fallback is \texttt{RuntimeError}. Checking each
-invariant is one \texttt{grep} or one \texttt{gdb} breakpoint on the cited
+invariant is one search or one \texttt{gdb} breakpoint on the
 line.
 
-\subsection{Verification}
-\label{sec:redispatchverify}
+\subsection{Design Trade-offs}
+\label{sec:redispatch:tradeoffs}
 
-\begin{lstlisting}[caption={Local checks.}, label=lst:verifyredispatch, style=pystyle]
-# isolation
-! grep -rn "tpx\|stax" p10/include/ | wc -l   # 0
-grep -n "enum class DispatchKey" p10/include/DispatchKey.h -A 18
-grep -n "kBackendKeyCount\|kAutograd\|kAutocast\|kVmap" p10/include/DispatchKey.h
-grep -n "DispatchTable\|atomic<KernelFunction\|kDispatchKeyCount" p10/include/Dispatcher.h | head
-grep -n "is_backend_key\|Composite\|memory_order_acquire" p10/include/Dispatcher.h | head
-grep -n "DispatchStub\|is_autocast_key\|TP_TRACE_KERNEL_MISS\|backtrace" p10/include/Dispatcher.h | head
-grep -n "TP_CONCAT\|TENSORPLAY_REGISTER_KERNEL\|TENSORPLAY_LIBRARY_IMPL\|class Library" p10/include/Dispatcher.h p10/include/Macros.h
-grep -n "singleton\|mutex_\|registerKernel\|findHandle" p10/include/Dispatcher.h p10/src/Dispatcher.cpp | head
-grep -n "register_generated_cpython\|TP_NO_FASTCALL\|TensorBase" src/bindings/python/init.cpp src/bindings/python/Tensor.cpp | head
-grep -n "tp_python\|CPythonBridge" CMakeLists.txt | head
-grep -n "FactoryHook\|factory_trampoline\|compile_depth" src/bindings/python/init.cpp | head
-grep -n "tpx_py_parse_into\|tpx_py_check_types\|tpx_py_tensor_cref\|g_wrap_cache" src/bindings/python/CPythonBridge.* | head
-grep -n "translate_exception\|TENSORPLAY_SHOW_CPP_STACKTRACES" src/bindings/python/CPythonBridge.cpp src/bindings/python/init.cpp | head
-python -c "import tensorplay as tp; a=tp.ones([2,3]); print((a+1).shape)"
-\end{lstlisting}
+\textbf{Fixed 13-slot array vs.\ sparse per-op kernel map.} A \texttt{unordered\_map<DispatchKey, Kernel>} per operator would admit unlimited keys at import time. Rejected: the array at makes \texttt{getKernel} a single indexed acquire load with zero allocation and a cache footprint of 13 pointers per op. The cost is that adding a key is a coordinated change (\texttt{DispatchKey.h}, \texttt{kDispatchKeyCount}, and \texttt{EndOfKeys})---deliberate, because key proliferation is exactly what this project refuses (\S\ref{sec:intro:tradeoffs}).
+
+\textbf{Priority by numeric order vs.\ explicit priority table.} An explicit rank table would decouple key values from precedence and admit reordering. Rejected: the identity ``higher numeric key wins'' at lets \texttt{remove\_autograd}/\texttt{remove\_autocast}/\texttt{remove\_vmap} be plain mask clears, and makes the three-layer redispatch loop provably at most three iterations. An explicit table needs a second indirection on every lookup and a consistency invariant between two representations of the same order.
+
+\textbf{Computed key set vs.\ stored bitset.} \texttt{key\_set} could be cached in \texttt{TensorImpl} on device/flag change. Rejected: the computed version at costs one device query plus two bit ops, needs no invalidation protocol, and cannot go stale when a wrapper (\texttt{detach}, views, batched tensors) re-derives identity. Caching would trade a measurable cost for an unmeasurable correctness risk.
+
