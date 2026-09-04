@@ -2,21 +2,40 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
+
+import tensorplay
 
 __all__ = ["MaskBuffer"]
 
 
+@dataclass
 class MaskBuffer:
-    def __init__(self) -> None:
-        self._values: dict[tuple[Any, ...], Any] = {}
+    data: Any = None
+    refcount: int = 0
 
-    def get(self, key: tuple[Any, ...]) -> Any:
-        return self._values.get(tuple(key))
+    def materialize_mask(self, mask: Any) -> None:
+        if self.refcount == 0:
+            self.data = mask
+        else:
+            if self.data is None:
+                raise AssertionError("mask buffer data is missing")
+            if not bool(tensorplay.equal(self.data, mask)):
+                raise RuntimeError("mask buffer received conflicting data")
+        self.refcount += 1
 
-    def set(self, key: tuple[Any, ...], value: Any) -> Any:
-        self._values[tuple(key)] = value
-        return value
+    def release_mask(self) -> None:
+        if self.refcount == 0 or self.data is None:
+            raise RuntimeError("mask buffer has not been materialized")
+        self.refcount -= 1
+        if self.refcount == 0:
+            self.data = None
 
-    def clear(self) -> None:
-        self._values.clear()
+    def apply_mask(self, tensor: Any) -> None:
+        if self.refcount == 0 or self.data is None:
+            raise RuntimeError("mask buffer has not been materialized")
+        if int(tensor.ndim) == int(self.data.ndim):
+            tensor[self.data] = 0.0
+        else:
+            tensor[self.data, :] = 0.0

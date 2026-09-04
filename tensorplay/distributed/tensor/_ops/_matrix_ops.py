@@ -8,7 +8,7 @@ from typing import Any, Sequence
 
 from .._api import DTensor
 from .._dtensor_spec import DTensorSpec, TensorMeta
-from .._op_schema import OpSchema
+from .._op_schema import OpSchema, OpStrategy, RuntimeSchemaInfo
 from ..placement_types import (
     Partial,
     Placement,
@@ -18,7 +18,7 @@ from ..placement_types import (
     _is_shard_like,
 )
 from ._einsum_strategy import EinsumDims
-from .single_dim_strategy import _ShardingPlaceholder
+from .single_dim_strategy import _ShardingPlaceholder, register_single_dim_strategy
 from .utils import _is_tensor_like, _operation_name, normalize_dim, prod
 
 __all__ = [
@@ -120,7 +120,12 @@ def transpose_single_dim_strategy(
         shape = tuple(spec.shape[index] for index in permutation) if spec.tensor_meta else None
         stride = tuple(spec.stride[index] for index in permutation) if spec.tensor_meta else None
         meta = None if shape is None else TensorMeta(shape, stride or (), spec.tensor_meta.dtype)
-        return DTensorSpec(spec.mesh, placements, meta, shard_order=spec.shard_order)
+        return DTensorSpec(
+            spec.mesh,
+            placements,
+            meta,
+            use_strided_shard_as_shard_order=spec.use_strided_shard_as_shard_order,
+        )
     return _transpose_strategy(dim0 if isinstance(dim0, (tuple, list)) else (),)
 
 
@@ -456,103 +461,606 @@ def scaled_mm_single_dim_strategy(
     return result
 
 
-def _attention_single_dim_strategies(
-    args_schema: Sequence[Any], *, backward: bool = False, has_bias: bool = False,
-    debug_mask: bool = False,
+def _scaled_dot_product_flash_attention_base_strategies(
+    op_schema: OpSchema,
 ) -> list[list[Any]]:
-    tensor_count = sum(_meta(value) is not None for value in args_schema)
-    if backward:
-        outputs = 4 if has_bias else 3
-        inputs = max(3, tensor_count)
-    else:
-        outputs = 3
-        inputs = max(3, tensor_count)
-    total = outputs + inputs
-    replicated = [Replicate()] * total
-    result = [replicated]
-    head = [Replicate()] * total
-    batch = [Replicate()] * total
-    for index in range(total):
-        if index < outputs:
-            head[index] = Shard(1)
-            batch[index] = Shard(0)
-        elif index < outputs + min(inputs, 3):
-            head[index] = Shard(1)
-            batch[index] = Shard(0)
-    if debug_mask and outputs:
-        head[0] = Shard(1)
-        batch[0] = Shard(0)
-    result.extend([head, batch])
-    return result
+    return_debug_mask = len(op_schema.args_schema) >= 6 and bool(
+        op_schema.args_schema[5]
+    )
+    q_input_strategy = op_schema.args_schema[0]
+    if not isinstance(q_input_strategy, OpStrategy):
+        raise AssertionError(f"expected OpStrategy, got {type(q_input_strategy)}")
+
+    debug_attn_mask_sharding: Placement = (
+        Replicate() if not return_debug_mask else Shard(1)
+    )
+    return [
+        [
+            Replicate(),
+            Replicate(),
+            None,
+            None,
+            None,
+            None,
+            Replicate(),
+            None,
+            Replicate(),
+            Replicate(),
+            Replicate(),
+            Replicate(),
+        ],
+        [
+            Shard(1),
+            Shard(1),
+            None,
+            None,
+            None,
+            None,
+            Replicate(),
+            None,
+            debug_attn_mask_sharding,
+            Shard(1),
+            Shard(1),
+            Shard(1),
+        ],
+        [
+            Shard(0),
+            Shard(0),
+            None,
+            None,
+            None,
+            None,
+            Replicate(),
+            None,
+            Shard(0) if return_debug_mask else Replicate(),
+            Shard(0),
+            Shard(0),
+            Shard(0),
+        ],
+    ]
 
 
-def _attention_base_strategies(op_schema: OpSchema, *, backward: bool = False, has_bias: bool = False) -> list[list[Any]]:
-    args = getattr(op_schema, "args_schema", getattr(op_schema, "args", ()))
-    return _attention_single_dim_strategies(args, backward=backward, has_bias=has_bias)
-
-
-def _scaled_dot_product_flash_attention_base_strategies(op_schema: OpSchema) -> list[list[Any]]:
-    return _attention_base_strategies(op_schema)
-
-
+@register_single_dim_strategy(
+    "_scaled_dot_product_flash_attention", schema_info=RuntimeSchemaInfo(5)
+)
 def scaled_dot_product_flash_attention_single_dim_strategy(
-    operation: Any, args_schema: Sequence[Any], kwargs_schema: dict[str, Any]
+    _op: Any,
+    args_schema: Sequence[Any],
+    _kwargs_schema: dict[str, Any],
+) -> list[list[Placement | _ShardingPlaceholder | None]]:
+    q_meta = args_schema[0]
+    if not isinstance(q_meta, TensorMeta):
+        raise AssertionError(f"expected TensorMeta, got {type(q_meta)}")
+
+    return_debug_mask = len(args_schema) >= 6 and bool(args_schema[5])
+    debug_attn_mask_head: Placement | _ShardingPlaceholder = (
+        _ShardingPlaceholder(1) if return_debug_mask else Replicate()
+    )
+    debug_attn_mask_batch: Placement | _ShardingPlaceholder = (
+        _ShardingPlaceholder(0) if return_debug_mask else Replicate()
+    )
+    return [
+        [
+            _ShardingPlaceholder(1),
+            _ShardingPlaceholder(1),
+            None,
+            None,
+            None,
+            None,
+            Replicate(),
+            None,
+            debug_attn_mask_head,
+            _ShardingPlaceholder(1),
+            _ShardingPlaceholder(1),
+            _ShardingPlaceholder(1),
+        ],
+        [
+            _ShardingPlaceholder(0),
+            _ShardingPlaceholder(0),
+            None,
+            None,
+            None,
+            None,
+            Replicate(),
+            None,
+            debug_attn_mask_batch,
+            _ShardingPlaceholder(0),
+            _ShardingPlaceholder(0),
+            _ShardingPlaceholder(0),
+        ],
+    ]
+
+
+def _scaled_dot_product_flash_attention_backward_base_strategies(
+    op_schema: OpSchema,
 ) -> list[list[Any]]:
-    return _attention_single_dim_strategies(args_schema, debug_mask=bool(len(args_schema) > 5 and args_schema[5]))
+    q_input_strategy = op_schema.args_schema[1]
+    if not isinstance(q_input_strategy, OpStrategy):
+        raise AssertionError(f"expected OpStrategy, got {type(q_input_strategy)}")
+    num_tensor_inputs = sum(
+        isinstance(arg_spec, OpStrategy) for arg_spec in op_schema.args_schema
+    )
+    if num_tensor_inputs < 6:
+        raise AssertionError(
+            f"expected at least 6 tensor inputs, got {num_tensor_inputs}"
+        )
+
+    all_replicate = [Replicate()] * (3 + num_tensor_inputs)
+    num_heads_dim_sharding = [
+        Shard(1),
+        Shard(1),
+        Shard(1),
+        Shard(1),
+        Shard(1),
+        Shard(1),
+        Shard(1),
+        Shard(1),
+        Shard(1),
+    ]
+    num_heads_dim_sharding.extend([Replicate()] * (num_tensor_inputs - 6))
+    batch_dim_sharding = [Shard(0)] * 9
+    batch_dim_sharding.extend([Replicate()] * (num_tensor_inputs - 6))
+    return [all_replicate, num_heads_dim_sharding, batch_dim_sharding]
 
 
-def _scaled_dot_product_flash_attention_backward_base_strategies(op_schema: OpSchema) -> list[list[Any]]:
-    return _attention_base_strategies(op_schema, backward=True)
-
-
+@register_single_dim_strategy("_scaled_dot_product_flash_attention_backward")
 def scaled_dot_product_flash_attention_backward_single_dim_strategy(
-    operation: Any, args_schema: Sequence[Any], kwargs_schema: dict[str, Any]
+    _op: Any,
+    args_schema: Sequence[Any],
+    _kwargs_schema: dict[str, Any],
+) -> list[list[Placement | _ShardingPlaceholder]]:
+    num_tensor_inputs = sum(isinstance(arg, TensorMeta) for arg in args_schema)
+    if num_tensor_inputs < 6:
+        raise AssertionError(
+            f"expected at least 6 tensor inputs, got {num_tensor_inputs}"
+        )
+
+    num_heads_dim_sharding: list[Placement | _ShardingPlaceholder] = [
+        _ShardingPlaceholder(1),
+        _ShardingPlaceholder(1),
+        _ShardingPlaceholder(1),
+        _ShardingPlaceholder(1),
+        _ShardingPlaceholder(1),
+        _ShardingPlaceholder(1),
+        _ShardingPlaceholder(1),
+        _ShardingPlaceholder(1),
+        _ShardingPlaceholder(1),
+    ]
+    num_heads_dim_sharding.extend([Replicate()] * (num_tensor_inputs - 6))
+    batch_dim_sharding: list[Placement | _ShardingPlaceholder] = [
+        _ShardingPlaceholder(0),
+        _ShardingPlaceholder(0),
+        _ShardingPlaceholder(0),
+        _ShardingPlaceholder(0),
+        _ShardingPlaceholder(0),
+        _ShardingPlaceholder(0),
+        _ShardingPlaceholder(0),
+        _ShardingPlaceholder(0),
+        _ShardingPlaceholder(0),
+    ]
+    batch_dim_sharding.extend([Replicate()] * (num_tensor_inputs - 6))
+    return [num_heads_dim_sharding, batch_dim_sharding]
+
+
+def _scaled_dot_product_efficient_attention_base_strategies(
+    op_schema: OpSchema,
 ) -> list[list[Any]]:
-    return _attention_single_dim_strategies(args_schema, backward=True)
+    q_input_strategy = op_schema.args_schema[0]
+    if not isinstance(q_input_strategy, OpStrategy):
+        raise AssertionError(f"expected OpStrategy, got {type(q_input_strategy)}")
+    has_attn_bias = op_schema.args_schema[3] is not None
+    compute_log_sumexp = bool(op_schema.args_schema[4])
+
+    all_replicate = [
+        Replicate(),
+        Replicate(),
+        None,
+        None,
+        Replicate(),
+        Replicate(),
+        Replicate(),
+    ]
+    if has_attn_bias:
+        all_replicate.append(Replicate())
+    head = [
+        Shard(1),
+        Shard(1) if compute_log_sumexp else Replicate(),
+        None,
+        None,
+        Shard(1),
+        Shard(1),
+        Shard(1),
+    ]
+    batch = [
+        Shard(0),
+        Shard(0) if compute_log_sumexp else Replicate(),
+        None,
+        None,
+        Shard(0),
+        Shard(0),
+        Shard(0),
+    ]
+    if has_attn_bias:
+        head.append(Shard(1))
+        batch.append(Shard(0))
+    return [all_replicate, head, batch]
 
 
-def _scaled_dot_product_efficient_attention_base_strategies(op_schema: OpSchema) -> list[list[Any]]:
-    args = getattr(op_schema, "args_schema", getattr(op_schema, "args", ()))
-    return _attention_base_strategies(args, has_bias=bool(len(args) > 3 and args[3] is not None))
-
-
+@register_single_dim_strategy(
+    "_scaled_dot_product_efficient_attention", schema_info=RuntimeSchemaInfo(4)
+)
 def scaled_dot_product_efficient_attention_single_dim_strategy(
-    operation: Any, args_schema: Sequence[Any], kwargs_schema: dict[str, Any]
+    _op: Any,
+    args_schema: Sequence[Any],
+    _kwargs_schema: dict[str, Any],
+) -> list[list[Placement | _ShardingPlaceholder | None]]:
+    q_meta = args_schema[0]
+    if not isinstance(q_meta, TensorMeta):
+        raise AssertionError(f"expected TensorMeta, got {type(q_meta)}")
+    has_attn_bias = args_schema[3] is not None
+    compute_log_sumexp = bool(args_schema[4])
+    logsumexp_head: Placement | _ShardingPlaceholder = (
+        _ShardingPlaceholder(1) if compute_log_sumexp else Replicate()
+    )
+    logsumexp_batch: Placement | _ShardingPlaceholder = (
+        _ShardingPlaceholder(0) if compute_log_sumexp else Replicate()
+    )
+    head: list[Placement | _ShardingPlaceholder | None] = [
+        _ShardingPlaceholder(1),
+        logsumexp_head,
+        None,
+        None,
+        _ShardingPlaceholder(1),
+        _ShardingPlaceholder(1),
+        _ShardingPlaceholder(1),
+    ]
+    batch: list[Placement | _ShardingPlaceholder | None] = [
+        _ShardingPlaceholder(0),
+        logsumexp_batch,
+        None,
+        None,
+        _ShardingPlaceholder(0),
+        _ShardingPlaceholder(0),
+        _ShardingPlaceholder(0),
+    ]
+    if has_attn_bias:
+        head.append(_ShardingPlaceholder(1))
+        batch.append(_ShardingPlaceholder(0))
+    return [head, batch]
+
+
+def _scaled_dot_product_efficient_attention_backward_base_strategies(
+    op_schema: OpSchema,
 ) -> list[list[Any]]:
-    return _attention_single_dim_strategies(args_schema, has_bias=bool(len(args_schema) > 3 and args_schema[3] is not None))
+    q_input_strategy = op_schema.args_schema[1]
+    if not isinstance(q_input_strategy, OpStrategy):
+        raise AssertionError(f"expected OpStrategy, got {type(q_input_strategy)}")
+    has_attn_bias = op_schema.args_schema[4] is not None
+    all_replicate = [Replicate()] * (12 + int(has_attn_bias))
+    if not has_attn_bias:
+        all_replicate[3] = None
+
+    head: list[Placement | None] = [
+        Shard(1),
+        Shard(1),
+        Shard(1),
+        Shard(1) if has_attn_bias else None,
+        Shard(1),
+        Shard(1),
+        Shard(1),
+        Shard(1),
+        Shard(1),
+        Shard(1),
+    ]
+    if has_attn_bias:
+        head.insert(8, Shard(1))
+    head.extend([Replicate(), Replicate()])
+
+    batch: list[Placement | None] = [
+        Shard(0),
+        Shard(0),
+        Shard(0),
+        Shard(0) if has_attn_bias else None,
+        Shard(0),
+        Shard(0),
+        Shard(0),
+        Shard(0),
+        Shard(0),
+        Shard(0),
+    ]
+    if has_attn_bias:
+        batch.insert(8, Shard(0))
+    batch.extend([Replicate(), Replicate()])
+    return [all_replicate, head, batch]
 
 
-def _scaled_dot_product_efficient_attention_backward_base_strategies(op_schema: OpSchema) -> list[list[Any]]:
-    args = getattr(op_schema, "args_schema", getattr(op_schema, "args", ()))
-    return _attention_base_strategies(args, backward=True, has_bias=bool(len(args) > 4 and args[4] is not None))
-
-
+@register_single_dim_strategy("_scaled_dot_product_efficient_attention_backward")
 def scaled_dot_product_efficient_attention_backward_single_dim_strategy(
-    operation: Any, args_schema: Sequence[Any], kwargs_schema: dict[str, Any]
+    _op: Any,
+    args_schema: Sequence[Any],
+    _kwargs_schema: dict[str, Any],
+) -> list[list[Placement | _ShardingPlaceholder | None]]:
+    has_attn_bias = args_schema[4] is not None
+    head: list[Placement | _ShardingPlaceholder | None] = [
+        _ShardingPlaceholder(1),
+        _ShardingPlaceholder(1),
+        _ShardingPlaceholder(1),
+        _ShardingPlaceholder(1) if has_attn_bias else None,
+        _ShardingPlaceholder(1),
+        _ShardingPlaceholder(1),
+        _ShardingPlaceholder(1),
+        _ShardingPlaceholder(1),
+    ]
+    if has_attn_bias:
+        head.append(_ShardingPlaceholder(1))
+    head.extend(
+        [
+            _ShardingPlaceholder(1),
+            _ShardingPlaceholder(1),
+            Replicate(),
+            Replicate(),
+        ]
+    )
+    batch: list[Placement | _ShardingPlaceholder | None] = [
+        _ShardingPlaceholder(0),
+        _ShardingPlaceholder(0),
+        _ShardingPlaceholder(0),
+        _ShardingPlaceholder(0) if has_attn_bias else None,
+        _ShardingPlaceholder(0),
+        _ShardingPlaceholder(0),
+        _ShardingPlaceholder(0),
+        _ShardingPlaceholder(0),
+    ]
+    if has_attn_bias:
+        batch.append(_ShardingPlaceholder(0))
+    batch.extend(
+        [
+            _ShardingPlaceholder(0),
+            _ShardingPlaceholder(0),
+            Replicate(),
+            Replicate(),
+        ]
+    )
+    return [head, batch]
+
+
+def _scaled_dot_product_cudnn_attention_base_strategies(
+    op_schema: OpSchema,
 ) -> list[list[Any]]:
-    return _attention_single_dim_strategies(args_schema, backward=True, has_bias=bool(len(args_schema) > 4 and args_schema[4] is not None))
+    query_strategy, _, _, attn_bias_strategy, compute_log_sumexp, *rest_args = (
+        op_schema.args_schema
+    )
+    return_debug_mask = len(op_schema.args_schema) >= 8 and bool(rest_args[2])
+    has_attn_bias = attn_bias_strategy is not None
+    if not isinstance(query_strategy, OpStrategy):
+        raise AssertionError(f"expected OpStrategy, got {type(query_strategy)}")
+
+    debug_attn_mask_sharding: Placement | None = (
+        Replicate() if return_debug_mask else None
+    )
+    all_replicate: list[Placement | None] = [
+        Replicate(),
+        Replicate(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        debug_attn_mask_sharding,
+        Replicate(),
+        Replicate(),
+        Replicate(),
+    ]
+    if has_attn_bias:
+        all_replicate.append(Replicate())
+
+    head: list[Placement | None] = [
+        Shard(1),
+        Shard(1) if compute_log_sumexp else Replicate(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Shard(1) if return_debug_mask else None,
+        Shard(1),
+        Shard(1),
+        Shard(1),
+    ]
+    if has_attn_bias:
+        head.append(Shard(1))
+
+    batch: list[Placement | None] = [
+        Shard(0),
+        Shard(0) if compute_log_sumexp else Replicate(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Shard(0) if return_debug_mask else None,
+        Shard(0),
+        Shard(0),
+        Shard(0),
+    ]
+    if has_attn_bias:
+        batch.append(Shard(0))
+    return [all_replicate, head, batch]
 
 
-def _scaled_dot_product_cudnn_attention_base_strategies(op_schema: OpSchema) -> list[list[Any]]:
-    args = getattr(op_schema, "args_schema", getattr(op_schema, "args", ()))
-    return _attention_base_strategies(args, has_bias=bool(len(args) > 3 and args[3] is not None))
-
-
+@register_single_dim_strategy(
+    "_scaled_dot_product_cudnn_attention", schema_info=RuntimeSchemaInfo(4)
+)
 def scaled_dot_product_cudnn_attention_single_dim_strategy(
-    operation: Any, args_schema: Sequence[Any], kwargs_schema: dict[str, Any]
+    _op: Any,
+    args_schema: Sequence[Any],
+    _kwargs_schema: dict[str, Any],
+) -> list[list[Placement | _ShardingPlaceholder | None]]:
+    query_meta = args_schema[0]
+    if not isinstance(query_meta, TensorMeta):
+        raise AssertionError(f"expected TensorMeta, got {type(query_meta)}")
+    has_attn_bias = args_schema[3] is not None
+    compute_log_sumexp = bool(args_schema[4])
+    return_debug_mask = len(args_schema) >= 8 and bool(args_schema[7])
+    logsumexp_head: Placement | _ShardingPlaceholder = (
+        _ShardingPlaceholder(1) if compute_log_sumexp else Replicate()
+    )
+    logsumexp_batch: Placement | _ShardingPlaceholder = (
+        _ShardingPlaceholder(0) if compute_log_sumexp else Replicate()
+    )
+    debug_attn_mask_head: Placement | _ShardingPlaceholder | None = (
+        _ShardingPlaceholder(1) if return_debug_mask else None
+    )
+    debug_attn_mask_batch: Placement | _ShardingPlaceholder | None = (
+        _ShardingPlaceholder(0) if return_debug_mask else None
+    )
+    head: list[Placement | _ShardingPlaceholder | None] = [
+        _ShardingPlaceholder(1),
+        logsumexp_head,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        debug_attn_mask_head,
+        _ShardingPlaceholder(1),
+        _ShardingPlaceholder(1),
+        _ShardingPlaceholder(1),
+    ]
+    if has_attn_bias:
+        head.append(_ShardingPlaceholder(1))
+    batch: list[Placement | _ShardingPlaceholder | None] = [
+        _ShardingPlaceholder(0),
+        logsumexp_batch,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        debug_attn_mask_batch,
+        _ShardingPlaceholder(0),
+        _ShardingPlaceholder(0),
+        _ShardingPlaceholder(0),
+    ]
+    if has_attn_bias:
+        batch.append(_ShardingPlaceholder(0))
+    return [head, batch]
+
+
+def _scaled_dot_product_cudnn_attention_backward_base_strategies(
+    op_schema: OpSchema,
 ) -> list[list[Any]]:
-    return _attention_single_dim_strategies(args_schema, has_bias=bool(len(args_schema) > 3 and args_schema[3] is not None))
+    if len(op_schema.args_schema) < 15:
+        raise AssertionError(
+            f"expected at least 15 args_schema, got {len(op_schema.args_schema)}"
+        )
+    has_attn_bias = op_schema.args_schema[8] is not None
+    has_scale = len(op_schema.args_schema) >= 16 and False
+    query_strategy = op_schema.args_schema[1]
+    if not isinstance(query_strategy, OpStrategy):
+        raise AssertionError(f"expected OpStrategy, got {type(query_strategy)}")
+
+    all_replicate: list[Placement | None] = [Replicate()] * 3
+    all_replicate.extend([Replicate()] * 6)
+    all_replicate.extend([Replicate(), Replicate()])
+    all_replicate.append(Replicate() if has_attn_bias else None)
+    all_replicate.extend([None] * 6)
+    if has_scale:
+        all_replicate.append(None)
+
+    head: list[Placement | None] = [Shard(1)] * 3
+    head.extend([Shard(1)] * 4)
+    head.extend([Shard(1), Shard(1)])
+    head.extend([Replicate(), Replicate()])
+    head.append(Shard(1) if has_attn_bias else None)
+    head.extend([None] * 6)
+    if has_scale:
+        head.append(None)
+
+    batch: list[Placement | None] = [Shard(0)] * 3
+    batch.extend([Shard(0)] * 4)
+    batch.extend([Shard(0), Shard(0)])
+    batch.extend([Replicate(), Replicate()])
+    batch.append(Shard(0) if has_attn_bias else None)
+    batch.extend([None] * 6)
+    if has_scale:
+        batch.append(None)
+    return [all_replicate, head, batch]
 
 
-def _scaled_dot_product_cudnn_attention_backward_base_strategies(op_schema: OpSchema) -> list[list[Any]]:
-    args = getattr(op_schema, "args_schema", getattr(op_schema, "args", ()))
-    return _attention_base_strategies(args, backward=True, has_bias=bool(len(args) > 8 and args[8] is not None))
-
-
+@register_single_dim_strategy("_scaled_dot_product_cudnn_attention_backward")
 def scaled_dot_product_cudnn_attention_backward_single_dim_strategy(
-    operation: Any, args_schema: Sequence[Any], kwargs_schema: dict[str, Any]
-) -> list[list[Any]]:
-    return _attention_single_dim_strategies(args_schema, backward=True, has_bias=bool(len(args_schema) > 8 and args_schema[8] is not None))
+    _op: Any,
+    args_schema: Sequence[Any],
+    _kwargs_schema: dict[str, Any],
+) -> list[list[Placement | _ShardingPlaceholder | None]]:
+    import tensorplay as tp
+
+    if len(args_schema) < 15:
+        raise AssertionError(f"expected at least 15 args, got {len(args_schema)}")
+    for arg in args_schema[:6]:
+        if not isinstance(arg, TensorMeta):
+            raise AssertionError(f"expected TensorMeta, got {type(arg)}")
+
+    philox_placements: list[Placement] = []
+    for arg in args_schema[6:8]:
+        if isinstance(arg, TensorMeta):
+            philox_placements.append(Replicate())
+        elif not isinstance(arg, tp.Tensor):
+            raise AssertionError(f"expected TensorMeta or Tensor, got {type(arg)}")
+
+    has_attn_bias = args_schema[8] is not None
+    if has_attn_bias and not isinstance(args_schema[8], (TensorMeta, tp.Tensor)):
+        raise AssertionError(
+            f"expected TensorMeta or Tensor, got {type(args_schema[8])}"
+        )
+
+    cum_seq_placements: list[None] = []
+    for arg in args_schema[9:11]:
+        if isinstance(arg, TensorMeta):
+            cum_seq_placements.append(None)
+        elif arg is None or isinstance(arg, tp.Tensor):
+            continue
+        else:
+            raise AssertionError(f"expected TensorMeta or Tensor, got {type(arg)}")
+
+    head: list[Placement | _ShardingPlaceholder | None] = [
+        _ShardingPlaceholder(1),
+        _ShardingPlaceholder(1),
+        _ShardingPlaceholder(1),
+        _ShardingPlaceholder(1),
+        _ShardingPlaceholder(1),
+        _ShardingPlaceholder(1),
+        _ShardingPlaceholder(1),
+        _ShardingPlaceholder(1),
+        _ShardingPlaceholder(1),
+    ]
+    head.extend(philox_placements)
+    if has_attn_bias and isinstance(args_schema[8], TensorMeta):
+        head.append(_ShardingPlaceholder(1))
+    head.extend(cum_seq_placements)
+
+    batch: list[Placement | _ShardingPlaceholder | None] = [
+        _ShardingPlaceholder(0),
+        _ShardingPlaceholder(0),
+        _ShardingPlaceholder(0),
+        _ShardingPlaceholder(0),
+        _ShardingPlaceholder(0),
+        _ShardingPlaceholder(0),
+        _ShardingPlaceholder(0),
+        _ShardingPlaceholder(0),
+        _ShardingPlaceholder(0),
+    ]
+    batch.extend(philox_placements)
+    if has_attn_bias and isinstance(args_schema[8], TensorMeta):
+        batch.append(_ShardingPlaceholder(0))
+    batch.extend(cum_seq_placements)
+    return [head, batch]
 
 
 def constant_pad_nd_single_dim_strategy(

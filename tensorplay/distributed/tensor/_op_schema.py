@@ -21,7 +21,21 @@ __all__ = [
 ]
 
 
+def _rebuild_tensor_from_dtensor_meta(arg: DTensorSpec) -> Any:
+    if arg.tensor_meta is None:
+        raise AssertionError("DTensorSpec does not contain tensor metadata")
+    import tensorplay
+
+    meta = arg.tensor_meta
+    factory = getattr(tensorplay, "empty_strided", None)
+    if factory is not None:
+        return factory(meta.shape, meta.stride, dtype=meta.dtype)
+    return tensorplay.empty(meta.shape, dtype=meta.dtype)
+
+
 def _tree_leaves(value: Any) -> list[Any]:
+    if isinstance(value, TensorMeta):
+        return [value]
     if isinstance(value, Mapping):
         result: list[Any] = []
         for item in value.values():
@@ -36,6 +50,8 @@ def _tree_leaves(value: Any) -> list[Any]:
 
 
 def _tree_map(value: Any, function: Callable[[Any], Any]) -> Any:
+    if isinstance(value, TensorMeta):
+        return function(value)
     if isinstance(value, dict):
         return {key: _tree_map(item, function) for key, item in value.items()}
     if isinstance(value, tuple):
@@ -50,6 +66,8 @@ def _tree_map_only(
 ) -> Any:
     if isinstance(value, target):
         return function(value)
+    if isinstance(value, TensorMeta):
+        return value
     if isinstance(value, dict):
         return {
             key: _tree_map_only(item, target, function)
@@ -87,7 +105,7 @@ def _pretty_print_spec(spec: Any) -> str:
 
 
 @dataclass
-class PlacementStrategy:
+class OpSpec:
     """A valid output layout and optional input layouts for one operation."""
 
     output_specs: Any
@@ -131,8 +149,26 @@ class PlacementStrategy:
             prefix = f"{_pretty_print_spec(tuple(self.input_specs))} -> "
         return prefix + _pretty_print_spec(self.output_specs)
 
+    def __hash__(self) -> int:
+        if self.output_specs is None:
+            output_hash = hash(None)
+        elif isinstance(self.output_specs, DTensorSpec):
+            output_hash = hash(self.output_specs)
+        else:
+            output_hash = hash(tuple(self.output_specs))
+        input_hash = hash(tuple(self.input_specs)) if self.input_specs else 0
+        return hash((output_hash, input_hash))
 
-OpSpec = PlacementStrategy
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, OpSpec):
+            return False
+        return (
+            self.output_specs == other.output_specs
+            and self.input_specs == other.input_specs
+        )
+
+
+PlacementStrategy = OpSpec
 
 
 class StrategyType:
@@ -205,6 +241,14 @@ class TupleStrategy(StrategyType):
     def children(self) -> tuple[StrategyType, ...]:
         return self.childs
 
+    @property
+    def childs(self) -> tuple[StrategyType, ...]:
+        return self._children
+
+    @childs.setter
+    def childs(self, value: Sequence[StrategyType]) -> None:
+        self._children = tuple(value)
+
     def child_mesh(self, index: int) -> Any:
         child = self.children[index]
         if not isinstance(child, OpStrategy):
@@ -213,6 +257,12 @@ class TupleStrategy(StrategyType):
 
     def __str__(self) -> str:
         return "TupleStrategy(" + ", ".join(str(child) for child in self.childs) + ")"
+
+    def __hash__(self) -> int:
+        return hash(tuple(self.children))
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, TupleStrategy) and self.children == other.children
 
 
 @dataclass
@@ -232,6 +282,9 @@ class OpSchema:
     args_schema: tuple[Any, ...] = ()
     kwargs_schema: dict[str, Any] = field(default_factory=dict)
     schema_info: RuntimeSchemaInfo | None = None
+    _comparison_key: tuple[Any, ...] | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     def __init__(
         self,
@@ -302,6 +355,8 @@ class OpSchema:
     @property
     def args_meta(self) -> tuple[Any, ...]:
         def convert(value: Any) -> Any:
+            if isinstance(value, TensorMeta):
+                return value
             if isinstance(value, OpStrategy):
                 return value.tensor_meta
             if isinstance(value, TupleStrategy):
@@ -318,6 +373,8 @@ class OpSchema:
     @property
     def kwargs_meta(self) -> dict[str, Any]:
         def convert(value: Any) -> Any:
+            if isinstance(value, TensorMeta):
+                return value
             if isinstance(value, OpStrategy):
                 return value.tensor_meta
             if isinstance(value, TupleStrategy):
@@ -344,7 +401,7 @@ class OpSchema:
         return False
 
     def __post_init__(self) -> None:
-        return None
+        self._recompute_comparison_key()
 
     def arg_type_tensor_or_tensor_list_like(self, arg_idx: int) -> bool:
         value = self.args_schema[arg_idx]
@@ -383,7 +440,8 @@ class OpSchema:
 
     def get_mesh_from_args(self, validate: bool = True) -> Any:
         mesh = None
-        for value in self.args_schema:
+        values = tuple(self.args_schema) + tuple(self.kwargs_schema.values())
+        for value in values:
             candidates = _tree_leaves(value)
             for candidate in candidates:
                 if isinstance(candidate, DTensorSpec):
@@ -397,7 +455,7 @@ class OpSchema:
         if mesh is None:
             raise ValueError("cannot find a device mesh in operation arguments")
         if validate:
-            for value in self.args_schema:
+            for value in values:
                 for candidate in _tree_leaves(value):
                     candidate_mesh = None
                     if isinstance(candidate, DTensorSpec):
@@ -419,6 +477,22 @@ class OpSchema:
         return bool(getattr(self.func, "is_view", False))
 
     def __hash__(self) -> int:
+        if self._comparison_key is None:
+            self._recompute_comparison_key()
+        return hash((self.func, self._comparison_key))
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, OpSchema) or self.func != other.func:
+            return False
+        if len(self.args_schema) != len(other.args_schema):
+            return False
+        if self._comparison_key is None:
+            self._recompute_comparison_key()
+        if other._comparison_key is None:
+            other._recompute_comparison_key()
+        return self._comparison_key == other._comparison_key
+
+    def _recompute_comparison_key(self) -> None:
         info = self.schema_info
         static_argnum = len(self.args_schema) if info is None else info.static_argnum
         args = tuple(
@@ -428,27 +502,12 @@ class OpSchema:
         )
         if info is not None and info.static_kwargkey is not None:
             kwargs = tuple(
-                _freeze(self.kwargs_schema.get(key)) for key in info.static_kwargkey
+                (key, _freeze(self.kwargs_schema.get(key)))
+                for key in info.static_kwargkey
             )
-            return hash((self.func, args, kwargs))
-        return hash((self.func, args))
-
-    def __eq__(self, other: object) -> bool:
-        if not isinstance(other, OpSchema) or self.func != other.func:
-            return False
-        if len(self.args_schema) != len(other.args_schema):
-            return False
-        info = self.schema_info
-        static_argnum = len(self.args_schema) if info is None else info.static_argnum
-        for index, (left, right) in enumerate(zip(self.args_schema, other.args_schema)):
-            if isinstance(left, DTensorSpec) or index >= static_argnum:
-                if left != right:
-                    return False
-        if info is not None and info.static_kwargkey:
-            for key in info.static_kwargkey:
-                if self.kwargs_schema.get(key) != other.kwargs_schema.get(key):
-                    return False
-        return True
+        else:
+            kwargs = ()
+        self._comparison_key = (args, kwargs)
 
     @staticmethod
     def _fake_tensor(spec: DTensorSpec) -> Any:
@@ -464,13 +523,13 @@ class OpSchema:
 
     def gen_fake_args(self) -> tuple[Any, ...]:
         return tuple(
-            _tree_map_only(value, DTensorSpec, self._fake_tensor)
+            _tree_map_only(value, DTensorSpec, _rebuild_tensor_from_dtensor_meta)
             for value in self.args_schema
         )
 
     def gen_fake_kwargs(self) -> dict[str, Any]:
         return {
-            key: _tree_map_only(value, DTensorSpec, self._fake_tensor)
+            key: _tree_map_only(value, DTensorSpec, _rebuild_tensor_from_dtensor_meta)
             for key, value in self.kwargs_schema.items()
         }
 
@@ -491,6 +550,7 @@ class OpSchema:
         self.args_schema = tuple(replace(value) for value in origin_schema.args_schema)
         self.kwargs_schema = dict(origin_schema.kwargs_schema)
         self.schema_info = origin_schema.schema_info
+        self._recompute_comparison_key()
 
     def __repr__(self) -> str:
         return (
@@ -512,6 +572,18 @@ class OutputSharding:
     needs_redistribute: bool = False
     schema_suggestions: tuple[Any, ...] = ()
     failed_reason: str | None = None
+
+    @property
+    def mesh(self) -> Any:
+        if isinstance(self.output_spec, DTensorSpec):
+            return self.output_spec.mesh
+        if isinstance(self.output_spec, (tuple, list)):
+            for value in self.output_spec:
+                if isinstance(value, DTensorSpec):
+                    return value.mesh
+        raise ValueError(
+            f"cannot determine mesh from output spec {self.output_spec!r}"
+        )
 
 
 @dataclass

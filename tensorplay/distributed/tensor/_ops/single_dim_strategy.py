@@ -542,7 +542,10 @@ def _expand_single_dim_strategy_to_mesh(
             return create(schema, meta)
 
     tuple_length = _tuple_strategy_length(op_schema)
-    if tuple_length is None:
+    operation_name = _base_operation_name(op_schema.op)
+    if tuple_length is None or not operation_name.startswith(
+        ("_foreach_", "_amp_foreach_", "_fused_")
+    ):
         return create_cached(op_schema, output_tensor_meta)
 
     def expanded_foreach(

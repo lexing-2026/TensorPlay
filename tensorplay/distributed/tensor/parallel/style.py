@@ -6,6 +6,8 @@ from abc import ABC, abstractmethod
 from functools import partial
 from typing import Any, Sequence
 
+import tensorplay
+
 from .._api import DTensor, distribute_module, distribute_tensor
 from ..placement_types import Placement, Replicate, Shard
 
@@ -187,7 +189,17 @@ class SequenceParallel(ParallelStyle):
         del module
         if not inputs:
             return inputs
-        value = _as_dtensor(inputs[0], mesh, _single_layout(self.sequence_sharding, mesh))
+        desired = _single_layout(self.sequence_sharding, mesh)
+        value = inputs[0]
+        if isinstance(value, DTensor):
+            if value.placements != desired:
+                value = value.redistribute(placements=desired)
+        elif isinstance(value, tensorplay.Tensor):
+            value = _as_dtensor(value, mesh, desired)
+        else:
+            raise ValueError(
+                f"expecting input of SequenceParallel to be a tensor or DTensor, but got {value}"
+            )
         return (value,) + inputs[1:]
 
     def _output(self, module: Any, output: Any, mesh: Any) -> Any:
@@ -234,6 +246,15 @@ class PrepareModuleInput(ParallelStyle):
         module.register_forward_pre_hook(hook, with_kwargs=bool(self.input_kwarg_layouts))
         return module
 
+    def __repr__(self) -> str:
+        return (
+            f"PrepareModuleInput(input_layouts={self.input_layouts}, "
+            f"desired_input_layouts={self.desired_input_layouts}, "
+            f"input_kwarg_layouts={self.input_kwarg_layouts}, "
+            f"desired_input_kwarg_layouts={self.desired_input_kwarg_layouts}, "
+            f"use_local_output={self.use_local_output})"
+        )
+
 
 class PrepareModuleOutput(ParallelStyle):
     def __init__(self, *, output_layouts: Placement | tuple[Placement | None, ...], desired_output_layouts: Placement | tuple[Placement, ...], use_local_output: bool = True) -> None:
@@ -261,6 +282,13 @@ class PrepareModuleOutput(ParallelStyle):
         module.register_forward_hook(hook)
         return module
 
+    def __repr__(self) -> str:
+        return (
+            f"PrepareModuleOutput(output_layouts={self.output_layouts}, "
+            f"desired_output_layouts={self.desired_output_layouts}, "
+            f"use_local_output={self.use_local_output})"
+        )
+
 
 class PrepareModuleInputOutput(ParallelStyle):
     def __init__(self, *, input_layouts: Placement | tuple[Placement | None, ...] | None = None, desired_input_layouts: Placement | tuple[Placement | None, ...] | None = None, input_kwarg_layouts: dict[str, Placement] | None = None, desired_input_kwarg_layouts: dict[str, Placement] | None = None, use_local_input: bool = False, output_layouts: Placement | tuple[Placement | None, ...], desired_output_layouts: Placement | tuple[Placement, ...], use_local_output: bool = True) -> None:
@@ -271,3 +299,15 @@ class PrepareModuleInputOutput(ParallelStyle):
         self.prepare_module_input._apply(module, device_mesh)
         self.prepare_module_output._apply(module, device_mesh)
         return module
+
+    def __repr__(self) -> str:
+        return (
+            f"PrepareModuleInputOutput(input_layouts={self.prepare_module_input.input_layouts}, "
+            f"desired_input_layouts={self.prepare_module_input.desired_input_layouts}, "
+            f"input_kwarg_layouts={self.prepare_module_input.input_kwarg_layouts}, "
+            f"desired_input_kwarg_layouts={self.prepare_module_input.desired_input_kwarg_layouts}, "
+            f"use_local_input={self.prepare_module_input.use_local_output}, "
+            f"output_layouts={self.prepare_module_output.output_layouts}, "
+            f"desired_output_layouts={self.prepare_module_output.desired_output_layouts}, "
+            f"use_local_output={self.prepare_module_output.use_local_output})"
+        )

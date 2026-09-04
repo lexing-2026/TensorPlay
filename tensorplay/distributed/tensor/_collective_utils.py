@@ -33,6 +33,99 @@ __all__ = [
 ]
 
 
+def _mesh_get_process_group_impl(mesh: Any, dim: int) -> Any:
+    return mesh.get_group(dim)
+
+
+def _mesh_get_process_group_fake(mesh: Any, dim: int) -> Any:
+    return mesh.get_group(dim)
+
+
+def _shard_dim_alltoall_meta(
+    value: Any, gather_dim: int, shard_dim: int, group_name: Any
+) -> Any:
+    from .. import _functional_collectives as funcol
+
+    group = funcol._resolve_group(group_name)
+    group_size = int(group.size())
+    gathered = tensorplay.cat(
+        tuple(tensorplay.empty_like(value) for _ in range(group_size)),
+        dim=int(gather_dim),
+    )
+    chunk_size = int(gathered.shape[int(shard_dim)]) // group_size
+    return gathered.narrow(
+        int(shard_dim), int(group.rank()) * chunk_size, chunk_size
+    ).contiguous()
+
+
+def _shard_dim_alltoall_setup_context(
+    context: Any, inputs: tuple[Any, ...], output: Any
+) -> None:
+    del output
+    _, gather_dim, shard_dim, group_name = inputs
+    context.gather_dim = gather_dim
+    context.shard_dim = shard_dim
+    context.group_name = group_name
+
+
+def _shard_dim_alltoall_backward(context: Any, grad_output: Any) -> tuple[Any, None, None, None]:
+    return (
+        _shard_dim_alltoall_impl(
+            grad_output,
+            context.shard_dim,
+            context.gather_dim,
+            context.group_name,
+        ),
+        None,
+        None,
+        None,
+    )
+
+
+def _shard_dim_alltoall_impl(
+    value: Any, gather_dim: int, shard_dim: int, group_name: Any
+) -> Any:
+    from .. import _functional_collectives as funcol
+
+    group = funcol._resolve_group(group_name)
+    gather_dim = _tensor_dim(value, int(gather_dim))
+    shard_dim = _tensor_dim(value, int(shard_dim))
+    group_size = int(group.size())
+    if gather_dim == shard_dim or group_size <= 1:
+        return value
+    source_shards, _ = Shard(shard_dim)._split_tensor(
+        value, group_size, with_padding=True, contiguous=True
+    )
+    outputs = [value.new_empty(tuple(shard.shape)) for shard in source_shards]
+    work = dist.all_to_all(outputs, source_shards, group=group)
+    if work is not None and hasattr(work, "wait"):
+        work.wait()
+    return tensorplay.cat(tuple(outputs), dim=gather_dim).contiguous()
+
+
+def _make_shard_dim_alltoall_function() -> Any:
+    from tensorplay.autograd.function import Function
+
+    class ShardDimAllToAll(Function):
+        @staticmethod
+        def forward(context: Any, value: Any, gather_dim: int, shard_dim: int, group_name: Any) -> Any:
+            _shard_dim_alltoall_setup_context(
+                context, (value, gather_dim, shard_dim, group_name), None
+            )
+            return _shard_dim_alltoall_impl(
+                value, gather_dim, shard_dim, group_name
+            )
+
+        @staticmethod
+        def backward(context: Any, grad_output: Any) -> tuple[Any, None, None, None]:
+            return _shard_dim_alltoall_backward(context, grad_output)
+
+    return ShardDimAllToAll
+
+
+_ShardDimAllToAll = _make_shard_dim_alltoall_function()
+
+
 def _mesh_ndim(mesh: Any) -> int:
     value = getattr(mesh, "ndim")
     return int(value() if callable(value) else value)
@@ -142,10 +235,11 @@ def mesh_scatter(
     if local_rank == group_src:
         if source_list is None or len(source_list) != group_size:
             raise ValueError("scatter_list must contain one tensor per mesh rank")
+    ranks = dist.get_process_group_ranks(group)
     return dist.scatter(
         output,
         scatter_list=source_list,
-        src=int(group_src),
+        src=int(ranks[int(group_src)]),
         group=group,
         async_op=async_op,
     )
@@ -211,13 +305,10 @@ def shard_dim_alltoall(
     group_size = _group_size(mesh, mesh_dim)
     if gather_dim == shard_dim or group_size <= 1:
         return value
-
-    source_shards, _ = Shard(shard_dim)._split_tensor(
-        value, group_size, with_padding=True, contiguous=True
+    group = _mesh_get_process_group_impl(mesh, mesh_dim)
+    return _ShardDimAllToAll.apply(
+        value, gather_dim, shard_dim, group.group_name
     )
-    outputs = [value.new_empty(tuple(shard.shape)) for shard in source_shards]
-    dist.all_to_all(outputs, source_shards, group=_group(mesh, mesh_dim))
-    return tensorplay.cat(tuple(outputs), dim=gather_dim).contiguous()
 
 
 def fill_empty_tensor_to_shards(

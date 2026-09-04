@@ -37,6 +37,8 @@ __all__ = [
     "register_op_strategy",
     "register_prop_rule",
     "replicate_op_strategy",
+    "shift_shard_dims_after_insert",
+    "shift_shard_dims_after_remove",
 ]
 
 _PROPAGATION_RULES: dict[Any, Callable[..., Any]] = {}
@@ -86,7 +88,10 @@ def _operation_name(operation: Any) -> str:
 
 def _schema_values(schema: Any) -> list[Any]:
     if hasattr(schema, "args"):
-        values = getattr(schema, "args")
+        values = (
+            getattr(schema, "args"),
+            getattr(schema, "kwargs", {}),
+        )
     else:
         values = schema
     result: list[Any] = []
@@ -169,20 +174,6 @@ def _matrix_rule(schema: Any) -> Any:
     return OutputSharding(mm_single_dim_strategy(left, right, bias=bias))
 
 
-def _cat_rule(schema: Any) -> Any:
-    from ._tensor_ops import cat_single_dim_strategy
-
-    dim = _schema_argument(schema, 1, "dim", 0)
-    return OutputSharding(cat_single_dim_strategy(schema, dim))
-
-
-def _stack_rule(schema: Any) -> Any:
-    from ._tensor_ops import stack_strategy
-
-    dim = _schema_argument(schema, 1, "dim", 0)
-    return OutputSharding(stack_strategy(schema, dim))
-
-
 def _single_input_rule(schema: Any) -> Any:
     values = _schema_values(schema)
     if not values:
@@ -198,20 +189,15 @@ def _install_builtin_rules() -> None:
     if _BUILTINS_READY:
         return
     _BUILTINS_READY = True
-    from ._common_rules import pointwise_rule
     from ._conv_ops import convolution_backward_rules, convolution_rules
     from ._embedding_ops import embedding_dense_backward_strategy, embedding_strategy
-    from ._random_ops import multinomial_single_dim_strategy, random_inplace_single_dim_strategy
+    from ._experimental_ops import slice_backward_rules
+    from ._math_ops import register_math_ops
+    from ._random_ops import register_random_ops
+    from ._tensor_ops import register_tensor_ops
+    from ._pointwise_ops import register_pointwise_ops
+    from ._view_ops import register_view_ops
 
-    pointwise_names = {
-        "add", "sub", "mul", "div", "true_divide", "floor_divide", "pow",
-        "neg", "abs", "exp", "expm1", "log", "log1p", "log2", "log10",
-        "sqrt", "rsqrt", "sin", "cos", "tan", "tanh", "sinh", "cosh",
-        "asin", "acos", "atan", "sigmoid", "relu", "gelu", "silu",
-        "maximum", "minimum", "where", "clamp", "lerp", "isfinite", "isnan",
-    }
-    for name in pointwise_names:
-        _NAMED_PROPAGATION_RULES[name] = pointwise_rule
     reduction_names = {
         "sum", "mean", "prod", "amin", "amax", "min", "max", "all", "any",
         "var", "std", "norm",
@@ -220,9 +206,7 @@ def _install_builtin_rules() -> None:
         _NAMED_PROPAGATION_RULES[name] = _reduction_rule
     for name in {"mm", "matmul", "bmm", "addmm", "baddbmm", "linear"}:
         _NAMED_PROPAGATION_RULES[name] = _matrix_rule
-    _NAMED_PROPAGATION_RULES["cat"] = _cat_rule
-    _NAMED_PROPAGATION_RULES["stack"] = _stack_rule
-    for name in {"clone", "detach", "contiguous", "to", "_to_copy", "alias"}:
+    for name in {"to"}:
         _NAMED_PROPAGATION_RULES[name] = _single_input_rule
     for name in {"convolution", "convolution_backward"}:
         _NAMED_PROPAGATION_RULES[name] = (
@@ -231,9 +215,16 @@ def _install_builtin_rules() -> None:
     _NAMED_STRATEGY_RULES.update({
         "embedding": embedding_strategy,
         "embedding_dense_backward": embedding_dense_backward_strategy,
-        "multinomial": multinomial_single_dim_strategy,
-        "random_": random_inplace_single_dim_strategy,
+        "slice_backward": slice_backward_rules,
     })
+    register_tensor_ops()
+    register_math_ops()
+    register_pointwise_ops()
+    register_random_ops()
+    register_view_ops()
+    from .autogen import auto_register_op_variants
+
+    auto_register_op_variants()
 
 
 def _lookup_builtin_rule(operation: Any) -> tuple[str, Callable[..., Any] | None]:
@@ -277,6 +268,38 @@ def normalize_dims(dims: int | Sequence[int] | None, ndim: int) -> tuple[int, ..
     if len(set(result)) != len(result):
         raise ValueError("dimensions must be unique")
     return result
+
+
+def shift_shard_dims_after_insert(
+    placements: Sequence[Placement], insert_dim: int = 0
+) -> tuple[Placement, ...]:
+    result: list[Placement] = []
+    for placement in placements:
+        if isinstance(placement, _StridedShard) and placement.dim >= insert_dim:
+            result.append(
+                _StridedShard(placement.dim + 1, split_factor=placement.split_factor)
+            )
+        elif isinstance(placement, Shard) and placement.dim >= insert_dim:
+            result.append(Shard(placement.dim + 1))
+        else:
+            result.append(placement)
+    return tuple(result)
+
+
+def shift_shard_dims_after_remove(
+    placements: Sequence[Placement], remove_dim: int = 0
+) -> tuple[Placement, ...]:
+    result: list[Placement] = []
+    for placement in placements:
+        if isinstance(placement, _StridedShard) and placement.dim > remove_dim:
+            result.append(
+                _StridedShard(placement.dim - 1, split_factor=placement.split_factor)
+            )
+        elif isinstance(placement, Shard) and placement.dim > remove_dim:
+            result.append(Shard(placement.dim - 1))
+        else:
+            result.append(placement)
+    return tuple(result)
 
 
 def prod(values: Iterable[int]) -> int:
@@ -345,24 +368,39 @@ def is_tensor_partial(spec: DTensorSpec) -> bool:
     return any(isinstance(placement, Partial) for placement in spec.placements)
 
 
-def infer_broadcast_dims_map(input_shape: Sequence[int], output_shape: Sequence[int]) -> tuple[int | None, ...]:
-    if len(input_shape) > len(output_shape):
-        raise ValueError("input rank cannot exceed output rank")
-    padding = len(output_shape) - len(input_shape)
-    result: list[int | None] = [None] * padding
-    for index, (source, target) in enumerate(zip(input_shape, output_shape[padding:])):
+def infer_broadcast_dims_map(
+    common_shape: Sequence[int], input_shape: Sequence[int]
+) -> tuple[int, ...]:
+    if len(input_shape) > len(common_shape):
+        raise ValueError("input rank cannot exceed broadcast rank")
+    result = [-1] * len(common_shape)
+    for index in range(-1, -1 - len(input_shape), -1):
+        source = int(input_shape[index])
+        target = int(common_shape[index])
         if source not in (1, target):
             raise ValueError("shapes are not broadcastable")
-        result.append(index if source == target else None)
+        if source == target:
+            result[len(common_shape) + index] = len(input_shape) + index
     return tuple(result)
 
 
-def map_placements_after_broadcast(placements: Sequence[Any], dim_map: Sequence[int | None]) -> tuple[Any, ...]:
+def map_placements_after_broadcast(
+    placements: Sequence[Any],
+    shape: Sequence[int],
+    broadcast_dims_map: Sequence[int],
+) -> tuple[Any, ...]:
     result = []
     for placement in placements:
         if _is_shard_like(placement):
-            target = dim_map[placement.dim]
-            result.append(placement if target is not None else Replicate())
+            shard_dim = normalize_dim(placement.dim, len(shape))
+            input_dim = broadcast_dims_map[shard_dim]
+            result.append(
+                type(placement)(input_dim, placement.split_factor)
+                if input_dim != -1 and isinstance(placement, _StridedShard)
+                else Shard(input_dim)
+                if input_dim != -1
+                else Replicate()
+            )
         else:
             result.append(placement)
     return tuple(result)

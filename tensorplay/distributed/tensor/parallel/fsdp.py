@@ -6,10 +6,12 @@ from typing import Any
 
 from .._api import DTensor
 from .._dtensor_spec import DTensorSpec
-from .._shards_wrapper import ShardMetadata, ShardsWrapper
 from .._utils import compute_local_shape_and_global_offset
 from ..placement_types import Replicate, Shard
 from ._data_parallel_utils import _flatten_tensor, _unflatten_tensor
+from ...fsdp._shard_utils import _all_gather_dtensor, _create_chunk_dtensor, _create_chunk_sharded_tensor
+from ..._shard.metadata import ShardMetadata
+from ..._shard.sharded_tensor.shard import Shard as LocalShard
 
 __all__ = ["DTensorExtensions"]
 
@@ -20,29 +22,45 @@ class DTensorExtensions:
         self.compute_stream = None
 
     def pre_flatten_transform(self, tensor: Any) -> tuple[Any, DTensorSpec | None]:
-        local, spec = _flatten_tensor(tensor)
-        return local, None if spec is None else DTensorSpec(spec.device_mesh, spec.placements, None)
+        return _flatten_tensor(tensor)
 
     def post_unflatten_transform(self, tensor: Any, param_extension: DTensorSpec) -> Any:
-        return _unflatten_tensor(tensor, param_extension)
+        stream = self.compute_stream
+        current_stream = getattr(self.device_handle, "current_stream", None)
+        if stream is None and callable(current_stream):
+            stream = current_stream()
+        stream_context = getattr(self.device_handle, "stream", None)
+        if stream is not None and callable(stream_context):
+            with stream_context(stream):
+                return _unflatten_tensor(
+                    tensor,
+                    param_extension,
+                    device_handle=self.device_handle,
+                    compute_stream=self.compute_stream,
+                )
+        return _unflatten_tensor(
+            tensor,
+            param_extension,
+            device_handle=self.device_handle,
+            compute_stream=self.compute_stream,
+        )
 
     def chunk_tensor(self, tensor: Any, rank: int, world_size: int, num_devices_per_node: int, pg: Any, device: Any = None) -> Any:
-        del num_devices_per_node, pg, device
-        return tensor.chunk(world_size, dim=0)[rank]
+        return _create_chunk_sharded_tensor(
+            tensor, rank, world_size, num_devices_per_node, pg, device
+        )
 
     def chunk_dtensor(self, tensor: DTensor, rank: int, device_mesh: Any) -> Any:
-        del rank
-        mesh_ndim = getattr(device_mesh, "ndim")
-        mesh_ndim = int(mesh_ndim() if callable(mesh_ndim) else mesh_ndim)
-        placements = (Shard(0),) + tuple(Replicate() for _ in range(mesh_ndim - 1))
-        return tensor.redistribute(device_mesh=device_mesh, placements=placements).to_local()
+        return _create_chunk_dtensor(tensor, rank, device_mesh)
 
-    def pre_load_state_dict_transform(self, tensor: Any) -> tuple[Any, list[ShardMetadata]]:
+    def pre_load_state_dict_transform(self, tensor: Any) -> tuple[Any, list[LocalShard]]:
         if not isinstance(tensor, DTensor):
             return tensor, []
         local_shape, offset = compute_local_shape_and_global_offset(tensor.shape, tensor.device_mesh, tensor.placements)
-        return tensor.to_local(), [ShardMetadata(tensor.to_local(), offset, local_shape)]
+        metadata = ShardMetadata(
+            list(offset), list(local_shape), f"rank:{tensor.device_mesh.get_rank()}/{tensor.device}"
+        )
+        return tensor.to_local(), [LocalShard(tensor.to_local(), metadata)]
 
     def all_gather_dtensor(self, tensor: DTensor, parent_mesh: Any = None) -> Any:
-        del parent_mesh
-        return tensor.full_tensor()
+        return _all_gather_dtensor(tensor, parent_mesh)
