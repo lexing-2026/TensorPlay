@@ -740,6 +740,191 @@ TEST_F(VulkanExtendedOpTest, QuantizedConv2dPackedMatchesScalarPath) {
            true, 0.04, 1);
 }
 
+TEST_F(VulkanExtendedOpTest, CumsumMatchesCpu) {
+  // Width, height, batch, and channel scans, with and without keepdim.
+  Tensor x = tpx_ops::arange(24., DType::Float32).reshape({2, 3, 4});
+
+  vulkan_test::expect_allclose(
+      tpx_ops::cumsum(vk(x), 2).to(Device(DeviceType::CPU)),
+      tpx_ops::cumsum(x, 2));
+  vulkan_test::expect_allclose(
+      tpx_ops::cumsum(vk(x), 1).to(Device(DeviceType::CPU)),
+      tpx_ops::cumsum(x, 1));
+  vulkan_test::expect_allclose(
+      tpx_ops::cumsum(vk(x), 0).to(Device(DeviceType::CPU)),
+      tpx_ops::cumsum(x, 0));
+  vulkan_test::expect_allclose(
+      tpx_ops::cumsum(vk(x.reshape({2, 12})), 1).to(Device(DeviceType::CPU)),
+      tpx_ops::cumsum(x.reshape({2, 12}), 1));
+
+  // Channel-axis scan through the texel lanes, including a channel count
+  // that does not fill the last texel.
+  Tensor c = tpx_ops::arange(18., DType::Float32).reshape({1, 6, 3});
+  vulkan_test::expect_allclose(
+      tpx_ops::cumsum(vk(c), 1).to(Device(DeviceType::CPU)),
+      tpx_ops::cumsum(c, 1));
+
+  // In-place form.
+  Tensor v = vk(x.clone());
+  tpx_ops::cumsum_(v, 2);
+  vulkan_test::expect_allclose(
+      v.to(Device(DeviceType::CPU)), tpx_ops::cumsum(x, 2));
+}
+
+TEST_F(VulkanExtendedOpTest, MaskedFillMatchesCpu) {
+  Tensor x = tpx_ops::arange(12., DType::Float32).reshape({3, 4});
+  Tensor mask_cpu = tpx_ops::remainder(
+                        tpx_ops::arange(12., DType::Float32), Scalar(3.))
+                        .reshape({3, 4})
+                        .eq(Scalar(0));
+
+  vulkan_test::expect_allclose(
+      tpx_ops::masked_fill(vk(x), vk(mask_cpu), Scalar(-1.5))
+          .to(Device(DeviceType::CPU)),
+      tpx_ops::masked_fill(x, mask_cpu, Scalar(-1.5)));
+
+  // Tensor form: this backend accepts a 0-dimensional value tensor.
+  Tensor value = tpx_ops::full({}, 7.25);
+  vulkan_test::expect_allclose(
+      tpx_ops::masked_fill(vk(x), vk(mask_cpu), vk(value))
+          .to(Device(DeviceType::CPU)),
+      tpx_ops::masked_fill(x, mask_cpu, value));
+
+  // In-place form on a device tensor.
+  Tensor y = vk(x.clone());
+  Tensor y_ref = x.clone();
+  tpx_ops::masked_fill_(y, vk(mask_cpu), Scalar(100.));
+  tpx_ops::masked_fill_(y_ref, mask_cpu, Scalar(100.));
+  vulkan_test::expect_allclose(y.to(Device(DeviceType::CPU)), y_ref);
+}
+
+TEST_F(VulkanExtendedOpTest, GluMatchesCpu) {
+  // Last-dim split (default), channel split through the texel lanes, and a
+  // width split.
+  Tensor x = tpx_ops::arange(24., DType::Float32).reshape({2, 12});
+  vulkan_test::expect_allclose(
+      tpx_ops::glu(vk(x), -1).to(Device(DeviceType::CPU)),
+      tpx_ops::glu(x, -1));
+
+  Tensor c = tpx_ops::arange(48., DType::Float32).reshape({2, 8, 3});
+  vulkan_test::expect_allclose(
+      tpx_ops::glu(vk(c), 1).to(Device(DeviceType::CPU)),
+      tpx_ops::glu(c, 1));
+
+  Tensor w = tpx_ops::arange(24., DType::Float32).reshape({2, 3, 4});
+  vulkan_test::expect_allclose(
+      tpx_ops::glu(vk(w), 2).to(Device(DeviceType::CPU)),
+      tpx_ops::glu(w, 2));
+}
+
+TEST_F(VulkanExtendedOpTest, UpsampleBilinear2dMatchesCpu) {
+  Tensor x = tpx_ops::arange(16., DType::Float32).reshape({1, 1, 4, 4});
+
+  vulkan_test::expect_allclose(
+      tpx_ops::upsample_bilinear2d(vk(x), {8, 8}, false)
+          .to(Device(DeviceType::CPU)),
+      tpx_ops::upsample_bilinear2d(x, {8, 8}, false),
+      1e-4, 1e-5);
+
+  // Downsample and corner-aligned form.
+  vulkan_test::expect_allclose(
+      tpx_ops::upsample_bilinear2d(vk(x), {2, 6}, false)
+          .to(Device(DeviceType::CPU)),
+      tpx_ops::upsample_bilinear2d(x, {2, 6}, false),
+      1e-4, 1e-5);
+  vulkan_test::expect_allclose(
+      tpx_ops::upsample_bilinear2d(vk(x), {8, 8}, true)
+          .to(Device(DeviceType::CPU)),
+      tpx_ops::upsample_bilinear2d(x, {8, 8}, true),
+      1e-4, 1e-5);
+
+  // Multi-channel with a channel count that pads the last texel.
+  Tensor m = tpx_ops::arange(48., DType::Float32).reshape({1, 3, 4, 4});
+  vulkan_test::expect_allclose(
+      tpx_ops::upsample_bilinear2d(vk(m), {6, 6}, false)
+          .to(Device(DeviceType::CPU)),
+      tpx_ops::upsample_bilinear2d(m, {6, 6}, false),
+      1e-4, 1e-5);
+}
+
+TEST_F(VulkanExtendedOpTest, ComparisonOpsMatchCpu) {
+  Tensor a = tpx_ops::arange(12., DType::Float32).reshape({3, 4});
+  Tensor b = tpx_ops::full({3, 4}, 6.);
+
+  vulkan_test::expect_allclose(
+      tpx_ops::eq(vk(a), vk(b)).to(Device(DeviceType::CPU)).to(DType::Float32),
+      tpx_ops::eq(a, b).to(DType::Float32));
+  vulkan_test::expect_allclose(
+      tpx_ops::lt(vk(a), vk(b)).to(Device(DeviceType::CPU)).to(DType::Float32),
+      tpx_ops::lt(a, b).to(DType::Float32));
+  vulkan_test::expect_allclose(
+      tpx_ops::gt(vk(a), vk(b)).to(Device(DeviceType::CPU)).to(DType::Float32),
+      tpx_ops::gt(a, b).to(DType::Float32));
+  vulkan_test::expect_allclose(
+      tpx_ops::ge(vk(a), vk(b)).to(Device(DeviceType::CPU)).to(DType::Float32),
+      tpx_ops::ge(a, b).to(DType::Float32));
+
+  // Scalar forms fold into tensors internally.
+  vulkan_test::expect_allclose(
+      tpx_ops::eq(vk(a), Scalar(5.)).to(Device(DeviceType::CPU))
+          .to(DType::Float32),
+      tpx_ops::eq(a, Scalar(5.)).to(DType::Float32));
+  vulkan_test::expect_allclose(
+      tpx_ops::lt(vk(a), Scalar(5.5)).to(Device(DeviceType::CPU))
+          .to(DType::Float32),
+      tpx_ops::lt(a, Scalar(5.5)).to(DType::Float32));
+}
+
+TEST_F(VulkanExtendedOpTest, WhereMatchesCpu) {
+  Tensor cond_cpu = tpx_ops::lt(
+      tpx_ops::arange(12., DType::Float32), Scalar(6.)).reshape({3, 4});
+  Tensor x = tpx_ops::arange(12., DType::Float32).mul(Scalar(10.)).reshape({3, 4});
+  Tensor y = tpx_ops::full({3, 4}, -1.);
+
+  vulkan_test::expect_allclose(
+      tpx_ops::where(vk(cond_cpu), vk(x), vk(y)).to(Device(DeviceType::CPU)),
+      tpx_ops::where(cond_cpu, x, y));
+
+  // Scalar variants fold into tensors internally.
+  vulkan_test::expect_allclose(
+      tpx_ops::where(vk(cond_cpu), Scalar(3.), vk(y)).to(Device(DeviceType::CPU)),
+      tpx_ops::where(cond_cpu, Scalar(3.), y));
+  vulkan_test::expect_allclose(
+      tpx_ops::where(vk(cond_cpu), vk(x), Scalar(-7.)).to(Device(DeviceType::CPU)),
+      tpx_ops::where(cond_cpu, x, Scalar(-7.)));
+}
+
+TEST_F(VulkanExtendedOpTest, EmbeddingMatchesCpu) {
+  Tensor weight = tpx_ops::arange(40., DType::Float32).reshape({8, 5});
+  // The index payload is uploaded through a host-side narrow to Int32 (the
+  // backend texture vocabulary has no 8-byte element), so keep the test
+  // indices on the CPU and let the kernel pick them up.
+  Tensor indices = Tensor::tensor(
+      std::vector<float>{0.f, 3.f, 7.f, 1.f, 3.f}).to(DType::Int64);
+
+  vulkan_test::expect_allclose(
+      tpx_ops::embedding(vk(weight), indices).to(Device(DeviceType::CPU)),
+      tpx_ops::embedding(weight, indices));
+}
+
+TEST_F(VulkanExtendedOpTest, IndexSelectMatchesCpu) {
+  Tensor x = tpx_ops::arange(40., DType::Float32).reshape({8, 5});
+  Tensor idx = Tensor::tensor(
+      std::vector<float>{2.f, 0.f, 7.f, 2.f}).to(DType::Int64);
+
+  vulkan_test::expect_allclose(
+      tpx_ops::index_select(vk(x), 0, idx).to(Device(DeviceType::CPU)),
+      tpx_ops::index_select(x, 0, idx));
+
+  // 1-d row selection.
+  Tensor v = tpx_ops::arange(6., DType::Float32);
+  Tensor iv = Tensor::tensor(std::vector<float>{4.f, 1.f}).to(DType::Int64);
+  vulkan_test::expect_allclose(
+      tpx_ops::index_select(vk(v), 0, iv).to(Device(DeviceType::CPU)),
+      tpx_ops::index_select(v, 0, iv));
+}
+
+
 TEST_F(VulkanExtendedOpTest, QuantizedQuint8Roundtrip) {
   Tensor x = tpx_ops::arange(12., DType::Float32).sub(Scalar(5.)).div(Scalar(2.));
   const double scale = 0.1;
@@ -1021,6 +1206,145 @@ TEST_F(VulkanExtendedOpTest, QuantizeRoundtrip) {
   vulkan_test::expect_allclose(
       back, tpx_ops::dequantize_per_tensor(
                 tpx_ops::quantize_per_tensor(x, scale, zp), scale, zp));
+}
+
+TEST_F(VulkanExtendedOpTest, SumAndMeanWholeTensor) {
+  Tensor x = tpx_ops::arange(24., DType::Float32).reshape({2, 3, 4});
+
+  vulkan_test::expect_allclose(
+      tpx_ops::sum(vk(x)).to(Device(DeviceType::CPU)), tpx_ops::sum(x));
+  vulkan_test::expect_allclose(
+      tpx_ops::mean(vk(x)).to(Device(DeviceType::CPU)), tpx_ops::mean(x));
+  EXPECT_EQ(
+      tpx_ops::sum(vk(x)).item().to<double>(), 276.0);
+}
+
+TEST_F(VulkanExtendedOpTest, ItemScalarRead) {
+  Tensor x = tpx_ops::arange(6., DType::Float32).reshape({2, 3});
+  Tensor picked = tpx_ops::select(vk(x), 0, 1);
+  EXPECT_EQ(picked.size(0), 3);
+  EXPECT_EQ(
+      tpx_ops::sum(vk(x)).item().to<double>(), 15.0);
+
+  Tensor zero_dim = tpx_ops::full({}, 3.5, DType::Float32);
+  Tensor vk_zero_dim = vk(zero_dim);
+  EXPECT_EQ(vk_zero_dim.item().to<double>(), 3.5);
+}
+
+TEST_F(VulkanExtendedOpTest, RandomLikeFactories) {
+  Tensor x = tpx_ops::arange(6., DType::Float32).reshape({2, 3});
+
+  Tensor r = tpx_ops::rand_like(vk(x));
+  Tensor host_r = r.to(Device(DeviceType::CPU));
+  const float* r_data = static_cast<const float*>(host_r.impl()->storage().data());
+  for (int64_t i = 0; i < host_r.numel(); ++i) {
+    ASSERT_GE(r_data[i], 0.0f);
+    ASSERT_LT(r_data[i], 1.0f);
+  }
+
+  Tensor n = tpx_ops::randn_like(vk(x)).to(Device(DeviceType::CPU));
+  const float* n_data = static_cast<const float*>(n.impl()->storage().data());
+  double sum = 0.0;
+  for (int64_t i = 0; i < n.numel(); ++i) {
+    sum += n_data[i];
+  }
+  EXPECT_NEAR(sum / n.numel(), 0.0, 1.0);
+}
+
+TEST_F(VulkanExtendedOpTest, RepeatAndTile) {
+  Tensor x = tpx_ops::arange(6., DType::Float32).reshape({2, 3});
+
+  vulkan_test::expect_allclose(
+      tpx_ops::repeat(vk(x), {2, 2, 1}).to(Device(DeviceType::CPU)),
+      tpx_ops::repeat(x, {2, 2, 1}));
+  vulkan_test::expect_allclose(
+      tpx_ops::tile(vk(x), {2, 1}).to(Device(DeviceType::CPU)),
+      tpx_ops::tile(x, {2, 1}));
+  vulkan_test::expect_allclose(
+      tpx_ops::tile(vk(x), {2}).to(Device(DeviceType::CPU)),
+      tpx_ops::tile(x, {2}));
+}
+
+TEST_F(VulkanExtendedOpTest, InplaceUnaryVariants) {
+  Tensor x = tpx_ops::arange(6., DType::Float32).reshape({2, 3});
+
+  Tensor a = vk(x);
+  tpx_ops::abs_(a);
+  vulkan_test::expect_allclose(a.to(Device(DeviceType::CPU)), tpx_ops::abs(x));
+
+  Tensor t = vk(x);
+  tpx_ops::tanh_(t);
+  vulkan_test::expect_allclose(t.to(Device(DeviceType::CPU)), tpx_ops::tanh(x));
+
+  Tensor s = vk(x);
+  tpx_ops::sigmoid_(s);
+  vulkan_test::expect_allclose(s.to(Device(DeviceType::CPU)), tpx_ops::sigmoid(x));
+}
+
+TEST_F(VulkanExtendedOpTest, HardtanhViaClamp) {
+  Tensor x = tpx_ops::arange(6., DType::Float32).reshape({2, 3});
+
+  vulkan_test::expect_allclose(
+      tpx_ops::hardtanh(vk(x), -1.0, 4.0).to(Device(DeviceType::CPU)),
+      tpx_ops::hardtanh(x, -1.0, 4.0));
+
+  Tensor h = vk(x);
+  tpx_ops::hardtanh_(h, -1.0, 4.0);
+  vulkan_test::expect_allclose(
+      h.to(Device(DeviceType::CPU)),
+      tpx_ops::hardtanh(x, -1.0, 4.0));
+}
+
+TEST_F(VulkanExtendedOpTest, PowVariants) {
+  Tensor x = tpx_ops::arange(1., 7., DType::Float32).reshape({2, 3});
+
+  // Scalar base, tensor exponent.
+  vulkan_test::expect_allclose(
+      tpx_ops::pow(Scalar(2.0), vk(x)).to(Device(DeviceType::CPU)),
+      tpx_ops::pow(Scalar(2.0), x));
+  // Base of 1 short-circuits to ones.
+  vulkan_test::expect_allclose(
+      tpx_ops::pow(Scalar(1.0), vk(x)).to(Device(DeviceType::CPU)),
+      tpx_ops::pow(Scalar(1.0), x));
+
+  // In-place with a scalar exponent.
+  Tensor p = vk(x);
+  tpx_ops::pow_(p, Scalar(2.0));
+  vulkan_test::expect_allclose(
+      p.to(Device(DeviceType::CPU)), tpx_ops::pow(x, Scalar(2.0)));
+
+  // In-place with a tensor exponent.
+  Tensor e = tpx_ops::full({2, 3}, 3.0, DType::Float32);
+  Tensor q = vk(x);
+  tpx_ops::pow_(q, vk(e));
+  vulkan_test::expect_allclose(q.to(Device(DeviceType::CPU)), tpx_ops::pow(x, e));
+}
+
+TEST_F(VulkanExtendedOpTest, BaddbmmScaledBatchedAdd) {
+  Tensor b1 = tpx_ops::arange(12., DType::Float32).reshape({2, 2, 3});
+  Tensor b2 = tpx_ops::arange(12., DType::Float32).reshape({2, 3, 2});
+
+  Tensor bias3 = tpx_ops::ones({2, 2, 2}, DType::Float32);
+  vulkan_test::expect_allclose(
+      tpx_ops::baddbmm(vk(bias3), vk(b1), vk(b2), Scalar(3.0), Scalar(2.0))
+          .to(Device(DeviceType::CPU)),
+      tpx_ops::baddbmm(bias3, b1, b2, Scalar(3.0), Scalar(2.0)));
+
+  Tensor bias1 = tpx_ops::ones({2}, DType::Float32);
+  vulkan_test::expect_allclose(
+      tpx_ops::baddbmm(vk(bias1), vk(b1), vk(b2)).to(Device(DeviceType::CPU)),
+      tpx_ops::baddbmm(bias1, b1, b2));
+
+  Tensor bias2 = tpx_ops::arange(4., DType::Float32).reshape({2, 2});
+  vulkan_test::expect_allclose(
+      tpx_ops::baddbmm(vk(bias2), vk(b1), vk(b2)).to(Device(DeviceType::CPU)),
+      tpx_ops::baddbmm(bias2, b1, b2));
+
+  // beta = 0 ignores the addend entirely.
+  vulkan_test::expect_allclose(
+      tpx_ops::baddbmm(vk(bias3), vk(b1), vk(b2), Scalar(0.0), Scalar(1.0))
+          .to(Device(DeviceType::CPU)),
+      tpx_ops::baddbmm(bias3, b1, b2, Scalar(0.0), Scalar(1.0)));
 }
 
 } // namespace

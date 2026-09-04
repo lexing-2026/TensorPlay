@@ -50,6 +50,20 @@ bool record_buffer_to_nchw_op(
     api::PipelineBarrier& pipeline_barrier,
     VkFence fence_handle);
 
+//
+// GPU-side relayout: moves the tensor payload between the packed-layout
+// encodings without leaving the device.  Each returns a new texture-backed
+// vTensor with the same logical sizes but the requested packed layout.
+// Kernels that reduce along the K axis consume these encodings directly
+// (one texel lane per reduction step).
+//
+
+api::vTensor convert_image_channels_packed_to_width_packed(
+    const api::vTensor& v_input);
+
+api::vTensor convert_image_channels_packed_to_height_packed(
+    const api::vTensor& v_input);
+
 } // namespace packing
 } // namespace vulkan
 } // namespace tensorplay

@@ -183,28 +183,56 @@ Tensor abs_kernel(const Tensor& self) {
   return unary_op(self, VK_KERNEL(abs), "buffer_abs");
 }
 
+Tensor& abs_inplace_kernel(Tensor& self) {
+  return unary_op_(self, VK_KERNEL(absinplace), "buffer_absinplace");
+}
+
 Tensor neg_kernel(const Tensor& self) {
   return unary_op(self, VK_KERNEL(neg), "buffer_neg");
+}
+
+Tensor& neg_inplace_kernel(Tensor& self) {
+  return unary_op_(self, VK_KERNEL(neginplace), "buffer_neginplace");
 }
 
 Tensor floor_kernel(const Tensor& self) {
   return unary_op(self, VK_KERNEL(floor), "buffer_floor");
 }
 
+Tensor& floor_inplace_kernel(Tensor& self) {
+  return unary_op_(self, VK_KERNEL(floorinplace), "buffer_floorinplace");
+}
+
 Tensor sin_kernel(const Tensor& self) {
   return unary_op(self, VK_KERNEL(sin), "buffer_sin");
+}
+
+Tensor& sin_inplace_kernel(Tensor& self) {
+  return unary_op_(self, VK_KERNEL(sininplace), "buffer_sininplace");
 }
 
 Tensor cos_kernel(const Tensor& self) {
   return unary_op(self, VK_KERNEL(cos), "buffer_cos");
 }
 
+Tensor& cos_inplace_kernel(Tensor& self) {
+  return unary_op_(self, VK_KERNEL(cosinplace), "buffer_cosinplace");
+}
+
 Tensor tanh_kernel(const Tensor& self) {
   return unary_op(self, VK_KERNEL(tanh), "buffer_tanh");
 }
 
+Tensor& tanh_inplace_kernel(Tensor& self) {
+  return unary_op_(self, VK_KERNEL(tanhinplace), "buffer_tanhinplace");
+}
+
 Tensor sigmoid_kernel(const Tensor& self) {
   return unary_op(self, VK_KERNEL(sigmoid), "buffer_sigmoid");
+}
+
+Tensor& sigmoid_inplace_kernel(Tensor& self) {
+  return unary_op_(self, VK_KERNEL(sigmoidinplace), "buffer_sigmoidinplace");
 }
 
 Tensor relu_kernel(const Tensor& self) {
@@ -231,12 +259,19 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, UnaryOpKernels) {
   m.impl("log", &tensorplay::vulkan::ops::log_kernel);
   m.impl("log_", &tensorplay::vulkan::ops::log_inplace_kernel);
   m.impl("abs", &tensorplay::vulkan::ops::abs_kernel);
+  m.impl("abs_", &tensorplay::vulkan::ops::abs_inplace_kernel);
   m.impl("neg", &tensorplay::vulkan::ops::neg_kernel);
+  m.impl("neg_", &tensorplay::vulkan::ops::neg_inplace_kernel);
   m.impl("floor", &tensorplay::vulkan::ops::floor_kernel);
+  m.impl("floor_", &tensorplay::vulkan::ops::floor_inplace_kernel);
   m.impl("sin", &tensorplay::vulkan::ops::sin_kernel);
+  m.impl("sin_", &tensorplay::vulkan::ops::sin_inplace_kernel);
   m.impl("cos", &tensorplay::vulkan::ops::cos_kernel);
+  m.impl("cos_", &tensorplay::vulkan::ops::cos_inplace_kernel);
   m.impl("tanh", &tensorplay::vulkan::ops::tanh_kernel);
+  m.impl("tanh_", &tensorplay::vulkan::ops::tanh_inplace_kernel);
   m.impl("sigmoid", &tensorplay::vulkan::ops::sigmoid_kernel);
+  m.impl("sigmoid_", &tensorplay::vulkan::ops::sigmoid_inplace_kernel);
   m.impl("relu", &tensorplay::vulkan::ops::relu_kernel);
   m.impl("relu_", &tensorplay::vulkan::ops::relu_inplace_kernel);
   m.impl("rsqrt", &tensorplay::vulkan::ops::rsqrt_kernel);

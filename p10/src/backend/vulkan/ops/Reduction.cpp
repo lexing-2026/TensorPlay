@@ -3,9 +3,11 @@
 #include "Blocks.h"
 #include "Common.h"
 #include "Convert.h"
+#include "Factory.h"
 #include "Utils.h"
 
 #include <algorithm>
+#include <cmath>
 #include <optional>
 #include <set>
 #include <vector>
@@ -195,12 +197,13 @@ Tensor reduce_impl(
         current, axis, mean_mode, correction, var_mode);
   }
 
-  if (keepdim || self.dim() == 1) {
+  if (keepdim) {
     return current;
   }
 
   // Squeeze the reduced axes: fold consecutive length-one axes out of the
-  // shape and move the payload into the squeezed layout.
+  // shape and move the payload into the squeezed layout.  Reducing the only
+  // axis of a 1d input squeezes everything, producing a scalar (0d result).
   std::vector<int64_t> final_sizes;
   final_sizes.reserve(static_cast<size_t>(self.dim()));
   for (int64_t i = 0; i < self.dim(); ++i) {
@@ -208,6 +211,10 @@ Tensor reduce_impl(
     if (!reduced || current.size(i) != 1) {
       final_sizes.push_back(current.size(i));
     }
+  }
+
+  if (final_sizes.empty()) {
+    return repack_with_sizes(current, final_sizes);
   }
 
   return repack_with_sizes(current, std::move(final_sizes));
@@ -231,6 +238,122 @@ Tensor mean_dim_kernel(
     DType dtype) {
   (void)dtype;
   return reduce_impl(self, dims, keepdim, true, false, 0);
+}
+
+//
+// Whole-tensor reductions fold into the axis-wise path by listing every
+// axis in one call, exactly like the dim-listed entry points do.
+//
+Tensor sum_kernel(const Tensor& self, DType dtype) {
+  TP_CHECK(
+      self.dtype() == DType::Float32,
+      "Vulkan reductions support Float32 tensors only");
+  if (self.numel() == 0) {
+    return full_kernel(
+        {}, Scalar(0.0), DType::Float32, Device(DeviceType::Vulkan), false);
+  }
+  std::vector<int64_t> dims;
+  dims.reserve(static_cast<size_t>(self.dim()));
+  for (int64_t d = 0; d < self.dim(); ++d) {
+    dims.push_back(d);
+  }
+  return reduce_impl(self, dims, false, false, 0, 0);
+}
+
+Tensor mean_kernel(const Tensor& self, DType dtype) {
+  TP_CHECK(
+      self.dtype() == DType::Float32,
+      "Vulkan reductions support Float32 tensors only");
+  Tensor summed = sum_kernel(self, dtype);
+  return summed.mul(Scalar(1.0 / static_cast<double>(self.numel())));
+}
+
+//
+// Whole-tensor variance: the same two-pass composition the dim-listed
+// entry uses (keepdim mean, broadcast subtract, square, sum), with the
+// reduced span covering every axis.
+//
+Tensor var_kernel(const Tensor& self, int64_t correction) {
+  TP_CHECK(
+      self.dtype() == DType::Float32,
+      "Vulkan var supports Float32 tensors only");
+  TP_CHECK(self.dim() >= 1 && self.dim() <= 4, "Vulkan var: 1d to 4d only");
+  TP_CHECK(self.numel() > 0, "Vulkan var does not support empty tensors");
+
+  std::vector<int64_t> dims;
+  dims.reserve(static_cast<size_t>(self.dim()));
+  for (int64_t d = 0; d < self.dim(); ++d) {
+    dims.push_back(d);
+  }
+
+  const int64_t count = self.numel();
+  Tensor mean = reduce_impl(self, dims, /*keepdim=*/true, true, false, 0);
+  Tensor centered_sq = square(broadcast_sub(self, mean));
+  Tensor summed = reduce_impl(centered_sq, dims, false, false, false, 0);
+  const double denom =
+      static_cast<double>(std::max<int64_t>(count - correction, 1));
+  return summed.mul(Scalar(1.0 / denom));
+}
+
+Tensor std_kernel(const Tensor& self, int64_t correction) {
+  Tensor v = var_kernel(self, correction);
+  return v.sqrt();
+}
+
+//
+// p-norms: abs then pow(1/p) fold around the whole-tensor sum, matching
+// the norm formula the dim-listed CPU entry evaluates.  Infinite p needs
+// a max reduction the backend does not carry, so it is rejected.
+//
+Tensor norm_impl(const Tensor& self, double p) {
+  TP_CHECK(
+      self.dtype() == DType::Float32,
+      "Vulkan norm supports Float32 tensors only");
+  TP_CHECK(self.dim() >= 1 && self.dim() <= 4, "Vulkan norm: 1d to 4d only");
+  TP_CHECK(!std::isinf(p), "Vulkan norm: infinite p is not supported");
+
+  Tensor reduced;
+  if (p == 2.0) {
+    Tensor sq = self * self;
+    reduced = sum_kernel(sq, DType::Undefined);
+  } else if (p == 1.0) {
+    reduced = sum_kernel(self.abs(), DType::Undefined);
+  } else {
+    Tensor powered = self.abs().pow(Scalar(p));
+    reduced = sum_kernel(powered, DType::Undefined);
+    return reduced.pow(Scalar(1.0 / p));
+  }
+  return reduced.sqrt();
+}
+
+Tensor norm_kernel(const Tensor& self, double p) {
+  return norm_impl(self, p);
+}
+
+Tensor norm_dim_kernel(
+    const Tensor& self,
+    const std::vector<int64_t>& dims,
+    double p,
+    bool keepdim) {
+  TP_CHECK(
+      self.dtype() == DType::Float32,
+      "Vulkan norm supports Float32 tensors only");
+  TP_CHECK(self.dim() >= 1 && self.dim() <= 4, "Vulkan norm: 1d to 4d only");
+  TP_CHECK(!std::isinf(p), "Vulkan norm: infinite p is not supported");
+  TP_CHECK(!dims.empty(), "Vulkan norm requires at least one dim");
+
+  Tensor reduced;
+  if (p == 2.0) {
+    Tensor sq = self * self;
+    reduced = reduce_impl(sq, dims, keepdim, false, false, 0);
+  } else if (p == 1.0) {
+    reduced = reduce_impl(self.abs(), dims, keepdim, false, false, 0);
+  } else {
+    Tensor powered = self.abs().pow(Scalar(p));
+    reduced = reduce_impl(powered, dims, keepdim, false, false, 0);
+    return reduced.pow(Scalar(1.0 / p));
+  }
+  return reduced.sqrt();
 }
 
 namespace {
@@ -362,10 +485,16 @@ Tensor std_dim_kernel(
 } // namespace tensorplay
 
 TENSORPLAY_LIBRARY_IMPL(Vulkan, ReductionKernels) {
+  m.impl("sum", &tensorplay::vulkan::ops::sum_kernel);
   m.impl("sum.dim_IntList", &tensorplay::vulkan::ops::sum_dim_kernel);
+  m.impl("mean", &tensorplay::vulkan::ops::mean_kernel);
   m.impl("mean.dim", &tensorplay::vulkan::ops::mean_dim_kernel);
   m.impl("var.dim", &tensorplay::vulkan::ops::var_dim_kernel);
   m.impl("std.dim", &tensorplay::vulkan::ops::std_dim_kernel);
+  m.impl("var", &tensorplay::vulkan::ops::var_kernel);
+  m.impl("std", &tensorplay::vulkan::ops::std_kernel);
+  m.impl("norm", &tensorplay::vulkan::ops::norm_kernel);
+  m.impl("norm.dim", &tensorplay::vulkan::ops::norm_dim_kernel);
 }
 
 #endif /* USE_VULKAN */

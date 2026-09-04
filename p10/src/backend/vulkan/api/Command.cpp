@@ -358,13 +358,18 @@ VkCommandBuffer CommandBuffer::get_submit_handle(const bool final_use) {
       "Vulkan CommandBuffer: requested submit handle with a command buffer "
       "in the wrong state!");
 
-  if (final_use) {
-    flags_ |= VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  }
+  const VkCommandBuffer handle = handle_;
 
+  // Buffers handed out for one-time use (the default) are detached from the
+  // Context after submission: the next recording must start on a fresh
+  // buffer because recording into an ended VkCommandBuffer is invalid.  The
+  // pool recycles the underlying resource at flush time.
+  if (!is_reusable() || final_use) {
+    invalidate();
+  }
   state_ = CommandBuffer::State::SUBMITTED;
 
-  return handle_;
+  return handle;
 }
 
 //

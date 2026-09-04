@@ -3,6 +3,7 @@
 #include "Blocks.h"
 #include "Common.h"
 #include "Convert.h"
+#include "Factory.h"
 #include "Utils.h"
 
 #include "../api/Context.h"
@@ -235,6 +236,46 @@ Tensor& bernoulli_tensor_kernel(
   return self;
 }
 
+/*
+ * *_like factories: clone the source (same sizes, dtype and device), then
+ * refill the clone in place from the random stream.  dtype/device overrides
+ * fall back to the generic factory path, matching the public *_like contract
+ * for non-defaulted arguments.
+ */
+Tensor rand_like_kernel(
+    const Tensor& self,
+    DType dtype,
+    std::optional<Device> device) {
+  TP_CHECK(
+      dtype == DType::Undefined || dtype == DType::Float32,
+      "Vulkan rand_like supports Float32 tensors only");
+  TP_CHECK(
+      !device.has_value() || device->is_vulkan(),
+      "Vulkan rand_like expects a Vulkan device");
+  if (dtype != DType::Undefined || (device.has_value() && !device->is_vulkan())) {
+    return full_like_kernel(self, Scalar(0.0), dtype, device);
+  }
+  Tensor out = self.clone();
+  return uniform_kernel(out, 0.0, 1.0, std::nullopt);
+}
+
+Tensor randn_like_kernel(
+    const Tensor& self,
+    DType dtype,
+    std::optional<Device> device) {
+  TP_CHECK(
+      dtype == DType::Undefined || dtype == DType::Float32,
+      "Vulkan randn_like supports Float32 tensors only");
+  TP_CHECK(
+      !device.has_value() || device->is_vulkan(),
+      "Vulkan randn_like expects a Vulkan device");
+  if (dtype != DType::Undefined || (device.has_value() && !device->is_vulkan())) {
+    return full_like_kernel(self, Scalar(0.0), dtype, device);
+  }
+  Tensor out = self.clone();
+  return normal_kernel(out, 0.0, 1.0, std::nullopt);
+}
+
 } // namespace ops
 } // namespace vulkan
 } // namespace tensorplay
@@ -244,6 +285,8 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, RandomKernels) {
   m.impl("normal_", &tensorplay::vulkan::ops::normal_kernel);
   m.impl("bernoulli_.float", &tensorplay::vulkan::ops::bernoulli_scalar_kernel);
   m.impl("bernoulli_.Tensor", &tensorplay::vulkan::ops::bernoulli_tensor_kernel);
+  m.impl("rand_like", &tensorplay::vulkan::ops::rand_like_kernel);
+  m.impl("randn_like", &tensorplay::vulkan::ops::randn_like_kernel);
 }
 
 #endif /* USE_VULKAN */

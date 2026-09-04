@@ -1,5 +1,6 @@
 #ifdef USE_VULKAN
 
+#include "Blocks.h"
 #include "Common.h"
 #include "Convert.h"
 #include "../api/Context.h"
