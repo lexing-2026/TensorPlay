@@ -7,8 +7,8 @@ from collections.abc import Mapping
 from typing import Any, Callable
 
 from ..graph import GraphCaptureError, GraphModule, Node, Proxy, Tracer
-from .dynamic_shapes import AdditionalInputs, Dim, ShapesCollection, _DimHint
-from .exported_program import ExportedProgram, ModuleCallEntry, ModuleCallSignature
+from .dynamic_shapes import AdditionalInputs, ConstraintsExceededError, Dim, ShapesCollection, _DimHint
+from .exported_program import EqualityConstraint, ExportedProgram, ModuleCallEntry, ModuleCallSignature
 from .graph_signature import (
     ConstantArgument,
     ExportGraphSignature,
@@ -355,20 +355,38 @@ def _flatten_leaves(value: Any) -> list[Any]:
 
 
 def _mutation_chain_root(node: Node) -> Node:
-    """Walk in-place op chains back to the state holder they started from."""
+    """Walk in-place op and element-read chains back to the state holder.
+
+    Two hop rules apply: in-place methods (``add_``) consume the previous
+    value of the object they update, and ``getitem`` reads reach into a
+    container that itself entered the graph as one placeholder.  Hopping
+    through both attributes an element update to the container input.
+    """
+
+    import operator
 
     seen: set[int] = set()
     current = node
-    while (
-        id(current) not in seen
-        and current.op == "call_method"
-        and isinstance(current.target, str)
-        and current.target.endswith("_")
-        and current.args
-        and isinstance(current.args[0], Node)
-    ):
+    while id(current) not in seen:
         seen.add(id(current))
-        current = current.args[0]
+        if (
+            current.op == "call_method"
+            and isinstance(current.target, str)
+            and current.target.endswith("_")
+            and current.args
+            and isinstance(current.args[0], Node)
+        ):
+            current = current.args[0]
+            continue
+        if (
+            current.op == "call_function"
+            and current.target is operator.getitem
+            and current.args
+            and isinstance(current.args[0], Node)
+        ):
+            current = current.args[0]
+            continue
+        break
     return current
 
 
@@ -382,9 +400,13 @@ def _detect_mutations(
     node carrying the final value of the mutated object.
     """
 
+    state_by_placeholder: dict[str, tuple[str, str, bool]] = {
+        node.name: (target, kind, persistent)
+        for target, (node, kind, persistent) in state_targets.items()
+    }
     holders: dict[str, tuple[OutputKind, str | None]] = {}
     for node in graph_module.graph.placeholders:
-        entry = _state_entry_for_placeholder(state_targets, node.name)
+        entry = state_by_placeholder.get(node.name)
         if entry is not None:
             _target, kind, _persistent = entry
             holders[node.name] = (
@@ -407,7 +429,13 @@ def _detect_mutations(
         info = holders.get(root.name)
         if info is None:
             continue
-        mutations[node.name] = (node, info[0], info[1])
+        # only a container element (getitem chain) may update a user input;
+        # a direct in-place call on a whole input tensor is graph-invisible
+        # by construction because capture runs on value copies
+        if info[0] is OutputKind.USER_INPUT_MUTATION and root is node.args[0]:
+            continue
+        target = info[1] if info[1] is not None else root.name
+        mutations[node.name] = (node, info[0], target)
     return list(mutations.values())
 
 
@@ -419,6 +447,77 @@ def _state_entry_for_placeholder(
         if node.name == placeholder_name:
             return target, kind, persistent
     return None
+
+
+def _state_map_for_placeholders(
+    state_targets: Mapping[str, tuple[Node, str, bool]],
+) -> dict[str, tuple[str, str, bool]]:
+    """Placeholder-name-keyed view of the lifted-state table.
+
+    Signature construction visits placeholders in graph order; a name-keyed
+    map keeps that walk linear instead of scanning the state table per node.
+    """
+
+    return {
+        node.name: (target, kind, persistent)
+        for target, (node, kind, persistent) in state_targets.items()
+    }
+
+
+def _rewrite_container_reads(
+    graph_module: GraphModule,
+    mutations: list[tuple[Node, OutputKind, str | None]],
+) -> None:
+    """Point element reads after a mutation at the mutated value.
+
+    A second ``items[0]`` read records its own getitem node; without this
+    rewrite it would observe the pre-mutation element and diverge from eager
+    execution, where both reads return the same object.
+    """
+
+    import operator
+
+    if not mutations:
+        return
+    graph = graph_module.graph
+    order = {node.name: position for position, node in enumerate(graph.nodes)}
+    finals: dict[tuple[str, int], Node] = {}
+    for node, _kind, _target in mutations:
+        current = node
+        container: Node | None = None
+        index: int | None = None
+        while True:
+            if (
+                current.op == "call_function"
+                and current.target is operator.getitem
+                and current.args
+                and isinstance(current.args[0], Node)
+            ):
+                if index is None and len(current.args) > 1 and isinstance(current.args[1], int):
+                    container = current.args[0]
+                    index = current.args[1]
+                current = current.args[0]
+                continue
+            break
+        if container is not None and index is not None:
+            finals[(container.name, index)] = node
+    if not finals:
+        return
+    for read in list(graph.nodes):
+        if read.op != "call_function" or read.target is not operator.getitem:
+            continue
+        if len(read.args) != 2 or not isinstance(read.args[0], Node):
+            continue
+        key = (read.args[0].name, read.args[1]) if isinstance(read.args[1], int) else None
+        final = finals.get(key) if key is not None else None
+        if final is None or final is read:
+            continue
+        if order.get(final.name, -1) >= order.get(read.name, 1 << 30):
+            # the read happens before the mutation; it keeps the old value
+            continue
+        read.replace_all_uses_with(final)
+        if not read.users:
+            graph.erase_node(read)
 
 
 def _output_specs(
@@ -463,7 +562,7 @@ def _restructure_output(
 def _assert_dim_range(tensor: Any, index: int, min: Any, max: Any, name: str) -> Any:
     size = tuple(tensor.shape)[index]
     if (min is not None and size < min) or (max is not None and size > max):
-        raise RuntimeError(
+        raise ConstraintsExceededError(
             f"runtime assertion failed for {name!r}: expected dimension {index} "
             f"in [{min if min is not None else '-inf'}, {max if max is not None else 'inf'}], "
             f"got {size}"
@@ -475,7 +574,7 @@ def _assert_dims_equal(tensor_a: Any, index_a: int, tensor_b: Any, index_b: int,
     size_a = tuple(tensor_a.shape)[index_a]
     size_b = tuple(tensor_b.shape)[index_b]
     if size_a != size_b:
-        raise RuntimeError(
+        raise ConstraintsExceededError(
             f"runtime assertion failed for {name!r}: dimensions "
             f"{index_a} and {index_b} must agree, got {size_a} and {size_b}"
         )
@@ -495,7 +594,7 @@ def _assert_dim_relation(
     size_derived = tuple(tensor_derived.shape)[index_derived]
     expected = scale * size_root + offset
     if size_derived != expected:
-        raise RuntimeError(
+        raise ConstraintsExceededError(
             f"runtime assertion failed for {name!r}: expected dimension "
             f"{index_derived} == {scale} * dim {index_root} + {offset} "
             f"({expected}), got {size_derived}"
@@ -507,21 +606,55 @@ def _apply_dynamic_shape_constraints(
     graph_module: GraphModule,
     combined_args: Mapping[str, Any],
     normalized: Mapping[str, Any],
-) -> dict[str, dict[str, int | None]]:
-    """Validate the spec, insert runtime assertions, and report range bounds."""
+) -> tuple[dict[str, dict[str, int | None]], list[EqualityConstraint]]:
+    """Validate the spec, insert runtime assertions, and describe shared dims.
+
+    Returns the per-name range bounds and one equality record per named
+    dimension that appears at more than one input site (shared dims must hold
+    equal sizes across those sites at runtime).
+    """
 
     from .dynamic_shapes import _constraint_program, _process_dynamic_shapes
+    from .dim_constraints import DimConstraints, attach_observed_sizes
 
     constraints = _process_dynamic_shapes(combined_args, normalized)
     if not constraints:
-        return {}
+        return {}, []
+
+    # strict checks first: contradictory range declarations for one name are
+    # specification errors regardless of the example inputs
     asserts, ranges = _constraint_program(constraints)
+
+    solver = DimConstraints()
+    for constraint, observed in attach_observed_sizes(constraints, combined_args, normalized):
+        solver.add(constraint, observed)
+    if not solver.solve():
+        raise ConstraintsExceededError(
+            "export-time dimension constraints are inconsistent:\n"
+            + solver.pretty_print()
+        )
+
     placeholders = {node.name: node for node in graph_module.graph.placeholders}
     identity_to_name = {
         id(value): name
         for name, value in combined_args.items()
         if not isinstance(value, (dict, list, tuple))
     }
+
+    # one equality record per name spanning several distinct input sites
+    site_pairs: dict[str, set[tuple[str, int]]] = {}
+    for constraint in constraints:
+        if constraint.name is None:
+            continue
+        input_name = identity_to_name.get(id(constraint.source))
+        if input_name is None:
+            continue
+        site_pairs.setdefault(constraint.name, set()).add((input_name, constraint.dim))
+    equality_constraints = [
+        EqualityConstraint(tuple(sorted(pairs, key=repr)), name=name)
+        for name, pairs in site_pairs.items()
+        if len(pairs) > 1
+    ]
 
     def node_of(source: Any) -> Node | None:
         name = identity_to_name.get(id(source))
@@ -583,7 +716,7 @@ def _apply_dynamic_shape_constraints(
                     constraint.name or f"dim {constraint.dim}",
                 ),
             )
-    return ranges
+    return ranges, equality_constraints
 
 
 def _graph_signature(
@@ -593,9 +726,10 @@ def _graph_signature(
 ) -> ExportGraphSignature:
     """Signature over the flat input contract: state first, then user inputs."""
 
+    state_by_placeholder = _state_map_for_placeholders(state_targets)
     inputs: list[InputSpec] = []
     for node in graph_module.graph.placeholders:
-        entry = _state_entry_for_placeholder(state_targets, node.name)
+        entry = state_by_placeholder.get(node.name)
         if entry is None:
             inputs.append(InputSpec(InputKind.USER_INPUT, TensorArgument(node.name), None))
             continue
@@ -731,9 +865,10 @@ def _capture(
 
     mutations = _detect_mutations(graph_module, tracer.state_targets)
     user_out_spec = tree_flatten(graph_module.graph.output_node.args[0])[1]
-    ranges = _apply_dynamic_shape_constraints(
+    ranges, equality_constraints = _apply_dynamic_shape_constraints(
         graph_module, _combine_args(model, args, kwargs), normalized
     )
+    _rewrite_container_reads(graph_module, mutations)
     _restructure_output(graph_module, mutations)
     if mutations or ranges:
         graph_module.recompile()
@@ -790,6 +925,7 @@ def _capture(
         dynamic_shapes=normalized,
         module_call_graph=calls,
         range_constraints=ranges,
+        equality_constraints=equality_constraints,
     )
     program.validate()
     return program

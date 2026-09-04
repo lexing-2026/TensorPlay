@@ -207,6 +207,63 @@ class ExportGraphSignature:
             if spec.kind is InputKind.CUSTOM_OBJ and isinstance(spec.target, str)
         )
 
+    # neutral aliases: tensor constants and custom objects live in the same
+    # input-spec table; callers may prefer the shorter names
+    @property
+    def constants(self) -> Collection[str]:
+        return self.lifted_tensor_constants
+
+    @property
+    def tensor_constants(self) -> Collection[str]:
+        return self.lifted_tensor_constants
+
+    @property
+    def custom_objs(self) -> Collection[str]:
+        return self.lifted_custom_objs
+
+    def is_param(self, name: str) -> bool:
+        """Whether ``name`` is a placeholder carrying a lifted parameter."""
+        return any(
+            spec.kind is InputKind.PARAMETER
+            and isinstance(spec.arg, TensorArgument)
+            and spec.arg.name == name
+            for spec in self.input_specs
+        )
+
+    def is_buffer(self, name: str) -> bool:
+        """Whether ``name`` is a placeholder carrying a lifted buffer."""
+        return any(
+            spec.kind is InputKind.BUFFER
+            and isinstance(spec.arg, TensorArgument)
+            and spec.arg.name == name
+            for spec in self.input_specs
+        )
+
+    def get_param_to_buffer(self) -> Mapping[str, str]:
+        """Map parameter targets to the buffer targets holding their gradients.
+
+        Gradients are declared as ``GRADIENT_TO_PARAMETER`` outputs; a gradient
+        for a parameter whose optimizer state lives in a buffer binds the two
+        targets under the parameter's FQN.
+        """
+        result: dict[str, str] = {}
+        gradient_targets = {
+            spec.target
+            for spec in self.output_specs
+            if spec.kind is OutputKind.GRADIENT_TO_PARAMETER and isinstance(spec.target, str)
+        }
+        if not gradient_targets:
+            return result
+        buffer_targets = {
+            spec.target
+            for spec in self.input_specs
+            if spec.kind is InputKind.BUFFER and isinstance(spec.target, str)
+        }
+        for target in gradient_targets:
+            if target in buffer_targets:
+                result[target] = target
+        return result
+
     @property
     def user_inputs(self) -> Collection[Any]:
         values: list[Any] = []
@@ -360,6 +417,23 @@ class ExportGraphSignature:
                 self.replace_all_uses(old.name, new)
 
         return hook
+
+    def clone(self) -> "ExportGraphSignature":
+        """Deep copy: specs and argument records are duplicated, not shared."""
+        return dataclasses.replace(
+            self,
+            input_specs=[
+                dataclasses.replace(spec, arg=dataclasses.replace(spec.arg))
+                for spec in self.input_specs
+            ],
+            output_specs=[
+                dataclasses.replace(spec, arg=dataclasses.replace(spec.arg))
+                for spec in self.output_specs
+            ],
+        )
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> "ExportGraphSignature":
+        return self.clone()
 
     def __str__(self) -> str:
         inputs = "\n".join(str(spec) for spec in self.input_specs)

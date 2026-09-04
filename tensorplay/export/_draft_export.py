@@ -107,8 +107,32 @@ class DraftExportReport:
             return "graph capture completed without recorded failures"
         return "\n".join(failure.print(self.str_to_filename) for failure in self.failures)
 
-    def apply_suggested_fixes(self) -> None:
-        raise NotImplementedError("automatic application of suggestions is unavailable")
+    def apply_suggested_fixes(self) -> Any:
+        """Re-export with dynamic shapes repaired from recorded suggestions.
+
+        Requires the report to carry the original capture inputs; refinement
+        reuses the textual fixes rendered by the dimension-constraint solver.
+        """
+
+        from .dynamic_shapes import refine_dynamic_shapes_from_suggested_fixes
+
+        capture = getattr(self, "_capture_inputs", None)
+        if capture is None:
+            raise RuntimeError(
+                "suggested fixes cannot be applied without the original capture inputs"
+            )
+        model, args, kwargs, dynamic_shapes = capture
+        refined = dynamic_shapes
+        for failure in self.failures:
+            message = failure.data.get("message", "")
+            if "Suggested fixes:" in message:
+                refined = refine_dynamic_shapes_from_suggested_fixes(message, refined)
+        self._capture_inputs = (model, args, kwargs, refined)
+        retry = draft_export(model, *args, dynamic_shapes=refined, **dict(kwargs))
+        if retry.success:
+            self.failures = []
+            self.exported_program = retry.exported_program
+        return self.exported_program
 
 
 @dataclass
@@ -133,7 +157,9 @@ class LogRecord:
 def draft_export(model: Any, *args: Any, dynamic_shapes: Any = None, **kwargs: Any) -> "DraftExportReport":
     """Capture a program, reporting failures instead of raising them.
 
-    On success the returned report carries the captured program.  When
+    On success the returned report carries the captured program, checked two
+    ways: structural validation of the graph, and a numerical comparison of
+    the captured program against eager execution on the example inputs.  When
     capture fails, the report records the failure and ``exported_program``
     stays ``None``; call ``raise_on_failure()`` to surface the errors.
     """
@@ -141,14 +167,90 @@ def draft_export(model: Any, *args: Any, dynamic_shapes: Any = None, **kwargs: A
     try:
         program = export(model, *args, dynamic_shapes=dynamic_shapes, **kwargs)
     except Exception as exc:
-        return DraftExportReport(
+        report = DraftExportReport(
             [FailureReport(FailureType.DATA_DEPENDENT_ERROR, {"message": str(exc)})]
         )
+        report._capture_inputs = (model, args, dict(kwargs), dynamic_shapes)
+        if "Suggested fixes:" in str(exc):
+            report.failures[0].xfail = False
+        return report
     report = DraftExportReport([], exported_program=program)
+    report._capture_inputs = (model, args, dict(kwargs), dynamic_shapes)
     try:
         program.validate()
     except Exception as exc:
         report.failures.append(
             FailureReport(FailureType.MISMATCHED_KERNEL, {"message": str(exc)})
         )
+    _compare_against_eager(report, program, model, args, kwargs)
     return report
+
+
+def _flatten_numbers(value: Any) -> list[Any]:
+    if isinstance(value, (tuple, list)):
+        leaves: list[Any] = []
+        for item in value:
+            leaves.extend(_flatten_numbers(item))
+        return leaves
+    if isinstance(value, dict):
+        leaves = []
+        for item in value.values():
+            leaves.extend(_flatten_numbers(item))
+        return leaves
+    return [value]
+
+
+def _values_match(reference: Any, candidate: Any, tolerance: float) -> bool:
+    left = _flatten_numbers(reference)
+    right = _flatten_numbers(candidate)
+    if len(left) != len(right):
+        return False
+    for expected, actual in zip(left, right):
+        if hasattr(expected, "shape") or hasattr(actual, "shape"):
+            try:
+                if tuple(expected.shape) != tuple(actual.shape):
+                    return False
+                delta = (expected - actual).abs().max().item()
+                scale = expected.abs().max().item()
+                if delta > tolerance * max(scale, 1.0):
+                    return False
+            except Exception:
+                if expected is not actual:
+                    return False
+        elif expected != actual:
+            return False
+    return True
+
+
+def _compare_against_eager(
+    report: "DraftExportReport",
+    program: Any,
+    model: Any,
+    args: tuple[Any, ...],
+    kwargs: Any,
+) -> None:
+    """Record a kernel-mismatch failure when graph and eager disagree."""
+
+    try:
+        eager = model(*args, **dict(kwargs))
+        captured = program(*args, **dict(kwargs))
+    except Exception as exc:
+        report.failures.append(
+            FailureReport(
+                FailureType.DATA_DEPENDENT_ERROR,
+                {"message": f"execution check failed: {exc}"},
+            )
+        )
+        return
+    if not _values_match(eager, captured, tolerance=1e-4):
+        report.failures.append(
+            FailureReport(
+                FailureType.MISMATCHED_KERNEL,
+                {
+                    "message": (
+                        "captured graph disagrees with eager execution on the "
+                        "example inputs"
+                    )
+                },
+            )
+        )

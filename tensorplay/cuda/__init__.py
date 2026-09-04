@@ -13,8 +13,7 @@ It is lazily initialized, so you can always import it, and use
 - legacy per-dtype ``Storage``/``Tensor`` classes are not provided
   (tensorplay has no typed storages);
 - ``cudart()`` returns ``None`` (no ctypes runtime binding is exposed);
-- RNG state introspection and graph capture raise descriptive errors until
-  the corresponding bindings land.
+- RNG state introspection and graph capture are provided by native bindings.
 """
 
 import os

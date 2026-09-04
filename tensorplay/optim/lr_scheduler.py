@@ -263,9 +263,9 @@ class LRScheduler:
             elif not getattr(self.optimizer, "_opt_called", False):
                 warnings.warn(
                     "Detected call of `lr_scheduler.step()` before `optimizer.step()`. "
-                    "`optimizer.step()` before `lr_scheduler.step()`.  Failure to do this "
-                    "See more details at "
-                    "the learning-rate scheduling documentation",
+                    "Call `optimizer.step()` before `lr_scheduler.step()`. Failure to do this "
+                    "will result in the first value of the learning-rate schedule being skipped. "
+                    "See more details at the learning-rate scheduling documentation",
                     UserWarning,
                     stacklevel=2,
                 )
@@ -1743,8 +1743,6 @@ class CyclicLR(LRScheduler):
     * "exp_range": A cycle that scales initial amplitude by :math:`\text{gamma}^{\text{cycle iterations}}`
       at each cycle iteration.
 
-    This implementation was adapted from the github repo: `bckenstler/CLR`_
-
     Args:
         optimizer (Optimizer): Wrapped optimizer.
         base_lr (float or list): Initial learning rate which is the
@@ -1818,7 +1816,6 @@ class CyclicLR(LRScheduler):
     .. image:: ../scripts/lr_scheduler_images/CyclicLR.png
 
     .. _Cyclical Learning Rates for Training Neural Networks: https://arxiv.org/abs/1506.01186
-    .. _bckenstler/CLR: https://github.com/bckenstler/CLR
     """
 
     def __init__(

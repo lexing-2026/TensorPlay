@@ -3,9 +3,31 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from enum import IntEnum
 from typing import Any
 
-__all__ = ["TensorProperties", "Weights", "get_complete_tensor", "group_weights"]
+__all__ = [
+    "TensorProperties",
+    "WeightType",
+    "Weights",
+    "get_complete_tensor",
+    "group_weights",
+]
+
+
+class WeightType(IntEnum):
+    """Role a packaged weight plays in the captured program."""
+
+    PARAMETER = 0
+    BUFFER = 1
+    OPTIONAL_STATE = 2
+    USER_INPUT = 3
+    USER_OUTPUT = 4
+    PARAMETER_MUTATION = 5
+    BUFFER_MUTATION = 6
+    USER_INPUT_MUTATION = 7
+    GRADIENT_TO_PARAMETER = 8
+    GRADIENT_TO_USER_INPUT = 9
 
 
 def _end_ptr(value: Any) -> int | None:

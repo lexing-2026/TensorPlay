@@ -21,7 +21,42 @@ __all__ = [
     "_get_make_file",
     "_remove_detach_pass",
     "_sticky_export",
+    "update_tensor_list_mutable",
 ]
+
+
+def update_tensor_list_mutable(
+    ep: ExportedProgram, mutable_from_list: Any = None
+) -> ExportedProgram:
+    """Normalize tensor-list mutation bookkeeping in a captured program.
+
+    Tensor lists flatten into per-element user inputs, so in-place element
+    updates already surface as user-input mutation outputs.  This helper
+    verifies that contract for every element of ``mutable_from_list`` and
+    returns the program unchanged when it holds; a mismatch raises, since a
+    silent repair would change what the graph writes back.
+    """
+
+    if mutable_from_list is None:
+        return ep
+    if not isinstance(mutable_from_list, (list, tuple)):
+        raise TypeError("mutable_from_list must be a list or tuple of tensors")
+    declared = {id(value) for value in mutable_from_list}
+    example_inputs = ep.example_inputs
+    for spec in ep.graph_signature.output_specs:
+        if spec.kind.name != "USER_INPUT_MUTATION":
+            continue
+        container_name = spec.target
+        example = example_inputs.get(container_name) if container_name else None
+        if example is None:
+            continue
+        container = example if isinstance(example, (list, tuple)) else (example,)
+        if all(id(item) not in declared for item in container):
+            raise ValueError(
+                f"mutation output {spec.arg.name!r} does not alias an element of "
+                f"mutable_from_list; the declared mutable list is incomplete"
+            )
+    return ep
 
 
 def _copy_graph_module_and_signature(ep: ExportedProgram) -> tuple[Any, ExportGraphSignature]:
@@ -36,7 +71,8 @@ def _remove_detach_pass(graph_module: Any, signature: ExportGraphSignature | Non
             node.replace_all_uses_with(node.args[0])
             if not node.users:
                 node.graph.erase_node(node)
-    graph_module.graph.eliminate_dead_code() if hasattr(graph_module.graph, "eliminate_dead_code") else None
+    if hasattr(graph_module.graph, "eliminate_dead_code"):
+        graph_module.graph.eliminate_dead_code()
     graph_module.recompile()
 
 

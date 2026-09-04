@@ -16,9 +16,30 @@ from warnings import warn
 import tensorplay
 from tensorplay import Tensor
 
+from .flex_attention import (
+    AuxOutput,
+    AuxRequest,
+    BlockMask,
+    and_masks,
+    create_block_mask,
+    create_mask,
+    flex_attention,
+    noop_mask,
+    or_masks,
+)
+
 __all__ = [
+    "AuxOutput",
+    "AuxRequest",
+    "BlockMask",
     "SDPBackend",
     "SDPParams",
+    "and_masks",
+    "create_block_mask",
+    "create_mask",
+    "flex_attention",
+    "noop_mask",
+    "or_masks",
     "sdpa_kernel",
     "WARN_FOR_UNFUSED_KERNELS",
     "_sdpa_kernel_variadic",
@@ -172,6 +193,8 @@ def _check_flash_eligibility(params: SDPParams, debug: bool = False):
         return False, f"unsupported dtype {q.dtype}"
     if q.dtype != k.dtype or q.dtype != v.dtype:
         return False, "query/key/value must share one dtype"
+    if q.size(-1) > 128:
+        return False, "head dimension > 128 exceeds the fused kernel limit"
     if k.shape != v.shape or k.shape[:-1] != q.shape[:-1]:
         return False, "query/key/value leading shapes must match"
     if params.need_attn_weights:

@@ -1,10 +1,8 @@
 # mypy: allow-untyped-defs
 r"""CUDA random-number generator helpers.
 
-Seeding APIs drive the per-device generators of the native runtime. State
-introspection (``get_rng_state``/``set_rng_state``) requires per-device
-generator bindings that this TensorPlay build does not expose yet;
-``initial_seed`` is tracked on the Python side.
+Seeding APIs and state serialization use the per-device generators of the
+native runtime.
 """
 
 from collections.abc import Iterable
@@ -16,6 +14,7 @@ import tensorplay
 from tensorplay import Tensor
 from tensorplay._C import _cuda as _lcuda
 
+from ._utils import _get_device_index
 from . import _lazy_call, _lazy_init, current_device, device_count, is_initialized
 
 
@@ -31,11 +30,6 @@ __all__ = [
     "initial_seed",
 ]
 
-# Python-side tracking of the latest seed applied to each device's generator,
-# used to implement initial_seed() until native generator handles are exposed.
-_initial_seeds: dict[int, int] = {}
-
-
 def get_rng_state(device: int | str | Any = "cuda") -> Tensor:
     r"""Return the random number generator state of the specified GPU as a ByteTensor.
 
@@ -46,10 +40,9 @@ def get_rng_state(device: int | str | Any = "cuda") -> Tensor:
     .. warning::
         This function eagerly initializes CUDA.
     """
-    raise RuntimeError(
-        "tensorplay does not yet expose per-device CUDA RNG state; "
-        "use manual_seed / manual_seed_all instead"
-    )
+    _lazy_init()
+    index = _get_device_index(device, optional=True)
+    return _lcuda.get_rng_state(index)
 
 
 def get_rng_state_all() -> list[Tensor]:
@@ -66,10 +59,9 @@ def set_rng_state(new_state: Tensor, device: int | str | Any = "cuda") -> None:
         device (tensorplay.Device or int, optional): The device to set the RNG state.
             Default: ``'cuda'`` (i.e., the current CUDA device).
     """
-    raise RuntimeError(
-        "tensorplay does not yet expose per-device CUDA RNG state; "
-        "use manual_seed / manual_seed_all instead"
-    )
+    _lazy_init()
+    index = _get_device_index(device, optional=True)
+    _lcuda.set_rng_state(new_state, index)
 
 
 def set_rng_state_all(new_states: Iterable[Tensor]) -> None:
@@ -98,8 +90,6 @@ def manual_seed(seed: int) -> None:
     seed = int(seed)
 
     def cb():
-        idx = current_device()
-        _initial_seeds[idx] = seed
         _lcuda.manual_seed(seed)
 
     _lazy_call(cb, seed=True)
@@ -124,7 +114,6 @@ def manual_seed_all(seed: int) -> None:
             for i in range(device_count()):
                 with device_ctx(i):
                     _lcuda.manual_seed(seed)
-                    _initial_seeds[i] = seed
         finally:
             from . import set_device
 
@@ -145,9 +134,7 @@ def seed() -> None:
     """
 
     def cb():
-        idx = current_device()
         random_seed = _random.getrandbits(64) & 0x7FFFFFFF
-        _initial_seeds[idx] = random_seed
         _lcuda.manual_seed(random_seed)
 
     _lazy_call(cb, seed=True)
@@ -169,7 +156,6 @@ def seed_all() -> None:
             for i in range(device_count()):
                 with device_ctx(i):
                     _lcuda.manual_seed(random_seed)
-                    _initial_seeds[i] = random_seed
         finally:
             from . import set_device
 
@@ -186,9 +172,4 @@ def initial_seed() -> int:
     """
     _lazy_init()
     idx = current_device()
-    if idx not in _initial_seeds:
-        raise RuntimeError(
-            f"seed for cuda:{idx} was not set in this process; "
-            "call manual_seed or seed first"
-        )
-    return _initial_seeds[idx]
+    return int(_lcuda.current_seed(idx))
