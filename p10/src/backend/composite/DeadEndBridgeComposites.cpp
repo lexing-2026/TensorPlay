@@ -46,10 +46,22 @@ Tensor inverse_bridge(const Tensor& self) {
     return ops::linalg_inv(self);
 }
 
-// Moore-Penrose pseudo-inverse through the SVD cutoff form; rcond is the
-// legacy singular-value floor relative to the largest value.
+// Moore-Penrose pseudo-inverse through the SVD cutoff form: values at or
+// below the rcond-relative largest-singular-value floor are treated as zero.
 Tensor pinverse_bridge(const Tensor& self, double rcond) {
-    return ops::linalg_pinv(self, rcond);
+    auto svd = ops::linalg_svd(self, /*full_matrices=*/false);
+    Tensor U = std::get<0>(svd);
+    Tensor S = std::get<1>(svd);
+    Tensor Vh = std::get<2>(svd);
+    Tensor smax = std::get<0>(ops::max(S, -1, /*keepdim=*/true));
+    Tensor cutoff = smax * rcond;
+    // diag(1/s) with the cutoff floor, applied to the rows of U^H
+    Tensor s_inv = ops::where(ops::gt(S, cutoff), ops::reciprocal(S),
+                              Tensor::zeros_like(S))
+                       .unsqueeze(-1);
+    Tensor ut = ops::transpose(ops::conj(U), -2, -1) * s_inv;
+    // pinv = V^H @ (scaled U^H)
+    return ops::matmul(ops::transpose(Vh, -2, -1), ut);
 }
 
 // Batched dot product along dim: sum(x * y, dim).
@@ -291,11 +303,18 @@ Tensor& _log_softmax_backward_data_bridge_out(const Tensor& grad_output,
 // log_sigmoid forward with its saved-buffer output
 // ---------------------------------------------------------------------------
 
-// log_sigmoid(x) = -softplus(-x); the buffer caches exp(result) so the
-// backward stays elementwise.
+// log_sigmoid(x) = -softplus(-x); the buffer caches exp(-|x|), the stable
+// remainder of the softplus evaluation the backward reuses elementwise.
 std::tuple<Tensor, Tensor> log_sigmoid_forward_bridge(const Tensor& self) {
-    Tensor buffer = ops::sigmoid(ops::neg(self));
-    Tensor output = ops::log(buffer);
+    Tensor buffer = ops::exp(ops::neg(ops::abs(self)));
+    // x >= 0: logsig = log(b) - log(1+b) with b = exp(-x)
+    // x <  0: logsig = -softplus(x) = x - log(1+exp(x)); with b = exp(x) the
+    //         stable form is log(b) - log(1+b)
+    Tensor neg = ops::neg(self);
+    Tensor pos_branch = ops::log(ops::div(buffer, ops::add(buffer, Scalar(1.0))));
+    Tensor neg_branch = neg - ops::log(ops::add(buffer, Scalar(1.0)));
+    Tensor output = ops::where(ops::lt(self, Scalar(0.0)), neg_branch,
+                               pos_branch);
     return {output, buffer};
 }
 
@@ -335,11 +354,10 @@ Tensor& rrelu_with_noise_bridge_inplace(Tensor& self, Tensor& noise,
 
 // The out= contract takes the destination's dtype/device/grad mode; the
 // TensorOptions arguments are accepted for schema compatibility and ignored.
-Tensor& arange_bridge_out(Scalar end, DType dtype, Device device,
-                          bool requires_grad, Tensor& out) {
+Tensor& arange_bridge_out(Scalar end, DType dtype,
+                          std::optional<Device> device, Tensor& out) {
     (void)dtype;
     (void)device;
-    (void)requires_grad;
     out = ops::arange(end, out.dtype(), std::optional<Device>(out.device()));
     return out;
 }
