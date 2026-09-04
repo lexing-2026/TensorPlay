@@ -31,6 +31,8 @@ jobs:
       cpu: ${{ steps.read-matrix.outputs.cpu }}
       cuda: ${{ steps.read-matrix.outputs.cuda }}
       variants: ${{ steps.read-matrix.outputs.variants }}
+      release_tag: ${{ steps.read-matrix.outputs.release_tag }}
+      stable_tag: ${{ steps.read-matrix.outputs.stable_tag }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -40,6 +42,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Tag shape flags, evaluated once here because workflow expressions
+          # have no regex helper. release_tag covers full semver tags and
+          # their release candidates (vX.Y.Z or vX.Y.Z-rcN); stable_tag only
+          # matches the X.Y.0 tags that publish to PyPI and the index branch.
+          release_tag=false
+          stable_tag=false
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" && "${GITHUB_REF_NAME:-}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$ ]]; then
+            release_tag=true
+          fi
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" && "${GITHUB_REF_NAME:-}" =~ ^v[0-9]+\.[0-9]+\.0$ ]]; then
+            stable_tag=true
+          fi
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "stable_tag=$stable_tag" >> "$GITHUB_OUTPUT"
           cpu_matrix="$(jq -c '
             [
               .cpu_platforms[] as $platform |
@@ -75,6 +91,7 @@ jobs:
   # manual dispatch from a branch simply skips this step and runs CI locally.
   create-release:
     name: create-release
+    needs: define-wheel-matrix
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -84,7 +101,7 @@ jobs:
           submodules: false
           show-progress: false
       - name: Create release for an eligible tag
-        if: ${{ startsWith(github.ref, 'refs/tags/v') && matches(github.ref_name, '^v\d+\.\d+\.\d+(-rc\d+)?$') }}
+        if: ${{ needs.define-wheel-matrix.outputs.release_tag == 'true' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -132,7 +149,7 @@ jobs:
       build_environment: ${{ format('release-{0}-py{1}-cpu', matrix.platform, matrix.python) }}
       runs_on: ${{ matrix.runner }}
       python_version: ${{ matrix.python }}
-      upload_release: ${{ startsWith(github.ref, 'refs/tags/v') && matches(github.ref_name, '^v\d+\.\d+\.\d+(-rc\d+)?$') }}
+      upload_release: ${{ needs.define-wheel-matrix.outputs.release_tag == 'true' }}
 
   cuda-build:
     name: ${{ matrix.build_name }}-build-test
@@ -153,14 +170,16 @@ jobs:
       python_version: ${{ matrix.python }}
       cuda: ${{ matrix.variant }}
       cuda_toolkit: ${{ matrix.toolkit }}
-      upload_release: ${{ startsWith(github.ref, 'refs/tags/v') && matches(github.ref_name, '^v\d+\.\d+\.\d+(-rc\d+)?$') }}
+      upload_release: ${{ needs.define-wheel-matrix.outputs.release_tag == 'true' }}
 
   pypi-upload:
     # CPU wheels remain on PyPI -- stable releases only, never release
     # candidates. Release assets are downloaded after every CPU build has
     # tested and uploaded its own wheel.
-    if: startsWith(github.ref, 'refs/tags/v') && matches(github.ref_name, '^v\d+\.\d+\.0$')
-    needs: cpu-build
+    if: needs.define-wheel-matrix.outputs.stable_tag == 'true'
+    needs:
+      - define-wheel-matrix
+      - cpu-build
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -200,7 +219,7 @@ jobs:
   cuda-upload:
     # Publish one complete static index to the branch tracked by Pages --
     # stable releases only, never release candidates.
-    if: startsWith(github.ref, 'refs/tags/v') && matches(github.ref_name, '^v\d+\.\d+\.0$')
+    if: needs.define-wheel-matrix.outputs.stable_tag == 'true'
     needs:
       - define-wheel-matrix
       - cuda-build

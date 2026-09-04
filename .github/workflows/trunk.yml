@@ -65,6 +65,11 @@ jobs:
   cpu-build:
     name: ${{ matrix.build_name }}-build-test
     needs: define-wheel-matrix
+    permissions:
+      # The called workflow's build-test job needs contents: write to
+      # upload wheels to a GitHub Release on tag builds; the job-level grant
+      # here keeps the top-level read-all default untouched.
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -79,6 +84,8 @@ jobs:
   cuda-build:
     name: ${{ matrix.build_name }}-build-test
     needs: define-wheel-matrix
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
