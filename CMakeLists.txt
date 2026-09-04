@@ -435,10 +435,16 @@ if(USE_BLAS)
         set(MKL_LINK "static")
         # Our kernels use 32-bit cblas indices; MKLConfig defaults to ilp64.
         set(MKL_INTERFACE lp64)
+        # Config mode first (oneAPI MKLConfig), then the module fallback:
+        # CI unpacks the mkl-static / mkl-include wheels under /opt/intel
+        # (MKLROOT), which only the module layout knows how to assemble.
         find_package(MKL CONFIG QUIET)
+        if(NOT MKL_FOUND)
+            find_package(MKL MODULE QUIET)
+        endif()
         
         if(MKL_FOUND)
-            message(STATUS "Found MKL (Config): ${MKL_DIR}")
+            message(STATUS "Found MKL: ${MKL_DIR}")
             list(APPEND COMPUTE_LIBS MKL::MKL)
             set(BLAS_FOUND TRUE)
             list(APPEND BLAS_COMPILE_DEFS "USE_MKL")
@@ -893,6 +899,7 @@ configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/ConfigInfo.h.in"
 # Code generation: the schema engine is self-contained under tools/codegen.
 file(GLOB_RECURSE tp_codegen_reference CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/tools/codegen/*.py")
+set(TP_CODEGEN_TAGS "${CMAKE_CURRENT_SOURCE_DIR}/config/tags.yaml")
 add_custom_command(
             OUTPUT ${GEN_HEADER} ${GEN_CPP} ${GEN_BINDINGS_HEADER}
                    ${GEN_CPYTHON_HEADER}
@@ -906,6 +913,7 @@ add_custom_command(
             DEPENDS
                 ${CMAKE_CURRENT_SOURCE_DIR}/config/native_functions.yaml
                 ${CMAKE_CURRENT_SOURCE_DIR}/config/derivatives.yaml
+                ${TP_CODEGEN_TAGS}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tools/codegen/main.py
                 ${CMAKE_CURRENT_SOURCE_DIR}/tools/codegen/model.py
                 ${CMAKE_CURRENT_SOURCE_DIR}/tools/codegen/api_types.py
@@ -1271,6 +1279,7 @@ add_custom_command(
         "${TP_PACKAGE_DIR}/functional.py"
         "${TP_PACKAGE_DIR}/_docs.py"
         "${CMAKE_CURRENT_SOURCE_DIR}/config/native_functions.yaml"
+        ${TP_CODEGEN_TAGS}
         "${CMAKE_CURRENT_SOURCE_DIR}/src/bindings/python/DType.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/tools/codegen/gen_pyi.py"
         "${CMAKE_CURRENT_SOURCE_DIR}/tools/codegen/api_types.py"
