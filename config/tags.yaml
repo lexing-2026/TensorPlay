@@ -1,0 +1,37 @@
+# TensorPlay's code-generation tag registry.
+# Keep this file versioned with the schemas so clean/offline builds are self-contained.
+
+- tag: pt2_compliant_tag
+  desc: Operator satisfies the compiler compatibility contract.
+- tag: pt2_compliant_dynamic_shapes
+  desc: Operator supports dynamic-shape compilation.
+- tag: nondeterministic_seeded
+  desc: Operator is intentionally random but seedable.
+- tag: dynamic_output_shape
+  desc: Operator output shape depends on input data.
+- tag: fixed_output_shape
+  desc: Operator output shape is fixed by schema and input metadata.
+- tag: generated
+  desc: Operator entry is generated rather than declared directly.
+- tag: inplace_view
+  desc: Operator mutates tensor metadata without changing storage values.
+- tag: alias_with_write
+  desc: Operator may write through an aliased tensor.
+- tag: no_autograd
+  desc: Operator has no generated automatic-differentiation formula.
+- tag: no_python
+  desc: Operator is not exposed through the Python binding layer.
+- tag: vulkan_ios_gpu_support
+  desc: Operator is supported on the iOS Vulkan target.
+- tag: vulkan_mac_gpu_support
+  desc: Operator is supported on the macOS Vulkan target.
+- tag: vulkan_android_gpu_support
+  desc: Operator is supported on the Android Vulkan target.
+- tag: view_copy
+  desc: Operator is a copying variant of a view operation.
+- tag: non_native
+  desc: Operator is implemented outside the native kernel set.
+- tag: custom_method
+  desc: Operator uses a custom binding method.
+- tag: deprecated
+  desc: Operator is deprecated but retained for schema compatibility.
