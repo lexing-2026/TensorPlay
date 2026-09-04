@@ -18,7 +18,7 @@
 //   PointwiseKernels.cpp element-for-element, including multiplication order,
 //   so vector and fallback paths produce identical values.
 
-#include <immintrin.h>
+#include "cpu/vec/Intrinsics.h"
 #include <cmath>
 #include <cstdint>
 #include <cstring>
