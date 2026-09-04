@@ -56,34 +56,28 @@ Tensor& copysign_tensor_out(const Tensor& self, const Tensor& other, Tensor& out
 //      back to the registered Scalar-based clamp when only one side is given.
 Tensor clamp_tensor(const Tensor& self, const std::optional<Tensor>& min,
                     const std::optional<Tensor>& max) {
-    if (min.has_value() && max.has_value()) {
-        Tensor lo = *min;
-        Tensor hi = *max;
-        // element-wise clamp via minimum(maximum)
-        Tensor t = ops::maximum(self, ops::mul(lo, ops::ones({}, lo.dtype(), lo.device())));
-        (void)t;
-        // broadcast-friendly form: clamp(min=lo) then clamp(max=hi)
-        Scalar lo_s = lo.item();
-        Scalar hi_s = hi.item();
-        if (lo.numel() == 1 && hi.numel() == 1) {
-            return ops::clamp(self, lo_s, hi_s);
-        }
+    // .item() is only legal on 1-element tensors; any other bound shape goes
+    // through the elementwise maximum/minimum composition below.
+    const auto is_scalar_bound = [](const std::optional<Tensor>& b) {
+        return !b.has_value() || b->numel() == 1;
+    };
+    if (is_scalar_bound(min) && is_scalar_bound(max)) {
+        const std::optional<Scalar> lo = min.has_value() ? std::optional<Scalar>(min->item())
+                                                         : std::nullopt;
+        const std::optional<Scalar> hi = max.has_value() ? std::optional<Scalar>(max->item())
+                                                         : std::nullopt;
+        return ops::clamp(self, lo, hi);
     }
-    if (min.has_value() && min->numel() == 1 && !max.has_value()) {
-        return ops::clamp_max(self, min->item());
+    // Elementwise bounds: clamp(min=lo) then clamp(max=hi) via the maximum /
+    // minimum kernels, which broadcast like any other binary op.
+    Tensor cur = self;
+    if (min.has_value()) {
+        cur = ops::maximum(cur, *min);
     }
-    if (max.has_value() && max->numel() == 1 && !min.has_value()) {
-        return ops::clamp_min(self, max->item());
+    if (max.has_value()) {
+        cur = ops::minimum(cur, *max);
     }
-    if (min.has_value() && max.has_value()) {
-        // general tensor-bounds clamp: max(min(x, hi), lo) elementwise
-        Tensor hi = *max;
-        Tensor lo = *min;
-        // route through where-based composition on the registered kernels
-        Tensor capped = ops::where(ops::gt(self, hi), hi, self);
-        return ops::where(ops::lt(capped, lo), lo, capped);
-    }
-    TP_THROW(RuntimeError, "clamp: at least one of 'min' or 'max' must be specified");
+    return cur;
 }
 
 Tensor& clamp__tensor(Tensor& self, const std::optional<Tensor>& min,

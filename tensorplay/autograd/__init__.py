@@ -22,7 +22,7 @@ from .grad_mode import (
 
 from .function import Function, NestedIOFunction
 from .variable import Variable
-from .graph import saved_tensor_hooks as saved_tensors_hooks
+from .graph import save_on_cpu, saved_tensor_hooks as saved_tensors_hooks
 from . import forward_ad
 from .._C._autograd import (
     backward as _backward,
@@ -45,6 +45,8 @@ __all__ = [
     "inference_mode",
     "no_grad",
     "set_grad_enabled",
+    "saved_tensors_hooks",
+    "save_on_cpu",
     # inference mode
     "is_inference_mode_enabled",
     # anomaly mode

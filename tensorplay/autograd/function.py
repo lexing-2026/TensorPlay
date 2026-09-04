@@ -13,6 +13,19 @@ def _current_saved_hooks_pair():
     return _hook_stack[-1] if _hook_stack else None
 
 
+def _native_saved_hooks_active() -> bool:
+    return bool(getattr(
+        _autograd, "_saved_variable_hooks_active", lambda: False)())
+
+
+def _native_pack_saved_tensor(tensor):
+    return _autograd._pack_saved_tensor(tensor)
+
+
+def _native_unpack_saved_tensor(token):
+    return _autograd._unpack_saved_tensor(token)
+
+
 # build without them is loaded, the generic Python fallbacks run instead.
 _FAST_GRAPH = hasattr(_autograd, "setup_custom_function_graph")
 _FAST_ATTACH = hasattr(_autograd, "PyNode") and hasattr(
@@ -191,20 +204,31 @@ class _Context:
             if t is not None and not isinstance(t, tensorplay.Tensor):
                 raise TypeError(
                     "save_for_backward only accepts Tensors or None")
-        pair = _current_saved_hooks_pair()
-        if pair is not None:
-            pack_fn, unpack_fn = pair
-            self._saved_pack = tuple(
-                None if t is None else pack_fn(t) for t in tensors)
-            self._saved_unpack = unpack_fn
+        if _native_saved_hooks_active():
+            self._saved_native_tokens = tuple(
+                None if t is None else _native_pack_saved_tensor(t)
+                for t in tensors
+            )
+            self._saved_pack = None
+            self._saved_unpack = None
+            self._saved_tensors = tuple(None for _ in tensors)
+        else:
+            self._saved_native_tokens = None
+            pair = _current_saved_hooks_pair()
+            if pair is not None:
+                pack_fn, unpack_fn = pair
+                self._saved_pack = tuple(
+                    None if t is None else pack_fn(t) for t in tensors)
+                self._saved_unpack = unpack_fn
+            else:
+                self._saved_pack = None
+                self._saved_unpack = None
+            self._saved_tensors = tensors
+        if not _native_saved_hooks_active():
             self._saved_versions = tuple(
                 None if t is None else t._version for t in tensors)
         else:
-            self._saved_pack = None
-            self._saved_unpack = None
-            self._saved_versions = tuple(
-                None if t is None else t._version for t in tensors)
-        self._saved_tensors = tensors
+            self._saved_versions = tuple(None for _ in tensors)
 
     @property
     def saved_tensors(self):
@@ -212,6 +236,12 @@ class _Context:
 
         Raises if any saved tensor was modified in-place since saving,
         """
+        native_tokens = getattr(self, "_saved_native_tokens", None)
+        if native_tokens is not None:
+            return tuple(
+                None if token is None else _native_unpack_saved_tensor(token)
+                for token in native_tokens
+            )
         tensors = self._saved_tensors
         versions = getattr(self, "_saved_versions", ())
         for t, v in zip(tensors, versions):
