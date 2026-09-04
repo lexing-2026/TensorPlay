@@ -96,13 +96,24 @@ if(MKL_INCLUDE_DIR)
             set(_MKL_THREAD_LIB mkl_${MKL_THREADING})
         endif()
         foreach(_comp mkl_${MKL_INTERFACE} ${_MKL_THREAD_LIB} mkl_core)
+            # Both layouts exist in the wild: OneAPI installs the interface
+            # layer as libmkl_<iface>.a, the pip mkl-static wheel ships
+            # libmkl_intel_<iface>.a.  The interface layer is mandatory --
+            # the cblas entry points live there -- so a miss voids the set
+            # rather than half-configuring.
+            set(_MKL_CANDIDATES "${_comp}")
+            if(_comp STREQUAL "mkl_${MKL_INTERFACE}")
+                list(APPEND _MKL_CANDIDATES "mkl_intel_${MKL_INTERFACE}")
+            endif()
             find_library(MKL_${_comp}_LIBRARY
-                NAMES ${_comp}
+                NAMES ${_MKL_CANDIDATES}
                 HINTS ${_MKL_ROOTS}
                 PATH_SUFFIXES ${_MKL_LIB_SUFFIXES}
             )
             if(MKL_${_comp}_LIBRARY)
                 list(APPEND MKL_LIBRARIES "${MKL_${_comp}_LIBRARY}")
+            elseif(_comp STREQUAL "mkl_${MKL_INTERFACE}")
+                set(MKL_LIBRARIES "")
             endif()
         endforeach()
         # Threaded layers talk to an OpenMP runtime; carry ours so consumers
