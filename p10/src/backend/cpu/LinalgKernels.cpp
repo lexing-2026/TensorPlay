@@ -615,7 +615,7 @@ Tensor linalg_lu_solve_kernel(const Tensor& LU, const Tensor& pivots,
     } else {
         work_cm = clone_batched_column_major(expand_to_batch(B, batch));
     }
-    const char trans = (left == adjoint) ? 'N' : 'T';
+    const char trans = (left != adjoint) ? 'N' : 'T';
     run_real(LU.dtype(), [&](auto tag) {
         using T = std::remove_pointer_t<decltype(tag)>;
         const auto* piv = piv_exp.data_ptr<int32_t>();

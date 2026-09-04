@@ -2159,6 +2159,16 @@ Tensor pow_tensor_tensor_kernel(const Tensor& self, const Tensor& exponent) {
     return result;
 }
 
+// Scalar-base power: a base of 1 short-circuits to ones, anything else
+// wraps the scalar as a 0-dim tensor and reuses the Tensor_Tensor kernel.
+Tensor pow_scalar_tensor_kernel(Scalar base, const Tensor& exponent) {
+    if (!base.isComplex() && base.toDouble() == 1.0) {
+        return Tensor::ones(exponent.shape(), exponent.dtype(), exponent.device());
+    }
+    Tensor base_t = Tensor::full({}, base, exponent.dtype(), exponent.device());
+    return pow_tensor_tensor_kernel(base_t, exponent);
+}
+
 // Lerp implementations using composition
 template <typename T, typename W>
 inline T lerp_scalar_value(T self, T end, W weight) {
@@ -2504,6 +2514,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, PointwiseKernels) {
     m.impl("softmax", softmax_kernel);
     m.impl("log_softmax", log_softmax_kernel);
     m.impl("pow.Tensor_Tensor", pow_tensor_tensor_kernel);
+    m.impl("pow.Scalar", pow_scalar_tensor_kernel);
     m.impl("lerp", lerp_scalar_kernel);
     m.impl("lerp.Tensor", lerp_tensor_kernel);
     m.impl("lerp_.Scalar", lerp_scalar_inplace_kernel);

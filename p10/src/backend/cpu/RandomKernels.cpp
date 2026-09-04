@@ -5,6 +5,7 @@
 #include "DistributionDispatch.h"
 #include "TensorIterator.h"
 #include "Exception.h"
+#include "Utils.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 #include <algorithm>
 #include <cmath>
@@ -419,6 +420,312 @@ Tensor poisson_kernel(const Tensor& self) {
     return out;
 }
 
+// Truncated Stirling series for log(n!) - 0.5*log(2*pi*n) - n + n*log(n),
+// tabulated for the first few integers and evaluated from the asymptotic
+// expansion afterwards.
+double stirling_approx_tail(double k) {
+    static const double kTailValues[10] = {
+        0.0810614667953272, 0.0413406959554092, 0.0276779256849983,
+        0.02079067210376509, 0.0166446911898211, 0.0138761288230707,
+        0.0118967099458917, 0.0104112652619720, 0.00925546218271273,
+        0.00833056343336287};
+    if (k < 10.0) {
+        return kTailValues[static_cast<size_t>(k)];
+    }
+    const double kp1sq = (k + 1) * (k + 1);
+    return (1.0 / 12 - (1.0 / 360 - 1.0 / 1260 / kp1sq) / kp1sq) / (k + 1);
+}
+
+// Exact small-parameter binomial draw: count how many geometric variates
+// with success probability `prob` fit below `count`.
+double binomial_inversion(double count, double prob, Generator* gen) {
+    uniform_real_distribution<double> standard_uniform(0.0, 1.0);
+    const double log1mprob = std::log1p(-prob);
+    double geom_sum = 0.0;
+    double num_geom = 0.0;
+    while (true) {
+        const double u = standard_uniform(gen);
+        const double geom = std::ceil(std::log(u) / log1mprob);
+        geom_sum += geom;
+        if (geom_sum > count) {
+            break;
+        }
+        num_geom += 1.0;
+    }
+    return num_geom;
+}
+
+// Transformed rejection for the binomial law when count * prob is large;
+// most draws are accepted after the squeeze test without evaluating logs.
+double binomial_btrs(double count, double prob, Generator* gen) {
+    uniform_real_distribution<double> standard_uniform(0.0, 1.0);
+    const double stddev = std::sqrt(count * prob * (1.0 - prob));
+    const double b = 1.15 + 2.53 * stddev;
+    const double a = -0.0873 + 0.0248 * b + 0.01 * prob;
+    const double c = count * prob + 0.5;
+    const double v_r = 0.92 - 4.2 / b;
+    const double r = prob / (1.0 - prob);
+    const double alpha = (2.83 + 5.1 / b) * stddev;
+    const double m = std::floor((count + 1.0) * prob);
+    while (true) {
+        const double u0 = standard_uniform(gen);
+        const double v = standard_uniform(gen);
+        const double u = u0 - 0.5;
+        const double us = 0.5 - std::fabs(u);
+        const double k = std::floor((2.0 * a / us + b) * u + c);
+        if (k < 0.0 || k > count) {
+            continue;
+        }
+        if (us >= 0.07 && v <= v_r) {
+            return k;
+        }
+        const double vlog = std::log(v * alpha / (a / (us * us) + b));
+        const double upperbound =
+            (m + 0.5) * std::log((m + 1.0) / (r * (count - m + 1.0))) +
+            (count + 1.0) * std::log((count - m + 1.0) / (count - k + 1.0)) +
+            (k + 0.5) * std::log(r * (count - k + 1.0) / (k + 1.0)) +
+            stirling_approx_tail(m) + stirling_approx_tail(count - m) -
+            stirling_approx_tail(k) - stirling_approx_tail(count - k);
+        if (vlog <= upperbound) {
+            return k;
+        }
+    }
+}
+
+// Binomial draw for one (count, prob) pair.  prob > 0.5 samples the
+// complementary failure count so the acceptance rate stays controlled; a
+// NaN prob propagates as NaN.  Callers must guarantee count is not NaN
+// (a NaN count would never terminate the geometric sum below).
+double sample_binomial(double count, double prob, Generator* gen) {
+    if (count != count) {
+        TP_THROW(ValueError, "binomial: count must not be NaN");
+    }
+    if (count <= 0.0 || prob <= 0.0) {
+        return 0.0;
+    }
+    if (prob >= 1.0) {
+        return count;
+    }
+    if (prob != prob) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    if (prob <= 0.5) {
+        if (count * prob >= 10.0) {
+            return binomial_btrs(count, prob, gen);
+        }
+        return binomial_inversion(count, prob, gen);
+    }
+    const double qprob = 1.0 - prob;
+    if (count * qprob >= 10.0) {
+        return count - binomial_btrs(count, qprob, gen);
+    }
+    return count - binomial_inversion(count, qprob, gen);
+}
+
+// Gamma draw with shape `alpha` and unit scale: boosting handles the
+// alpha < 1 regime, then a squeeze-based acceptance test on the cubic of a
+// normal variate; all arithmetic stays in double regardless of storage
+// dtype.  `alpha` must be finite and >= 0 (alpha == 0 yields 0).
+template <typename scalar_t>
+scalar_t sample_gamma(scalar_t alpha_in, Generator* gen) {
+    uniform_real_distribution<double> standard_uniform(0.0, 1.0);
+    normal_distribution<double> standard_normal(0.0, 1.0);
+    double alpha = static_cast<double>(alpha_in);
+    double scale = 1.0;
+    if (alpha < 1.0) {
+        if (alpha == 0.0) {
+            return static_cast<scalar_t>(0.0);
+        }
+        scale *= std::pow(1.0 - standard_uniform(gen), 1.0 / alpha);
+        alpha += 1.0;
+    }
+    const double d = alpha - 1.0 / 3.0;
+    const double c = 1.0 / std::sqrt(9.0 * d);
+    for (;;) {
+        double x, y;
+        do {
+            x = standard_normal(gen);
+            y = 1.0 + c * x;
+        } while (y <= 0.0);
+        const double v = y * y * y;
+        const double u = 1.0 - standard_uniform(gen);
+        const double xx = x * x;
+        if (u < 1.0 - 0.0331 * xx * xx) {
+            return static_cast<scalar_t>(scale * d * v);
+        }
+        if (std::log(u) < 0.5 * xx + d * (1.0 - v + std::log(v))) {
+            return static_cast<scalar_t>(scale * d * v);
+        }
+    }
+}
+
+Tensor binomial_kernel(const Tensor& count, const Tensor& prob,
+                       std::optional<Generator> generator) {
+    if (!isFloatingType(count.dtype())) {
+        TP_THROW(ValueError, "binomial only supports floating-point dtypes for count, got: ",
+                  toString(count.dtype()));
+    }
+    if (!isFloatingType(prob.dtype())) {
+        TP_THROW(ValueError, "binomial only supports floating-point dtypes for prob, got: ",
+                  toString(prob.dtype()));
+    }
+    if (prob.dtype() != count.dtype()) {
+        TP_THROW(RuntimeError, "Found dtype ", toString(prob.dtype()),
+                  " but expected ", toString(count.dtype()));
+    }
+    Generator& gen = generator.has_value() ? *generator : default_generator();
+    const std::vector<int64_t> bshape =
+        broadcast_shapes(static_cast<std::vector<int64_t>>(count.shape()),
+                         static_cast<std::vector<int64_t>>(prob.shape()));
+    Tensor out(bshape, count.dtype(), count.device());
+    if (out.numel() == 0) {
+        return out;
+    }
+    Tensor count_b = count.expand(bshape).contiguous();
+    Tensor prob_b = prob.expand(bshape).contiguous();
+
+    if (count.dtype() == DType::Float32) {
+        const float* cp = count_b.data_ptr<float>();
+        const float* pp = prob_b.data_ptr<float>();
+        float* res = out.data_ptr<float>();
+        for (int64_t i = 0; i < out.numel(); ++i) {
+            res[i] = static_cast<float>(
+                sample_binomial(static_cast<double>(cp[i]), static_cast<double>(pp[i]), &gen));
+        }
+    } else if (count.dtype() == DType::Float64) {
+        const double* cp = count_b.data_ptr<double>();
+        const double* pp = prob_b.data_ptr<double>();
+        double* res = out.data_ptr<double>();
+        for (int64_t i = 0; i < out.numel(); ++i) {
+            res[i] = sample_binomial(cp[i], pp[i], &gen);
+        }
+    } else {
+        TP_THROW(NotImplementedError, "\"binomial_cpu\" not implemented for '",
+                  toString(count.dtype()), "'");
+    }
+    return out;
+}
+
+Tensor standard_gamma_kernel(const Tensor& self, std::optional<Generator> generator) {
+    if (self.dtype() != DType::Float32 && self.dtype() != DType::Float64) {
+        TP_THROW(NotImplementedError, "\"standard_gamma_cpu\" not implemented for '",
+                  toString(self.dtype()), "'");
+    }
+    Tensor out(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
+    if (self.numel() == 0) {
+        return out;
+    }
+    Generator& gen = generator.has_value() ? *generator : default_generator();
+
+    Tensor sc = self.contiguous();
+
+    // The rejection loop makes no progress for NaN or negative shapes, so
+    // screen the concentrations up front.
+    if (sc.dtype() == DType::Float32) {
+        const float* vp = sc.data_ptr<float>();
+        for (int64_t i = 0; i < sc.numel(); ++i) {
+            if (!(vp[i] >= 0.0f)) {
+                TP_THROW(ValueError, "standard_gamma: concentration values must be non-negative");
+            }
+        }
+    } else {
+        const double* vp = sc.data_ptr<double>();
+        for (int64_t i = 0; i < sc.numel(); ++i) {
+            if (!(vp[i] >= 0.0)) {
+                TP_THROW(ValueError, "standard_gamma: concentration values must be non-negative");
+            }
+        }
+    }
+
+    if (sc.dtype() == DType::Float32) {
+        const float* sp = sc.data_ptr<float>();
+        float* res = out.data_ptr<float>();
+        for (int64_t i = 0; i < out.numel(); ++i) {
+            const float sample = sample_gamma(sp[i], &gen);
+            res[i] = std::max(std::numeric_limits<float>::min(), sample);
+        }
+    } else {
+        const double* sp = sc.data_ptr<double>();
+        double* res = out.data_ptr<double>();
+        for (int64_t i = 0; i < out.numel(); ++i) {
+            const double sample = sample_gamma(sp[i], &gen);
+            res[i] = std::max(std::numeric_limits<double>::min(), sample);
+        }
+    }
+    return out;
+}
+
+Tensor sample_dirichlet_kernel(const Tensor& self, std::optional<Generator> generator) {
+    if (self.dtype() != DType::Float32 && self.dtype() != DType::Float64) {
+        TP_THROW(NotImplementedError, "\"_sample_dirichlet_cpu\" not implemented for '",
+                  toString(self.dtype()), "'");
+    }
+    TP_CHECK(self.dim() >= 1, "dirichlet: expects a tensor with at least one dimension");
+    Tensor out(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
+    if (self.numel() == 0) {
+        return out;
+    }
+    Generator& gen = generator.has_value() ? *generator : default_generator();
+
+    Tensor sc = self.contiguous();
+    const int64_t k = sc.size(-1);
+    const int64_t rows = sc.numel() / k;
+
+    // Draw the gamma variates in double so tiny concentrations survive the
+    // normalization, clamped away from zero.
+    std::vector<double> gamma_vals(static_cast<size_t>(sc.numel()));
+    if (sc.dtype() == DType::Float32) {
+        const float* sp = sc.data_ptr<float>();
+        for (int64_t i = 0; i < sc.numel(); ++i) {
+            const double a = static_cast<double>(sp[i]);
+            if (!(a >= 0.0)) {
+                TP_THROW(ValueError, "dirichlet: concentration values must be non-negative");
+            }
+            gamma_vals[static_cast<size_t>(i)] =
+                std::max(std::numeric_limits<double>::min(),
+                         static_cast<double>(sample_gamma(a, &gen)));
+        }
+    } else {
+        const double* sp = sc.data_ptr<double>();
+        for (int64_t i = 0; i < sc.numel(); ++i) {
+            if (!(sp[i] >= 0.0)) {
+                TP_THROW(ValueError, "dirichlet: concentration values must be non-negative");
+            }
+            gamma_vals[static_cast<size_t>(i)] =
+                std::max(std::numeric_limits<double>::min(),
+                         static_cast<double>(sample_gamma(sp[i], &gen)));
+        }
+    }
+
+    // Normalize each last-dimension group and clamp into the representable
+    // range of the storage dtype.
+    auto write = [&](auto tag) {
+        using scalar_t = decltype(tag);
+        scalar_t* res = out.data_ptr<scalar_t>();
+        const scalar_t min_val = std::numeric_limits<scalar_t>::min();
+        const scalar_t max_val =
+            static_cast<scalar_t>(std::nexttoward(static_cast<scalar_t>(1.0f), 0.0L));
+        for (int64_t r = 0; r < rows; ++r) {
+            double rowsum = 0.0;
+            for (int64_t j = 0; j < k; ++j) {
+                rowsum += gamma_vals[static_cast<size_t>(r * k + j)];
+            }
+            for (int64_t j = 0; j < k; ++j) {
+                const double ratio =
+                    gamma_vals[static_cast<size_t>(r * k + j)] / rowsum;
+                const scalar_t v = static_cast<scalar_t>(ratio);
+                res[r * k + j] = std::min(max_val, std::max(min_val, v));
+            }
+        }
+    };
+    if (out.dtype() == DType::Float32) {
+        write(float{});
+    } else {
+        write(double{});
+    }
+    return out;
+}
+
 // In-place kernels
 // Note: Must take Tensor& and return Tensor& to match DispatchStub signature for Tensor(a!)
 
@@ -645,6 +952,9 @@ TENSORPLAY_LIBRARY_IMPL(CPU, RandomKernels) {
     m.impl("bernoulli.p", bernoulli_p_kernel);
     m.impl("normal", normal_kernel);
     m.impl("poisson", poisson_kernel);
+    m.impl("binomial", binomial_kernel);
+    m.impl("_standard_gamma", standard_gamma_kernel);
+    m.impl("_sample_dirichlet", sample_dirichlet_kernel);
     m.impl("bernoulli_.Tensor", bernoulli_tensor_inplace_kernel);
     m.impl("bernoulli_.float", bernoulli_scalar_inplace_kernel);
     m.impl("cauchy_", cauchy_kernel);

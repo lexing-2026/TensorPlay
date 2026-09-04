@@ -365,6 +365,20 @@ TENSORPLAY_LIBRARY_IMPL(CPU, PadKernels) {
     m.impl("replication_pad_nd_backward", replication_pad_nd_backward_cpu);
     m.impl("circular_pad_nd", circular_pad_nd_cpu);
     m.impl("circular_pad_nd_backward", circular_pad_nd_backward_cpu);
+    // The rank-specific spellings are the same kernel: the pad list length
+    // selects the padded trailing dimensions, so 1d/2d/3d collapse onto _nd.
+    m.impl("reflection_pad1d", reflection_pad_nd_cpu);
+    m.impl("reflection_pad2d", reflection_pad_nd_cpu);
+    m.impl("reflection_pad3d", reflection_pad_nd_cpu);
+    m.impl("reflection_pad1d_backward", reflection_pad_nd_backward_cpu);
+    m.impl("reflection_pad2d_backward", reflection_pad_nd_backward_cpu);
+    m.impl("reflection_pad3d_backward", reflection_pad_nd_backward_cpu);
+    m.impl("replication_pad1d", replication_pad_nd_cpu);
+    m.impl("replication_pad2d", replication_pad_nd_cpu);
+    m.impl("replication_pad3d", replication_pad_nd_cpu);
+    m.impl("replication_pad1d_backward", replication_pad_nd_backward_cpu);
+    m.impl("replication_pad2d_backward", replication_pad_nd_backward_cpu);
+    m.impl("replication_pad3d_backward", replication_pad_nd_backward_cpu);
 }
 
 // constant_pad_nd is a composite over narrow/fill_/copy_ (PadNd.cpp), all of

@@ -1467,9 +1467,13 @@ bool batch_items_contiguous_or_transposed(const Tensor& t) {
     if (t.dim() != 3) return false;
     const auto sizes = static_cast<std::vector<int64_t>>(t.shape());
     const auto strides = t.strides();
-    // The stride of a size-1 dimension is irrelevant.
-    return (strides[2] == 1 && (sizes[1] == 1 || strides[1] >= sizes[2])) ||
-           (strides[1] == 1 && (sizes[2] == 1 || strides[2] >= sizes[1]));
+    // Per-slice row-major (column stride 1, row stride covering the inner
+    // extent) or its transposed-storage mirror (row stride 1, column stride
+    // covering the outer extent).  Both must hold strictly: a size-1 inner
+    // dimension with arbitrary strides can satisfy the stride pattern while
+    // violating CBLAS's lead-dimension validation.
+    return (strides[2] == 1 && strides[1] >= sizes[2]) ||
+           (strides[1] == 1 && strides[2] >= sizes[1]);
 }
 
 template <typename T>
@@ -1525,13 +1529,24 @@ void bgemm_batch(const Tensor& batch1, const Tensor& batch2, Tensor& result,
     const auto s2 = batch2.strides();
     const auto sr = result.strides();
     // Row-major CBLAS arguments; the per-slice matrix strides carry any
-    // transposed views directly.  For a transposed view (row stride 1) the
-    // stored matrix is the K x M transpose, so the op flag flips and the
-    // leading dimension is the column stride.
-    const bool trans_a = s1[1] == 1;
-    const int64_t lda = trans_a ? s1[2] : s1[1];
-    const bool trans_b = s2[1] == 1;
-    const int64_t ldb = trans_b ? s2[2] : s2[1];
+    // transposed views directly.  Each orientation carries a lead-dimension
+    // requirement: NoTrans needs the row stride to cover the operand's inner
+    // extent, Trans needs the column stride to cover the outer extent.  When
+    // both strides are 1 (a degenerate inner dimension) either flag is
+    // semantically fine but only one satisfies CBLAS validation, so pick by
+    // the requirement instead of by stride pattern.
+    auto pick_a = [&](bool& trans, int64_t& ld) {
+        if (s1[2] == 1 && s1[1] >= K) { trans = false; ld = s1[1]; return; }
+        trans = true; ld = s1[2];
+    };
+    auto pick_b = [&](bool& trans, int64_t& ld) {
+        if (s2[2] == 1 && s2[1] >= N) { trans = false; ld = s2[1]; return; }
+        trans = true; ld = s2[2];
+    };
+    bool trans_a; int64_t lda;
+    bool trans_b; int64_t ldb;
+    pick_a(trans_a, lda);
+    pick_b(trans_b, ldb);
     const int64_t ldc = sr[1];
     const T* A = batch1.data_ptr<T>();
     const T* Bp = batch2.data_ptr<T>();
@@ -1605,23 +1620,29 @@ Tensor baddbmm_kernel(const Tensor& input, const Tensor& batch1, const Tensor& b
         batch_items_contiguous_or_transposed(batch1) &&
         batch_items_contiguous_or_transposed(batch2);
     if (fused_ok) {
-        // beta == 0 makes the seed write-only (BLAS never reads C), so the
-        // broadcast copy of `input` is skipped entirely.
-        Tensor result = beta_v != 0.0
-            ? detail::contiguous_clone(expand_gemm_input(input, target))
-            : Tensor::empty(target, batch1.dtype(), batch1.device());
-        if (B == 0 || M == 0 || N == 0) return result;
+        // GEMM always runs with beta = 0 into a fresh buffer (MKL's
+        // beta != 0 kernel selection is markedly slower here); the seed
+        // folds in through one pointwise pass afterwards.
+        Tensor result = Tensor::empty(target, batch1.dtype(), batch1.device());
+        if (B == 0 || M == 0 || N == 0) {
+            if (beta_v != 0.0 && B > 0 && M > 0 && N > 0) {
+                result.copy_(detail::contiguous_clone(expand_gemm_input(input, target)));
+                if (beta_v != 1.0) result.mul_(beta);
+            } else if (beta_v != 0.0 && (M == 0 || N == 0) && batch1.size(2) != 0) {
+                // (B, M, 0) x (B, 0, N) contraction over an empty axis: the
+                // product contributes nothing, beta * seed remains.
+            }
+            return result;
+        }
         if (batch1.size(2) == 0) {
             // Empty contraction: the product contributes nothing.
+            result.copy_(detail::contiguous_clone(expand_gemm_input(input, target)));
             if (beta_v != 1.0) result.mul_(beta);
             return result;
         }
-        if (batch1.dtype() == DType::Float32) {
-            bgemm_batch<float>(batch1, batch2, result, alpha_v, beta_v);
-        } else {
-            bgemm_batch<double>(batch1, batch2, result, alpha_v, beta_v);
-        }
-        return result;
+        Tensor product = matmul_batched_2d(batch1, batch2, {B}, {B});
+        if (alpha_v != 1.0) product.mul_(alpha);
+        return beta_v != 0.0 ? product.add_(input, beta) : product;
     }
 #endif
 

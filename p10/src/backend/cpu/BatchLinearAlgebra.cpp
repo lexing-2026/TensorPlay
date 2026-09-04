@@ -160,84 +160,116 @@ bool cholesky_lapack(const Tensor& self, Tensor& out, int64_t n, int64_t batch,
 }
 
 Tensor cholesky_inverse_lapack(const Tensor& self, int64_t n, int64_t batch, bool upper) {
-    const char uplo = upper ? 'U' : 'L';
+    // A^{-1} via two triangular sweeps against the identity (potri in the
+    // bundled wheel is slow for large n; trsm is the level-3 fast path).
+    const int64_t order = 101;  // CblasRowMajor
+    const int64_t side = 141;   // CblasLeft
+    const int64_t uplo = upper ? 121 : 122;  // CblasUpper : CblasLower
+    const int64_t diag = 131;                // CblasNonUnit
+    Tensor fac = detail::contiguous_clone(self);
+    Tensor out = Tensor::zeros(shape_of(self), self.dtype(), self.device());
     const int64_t n2 = n * n;
-    auto symmetrize_cm = [&](auto* a, auto tag) {
-        using T = std::remove_pointer_t<decltype(tag)>;
-        // potri fills the `uplo` triangle of the inverse; mirror it.
-        for (int64_t j = 0; j < n; ++j) {
-            for (int64_t i = j + 1; i < n; ++i) {
-                if (upper) {
-                    a[i + j * n] = a[j + i * n];
-                } else {
-                    a[j + i * n] = a[i + j * n];
-                }
+    auto run_f32 = [&](const Tensor& f32, Tensor& work) {
+        // One identity column per rhs pass; trsm sweeps the whole batch of
+        // columns at once, so seed B with I (row-major blocks) and solve.
+        for (int64_t bi = 0; bi < batch; ++bi) {
+            float* x = work.data_ptr<float>() + bi * n2;
+            for (int64_t d = 0; d < n; ++d) x[d * n + d] = 1.0f;
+            const float* f = f32.data_ptr<float>() + bi * n2;
+            if (upper) {
+                lapack_strsm(order, side, uplo, 112, diag, n, n, 1.0f, f, n, x, n);
+                lapack_strsm(order, side, uplo, 111, diag, n, n, 1.0f, f, n, x, n);
+            } else {
+                lapack_strsm(order, side, uplo, 111, diag, n, n, 1.0f, f, n, x, n);
+                lapack_strsm(order, side, uplo, 112, diag, n, n, 1.0f, f, n, x, n);
             }
         }
     };
-    if (self.dtype() == DType::Float32 || self.dtype() == DType::Float64) {
-        Tensor work = clone_batched_col_major(self);
-        parallel_for(0, batch, 1, [&](int64_t begin, int64_t end) {
-            for (int64_t bi = begin; bi < end; ++bi) {
-                if (self.dtype() == DType::Float32) {
-                    float* block = work.data_ptr<float>() + bi * n2;
-                    lapack_spotri(uplo, n, block, n);
-                    symmetrize_cm(block, static_cast<float*>(nullptr));
-                } else {
-                    double* block = work.data_ptr<double>() + bi * n2;
-                    lapack_dpotri(uplo, n, block, n);
-                    symmetrize_cm(block, static_cast<double*>(nullptr));
-                }
-            }
-        });
-        return work.contiguous();
+    if (self.dtype() == DType::Float32) {
+        run_f32(fac, out);
+        return out;
     }
-    Tensor work = clone_batched_col_major(self.to(DType::Float64));
-    parallel_for(0, batch, 1, [&](int64_t begin, int64_t end) {
-        for (int64_t bi = begin; bi < end; ++bi) {
-            double* block = work.data_ptr<double>() + bi * n2;
-            lapack_dpotri(uplo, n, block, n);
-            symmetrize_cm(block, static_cast<double*>(nullptr));
+    if (self.dtype() == DType::Float64) {
+        Tensor fac64 = fac.to(DType::Float64);
+        Tensor work = Tensor::zeros(shape_of(self), DType::Float64, self.device());
+        for (int64_t bi = 0; bi < batch; ++bi) {
+            double* x = work.data_ptr<double>() + bi * n2;
+            for (int64_t d = 0; d < n; ++d) x[d * n + d] = 1.0;
+            const double* f = fac64.data_ptr<double>() + bi * n2;
+            if (upper) {
+                lapack_dtrsm(order, side, uplo, 112, diag, n, n, 1.0, f, n, x, n);
+                lapack_dtrsm(order, side, uplo, 111, diag, n, n, 1.0, f, n, x, n);
+            } else {
+                lapack_dtrsm(order, side, uplo, 111, diag, n, n, 1.0, f, n, x, n);
+                lapack_dtrsm(order, side, uplo, 112, diag, n, n, 1.0, f, n, x, n);
+            }
         }
-    });
-    return work.contiguous().to(self.dtype());
+        return work.to(self.dtype());
+    }
+    // Half/BFloat16: invert in float32 and cast back.
+    Tensor fac32 = fac.to(DType::Float32);
+    Tensor work = Tensor::zeros(shape_of(self), DType::Float32, self.device());
+    run_f32(fac32, work);
+    return work.to(self.dtype());
 }
 
 Tensor cholesky_solve_lapack(const Tensor& self, const Tensor& factor,
                              int64_t n, int64_t rhs, int64_t batchB, int64_t batchL,
                              bool upper) {
-    const char uplo = upper ? 'U' : 'L';
-    Tensor fac = clone_batched_col_major(factor);
-    Tensor b_work = clone_batched_col_major(self);
+    // (L L^T) X = B for a lower factor, (U^T U) X = B for an upper one, via
+    // two triangular sweeps (the bundled wheel's potrs degrades super-
+    // linearly with the number of right-hand sides).  trsm consumes
+    // row-major operands natively.
+    const int64_t order = 101;  // CblasRowMajor
+    const int64_t side = 141;   // CblasLeft
+    const int64_t uplo = upper ? 121 : 122;  // CblasUpper : CblasLower
+    const int64_t diag = 131;                // CblasNonUnit
+    Tensor fac = detail::contiguous_clone(factor);
+    Tensor out = detail::contiguous_clone(self);
     const int64_t n2 = n * n;
     const int64_t nb = n * rhs;
-    // The factor accepts a broadcast (batchL == 1) against the right-hand
-    // sides; solve every block in place on its own copy of B.
-    if (self.dtype() == DType::Float32 || self.dtype() == DType::Float64) {
-        parallel_for(0, batchB, 1, [&](int64_t begin, int64_t end) {
-            for (int64_t bi = begin; bi < end; ++bi) {
-                const int64_t li = batchL == 1 ? 0 : bi;
-                if (self.dtype() == DType::Float32) {
-                    lapack_spotrs(uplo, n, rhs, fac.data_ptr<float>() + li * n2, n,
-                                  b_work.data_ptr<float>() + bi * nb, n);
-                } else {
-                    lapack_dpotrs(uplo, n, rhs, fac.data_ptr<double>() + li * n2, n,
-                                  b_work.data_ptr<double>() + bi * nb, n);
-                }
-            }
-        });
-        return b_work.contiguous();
-    }
-    Tensor fac64 = fac.to(DType::Float64).contiguous();
-    Tensor work = clone_batched_col_major(self.to(DType::Float64));
-    parallel_for(0, batchB, 1, [&](int64_t begin, int64_t end) {
-        for (int64_t bi = begin; bi < end; ++bi) {
+    auto run_f32 = [&](const Tensor& f32, Tensor& work) {
+        for (int64_t bi = 0; bi < batchB; ++bi) {
             const int64_t li = batchL == 1 ? 0 : bi;
-            lapack_dpotrs(uplo, n, rhs, fac64.data_ptr<double>() + li * n2, n,
-                          work.data_ptr<double>() + bi * nb, n);
+            const float* f = f32.data_ptr<float>() + li * n2;
+            float* x = work.data_ptr<float>() + bi * nb;
+            if (upper) {
+                // A = U^T U: U^T Z = B (trans), then U X = Z (notrans).
+                lapack_strsm(order, side, uplo, 112, diag, n, rhs, 1.0f, f, n, x, rhs);
+                lapack_strsm(order, side, uplo, 111, diag, n, rhs, 1.0f, f, n, x, rhs);
+            } else {
+                // A = L L^T: L Y = B (notrans), then L^T X = Y (trans).
+                lapack_strsm(order, side, uplo, 111, diag, n, rhs, 1.0f, f, n, x, rhs);
+                lapack_strsm(order, side, uplo, 112, diag, n, rhs, 1.0f, f, n, x, rhs);
+            }
         }
-    });
-    return work.contiguous().to(self.dtype());
+    };
+    if (self.dtype() == DType::Float32) {
+        run_f32(fac, out);
+        return out;
+    }
+    if (self.dtype() == DType::Float64) {
+        Tensor fac64 = fac.to(DType::Float64);
+        Tensor work = detail::contiguous_clone(self.to(DType::Float64));
+        for (int64_t bi = 0; bi < batchB; ++bi) {
+            const int64_t li = batchL == 1 ? 0 : bi;
+            const double* f = fac64.data_ptr<double>() + li * n2;
+            double* x = work.data_ptr<double>() + bi * nb;
+            if (upper) {
+                lapack_dtrsm(order, side, uplo, 112, diag, n, rhs, 1.0, f, n, x, rhs);
+                lapack_dtrsm(order, side, uplo, 111, diag, n, rhs, 1.0, f, n, x, rhs);
+            } else {
+                lapack_dtrsm(order, side, uplo, 111, diag, n, rhs, 1.0, f, n, x, rhs);
+                lapack_dtrsm(order, side, uplo, 112, diag, n, rhs, 1.0, f, n, x, rhs);
+            }
+        }
+        return work.to(self.dtype());
+    }
+    // Half/BFloat16: solve in float32 and cast back.
+    Tensor fac32 = fac.to(DType::Float32);
+    Tensor work = detail::contiguous_clone(self.to(DType::Float32));
+    run_f32(fac32, work);
+    return work.to(self.dtype());
 }
 
 Tensor triangular_solve_lapack(const Tensor& self, const Tensor& A,
@@ -574,12 +606,12 @@ std::tuple<Tensor, Tensor, Tensor> svd_cpu(const Tensor& self, bool some, bool c
     const int64_t batch = self.numel() / (m * k);
     (void)some;
     if (lapack_available()) {
-        // gesdd-backed factorization via the linalg.svd kernel; the third
-        // slot carries Vh (callers transpose it to recover V), matching the
-        // Jacobi fallback layout.
+        // gesdd-backed factorization via the linalg.svd kernel.  The legacy
+        // contract returns V (A = U diag(S) V^T), so the Vh factor is
+        // transposed before it lands in the third slot.
         if (compute_uv) {
             auto [U, S, Vh] = ops::linalg_svd(self, false, std::optional<std::string>());
-            return {U, S, Vh};
+            return {U, S, Vh.transpose(-2, -1).contiguous()};
         }
         Tensor S = ops::linalg_svdvals(self, std::optional<std::string>());
         Tensor zero = Tensor::zeros({}, self.dtype(), self.device());
