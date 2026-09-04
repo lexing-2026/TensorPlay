@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.18)
 project(TensorPlay LANGUAGES CXX)
 
+include(CMakeDependentOption)
+
 # EnvVarForwarding reads os.environ via Python (see module header), so the
 # CMakeLists.txt. Forwarded BUILD_*/USE_*/CMAKE_* env vars become cache
 # variables before the USE_CUDA auto-detection below consumes them.
@@ -974,9 +976,32 @@ if(NOT WIN32)
 endif()
 
 # ---------------------------------------------------------------------------
+# Distributed transports.  Platform defaults and dependent options follow
+# the reference layout: distributed is off by default outside Linux and
+# Windows; tensorpipe never builds on Windows; gloo requires a 64-bit host.
+# ---------------------------------------------------------------------------
+if(NOT LINUX AND NOT WIN32)
+    set(USE_TP_DISTRIBUTED OFF CACHE BOOL "Use distributed" FORCE)
+else()
+    set(USE_TP_DISTRIBUTED ON CACHE BOOL "Use distributed")
+endif()
+cmake_dependent_option(TP_USE_GLOO "Use the gloo process-group transport" ON
+    "USE_TP_DISTRIBUTED AND NOT WIN32" OFF)
+cmake_dependent_option(TP_USE_TENSORPIPE "Use the tensorpipe RPC transport" ON
+    "USE_TP_DISTRIBUTED" OFF)
+cmake_dependent_option(TP_USE_MPI "Enable the MPI process group backend" ON
+    "USE_TP_DISTRIBUTED" OFF)
+
+if(TP_USE_GLOO AND NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+    message(WARNING "Gloo can only be used on 64-bit systems.")
+    set(TP_USE_GLOO OFF)
+endif()
+
+# ---------------------------------------------------------------------------
 # CPU process-group backends (gloo transport + MPI), kept as a separate
 # static library so the pybind11 module stays free of unity-build collisions.
 # ---------------------------------------------------------------------------
+if(TP_USE_GLOO)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(BUILD_TEST OFF CACHE BOOL "" FORCE)
 set(BUILD_BENCHMARK OFF CACHE BOOL "" FORCE)
@@ -986,9 +1011,13 @@ set(TP_GLOO_USE_RCCL_SAVE "${USE_RCCL}")
 set(USE_NCCL OFF CACHE BOOL "" FORCE)
 set(USE_RCCL OFF)
 set(USE_RCCL OFF CACHE BOOL "" FORCE)
-# libuv ships as a non-PIC static archive on this platform and cannot be
-# linked into the shared transport library; the TCP transport covers our use.
-set(USE_LIBUV OFF CACHE BOOL "" FORCE)
+# libuv ships as a non-PIC static archive on Linux and cannot be linked
+# into the shared transport library there (the TCP transport covers our
+# use); Windows gloo only supports the libuv transport, so it stays on and
+# consumes the libuv_ROOT provisioned by CI.
+if(NOT WIN32)
+    set(USE_LIBUV OFF CACHE BOOL "" FORCE)
+endif()
 set(USE_TCP_OPENSSL_LINK OFF CACHE BOOL "" FORCE)
 set(USE_TCP_OPENSSL_LOAD OFF CACHE BOOL "" FORCE)
 # Gloo builds CPU-only, but its USE_CUDA knob lives in the global namespace:
@@ -1000,7 +1029,9 @@ add_subdirectory(third_party/gloo)
 set(USE_CUDA "${TP_GLOO_USE_CUDA_SAVE}" CACHE BOOL "" FORCE)
 set(USE_RCCL "${TP_GLOO_USE_RCCL_SAVE}")
 set(USE_RCCL "${TP_GLOO_USE_RCCL_SAVE}" CACHE BOOL "" FORCE)
+endif()
 
+if(TP_USE_TENSORPIPE)
 set(TP_USE_CUDA ${TP_CUDA_ENABLED} CACHE BOOL "" FORCE)
 set(TP_BUILD_LIBUV OFF CACHE BOOL "" FORCE)
 set(TP_BUILD_PYTHON OFF CACHE BOOL "" FORCE)
@@ -1016,9 +1047,11 @@ set_target_properties(tensorpipe PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(TARGET tensorpipe_cuda)
     set_target_properties(tensorpipe_cuda PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
+endif()
 
-add_library(tp_distributed STATIC
-    src/distributed/gloo/ProcessGroupGloo.cpp
+# Process-group library.  Gloo sources join only when the transport was
+# built; the store layer and MPI backend stay available otherwise.
+set(TP_DISTRIBUTED_SOURCES
     src/distributed/mpi/ProcessGroupMPI.cpp
     src/distributed/store/FileStore.cpp
     src/distributed/store/HashStore.cpp
@@ -1026,15 +1059,22 @@ add_library(tp_distributed STATIC
     src/distributed/store/Store.cpp
     src/distributed/store/TCPStore.cpp
 )
+set(TP_DISTRIBUTED_LINK p10 pybind11::pybind11)
+set(TP_DISTRIBUTED_DEFINES)
+if(TP_USE_GLOO)
+    list(APPEND TP_DISTRIBUTED_SOURCES src/distributed/gloo/ProcessGroupGloo.cpp)
+    list(APPEND TP_DISTRIBUTED_LINK gloo)
+    list(APPEND TP_DISTRIBUTED_DEFINES USE_P10D_GLOO)
+endif()
+add_library(tp_distributed STATIC ${TP_DISTRIBUTED_SOURCES})
 target_include_directories(tp_distributed
     PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src/distributed"
            "${CMAKE_CURRENT_SOURCE_DIR}/src/distributed/autograd"
            "${CMAKE_CURRENT_SOURCE_DIR}/p10/include"
            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/gloo")
-target_link_libraries(tp_distributed PUBLIC p10 pybind11::pybind11 gloo)
-target_compile_definitions(tp_distributed PUBLIC USE_P10D_GLOO)
+target_link_libraries(tp_distributed PUBLIC ${TP_DISTRIBUTED_LINK})
+target_compile_definitions(tp_distributed PUBLIC ${TP_DISTRIBUTED_DEFINES})
 
-option(TP_USE_MPI "Enable the MPI process group backend" ON)
 if(TP_USE_MPI)
     find_package(MPI COMPONENTS CXX QUIET)
     if(MPI_CXX_FOUND)
@@ -1086,9 +1126,6 @@ set(TP_C_SOURCES
     src/distributed/rpc/rref_context.cpp
     src/distributed/rpc/rref_impl.cpp
     src/distributed/rpc/rref_proto.cpp
-    src/distributed/rpc/tensorpipe_agent.cpp
-    src/distributed/rpc/tensorpipe_backend.cpp
-    src/distributed/rpc/tensorpipe_utils.cpp
     src/distributed/rpc/types.cpp
     src/distributed/rpc/unpickled_python_call.cpp
     src/distributed/rpc/unpickled_python_remote_call.cpp
@@ -1115,6 +1152,14 @@ set(TP_C_SOURCES
      src/bindings/python/FileCheck.cpp
      src/Version.cpp
 )
+if(TP_USE_TENSORPIPE)
+    # The tensorpipe transport TUs require its headers; they only join the
+    # extension where the transport was built.
+    list(APPEND TP_C_SOURCES
+        src/distributed/rpc/tensorpipe_agent.cpp
+        src/distributed/rpc/tensorpipe_backend.cpp
+        src/distributed/rpc/tensorpipe_utils.cpp)
+endif()
 if(USE_ROCM)
     # Swap every binding TU over to its hipify-staged copy where one exists
     # (raw CUDA runtime calls in the bindings need the HIP translation too).
@@ -1122,10 +1167,15 @@ if(USE_ROCM)
 endif()
 pybind11_add_module(_C ${TP_C_SOURCES})
 set_target_properties(_C PROPERTIES UNITY_BUILD ON)
-if(NOT WIN32)
-    target_link_libraries(_C PRIVATE p10 tpx stax tp_python tp_distributed tensorpipe)
+# Transport selection follows the dependent options above; the fallback
+# branch keeps the wheel buildable where a transport is unavailable.
+if(TARGET tp_python)
+    target_link_libraries(_C PRIVATE p10 tpx stax tp_python tp_distributed)
 else()
-    target_link_libraries(_C PRIVATE p10 tpx stax tp_distributed tensorpipe)
+    target_link_libraries(_C PRIVATE p10 tpx stax tp_distributed)
+endif()
+if(TP_USE_TENSORPIPE)
+    target_link_libraries(_C PRIVATE tensorpipe)
 endif()
 
 if(TP_CUDA_ENABLED AND TARGET tensorpipe_cuda)

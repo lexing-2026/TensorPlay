@@ -18,7 +18,7 @@
 // where the surrounding code already guarantees AVX2/AVX-512 support
 // (capability TUs or target-attributed functions).
 
-#include <immintrin.h>
+#include "cpu/vec/Intrinsics.h"
 
 #if defined(_MSC_VER) && defined(_M_X64)
 #define TP_SLEEF_CC __vectorcall
@@ -29,6 +29,10 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+// The vector-math entry points exist only on the x86-64 paths; other
+// architectures keep the file includable and compile the scalar fallbacks.
+#if defined(__x86_64__) || defined(_M_X64)
 
 // __m256 (f8)
 __m256 TP_SLEEF_CC Sleef_expf8_u10(__m256);
@@ -263,3 +267,5 @@ inline __m512d hypot(__m512d a, __m512d b) { return Sleef_hypotd8_u05(a, b); }
 } // namespace tpsleef
 } // namespace tensorplay
 
+
+#endif // x86-64 vector-math surface

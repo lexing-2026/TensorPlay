@@ -117,7 +117,6 @@ set(P10_SOURCES
     src/backend/composite/ConvolutionTBC.cpp
     src/backend/composite/Distance.cpp
     src/backend/composite/Dropout.cpp
-    src/backend/composite/FactoryToolsComposite.cpp
     src/backend/composite/Histogram.cpp
     src/backend/composite/Integration.cpp
     src/backend/composite/Itertools.cpp
@@ -165,6 +164,7 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/SparseKernels.cu
         src/backend/cuda/SemiStructuredKernels.cu
         src/backend/cuda/QuantKernels.cu
+        src/backend/cuda/QuantGemmKernels.cu
         src/backend/cuda/ForwardKernels.cu
         src/backend/cuda/FactoryKernels.cu
         src/backend/cuda/EmbeddingKernels.cu
@@ -188,7 +188,6 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/CudaBlasGemm.cpp
         src/backend/cuda/ActivationKernels.cu
         src/backend/cuda/NormalizationKernels.cu
-        src/backend/cuda/LossKernels.cu
         src/backend/cuda/LossFillKernels.cu
         src/backend/cuda/LossCTC.cu
         src/backend/cuda/ConvKernels.cu
@@ -325,6 +324,7 @@ if(USE_VULKAN)
         src/backend/vulkan/ops/Comparison.cpp
         src/backend/vulkan/ops/Indexing.cpp
         src/backend/vulkan/ops/Upsample.cpp
+        src/backend/vulkan/ops/Selection.cpp
         src/backend/vulkan/ops/Where.cpp
         src/backend/vulkan/ops/Pooling.cpp
         src/backend/vulkan/ops/Quant.cpp
@@ -550,6 +550,13 @@ if(USE_VULKAN)
 endif()
 if(USE_CUDA)
     target_link_libraries(p10 PRIVATE CUDA::cudart CUDA::cublas CUDA::cublasLt CUDA::cufft CUDA::cusolver)
+    # CUPTI headers live in the toolkit's extras/CUPTI/include, which the
+    # plain toolkit include dirs do not cover; the imported target does.
+    if(TARGET CUDA::cupti)
+        target_link_libraries(p10 PRIVATE CUDA::cupti)
+    elseif(CUDAToolkit_CUPTI_INCLUDE_DIR)
+        target_include_directories(p10 PRIVATE "${CUDAToolkit_CUPTI_INCLUDE_DIR}")
+    endif()
     target_compile_definitions(p10 PRIVATE USE_CUDA)
     # CUDA 13 moved CUB/thrust under <toolkit>/include/cccl; SparseKernels
     # includes <cub/cub.cuh>, which resolves only with that dir on the path.
