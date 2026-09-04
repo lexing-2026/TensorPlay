@@ -48,6 +48,7 @@ endif()
 # install-prefix cache entry SLEEF's own configure checks; the private
 # prefix keeps the vendored tree's install rules out of the project's.
 function(_tp_add_vendored_sleef)
+    set(TP_SAVED_INSTALL_PREFIX "${CMAKE_INSTALL_PREFIX}")
     set(CMAKE_INSTALL_PREFIX "${CMAKE_BINARY_DIR}/third_party/sleef-prefix"
         CACHE PATH "" FORCE)
     unset(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
@@ -69,6 +70,11 @@ function(_tp_add_vendored_sleef)
     add_subdirectory(
         "${CMAKE_CURRENT_LIST_DIR}/../../third_party/sleef"
         "${CMAKE_BINARY_DIR}/third_party/sleef")
+    # SLEEF's tlfloat ExternalProject bakes CMAKE_INSTALL_PREFIX into its
+    # configure step at generate time; restore the project prefix only
+    # after that value has been captured.
+    set(CMAKE_INSTALL_PREFIX "${TP_SAVED_INSTALL_PREFIX}"
+        CACHE PATH "" FORCE)
 endfunction()
 
 _tp_add_vendored_sleef()

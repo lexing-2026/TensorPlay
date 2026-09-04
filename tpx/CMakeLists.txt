@@ -18,9 +18,13 @@ set_source_files_properties(${GEN_TPX_OPS_CPP} ${GEN_TPX_AUTOGRAD_REG_CPP} ${GEN
 add_library(tpx ${TPX_SOURCES})
 # Engine.cpp instantiates cpu::veccomplex AVX2 inline helpers (VecComplex.h);
 # compile this TU with matching ISA flags so always_inline succeeds.  The
-# complex fast paths themselves are runtime-guarded at their dispatch sites.
-set_source_files_properties(src/Engine.cpp PROPERTIES
-    COMPILE_OPTIONS "-mavx2;-mfma")
+# complex fast paths themselves are runtime-guarded at their dispatch sites,
+# and the helpers compile away entirely on non-x86 hosts, where the flags
+# below are not valid options.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64)|(AMD64|i[3-9]86)")
+    set_source_files_properties(src/Engine.cpp PROPERTIES
+        COMPILE_OPTIONS "-mavx2;-mfma")
+endif()
 set_target_properties(tpx PROPERTIES UNITY_BUILD ON)
 add_dependencies(tpx generate_code)
 target_link_libraries(tpx PRIVATE p10)
