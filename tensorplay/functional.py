@@ -3273,12 +3273,26 @@ def nonzero(input, *, out=None):
             return _captured
     return _C.nonzero(self=input)
 
-def unique(input, sorted=True, return_inverse=False, return_counts=False):
+def unique(input, sorted=True, return_inverse=False, return_counts=False, dim=None):
+    if dim is not None:
+        values, inverse, counts = unique_dim(input, dim, sorted, True, True)
+        outs = [values]
+        if return_inverse:
+            outs.append(inverse)
+        if return_counts:
+            outs.append(counts)
+        return outs[0] if len(outs) == 1 else tuple(outs)
     if _capturing():
         _captured = _capture_call(unique, (input, sorted, return_inverse, return_counts), {})
         if _captured is not None:
             return _captured
-    return _C.unique(input, sorted, return_inverse, return_counts)
+    values, inverse, counts = _C.unique(input, sorted, True, True)
+    outs = [values]
+    if return_inverse:
+        outs.append(inverse)
+    if return_counts:
+        outs.append(counts)
+    return outs[0] if len(outs) == 1 else tuple(outs)
 
 def count_nonzero(input, dim=[]):
     if _capturing():
@@ -4369,14 +4383,14 @@ def index_fill_(input, dim, index, value):
         value = tensorplay.Scalar(value)
     return _C.index_fill_(input, dim, index, value)
 
-def searchsorted(sorted_sequence, input, *, out_int32=False, right=False, out=None):
+def searchsorted(sorted_sequence, input, *, out_int32=False, right=False, side=None, sorter=None, out=None):
     if out is not None:
-        return _C.searchsorted(sorted_sequence, input, out_int32=out_int32, right=right, out=out)
+        return _C.searchsorted(sorted_sequence, input, out_int32=out_int32, right=right, side=side, sorter=sorter, out=out)
     if _capturing():
-        _captured = _capture_call(searchsorted, (sorted_sequence, input), {'out_int32': out_int32, 'right': right})
+        _captured = _capture_call(searchsorted, (sorted_sequence, input), {'out_int32': out_int32, 'right': right, 'side': side, 'sorter': sorter})
         if _captured is not None:
             return _captured
-    return _C.searchsorted(sorted_sequence, input, out_int32=out_int32, right=right)
+    return _C.searchsorted(sorted_sequence, input, out_int32=out_int32, right=right, side=side, sorter=sorter)
 
 def bucketize(input, boundaries, *, out_int32=False, right=False, out=None):
     if out is not None:
