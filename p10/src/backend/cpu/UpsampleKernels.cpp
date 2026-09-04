@@ -470,8 +470,9 @@ Tensor upsample_nearest1d_backward_cpu(const Tensor& grad_output, std::vector<in
     Tensor go = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
     Tensor grad_input = Tensor::zeros(out_shape(go, input_size), go.dtype(), go.device());
     const int64_t dim_b = go.size(0), dim_c = go.size(1);
-    const int64_t src_dim_w = output_size[0];  // W2
-    const int64_t dst_dim_w = input_size[0];   // W1
+    const int64_t src_dim_w = output_size[output_size.size() - 1];  // W2
+    // input_size may carry the full tensor rank; W is the last entry.
+    const int64_t dst_dim_w = input_size[input_size.size() - 1];    // W1
     if (go.numel() == 0 || src_dim_w == 0 || dst_dim_w == 0) return grad_input;
     const int64_t src_c_stride = src_dim_w;
 
@@ -513,8 +514,11 @@ Tensor upsample_nearest2d_backward_cpu(const Tensor& grad_output, std::vector<in
     Tensor go = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
     Tensor grad_input = Tensor::zeros(out_shape(go, input_size), go.dtype(), go.device());
     const int64_t dim_b = go.size(0), dim_c = go.size(1);
-    const int64_t src_dim_h = output_size[0], src_dim_w = output_size[1];   // H2, W2
-    const int64_t dst_dim_h = input_size[0], dst_dim_w = input_size[1];     // H1, W1
+    const int64_t src_dim_h = output_size[output_size.size() - 2],
+                  src_dim_w = output_size[output_size.size() - 1];  // H2, W2
+    // input_size may carry the full tensor rank; H/W are the trailing entries.
+    const int64_t dst_dim_h = input_size[input_size.size() - 2],
+                  dst_dim_w = input_size[input_size.size() - 1];    // H1, W1
     if (go.numel() == 0 || src_dim_h * src_dim_w == 0 || dst_dim_h * dst_dim_w == 0) return grad_input;
     const int64_t dst_c_stride = dst_dim_h * dst_dim_w;
     const int64_t src_c_stride = src_dim_h * src_dim_w;
@@ -577,8 +581,13 @@ Tensor upsample_nearest3d_backward_cpu(const Tensor& grad_output, std::vector<in
     Tensor go = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
     Tensor grad_input = Tensor::zeros(out_shape(go, input_size), go.dtype(), go.device());
     const int64_t dim_b = go.size(0), dim_c = go.size(1);
-    const int64_t src_dim_d = output_size[0], src_dim_h = output_size[1], src_dim_w = output_size[2];
-    const int64_t dst_dim_d = input_size[0], dst_dim_h = input_size[1], dst_dim_w = input_size[2];
+    const int64_t src_dim_d = output_size[output_size.size() - 3],
+                  src_dim_h = output_size[output_size.size() - 2],
+                  src_dim_w = output_size[output_size.size() - 1];
+    // input_size may carry the full tensor rank; D/H/W are the trailing entries.
+    const int64_t dst_dim_d = input_size[input_size.size() - 3],
+                  dst_dim_h = input_size[input_size.size() - 2],
+                  dst_dim_w = input_size[input_size.size() - 1];
     if (go.numel() == 0) return grad_input;
     if (src_dim_d * src_dim_h * src_dim_w == 0 || dst_dim_d * dst_dim_h * dst_dim_w == 0) return grad_input;
     const int64_t dst_c_stride = dst_dim_d * dst_dim_h * dst_dim_w;
@@ -643,7 +652,8 @@ Tensor upsample_linear1d_backward_cpu(const Tensor& grad_output, std::vector<int
     Tensor go = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
     Tensor grad_input = Tensor::zeros(out_shape(go, input_size), go.dtype(), go.device());
     const int64_t N = go.size(0), C = go.size(1);
-    const int64_t W2 = output_size[0], W1 = input_size[0];
+    const int64_t W2 = output_size[output_size.size() - 1],
+                  W1 = input_size[input_size.size() - 1];
     if (go.numel() == 0 || W2 == 0 || W1 == 0) return grad_input;
 
     UP_DISPATCH(go, {
@@ -684,7 +694,8 @@ Tensor upsample_bilinear2d_backward_cpu(const Tensor& grad_output, std::vector<i
     Tensor go = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
     Tensor grad_input = Tensor::zeros(out_shape(go, input_size), go.dtype(), go.device());
     const int64_t batchsize = go.size(0), channels = go.size(1);
-    const int64_t height1 = input_size[0], width1 = input_size[1];
+    const int64_t height1 = input_size[input_size.size() - 2],
+                  width1 = input_size[input_size.size() - 1];
     const int64_t height2 = output_size[0], width2 = output_size[1];
     if (go.numel() == 0 || height2 * width2 == 0 || height1 * width1 == 0) return grad_input;
 
@@ -745,7 +756,9 @@ Tensor upsample_trilinear3d_backward_cpu(const Tensor& grad_output, std::vector<
     Tensor go = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
     Tensor grad_input = Tensor::zeros(out_shape(go, input_size), go.dtype(), go.device());
     const int64_t batchsize = go.size(0), channels = go.size(1);
-    const int64_t depth1 = input_size[0], height1 = input_size[1], width1 = input_size[2];
+    const int64_t depth1 = input_size[input_size.size() - 3],
+                  height1 = input_size[input_size.size() - 2],
+                  width1 = input_size[input_size.size() - 1];
     const int64_t depth2 = output_size[0], height2 = output_size[1], width2 = output_size[2];
     if (go.numel() == 0) return grad_input;
 
@@ -817,7 +830,8 @@ Tensor upsample_bicubic2d_backward_cpu(const Tensor& grad_output, std::vector<in
     Tensor go = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
     Tensor grad_input = Tensor::zeros(out_shape(go, input_size), go.dtype(), go.device());
     const int64_t batchsize = go.size(0), channels = go.size(1);
-    const int64_t input_height = input_size[0], input_width = input_size[1];
+    const int64_t input_height = input_size[input_size.size() - 2],
+                  input_width = input_size[input_size.size() - 1];
     const int64_t output_height = output_size[0], output_width = output_size[1];
     if (go.numel() == 0) return grad_input;
 
@@ -976,14 +990,15 @@ Tensor _upsample_nearest_exact1d_backward_cpu(const Tensor& grad_output, std::ve
     Tensor go = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
     Tensor grad_input = Tensor::zeros(out_shape(go, input_size), go.dtype(), go.device());
     const int64_t dim_b = go.size(0), dim_c = go.size(1);
-    const int64_t src_dim_w = output_size[0];  // W2
-    const int64_t dst_dim_w = input_size[0];   // W1
+    const int64_t src_dim_w = output_size[output_size.size() - 1];  // W2
+    // input_size may carry the full tensor rank; W is the last entry.
+    const int64_t dst_dim_w = input_size[input_size.size() - 1];    // W1
     if (go.numel() == 0 || src_dim_w == 0 || dst_dim_w == 0) return grad_input;
 
     UP_DISPATCH(go, {
         const scalar_t* grad_o = go.data_ptr<scalar_t>();
         scalar_t* grad_i = grad_input.data_ptr<scalar_t>();
-        const float width_scale = compute_scales_value_backwards_f(scales, src_dim_w, dst_dim_w);
+        const float width_scale = compute_scales_value_f(scales, dst_dim_w, src_dim_w);
         std::vector<int64_t> src_tab(static_cast<size_t>(src_dim_w));
         for (int64_t w2 = 0; w2 < src_dim_w; ++w2)
             src_tab[static_cast<size_t>(w2)] = nearest_exact_compute_source_index(width_scale, w2, dst_dim_w);
@@ -1013,15 +1028,18 @@ Tensor _upsample_nearest_exact2d_backward_cpu(const Tensor& grad_output, std::ve
     Tensor go = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
     Tensor grad_input = Tensor::zeros(out_shape(go, input_size), go.dtype(), go.device());
     const int64_t dim_b = go.size(0), dim_c = go.size(1);
-    const int64_t src_dim_h = output_size[0], src_dim_w = output_size[1];
-    const int64_t dst_dim_h = input_size[0], dst_dim_w = input_size[1];
+    const int64_t src_dim_h = output_size[output_size.size() - 2],
+                  src_dim_w = output_size[output_size.size() - 1];
+    // input_size may carry the full tensor rank; H/W are the trailing entries.
+    const int64_t dst_dim_h = input_size[input_size.size() - 2],
+                  dst_dim_w = input_size[input_size.size() - 1];
     if (go.numel() == 0 || src_dim_h * src_dim_w == 0 || dst_dim_h * dst_dim_w == 0) return grad_input;
 
     UP_DISPATCH(go, {
         const scalar_t* grad_o = go.data_ptr<scalar_t>();
         scalar_t* grad_i = grad_input.data_ptr<scalar_t>();
-        const float height_scale = compute_scales_value_backwards_f(scales_h, src_dim_h, dst_dim_h);
-        const float width_scale = compute_scales_value_backwards_f(scales_w, src_dim_w, dst_dim_w);
+        const float height_scale = compute_scales_value_f(scales_h, dst_dim_h, src_dim_h);
+        const float width_scale = compute_scales_value_f(scales_w, dst_dim_w, src_dim_w);
         auto preimage = [](float scale, int64_t src_dim, int64_t dst_dim) {
             std::vector<int64_t> src_tab(static_cast<size_t>(src_dim));
             for (int64_t i = 0; i < src_dim; ++i)
@@ -1060,8 +1078,13 @@ Tensor _upsample_nearest_exact3d_backward_cpu(const Tensor& grad_output, std::ve
     Tensor go = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
     Tensor grad_input = Tensor::zeros(out_shape(go, input_size), go.dtype(), go.device());
     const int64_t dim_b = go.size(0), dim_c = go.size(1);
-    const int64_t src_d = output_size[0], src_h = output_size[1], src_w = output_size[2];
-    const int64_t dst_d = input_size[0], dst_h = input_size[1], dst_w = input_size[2];
+    const int64_t src_d = output_size[output_size.size() - 3],
+                  src_h = output_size[output_size.size() - 2],
+                  src_w = output_size[output_size.size() - 1];
+    // input_size may carry the full tensor rank; D/H/W are the trailing entries.
+    const int64_t dst_d = input_size[input_size.size() - 3],
+                  dst_h = input_size[input_size.size() - 2],
+                  dst_w = input_size[input_size.size() - 1];
     if (go.numel() == 0 || src_d * src_h * src_w == 0 || dst_d * dst_h * dst_w == 0) return grad_input;
 
     UP_DISPATCH(go, {
@@ -1076,9 +1099,9 @@ Tensor _upsample_nearest_exact3d_backward_cpu(const Tensor& grad_output, std::ve
                 lo[static_cast<size_t>(j)] = static_cast<int64_t>(std::lower_bound(src_tab.begin(), src_tab.end(), j) - src_tab.begin());
             return lo;
         };
-        const std::vector<int64_t> dlo = preimage(compute_scales_value_backwards_f(scales_d, src_d, dst_d), src_d, dst_d);
-        const std::vector<int64_t> hlo = preimage(compute_scales_value_backwards_f(scales_h, src_h, dst_h), src_h, dst_h);
-        const std::vector<int64_t> wlo = preimage(compute_scales_value_backwards_f(scales_w, src_w, dst_w), src_w, dst_w);
+        const std::vector<int64_t> dlo = preimage(compute_scales_value_f(scales_d, dst_d, src_d), src_d, dst_d);
+        const std::vector<int64_t> hlo = preimage(compute_scales_value_f(scales_h, dst_h, src_h), src_h, dst_h);
+        const std::vector<int64_t> wlo = preimage(compute_scales_value_f(scales_w, dst_w, src_w), src_w, dst_w);
         parallel_for(0, dim_b * dim_c, 1, [&](int64_t begin, int64_t end) {
             for (int64_t bc = begin; bc < end; ++bc) {
                 const scalar_t* go_base = grad_o + bc * src_d * src_h * src_w;
@@ -1308,8 +1331,10 @@ Tensor aa_2d_backward(const Tensor& grad_output, const std::vector<int64_t>& out
     Tensor go = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
     Tensor grad_input = Tensor::zeros(out_shape(go, input_size), go.dtype(), go.device());
     const int64_t N = go.size(0), C = go.size(1);
-    const int64_t H1 = input_size[0], W1 = input_size[1];
-    const int64_t H2 = output_size[0], W2 = output_size[1];
+    const int64_t H1 = input_size[input_size.size() - 2],
+                  W1 = input_size[input_size.size() - 1];
+    const int64_t H2 = output_size[output_size.size() - 2],
+                  W2 = output_size[output_size.size() - 1];
     if (go.numel() == 0 || H1 == 0 || W1 == 0 || H2 == 0 || W2 == 0) return grad_input;
 
     const AaAxis ah = aa_axis_weights(H1, H2, aa_axis_scale(H1, H2, align_corners, scales_h), taps_half, filter);
