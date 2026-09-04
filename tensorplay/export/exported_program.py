@@ -18,6 +18,7 @@ from .graph_signature import (
 )
 
 __all__ = [
+    "EqualityConstraint",
     "ExportedProgram",
     "ModuleCallEntry",
     "ModuleCallSignature",
@@ -46,6 +47,33 @@ class ModuleCallSignature:
 class ModuleCallEntry:
     fqn: str
     signature: ModuleCallSignature | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class EqualityConstraint:
+    """Ties several input sites to one shared dimension size.
+
+    ``sites`` lists every ``(input placeholder name, dim index)`` pair whose
+    runtime sizes must stay equal; ``name`` is the symbolic dimension they
+    implement when the tie comes from a shared :class:`Dim`, else ``None``.
+    """
+
+    sites: tuple[tuple[str, int], ...]
+    name: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "sites", tuple((str(item), int(dim)) for item, dim in self.sites)
+        )
+        if len(self.sites) < 2:
+            raise ValueError("an equality constraint needs at least two sites")
+
+    @property
+    def dim_pairs(self) -> tuple[tuple[str, int], ...]:
+        return self.sites
+
+    def __repr__(self) -> str:
+        return f"EqualityConstraint(sites={self.sites!r}, name={self.name!r})"
 
 
 def _strip_mutation_outputs(graph_module: GraphModule, value: Any) -> Any:
@@ -155,6 +183,15 @@ class _CallSpec(NamedTuple):
     out_spec: TreeSpec | None
 
 
+class _ProgramBindings(NamedTuple):
+    """Precomputed input-layout facts used on every program invocation."""
+
+    key: int
+    state_specs: tuple[Any, ...]
+    state_names: frozenset[str]
+    user_placeholders: tuple[str, ...]
+
+
 class Verifier:
     """Structural checks every captured program must satisfy."""
 
@@ -240,7 +277,14 @@ class ExportedProgram:
     dynamic_shapes: Any = None
     module_call_graph: list[ModuleCallEntry] = dataclasses.field(default_factory=list)
     range_constraints: dict[Any, Any] = dataclasses.field(default_factory=dict)
+    equality_constraints: list[EqualityConstraint] = dataclasses.field(default_factory=list)
     verifier: Any = None
+    _bindings: Any = dataclasses.field(
+        default=None, init=False, repr=False, compare=False
+    )
+    _unlifted: Any = dataclasses.field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         if isinstance(self.graph_signature, GraphSignature):
@@ -252,12 +296,18 @@ class ExportedProgram:
             self.dynamic_shapes = {}
         self.module_call_graph = list(self.module_call_graph)
         self.range_constraints = dict(self.range_constraints)
+        self.equality_constraints = list(self.equality_constraints)
         if self.verifier is None:
             self.verifier = Verifier()
 
     @property
     def graph(self):
         return self.graph_module.graph
+
+    @property
+    def code(self) -> str:
+        """Python source of the captured graph's generated forward."""
+        return self.graph_module.graph.python_code()
 
     @property
     def call_spec(self) -> _CallSpec:
@@ -268,6 +318,11 @@ class ExportedProgram:
     def constants(self) -> dict[str, Any]:
         constants = getattr(self.graph_module, "meta", {}).get("constants", {})
         return dict(constants)
+
+    @property
+    def tensor_constants(self) -> dict[str, Any]:
+        """Lifted non-parameter, non-buffer tensor values."""
+        return self.constants
 
     def _mutation_count(self) -> int:
         return int(getattr(self.graph_module, "meta", {}).get("num_mutations", 0) or 0)
@@ -282,14 +337,23 @@ class ExportedProgram:
 
         The returned module takes only the user arguments: state placeholders
         are rewritten into attribute reads on a fresh module that owns the
-        parameter, buffer, and constant values.
+        parameter, buffer, and constant values.  The result is cached; pass
+        ``rebind`` to drop state changes made through this program view.
         """
-
+        if self._unlifted is not None:
+            return self._unlifted
         state_specs = self._state_specs()
         if not state_specs:
             self.graph_module.recompile()
-            return self.graph_module
-        return _unlift_exported_program_lifted_states(self)
+            result = self.graph_module
+        else:
+            result = _unlift_exported_program_lifted_states(self)
+        self._unlifted = result
+        return result
+
+    def invalidate_unlifted(self) -> None:
+        """Drop the cached unlifted module so the next call rebuilds it."""
+        self._unlifted = None
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         call_kwargs = self._user_call_kwargs(args, kwargs)
@@ -385,11 +449,34 @@ class ExportedProgram:
             yield from method()
 
     def _state_specs(self) -> list[Any]:
-        return [
+        return list(self._layout().state_specs)
+
+    def _layout(self) -> "_ProgramBindings":
+        """Cached input-layout facts, keyed by the signature spec list object.
+
+        The cache is refreshed whenever the signature's spec list is replaced
+        (deep copies, passes, token removal); in-place arg renames do not
+        change the layout, so they keep the cache valid.
+        """
+
+        key = id(self.graph_signature.input_specs)
+        cached = self._bindings
+        if cached is not None and cached.key == key:
+            return cached
+        state_specs = tuple(
             spec
             for spec in self.graph_signature.input_specs
             if spec.kind is not InputKind.USER_INPUT
-        ]
+        )
+        state_names = frozenset(spec.arg.name for spec in state_specs)
+        user_placeholders = tuple(
+            node.name
+            for node in self.graph.placeholders
+            if node.name not in state_names
+        )
+        bindings = _ProgramBindings(key, state_specs, state_names, user_placeholders)
+        self._bindings = bindings
+        return bindings
 
     def _resolve_state_value(self, target: str) -> Any:
         value: Any = self.graph_module.root
@@ -400,22 +487,27 @@ class ExportedProgram:
     def _user_call_kwargs(self, args: Any, kwargs: Any) -> dict[str, Any]:
         """Bind user arguments by name and fill lifted state values."""
 
-        state_names = {spec.arg.name for spec in self._state_specs()}
-        user_placeholders = [
-            node for node in self.graph.placeholders if node.name not in state_names
-        ]
+        bindings = self._layout()
         call_kwargs = dict(kwargs)
-        for node, value in zip(user_placeholders, args):
-            if node.name in call_kwargs:
-                raise TypeError(f"duplicate value for argument {node.name!r}")
-            call_kwargs[node.name] = value
-        for node in user_placeholders:
-            if node.name in call_kwargs:
+        placeholders = self.graph.placeholders
+        user_names = bindings.user_placeholders
+        nodes_by_name = {node.name: node for node in placeholders}
+        for index, name in enumerate(user_names):
+            if index < len(args):
+                if name in call_kwargs:
+                    raise TypeError(f"duplicate value for argument {name!r}")
+                call_kwargs[name] = args[index]
+        for name in user_names:
+            if name in call_kwargs:
                 continue
-            if node.name not in self.example_inputs:
-                raise TypeError(f"missing required export input: {node.name}")
-            call_kwargs[node.name] = self.example_inputs[node.name]
-        for spec in self._state_specs():
+            if name not in self.example_inputs:
+                raise TypeError(f"missing required export input: {name}")
+            call_kwargs[name] = self.example_inputs[name]
+        if len(args) > len(user_names):
+            raise TypeError(
+                f"expected at most {len(user_names)} positional arguments, got {len(args)}"
+            )
+        for spec in bindings.state_specs:
             call_kwargs[spec.arg.name] = self._resolve_state_value(spec.target)
         return call_kwargs
 
@@ -438,7 +530,12 @@ class ExportedProgram:
         return tuple(ordered)
 
     def _check_input_constraints(self, flat_args_with_path: Any) -> None:
-        """Fail fast on structurally invalid inputs."""
+        """Fail fast on structurally invalid inputs.
+
+        Checks the leaf count against the user-input specs and, when the
+        capture recorded a call contract, the tree structure of the caller's
+        argument container.
+        """
 
         user_specs = [
             spec for spec in self.graph_signature.input_specs
@@ -448,6 +545,16 @@ class ExportedProgram:
         if len(flat) != len(user_specs):
             raise TypeError(
                 f"expected {len(user_specs)} flattened user inputs, got {len(flat)}"
+            )
+        in_spec = self.call_spec.in_spec
+        if in_spec is None:
+            return
+        from ..graph._pytree import tree_flatten as _flatten
+
+        _leaves, actual = _flatten(tuple(flat))
+        if actual != in_spec:
+            raise TypeError(
+                "input tree structure does not match the captured call contract"
             )
 
     @staticmethod

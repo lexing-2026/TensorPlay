@@ -14,11 +14,23 @@ from typing import Any
 __all__ = [
     "AdditionalInputs",
     "Constraint",
+    "ConstraintsExceededError",
     "Dim",
+    "DerivedDim",
     "ShapesCollection",
     "dims",
     "refine_dynamic_shapes_from_suggested_fixes",
 ]
+
+
+class ConstraintsExceededError(RuntimeError):
+    """A runtime input violated the declared dynamic-shape contract.
+
+    Raised by the assertions inserted into captured graphs and by export-time
+    validation when an example input falls outside a declared range.  It is a
+    ``RuntimeError`` so callers written against plain runtime failures keep
+    working.
+    """
 
 
 class _DimHintType(Enum):
@@ -222,6 +234,11 @@ class _DerivedDim(Dim):
 
     def __repr__(self) -> str:
         return self.__name__
+
+
+DerivedDim = _DerivedDim
+"""Public alias for a linear expression ``scale * root + offset`` over one
+base dimension."""
 
 
 def dims(*names: str, min: int | None = None, max: int | None = None) -> tuple[Dim, ...]:
@@ -641,7 +658,13 @@ def _check_dynamic_shapes(
                     lower = f"min={dim.min}" if dim.min else ""
                     upper = f"max={dim.max}" if dim.max is not None else ""
                     bound = ", ".join(item for item in (lower, upper) if item)
-                    suggested = Dim(dim.__name__, min=max(dim.min, 1), max=dim.max)
+                    # widen to include the observed size: the repaired range
+                    # covers the example input, keeping the dim dynamic
+                    suggested = Dim(
+                        dim.__name__,
+                        min=min(dim.min, size[index]),
+                        max=None if dim.max is None else max(dim.max, size[index]),
+                    )
                     raise ValueError(
                         f"input size {size[index]} of dimension {index} at "
                         f"dynamic_shapes{_render_path(path)} violates {dim.__name__}"

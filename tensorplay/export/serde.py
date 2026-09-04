@@ -416,6 +416,13 @@ def serialize(
             str(name): bounds
             for name, bounds in (program.range_constraints or {}).items()
         },
+        "equality_constraints": [
+            {
+                "sites": [[name, int(dim)] for name, dim in constraint.sites],
+                "name": constraint.name,
+            }
+            for constraint in (program.equality_constraints or [])
+        ],
         "dynamic_shapes": _encode_dynamic_shapes(program.dynamic_shapes),
         "meta": {
             "num_mutations": graph_module.meta.get("num_mutations", 0),
@@ -447,7 +454,7 @@ def deserialize(
 
     import tensorplay as tp
     from ..graph import Graph, GraphModule
-    from .exported_program import ExportedProgram, ModuleCallEntry
+    from .exported_program import EqualityConstraint, ExportedProgram, ModuleCallEntry
     from .graph_signature import ExportGraphSignature
 
     if isinstance(artifact, SerializedArtifact):
@@ -552,6 +559,13 @@ def deserialize(
         range_constraints={
             key: value for key, value in document.get("range_constraints", {}).items()
         },
+        equality_constraints=[
+            EqualityConstraint(
+                tuple((name, int(dim)) for name, dim in entry["sites"]),
+                name=entry.get("name"),
+            )
+            for entry in document.get("equality_constraints", [])
+        ],
     )
     return program
 

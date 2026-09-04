@@ -55,7 +55,7 @@ def _add_indent(s_, num_spaces: int):
     if len(s) == 1:
         return s_
     first = s.pop(0)
-    s = [(num_spaces * " ") + line for line in s]
+    s = [(num_spaces * " ") + line if line.strip() else "" for line in s]
     s = "\n".join(s)
     s = first + "\n" + s
     return s

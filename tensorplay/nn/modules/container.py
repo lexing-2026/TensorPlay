@@ -735,8 +735,7 @@ class ParameterList(Module):
                     device_ = ""
                 param_ = 'Parameter' if isinstance(p, Parameter) else 'Tensor'
                 lines.append(
-                    "  (" + str(k) + "): " + param_ + " containing: [{" + str(p.dtype) + \
-                    "} of size {" + size_ + "}{" + device_ + "}]"
+                    f"  ({k}): {param_} containing: [{p.dtype} of size {size_}{device_}]"
                 )
             else:
                 lines.append("  (" + str(k) + "): Object of type: " + type(p).__name__)
@@ -963,8 +962,8 @@ class ParameterDict(Module):
                     device_ = ""
                 param_ = 'Parameter' if isinstance(p, Parameter) else 'Tensor'
                 lines.append(
-                    "  (" + str(k) + "): " + param_ + " containing: [{" + tensorplay.typename(p) + \
-                    "} of size {" + size_ + "}{" + device_ + "}]"
+                    f"  ({k}): {param_} containing: "
+                    f"[{tensorplay.typename(p)} of size {size_}{device_}]"
                 )
             else:
                 lines.append(
