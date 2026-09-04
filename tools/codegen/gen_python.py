@@ -385,6 +385,36 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
             ]
             continue
 
+        if name == 'unique' and 'function' in f.variants:
+            seen.add(name)
+            # dim form routes to unique_dim; the flat form always computes
+            # all three outputs and trims them in Python, matching the
+            # reference contract of returning 1/2/3 tensors by flags.
+            lines += [
+                'def unique(input, sorted=True, return_inverse=False, return_counts=False, dim=None):',
+                '    if dim is not None:',
+                '        values, inverse, counts = unique_dim(input, dim, sorted, True, True)',
+                '        outs = [values]',
+                '        if return_inverse:',
+                '            outs.append(inverse)',
+                '        if return_counts:',
+                '            outs.append(counts)',
+                '        return outs[0] if len(outs) == 1 else tuple(outs)',
+                '    if _capturing():',
+                '        _captured = _capture_call(unique, (input, sorted, return_inverse, return_counts), {})',
+                '        if _captured is not None:',
+                '            return _captured',
+                '    values, inverse, counts = _C.unique(input, sorted, True, True)',
+                '    outs = [values]',
+                '    if return_inverse:',
+                '        outs.append(inverse)',
+                '    if return_counts:',
+                '        outs.append(counts)',
+                '    return outs[0] if len(outs) == 1 else tuple(outs)',
+                '',
+            ]
+            continue
+
         if name == 'unique_consecutive' and 'function' in f.variants:
             seen.add(name)
             # flags false only the output tensor is returned.

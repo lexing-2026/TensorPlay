@@ -320,7 +320,7 @@ class TestEngineMaterialization:
             def backward(ctx, g0, g1):
                 # o1 received a real gradient; o2 was unused -> its slot
                 # must arrive as None under materialize_grads=False.
-                seen["none"] = g1 is None and not (g0 is None)
+                seen["none"] = g1 is None and g0 is not None
                 return None  # nothing further to propagate
 
         x = _ones_leaf(2)
