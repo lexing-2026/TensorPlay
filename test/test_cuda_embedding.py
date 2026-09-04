@@ -6,6 +6,9 @@ import numpy as np
 import pytest
 import torch
 
+if not torch.cuda.is_available():
+    pytest.skip("torch CUDA not available", allow_module_level=True)
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import tensorplay as tp
 

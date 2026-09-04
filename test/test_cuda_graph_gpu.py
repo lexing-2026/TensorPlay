@@ -228,6 +228,9 @@ def test_replay_on_multiple_streams():
     side = tp.cuda.Stream()
     a = tp.randn((32, 32), device=device)
     static_x.copy_(a)
+    # copy_ runs on the default stream; the replay on a non-blocking side
+    # stream must not race with it, so order them through an event.
+    side.wait_stream(tp.cuda.current_stream())
     with tp.cuda.stream(side):
         g.replay()
     tp.cuda.synchronize()
@@ -245,6 +248,7 @@ def test_explicit_stream_replay_overload():
         static_y = static_x @ w
     side = tp.cuda.Stream()
     static_x.copy_(tp.ones((16, 16), device=device))
+    side.wait_stream(tp.cuda.current_stream())
     g.replay(stream=side)
     tp.cuda.synchronize()
     assert tp.allclose(static_y, tp.ones((16, 16), device=device) @ w)
