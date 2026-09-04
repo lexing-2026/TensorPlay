@@ -536,3 +536,300 @@ def test_unflatten_hierarchical_mutation_and_multi_output():
     ref1, ref2 = model(x)
     assert out1.tolist() == ref1.tolist()
     assert out2.tolist() == ref2.tolist()
+
+
+# ---------------------------------------------------------------------------
+# graph signature helpers
+# ---------------------------------------------------------------------------
+
+
+def test_graph_signature_param_buffer_predicates_and_clone():
+    import copy
+
+    program = tp_export.export(MLP(), tp.randn(2, 4))
+    signature = program.graph_signature
+    placeholder = next(iter(signature.inputs_to_parameters))
+    assert signature.is_param(placeholder)
+    assert not signature.is_buffer(placeholder)
+    buffer_placeholder = next(iter(signature.inputs_to_buffers))
+    assert signature.is_buffer(buffer_placeholder)
+    assert not signature.is_param(buffer_placeholder)
+
+    clone = signature.clone()
+    clone.input_specs[0].arg.name = "renamed"
+    assert signature.input_specs[0].arg.name != "renamed"
+    roundtrip = copy.deepcopy(signature)
+    assert roundtrip.input_specs[0].arg.name == signature.input_specs[0].arg.name
+    assert signature.tensor_constants == ()
+    assert signature.custom_objs == ()
+
+
+# ---------------------------------------------------------------------------
+# ExportedProgram additions
+# ---------------------------------------------------------------------------
+
+
+def test_exported_program_code_and_tensor_constants():
+    class Block(tp.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale_const = tp.randn(2)
+
+        def forward(self, x):
+            return x * self.scale_const
+
+    program = tp_export.export(Block(), tp.randn(2))
+    assert "def forward" in program.code
+    assert "scale_const" in program.tensor_constants
+
+
+def test_exported_program_module_cached_and_invalidation():
+    model = MLP()
+    program = tp_export.export(model, tp.randn(2, 4))
+    first = program.module()
+    assert program.module() is first
+    program.invalidate_unlifted()
+    assert program.module() is not first
+
+
+def test_exported_program_rejects_extra_positional_args():
+    program = tp_export.export(MLP(), tp.randn(2, 4))
+    with pytest.raises(TypeError, match="positional"):
+        program(tp.randn(2, 4), tp.randn(2, 4))
+
+
+# ---------------------------------------------------------------------------
+# equality constraints
+# ---------------------------------------------------------------------------
+
+
+def test_equality_constraint_records_shared_dim_sites():
+    batch = tp_export.Dim("batch")
+    program = tp_export.export(
+        lambda a, b: a.sum() + b.sum(),
+        tp.randn(4, 3),
+        tp.randn(4, 3),
+        dynamic_shapes={"a": {0: batch}, "b": {0: batch}},
+    )
+    assert program.equality_constraints == [
+        tp_export.EqualityConstraint((("a", 0), ("b", 0)), name="batch")
+    ]
+    with pytest.raises(ValueError, match="two sites"):
+        tp_export.EqualityConstraint((("a", 0),))
+
+
+def test_save_load_roundtrips_equality_constraints(tmp_path):
+    import io
+
+    batch = tp_export.Dim("batch")
+    program = tp_export.export(
+        lambda a, b: a.sum() + b.sum(),
+        tp.randn(4, 3),
+        tp.randn(4, 3),
+        dynamic_shapes={"a": {0: batch}, "b": {0: batch}},
+    )
+    buffer = io.BytesIO()
+    tp_export.save(program, buffer)
+    buffer.seek(0)
+    loaded = tp_export.load(buffer)
+    assert loaded.equality_constraints == program.equality_constraints
+
+
+# ---------------------------------------------------------------------------
+# export-time constraint solver
+# ---------------------------------------------------------------------------
+
+
+def test_inconsistent_shared_dim_fails_at_export_with_suggested_fixes():
+    d = tp_export.Dim("d")
+    with pytest.raises(Exception, match="Suggested fixes"):
+        tp_export.export(
+            lambda a, b: a.sum() + b.sum(),
+            tp.randn(4, 3),
+            tp.randn(5, 3),
+            dynamic_shapes={"a": {0: d}, "b": {0: d}},
+        )
+
+
+def test_static_dim_conflicting_sizes_still_fail_at_export():
+    with pytest.raises(Exception, match="Suggested fixes"):
+        tp_export.export(
+            lambda a, b: a.sum() + b.sum(),
+            tp.randn(4, 3),
+            tp.randn(5, 3),
+            dynamic_shapes={
+                "a": {0: tp_export.Dim("d", min=4, max=4)},
+                "b": {0: tp_export.Dim("d", min=4, max=4)},
+            },
+        )
+
+
+def test_derived_dim_public_alias():
+    base = tp_export.Dim("base")
+    assert isinstance(base * 2, tp_export.DerivedDim)
+
+
+def test_runtime_assertions_raise_constraints_exceeded_error():
+    bounded = tp_export.Dim("bounded", min=2, max=8)
+    program = tp_export.export(
+        lambda t: t * 2, tp.randn(4), dynamic_shapes={"t": {0: bounded}}
+    )
+    with pytest.raises(tp_export.ConstraintsExceededError, match="runtime assertion"):
+        program(tp.randn(1))
+
+
+# ---------------------------------------------------------------------------
+# draft export diagnostics
+# ---------------------------------------------------------------------------
+
+
+def test_draft_export_checks_graph_against_eager():
+    ok = tp_export.draft_export(lambda t: t.relu() + 1, tp.randn(3))
+    assert ok.success and ok.exported_program is not None
+
+
+def test_draft_export_apply_suggested_fixes_repairs_spec():
+    # range violation: the suggested fix widens the declared range to cover
+    # the example input, so the re-export succeeds
+    d = tp_export.Dim("d", min=10)
+    bad = tp_export.draft_export(
+        lambda t: t * 2, tp.randn(4), dynamic_shapes={"t": {0: d}}
+    )
+    assert not bad.success
+    fixed = bad.apply_suggested_fixes()
+    assert fixed is not None
+    assert fixed(tp.randn(4)).shape == (4,)
+    assert fixed(tp.randn(12)).shape == (12,)
+
+
+# ---------------------------------------------------------------------------
+# container-element mutation contract
+# ---------------------------------------------------------------------------
+
+
+def test_export_records_list_element_mutation_and_reread():
+    def fn(items):
+        items[0].mul_(2.0)
+        return items[0] + items[1]
+
+    program = tp_export.export(fn, [tp.randn(3), tp.randn(3)])
+    assert list(program.graph_signature.user_inputs_to_mutate.values()) == ["items"]
+
+    fresh = [tp.randn(3), tp.randn(3)]
+    snapshot = [t.clone() for t in fresh]
+    expected = fn(snapshot)
+    actual = program(fresh)
+    assert actual.tolist() == expected.tolist()
+    # the mutated element is written back, matching eager aliasing
+    assert fresh[0].tolist() == snapshot[0].tolist()
+
+
+def test_export_dict_value_mutation_recorded():
+    def fn(pairs):
+        pairs["a"].add_(1.0)
+        return pairs["a"] * pairs["b"]
+
+    fresh = {"a": tp.randn(3), "b": tp.randn(3)}
+    snapshot = {k: v.clone() for k, v in fresh.items()}
+    program = tp_export.export(fn, fresh)
+    expected = fn(snapshot)
+    assert program(fresh).tolist() == expected.tolist()
+    assert fresh["a"].tolist() == snapshot["a"].tolist()
+
+
+# ---------------------------------------------------------------------------
+# custom object registration
+# ---------------------------------------------------------------------------
+
+
+def test_register_dataclass_serialized_name_and_none_fields():
+    from dataclasses import dataclass as _dataclass
+
+    @_dataclass
+    class Opt:
+        x: object
+        y: object = None
+
+    tp_export.register_dataclass(Opt, serialized_type_name="examples_pkg.Opt")
+    from tensorplay.export.custom_obj import registered_dataclass_name
+    from tensorplay.graph._pytree import tree_flatten, tree_unflatten
+
+    assert registered_dataclass_name(Opt) == "examples_pkg.Opt"
+    value = Opt(tp.randn(3), None)
+    leaves, spec = tree_flatten(value)
+    assert len(leaves) == 2 and leaves[1] is None
+    rebuilt = tree_unflatten(leaves, spec)
+    assert isinstance(rebuilt, Opt) and rebuilt.y is None
+
+
+# ---------------------------------------------------------------------------
+# archive additions
+# ---------------------------------------------------------------------------
+
+
+def test_weight_type_roles_declared():
+    from tensorplay.export import WeightType
+
+    assert int(WeightType.PARAMETER) == 0
+    assert WeightType.BUFFER.name == "BUFFER"
+
+
+def test_multimodal_archive_save_and_load(tmp_path):
+    from tensorplay.export.pt2_archive import load_multimodal_pt2, save_multimodal_pt2
+
+    encoder = tp_export.export(MLP(), tp.randn(3, 4))
+    head = tp_export.export(lambda t: t.relu(), tp.randn(5))
+    path = tmp_path / "multi.pt2"
+    save_multimodal_pt2(str(path), {"encoder": encoder, "head": head})
+    loaded = load_multimodal_pt2(str(path))
+    assert set(loaded) == {"encoder", "head"}
+    x = tp.randn(2, 4)
+    assert loaded["encoder"](x).tolist() == encoder(x).tolist()
+    sample = tp.randn(3)
+    assert loaded["head"](sample).tolist() == head(sample).tolist()
+    assert any(
+        isinstance(v, tp.nn.Parameter) for v in loaded["encoder"].state_dict.values()
+    )
+
+
+# ---------------------------------------------------------------------------
+# passes
+# ---------------------------------------------------------------------------
+
+
+def test_runtime_dependent_decomposition_pass_rewrites_sites():
+    from tensorplay.export.passes import (
+        RuntimeDependentDecompositionPass,
+        register_runtime_dependent_op,
+    )
+
+    program = tp_export.export(lambda a: (a + 1).relu(), tp.randn(4))
+    register_runtime_dependent_op(
+        "relu", lambda graph, node: graph.call_method("clamp_min", (node.args[0], 0.0))
+    )
+    result = RuntimeDependentDecompositionPass()(program.graph_module)
+    assert result is not None and result.modified
+    names = [
+        getattr(node.target, "__name__", node.target)
+        for node in result.graph_module.graph.nodes
+        if node.op in ("call_function", "call_method")
+    ]
+    assert "clamp_min" in names and "relu" not in names
+    x = tp.randn(3)
+    assert program(x).tolist() == (x + 1).clamp_min(0.0).tolist()
+    assert RuntimeDependentDecompositionPass()(program.graph_module) is None
+
+
+def test_update_tensor_list_mutable_validates_declared_list():
+    from tensorplay.export.experimental import update_tensor_list_mutable
+
+    def fn(items):
+        items[0].mul_(2.0)
+        return items[0] + items[1]
+
+    a, b = tp.randn(3), tp.randn(3)
+    program = tp_export.export(fn, [a, b])
+    update_tensor_list_mutable(program, [a, b])
+    update_tensor_list_mutable(program)
+    with pytest.raises(ValueError, match="mutable_from_list"):
+        update_tensor_list_mutable(program, [tp.randn(3)])

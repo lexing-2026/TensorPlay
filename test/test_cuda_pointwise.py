@@ -40,7 +40,7 @@ class TestCUDAPointwise(unittest.TestCase):
 
         # Ceil
         res = tp.ceil(a)
-        expected = [math.ceil(x) for x in a.cpu().numpy()]
+        expected = [float(math.ceil(x)) for x in a.cpu().numpy()]
         self.assertTrue(tp.allclose(res.cpu(), tp.tensor(expected)), "Ceil failed")
         
         # Sqrt (only positive)
