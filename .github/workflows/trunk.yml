@@ -23,6 +23,7 @@ jobs:
     outputs:
       cpu: ${{ steps.read-matrix.outputs.cpu }}
       cuda: ${{ steps.read-matrix.outputs.cuda }}
+      cuda_trunk: ${{ steps.read-matrix.outputs.cuda_trunk }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -32,6 +33,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Trunk lane: newest toolkit only, one wheel per CUDA platform;
+          # tags and release branches build every configured variant.
+          cuda_trunk_matrix="$(jq -c --slurpfile variants .github/cuda-variants.json '
+            [
+              .cuda_platforms[] as $platform |
+              {
+                platform: $platform.name,
+                runner: $platform.runner,
+                python: "3.12",
+                variant: ($variants[0][-1].variant),
+                toolkit: ($variants[0][-1].toolkit),
+                build_name: ("tensorplay-" + $platform.name + "-" + ($variants[0][-1].variant) + "-py3_12")
+              }
+            ]
+          ' .github/wheel-platforms.json)"
+          echo "cuda_trunk=$cuda_trunk_matrix" >> "$GITHUB_OUTPUT"
           cpu_matrix="$(jq -c '
             [
               .cpu_platforms[] as $platform |
@@ -82,6 +99,9 @@ jobs:
       python_version: ${{ matrix.python }}
 
   cuda-build:
+    # Plain main pushes build one regression lane per platform (the newest
+    # toolkit); tags and release branches expand to every configured
+    # variant, where the wheels are actually published.
     name: ${{ matrix.build_name }}-build-test
     needs: define-wheel-matrix
     permissions:
@@ -89,7 +109,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(needs.define-wheel-matrix.outputs.cuda) }}
+        include: ${{ fromJSON((github.ref_type == 'tag' || startsWith(github.ref_name, 'release/')) && needs.define-wheel-matrix.outputs.cuda || needs.define-wheel-matrix.outputs.cuda_trunk) }}
     uses: ./.github/workflows/_binary-build-test.yml
     with:
       build_name: ${{ matrix.build_name }}

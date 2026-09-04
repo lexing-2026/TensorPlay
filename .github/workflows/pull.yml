@@ -1,7 +1,7 @@
 name: pull
 
-# PR CI matrix. Each job builds and smoke-tests its wheel on the same runner,
-# so no wheel needs to cross jobs or be stored as an Actions artifact.
+# PR CI: lint plus one CPU smoke build. The full platform/variant wheel
+# matrix runs on trunk (main pushes) and release tags, not on every PR.
 
 on:
   pull_request:
@@ -16,83 +16,15 @@ concurrency:
 permissions: read-all
 
 jobs:
-  define-wheel-matrix:
-    name: define-wheel-matrix
-    runs-on: ubuntu-latest
-    outputs:
-      cpu: ${{ steps.read-matrix.outputs.cpu }}
-      cuda: ${{ steps.read-matrix.outputs.cuda }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: false
-          show-progress: false
-      - id: read-matrix
-        shell: bash
-        run: |
-          set -euo pipefail
-          cpu_matrix="$(jq -c '
-            [
-              .cpu_platforms[] as $platform |
-              .python_versions[] as $python |
-              {
-                platform: $platform.name,
-                runner: $platform.runner,
-                python: $python,
-                build_name: ("tensorplay-" + $platform.name + "-py" + ($python | gsub("\\."; "_")) + "-cpu")
-              }
-            ]
-          ' .github/wheel-platforms.json)"
-          cuda_matrix="$(jq -c --slurpfile variants .github/cuda-variants.json '
-            [
-              .cuda_platforms[] as $platform |
-              .python_versions[] as $python |
-              $variants[0][] as $cuda |
-              {
-                platform: $platform.name,
-                runner: $platform.runner,
-                python: $python,
-                variant: $cuda.variant,
-                toolkit: $cuda.toolkit,
-                build_name: ("tensorplay-" + $platform.name + "-" + $cuda.variant + "-py" + ($python | gsub("\\."; "_")))
-              }
-            ]
-          ' .github/wheel-platforms.json)"
-          echo "cpu=$cpu_matrix" >> "$GITHUB_OUTPUT"
-          echo "cuda=$cuda_matrix" >> "$GITHUB_OUTPUT"
-
-  cpu-build:
-    name: ${{ matrix.build_name }}-build-test
-    needs: define-wheel-matrix
+  smoke-build:
+    name: pull-smoke-build
     permissions:
       # Job-level grant so the called workflow's contents:write job does not
       # count as a permission elevation over the workflow-level read-all.
       contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include: ${{ fromJSON(needs.define-wheel-matrix.outputs.cpu) }}
     uses: ./.github/workflows/_binary-build-test.yml
     with:
-      build_name: ${{ matrix.build_name }}
-      build_environment: ${{ format('pull-{0}-py{1}-cpu', matrix.platform, matrix.python) }}
-      runs_on: ${{ matrix.runner }}
-      python_version: ${{ matrix.python }}
-
-  cuda-build:
-    name: ${{ matrix.build_name }}-build-test
-    needs: define-wheel-matrix
-    permissions:
-      contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include: ${{ fromJSON(needs.define-wheel-matrix.outputs.cuda) }}
-    uses: ./.github/workflows/_binary-build-test.yml
-    with:
-      build_name: ${{ matrix.build_name }}
-      build_environment: ${{ format('pull-{0}-py{1}-{2}', matrix.platform, matrix.python, matrix.variant) }}
-      runs_on: ${{ matrix.runner }}
-      python_version: ${{ matrix.python }}
-      cuda: ${{ matrix.variant }}
-      cuda_toolkit: ${{ matrix.toolkit }}
+      build_name: tensorplay-linux-x86_64-py3_12-cpu
+      build_environment: pull-smoke-linux-x86_64-py3_12
+      runs_on: ubuntu-22.04
+      python_version: "3.12"

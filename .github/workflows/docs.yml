@@ -52,16 +52,6 @@ jobs:
       - name: Install docs requirements
         run: python -m pip install -r docs/requirements.txt
 
-      - name: Regenerate reference pages when source docs are available
-        run: |
-          # .gitmodules entry, so it is normally absent in CI; the committed
-          # docs/source pages are the fallback.
-          if [[ -d third_party/pytorch/docs/source ]]; then
-            python docs/source/scripts/gen_reference_pages.py
-          else
-            echo "source docs unavailable; using committed reference pages"
-          fi
-
       - name: Build HTML docs
         run: make -C docs html
 

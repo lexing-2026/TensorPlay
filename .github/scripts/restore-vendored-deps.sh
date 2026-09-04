@@ -78,4 +78,8 @@ if [[ "$nnpack_supported" == "1" ]]; then
     python_pin python-peachpy https://github.com/malfet/PeachPy f45429b087dd7d5bc78bb40dc7cf06425c252d67
 fi
 
+# --- distributed transports (gloo + tensorpipe) ---
+clone_pin gloo https://github.com/pytorch/gloo 44651678bdc9ffc837181295acdd142ae7880ad9
+clone_pin tensorpipe https://github.com/pytorch/tensorpipe 2b4cd91092d335a697416b2a3cb398283246849d
+
 echo "Vendored dependencies restored under $DEST"

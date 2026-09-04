@@ -13,23 +13,95 @@ import re
 from .model import Argument, NativeFunction, Type, make_type
 
 # ---------------------------------------------------------------------------
-#
-# and reference/value conventions, then every signature composes through the
-# Shared CType classes (ConstRef/MutRef/Optional/Vector).
+# C++ type algebra.  Every signature composes through the shared CType
+# classes (atom / const-ref / mut-ref / optional / vector); each target
+# spelling derives from the same tree exactly once.
 # ---------------------------------------------------------------------------
-from tools.codegen.model import _ensure_torchgen
-_ensure_torchgen()
-from torchgen.api.types import (
-    BaseCType, ConstRefCType, MutRefCType, OptionalCType, VectorCType,
-    longT as tg_longT, doubleT as tg_doubleT, boolT as tg_boolT,
-    stringT as tg_stringT,
-)
-from torchgen.api.types import BaseCppType
 
 
-class _P10(BaseCppType):
+class CppType:
+    """Base namespace handle (types are named, namespaces optional)."""
+
+    def __init__(self, namespace: str, name: str):
+        self.namespaces = [namespace] if namespace else []
+        self.name = name
+
+    def __str__(self) -> str:
+        ns = "::".join([*self.namespaces, self.name])
+        return ns
+
+
+class CType:
+    def cpp_type(self) -> str:
+        raise NotImplementedError
+
+    def cpp_type_ref(self, *, const: bool = False) -> str:
+        t = self.cpp_type()
+        if t.endswith("&") or t.endswith("*"):
+            return t
+        return f"{'const ' if const else ''}{t}&"
+
+    def __str__(self) -> str:
+        return self.cpp_type()
+
+
+class BaseCType(CType):
+    def __init__(self, base: CppType):
+        self.base = base
+
+    def cpp_type(self) -> str:
+        return str(self.base)
+
+
+class BaseCppType:
+    """Marker mixin for atom namespaces registered in the type map."""
+
+
+class ConstRefCType(CType):
+    def __init__(self, elem: CType):
+        self.elem = elem
+
+    def cpp_type(self) -> str:
+        return f"const {self.elem.cpp_type()}&"
+
+
+class MutRefCType(CType):
+    def __init__(self, elem: CType):
+        self.elem = elem
+
+    def cpp_type(self) -> str:
+        return f"{self.elem.cpp_type()}&"
+
+
+class OptionalCType(CType):
+    def __init__(self, elem: CType):
+        self.elem = elem
+
+    def cpp_type(self) -> str:
+        return f"std::optional<{self.elem.cpp_type()}>"
+
+
+class VectorCType(CType):
+    def __init__(self, elem: CType):
+        self.elem = elem
+
+    def cpp_type(self) -> str:
+        return f"std::vector<{self.elem.cpp_type()}>"
+
+
+class _P10(CppType, BaseCppType):
     pass
 
+
+_INT64 = _P10("", "int64_t")
+_DOUBLE = _P10("", "double")
+_BOOL = _P10("", "bool")
+_STRING = _P10("", "std::string")
+
+tg_longT = BaseCType(_INT64)
+tg_doubleT = BaseCType(_DOUBLE)
+tg_boolT = BaseCType(_BOOL)
+tg_stringT = BaseCType(_STRING)
 
 _TENSOR = BaseCType(_P10("", "Tensor"))
 _SCALAR = BaseCType(_P10("", "Scalar"))
