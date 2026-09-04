@@ -4,7 +4,13 @@
 // Only int32/int64 specializations are provided (int8/16/uint8 can be added
 // when kernels need them).
 
+// x86-64 intrinsics only: the AVX specializations below are guarded by
+// CPU_CAPABILITY_AVX2/AVX512, and other architectures fall back to the
+// generic Vectorized template in vec_base.h.
+#if defined(__x86_64__) || defined(__i386__) || \
+    (defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64)))
 #include <immintrin.h>
+#endif
 #include "cpu/vec/vec_base.h"
 
 #include <algorithm>
