@@ -5,6 +5,7 @@
 
 #ifdef USE_CUDA
 #include "CUDARuntime.h"
+#include "CUDAGenerator.h"
 #include <cuda_runtime.h>
 
 struct CudaDeviceProperties {
@@ -337,6 +338,37 @@ void init_device(py::module_& m) {
         tensorplay::cuda::manual_seed_all(seed);
 #endif
     }, "seed"_a);
+
+    cuda.def("get_rng_state", [](int device) {
+#ifdef USE_CUDA
+        tensorplay::cuda::CUDAGuard guard(device);
+        return tensorplay::cuda::get_rng_state();
+#else
+        (void)device;
+        throw std::runtime_error("CUDA is not available");
+#endif
+    }, "device"_a = -1);
+
+    cuda.def("set_rng_state", [](const Tensor& state, int device) {
+#ifdef USE_CUDA
+        tensorplay::cuda::CUDAGuard guard(device);
+        tensorplay::cuda::set_rng_state(state);
+#else
+        (void)state;
+        (void)device;
+        throw std::runtime_error("CUDA is not available");
+#endif
+    }, "state"_a, "device"_a = -1);
+
+    cuda.def("current_seed", [](int device) {
+#ifdef USE_CUDA
+        tensorplay::cuda::CUDAGuard guard(device);
+        return tensorplay::cuda::current_seed();
+#else
+        (void)device;
+        throw std::runtime_error("CUDA is not available");
+#endif
+    }, "device"_a = -1);
 
 #ifdef USE_CUDA
     cuda.def("current_stream", [](int device) {

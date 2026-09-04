@@ -8,11 +8,16 @@ import gc
 import json
 import os
 import statistics
+import sys
 import tempfile
 import time
 from pathlib import Path
 
 import numpy as np
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import tensorplay as tp
 
@@ -75,104 +80,215 @@ def _record(result, runtime, operation, path, timings):
     )
 
 
+def _measure(result, runtime, operation, path, callback, reps, warmups):
+    _record(
+        result,
+        runtime,
+        operation,
+        path,
+        _timed(callback, reps, warmups),
+    )
+
+
 def run(args):
     state = _build_state(args.size_mb, args.tensors)
     peer_state = _to_peer(state)
     results = []
     with tempfile.TemporaryDirectory(prefix="tensorplay-serialization-") as directory:
         root = Path(directory)
-        tp_path = root / "tensorplay.pt"
-        _timed(lambda: tp.save(state, tp_path), 1, 0)
-        _record(
+        tensorplay_files = {}
+
+        pt_path = root / "tensorplay.pt"
+        tensorplay_files["pt"] = pt_path
+        _timed(lambda: tp.save(state, pt_path), 1, 0)
+        _measure(
             results,
             "tensorplay",
             "save",
-            tp_path,
-            _timed(lambda: tp.save(state, tp_path), args.reps, args.warmups),
+            pt_path,
+            lambda: tp.save(state, pt_path),
+            args.reps,
+            args.warmups,
         )
-        _record(
+        _measure(
             results,
             "tensorplay",
             "load",
-            tp_path,
-            _timed(lambda: tp.load(tp_path, mmap=args.mmap), args.reps, args.warmups),
+            pt_path,
+            lambda: tp.load(pt_path, mmap=args.mmap),
+            args.reps,
+            args.warmups,
         )
+
+        if "legacy" in args.formats:
+            legacy_path = root / "tensorplay.pth"
+            tensorplay_files["legacy"] = legacy_path
+            save_legacy = lambda: tp.save(
+                state, legacy_path, _use_new_zipfile_serialization=False
+            )
+            load_legacy = lambda: tp.load(legacy_path, mmap=args.mmap)
+            _timed(save_legacy, 1, 0)
+            _measure(
+                results,
+                "tensorplay",
+                "save",
+                legacy_path,
+                save_legacy,
+                args.reps,
+                args.warmups,
+            )
+            _measure(
+                results,
+                "tensorplay",
+                "load",
+                legacy_path,
+                load_legacy,
+                args.reps,
+                args.warmups,
+            )
+
+        if "safetensors" in args.formats:
+            safe_path = root / "tensorplay.safetensors"
+            tensorplay_files["safetensors"] = safe_path
+            save_safe = lambda: tp.save(state, safe_path)
+            load_safe = lambda: tp.load(safe_path, mmap=args.mmap)
+            _timed(save_safe, 1, 0)
+            _measure(
+                results,
+                "tensorplay",
+                "save",
+                safe_path,
+                save_safe,
+                args.reps,
+                args.warmups,
+            )
+            _measure(
+                results,
+                "tensorplay",
+                "load",
+                safe_path,
+                load_safe,
+                args.reps,
+                args.warmups,
+            )
 
         if "mega" in args.formats:
             mega_path = root / "tensorplay.mega"
-            _timed(lambda: tp.save(state, mega_path, checksum=args.checksum), 1, 0)
-            _record(
+            tensorplay_files["mega"] = mega_path
+            save_mega = lambda: tp.save(
+                state, mega_path, checksum=args.checksum
+            )
+            load_mega = lambda: tp.load(mega_path, mmap=args.mmap)
+            _timed(save_mega, 1, 0)
+            _measure(
                 results,
                 "tensorplay",
                 "save",
                 mega_path,
-                _timed(
-                    lambda: tp.save(state, mega_path, checksum=args.checksum),
-                    args.reps,
-                    args.warmups,
-                ),
+                save_mega,
+                args.reps,
+                args.warmups,
             )
-            _record(
+            _measure(
                 results,
                 "tensorplay",
                 "load",
                 mega_path,
-                _timed(
-                    lambda: tp.load(mega_path, mmap=args.mmap),
-                    args.reps,
-                    args.warmups,
-                ),
+                load_mega,
+                args.reps,
+                args.warmups,
             )
 
         if peer_state is not None and "peer" in args.formats:
             import torch
 
+            peer_files = {}
+
+            def peer_load(path):
+                options = {"map_location": "cpu", "weights_only": True}
+                if path.suffix == ".pt":
+                    options["mmap"] = args.mmap
+                return torch.load(path, **options)
+
             peer_path = root / "peer.pt"
-            torch.save(peer_state, peer_path)
-            _record(
+            peer_files["pt"] = peer_path
+            save_peer = lambda: torch.save(peer_state, peer_path)
+            _timed(save_peer, 1, 0)
+            _measure(
                 results,
                 "peer",
                 "save",
                 peer_path,
-                _timed(lambda: torch.save(peer_state, peer_path), args.reps, args.warmups),
+                save_peer,
+                args.reps,
+                args.warmups,
             )
-            _record(
+            _measure(
                 results,
                 "peer",
                 "load",
                 peer_path,
-                _timed(
-                    lambda: torch.load(
-                        peer_path, map_location="cpu", weights_only=True, mmap=args.mmap
+                lambda: peer_load(peer_path),
+                args.reps,
+                args.warmups,
+            )
+
+            if "legacy" in args.formats:
+                peer_legacy_path = root / "peer.pth"
+                peer_files["legacy"] = peer_legacy_path
+                save_peer_legacy = lambda: torch.save(
+                    peer_state,
+                    peer_legacy_path,
+                    _use_new_zipfile_serialization=False,
+                )
+                _timed(save_peer_legacy, 1, 0)
+                _measure(
+                    results,
+                    "peer",
+                    "save",
+                    peer_legacy_path,
+                    save_peer_legacy,
+                    args.reps,
+                    args.warmups,
+                )
+                _measure(
+                    results,
+                    "peer",
+                    "load",
+                    peer_legacy_path,
+                    lambda: peer_load(peer_legacy_path),
+                    args.reps,
+                    args.warmups,
+                )
+
+            for label, peer_file in peer_files.items():
+                _measure(
+                    results,
+                    "tensorplay",
+                    "load_peer_file",
+                    peer_file,
+                    lambda peer_file=peer_file: tp.load(
+                        peer_file, mmap=args.mmap
                     ),
                     args.reps,
                     args.warmups,
-                ),
-            )
-            _record(
-                results,
-                "tensorplay",
-                "load_peer_file",
-                peer_path,
-                _timed(
-                    lambda: tp.load(peer_path, mmap=args.mmap),
-                    args.reps,
-                    args.warmups,
-                ),
-            )
-            _record(
-                results,
-                "peer",
-                "load_tensorplay_file",
-                tp_path,
-                _timed(
-                    lambda: torch.load(
-                        tp_path, map_location="cpu", weights_only=True, mmap=args.mmap
+                )
+
+            for label in ("pt", "legacy"):
+                tensorplay_file = tensorplay_files.get(label)
+                if tensorplay_file is None:
+                    continue
+                _measure(
+                    results,
+                    "peer",
+                    "load_tensorplay_file",
+                    tensorplay_file,
+                    lambda tensorplay_file=tensorplay_file: peer_load(
+                        tensorplay_file
                     ),
                     args.reps,
                     args.warmups,
-                ),
-            )
+                )
 
         gc.collect()
     return results
@@ -193,8 +309,8 @@ def main():
     parser.add_argument(
         "--formats",
         nargs="+",
-        choices=("mega", "peer"),
-        default=("mega", "peer"),
+        choices=("mega", "safetensors", "legacy", "peer"),
+        default=("mega", "safetensors", "legacy", "peer"),
     )
     parser.add_argument("--json", type=Path)
     args = parser.parse_args()

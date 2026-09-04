@@ -10,6 +10,7 @@ namespace {
 
 thread_local std::vector<Layer> layers;
 thread_local int64_t next_level = 0;
+thread_local size_t disabled_depth = 0;
 
 int64_t normalize_dim(int64_t dim, int64_t ndim) {
     if (dim < 0) dim += ndim;
@@ -20,6 +21,16 @@ int64_t normalize_dim(int64_t dim, int64_t ndim) {
 }
 
 } // namespace
+
+DisableTransformsGuard::DisableTransformsGuard() {
+    ++disabled_depth;
+}
+
+DisableTransformsGuard::~DisableTransformsGuard() {
+    if (!active_) return;
+    if (disabled_depth > 0) --disabled_depth;
+    active_ = false;
+}
 
 int64_t push_vmap(int64_t batch_size, Randomness randomness) {
     if (batch_size < 0) {
@@ -56,8 +67,12 @@ void clear_layers() {
     layers.clear();
 }
 
+bool are_transforms_active() {
+    return !layers.empty() && disabled_depth == 0;
+}
+
 DispatchKey dispatch_key_for_random(DispatchKey backend) {
-    if (!layers.empty() && layers.back().kind == Kind::Vmap) {
+    if (are_transforms_active() && layers.back().kind == Kind::Vmap) {
         return toVmapKey(backend);
     }
     return backend;
