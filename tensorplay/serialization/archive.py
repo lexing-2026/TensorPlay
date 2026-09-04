@@ -1059,7 +1059,7 @@ def _storage_bytes(tensor, storage_nbytes: int) -> bytes:
     return raw.numpy().tobytes()
 
 
-def _serialize_object(obj: Any, pickle_protocol: int):
+def _serialize_object(obj: Any, pickle_protocol: int, *, legacy: bool = False):
     storages: dict[tuple, dict] = {}
     order: list[dict] = []
     record_by_key: dict[str, dict] = {}
@@ -1127,13 +1127,14 @@ def _serialize_object(obj: Any, pickle_protocol: int):
         if isinstance(value, _PTStorageRef):
             record = record_by_key[value.key]
             storage_cls = _PT_STORAGE_CLASSES[record["dtype"]]
-            return (
+            result = (
                 "storage",
                 storage_cls,
                 record["key"],
                 record["location"],
                 record["numel"],
             )
+            return result + (None,) if legacy else result
         return None
 
     data_buf = io.BytesIO()
@@ -1209,12 +1210,37 @@ def _direct_zip_member(archive, name: str, size: int, checksum: int,
     info.header_offset = position
     archive._writecheck(info)
     zip64 = info.file_size > zipfile.ZIP64_LIMIT
-    archive.fp.write(info.FileHeader(zip64))
+    local_header = info.FileHeader(zip64)
     archive.filelist.append(info)
     archive.NameToInfo[info.filename] = info
-    archive.start_dir = int(archive.fp.tell())
-    archive.fp.flush()
-    return info
+    return info, local_header
+
+
+def _write_fd_buffer(fd: int, data) -> None:
+    view = memoryview(data)
+    position = 0
+    while position < len(view):
+        written = os.write(fd, view[position:])
+        if written <= 0:
+            raise OSError("short write while writing checkpoint storage")
+        position += written
+
+
+def _write_zip_payload(fd: int, local_header: bytes, payload) -> None:
+    header_size = len(local_header)
+    payload_size = payload.nbytes
+    if hasattr(os, "writev"):
+        written = os.writev(fd, [local_header, payload])
+        if written == header_size + payload_size:
+            return
+        if written < header_size:
+            _write_fd_buffer(fd, memoryview(local_header)[written:])
+            _write_fd_buffer(fd, payload)
+        else:
+            _write_fd_buffer(fd, payload[written - header_size:])
+        return
+    _write_fd_buffer(fd, local_header)
+    _write_fd_buffer(fd, payload)
 
 
 def _write_torch_file_direct(fileobj, data_value: bytes, order: list[dict],
@@ -1231,6 +1257,10 @@ def _write_torch_file_direct(fileobj, data_value: bytes, order: list[dict],
     if not isinstance(filename, (str, bytes, os.PathLike)):
         return False
     try:
+        fd = fileobj.fileno()
+    except (AttributeError, OSError, ValueError):
+        return False
+    try:
         if int(fileobj.tell()) != 0:
             return False
     except (AttributeError, OSError, ValueError):
@@ -1241,7 +1271,7 @@ def _write_torch_file_direct(fileobj, data_value: bytes, order: list[dict],
         raw, view = _raw_storage_view(record["tensor"], record["storage_nbytes"])
         if raw is None:
             return False
-        raw_storages.append((record, raw, zlib.crc32(view) & 0xFFFFFFFF))
+        raw_storages.append((record, raw, view, zlib.crc32(view) & 0xFFFFFFFF))
 
     with zipfile.ZipFile(
         fileobj, "w", compression=zipfile.ZIP_STORED, allowZip64=True
@@ -1252,16 +1282,18 @@ def _write_torch_file_direct(fileobj, data_value: bytes, order: list[dict],
         archive.writestr("archive/.storage_alignment", str(int(storage_alignment)))
         if not disable_byteorder_record:
             archive.writestr("archive/byteorder", sys.byteorder)
-        for record, raw, checksum in raw_storages:
+        archive.fp.flush()
+        for record, _raw, view, checksum in raw_storages:
             name = f"archive/data/{record['key']}"
-            _direct_zip_member(
+            _info, local_header = _direct_zip_member(
                 archive,
                 name,
                 record["storage_nbytes"],
                 checksum,
                 align=storage_alignment,
             )
-            saver(os.fspath(fileobj.name), [raw])
+            os.lseek(fd, int(archive.fp.tell()), os.SEEK_SET)
+            _write_zip_payload(fd, local_header, view)
             archive.fp.seek(0, os.SEEK_END)
             archive.start_dir = int(archive.fp.tell())
     return True
@@ -1317,7 +1349,7 @@ def write_legacy_torch_file(
     pickle_protocol: int = 2,
     pickle_module=None,
 ) -> None:
-    data_value, order = _serialize_object(obj, pickle_protocol)
+    data_value, order = _serialize_object(obj, pickle_protocol, legacy=True)
     pickle.dump(TORCH_MAGIC_NUMBER, fileobj, protocol=pickle_protocol)
     pickle.dump(TORCH_PROTOCOL_VERSION, fileobj, protocol=pickle_protocol)
     pickle.dump(

@@ -34,11 +34,23 @@ struct P10_API Layer {
     bool add_back_views = false;
 };
 
+class P10_API DisableTransformsGuard {
+public:
+    DisableTransformsGuard();
+    ~DisableTransformsGuard();
+    DisableTransformsGuard(const DisableTransformsGuard&) = delete;
+    DisableTransformsGuard& operator=(const DisableTransformsGuard&) = delete;
+
+private:
+    bool active_ = true;
+};
+
 P10_API int64_t push_vmap(int64_t batch_size, Randomness randomness);
 P10_API Layer pop_layer();
 P10_API std::optional<Layer> current_layer();
 P10_API std::vector<Layer> layer_stack();
 P10_API void clear_layers();
+P10_API bool are_transforms_active();
 P10_API DispatchKey dispatch_key_for_random(DispatchKey backend);
 
 P10_API Tensor make_batched(const Tensor& value, int64_t dim, int64_t level);
