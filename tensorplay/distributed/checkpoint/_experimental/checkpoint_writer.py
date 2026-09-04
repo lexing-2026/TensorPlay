@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import abc
+import logging
 from concurrent.futures import Future
 from dataclasses import dataclass
 import os
@@ -12,6 +13,8 @@ import tensorplay as tp
 
 from .barriers import Barrier
 from .types import RankInfo, STATE_DICT
+
+logger = logging.getLogger(__name__)
 
 
 class WriterHook(abc.ABC):

@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import abc
+import logging
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any
 
-from ... import distributed_core as dist
+import tensorplay.distributed as dist
+from ...elastic.utils import store as store_util
+
+logger = logging.getLogger(__name__)
 
 BARRIER_REGISTRY: dict[str, type["Barrier"]] = {}
 
@@ -33,6 +37,10 @@ def create_barrier_from_config(barrier_config: BarrierConfig) -> "Barrier | None
 
 class Barrier(abc.ABC):
     @abc.abstractmethod
+    def __init__(self, **kwargs: Any) -> None:
+        del kwargs
+
+    @abc.abstractmethod
     def execute_barrier(self) -> None: ...
 
 
@@ -42,7 +50,7 @@ class DistBarrier(Barrier):
 
     def __init__(self) -> None:
         if not dist.is_initialized():
-            raise RuntimeError("a process group is required for DistBarrier")
+            raise AssertionError("a process group is required for DistBarrier")
 
     def execute_barrier(self) -> None:
         dist.barrier()
@@ -52,15 +60,39 @@ class DistBarrier(Barrier):
 class TCPStoreBarrier(Barrier):
     barrier_type = "tcp_store"
 
-    def __init__(self, global_rank: int, global_world_size: int, barrier_prefix: str = "checkpoint", timeout_barrier_init_secs: int = 30, use_checkpoint_barrier_tcpstore_libuv: bool = False, tcpstore_port: int = 0, master_address: str = "127.0.0.1", timeout_secs: int = 600) -> None:
-        del timeout_barrier_init_secs, use_checkpoint_barrier_tcpstore_libuv, tcpstore_port, master_address
-        self._rank = global_rank
-        self._world_size = global_world_size
-        self._prefix = barrier_prefix
+    def __init__(
+        self,
+        global_rank: int,
+        global_world_size: int,
+        barrier_prefix: str,
+        timeout_barrier_init_secs: int,
+        use_checkpoint_barrier_tcpstore_libuv: bool,
+        tcpstore_port: int,
+        master_address: str,
+        timeout_secs: int,
+    ) -> None:
+        del use_checkpoint_barrier_tcpstore_libuv
+        self._tcp_store_barrier_seq = Counter()
+        self._barrier_prefix = barrier_prefix
+        self._global_rank = int(global_rank)
+        self._global_world_size = int(global_world_size)
         self._timeout_secs = timeout_secs
-        self._sequence = Counter()
+        self._tcp_store = dist.TCPStore(
+            master_address,
+            int(tcpstore_port),
+            world_size=self._global_world_size,
+            timeout=float(timeout_barrier_init_secs),
+            is_master=self._global_rank == 0,
+        )
 
     def execute_barrier(self) -> None:
-        if dist.is_initialized():
-            dist.barrier()
-        self._sequence[self._prefix] += 1
+        prefix = self._barrier_prefix
+        sequence = self._tcp_store_barrier_seq[prefix]
+        self._tcp_store.set(f"rank{self._global_rank}", str(sequence))
+        with store_util.barrier(
+            store=self._tcp_store,
+            world_size=self._global_world_size,
+            key_prefix=f"{prefix}{sequence}",
+        ):
+            pass
+        self._tcp_store_barrier_seq[prefix] += 1

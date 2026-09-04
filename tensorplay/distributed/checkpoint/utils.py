@@ -87,45 +87,45 @@ class _DistWrapper:
     def get_world_size(self) -> int:
         return dist.get_world_size(self.group) if self.use_dist else 1
 
-    def broadcast_object(self, value: T | None) -> T:
-        objects = [value]
+    def broadcast_object(self, object: T | None) -> T:
+        objects = [object]
         if self.use_dist:
             dist.broadcast_object_list(
                 objects, src=self.global_coordinator_rank, group=self.group
             )
         return cast(T, objects[0])
 
-    def gather_object(self, value: T) -> list[T] | None:
+    def gather_object(self, object: T) -> list[T] | None:
         if not self.use_dist:
-            return [value]
+            return [object]
         gathered = cast(
             list[T] | None,
             [None] * self.get_world_size() if self.is_coordinator else None,
         )
         dist.gather_object(
-            value,
+            object,
             object_gather_list=gathered if self.is_coordinator else None,
             dst=self.global_coordinator_rank,
             group=self.group,
         )
         return gathered
 
-    def all_gather_object(self, value: T) -> list[T]:
+    def all_gather_object(self, object: T) -> list[T]:
         if not self.use_dist:
-            return [value]
+            return [object]
         gathered = cast(list[T], [None] * self.get_world_size())
-        dist.all_gather_object(gathered, value, group=self.group)
+        dist.all_gather_object(gathered, object, group=self.group)
         return gathered
 
-    def scatter_object(self, values: list[T] | None) -> T:
+    def scatter_object(self, object_list: list[T] | None) -> T:
         if not self.use_dist:
-            if not values:
+            if not object_list:
                 raise AssertionError("values must contain an item")
-            return values[0]
+            return object_list[0]
         result = [None]
         dist.scatter_object_list(
             result,
-            scatter_object_input_list=values if self.is_coordinator else None,
+            scatter_object_input_list=object_list if self.is_coordinator else None,
             src=self.global_coordinator_rank,
             group=self.group,
         )
@@ -254,7 +254,11 @@ def find_state_dict_object(state_dict: dict[str, Any], index: MetadataIndex) -> 
     if index.fqn not in state_dict:
         raise ValueError(f"Could not find state-dict key {index.fqn!r}")
     value = state_dict[index.fqn]
-    if isinstance(value, tp.Tensor) or (ShardedTensor and isinstance(value, ShardedTensor)):
+    if (
+        isinstance(value, tp.Tensor)
+        or (ShardedTensor and isinstance(value, ShardedTensor))
+        or callable(getattr(value, "__get_tensor_shard__", None))
+    ):
         return find_tensor_shard(value, index)
     if index.offset is not None:
         raise ValueError(
@@ -273,10 +277,10 @@ def _element_wise_sub(a: Sequence[int], b: Sequence[int]) -> list[int]:
 
 
 class _ReaderView(io.IOBase):
-    def __init__(self, base_stream: io.IOBase, offset: int, length: int):
+    def __init__(self, base_stream: io.IOBase, offset: int, len: int):
         super().__init__()
         self.offset = int(offset)
-        self.len = int(length)
+        self.len = int(len)
         self.base_stream = base_stream
         self.seek(0)
 
@@ -297,11 +301,11 @@ class _ReaderView(io.IOBase):
     def seekable(self) -> bool:
         return self.base_stream.seekable()
 
-    def readinto(self, buffer: Any) -> int:
+    def readinto(self, b: Any) -> int:
         remaining = self.len - self.tell()
         if remaining <= 0:
             return 0
-        view = buffer if len(buffer) <= remaining else memoryview(buffer)[:remaining]
+        view = b if len(b) <= remaining else memoryview(b)[:remaining]
         return self.base_stream.readinto(view)  # type: ignore[attr-defined]
 
     def read(self, size: int = -1) -> bytes:

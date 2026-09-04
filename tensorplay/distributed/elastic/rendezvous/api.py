@@ -61,6 +61,10 @@ class RendezvousStoreInfo:
         """Alias of :attr:`master_addr`."""
         return self.master_addr
 
+    @property
+    def master_port(self) -> int:
+        return self.port
+
     @classmethod
     def build(cls, rank: int, store: Store, local_addr: str | None = None, server_port: int | None = None):
         """Derive store info for ``rank`` from the rendezvous store.
@@ -81,12 +85,11 @@ class RendezvousStoreInfo:
                     if not local_addr:
                         addr = host
             if port is None:
-                raise RendezvousStateError(
-                    "The rendezvous store does not expose a listening endpoint; "
-                    "pass server_port explicitly."
-                )
-            store.set("tp_elastic/rdzv/master_addr", addr)
-            store.set("tp_elastic/rdzv/master_port", str(port))
+                from ..utils.distributed import get_free_port
+
+                port = get_free_port()
+            store.set("tp_elastic/rdzv/master_addr", addr.encode())
+            store.set("tp_elastic/rdzv/master_port", str(port).encode())
             return cls(master_addr=addr, port=int(port))
         end = _deadline(300)
         while True:
@@ -169,10 +172,10 @@ class RendezvousHandler(abc.ABC):
         """Backend name (e.g. ``static`` or ``core``)."""
         ...
 
-    @abc.abstractmethod
+    @property
     def use_agent_store(self) -> bool:
         """Whether workers can reuse the agent-held store as their bootstrap store."""
-        ...
+        return False
 
     @abc.abstractmethod
     def next_rendezvous(self) -> RendezvousInfo:
@@ -231,20 +234,55 @@ class RendezvousParameters:
         backend: str,
         endpoint: str,
         run_id: str,
+        *args,
+        min_nodes: int | None = None,
+        max_nodes: int | None = None,
         local_addr: str | None = None,
         node_rank: int = 0,
         local_world_size: int = 1,
         config: dict | None = None,
         **kwargs,
     ) -> None:
+        if len(args) >= 2 and all(isinstance(value, int) for value in args[:2]):
+            positional_min_nodes, positional_max_nodes = int(args[0]), int(args[1])
+            if len(args) > 2:
+                local_addr = args[2]
+            if len(args) > 3:
+                raise TypeError("too many positional rendezvous parameters")
+        else:
+            positional_min_nodes, positional_max_nodes = 1, 1
+            if args:
+                local_addr = args[0]
+            if len(args) > 1:
+                node_rank = args[1]
+            if len(args) > 2:
+                local_world_size = args[2]
+            if len(args) > 3:
+                config = args[3]
+            if len(args) > 4:
+                raise TypeError("too many positional rendezvous parameters")
+        merged_config = dict(config or {})
+        merged_config.update(kwargs)
+        self._min_nodes = int(
+            positional_min_nodes if min_nodes is None else min_nodes
+        )
+        self._max_nodes = int(
+            positional_max_nodes if max_nodes is None else max_nodes
+        )
+        if not backend:
+            raise ValueError("The rendezvous backend name must be non-empty")
+        if self._min_nodes < 1:
+            raise ValueError("min_nodes must be greater than zero")
+        if self._max_nodes < self._min_nodes:
+            raise ValueError("max_nodes must be greater than or equal to min_nodes")
         self.backend = backend
         self.endpoint = endpoint
         self.run_id = run_id
         self.local_addr = local_addr
         self.node_rank = int(node_rank)
         self.local_world_size = int(local_world_size)
-        self.config = config or {}
-        self.kwargs = kwargs
+        self.config = merged_config
+        self.kwargs = {}
 
     def get(self, key: str, default=None):
         """Return backend parameter ``key`` or ``default``."""
@@ -254,39 +292,45 @@ class RendezvousParameters:
 
     def get_as_bool(self, key: str, default: bool | None = None) -> bool | None:
         """Return ``key`` coerced to bool (accepts 1/0/true/false)."""
-        if key not in self.config and key not in self.kwargs:
-            return default
-        value = self.get(key)
+        value = self.get(key, default)
         if value is None:
             return default
         if isinstance(value, bool):
             return value
-        text = str(value).strip().lower()
-        if text in ("1", "true", "yes", "on"):
-            return True
-        if text in ("0", "false", "no", "off", ""):
-            return False
-        raise ValueError(f"Parameter '{key}' is not a boolean: {value!r}")
+        if isinstance(value, int):
+            if value == 1:
+                return True
+            if value == 0:
+                return False
+        elif isinstance(value, str):
+            text = value.lower()
+            if text in ("1", "true", "t", "yes", "y"):
+                return True
+            if text in ("0", "false", "f", "no", "n"):
+                return False
+        raise ValueError(
+            f"The rendezvous configuration option '{key}' does not represent a valid boolean value."
+        )
 
     def get_as_int(self, key: str, default: int | None = None) -> int | None:
         """Return ``key`` coerced to int."""
-        if key not in self.config and key not in self.kwargs:
-            return default
         value = self.get(key)
         if value is None:
             return default
         try:
             return int(value)
         except (TypeError, ValueError) as e:
-            raise ValueError(f"Parameter '{key}' is not an integer: {value!r}") from e
+            raise ValueError(
+                f"The rendezvous configuration option '{key}' does not represent a valid integer value."
+            ) from e
 
     @property
     def min_nodes(self) -> int:
-        return self.get_as_int("min_nodes", 1)
+        return self.get_as_int("min_nodes", self._min_nodes)
 
     @property
     def max_nodes(self) -> int:
-        return self.get_as_int("max_nodes", self.min_nodes)
+        return self.get_as_int("max_nodes", self._max_nodes)
 
     @property
     def timeout(self) -> "RendezvousTimeout":
@@ -294,14 +338,51 @@ class RendezvousParameters:
         return RendezvousTimeout.from_params(self)
 
 
-@dataclass
 class RendezvousTimeout:
-    """Time budgets of the rendezvous phases."""
+    """Hold the timeout configuration of a rendezvous."""
 
-    join: timedelta = timedelta(seconds=600)
-    last_call: timedelta = timedelta(seconds=30)
-    close: timedelta = timedelta(seconds=30)
-    heartbeat: timedelta = timedelta(seconds=5)
+    _ZERO = timedelta(0)
+    _DEFAULT_TIMEOUTS = {
+        "join": timedelta(seconds=600),
+        "last_call": timedelta(seconds=30),
+        "close": timedelta(seconds=30),
+        "heartbeat": timedelta(seconds=5),
+    }
+
+    def __init__(
+        self,
+        join: timedelta | None = None,
+        last_call: timedelta | None = None,
+        close: timedelta | None = None,
+        heartbeat: timedelta | None = None,
+    ) -> None:
+        self._set_timeouts(
+            join=join, last_call=last_call, close=close, heartbeat=heartbeat
+        )
+
+    @property
+    def join(self) -> timedelta:
+        return self._join
+
+    @property
+    def last_call(self) -> timedelta:
+        return self._last_call
+
+    @property
+    def close(self) -> timedelta:
+        return self._close
+
+    @property
+    def heartbeat(self) -> timedelta:
+        return self._heartbeat
+
+    def _set_timeouts(self, **timeouts: timedelta | None) -> None:
+        for name, timeout in timeouts.items():
+            if timeout is None:
+                timeout = self._DEFAULT_TIMEOUTS[name]
+            if timeout <= self._ZERO:
+                raise ValueError(f"The {name} timeout ({timeout}) must be positive.")
+            setattr(self, "_" + name, timeout)
 
     @staticmethod
     def from_params(params: RendezvousParameters) -> "RendezvousTimeout":
@@ -310,10 +391,10 @@ class RendezvousTimeout:
             return timedelta(seconds=raw) if raw is not None else default
 
         return RendezvousTimeout(
-            join=_seconds("join_timeout", RendezvousTimeout.join),
-            last_call=_seconds("last_call_timeout", RendezvousTimeout.last_call),
-            close=_seconds("close_timeout", RendezvousTimeout.close),
-            heartbeat=_seconds("heartbeat_timeout", RendezvousTimeout.heartbeat),
+            join=_seconds("join_timeout", RendezvousTimeout().join),
+            last_call=_seconds("last_call_timeout", RendezvousTimeout().last_call),
+            close=_seconds("close_timeout", RendezvousTimeout().close),
+            heartbeat=_seconds("heartbeat_timeout", RendezvousTimeout().heartbeat),
         )
 
 
@@ -324,21 +405,31 @@ class RendezvousHandlerRegistry:
         self._handlers: dict[str, callable] = {}
 
     def register(self, backend: str, creator: callable) -> None:
-        """Register ``creator`` under ``backend``; later registrations win."""
+        """Register ``creator`` under ``backend``."""
         if not backend:
-            raise ValueError("Backend name must be non-empty")
+            raise ValueError("The rendezvous backend name must be a non-empty string.")
+        current_creator = self._handlers.get(backend)
+        if current_creator is not None and current_creator != creator:
+            raise ValueError(
+                f"The rendezvous backend '{backend}' is already registered with a different creator."
+            )
         self._handlers[backend] = creator
 
     def create_handler(self, params: RendezvousParameters) -> RendezvousHandler:
         """Instantiate the handler for ``params.backend``."""
         try:
             creator = self._handlers[params.backend]
-        except KeyError:
-            raise RendezvousError(
-                f"No rendezvous handler for backend '{params.backend}'. "
-                f"Registered backends: {sorted(self._handlers)}"
-            ) from None
-        return creator(params)
+        except KeyError as e:
+            raise ValueError(
+                f"The rendezvous backend '{params.backend}' is not registered."
+            ) from e
+        handler = creator(params)
+        if handler.get_backend() != params.backend:
+            raise RuntimeError(
+                f"The rendezvous backend '{handler.get_backend()}' does not match the requested "
+                f"backend '{params.backend}'."
+            )
+        return handler
 
 
 _create_handler_registry: RendezvousHandlerRegistry | None = None

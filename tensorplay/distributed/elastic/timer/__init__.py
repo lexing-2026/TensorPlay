@@ -13,6 +13,7 @@ from .file_based_local_timer import (
     FileTimerRequestQueue,
     FileTimerServer,
 )
+from .local_timer import LocalTimerClient, LocalTimerServer, MultiprocessingRequestQueue
 
 __all__ = [
     "TimerRequest",
@@ -25,4 +26,7 @@ __all__ = [
     "FileTimerRequest",
     "FileTimerRequestQueue",
     "FileTimerServer",
+    "LocalTimerClient",
+    "LocalTimerServer",
+    "MultiprocessingRequestQueue",
 ]

@@ -38,6 +38,9 @@ class StorageWriter(abc.ABC):
     def storage_meta(self) -> StorageMeta | None:
         return None
 
+    def abort(self) -> None:
+        return None
+
 
 class StorageReader(abc.ABC):
     @abc.abstractmethod

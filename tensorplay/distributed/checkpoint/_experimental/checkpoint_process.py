@@ -2,16 +2,19 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from enum import Enum, auto
+from enum import Enum
 import multiprocessing as mp
+import logging
+import os
 import threading
-import time
 from typing import Any, Callable
 
 from multiprocessing.connection import Connection
 
 from .checkpoint_writer import CheckpointWriter
 from .types import RankInfo, STATE_DICT
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -22,9 +25,11 @@ class CheckpointProcessConfig:
 
 
 class RequestType(Enum):
-    PING = auto()
-    WRITE = auto()
-    CLOSE = auto()
+    PING = "ping"
+    WRITE_CHECKPOINT = "write_checkpoint"
+    TERMINATE_PROCESS = "exit"
+    WRITE = WRITE_CHECKPOINT
+    CLOSE = TERMINATE_PROCESS
 
 
 @dataclass
@@ -38,7 +43,11 @@ class WorkerResponse:
     request_type: RequestType
     success: bool
     payload: Any = None
-    error: str | None = None
+    error_msg: str | None = None
+
+    @property
+    def error(self) -> str | None:
+        return self.error_msg
 
 
 def _call_writer_factory(
@@ -92,7 +101,9 @@ def _subprocess_entry(
             if current_request is RequestType.WRITE:
                 payload = request.payload
                 result = writer.write(
-                    payload["path"], payload["state_dict"], **payload.get("kwargs", {})
+                    path=payload["path"],
+                    state_dict=payload["state_dict"],
+                    **payload.get("kwargs", {}),
                 )
                 if isinstance(result, Future):
                     result.result()
@@ -109,7 +120,7 @@ def _subprocess_entry(
                 WorkerResponse(
                     current_request,
                     False,
-                    error=f"{type(error).__name__}: {error}",
+                    error_msg=f"{type(error).__name__}: {error}",
                 )
             )
         except (BrokenPipeError, EOFError, OSError):
@@ -142,21 +153,26 @@ class CheckpointProcess:
         self._io_lock = threading.Lock()
         self._parent_end: Connection | None = None
         self._process: mp.Process | None = None
+        self.process: mp.Process | None = None
         self._closing = False
         self._closed = False
         self.process_creation_future = self._executor.submit(self._create_subprocess)
 
-    def _create_subprocess(self) -> None:
+    def _create_subprocess(
+        self, config: CheckpointProcessConfig | None = None
+    ) -> None:
+        config = self._config if config is None else config
         try:
-            context = mp.get_context(self._config.process_start_method)
+            context = mp.get_context(config.process_start_method)
         except ValueError as error:
             raise ValueError(
                 f"unknown checkpoint process start method {self._config.process_start_method!r}"
             ) from error
         parent_end, child_end = context.Pipe(duplex=True)
         process = context.Process(
-            target=_subprocess_entry,
+            target=CheckpointProcess._subprocess,
             args=(
+                0,
                 self._rank_info,
                 child_end,
                 self._subprocess_init_fn,
@@ -166,6 +182,7 @@ class CheckpointProcess:
             ),
             daemon=True,
         )
+        process.processes = [process]
         with self._io_lock:
             if self._closed or self._closing:
                 parent_end.close()
@@ -173,10 +190,32 @@ class CheckpointProcess:
                 raise RuntimeError("checkpoint process is closing")
             self._parent_end = parent_end
             self._process = process
+            self.process = process
         process.start()
         child_end.close()
         self._send(RequestType.PING, {})
-        self._recv(self._config.subprocess_init_timeout_secs)
+        self._recv(config.subprocess_init_timeout_secs)
+
+    @staticmethod
+    def _subprocess(
+        sub_rank: int,
+        rank_info: RankInfo,
+        parent_pipe: Connection,
+        subprocess_init_fn: Callable[..., None],
+        subprocess_init_args: tuple[Any, ...],
+        checkpoint_writer_init_fn: Callable[..., CheckpointWriter],
+        checkpoint_writer_init_args: dict[str, Any],
+    ) -> None:
+        if sub_rank != 0:
+            raise AssertionError("one checkpoint worker is required per parent")
+        _subprocess_entry(
+            rank_info,
+            parent_pipe,
+            subprocess_init_fn,
+            subprocess_init_args,
+            checkpoint_writer_init_fn,
+            checkpoint_writer_init_args,
+        )
 
     def _send(self, request_type: RequestType, payload: dict[str, Any]) -> None:
         with self._io_lock:
@@ -187,8 +226,8 @@ class CheckpointProcess:
                 raise RuntimeError("checkpoint process is not initialized")
             try:
                 parent_end.send(WorkerRequest(request_type, payload))
-            except (BrokenPipeError, EOFError, OSError) as error:
-                raise RuntimeError("checkpoint worker terminated unexpectedly") from error
+            except (BrokenPipeError, EOFError, OSError, ValueError) as error:
+                raise RuntimeError("Child process terminated unexpectedly") from error
 
     def _recv(self, timeout: float | None = None) -> Any:
         parent_end = self._parent_end
@@ -197,36 +236,36 @@ class CheckpointProcess:
         if timeout is not None and timeout < 0:
             raise ValueError("checkpoint worker timeout must be non-negative")
         if timeout is not None and not parent_end.poll(timeout):
-            raise TimeoutError("timed out waiting for checkpoint worker")
+            raise TimeoutError("Timed out waiting for checkpoint worker")
         try:
             response = parent_end.recv()
-        except (EOFError, BrokenPipeError, ConnectionResetError, OSError) as error:
-            raise RuntimeError("checkpoint worker terminated unexpectedly") from error
+        except (EOFError, BrokenPipeError, ConnectionResetError, OSError, ValueError) as error:
+            raise RuntimeError("Child process terminated unexpectedly") from error
         if not isinstance(response, WorkerResponse):
-            raise RuntimeError("checkpoint worker returned an invalid response")
+            raise RuntimeError("Child process returned an invalid response")
         if not response.success:
-            raise RuntimeError(response.error or "checkpoint worker failed")
+            raise RuntimeError(response.error_msg or "checkpoint worker failed")
         return response.payload
 
     def write(
         self,
-        path: str | STATE_DICT,
-        state_dict: STATE_DICT | str | Future[STATE_DICT] | None = None,
+        state_dict: STATE_DICT | str | Future[STATE_DICT],
+        path: str | STATE_DICT | Future[STATE_DICT] | None = None,
         **kwargs: Any,
     ) -> Future[Any]:
-        if isinstance(path, str):
-            target_path = path
-            target_state = state_dict
-        else:
-            target_state = path
+        if isinstance(state_dict, (str, os.PathLike)):
             target_path = state_dict
-        if not isinstance(target_path, str):
+            target_state = path
+        else:
+            target_state = state_dict
+            target_path = path
+        if not isinstance(target_path, (str, os.PathLike)):
             raise TypeError("checkpoint path must be a string")
         if not isinstance(target_state, (dict, Future)):
             raise TypeError("checkpoint state_dict must be a dictionary or Future")
         self.process_creation_future.result()
         return self._executor.submit(
-            self._write, target_path, target_state, **kwargs
+            self._write, os.fspath(target_path), target_state, **kwargs
         )
 
     def _write(
@@ -264,7 +303,14 @@ class CheckpointProcess:
                     parent_end.send(WorkerRequest(RequestType.CLOSE, {}))
                 if parent_end.poll(self._config.subprocess_shutdown_timeout_secs):
                     self._recv()
-            except (BrokenPipeError, EOFError, OSError, RuntimeError, TimeoutError):
+            except (
+                BrokenPipeError,
+                EOFError,
+                OSError,
+                RuntimeError,
+                TimeoutError,
+                ValueError,
+            ):
                 pass
         process.join(self._config.subprocess_shutdown_timeout_secs)
         if process.is_alive():

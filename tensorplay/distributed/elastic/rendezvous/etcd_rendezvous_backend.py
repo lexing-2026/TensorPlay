@@ -33,9 +33,13 @@ class EtcdRendezvousBackend(RendezvousBackend):
             return None
         except Exception as exc:
             raise RendezvousConnectionError(f"etcd state read failed: {exc}") from exc
+        return self._decode_state(result)
+
+    def _decode_state(self, result) -> tuple[bytes, Token]:
         try:
-            return b64decode((result.value or "").encode()), int(result.modifiedIndex)
-        except (ValueError, TypeError, binascii.Error) as exc:
+            raw = result.value if hasattr(result, "value") else result
+            return b64decode((raw or "").encode()), int(result.modifiedIndex)
+        except (ValueError, TypeError, binascii.Error, AttributeError) as exc:
             raise RendezvousStateError("invalid rendezvous state") from exc
 
     def set_state(self, state: bytes, token: Token | None = None):

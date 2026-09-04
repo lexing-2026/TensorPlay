@@ -8,64 +8,110 @@ import tensorplay as tp
 
 import tensorplay.distributed as dist
 
-from .api import CheckpointException
-from .default_planner import DefaultLoadPlanner
+from ._storage_utils import _storage_setup
+from .default_planner import DefaultLoadPlanner, _EmptyStateDictLoadPlanner
 from .metadata import Metadata
+from .planner import LoadPlan
+from .state_dict_saver import _snapshot_state_dict
+from .utils import _DistWrapper
 
-__all__ = ["load"]
-
-
-def _default_reader(checkpoint_id):
-    from .filesystem import FileSystemReader
-
-    return FileSystemReader(checkpoint_id)
+__all__ = ["load_state_dict", "load"]
 
 
-def _reader_for(checkpoint_id: Any, storage_reader: Any) -> Any:
-    if storage_reader is None:
-        if checkpoint_id is None:
-            raise ValueError("must specify either checkpoint_id or storage_reader")
-        return _default_reader(checkpoint_id)
-    if checkpoint_id is not None:
-        reset = getattr(storage_reader, "reset", None)
-        if callable(reset):
-            reset(checkpoint_id)
-    return storage_reader
+def _is_stateful(value: Any) -> bool:
+    return callable(getattr(value, "state_dict", None)) and callable(
+        getattr(value, "load_state_dict", None)
+    )
 
 
-def _read_snapshot(reader: Any, state_dict: dict[str, Any], planner: Any) -> dict[str, Any]:
-    metadata = reader.read_metadata()
-    if not isinstance(metadata, Metadata):
-        loaded = reader.read_data(metadata, state_dict)
-        return loaded
-    planner.set_up_planner(state_dict, metadata, is_coordinator=True)
-    plan = planner.create_local_plan()
-    prepare = getattr(reader, "prepare_local_plan", None)
-    if callable(prepare):
-        plan = prepare(plan)
-    read_data = reader.read_data
-    parameters = list(inspect.signature(read_data).parameters.values())
-    if len(parameters) >= 3 or (
-        len(parameters) >= 2 and parameters[1].name in {"state_dict", "destination"}
-    ):
-        result = read_data(plan, state_dict, planner)
-    else:
-        result = read_data(plan, planner)
-    if hasattr(result, "result"):
-        result = result.result()
-    if isinstance(result, dict):
-        return result
-    return state_dict
+def _restore_state_dict(
+    state_dict: dict[str, Any], snapshot: dict[str, Any]
+) -> None:
+    for key in tuple(state_dict):
+        if key not in snapshot:
+            del state_dict[key]
+    _fill_in_place(state_dict, snapshot)
 
 
-def _raise_load_failures(message: str, statuses: list[Any]) -> None:
-    failures = {
-        rank: RuntimeError(str(status.get("error", "unknown checkpoint failure")))
-        for rank, status in enumerate(statuses)
-        if not isinstance(status, dict) or not status.get("ok", False)
-    }
-    if failures:
-        raise CheckpointException(message, failures)
+def _load_state_dict(
+    state_dict: dict[str, Any],
+    storage_reader: Any,
+    process_group: Any = None,
+    coordinator_rank: int = 0,
+    no_dist: bool = False,
+    planner: Any = None,
+) -> None:
+    dist_wrapper = _DistWrapper(process_group, not no_dist, coordinator_rank)
+    planner = planner or DefaultLoadPlanner()
+    rollback_state: dict[str, Any] | None = None
+    metadata: Metadata | None = None
+    use_collectives = True
+
+    def local_step() -> LoadPlan:
+        nonlocal rollback_state, metadata, use_collectives
+        rollback_state = _snapshot_state_dict(state_dict)
+        try:
+            metadata = storage_reader.read_metadata()
+        except BaseException as global_error:
+            try:
+                parameters = inspect.signature(storage_reader.read_metadata).parameters
+                if not (
+                    "rank" in parameters
+                    or any(
+                        parameter.kind is inspect.Parameter.VAR_KEYWORD
+                        for parameter in parameters.values()
+                    )
+                ):
+                    raise global_error
+                metadata = storage_reader.read_metadata(rank=dist_wrapper.rank)
+                use_collectives = False
+            except BaseException:
+                raise global_error
+        if not isinstance(metadata, Metadata):
+            raise TypeError("checkpoint metadata must be a Metadata object")
+        planner.set_up_planner(
+            state_dict,
+            metadata,
+            is_coordinator=dist_wrapper.is_coordinator,
+        )
+        storage_reader.set_up_storage_reader(
+            metadata,
+            dist_wrapper.is_coordinator,
+            rank=dist_wrapper.rank,
+            use_collectives=use_collectives,
+        )
+        local_plan = planner.create_local_plan()
+        return storage_reader.prepare_local_plan(local_plan)
+
+    def global_step(all_local_plans: list[LoadPlan]) -> list[LoadPlan]:
+        all_local_plans = planner.create_global_plan(all_local_plans)
+        return storage_reader.prepare_global_plan(all_local_plans)
+
+    try:
+        if use_collectives:
+            central_plan = dist_wrapper.reduce_scatter(
+                "checkpoint plan", local_step, global_step
+            )
+        else:
+            central_plan = global_step([local_step()])[0]
+
+        def read_data() -> None:
+            final_local_plan = planner.finish_plan(central_plan)
+            reads = storage_reader.read_data(final_local_plan, planner)
+            reads.result()
+
+        if use_collectives:
+            dist_wrapper.all_gather("checkpoint read", read_data)
+        else:
+            read_data()
+        dist_wrapper.barrier()
+    except BaseException:
+        if rollback_state is not None:
+            try:
+                _restore_state_dict(state_dict, rollback_state)
+            except BaseException:
+                pass
+        raise
 
 
 def load(
@@ -80,47 +126,70 @@ def load(
     """Load checkpoint values into an existing state dictionary."""
     if not isinstance(state_dict, dict):
         raise TypeError("state_dict must be a dictionary")
-    if no_dist or not dist.is_initialized():
-        reader = _reader_for(checkpoint_id, storage_reader)
-        metadata = reader.read_metadata()
-        if planner is None and isinstance(metadata, Metadata):
-            planner = DefaultLoadPlanner()
-        if planner is not None and isinstance(metadata, Metadata):
-            saved = _read_snapshot(reader, state_dict, planner)
-        else:
-            saved = reader.read_data(metadata, state_dict)
-        _fill_in_place(state_dict, saved)
-        return
-
-    pg = process_group or dist._get_default_group()
-    local_error: str | None = None
-    saved: dict[str, Any] | None = None
-    try:
-        reader = _reader_for(checkpoint_id, storage_reader)
-        metadata = reader.read_metadata()
-        local_planner = planner
-        if local_planner is None and isinstance(metadata, Metadata):
-            local_planner = DefaultLoadPlanner()
-        if local_planner is not None and isinstance(metadata, Metadata):
-            saved = _read_snapshot(reader, state_dict, local_planner)
-        else:
-            saved = reader.read_data(metadata, state_dict)
-        if not isinstance(saved, dict):
-            raise RuntimeError("checkpoint data must contain a dictionary")
-    except BaseException as error:
-        local_error = f"{type(error).__name__}: {error}"
-
-    statuses = [None] * dist.get_world_size(pg)
-    dist.all_gather_object(
-        statuses,
-        {"ok": local_error is None, "error": local_error},
-        group=pg,
+    keys = sorted(state_dict)
+    stateful_state_dict: dict[str, Any] = {}
+    for key in keys:
+        value = state_dict[key]
+        stateful_state_dict[key] = (
+            value.state_dict() if _is_stateful(value) else value
+        )
+    working_state_dict = stateful_state_dict
+    reader = _storage_setup(storage_reader, checkpoint_id, reader=True)
+    _load_state_dict(
+        working_state_dict,
+        reader,
+        process_group=process_group,
+        no_dist=no_dist or not dist.is_initialized(),
+        planner=planner,
     )
-    _raise_load_failures("checkpoint load failed", statuses)
-    if saved is None:
-        raise RuntimeError("checkpoint load produced no state")
-    _fill_in_place(state_dict, saved)
-    dist.barrier(pg)
+    for key in keys:
+        value = state_dict[key]
+        loaded = working_state_dict[key]
+        if _is_stateful(value):
+            value.load_state_dict(loaded)
+        else:
+            state_dict[key] = loaded
+
+
+def load_state_dict(
+    state_dict: dict[str, Any],
+    storage_reader: Any,
+    process_group: Any = None,
+    coordinator_rank: int = 0,
+    no_dist: bool = False,
+    planner: Any = None,
+) -> None:
+    storage_reader.reset()
+    _load_state_dict(
+        state_dict,
+        storage_reader,
+        process_group=process_group,
+        coordinator_rank=coordinator_rank,
+        no_dist=no_dist or not dist.is_initialized(),
+        planner=planner,
+    )
+
+
+def _load_state_dict_from_keys(
+    keys: set[str] | str | None = None,
+    *,
+    checkpoint_id: str | Any | None = None,
+    storage_reader: Any = None,
+    process_group: Any = None,
+) -> dict[str, Any]:
+    if isinstance(keys, str):
+        keys = {keys}
+    reader = _storage_setup(storage_reader, checkpoint_id, reader=True)
+    planner = _EmptyStateDictLoadPlanner(keys=keys)
+    result: dict[str, Any] = {}
+    _load_state_dict(
+        result,
+        reader,
+        process_group=process_group,
+        no_dist=not dist.is_initialized(),
+        planner=planner,
+    )
+    return result
 
 
 def _fill_in_place(state_dict: dict[str, Any], saved: dict[str, Any]) -> None:

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
 import tensorplay as tp
 
 from .types import RankInfo, STATE_DICT
+
+logger = logging.getLogger(__name__)
 
 
 class CheckpointReader:
@@ -14,10 +17,6 @@ class CheckpointReader:
 
     def read(self, path: str, state_dict: STATE_DICT | None = None, *, map_location: Any = None, **kwargs: Any) -> tuple[STATE_DICT, list[str]]:
         file_path = Path(path) / f"checkpoint_{self._rank_info.global_rank}.pt"
-        if not file_path.exists():
-            legacy_path = Path(path) / f"checkpoint_{self._rank_info.global_rank}.tp"
-            if legacy_path.exists():
-                file_path = legacy_path
         if not file_path.exists():
             raise FileNotFoundError(file_path)
         loaded = tp.load(file_path, map_location=map_location, **kwargs)

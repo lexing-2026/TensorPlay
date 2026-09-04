@@ -19,6 +19,7 @@ from .api import (
     RendezvousTimeoutError,
 )
 from .p10d_rendezvous_backend import P10dRendezvousBackend
+from .c10d_rendezvous_backend import C10dRendezvousBackend
 from .dynamic_rendezvous import DynamicRendezvousHandler, RendezvousSettings
 from .static_tcp_rendezvous import StaticTCPRendezvous
 from .utils import (
@@ -46,6 +47,7 @@ __all__ = [
     "DynamicRendezvousHandler",
     "StaticTCPRendezvous",
     "P10dRendezvousBackend",
+    "C10dRendezvousBackend",
     "create_handler",
     "get_registry",
     "parse_rendezvous_endpoint",

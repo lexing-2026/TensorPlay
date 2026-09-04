@@ -17,7 +17,7 @@ from .api import (
     SignalException,
     Std,
     SubprocessContext,
-    start_processes,
+    start_processes as _start_processes,
 )
 from .redirects import Redirects, Std, to_map
 from .tail_log import TailLog, tail_logfile
@@ -41,3 +41,7 @@ __all__ = [
     "ChildFailedError",
     "record",
 ]
+
+
+def start_processes(*args, **kwargs):
+    return _start_processes(*args, **kwargs)

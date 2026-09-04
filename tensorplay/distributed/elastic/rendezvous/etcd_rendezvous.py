@@ -58,9 +58,16 @@ class EtcdRendezvousHandler(RendezvousHandler):
         self._participant_id = f"{local_addr or 'localhost'}-{uuid.uuid4().hex}"
         self._closed = False
 
+    def __del__(self) -> None:
+        try:
+            del self._rdzv_impl
+        except AttributeError:
+            pass
+
     def get_backend(self) -> str:
         return "etcd"
 
+    @property
     def use_agent_store(self) -> bool:
         return False
 
@@ -124,6 +131,12 @@ class EtcdRendezvous:
             self.client.write(self.get_path("/rdzv/version_counter"), "0", prevExist=False)
         except _etcd.EtcdAlreadyExist:
             pass
+
+    def __del__(self) -> None:
+        for name in ("_lease_run_id_stop", "_lease_this_rank_stop"):
+            event = getattr(self, name, None)
+            if event is not None:
+                event.set()
 
     def _ensure_path(self, path: str) -> None:
         try:
