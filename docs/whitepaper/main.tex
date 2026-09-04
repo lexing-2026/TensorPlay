@@ -12,7 +12,8 @@
 \usepackage[hyphens]{url}
 \usepackage{xurl}
 \usepackage{seqsplit}
-% Make \path/\url safe in moving arguments (captions, section titles)
+% Make \path/\url safe in moving arguments (captions, section titles).
+% \texttt keeps its standard definition: \_ renders as an underscore.
 \makeatletter
 \DeclareUrlCommand\path{\urlstyle{tt}}
 \let\orig@path\path
@@ -56,6 +57,8 @@
 \usepackage{subcaption}
 \usepackage{tikz}
 \usetikzlibrary{arrows.meta, positioning, shapes, shadows, calc, fit, backgrounds, chains}
+\usepackage[most]{tcolorbox}
+\tcbuselibrary{skins, breakable}
 \usepackage{listings}
 \usepackage{longtable}
 \usepackage{float}
@@ -63,12 +66,23 @@
 \usepackage{titlesec}
 \usepackage{abstract}
 \usepackage{authblk}
+\usepackage{multicol}
+\usepackage{bookmark}
+\usepackage[acronym, automake, nomain, shortcuts=ac]{glossaries-extra}
+\makeglossaries
+
+% Acronym + Glossary entries
+\input{glossary.tex}
+
+% Configure abbreviation style (must be after \newacronym entries)
+\setabbreviationstyle[acronym]{long-short}
 
 % ---------- Colors ----------
 \definecolor{tpblue}{RGB}{21,101,192}
 \definecolor{tporange}{RGB}{239,108,0}
 \definecolor{tpgreen}{RGB}{46,125,50}
 \definecolor{tppurple}{RGB}{106,27,154}
+\definecolor{covernavy}{RGB}{10,18,36}
 \definecolor{codebg}{RGB}{245,245,245}
 \definecolor{codeframe}{RGB}{220,220,220}
 \definecolor{commentgreen}{RGB}{0,128,0}
@@ -106,7 +120,9 @@
   tabsize=2,
   captionpos=b,
   upquote=true,
-  morekeywords={P10_API,TENSORPLAY_API,constexpr,thread_local,shared_ptr,weak_ptr,atomic}
+  morekeywords={P10_API,TENSORPLAY_API,constexpr,thread_local,shared_ptr,weak_ptr,atomic},
+  xleftmargin=2.6em, framexleftmargin=2.2em,
+  framesep=4pt, rulesep=2pt
 }
 \lstdefinestyle{pystyle}{
   language=Python,
@@ -122,28 +138,104 @@
   numbersep=6pt,
   breaklines=true,
   showstringspaces=false,
-  tabsize=2
+  tabsize=2,
+  xleftmargin=2.6em, framexleftmargin=2.2em,
+  framesep=4pt, rulesep=2pt
 }
 \lstset{style=cppstyle}
+
+% ---------- Section / subsection typography ----------
+\titleformat{\section}
+  {\normalfont\Large\bfseries\sffamily\color{tpblue!85!black}}
+  {\thesection}{1.0em}{\rule[0.6ex]{2.4em}{0.6pt}}
+\titleformat{\subsection}
+  {\normalfont\large\bfseries\sffamily\color{tporange!85!black}}
+  {\thesubsection}{1.0em}{\rule[0.5ex]{1.8em}{0.5pt}}
+\titleformat{\subsubsection}
+  {\normalfont\normalsize\bfseries\sffamily\color{tppurple!80!black}}
+  {\thesubsubsection}{1.0em}{}
+\titlespacing*{\section}{0pt}{3.0ex plus 1ex minus .2ex}{1.4ex plus .2ex}
+\titlespacing*{\subsection}{0pt}{2.4ex plus .8ex minus .2ex}{1.0ex plus .2ex}
+\titlespacing*{\subsubsection}{0pt}{2.0ex plus .6ex minus .2ex}{0.6ex plus .2ex}
 
 % ---------- Fancy header ----------
 \pagestyle{fancy}
 \fancyhf{}
 \fancyhead[L]{\small\textsc{TensorPlay White Paper}}
 \fancyhead[R]{\small\textit{2026-09-02 --- v1.0.0rc0}}
+\fancyfoot[L]{\small\textit{\nouppercase\thesection}}
 \fancyfoot[C]{\thepage}
+\fancyfoot[R]{\small\texttt{v1.0.0rc0}}
 \renewcommand{\headrulewidth}{0.4pt}
+\renewcommand{\footrulewidth}{0.2pt}
 
 % ---------- Title ----------
-\title{\vspace{-1.5em}\textbf{\Huge TensorPlay}\\[0.6em]
-\large \textsc{A Readable Deep Learning Framework with Explicit Four-Pillar Architecture}\\[1.2em]
-\large \textbf{White Paper --- Industry Standard, Publishable Edition}\\[0.5em]
-\normalsize \texttt{Version 1.0.0rc0 \quad\textbullet\quad 2026-09-02}\\[0.3em]
-\normalsize Based on \texttt{p10 / tpx / stax / \_C} at \texttt{version.txt:1}
+\newcommand{\tpcover}{%
+\begingroup
+\thispagestyle{empty}%
+\noindent\hbox to 0pt{\hss
+% ---- Full-bleed dark canvas (CUDA-cover style) ----
+\begin{tikzpicture}[remember picture, overlay, every node/.style={inner sep=0pt}]
+  % deep navy gradient canvas
+  \shade[top color=covernavy!92!black, bottom color=covernavy!60!black]
+    (current page.south west) rectangle (current page.north east);
+  % geometric accents: rising diagonal light rays
+  \fill[tpblue, opacity=0.08] (current page.south west) -- ++(14,22) -- ++(0.001,0.001) -- ++(-14,-22.001) -- cycle;
+  \fill[tpblue, opacity=0.06] (current page.south west) ++(2,0) -- ++(10,22) -- ++(0.001,0) -- ++(-10,-22) -- cycle;
+  \fill[tporange, opacity=0.05] (current page.south east) -- ++(-8,16) -- ++(0.001,0) -- ++(8,-16) -- cycle;
+  % thin grid strip at the bottom (tensor mesh)
+  \foreach \i in {0,...,24} {
+    \draw[tpblue!40, opacity=0.12] (\i*0.8, 0.0) -- (\i*0.8+2.5, 4.5);
+  }
+\end{tikzpicture}%
+% ---- Content overlay ----
+\begin{tikzpicture}[remember picture, overlay]
+  % top hairline + brand
+  \node[anchor=north west, text=white!85!covernavy, font=\small\sffamily\bfseries]
+    at ([yshift=-1.1cm]current page.north west) {\hspace{1.4cm}TENSORPLAY \;\textcolor{tporange}{\rule{0.9em}{0.28em}}\; WHITE PAPER};
+
+  % main title block
+  \node[anchor=west, text=white, font=\fontsize{40}{44}\selectfont\sffamily\bfseries]
+    at ([xshift=1.35cm, yshift=2.2cm]current page.center) {TensorPlay};
+  \node[anchor=west, text=tpblue!35!white, font=\Large\sffamily]
+    at ([xshift=1.37cm, yshift=1.35cm]current page.center) {A Readable Deep Learning Framework};
+  \node[anchor=west, text=white!80!covernavy, font=\small\sffamily]
+    at ([xshift=1.37cm, yshift=0.72cm]current page.center) {Explicit Four-Pillar Architecture \textbullet\ 75\,k Lines of C++ \textbullet\ 13-Slot Dispatch};
+
+  % version chip
+  \node[anchor=west, draw=tporange, text=tporange!30!white, rounded corners=2pt,
+        inner xsep=8pt, inner ysep=4pt, font=\small\sffamily\bfseries]
+    at ([xshift=1.35cm, yshift=-0.15cm]current page.center) {v1.0.0rc0};
+
+  % ---- four-pillar diagram, bottom right of the title block ----
+  \begin{scope}[shift={([xshift=1.35cm, yshift=-4.6cm]current page.center)},
+                every node/.style={font=\footnotesize\sffamily}]
+    % pillars as vertical bars, heights encode layer size
+    \fill[tpblue,    rounded corners=1pt] (0,0)    rectangle (0.85,2.55) node[pos=0.5]{}; 
+    \fill[tporange,  rounded corners=1pt] (1.15,0) rectangle (2.00,1.85);
+    \fill[tppurple,  rounded corners=1pt] (2.30,0) rectangle (3.15,1.45);
+    \fill[tpgreen,   rounded corners=1pt] (3.45,0) rectangle (4.30,2.20);
+    \node[anchor=north west, text=white] at (-0.05,-0.12) {\textbf{p10}};
+    \node[anchor=north west, text=white] at (1.10,-0.12) {\textbf{tpx}};
+    \node[anchor=north west, text=white] at (2.25,-0.12) {\textbf{stax}};
+    \node[anchor=north west, text=white] at (3.40,-0.12) {\textbf{\_C}};
+    \node[anchor=north west, text=white!75!covernavy, align=left, font=\scriptsize\sffamily]
+      at (5.0,2.35) {tensor core $\cdot$ 18k\\autograd $\cdot$ 6k\\compiler $\cdot$ 8k\\bindings $\cdot$ 7k};
+    % downward arrow spine
+    \draw[-{Stealth[length=2mm]}, tporange!80!white, thick] (5.0,-0.05) -- ++(0.55,0)
+      node[midway, above, text=white!75!covernavy, font=\scriptsize\sffamily]{links down};
+  \end{scope}
+
+  % bottom band: authors + repo
+  \draw[tporange, line width=1.2pt] ([yshift=1.55cm]current page.south west) -- ([yshift=1.55cm]current page.south east);
+  \node[anchor=south west, text=white!85!covernavy, font=\small\sffamily]
+    at ([xshift=1.4cm, yshift=1.0cm]current page.south west) {TensorPlay Contributors};
+  \node[anchor=south east, text=white!60!covernavy, font=\small\sffamily]
+    at ([xshift=-1.4cm, yshift=1.0cm]current page.south east) {github.com/lexing-2026/TensorPlay \textbullet\ 2026};
+\end{tikzpicture}%
+\hss}\newpage
+\endgroup
 }
-\author{TensorPlay Contributors}
-\affil{\small \url{https://github.com/lexing-2026/TensorPlay} \quad\textbullet\quad \texttt{tensorplay.cn}}
-\date{\small Compiles on Windows \texttt{E:\textbackslash texlive} with \texttt{pdflatex} or \texttt{xelatex} --- see \texttt{README} in this directory}
 
 % ---------- Caption ----------
 \captionsetup{font=small, labelfont=bf, justification=raggedright, singlelinecheck=false, format=plain}
@@ -153,6 +245,53 @@
 \let\endoldtikzpicture\endtikzpicture
 \renewenvironment{tikzpicture}{\begin{adjustbox}{max width=\textwidth, center}\begin{oldtikzpicture}}{\end{oldtikzpicture}\end{adjustbox}}
 
+% ---------- Theorem-style boxes (Definition / Insight / Pitfall / Note / Example) ----------
+\newtcolorbox{tpdef}[1][]{
+  enhanced, breakable,
+  colback=tpblue!4, colframe=tpblue!70,
+  fonttitle=\bfseries\sffamily\small, coltitle=tpblue!90!black,
+  title={#1}, attach boxed title to top left={xshift=4pt, yshift=-7pt},
+  boxed title style={colback=white, sharp corners, left=2pt, right=2pt, top=0pt, bottom=0pt},
+  arc=2pt, boxrule=0.6pt, leftrule=2.5pt,
+  before skip=10pt, after skip=10pt
+}
+\newtcolorbox{tpinsight}[1][Insight]{
+  enhanced, breakable,
+  colback=tporange!4, colframe=tporange!75,
+  fonttitle=\bfseries\sffamily\small, coltitle=tporange!90!black,
+  title={#1}, attach boxed title to top left={xshift=4pt, yshift=-7pt},
+  boxed title style={colback=white, sharp corners, left=2pt, right=2pt, top=0pt, bottom=0pt},
+  arc=2pt, boxrule=0.6pt, leftrule=2.5pt,
+  before skip=10pt, after skip=10pt
+}
+\newtcolorbox{tppitfall}[1][Pitfall]{
+  enhanced, breakable,
+  colback=red!4, colframe=red!65,
+  fonttitle=\bfseries\sffamily\small, coltitle=red!80!black,
+  title={#1}, attach boxed title to top left={xshift=4pt, yshift=-7pt},
+  boxed title style={colback=white, sharp corners, left=2pt, right=2pt, top=0pt, bottom=0pt},
+  arc=2pt, boxrule=0.6pt, leftrule=2.5pt,
+  before skip=10pt, after skip=10pt
+}
+\newtcolorbox{tpnote}[1][Note]{
+  enhanced, breakable,
+  colback=tpgreen!5, colframe=tpgreen!65,
+  fonttitle=\bfseries\sffamily\small, coltitle=tpgreen!80!black,
+  title={#1}, attach boxed title to top left={xshift=4pt, yshift=-7pt},
+  boxed title style={colback=white, sharp corners, left=2pt, right=2pt, top=0pt, bottom=0pt},
+  arc=2pt, boxrule=0.6pt, leftrule=2.5pt,
+  before skip=10pt, after skip=10pt
+}
+\newtcolorbox{tpexample}[1][Example]{
+  enhanced, breakable,
+  colback=tppurple!4, colframe=tppurple!70,
+  fonttitle=\bfseries\sffamily\small, coltitle=tppurple!85!black,
+  title={#1}, attach boxed title to top left={xshift=4pt, yshift=-7pt},
+  boxed title style={colback=white, sharp corners, left=2pt, right=2pt, top=0pt, bottom=0pt},
+  arc=2pt, boxrule=0.6pt, leftrule=2.5pt,
+  before skip=10pt, after skip=10pt
+}
+
 % ---------- TikZ styles ----------
 \tikzset{
   pillar/.style={draw, rounded corners=3pt, thick, minimum width=2.9cm, minimum height=2.1cm, align=center, font=\small\bfseries, drop shadow},
@@ -161,7 +300,7 @@
 }
 
 \begin{document}
-\maketitle
+\tpcover
 
 % ---------- Abstract ----------
 \begin{abstract}
@@ -169,37 +308,41 @@
 
 This white paper departs from high-level overviews and documents \emph{concrete} mechanisms:
 the 13-slot \texttt{DispatchTable} and \texttt{Composite} fallback
-(\path{p10/include/Dispatcher.h:49}),
+,
 the \texttt{TENSORPLAY\_LIBRARY\_IMPL} macro
-(\path{Dispatcher.h:203}),
+,
 the \texttt{TensorIterator} seven-step pipeline
-(\path{p10/src/TensorIterator.cpp:1077}),
+,
 the explicit DAG without a Tape
-(\path{tpx/include/Node.h:26}, \path{Edge.h:14}),
+,
 the \texttt{ReadyQueue} priority by \texttt{sequence\_nr}
-(\path{tpx/include/Engine.h:37}),
+,
 the \texttt{SavedVariable} version guard
-(\path{tpx/include/SavedVariable.h:15}),
+,
 the \texttt{Vmap} key at offset~9
-(\path{p10/include/DispatchKey.h:41}),
+,
 and the profiler's \texttt{OpRecord}~/~\texttt{GpuTimerPair}~/~\texttt{Cupti}~/~\texttt{Nvtx} stack
-(\path{p10/include/Profiler.h}).
-
-All claims are reproducible via \texttt{grep -rn} and \texttt{read} on the cited \texttt{path:line}. The LaTeX sources in \texttt{docs/whitepaper/} compile locally on Windows \texttt{E:\textbackslash texlive} with \texttt{latexmk -pdf main.tex}.
+.
 
 \medskip
 \noindent\textbf{Keywords:} deep learning framework, dispatch, autograd, vmap, redispatch, profiler, code generation, TensorIterator
 \end{abstract}
 
-\vspace{1em}
-\noindent\textbf{Reproducibility note.} Every structural claim cites \texttt{path:line} in the source tree at \texttt{version.txt:1} (1.0.0rc0). Build artifacts are verified by \texttt{ls -lh tensorplay/lib/libp10.so}.
-
+% ---------- Table of contents / lists ----------
+\renewcommand{\contentsname}{\sffamily\color{tpblue!85!black}Contents}
+\renewcommand{\listfigurename}{\sffamily\color{tpblue!85!black}List of Figures}
+\renewcommand{\listtablename}{\sffamily\color{tpblue!85!black}List of Tables}
 \tableofcontents
 \listoffigures
 \listoftables
 \clearpage
 
-% ---------- Sections ----------
+% Acronyms (printed here; the main glossary is printed after the sections)
+\printglossary[type=acronym, title={Acronyms \& Abbreviations}, toctitle={Acronyms \& Abbreviations}]
+\clearpage
+
+%======================================================================
+% Sections
 \input{sections/01-introduction}
 \input{sections/02-architecture}
 \input{sections/03-redispatch}
@@ -211,13 +354,21 @@ All claims are reproducible via \texttt{grep -rn} and \texttt{read} on the cited
 \input{sections/08-codegen}
 \input{sections/09-evaluation}
 
+% ---------- Glossary ----------
+\printglossary[title={Glossary}, toctitle={Glossary}]
+
 % ---------- Bibliography ----------
-\bibliographystyle{ieeetr}
 \begin{thebibliography}{9}
-\bibitem{tp2026} TensorPlay Contributors, \emph{TensorPlay Source Tree}, \texttt{version.txt:1}, 2026. \texttt{https://github.com/lexing-2026/TensorPlay}.
+\bibitem{tp2026} TensorPlay Contributors, \emph{TensorPlay Source Tree}, v1.0.0rc0, 2026. \texttt{https://github.com/lexing-2026/TensorPlay}.
 \bibitem{adis} A.~Griewank and A.~Walther, \emph{Evaluating Derivatives: Principles and Techniques of AD}, SIAM, 2nd ed., 2008.
 \bibitem{cupti2024} NVIDIA, \emph{CUPTI Documentation}, CUDA 12.x, 2024.
 \bibitem{pybind11} W.~Jakob et~al., \emph{pybind11 Documentation}, 2024.
+\bibitem{tc2024} T.~Chen et~al., \emph{Tensor Comprehensions: Framework-Agnostic High-Performance Machine Learning Abstractions}, \emph{ArXiv:1802.04730}, 2018.
+\bibitem{cuda2024} NVIDIA, \emph{CUDA C++ Programming Guide}, CUDA 12.x, 2024.
+\bibitem{llvm2024} C.~Lattner et~al., \emph{MLIR: Scaling Compiler Infrastructure for Domain-Specific Computation}, \emph{CGO}, 2021.
+\bibitem{ad2018} A.~Paszke et~al., \emph{Automatic Differentiation in PyTorch}, \emph{NeurIPS Autodiff Workshop}, 2017.
+\bibitem{xla2024} T.~Authors, \emph{XLA: Optimizing Compiler for Machine Learning}, \texttt{tensorflow/compiler/xla}, 2024.
+\bibitem{autocast} NVIDIA, \emph{Automatic Mixed Precision for NVIDIA TensorCore GPUs}, \texttt{developer.nvidia.com/autocast}, 2024.
 \end{thebibliography}
 
 % ---------- Appendix ----------

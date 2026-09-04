@@ -1,0 +1,93 @@
+% Glossary & Acronyms for TensorPlay White Paper
+% Loaded by main.tex via \input{glossary.tex}
+% Descriptions must use plain text (no fragile commands) --- \path{} etc. are
+% rewritten as literal strings to survive the moving argument.
+
+% --- Acronyms ---
+\newacronym{api}{API}{Application Programming Interface}
+\newacronym{ad}{AD}{Automatic Differentiation}
+\newacronym{cpu}{CPU}{Central Processing Unit}
+\newacronym{cuda}{CUDA}{Compute Unified Device Architecture (NVIDIA)}
+\newacronym{cupti}{CUPTI}{CUDA Profiling Tools Interface}
+\newacronym{dag}{DAG}{Directed Acyclic Graph}
+\newacronym{dlpack}{DLPack}{Deep Learning Pack --- tensor-exchange memory format}
+\newacronym{dso}{DSO}{Dynamic Shared Object}
+\newacronym{itt}{ITT}{Intel Threading Tools --- VTune markers}
+\newacronym{jit}{JIT}{Just-In-Time compilation}
+\newacronym{lto}{LTO}{Link-Time Optimization}
+\newacronym{mkl}{MKL}{Intel Math Kernel Library}
+\newacronym{nvtx}{NVTX}{NVIDIA Tools Extension --- domain/probe markers}
+\newacronym{pgo}{PGO}{Profile-Guided Optimization}
+\newacronym{rpath}{RPATH}{Runtime library search path embedded in ELF}
+\newacronym{so}{SO}{\texttt{.so} shared object on Linux}
+\newacronym{symbolic}{Symbolic AD}{Symbolic-mode automatic differentiation}
+\newacronym{tape}{Tape}{Sequence of recorded operations for backward replay}
+\newacronym{tc}{TC}{Tensor Comprehensions --- polyhedral ML compiler}
+\newacronym{tls}{TLS}{Thread-Local Storage}
+\newacronym{usecase}{Use Case}{A canonical operator pattern (e.g.\ \texttt{BinaryUseCase}, \texttt{UnaryUseCase})}
+\newacronym{vmap}{vmap}{Vectorizing map --- batched apply over a leading axis}
+\newacronym{vulkan}{Vulkan}{Cross-platform GPU compute API (Khronos)}
+\newacronym{xla}{XLA}{Accelerated Linear Algebra --- ML compiler}
+\newacronym[longplural={Linear Algebra Operators}]{op}{Op}{Operator --- single tensor-to-tensor function}
+
+% --- Glossary ---
+\newglossaryentry{dispatchkey}{
+  name=\texttt{DispatchKey},
+  description={13-slot enum (\texttt{p10/include/DispatchKey.h:15}) selecting which implementation of an operator runs. Backend (0--2), \texttt{Autocast} (3--5), \texttt{Autograd} (6--8), \texttt{Vmap} (9--11), \texttt{Composite} (12).},
+  sort=DispatchKey
+}
+\newglossaryentry{dispatcher}{
+  name=\texttt{Dispatcher},
+  description={Static registry mapping \texttt{OperatorName} to a \texttt{DispatchTable}. The kernel-slot array is \texttt{array<atomic<KernelFunction>,13>} at \texttt{p10/include/Dispatcher.h:49--61}.},
+  sort=Dispatcher
+}
+\newglossaryentry{tensoriterator}{
+  name=\texttt{TensorIterator},
+  description={Seven-step broadcast/compute pipeline (\texttt{coerce\_inputs}, \texttt{split\_inputs}, \texttt{analyze\_broadcast}, \texttt{compute\_strides}, \texttt{reorder\_dims}, \texttt{coalesce\_dims}, \texttt{allocate\_output}) at \texttt{p10/src/TensorIterator.cpp:1077}.},
+  sort=TensorIterator
+}
+\newglossaryentry{sequence_nr}{
+  name=\texttt{sequence\_nr},
+  description={Per-thread monotonic counter assigned in \texttt{Node::Node} at \texttt{tpx/include/Node.h:50,109}. Used by \texttt{ReadyQueue} (\texttt{Engine.h:38}) to prioritize recomputation deterministically.},
+  sort=SequenceNR
+}
+\newglossaryentry{savedvariable}{
+  name=\texttt{SavedVariable},
+  description={Type-erased wrapper that saves a tensor plus its \texttt{version\_counter} snapshot, asserting on unpack that the tensor has not been mutated since forward. Located at \texttt{tpx/include/SavedVariable.h:15,33}.},
+  sort=SavedVariable
+}
+\newglossaryentry{oprecord}{
+  name=\texttt{OpRecord},
+  description={Stack-allocated profiler record stamped on every dispatched op at \texttt{p10/include/Profiler.h:145}. Holds \texttt{begin/end\_ns}, \texttt{tid}, \texttt{kind}, optional \texttt{shapes/dtypes}, \texttt{site\_id/stack\_id}.},
+  sort=OpRecord
+}
+\newglossaryentry{gputimer}{
+  name=\texttt{GpuTimerPair},
+  description={Pooled \texttt{cudaEvent} pair armed per dispatched CUDA op at \texttt{p10/include/Profiler.h:227}. Resolves \texttt{gpu\_ms} at session stop. Host-side \texttt{begin/end} bookkept on \texttt{OpRecord}.},
+  sort=GpuTimerPair
+}
+\newglossaryentry{redispatch}{
+  name=redispatch,
+  description={Scheme whereby an op at key \emph{K} internally calls itself at \emph{K'} (lower-priority). Used by \texttt{Autograd} (calls backend), \texttt{Autocast} (calls default-dtype), \texttt{Vmap} (calls batched kernel).},
+  sort=Redispatch
+}
+\newglossaryentry{composite}{
+  name=\texttt{Composite},
+  description={Slot 12 in \texttt{DispatchKey}. Backend-neutral fallback; never in a \texttt{DispatchKeySet}, consulted only by \texttt{OperatorHandle::getKernel} for \texttt{is\_backend\_key}.},
+  sort=Composite
+}
+\newglossaryentry{tp_packagedir}{
+  name=\texttt{TP\_PACKAGE\_DIR},
+  description={CMake variable pinning \texttt{OUTPUT\_DIRECTORY} of every library to \texttt{\$\{CMAKE\_CURRENT\_SOURCE\_DIR\}/tensorplay}. Set at \texttt{CMakeLists.txt:326,1170}.},
+  sort=TPPackageDir
+}
+\newglossaryentry{usb_slot}{
+  name=USB slot,
+  description={Pure-virtual interface \texttt{AutogradMetaBase} (\texttt{p10/include/AutogradMetaBase.h:13--25}) that lets \texttt{p10} carry differentiation state without including \texttt{tpx}. Concrete plug is \texttt{AutogradMeta} at \texttt{tpx/include/AutogradMeta.h:26--108}.},
+  sort=USBSlot
+}
+\newglossaryentry{linktime_axiom}{
+  name=link-time acyclicity,
+  description={Axiom: for any $(a,b)\in D$, \texttt{level}(a) > \texttt{level}(b), with \texttt{level}(p10)=0, \texttt{level}(tpx)=1, \texttt{level}(stax)=2, \texttt{level}(\_C)=3, enforced by \texttt{add\_subdirectory} order at \texttt{CMakeLists.txt:938--944} and downward-only \texttt{target\_link\_libraries} edges.},
+  sort=LinkTimeAcyclicity
+}

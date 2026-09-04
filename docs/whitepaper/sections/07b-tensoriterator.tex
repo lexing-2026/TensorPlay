@@ -4,9 +4,13 @@
 
 \subsection{Problem: One-Iteration Abstraction}
 
-A pointwise kernel for \texttt{add} must handle three orthogonal concerns: (i) broadcast (\path{[3,1,5] + [4,5] $\rightarrow$ [3,4,5]}), (ii) type promotion (\path{int32 + float32 $\rightarrow$ float32}), and (iii) non-contiguous strides. Hand-writing four nested loops per kernel would duplicate 80\% of \path{p10/src/backend/cpu/PointwiseKernels.cpp:2518}. TensorIterator (\path{p10/include/TensorIterator.h:125--418}, \path{p10/src/TensorIterator.cpp:1145}, \path{TensorIteratorReduce.cpp}) is the reusable execution template: kernels provide only \texttt{dst[i]=func(src[i])}.
+A pointwise \ac{cpu} kernel for \texttt{add} must handle three orthogonal concerns: (i) broadcast, (ii) type promotion, and (iii) non-contiguous strides. Hand-writing four nested loops per kernel would duplicate 80\% of. TensorIterator is the reusable execution template: kernels provide only \texttt{dst[i]=func(src[i])}.
 
 The CPU implementation provides the complete reusable iterator path, while CUDA kernels currently hand-write indexing; unifying the two paths remains future work.
+
+\begin{tpdef}[Definition (TensorIterator)]
+The \emph{TensorIterator} is a reusable execution template for elementwise and reduction kernels. Given operands $(t_1,\dots,t_n)$ and an output $o$, its build pipeline (seven steps, \S\ref{sec:tensoriterator}) computes a common shape $S$, a common dtype $D$, and per-operand strides such that the innermost loop can execute with unit stride on the contiguous path. A kernel then supplies only a scalar functor $\mathrm{dst}[i] = f(\mathrm{src}_1[i],\dots,\mathrm{src}_n[i])$ plus an optional vectorized variant; broadcast, promotion, and stride reordering are all resolved \emph{before} the loop runs, so the hot path contains no per-element branching on those concerns.
+\end{tpdef}
 
 \begin{table}[H]
 \centering
@@ -27,9 +31,9 @@ Parallel & per-kernel \texttt{parallel\_for} & \texttt{for\_each(loop)} \\
 
 \subsection{Data Structures}
 
-\path{p10/include/TensorIterator.h:32}:
+:
 
-\begin{lstlisting}[caption={\texttt{OperandInfo} \path{:32}.}, label=lst:operandinfo]
+\begin{lstlisting}[caption={\texttt{OperandInfo} .}, label=lst:operandinfo]
 struct OperandInfo{
   Tensor tensor_; void* data=nullptr; StrideVector stride_bytes;
   optional<Device> device; ScalarType target_dtype, current_dtype;
@@ -38,9 +42,9 @@ struct OperandInfo{
 };
 \end{lstlisting}
 
-\path{TensorIteratorBase:125}:
+:
 
-\begin{lstlisting}[caption={\path{TensorIteratorBase:125} — state.}, label=lst:tibase]
+\begin{lstlisting}[caption={state.}, label=lst:tibase]
 struct TensorIteratorBase{
   using loop1d_t = function<void(char**, strides, size)>;
   DimVector shape_, perm_; bool has_coalesced_dimensions_;
@@ -50,9 +54,9 @@ struct TensorIteratorBase{
 };
 \end{lstlisting}
 
-\path{TensorIterator:418} factories:
+ factories:
 
-\begin{lstlisting}[caption={\path{TensorIterator:418} — factories.}, label=lst:tifactories]
+\begin{lstlisting}[caption={factories.}, label=lst:tifactories]
 static TensorIterator binary_op(Tensor& out, const Tensor& a, const Tensor& b){
   return TensorIteratorConfig().add_output(out).add_input(a).add_input(b)
     .promote_inputs_to_common_dtype(true).build();
@@ -60,13 +64,13 @@ static TensorIterator binary_op(Tensor& out, const Tensor& a, const Tensor& b){
 static TensorIterator reduce_op(Tensor& out, const Tensor& a);
 \end{lstlisting}
 
-\path{TensorIteratorConfig:435} is the builder (\texttt{add\_output}, \texttt{add\_input}, \path{set\_check\_mem\_overlap}, \path{promote\_inputs\_to\_common\_dtype}, \texttt{is\_reduction}, \texttt{resize\_outputs}, \path{build():613}).
+ is the builder (\texttt{add\_output}, \texttt{add\_input}, \texttt{set\_check\_mem\_overlap}, \texttt{promote\_inputs\_to\_common\_dtype}, \texttt{is\_reduction}, \texttt{resize\_outputs},).
 
 \subsection{Build Pipeline: Seven Steps}
 
-\path{p10/src/TensorIterator.cpp:1077}:
+:
 
-\begin{lstlisting}[caption={\path{build():1077} — seven steps.}, label=lst:tibuild]
+\begin{lstlisting}[caption={seven steps.}, label=lst:tibuild]
 void TensorIteratorBase::build(Config& cfg){
   is_reduction_=cfg.is_reduction_;
   populate_operands(cfg); mark_outputs(); compute_mem_overlaps(cfg);
@@ -87,7 +91,7 @@ void TensorIteratorBase::build(Config& cfg){
 \node[libbox, fill=green!8, draw=tpgreen, right=0.3cm of e, minimum width=1.7cm, minimum height=0.9cm, align=center] (f) {coalesce\\dims};
 \node[libbox, fill=purple!8, draw=tppurple, right=0.3cm of f, minimum width=1.7cm, minimum height=0.9cm, align=center] (g) {allocate\\output};
 \draw[arrow] (a) -- (b); \draw[arrow] (b) -- (c); \draw[arrow] (c) -- (d); \draw[arrow] (d) -- (e); \draw[arrow] (e) -- (f); \draw[arrow] (f) -- (g);
-\node[libbox, fill=gray!8, draw=gray, below=0.6cm of c, minimum width=9.5cm, align=center] (fast) {fast path: \path{all\_same\_shape \&\& contiguous \&\& !is\_reduction} $\rightarrow$ collapse to 1D (\path{fast\_set\_up:1006})};
+\node[libbox, fill=gray!8, draw=gray, below=0.6cm of c, minimum width=9.5cm, align=center] (fast) {fast path: \texttt{all\_same\_shape \&\& contiguous \&\& !is\_reduction} $\rightarrow$ collapse to 1D};
 \draw[arrow, dashed, color=gray] (a) -- (fast); \draw[arrow, dashed, color=gray] (fast) -- (g);
 \end{tikzpicture}
 \caption{TensorIterator build pipeline. Fast path skips reorder and coalesce for the contiguous case.}
@@ -96,21 +100,21 @@ void TensorIteratorBase::build(Config& cfg){
 
 \begin{enumerate}[leftmargin=1.2em]
 \item \textbf{populate\_operands:} move \texttt{Tensor} into \texttt{OperandInfo}, record \texttt{data} and \texttt{stride\_bytes}.
-\item \textbf{compute\_shape} (\path{infer\_size:45}): broadcast rule \texttt{size==1} broadcasts, else equal; preserves \texttt{0}-size.
-\item \textbf{compute\_types} (\path{compute\_common\_dtype:185} folds \texttt{promoteTypes}, \path{compute\_types:210}): if \path{promote\_inputs\_to\_common\_dtype}, creates temporaries via \path{op.tensor().to(common\_dtype)}; if \path{cast\_common\_dtype\_to\_outputs}, allocates temp output.
-\item \textbf{compute\_strides + reorder\_dimensions:106}: insertion sort dims by stride ascending, reduced dims front; disabled if \path{enforce\_linear\_iteration}.
-\item \textbf{coalesce\_dimensions:530}: merges \path{shape[n]*stride[n]==stride[n+1]} adjacent dims.
-\item \textbf{allocate\_or\_resize\_outputs}: \path{empty(shape, dtype, device)} if \texttt{resize\_outputs}.
-\item \textbf{post:} fill \path{op.data = tensor().data\_ptr()}.
+\item \textbf{compute\_shape}: broadcast rule \texttt{size==1} broadcasts, else equal; preserves \texttt{0}-size.
+\item \textbf{compute\_types} ( folds \texttt{promoteTypes},): if \texttt{promote\_inputs\_to\_common\_dtype}, creates temporaries via \texttt{op.tensor.to(common\_dtype)}; if \texttt{cast\_common\_dtype\_to\_outputs}, allocates temp output.
+\item \textbf{compute\_strides + reorder\_dimensions:106}: insertion sort dims by stride ascending, reduced dims front; disabled if \texttt{enforce\_linear\_iteration}.
+\item \textbf{coalesce\_dimensions:530}: merges \texttt{shape[n]*stride[n]==stride[n+1]} adjacent dims.
+\item \textbf{allocate\_or\_resize\_outputs}: \texttt{empty(shape, dtype, device)} if \texttt{resize\_outputs}.
+\item \textbf{post:} fill \texttt{op.data = tensor.data\_ptr}.
 \end{enumerate}
 
-\path{fast\_set\_up:1006} collapses to \texttt{shape[0]=numel} when all operands share shape and are contiguous.
+ collapses to \texttt{shape[0]=numel} when all operands share shape and are contiguous.
 
 \subsection{Type Promotion Lattice}
 
-\path{p10/include/TypePromotion.h:12} defines a strict lattice (\path{Complex $>$ Float $>$ Int $>$ Bool}):
+ defines a strict lattice:
 
-\begin{lstlisting}[caption={\path{TypePromotion.h:12} — lattice (abridged).}, label=lst:promote]
+\begin{lstlisting}[caption={lattice (abridged).}, label=lst:promote]
 DType promoteTypes(DType a,DType b){
   if(a==b) return a; if(a==Undefined||b==Undefined) return Undefined;
   if(isComplexType(a)||isComplexType(b)){
@@ -126,7 +130,7 @@ DType promoteTypes(DType a,DType b){
 }
 \end{lstlisting}
 
-\path{DType.h:53} enumerates 20+ types (\texttt{UInt8}, \texttt{Float32}, \texttt{BFloat16}, \texttt{ComplexDouble}, \texttt{QInt8}, ...), with \path{isIntegral/isFloating/isComplex} predicates and \texttt{elementSize}. The result is written to \texttt{Edge::grad\_dtype} for backward cast-back (\path{Engine:498}).
+ enumerates 20+ types (\texttt{UInt8}, \texttt{Float32}, \texttt{BFloat16}, \texttt{ComplexDouble}, \texttt{QInt8},...), with \texttt{isComplex} predicates and \texttt{elementSize}. The result is written to \texttt{Edge::grad\_dtype} for backward cast-back.
 
 \begin{figure}[H]
 \centering
@@ -140,17 +144,17 @@ DType promoteTypes(DType a,DType b){
 \node[libbox, fill=yellow!12, draw=orange!60!black, below=of i, minimum width=2.2cm] (b) {Bool};
 \draw[arrow] (c) -- (cf); \draw[arrow] (cf) -- (f64); \draw[arrow] (f64) -- (f32); \draw[arrow] (f32) -- (f16); \draw[arrow] (f16) -- (i); \draw[arrow] (i) -- (b);
 \end{tikzpicture}
-\caption{Promotion lattice. \path{Float16+BFloat16 $\rightarrow$ Float32} is the special case at \path{TypePromotion.h:84}.}
+\caption{Promotion lattice. \texttt{Float16+BFloat16 $\rightarrow$ Float32} is the special case.}
 \label{fig:promotion}
 \end{figure}
 
 \subsection{Parallel and Reduction}
 
-\path{TensorIteratorBase:327} \path{for\_each(loop, grain=GRAIN\_SIZE)} dispatches to \path{parallel::parallel\_for} (custom thread pool, \texttt{GRAIN\_SIZE=32768}). \path{TensorIteratorReduce.cpp:33} \texttt{parallel\_reduce} selects \path{two\_pass\_reduction} for single-element outputs (per-thread buffer then \texttt{final\_reduce}) vs.\ \path{parallel\_dim\_reduction:78} (\texttt{find\_split\_dim}, \texttt{narrow}, \texttt{foreach}).
+ \texttt{for\_each(loop, grain=GRAIN\_SIZE)} dispatches to \texttt{parallel::parallel\_for} (custom thread pool, \texttt{GRAIN\_SIZE=32768}). \texttt{parallel\_reduce} selects \texttt{two\_pass\_reduction} for single-element outputs (per-thread buffer then \texttt{final\_reduce}) vs.\ (\texttt{find\_split\_dim}, \texttt{narrow}, \texttt{foreach}).
 
 \subsection{Kernel Wiring}
 
-\path{p10/src/backend/cpu/PointwiseKernels.cpp:108}:
+:
 
 \begin{lstlisting}[caption={Pointwise wiring.}, label=lst:pointwise]
 template<Func> Tensor unary_op_kernel(const Tensor& self, Func func, VOp vec){
@@ -163,7 +167,7 @@ template<Func> Tensor unary_op_kernel(const Tensor& self, Func func, VOp vec){
 }
 \end{lstlisting}
 
-CUDA \texttt{PointwiseKernels.cu} currently hand-writes \texttt{blockIdx*blockDim} grid-stride loops without TI — the known repetition left as future work.
+\ac{cuda} \texttt{PointwiseKernels.cu} currently hand-writes \texttt{blockIdx*blockDim} grid-stride loops without TI — the known repetition left as future work.
 
 \subsection{Comparison}
 
@@ -184,3 +188,10 @@ Vector & \texttt{vecunary} outside TI & inside TI \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+\subsection{Design Trade-offs}
+\label{sec:ti:tradeoffs}
+
+\textbf{Resolve-before-loop vs.\ per-element branching.} The iterator could check broadcast/promotion inside the inner loop instead of precomputing shapes, types, and reordered strides in the seven-step build. Rejected: per-element branching on concerns that are loop-invariant wastes a compare and a predictable-not-taken slot on every element; resolving up front (\S\ref{sec:tensoriterator}) puts the whole cost in setup, so the hot loop is a bare unit-stride \texttt{dst[i]=func(src[i])} that autovectorizes. The trade: a broadcast \texttt{[3,1,5]+[4,5]} pays $\sim$1\,\textmu s of setup per op call, amortized only over enough elements---which is why very small tensors ($<$16 elements) take a dedicated fast path that skips the full iterator build.
+
+\textbf{TI on CPU only vs.\ both backends.} Extending TI to CUDA (Table~\ref{tab:ti_compare}) would unify the two kernel families. Deferred, not rejected: CUDA TI needs a device-side iterator state layout and different parallelization decisions (grid-stride vs.\ grain 8192), and the hand-written CUDA kernels at \texttt{PointwiseKernels.cu} are correct today. The seam is documented so the unification is a refactor, not a redesign.
