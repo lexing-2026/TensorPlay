@@ -72,11 +72,31 @@ jobs:
           submodules: false
           show-progress: false
 
-      # Linux wheel builds link the accelerated BLAS stack and the oneDNN
-      # fetch needs no extra packages; OpenBLAS comes from the runner image
-      # repositories. macOS uses Accelerate, Windows falls back to naive.
-      - name: Install Linux build dependencies
-        if: ${{ runner.os == 'Linux' }}
+      # Linux x86_64 wheels link the same accelerated BLAS as the release
+      # defaults: MKL static libraries unpacked from the mkl wheels under
+      # /opt/intel (MKLROOT), the way the reference project's CI image
+      # provisions it. Other platforms keep their vendor defaults.
+      - name: Install MKL (linux x86_64)
+        if: ${{ runner.os == 'Linux' && runner.arch == 'X64' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -d /opt/intel/lib ]; then
+            sudo mkdir -p /opt/intel
+            pushd "$(mktemp -d)"
+            python -m pip install --quiet wheel
+            python -m pip download --quiet -d . 'mkl-static==2024.2.0'
+            python -m wheel unpack mkl_static-2024.2.0-py2.py3-none-manylinux1_x86_64.whl
+            python -m wheel unpack mkl_include-2024.2.0-py2.py3-none-manylinux1_x86_64.whl
+            sudo cp -a mkl_static-2024.2.0/mkl_static-2024.2.0.data/data/lib/. /opt/intel/lib/
+            sudo cp -a mkl_include-2024.2.0/mkl_include-2024.2.0.data/data/include/. /opt/intel/include/
+            popd
+          fi
+          echo "MKLROOT=/opt/intel" >> "$GITHUB_ENV"
+
+      # Non-x86_64 Linux (arm64) uses OpenBLAS from the runner repositories.
+      - name: Install OpenBLAS (linux arm64)
+        if: ${{ runner.os == 'Linux' && runner.arch == 'ARM64' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -187,3 +207,37 @@ jobs:
           gh release upload "$release" dist/*.whl \
             --repo "$GITHUB_REPOSITORY" \
             --clobber
+      run_cpu_benchmarks:
+        required: false
+        type: boolean
+        default: false
+        description: Run CPU benchmarks against the installed reference runtime
+      - name: Install CPU performance reference
+        if: ${{ inputs.run_cpu_benchmarks && inputs.cuda == 'cpu' }}
+        shell: bash
+        run: python -m pip install --disable-pip-version-check torch
+
+      - name: Run CPU performance benchmarks
+        if: ${{ inputs.run_cpu_benchmarks && inputs.cuda == 'cpu' }}
+        shell: bash
+        env:
+          OMP_NUM_THREADS: "2"
+          MKL_NUM_THREADS: "2"
+          OPENBLAS_NUM_THREADS: "2"
+        run: |
+          set -euo pipefail
+          python benchmark/bench_real_cpu.py --dtype f32 --reps 3 --threads 2 \
+            | tee cpu-elementwise.log
+          python benchmark/bench_train_fp32_cpu.py --reps 2 --threads 2 \
+            | tee cpu-train-step.log
+
+      - name: Upload CPU performance logs
+        if: ${{ always() && inputs.run_cpu_benchmarks && inputs.cuda == 'cpu' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.build_name }}-performance
+          path: |
+            cpu-elementwise.log
+            cpu-train-step.log
+          if-no-files-found: warn
+
