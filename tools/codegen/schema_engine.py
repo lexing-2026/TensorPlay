@@ -9,13 +9,14 @@ and produces the record model the generators consume: operator names with
 inplace/functional suffix rules, argument buckets (positional, self,
 keyword-only, out), tensor-options clusters, kinds (functional / inplace /
 out), view metadata, and structured groups.  No external schema package is
-imported; the parser, type algebra, tag registry and alias tables all live
-in this file so the codegen is self-contained.
+imported; the parser, type algebra and alias tables live in this file, while
+the tag registry is versioned under config/tags.yaml for self-contained builds.
 """
 
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
@@ -741,31 +742,32 @@ RETURNS_VIEWS_OF_INPUT = frozenset(VIEW_FUNCTIONS.keys()).union({
 # Tag registry
 # ---------------------------------------------------------------------------
 
-VALID_TAGS = frozenset({
-    "pt2_compliant_tag",
-    "pt2_compliant_dynamic_shapes",
-    "nondeterministic_seeded",
-    "dynamic_output_shape",
-    "fixed_output_shape",
-    "generated",
-    "inplace_view",
-    "alias_with_write",
-    "no_autograd",
-    "no_python",
-    "vulkan_ios_gpu_support",
-    "vulkan_mac_gpu_support",
-    "vulkan_android_gpu_support",
-    "view_copy",
-    "non_native",
-    "custom_method",
-    "deprecated",
-})
+_TAGS_PATH = Path(__file__).resolve().parents[2] / "config" / "tags.yaml"
 
 
-def parse_tags_yaml(_path: str) -> dict:
-    """Tag source of truth is built in; the path argument is accepted for
-    signature compatibility and ignored."""
-    return {tag: None for tag in VALID_TAGS}
+def parse_tags_yaml(path: str | Path | None = None) -> dict[str, str | None]:
+    """Load the versioned tag registry used by schema parsing."""
+    tag_path = Path(path) if path is not None else _TAGS_PATH
+    with tag_path.open("r", encoding="utf-8") as tag_file:
+        entries = yaml.safe_load(tag_file)
+    if not isinstance(entries, list) or not entries:
+        raise TypeError(f"tag file must contain a non-empty list: {tag_path}")
+
+    tags: dict[str, str | None] = {}
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict) or not isinstance(entry.get("tag"), str):
+            raise TypeError(f"tag entry {index} must define a string tag: {tag_path}")
+        name = entry["tag"]
+        if name in tags:
+            raise ValueError(f"duplicate tag: {name}")
+        description = entry.get("desc")
+        if description is not None and not isinstance(description, str):
+            raise TypeError(f"tag description must be a string: {name}")
+        tags[name] = description
+    return tags
+
+
+VALID_TAGS = frozenset(parse_tags_yaml())
 
 
 # ---------------------------------------------------------------------------
