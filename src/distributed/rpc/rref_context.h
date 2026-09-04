@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace tensorplay::distributed::rpc {
 
@@ -19,6 +20,7 @@ struct RRefState final {
     bool ready = false;
     bool has_exception = false;
     size_t references = 1;
+    std::unordered_set<ForkId, GloballyUniqueId::Hash> forks;
     py::object value = py::none();
     py::object error = py::none();
 
@@ -34,12 +36,17 @@ public:
     RRefContext& operator=(const RRefContext&) = delete;
 
     std::shared_ptr<RRefState> create(const RRefId& id);
+    std::shared_ptr<RRefState> create(
+        const RRefId& id,
+        const ForkId& fork_id);
     std::shared_ptr<RRefState> find(const RRefId& id) const;
     void set_value(const RRefId& id, py::object value);
     void set_exception(const RRefId& id, py::object error);
     py::object wait(const RRefId& id, double timeout_seconds) const;
     void retain(const RRefId& id);
+    bool retain(const RRefId& id, const ForkId& fork_id);
     bool release(const RRefId& id);
+    bool release(const RRefId& id, const ForkId& fork_id);
     void clear();
     size_t size() const;
 

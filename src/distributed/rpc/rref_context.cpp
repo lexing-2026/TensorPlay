@@ -30,6 +30,20 @@ std::shared_ptr<RRefState> RRefContext::create(const RRefId& id) {
     return state;
 }
 
+std::shared_ptr<RRefState> RRefContext::create(
+    const RRefId& id,
+    const ForkId& fork_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto existing = owners_.find(id);
+    if (existing != owners_.end()) {
+        return existing->second;
+    }
+    auto state = std::make_shared<RRefState>();
+    state->forks.emplace(fork_id);
+    owners_.emplace(id, state);
+    return state;
+}
+
 std::shared_ptr<RRefState> RRefContext::find(const RRefId& id) const {
     std::lock_guard<std::mutex> lock(mutex_);
     auto iterator = owners_.find(id);
@@ -135,6 +149,23 @@ void RRefContext::retain(const RRefId& id) {
     ++state->references;
 }
 
+bool RRefContext::retain(const RRefId& id, const ForkId& fork_id) {
+    auto state = find(id);
+    if (!state) {
+        throw std::runtime_error("RRef owner entry does not exist");
+    }
+    std::lock_guard<std::mutex> lock(state->mutex);
+    if (!state->forks.emplace(fork_id).second) {
+        return false;
+    }
+    if (state->references == std::numeric_limits<size_t>::max()) {
+        state->forks.erase(fork_id);
+        throw std::overflow_error("RRef owner reference count overflow");
+    }
+    ++state->references;
+    return true;
+}
+
 bool RRefContext::release(const RRefId& id) {
     std::lock_guard<std::mutex> map_lock(mutex_);
     auto iterator = owners_.find(id);
@@ -149,6 +180,27 @@ bool RRefContext::release(const RRefId& id) {
     }
     if (!state->ready) {
         state->references = 0;
+        return false;
+    }
+    owners_.erase(iterator);
+    return true;
+}
+
+bool RRefContext::release(const RRefId& id, const ForkId& fork_id) {
+    std::lock_guard<std::mutex> map_lock(mutex_);
+    auto iterator = owners_.find(id);
+    if (iterator == owners_.end()) {
+        return false;
+    }
+    auto state = iterator->second;
+    std::lock_guard<std::mutex> state_lock(state->mutex);
+    if (!state->forks.erase(fork_id)) {
+        return false;
+    }
+    if (state->references > 0) {
+        --state->references;
+    }
+    if (state->references != 0 || !state->ready) {
         return false;
     }
     owners_.erase(iterator);

@@ -126,9 +126,9 @@ std::shared_ptr<RpcRRef> RpcRRef::fork() const {
     if (runtime_ == nullptr) {
         throw std::runtime_error("RRef is detached from its runtime");
     }
-    runtime_->fork_rref(*this);
     const ForkId fork_id(runtime_->current_worker().id,
                          runtime_->next_local_id_.fetch_add(1));
+    runtime_->fork_rref(*this, fork_id);
     return std::make_shared<RpcRRef>(
         runtime_,
         owner_,
