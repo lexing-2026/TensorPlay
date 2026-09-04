@@ -59,7 +59,12 @@ class _TensorMeta:
         return _TensorMeta(tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype, bool(tensor.requires_grad))
 
     def to_tensor(self, device: Any = None) -> Any:
-        return _make_tensor_from_meta(self, device)
+        tensor = _make_tensor_from_meta(self, device)
+        if self.requires_grad and (
+            tensor.is_floating_point() or tensor.is_complex()
+        ):
+            tensor.requires_grad_(True)
+        return tensor
 
     def get_diff(self, other: "_TensorMeta") -> list[str]:
         fields = ("shape", "stride", "dtype")
@@ -77,8 +82,20 @@ class _DTensorMeta(_TensorMeta):
     @staticmethod
     def from_dtensor(tensor: DTensor) -> "_DTensorMeta":
         local = tensor.to_local()
-        names = tuple(tensor.device_mesh.mesh_dim_names or ())
-        return _DTensorMeta(tuple(local.shape), tuple(local.stride()), tensor.dtype, bool(local.requires_grad), tuple(tensor.shape), tuple(tensor.stride()), tuple(tensor.placements), names, None)
+        mesh = tensor.device_mesh
+        names = tuple(mesh.mesh_dim_names or ())
+        layout = getattr(mesh, "_layout", None)
+        return _DTensorMeta(
+            tuple(local.shape),
+            tuple(local.stride()),
+            tensor.dtype,
+            bool(local.requires_grad),
+            tuple(tensor.shape),
+            tuple(tensor.stride()),
+            tuple(tensor.placements),
+            names,
+            layout,
+        )
 
     @property
     def mesh_cache_key(self) -> tuple[tuple[str, ...], Any]:
@@ -89,37 +106,111 @@ class _DTensorMeta(_TensorMeta):
         if not isinstance(other, _DTensorMeta):
             differences.append("metadata kind mismatch")
             return differences
-        for field in ("global_shape", "global_stride", "placements", "mesh_dim_names", "mesh_layout"):
-            if getattr(self, field) != getattr(other, field):
+        for field_name in ("global_shape", "global_stride", "placements", "mesh_dim_names", "mesh_layout"):
+            if getattr(self, field_name) != getattr(other, field_name):
                 differences.append(
-                    f"{field} mismatch: {getattr(self, field)!r} vs {getattr(other, field)!r}"
+                    f"{field_name} mismatch: {getattr(self, field_name)!r} vs {getattr(other, field_name)!r}"
                 )
         return differences
 
     def to_dtensor(self, device: Any, mesh: Any) -> DTensor:
         local = _make_tensor_from_meta(self, device)
-        return DTensor.from_local(local, mesh, self.placements, shape=self.global_shape, stride=self.global_stride)
+        if self.requires_grad and (
+            local.is_floating_point() or local.is_complex()
+        ):
+            local.requires_grad_(True)
+        return DTensor.from_local(
+            local,
+            mesh,
+            self.placements,
+            shape=self.global_shape,
+            stride=self.global_stride,
+            run_check=False,
+        )
 
 
 TensorMeta = _TensorMeta | _DTensorMeta
 
 
-@dataclass
+@dataclass(init=False)
 class _StageForwardMeta:
     input_metas: tuple[TensorMeta, ...] = ()
     output_metas: tuple[TensorMeta, ...] = ()
 
+    def __init__(
+        self,
+        forward_metas: Iterable[TensorMeta] | None = None,
+        *,
+        input_metas: Iterable[TensorMeta] | None = None,
+        output_metas: Iterable[TensorMeta] | None = None,
+    ) -> None:
+        if output_metas is not None:
+            if forward_metas is not None:
+                raise TypeError("forward metadata was provided twice")
+            forward_metas = output_metas
+        self.input_metas = tuple(input_metas or ())
+        self.output_metas = tuple(forward_metas or ())
 
-@dataclass
+    @property
+    def forward_metas(self) -> tuple[TensorMeta, ...]:
+        return self.output_metas
+
+    @forward_metas.setter
+    def forward_metas(self, value: Iterable[TensorMeta]) -> None:
+        self.output_metas = tuple(value)
+
+
+@dataclass(init=False)
 class _StageBackwardMeta:
     input_grad_metas: tuple[TensorMeta | None, ...] = ()
     output_grad_metas: tuple[TensorMeta | None, ...] = ()
 
+    def __init__(
+        self,
+        backward_metas: Iterable[TensorMeta | None] | None = None,
+        *,
+        input_grad_metas: Iterable[TensorMeta | None] | None = None,
+        output_grad_metas: Iterable[TensorMeta | None] | None = None,
+    ) -> None:
+        if input_grad_metas is not None:
+            if backward_metas is not None:
+                raise TypeError("backward metadata was provided twice")
+            backward_metas = input_grad_metas
+        self.input_grad_metas = tuple(backward_metas or ())
+        self.output_grad_metas = tuple(output_grad_metas or ())
 
-@dataclass
+    @property
+    def backward_metas(self) -> tuple[TensorMeta | None, ...]:
+        return self.input_grad_metas
+
+    @backward_metas.setter
+    def backward_metas(self, value: Iterable[TensorMeta | None]) -> None:
+        self.input_grad_metas = tuple(value)
+
+
+@dataclass(init=False)
 class _StageMeta:
     forward: _StageForwardMeta = field(default_factory=_StageForwardMeta)
     backward: _StageBackwardMeta = field(default_factory=_StageBackwardMeta)
+
+    def __init__(
+        self,
+        inputs: Iterable[TensorMeta] | None = None,
+        outputs: Iterable[TensorMeta] | None = None,
+        input_grads: Iterable[TensorMeta | None] | None = None,
+        output_grads: Iterable[TensorMeta | None] | None = None,
+        *,
+        forward: _StageForwardMeta | None = None,
+        backward: _StageBackwardMeta | None = None,
+    ) -> None:
+        self.forward = forward or _StageForwardMeta(
+            input_metas=inputs,
+            output_metas=outputs,
+        )
+        self.backward = backward or _StageBackwardMeta(
+            input_grad_metas=input_grads,
+            output_grad_metas=output_grads,
+        )
 
     @property
     def inputs(self) -> tuple[TensorMeta, ...] | None:
@@ -181,7 +272,17 @@ def _make_tensor_from_meta(meta: TensorMeta, device: Any = None) -> Any:
 
 
 def _derive_grad_metas(output_metas: Iterable[TensorMeta]) -> tuple[TensorMeta | None, ...]:
-    return tuple(meta if meta.requires_grad else None for meta in output_metas)
+    return tuple(
+        None
+        if not meta.requires_grad or isinstance(meta, _DTensorMeta)
+        else _TensorMeta(
+            shape=meta.shape,
+            stride=meta.stride,
+            dtype=meta.dtype,
+            requires_grad=False,
+        )
+        for meta in output_metas
+    )
 
 
 class _MeshCache:
@@ -209,6 +310,22 @@ class _MeshCache:
 
     def put(self, key: Any, mesh: Any) -> None:
         self._cache[key] = mesh
+
+    def update_from_tensors(self, tensors: tuple[Any | None, ...]) -> None:
+        for tensor in tensors:
+            if isinstance(tensor, DTensor):
+                mesh = tensor.device_mesh
+                names = tuple(mesh.mesh_dim_names or ())
+                layout = getattr(mesh, "_layout", None)
+                key = (names, layout)
+                if key not in self._cache:
+                    self._cache[key] = mesh
+
+    def __contains__(self, key: Any) -> bool:
+        return key in self._cache
+
+    def __len__(self) -> int:
+        return len(self._cache)
 
 
 class InferenceMode(str, Enum):
@@ -243,7 +360,7 @@ def flatten_args(args: Any, kwargs: dict[str, Any] | None = None, *, detach: boo
         if detach:
             detached = [
                 value.detach().requires_grad_(value.requires_grad)
-                if isinstance(value, tp.Tensor)
+                if isinstance(value, (tp.Tensor, DTensor))
                 else value
                 for value in flat
             ]
@@ -255,7 +372,7 @@ def flatten_args(args: Any, kwargs: dict[str, Any] | None = None, *, detach: boo
     if detach:
         flat = [
             value.detach().requires_grad_(value.requires_grad)
-            if isinstance(value, tp.Tensor)
+            if isinstance(value, (tp.Tensor, DTensor))
             else value
             for value in flat
         ]
@@ -381,15 +498,21 @@ def extract_tensor_metas(value: Any, *, allow_none: bool = False) -> Any:
     return tree_map(extract, value)
 
 
-def to_local_if_dtensor(value: Any) -> Any:
+def to_local_if_dtensor(value: Any, detach: bool = False) -> Any:
     if isinstance(value, DTensor):
-        return value.to_local()
+        result = value.detach() if detach else value
+        return result.to_local()
+    if detach and isinstance(value, tp.Tensor):
+        return value.detach()
     if isinstance(value, tuple):
-        return tuple(to_local_if_dtensor(item) for item in value)
+        return tuple(to_local_if_dtensor(item, detach=detach) for item in value)
     if isinstance(value, list):
-        return [to_local_if_dtensor(item) for item in value]
+        return [to_local_if_dtensor(item, detach=detach) for item in value]
     if isinstance(value, dict):
-        return {key: to_local_if_dtensor(item) for key, item in value.items()}
+        return {
+            key: to_local_if_dtensor(item, detach=detach)
+            for key, item in value.items()
+        }
     return value
 
 
@@ -400,7 +523,7 @@ def validate_and_normalize_to_tuple(
 ) -> tuple[Any, ...] | None:
     if value is None:
         return None
-    if isinstance(value, tp.Tensor):
+    if isinstance(value, (tp.Tensor, DTensor)):
         result = (value,)
     elif isinstance(value, (tuple, list)):
         result = tuple(value)
@@ -411,7 +534,7 @@ def validate_and_normalize_to_tuple(
     for index, item in enumerate(result):
         if item is None and allow_none:
             continue
-        if not isinstance(item, tp.Tensor):
+        if not isinstance(item, (tp.Tensor, DTensor)):
             raise PipeliningMetadataError(
                 f"pipeline value at index {index} is not a tensor"
             )

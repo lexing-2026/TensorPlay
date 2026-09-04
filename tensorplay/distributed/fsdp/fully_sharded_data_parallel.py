@@ -3,6 +3,7 @@
 import contextlib
 import copy
 import math
+import warnings
 from enum import Enum, auto
 from typing import Any, Iterable
 
@@ -11,12 +12,20 @@ from tensorplay.nn.modules.module import Module
 from tensorplay.nn.parameter import Parameter
 
 from .. import distributed_core as dist
-from ._common_utils import TrainingState
+from ._common_utils import TrainingState, _FSDPDeviceHandle
 from ._fully_shard import FSDPModule, fully_shard
 from ._fully_shard._fsdp_api import CPUOffloadPolicy, DataParallelMeshDims, MixedPrecisionPolicy, OffloadPolicy
 from ._fully_shard._fsdp_init import _init_default_mesh
 from ._fully_shard._fsdp_param import ShardedState
-from ._optim_utils import _optim_state_dict, _rekey_sharded_optim_state_dict
+from ._optim_utils import (
+    _flatten_optim_state_dict,
+    _optim_state_dict,
+    _rekey_sharded_optim_state_dict,
+)
+from ._state_dict_utils import (
+    _register_all_state_dict_hooks,
+)
+from ._unshard_param_utils import _unshard_params_for_summon
 from ._init_utils import _sync_module_params_and_buffers
 from ..device_mesh import DeviceMesh
 from ..tensor import Replicate
@@ -352,8 +361,22 @@ class FullyShardedDataParallel(Module):
             dp_mesh_dims=dp_mesh_dims,
         )
         state = self.module._get_fsdp_state()
-        state.process_group = process_group
+        mesh_info = getattr(state, "mesh_info", None)
+        state.process_group = process_group or getattr(
+            mesh_info, "shard_process_group", None
+        )
         state.device_mesh = mesh
+        state._device_mesh = mesh
+        state.rank = int(getattr(mesh_info, "shard_mesh_rank", _global_rank()))
+        state.world_size = int(getattr(mesh_info, "shard_world_size", 1))
+        state.compute_device = getattr(state, "_device", None)
+        state._device_handle = _FSDPDeviceHandle.from_device(state.compute_device)
+        state._buffer_names = {name for name, _ in self.module.named_buffers()}
+        state._buffer_name_to_orig_dtype = {
+            name: getattr(buffer, "dtype", None)
+            for name, buffer in self.module.named_buffers()
+        }
+        state._ignored_buffer_names = set()
         state.sharding_strategy = self.sharding_strategy
         state._ignored_modules = self._ignored_modules
         state._ignored_params = self._ignored_params
@@ -364,8 +387,24 @@ class FullyShardedDataParallel(Module):
         state.limit_all_gathers = bool(limit_all_gathers)
         state.use_orig_params = self.use_orig_params
         state._device_id = device_id
-        state._param_group._reshard_after_forward_enabled = self.sharding_strategy == ShardingStrategy.FULL_SHARD
-        state._param_group._reshard_after_backward_enabled = True
+        state._state_dict_type = self._state_dict_type
+        state._state_dict_config = self._state_dict_config
+        state._optim_state_dict_config = self._optim_state_dict_config
+        from ._init_utils import _init_extension
+
+        _init_extension(state, device_mesh)
+        for group in state._all_param_groups():
+            group._reshard_after_forward_enabled = (
+                self.sharding_strategy == ShardingStrategy.FULL_SHARD
+            )
+            group._reshard_after_backward_enabled = True
+        self._fsdp_state = state
+        state._state_dict_wrapped_prefix = "module."
+        _register_all_state_dict_hooks(state, module=self)
+
+    @property
+    def module(self) -> Module:
+        return self._modules["module"]
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
         return self.module(*args, **kwargs)
@@ -374,7 +413,7 @@ class FullyShardedDataParallel(Module):
         try:
             return super().__getattr__(name)
         except AttributeError:
-            module = self.__dict__.get("module")
+            module = self._modules.get("module")
             if module is not None:
                 return getattr(module, name)
             raise
@@ -393,7 +432,11 @@ class FullyShardedDataParallel(Module):
 
     def check_is_root(self) -> bool:
         state = getattr(self.module, "_fsdp_state", None)
-        return bool(state is not None and getattr(state, "_is_root", True))
+        if state is None:
+            return False
+        if getattr(state, "_is_root", None) is None:
+            state._lazy_init()
+        return bool(state._is_root)
 
     @staticmethod
     def fsdp_modules(module: Module, root_only: bool = False) -> list[Any]:
@@ -410,14 +453,35 @@ class FullyShardedDataParallel(Module):
             state_id = id(state) if state is not None else id(target)
             if state_id in state_ids:
                 continue
+            if root_only:
+                if state is not None and getattr(state, "_is_root", None) is None:
+                    state._lazy_init()
+                if state is not None and not getattr(state, "_is_root", False):
+                    continue
             state_ids.add(state_id)
             result.append(item)
-        return result[:1] if root_only and result else result
+        return result
 
     def apply(self, fn: Any) -> "FullyShardedDataParallel":
-        with self.summon_full_params(self):
-            super().apply(fn)
-        return self
+        state = self.module._get_fsdp_state()
+        uninitialized = getattr(state, "_is_root", None) is None
+        self._assert_state(TrainingState.IDLE)
+        with _unshard_params_for_summon(
+            self.module,
+            state,
+            writeback=True,
+            rank0_only=False,
+            offload_to_cpu=False,
+            with_grads=False,
+        ):
+            result = super().apply(fn)
+        if uninitialized and getattr(state, "_is_root", None):
+            for wrapper in self.fsdp_modules(self):
+                target = wrapper.module if isinstance(wrapper, FullyShardedDataParallel) else wrapper
+                target_state = getattr(target, "_fsdp_state", None)
+                if target_state is not None:
+                    target_state._reset_lazy_init()
+        return result
 
     def _mixed_precision_enabled_for_buffers(self) -> bool:
         return self.mixed_precision.buffer_dtype is not None
@@ -428,21 +492,197 @@ class FullyShardedDataParallel(Module):
     def _reset_lazy_init(self) -> None:
         state = getattr(self.module, "_fsdp_state", None)
         if state is not None:
-            state._reset_iter_state()
+            state._reset_lazy_init()
+
+    def _assert_state(self, state: TrainingState | list[TrainingState]) -> None:
+        expected = [state] if isinstance(state, TrainingState) else list(state)
+        current = getattr(self.module._get_fsdp_state(), "_training_state", None)
+        if current not in expected:
+            raise ValueError(
+                f"expected to be in states {expected} but current state is {current}"
+            )
+
+    @staticmethod
+    def _warn_optim_input(optim_input: Any, *, stacklevel: int = 1) -> None:
+        if optim_input is not None:
+            warnings.warn(
+                "optim_input is deprecated",
+                FutureWarning,
+                stacklevel=stacklevel + 1,
+            )
+
+    @staticmethod
+    def _is_using_optim_input(optim_input: Any, optim: Any) -> bool:
+        return optim_input is not None or optim is None
+
+    @staticmethod
+    def _warn_legacy_optim_state_dict(
+        current_name: str, new_name: str, *, stacklevel: int = 1
+    ) -> None:
+        warnings.warn(
+            f"{current_name} is deprecated; use {new_name}",
+            FutureWarning,
+            stacklevel=stacklevel + 1,
+        )
+
+    @staticmethod
+    def _optim_state_dict_impl(
+        model: Module,
+        optim: Any,
+        optim_state_dict: dict[str, Any] | None = None,
+        optim_input: Any = None,
+        rank0_only: bool = True,
+        full_state_dict: bool = True,
+        group: Any = None,
+        cpu_offload: bool = True,
+        *,
+        _stacklevel: int = 1,
+    ) -> dict[str, Any]:
+        if full_state_dict:
+            FullyShardedDataParallel._warn_optim_input(
+                optim_input, stacklevel=_stacklevel + 1
+            )
+        wrappers = FullyShardedDataParallel.fsdp_modules(model)
+        use_orig_params = bool(getattr(wrappers[0], "use_orig_params", False)) if wrappers else False
+        using_optim_input = FullyShardedDataParallel._is_using_optim_input(
+            optim_input, optim
+        )
+        source = optim_state_dict
+        if source is None and optim is not None:
+            source = optim.state_dict()
+        if source is None:
+            raise ValueError("an optimizer or optimizer state is required")
+        return _optim_state_dict(
+            model,
+            optim,
+            source,
+            optim_input,
+            rank0_only,
+            not full_state_dict,
+            group,
+            using_optim_input,
+            use_orig_params,
+            cpu_offload,
+        )
+
+    @staticmethod
+    def _optim_state_dict_to_load_impl(
+        optim_state_dict: dict[str, Any],
+        model: Module,
+        optim_input: Any = None,
+        optim: Any = None,
+        full_state_dict: bool = True,
+        rank0_only: bool = False,
+        is_named_optimizer: bool = False,
+        group: Any = None,
+    ) -> dict[str, Any]:
+        if full_state_dict:
+            FullyShardedDataParallel._warn_optim_input(optim_input)
+            using_optim_input = FullyShardedDataParallel._is_using_optim_input(
+                optim_input, optim
+            )
+        else:
+            using_optim_input = False
+            if optim_input is not None or rank0_only:
+                raise AssertionError(
+                    "full optimizer state loading requires rank0_only=False for a sharded input"
+                )
+        if rank0_only and dist.is_initialized() and _global_rank() != 0:
+            source = {"state": {}}
+        else:
+            source = optim_state_dict
+        wrappers = FullyShardedDataParallel.fsdp_modules(model)
+        use_orig_params = bool(getattr(wrappers[0], "use_orig_params", False)) if wrappers else False
+        flattened = _flatten_optim_state_dict(
+            source,
+            model=model,
+            use_orig_params=use_orig_params,
+            optim=optim if is_named_optimizer else None,
+            rank0_only=rank0_only,
+            group=group,
+        )
+        return _rekey_sharded_optim_state_dict(
+            flattened,
+            model,
+            optim,
+            optim_input,
+            using_optim_input,
+            is_named_optimizer,
+        )
 
     @staticmethod
     def set_state_dict_type(module: Module, state_dict_type: StateDictType, state_dict_config: StateDictConfig | None = None, optim_state_dict_config: OptimStateDictConfig | None = None) -> StateDictSettings:
         targets = FullyShardedDataParallel.fsdp_modules(module)
         if not targets:
             raise ValueError("module does not contain a fully sharded wrapper")
-        target = targets[0]
-        previous = StateDictSettings(target._state_dict_type, target._state_dict_config, target._optim_state_dict_config)
-        state_dict_config = state_dict_config or _default_state_dict_config(state_dict_type)
-        optim_state_dict_config = optim_state_dict_config or _default_optim_state_dict_config(state_dict_type)
+        state_dict_config_types = {
+            StateDictType.FULL_STATE_DICT: FullStateDictConfig,
+            StateDictType.LOCAL_STATE_DICT: LocalStateDictConfig,
+            StateDictType.SHARDED_STATE_DICT: ShardedStateDictConfig,
+        }
+        optim_state_dict_config_types = {
+            StateDictType.FULL_STATE_DICT: FullOptimStateDictConfig,
+            StateDictType.LOCAL_STATE_DICT: LocalOptimStateDictConfig,
+            StateDictType.SHARDED_STATE_DICT: ShardedOptimStateDictConfig,
+        }
+        state_dict_config_type = state_dict_config_types[state_dict_type]
+        optim_state_dict_config_type = optim_state_dict_config_types[state_dict_type]
+        if state_dict_config is None:
+            state_dict_config = state_dict_config_type()
+        if optim_state_dict_config is None:
+            optim_state_dict_config = optim_state_dict_config_type()
+        if type(state_dict_config) is not state_dict_config_type:
+            raise RuntimeError(
+                f"Expected state_dict_config of type {state_dict_config_type} "
+                f"but got {type(state_dict_config)}"
+            )
+        if type(optim_state_dict_config) is not optim_state_dict_config_type:
+            raise RuntimeError(
+                f"Expected optim_state_dict_config of type {optim_state_dict_config_type} "
+                f"but got {type(optim_state_dict_config)}"
+            )
+        previous: StateDictSettings | None = None
         for item in targets:
-            item._state_dict_type = state_dict_type
-            item._state_dict_config = state_dict_config
-            item._optim_state_dict_config = optim_state_dict_config
+            candidates = (item.module,) if isinstance(item, FullyShardedDataParallel) else ()
+            for candidate in (item, *candidates):
+                current = StateDictSettings(
+                    candidate._state_dict_type,
+                    candidate._state_dict_config,
+                    candidate._optim_state_dict_config,
+                )
+                if previous is None:
+                    previous = current
+                else:
+                    if previous.state_dict_type != current.state_dict_type:
+                        raise AssertionError(
+                            "All FSDP modules should have the same state_dict_type."
+                        )
+                    if not isinstance(
+                        current.state_dict_config, type(previous.state_dict_config)
+                    ):
+                        raise AssertionError(
+                            "All FSDP modules must have the same type of state_dict_config."
+                        )
+                    if not isinstance(
+                        current.optim_state_dict_config,
+                        type(previous.optim_state_dict_config),
+                    ):
+                        raise AssertionError(
+                            "All FSDP modules must have the same type of optim_state_dict_config."
+                        )
+        for item in targets:
+            candidates = (item.module,) if isinstance(item, FullyShardedDataParallel) else ()
+            for candidate in (item, *candidates):
+                candidate._state_dict_type = state_dict_type
+                candidate._state_dict_config = state_dict_config
+                candidate._optim_state_dict_config = optim_state_dict_config
+                candidate_state = getattr(candidate, "_fsdp_state", None)
+                if candidate_state is not None:
+                    candidate_state._state_dict_type = state_dict_type
+                    candidate_state._state_dict_config = state_dict_config
+                    candidate_state._optim_state_dict_config = optim_state_dict_config
+        if previous is None:
+            raise ValueError("module does not contain a fully sharded wrapper")
         return previous
 
     @staticmethod
@@ -450,49 +690,56 @@ class FullyShardedDataParallel(Module):
         targets = FullyShardedDataParallel.fsdp_modules(module)
         if not targets:
             raise ValueError("module does not contain a fully sharded wrapper")
-        target = targets[0]
-        return StateDictSettings(target._state_dict_type, target._state_dict_config, target._optim_state_dict_config)
+        settings: StateDictSettings | None = None
+        for item in targets:
+            candidates = (item.module,) if isinstance(item, FullyShardedDataParallel) else ()
+            for candidate in (item, *candidates):
+                current = StateDictSettings(
+                    candidate._state_dict_type,
+                    candidate._state_dict_config,
+                    candidate._optim_state_dict_config,
+                )
+                if settings is None:
+                    settings = current
+                elif settings != current:
+                    raise AssertionError(
+                        "All FSDP modules must have the same state dict settings."
+                        f"Got {current} and {settings}."
+                    )
+        if settings is None:
+            raise ValueError("module does not contain a fully sharded wrapper")
+        return settings
 
     @staticmethod
     @contextlib.contextmanager
     def state_dict_type(module: Module, state_dict_type: StateDictType, state_dict_config: StateDictConfig | None = None, optim_state_dict_config: OptimStateDictConfig | None = None):
         previous = FullyShardedDataParallel.set_state_dict_type(module, state_dict_type, state_dict_config, optim_state_dict_config)
         try:
-            yield previous
+            yield
         finally:
             FullyShardedDataParallel.set_state_dict_type(module, previous.state_dict_type, previous.state_dict_config, previous.optim_state_dict_config)
 
     def state_dict(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        config = self._state_dict_config
-        if self._state_dict_type == StateDictType.LOCAL_STATE_DICT:
-            state = self.module.state_dict(*args, **kwargs)
-        else:
-            with self.summon_full_params(
-                self,
-                rank0_only=bool(getattr(config, "rank0_only", False)),
-                offload_to_cpu=bool(getattr(config, "offload_to_cpu", False)),
-            ):
-                state = self.module.state_dict(*args, **kwargs)
-            if bool(getattr(config, "rank0_only", False)) and _global_rank() != 0:
-                return {}
-        if getattr(self._state_dict_config, "offload_to_cpu", False):
-            state = {key: value.cpu() if isinstance(value, tp.Tensor) else value for key, value in state.items()}
-        return state
+        return super().state_dict(*args, **kwargs)
 
     def load_state_dict(self, state_dict: dict[str, Any], *args: Any, **kwargs: Any) -> Any:
-        if self._state_dict_type == StateDictType.LOCAL_STATE_DICT:
-            result = self.module.load_state_dict(state_dict, *args, **kwargs)
-        else:
-            with self.summon_full_params(self):
-                result = self.module.load_state_dict(state_dict, *args, **kwargs)
-            self.module.reshard()
-        return result
+        return super().load_state_dict(state_dict, *args, **kwargs)
 
     def named_parameters(self, *args: Any, **kwargs: Any):
-        yield from super().named_parameters(*args, **kwargs)
+        state = getattr(self, "_fsdp_state", None)
+        clean_names = bool(getattr(state, "_summoning_full_params", False))
+        for name, param in super().named_parameters(*args, **kwargs):
+            if clean_names:
+                name = name.replace("module.", "")
+            yield name, param
 
     def named_buffers(self, *args: Any, **kwargs: Any):
-        yield from super().named_buffers(*args, **kwargs)
+        state = getattr(self, "_fsdp_state", None)
+        clean_names = bool(getattr(state, "_summoning_full_params", False))
+        for name, buffer in super().named_buffers(*args, **kwargs):
+            if clean_names:
+                name = name.replace("module.", "")
+            yield name, buffer
 
     @staticmethod
     @contextlib.contextmanager
@@ -512,51 +759,93 @@ class FullyShardedDataParallel(Module):
             if id(state) not in state_ids:
                 state_ids.add(id(state))
                 targets.append(target)
-        if rank0_only and _global_rank() != 0:
-            for target in targets:
-                target.reshard()
-            yield
-            return
         snapshots: list[tuple[Any, Any, Any]] = []
-        for target in targets:
-            state = target._get_fsdp_state()
-            for param in state._fsdp_param_group().params:
-                local = param._sharded_local_tensor()
-                snapshots.append((param, local.detach().clone(), getattr(local, "device", None)))
-            target.unshard()
-        for param, _, _ in snapshots:
-            if not offload_to_cpu:
-                continue
-            full = param._full_tensor
-            if getattr(full, "device", None) is not None and str(full.device) != "cpu":
-                param._full_tensor = full.to("cpu")
-                param._setattr_on_modules(
-                    Parameter(param._full_tensor, requires_grad=param.param.requires_grad)
-                )
-        if with_grads:
-            _materialize_summoned_grads(snapshots)
+        nonzero_params: set[int] = set()
+        nonzero_targets: set[int] = set()
+        state_flags = [
+            (
+                target._get_fsdp_state(),
+                bool(getattr(target._get_fsdp_state(), "_summoning_full_params", False)),
+                getattr(
+                    target._get_fsdp_state(),
+                    "_training_state",
+                    TrainingState.IDLE,
+                ),
+            )
+            for target in targets
+        ]
+        for state, _, _ in state_flags:
+            state._summoning_full_params = True
+            state._training_state = TrainingState.SUMMON_FULL_PARAMS
         try:
+            for target in targets:
+                state = target._get_fsdp_state()
+                target_rank = int(getattr(state, "rank", _global_rank()))
+                nonzero_target = rank0_only and target_rank != 0
+                for group in state._all_param_groups():
+                    for param in group.params:
+                        if nonzero_target:
+                            nonzero_params.add(id(param))
+                        local = param._sharded_local_tensor()
+                        snapshots.append(
+                            (param, local.detach().clone(), getattr(local, "device", None))
+                        )
+                target.unshard()
+                if nonzero_target:
+                    nonzero_targets.add(id(target))
+                    target.reshard()
+            for param, _, _ in snapshots:
+                if not offload_to_cpu or id(param) in nonzero_params:
+                    continue
+                full = param._full_tensor
+                if getattr(full, "device", None) is not None and str(full.device) != "cpu":
+                    param._full_tensor = full.to("cpu")
+                    param._unsharded_param = param._full_tensor
+                    param._setattr_on_modules(
+                        Parameter(
+                            param._full_tensor,
+                            requires_grad=param.param.requires_grad,
+                        )
+                    )
+            if with_grads:
+                _materialize_summoned_grads(
+                    snapshot
+                    for snapshot in snapshots
+                    if id(snapshot[0]) not in nonzero_params
+                )
             yield
         finally:
-            for param, local, device in snapshots:
-                if not writeback:
-                    sharded = param._sharded_tensor
-                    if sharded is not None:
-                        sharded_local = sharded.to_local()
-                        if device is not None and getattr(local, "device", None) != device:
-                            local = local.to(device)
-                        with tp.no_grad():
-                            sharded_local.copy_(local)
-                    param._state = ShardedState.SHARDED
-                elif offload_to_cpu and device is not None:
-                    full = param._full_tensor
-                    if getattr(full, "device", None) != device:
-                        param._full_tensor = full.to(device)
-                        param._setattr_on_modules(
-                            Parameter(param._full_tensor, requires_grad=param.param.requires_grad)
-                        )
-            for target in reversed(targets):
-                target.reshard()
+            try:
+                for param, local, device in snapshots:
+                    if id(param) in nonzero_params:
+                        continue
+                    if not writeback:
+                        sharded = param._sharded_tensor
+                        if sharded is not None:
+                            sharded_local = sharded.to_local()
+                            if device is not None and getattr(local, "device", None) != device:
+                                local = local.to(device)
+                            with tp.no_grad():
+                                sharded_local.copy_(local)
+                        param._state = ShardedState.SHARDED
+                    elif offload_to_cpu and device is not None:
+                        full = param._full_tensor
+                        if getattr(full, "device", None) != device:
+                            param._full_tensor = full.to(device)
+                            param._unsharded_param = param._full_tensor
+                            param._setattr_on_modules(
+                                Parameter(
+                                    param._full_tensor,
+                                    requires_grad=param.param.requires_grad,
+                                )
+                            )
+                for target in reversed(targets):
+                    if id(target) not in nonzero_targets:
+                        target.reshard()
+            finally:
+                for state, previous, previous_training_state in state_flags:
+                    state._summoning_full_params = previous
+                    state._training_state = previous_training_state
 
     def _deregister_orig_params_ctx(self):
         if not self.use_orig_params:
@@ -570,96 +859,305 @@ class FullyShardedDataParallel(Module):
     def no_sync(self):
         @contextlib.contextmanager
         def context():
+            state = self.module._get_fsdp_state()
+            if getattr(state, "_is_root", None) is None:
+                state._lazy_init()
+            if not getattr(state, "_is_root", False):
+                raise RuntimeError(
+                    "no_sync must be called on the root fully sharded module"
+                )
+            self._assert_state(TrainingState.IDLE)
             previous = self._no_sync
             self._no_sync = True
-            state = getattr(self.module, "_fsdp_state", None)
-            previous_sync = None
-            if state is not None:
-                previous_sync = state._requires_gradient_sync
+            state_snapshots = []
+            group_snapshots = []
+            states_seen = set()
+            groups_seen = set()
+            for candidate in self.module.modules():
+                state = getattr(candidate, "_fsdp_state", None)
+                if state is None or id(state) in states_seen:
+                    continue
+                states_seen.add(id(state))
+                state_snapshots.append(
+                    (
+                        state,
+                        state._requires_gradient_sync,
+                        state._requires_all_reduce,
+                    )
+                )
                 state._requires_gradient_sync = False
-                group = state._fsdp_param_group()
-                group._requires_gradient_sync = False
+                state._requires_all_reduce = False
+                for group in state._all_param_groups():
+                    if id(group) in groups_seen:
+                        continue
+                    groups_seen.add(id(group))
+                    group_snapshots.append(
+                        (
+                            group,
+                            group.reduce_grads,
+                            group.all_reduce_grads,
+                            group._requires_gradient_sync,
+                            group._requires_all_reduce,
+                        )
+                    )
+                    group.reduce_grads = False
+                    group.all_reduce_grads = False
+                    group._requires_gradient_sync = False
+                    group._requires_all_reduce = False
             try:
                 yield
             finally:
                 self._no_sync = previous
-                if state is not None:
-                    state._requires_gradient_sync = bool(previous_sync)
-                    state._fsdp_param_group()._requires_gradient_sync = bool(previous_sync)
+                for (
+                    state,
+                    previous_sync,
+                    previous_all_reduce,
+                ) in state_snapshots:
+                    state._requires_gradient_sync = previous_sync
+                    state._requires_all_reduce = previous_all_reduce
+                for (
+                    group,
+                    previous_reduce,
+                    previous_all_reduce,
+                    previous_sync,
+                    previous_group_all_reduce,
+                ) in group_snapshots:
+                    group.reduce_grads = previous_reduce
+                    group.all_reduce_grads = previous_all_reduce
+                    group._requires_gradient_sync = previous_sync
+                    group._requires_all_reduce = previous_group_all_reduce
         return context()
 
-    def clip_grad_norm_(self, max_norm: float, norm_type: float = 2.0) -> float:
-        grads = [param.grad for param in self.module.parameters() if getattr(param, "grad", None) is not None]
-        if not grads:
-            return 0.0
+    @tp.no_grad()
+    def clip_grad_norm_(self, max_norm: float, norm_type: float = 2.0) -> Any:
         state = self.module._get_fsdp_state()
-        group = state._fsdp_param_group()._all_reduce_process_group()
+        if state is None:
+            raise RuntimeError("clip_grad_norm_ requires a sharded module")
+        if getattr(state, "_is_root", None) is None:
+            state._lazy_init()
+        if not getattr(state, "_is_root", False):
+            raise RuntimeError(
+                "clip_grad_norm_ should only be called on the root fully sharded module"
+            )
+        self._assert_state(TrainingState.IDLE)
+        try:
+            norm_type = float(norm_type)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("norm_type must be a positive number") from exc
+        if norm_type <= 0 and norm_type != math.inf:
+            raise ValueError("norm_type must be positive")
+        max_norm = float(max_norm)
+        if max_norm < 0:
+            raise ValueError("max_norm must be non-negative")
+
+        groups: list[Any] = []
+        states_seen: set[int] = set()
+        groups_seen: set[int] = set()
+        for candidate in self.module.modules():
+            candidate_state = getattr(candidate, "_fsdp_state", None)
+            if candidate_state is None or id(candidate_state) in states_seen:
+                continue
+            states_seen.add(id(candidate_state))
+            for group in candidate_state._all_param_groups():
+                if id(group) in groups_seen:
+                    continue
+                groups_seen.add(id(group))
+                groups.append(group)
+
+        device = getattr(state, "compute_device", None)
+        if device is None:
+            device = next(
+                (
+                    getattr(param, "device", None)
+                    for param in self.module.parameters()
+                    if getattr(param, "device", None) is not None
+                ),
+                "cpu",
+            )
+        zero = tp.tensor(0.0, device=device, dtype=tp.float32)
+        sharded_params: list[Any] = []
+        nonsharded_params: list[Any] = []
+        sharded_param_ids: set[int] = set()
+        nonsharded_param_ids: set[int] = set()
+        sharded_norms: list[Any] = []
+        sharded_norm_groups: list[Any] = []
+        grads: list[Any] = []
+        for group in groups:
+            reduce_group = group._reduce_scatter_process_group()
+            try:
+                group_world_size = (
+                    dist.get_world_size(reduce_group)
+                    if reduce_group is not None
+                    else 1
+                )
+            except (RuntimeError, ValueError):
+                group_world_size = 1
+            target = sharded_params if group_world_size > 1 else nonsharded_params
+            target_ids = (
+                sharded_param_ids if group_world_size > 1 else nonsharded_param_ids
+            )
+            for fsdp_param in group.params:
+                param = fsdp_param._sharded_local_tensor()
+                if id(param) in target_ids:
+                    continue
+                target_ids.add(id(param))
+                target.append(param)
+                grad = getattr(param, "grad", None)
+                if grad is not None:
+                    grads.append(grad)
+            if group_world_size > 1:
+                sharded_norms.append(
+                    _get_grad_norm(target, norm_type, zero, device)
+                )
+                sharded_norm_groups.append(reduce_group)
+
+        for param in self.parameters():
+            param_id = id(param)
+            if param_id in sharded_param_ids or param_id in nonsharded_param_ids:
+                continue
+            nonsharded_param_ids.add(param_id)
+            nonsharded_params.append(param)
+            grad = getattr(param, "grad", None)
+            if grad is not None:
+                grads.append(grad)
+
         if norm_type == math.inf:
-            total_tensor = tp.tensor(
-                max(float(grad.abs().max().item()) for grad in grads),
-                device=grads[0].device,
+            total_norm = zero
+            for local_norm, reduce_group in zip(
+                sharded_norms, sharded_norm_groups
+            ):
+                if reduce_group is not None:
+                    dist.all_reduce(
+                        local_norm, op=dist.ReduceOp.MAX, group=reduce_group
+                    )
+                total_norm = tp.maximum(total_norm, local_norm)
+            local_nonsharded_norm = _get_grad_norm(
+                nonsharded_params, norm_type, zero, device
             )
-            if group is not None and int(group.size()) > 1:
-                dist.all_reduce(total_tensor, op=dist.ReduceOp.MAX, group=group)
-            total = float(total_tensor.item())
+            total_norm = tp.maximum(total_norm, local_nonsharded_norm)
         else:
-            total_tensor = tp.tensor(
-                sum(float((grad.abs() ** norm_type).sum().item()) for grad in grads),
-                device=grads[0].device,
+            total_power = zero
+            for local_norm, reduce_group in zip(
+                sharded_norms, sharded_norm_groups
+            ):
+                local_power = local_norm ** norm_type
+                if reduce_group is not None:
+                    dist.all_reduce(
+                        local_power, op=dist.ReduceOp.SUM, group=reduce_group
+                    )
+                total_power = total_power + local_power
+            local_nonsharded_norm = _get_grad_norm(
+                nonsharded_params, norm_type, zero, device
             )
-            if group is not None and int(group.size()) > 1:
-                dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM, group=group)
-            total = float(total_tensor.item()) ** (1.0 / norm_type)
-        scale = min(1.0, float(max_norm) / (total + 1e-6))
-        if scale < 1.0:
-            for grad in grads:
-                grad.mul_(scale)
-        return total
+            total_norm = (total_power + local_nonsharded_norm ** norm_type) ** (
+                1.0 / norm_type
+            )
+
+        clip_coef = max_norm / (total_norm + 1e-6)
+        clip_coef = tp.clamp(clip_coef, max=1.0)
+        for grad in grads:
+            grad.mul_(clip_coef.to(device=grad.device, dtype=grad.dtype))
+        if not grads:
+            return total_norm
+        total_dtype = grads[0].dtype
+        for grad in grads[1:]:
+            total_dtype = tp.promote_types(total_dtype, grad.dtype)
+        return total_norm.to(dtype=total_dtype)
 
     def register_comm_hook(self, state: Any, hook: Any) -> None:
+        if not self.check_is_root():
+            raise AssertionError("register_comm_hook must be called on a root module")
         if not callable(hook):
-            raise TypeError("communication hook must be callable")
+            raise ValueError(f"the communication hook must be callable: {hook!r}")
+        if self._comm_hook is not None:
+            raise AssertionError("a communication hook is already registered")
+        states: list[Any] = []
+        seen: set[int] = set()
+        for candidate in self.module.modules():
+            fsdp_state = getattr(candidate, "_fsdp_state", None)
+            if fsdp_state is None or id(fsdp_state) in seen:
+                continue
+            seen.add(id(fsdp_state))
+            states.append(fsdp_state)
+        for fsdp_state in states:
+            if getattr(fsdp_state, "_comm_hook", None) is not None:
+                raise AssertionError("a communication hook is already registered")
+            for group in fsdp_state._all_param_groups():
+                if group._is_hsdp():
+                    raise AssertionError(
+                        "communication hooks are not supported for hybrid sharding"
+                    )
+        for fsdp_state in states:
+            fsdp_state._comm_hook = hook
+            fsdp_state._comm_hook_state = state
+            for group in fsdp_state._all_param_groups():
+                group._comm_hook = hook
+                group._comm_hook_state = state
         self._comm_hook = (state, hook)
 
     def _unshard(self, async_op: bool = False) -> Any:
-        return self.module.unshard(async_op)
+        class UnshardHandle:
+            def __init__(self, handle: Any) -> None:
+                self._handle = handle
+
+            def wait(self) -> None:
+                if self._handle is not None:
+                    waiter = getattr(self._handle, "wait", None)
+                    if callable(waiter):
+                        waiter()
+                    self._handle = None
+
+        result = self.module.unshard(async_op=bool(async_op))
+        if async_op:
+            return UnshardHandle(result)
+        if result is not None:
+            UnshardHandle(result).wait()
+        return None
 
     def _wait_unshard_streams_on_current_stream(self) -> None:
-        self.module._get_fsdp_state()._fsdp_param_group().wait_for_unshard()
+        state = self.module._get_fsdp_state()
+        for group in state._all_param_groups():
+            group.wait_for_unshard()
 
+    @contextlib.contextmanager
     def _use_training_state(self, state: TrainingState, handle_training_state: Any = None):
-        del handle_training_state
-        current = self.module._get_fsdp_state()._training_state
-        self.module._get_fsdp_state()._training_state = state
-        return current
+        fsdp_state = self.module._get_fsdp_state()
+        previous = fsdp_state._training_state
+        fsdp_state._training_state = state
+        handle = getattr(fsdp_state, "_handle", None)
+        if handle is not None:
+            previous_handle_state = handle._training_state
+            handle._training_state = handle_training_state
+        try:
+            yield
+        finally:
+            fsdp_state._training_state = previous
+            if handle is not None:
+                handle._training_state = previous_handle_state
 
     def full_optim_state_dict(self, optim: Any, optim_input: Any = None, rank0_only: bool = True, group: Any = None) -> dict[str, Any]:
         config = self._optim_state_dict_config
-        return _optim_state_dict(
+        return self._optim_state_dict_impl(
             self,
             optim,
             optim.state_dict(),
             optim_input,
             rank0_only,
-            False,
+            True,
             group,
-            optim_input is not None,
-            self.use_orig_params,
             bool(getattr(config, "offload_to_cpu", True)),
         )
 
     def sharded_optim_state_dict(self, optim: Any, group: Any = None) -> dict[str, Any]:
         config = self._optim_state_dict_config
-        return _optim_state_dict(
+        return self._optim_state_dict_impl(
             self,
             optim,
             optim.state_dict(),
             None,
             False,
-            True,
-            group,
             False,
-            self.use_orig_params,
+            group,
             bool(getattr(config, "offload_to_cpu", False)),
         )
 
@@ -773,58 +1271,32 @@ class FullyShardedDataParallel(Module):
     def optim_state_dict(model: Module, optim: Any, optim_state_dict: dict[str, Any] | None = None, group: Any = None) -> dict[str, Any]:
         wrappers = FullyShardedDataParallel.fsdp_modules(model)
         state_type = wrappers[0]._state_dict_type if wrappers else StateDictType.FULL_STATE_DICT
-        if state_type == StateDictType.LOCAL_STATE_DICT:
-            converted = _optim_state_dict(
-                model,
-                optim,
-                optim_state_dict,
-                None,
-                False,
-                True,
-                group,
-                False,
-                bool(getattr(wrappers[0], "use_orig_params", False)) if wrappers else False,
-                False,
+        source = optim_state_dict if optim_state_dict is not None else optim.state_dict()
+        if state_type == StateDictType.FULL_STATE_DICT:
+            return FullyShardedDataParallel._optim_state_dict_impl(
+                model, optim, source, None, True, True, group, True
             )
-            return _rekey_sharded_optim_state_dict(converted, model, optim, None, False, False)
-        if state_type == StateDictType.SHARDED_STATE_DICT:
-            return _optim_state_dict(
-                model,
-                optim,
-                optim_state_dict,
-                None,
-                False,
-                True,
-                group,
-                False,
-                bool(getattr(wrappers[0], "use_orig_params", False)) if wrappers else False,
-                False,
-            )
-        return _optim_state_dict(
-            model,
-            optim,
-            optim_state_dict,
-            None,
-            False,
-            False,
-            group,
-            False,
-            bool(getattr(wrappers[0], "use_orig_params", False)) if wrappers else False,
-            False,
+        return FullyShardedDataParallel._optim_state_dict_impl(
+            model, optim, source, None, False, False, group, False
         )
 
     @staticmethod
     def optim_state_dict_to_load(model: Module, optim: Any, optim_state_dict: dict[str, Any], is_named_optimizer: bool = False, load_directly: bool = False, group: Any = None) -> dict[str, Any]:
-        if load_directly:
-            return copy.deepcopy(optim_state_dict)
-        if is_named_optimizer:
-            return copy.deepcopy(optim_state_dict)
-        return FullyShardedDataParallel.rekey_optim_state_dict(
+        wrappers = FullyShardedDataParallel.fsdp_modules(model)
+        state_type = wrappers[0]._state_dict_type if wrappers else StateDictType.FULL_STATE_DICT
+        result = FullyShardedDataParallel._optim_state_dict_to_load_impl(
             optim_state_dict,
-            OptimStateKeyType.PARAM_ID,
             model,
-            optim=optim,
+            None,
+            optim,
+            state_type == StateDictType.FULL_STATE_DICT,
+            False,
+            is_named_optimizer,
+            group,
         )
+        if load_directly:
+            optim.load_state_dict(result)
+        return result
 
 
 def _optimizer_parameter_maps(
@@ -911,11 +1383,23 @@ def _rank_is_zero() -> bool:
         return True
 
 
-def _get_grad_norm(parameters: Iterable[Any], norm_type: float = 2.0) -> float:
-    values = [param.grad for param in parameters if getattr(param, "grad", None) is not None]
+def _get_grad_norm(
+    parameters: Iterable[Any],
+    norm_type: float,
+    zero: Any,
+    device: Any,
+) -> Any:
+    values = [
+        param.grad for param in parameters if getattr(param, "grad", None) is not None
+    ]
     if not values:
-        return 0.0
-    return sum(float((value.abs() ** norm_type).sum().item()) for value in values) ** (1.0 / norm_type)
+        return zero
+    norms = [
+        tp.linalg.vector_norm(value.detach(), norm_type, dtype=tp.float32)
+        for value in values
+    ]
+    result = tp.linalg.vector_norm(tp.stack(norms), norm_type, dtype=tp.float32)
+    return result.to(device=device)
 
 
 def _get_param_to_fqn(model: Module) -> dict[Any, str]:
