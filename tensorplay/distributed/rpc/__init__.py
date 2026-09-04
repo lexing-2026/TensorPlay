@@ -5,10 +5,13 @@ from .api import (
     RRef,
     _get_current_rpc_agent,
     _is_current_rpc_agent_set,
+    _set_rpc_timeout,
+    get_rpc_timeout,
     get_worker_info,
     init_rpc,
     is_available,
     method_factory,
+    new_method,
     remote,
     rpc_async,
     rpc_sync,
@@ -32,6 +35,10 @@ from .constants import (
 )
 from .options import TensorPipeRpcBackendOptions
 
+
+def is_available() -> bool:
+    return api.is_available()
+
 __all__ = [
     "api",
     "backend_registry",
@@ -45,10 +52,12 @@ __all__ = [
     "backend_registered",
     "construct_rpc_backend_options",
     "get_worker_info",
+    "get_rpc_timeout",
     "init_backend",
     "init_rpc",
     "is_available",
     "method_factory",
+    "new_method",
     "register_backend",
     "remote",
     "rpc_async",

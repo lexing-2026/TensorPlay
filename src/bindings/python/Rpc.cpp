@@ -1,5 +1,6 @@
 #include "python_bindings.h"
 
+#include "../../distributed/rpc/agent_utils.h"
 #include "../../distributed/rpc/python_call.h"
 #include "../../distributed/rpc/python_functions.h"
 #include "../../distributed/rpc/rpc_agent.h"
@@ -125,6 +126,16 @@ void init_rpc(py::module_& m) {
             return agent.get_worker_info(checked_worker_id(id));
         })
         .def("get_worker_infos", &tensorplay::distributed::rpc::RpcAgent::get_worker_infos)
+        .def("get_rpc_timeout", [](const tensorplay::distributed::rpc::RpcAgent& agent) {
+            return static_cast<double>(agent.rpc_timeout().count()) / 1000.0;
+        })
+        .def("set_rpc_timeout", [](tensorplay::distributed::rpc::RpcAgent& agent, double timeout) {
+            if (timeout < 0.0) {
+                throw py::value_error("RPC timeout must be non-negative");
+            }
+            agent.set_rpc_timeout(
+                tensorplay::distributed::rpc::timeout_to_duration(timeout));
+        })
         .def("get_metrics", &tensorplay::distributed::rpc::RpcAgent::get_metrics)
         .def("get_debug_info", &tensorplay::distributed::rpc::RpcAgent::get_debug_info)
         .def(
@@ -206,11 +217,16 @@ void init_rpc(py::module_& m) {
         .def("device_maps", &TensorPipeAgent::device_maps);
 
     py::enum_<MessageType>(rpc, "MessageType")
+        .value("SCRIPT_CALL", MessageType::SCRIPT_CALL)
+        .value("SCRIPT_RET", MessageType::SCRIPT_RET)
         .value("PYTHON_CALL", MessageType::PYTHON_CALL)
         .value("PYTHON_RET", MessageType::PYTHON_RET)
+        .value("SCRIPT_REMOTE_CALL", MessageType::SCRIPT_REMOTE_CALL)
         .value("PYTHON_REMOTE_CALL", MessageType::PYTHON_REMOTE_CALL)
         .value("REMOTE_RET", MessageType::REMOTE_RET)
+        .value("SCRIPT_RREF_FETCH_CALL", MessageType::SCRIPT_RREF_FETCH_CALL)
         .value("PYTHON_RREF_FETCH_CALL", MessageType::PYTHON_RREF_FETCH_CALL)
+        .value("SCRIPT_RREF_FETCH_RET", MessageType::SCRIPT_RREF_FETCH_RET)
         .value("PYTHON_RREF_FETCH_RET", MessageType::PYTHON_RREF_FETCH_RET)
         .value("RREF_USER_DELETE", MessageType::RREF_USER_DELETE)
         .value("RREF_FORK_REQUEST", MessageType::RREF_FORK_REQUEST)

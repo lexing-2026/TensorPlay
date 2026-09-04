@@ -13,11 +13,16 @@ uint64_t next_message_id() {
 
 std::string message_type_name(MessageType type) {
     switch (type) {
+        case MessageType::SCRIPT_CALL: return "SCRIPT_CALL";
+        case MessageType::SCRIPT_RET: return "SCRIPT_RET";
         case MessageType::PYTHON_CALL: return "PYTHON_CALL";
         case MessageType::PYTHON_RET: return "PYTHON_RET";
+        case MessageType::SCRIPT_REMOTE_CALL: return "SCRIPT_REMOTE_CALL";
         case MessageType::PYTHON_REMOTE_CALL: return "PYTHON_REMOTE_CALL";
         case MessageType::REMOTE_RET: return "REMOTE_RET";
+        case MessageType::SCRIPT_RREF_FETCH_CALL: return "SCRIPT_RREF_FETCH_CALL";
         case MessageType::PYTHON_RREF_FETCH_CALL: return "PYTHON_RREF_FETCH_CALL";
+        case MessageType::SCRIPT_RREF_FETCH_RET: return "SCRIPT_RREF_FETCH_RET";
         case MessageType::PYTHON_RREF_FETCH_RET: return "PYTHON_RREF_FETCH_RET";
         case MessageType::RREF_USER_DELETE: return "RREF_USER_DELETE";
         case MessageType::RREF_FORK_REQUEST: return "RREF_FORK_REQUEST";

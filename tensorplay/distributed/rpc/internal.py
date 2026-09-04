@@ -17,6 +17,7 @@ __all__ = ["RPCExecMode", "serialize", "deserialize", "PythonUDF", "RemoteExcept
 class RPCExecMode(Enum):
     SYNC = "sync"
     ASYNC = "async"
+    ASYNC_JIT = "async_jit"
     REMOTE = "remote"
 
 

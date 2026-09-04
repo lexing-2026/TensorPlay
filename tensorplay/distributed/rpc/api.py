@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import collections
 import functools
 import threading
 import time
@@ -57,11 +58,11 @@ class WorkerInfo:
 
 
 def get_worker_info(worker_name: Any = None) -> WorkerInfo:
+    if _agent is None:
+        raise RuntimeError("RPC has not been initialized")
     if worker_name is None:
-        if _current_worker is None:
-            raise RuntimeError("RPC has not been initialized")
-        return _current_worker
-    return _to_worker_info(worker_name)
+        return _agent.get_worker_info()
+    return _agent.get_worker_info(worker_name)
 
 
 class _Future(Generic[T]):
@@ -140,16 +141,18 @@ class _Future(Generic[T]):
 Future = _Future
 
 
-@dataclass
 class AllGatherStates:
-    gathered_objects: dict[str, Any] | None = None
-    proceed_signal: threading.Event | None = None
+    def __init__(self) -> None:
+        self.gathered_objects: dict[str, Any] = {}
+        self.proceed_signal = threading.Event()
 
-    def __post_init__(self) -> None:
-        if self.gathered_objects is None:
-            self.gathered_objects = {}
-        if self.proceed_signal is None:
-            self.proceed_signal = threading.Event()
+
+_ALL_WORKER_NAMES: set[str] = set()
+_all_gather_dict_lock = threading.RLock()
+_all_gather_sequence_id: dict[str, int] = {}
+_all_gather_sequence_id_to_states: collections.defaultdict[str, AllGatherStates] = (
+    collections.defaultdict(AllGatherStates)
+)
 
 
 class _NativeRpcAgent:
@@ -271,6 +274,7 @@ def _load_native_runtime() -> Any:
 
 def _init_rpc_states(agent: Any) -> None:
     global _agent, _current_worker, _workers, _executor, _native_runtime
+    global _ALL_WORKER_NAMES
     with _state_lock:
         if _agent is not None and _agent is not agent:
             raise RuntimeError("RPC is already initialized")
@@ -281,7 +285,39 @@ def _init_rpc_states(agent: Any) -> None:
         _current_worker = agent.get_worker_info()
         _workers = {info.name: info for info in agent.get_worker_infos()}
         _workers.setdefault(_current_worker.name, _current_worker)
+        _ALL_WORKER_NAMES = set(_workers)
         _executor = None
+
+
+def _gather_to_leader(
+    sequence_id: str,
+    worker_name: str,
+    obj: Any,
+    worker_names: set[str] | None = None,
+) -> None:
+    with _all_gather_dict_lock:
+        expected = set(worker_names) if worker_names else set(_ALL_WORKER_NAMES)
+        if worker_name not in expected:
+            raise AssertionError(f"{worker_name} is not expected by leader")
+        states = _all_gather_sequence_id_to_states[sequence_id]
+        if worker_name in states.gathered_objects:
+            raise AssertionError(
+                f"{worker_name} reported sequence id {sequence_id} twice"
+            )
+        states.gathered_objects[worker_name] = obj
+        if expected == set(states.gathered_objects):
+            states.proceed_signal.set()
+
+
+def _broadcast_to_followers(sequence_id: str, objects_map: dict[str, Any]) -> None:
+    with _all_gather_dict_lock:
+        states = _all_gather_sequence_id_to_states[sequence_id]
+    if states.proceed_signal.is_set():
+        raise AssertionError(
+            f"termination signal sequence id {sequence_id} was set twice"
+        )
+    states.gathered_objects = dict(objects_map)
+    states.proceed_signal.set()
 
 
 def init_rpc(
@@ -318,7 +354,8 @@ def init_rpc(
         )
         native_agent = agent.native
         _native_runtime = native_agent
-        _init_rpc_states(agent)
+        if _agent is None:
+            _init_rpc_states(agent)
         if world_size > 1:
             _all_gather(None, timeout=timeout)
             native_agent.barrier(list(_workers), timeout)
@@ -331,12 +368,17 @@ def init_rpc(
 
 def _reset_current_rpc_agent() -> None:
     global _agent, _current_worker, _workers, _executor, _native_runtime
+    global _ALL_WORKER_NAMES
     with _state_lock:
         _agent = None
         _current_worker = None
         _workers = {}
         _executor = None
         _native_runtime = None
+        _ALL_WORKER_NAMES = set()
+        with _all_gather_dict_lock:
+            _all_gather_sequence_id.clear()
+            _all_gather_sequence_id_to_states.clear()
         _pending.clear()
         _rrefs.clear()
 
@@ -350,7 +392,24 @@ def _get_current_rpc_agent() -> Any:
 def get_rpc_timeout() -> float:
     if _agent is None:
         return rpc_constants.DEFAULT_RPC_TIMEOUT_SEC
+    native = getattr(_agent, "native", None)
+    if native is not None and hasattr(native, "get_rpc_timeout"):
+        return float(native.get_rpc_timeout())
     return float(getattr(_agent.get_backend_options(), "rpc_timeout", rpc_constants.DEFAULT_RPC_TIMEOUT_SEC))
+
+
+def _set_rpc_timeout(timeout: float) -> None:
+    timeout = float(timeout)
+    if timeout < 0.0:
+        raise ValueError("RPC timeout must be non-negative")
+    if _agent is None:
+        raise RuntimeError("RPC has not been initialized")
+    native = getattr(_agent, "native", None)
+    if native is not None and hasattr(native, "set_rpc_timeout"):
+        native.set_rpc_timeout(timeout)
+    options = _agent.get_backend_options()
+    if hasattr(options, "rpc_timeout"):
+        options.rpc_timeout = timeout
 
 
 def _require_initialized(fn: Any) -> Any:
@@ -367,13 +426,14 @@ def _to_worker_info(to: Any) -> WorkerInfo:
     if isinstance(to, WorkerInfo):
         return to
     if isinstance(to, int):
+        return get_worker_info(to)
+    if isinstance(to, str):
+        if to.startswith("rank:") and to[5:].isdigit():
+            return _to_worker_info(int(to[5:]))
+        if to in _workers:
+            return _workers[to]
         if _agent is not None:
             return _agent.get_worker_info(to)
-        raise RuntimeError("RPC has not been initialized")
-    if isinstance(to, str) and to in _workers:
-        return _workers[to]
-    if isinstance(to, str) and to.startswith("rank:") and to[5:].isdigit():
-        return _to_worker_info(int(to[5:]))
     raise ValueError(f"cannot resolve worker {to!r}")
 
 
@@ -494,29 +554,76 @@ def _wait_all():
                 _thread_local.future_list = old
 
 
-def _all_gather(obj: Any, worker_names: set[str] | None = None, timeout: float = rpc_constants.UNSET_RPC_TIMEOUT) -> dict[str, Any]:
-    if _native_runtime is None:
-        raise RuntimeError("native RPC runtime is not running")
-    names = list(worker_names or _workers)
-    return dict(_native_runtime.all_gather(obj, names, float(timeout)))
+def _all_gather(
+    obj: Any,
+    worker_names: set[str] | None = None,
+    timeout: float = rpc_constants.UNSET_RPC_TIMEOUT,
+) -> dict[str, Any]:
+    if _native_runtime is not None:
+        names = list(worker_names or _workers)
+        return dict(_native_runtime.all_gather(obj, names, float(timeout)))
+    if not _ALL_WORKER_NAMES:
+        raise RuntimeError("RPC has not been initialized")
+    expected = set(worker_names or _ALL_WORKER_NAMES)
+    leader_name = min(expected)
+    self_name = get_worker_info().name
+    with _all_gather_dict_lock:
+        concat_names = "".join(sorted(expected))
+        sequence_num = _all_gather_sequence_id.get(concat_names, 0)
+        _all_gather_sequence_id[concat_names] = sequence_num + 1
+        sequence_id = concat_names + str(sequence_num)
+
+    is_leader = leader_name == self_name
+    if timeout == rpc_constants.UNSET_RPC_TIMEOUT:
+        rpc_timeout = get_rpc_timeout()
+        signal_timeout = None
+    elif timeout == rpc_constants.DEFAULT_SHUTDOWN_TIMEOUT:
+        rpc_timeout = timeout
+        signal_timeout = None
+    else:
+        rpc_timeout = timeout
+        signal_timeout = timeout
+
+    if is_leader:
+        _gather_to_leader(sequence_id, self_name, obj, expected)
+    else:
+        rpc_sync(
+            leader_name,
+            _gather_to_leader,
+            args=(sequence_id, self_name, obj, expected),
+            timeout=rpc_timeout,
+        )
+
+    with _all_gather_dict_lock:
+        states = _all_gather_sequence_id_to_states[sequence_id]
+    states.proceed_signal.wait(timeout=signal_timeout)
+
+    if is_leader:
+        futures: dict[str, _Future[Any]] = {}
+        for follower_name in expected - {leader_name}:
+            futures[follower_name] = rpc_async(
+                follower_name,
+                _broadcast_to_followers,
+                args=(sequence_id, states.gathered_objects),
+                timeout=rpc_timeout,
+            )
+        for future in futures.values():
+            future.wait()
+
+    with _all_gather_dict_lock:
+        states = _all_gather_sequence_id_to_states.pop(sequence_id)
+    return dict(states.gathered_objects)
 
 
-def _barrier(worker_names: list[str] | set[str] | None = None) -> None:
-    if _native_runtime is None:
-        raise RuntimeError("native RPC runtime is not running")
-    _native_runtime.barrier(list(worker_names or _workers), -1.0)
+def _barrier(
+    worker_names: list[str] | set[str] | None = None,
+    timeout: float = rpc_constants.UNSET_RPC_TIMEOUT,
+) -> None:
+    _all_gather(None, set(worker_names or _workers), timeout=timeout)
 
 
 def _wait_all_workers(timeout: float = rpc_constants.DEFAULT_SHUTDOWN_TIMEOUT) -> None:
-    deadline = None if timeout == 0 else time.monotonic() + float(timeout)
-    while True:
-        with _state_lock:
-            futures = list(_pending)
-        if not futures:
-            return
-        for future in futures:
-            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
-            future.wait(remaining)
+    _all_gather(None, timeout=timeout)
 
 
 def _finalize_shutdown() -> None:
@@ -534,8 +641,7 @@ def shutdown(graceful: bool = True, timeout: float = rpc_constants.DEFAULT_SHUTD
     try:
         if graceful:
             _wait_all_workers(timeout)
-            if _native_runtime is not None and _workers:
-                _all_gather(None, timeout=timeout)
+            _get_current_rpc_agent().join(shutdown=True, timeout=timeout)
     finally:
         _finalize_shutdown()
 
@@ -614,6 +720,7 @@ class RRef(Generic[T]):
         if self._native is not None:
             return RRef(_native=self._native.fork())
         forked = object.__new__(RRef)
+        forked._native = None
         forked._future = self._future
         forked._owner = self._owner
         forked._id = uuid.uuid4().hex
@@ -622,7 +729,9 @@ class RRef(Generic[T]):
         return forked
 
     def _get_type(self, timeout: float = rpc_constants.UNSET_RPC_TIMEOUT, blocking: bool = True) -> Any:
-        result = type(self.to_here(timeout))
+        if self._native is not None and not self.is_owner():
+            return _rref_typeof_on_user(self, timeout, blocking)
+        result = type(self.local_value())
         return result if blocking else _Future.completed(result)
 
     def _serialize(self) -> dict[str, Any]:
@@ -701,11 +810,15 @@ def remote(to: Any, func: Any, args: tuple[Any, ...] | None = None, kwargs: dict
 
 
 def _invoke_rpc(to: Any, func: Any, rpc_type: RPCExecMode, args: tuple[Any, ...] | None = None, kwargs: dict[str, Any] | None = None, timeout: float = rpc_constants.UNSET_RPC_TIMEOUT) -> Any:
+    call_args = tuple(args or ())
+    call_kwargs = dict(kwargs or {})
+    if not callable(func):
+        raise TypeError("function should be callable")
     if rpc_type is RPCExecMode.SYNC:
-        return rpc_sync(to, func, args, kwargs, timeout)
+        return rpc_sync(to, func, call_args, call_kwargs, timeout)
     if rpc_type is RPCExecMode.REMOTE:
-        return remote(to, func, args, kwargs, timeout)
-    return rpc_async(to, func, args, kwargs, timeout)
+        return remote(to, func, call_args, call_kwargs, timeout)
+    return rpc_async(to, func, call_args, call_kwargs, timeout)
 
 
 @_require_initialized
