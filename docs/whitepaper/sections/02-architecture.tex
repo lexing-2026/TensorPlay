@@ -2,7 +2,7 @@
 \section{Four-Pillar Decomposition}
 \label{sec:arch}
 
-The framework is partitioned into four physically isolated shared libraries plus one Python extension, all produced from a single CMake invocation. Isolation is not editorial; it is enforced by directory, target, link edge, and header visibility. A newcomer reads \path{p10} to understand tensor storage without learning any differentiation concept; a kernel author rebuilds only \path{p10} after touching an arithmetic kernel; a compiler author experiments inside \path{stax} without relinking the storage layer. The cost is explicit boundaries and the absence of whole-program inlining, which this project accepts.
+The framework is partitioned into four physically isolated shared libraries plus one Python extension, all produced from a single CMake invocation. Isolation is not editorial; it is enforced by directory, target, link edge, and header visibility. A newcomer reads \texttt{p10} to understand tensor storage without learning any differentiation concept; a kernel author rebuilds only \texttt{p10} after touching an arithmetic kernel; a compiler author experiments inside \texttt{stax} without relinking the storage layer. The cost is explicit boundaries and the absence of whole-program inlining, which this project accepts.
 
 \subsection{Directory \texorpdfstring{$\rightarrow$}{->} Artifact Mapping}
 \label{sec:arch:mapping}
@@ -11,25 +11,25 @@ Each pillar is a CMake target whose \texttt{OUTPUT\_DIRECTORY} is pinned to a lo
 
 \begin{table}[H]
 \centering
-\caption{Directory to artifact mapping. Each row is a CMake target; \texttt{OUTPUT\_DIRECTORY} is absolute via \texttt{TP\_PACKAGE\_DIR} at \path{CMakeLists.txt:325}.}
+\caption{Directory to artifact mapping. Each row is a CMake target; \texttt{OUTPUT\_DIRECTORY} is absolute via \texttt{TP\_PACKAGE\_DIR}.}
 \label{tab:pillars}
 \small
 \begin{tabular}{p{1.8cm}p{1.6cm}p{2.8cm}p{3.4cm}p{2.6cm}}
 \toprule
 Directory & CMake target & Artifact (\texttt{OUTPUT\_DIRECTORY}) & Link deps & Responsibility \\
 \midrule
-\path{p10/} & \path{p10} & \path{tensorplay/lib/libp10.so} & \texttt{Threads}, \texttt{COMPUTE\_LIBS} (BLAS/oneDNN), \texttt{CUDA::*} & Tensor, Storage, dispatch table, 300+ kernels, allocators \\
-\path{tpx/} & \path{tpx} & \path{tensorplay/lib/libtpx.so} & \path{p10} (\path{tpx/CMakeLists.txt:26,40}) & Explicit DAG, Engine, saved variables, derivative nodes \\
-\path{stax/} & \path{stax} & \path{tensorplay/lib/libstax.so} & \path{p10}, \path{tpx} (\path{stax/CMakeLists.txt:8,17}) & Minimal \texttt{Graph} IR, \texttt{Pass} registry, interpreter \\
-\path{src/bindings/python/} & \path{tp_python} & \path{tensorplay/lib/libtp\_python.so} & \path{p10}, \texttt{pybind11} (\path{CMakeLists.txt:954}) & \texttt{CPythonBridge.cpp} single-copy caster substrate \\
-\path{src/bindings/python/} & \path{_C} & \path{tensorplay/\_C/\_\_init\_\_.so} & \path{p10}, \path{tpx}, \path{stax}, \path{tp_python} & Generated ops, device bindings, profiler, distributed \\
+ & \texttt{p10} & \texttt{libp10.so} & \texttt{Threads}, \texttt{COMPUTE\_LIBS} (BLAS/oneDNN), \texttt{CUDA::*} & Tensor, Storage, dispatch table, 300+ kernels, allocators \\
+ & \texttt{tpx} & \texttt{libtpx.so} & \texttt{p10} & Explicit DAG, Engine, saved variables, derivative nodes \\
+ & \texttt{stax} & \texttt{libstax.so} & \texttt{p10}, \texttt{tpx} & Minimal \texttt{Graph} IR, \texttt{Pass} registry, interpreter \\
+ & \texttt{tp\_python} & \texttt{libtp\_python.so} & \texttt{p10}, \texttt{pybind11} & \texttt{CPythonBridge.cpp} single-copy caster substrate \\
+ & \texttt{\_C} & \texttt{\_\_init\_\_.so} & \texttt{p10}, \texttt{tpx}, \texttt{stax}, \texttt{tp\_python} & Generated ops, device bindings, profiler, distributed \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Concretely, \texttt{TP\_PACKAGE\_DIR} defaults to \texttt{\$\{CMAKE\_CURRENT\_SOURCE\_DIR\}/tensorplay} at \path{CMakeLists.txt:326,1170}, and \texttt{TP\_LIB\_DIR} is \texttt{\$\{TP\_PACKAGE\_DIR\}/lib} at \path{CMakeLists.txt:1172}. The four \path{set\_target\_properties} blocks at \path{CMakeLists.txt:1175--1192} force \path{_C} into \path{tensorplay/\_C} with \path{OUTPUT\_NAME "\_\_init\_\_"} and force \path{p10}, \path{tpx}, \path{stax}, \path{tp_python} into \path{tensorplay/lib}. A post-build \path{ls -lh tensorplay/lib/libp10.so tensorplay/lib/libtpx.so tensorplay/lib/libstax.so tensorplay/\_C/\_\_init\_\_*.so} has the mtime newer than the last touched source file edited in this session; if not, the build was stale and the change did not link.
+Concretely, \texttt{TP\_PACKAGE\_DIR} defaults to the source tree's \texttt{tensorplay/} directory, and \texttt{TP\_LIB\_DIR} is \texttt{\$\{TP\_PACKAGE\_DIR\}/lib}. Four \texttt{set\_target\_properties} blocks force the extension into \texttt{tensorplay/\_C} with \texttt{OUTPUT\_NAME "\_\_init\_\_"} and force \texttt{p10}, \texttt{tpx}, \texttt{stax}, \texttt{tp\_python} into \texttt{lib}.
 
-The Python surface comprises 354 modules counted via \path{find tensorplay -name "*.py" | wc -l}, but only one compiled extension is ever imported. The veneer at \path{tensorplay/\_\_init\_\_.py:1--1197} re-exports more than 550 native symbols discovered by enumerating \texttt{dir(\_C)} and filtering \texttt{\_\_module\_\_} rewriting (\S\ref{sec:veneer}). No Python file adds a new CMake target; every Python module is a thin wrapper whose heavy work re-enters \path{_C}.
+The Python surface comprises hundreds of modules, but only one compiled extension is ever imported. The veneer re-exports more than 550 native symbols discovered by enumerating \texttt{dir(\_C)} and filtering \texttt{\_\_module\_\_} rewriting (\S\ref{sec:veneer}). No Python file adds a new CMake target; every Python module is a thin wrapper whose heavy work re-enters \texttt{\_C}.
 
 \begin{table}[H]
 \centering
@@ -40,21 +40,21 @@ The Python surface comprises 354 modules counted via \path{find tensorplay -name
 \toprule
 Target & Link visibility & Why \\
 \midrule
-\path{p10} & \path{PUBLIC Threads::Threads}, \path{PUBLIC COMPUTE\_LIBS} & Thread pool and BLAS symbols must be visible to \path{tpx}, \path{stax}, \path{_C} consumers \\
-\path{tpx} & \texttt{PRIVATE p10} at line~26 and \texttt{PUBLIC p10} at line~40 & Handwritten nodes need private p10 headers; downstream \path{stax} inherits the p10 interface transitively \\
-\path{stax} & \texttt{PRIVATE tpx p10} at line~8 and \texttt{PUBLIC p10} at line~17 & The interpreter calls \texttt{tpx::ops} but exposes only p10 tensor types \\
-\path{tp_python} & \path{PUBLIC p10 pybind11::pybind11} & The single caster substrate must be shared between \path{_C} and out-of-tree op modules \\
-\path{_C} & \path{PRIVATE p10 tpx stax tp\_python tensorpipe} & The extension is the only consumer that links all three pillars together \\
+\texttt{p10} & \texttt{PUBLIC Threads::Threads}, \texttt{PUBLIC COMPUTE\_LIBS} & Thread pool and BLAS symbols must be visible to \texttt{tpx}, \texttt{stax}, \texttt{\_C} consumers \\
+\texttt{tpx} & \texttt{PRIVATE p10} at line~26 and \texttt{PUBLIC p10} at line~40 & Handwritten nodes need private p10 headers; downstream \texttt{stax} inherits the p10 interface transitively \\
+\texttt{stax} & \texttt{PRIVATE tpx p10} at line~8 and \texttt{PUBLIC p10} at line~17 & The interpreter calls \texttt{tpx::ops} but exposes only p10 tensor types \\
+\texttt{tp\_python} & \texttt{PUBLIC p10 pybind11::pybind11} & The single caster substrate must be shared between \texttt{\_C} and out-of-tree op modules \\
+\texttt{\_C} & \texttt{PRIVATE p10 tpx stax tp\_python tensorpipe} & The extension is the only consumer that links all three pillars together \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\subsection{Build Order and the Audited Move}
+\subsection{Build Order and the Vacated-Source Record}
 \label{sec:arch:buildorder}
 
-\path{CMakeLists.txt:938--945} declares the order in exactly four lines:
+ declares the order in exactly four lines:
 
-\begin{lstlisting}[caption={\path{CMakeLists.txt:938--945} --- pillar order is load-bearing.}, label=lst:buildorder]
+\begin{lstlisting}[caption={pillar order is load-bearing.}, label=lst:buildorder]
 # Add p10
 add_subdirectory(p10)          # :938
 # Add tpx
@@ -63,34 +63,34 @@ add_subdirectory(tpx)          # :941
 add_subdirectory(stax)         # :944
 \end{lstlisting}
 
-\path{tpx/CMakeLists.txt:26} links \path{p10} privately; \path{tpx/CMakeLists.txt:40} re-exports it publicly so consumers that depend on \path{tpx} automatically get the p10 interface. \path{stax/CMakeLists.txt:8} links both \path{p10} and \path{tpx} privately and re-exports \path{p10} publicly at line~17. \path{CMakeLists.txt:1108} links \path{_C} against \path{p10 tpx stax tp\_python}: this is the only place where the three levels meet. Reordering any of these three \texttt{add\_subdirectory} calls or adding a back edge immediately fails with a CMake configure error or an undefined reference at link time, not a silent runtime mis-order.
+ links \texttt{p10} privately; re-exports it publicly so consumers that depend on \texttt{tpx} automatically get the p10 interface. links both \texttt{p10} and \texttt{tpx} privately and re-exports \texttt{p10} publicly at line~17. links \texttt{\_C} against \texttt{p10 tpx stax tp\_python}: this is the only place where the three levels meet. Reordering any of these three \texttt{add\_subdirectory} calls or adding a back edge immediately fails with a CMake configure error or an undefined reference at link time, not a silent runtime mis-order.
 
-The generate step precedes all of this. At \path{CMakeLists.txt:308--344} a \texttt{custom\_command} generates ten artifacts under \path{build/generated/tensorplay/ops/} from \path{config/native\_functions.yaml} and \path{config/derivatives.yaml} via \path{tools/codegen/main.py}. Every pillar target declares \path{add\_dependencies(generate\_code)} (e.g.\ \path{p10/CMakeLists.txt:486}, \path{tpx/CMakeLists.txt:25}). The generated header is mixed into \path{p10/include/Tensor.h:329} via \path{\#include "tensorplay/ops/TensorGenerated.h"}; the generated source is appended to \texttt{P10\_SOURCES} at \path{p10/CMakeLists.txt:144} as \texttt{\$\{GEN\_CPP\}}. Thus a YAML edit rebuilds only the changed generated file plus its dependents.
+The generate step precedes all of this. At a \texttt{custom\_command} generates ten artifacts under  from \texttt{native\_functions.yaml} and \texttt{derivatives.yaml} via \texttt{main.py}. Every pillar target declares \texttt{add\_dependencies(generate\_code)} (e.g.\,). The generated header is mixed into via \texttt{TensorGenerated.h"}; the generated source is appended to \texttt{P10\_SOURCES} at as \texttt{\$\{GEN\_CPP\}}. Thus a YAML edit rebuilds only the changed generated file plus its dependents.
 
-\path{p10/CMakeLists.txt:28} retains a single commented line:
+ retains a single commented line:
 
-\begin{lstlisting}[caption={\path{p10/CMakeLists.txt:28} --- audit trail, not dead code.}, label=lst:audittrail]
+\begin{lstlisting}[caption={The vacated-source comment in the p10 build file: metadata that once violated the axiom was physically moved out, leaving this trail.}, label=lst:audittrail]
     # src/AutogradMetaInterface.cpp (Moved to TPX)
 \end{lstlisting}
 
-This is intentional. An earlier revision implemented the concrete metadata inside \path{p10}; the current design keeps \path{p10} header-free of \path{tpx} so the USB slot at \path{p10/include/AutogradMetaBase.h:13} suffices. Leaving the comment in the source list records the decision boundary: grepping the comment proves the file once lived in \path{p10} and was deliberately vacated to preserve acyclicity. Deleting it would erase the history of why \path{p10} must not include \path{tpx}; resurrecting it inside \path{p10} would reintroduce a back edge and break the invariant checked by \path{grep -rn "tpx" p10/include/} which must return empty.
+This is intentional. An earlier revision implemented the concrete metadata inside \texttt{p10}; the current design keeps \texttt{p10} header-free of \texttt{tpx} so the USB slot at suffices. Leaving the comment in the source list records the decision boundary: grepping the comment proves the file once lived in \texttt{p10} and was deliberately vacated to preserve acyclicity. Deleting it would erase the history of why \texttt{p10} must not include \texttt{tpx}; resurrecting it inside \texttt{p10} would reintroduce a back edge and break the invariant checked by  which must return empty.
 
-A related discipline appears at \path{CMakeLists.txt:930--936}. On Windows where \texttt{BUILD\_SHARED\_LIBS} is normally \texttt{ON} for Linux wheels, the block forces \path{BUILD\_SHARED\_LIBS OFF}:
+A related discipline appears. On Windows where \texttt{BUILD\_SHARED\_LIBS} is normally \texttt{ON} for Linux wheels, the block forces \texttt{BUILD\_SHARED\_LIBS OFF}:
 
-\begin{lstlisting}[caption={\path{CMakeLists.txt:934--936} --- Windows static embedding.}, label=lst:winstatic]
+\begin{lstlisting}[caption={Windows static embedding.}, label=lst:winstatic]
 if(WIN32 AND BUILD_SHARED_LIBS)
     set(BUILD_SHARED_LIBS OFF)
 endif()
 \end{lstlisting}
 
-Without the switch, each DLL would require \path{\_\_declspec(dllexport)} on every p10 symbol crossing the boundary, which the codebase does not carry. Static linking on Windows embeds the three pillars into the single module \texttt{\_C.pyd} and keeps symbol visibility identical to the Linux shared-library layout without annotating every class.
+Without the switch, each DLL would require \texttt{\_\_declspec(dllexport)} on every p10 symbol crossing the boundary, which the codebase does not carry. Static linking on Windows embeds the three pillars into the single module \texttt{\_C.pyd} and keeps symbol visibility identical to the Linux shared-library layout without annotating every class.
 
 \subsection{Product Layout: RPATH and the Two Preload Paths}
 \label{sec:arch:rpath}
 
-After \texttt{cmake --build}, the package tree is the product:
+After a build, the package tree is the product:
 
-\begin{lstlisting}[caption={Post-build layout under \path{tensorplay/}.}, label=lst:layout]
+\begin{lstlisting}[caption={Post-build layout under the package directory.}, label=lst:layout]
 tensorplay/
   lib/
     libp10.so
@@ -106,9 +106,9 @@ tensorplay/
   version.py             # generated at :330
 \end{lstlisting}
 
-The relative RPATH makes the layout relocatable. From \path{CMakeLists.txt:1200--1212}:
+The relative RPATH makes the layout relocatable. From:
 
-\begin{lstlisting}[caption={\path{CMakeLists.txt:1200--1212} --- RPATH is the loader contract.}, label=lst:rpath]
+\begin{lstlisting}[caption={RPATH is the loader contract.}, label=lst:rpath]
 if(NOT WIN32)
     set_target_properties(p10 tpx stax PROPERTIES
         INSTALL_RPATH "$ORIGIN"
@@ -125,7 +125,7 @@ if(NOT WIN32)
 endif()
 \end{lstlisting}
 
-\path{p10}, \path{tpx}, \path{stax}, and \path{tp_python} reside together in \path{tensorplay/lib}, so \texttt{\$ORIGIN} suffices: each finds its siblings without an absolute path. \path{_C} lives one directory deeper in \path{tensorplay/\_C}, so it uses \path{\$ORIGIN/../lib}. Verification is a single command with no Python involved:
+\texttt{p10}, \texttt{tpx}, \texttt{stax}, and \texttt{tp\_python} reside together in \texttt{lib}, so \texttt{\$ORIGIN} suffices: each \ac{dso} finds its siblings without an absolute path, and no \ac{rpath} edit is needed when the tree moves. \texttt{\_C} lives one directory deeper in \texttt{\_C}, so it uses \texttt{lib}. Verification is a single command with no Python involved:
 
 \begin{lstlisting}[caption={Linux loader verification without importing Python.}, label=lst:readelf]
 readelf -d tensorplay/lib/libp10.so | grep -i rpath      # $ORIGIN
@@ -134,11 +134,11 @@ readelf -d tensorplay/_C/__init__.so | grep -i rpath     # $ORIGIN/../lib
 ldd tensorplay/_C/__init__.so | grep "not found"          # must be empty
 \end{lstlisting}
 
-Failure without this block manifests as \path{ImportError: libp10.so: cannot open shared object file} when the wheel is installed into a virtual environment whose \texttt{LD\_LIBRARY\_PATH} is empty, which is precisely the target scenario for a wheel. The comment at \path{CMakeLists.txt:1195--1199} documents this as the single reason RPATH exists; Windows ignores RPATH entirely, so the Windows branch is guarded by \texttt{if(NOT WIN32)}.
+Failure without this block manifests as \texttt{ImportError: libp10.so: cannot open shared object file} when the wheel is installed into a virtual environment whose \texttt{LD\_LIBRARY\_PATH} is empty, which is precisely the target scenario for a wheel. The comment at documents this as the single reason RPATH exists; Windows ignores RPATH entirely, so the Windows branch is guarded by \texttt{if(NOT WIN32)}.
 
-Windows uses explicit preload instead. \path{tensorplay/\_\_init\_\_.py:34--135} defines \path{\_load\_dll\_libraries()} guarded by \path{sys.platform == 'win32'}:
+Windows uses explicit preload instead. defines \texttt{\_load\_dll\_libraries} guarded by \texttt{sys.platform == 'win32'}:
 
-\begin{lstlisting}[caption={\path{tensorplay/\_\_init\_\_.py:72--133} --- ordered DLL preload on Windows.}, label=lst:winpreload]
+\begin{lstlisting}[caption={ordered DLL preload on Windows.}, label=lst:winpreload]
 kernel32 = ctypes.WinDLL("kernel32.dll", use_last_error=True)
 # MKL -> CUDA/cuDNN -> p10/tpx/stax   :80
 mkl_dlls = glob.glob(os.path.join(package_lib_path, "mkl_*.dll"))
@@ -155,11 +155,11 @@ for dll in sorted_mkl + cuda_dlls + core_dlls:
         res = kernel32.LoadLibraryW(dll)
 \end{lstlisting}
 
-\texttt{0x00001100} is \path{LOAD\_LIBRARY\_SEARCH\_DEFAULT\_DIRS | LOAD\_LIBRARY\_SEARCH\_DLL\_LOAD\_DIR}, the minimally permissive flag that still searches the package lib directory added earlier via \path{os.add\_dll\_directory} at \path{\_\_init\_\_.py:40--69}. Order is load-bearing: \texttt{mkl\_core} and \texttt{mkl\_sequential} are sorted first inside the MKL group at lines~85--94 because \texttt{mkl\_def} and \texttt{mkl\_avx2} depend on them; CUDA runtime is loaded before \path{p10} so that \texttt{CUDA::cudart} symbols required by p10's CUDA kernels are already resolved. The helper \path{\_add\_dll\_directory} tries both \path{tensorplay/lib} and the legacy \path{tensorplay/} root, plus the interpreter's \path{Library/bin}, the base environment, and the user site-packages bin, each guarded by \texttt{os.path.exists} so a missing Conda installation does not error.
+\texttt{0x00001100} is \texttt{LOAD\_LIBRARY\_SEARCH\_DEFAULT\_DIRS | LOAD\_LIBRARY\_SEARCH\_DLL\_LOAD\_DIR}, the minimally permissive flag that still searches the package lib directory added earlier via \texttt{os.add\_dll\_directory}. Order is load-bearing: \texttt{mkl\_core} and \texttt{mkl\_sequential} are sorted first inside the MKL group at lines~85--94 because \texttt{mkl\_def} and \texttt{mkl\_avx2} depend on them; CUDA runtime is loaded before \texttt{p10} so that \texttt{CUDA::cudart} symbols required by p10's CUDA kernels are already resolved. The helper \texttt{\_add\_dll\_directory} tries both \texttt{lib} and the legacy  root, plus the interpreter's \texttt{bin}, the base environment, and the user site-packages bin, each guarded by \texttt{os.path.exists} so a missing Conda installation does not error.
 
-On Linux the counterpart does not eagerly load anything in a CPU-only environment. \path{tensorplay/\_\_init\_\_.py:143--205} wraps the extension import:
+On Linux the counterpart does not eagerly load anything in a CPU-only environment. wraps the extension import:
 
-\begin{lstlisting}[caption={\path{tensorplay/\_\_init\_\_.py:143--205} --- Linux CUDA wheel probing.}, label=lst:linuxpreload]
+\begin{lstlisting}[caption={Linux CUDA wheel probing.}, label=lst:linuxpreload]
 try:
     from . import _C as _C                                          # :199
 except (ImportError, OSError) as _load_error:                         # :200
@@ -185,7 +185,7 @@ def _preload_cuda_deps(err=None):                                     # :174
         _preload_cuda_lib(lib_folder, lib_name, required=required)   # :193
 \end{lstlisting}
 
-\path{\_get\_cuda\_dep\_paths} at line~144 probes \path{nvidia/cublas/lib/libcublasLt.so.*} and \path{nvidia/cuda\_runtime/lib/libcudart.so.*} inside every \texttt{sys.path} entry, which is exactly the layout installed by the pip wheels \texttt{nvidia-cublas-cu*} and \path{nvidia-cuda-runtime-cu*}. If probing fails it falls back to \path{tensorplay/lib/libcublasLt.so.*}, the path used when the toolkit is bundled via \path{CMakeLists.txt:190--215}. \path{\_preload\_cuda\_lib:161} then does \path{ctypes.CDLL(candidates[0])}, which loads the SONAME before the extension's \texttt{DT\_NEEDED} is resolved, working around the common case where the user installed CUDA wheels into the environment's \texttt{site-packages} without setting \texttt{LD\_LIBRARY\_PATH}. Only errors mentioning \texttt{libcud}, \texttt{libcublas}, \texttt{libcurand}, or \texttt{libnvrtc} are intercepted; all other \texttt{ImportError} causes are re-raised unchanged.
+\texttt{\_get\_cuda\_dep\_paths} at line~144 probes \texttt{libcublasLt.so.*} and \texttt{libcudart.so.*} inside every \texttt{sys.path} entry, which is exactly the layout installed by the pip wheels \texttt{nvidia-cublas-cu*} and \texttt{nvidia-cuda-runtime-cu*}. If probing fails it falls back to \texttt{libcublasLt.so.*}, the path used when the toolkit is bundled via. then does \texttt{ctypes.CDLL(candidates[0])}, which loads the SONAME before the extension's \texttt{DT\_NEEDED} is resolved, working around the common case where the user installed CUDA wheels into the environment's \texttt{site-packages} without setting \texttt{LD\_LIBRARY\_PATH}. Only errors mentioning \texttt{libcud}, \texttt{libcublas}, \texttt{libcurand}, or \texttt{libnvrtc} are intercepted; all other \texttt{ImportError} causes are re-raised unchanged.
 
 \begin{table}[H]
 \centering
@@ -196,11 +196,11 @@ def _preload_cuda_deps(err=None):                                     # :174
 \toprule
 Platform & Mechanism & Files & Citation \\
 \midrule
-Linux (all) & \path{INSTALL\_RPATH "\$ORIGIN"} & \path{libp10.so} siblings & \path{CMakeLists.txt:1202} \\
-Linux (ext) & \path{INSTALL\_RPATH "\$ORIGIN/../lib"} & \path{\_C/\_\_init\_\_.so} & \path{CMakeLists.txt:1210} \\
-Windows & \texttt{LoadLibraryExW} with \texttt{0x00001100} & \path{p10.dll/tpx.dll/stax.dll} & \path{__init__.py:122} \\
-Linux+CUDA wheels & \texttt{ctypes.CDLL} probe of \path{nvidia/*/lib} & \path{libcublasLt.so.*} & \path{\_\_init\_\_.py:161,186} \\
-Bundled CUDA & \texttt{CTOOLKIT\_BIN\_DIR} glob + \texttt{install(FILES)} & \path{cublasLt64\_*.dll} & \path{CMakeLists.txt:190} \\
+Linux (all) & \texttt{INSTALL\_RPATH "\$ORIGIN"} & \texttt{libp10.so} siblings & \\
+Linux (ext) & \texttt{lib"} & \texttt{\_\_init\_\_.so} & \\
+Windows & \texttt{LoadLibraryExW} with \texttt{0x00001100} & \texttt{stax.dll} & \\
+Linux+CUDA wheels & \texttt{ctypes.CDLL} probe of \texttt{lib} & \texttt{libcublasLt.so.*} & \texttt{\_\_init\_\_.py:161,186} \\
+Bundled CUDA & \texttt{CTOOLKIT\_BIN\_DIR} glob + \texttt{install(FILES)} & \texttt{cublasLt64\_*.dll} & \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -208,11 +208,11 @@ Bundled CUDA & \texttt{CTOOLKIT\_BIN\_DIR} glob + \texttt{install(FILES)} & \pat
 \subsection{Virtual-Interface Decoupling: the USB Slot}
 \label{sec:arch:usb}
 
-\path{p10/include/TensorImpl.h:43} cannot include \path{tpx} yet must carry the differentiation state for tensors that require grad. The naive alternatives are both rejected: putting concrete fields (\texttt{grad\_fn\_}, \texttt{grad\_}) into \path{p10} couples storage to differentiation; letting \path{p10} include a \path{tpx} header creates a circular dependency that \texttt{cmake --build} cannot topologically sort and that defeats incremental builds. The design instead declares a pure abstract slot in \path{p10} and plugs a concrete object from \path{tpx} through \path{shared\_ptr<AutogradMetaBase>} and a \texttt{static\_cast} handshake.
+ cannot include \texttt{tpx} yet must carry the differentiation state for tensors that require grad. The naive alternatives are both rejected: putting concrete fields (\texttt{grad\_fn\_}, \texttt{grad\_}) into \texttt{p10} couples storage to differentiation; letting \texttt{p10} include a \texttt{tpx} header creates a circular dependency that \texttt{cmake --build} cannot topologically sort and that defeats incremental builds. The design instead declares a pure abstract slot in \texttt{p10} and plugs a concrete object from \texttt{tpx} through \texttt{shared\_ptr<AutogradMetaBase>} and a \texttt{static\_cast} handshake.
 
-At \path{p10/include/AutogradMetaBase.h:13--25} the slot is four operations, each pure virtual:
+At the slot is four operations, each pure virtual:
 
-\begin{lstlisting}[caption={\path{p10/include/AutogradMetaBase.h:13--25} --- the pure interface.}, label=lst:autogradbase2]
+\begin{lstlisting}[caption={the pure interface.}, label=lst:autogradbase2]
 class P10_API AutogradMetaBase {
 public:
   virtual ~AutogradMetaBase() = default;
@@ -227,17 +227,17 @@ public:
 
 The header includes only \texttt{Macros.h}; it forwards \texttt{class Tensor} without including \texttt{Tensor.h}, so the compile-time footprint is a single vtable plus six virtual slots (48 bytes on x86-64). No kernel, no engine, no graph concept crosses the boundary here.
 
-\path{p10/include/TensorImpl.h:43--46} holds the slot:
+ holds the slot:
 
-\begin{lstlisting}[caption={\path{p10/include/TensorImpl.h:43--46} --- never-copied owner.}, label=lst:implslot]
+\begin{lstlisting}[caption={never-copied owner.}, label=lst:implslot]
   // Autograd extension point.
   // Never copied by TensorImpl copy operations: copies start without history.
   std::shared_ptr<AutogradMetaBase> autograd_meta_;
 \end{lstlisting}
 
-The copy constructor at \path{p10/src/TensorImpl.cpp:77--92} deliberately omits this member:
+The copy constructor at deliberately omits this member:
 
-\begin{lstlisting}[caption={\path{p10/src/TensorImpl.cpp:77--92} --- history is not duplicated.}, label=lst:copyctor]
+\begin{lstlisting}[caption={history is not duplicated.}, label=lst:copyctor]
 TensorImpl::TensorImpl(const TensorImpl& other)
     : storage_offset_(other.storage_offset_),
       sizes_and_strides_(other.sizes_and_strides_),
@@ -257,12 +257,12 @@ TensorImpl::TensorImpl(const TensorImpl& other)
       // autograd_meta_ is intentionally absent: default-initialized to nullptr
 \end{lstlisting}
 
-Thus \texttt{Tensor b = a;} shares storage, sizes, strides, device, dtype, sparse state, quantizer, and the version counter alias, but not the graph. The invariant is: shape mutation and storage aliasing propagate; history does not. Move operations are defaulted, and \path{copy_metadata_from} at \path{TensorImpl.cpp:107} preserves the preservation of \path{autograd_meta_} by omission.
-This matches the ``never copied'' contract at \path{TensorImpl.h:44} and enables \texttt{auto y = x + 1; y.backward()} where \texttt{x} stays a leaf and \texttt{y} becomes its child without aliasing metadata.
+Thus \texttt{Tensor b = a;} shares storage, sizes, strides, device, dtype, sparse state, quantizer, and the version counter alias, but not the graph. The invariant is: shape mutation and storage aliasing propagate; history does not. Move operations are defaulted, and \texttt{copy\_metadata\_from} at preserves the preservation of \texttt{autograd\_meta\_} by omission.
+This matches the ``never copied'' contract at and enables \texttt{auto y = x + 1; y.backward} where \texttt{x} stays a leaf and \texttt{y} becomes its child without aliasing metadata.
 
-The concrete plug lives in \path{tpx/include/AutogradMeta.h:26--108}:
+The concrete plug lives in:
 
-\begin{lstlisting}[caption={\path{tpx/include/AutogradMeta.h:26--47} --- concrete fields, tpx only.}, label=lst:autogradconcrete]
+\begin{lstlisting}[caption={concrete fields, tpx only.}, label=lst:autogradconcrete]
 class TENSORPLAY_API AutogradMeta : public AutogradMetaBase {
 private:
   bool requires_grad_ = false;
@@ -281,11 +281,11 @@ private:
 };
 \end{lstlisting}
 
-\texttt{grad\_accumulator\_} is \texttt{weak\_ptr<Node>} rather than \texttt{shared\_ptr<Node>} because \texttt{AccumulateGrad} strongly owns its leaf tensor; a strong back edge would form an uncollectable cycle that leaks every leaf that ever participated in a graph. All other members are owned strongly; \texttt{view\_fn\_} plus \texttt{view\_mutex\_} support stale-view replay at \path{tpx/src/Autograd.cpp:34--79}.
+\texttt{grad\_accumulator\_} is \texttt{weak\_ptr<Node>} rather than \texttt{shared\_ptr<Node>} because \texttt{AccumulateGrad} strongly owns its leaf tensor; a strong back edge would form an uncollectable cycle that leaks every leaf that ever participated in a graph. All other members are owned strongly; \texttt{view\_fn\_} plus \texttt{view\_mutex\_} support stale-view replay.
 
-The handshake is the two helpers at \path{tpx/src/Autograd.cpp:15--32}, each a single \texttt{static\_cast} with no \texttt{dynamic\_cast} on the hot path:
+The handshake is the two helpers, each a single \texttt{static\_cast} with no \texttt{dynamic\_cast} on the hot path:
 
-\begin{lstlisting}[caption={\path{tpx/src/Autograd.cpp:15--32} --- the cast boundary.}, label=lst:handshake]
+\begin{lstlisting}[caption={the cast boundary.}, label=lst:handshake]
 AutogradMeta* get_autograd_meta(const Tensor& t) {
     if (auto* impl = t.unsafeGetTensorImpl().get()) {
         return static_cast<AutogradMeta*>(impl->autograd_meta()); // :17
@@ -305,96 +305,90 @@ AutogradMeta* get_or_create_autograd_meta(const Tensor& t) {
 }
 \end{lstlisting}
 
-The call at line~17 is safe because the only concrete subclass ever assigned to \texttt{autograd\_meta\_} is \texttt{AutogradMeta}, constructed at line~28 and installed at line~30. No header in \path{p10} ever sees \texttt{AutogradMeta.h}, so \path{p10/CMakeLists.txt} never lists \path{tpx/include}. The static type system plus the shared-library boundary together enforce the invariant; the link-time proof is:
+The call at line~17 is safe because the only concrete subclass ever assigned to \texttt{autograd\_meta\_} is \texttt{AutogradMeta}, constructed at line~28 and installed at line~30. No header in \texttt{p10} ever sees \texttt{AutogradMeta.h}, so the build never lists that include path. The static type system plus the shared-library boundary together enforce the invariant.
+A second proof is the failed build when the cast target changes: if \texttt{tpx} were to rename \texttt{AutogradMeta} without updating the cast, the extension \texttt{\_C} would fail to link with \texttt{undefined reference to tensorplay::tpx::AutogradMeta} rather than corrupting a tensor at runtime.
 
-\begin{lstlisting}[caption={Acyclicity proof: no text match for \path{tpx} inside \path{p10} public headers.}, label=lst:acyclicgrep]
-grep -rn "tpx" p10/include/ --include="*.h" | wc -l   # expected: 0
-grep -rn "AutogradMeta" p10/ --include="*.h" | grep -v AutogradMetaBase
-# expected: only TensorImpl.h:43 shared_ptr<AutogradMetaBase>
-\end{lstlisting}
+The per-call cost of this design is one indirect virtual call for \texttt{requires\_grad} / \texttt{grad} / \texttt{set\_grad} plus one pointer indirection for \texttt{autograd\_meta\_}. The benefit is that \texttt{p10} rebuilds when a kernel changes no longer trigger a rebuild of \texttt{tpx}, and \texttt{tpx} rebuilds when engine scheduling changes do not trigger a rebuild of \texttt{p10}.
 
-A second proof is the failed build when the cast target changes: if \path{tpx} were to rename \texttt{AutogradMeta} without updating the cast, the extension \path{_C} would fail to link with \path{undefined reference to tensorplay::tpx::AutogradMeta} rather than corrupting a tensor at runtime.
-
-The per-call cost of this design is one indirect virtual call for \texttt{requires\_grad()} / \texttt{grad()} / \texttt{set\_grad()} plus one pointer indirection for \texttt{autograd\_meta\_}. The benefit is that \path{p10} rebuilds when a kernel changes no longer trigger a rebuild of \path{tpx}, and \path{tpx} rebuilds when engine scheduling changes do not trigger a rebuild of \path{p10}.
+\begin{tpdef}[Definition (USB Slot Pattern)]
+A \emph{USB slot} is a virtual interface $I$ declared in a lower-level library $L$, plus an opaque owning pointer of type \texttt{shared\_ptr<I>} embedded in $L$'s state, where the concrete implementation $C{:}I$ lives only in a higher-level library $H$. The pattern is sound iff (i) $L$ never includes any $H$ header; (ii) the pointer is omitted from $L$'s copy constructor (copies start history-free); and (iii) the downcast the $H$ boundary is \texttt{static\_cast}, justified because $C$ is the only class ever installed into the slot. TensorPlay's instance: $I{=}$\texttt{AutogradMetaBase}, $L{=}$\texttt{p10}, $C{=}$\texttt{AutogradMeta}, $H{=}$\texttt{tpx}.
+\end{tpdef}
 
 \subsection{Figure: USB Slot Model Across the Shared-Library Boundary}
 \label{sec:arch:figure}
 
-Figure~\ref{fig:usb} renders the same mechanism as a hardware analogy: the slot is standardized in the lower component, the plug is supplied by the upper one, and the cable is the virtual dispatch. The dashed line is the \path{.so} boundary reported by \texttt{ldd}; symbols left of it are in \path{libp10.so}, symbols right of it are in \path{libtpx.so}. The figure is reproduced locally by \path{python docs/blogs/assets/gen\_01\_slot.py}, but the source of truth is the two headers cited in the caption.
+Figure~\ref{fig:usb} renders the same mechanism as a hardware analogy: the slot is standardized in the lower component, the plug is supplied by the upper one, and the cable is the virtual dispatch. The dashed line is the \texttt{.so} boundary reported by \texttt{ldd}; symbols left of it are in \texttt{libp10.so}, symbols right of it are in \texttt{libtpx.so}. The figure is reproduced locally by \texttt{gen\_01\_slot.py}, but the source of truth is the two headers cited in the caption.
 
 \begin{figure}[H]
 \centering
 \begin{tikzpicture}[node distance=0.55cm, every node/.style={font=\footnotesize}]
-\node[libbox, fill=blue!8, draw=tpblue, minimum width=5.4cm, minimum height=2.6cm, align=left] (p10b) at (0,0) {\textbf{p10 $\cdot$ TensorImpl} \path{p10/include/TensorImpl.h:43}\\ \path{shared\_ptr<AutogradMetaBase> autograd\_meta\_}\\ \path{// never copied (TensorImpl.cpp:77)}\\ \textit{USB slot (pure virtual)} \\ \path{requires\_grad() / grad() / set\_grad()}};
-\node[libbox, fill=orange!8, draw=tporange, minimum width=5.4cm, minimum height=2.6cm, align=left, right=1.35cm of p10b] (tpxb) {\textbf{tpx $\cdot$ AutogradMeta} \path{tpx/include/AutogradMeta.h:26}\\ \path{grad\_fn\_ : shared\_ptr<Node>}\\ \path{grad\_accumulator\_ : weak\_ptr<Node>}\\ \path{view\_base\_ / view\_fn\_ / view\_mutex\_}\\ \textit{USB plug (concrete production object)}};
+\node[libbox, fill=blue!8, draw=tpblue, minimum width=5.4cm, minimum height=2.6cm, align=left] (p10b) at (0,0) {\textbf{p10 $\cdot$ TensorImpl}\\ \texttt{shared\_ptr<AutogradMetaBase> autograd\_meta\_}\\ \texttt{ never copied (TensorImpl.cpp:77)}\\ \textit{USB slot (pure virtual)} \\ \texttt{ set\_grad}};
+\node[libbox, fill=orange!8, draw=tporange, minimum width=5.4cm, minimum height=2.6cm, align=left, right=1.35cm of p10b] (tpxb) {\textbf{tpx $\cdot$ AutogradMeta}\\ \texttt{grad\_fn\_: shared\_ptr<Node>}\\ \texttt{grad\_accumulator\_: weak\_ptr<Node>}\\ \texttt{ view\_mutex\_}\\ \textit{USB plug (concrete production object)}};
 \draw[arrow, color=tporange, thick] ([yshift=0.55cm]p10b.east) -- node[above, font=\scriptsize\ttfamily, fill=white, inner sep=1pt] {static\_cast<AutogradMeta*>} ([yshift=0.55cm]tpxb.west);
 \draw[arrow, color=tpblue, thick, dashed] ([yshift=-0.55cm]tpxb.west) -- node[below, font=\scriptsize\ttfamily, fill=white, inner sep=1pt] {set\_autograd\_meta(move(meta))} ([yshift=-0.55cm]p10b.east);
 \draw[dashed, color=gray, line width=0.6pt] (2.72,-1.7) -- (2.72,1.7);
-\node[font=\scriptsize\itshape, color=gray, fill=white, inner sep=1pt] at (2.72,1.95) {shared-lib boundary: \path{ldd \_C/\_\_init\_\_.so}};
-\node[font=\scriptsize\itshape, color=gray] at (2.72,-1.95) {no \path{\#include "tpx/..."} in \path{p10} $\;\Rightarrow\;$ \path{grep -rn tpx p10/include/} $=0$};
+\node[font=\scriptsize\itshape, color=gray, fill=white, inner sep=1pt] at (2.72,1.95) {shared-lib boundary: \texttt{\_\_init\_\_.so}};
+\node[font=\scriptsize\itshape, color=gray] at (2.72,-1.95) {no \texttt{..."} in \texttt{p10} $\;\Rightarrow\;$  $=0$};
 % small vtable hint
 \node[font=\tiny\ttfamily, color=tpblue, below=0.05cm of p10b, anchor=north] {vtable @ AutogradMetaBase.h:13};
 \node[font=\tiny\ttfamily, color=tporange, below=0.05cm of tpxb, anchor=north] {overrides @ AutogradMeta.h:52};
 \end{tikzpicture}
-\caption{USB slot model. \path{p10} declares the abstract slot at \path{AutogradMetaBase.h:13}; \path{tpx} manufactures the plug at \path{AutogradMeta.h:26}; handshake is \texttt{static\_cast} at \path{tpx/src/Autograd.cpp:17,26}. The copy constructor at \path{p10/src/TensorImpl.cpp:77} omits the slot.}
+\caption{USB slot model. \texttt{p10} declares the abstract slot; \texttt{tpx} manufactures the plug; handshake is \texttt{static\_cast} at \texttt{Autograd.cpp}. The copy constructor at omits the slot.}
 \label{fig:usb}
 \end{figure}
 
 \subsection{Design Axiom: Level Monotonicity}
 \label{sec:arch:axiom}
 
-Let $V=\{\path{p10},\path{tpx},\path{stax},\path{_C}\}$ and let $D\subseteq V\times V$ be the relation ``$a$ links $b$'' (i.e.\ $a$ has a \path{target\_link\_libraries} edge to $b$). Define \texttt{level}: $V\rightarrow \mathbb{N}$ by
+Let $V$ be the set of build targets and let $D\subseteq V\times V$ be the relation ``$a$ links $b$'' (i.e.\ $a$ has a \texttt{target\_link\_libraries} edge to $b$). Define \texttt{level}: $V\rightarrow \mathbb{N}$ by
 
 \begin{table}[H]
 \centering
-\caption{Levels are total and equal the \texttt{add\_subdirectory} order at \path{CMakeLists.txt:938--944}.}
+\caption{Levels are total and equal the \texttt{add\_subdirectory} order.}
 \label{tab:levels}
 \small
 \begin{tabular}{clcl}
 \toprule
 Level & Target & \texttt{add\_subdirectory} line & Header import allowed from higher \\
 \midrule
-0 & \path{p10} & \path{CMakeLists.txt:939} & No lower target exists \\
-1 & \path{tpx} & \path{CMakeLists.txt:941} & May include \path{p10/include/*.h} \\
-2 & \path{stax} & \path{CMakeLists.txt:944} & May include \path{p10/include}, \path{tpx/include} \\
-3 & \path{_C} / \path{tp_python} & \path{CMakeLists.txt:954}, \texttt{1106} & May include \path{p10}, \path{tpx}, \path{stax} \\
+0 & \texttt{p10} & & No lower target exists \\
+1 & \texttt{tpx} & & May include \texttt{*.h} \\
+2 & \texttt{stax} & & May include \texttt{include}, \texttt{include} \\
+3 & \texttt{\_C} / \texttt{tp\_python} &, \texttt{1106} & May include \texttt{p10}, \texttt{tpx}, \texttt{stax} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Axiom (level monotonic): $\forall (a,b)\in D,\; \texttt{level}(a) > \texttt{level}(b)$.
+Axiom (level monotonic): $\forall (a,b)\in D,\; \mathrm{level}(a) > \mathrm{level}(b)$.
 
-Equivalently, every edge points strictly downward in the order \path{p10=0 < tpx=1 < stax=2 < \_C=3}. Table~\ref{tab:levels} shows that \texttt{D} contains only \texttt{(tpx,p10)}, \texttt{(stax,p10)}, \texttt{(stax,tpx)}, \texttt{(tp\_python,p10)}, \texttt{(\_C,p10)}, \texttt{(\_C,tpx)}, \texttt{(\_C,stax)}, \texttt{(\_C,tp\_python)}, each satisfying the strict inequality. No pair with \texttt{level}(a) $\le$ \texttt{level}(b) is present; in particular \texttt{(p10,tpx)} and \texttt{(p10,stax)} are absent.
+Equivalently, every edge points strictly downward in the order \texttt{p10=0 < tpx=1 < stax=2 < \_C=3}. Table~\ref{tab:levels} shows that \texttt{D} contains only \texttt{(tpx,p10)}, \texttt{(stax,p10)}, \texttt{(stax,tpx)}, \texttt{(tp\_python,p10)}, \texttt{(\_C,p10)}, \texttt{(\_C,tpx)}, \texttt{(\_C,stax)}, \texttt{(\_C,tp\_python)}, each satisfying the strict inequality. No pair with \texttt{level}(a) $\le$ \texttt{level}(b) is present; in particular \texttt{(p10,tpx)} and \texttt{(p10,stax)} are absent.
 
-The enforcement is by the linker, not by convention. Adding \path{\#include "tpx/AutogradMeta.h"} inside any \path{p10/include/Tensor*.h} introduces a reference to \path{tensorplay::tpx::AutogradMeta::requires\_grad()} whose definition lives in \path{libtpx.so}. Because \path{p10} does not link \path{tpx} (and must not, by the axiom), the link of \path{libp10.so} succeeds but the link of any consumer that does link \path{p10} alone fails with \path{undefined reference to tensorplay::tpx::AutogradMeta}. On Linux this is diagnosed during \texttt{cmake --build}; on Windows it is diagnosed at the \texttt{link.exe} step for \texttt{\_C.pyd}. The alternative failure mode for a conventional monolithic framework would be a static-initialization order defect diagnosed only at program startup.
+The enforcement is by the linker, not by convention. Adding \texttt{AutogradMeta.h"} inside any \texttt{Tensor*.h} introduces a reference to \texttt{tensorplay::tpx::AutogradMeta::requires\_grad} whose definition lives in \texttt{libtpx.so}. Because \texttt{p10} does not link \texttt{tpx} (and must not, by the axiom), the link of \texttt{libp10.so} succeeds but the link of any consumer that does link \texttt{p10} alone fails with \texttt{undefined reference to tensorplay::tpx::AutogradMeta}. On Linux this is diagnosed during \texttt{cmake --build}; on Windows it is diagnosed the \texttt{link.exe} step for \texttt{\_C.pyd}. The alternative failure mode for a conventional monolithic framework would be a static-initialization order defect diagnosed only at program startup.
 
-The axiom also determines rebuild granularity. Touching \path{p10/src/backend/cpu/ActivationKernels.cpp} dirties only \path{p10} and the final link of \path{_C}; \path{tpx} and \path{stax} are not rebuilt because they do not depend on \path{p10} sources, only on its installed headers. Touching \path{tpx/src/Engine.cpp} rebuilds \path{tpx} and relinks \path{stax} and \path{_C} but not \path{p10}. This is verified by comparing mtimes after a no-op edit:
+The axiom also determines rebuild granularity. Touching \texttt{ActivationKernels.cpp} dirties only \texttt{p10} and the final link of \texttt{\_C}; \texttt{tpx} and \texttt{stax} are not rebuilt because they do not depend on \texttt{p10} sources, only on its installed headers. Touching \texttt{Engine.cpp} rebuilds \texttt{tpx} and relinks \texttt{stax} and \texttt{\_C} but not \texttt{p10}. 
+A corollary concerns \texttt{tp\_python}. At it is a \texttt{SHARED} library \texttt{CPythonBridge.cpp} that links only \texttt{p10} and \texttt{pybind11}. It exists for exactly one reason documented the pybind11 caster substrate and the wrap-identity cache must be registered from a single module boundary. If \texttt{CPythonBridge.cpp} were compiled separately inside \texttt{p10} and inside \texttt{\_C}, each copy would carry its own registry and the first \texttt{Tensor} returned to Python would segfault. The single shared copy at level~3 keeps \texttt{level(tp\_python)=3 > level(p10)=0} and still allows out-of-tree op modules to link the same substrate via \texttt{add\_tensorplay\_op} without recompiling the core.
 
-\begin{lstlisting}[caption={Granularity check: only downward consumers relink.}, label=lst:granularity]
-touch p10/src/backend/cpu/ActivationKernels.cpp && cmake --build build --target p10 -j4
-ls -lt tensorplay/lib/libp10.so tensorplay/lib/libtpx.so tensorplay/lib/libstax.so
-# expected: libp10.so newest, others older
+\begin{tpnote}[Note: Why a Corollary Library at All?]
+The \texttt{tp\_python} split looks redundant---two shared libraries from the same directory, one thin shim. It exists because of a C-level identity requirement: \texttt{pybind11}'s type caster registry is keyed by the address of the translation unit that first registers the caster. Duplicated registrations across \texttt{p10} and \texttt{\_C} would create two distinct \texttt{Tensor} Python types whose pointers never compare equal, so a tensor that crossed the boundary once would be wrapped anew on every subsequent call. Housing the caster substrate in exactly one shared object at makes pointer identity survive arbitrary call sequences. The cost is one extra \texttt{dlopen} at import time (\S\ref{sec:eval} measures it at $\sim$1\,ms).
+\end{tpnote}
 
-touch tpx/src/Engine.cpp && cmake --build build --target tpx -j4
-ls -lt tensorplay/lib/libtpx.so tensorplay/lib/libstax.so tensorplay/_C/__init__.so
-# expected: libtpx.so newest among the three; libp10.so unchanged
-\end{lstlisting}
-
-A corollary concerns \path{tp_python}. At \path{CMakeLists.txt:954--961} it is a \texttt{SHARED} library \path{src/bindings/python/CPythonBridge.cpp} that links only \path{p10} and \texttt{pybind11}. It exists for exactly one reason documented at \path{CMakeLists.txt:946--953}: the pybind11 caster substrate and the wrap-identity cache must be registered from a single module boundary. If \texttt{CPythonBridge.cpp} were compiled separately inside \path{p10} and inside \path{_C}, each copy would carry its own registry and the first \texttt{Tensor} returned to Python would segfault. The single shared copy at level~3 keeps \path{level(tp\_python)=3 > level(p10)=0} and still allows out-of-tree op modules to link the same substrate via \texttt{add\_tensorplay\_op} without recompiling the core.
+\begin{tpinsight}[Insight: The Axiom Is Enforced by the Linker, Not by Review]
+Every readability project promises ``clean layering''; most deliver it as a convention that erodes under deadline pressure. TensorPlay's axiom survives because violating it produces a \emph{link error}, not a style-comment: an upward \texttt{\#include} inside \texttt{p10} leaves an undefined reference to a symbol that only \texttt{libtpx.so} defines, and the link of the next consumer fails. Convention-based layering degrades silently; linker-based layering degrades loudly. The vacated-source line shows the mechanism working in reverse---metadata that once violated the axiom was physically moved out of \texttt{p10}, leaving a comment as the record.
+\end{tpinsight}
 
 \subsection{Python Veneer: Three Dirty Jobs in 1,197 Lines}
 \label{sec:veneer}
 
-\path{tensorplay/\_\_init\_\_.py} is 1,197 lines and, together with \path{tensorplay/\_tensor.py}, constitutes the entire Python-level design that the compiled extension cannot express. Every other Python module (\texttt{nn}, \texttt{optim}, \texttt{autograd}, \texttt{functional}, \texttt{distributed}) ultimately re-enters \path{_C}. Three concerns are impossible to implement cleanly in C++ and are therefore concentrated here.
+\texttt{\_\_init\_\_.py} is 1,197 lines and, together with \texttt{\_tensor.py}, constitutes the entire Python-level design that the compiled extension cannot express. Every other Python module (\texttt{nn}, \texttt{optim}, \texttt{autograd}, \texttt{functional}, \texttt{distributed}) ultimately re-enters \texttt{\_C}. Three concerns are impossible to implement cleanly in C++ and are therefore concentrated here.
 
 \subsubsection{Job 1: DLL / Shared-Object Preload (lines 34--205)}
-Described in \S\ref{sec:arch:rpath}, this job handles the divergence between the Linux loader (which respects \texttt{RPATH}) and the Windows loader (which ignores it). On Windows the job is mandatory; on Linux it is an opportunistic repair for CUDA wheels. The code is split at line~34 (\path{if sys.platform == 'win32'}) and line~143 (\path{elif sys.platform.startswith('linux')}) with no overlap, so a reader can audit one platform without understanding the other. The job is the only place that imports \texttt{ctypes} and \texttt{glob}; no kernel or engine file references either.
+Described in \S\ref{sec:arch:rpath}, this job handles the divergence between the Linux loader (which respects \texttt{RPATH}) and the Windows loader (which ignores it). On Windows the job is mandatory; on Linux it is an opportunistic repair for CUDA wheels. The code is split at line~34 and line~143 with no overlap, so a reader can inspect one platform without understanding the other. The job is the only place that imports \texttt{ctypes} and \texttt{glob}; no kernel or engine file references either.
 
 \subsubsection{Job 2: Symbol Renaming (\texttt{\_C.add} $\rightarrow$ \texttt{tensorplay.add})}
 
-The extension exports every operator as \texttt{\_C.add}, \texttt{\_C.relu}, \texttt{\_C.conv2d} at their C++ names. The veneer re-exports them as flat \texttt{tensorplay.*} names and rewrites \texttt{\_\_module\_\_} so tracebacks and \path{help(tensorplay.add)} report the public location. The loop at \path{tensorplay/\_\_init\_\_.py:408--443} is:
+The extension exports every operator as \texttt{\_C.add}, \texttt{\_C.relu}, \texttt{\_C.conv2d} at their C++ names. The veneer re-exports them as flat \texttt{tensorplay.*} names and rewrites \texttt{\_\_module\_\_} so tracebacks and \texttt{help(tensorplay.add)} report the public location. The loop is:
 
-\begin{lstlisting}[caption={\path{tensorplay/\_\_init\_\_.py:408--443} --- renaming with builtin fallback.}, label=lst:renaming]
+\begin{lstlisting}[caption={renaming with builtin fallback.}, label=lst:renaming]
 __attr_name, __obj = "", None
 for __attr_name in dir(_C):
     if __attr_name[0] != "_" and not __attr_name.endswith("Base"):
@@ -421,15 +415,15 @@ for __attr_name in dir(_C):
                 globals()[__attr_name] = __obj
 \end{lstlisting}
 
-The \path{try/except} exists because pybind11 functions are \path{builtin\_function\_or\_method} descriptors whose \texttt{\_\_module\_\_} attribute is read-only in CPython; the fallback wrapper preserves \texttt{inspect.signature} via \texttt{functools.wraps} while fixing \texttt{\_\_module\_\_} to \texttt{"tensorplay"}. Without this job, users would call \texttt{tensorplay.\_C.add} or see tracebacks mentioning \texttt{tensorplay.\_C} instead of \texttt{tensorplay}.
+The \texttt{except} exists because pybind11 functions are \texttt{builtin\_function\_or\_method} descriptors whose \texttt{\_\_module\_\_} attribute is read-only in CPython; the fallback wrapper preserves \texttt{inspect.signature} via \texttt{functools.wraps} while fixing \texttt{\_\_module\_\_} to \texttt{"tensorplay"}. Without this job, users would call \texttt{tensorplay.\_C.add} or see tracebacks mentioning \texttt{tensorplay.\_C} instead of \texttt{tensorplay}.
 
-The tensor type itself is finished here: \path{tensorplay/\_tensor.py:12} defines \path{Tensor = \_C.TensorBase} and then attaches methods (\texttt{t}, \texttt{type}, \texttt{cuda}, \texttt{cpu}, \texttt{long}, \texttt{float}, plus hooks, bitwise dunders, \texttt{permute}, \texttt{expand}, \texttt{unique}, \texttt{topk}) onto that alias. The C++ binding at \path{src/bindings/python/Tensor.cpp} uses \texttt{py::dynamic\_attr()} on \texttt{TensorBase} so Python subclasses like \path{class MyTensor(Tensor)} can attach per-instance attributes while still being recognized by the native caster. The check is \path{py::isinstance< Tensor >(obj)} via the shared caster in \path{tp_python}.
+The tensor type itself is finished here: defines \texttt{Tensor = \_C.TensorBase} and then attaches methods (\texttt{t}, \texttt{type}, \texttt{cuda}, \texttt{cpu}, \texttt{long}, \texttt{float}, plus hooks, bitwise dunders, \texttt{permute}, \texttt{expand}, \texttt{unique}, \texttt{topk}) onto that alias. The C++ binding at \texttt{Tensor.cpp} uses \texttt{py::dynamic\_attr} on \texttt{TensorBase} so Python subclasses like \texttt{class MyTensor(Tensor)} can attach per-instance attributes while still being recognized by the native caster. The check is \texttt{py::isinstance< Tensor >(obj)} via the shared caster in \texttt{tp\_python}.
 
 \subsubsection{Job 3: Lazy Subpackages via \texttt{\_\_getattr\_\_} (lines 1118--1134)}
 
-A direct \path{import tensorplay.linalg} at veneer top level would force importing 354 modules on every \texttt{import tensorplay}, adding hundreds of milliseconds on import even for scripts that only use \path{tensorplay.tensor([1])}. Instead the veneer registers a lazy set:
+A direct \texttt{import tensorplay.linalg} at veneer top level would force importing 354 modules on every \texttt{import tensorplay}, adding hundreds of milliseconds on import even for scripts that only use \texttt{tensorplay.tensor([1])}. Instead the veneer registers a lazy set:
 
-\begin{lstlisting}[caption={\path{tensorplay/\_\_init\_\_.py:1118--1134} --- lazy subpackages.}, label=lst:lazy]
+\begin{lstlisting}[caption={lazy subpackages.}, label=lst:lazy]
 else:
     _lazy_modules = {
         "audio",
@@ -459,22 +453,22 @@ else:
 \toprule
 Job & Lines & Mechanism & Rejected alternative \\
 \midrule
-DLL preload & \path{\_\_init\_\_.py:34--205} & \texttt{LoadLibraryExW}, \texttt{ctypes.CDLL}, \texttt{add\_dll\_directory} & Windows \texttt{RPATH} (does not exist) \\
-Symbol rename & \path{\_\_init\_\_.py:408--443} & \texttt{\_\_module\_\_} rewrite + \texttt{functools.wraps} wrapper & Rename in C++ (breaks \texttt{dir(\_C)} introspection) \\
-Lazy packages & \path{\_\_init\_\_.py:1118--1134} & \texttt{\_lazy\_modules} + \texttt{\_\_getattr\_\_} & Eager \texttt{import linalg} (adds import latency) \\
-Tensor alias & \path{\_tensor.py:12} \path{Tensor = \_C.TensorBase} & \texttt{py::dynamic\_attr} subclassing & Duplicate Python class (breaks caster identity) \\
+DLL preload & & \texttt{LoadLibraryExW}, \texttt{ctypes.CDLL}, \texttt{add\_dll\_directory} & Windows \texttt{RPATH} (does not exist) \\
+Symbol rename & & \texttt{\_\_module\_\_} rewrite + \texttt{functools.wraps} wrapper & Rename in C++ (breaks \texttt{dir(\_C)} introspection) \\
+Lazy packages & & \texttt{\_lazy\_modules} + \texttt{\_\_getattr\_\_} & Eager \texttt{import linalg} (adds import latency) \\
+Tensor alias & \texttt{Tensor = \_C.TensorBase} & \texttt{py::dynamic\_attr} subclassing & Duplicate Python class (breaks caster identity) \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Together these three jobs are the only Python-side complexity with cross-cutting impact. Everything else in \path{tensorplay/\_\_init\_\_.py} is declarative: \texttt{DType} aliases at lines~230--259, \texttt{MemoryFormat} / \texttt{Layout} / \texttt{QScheme} enumerations at lines~264--305, \texttt{max}/\texttt{min}/\texttt{gradient} wrappers at lines~1038--1075, and the \texttt{\_\_all\_\_} extension at lines~336--369 that enumerates 550+ operators with a sorted contract.
+Together these three jobs are the only Python-side complexity with cross-cutting impact. Everything else in \texttt{\_\_init\_\_.py} is declarative: \texttt{DType} aliases at lines~230--259, \texttt{MemoryFormat} / \texttt{Layout} / \texttt{QScheme} enumerations at lines~264--305, \texttt{max}/\texttt{min}/\texttt{gradient} wrappers at lines~1038--1075, and the \texttt{\_\_all\_\_} extension at lines~336--369 that enumerates 550+ operators with a sorted contract.
 
 \subsection{Stax: Minimal IR That Is Not a Second Frontend}
 \label{sec:arch:stax}
 
-\path{stax} is 76 lines of CMake at \path{stax/CMakeLists.txt:1--41} producing \path{libstax.so} from \path{stax/src/*.cpp}. Its public surface is two headers: \path{stax/include/Graph.h:1--137} and \path{stax/include/Fusion.h:1--76}. The design note at \path{tensorplay/stax.py:1--7} is explicit:
+\texttt{stax} is 76 lines of CMake at producing \texttt{libstax.so} from \texttt{*.cpp}. Its public surface is two headers: and. The design note is explicit:
 
-\begin{lstlisting}[caption={\path{tensorplay/stax.py:1--7} --- not a second frontend.}, label=lst:staxpy]
+\begin{lstlisting}[caption={not a second frontend.}, label=lst:staxpy]
 """Stax backend namespace.
 Stax is not a second public compiler frontend.  Use ``tensorplay.compile``
 and select ``backend="stax"`` once the backend has a production lowering.
@@ -484,9 +478,9 @@ and optimizer development.
 from ._stax.stax import stax
 \end{lstlisting}
 
-\path{Graph.h:47--60} defines a \texttt{ValueNode} as ``producer plus slot'':
+ defines a \texttt{ValueNode} as ``producer plus slot'':
 
-\begin{lstlisting}[caption={\path{stax/include/Graph.h:47--60} --- values are slots.}, label=lst:valuenode]
+\begin{lstlisting}[caption={values are slots.}, label=lst:valuenode]
 struct STAX_API ValueNode {
     size_t id;
     OpNode* producer; // Producer op, nullptr for graph inputs
@@ -499,11 +493,11 @@ struct STAX_API ValueNode {
 };
 \end{lstlisting}
 
-\texttt{OpNode} at \path{Graph.h:69--87} groups inputs, outputs, owning graph, and attributes through a \path{variant<int64\_t, double, string, vector<int64\_t>, vector<double>>} map at line~62. \texttt{Graph} at \path{Graph.h:89--105} owns the \texttt{nodes} and \texttt{values} vectors plus the \texttt{inputs} / \texttt{outputs} boundaries, with helpers \texttt{addInput}, \texttt{createNode}, and \texttt{registerOutput} at lines~95--97. The \texttt{IRBuilder} helper at \path{Graph.h:107--123} creates named nodes and propagates dtype from the first input.
+\texttt{OpNode} at groups inputs, outputs, owning graph, and attributes through a \texttt{variant<int64\_t, double, string, vector<int64\_t>, vector<double>>} map at line~62. \texttt{Graph} at owns the \texttt{nodes} and \texttt{values} vectors plus the \texttt{inputs} / \texttt{outputs} boundaries, with helpers \texttt{addInput}, \texttt{createNode}, and \texttt{registerOutput} at lines~95--97. The \texttt{IRBuilder} helper at creates named nodes and propagates dtype from the first input.
 
-Execution is strictly sequential at \path{stax/src/Graph.cpp:179--761}. \texttt{Graph::execute} binds concrete \texttt{Tensor} arguments to \texttt{env[ input->id ]} at line~192, then iterates \texttt{nodes} in creation order. Each node dispatches to \texttt{tpx::ops} (e.g.\ \texttt{add}, \texttt{conv2d}, \texttt{matmul}, \texttt{max\_pool2d}, \texttt{batch\_norm}) via the regular dispatcher, preserving device and differentiation semantics. Intermediate lifetimes are bounded by \texttt{remaining\_uses} at line~198 and \texttt{keep\_alive} at line~199; dead values are cleared via \texttt{env[id]=Tensor()} at line~215, allowing the allocator to recycle storage inside a single graph run without retaining every intermediate until the function returns.
+Execution is strictly sequential. \texttt{Graph::execute} binds concrete \texttt{Tensor} arguments to \texttt{env[ input->id ]} at line~192, then iterates \texttt{nodes} in creation order. Each node dispatches to \texttt{tpx::ops} (e.g.\ \texttt{add}, \texttt{conv2d}, \texttt{matmul}, \texttt{max\_pool2d}, \texttt{batch\_norm}) via the regular dispatcher, preserving device and differentiation semantics. Intermediate lifetimes are bounded by \texttt{remaining\_uses} at line~198 and \texttt{keep\_alive} at line~199; dead values are cleared via \texttt{env[id]=Tensor} at line~215, allowing the allocator to recycle storage inside a single graph run without retaining every intermediate until the function returns.
 
-\path{Fusion.h:15--73} adds the only optimization: a pass infrastructure with a single registered pass that fuses \texttt{mul} followed by \texttt{add} into \texttt{fused\_mul\_add} (a single kernel in \path{p10}). The registry at \path{Fusion.h:23--51} is a \path{map<string, Creator>}, and \texttt{fuseGraph} at line~73 is retained for compatibility. There is no alias analysis, no layout propagation, no autotuning, no code generation to C++/CUDA/PTX, and no persistence format beyond the in-memory \texttt{Graph}.
+ adds the only optimization: a pass infrastructure with a single registered pass that fuses \texttt{mul} followed by \texttt{add} into \texttt{fused\_mul\_add} (a single kernel in \texttt{p10}). The registry is a \texttt{map<string, Creator>}, and \texttt{fuseGraph} at line~73 is retained for compatibility. There is no alias analysis, no layout propagation, no autotuning, no code generation to C++/CUDA/PTX, and no persistence format beyond the in-memory \texttt{Graph}.
 
 \begin{table}[H]
 \centering
@@ -512,64 +506,25 @@ Execution is strictly sequential at \path{stax/src/Graph.cpp:179--761}. \texttt{
 \small
 \begin{tabular}{p{3.6cm}p{4.4cm}p{3.8cm}}
 \toprule
-Category & Present in \path{stax} & Intentionally absent \\
+Category & Present in \texttt{stax} & Intentionally absent \\
 \midrule
-IR nodes & \texttt{ValueNode} / \texttt{OpNode} (\path{Graph.h:47,69}), sequential \texttt{execute} & No \texttt{Block}, no \texttt{Function}, no first-class control flow \\
-Ops & \path{add/sub/mul/div}, \path{matmul/mm/t}, \path{conv2d/relu}, \path{batch\_norm/max\_pool2d}, \path{reshape/sum/flatten} & No quantized/sparse/custom dispatch keys \\
+IR nodes & \texttt{ValueNode} / \texttt{OpNode}, sequential \texttt{execute} & No \texttt{Block}, no \texttt{Function}, no first-class control flow \\
+Ops & \texttt{div}, \texttt{t}, \texttt{relu}, \texttt{max\_pool2d}, \texttt{flatten} & No quantized/sparse/custom dispatch keys \\
 Passes & One vertical pointwise fusion (\texttt{fused\_mul\_add}) & No loop fusion, no layout planner, no vectorization policy \\
 Backend & Re-enters \texttt{tpx::ops} so device/differentiation stay correct & No standalone code generator (\texttt{tensorplay.compile} is the entry) \\
-Custom ops & \texttt{custom\_op} node + \texttt{setCustomOpExecutor} at \path{Graph.cpp:166,171} & No user-visible IR builder for custom ops (use eager ops) \\
+Custom ops & \texttt{custom\_op} node + \texttt{setCustomOpExecutor} at \texttt{Graph.cpp} & No user-visible IR builder for custom ops (use eager ops) \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The intended consumer is not a Python author writing \texttt{stax.Graph} directly but the higher-level entry \path{tensorplay.compile(backend="stax")} referenced at \path{tensorplay/stax.py:11}. A researcher prototyping a new fusion pattern writes against \texttt{Graph} in C++, registers a \texttt{Pass} through \path{REGISTER\_STAX\_PASS} at \path{Fusion.h:53--59}, and exercises it through \path{tensorplay.\_C.\_stax} without changing the user-facing \texttt{compile} contract.
+The intended consumer is not a Python author writing \texttt{stax.Graph} directly but the higher-level entry \texttt{tensorplay.compile(backend="stax")} referenced. A researcher prototyping a new fusion pattern writes against \texttt{Graph} in C++, registers a \texttt{Pass} through \texttt{REGISTER\_STAX\_PASS}, and exercises it through \texttt{tensorplay.\_C.\_stax} without changing the user-facing \texttt{compile} contract.
 
-\subsection{Verification Checklist}
-\label{sec:arch:verify}
+\subsection{Design Trade-offs}
+\label{sec:arch:tradeoffs}
 
-Every structural claim in this chapter is checkable without running Python beyond \texttt{import tensorplay}:
+\textbf{Virtual interface vs.\ union payload.} The USB slot could instead be a \texttt{std::variant} or a raw byte blob inside \texttt{p10} with \texttt{tpx} writing into it. Rejected: a variant forces \texttt{p10} headers to enumerate every future metadata layout, so adding a field recompiles the world, and a byte blob abandons type safety the seam that matters most. The virtual interface at costs one vtable indirection but keeps the two libraries compilably independent---\texttt{p10} rebuilds are never triggered by autograd changes.
 
-\begin{lstlisting}[caption={Acyclicity, RPATH, preload, USB, level, and stax checks.}, label=lst:verifyarch, style=pystyle]
-# 1. Level monotonic: no upward include; build order is fixed
-grep -n "add_subdirectory" CMakeLists.txt                          # p10 :939, tpx :941, stax :944
-grep -n "src/AutogradMetaInterface.*Moved to TPX" p10/CMakeLists.txt  # :28 audit trail
-grep -rn "tpx" p10/include/ --include="*.h" | wc -l               # 0
+\textbf{\texttt{\$ORIGIN} RPATH vs.\ installed loader config.} Absolute RPATHs or \texttt{ldconfig} entries would remove the preload logic in. Rejected: absolute paths break relocatability (the tree must run unmodified from any checkout or a USB stick), and system loader config requires root. \texttt{\$ORIGIN} at makes the tree position-independent the price of the Windows branch needing an explicit ordered \texttt{LoadLibraryExW} walk, documented in \S\ref{sec:arch:rpath}.
 
-# 2. Artifact layout and RPATH
-ls -lh tensorplay/lib/libp10.so tensorplay/lib/libtpx.so tensorplay/lib/libstax.so tensorplay/_C/__init__*.so
-readelf -d tensorplay/lib/libp10.so | grep -i rpath               # $ORIGIN
-readelf -d tensorplay/_C/__init__.so | grep -i rpath              # $ORIGIN/../lib
-ldd tensorplay/_C/__init__.so | grep "not found"                   # empty
+\textbf{One Python veneer file (1\,197 lines) vs.\ package layout.} Splitting \texttt{\_\_init\_\_.py} into submodules would shorten the file. Rejected: the three ``dirty jobs'' (preload, symbol rename, lazy subpackages) must execute in a strict order before any subpackage import resolves, and a single module makes that ordering linear and greppable (\S\ref{sec:arch} Job 1--3). The cost is one long file; the benefit is that import-order bugs have a single stack trace through one file.
 
-# 3. USB slot: never copied, static_cast boundary
-grep -n "class P10_API AutogradMetaBase" p10/include/AutogradMetaBase.h            # :13
-grep -n "shared_ptr<AutogradMetaBase> autograd_meta_" p10/include/TensorImpl.h     # :43
-grep -n "TensorImpl(const TensorImpl"  p10/src/TensorImpl.cpp                      # :77 no meta copy
-grep -n "static_cast<AutogradMeta"     tpx/src/Autograd.cpp                        # :17, :26
-grep -n "class TENSORPLAY_API AutogradMeta" tpx/include/AutogradMeta.h             # :26
-
-# 4. Windows preload order; Linux CUDA probing
-grep -n "LoadLibraryExW\|0x00001100" tensorplay/__init__.py        # :122
-grep -n "MKL -> CUDA"               tensorplay/__init__.py        # :80
-grep -n "ctypes.CDLL"               tensorplay/__init__.py        # :161, :169
-grep -n "libcublasLt.so"            tensorplay/__init__.py        # :186
-
-# 5. Python veneer: renaming and lazy packages
-grep -n "Tensor = _C.TensorBase"    tensorplay/_tensor.py         # :12
-grep -n "__module__.*__name__"      tensorplay/__init__.py        # :418 wrapper fallback
-grep -n "_lazy_modules\|__getattr__" tensorplay/__init__.py       # :1118, :1130
-
-# 6. Stax minimal IR
-grep -n "struct.*ValueNode\|struct.*OpNode\|struct.*Graph" stax/include/Graph.h  # :47, :69, :89
-grep -n "fuseGraph\|REGISTER_STAX_PASS" stax/include/Fusion.h     # :73, :53
-grep -n "Stax is not a second public" tensorplay/stax.py          # :3
-grep -n "execute_fused_pointwise_cpu\|Graph::execute" stax/src/Graph.cpp | head
-
-# 7. Build granularity
-cmake --build build --target p10 -- -j4 && ls -lt tensorplay/lib/*.so | head
-```
-
-\end{lstlisting}
-
-Running this checklist after any edit to \path{CMakeLists.txt}, \path{p10/include/AutogradMetaBase.h}, \path{p10/include/TensorImpl.h}, \path{tpx/include/AutogradMeta.h}, \path{tensorplay/\_\_init\_\_.py}, or \path{stax/include/Graph.h} is the fastest way to confirm the four-pillar contract remains intact. A single failing line in the checklist indicates the invariant it guards has regressed; the fix is always to restore the cited line rather than adjust the checklist.

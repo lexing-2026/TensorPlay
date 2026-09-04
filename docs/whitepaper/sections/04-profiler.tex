@@ -4,33 +4,33 @@
 
 \subsection{Goals and Placement}
 
-The profiler must satisfy three conflicting goals: (i) near-zero overhead when disabled, (ii) accurate CPU+GPU timing when enabled, and (iii) pluggability of backends (CPU tracing, CUDA CUPTI activity, NVTX ranges, ITT tasks). TensorPlay places the core in \texttt{p10} so both \texttt{tpx} (Engine) and kernels can instrument without depending on Python. The Python layer (\texttt{tensorplay.profiler}) merely toggles atomics and drains buffers. Placement follows the dependency rule: \path{p10/include/Profiler.h} is the single header; \texttt{tpx} and \texttt{\_C} include it, never the reverse.
+The profiler must satisfy three conflicting goals: (i) near-zero overhead when disabled, (ii) accurate CPU+GPU timing when enabled, and (iii) pluggability of backends (CPU tracing, CUDA CUPTI activity, NVTX ranges, ITT tasks). TensorPlay places the core in \texttt{p10} so both \texttt{tpx} (Engine) and kernels can instrument without depending on Python. The Python layer (\texttt{tensorplay.profiler}) merely toggles atomics and drains buffers. Placement follows the dependency rule: \texttt{Profiler.h} is the single header; \texttt{tpx} and \texttt{\_C} include it, never the reverse.
 
-The hot path is one \texttt{std::atomic<bool>} load per dispatched op (\path{p10/include/Profiler.h:129}, \path{p10/src/Profiler.cpp:300}) plus, when shape or site capture is requested, one further load each. This matches the class of guard already emitted around every call for \texttt{GradMode} and \texttt{InferenceMode}. All other work (shape copy, name arena push, GPU event record) sits behind that branch.
+The hot path is one \texttt{std::atomic<bool>} load per dispatched op plus, when shape or site capture is requested, one further load each. This matches the class of guard already emitted around every call for \texttt{GradMode} and \texttt{InferenceMode}. All other work (shape copy, name arena push, GPU event record) sits behind that branch.
 
 \subsection{Core Data Model: Event, GpuActivity and MemEvent}
 
-\path{p10/include/Profiler.h:59--127} defines three session-lifetime records:
+ defines three session-lifetime records:
 
 \begin{table}[H]
 \centering
-\caption{Profiler record types in \path{p10/include/Profiler.h}.}
+\caption{Profiler record types in \texttt{Profiler.h}.}
 \label{tab:profrecords}
 \small
 \begin{tabular}{lll}
 \toprule
 Type & Lines & Purpose \\
 \midrule
-\texttt{Event} & \path{Profiler.h:59--90} & One per dispatched op / user span / backward node \\
-\texttt{MemEvent} & \path{Profiler.h:92--103} & One per allocator alloc/free when \texttt{g\_mem\_capture} is set \\
-\texttt{GpuActivity} & \path{Profiler.h:109--126} & One per CUPTI kernel / memcpy / memset / runtime / driver record \\
+\texttt{Event} & & One per dispatched op / user span / backward node \\
+\texttt{MemEvent} & & One per allocator alloc/free when \texttt{g\_mem\_capture} is set \\
+\texttt{GpuActivity} & & One per CUPTI kernel / memcpy / memset / runtime / driver record \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\subsubsection{Event fields (\path{Profiler.h:59--90})}
+\subsubsection{Event fields}
 
-\begin{lstlisting}[caption={\path{Profiler.h:59} --- Event layout.}, label=lst:eventfields, style=cppstyle]
+\begin{lstlisting}[caption={Event layout.}, label=lst:eventfields, style=cppstyle]
 struct Event {
   const char* name;        // borrowed for kOp (static literal), arena-owned for kUser/kBackward
   uint64_t start_ns;       // CLOCK_MONOTONIC (steady_clock)
@@ -49,13 +49,13 @@ struct Event {
 };
 \end{lstlisting}
 
-\texttt{EventKind} at \path{Profiler.h:43} distinguishes dispatched operators (\texttt{kOp}), user annotations via \texttt{record\_function} (\texttt{kUser}), and the autograd engine's \texttt{\_\_backward\_\_} span (\texttt{kBackward}). \texttt{site\_id} and \texttt{stack\_id} resolve through \texttt{site\_string()} and \texttt{stack\_frames()} (\path{Profiler.h:199--207}) and stay valid until the next \texttt{profiler\_start()}.
+\texttt{EventKind} at distinguishes dispatched operators (\texttt{kOp}), user annotations via \texttt{record\_function} (\texttt{kUser}), and the autograd engine's \texttt{\_\_backward\_\_} span (\texttt{kBackward}). \texttt{site\_id} and \texttt{stack\_id} resolve through \texttt{site\_string} and \texttt{stack\_frames} and stay valid until the next \texttt{profiler\_start}.
 
-\texttt{GpuActivity} at \path{Profiler.h:109--126} adds \texttt{correlation}, \texttt{external\_id}, \texttt{thread\_id}, \texttt{cbid}, \texttt{device}, \texttt{stream}, \texttt{kind} (\path{'k'/'m'/'s'/'r'/'d'}), \texttt{bytes}, \texttt{copy\_kind}, \texttt{value}. \path{kNoExt = 0xffffffffffffffff} marks uncorrelated activity.
+\texttt{GpuActivity} at adds \texttt{correlation}, \texttt{external\_id}, \texttt{thread\_id}, \texttt{cbid}, \texttt{device}, \texttt{stream}, \texttt{kind}, \texttt{bytes}, \texttt{copy\_kind}, \texttt{value}. \texttt{kNoExt = 0xffffffffffffffff} marks uncorrelated activity.
 
-\subsubsection{OpRecord fields and lifecycle (\path{Profiler.h:145--173})}
+\subsubsection{OpRecord fields and lifecycle}
 
-\begin{lstlisting}[caption={\path{Profiler.h:145} --- OpRecord handle.}, label=lst:oprecorddecl, style=cppstyle]
+\begin{lstlisting}[caption={OpRecord handle.}, label=lst:oprecorddecl, style=cppstyle]
 struct TENSORPLAY_API OpRecord {
   explicit OpRecord(const char* name, EventKind kind = EventKind::kOp);
   explicit OpRecord(const std::string& name, EventKind kind = EventKind::kUser);
@@ -76,24 +76,24 @@ private:
 };
 \end{lstlisting}
 
-Field semantics, in order of declaration in \path{Profiler.h:162--173}:
+Field semantics, in order of declaration in:
 
 \begin{table}[H]
 \centering
-\caption{OpRecord private state (\path{Profiler.h:166--173}).}
+\caption{OpRecord private state.}
 \label{tab:oprecordstate}
 \small
 \begin{tabular}{lp{9.2cm}}
 \toprule
 Field & Meaning \\
 \midrule
-\texttt{start\_ns\_} & \texttt{steady\_clock} snapshot taken in \texttt{begin()} (\path{Profiler.cpp:303}) \\
-\texttt{slot\_} & Index into \texttt{g\_events} vector; stable because the vector is append-only (\path{Profiler.cpp:333}) \\
-\texttt{live\_} & True iff this instance owns a valid slot; guards \texttt{set\_io\_meta} and \path{\textasciitilde OpRecord} \\
-\texttt{counted\_} & True iff \texttt{g\_inflight} was incremented; guards \texttt{release\_inflight()} \\
+\texttt{start\_ns\_} & \texttt{steady\_clock} snapshot taken in \texttt{begin} \\
+\texttt{slot\_} & Index into \texttt{g\_events} vector; stable because the vector is append-only \\
+\texttt{live\_} & True iff this instance owns a valid slot; guards \texttt{set\_io\_meta} and \texttt{\textasciitilde OpRecord} \\
+\texttt{counted\_} & True iff \texttt{g\_inflight} was incremented; guards \texttt{release\_inflight} \\
 \texttt{nvtx\_open\_} & True iff \texttt{nvtx\_span\_begin} was emitted; closed in destructor even if \texttt{live\_} is false \\
 \texttt{itt\_open\_} & Same for \texttt{itt\_span\_begin} \\
-\texttt{trace\_pushed\_} & True iff \path{cupti\_push\_ext(slot\_)} succeeded; popped in \path{GpuTimerPair::close()} \\
+\texttt{trace\_pushed\_} & True iff \texttt{cupti\_push\_ext(slot\_)} succeeded; popped in \texttt{GpuTimerPair::close} \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -101,25 +101,25 @@ Field & Meaning \\
 Lifecycle, concrete path:line trace:
 
 \begin{enumerate}[leftmargin=1.4em]
-\item Construction calls \texttt{OpRecord::begin()} (\path{p10/src/Profiler.cpp:292--336}). First it checks \texttt{g\_emit\_nvtx} and \texttt{g\_emit\_itt} via relaxed loads (so NVTX/ITT ranges can fire without a profiling session for \texttt{kOp}, as noted at \path{Profiler.cpp:296--299}). Then it checks \texttt{g\_active} (\path{Profiler.cpp:300}); if false, returns immediately with \texttt{live\_=false}: disabled cost is one acquire-load and a predicted not-taken branch.
-\item If active, it does \path{g\_inflight.fetch\_add(1)} (\path{Profiler.cpp:301}), snapshots \texttt{now\_ns()} (\path{Profiler.cpp:303} via \texttt{steady\_clock}), then locks \texttt{g\_mutex}. A second relaxed check of \texttt{g\_active} handles the race where \texttt{profiler\_stop()} cleared the flag between the two checks (\path{Profiler.cpp:305--309}).
-\item It builds an \texttt{Event} (\path{Profiler.cpp:310--324}): \texttt{name} is either the static literal (\texttt{kOp} path, \path{Profiler.cpp:311}) or an arena copy in \texttt{g\_name\_arena} (\path{Profiler.cpp:316--319} for \texttt{kUser}/\texttt{kBackward}). \texttt{tid} comes from \texttt{this\_thread\_id()} (\path{Profiler.cpp:313}, defined at \path{Profiler.cpp:55--61} as a \texttt{thread\_local} hash of \path{std::this\_thread::get\_id()}). If \path{t\_pending\_site.valid} is set, its \path{site\_id/stack\_id} are consumed and cleared (\path{Profiler.cpp:320--324}) so inner composite ops do not inherit the outermost Python site.
-\item If \texttt{nvtx\_on || itt\_on}, it calls \path{nvtx\_span\_begin(e.name)} and \path{itt\_span\_begin(e.name)} (\path{Profiler.cpp:325--331}) and sets \path{nvtx\_open\_/itt\_open\_}. Then \path{g\_events->push\_back(e)} and \texttt{slot\_ = size-1}, \texttt{start\_ns\_ = start}, \texttt{live\_=true} (\path{Profiler.cpp:332--335}).
-\item \texttt{set\_io\_meta()} (\path{Profiler.cpp:365--373}) and \path{set\_output\_bytes()} (\path{Profiler.cpp:375--378}) lock \texttt{g\_mutex} and write into \path{(*g\_events)[slot\_]} if \texttt{live\_} and slot is in bounds. \texttt{set\_shapes()} is a shapes-only overload for generated dispatchers where dtypes stay unset (\path{Profiler.h:159}, \path{Profiler.cpp:381--383}).
-\item Destruction (\path{Profiler.cpp:346--363}) always closes NVTX/ITT first (\path{Profiler.cpp:347--348}), then if \texttt{!live\_} returns. Otherwise it records \texttt{end = now\_ns()}, locks \texttt{g\_mutex}, writes \path{(*g\_events)[slot\_].end\_ns = end} if the slot still exists (dropped silently if \texttt{profiler\_stop()} already cleared the vector), then calls \texttt{release\_inflight()} which does \path{g\_inflight.fetch\_sub(1)} and notifies \texttt{g\_inflight\_cv} when the count reaches zero (\path{Profiler.cpp:44--48}).
+\item Construction calls \texttt{OpRecord::begin}. First it checks \texttt{g\_emit\_nvtx} and \texttt{g\_emit\_itt} via relaxed loads (so NVTX/ITT ranges can fire without a profiling session for \texttt{kOp}, as noted at). Then it checks \texttt{g\_active}; if false, returns immediately with \texttt{live\_=false}: disabled cost is one acquire-load and a predicted not-taken branch.
+\item If active, it does \texttt{g\_inflight.fetch\_add(1)}, snapshots \texttt{now\_ns} ( via \texttt{steady\_clock}), then locks \texttt{g\_mutex}. A second relaxed check of \texttt{g\_active} handles the race where \texttt{profiler\_stop} cleared the flag between the two checks.
+\item It builds an \texttt{Event}: \texttt{name} is either the static literal (\texttt{kOp} path,) or an arena copy in \texttt{g\_name\_arena} ( for \texttt{kUser}/\texttt{kBackward}). \texttt{tid} comes from \texttt{this\_thread\_id} (, defined at as a \texttt{thread\_local} hash of \texttt{std::this\_thread::get\_id}). If \texttt{t\_pending\_site.valid} is set, its \texttt{stack\_id} are consumed and cleared so inner composite ops do not inherit the outermost Python site.
+\item If \texttt{nvtx\_on || itt\_on}, it calls \texttt{nvtx\_span\_begin(e.name)} and \texttt{itt\_span\_begin(e.name)} and sets \texttt{itt\_open\_}. Then \texttt{g\_events->push\_back(e)} and \texttt{slot\_ = size-1}, \texttt{start\_ns\_ = start}, \texttt{live\_=true}.
+\item \texttt{set\_io\_meta} and \texttt{set\_output\_bytes} lock \texttt{g\_mutex} and write into \texttt{(*g\_events)[slot\_]} if \texttt{live\_} and slot is in bounds. \texttt{set\_shapes} is a shapes-only overload for generated dispatchers where dtypes stay unset.
+\item Destruction always closes NVTX/ITT first, then if \texttt{!live\_} returns. Otherwise it records \texttt{end = now\_ns}, locks \texttt{g\_mutex}, writes \texttt{(*g\_events)[slot\_].end\_ns = end} if the slot still exists (dropped silently if \texttt{profiler\_stop} already cleared the vector), then calls \texttt{release\_inflight} which does \texttt{g\_inflight.fetch\_sub(1)} and notifies \texttt{g\_inflight\_cv} when the count reaches zero.
 \end{enumerate}
 
-The \texttt{g\_inflight} protocol is critical for correctness: \texttt{profiler\_stop()} at \path{Profiler.cpp:110--120} first stores \texttt{g\_active=false}, then waits on \texttt{g\_inflight\_cv} until \texttt{g\_inflight==0} before taking \texttt{g\_mutex} and moving \texttt{g\_events} out. This prevents a CUDA or CPU worker from appending \texttt{gpu\_ms} or \texttt{end\_ns} after \texttt{gpu\_resolve\_all} has snapshotted the vector.
+The \texttt{g\_inflight} protocol is critical for correctness: \texttt{profiler\_stop} at first stores \texttt{g\_active=false}, then waits on \texttt{g\_inflight\_cv} until \texttt{g\_inflight==0} before taking \texttt{g\_mutex} and moving \texttt{g\_events} out. This prevents a CUDA or CPU worker from appending \texttt{gpu\_ms} or \texttt{end\_ns} after \texttt{gpu\_resolve\_all} has snapshotted the vector.
 
 \begin{figure}[H]
 \centering
 \begin{tikzpicture}[node distance=0.7cm, font=\small]
-\node[libbox, fill=blue!6, draw=tpblue, minimum width=13cm, minimum height=0.6cm] (cfg) {\path{g\_active / g\_capture\_shapes / g\_capture\_sites} atomics \quad\path{Profiler.h:129--134}};
-\node[libbox, fill=orange!7, draw=tporange, below=0.5cm of cfg, minimum width=6.2cm, minimum height=1.8cm, align=left] (begin) {\textbf{OpRecord::begin()} \path{Profiler.cpp:292}\\ \texttt{now\_ns()} + lock + push Event\\ slot\_ = events.size()-1};
-\node[libbox, fill=orange!7, draw=tporange, right=0.6cm of begin, minimum width=6.2cm, minimum height=1.8cm, align=left] (dtor) {\textbf{\textasciitilde OpRecord} \path{Profiler.cpp:346}\\ \texttt{now\_ns()} + lock + end\_ns\\ \texttt{g\_inflight--}};
-\node[libbox, fill=purple!7, draw=tppurple, below=0.6cm of begin, minimum width=6.2cm, minimum height=1.1cm] (shape) {\path{set\_io\_meta / set\_output\_bytes} \path{Profiler.cpp:365}};
-\node[libbox, fill=green!7, draw=tpgreen, below=0.6cm of dtor, minimum width=6.2cm, minimum height=1.1cm] (gpu) {\path{GpuTimerPair::arm / close} \path{ProfilerGpu.cpp:142}};
-\node[libbox, fill=blue!6, draw=tpblue, below=0.6cm of shape, minimum width=13cm, minimum height=0.7cm] (arena) {\path{g\_events vector + g\_name\_arena + g\_site\_table} \quad guarded by \texttt{g\_mutex} \path{Profiler.cpp:18--35}};
+\node[libbox, fill=blue!6, draw=tpblue, minimum width=13cm, minimum height=0.6cm] (cfg) {\texttt{ g\_capture\_sites} atomics \quad};
+\node[libbox, fill=orange!7, draw=tporange, below=0.5cm of cfg, minimum width=6.2cm, minimum height=1.8cm, align=left] (begin) {\textbf{OpRecord::begin}\\ \texttt{now\_ns} + lock + push Event\\ slot\_ = events.size-1};
+\node[libbox, fill=orange!7, draw=tporange, right=0.6cm of begin, minimum width=6.2cm, minimum height=1.8cm, align=left] (dtor) {\textbf{\textasciitilde OpRecord}\\ \texttt{now\_ns} + lock + end\_ns\\ \texttt{g\_inflight--}};
+\node[libbox, fill=purple!7, draw=tppurple, below=0.6cm of begin, minimum width=6.2cm, minimum height=1.1cm] (shape) {\texttt{ set\_output\_bytes}};
+\node[libbox, fill=green!7, draw=tpgreen, below=0.6cm of dtor, minimum width=6.2cm, minimum height=1.1cm] (gpu) {\texttt{ close}};
+\node[libbox, fill=blue!6, draw=tpblue, below=0.6cm of shape, minimum width=13cm, minimum height=0.7cm] (arena) {\texttt{g\_events vector + g\_name\_arena + g\_site\_table} \quad guarded by \texttt{g\_mutex}};
 \draw[arrow] (cfg) -- (begin);
 \draw[arrow] (cfg) -- (dtor);
 \draw[arrow] (begin) -- (shape);
@@ -127,15 +127,15 @@ The \texttt{g\_inflight} protocol is critical for correctness: \texttt{profiler\
 \draw[arrow] (dtor) -- (gpu);
 \draw[arrow] (gpu) -- (arena);
 \end{tikzpicture}
-\caption{OpRecord lifecycle and storage. Every dispatched op creates exactly one \texttt{OpRecord} at the redispatch funnel; \texttt{g\_inflight} keeps \texttt{profiler\_stop()} from racing the destructor.}
+\caption{OpRecord lifecycle and storage. Every dispatched op creates exactly one \texttt{OpRecord} the redispatch funnel; \texttt{g\_inflight} keeps \texttt{profiler\_stop} from racing the destructor.}
 \label{fig:oprecordlife}
 \end{figure}
 
 \subsection{Storage: Append-Only Vector as Logical RingBuffer}
 
-The original design document calls this component \texttt{RingBuffer} (\path{p10/include/RingBuffer.h} in the draft). The shipped implementation realizes the same logical buffer as an append-only vector guarded by a mutex plus stable slot indices. Concrete state in \path{p10/src/Profiler.cpp:18--45}:
+The original design document calls this component \texttt{RingBuffer} (\texttt{RingBuffer.h} in the draft). The shipped implementation realizes the same logical buffer as an append-only vector guarded by a mutex plus stable slot indices. Concrete state in:
 
-\begin{lstlisting}[caption={\path{Profiler.cpp:18} --- session storage.}, label=lst:profstorage, style=cppstyle]
+\begin{lstlisting}[caption={session storage.}, label=lst:profstorage, style=cppstyle]
 std::mutex g_mutex;
 std::vector<Event>* g_events = nullptr;              // append-only, slots stable
 std::vector<MemEvent>* g_mem_events = nullptr;
@@ -151,11 +151,11 @@ std::mutex g_inflight_mutex;
 std::condition_variable g_inflight_cv;
 \end{lstlisting}
 
-Why a vector and not a fixed ring: slots are referenced by \texttt{OpRecord::slot\_} and by \texttt{GpuTimerPair}'s external correlation id (\texttt{slot\_} cast to \texttt{uint64\_t} at \path{ProfilerGpu.cpp:150}) for the entire session. A ring that overwrites would invalidate those indices. The binding layer drains the vector in \texttt{profiler\_stop()} (\path{Profiler.cpp:122--137}) via \path{std::move(*g\_events)} then \texttt{stable\_sort} by \texttt{start\_ns}. The arena (\texttt{g\_name\_arena}) stays alive until the next \texttt{profiler\_start()} because \texttt{Event::name} for user spans is a borrowed pointer into it (\path{Profiler.cpp:128--132} comment).
+Why a vector and not a fixed ring: slots are referenced by \texttt{OpRecord::slot\_} and by \texttt{GpuTimerPair}'s external correlation id (\texttt{slot\_} cast to \texttt{uint64\_t} at) for the entire session. A ring that overwrites would invalidate those indices. The binding layer drains the vector in \texttt{profiler\_stop} via \texttt{std::move(*g\_events)} then \texttt{stable\_sort} by \texttt{start\_ns}. The arena (\texttt{g\_name\_arena}) stays alive until the next \texttt{profiler\_start} because \texttt{Event::name} for user spans is a borrowed pointer into it ( comment).
 
-Pending Python site handling is thread-local at \path{Profiler.cpp:64--68}:
+Pending Python site handling is thread-local at:
 
-\begin{lstlisting}[caption={\path{Profiler.cpp:64} --- per-thread pending site.}, label=lst:pendingsite, style=cppstyle]
+\begin{lstlisting}[caption={per-thread pending site.}, label=lst:pendingsite, style=cppstyle]
 thread_local struct {
   bool valid = false;
   uint32_t site_id = Event::kNoSite;
@@ -163,46 +163,46 @@ thread_local struct {
 } t_pending_site;
 \end{lstlisting}
 
-\texttt{set\_python\_site()} (\path{Profiler.cpp:140--145}) and \path{set\_python\_stack()} (\path{Profiler.cpp:147--160}) are called by the binding layer while the GIL is held; they intern through \texttt{intern\_site()} (\path{Profiler.cpp:258--271}) and \texttt{intern\_stack()} (\path{Profiler.cpp:162--196}) which dedup via \texttt{g\_site\_index} and \texttt{g\_frame\_index}. The next \texttt{OpRecord::begin()} on that thread consumes the pending site and clears \texttt{valid} (\path{Profiler.cpp:320--324}), so inner composite ops record no site instead of repeating the outermost call.
+\texttt{set\_python\_site} and \texttt{set\_python\_stack} are called by the binding layer while the GIL is held; they intern through \texttt{intern\_site} and \texttt{intern\_stack} which dedup via \texttt{g\_site\_index} and \texttt{g\_frame\_index}. The next \texttt{OpRecord::begin} on that thread consumes the pending site and clears \texttt{valid}, so inner composite ops record no site instead of repeating the outermost call.
 
-User annotations have their own LIFO stack at \path{Profiler.cpp:387--389} (\path{thread\_local std::vector<size\_t> t\_user\_stack}) pushed in \texttt{user\_span\_begin()} (\path{Profiler.cpp:391--411}) and popped in \texttt{user\_span\_end()} (\path{Profiler.cpp:413--421}). Both manipulate \texttt{g\_events} under \texttt{g\_mutex} and emit NVTX around the push/pop (\path{Profiler.cpp:410,415}).
+User annotations have their own LIFO stack at (\texttt{thread\_local std::vector<size\_t> t\_user\_stack}) pushed in \texttt{user\_span\_begin} and popped in \texttt{user\_span\_end}. Both manipulate \texttt{g\_events} under \texttt{g\_mutex} and emit NVTX around the push/pop.
 
 The logical RingBuffer properties that remain: no allocation on the hot path beyond the vector's amortized growth (op events are 64 bytes plus optional shared\_ptr payloads), and the buffer is drained exactly once at session stop.
 
 \subsection{Configuration Atomics: ProfilerConfig Surface}
 
-The white-paper draft refers to \path{ProfilerConfig::is\_enabled()} and fields \texttt{enabled\_}, \texttt{with\_stack\_}, etc. In the shipped header these are free atomics in \texttt{tensorplay::prof} at \path{p10/include/Profiler.h:129--134,212,240,258,281,295}:
+Configuration is a small set of free atomics in namespace \texttt{tensorplay::prof}---one per feature switch:
 
 \begin{table}[H]
 \centering
-\caption{Profiler configuration atomics (\path{p10/include/Profiler.h}). Draft name $\rightarrow$ shipped symbol.}
+\caption{Profiler configuration atomics. Draft name $\rightarrow$ shipped symbol.}
 \label{tab:profatomics}
 \small
 \begin{tabular}{llll}
 \toprule
 Draft \texttt{ProfilerConfig} & Shipped atomic & Lines & Guarded feature \\
 \midrule
-\texttt{enabled\_} & \texttt{g\_active} & \path{Profiler.h:129}, \path{Profiler.cpp:87} & All recording (\path{Profiler.cpp:300}) \\
-\texttt{with\_shapes\_} & \texttt{g\_capture\_shapes} & \path{Profiler.h:131}, \path{Profiler.cpp:88} & \texttt{set\_io\_meta} in redispatch (\path{gen\_api.py:337}) \\
-\texttt{with\_stack\_} & \texttt{g\_capture\_sites} & \path{Profiler.h:133}, \path{Profiler.cpp:89} & \path{set\_python\_site/stack} adoption \\
-\texttt{capture\_memory\_} & \texttt{g\_mem\_capture} & \path{Profiler.h:212}, \path{Profiler.cpp:90} & \path{mem\_record\_alloc/free} (\path{Profiler.cpp:212}) \\
-\texttt{gpu\_timing\_} & \texttt{g\_gpu\_timing} & \path{Profiler.h:241}, \path{ProfilerGpu.cpp:135} & \texttt{cudaEvent} pair per CUDA op \\
-\texttt{gpu\_trace\_} & \texttt{g\_gpu\_trace} & \path{Profiler.h:258}, \path{ProfilerCupti.cpp:358} & CUPTI activity collection \\
-\texttt{emit\_nvtx\_} & \texttt{g\_emit\_nvtx} & \path{Profiler.h:281}, \path{ProfilerNvtx.cpp:94} & \path{nvtxRangePushA/Pop} per span \\
-\texttt{emit\_itt\_} & \texttt{g\_emit\_itt} & \path{Profiler.h:295}, \path{ProfilerItt.cpp:83} & \path{\_\_itt\_task\_begin/end} per span \\
+\texttt{enabled\_} & \texttt{g\_active} &, & All recording \\
+\texttt{with\_shapes\_} & \texttt{g\_capture\_shapes} &, & \texttt{set\_io\_meta} in redispatch \\
+\texttt{with\_stack\_} & \texttt{g\_capture\_sites} &, & \texttt{stack} adoption \\
+\texttt{capture\_memory\_} & \texttt{g\_mem\_capture} &, & \texttt{free} \\
+\texttt{gpu\_timing\_} & \texttt{g\_gpu\_timing} &, & \texttt{cudaEvent} pair per CUDA op \\
+\texttt{gpu\_trace\_} & \texttt{g\_gpu\_trace} &, & CUPTI activity collection \\
+\texttt{emit\_nvtx\_} & \texttt{g\_emit\_nvtx} &, & \texttt{Pop} per span \\
+\texttt{emit\_itt\_} & \texttt{g\_emit\_itt} &, & \texttt{end} per span \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-All are \texttt{std::atomic<bool>} with \path{memory\_order\_release} on stores (\path{Profiler.cpp:95,111--114}, \path{ProfilerGpu.cpp:135} via \path{init.cpp:501}) and \path{memory\_order\_acquire} on the hot-path load (\path{Profiler.cpp:300}). Two additional relaxed checks appear inside the \texttt{g\_mutex} critical section (\path{Profiler.cpp:305,332}) to handle the start/stop race without extra synchronization. The Python entry points in \path{src/bindings/python/init.cpp:495--530} translate \path{profile(record\_shapes,with\_stack,gpu\_timing,gpu\_trace,profile\_memory)} into stores to these atomics plus calls to \texttt{profiler\_start()}, \path{profiler\_start\_with\_shapes()}, \path{profiler\_start\_full()} (\path{Profiler.h:136--138}, \path{Profiler.cpp:92--108}) and \texttt{cupti\_start()}.
+All are \texttt{std::atomic<bool>} with \texttt{memory\_order\_release} on stores (\texttt{Profiler.cpp}, via) and \texttt{memory\_order\_acquire} on the hot-path load. Two additional relaxed checks appear inside the \texttt{g\_mutex} critical section to handle the start/stop race without extra synchronization. The Python entry points in translate \texttt{profile(record\_shapes,with\_stack,gpu\_timing,gpu\_trace,profile\_memory)} into stores to these atomics plus calls to \texttt{profiler\_start}, \texttt{profiler\_start\_with\_shapes}, \texttt{profiler\_start\_full} and \texttt{cupti\_start}.
 
-\texttt{with\_stack} implies \texttt{record\_shapes} in the Python layer (\path{tensorplay/profiler/profiler.py:141--143}); the C++ layer keeps them independent but the binding's \texttt{\_profiler\_start} at \path{init.cpp:521--527} branches to \path{profiler\_start\_full()} when \texttt{with\_stack} is set, which sets both \texttt{g\_capture\_shapes} and \texttt{g\_capture\_sites} to true (\path{Profiler.cpp:104--108}).
+\texttt{with\_stack} implies \texttt{record\_shapes} in the Python layer; the C++ layer keeps them independent but the binding's \texttt{\_profiler\_start} at branches to \texttt{profiler\_start\_full} when \texttt{with\_stack} is set, which sets both \texttt{g\_capture\_shapes} and \texttt{g\_capture\_sites} to true.
 
 \subsection{GpuTimerPair: cudaEvent vs.\ CUPTI Selection}
 
-\path{p10/include/Profiler.h:227--240} declares \texttt{GpuTimerPair} as a pool-backed \texttt{cudaEvent\_t} pair plus CUPTI correlation bracketing:
+ declares \texttt{GpuTimerPair} as a pool-backed \texttt{cudaEvent\_t} pair plus CUPTI correlation bracketing:
 
-\begin{lstlisting}[caption={\path{Profiler.h:227} --- GpuTimerPair handle.}, label=lst:gputimerpair, style=cppstyle]
+\begin{lstlisting}[caption={GpuTimerPair handle.}, label=lst:gputimerpair, style=cppstyle]
 struct TENSORPLAY_API GpuTimerPair {
   explicit GpuTimerPair(OpRecord& rec) : rec_(rec) {}
   ~GpuTimerPair();
@@ -217,11 +217,11 @@ private:
 };
 \end{lstlisting}
 
-The implementation lives in \path{p10/src/ProfilerGpu.cpp}. For \texttt{!USE\_CUDA} it compiles to no-ops at \path{ProfilerGpu.cpp:308--315} so generated code links without \texttt{\#ifdef} noise.
+The implementation lives in \texttt{ProfilerGpu.cpp}. For \texttt{!USE\_CUDA} it compiles to no-ops at so generated code links without \texttt{\#ifdef} noise.
 
-\subsubsection{Selection logic in \texttt{arm()} (\path{ProfilerGpu.cpp:142--163})}
+\subsubsection{Selection logic in \texttt{arm}}
 
-\begin{lstlisting}[caption={\path{ProfilerGpu.cpp:142} --- arm() selection.}, label=lst:gpuarm, style=cppstyle]
+\begin{lstlisting}[caption={arm() selection.}, label=lst:gpuarm, style=cppstyle]
 void GpuTimerPair::arm(const Device& device) {
   if (!rec_.live_ || !device.is_cuda()) return;
   if (g_gpu_trace.load(memory_order_acquire)) {
@@ -244,32 +244,32 @@ void GpuTimerPair::arm(const Device& device) {
 Two orthogonal features interleave:
 
 \begin{itemize}[leftmargin=1.4em]
-\item \textbf{CUPTI correlation} is independent of \texttt{g\_gpu\_timing}. If \texttt{g\_gpu\_trace} is set (\path{Profiler.h:258}), \texttt{arm()} pushes the op's slot as an external correlation id via \texttt{cupti\_push\_ext()} (\path{ProfilerCupti.cpp:549--558}) onto CUPTI's per-thread stack. This happens even when event timing is off, so a \texttt{gpu\_trace} session correlates kernels without paying \texttt{cudaEventRecord} cost.
-\item \textbf{cudaEvent timing} is gated on \texttt{g\_gpu\_timing} (\path{Profiler.h:241}). When on, \texttt{arm()} acquires a pooled \texttt{cudaEvent\_t} via \texttt{acquire\_event()} (\path{ProfilerGpu.cpp:54--74}, recycles from \texttt{g\_pool} under \texttt{g\_gpu\_mutex} or creates with \path{cudaEventCreateWithFlags}), records it on the current stream (\path{cuda::getCurrentCUDAStream()}, \path{ProfilerGpu.cpp:153--155}), and saves device/stream/event.
+\item \textbf{CUPTI correlation} is independent of \texttt{g\_gpu\_timing}. If \texttt{g\_gpu\_trace} is set, \texttt{arm} pushes the op's slot as an external correlation id via \texttt{cupti\_push\_ext} onto CUPTI's per-thread stack. This happens even when event timing is off, so a \texttt{gpu\_trace} session correlates kernels without paying \texttt{cudaEventRecord} cost.
+\item \textbf{cudaEvent timing} is gated on \texttt{g\_gpu\_timing}. When on, \texttt{arm} acquires a pooled \texttt{cudaEvent\_t} via \texttt{acquire\_event} (, recycles from \texttt{g\_pool} under \texttt{g\_gpu\_mutex} or creates with \texttt{cudaEventCreateWithFlags}), records it on the current stream, and saves device/stream/event.
 \end{itemize}
 
-\texttt{close()} at \path{ProfilerGpu.cpp:165--195} follows the same order: first it pops the CUPTI correlation if one was pushed (\path{ProfilerGpu.cpp:166--169} via \texttt{cupti\_pop\_ext()} at \path{ProfilerCupti.cpp:561--567}), then if \texttt{armed\_} records the end event via \texttt{acquire\_event()} and \texttt{cudaEventRecord} (\path{ProfilerGpu.cpp:186--191}), and appends a \texttt{LivePair\{slot,device,stream,start,end\}} to \texttt{g\_live} under \texttt{g\_gpu\_mutex} (\path{ProfilerGpu.cpp:192--195}). Profiling never makes a valid op fail: every CUDA error path destroys the partial event and returns.
+\texttt{close} at follows the same order: first it pops the CUPTI correlation if one was pushed ( via \texttt{cupti\_pop\_ext} at), then if \texttt{armed\_} records the end event via \texttt{acquire\_event} and \texttt{cudaEventRecord}, and appends a \texttt{LivePair\{slot,device,stream,start,end\}} to \texttt{g\_live} under \texttt{g\_gpu\_mutex}. Profiling never makes a valid op fail: every CUDA error path destroys the partial event and returns.
 
-\subsubsection{Resolution at session stop (\path{ProfilerGpu.cpp:198--271})}
+\subsubsection{Resolution at session stop}
 
-\texttt{gpu\_resolve\_all()} is called from the binding's \texttt{\_profiler\_stop} at \path{src/bindings/python/init.cpp:545} after \texttt{profiler\_stop()} but before returning to Python. Key steps (\path{ProfilerGpu.cpp:198--271}):
+\texttt{gpu\_resolve\_all} is called from the binding's \texttt{\_profiler\_stop} at after \texttt{profiler\_stop} but before returning to Python. Key steps:
 
 \begin{enumerate}[leftmargin=1.4em]
-\item Swap \texttt{g\_live} out under the mutex (\path{ProfilerGpu.cpp:204--207}) so dispatch can continue while resolution runs.
-\item Compute a deadline from \path{TP\_PROFILER\_GPU\_TIMEOUT\_MS} (default 5000\,ms, \path{ProfilerGpu.cpp:76--87}).
-\item Build \texttt{last\_on\_stream} map: one wait per stream is sufficient because CUDA orders event records on a stream (\path{ProfilerGpu.cpp:215--220}).
-\item For each stream's last end event, call \texttt{wait\_event()} which polls \texttt{cudaEventQuery} with \texttt{50\,\textmu s} sleeps until success or deadline (\path{ProfilerGpu.cpp:89--98}). This avoids a device-wide synchronize.
-\item Resolve each pair via \path{cudaEventElapsedTime} (\path{ProfilerGpu.cpp:236}). On success, write \path{events[slot].gpu\_ms = ms} and invoke the \texttt{emit} callback (\path{ProfilerGpu.cpp:239--240}). Reusable events go to a local \texttt{reusable} vector; failed pairs are destroyed via \path{destroy\_event\_pair()} which does \texttt{cudaEventDestroy} even for pending events (\path{ProfilerGpu.cpp:123--129}). Pending pairs are intentionally not returned to the pool so the next session starts clean.
-\item Return reusable events to \texttt{g\_pool} under one lock (\path{ProfilerGpu.cpp:260--265}) and restore the caller's device (\path{ProfilerGpu.cpp:269--270}).
+\item Swap \texttt{g\_live} out under the mutex so dispatch can continue while resolution runs.
+\item Compute a deadline from \texttt{TP\_PROFILER\_GPU\_TIMEOUT\_MS} (default 5000\,ms,).
+\item Build \texttt{last\_on\_stream} map: one wait per stream is sufficient because CUDA orders event records on a stream.
+\item For each stream's last end event, call \texttt{wait\_event} which polls \texttt{cudaEventQuery} with \texttt{50\,\textmu s} sleeps until success or deadline. This avoids a device-wide synchronize.
+\item Resolve each pair via \texttt{cudaEventElapsedTime}. On success, write \texttt{events[slot].gpu\_ms = ms} and invoke the \texttt{emit} callback. Reusable events go to a local \texttt{reusable} vector; failed pairs are destroyed via \texttt{destroy\_event\_pair} which does \texttt{cudaEventDestroy} even for pending events. Pending pairs are intentionally not returned to the pool so the next session starts clean.
+\item Return reusable events to \texttt{g\_pool} under one lock and restore the caller's device.
 \end{enumerate}
 
-The pool at \path{ProfilerGpu.cpp:41--52} is \path{unordered\_map<int, deque<cudaEvent\_t>>} keyed by device index, created with \texttt{cudaEventDefault} (timing on). \texttt{gpu\_drain\_pool()} at \path{ProfilerGpu.cpp:273--295} swaps and destroys all pooled and live events, used by the binding at process teardown.
+The pool is \texttt{unordered\_map<int, deque<cudaEvent\_t>>} keyed by device index, created with \texttt{cudaEventDefault} (timing on). \texttt{gpu\_drain\_pool} at swaps and destroys all pooled and live events, used by the binding at process teardown.
 
 \subsection{OptionalCUDAGuard: Correct Device for Multi-GPU Timing}
 
-Generated redispatch helpers must record GPU events on the op's target device even when the calling thread's current device is elsewhere. \path{p10/include/CUDARuntime.h:103--113} declares:
+Generated redispatch helpers must record GPU events on the op's target device even when the calling thread's current device is elsewhere. declares:
 
-\begin{lstlisting}[caption={\path{CUDARuntime.h:103} --- OptionalCUDAGuard.}, label=lst:optionalguard, style=cppstyle]
+\begin{lstlisting}[caption={OptionalCUDAGuard.}, label=lst:optionalguard, style=cppstyle]
 class P10_API OptionalCUDAGuard {
 public:
   explicit OptionalCUDAGuard(const Device& device);
@@ -279,11 +279,11 @@ private:
 };
 \end{lstlisting}
 
-For \texttt{!USE\_CUDA} it is an empty inline at \path{CUDARuntime.h:151--154}. For CUDA builds, the constructor at \path{p10/src/backend/cuda/CUDARuntime.cpp:264--266} does \path{if (device.is\_cuda()) guard\_ = make\_unique<CUDAGuard>(device)}; the destructor restores via \texttt{CUDAGuard} at \path{CUDARuntime.cpp:260--261}. \texttt{CUDAGuard} itself (at \path{CUDARuntime.h:23--35}) saves \texttt{cudaGetDevice}, calls \texttt{cudaSetDevice} to the target, and restores on destruction.
+For \texttt{!USE\_CUDA} it is an empty inline. For CUDA builds, the constructor at does \texttt{if (device.is\_cuda) guard\_ = make\_unique<CUDAGuard>(device)}; the destructor restores via \texttt{CUDAGuard}. \texttt{CUDAGuard} itself (at) saves \texttt{cudaGetDevice}, calls \texttt{cudaSetDevice} to the target, and restores on destruction.
 
-Codegen emits the guard immediately after the profiler handles at \path{tools/codegen/gen\_api.py:395--398}:
+Codegen emits the guard immediately after the profiler handles at:
 
-\begin{lstlisting}[caption={\path{gen\_api.py:395} --- device guard emission.}, label=lst:genguard, style=cppstyle]
+\begin{lstlisting}[caption={device guard emission.}, label=lst:genguard, style=cppstyle]
 #ifdef USE_CUDA
     tensorplay::prof::GpuTimerPair __tp_gpu(__tp_prof_rec);
 #endif
@@ -297,7 +297,7 @@ Codegen emits the guard immediately after the profiler handles at \path{tools/co
 #endif
 \end{lstlisting}
 
-Placement matters: the guard is constructed before \texttt{arm()} so \texttt{acquire\_event} and \texttt{cudaEventRecord} run on the correct device, and \texttt{close()} runs before the guard is destroyed (the guard outlives \texttt{\_\_tp\_gpu} only until the function returns, but \texttt{close()} is called explicitly after dispatch, before destruction, at \path{gen\_api.py:431}). On CPU ops \path{device.is\_cuda()==false} so the guard is a no-op and \texttt{arm()} early-returns at \path{ProfilerGpu.cpp:143}.
+Placement matters: the guard is constructed before \texttt{arm} so \texttt{acquire\_event} and \texttt{cudaEventRecord} run on the correct device, and \texttt{close} runs before the guard is destroyed (the guard outlives \texttt{\_\_tp\_gpu} only until the function returns, but \texttt{close} is called explicitly after dispatch, before destruction, at). On CPU ops \texttt{device.is\_cuda==false} so the guard is a no-op and \texttt{arm} early-returns.
 
 \subsection{Backend Stack: ITT, NVTX and CUPTI}
 
@@ -310,57 +310,57 @@ Placement matters: the guard is constructed before \texttt{arm()} so \texttt{acq
 \toprule
 Backend & File & Mechanism & Runtime library \\
 \midrule
-CPU & \path{p10/src/Profiler.cpp} & \path{chrono::steady\_clock}, vector drain & -- \\
-GPU events & \path{p10/src/ProfilerGpu.cpp} & \path{cudaEventCreate/Record/ElapsedTime} & \texttt{cudart} \\
-CUPTI & \path{p10/src/ProfilerCupti.cpp} & \texttt{cuptiActivityEnable}, buffer callbacks & \path{libcupti.so.13/.12/.11} via \texttt{dlopen} \\
-Stub & \path{p10/src/ProfilerCuptiStub.cpp} & no-op symbols & -- (CPU/HIP builds) \\
-NVTX & \path{p10/src/ProfilerNvtx.cpp} & \path{nvtxRangePushA/Pop} & \path{libnvtx.so} via \texttt{dlopen} \\
-ITT & \path{p10/src/ProfilerItt.cpp} & \path{\_\_itt\_task\_begin/end} & \path{libittnotify.so} via \texttt{dlopen} \\
+CPU & \texttt{Profiler.cpp} & \texttt{chrono::steady\_clock}, vector drain & -- \\
+GPU events & \texttt{ProfilerGpu.cpp} & \texttt{ElapsedTime} & \texttt{cudart} \\
+CUPTI & \texttt{ProfilerCupti.cpp} & \texttt{cuptiActivityEnable}, buffer callbacks & \texttt{.11} via \texttt{dlopen} \\
+Stub & \texttt{ProfilerCuptiStub.cpp} & no-op symbols & -- (CPU/HIP builds) \\
+NVTX & \texttt{ProfilerNvtx.cpp} & \texttt{Pop} & \texttt{libnvtx.so} via \texttt{dlopen} \\
+ITT & \texttt{ProfilerItt.cpp} & \texttt{end} & \texttt{libittnotify.so} via \texttt{dlopen} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\subsubsection{ProfilerNVTX (\path{p10/src/ProfilerNvtx.cpp:1--153})}
+\subsubsection{ProfilerNVTX}
 
-The NVTX bridge is dlopen'd, not linked. \texttt{ensure\_loaded()} at \path{ProfilerNvtx.cpp:38--81} probes \path{libnvtx.so}, \path{libnvtx\_dynamic.so}, \path{libNVToolsExt.so} and \path{libroctx64.so} (ROCm twin, exports \texttt{roctxRangePushA} etc.) via \texttt{dlopen} and \texttt{dlsym} for \texttt{nvtxRangePushA}, \texttt{nvtxRangePop}, \texttt{nvtxMarkA}, \texttt{nvtxRangeStartA}, \texttt{nvtxRangeEnd}. If none loads, \texttt{g\_available=false} and every call degrades. Two entry groups exist:
+The NVTX bridge is dlopen'd, not linked. \texttt{ensure\_loaded} at probes \texttt{libnvtx.so}, \texttt{libnvtx\_dynamic.so}, \texttt{libNVToolsExt.so} and \texttt{libroctx64.so} (ROCm twin, exports \texttt{roctxRangePushA} etc.) via \texttt{dlopen} and \texttt{dlsym} for \texttt{nvtxRangePushA}, \texttt{nvtxRangePop}, \texttt{nvtxMarkA}, \texttt{nvtxRangeStartA}, \texttt{nvtxRangeEnd}. If none loads, \texttt{g\_available=false} and every call degrades. Two entry groups exist:
 
 \begin{itemize}[leftmargin=1.4em]
-\item Raw passthroughs for \path{tensorplay.cuda.nvtx} at \path{ProfilerNvtx.cpp:98--141}: \path{nvtx\_range\_push/pop/mark/range\_start/range\_end}. These throw \texttt{RuntimeError} with ``NVTX functions not installed'' when unavailable, preserving the historical contract.
-\item Internal no-throw hooks at \path{ProfilerNvtx.cpp:144--150}: \path{nvtx\_span\_begin/end} check \path{emitting() = g\_emit\_nvtx.load(relaxed) \&\& usable()} then call \path{nv\_range\_push\_a / nv\_range\_pop}. \texttt{OpRecord::begin()} calls them at \path{Profiler.cpp:327--330} only when \texttt{nvtx\_on} is true (which additionally requires \texttt{kind==kOp}), so user annotations do not emit NVTX unless explicitly requested via the binding's \path{\_profiler\_emit\_nvtx}.
+\item Raw passthroughs for \texttt{tensorplay.cuda.nvtx} \texttt{range\_end}. These throw \texttt{RuntimeError} with ``NVTX functions not installed'' when unavailable, preserving the historical contract.
+\item Internal no-throw hooks \texttt{end} check \texttt{emitting = g\_emit\_nvtx.load(relaxed) \&\& usable} then call \texttt{ nv\_range\_pop}. \texttt{OpRecord::begin} calls them at only when \texttt{nvtx\_on} is true (which additionally requires \texttt{kind==kOp}), so user annotations do not emit NVTX unless explicitly requested via the binding's \texttt{\_profiler\_emit\_nvtx}.
 \end{itemize}
 
-\texttt{g\_emit\_nvtx} is toggled from Python via \path{src/bindings/python/init.cpp:641--643} (\path{\_profiler\_emit\_nvtx}) and from the \texttt{emit\_nvtx} context manager at \path{tensorplay/profiler/profiler.py:409--412}.
+\texttt{g\_emit\_nvtx} is toggled from Python via and from the \texttt{emit\_nvtx} context manager.
 
-\subsubsection{ProfilerItt (\path{p10/src/ProfilerItt.cpp:1--110})}
+\subsubsection{ProfilerItt}
 
-The ITT bridge follows the same dlopen structure as NVTX but targets the Intel VTune/Advisor family. \texttt{ensure\_loaded()} at \path{ProfilerItt.cpp:50--74} dlopens \path{libittnotify.so} then \path{libittnotify64.so}, dlsyms \path{\_\_itt\_domain\_create}, \path{\_\_itt\_string\_handle\_create}, \path{\_\_itt\_task\_begin}, \texttt{\_\_itt\_task\_end}, creates domain \texttt{"tensorplay"} at \path{ProfilerItt.cpp:69}. Internal hooks \path{itt\_span\_begin/end} at \path{ProfilerItt.cpp:99--107} check \path{g\_emit\_itt.load(relaxed)} then call \path{itt\_task\_begin\_name/end} which internally does \path{fn\_string\_handle\_create} + \texttt{fn\_task\_begin} (\path{ProfilerItt.cpp:87--96}). Availability is \texttt{itt\_available()} at \path{ProfilerItt.cpp:85}.
+The ITT bridge follows the same dlopen structure as NVTX but targets the Intel VTune/Advisor family. \texttt{ensure\_loaded} at dlopens \texttt{libittnotify.so} then \texttt{libittnotify64.so}, dlsyms \texttt{\_\_itt\_domain\_create}, \texttt{\_\_itt\_string\_handle\_create}, \texttt{\_\_itt\_task\_begin}, \texttt{\_\_itt\_task\_end}, creates domain \texttt{"tensorplay"}. Internal hooks \texttt{end} at check \texttt{g\_emit\_itt.load(relaxed)} then call \texttt{end} which internally does \texttt{fn\_string\_handle\_create} + \texttt{fn\_task\_begin}. Availability is \texttt{itt\_available}.
 
 Both bridges keep no hard link dependency: a CPU-only wheel imports and runs with all profiler calls becoming no-ops.
 
-\subsubsection{CuptiStub (\path{p10/src/ProfilerCuptiStub.cpp:1--30})}
+\subsubsection{CuptiStub}
 
-For HIP builds (and any re-exported \path{ProfilerCuptiStub.cpp}) the file provides no-op definitions for \texttt{g\_gpu\_trace}, \texttt{cupti\_available()}, \path{cupti\_last\_error()}, \texttt{cupti\_start()}, \path{cupti\_stop\_and\_collect()}, \texttt{cupti\_push\_ext()}, \texttt{cupti\_pop\_ext()}, \texttt{cupti\_version()}. This lets the extension import under \texttt{RTLD\_NOW} without embedding \texttt{\#ifdef} at the ~15 call sites that reference CUPTI symbols (\texttt{ProfilerGpu.cpp}, \texttt{init.cpp}). The CPU build at \path{p10/src/ProfilerCupti.cpp:572--595} provides the same fallback when \texttt{!USE\_CUDA}.
+For HIP builds (and any re-exported \texttt{ProfilerCuptiStub.cpp}) the file provides no-op definitions for \texttt{g\_gpu\_trace}, \texttt{cupti\_available}, \texttt{cupti\_last\_error}, \texttt{cupti\_start}, \texttt{cupti\_stop\_and\_collect}, \texttt{cupti\_push\_ext}, \texttt{cupti\_pop\_ext}, \texttt{cupti\_version}. This lets the extension import under \texttt{RTLD\_NOW} without embedding \texttt{\#ifdef} the ~15 call sites that reference CUPTI symbols (\texttt{ProfilerGpu.cpp}, \texttt{init.cpp}). The CPU build provides the same fallback when \texttt{!USE\_CUDA}.
 
 \subsection{CUPTI in Detail: Subscription, Buffers and correlationId}
 
-\path{p10/src/ProfilerCupti.cpp} is 596 lines for USE\_CUDA and 24 lines for CPU. The design constraint is: \texttt{libcupti} is never a hard dependency; all entry points are dlsym'd from a dlopened handle (\path{ProfilerCupti.cpp:91--103}, \texttt{108,424--466}) and sessions on machines without the toolkit degrade to \path{cupti\_available()==false}.
+\texttt{ProfilerCupti.cpp} is 596 lines for USE\_CUDA and 24 lines for CPU. The design constraint is: \texttt{libcupti} is never a hard dependency; all entry points are dlsym'd from a dlopened handle (, \texttt{108,424--466}) and sessions on machines without the toolkit degrade to \texttt{cupti\_available==false}.
 
 \subsubsection{Entry points and handle}
 
-\texttt{CuptiFns} at \path{ProfilerCupti.cpp:91--103} holds \texttt{GetTimestamp}, \texttt{RegisterCallbacks}, \texttt{Enable}, \texttt{Disable}, \texttt{FlushAll}, \texttt{GetNextRecord}, \texttt{GetNumLostRecords}, \path{PushExternalCorrelationId}, \path{PopExternalCorrelationId}, \texttt{GetCallbackName}, \texttt{GetVersion}. \texttt{g\_cupti\_lib} at \path{ProfilerCupti.cpp:107} is kept for the process lifetime; \texttt{g\_fns} at \path{ProfilerCupti.cpp:106} is set-once after the first successful \texttt{cupti\_start()}, so \path{cupti\_push\_ext/pop} can read it without locking (\path{ProfilerCupti.cpp:549--567} comment).
+\texttt{CuptiFns} holds \texttt{GetTimestamp}, \texttt{RegisterCallbacks}, \texttt{Enable}, \texttt{Disable}, \texttt{FlushAll}, \texttt{GetNextRecord}, \texttt{GetNumLostRecords}, \texttt{PushExternalCorrelationId}, \texttt{PopExternalCorrelationId}, \texttt{GetCallbackName}, \texttt{GetVersion}. \texttt{g\_cupti\_lib} is kept for the process lifetime; \texttt{g\_fns} is set-once after the first successful \texttt{cupti\_start}, so \texttt{pop} can read it without locking ( comment).
 
-\texttt{cupti\_available()} at \path{ProfilerCupti.cpp:360--379} probes without enabling: it first checks \texttt{g\_fns!=nullptr}, then tries \path{dlopen(..., RTLD\_NOLOAD)} for \path{libcupti.so.13/.12/.11/.1/.so}. \texttt{cupti\_version()} at \path{ProfilerCupti.cpp:389--415} dlsyms \texttt{cuptiGetVersion} without enabling any kind, used to stamp trace-export schema metadata.
+\texttt{cupti\_available} at probes without enabling: it first checks \texttt{g\_fns!=nullptr}, then tries \texttt{dlopen(..., RTLD\_NOLOAD)} for \texttt{.so}. \texttt{cupti\_version} at dlsyms \texttt{cuptiGetVersion} without enabling any kind, used to stamp trace-export schema metadata.
 
 \subsubsection{Subscription: kinds and callbacks}
 
-\texttt{cupti\_start()} at \path{ProfilerCupti.cpp:417--507} (called from \path{init.cpp:511} before \texttt{profiler\_start()}) does:
+\texttt{cupti\_start} at (called from before \texttt{profiler\_start}) does:
 
 \begin{enumerate}[leftmargin=1.4em]
-\item Lazily dlopens the library from candidates \path{libcupti.so.13, .12, .11, .1, .so} (\path{ProfilerCupti.cpp:425--431}) and dlsyms mandatory symbols via macro \texttt{TP\_CUPTI\_DLSYM} (\path{ProfilerCupti.cpp:439--465}); optional symbols \texttt{GetNumLostRecords}, \texttt{GetCallbackName}, \texttt{GetVersion} are null-checked.
-\item Calibrates the timebase: \path{g\_fns->GetTimestamp(\&cupti\_now)} then \path{g\_time\_offset\_ns = steady\_now\_ns() - cupti\_now} (\path{ProfilerCupti.cpp:472--476}). Every activity record's \path{start/end} is later offset by this value (\path{ProfilerCupti.cpp:255--289}), mapping CUPTI's epoch onto the op timeline's \texttt{CLOCK\_MONOTONIC}.
-\item Registers buffer callbacks \texttt{buffer\_requested} / \texttt{buffer\_completed} via \texttt{RegisterCallbacks} (\path{ProfilerCupti.cpp:478--485}).
-\item Enables five kinds (\path{ProfilerCupti.cpp:487--504}):
-\begin{lstlisting}[caption={\path{ProfilerCupti.cpp:487} --- enabled kinds.}, label=lst:cuptiKinds, style=cppstyle]
+\item Lazily dlopens the library from candidates \texttt{libcupti.so.13,.12,.11,.1,.so} and dlsyms mandatory symbols via macro \texttt{TP\_CUPTI\_DLSYM}; optional symbols \texttt{GetNumLostRecords}, \texttt{GetCallbackName}, \texttt{GetVersion} are null-checked.
+\item Calibrates the timebase: \texttt{g\_fns->GetTimestamp(\&cupti\_now)} then \texttt{g\_time\_offset\_ns = steady\_now\_ns - cupti\_now}. Every activity record's \texttt{end} is later offset by this value, mapping CUPTI's epoch onto the op timeline's \texttt{CLOCK\_MONOTONIC}.
+\item Registers buffer callbacks \texttt{buffer\_requested} / \texttt{buffer\_completed} via \texttt{RegisterCallbacks}.
+\item Enables five kinds:
+\begin{lstlisting}[caption={enabled kinds.}, label=lst:cuptiKinds, style=cppstyle]
 static const CUpti_ActivityKind kinds[] = {
   CUPTI_ACTIVITY_KIND_MEMCPY,
   CUPTI_ACTIVITY_KIND_MEMSET,
@@ -372,30 +372,34 @@ for (auto k : kinds) rc = g_fns->Enable(k);
 \end{lstlisting}
 \end{enumerate}
 
-\path{disable\_kinds\_locked()} at \path{ProfilerCupti.cpp:341--354} disables the same set in \path{cupti\_stop\_and\_collect()}.
+\texttt{disable\_kinds\_locked} at disables the same set in \texttt{cupti\_stop\_and\_collect}.
 
-Buffer handling uses 1\,MiB pooled buffers at \path{ProfilerCupti.cpp:114--115} (\texttt{kBufSize = 1<<20}):
+Buffer handling uses 1\,MiB pooled buffers at (\texttt{kBufSize = 1<<20}):
 
 \begin{itemize}[leftmargin=1.4em]
-\item \texttt{buffer\_requested} (\path{ProfilerCupti.cpp:224--245}) pops from \texttt{g\_free\_bufs} under \texttt{g\_cupti\_mutex} or does \texttt{malloc(kBufSize)}. On allocation failure it returns \path{nullptr/0} so CUPTI drops records but profiling continues.
-\item \texttt{buffer\_completed} (\path{ProfilerCupti.cpp:331--339}) is called by CUPTI on its completion thread; it locks \texttt{g\_cupti\_mutex}, calls \path{parse\_buffer\_locked} then pushes the buffer to \texttt{g\_free\_bufs} for recycling.
-\item \path{parse\_buffer\_locked} (\path{ProfilerCupti.cpp:247--329}) iterates via \texttt{GetNextRecord}. For \texttt{CONCURRENT\_KERNEL} it picks the revision alias \texttt{ActivityKernel} (Kernel9 on CUDA 12.8+, Kernel8, or Kernel4, \path{ProfilerCupti.cpp:36--42}) and pushes a \texttt{GpuActivity\{'k',\dots\}} with name interned via \path{intern\_name\_locked} (\path{ProfilerCupti.cpp:134--143}). Memcpy/memset/runtime/driver/external-correlation each map to \path{'m'/'s'/'r'/'d'} plus the prefix-field extraction noted at \path{ProfilerCupti.cpp:32--35} (revisions only append trailing fields). Lost records are surfaced via \texttt{GetNumLostRecords} at \path{ProfilerCupti.cpp:321--328}.
+\item \texttt{buffer\_requested} pops from \texttt{g\_free\_bufs} under \texttt{g\_cupti\_mutex} or does \texttt{malloc(kBufSize)}. On allocation failure it returns \texttt{0} so CUPTI drops records but profiling continues.
+\item \texttt{buffer\_completed} is called by CUPTI on its completion thread; it locks \texttt{g\_cupti\_mutex}, calls \texttt{parse\_buffer\_locked} then pushes the buffer to \texttt{g\_free\_bufs} for recycling.
+\item \texttt{parse\_buffer\_locked} iterates via \texttt{GetNextRecord}. For \texttt{CONCURRENT\_KERNEL} it picks the revision alias \texttt{ActivityKernel} (Kernel9 on CUDA 12.8+, Kernel8, or Kernel4,) and pushes a \texttt{GpuActivity\{'k',\dots\}} with name interned via \texttt{intern\_name\_locked}. Memcpy/memset/runtime/driver/external-correlation each map to \texttt{'d'} plus the prefix-field extraction noted at (revisions only append trailing fields). Lost records are surfaced via \texttt{GetNumLostRecords}.
 \end{itemize}
 
 \subsubsection{correlationId and external correlation}
 
-The key join is three-way: op $\rightarrow$ runtime API $\rightarrow$ kernel. \texttt{GpuTimerPair::arm()} pushes the op's slot as \texttt{uint64\_t} external id (\path{ProfilerGpu.cpp:150}); CUPTI emits an \path{EXTERNAL\_CORRELATION} record mapping \path{correlationId $\rightarrow$ externalId} (\path{ProfilerCupti.cpp:309--315}, kind \texttt{CUSTOM0}); kernel/memcpy activity records carry the same \texttt{correlationId} (\path{ProfilerCupti.cpp:254--275}). At snapshot time \path{cupti\_stop\_and\_collect()} flushes via \texttt{FlushAll(0)} (\path{ProfilerCupti.cpp:521}), sleeps 5\,ms to absorb the completion thread (\path{ProfilerCupti.cpp:524}), then joins \texttt{g\_acts} with \texttt{g\_corr2ext} at \path{ProfilerCupti.cpp:529--534}:
+The key join is three-way: op $\rightarrow$ runtime API $\rightarrow$ kernel. \texttt{GpuTimerPair::arm} pushes the op's slot as \texttt{uint64\_t} external id; CUPTI emits an \texttt{EXTERNAL\_CORRELATION} record mapping \texttt{correlationId $\rightarrow$ externalId} (, kind \texttt{CUSTOM0}); kernel/memcpy activity records carry the same \texttt{correlationId}. At snapshot time \texttt{cupti\_stop\_and\_collect} flushes via \texttt{FlushAll(0)}, sleeps 5\,ms to absorb the completion thread, then joins \texttt{g\_acts} with \texttt{g\_corr2ext} at:
 
-\begin{lstlisting}[caption={\path{ProfilerCupti.cpp:529} --- external-id join.}, label=lst:correlationJoin, style=cppstyle]
+\begin{tpnote}[Note: Why the Join Is Deferred to Session Stop]
+The three-way correlation join (op $\rightarrow$ runtime API $\rightarrow$ kernel) is \emph{not} performed as records arrive. CUPTI's completion thread calls \texttt{buffer\_completed} from a foreign thread with no GIL and no guarantee that the matching \texttt{EXTERNAL\_CORRELATION} record has been seen yet---records for one op can arrive in any order across separate buffers. Doing the join lazily at \texttt{cupti\_stop\_and\_collect} sidesteps ordering entirely: by session stop, both sides of the map are complete, so one pass over \texttt{g\_acts} against \texttt{g\_corr2ext} suffices. The 5\,ms sleep at line~524 is the price: the completion thread must be quiesced before the join, so session teardown carries a fixed $\sim$5\,ms latency. The alternative---joining incrementally with per-record locking---would put a recursive mutex on the collector's hot path and still need a final drain pass for late-arriving correlation records.
+\end{tpnote}
+
+\begin{lstlisting}[caption={external-id join.}, label=lst:correlationJoin, style=cppstyle]
 for (auto& a : acts) {
   auto it = g_corr2ext->find(a.correlation);
   if (it != g_corr2ext->end()) a.external_id = it->second;
 }
 \end{lstlisting}
 
-The binding at \path{src/bindings/python/init.cpp:557--569} then folds per-op:
+The binding at then folds per-op:
 
-\begin{lstlisting}[caption={\path{init.cpp:557} --- per-op kernel aggregation.}, label=lst:foldKernels, style=cppstyle]
+\begin{lstlisting}[caption={per-op kernel aggregation.}, label=lst:foldKernels, style=cppstyle]
 for (auto& a : gpu_acts) {
   if (a.kind=='r' || a.kind=='d') continue;
   if (a.external_id==GpuActivity::kNoExt || a.external_id>=events.size()) continue;
@@ -406,13 +410,13 @@ for (auto& a : gpu_acts) {
 }
 \end{lstlisting}
 
-\path{cupti\_push\_ext/pop\_ext} at \path{ProfilerCupti.cpp:549--567} are per-thread stack ops on \path{CUPTI\_EXTERNAL\_CORRELATION\_KIND\_CUSTOM0}; composite inner ops nest correctly because \texttt{GpuTimerPair} brackets each dispatch. Outside a \texttt{gpu\_trace} session the only per-op cost is the \texttt{g\_gpu\_trace} acquire-load in \texttt{GpuTimerPair::arm} (\path{ProfilerCupti.cpp:16--18} comment), same as \texttt{g\_gpu\_timing}.
+\texttt{pop\_ext} are per-thread stack ops on \texttt{CUPTI\_EXTERNAL\_CORRELATION\_KIND\_CUSTOM0}; composite inner ops nest correctly because \texttt{GpuTimerPair} brackets each dispatch. Outside a \texttt{gpu\_trace} session the only per-op cost is the \texttt{g\_gpu\_trace} acquire-load in \texttt{GpuTimerPair::arm} ( comment), same as \texttt{g\_gpu\_timing}.
 
-\subsection{Integration I: Code Generation (\path{tools/codegen/gen\_api.py})}
+\subsection{Integration I: Code Generation}
 
-Every dispatched execution passes through exactly one \path{detail::redispatch\_*} funnel. The generator instruments that funnel so the profiler sees each op once, below autograd and autocast. At \path{tools/codegen/gen\_api.py:321--444} (\texttt{\_emit\_redispatch}):
+Every dispatched execution passes through exactly one \texttt{detail::redispatch\_*} funnel. The generator instruments that funnel so the profiler sees each op once, below autograd and autocast. At (\texttt{\_emit\_redispatch}):
 
-\begin{lstlisting}[caption={\path{gen\_api.py:321} --- redispatch instrumentation.}, label=lst:genredispatch, style=cppstyle]
+\begin{lstlisting}[caption={redispatch instrumentation.}, label=lst:genredispatch, style=cppstyle]
 namespace detail {
 TENSORPLAY_API Tensor redispatch_add(const Tensor& self, const Tensor& other) {
     tensorplay::prof::OpRecord __tp_prof_rec("add");
@@ -451,67 +455,67 @@ TENSORPLAY_API Tensor redispatch_add(const Tensor& self, const Tensor& other) {
 Details:
 
 \begin{itemize}[leftmargin=1.4em]
-\item \texttt{\_\_tp\_prof\_rec} is constructed first (\path{gen\_api.py:327}), before the shape branch, so the acquire-load happens even when shapes are not captured. The shape branch at \path{gen\_api.py:335--389} iterates tensor-like args (\texttt{is\_tensor\_like}, handling \texttt{is\_list}, \texttt{is\_opt}, \texttt{is\_mutable\_ref}) and copies shapes/dtypes only when \texttt{g\_capture\_shapes} is set. The second load inside the branch means the fully-inactive path costs exactly one load.
-\item For mutable ops (\path{gen\_api.py:446--462}) the version bump after \texttt{DispatchStub::call} is preserved; for \texttt{void} returns the shape/output-bytes tail is omitted.
-\item \texttt{set\_output\_bytes} at \path{gen\_api.py:435--443} is gated on the same \texttt{g\_capture\_shapes} load and only for \texttt{Tensor}-returning ops. This value feeds the memory snapshot view (\path{Profiler.h:84--87}) and is distinct from allocator-level \texttt{MemEvent} accounting.
-\item The generator header includes \texttt{Profiler.h} at \path{gen\_api.py:295} and \texttt{CUDARuntime.h} under \texttt{USE\_CUDA} at \path{gen\_api.py:297}, so the emitted TUs compile on both CPU and CUDA builds.
+\item \texttt{\_\_tp\_prof\_rec} is constructed first, before the shape branch, so the acquire-load happens even when shapes are not captured. The shape branch at iterates tensor-like args (\texttt{is\_tensor\_like}, handling \texttt{is\_list}, \texttt{is\_opt}, \texttt{is\_mutable\_ref}) and copies shapes/dtypes only when \texttt{g\_capture\_shapes} is set. The second load inside the branch means the fully-inactive path costs exactly one load.
+\item For mutable ops the version bump after \texttt{DispatchStub::call} is preserved; for \texttt{void} returns the shape/output-bytes tail is omitted.
+\item \texttt{set\_output\_bytes} is gated on the same \texttt{g\_capture\_shapes} load and only for \texttt{Tensor}-returning ops. This value feeds the memory snapshot view and is distinct from allocator-level \texttt{MemEvent} accounting.
+\item The generator header includes \texttt{Profiler.h} at and \texttt{CUDARuntime.h} under \texttt{USE\_CUDA}, so the emitted TUs compile on both CPU and CUDA builds.
 \end{itemize}
 
-The public \texttt{Tensor::add} entry at \path{gen\_api.py:566} delegates to \path{detail::redispatch\_add} after handling vmap, autocast and autograd dispatch keys; thus the same \texttt{OpRecord} covers both eager and graph-captured executions, and fused \texttt{stax} ops that still route through the dispatcher also report bytes.
+The public \texttt{Tensor::add} entry at delegates to \texttt{detail::redispatch\_add} after handling vmap, autocast and autograd dispatch keys; thus the same \texttt{OpRecord} covers both eager and graph-captured executions, and fused \texttt{stax} ops that still route through the dispatcher also report bytes.
 
-\subsection{Integration II: Autograd Engine (\path{tpx/src/Engine.cpp:333})}
+\subsection{Integration II: Autograd Engine}
 
 Two spans are emitted by the engine:
 
-\subsubsection{Per-node backward events (\path{Engine.cpp:367--371})}
+\subsubsection{Per-node backward events}
 
-\begin{lstlisting}[caption={\path{Engine.cpp:367} --- per-node backward span.}, label=lst:backwardspan, style=cppstyle]
+\begin{lstlisting}[caption={per-node backward span.}, label=lst:backwardspan, style=cppstyle]
 std::optional<tensorplay::prof::OpRecord> __tp_node_rec;
 if (tensorplay::prof::g_active.load(std::memory_order_acquire)) {
   __tp_node_rec.emplace(tensorplay::prof::intern_name("backward::" + func->name()));
 }
 \end{lstlisting}
 
-This sits inside \path{Engine::evaluate\_function} at \path{tpx/src/Engine.cpp:333--449}. Hop cost is one atomic load plus, only when active, a virtual \texttt{func->name()} demangle and \texttt{intern\_name} dedup at \path{Profiler.cpp:273--290} (one arena copy per distinct node name). The \texttt{optional<OpRecord>} ensures the destructor runs even on exception paths; \texttt{AnomalyMode} handling at \path{Engine.cpp:434--442} preserves the failure traceback. Node events overlap the parent \texttt{\_\_backward\_\_} span by wall time, visible in chrome traces as children.
+This sits inside \texttt{Engine::evaluate\_function}. Hop cost is one atomic load plus, only when active, a virtual \texttt{func->name} demangle and \texttt{intern\_name} dedup at (one arena copy per distinct node name). The \texttt{optional<OpRecord>} ensures the destructor runs even on exception paths; \texttt{AnomalyMode} handling at preserves the failure traceback. Node events overlap the parent \texttt{\_\_backward\_\_} span by wall time, visible in chrome traces as children.
 
-\subsubsection{Backward-phase span (\path{Engine.cpp:627--628})}
+\subsubsection{Backward-phase span}
 
-\begin{lstlisting}[caption={\path{Engine.cpp:627} --- backward-phase annotation.}, label=lst:backwardsession, style=cppstyle]
+\begin{lstlisting}[caption={backward-phase annotation.}, label=lst:backwardsession, style=cppstyle]
 tensorplay::prof::OpRecord __tp_backward_span("__backward__", tensorplay::prof::EventKind::kBackward);
 \end{lstlisting}
 
-This lives in \texttt{Engine::execute} at \path{tpx/src/Engine.cpp:621--710}. It brackets the entire \texttt{execute()} call, including the \path{while(!graph\_task.is\_completed())} drain at \path{Engine.cpp:684--698} where worker threads may be evaluating device nodes concurrently (device \texttt{ReadyQueue} at \path{tpx/include/Engine.h:37} prioritized by \texttt{sequence\_nr}). The second-order graph created under \texttt{create\_graph} joins because \texttt{GradModeGuard} is active during \texttt{evaluate\_function}.
+This lives in \texttt{Engine::execute}. It brackets the entire \texttt{execute} call, including the \texttt{while(!graph\_task.is\_completed)} drain at where worker threads may be evaluating device nodes concurrently (device \texttt{ReadyQueue} at prioritized by \texttt{sequence\_nr}). The second-order graph created under \texttt{create\_graph} joins because \texttt{GradModeGuard} is active during \texttt{evaluate\_function}.
 
 \subsection{Integration III: Python Binding Drain and Trace Export}
 
-\path{src/bindings/python/init.cpp:495--653} bridges C++ and Python:
+ bridges C++ and Python:
 
 \begin{table}[H]
 \centering
-\caption{Python binding profiler symbols (\path{src/bindings/python/init.cpp}).}
+\caption{Python binding profiler symbols.}
 \label{tab:pyprof}
 \small
 \begin{tabular}{lll}
 \toprule
 Symbol & Lines & Role \\
 \midrule
-\texttt{\_profiler\_start} & \path{init.cpp:495--530} & Stores \path{g\_gpu\_timing/g\_mem\_capture/g\_gpu\_trace}, calls \texttt{cupti\_start()}, then \texttt{profiler\_start*()} \\
-\texttt{\_profiler\_stop} & \path{init.cpp:539--626} & \texttt{profiler\_stop()}, \texttt{gpu\_resolve\_all}, \path{cupti\_stop\_and\_collect}, \texttt{mem\_take}, tuple conversion \\
-\path{\_profiler\_is\_active} & \path{init.cpp:627--631} & Single acquire-load for Python-side span emission \\
-\path{\_profiler\_user\_begin/end} & \path{init.cpp:632--640} & Capture Python site then \path{user\_span\_begin/end} \\
-\path{\_profiler\_emit\_nvtx/itt} & \path{init.cpp:641--648} & Store to \path{g\_emit\_nvtx/g\_emit\_itt} \\
-\path{\_profiler\_cupti\_version} & \path{init.cpp:650--652} & Stamp trace schema metadata \\
+\texttt{\_profiler\_start} & & Stores \texttt{g\_gpu\_trace}, calls \texttt{cupti\_start}, then \texttt{profiler\_start*} \\
+\texttt{\_profiler\_stop} & & \texttt{profiler\_stop}, \texttt{gpu\_resolve\_all}, \texttt{cupti\_stop\_and\_collect}, \texttt{mem\_take}, tuple conversion \\
+\texttt{\_profiler\_is\_active} & & Single acquire-load for Python-side span emission \\
+\texttt{end} & & Capture Python site then \texttt{end} \\
+\texttt{itt} & & Store to \texttt{g\_emit\_itt} \\
+\texttt{\_profiler\_cupti\_version} & & Stamp trace schema metadata \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\texttt{\_profiler\_start} at \path{init.cpp:495--530} stores \texttt{g\_gpu\_timing} first (line 501) so a later CPU profile does not arm events for CPU redispatches, then if \texttt{gpu\_trace} arms CUPTI before the first op (line 509--519) and warns via \texttt{PyErr\_WarnEx} if unavailable. It then branches to \path{profiler\_start\_full / profiler\_start\_with\_shapes / profiler\_start} (lines 521--527).
+\texttt{\_profiler\_start} at stores \texttt{g\_gpu\_timing} first (line 501) so a later CPU profile does not arm events for CPU redispatches, then if \texttt{gpu\_trace} arms CUPTI before the first op (line 509--519) and warns via \texttt{PyErr\_WarnEx} if unavailable. It then branches to \texttt{ profiler\_start} (lines 521--527).
 
-\texttt{\_profiler\_stop} at \path{init.cpp:539--626} releases the GIL around the stop work (line 540), resolves GPU pairs with a bounded wait (line 545), exchanges \texttt{g\_gpu\_trace} atomically (line 550), collects CUPTI activities, folds them per-op (lines 557--569), takes mem events (lines 571--572), reacquires the GIL, then converts each \texttt{Event} to an 13-tuple \path{(name,kind,start\_ns,end\_ns,tid,shapes,dtypes,site,gpu\_ms,out\_bytes,stack,kernel\_count,flops)} at lines 574--610. FLOPs are computed once per event off the hot path via \texttt{estimate\_flops} at \path{Profiler.cpp:514--555} (matrix multiply counted as two ops, conv approximated with stride 1 / padding 0).
+\texttt{\_profiler\_stop} at releases the GIL around the stop work (line 540), resolves GPU pairs with a bounded wait (line 545), exchanges \texttt{g\_gpu\_trace} atomically (line 550), collects CUPTI activities, folds them per-op (lines 557--569), takes mem events (lines 571--572), reacquires the GIL, then converts each \texttt{Event} to an 13-tuple \texttt{(name,kind,start\_ns,end\_ns,tid,shapes,dtypes,site,gpu\_ms,out\_bytes,stack,kernel\_count,flops)} at lines 574--610. FLOPs are computed once per event off the hot path via \texttt{estimate\_flops} at (matrix multiply counted as two ops, conv approximated with stride 1 / padding 0).
 
-The high-level Python surface at \path{tensorplay/profiler/profiler.py:114--366} (\texttt{class profile}) orchestrates sessions:
+The high-level Python surface at (\texttt{class profile}) orchestrates sessions:
 
-\begin{lstlisting}[caption={\path{profiler.py:211} --- session start/stop.}, label=lst:profilerpy, style=pystyle]
+\begin{lstlisting}[caption={session start/stop.}, label=lst:profilerpy, style=pystyle]
 def _start_session(self):
     _C._profiler_start(self.record_shapes, self.with_stack, self.gpu_timing, self.gpu_trace, self.profile_memory)
     self._recording = True
@@ -525,106 +529,51 @@ def _stop_session(self):
     self._recording = False
 \end{lstlisting}
 
-\texttt{profile} supports a \texttt{schedule} callback at \path{profiler.py:250--269} (with \path{ProfilerAction RECORD / RECORD\_AND\_SAVE / NONE} at \path{tensorplay/profiler/\_schedule.py}) and module tracing via patching \texttt{Module.\_\_call\_\_} when \texttt{with\_modules=True} (\path{profiler.py:75--112} emits \path{\_profiler\_user\_begin("nn.Module: ...")}). Chrome trace export at \path{profiler.py:325--335} delegates to \path{tensorplay/profiler/\_chrome\_trace\_export.py:105} which merges CPU and GPU events by \texttt{correlationId} and applies the CUPTI offset.
+\texttt{profile} supports a \texttt{schedule} callback at (with \texttt{ NONE} at \texttt{\_schedule.py}) and module tracing via patching \texttt{Module.\_\_call\_\_} when \texttt{with\_modules=True} ( emits \texttt{\_profiler\_user\_begin("nn.Module:...")}). Chrome trace export at delegates to which merges CPU and GPU events by \texttt{correlationId} and applies the CUPTI offset.
 
 \subsection{Overhead Analysis with Numbers}
 
 \begin{table}[H]
 \centering
-\caption{Profiler overhead budget. Measured on quiet host, mid-range x86, single thread, \path{tools/bench\_profiler\_overhead.py}.}
+\caption{Profiler overhead budget. Measured on quiet host, mid-range x86, single thread, \texttt{bench\_profiler\_overhead.py}.}
 \label{tab:profoverhead}
 \small
 \begin{tabular}{llll}
 \toprule
 Mode & What runs per op & Cost & Notes \\
 \midrule
-Disabled & \path{g\_active.load(acquire)} + not-taken branch & $\approx$ 2 cycles ($\sim$0.6\,ns at 3.5\,GHz) & One load is the only hot-path cost (\path{Profiler.cpp:300}) \\
-CPU enabled (no shapes) & \path{rdtsc/chrono::steady\_clock} + vector push & $\approx$ 30\,ns & \texttt{now\_ns()} at \path{Profiler.cpp:50--53} + \texttt{g\_mutex} + \texttt{push\_back} \\
-CPU + shapes & Above + shape/dtype vector copy & $\approx$ 80--120\,ns & Second \texttt{g\_capture\_shapes} load at \path{gen\_api.py:337} + \texttt{set\_io\_meta} \\
-CPU + with\_stack & Above + site intern & $\approx$ 150--300\,ns & \texttt{intern\_site} at \path{Profiler.cpp:258--271} + \texttt{t\_pending\_site} adopt \\
-GPU events (cudaEvent) & Two \texttt{cudaEventRecord} per op & $\approx$ 5\,\textmu s & Hence opt-in via \texttt{gpu\_timing} (\path{Profiler.h:241}); not for fine-grained kernels \\
-CUPTI trace & CUPTI buffer fill + parse on completion thread & $\approx$ 1--3\,\textmu s amortized & 1\,MiB buffers at \path{ProfilerCupti.cpp:114}; parse at \path{ProfilerCupti.cpp:247} \\
-NVTX/ITT & One range push/pop & $\approx$ 40--60\,ns when emitting & Guarded by \path{g\_emit\_nvtx/itt} relaxed load (\path{ProfilerNvtx.cpp:89}) \\
+Disabled & \texttt{g\_active.load(acquire)} + not-taken branch & $\approx$ 2 cycles ($\sim$0.6\,ns at 3.5\,GHz) & One load is the only hot-path cost \\
+CPU enabled (no shapes) & \texttt{chrono::steady\_clock} + vector push & $\approx$ 30\,ns & \texttt{now\_ns} at + \texttt{g\_mutex} + \texttt{push\_back} \\
+CPU + shapes & Above + shape/dtype vector copy & $\approx$ 80--120\,ns & Second \texttt{g\_capture\_shapes} load at + \texttt{set\_io\_meta} \\
+CPU + with\_stack & Above + site intern & $\approx$ 150--300\,ns & \texttt{intern\_site} at + \texttt{t\_pending\_site} adopt \\
+GPU events (cudaEvent) & Two \texttt{cudaEventRecord} per op & $\approx$ 5\,\textmu s & Hence opt-in via \texttt{gpu\_timing}; not for fine-grained kernels \\
+CUPTI trace & CUPTI buffer fill + parse on completion thread & $\approx$ 1--3\,\textmu s amortized & 1\,MiB buffers; parse at \\
+NVTX/ITT & One range push/pop & $\approx$ 40--60\,ns when emitting & Guarded by \texttt{itt} relaxed load \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \subsubsection{Why disabled is 2 cycles}
 
-\texttt{OpRecord::begin()} at \path{Profiler.cpp:300} is one \path{memory\_order\_acquire} load of a static atomic, inlined to a \texttt{mov} + \texttt{cmp} + predicted not-taken branch on x86. No thread-local beyond the load, no call. The shape/site second loads sit inside the \texttt{g\_active} true-branch at \path{gen\_api.py:336} and \path{Profiler.cpp:297--299}, so they add zero cycles when disabled. This matches \path{GradMode::is\_enabled()} and \path{InferenceMode::is\_enabled()} guards already emitted around every op.
+\texttt{OpRecord::begin} is one \texttt{memory\_order\_acquire} load of a static atomic, inlined to a \texttt{mov} + \texttt{cmp} + predicted not-taken branch on x86. No thread-local beyond the load, no call. The shape/site second loads sit inside the \texttt{g\_active} true-branch at and, so they add zero cycles when disabled. This matches \texttt{GradMode::is\_enabled} and \texttt{InferenceMode::is\_enabled} guards already emitted around every op.
 
 \subsubsection{Why CPU is 30\,ns}
 
-\texttt{now\_ns()} at \path{Profiler.cpp:50--53} is \path{chrono::steady\_clock::now().time\_since\_epoch().count()}, which on Linux is a \path{clock\_gettime(CLOCK\_MONOTONIC)} vdso call ($\sim$15\,ns). The remaining $\sim$15\,ns is the \texttt{g\_mutex} uncontended lock plus \path{g\_events->push\_back} amortized allocation. The measured p50 over 200 iterations of \texttt{add} on 256$\times$512 at \path{tools/bench\_profiler\_overhead.py:64--89} (single-thread pinned, \path{--threads 1 --framework tp}) is 28--35\,ns added latency.
+\texttt{now\_ns} is \texttt{chrono::steady\_clock::now.time\_since\_epoch.count}, which on Linux is a \texttt{clock\_gettime(CLOCK\_MONOTONIC)} vdso call ($\sim$15\,ns). The remaining $\sim$15\,ns is the \texttt{g\_mutex} uncontended lock plus \texttt{g\_events->push\_back} amortized allocation. The measured p50 over 200 iterations of \texttt{add} on 256$\times$512 at (single-thread pinned, \texttt{--threads 1 --framework tp}) is 28--35\,ns added latency.
 
 \subsubsection{Why GPU events are 5\,\textmu s}
 
-\texttt{cudaEventRecord} is a driver call that enqueues a marker on the stream; the per-op pair costs two records plus \texttt{acquire\_event} pool lookup at \path{ProfilerGpu.cpp:54--74}. On the sm\_89 remote box cited at \path{ProfilerGpu.cpp:15}, the measured round-trip is 4.2--6.1\,\textmu s. This is why GPU timing is not enabled by default: it dominates kernels shorter than $\sim$10\,\textmu s. For sub-10\,\textmu s kernels, CUPTI's \texttt{CONCURRENT\_KERNEL} activity at \path{ProfilerCupti.cpp:251--261} is preferable because it timestamps on the GPU and reports asynchronously without per-op driver calls.
+\texttt{cudaEventRecord} is a driver call that enqueues a marker on the stream; the per-op pair costs two records plus \texttt{acquire\_event} pool lookup. On the sm\_89 remote box cited, the measured round-trip is 4.2--6.1\,\textmu s. This is why GPU timing is not enabled by default: it dominates kernels shorter than $\sim$10\,\textmu s. For sub-10\,\textmu s kernels, \ac{cupti}'s \texttt{CONCURRENT\_KERNEL} activity is preferable because it timestamps on the GPU and reports asynchronously without per-op driver calls.
 
-\subsubsection{Reproducing the numbers}
+\begin{tpinsight}[Insight: One Atomic Separates ``Free'' from ``5\,\textmu s per Op'']
+The profiler's cost model is not a smooth dial---it is a cliff structure with exactly three plateaus, and which plateau you occupy is decided by a single \texttt{atomic<bool>} load. Disabled costs $\sim$0.6\,ns because the acquire load inlines to one \texttt{cmp} against a cache line that is never written. Enabled-CPU costs $\sim$30\,ns because the true-branch pays a vdso clock read plus an uncontended mutex. Enabled-GPU costs $\sim$5\,\textmu s because each op arms two \texttt{cudaEventRecord} driver calls. The design lesson: put the \emph{cheapest possible test} in front of the most expensive mechanism, and make the test's false branch contain zero other loads. The shape/site captures obey the same discipline---their guards sit strictly \emph{inside} the \texttt{g\_active} true-branch, so a disabled session never touches their cache lines at all.
+\end{tpinsight}
 
-\begin{lstlisting}[caption={Reproducing overhead numbers.}, label=lst:overheadbench, style=pystyle]
-# pin to one thread, isolate BLAS pools, avoid cross-library contention
-python3 tools/bench_profiler_overhead.py --framework tp --threads 1 --shapes 256x512 --iters 200 --rounds 3
-python3 tools/bench_profiler_overhead.py --framework tp --threads 1 --record-shapes --shapes 256x512
+With \texttt{--threads 1} the CPU overhead column should be 8--14\% on 256$\times$512 matmul (base $\sim$12\,\textmu s, profiled $\sim$13.2\,\textmu s), shrinking to $<$2\% on larger shapes where kernel time dominates.
 
-# raw signals: confirm atomics and event paths
-grep -n "g_active.load" p10/src/Profiler.cpp
-grep -n "acquire_event\|cudaEventRecord" p10/src/ProfilerGpu.cpp
-grep -n "cuptiActivityEnable" p10/src/ProfilerCupti.cpp
-\end{lstlisting}
+\subsection{An Interactive Tour}
 
-Expected output columns are \path{base us / profiled us / overhead\% / events / unique ops} at \path{bench\_profiler\_overhead.py:150--172}. With \texttt{--threads 1} the CPU overhead column should be 8--14\% on 256$\times$512 matmul (base $\sim$12\,\textmu s, profiled $\sim$13.2\,\textmu s), shrinking to $<$2\% on larger shapes where kernel time dominates.
-
-\subsection{Verification Commands}
-
-\begin{lstlisting}[caption={Profiler checks: compile-time, link-time and runtime.}, label=lst:verifyprof, style=pystyle]
-# 1. OpRecord / GpuTimerPair / Event are in the public header
-grep -n "struct Event\|struct OpRecord\|struct GpuTimerPair\|g_active\|g_gpu_timing" p10/include/Profiler.h | head -n 30
-
-# 2. Hot-path guards are single atomic loads (no function call when disabled)
-grep -n "g_active.load\|g_capture_shapes.load\|g_gpu_timing.load\|g_gpu_trace.load" p10/src/Profiler.cpp p10/src/ProfilerGpu.cpp tools/codegen/gen_api.py | head -n 20
-
-# 3. CUPTI subscription and correlationId plumbing
-grep -n "cuptiActivityEnable\|cuptiActivityRegisterCallbacks\|PushExternalCorrelationId\|correlationId\|g_corr2ext\|EXTERNAL_CORRELATION" p10/src/ProfilerCupti.cpp | head -n 30
-grep -n "cupti_push_ext\|cupti_pop_ext" p10/src/ProfilerGpu.cpp p10/include/Profiler.h | head
-
-# 4. Stub keeps CPU/HIP builds link-clean
-grep -n "cupti_available\|cupti_start" p10/src/ProfilerCuptiStub.cpp | head
-
-# 5. ITT / NVTX bridges are dlopen'd (no hard link dep)
-grep -n "dlopen.*libnvtx\|dlopen.*libittnotify\|nvtxRangePushA\|__itt_task_begin" p10/src/ProfilerNvtx.cpp p10/src/ProfilerItt.cpp | head -n 20
-
-# 6. OptionalCUDAGuard ensures correct device before arm()
-grep -n "class OptionalCUDAGuard" p10/include/CUDARuntime.h -A 8
-grep -n "OptionalCUDAGuard device_guard" tools/codegen/gen_api.py p10/src/backend/cuda/CUDARuntime.cpp | head
-
-# 7. Codegen injects OpRecord, sets output bytes, arms GPU pair
-grep -n "OpRecord\|GpuTimerPair\|set_output_bytes\|set_io_meta\|OptionalCUDAGuard\|DispatchStub" tools/codegen/gen_api.py | head -n 30
-python3 -m py_compile tools/codegen/gen_api.py && echo "gen_api.py syntax OK"
-
-# 8. Engine emits per-node and backward-phase spans
-grep -n "OpRecord.*backward\|g_active.load\|intern_name" tpx/src/Engine.cpp -n | head -n 20
-grep -n "evaluate_function" tpx/include/Engine.h -n
-
-# 9. Python binding drains and merges (no device-wide synchronize)
-grep -n "_profiler_start\|_profiler_stop\|gpu_resolve_all\|cupti_stop_and_collect" src/bindings/python/init.cpp -n | head -n 20
-
-# 10. Overhead benchmark (quiet machine, no parallel build)
-TP_PROFILER_GPU_TIMEOUT_MS=5000 python3 tools/bench_profiler_overhead.py --framework tp --threads 1 --shapes 256x512 --iters 200 --rounds 3 2>&1 | tail -n 20
-
-# 11. White-paper compiles (no missing packages beyond the main.tex preamble)
-pdflatex -interaction=nonstopmode -halt-on-error docs/whitepaper/main.tex 2>&1 | tail -n 20
-# or
-latexmk -pdf docs/whitepaper/main.tex 2>&1 | tail -n 20
-ls -lh docs/whitepaper/main.pdf
-
-# 12. No upward include (p10 must not depend on tpx/Python)
-! grep -rn "tpx\|stax" p10/include/Profiler.h | wc -l  # expect 0
-! grep -rn "Python.h" p10/include/Profiler.h | wc -l  # expect 0
-\end{lstlisting}
-
-\begin{lstlisting}[caption={Interactive smoke test (no GPU required).}, label=lst:smoketest, style=pystyle]
+\begin{lstlisting}[caption={Profiling a few ops from Python (no GPU required).}, label=lst:smoketest, style=pystyle]
 python3 - << 'PY'
 import tensorplay as tp
 from tensorplay.profiler import profile, ProfilerActivity
@@ -657,21 +606,19 @@ cat /tmp/tp_trace.json | python3 -m json.tool | head -n 40
 \subsection{Invariants and Edge Cases}
 
 \begin{itemize}[leftmargin=1.2em]
-\item \textbf{A1: Exactly one OpRecord per dispatched op.} The redispatch funnel at \path{tools/codegen/gen\_api.py:327} is the single instrumentation site below autograd/autocast/vmap. Public \texttt{Tensor::add} at \path{gen\_api.py:566} never instruments directly; it delegates to \path{detail::redispatch\_add}. Custom operators that call \path{Dispatcher::singleton().findHandle} without going through codegen must emit their own \texttt{OpRecord} or be invisible (custom-op wrapper at \path{tensorplay/library.py} does so when \path{\_note\_profiling\_start} is live, \path{profiler.py:222,228}).
-\item \textbf{A2: Slots stay stable until next start.} \texttt{g\_events} is cleared only in \path{clear\_session\_locked()} at \path{Profiler.cpp:70--83} (called by \texttt{profiler\_start}) and moved out in \texttt{profiler\_stop} at \path{Profiler.cpp:122--126}; the arena \texttt{g\_name\_arena} is cleared there too but not after the per-slot move, preserving borrowed pointers until the binding copies them at \path{init.cpp:605--609}.
-\item \textbf{A3: GPU pair stranded on exception is destroyed, not leaked.} If \texttt{DispatchStub::call} throws before \texttt{close()}, \path{GpuTimerPair::\textasciitilde GpuTimerPair} at \path{ProfilerGpu.cpp:137--140} calls \texttt{close()} which still does \texttt{cupti\_pop\_ext} (\path{ProfilerGpu.cpp:166--169}) and destroys any acquired start event when \texttt{!rec\_.live\_} (\path{ProfilerGpu.cpp:182--185}).
-\item \textbf{A4: Stop waits for inflight.} \texttt{profiler\_stop} at \path{Profiler.cpp:115--120} waits on \texttt{g\_inflight\_cv} before swapping \texttt{g\_events}, so \texttt{gpu\_resolve\_all} at \path{init.cpp:545} never races a still-unwinding \path{\textasciitilde OpRecord} that would write \texttt{end\_ns} after the snapshot.
-\item \textbf{A5: CUPTI FlushAll runs without g\_cupti\_mutex.} At \path{ProfilerCupti.cpp:514--521} the mutex is released before \texttt{FlushAll(0)} because \texttt{buffer\_completed} takes the same mutex to parse and recycle buffers; holding it would deadlock.
-\item \textbf{A6: No hard CUPTI/NVTX/ITT link.} All three bridges dlopen at \path{ProfilerCupti.cpp:425}, \path{ProfilerNvtx.cpp:64}, \path{ProfilerItt.cpp:55}. Missing libraries degrade to \path{cupti\_available()==false} / \path{nvtx\_available()==false} / \path{itt\_available()==false} with a warning, never a link error. The stub at \path{ProfilerCuptiStub.cpp} provides the same for HIP.
+\item \textbf{A1: Exactly one OpRecord per dispatched op.} The redispatch funnel is the single instrumentation site below autograd/autocast/vmap. Public \texttt{Tensor::add} never instruments directly; it delegates to \texttt{detail::redispatch\_add}. Custom operators that call \texttt{Dispatcher::singleton.findHandle} without going through codegen must emit their own \texttt{OpRecord} or be invisible (custom-op wrapper at \texttt{library.py} does so when \texttt{\_note\_profiling\_start} is live, \texttt{profiler.py}).
+\item \textbf{A2: Slots stay stable until next start.} \texttt{g\_events} is cleared only by session start and moved out by session stop; the name arena is cleared there too but not after the per-slot move, preserving borrowed pointers until the binding copies them.
+\item \textbf{A3: GPU pair stranded on exception is destroyed, not leaked.} If \texttt{DispatchStub::call} throws before \texttt{close}, the \texttt{GpuTimerPair} destructor calls \texttt{close} which still does \texttt{cupti\_pop\_ext} and destroys any acquired start event when \texttt{!rec\_.live\_}.
+\item \textbf{A4: Stop waits for inflight.} Session stop waits on \texttt{g\_inflight\_cv} before swapping \texttt{g\_events}, so \texttt{gpu\_resolve\_all} never races a still-unwinding \texttt{\textasciitilde OpRecord} that would write \texttt{end\_ns} after the snapshot.
+\item \textbf{A5: CUPTI FlushAll runs without the CUPTI mutex.} The mutex is released before \texttt{FlushAll(0)} because \texttt{buffer\_completed} takes the same mutex to parse and recycle buffers; holding it would deadlock.
+\item \textbf{A6: No hard CUPTI/NVTX/ITT link.} All three bridges dlopen,. Missing libraries degrade to \texttt{cupti\_available==false} / \texttt{nvtx\_available==false} / \texttt{itt\_available==false} with a warning, never a link error. A stub provides the same interface for HIP builds.
 \end{itemize}
 
-\subsection{Compilation and Length Notes}
+\subsection{Design Trade-offs}
+\label{sec:profiler:tradeoffs}
 
-This section is $\sim$670 lines of source (\path{docs/whitepaper/sections/04-profiler.tex}, $>$350 required) and $\sim$5200 words ($>$3000 required), contributing $\sim$10 pages in isolation and $\sim$12 pages within the full white paper (with listings and figure). It uses only packages declared in \path{docs/whitepaper/main.tex:6--25}: \path{lmodern, amsmath, booktabs, tikz, listings, hyperref, geometry, microtype}. Fig.~\ref{fig:oprecordlife} is native TikZ; no external graphics are required. To compile incrementally:
+\textbf{Single global session vs.\ per-thread contexts.} Thread-local profiler state would allow concurrent independent sessions and remove the \texttt{g\_mutex} on the event path. Rejected: cross-thread attribution (which op spawned which GPU kernel) becomes ambiguous, and the whole-stack tools TensorPlay bridges to (Nsight via NVTX, VTune via ITT) are global-session by nature. The global \texttt{g\_events} at keeps the join trivial the price of one uncontended lock, $\sim$15\,ns of the 30\,ns enabled cost.
 
-\begin{lstlisting}[caption={Minimal LaTeX check for this section.}, label=lst:latexcheck, style=pystyle]
-pdflatex -interaction=nonstopmode -halt-on-error main.tex
-# check page count contributed by profiler
-grep -c "\\\\subsection\|\\\\subsubsection" sections/04-profiler.tex
-wc -l sections/04-profiler.tex && wc -w sections/04-profiler.tex
-\end{lstlisting}
+\textbf{\texttt{cudaEvent} pairs vs.\ CUPTI-only timing.} CUPTI \texttt{CONCURRENT\_KERNEL} activity alone could serve all GPU timing, making \texttt{GpuTimerPair} unnecessary. Rejected: CUPTI records only kernels and memcpys---user-level gaps, allocator stalls, and non-kernel work are invisible, and its asynchronous buffer completion makes per-op wall-clock attribution fuzzy. The event pair at measures stream time directly, including gaps, at a known constant $\sim$5\,\textmu s per op. The two are complementary: events for op-relative timing, CUPTI for kernel-level detail when sub-10\,\textmu s resolution matters.
+
+\textbf{dlopen bridges vs.\ hard link dependencies.} Linking CUPTI/NVTX/ITT directly would remove all the availability atomics and stub files. Rejected: any of the three can be absent on a user box (CPU-only container, stripped driver, no VTune install), and a hard link would make \texttt{import tensorplay} fail there. The dlopen-at-first-use design degrades to ``feature off, warning printed,'' matching A6.
