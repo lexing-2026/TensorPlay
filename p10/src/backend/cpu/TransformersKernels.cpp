@@ -5,8 +5,6 @@
 // row softmax with runtime-dispatched libmvec vector exp (AVX-512 16-wide ->
 // AVX2 8-wide -> scalar).  f64 keeps a serial double reference oracle.
 
-#include <immintrin.h>
-
 #include <algorithm>
 #include <type_traits>
 #include <vector>
