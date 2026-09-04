@@ -108,22 +108,23 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq libopenblas-dev 1>/dev/null
 
-      # Windows gloo requires a system libuv; provision the reference
-      # project's prebuilt tarball into the runner's Python prefix and
-      # export libuv_ROOT for its find_library call.
+      # Windows gloo requires a system libuv; provision a prebuilt libuv
+      # tarball into the runner's Python prefix and export libuv_ROOT for
+      # its find_library call. The Windows Python prints its prefix as a
+      # drive path; convert it to an MSYS path before handing it to the
+      # shell tools (tar would otherwise read "C:\..." as a remote spec).
       - name: Install libuv (windows)
         if: ${{ runner.os == 'Windows' }}
         shell: bash
         run: |
           set -euo pipefail
-          prefix="$(python -c 'import sys, pathlib; print(pathlib.Path(sys.prefix))')"
+          prefix="$(cygpath -u "$(python -c 'import sys, pathlib; print(pathlib.Path(sys.prefix))')")"
           curl -sL -o libuv.tar.bz2 https://s3.amazonaws.com/ossci-windows/libuv-1.40.0-h8ffe710_0.tar.bz2
           7z x -aoa libuv.tar.bz2 -o"$PWD" >/dev/null
           mkdir -p "$prefix"
           tar -xf libuv.tar -C "$prefix"
-          libuv_root="$prefix/Library"
-          test -d "$libuv_root"
-          echo "libuv_ROOT=$(cygpath -w "$libuv_root")" >> "$GITHUB_ENV"
+          test -d "$prefix/Library"
+          echo "libuv_ROOT=$(cygpath -w "$prefix/Library")" >> "$GITHUB_ENV"
 
       # The wheel links vendored SLEEF/NNPACK trees that CI checkouts do
       # not carry; fetch the pinned revisions before configuring.
