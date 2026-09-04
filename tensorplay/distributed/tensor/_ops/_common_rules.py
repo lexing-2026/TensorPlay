@@ -20,9 +20,17 @@ def _replace_char_in_str(value: str, new_char: str, index: int) -> str:
 def _schema_specs(op_schema: Any) -> tuple[DTensorSpec, ...]:
     specs = getattr(op_schema, "args_spec", None)
     if specs is not None:
-        return tuple(specs)
-    values = getattr(op_schema, "args", op_schema)
-    result: list[DTensorSpec] = []
+        result = list(specs)
+        values = getattr(op_schema, "kwargs", {})
+    elif hasattr(op_schema, "args"):
+        values = (
+            getattr(op_schema, "args"),
+            getattr(op_schema, "kwargs", {}),
+        )
+        result = []
+    else:
+        values = op_schema
+        result = []
 
     def visit(value: Any) -> None:
         if isinstance(value, DTensorSpec):

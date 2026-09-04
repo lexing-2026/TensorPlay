@@ -8,7 +8,14 @@ from ._math_ops import (
     map_placements_after_reduction,
 )
 from ._tensor_ops import cat_single_dim_strategy, stack_strategy
-from ._view_ops import dim_flatten, dim_movedim, dim_transpose, propagate_shape_and_sharding
+from .autogen import auto_register_op_variants
+from ._view_ops import (
+    dim_flatten,
+    dim_movedim,
+    dim_transpose,
+    propagate_shape_and_sharding,
+    register_view_ops,
+)
 from .single_dim_strategy import register_single_dim_strategy
 from .utils import (
     normalize_dim,
@@ -28,10 +35,12 @@ __all__ = [
     "map_placements_after_reduction",
     "cat_single_dim_strategy",
     "stack_strategy",
+    "auto_register_op_variants",
     "dim_flatten",
     "dim_movedim",
     "dim_transpose",
     "propagate_shape_and_sharding",
+    "register_view_ops",
     "normalize_dim",
     "normalize_dims",
     "register_op_strategy",
