@@ -4,7 +4,10 @@
 #include "Scalar.h"
 #include "Utils.h"
 #include "Exception.h"
+#include "Half.h"
+#include "BFloat16.h"
 #include "Parallel.h"
+#include "Bucketization.h"
 
 #include <tuple>
 #include <vector>
@@ -12,6 +15,8 @@
 #include <numeric>
 #include <cstring>
 #include <limits>
+#include <optional>
+#include <string>
 #include <utility>
 
 namespace tensorplay {
@@ -927,72 +932,262 @@ Tensor argsort_cpu(const Tensor& self, int64_t dim, bool descending) {
 // ---------------------------------------------------------------------------
 // searchsorted / bucketize
 //
-// searchsorted_cpu_contiguous: binary search per value; right=false yields
-// the lower bound (first boundary >= v), right=true the upper bound (first
-// boundary > v).
+// Per query value the kernel binary-searches the innermost dimension of the
+// boundaries and returns an insertion position: right=false yields the lower
+// bound (first boundary >= v) and right=true the upper bound (first boundary
+// > v).  The bound comparators are written as `!(bd >= v)` / `!(bd > v)` so a
+// NaN query compares greater than every boundary entry and lands at the end
+// of the searched range instead of folding to position 0.
+//
+// Boundaries may be 1-D (shared lookup table for every query) or N-D matching
+// all leading dimensions of the input (one lookup table per row, shared along
+// the innermost axis).  A sorter tensor carries the permutation that orders an
+// unsorted boundary tensor; boundary element access then goes through
+// `bd[sorter[mid] + row_offset]`.
 // ---------------------------------------------------------------------------
 
-Tensor searchsorted_cpu(const Tensor& sorted_sequence, const Tensor& self, bool out_int32, bool right) {
-    Tensor seq = sorted_sequence.contiguous();
-    Tensor vals = self.contiguous();
-    int64_t seq_len = seq.size(-1);
-    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(vals.shape()),
-                                  out_int32 ? DType::Int32 : DType::Int64, self.device());
+namespace {
 
-#define TP_SS_RUN(stype, vtype) \
-    do { \
-        const stype* sp = seq.data_ptr<stype>(); \
-        const vtype* vp = vals.data_ptr<vtype>(); \
-        if (out_int32) { \
-            int32_t* rp = result.data_ptr<int32_t>(); \
-            for (int64_t i = 0; i < vals.numel(); ++i) { \
-                vtype v = vp[i]; \
-                int64_t lo = 0, hi = seq_len; \
-                while (lo < hi) { \
-                    int64_t mid = (lo + hi) >> 1; \
-                    bool go_right = right ? !(v < static_cast<vtype>(sp[mid])) : (static_cast<vtype>(sp[mid]) < v); \
-                    if (go_right) lo = mid + 1; else hi = mid; \
-                } \
-                rp[i] = static_cast<int32_t>(lo); \
-            } \
-        } else { \
-            int64_t* rp = result.data_ptr<int64_t>(); \
-            for (int64_t i = 0; i < vals.numel(); ++i) { \
-                vtype v = vp[i]; \
-                int64_t lo = 0, hi = seq_len; \
-                while (lo < hi) { \
-                    int64_t mid = (lo + hi) >> 1; \
-                    bool go_right = right ? !(v < static_cast<vtype>(sp[mid])) : (static_cast<vtype>(sp[mid]) < v); \
-                    if (go_right) lo = mid + 1; else hi = mid; \
-                } \
-                rp[i] = lo; \
-            } \
-        } \
-    } while (0)
+// Minimal size for the contiguous searchsorted kernel to run in parallel.
+constexpr int64_t kSearchSortedGrainSize = 200;
 
-#define TP_SS_VTYPE(stype) \
-    if (vals.dtype() == DType::Float32) { TP_SS_RUN(stype, float); return result; } \
-    if (vals.dtype() == DType::Float64) { TP_SS_RUN(stype, double); return result; } \
-    if (vals.dtype() == DType::Int64)   { TP_SS_RUN(stype, int64_t); return result; } \
-    if (vals.dtype() == DType::Int32)   { TP_SS_RUN(stype, int32_t); return result; }
-
-    if (seq.dtype() == DType::Float32) { TP_SS_VTYPE(float) }
-    else if (seq.dtype() == DType::Float64) { TP_SS_VTYPE(double) }
-    else if (seq.dtype() == DType::Int64) { TP_SS_VTYPE(int64_t) }
-    else if (seq.dtype() == DType::Int32) { TP_SS_VTYPE(int32_t) }
-    else {
-        Tensor seq_d = seq.to(DType::Float64);
-        Tensor vals_d = vals.to(DType::Float64);
-        return searchsorted_cpu(seq_d, vals_d, out_int32, right);
+// Reindexes an unsorted boundary tensor through its sorter permutation.
+// Materializing `bd[sorter]` up front keeps the hot loop branch-free and lets
+// the same contiguous kernel serve both paths.
+Tensor searchsorted_apply_sorter(const Tensor& boundaries, const Tensor& sorter) {
+    const std::vector<int64_t> sizes =
+        static_cast<std::vector<int64_t>>(boundaries.shape());
+    Tensor sorted = Tensor::empty(sizes, boundaries.dtype(), boundaries.device());
+    const int64_t n = boundaries.numel();
+    const int64_t inner = boundaries.size(-1);
+    Tensor seq_c = boundaries.contiguous();
+    Tensor sorter_c = sorter.contiguous();
+    const int64_t* sp = sorter_c.data_ptr<int64_t>();
+#define TP_SS_SORT_CASE(ctype, name)                                        \
+    case DType::name: {                                                     \
+        const ctype* src = seq_c.data_ptr<ctype>();                         \
+        ctype* dst = sorted.data_ptr<ctype>();                              \
+        parallel_for(0, n, kSearchSortedGrainSize, [&](int64_t b, int64_t e) { \
+            for (int64_t i = b; i < e; ++i) dst[i] = src[sp[i]];            \
+        });                                                                 \
+        break;                                                              \
     }
-#undef TP_SS_VTYPE
+    switch (seq_c.dtype()) {
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_SS_SORT_CASE)
+        default: TP_THROW(TypeError, "searchsorted(): unsupported boundaries dtype ",
+                          toString(seq_c.dtype()));
+    }
+#undef TP_SS_SORT_CASE
+    return sorted;
+}
+
+// The contiguous hot loop.  `boundaries` must be contiguous with the same
+// dtype as `input`; `is_1d_boundaries` selects the shared-table addressing.
+template <typename input_t, typename output_t>
+void searchsorted_cpu_contiguous(Tensor& result, const Tensor& input,
+                                 const Tensor& boundaries, bool right,
+                                 bool is_1d_boundaries) {
+    const int64_t numel_in = input.numel();
+    const bool is_scalar_input = input.dim() == 0 && numel_in == 1;
+    // Innermost dimension size of the input and of the lookup tables.
+    const int64_t idim_in = is_scalar_input ? 1 : input.size(-1);
+    const int64_t idim_bd = boundaries.size(-1);
+
+    const input_t* data_in = input.data_ptr<input_t>();
+    const input_t* data_bd = boundaries.data_ptr<input_t>();
+    output_t* data_out = result.data_ptr<output_t>();
+
+    parallel_for(0, numel_in, kSearchSortedGrainSize, [&](int64_t b, int64_t e) {
+        for (int64_t i = b; i < e; ++i) {
+            // A 1-D boundary table is shared by every query; a row-wise table
+            // starts at (query row / input innermost) * table innermost.
+            int64_t start_bd = is_1d_boundaries ? 0 : i / idim_in * idim_bd;
+            int64_t end_bd = start_bd + idim_bd;
+            const input_t val = data_in[i];
+            if (!right) {
+                // lower bound: first position with bd >= val
+                while (start_bd < end_bd) {
+                    const int64_t mid = start_bd + ((end_bd - start_bd) >> 1);
+                    if (!(data_bd[mid] >= val)) start_bd = mid + 1; else end_bd = mid;
+                }
+            } else {
+                // upper bound: first position with bd > val
+                while (start_bd < end_bd) {
+                    const int64_t mid = start_bd + ((end_bd - start_bd) >> 1);
+                    if (!(data_bd[mid] > val)) start_bd = mid + 1; else end_bd = mid;
+                }
+            }
+            data_out[i] = static_cast<output_t>(start_bd - (is_1d_boundaries ? 0 : i / idim_in * idim_bd));
+        }
+    });
+}
+
+void searchsorted_dispatch(Tensor& result, const Tensor& input,
+                           const Tensor& boundaries, bool right) {
+#define TP_SS_RUN(input_t, output_t)                                       \
+    searchsorted_cpu_contiguous<input_t, output_t>(                        \
+        result, input, boundaries, right, boundaries.dim() == 1)
+
+    if (result.dtype() == DType::Int64) {
+        switch (input.dtype()) {
+            case DType::Float64: TP_SS_RUN(double, int64_t); return;
+            case DType::Float32: TP_SS_RUN(float, int64_t); return;
+            case DType::Float16: TP_SS_RUN(Half, int64_t); return;
+            case DType::BFloat16: TP_SS_RUN(BFloat16, int64_t); return;
+            case DType::Int64: TP_SS_RUN(int64_t, int64_t); return;
+            case DType::Int32: TP_SS_RUN(int32_t, int64_t); return;
+            case DType::Int16: TP_SS_RUN(int16_t, int64_t); return;
+            case DType::Int8: TP_SS_RUN(int8_t, int64_t); return;
+            case DType::UInt8: TP_SS_RUN(uint8_t, int64_t); return;
+            case DType::UInt16: TP_SS_RUN(uint16_t, int64_t); return;
+            case DType::UInt32: TP_SS_RUN(uint32_t, int64_t); return;
+            case DType::UInt64: TP_SS_RUN(uint64_t, int64_t); return;
+            case DType::Bool: TP_SS_RUN(bool, int64_t); return;
+            default: break;
+        }
+    } else {
+        switch (input.dtype()) {
+            case DType::Float64: TP_SS_RUN(double, int32_t); return;
+            case DType::Float32: TP_SS_RUN(float, int32_t); return;
+            case DType::Float16: TP_SS_RUN(Half, int32_t); return;
+            case DType::BFloat16: TP_SS_RUN(BFloat16, int32_t); return;
+            case DType::Int64: TP_SS_RUN(int64_t, int32_t); return;
+            case DType::Int32: TP_SS_RUN(int32_t, int32_t); return;
+            case DType::Int16: TP_SS_RUN(int16_t, int32_t); return;
+            case DType::Int8: TP_SS_RUN(int8_t, int32_t); return;
+            case DType::UInt8: TP_SS_RUN(uint8_t, int32_t); return;
+            case DType::UInt16: TP_SS_RUN(uint16_t, int32_t); return;
+            case DType::UInt32: TP_SS_RUN(uint32_t, int32_t); return;
+            case DType::UInt64: TP_SS_RUN(uint64_t, int32_t); return;
+            case DType::Bool: TP_SS_RUN(bool, int32_t); return;
+            default: break;
+        }
+    }
 #undef TP_SS_RUN
+    TP_THROW(TypeError, "searchsorted(): unsupported dtype ",
+             toString(input.dtype()));
+}
+
+Tensor& searchsorted_out_cpu_impl(const Tensor& sorted_sequence,
+                                  const Tensor& self, bool out_int32,
+                                  bool right,
+                                  const std::optional<std::string>& side_opt,
+                                  const Tensor& sorter_opt, Tensor& result) {
+    const Tensor& sorter = sorter_opt;
+    bucketization::pre_check(sorted_sequence, self, result, out_int32, right,
+                             side_opt, sorter);
+    result.resize_(static_cast<std::vector<int64_t>>(self.shape()));
+
+    // Two inputs control the bound direction; pre_check rejects conflicts.
+    const bool is_right = side_opt.has_value() ? *side_opt == "right" : right;
+
+    if (self.numel() == 0) {
+        return result;
+    }
+
+    // Non-contiguous outputs are written through a contiguous copy and copied
+    // back afterwards so the strided result keeps its layout.
+    Tensor out = result;
+    const bool out_is_contiguous = result.is_contiguous();
+    if (!out_is_contiguous) out = result.contiguous();
+
+    Tensor trimmed_input, trimmed_boundaries, trimmed_sorter;
+    Tensor sorter_work = sorter;
+    if (sorter_work.defined()) {
+        sorter_work = searchsorted_apply_sorter(sorted_sequence, sorter_work);
+    }
+    Tensor seq = sorter_work.defined() ? sorter_work : sorted_sequence;
+    bucketization::maybe_trim_input_tensors(trimmed_input, trimmed_boundaries,
+                                            self, seq);
+    const Tensor& final_input = trimmed_input.defined() ? trimmed_input : self;
+    const Tensor& final_boundaries =
+        trimmed_boundaries.defined() ? trimmed_boundaries : seq;
+    searchsorted_dispatch(out, final_input, final_boundaries, is_right);
+
+    if (!out_is_contiguous) result.copy_(out);
     return result;
 }
 
-Tensor bucketize_cpu(const Tensor& self, const Tensor& boundaries, bool out_int32, bool right) {
-    // Boundaries form the lookup table and self supplies the query values.
-    return searchsorted_cpu(boundaries, self, out_int32, right);
+Tensor empty_searchsorted_output(const Tensor& like, bool out_int32) {
+    return Tensor::empty({}, out_int32 ? DType::Int32 : DType::Int64,
+                         like.device());
+}
+
+} // anonymous namespace
+
+Tensor& searchsorted_out_cpu(const Tensor& sorted_sequence, const Tensor& self,
+                             bool out_int32, bool right,
+                             const std::optional<std::string>& side_opt,
+                             const std::optional<Tensor>& sorter_opt,
+                             Tensor& result) {
+    return searchsorted_out_cpu_impl(
+        sorted_sequence, self, out_int32, right, side_opt,
+        sorter_opt.value_or(Tensor()), result);
+}
+
+Tensor searchsorted_cpu(const Tensor& sorted_sequence, const Tensor& self,
+                        bool out_int32, bool right,
+                        const std::optional<std::string>& side_opt,
+                        const std::optional<Tensor>& sorter_opt) {
+    Tensor result = empty_searchsorted_output(self, out_int32);
+    searchsorted_out_cpu_impl(
+        sorted_sequence, self, out_int32, right, side_opt,
+        sorter_opt.value_or(Tensor()), result);
+    return result;
+}
+
+Tensor& searchsorted_scalar_out_cpu(const Tensor& sorted_sequence,
+                                    const Scalar& self, bool out_int32,
+                                    bool right,
+                                    const std::optional<std::string>& side_opt,
+                                    const std::optional<Tensor>& sorter_opt,
+                                    Tensor& result) {
+    Tensor scalar_query =
+        bucketization::scalar_tensor(self, sorted_sequence.device());
+    return searchsorted_out_cpu_impl(
+        sorted_sequence, scalar_query, out_int32, right, side_opt,
+        sorter_opt.value_or(Tensor()), result);
+}
+
+Tensor searchsorted_scalar_cpu(const Tensor& sorted_sequence, const Scalar& self,
+                               bool out_int32, bool right,
+                               const std::optional<std::string>& side_opt,
+                               const std::optional<Tensor>& sorter_opt) {
+    Tensor result = empty_searchsorted_output(sorted_sequence, out_int32);
+    searchsorted_scalar_out_cpu(sorted_sequence, self, out_int32, right,
+                                side_opt, sorter_opt, result);
+    return result;
+}
+
+Tensor& bucketize_out_cpu(const Tensor& self, const Tensor& boundaries,
+                          bool out_int32, bool right, Tensor& result) {
+    TP_CHECK(boundaries.dim() == 1,
+             "bucketize(): boundaries tensor must be 1 dimension, but got dim(",
+             boundaries.dim(), ")");
+    return searchsorted_out_cpu_impl(boundaries, self, out_int32, right,
+                                     std::nullopt, Tensor(), result);
+}
+
+Tensor bucketize_cpu(const Tensor& self, const Tensor& boundaries,
+                     bool out_int32, bool right) {
+    Tensor result = empty_searchsorted_output(self, out_int32);
+    bucketize_out_cpu(self, boundaries, out_int32, right, result);
+    return result;
+}
+
+Tensor& bucketize_scalar_out_cpu(const Scalar& self, const Tensor& boundaries,
+                                 bool out_int32, bool right, Tensor& result) {
+    Tensor scalar_query =
+        bucketization::scalar_tensor(self, boundaries.device());
+    return bucketize_out_cpu(scalar_query, boundaries, out_int32, right,
+                             result);
+}
+
+Tensor bucketize_scalar_cpu(const Scalar& self, const Tensor& boundaries,
+                            bool out_int32, bool right) {
+    Tensor result = empty_searchsorted_output(boundaries, out_int32);
+    bucketize_scalar_out_cpu(self, boundaries, out_int32, right, result);
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -1152,103 +1347,244 @@ Tensor cumsum_backward_cpu(const Tensor& grad, int64_t dim) {
     return result;
 }
 
-// stable sort of (value, original index) pairs, group adjacent equal values.
+// unique family.
+//
+// The flat form sorts the values and groups adjacent equal elements; the
+// dim form sorts whole rows lexicographically and groups equal rows.
+// Equality uses the original dtype's `!=`, so NaN entries never compare equal
+// and each NaN survives as its own group (matching sorted order, where the
+// sort kernel sinks NaNs to the rear).  `sorted=false` is accepted for API
+// compatibility; grouping is inherently order-based, so the values output is
+// always in ascending order.
+//
 // Returns (values, inverse, counts); inverse/counts are empty when the
 // corresponding flag is false.
-std::tuple<Tensor, Tensor, Tensor> unique_cpu(const Tensor& self, bool sorted, bool return_inverse, bool return_counts) {
-    TP_CHECK(self.dim() <= 1 || self.numel() == self.size(-1) * 1,
-             "unique: only 1D tensors are supported");
-    if (self.numel() == 0) {
-        Tensor values = Tensor::empty({0}, self.dtype(), self.device());
-        Tensor inverse = return_inverse ? Tensor::empty({0}, DType::Int64, self.device()) : Tensor();
-        Tensor counts = return_counts ? Tensor::empty({0}, DType::Int64, self.device()) : Tensor();
-        return std::make_tuple(values, inverse, counts);
-    }
-    Tensor sc = self.contiguous().reshape({self.numel()});
-    const int64_t n = sc.numel();
+namespace {
 
-    // generic value extraction to double for grouping; exact for integer and
-    // float32/float64 bit patterns compared via the original representation.
+template <typename scalar_t>
+std::tuple<Tensor, Tensor, Tensor> unique_flat_cpu_template(
+        const Tensor& self, bool return_inverse, bool return_counts) {
+    // A 0-dim input sorts as a single-element row; the inverse keeps the
+    // original (scalar) shape.
+    Tensor input = self.dim() == 0 ? self.reshape({1}).contiguous()
+                                   : self.contiguous();
+    const int64_t numel = input.numel();
+    Tensor values = Tensor::empty({0}, self.dtype(), self.device());
+    Tensor inverse = Tensor::empty({0}, DType::Int64, self.device());
+    Tensor counts = Tensor::empty({0}, DType::Int64, self.device());
+    if (numel == 0) {
+        if (return_inverse) {
+            inverse.resize_(static_cast<std::vector<int64_t>>(self.shape()));
+        }
+        return {values, inverse, counts};
+    }
+
+    Tensor sorted_vals, order;
+    std::tie(sorted_vals, order) = sort_cpu(input, 0, false);
+    const scalar_t* sv = sorted_vals.data_ptr<scalar_t>();
+    const int64_t* idx = order.data_ptr<int64_t>();
+
+    // First sweep: number of groups (adjacent elements that differ).
+    int64_t n_groups = 1;
+    for (int64_t i = 1; i < numel; ++i) {
+        if (sv[i] != sv[i - 1]) ++n_groups;
+    }
+
+    values = Tensor::empty({n_groups}, self.dtype(), self.device());
+    scalar_t* vp = values.data_ptr<scalar_t>();
+    int64_t* ip = return_inverse
+        ? (inverse.resize_(static_cast<std::vector<int64_t>>(self.shape())),
+           inverse.data_ptr<int64_t>())
+        : nullptr;
+    int64_t* cp = return_counts
+        ? (counts.resize_({n_groups}), counts.data_ptr<int64_t>())
+        : nullptr;
+
+    // Second sweep: fill the group values, counts, and the per-element
+    // inverse through the sort permutation.
+    int64_t g = 0;
+    int64_t group_start = 0;
+    for (int64_t i = 0; i < numel; ++i) {
+        if (i > 0 && sv[i] != sv[i - 1]) {
+            if (return_counts) cp[g] = i - group_start;
+            ++g;
+            group_start = i;
+        }
+        vp[g] = sv[i];
+        if (return_inverse) ip[idx[i]] = g;
+    }
+    if (return_counts) cp[g] = numel - group_start;
+    return {values, inverse, counts};
+}
+
+// Row-wise grouping over `self.moveaxis(dim, 0).view({n, -1})`: rows are
+// sorted lexicographically (unless `consecutive`, which keeps the original
+// order) and adjacent equal rows collapse into one output row.
+template <typename scalar_t>
+std::tuple<Tensor, Tensor, Tensor> unique_dim_cpu_template(
+        const Tensor& self, int64_t dim, bool consecutive,
+        bool return_inverse, bool return_counts) {
+    const std::vector<int64_t> sizes =
+        static_cast<std::vector<int64_t>>(self.shape());
+    const int64_t zero_dims = std::count(sizes.begin(), sizes.end(), 0);
+    if (self.size(dim) == 0) {
+        TP_CHECK(zero_dims == 1,
+                 "Number of zero sized dimensions is more than one, so unique "
+                 "cannot be applied");
+        Tensor values = Tensor::empty(sizes, self.dtype(), self.device());
+        Tensor inverse = Tensor::empty({0}, DType::Int64, self.device());
+        Tensor counts = Tensor::empty({0}, DType::Int64, self.device());
+        return {values, inverse, counts};
+    }
+    TP_CHECK(zero_dims == 0,
+             "There are 0 sized dimensions, and they aren't selected, so "
+             "unique cannot be applied");
+
+    Tensor input_flat = self.moveaxis(dim, 0).contiguous();
+    std::vector<int64_t> front_sizes =
+        static_cast<std::vector<int64_t>>(input_flat.shape());
+    const int64_t n = front_sizes[0];
+    input_flat = input_flat.reshape({n, -1});
+    const int64_t row_len = input_flat.size(1);
+    const scalar_t* rows = input_flat.data_ptr<scalar_t>();
+
+    // Row ordering: identity for the consecutive form, lexicographic sort of
+    // element columns otherwise (stable, so ties keep first-occurrence order).
     std::vector<int64_t> order(n);
     for (int64_t i = 0; i < n; ++i) order[i] = i;
-    std::vector<double> vals(n);
-    switch (sc.dtype()) {
-        case DType::Float32: { auto* p = sc.data_ptr<float>(); for (int64_t i = 0; i < n; ++i) vals[i] = double(p[i]); break; }
-        case DType::Float64: { auto* p = sc.data_ptr<double>(); for (int64_t i = 0; i < n; ++i) vals[i] = p[i]; break; }
-        case DType::Int64:   { auto* p = sc.data_ptr<int64_t>(); for (int64_t i = 0; i < n; ++i) vals[i] = double(p[i]); break; }
-        case DType::Int32:   { auto* p = sc.data_ptr<int32_t>(); for (int64_t i = 0; i < n; ++i) vals[i] = double(p[i]); break; }
-        case DType::Int16:   { auto* p = sc.data_ptr<int16_t>(); for (int64_t i = 0; i < n; ++i) vals[i] = double(p[i]); break; }
-        case DType::Int8:    { auto* p = sc.data_ptr<int8_t>(); for (int64_t i = 0; i < n; ++i) vals[i] = double(p[i]); break; }
-        case DType::UInt8:   { auto* p = sc.data_ptr<uint8_t>(); for (int64_t i = 0; i < n; ++i) vals[i] = double(p[i]); break; }
-        case DType::Bool:    { auto* p = sc.data_ptr<bool>(); for (int64_t i = 0; i < n; ++i) vals[i] = p[i] ? 1.0 : 0.0; break; }
-        default: TP_THROW(TypeError, "unique: unsupported dtype");
+    if (!consecutive) {
+        std::sort(order.begin(), order.end(), [&](int64_t a, int64_t b) {
+            const scalar_t* ra = rows + a * row_len;
+            const scalar_t* rb = rows + b * row_len;
+            for (int64_t c = 0; c < row_len; ++c) {
+                if (ra[c] < rb[c]) return true;
+                if (rb[c] < ra[c]) return false;
+            }
+            return false;
+        });
     }
 
-    // exact equality via bit pattern where it matters (floats): compare doubles;
-    // int64 values above 2^53 lose precision in double, so compare raw ints too.
-    auto equal_at = [&](int64_t a, int64_t b) -> bool {
-        if (vals[a] != vals[b]) return false;
-        if (sc.dtype() == DType::Int64) {
-            return sc.data_ptr<int64_t>()[a] == sc.data_ptr<int64_t>()[b];
+    // Walk the ordered rows, collapsing equal adjacent rows.
+    auto row_equal = [&](int64_t a, int64_t b) {
+        const scalar_t* ra = rows + a * row_len;
+        const scalar_t* rb = rows + b * row_len;
+        for (int64_t c = 0; c < row_len; ++c) {
+            if (ra[c] != rb[c]) return false;
         }
         return true;
     };
 
-    std::stable_sort(order.begin(), order.end(), [&](int64_t a, int64_t b) {
-        if (vals[a] != vals[b]) return vals[a] < vals[b];
-        return a < b;
-    });
-    if (!sorted) {
-        // keep first-occurrence order of groups instead of sorted order
-        std::vector<bool> seen_group(n, false);
-    }
+    Tensor kept_rows = Tensor::empty({n, row_len}, input_flat.dtype(),
+                                     input_flat.device());
+    scalar_t* kept = kept_rows.data_ptr<scalar_t>();
+    Tensor inverse = Tensor::empty({n}, DType::Int64, self.device());
+    int64_t* ip = inverse.data_ptr<int64_t>();
+    Tensor counts_buf = Tensor::empty({0}, DType::Int64, self.device());
+    int64_t* cp = return_counts
+        ? (counts_buf.resize_({n}),
+           counts_buf.data_ptr<int64_t>())
+        : nullptr;
 
-    std::vector<int64_t> group_first;          // index into order of each group start
-    std::vector<int64_t> inverse(n);
+    int64_t n_groups = 0;
     for (int64_t k = 0; k < n; ++k) {
-        if (k == 0 || !equal_at(order[k], order[k - 1])) group_first.push_back(k);
-        inverse[order[k]] = int64_t(group_first.size()) - 1;
-    }
-    const int64_t n_groups = int64_t(group_first.size());
-
-    Tensor values = Tensor::empty({n_groups}, sc.dtype(), sc.device());
-    // NB: group_first[] indexes positions in the sorted order[] sequence;
-    // unique_cpu_temp_impl gathers via sort_indices).
-    #define TP_UNIQUE_FILL(ctype, dt)                                            \
-        {                                                                        \
-            ctype* dst = values.data_ptr<ctype>();                               \
-            for (int64_t g = 0; g < n_groups; ++g) dst[g] = p[order[group_first[g]]]; \
-        }                                                                        \
-        break;
-    switch (sc.dtype()) {
-        case DType::Float32: { auto* p = sc.data_ptr<float>(); TP_UNIQUE_FILL(float, Float32) }
-        case DType::Float64: { auto* p = sc.data_ptr<double>(); TP_UNIQUE_FILL(double, Float64) }
-        case DType::Int64:   { auto* p = sc.data_ptr<int64_t>(); TP_UNIQUE_FILL(int64_t, Int64) }
-        case DType::Int32:   { auto* p = sc.data_ptr<int32_t>(); TP_UNIQUE_FILL(int32_t, Int32) }
-        case DType::Int16:   { auto* p = sc.data_ptr<int16_t>(); TP_UNIQUE_FILL(int16_t, Int16) }
-        case DType::Int8:    { auto* p = sc.data_ptr<int8_t>(); TP_UNIQUE_FILL(int8_t, Int8) }
-        case DType::UInt8:   { auto* p = sc.data_ptr<uint8_t>(); TP_UNIQUE_FILL(uint8_t, UInt8) }
-        case DType::Bool:    { auto* p = sc.data_ptr<bool>(); TP_UNIQUE_FILL(bool, Bool) }
-        default: break;
-    }
-    #undef TP_UNIQUE_FILL
-
-    Tensor inverse_t, counts_t;
-    if (return_inverse) {
-        inverse_t = Tensor::empty({n}, DType::Int64, sc.device());
-        auto* ip = inverse_t.data_ptr<int64_t>();
-        for (int64_t i = 0; i < n; ++i) ip[i] = inverse[i];
-    }
-    if (return_counts) {
-        counts_t = Tensor::empty({n_groups}, DType::Int64, sc.device());
-        auto* cp = counts_t.data_ptr<int64_t>();
-        for (int64_t g = 0; g < n_groups; ++g) {
-            const int64_t begin = group_first[g];
-            const int64_t stop = (g + 1 < n_groups) ? group_first[g + 1] : n;
-            cp[g] = stop - begin;
+        const int64_t row = order[k];
+        if (k == 0 || !row_equal(row, order[k - 1])) {
+            std::memcpy(kept + n_groups * row_len, rows + row * row_len,
+                        static_cast<size_t>(row_len) * sizeof(scalar_t));
+            if (return_counts) cp[n_groups] = 1;
+            ++n_groups;
+        } else if (return_counts) {
+            ++cp[n_groups - 1];
         }
+        ip[row] = n_groups - 1;
     }
-    return std::make_tuple(values, inverse_t, counts_t);
+
+    // Rebuild the output with the selected dim resized to the group count.
+    front_sizes[0] = n_groups;
+    Tensor values = kept_rows.slice(0, 0, n_groups)
+                        .reshape(front_sizes).moveaxis(0, dim);
+    Tensor counts_t;
+    if (return_counts) {
+        counts_t = counts_buf.slice(0, 0, n_groups);
+    }
+    return {values, inverse, counts_t};
+}
+
+template <typename scalar_t>
+std::tuple<Tensor, Tensor, Tensor> unique_dispatch(const Tensor& self,
+                                                   int64_t dim, bool consecutive,
+                                                   bool return_inverse,
+                                                   bool return_counts) {
+    if (dim < 0) {
+        return unique_flat_cpu_template<scalar_t>(self, return_inverse,
+                                                  return_counts);
+    }
+    return unique_dim_cpu_template<scalar_t>(self, dim, consecutive,
+                                             return_inverse, return_counts);
+}
+
+#define TP_UNIQUE_CASE(ctype, name)                                            \
+    case DType::name:                                                          \
+        return unique_dispatch<ctype>(self, dim, consecutive, return_inverse,  \
+                                      return_counts);
+
+std::tuple<Tensor, Tensor, Tensor> unique_any_cpu(const Tensor& self,
+                                                  int64_t dim, bool consecutive,
+                                                  bool return_inverse,
+                                                  bool return_counts) {
+    switch (self.dtype()) {
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_UNIQUE_CASE)
+        default: TP_THROW(TypeError, "unique: unsupported dtype ",
+                          toString(self.dtype()));
+    }
+}
+#undef TP_UNIQUE_CASE
+
+} // anonymous namespace
+
+// Flat unique with counts (the public `unique` entry point).
+std::tuple<Tensor, Tensor, Tensor> unique_cpu(const Tensor& self, bool sorted,
+                                              bool return_inverse,
+                                              bool return_counts) {
+    (void)sorted;
+    return unique_any_cpu(self, /*dim=*/-1, /*consecutive=*/false,
+                          return_inverse, return_counts);
+}
+
+// Flat unique without counts (legacy two-output alias).
+std::tuple<Tensor, Tensor> _unique_cpu(const Tensor& self, bool sorted,
+                                       bool return_inverse) {
+    (void)sorted;
+    auto result = unique_any_cpu(self, /*dim=*/-1, /*consecutive=*/false,
+                                 return_inverse, /*return_counts=*/false);
+    return std::make_tuple(std::get<0>(result), std::get<1>(result));
+}
+
+// Full flat unique (three outputs); `unique` currently forwards here.
+std::tuple<Tensor, Tensor, Tensor> _unique2_cpu(const Tensor& self, bool sorted,
+                                                bool return_inverse,
+                                                bool return_counts) {
+    (void)sorted;
+    return unique_any_cpu(self, /*dim=*/-1, /*consecutive=*/false,
+                          return_inverse, return_counts);
+}
+
+// Dim-wise unique; the values output is always sorted (order-based grouping).
+std::tuple<Tensor, Tensor, Tensor> unique_dim_cpu(const Tensor& self,
+                                                  int64_t dim, bool sorted,
+                                                  bool return_inverse,
+                                                  bool return_counts) {
+    (void)sorted;
+    return unique_any_cpu(self, wrap_dim(dim, self.dim()),
+                          /*consecutive=*/false, return_inverse, return_counts);
+}
+
+// Dim-wise unique without reordering between equal-adjacent rows.
+std::tuple<Tensor, Tensor, Tensor> unique_dim_consecutive_cpu(
+        const Tensor& self, int64_t dim, bool return_inverse,
+        bool return_counts) {
+    return unique_any_cpu(self, wrap_dim(dim, self.dim()), /*consecutive=*/true,
+                          return_inverse, return_counts);
 }
 
 Tensor scatter_reduce_cpu(const Tensor& self, int64_t dim, const Tensor& index,
@@ -1313,10 +1649,20 @@ TENSORPLAY_LIBRARY_IMPL(CPU, IndexingKernels) {
     m.impl("index_put_", index_put__cpu);
     m.impl("nonzero", nonzero_cpu);
     m.impl("unique", unique_cpu);
+    m.impl("_unique", _unique_cpu);
+    m.impl("_unique2", _unique2_cpu);
+    m.impl("unique_dim", unique_dim_cpu);
+    m.impl("unique_dim_consecutive", unique_dim_consecutive_cpu);
     m.impl("sort", sort_cpu);
     m.impl("argsort", argsort_cpu);
     m.impl("searchsorted.Tensor", searchsorted_cpu);
+    m.impl("searchsorted.Tensor_out", searchsorted_out_cpu);
+    m.impl("searchsorted.Scalar", searchsorted_scalar_cpu);
+    m.impl("searchsorted.Scalar_out", searchsorted_scalar_out_cpu);
     m.impl("bucketize.Tensor", bucketize_cpu);
+    m.impl("bucketize.Tensor_out", bucketize_out_cpu);
+    m.impl("bucketize.Scalar", bucketize_scalar_cpu);
+    m.impl("bucketize.Scalar_out", bucketize_scalar_out_cpu);
     m.impl("bincount", bincount_cpu);
     m.impl("take", take_cpu);
     m.impl("masked_scatter", masked_scatter_cpu);

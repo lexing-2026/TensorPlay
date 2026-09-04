@@ -1234,6 +1234,11 @@ Tensor add_relu_cpu(const Tensor& self, const Tensor& other) {
 }
 
 Tensor sub_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
+    if (self.dtype() == DType::Bool && other.dtype() == DType::Bool) {
+        TP_THROW(RuntimeError,
+                 "Subtraction, the `-` operator, with two bool tensors is not "
+                 "supported. Use the `^` or `logical_xor()` operator instead.");
+    }
     if (alpha.isFloatingPoint()) {
         return add_kernel(self, other, Scalar(-alpha.toDouble()));
     } else {
