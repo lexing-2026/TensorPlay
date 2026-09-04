@@ -28,6 +28,12 @@ jobs:
           submodules: false
           show-progress: false
 
+      # The wheel links vendored SLEEF/NNPACK trees that CI checkouts do
+      # not carry; fetch the pinned revisions before configuring.
+      - name: Restore vendored build dependencies
+        shell: bash
+        run: bash .github/scripts/restore-vendored-deps.sh
+
       - name: Load ROCm build configuration
         id: rocm-config
         shell: bash

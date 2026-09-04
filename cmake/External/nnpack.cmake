@@ -61,6 +61,16 @@ if(ANDROID OR IOS OR ${CMAKE_SYSTEM_NAME} STREQUAL "Linux" OR ${CMAKE_SYSTEM_NAM
   set(GOOGLETEST_SOURCE_DIR "${TP_THIRD_PARTY_ROOT}/googletest" CACHE STRING "Google Test source directory")
 
   if(NOT TARGET nnpack)
+    # No vendored checkout (for example a CI build without third_party):
+    # degrade to reference kernels instead of failing the configure.
+    if(NOT EXISTS "${NNPACK_SOURCE_DIR}/CMakeLists.txt")
+      message(STATUS
+        "Vendored NNPACK checkout not found at third_party/NNPACK; "
+        "building without NNPACK kernels.")
+      set(USE_NNPACK OFF CACHE BOOL "" FORCE)
+      set(NNPACK_FOUND FALSE)
+      return()
+    endif()
     set(NNPACK_BUILD_TESTS OFF CACHE BOOL "")
     set(NNPACK_BUILD_BENCHMARKS OFF CACHE BOOL "")
     set(NNPACK_LIBRARY_TYPE "static" CACHE STRING "")
