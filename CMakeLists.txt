@@ -1306,7 +1306,11 @@ if(NOT WIN32)
 endif()
 
 # Installation
-install(TARGETS p10 tpx stax tp_python
+set(TP_INSTALL_TARGETS p10 tpx stax)
+if(TARGET tp_python)
+    list(APPEND TP_INSTALL_TARGETS tp_python)
+endif()
+install(TARGETS ${TP_INSTALL_TARGETS}
     LIBRARY DESTINATION tensorplay/lib
     RUNTIME DESTINATION tensorplay/lib
 )
