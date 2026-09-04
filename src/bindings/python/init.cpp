@@ -1,4 +1,5 @@
 #include "python_bindings.h"
+#include "PyNewRef.h"
 #include "tensorplay/ops/Config.h"
 #include "tensorplay/ops/TensorCPythonGenerated.h"
 #include "CPythonBridge.h"
