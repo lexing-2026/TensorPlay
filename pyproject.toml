@@ -23,6 +23,7 @@ requires-python = ">=3.9,<3.14"
 dependencies = [
     "numpy>=2.0.0",
     "sympy>=1.13.3",
+    "megatensors>=0.0.5",
     "typing-extensions>=4.0.0",
     "PyYAML"
 ]
@@ -54,7 +55,13 @@ all = [
     "tqdm",
     "onnx",
     "scipy",
-    "soundfile"
+    "soundfile",
+    "tensorboard>=2.11",
+    "pillow>=9.0"
+]
+tensorboard = [
+    "tensorboard>=2.11",
+    "pillow>=9.0"
 ]
 
 [project.urls]

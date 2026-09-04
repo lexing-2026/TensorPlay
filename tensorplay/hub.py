@@ -467,7 +467,7 @@ def load_state_dict_from_url(url: str, progress: bool = True, check_hash: bool =
         download_url_to_file(url, str(cached), hash_prefix=hash_prefix, progress=progress)
 
     try:
-        from tensorplay import _serialization_torch as ser_torch
+        from tensorplay.serialization import archive as ser_torch
     except ImportError:
         ser_torch = None
     import tensorplay as tp
