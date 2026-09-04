@@ -81,9 +81,11 @@ fi
 # --- distributed transports (gloo + tensorpipe) ---
 clone_pin gloo https://github.com/pytorch/gloo 44651678bdc9ffc837181295acdd142ae7880ad9
 clone_pin tensorpipe https://github.com/pytorch/tensorpipe 2b4cd91092d335a697416b2a3cb398283246849d
-if [[ -d "$DEST/tensorpipe/.git" && ! -d "$DEST/tensorpipe/third_party/libuv" ]]; then
+if [[ -d "$DEST/tensorpipe/.git" && ! -f "$DEST/tensorpipe/third_party/libuv/CMakeLists.txt" ]]; then
     echo "::group::Init tensorpipe submodules (libuv/libnop/pybind11)"
-    git -C "$DEST/tensorpipe" submodule update --init --depth 1
+    # --force: the libuv submodule tracks a branch (v1.x), and a shallow
+    # first update leaves its worktree empty without it.
+    git -C "$DEST/tensorpipe" submodule update --init --force --depth 1
     echo "::endgroup::"
 fi
 
