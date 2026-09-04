@@ -154,8 +154,8 @@ static Tensor conv_transpose3d_naive(const Tensor& input, const Tensor& weight, 
 // kernels and is correct for all shapes (verified standalone and in-tree).
 // Every gemm_direct call site passes contiguous row-major matrices
 // (lda == M or K, ldb == K or N, ldc == N), so plain 'ab' descs map 1:1.
-#ifdef USE_ONEDNN
 namespace {
+#ifdef USE_ONEDNN
 struct MatmulGemmKey {
     bool transA, transB;
     int64_t M, N, K;
@@ -2686,6 +2686,7 @@ Tensor conv3d_cpu(const Tensor& input_arg, const Tensor& weight_arg, const Tenso
 // osize = (isize-1)*s - pad_l - pad_r + d*(k-1) + 1, hence
 // pad_l = padding, pad_r = padding - output_padding.
 namespace {
+#ifdef USE_ONEDNN
 
 struct CachedDeconvWeight {
     const void* data;
@@ -2695,8 +2696,10 @@ struct CachedDeconvWeight {
     Storage storage;
 };
 
+#endif // USE_ONEDNN
 } // namespace
 
+#ifdef USE_ONEDNN
 static bool conv_transpose2d_onednn(const Tensor& input, const Tensor& weight, const Tensor& bias,
                                     const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
                                     const std::vector<int64_t>& output_padding, const std::vector<int64_t>& dilation,
@@ -2935,7 +2938,9 @@ static bool conv_transpose2d_onednn(const Tensor& input, const Tensor& weight, c
         return false;
     }
 }
+#endif // USE_ONEDNN
 
+#ifdef USE_ONEDNN
 static bool conv_transpose3d_onednn(const Tensor& input, const Tensor& weight, const Tensor& bias,
                                     const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
                                     const std::vector<int64_t>& output_padding, const std::vector<int64_t>& dilation,
@@ -3174,6 +3179,7 @@ static bool conv_transpose3d_onednn(const Tensor& input, const Tensor& weight, c
         return false;
     }
 }
+#endif // USE_ONEDNN
 
 Tensor conv_transpose2d_cpu(const Tensor& input, const Tensor& weight, const Tensor& bias, const std::vector<int64_t>& stride_arg, const std::vector<int64_t>& padding_arg, const std::vector<int64_t>& output_padding_arg, int64_t groups, const std::vector<int64_t>& dilation_arg) {
     // Input: (N, C_in, H_in, W_in)
@@ -3219,6 +3225,7 @@ Tensor conv_transpose2d_cpu(const Tensor& input, const Tensor& weight, const Ten
     
     int64_t H_out = (H_in - 1) * sH - 2 * pH + dH * (kH - 1) + opH + 1;
     int64_t W_out = (W_in - 1) * sW - 2 * pW + dW * (kW - 1) + opW + 1;
+#ifdef USE_ONEDNN
     
     if (input.dtype() == DType::Float32) {
         Tensor out_dnn = Tensor::empty({N, C_out, H_out, W_out}, input.dtype(), input.device());
@@ -3227,6 +3234,7 @@ Tensor conv_transpose2d_cpu(const Tensor& input, const Tensor& weight, const Ten
             return out_dnn;
         }
     }
+#endif // USE_ONEDNN
 
     Tensor out = Tensor::zeros({N, C_out, H_out, W_out}, input.dtype(), input.device()); // Initialize with zeros for accumulation
     
@@ -3344,7 +3352,7 @@ Tensor conv_transpose3d_cpu(const Tensor& input, const Tensor& weight, const Ten
     int64_t D_out = (D_in - 1) * sD - 2 * pD + dD * (kD - 1) + opD + 1;
     int64_t H_out = (H_in - 1) * sH - 2 * pH + dH * (kH - 1) + opH + 1;
     int64_t W_out = (W_in - 1) * sW - 2 * pW + dW * (kW - 1) + opW + 1;
-
+#ifdef USE_ONEDNN
     if (input.dtype() == DType::Float32) {
         Tensor out_dnn = Tensor::empty({N, C_out, D_out, H_out, W_out}, input.dtype(), input.device());
         if (conv_transpose3d_onednn(input, weight, bias, stride, padding, output_padding,
@@ -3352,6 +3360,7 @@ Tensor conv_transpose3d_cpu(const Tensor& input, const Tensor& weight, const Ten
             return out_dnn;
         }
     }
+#endif // USE_ONEDNN
 
     Tensor out = Tensor::zeros({N, C_out, D_out, H_out, W_out}, input.dtype(), input.device());
 
@@ -4048,6 +4057,7 @@ Tensor conv_transpose2d_grad_input_cpu(const Tensor& grad_output, const Tensor& 
 // backward_weights primitive instead: src=input, diff_dst=grad_output,
 // diff_weights produced in oneDNN's layout and reordered into the user's
 // IOHW buffer through a strides-only view.
+#ifdef USE_ONEDNN
 static bool conv_transpose2d_grad_weight_onednn(const Tensor& grad_output, const Tensor& input, const Tensor& weight,
                                                 const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
                                                 const std::vector<int64_t>& output_padding, const std::vector<int64_t>& dilation,
@@ -4201,7 +4211,9 @@ static bool conv_transpose2d_grad_weight_onednn(const Tensor& grad_output, const
         return false;
     }
 }
+#endif // USE_ONEDNN
 
+#ifdef USE_ONEDNN
 static bool conv_transpose3d_grad_weight_onednn(const Tensor& grad_output, const Tensor& input, const Tensor& weight,
                                                 const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
                                                 const std::vector<int64_t>& output_padding, const std::vector<int64_t>& dilation,
@@ -4354,11 +4366,13 @@ static bool conv_transpose3d_grad_weight_onednn(const Tensor& grad_output, const
         return false;
     }
 }
+#endif // USE_ONEDNN
 
 Tensor conv_transpose2d_grad_weight_cpu(const Tensor& grad_output, const Tensor& input, const Tensor& weight, const std::vector<int64_t>& stride, const std::vector<int64_t>& padding, const std::vector<int64_t>& output_padding, int64_t groups, const std::vector<int64_t>& dilation) {
     // plain conv weight gradient. im2col runs over grad_output (the large tensor),
     // the MM against input (the small one); output_padding rows fall outside the
     // conv windows and correctly do not contribute.
+#ifdef USE_ONEDNN
     if (input.dtype() == DType::Float32) {
         Tensor gw = Tensor::empty(static_cast<std::vector<int64_t>>(weight.shape()), input.dtype(), input.device());
         if (conv_transpose2d_grad_weight_onednn(grad_output, input, weight, stride, padding,
@@ -4366,6 +4380,7 @@ Tensor conv_transpose2d_grad_weight_cpu(const Tensor& grad_output, const Tensor&
             return gw;
         }
     }
+#endif // USE_ONEDNN
     return conv2d_grad_weight_cpu(input, grad_output, weight, stride, padding, dilation, groups);
 }
 
@@ -4388,11 +4403,13 @@ Tensor conv_transpose3d_grad_input_cpu(const Tensor& grad_output, const Tensor& 
 
 Tensor conv_transpose3d_grad_weight_cpu(const Tensor& grad_output, const Tensor& input, const Tensor& weight, const std::vector<int64_t>& stride, const std::vector<int64_t>& padding, const std::vector<int64_t>& output_padding, int64_t groups, const std::vector<int64_t>& dilation) {
     if (input.dtype() == DType::Float32) {
+#ifdef USE_ONEDNN
         Tensor gw = Tensor::empty(static_cast<std::vector<int64_t>>(weight.shape()), input.dtype(), input.device());
         if (conv_transpose3d_grad_weight_onednn(grad_output, input, weight, stride, padding,
                                                 output_padding, dilation, groups, gw)) {
             return gw;
         }
+#endif // USE_ONEDNN
     }
     return conv3d_grad_weight_cpu(input, grad_output, weight, stride, padding, dilation, groups);
 }
