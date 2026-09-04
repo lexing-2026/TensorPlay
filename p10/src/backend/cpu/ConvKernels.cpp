@@ -815,7 +815,12 @@ void col2im3d(const T* data_col, int64_t channels, int64_t depth, int64_t height
 }
 
 #ifdef USE_ONEDNN
+// The oneDNN scratchpad tuning below reads the OpenMP thread count; on
+// builds without an OpenMP runtime (AppleClang defaults) the guarded
+// call sites degrade to the single-thread behavior.
+#ifdef _OPENMP
 #include <omp.h>
+#endif
 using namespace dnnl;
 
 static dnnl::algorithm get_onednn_algo(int64_t kh, int64_t kw) {
