@@ -8,37 +8,49 @@ from pathlib import Path
 from typing import Any
 
 from ._extension import StreamTransformExtension
-from .filesystem import FileSystemReader, FileSystemWriter
+from .filesystem import FileSystemBase, FileSystemReader, FileSystemWriter, SerializationFormat
 
 __all__ = ["FsspecWriter", "FsspecReader"]
 
 
-class FileSystem:
+class FileSystem(FileSystemBase):
     def __init__(self) -> None:
         self.fs: Any = None
 
     def init_path(self, path: str | os.PathLike[str], **kwargs: Any) -> str:
-        del kwargs
         try:
             import fsspec
-            self.fs, target = fsspec.core.url_to_fs(path)
-            return target
-        except ImportError:
+            self.fs, _ = fsspec.core.url_to_fs(path, **kwargs)
             return os.fspath(path)
+        except ImportError:
+            return Path(path)
 
     @contextlib.contextmanager
     def create_stream(self, path: str | os.PathLike[str], mode: str) -> Generator[io.IOBase, None, None]:
         if self.fs is None:
             stream = open(path, mode)
-        else:
-            stream = self.fs.open(path, mode)
-        try:
-            yield stream
-        except BaseException:
-            stream.close()
-            raise
-        finally:
-            stream.close()
+            try:
+                yield stream
+            except BaseException:
+                if any(character in mode for character in "w+a"):
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
+                raise
+            finally:
+                stream.close()
+            return
+        with self.fs.open(os.fspath(path), mode) as stream:
+            try:
+                yield stream
+            except BaseException:
+                if any(character in mode for character in "w+a"):
+                    try:
+                        self.rm_file(path)
+                    except BaseException:
+                        pass
+                raise
 
     def concat_path(self, path: str | os.PathLike[str], suffix: str) -> str:
         return os.path.join(os.fspath(path), suffix)
@@ -54,7 +66,15 @@ class FileSystem:
             self.fs.makedirs(path, exist_ok=True)
     @classmethod
     def validate_checkpoint_id(cls, checkpoint_id: str | os.PathLike[str]) -> bool:
-        return isinstance(checkpoint_id, (str, os.PathLike))
+        if isinstance(checkpoint_id, Path):
+            return False
+        try:
+            import fsspec
+
+            fsspec.core.url_to_fs(checkpoint_id)
+        except (ImportError, ValueError):
+            return isinstance(checkpoint_id, (str, os.PathLike)) and bool(str(checkpoint_id))
+        return True
     def exists(self, path: str | os.PathLike[str]) -> bool:
         return os.path.exists(path) if self.fs is None else bool(self.fs.exists(path))
     def rm_file(self, path: str | os.PathLike[str]) -> None:
@@ -67,9 +87,28 @@ class FileSystem:
 
 
 class FsspecWriter(FileSystemWriter):
-    def __init__(self, path: str | os.PathLike[str], single_file_per_rank: bool = True, sync_files: bool = True, thread_count: int = 1, per_thread_copy_ahead: int = 10_000_000, overwrite: bool = True, _extensions: Sequence[StreamTransformExtension] | None = None, serialization_format: Any = None, **kwargs: Any) -> None:
-        del single_file_per_rank, sync_files, thread_count, per_thread_copy_ahead, _extensions, serialization_format
-        super().__init__(os.fspath(path), overwrite=overwrite)
+    def __init__(
+        self,
+        path: str | os.PathLike[str],
+        single_file_per_rank: bool = True,
+        sync_files: bool = True,
+        thread_count: int = 1,
+        per_thread_copy_ahead: int = 10_000_000,
+        overwrite: bool = True,
+        _extensions: Sequence[StreamTransformExtension] | None = None,
+        serialization_format: SerializationFormat = SerializationFormat.TORCH_SAVE,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(
+            os.fspath(path),
+            single_file_per_rank=single_file_per_rank,
+            sync_files=sync_files,
+            thread_count=thread_count,
+            per_thread_copy_ahead=per_thread_copy_ahead,
+            overwrite=overwrite,
+            _extensions=_extensions,
+            serialization_format=serialization_format,
+        )
         self.fs = FileSystem()
         self.path = self.fs.init_path(path, **kwargs)
 

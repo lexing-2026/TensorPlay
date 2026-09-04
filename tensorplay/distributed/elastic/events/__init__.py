@@ -17,6 +17,29 @@ __all__ = [
     "construct_and_record_rdzv_event",
 ]
 
+_events_loggers: dict[str, logging.Logger] = {}
+
+
+def _get_or_create_logger(destination: str = "null") -> logging.Logger:
+    """Return a non-propagating logger with the requested event destination."""
+    logger = _events_loggers.get(destination)
+    if logger is not None:
+        return logger
+    logger = logging.getLogger(f"tp_elastic_events-{destination}")
+    logger.setLevel(os.environ.get("LOGLEVEL", "INFO"))
+    logger.propagate = False
+    handler = get_logging_handler(destination)
+    if isinstance(handler, logging.Handler):
+        logger.addHandler(handler)
+    else:
+        class _EventHandler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                handler.record(record.getMessage())
+
+        logger.addHandler(_EventHandler())
+    _events_loggers[destination] = logger
+    return logger
+
 
 def record(event: Event, destination: str = "null") -> None:
     """Dispatch ``event`` to the handler registered under ``destination``."""

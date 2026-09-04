@@ -53,3 +53,9 @@ class SignalExceptionHandler(ErrorHandler):
 
         if isinstance(exc, SignalException):
             raise exc
+
+
+def get_error_handler():
+    from .error_handler import ErrorHandler as DefaultErrorHandler
+
+    return DefaultErrorHandler()

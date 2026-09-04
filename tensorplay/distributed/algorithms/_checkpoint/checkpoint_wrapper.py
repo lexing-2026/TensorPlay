@@ -9,6 +9,7 @@ from typing import Any
 
 import tensorplay as tp
 import tensorplay.nn as nn
+from tensorplay.autograd import save_on_cpu
 from tensorplay.distributed.utils import (
     _pack_kwargs,
     _replace_by_prefix,
@@ -111,9 +112,8 @@ class OffloadWrapper(ActivationWrapper):
         super().__init__(*args, **kwargs)
 
     def forward(self, *args, **kwargs):
-        raise NotImplementedError(
-            "OffloadWrapper requires autograd-graph save_on_cpu support "
-        )
+        with save_on_cpu(pin_memory=True):
+            return self._checkpoint_wrapped_module(*args, **kwargs)
 
 
 class CheckpointWrapper(ActivationWrapper):

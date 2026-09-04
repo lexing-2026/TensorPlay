@@ -293,7 +293,6 @@ class DeviceMesh:
         if dim in self._dim_groups:
             return self._dim_groups[dim]
         my_global = dist.get_rank()
-        # find my coordinate along each axis via rank_map lookup
         try:
             pos = self._rank_map.index(my_global)
         except ValueError as e:
@@ -301,11 +300,23 @@ class DeviceMesh:
                 f"Rank {my_global} is not part of this DeviceMesh"
             ) from e
         coords = self._coords_of(pos)
-        ranks = self._ranks_along_dim(dim, coords)
-        kwargs = {"ranks": ranks}
-        if self._backend_override is not None:
-            kwargs["backend"] = self._backend_override
-        group = dist.new_group(**kwargs)
+        group = None
+        from itertools import product
+
+        other_ranges = [
+            range(size) if axis != dim else (0,)
+            for axis, size in enumerate(self._sizes)
+        ]
+        for line_coords in product(*other_ranges):
+            ranks = self._ranks_along_dim(dim, tuple(line_coords))
+            kwargs = {"ranks": ranks}
+            if self._backend_override is not None:
+                kwargs["backend"] = self._backend_override
+            candidate = dist.new_group(**kwargs)
+            if my_global in ranks:
+                group = candidate
+        if group is None:
+            raise RuntimeError(f"Rank {my_global} is not part of mesh dimension {dim}")
         self._dim_groups[dim] = group
         return group
 

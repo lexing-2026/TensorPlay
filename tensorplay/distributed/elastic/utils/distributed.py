@@ -6,7 +6,12 @@ from tensorplay.distributed import FileStore, Store, TCPStore
 
 from .logging import get_logger
 
-__all__ = ["create_core_store", "get_free_port", "get_socket_with_port"]
+__all__ = [
+    "create_core_store",
+    "create_c10d_store",
+    "get_free_port",
+    "get_socket_with_port",
+]
 
 logger = get_logger(__name__)
 
@@ -75,6 +80,44 @@ def _check_full_rank(store: Store, world_size: int, timeout: float) -> None:
         num = int(store.get(key, timeout=1))
     if num == world_size:
         store.delete_key(key)
+
+
+def create_c10d_store(
+    is_server: bool,
+    server_addr: str,
+    server_port: int = -1,
+    world_size: int = 1,
+    timeout: float = 600,
+    wait_for_workers: bool = True,
+    retries: int = 3,
+    use_libuv: bool | None = None,
+) -> Store:
+    del use_libuv
+    if server_port == -1 and world_size > 1:
+        raise ValueError(
+            f"server_port must be specified when world_size > 1, got server_port={server_port}, world_size={world_size}"
+        )
+    attempts = 1 if server_port != -1 else max(1, int(retries))
+    last_error: Exception | None = None
+    for _ in range(attempts):
+        port = get_free_port() if server_port == -1 else server_port
+        try:
+            store = TCPStore(
+                server_addr,
+                port,
+                world_size=world_size,
+                is_master=is_server,
+                timeout=timeout,
+                wait_for_workers=False,
+            )
+            if wait_for_workers:
+                _check_full_rank(store, world_size, timeout)
+            return store
+        except (OSError, RuntimeError) as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Store bootstrap failed")
 
 
 def get_free_port() -> int:

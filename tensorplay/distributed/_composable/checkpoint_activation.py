@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
-from typing import Any, AbstractSet
+from typing import Any, Callable
 
 import tensorplay.nn as nn
 from tensorplay.distributed._composable.contract import _get_registry
@@ -18,6 +18,9 @@ class _CheckpointState:
     enabled: bool = True
     context_fn: Any = None
     kwargs: dict[str, Any] | None = None
+    original_forward: Callable[..., Any] | None = None
+    wrapped_forward: Callable[..., Any] | None = None
+    _ac_generator: Any = None
 
 
 def _state(module: nn.Module) -> _CheckpointState:
@@ -53,23 +56,36 @@ def checkpoint(module: nn.Module, **kwargs: Any) -> nn.Module:
     state = _state(module)
     if state.kwargs is not None:
         raise RuntimeError("activation checkpointing is already enabled for this module")
-    state.kwargs = dict(kwargs)
-
-    def pre_hook(current: nn.Module, args: tuple[Any, ...], call_kwargs: dict[str, Any]):
-        current_state = _state(current)
-        if not current_state.enabled:
-            return None
-        current_state._context = current_state.context_fn() if current_state.context_fn else None
-        return args, call_kwargs
-
-    def post_hook(current: nn.Module, args: tuple[Any, ...], output: Any):
-        current_state = _state(current)
-        current_state._context = None
-        return output
 
     state.context_fn = kwargs.get("context_fn")
-    module.register_forward_pre_hook(pre_hook, with_kwargs=True)
-    module.register_forward_hook(post_hook, always_call=True)
+    state.kwargs = dict(kwargs)
+    state.kwargs.setdefault("use_reentrant", False)
+
+    original_forward = module.forward
+    state.original_forward = original_forward
+
+    def checkpointed_forward(*args: Any, **call_kwargs: Any) -> Any:
+        current_state = _state(module)
+        if not current_state.enabled:
+            return original_forward(*args, **call_kwargs)
+
+        def invoke(
+            packed_args: tuple[Any, ...],
+            packed_kwargs: dict[str, Any],
+        ) -> Any:
+            with _no_hook(module):
+                return original_forward(*packed_args, **packed_kwargs)
+
+        invoke.parameters = module.parameters
+        return _checkpoint_call(
+            invoke,
+            tuple(args),
+            dict(call_kwargs),
+            **dict(current_state.kwargs or {}),
+        )
+
+    state.wrapped_forward = checkpointed_forward
+    module.__dict__["forward"] = checkpointed_forward
     return module
 
 

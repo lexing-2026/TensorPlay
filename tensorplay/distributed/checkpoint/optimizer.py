@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import copy
+import math
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from typing import Any
 
 import tensorplay as tp
@@ -17,9 +19,13 @@ from .metadata import (
     TensorStorageMetadata,
 )
 from .planner import LoadPlan, LoadPlanner
+from .planner_helpers import _create_read_items, create_read_items_for_chunk_list
 from .state_dict_loader import load as load_state_dict
+from .utils import _element_wise_add, _element_wise_sub, _normalize_device_info
 
 __all__ = ["load_sharded_optimizer_state_dict"]
+
+STATE_DICT_2D_LAYOUT = dict[str, tuple[Sequence[int] | None, Sequence[int]]]
 
 
 def _gen_rank_device(global_rank: int, device_type: str = "cuda") -> str:
@@ -27,12 +33,15 @@ def _gen_rank_device(global_rank: int, device_type: str = "cuda") -> str:
     if device_type == "cpu":
         return "cpu"
     device_module = getattr(tp, device_type, None)
+    is_available = getattr(device_module, "is_available", None)
+    if callable(is_available) and not is_available():
+        return "cpu"
     count = getattr(device_module, "device_count", None)
     try:
         device_count = int(count()) if callable(count) else 1
     except Exception:
         device_count = 1
-    return f"{device_type}:{int(global_rank) % max(device_count, 1)}"
+    return _normalize_device_info(device_type, int(global_rank) % max(device_count, 1))
 
 
 def _group_device_type(process_group: Any = None) -> str:
@@ -54,52 +63,66 @@ def _group_global_ranks(process_group: Any = None) -> list[int]:
     ]
 
 
-def _create_colwise_spec(process_group: Any = None) -> Any:
+def _create_colwise_spec(pg: Any = None) -> Any:
     """Build a dimension-zero sharding specification for a process group."""
     from .._shard.sharding_spec import ChunkShardingSpec
 
-    device_type = _group_device_type(process_group)
+    device_type = _group_device_type(pg)
     placements = [
         f"rank:{rank}/{_gen_rank_device(rank, device_type)}"
-        for rank in _group_global_ranks(process_group)
+        for rank in _group_global_ranks(pg)
     ]
     return ChunkShardingSpec(dim=0, placements=placements)
 
 
-def _is_nested_tensor(value: Any) -> bool:
+def _is_nested_tensor(val: Any) -> bool:
     """Detect unsupported nested distributed tensor containers."""
     from .._shard.sharded_tensor import ShardedTensor
     from ..tensor import DTensor
 
-    if isinstance(value, ShardedTensor):
-        local_shards = value.local_shards()
+    if type(val) is ShardedTensor:
+        local_shards = val.local_shards()
         if not local_shards:
             return False
         local = local_shards[0].tensor
-        if isinstance(local, (ShardedTensor, DTensor)):
+        if type(local) is ShardedTensor:
+            return True
+        if type(local) is DTensor:
             raise ValueError("nested distributed tensor state is not supported")
         return False
-    if isinstance(value, DTensor) and isinstance(
-        value.to_local(), (ShardedTensor, DTensor)
-    ):
-        raise ValueError("nested distributed tensor state is not supported")
+    if type(val) is DTensor:
+        local = val.to_local()
+        if type(local) is DTensor or type(local) is ShardedTensor:
+            raise ValueError("nested distributed tensor state is not supported")
     return False
 
 
 def _alloc_tensor(
-    properties: TensorProperties,
+    props: TensorProperties,
     size: Sequence[int],
-    device: Any = None,
+    device_type: Any = "cuda",
 ) -> tp.Tensor:
-    """Allocate a tensor using checkpoint properties."""
+    if device_type is None:
+        device_type = "cpu"
+    if not isinstance(device_type, str):
+        device = device_type
+    elif device_type == "cpu":
+        device = "cpu"
+    else:
+        device_module = getattr(tp, device_type, None)
+        is_available = getattr(device_module, "is_available", None)
+        if callable(is_available) and not is_available():
+            device = "cpu"
+        else:
+            current_device = getattr(device_module, "current_device", None)
+            device_index = int(current_device()) if callable(current_device) else 0
+            device = _normalize_device_info(device_type, device_index)
     kwargs: dict[str, Any] = {
-        "dtype": properties.dtype,
-        "requires_grad": bool(properties.requires_grad),
+        "dtype": props.dtype,
+        "requires_grad": bool(props.requires_grad),
+        "pin_memory": bool(props.pin_memory),
+        "device": device,
     }
-    if device is not None:
-        kwargs["device"] = device
-    if properties.pin_memory:
-        kwargs["pin_memory"] = True
     return tp.empty(tuple(int(value) for value in size), **kwargs)
 
 
@@ -144,14 +167,30 @@ def _get_state_dict_2d_layout(
     """Collect local slices used by optimizer tensors."""
     specs: dict[str, tuple[Sequence[int] | None, Sequence[int]]] = {}
     process_group = None
+    from .._shard.sharded_tensor import ShardedTensor
+
     for key, value in state_dict.items():
         if not hasattr(value, "shape"):
             continue
-        _is_nested_tensor(value)
-        offset, size, group = _layout_for_value(value)
-        specs[str(key)] = (offset, size)
-        if process_group is None and group is not None:
-            process_group = group
+        specs[str(key)] = (None, tuple(int(item) for item in value.shape))
+        if _is_nested_tensor(value):
+            local_shards = value.local_shards()
+            if len(local_shards) != 1:
+                raise AssertionError("one local optimizer shard is required")
+            if not isinstance(value, ShardedTensor):
+                raise AssertionError("nested optimizer values must be sharded tensors")
+            shard = local_shards[0]
+            specs[str(key)] = (
+                tuple(int(item) for item in shard.metadata.shard_offsets),
+                tuple(int(item) for item in shard.metadata.shard_sizes),
+            )
+            process_group = getattr(shard.tensor, "_process_group", None)
+        else:
+            offset, size, group = _layout_for_value(value)
+            if offset is not None:
+                specs[str(key)] = (offset, size)
+            if process_group is None and group is not None:
+                process_group = group
     return specs, process_group
 
 
@@ -313,10 +352,6 @@ def _load_checkpoint_values(
     storage_reader: Any,
     planner: LoadPlanner | None,
 ) -> tuple[dict[str, Any], Metadata]:
-    if isinstance(storage_reader, (str, bytes)):
-        from .filesystem import FileSystemReader
-
-        storage_reader = FileSystemReader(storage_reader)
     if not hasattr(storage_reader, "read_metadata"):
         raise TypeError("storage_reader must provide read_metadata()")
     metadata = storage_reader.read_metadata()
@@ -336,80 +371,116 @@ def _load_checkpoint_values(
     return destination, metadata
 
 
-def _load_legacy_optimizer_state(
-    model: Any,
-    optimizer: Any,
-    checkpoint_id: Any,
-    process_group: Any = None,
-) -> dict[str, Any]:
-    del process_group
-    if not callable(getattr(model, "state_dict", None)):
-        raise TypeError("model must provide state_dict()")
-    if not callable(getattr(optimizer, "state_dict", None)):
-        raise TypeError("optimizer must provide state_dict()")
-    from .filesystem import FileSystemReader
-
-    loaded, metadata = _load_checkpoint_values(
-        model.state_dict(), "optimizer", FileSystemReader(checkpoint_id), None
-    )
-    result = _optimizer_result(loaded, metadata, "optimizer")
-    optimizer_state = result.get("optimizer", result)
-    load_optimizer = getattr(optimizer, "load_state_dict", None)
-    if callable(load_optimizer):
-        load_optimizer(optimizer_state)
-    return result
-
-
 def load_sharded_optimizer_state_dict(
-    model_state_dict: Any = None,
-    optimizer_key: Any = None,
-    storage_reader: Any = None,
+    model_state_dict: dict[str, Any],
+    optimizer_key: str,
+    storage_reader: Any,
     planner: LoadPlanner | None = None,
-    **legacy_kwargs: Any,
 ) -> dict[str, Any]:
-    """Load the optimizer portion of a distributed checkpoint.
-
-    The primary interface accepts a model state dictionary, an optimizer key,
-    and a storage reader.  A convenience form accepting ``model``,
-    ``optimizer`` and ``checkpoint_id`` is also accepted.
-    """
-    if model_state_dict is None and "model" in legacy_kwargs:
-        model_state_dict = legacy_kwargs.pop("model")
-        optimizer = legacy_kwargs.pop("optimizer", None)
-        checkpoint_id = legacy_kwargs.pop("checkpoint_id", None)
-        if optimizer is None or checkpoint_id is None:
-            raise TypeError("model, optimizer and checkpoint_id are required")
-        return _load_legacy_optimizer_state(
-            model_state_dict,
-            optimizer,
-            checkpoint_id,
-            legacy_kwargs.pop("process_group", None),
-        )
-
-    if not isinstance(optimizer_key, str):
-        if optimizer_key is None and "optimizer" in legacy_kwargs:
-            optimizer_key = legacy_kwargs.pop("optimizer")
-        if not isinstance(optimizer_key, str):
-            if storage_reader is None:
-                raise TypeError("optimizer_key must be a string")
-            return _load_legacy_optimizer_state(
-                model_state_dict,
-                optimizer_key,
-                storage_reader,
-                legacy_kwargs.pop("process_group", None),
-            )
-
-    if legacy_kwargs:
-        unexpected = next(iter(legacy_kwargs))
-        raise TypeError(f"unexpected argument {unexpected!r}")
     if not isinstance(model_state_dict, Mapping):
         raise TypeError("model_state_dict must be a mapping")
-    if storage_reader is None:
-        raise TypeError("storage_reader is required")
-    values, metadata = _load_checkpoint_values(
-        model_state_dict, optimizer_key, storage_reader, planner
+    metadata = storage_reader.read_metadata()
+    layout_specs, dp_pg = _get_state_dict_2d_layout(model_state_dict)
+    dp_pg_device_type = _group_device_type(dp_pg)
+    device_module = getattr(tp, dp_pg_device_type, None)
+    device_count = getattr(device_module, "device_count", None)
+    num_devices_per_node = (
+        max(int(device_count()), 1) if callable(device_count) else 1
     )
-    return _optimizer_result(values, metadata, optimizer_key)
+    if dist.is_initialized():
+        world_size = dist.get_world_size(dp_pg)
+        current_rank = dist.get_rank(dp_pg)
+        current_global_rank = dist.get_rank()
+    else:
+        world_size = 1
+        current_rank = 0
+        current_global_rank = 0
+
+    from .._shard.sharded_tensor import Shard, ShardedTensor
+    from .._shard.sharded_tensor import TensorProperties as ShardTensorProperties
+    from .._shard.sharding_spec import ChunkShardingSpec
+    from ..fsdp._shard_utils import _create_chunk_sharded_tensor
+
+    if dp_pg is None:
+        placements = [
+            f"rank:{rank}/{_gen_rank_device(rank, dp_pg_device_type)}"
+            for rank in range(world_size)
+        ]
+        sharding_spec = ChunkShardingSpec(dim=0, placements=placements)
+    else:
+        placements = [
+            f"rank:{rank}/{_gen_rank_device(rank, dp_pg_device_type)}"
+            for rank in _group_global_ranks(dp_pg)
+        ]
+        sharding_spec = ChunkShardingSpec(dim=0, placements=placements)
+
+    state_dict: dict[str, Any] = {}
+    fqn_to_offset: dict[str, Sequence[int]] = {}
+    planner_data = metadata.planner_data or {}
+    for key, description in metadata.state_dict_metadata.items():
+        key_path = planner_data.get(key, tuple(str(key).split(".")))
+        if not key_path or key_path[0] != optimizer_key:
+            continue
+        if isinstance(description, BytesStorageMetadata):
+            state_dict[key] = "<bytes_io>"
+            continue
+        if not isinstance(description, TensorStorageMetadata):
+            raise TypeError(f"unsupported metadata for {key}: {type(description)!r}")
+        size = tuple(int(item) for item in description.size)
+        if math.prod(size) == 1:
+            state_dict[key] = _alloc_tensor(
+                description.properties, size, dp_pg_device_type
+            )
+        elif dp_pg is None:
+            state_dict[key] = _create_chunk_sharded_tensor(
+                _alloc_tensor(description.properties, size, dp_pg_device_type),
+                rank=current_rank,
+                world_size=world_size,
+                num_devices_per_node=num_devices_per_node,
+                pg=dist._get_default_group() if dist.is_initialized() else None,
+            )
+        else:
+            spec_key = key_path[2] if len(key_path) > 2 else key
+            alloc_size = layout_specs.get(spec_key, (None, size))[1]
+            properties = ShardTensorProperties(
+                dtype=description.properties.dtype,
+                layout=description.properties.layout,
+                requires_grad=description.properties.requires_grad,
+                memory_format=description.properties.memory_format,
+                pin_memory=description.properties.pin_memory,
+            )
+            sharded_metadata = sharding_spec.build_metadata(alloc_size, properties)
+            local_shards = []
+            for shard_metadata in sharded_metadata.shards_metadata:
+                placement_rank = shard_metadata.placement.rank()
+                if int(placement_rank) != int(current_global_rank):
+                    continue
+                local_shards.append(
+                    Shard(
+                        tensor=_alloc_tensor(
+                            description.properties,
+                            shard_metadata.shard_sizes,
+                            dp_pg_device_type,
+                        ),
+                        metadata=shard_metadata,
+                    )
+                )
+            state_dict[key] = ShardedTensor._init_from_local_shards_and_global_metadata(
+                local_shards,
+                sharded_metadata,
+                sharding_spec,
+                dp_pg,
+            )
+            if spec_key in layout_specs and layout_specs[spec_key][0] is not None:
+                fqn_to_offset[key] = layout_specs[spec_key][0]
+
+    load_state_dict(
+        state_dict=state_dict,
+        storage_reader=storage_reader,
+        planner=_ReaderWithOffset(fqn_to_offset) if dp_pg is not None else planner,
+        process_group=dp_pg,
+    )
+    return unflatten_state_dict(state_dict, planner_data)
 
 
 class _ReaderWithOffset(DefaultLoadPlanner):
@@ -424,20 +495,47 @@ class _ReaderWithOffset(DefaultLoadPlanner):
         self.translation: dict[MetadataIndex, MetadataIndex] = {}
 
     def create_local_plan(self) -> LoadPlan:
-        plan = super().create_local_plan()
+        from .._shard.sharded_tensor import ShardedTensor
+
         self.translation = {}
-        for item in plan.items:
-            offset = self.fqn_to_offset.get(item.dest_index.fqn)
-            if offset is None or item.dest_index.offset is None:
+        requests = []
+        for fqn, value in self.state_dict.items():
+            metadata = self.metadata.state_dict_metadata[fqn]
+            if not isinstance(value, ShardedTensor):
+                requests.extend(_create_read_items(fqn, metadata, value))
                 continue
-            original = tuple(
-                int(left) - int(right)
-                for left, right in zip(item.dest_index.offset, offset)
+            if fqn not in self.fqn_to_offset:
+                requests.extend(_create_read_items(fqn, metadata, value))
+                continue
+            offset = self.fqn_to_offset[fqn]
+            local_shards = value.local_shards()
+            if len(local_shards) != 1:
+                raise AssertionError("one local optimizer shard is required")
+            original_shard = local_shards[0]
+            local_chunks = [
+                ChunkStorageMetadata(
+                    offsets=tuple(
+                        _element_wise_add(original_shard.metadata.shard_offsets, offset)
+                    ),
+                    sizes=tuple(original_shard.metadata.shard_sizes),
+                )
+            ]
+            read_items = create_read_items_for_chunk_list(
+                fqn, metadata, local_chunks
             )
-            self.translation[item.dest_index] = MetadataIndex(
-                item.dest_index.fqn, original, item.dest_index.index
-            )
-        return plan
+            for read_item in read_items:
+                if read_item.dest_index.offset is None:
+                    raise AssertionError("dest_index.offset must not be None")
+                original_offset = _element_wise_sub(
+                    read_item.dest_index.offset, offset
+                )
+                original_index = replace(
+                    read_item.dest_index,
+                    offset=tuple(original_offset),
+                )
+                self.translation[read_item.dest_index] = original_index
+            requests.extend(read_items)
+        return LoadPlan(requests)
 
     def lookup_tensor(self, index: MetadataIndex) -> tp.Tensor:
         return super().lookup_tensor(self.translation.get(index, index))

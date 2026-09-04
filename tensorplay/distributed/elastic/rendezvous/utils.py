@@ -167,3 +167,9 @@ class _PeriodicTimer:
     def cancel(self) -> None:
         """Stop the timer; the in-flight action is allowed to finish."""
         self._stop_requested = True
+
+    @staticmethod
+    def _stop_thread(thread, stop_event) -> None:
+        stop_event.set()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join()

@@ -19,6 +19,20 @@ SHAPE_KEY = "shape"
 DATA_KEY = "data"
 DTYPE_KEY = "dtype"
 DATA_OFFSETS_KEY = "data_offsets"
+DTYPE_MAP = {
+    "BOOL": tp.bool,
+    "U8": tp.uint8,
+    "I8": tp.int8,
+    "I16": tp.int16,
+    "I32": tp.int32,
+    "I64": tp.int64,
+    "U32": tp.uint32,
+    "U64": tp.uint64,
+    "F16": tp.float16,
+    "BF16": tp.bfloat16,
+    "F32": tp.float32,
+    "F64": tp.float64,
+}
 HF_DCP_VERSION = 1.0
 DCP_VERSION_KEY = "DCP_VERSION"
 DCP_SHARDING_INFO_KEY = "DCP_SHARDING_INFO"

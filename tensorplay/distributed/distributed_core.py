@@ -1229,6 +1229,7 @@ def new_group(ranks: Optional[List[int]] = None,
     if sort_ranks:
         ranks.sort()
     if _global_rank() not in ranks:
+        _group_count += 1
         if backend == Backend.MPI:
             _C.ProcessGroupMPI.create(ranks)
         return GroupMember.NON_GROUP_MEMBER

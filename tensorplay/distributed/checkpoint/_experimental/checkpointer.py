@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import abc
+import logging
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Any
+from typing import Any, TypeVar
 
 from .checkpoint_process import CheckpointProcess
 from .checkpoint_reader import CheckpointReader
 from .checkpoint_writer import CheckpointWriter
 from .staging import CheckpointStager
 from .types import STATE_DICT
+
+logger = logging.getLogger(__name__)
+LOG_INTERVAL = 60
+T = TypeVar("T")
 
 
 class Checkpointer(abc.ABC):

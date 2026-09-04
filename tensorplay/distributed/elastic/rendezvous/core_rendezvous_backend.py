@@ -13,7 +13,7 @@ import tempfile
 
 from tensorplay.distributed import FileStore, Store, StoreTimeoutError, TCPStore
 
-from .api import RendezvousConnectionError, RendezvousParameters
+from .api import RendezvousConnectionError, RendezvousParameters, RendezvousStateError
 from .utils import _matches_machine_hostname, parse_rendezvous_endpoint
 
 Token = int
@@ -71,8 +71,9 @@ class CoreRendezvousBackend(RendezvousBackend):
         base64_state = self._call_store("get", self._key, timeout=1)
         return self._decode_state(base64_state)
 
-    def set_state(self, value: bytes, token: Token) -> tuple[bytes, Token] | None:
+    def set_state(self, value: bytes, token: Token | None = None) -> tuple[bytes, Token] | None:
         self._check_reachable()
+        token = 0 if token is None else int(token)
         current_raw = self._read_raw()
         current = self._decode_state(current_raw)
         if current is not None:
@@ -157,8 +158,10 @@ class CoreRendezvousBackend(RendezvousBackend):
             token_str, _, payload = text.partition(":")
             state = base64.b64decode(payload)
             return state, int(token_str)
-        except (ValueError, TypeError):
-            return None
+        except (ValueError, TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RendezvousStateError(
+                "The rendezvous state is corrupt. See inner exception for details."
+            ) from exc
 
 
 def _create_tcp_store(params: RendezvousParameters) -> TCPStore:
