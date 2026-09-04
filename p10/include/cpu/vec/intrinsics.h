@@ -33,9 +33,12 @@
 
 // Runtime capability detection: used by the dispatch layer to select the
 // kernel compiled for the CPU's instruction set. Uses compiler builtins to
-// avoid a dependency on cpuinfo.
+// avoid a dependency on cpuinfo. The cpuid builtin exists on x86 targets
+// only; everywhere else (and on MSVC, which has no such builtin) the
+// dispatcher's non-AVX paths are the answer.
 inline bool tp_cpu_supports_avx2() {
-#if defined(__GNUC__) || defined(__clang__)
+#if (defined(__x86_64__) || defined(__i386__)) && \
+    (defined(__GNUC__) || defined(__clang__))
   return __builtin_cpu_supports("avx2");
 #else
   return false;
@@ -43,7 +46,8 @@ inline bool tp_cpu_supports_avx2() {
 }
 
 inline bool tp_cpu_supports_avx512() {
-#if defined(__GNUC__) || defined(__clang__)
+#if (defined(__x86_64__) || defined(__i386__)) && \
+    (defined(__GNUC__) || defined(__clang__))
   return __builtin_cpu_supports("avx512f") &&
       __builtin_cpu_supports("avx512vl") && __builtin_cpu_supports("avx512bw") &&
       __builtin_cpu_supports("avx512dq");
