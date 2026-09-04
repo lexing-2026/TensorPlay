@@ -3,6 +3,7 @@
 #include "Autograd.h"
 #include "Context.h"
 #include "Exception.h"
+#include "tensorplay/ops/TPXOpsGenerated.h"
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <complex>
@@ -10,6 +11,8 @@
 
 namespace tensorplay {
 namespace python {
+
+namespace ops = tensorplay::tpx::ops;
 
 using Tensor = tensorplay::Tensor;
 
@@ -248,11 +251,13 @@ inline Tensor list_to_tensor(PyObject* list, std::optional<DType> requested_dtyp
     // Determine target device
     Device target_device = device.value_or(globalContext().defaultDevice());
     
-    // Optimization: If target is CPU, create directly.
-    // If target is GPU, create on CPU first (staging) then copy.
-    // TODO: Use pinned memory for staging if target is GPU
-    
+    // Staging buffer: pinned host memory when the list will be copied to the
+    // GPU, so the H2D transfer runs asynchronously and is not pageable-
+    // copy bound.
     Tensor t = Tensor(shape, dtype, Device(DeviceType::CPU));
+    if (target_device.type() != DeviceType::CPU) {
+        t = ops::empty(shape, dtype, t.device(), /*pin_memory=*/true);
+    }
     
     // Dispatch copy_data based on dtype
     size_t index = 0;

@@ -31,6 +31,30 @@ using namespace tensorplay::python;
 using Tensor = tensorplay::tpx::Tensor; 
 using Tensor = tensorplay::Tensor;
 
+namespace {
+
+std::string tensor_repr(const Tensor& self) {
+    std::string result = self.toString();
+    std::string suffix;
+    try {
+        if (auto fn = tensorplay::tpx::impl::grad_fn(self)) {
+            suffix = ", grad_fn=<" + fn->name() + ">";
+        } else if (self.requires_grad()) {
+            suffix = ", requires_grad=True";
+        }
+    } catch (...) {
+        suffix = ", grad_fn=<Invalid>";
+    }
+
+    if (suffix.empty()) return result;
+    const auto closing = result.rfind(')');
+    if (closing == std::string::npos) return result + suffix;
+    result.insert(closing, suffix);
+    return result;
+}
+
+}
+
 // --- DLPack Helpers ---
 
 static DLDataType to_dlpack_dtype(DType dtype) {
@@ -3223,8 +3247,8 @@ void init_tensor(py::module_& m) {
         })
 
         // String repr
-        .def("__repr__", &Tensor::toString)
-        .def("__str__", &Tensor::toString)
+        .def("__repr__", &tensor_repr)
+        .def("__str__", &tensor_repr)
         // pybind's default always-true object truthiness (which made a 0-d
         // Bool tensor bool(t) == True even when t.item() == False).
         .def("__bool__", [](const Tensor& self) -> bool {

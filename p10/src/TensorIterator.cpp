@@ -692,7 +692,6 @@ void TensorIteratorBase::serial_for_each(loop2d_t loop, Range range) const {
 }
 
 bool TensorIteratorBase::is_trivial_1d() const {
-  // TODO: check for casting once it's supported
   return ndim() == 1;
 }
 
@@ -793,7 +792,6 @@ TensorIterator TensorIterator::reduce_op(Tensor& out, const Tensor& a) {
     .add_owned_const_input(a)
     .resize_outputs(false)
     .is_reduction(true)
-    // TODO: not supporting casting to outputs is only really necessary for arg{min,max}
     .promote_inputs_to_common_dtype(true)
     .build();
 }
@@ -831,7 +829,6 @@ void TensorIteratorBase::populate_operands(TensorIteratorConfig& config) {
 }
 
 void TensorIteratorBase::mark_outputs() {
-  // TODO: merge this into populate_operands
   for (const auto i : irange(num_outputs_)) {
     operands_[i].is_output = true;
     const auto& output = tensor(i);
@@ -1006,7 +1003,6 @@ int TensorIteratorBase::get_dim_to_split() const {
 bool TensorIteratorBase::fast_set_up(const TensorIteratorConfig& config) {
   // This function tries to do a fast setup to avoid needless reordering of dimensions and tracking output strides
   // Return true if it can do fast setup or false otherwise
-  // TODO enable fast handling for reductions
   FastSetupType setup_type = compute_fast_setup_type(config);
   if (setup_type == FastSetupType::NONE) {
     return false;

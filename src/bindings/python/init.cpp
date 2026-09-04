@@ -8,6 +8,7 @@
 #include "Graph.h"
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 // Extern declarations (if not in header)
 void init_scalar(py::module_& m);
@@ -274,6 +275,43 @@ int install_factory_fast_paths_impl(py::module_& m, py::dict wrappers) {
     return 0;
 }
 
+py::tuple dtensor_compute_global_tensor_info(
+    const Tensor& tensor,
+    const py::object& mesh,
+    const py::sequence& placements) {
+    auto shape = static_cast<std::vector<int64_t>>(tensor.shape());
+    auto strides = tensor.strides();
+    const Py_ssize_t count = py::len(placements);
+    for (Py_ssize_t index = 0; index < count; ++index) {
+        const py::object placement = placements[index];
+        const bool is_shard = py::cast<bool>(placement.attr("is_shard")());
+        if (is_shard) {
+            const int64_t shard_dim = py::cast<int64_t>(placement.attr("dim"));
+            if (shard_dim < 0 || shard_dim >= tensor.dim()) {
+                throw py::index_error("sharding dimension is outside tensor rank");
+            }
+            const int64_t mesh_dim_size = py::cast<int64_t>(
+                mesh.attr("size")(index));
+            shape[static_cast<size_t>(shard_dim)] *= mesh_dim_size;
+            for (size_t dim = 0; dim < strides.size(); ++dim) {
+                if (static_cast<int64_t>(dim) != shard_dim &&
+                    strides[dim] >= strides[static_cast<size_t>(shard_dim)]) {
+                    strides[dim] *= mesh_dim_size;
+                }
+            }
+            continue;
+        }
+        const bool is_replicate =
+            py::cast<bool>(placement.attr("is_replicate")());
+        const bool is_partial =
+            py::cast<bool>(placement.attr("is_partial")());
+        if (!is_replicate && !is_partial) {
+            throw py::type_error("unsupported placement type");
+        }
+    }
+    return py::make_tuple(std::move(shape), std::move(strides));
+}
+
 } // anonymous namespace
 
 PYBIND11_MODULE(_C, m) {
@@ -331,6 +369,12 @@ PYBIND11_MODULE(_C, m) {
     init_distributed_autograd(m);
     init_filecheck(m);
     init_cuda_graph(m);
+
+    m.def("_DTensor_compute_global_tensor_info",
+          &dtensor_compute_global_tensor_info,
+          "tensor"_a,
+          "mesh"_a,
+          "placements"_a);
 
     // CUDA availability
     m.def("is_cuda_available", []() {

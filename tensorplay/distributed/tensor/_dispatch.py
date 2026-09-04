@@ -588,13 +588,18 @@ class OpDispatcher:
             {
                 "native_dropout",
                 "normal_",
+                "normal",
                 "rand_like",
                 "randn_like",
                 "randint_like",
                 "randint_like_low_dtype",
                 "uniform_",
+                "uniform",
                 "bernoulli",
                 "bernoulli_",
+                "log_normal",
+                "exponential",
+                "geometric",
             }
         )
         self._custom_op_handlers: dict[Any, Callable[..., Any]] = {

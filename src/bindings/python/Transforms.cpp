@@ -1,5 +1,7 @@
 #include "python_bindings.h"
 
+#include <memory>
+
 #include "TransformDispatch.h"
 
 namespace {
@@ -14,7 +16,35 @@ tensorplay::transform::Randomness parse_randomness(const std::string& value) {
 
 } // namespace
 
+namespace {
+
+struct PyDisableTransforms {
+    PyDisableTransforms()
+        : guard(std::make_unique<tensorplay::transform::DisableTransformsGuard>()) {}
+
+    PyDisableTransforms& enter() { return *this; }
+
+    bool exit(const py::object&, const py::object&, const py::object&) {
+        guard.reset();
+        return false;
+    }
+
+    std::unique_ptr<tensorplay::transform::DisableTransformsGuard> guard;
+};
+
+} // namespace
+
 void init_transforms(py::module_& m) {
+    m.def("_are_functorch_transforms_active", []() {
+        return tensorplay::transform::are_transforms_active();
+    });
+
+    py::class_<PyDisableTransforms>(m, "_DisableFuncTorch")
+        .def(py::init<>())
+        .def("__enter__", &PyDisableTransforms::enter,
+             py::return_value_policy::reference_internal)
+        .def("__exit__", &PyDisableTransforms::exit);
+
     m.def("_transform_push_vmap", [](int64_t batch_size,
                                       const std::string& randomness) {
         return tensorplay::transform::push_vmap(
