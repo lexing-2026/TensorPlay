@@ -38,6 +38,11 @@ on:
         type: boolean
         default: false
         description: Upload the tested wheel to a GitHub Release
+      run_cpu_benchmarks:
+        required: false
+        type: boolean
+        default: false
+        description: Run CPU benchmarks against the installed reference runtime
       build_version:
         required: false
         type: string
@@ -192,26 +197,6 @@ jobs:
           print("CUDA wheel import ok:", getattr(tp, "__version__", "ok"))
           PY
 
-      - name: Upload tested wheel to GitHub Release
-        if: ${{ inputs.upload_release && (startsWith(github.ref, 'refs/tags/v') || inputs.build_version != '') }}
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          if [[ "${{ inputs.build_version }}" != "" ]]; then
-            release="nightly"
-          else
-            release="$GITHUB_REF_NAME"
-          fi
-          gh release upload "$release" dist/*.whl \
-            --repo "$GITHUB_REPOSITORY" \
-            --clobber
-      run_cpu_benchmarks:
-        required: false
-        type: boolean
-        default: false
-        description: Run CPU benchmarks against the installed reference runtime
       - name: Install CPU performance reference
         if: ${{ inputs.run_cpu_benchmarks && inputs.cuda == 'cpu' }}
         shell: bash
@@ -241,3 +226,18 @@ jobs:
             cpu-train-step.log
           if-no-files-found: warn
 
+      - name: Upload tested wheel to GitHub Release
+        if: ${{ inputs.upload_release && (startsWith(github.ref, 'refs/tags/v') || inputs.build_version != '') }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ "${{ inputs.build_version }}" != "" ]]; then
+            release="nightly"
+          else
+            release="$GITHUB_REF_NAME"
+          fi
+          gh release upload "$release" dist/*.whl \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
