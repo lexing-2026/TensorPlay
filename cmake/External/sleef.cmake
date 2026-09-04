@@ -53,6 +53,11 @@ function(_tp_add_vendored_sleef)
         CACHE PATH "" FORCE)
     unset(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
     unset(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT CACHE)
+    # The vendored tree provisions tlfloat itself; never let SLEEF's
+    # pkg-config probe answer instead, because it resolves the dependency
+    # to a bare -l name whose search directory stays scoped to SLEEF's
+    # subdirectory and never reaches the compute library's link line.
+    set(CMAKE_DISABLE_FIND_PACKAGE_PkgConfig ON)
     set(BUILD_SHARED_LIBS OFF)
     set(SLEEF_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
     set(SLEEF_BUILD_LIBM ON CACHE BOOL "" FORCE)
@@ -75,7 +80,22 @@ function(_tp_add_vendored_sleef)
     # after that value has been captured.
     set(CMAKE_INSTALL_PREFIX "${TP_SAVED_INSTALL_PREFIX}"
         CACHE PATH "" FORCE)
+    set(CMAKE_DISABLE_FIND_PACKAGE_PkgConfig OFF)
 endfunction()
 
 _tp_add_vendored_sleef()
 message(STATUS "Building vendored SLEEF (static)")
+# Belt and braces for the link line: if SLEEF's configure still resolved
+# tlfloat to a bare -l name, replace it with the archive location the
+# vendored install step is known to produce, so the compute library links
+# regardless of which resolution branch SLEEF took.
+if(TARGET sleef AND DEFINED TLFLOAT_LIBRARIES
+   AND NOT TLFLOAT_LIBRARIES MATCHES "/")
+    set(TP_TLFLOAT_ARCHIVE
+        "${CMAKE_BINARY_DIR}/third_party/sleef-prefix/lib/${CMAKE_STATIC_LIBRARY_PREFIX}tlfloat${CMAKE_STATIC_LIBRARY_SUFFIX}")
+    if(EXISTS "${TP_TLFLOAT_ARCHIVE}")
+        set(TLFLOAT_LIBRARIES "${TP_TLFLOAT_ARCHIVE}")
+        set(TLFLOAT_LIBRARY_DIRS "")
+        message(STATUS "Rewrote bare tlfloat reference to ${TP_TLFLOAT_ARCHIVE}")
+    endif()
+endif()
