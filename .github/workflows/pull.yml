@@ -64,6 +64,10 @@ jobs:
   cpu-build:
     name: ${{ matrix.build_name }}-build-test
     needs: define-wheel-matrix
+    permissions:
+      # Job-level grant so the called workflow's contents:write job does not
+      # count as a permission elevation over the workflow-level read-all.
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -78,6 +82,8 @@ jobs:
   cuda-build:
     name: ${{ matrix.build_name }}-build-test
     needs: define-wheel-matrix
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
