@@ -999,7 +999,7 @@ __global__ __launch_bounds__(256, 2) void sdpa_wmma_flash_half_aligned_kernel(
     const tensorplay::Half* __restrict__ v,
     tensorplay::Half* __restrict__ out,
     int64_t B, int64_t H, int64_t T, int64_t D, float scale,
-    bool is_causal, int debug_mode) {
+    bool is_causal) {
   using namespace nvcuda;
   constexpr int q_tile = 64;
   constexpr int k_tile = 64;
@@ -1092,18 +1092,6 @@ __global__ __launch_bounds__(256, 2) void sdpa_wmma_flash_half_aligned_kernel(
     }
     __syncthreads();
 
-    // Temporary validation hook: mode 1 exposes the raw scaled QK tile
-    // before masking/softmax, isolating the WMMA QK schedule itself.
-    if (debug_mode == 1) {
-      for (int idx = thread; idx < q_tile * k_tile; idx += threads) {
-        const int qr = idx / k_tile;
-        const int kk = idx % k_tile;
-        out_half[bh_base + (q0 + qr) * D + kk] =
-            __float2half(smem.transient.score[qr][kk] * scale);
-      }
-      return;
-    }
-
     // Online softmax over this key tile.  All lanes participate in both
     // reductions; lane zero only publishes the three scalar row states.
     if (warp < warps) {
@@ -1147,19 +1135,6 @@ __global__ __launch_bounds__(256, 2) void sdpa_wmma_flash_half_aligned_kernel(
       }
     }
     __syncthreads();
-
-    // Temporary validation hook for the native tile.  It writes the compact
-    // P tile into the first 64 columns of the public output and returns;
-    // this isolates QK/softmax from the WMMA PV and epilogue.
-    if (debug_mode == 2) {
-      for (int idx = thread; idx < q_tile * k_tile; idx += threads) {
-        const int qr = idx / k_tile;
-        const int kk = idx % k_tile;
-        out_half[bh_base + (q0 + qr) * D + kk] =
-            smem.transient.probability[qr][kk];
-      }
-      return;
-    }
 
     // Bring the previous numerator into the new max coordinate before the
     // Tensor Core PV update.  Each lane's accumulator fragment elements map
@@ -1806,8 +1781,7 @@ Tensor sdpa_kernel_cuda(const Tensor& query, const Tensor& key, const Tensor& va
         getCurrentCUDAStream().stream()>>>(
         q.data_ptr<tensorplay::Half>(), k.data_ptr<tensorplay::Half>(),
         v.data_ptr<tensorplay::Half>(), out.data_ptr<tensorplay::Half>(),
-        B, H, T, D, scale, is_causal,
-        impl == 6 ? 1 : (impl == 7 ? 2 : 0));
+        B, H, T, D, scale, is_causal);
     TP_CUDA_CHECK(cudaGetLastError());
     return out;
 #endif  // TP_HAS_NATIVE_CUTE_FLASH

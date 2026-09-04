@@ -6,6 +6,8 @@
 #include "../impl/Common.h"
 #include "../api/ShaderRegistry.h"
 
+#include <functional>
+
 namespace tensorplay {
 namespace vulkan {
 namespace ops {
@@ -252,10 +254,54 @@ Tensor full_kernel(
 /*
  * Host-computed factories: the values are materialized on the CPU with the
  * same formulas the CPU factory kernels apply, then streamed into the
- * payload through the staging pipeline, which covers every VkFormat.  Both
- * shapes are 1d, i.e. one value per spatial position on channel lane 0 of
- * the packed staging layout.
+ * payload through the staging pipeline, which covers every VkFormat.  The
+ * staging buffer carries the texture's element type, so the writer is
+ * instantiated per element width the backend supports.
  */
+Device resolve_device(std::optional<Device> device);
+
+template <typename T>
+void scatter_staging_1d(
+    api::vTensor& v,
+    int64_t steps,
+    const std::function<double(int64_t)>& fill) {
+  Tensor host = utils::create_staging_tensor(v);
+  T* data = static_cast<T*>(host.impl()->storage().data());
+  for (int64_t i = 0; i < steps; ++i) {
+    data[i * 4] = static_cast<T>(fill(i));
+  }
+  utils::upload_host_bytes(
+      v, host.impl()->storage().data(), host.numel() * host.itemsize());
+}
+
+void scatter_staging_values_1d(
+    api::vTensor& v,
+    int64_t steps,
+    const std::function<double(int64_t)>& fill) {
+  switch (v.texture_dtype()) {
+    case DType::Float32:
+      scatter_staging_1d<float>(v, steps, fill);
+      return;
+    case DType::Float16:
+      scatter_staging_1d<tensorplay::Half>(v, steps, fill);
+      return;
+    case DType::Int32:
+      scatter_staging_1d<int32_t>(v, steps, fill);
+      return;
+    case DType::Int8:
+    case DType::Bool:
+      scatter_staging_1d<int8_t>(v, steps, fill);
+      return;
+    case DType::UInt8:
+      scatter_staging_1d<uint8_t>(v, steps, fill);
+      return;
+    default:
+      TP_THROW(
+          NotImplementedError,
+          "Vulkan host-filled factory: unsupported texture dtype");
+  }
+}
+
 template <typename Filler>
 Tensor host_filled_1d(int64_t steps, DType dtype, Device device, Filler fill) {
   Tensor t = zeros_kernel({steps}, dtype, device, false);
@@ -266,13 +312,8 @@ Tensor host_filled_1d(int64_t steps, DType dtype, Device device, Filler fill) {
   TP_CHECK(
       v.storage_type() == api::StorageType::TEXTURE_3D,
       "Vulkan host-filled factories require texture storage");
-  Tensor host = utils::create_staging_tensor(v);
-  float* data = host.data_ptr<float>();
-  for (int64_t i = 0; i < steps; ++i) {
-    data[i * 4] = fill(i);
-  }
-  utils::upload_host_bytes(
-      v, host.impl()->storage().data(), host.numel() * host.itemsize());
+  scatter_staging_values_1d(
+      v, steps, [fill](int64_t i) { return static_cast<double>(fill(i)); });
   return t;
 }
 
@@ -282,7 +323,10 @@ Tensor eye_kernel(
     DType dtype,
     std::optional<Device> device) {
   if (m < 0) m = n;
-  TP_CHECK(dtype == DType::Float32, "Vulkan eye supports Float32 only");
+  TP_CHECK(
+      dtype == DType::Float32 || dtype == DType::Float16 ||
+          dtype == DType::Int32,
+      "Vulkan eye supports Float32, Float16 and Int32 only");
   Tensor t = zeros_kernel({n, m}, dtype, resolve_device(device), false);
   if (t.numel() == 0) {
     return t;
@@ -292,13 +336,31 @@ Tensor eye_kernel(
       v.storage_type() == api::StorageType::TEXTURE_3D,
       "Vulkan eye requires texture storage");
   Tensor host = utils::create_staging_tensor(v);
-  float* data = host.data_ptr<float>();
+  const int64_t itemsize = host.itemsize();
+  uint8_t* bytes = static_cast<uint8_t*>(host.impl()->storage().data());
   // {n, m}: N=1, C=n (row), H=1, W=m (column); the diagonal lives one
   // element per channel lane across the width.
   for (int64_t i = 0; i < std::min(n, m); ++i) {
     const int64_t z = i / 4;
     const int64_t lane = i % 4;
-    data[((z * 1 + 0) * m + i) * 4 + lane] = 1.0f;
+    const int64_t byte_offset =
+        (((z * 1 + 0) * m + i) * 4 + lane) * itemsize;
+    switch (v.texture_dtype()) {
+      case DType::Float32:
+        *reinterpret_cast<float*>(bytes + byte_offset) = 1.0f;
+        break;
+      case DType::Float16:
+        *reinterpret_cast<tensorplay::Half*>(bytes + byte_offset) =
+            tensorplay::Half(1.0f);
+        break;
+      case DType::Int32:
+        *reinterpret_cast<int32_t*>(bytes + byte_offset) = 1;
+        break;
+      default:
+        TP_THROW(
+            NotImplementedError,
+            "Vulkan eye: unsupported texture dtype");
+    }
   }
   utils::upload_host_bytes(
       v, host.impl()->storage().data(), host.numel() * host.itemsize());
@@ -312,13 +374,16 @@ Tensor linspace_kernel(
     DType dtype,
     std::optional<Device> device) {
   TP_CHECK(steps >= 0, "number of steps must be non-negative");
-  TP_CHECK(dtype == DType::Float32, "Vulkan linspace supports Float32 only");
+  TP_CHECK(
+      dtype == DType::Float32 || dtype == DType::Float16 ||
+          dtype == DType::Int32,
+      "Vulkan linspace supports Float32, Float16 and Int32 only");
   const double s = start.toDouble();
   const double e = end.toDouble();
   const double step = steps > 1 ? (e - s) / (steps - 1) : 0.0;
   return host_filled_1d(
       steps, dtype, resolve_device(device),
-      [&](int64_t i) { return static_cast<float>(s + i * step); });
+      [&](int64_t i) { return s + i * step; });
 }
 
 Tensor logspace_kernel(
@@ -329,15 +394,16 @@ Tensor logspace_kernel(
     DType dtype,
     std::optional<Device> device) {
   TP_CHECK(steps >= 0, "number of steps must be non-negative");
-  TP_CHECK(dtype == DType::Float32, "Vulkan logspace supports Float32 only");
+  TP_CHECK(
+      dtype == DType::Float32 || dtype == DType::Float16 ||
+          dtype == DType::Int32,
+      "Vulkan logspace supports Float32, Float16 and Int32 only");
   const double s = start.toDouble();
   const double e = end.toDouble();
   const double step = steps > 1 ? (e - s) / (steps - 1) : 0.0;
   return host_filled_1d(
       steps, dtype, resolve_device(device),
-      [&](int64_t i) {
-        return static_cast<float>(std::pow(base, s + i * step));
-      });
+      [&](int64_t i) { return std::pow(base, s + i * step); });
 }
 
 Tensor empty_like_kernel(
@@ -453,6 +519,9 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, FactoryKernels) {
   m.impl("ones_like", &tensorplay::vulkan::ops::ones_like_kernel);
   m.impl("full_like", &tensorplay::vulkan::ops::full_like_kernel);
   m.impl("fill_.Scalar", &tensorplay::vulkan::ops::fill_kernel);
+  m.impl("eye", &tensorplay::vulkan::ops::eye_kernel);
+  m.impl("linspace", &tensorplay::vulkan::ops::linspace_kernel);
+  m.impl("logspace", &tensorplay::vulkan::ops::logspace_kernel);
 }
 
 #endif /* USE_VULKAN */
