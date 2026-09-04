@@ -58,12 +58,13 @@ endif()
 # ---------------------------------------------------------------------------
 # Vendored source tree (subdirectory build)
 # ---------------------------------------------------------------------------
-set(MKLDNN_ROOT "${PROJECT_SOURCE_DIR}/third_party/oneDNN")
+set(MKLDNN_ROOT "${PROJECT_SOURCE_DIR}/third_party/oneDNN" CACHE PATH "oneDNN source tree")
 
 find_path(MKLDNN_VENDORED_INCLUDE_DIR
     NAMES dnnl.h dnnl.hpp
     PATHS "${MKLDNN_ROOT}"
     PATH_SUFFIXES include include/oneapi/dnnl
+    NO_DEFAULT_PATH
 )
 
 if(NOT MKLDNN_VENDORED_INCLUDE_DIR)
@@ -75,6 +76,24 @@ if(NOT MKLDNN_VENDORED_INCLUDE_DIR)
             return()
         endif()
     endif()
+    # Configure-time fetch: clone the pinned release when neither a vendored
+    # checkout nor a system installation is available (fresh CI runners).
+    set(MKLDNN_FETCH_ROOT "${CMAKE_BINARY_DIR}/third_party/oneDNN")
+    find_package(Git REQUIRED)
+    message(STATUS "Fetching oneDNN v3.12 into ${MKLDNN_FETCH_ROOT}")
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} clone --depth 1 --branch v3.12
+                https://github.com/uxlfoundation/oneDNN
+                "${MKLDNN_FETCH_ROOT}"
+        RESULT_VARIABLE _tp_onednn_clone
+        OUTPUT_QUIET)
+    if(_tp_onednn_clone EQUAL 0)
+        set(MKLDNN_ROOT "${MKLDNN_FETCH_ROOT}")
+        set(MKLDNN_VENDORED_INCLUDE_DIR "${MKLDNN_FETCH_ROOT}/include")
+    endif()
+endif()
+
+if(NOT MKLDNN_VENDORED_INCLUDE_DIR)
     message(STATUS "oneDNN source files not found! Initialize the checkout:"
         "\n  mkdir -p third_party && cp -a <oneDNN source> third_party/oneDNN")
     set(MKLDNN_FOUND FALSE)
