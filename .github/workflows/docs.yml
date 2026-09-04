@@ -40,6 +40,10 @@ jobs:
 
       # Sphinx autodoc imports tensorplay._C, so the extension must be built.
       # CPU-only keeps the build fast and GPU-free.
+      - name: Restore vendored build dependencies
+        shell: bash
+        run: bash .github/scripts/restore-vendored-deps.sh
+
       - name: Build and install TensorPlay (CPU only)
         run: |
           python -m pip install --upgrade pip
