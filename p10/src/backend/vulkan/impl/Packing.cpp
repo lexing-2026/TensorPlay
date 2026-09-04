@@ -43,7 +43,78 @@ struct ToFromTextureParams final {
   api::utils::ivec2 channelInfo;
 };
 
+//
+// Shared record path for the packed-layout conversions.  The shader reads
+// the channel-packed source through its sampler and writes texels whose
+// vec4 lanes follow the target packing; the launch grid covers the output
+// extents, which encode the packed dimension of the target layout.
+//
+api::vTensor channel_image_repacking(
+    const api::vTensor& v_input,
+    const api::GPUMemoryLayout target_layout,
+    const api::ShaderInfo& shader_descriptor) {
+  api::Context* const context = api::context();
+
+  api::vTensor v_output{
+      context,
+      v_input.sizes(),
+      v_input.dtype(),
+      v_input.storage_type(),
+      target_layout,
+  };
+
+  api::PipelineBarrier pipeline_barrier{};
+
+  // The shader indexes the source through its logical {N, C, H, W} sizes;
+  // front-pad the sizes with ones so 2D/3D tensors address like 4D.
+  const struct Block final {
+    api::utils::ivec4 sizes;
+  } block{
+      api::utils::make_ivec4_prepadded1(v_input.sizes()),
+  };
+
+  api::UniformParamsBuffer params(context, block);
+
+  context->submit_compute_job(
+      // shader descriptor
+      shader_descriptor,
+      // pipeline barrier
+      pipeline_barrier,
+      // global work group size
+      v_output.extents(),
+      // local work group size
+      adaptive_work_group_size(v_output.extents()),
+      // fence handle
+      VK_NULL_HANDLE,
+      // shader arguments
+      v_output.image(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::WRITE),
+      v_input.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+      // params buffer
+      params.buffer());
+
+  return v_output;
+}
+
 } // namespace
+
+api::vTensor convert_image_channels_packed_to_width_packed(
+    const api::vTensor& v_input) {
+  return channel_image_repacking(
+      v_input,
+      api::GPUMemoryLayout::TENSOR_WIDTH_PACKED,
+      VK_KERNEL(convert_channels_to_width_packed));
+}
+
+api::vTensor convert_image_channels_packed_to_height_packed(
+    const api::vTensor& v_input) {
+  return channel_image_repacking(
+      v_input,
+      api::GPUMemoryLayout::TENSOR_HEIGHT_PACKED,
+      VK_KERNEL(convert_channels_to_height_packed));
+}
 
 void record_nchw_to_image_op(
     api::Context* const context,

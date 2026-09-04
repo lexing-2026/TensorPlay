@@ -72,7 +72,8 @@ struct ShaderInfo final {
       std::string,
       const uint32_t*,
       const uint32_t,
-      std::vector<VkDescriptorType>);
+      std::vector<VkDescriptorType>,
+      const utils::uvec3 out_tile_size = {1u, 1u, 1u});
 };
 
 bool operator==(const ShaderInfo& _1, const ShaderInfo& _2);

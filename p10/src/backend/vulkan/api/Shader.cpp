@@ -84,14 +84,15 @@ ShaderInfo::ShaderInfo(
     std::string kernel,
     const uint32_t* const code,
     const uint32_t num_code_words,
-    std::vector<VkDescriptorType> layout)
+    std::vector<VkDescriptorType> layout,
+    const utils::uvec3 out_tile_size)
     : src_code{
           code,
           num_code_words,
       },
       kernel_name(std::move(kernel)),
       kernel_layout(std::move(layout)),
-      out_tile_size{1u, 1u, 1u} {
+      out_tile_size(out_tile_size) {
   VK_CHECK_COND(code, "Shader binary cannot be null!");
   VK_CHECK_COND(num_code_words > 0u, "Shader binary cannot be empty!");
   VK_CHECK_COND(!kernel_layout.empty(), "Shader layout signature cannot be empty!");

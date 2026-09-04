@@ -249,6 +249,97 @@ Tensor full_kernel(
   return t;
 }
 
+/*
+ * Host-computed factories: the values are materialized on the CPU with the
+ * same formulas the CPU factory kernels apply, then streamed into the
+ * payload through the staging pipeline, which covers every VkFormat.  Both
+ * shapes are 1d, i.e. one value per spatial position on channel lane 0 of
+ * the packed staging layout.
+ */
+template <typename Filler>
+Tensor host_filled_1d(int64_t steps, DType dtype, Device device, Filler fill) {
+  Tensor t = zeros_kernel({steps}, dtype, device, false);
+  if (steps == 0) {
+    return t;
+  }
+  api::vTensor v = convert(t);
+  TP_CHECK(
+      v.storage_type() == api::StorageType::TEXTURE_3D,
+      "Vulkan host-filled factories require texture storage");
+  Tensor host = utils::create_staging_tensor(v);
+  float* data = host.data_ptr<float>();
+  for (int64_t i = 0; i < steps; ++i) {
+    data[i * 4] = fill(i);
+  }
+  utils::upload_host_bytes(
+      v, host.impl()->storage().data(), host.numel() * host.itemsize());
+  return t;
+}
+
+Tensor eye_kernel(
+    int64_t n,
+    int64_t m,
+    DType dtype,
+    std::optional<Device> device) {
+  if (m < 0) m = n;
+  TP_CHECK(dtype == DType::Float32, "Vulkan eye supports Float32 only");
+  Tensor t = zeros_kernel({n, m}, dtype, resolve_device(device), false);
+  if (t.numel() == 0) {
+    return t;
+  }
+  api::vTensor v = convert(t);
+  TP_CHECK(
+      v.storage_type() == api::StorageType::TEXTURE_3D,
+      "Vulkan eye requires texture storage");
+  Tensor host = utils::create_staging_tensor(v);
+  float* data = host.data_ptr<float>();
+  // {n, m}: N=1, C=n (row), H=1, W=m (column); the diagonal lives one
+  // element per channel lane across the width.
+  for (int64_t i = 0; i < std::min(n, m); ++i) {
+    const int64_t z = i / 4;
+    const int64_t lane = i % 4;
+    data[((z * 1 + 0) * m + i) * 4 + lane] = 1.0f;
+  }
+  utils::upload_host_bytes(
+      v, host.impl()->storage().data(), host.numel() * host.itemsize());
+  return t;
+}
+
+Tensor linspace_kernel(
+    Scalar start,
+    Scalar end,
+    int64_t steps,
+    DType dtype,
+    std::optional<Device> device) {
+  TP_CHECK(steps >= 0, "number of steps must be non-negative");
+  TP_CHECK(dtype == DType::Float32, "Vulkan linspace supports Float32 only");
+  const double s = start.toDouble();
+  const double e = end.toDouble();
+  const double step = steps > 1 ? (e - s) / (steps - 1) : 0.0;
+  return host_filled_1d(
+      steps, dtype, resolve_device(device),
+      [&](int64_t i) { return static_cast<float>(s + i * step); });
+}
+
+Tensor logspace_kernel(
+    Scalar start,
+    Scalar end,
+    int64_t steps,
+    double base,
+    DType dtype,
+    std::optional<Device> device) {
+  TP_CHECK(steps >= 0, "number of steps must be non-negative");
+  TP_CHECK(dtype == DType::Float32, "Vulkan logspace supports Float32 only");
+  const double s = start.toDouble();
+  const double e = end.toDouble();
+  const double step = steps > 1 ? (e - s) / (steps - 1) : 0.0;
+  return host_filled_1d(
+      steps, dtype, resolve_device(device),
+      [&](int64_t i) {
+        return static_cast<float>(std::pow(base, s + i * step));
+      });
+}
+
 Tensor empty_like_kernel(
     const Tensor& self,
     DType dtype,

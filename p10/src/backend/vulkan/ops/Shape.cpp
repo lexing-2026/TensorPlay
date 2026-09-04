@@ -508,6 +508,176 @@ Tensor stack_kernel(const std::vector<Tensor>& tensors, int64_t dim) {
   return cat_kernel(unsqueezed, dim);
 }
 
+/*
+ * Tiling via repeated concatenation, one output axis at a time.  The
+ * source is padded to the repeat rank with leading singleton axes first;
+ * short repeat lists are promoted with leading ones by the tile() entry,
+ * matching the public tiling contract.
+ */
+Tensor repeat_kernel(const Tensor& self, const std::vector<int64_t>& repeats) {
+  TP_CHECK(
+      self.dim() <= 4,
+      "Vulkan repeat only supports tensors <= 4 dimensions");
+  const int64_t in_ndims = self.dim();
+  const int64_t out_ndims = static_cast<int64_t>(repeats.size());
+  TP_CHECK(
+      out_ndims >= in_ndims,
+      "Number of dimensions of repeat dims can not be smaller than "
+      "number of dimensions of tensor");
+  const int64_t add_ndims = out_ndims - in_ndims;
+
+  Tensor tensor_to_repeat = clone_kernel(self);
+  for (int64_t i = 0; i < add_ndims; ++i) {
+    tensor_to_repeat = unsqueeze_kernel(tensor_to_repeat, 0);
+  }
+
+  for (int64_t i = 0; i < out_ndims; ++i) {
+    if (repeats[i] == 1) {
+      continue;
+    }
+    TP_CHECK(repeats[i] >= 0, "Vulkan repeat: repeats must be non-negative");
+    std::vector<Tensor> tensor_seq_to_concat;
+    tensor_seq_to_concat.reserve(static_cast<size_t>(repeats[i]));
+    for (int64_t k = 0; k < repeats[i]; ++k) {
+      tensor_seq_to_concat.push_back(clone_kernel(tensor_to_repeat));
+    }
+    tensor_to_repeat = cat_kernel(tensor_seq_to_concat, i);
+  }
+  return tensor_to_repeat;
+}
+
+Tensor tile_kernel(const Tensor& self, const std::vector<int64_t>& dims) {
+  const int64_t size_diff = self.dim() - static_cast<int64_t>(dims.size());
+  if (size_diff > 0) {
+    std::vector<int64_t> new_repeats(static_cast<size_t>(size_diff), 1);
+    new_repeats.insert(new_repeats.end(), dims.begin(), dims.end());
+    return repeat_kernel(self, new_repeats);
+  }
+  return repeat_kernel(self, dims);
+}
+
+namespace {
+
+int64_t wrap_dim_checked(int64_t dim, int64_t ndim) {
+  const int64_t min = -ndim;
+  const int64_t max = ndim - 1;
+  TP_CHECK(
+      dim >= min && dim <= max,
+      "Dimension out of range (expected to be in range of [", min, ", ",
+      max, "], but got ", dim, ")");
+  return dim < 0 ? dim + ndim : dim;
+}
+
+} // namespace
+
+/*
+ * Chunking is repeated slicing; unbinding is repeated selection.  Both ride
+ * the strided-view materialization the slice/select entries own.
+ */
+std::vector<Tensor> split_sizes_kernel(
+    const Tensor& self,
+    const std::vector<int64_t>& split_sizes,
+    int64_t dim) {
+  TP_CHECK(
+      self.dim() > 0, "split expects at least a 1-dimensional tensor");
+  dim = wrap_dim_checked(dim, self.dim());
+  const int64_t dim_size = self.size(dim);
+
+  std::vector<Tensor> result;
+  result.reserve(split_sizes.size());
+  int64_t start_idx = 0;
+  for (const int64_t length : split_sizes) {
+    TP_CHECK(
+        length >= 0,
+        "split_with_sizes expects split_sizes have only non-negative entries");
+    result.push_back(slice_kernel(self, dim, start_idx, start_idx + length, 1));
+    start_idx += length;
+  }
+  TP_CHECK(
+      start_idx == dim_size,
+      "split_with_sizes expects split_sizes to sum exactly to the input "
+      "tensor's size at dimension ", dim);
+  return result;
+}
+
+std::vector<Tensor> chunk_kernel(
+    const Tensor& self,
+    int64_t chunks,
+    int64_t dim) {
+  TP_CHECK(
+      self.dim() > 0, "chunk expects at least a 1-dimensional tensor");
+  TP_CHECK(chunks > 0, "chunk expects `chunks` to be greater than 0");
+  dim = wrap_dim_checked(dim, self.dim());
+  const int64_t dim_size = self.size(dim);
+  const int64_t split_size = (dim_size + chunks - 1) / chunks;
+  std::vector<int64_t> split_sizes(
+      static_cast<size_t>(chunks), split_size);
+  // The tail chunk absorbs the remainder so the sizes sum to the axis.
+  if (split_size > 0 && dim_size % split_size != 0) {
+    split_sizes.back() = dim_size - split_size * (chunks - 1);
+  } else if (split_size == 0) {
+    split_sizes.back() = 0;
+  }
+  return split_sizes_kernel(self, split_sizes, dim);
+}
+
+std::vector<Tensor> unbind_kernel(const Tensor& self, int64_t dim) {
+  TP_CHECK(
+      self.dim() > 0,
+      "Dimension specified as ", dim, " but tensor has no dimensions");
+  dim = wrap_dim_checked(dim, self.dim());
+  std::vector<Tensor> result;
+  result.reserve(static_cast<size_t>(self.size(dim)));
+  for (int64_t i = 0; i < self.size(dim); ++i) {
+    result.push_back(select_kernel(self, dim, i));
+  }
+  return result;
+}
+
+/*
+ * Axis moves are permutations: destination slots take the moved dims in
+ * order, remaining slots keep their original dims in ascending order.
+ */
+Tensor movedim_kernel(
+    const Tensor& self,
+    const std::vector<int64_t>& source,
+    const std::vector<int64_t>& destination) {
+  const int64_t ndim = self.dim();
+  TP_CHECK(
+      source.size() == destination.size(),
+      "movedim: source and destination must contain the same number of dims");
+  std::vector<int64_t> src(source), dst(destination);
+  for (auto& d : src) d = wrap_dim_checked(d, ndim);
+  for (auto& d : dst) d = wrap_dim_checked(d, ndim);
+  auto all_unique = [](std::vector<int64_t> dims) {
+    std::sort(dims.begin(), dims.end());
+    return std::adjacent_find(dims.begin(), dims.end()) == dims.end();
+  };
+  TP_CHECK(all_unique(src), "movedim: repeated dim in `source`");
+  TP_CHECK(all_unique(dst), "movedim: repeated dim in `destination`");
+  if (ndim == 0) {
+    return self;
+  }
+
+  std::vector<bool> src_seen(static_cast<size_t>(ndim), false);
+  std::vector<bool> dst_seen(static_cast<size_t>(ndim), false);
+  for (const int64_t d : src) src_seen[static_cast<size_t>(d)] = true;
+  for (const int64_t d : dst) dst_seen[static_cast<size_t>(d)] = true;
+
+  std::vector<int64_t> permutation(static_cast<size_t>(ndim), -1);
+  for (size_t k = 0; k < src.size(); ++k) {
+    permutation[static_cast<size_t>(dst[k])] = src[k];
+  }
+  int64_t cursor = 0;
+  for (int64_t i = 0; i < ndim; ++i) {
+    if (!dst_seen[static_cast<size_t>(i)]) {
+      while (src_seen[static_cast<size_t>(cursor)]) ++cursor;
+      permutation[static_cast<size_t>(i)] = cursor++;
+    }
+  }
+  return permute_kernel(self, permutation);
+}
+
 } // namespace ops
 } // namespace vulkan
 } // namespace tensorplay
@@ -522,6 +692,12 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, ShapeKernels) {
   m.impl("select.int", &tensorplay::vulkan::ops::select_kernel);
   m.impl("cat", &tensorplay::vulkan::ops::cat_kernel);
   m.impl("stack", &tensorplay::vulkan::ops::stack_kernel);
+  m.impl("repeat", &tensorplay::vulkan::ops::repeat_kernel);
+  m.impl("tile", &tensorplay::vulkan::ops::tile_kernel);
+  m.impl("split.sizes", &tensorplay::vulkan::ops::split_sizes_kernel);
+  m.impl("chunk", &tensorplay::vulkan::ops::chunk_kernel);
+  m.impl("unbind", &tensorplay::vulkan::ops::unbind_kernel);
+  m.impl("movedim", &tensorplay::vulkan::ops::movedim_kernel);
 }
 
 #endif /* USE_VULKAN */

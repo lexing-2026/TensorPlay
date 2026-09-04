@@ -313,10 +313,18 @@ if(USE_VULKAN)
         src/backend/vulkan/ops/Clone.cpp
         src/backend/vulkan/ops/Conv.cpp
         src/backend/vulkan/ops/Copy.cpp
+        src/backend/vulkan/ops/Cumsum.cpp
         src/backend/vulkan/ops/Factory.cpp
+        src/backend/vulkan/ops/Glu.cpp
+        src/backend/vulkan/ops/MaskedFill.cpp
         src/backend/vulkan/ops/Matmul.cpp
         src/backend/vulkan/ops/Misc.cpp
         src/backend/vulkan/ops/Normalization.cpp
+        src/backend/vulkan/ops/ParamCache.cpp
+        src/backend/vulkan/ops/Comparison.cpp
+        src/backend/vulkan/ops/Indexing.cpp
+        src/backend/vulkan/ops/Upsample.cpp
+        src/backend/vulkan/ops/Where.cpp
         src/backend/vulkan/ops/Pooling.cpp
         src/backend/vulkan/ops/Quant.cpp
         src/backend/vulkan/ops/Random.cpp

@@ -3,6 +3,7 @@
 #include "Blocks.h"
 #include "Common.h"
 #include "Convert.h"
+#include "Utils.h"
 
 #include <optional>
 #include <set>
@@ -356,64 +357,6 @@ Tensor flip_kernel(const Tensor& self, const std::vector<int64_t>& dims) {
   return convert(v_output);
 }
 
-Tensor upsample_nearest2d_kernel(
-    const Tensor& self,
-    std::vector<int64_t> output_size,
-    std::optional<double> scales_h,
-    std::optional<double> scales_w) {
-  validate_elementwise_4d(self, "upsample_nearest2d");
-  TP_CHECK(
-      self.dim() == 4, "Vulkan upsample_nearest2d requires a 4d tensor");
-  TP_CHECK(
-      output_size.size() == 2,
-      "Vulkan upsample_nearest2d expects a 2d output size");
-
-  api::Context* const context = api::context();
-
-  api::vTensor v_input = convert(self);
-
-  const int64_t OH = output_size[1];
-  const int64_t OW = output_size[0];
-
-  api::vTensor v_output{context, {self.size(0), self.size(1), OH, OW},
-                        self.dtype()};
-
-  const struct UpsampleNearest2DBlock final {
-    ivec4 in_sizes;
-    ivec4 out_sizes;
-    float scale_w;
-    float scale_h;
-    int c_depth;
-    int fill0;
-  } block{
-      make_whcn_ivec4(v_input.sizes()),
-      make_whcn_ivec4(v_output.sizes()),
-      static_cast<float>(
-          scales_w.value_or(static_cast<double>(self.size(3)) /
-                            static_cast<double>(OW))),
-      static_cast<float>(
-          scales_h.value_or(static_cast<double>(self.size(2)) /
-                            static_cast<double>(OH))),
-      c_depth_of(v_input.sizes()),
-      0,
-  };
-
-  api::UniformParamsBuffer params(context, block);
-  api::PipelineBarrier pipeline_barrier{};
-
-  context->submit_compute_job(
-      VK_KERNEL(upsample_nearest2d), pipeline_barrier, v_output.extents(),
-      adaptive_work_group_size(v_output.extents()), VK_NULL_HANDLE,
-      v_output.image(
-          pipeline_barrier,
-          api::PipelineStage::COMPUTE,
-          api::MemoryAccessType::WRITE),
-      v_input.image(pipeline_barrier, api::PipelineStage::COMPUTE),
-      params.buffer());
-
-  return convert(v_output);
-}
-
 namespace {
 
 Tensor pad2d_impl(
@@ -492,6 +435,18 @@ Tensor replication_pad_nd_kernel(
   return pad2d_impl(self, pad, /*replicate=*/true);
 }
 
+/*
+ * Scalar extraction from a single-element tensor.  The read rides the
+ * device-to-host copy path, which stages the payload out in logical order;
+ * no unpack kernel of its own is needed.
+ */
+Scalar item_kernel(const Tensor& self) {
+  TP_CHECK(
+      self.numel() == 1, "item() only supported for 1-element tensors");
+  const Tensor host = self.to(Device(DeviceType::CPU));
+  return host.item();
+}
+
 } // namespace ops
 } // namespace vulkan
 } // namespace tensorplay
@@ -499,12 +454,12 @@ Tensor replication_pad_nd_kernel(
 TENSORPLAY_LIBRARY_IMPL(Vulkan, MiscKernels) {
   m.impl("pow.Tensor_Scalar", &tensorplay::vulkan::ops::pow_scalar_kernel);
   m.impl("pow.Tensor_Tensor", &tensorplay::vulkan::ops::pow_tensor_kernel);
+  m.impl("item", &tensorplay::vulkan::ops::item_kernel);
   m.impl("lerp", &tensorplay::vulkan::ops::lerp_scalar_kernel);
   m.impl("lerp.Tensor", &tensorplay::vulkan::ops::lerp_tensor_kernel);
   m.impl("lerp_.Scalar", &tensorplay::vulkan::ops::lerp_scalar_inplace_kernel);
   m.impl("lerp_.Tensor", &tensorplay::vulkan::ops::lerp_tensor_inplace_kernel);
   m.impl("flip", &tensorplay::vulkan::ops::flip_kernel);
-  m.impl("upsample_nearest2d", &tensorplay::vulkan::ops::upsample_nearest2d_kernel);
   m.impl("reflection_pad_nd", &tensorplay::vulkan::ops::reflection_pad_nd_kernel);
   m.impl("replication_pad_nd", &tensorplay::vulkan::ops::replication_pad_nd_kernel);
 }

@@ -125,6 +125,38 @@ Tensor& clamp_inplace_kernel(
   return clamp_(self, min, max);
 }
 
+// One-sided clamps delegate to the two-sided entry with the opposite bound
+// left unset, and the in-place forms round-trip through the copy kernel.
+Tensor clamp_min_kernel(const Tensor& self, Scalar min) {
+  return clamp(self, min, std::nullopt);
+}
+
+Tensor clamp_max_kernel(const Tensor& self, Scalar max) {
+  return clamp(self, std::nullopt, max);
+}
+
+Tensor& clamp_min_inplace_kernel(Tensor& self, Scalar min) {
+  self.copy_(clamp(self, min, std::nullopt));
+  return self;
+}
+
+Tensor& clamp_max_inplace_kernel(Tensor& self, Scalar max) {
+  self.copy_(clamp(self, std::nullopt, max));
+  return self;
+}
+
+/*
+ * Hard tanh is the clamping range applied under the activation's name; the
+ * entry points reuse the clamp dispatches directly.
+ */
+Tensor hardtanh_kernel(const Tensor& self, Scalar min, Scalar max) {
+  return clamp(self, min, max);
+}
+
+Tensor& hardtanh_inplace_kernel(Tensor& self, Scalar min, Scalar max) {
+  return clamp_(self, min, max);
+}
+
 } // namespace ops
 } // namespace vulkan
 } // namespace tensorplay
@@ -132,6 +164,12 @@ Tensor& clamp_inplace_kernel(
 TENSORPLAY_LIBRARY_IMPL(Vulkan, ClampKernels) {
   m.impl("clamp", &tensorplay::vulkan::ops::clamp_kernel);
   m.impl("clamp_", &tensorplay::vulkan::ops::clamp_inplace_kernel);
+  m.impl("clamp_min", &tensorplay::vulkan::ops::clamp_min_kernel);
+  m.impl("clamp_max", &tensorplay::vulkan::ops::clamp_max_kernel);
+  m.impl("clamp_min_", &tensorplay::vulkan::ops::clamp_min_inplace_kernel);
+  m.impl("clamp_max_", &tensorplay::vulkan::ops::clamp_max_inplace_kernel);
+  m.impl("hardtanh", &tensorplay::vulkan::ops::hardtanh_kernel);
+  m.impl("hardtanh_", &tensorplay::vulkan::ops::hardtanh_inplace_kernel);
 }
 
 #endif /* USE_VULKAN */

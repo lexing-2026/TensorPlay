@@ -378,6 +378,27 @@ Tensor& mul_scalar_inplace_kernel(Tensor& self, Scalar other) {
                                   self, other, Scalar(1.0));
 }
 
+/*
+ * Scalar-base power: the base broadcast comes in as the shader's scalar
+ * argument while the tensor operand supplies the exponents.
+ */
+Tensor pow_scalar_base_kernel(Scalar base, const Tensor& self) {
+  return binary_op_scalar(
+      "pow_scalar_tensor", "pow_scalar_tensor", self, base,
+      Scalar(1.0));
+}
+
+Tensor& pow_tensor_scalar_inplace_kernel(Tensor& self, Scalar exponent) {
+  return binary_op_scalar_inplace(
+      "pow_tensor_scalarinplace", "pow_tensor_scalarinplace", self, exponent,
+      Scalar(1.0));
+}
+
+Tensor& pow_tensor_inplace_kernel(Tensor& self, const Tensor& exponent) {
+  return binary_op_tensor_inplace(
+      "powinplace", "powinplace", self, exponent, Scalar(1.0));
+}
+
 } // namespace ops
 } // namespace vulkan
 } // namespace tensorplay
@@ -396,6 +417,9 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, BinaryOpKernels) {
   m.impl("div.Tensor", &tensorplay::vulkan::ops::div_kernel);
   m.impl("div.Scalar", &tensorplay::vulkan::ops::div_scalar_kernel);
   m.impl("div_.Tensor", &tensorplay::vulkan::ops::div_inplace_kernel);
+  m.impl("pow.Scalar", &tensorplay::vulkan::ops::pow_scalar_base_kernel);
+  m.impl("pow_.Scalar", &tensorplay::vulkan::ops::pow_tensor_scalar_inplace_kernel);
+  m.impl("pow_.Tensor", &tensorplay::vulkan::ops::pow_tensor_inplace_kernel);
 }
 
 #endif /* USE_VULKAN */
