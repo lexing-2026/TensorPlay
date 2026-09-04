@@ -258,11 +258,30 @@ Tensor max_unpool3d_backward_cuda(const Tensor& grad_output, const Tensor& indic
     }
 }
 
+Tensor& interop_max_unpool2d_out_cuda(const Tensor& self, const Tensor& indices,
+              const std::vector<int64_t>& output_size, Tensor& out) {
+        out = max_unpool2d_cuda(self, indices, output_size);
+        return out;
+    
+}
+
+Tensor& interop_max_unpool3d_out_cuda(const Tensor& self, const Tensor& indices,
+              const std::vector<int64_t>& output_size,
+              const std::vector<int64_t>& stride,
+              const std::vector<int64_t>& padding, Tensor& out) {
+        out = max_unpool3d_cuda(self, indices, output_size, stride, padding);
+        return out;
+    
+}
+
 TENSORPLAY_LIBRARY_IMPL(CUDA, MaxUnpoolKernels) {
     m.impl("max_unpool2d", max_unpool2d_cuda);
     m.impl("max_unpool2d_backward", max_unpool2d_backward_cuda);
     m.impl("max_unpool3d", max_unpool3d_cuda);
     m.impl("max_unpool3d_backward", max_unpool3d_backward_cuda);
+
+    m.impl("max_unpool2d.out", interop_max_unpool2d_out_cuda);
+    m.impl("max_unpool3d.out", interop_max_unpool3d_out_cuda);
 }
 
 }  // namespace cuda

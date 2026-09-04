@@ -8,7 +8,7 @@ namespace graph {
 
 namespace {
 
-#if CUDART_VERSION >= 12040
+#if !defined(USE_ROCM) && CUDART_VERSION >= 12040
 // Captured into the parent graph right before a conditional node: at replay
 // time this device-side write decides whether the node's body executes.
 __global__ void set_conditional_handle_kernel(
@@ -20,7 +20,7 @@ __global__ void set_conditional_handle_kernel(
 } // namespace
 
 bool conditionalNodesSupported() {
-#if CUDART_VERSION >= 12040
+#if !defined(USE_ROCM) && CUDART_VERSION >= 12040
     return true;
 #else
     return false;
@@ -29,7 +29,7 @@ bool conditionalNodesSupported() {
 
 void launchSetConditionalHandle(uint64_t handle, const void* pred_bool,
                                 cudaStream_t stream) {
-#if CUDART_VERSION >= 12040
+#if !defined(USE_ROCM) && CUDART_VERSION >= 12040
     set_conditional_handle_kernel<<<1, 1, 0, stream>>>(
         static_cast<cudaGraphConditionalHandle>(handle),
         static_cast<const bool*>(pred_bool));

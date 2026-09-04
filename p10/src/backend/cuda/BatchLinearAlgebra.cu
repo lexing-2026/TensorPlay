@@ -130,10 +130,12 @@ std::tuple<Tensor, Tensor, Tensor> svd_cuda(const Tensor& self, bool some, bool 
     (void)some;
     const DType dt = self.dtype();
     if (compute_uv) {
-        // Reduced factorization; the third slot carries Vh, matching the
-        // CPU kernel's layout contract.
+        // Reduced factorization; the legacy contract returns V (A =
+        // U diag(S) V^T), so the Vh factor is transposed into the third
+        // slot, matching the CPU kernel.
         auto [U, S, Vh] = ops::linalg_svd(to_compute(self), false, std::optional<std::string>());
-        return {from_compute(U, dt), from_compute(S, dt), from_compute(Vh, dt)};
+        return {from_compute(U, dt), from_compute(S, dt),
+                from_compute(Vh, dt).transpose(-2, -1).contiguous()};
     }
     Tensor S = ops::linalg_svdvals(to_compute(self), std::optional<std::string>());
     Tensor zero = Tensor::zeros({}, dt, self.device());

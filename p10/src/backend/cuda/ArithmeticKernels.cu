@@ -12,6 +12,7 @@
 #include "GradMode.h"
 #include "CUDABroadcast.cuh"
 #include "CUDAComplex.cuh"
+#include "ElementwiseStrided.cuh"
 #include <thrust/complex.h>
 
 #include <cuda_runtime.h>
@@ -308,6 +309,41 @@ __global__ void div_scalar_kernel_cuda_impl(int64_t n, const T* a, typename Bina
     }
 }
 
+// In-place Tensor-Scalar helpers for dense non-contiguous layouts.  Each
+// wraps the math in a small functor and hands it to the iterator-driven
+// strided kernel; a false return means the caller's contiguous fast path
+// applies (contiguous input or uncoalescable rank).  The math type M matches
+// BinaryOpMath<T>::type of the launching dtype so integer arithmetic and
+// half-precision promotion behave exactly as in the contiguous kernels.
+template <typename M>
+struct StridedAddScalar {
+    M b, alpha;
+    template <typename T> __device__ T operator()(T x) const {
+        return static_cast<T>(static_cast<M>(x) + alpha * b);
+    }
+};
+template <typename M>
+struct StridedSubScalar {
+    M b, alpha;
+    template <typename T> __device__ T operator()(T x) const {
+        return static_cast<T>(static_cast<M>(x) - alpha * b);
+    }
+};
+template <typename M>
+struct StridedMulScalar {
+    M b;
+    template <typename T> __device__ T operator()(T x) const {
+        return static_cast<T>(static_cast<M>(x) * b);
+    }
+};
+template <typename M>
+struct StridedDivScalar {
+    M b;
+    template <typename T> __device__ T operator()(T x) const {
+        return static_cast<T>(static_cast<M>(x) / b);
+    }
+};
+
 // --- Vectorized same-shape fast path ---
 // (get_offset == identity), so the general broadcast machinery is skipped in
 
@@ -564,6 +600,159 @@ inline bool try_row_broadcast(int64_t n, const Tensor& a, const Tensor& b,
     }
 }
 
+
+// Bool arithmetic follows the byte-domain rules used on the CPU side:
+// add is logical or, sub is xor, mul is and; alpha is ignored because the
+// result domain stays {0, 1}.
+__global__ void add_broadcast_bool_kernel(int64_t n,
+                                         const bool* a, TensorDesc a_desc,
+                                         const bool* b, TensorDesc b_desc,
+                                         bool* y, TensorDesc y_desc) {
+    TP_CUDA_GRIDSTRIDE(i) {
+        int64_t a_off = get_offset(i, a_desc, y_desc);
+        int64_t b_off = get_offset(i, b_desc, y_desc);
+        y[i] = a[a_off] || b[b_off];
+    }
+}
+
+__global__ void sub_broadcast_bool_kernel(int64_t n,
+                                         const bool* a, TensorDesc a_desc,
+                                         const bool* b, TensorDesc b_desc,
+                                         bool* y, TensorDesc y_desc) {
+    TP_CUDA_GRIDSTRIDE(i) {
+        int64_t a_off = get_offset(i, a_desc, y_desc);
+        int64_t b_off = get_offset(i, b_desc, y_desc);
+        y[i] = a[a_off] != b[b_off];
+    }
+}
+
+__global__ void mul_broadcast_bool_kernel(int64_t n,
+                                         const bool* a, TensorDesc a_desc,
+                                         const bool* b, TensorDesc b_desc,
+                                         bool* y, TensorDesc y_desc) {
+    TP_CUDA_GRIDSTRIDE(i) {
+        int64_t a_off = get_offset(i, a_desc, y_desc);
+        int64_t b_off = get_offset(i, b_desc, y_desc);
+        y[i] = a[a_off] && b[b_off];
+    }
+}
+
+template <typename T, int VecSize, typename Op>
+__global__ void binary_bool_vectorized_kernel(int64_t n, const T* __restrict__ a,
+                                              const T* __restrict__ b, T* __restrict__ y, Op op) {
+    const int64_t vec_n = n / VecSize;
+    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    for (; i < vec_n; i += stride) {
+        TPVecPack<T, VecSize> pa = *reinterpret_cast<const TPVecPack<T, VecSize>*>(a + i * VecSize);
+        TPVecPack<T, VecSize> pb = *reinterpret_cast<const TPVecPack<T, VecSize>*>(b + i * VecSize);
+        TPVecPack<T, VecSize> po;
+#pragma unroll
+        for (int v = 0; v < VecSize; ++v) po.v[v] = op(pa.v[v], pb.v[v]);
+        *reinterpret_cast<TPVecPack<T, VecSize>*>(y + i * VecSize) = po;
+    }
+    for (int64_t j = vec_n * VecSize + i; j < n; j += stride) {
+        y[j] = op(a[j], b[j]);
+    }
+}
+
+enum class BoolBinOp { Or, Xor, And };
+
+inline bool launch_bool_vec(int64_t n, const Tensor& a, const Tensor& b, Tensor& y,
+                            BoolBinOp op, cudaStream_t stream) {
+    constexpr int kVec = 8;
+    constexpr size_t kAlign = sizeof(bool) * kVec;
+    const bool* pa = a.data_ptr<bool>();
+    const bool* pb = b.data_ptr<bool>();
+    bool* py = y.data_ptr<bool>();
+    const uintptr_t align_mask = kAlign - 1;
+    if ((reinterpret_cast<uintptr_t>(pa) | reinterpret_cast<uintptr_t>(pb) |
+         reinterpret_cast<uintptr_t>(py)) & align_mask) return false;
+    dim3 block(256);
+    const int64_t vec_n = n / kVec;
+    const int64_t want = (vec_n + block.x - 1) / block.x;
+    dim3 grid(static_cast<unsigned>(want < 1 ? 1 : want));
+    switch (op) {
+        case BoolBinOp::Or:
+            binary_bool_vectorized_kernel<bool, kVec><<<grid, block, 0, stream>>>(
+                n, pa, pb, py, [] __device__ (bool x, bool v) { return x || v; });
+            break;
+        case BoolBinOp::Xor:
+            binary_bool_vectorized_kernel<bool, kVec><<<grid, block, 0, stream>>>(
+                n, pa, pb, py, [] __device__ (bool x, bool v) { return x != v; });
+            break;
+        case BoolBinOp::And:
+            binary_bool_vectorized_kernel<bool, kVec><<<grid, block, 0, stream>>>(
+                n, pa, pb, py, [] __device__ (bool x, bool v) { return x && v; });
+            break;
+    }
+    return true;
+}
+
+void get_grid_block(int64_t n, dim3& grid, dim3& block);
+
+inline bool try_bool_binary(const Tensor& a, const Tensor& b, Tensor& y,
+                            DType result_dtype, BoolBinOp op,
+                            const std::vector<int64_t>& out_shape) {
+    if (result_dtype != DType::Bool) return false;
+    if (!a.is_contiguous() || !b.is_contiguous() || !y.is_contiguous()) {
+        dim3 grid, block;
+        get_grid_block(y.numel(), grid, block);
+        TensorDesc a_desc = make_desc(a, out_shape.size());
+        TensorDesc b_desc = make_desc(b, out_shape.size());
+        TensorDesc y_desc = make_desc(y, out_shape.size());
+        auto stream = getCurrentCUDAStream().stream();
+        switch (op) {
+            case BoolBinOp::Or:
+                add_broadcast_bool_kernel<<<grid, block, 0, stream>>>(
+                    y.numel(), a.data_ptr<bool>(), a_desc, b.data_ptr<bool>(), b_desc,
+                    y.data_ptr<bool>(), y_desc);
+                break;
+            case BoolBinOp::Xor:
+                sub_broadcast_bool_kernel<<<grid, block, 0, stream>>>(
+                    y.numel(), a.data_ptr<bool>(), a_desc, b.data_ptr<bool>(), b_desc,
+                    y.data_ptr<bool>(), y_desc);
+                break;
+            case BoolBinOp::And:
+                mul_broadcast_bool_kernel<<<grid, block, 0, stream>>>(
+                    y.numel(), a.data_ptr<bool>(), a_desc, b.data_ptr<bool>(), b_desc,
+                    y.data_ptr<bool>(), y_desc);
+                break;
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return true;
+    }
+    auto stream = getCurrentCUDAStream().stream();
+    if (launch_bool_vec(y.numel(), a, b, y, op, stream)) {
+        CUDA_CHECK(cudaGetLastError());
+        return true;
+    }
+    dim3 grid, block;
+    get_grid_block(y.numel(), grid, block);
+    TensorDesc a_desc = make_desc(a, out_shape.size());
+    TensorDesc b_desc = make_desc(b, out_shape.size());
+    TensorDesc y_desc = make_desc(y, out_shape.size());
+    switch (op) {
+        case BoolBinOp::Or:
+            add_broadcast_bool_kernel<<<grid, block, 0, stream>>>(
+                y.numel(), a.data_ptr<bool>(), a_desc, b.data_ptr<bool>(), b_desc,
+                y.data_ptr<bool>(), y_desc);
+            break;
+        case BoolBinOp::Xor:
+            sub_broadcast_bool_kernel<<<grid, block, 0, stream>>>(
+                y.numel(), a.data_ptr<bool>(), a_desc, b.data_ptr<bool>(), b_desc,
+                y.data_ptr<bool>(), y_desc);
+            break;
+        case BoolBinOp::And:
+            mul_broadcast_bool_kernel<<<grid, block, 0, stream>>>(
+                y.numel(), a.data_ptr<bool>(), a_desc, b.data_ptr<bool>(), b_desc,
+                y.data_ptr<bool>(), y_desc);
+            break;
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 // --- Dispatchers ---
 
 void get_grid_block(int64_t n, dim3& grid, dim3& block) {
@@ -649,6 +838,9 @@ bool try_add_out_direct(const Tensor& self, const Tensor& other, Scalar alpha,
         case DType::ComplexDouble:
             run_cplx_binary<double>(a, b, out,
                                     cuda::cplx::AddAlphaOp<double>{s2c<double>(alpha)});
+            break;
+        case DType::Bool:
+            try_bool_binary(a, b, out, result_dtype, BoolBinOp::Or, out_shape);
             break;
         default:
             TP_THROW(NotImplementedError, "CUDA add: unsupported dtype");
@@ -760,6 +952,9 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
         case DType::ComplexDouble:
             run_cplx_binary<double>(a, b, result,
                                     cuda::cplx::AddAlphaOp<double>{s2c<double>(alpha)});
+            break;
+        case DType::Bool:
+            try_bool_binary(a, b, result, result_dtype, BoolBinOp::Or, out_shape);
             break;
         default:
             TP_THROW(NotImplementedError, "CUDA add: unsupported dtype");
@@ -940,6 +1135,10 @@ Tensor& add_inplace_kernel(Tensor& self, const Tensor& other, Scalar alpha) {
             run_cplx_binary<double>(self, b, self,
                                     cuda::cplx::AddAlphaOp<double>{s2c<double>(alpha)});
             break;
+        case DType::Bool:
+            try_bool_binary(self, b, self, self.dtype(), BoolBinOp::Or,
+                            static_cast<std::vector<int64_t>>(self.shape()));
+            break;
         default:
             TP_THROW(NotImplementedError, "CUDA add_: unsupported dtype");
     }
@@ -999,6 +1198,10 @@ Tensor sub_kernel(const Tensor& self, const Tensor& other, Scalar alpha) {
             run_cplx_binary<double>(a, b, result,
                                     cuda::cplx::SubAlphaOp<double>{s2c<double>(alpha)});
             break;
+        case DType::Bool:
+            TP_THROW(RuntimeError,
+                     "Subtraction, the `-` operator, with two bool tensors is "
+                     "not supported. Use the `^` or `logical_xor()` operator instead.");
         default:
             TP_THROW(NotImplementedError, "CUDA sub: unsupported dtype");
     }
@@ -1052,6 +1255,10 @@ Tensor& sub_inplace_kernel(Tensor& self, const Tensor& other, Scalar alpha) {
             run_cplx_binary<double>(self, b, self,
                                     cuda::cplx::SubAlphaOp<double>{s2c<double>(alpha)});
             break;
+        case DType::Bool:
+            TP_THROW(RuntimeError,
+                     "Subtraction, the `-` operator, with two bool tensors is "
+                     "not supported. Use the `^` or `logical_xor()` operator instead.");
         default:
             TP_THROW(NotImplementedError, "CUDA sub_: unsupported dtype");
     }
@@ -1109,6 +1316,9 @@ Tensor mul_kernel(const Tensor& self, const Tensor& other) {
         case DType::ComplexDouble:
             run_cplx_binary<double>(a, b, result, cuda::cplx::MulOp{});
             break;
+        case DType::Bool:
+            try_bool_binary(a, b, result, result_dtype, BoolBinOp::And, out_shape);
+            break;
         default:
             TP_THROW(NotImplementedError, "CUDA mul: unsupported dtype");
     }
@@ -1159,6 +1369,10 @@ Tensor& mul_inplace_kernel(Tensor& self, const Tensor& other) {
             break;
         case DType::ComplexDouble:
             run_cplx_binary<double>(self, b, self, cuda::cplx::MulOp{});
+            break;
+        case DType::Bool:
+            try_bool_binary(self, b, self, self.dtype(), BoolBinOp::And,
+                            static_cast<std::vector<int64_t>>(self.shape()));
             break;
         default:
             TP_THROW(NotImplementedError, "CUDA mul_: unsupported dtype");
@@ -1363,7 +1577,36 @@ Tensor& add_scalar_inplace_kernel(Tensor& self, Scalar other, Scalar alpha) {
     dim3 grid, block; get_grid_block(n, grid, block);
     
     if (!self.is_contiguous()) {
-         TP_THROW(NotImplementedError, "CUDA add_scalar_: non-contiguous input not supported yet (requires strided kernel)");
+        switch (self.dtype()) {
+            case DType::Float32:
+                if (launch_unary_inplace_strided<float>(self, StridedAddScalar<float>{other.to<float>(), alpha.to<float>()})) return self;
+                break;
+            case DType::Int32:
+                if (launch_unary_inplace_strided<int>(self, StridedAddScalar<int>{other.to<int>(), alpha.to<int>()})) return self;
+                break;
+            case DType::Int64:
+                if (launch_unary_inplace_strided<int64_t>(self, StridedAddScalar<int64_t>{other.to<int64_t>(), alpha.to<int64_t>()})) return self;
+                break;
+            case DType::Float16:
+                if (launch_unary_inplace_strided<tensorplay::Half>(self, StridedAddScalar<float>{other.to<float>(), alpha.to<float>()})) return self;
+                break;
+            case DType::BFloat16:
+                if (launch_unary_inplace_strided<tensorplay::BFloat16>(self, StridedAddScalar<float>{other.to<float>(), alpha.to<float>()})) return self;
+                break;
+            case DType::Float64:
+                if (launch_unary_inplace_strided<double>(self, StridedAddScalar<double>{other.to<double>(), alpha.to<double>()})) return self;
+                break;
+            case DType::ComplexFloat:
+            case DType::ComplexDouble: {
+                Tensor tmp = self.contiguous();
+                if (self.dtype() == DType::ComplexFloat) run_cplx_add_scalar<float>(tmp, other, alpha, tmp);
+                else run_cplx_add_scalar<double>(tmp, other, alpha, tmp);
+                self.copy_(tmp);
+                return self;
+            }
+            default:
+                break;
+        }
     }
     
     switch (self.dtype()) {
@@ -1446,7 +1689,36 @@ Tensor& sub_scalar_inplace_kernel(Tensor& self, Scalar other, Scalar alpha) {
     dim3 grid, block; get_grid_block(n, grid, block);
     
     if (!self.is_contiguous()) {
-         TP_THROW(NotImplementedError, "CUDA sub_scalar_: non-contiguous input not supported yet");
+        switch (self.dtype()) {
+            case DType::Float32:
+                if (launch_unary_inplace_strided<float>(self, StridedSubScalar<float>{other.to<float>(), alpha.to<float>()})) return self;
+                break;
+            case DType::Int32:
+                if (launch_unary_inplace_strided<int>(self, StridedSubScalar<int>{other.to<int>(), alpha.to<int>()})) return self;
+                break;
+            case DType::Int64:
+                if (launch_unary_inplace_strided<int64_t>(self, StridedSubScalar<int64_t>{other.to<int64_t>(), alpha.to<int64_t>()})) return self;
+                break;
+            case DType::Float16:
+                if (launch_unary_inplace_strided<tensorplay::Half>(self, StridedSubScalar<float>{other.to<float>(), alpha.to<float>()})) return self;
+                break;
+            case DType::BFloat16:
+                if (launch_unary_inplace_strided<tensorplay::BFloat16>(self, StridedSubScalar<float>{other.to<float>(), alpha.to<float>()})) return self;
+                break;
+            case DType::Float64:
+                if (launch_unary_inplace_strided<double>(self, StridedSubScalar<double>{other.to<double>(), alpha.to<double>()})) return self;
+                break;
+            case DType::ComplexFloat:
+            case DType::ComplexDouble: {
+                Tensor tmp = self.contiguous();
+                if (self.dtype() == DType::ComplexFloat) run_cplx_sub_scalar<float>(tmp, other, alpha, tmp);
+                else run_cplx_sub_scalar<double>(tmp, other, alpha, tmp);
+                self.copy_(tmp);
+                return self;
+            }
+            default:
+                break;
+        }
     }
     
     switch (self.dtype()) {
@@ -1528,7 +1800,36 @@ Tensor& mul_scalar_inplace_kernel(Tensor& self, Scalar other) {
     dim3 grid, block; get_grid_block(n, grid, block);
     
     if (!self.is_contiguous()) {
-         TP_THROW(NotImplementedError, "CUDA mul_scalar_: non-contiguous input not supported yet");
+        switch (self.dtype()) {
+            case DType::Float32:
+                if (launch_unary_inplace_strided<float>(self, StridedMulScalar<float>{other.to<float>()})) return self;
+                break;
+            case DType::Int32:
+                if (launch_unary_inplace_strided<int>(self, StridedMulScalar<int>{other.to<int>()})) return self;
+                break;
+            case DType::Int64:
+                if (launch_unary_inplace_strided<int64_t>(self, StridedMulScalar<int64_t>{other.to<int64_t>()})) return self;
+                break;
+            case DType::Float16:
+                if (launch_unary_inplace_strided<tensorplay::Half>(self, StridedMulScalar<float>{other.to<float>()})) return self;
+                break;
+            case DType::BFloat16:
+                if (launch_unary_inplace_strided<tensorplay::BFloat16>(self, StridedMulScalar<float>{other.to<float>()})) return self;
+                break;
+            case DType::Float64:
+                if (launch_unary_inplace_strided<double>(self, StridedMulScalar<double>{other.to<double>()})) return self;
+                break;
+            case DType::ComplexFloat:
+            case DType::ComplexDouble: {
+                Tensor tmp = self.contiguous();
+                if (self.dtype() == DType::ComplexFloat) run_cplx_mul_scalar<float>(tmp, other, tmp);
+                else run_cplx_mul_scalar<double>(tmp, other, tmp);
+                self.copy_(tmp);
+                return self;
+            }
+            default:
+                break;
+        }
     }
     
     switch (self.dtype()) {
@@ -1610,7 +1911,36 @@ Tensor& div_scalar_inplace_kernel(Tensor& self, Scalar other) {
     dim3 grid, block; get_grid_block(n, grid, block);
     
     if (!self.is_contiguous()) {
-         TP_THROW(NotImplementedError, "CUDA div_scalar_: non-contiguous input not supported yet");
+        switch (self.dtype()) {
+            case DType::Float32:
+                if (launch_unary_inplace_strided<float>(self, StridedDivScalar<float>{other.to<float>()})) return self;
+                break;
+            case DType::Int32:
+                if (launch_unary_inplace_strided<int>(self, StridedDivScalar<int>{other.to<int>()})) return self;
+                break;
+            case DType::Int64:
+                if (launch_unary_inplace_strided<int64_t>(self, StridedDivScalar<int64_t>{other.to<int64_t>()})) return self;
+                break;
+            case DType::Float16:
+                if (launch_unary_inplace_strided<tensorplay::Half>(self, StridedDivScalar<float>{other.to<float>()})) return self;
+                break;
+            case DType::BFloat16:
+                if (launch_unary_inplace_strided<tensorplay::BFloat16>(self, StridedDivScalar<float>{other.to<float>()})) return self;
+                break;
+            case DType::Float64:
+                if (launch_unary_inplace_strided<double>(self, StridedDivScalar<double>{other.to<double>()})) return self;
+                break;
+            case DType::ComplexFloat:
+            case DType::ComplexDouble: {
+                Tensor tmp = self.contiguous();
+                if (self.dtype() == DType::ComplexFloat) run_cplx_div_scalar<float>(tmp, other, tmp);
+                else run_cplx_div_scalar<double>(tmp, other, tmp);
+                self.copy_(tmp);
+                return self;
+            }
+            default:
+                break;
+        }
     }
     
     // Inplace division on integer tensor?

@@ -3,6 +3,7 @@
 #include "Dispatcher.h"
 #include "Scalar.h"
 #include "Exception.h"
+#include "Bucketization.h"
 #include "Context.h"
 #include "CUDARuntime.h"
 #include "Allocator.h"
@@ -10,6 +11,7 @@
 
 #include <cuda_runtime.h>
 #include "GPUPrimitives.cuh"
+#include "SortingRadixSelect.cuh"
 
 // Narrow floating-point atomics operate on the containing 32-bit word and
 // replace the selected half with an atomic compare-and-swap. The overloads
@@ -23,6 +25,9 @@
 #include <functional>
 #include <limits>
 #include <mutex>
+#include <optional>
+#include <string>
+#include <tuple>
 #include <tuple>
 #include <type_traits>
 #include <unordered_map>
@@ -783,22 +788,30 @@ __global__ void nonzero_fill_kernel(int64_t n, int64_t ndim, const T* x,
 }
 
 // Searchsorted uses a binary search: right=false selects the lower bound and
-// right=true selects the upper bound.
+// right=true selects the upper bound.  The bound comparators are written as
+// `!(bd >= v)` / `!(bd > v)` so a NaN query compares greater than every
+// boundary entry and lands at the end of the searched range.  Boundaries may
+// be 1-D (shared table for all queries) or N-D matching the leading query
+// dimensions (one table per row, shared along the innermost axis).
 template <typename S, typename V>
 __global__ void searchsorted_kernel(int64_t n, int64_t seq_len, bool right,
+                                    int64_t idim_in, bool is_1d_boundaries,
                                     const S* sp, const V* vp, int64_t* rp) {
     int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
     for (; i < n; i += stride) {
-        V v = vp[i];
-        int64_t lo = 0, hi = seq_len;
+        const V v = vp[i];
+        // A 1-D boundary table is shared by every query; a row-wise table
+        // starts at (query row / input innermost) * table innermost.
+        int64_t lo = is_1d_boundaries ? 0 : i / idim_in * seq_len;
+        int64_t hi = lo + seq_len;
+        const int64_t base = lo;
         while (lo < hi) {
-            int64_t mid = (lo + hi) >> 1;
-            bool go_right = right ? !(v < static_cast<V>(sp[mid]))
-                                  : (static_cast<V>(sp[mid]) < v);
+            const int64_t mid = lo + ((hi - lo) >> 1);
+            const bool go_right = right ? !(sp[mid] > v) : !(sp[mid] >= v);
             if (go_right) lo = mid + 1; else hi = mid;
         }
-        rp[i] = lo;
+        rp[i] = lo - base;
     }
 }
 
@@ -837,7 +850,8 @@ __global__ void bincount_weighted_kernel(int64_t n, const int64_t* x, const W* w
 
 // Per-slice in-place heapsort carrying original positions. Global-memory
 // storage supports arbitrary slice sizes without shared-memory limits while
-// preserving the stable-order contract.
+// preserving the stable-order contract. Kept as the fallback for shapes
+// beyond the radix path's limits (slice count > 2^21 or numel > INT_MAX).
 template <typename T>
 __global__ void sort_kernel(int64_t n_slices, int64_t d_size, int64_t inner,
                             bool descending, const T* in, T* vals, int64_t* idxs) {
@@ -876,6 +890,179 @@ __global__ void sort_kernel(int64_t n_slices, int64_t d_size, int64_t inner,
             sift_down(0, end - 1);
         }
     }
+}
+
+// Radix-sort path: each element is packed into a contiguous (sortable key,
+// position) pair, one segmented radix pass orders every slice, then results
+// are scattered back to the strided output layout. Radix ordering is stable,
+// so equal keys keep their original relative order in both directions.
+// Encodings reuse the topk bit-twiddling traits; bool gets a trivial one.
+template <typename T>
+struct SortRadixTraits : topk_detail::TopKRadixTraits<T> {};
+
+// bool has no topk trait: a single-bit key suffices (false < true).
+template <>
+struct SortRadixTraits<bool> {
+    using key_type = uint32_t;
+    static constexpr int bit_count = 1;
+    __device__ static inline key_type encode(bool value) { return value ? 1u : 0u; }
+    __device__ static inline bool deconvert(key_type value) { return value != 0u; }
+};
+
+// Floating encodings fold negative zero onto positive zero before the sign
+// flip: the two zero bit patterns compare equal (stable order), not as
+// distinct magnitudes.
+template <>
+struct SortRadixTraits<float> : topk_detail::TopKRadixTraits<float> {
+    __device__ static inline key_type encode(float value) {
+        uint32_t bits = static_cast<uint32_t>(__float_as_int(value));
+        if ((bits & 0x7fffffffu) == 0u) bits = 0u;
+        const uint32_t mask = (bits & 0x80000000u) ? 0xffffffffu : 0x80000000u;
+        return value == value ? static_cast<uint32_t>(bits ^ mask) : 0xffffffffu;
+    }
+};
+
+template <>
+struct SortRadixTraits<double> : topk_detail::TopKRadixTraits<double> {
+    __device__ static inline key_type encode(double value) {
+        uint64_t bits = static_cast<uint64_t>(__double_as_longlong(value));
+        if ((bits & 0x7fffffffffffffffULL) == 0ULL) bits = 0ULL;
+        const uint64_t mask = (bits >> 63) ? 0xffffffffffffffffULL
+                                           : 0x8000000000000000ULL;
+        return value == value ? static_cast<uint64_t>(bits ^ mask)
+                              : 0xffffffffffffffffULL;
+    }
+};
+
+template <>
+struct SortRadixTraits<Half> : topk_detail::TopKRadixTraits<Half> {
+    __device__ static inline key_type encode(Half value) {
+        uint16_t bits = static_cast<uint16_t>(value.x);
+        if ((bits & 0x7fffu) == 0u) bits = 0u;
+        const uint16_t mask = (bits & 0x8000u) ? 0xffffu : 0x8000u;
+        const float converted = static_cast<float>(value);
+        return converted == converted ? static_cast<uint32_t>(bits ^ mask)
+                                      : 0xffffu;
+    }
+};
+
+template <>
+struct SortRadixTraits<BFloat16> : topk_detail::TopKRadixTraits<BFloat16> {
+    __device__ static inline key_type encode(BFloat16 value) {
+        uint16_t bits = static_cast<uint16_t>(value.x);
+        if ((bits & 0x7fffu) == 0u) bits = 0u;
+        const uint16_t mask = (bits & 0x8000u) ? 0xffffu : 0x8000u;
+        const float converted = static_cast<float>(value);
+        return converted == converted ? static_cast<uint32_t>(bits ^ mask)
+                                      : 0xffffu;
+    }
+};
+
+template <typename T>
+__global__ void sort_radix_pack_kernel(int64_t n, int64_t d_size, int64_t inner,
+                                       const T* in,
+                                       typename SortRadixTraits<T>::key_type* keys,
+                                       int64_t* pos) {
+    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    for (; i < n; i += stride) {
+        const int64_t slice = i / d_size;
+        const int64_t j = i - slice * d_size;
+        const int64_t o = slice / inner;
+        const int64_t in2 = slice - o * inner;
+        const int64_t src = (o * d_size + j) * inner + in2;
+        keys[i] = SortRadixTraits<T>::encode(in[src]);
+        pos[i] = j;
+    }
+}
+
+template <typename T>
+__global__ void sort_radix_unpack_kernel(int64_t n, int64_t d_size, int64_t inner,
+                                         const typename SortRadixTraits<T>::key_type* keys,
+                                         const int64_t* pos, T* vals, int64_t* idxs) {
+    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    for (; i < n; i += stride) {
+        const int64_t slice = i / d_size;
+        const int64_t j = i - slice * d_size;
+        const int64_t o = slice / inner;
+        const int64_t in2 = slice - o * inner;
+        const int64_t dst = (o * d_size + j) * inner + in2;
+        vals[dst] = SortRadixTraits<T>::deconvert(keys[i]);
+        idxs[dst] = pos[i];
+    }
+}
+
+// offsets[s] = s * d_size; end offsets are served by the same buffer shifted
+// by one entry since every segment has identical length.
+__global__ void sort_radix_fill_offsets_kernel(int n_offsets, int64_t d_size, int* offsets) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n_offsets) offsets[i] = static_cast<int>(static_cast<int64_t>(i) * d_size);
+}
+
+template <typename T>
+void sort_radix_impl(const Tensor& self_c, Tensor& values, Tensor& indices,
+                     int64_t d_size, int64_t slices, int64_t inner, bool descending) {
+    using Key = typename SortRadixTraits<T>::key_type;
+    const int64_t n = self_c.numel();
+    const auto device = self_c.device();
+    const DType key_dtype = sizeof(Key) == 8 ? DType::UInt64 : DType::UInt32;
+    Tensor keys_a = Tensor::empty({n}, key_dtype, device);
+    Tensor keys_b = Tensor::empty({n}, key_dtype, device);
+    Tensor pos_a = Tensor::empty({n}, DType::Int64, device);
+    Tensor pos_b = Tensor::empty({n}, DType::Int64, device);
+    Tensor offsets = Tensor::empty({slices + 1}, DType::Int32, device);
+    auto stream = getCurrentCUDAStream().stream();
+    const int blocks = static_cast<int>((n + kThreads - 1) / kThreads);
+    const int off_blocks = static_cast<int>((slices + 1 + kThreads - 1) / kThreads);
+    sort_radix_pack_kernel<T><<<blocks, kThreads, 0, stream>>>(
+        n, d_size, inner, static_cast<const T*>(self_c.data_ptr()),
+        keys_a.data_ptr<Key>(), pos_a.data_ptr<int64_t>());
+    sort_radix_fill_offsets_kernel<<<off_blocks, kThreads, 0, stream>>>(
+        static_cast<int>(slices) + 1, d_size, offsets.data_ptr<int32_t>());
+    cub::DoubleBuffer<Key> key_buf(keys_a.data_ptr<Key>(), keys_b.data_ptr<Key>());
+    cub::DoubleBuffer<int64_t> pos_buf(pos_a.data_ptr<int64_t>(), pos_b.data_ptr<int64_t>());
+    const int* begin_offsets = offsets.data_ptr<int32_t>();
+    const int* end_offsets = begin_offsets + 1;
+    const int n_items = static_cast<int>(n);
+    const int n_segments = static_cast<int>(slices);
+    const int bits = SortRadixTraits<T>::bit_count;
+    size_t tmp_bytes = 0;
+    cudaError_t err = descending
+        ? cub::DeviceSegmentedRadixSort::SortPairsDescending(
+              nullptr, tmp_bytes, key_buf, pos_buf, n_items, n_segments,
+              begin_offsets, end_offsets, 0, bits, stream)
+        : cub::DeviceSegmentedRadixSort::SortPairs(
+              nullptr, tmp_bytes, key_buf, pos_buf, n_items, n_segments,
+              begin_offsets, end_offsets, 0, bits, stream);
+    CUDA_CHECK(err);
+    Tensor tmp = Tensor::empty({static_cast<int64_t>(std::max<size_t>(tmp_bytes, 1))},
+                               DType::UInt8, device);
+    err = descending
+        ? cub::DeviceSegmentedRadixSort::SortPairsDescending(
+              tmp.data_ptr(), tmp_bytes, key_buf, pos_buf, n_items, n_segments,
+              begin_offsets, end_offsets, 0, bits, stream)
+        : cub::DeviceSegmentedRadixSort::SortPairs(
+              tmp.data_ptr(), tmp_bytes, key_buf, pos_buf, n_items, n_segments,
+              begin_offsets, end_offsets, 0, bits, stream);
+    CUDA_CHECK(err);
+    sort_radix_unpack_kernel<T><<<blocks, kThreads, 0, stream>>>(
+        n, d_size, inner, key_buf.Current(), pos_buf.Current(),
+        static_cast<T*>(values.data_ptr()), indices.data_ptr<int64_t>());
+}
+
+void radix_sort_impl(const Tensor& self_c, Tensor& values, Tensor& indices,
+                     int64_t /*dim*/, int64_t /*outer*/, int64_t inner, int64_t d_size,
+                     int64_t slices, bool descending) {
+#define TP_RADIX_CASE(ctype, name) \
+    case DType::name: \
+        sort_radix_impl<ctype>(self_c, values, indices, d_size, slices, inner, descending); \
+        break;
+    switch (self_c.dtype()) {
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_RADIX_CASE)
+        default: TP_THROW(TypeError, "sort: unsupported dtype");
+    }
+#undef TP_RADIX_CASE
 }
 
 } // anonymous namespace
@@ -1698,10 +1885,55 @@ Tensor nonzero_cuda(const Tensor& self) {
 // ---------------------------------------------------------------------------
 
 namespace {
+
+// Materializes boundaries[sorter[i]] element by element: an unsorted boundary
+// tensor is reindexed into ascending order once, before the search loop runs.
+template <typename T>
+__global__ void sorter_gather_kernel(int64_t n, const T* src,
+                                     const int64_t* sorter, T* dst) {
+    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    for (; i < n; i += stride) dst[i] = src[sorter[i]];
+}
+
+Tensor searchsorted_apply_sorter_cuda(const Tensor& boundaries,
+                                      const Tensor& sorter) {
+    Tensor sorted = Tensor::empty(
+        static_cast<std::vector<int64_t>>(boundaries.shape()),
+        boundaries.dtype(), boundaries.device());
+    Tensor seq_c = boundaries.contiguous();
+    Tensor sorter_c = sorter.contiguous();
+    const int64_t n = seq_c.numel();
+    if (n == 0) return sorted;
+    auto stream = getCurrentCUDAStream().stream();
+#define TP_SS_SORTER_CASE(ctype, name)                                        \
+    case DType::name:                                                         \
+        sorter_gather_kernel<ctype><<<(n + kThreads - 1) / kThreads,          \
+                                      kThreads, 0, stream>>>(                 \
+            n, seq_c.data_ptr<ctype>(), sorter_c.data_ptr<int64_t>(),         \
+            sorted.data_ptr<ctype>());                                        \
+        break;
+    switch (seq_c.dtype()) {
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_SS_SORTER_CASE)
+        default: TP_THROW(TypeError,
+                          "searchsorted(): unsupported boundaries dtype ",
+                          toString(seq_c.dtype()));
+    }
+#undef TP_SS_SORTER_CASE
+    CUDA_CHECK(cudaGetLastError());
+    return sorted;
+}
+
+// Lower bound (`right=false`) or upper bound (`right=true`) positions for
+// every query value.  Inputs must be contiguous with a common dtype; the
+// direction flag comes pre-resolved through the `side` alias.
 Tensor searchsorted_impl_cuda(const Tensor& seq_f, const Tensor& vals_f, bool out_int32, bool right) {
     Tensor seq = seq_f.contiguous();
     Tensor vals = vals_f.contiguous();
     int64_t seq_len = seq.size(-1);
+    const bool is_1d_boundaries = seq.dim() == 1;
+    const int64_t idim_in =
+        (vals.dim() == 0 && vals.numel() == 1) ? 1 : vals.size(-1);
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(vals.shape()),
                                   out_int32 ? DType::Int32 : DType::Int64, vals.device());
     int64_t n = vals.numel();
@@ -1715,12 +1947,14 @@ Tensor searchsorted_impl_cuda(const Tensor& seq_f, const Tensor& vals_f, bool ou
             Tensor tmp = Tensor::empty(static_cast<std::vector<int64_t>>(vals.shape()),
                                        DType::Int64, vals.device());
             searchsorted_kernel<S, V><<<(n + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                n, seq_len, right, seq.data_ptr<S>(), vals.data_ptr<V>(), tmp.data_ptr<int64_t>());
+                n, seq_len, right, idim_in, is_1d_boundaries,
+                seq.data_ptr<S>(), vals.data_ptr<V>(), tmp.data_ptr<int64_t>());
             CUDA_CHECK(cudaGetLastError());
             return tmp.to(DType::Int32);
         }
         searchsorted_kernel<S, V><<<(n + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-            n, seq_len, right, seq.data_ptr<S>(), vals.data_ptr<V>(), result.data_ptr<int64_t>());
+            n, seq_len, right, idim_in, is_1d_boundaries,
+            seq.data_ptr<S>(), vals.data_ptr<V>(), result.data_ptr<int64_t>());
         CUDA_CHECK(cudaGetLastError());
         return result;
     };
@@ -1745,13 +1979,120 @@ Tensor searchsorted_impl_cuda(const Tensor& seq_f, const Tensor& vals_f, bool ou
 }
 } // anonymous namespace
 
-Tensor searchsorted_cuda(const Tensor& sorted_sequence, const Tensor& self, bool out_int32, bool right) {
-    return searchsorted_impl_cuda(sorted_sequence, self, out_int32, right);
+// Direction resolution, validation and operand normalization follow the same
+// contract as the CPU kernels; only the contiguous search loop is device code.
+Tensor& searchsorted_out_cuda_impl(const Tensor& sorted_sequence,
+                                   const Tensor& self, bool out_int32,
+                                   bool right,
+                                   const std::optional<std::string>& side_opt,
+                                   const Tensor& sorter_opt, Tensor& result) {
+    bucketization::pre_check(sorted_sequence, self, result, out_int32, right,
+                             side_opt, sorter_opt);
+    result.resize_(static_cast<std::vector<int64_t>>(self.shape()));
+    const bool is_right = side_opt.has_value() ? *side_opt == "right" : right;
+    if (self.numel() == 0) return result;
+
+    Tensor seq = sorted_sequence;
+    Tensor sorter = sorter_opt;
+    if (sorter.defined()) {
+        // Materialize the reindexed boundaries so the device search loop needs
+        // no per-comparison indirection.
+        seq = searchsorted_apply_sorter_cuda(seq, sorter);
+    }
+
+    Tensor vals = self;
+    Tensor trimmed_input, trimmed_boundaries;
+    bucketization::maybe_trim_input_tensors(trimmed_input, trimmed_boundaries,
+                                            vals, seq);
+    const Tensor& final_input = trimmed_input.defined() ? trimmed_input : vals;
+    const Tensor& final_boundaries =
+        trimmed_boundaries.defined() ? trimmed_boundaries : seq;
+    Tensor computed = searchsorted_impl_cuda(final_boundaries, final_input,
+                                             out_int32, is_right);
+    if (&result != &computed) {
+        result.copy_(computed);
+    }
+    return result;
 }
 
-Tensor bucketize_cuda(const Tensor& self, const Tensor& boundaries, bool out_int32, bool right) {
-    // Boundaries are the sorted sequence and self supplies the query values.
-    return searchsorted_impl_cuda(boundaries, self, out_int32, right);
+Tensor& searchsorted_out_cuda(const Tensor& sorted_sequence, const Tensor& self,
+                              bool out_int32, bool right,
+                              const std::optional<std::string>& side_opt,
+                              const std::optional<Tensor>& sorter_opt,
+                              Tensor& result) {
+    return searchsorted_out_cuda_impl(
+        sorted_sequence, self, out_int32, right, side_opt,
+        sorter_opt.value_or(Tensor()), result);
+}
+
+Tensor searchsorted_cuda(const Tensor& sorted_sequence, const Tensor& self,
+                         bool out_int32, bool right,
+                         const std::optional<std::string>& side_opt,
+                         const std::optional<Tensor>& sorter_opt) {
+    Tensor result = Tensor::empty(
+        {}, out_int32 ? DType::Int32 : DType::Int64, self.device());
+    searchsorted_out_cuda_impl(sorted_sequence, self, out_int32, right,
+                               side_opt, sorter_opt.value_or(Tensor()),
+                               result);
+    return result;
+}
+
+Tensor& searchsorted_scalar_out_cuda(const Tensor& sorted_sequence,
+                                     const Scalar& self, bool out_int32,
+                                     bool right,
+                                     const std::optional<std::string>& side_opt,
+                                     const std::optional<Tensor>& sorter_opt,
+                                     Tensor& result) {
+    Tensor scalar_tensor =
+        bucketization::scalar_tensor(self, sorted_sequence.device());
+    return searchsorted_out_cuda_impl(
+        sorted_sequence, scalar_tensor, out_int32, right, side_opt,
+        sorter_opt.value_or(Tensor()), result);
+}
+
+Tensor searchsorted_scalar_cuda(const Tensor& sorted_sequence, const Scalar& self,
+                                bool out_int32, bool right,
+                                const std::optional<std::string>& side_opt,
+                                const std::optional<Tensor>& sorter_opt) {
+    Tensor result = Tensor::empty(
+        {}, out_int32 ? DType::Int32 : DType::Int64, sorted_sequence.device());
+    searchsorted_scalar_out_cuda(sorted_sequence, self, out_int32, right,
+                                 side_opt, sorter_opt.value_or(Tensor()),
+                                 result);
+    return result;
+}
+
+Tensor& bucketize_out_cuda(const Tensor& self, const Tensor& boundaries,
+                           bool out_int32, bool right, Tensor& result) {
+    TP_CHECK(boundaries.dim() == 1,
+             "bucketize(): boundaries tensor must be 1 dimension, but got dim(",
+             boundaries.dim(), ")");
+    return searchsorted_out_cuda_impl(boundaries, self, out_int32, right,
+                                      std::nullopt, Tensor(), result);
+}
+
+Tensor bucketize_cuda(const Tensor& self, const Tensor& boundaries,
+                      bool out_int32, bool right) {
+    Tensor result = Tensor::empty(
+        {}, out_int32 ? DType::Int32 : DType::Int64, self.device());
+    bucketize_out_cuda(self, boundaries, out_int32, right, result);
+    return result;
+}
+
+Tensor& bucketize_scalar_out_cuda(const Scalar& self, const Tensor& boundaries,
+                                  bool out_int32, bool right, Tensor& result) {
+    Tensor scalar_tensor =
+        bucketization::scalar_tensor(self, boundaries.device());
+    return bucketize_out_cuda(scalar_tensor, boundaries, out_int32, right,
+                              result);
+}
+
+Tensor bucketize_scalar_cuda(const Scalar& self, const Tensor& boundaries,
+                             bool out_int32, bool right) {
+    Tensor result = Tensor::empty(
+        {}, out_int32 ? DType::Int32 : DType::Int64, boundaries.device());
+    bucketize_scalar_out_cuda(self, boundaries, out_int32, right, result);
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -1879,6 +2220,15 @@ std::tuple<Tensor, Tensor> sort_cuda(const Tensor& self, int64_t dim, bool desce
     int64_t slices = outer * inner;
     if (slices == 0 || d_size == 0) return {values, indices};
     auto stream = getCurrentCUDAStream().stream();
+    // Radix path: one segmented radix pass orders every slice together.
+    // Complexity is O(n * bytes) versus the heapsort fallback's O(n log n)
+    // serialized per-slice walk; the fallback remains for tensors beyond
+    // the 32-bit size limit of the device primitives.
+    if (self_c.numel() <= std::numeric_limits<int>::max()) {
+        radix_sort_impl(self_c, values, indices, dim, outer, inner, d_size, slices, descending);
+        CUDA_CHECK(cudaGetLastError());
+        return {values, indices};
+    }
 #define TP_SORT_CASE(ctype, name) \
     case DType::name: \
         sort_kernel<ctype><<<(slices + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
@@ -2037,6 +2387,216 @@ std::tuple<Tensor, Tensor, Tensor> unique_cuda(const Tensor& self, bool sorted,
     return std::make_tuple(values, inverse, counts);
 }
 
+// Two-output flat unique: drops the counts tensor of the three-output path.
+std::tuple<Tensor, Tensor> _unique_cuda(const Tensor& self, bool sorted,
+                                        bool return_inverse) {
+    auto result = unique_cuda(self, sorted, return_inverse, /*return_counts=*/false);
+    return std::make_tuple(std::get<0>(result), std::get<1>(result));
+}
+
+std::tuple<Tensor, Tensor, Tensor> _unique2_cuda(const Tensor& self, bool sorted,
+                                                 bool return_inverse,
+                                                 bool return_counts) {
+    return unique_cuda(self, sorted, return_inverse, return_counts);
+}
+
+// Row equality over the flattened {n, row_len} matrix: two rows match when
+// every column pair is equal (a NaN cell never matches another NaN).
+template <typename T>
+__global__ void unique_row_equal_kernel(int64_t n, int64_t row_len,
+                                        const T* rows, const int64_t* order,
+                                        int64_t* is_new) {
+    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    for (; i < n; i += stride) {
+        if (i == 0) { is_new[0] = 1; continue; }
+        const T* cur = rows + order[i] * row_len;
+        const T* prev = rows + order[i - 1] * row_len;
+        int64_t same = 1;
+        for (int64_t c = 0; c < row_len; ++c) {
+            if (cur[c] != prev[c]) { same = 0; break; }
+        }
+        is_new[i] = same ? 0 : 1;
+    }
+}
+
+// Gathers the kept rows into a compact buffer and writes the inverse mapping
+// from original row positions to group ids (row order already applied).
+template <typename T>
+__global__ void unique_row_emit_kernel(int64_t n, int64_t row_len,
+                                       const T* rows, const int64_t* order,
+                                       const int64_t* gid, T* out,
+                                       int64_t* inverse) {
+    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    for (; i < n; i += stride) {
+        const int64_t row = order[i];
+        const int64_t g = gid[i] - 1;  // inclusive cumsum -> 0-based group id
+        const T* src = rows + row * row_len;
+        T* dst = out + g * row_len;
+        for (int64_t c = 0; c < row_len; ++c) dst[c] = src[c];
+        inverse[row] = g;
+    }
+}
+
+// Dim-wise unique.  Rows (slices along `dim`) are sorted lexicographically by
+// `sort_cuda` applied to the transposed matrix — sorting each row-position
+// column independently is not row order, so instead the sort runs on a
+// {row_len, n} layout along the last axis, which orders rows by their
+// first column, and repeated stable passes over remaining columns refine the
+// order (LSD across columns; each pass must be stable, guaranteed by the
+// tie-breaking index in the radix sort).
+std::tuple<Tensor, Tensor, Tensor> unique_dim_cuda_impl(const Tensor& self,
+                                                        int64_t dim,
+                                                        bool consecutive,
+                                                        bool return_inverse,
+                                                        bool return_counts) {
+    const std::vector<int64_t> sizes =
+        static_cast<std::vector<int64_t>>(self.shape());
+    const int64_t zero_dims = std::count(sizes.begin(), sizes.end(), 0);
+    if (self.size(dim) == 0) {
+        TP_CHECK(zero_dims == 1,
+                 "Number of zero sized dimensions is more than one, so unique "
+                 "cannot be applied");
+        Tensor values = Tensor::empty(sizes, self.dtype(), self.device());
+        Tensor inverse = Tensor::empty({0}, DType::Int64, self.device());
+        Tensor counts = Tensor::empty({0}, DType::Int64, self.device());
+        return std::make_tuple(values, inverse, counts);
+    }
+    TP_CHECK(zero_dims == 0,
+             "There are 0 sized dimensions, and they aren't selected, so "
+             "unique cannot be applied");
+
+    Tensor input_flat = self.moveaxis(dim, 0).contiguous();
+    std::vector<int64_t> front_sizes =
+        static_cast<std::vector<int64_t>>(input_flat.shape());
+    const int64_t n = front_sizes[0];
+    input_flat = input_flat.reshape({n, -1});
+    const int64_t row_len = input_flat.size(1);
+
+    Tensor rows_sorted;
+    Tensor order;
+    if (consecutive) {
+        rows_sorted = input_flat;
+        order = Tensor::arange(Scalar(int64_t(0)), Scalar(n), Scalar(int64_t(1)),
+                               DType::Int64, self.device());
+    } else {
+        // LSD refinement: stable-sort rows by each column from last to first.
+        // The radix sort's tie-breaking on row index keeps each pass stable.
+        rows_sorted = input_flat;
+        order = Tensor::arange(Scalar(int64_t(0)), Scalar(n), Scalar(int64_t(1)),
+                               DType::Int64, self.device());
+        for (int64_t c = row_len - 1; c >= 0; --c) {
+            // Sort the current rows by column c: gather the column, sort its
+            // (key, row) pairs, and reorder the rows through the permutation.
+            Tensor col = rows_sorted.slice(1, c, c + 1).reshape({n});
+            Tensor col_sorted, col_order;
+            std::tie(col_sorted, col_order) = sort_cuda(col, 0, false);
+            // col_order indexes rows within the current rows_sorted layout.
+            // Compose with the accumulated permutation and gather rows.
+            Tensor composed = col_order.gather(0, order.gather(0, col_order));
+            order = composed;
+            Tensor idx = order.reshape({n, 1})
+                             .expand(std::vector<int64_t>{n, row_len});
+            rows_sorted = rows_sorted.gather(0, idx);
+        }
+    }
+
+    Tensor flags = Tensor::zeros({n}, DType::Int64, self.device());
+    const int threads = 256;
+    const int blocks = static_cast<int>((n + threads - 1) / threads);
+    auto stream = getCurrentCUDAStream().stream();
+
+#define UNIQUE_ROW_CASE(ctype, name)                                          \
+    case DType::name:                                                          \
+        unique_row_equal_kernel<ctype><<<blocks, threads, 0, stream>>>(        \
+            n, row_len, rows_sorted.data_ptr<ctype>(),                         \
+            order.data_ptr<int64_t>(), flags.data_ptr<int64_t>());             \
+        break;
+    switch (self.dtype()) {
+        UNIQUE_ROW_CASE(float, Float32)
+        UNIQUE_ROW_CASE(double, Float64)
+        UNIQUE_ROW_CASE(int64_t, Int64)
+        UNIQUE_ROW_CASE(int32_t, Int32)
+        UNIQUE_ROW_CASE(int16_t, Int16)
+        UNIQUE_ROW_CASE(int8_t, Int8)
+        UNIQUE_ROW_CASE(uint8_t, UInt8)
+        case DType::Bool:
+            unique_row_equal_kernel<bool><<<blocks, threads, 0, stream>>>(
+                n, row_len, rows_sorted.data_ptr<bool>(),
+                order.data_ptr<int64_t>(), flags.data_ptr<int64_t>());
+            break;
+        default:
+            TP_THROW(NotImplementedError,
+                     "unique_dim: unsupported dtype on CUDA");
+    }
+#undef UNIQUE_ROW_CASE
+
+    Tensor gid = flags.cumsum(0);
+    const int64_t num_groups =
+        gid.to(Device(DeviceType::CPU)).data_ptr<int64_t>()[n - 1];
+
+    Tensor kept_rows = Tensor::empty({num_groups, row_len}, self.dtype(),
+                                     self.device());
+    Tensor inverse = Tensor::empty({n}, DType::Int64, self.device());
+
+#define UNIQUE_ROW_EMIT_CASE(ctype, name)                                     \
+    case DType::name:                                                          \
+        unique_row_emit_kernel<ctype><<<blocks, threads, 0, stream>>>(         \
+            n, row_len, rows_sorted.data_ptr<ctype>(),                         \
+            order.data_ptr<int64_t>(), gid.data_ptr<int64_t>(),                \
+            kept_rows.data_ptr<ctype>(), inverse.data_ptr<int64_t>());         \
+        break;
+    switch (self.dtype()) {
+        UNIQUE_ROW_EMIT_CASE(float, Float32)
+        UNIQUE_ROW_EMIT_CASE(double, Float64)
+        UNIQUE_ROW_EMIT_CASE(int64_t, Int64)
+        UNIQUE_ROW_EMIT_CASE(int32_t, Int32)
+        UNIQUE_ROW_EMIT_CASE(int16_t, Int16)
+        UNIQUE_ROW_EMIT_CASE(int8_t, Int8)
+        UNIQUE_ROW_EMIT_CASE(uint8_t, UInt8)
+        case DType::Bool:
+            unique_row_emit_kernel<bool><<<blocks, threads, 0, stream>>>(
+                n, row_len, rows_sorted.data_ptr<bool>(),
+                order.data_ptr<int64_t>(), gid.data_ptr<int64_t>(),
+                kept_rows.data_ptr<bool>(), inverse.data_ptr<int64_t>());
+            break;
+        default:
+            TP_THROW(NotImplementedError,
+                     "unique_dim: unsupported dtype on CUDA");
+    }
+#undef UNIQUE_ROW_EMIT_CASE
+
+    front_sizes[0] = num_groups;
+    Tensor values = kept_rows.reshape(front_sizes).moveaxis(0, dim);
+
+    Tensor counts;
+    if (return_counts) {
+        // counts[g] = number of positions whose gid equals g+1; resolved via
+        // a bincount over the shifted gid buffer.
+        Tensor one = Tensor::ones({n}, DType::Int64, self.device());
+        Tensor shifted = gid.sub(Scalar(int64_t(1)));
+        counts = shifted.bincount(one, num_groups);
+    }
+    return std::make_tuple(values, inverse, counts);
+}
+
+std::tuple<Tensor, Tensor, Tensor> unique_dim_cuda(const Tensor& self,
+                                                   int64_t dim, bool sorted,
+                                                   bool return_inverse,
+                                                   bool return_counts) {
+    (void)sorted;
+    return unique_dim_cuda_impl(self, dim, /*consecutive=*/false,
+                                return_inverse, return_counts);
+}
+
+std::tuple<Tensor, Tensor, Tensor> unique_dim_consecutive_cuda(
+        const Tensor& self, int64_t dim, bool return_inverse,
+        bool return_counts) {
+    return unique_dim_cuda_impl(self, dim, /*consecutive=*/true,
+                                return_inverse, return_counts);
+}
+
 // ---------------------------------------------------------------------------
 // cumsum_backward: reverse scan R[i] = sum_{j>=i} g[j].
 // ---------------------------------------------------------------------------
@@ -2121,6 +2681,39 @@ Tensor index_reduce_backward_src_cuda(const Tensor& grad,
                                       const Tensor& source,
                                       const std::string& reduce,
                                       bool include_self);
+Tensor& interop_tril_out_cuda(const Tensor& self, int64_t diagonal, Tensor& out) {
+        out = tril_cuda(self, diagonal);
+        return out;
+
+}
+
+Tensor& interop_triu_out_cuda(const Tensor& self, int64_t diagonal, Tensor& out) {
+        out = triu_cuda(self, diagonal);
+        return out;
+
+}
+
+Tensor& interop_index_add_out_cuda(const Tensor& self, int64_t dim, const Tensor& index,
+              const Tensor& source, Scalar alpha, Tensor& out) {
+        (void)alpha;
+        out = index_add_cuda(self, dim, index, source);
+        return out;
+
+}
+
+Tensor& interop_index_reduce_out_cuda(const Tensor& self, int64_t dim, const Tensor& index,
+              const Tensor& source, std::string reduce, bool include_self,
+              Tensor& out) {
+        out = index_reduce_cuda(self, dim, index, source, reduce, include_self);
+        return out;
+
+}
+
+Tensor& interop_masked_fill__Scalar_cuda(Tensor& self, const Tensor& mask, Scalar value) {
+        return masked_fill__cuda(self, mask, value);
+    
+}
+
 TENSORPLAY_LIBRARY_IMPL(CUDA, IndexingKernels) {
     m.impl("masked_fill", masked_fill_cuda);
     m.impl("masked_fill_", masked_fill__cuda);
@@ -2158,11 +2751,29 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, IndexingKernels) {
     m.impl("sort", sort_cuda);
     m.impl("argsort", argsort_cuda);
     m.impl("unique", unique_cuda);
+    m.impl("_unique", _unique_cuda);
+    m.impl("_unique2", _unique2_cuda);
+    m.impl("unique_dim", unique_dim_cuda);
+    m.impl("unique_dim_consecutive", unique_dim_consecutive_cuda);
     m.impl("searchsorted.Tensor", searchsorted_cuda);
+    m.impl("searchsorted.Tensor_out", searchsorted_out_cuda);
+    m.impl("searchsorted.Scalar", searchsorted_scalar_cuda);
+    m.impl("searchsorted.Scalar_out", searchsorted_scalar_out_cuda);
     m.impl("bucketize.Tensor", bucketize_cuda);
+    m.impl("bucketize.Tensor_out", bucketize_out_cuda);
+    m.impl("bucketize.Scalar", bucketize_scalar_cuda);
+    m.impl("bucketize.Scalar_out", bucketize_scalar_out_cuda);
     m.impl("bincount", bincount_cuda);
     m.impl("take", take_cuda);
     m.impl("masked_scatter", masked_scatter_cuda);
+
+    // out-variants: run the value kernel, then transfer into the caller's
+    // buffer.  masked_fill_.Scalar routes through the tensor-overload kernel.
+    m.impl("tril.out", interop_tril_out_cuda);
+    m.impl("triu.out", interop_triu_out_cuda);
+    m.impl("index_add.out", interop_index_add_out_cuda);
+    m.impl("index_reduce.out", interop_index_reduce_out_cuda);
+    m.impl("masked_fill_.Scalar", interop_masked_fill__Scalar_cuda);
 }
 
 } // namespace cuda

@@ -875,6 +875,8 @@ void apply_syevj_batched(const Tensor& values, const Tensor& vectors,
     syevjInfo_t params = nullptr;
     CUSOLVER_CHECK(cusolverDnCreateSyevjInfo(&params));
     CUSOLVER_CHECK(cusolverDnXsyevjSetSortEig(params, 1));
+    CUSOLVER_CHECK(cusolverDnXsyevjSetTolerance(params, 1e-7));
+    CUSOLVER_CHECK(cusolverDnXsyevjSetMaxSweeps(params, 100));
 
     int lwork = 0;
     CUSOLVER_CHECK(Tr::syevj_bufferSize(

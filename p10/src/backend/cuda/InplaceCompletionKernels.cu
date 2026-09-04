@@ -522,6 +522,7 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, InplaceCompletionKernels) {
     m.impl("asin_", asin_inplace_kernel);
     m.impl("asinh_", asinh_inplace_kernel);
     m.impl("atan2_", atan2_inplace_kernel);
+    m.impl("arctan2_", atan2_inplace_kernel);
     m.impl("atan_", atan_inplace_kernel);
     m.impl("atanh_", atanh_inplace_kernel);
     m.impl("bitwise_not_", bitwise_not_inplace_kernel);

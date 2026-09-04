@@ -901,8 +901,18 @@ std::tuple<Tensor, Tensor> topk_kernel_cuda(const Tensor& self, int64_t k, int64
   return {values, indices};
 }
 
+std::tuple<Tensor, Tensor> interop_topk_values_cuda(const Tensor& self, int64_t k, int64_t dim,
+                                                    bool largest, bool sorted,
+                                                    Tensor& values, Tensor& indices) {
+  std::tie(values, indices) = topk_kernel_cuda(self, k, dim, largest, sorted, 0);
+  return {values, indices};
+}
+
 TENSORPLAY_LIBRARY_IMPL(CUDA, TopKKernels) {
   m.impl("topk", topk_kernel_cuda);
+  // out-variant: run the value kernel, then transfer into the caller's
+  // values/indices buffers.
+  m.impl("topk.values", interop_topk_values_cuda);
 }
 
 } // namespace cuda
