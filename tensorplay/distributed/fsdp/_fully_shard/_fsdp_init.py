@@ -1,15 +1,24 @@
 """Initialization helpers for composable sharding."""
 
+import warnings
+import itertools
 from typing import Any, Iterable
+
+from tensorplay.nn.modules.container import ModuleDict, ModuleList
+from tensorplay.nn.modules.module import Module
 
 from ...device_mesh import DeviceMesh, init_device_mesh
 from ... import distributed_core as dist
+from ...tensor import Replicate
+from ...utils import _get_root_modules
 from ._fsdp_common import (
     DataParallelMeshInfo,
     DDPMeshInfo,
     FSDPMeshInfo,
     HSDPMeshInfo,
+    _is_composable_with_fsdp,
 )
+from .._common_utils import _get_module_fsdp_state
 from ._fsdp_param import FSDPParam
 from ._fsdp_param_group import FSDPParamGroup
 
@@ -34,14 +43,43 @@ __all__ = [
 ]
 
 
-def _validate_module(module: Any) -> None:
+def _validate_module(module: Any, func_name: str = "fully_shard") -> None:
     if not hasattr(module, "named_parameters") or not hasattr(module, "forward"):
-        raise TypeError("fully_shard expects a module with parameters and forward")
+        raise TypeError(f"{func_name} expects a module with parameters and forward")
+    if isinstance(module, (ModuleList, ModuleDict)) and type(module).forward is Module.forward:
+        raise ValueError(
+            f"{func_name} does not support containers that do not implement forward: {module}"
+        )
 
 
-def _validate_mesh(mesh: Any) -> None:
+def _validate_mesh(mesh: Any, dp_mesh_dims: Any = None) -> None:
     if mesh is None or not hasattr(mesh, "ndim") or not hasattr(mesh, "size"):
         raise TypeError("mesh must provide ndim() and size()")
+    if dp_mesh_dims is not None:
+        shard_names = tuple(getattr(dp_mesh_dims, "shard_names", ()) or ())
+        replicate_names = tuple(getattr(dp_mesh_dims, "replicate_names", ()) or ())
+        if not shard_names and not replicate_names:
+            raise ValueError(
+                "at least one data-parallel mesh dimension is required"
+            )
+        mesh_dim_names = getattr(mesh, "mesh_dim_names", None)
+        if mesh_dim_names is None:
+            raise ValueError(
+                "mesh dimension names are required when data-parallel dimensions are specified"
+            )
+        for name in shard_names + replicate_names:
+            if name not in mesh_dim_names:
+                raise ValueError(
+                    f"mesh dimension {name!r} is not present in mesh_dim_names"
+                )
+        if set(shard_names).intersection(replicate_names):
+            raise ValueError("shard and replicate dimensions must be different")
+        return
+    ndim = _mesh_ndim(mesh)
+    if ndim not in (1, 2):
+        raise ValueError("fully_shard expects a one- or two-dimensional mesh")
+    if ndim == 2 and getattr(mesh, "mesh_dim_names", None) is None:
+        raise ValueError("a two-dimensional mesh requires dimension names")
 
 
 def _mesh_ndim(mesh: Any) -> int:
@@ -84,7 +122,7 @@ def _normalize_dp_dims(mesh: Any, dp_mesh_dims: Any) -> tuple[tuple[int, ...], t
 
 
 def _get_mesh_info(mesh: Any, dp_mesh_dims: Any = None) -> DataParallelMeshInfo:
-    _validate_mesh(mesh)
+    _validate_mesh(mesh, dp_mesh_dims)
     ndim = _mesh_ndim(mesh)
     if dp_mesh_dims is None:
         if ndim == 1:
@@ -192,6 +230,10 @@ def _get_post_forward_mesh_info(
             f"factor of {shard_size}, not {reshard_after_forward}"
         )
     if reshard_after_forward == 1:
+        warnings.warn(
+            "reshard_after_forward=1 uses a world-size-one layout; use True for full sharding",
+            stacklevel=2,
+        )
         return None
     if reshard_after_forward == shard_size:
         return mesh_info
@@ -231,34 +273,121 @@ def _get_device_from_mesh(mesh: Any) -> Any:
     return getattr(mesh, "device_type", "cpu")
 
 
-def _ignore_module(module: Any, ignored_modules: set[Any] | None = None) -> bool:
-    return ignored_modules is not None and module in ignored_modules
+def _ignore_module(
+    module: Any,
+    ignored_params: set[Any] | None = None,
+    ignore_decision: dict[Any, bool] | None = None,
+) -> bool:
+    if ignore_decision is None:
+        return ignored_params is not None and module in ignored_params
+    if module in ignore_decision:
+        return ignore_decision[module]
+    if any(module.buffers(recurse=False)):
+        ignore_decision[module] = False
+        return False
+    ignored_params = ignored_params or set()
+    if any(param not in ignored_params for _, param in module.named_parameters(recurse=False)):
+        ignore_decision[module] = False
+        return False
+    if any(
+        not _ignore_module(child, ignored_params, ignore_decision)
+        for child in module.children()
+    ):
+        ignore_decision[module] = False
+        return False
+    ignore_decision[module] = True
+    return True
 
 
-def _adjust_managed_modules(modules: Iterable[Any]) -> list[Any]:
-    return list(modules)
+def _adjust_managed_modules(
+    modules: Iterable[Any], ignored_params: set[Any] | None = None
+) -> list[Any]:
+    modules = list(modules)
+    if ignored_params is None:
+        return modules
+    decisions: dict[Any, bool] = {}
+    return [
+        module
+        for module in modules
+        if not _ignore_module(module, ignored_params, decisions)
+    ]
 
 
-def _get_managed_modules(root: Any, ignored_modules: set[Any] | None = None) -> list[Any]:
-    return [module for module in root.modules() if not _ignore_module(module, ignored_modules)]
+def _get_managed_modules(
+    root: Any,
+    ignored_params: set[Any] | None = None,
+    is_composable_fn: Any = None,
+    get_state_fn: Any = None,
+) -> list[Any]:
+    roots = tuple(root) if isinstance(root, (list, tuple)) else (root,)
+    root_set = set(roots)
+    is_composable_fn = is_composable_fn or _is_composable_with_fsdp
+    get_state_fn = get_state_fn or _get_module_fsdp_state
+    visited: set[int] = set()
+    managed: list[Any] = []
+
+    def dfs(module: Any) -> None:
+        if id(module) in visited:
+            return
+        if not is_composable_fn(module):
+            return
+        if module not in root_set and get_state_fn(module) is not None:
+            return
+        visited.add(id(module))
+        for child in module.children():
+            dfs(child)
+        managed.append(module)
+
+    for root_module in roots:
+        dfs(root_module)
+    return _adjust_managed_modules(managed, ignored_params)
 
 
 def _verify_managed_param(param: Any, ignored_params: set[Any] | None = None) -> bool:
-    return param not in (ignored_params or set())
+    if ignored_params is None:
+        if len(getattr(param, "shape", ())) == 0:
+            raise ValueError(
+                "fully_shard does not support scalar parameters; use a one-dimensional parameter"
+            )
+        return True
+    return param not in ignored_params
 
 
-def _get_managed_states(modules: Iterable[Any], ignored_params: set[Any] | None = None) -> list[tuple[Any, str, Any]]:
-    result = []
+def _get_managed_states(
+    modules: Iterable[Any], ignored_params: set[Any] | None = None
+) -> tuple[list[Any], list[Any]]:
+    params: list[Any] = []
+    buffers: list[Any] = []
+    seen_params: set[int] = set()
+    seen_buffers: set[int] = set()
     for module in modules:
         for name, param in module.named_parameters(recurse=False):
-            if _verify_managed_param(param, ignored_params):
-                result.append((module, name, param))
-    return result
+            if id(param) not in seen_params and _verify_managed_param(param, ignored_params):
+                if len(getattr(param, "shape", ())) == 0:
+                    raise ValueError(
+                        f"fully_shard does not support scalar parameter {name!r}"
+                    )
+                params.append(param)
+                seen_params.add(id(param))
+        for buffer in module.buffers(recurse=False):
+            if id(buffer) not in seen_buffers:
+                buffers.append(buffer)
+                seen_buffers.add(id(buffer))
+    return params, buffers
 
 
-def _move_states_to_device(modules: Iterable[Any], device: Any) -> None:
-    for module in modules:
-        module.to(device)
+def _move_states_to_device(
+    params_or_modules: Iterable[Any], buffers_or_device: Any, device: Any = None
+) -> None:
+    if device is None:
+        for module in params_or_modules:
+            module.to(buffers_or_device)
+        return
+    for tensor in itertools.chain(params_or_modules, buffers_or_device):
+        tensor_device = getattr(tensor, "device", None)
+        if tensor_device == device or str(tensor_device) == "meta":
+            continue
+        tensor.data = tensor.to(device)
 
 
 def _apply_to_module(module: Any, state: Any) -> Any:
@@ -266,11 +395,120 @@ def _apply_to_module(module: Any, state: Any) -> Any:
     return module
 
 
-def _init_param_group(modules: Iterable[Any], mesh_info: DataParallelMeshInfo, device: Any, mp_policy: Any, offload_policy: Any, shard_placement_fn: Any = None) -> FSDPParamGroup:
-    params = [FSDPParam(param, type("Info", (), {"module": module, "fqn": name, "name": name})(), mesh_info, device=device, shard_placement_fn=shard_placement_fn, mp_policy=mp_policy, offload_policy=offload_policy) for module in modules for name, param in module.named_parameters(recurse=False)]
-    return FSDPParamGroup(params, modules, mesh_info, None, device, shard_placement_fn, mp_policy, offload_policy)
+def _init_param_group(
+    state: Any,
+    params: list[FSDPParam],
+    modules: Iterable[Any],
+    mesh_info: DataParallelMeshInfo,
+    post_forward_mesh_info: DataParallelMeshInfo | None,
+    device: Any,
+    shard_placement_fn: Any,
+    mp_policy: Any,
+    offload_policy: Any,
+    reshard_after_forward: Any = True,
+) -> None:
+    if not params:
+        return
+    modules = list(modules)
+    if shard_placement_fn is None:
+        state._fsdp_param_groups.append(
+            FSDPParamGroup(
+                params,
+                modules,
+                mesh_info,
+                post_forward_mesh_info,
+                device,
+                shard_placement_fn,
+                mp_policy,
+                offload_policy,
+            )
+        )
+        return
+    if not isinstance(mesh_info, FSDPMeshInfo):
+        if all(isinstance(fsdp_param._placement, Replicate) for fsdp_param in params):
+            state._fsdp_param_groups.append(
+                FSDPParamGroup(
+                    params,
+                    modules,
+                    mesh_info,
+                    post_forward_mesh_info,
+                    device,
+                    shard_placement_fn,
+                    mp_policy,
+                    offload_policy,
+                )
+            )
+            return
+        raise ValueError("per-parameter placement requires an FSDP mesh")
+    grouped: dict[tuple[int, int], tuple[DataParallelMeshInfo, list[FSDPParam]]] = {}
+    for fsdp_param in params:
+        param_mesh_info = fsdp_param.mesh_info
+        if not isinstance(param_mesh_info, FSDPMeshInfo):
+            raise ValueError("per-parameter placement must return an FSDP mesh")
+        shard_group = getattr(param_mesh_info, "shard_process_group", None)
+        replicate_group = (
+            getattr(param_mesh_info, "replicate_process_group", None)
+            if isinstance(param_mesh_info, HSDPMeshInfo)
+            else None
+        )
+        key = (id(shard_group), id(replicate_group))
+        existing = grouped.get(key)
+        if existing is None:
+            grouped[key] = (param_mesh_info, [fsdp_param])
+        else:
+            existing_mesh_info, existing_params = existing
+            if existing_mesh_info is not param_mesh_info:
+                raise ValueError(
+                    "parameters sharing a process group must share mesh info"
+                )
+            existing_params.append(fsdp_param)
+    for group_mesh_info, group_params in grouped.values():
+        group_post_forward_mesh_info = (
+            post_forward_mesh_info
+            if group_mesh_info is mesh_info
+            else _get_post_forward_mesh_info(
+                reshard_after_forward, group_mesh_info
+            )
+        )
+        for fsdp_param in group_params:
+            fsdp_param.post_forward_mesh_info = group_post_forward_mesh_info
+        state._fsdp_param_groups.append(
+            FSDPParamGroup(
+                group_params,
+                modules,
+                group_mesh_info,
+                group_post_forward_mesh_info,
+                device,
+                shard_placement_fn,
+                mp_policy,
+                offload_policy,
+            )
+        )
 
 
-def _get_modules_and_states(module: Any) -> tuple[list[Any], list[Any]]:
-    modules = list(module.modules())
-    return modules, [getattr(item, "_fsdp_state", None) for item in modules]
+def _get_modules_and_states(
+    module: Any,
+    device: Any,
+    ignored_params: set[Any] | None,
+    is_composable_fn: Any = None,
+    get_state_fn: Any = None,
+) -> tuple[Any, tuple[Any, ...], list[Any], list[Any], list[Any]]:
+    arg_module = module
+    if hasattr(module, "named_modules"):
+        root_modules = (module,)
+    else:
+        candidates = list(module)
+        if not candidates:
+            raise ValueError("fully_shard expects at least one module")
+        root_modules = tuple(_get_root_modules(candidates))
+    if not root_modules:
+        raise ValueError("fully_shard could not find a root module")
+    managed_modules = _get_managed_modules(
+        root_modules,
+        ignored_params,
+        is_composable_fn,
+        get_state_fn,
+    )
+    params, buffers = _get_managed_states(managed_modules, ignored_params)
+    _move_states_to_device(params, buffers, device)
+    return arg_module, root_modules, managed_modules, params, buffers

@@ -1,8 +1,11 @@
 """Configuration objects for fully sharded module execution."""
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any
+
+from tensorplay.nn.modules.batchnorm import _BatchNorm
 
 __all__ = [
     "ShardingStrategy",
@@ -43,7 +46,7 @@ class MixedPrecision:
     keep_low_precision_grads: bool = False
     cast_forward_inputs: bool = False
     cast_root_forward_inputs: bool = True
-    _module_classes_to_ignore: tuple[type, ...] = ()
+    _module_classes_to_ignore: Sequence[type] = (_BatchNorm,)
 
 
 @dataclass

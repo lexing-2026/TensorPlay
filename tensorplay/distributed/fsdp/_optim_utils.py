@@ -11,6 +11,11 @@ from typing import Any, Iterator, NamedTuple
 import tensorplay as tp
 
 from .. import distributed_core as dist
+from ._common_utils import (
+    _apply_to_modules,
+    _named_parameters_with_duplicates,
+    clean_tensor_name,
+)
 
 __all__ = [
     "FSDPParamInfo",
@@ -592,10 +597,19 @@ def _flatten_optim_state(
     present = [unflat_osd_state.get(name) for name in names]
     if not any(state is not None for state in present):
         return {}
-    state_names: set[str] = set()
+    state_names: set[str] | None = None
     for state in present:
-        if state is not None:
-            state_names.update(state)
+        if state is None:
+            continue
+        current_names = set(state)
+        if state_names is None:
+            state_names = current_names
+        elif state_names != current_names:
+            raise ValueError(
+                f"differing optimizer state names for parameters {tuple(names)}"
+            )
+    if state_names is None:
+        raise AssertionError("optimizer state names are unavailable")
     result: dict[str, Any] = {}
     records = _records(fsdp_param_info)
     shapes = [record["shape"] for record in records]
@@ -740,7 +754,32 @@ def _get_param_id_to_param_from_optim_input(model: Any, optim_input: Any) -> dic
 
 
 def _get_flat_param_to_fqn(model: Any) -> dict[Any, str]:
-    return {param: str(name) for name, param in model.named_parameters()}
+    from ._flat_param import FlatParameter
+
+    def module_fn(
+        module: Any,
+        prefix: str,
+        tree_level: int,
+        flat_param_to_fqn: dict[Any, str],
+    ) -> None:
+        del tree_level
+        for param_name, param in _named_parameters_with_duplicates(
+            module, recurse=False
+        ):
+            if isinstance(param, FlatParameter):
+                flat_param_to_fqn[param] = clean_tensor_name(prefix + param_name)
+
+    def return_fn(flat_param_to_fqn: dict[Any, str]) -> dict[Any, str]:
+        return flat_param_to_fqn
+
+    result: dict[Any, str] = {}
+    return _apply_to_modules(
+        model,
+        module_fn,
+        return_fn,
+        [name for name, _ in _named_parameters_with_duplicates(model)],
+        result,
+    )
 
 
 def _get_param_key_to_param(
@@ -924,20 +963,90 @@ def _allgather_orig_param_states(
     to_save: bool,
     cpu_offload: bool,
 ) -> dict[str, dict[str, Any]]:
-    del gathered_state_info
     if not to_save:
         return {}
-    result: dict[str, dict[str, Any]] = {}
-    for record in _records(fsdp_param_info):
-        source = input_states.get(record["name"], {})
-        target: dict[str, Any] = {}
-        for state_name, value in source.items():
-            if _is_tensor(value) and value.dim() > 0:
-                value = _gather_param_value(value, record, fsdp_param_info)
-                if shard_state:
-                    value = _local_shard(value, record, fsdp_param_info)
-            target[state_name] = _clone_state(value, cpu_offload)
-        result[record["name"]] = target
+    records = _records(fsdp_param_info)
+    records_by_name = {record["name"]: record for record in records}
+    state_names: dict[str, set[str]] = {
+        name: set(values) for name, values in input_states.items()
+    }
+    for info in gathered_state_info:
+        for name, values in getattr(info, "state", {}).items():
+            state_names.setdefault(name, set()).update(values)
+        for name, values in getattr(info, "metadata", {}).items():
+            state_names.setdefault(name, set()).update(values)
+    ordered_names = [record["name"] for record in records]
+    ordered_names.extend(name for name in state_names if name not in records_by_name)
+    result: dict[str, dict[str, Any]] = {
+        name: {} for name in ordered_names if name in state_names
+    }
+    group = _group_for_info(fsdp_param_info)
+    world = _world_size(group)
+    for name in ordered_names:
+        if name not in state_names:
+            continue
+        record = records_by_name.get(name)
+        local_states = input_states.get(name, {})
+        remote_states = [
+            getattr(info, "state", {}).get(name, {}) for info in gathered_state_info
+        ]
+        remote_metadata = [
+            getattr(info, "metadata", {}).get(name, {})
+            for info in gathered_state_info
+        ]
+        for state_name in sorted(state_names[name]):
+            value = local_states.get(state_name)
+            descriptions = [
+                metadata.get(state_name)
+                for metadata in remote_metadata
+                if state_name in metadata
+            ]
+            is_tensor_state = _is_tensor(value) and value.dim() > 0
+            is_tensor_state = is_tensor_state or bool(descriptions)
+            if record is None or not is_tensor_state:
+                candidates = [
+                    states[state_name]
+                    for states in remote_states
+                    if state_name in states
+                ]
+                if value is not None:
+                    candidates.insert(0, value)
+                if not candidates:
+                    continue
+                first = candidates[0]
+                if any(not _same_value(first, candidate) for candidate in candidates[1:]):
+                    raise ValueError(
+                        f"optimizer state {state_name} differs across ranks"
+                    )
+                result[name][state_name] = _clone_state(first, cpu_offload)
+                continue
+
+            owner = record["owner"]
+            local_getter = getattr(owner, "_sharded_local_tensor", None)
+            if not callable(local_getter):
+                if value is not None:
+                    result[name][state_name] = _clone_state(value, cpu_offload)
+                continue
+            local_param = local_getter()
+            local_shape = tuple(int(size) for size in local_param.shape)
+            dtype = getattr(value, "dtype", None)
+            if dtype is None and descriptions:
+                dtype = descriptions[0].dtype
+            for description in descriptions[1:]:
+                if description.dtype != dtype:
+                    raise ValueError(
+                        f"optimizer state {state_name} uses different dtypes across ranks"
+                    )
+            if value is None or not (_is_tensor(value) and value.dim() > 0):
+                value = tp.zeros(local_shape, dtype=dtype, device=local_param.device)
+            elif tuple(int(size) for size in value.shape) != local_shape:
+                value = _local_shard(value, record, fsdp_param_info)
+            elif world <= 1:
+                value = value.detach().clone()
+            full = _gather_param_value(value, record, fsdp_param_info)
+            if shard_state:
+                full = _local_shard(full, record, fsdp_param_info)
+            result[name][state_name] = _clone_state(full, cpu_offload)
     return result
 
 
@@ -1073,33 +1182,60 @@ def _optim_state_dict(
 
 
 def _get_fqn_to_fsdp_param_info(model: Any) -> dict[str, FSDPParamInfo]:
-    result: dict[str, FSDPParamInfo] = {}
-    for module in model.modules():
+    def module_fn(
+        module: Any,
+        prefix: str,
+        tree_level: int,
+        fqn_to_param_info: dict[str, FSDPParamInfo],
+    ) -> None:
+        del tree_level
         state = getattr(module, "_fsdp_state", None)
         if state is None:
-            continue
-        getter = getattr(state, "_fsdp_param_group", None)
-        param_group = getter() if callable(getter) else getattr(state, "_param_group", None)
-        if param_group is None:
-            continue
-        params = list(getattr(param_group, "params", ()))
-        if not params:
-            continue
-        info = FSDPParamInfo(state, param_group)
-        for index, owner in enumerate(params):
-            fqn = str(getattr(getattr(owner, "module_info", None), "fqn", index))
-            info.param_indices[fqn] = index
-            info.param_requires_grad.append(bool(getattr(getattr(owner, "param", owner), "requires_grad", False)))
-        for fqn in info.param_indices:
-            result[fqn] = info
-    model_names = [str(name) for name, _ in model.named_parameters()]
-    for name in model_names:
-        if name in result:
-            continue
-        matches = [candidate for candidate in result if name.endswith(candidate)]
-        if len(matches) == 1:
-            result[name] = result[matches[0]]
-    return result
+            return
+        groups_getter = getattr(state, "_all_param_groups", None)
+        if callable(groups_getter):
+            param_groups = list(groups_getter())
+        else:
+            getter = getattr(state, "_fsdp_param_group", None)
+            param_group = (
+                getter() if callable(getter) else getattr(state, "_param_group", None)
+            )
+            param_groups = [param_group] if param_group is not None else []
+        for param_group in param_groups:
+            params = list(getattr(param_group, "params", ()))
+            if not params:
+                continue
+            info = FSDPParamInfo(state, param_group)
+            for index, owner in enumerate(params):
+                local_fqn = str(
+                    getattr(getattr(owner, "module_info", None), "fqn", index)
+                )
+                if local_fqn.isdigit() or (
+                    prefix and not local_fqn.startswith(prefix.rstrip("."))
+                ):
+                    fqn = clean_tensor_name(prefix + local_fqn)
+                else:
+                    fqn = clean_tensor_name(local_fqn)
+                info.param_indices[fqn] = index
+                info.param_requires_grad.append(
+                    bool(getattr(getattr(owner, "param", owner), "requires_grad", False))
+                )
+            for fqn in info.param_indices:
+                fqn_to_param_info[fqn] = info
+
+    def return_fn(
+        fqn_to_param_info: dict[str, FSDPParamInfo],
+    ) -> dict[str, FSDPParamInfo]:
+        return fqn_to_param_info
+
+    result: dict[str, FSDPParamInfo] = {}
+    return _apply_to_modules(
+        model,
+        module_fn,
+        return_fn,
+        [name for name, _ in _named_parameters_with_duplicates(model)],
+        result,
+    )
 
 
 def _set_optim_use_dtensor(fsdp_state: Any, state_dict_settings: Any) -> None:

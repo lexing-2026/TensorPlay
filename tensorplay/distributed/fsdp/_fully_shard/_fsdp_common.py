@@ -191,6 +191,9 @@ class DDPMeshInfo(DataParallelMeshInfo):
 class HSDPMeshInfo(FSDPMeshInfo, DDPMeshInfo):
     replicate_mesh_dim: int | str = 0
 
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
 
 def _raise_assert_with_print(message: str) -> None:
     raise AssertionError(message)

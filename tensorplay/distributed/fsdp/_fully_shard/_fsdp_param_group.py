@@ -6,17 +6,36 @@ from typing import Any, Iterable
 import tensorplay as tp
 from tensorplay.autograd import Function
 
+from ... import distributed_core as dist
+from ...utils import _apply_to_tensors
 from ._fsdp_api import CPUOffloadPolicy
 from ._fsdp_collectives import (
     AllGatherResult,
     DefaultAllGather,
     DefaultReduceScatter,
+    ProcessGroupAllocAllGather,
+    ProcessGroupAllocReduceScatter,
+    SymmMemAllGather,
+    SymmMemReduceScatter,
+    _record_event,
+    _current_stream,
     foreach_all_gather,
     foreach_all_gather_copy_out,
     foreach_reduce,
+    _wait_event,
+    _wait_stream,
 )
-from ._fsdp_common import DataParallelMeshInfo, FSDPMeshInfo, TrainingState
-from ._fsdp_param import FSDPParam, ShardedState
+from .._common_utils import collect_grad_tensors, replace_grad_tensors
+from ._fsdp_common import (
+    DataParallelMeshInfo,
+    FSDPMeshInfo,
+    TrainingState,
+    _disable_functorch_if_active,
+    _cast_fp_tensor,
+    _dynamo_disable,
+    is_bw,
+)
+from ._fsdp_param import FSDPParam, ParamModuleInfo, ShardedState
 
 __all__ = [
     "FSDPCommContext",
@@ -25,6 +44,7 @@ __all__ = [
     "AllReduceState",
     "FSDPParamGroup",
     "RegisterPostBackwardFunction",
+    "_get_param_module_infos",
 ]
 
 
@@ -39,25 +59,56 @@ class FSDPCommContext:
         self.all_reduce_stream = None
         self.all_gather_state: AllGatherState | None = None
         self.reduce_scatter_states: list[ReduceScatterState] = []
+        self._last_post_reduce_events: dict[Any, Any] = {}
         self.post_forward_order: list[Any] = []
         self.reduce_scatter_max_input_buffers = 1
 
     def lazy_init(self, device: Any) -> None:
         self.device = device
-        self.device_handle = getattr(tp, "cuda", None)
+        device_type = str(getattr(device, "type", device)).split(":", 1)[0].lower()
+        cuda = getattr(tp, "cuda", None)
+        self.device_handle = (
+            cuda
+            if device_type == "cuda"
+            and cuda is not None
+            and callable(getattr(cuda, "is_available", None))
+            and cuda.is_available()
+            else None
+        )
+        if self.device_handle is None:
+            self.initialized = True
+            return
+        try:
+            self.all_gather_copy_in_stream = self.device_handle.Stream(
+                device=device, priority=-1
+            )
+            self.all_gather_stream = self.device_handle.Stream(
+                device=device, priority=-1
+            )
+            self.reduce_scatter_stream = self.device_handle.Stream(
+                device=device, priority=-1
+            )
+            self.all_reduce_stream = self.device_handle.Stream(device=device)
+        except (RuntimeError, TypeError):
+            self.all_gather_copy_in_stream = None
+            self.all_gather_stream = None
+            self.reduce_scatter_stream = None
+            self.all_reduce_stream = None
         self.initialized = True
 
     def get_all_gather_streams(self, async_op: bool, training_state: Any) -> tuple[Any, Any]:
-        del training_state
-        if not async_op or self.device is None:
+        if self.device_handle is None or self.device is None:
             return None, None
-        device_type = getattr(self.device, "type", str(self.device).split(":", 1)[0])
-        if str(device_type) != "cuda" or not getattr(tp, "cuda", None) or not tp.cuda.is_available():
-            return None, None
-        try:
-            return tp.cuda.Stream(device=self.device), tp.cuda.Stream(device=self.device)
-        except (RuntimeError, TypeError):
-            return None, None
+        state_name = getattr(training_state, "name", str(training_state))
+        if (
+            not async_op
+            and state_name in {"FORWARD", "PRE_BACKWARD"}
+            and self.all_gather_copy_in_stream is not None
+            and self.all_gather_stream is not None
+        ):
+            return self.all_gather_copy_in_stream, self.all_gather_stream
+        current_stream = _current_stream(self.device)
+        return current_stream, current_stream
 
 
 @dataclass
@@ -68,13 +119,13 @@ class AllGatherState:
 
 @dataclass
 class ReduceScatterState:
-    results: list[Any] = field(default_factory=list)
+    reduce_scatter_input: Any = None
     event: Any = None
 
 
 @dataclass
 class AllReduceState:
-    results: list[Any] = field(default_factory=list)
+    all_reduce_input: Any = None
     event: Any = None
 
 
@@ -83,15 +134,17 @@ class FSDPParamGroup:
         del shard_placement_fn
         self.params = list(params)
         self.fsdp_params = self.params
-        self.modules = list(modules)
+        self.modules = modules if isinstance(modules, list) else list(modules)
         self.mesh_info = mesh_info
         self.post_forward_mesh_info = post_forward_mesh_info
         self.device = device
         self.mp_policy = mp_policy
         self.offload_policy = offload_policy
         self.comm_ctx = FSDPCommContext()
+        self._module_fqn = None
         self._reshard_after_forward_enabled = True
         self._reshard_after_backward_enabled = True
+        self.reshard_after_backward = True
         self._requires_gradient_sync = True
         self._requires_all_reduce = True
         self.reduce_scatter_max_input_buffers = 1
@@ -99,7 +152,8 @@ class FSDPParamGroup:
         self._sharded_state = ShardedState.SHARDED
         self._backward_finalized = False
         self._post_backward_done = False
-        self._all_gather_result: list[AllGatherResult] | None = None
+        self._all_gather_result: AllGatherResult | list[AllGatherResult] | None = None
+        self._all_gather_async_op = False
         self._all_gather_comm = DefaultAllGather()
         self._reduce_scatter_comm = DefaultReduceScatter()
         self.unshard_async_op = False
@@ -116,9 +170,14 @@ class FSDPParamGroup:
         self.force_sum_reduction_for_comms = False
         self._partial_reduce_output = None
         self._post_reduce_event = None
+        self._reshard_after_forward_event = None
         self._all_reduce_state = None
         self._all_reduce_hook = None
         self._all_reduce_hook_stream = None
+        self._comm_hook = None
+        self._comm_hook_state = None
+        self._module_to_pre_save_state_dict_hook_handle: dict[Any, Any] = {}
+        self._module_to_pre_load_state_dict_hook_handle: dict[Any, Any] = {}
         self._state_dict_hooks_registered = False
         self._post_forward_recorded = False
         self._post_backward_wrapped = False
@@ -138,6 +197,14 @@ class FSDPParamGroup:
         ]
         orig_dtypes = {param.orig_dtype for param in candidates}
         reduce_dtypes = {param.reduce_dtype for param in candidates}
+        if trainable and len(orig_dtypes) != 1:
+            raise AssertionError(
+                f"FSDP expects uniform original parameter dtype but got {orig_dtypes}"
+            )
+        if trainable and len(reduce_dtypes) != 1:
+            raise AssertionError(
+                f"FSDP expects uniform reduce dtype but got {reduce_dtypes}"
+            )
         self._orig_dtype = next(iter(orig_dtypes)) if len(orig_dtypes) == 1 else None
         self._reduce_dtype = (
             next(iter(reduce_dtypes)) if len(reduce_dtypes) == 1 else None
@@ -151,15 +218,58 @@ class FSDPParamGroup:
                 param.reset_sharded_param()
                 param._init_extensions()
             self._reset_sharded_params = True
-        self._init_mp_dtypes()
         self._validate_no_meta_params()
         self._validate_cpu_offload_params()
         self._validate_reduce_scatter_max_input_buffers()
+        self._init_mp_dtypes()
+        self._register_state_dict_hooks()
 
     def set_symm_mem(self, backend: Any) -> None:
+        if not isinstance(self._all_gather_comm, (DefaultAllGather, SymmMemAllGather)):
+            raise AssertionError(
+                "cannot enable symmetric memory with a custom all-gather"
+            )
+        self._all_gather_comm = SymmMemAllGather(
+            self._all_gather_process_group(), backend
+        )
+        if not isinstance(
+            self._reduce_scatter_comm,
+            (DefaultReduceScatter, SymmMemReduceScatter),
+        ):
+            raise AssertionError(
+                "cannot enable symmetric memory with a custom reduce-scatter"
+            )
+        if self.force_sum_reduction_for_comms:
+            self._reduce_scatter_comm = SymmMemReduceScatter(
+                self._reduce_scatter_process_group(), backend
+            )
         self._symm_mem_backend = backend
 
     def set_allocate_memory_from_process_group(self, enable: bool) -> None:
+        if not isinstance(
+            self._all_gather_comm,
+            (DefaultAllGather, ProcessGroupAllocAllGather),
+        ):
+            raise AssertionError(
+                "cannot enable process-group allocation with a custom all-gather"
+            )
+        self._all_gather_comm = (
+            ProcessGroupAllocAllGather(self._all_gather_process_group())
+            if enable
+            else DefaultAllGather()
+        )
+        if not isinstance(
+            self._reduce_scatter_comm,
+            (DefaultReduceScatter, ProcessGroupAllocReduceScatter),
+        ):
+            raise AssertionError(
+                "cannot enable process-group allocation with a custom reduce-scatter"
+            )
+        self._reduce_scatter_comm = (
+            ProcessGroupAllocReduceScatter(self._reduce_scatter_process_group())
+            if enable
+            else DefaultReduceScatter()
+        )
         self._allocate_from_process_group = bool(enable)
 
     def _unshard_impl(self) -> None:
@@ -177,6 +287,7 @@ class FSDPParamGroup:
             return self.post_forward_mesh_info
         return self.mesh_info
 
+    @_disable_functorch_if_active
     def unshard(self, async_op: bool = False) -> None:
         if self._is_unsharded:
             return
@@ -185,6 +296,9 @@ class FSDPParamGroup:
                 self.wait_for_unshard()
             return
         self.lazy_init()
+        if self._reshard_after_forward_event is not None:
+            self._wait_all_gather_streams_on_event(self._reshard_after_forward_event)
+            self._reshard_after_forward_event = None
         if (
             not self.unshard_in_backward
             and self._training_state == TrainingState.PRE_BACKWARD
@@ -201,9 +315,12 @@ class FSDPParamGroup:
                 param.init_all_gather_outputs(
                     [int(value.numel())], [value.dtype], 1, self.device
                 )
+                param.alloc_all_gather_outputs()
                 output = param.all_gather_outputs[0]
                 output.copy_(value)
-                results.append(AllGatherResult(output, None))
+                results.append(
+                    AllGatherResult(output, _record_event(_current_stream(self.device)))
+                )
             self._all_gather_result = results
         else:
             self._all_gather_result = foreach_all_gather(
@@ -216,29 +333,72 @@ class FSDPParamGroup:
                 self.device,
                 self._all_gather_comm,
             )
-        if not async_op:
-            self.wait_for_unshard()
+        self._all_gather_async_op = bool(async_op)
 
+    @_disable_functorch_if_active
     def wait_for_unshard(self) -> None:
+        if self._training_state == TrainingState.FORWARD:
+            previous = self.comm_ctx.all_gather_state
+            if previous is not None:
+                self._wait_all_gather_streams_on_event(previous.event)
+                self.comm_ctx.all_gather_state = None
         results = self._all_gather_result
         if results is None:
             return
         try:
-            foreach_all_gather_copy_out(
-                results, self.params, self._all_gather_process_group()
-            )
+            world_size = self._all_gather_world_size()
+            if world_size == 1:
+                if not isinstance(results, list):
+                    raise RuntimeError("single-rank all-gather result is malformed")
+                for result, param in zip(results, self.params):
+                    _wait_event(result.event, _current_stream(result.output.device))
+                    result.wait()
+                    param.init_unsharded_param()
+            else:
+                if not isinstance(results, AllGatherResult):
+                    raise RuntimeError("multi-rank all-gather result is malformed")
+                foreach_all_gather_copy_out(
+                    results, self.params, self._all_gather_process_group()
+                )
+                for param in self.params:
+                    param.init_unsharded_param()
             self._sharded_state = ShardedState.UNSHARDED
             self._is_unsharded = True
+            copy_out_event = _record_event(_current_stream(self.device))
+            if (
+                not self._all_gather_async_op
+                and self._training_state == TrainingState.FORWARD
+                and world_size > 1
+            ):
+                self.comm_ctx.all_gather_state = AllGatherState(
+                    results if isinstance(results, list) else [results],
+                    copy_out_event,
+                )
+            else:
+                self._wait_all_gather_streams_on_event(copy_out_event)
         finally:
             self._all_gather_result = None
+            self._all_gather_async_op = False
 
     def _wait_all_gather_streams_on_event(self, event: Any) -> None:
-        wait = getattr(event, "wait", None)
-        if wait is not None:
-            wait()
+        if event is None:
+            return
+        _wait_event(event, self.comm_ctx.all_gather_copy_in_stream)
+        _wait_event(event, self.comm_ctx.all_gather_stream)
 
+    @_disable_functorch_if_active
     def reshard(self) -> None:
-        self.wait_for_unshard()
+        if self._training_state == TrainingState.FORWARD:
+            if not self._reshard_after_forward_enabled:
+                return
+            if self._use_post_forward_mesh():
+                self._to_sharded_post_forward()
+                self._reshard_after_forward_event = _record_event(
+                    _current_stream(self.device)
+                )
+                return
+        if self._all_gather_result is not None:
+            self.wait_for_unshard()
         if not self._is_unsharded:
             return
         for param in self.params:
@@ -261,23 +421,66 @@ class FSDPParamGroup:
         self._backward_finalized = False
 
     def _reset_iter_state(self) -> None:
+        current_stream = _current_stream(self.device)
+        if self.comm_ctx.all_gather_state is not None:
+            _wait_event(self.comm_ctx.all_gather_state.event, current_stream)
+            self.comm_ctx.all_gather_state = None
+        if self._all_gather_result is not None:
+            pending = self._all_gather_result
+            if isinstance(pending, list):
+                for result in pending:
+                    _wait_event(result.event, current_stream)
+                    result.wait()
+            else:
+                _wait_event(pending.event, current_stream)
+                pending.wait()
+            self._all_gather_result = None
+        _wait_event(self._post_reduce_event, current_stream)
+        _wait_event(
+            getattr(self._all_reduce_state, "event", None), current_stream
+        )
+        for state in self.comm_ctx.reduce_scatter_states:
+            _wait_event(state.event, current_stream)
+        for event in self.comm_ctx._last_post_reduce_events.values():
+            _wait_event(event, current_stream)
+        self.comm_ctx._last_post_reduce_events.clear()
+        if self._reshard_after_forward_event is not None:
+            self._wait_all_gather_streams_on_event(self._reshard_after_forward_event)
+            self._reshard_after_forward_event = None
+        self._to_sharded()
         self._is_unsharded = False
         self._sharded_state = ShardedState.SHARDED
         self._backward_finalized = False
         self._post_backward_done = False
         self._post_reduce_event = None
         self._all_reduce_state = None
+        for param in self.params:
+            event = getattr(param, "grad_offload_event", None)
+            if event is not None:
+                synchronize = getattr(event, "synchronize", None)
+                if callable(synchronize):
+                    synchronize()
+                param.grad_offload_event = None
+        self._post_forward_indices.clear()
+        self._training_state = TrainingState.IDLE
         self._partial_reduce_output = None
         self.comm_ctx.reduce_scatter_states.clear()
 
     def pre_forward(self, module: Any, args: Any, kwargs: Any) -> tuple[Any, Any]:
         del module
+        self.lazy_init()
         self._backward_finalized = False
         self._post_backward_done = False
         entering_forward_pass = self._training_state != TrainingState.FORWARD
         self._training_state = TrainingState.FORWARD
+        current_stream = _current_stream(self.device)
+        if entering_forward_pass:
+            _wait_stream(self.comm_ctx.all_gather_copy_in_stream, current_stream)
+            _wait_stream(self.comm_ctx.all_gather_stream, current_stream)
         self.unshard(self.unshard_async_op)
         self.wait_for_unshard()
+        for param in self.params:
+            param._restore_spmd_types(param.unsharded_param())
         policy = self.mp_policy
         if getattr(policy, "cast_forward_inputs", False):
             dtype = getattr(policy, "param_dtype", None)
@@ -292,27 +495,53 @@ class FSDPParamGroup:
         del module, input
         dtype = getattr(self.mp_policy, "output_dtype", None)
         result = _cast_tree(output, dtype) if dtype is not None else output
-        if self._reshard_after_forward_enabled:
-            if self._use_post_forward_mesh():
-                self._to_sharded_post_forward()
-            else:
-                self.reshard()
+        if not is_bw():
+            if self._reshard_after_forward_enabled:
+                if self._use_post_forward_mesh():
+                    self._to_sharded_post_forward()
+                    self._reshard_after_forward_event = _record_event(
+                        _current_stream(self.device)
+                    )
+                else:
+                    self.reshard()
+            if self._training_state == TrainingState.FORWARD:
+                self._record_post_forward()
         self._training_state = TrainingState.IDLE
         return result
 
+    def finalize_forward(self) -> None:
+        state = self.comm_ctx.all_gather_state
+        if state is None:
+            return
+        self._wait_all_gather_streams_on_event(state.event)
+        self.comm_ctx.all_gather_state = None
+
     def _record_post_forward(self) -> None:
+        post_forward_index = len(self.comm_ctx.post_forward_order)
+        self.comm_ctx.post_forward_order.append(self)
+        self._post_forward_indices.append(post_forward_index)
         self._post_forward_recorded = True
 
+    @_dynamo_disable
     def pre_backward(self, default_prefetch: Any, *unused: Any) -> None:
-        del default_prefetch, unused
+        if self._training_state == TrainingState.PRE_BACKWARD:
+            return
+        del unused
         self._training_state = TrainingState.PRE_BACKWARD
         self.unshard(self.unshard_async_op)
         self.wait_for_unshard()
+        if default_prefetch:
+            self._backward_prefetch()
 
+    @_dynamo_disable
     def post_backward(self, *unused: Any) -> None:
         del unused
         if self._post_backward_done:
             return
+        is_partial_group_backward = (
+            len(self.modules) > 1
+            and self._training_state == TrainingState.FORWARD
+        )
         self._training_state = TrainingState.POST_BACKWARD
         for param in self.params:
             param.accumulate_unsharded_grad_if_needed()
@@ -336,7 +565,7 @@ class FSDPParamGroup:
             ):
                 fsdp_params_with_grad.append(param)
                 unsharded_grads.append(param.unsharded_zero_grad_data())
-        if not self.reduce_grads or not self._requires_gradient_sync:
+        if not self.reduce_grads:
             for param in fsdp_params_with_grad:
                 if param.unsharded_accumulated_grad is not None:
                     continue
@@ -358,11 +587,11 @@ class FSDPParamGroup:
                 self.reshard()
             self._post_backward_done = True
             return
-        limit = int(self.reduce_scatter_max_input_buffers)
-        while len(self.comm_ctx.reduce_scatter_states) >= limit:
-            state = self.comm_ctx.reduce_scatter_states.pop(0)
-            if state.event is not None:
-                self._wait_all_gather_streams_on_event(state.event)
+        limit = int(self.comm_ctx.reduce_scatter_max_input_buffers)
+        if self._param_group_index == self._num_param_groups - 1:
+            while len(self.comm_ctx.reduce_scatter_states) >= limit:
+                state = self.comm_ctx.reduce_scatter_states.pop(0)
+                _wait_event(state.event, _current_stream(self.device))
         for param in fsdp_params_with_grad:
             if param.unsharded_accumulated_grad is not None:
                 param.unsharded_accumulated_grad = None
@@ -372,6 +601,13 @@ class FSDPParamGroup:
                 param._unsharded_grad = None
         if self._reshard_after_backward_enabled:
             self.reshard()
+        all_reduce_group = self._all_reduce_process_group()
+        all_reduce_stream = self.comm_ctx.all_reduce_stream
+        if all_reduce_group is None and self._all_reduce_hook_stream is not None:
+            if self._all_reduce_hook is None:
+                raise RuntimeError("all-reduce hook stream requires an all-reduce hook")
+            all_reduce_stream = self._all_reduce_hook_stream
+        self._wait_for_post_backward()
         reduce_result = foreach_reduce(
             fsdp_params_with_grad,
             unsharded_grads,
@@ -382,30 +618,38 @@ class FSDPParamGroup:
             self._reduce_dtype,
             self.device,
             self.gradient_divide_factor,
-            self._all_reduce_process_group(),
-            self.comm_ctx.all_reduce_stream,
-            self.all_reduce_grads and self._requires_all_reduce,
+            all_reduce_group,
+            all_reduce_stream,
+            self.all_reduce_grads,
             self._partial_reduce_output,
             self._all_reduce_hook,
             self.force_sum_reduction_for_comms,
+            self._comm_hook,
+            self._comm_hook_state,
         )
         (
             reduce_scatter_input,
             reduce_scatter_event,
-            _post_reduce_stream,
+            post_reduce_stream,
             post_reduce_event,
             all_reduce_input,
             all_reduce_event,
             partial_reduce_output,
         ) = reduce_result
         self.comm_ctx.reduce_scatter_states.append(
-            ReduceScatterState([reduce_scatter_input], reduce_scatter_event)
+            ReduceScatterState(reduce_scatter_input, reduce_scatter_event)
         )
         self._post_reduce_event = post_reduce_event
+        self.comm_ctx._last_post_reduce_events[post_reduce_stream] = post_reduce_event
         self._partial_reduce_output = partial_reduce_output
+        if is_partial_group_backward:
+            _wait_event(post_reduce_event, _current_stream(self.device))
         if all_reduce_input is not None:
+            device_type = str(getattr(self.device, "type", self.device)).split(":", 1)[0]
+            if device_type != "cpu" and all_reduce_event is None:
+                raise RuntimeError("all-reduce completion event is unavailable")
             self._all_reduce_state = AllReduceState(
-                [all_reduce_input], all_reduce_event
+                all_reduce_input, all_reduce_event
             )
         self._post_backward_done = True
 
@@ -415,31 +659,92 @@ class FSDPParamGroup:
         self._backward_finalized = True
         if not self._post_backward_done:
             self.post_backward()
-        if self._post_reduce_event is not None:
-            self._wait_all_gather_streams_on_event(self._post_reduce_event)
-            self._post_reduce_event = None
+        current_stream = _current_stream(self.device)
+        for event in self.comm_ctx._last_post_reduce_events.values():
+            _wait_event(event, current_stream)
+        self.comm_ctx._last_post_reduce_events.clear()
+        self._post_reduce_event = None
         for state in self.comm_ctx.reduce_scatter_states:
-            if state.event is not None:
-                self._wait_all_gather_streams_on_event(state.event)
+            _wait_event(state.event, current_stream)
         self.comm_ctx.reduce_scatter_states.clear()
+        _wait_event(getattr(self._all_reduce_state, "event", None), current_stream)
         self._all_reduce_state = None
+        for param in self.params:
+            event = getattr(param, "grad_offload_event", None)
+            if event is not None:
+                synchronize = getattr(event, "synchronize", None)
+                if callable(synchronize):
+                    synchronize()
+                param.grad_offload_event = None
+        if self._all_gather_result is not None:
+            pending = self._all_gather_result
+            if isinstance(pending, list):
+                for result in pending:
+                    _wait_event(result.event, current_stream)
+                    result.wait()
+            else:
+                _wait_event(pending.event, current_stream)
+                pending.wait()
+            self._all_gather_result = None
+        self._post_forward_indices.clear()
         self._partial_reduce_output = None
 
     def _wait_for_post_backward(self) -> None:
         self.wait_for_unshard()
+        current_stream = _current_stream(self.device)
+        _wait_event(self._post_reduce_event, current_stream)
+        self._post_reduce_event = None
+        _wait_event(getattr(self._all_reduce_state, "event", None), current_stream)
+        self._all_reduce_state = None
 
     def _backward_prefetch(self) -> None:
-        self.wait_for_unshard()
+        if not self._post_forward_indices:
+            return
+        current_index = self._post_forward_indices.pop()
+        if self._num_param_groups > 1:
+            if self._param_group_index != 1:
+                return
+            current_modules = self.modules
+            target_modules = None
+            for step in range(1, current_index + 1):
+                target = self.comm_ctx.post_forward_order[current_index - step]
+                if target.modules is current_modules:
+                    continue
+                if target_modules is None:
+                    target_modules = target.modules
+                elif target.modules is not target_modules:
+                    break
+                self._prefetch_unshard(target, "backward")
+        elif current_index > 0:
+            self._prefetch_unshard(
+                self.comm_ctx.post_forward_order[current_index - 1], "backward"
+            )
 
-    def _prefetch_unshard(self, target_fsdp_param_group: Any, pass_type: Any) -> None:
-        del pass_type
-        target_fsdp_param_group.unshard()
+    @staticmethod
+    def _prefetch_unshard(target_fsdp_param_group: Any, pass_type: Any) -> None:
+        if pass_type not in {"forward", "backward"}:
+            raise ValueError(f"unknown prefetch pass: {pass_type}")
+        state = (
+            TrainingState.FORWARD
+            if pass_type == "forward"
+            else TrainingState.PRE_BACKWARD
+        )
+        with target_fsdp_param_group.use_training_state(state):
+            target_fsdp_param_group.unshard(target_fsdp_param_group.unshard_async_op)
 
     def _to_sharded(self) -> None:
-        self.reshard()
+        if self._sharded_state == ShardedState.SHARDED:
+            return
+        for param in self.params:
+            param.to_sharded()
+        self._is_unsharded = False
+        self._sharded_state = ShardedState.SHARDED
+        self._post_backward_wrapped = False
+        self._backward_finalized = False
 
     def _to_sharded_post_forward(self) -> None:
-        self.wait_for_unshard()
+        if self._all_gather_result is not None:
+            self.wait_for_unshard()
         if not self._is_unsharded:
             return
         for param in self.params:
@@ -458,7 +763,12 @@ class FSDPParamGroup:
         self._backward_finalized = False
 
     def _to_unsharded(self) -> None:
-        self.unshard()
+        if self._sharded_state == ShardedState.UNSHARDED:
+            return
+        for param in self.params:
+            param.to_unsharded()
+        self._is_unsharded = True
+        self._sharded_state = ShardedState.UNSHARDED
 
     def is_sharded(self) -> bool:
         return self._sharded_state == ShardedState.SHARDED
@@ -484,32 +794,16 @@ class FSDPParamGroup:
         return _TrainingStateGuard()
 
     def _register_post_backward_hook(self, args: Any, kwargs: Any) -> tuple[Any, Any]:
-        values = [
-            value
-            for value in _iter_tensors((args, kwargs))
-            if getattr(value, "requires_grad", False)
-        ]
-        if not values:
+        if not getattr(tp, "is_grad_enabled", lambda: True)():
             return args, kwargs
-        wrapped = RegisterPostBackwardFunction.apply(self, *values)
-        if not isinstance(wrapped, tuple):
-            wrapped = (wrapped,)
-        iterator = iter(wrapped)
-
-        def replace(value: Any) -> Any:
-            if isinstance(value, tp.Tensor):
-                if getattr(value, "requires_grad", False):
-                    return next(iterator)
-                return value
-            if isinstance(value, tuple):
-                return tuple(replace(item) for item in value)
-            if isinstance(value, list):
-                return [replace(item) for item in value]
-            if isinstance(value, dict):
-                return {key: replace(item) for key, item in value.items()}
-            return value
-
-        return replace(args), replace(kwargs)
+        input_tensors = collect_grad_tensors((args, kwargs))
+        if not input_tensors:
+            return args, kwargs
+        output_tensors = RegisterPostBackwardFunction.apply(self, *input_tensors)
+        if not isinstance(output_tensors, tuple):
+            output_tensors = (output_tensors,)
+        replaced = replace_grad_tensors((args, kwargs), iter(output_tensors))
+        return replaced
 
     def _install_post_backward_wrappers(self) -> None:
         if self._post_backward_wrapped:
@@ -527,6 +821,34 @@ class FSDPParamGroup:
         self._post_backward_wrapped = True
 
     def _register_state_dict_hooks(self) -> None:
+        num_pre_save_hooks = len(self._module_to_pre_save_state_dict_hook_handle)
+        num_pre_load_hooks = len(self._module_to_pre_load_state_dict_hook_handle)
+        if num_pre_save_hooks != num_pre_load_hooks:
+            raise AssertionError(
+                f"pre-save hooks={num_pre_save_hooks} pre-load hooks={num_pre_load_hooks}"
+            )
+        if num_pre_save_hooks > 0:
+            self._state_dict_hooks_registered = True
+            return
+        modules_with_params = {param.module_info.module for param in self.params}
+
+        def to_sharded_hook(*args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+            if getattr(
+                getattr(self, "_fsdp_state", None),
+                "_summoning_full_params",
+                False,
+            ):
+                return
+            self._to_sharded()
+
+        for module in modules_with_params:
+            self._module_to_pre_save_state_dict_hook_handle[module] = (
+                module.register_state_dict_pre_hook(to_sharded_hook)
+            )
+            self._module_to_pre_load_state_dict_hook_handle[module] = (
+                module._register_load_state_dict_pre_hook(to_sharded_hook)
+            )
         self._state_dict_hooks_registered = True
 
     def _reshard_after_forward(self) -> bool:
@@ -567,9 +889,33 @@ class FSDPParamGroup:
             return None
         return self.mesh_info.mesh.get_group(self.mesh_info.replicate_mesh_dim)
 
-    def _set_separate_reduce_scatter_group(self, enable: bool, new_groups: Any = None) -> None:
-        self._separate_reduce_scatter = bool(enable)
-        self._new_reduce_scatter_groups = new_groups
+    def _set_separate_reduce_scatter_group(
+        self, enable: bool, new_groups: dict[tuple[int, ...], Any] | None = None
+    ) -> None:
+        if not isinstance(self.mesh_info, FSDPMeshInfo):
+            raise AssertionError(
+                f"Expected FSDPMeshInfo, got {type(self.mesh_info).__name__}"
+            )
+        if not enable:
+            self.mesh_info.reduce_scatter_process_group = None
+            return
+        ranks = tuple(
+            dist.get_process_group_ranks(self.mesh_info.shard_process_group)
+        )
+        cache = new_groups if new_groups is not None else {}
+        if ranks not in cache:
+            existing = self.mesh_info.reduce_scatter_process_group
+            if existing is None:
+                existing = dist.new_group(
+                    list(ranks),
+                    group_desc="fsdp_reduce_scatter",
+                )
+                if existing == dist.GroupMember.NON_GROUP_MEMBER:
+                    raise AssertionError(
+                        f"Current rank was not included in process group {ranks}"
+                    )
+            cache[ranks] = existing
+        self.mesh_info.reduce_scatter_process_group = cache[ranks]
 
     def _with_fqn(self, label: str) -> str:
         return f"{label}[{', '.join(p.module_info.fqn for p in self.params)}]"
@@ -584,7 +930,14 @@ class FSDPParamGroup:
         invalid = [
             param
             for param in self.params
-            if str(getattr(param.param.device, "type", param.param.device)) != "cpu"
+            if str(
+                getattr(
+                    getattr(param._sharded_local_tensor(), "device", None),
+                    "type",
+                    getattr(param._sharded_local_tensor(), "device", None),
+                )
+            )
+            != "cpu"
         ]
         if invalid:
             raise RuntimeError("CPU offload requires sharded parameters on CPU")
@@ -593,35 +946,46 @@ class FSDPParamGroup:
         limit = int(getattr(self, "reduce_scatter_max_input_buffers", 1))
         if limit <= 0:
             raise ValueError("reduce_scatter_max_input_buffers must be positive")
+        if limit > 1 and isinstance(self._reduce_scatter_comm, SymmMemReduceScatter):
+            raise ValueError(
+                "max_input_buffers greater than one is not supported with the "
+                "symmetric-memory reduce-scatter communication path"
+            )
 
     def __repr__(self) -> str:
         return f"FSDPParamGroup(num_params={len(self.params)}, sharded={self.is_sharded()})"
 
 
 def _cast_tree(value: Any, dtype: Any) -> Any:
-    if hasattr(value, "is_floating_point") and value.is_floating_point():
-        return value.to(dtype=dtype)
-    if isinstance(value, tuple):
-        return tuple(_cast_tree(item, dtype) for item in value)
-    if isinstance(value, list):
-        return [_cast_tree(item, dtype) for item in value]
-    if isinstance(value, dict):
-        return {key: _cast_tree(item, dtype) for key, item in value.items()}
-    return value
+    return _apply_to_tensors(lambda tensor: _cast_fp_tensor(dtype, tensor), value)
 
 
-def _iter_tensors(value: Any):
-    if isinstance(value, tp.Tensor):
-        yield value
-    elif isinstance(value, dict):
-        for item in value.values():
-            yield from _iter_tensors(item)
-    elif isinstance(value, (tuple, list)):
-        for item in value:
-            yield from _iter_tensors(item)
+def _get_param_module_infos(
+    params: list[Any], modules: Iterable[Any]
+) -> list[Any]:
+    params_set = set(params)
+    param_to_module_info: dict[Any, Any] = {}
+    for module in modules:
+        for _, submodule in module.named_modules(remove_duplicate=False):
+            for param_name, param in submodule.named_parameters(
+                recurse=False, remove_duplicate=False
+            ):
+                if param not in params_set:
+                    continue
+                if param not in param_to_module_info:
+                    param_to_module_info[param] = ParamModuleInfo(submodule, param_name)
+                else:
+                    info = param_to_module_info[param]
+                    info.shared_modules.append(submodule)
+                    info.shared_param_names.append(param_name)
+    if len(param_to_module_info) != len(params):
+        raise AssertionError(f"Some parameters are not in the module tree of {modules}")
+    return [param_to_module_info[param] for param in params]
 
 
 class RegisterPostBackwardFunction(Function):
+    generate_vmap_rule = True
+
     @staticmethod
     def forward(param_group: FSDPParamGroup, *inputs: Any) -> tuple[Any, ...]:
         return inputs

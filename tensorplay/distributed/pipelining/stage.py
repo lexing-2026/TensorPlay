@@ -9,15 +9,31 @@ import tensorplay as tp
 from .. import config as dist_config
 from .. import distributed_core as dist
 
+from ._backward import (
+    _autograd_grad_for_inputs,
+    stage_backward,
+    stage_backward_input,
+    stage_backward_weight,
+)
 from ._utils import (
+    _MeshCache,
     PipeliningMetadataError,
     _StageBackwardMeta,
     _StageForwardMeta,
     _StageMeta,
+    _DTensorMeta,
+    _TensorMeta,
+    _derive_grad_metas,
+    flatten_args,
+    _make_tensor_from_meta,
+    InferenceMode,
     extract_tensor_meta,
     extract_tensor_metas,
+    to_local_if_dtensor,
+    validate_static_arg_grad_correspondence,
     validate_tensors_metadata,
 )
+from ..tensor import DTensor
 
 __all__ = ["PipelineStage", "build_stage"]
 
@@ -36,8 +52,26 @@ class _RecvInfo:
     tensor_meta: Any
     is_root_arg: bool = False
 
+    def __init__(
+        self,
+        input_name: str,
+        source: int | None,
+        buffer: Any,
+        tensor_meta: Any,
+        is_root_arg: bool = False,
+    ) -> None:
+        self.input_name = input_name
+        self.source = source
+        self.buffer = buffer
+        self.tensor_meta = tensor_meta
+        self.is_root_arg = is_root_arg
+
     def __repr__(self) -> str:
-        return f"_RecvInfo(input={self.input_name!r}, source={self.source!r}, root_arg={self.is_root_arg})"
+        if self.is_root_arg:
+            return f"_RecvInfo(input={self.input_name}, root_arg=True)"
+        meta_type = type(self.tensor_meta).__name__ if self.tensor_meta else "None"
+        buffer_shape = self.buffer.size() if self.buffer is not None else "None"
+        return f"_RecvInfo(input={self.input_name}, source={self.source}, shape={buffer_shape}, meta={meta_type})"
 
 
 def _build_p2p_direction_groups(group: Any) -> tuple[Any, Any]:
@@ -107,8 +141,11 @@ class _PipelineStageBase(ABC):
         self.grad_send_info: list[Any] | None = None
         self.chunks: int | None = None
         self._stage_meta = _StageMeta()
+        self._mesh_cache = _MeshCache()
         self._input_chunks: dict[int, tuple[Any, ...]] = {}
         self._forward_inputs: dict[int, tuple[Any, ...]] = {}
+        self.backward_state: dict[int, tuple[Any, Any, Any, Any]] = {}
+        self.dw_runner: dict[int, Callable[[], Any]] = {}
 
     @property
     def has_backward(self) -> bool:
@@ -138,7 +175,7 @@ class _PipelineStageBase(ABC):
     def _create_grad_send_info(self, args_recv_info: tuple[_RecvInfo, ...]) -> list[Any]:
         return [item.source if isinstance(item, _RecvInfo) else None for item in args_recv_info]
 
-    def _prepare_forward_infra(self, num_microbatches: int, args: Any, kwargs: Any, has_backward: bool) -> None:
+    def _prepare_forward_infra(self, num_microbatches: int, args: Any, kwargs: Any, has_backward: bool) -> Any:
         self.chunks = num_microbatches
         self.has_backward = has_backward
         self._stage_meta.forward.input_metas = tuple(meta for meta in (extract_tensor_meta(value) for value in args) if meta is not None)
@@ -165,14 +202,21 @@ class _PipelineStageBase(ABC):
         )
 
     def _setup_backward_recv_info(self, num_microbatches: int) -> None:
-        self.grad_recv_info = {index: tuple() for index in range(num_microbatches)}
+        self.chunks = num_microbatches
+        self.grad_recv_info = {
+            index: self._create_grad_recv_info(self.act_send_info)
+            for index in range(num_microbatches)
+        }
 
     def _create_grad_recv_info(self, act_send_info: Any) -> tuple[_RecvInfo, ...]:
         del act_send_info
         return ()
 
     def _resolve_peer_global_rank(self, stage_idx: int) -> int:
-        return int(stage_idx)
+        peer_group_rank = self.stage_index_to_group_rank[int(stage_idx)]
+        if self.group is None:
+            return int(peer_group_rank)
+        return int(dist.get_global_rank(self.group, peer_group_rank))
 
     def _get_recv_ops(self, recv_infos: Any, group: Any) -> list[Any]:
         if not dist.is_initialized():
@@ -192,29 +236,60 @@ class _PipelineStageBase(ABC):
         return operations
 
     def set_local_fwd_input(self, prev_stage_outputs: Any, mb_index: int) -> None:
-        values = tuple(prev_stage_outputs) if isinstance(prev_stage_outputs, (tuple, list)) else (prev_stage_outputs,)
-        self._input_chunks[mb_index] = values
-        recv_infos = self.args_recv_info.get(mb_index, ())
-        for info, value in zip(recv_infos, values):
-            if isinstance(info, _RecvInfo):
-                info.buffer = value.detach().requires_grad_(True) if isinstance(value, tp.Tensor) else value
+        values = _normalize_model_output_as_tuple(prev_stage_outputs)
+        recv_infos = self.args_recv_info[mb_index]
+        if len(recv_infos) != len(values):
+            raise PipeliningMetadataError(
+                f"Stage {self.stage_index}: local forward input count does not match "
+                f"the receive metadata ({len(values)} != {len(recv_infos)})"
+            )
+        if self.is_first:
+            raise AssertionError("local forward input is only valid for a non-first stage")
+        for info, value in zip(recv_infos, values, strict=True):
+            if info.is_root_arg:
+                raise AssertionError("local forward input cannot replace a root argument")
+            local_value = to_local_if_dtensor(value)
+            if isinstance(local_value, tp.Tensor):
+                local_value = local_value.detach()
+                if (
+                    info.tensor_meta is not None
+                    and info.tensor_meta.requires_grad
+                    and (local_value.is_floating_point() or local_value.is_complex())
+                ):
+                    local_value.requires_grad_(True)
+            info.buffer = local_value
+        self._input_chunks[mb_index] = tuple(info.buffer for info in recv_infos)
 
     def get_local_bwd_output(self, mb_index: int) -> Any:
-        return self.bwd_cache.get(mb_index)
+        if not self.has_backward:
+            raise AssertionError("cannot get a backward output without backward enabled")
+        if self.is_first:
+            raise AssertionError("the first stage has no local backward output")
+        self._check_chunk_id(mb_index)
+        return self.bwd_cache.pop(mb_index)
 
     def set_local_bwd_input(self, next_stage_bwd_outputs: Any, mb_index: int) -> None:
-        values = tuple(next_stage_bwd_outputs) if isinstance(next_stage_bwd_outputs, (tuple, list)) else (next_stage_bwd_outputs,)
-        self.bwd_cache[mb_index] = values
-        recv_infos = self.grad_recv_info.get(mb_index, ())
-        if not recv_infos and values:
-            recv_infos = tuple(
-                _RecvInfo(str(index), self.stage_index + 1, value, None, False)
-                for index, value in enumerate(values)
+        values = next_stage_bwd_outputs
+        if not isinstance(values, tuple):
+            raise AssertionError(f"expected a tuple of gradients, got {type(values)}")
+        if not self.has_backward:
+            raise AssertionError("cannot set a backward input without backward enabled")
+        if self.is_last:
+            raise AssertionError("the last stage has no local backward input")
+        recv_infos = self.grad_recv_info[mb_index]
+        if len(recv_infos) != len(values):
+            raise PipeliningMetadataError(
+                f"Stage {self.stage_index}: local backward input count does not match "
+                f"the receive metadata ({len(values)} != {len(recv_infos)})"
             )
-            self.grad_recv_info[mb_index] = recv_infos
-        for info, value in zip(recv_infos, values):
-            if isinstance(info, _RecvInfo):
-                info.buffer = value
+        for info, value in zip(recv_infos, values, strict=True):
+            if value is None:
+                if info.buffer is not None:
+                    info.buffer.zero_()
+                continue
+            if info.is_root_arg:
+                raise AssertionError("local backward input cannot target a root argument")
+            info.buffer = to_local_if_dtensor(value)
 
     def get_fwd_recv_ops(self, fwd_chunk_id: int) -> list[Any]:
         self._check_chunk_id(fwd_chunk_id)
@@ -232,15 +307,18 @@ class _PipelineStageBase(ABC):
 
     def get_fwd_send_ops(self, fwd_chunk_id: int) -> list[Any]:
         self._check_chunk_id(fwd_chunk_id)
-        if not self.output_chunks:
-            return []
-        output = self.output_chunks[fwd_chunk_id]
+        output = self.fwd_cache[fwd_chunk_id][0]
         values = _normalize_model_output_as_tuple(output)
         operations = []
         for index, value in enumerate(values):
             for destination in self.act_send_info.get(index, ()):
-                if destination is None or not isinstance(value, tp.Tensor):
+                if destination is None:
                     continue
+                value = to_local_if_dtensor(value, detach=True)
+                if not isinstance(value, tp.Tensor):
+                    raise PipeliningMetadataError(
+                        f"Stage {self.stage_index}: activation {index} is not a tensor"
+                    )
                 peer_group_rank = self.stage_index_to_group_rank[int(destination)]
                 peer = (
                     peer_group_rank
@@ -253,11 +331,18 @@ class _PipelineStageBase(ABC):
         return operations
 
     def _get_grad_send_meta(self, input_idx: int) -> Any:
-        if self.grad_send_info is None:
-            return None
-        if input_idx < 0 or input_idx >= len(self.grad_send_info):
-            return None
-        return self.grad_send_info[input_idx]
+        input_grads = self._stage_meta.input_grads
+        if input_grads is not None and input_idx < len(input_grads):
+            return input_grads[input_idx]
+        inputs = self._stage_meta.inputs
+        if inputs is not None and input_idx < len(inputs):
+            meta = inputs[input_idx]
+            if meta is not None:
+                return _derive_grad_metas((meta,))[0]
+        raise PipeliningMetadataError(
+            f"Stage {self.stage_index}: backward produced a gradient for input "
+            f"{input_idx}, but no gradient metadata is available"
+        )
 
     def get_bwd_send_ops(self, bwd_chunk_id: int) -> list[Any]:
         self._check_chunk_id(bwd_chunk_id)
@@ -267,11 +352,34 @@ class _PipelineStageBase(ABC):
             self.grad_send_info = self._create_grad_send_info(
                 self.args_recv_info.get(bwd_chunk_id, ())
             )
-        gradients = self.bwd_cache.get(bwd_chunk_id, ())
+        gradients = self.bwd_cache.pop(bwd_chunk_id, ())
         operations = []
-        for gradient, destination in zip(gradients or (), self.grad_send_info):
-            if destination is None or gradient is None or not isinstance(gradient, tp.Tensor):
+        for index, (gradient, destination) in enumerate(
+            zip(gradients or (), self.grad_send_info, strict=True)
+        ):
+            if destination is None:
+                if gradient is not None:
+                    raise PipeliningMetadataError(
+                        f"Stage {self.stage_index}: input {index} has a gradient but "
+                        "no previous stage receives it"
+                    )
                 continue
+            grad_meta = self._get_grad_send_meta(index)
+            if grad_meta is None:
+                if gradient is not None:
+                    raise PipeliningMetadataError(
+                        f"Stage {self.stage_index}: input {index} produced a gradient "
+                        "without gradient metadata"
+                    )
+                continue
+            if gradient is None:
+                send_tensor = _make_tensor_from_meta(grad_meta, self.device).zero_()
+            else:
+                send_tensor = to_local_if_dtensor(gradient, detach=True)
+                if not isinstance(send_tensor, tp.Tensor):
+                    raise PipeliningMetadataError(
+                        f"Stage {self.stage_index}: input {index} gradient is not a tensor"
+                    )
             peer_group_rank = self.stage_index_to_group_rank[int(destination)]
             peer = (
                 peer_group_rank
@@ -279,7 +387,7 @@ class _PipelineStageBase(ABC):
                 else dist.get_global_rank(self._upstream_group, peer_group_rank)
             )
             operations.append(
-                dist.P2POp(dist.isend, gradient, peer, self._upstream_group)
+                dist.P2POp(dist.isend, send_tensor, peer, self._upstream_group)
             )
         return operations
 
@@ -289,17 +397,114 @@ class _PipelineStageBase(ABC):
         self.output_chunks.clear()
         self._input_chunks.clear()
         self._forward_inputs.clear()
+        self.backward_state.clear()
+        self.dw_runner.clear()
+        for recv_infos in self.args_recv_info.values():
+            for info in recv_infos:
+                if not info.is_root_arg and isinstance(info.buffer, tp.Tensor):
+                    info.buffer.grad = None
 
     def _map_tensor_from_recv_info(self, recv_infos: Any) -> tuple[Any, ...]:
-        return tuple(item.buffer for item in recv_infos)
+        values = []
+        for item in recv_infos:
+            if item.is_root_arg:
+                raise PipeliningMetadataError("root arguments are not received tensors")
+            values.append(item.buffer)
+        return tuple(values)
 
     def _retrieve_recv_activations(self, fwd_chunk_id: int) -> tuple[Any, ...]:
-        return self._map_tensor_from_recv_info(self.args_recv_info.get(fwd_chunk_id, ()))
+        recv_infos = self.args_recv_info.get(fwd_chunk_id, ())
+        values = []
+        for index, info in enumerate(recv_infos):
+            if info.is_root_arg:
+                raise PipeliningMetadataError(
+                    f"Stage {self.stage_index}: root input cannot be received"
+                )
+            if info.buffer is None or info.tensor_meta is None:
+                raise PipeliningMetadataError(
+                    f"Stage {self.stage_index}: activation {index} has no receive buffer or metadata"
+                )
+            effective_requires_grad = bool(
+                info.tensor_meta.requires_grad
+                and self.has_backward
+                and tp.is_grad_enabled()
+            )
+            if isinstance(info.tensor_meta, _DTensorMeta):
+                local = info.buffer
+                if not isinstance(local, tp.Tensor):
+                    raise PipeliningMetadataError(
+                        f"Stage {self.stage_index}: DTensor activation buffer is not a tensor"
+                    )
+                local = local.detach()
+                if effective_requires_grad and (
+                    local.is_floating_point() or local.is_complex()
+                ):
+                    local.requires_grad_(True)
+                mesh = self._mesh_cache.get_mesh(info.tensor_meta.mesh_cache_key)
+                values.append(
+                    DTensor.from_local(
+                        local,
+                        device_mesh=mesh,
+                        placements=info.tensor_meta.placements,
+                        shape=info.tensor_meta.global_shape,
+                        stride=info.tensor_meta.global_stride,
+                        run_check=False,
+                    )
+                )
+            else:
+                value = info.buffer
+                if not isinstance(value, tp.Tensor):
+                    raise PipeliningMetadataError(
+                        f"Stage {self.stage_index}: activation {index} is not a tensor"
+                    )
+                value.requires_grad_(
+                    effective_requires_grad
+                    and (value.is_floating_point() or value.is_complex())
+                )
+                values.append(value)
+        return tuple(values)
 
     def _retrieve_recv_grads(self, bwd_chunk_id: int) -> tuple[Any, ...]:
-        return self._map_tensor_from_recv_info(self.grad_recv_info.get(bwd_chunk_id, ()))
+        recv_infos = self.grad_recv_info.get(bwd_chunk_id, ())
+        values = []
+        for index, info in enumerate(recv_infos):
+            if info.is_root_arg:
+                raise PipeliningMetadataError(
+                    f"Stage {self.stage_index}: root input cannot receive a gradient"
+                )
+            if info.buffer is None:
+                if info.tensor_meta is not None:
+                    raise PipeliningMetadataError(
+                        f"Stage {self.stage_index}: gradient {index} has metadata but no buffer"
+                    )
+                values.append(None)
+                continue
+            if info.tensor_meta is None:
+                raise PipeliningMetadataError(
+                    f"Stage {self.stage_index}: gradient {index} has a buffer but no metadata"
+                )
+            if isinstance(info.tensor_meta, _DTensorMeta):
+                mesh = self._mesh_cache.get_mesh(info.tensor_meta.mesh_cache_key)
+                values.append(
+                    DTensor.from_local(
+                        info.buffer,
+                        device_mesh=mesh,
+                        placements=info.tensor_meta.placements,
+                        shape=info.tensor_meta.global_shape,
+                        stride=info.tensor_meta.global_stride,
+                        run_check=False,
+                    )
+                )
+            else:
+                values.append(info.buffer)
+        return tuple(values)
 
     def forward_maybe_with_nosync(self, *args: Any, **kwargs: Any) -> Any:
+        from ...nn.parallel.distributed import DistributedDataParallel
+
+        if isinstance(self.submod, DistributedDataParallel):
+            with self.submod.no_sync():
+                return self.submod(*args, **kwargs)
         return self.submod(*args, **kwargs)
 
     def scale_grads(self, grad_scale_factor: float) -> None:
@@ -308,13 +513,50 @@ class _PipelineStageBase(ABC):
                 param.grad.div_(grad_scale_factor)
 
     def backward_maybe_with_nosync(self, backward_type: Any, bwd_kwargs: dict[str, Any], last_backward: bool = False) -> Any:
-        del backward_type, last_backward
-        return self.backward_one_chunk(**bwd_kwargs)
+        del last_backward
+
+        fsdp_flags = (
+            ("set_is_last_backward", False),
+            ("set_reshard_after_backward", False),
+            ("set_requires_gradient_sync", False),
+        )
+        for method_name, value in fsdp_flags:
+            method = getattr(self.submod, method_name, None)
+            if callable(method):
+                method(value)
+        if backward_type == "full":
+            return stage_backward(
+                bwd_kwargs["stage_output"],
+                bwd_kwargs["output_grads"],
+                bwd_kwargs["input_values"],
+            ), None
+        if backward_type == "input":
+            return stage_backward_input(
+                bwd_kwargs["stage_output"],
+                bwd_kwargs["output_grads"],
+                bwd_kwargs["input_values"],
+                self.submod.parameters(),
+            )
+        if backward_type == "weight":
+            return stage_backward_weight(
+                self.submod.parameters(),
+                bwd_kwargs["param_groups"] or [],
+            ), None
+        raise RuntimeError(f"unknown backward type {backward_type!r}")
 
     def forward_one_chunk(self, fwd_chunk_id: int, args: tuple[Any, ...], kwargs: dict[str, Any], save_forward_output: bool = True) -> Any:
         self._check_chunk_id(fwd_chunk_id)
-        output = self.forward_maybe_with_nosync(*args, **kwargs)
-        self._forward_inputs[fwd_chunk_id] = tuple(args)
+        composite_args = args if self.is_first else self._retrieve_recv_activations(fwd_chunk_id)
+        output = self.forward_maybe_with_nosync(*composite_args, **kwargs)
+        self._forward_inputs[fwd_chunk_id] = tuple(
+            value
+            for value in flatten_args(composite_args)
+            if isinstance(value, tp.Tensor) or value is not None
+        ) + tuple(
+            value
+            for value in flatten_args(kwargs)
+            if isinstance(value, tp.Tensor) or value is not None
+        )
         output_tuple = _normalize_model_output_as_tuple(output)
         self.fwd_cache[fwd_chunk_id] = (output, output_tuple)
         if save_forward_output:
@@ -325,21 +567,166 @@ class _PipelineStageBase(ABC):
         return output
 
     def backward_one_chunk(self, bwd_chunk_id: int, loss: Any = None, full_backward: bool = True, last_backward: bool = False) -> Any:
-        del full_backward, last_backward
-        if loss is None:
-            loss = self.fwd_cache[bwd_chunk_id][0]
-        if hasattr(loss, "backward"):
-            loss.backward()
-        self.bwd_cache[bwd_chunk_id] = None
-        return None
+        if not self.has_backward:
+            return None
+        self._check_chunk_id(bwd_chunk_id)
+        output, output_values = self.fwd_cache.pop(bwd_chunk_id)
+        if self.is_last:
+            stage_output = output if loss is None else loss
+            output_grads = None
+        else:
+            stage_output = output_values
+            output_grads = self._retrieve_recv_grads(bwd_chunk_id)
+        input_values = self._forward_inputs.pop(bwd_chunk_id, ())
+        bwd_kwargs = {
+            "stage_output": stage_output,
+            "output_grads": output_grads,
+            "input_values": input_values,
+        }
+        grads_input: tuple[Any, ...] = ()
+        if self.dw_builder is not None:
+            grads_input, _ = self.backward_maybe_with_nosync(
+                "full", bwd_kwargs, last_backward=last_backward
+            )
+            if full_backward:
+                self.dw_builder()()
+            else:
+                self.dw_runner[bwd_chunk_id] = self.dw_builder()
+        elif full_backward:
+            grads_input, _ = self.backward_maybe_with_nosync(
+                "full", bwd_kwargs, last_backward=last_backward
+            )
+        else:
+            param_groups = None
+            if not self.is_first:
+                grads_input, param_groups = self.backward_maybe_with_nosync(
+                    "input", bwd_kwargs, last_backward=last_backward
+                )
+            self.backward_state[bwd_chunk_id] = (
+                input_values,
+                param_groups,
+                stage_output,
+                output_grads,
+            )
+            self.dw_runner[bwd_chunk_id] = lambda: None
+        num_forward_inputs = len(self._stage_meta.inputs or ())
+        self.bwd_cache[bwd_chunk_id] = tuple(grads_input[:num_forward_inputs])
+        return self.bwd_cache[bwd_chunk_id]
 
     def backward_weight_one_chunk(self, bwd_chunk_id: int, last_backward: bool = False) -> Any:
-        return self.backward_one_chunk(bwd_chunk_id, last_backward=last_backward)
+        if not self.has_backward:
+            return None
+        runner = self.dw_runner.pop(bwd_chunk_id, None)
+        if runner is None:
+            raise AssertionError(
+                f"backward weight requested for chunk {bwd_chunk_id} without input backward"
+            )
+        if self.dw_builder is not None:
+            return runner()
+        input_values, param_groups, stage_output, output_grads = self.backward_state.pop(
+            bwd_chunk_id
+        )
+        if self.is_first:
+            self.backward_maybe_with_nosync(
+                "full",
+                {
+                    "stage_output": stage_output,
+                    "output_grads": output_grads,
+                    "input_values": input_values,
+                },
+                last_backward=last_backward,
+            )
+        else:
+            self.backward_maybe_with_nosync(
+                "weight",
+                {"param_groups": param_groups},
+                last_backward=last_backward,
+            )
+        return None
 
     def _get_init_p2p_neighbors_ops(self) -> list[Any]:
-        return []
+        operations: list[Any] = []
+        next_stage_peer_rank = self.stage_index_to_group_rank.get(
+            self.stage_index + 1
+        )
+        previous_stage_peer_rank = self.stage_index_to_group_rank.get(
+            self.stage_index - 1
+        )
+        downstream_recv_tensor = tp.zeros(
+            1, device=self.device, dtype=tp.float32
+        )
+        upstream_recv_tensor = tp.zeros(
+            1, device=self.device, dtype=tp.float32
+        )
+        send_tensor = tp.tensor(
+            self.stage_index, device=self.device, dtype=tp.float32
+        )
+        if not self.is_first:
+            operations.append(
+                dist.P2POp(
+                    dist.irecv,
+                    downstream_recv_tensor,
+                    group_peer=previous_stage_peer_rank,
+                    group=self._downstream_group,
+                )
+            )
+        if not self.is_last:
+            operations.append(
+                dist.P2POp(
+                    dist.isend,
+                    send_tensor,
+                    group_peer=next_stage_peer_rank,
+                    group=self._downstream_group,
+                )
+            )
+        if not self.is_first:
+            operations.append(
+                dist.P2POp(
+                    dist.isend,
+                    send_tensor,
+                    group_peer=previous_stage_peer_rank,
+                    group=self._upstream_group,
+                )
+            )
+        if not self.is_last:
+            operations.append(
+                dist.P2POp(
+                    dist.irecv,
+                    upstream_recv_tensor,
+                    group_peer=next_stage_peer_rank,
+                    group=self._upstream_group,
+                )
+            )
+        return operations
 
     def perform_reduce_grad(self, grad_scale_factor: float) -> None:
+        state_getter = getattr(self.submod, "_get_fsdp_state", None)
+        if not callable(state_getter):
+            state_getter = getattr(self.submod, "_get_replicate_state", None)
+        if callable(state_getter):
+            for method_name, value in (
+                ("set_is_last_backward", True),
+                ("set_reshard_after_backward", True),
+                ("set_requires_gradient_sync", True),
+            ):
+                method = getattr(self.submod, method_name, None)
+                if callable(method):
+                    method(value)
+            state = state_getter()
+            state_context = getattr(state, "_state_ctx", None)
+            states = (
+                getattr(state_context, "all_states", None)
+                or getattr(state_context, "states", None)
+                or [state]
+            )
+            for state_item in states:
+                groups_getter = getattr(state_item, "_all_param_groups", None)
+                if callable(groups_getter):
+                    for param_group in groups_getter():
+                        param_group.post_backward()
+            callback = getattr(state, "_root_post_backward_final_callback", None)
+            if callable(callback):
+                callback()
         self.scale_grads(grad_scale_factor)
 
 
@@ -354,8 +741,13 @@ class _PipelineStage(_PipelineStageBase):
             for node in getattr(self.graph, "nodes", ())
             if getattr(node, "op", None) == "call_module"
         ]
-        self.node = submod_nodes[stage_index] if len(submod_nodes) == self.num_stages else None
-        self.name = getattr(self.node, "name", f"submod_{stage_index}")
+        if len(submod_nodes) != self.num_stages:
+            raise PipeliningMetadataError(
+                f"Number of submodules in pipe graph {len(submod_nodes)} does not match "
+                f"number of stages {self.num_stages}"
+            )
+        self.node = submod_nodes[stage_index]
+        self.name = self.node.name
         self.submod_to_stage_index = {
             getattr(node, "name", ""): index
             for index, node in enumerate(submod_nodes)
@@ -363,6 +755,12 @@ class _PipelineStage(_PipelineStageBase):
         self._move_submod_to_device()
 
     def _move_submod_to_device(self) -> None:
+        parameters = getattr(self.submod, "parameters", None)
+        if callable(parameters) and any(
+            bool(getattr(parameter, "is_meta", False))
+            for parameter in parameters()
+        ):
+            return
         if self.device is not None and hasattr(self.submod, "to"):
             self.submod.to(self.device)
 
@@ -370,7 +768,9 @@ class _PipelineStage(_PipelineStageBase):
         try:
             return self.submod_to_stage_index[submod_name]
         except KeyError as exc:
-            raise ValueError(f"stage {submod_name!r} is not present") from exc
+            raise PipeliningMetadataError(
+                f"stage {submod_name!r} is not present"
+            ) from exc
 
     def _tensor_from_meta(self, meta: Any, value: Any = None) -> Any:
         if isinstance(value, tp.Tensor):
@@ -386,18 +786,10 @@ class _PipelineStage(_PipelineStageBase):
                 result.requires_grad_(True)
         return result
 
-    def _create_act_recv_info(self, args: Any = ()) -> tuple[_RecvInfo, ...]:
+    def _create_act_recv_info(self) -> tuple[_RecvInfo, ...]:
         if self.node is None:
-            values = tuple(args)
-            return tuple(
-                _RecvInfo(
-                    str(index),
-                    None if self.is_first else self.stage_index - 1,
-                    self._tensor_from_meta(extract_tensor_meta(value), value),
-                    extract_tensor_meta(value),
-                    self.is_first,
-                )
-                for index, value in enumerate(values)
+            raise PipeliningMetadataError(
+                f"Stage {self.stage_index}: graph stage node is unavailable"
             )
         stage_graph = getattr(self.submod, "graph", None)
         placeholders = [
@@ -407,42 +799,95 @@ class _PipelineStage(_PipelineStageBase):
         ]
         outer_args = tuple(getattr(self.node, "args", ()))
         result: list[_RecvInfo] = []
-        for index, placeholder in enumerate(placeholders):
-            arg_node = outer_args[index] if index < len(outer_args) else None
-            value = None
-            if index < len(args) and getattr(arg_node, "op", None) == "placeholder":
-                value = args[index]
+        if len(placeholders) != len(outer_args):
+            raise PipeliningMetadataError(
+                f"Stage {self.stage_index}: graph placeholder and dependency counts differ"
+            )
+        for placeholder, arg_node in zip(placeholders, outer_args, strict=True):
             meta_value = getattr(placeholder, "meta", {}).get("val")
-            meta = extract_tensor_meta(meta_value)
-            source = None
-            source_name = str(getattr(placeholder, "name", index))
+            if meta_value is None:
+                raise PipeliningMetadataError(
+                    f"Stage {self.stage_index}: placeholder metadata is unavailable"
+                )
+            if isinstance(meta_value, DTensor):
+                raise PipeliningMetadataError(
+                    f"Stage {self.stage_index}: distributed tensor metadata is unsupported for graph stages"
+                )
+            if getattr(arg_node, "op", None) == "placeholder":
+                result.append(
+                    _RecvInfo(
+                        f"root_input_{getattr(placeholder, 'name', 'input')}",
+                        None,
+                        None,
+                        _TensorMeta.from_tensor(meta_value),
+                        True,
+                    )
+                )
+                continue
             while getattr(arg_node, "target", None) is operator.getitem:
                 arg_node = arg_node.args[0]
-            if getattr(arg_node, "op", None) == "call_module":
-                source_name = getattr(arg_node, "name", source_name)
-                source = self.get_stage_index_of_submod(source_name)
+            if getattr(arg_node, "op", None) != "call_module":
+                raise PipeliningMetadataError(
+                    f"Stage {self.stage_index}: expected a stage dependency"
+                )
+            source = self.get_stage_index_of_submod(getattr(arg_node, "name", ""))
+            meta = _TensorMeta(
+                shape=tuple(meta_value.shape),
+                stride=tuple(meta_value.stride()),
+                dtype=meta_value.dtype,
+                requires_grad=bool(
+                    self.has_backward
+                    and (
+                        meta_value.is_floating_point()
+                        or meta_value.is_complex()
+                    )
+                ),
+            )
             result.append(
                 _RecvInfo(
-                    source_name,
+                    getattr(arg_node, "name", getattr(placeholder, "name", "input")),
                     source,
-                    value if source is None else self._tensor_from_meta(meta, value),
+                    _make_tensor_from_meta(meta, self.device),
                     meta,
-                    source is None,
                 )
             )
         return tuple(result)
 
-    def _prepare_forward_infra(self, num_microbatches: int, args: Any, kwargs: Any, has_backward: bool) -> None:
+    def _prepare_forward_infra(self, num_microbatches: int, args: Any, kwargs: Any, has_backward: bool) -> Any:
         del kwargs
         self.chunks = int(num_microbatches)
         self.has_backward = bool(has_backward)
-        self.args_recv_info = {
-            index: self._create_act_recv_info(args)
-            for index in range(self.chunks)
-        }
+        for index in range(self.chunks):
+            self.args_recv_info[index] = self._create_act_recv_info()
+        recv_infos = self.args_recv_info[0]
+        if self.is_first:
+            if not isinstance(args, tuple):
+                raise AssertionError("first stage requires real tensor args")
+            self._stage_meta.inputs = tuple(
+                info.tensor_meta for info in recv_infos[: len(args)]
+            )
+        else:
+            self._stage_meta.inputs = tuple(
+                info.tensor_meta for info in recv_infos if not info.is_root_arg
+            )
         self.act_send_info = self._create_act_send_info()
-        if self.has_backward:
-            self._prepare_backward_infra(self.chunks)
+
+    def _prepare_backward_infra(
+        self,
+        num_microbatches: int,
+        loss_fn: Any = None,
+        target: Any = None,
+        received_grad_meta: Any = None,
+        loss_kwargs: Any = None,
+    ) -> None:
+        del loss_fn, target, received_grad_meta, loss_kwargs
+        if self._stage_meta.inputs is None:
+            raise PipeliningMetadataError(
+                f"Stage {self.stage_index}: inputs metadata required for backward inference."
+            )
+        self._stage_meta.input_grads = _derive_grad_metas(self._stage_meta.inputs)
+        self._setup_backward_recv_info(num_microbatches)
+        return None
 
     def find_dst_rank(self, user: Any) -> int:
         if getattr(user, "op", None) != "call_module":
@@ -484,60 +929,93 @@ class _PipelineStage(_PipelineStageBase):
                     return result_values
                 return [value]
 
-            self._stage_meta.forward.output_metas = tuple(
-                meta
-                for meta in (
-                    extract_tensor_meta(getattr(value, "meta", {}).get("val"))
-                    for value in flatten_graph_values(values)
+            output_metas: list[_TensorMeta] = []
+            for index, value in enumerate(flatten_graph_values(values)):
+                example_value = getattr(value, "meta", {}).get("val")
+                if example_value is None:
+                    raise PipeliningMetadataError(
+                        f"Stage {self.stage_index}: output metadata is unavailable at index {index}"
+                    )
+                if isinstance(example_value, DTensor):
+                    raise PipeliningMetadataError(
+                        f"Stage {self.stage_index}: distributed tensor metadata is unsupported for graph stages"
+                    )
+                if not isinstance(example_value, tp.Tensor):
+                    raise PipeliningMetadataError(
+                        f"Stage {self.stage_index}: output {index} is not a tensor"
+                    )
+                output_metas.append(
+                    _TensorMeta(
+                        shape=tuple(example_value.shape),
+                        stride=tuple(example_value.stride()),
+                        dtype=example_value.dtype,
+                        requires_grad=bool(
+                            self.has_backward
+                            and (
+                                example_value.is_floating_point()
+                                or example_value.is_complex()
+                            )
+                        ),
+                    )
                 )
-                if meta is not None
-            )
+            self._stage_meta.outputs = tuple(output_metas)
         return result
 
     def _create_grad_recv_info(self, act_send_info: Any) -> tuple[_RecvInfo, ...]:
-        result: list[_RecvInfo] = []
-        output_metas = self._stage_meta.forward.output_metas
-        output_count = max(len(output_metas), max(act_send_info, default=-1) + 1)
-        for output_index in range(output_count):
-            destinations = act_send_info.get(output_index, ())
-            if destinations:
-                meta = output_metas[output_index] if output_index < len(output_metas) else None
-                buffer = self._tensor_from_meta(meta)
-                result.append(
-                    _RecvInfo(str(output_index), int(destinations[0]), buffer, meta, False)
-                )
-            else:
-                result.append(_RecvInfo(str(output_index), None, None, None, False))
-        return tuple(result)
+        if self._stage_meta.outputs is None:
+            raise PipeliningMetadataError(
+                f"Stage {self.stage_index}: outputs metadata required for grad recv info."
+            )
 
-    def forward_one_chunk(self, fwd_chunk_id: int, args: tuple[Any, ...], kwargs: dict[str, Any], save_forward_output: bool = True) -> Any:
-        if not self.is_first:
-            args = self._retrieve_recv_activations(fwd_chunk_id)
-        return super().forward_one_chunk(fwd_chunk_id, args, kwargs, save_forward_output)
+        outputs_meta = self._stage_meta.outputs
+        output_grads_metas: list[Any] = []
+        grad_recv_infos: list[_RecvInfo] = []
+        for out_idx, out_meta in enumerate(outputs_meta):
+            dst_list = act_send_info.get(out_idx, [])
+            grad_src = dst_list[0] if dst_list else self.stage_index + 1
+            if not dst_list or not out_meta.requires_grad:
+                output_grads_metas.append(None)
+                grad_recv_infos.append(
+                    _RecvInfo(
+                        f"recv_grad_for_{self.stage_index}_none_{out_idx}",
+                        grad_src,
+                        None,
+                        None,
+                    )
+                )
+                continue
+            grad_meta = _TensorMeta(
+                shape=out_meta.shape,
+                stride=out_meta.stride,
+                dtype=out_meta.dtype,
+                requires_grad=False,
+            )
+            output_grads_metas.append(grad_meta)
+            if len(dst_list) != 1:
+                raise PipeliningMetadataError(
+                    "Backward of skip connections not supported yet"
+                )
+            grad_recv_infos.append(
+                _RecvInfo(
+                    f"recv_grad_for_{self.stage_index}_from_{grad_src}",
+                    grad_src,
+                    _make_tensor_from_meta(grad_meta, self.device),
+                    grad_meta,
+                )
+            )
+        self._stage_meta.output_grads = tuple(output_grads_metas)
+        if self._stage_meta.inputs is not None:
+            self._stage_meta.input_grads = _derive_grad_metas(self._stage_meta.inputs)
+        return tuple(grad_recv_infos)
 
     def backward_one_chunk(self, bwd_chunk_id: int, loss: Any = None, full_backward: bool = True, last_backward: bool = False) -> Any:
-        del full_backward, last_backward
         self._check_chunk_id(bwd_chunk_id)
-        output, output_values = self.fwd_cache.pop(bwd_chunk_id)
-        if self.is_last:
-            if loss is None:
-                loss = output
-            if not isinstance(loss, tp.Tensor):
-                raise TypeError("the last pipeline stage loss must be a tensor")
-            loss.backward()
-        else:
-            grad_values = tuple(
-                info.buffer if isinstance(info, _RecvInfo) else None
-                for info in self.grad_recv_info.get(bwd_chunk_id, ())
-            )
-            if grad_values and any(value is not None for value in grad_values):
-                tp.autograd.backward(output_values, grad_tensors=grad_values)
-        inputs = self._forward_inputs.pop(bwd_chunk_id, ())
-        self.bwd_cache[bwd_chunk_id] = tuple(
-            getattr(value, "grad", None) if isinstance(value, tp.Tensor) else None
-            for value in inputs
+        return super().backward_one_chunk(
+            bwd_chunk_id,
+            loss=loss,
+            full_backward=full_backward,
+            last_backward=last_backward,
         )
-        return self.bwd_cache[bwd_chunk_id]
 
     def _get_output_node(self) -> Any:
         for graph in (getattr(self.submod, "graph", None), self.graph):
@@ -560,44 +1038,110 @@ def build_stage(stage_module: Any, stage_index: int, pipe_info: Any, device: Any
 
 class PipelineStage(_PipelineStageBase):
     def __init__(self, submodule: Any, stage_index: int, num_stages: int, device: Any = None, input_args: tuple[Any, ...] | None = None, output_args: Any = None, output_grads: Any = None, input_grads: Any = None, group: Any = None, dw_builder: Callable[[], Callable[..., None]] | None = None, get_mesh: Any = None) -> None:
-        del output_grads, input_grads, get_mesh
         super().__init__(submodule, stage_index, num_stages, device, group, dw_builder)
-        self._input_example = tuple(input_args or ())
+        self._mesh_cache = _MeshCache(get_mesh_cb=get_mesh)
+        self._input_example = _normalize_model_output_as_tuple(input_args) if input_args is not None else ()
         self._output_example = _normalize_model_output_as_tuple(output_args) if output_args is not None else None
-        self._prepare_forward_infra(1, self._input_example, {}, False)
-        if self._output_example is not None:
-            self._stage_meta.forward.output_metas = tuple(
-                meta for meta in (extract_tensor_meta(value) for value in self._output_example)
-                if meta is not None
-            )
+        input_grad_values = _normalize_model_output_as_tuple(input_grads) if input_grads is not None else None
+        output_grad_values = _normalize_model_output_as_tuple(output_grads) if output_grads is not None else None
+        self._user_meta = _StageMeta()
+        self._user_meta.inputs = extract_tensor_metas(self._input_example) if self._input_example else None
+        self._user_meta.outputs = extract_tensor_metas(self._output_example) if self._output_example is not None else None
+        self._user_meta.input_grads = extract_tensor_metas(input_grad_values, allow_none=True) if input_grad_values is not None else None
+        self._user_meta.output_grads = extract_tensor_metas(output_grad_values, allow_none=True) if output_grad_values is not None else None
+        for values in (self._input_example, self._output_example, input_grad_values, output_grad_values):
+            if values:
+                self._mesh_cache.update_from_tensors(values)
+        if self._user_meta.has_dtensors():
+            if self._input_example and input_grad_values:
+                validate_static_arg_grad_correspondence(
+                    self.stage_index,
+                    self._input_example,
+                    input_grad_values,
+                    is_input=True,
+                )
+            if self._output_example and output_grad_values:
+                validate_static_arg_grad_correspondence(
+                    self.stage_index,
+                    self._output_example,
+                    output_grad_values,
+                    is_input=False,
+                )
+        self._inference_mode: InferenceMode | None = None
+        self._fwd_outputs_for_bwd_meta: tuple[Any, ...] | None = None
+        self._fwd_inputs_for_bwd_meta: tuple[Any, ...] | None = None
+        self._fwd_kwargs_tensors_for_bwd_meta: tuple[Any, ...] | None = None
+        self._metadata_inference_buffer_backup: list[tuple[Any, Any]] | None = None
+        self._inference_mode = None
 
-    def _prepare_forward_infra(self, num_microbatches: int, args: Any, kwargs: Any, has_backward: bool) -> None:
-        del kwargs
+    def _prepare_forward_infra(self, num_microbatches: int, args: Any, kwargs: Any, has_backward: bool) -> Any:
         self.chunks = int(num_microbatches)
         self.has_backward = bool(has_backward)
-        source_args = tuple(args) if args else self._input_example
-        self._stage_meta.forward.input_metas = tuple(
-            meta for meta in (extract_tensor_meta(value) for value in source_args)
-            if meta is not None
+        self._inference_mode = (
+            InferenceMode.DYNAMIC
+            if InferenceMode.needs_dynamic(self._user_meta, has_backward)
+            else InferenceMode.STATIC
         )
-        infos = []
-        for position, value in enumerate(source_args):
-            meta = extract_tensor_meta(value)
-            if self.is_first:
-                infos.append(_RecvInfo(str(position), None, value, meta, True))
-            else:
-                if not isinstance(value, tp.Tensor):
-                    raise TypeError("non-first pipeline stage inputs must be tensors")
-                buffer = value.detach().clone()
-                if getattr(buffer, "is_floating_point", lambda: False)() or getattr(buffer.dtype, "is_complex", False):
-                    buffer.requires_grad_(True)
-                infos.append(_RecvInfo(str(position), self.stage_index - 1, buffer, meta, False))
-        self.args_recv_info = {index: tuple(infos) for index in range(self.chunks)}
-        if self._output_example is not None:
-            self._stage_meta.forward.output_metas = tuple(
-                meta for meta in (extract_tensor_meta(value) for value in self._output_example)
-                if meta is not None
+        source_args = args
+        if source_args is None or source_args == ():
+            source_args = self._input_example
+        fwd_meta_output = None
+        if self._inference_mode == InferenceMode.DYNAMIC:
+            fwd_meta_output = self._forward_metadata_inference(
+                source_args, kwargs, has_backward
             )
+        else:
+            self._stage_meta.inputs = self._user_meta.inputs
+            self._stage_meta.outputs = self._user_meta.outputs
+        if self._stage_meta.inputs is None and source_args:
+            self._stage_meta.inputs = extract_tensor_metas(tuple(source_args))
+        if self._stage_meta.outputs is None and self._output_example is not None:
+            self._stage_meta.outputs = extract_tensor_metas(self._output_example)
+        self._setup_forward_recv_info(self.chunks, has_backward)
+        self._setup_forward_send_info()
+        return fwd_meta_output
+
+    def _prepare_backward_infra(
+        self,
+        num_microbatches: int,
+        loss_fn: Any = None,
+        target: Any = None,
+        received_grad_meta: Any = None,
+        loss_kwargs: Any = None,
+    ) -> Any:
+        self.chunks = int(num_microbatches)
+        self.has_backward = True
+        if self._inference_mode == InferenceMode.DYNAMIC:
+            result = self._backward_metadata_inference(
+                loss_fn,
+                target,
+                received_grad_meta,
+                loss_kwargs,
+            )
+            self._validate_inferred_metadata()
+        else:
+            result = None
+            self._stage_meta.inputs = self._user_meta.inputs
+            self._stage_meta.outputs = self._user_meta.outputs
+            self._stage_meta.input_grads = self._user_meta.input_grads
+            self._stage_meta.output_grads = self._user_meta.output_grads
+        if isinstance(received_grad_meta, _StageBackwardMeta):
+            self._stage_meta.output_grads = received_grad_meta.input_grad_metas
+        if self._stage_meta.output_grads is None:
+            if self._stage_meta.outputs is None:
+                raise PipeliningMetadataError(
+                    f"Stage {self.stage_index}: output metadata is required for backward inference."
+                )
+            self._stage_meta.output_grads = _derive_grad_metas(self._stage_meta.outputs)
+        if self._stage_meta.input_grads is None:
+            if self._stage_meta.inputs is None:
+                raise PipeliningMetadataError(
+                    f"Stage {self.stage_index}: input metadata is required for backward inference."
+                )
+            self._stage_meta.input_grads = _derive_grad_metas(self._stage_meta.inputs)
+        self._setup_backward_recv_info(num_microbatches)
+        self.grad_send_info = self._create_grad_send_info(self.args_recv_info.get(0, ()))
+        return result
 
     def get_fwd_recv_ops(self, fwd_chunk_id: int) -> list[Any]:
         self._check_chunk_id(fwd_chunk_id)
@@ -607,131 +1151,408 @@ class PipelineStage(_PipelineStageBase):
             self.args_recv_info[fwd_chunk_id], self._downstream_group
         )
 
-    def forward_one_chunk(self, fwd_chunk_id: int, args: tuple[Any, ...], kwargs: dict[str, Any], save_forward_output: bool = True) -> Any:
-        if not self.is_first:
-            args = self._retrieve_recv_activations(fwd_chunk_id)
-        return super().forward_one_chunk(fwd_chunk_id, args, kwargs, save_forward_output)
-
-    def get_fwd_send_ops(self, fwd_chunk_id: int) -> list[Any]:
-        self._check_chunk_id(fwd_chunk_id)
-        if self.is_last or not dist.is_initialized():
-            return []
-        output = self.output_chunks[fwd_chunk_id]
-        values = _normalize_model_output_as_tuple(output)
-        peer_group_rank = self.stage_index_to_group_rank[self.stage_index + 1]
-        peer = (
-            peer_group_rank
-            if self._downstream_group is None
-            else dist.get_global_rank(self._downstream_group, peer_group_rank)
-        )
-        return [
-            dist.P2POp(dist.isend, value, peer, self._downstream_group)
-            for value in values if isinstance(value, tp.Tensor)
-        ]
-
-    def get_bwd_recv_ops(self, bwd_chunk_id: int) -> list[Any]:
-        self._check_chunk_id(bwd_chunk_id)
-        if self.is_last or not dist.is_initialized():
-            return []
-        _, output_values = self.fwd_cache[bwd_chunk_id]
-        infos = []
-        for index, value in enumerate(output_values):
-            if isinstance(value, tp.Tensor) and getattr(value, "requires_grad", False):
-                infos.append(_RecvInfo(str(index), self.stage_index + 1, value.detach().new_empty(tuple(value.shape)), None, False))
-            else:
-                infos.append(_RecvInfo(str(index), None, None, None, False))
-        self.grad_recv_info[bwd_chunk_id] = tuple(infos)
-        return self._get_recv_ops(infos, self._upstream_group)
-
-    def get_bwd_send_ops(self, bwd_chunk_id: int) -> list[Any]:
-        self._check_chunk_id(bwd_chunk_id)
-        if self.is_first or not dist.is_initialized():
-            return []
-        gradients = self.bwd_cache.get(bwd_chunk_id, ())
-        recv_infos = self.args_recv_info[bwd_chunk_id]
-        peer_group_rank = self.stage_index_to_group_rank[self.stage_index - 1]
-        peer = (
-            peer_group_rank
-            if self._upstream_group is None
-            else dist.get_global_rank(self._upstream_group, peer_group_rank)
-        )
-        operations = []
-        for info, gradient in zip(recv_infos, gradients):
-            if isinstance(info, _RecvInfo) and info.source is not None and gradient is not None:
-                operations.append(
-                    dist.P2POp(dist.isend, gradient, peer, self._upstream_group)
-                )
-        return operations
-
-    def backward_one_chunk(self, bwd_chunk_id: int, loss: Any = None, full_backward: bool = True, last_backward: bool = False) -> Any:
-        del full_backward, last_backward
-        self._check_chunk_id(bwd_chunk_id)
-        output, output_values = self.fwd_cache.pop(bwd_chunk_id)
-        if self.is_last:
-            if loss is None:
-                loss = output
-            if not isinstance(loss, tp.Tensor):
-                raise TypeError("the last pipeline stage loss must be a tensor")
-            loss.backward()
-        else:
-            grad_values = tuple(
-                info.buffer if isinstance(info, _RecvInfo) and info.source is not None else None
-                for info in self.grad_recv_info.get(bwd_chunk_id, ())
-            )
-            tp.autograd.backward(output_values, grad_tensors=grad_values)
-        inputs = self._forward_inputs.pop(bwd_chunk_id, ())
-        self.bwd_cache[bwd_chunk_id] = tuple(
-            getattr(value, "grad", None) if isinstance(value, tp.Tensor) else None
-            for value in inputs
-        )
-        return self.bwd_cache[bwd_chunk_id]
-
     def _recv_meta(self, src_stage: int) -> Any:
-        return self.args_recv_info.get(src_stage)
+        objects = [None]
+        dist.recv_object_list(
+            objects,
+            src=self._resolve_peer_global_rank(src_stage),
+            group=self.group,
+            device=self.device,
+        )
+        if len(objects) != 1:
+            raise PipeliningMetadataError(
+                f"expected one metadata object, got {len(objects)}"
+            )
+        return objects[0]
 
     def _send_meta(self, meta: Any, dst_stage: int) -> None:
-        self.act_send_info[dst_stage] = [meta]
+        dist.send_object_list(
+            [meta],
+            dst=self._resolve_peer_global_rank(dst_stage),
+            group=self.group,
+            device=self.device,
+        )
 
     def _is_same_rank(self, other_stage: int) -> bool:
-        return int(other_stage) == self.stage_index
+        return self.stage_index_to_group_rank[int(other_stage)] == self.group_rank
 
-    def _warmup_forward_vote(self, has_backward: bool, received_acc: Any) -> bool:
-        return bool(has_backward and received_acc)
+    def _warmup_forward_vote(self, has_backward: bool, received_acc: Any = None) -> Any:
+        my_vote = 0 if InferenceMode.needs_dynamic(self._user_meta, has_backward) else 1
+        vote = tp.tensor([my_vote], dtype=tp.int32, device=self.device)
+        if self.is_first:
+            accumulated = vote
+        elif self._is_same_rank(self.stage_index - 1):
+            if received_acc is None:
+                raise AssertionError("forward vote is missing the accumulated value")
+            accumulated = received_acc * vote
+        else:
+            accumulated = tp.zeros(1, dtype=tp.int32, device=self.device)
+            dist.recv(
+                accumulated,
+                src=self._resolve_peer_global_rank(self.stage_index - 1),
+                group=self.group,
+            )
+            accumulated = accumulated * vote
+        if not self.is_last and not self._is_same_rank(self.stage_index + 1):
+            dist.send(
+                accumulated,
+                dst=self._resolve_peer_global_rank(self.stage_index + 1),
+                group=self.group,
+            )
+        return accumulated
 
-    def _warmup_backward_result(self, received_result: Any) -> Any:
-        return received_result
+    def _warmup_backward_result(self, received_result: Any = None) -> Any:
+        if self.is_last or self._is_same_rank(self.stage_index + 1):
+            if received_result is None:
+                raise AssertionError("backward vote is missing the accumulated value")
+            result = received_result
+        else:
+            result = tp.zeros(1, dtype=tp.int32, device=self.device)
+            dist.recv(
+                result,
+                src=self._resolve_peer_global_rank(self.stage_index + 1),
+                group=self.group,
+            )
+        if not self.is_first and not self._is_same_rank(self.stage_index - 1):
+            dist.send(
+                result,
+                dst=self._resolve_peer_global_rank(self.stage_index - 1),
+                group=self.group,
+            )
+        return result
 
-    def _compute_outputs(self, module: Any) -> Any:
-        return module()
+    def _compute_outputs(self, *args: Any, module: Any = None, **kwargs: Any) -> Any:
+        return (self.submod if module is None else module)(*args, **kwargs)
 
-    def _compute_input_grads(self, outputs: Any, all_fwd_inputs: Any, grad_outputs: Any) -> tuple[Any, ...]:
-        grads = tp.autograd.grad(outputs, all_fwd_inputs, grad_outputs=grad_outputs, allow_unused=True)
-        return tuple(grads)
+    def _compute_input_grads(
+        self,
+        outputs: Any,
+        all_fwd_inputs: Any,
+        grad_outputs: Any = None,
+    ) -> tuple[Any, ...]:
+        return _autograd_grad_for_inputs(
+            tuple(outputs),
+            tuple(all_fwd_inputs),
+            None if grad_outputs is None else tuple(grad_outputs),
+            allow_unused=True,
+        )
+
+    def backward_one_chunk(self, bwd_chunk_id: int, loss: Any = None, full_backward: bool = True, last_backward: bool = False) -> Any:
+        return super().backward_one_chunk(
+            bwd_chunk_id,
+            loss=loss,
+            full_backward=full_backward,
+            last_backward=last_backward,
+        )
 
     def _to_tensor(self, arg: Any) -> Any:
-        return arg if isinstance(arg, tp.Tensor) else tp.tensor(arg)
+        if isinstance(arg, DTensor):
+            local = arg.to_local().detach()
+            if getattr(arg, "requires_grad", False) and (
+                local.is_floating_point() or local.is_complex()
+            ):
+                local.requires_grad_(True)
+            return DTensor.from_local(
+                local,
+                device_mesh=arg.device_mesh,
+                placements=arg.placements,
+                shape=arg.shape,
+                stride=arg.stride(),
+            )
+        if isinstance(arg, tp.Tensor):
+            result = arg.detach()
+            if arg.requires_grad:
+                result.requires_grad_(True)
+            return result
+        if isinstance(arg, _DTensorMeta):
+            mesh = self._mesh_cache.get_mesh(arg.mesh_cache_key)
+            local = _make_tensor_from_meta(arg, self.device)
+            if arg.requires_grad and (
+                local.is_floating_point() or local.is_complex()
+            ):
+                local.requires_grad_(True)
+            return DTensor.from_local(
+                local,
+                device_mesh=mesh,
+                placements=arg.placements,
+                shape=arg.global_shape,
+                stride=arg.global_stride,
+            )
+        if isinstance(arg, _TensorMeta):
+            result = arg.to_tensor(self.device)
+            if arg.requires_grad and (
+                result.is_floating_point() or result.is_complex()
+            ):
+                result.requires_grad_(True)
+            return result
+        raise PipeliningMetadataError(
+            f"unsupported metadata value {type(arg).__name__}"
+        )
 
     def _ones_from_metadata(self, meta: Any) -> Any:
-        return tp.ones(meta.shape, dtype=meta.dtype)
+        local = tp.ones(meta.shape, dtype=meta.dtype, device=self.device)
+        if isinstance(meta, _DTensorMeta):
+            mesh = self._mesh_cache.get_mesh(meta.mesh_cache_key)
+            return DTensor.from_local(
+                local,
+                device_mesh=mesh,
+                placements=meta.placements,
+                shape=meta.global_shape,
+                stride=meta.global_stride,
+            )
+        return local
 
     def _pre_metadata_inference_backup(self) -> None:
-        self._metadata_backup = self._stage_meta
+        if self._inference_mode != InferenceMode.DYNAMIC:
+            return
+        if self._metadata_inference_buffer_backup is not None:
+            raise RuntimeError("metadata inference backup is already active")
+        named_buffers = getattr(self.submod, "named_buffers", None)
+        if callable(named_buffers):
+            self._metadata_inference_buffer_backup = [
+                (buffer, buffer.detach().clone())
+                for _, buffer in named_buffers(remove_duplicate=False)
+            ]
 
     def _forward_metadata_inference(self, args: Any, kwargs: Any, has_backward: bool) -> Any:
-        return self.forward_one_chunk(0, tuple(args), dict(kwargs), save_forward_output=has_backward)
+        kwargs = kwargs or {}
+        if self.is_first:
+            if args is None or isinstance(args, _StageForwardMeta):
+                raise PipeliningMetadataError(
+                    f"Stage {self.stage_index}: first stage requires tensor inputs"
+                )
+            values = tuple(args)
+            self._stage_meta.inputs = extract_tensor_metas(values)
+            inference_args = tuple(self._to_tensor(value) for value in values)
+        elif self._is_same_rank(self.stage_index - 1) or isinstance(args, _StageForwardMeta):
+            if not isinstance(args, _StageForwardMeta):
+                raise PipeliningMetadataError(
+                    f"Stage {self.stage_index}: forward metadata from the previous stage is required"
+                )
+            input_metas = args.forward_metas
+            self._stage_meta.inputs = tuple(input_metas)
+            inference_args = tuple(self._to_tensor(meta) for meta in input_metas)
+        else:
+            recv_meta = self._recv_meta(self.stage_index - 1)
+            if not isinstance(recv_meta, _StageForwardMeta):
+                raise PipeliningMetadataError(
+                    f"Stage {self.stage_index}: invalid forward metadata received from the previous stage"
+                )
+            input_metas = recv_meta.forward_metas
+            self._stage_meta.inputs = tuple(input_metas)
+            inference_args = tuple(self._to_tensor(meta) for meta in input_metas)
+        inference_kwargs = {
+            key: self._to_tensor(value) if isinstance(value, tp.Tensor) else value
+            for key, value in kwargs.items()
+        }
+        with (tp.enable_grad() if has_backward else tp.no_grad()):
+            output = self._compute_outputs(
+                *inference_args,
+                module=self.submod,
+                **inference_kwargs,
+            )
+        output_values = _normalize_model_output_as_tuple(output)
+        self._stage_meta.outputs = tuple(
+            meta
+            for meta in (extract_tensor_meta(value) for value in output_values)
+            if meta is not None
+        )
+        self._fwd_outputs_for_bwd_meta = output_values
+        self._fwd_inputs_for_bwd_meta = inference_args
+        self._fwd_kwargs_tensors_for_bwd_meta = tuple(
+            value
+            for value in flatten_args(inference_kwargs)
+            if isinstance(value, tp.Tensor) or isinstance(value, DTensor)
+        )
+        fwd_meta = _StageForwardMeta(forward_metas=self._stage_meta.outputs)
+        if self.is_last or self._is_same_rank(self.stage_index + 1):
+            return fwd_meta
+        self._send_meta(fwd_meta, self.stage_index + 1)
+        return None
 
-    def _backward_metadata_inference(self, loss_fn: Any, target: Any, received_grad_meta: Any, loss_kwargs: Any) -> None:
-        del loss_fn, target, received_grad_meta, loss_kwargs
+    def _backward_metadata_inference(self, loss_fn: Any, target: Any, received_grad_meta: Any, loss_kwargs: Any) -> Any:
+        fwd_outputs = self._fwd_outputs_for_bwd_meta
+        fwd_inputs = self._fwd_inputs_for_bwd_meta
+        if fwd_outputs is None or fwd_inputs is None:
+            raise PipeliningMetadataError(
+                f"Stage {self.stage_index}: forward metadata inference must run first"
+            )
+        all_inputs = list(fwd_inputs) + list(self._fwd_kwargs_tensors_for_bwd_meta or ())
+        if self.is_last:
+            if loss_fn is None or target is None:
+                raise PipeliningMetadataError(
+                    f"Stage {self.stage_index}: loss_fn and target are required for backward inference"
+                )
+            output_value = fwd_outputs[0] if len(fwd_outputs) == 1 else fwd_outputs
+            loss = loss_fn(output_value, self._to_tensor(target), **(loss_kwargs or {}))
+            input_grads = self._compute_input_grads((loss,), all_inputs)
+            self._stage_meta.output_grads = None
+        else:
+            if self._is_same_rank(self.stage_index + 1) or (
+                not dist.is_initialized() and received_grad_meta is not None
+            ):
+                if not isinstance(received_grad_meta, _StageBackwardMeta):
+                    raise PipeliningMetadataError(
+                        f"Stage {self.stage_index}: backward metadata from the next stage is required"
+                    )
+                output_grad_metas = received_grad_meta.backward_metas
+            else:
+                recv_meta = self._recv_meta(self.stage_index + 1)
+                if not isinstance(recv_meta, _StageBackwardMeta):
+                    raise PipeliningMetadataError(
+                        f"Stage {self.stage_index}: invalid backward metadata received from the next stage"
+                    )
+                output_grad_metas = recv_meta.backward_metas
+            self._stage_meta.output_grads = output_grad_metas
+            if len(fwd_outputs) != len(output_grad_metas):
+                raise PipeliningMetadataError(
+                    f"Stage {self.stage_index}: output and gradient metadata counts differ"
+                )
+            filtered_outputs = []
+            filtered_grad_outputs = []
+            for index, (output, grad_meta) in enumerate(
+                zip(fwd_outputs, output_grad_metas, strict=True)
+            ):
+                if not isinstance(output, (tp.Tensor, DTensor)):
+                    raise PipeliningMetadataError(
+                        f"Stage {self.stage_index}: output {index} is not a tensor"
+                    )
+                if not output.requires_grad and getattr(output, "grad_fn", None) is None:
+                    if grad_meta is not None:
+                        raise PipeliningMetadataError(
+                            f"Stage {self.stage_index}: output {index} has gradient metadata but does not require gradients"
+                        )
+                    continue
+                filtered_outputs.append(output)
+                filtered_grad_outputs.append(
+                    self._ones_from_metadata(grad_meta) if grad_meta is not None else None
+                )
+            if filtered_outputs:
+                input_grads = self._compute_input_grads(
+                    filtered_outputs,
+                    all_inputs,
+                    filtered_grad_outputs,
+                )
+            else:
+                input_grads = tuple(None for _ in all_inputs)
+        input_metas = self._stage_meta.inputs or ()
+        if len(input_grads) < len(input_metas):
+            raise PipeliningMetadataError(
+                f"Stage {self.stage_index}: backward returned too few input gradients"
+            )
+        self._stage_meta.input_grads = tuple(
+            extract_tensor_meta(gradient)
+            if isinstance(gradient, (tp.Tensor, DTensor))
+            else (
+                _derive_grad_metas((meta,))[0]
+                if meta is not None and meta.requires_grad
+                else None
+            )
+            for meta, gradient in zip(input_metas, input_grads)
+        )
+        bwd_meta = _StageBackwardMeta(backward_metas=self._stage_meta.input_grads)
+        if self.is_first or self._is_same_rank(self.stage_index - 1):
+            return bwd_meta
+        self._send_meta(bwd_meta, self.stage_index - 1)
+        return None
 
     def _post_metadata_inference_cleanup(self) -> None:
+        if self._metadata_inference_buffer_backup is not None:
+            with tp.no_grad():
+                for buffer, saved in self._metadata_inference_buffer_backup:
+                    buffer.copy_(saved)
+            self._metadata_inference_buffer_backup = None
+        self._fwd_outputs_for_bwd_meta = None
+        self._fwd_inputs_for_bwd_meta = None
+        self._fwd_kwargs_tensors_for_bwd_meta = None
         self.clear_runtime_states()
 
     def _validate_inferred_metadata(self) -> None:
-        if not self._stage_meta.forward.output_metas:
+        if not self._stage_meta.outputs:
             raise PipeliningMetadataError("stage output metadata is empty")
+        for user_meta, inferred_meta, label in (
+            (self._user_meta.inputs, self._stage_meta.inputs, "input"),
+            (self._user_meta.outputs, self._stage_meta.outputs, "output"),
+            (self._user_meta.input_grads, self._stage_meta.input_grads, "input_grad"),
+            (self._user_meta.output_grads, self._stage_meta.output_grads, "output_grad"),
+        ):
+            if user_meta is not None and inferred_meta is not None:
+                validate_tensors_metadata(
+                    f"Stage {self.stage_index} {label}",
+                    user_meta,
+                    inferred_meta,
+                    raise_on_mismatch=False,
+                    warn_on_mismatch=True,
+                )
 
     def _setup_forward_recv_info(self, num_microbatches: int, has_backward: bool) -> None:
-        self._prepare_forward_infra(num_microbatches, (), {}, has_backward)
+        del has_backward
+        if self._stage_meta.inputs is None:
+            raise PipeliningMetadataError(
+                f"Stage {self.stage_index}: inputs metadata is required for receive setup."
+            )
+        self.args_recv_info = {}
+        for chunk_id in range(num_microbatches):
+            if self.is_first:
+                infos = tuple(
+                    _RecvInfo(
+                        f"root_input_{index}",
+                        None,
+                        None,
+                        meta,
+                        True,
+                    )
+                    for index, meta in enumerate(self._stage_meta.inputs)
+                )
+            else:
+                infos = tuple(
+                    _RecvInfo(
+                        f"recv_for_{self.stage_index}_from_{self.stage_index - 1}",
+                        self.stage_index - 1,
+                        self._to_tensor(meta),
+                        meta,
+                        False,
+                    )
+                    for meta in self._stage_meta.inputs
+                )
+            self.args_recv_info[chunk_id] = infos
 
     def _setup_forward_send_info(self) -> None:
-        self.act_send_info = {index: [] for index in range(self.chunks or 0)}
+        if self._stage_meta.outputs is None:
+            raise PipeliningMetadataError(
+                f"Stage {self.stage_index}: outputs metadata is required for send setup."
+            )
+        self.act_send_info = {
+            index: [self.stage_index + 1] if not self.is_last else []
+            for index in range(len(self._stage_meta.outputs))
+        }
+
+    def _create_grad_recv_info(
+        self,
+        act_send_info: dict,
+    ) -> tuple[_RecvInfo, ...]:
+        grad_recv_infos: list[_RecvInfo] = []
+        if not self.is_last:
+            if self._stage_meta.output_grads is None:
+                raise PipeliningMetadataError(
+                    f"Stage {self.stage_index}: output_grads metadata is required for creating grad recv info."
+                )
+            output_grads = self._stage_meta.output_grads
+            for index, destinations in act_send_info.items():
+                if destinations is None or not destinations:
+                    raise PipeliningMetadataError(
+                        f"Stage {self.stage_index}: output {index} is not sent to any stage."
+                    )
+                source = destinations[0]
+                grad_meta = output_grads[index]
+                grad_recv_infos.append(
+                    _RecvInfo(
+                        f"recv_grad_for_{self.stage_index}_from_{source}",
+                        source,
+                        _make_tensor_from_meta(grad_meta, self.device)
+                        if grad_meta is not None
+                        else None,
+                        grad_meta,
+                    )
+                )
+        return tuple(grad_recv_infos)
