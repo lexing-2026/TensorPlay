@@ -1,5 +1,10 @@
 """(see docstring above)"""
 
+# The generator registry annotates with PEP 604 unions (e.g. `str | None`);
+# lazily-evaluated annotations keep those wheels on the oldest supported
+# Python (3.9) where `type | None` would otherwise raise at import time.
+from __future__ import annotations
+
 import argparse
 import os
 from dataclasses import dataclass, field

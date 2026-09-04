@@ -521,7 +521,23 @@ if(USE_BLAS)
 
     if(NOT BLAS_FOUND AND (BLAS_PROVIDER STREQUAL "OpenBLAS" OR TP_TRY_OPENBLAS))
         find_package(OpenBLAS CONFIG QUIET)
-        if(OpenBLAS_FOUND)
+        if(OpenBLAS_FOUND AND NOT TARGET OpenBLAS::OpenBLAS)
+            # Distribution config scripts only export the plain target name;
+            # provide the namespaced alias so downstream references resolve.
+            if(TARGET openblas)
+                add_library(OpenBLAS::OpenBLAS ALIAS openblas)
+            elseif(TARGET libopenblas)
+                add_library(OpenBLAS::OpenBLAS ALIAS libopenblas)
+            elseif(TARGET openblas_static)
+                add_library(OpenBLAS::OpenBLAS ALIAS openblas_static)
+            else()
+                message(STATUS
+                    "OpenBLAS config package found but exports no known "
+                    "target; falling back to module-mode detection")
+                set(OpenBLAS_FOUND FALSE)
+            endif()
+        endif()
+        if(OpenBLAS_FOUND AND TARGET OpenBLAS::OpenBLAS)
              list(APPEND COMPUTE_LIBS OpenBLAS::OpenBLAS)
              set(BLAS_FOUND TRUE)
              list(APPEND BLAS_COMPILE_DEFS "USE_OPENBLAS" "USE_BLAS")
@@ -529,7 +545,7 @@ if(USE_BLAS)
              # Module-mode fallback (cmake/Modules/FindOpenBLAS.cmake):
              # pkg-config or manual prefix layouts.
              find_package(OpenBLAS MODULE QUIET)
-             if(OpenBLAS_FOUND)
+             if(OpenBLAS_FOUND AND TARGET OpenBLAS::OpenBLAS)
                  list(APPEND COMPUTE_LIBS OpenBLAS::OpenBLAS)
                  set(BLAS_FOUND TRUE)
                  list(APPEND BLAS_COMPILE_DEFS "USE_OPENBLAS" "USE_BLAS")
@@ -582,7 +598,17 @@ if(USE_BLAS)
     endif()
 
     if(BLAS_FOUND)
-        message(STATUS "✅ Successfully configured BLAS: ${BLAS_PROVIDER} (${BLAS_COMPILE_DEFS})")
+        # Report the provider that actually configured; the cache variable
+        # keeps its requested default even when detection fell through to
+        # another backend.
+        if("USE_MKL" IN_LIST BLAS_COMPILE_DEFS)
+            set(TP_BLAS_ACTIVE "MKL")
+        elseif("USE_OPENBLAS" IN_LIST BLAS_COMPILE_DEFS)
+            set(TP_BLAS_ACTIVE "OpenBLAS")
+        else()
+            set(TP_BLAS_ACTIVE "${BLAS_PROVIDER}")
+        endif()
+        message(STATUS "✅ Successfully configured BLAS: ${TP_BLAS_ACTIVE} (${BLAS_COMPILE_DEFS})")
     else()
         message(WARNING "Could not find ${BLAS_PROVIDER}.")
     endif()
