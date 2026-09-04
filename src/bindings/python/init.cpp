@@ -37,12 +37,10 @@ void tpx_prof_capture_site() {
     int depth = 0;
     while (frame != nullptr && depth < 64) {
         PyCodeObject* code = PyFrame_GetCode(frame);  // new reference
-#if PY_VERSION_HEX >= 0x030D0000
-        const char* file = PyCode_GetFilename(code);   // borrowed (3.13+)
-#else
-        // pre-3.13: co_filename is a directly accessible member
+        // The non-limited CPython layout keeps co_filename as a direct
+        // member across every supported version; the getter API arrived
+        // much later than the oldest wheels we build.
         const char* file = PyUnicode_AsUTF8(code->co_filename);
-#endif
         // co_name stays an immediate PyCodeObject member through 3.13
         const char* func = PyUnicode_AsUTF8(code->co_name);
         const int line = PyFrame_GetLineNumber(frame);
