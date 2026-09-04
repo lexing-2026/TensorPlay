@@ -11,7 +11,11 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_type == 'branch' && github.sha }}
+  # Branch-level group: a new push to the same branch supersedes the run
+  # for the previous head instead of racing it. Including the SHA would
+  # let every intermediate commit of a rapid series run its own full
+  # matrix, so only the tip of the branch gets machine time.
+  group: ${{ github.workflow }}-${{ github.ref_name }}
   cancel-in-progress: true
 
 permissions: read-all
@@ -24,11 +28,13 @@ jobs:
       cpu: ${{ steps.read-matrix.outputs.cpu }}
       cuda: ${{ steps.read-matrix.outputs.cuda }}
       cuda_trunk: ${{ steps.read-matrix.outputs.cuda_trunk }}
+      run_cuda: ${{ steps.lanes.outputs.run_cuda }}
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: false
           show-progress: false
+          fetch-depth: 0
       - id: read-matrix
         shell: bash
         run: |
@@ -78,6 +84,28 @@ jobs:
           ' .github/wheel-platforms.json)"
           echo "cpu=$cpu_matrix" >> "$GITHUB_OUTPUT"
           echo "cuda=$cuda_matrix" >> "$GITHUB_OUTPUT"
+      - id: lanes
+        shell: bash
+        env:
+          GH_EVENT: ${{ github.event_name }}
+          GH_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          # CUDA lanes are the most expensive slice of the matrix (GPU
+          # toolkits download, fat .cu compiles). On plain pushes, skip
+          # them when the change cannot touch device code: release and
+          # tag builds, scheduled runs, and manual dispatches always
+          # build the full matrix because their wheels get published.
+          run_cuda=true
+          if [[ "$GH_EVENT" == "push" ]] \
+             && git rev-parse --verify -q "$GH_BEFORE^{commit}" >/dev/null; then
+            if ! git diff --name-only "$GH_BEFORE"...HEAD \
+                  | grep -qE '^p10/|^tpx/|^include/|^config/|^tools/|^cmake/|CMakeLists\.txt$|\.cu$|^(pyproject|setup)\.toml$|^version\.txt$|\.github/(workflows|scripts)/'; then
+              echo "No CUDA-relevant paths in the pushed range; skipping CUDA lanes"
+              run_cuda=false
+            fi
+          fi
+          echo "run_cuda=$run_cuda" >> "$GITHUB_OUTPUT"
 
   cpu-build:
     name: ${{ matrix.build_name }}-build-test
@@ -101,7 +129,9 @@ jobs:
   cuda-build:
     # Plain main pushes build one regression lane per platform (the newest
     # toolkit); tags and release branches expand to every configured
-    # variant, where the wheels are actually published.
+    # variant, where the wheels are actually published. Pure frontend,
+    # docs, or test-only pushes skip these lanes entirely.
+    if: needs.define-wheel-matrix.outputs.run_cuda == 'true'
     name: ${{ matrix.build_name }}-build-test
     needs: define-wheel-matrix
     permissions:
