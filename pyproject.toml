@@ -19,7 +19,7 @@ authors = [{ name = "zlx", email = "2095774200@shu.edu.cn" }]
 maintainers = [{ name = "zlx", email = "2095774200@shu.edu.cn" }]
 license = { text = "Apache License 2.0" }
 keywords = ["deep learning", "neural network", "tensor", "framework", "education", "CUDA", "CPU"]
-requires-python = ">=3.9,<3.14"
+requires-python = ">=3.10,<3.14"
 dependencies = [
     "numpy>=2.0.0",
     "sympy>=1.13.3",
@@ -29,17 +29,15 @@ dependencies = [
 ]
 
 classifiers = [
-    "Development Status :: 4 - Beta",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
-    "Programming Language :: Python :: 3 :: Only",
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: Microsoft :: Windows",
     "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS :: MacOS X",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Scientific/Engineering :: Mathematics",
     "Topic :: Software Development :: Libraries :: Python Modules",
@@ -109,9 +107,6 @@ strip = false
 exclude = [
     "**/.github/**",
     "build/**",
-    ".codegraph/**",
-    "third_party/pyt[oa]rch/**",
-    "third_party/audio/**",
 ]
 
 [tool.scikit-build.wheel]
