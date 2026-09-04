@@ -70,7 +70,7 @@ class CodegenContext:
     def write(self, filename: str, content: str) -> None:
         path = os.path.join(self.out_dir, filename)
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as fh:
+        with open(path, "w", encoding="utf-8") as fh:
             fh.write(content)
         self.written[filename] = path
         print(f'Generated "{path}"')
@@ -79,7 +79,7 @@ class CodegenContext:
         assert self.pkg_out, "pkg_out not provided"
         path = os.path.join(self.pkg_out, relname)
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as fh:
+        with open(path, "w", encoding="utf-8") as fh:
             fh.write(content)
         print(f'Generated "{path}"')
 
@@ -186,7 +186,7 @@ def _gen_pyi(ctx: CodegenContext) -> None:
         for name, content in outputs.items():
             path = os.path.join(out_dir, name)
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w") as fh:
+            with open(path, "w", encoding="utf-8") as fh:
                 fh.write(content)
             print(f'Generated "{path}"')
 

@@ -360,7 +360,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     import yaml
-    with open(args.yaml) as fh:
+    with open(args.yaml, encoding="utf-8") as fh:
         data = yaml.safe_load(fh) or []
     tmp = Path(args.out_dir)
     tmp.mkdir(parents=True, exist_ok=True)

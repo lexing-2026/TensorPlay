@@ -792,7 +792,7 @@ class NativeFunctionCollection(list[NativeFunction]):
 
 def _parse_reference_native_yaml(path: str) -> _ReferenceParseResult:
     """Run the schema validation pass and return the reference records."""
-    with open(path, "r") as fh:
+    with open(path, "r", encoding="utf-8") as fh:
         data = yaml.load(fh, Loader=LineLoader)
     if not isinstance(data, list):
         raise TypeError(f"schema file must contain a list: {path}")
@@ -818,7 +818,7 @@ def _parse_reference_native_yaml(path: str) -> _ReferenceParseResult:
 
 
 def parse_native_yaml(path: str) -> NativeFunctionCollection:
-    with open(path, "r") as fh:
+    with open(path, "r", encoding="utf-8") as fh:
         data = yaml.load(fh, Loader=YamlLoader)
     if not isinstance(data, list):
         raise TypeError(f"schema file must contain a list: {path}")
@@ -868,6 +868,6 @@ def parse_native_yaml(path: str) -> NativeFunctionCollection:
 
 
 def parse_derivatives_yaml(path: str) -> list[dict]:
-    with open(path, "r") as fh:
+    with open(path, "r", encoding="utf-8") as fh:
         data = yaml.load(fh, Loader=YamlLoader)
     return data or []
