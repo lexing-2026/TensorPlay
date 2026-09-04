@@ -1013,8 +1013,11 @@ else()
 endif()
 cmake_dependent_option(TP_USE_GLOO "Use the gloo process-group transport" ON
     "USE_TP_DISTRIBUTED AND NOT WIN32" OFF)
+# The tensorpipe sources use POSIX-only interfaces (ssize_t and the fd
+# sharing socket API) and do not compile under MSVC; Windows keeps the
+# gloo transport only.
 cmake_dependent_option(TP_USE_TENSORPIPE "Use the tensorpipe RPC transport" ON
-    "USE_TP_DISTRIBUTED" OFF)
+    "USE_TP_DISTRIBUTED AND NOT WIN32" OFF)
 cmake_dependent_option(TP_USE_MPI "Enable the MPI process group backend" ON
     "USE_TP_DISTRIBUTED" OFF)
 
@@ -1097,6 +1100,7 @@ target_include_directories(tp_distributed
     PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src/distributed"
            "${CMAKE_CURRENT_SOURCE_DIR}/src/distributed/autograd"
            "${CMAKE_CURRENT_SOURCE_DIR}/p10/include"
+           "${CMAKE_CURRENT_SOURCE_DIR}/tpx/include"
            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/gloo")
 target_link_libraries(tp_distributed PUBLIC ${TP_DISTRIBUTED_LINK})
 target_compile_definitions(tp_distributed PUBLIC ${TP_DISTRIBUTED_DEFINES})
