@@ -85,17 +85,32 @@ endfunction()
 
 _tp_add_vendored_sleef()
 message(STATUS "Building vendored SLEEF (static)")
-# Belt and braces for the link line: if SLEEF's configure still resolved
-# tlfloat to a bare -l name, replace it with the archive location the
-# vendored install step is known to produce, so the compute library links
-# regardless of which resolution branch SLEEF took.
-if(TARGET sleef AND DEFINED TLFLOAT_LIBRARIES
-   AND NOT TLFLOAT_LIBRARIES MATCHES "/")
-    set(TP_TLFLOAT_ARCHIVE
-        "${CMAKE_BINARY_DIR}/third_party/sleef-prefix/lib/${CMAKE_STATIC_LIBRARY_PREFIX}tlfloat${CMAKE_STATIC_LIBRARY_SUFFIX}")
-    if(EXISTS "${TP_TLFLOAT_ARCHIVE}")
-        set(TLFLOAT_LIBRARIES "${TP_TLFLOAT_ARCHIVE}")
-        set(TLFLOAT_LIBRARY_DIRS "")
-        message(STATUS "Rewrote bare tlfloat reference to ${TP_TLFLOAT_ARCHIVE}")
+# Some of SLEEF's tlfloat resolution paths answer with a bare -l style
+# entry whose search directory stays scoped to SLEEF's subdirectory and
+# never reaches the compute library's link line. Scan the resulting link
+# interface and swap any such entry for the archive the vendored install
+# step produces.
+if(TARGET sleef)
+    get_target_property(TP_SLEEF_IFACE sleef INTERFACE_LINK_LIBRARIES)
+    if(TP_SLEEF_IFACE)
+        set(TP_TLFLOAT_ARCHIVE
+            "${CMAKE_BINARY_DIR}/third_party/sleef-prefix/lib/${CMAKE_STATIC_LIBRARY_PREFIX}tlfloat${CMAKE_STATIC_LIBRARY_SUFFIX}")
+        set(TP_SLEEF_IFACE_FIXED "")
+        set(TP_SLEEF_IFACE_CHANGED FALSE)
+        foreach(TP_IFACE_ITEM ${TP_SLEEF_IFACE})
+            if(TP_IFACE_ITEM STREQUAL "tlfloat" OR TP_IFACE_ITEM STREQUAL "-ltlfloat")
+                list(APPEND TP_SLEEF_IFACE_FIXED "${TP_TLFLOAT_ARCHIVE}")
+                set(TP_SLEEF_IFACE_CHANGED TRUE)
+            else()
+                list(APPEND TP_SLEEF_IFACE_FIXED "${TP_IFACE_ITEM}")
+            endif()
+        endforeach()
+        if(TP_SLEEF_IFACE_CHANGED)
+            set_target_properties(sleef PROPERTIES
+                INTERFACE_LINK_LIBRARIES "${TP_SLEEF_IFACE_FIXED}")
+            message(STATUS "Pinned the sleef tlfloat link entry to ${TP_TLFLOAT_ARCHIVE}")
+        else()
+            message(STATUS "sleef link interface: ${TP_SLEEF_IFACE_FIXED}")
+        endif()
     endif()
 endif()
