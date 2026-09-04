@@ -394,6 +394,20 @@ static void col_to_row_major(const T* src, int64_t rows, int64_t cols, T* dst) {
             dst[r * cols + c] = src[c * rows + r];
 }
 
+// ---- linalg_vdot -----------------------------------------------------------
+// Flattened 1-D dot product with the conjugate applied to self: sum(conj(x)
+// * y) over the whole tensor regardless of the input rank.
+Tensor linalg_vdot_composite(const Tensor& self, const Tensor& other) {
+    if (self.shape() != other.shape()) {
+        TP_THROW(RuntimeError,
+                 "linalg.vdot: both tensors must have the same shape, got ",
+                 self.shape(), " and ", other.shape());
+    }
+    Tensor x = ops::conj(self.reshape({-1}));
+    Tensor y = other.reshape({-1});
+    return ops::sum(x * y);
+}
+
 Tensor ormqr_composite(const Tensor& self, const Tensor& input2, const Tensor& input3,
                        bool left, bool transpose) {
     using namespace cpu;
@@ -530,48 +544,6 @@ std::tuple<Tensor, Tensor> geqrf_composite(const Tensor& self) {
     if (self.dtype() == DType::Float32) run_one_dtype(static_cast<float*>(nullptr));
     else run_one_dtype(static_cast<double*>(nullptr));
     return std::tuple<Tensor, Tensor>(std::move(a), std::move(tau));
-}
-
-// ---- legacy linalg names ----------------------------------------------------
-// inverse/pinverse/lu_solve/orgqr predate the linalg_* spellings and resolve to
-// those kernels; routing here keeps the two names on one implementation.
-Tensor inverse_composite(const Tensor& self) {
-    return std::get<0>(ops::linalg_inv_ex(self, false));
-}
-
-Tensor pinverse_composite(const Tensor& self, double rcond) {
-    // Moore-Penrose pseudo-inverse from the reduced SVD: singular values below
-    // rcond * largest are treated as zero, then Vᴴᴴ · (s⁻¹ ⊙ Uᴴ) with the
-    // diagonal folded into a broadcast scale so batches never need diag().
-    const auto [U, S, Vh] = ops::linalg_svd(self, false, std::nullopt);
-    const double cutoff = S.numel() == 0
-        ? 0.0 : rcond * ops::max(S).item().toDouble();
-    const Tensor S_inv = ops::where(ops::gt(S, Scalar(cutoff)),
-                                    ops::reciprocal(S), Scalar(0.0));
-    return ops::matmul(ops::transpose(Vh, -2, -1),
-                       ops::matmul(S_inv.unsqueeze(-1), ops::transpose(U, -2, -1)));
-}
-
-Tensor lu_solve_composite(const Tensor& self, const Tensor& LU_data,
-                          const Tensor& LU_pivots) {
-    return ops::linalg_lu_solve(LU_data, LU_pivots, self, true, false);
-}
-
-Tensor orgqr_composite(const Tensor& self, const Tensor& input2) {
-    return ops::linalg_householder_product(self, input2);
-}
-
-Tensor linalg_vecdot_composite(const Tensor& x, const Tensor& y, int64_t dim) {
-    // vecdot(x, y, dim) = sum(conj(x) * y, dim); the sum drops the reduced axis.
-    return ops::sum(ops::mul(ops::conj_physical(x), y), std::vector<int64_t>{dim}, false);
-}
-
-Tensor linalg_vdot_composite(const Tensor& self, const Tensor& other) {
-    // vdot conjugates the first argument and contracts the flattened
-    // operands, matching vecdot over the flattened views.
-    const Tensor a = ops::reshape(self, {self.numel()});
-    const Tensor b = ops::reshape(other, {other.numel()});
-    return ops::sum(ops::mul(ops::conj_physical(a), b), std::vector<int64_t>{0}, false);
 }
 
 // ---- matmul dtype overloads --------------------------------------------------
@@ -789,16 +761,41 @@ std::tuple<Tensor, Tensor> gru_data_native(const Tensor& data, const Tensor& bat
                                            const Tensor& hx, const std::vector<Tensor>& params,
                                            bool has_biases, int64_t num_layers, double dropout,
                                            bool train, bool bidirectional) {
-    // Packed-sequence path: run the plain loop over the full buffer, then
-    // trim each timestep to its true batch length by zeroing the tail.
-    // The reference packed output has variable rows per step; flattened
-    // consumers slice by batch_sizes, which stays consistent with this
-    // zeroed-padded layout.
-    auto r = ops::gru(data, std::vector<Tensor>{hx}, params, has_biases, num_layers,
+    if (batch_sizes.dim() != 1) {
+        TP_THROW(RuntimeError, "gru.data: batch_sizes must be 1-dimensional");
+    }
+    const int64_t num_steps = batch_sizes.size(0);
+    const int64_t total = data.size(0);
+    if (num_steps == 0 || total == 0) {
+        auto r = ops::gru(data.unsqueeze(0), std::vector<Tensor>{hx}, params, has_biases,
+                          num_layers, static_cast<float>(dropout), train, bidirectional, false);
+        return {std::get<0>(r).reshape({total, std::get<0>(r).size(-1)}), std::get<1>(r)};
+    }
+    Tensor bs_cpu = batch_sizes.to(Device(DeviceType::CPU)).contiguous();
+    const int64_t* bs_ptr = bs_cpu.data_ptr<int64_t>();
+    const int64_t max_batch = bs_ptr[0];
+    const int64_t feat = data.size(1);
+    Tensor padded = Tensor::zeros({num_steps, max_batch, feat}, data.dtype(), data.device());
+    int64_t offset = 0;
+    for (int64_t i = 0; i < num_steps; ++i) {
+        const int64_t b = bs_ptr[i];
+        if (b > 0) {
+            padded.select(0, i).narrow(0, 0, b).copy_(data.narrow(0, offset, b));
+        }
+        offset += b;
+    }
+    auto r = ops::gru(padded, std::vector<Tensor>{hx}, params, has_biases, num_layers,
                       static_cast<float>(dropout), train, bidirectional, false);
-    Tensor out = std::get<0>(r);
+    Tensor out_padded = std::get<0>(r);
     Tensor hn = std::get<1>(r);
-    (void)batch_sizes;
+    std::vector<Tensor> steps;
+    steps.reserve(num_steps);
+    for (int64_t i = 0; i < num_steps; ++i) {
+        const int64_t b = bs_ptr[i];
+        if (b > 0) steps.push_back(out_padded.select(0, i).narrow(0, 0, b));
+    }
+    Tensor out = steps.empty() ? Tensor::empty({0, out_padded.size(-1)}, out_padded.dtype(), out_padded.device())
+                               : ops::cat(steps, 0);
     return {out, hn};
 }
 
@@ -808,10 +805,40 @@ std::tuple<Tensor, Tensor> rnn_relu_data_native(const Tensor& data, const Tensor
                                                 bool has_biases, int64_t num_layers,
                                                 double dropout, bool train,
                                                 bool bidirectional) {
-    auto r = ops::rnn_relu(data, std::vector<Tensor>{hx}, params, has_biases, num_layers,
+    if (batch_sizes.dim() != 1) {
+        TP_THROW(RuntimeError, "rnn_relu.data: batch_sizes must be 1-dimensional");
+    }
+    const int64_t num_steps = batch_sizes.size(0);
+    const int64_t total = data.size(0);
+    if (num_steps == 0 || total == 0) {
+        auto r = ops::rnn_relu(data.unsqueeze(0), std::vector<Tensor>{hx}, params, has_biases,
+                               num_layers, static_cast<float>(dropout), train, bidirectional, false);
+        return {std::get<0>(r).reshape({total, std::get<0>(r).size(-1)}), std::get<1>(r)};
+    }
+    Tensor bs_cpu = batch_sizes.to(Device(DeviceType::CPU)).contiguous();
+    const int64_t* bs_ptr = bs_cpu.data_ptr<int64_t>();
+    const int64_t max_batch = bs_ptr[0];
+    const int64_t feat = data.size(1);
+    Tensor padded = Tensor::zeros({num_steps, max_batch, feat}, data.dtype(), data.device());
+    int64_t offset = 0;
+    for (int64_t i = 0; i < num_steps; ++i) {
+        const int64_t b = bs_ptr[i];
+        if (b > 0) padded.select(0, i).narrow(0, 0, b).copy_(data.narrow(0, offset, b));
+        offset += b;
+    }
+    auto r = ops::rnn_relu(padded, std::vector<Tensor>{hx}, params, has_biases, num_layers,
                            static_cast<float>(dropout), train, bidirectional, false);
-    (void)batch_sizes;
-    return r;
+    Tensor out_padded = std::get<0>(r);
+    Tensor hn = std::get<1>(r);
+    std::vector<Tensor> steps;
+    steps.reserve(num_steps);
+    for (int64_t i = 0; i < num_steps; ++i) {
+        const int64_t b = bs_ptr[i];
+        if (b > 0) steps.push_back(out_padded.select(0, i).narrow(0, 0, b));
+    }
+    Tensor out = steps.empty() ? Tensor::empty({0, out_padded.size(-1)}, out_padded.dtype(), out_padded.device())
+                               : ops::cat(steps, 0);
+    return {out, hn};
 }
 
 std::tuple<Tensor, Tensor> rnn_tanh_data_native(const Tensor& data, const Tensor& batch_sizes,
@@ -820,11 +847,116 @@ std::tuple<Tensor, Tensor> rnn_tanh_data_native(const Tensor& data, const Tensor
                                                 bool has_biases, int64_t num_layers,
                                                 double dropout, bool train,
                                                 bool bidirectional) {
-    auto r = ops::rnn_tanh(data, std::vector<Tensor>{hx}, params, has_biases, num_layers,
+    if (batch_sizes.dim() != 1) {
+        TP_THROW(RuntimeError, "rnn_tanh.data: batch_sizes must be 1-dimensional");
+    }
+    const int64_t num_steps = batch_sizes.size(0);
+    const int64_t total = data.size(0);
+    if (num_steps == 0 || total == 0) {
+        auto r = ops::rnn_tanh(data.unsqueeze(0), std::vector<Tensor>{hx}, params, has_biases,
+                               num_layers, static_cast<float>(dropout), train, bidirectional, false);
+        return {std::get<0>(r).reshape({total, std::get<0>(r).size(-1)}), std::get<1>(r)};
+    }
+    Tensor bs_cpu = batch_sizes.to(Device(DeviceType::CPU)).contiguous();
+    const int64_t* bs_ptr = bs_cpu.data_ptr<int64_t>();
+    const int64_t max_batch = bs_ptr[0];
+    const int64_t feat = data.size(1);
+    Tensor padded = Tensor::zeros({num_steps, max_batch, feat}, data.dtype(), data.device());
+    int64_t offset = 0;
+    for (int64_t i = 0; i < num_steps; ++i) {
+        const int64_t b = bs_ptr[i];
+        if (b > 0) padded.select(0, i).narrow(0, 0, b).copy_(data.narrow(0, offset, b));
+        offset += b;
+    }
+    auto r = ops::rnn_tanh(padded, std::vector<Tensor>{hx}, params, has_biases, num_layers,
                            static_cast<float>(dropout), train, bidirectional, false);
-    (void)batch_sizes;
-    return r;
+    Tensor out_padded = std::get<0>(r);
+    Tensor hn = std::get<1>(r);
+    std::vector<Tensor> steps;
+    steps.reserve(num_steps);
+    for (int64_t i = 0; i < num_steps; ++i) {
+        const int64_t b = bs_ptr[i];
+        if (b > 0) steps.push_back(out_padded.select(0, i).narrow(0, 0, b));
+    }
+    Tensor out = steps.empty() ? Tensor::empty({0, out_padded.size(-1)}, out_padded.dtype(), out_padded.device())
+                               : ops::cat(steps, 0);
+    return {out, hn};
 }
+
+namespace {
+
+// One packed-sequence LSTM layer.  batch_sizes is a non-increasing profile
+// over the packed time axis; at each step the rows whose sequences just
+// ended are frozen into the final-state list, and the remaining active
+// prefix keeps running.  Reversing the frozen list at the end restores the
+// original row order, so row j gets the state after its true last input.
+// For the reverse direction the walk starts from the smallest batch and
+// grows it, attaching fresh initial states for rows whose reversed sequence
+// begins at the current step; every row is active at step 0, so the loop's
+// final state is already the complete h_n/c_n in row order.
+std::pair<Tensor, std::pair<Tensor, Tensor>> packed_lstm_layer(
+    const Tensor& data, const int64_t* batch_sizes, int64_t num_steps,
+    const Tensor& hx0, const Tensor& cx0, bool reverse,
+    const Tensor& w_ih, const Tensor& w_hh,
+    const std::optional<Tensor>& b_ih, const std::optional<Tensor>& b_hh) {
+    std::vector<Tensor> step_outputs;
+    std::vector<Tensor> frozen_h, frozen_c;
+    Tensor h, c;
+    if (!reverse) {
+        h = hx0.narrow(0, 0, batch_sizes[0]);
+        c = cx0.narrow(0, 0, batch_sizes[0]);
+        int64_t input_offset = 0;
+        int64_t last = batch_sizes[0];
+        for (int64_t i = 0; i < num_steps; ++i) {
+            const int64_t b = batch_sizes[i];
+            Tensor step_input = data.narrow(0, input_offset, b);
+            input_offset += b;
+            const int64_t dec = last - b;
+            if (dec > 0) {
+                frozen_h.push_back(h.narrow(0, last - dec, dec));
+                frozen_c.push_back(c.narrow(0, last - dec, dec));
+                h = h.narrow(0, 0, last - dec);
+                c = c.narrow(0, 0, last - dec);
+            }
+            last = b;
+            auto cell = ops::lstm_cell(step_input, h, c, w_ih, w_hh, b_ih, b_hh);
+            h = std::get<0>(cell);
+            c = std::get<1>(cell);
+            step_outputs.push_back(h);
+        }
+        frozen_h.push_back(h);
+        frozen_c.push_back(c);
+        std::reverse(frozen_h.begin(), frozen_h.end());
+        std::reverse(frozen_c.begin(), frozen_c.end());
+        return {ops::cat(step_outputs, 0),
+                std::make_pair(ops::cat(frozen_h, 0), ops::cat(frozen_c, 0))};
+    }
+    h = hx0.narrow(0, 0, batch_sizes[num_steps - 1]);
+    c = cx0.narrow(0, 0, batch_sizes[num_steps - 1]);
+    int64_t input_offset = data.size(0);
+    int64_t last = batch_sizes[num_steps - 1];
+    for (int64_t i = num_steps - 1; i >= 0; --i) {
+        const int64_t b = batch_sizes[i];
+        const int64_t inc = b - last;
+        if (inc > 0) {
+            h = ops::cat(std::vector<Tensor>{
+                h, hx0.narrow(0, last, inc)}, 0);
+            c = ops::cat(std::vector<Tensor>{
+                c, cx0.narrow(0, last, inc)}, 0);
+        }
+        Tensor step_input = data.narrow(0, input_offset - b, b);
+        input_offset -= b;
+        last = b;
+        auto cell = ops::lstm_cell(step_input, h, c, w_ih, w_hh, b_ih, b_hh);
+        h = std::get<0>(cell);
+        c = std::get<1>(cell);
+        step_outputs.push_back(h);
+    }
+    std::reverse(step_outputs.begin(), step_outputs.end());
+    return {ops::cat(step_outputs, 0), std::make_pair(h, c)};
+}
+
+}  // namespace
 
 std::tuple<Tensor, Tensor, Tensor> lstm_data_native(const Tensor& data,
                                                     const Tensor& batch_sizes,
@@ -833,10 +965,96 @@ std::tuple<Tensor, Tensor, Tensor> lstm_data_native(const Tensor& data,
                                                     bool has_biases, int64_t num_layers,
                                                     double dropout, bool train,
                                                     bool bidirectional) {
-    auto r = ops::lstm(data, hx, params, has_biases, num_layers, static_cast<float>(dropout),
-                       train, bidirectional, false);
-    (void)batch_sizes;
-    return r;
+    if (hx.size() != 2) {
+        TP_THROW(RuntimeError, "lstm.data: expects two hidden states");
+    }
+    if (batch_sizes.dim() != 1) {
+        TP_THROW(RuntimeError, "lstm.data: batch_sizes must be 1-dimensional");
+    }
+    const int64_t num_steps = batch_sizes.size(0);
+    const int64_t total = data.size(0);
+    if (num_steps == 0 || total == 0) {
+        auto r = ops::lstm(data.unsqueeze(0), hx, params, has_biases, num_layers,
+                           static_cast<float>(dropout), train, bidirectional, false);
+        Tensor out = std::get<0>(r);
+        return {out.reshape({total, out.size(-1)}), std::get<1>(r), std::get<2>(r)};
+    }
+    Tensor bs_cpu = batch_sizes.to(Device(DeviceType::CPU)).contiguous();
+    const int64_t* bs_ptr = bs_cpu.data_ptr<int64_t>();
+    const int64_t dirs = bidirectional ? 2 : 1;
+    const int64_t max_batch = bs_ptr[0];
+    if (hx[0].dim() != 3 || hx[1].dim() != 3) {
+        TP_THROW(RuntimeError,
+                 "lstm.data: hidden states must be [num_layers * dirs, batch, "
+                 "hidden_size]");
+    }
+    if (hx[0].size(0) != num_layers * dirs || hx[1].size(0) != num_layers * dirs) {
+        TP_THROW(RuntimeError,
+                 "lstm.data: hidden states must have num_layers * dirs leading "
+                 "rows, got ", hx[0].size(0));
+    }
+    if (hx[0].size(1) < max_batch || hx[1].size(1) < max_batch) {
+        TP_THROW(RuntimeError,
+                 "lstm.data: initial hidden batch must cover the largest "
+                 "batch size (", max_batch, ")");
+    }
+    const int64_t param_stride = has_biases ? 4 : 2;
+    if (static_cast<int64_t>(params.size()) < num_layers * dirs * param_stride) {
+        TP_THROW(RuntimeError, "lstm.data: missing parameters");
+    }
+    std::vector<Tensor> hy_list, cy_list;
+    hy_list.reserve(num_layers * dirs);
+    cy_list.reserve(num_layers * dirs);
+    Tensor layer_input_data = data;
+    for (int64_t layer = 0; layer < num_layers; ++layer) {
+        Tensor fw_out, fw_h, fw_c, rv_out, rv_h, rv_c;
+        {
+            const int64_t si = layer * dirs;
+            const int64_t pbase = si * param_stride;
+            std::optional<Tensor> b_ih, b_hh;
+            if (has_biases) {
+                b_ih = params[pbase + 2];
+                b_hh = params[pbase + 3];
+            }
+            auto fw = packed_lstm_layer(
+                layer_input_data, bs_ptr, num_steps,
+                hx[0].select(0, si).contiguous(),
+                hx[1].select(0, si).contiguous(),
+                false, params[pbase], params[pbase + 1], b_ih, b_hh);
+            fw_out = fw.first;
+            fw_h = fw.second.first;
+            fw_c = fw.second.second;
+            hy_list.push_back(fw_h);
+            cy_list.push_back(fw_c);
+        }
+        if (bidirectional) {
+            const int64_t si = layer * dirs + 1;
+            const int64_t pbase = si * param_stride;
+            std::optional<Tensor> b_ih, b_hh;
+            if (has_biases) {
+                b_ih = params[pbase + 2];
+                b_hh = params[pbase + 3];
+            }
+            auto rv = packed_lstm_layer(
+                layer_input_data, bs_ptr, num_steps,
+                hx[0].select(0, si).contiguous(),
+                hx[1].select(0, si).contiguous(),
+                true, params[pbase], params[pbase + 1], b_ih, b_hh);
+            rv_out = rv.first;
+            rv_h = rv.second.first;
+            rv_c = rv.second.second;
+            hy_list.push_back(rv_h);
+            cy_list.push_back(rv_c);
+            layer_input_data =
+                ops::cat(std::vector<Tensor>{fw_out, rv_out}, fw_out.dim() - 1);
+        } else {
+            layer_input_data = fw_out;
+        }
+        if (train && dropout != 0.0 && layer < num_layers - 1) {
+            layer_input_data = ops::dropout(layer_input_data, dropout, true);
+        }
+    }
+    return {layer_input_data, ops::stack(hy_list, 0), ops::stack(cy_list, 0)};
 }
 
 // ---- sparse / misc ------------------------------------------------------------
@@ -1232,6 +1450,29 @@ Tensor upsample_nearest3d_vec_native(const Tensor& input,
     return ops::upsample_nearest3d(input, sz);
 }
 
+// nearest-exact .vec entry points: same size/scale handling as the legacy
+// nearest family, but they resolve to the pixel-center exact kernels.
+Tensor _upsample_nearest_exact1d_vec_native(const Tensor& input,
+                                            const std::optional<std::vector<int64_t>>& output_size,
+                                            const std::optional<std::vector<double>>& scale_factors) {
+    const auto sz = upsample_out_size(input, output_size, scale_factors);
+    return ops::_upsample_nearest_exact1d(input, sz);
+}
+
+Tensor _upsample_nearest_exact2d_vec_native(const Tensor& input,
+                                            const std::optional<std::vector<int64_t>>& output_size,
+                                            const std::optional<std::vector<double>>& scale_factors) {
+    const auto sz = upsample_out_size(input, output_size, scale_factors);
+    return ops::_upsample_nearest_exact2d(input, sz);
+}
+
+Tensor _upsample_nearest_exact3d_vec_native(const Tensor& input,
+                                            const std::optional<std::vector<int64_t>>& output_size,
+                                            const std::optional<std::vector<double>>& scale_factors) {
+    const auto sz = upsample_out_size(input, output_size, scale_factors);
+    return ops::_upsample_nearest_exact3d(input, sz);
+}
+
 // ---- misc forwards ------------------------------------------------------------
 Tensor& logit_backward_gi_native(const Tensor& grad_output, const Tensor& self,
                                  std::optional<double> eps, Tensor& grad_input) {
@@ -1344,11 +1585,6 @@ TENSORPLAY_LIBRARY_IMPL(Composite, VariantHandOps) {
     m.impl("quantile.scalar", quantile_scalar_native);
     m.impl("ormqr", ormqr_composite);
     m.impl("geqrf", geqrf_composite);
-    m.impl("inverse", inverse_composite);
-    m.impl("pinverse", pinverse_composite);
-    m.impl("lu_solve", lu_solve_composite);
-    m.impl("orgqr", orgqr_composite);
-    m.impl("linalg_vecdot", linalg_vecdot_composite);
     m.impl("linalg_vdot", linalg_vdot_composite);
 
     m.impl("mm.dtype", mm_dtype_native);
@@ -1427,6 +1663,9 @@ TENSORPLAY_LIBRARY_IMPL(Composite, VariantHandOps) {
     m.impl("upsample_trilinear3d.vec", upsample_trilinear3d_vec_native);
     m.impl("upsample_nearest2d.vec", upsample_nearest2d_vec_native);
     m.impl("upsample_nearest3d.vec", upsample_nearest3d_vec_native);
+    m.impl("_upsample_nearest_exact1d.vec", _upsample_nearest_exact1d_vec_native);
+    m.impl("_upsample_nearest_exact2d.vec", _upsample_nearest_exact2d_vec_native);
+    m.impl("_upsample_nearest_exact3d.vec", _upsample_nearest_exact3d_vec_native);
 
     m.impl("logit_backward.grad_input", logit_backward_gi_native);
     m.impl("quantize_per_tensor.tensor_qparams", quantize_per_tensor_tq_native);
