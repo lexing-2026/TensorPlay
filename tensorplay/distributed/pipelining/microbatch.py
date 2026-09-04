@@ -4,6 +4,7 @@ import operator
 from typing import Any, Iterable, Sequence
 
 import tensorplay as tp
+from ..tensor import DTensor
 from tensorplay.utils._pytree import flatten_up_to, tree_flatten, tree_map, tree_unflatten
 
 __all__ = ["TensorChunkSpec", "split_args_kwargs_into_chunks", "merge_chunks"]
@@ -55,7 +56,7 @@ def _flatten_value_specs(value: Any, spec: Any) -> list[tuple[Any, Any]]:
     if _spec_is_replicate(spec):
         return [(leaf, spec) for leaf in tree_flatten(value)[0]]
     if isinstance(spec, TensorChunkSpec):
-        if not isinstance(value, tp.Tensor):
+        if not _is_tensor_value(value) and not _is_block_mask(value):
             raise ValueError(
                 "a tensor chunk specification must select a tensor leaf"
             )
@@ -76,7 +77,7 @@ def _flatten_value_specs(value: Any, spec: Any) -> list[tuple[Any, Any]]:
                 (leaf, leaf_spec) for leaf in tree_flatten(subtree)[0]
             )
         elif isinstance(leaf_spec, TensorChunkSpec):
-            if not isinstance(subtree, tp.Tensor):
+            if not _is_tensor_value(subtree) and not _is_block_mask(subtree):
                 raise ValueError(
                     "a tensor chunk specification must select a tensor leaf"
                 )
@@ -89,25 +90,124 @@ def _flatten_value_specs(value: Any, spec: Any) -> list[tuple[Any, Any]]:
 
 
 def _split_tensor(value: Any, spec: TensorChunkSpec, num_chunks: int) -> list[Any]:
-    if not isinstance(value, tp.Tensor):
+    if not _is_tensor_value(value):
         raise TypeError(f"expected a tensor, got {type(value).__name__}")
     dim = spec.split_dim if spec.split_dim >= 0 else spec.split_dim + value.dim()
     if dim < 0 or dim >= value.dim():
         raise ValueError("split dimension is outside the tensor rank")
     if int(value.shape[dim]) < num_chunks:
         raise ValueError("tensor dimension is smaller than the requested chunk count")
-    return list(value.tensor_split(num_chunks, dim=dim)) if hasattr(value, "tensor_split") else list(tp.tensor_split(value, num_chunks, dim=dim))
+    if isinstance(value, DTensor):
+        local_tensor = value.to_local()
+        local_chunks = tp.tensor_split(local_tensor, num_chunks, dim=dim)
+        global_size = int(value.shape[dim])
+        quotient, remainder = divmod(global_size, num_chunks)
+        global_stride = value.stride()
+        chunks = []
+        for index, local_chunk in enumerate(local_chunks):
+            chunk_shape = list(value.shape)
+            chunk_shape[dim] = quotient + (1 if index < remainder else 0)
+            chunks.append(
+                DTensor.from_local(
+                    local_chunk,
+                    value.device_mesh,
+                    value.placements,
+                    shape=tuple(chunk_shape),
+                    stride=global_stride,
+                    run_check=False,
+                )
+            )
+        return chunks
+    return list(tp.tensor_split(value, num_chunks, dim=dim))
+
+
+def _is_tensor_value(value: Any) -> bool:
+    return isinstance(value, (tp.Tensor, DTensor))
 
 
 def _spec_is_replicate(spec: Any) -> bool:
     return spec is None or spec is _Replicate or isinstance(spec, _Replicate)
 
 
+def _is_block_mask(value: Any) -> bool:
+    return (
+        not _is_tensor_value(value)
+        and all(
+            hasattr(value, name)
+            for name in (
+                "kv_num_blocks",
+                "kv_indices",
+                "full_kv_num_blocks",
+                "full_kv_indices",
+                "BLOCK_SIZE",
+                "mask_mod",
+                "seq_lengths",
+            )
+        )
+        and callable(getattr(type(value), "from_kv_blocks", None))
+    )
+
+
+def _split_block_mask(block_mask: Any, num_chunks: int) -> list[Any]:
+    batch_size = int(block_mask.kv_num_blocks.size(0))
+    if batch_size == 1:
+        return [block_mask] * num_chunks
+    if batch_size < num_chunks:
+        raise AssertionError(
+            "Block mask has fewer batch size than the number of chunks. "
+        )
+
+    batch_dim = 0
+    kv_num_blocks_chunks = tp.tensor_split(
+        block_mask.kv_num_blocks, num_chunks, batch_dim
+    )
+    kv_indices_chunks = tp.tensor_split(block_mask.kv_indices, num_chunks, batch_dim)
+    full_kv_num_blocks_chunks = (
+        tp.tensor_split(block_mask.full_kv_num_blocks, num_chunks, batch_dim)
+        if block_mask.full_kv_num_blocks is not None
+        else [None] * num_chunks
+    )
+    full_kv_indices_chunks = (
+        tp.tensor_split(block_mask.full_kv_indices, num_chunks, batch_dim)
+        if block_mask.full_kv_indices is not None
+        else [None] * num_chunks
+    )
+
+    chunk_block_masks = []
+    batch_offset = 0
+    for chunk_idx in range(num_chunks):
+
+        def create_mask_mod(idx: int):
+            def batch_offset_mask_mod(b: Any, h: Any, q_idx: Any, kv_idx: Any):
+                b_offset = tp.full_like(b, idx)
+                return block_mask.mask_mod(b + b_offset, h, q_idx, kv_idx)
+
+            return batch_offset_mask_mod
+
+        chunk_block_masks.append(
+            type(block_mask).from_kv_blocks(
+                kv_num_blocks=kv_num_blocks_chunks[chunk_idx],
+                kv_indices=kv_indices_chunks[chunk_idx],
+                full_kv_num_blocks=full_kv_num_blocks_chunks[chunk_idx],
+                full_kv_indices=full_kv_indices_chunks[chunk_idx],
+                BLOCK_SIZE=block_mask.BLOCK_SIZE,
+                mask_mod=create_mask_mod(batch_offset),
+                seq_lengths=block_mask.seq_lengths,
+            )
+        )
+        batch_offset += int(kv_num_blocks_chunks[chunk_idx].size(0))
+    return chunk_block_masks
+
+
 def _leaf_chunks(value: Any, spec: Any, num_chunks: int) -> list[Any]:
     if _spec_is_replicate(spec):
         return [value] * num_chunks
     if isinstance(spec, TensorChunkSpec):
-        if not isinstance(value, tp.Tensor):
+        if _is_block_mask(value):
+            if spec.split_dim != 0:
+                raise AssertionError("BlockMask only supports split_dim=0")
+            return _split_block_mask(value, num_chunks)
+        if not _is_tensor_value(value):
             return [value] * num_chunks
         return _split_tensor(value, spec, num_chunks)
     raise ValueError(f"unsupported value/spec pair: {type(value).__name__}, {spec!r}")
@@ -130,7 +230,22 @@ def _adjust_chunk_count(value: Any, spec: Any, requested: int) -> int:
     count = requested
     found_tensor = False
     for item, item_spec in pairs:
-        if not isinstance(item_spec, TensorChunkSpec) or not isinstance(item, tp.Tensor):
+        if not isinstance(item_spec, TensorChunkSpec):
+            continue
+        if _is_block_mask(item):
+            if item_spec.split_dim != 0:
+                raise AssertionError("BlockMask only supports split_dim=0")
+            size = int(item.kv_num_blocks.size(0))
+            if not found_tensor:
+                found_tensor = True
+                if size != 1:
+                    count = min(count, size)
+            elif size != 1 and size < count:
+                raise ValueError(
+                    "a later block mask has fewer batches than the effective chunk count"
+                )
+            continue
+        if not _is_tensor_value(item):
             continue
         dim = item_spec.split_dim if item_spec.split_dim >= 0 else item_spec.split_dim + item.dim()
         if dim < 0 or dim >= item.dim():
@@ -159,14 +274,14 @@ def split_args_kwargs_into_chunks(args: tuple[Any, ...], kwargs: dict[str, Any],
     if args_chunk_spec is None:
         args_chunk_spec = tree_map(
             lambda value: TensorChunkSpec(DEFAULT_CHUNK_DIM)
-            if isinstance(value, tp.Tensor)
+            if _is_tensor_value(value)
             else _Replicate(),
             args,
         )
     if kwargs_chunk_spec is None:
         kwargs_chunk_spec = tree_map(
             lambda value: TensorChunkSpec(DEFAULT_CHUNK_DIM)
-            if isinstance(value, tp.Tensor)
+            if _is_tensor_value(value) or _is_block_mask(value)
             else _Replicate(),
             kwargs,
         )
@@ -190,9 +305,32 @@ def _merge_leaf(chunks: list[Any], spec: Any) -> Any:
                 raise ValueError("replicated values differ between chunks")
         return first
     if isinstance(spec, TensorChunkSpec):
-        if not all(isinstance(value, tp.Tensor) for value in chunks):
+        if not all(_is_tensor_value(value) for value in chunks):
             raise TypeError("tensor chunk specification requires tensor values")
         dim = spec.split_dim if spec.split_dim >= 0 else spec.split_dim + chunks[0].dim()
+        dtensor_flags = [isinstance(value, DTensor) for value in chunks]
+        if any(dtensor_flags):
+            if not all(dtensor_flags):
+                raise ValueError("tensor chunks must use one tensor representation")
+            placements = chunks[0].placements
+            for index, value in enumerate(chunks[1:], 1):
+                if value.placements != placements:
+                    raise ValueError(f"tensor chunk placement mismatch at index {index}")
+            first = chunks[0]
+            local_value = tp.cat(
+                [value.to_local() for value in chunks],
+                dim=dim,
+            )
+            shape = list(first.shape)
+            shape[dim] = sum(value.shape[dim] for value in chunks)
+            return DTensor.from_local(
+                local_value,
+                first.device_mesh,
+                placements,
+                shape=tuple(shape),
+                stride=first.stride(),
+                run_check=False,
+            )
         return tp.cat(tuple(chunks), dim=dim)
     if isinstance(spec, _CustomReducer):
         result = spec.init_value
@@ -221,7 +359,7 @@ def merge_chunks(chunks: list[Any], chunk_spec: Any) -> Any:
     if chunk_spec is None:
         flat_specs = [
             TensorChunkSpec(DEFAULT_CHUNK_DIM)
-            if isinstance(value, tp.Tensor)
+            if _is_tensor_value(value)
             else _Replicate()
             for value in flat_chunks
         ]

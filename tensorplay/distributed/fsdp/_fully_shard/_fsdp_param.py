@@ -1,14 +1,20 @@
 """Parameter state transitions for composable sharding."""
 
+import importlib.util
+import inspect
+import itertools
 import math
 from dataclasses import dataclass
 from enum import Enum, auto
+from functools import lru_cache
 from typing import Any, Callable
 
 import tensorplay as tp
+from tensorplay.nn.modules.module import Module
 from tensorplay.nn.parameter import Parameter
 
 from ... import distributed_core as dist
+from ...device_mesh import DeviceMesh
 from ...tensor import DTensor, Replicate, Shard, distribute_tensor
 from ...tensor._dtensor_spec import DTensorSpec, TensorMeta
 from ...tensor.placement_types import _StridedShard
@@ -16,6 +22,9 @@ from ...tensor._collective_utils import pad_tensor, unpad_tensor
 from ._fsdp_api import CPUOffloadPolicy
 from ._fsdp_common import (
     DataParallelMeshInfo,
+    DDPMeshInfo,
+    FSDPMeshInfo,
+    HSDPMeshInfo,
     ShardPlacementResult,
     _chunk_with_empty,
     _from_local_no_grad,
@@ -90,12 +99,40 @@ class ExtensionsData:
         self.all_gather_input_sizes = ()
 
 
+_orig_param_uid_counter = itertools.count()
+
+
 def _get_orig_param_uid(param: Any) -> int:
-    return id(param)
+    if not hasattr(param, "_fsdp_orig_uid"):
+        param._fsdp_orig_uid = next(_orig_param_uid_counter)
+    return param._fsdp_orig_uid
 
 
-def _spans_same_mesh(lhs_axes: Any, rhs_axes: Any) -> bool:
-    return tuple(lhs_axes) == tuple(rhs_axes)
+@lru_cache(maxsize=1)
+def _get_spmd_support() -> tuple[Any, Any, Any, Any] | None:
+    if importlib.util.find_spec("spmd_types") is None:
+        return None
+    import spmd_types as spmd
+    from spmd_types._mesh_axis import flatten_axes
+    from spmd_types.runtime import get_partition_spec
+    from spmd_types.types import partition_spec_to_shard_types
+
+    return spmd, flatten_axes, get_partition_spec, partition_spec_to_shard_types
+
+
+def _spans_same_mesh(
+    lhs_axes: Any,
+    rhs_axes: Any,
+    spmd: Any = None,
+    flatten_axes: Any = None,
+) -> bool:
+    if spmd is None or flatten_axes is None:
+        return tuple(lhs_axes) == tuple(rhs_axes)
+    lhs_mesh = spmd.normalize_mesh(frozenset(lhs_axes))
+    rhs_mesh = spmd.normalize_mesh(frozenset(rhs_axes))
+    if not lhs_mesh or not rhs_mesh:
+        return lhs_mesh == rhs_mesh
+    return flatten_axes(tuple(lhs_mesh)) == flatten_axes(tuple(rhs_mesh))
 
 
 def _mesh_placements(mesh: Any, placement: Any, mesh_dim: int | str = 0) -> tuple[Any, ...]:
@@ -151,6 +188,7 @@ class FSDPParam:
         self.pin_memory = bool(
             self.offload_to_cpu and getattr(offload_policy, "pin_memory", False)
         )
+        self.grad_offload_event: Any = None
         self.param_requires_grad = bool(getattr(param, "requires_grad", False))
         self._state = ShardedState.UNSHARDED
         self._full_tensor = param
@@ -183,6 +221,11 @@ class FSDPParam:
         self.fsdp_placement = self._placement
         self._shard_mesh = self._init_shard_mesh()
         self._init_sharded_param(param, device, shard_placement_fn, mesh_info)
+        self._post_load_hook_handle = (
+            module_info.module.register_load_state_dict_post_hook(
+                lambda *args, **kwargs: self.reset_sharded_param()
+            )
+        )
 
     def _resolve_placement(
         self,
@@ -250,6 +293,8 @@ class FSDPParam:
             padded.narrow(shard_dim, 0, length).copy_(selected)
         if self.offload_to_cpu and getattr(padded, "device", None) != "cpu":
             padded = padded.cpu()
+        if self.pin_memory and not getattr(padded, "is_pinned", lambda: False)():
+            padded = padded.pin_memory()
         self._sharded_param_data = padded.view(-1)
         length = int(selected.shape[shard_dim]) if int(selected.numel()) else 0
         local = padded.narrow(shard_dim, 0, length)
@@ -263,6 +308,7 @@ class FSDPParam:
         self._setattr_on_modules(self.sharded_param)
         return local
 
+    @tp.no_grad()
     def _init_sharded_param(
         self,
         param: Any,
@@ -271,6 +317,24 @@ class FSDPParam:
         mesh_info: DataParallelMeshInfo,
     ) -> None:
         del device, shard_placement_fn
+        spmd_support = _get_spmd_support()
+        self.is_spmd_types = False
+        if spmd_support is not None and not isinstance(param, DTensor):
+            spmd = spmd_support[0]
+            get_partition_spec = spmd_support[2]
+            get_local_type = getattr(spmd, "get_local_type", None)
+            init_local_type = (
+                get_local_type(param) if callable(get_local_type) else None
+            )
+            if init_local_type:
+                self.is_spmd_types = True
+                param = self._resolve_spmd_types_for_storage(
+                    param,
+                    get_partition_spec(param),
+                    init_local_type,
+                    mesh_info,
+                )
+                self.param = param
         if isinstance(param, DTensor):
             param_data = param.to_local()
             self._unsharded_dtensor_spec = DTensorSpec(
@@ -281,6 +345,7 @@ class FSDPParam:
         else:
             param_data = param
             self._unsharded_dtensor_spec = None
+        self.is_dtensor = isinstance(param, DTensor)
         if not getattr(param_data, "is_contiguous", lambda: True)():
             raise NotImplementedError(
                 f"non-contiguous parameters are unsupported: shape={param_data.shape}"
@@ -307,67 +372,332 @@ class FSDPParam:
         self._full_tensor = None
         self._state = ShardedState.SHARDED
 
-    def _resolve_spmd_types_for_storage(self, param: Any, partition_spec: Any, init_local_type: Any, mesh_info: Any) -> Any:
-        del param, partition_spec, mesh_info
-        return init_local_type
+    def _resolve_spmd_types_for_storage(
+        self,
+        param: Any,
+        partition_spec: Any,
+        init_local_type: Any,
+        mesh_info: Any,
+    ) -> Any:
+        spmd_support = _get_spmd_support()
+        if spmd_support is None:
+            raise RuntimeError("type-check metadata support is unavailable")
+        spmd, flatten_axes, _, partition_spec_to_shard_types = spmd_support
+        storage_mesh = getattr(mesh_info, "spmd_mesh", None)
+        storage_mesh_names = getattr(storage_mesh, "mesh_dim_names", None)
+        if storage_mesh is None or storage_mesh_names is None:
+            raise ValueError(
+                "type-check annotated parameters require a named full storage mesh "
+                "and data-parallel mesh dimensions"
+            )
+
+        storage_mesh_axes = tuple(
+            (name, spmd.MeshAxis.of(storage_mesh.get_group(name)))
+            for name in storage_mesh_names
+        )
+        storage_axes = tuple(axis for _, axis in storage_mesh_axes)
+        local_type = dict(init_local_type)
+        if partition_spec is not None:
+            local_type.update(partition_spec_to_shard_types(partition_spec))
+        annotated_axes = tuple(local_type.keys())
+        if _spans_same_mesh(
+            annotated_axes,
+            storage_axes,
+            spmd,
+            flatten_axes,
+        ):
+            restore_mesh = annotated_axes
+        else:
+            current_mesh = spmd.current_mesh()
+            if current_mesh is None:
+                raise ValueError(
+                    f"parameter '{self.module_info.param_name}' has partial type-check "
+                    "metadata that cannot be restored from the storage mesh"
+                )
+            restore_mesh = tuple(current_mesh)
+
+        unknown_axes = tuple(
+            axis for axis in init_local_type if axis not in restore_mesh
+        )
+        if unknown_axes:
+            raise ValueError(
+                f"parameter '{self.module_info.param_name}' has metadata axes "
+                f"outside the compute mesh: {unknown_axes}"
+            )
+        if not _spans_same_mesh(
+            restore_mesh,
+            storage_axes,
+            spmd,
+            flatten_axes,
+        ):
+            raise ValueError(
+                f"parameter '{self.module_info.param_name}' uses a compute mesh "
+                "with a different rank set from the storage mesh"
+            )
+
+        dp_mesh_dims = getattr(mesh_info, "dp_mesh_dims", None)
+        if dp_mesh_dims is None:
+            raise ValueError("type-check annotated parameters require DP mesh dimensions")
+        dp_names = set(
+            itertools.chain(
+                dp_mesh_dims.shard_names,
+                dp_mesh_dims.replicate_names,
+            )
+        )
+        fsdp_axis = flatten_axes(
+            tuple(axis for name, axis in storage_mesh_axes if name in dp_names)
+        )
+        non_fsdp_storage_mesh_axes = {
+            axis for name, axis in storage_mesh_axes if name not in dp_names
+        }
+        storage_axis_types = {
+            axis: spmd.R for name, axis in storage_mesh_axes if name in dp_names
+        }
+        for axis, axis_type in local_type.items():
+            if axis <= fsdp_axis:
+                if axis_type is not spmd.R:
+                    raise ValueError(
+                        f"expected replicated metadata on data-parallel axis {axis}"
+                    )
+            else:
+                if axis not in non_fsdp_storage_mesh_axes:
+                    raise ValueError(
+                        f"metadata axis {axis} is not a storage mesh axis"
+                    )
+                storage_axis_types[axis] = axis_type
+        if set(storage_axes) != set(storage_axis_types):
+            raise ValueError(
+                f"parameter '{self.module_info.param_name}' has incomplete "
+                "type-check metadata for the storage mesh"
+            )
+
+        restore_type = {
+            axis: init_local_type.get(axis, spmd.R) for axis in restore_mesh
+        }
+        placements = []
+        grad_placements = []
+        for axis_type in storage_axis_types.values():
+            placements.append(spmd.spmd_type_to_dtensor_placement(axis_type))
+            grad_placements.append(
+                spmd.spmd_type_to_dtensor_placement(axis_type.backward_type())
+            )
+        dtensor_param = DTensor.from_local(
+            getattr(param, "data", param),
+            storage_mesh,
+            placements,
+            run_check=False,
+        )
+        self._spmd_partition_spec = partition_spec
+        self._spmd_init_local_type = init_local_type
+        self._spmd_restore_mesh = tuple(restore_mesh)
+        self._spmd_restore_type = restore_type
+        self._spmd_grad_placements = tuple(grad_placements)
+        return dtensor_param
 
     def _restore_spmd_types(self, tensor: Any) -> Any:
-        return tensor
+        if not getattr(self, "is_spmd_types", False):
+            return None
+        spmd_support = _get_spmd_support()
+        if spmd_support is None or not spmd_support[0].is_type_checking():
+            return None
+        spmd = spmd_support[0]
+        spmd.assert_type(
+            tensor,
+            self._spmd_restore_type,
+            partition_spec=self._spmd_partition_spec,
+        )
+        return None
 
     def _init_sharding_spec(self, param: Any, fsdp_placement: Any, shard_dim: int) -> Any:
-        del shard_dim
-        if isinstance(param, DTensor):
+        if self.is_dtensor:
             self._unsharded_dtensor_spec = DTensorSpec(
                 param.device_mesh,
                 param.placements,
                 TensorMeta(tuple(param.shape), tuple(param.stride()), param.dtype),
             )
-            self._spmd_mesh = param.device_mesh
-            original_placements = list(param.placements)
-            if self.mesh_info.is_spmd_mesh and self.mesh_info.dp_mesh_dims is not None:
-                names = getattr(self._spmd_mesh, "mesh_dim_names", None)
-                if names is None:
-                    raise ValueError("an SPMD parameter mesh needs dimension names")
-                for name in self.mesh_info.dp_mesh_dims.shard_names:
-                    index = names.index(name)
-                    original = original_placements[index]
-                    if not isinstance(original, Replicate):
-                        raise ValueError(
-                            f"data-parallel shard dimension {name!r} must be replicated"
-                        )
-                    original_placements[index] = fsdp_placement
-                for name in self.mesh_info.dp_mesh_dims.replicate_names:
-                    index = names.index(name)
-                    if not isinstance(original_placements[index], Replicate):
-                        raise ValueError(
-                            f"data-parallel replicate dimension {name!r} must be replicated"
-                        )
-            self._spmd_placements = tuple(original_placements)
-            tensor_meta = self._unsharded_dtensor_spec.tensor_meta
         else:
-            self._spmd_mesh = self.mesh_info.mesh
-            self._spmd_placements = self._placement_list(
+            self._unsharded_dtensor_spec = None
+        if self.mesh_info.is_spmd_mesh and not self.is_dtensor:
+            raise ValueError(
+                "When dp_mesh_dims is provided, every parameter must be a distributed "
+                "tensor on the full SPMD mesh. "
+                f"Got plain tensor for parameter '{self.module_info.param_name}'."
+            )
+        if self.is_dtensor and self.mesh_info.is_spmd_mesh:
+            return self._init_sharding_spec_spmd(param, fsdp_placement, shard_dim)
+        if self.is_dtensor:
+            return self._init_sharding_spec_tp(param, fsdp_placement, shard_dim)
+        return self._init_sharding_spec_plain(param, fsdp_placement)
+
+    def _init_sharding_spec_spmd(
+        self, param: Any, fsdp_placement: Any, shard_dim: int
+    ) -> Any:
+        if self._unsharded_dtensor_spec is None:
+            raise AssertionError("distributed parameter metadata is missing")
+        spmd_mesh = self._unsharded_dtensor_spec.mesh
+        dp_dim_names = self.mesh_info.dp_mesh_dims
+        if dp_dim_names is None:
+            raise AssertionError("data-parallel mesh dimensions are missing")
+        mesh_dim_names = getattr(spmd_mesh, "mesh_dim_names", None)
+        if mesh_dim_names is None:
+            raise AssertionError("an SPMD parameter mesh needs dimension names")
+        if (
+            self.mesh_info.spmd_mesh is not None
+            and spmd_mesh is not self.mesh_info.spmd_mesh
+        ):
+            raise ValueError(
+                "the parameter distributed mesh must be the full mesh passed to fully_shard"
+            )
+
+        dp_shard_indices = [
+            mesh_dim_names.index(name) for name in dp_dim_names.shard_names
+        ]
+        original_placements = self._unsharded_dtensor_spec.placements
+        for index in dp_shard_indices:
+            if not isinstance(original_placements[index], Replicate):
+                raise ValueError(
+                    f"data-parallel shard dimension '{mesh_dim_names[index]}' "
+                    f"must be replicated, got {original_placements[index]}"
+                )
+        dp_replicate_indices = []
+        for name in dp_dim_names.replicate_names:
+            index = mesh_dim_names.index(name)
+            dp_replicate_indices.append(index)
+            if not isinstance(original_placements[index], Replicate):
+                raise ValueError(
+                    f"data-parallel replicate dimension '{mesh_dim_names[index]}' "
+                    f"must be replicated, got {original_placements[index]}"
+                )
+        self._dp_dim_indices = frozenset(dp_shard_indices + dp_replicate_indices)
+
+        placements = list(original_placements)
+        for dp_index in dp_shard_indices:
+            split_factor = 1
+            for mesh_index in range(dp_index + 1, int(spmd_mesh.ndim)):
+                placement = original_placements[mesh_index]
+                if (
+                    isinstance(placement, (Shard, _StridedShard))
+                    and placement.dim == shard_dim
+                ):
+                    split_factor *= int(spmd_mesh.size(mesh_index))
+            placements[dp_index] = (
+                _StridedShard(shard_dim, split_factor=split_factor)
+                if split_factor > 1
+                else fsdp_placement
+            )
+
+        self._spmd_mesh = spmd_mesh
+        self._spmd_placements = tuple(placements)
+        self._sharding_spec = self._build_spmd_sharding_spec(
+            dp_dim_names, dp_shard_indices, fsdp_placement
+        )
+        return param.to_local()
+
+    def _build_spmd_sharding_spec(
+        self, dp_dim_names: Any, dp_shard_indices: list[int], fsdp_placement: Any
+    ) -> DTensorSpec:
+        del fsdp_placement
+        if self._unsharded_dtensor_spec is None:
+            raise AssertionError("distributed parameter metadata is missing")
+        tensor_meta = self._unsharded_dtensor_spec.tensor_meta
+        if len(dp_shard_indices) <= 1:
+            return DTensorSpec(
                 self._spmd_mesh,
-                fsdp_placement,
-                self.mesh_info.shard_mesh_dim,
+                self._spmd_placements,
+                tensor_meta=tensor_meta,
             )
-            tensor_meta = TensorMeta(
-                tuple(param.shape), tuple(param.stride()), param.dtype
+        mesh_dim_names = getattr(self._spmd_mesh, "mesh_dim_names", None)
+        if mesh_dim_names is None:
+            raise AssertionError("an SPMD parameter mesh needs dimension names")
+        shard_names = set(dp_dim_names.shard_names)
+        replicate_names = set(dp_dim_names.replicate_names)
+        submeshes = []
+        spec_placements = []
+        skip = 0
+        for index, name in enumerate(mesh_dim_names):
+            if skip > 0:
+                skip -= 1
+                continue
+            if name in shard_names:
+                submeshes.append(self.mesh_info.mesh)
+                if isinstance(self.mesh_info, HSDPMeshInfo):
+                    spec_placements.append(Replicate())
+                spec_placements.append(self._spmd_placements[index])
+                skip = len(dp_dim_names.shard_names) - 1
+            elif name in replicate_names and isinstance(self.mesh_info, HSDPMeshInfo):
+                continue
+            else:
+                submeshes.append(self._spmd_mesh[name])
+                spec_placements.append(self._spmd_placements[index])
+        spec_mesh = DeviceMesh._concatenate(submeshes)
+        return DTensorSpec(spec_mesh, tuple(spec_placements), tensor_meta=tensor_meta)
+
+    def _init_sharding_spec_tp(
+        self, param: Any, fsdp_placement: Any, shard_dim: int
+    ) -> Any:
+        if self._unsharded_dtensor_spec is None:
+            raise AssertionError("distributed parameter metadata is missing")
+        dp_mesh = self.mesh_info.mesh
+        tp_mesh = self._unsharded_dtensor_spec.mesh
+        if dp_mesh is None or tp_mesh is None:
+            raise AssertionError("data-parallel and model-parallel meshes are required")
+        self._spmd_mesh = DeviceMesh._concatenate([dp_mesh, tp_mesh])
+        if len(self._unsharded_dtensor_spec.placements) > 2:
+            raise NotImplementedError(
+                "only one-dimensional model parallel placement or a two-dimensional "
+                f"model parallel placement is supported, got {self._unsharded_dtensor_spec.placements}"
             )
+        split_factor = self._unsharded_dtensor_spec.num_shards_map[shard_dim]
+        if not 2 <= int(self._spmd_mesh.ndim) <= 4:
+            raise AssertionError(
+                "the combined data-parallel/model-parallel mesh must have between "
+                f"2 and 4 dimensions, got {self._spmd_mesh.ndim}"
+            )
+        if isinstance(self.mesh_info, FSDPMeshInfo):
+            dp_shard_tp_placements = (
+                _StridedShard(shard_dim, split_factor=split_factor)
+                if split_factor > 1
+                else fsdp_placement,
+                *self._unsharded_dtensor_spec.placements,
+            )
+        else:
+            dp_shard_tp_placements = (
+                Replicate(),
+                *self._unsharded_dtensor_spec.placements,
+            )
+        if isinstance(self.mesh_info, HSDPMeshInfo):
+            if self.mesh_info.replicate_mesh_dim != 0:
+                raise AssertionError(
+                    "the HSDP replicate mesh dimension must be zero"
+                )
+            self._spmd_placements = (Replicate(),) + dp_shard_tp_placements
+        else:
+            self._spmd_placements = dp_shard_tp_placements
         self._sharding_spec = DTensorSpec(
             self._spmd_mesh,
             self._spmd_placements,
-            tensor_meta=tensor_meta,
+            tensor_meta=self._unsharded_dtensor_spec.tensor_meta,
         )
-        return param.to_local() if isinstance(param, DTensor) else param
+        return param.to_local()
 
-    _init_sharding_spec_spmd = _init_sharding_spec
-    _init_sharding_spec_tp = _init_sharding_spec
-    _init_sharding_spec_plain = _init_sharding_spec
-
-    def _build_spmd_sharding_spec(self, dp_dim_names: Any, dp_shard_indices: Any, fsdp_placement: Any) -> tuple[Any, ...]:
-        del dp_dim_names, dp_shard_indices
-        return (fsdp_placement,)
+    def _init_sharding_spec_plain(self, param: Any, fsdp_placement: Any) -> Any:
+        self._spmd_mesh = self.mesh_info.mesh
+        if isinstance(self.mesh_info, HSDPMeshInfo):
+            self._spmd_placements = (Replicate(), fsdp_placement)
+        elif isinstance(self.mesh_info, FSDPMeshInfo):
+            self._spmd_placements = (fsdp_placement,)
+        elif isinstance(self.mesh_info, DDPMeshInfo):
+            self._spmd_placements = (Replicate(),)
+        else:
+            raise TypeError(f"unsupported data-parallel mesh info {type(self.mesh_info)!r}")
+        self._sharding_spec = DTensorSpec(
+            self._spmd_mesh,
+            self._spmd_placements,
+            tensor_meta=TensorMeta(
+                tuple(param.shape), tuple(param.stride()), param.dtype
+            ),
+        )
+        return param
 
     def _init_sharded_post_forward_param_metadata(self, param: Any) -> None:
         if self.post_forward_mesh_info is None:
@@ -417,11 +747,20 @@ class FSDPParam:
             raise AssertionError(
                 "all-gather output release requires a post all-gather extension"
             )
+        self._release_all_gather_outputs_after_post_all_gather = False
         self._extensions = ExtensionsData()
         if callable(should_release):
             value = should_release()
             if not isinstance(value, bool):
                 raise AssertionError("all-gather output release flag must be boolean")
+            if (
+                value
+                and self.post_forward_mesh_info is not None
+                and self.post_forward_mesh_info != self.mesh_info
+            ):
+                raise NotImplementedError(
+                    "all-gather output release is unavailable for a different post-forward mesh"
+                )
             self._release_all_gather_outputs_after_post_all_gather = value
 
     def init_all_gather_outputs(self, all_gather_input_numels: Any, all_gather_input_dtypes: Any, world_size: int, device: Any) -> None:
@@ -436,7 +775,52 @@ class FSDPParam:
         self._all_gather_output = self.all_gather_outputs[0] if self.all_gather_outputs else None
 
     def init_unsharded_param(self) -> Any:
-        self.to_unsharded()
+        self._all_gather_outputs_ready = True
+        local = self._sharded_local_tensor()
+        post_all_gather = getattr(local, "fsdp_post_all_gather", None)
+        if callable(post_all_gather):
+            all_gather_outputs = self._unflatten_all_gather_outputs()
+            if all_gather_outputs is None:
+                raise RuntimeError("all-gather outputs are unavailable")
+            if self._unsharded_param is None:
+                result = post_all_gather(
+                    all_gather_outputs,
+                    self._extensions.metadata,
+                    self.param_dtype or self.orig_dtype,
+                )
+                if not isinstance(result, tuple) or len(result) != 2:
+                    raise ValueError(
+                        "fsdp_post_all_gather must return a tensor and inner tensors"
+                    )
+                unsharded_tensor, inner_tensors = result
+                self._unsharded_inner_tensors = list(inner_tensors or ())
+                self._set_unsharded_tensor(unsharded_tensor)
+                self._register_full_gradient_hook(self._unsharded_param)
+                self._state = ShardedState.UNSHARDED
+            else:
+                for tensor in self._unsharded_inner_tensors:
+                    alloc_storage(tensor)
+                post_all_gather(
+                    all_gather_outputs,
+                    self._extensions.metadata,
+                    self.param_dtype or self.orig_dtype,
+                    out=self._unsharded_param,
+                )
+            self._extensions.clear()
+            self._release_all_gather_outputs_if_needed()
+            return self._full_tensor
+        if len(self.all_gather_outputs) > 1:
+            raise ValueError("default all-gather requires one output tensor")
+        if self.all_gather_outputs:
+            gathered = self._attach_local_gradient_to_all_gather(
+                self.all_gather_outputs[0]
+            )
+            self._set_unsharded_tensor(gathered)
+            self._register_full_gradient_hook(self._unsharded_param)
+            self._state = ShardedState.UNSHARDED
+            self._release_all_gather_outputs_if_needed()
+        else:
+            self.to_unsharded()
         return self._full_tensor
 
     def _release_all_gather_outputs_if_needed(self) -> None:
@@ -492,10 +876,11 @@ class FSDPParam:
                 self._contiguous_orig_stride,
                 storage_offset=0,
             )
-        self._unsharded_param = tensor
-        self._full_tensor = tensor
-        self._setattr_on_modules(tensor)
-        return tensor
+        unsharded_param = Parameter(tensor, requires_grad=self.param_requires_grad)
+        self._unsharded_param = unsharded_param
+        self._full_tensor = unsharded_param
+        self._setattr_on_modules(unsharded_param)
+        return unsharded_param
 
     def _attach_local_gradient_to_all_gather(self, gathered: Any) -> Any:
         mesh_info = self._active_mesh_info()
@@ -505,24 +890,57 @@ class FSDPParam:
         count = int(mesh_info.mesh.size(mesh_dim))
         if count <= 1:
             return gathered
-        local = self._sharded_local_tensor().reshape(-1)
+        gathered = gathered.reshape(-1)
+        shard_dim = int(self._placement.dim)
         width = int(gathered.numel()) // count
+        padded_size = tuple(int(value) for value in self.padded_sharded_param_size)
+        if math.prod(padded_size) != width:
+            raise RuntimeError("all-gather slot does not match the padded shard")
+        local = self._sharded_local_tensor()
+        if getattr(local, "dtype", None) != getattr(gathered, "dtype", None):
+            local = local.to(dtype=gathered.dtype)
         if int(local.numel()) > width:
             raise RuntimeError("local shard is larger than the all-gather slot")
-        if int(local.numel()) < width:
-            padding = local.new_zeros(width - int(local.numel()))
-            local = tp.cat((local, padding), dim=0)
-        rank = int(mesh_info.mesh.get_local_rank(mesh_dim))
+        if shard_dim == 0:
+            local = local.reshape(-1)
+            if int(local.numel()) < width:
+                local = tp.cat((local, local.new_zeros(width - int(local.numel()))), dim=0)
+            pieces = [
+                gathered.narrow(0, index * width, width).detach()
+                for index in range(count)
+            ]
+            rank = int(mesh_info.mesh.get_local_rank(mesh_dim))
+            pieces[rank] = local
+            return tp.cat(tuple(pieces), dim=0)
+        local_shape = tuple(int(value) for value in local.shape)
+        if local_shape != padded_size:
+            if any(
+                left != right
+                for index, (left, right) in enumerate(zip(local_shape, padded_size))
+                if index != shard_dim
+            ) or local_shape[shard_dim] > padded_size[shard_dim]:
+                raise RuntimeError("local shard shape does not match the padded shard")
+            padding_shape = list(local_shape)
+            padding_shape[shard_dim] = padded_size[shard_dim] - local_shape[shard_dim]
+            local = tp.cat((local, local.new_zeros(tuple(padding_shape))), dim=shard_dim)
         pieces = [
-            gathered.narrow(0, index * width, width).detach()
+            gathered.narrow(0, index * width, width).detach().view(padded_size)
             for index in range(count)
         ]
+        rank = int(mesh_info.mesh.get_local_rank(mesh_dim))
         pieces[rank] = local
-        return tp.cat(tuple(pieces), dim=0)
+        return tp.cat(tuple(pieces), dim=shard_dim)
 
     def to_sharded(self) -> None:
         if self._state == ShardedState.SHARDED:
             self._setattr_on_modules(self.sharded_param)
+            return
+        if self._state == ShardedState.SHARDED_POST_FORWARD:
+            self._sharded_post_forward_tensor = None
+            self._sharded_post_forward_param_data = None
+            self._sharded_post_forward_param = None
+            self._setattr_on_modules(self.sharded_param)
+            self._state = ShardedState.SHARDED
             return
         full_tensor = (
             self._unsharded_param
@@ -606,13 +1024,8 @@ class FSDPParam:
                 candidate = gathered_outputs
                 if isinstance(candidate, tuple):
                     candidate = candidate[0]
-                if int(candidate.numel()) == math.prod(self._orig_size):
-                    gathered = tp.as_strided(
-                        candidate,
-                        self._orig_size,
-                        self._contiguous_orig_stride,
-                        storage_offset=0,
-                    )
+                if int(candidate.numel()) >= math.prod(self._orig_size):
+                    gathered = self._attach_local_gradient_to_all_gather(candidate)
         self._set_unsharded_tensor(gathered)
         self._register_full_gradient_hook(self._unsharded_param)
         if self._compute_dtype is not None and self._compute_dtype != getattr(
@@ -861,16 +1274,17 @@ class FSDPParam:
 
     def alloc_all_gather_outputs(self) -> None:
         for tensor in self.all_gather_outputs:
-            if tensor is None:
-                continue
-            self._all_gather_output = tensor
+            alloc_storage(tensor)
 
     def free_all_gather_outputs(self) -> None:
-        self.all_gather_outputs.clear()
-        self._all_gather_output = None
+        for tensor in self.all_gather_outputs:
+            free_storage(tensor)
         self._all_gather_outputs_ready = False
 
     def free_unsharded_param(self) -> None:
+        self.free_all_gather_outputs()
+        for tensor in self._unsharded_inner_tensors:
+            free_storage(tensor)
         if self._state == ShardedState.UNSHARDED:
             self._unsharded_param = None
             self._full_tensor = None
@@ -880,6 +1294,50 @@ class FSDPParam:
         self._assert_in_states(
             ShardedState.SHARDED, ShardedState.SHARDED_POST_FORWARD
         )
+        local = self._sharded_local_tensor()
+        pre_all_gather = getattr(local, "fsdp_pre_all_gather", None)
+        if self._state == ShardedState.SHARDED and callable(pre_all_gather):
+            parameter_count = len(inspect.signature(pre_all_gather).parameters)
+            if parameter_count not in (1, 5):
+                raise AssertionError(
+                    "fsdp_pre_all_gather accepts one or five arguments"
+                )
+            if parameter_count == 1:
+                result = pre_all_gather(self.shard_mesh())
+            else:
+                result = pre_all_gather(
+                    self.shard_mesh(),
+                    self._orig_size,
+                    self._contiguous_orig_stride,
+                    self.module_info.module,
+                    self.mp_policy,
+                )
+            if not isinstance(result, tuple) or len(result) != 2:
+                raise ValueError(
+                    "fsdp_pre_all_gather must return inputs and metadata"
+                )
+            inputs, metadata = result
+            inputs = list(inputs)
+            if not inputs:
+                raise ValueError("fsdp_pre_all_gather must return at least one input")
+            if parameter_count == 5:
+                padded = tuple(self.padded_sharded_param_size)
+                local_shape = tuple(local.shape)
+                if local_shape != padded and any(
+                    tuple(value.shape) != padded for value in inputs
+                ):
+                    raise ValueError(
+                        "fsdp_pre_all_gather must return padded shard-shaped inputs"
+                    )
+            self._extensions.metadata = metadata
+            self._extensions.all_gather_input_sizes = tuple(
+                tuple(value.shape) for value in inputs
+            )
+            return [value.reshape(-1) for value in inputs]
+        if self._state == ShardedState.SHARDED_POST_FORWARD and callable(pre_all_gather):
+            raise NotImplementedError(
+                "all-gather extensions are unavailable after forward reshard"
+            )
         if self._state == ShardedState.SHARDED_POST_FORWARD:
             value = self._sharded_post_forward_param_data
             if value is None:
@@ -890,6 +1348,11 @@ class FSDPParam:
             raise RuntimeError("all-gather input storage is unavailable")
         if self.param_dtype is not None and value.dtype != self.param_dtype:
             value = value.to(dtype=self.param_dtype)
+        if self.offload_to_cpu and getattr(value, "device", None) != self.device:
+            try:
+                value = value.to(self.device, non_blocking=True)
+            except TypeError:
+                value = value.to(self.device)
         return [value.reshape(-1)]
 
     def unsharded_param(self) -> Any:
@@ -912,7 +1375,36 @@ class FSDPParam:
         return tp.zeros_like(self.unsharded_param())
 
     def _get_grad_inner_tensor(self, grad: Any) -> Any:
-        return grad.to_local() if isinstance(grad, DTensor) else grad
+        if getattr(self, "is_spmd_types", False):
+            if self._unsharded_dtensor_spec is None:
+                raise AssertionError("distributed parameter metadata is missing")
+            grad = DTensor.from_local(
+                grad,
+                self._unsharded_dtensor_spec.mesh,
+                tuple(self._spmd_grad_placements),
+                run_check=False,
+            )
+            if not self.is_dtensor:
+                raise AssertionError(
+                    "type-check metadata must resolve to a distributed parameter"
+                )
+        if isinstance(grad, DTensor):
+            if self._unsharded_dtensor_spec is not None:
+                placements = self._unsharded_dtensor_spec.placements
+                if self.mesh_info.is_spmd_mesh:
+                    dp_indices = getattr(self, "_dp_dim_indices", frozenset())
+                    target_placements = tuple(
+                        grad.placements[index]
+                        if index in dp_indices
+                        else placements[index]
+                        for index in range(len(placements))
+                    )
+                else:
+                    target_placements = placements
+                if target_placements != grad.placements:
+                    grad = grad.redistribute(placements=target_placements)
+            return grad.to_local()
+        return grad
 
     def _unsharded_gradient(self) -> Any:
         if self._unsharded_grad is not None:
@@ -955,30 +1447,55 @@ class FSDPParam:
             raise RuntimeError(f"parameter state {self._state!r} is not one of {states!r}")
 
     def reset_sharded_param(self) -> None:
-        current = self.module_info.module._parameters.get(self.module_info.name)
-        if current is None:
+        module_info = self._module_info
+        new_param = module_info.module._parameters.get(module_info.param_name)
+        if new_param is None:
             return
-        if isinstance(current, DTensor):
-            local = current.to_local()
-        else:
-            local = current
+        if new_param is not self.sharded_param:
+            self.sharded_param = new_param
+        if self._state != ShardedState.SHARDED:
+            self._full_tensor = new_param
+            self._unsharded_param = new_param
+            self._state = ShardedState.UNSHARDED
+            return
+        local = new_param.to_local() if isinstance(new_param, DTensor) else new_param
+        if getattr(local, "is_meta", False):
+            return
+        same_local_tensor = False
+        old_data = getattr(self, "_sharded_param_data", None)
+        storage = getattr(old_data, "untyped_storage", None)
+        new_storage = getattr(local, "untyped_storage", None)
+        if callable(storage) and callable(new_storage):
+            try:
+                old_ptr = int(storage().data_ptr())
+                new_ptr = int(new_storage().data_ptr())
+                same_local_tensor = old_ptr > 0 and old_ptr == new_ptr
+            except (AttributeError, RuntimeError):
+                same_local_tensor = False
+        padded_size = tuple(self.padded_sharded_param_size)
+        shard_dim = int(self._placement.dim) if isinstance(self._placement, Shard) else 0
+        length = int(local.shape[shard_dim]) if int(local.numel()) else 0
+        updated_local_tensor = False
+        if tuple(local.shape) != padded_size and not same_local_tensor:
+            if shard_dim != 0:
+                raise AssertionError(
+                    f"shard dimension {shard_dim} requires even sharding: {local.shape=}"
+                )
+            padded = local.new_zeros(padded_size)
+            if length:
+                padded.narrow(shard_dim, 0, length).copy_(local)
+            local = padded
+            updated_local_tensor = True
+        if self.pin_memory and not getattr(local, "is_pinned", lambda: False)():
+            local = local.cpu().pin_memory()
+            updated_local_tensor = True
+        if not same_local_tensor:
+            self._sharded_param_data = local.reshape(-1)
+        if updated_local_tensor or self._sharded_tensor is None:
+            unpadded = local.narrow(shard_dim, 0, length) if length else local.narrow(shard_dim, 0, 0)
+            self._sharded_tensor = self.to_sharded_dtensor(unpadded)
         if self._state == ShardedState.SHARDED:
-            self.sharded_param = current
-            self._sharded_tensor = self.to_sharded_dtensor(local)
-            padded_size = getattr(self, "padded_sharded_param_size", None)
-            if padded_size is not None and tuple(local.shape) != tuple(padded_size):
-                shard_dim = int(self._placement.dim) if isinstance(self._placement, Shard) else 0
-                padded = local.new_zeros(tuple(padded_size))
-                length = int(local.shape[shard_dim]) if int(local.numel()) else 0
-                if length:
-                    padded.narrow(shard_dim, 0, length).copy_(local)
-                self._sharded_param_data = padded.reshape(-1)
-            else:
-                self._sharded_param_data = local.reshape(-1)
-            return
-        self._full_tensor = current
-        self._unsharded_param = current
-        self._state = ShardedState.UNSHARDED
+            self._setattr_on_modules(self.sharded_param)
 
     def _use_unsharded_tensor(self, tensor: Any) -> None:
         self._all_gather_outputs_ready = True
@@ -995,16 +1512,27 @@ class FSDPParam:
         return f"FSDPParam(fqn={self.module_info.fqn!r}, state={self._state!r})"
 
 
-def alloc_storage(tensor: Any) -> Any:
-    return tensor
+def alloc_storage(tensor: Any) -> None:
+    itemsize = getattr(tensor, "itemsize")
+    itemsize = itemsize() if callable(itemsize) else itemsize
+    size = int(tensor.numel()) * int(itemsize)
+    storage = tensor.untyped_storage()
+    if int(storage.size()) != size:
+        storage.resize_(size)
 
 
 def free_storage(tensor: Any) -> None:
-    del tensor
+    storage = tensor.untyped_storage()
+    if int(storage.size()) != 0:
+        storage.resize_(0)
 
 
 def unsafe_setattr_param(module: Any, param_name: str, param: Any) -> None:
-    module._parameters[param_name] = param
+    if getattr(module.__setattr__, "__func__", None) is Module.__setattr__:
+        module._buffers.pop(param_name, None)
+        module._parameters[param_name] = param
+    else:
+        setattr(module, param_name, param)
 
 
 def set_requires_grad_if_needed(src_tensor: Any, dst_tensor: Any) -> None:

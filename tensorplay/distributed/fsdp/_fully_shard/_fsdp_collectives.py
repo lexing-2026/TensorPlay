@@ -1,13 +1,16 @@
 """Collective adapters used by composable sharding."""
 
+import contextlib
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Sequence
 
 import tensorplay as tp
 
 from ... import distributed_core as dist
+from ... import _symmetric_memory as symm_mem
 from ._fsdp_api import AllGather, Comm, ReduceScatter
+from ._fsdp_param import ShardedState
 
 __all__ = [
     "AllGatherResult",
@@ -35,7 +38,11 @@ __all__ = [
 @dataclass
 class AllGatherResult:
     output: Any
+    event: Any = None
     work: Any = None
+    param_all_gather_input_dtypes: list[list[Any]] = field(default_factory=list)
+    param_all_gather_input_numels: list[list[int]] = field(default_factory=list)
+    all_gather_input_split_sizes: list[int] = field(default_factory=list)
 
     def wait(self) -> Any:
         if self.work is not None:
@@ -43,20 +50,91 @@ class AllGatherResult:
         return self.output
 
 
+def _stream_context(stream: Any) -> Any:
+    if stream is None:
+        return contextlib.nullcontext()
+    cuda = getattr(tp, "cuda", None)
+    stream_context = getattr(cuda, "stream", None)
+    return stream_context(stream) if callable(stream_context) else contextlib.nullcontext()
+
+
+def _record_event(stream: Any) -> Any:
+    record = getattr(stream, "record_event", None)
+    return record() if callable(record) else None
+
+
+def _current_stream(device: Any) -> Any:
+    device_type = str(getattr(device, "type", device)).split(":", 1)[0].lower()
+    cuda = getattr(tp, "cuda", None)
+    current_stream = getattr(cuda, "current_stream", None)
+    if device_type != "cuda" or not callable(current_stream):
+        return None
+    try:
+        return current_stream(device)
+    except (RuntimeError, TypeError):
+        return None
+
+
+def _wait_stream(dst: Any, src: Any) -> None:
+    wait = getattr(dst, "wait_stream", None)
+    if dst is not None and src is not None and dst != src and callable(wait):
+        wait(src)
+
+
+def _wait_event(event: Any, stream: Any = None) -> None:
+    if event is None:
+        return
+    if stream is not None:
+        wait = getattr(stream, "wait_event", None)
+        if callable(wait):
+            wait(event)
+            return
+    wait = getattr(event, "wait", None)
+    if callable(wait):
+        wait()
+
+
 class DefaultAllocMixin(Comm):
     def allocate(self, size: Sequence[int], *, dtype: Any, device: Any) -> Any:
         return tp.empty(tuple(size), dtype=dtype, device=device)
 
 
-class ProcessGroupAllocMixin(DefaultAllocMixin):
+class ProcessGroupAllocMixin:
     def __init__(self, group: Any = None) -> None:
         self.group = group
 
+    def allocate(self, size: Sequence[int], *, dtype: Any, device: Any) -> Any:
+        backend = None
+        getter = getattr(self.group, "_get_backend", None)
+        if callable(getter):
+            try:
+                backend = getter(device)
+            except (AttributeError, RuntimeError, TypeError):
+                backend = None
+        if backend is None and self.group is not None:
+            backend_name = str(getattr(self.group, "backend", "")).lower()
+            backend = getattr(self.group, f"{backend_name}_pg", None)
+        supports = getattr(backend, "supports_tensor_alloc", None)
+        allocate = getattr(backend, "allocate_tensor", None)
+        if callable(supports) and callable(allocate) and supports(device):
+            return allocate(math.prod(int(value) for value in size), dtype=dtype, device=device)
+        return tp.empty(tuple(size), dtype=dtype, device=device)
 
-class SymmMemAllocMixin(ProcessGroupAllocMixin):
+
+class SymmMemAllocMixin:
     def __init__(self, group: Any = None, backend: Any = None) -> None:
-        super().__init__(group)
+        self.group = group
         self.backend = backend
+        if backend is not None:
+            symm_mem.set_backend(backend)
+        if group is not None:
+            size = getattr(group, "size", None)
+            world_size = int(size() if callable(size) else size or 1)
+            if world_size > 1:
+                dist.barrier(group=group)
+
+    def allocate(self, size: Sequence[int], *, dtype: Any, device: Any) -> Any:
+        return symm_mem.empty(tuple(size), dtype=dtype, device=device)
 
 
 class DefaultAllGather(DefaultAllocMixin, AllGather):
@@ -69,14 +147,32 @@ class DefaultAllGather(DefaultAllocMixin, AllGather):
         )
 
 
-class ProcessGroupAllocAllGather(DefaultAllGather, ProcessGroupAllocMixin):
+class ProcessGroupAllocAllGather(ProcessGroupAllocMixin, AllGather):
     def __init__(self, group: Any = None) -> None:
         ProcessGroupAllocMixin.__init__(self, group)
 
+    def __call__(self, output_tensor: Any, input_tensor: Any, group: Any, async_op: bool = False) -> Any:
+        return dist.all_gather_single(
+            output_tensor,
+            input_tensor,
+            group=group,
+            async_op=async_op,
+        )
 
-class SymmMemAllGather(ProcessGroupAllocAllGather, SymmMemAllocMixin):
+
+class SymmMemAllGather(SymmMemAllocMixin, AllGather):
     def __init__(self, group: Any = None, backend: Any = None) -> None:
         SymmMemAllocMixin.__init__(self, group, backend)
+
+    def __call__(self, output_tensor: Any, input_tensor: Any, group: Any, async_op: bool = False) -> Any:
+        if group is not None:
+            symm_mem.rendezvous(output_tensor, group)
+        return dist.all_gather_single(
+            output_tensor,
+            input_tensor,
+            group=group,
+            async_op=async_op,
+        )
 
 
 class DefaultReduceScatter(DefaultAllocMixin, ReduceScatter):
@@ -90,14 +186,35 @@ class DefaultReduceScatter(DefaultAllocMixin, ReduceScatter):
         )
 
 
-class ProcessGroupAllocReduceScatter(DefaultReduceScatter, ProcessGroupAllocMixin):
+class ProcessGroupAllocReduceScatter(ProcessGroupAllocMixin, ReduceScatter):
     def __init__(self, group: Any = None) -> None:
         ProcessGroupAllocMixin.__init__(self, group)
 
+    def __call__(self, output_tensor: Any, input_tensor: Any, group: Any, op: Any, async_op: bool = False) -> Any:
+        return dist.reduce_scatter_single(
+            output_tensor,
+            input_tensor,
+            op=op,
+            group=group,
+            async_op=async_op,
+        )
 
-class SymmMemReduceScatter(ProcessGroupAllocReduceScatter, SymmMemAllocMixin):
+
+class SymmMemReduceScatter(SymmMemAllocMixin, ReduceScatter):
     def __init__(self, group: Any = None, backend: Any = None) -> None:
         SymmMemAllocMixin.__init__(self, group, backend)
+
+    def __call__(self, output_tensor: Any, input_tensor: Any, group: Any, op: Any, async_op: bool = False) -> Any:
+        if group is not None:
+            symm_mem.rendezvous(input_tensor, group)
+            symm_mem.rendezvous(output_tensor, group)
+        return dist.reduce_scatter_single(
+            output_tensor,
+            input_tensor,
+            op=op,
+            group=group,
+            async_op=async_op,
+        )
 
 
 def all_gather_copy_in_meta(all_gather_inputs: Sequence[Any], all_gather_output: Any, inp_split_sizes: Sequence[int], all_gather_input_numel: int, rank: int) -> Any:
@@ -175,33 +292,173 @@ def chunk_cat(tensors: Sequence[Any], dim: int, num_chunks: int, out: Any = None
 
 
 def _get_param_all_gather_inputs(fsdp_params: Sequence[Any]) -> list[Any]:
-    return [param.all_gather_inputs for param in fsdp_params]
-
-
-def foreach_all_gather(fsdp_params: Sequence[Any], group: Any, async_op: bool, all_gather_copy_in_stream: Any, all_gather_stream: Any, device: Any, all_gather_comm: AllGather | None = None) -> list[AllGatherResult]:
-    del all_gather_copy_in_stream, all_gather_stream, device
-    comm = all_gather_comm or DefaultAllGather()
-    results = []
-    for param in fsdp_params:
-        inputs = tuple(param.all_gather_inputs)
-        if not inputs:
-            raise ValueError("each sharded parameter needs an all-gather input")
-        local = inputs[0] if len(inputs) == 1 else tp.cat(
-            tuple(value.reshape(-1) for value in inputs), dim=0
+    def use_foreach_copy(param: Any) -> bool:
+        local = param._sharded_local_tensor()
+        return bool(
+            getattr(param, "param_dtype", None) is not None
+            and not getattr(param, "offload_to_cpu", False)
+            and not callable(getattr(local, "fsdp_pre_all_gather", None))
         )
-        width = int(local.numel()) * dist.get_world_size(group)
-        output = local.new_empty(width)
-        work = comm(output, local.reshape(-1), group, async_op)
-        results.append(AllGatherResult(output, work))
-    return results
+
+    param_all_gather_inputs: list[list[Any]] = [[] for _ in fsdp_params]
+    foreach_copy_indices: list[int] = []
+    foreach_copy_inputs: list[Any] = []
+    foreach_copy_input_numels: list[int] = []
+
+    for index, param in enumerate(fsdp_params):
+        if use_foreach_copy(param):
+            foreach_copy_indices.append(index)
+            if param.sharded_state == ShardedState.SHARDED:
+                value = param._sharded_param_data
+            else:
+                value = param._sharded_post_forward_param_data
+            if value is None:
+                raise RuntimeError("all-gather input storage is unavailable")
+            foreach_copy_inputs.append(value)
+            foreach_copy_input_numels.append(int(value.numel()))
+        else:
+            param_all_gather_inputs[index] = param.all_gather_inputs
+
+    if foreach_copy_inputs:
+        first = fsdp_params[foreach_copy_indices[0]]
+        flat = tp.empty(
+            (sum(foreach_copy_input_numels),),
+            device=first.device,
+            dtype=first.param_dtype,
+        )
+        splits = flat.split(tuple(foreach_copy_input_numels))
+        tp._foreach_copy_(splits, foreach_copy_inputs)
+        for index, split in zip(foreach_copy_indices, splits):
+            param_all_gather_inputs[index] = [split]
+
+    return param_all_gather_inputs
 
 
-def foreach_all_gather_copy_out(all_gather_result: Sequence[AllGatherResult], fsdp_params: Sequence[Any], group: Any) -> None:
-    del group
-    for result, param in zip(all_gather_result, fsdp_params):
-        gathered = result.wait()
-        gathered = param._attach_local_gradient_to_all_gather(gathered)
-        param._use_unsharded_tensor(gathered)
+def foreach_all_gather(fsdp_params: Sequence[Any], group: Any, async_op: bool, all_gather_copy_in_stream: Any, all_gather_stream: Any, device: Any, all_gather_comm: AllGather | None = None) -> AllGatherResult:
+    comm = all_gather_comm or DefaultAllGather()
+    current_stream = _current_stream(device)
+    copy_stream = all_gather_copy_in_stream or current_stream
+    comm_stream = all_gather_stream or copy_stream
+    with _stream_context(copy_stream):
+        param_all_gather_inputs = _get_param_all_gather_inputs(fsdp_params)
+        (
+            param_all_gather_input_dtypes,
+            param_all_gather_input_numels,
+            dtype,
+        ) = _get_all_gather_input_metadatas(param_all_gather_inputs)
+        if dtype == getattr(tp, "uint8", "uint8"):
+            all_gather_inputs = [
+                value.view(getattr(tp, "uint8", "uint8"))
+                for inputs in param_all_gather_inputs
+                for value in inputs
+            ]
+        else:
+            all_gather_inputs = [
+                value for inputs in param_all_gather_inputs for value in inputs
+            ]
+        inp_split_sizes = [int(value.numel()) for value in all_gather_inputs]
+        all_gather_input_numel = sum(inp_split_sizes)
+        world_size = dist.get_world_size(group)
+        rank = dist.get_rank(group)
+        output = comm.allocate(
+            (all_gather_input_numel * world_size,),
+            dtype=dtype,
+            device=device,
+        )
+        all_gather_input, output = all_gather_copy_in_cuda(
+            all_gather_inputs,
+            output,
+            inp_split_sizes,
+            all_gather_input_numel,
+            rank,
+        )
+    _wait_stream(comm_stream, copy_stream)
+    with _stream_context(comm_stream):
+        work = comm(
+            output_tensor=output,
+            input_tensor=all_gather_input,
+            group=group,
+            async_op=async_op,
+        )
+        event = _record_event(comm_stream)
+    return AllGatherResult(
+        output,
+        event,
+        work,
+        param_all_gather_input_dtypes,
+        param_all_gather_input_numels,
+        inp_split_sizes,
+    )
+
+
+def foreach_all_gather_copy_out(all_gather_result: AllGatherResult, fsdp_params: Sequence[Any], group: Any) -> None:
+    _wait_event(all_gather_result.event, _current_stream(all_gather_result.output.device))
+    all_gather_result.wait()
+    world_size = dist.get_world_size(group)
+    output = all_gather_result.output
+    input_sizes = all_gather_result.all_gather_input_split_sizes
+    if not input_sizes:
+        raise ValueError("all-gather result is missing input split sizes")
+    if len(all_gather_result.param_all_gather_input_numels) != len(fsdp_params):
+        raise ValueError("all-gather metadata does not match the parameter list")
+    if len(all_gather_result.param_all_gather_input_dtypes) != len(fsdp_params):
+        raise ValueError("all-gather dtype metadata does not match the parameter list")
+    all_gather_outputs: list[Any] = []
+    shard_i_copy_infos: list[tuple[Any, list[Any]]] = []
+    for input_numels, input_dtypes, param in zip(
+        all_gather_result.param_all_gather_input_numels,
+        all_gather_result.param_all_gather_input_dtypes,
+        fsdp_params,
+    ):
+        param.init_all_gather_outputs(input_numels, input_dtypes, world_size, output.device)
+        param.alloc_all_gather_outputs()
+        param_outputs = param.all_gather_outputs
+        placement = getattr(param, "fsdp_placement", getattr(param, "_placement", None))
+        if int(getattr(placement, "dim", 0)) != 0:
+            param_outputs = [tp.empty_like(tensor) for tensor in param_outputs]
+            shard_i_copy_infos.append((param, param_outputs))
+        all_gather_outputs.extend(param_outputs)
+    output_rows = output.view(world_size, -1)
+    offset = 0
+    output_dtype = getattr(tp, "uint8", "uint8")
+    for target in all_gather_outputs:
+        target_view = target
+        if output.dtype == output_dtype:
+            target_view = target.view(output_dtype)
+        width = int(target_view.numel()) // world_size
+        end = offset + width
+        if end > int(output_rows.shape[1]):
+            raise ValueError("all-gather output is smaller than the parameter outputs")
+        target_view.view(world_size, -1).copy_(output_rows[:, offset:end])
+        offset = end
+    if offset != int(output_rows.shape[1]):
+        raise ValueError("all-gather output has unused elements")
+    for param, param_outputs in shard_i_copy_infos:
+        placement = getattr(param, "fsdp_placement", getattr(param, "_placement", None))
+        shard_dim = int(getattr(placement, "dim", 0))
+        padded_size = tuple(
+            int(size) for size in getattr(param, "padded_sharded_param_size", ())
+        )
+        sharded_state = getattr(param, "sharded_state", getattr(param, "_state", None))
+        if getattr(sharded_state, "name", sharded_state) == "SHARDED_POST_FORWARD":
+            post_data = getattr(param, "_sharded_post_forward_param_data", None)
+            post_shape = getattr(param, "_post_forward_shape", None)
+            if post_data is not None and post_shape is not None:
+                padded_size = list(int(size) for size in post_shape)
+                other_numel = math.prod(
+                    size for index, size in enumerate(padded_size) if index != shard_dim
+                )
+                padded_size[shard_dim] = int(post_data.numel()) // max(other_numel, 1)
+                padded_size = tuple(padded_size)
+        if not padded_size:
+            raise ValueError("all-gather parameter shape metadata is missing")
+        pre_size = list(padded_size)
+        pre_size[0] *= world_size
+        post_size = list(padded_size)
+        post_size[shard_dim] *= world_size
+        for source, target in zip(param_outputs, param.all_gather_outputs):
+            chunks = source.view(tuple(pre_size)).chunk(world_size, dim=0)
+            target.view(tuple(post_size)).copy_(tp.cat(tuple(chunks), dim=shard_dim))
 
 
 def foreach_reduce(
@@ -220,8 +477,9 @@ def foreach_reduce(
     partial_reduce_output: Any,
     all_reduce_hook: Any,
     force_sum_reduction_for_comms: bool,
+    comm_hook: Any = None,
+    comm_hook_state: Any = None,
 ) -> tuple[Any, Any, Any, Any, Any, Any, Any]:
-    del reduce_scatter_stream, device, all_reduce_stream
     if len(fsdp_params) != len(unsharded_grads):
         raise ValueError("parameter and gradient lists must have the same length")
     if not fsdp_params:
@@ -244,7 +502,7 @@ def foreach_reduce(
             reduce_scatter_group,
             all_reduce_group,
             reduce_dtype,
-            getattr(getattr(device, "type", None), "lower", lambda: str(device).lower())(),
+            str(getattr(device, "type", device)).split(":", 1)[0].lower(),
             gradient_divide_factor,
             force_sum_reduction_for_comms,
         )
@@ -283,9 +541,7 @@ def foreach_reduce(
         padded_sizes.append(tuple(int(size) for size in value.shape))
         prepared_grads.append(value)
 
-    reduce_scatter_input_numel = sum(
-        math.prod(size) for size in padded_sizes
-    )
+    reduce_scatter_input_numel = sum(math.prod(size) for size in padded_sizes)
     if reduce_scatter_input_numel % world_size:
         raise RuntimeError("reduce-scatter input size must divide by world size")
     comm = reduce_scatter_comm or DefaultReduceScatter()
@@ -296,75 +552,126 @@ def foreach_reduce(
         prepared_grads, reduce_scatter_input, world_size
     )
     unsharded_grads.clear()
-    reduce_scatter_input = _div_if_needed(
-        reduce_scatter_input, predivide_factor
-    )
-    reduce_scatter_output_numel = reduce_scatter_input_numel // world_size
-    reduce_output = comm.allocate(
-        (reduce_scatter_output_numel,), dtype=reduce_dtype, device=device
-    )
-    if world_size > 1:
-        comm(
-            reduce_output,
-            reduce_scatter_input,
-            reduce_scatter_group,
-            reduce_scatter_op,
-            False,
+
+    current_stream = _current_stream(device)
+    _wait_stream(reduce_scatter_stream, current_stream)
+    with _stream_context(reduce_scatter_stream):
+        reduce_scatter_input = _div_if_needed(
+            reduce_scatter_input, predivide_factor
         )
-    else:
-        reduce_output.copy_(reduce_scatter_input)
+        reduce_scatter_output_numel = reduce_scatter_input_numel // world_size
+        reduce_output = comm.allocate(
+            (reduce_scatter_output_numel,), dtype=reduce_dtype, device=device
+        )
+        if comm_hook is not None:
+            comm_hook(comm_hook_state, reduce_scatter_input, reduce_output)
+        elif world_size > 1:
+            comm(
+                reduce_output,
+                reduce_scatter_input,
+                reduce_scatter_group,
+                reduce_scatter_op,
+                False,
+            )
+        else:
+            reduce_output.copy_(reduce_scatter_input)
+        reduce_scatter_event = _record_event(reduce_scatter_stream)
 
     all_reduce_input = None
     all_reduce_event = None
-    all_reduce_world_size = (
-        dist.get_world_size(all_reduce_group)
-        if all_reduce_group is not None
-        else 1
-    )
-    if all_reduce_group is not None and all_reduce_world_size > 1:
-        if all_reduce_grads:
+    post_reduce_stream = reduce_scatter_stream
+    if all_reduce_group is not None and comm_hook is None:
+        if not all_reduce_grads:
+            with _stream_context(reduce_scatter_stream):
+                if partial_reduce_output is not None:
+                    partial_reduce_output += reduce_output
+                else:
+                    partial_reduce_output = reduce_output
+                post_reduce_event = _record_event(reduce_scatter_stream)
+            return (
+                reduce_scatter_input,
+                reduce_scatter_event,
+                reduce_scatter_stream,
+                post_reduce_event,
+                all_reduce_input,
+                all_reduce_event,
+                partial_reduce_output,
+            )
+        with _stream_context(reduce_scatter_stream):
+            if partial_reduce_output is not None:
+                reduce_output += partial_reduce_output
+        all_reduce_stream = all_reduce_stream or reduce_scatter_stream
+        _wait_stream(all_reduce_stream, reduce_scatter_stream or current_stream)
+        with _stream_context(all_reduce_stream):
             dist.all_reduce(
-                reduce_output, op=all_reduce_op, group=all_reduce_group, async_op=False
+                reduce_output,
+                op=all_reduce_op,
+                group=all_reduce_group,
+                async_op=False,
             )
             all_reduce_input = reduce_output
-        elif partial_reduce_output is not None:
-            reduce_output = partial_reduce_output + reduce_output
-        elif not all_reduce_grads:
-            partial_reduce_output = reduce_output
+            all_reduce_event = _record_event(all_reduce_stream)
+        post_reduce_stream = all_reduce_stream
 
     if all_reduce_hook is not None:
-        all_reduce_hook(reduce_output)
-    reduce_output = _div_if_needed(reduce_output, postdivide_factor)
-    if orig_dtype is not None and reduce_output.dtype != orig_dtype:
-        reduce_output = reduce_output.to(dtype=orig_dtype)
+        hook_stream = all_reduce_stream or post_reduce_stream
+        _wait_stream(hook_stream, reduce_scatter_stream or current_stream)
+        with _stream_context(hook_stream):
+            all_reduce_hook(reduce_output)
+        post_reduce_stream = hook_stream
 
-    flat_grad_offset = 0
-    for padded_size, fsdp_param in zip(padded_sizes, fsdp_params):
-        sharded_size = tuple(int(size) for size in fsdp_param.sharded_size)
-        new_sharded_grad = tp.as_strided(
-            reduce_output,
-            sharded_size,
-            tuple(int(stride) for stride in fsdp_param.contiguous_sharded_stride),
-            storage_offset=flat_grad_offset,
-        )
-        if getattr(fsdp_param, "offload_to_cpu", False):
-            new_sharded_grad = new_sharded_grad.to("cpu")
-        old_grad = getattr(fsdp_param, "_sharded_grad", None)
-        if old_grad is not None:
-            new_sharded_grad = old_grad + new_sharded_grad
-        fsdp_param._set_sharded_grad(new_sharded_grad)
-        flat_grad_offset += math.prod(padded_size) // world_size
+    with _stream_context(post_reduce_stream):
+        reduce_output = _div_if_needed(reduce_output, postdivide_factor)
+        if orig_dtype is not None and reduce_output.dtype != orig_dtype:
+            reduce_output = reduce_output.to(dtype=orig_dtype)
+
+        flat_grad_offset = 0
+        for padded_size, fsdp_param in zip(padded_sizes, fsdp_params):
+            sharded_size = tuple(int(size) for size in fsdp_param.sharded_size)
+            new_sharded_grad = tp.as_strided(
+                reduce_output,
+                sharded_size,
+                tuple(
+                    int(stride) for stride in fsdp_param.contiguous_sharded_stride
+                ),
+                storage_offset=flat_grad_offset,
+            )
+            if getattr(fsdp_param, "offload_to_cpu", False):
+                old_grad = getattr(fsdp_param, "_sharded_grad", None)
+                has_post_accumulate_grad_hook = bool(
+                    getattr(
+                        fsdp_param._sharded_local_tensor(),
+                        "_post_accumulate_grad_hooks",
+                        None,
+                    )
+                )
+                non_blocking = bool(
+                    getattr(fsdp_param, "pin_memory", False)
+                    and old_grad is None
+                    and not has_post_accumulate_grad_hook
+                )
+                new_sharded_grad = new_sharded_grad.to(
+                    "cpu", non_blocking=non_blocking
+                )
+                if non_blocking:
+                    fsdp_param.grad_offload_event = _record_event(post_reduce_stream)
+            else:
+                old_grad = getattr(fsdp_param, "_sharded_grad", None)
+            if old_grad is not None:
+                new_sharded_grad = old_grad + new_sharded_grad
+            fsdp_param._set_sharded_grad(new_sharded_grad)
+            flat_grad_offset += math.prod(padded_size) // world_size
+        post_reduce_event = _record_event(post_reduce_stream)
 
     return (
         reduce_scatter_input,
-        None,
-        None,
-        None,
+        reduce_scatter_event,
+        post_reduce_stream,
+        post_reduce_event,
         all_reduce_input,
         all_reduce_event,
         partial_reduce_output,
     )
-
 
 def foreach_reduce_scatter_copy_in(unsharded_grads: Sequence[Any], reduce_scatter_input: Any, world_size: int) -> Any:
     world_size = int(world_size)
@@ -441,4 +748,10 @@ def _get_gradient_divide_factors(reduce_scatter_group: Any, all_reduce_group: An
 
 
 def _div_if_needed(tensor: Any, div_factor: float | None) -> Any:
-    return tensor if div_factor in (None, 1) else tensor / div_factor
+    if div_factor in (None, 1):
+        return tensor
+    divide = getattr(tensor, "div_", None)
+    if callable(divide):
+        divide(div_factor)
+        return tensor
+    return tensor / div_factor
