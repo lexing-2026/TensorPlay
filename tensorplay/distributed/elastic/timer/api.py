@@ -5,37 +5,94 @@ Workers hold a :class:`TimerClient` to register scope deadlines; a
 interrupts workers that overstay them.
 """
 import abc
+import logging
 import threading
+import time
 from contextlib import contextmanager
-from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
+from inspect import getframeinfo, stack
+from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
-@dataclass
 class TimerRequest:
-    """One deadline registration: ``scope`` must finish before ``expire_time``."""
+    """One deadline registration and its compatibility aliases."""
 
-    scope: str
-    expire_time: datetime
+    __slots__ = ["worker_id", "scope_id", "expiration_time"]
+
+    def __init__(
+        self,
+        *args,
+        worker_id: Any = None,
+        scope_id: str | None = None,
+        expiration_time: float | datetime | None = None,
+        scope: str | None = None,
+        expire_time: float | datetime | None = None,
+    ) -> None:
+        if len(args) >= 3:
+            worker_id, scope_id, expiration_time = args[:3]
+        elif len(args) == 2:
+            scope, expire_time = args
+        elif len(args) == 1:
+            raise TypeError("TimerRequest requires a scope and expiration")
+        scope_id = scope_id if scope_id is not None else scope
+        expiration_time = (
+            expiration_time if expiration_time is not None else expire_time
+        )
+        if scope_id is None or expiration_time is None:
+            raise TypeError("TimerRequest requires a scope and expiration")
+        self.worker_id = worker_id
+        self.scope_id = str(scope_id)
+        self.expiration_time = (
+            expiration_time.timestamp()
+            if isinstance(expiration_time, datetime)
+            else expiration_time
+        )
+
+    @property
+    def scope(self) -> str:
+        return self.scope_id
+
+    @property
+    def expire_time(self) -> datetime:
+        return datetime.fromtimestamp(float(self.expiration_time))
+
+    def __eq__(self, other) -> bool:
+        return (
+            isinstance(other, TimerRequest)
+            and self.worker_id == other.worker_id
+            and self.scope_id == other.scope_id
+            and self.expiration_time == other.expiration_time
+        )
 
     def __repr__(self) -> str:
-        return f"TimerRequest(scope={self.scope!r}, expire_time={self.expire_time.isoformat()!r})"
+        return (
+            f"TimerRequest(worker_id={self.worker_id!r}, "
+            f"scope_id={self.scope_id!r}, expiration_time={self.expiration_time!r})"
+        )
 
 
 class TimerClient(abc.ABC):
     """Client side of the timer contract."""
 
     @abc.abstractmethod
+    def acquire(self, scope_id: str, expiration_time: float) -> None:
+        ...
+
+    @abc.abstractmethod
+    def release(self, scope_id: str) -> None:
+        ...
+
     def start_timer(self, request: TimerRequest) -> None:
-        ...
+        self.acquire(request.scope_id, float(request.expiration_time))
 
-    @abc.abstractmethod
     def acquire_scope(self, scope: str, expiration_time: datetime) -> None:
-        ...
+        value = expiration_time.timestamp() if isinstance(expiration_time, datetime) else expiration_time
+        self.acquire(scope, float(value))
 
-    @abc.abstractmethod
     def cancel_scope(self, scope: str) -> None:
-        ...
+        self.release(scope)
 
 
 class RequestQueue(abc.ABC):
@@ -46,7 +103,7 @@ class RequestQueue(abc.ABC):
         ...
 
     @abc.abstractmethod
-    def get(self) -> TimerRequest | None:
+    def get(self, size: int = 1, timeout: float = 0):
         ...
 
     @abc.abstractmethod
@@ -55,81 +112,79 @@ class RequestQueue(abc.ABC):
 
 
 class TimerServer(abc.ABC):
-    """Watches outstanding deadlines and reacts when they expire.
-
-    Subclasses implement :meth:`_handle_timer` and :meth:`_process_waiting_timers`
-    semantics; the watchdog loop calls them periodically.
-    """
+    """Watches outstanding deadlines and reacts when they expire."""
 
     def __init__(self, request_queue: RequestQueue, max_interval: float, daemon: bool = True) -> None:
         self._request_queue = request_queue
         self._max_interval = max_interval
         self._daemon = daemon
         self._watchdog_thread: threading.Thread | None = None
-        self._stop = threading.Event()
-        self._timers: dict[str, TimerRequest] = {}
-        self._reaped_scopes: dict[str, TimerRequest] = {}
-        self._lock = threading.Lock()
+        self._stop_signaled = False
 
-    def is_running(self) -> bool:
-        """Whether the watchdog loop is alive."""
-        return self._watchdog_thread is not None and self._watchdog_thread.is_alive()
+    @abc.abstractmethod
+    def register_timers(self, timer_requests: list[TimerRequest]) -> None:
+        ...
+
+    @abc.abstractmethod
+    def clear_timers(self, worker_ids: set[Any]) -> None:
+        ...
+
+    @abc.abstractmethod
+    def get_expired_timers(self, deadline: float) -> dict[Any, list[TimerRequest]]:
+        ...
+
+    @abc.abstractmethod
+    def _reap_worker(self, worker_id: Any) -> bool:
+        ...
+
+    def _reap_worker_no_throw(self, worker_id: Any) -> bool:
+        try:
+            return self._reap_worker(worker_id)
+        except Exception:
+            logger.exception("Uncaught exception while reaping worker %s", worker_id)
+            return True
+
+    def _get_scopes(self, timer_requests):
+        return [request.scope_id for request in timer_requests]
+
+    def _run_watchdog(self) -> None:
+        batch_size = max(1, self._request_queue.size())
+        requests = self._request_queue.get(batch_size, self._max_interval)
+        if requests is None:
+            requests = []
+        if isinstance(requests, TimerRequest):
+            requests = [requests]
+        self.register_timers(requests)
+        reaped = set()
+        for worker_id in self.get_expired_timers(time.time()):
+            if self._reap_worker_no_throw(worker_id):
+                reaped.add(worker_id)
+        self.clear_timers(reaped)
+
+    def _watchdog_loop(self) -> None:
+        while not self._stop_signaled:
+            try:
+                self._run_watchdog()
+            except Exception:
+                logger.exception("Error running timer watchdog")
 
     def start(self) -> None:
-        """Start the watchdog loop once."""
-        if self.is_running():
+        if self._watchdog_thread is not None and self._watchdog_thread.is_alive():
             return
-        self._stop.clear()
-        self._watchdog_thread = threading.Thread(target=self._watchdog, daemon=self._daemon)
+        self._stop_signaled = False
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog_loop, daemon=self._daemon
+        )
         self._watchdog_thread.start()
 
     def stop(self) -> None:
-        """Stop the watchdog loop and join it."""
-        self._stop.set()
+        self._stop_signaled = True
         if self._watchdog_thread is not None:
             self._watchdog_thread.join(timeout=self._max_interval * 2)
             self._watchdog_thread = None
 
-    @abc.abstractmethod
-    def _handle_timer(self, request: TimerRequest) -> bool:
-        """React to an expired timer; return True once fully processed."""
-        ...
-
-    @abc.abstractmethod
-    def _process_waiting_timers(self) -> None:
-        """Poll the queue for new registrations."""
-        ...
-
-    def _watchdog(self) -> None:
-        while not self._stop.is_set():
-            try:
-                self._process_waiting_timers()
-                now = datetime.now()
-                with self._lock:
-                    expired = [
-                        (scope, req)
-                        for scope, req in list(self._timers.items())
-                        if req.expire_time <= now
-                    ]
-                    for scope, req in expired:
-                        del self._timers[scope]
-                        self._reaped_scopes[scope] = req
-                for scope, req in expired:
-                    self._handle_timer(req)
-                with self._lock:
-                    for scope, req in list(self._reaped_scopes.items()):
-                        if self._handle_timer(req):
-                            del self._reaped_scopes[scope]
-                        else:
-                            self._timers[scope] = req
-            except Exception:  # pragma: no cover - watchdog must not die
-                pass
-            self._stop.wait(self._max_interval)
-
-    def register_timer(self, request: TimerRequest) -> None:
-        """Add or replace a deadline."""
-        with self._lock:
-            self._timers[request.scope] = request
+    def is_running(self) -> bool:
+        return self._watchdog_thread is not None and self._watchdog_thread.is_alive()
 
 
 _default_timer_client: TimerClient | None = None
@@ -141,6 +196,7 @@ def configure(timer_client: TimerClient) -> None:
     _default_timer_client = timer_client
 
 
+@contextmanager
 def expires(
     after: float,
     scope: str | None = None,
@@ -153,16 +209,14 @@ def expires(
     reacts (typically by raising ``SignalException`` in the worker).
     """
     client = client or _default_timer_client
-
-    @contextmanager
-    def _expires():
-        actual_scope = scope or f"expires@{id(_expires)}"
-        if client is not None:
-            client.acquire_scope(actual_scope, datetime.now() + timedelta(seconds=after))
-        try:
-            yield
-        finally:
-            if client is not None:
-                client.cancel_scope(actual_scope)
-
-    return _expires()
+    if client is None:
+        raise RuntimeError("Configure timer client before using countdown timers.")
+    if scope is None:
+        caller = getframeinfo(stack()[1][0])
+        scope = f"{caller.filename}#{caller.lineno}"
+    expiration = time.time() + after
+    client.acquire(scope, expiration)
+    try:
+        yield
+    finally:
+        client.release(scope)

@@ -40,8 +40,17 @@ class macros:
     ]
 
     @classmethod
-    def substitute(cls, args: list[str]) -> list[str]:
+    def substitute(cls, args: list[str], local_rank: str | None = None) -> list[str]:
         """Replace ``${field}`` tokens in ``args``; unknown tokens are kept."""
+        if local_rank is not None:
+            from string import Template
+
+            return [
+                Template(value).safe_substitute(local_rank=local_rank)
+                if isinstance(value, str)
+                else value
+                for value in args
+            ]
         if not any("${" in str(arg) for arg in args):
             return args
         import re

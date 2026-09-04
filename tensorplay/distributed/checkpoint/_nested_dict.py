@@ -3,6 +3,10 @@ from __future__ import annotations
 from collections.abc import Mapping, MutableMapping
 from typing import Any
 
+from ._traverse import traverse_state_dict
+
+FLATTEN_MAPPING = dict[str, tuple[Any, ...]]
+
 __all__ = ["flatten_state_dict", "unflatten_state_dict"]
 
 
@@ -10,22 +14,14 @@ def flatten_state_dict(state_dict: Mapping[str, Any]) -> tuple[dict[str, Any], d
     flat: dict[str, Any] = {}
     mapping: dict[str, tuple[Any, ...]] = {}
 
-    def visit(value: Any, path: tuple[Any, ...]) -> None:
-        if isinstance(value, Mapping):
-            for key, child in value.items():
-                visit(child, path + (key,))
-            return
-        if isinstance(value, (list, tuple)):
-            for index, child in enumerate(value):
-                visit(child, path + (index,))
-            return
+    def flat_copy(path: tuple[Any, ...], value: Any) -> None:
         key = ".".join(str(part) for part in path)
         if key in flat:
             raise ValueError(f"duplicated flattened key {key}")
         flat[key] = value
         mapping[key] = path
 
-    visit(state_dict, ())
+    traverse_state_dict(state_dict, flat_copy)
     return flat, mapping
 
 
@@ -61,13 +57,13 @@ def _set_element(root: MutableMapping[Any, Any], path: tuple[Any, ...], value: A
 
 def unflatten_state_dict(
     state_dict: Mapping[str, Any],
-    mappings: Mapping[str, tuple[Any, ...]] | None = None,
+    mapping: Mapping[str, tuple[Any, ...]] | None = None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for flat_key, value in state_dict.items():
         path = (
-            tuple(mappings[flat_key])
-            if mappings is not None and flat_key in mappings
+            tuple(mapping[flat_key])
+            if mapping is not None and flat_key in mapping
             else tuple(flat_key.split("."))
         )
         _set_element(result, path, value)

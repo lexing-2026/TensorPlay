@@ -49,6 +49,14 @@ def get_all(
     return [store.get(key) for key in keys]
 
 
+def _barrier_nonblocking(store: Store, world_size: int, key_prefix: str) -> str:
+    key = f"{key_prefix}/num_members"
+    last_member = f"{key_prefix}/last_member"
+    if store.add(key, 1) == world_size:
+        store.set(last_member, b"1")
+    return last_member
+
+
 def synchronize(
     store: Store,
     data: bytes,

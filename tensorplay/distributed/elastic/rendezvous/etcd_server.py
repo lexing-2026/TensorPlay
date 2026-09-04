@@ -4,6 +4,7 @@ import atexit
 import os
 import shutil
 import socket
+import shlex
 import subprocess
 import tempfile
 import time
@@ -57,22 +58,54 @@ class EtcdServer:
         return f"{self._host}:{self._port}"
 
     def start(self, timeout: int = 60, num_retries: int = 3, stderr=None) -> None:
-        del timeout, num_retries, stderr
         if self._started:
             return
-        sock = find_free_port()
-        self._port = sock.getsockname()[1]
-        sock.close()
-        binary = shutil.which(self._etcd_binary_path) if not os.path.isfile(self._etcd_binary_path) else self._etcd_binary_path
-        if binary:
-            data_dir = os.path.join(self._base_data_dir, "0")
-            os.makedirs(data_dir, exist_ok=True)
-            self._etcd_proc = subprocess.Popen(
-                [binary, "--data-dir", data_dir, "--listen-client-urls", f"http://{self._host}:{self._port}", "--advertise-client-urls", f"http://{self._host}:{self._port}"],
-                close_fds=True,
-            )
+        attempts = max(1, int(num_retries))
+        for attempt in range(attempts):
+            try:
+                data_dir = os.path.join(self._base_data_dir, str(attempt))
+                os.makedirs(data_dir, exist_ok=True)
+                self._start(data_dir, timeout, stderr)
+                break
+            except Exception:
+                stop_etcd(self._etcd_proc)
+                self._etcd_proc = None
+                if attempt + 1 == attempts:
+                    raise
         self._started = True
         atexit.register(self.stop)
+
+    def _start(self, data_dir: str, timeout: int = 60, stderr=None) -> None:
+        sock = find_free_port()
+        peer = find_free_port()
+        self._port = sock.getsockname()[1]
+        peer_port = peer.getsockname()[1]
+        sock.close()
+        peer.close()
+        binary = (
+            self._etcd_binary_path
+            if os.path.isfile(self._etcd_binary_path)
+            else shutil.which(self._etcd_binary_path)
+        )
+        if not binary:
+            return
+        command = " ".join(
+            [
+                binary,
+                "--data-dir",
+                data_dir,
+                "--listen-client-urls",
+                f"http://{self._host}:{self._port}",
+                "--advertise-client-urls",
+                f"http://{self._host}:{self._port}",
+                "--listen-peer-urls",
+                f"http://{self._host}:{peer_port}",
+            ]
+        )
+        self._etcd_proc = subprocess.Popen(
+            shlex.split(command), close_fds=True, stderr=stderr
+        )
+        self._wait_for_ready(timeout)
 
     def get_client(self):
         if not self._started:

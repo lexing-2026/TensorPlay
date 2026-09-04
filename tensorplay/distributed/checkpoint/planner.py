@@ -78,6 +78,12 @@ class LoadPlan:
 
 
 class SavePlanner(abc.ABC):
+    _cached_save_plan: dict[str, SavePlan] = {}
+    _cached_final_save_plan: dict[str, SavePlan] = {}
+    _cached_all_plans: dict[str, list[SavePlan]] = {}
+    _cached_global_plan: dict[str, list[SavePlan]] = {}
+    _cached_metadata: dict[str, Metadata] = {}
+
     @abc.abstractmethod
     def set_up_planner(self, state_dict: dict[str, Any], storage_meta: StorageMeta | None = None, is_coordinator: bool = False) -> None: ...
     @abc.abstractmethod

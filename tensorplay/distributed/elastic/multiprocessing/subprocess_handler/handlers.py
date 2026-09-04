@@ -14,7 +14,6 @@ def get_subprocess_handler(
     local_rank_id: int,
     numa_options=None,
 ) -> SubprocessHandler:
-    del numa_options
     command = (entrypoint, *tuple(str(value) for value in args))
     return SubprocessHandler(
         args=command,
@@ -22,4 +21,5 @@ def get_subprocess_handler(
         stdout=stdout,
         stderr=stderr,
         local_rank_id=local_rank_id,
+        numa_options=numa_options,
     )
