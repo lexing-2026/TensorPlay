@@ -8,6 +8,7 @@ from typing import Any
 
 from .._api import _current_mesh
 from .style import ParallelStyle
+from ._utils import _validate_tp_mesh_dim
 
 __all__ = ["parallelize_module"]
 
@@ -20,6 +21,7 @@ def parallelize_module(
     src_data_rank: int | None = 0,
 ) -> Any:
     mesh = device_mesh or _current_mesh()
+    _validate_tp_mesh_dim(mesh)
     if parallelize_plan is None:
         return module
     if isinstance(parallelize_plan, ParallelStyle):

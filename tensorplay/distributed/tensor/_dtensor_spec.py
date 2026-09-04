@@ -1,30 +1,36 @@
-"""Immutable metadata records for distributed tensor layouts."""
+"""Metadata records for distributed tensor layouts."""
 
 from __future__ import annotations
 
-from collections import namedtuple
+import hashlib
+import itertools
+import math
+from collections import defaultdict, namedtuple
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 
-from .placement_types import Partial, Placement, Replicate, Shard, _is_shard_like
+from .placement_types import (
+    Partial,
+    Placement,
+    Replicate,
+    Shard,
+    _StridedShard,
+    _is_shard_like,
+)
 
 __all__ = ["DTensorSpec", "ShardOrderEntry", "TensorMeta"]
 
 
-class _DimMap(list[int]):
-    def __call__(self) -> tuple[int, ...]:
-        return tuple(self)
+class _StridedShardNotDecodableError(ValueError):
+    pass
 
 
-class _BoolValue(int):
-    def __new__(cls, value: bool) -> "_BoolValue":
-        return int.__new__(cls, bool(value))
+class ShardOrderEntry(NamedTuple):
+    tensor_dim: int
+    mesh_dims: tuple[int, ...]
 
-    def __bool__(self) -> bool:
-        return int(self) != 0
 
-    def __call__(self) -> bool:
-        return bool(self)
+ShardOrder = tuple[ShardOrderEntry, ...]
 
 
 _TensorMetaBase = namedtuple("_TensorMetaBase", ("shape", "stride", "dtype"))
@@ -37,44 +43,288 @@ class TensorMeta(_TensorMetaBase):
     dtype: Any
 
     def __new__(cls, shape: Any, stride: Any, dtype: Any) -> "TensorMeta":
-        return super().__new__(
-            cls,
-            tuple(shape),
-            tuple(stride),
-            dtype,
-        )
+        return super().__new__(cls, tuple(shape), tuple(stride), dtype)
 
 
-@dataclass(frozen=True)
-class ShardOrderEntry:
-    mesh_dim: int
-    tensor_dim: int
-
-
-@dataclass(frozen=True)
+@dataclass
 class DTensorSpec:
     mesh: Any
     placements: tuple[Placement, ...]
     tensor_meta: TensorMeta | None = None
-    shard_order: tuple[ShardOrderEntry, ...] = ()
+    shard_order: ShardOrder | None = None
+    use_strided_shard_as_shard_order: bool | None = None
 
-    def __init__(
-        self,
+    def __post_init__(self) -> None:
+        if not isinstance(self.placements, tuple):
+            self.placements = tuple(self.placements)
+        if self.use_strided_shard_as_shard_order is None:
+            self.use_strided_shard_as_shard_order = any(
+                isinstance(placement, _StridedShard)
+                for placement in self.placements
+            )
+        if self.use_strided_shard_as_shard_order:
+            if self.shard_order is not None:
+                raise ValueError(
+                    "DTensorSpec does not allow shard_order when "
+                    "use_strided_shard_as_shard_order is True"
+                )
+        elif self.shard_order is None:
+            self.shard_order = self.compute_default_shard_order(self.placements)
+        self._hash: int | None = None
+
+    @staticmethod
+    def _normalize_placements_into_shard_order(
+        placements: tuple[Placement, ...],
         mesh: Any,
-        placements: Any,
-        tensor_meta: TensorMeta | None = None,
-        shard_order: Any = (),
-    ) -> None:
-        object.__setattr__(self, "mesh", mesh)
-        object.__setattr__(self, "placements", tuple(placements))
-        object.__setattr__(self, "tensor_meta", tensor_meta)
-        object.__setattr__(self, "shard_order", tuple(shard_order))
+        use_strided_shard_as_shard_order: bool = True,
+    ) -> tuple[tuple[Placement, ...], ShardOrder]:
+        if use_strided_shard_as_shard_order:
+            shard_order = DTensorSpec._maybe_convert_StridedShard_to_shard_order(
+                placements, mesh
+            )
+            if shard_order is None:
+                raise _StridedShardNotDecodableError(
+                    f"_StridedShard placements {placements} cannot be decoded "
+                    "into a corresponding shard_order"
+                )
+            normalized_placements = tuple(
+                Shard(placement.dim)
+                if isinstance(placement, _StridedShard)
+                else placement
+                for placement in placements
+            )
+            return normalized_placements, shard_order
+        return placements, DTensorSpec.compute_default_shard_order(placements)
 
-    @property
-    def ndim(self) -> int:
+    @staticmethod
+    def compute_default_shard_order(
+        placements: tuple[Placement, ...],
+    ) -> ShardOrder:
+        tensor_dim_to_mesh_dims: defaultdict[int, list[int]] = defaultdict(list)
+        for mesh_dim, placement in enumerate(placements):
+            if _is_shard_like(placement):
+                if placement.dim < 0:
+                    raise AssertionError(
+                        f"Shard dim {placement.dim} in placements {placements} must be normalized"
+                    )
+                tensor_dim_to_mesh_dims[placement.dim].append(mesh_dim)
+        return tuple(
+            ShardOrderEntry(tensor_dim, tuple(mesh_dims))
+            for tensor_dim, mesh_dims in sorted(tensor_dim_to_mesh_dims.items())
+        )
+
+    @staticmethod
+    def _convert_shard_order_to_StridedShard(
+        shard_order: ShardOrder,
+        placements: tuple[Placement, ...],
+        mesh: Any,
+    ) -> tuple[Placement, ...]:
+        placements_list = list(placements)
+        for entry in shard_order:
+            for index, mesh_dim in enumerate(entry.mesh_dims):
+                if type(placements[mesh_dim]) is not Shard:
+                    raise ValueError(
+                        "Only Shard placement can be converted to _StridedShard, "
+                        f"found {placements[mesh_dim]} in placements={placements}."
+                    )
+                split_factor = math.prod(
+                    mesh.size(indexed_mesh_dim)
+                    for indexed_mesh_dim in entry.mesh_dims[:index]
+                    if indexed_mesh_dim > mesh_dim
+                )
+                placements_list[mesh_dim] = (
+                    Shard(entry.tensor_dim)
+                    if split_factor == 1
+                    else _StridedShard(entry.tensor_dim, split_factor=split_factor)
+                )
+        return tuple(placements_list)
+
+    @staticmethod
+    def _maybe_convert_StridedShard_to_shard_order(
+        placements: tuple[Placement, ...],
+        mesh: Any,
+    ) -> ShardOrder | None:
+        if not any(isinstance(placement, _StridedShard) for placement in placements):
+            return DTensorSpec.compute_default_shard_order(placements)
+        shard_placements = [
+            placement for placement in placements if _is_shard_like(placement)
+        ]
+        if not shard_placements:
+            return ()
+        max_tensor_dim = max(placement.dim for placement in shard_placements) + 1
+        tensor_dim_to_mesh_dims_order: list[list[int]] = [
+            [] for _ in range(max_tensor_dim)
+        ]
+        for mesh_dim in reversed(range(len(placements))):
+            placement = placements[mesh_dim]
+            if _is_shard_like(placement):
+                tensor_dim = placement.dim
+                mesh_dims_order = tensor_dim_to_mesh_dims_order[tensor_dim]
+                split_factor = (
+                    placement.split_factor
+                    if isinstance(placement, _StridedShard)
+                    else 1
+                )
+                accumulated_factor = 1
+                found = False
+                for index in range(len(mesh_dims_order) + 1):
+                    if accumulated_factor == split_factor:
+                        mesh_dims_order.insert(index, mesh_dim)
+                        found = True
+                        break
+                    if index < len(mesh_dims_order):
+                        accumulated_factor *= mesh.size(mesh_dims_order[index])
+                if not found:
+                    return None
+            elif not isinstance(placement, (Replicate, Partial)):
+                raise ValueError(
+                    f"Unsupported placement type {type(placement)} encountered in "
+                    f"{placements}; expected Replicate or Partial."
+                )
+        return tuple(
+            ShardOrderEntry(tensor_dim, tuple(mesh_dims))
+            for tensor_dim, mesh_dims in enumerate(tensor_dim_to_mesh_dims_order)
+            if mesh_dims
+        )
+
+    def _verify_shard_order(self, shard_order: ShardOrder) -> None:
+        if any(isinstance(placement, _StridedShard) for placement in self.placements):
+            return
+        total_shard = 0
+        previous_tensor_dim = -1
+        for entry in shard_order:
+            if not entry.mesh_dims:
+                raise AssertionError(
+                    f"shard_order {shard_order} has empty mesh dimension"
+                )
+            if entry.tensor_dim < 0:
+                raise AssertionError(
+                    f"shard_order {shard_order} has invalid tensor dimension"
+                )
+            if entry.tensor_dim <= previous_tensor_dim:
+                raise AssertionError("tensor dimensions must be sorted in shard_order")
+            previous_tensor_dim = entry.tensor_dim
+            total_shard += len(entry.mesh_dims)
+            for mesh_dim in entry.mesh_dims:
+                if not 0 <= mesh_dim < len(self.placements):
+                    raise AssertionError(
+                        f"shard_order {shard_order} has invalid mesh dimension"
+                    )
+                if self.placements[mesh_dim] != Shard(entry.tensor_dim):
+                    raise AssertionError(
+                        f"placement[{mesh_dim}] does not match shard_order"
+                    )
+        if total_shard != sum(
+            isinstance(placement, Shard) for placement in self.placements
+        ):
+            raise AssertionError
+
+    def __setattr__(self, attr: str, value: Any) -> None:
+        if attr == "shard_order" and value is not None:
+            self._verify_shard_order(value)
+        super().__setattr__(attr, value)
+        if hasattr(self, "_hash") and attr in {
+            "mesh",
+            "placements",
+            "tensor_meta",
+            "shard_order",
+        }:
+            self._hash = None
+        if attr == "tensor_meta" and value is not None:
+            try:
+                from tensorplay.graph.passes.shape_prop import TensorMetadata
+            except ImportError:
+                TensorMetadata = ()
+            allowed = (TensorMeta, TensorMetadata) if TensorMetadata else (TensorMeta,)
+            if not isinstance(value, allowed):
+                raise AssertionError(repr(value))
+
+    def _hash_key(self) -> tuple[Any, ...]:
+        if self.tensor_meta is not None:
+            return (
+                self.mesh,
+                self.placements,
+                self.shard_order,
+                self.tensor_meta.shape,
+                self.tensor_meta.stride,
+                self.tensor_meta.dtype,
+            )
+        return self.mesh, self.placements, self.shard_order
+
+    def _hash_impl(self) -> int:
+        return hash(self._hash_key())
+
+    def __hash__(self) -> int:
+        if self._hash is None:
+            self._hash = self._hash_impl()
+        return self._hash
+
+    def _stable_hash(self) -> str:
+        stable_hash = getattr(self.mesh, "_stable_hash", None)
+        mesh_key = stable_hash() if callable(stable_hash) else repr(self.mesh)
+        key = self._hash_key()
+        stable_key = (mesh_key,) + key[1:]
+        return hashlib.blake2b(repr(stable_key).encode(), digest_size=16).hexdigest()
+
+    def _check_equals(self, other: object, skip_shapes: bool = False) -> bool:
+        if not (
+            isinstance(other, DTensorSpec)
+            and self.mesh == other.mesh
+            and self.placements == other.placements
+            and self.shard_order == other.shard_order
+        ):
+            return False
+        if self.tensor_meta is None or other.tensor_meta is None:
+            return self.tensor_meta == other.tensor_meta
+        if skip_shapes:
+            return self.tensor_meta.dtype == other.tensor_meta.dtype
+        return (
+            self.tensor_meta.shape == other.tensor_meta.shape
+            and self.tensor_meta.stride == other.tensor_meta.stride
+            and self.tensor_meta.dtype == other.tensor_meta.dtype
+        )
+
+    def __eq__(self, other: object, /) -> bool:
+        return self._check_equals(other)
+
+    def __str__(self) -> str:
+        placement_str = self.format_shard_order_str(self.placements, self.shard_order)
         if self.tensor_meta is None:
-            raise ValueError("tensor_meta is not set")
-        return len(self.tensor_meta.shape)
+            return f"Spec(unknown shape({placement_str}))"
+        dtype = getattr(self.tensor_meta.dtype, "name", str(self.tensor_meta.dtype))
+        shape = tuple(self.tensor_meta.shape)
+        return f"Spec({dtype}{shape}({placement_str}))"
+
+    @staticmethod
+    def is_default_device_order(shard_order: ShardOrder | None) -> bool:
+        if shard_order is None:
+            return False
+        return all(
+            all(previous < current for previous, current in itertools.pairwise(entry.mesh_dims))
+            for entry in shard_order
+        )
+
+    @staticmethod
+    def format_shard_order_str(
+        placements: tuple[Placement, ...],
+        shard_order: ShardOrder | None = None,
+    ) -> str:
+        result = ""
+        for mesh_dim, placement in enumerate(placements):
+            if _is_shard_like(placement) and shard_order is not None:
+                for entry in shard_order:
+                    if placement.dim != entry.tensor_dim:
+                        continue
+                    if mesh_dim not in entry.mesh_dims:
+                        raise AssertionError
+                    if len(entry.mesh_dims) > 1:
+                        result += f"{placement}[{entry.mesh_dims.index(mesh_dim)}]"
+                    else:
+                        result += str(placement)
+                    break
+            else:
+                result += str(placement)
+        return result
 
     @property
     def shape(self) -> tuple[int, ...]:
@@ -89,11 +339,17 @@ class DTensorSpec:
         return self.tensor_meta.stride
 
     @property
+    def ndim(self) -> int:
+        if self.tensor_meta is None:
+            raise ValueError("tensor_meta is not set")
+        return len(self.tensor_meta.shape)
+
+    @property
     def num_shards(self) -> int:
         result = 1
-        for index, placement in enumerate(self.placements):
-            if placement.is_shard():
-                result *= int(self.mesh.size(index))
+        for mesh_dim, placement in enumerate(self.placements):
+            if _is_shard_like(placement):
+                result *= int(self.mesh.size(mesh_dim))
         return result
 
     @property
@@ -101,22 +357,10 @@ class DTensorSpec:
         return self.mesh
 
     @property
-    def is_replicated(self) -> bool:
-        return _BoolValue(all(placement.is_replicate() for placement in self.placements))
-
-    @property
-    def is_sharded(self) -> bool:
-        return _BoolValue(any(_is_shard_like(placement) for placement in self.placements))
-
-    @property
-    def is_partial(self) -> bool:
-        return _BoolValue(any(isinstance(placement, Partial) for placement in self.placements))
-
-    @property
     def dim_map(self) -> list[int]:
-        result = _DimMap([-1] * self.ndim)
+        result = [-1] * self.ndim
         for mesh_dim, placement in enumerate(self.placements):
-            if isinstance(placement, Shard):
+            if _is_shard_like(placement):
                 if result[placement.dim] != -1:
                     raise ValueError(
                         f"tensor dimension {placement.dim} is sharded on multiple mesh dimensions"
@@ -127,16 +371,16 @@ class DTensorSpec:
     @property
     def num_shards_map(self) -> list[int]:
         result = [1] * self.ndim
-        for index, placement in enumerate(self.placements):
-            if placement.is_shard():
-                result[placement.dim] *= int(self.mesh.size(index))
+        for mesh_dim, placement in enumerate(self.placements):
+            if _is_shard_like(placement):
+                result[placement.dim] *= int(self.mesh.size(mesh_dim))
         return result
 
     @property
     def sums(self) -> list[int]:
         return [
-            index
-            for index, placement in enumerate(self.placements)
+            mesh_dim
+            for mesh_dim, placement in enumerate(self.placements)
             if placement.is_partial()
         ]
 
@@ -152,67 +396,36 @@ class DTensorSpec:
         mesh_ndim = int(mesh_ndim_value() if callable(mesh_ndim_value) else mesh_ndim_value)
         placements: list[Placement] = [Replicate() for _ in range(mesh_ndim)]
         for mesh_dim in sums:
-            mesh_dim = int(mesh_dim)
-            if mesh_dim < 0 or mesh_dim >= mesh_ndim:
-                raise ValueError(f"sum mesh dimension {mesh_dim} is outside the mesh")
             placements[mesh_dim] = Partial()
         for tensor_dim, mesh_dim in enumerate(dim_map):
-            mesh_dim = int(mesh_dim)
             if mesh_dim < 0:
                 continue
-            if mesh_dim >= mesh_ndim:
-                raise ValueError(f"mesh dimension {mesh_dim} is outside the mesh")
-            previous = placements[mesh_dim]
-            if isinstance(previous, Shard):
+            placement = placements[mesh_dim]
+            if placement.is_shard():
                 raise RuntimeError(
                     f"mesh dimension {mesh_dim} cannot shard two tensor dimensions"
                 )
-            if isinstance(previous, Partial):
+            if placement.is_partial():
                 raise RuntimeError(
                     f"mesh dimension {mesh_dim} cannot be both sharded and partial"
                 )
             placements[mesh_dim] = Shard(tensor_dim)
         return cls(mesh, tuple(placements), tensor_meta=tensor_meta)
 
+    def is_replicated(self) -> bool:
+        return all(placement.is_replicate() for placement in self.placements)
+
+    def is_sharded(self) -> bool:
+        return any(_is_shard_like(placement) for placement in self.placements)
+
     def shallow_copy_with_tensor_meta(
         self, tensor_meta: TensorMeta | None
     ) -> "DTensorSpec":
         if tensor_meta is None:
-            raise ValueError("tensor_meta is required")
-        return type(self)(
+            raise AssertionError("shallow copy with no tensor_meta!")
+        return DTensorSpec(
             self.mesh,
             self.placements,
             tensor_meta=tensor_meta,
-            shard_order=self.shard_order,
+            use_strided_shard_as_shard_order=self.use_strided_shard_as_shard_order,
         )
-
-    def __hash__(self) -> int:
-        meta = self.tensor_meta
-        return hash(
-            (
-                self.mesh,
-                self.placements,
-                None if meta is None else meta.shape,
-                None if meta is None else meta.stride,
-                None if meta is None else meta.dtype,
-                self.shard_order,
-            )
-        )
-
-    def __eq__(self, other: object) -> bool:
-        if not isinstance(other, DTensorSpec):
-            return NotImplemented
-        return (
-            self.mesh == other.mesh
-            and self.placements == other.placements
-            and self.tensor_meta == other.tensor_meta
-            and self.shard_order == other.shard_order
-        )
-
-    def __str__(self) -> str:
-        placement = self.placements[0] if len(self.placements) == 1 else self.placements
-        shape = "unknown shape" if self.tensor_meta is None else tuple(self.tensor_meta.shape)
-        return f"Spec({placement} on {shape})"
-
-    def __repr__(self) -> str:
-        return f"DTensorSpec(mesh={self.mesh!r}, placements={self.placements!r}, tensor_meta={self.tensor_meta!r})"

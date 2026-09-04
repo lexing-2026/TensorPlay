@@ -9,16 +9,8 @@ from typing import Any
 
 import tensorplay
 
-from .. import distributed_core as dist
 from ..device_mesh import DeviceMesh, _MeshEnv
-from ._collective_utils import (
-    check_tensor_meta,
-    mesh_broadcast,
-    mesh_scatter,
-    pad_tensor,
-    shard_dim_alltoall,
-    unpad_tensor,
-)
+from ._collective_utils import check_tensor_meta
 from ._utils import (
     assert_no_mixed_partial_types,
     compute_global_tensor_info,
@@ -169,12 +161,6 @@ def _group(mesh: DeviceMesh, mesh_dim: int) -> Any:
     return mesh.get_group(mesh_dim)
 
 
-def _local_rank(mesh: DeviceMesh, mesh_dim: int) -> int:
-    if not _participates(mesh):
-        raise RuntimeError("the current rank is not part of the device mesh")
-    return int(mesh.get_local_rank(_mesh_dim(mesh, mesh_dim)))
-
-
 def _validate_src_data_rank(
     mesh: DeviceMesh, mesh_dim: int, src_data_rank: int | None
 ) -> None:
@@ -184,18 +170,6 @@ def _validate_src_data_rank(
         raise ValueError("src_data_rank must be a non-negative mesh-relative rank")
     if src_data_rank >= int(mesh.size(_mesh_dim(mesh, mesh_dim))):
         raise ValueError("src_data_rank is outside the mesh dimension")
-
-
-def _shape_with_dimension(shape: Sequence[int], dim: int, size: int) -> tuple[int, ...]:
-    result = list(shape)
-    result[dim] = int(size)
-    return tuple(result)
-
-
-def _copy_into_slice(destination: Any, source: Any, dim: int, start: int = 0) -> None:
-    slices = [slice(None)] * int(destination.dim())
-    slices[dim] = slice(start, start + int(source.shape[dim]))
-    destination[tuple(slices)].copy_(source)
 
 
 def _distribute_shard(
@@ -209,345 +183,17 @@ def _distribute_shard(
         return _new_empty_nonparticipant(value)
     mesh_dim = _mesh_dim(mesh, mesh_dim)
     _validate_src_data_rank(mesh, mesh_dim, src_data_rank)
-    chunks, pads = placement._split_tensor(value, int(mesh.size(mesh_dim)), with_padding=True)
-    rank = _local_rank(mesh, mesh_dim)
-    if src_data_rank is None or int(mesh.size(mesh_dim)) <= 1:
-        return placement._maybe_unpad_tensor_with_sizes(
-            placement.dim, chunks[rank], pads, rank, True
-        )
-    output = value.new_empty(tuple(chunks[0].shape))
-    mesh_scatter(
-        output,
-        chunks,
-        mesh,
-        mesh_dim=mesh_dim,
-        group_src=src_data_rank,
-    )
-    return placement._maybe_unpad_tensor_with_sizes(
-        placement.dim, output, pads, rank, True
-    )
+    return placement._shard_tensor(value, mesh, mesh_dim, src_data_rank)
 
 
 def _replicate(
     value: Any, mesh: DeviceMesh, mesh_dim: int, src_data_rank: int | None
 ) -> Any:
-    if not _participates(mesh) or src_data_rank is None:
-        return value
     mesh_dim = _mesh_dim(mesh, mesh_dim)
     _validate_src_data_rank(mesh, mesh_dim, src_data_rank)
-    if int(mesh.size(mesh_dim)) <= 1:
-        return value
-    mesh_broadcast(value, mesh, mesh_dim=mesh_dim, group_src=src_data_rank)
-    return value
-
-
-def _reduce_op(reduce_op: str) -> int:
-    try:
-        return {
-            "sum": dist.ReduceOp.SUM,
-            "avg": dist.ReduceOp.AVG,
-            "min": dist.ReduceOp.MIN,
-            "max": dist.ReduceOp.MAX,
-            "product": dist.ReduceOp.PRODUCT,
-        }[reduce_op]
-    except KeyError as error:
-        raise ValueError(f"unsupported reduction {reduce_op!r}") from error
-
-
-def _reduce(
-    value: Any,
-    placement: Partial,
-    mesh: DeviceMesh,
-    mesh_dim: int,
-    async_op: bool = False,
-) -> Any:
-    if not _participates(mesh) or int(mesh.size(mesh_dim)) <= 1:
-        return value
-    result = value.clone()
-    pre_reduce = getattr(placement, "_pre_reduce_transform", None)
-    post_reduce = getattr(placement, "_post_reduce_transform", None)
-    if callable(pre_reduce):
-        result = pre_reduce(result)
-    work = dist.all_reduce(
-        result,
-        op=_reduce_op(placement.reduce_op),
-        group=_group(mesh, mesh_dim),
-        async_op=async_op,
+    return Replicate._make_replicate_tensor(
+        value, mesh, mesh_dim, src_data_rank
     )
-    if async_op and work is not None:
-        from .._functional_collectives import AsyncCollectiveTensor
-
-        if callable(post_reduce):
-            reduced_result = result
-
-            def apply_post_reduce() -> None:
-                reduced_result.copy_(post_reduce(reduced_result))
-
-            work = _PostProcessWork(
-                work, apply_post_reduce
-            )
-        result = AsyncCollectiveTensor(result, work)
-    elif callable(post_reduce):
-        result = post_reduce(result)
-    return result
-
-
-class _PostProcessWork:
-    """Run a tensor transformation once the wrapped collective is complete."""
-
-    def __init__(self, work: Any, callback: Any) -> None:
-        self._work = work
-        self._callback = callback
-        self._done = False
-
-    def wait(self, timeout: Any = None) -> bool:
-        result = self._work.wait(timeout)
-        if result is not False and not self._done:
-            self._callback()
-            self._done = True
-        return result
-
-    def is_completed(self) -> bool:
-        return bool(self._work.is_completed())
-
-    def abort(self) -> None:
-        return self._work.abort()
-
-
-def _partition_partial(value: Any, placement: Partial, mesh: DeviceMesh, mesh_dim: int) -> Any:
-    count = int(mesh.size(mesh_dim))
-    if count <= 1:
-        return value
-    partition = getattr(placement, "_partition_value", None)
-    if callable(partition):
-        return partition(value, mesh, mesh_dim)
-    if placement.reduce_op == "sum":
-        return value / count
-    if placement.reduce_op in ("avg", "min", "max"):
-        return value
-    raise ValueError(
-        f"Replicate to Partial({placement.reduce_op}) conversion is not supported"
-    )
-
-
-def _stage_dim_size(
-    global_shape: Sequence[int],
-    mesh: DeviceMesh,
-    placements: Sequence[Placement],
-    mesh_dim: int,
-    tensor_dim: int,
-) -> int:
-    size = int(global_shape[tensor_dim])
-    for index in range(mesh_dim):
-        placement = placements[index]
-        if _is_shard_like(placement) and placement.dim == tensor_dim:
-            count = int(mesh.size(index))
-            size = (size + count - 1) // count
-    return size
-
-
-def _all_gather_shard(
-    value: Any,
-    placement: Shard,
-    mesh: DeviceMesh,
-    mesh_dim: int,
-    logical_size: int,
-    async_op: bool = False,
-) -> Any:
-    count = int(mesh.size(mesh_dim))
-    if count <= 1:
-        return value
-    width = (logical_size + count - 1) // count
-    current_size = int(value.shape[placement.dim])
-    if current_size > width:
-        raise ValueError("local shard is larger than its logical shard width")
-    padded = pad_tensor(value, placement.dim, width - current_size)
-    shard_dim = int(placement.dim)
-    if shard_dim < 0:
-        shard_dim += int(padded.dim())
-    moved = padded.movedim(shard_dim, 0) if shard_dim != 0 else padded
-    output_shape = list(moved.shape)
-    output_shape[0] *= count
-    result = padded.new_empty(tuple(output_shape))
-    work = dist.all_gather_single(
-        result,
-        moved,
-        group=_group(mesh, mesh_dim),
-        async_op=async_op,
-    )
-    if async_op and work is not None:
-        from .._functional_collectives import AsyncCollectiveTensor
-
-        result = AsyncCollectiveTensor(result, work)
-    if shard_dim != 0:
-        result = result.movedim(0, shard_dim)
-    return unpad_tensor(result, shard_dim, count * width - logical_size)
-
-
-def _replicate_to_shard(
-    value: Any,
-    target: Shard,
-    mesh: DeviceMesh,
-    mesh_dim: int,
-) -> Any:
-    count = int(mesh.size(mesh_dim))
-    rank = _local_rank(mesh, mesh_dim)
-    shards, _ = target._split_tensor(value, count, with_padding=False, contiguous=True)
-    return shards[rank].clone()
-
-
-def _partial_to_shard(
-    value: Any,
-    source: Partial,
-    target: Shard,
-    mesh: DeviceMesh,
-    mesh_dim: int,
-    async_op: bool = False,
-) -> Any:
-    count = int(mesh.size(mesh_dim))
-    if count <= 1:
-        return value
-    shards, pads = target._split_tensor(value, count, with_padding=True, contiguous=True)
-    width = int(shards[0].shape[target.dim])
-    output = value.new_empty(_shape_with_dimension(value.shape, target.dim, width))
-    work = dist.reduce_scatter(
-        output,
-        shards,
-        op=_reduce_op(source.reduce_op),
-        group=_group(mesh, mesh_dim),
-        async_op=async_op,
-    )
-    if async_op and work is not None:
-        from .._functional_collectives import AsyncCollectiveTensor
-
-        output = AsyncCollectiveTensor(output, work)
-    rank = _local_rank(mesh, mesh_dim)
-    return unpad_tensor(output, target.dim, pads[rank])
-
-
-def _shard_to_partial(
-    value: Any,
-    source: Shard,
-    target: Partial,
-    mesh: DeviceMesh,
-    mesh_dim: int,
-    global_shape: Sequence[int],
-    placements: Sequence[Placement],
-) -> Any:
-    if target.reduce_op != "sum":
-        raise ValueError("Shard to Partial conversion requires the sum reduction")
-    count = int(mesh.size(mesh_dim))
-    logical_size = _stage_dim_size(global_shape, mesh, placements, mesh_dim, source.dim)
-    width = (logical_size + count - 1) // count
-    rank = _local_rank(mesh, mesh_dim)
-    start = min(rank * width, logical_size)
-    local_size = max(0, min(width, logical_size - start))
-    if int(value.shape[source.dim]) != local_size:
-        raise ValueError("local shard shape does not match the placement metadata")
-    result = value.new_zeros(_shape_with_dimension(value.shape, source.dim, logical_size))
-    if local_size:
-        _copy_into_slice(result, value, source.dim, start)
-    return result
-
-
-def _shard_to_shard(
-    value: Any,
-    source: Shard,
-    target: Shard,
-    mesh: DeviceMesh,
-    mesh_dim: int,
-    global_shape: Sequence[int],
-    placements: Sequence[Placement],
-) -> Any:
-    if source.dim == target.dim:
-        return value
-    count = int(mesh.size(mesh_dim))
-    if count <= 1:
-        return value
-    old_size = _stage_dim_size(global_shape, mesh, placements, mesh_dim, source.dim)
-    new_size = _stage_dim_size(global_shape, mesh, placements, mesh_dim, target.dim)
-    old_width = (old_size + count - 1) // count
-    new_width = (new_size + count - 1) // count
-    if int(value.shape[source.dim]) > old_width:
-        raise ValueError("local shard shape does not match the source placement")
-    value = pad_tensor(value, source.dim, old_width - int(value.shape[source.dim]))
-    target_total = count * new_width
-    if int(value.shape[target.dim]) > target_total:
-        raise ValueError("target shard dimension is smaller than the local tensor")
-    value = pad_tensor(value, target.dim, target_total - int(value.shape[target.dim]))
-    result = shard_dim_alltoall(value, source.dim, target.dim, mesh, mesh_dim)
-    result = unpad_tensor(result, source.dim, count * old_width - old_size)
-    rank = _local_rank(mesh, mesh_dim)
-    target_start = min(rank * new_width, new_size)
-    target_local_size = max(0, min(new_width, new_size - target_start))
-    return unpad_tensor(result, target.dim, new_width - target_local_size)
-
-
-def _convert_placement(
-    value: Any,
-    source: Placement,
-    target: Placement,
-    mesh: DeviceMesh,
-    mesh_dim: int,
-    global_shape: Sequence[int],
-    placements: Sequence[Placement],
-    async_op: bool = False,
-) -> Any:
-    if source == target:
-        return value
-    if isinstance(source, Replicate) and isinstance(target, Shard):
-        return _replicate_to_shard(value, target, mesh, mesh_dim)
-    if isinstance(source, Replicate) and isinstance(target, Partial):
-        return _partition_partial(value, target, mesh, mesh_dim)
-    if _is_shard_like(source) and isinstance(target, Replicate):
-        logical_size = _stage_dim_size(global_shape, mesh, placements, mesh_dim, source.dim)
-        return _all_gather_shard(
-            value, source, mesh, mesh_dim, logical_size, async_op
-        )
-    if _is_shard_like(source) and _is_shard_like(target):
-        return _shard_to_shard(
-            value, source, target, mesh, mesh_dim, global_shape, placements
-        )
-    if _is_shard_like(source) and isinstance(target, Partial):
-        return _shard_to_partial(
-            value, source, target, mesh, mesh_dim, global_shape, placements
-        )
-    if isinstance(source, Partial) and isinstance(target, Replicate):
-        return _reduce(value, source, mesh, mesh_dim, async_op)
-    if isinstance(source, Partial) and isinstance(target, Shard):
-        return _partial_to_shard(value, source, target, mesh, mesh_dim, async_op)
-    if isinstance(source, Partial) and isinstance(target, Partial):
-        raise ValueError("conversion between different partial reductions is unsupported")
-    raise ValueError(f"unsupported placement conversion: {source!r} to {target!r}")
-
-
-def _redistribute_local(
-    value: Any,
-    mesh: DeviceMesh,
-    source: Sequence[Placement],
-    target: Sequence[Placement],
-    global_shape: Sequence[int],
-    async_op: bool = False,
-) -> Any:
-    if not _participates(mesh):
-        return value
-    current = list(source)
-    result = value
-    for mesh_dim in reversed(range(len(current))):
-        if current[mesh_dim] == target[mesh_dim]:
-            continue
-        result = _convert_placement(
-            result,
-            current[mesh_dim],
-            target[mesh_dim],
-            mesh,
-            mesh_dim,
-            global_shape,
-            current,
-            async_op,
-        )
-        current[mesh_dim] = target[mesh_dim]
-    return result
 
 
 def _normalize_grad_placements(
@@ -578,10 +224,9 @@ class DTensor:
             raise TypeError("local_tensor must be a plain tensor")
         if shape is None:
             shape, _ = compute_global_tensor_info(
-                local_tensor.shape,
-                local_tensor.stride(),
-                placements,
+                local_tensor,
                 device_mesh,
+                placements,
             )
         normalized_shape = tuple(int(value) for value in shape)
         rank = len(normalized_shape) if int(local_tensor.numel()) == 0 else int(local_tensor.dim())
@@ -636,10 +281,9 @@ class DTensor:
         normalized = _normalize_placements(placements, mesh, int(local_tensor.dim()))
         if shape is None:
             global_shape, global_stride = compute_global_tensor_info(
-                local_tensor.shape,
-                local_tensor.stride(),
-                normalized,
+                local_tensor,
                 mesh,
+                normalized,
             )
         else:
             global_shape = normalize_to_torch_size(shape)
@@ -739,33 +383,25 @@ class DTensor:
         if placements is None:
             raise RuntimeError("placements is needed for redistribute")
         target = _normalize_placements(placements, mesh, self.ndim)
-        for source, destination in zip(self._placements, target):
-            if isinstance(destination, Partial) and source != destination:
-                if not _is_shard_like(source) or destination.reduce_op != "sum":
-                    raise RuntimeError(
-                        "only Shard to Partial(sum) redistribution is supported"
-                    )
         if target == self._placements and forward_dtype is None:
             return self
-        value = self._local_tensor
-        if forward_dtype is not None and value.dtype != forward_dtype:
-            value = value.to(forward_dtype)
-        if target != self._placements:
-            value = _redistribute_local(
-                value,
-                mesh,
-                self._placements,
-                target,
-                self._shape,
-                async_op,
-            )
-        return type(self)(
-            value,
+        from ._redistribute import Redistribute
+
+        input_dtype = self._local_tensor.dtype
+        forward_dtype = forward_dtype or input_dtype
+        return Redistribute.apply(
+            self,
             mesh,
             target,
-            shape=self._shape,
-            stride=self._stride,
-            backward_dtype=backward_dtype,
+            async_op,
+            {
+                "op_dtype": forward_dtype,
+                "out_dtype": forward_dtype,
+                "backward_options": {
+                    "op_dtype": backward_dtype or input_dtype,
+                    "out_dtype": input_dtype,
+                },
+            },
         )
 
     def detach(self) -> "DTensor":
@@ -791,6 +427,7 @@ class DTensor:
         )
 
     def __create_write_items__(self, fqn: str, object: Any) -> list[Any]:
+        self._raise_if_contains_partial_placements()
         create_items = getattr(self._local_tensor, "__create_write_items__", None)
         if callable(create_items):
             return list(create_items(fqn, object))
@@ -799,6 +436,7 @@ class DTensor:
         return [_create_write_item_for_dtensor(fqn, self)]
 
     def __create_chunk_list__(self) -> list[Any]:
+        self._raise_if_contains_partial_placements()
         create_chunks = getattr(self._local_tensor, "__create_chunk_list__", None)
         if callable(create_chunks):
             return list(create_chunks())
@@ -810,6 +448,12 @@ class DTensor:
             return [_create_chunk_from_dtensor(self)]
         offsets, sizes = self._local_chunk
         return [ChunkStorageMetadata(offsets, sizes)]
+
+    def _raise_if_contains_partial_placements(self) -> None:
+        if any(isinstance(placement, Partial) for placement in self._placements):
+            raise ValueError(
+                "checkpoint operations do not support partial placements"
+            )
 
     def __get_tensor_shard__(self, index: Any) -> Any:
         get_shard = getattr(self._local_tensor, "__get_tensor_shard__", None)
@@ -841,6 +485,11 @@ class DTensor:
             return self._op_dispatcher.dispatch_method(self, name, args, kwargs)
 
         return invoke
+
+    def __getitem__(self, index: Any) -> Any:
+        return self._op_dispatcher.dispatch_method(
+            self, "__getitem__", (index,), {}
+        )
 
     def _binary(
         self,
@@ -938,7 +587,7 @@ def distribute_tensor(
                 value = _replicate(value, mesh, mesh_dim, src_data_rank)
             elif isinstance(placement, Partial):
                 value = _replicate(value, mesh, mesh_dim, src_data_rank)
-                value = _partition_partial(value, placement, mesh, mesh_dim)
+                value = placement._partition_value(value, mesh, mesh_dim)
             else:
                 raise RuntimeError(f"unsupported placement {placement!r}")
     return DTensor(
@@ -1102,7 +751,7 @@ def _factory(
             local = operation(local_size, **kwargs)
         for mesh_dim, placement in enumerate(normalized):
             if isinstance(placement, Partial):
-                local = _partition_partial(local, placement, mesh, mesh_dim)
+                local = placement._partition_value(local, mesh, mesh_dim)
     return DTensor(
         local,
         mesh,
