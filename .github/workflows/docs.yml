@@ -40,6 +40,13 @@ jobs:
 
       # Sphinx autodoc imports tensorplay._C, so the extension must be built.
       # CPU-only keeps the build fast and GPU-free.
+      - name: Install Linux build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libopenblas-dev 1>/dev/null
+
       - name: Restore vendored build dependencies
         shell: bash
         run: bash .github/scripts/restore-vendored-deps.sh
