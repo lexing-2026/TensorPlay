@@ -2575,6 +2575,7 @@
   variants: function, method
   dispatch:
     CPU: flip_cpu
+    CUDA: flip_cuda
 
 - func: index_select(Tensor self, int dim, Tensor index) -> Tensor
   variants: function, method
