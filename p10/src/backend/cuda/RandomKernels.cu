@@ -837,6 +837,7 @@ Tensor poisson_kernel_cuda(const Tensor& self) {
     Tensor t(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
     int64_t n = self.numel();
     if (n == 0) return t;
+    const Tensor input = self.is_contiguous() ? self : self.contiguous();
     const int threads = 256;
     const int blocks = static_cast<int>((n + threads - 1) / threads);
     // Each thread runs curand_poisson which consumes lambda-dependent counters;
@@ -848,12 +849,18 @@ Tensor poisson_kernel_cuda(const Tensor& self) {
 
     if (self.dtype() == DType::Float32) {
         poisson_fill_impl<float><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
-            n, philox_args, self.data_ptr<float>(), t.data_ptr<float>());
+            n, philox_args, input.data_ptr<float>(), t.data_ptr<float>());
     } else if (self.dtype() == DType::Float64) {
         poisson_fill_impl<double><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
-            n, philox_args, self.data_ptr<double>(), t.data_ptr<double>());
+            n, philox_args, input.data_ptr<double>(), t.data_ptr<double>());
+    } else if (self.dtype() == DType::Float16) {
+        poisson_fill_impl<Half><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+            n, philox_args, input.data_ptr<Half>(), t.data_ptr<Half>());
+    } else if (self.dtype() == DType::BFloat16) {
+        poisson_fill_impl<BFloat16><<<blocks, threads, 0, getCurrentCUDAStream().stream()>>>(
+            n, philox_args, input.data_ptr<BFloat16>(), t.data_ptr<BFloat16>());
     } else {
-        TP_THROW(NotImplementedError, "poisson() only supports Float32/Float64 on CUDA for now");
+        TP_THROW(NotImplementedError, "poisson() only supports floating dtypes on CUDA");
     }
     cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess) {
