@@ -122,6 +122,190 @@ __global__ void cast_complex_to_complex_kernel(
                         static_cast<RD>(src[src_offset].y)};
 }
 
+// ---------------------------------------------------------------------------
+// Tiled 2-D transpose copy.  dst is the row-major [rows, cols] contiguous
+// tensor; src is the [rows, cols] live transpose view of row-major
+// [cols, rows] storage, with flat addressing r + c*rows.  The two flat
+// layouts are transposes of each other.  Each block stages a 32x32 tile
+// through shared memory: the read pass walks the view's contiguous axis
+// (rows, stride 1) and the write pass walks the destination rows'
+// contiguous axis (cols, stride 1), so both global passes are fully
+// coalesced for any aspect ratio; the +1 lane padding in the tile removes
+// the shared-memory bank conflict that the direct strided copy hits on
+// every element.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr int kTransTile = 32;
+constexpr int kTransBlockRows = 8;
+
+template <typename T>
+__global__ void transpose_tiled_kernel(
+    T* __restrict__ dst, const T* __restrict__ src,
+    int64_t rows, int64_t cols) {
+    __shared__ T tile[kTransTile][kTransTile + 1];
+
+    const int64_t r_base = static_cast<int64_t>(blockIdx.x) * kTransTile;
+    const int64_t c_base = static_cast<int64_t>(blockIdx.y) * kTransTile;
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+
+    // Read phase: one warp per column stripe, lanes stride along the view's
+    // contiguous axis (rows) at unit stride.
+    const int64_t r = r_base + tx;
+    const int64_t c = c_base + ty;
+#pragma unroll
+    for (int j = 0; j < kTransTile; j += kTransBlockRows) {
+        if (r < rows && c + j < cols)
+            tile[ty + j][tx] = src[r + (c + j) * rows];
+    }
+    __syncthreads();
+
+    // Write phase: transpose the lane mapping (tx now indexes the column
+    // axis) so dst writes also walk unit stride along dst rows.
+    const int64_t r2 = r_base + ty;
+    const int64_t c2 = c_base + tx;
+#pragma unroll
+    for (int j = 0; j < kTransTile; j += kTransBlockRows) {
+        if (r2 + j < rows && c2 < cols)
+            dst[(r2 + j) * cols + c2] = tile[tx][ty + j];
+    }
+}
+
+// Vectorized rectangular transpose: a 64x64 tile staged by 256 threads, each
+// moving one 16-byte packet per stripe on both the read and the write pass.
+// Every global transaction therefore spans 512 contiguous bytes instead of
+// the 128 bytes a lane-per-element walk produces, which is what separates
+// this schedule from the scalar tile above on narrow-memory parts.
+constexpr int kTransVecTile = 64;
+
+__global__ void transpose_tiled_vec4_kernel(
+    float* __restrict__ dst, const float* __restrict__ src,
+    int64_t rows, int64_t cols) {
+    __shared__ float tile[kTransVecTile][kTransVecTile + 1];
+
+    const int64_t r_base = static_cast<int64_t>(blockIdx.x) * kTransVecTile;
+    const int64_t c_base = static_cast<int64_t>(blockIdx.y) * kTransVecTile;
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+
+    // Full 4x4 sub-tiles take the packet path; sub-tiles that straddle the
+    // matrix edge fall back to guarded scalar moves so no element is
+    // skipped.  Packet starts stay 16-byte aligned whenever both extents are
+    // multiples of four (gated by the host launcher).  The write phase swaps
+    // the axis roles of the lane indices, so it carries its own bounds flags.
+    const bool full = (r_base + tx * 4 + 4 <= rows) && (c_base + ty * 4 + 4 <= cols);
+    const bool any = (r_base + tx * 4 < rows) && (c_base + ty * 4 < cols);
+
+    float v[4][4];
+    if (full) {
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float4 pack = *reinterpret_cast<const float4*>(
+                src + (r_base + tx * 4) + (c_base + ty * 4 + i) * rows);
+            v[i][0] = pack.x;
+            v[i][1] = pack.y;
+            v[i][2] = pack.z;
+            v[i][3] = pack.w;
+        }
+    } else if (any) {
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int64_t c = c_base + ty * 4 + i;
+                const int64_t r = r_base + tx * 4 + j;
+                v[i][j] = (r < rows && c < cols) ? src[r + c * rows] : 0.0f;
+            }
+        }
+    }
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j)
+            tile[ty * 4 + i][tx * 4 + j] = v[i][j];
+    }
+    __syncthreads();
+
+    // Write phase: the lane mapping swaps axes, so each lane stores one
+    // 4-wide packet of one destination row at unit stride along cols.
+    const bool full_w = (r_base + tx * 4 + 4 <= rows) && (c_base + ty * 4 + 4 <= cols);
+    const bool any_w = (r_base + tx * 4 < rows) && (c_base + ty * 4 < cols);
+    if (full_w) {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            float4 out;
+            out.x = tile[ty * 4 + 0][tx * 4 + j];
+            out.y = tile[ty * 4 + 1][tx * 4 + j];
+            out.z = tile[ty * 4 + 2][tx * 4 + j];
+            out.w = tile[ty * 4 + 3][tx * 4 + j];
+            *reinterpret_cast<float4*>(
+                dst + (r_base + tx * 4 + j) * cols + (c_base + ty * 4)) = out;
+        }
+    } else if (any_w) {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                const int64_t r = r_base + tx * 4 + j;
+                const int64_t c = c_base + ty * 4 + c;
+                if (r < rows && c < cols)
+                    dst[r * cols + c] = tile[ty * 4 + c][tx * 4 + j];
+            }
+        }
+    }
+}
+
+// dst is a [rows, cols] column-major view of a [cols, rows] row-major
+// source: the two storages agree element for element, so the copy
+// degenerates to memcpy.
+bool transpose_layout_is_identity(const Tensor& self, const Tensor& src) {
+    return self.dim() == 2 && src.dim() == 2 &&
+           self.size(0) == src.size(1) && self.size(1) == src.size(0) &&
+           self.stride(0) == 1 && self.stride(1) == self.size(0);
+}
+
+// src is the [rows, cols] transpose view of row-major [cols, rows] storage:
+// unit stride over rows, the destination row count over cols.
+bool transpose_layout_is_tiled_copy(const Tensor& self, const Tensor& src) {
+    if (self.dim() != 2 || src.dim() != 2 || self.dtype() != src.dtype())
+        return false;
+    if (!self.is_contiguous()) return false;
+    if (self.size(0) != src.size(0) || self.size(1) != src.size(1))
+        return false;
+    if (src.stride(0) != 1 || src.stride(1) != self.size(0)) return false;
+    const int64_t total = self.numel();
+    if (total < kTransTile * kTransTile * 4) return false;
+    switch (src.itemsize()) {
+        case 1: case 2: case 4: case 8: return true;
+        default: return false;
+    }
+}
+
+// Same layout contract as the scalar tile, restricted to the float32 case
+// with both extents multiple of four (so every 4-float packet starts
+// 16-byte aligned) and both base pointers 16-byte aligned.
+bool transpose_layout_is_tiled_copy_vec(const Tensor& self, const Tensor& src) {
+    if (self.dim() != 2 || src.dim() != 2 ||
+        self.dtype() != DType::Float32)
+        return false;
+    if (!self.is_contiguous()) return false;
+    if (self.size(0) != src.size(0) || self.size(1) != src.size(1))
+        return false;
+    if (src.stride(0) != 1 || src.stride(1) != self.size(0)) return false;
+    const int64_t rows = self.size(0);
+    const int64_t cols = self.size(1);
+    if (rows < 256 || cols < 256) return false;
+    if (rows % 4 != 0 || cols % 4 != 0) return false;
+    if ((reinterpret_cast<uintptr_t>(self.data_ptr()) |
+         reinterpret_cast<uintptr_t>(src.data_ptr())) & 15u)
+        return false;
+    return true;
+}
+
+}  // namespace
+
 Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
     if (self.numel() != src.numel()) {
         TP_THROW(RuntimeError, "Sizes do not match for copy");
@@ -175,7 +359,64 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
         }
         return self;
     }
-    
+
+    // Transposed 2-D views: a column-major destination over a row-major
+    // source (or the reverse) is either an identity re-labelling or a full
+    // tile transpose; both beat the generic per-element strided walker.
+    if (src_cuda && self.dtype() == src.dtype() &&
+        transpose_layout_is_identity(self, src)) {
+        const size_t nbytes = self.numel() * self.itemsize();
+        checkCuda(cudaMemcpyAsync(self.data_ptr(), src.data_ptr(), nbytes,
+                                  cudaMemcpyDeviceToDevice, stream.stream()),
+                  "cudaMemcpyAsync (transposed identity)");
+        return self;
+    }
+    if (src_cuda && transpose_layout_is_tiled_copy_vec(self, src)) {
+        const int64_t rows = self.size(0);
+        const int64_t cols = self.size(1);
+        dim3 block(kTransVecTile / 4, kTransVecTile / 4);
+        dim3 grid(static_cast<unsigned>((rows + kTransVecTile - 1) / kTransVecTile),
+                  static_cast<unsigned>((cols + kTransVecTile - 1) / kTransVecTile));
+        transpose_tiled_vec4_kernel<<<grid, block, 0, stream.stream()>>>(
+            static_cast<float*>(self.data_ptr()),
+            static_cast<const float*>(src.data_ptr()), rows, cols);
+        checkCuda(cudaGetLastError(), "CUDA vectorized tiled transpose copy");
+        return self;
+    }
+    if (src_cuda && transpose_layout_is_tiled_copy(self, src)) {
+        const int64_t rows = self.size(0);
+        const int64_t cols = self.size(1);
+        dim3 block(kTransTile, kTransBlockRows);
+        dim3 grid(static_cast<unsigned>((rows + kTransTile - 1) / kTransTile),
+                  static_cast<unsigned>((cols + kTransTile - 1) / kTransTile));
+        switch (src.itemsize()) {
+            case 1:
+                transpose_tiled_kernel<uint8_t><<<grid, block, 0, stream.stream()>>>(
+                    static_cast<uint8_t*>(self.data_ptr()),
+                    static_cast<const uint8_t*>(src.data_ptr()), rows, cols);
+                break;
+            case 2:
+                transpose_tiled_kernel<uint16_t><<<grid, block, 0, stream.stream()>>>(
+                    static_cast<uint16_t*>(self.data_ptr()),
+                    static_cast<const uint16_t*>(src.data_ptr()), rows, cols);
+                break;
+            case 4:
+                transpose_tiled_kernel<uint32_t><<<grid, block, 0, stream.stream()>>>(
+                    static_cast<uint32_t*>(self.data_ptr()),
+                    static_cast<const uint32_t*>(src.data_ptr()), rows, cols);
+                break;
+            case 8:
+                transpose_tiled_kernel<uint64_t><<<grid, block, 0, stream.stream()>>>(
+                    static_cast<uint64_t*>(self.data_ptr()),
+                    static_cast<const uint64_t*>(src.data_ptr()), rows, cols);
+                break;
+            default:
+                break;
+        }
+        checkCuda(cudaGetLastError(), "CUDA tiled transpose copy");
+        return self;
+    }
+
     // Strided copy or Casting copy
     // If src is CPU, we must move it to CUDA first (to a contiguous buffer)
     Tensor src_cuda_tensor = src;
