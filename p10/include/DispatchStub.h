@@ -8,6 +8,13 @@
 // the fastest available kernel is chosen based on the features reported by
 // the CPU.
 //
+// Architecture tiers: on x86 the tiers are AVX2/AVX512; PowerPC builds
+// dispatch to a VSX tier; s390x builds dispatch to a ZVECTOR tier (vector
+// extension, requires the VXE hardware feature); aarch64 builds dispatch to
+// SVE256/SVE128 tiers selected by the SVE vector length. The tier set is
+// selected by the build system via the HAVE_*_CPU_DEFINITION macros, so
+// exactly one architecture family exists in any given binary.
+//
 // Example:
 //
 // In native/MyKernel.h:
@@ -39,10 +46,15 @@ namespace cpu {
 
 enum class CPUCapability {
   DEFAULT = 0,
-#if defined(HAVE_AVX2_CPU_DEFINITION)
+#if defined(HAVE_VSX_CPU_DEFINITION)
+  VSX = 1,
+#elif defined(HAVE_ZVECTOR_CPU_DEFINITION)
+  ZVECTOR = 1,
+#elif defined(HAVE_SVE_CPU_DEFINITION)
+  SVE256 = 1,
+  SVE128 = 2,
+#else
   AVX2 = 1,
-#endif
-#if defined(HAVE_AVX512_CPU_DEFINITION)
   AVX512 = 2,
 #endif
   NUM_OPTIONS
@@ -84,6 +96,16 @@ struct P10_API CPUDispatchStubImpl {
 #ifdef HAVE_AVX2_CPU_DEFINITION
       , void *AVX2
 #endif
+#ifdef HAVE_VSX_CPU_DEFINITION
+      , void *VSX
+#endif
+#ifdef HAVE_ZVECTOR_CPU_DEFINITION
+      , void *ZVECTOR
+#endif
+#ifdef HAVE_SVE_CPU_DEFINITION
+      , void *SVE128
+      , void *SVE256
+#endif
   );
 
   // Analogous to try_get_call_ptr(), but it will return the ErrorType and not
@@ -96,6 +118,16 @@ struct P10_API CPUDispatchStubImpl {
 #ifdef HAVE_AVX2_CPU_DEFINITION
     , void *AVX2
 #endif
+#ifdef HAVE_VSX_CPU_DEFINITION
+    , void *VSX
+#endif
+#ifdef HAVE_ZVECTOR_CPU_DEFINITION
+    , void *ZVECTOR
+#endif
+#ifdef HAVE_SVE_CPU_DEFINITION
+    , void *SVE128
+    , void *SVE256
+#endif
   );
 
   void* get_call_ptr(
@@ -106,6 +138,16 @@ struct P10_API CPUDispatchStubImpl {
 #endif
 #ifdef HAVE_AVX2_CPU_DEFINITION
       , void *AVX2
+#endif
+#ifdef HAVE_VSX_CPU_DEFINITION
+      , void *VSX
+#endif
+#ifdef HAVE_ZVECTOR_CPU_DEFINITION
+      , void *ZVECTOR
+#endif
+#ifdef HAVE_SVE_CPU_DEFINITION
+      , void *SVE128
+      , void *SVE256
 #endif
   );
 
@@ -121,6 +163,16 @@ struct P10_API CPUDispatchStubImpl {
 #endif
 #ifdef HAVE_AVX2_CPU_DEFINITION
     , void *AVX2
+#endif
+#ifdef HAVE_VSX_CPU_DEFINITION
+    , void *VSX
+#endif
+#ifdef HAVE_ZVECTOR_CPU_DEFINITION
+    , void *ZVECTOR
+#endif
+#ifdef HAVE_SVE_CPU_DEFINITION
+    , void *SVE128
+    , void *SVE256
 #endif
   );
 
@@ -151,6 +203,16 @@ private:
 #ifdef HAVE_AVX2_CPU_DEFINITION
       , reinterpret_cast<void*>(AVX2)
 #endif
+#ifdef HAVE_VSX_CPU_DEFINITION
+      , reinterpret_cast<void*>(VSX)
+#endif
+#ifdef HAVE_ZVECTOR_CPU_DEFINITION
+      , reinterpret_cast<void*>(ZVECTOR)
+#endif
+#ifdef HAVE_SVE_CPU_DEFINITION
+      , reinterpret_cast<void*>(SVE128)
+      , reinterpret_cast<void*>(SVE256)
+#endif
       )
     );
   }
@@ -173,6 +235,16 @@ public:
 #ifdef HAVE_AVX2_CPU_DEFINITION
       , reinterpret_cast<void*>(AVX2)
 #endif
+#ifdef HAVE_VSX_CPU_DEFINITION
+      , reinterpret_cast<void*>(VSX)
+#endif
+#ifdef HAVE_ZVECTOR_CPU_DEFINITION
+      , reinterpret_cast<void*>(ZVECTOR)
+#endif
+#ifdef HAVE_SVE_CPU_DEFINITION
+      , reinterpret_cast<void*>(SVE128)
+      , reinterpret_cast<void*>(SVE256)
+#endif
       );
     if (std::holds_alternative<ErrorType>(result)){
       return false;
@@ -186,6 +258,16 @@ public:
 #endif
 #ifdef HAVE_AVX2_CPU_DEFINITION
   static P10_API FnPtr AVX2;
+#endif
+#ifdef HAVE_VSX_CPU_DEFINITION
+  static P10_API FnPtr VSX;
+#endif
+#ifdef HAVE_ZVECTOR_CPU_DEFINITION
+  static P10_API FnPtr ZVECTOR;
+#endif
+#ifdef HAVE_SVE_CPU_DEFINITION
+  static P10_API FnPtr SVE128;
+  static P10_API FnPtr SVE256;
 #endif
 private:
   CPUDispatchStubImpl impl;
@@ -219,12 +301,36 @@ private:
 #define REGISTER_AVX2_DISPATCH(name, fn)
 #endif
 
+#ifdef HAVE_VSX_CPU_DEFINITION
+#define REGISTER_VSX_DISPATCH(name, fn) REGISTER_ARCH_DISPATCH(name, VSX, fn)
+#else
+#define REGISTER_VSX_DISPATCH(name, fn)
+#endif
+
+#ifdef HAVE_ZVECTOR_CPU_DEFINITION
+#define REGISTER_ZVECTOR_DISPATCH(name, fn) REGISTER_ARCH_DISPATCH(name, ZVECTOR, fn)
+#else
+#define REGISTER_ZVECTOR_DISPATCH(name, fn)
+#endif
+
+#ifdef HAVE_SVE_CPU_DEFINITION
+#define REGISTER_SVE128_DISPATCH(name, fn) REGISTER_ARCH_DISPATCH(name, SVE128, fn)
+#define REGISTER_SVE256_DISPATCH(name, fn) REGISTER_ARCH_DISPATCH(name, SVE256, fn)
+#else
+#define REGISTER_SVE128_DISPATCH(name, fn)
+#define REGISTER_SVE256_DISPATCH(name, fn)
+#endif
+
 // Macro to register the same kernel for all CPU arch types. This is useful
 // if a kernel does not benefit from being recompiled across different arch types.
 #define REGISTER_ALL_CPU_DISPATCH(name, fn)                                    \
   REGISTER_ARCH_DISPATCH(name, DEFAULT, fn)                                    \
   REGISTER_AVX512_DISPATCH(name, fn)                                           \
-  REGISTER_AVX2_DISPATCH(name, fn)
+  REGISTER_AVX2_DISPATCH(name, fn)                                             \
+  REGISTER_VSX_DISPATCH(name, fn)                                              \
+  REGISTER_ZVECTOR_DISPATCH(name, fn)                                          \
+  REGISTER_SVE128_DISPATCH(name, fn)                                           \
+  REGISTER_SVE256_DISPATCH(name, fn)
 
 #define REGISTER_NO_CPU_DISPATCH(name)                                         \
   REGISTER_ALL_CPU_DISPATCH(name, nullptr)
@@ -232,12 +338,15 @@ private:
 #if defined(CPU_CAPABILITY)
 // REGISTER_DISPATCH now dispatches an AVX512 kernel to nullptr but registers other dispatches.
 // ALSO_REGISTER_AVX512_DISPATCH should be used for ensuring AVX512 dispatch, among others.
+// ALSO_REGISTER_SVE256_DISPATCH should be used for ensuring SVE256 dispatch, among others.
 #ifdef CPU_CAPABILITY_AVX512
 #define REGISTER_DISPATCH(name, fn) REGISTER_ARCH_DISPATCH(name, CPU_CAPABILITY, ((void*)(fn) ? nullptr : nullptr))
 #else
 #define REGISTER_DISPATCH(name, fn) REGISTER_ARCH_DISPATCH(name, CPU_CAPABILITY, fn)
 #endif
 #define ALSO_REGISTER_AVX512_DISPATCH(name, fn) REGISTER_ARCH_DISPATCH(name, CPU_CAPABILITY, fn)
+#define ALSO_REGISTER_SVE128_DISPATCH(name, fn) REGISTER_ARCH_DISPATCH(name, CPU_CAPABILITY, fn)
+#define ALSO_REGISTER_SVE256_DISPATCH(name, fn) REGISTER_ARCH_DISPATCH(name, CPU_CAPABILITY, fn)
 #endif
 
 } // namespace cpu

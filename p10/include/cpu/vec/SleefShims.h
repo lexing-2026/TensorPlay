@@ -12,8 +12,8 @@
 // libsleef; they pick the AVX-512/AVX2 implementation for the running CPU.
 // No ISA macros are required to declare or call them.
 //
-// Precision tiers follow the reference vec layer: u10 for most functions,
-// u35 for single-precision sin/cos, u15 for erfc and u05 for hypot.
+// Precision tiers: u10 for most functions, u35 for single-precision sin/cos,
+// u15 for erfc and u05 for hypot.
 // Gate for consumers: the SIMD call sites themselves must be compiled only
 // where the surrounding code already guarantees AVX2/AVX-512 support
 // (capability TUs or target-attributed functions).
