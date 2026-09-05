@@ -501,6 +501,7 @@ Tensor flip_cuda(const Tensor& self, const std::vector<int64_t>& dims) {
         break;
     switch (sc.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_FL2)
+        TENSORPLAY_FORALL_QINT_TYPES(TP_FL2)
         default: TP_THROW(TypeError, "flip: unsupported dtype");
     }
 #undef TP_FL2
