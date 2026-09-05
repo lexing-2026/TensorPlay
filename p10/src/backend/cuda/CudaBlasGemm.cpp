@@ -380,6 +380,17 @@ void gemm_impl(const Tensor& self, const Tensor& other, Tensor& result,
 #else
     const bool prefer_classic_precision = false;
 #endif
+    // The custom half-precision GEMV kernels cover the memory-bound skinny
+    // shapes (single vector or a small activation batch against a large
+    // output axis), where the BLAS tile kernels run far below the copy
+    // bandwidth.  beta != 0 is fine: the kernels read-modify-write the
+    // output, matching this function's accumulate contract.  With a bias the
+    // epilogue path below stays in charge.
+    if (!has_bias && (dtype == DType::Float16 || dtype == DType::BFloat16) &&
+        try_half_gemv(self_contig, other_transposed ? other : other_contig,
+                      result, alpha, beta, other_transposed)) {
+        return;
+    }
     if (!has_bias && (dtype == DType::Float16 || dtype == DType::BFloat16 ||
                       prefer_classic_precision)) {
         const cudaDataType_t cuda_type = to_cublas_type(dtype);

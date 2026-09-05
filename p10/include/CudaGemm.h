@@ -26,5 +26,15 @@ void gemm_strided_batched_3d(const Tensor& self_3d, const Tensor& other_3d,
 // Zero-fill used for empty-K GEMM outputs.
 Tensor& zero_matmul_output_cuda(Tensor& output);
 
+// Half-precision GEMV fast path for the memory-bound shapes: N == 1
+// (matrix @ vector) or a small activation batch (M <= 8) against a large
+// output axis.  `other_transposed` reports that `other` is a live (K, N)
+// view of contiguous (N, K) row-major storage (the x @ W.t() pattern), whose
+// rows the kernel walks directly.  Returns false when the shape falls
+// outside the custom kernels' envelope and the caller must use the classic
+// GEMM entry.
+bool try_half_gemv(const Tensor& self, const Tensor& other, Tensor& result,
+                   double alpha, double beta, bool other_transposed);
+
 } // namespace cuda
 } // namespace tensorplay

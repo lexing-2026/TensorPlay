@@ -167,6 +167,7 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/CUDARuntimeKernels.cu
         src/backend/cuda/ArithmeticKernels.cu
         src/backend/cuda/CopyKernels.cu
+        src/backend/cuda/HalfGemmKernels.cu
         src/backend/cuda/Cross.cu
         src/backend/cuda/SparseKernels.cu
         src/backend/cuda/SemiStructuredKernels.cu
