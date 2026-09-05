@@ -2,6 +2,7 @@ unary_op:
   parameter_names_with_default_values:
     OPERATOR: exp(X)
     INPLACE: false
+    DTYPE: float
   generate_variant_forall:
     INPLACE:
       - VALUE: false
@@ -17,7 +18,13 @@ unary_op:
       OPERATOR: log(X)
     - NAME: abs
       OPERATOR: abs(X)
+    - NAME: abs_i32
+      DTYPE: int
+      OPERATOR: abs(X)
     - NAME: neg
+      OPERATOR: -X
+    - NAME: neg_i32
+      DTYPE: int
       OPERATOR: -X
     - NAME: tanh
       OPERATOR: tanh(X)
@@ -27,17 +34,83 @@ unary_op:
       OPERATOR: floor(X)
     - NAME: sin
       OPERATOR: sin(X)
+    - NAME: sin_i32
+      DTYPE: int
+      OPERATOR: X
     - NAME: cos
       OPERATOR: cos(X)
+    - NAME: cos_i32
+      DTYPE: int
+      OPERATOR: X
     - NAME: relu
       OPERATOR: max(X, 0.0f)
+    - NAME: relu_i32
+      DTYPE: int
+      OPERATOR: max(X, ivec4(0))
     - NAME: rsqrt
       OPERATOR: inversesqrt(X)
+    - NAME: sign
+      OPERATOR: sign(X)
+    - NAME: sign_i32
+      DTYPE: int
+      OPERATOR: sign(X)
+    - NAME: ceil
+      OPERATOR: ceil(X)
+    - NAME: round
+      OPERATOR: round(X)
+    - NAME: round_half_even
+      OPERATOR: roundEven(X)
+    - NAME: trunc
+      OPERATOR: trunc(X)
+    - NAME: tan
+      OPERATOR: tan(X)
+    - NAME: sinh
+      OPERATOR: sinh(X)
+    - NAME: cosh
+      OPERATOR: cosh(X)
+    - NAME: asin
+      OPERATOR: asin(X)
+    - NAME: acos
+      OPERATOR: acos(X)
+    - NAME: atan
+      OPERATOR: atan(X)
+    - NAME: exp2
+      OPERATOR: exp2(X)
+    - NAME: expm1
+      OPERATOR: exp(X) - 1.0f
+    - NAME: log1p
+      OPERATOR: log(1.0f + X)
+    - NAME: log2
+      OPERATOR: log2(X)
+    - NAME: log10
+      OPERATOR: log2(X) * 0.3010299956639812f
+    - NAME: sqrt_i32
+      DTYPE: int
+      OPERATOR: ivec4(sqrt(vec4(X)))
+    - NAME: ceil_i32
+      DTYPE: int
+      OPERATOR: X
+    - NAME: floor_i32
+      DTYPE: int
+      OPERATOR: X
+    - NAME: trunc_i32
+      DTYPE: int
+      OPERATOR: X
+    - NAME: square_i32
+      DTYPE: int
+      OPERATOR: X * X
+    - NAME: reciprocal_i32
+      DTYPE: int
+      OPERATOR: ivec4(1.0f / vec4(X))
+    - NAME: sigmoid_i32
+      DTYPE: int
+      OPERATOR: ivec4(1.0f / (1.0f + exp(-vec4(X))))
 
 binary_op_scalar:
   parameter_names_with_default_values:
     OPERATOR: X + Y
     INPLACE: false
+    DTYPE: float
   generate_variant_forall:
     INPLACE:
       - VALUE: false
@@ -47,18 +120,41 @@ binary_op_scalar:
   shader_variants:
     - NAME: add_scalar
       OPERATOR: X + Y
+    - NAME: add_scalar_i32
+      DTYPE: int
+      OPERATOR: X + Y
     - NAME: mul_scalar
+      OPERATOR: X * Y
+    - NAME: mul_scalar_i32
+      DTYPE: int
       OPERATOR: X * Y
     - NAME: pow_tensor_scalar
       OPERATOR: pow (X, Y)
     - NAME: floor_mul_scalar
       OPERATOR: floor(X * Y)
+    - NAME: floor_mul_scalar_i32
+      DTYPE: int
+      OPERATOR: ivec4(floor(vec4(X) * vec4(Y)))
+    - NAME: rsub_scalar
+      OPERATOR: Y - X
+    - NAME: rsub_scalar_i32
+      DTYPE: int
+      OPERATOR: Y - X
+    - NAME: pow_tensor_scalar_i32
+      DTYPE: int
+      OPERATOR: ivec4(pow(vec4(X), vec4(Y)))
+    - NAME: div_scalar_i32
+      DTYPE: int
+      OPERATOR: X / Y
+    - NAME: mul_scalar_recip
+      OPERATOR: X * Y
 
 binary_op_tensor:
   parameter_names_with_default_values:
     IS_DIV: false
     OPERATOR: X + A * Y
     INPLACE: false
+    DTYPE: float
   generate_variant_forall:
     INPLACE:
       - VALUE: false
@@ -68,11 +164,24 @@ binary_op_tensor:
   shader_variants:
     - NAME: add
       OPERATOR: X + A * Y
+    - NAME: add_i32
+      DTYPE: int
+      OPERATOR: X + A * Y
     - NAME: sub
+      OPERATOR: X - A * Y
+    - NAME: sub_i32
+      DTYPE: int
       OPERATOR: X - A * Y
     - NAME: mul
       OPERATOR: X * Y
+    - NAME: mul_i32
+      DTYPE: int
+      OPERATOR: X * Y
     - NAME: div
+      IS_DIV: true
+      OPERATOR: X / Y
+    - NAME: div_i32
+      DTYPE: int
       IS_DIV: true
       OPERATOR: X / Y
     - NAME: pow
@@ -80,13 +189,45 @@ binary_op_tensor:
     - NAME: floor_divide
       IS_DIV: true
       OPERATOR: floor(X / Y)
+    - NAME: floor_divide_i32
+      DTYPE: int
+      IS_DIV: true
+      OPERATOR: ivec4(floor(vec4(X) / vec4(Y)))
     - NAME: sq_diff
+      OPERATOR: (X - Y) * (X - Y)
+    - NAME: maximum
+      OPERATOR: max(X, Y)
+    - NAME: maximum_i32
+      DTYPE: int
+      OPERATOR: max(X, Y)
+    - NAME: minimum
+      OPERATOR: min(X, Y)
+    - NAME: minimum_i32
+      DTYPE: int
+      OPERATOR: min(X, Y)
+    - NAME: atan2
+      OPERATOR: atan(X, Y)
+    - NAME: remainder
+      OPERATOR: X - Y * floor(X / Y)
+    - NAME: remainder_i32
+      DTYPE: int
+      OPERATOR: X - Y * (X / Y)
+    - NAME: fmod
+      OPERATOR: X - Y * trunc(X / Y)
+    - NAME: fmod_i32
+      DTYPE: int
+      OPERATOR: X - Y * (X / Y)
+    - NAME: logaddexp
+      OPERATOR: max(X, Y) + log(1.0f + exp(-abs(X - Y)))
+    - NAME: sq_diff_i32
+      DTYPE: int
       OPERATOR: (X - Y) * (X - Y)
 
 clamp:
   parameter_names_with_default_values:
     OPERATOR: clamp(X, min_val, max_val)
     INPLACE: false
+    DTYPE: float
   generate_variant_forall:
     INPLACE:
       - VALUE: false
@@ -96,11 +237,15 @@ clamp:
   shader_variants:
     - NAME: clamp
       OPERATOR: clamp(X, min_val, max_val)
+    - NAME: clamp_i32
+      DTYPE: int
+      OPERATOR: clamp(X, min_val, max_val)
 
 buffer_unary_op:
   parameter_names_with_default_values:
     OPERATOR: X
     INPLACE: false
+    DTYPE: float
   generate_variant_forall:
     INPLACE:
       - VALUE: false
@@ -116,7 +261,13 @@ buffer_unary_op:
       OPERATOR: log(X)
     - NAME: buffer_abs
       OPERATOR: abs(X)
+    - NAME: buffer_abs_i32
+      DTYPE: int
+      OPERATOR: abs(X)
     - NAME: buffer_neg
+      OPERATOR: -X
+    - NAME: buffer_neg_i32
+      DTYPE: int
       OPERATOR: -X
     - NAME: buffer_tanh
       OPERATOR: tanh(X)
@@ -130,13 +281,72 @@ buffer_unary_op:
       OPERATOR: cos(X)
     - NAME: buffer_relu
       OPERATOR: max(X, 0.0f)
+    - NAME: buffer_relu_i32
+      DTYPE: int
+      OPERATOR: max(X, 0)
     - NAME: buffer_rsqrt
       OPERATOR: inversesqrt(X)
+    - NAME: buffer_sign
+      OPERATOR: sign(X)
+    - NAME: buffer_sign_i32
+      DTYPE: int
+      OPERATOR: sign(X)
+    - NAME: buffer_floor_i32
+      DTYPE: int
+      OPERATOR: X
+    - NAME: buffer_ceil
+      OPERATOR: ceil(X)
+    - NAME: buffer_ceil_i32
+      DTYPE: int
+      OPERATOR: X
+    - NAME: buffer_round
+      OPERATOR: round(X)
+    - NAME: buffer_trunc
+      OPERATOR: trunc(X)
+    - NAME: buffer_trunc_i32
+      DTYPE: int
+      OPERATOR: X
+    - NAME: buffer_tan
+      OPERATOR: tan(X)
+    - NAME: buffer_sinh
+      OPERATOR: sinh(X)
+    - NAME: buffer_cosh
+      OPERATOR: cosh(X)
+    - NAME: buffer_asin
+      OPERATOR: asin(X)
+    - NAME: buffer_acos
+      OPERATOR: acos(X)
+    - NAME: buffer_atan
+      OPERATOR: atan(X)
+    - NAME: buffer_exp2
+      OPERATOR: exp2(X)
+    - NAME: buffer_expm1
+      OPERATOR: exp(X) - 1.0f
+    - NAME: buffer_log1p
+      OPERATOR: log(1.0f + X)
+    - NAME: buffer_log2
+      OPERATOR: log2(X)
+    - NAME: buffer_log10
+      OPERATOR: log2(X) * 0.3010299956639812f
+    - NAME: buffer_square
+      OPERATOR: X * X
+    - NAME: buffer_square_i32
+      DTYPE: int
+      OPERATOR: X * X
+    - NAME: buffer_reciprocal
+      OPERATOR: 1.0f / X
+    - NAME: buffer_reciprocal_i32
+      DTYPE: int
+      OPERATOR: int(1.0f / float(X))
+    - NAME: buffer_sigmoid_i32
+      DTYPE: int
+      OPERATOR: int(1.0f / (1.0f + exp(-float(X))))
 
 buffer_binary_op_tensor:
   parameter_names_with_default_values:
     OPERATOR: X + A * Y
     INPLACE: false
+    DTYPE: float
   generate_variant_forall:
     INPLACE:
       - VALUE: false
@@ -146,17 +356,56 @@ buffer_binary_op_tensor:
   shader_variants:
     - NAME: buffer_add
       OPERATOR: X + A * Y
+    - NAME: buffer_add_i32
+      DTYPE: int
+      OPERATOR: X + A * Y
     - NAME: buffer_sub
+      OPERATOR: X - A * Y
+    - NAME: buffer_sub_i32
+      DTYPE: int
       OPERATOR: X - A * Y
     - NAME: buffer_mul
       OPERATOR: X * Y
+    - NAME: buffer_mul_i32
+      DTYPE: int
+      OPERATOR: X * Y
     - NAME: buffer_div
       OPERATOR: X / Y
+    - NAME: buffer_div_i32
+      DTYPE: int
+      OPERATOR: X / Y
+    - NAME: buffer_floor_divide
+      OPERATOR: floor(X / Y)
+    - NAME: buffer_maximum
+      OPERATOR: max(X, Y)
+    - NAME: buffer_maximum_i32
+      DTYPE: int
+      OPERATOR: max(X, Y)
+    - NAME: buffer_minimum
+      OPERATOR: min(X, Y)
+    - NAME: buffer_minimum_i32
+      DTYPE: int
+      OPERATOR: min(X, Y)
+    - NAME: buffer_remainder
+      OPERATOR: X - Y * floor(X / Y)
+    - NAME: buffer_remainder_i32
+      DTYPE: int
+      OPERATOR: X - Y * (X / Y)
+    - NAME: buffer_fmod
+      OPERATOR: X - Y * trunc(X / Y)
+    - NAME: buffer_fmod_i32
+      DTYPE: int
+      OPERATOR: X - Y * (X / Y)
+    - NAME: buffer_atan2
+      OPERATOR: atan(X, Y)
+    - NAME: buffer_logaddexp
+      OPERATOR: max(X, Y) + log(1.0f + exp(-abs(X - Y)))
 
 buffer_binary_op_scalar:
   parameter_names_with_default_values:
     OPERATOR: X + A * Y
     INPLACE: false
+    DTYPE: float
   generate_variant_forall:
     INPLACE:
       - VALUE: false
@@ -166,8 +415,27 @@ buffer_binary_op_scalar:
   shader_variants:
     - NAME: buffer_add_scalar
       OPERATOR: X + A * Y
+    - NAME: buffer_add_scalar_i32
+      DTYPE: int
+      OPERATOR: X + A * Y
     - NAME: buffer_mul_scalar
       OPERATOR: X * Y
+    - NAME: buffer_mul_scalar_i32
+      DTYPE: int
+      OPERATOR: X * Y
+    - NAME: buffer_floor_mul_scalar
+      OPERATOR: floor(X * Y)
+    - NAME: buffer_floor_mul_scalar_i32
+      DTYPE: int
+      OPERATOR: X * Y
+    - NAME: buffer_rsub_scalar
+      OPERATOR: Y - X
+    - NAME: buffer_rsub_scalar_i32
+      DTYPE: int
+      OPERATOR: Y - X
+    - NAME: buffer_div_scalar_i32
+      DTYPE: int
+      OPERATOR: X / Y
 
 mm:
   parameter_names_with_default_values: {}
@@ -341,9 +609,12 @@ compare:
       OPERATOR: greaterThanEqual(X, Y)
 
 where:
-  parameter_names_with_default_values: {}
+  parameter_names_with_default_values:
+    DTYPE: float
   shader_variants:
     - NAME: where
+    - NAME: where_i32
+      DTYPE: int
 
 embedding:
   parameter_names_with_default_values: {}
@@ -520,6 +791,7 @@ activation:
   parameter_names_with_default_values:
     OPERATOR: X
     INPLACE: false
+    DTYPE: float
   generate_variant_forall:
     INPLACE:
       - VALUE: false
@@ -533,15 +805,22 @@ activation:
       OPERATOR: "X * tanh(log1p_approx(exp(X)))"
     - NAME: relu6
       OPERATOR: "clamp(X, 0.0f, 6.0f)"
+    - NAME: relu6_i32
+      DTYPE: int
+      OPERATOR: "clamp(X, ivec4(0), ivec4(6))"
     - NAME: hardsigmoid
       OPERATOR: "clamp(X + 3.0f, 0.0f, 6.0f) / 6.0f"
     - NAME: hardswish
       OPERATOR: "X * clamp(X + 3.0f, 0.0f, 6.0f) / 6.0f"
+    - NAME: hardswish_i32
+      DTYPE: int
+      OPERATOR: "ivec4(hardswish_approx(vec4(X)))"
 
 activation_param:
   parameter_names_with_default_values:
     OPERATOR: X
     INPLACE: false
+    DTYPE: float
   generate_variant_forall:
     INPLACE:
       - VALUE: false
@@ -551,10 +830,19 @@ activation_param:
   shader_variants:
     - NAME: leaky_relu
       OPERATOR: "mix((X * P0), X, step(0.0f, X))"
+    - NAME: leaky_relu_i32
+      DTYPE: int
+      OPERATOR: "max(X * P0, X)"
     - NAME: threshold
+      OPERATOR: "mix(X, P1, lessThanEqual(X, P0))"
+    - NAME: threshold_i32
+      DTYPE: int
       OPERATOR: "mix(X, P1, lessThanEqual(X, P0))"
     - NAME: hardshrink
       OPERATOR: "mix(X, vec4(0.0f), lessThanEqual(abs(X), P0))"
+    - NAME: hardshrink_i32
+      DTYPE: int
+      OPERATOR: "mix(X, ivec4(0), lessThanEqual(abs(X), P0))"
 
 gelu:
   parameter_names_with_default_values:

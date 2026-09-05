@@ -54,3 +54,12 @@ vec4 log1p_approx(const vec4 x) {
       log1p_approx(x.z),
       log1p_approx(x.w));
 }
+
+/*
+ * Hardswish core on a float vector: the C++ ops layer casts integer
+ * payloads to float, runs this, and rounds back, so int hardware keeps the
+ * swish curve instead of a piecewise integer substitute.
+ */
+vec4 hardswish_approx(const vec4 x) {
+  return x * clamp(x + 3.0f, 0.0f, 6.0f) / 6.0f;
+}

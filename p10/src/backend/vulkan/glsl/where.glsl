@@ -2,21 +2,37 @@
 // clang-format off
 #define PRECISION ${PRECISION}
 #define FORMAT ${FORMAT}
+#define DTYPE ${DTYPE}
 // clang-format on
 
 layout(std430) buffer;
 
-layout(set = 0, binding = 0, FORMAT) uniform PRECISION restrict writeonly image3D uOutput;
-layout(set = 0, binding = 1) uniform PRECISION sampler3D uCondition;
-layout(set = 0, binding = 2) uniform PRECISION sampler3D uInput;
-layout(set = 0, binding = 3) uniform PRECISION sampler3D uOther;
-layout(set = 0, binding = 4) uniform PRECISION restrict Block {
-  // (W, H, C, N) sizes of the output
-  ivec4 out_sizes;
-  int c_depth;
-  int fill;
-}
-uBlock;
+$if DTYPE == "int":
+  // Signed-word payload planes; the condition stays a signed-byte texture.
+  layout(set = 0, binding = 0, FORMAT) uniform PRECISION restrict writeonly iimage3D uOutput;
+  layout(set = 0, binding = 1, rgba8i) uniform PRECISION restrict readonly iimage3D uCondition;
+  layout(set = 0, binding = 2, FORMAT) uniform PRECISION restrict readonly iimage3D uInput;
+  layout(set = 0, binding = 3, FORMAT) uniform PRECISION restrict readonly iimage3D uOther;
+  layout(set = 0, binding = 4) uniform PRECISION restrict Block {
+    // (W, H, C, N) sizes of the output
+    ivec4 out_sizes;
+    int c_depth;
+    int fill;
+  }
+  uBlock;
+$else:
+  layout(set = 0, binding = 0, FORMAT) uniform PRECISION restrict writeonly image3D uOutput;
+  layout(set = 0, binding = 1, rgba8i) uniform PRECISION restrict readonly iimage3D uCondition;
+  layout(set = 0, binding = 2) uniform PRECISION sampler3D uInput;
+  layout(set = 0, binding = 3) uniform PRECISION sampler3D uOther;
+  layout(set = 0, binding = 4) uniform PRECISION restrict Block {
+    // (W, H, C, N) sizes of the output
+    ivec4 out_sizes;
+    int c_depth;
+    int fill;
+  }
+  uBlock;
+// end-of-dtype-branches
 
 layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
 
@@ -34,10 +50,19 @@ void main() {
     return;
   }
 
-  const vec4 cond = mix(
-      vec4(0.0f), vec4(1.0f),
-      notEqual(texelFetch(uCondition, pos, 0), ivec4(0)));
-  const vec4 a = texelFetch(uInput, pos, 0);
-  const vec4 b = texelFetch(uOther, pos, 0);
-  imageStore(uOutput, pos, mix(b, a, cond));
+  // clang-format off
+  $if DTYPE == "int":
+    const ivec4 cond =
+        ivec4(notEqual(imageLoad(uCondition, pos), ivec4(0)));
+    const ivec4 a = imageLoad(uInput, pos);
+    const ivec4 b = imageLoad(uOther, pos);
+    imageStore(uOutput, pos, a * cond + b * (1 - cond));
+  $else:
+    const vec4 cond = mix(
+        vec4(0.0f), vec4(1.0f),
+        notEqual(imageLoad(uCondition, pos), ivec4(0)));
+    const vec4 a = texelFetch(uInput, pos, 0);
+    const vec4 b = texelFetch(uOther, pos, 0);
+    imageStore(uOutput, pos, mix(b, a, cond));
+  // clang-format on
 }

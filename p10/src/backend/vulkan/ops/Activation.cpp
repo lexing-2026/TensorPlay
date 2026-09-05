@@ -22,11 +22,28 @@ namespace {
 
 void validate_activation(const Tensor& t, const char* name) {
   TP_CHECK(
-      t.dtype() == DType::Float32,
-      std::string("Vulkan ") + name + " supports Float32 tensors only");
+      t.dtype() == DType::Float32 || t.dtype() == DType::Float16 ||
+          t.dtype() == DType::Int32,
+      std::string("Vulkan ") + name +
+          " supports Float32, Float16 and Int32 tensors only");
   TP_CHECK(
       t.dim() >= 1 && t.dim() <= 4,
       std::string("Vulkan ") + name + " supports 1d to 4d tensors");
+}
+
+// Variant resolution: Int32 payloads need the `_i32` twin of the formula
+// (registry-checked so a float-only activation fails with a clear error).
+std::string activation_variant(const std::string& base, const Tensor& t) {
+  if (t.dtype() != DType::Int32) {
+    return base;
+  }
+  std::string cand = base + "_i32";
+  TP_CHECK(
+      api::shader_registry().has_shader(cand) &&
+          api::shader_registry().has_shader(cand + "inplace"),
+      "Vulkan activation " + base +
+          " has no Int32 kernel; the op is float-only");
+  return cand;
 }
 
 // Dispatches one activation formula by shader name, covering both storage
@@ -140,7 +157,10 @@ Tensor activation_out(
 
   api::vTensor v_output{context, v_self.sizes(), v_self.dtype()};
   Tensor out = convert(v_output);
-  activation_dispatch(shader, buffer_shader, out, self, p0, p1);
+  activation_dispatch(
+      activation_variant(shader, self),
+      activation_variant(buffer_shader, self),
+      out, self, p0, p1);
   return out;
 }
 
@@ -151,7 +171,10 @@ Tensor& activation_inplace(
     float p0,
     float p1) {
   validate_activation(self, shader.c_str());
-  return activation_dispatch(shader, buffer_shader, self, self, p0, p1);
+  return activation_dispatch(
+      activation_variant(shader, self),
+      activation_variant(buffer_shader, self),
+      self, self, p0, p1);
 }
 
 } // namespace
@@ -225,6 +248,12 @@ Tensor& threshold_inplace_kernel(
 
 Tensor hardshrink_kernel(const Tensor& self, Scalar lambd) {
   return activation_out(
+      "hardshrink", "buffer_hardshrink", self,
+      static_cast<float>(lambd.toDouble()), 0.0f);
+}
+
+Tensor& hardshrink_inplace_kernel(Tensor& self, Scalar lambd) {
+  return activation_inplace(
       "hardshrink", "buffer_hardshrink", self,
       static_cast<float>(lambd.toDouble()), 0.0f);
 }
@@ -339,6 +368,7 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, ActivationKernels) {
   m.impl("threshold", &tensorplay::vulkan::ops::threshold_kernel);
   m.impl("threshold_", &tensorplay::vulkan::ops::threshold_inplace_kernel);
   m.impl("hardshrink", &tensorplay::vulkan::ops::hardshrink_kernel);
+  m.impl("hardshrink_", &tensorplay::vulkan::ops::hardshrink_inplace_kernel);
   m.impl("hardshrink_backward",
          &tensorplay::vulkan::ops::hardshrink_backward_kernel);
 }

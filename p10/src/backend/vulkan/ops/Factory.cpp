@@ -258,8 +258,6 @@ Tensor full_kernel(
  * staging buffer carries the texture's element type, so the writer is
  * instantiated per element width the backend supports.
  */
-Device resolve_device(std::optional<Device> device);
-
 template <typename T>
 void scatter_staging_1d(
     api::vTensor& v,
@@ -300,6 +298,10 @@ void scatter_staging_values_1d(
           NotImplementedError,
           "Vulkan host-filled factory: unsupported texture dtype");
   }
+}
+
+Device resolve_device(std::optional<Device> device) {
+  return device.value_or(Device(DeviceType::Vulkan));
 }
 
 template <typename Filler>
@@ -461,10 +463,6 @@ DType resolve_dtype(std::optional<DType> dtype) {
     return DType::Float32;
   }
   return *dtype;
-}
-
-Device resolve_device(std::optional<Device> device) {
-  return device.value_or(Device(DeviceType::Vulkan));
 }
 
 // Schema-level adapters: the dispatcher invokes kernels with the optional

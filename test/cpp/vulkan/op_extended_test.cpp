@@ -1347,4 +1347,534 @@ TEST_F(VulkanExtendedOpTest, BaddbmmScaledBatchedAdd) {
       tpx_ops::baddbmm(bias3, b1, b2, Scalar(0.0), Scalar(1.0)));
 }
 
+TEST_F(VulkanExtendedOpTest, ReductionComposites) {
+  Tensor x = tpx_ops::arange(24., DType::Float32).reshape({2, 3, 4});
+
+  // Multi-dispatch compositions (var/std/norm) submit several batches of
+  // work; the payload is staged back out for comparison without an extra
+  // in-between sync on purpose.
+  Tensor xv = vk(x);
+  vulkan_test::expect_allclose(
+      tpx_ops::var(xv, 1).to(Device(DeviceType::CPU)), tpx_ops::var(x, 1),
+      1e-4, 1e-5);
+  vulkan_test::expect_allclose(
+      tpx_ops::std(xv, 1).to(Device(DeviceType::CPU)), tpx_ops::std(x, 1),
+      1e-4, 1e-5);
+  vulkan_test::expect_allclose(
+      tpx_ops::norm(xv, 1.0).to(Device(DeviceType::CPU)),
+      tpx_ops::norm(x, 1.0), 1e-3, 1e-5);
+  vulkan_test::expect_allclose(
+      tpx_ops::norm(xv, 2.0).to(Device(DeviceType::CPU)),
+      tpx_ops::norm(x, 2.0), 1e-3, 1e-5);
+  vulkan_test::expect_allclose(
+      tpx_ops::norm(xv, {1}, 3.0, false).to(Device(DeviceType::CPU)),
+      tpx_ops::norm(x, {1}, 3.0, false), 1e-3, 1e-5);
+}
+
+TEST_F(VulkanExtendedOpTest, ViewComposites) {
+  Tensor x = tpx_ops::arange(24., DType::Float32).reshape({2, 3, 4});
+
+  auto chunks = tpx_ops::chunk(vk(x), 3, 1);
+  auto ref_chunks = tpx_ops::chunk(x, 3, 1);
+  ASSERT_EQ(chunks.size(), ref_chunks.size());
+  for (size_t i = 0; i < chunks.size(); ++i) {
+    vulkan_test::expect_allclose(
+        chunks[i].to(Device(DeviceType::CPU)), ref_chunks[i]);
+  }
+
+  auto unbound = tpx_ops::unbind(vk(x), 1);
+  auto ref_unbound = tpx_ops::unbind(x, 1);
+  for (size_t i = 0; i < unbound.size(); ++i) {
+    vulkan_test::expect_allclose(
+        unbound[i].to(Device(DeviceType::CPU)), ref_unbound[i]);
+  }
+
+  vulkan_test::expect_allclose(
+      tpx_ops::movedim(vk(x), 1, 2).to(Device(DeviceType::CPU)),
+      tpx_ops::movedim(x, 1, 2));
+}
+
+TEST_F(VulkanExtendedOpTest, HostFilledFactories) {
+  vulkan_test::expect_allclose(
+      tpx_ops::eye(4, 4, DType::Float32, Device(DeviceType::Vulkan))
+          .to(Device(DeviceType::CPU)),
+      tpx_ops::eye(4, 4, DType::Float32, Device(DeviceType::CPU)));
+  vulkan_test::expect_allclose(
+      tpx_ops::eye(3, 5, DType::Float32, Device(DeviceType::Vulkan))
+          .to(Device(DeviceType::CPU)),
+      tpx_ops::eye(3, 5, DType::Float32, Device(DeviceType::CPU)));
+
+  vulkan_test::expect_allclose(
+      tpx_ops::linspace(0., 1., 6, DType::Float32, Device(DeviceType::Vulkan))
+          .to(Device(DeviceType::CPU)),
+      tpx_ops::linspace(0., 1., 6, DType::Float32, Device(DeviceType::CPU)));
+  vulkan_test::expect_allclose(
+      tpx_ops::logspace(0., 1., 6, 10.0, DType::Float32,
+                        Device(DeviceType::Vulkan))
+          .to(Device(DeviceType::CPU)),
+      tpx_ops::logspace(0., 1., 6, 10.0, DType::Float32,
+                        Device(DeviceType::CPU)));
+}
+
+TEST_F(VulkanExtendedOpTest, ClampBoundsAndInplaceUnary) {
+  Tensor x = tpx_ops::arange(6., DType::Float32).reshape({2, 3});
+
+  vulkan_test::expect_allclose(
+      tpx_ops::clamp_min(vk(x), Scalar(2.0)).to(Device(DeviceType::CPU)),
+      tpx_ops::clamp_min(x, Scalar(2.0)));
+  vulkan_test::expect_allclose(
+      tpx_ops::clamp_max(vk(x), Scalar(4.0)).to(Device(DeviceType::CPU)),
+      tpx_ops::clamp_max(x, Scalar(4.0)));
+
+  Tensor n = vk(x);
+  tpx_ops::neg_(n);
+  vulkan_test::expect_allclose(n.to(Device(DeviceType::CPU)), tpx_ops::neg(x));
+
+  Tensor s = vk(x);
+  tpx_ops::sin_(s);
+  vulkan_test::expect_allclose(s.to(Device(DeviceType::CPU)), tpx_ops::sin(x));
+}
+
+TEST_F(VulkanExtendedOpTest, QuantizedMetadataProbes) {
+  Tensor x = tpx_ops::ones({2, 2}, DType::Float32);
+  const double scale = 0.5;
+  const int64_t zp = 3;
+
+  Tensor q = tpx_ops::quantize_per_tensor(vk(x), scale, zp);
+  EXPECT_EQ(tpx_ops::q_scale(q), scale);
+  EXPECT_EQ(tpx_ops::q_zero_point(q), zp);
+
+  Tensor dq = tpx_ops::dequantize(q).to(Device(DeviceType::CPU));
+  Tensor ref = tpx_ops::dequantize(tpx_ops::quantize_per_tensor(x, scale, zp));
+  vulkan_test::expect_allclose(dq, ref);
+}
+
+TEST_F(VulkanExtendedOpTest, ProductReductionsMultiDtype) {
+  // Float payload folds on the device; the arange below contains zero, so
+  // every product must come out exactly zero rather than an epsilon off.
+  Tensor x = tpx_ops::arange(12., DType::Float32).reshape({3, 4});
+  Tensor xv = vk(x);
+  vulkan_test::expect_allclose(
+      tpx_ops::prod(xv).to(Device(DeviceType::CPU)), tpx_ops::prod(x));
+  vulkan_test::expect_allclose(
+      tpx_ops::prod(xv, {0}).to(Device(DeviceType::CPU)),
+      tpx_ops::prod(x, {0}));
+  vulkan_test::expect_allclose(
+      tpx_ops::prod(xv, {1}).to(Device(DeviceType::CPU)),
+      tpx_ops::prod(x, {1}));
+  vulkan_test::expect_allclose(
+      tpx_ops::prod(xv, {1}, true).to(Device(DeviceType::CPU)),
+      tpx_ops::prod(x, {1}, true));
+
+  // Integer payloads stage through the host; the result promotes to Int64.
+  Tensor xi = tpx_ops::arange(1, 7, DType::Int32).reshape({2, 3});
+  Tensor xiv = vk(xi);
+  Tensor got = tpx_ops::prod(xiv).to(Device(DeviceType::CPU))
+                   .to(DType::Float32);
+  Tensor ref = tpx_ops::prod(xi).to(DType::Float32);
+  vulkan_test::expect_allclose(got, ref);
+  EXPECT_EQ(got.item().to<double>(), 720.0);
+}
+
+TEST_F(VulkanExtendedOpTest, BooleanAggregatesMultiDtype) {
+  Tensor xf = tpx_ops::arange(6., DType::Float32).reshape({2, 3});
+  Tensor mask = tpx_ops::ne(xf, Scalar(0.0)); // Bool payload on the CPU
+  Tensor maskv = vk(mask);
+
+  Tensor got_all = tpx_ops::all(maskv).to(Device(DeviceType::CPU))
+                       .to(DType::Float32);
+  Tensor ref_all = tpx_ops::all(mask).to(DType::Float32);
+  vulkan_test::expect_allclose(got_all, ref_all);
+  EXPECT_EQ(got_all.item().to<double>(), 0.0);
+
+  Tensor got_any = tpx_ops::any(maskv).to(Device(DeviceType::CPU))
+                       .to(DType::Float32);
+  Tensor ref_any = tpx_ops::any(mask).to(DType::Float32);
+  vulkan_test::expect_allclose(got_any, ref_any);
+  EXPECT_EQ(got_any.item().to<double>(), 1.0);
+
+  vulkan_test::expect_allclose(
+      tpx_ops::all(maskv, 0).to(Device(DeviceType::CPU)).to(DType::Float32),
+      tpx_ops::all(mask, 0).to(DType::Float32));
+  vulkan_test::expect_allclose(
+      tpx_ops::any(maskv, 1).to(Device(DeviceType::CPU)).to(DType::Float32),
+      tpx_ops::any(mask, 1).to(DType::Float32));
+
+  // Float payloads fold through the comparison-chain path.
+  Tensor zeros = tpx_ops::zeros({2, 3}, DType::Float32);
+  Tensor ones = tpx_ops::ones({2, 3}, DType::Float32);
+  EXPECT_EQ(tpx_ops::all(vk(zeros)).item().to<double>(), 0.0);
+  EXPECT_EQ(tpx_ops::any(vk(ones)).item().to<double>(), 1.0);
+}
+
+TEST_F(VulkanExtendedOpTest, CountNonzeroAndIsNan) {
+  Tensor x = tpx_ops::arange(1., 13., DType::Float32).reshape({3, 4});
+  Tensor xv = vk(x);
+
+  Tensor got = tpx_ops::count_nonzero(xv).to(Device(DeviceType::CPU))
+                   .to(DType::Float32);
+  Tensor ref = tpx_ops::count_nonzero(x).to(DType::Float32);
+  vulkan_test::expect_allclose(got, ref);
+  EXPECT_EQ(got.item().to<double>(), 12.0);
+
+  vulkan_test::expect_allclose(
+      tpx_ops::count_nonzero(xv, {1}).to(Device(DeviceType::CPU))
+          .to(DType::Float32),
+      tpx_ops::count_nonzero(x, {1}).to(DType::Float32));
+
+  Tensor xi = tpx_ops::arange(1, 7, DType::Int32).reshape({2, 3});
+  vulkan_test::expect_allclose(
+      tpx_ops::count_nonzero(vk(xi)).to(Device(DeviceType::CPU))
+          .to(DType::Float32),
+      tpx_ops::count_nonzero(xi).to(DType::Float32));
+
+  // A fixed host-side mix of NaN and finite values exercises both isnan
+  // verdicts without relying on inf/0/0 overflow semantics.
+  Tensor nan_fixed = Tensor::tensor(
+      std::vector<float>{1.0f, std::nan(""), std::nan(""), 2.0f});
+  vulkan_test::expect_allclose(
+      tpx_ops::isnan(vk(nan_fixed)).to(Device(DeviceType::CPU))
+          .to(DType::Float32),
+      tpx_ops::isnan(nan_fixed).to(DType::Float32));
+}
+
+TEST_F(VulkanExtendedOpTest, IndexReductionsMatchCpu) {
+  Tensor x = tpx_ops::arange(12., DType::Float32).reshape({3, 4});
+  Tensor xv = vk(x);
+
+  // The index planes answer Int32 on the device and Int64 on the CPU; both
+  // cast to Float32 for the value comparison.
+  vulkan_test::expect_allclose(
+      tpx_ops::argmax(xv, 1).to(Device(DeviceType::CPU)).to(DType::Float32),
+      tpx_ops::argmax(x, 1).to(DType::Float32));
+  vulkan_test::expect_allclose(
+      tpx_ops::argmin(xv, 0).to(Device(DeviceType::CPU)).to(DType::Float32),
+      tpx_ops::argmin(x, 0).to(DType::Float32));
+
+  auto mx = tpx_ops::max(xv, 1);
+  auto ref_mx = tpx_ops::max(x, 1);
+  vulkan_test::expect_allclose(
+      std::get<0>(mx).to(Device(DeviceType::CPU)), std::get<0>(ref_mx));
+  vulkan_test::expect_allclose(
+      std::get<1>(mx).to(Device(DeviceType::CPU)).to(DType::Float32),
+      std::get<1>(ref_mx).to(DType::Float32));
+
+  auto mn = tpx_ops::min(xv, 1);
+  auto ref_mn = tpx_ops::min(x, 1);
+  vulkan_test::expect_allclose(
+      std::get<0>(mn).to(Device(DeviceType::CPU)), std::get<0>(ref_mn));
+  vulkan_test::expect_allclose(
+      std::get<1>(mn).to(Device(DeviceType::CPU)).to(DType::Float32),
+      std::get<1>(ref_mn).to(DType::Float32));
+
+  vulkan_test::expect_allclose(
+      tpx_ops::amax(xv).to(Device(DeviceType::CPU)), tpx_ops::amax(x));
+  vulkan_test::expect_allclose(
+      tpx_ops::amin(xv, {1}).to(Device(DeviceType::CPU)),
+      tpx_ops::amin(x, {1}));
+}
+
+TEST_F(VulkanExtendedOpTest, SelectionOpsMatchCpu) {
+  Tensor x = tpx_ops::arange(1., 13., DType::Float32).reshape({3, 4});
+  Tensor xv = vk(x);
+
+  auto sv = tpx_ops::sort(xv, 1);
+  auto ref_sv = tpx_ops::sort(x, 1);
+  vulkan_test::expect_allclose(
+      std::get<0>(sv).to(Device(DeviceType::CPU)), std::get<0>(ref_sv));
+  vulkan_test::expect_allclose(
+      std::get<1>(sv).to(Device(DeviceType::CPU)).to(DType::Float32),
+      std::get<1>(ref_sv).to(DType::Float32));
+
+  auto tk = tpx_ops::topk(xv, 2, 1);
+  auto ref_tk = tpx_ops::topk(x, 2, 1);
+  vulkan_test::expect_allclose(
+      std::get<0>(tk).to(Device(DeviceType::CPU)), std::get<0>(ref_tk));
+  vulkan_test::expect_allclose(
+      std::get<1>(tk).to(Device(DeviceType::CPU)).to(DType::Float32),
+      std::get<1>(ref_tk).to(DType::Float32));
+
+  vulkan_test::expect_allclose(
+      tpx_ops::median(xv).to(Device(DeviceType::CPU)),
+      tpx_ops::median(x));
+}
+
+TEST_F(VulkanExtendedOpTest, CumprodAndLogsumexpMatchCpu) {
+  Tensor x = tpx_ops::arange(1., 13., DType::Float32).reshape({3, 4});
+  Tensor xv = vk(x);
+
+  vulkan_test::expect_allclose(
+      tpx_ops::cumprod(xv, 1).to(Device(DeviceType::CPU)),
+      tpx_ops::cumprod(x, 1), 1e-4, 1e-5);
+  vulkan_test::expect_allclose(
+      tpx_ops::cumprod(xv, 0).to(Device(DeviceType::CPU)),
+      tpx_ops::cumprod(x, 0), 1e-4, 1e-5);
+
+  vulkan_test::expect_allclose(
+      tpx_ops::logsumexp(xv, 1).to(Device(DeviceType::CPU)),
+      tpx_ops::logsumexp(x, 1), 1e-4, 1e-5);
+  vulkan_test::expect_allclose(
+      tpx_ops::logsumexp(xv, 0, true).to(Device(DeviceType::CPU)),
+      tpx_ops::logsumexp(x, 0, true), 1e-4, 1e-5);
+}
+
+//
+// Multi-dtype arithmetic: Int32 payloads run the `_i32` shader twins
+// natively; every test compares against the CPU result element-wise.
+//
+
+TEST_F(VulkanExtendedOpTest, Int32BinaryTensorArithmetic) {
+  Tensor a = tpx_ops::arange(1, 7, DType::Int32).reshape({2, 3});
+  Tensor b = tpx_ops::full({2, 3}, 2, DType::Int32);
+  Tensor av = vk(a);
+  Tensor bv = vk(b);
+
+  vulkan_test::expect_allclose(
+      tpx_ops::add(av, bv).to(Device(DeviceType::CPU)).to(DType::Float32),
+      tpx_ops::add(a, b).to(DType::Float32));
+  vulkan_test::expect_allclose(
+      tpx_ops::sub(av, bv).to(Device(DeviceType::CPU)).to(DType::Float32),
+      tpx_ops::sub(a, b).to(DType::Float32));
+  vulkan_test::expect_allclose(
+      tpx_ops::mul(av, bv).to(Device(DeviceType::CPU)).to(DType::Float32),
+      tpx_ops::mul(a, b).to(DType::Float32));
+  vulkan_test::expect_allclose(
+      tpx_ops::div(av, bv).to(Device(DeviceType::CPU)).to(DType::Float32),
+      tpx_ops::div(a, b).to(DType::Float32));
+
+  // In-place forms mutate the payload on the device.
+  Tensor acc = vk(tpx_ops::arange(1, 7, DType::Int32).reshape({2, 3}));
+  tpx_ops::add_(acc, bv);
+  vulkan_test::expect_allclose(
+      acc.to(Device(DeviceType::CPU)).to(DType::Float32),
+      tpx_ops::add(a, b).to(DType::Float32));
+  tpx_ops::sub_(acc, bv);
+  tpx_ops::mul_(acc, bv);
+  vulkan_test::expect_allclose(
+      acc.to(Device(DeviceType::CPU)).to(DType::Float32),
+      tpx_ops::mul(a, b).to(DType::Float32));
+}
+
+TEST_F(VulkanExtendedOpTest, Int32ScalarArithmetic) {
+  Tensor a = tpx_ops::arange(1, 7, DType::Int32).reshape({2, 3});
+  Tensor av = vk(a);
+
+  vulkan_test::expect_allclose(
+      tpx_ops::add(av, Scalar(3)).to(Device(DeviceType::CPU)).to(DType::Float32),
+      tpx_ops::add(a, Scalar(3)).to(DType::Float32));
+  vulkan_test::expect_allclose(
+      tpx_ops::mul(av, Scalar(-2)).to(Device(DeviceType::CPU)).to(DType::Float32),
+      tpx_ops::mul(a, Scalar(-2)).to(DType::Float32));
+  vulkan_test::expect_allclose(
+      tpx_ops::rsub(av, Scalar(10)).to(Device(DeviceType::CPU)).to(DType::Float32),
+      tpx_ops::rsub(a, Scalar(10)).to(DType::Float32));
+
+  Tensor acc = vk(a);
+  tpx_ops::add_(acc, Scalar(5));
+  vulkan_test::expect_allclose(
+      acc.to(Device(DeviceType::CPU)).to(DType::Float32),
+      tpx_ops::add(a, Scalar(5)).to(DType::Float32));
+}
+
+TEST_F(VulkanExtendedOpTest, Int32Unary) {
+  Tensor a = tpx_ops::arange(-3, 6, DType::Int32).reshape({3, 3});
+  Tensor av = vk(a);
+
+  vulkan_test::expect_allclose(
+      tpx_ops::abs(av).to(Device(DeviceType::CPU)).to(DType::Float32),
+      tpx_ops::abs(a).to(DType::Float32));
+  vulkan_test::expect_allclose(
+      tpx_ops::neg(av).to(Device(DeviceType::CPU)).to(DType::Float32),
+      tpx_ops::neg(a).to(DType::Float32));
+  vulkan_test::expect_allclose(
+      tpx_ops::relu(av).to(Device(DeviceType::CPU)).to(DType::Float32),
+      tpx_ops::relu(a).to(DType::Float32));
+  vulkan_test::expect_allclose(
+      tpx_ops::sign(av).to(Device(DeviceType::CPU)).to(DType::Float32),
+      tpx_ops::sign(a).to(DType::Float32));
+  vulkan_test::expect_allclose(
+      tpx_ops::square(av).to(Device(DeviceType::CPU)).to(DType::Float32),
+      tpx_ops::square(a).to(DType::Float32));
+
+  Tensor acc = vk(a);
+  tpx_ops::abs_(acc);
+  vulkan_test::expect_allclose(
+      acc.to(Device(DeviceType::CPU)).to(DType::Float32),
+      tpx_ops::abs(a).to(DType::Float32));
+}
+
+TEST_F(VulkanExtendedOpTest, Int32ClampAndWhere) {
+  Tensor a = tpx_ops::arange(-4, 8, DType::Int32).reshape({2, 6});
+  Tensor av = vk(a);
+
+  vulkan_test::expect_allclose(
+      tpx_ops::clamp(av, Scalar(-2), Scalar(3))
+          .to(Device(DeviceType::CPU)).to(DType::Float32),
+      tpx_ops::clamp(a, Scalar(-2), Scalar(3)).to(DType::Float32));
+  vulkan_test::expect_allclose(
+      tpx_ops::clamp_min(av, Scalar(0))
+          .to(Device(DeviceType::CPU)).to(DType::Float32),
+      tpx_ops::clamp_min(a, Scalar(0)).to(DType::Float32));
+  vulkan_test::expect_allclose(
+      tpx_ops::clamp_max(av, Scalar(2))
+          .to(Device(DeviceType::CPU)).to(DType::Float32),
+      tpx_ops::clamp_max(a, Scalar(2)).to(DType::Float32));
+
+  Tensor mask_cpu = tpx_ops::ge(a, Scalar(0));
+  Tensor picked = tpx_ops::where(vk(mask_cpu), av, vk(a.mul(Scalar(-1))));
+  vulkan_test::expect_allclose(
+      picked.to(Device(DeviceType::CPU)).to(DType::Float32),
+      tpx_ops::where(mask_cpu, a, a.mul(Scalar(-1))).to(DType::Float32));
+}
+
+TEST_F(VulkanExtendedOpTest, Int32OrderedComparisons) {
+  Tensor a = tpx_ops::arange(0, 6, DType::Int32).reshape({2, 3});
+  Tensor b = tpx_ops::full({2, 3}, 3, DType::Int32);
+  Tensor av = vk(a);
+  Tensor bv = vk(b);
+
+  vulkan_test::expect_allclose(
+      tpx_ops::lt(av, bv).to(Device(DeviceType::CPU)).to(DType::Float32),
+      tpx_ops::lt(a, b).to(DType::Float32));
+  vulkan_test::expect_allclose(
+      tpx_ops::le(av, bv).to(Device(DeviceType::CPU)).to(DType::Float32),
+      tpx_ops::le(a, b).to(DType::Float32));
+  vulkan_test::expect_allclose(
+      tpx_ops::gt(av, bv).to(Device(DeviceType::CPU)).to(DType::Float32),
+      tpx_ops::gt(a, b).to(DType::Float32));
+  vulkan_test::expect_allclose(
+      tpx_ops::ge(av, bv).to(Device(DeviceType::CPU)).to(DType::Float32),
+      tpx_ops::ge(a, b).to(DType::Float32));
+  vulkan_test::expect_allclose(
+      tpx_ops::lt(av, Scalar(3)).to(Device(DeviceType::CPU)).to(DType::Float32),
+      tpx_ops::lt(a, Scalar(3)).to(DType::Float32));
+  vulkan_test::expect_allclose(
+      tpx_ops::ge(av, Scalar(2)).to(Device(DeviceType::CPU)).to(DType::Float32),
+      tpx_ops::ge(a, Scalar(2)).to(DType::Float32));
+}
+
+TEST_F(VulkanExtendedOpTest, Int32MinimumMaximum) {
+  Tensor a = tpx_ops::arange(0, 6, DType::Int32).reshape({2, 3});
+  Tensor b = tpx_ops::full({2, 3}, 3, DType::Int32);
+  Tensor av = vk(a);
+  Tensor bv = vk(b);
+
+  vulkan_test::expect_allclose(
+      tpx_ops::maximum(av, bv).to(Device(DeviceType::CPU)).to(DType::Float32),
+      tpx_ops::maximum(a, b).to(DType::Float32));
+  vulkan_test::expect_allclose(
+      tpx_ops::minimum(av, bv).to(Device(DeviceType::CPU)).to(DType::Float32),
+      tpx_ops::minimum(a, b).to(DType::Float32));
+  vulkan_test::expect_allclose(
+      tpx_ops::remainder(av, bv).to(Device(DeviceType::CPU)).to(DType::Float32),
+      tpx_ops::remainder(a, b).to(DType::Float32));
+  vulkan_test::expect_allclose(
+      tpx_ops::fmod(av, bv).to(Device(DeviceType::CPU)).to(DType::Float32),
+      tpx_ops::fmod(a, b).to(DType::Float32));
+}
+
+//
+// Newly registered float ops, each against the CPU reference.
+//
+
+TEST_F(VulkanExtendedOpTest, NewFloatUnaryPointwise) {
+  Tensor x = tpx_ops::arange(-2.0, 2.25, 0.25, DType::Float32);
+  Tensor xv = vk(x);
+
+  vulkan_test::expect_allclose(
+      tpx_ops::ceil(xv).to(Device(DeviceType::CPU)), tpx_ops::ceil(x));
+  vulkan_test::expect_allclose(
+      tpx_ops::trunc(xv).to(Device(DeviceType::CPU)), tpx_ops::trunc(x));
+  vulkan_test::expect_allclose(
+      tpx_ops::round(xv).to(Device(DeviceType::CPU)), tpx_ops::round(x));
+  vulkan_test::expect_allclose(
+      tpx_ops::tan(xv).to(Device(DeviceType::CPU)), tpx_ops::tan(x),
+      1e-4, 1e-5);
+  vulkan_test::expect_allclose(
+      tpx_ops::sinh(xv).to(Device(DeviceType::CPU)), tpx_ops::sinh(x),
+      1e-4, 1e-5);
+  vulkan_test::expect_allclose(
+      tpx_ops::cosh(xv).to(Device(DeviceType::CPU)), tpx_ops::cosh(x),
+      1e-4, 1e-5);
+  vulkan_test::expect_allclose(
+      tpx_ops::asin(xv).to(Device(DeviceType::CPU)), tpx_ops::asin(x),
+      1e-4, 1e-5);
+  vulkan_test::expect_allclose(
+      tpx_ops::acos(xv).to(Device(DeviceType::CPU)), tpx_ops::acos(x),
+      1e-4, 1e-5);
+  vulkan_test::expect_allclose(
+      tpx_ops::atan(xv).to(Device(DeviceType::CPU)), tpx_ops::atan(x),
+      1e-4, 1e-5);
+  vulkan_test::expect_allclose(
+      tpx_ops::exp2(xv).to(Device(DeviceType::CPU)), tpx_ops::exp2(x),
+      1e-4, 1e-5);
+  vulkan_test::expect_allclose(
+      tpx_ops::expm1(xv).to(Device(DeviceType::CPU)), tpx_ops::expm1(x),
+      1e-4, 1e-5);
+  vulkan_test::expect_allclose(
+      tpx_ops::log1p(xv.add(Scalar(5.0))).to(Device(DeviceType::CPU)),
+      tpx_ops::log1p(x.add(Scalar(5.0))), 1e-4, 1e-5);
+  vulkan_test::expect_allclose(
+      tpx_ops::log2(xv.abs().add(Scalar(0.5))).to(Device(DeviceType::CPU)),
+      tpx_ops::log2(x.abs().add(Scalar(0.5))), 1e-4, 1e-5);
+  vulkan_test::expect_allclose(
+      tpx_ops::log10(xv.abs().add(Scalar(0.5))).to(Device(DeviceType::CPU)),
+      tpx_ops::log10(x.abs().add(Scalar(0.5))), 1e-4, 1e-5);
+  vulkan_test::expect_allclose(
+      tpx_ops::square(xv).to(Device(DeviceType::CPU)), tpx_ops::square(x));
+  vulkan_test::expect_allclose(
+      tpx_ops::reciprocal(xv.add(Scalar(10.0))).to(Device(DeviceType::CPU)),
+      tpx_ops::reciprocal(x.add(Scalar(10.0))), 1e-4, 1e-5);
+
+  // In-place variants on a writable payload.
+  Tensor acc = vk(x);
+  tpx_ops::exp2_(acc);
+  vulkan_test::expect_allclose(
+      acc.to(Device(DeviceType::CPU)), tpx_ops::exp2(x), 1e-4, 1e-5);
+}
+
+TEST_F(VulkanExtendedOpTest, NewFloatBinaryPointwise) {
+  Tensor a = tpx_ops::arange(-3.0, 3.0, 0.5, DType::Float32);
+  Tensor b = tpx_ops::full(a.shape(), 1.5, DType::Float32);
+  Tensor av = vk(a);
+  Tensor bv = vk(b);
+
+  vulkan_test::expect_allclose(
+      tpx_ops::maximum(av, bv).to(Device(DeviceType::CPU)),
+      tpx_ops::maximum(a, b));
+  vulkan_test::expect_allclose(
+      tpx_ops::minimum(av, bv).to(Device(DeviceType::CPU)),
+      tpx_ops::minimum(a, b));
+  vulkan_test::expect_allclose(
+      tpx_ops::remainder(av, bv).to(Device(DeviceType::CPU)),
+      tpx_ops::remainder(a, b), 1e-4, 1e-5);
+  vulkan_test::expect_allclose(
+      tpx_ops::fmod(av, bv).to(Device(DeviceType::CPU)),
+      tpx_ops::fmod(a, b), 1e-4, 1e-5);
+  vulkan_test::expect_allclose(
+      tpx_ops::atan2(av, bv).to(Device(DeviceType::CPU)),
+      tpx_ops::atan2(a, b), 1e-4, 1e-5);
+  vulkan_test::expect_allclose(
+      tpx_ops::logaddexp(av, bv).to(Device(DeviceType::CPU)),
+      tpx_ops::logaddexp(a, b), 1e-4, 1e-5);
+  vulkan_test::expect_allclose(
+      tpx_ops::true_divide(av, bv).to(Device(DeviceType::CPU)),
+      tpx_ops::true_divide(a, b), 1e-4, 1e-5);
+  vulkan_test::expect_allclose(
+      tpx_ops::true_divide(av, Scalar(2.0)).to(Device(DeviceType::CPU)),
+      tpx_ops::true_divide(a, Scalar(2.0)), 1e-4, 1e-5);
+  vulkan_test::expect_allclose(
+      tpx_ops::rsub(av, Scalar(1.0)).to(Device(DeviceType::CPU)),
+      tpx_ops::rsub(a, Scalar(1.0)), 1e-4, 1e-5);
+  vulkan_test::expect_allclose(
+      tpx_ops::subtract(av, bv).to(Device(DeviceType::CPU)),
+      tpx_ops::subtract(a, b));
+  vulkan_test::expect_allclose(
+      tpx_ops::multiply(av, bv).to(Device(DeviceType::CPU)),
+      tpx_ops::multiply(a, b));
+  vulkan_test::expect_allclose(
+      tpx_ops::divide(av, bv).to(Device(DeviceType::CPU)),
+      tpx_ops::divide(a, b), 1e-4, 1e-5);
+}
+
 } // namespace
