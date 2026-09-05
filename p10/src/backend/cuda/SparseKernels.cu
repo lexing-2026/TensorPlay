@@ -1354,6 +1354,10 @@ Tensor sparse_mm_cuda(const Tensor& self, const Tensor& dense) {
         TP_THROW(TypeError,
                  "sparse_mm(): operands must share the sparse tensor's dtype");
     }
+    if (self.device() != dense.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "sparse_mm(): operands must be on the same device");
+    }
     constexpr int threads = 128;
     Tensor source = self;
     if (self.is_sparse_csr()) {
@@ -1535,6 +1539,10 @@ Tensor sparse_add_cuda(const Tensor& self, const Tensor& other) {
     if (self.dtype() != other.dtype()) {
         TP_THROW(TypeError, "sparse.add(): operands must share one dtype");
     }
+    if (self.device() != other.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "sparse.add(): operands must share one device");
+    }
     Tensor a = self.is_coalesced() ? self : self.coalesce();
     Tensor b = other.is_coalesced() ? other : other.coalesce();
     if (a._values().dim() != 1 || b._values().dim() != 1) {
@@ -1612,6 +1620,10 @@ Tensor sparse_mul_cuda(const Tensor& self, const Tensor& other) {
     }
     if (self.dtype() != other.dtype()) {
         TP_THROW(TypeError, "sparse.mul(): operands must share one dtype");
+    }
+    if (self.device() != other.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "sparse.mul(): operands must share one device");
     }
     Tensor a = self.coalesce();
     Tensor b = other.coalesce();
