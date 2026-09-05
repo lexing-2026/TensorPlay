@@ -350,6 +350,10 @@ GPU_ATOMIC_INTEGER(Mul, a* b, int8_t)
 GPU_ATOMIC_INTEGER(Mul, a* b, int16_t)
 GPU_ATOMIC_INTEGER(Mul, a* b, int32_t)
 GPU_ATOMIC_INTEGER(Mul, a* b, int64_t)
+GPU_ATOMIC_INTEGER(Mul, a* b, uint16_t)
+GPU_ATOMIC_INTEGER(Mul, a* b, uint32_t)
+GPU_ATOMIC_INTEGER(Mul, a* b, uint64_t)
+GPU_ATOMIC_INTEGER(Mul, a && b, bool)
 
 inline __device__ tensorplay::Half gpuAtomicMul(tensorplay::Half* address, tensorplay::Half val) {
   return AtomicFPOp<tensorplay::Half>()(
@@ -405,6 +409,10 @@ GPU_ATOMIC_INTEGER(Max, safe_max(a, b), int8_t)
 GPU_ATOMIC_INTEGER(Max, safe_max(a, b), int16_t)
 GPU_ATOMIC_INTEGER(Max, safe_max(a, b), int32_t)
 GPU_ATOMIC_INTEGER(Max, safe_max(a, b), int64_t)
+GPU_ATOMIC_INTEGER(Max, safe_max(a, b), uint16_t)
+GPU_ATOMIC_INTEGER(Max, safe_max(a, b), uint32_t)
+GPU_ATOMIC_INTEGER(Max, safe_max(a, b), uint64_t)
+GPU_ATOMIC_INTEGER(Max, safe_max(a, b), bool)
 
 inline __device__ tensorplay::Half gpuAtomicMax(tensorplay::Half* address, tensorplay::Half val) {
   return AtomicFPOp<tensorplay::Half>()(address, val, [](tensorplay::Half bsum, tensorplay::Half val) {
@@ -464,6 +472,10 @@ GPU_ATOMIC_INTEGER(Min, safe_min(a, b), int8_t)
 GPU_ATOMIC_INTEGER(Min, safe_min(a, b), int16_t)
 GPU_ATOMIC_INTEGER(Min, safe_min(a, b), int32_t)
 GPU_ATOMIC_INTEGER(Min, safe_min(a, b), int64_t)
+GPU_ATOMIC_INTEGER(Min, safe_min(a, b), uint16_t)
+GPU_ATOMIC_INTEGER(Min, safe_min(a, b), uint32_t)
+GPU_ATOMIC_INTEGER(Min, safe_min(a, b), uint64_t)
+GPU_ATOMIC_INTEGER(Min, safe_min(a, b), bool)
 
 inline __device__ tensorplay::Half gpuAtomicMin(tensorplay::Half* address, tensorplay::Half val) {
   return AtomicFPOp<tensorplay::Half>()(address, val, [](tensorplay::Half bsum, tensorplay::Half val) {
