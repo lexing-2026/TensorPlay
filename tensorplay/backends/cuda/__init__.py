@@ -21,7 +21,7 @@ __all__ = [
 def is_built() -> bool:
     r"""Returns whether TensorPlay is built with CUDA support. Note that this
     doesn't mean CUDA is available; just that if TensorPlay is built for the machine."""
-    return bool(tensorplay._C.is_cuda_available)
+    return bool(tensorplay._C.is_cuda_available())
 
 
 def is_available() -> bool:

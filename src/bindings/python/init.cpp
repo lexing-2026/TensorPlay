@@ -737,6 +737,14 @@ PYBIND11_MODULE(_C, m) {
         Py_DECREF(name_obj);
     });
 
+    m.def("_swap_tensor_impl", [](py::object first, py::object second) {
+        Tensor& first_tensor =
+            tensorplay::python_c::tpx_py_tensor_mref(first.ptr());
+        Tensor& second_tensor =
+            tensorplay::python_c::tpx_py_tensor_mref(second.ptr());
+        first_tensor.swap_impl(second_tensor);
+    }, "first"_a, "second"_a);
+
     // METH_FASTCALL function layer goes in LAST, after every pybind11
     // binding above: it only fills names nothing else bound and must never
     // shadow a hand-written overload.  TP_NO_FASTCALL=1 disables it (escape

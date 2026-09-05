@@ -1110,6 +1110,7 @@ from tensorplay.autograd import (
 
 from tensorplay import (
     __config__ as __config__,
+    __future__ as __future__,
     autograd as autograd,
     backends as backends,
     cuda as cuda,

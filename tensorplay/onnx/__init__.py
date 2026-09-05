@@ -34,7 +34,6 @@ from ._verify import VerificationError, VerificationResult, verify_model
 __all__ = [
     "DEFAULT_OPSET_VERSION",
     "MIN_OPSET_VERSION",
-    "ExportOptions",
     "UnsupportedOperatorError",
     "VerificationError",
     "VerificationResult",
