@@ -97,7 +97,12 @@ Tensor float_math_cuda(const Tensor& self, F function, const char*) {
 }
 
 template <typename F>
-Tensor binary_float_cuda(const Tensor& lhs_in, const Tensor& rhs_in, F function, const char*) {
+Tensor binary_float_cuda(const Tensor& lhs_in, const Tensor& rhs_in, F function,
+                         const char* name) {
+    if (lhs_in.device() != rhs_in.device()) {
+        TP_THROW(DeviceMismatchError, name,
+                 ": inputs must be on the same device");
+    }
     DType dtype = promoteTypes(lhs_in.dtype(), rhs_in.dtype());
     if (!isFloatingType(dtype)) {
         dtype = DType::Float32;
@@ -173,6 +178,10 @@ Tensor typed_math_cuda(const Tensor& self, F function) {
 
 template <typename F>
 Tensor typed_binary_cuda(const Tensor& lhs_in, const Tensor& rhs_in, F function) {
+    if (lhs_in.device() != rhs_in.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "special binary inputs must be on the same device");
+    }
     DType dtype = promoteTypes(lhs_in.dtype(), rhs_in.dtype());
     if (!isFloatingType(dtype)) {
         dtype = DType::Float32;
