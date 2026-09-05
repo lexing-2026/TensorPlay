@@ -17,6 +17,7 @@ from tensorplay import Tensor
 from ._construction import (
     coalesce,
     sparse_coo_tensor,
+    sparse_csr_tensor,
     sparse_mask,
     spdiags,
     to_dense,
@@ -46,6 +47,7 @@ __all__ = [
     "softmax",
     "solve",
     "sparse_coo_tensor",
+    "sparse_csr_tensor",
     "sparse_mask",
     "spdiags",
     "sum",
