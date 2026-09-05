@@ -61,10 +61,10 @@ struct PlanSpec {
 struct PlanSpecHash {
     size_t operator()(const PlanSpec& k) const {
         size_t h = std::hash<int>()(k.rank) ^ (std::hash<int>()(k.type) << 1);
+        auto mix = [&h](int64_t v) {
+            h ^= std::hash<int64_t>()(v) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        };
         for (int i = 0; i < 2; ++i) {
-            auto mix = [&h](int64_t v) {
-                h ^= std::hash<int64_t>()(v) + 0x9e3779b9 + (h << 6) + (h >> 2);
-            };
             mix(k.n[i]);
             mix(k.inembed[i]);
             mix(k.onembed[i]);
